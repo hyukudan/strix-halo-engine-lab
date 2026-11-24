@@ -4,7 +4,12 @@
 //    reference of the same NVFP4 operands (FP32 tensor accumulation, bound 1e-4 of the absolute product sum), padding never
 //    stored, two launches bitwise equal.
 // 3. Bench (--bench): one Inkling-class chunk (128 experts x 2 tiles of 64 rows) per projection, BF16 shift-decode tile vs
-//    quantiser + W4A4 tile, median of 20 launches each (cudaEvent).
+//    quantiser + W4A4 tile, median of 20 launches each (cudaEvent); then the same chunk in the tall plan (uneven expert loads,
+//    tiles of <= 128 rows), BF16 tile vs W4A4 tile, with the W4A4 output digest; BENCH-R2 lines: the two-term quantiser +
+//    projection.
+// DIGEST lines: FNV-1a of the projection outputs of the fixture (identity evidence between two builds).
+// 4. Two-term rule r2@1: quantiser [term 1 | residual term] bitwise against the host rule, projection q1 W + q2 W (one K sweep)
+//    against the double reference.
 #include "cuda/core/grouped_w4a4.hpp"
 #include "cuda/core/mma_tile.cuh"
 
@@ -67,6 +72,11 @@ std::uint8_t encode_e2m1(float x) {  // |x| <= 6
     }
     return static_cast<std::uint8_t>(best | (std::signbit(x) ? 8U : 0U));
 }
+// Expected residual of the two-term rule r2@1, written independently of moe_core/nvfp4_act_rule.hpp: the literal E2M1
+// values above and one FP32 FMA per element, r_i = -fma(q_i, scale, -v_i) = v_i - q_i * scale rounded once.
+void residual_expected(const float (&v)[16], float scale, const std::uint8_t* codes, float (&r)[16]) {
+    for (unsigned i = 0; i < 16U; ++i) r[i] = -std::fma(e2m1_value((codes[i / 2U] >> (4U * (i & 1U))) & 15U), scale, -v[i]);
+}
 // Code bytes equal up to the sign of zero (E2M1 0x8 = -0 decodes to 0 like 0x0).
 bool same_codes(const std::uint8_t* a, const std::uint8_t* b, std::size_t n) {
     const auto norm = [](std::uint8_t v) {
@@ -77,10 +87,12 @@ bool same_codes(const std::uint8_t* a, const std::uint8_t* b, std::size_t n) {
         if (norm(a[i]) != norm(b[i])) return false;
     return true;
 }
-void quantize_host(const float* x, unsigned width, std::uint8_t* codes, std::uint8_t* scales, float* rs, bool mse = false) {
+// fixed_ts: the row scale of term 1 (the two-term rule encodes the residual at the same row scale).
+void quantize_host(const float* x, unsigned width, std::uint8_t* codes, std::uint8_t* scales, float* rs, bool mse = false,
+                   const float* fixed_ts = nullptr) {
     float amax = 0.F;
     for (unsigned i = 0; i < width; ++i) amax = std::max(amax, std::fabs(x[i]));
-    const float ts = amax / gw::kRowScaleDiv;
+    const float ts = fixed_ts ? *fixed_ts : amax / gw::kRowScaleDiv;
     *rs = ts;
     for (unsigned q = 0; q < width / 16U; ++q) {
         float a16 = 0.F;
@@ -128,6 +140,14 @@ T* upload(const std::vector<T>& h) {
     return d;
 }
 
+// Output digest of a projection (the identity evidence between two builds of this fixture: same seeds, same bytes).
+std::uint64_t fnv1a64(const void* p, std::size_t n) {
+    const auto* b = static_cast<const unsigned char*>(p);
+    std::uint64_t h = 1469598103934665603ULL;
+    for (std::size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ULL;
+    return h;
+}
+
 struct Expert {
     std::vector<std::uint8_t> codes, scales;
     packed::RowOrder order;
@@ -152,7 +172,10 @@ void correctness(std::mt19937& rng) {
         unsigned assignments = 0;
         for (const auto& t : tiles_spec) assignments += t.rows;
         std::vector<float> tokens(std::size_t{kTokens} * K);
-        for (auto& v : tokens) v = normal(rng) * (1.F + static_cast<float>(byte(rng) % 7));
+        for (auto& v : tokens) {  // two sequenced draws: the fixture's inputs (and digests) must not depend on the compiler
+            const float n = normal(rng);
+            v = n * (1.F + static_cast<float>(byte(rng) % 7));
+        }
         std::vector<std::uint32_t> index(assignments);
         for (auto& i : index) i = static_cast<std::uint32_t>(byte(rng)) % kTokens;
         // device operands
@@ -255,6 +278,7 @@ void correctness(std::mt19937& rng) {
         CK(cudaDeviceSynchronize());
         std::vector<float> got(std::size_t{assignments} * kOut), again(got.size());
         CK(cudaMemcpy(got.data(), dout, out_bytes, cudaMemcpyDeviceToHost));
+        std::printf("DIGEST projection K %u fnv1a64 %016llx\n", K, static_cast<unsigned long long>(fnv1a64(got.data(), out_bytes)));
         CK(strix::cuda::core::grouped_w4a4::launch(args, nullptr));
         CK(cudaMemcpy(again.data(), dout, out_bytes, cudaMemcpyDeviceToHost));
         check(std::memcmp(got.data(), again.data(), out_bytes) == 0, "two launches bitwise equal");
@@ -271,6 +295,22 @@ void correctness(std::mt19937& rng) {
             CK(cudaMemcpy(again.data(), dout, out_bytes, cudaMemcpyDeviceToHost));
             check(std::memcmp(got.data(), again.data(), out_bytes) == 0, "128-row plan (row slices) bitwise the 64-row plan");
             CK(cudaFree(dmerged));
+        }
+        {  // token image: the kTokens token rows quantised once, the projection reads image row index[first + r]: bitwise the
+           // image quantised per assignment from the gathered rows (every assignment of a token reads the same codes).
+            std::uint8_t* dtoken = nullptr;
+            CK(cudaMalloc(&dtoken, gw::image_layout(kTokens, K).bytes));
+            const auto timage = gw::make_image(dtoken, kTokens, K);
+            CK(strix::cuda::core::grouped_w4a4::quantize(gw::QuantizeArgs<float>{dtokens, K, nullptr, kTokens, K, timage, nullptr},
+                                                         nullptr));
+            gw::Args targs = args;
+            targs.input = timage;
+            targs.row_index = dindex;
+            CK(cudaMemset(dout, 0xff, out_bytes));
+            CK(strix::cuda::core::grouped_w4a4::launch(targs, nullptr));
+            CK(cudaMemcpy(again.data(), dout, out_bytes, cudaMemcpyDeviceToHost));
+            check(std::memcmp(got.data(), again.data(), out_bytes) == 0, "token image + row index bitwise the per-assignment image");
+            CK(cudaFree(dtoken));
         }
         double worst = 0.0;
         first = 0;
@@ -303,6 +343,139 @@ void correctness(std::mt19937& rng) {
             first += t.rows;
         }
         check(worst == 0.0, "W4A4 projection within 1e-4 of the product magnitude (and every live row stored)");
+        {  // Two-term rule r2@1 (mse@1 terms, then nearest@1 terms): the quantiser bitwise against the host rule (term 1 = the one-term mse@1 image,
+           // term 2 = the image of the residual at the same row scale), the projection = the double sum over [q1 | q2] x [W | W].
+            const auto layout2 = gw::image_layout(assignments, K, 2U);
+            std::uint8_t* dimage3 = nullptr;
+            CK(cudaMalloc(&dimage3, layout2.bytes));
+            const auto image3 = gw::make_image(dimage3, assignments, K, 2U);
+            std::vector<std::uint8_t> c2(std::size_t{assignments} * K), s2(std::size_t{assignments} * K / 8U);
+            std::vector<float> r2(assignments);
+            std::vector<std::uint8_t> h2c(K / 2U), h2s(K / 16U);
+            std::vector<float> resid(K);
+            for (const bool mse : {true, false}) {  // r2@1 with mse@1 terms, then with nearest@1 terms (class nvfp4_r2)
+                const auto rule = mse ? gw::ScaleRule::mse : gw::ScaleRule::nearest;
+                CK(strix::cuda::core::grouped_w4a4::quantize(
+                    gw::QuantizeArgs<float>{dtokens, K, dindex, assignments, K, image3, nullptr, 2U}, nullptr, rule));
+                CK(cudaMemcpy(c2.data(), image3.codes, c2.size(), cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(s2.data(), image3.scales, s2.size(), cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(r2.data(), image3.row_scale, r2.size() * 4, cudaMemcpyDeviceToHost));
+                bool ok2 = true;
+                for (unsigned a = 0; a < assignments; ++a) {
+                    const float* x = tokens.data() + std::size_t{index[a]} * K;
+                    float hr;
+                    quantize_host(x, K, hc.data(), hs.data(), &hr, mse);
+                    for (unsigned q = 0; q < K / 16U; ++q) {
+                        float v[16], r[16];
+                        std::memcpy(v, x + 16U * q, sizeof v);
+                        residual_expected(v, e4m3_value(hs[q]) * hr, hc.data() + 8U * q, r);
+                        std::memcpy(resid.data() + 16U * q, r, sizeof r);
+                    }
+                    float hr2;
+                    quantize_host(resid.data(), K, h2c.data(), h2s.data(), &hr2, mse, &hr);
+                    const std::uint8_t* dc = c2.data() + std::size_t{a} * K;
+                    const std::uint8_t* ds = s2.data() + std::size_t{a} * K / 8U;
+                    ok2 = ok2 && hr == r2[a] && same_codes(hc.data(), dc, K / 2U) && same_codes(h2c.data(), dc + K / 2U, K / 2U) &&
+                          std::memcmp(hs.data(), ds, K / 16U) == 0 && std::memcmp(h2s.data(), ds + K / 16U, K / 16U) == 0;
+                }
+                check(ok2, "quantiser r2@1 (each rule) FP32 gather: scales and row scale bitwise, codes equal modulo signed zero, "
+                           "residual expected independently (literal E2M1 values, FP32 FMA)");
+                const gw::Args args2{{dtiles, static_cast<unsigned>(tiles.size()), K, kOut, nullptr, nullptr, 64U}, dbase, image3, nullptr, 2U};
+                check(gw::fits(args2) && !gw::fits(gw::Args{args2.tiles, dbase, image, nullptr, 2U}),
+                      "two-term projection admits a two-term image only");
+                CK(cudaMemset(dout, 0xff, out_bytes));
+                CK(strix::cuda::core::grouped_w4a4::launch(args2, nullptr));
+                CK(cudaMemcpy(got.data(), dout, out_bytes, cudaMemcpyDeviceToHost));
+                double worst2 = 0.0;
+                first = 0;
+                for (const auto& t : tiles_spec) {
+                    const auto& ex = experts[t.expert];
+                    for (unsigned r = 0; r < t.rows; ++r) {
+                        const unsigned a = first + r;
+                        for (unsigned o = 0; o < kOut; ++o) {
+                            const auto prow = packed::physical_row(ex.order, kOut, o);
+                            double sum = 0.0, mag = 0.0;
+                            for (unsigned k = 0; k < 2U * K; ++k) {
+                                const unsigned kw = k % K;
+                                const double wv = e2m1_value((ex.codes[prow * (K / 2U) + kw / 2U] >> (4U * (kw & 1U))) & 15U) *
+                                                  e4m3_value(ex.scales[prow * (K / 16U) + kw / 16U]);
+                                const double xv = e2m1_value((c2[std::size_t{a} * K + k / 2U] >> (4U * (k & 1U))) & 15U) *
+                                                  e4m3_value(s2[std::size_t{a} * K / 8U + k / 16U]);
+                                sum += wv * xv;
+                                mag += std::fabs(wv * xv);
+                            }
+                            const double scale = static_cast<double>(outer) * r2[a];
+                            const double want = sum * scale, bound = 1e-4 * mag * scale + 1e-30;
+                            const double err = std::fabs(static_cast<double>(got[std::size_t{a} * kOut + o]) - want);
+                            if (!(err <= bound)) {
+                                if (worst2 == 0.0)
+                                    std::printf("  r2 K %u assignment %u output %u got %.9g want %.9g\n", K, a, o,
+                                                static_cast<double>(got[std::size_t{a} * kOut + o]), want);
+                                worst2 = 1.0;
+                            }
+                        }
+                    }
+                    first += t.rows;
+                }
+                check(worst2 == 0.0, "two-term W4A4 projection within 1e-4 of the product magnitude over [q1 | q2] x [W | W]");
+                std::printf("DIGEST projection r2 %s K %u fnv1a64 %016llx\n", mse ? "mse" : "nearest", K,
+                            static_cast<unsigned long long>(fnv1a64(got.data(), out_bytes)));
+                {  // token image (one two-term row per token) + row index: bitwise the per-assignment two-term image
+                    std::uint8_t* dtok2 = nullptr;
+                    CK(cudaMalloc(&dtok2, gw::image_layout(kTokens, K, 2U).bytes));
+                    const auto timage2 = gw::make_image(dtok2, kTokens, K, 2U);
+                    CK(strix::cuda::core::grouped_w4a4::quantize(
+                        gw::QuantizeArgs<float>{dtokens, K, nullptr, kTokens, K, timage2, nullptr, 2U}, nullptr, rule));
+                    gw::Args targs2 = args2;
+                    targs2.input = timage2;
+                    targs2.row_index = dindex;
+                    CK(cudaMemset(dout, 0xff, out_bytes));
+                    CK(strix::cuda::core::grouped_w4a4::launch(targs2, nullptr));
+                    CK(cudaMemcpy(again.data(), dout, out_bytes, cudaMemcpyDeviceToHost));
+                    check(std::memcmp(got.data(), again.data(), out_bytes) == 0,
+                          "two-term token image + row index bitwise the per-assignment two-term image");
+                    CK(cudaFree(dtok2));
+                }
+            }
+            // BF16 source rows (the down input of the two-term classes), two terms with mse@1 (nvfp4_mse_r2) and nearest@1 terms
+            // (nvfp4_r2): as the rule on their FP32 widening.
+            for (const bool mse : {true, false}) {
+                CK(strix::cuda::core::grouped_w4a4::quantize(
+                    gw::QuantizeArgs<std::uint16_t>{dbrows, K, nullptr, assignments, K, image3, nullptr, 2U}, nullptr,
+                    mse ? gw::ScaleRule::mse : gw::ScaleRule::nearest));
+                CK(cudaMemcpy(c2.data(), image3.codes, c2.size(), cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(s2.data(), image3.scales, s2.size(), cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(r2.data(), image3.row_scale, r2.size() * 4, cudaMemcpyDeviceToHost));
+                bool okb = true;
+                for (unsigned a = 0; a < assignments; ++a) {
+                    const float* x = bwide.data() + std::size_t{a} * K;
+                    float hr;
+                    quantize_host(x, K, hc.data(), hs.data(), &hr, mse);
+                    for (unsigned q = 0; q < K / 16U; ++q) {
+                        float v[16], r[16];
+                        std::memcpy(v, x + 16U * q, sizeof v);
+                        residual_expected(v, e4m3_value(hs[q]) * hr, hc.data() + 8U * q, r);
+                        std::memcpy(resid.data() + 16U * q, r, sizeof r);
+                    }
+                    float hr2;
+                    quantize_host(resid.data(), K, h2c.data(), h2s.data(), &hr2, mse, &hr);
+                    const std::uint8_t* dc = c2.data() + std::size_t{a} * K;
+                    const std::uint8_t* ds = s2.data() + std::size_t{a} * K / 8U;
+                    okb = okb && hr == r2[a] && same_codes(hc.data(), dc, K / 2U) &&
+                          same_codes(h2c.data(), dc + K / 2U, K / 2U) && std::memcmp(hs.data(), ds, K / 16U) == 0 &&
+                          std::memcmp(h2s.data(), ds + K / 16U, K / 16U) == 0;
+                }
+                check(okb, mse ? "quantiser r2@1 (mse@1 terms) BF16 rows: scales bitwise, codes equal modulo signed zero, one row scale"
+                               : "quantiser r2@1 (nearest@1 terms) BF16 rows: scales bitwise, codes equal modulo signed zero, one row scale");
+            }
+            // Native admission: a base width the projection rejects (K = 64, so K x terms = 128) is refused by the quantiser.
+            const auto narrow = gw::make_image(dimage3, assignments, 64U, 2U);
+            check(strix::cuda::core::grouped_w4a4::quantize(
+                      gw::QuantizeArgs<std::uint16_t>{dbrows, K, nullptr, assignments, 64U, narrow, nullptr, 2U}, nullptr,
+                      gw::ScaleRule::mse) == cudaErrorInvalidValue && cudaGetLastError() == cudaSuccess,
+                  "quantiser refuses a two-term image of base width 64 (projection needs K % 128)");
+            CK(cudaFree(dimage3));
+        }
         std::printf("fixture K %u: %u assignments, %zu tiles checked\n", K, assignments, tiles.size());
     }
 }
@@ -400,6 +573,153 @@ void bench() {
         std::printf("BENCH %s K %u rows %u: bf16_shift %.3f ms (%.0f TFLOPS)  quant %.3f ms  w4a4 %.3f ms (%.0f TFLOPS)  ratio %.2fx\n",
                     pj.name, K, kAssign, t_bf16, 2.0 * macs / t_bf16 / 1e9, t_quant, t_w4a4, 2.0 * macs / t_w4a4 / 1e9,
                     t_bf16 / (t_w4a4 + t_quant));
+        {  // two-term rule r2@1 (mse@1 terms): quantiser + projection over [q1 | q2] x [W | W]
+            std::uint8_t* image2_bytes = nullptr;
+            CK(cudaMalloc(&image2_bytes, gw::image_layout(kAssign, K, 2U).bytes));
+            const auto image2 = gw::make_image(image2_bytes, kAssign, K, 2U);
+            const float t_quant2 = median_ms([&] {
+                CK(strix::cuda::core::grouped_w4a4::quantize(
+                    gw::QuantizeArgs<float>{tokens, K, index, kAssign, K, image2, nullptr, 2U}, nullptr, gw::ScaleRule::mse));
+            });
+            const gw::Args rargs{bargs, bf, image2, nullptr, 2U};
+            const float t_r2 = median_ms([&] { CK(strix::cuda::core::grouped_w4a4::launch(rargs, nullptr)); });
+            std::printf("BENCH-R2 %s K %u rows %u: quant_r2 %.3f ms  w4a4_r2 %.3f ms  (r2 / one term %.2fx, bf16 / r2 %.2fx)\n",
+                        pj.name, K, kAssign, t_quant2, t_r2, (t_r2 + t_quant2) / (t_w4a4 + t_quant), t_bf16 / (t_r2 + t_quant2));
+            CK(cudaFree(image2_bytes));
+        }
+        CK(cudaFree(codes));
+        CK(cudaFree(scales));
+        CK(cudaFree(tokens));
+        CK(cudaFree(bf));
+        CK(cudaFree(out));
+        CK(cudaFree(index));
+        CK(cudaFree(gathered));
+        CK(cudaFree(image_bytes));
+        CK(cudaFree(dtiles));
+    }
+}
+
+// Bench of an Inkling-class prefill chunk in the plan the dispatcher builds today: 2,048 tokens x top-8 = 16,384 assignments
+// over 128 experts with uneven loads (log-normal weights, fixed seed), each expert cut into tiles of <= 128 rows (the tall
+// plan); BF16 grouped tile (EXACT incumbent at max_tile_rows 128) vs the W4A4 tile on the same tiles. Useful MACs only.
+void ragged_bench() {
+    constexpr unsigned kExperts = 128U, kAssign = 16384U, kTokens = 2048U, kOut = 2304U, kTileCap = 128U;
+    std::mt19937 rng(20261124U);
+    std::normal_distribution<double> nd(0.0, 0.6);
+    std::vector<double> w(kExperts);
+    double sum = 0.0;
+    for (auto& x : w) sum += (x = std::exp(nd(rng)));
+    std::vector<unsigned> count(kExperts);
+    unsigned assigned = 0;
+    for (unsigned e = 0; e < kExperts; ++e) assigned += (count[e] = static_cast<unsigned>(kAssign * w[e] / sum));
+    for (unsigned e = 0; assigned < kAssign; e = (e + 1U) % kExperts, ++assigned) ++count[e];
+    unsigned max_count = 0, tiles_total = 0, empty = 0;
+    for (unsigned c : count) {
+        max_count = std::max(max_count, c);
+        tiles_total += (c + kTileCap - 1U) / kTileCap;
+        empty += c == 0U;
+    }
+    std::printf("RAGGED plan: %u assignments, %u experts (max %u rows, %u empty), %u tiles of <= %u rows\n", kAssign, kExperts,
+                max_count, empty, tiles_total, kTileCap);
+    const struct { const char* name; unsigned K; packed::RowOrder order; } projs[] = {
+        {"gate_up", 2304U, packed::RowOrder::interleaved_halves}, {"down", 1152U, packed::RowOrder::contiguous}};
+    for (const auto& pj : projs) {
+        const unsigned K = pj.K;
+        const std::size_t wcodes = std::size_t{kOut} * K / 2U, wscales = std::size_t{kOut} * K / 16U;
+        std::uint8_t *codes = nullptr, *scales = nullptr, *image_bytes = nullptr;
+        CK(cudaMalloc(&codes, wcodes * kExperts));
+        CK(cudaMalloc(&scales, wscales * kExperts));
+        fill_bytes<<<1024, 256>>>(codes, wcodes * kExperts, 7U, 0, 0);
+        fill_bytes<<<1024, 256>>>(scales, wscales * kExperts, 9U, 0x30, 0x10);
+        float *tokens = nullptr, *out = nullptr, *gathered = nullptr;
+        std::uint16_t* bf = nullptr;
+        std::uint32_t* index = nullptr;
+        CK(cudaMalloc(&tokens, std::size_t{kTokens} * K * 4U));
+        CK(cudaMalloc(&bf, std::size_t{kAssign} * K * 2U));
+        CK(cudaMalloc(&out, std::size_t{kAssign} * kOut * 4U));
+        CK(cudaMalloc(&index, kAssign * 4U));
+        CK(cudaMalloc(&gathered, std::size_t{kAssign} * K * 4U));
+        fill_floats<<<1024, 256>>>(tokens, std::size_t{kTokens} * K, 3U);
+        fill_floats<<<1024, 256>>>(gathered, std::size_t{kAssign} * K, 5U);
+        to_bf16<<<1024, 256>>>(gathered, bf, std::size_t{kAssign} * K);
+        std::vector<std::uint32_t> hindex(kAssign);
+        for (unsigned a = 0; a < kAssign; ++a) hindex[a] = (a * 2654435761U) % kTokens;
+        CK(cudaMemcpy(index, hindex.data(), kAssign * 4U, cudaMemcpyHostToDevice));
+        const auto layout = gw::image_layout(kAssign, K);
+        CK(cudaMalloc(&image_bytes, layout.bytes));
+        const auto image = gw::make_image(image_bytes, kAssign, K);
+        std::vector<view::TileRows> tiles;
+        unsigned first = 0;
+        for (unsigned e = 0; e < kExperts; ++e) {
+            const packed::PackedMatrix wm{codes + wcodes * e, scales + wscales * e, kOut, K, 0.01F, pj.order};
+            for (unsigned done = 0; done < count[e]; done += kTileCap) {
+                const unsigned rows = std::min(kTileCap, count[e] - done);
+                tiles.push_back({wm, bf + std::size_t{first} * K, out + std::size_t{first} * kOut, K, kOut, rows});
+                first += rows;
+            }
+        }
+        view::TileRows* dtiles = upload(tiles);
+        view::Args bargs{dtiles, static_cast<unsigned>(tiles.size()), K, kOut, nullptr, nullptr, kTileCap};
+        const gw::Args wargs{bargs, bf, image};
+        CK(strix::cuda::core::grouped_w4a4::quantize(gw::QuantizeArgs<float>{tokens, K, index, kAssign, K, image, nullptr}, nullptr));
+        const float t_bf16 = median_ms([&] { CK(strix::cuda::core::mma::microscaled::launch<packed::MatrixFormat::nvfp4>(bargs, nullptr)); });
+        const float t_quant = median_ms([&] {
+            CK(strix::cuda::core::grouped_w4a4::quantize(gw::QuantizeArgs<float>{tokens, K, index, kAssign, K, image, nullptr}, nullptr));
+        });
+        const float t_w4a4 = median_ms([&] { CK(strix::cuda::core::grouped_w4a4::launch(wargs, nullptr)); });
+        std::vector<float> h(std::size_t{kAssign} * kOut);
+        CK(cudaMemcpy(h.data(), out, h.size() * 4U, cudaMemcpyDeviceToHost));
+        const double macs = double(kAssign) * kOut * K;
+        std::printf("RAGGED %s K %u rows %u tiles %zu: bf16_tile %.3f ms (%.0f TFLOPS)  quant %.3f ms  w4a4 %.3f ms (%.0f TFLOPS)  "
+                    "w4a4 digest %016llx\n",
+                    pj.name, K, kAssign, tiles.size(), t_bf16, 2.0 * macs / t_bf16 / 1e9, t_quant, t_w4a4, 2.0 * macs / t_w4a4 / 1e9,
+                    static_cast<unsigned long long>(fnv1a64(h.data(), h.size() * 4U)));
+        {  // token image arm (the gate/up input of the dispatch): quantise the kTokens token rows once, the projection reads
+           // image row index[first + r]; digest equal to the per-assignment image line above.
+            const auto timage = gw::make_image(image_bytes, kTokens, K);  // kTokens < kAssign rows: fits the image bytes
+            gw::Args targs = wargs;
+            targs.input = timage;
+            targs.row_index = index;
+            const float t_tq = median_ms([&] {
+                CK(strix::cuda::core::grouped_w4a4::quantize(gw::QuantizeArgs<float>{tokens, K, nullptr, kTokens, K, timage, nullptr},
+                                                             nullptr));
+            });
+            const float t_tw = median_ms([&] { CK(strix::cuda::core::grouped_w4a4::launch(targs, nullptr)); });
+            CK(cudaMemcpy(h.data(), out, h.size() * 4U, cudaMemcpyDeviceToHost));
+            std::printf("RAGGED %s token-image K %u tokens %u: quant %.3f ms  w4a4 %.3f ms (%.0f TFLOPS)  w4a4 digest %016llx\n", pj.name,
+                        K, kTokens, t_tq, t_tw, 2.0 * macs / t_tw / 1e9, static_cast<unsigned long long>(fnv1a64(h.data(), h.size() * 4U)));
+        }
+        {  // two-term arms (one K sweep): r2@1 nearest@1 terms per assignment (the down input) and per token + row index (the
+           // gate/up input; digest equal to the per-assignment line), and the mse@1 terms' quantiser for comparison.
+            std::uint8_t* image2_bytes = nullptr;
+            CK(cudaMalloc(&image2_bytes, gw::image_layout(kAssign, K, 2U).bytes));
+            const auto image2 = gw::make_image(image2_bytes, kAssign, K, 2U);
+            const auto timage2 = gw::make_image(image2_bytes, kTokens, K, 2U);  // kTokens < kAssign rows: fits
+            const gw::Args rargs{bargs, bf, image2, nullptr, 2U};
+            gw::Args targs2 = rargs;
+            targs2.input = timage2;
+            targs2.row_index = index;
+            const auto quant2 = [&](gw::ScaleRule rule, bool token) {
+                CK(strix::cuda::core::grouped_w4a4::quantize(
+                    gw::QuantizeArgs<float>{tokens, K, token ? nullptr : index, token ? kTokens : kAssign, K, token ? timage2 : image2,
+                                            nullptr, 2U},
+                    nullptr, rule));
+            };
+            const float t_qmse = median_ms([&] { quant2(gw::ScaleRule::mse, false); });
+            const float t_qa = median_ms([&] { quant2(gw::ScaleRule::nearest, false); });
+            const float t_ra = median_ms([&] { CK(strix::cuda::core::grouped_w4a4::launch(rargs, nullptr)); });
+            CK(cudaMemcpy(h.data(), out, h.size() * 4U, cudaMemcpyDeviceToHost));
+            const auto da = fnv1a64(h.data(), h.size() * 4U);
+            const float t_qt = median_ms([&] { quant2(gw::ScaleRule::nearest, true); });
+            const float t_rt = median_ms([&] { CK(strix::cuda::core::grouped_w4a4::launch(targs2, nullptr)); });
+            CK(cudaMemcpy(h.data(), out, h.size() * 4U, cudaMemcpyDeviceToHost));
+            const auto dt = fnv1a64(h.data(), h.size() * 4U);
+            std::printf("RAGGED-R2 %s K %u rows %u: quant_mse %.3f  quant_nearest %.3f  token %.3f ms | w4a4_r2 %.3f ms (%.2fx one term)  "
+                        "token %.3f ms | digest %016llx token %016llx\n",
+                        pj.name, K, kAssign, t_qmse, t_qa, t_qt, t_ra, t_ra / t_w4a4, t_rt, static_cast<unsigned long long>(da),
+                        static_cast<unsigned long long>(dt));
+            CK(cudaFree(image2_bytes));
+        }
         CK(cudaFree(codes));
         CK(cudaFree(scales));
         CK(cudaFree(tokens));
@@ -422,6 +742,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("grouped_w4a4_cuda: PASS (quantiser bitwise FP32+BF16, projection ragged tiles K 2304/1152, deterministic)\n");
-    if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) bench();
+    if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
+        bench();
+        ragged_bench();
+    }
     return 0;
 }

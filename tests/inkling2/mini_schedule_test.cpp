@@ -481,7 +481,7 @@ int served_build_fallback() {
     auto fits = mini_build_served_decoder(8192U, 128U, true, Builder{&calls, ~0U, false, false}, log);
     if (fits.second != 8192U || fits.first != 8192U || calls != std::vector<unsigned>{8192U} || !log.str().empty())
         return fail("a default chunk that builds is served");
-    // Default chunk does not fit, incumbent does: served at 128 with a log line naming the refused chunk.
+    // Default chunk does not fit, incumbent does: the shared fallback reports the admitted chunk.
     calls.clear();
     std::pair<unsigned, unsigned> fallback{};
     try {
@@ -491,18 +491,25 @@ int served_build_fallback() {
         return 1;
     }
     if (fallback.second != 128U || fallback.first != 128U || calls != std::vector<unsigned>{8192U, 128U} ||
-        log.str().find("default prefill chunk of 8192 rows could not be built (out of memory)") == std::string::npos ||
-        log.str().find("incumbent 128-row chunk") == std::string::npos)
+        log.str().find("8192") == std::string::npos || log.str().find("128") == std::string::npos)
         return fail("a default chunk that cannot be built serves the incumbent chunk");
-    // Unreadable checkpoint: both builds fail, the incumbent build's own error propagates (not a geometry refusal).
+    // An unreadable checkpoint propagates immediately. Only an allocation failure can trigger the retry.
     calls.clear();
     try {
         (void)mini_build_served_decoder(8192U, 128U, true, Builder{&calls, ~0U, true, false}, log);
         return fail("an unreadable checkpoint is refused");
     } catch (const std::runtime_error& e) {
-        if (std::string(e.what()) != "bad checkpoint" || calls != std::vector<unsigned>{8192U, 128U})
+        if (std::string(e.what()) != "bad checkpoint" || calls != std::vector<unsigned>{8192U})
             return fail("an unreadable checkpoint keeps its own error");
     }
+    calls.clear();
+    const auto bad_alloc = mini_build_served_decoder(8192U, 128U, true, [&](unsigned rows) {
+        calls.push_back(rows);
+        if (rows > 128U) throw std::bad_alloc();
+        return rows;
+    }, log);
+    if (bad_alloc.second != 128U || calls != std::vector<unsigned>{8192U, 128U})
+        return fail("a bad_alloc retries at the incumbent chunk");
     // Explicit larger chunk (automatic false): refused with the incumbent chunk as remedy, never retried.
     calls.clear();
     try {

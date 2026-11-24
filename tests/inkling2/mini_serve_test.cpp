@@ -4,6 +4,7 @@
 #include "strix/serve/fixed_kv_cohort.hpp"
 #include "strix/serve/http_client.hpp"
 #include "strix/serve/replica_router.hpp"
+#include "../../apps/inkling2_mini_cli.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -305,8 +306,18 @@ void set_w4a4_env(const char* value) {
 #endif
 }
 
-void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
-            W4a4 w4a4 = W4a4::bf16) {
+// The served down-image lever value (process environment, as strix-serve reads it); nullptr clears it.
+void set_image_env(const char* value) {
+#ifdef _WIN32
+    require(_putenv_s("STRIX_INK_COMBINE_IMAGE", value ? value : "") == 0, "cannot set STRIX_INK_COMBINE_IMAGE");
+#else
+    require((value ? setenv("STRIX_INK_COMBINE_IMAGE", value, 1) : unsetenv("STRIX_INK_COMBINE_IMAGE")) == 0,
+            "cannot set STRIX_INK_COMBINE_IMAGE");
+#endif
+}
+
+void wiring(const char* root, bool with_sockets, const char* backend, bool qualify_q8, bool sample_capable = false,
+            W4a4 w4a4 = W4a4::bf16, bool image = false) {
     sv::ServiceFactories factories;
     bool created = false;
     bool pressure = false;
@@ -314,6 +325,8 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         require(options.checkpoint == "MODEL.safetensors", "checkpoint did not reach native adapter");
         // The served prefill runs the operand class the profile resolved, never a class-less on/off.
         require(options.moe_w4a4 == w4a4, "W4A4 operand class did not reach native adapter");
+        // The served prefill resolves the down-image lever like the CLI and the gate do: off unless selected explicitly.
+        require(options.combine_image == image, "down-image selection did not reach native adapter");
         require(options.tier == strix::profile::Name::fast && options.weight_options.qualify_q8 == qualify_q8,
                 "FAST request did not reach native adapter");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
@@ -363,7 +376,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                                "prompt_share 1 served identity incumbent form_rows 128") != std::string::npos,
                 "plain launch must keep the production prefill schedule");
         // The variant goes through the shared resolver (review r19): requested by --identity-variant ID[@VERSION],
-        // admitted on a declared backend (HIP) under a tier its row admits (also EXACT: an exact identity variant),
+        // admitted on a declared backend (HIP) only under FAST or TURBO,
         // printed with its version and reference; the CLI's chunk and tail rule. Refused before any device work: an
         // unknown id, a version this build does not declare, an undeclared backend (CUDA, no served receipt yet) and
         // the retired family-local switch.
@@ -398,9 +411,56 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             *(tier + 1) = "exact";
             const auto code = inspect_with({"--identity-variant", "served-cli-prefill"}, o, e);
             *(std::find(strings.begin(), strings.end(), "--profile") + 1) = base;
-            require(hip ? code == 0 && o.str().find("served identity served-cli-prefill@1") != std::string::npos
-                        : code != 0,
-                    "EXACT admits the exact identity variant on its declared backend only");
+            require(code != 0 && !created &&
+                        (!hip || e.str().find("is not admitted under --profile exact") != std::string::npos),
+                    "EXACT refuses the served variant before device work");
+        }
+        if (!qualify_q8) {
+            sv::SerialGenerationFamily family{};
+            family.default_prefill_chunk = mini::mini_prefill_schedule(hip).chunk;
+            family.supports_packed_decode = true;
+            family.packed_decode_default = true;
+            family.supports_speculation = true;
+            const auto parse_cli = [&](std::string_view tier, const char* form) {
+                std::vector<std::string> cli_args{"inkling", "MODEL.safetensors", "1", "--profile",
+                                                  std::string(tier), "--identity-variant", "served-cli-prefill@1", form};
+                std::vector<char*> argv;
+                for (auto& arg : cli_args) argv.push_back(arg.data());
+                return mini::cli::parse(static_cast<int>(argv.size()), argv.data(), family, backend);
+            };
+            for (const auto* tier_name : {"exact", "fast", "turbo"}) {
+                *(std::find(strings.begin(), strings.end(), "--profile") + 1) = tier_name;
+                std::ostringstream o, e;
+                const int code = inspect_with({"--identity-variant", "served-cli-prefill@1"}, o, e);
+                std::optional<mini::cli::Options> parsed;
+                try {
+                    parsed = parse_cli(tier_name, "--grouped-decode");
+                } catch (const std::invalid_argument&) {}
+                const bool admitted = hip && std::string_view(tier_name) != "exact";
+                require((code == 0) == admitted && parsed.has_value() == admitted && !created,
+                        "the native CLI parser and the served entry admit the same backend and tier");
+                if (parsed) {
+                    std::ostringstream receipt;
+                    mini::cli::write_profile(parsed->tier, receipt, true);
+                    require(!parsed->generation.packed_decode &&
+                                parsed->generation.speculation == sv::CliSpeculation::off &&
+                                receipt.str().find("\n" + parsed->tier.identity() + "\n") != std::string::npos &&
+                                o.str().find("served " + parsed->tier.identity()) != std::string::npos &&
+                                o.str().find("prefill_rows " + std::to_string(parsed->generation.prefill_chunk)) !=
+                                    std::string::npos,
+                            "the admitted CLI and server share the identity, prefill chunk and grouped continuation");
+                }
+            }
+            *(std::find(strings.begin(), strings.end(), "--profile") + 1) = "fast";
+            if (hip) {
+                bool refused = false;
+                try {
+                    (void)parse_cli("fast", "--packed-decode");
+                } catch (const std::invalid_argument& e) {
+                    refused = std::string_view(e.what()).find("requires --grouped-decode") != std::string_view::npos;
+                }
+                require(refused, "a packed continuation cannot claim the served grouped identity");
+            }
         }
         {
             struct Refusal {
@@ -610,7 +670,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
     const auto rc = run(shell, out, error);
     if (rc != 0) throw std::runtime_error(error.str());
     require(created, "selected backend was not constructed");
-    if (!qualify_q8 && (std::string_view(backend) == "hip" || sample_capable)) {
+    if (with_sockets && !qualify_q8 && (std::string_view(backend) == "hip" || sample_capable)) {
         const auto* factory = factories.find("inkling2");
         require(factory != nullptr, "Inkling service factory was not registered");
         socket_startup(*factory, backend, sample_capable);
@@ -701,22 +761,34 @@ void slot_counterfactual() {
 }
 
 int main(int argc, char** argv) try {
-    require(argc == 2, "expected repository root");
+    const bool with_sockets = argc == 2;
+    require(with_sockets || (argc == 3 && std::string_view(argv[2]) == "--no-sockets"),
+            "expected repository root [--no-sockets]");
+    set_image_env(nullptr);
     admission();
     slot_counterfactual();
     sampling();
     for (const auto* backend : {"hip", "cuda"}) {
-        wiring(argv[1], backend, false);
-        wiring(argv[1], backend, true);
+        wiring(argv[1], with_sockets, backend, false);
+        wiring(argv[1], with_sockets, backend, true);
     }
-    wiring(argv[1], "cuda", false, true);
+    wiring(argv[1], with_sockets, "cuda", false, true);
     // Every lever value reaches the served decoder as its own class (mse used to run nearest@1 there).
     for (const auto& [value, expected] : {std::pair{"1", W4a4::nvfp4}, std::pair{"mse", W4a4::nvfp4_mse},
                                           std::pair{"mse-gate-up", W4a4::nvfp4_mse_gate_up}}) {
         set_w4a4_env(value);
-        wiring(argv[1], "cuda", false, false, expected);
+        wiring(argv[1], with_sockets, "cuda", false, false, expected);
     }
     set_w4a4_env(nullptr);
+    // Default off (no profile selects it); an explicit selection reaches the adapter, an explicit 0 keeps it off.
+    set_image_env(nullptr);
+    wiring(argv[1], with_sockets, "hip", false);
+    set_image_env("1");
+    for (const auto* backend : {"hip", "cuda"})
+        wiring(argv[1], with_sockets, backend, false, false, W4a4::bf16, true);
+    set_image_env("0");
+    wiring(argv[1], with_sockets, "hip", false);
+    set_image_env(nullptr);
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

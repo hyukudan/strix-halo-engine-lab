@@ -6,7 +6,7 @@
 // 129 rows (both sides of the 16-row warp slice and of the 128-row query tile), for comparing two builds case by case.
 // Every launch is checked (a failed launch exits rc 2); outputs start as a sentinel (again before the second split
 // launch) and every live element must be written and finite;
-// the blocks are checked against the double reference on sampled rows. --inject-unwritten skips the 17-row launch (negative
+// the blocks are checked against the double reference on sampled rows and must repeat bitwise after re-poisoning. --inject-unwritten skips the 17-row launch (negative
 // control: the run must FAIL).
 // The one-row flash also runs with the swz3 pipe (three stages, prefetch distance 2): its digest must equal the pad2 one
 // (layouts change addresses, never arithmetic) and TIME reports both pipes with GB/s of the unique K/V bytes walked.
@@ -16,7 +16,7 @@
 // refused launch exits rc 3 with no device work). --check-args stops after that check: a kit dry run proves the arguments
 // without touching the GPU.
 // Usage: cuda_core_decode_split_bench [--iters N] [--check-only] [--check-args] [--inject-unwritten] [--inject-stale]
-//        [--inject-nonfinite]
+//        [--inject-nonfinite] [--inject-stale-rows] (skip only the repeated 17-row launch; must FAIL)
 #include "strix/cuda_core/attention.hpp"
 #include "strix/attention_split_plan.hpp"
 
@@ -41,6 +41,7 @@ constexpr unsigned kHeads = 24, kKv = 8, kDim = 128, kExtent = 1024;
 constexpr float kScale = 0.08838834764831845f;
 bool g_fail = false;
 bool g_inject_unwritten = false;
+bool g_inject_stale_rows = false;  // negative control: only the second 17-row launch is skipped
 bool g_inject_stale = false;     // negative control: the second split launch is skipped
 bool g_inject_nonfinite = false;  // negative control: the same infinity in every one-row output
 constexpr std::uint32_t kSentinel = 0xffffffffU;  // a NaN no kernel stores
@@ -298,6 +299,7 @@ void run_case(const Case& c, int iters, bool check_only) {
     std::size_t rows_text_len = 0;
     double err_rows = 0, scale_rows = 0;
     std::size_t miss_rows = 0;
+    bool rows_det = true;
     for (const unsigned rows : kBlockRows) {
         unsigned long long rows_bits = 0ULL;
         const bool fits = block_fits(c, rows);
@@ -315,14 +317,20 @@ void run_case(const Case& c, int iters, bool check_only) {
             dsr.put(hsr);
             outr.poison();
             const cc::PreparedBf16Flash prepared_rows{dbr.p, dsr.p, kExtent, c.window, c.wrapped, false};
-            if (!(g_inject_unwritten && rows == 17U))
-                check(cc::attention_prefill_prepared_bf16(dims, prepared_rows, dqr.p, kb, vb, pos0, rows, outr.p, nullptr,
-                                                          cc::FlashPipe::pad2, nullptr),
-                      "flash rows");
-            check(cudaDeviceSynchronize(), "sync rows");
+            const auto launch_rows = [&](bool repeat) {
+                if (!(rows == 17U && (g_inject_unwritten || (repeat && g_inject_stale_rows))))
+                    check(cc::attention_prefill_prepared_bf16(dims, prepared_rows, dqr.p, kb, vb, pos0, rows, outr.p,
+                                                             nullptr, cc::FlashPipe::pad2, nullptr), "flash rows");
+                check(cudaDeviceSynchronize(), "sync rows");
+            };
+            launch_rows(false);
             const auto out = outr.get();
-            miss_rows += unwritten(out, live);
-            bad += nonfinite(out, live);
+            outr.poison();
+            launch_rows(true);
+            const auto repeat = outr.get();
+            miss_rows += unwritten(out, live) + unwritten(repeat, live);
+            bad += nonfinite(out, live) + nonfinite(repeat, live);
+            rows_det = rows_det && std::memcmp(out.data(), repeat.data(), live * sizeof(float)) == 0;
             rows_bits = fnv(out);
             // double reference on the rows next to each boundary and on the last row (this case's own position)
             const unsigned sample[] = {15U, 16U, 127U, 128U, rows - 1U};
@@ -371,7 +379,7 @@ void run_case(const Case& c, int iters, bool check_only) {
     }
     // BF16 Q and P operands: a few 1e-3 of the output scale; 2e-2 (or 8x the one-row flash error) only rejects wrong rows.
     const double bound_rows = std::max(2e-2 * std::max(scale_rows, 1e-3), 8.0 * err_flash);
-    ok = ok && miss_rows == 0 && bad == 0 && std::isfinite(err_rows) && err_rows <= bound_rows;
+    ok = ok && rows_det && miss_rows == 0 && bad == 0 && std::isfinite(err_rows) && err_rows <= bound_rows;
     if (!ok) g_fail = true;
     std::printf("SPLIT %s pos=%u window=%u wrapped=%d splits=%u chunk=%u err_split=%.3e err_flash=%.3e ref_scale=%.3e det=%s "
                 "bits=%016llx flash_bits=%016llx swz3=%s err_rows=%.3e unwritten=%zu nonfinite=%zu rows=%s %s\n",
@@ -461,6 +469,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--check-args")) args_only = true;
         else if (!std::strcmp(argv[i], "--inject-unwritten")) g_inject_unwritten = true;
         else if (!std::strcmp(argv[i], "--inject-stale")) g_inject_stale = true;
+        else if (!std::strcmp(argv[i], "--inject-stale-rows")) g_inject_stale_rows = true;
         else if (!std::strcmp(argv[i], "--inject-nonfinite")) g_inject_nonfinite = true;
         else {
             std::printf("unknown option %s\n", argv[i]);

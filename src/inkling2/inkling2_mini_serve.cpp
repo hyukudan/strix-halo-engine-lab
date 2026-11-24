@@ -58,8 +58,6 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
         else if (name == "--context") out.context = static_cast<unsigned>(number(name, value, kMaxContext));
         else if (name == "--prefill-rows" || name == "--prefill-chunk")  // one spelling with the CLI; the old one kept
             out.prefill_rows_requested = static_cast<unsigned>(number(name, value, 65535U));
-        else if (name == profile::kIdentityVariantOption)  // the shared request: admitted by resolve_mini_profile
-            profile::request_variant(kMiniProfile, out.weight_options.tier, value, profile::VariantOrigin::cli);
         else if (name == "--prefill-rows-decoding")
             out.prefill_rows_decoding = static_cast<unsigned>(number(name, value, 65535U));
         else if (name == "--prefill-gap-ms" || name == "--prompt-share") {
@@ -78,12 +76,13 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
             if (value != "off") throw std::invalid_argument("Inkling serving requires --speculation off");
         } else throw std::invalid_argument("unknown Inkling argument " + std::string(name));
     }
-    // The backend first: an identity variant is admitted per declared backend (profile::admit_variants).
+    // The shared profile resolver checks the variant against the selected backend and tier.
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     out.weight_options.tier.backend = std::string(resolved.backend);
     const auto resolution = resolve_mini_profile(out.weight_options, true);
     out.tier = resolution.profile;
     out.moe_w4a4 = mini_moe_w4a4_class(resolution);
+    out.combine_image = mini_combine_image(resolution);
     // The served identity: the admitted variant only (Resolution::selected), else the incumbent.
     out.served_identity = resolution.selected(kMiniServedCliPrefill) ? MiniServedIdentity::cli_prefill
                                                                       : MiniServedIdentity::incumbent;

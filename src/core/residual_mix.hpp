@@ -319,6 +319,35 @@ inline bool fits(const TransitionArgs& args) {
     return true;
 }
 
+struct LowRankController {
+    unsigned width;
+    unsigned rank;
+    unsigned message_count;
+    float epsilon;
+    bool round_operands_bf16;
+    bool round_latent_bf16;
+
+    constexpr std::size_t scratch_elements_per_row() const {
+        return 4U * std::size_t{width} + rank;
+    }
+
+    constexpr std::size_t scratch_elements(unsigned rows) const {
+        return rows * scratch_elements_per_row();
+    }
+
+    // The down operand of one row: the normalised raw row and one normalised readout, independent of message_count
+    // (the number of readout banks).
+    constexpr std::size_t down_operand_elements() const {
+        return std::size_t{kLowRankDownRows} * width;
+    }
+
+    // One-plane admission of the controller's operands from the weight maxima (core/dense_row_plan.hpp). Holds for
+    // finite residual rows only; message_count plays no part.
+    bool operands_bounded(float down_max, float gate_max) const {
+        return low_rank_operands_bounded(width, rank, down_max, gate_max);
+    }
+};
+
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #if defined(__HIPCC__)
 using Error = hipError_t;
@@ -888,23 +917,6 @@ inline Error launch_capture_message_bank(std::span<const ConstRows> inputs, std:
     return success;
 }
 
-struct LowRankController {
-    unsigned width;
-    unsigned rank;
-    unsigned message_count;
-    float epsilon;
-    bool round_operands_bf16;
-    bool round_latent_bf16;
-
-    constexpr std::size_t scratch_elements_per_row() const {
-        return 4U * std::size_t{width} + rank;
-    }
-
-    constexpr std::size_t scratch_elements(unsigned rows) const {
-        return rows * scratch_elements_per_row();
-    }
-};
-
 struct ControllerWeights {
     ConstRows query;
     const std::uint16_t* down;
@@ -952,7 +964,7 @@ void enqueue_low_rank_controller_tail(LowRankController plan, ControllerWeights 
     const auto conditioned = scratch.subspan(3U * elements, elements);
     const auto latent = scratch.subspan(4U * elements, std::size_t{rows} * plan.rank);
     const auto width = plan.width;
-    const auto stride = 2U * width;
+    const auto stride = kLowRankDownRows * width;
     const detail::NormalizePair normalize{{
         {raw.data(), operands.data(), rows, width, plan.epsilon, width, stride, plan.round_operands_bf16},
         {message.data(), operands.data() + width, rows, width, plan.epsilon, width, stride, plan.round_operands_bf16},
@@ -991,9 +1003,19 @@ void enqueue_low_rank_controller_tail(LowRankController plan, ControllerWeights 
         detail::normalize_pair<<<grid, detail::kThreads, 0, stream>>>(
             normalize.operands[0], normalize.operands[1]);
         operations.check(detail::last_error());
-        operations.dense(operands.data(), stride, rows, down);
+        dense_declared(operations, operands.data(), stride, rows, down, plan.round_operands_bf16);
     }
     const Bf16RowProjection gates[] = {{weights.forget, width, forget.data()}, {weights.gain, width, gain.data()}};
+    // A backend may run the gate pair, the controller and the final norm as one row-owner launch that stores the
+    // conditioned rows straight into output and normalizes them there (same bits as the launches below; the
+    // conditioned scratch rows are not used). It returns false where it does not admit the shape.
+    if constexpr (requires {
+                      { operations.dense_controller_rms(latent.data(), plan.rank, rows, gates,
+                                                        ControllerArgs{}, weights.norm) } -> std::same_as<bool>;
+                  }) {
+        const ControllerArgs owned{raw.data(), message.data(), nullptr, nullptr, output.data(), elements};
+        if (operations.dense_controller_rms(latent.data(), plan.rank, rows, gates, owned, weights.norm)) return;
+    }
     // A backend may run the gate pair with the controller as its epilogue (conditioned straight from the two FP32
     // sums: same bits, no forget / gain image). It returns false where it does not admit the shape.
     const ControllerArgs control{raw.data(), message.data(), forget.data(), gain.data(), conditioned.data(), elements};
@@ -1001,7 +1023,7 @@ void enqueue_low_rank_controller_tail(LowRankController plan, ControllerWeights 
     if constexpr (requires { { operations.dense_controller(latent.data(), plan.rank, rows, gates, control) } -> std::same_as<bool>; })
         fused = operations.dense_controller(latent.data(), plan.rank, rows, gates, control);
     if (!fused) {
-        operations.dense(latent.data(), plan.rank, rows, gates);
+        dense_declared(operations, latent.data(), plan.rank, rows, gates, plan.round_latent_bf16);
         operations.check(launch_controller(control, stream));
     }
     operations.rms(conditioned.data(), weights.norm, output.data(), rows);

@@ -32,12 +32,15 @@ inline MiniServeCohort make_mini_device_cohort(
                                row_limit);
     const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, opt.weight_options);
     const auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view());
+    bool down_image = false;
     const auto build = [&](unsigned chunk) {
+        const auto tail = mini_admitted_tail_capacity(
+            chunk, mini_prefill_tail_capacity(chunk, opt.prefill_tail_divisor, opt.context),
+            [](unsigned enlarged) { return MiniResidentBackend::admits_chunk_rows(enlarged); });
         auto built = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, chunk, false,
-            MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows,
-            mini_prefill_tail_capacity(chunk, opt.prefill_tail_divisor, opt.context));
+            MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows, tail);
         built->set_served_identity(opt.served_identity, opt.form_rows);
-        built->set_moe_w4a4(opt.moe_w4a4);
+        down_image = configure_mini_decoder(*built, opt.moe_w4a4, opt.combine_image);
         return built;
     };
     const auto incumbent_rows = std::min(kMiniServeDefaultSlotRows, opt.prefill_rows);
@@ -91,6 +94,7 @@ inline MiniServeCohort make_mini_device_cohort(
               << " KV and history bytes per slot " << slot_bytes
               << " profile " << mini_profile_name(opt.tier)
               << " moe_prefill " << moe_core::grouped_w4a4::identity(opt.moe_w4a4)
+              << " down_image " << mini_down_image_name(down_image, opt.combine_image)
               << " weight_storage " << weights.storage.name << '@' << weights.storage.revision
 #if !defined(__HIPCC__)
               << " cohort_programs " << (programs.enabled ? "on" : "off")

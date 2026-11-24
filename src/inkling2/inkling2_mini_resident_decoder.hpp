@@ -66,12 +66,9 @@ public:
     using Rows = std::span<const unsigned>;
     enum class LogitRows { all };
 
-    // tail_rows: the capacity a prefill call's final chunk may take beyond max_chunk_rows, admitted when it keeps the
-    // bits of the greedy schedule (mini_prefill_tail_rows: the tail takes the same route forms in both schedules and
-    // the enlarged chunk passes the device admission). Each call then absorbs its ACTUAL remainder only when that
-    // remainder passes the same rule (call_tail_rows); otherwise it runs as its own chunk. The device chunk capacity
-    // is max_chunk_rows + the admitted capacity. Only the HIP routes are qualified; CUDA keeps
-    // greedy chunks.
+    // On HIP the CLI supplies the actual prompt remainder. Serving supplies its admitted tail capacity and checks the
+    // remainder of each call separately. The decoder allocates the requested enlargement only if the row forms and
+    // device limits admit it. CUDA keeps greedy chunks.
     MiniResidentDecoder(const std::string& checkpoint, unsigned max_positions, unsigned max_chunk_rows,
                         bool packed_decode = false, bool step_graphs = MiniResidentBackend::default_step_graphs,
                         weight::FormatId storage = weight::kBf16WeightStorage, unsigned verify_rows = 0U,
@@ -123,9 +120,7 @@ public:
         backend_.abandon_capture();
         auto& state = slots_.front()->state();
         validate_inputs(state, prompt, logits);
-        return state.append_sequence(prompt, [&](std::span<const unsigned> chunk, bool last) {
-            return append(state, chunk, last, last ? logits : std::span<float>{});
-        }, prefill_rows_, call_tail_rows(prompt.size()));
+        return prefill_text(state, prompt, logits, tail_rows_);
     }
 
     // Prefill whose `splice` rows (e.g. the projected rows of an image) replace the looked-up rows. They pass
@@ -145,7 +140,7 @@ public:
             const auto first = static_cast<std::uint64_t>(chunk.data() - prompt.data());
             const auto part = splice.slice(first, first + chunk.size());
             return append(state, chunk, last, last ? logits : std::span<float>{}, MiniAppendKind::prefill, {}, &part);
-        }, prefill_rows_, call_tail_rows(prompt.size()));  // the per-call tail rule of prefill()
+        }, prefill_rows_, tail_rows_);
     }
 
     [[nodiscard]] unsigned decode(unsigned token, std::span<float> logits = {}) try {
@@ -215,9 +210,7 @@ public:
         auto& state = slots_.at(slot)->state();
         validate_inputs(state, ids, {});
         last_logit_rows_ = 0U;
-        const auto token = state.append_sequence(ids, [&](std::span<const unsigned> chunk, bool last) {
-            return append(state, chunk, last, {}, MiniAppendKind::prefill, {}, nullptr, last);
-        }, prefill_rows_, call_tail_rows(ids.size()));
+        const auto token = prefill_text(state, ids, {}, call_tail_rows(ids.size()), true);
         last_logit_rows_ = 1U;
         return token;
     }
@@ -434,6 +427,9 @@ public:
     // Resolved operand class of the FAST W4A4 expert lever (mini_moe_w4a4_class; bf16 = off); set once after
     // construction. No bool form: a bool would drop the class and run nearest@1 for mse / mse-gate-up.
     void set_moe_w4a4(moe_core::grouped_w4a4::Activations activations) { backend_.set_moe_w4a4(activations); }
+    // Resolved exact down-image lever (mini_combine_image); set once after construction. True when the image route is
+    // active (HIP, qualified target); every entry point that resolves the profile passes the resolved state.
+    bool set_combine_image(bool selected) { return backend_.set_combine_image(selected); }
     [[nodiscard]] std::uint64_t gate_null_applications() const { return backend_.gate_null_applications(); }
 
     void prefill_gate_rows(std::span<const unsigned> prompt, std::span<float> logits) {
@@ -703,6 +699,14 @@ private:
         staged_logits_size_ = elements;
     }
 
+    [[nodiscard]] unsigned prefill_text(MiniResidentSessionState& state, std::span<const unsigned> ids,
+                                        std::span<float> logits, unsigned tail, bool keep_scores = false) {
+        return state.append_sequence(ids, [&](std::span<const unsigned> chunk, bool last) {
+            return append(state, chunk, last, last ? logits : std::span<float>{},
+                          MiniAppendKind::prefill, {}, nullptr, last && keep_scores);
+        }, prefill_rows_, tail);
+    }
+
     [[nodiscard]] unsigned append(MiniResidentSessionState& state, std::span<const unsigned> ids, bool pick_next,
                                   std::span<float> host_logits, MiniAppendKind kind = MiniAppendKind::prefill,
                                   std::span<unsigned> verify_top = {}, const session::EmbedSplice* splice = nullptr,
@@ -808,8 +812,7 @@ private:
         project_head(pending.input, std::span<float>(pending.scores, kOutputVocabulary), true);
     }
 
-    // The tail one prefill call of `rows` rows absorbs (mini_call_tail_rows on its actual remainder, within the
-    // admitted capacity): the same rule for prefill() and the served prefill_slot_first() calls.
+    // Resolve the actual remainder of the served call within the admitted tail capacity.
     [[nodiscard]] unsigned call_tail_rows(std::size_t rows) const noexcept {
 #if defined(__HIPCC__)
         return mini_call_tail_rows(rows, prefill_rows_, tail_rows_,
@@ -820,11 +823,10 @@ private:
 #endif
     }
 
-    // The largest capacity <= tail_rows the device admits (a capacity whose full enlargement fails is cut, not dropped).
     static unsigned admitted_tail_rows(unsigned chunk_rows, unsigned tail_rows) noexcept {
 #if defined(__HIPCC__)
-        return mini_admitted_tail_capacity(chunk_rows, tail_rows,
-                                           [](unsigned enlarged) { return MiniResidentBackend::admits_chunk_rows(enlarged); });
+        if (tail_rows == 0U) return 0U;
+        return mini_prefill_tail_rows(chunk_rows, tail_rows, MiniResidentBackend::admits_chunk_rows(chunk_rows + tail_rows));
 #else
         (void)chunk_rows;
         (void)tail_rows;

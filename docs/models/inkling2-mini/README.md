@@ -184,12 +184,13 @@ For the incumbent identity, `--slots` caps admission under the memory budget.
 With no explicit slot cap, it uses the requested prefill rows or 128, clipped to
 the context. A budget that holds zero slots is refused.
 
-HIP serving accepts the explicit `--identity-variant served-cli-prefill@1`.
-Its reference is the CLI with `--grouped-decode`. It feeds the whole prompt
+HIP serving accepts the explicit `--identity-variant served-cli-prefill@1`
+under `--profile fast` or `--profile turbo`. Select the same variant in the
+HIP CLI with `--grouped-decode --speculation off`. It feeds the whole prompt
 through prefill, including a one-token prompt, and selects the first generated
 token from its last prefill row. The shared profile resolver records the version
-and reference. CUDA retains the incumbent route. Served raw-score and canonical
-state qualification is pending for the HIP variant.
+and reference. EXACT and CUDA refuse the variant. Served raw-score and
+canonical state qualification is pending for the HIP variant.
 
 The HIP variant and explicit interleave controls can cut a prefill chunk while
 other lanes decode. `--prefill-rows-decoding` sets the piece size, and

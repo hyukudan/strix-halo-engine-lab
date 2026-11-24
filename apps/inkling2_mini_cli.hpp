@@ -31,8 +31,10 @@ struct Options {
     profile::Resolution tier;
 };
 
-inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily& family) {
+inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily& family,
+                     std::string_view backend = {}) {
     Options options;
+    options.weights.tier.backend = backend;
     options.generation = serve::parse_serial_generation_cli(argc, argv, family,
         [&](std::string_view argument, const auto& value) {
             if (parse_mini_weight_option(options.weights, argument, value, family.default_prefill_chunk != 0))
@@ -82,6 +84,13 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
                  generation.sampling_requested))
         throw std::invalid_argument("gate mode takes no prompt, --tokenize, --generate, --logits or sampling options");
     options.tier = resolve_mini_profile(options.weights, !generation.tokenize_file);
+    if (options.tier.selected(kMiniServedCliPrefill)) {
+        if (gate || generation.tokenize_file || options.dspark || generation.packed_decode ||
+            (generation.speculation != serve::CliSpeculation::automatic &&
+             generation.speculation != serve::CliSpeculation::off))
+            throw std::invalid_argument("served-cli-prefill requires --grouped-decode and generation without speculation");
+        options.generation.speculation = serve::CliSpeculation::off;
+    }
     if (options.gate_order_null && (!gate || options.tier.profile != profile::Name::standard))
         throw std::invalid_argument("--gate-order-null requires an exact gate arm");
     return options;
@@ -103,7 +112,7 @@ inline StepProgramOptions extract_step_program(std::vector<char*>& args) {
     constexpr std::string_view value_options[]{
         "--generate", "--logits", "--temperature", "--top-k", "--top-p", "--min-p", "--seed", "--prompt", "--messages",
         "--tokenize", "--tokenizer", "--prefill-chunk", "--profile", "--gate-manifest", "--gate-out",
-        "--gate-arm", "--gate-rows", "--gate-mode", "--dspark", "--speculation",
+        "--gate-arm", "--gate-rows", "--gate-mode", "--dspark", "--speculation", profile::kIdentityVariantOption,
     };
     StepProgramOptions options;
     auto output = args.begin() + 2;
@@ -185,6 +194,7 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
 inline void write_profile(const profile::Resolution& tier, std::ostream& output, bool device) {
     output << tier.summary() << (device ? " reference BASE\n" : "\n");
     if (const auto notice = tier.tier_notice(); !notice.empty()) output << notice << '\n';
+    if (!tier.incumbent_identity()) output << tier.identity() << '\n';
 }
 
 inline void write_weight_load_plan(std::ostream& output, const weight::WeightLoadPlan& plan) {

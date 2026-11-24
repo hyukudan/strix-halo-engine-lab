@@ -14,17 +14,45 @@ namespace strix::core {
 
 #if defined(__HIPCC__)
 namespace detail {
-template <unsigned Bucket>
+template <unsigned Bucket, weight_decode::Format Format = weight_decode::Format::q8_0>
 void launch_q8_tight_rows(dense_linear::View weights, const float* input, float* output,
                          unsigned rows, row_transforms::Stream stream) {
     constexpr unsigned tile = Bucket <= 8U ? 2U : 4U;
     constexpr unsigned block_outputs = 4U * tile;
-    dense_linear::kernel<Bucket, tile, weight_decode::Format::q8_0, dense_linear::Epilogue::store_tight_rows>
+    dense_linear::kernel<Bucket, tile, Format, dense_linear::Epilogue::store_tight_rows>
         <<<(weights.outputs + block_outputs - 1U) / block_outputs, 128, 0, stream>>>(
             weights, weights, input, output, rows);
 }
+template <weight_decode::Format Format>
+row_transforms::Status launch_lowbit_rows(dense_linear::View weights, const float* input, float* output,
+                                         unsigned rows, row_transforms::Stream stream) {
+    if (rows == 1U) launch_q8_tight_rows<1, Format>(weights, input, output, rows, stream);
+    else if (rows <= 2U) launch_q8_tight_rows<2, Format>(weights, input, output, rows, stream);
+    else if (rows <= 4U) launch_q8_tight_rows<4, Format>(weights, input, output, rows, stream);
+    else if (rows <= 8U) launch_q8_tight_rows<8, Format>(weights, input, output, rows, stream);
+    else launch_q8_tight_rows<16, Format>(weights, input, output, rows, stream);
+    return hipGetLastError();
+}
 }  // namespace detail
 #endif
+
+// Low-bit resident rows (q4_g64 / q6_g64) on the same dense rows family: one launch of the real row count, every row
+// of the window shares one weight read. HIP only today; the CUDA dense family has no decoder for these storages.
+inline row_transforms::Status enqueue_resident_lowbit_rows(
+    const weight::ResidentMatrixView& matrix, unsigned live_outputs, const float* input,
+    unsigned rows, float* output, row_transforms::Stream stream) {
+    if (!valid_resident_lowbit_rows(matrix, live_outputs, input, rows, output)) return row_transforms::invalid;
+#if defined(__HIPCC__)
+    const dense_linear::View weights{matrix.bytes.data(), static_cast<unsigned>(matrix.columns), live_outputs,
+                                     static_cast<std::size_t>(matrix.row_bytes)};
+    return matrix.storage == weight::kQ4G64WeightStorage
+               ? detail::launch_lowbit_rows<weight_decode::Format::q4_g64>(weights, input, output, rows, stream)
+               : detail::launch_lowbit_rows<weight_decode::Format::q6_g64>(weights, input, output, rows, stream);
+#else
+    (void)stream;
+    return row_transforms::invalid;
+#endif
+}
 
 // Bind compact resident weights to the native dense family. Only live output
 // rows are projected. The caller owns the activation/output BF16 boundaries.
@@ -36,6 +64,8 @@ inline row_transforms::Status enqueue_resident_q8_rows(
     , cuda_core::BigCtx* context = nullptr
 #endif
 ) {
+    if (matrix.storage == weight::kQ4G64WeightStorage || matrix.storage == weight::kQ6G64WeightStorage)
+        return enqueue_resident_lowbit_rows(matrix, live_outputs, input, rows, output, stream);
     if (!valid_resident_q8_rows(matrix, live_outputs, input, rows, output)) return row_transforms::invalid;
 
     const auto width = static_cast<unsigned>(matrix.columns);
