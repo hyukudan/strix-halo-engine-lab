@@ -114,41 +114,84 @@ bool check_rows_order(unsigned units, unsigned blocks, unsigned tile) {
 int main() {
     static_assert(r1::rows_chunk_count(1U) == 1U && r1::rows_chunk_count(r1::kMaxRows) == 1U);
     static_assert(r1::rows_chunk_count(r1::kMaxRows + 1U) == 2U && r1::rows_chunk_count(16U) == 2U);
-    // Tile policy on the Inkling-shaped gate_up (intermediate 1152, hidden 2304, top-8, 2 columns per wave): below
-    // min_rows the (block, unit) order; else the largest tile whose span fits the cache budget.
+    // Tile policy on the Inkling-shaped gate_up (intermediate 1152, hidden 2304, top-8, 2 columns per wave): the
+    // largest tile whose span fits the measured budget; no budget keeps the (block, unit) order.
     using packed = strix::weight::microscaled::MatrixFormat;
-    // A plan holds only for the device and expert shape it was measured on: any other architecture, multiprocessor
-    // count or shape has none (the launch order stays).
-    constexpr auto plan = r1::rows_tiles_for("gfx1151", 20U, 2304U, 1152U, 8U);
-    static_assert(plan.min_rows == 4U && plan.cache_bytes == (std::uint64_t{24U} << 20U));
-    static_assert(r1::rows_tiles_for("gfx1151:sramecc-:xnack-", 20U, 2304U, 1152U, 8U).cache_bytes == plan.cache_bytes);
-    static_assert(r1::rows_tiles_for("gfx1201", 20U, 2304U, 1152U, 8U).cache_bytes == 0U);
-    static_assert(r1::rows_tiles_for("", 20U, 2304U, 1152U, 8U).cache_bytes == 0U);
-    static_assert(r1::rows_tiles_for("gfx1151", 16U, 2304U, 1152U, 8U).cache_bytes == 0U);
-    static_assert(r1::rows_tiles_for("gfx1151", 20U, 4096U, 1152U, 8U).cache_bytes == 0U);
-    static_assert(r1::rows_tiles_for("gfx1151", 20U, 2304U, 1536U, 8U).cache_bytes == 0U);
-    static_assert(r1::rows_tiles_for("gfx1151", 20U, 2304U, 1152U, 4U).cache_bytes == 0U);
-    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 2U, 8U, 2U, plan).tile == 72U);
-    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 4U, 8U, 2U, plan).tile == 18U);
-    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 8U, 8U, 2U, plan).tile == 9U);
-    static_assert(r1::gate_up_rows_order<packed::mxfp8>(1152U, 2304U, 8U, 8U, 2U, plan).tile == 5U);
-    static_assert(r1::gate_up_rows_order<packed::mxfp8>(1152U, 2304U, 4U, 8U, 2U, plan).tile == 10U);
-    // No plan (a device without a measured plan) and a single block's span above the budget keep the launch order.
-    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 8U, 8U, 2U, r1::kNoRowsTiles).tile == 72U);
-    static_assert(r1::rows_order(64U, 72U, 8U, (std::uint64_t{1U} << 20U), plan).tile == 72U);
-    static_assert(r1::rows_order(64U, 72U, 8U, (std::uint64_t{24U} << 20U) / 64U, plan).tile == 1U);
-    // The one-dimensional rows grid stays within the CTA limit and the 32-bit X work-item extent, else the launch
-    // takes the 2D one-row kernels: with 256 work-items per CTA the last legal grid is 0xFFFFFF CTAs (one CTA more is
-    // exactly 2^32 work-items), e.g. 8 rows x top-32 = 256 units of 65535 blocks pass, of 65536 blocks do not.
-    constexpr unsigned threads = 256U;
+    namespace tiles = strix::r1_rows_tiles;
+    // A plan holds only for the workload it was measured on (strix/r1_rows_tiles.hpp): gfx1151 / 20 WGPs, 128 experts,
+    // 2304 x 1152, top-8, NVFP4 or MXFP8, rows 4 and 8. Every other key or row count resolves to the incumbent order.
+    constexpr auto budget = [](std::string_view arch, unsigned mp, packed format, unsigned experts, unsigned hidden,
+                               unsigned intermediate, unsigned top_k, unsigned rows) {
+        return tiles::gate_up_cache_bytes(arch, mp, format, experts, hidden, intermediate, top_k, rows);
+    };
+    constexpr std::uint64_t mib24 = std::uint64_t{24U} << 20U;
+    static_assert(budget("gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 4U) == mib24);
+    static_assert(budget("gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 8U) == mib24);
+    static_assert(budget("gfx1151:sramecc-:xnack-", 20U, packed::mxfp8, 128U, 2304U, 1152U, 8U, 8U) == mib24);
+    // Row counts: 1 / 2 measured without gain, 3 / 5 / 6 / 7 not measured, 9+ past the table.
+    for (unsigned rows : {0U, 1U, 2U, 3U, 5U, 6U, 7U, 9U, 16U}) {
+        for (packed format : {packed::nvfp4, packed::mxfp8}) {
+            if (budget("gfx1151", 20U, format, 128U, 2304U, 1152U, 8U, rows) != 0U) {
+                std::printf("FAIL rows %u has a tile plan\n", rows);
+                return 1;
+            }
+        }
+    }
+    // Every other key field: architecture, multiprocessors, bank size (the review's 256-expert bank), hidden,
+    // intermediate, top_k.
+    static_assert(budget("gfx1201", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 8U) == 0U);
+    static_assert(budget("", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 8U) == 0U);
+    static_assert(budget("gfx1151", 16U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 8U) == 0U);
+    static_assert(budget("gfx1151", 20U, packed::nvfp4, 256U, 2304U, 1152U, 8U, 8U) == 0U);
+    static_assert(budget("gfx1151", 20U, packed::nvfp4, 64U, 2304U, 1152U, 8U, 8U) == 0U);
+    static_assert(budget("gfx1151", 20U, packed::nvfp4, 128U, 4096U, 1152U, 8U, 8U) == 0U);
+    static_assert(budget("gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1536U, 8U, 8U) == 0U);
+    static_assert(budget("gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1152U, 4U, 8U) == 0U);
+    // Uncovered -> the incumbent order (tile == blocks: CTA i = (i / blocks, i % blocks)).
+    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 5U, 8U, 2U,
+                                                         budget("gfx1151", 20U, packed::nvfp4, 128U, 2304U, 1152U, 8U, 5U))
+                      .tile == 72U);
+    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 8U, 8U, 2U,
+                                                         budget("gfx1151", 20U, packed::nvfp4, 256U, 2304U, 1152U, 8U, 8U))
+                      .tile == 72U);
+    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 2U, 8U, 2U, 0U).tile == 72U);
+    // Covered -> the measured tiles.
+    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 4U, 8U, 2U, mib24).tile == 18U);
+    static_assert(r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, 8U, 8U, 2U, mib24).tile == 9U);
+    static_assert(r1::gate_up_rows_order<packed::mxfp8>(1152U, 2304U, 8U, 8U, 2U, mib24).tile == 5U);
+    static_assert(r1::gate_up_rows_order<packed::mxfp8>(1152U, 2304U, 4U, 8U, 2U, mib24).tile == 10U);
+    // A single block's span above the budget keeps the launch order.
+    static_assert(r1::rows_order(64U, 72U, (std::uint64_t{1U} << 20U), mib24).tile == 72U);
+    static_assert(r1::rows_order(64U, 72U, mib24 / 64U, mib24).tile == 1U);
+    // Launch grids, every form, 64-bit: x <= 0x7FFFFFFF CTAs, y <= 0xFFFF CTAs, <= 0xFFFFFFFF work-items per axis. With
+    // 256 work-items per CTA the last legal x is 0xFFFFFF CTAs (one CTA more is exactly 2^32 work-items).
+    constexpr unsigned threads = r1::kBlockThreads;
+    static_assert(threads == 256U);
+    static_assert(r1::grid_launchable(0xFFFFFFU, 1U, threads) && !r1::grid_launchable(0x1000000U, 1U, threads));
+    static_assert(r1::grid_launchable(0x7FFFFFFFU, 1U, 1U) && !r1::grid_launchable(0x80000000U, 1U, 1U));
+    static_assert(r1::grid_launchable(1U, 0xFFFFU, threads) && !r1::grid_launchable(1U, 0x10000U, threads));
+    static_assert(!r1::grid_launchable(0U, 1U, threads) && !r1::grid_launchable(1U, 0U, threads));
+    // The flat rows grid (units x blocks on x) falls back to the 2D form past these limits.
     static_assert(r1::rows_order_launchable({64U, 72U, 9U}, threads));
     static_assert(r1::rows_order_launchable({1U, 0xFFFFFFU, 1U}, threads));
     static_assert(!r1::rows_order_launchable({1U, 0x1000000U, 1U}, threads));
     static_assert(r1::rows_order_launchable({256U, 65535U, 65535U}, threads));
     static_assert(!r1::rows_order_launchable({256U, 65536U, 65536U}, threads));
-    static_assert(r1::rows_order_launchable({1U, 0x7FFFFFFFU, 1U}, 1U));
-    static_assert(!r1::rows_order_launchable({2U, 0x40000000U, 1U}, 1U));
     static_assert(!r1::rows_order_launchable({256U, 16777217U, 16777217U}, threads));
+    // The 2D forms (gate (gate_blocks, rows x top_k), down (down_blocks, rows)): a legal fallback is admitted, an
+    // unrepresentable one refused. gate_blocks(intermediate, 2) = intermediate / 16: 268,435,440 -> 0xFFFFFF blocks
+    // (x = 2^32 - 256 work-items), 268,435,456 -> 2^24 blocks (exactly 2^32 work-items: the review's NVFP4 rows 2,
+    // top-1, hidden 32 call).
+    constexpr r1::Geometry g = r1::kGeometry;
+    static_assert(r1::rows_grids_launchable(32U, 268435440U, 2U, 1U, g, threads));
+    static_assert(!r1::rows_grids_launchable(32U, 268435456U, 2U, 1U, g, threads));
+    // The r12 example (8 rows, top-32, intermediate 1,048,576): flat grid refused, the 2D fallback (65,536 x 256) legal.
+    static_assert(!r1::rows_order_launchable(r1::gate_up_rows_order<packed::nvfp4>(1048576U, 2304U, 8U, 32U, 2U, 0U),
+                                             threads));
+    static_assert(r1::rows_grids_launchable(2304U, 1048576U, 8U, 32U, g, threads));
+    // down_blocks(hidden, 4) = hidden / 4: hidden 67,108,800 -> 0xFFFFF0 blocks pass, 67,108,864 -> 2^24 refused.
+    static_assert(r1::rows_grids_launchable(67108800U, 1152U, 1U, 8U, g, threads));
+    static_assert(!r1::rows_grids_launchable(67108864U, 1152U, 1U, 8U, g, threads));
     unsigned failures = check_wrap_edge() ? 0U : 1U;
     for (unsigned units : {1U, 2U, 3U, 8U, 16U, 64U}) {
         for (unsigned blocks : {1U, 5U, 72U, 576U}) {
@@ -162,8 +205,8 @@ int main() {
         }
     }
     for (unsigned rows = 1; rows <= r1::kMaxRows; ++rows) {
-        const auto nv = r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, rows, 8U, 2U, plan);
-        const auto mx = r1::gate_up_rows_order<packed::mxfp8>(1152U, 2304U, rows, 8U, 2U, plan);
+        const auto nv = r1::gate_up_rows_order<packed::nvfp4>(1152U, 2304U, rows, 8U, 2U, mib24);
+        const auto mx = r1::gate_up_rows_order<packed::mxfp8>(1152U, 2304U, rows, 8U, 2U, mib24);
         if (!check_rows_order(nv.units, nv.blocks, nv.tile) || !check_rows_order(mx.units, mx.blocks, mx.tile)) {
             std::printf("FAIL rows order policy rows %u\n", rows);
             ++failures;

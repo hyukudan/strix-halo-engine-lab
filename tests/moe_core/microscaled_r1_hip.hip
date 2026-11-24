@@ -294,7 +294,7 @@ void launch_part(const Bank& bank, const Buffers& b, unsigned rows, unsigned set
     if (part == 1U) {
         const auto one = r1::gate_up_grid(kFfn, rows, kTopK, d::kGateColumns);
         const auto many = r1::gate_up_rows_order<F>(kFfn, kHidden, rows, kTopK, d::kGateColumns,
-                                                    d::current_rows_tiles(kHidden, kFfn, kTopK));
+                                                    d::current_rows_cache_bytes(F, args, kTopK, rows));
         const unsigned lds = r1::staged_input_bytes<F>(kHidden);
         if (rows == 1U) d::gate_up<F, kTopK><<<dim3(one.x, one.y), d::kThreads, lds>>>(args);
         else d::gate_up_rows<F, kTopK><<<many.units * many.blocks, d::kThreads, lds>>>(args, many);

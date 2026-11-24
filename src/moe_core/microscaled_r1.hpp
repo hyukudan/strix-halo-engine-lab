@@ -7,6 +7,7 @@
 #include "moe_core/r1_route.hpp"
 #include "moe_core/r1_tail.hpp"
 #include "strix/exec/descriptor.hpp"
+#include "strix/r1_rows_tiles.hpp"
 
 #include <array>
 #include <cmath>
@@ -109,14 +110,6 @@ STRIX_R1_HD constexpr RowOffsets row_offsets(unsigned row, unsigned hidden, unsi
             std::size_t{row} * hidden};
 }
 
-template <packed::MatrixFormat Format, unsigned TopK>
-inline bool fits_rows(const Args& a, unsigned rows) {
-    return rows >= 1U && rows <= kMaxRows && fits<Format, TopK>(a) &&
-           std::uint64_t{rows} * TopK * a.intermediate <=
-               std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t) &&
-           std::uint64_t{rows} * a.hidden <= std::numeric_limits<unsigned>::max();
-}
-
 // Tail legality against an R1 launch: the tail's own plan rules (r1_tail::admits) plus range checks against the
 // launch's buffers. No tail store may touch any byte of the stored MoE output rows (the exact incumbent rows, written
 // by other CTAs), of the input rows or, with top_k != 0, of the activation rows every CTA reads. No tail input may
@@ -178,18 +171,6 @@ inline bool admits_route(const Args& args, const r1_route::Inline<Policy, Math, 
            !r1_tail::overlap(writes[1], writes[2]);
 }
 
-// Expert-union launches (gate_up_union / down_union): rows <= MaxRows <= r1_route::kMaxUnionRows routed rows laid out
-// as a rows launch (row_offsets), the experts as a shared presence mask (r1_route::kMaxUnionExperts), the assignments
-// of one expert in passes of at most MaxRows inputs.
-template <packed::MatrixFormat Format, unsigned TopK, unsigned MaxRows>
-inline bool fits_union(const Args& a, unsigned rows) {
-    static_assert(MaxRows >= 1U && MaxRows <= r1_route::kMaxUnionRows && MaxRows * TopK <= 256U);
-    return rows >= 1U && rows <= MaxRows && a.experts <= r1_route::kMaxUnionExperts && fits<Format, TopK>(a) &&
-           std::uint64_t{rows} * TopK * a.intermediate <=
-               std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t) &&
-           std::uint64_t{rows} * a.hidden <= std::numeric_limits<unsigned>::max();
-}
-
 // Launch geometry. A wave owns `columns` consecutive outputs and streams their rows together (gate_up: the gate and
 // up rows of each column; down_combine: one row per column per routed expert). Each row keeps its own accumulator,
 // lane->K mapping and butterfly, so the column count changes no output bit. It sets how many rows share one wave's
@@ -225,6 +206,52 @@ STRIX_R1_HD constexpr unsigned gate_first_column(unsigned block, unsigned wave, 
     return (block * kWavesPerBlock + wave) * columns;
 }
 STRIX_R1_HD constexpr unsigned down_blocks(unsigned hidden, unsigned columns) { return (hidden - 1U) / columns + 1U; }
+
+// Launch-grid limits every backend accepts (their intersection): at most 0x7FFFFFFF CTAs on x (HIP, CUDA) and 0xFFFF
+// on y (CUDA), and at most 0xFFFFFFFF work-items per axis (HIP holds each axis's extent in work-items in 32 bits, the
+// dispatch packet's grid_size_x / grid_size_y). Every R1 launch form (the flat rows grid, the two-dimensional gate_up /
+// down_combine / step grids, the union grids) is checked in 64 bits before anything is enqueued; a call no form can
+// represent is refused with an invalid-value status (the incumbent two-dimensional grids had the same limits).
+inline constexpr std::uint64_t kMaxGridX = 0x7FFFFFFFU;
+inline constexpr std::uint64_t kMaxGridY = 0xFFFFU;
+inline constexpr std::uint64_t kMaxAxisWorkItems = 0xFFFFFFFFU;
+// Work-items of one CTA: kWavesPerBlock waves of 32 lanes (wave32 HIP, CUDA warps; the devices launch() admits).
+inline constexpr unsigned kBlockThreads = 32U * kWavesPerBlock;
+STRIX_R1_HD constexpr bool grid_launchable(std::uint64_t x, std::uint64_t y, unsigned threads) {
+    return x >= 1U && y >= 1U && x <= kMaxGridX && y <= kMaxGridY && x * threads <= kMaxAxisWorkItems &&
+           y * threads <= kMaxAxisWorkItems;
+}
+// The two-dimensional rows grids of a geometry: gate_up (gate_blocks, rows x TopK) and down_combine (down_blocks, rows).
+STRIX_R1_HD constexpr bool rows_grids_launchable(unsigned hidden, unsigned intermediate, unsigned rows, unsigned top_k,
+                                                 const Geometry& geometry, unsigned threads) {
+    return grid_launchable(gate_blocks(intermediate, geometry.gate_columns), std::uint64_t{rows} * top_k, threads) &&
+           grid_launchable(down_blocks(hidden, geometry.down_columns), rows, threads);
+}
+
+template <packed::MatrixFormat Format, unsigned TopK>
+inline bool fits_rows(const Args& a, unsigned rows) {
+    return rows >= 1U && rows <= kMaxRows && fits<Format, TopK>(a) &&
+           std::uint64_t{rows} * TopK * a.intermediate <=
+               std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t) &&
+           std::uint64_t{rows} * a.hidden <= std::numeric_limits<unsigned>::max() &&
+           rows_grids_launchable(a.hidden, a.intermediate, rows, TopK, kGeometry, kBlockThreads);
+}
+
+// Expert-union launches (gate_up_union / down_union): rows <= MaxRows <= r1_route::kMaxUnionRows routed rows laid out
+// as a rows launch (row_offsets), the experts as a shared presence mask (r1_route::kMaxUnionExperts), the assignments
+// of one expert in passes of at most MaxRows inputs. Grids: gate (gate_blocks, union_groups), down (down_blocks, 1).
+template <packed::MatrixFormat Format, unsigned TopK, unsigned MaxRows>
+inline bool fits_union(const Args& a, unsigned rows) {
+    static_assert(MaxRows >= 1U && MaxRows <= r1_route::kMaxUnionRows && MaxRows * TopK <= 256U);
+    constexpr auto geometry = kUnionGeometry<MaxRows>;
+    return rows >= 1U && rows <= MaxRows && a.experts <= r1_route::kMaxUnionExperts && fits<Format, TopK>(a) &&
+           std::uint64_t{rows} * TopK * a.intermediate <=
+               std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t) &&
+           std::uint64_t{rows} * a.hidden <= std::numeric_limits<unsigned>::max() &&
+           grid_launchable(gate_blocks(a.intermediate, geometry.gate_columns),
+                           r1_route::union_groups(rows, TopK, a.experts), kBlockThreads) &&
+           grid_launchable(down_blocks(a.hidden, geometry.down_columns), 1U, kBlockThreads);
+}
 // HIP gate_up input staging. Every wave of a gate_up CTA reads the same input row and rounds each value to BF16 before
 // its FMAs; the CTA instead rounds the row once into LDS (the same input_bf16 values, as FP32) and the waves read them
 // there. Layout: value v sits at v + kStagedInputPad * (v / chunk), chunk = one lane's code chunk (32 NVFP4 / 16 MXFP8
@@ -286,60 +313,22 @@ STRIX_R1_HD constexpr RowsCta rows_cta(const RowsOrder& order, unsigned linear) 
     const unsigned inner = linear - full * span;
     return {inner / width, full * order.tile + inner % width};
 }
-// Tile plan of a (device, expert shape): the cache budget a tile's span must fit and the first row count that takes
-// tiles. A plan is measured data and holds only for the device and expert shape it was measured on; any other device
-// or shape keeps the (block, unit) order (kNoRowsTiles).
-struct RowsTiles {
-    std::uint64_t cache_bytes;
-    unsigned min_rows;
-};
-inline constexpr RowsTiles kNoRowsTiles{0U, 0U};
-// Plan key: arch = the HIP architecture name without feature suffix (gcnArchName up to ':'), multiprocessors = the
-// runtime's multiProcessorCount (work-group processors on RDNA: 20 for a 40-CU gfx1151), then the expert shape.
-struct DeviceRowsTiles {
-    std::string_view arch;
-    unsigned multiprocessors, hidden, intermediate, top_k;
-    RowsTiles tiles;
-};
-// gfx1151 with 20 WGPs (32 MiB last-level cache), hidden 2304 x intermediate 1152, top-8. Measured on the no-model
-// fixture tests/moe_core/microscaled_r1_hip.hip (128 experts, rows 1 / 2 / 4 / 8, NVFP4 and MXFP8, digests equal):
-// a 24 MiB budget is the best measured; with tiles rows 2 is slower, rows 4 and 8 faster (gate_up NVFP4 rows 8
-// -12.8 %).
-inline constexpr DeviceRowsTiles kDeviceRowsTiles[] = {
-    {"gfx1151", 20U, 2304U, 1152U, 8U, {std::uint64_t{24U} << 20U, 4U}},
-};
-// The measured plan of (architecture name as the runtime reports it, e.g. "gfx1151:sramecc-:xnack-", multiprocessor
-// count, expert shape), or kNoRowsTiles.
-constexpr RowsTiles rows_tiles_for(std::string_view arch, unsigned multiprocessors, unsigned hidden,
-                                   unsigned intermediate, unsigned top_k) {
-    const auto name = arch.substr(0U, arch.find(':'));
-    for (const auto& device : kDeviceRowsTiles) {
-        if (device.arch == name && device.multiprocessors == multiprocessors && device.hidden == hidden &&
-            device.intermediate == intermediate && device.top_k == top_k) {
-            return device.tiles;
-        }
-    }
-    return kNoRowsTiles;
-}
-// Tile policy: the largest tile whose span (units x tile CTAs of `cta_bytes` weight bytes) fits the plan's cache
-// budget, from its min_rows rows on. No plan, fewer rows, a span that fits whole, or a single block's span above the
-// budget keep the (block, unit) order (tile = blocks).
-STRIX_R1_HD constexpr RowsOrder rows_order(unsigned units, unsigned blocks, unsigned rows, std::uint64_t cta_bytes,
-                                           const RowsTiles& plan) {
-    if (plan.cache_bytes == 0U || rows < plan.min_rows) return {units, blocks, blocks};
+// Tile policy: the largest tile whose span (units x tile CTAs of `cta_bytes` weight bytes) fits `cache_bytes`, the
+// measured budget of the launch's (device, bank, format, row count) (strix/r1_rows_tiles.hpp; 0 = no measured plan).
+// No plan, a span that fits whole, or a single block's span above the budget keep the (block, unit) order
+// (tile = blocks).
+STRIX_R1_HD constexpr RowsOrder rows_order(unsigned units, unsigned blocks, std::uint64_t cta_bytes,
+                                           std::uint64_t cache_bytes) {
+    if (cache_bytes == 0U) return {units, blocks, blocks};
     const std::uint64_t span = std::uint64_t{units} * (cta_bytes == 0U ? 1U : cta_bytes);
-    const std::uint64_t fit = plan.cache_bytes / span;
+    const std::uint64_t fit = cache_bytes / span;
     if (fit == 0U || fit >= blocks) return {units, blocks, blocks};
     return {units, blocks, static_cast<unsigned>(fit)};
 }
-// The rows launch runs units x blocks CTAs of `threads` work-items on a one-dimensional grid. HIP takes a grid of at
-// most 0x7FFFFFFF CTAs per dimension and holds the X extent in work-items in 32 bits (the dispatch packet's
-// grid_size_x); a grid past either limit takes the two-dimensional one-row kernels instead (the same bits).
-inline constexpr std::uint64_t kMaxLinearCtas = 0x7FFFFFFFU;
-inline constexpr std::uint64_t kMaxLinearWorkItems = 0xFFFFFFFFU;
+// The rows launch runs units x blocks CTAs on a one-dimensional grid (grid_launchable(units x blocks, 1)); a grid it
+// cannot represent takes the two-dimensional one-row kernels instead (the same bits), which fits_rows has admitted.
 STRIX_R1_HD constexpr bool rows_order_launchable(const RowsOrder& order, unsigned threads) {
-    const std::uint64_t ctas = std::uint64_t{order.units} * order.blocks;
-    return ctas <= kMaxLinearCtas && ctas * threads <= kMaxLinearWorkItems;
+    return grid_launchable(std::uint64_t{order.units} * order.blocks, 1U, threads);
 }
 // Weight bytes one gate_up CTA reads: kWavesPerBlock waves x `columns` gate and up rows of `hidden` values each.
 template <packed::MatrixFormat Format>
@@ -350,9 +339,9 @@ STRIX_R1_HD constexpr std::uint64_t gate_up_cta_bytes(unsigned hidden, unsigned 
 }
 template <packed::MatrixFormat Format>
 STRIX_R1_HD constexpr RowsOrder gate_up_rows_order(unsigned intermediate, unsigned hidden, unsigned rows,
-                                                   unsigned top_k, unsigned columns, const RowsTiles& plan) {
-    return rows_order(rows * top_k, gate_blocks(intermediate, columns), rows,
-                      gate_up_cta_bytes<Format>(hidden, columns), plan);
+                                                   unsigned top_k, unsigned columns, std::uint64_t cache_bytes) {
+    return rows_order(rows * top_k, gate_blocks(intermediate, columns), gate_up_cta_bytes<Format>(hidden, columns),
+                      cache_bytes);
 }
 // Weight row read by output slot i of a wave whose first column is col; `live` columns remain in the matrix.
 // Slots past the live columns re-read the first valid row (their results are never stored).
@@ -410,6 +399,7 @@ namespace gemv = core::gemv_rows;
 inline constexpr unsigned kWarp = gemv::wave_size;
 inline constexpr unsigned kWarps = kWavesPerBlock;
 inline constexpr unsigned kThreads = kWarp * kWarps;
+static_assert(kThreads == kBlockThreads, "fits_rows checks the grids at kBlockThreads work-items per CTA");
 #if defined(__HIPCC__)
 // HIP launch bounds express the occupancy target in waves per execution unit.
 inline constexpr unsigned kMinWavesPerEu = 8;
@@ -1261,9 +1251,11 @@ __global__ __launch_bounds__(kThreads, kMinWavesPerEu) void down_combine_rows(Ar
     down_combine_row<Format, TopK, DownColumns, true>(args);
 }
 
-// The measured tile plan (rows_tiles_for) of the calling thread's current device for an expert shape. The device key
-// (architecture name, multiprocessor count) is read once per device.
-inline RowsTiles current_rows_tiles(unsigned hidden, unsigned intermediate, unsigned top_k) {
+// The measured tile budget (strix/r1_rows_tiles.hpp gate_up_cache_bytes) of the calling thread's current device for a
+// launch's format, bank and row count, or 0 (incumbent order). The device key (architecture name, multiprocessor
+// count) is read once per device.
+inline std::uint64_t current_rows_cache_bytes(packed::MatrixFormat format, const Args& args, unsigned top_k,
+                                              unsigned rows) {
     struct Key {
         std::array<char, sizeof(hipDeviceProp_t::gcnArchName)> arch{};
         unsigned multiprocessors = 0U;
@@ -1272,7 +1264,7 @@ inline RowsTiles current_rows_tiles(unsigned hidden, unsigned intermediate, unsi
     static std::array<std::once_flag, kDevices> once;
     static std::array<Key, kDevices> keys{};
     int device = 0;
-    if (hipGetDevice(&device) != hipSuccess || device < 0 || device >= kDevices) return kNoRowsTiles;
+    if (hipGetDevice(&device) != hipSuccess || device < 0 || device >= kDevices) return 0U;
     const auto index = static_cast<std::size_t>(device);
     std::call_once(once[index], [device, index] {
         hipDeviceProp_t properties{};
@@ -1283,7 +1275,8 @@ inline RowsTiles current_rows_tiles(unsigned hidden, unsigned intermediate, unsi
         keys[index].multiprocessors = static_cast<unsigned>(properties.multiProcessorCount);
     });
     const Key& key = keys[index];
-    return rows_tiles_for(std::string_view{key.arch.data()}, key.multiprocessors, hidden, intermediate, top_k);
+    return r1_rows_tiles::gate_up_cache_bytes(std::string_view{key.arch.data()}, key.multiprocessors, format,
+                                              args.experts, args.hidden, args.intermediate, top_k, rows);
 }
 
 // The HIP gate-up launch of launch() and launch_tail(): every HIP gate_up / gate_up_rows launch passes
@@ -1293,10 +1286,10 @@ template <packed::MatrixFormat Format, unsigned TopK>
 inline hipError_t enqueue_gate_up(const Args& args, hipStream_t stream, unsigned rows) {
     const unsigned columns = gate_blocks(args.intermediate, kGateColumns);
     const unsigned staged = staged_input_bytes<Format>(args.hidden);
-    const auto plan = rows == 1U ? kNoRowsTiles : current_rows_tiles(args.hidden, args.intermediate, TopK);
+    const auto budget = rows == 1U ? std::uint64_t{0U} : current_rows_cache_bytes(Format, args, TopK, rows);
     const auto order = rows == 1U ? RowsOrder{}
                                   : gate_up_rows_order<Format>(args.intermediate, args.hidden, rows, TopK,
-                                                               kGateColumns, plan);
+                                                               kGateColumns, budget);
     if (rows == 1U || !rows_order_launchable(order, kThreads)) {
         gate_up<Format, TopK><<<dim3(columns, rows * TopK), kThreads, staged, stream>>>(args);
     } else {
@@ -1415,7 +1408,9 @@ inline cudaError_t enqueue_step(const StepArgs& args, cudaStream_t stream) {
     static_assert(Rows <= 16U && session::is_step_replay_width(Rows));
     const auto& a = args.batch;
     constexpr auto limit = std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t);
-    if (!args.step || !fits<Format, TopK>(a) || a.intermediate > limit / Rows / TopK) return cudaErrorInvalidValue;
+    if (!args.step || !fits<Format, TopK>(a) || a.intermediate > limit / Rows / TopK ||
+        !rows_grids_launchable(a.hidden, a.intermediate, Rows, TopK, kGeometry, detail::kThreads))
+        return cudaErrorInvalidValue;
     if constexpr (GateUp) {
         const auto grid = gate_up_grid(a.intermediate, Rows, TopK, detail::kGateColumns);
         detail::gate_up_step<Format, TopK><<<dim3(grid.x, grid.y), detail::kThreads, 0, stream>>>(args);
