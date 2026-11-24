@@ -115,6 +115,9 @@ struct SerialGenerationFamily {
     // its chunk ends with one chunk that also takes a remainder of up to chunk / prefill_tail_divisor rows instead of
     // a short extra chunk (prefill_tail_rows). Zero = greedy chunks.
     std::uint32_t prefill_tail_divisor = 0;
+    // Chunk the implicit default falls back to when the decoder fails to allocate it (never an explicit --prefill-chunk);
+    // zero: no fallback. See prefill_chunk_fallback.hpp.
+    std::uint32_t prefill_chunk_fallback = 0;
 };
 
 // Tail rows for a prompt of prompt_size rows in chunks of `chunk` (already clamped to the prompt): the remainder after
@@ -134,6 +137,7 @@ struct SerialGenerationOptions {
     const char* tokenize_file{};
     const char* logits{};
     std::uint32_t generate{}, prefill_chunk{};
+    bool prefill_chunk_explicit{};
     bool packed_decode{};
     bool generate_requested{}, sampling_requested{};
     TokenSamplingPolicy sampling;
