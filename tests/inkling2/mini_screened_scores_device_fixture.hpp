@@ -5,7 +5,8 @@
 // score row). Reference: the full head through decode(token, host logits), which never screens. Sampling is the
 // shared sample_token_row with a fixed policy and fixed uniforms, so both runs sample the same ids exactly when
 // their scores agree. Covers a lane sampled alone from the first step, and a lane sampled alone after a packed
-// cohort step and after another lane's greedy step (whose scores are never read and never projected).
+// cohort step and after another lane's greedy step (whose scores are never read: projected only on the routes that
+// do not screen, see screened_route).
 
 #include "inkling2/inkling2_mini_resident_decoder.hpp"
 #include "strix/token_sampling.hpp"
@@ -69,6 +70,16 @@ inline void check_step(const char* where, unsigned step, std::span<const float> 
 template<class Decoder>
 std::optional<bool> scores_deferred(const Decoder& decoder) {
     if constexpr (requires { decoder.scores_deferred(); }) return decoder.scores_deferred();
+    else return std::nullopt;
+}
+
+// Whether a lone lane on `slot` steps through append() (the one route that picks through the screened head), as the
+// decoder's own dispatch decides it (cohort_program_width); no value on a decoder without that query.
+template<class Decoder>
+std::optional<bool> screened_route(const Decoder& decoder, unsigned slot) {
+    const std::array<unsigned, 1> slots{slot};
+    if constexpr (requires { decoder.cohort_program_width(std::span<const unsigned>(slots)); })
+        return decoder.cohort_program_width(std::span<const unsigned>(slots)) == 0U;
     else return std::nullopt;
 }
 
@@ -136,11 +147,22 @@ inline void screened_scores(const char* checkpoint, weight::FormatId storage) {
         const unsigned sampled = 1U - greedy;
         if (step_lane(decoder, greedy, reference.ids[step]) != reference.top[step])
             throw std::runtime_error("greedy lane: step " + std::to_string(step) + " pick differs from the full head");
-        // A screened greedy pick projects no score row (the BF16 head screens unless STRIX_SCREENED_HEAD=0).
+        // The contract (shared with the serve side, CohortGroup::reads_scores): a lane whose scores are read gets the
+        // full-head row of its own step (check_step on every read); a greedy lane nobody reads from may keep its
+        // screened pick without a row. Only a lone lane stepping through append() picks through the screened head
+        // (the BF16 head screens unless STRIX_SCREENED_HEAD=0); a CUDA lone lane off slot 0 replays the width-1
+        // cohort program, which projects the full row. So: deferred exactly when the pick took the screened route.
         const auto deferred = scores_deferred(decoder);
-        if (deferred && *deferred != screening)
-            throw std::logic_error(std::string("greedy lane: score row ") + (*deferred ? "deferred" : "projected") +
-                                   " with the screened head " + (screening ? "on" : "off"));
+        const auto route = screened_route(decoder, greedy);
+        if (deferred && route) {
+            const bool expected = screening && *route;
+            if (*deferred != expected)
+                throw std::logic_error("greedy lane: step " + std::to_string(step) + " slot " +
+                                       std::to_string(greedy) + ": score row " +
+                                       (*deferred ? "deferred" : "projected") + " with the screened head " +
+                                       (screening ? "on" : "off") + " on the " +
+                                       (*route ? "screened (append)" : "cohort program") + " route");
+        }
         const auto top = step_lane(decoder, sampled, reference.ids[step]);
         decoder.read_slot_logits(0U, scores);
         check_step("sampled lane after a greedy lane", step, scores, top, reference);

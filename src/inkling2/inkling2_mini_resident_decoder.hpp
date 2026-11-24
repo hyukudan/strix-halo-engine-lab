@@ -284,6 +284,20 @@ public:
     [[nodiscard]] detail::MiniResidentScreen& step_program_screen() noexcept { return screen_; }
 #endif
 
+    // Width of the cohort decode program a decode_slots() call on these slots replays (CUDA), 0 when its lanes step
+    // through append() instead: every HIP batch, the lone slot-0 lane (its one-row step graph) and DSpark tap capture.
+    // Only append() picks through the screened head (no score row until the first read); a cohort program projects
+    // the full score row of every lane. Either way a score read gets the full-head row of its own step.
+    [[nodiscard]] unsigned cohort_program_width(std::span<const unsigned> slots) const {
+#if defined(__HIPCC__)
+        (void)slots;
+        return 0U;
+#else
+        if (!draft_taps_.span().empty() || (slots.size() == 1U && slots.front() == 0U)) return 0U;
+        return cohort_policy_.width(static_cast<std::uint32_t>(slots.size()), decode_rows_);
+#endif
+    }
+
     // Batched lanes run one forward (grouped) or passes of at most kCohortPassRows lanes (packed: every row keeps
     // single-row decode arithmetic, so a lane matches its own decode() stream). With DSpark tap capture on,
     // lanes step one at a time so each committed position records its taps.
@@ -302,12 +316,9 @@ public:
 #if !defined(__HIPCC__)
         // A cohort decode program per width (captured once, replayed for any slots and positions). The lone
         // slot-0 lane keeps its one-row step graph; DSpark taps step lanes one at a time.
-        if (draft_taps_.span().empty() && !(slots.size() == 1U && slots.front() == 0U)) {
-            const auto width = cohort_policy_.width(static_cast<std::uint32_t>(slots.size()), decode_rows_);
-            if (width != 0U) {
-                decode_cohort(slots, ids, top, width);
-                return;
-            }
+        if (const auto width = cohort_program_width(slots); width != 0U) {
+            decode_cohort(slots, ids, top, width);
+            return;
         }
 #endif
         if (groups_.size() == 1U || draft_taps_.span().size() != 0U) {
