@@ -144,7 +144,7 @@ r1_rows_tiles::DeviceTable parse_r1_rows_tiles(const std::string& name, const Va
     }
     const auto* mib = std::get_if<Value::Array>(&required("cache_mib").data);
     if (!mib || mib->empty() || mib->size() > r1_rows_tiles::table_rows)
-        bad(key + ".cache_mib", "expected one budget per row count 0 .. 8 (at most 9 values)");
+        bad(key + ".cache_mib", "expected one budget per row count 0 .. 16 (at most 17 values)");
     for (std::size_t rows = 0; rows < mib->size(); ++rows) {
         const auto n = integer((*mib)[rows], key + ".cache_mib");
         if (n > (std::uint64_t{1} << 20U)) bad(key + ".cache_mib", "budget above 1 TiB");

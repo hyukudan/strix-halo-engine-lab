@@ -2,10 +2,15 @@
 // (128 experts, top-8, hidden 2304, ffn 1152, NVFP4 and MXFP8):
 //   check: for 1..8 rows under uniform, skewed and 100 %-collision routes (plus a failed row, an invalid id and
 //          non-finite / subnormal inputs), every row of a rows launch equals a one-row launch of that row bit for bit;
+//          then (own random stream, so the 1..8 digests stay comparable with older builds) 9..16 rows as ONE launch
+//          (kMaxLaunchRows), each row equal to its one-row launch and the whole output equal to launch_rows' default
+//          stream-ordered chunks of kMaxRows rows;
 //   digest: one FNV-1a line per case over the output and activation words, so two builds of this file (two trees)
 //           compare by diffing their digest lines;
-//   bench (--bench): ms per launch (whole launch, gate_up only, down_combine only) at 1 / 2 / 4 / 8 rows. Each timed
-//          launch takes the next of 16 route sets, so consecutive launches read different experts.
+//   bench (--bench): ms per launch (whole launch, gate_up only, down_combine only) at 1 / 2 / 4 / 8 / 12 / 16 rows;
+//          above kMaxRows also "chnk" (launch_rows' default chunks of kMaxRows rows, the incumbent cohort launch) and
+//          "untl" (the one launch in the incumbent (block, unit) start order). Each timed launch takes the next of 16
+//          route sets, so consecutive launches read different experts.
 // Exit 0 only when every check passes.
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
@@ -29,7 +34,7 @@ namespace packed = strix::weight::microscaled;
 using Expert = strix::moe_core::device_grouped::ExpertWeights;
 using packed::MatrixFormat;
 
-constexpr unsigned kExperts = 128U, kTopK = 8U, kHidden = 2304U, kFfn = 1152U, kRowsMax = r1::kMaxRows;
+constexpr unsigned kExperts = 128U, kTopK = 8U, kHidden = 2304U, kFfn = 1152U, kRowsMax = r1::kMaxLaunchRows;
 constexpr unsigned kSets = 16U;
 
 #define CHECK_HIP(x)                                                                                    \
@@ -221,6 +226,26 @@ bool run_case(const Bank& bank, Buffers& b, unsigned rows, Mode mode, unsigned v
     if (r1::launch<F, kTopK>(b.args(bank.matrices), nullptr, rows) != hipSuccess) return false;
     const auto out = fetch(b.output, std::size_t{rows} * kHidden);
     const auto act = fetch(b.activation, std::size_t{rows} * kTopK * kFfn);
+    if (rows > r1::kMaxRows) {
+        // The incumbent cohort launch: stream-ordered chunks of kMaxRows rows (default scratch). Same output words.
+        poison(b);
+        if (r1::launch_rows<F, kTopK>(b.args(bank.matrices), nullptr, rows) != hipSuccess) return false;
+        const auto chunked = fetch(b.output, std::size_t{rows} * kHidden);
+        if (std::memcmp(chunked.data(), out.data(), sizeof(float) * out.size()) != 0) {
+            std::fprintf(stderr, "%s FAIL rows %u mode %s variant %u: one launch differs from kMaxRows chunks\n", name,
+                         rows, mode_name(mode), variant);
+            return false;
+        }
+        poison(b);
+        if (r1::launch_rows<F, kTopK>(b.args(bank.matrices), nullptr, rows, r1::kMaxLaunchRows) != hipSuccess)
+            return false;
+        const auto whole = fetch(b.output, std::size_t{rows} * kHidden);
+        if (std::memcmp(whole.data(), out.data(), sizeof(float) * out.size()) != 0) {
+            std::fprintf(stderr, "%s FAIL rows %u mode %s variant %u: launch_rows(scratch %u) differs\n", name, rows,
+                         mode_name(mode), variant, r1::kMaxLaunchRows);
+            return false;
+        }
+    }
     std::uint64_t h = fnv(0xCBF29CE484222325ULL, out.data(), sizeof(float) * out.size());
     h = fnv(h, act.data(), sizeof(std::uint16_t) * act.size());
     all = fnv(all, &h, sizeof(h));
@@ -265,10 +290,11 @@ bool run_case(const Bank& bank, Buffers& b, unsigned rows, Mode mode, unsigned v
 }
 
 template <MatrixFormat F>
-bool check(const Bank& bank, Buffers& b, std::mt19937& rng, const char* name) {
+bool check(const Bank& bank, Buffers& b, std::mt19937& rng, const char* name, unsigned first_rows = 1U,
+           unsigned last_rows = r1::kMaxRows) {
     unsigned cases = 0U;
     std::uint64_t all = 0xCBF29CE484222325ULL;
-    for (unsigned rows = 1U; rows <= kRowsMax; ++rows) {
+    for (unsigned rows = first_rows; rows <= last_rows; ++rows) {
         for (Mode mode : {Mode::uniform, Mode::skewed, Mode::collide}) {
             for (unsigned variant = 0; variant < 4U; ++variant) {
                 if (!run_case<F>(bank, b, rows, mode, variant, rng, name, all)) return false;
@@ -276,8 +302,8 @@ bool check(const Bank& bank, Buffers& b, std::mt19937& rng, const char* name) {
             }
         }
     }
-    std::printf("check %s: %u cases, every rows-launch row equals its one-row launch; all-case digest %016llx\n", name,
-                cases, static_cast<unsigned long long>(all));
+    std::printf("check %s rows %u..%u: %u cases, every rows-launch row equals its one-row launch; all-case digest "
+                "%016llx\n", name, first_rows, last_rows, cases, static_cast<unsigned long long>(all));
     return true;
 }
 
@@ -289,8 +315,20 @@ void launch_part(const Bank& bank, const Buffers& b, unsigned rows, unsigned set
         (void)r1::launch<F, kTopK>(args, nullptr, rows);
         return;
     }
+    if (part == 3U) {
+        (void)r1::launch_rows<F, kTopK>(args, nullptr, rows);  // default scratch: chunks of kMaxRows rows
+        return;
+    }
     // The kernels launch() picks: the plain ones for one row, the rows ones (tail ahead) for several.
     namespace d = r1::detail;
+    if (part == 4U) {  // the whole launch in the incumbent (block, unit) start order (no tile budget)
+        const auto order = r1::gate_up_rows_order<F>(kFfn, kHidden, rows, kTopK, d::kGateColumns, 0U);
+        const auto down = r1::down_combine_grid(kHidden, rows, d::kDownColumns);
+        d::gate_up_rows<F, kTopK><<<order.units * order.blocks, d::kThreads, r1::staged_input_bytes<F>(kHidden)>>>(
+            args, order);
+        d::down_combine_rows<F, kTopK><<<dim3(down.x, down.y), d::kThreads>>>(args);
+        return;
+    }
     if (part == 1U) {
         const auto one = r1::gate_up_grid(kFfn, rows, kTopK, d::kGateColumns);
         const auto many = r1::gate_up_rows_order<F>(kFfn, kHidden, rows, kTopK, d::kGateColumns,
@@ -342,7 +380,7 @@ void bench(const Bank& bank, Buffers& b, std::mt19937& rng, const char* name) {
     CHECK_HIP(hipMalloc(&floor_ids, sizeof(unsigned) * kSets * kRowsMax * kTopK));
     CHECK_HIP(hipMalloc(&sink, sizeof(unsigned)));
     CHECK_HIP(hipMemset(sink, 0, sizeof(unsigned)));
-    for (unsigned rows : {1U, 2U, 4U, 8U}) {
+    for (unsigned rows : {1U, 2U, 4U, 8U, 12U, 16U}) {
         for (Mode mode : {Mode::uniform, Mode::skewed, Mode::collide}) {
             if (rows == 1U && mode == Mode::skewed) continue;
             std::vector<unsigned> all(std::size_t{kSets} * kRowsMax * kTopK, 0U);
@@ -361,7 +399,7 @@ void bench(const Bank& bank, Buffers& b, std::mt19937& rng, const char* name) {
             distinct /= kSets;
             upload_case(b, make_ids(mode, rows, rng), rows, rng, -1, false);
             CHECK_HIP(hipMemcpy(b.ids, all.data(), sizeof(unsigned) * all.size(), hipMemcpyHostToDevice));
-            for (unsigned part = 0; part < 3U; ++part) {
+            for (unsigned part = 0; part < (rows > r1::kMaxRows ? 5U : 3U); ++part) {
                 for (unsigned s = 0; s < kSets; ++s) launch_part<F>(bank, b, rows, s, 0U);  // warm + activation
                 CHECK_HIP(hipEventRecord(start, nullptr));
                 for (unsigned i = 0; i < kRounds * kSets; ++i) launch_part<F>(bank, b, rows, i % kSets, part);
@@ -371,10 +409,12 @@ void bench(const Bank& bank, Buffers& b, std::mt19937& rng, const char* name) {
                 float ms = 0.0F;
                 CHECK_HIP(hipEventElapsedTime(&ms, start, stop));
                 const double per = static_cast<double>(ms) / (kRounds * kSets);
-                const double share = part == 0U ? 1.0 : part == 1U ? 2.0 / 3.0 : 1.0 / 3.0;
+                const double share = part == 1U ? 2.0 / 3.0 : part == 2U ? 1.0 / 3.0 : 1.0;
+                const char* label = part == 0U ? "both" : part == 1U ? "gate" : part == 2U ? "down" : part == 3U ? "chnk"
+                                                                                                                  : "untl";
                 std::printf("bench %s rows %u mode %-7s %-4s %.4f ms/launch  assignments %u  distinct %.1f  "
                             "%.1f GB/s distinct  %.1f GB/s assignment\n",
-                            name, rows, mode_name(mode), part == 0U ? "both" : part == 1U ? "gate" : "down", per,
+                            name, rows, mode_name(mode), label, per,
                             rows * kTopK, distinct, distinct * bank.expert_bytes * share / (per * 1e6),
                             rows * kTopK * bank.expert_bytes * share / (per * 1e6));
             }
@@ -432,6 +472,8 @@ int main(int argc, char** argv) {
         measured.formats = strix::r1_rows_tiles::format_bit(MatrixFormat::nvfp4) |
                            strix::r1_rows_tiles::format_bit(MatrixFormat::mxfp8);
         measured.cache_bytes[4] = measured.cache_bytes[8] = std::uint64_t{24U} << 20U;
+        for (unsigned rows = r1::kMaxRows + 1U; rows <= r1::kMaxLaunchRows; ++rows)
+            measured.cache_bytes[rows] = std::uint64_t{24U} << 20U;  // candidate budget above kMaxRows (bench decides)
         strix::r1_rows_tiles::publish({measured});
     }
     std::mt19937 rng(20261124U);
@@ -451,6 +493,14 @@ int main(int argc, char** argv) {
         // NVFP4 scale planes at odd addresses: the same streamed arithmetic (digests equal the base build's).
         const Bank odd(MatrixFormat::nvfp4, true);
         ok = check<MatrixFormat::nvfp4>(odd, b, rng, "nvfp4odd") && ok;
+    }
+    {
+        // One rows launch above kMaxRows (kMaxLaunchRows): its own random stream after the incumbent cases.
+        std::mt19937 wide(20261124U + 16U);
+        const Bank nv(MatrixFormat::nvfp4);
+        ok = check<MatrixFormat::nvfp4>(nv, b, wide, "nvfp4", r1::kMaxRows + 1U, r1::kMaxLaunchRows) && ok;
+        const Bank mx(MatrixFormat::mxfp8);
+        ok = check<MatrixFormat::mxfp8>(mx, b, wide, "mxfp8", r1::kMaxRows + 1U, r1::kMaxLaunchRows) && ok;
     }
     std::printf("microscaled_r1_hip: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
