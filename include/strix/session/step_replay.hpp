@@ -33,13 +33,23 @@ inline constexpr std::uint32_t step_replay_valid = 1;
     return width;
 }
 
+// Largest active window whose padded graph fits the append plan at this frontier.
+template <class Plan>
+[[nodiscard]] constexpr std::uint32_t step_replay_rows_that_fit(
+    const Plan& plan, std::uint32_t first, std::uint32_t rows) {
+    if (rows > step_replay_max_rows) rows = step_replay_max_rows;
+    auto width = padded_step_replay_width(rows);
+    while (width != 0U && !plan.admits(first, width)) width >>= 1U;
+    return rows < width ? rows : width;
+}
+
 // Resident session geometry that admits every padded verify window. A speculator keeps a window of
 // R rows inside the request (first + R <= positions, R <= verify_rows), but the window runs on width
 // W = padded_step_replay_width(R) and the pending append of all W rows must be admitted by the
 // session plan: W <= max_chunk and first + W <= context. So the plan's chunk is at least the padded
 // width of the largest window and its context carries the largest padding overhang W(R) - R (the
 // padded rows are never kept and never published). verify_rows <= 1 keeps the request geometry.
-// The context is capped at max_context; a window whose padding would cross it is refused.
+// At max_context the chooser must trim windows with step_replay_rows_that_fit.
 struct StepReplaySessionGeometry {
     std::uint32_t positions;
     std::uint32_t append_rows;

@@ -140,6 +140,13 @@ bool check_verify_session() {
     // Near the model context the padding overhang is capped, never past kMaxContext.
     const auto end = strix::inkling2::mini_step_session_geometry(strix::inkling2::kMaxContext - 2U, 8U, 16U);
     if (end.positions != strix::inkling2::kMaxContext || end.append_rows != 16U) return false;
+    const MiniSessionStatePlan capped(end.positions, end.append_rows);
+    using strix::session::step_replay_rows_that_fit;
+    if (step_replay_rows_that_fit(capped, end.positions - 8U, 5U) != 5U ||
+        step_replay_rows_that_fit(capped, end.positions - 6U, 5U) != 4U ||
+        step_replay_rows_that_fit(capped, end.positions - 1U, 1U) != 1U ||
+        step_replay_rows_that_fit(capped, end.positions, 1U) != 0U)
+        return false;
     // No speculation keeps the request geometry.
     const auto off = strix::inkling2::mini_step_session_geometry(39U, 7U, 0U);
     return off.positions == 39U && off.append_rows == 7U;

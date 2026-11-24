@@ -4,7 +4,9 @@
 #include "strix/serve/serial_generation_cli.hpp"
 #include "strix/session/embed_rows.hpp"
 #include "strix/session/prompt_windows.hpp"
+#include "strix/session/step_replay.hpp"
 #include "strix/spec/block_drafter.hpp"
+#include "strix/spec/engine_target.hpp"
 #include "strix/token_sampling.hpp"
 
 #include <algorithm>
@@ -14,8 +16,8 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
-#include <initializer_list>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -89,6 +91,63 @@ private:
     unsigned rows_, next_{};
     std::vector<std::uint32_t> staged_;
 };
+
+class PaddedDecoder final : public SerialGenerationDecoder {
+public:
+    using Rows = std::vector<std::uint32_t>;
+    enum class LogitRows { all };
+
+    explicit PaddedDecoder(unsigned positions);
+    static unsigned token_at(unsigned position) { return position % 7U == 0U ? 3U : 1U; }
+    unsigned prefill(std::span<const unsigned> ids, std::span<float> logits) override {
+        inputs.assign(ids.begin(), ids.end());
+        return predict(committed(), logits);
+    }
+    unsigned decode(unsigned token, std::span<float> logits) override {
+        inputs.push_back(token);
+        return predict(committed(), logits);
+    }
+    unsigned max_verify_rows(CliSpeculation) const override { return 8U; }
+    strix::spec::VerifyTarget* verify_target() override { return target_.get(); }
+    unsigned committed() const { return static_cast<unsigned>(inputs.size()); }
+    unsigned vocab() const { return static_cast<unsigned>(scores.size()); }
+    bool admits(unsigned first, unsigned rows) const { return rows <= positions_ - first; }
+    unsigned admissible_verify_rows(unsigned rows) const {
+        return strix::session::step_replay_rows_that_fit(*this, committed(), rows);
+    }
+    Rows forward_rows(const unsigned* tokens, unsigned rows, LogitRows) {
+        check(admits(committed(), strix::session::padded_step_replay_width(rows)),
+              "padded verify crosses the context cap");
+        staged_.assign(tokens, tokens + rows);
+        Rows picks(rows);
+        for (unsigned row = 0; row < rows; ++row) picks[row] = token_at(committed() + row + 1U);
+        return picks;
+    }
+    void read_top(const Rows& picks, unsigned, unsigned* out) { std::ranges::copy(picks, out); }
+    void read_logits_rows(const Rows&, unsigned rows, float* out) {
+        for (unsigned row = 0; row < rows; ++row)
+            predict(committed() + row + 1U, {out + row * scores.size(), scores.size()});
+    }
+    void commit(unsigned keep) { inputs.insert(inputs.end(), staged_.begin(), staged_.begin() + keep); }
+    void sync() const {}
+
+private:
+    static unsigned predict(unsigned position, std::span<float> logits) {
+        const auto pick = token_at(position);
+        if (!logits.empty()) {
+            std::ranges::copy(scores, logits.begin());
+            std::swap(logits[1], logits[pick]);
+        }
+        return pick;
+    }
+
+    unsigned positions_;
+    Rows staged_;
+    std::unique_ptr<strix::spec::VerifyTarget> target_;
+};
+
+PaddedDecoder::PaddedDecoder(unsigned positions)
+    : positions_(positions), target_(std::make_unique<strix::spec::EngineVerifyTarget<PaddedDecoder>>(*this)) {}
 
 const SerialGenerationFamily family{"fixture", "Fixture", "CHECKPOINT", 9, 4, 64, 2,
     [](const SerialGenerationLoad& load) -> std::unique_ptr<SerialGenerationDecoder> {
@@ -191,7 +250,7 @@ SerialGenerationFamily media_family() {
 
 struct Outcome { int code; std::string out, error; };
 
-Outcome run(std::initializer_list<std::string> args, const SerialGenerationFamily& with = family) {
+Outcome run(const std::vector<std::string>& args, const SerialGenerationFamily& with = family) {
     std::vector<std::string> owned{"fixture", "checkpoint"};
     owned.insert(owned.end(), args.begin(), args.end());
     std::vector<char*> argv;
@@ -321,6 +380,28 @@ int main() try {
     check(diagnostic.code == 0 && diagnostic.out.starts_with(plain.out.substr(0, generated_end)) && tunes == 0 &&
           seeds == 0 && loaded_mode == CliSpeculation::verify,
           "the verify diagnostic keeps its equal prices (no engine tuning or seeds)");
+    auto padded_family = family;
+    padded_family.sampled_speculation = true;
+    padded_family.load = [](const SerialGenerationLoad& load) -> std::unique_ptr<SerialGenerationDecoder> {
+        return std::make_unique<PaddedDecoder>(load.positions);
+    };
+    for (const bool sampled_rows : {false, true}) {
+        std::vector<std::string> edge;
+        // Six serial rows let the diagnostic collect lookup evidence before
+        // it reaches position 58 with five active rows left in the budget.
+        for (unsigned position = 0; position < 52U; ++position)
+            edge.push_back(std::to_string(PaddedDecoder::token_at(position)));
+        edge.insert(edge.end(), {"--generate", "12", "--top-k", "1", "--temperature",
+                                 sampled_rows ? "1" : "0", "--speculation", "off"});
+        const auto serial_edge = run(edge, padded_family);
+        const auto serial_inputs = inputs;
+        edge.back() = "verify";
+        const auto verify_edge = run(edge, padded_family);
+        check(verify_edge.code == 0, verify_edge.error.c_str());
+        check(serial_edge.code == 0 && verify_edge.out.starts_with("next_token 1\ngenerated 1 1 1 1 3 1 1 1 1 1 1 3\n") &&
+              inputs == serial_inputs && verify_edge.out.find(" acceptance 3/3 draft_passes 1 ") != std::string::npos,
+              "context edge buys four rows, finishes with one, and matches serial IDs and committed inputs");
+    }
     (void)repeated("off");
     check(loaded_mode == CliSpeculation::off, "plain decode loads without a speculation mode");
     auto auto_family = family;

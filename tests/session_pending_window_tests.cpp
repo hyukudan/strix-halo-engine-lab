@@ -137,14 +137,41 @@ void publish(Lane& lane, const Pending& pending, unsigned keep) {
     for (const auto visit : Plan::visits()) {
         const auto rows = lane.state.visit(visit);
         const auto width = kPlan.visit(visit).kv.width;
-        const auto start = static_cast<unsigned>(cell(rows.kv, first));
-        const auto contiguous = rows.kv.wrapped ? std::min(keep, rows.kv.slots - start) : keep;
-        std::copy_n(pending.keys[visit].data(), contiguous * width, rows.kv.keys + std::size_t{start} * width);
-        std::copy_n(pending.values[visit].data(), contiguous * width, rows.kv.values + std::size_t{start} * width);
-        std::copy_n(pending.keys[visit].data() + contiguous * width, (keep - contiguous) * width, rows.kv.keys);
-        std::copy_n(pending.values[visit].data() + contiguous * width, (keep - contiguous) * width, rows.kv.values);
+        const auto copy = session::kept_prefix_copy_geometry({first, keep}, rows.kv, width);
+        std::copy_n(pending.keys[visit].data(), copy.contiguous_elements, rows.kv.keys + copy.kv_offset);
+        std::copy_n(pending.values[visit].data(), copy.contiguous_elements, rows.kv.values + copy.kv_offset);
+        std::copy_n(pending.keys[visit].data() + copy.contiguous_elements, copy.wrapped_elements, rows.kv.keys);
+        std::copy_n(pending.values[visit].data() + copy.contiguous_elements, copy.wrapped_elements, rows.kv.values);
         const auto image = rows.history[0];
-        std::copy_n(pending.images[visit].data() + std::size_t{keep - 1U} * image.size(), image.size(), image.data());
+        std::copy_n(pending.images[visit].data() + copy.history_row * image.size(), image.size(), image.data());
+    }
+}
+
+void wrapped_partial_commit() {
+    for (const unsigned keep : {1U, 2U}) {
+        Lane serial, staged;
+        const auto ring = staged.state.visit(0U).kv;
+        const auto first = 2U * ring.slots - 1U;
+        for (unsigned token = 0; token < first; ++token) {
+            serial.append_serial(token);
+            staged.append_serial(token);
+        }
+        const std::array tokens{100U, 101U, 102U, 103U};
+        const auto pending = stage_window(staged, tokens);
+        const auto width = kPlan.visit(0U).kv.width;
+        const auto copy = session::kept_prefix_copy_geometry({first, keep}, ring, width);
+        check(copy.kv_offset == (ring.slots - 1U) * width && copy.contiguous_elements == width &&
+                  copy.wrapped_elements == (keep - 1U) * width && copy.history_row == keep - 1U,
+              "kept prefix ending at or crossing the wrap has the expected copy geometry");
+        staged.state.commit_pending(keep, [&](unsigned kept) { publish(staged, pending, kept); });
+        for (unsigned row = 0; row < keep; ++row) serial.append_serial(tokens[row]);
+        check(staged.state.committed() == serial.state.committed() && staged.keys == serial.keys &&
+                  staged.values == serial.values && staged.history == serial.history,
+              "wrapped partial commit publishes exactly the serial prefix");
+        staged.append_serial(200U);
+        serial.append_serial(200U);
+        check(staged.keys == serial.keys && staged.values == serial.values && staged.history == serial.history,
+              "continuation after wrap equals serial");
     }
 }
 
@@ -393,6 +420,7 @@ void whole_batch() {
 int main() {
     graph_dispatch();
     equality();
+    wrapped_partial_commit();
     contract();
     padded_width();
     padded_window_admission();

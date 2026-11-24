@@ -791,6 +791,7 @@ public:
     // One serial step of the speculator: the plain decode step (committed at once).
     unsigned decode_committed_row(unsigned token, std::span<float> logits) { return decode(token, logits); }
     [[nodiscard]] unsigned committed() const;
+    [[nodiscard]] unsigned admissible_verify_rows(unsigned limit) const;
     [[nodiscard]] unsigned vocab() const { return kOutputVocabulary; }
     [[nodiscard]] static constexpr unsigned max_verify_rows() { return kMiniVerifyMaxRows; }
     // Verify windows need the packed expert route (the grouped tile has no width-bound leaves).
@@ -946,21 +947,17 @@ struct MiniCudaVerifyWorkspace {
             const auto resident = session.visit(visit);
             const auto& kv = resident.kv;
             const auto cache = view.cache(visit, kv);
-            const auto first = kv.wrapped ? chunk.first_position % kv.slots : chunk.first_position;
-            const auto contiguous = std::min(chunk.rows, kv.slots - first);
-            const auto offset = std::size_t{first} * kKvWidth;
-            const auto elements = std::size_t{contiguous} * kKvWidth;
-            copy(kv.keys + offset, cache.pending_keys, elements);
-            copy(kv.values + offset, cache.pending_values, elements);
-            if (contiguous != chunk.rows) {
-                const auto tail = std::size_t{chunk.rows - contiguous} * kKvWidth;
-                copy(kv.keys, cache.pending_keys + elements, tail);
-                copy(kv.values, cache.pending_values + elements, tail);
+            const auto plan = session::kept_prefix_copy_geometry(chunk, kv, kKvWidth);
+            copy(kv.keys + plan.kv_offset, cache.pending_keys, plan.contiguous_elements);
+            copy(kv.values + plan.kv_offset, cache.pending_values, plan.contiguous_elements);
+            if (plan.wrapped_elements != 0U) {
+                copy(kv.keys, cache.pending_keys + plan.contiguous_elements, plan.wrapped_elements);
+                copy(kv.values, cache.pending_values + plan.contiguous_elements, plan.wrapped_elements);
             }
             for (unsigned path = 0; path < resident.history.size(); ++path) {
                 const auto image = resident.history[path];
                 copy(image.data(), view.history(visit, static_cast<MiniConvolutionStream>(path)) +
-                    (chunk.rows - 1U) * image.size(), image.size());
+                    plan.history_row * image.size(), image.size());
             }
         }
         mini_gpu::synchronize(stream);
@@ -1296,6 +1293,11 @@ inline void MiniCudaProgramDecoder::commit(unsigned keep) {
 }
 
 inline unsigned MiniCudaProgramDecoder::committed() const { return impl_->decoder.step_program_state().committed(); }
+
+inline unsigned MiniCudaProgramDecoder::admissible_verify_rows(unsigned limit) const {
+    const auto& state = impl_->decoder.step_program_state();
+    return session::step_replay_rows_that_fit(state.plan(), state.committed(), std::min(limit, kMiniVerifyMaxRows));
+}
 
 inline void MiniCudaProgramDecoder::reset_gate_session() { impl_->decoder.reset_gate_session(); }
 inline void MiniCudaProgramDecoder::set_gate_route_tap(moe::RouteTap* tap) {

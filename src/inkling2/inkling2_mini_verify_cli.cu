@@ -5,6 +5,7 @@
 #undef main
 
 #include "cuda/core/lookup_cuda.cuh"
+#include "strix/spec/greedy_continuation.hpp"
 
 #include <cstring>
 
@@ -78,6 +79,45 @@ VerifyOptions extract_verify_options(std::vector<char*>& args) {
     return options;
 }
 
+// Use the actual end of the resident plan to exercise the capped geometry
+// without a model-maximum prompt. The repeated prefix supplies four drafts.
+void compare_context_edge(MiniCudaProgramDecoder& program, unsigned positions) {
+    constexpr unsigned budget = 6U;
+    const auto first = positions - budget;
+    const auto token_at = [](unsigned position) { return position % 7U == 0U ? 3U : 1U; };
+    const auto anchor = token_at(first);
+    std::vector<unsigned> prefix(first);
+    for (unsigned position = 0; position < first; ++position) prefix[position] = token_at(position);
+    const SerialTokenContinuationRequest request{anchor, first, kOutputVocabulary, positions, budget, kMiniEosToken};
+    for (const auto& rule : {spec::RowRule{}, spec::RowRule({1.0F, 2U, 1.0F, 0.0F, 19U}, {})}) {
+        program.reset_gate_session();
+        program.prefill(prefix, {});
+        std::vector<float> logits(kOutputVocabulary);
+        const auto serial = execute_serial_token_continuation(request, [&](unsigned token, std::uint64_t position) {
+            const auto pick = program.decode(token, logits);
+            return rule.sampled() ? rule.row_token(logits, position + 1U) : pick;
+        });
+        program.reset_gate_session();
+        program.prefill(prefix, {});
+        spec::BlockConfig config;
+        config.max_block = budget - 1U;
+        config.fixed_costs = true;
+        config.force_lookup = true;  // Exercise the edge independently of model acceptance of the fixture's drafts.
+        spec::set_context_cost(config.arbiter, "off");
+        spec::BlockDrafter drafter(config);
+        for (unsigned row = 1U; row <= config.max_block; ++row) drafter.seed_verify_ms(row, 1.0);
+        spec::EngineVerifyTarget target(program);
+        const auto result = spec::execute_block_token_continuation(request, prefix, drafter, target, config.max_block,
+                                                                   {}, rule);
+        const auto& widths = drafter.stats().rows_passes;
+        if (widths.size() <= 4U || widths[4U] == 0U ||
+            result.generated_tokens != serial.generated_tokens || result.stop_reason != serial.stop_reason ||
+            program.committed() != serial.final_position)
+            throw std::runtime_error("Inkling context-edge verify differs from serial or did not draft a window");
+    }
+    std::cout << "context-edge greedy and sampled continuations match serial\n";
+}
+
 void run_verify(std::vector<char*>& args, unsigned rows, bool compare) {
     const serve::SerialGenerationFamily family{
         "strix-inkling2-mini-cuda", "Inkling 2 Mini", "MODEL.safetensors", kVocabulary, kOutputVocabulary,
@@ -121,14 +161,35 @@ void run_verify(std::vector<char*>& args, unsigned rows, bool compare) {
         program.reset_gate_session();
         program.prefill(prefix, {});
         std::vector<float> reference(kOutputVocabulary);
+        const auto matches = [&](unsigned row, unsigned pick) {
+            const auto* actual = logits.data() + std::size_t{row} * kOutputVocabulary;
+            return pick == picks[row] && std::memcmp(actual, reference.data(), reference.size() * sizeof(float)) == 0;
+        };
         for (unsigned row = 0; row < rows; ++row) {
             const auto pick = program.decode(forced[row], reference);
-            const auto* actual = logits.data() + std::size_t{row} * kOutputVocabulary;
-            if (pick != picks[row] || std::memcmp(actual, reference.data(), reference.size() * sizeof(float)) != 0)
+            if (!matches(row, pick))
                 throw std::runtime_error("Inkling verify differs from sequential R=1 at row " + std::to_string(row));
         }
         std::cout << "R=" << rows << " vs " << rows << "xR=1 row_logits_bitwise=" << rows << '/' << rows
                   << " ids=" << rows << '/' << rows << '\n';
+        // With a prefix ending at the last local ring row, keep=1 ends at
+        // the boundary and keep=2 publishes both the final row and row zero.
+        if (rows >= 4U) {
+            for (const unsigned keep : {1U, 2U}) {
+                program.reset_gate_session();
+                program.prefill(prefix, {});
+                program.forward_rows(forced.data(), rows, MiniCudaProgramDecoder::LogitRows::all);
+                program.commit(keep);
+                for (unsigned row = keep; row < rows; ++row) {
+                    const auto pick = program.decode(forced[row], reference);
+                    if (!matches(row, pick))
+                        throw std::runtime_error("Inkling verify continuation differs after keeping " +
+                                                 std::to_string(keep) + " rows at row " + std::to_string(row));
+                }
+            }
+            std::cout << "partial-commit continuation row_logits_bitwise=yes ids=yes\n";
+        }
+        if (rows == kMiniVerifyMaxRows) compare_context_edge(program, geometry.positions);
     }
     session::write_logits(generation.logits, logits);
     for (unsigned row = 0; row < rows; ++row) {

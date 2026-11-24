@@ -510,6 +510,7 @@ StepRecord BlockSpeculator::step(std::vector<std::uint32_t>& out, const StepPara
     const bool serial_sampled = sampled && !target_.supports_row_rule(true);
     if (sampled) target_.set_first_position(params.context + 1);
     StepParams p = params;
+    if (!serial_sampled) p.max_rows = target_.admissible_verify_rows(p.max_rows);
     p.tree_rows = serial_sampled ? 0 : target_.tree_rows();
     // Verify pre-launch: the target enqueues the verify of [anchor, host prefix, device drafts] inside the chain call,
     // before the drafted ids are read back (the host launch overlaps the GPU draft). launched_rows = its row count.

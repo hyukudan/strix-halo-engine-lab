@@ -143,6 +143,23 @@ struct VisitKvRows {
     bool wrapped{};
 };
 
+struct KeptPrefixCopyGeometry {
+    std::size_t kv_offset;
+    std::size_t contiguous_elements;
+    std::size_t wrapped_elements;
+    unsigned history_row;
+};
+
+// Publish a nonempty, admitted kept prefix. The second segment, if any,
+// starts at resident row zero and immediately follows the first in staging.
+[[nodiscard]] constexpr KeptPrefixCopyGeometry kept_prefix_copy_geometry(
+    KvAppendChunk kept, const VisitKvRows& kv, unsigned row_width) noexcept {
+    const auto first = kv.wrapped ? kept.first_position % kv.slots : kept.first_position;
+    const auto contiguous = std::min(kept.rows, kv.slots - first);
+    return {std::size_t{first} * row_width, std::size_t{contiguous} * row_width,
+            std::size_t{kept.rows - contiguous} * row_width, kept.rows - 1U};
+}
+
 template <class Plan>
 VisitKvRows slice_kv_visit(const Plan& plan, typename Plan::Visit visit, KvRowPlanes planes) {
     if (!plan.valid(visit) || planes.keys.size() < plan.kv_elements_per_plane() ||

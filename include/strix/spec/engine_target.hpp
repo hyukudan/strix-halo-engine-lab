@@ -46,6 +46,15 @@ public:
     void set_observer(Observer f) { observer_ = std::move(f); }
     void set_row_rule(const RowRule& rule) override { rule_ = rule; }
     [[nodiscard]] bool supports_row_rule(bool sampled) const override { return !sampled || has_logits; }
+    [[nodiscard]] std::uint32_t admissible_verify_rows(std::uint32_t limit) const override {
+        if constexpr (requires(const Engine& e) {
+            { e.admissible_verify_rows(limit) } -> std::convertible_to<std::uint32_t>;
+        }) {
+            return std::min(limit, static_cast<std::uint32_t>(e_.admissible_verify_rows(limit)));
+        } else {
+            return limit;
+        }
+    }
     void set_first_position(std::uint64_t position) override { first_position_ = position; }
 
     void verify(std::span<const std::uint32_t> tokens, std::vector<std::uint32_t>& greedy) override {

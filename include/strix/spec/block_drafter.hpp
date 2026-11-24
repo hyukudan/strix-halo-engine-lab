@@ -314,6 +314,8 @@ public:
     virtual ~VerifyTarget() = default;
     virtual void set_row_rule(const RowRule&) {}
     [[nodiscard]] virtual bool supports_row_rule(bool sampled) const { return !sampled; }
+    // Dynamic cap on active rows at the current frontier (e.g. when a padded graph must fit).
+    [[nodiscard]] virtual std::uint32_t admissible_verify_rows(std::uint32_t limit) const { return limit; }
     // Position predicted by the anchor (StepParams::context + 1); targets may use their own committed count.
     virtual void set_first_position(std::uint64_t) {}
     // Serial fallback for targets that cannot sample windows. Forward the anchor and return its host logits.
