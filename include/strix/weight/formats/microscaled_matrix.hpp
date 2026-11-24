@@ -32,6 +32,24 @@ inline bool valid_row_order(RowOrder order, std::size_t rows) {
     return order == RowOrder::contiguous || (order == RowOrder::interleaved_halves && rows % 2U == 0);
 }
 
+inline Status slab_strides(MatrixFormat format, RowOrder order, std::size_t experts, std::size_t rows,
+                           std::size_t columns, std::size_t& code_stride, std::size_t& scale_stride) {
+    const bool nvfp4 = format == MatrixFormat::nvfp4;
+    if (!nvfp4 && format != MatrixFormat::mxfp8)
+        return {Error::unknown_format, "unknown microscaled slab format"};
+    if (!valid_row_order(order, rows))
+        return {Error::unsupported_shape, "invalid microscaled slab row order"};
+    const auto block = nvfp4 ? kNvfp4BlockColumns : kMxfp8BlockColumns;
+    constexpr auto limit = std::numeric_limits<std::size_t>::max();
+    if (experts == 0 || rows == 0 || columns == 0 || columns % block != 0 ||
+        rows > limit / columns || experts > limit / (rows * columns))
+        return {Error::unsupported_shape, "invalid microscaled slab geometry"};
+    const auto elements = rows * columns;
+    code_stride = nvfp4 ? elements / 2U : elements;
+    scale_stride = elements / block;
+    return {Error::ok, {}};
+}
+
 inline Status read_f32(const Slice& slice, float& out) {
     std::array<Byte, 4> bytes{};
     if (slice.range.bytes != bytes.size()) return {Error::malformed, "expected one F32 outer scale"};
@@ -118,18 +136,8 @@ struct ExpertSlabView {
 private:
     Status strides(std::size_t& code_stride, std::size_t& scale_stride) const {
         const bool nvfp4 = format == MatrixFormat::nvfp4;
-        if (!nvfp4 && format != MatrixFormat::mxfp8)
-            return {Error::unknown_format, "unknown microscaled slab format"};
-        if (!detail::valid_row_order(row_order, rows))
-            return {Error::unsupported_shape, "invalid microscaled slab row order"};
-        const auto block = nvfp4 ? kNvfp4BlockColumns : kMxfp8BlockColumns;
-        constexpr auto limit = std::numeric_limits<std::size_t>::max();
-        if (experts == 0 || rows == 0 || columns == 0 || columns % block != 0 ||
-            rows > limit / columns || experts > limit / (rows * columns))
-            return {Error::unsupported_shape, "invalid microscaled slab geometry"};
-        const auto elements = rows * columns;
-        code_stride = nvfp4 ? elements / 2U : elements;
-        scale_stride = elements / block;
+        if (const auto status = detail::slab_strides(format, row_order, experts, rows, columns, code_stride, scale_stride);
+            !status) return status;
         if (codes.range.bytes != experts * code_stride || block_scales.range.bytes != experts * scale_stride)
             return {Error::malformed, "microscaled slab slice length disagrees with geometry"};
         if (nvfp4 && (amax.range.bytes != experts * 4U || denominator.range.bytes != 4U))

@@ -1,6 +1,6 @@
 #pragma once
 
-enum hipError_t { hipSuccess, hipErrorInvalidDevice };
+enum hipError_t { hipSuccess, hipErrorInvalidDevice, hipErrorInvalidValue };
 
 struct hipDeviceProp_t {
     char gcnArchName[32];

@@ -1,12 +1,32 @@
 #pragma once
 
+#include "core/controller_rms_rows.hpp"
 #include "core/dense_linear.hpp"
 #include "core/dense_row_plan.hpp"
 #include "core/f16_tile_gemm.hpp"
 #include "core/fma_rows.hpp"
+#include "strix/hip/legacy_launch.hpp"
 
 #include <algorithm>
 #include <limits>
+
+// HIP launch boundary: the row-owner body remains in the shared core header. The launch re-checks the admitted shape
+// (rank selects the kernel's K16 unit count; a refused shape never reaches a specialization with other strides).
+namespace strix::core::controller_rms_rows {
+inline hipError_t enqueue(const Args& a, hipStream_t stream) {
+    if (!admits(a, 0U)) return hipErrorInvalidValue;
+    ::strix::hip::arch::require_current_device(::strix::hip::arch::LaunchRequirement::Rdna3Layout);
+    const dim3 grid(grid_blocks(a.rows));
+    switch (a.rank / 16U) {
+    case 1U: detail::controller_rms_kernel<1U><<<grid, kThreads, 0, stream>>>(a); break;
+    case 2U: detail::controller_rms_kernel<2U><<<grid, kThreads, 0, stream>>>(a); break;
+    case 3U: detail::controller_rms_kernel<3U><<<grid, kThreads, 0, stream>>>(a); break;
+    case 4U: detail::controller_rms_kernel<4U><<<grid, kThreads, 0, stream>>>(a); break;
+    default: return hipErrorInvalidValue;
+    }
+    return hipGetLastError();
+}
+}  // namespace strix::core::controller_rms_rows
 
 namespace strix::core::fma_rows {
 
@@ -169,6 +189,27 @@ inline hipError_t enqueue_bf16_controller_rows(const float* input, unsigned inpu
     group.append({gain.weights, gain.outputs, gain.output, gain.round_bf16});
     f16_tile_gemm::gemm_bf16_controller(input, rows, input_width, group, {current, message, output, forget.outputs}, stream);
     return hipGetLastError();
+}
+
+// The [forget, gain] pair with the controller epilogue followed by the norm of the conditioned rows
+// (ops::norm::enqueue_rms_bf16_rows, parallel form, BF16 scale) as one row-owner launch: output = the norm of
+// controller_mix(current, message, forget sum, gain sum), the bits of enqueue_bf16_controller_rows into a separate
+// buffer followed by that norm into output. hipErrorNotSupported where the row-owner form does not take the shape
+// (controller_rms_rows::admits): the caller runs the two launches.
+inline hipError_t enqueue_bf16_controller_rms_rows(const float* input, unsigned input_width, unsigned rows,
+                                                   std::span<const Bf16RowProjection> gates, const float* current,
+                                                   const float* message, const std::uint16_t* scale, float epsilon,
+                                                   float* output, hipStream_t stream) {
+    if (gates.size() != 2U) return hipErrorNotSupported;
+    const auto& forget = gates[0];
+    const auto& gain = gates[1];
+    if (!forget.contiguous(input_width) || !gain.contiguous(input_width) || forget.round_bf16 || gain.round_bf16 ||
+        forget.outputs != gain.outputs)
+        return hipErrorNotSupported;
+    const controller_rms_rows::Args args{input,   forget.weights, gain.weights, current, message, scale,
+                                         output,  rows,           forget.outputs, input_width, epsilon};
+    if (!controller_rms_rows::admits(args, gemv_rows::max_rows)) return hipErrorNotSupported;
+    return controller_rms_rows::enqueue(args, stream);
 }
 
 }  // namespace strix::core::fma_rows
