@@ -326,6 +326,25 @@ static void chunk_fallback_cli_cases() {
     typed = false;
     const auto untyped = run({"8", "4", "1", "2", "3", "5"}, pressure);
     check(untyped.code != 0 && loaded_rows == std::vector<std::uint32_t>{6U}, "untyped failure is not retried");
+
+    // The same out-of-memory runtime status through the shared classification of a failed runtime call: refused at a
+    // pinned host staging allocation (a general operation) it is never retried; refused at a device row allocation
+    // it retries once at the fallback rows.
+    constexpr int out_of_memory_status = 2;
+    auto operation = strix::RuntimeOperation::general;
+    pressure.load = [&](const SerialGenerationLoad& load) -> std::unique_ptr<SerialGenerationDecoder> {
+        loaded_rows.push_back(load.prefill_chunk);
+        if (load.prefill_chunk > 3U)
+            strix::throw_runtime_failure("allocate: out of memory", out_of_memory_status, true, operation);
+        return std::make_unique<Decoder>(std::min(8U, load.verify_rows));
+    };
+    loaded_rows.clear();
+    const auto staging = run({"8", "4", "1", "2", "3", "5"}, pressure);
+    check(staging.code != 0 && loaded_rows == std::vector<std::uint32_t>{6U}, "pinned staging refusal loads once");
+    loaded_rows.clear();
+    operation = strix::RuntimeOperation::device_allocation;
+    const auto rows = run({"8", "4", "1", "2", "3", "5"}, pressure);
+    check(rows.code == 0 && loaded_rows == std::vector<std::uint32_t>{6U, 2U}, "device row refusal loads twice");
 }
 
 int main() try {

@@ -61,11 +61,21 @@ inline void check(Status status, const char* operation) {
 #if defined(__HIPCC__)
     hip_check(status, operation);
 #else
-    if (status == cudaSuccess) return;
-    const auto message = std::string(operation) + ": " + cudaGetErrorString(status);
-    if (status == cudaErrorMemoryAllocation) throw DeviceAllocationError(message, static_cast<int>(status));
-    throw std::runtime_error(message);
+    if (status != cudaSuccess) throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
 #endif
+}
+
+// The status of a DEVICE-memory allocation (Buffer and the row-dependent buffers). Only here is an out-of-memory
+// status typed as DeviceAllocationError; check() keeps every other operation generic (pinned host staging included).
+inline void check_device_allocation(Status status, const char* operation) {
+    if (status == STRIX_DEVICE_RT(Success)) return;
+#if defined(__HIPCC__)
+    const bool out_of_memory = status == hipErrorOutOfMemory;
+#else
+    const bool out_of_memory = status == cudaErrorMemoryAllocation;
+#endif
+    throw_runtime_failure(std::string(operation) + ": " + STRIX_DEVICE_RT(GetErrorString)(status), static_cast<int>(status),
+                          out_of_memory, RuntimeOperation::device_allocation);
 }
 
 inline int current_device() {
@@ -285,7 +295,7 @@ public:
             throw std::invalid_argument("device buffer size overflow");
         if (elements == 0U) return;
         void* data{};
-        check(STRIX_DEVICE_RT(Malloc)(&data, elements * sizeof(T)), "allocate device buffer");
+        check_device_allocation(STRIX_DEVICE_RT(Malloc)(&data, elements * sizeof(T)), "allocate device buffer");
         data_ = static_cast<T*>(data);
     }
     ~Buffer() {

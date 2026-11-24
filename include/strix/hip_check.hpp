@@ -13,15 +13,10 @@
 #include <stdexcept>
 #include <string>
 
-#include "strix/device_allocation_error.hpp"
-
 namespace strix {
 
 inline void hip_check(hipError_t e, const char* what) {
-    if (e == hipSuccess) return;
-    const auto message = std::string(what) + ": " + hipGetErrorString(e);
-    if (e == hipErrorOutOfMemory) throw DeviceAllocationError(message, static_cast<int>(e));
-    throw std::runtime_error(message);
+    if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
 }
 
 inline void hip_check(hipError_t e) {
