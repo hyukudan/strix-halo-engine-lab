@@ -1,4 +1,5 @@
 #include "core/dense_row_plan.hpp"
+#include "core/residual_mix.hpp"
 #include "cuda/core/dense/row_plan.hpp"
 
 #include <array>
@@ -196,10 +197,48 @@ bool check_dense_declared() {
 
 }  // namespace
 
+bool check_low_rank_bound() {
+    using strix::core::finite_magnitude_max;
+    using strix::core::finite_magnitude_max_bf16;
+    using strix::core::low_rank_operands_bounded;
+    const float inf = std::numeric_limits<float>::infinity(), nan = std::numeric_limits<float>::quiet_NaN();
+    const float finite[] = {0.5F, -3.0F, 2.0F}, with_inf[] = {1.0F, -inf}, with_nan[] = {nan, 1.0F};
+    const bool magnitudes = finite_magnitude_max(finite) == 3.0F && finite_magnitude_max(with_inf) == inf &&
+                            finite_magnitude_max(with_nan) == inf && finite_magnitude_max({}) == 0.0F;
+    const std::uint16_t bf_finite[] = {0x3F80U, 0xC040U, 0x7F7FU}, bf_inf[] = {0x3F80U, 0xFF80U}, bf_nan[] = {0x7FC0U};
+    const bool bf16 = finite_magnitude_max_bf16(bf_finite) == std::bit_cast<float>(0x7F7F0000U) &&
+                      finite_magnitude_max_bf16(bf_inf) == inf && finite_magnitude_max_bf16(bf_nan) == inf &&
+                      finite_magnitude_max_bf16({}) == 0.0F;
+    // Inkling's controller shape (width 2304, rank 64): ordinary weights pass, any non-finite weight or a maximum that
+    // lets the latent or a gate sum reach 2^126 keeps the FP32 class.
+    const bool bounds = low_rank_operands_bounded(2304, 64, 4.0F, 4.0F) &&
+                        !low_rank_operands_bounded(2304, 64, inf, 1.0F) &&
+                        !low_rank_operands_bounded(2304, 64, 1.0F, nan) &&
+                        !low_rank_operands_bounded(2304, 64, 0x1p115F, 1.0F) &&   // latent ~ 2^127.2
+                        low_rank_operands_bounded(2304, 64, 0x1p100F, 0x1p7F) &&   // gate sum ~ 2^125.2
+                        !low_rank_operands_bounded(2304, 64, 0x1p100F, 0x1p8F);    // gate sum ~ 2^126.2
+    // Tail geometry: the down operand is raw + one readout whatever message_count says. The review's example (width 1,
+    // two normalised operands equal to 1, down coefficients 2^127 into one latent, unit gate weights) overflows the
+    // latent, so it is refused with a zero, a one and a large bank count alike.
+    bool tail = true;
+    for (const unsigned banks : {0U, 1U, 2U, 64U}) {
+        const strix::core::residual_mix::LowRankController plan{1U, 1U, banks, 1e-6F, true, true};
+        tail = tail && plan.down_operand_elements() == 2U && !plan.operands_bounded(0x1p127F, 1.0F) &&
+               plan.operands_bounded(1.0F, 1.0F) && !plan.operands_bounded(inf, 1.0F);
+        const strix::core::residual_mix::LowRankController wide{2304U, 64U, banks, 1e-6F, true, true};
+        tail = tail && wide.down_operand_elements() == 4608U && wide.operands_bounded(4.0F, 4.0F) &&
+               !wide.operands_bounded(0x1p115F, 1.0F);
+    }
+    if (!magnitudes || !bf16 || !bounds || !tail)
+        std::cerr << "low-rank operand bound: magnitudes " << magnitudes << " bf16 " << bf16 << " bounds " << bounds
+                  << " tail " << tail << '\n';
+    return magnitudes && bf16 && bounds && tail;
+}
+
 int main() {
     if (!check_row_chunks() || !check_projection_groups() || !check_cuda_bf16_paths() ||
         !check_cuda_bf16_fast_terms() || !check_exact_operand_planes() ||
-        !check_dense_declared()) {
+        !check_dense_declared() || !check_low_rank_bound()) {
         std::cerr << "Dense row or projection chunk policy failed\n";
         return 1;
     }
