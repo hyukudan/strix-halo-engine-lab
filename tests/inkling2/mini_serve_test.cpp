@@ -318,10 +318,13 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         // The served prefill resolves the down-image lever like the CLI and the gate do: off unless selected explicitly.
         require(options.combine_image == image, "down-image selection did not reach native adapter");
         // One decode form per request on every entry point: the command line's default, or the flag given.
-        require(options.packed_decode == mini::mini_packed_decode(decode_form) &&
-                    options.packed_decode == decode_form.value_or(mini::kMiniPackedDecodeDefault) &&
-                    mini::kMiniPackedDecodeDefault,
-                "served decode form differs from the command line's form for the same flags");
+        const bool served_hip = std::string_view(backend) == "hip";
+        require(options.packed_decode == decode_form.value_or(mini::mini_served_packed_default(served_hip)) &&
+                    (!decode_form || options.packed_decode == mini::mini_packed_decode(decode_form)) &&
+                    mini::kMiniPackedDecodeDefault && mini::mini_served_packed_default(true) &&
+                    !mini::mini_served_packed_default(false),
+                "served decode form differs from the command line's form for the same flags (HIP default packed; "
+                "CUDA keeps grouped without a flag until its identity ticket)");
         // One prefill schedule per request on every entry point: the command line's chunk and tail rule for the backend,
         // the whole prompt by prefill (emits-first), pieces only where the decoder's rule cuts without changing bits.
         const bool hip_backend = std::string_view(backend) == "hip";
@@ -331,10 +334,15 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                         mini::mini_prefill_tail_capacity(options.prefill_rows, schedule.tail_divisor, options.context) &&
                     mini::mini_prefill_piece_rule(hip_backend).cuttable() == hip_backend,
                 "served prefill schedule differs from the command line's for the same flags");
-        // The server's turbo preset carries the FAST levers (models/inkling2-mini.toml: no qualified TURBO set).
-        require(options.tier == (tier_name == "exact" ? strix::profile::Name::standard : strix::profile::Name::fast) &&
+        // The served tier is the requested tier, resolved like the command line's --profile (same lever identity).
+        mini::MiniWeightOptions cli_options;
+        cli_options.tier.profile = strix::profile::parse(tier_name);
+        cli_options.qualify_q8 = qualify_q8;
+        const auto cli = mini::resolve_mini_profile(cli_options, true);
+        require(options.tier == strix::profile::parse(tier_name) && options.tier == cli.profile &&
+                    mini::resolve_mini_profile(options.weight_options, true).fingerprint() == cli.fingerprint() &&
                     options.weight_options.qualify_q8 == qualify_q8,
-                "profile request did not reach native adapter");
+                "profile request did not reach native adapter as the command line resolves it");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
         const strix::weight::WeightLoadScope scope{kind, {}, {}, {}, {}, {}};
         const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope);
@@ -418,7 +426,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             const auto effective = sv::parse_json(capabilities.body);
             const auto* profile = effective.find("profile");
             const auto* weights = effective.find("weight_load");
-            require(capabilities.status == 200 && profile && profile->as_string() == (tier_name == "exact" ? "exact" : "fast") && weights &&
+            require(capabilities.status == 200 && profile && profile->as_string() == tier_name && weights &&
                     (tier_name != "fast" ||  // the FAST plan; the other tiers carry their own weight plan
                      (weights->find("storage")->as_string() == (qualify_q8 ? "gguf.q8_0" : "plain.bf16") &&
                       weights->find("status")->as_string() == (qualify_q8 ? "unqualified" : "pending"))),

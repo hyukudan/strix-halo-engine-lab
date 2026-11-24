@@ -58,6 +58,7 @@ levers = "exact"
 [presets.fast]
 levers = "fast"
 
-# Use the admitted FAST levers until this model has a qualified TURBO set.
+# The server resolves the requested tier like the command line: the native TURBO column carries the FAST lever values
+# until this model has a qualified TURBO set (include/strix/profiles/inkling2_mini.hpp).
 [presets.turbo]
-levers = "fast"
+levers = "turbo"

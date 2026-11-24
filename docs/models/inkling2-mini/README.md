@@ -74,8 +74,10 @@ build-cuda/strix-inkling2-mini-cuda MODEL.safetensors \
     TOKEN_ID TOKEN_ID --prefill-chunk 128 --generate 24
 ```
 
-Decode runs the experts on the one-row packed form by default, on both
-backends and on both entry points (the command line and `strix-serve`). On
+Decode runs the experts on the one-row packed form by default on the command
+line (both backends) and on `strix-serve` with HIP. A CUDA `strix-serve` without
+a flag keeps the grouped form it served before until its own identity ticket
+covers packed serving; `--packed-decode` selects packed there explicitly. On
 HIP a served lane keeps the bits of its own lone decode at any cohort width:
 cohorts run in passes of at most 16 lanes, the row limit of the dense one-row
 form. `--packed-decode` or `--grouped-decode` selects the form explicitly on

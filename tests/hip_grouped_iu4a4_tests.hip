@@ -192,7 +192,8 @@ Launch make_launch(const Plan& p, const Bank& gate, const Bank& down, float* y, 
     l.index_base = upload(std::vector<std::uint16_t>(p.token.size() + 1U, 0));
     for (std::size_t t = 0; t < p.tile_first.size(); ++t) {
         TileRows g{gate.matrix(p.tile_expert[t], true), l.index_base + p.tile_first[t], nullptr, 1U, 0U, p.tile_rows[t]};
-        TileRows d{down.matrix(p.tile_expert[t], true), nullptr, y + std::size_t(p.tile_first[t]) * n_down, 0U, n_down, p.tile_rows[t]};
+        TileRows d{down.matrix(p.tile_expert[t], true), l.index_base + p.tile_first[t], y + std::size_t(p.tile_first[t]) * n_down, 1U,
+                   n_down, p.tile_rows[t]};
         l.gate_tiles.push_back(g);
         l.down_tiles.push_back(d);
     }
@@ -514,15 +515,20 @@ int faults() {
         CHECK(hipFree(dm));
     }
     // Verdicts of the validation launch alone (count, coverage, planner failure).
-    const auto verdict = [&](const char* what, std::vector<TileRows> tl, unsigned count, unsigned planned, unsigned want) {
+    // Down side: the down tiles of the launch (gate bank, its code rule) unless `dl` replaces them.
+    const auto verdict = [&](const char* what, std::vector<TileRows> tl, unsigned count, unsigned planned, unsigned want,
+                             std::vector<TileRows> dl = {}) {
         gi::TileSource s = source(l, gate, gim, true, ng, dh, ng);
+        gi::TileSource ds = source(l, gate, gim, false, ng, dh, ng);
         TileRows* dt = upload(tl);
+        TileRows* dd = upload(dl.empty() ? l.down_tiles : dl);
         unsigned* dc = upload(std::vector<unsigned>{count});
         unsigned* df = upload(std::vector<unsigned>{planned});
-        s.tiles = s.index_tiles = dt;
-        s.tile_count = dc;
+        s.tiles = s.index_tiles = ds.index_tiles = dt;
+        ds.tiles = dd;
+        s.tile_count = ds.tile_count = dc;
         CHECK(hipMemset(l.dfault, 0, 4U));
-        hipLaunchKernelGGL(gi::detail::validate_kernel, dim3(1), dim3(1024), 0, nullptr, s, s, static_cast<const unsigned*>(df), tiles, A,
+        hipLaunchKernelGGL(gi::detail::validate_kernel, dim3(1), dim3(1024), 0, nullptr, s, ds, static_cast<const unsigned*>(df), tiles, A,
                            tokens, l.dfault);
         CHECK(hipGetLastError());
         CHECK(hipDeviceSynchronize());
@@ -530,6 +536,7 @@ int faults() {
         std::printf("%s verdict '%s': 0x%08x (want 0x%08x)\n", got == want ? "PASS" : "FAIL", what, got, want);
         fails += got == want ? 0 : 1;
         CHECK(hipFree(dt));
+        CHECK(hipFree(dd));
         CHECK(hipFree(dc));
         CHECK(hipFree(df));
     };
@@ -541,6 +548,17 @@ int faults() {
     verdict("device count past the plan", l.gate_tiles, tiles + 1U, 0U, gi::kFaultBounds);
     verdict("overlapping tiles", overlap, tiles, 0U, gi::kFaultBounds);
     verdict("planner failure copied", l.gate_tiles, tiles, 5U, 5U);
+    // A down tile is the gate/up tile's expert over the gate/up tile's rows: another expert, another tile's interval or an
+    // interval one row off is refused although every bound holds.
+    unsigned other = 1U;
+    while (other < tiles && p.tile_expert[other] == p.tile_expert[0]) ++other;
+    std::vector<TileRows> wrong_expert = l.down_tiles, wrong_interval = l.down_tiles, off_by_one = l.down_tiles;
+    if (other < tiles) wrong_expert[0].weights = l.down_tiles[other].weights;
+    wrong_interval[1].input = l.down_tiles[0].input;
+    off_by_one[0].input += 1;
+    verdict("down tile of another expert", l.gate_tiles, tiles, 0U, other < tiles ? gi::kFaultBounds : 0U, wrong_expert);
+    verdict("down tile over another tile's interval", l.gate_tiles, tiles, 0U, gi::kFaultBounds, wrong_interval);
+    verdict("down tile interval one row off", l.gate_tiles, tiles, 0U, gi::kFaultBounds, off_by_one);
     CHECK(hipFree(dh));
     return fails;
 }
@@ -632,6 +650,11 @@ int pass_cases() {
         for (std::size_t i = from; i < to; ++i) bad += bits(y[i]) != want;
         return bad;
     };
+    const auto untouched = [](const std::vector<std::uint8_t>& ws, int poison) {
+        unsigned bad = 0;
+        for (const std::uint8_t v : ws) bad += v != static_cast<std::uint8_t>(poison);
+        return bad;
+    };
     int fails = 0;
     const auto report = [&](bool ok, const char* what) {
         std::printf("%s pass %s (tokens %u assignments %u tiles %u)\n", ok ? "PASS" : "FAIL", what, tokens, A, tiles);
@@ -649,10 +672,11 @@ int pass_cases() {
     const Out f = run(0x5a, 1U, tiles, pass);
     report(f.status == hipSuccess && f.verdict == 1U && poisoned(f.y, 0U, y_floats, 0x5a) == 0U &&
                image_same(f, run(0x5a, 1U, tiles, pass), inner_at, A, ffn) == 0U &&
-               f.act[inner_at] == 0x5aU && f.act[inner_at + ad::act_code_bytes(A, ffn) - 1U] == 0x5aU,
-           "planner failure: no down row, no h image byte stored");
+               untouched(f.act, 0x5a) == 0U,
+           "planner failure: no down row, no token or h image byte stored");
     const Out t = run(0x5a, 0U, tiles - 1U, pass);
-    report(t.verdict == gi::kFaultBounds && poisoned(t.y, 0U, y_floats, 0x5a) == 0U, "short device count: refused, nothing stored");
+    report(t.verdict == gi::kFaultBounds && poisoned(t.y, 0U, y_floats, 0x5a) == 0U && untouched(t.act, 0x5a) == 0U,
+           "short device count: refused, nothing stored (activation workspace included)");
     std::vector<TileRows> past = l.down_tiles;
     past[0].output = dy + y_floats;  // one past the destination
     past[1].output = past[0].output;  // and a conflicting destination

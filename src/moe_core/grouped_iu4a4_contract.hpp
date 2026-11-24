@@ -34,9 +34,9 @@ namespace packed = strix::weight::microscaled;
 namespace rot = strix::core::iu4a4_rot;
 using grouped_microscaled::TileRows;
 inline constexpr unsigned kCtaRows = 128U;  // rows per CTA of the grouped GEMM; taller plan tiles run as row slices
-// Widest intermediate the pass quantises in its one-CTA-per-row form (the verdict-gated launch of h), and the most
-// tiles its one-CTA validation launch admits (interval table in LDS).
-inline constexpr unsigned kMaxIntermediate = 24576U;
+// Widest projection input (hidden and intermediate) the pass quantises in its one-CTA-per-row form (the verdict-gated
+// launches of the token image and of h), and the most tiles its one-CTA validation launch admits (interval table in LDS).
+inline constexpr unsigned kMaxRowInputs = 24576U;
 inline constexpr unsigned kMaxPassTiles = 2048U;
 
 constexpr std::size_t image_code_bytes(unsigned in, unsigned n) { return std::size_t(n) * in / 2U; }
@@ -89,7 +89,7 @@ inline const char* refusal(const Pass& p) {
         return "missing operand";
     if (p.tiles == 0U || p.tiles > kMaxPassTiles || p.max_tile_rows == 0U || p.max_tile_rows > p.assignments ||
         !supported(p.hidden, gate_width, true) || !supported(p.intermediate, p.hidden, false) ||
-        p.intermediate > kMaxIntermediate)
+        p.hidden > kMaxRowInputs || p.intermediate > kMaxRowInputs)
         return "shape the class does not take";
     if (reinterpret_cast<std::uintptr_t>(p.act) % 256U != 0U ||
         p.act_size < act_bytes(p.rows, p.assignments, p.hidden, p.intermediate))
