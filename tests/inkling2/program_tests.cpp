@@ -530,10 +530,10 @@ void check_latency_forms(const exec::CudaRecipeProgram& base, const exec::CudaRe
     const std::pair<std::string_view, std::string_view> map[]{
         {"cuda-sm120-residual-bank-mix-r1-v1", "cuda-sm120-residual-bank-softmax-tiled-r1-v1"},
         {"cuda-sm120-bf16-r1-mma3-group-round-v1", "cuda-sm120-bf16-r1-mma3-output-split-round-v1"},
-        {"cuda-sm120-packed-nvfp4-gate-up-r1-k8-v1", "cuda-sm120-packed-nvfp4-gate-up-r1-k8-pipe-v1"},
-        {"cuda-sm120-packed-mxfp8-gate-up-r1-k8-v1", "cuda-sm120-packed-mxfp8-gate-up-r1-k8-pipe-v1"},
-        {"cuda-sm120-packed-nvfp4-down-combine-r1-k8-v1", "cuda-sm120-packed-nvfp4-down-combine-r1-k8-pipe-v1"},
-        {"cuda-sm120-packed-mxfp8-down-combine-r1-k8-v1", "cuda-sm120-packed-mxfp8-down-combine-r1-k8-pipe-v1"},
+        {"cuda-sm120-packed-nvfp4-gate-up-r1-k8-pdl-v1", "cuda-sm120-packed-nvfp4-gate-up-r1-k8-pipe-v1"},
+        {"cuda-sm120-packed-mxfp8-gate-up-r1-k8-pdl-v1", "cuda-sm120-packed-mxfp8-gate-up-r1-k8-pipe-v1"},
+        {"cuda-sm120-packed-nvfp4-down-combine-r1-k8-pdl-v1", "cuda-sm120-packed-nvfp4-down-combine-r1-k8-pipe-v1"},
+        {"cuda-sm120-packed-mxfp8-down-combine-r1-k8-pdl-v1", "cuda-sm120-packed-mxfp8-down-combine-r1-k8-pipe-v1"},
     };
     std::array<unsigned, std::size(map)> moved{}, incumbent{};
     for (std::size_t i = 0; i < a.size(); ++i) {

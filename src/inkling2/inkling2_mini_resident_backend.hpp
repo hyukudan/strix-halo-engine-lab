@@ -627,20 +627,42 @@ private:
                     base += group.chunk.rows;
                 }
             }
-            check(prepare_with([&](const auto& backend) {
+            const auto prepare = [&](const auto& backend) {
                 return attn_core::enqueue_prepared_gqa<MiniPreparedGqaShape>(
                     backend, is_full_attention(visit.physical_layer), single ? single->chunk.first_position : 0U,
                     rows, inputs, weights, work, prep, operand_failure, device_position, prep_groups_, prep_lanes);
-            }));
-            if (single) {
-                // A taped (verify) chunk keeps the raw K/V rows, the inputs of the two KV convolutions.
+            };
+            // A taped (verify) chunk keeps the raw K/V rows, the inputs of the two KV convolutions.
+            const auto keep_tape = [&] {
+                if (!single) return;
                 const auto kv_rows = std::size_t{rows} * kKvWidth;
                 if (const auto key_tape = single->state.tape[0]; !key_tape.empty())
                     copy(std::span<const float>(work.raw_keys, kv_rows), key_tape);
                 if (const auto value_tape = single->state.tape[1]; !value_tape.empty())
                     copy(std::span<const float>(work.raw_values, kv_rows), value_tape);
+            };
+#if defined(__HIPCC__)
+            // A single prefill chunk in one window (the route mini_hip_bias_in_attention admits) projects the relative
+            // bias inside the flash: the prepare stage skips the [row][head][distance] image and its producer, the
+            // flash computes the same logits and flags (shared DenseProjectedBias trait). The null-order count needs
+            // the image producer, so it keeps the image route.
+            const auto* bias_weights =
+                attn_core::detail::bf16_projection(weights.projection(MiniAttentionProjection::relative_bias));
+            if (single && !adapter.null_applications && route_.attention_rows >= rows &&
+                mini_hip_bias_in_attention(rows, key_splits(image_of(*single, 0U)), device_position,
+                                           work.relative_features, bias_weights)) {
+                const detail::MiniResidentGqaBackend<detail::MiniPreparedHipProjectedBackend> projected{{{{stream_}}}, nullptr};
+                check(prepare(projected));
+                keep_tape();
+                check(enqueue_mini_hip_attention_projected<true>(visit, image_of(*single, 0U), cache_of(*single),
+                                                                 work.relative_features, bias_weights, failure, stream_));
+            } else
+#endif
+            {
+                check(prepare_with(prepare));
+                keep_tape();
+                launch_visits(visits);
             }
-            launch_visits(visits);
             check(attn_core::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(
                 adapter, rows, weights.projection(MiniAttentionProjection::output), attended, prep.gate_logits,
                 gated, output.data(), weights.output_row_bytes));
