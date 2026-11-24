@@ -289,6 +289,12 @@ void selection() {
          view::resolve_schedule(S::staged, 8U, 32U, true) == S::staged &&
          view::resolve_schedule(S::tall, 8U, 32U, true) == S::tall &&
          view::resolve_schedule(S::narrow, 200U, 32U, true) == S::narrow &&
+         view::resolve_schedule(S::automatic, 256U, 32U, true, 32U) == S::narrow &&
+         view::resolve_schedule(S::automatic, 256U, 32U, true, 33U) == S::tall &&
+         view::resolve_schedule(S::automatic, 0U, 32U, true, 4U) == S::narrow &&
+         view::resolve_schedule(S::automatic, 256U, 32U, false, 4U) == S::staged &&
+         view::resolve_schedule(S::automatic, 256U, 0U, true, 4U) == S::tall &&
+         view::resolve_schedule(S::tall, 256U, 32U, true, 4U) == S::tall &&
          view::tile_row_slices(48U, 256U, 32U) == 2U && view::tile_row_slices(32U, 256U, 32U) == 1U;
     check(ok, "schedule resolution: narrow for 1..32 known rows, tall above, staged without the K64 stage", none, true);
     // The HIP direct packed launch admits only shapes whose every stage exists: K = 96 is refused under the K64 tall

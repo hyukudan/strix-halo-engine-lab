@@ -44,14 +44,17 @@ enum class Decode : std::uint8_t { reference, shift };
 enum class Schedule : std::uint8_t { automatic, staged, tall, narrow };
 
 // Resolution of Schedule::automatic (backend-neutral; the backend supplies its CTA heights and whether the launch shape
-// fits the K stage shared by its tall and narrow bodies): narrow when the host-known bound on live tile rows is known and
-// fits one narrow CTA (narrow_rows 0 = no narrow body), else tall where it fits, else staged. Every schedule stores the
-// same bits, so the choice never changes a row's result (batch invariance holds across it).
+// fits the K stage shared by its tall and narrow bodies): narrow when the host-known bound on live tile rows fits one
+// narrow CTA, or when the host-known mean live rows per tile does (a taller tile then runs ceil(max / narrow_rows) narrow
+// row slices, the short slices exit; measured faster than the tall CTA while the mean stays within one narrow CTA);
+// narrow_rows 0 = no narrow body; else tall where it fits, else staged. Every schedule stores the same bits, so the
+// choice never changes a row's result (batch invariance holds across it).
 STRIX_GROUPED_ROWS_HD constexpr Schedule resolve_schedule(Schedule requested, unsigned max_tile_rows, unsigned narrow_rows,
-                                                          bool stage_fits) {
+                                                          bool stage_fits, unsigned mean_tile_rows = 0U) {
     if (requested != Schedule::automatic) return requested;
     if (!stage_fits) return Schedule::staged;
-    return max_tile_rows != 0U && max_tile_rows <= narrow_rows ? Schedule::narrow : Schedule::tall;
+    const auto fits_narrow = [narrow_rows](unsigned rows) { return rows != 0U && rows <= narrow_rows; };
+    return fits_narrow(max_tile_rows) || fits_narrow(mean_tile_rows) ? Schedule::narrow : Schedule::tall;
 }
 
 struct Args {
@@ -72,6 +75,8 @@ struct Args {
     float up_cap{};
     Decode decode{Decode::reference};
     Schedule schedule{Schedule::automatic};
+    // Host-known mean live rows per tile (ceil(assignments / experts)); zero means unknown. Schedule choice only.
+    unsigned mean_tile_rows{};
 };
 
 // Args of a gate-up whose tiles read their input rows in place: a tile whose input is gather_from + first x input_row

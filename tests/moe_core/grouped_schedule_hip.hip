@@ -1,11 +1,12 @@
 // No-model fixture of the schedule (placement) trait of the HIP grouped microscaled BF16 tile at the Inkling 2 Mini expert
-// shapes (gate_up 2304 x 2304 interleaved halves, down 2304 x 1152; 128 experts, top 8), NVFP4 and MXFP8, at decode row
-// counts. Every schedule runs one WMMA chain per output over the K16 units in ascending order, so every arm must store
-// the same bits. Checks per route draw (rows 1, 2, 8, 16, 48): the plain gate-up, the activated gate-up (paired
-// epilogue) and the down projection of every arm byte-equal to the tall arm, every output finite (outputs are seeded with
-// a NaN sentinel first); rows 48 runs the 32-row narrow CTA over two row slices. With --bench: ms per visit (activated
-// gate-up + down, the served form) per arm and rows, skewed routes, arms interleaved twice (A B C .. A B C ..), and GB/s
-// over the distinct expert bytes. Exit 1 on a failed check.
+// shapes (gate_up 2304 x 2304 interleaved halves, down 2304 x 1152; 128 experts, top 8), NVFP4 and MXFP8, at decode
+// and prefill row counts. Every schedule runs one WMMA chain per output over the K16 units in ascending order, so every
+// arm must store the same bits. Checks per route draw (rows 1, 2, 8, 16, 48, 128, 512; expert tiles split at 256 rows):
+// the plain gate-up, the activated gate-up (paired epilogue) and the down projection of every arm byte-equal to the tall
+// arm, every output finite (outputs are seeded with a NaN sentinel first); tiles above 32 rows run the narrow CTA over
+// row slices. The automatic arm gets the dispatch's bounds (max tile rows, mean rows = ceil(assignments / experts)).
+// With --bench: ms per visit (activated gate-up + down, the served form) per arm at rows 1 .. 2048, skewed routes, arms
+// interleaved twice (A B C .. A B C ..), and GB/s over the distinct expert bytes. Exit 1 on a failed check.
 #include <hip/hip_runtime.h>
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
@@ -34,7 +35,8 @@ using Format = packed::MatrixFormat;
 
 constexpr unsigned kExperts = 128U, kTopK = 8U, kHidden = 2304U, kInter = 1152U, kGate = 2U * kInter;
 constexpr unsigned kVariants = 6U;  // route draws cycled per timed rep (distinct experts per rep, cold weights)
-constexpr unsigned kMaxRows = 48U, kMaxAssign = kMaxRows * kTopK;
+constexpr unsigned kMaxRows = 2048U, kMaxAssign = kMaxRows * kTopK;
+constexpr unsigned kMaxTiles = kExperts + kMaxAssign / 256U;  // expert-major tiles split at kRowsPerTile
 constexpr float kGateCap = 4.0F, kUpCap = 25.0F;
 
 void require_hip(hipError_t status, const char* what) {
@@ -145,15 +147,15 @@ Device make_device() {
     require_hip(hipMalloc(&d.act, std::size_t{kMaxAssign} * kInter * 2U), "m");
     require_hip(hipMalloc(&d.gu_out, std::size_t{kMaxAssign} * kGate * 4U), "m");
     require_hip(hipMalloc(&d.dn_out, std::size_t{kMaxAssign} * kHidden * 4U), "m");
-    require_hip(hipMalloc(&d.gu_tiles, kExperts * sizeof(grouped::TileRows)), "m");
-    require_hip(hipMalloc(&d.dn_tiles, kExperts * sizeof(grouped::TileRows)), "m");
+    require_hip(hipMalloc(&d.gu_tiles, kMaxTiles * sizeof(grouped::TileRows)), "m");
+    require_hip(hipMalloc(&d.dn_tiles, kMaxTiles * sizeof(grouped::TileRows)), "m");
     return d;
 }
 
 // Expert-major tiles of one route draw over gathered rows.
 struct Plan {
     std::vector<grouped::TileRows> gu, dn;
-    unsigned max_rows{}, distinct{};
+    unsigned max_rows{}, mean_rows{}, distinct{};  // mean_rows: ceil(assignments / experts), as the dispatch
 };
 
 Plan plan_of(const Experts& F, const Routes& r, unsigned rows, const Device& d) {
@@ -164,13 +166,18 @@ Plan plan_of(const Experts& F, const Routes& r, unsigned rows, const Device& d) 
         for (unsigned row = 0; row < rows; ++row)
             for (unsigned k = 0; k < kTopK; ++k) n += r.ids[row * kTopK + k] == e ? 1U : 0U;
         if (n == 0U) continue;
-        p.max_rows = std::max(p.max_rows, n);
-        p.gu.push_back({F.host[e].gate_up, d.gu_in + std::size_t{first} * kHidden, d.gu_out + std::size_t{first} * kGate,
-                        kHidden, kGate, n});
-        p.dn.push_back({F.host[e].down, d.dn_in + std::size_t{first} * kInter, d.dn_out + std::size_t{first} * kHidden,
-                        kInter, kHidden, n});
-        first += n;
+        for (unsigned left = n; left != 0U;) {  // expert-major tiles of at most kRowsPerTile rows
+            const unsigned t = std::min(left, grouped::kRowsPerTile);
+            p.max_rows = std::max(p.max_rows, t);
+            p.gu.push_back({F.host[e].gate_up, d.gu_in + std::size_t{first} * kHidden,
+                            d.gu_out + std::size_t{first} * kGate, kHidden, kGate, t});
+            p.dn.push_back({F.host[e].down, d.dn_in + std::size_t{first} * kInter,
+                            d.dn_out + std::size_t{first} * kHidden, kInter, kHidden, t});
+            first += t;
+            left -= t;
+        }
     }
+    p.mean_rows = (rows * kTopK + kExperts - 1U) / kExperts;
     p.distinct = r.distinct;
     return p;
 }
@@ -180,18 +187,20 @@ void upload_plan(const Plan& p, const Device& d) {
     require_hip(hipMemcpy(d.dn_tiles, p.dn.data(), p.dn.size() * sizeof(grouped::TileRows), hipMemcpyHostToDevice), "t");
 }
 
-grouped::Args plain_args(const grouped::TileRows* tiles, unsigned count, unsigned inputs, unsigned outputs, unsigned rows) {
+grouped::Args plain_args(const grouped::TileRows* tiles, unsigned count, unsigned inputs, unsigned outputs, unsigned rows,
+                         unsigned mean_rows) {
     grouped::Args a{};
     a.tiles = tiles;
     a.count = count;
     a.inputs = inputs;
     a.outputs = outputs;
     a.max_tile_rows = rows;
+    a.mean_tile_rows = mean_rows;
     return a;
 }
 
 grouped::Args activated_args(const Plan& p, const Device& d) {
-    auto a = plain_args(d.gu_tiles, unsigned(p.gu.size()), kHidden, kGate, p.max_rows);
+    auto a = plain_args(d.gu_tiles, unsigned(p.gu.size()), kHidden, kGate, p.max_rows, p.mean_rows);
     a.pair_rows = d.dn_tiles;
     a.rebase_from = d.dn_in;
     a.rebase_to = d.act;
@@ -223,7 +232,7 @@ void with_arm(unsigned arm, Fn&& fn, Public&& pub) {
 }
 
 grouped::Args down_args(const Plan& p, const Device& d) {
-    auto down = plain_args(d.dn_tiles, unsigned(p.dn.size()), kInter, kHidden, p.max_rows);
+    auto down = plain_args(d.dn_tiles, unsigned(p.dn.size()), kInter, kHidden, p.max_rows, p.mean_rows);
     down.rebase_from = d.dn_in;
     down.rebase_to = d.act;
     return down;
@@ -246,8 +255,8 @@ void visit(unsigned arm, const Plan& p, const Device& d) {
 
 template <Format F>
 void plain(unsigned arm, const Plan& p, const Device& d) {
-    const auto gu = plain_args(d.gu_tiles, unsigned(p.gu.size()), kHidden, kGate, p.max_rows);
-    const auto dn = plain_args(d.dn_tiles, unsigned(p.dn.size()), kInter, kHidden, p.max_rows);
+    const auto gu = plain_args(d.gu_tiles, unsigned(p.gu.size()), kHidden, kGate, p.max_rows, p.mean_rows);
+    const auto dn = plain_args(d.dn_tiles, unsigned(p.dn.size()), kInter, kHidden, p.max_rows, p.mean_rows);
     with_arm<F>(
         arm,
         [&]<class S>() {
@@ -278,7 +287,7 @@ template <Format F>
 bool check(const Experts& Fm, const Device& d, std::mt19937& rng) {
     const char* name = F == Format::nvfp4 ? "nvfp4" : "mxfp8";
     bool ok = true;
-    for (unsigned rows : {1U, 2U, 8U, 16U, kMaxRows}) {
+    for (unsigned rows : {1U, 2U, 8U, 16U, 48U, 128U, 512U}) {
         const auto r = draw(rows, rng);
         const auto p = plan_of(Fm, r, rows, d);
         upload_plan(p, d);
@@ -322,7 +331,7 @@ void bench(const Experts& Fm, const Device& d, std::mt19937& rng) {
     hipEvent_t e0, e1;
     require_hip(hipEventCreate(&e0), "e");
     require_hip(hipEventCreate(&e1), "e");
-    for (unsigned rows : {1U, 2U, 4U, 8U, 16U}) {
+    for (unsigned rows : {1U, 2U, 4U, 8U, 16U, 24U, 32U, 48U, 64U, 128U, 256U, 512U, 1024U, 2048U}) {
         std::vector<Plan> ps;
         double distinct = 0.0;
         for (unsigned v = 0; v < kVariants; ++v) {
