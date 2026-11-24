@@ -2,6 +2,7 @@
 
 #include "attn_core/prepared_step.hpp"
 #include "core/short_convolution.hpp"
+#include "cuda/core/step_row_store.cuh"
 #include "cuda_program_recipe.hpp"
 #include "moe_core/microscaled_r1.hpp"
 
@@ -130,6 +131,17 @@ inline BoundStepLeaf bind_step(const core::causal_conv::StepArgs& a, unsigned ro
     return wr2_detail::by_width(rows, [&]<unsigned R>() {
         if (a.round_bf16) return wr2_detail::bind<R, enqueue_step<R, true>>(a, "cuda-sm120-causal-convolution-bf16", native);
         return wr2_detail::bind<R, enqueue_step<R, false>>(a, "cuda-sm120-causal-convolution-f32", native);
+    });
+}
+
+// Position-indexed BF16 row store (drafter feature taps): one width-bound program per width, the positions
+// come from the step descriptor, so the R = 1 decode graph and every verify graph reuse their capture.
+inline BoundStepLeaf bind_step(const cuda::core::StepRowStoreBf16& a, unsigned rows) {
+    if (!cuda::core::valid_step_row_store(a)) throw std::invalid_argument("invalid step row store");
+    const unsigned blocks = cuda::core::step_row_store_blocks(a.width);
+    return wr2_detail::by_width(rows, [&]<unsigned R>() {
+        return wr2_detail::bind<R, cuda::core::enqueue_step_row_store_bf16<R>>(a, "cuda-sm120-step-row-store-bf16",
+            {{blocks, R, 1}, {256, 1, 1}, 0});
     });
 }
 

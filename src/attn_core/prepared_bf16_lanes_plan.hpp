@@ -13,6 +13,7 @@
 // the number of lanes or on another lane, so a lane's bits equal the one-lane append_prepared_bf16 bits.
 
 #include "dense_flash_keysplit.hpp"
+#include "strix/attn/prepared_lanes.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -75,37 +76,10 @@ inline bool distinct_lane_caches(std::span<const PreparedBf16Lane> lanes) {
     return true;
 }
 
-// Lanes of one sequence on one cache (the rows of a verify window, each at its own position with its one-row decode
-// geometry). The lanes launch stores every lane's row before any flash, while the one-lane sequence stores and attends
-// row by row. A lane reads only the positions up to its own, so both orders read the same keys when the lanes that
-// share a cache are adjacent with consecutive positions (lane i + 1 at lane i's position + 1) and no store of the run
-// reuses a slot that a lane of the run still reads: a ring (wrapped) needs a window and cache_slots >= window - 1 +
-// run length (the session window ring reserves window - 1 + max chunk rows). Lanes on different caches must not alias,
-// as in distinct_lane_caches; with no shared cache this is distinct_lane_caches.
+// Lanes of one sequence on one cache (verify windows): the one backend-neutral rule of the lane contract
+// (strix/attn/prepared_lanes.hpp sequence_lane_caches), which the CUDA lanes admission binds as well.
 inline bool sequence_lane_caches(std::span<const PreparedBf16Lane> lanes, unsigned window) {
-    std::size_t run = 1U;  // Lanes on lane i's cache, ending at lane i.
-    for (std::size_t i = 0; i < lanes.size(); ++i) {
-        const auto& lane = lanes[i];
-        if (!lane.keys || !lane.values || lane.keys == lane.values) return false;
-        const bool same = i > 0U && lane.keys == lanes[i - 1U].keys && lane.values == lanes[i - 1U].values;
-        if (same) {
-            const auto& prior = lanes[i - 1U];
-            if (lane.first_position != prior.first_position + 1U || lane.cache_slots != prior.cache_slots ||
-                lane.wrapped != prior.wrapped)
-                return false;
-            ++run;
-            if (lane.wrapped != 0U && (window == 0U || std::size_t{lane.cache_slots} < std::size_t{window} - 1U + run))
-                return false;
-        } else {
-            run = 1U;
-        }
-        for (std::size_t j = 0; j + run <= i; ++j) {  // Lanes before this cache's run.
-            const auto* k = lanes[j].keys;
-            const auto* v = lanes[j].values;
-            if (lane.keys == k || lane.keys == v || lane.values == k || lane.values == v) return false;
-        }
-    }
-    return true;
+    return ::strix::attn::lanes::sequence_lane_caches<PreparedBf16Lane>(lanes, window);
 }
 
 // Lane `index` of the packed images in a one-lane argument block (PreparedBf16Args or a struct with its fields):
