@@ -87,7 +87,6 @@ inline constexpr std::string_view receipt = "gfx1151 EXACT served-cli-prefill, o
 inline constexpr double pass_fixed_ms = 0x0p+0 /* 0 */;
 inline constexpr std::string_view receipt = "incumbent busy regime (main: share 1 beside a decoding request; 256-row pieces = two 128-row slices)";
 } // namespace hip
-inline constexpr std::string_view identity = "served-incumbent";
 } // namespace serve_prefill
 namespace weights {
 namespace format {

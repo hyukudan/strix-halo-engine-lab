@@ -1,5 +1,6 @@
 #include "inkling2/inkling2_mini_schedule.hpp"
 #include "inkling2/inkling2_mini_serve.hpp"
+#include "inkling2/inkling2_mini_state.hpp"
 #include "strix/serve/fixed_kv_cohort.hpp"
 #include "strix/serve/http_client.hpp"
 #include "strix/serve/replica_router.hpp"
@@ -9,6 +10,7 @@
 #include <future>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -353,38 +355,116 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                                            "weight_storage plain.bf16@1 weight_status pending";
         require(out.str().find(expected) != std::string::npos, "inspection weight plan differs from CLI plan");
         // The served data (models/inkling2-mini.toml [serve_prefill]) as literals, so an edit of the data or of its
-        // resolver fails here: the default identity is served-incumbent (main's served bits, form chunk 128, no tail
-        // absorption); HIP runs it with the CLI's 8192-row chunk alone and, beside a decoding lane, the pieces, the
-        // gap and the share of the device class at launch (backend row: 256-row pieces); CUDA keeps the incumbent 128-row chunks, no pieces.
-        // STRIX_INKLING_PREFILL_TAIL is unset in the test.
+        // resolver fails here: with no identity variant requested the identity is the incumbent (main's served bits,
+        // form chunk 128, no tail absorption); HIP runs it with the CLI's 8192-row chunk alone and, beside a decoding
+        // lane, the pieces, the gap and the share of the device class at launch (backend row: 256-row pieces); CUDA
+        // keeps the incumbent 128-row chunks, no pieces. STRIX_INKLING_PREFILL_TAIL is unset in the test.
         const bool hip = std::string_view(backend) == "hip";
         const std::string line = hip ? "prefill_rows 8192 prefill_tail_divisor 0 prefill_rows_decoding device-class "
-                                       "prefill_gap_ms device-class prompt_share device-class served_identity "
-                                       "served-incumbent reference main-served form_rows 128"
+                                       "prefill_gap_ms device-class prompt_share device-class served identity "
+                                       "incumbent form_rows 128"
                                      : "prefill_rows 128 prefill_tail_divisor 0 prefill_rows_decoding 0 prefill_gap_ms 0 "
-                                       "prompt_share device-class served_identity served-incumbent reference main-served "
-                                       "form_rows 128";
+                                       "prompt_share device-class served identity incumbent form_rows 128";
         require(out.str().find(line) != std::string::npos, "server prefill schedule differs from its data");
-        // The variant is selected explicitly and printed with its reference; an unknown identity is refused.
-        {
-            std::ostringstream o, e;
-            strings.insert(strings.end(), {"--served-identity", "served-cli-prefill", "--family-inspect"});
+        // The variant goes through the shared resolver (review r19): requested by --identity-variant ID[@VERSION],
+        // admitted on a declared backend (HIP) under a tier its row admits (also EXACT: an exact identity variant),
+        // printed with its version and reference; the CLI's chunk and tail rule. Refused before any device work: an
+        // unknown id, a version this build does not declare, an undeclared backend (CUDA, no served receipt yet) and
+        // the retired family-local switch.
+        const auto inspect_with = [&](std::initializer_list<const char*> extra, std::ostringstream& o,
+                                      std::ostringstream& e) {
+            const auto size = strings.size();
+            strings.insert(strings.end(), extra.begin(), extra.end());
+            strings.emplace_back("--family-inspect");
             const auto code = run({}, o, e);
-            strings.resize(strings.size() - 3U);
-            const std::string variant = hip ? "prefill_rows 8192 prefill_tail_divisor 8 prefill_rows_decoding device-class"
-                                            : "prefill_rows 128 prefill_tail_divisor 0 prefill_rows_decoding 0";
-            require(code == 0 && o.str().find(variant) != std::string::npos &&
-                        o.str().find("served_identity served-cli-prefill reference cli-grouped-decode form_rows 0") !=
-                            std::string::npos,
-                    "the served-cli-prefill variant was not resolved and printed");
-            std::ostringstream o2, e2;
-            strings.insert(strings.end(), {"--served-identity", "cli", "--family-inspect"});
-            const auto bad = run({}, o2, e2);
-            strings.resize(strings.size() - 3U);
-            require(bad != 0 && e2.str().find("--served-identity") != std::string::npos && !created,
-                    "an unknown served identity was not refused");
+            strings.resize(size);
+            return code;
+        };
+        for (const auto* request : {"served-cli-prefill", "served-cli-prefill@1"}) {
+            std::ostringstream o, e;
+            const auto code = inspect_with({"--identity-variant", request}, o, e);
+            if (hip)
+                require(code == 0 && !created &&
+                            o.str().find("prefill_rows 8192 prefill_tail_divisor 8 prefill_rows_decoding device-class") !=
+                                std::string::npos &&
+                            o.str().find("served identity served-cli-prefill@1 reference cli-grouped-decode form_rows 0") !=
+                                std::string::npos,
+                        "the served-cli-prefill variant was not admitted and printed on HIP");
+            else
+                require(code != 0 && !created && e.str().find("is not declared for backend cuda") != std::string::npos,
+                        "the served-cli-prefill variant was admitted on CUDA without its receipt");
         }
-        require(hip || mini::mini_resolve_prefill_chunk(0U, 8192U, false) == 2048U, "the CUDA CLI chunk stays 2048");
+        if (!qualify_q8) {  // --qualify-q8 requires FAST: the EXACT arm runs without it
+            std::ostringstream o, e;
+            auto tier = std::find(strings.begin(), strings.end(), "--profile");
+            require(tier != strings.end() && tier + 1 != strings.end(), "the test launches with --profile");
+            const std::string base = *(tier + 1);
+            *(tier + 1) = "exact";
+            const auto code = inspect_with({"--identity-variant", "served-cli-prefill"}, o, e);
+            *(std::find(strings.begin(), strings.end(), "--profile") + 1) = base;
+            require(hip ? code == 0 && o.str().find("served identity served-cli-prefill@1") != std::string::npos
+                        : code != 0,
+                    "EXACT admits the exact identity variant on its declared backend only");
+        }
+        {
+            struct Refusal {
+                const char* option;
+                const char* value;
+                const char* message;
+            };
+            const Refusal refused[] = {
+                {"--identity-variant", "cli", "unknown identity variant 'cli'"},
+                {"--identity-variant", "served-cli-prefill@2", "is not built (this build declares @1)"},
+                {"--served-identity", "served-cli-prefill", "unknown Inkling argument --served-identity"},
+            };
+            for (const auto& [option, value, message] : refused) {
+                std::ostringstream o, e;
+                const auto bad = inspect_with({option, value}, o, e);
+                require(bad != 0 && !created && e.str().find(message) != std::string::npos,
+                        "an unknown, unbuilt or retired identity request was not refused");
+            }
+        }
+        // CUDA CLI parity (review r19): the variant takes the CLI's chunk and tail rule on every backend, so without
+        // --prefill-rows its calls are the CLI's: a 129-token CUDA prompt is ONE 129-row call (CLI chunk 2048), not
+        // 128 + 1 (the server's chunk, the old resolution); short prompts, chunk + 1 and tail on / off follow the CLI.
+        {
+            using mini::MiniServedIdentity;
+            const auto cli = mini::mini_prefill_schedule(false);
+            const auto variant = mini::mini_served_prefill_rows(MiniServedIdentity::cli_prefill, 0U, 8192U, false,
+                                                                cli.tail_divisor);
+            const auto incumbent = mini::mini_served_prefill_rows(MiniServedIdentity::incumbent, 0U, 8192U, false,
+                                                                  cli.tail_divisor);
+            require(variant.chunk == mini::mini_resolve_prefill_chunk(0U, 8192U, false) && variant.chunk == 2048U &&
+                        variant.tail_divisor == cli.tail_divisor && incumbent.chunk == 128U &&
+                        incumbent.tail_divisor == 0U,
+                    "the CUDA variant resolves the CLI's chunk and tail rule");
+            const auto calls = [](std::size_t prompt, unsigned chunk, unsigned divisor) {
+                std::vector<std::size_t> rows_of;
+                const auto tail = mini::mini_call_tail_rows(prompt, chunk,
+                                                            mini::mini_prefill_tail_capacity(chunk, divisor, 8192U),
+                                                            [](unsigned) { return true; });
+                for (std::size_t done = 0; done < prompt;) {
+                    std::size_t rows = std::min<std::size_t>(chunk, prompt - done);
+                    if (tail != 0U && prompt - done == std::size_t{chunk} + tail) rows += tail;
+                    rows_of.push_back(rows);
+                    done += rows;
+                }
+                return rows_of;
+            };
+            for (const std::size_t prompt : {17U, 129U, 2049U, 2052U, 4100U})
+                for (const unsigned divisor : {cli.tail_divisor, 0U, 8U})
+                    require(calls(prompt, variant.chunk, divisor) == calls(prompt, cli.chunk, divisor),
+                            "the variant's calls equal the CLI's (short, chunk + 1, tail on / off)");
+            require(calls(129U, variant.chunk, cli.tail_divisor) == std::vector<std::size_t>{129U},
+                    "a 129-token CUDA prompt is one call");
+            require(calls(129U, incumbent.chunk, 0U) == std::vector<std::size_t>{128U, 1U},
+                    "the server's 128-row chunk (the old resolution) splits it 128 + 1");
+            const auto hip_cli = mini::mini_prefill_schedule(true);
+            const auto hip_variant = mini::mini_served_prefill_rows(MiniServedIdentity::cli_prefill, 0U, 8192U, true,
+                                                                    hip_cli.tail_divisor);
+            require(hip_variant.chunk == hip_cli.chunk && hip_variant.tail_divisor == hip_cli.tail_divisor,
+                    "the HIP variant resolves the CLI's chunk and tail rule");
+        }
         // The overrides through the entry point: --prefill-chunk is the server alias of --prefill-rows; the decoding-
         // piece rows are honoured on HIP and refused where the decoder declares no cut rule (CUDA).
         std::ostringstream out2, error2;
@@ -514,9 +594,89 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
 }
 } // namespace
 
+// Slot capacity counterfactual (review r19 P1), on the real per-slot KV geometry: at context 8192 the incumbent 128-row
+// chunk gives sliding-window visits a ring, the 8192-row chunk linear rows over the whole context. Both plans are
+// complete (rows-proportional reservation with the first slot, and each chunk's slot bytes). The old comparison divided
+// both budgets by the candidate's slot bytes and handed back only the activation arenas.
+void slot_counterfactual() {
+    const std::uint64_t small = mini::MiniSessionStatePlan(8192U, 128U).kv_bytes() +
+                                mini::MiniSessionStatePlan(8192U, 128U).convolution_bytes();
+    const std::uint64_t large = mini::MiniSessionStatePlan(8192U, 8192U).kv_bytes() +
+                                mini::MiniSessionStatePlan(8192U, 8192U).convolution_bytes();
+    require(large >= 2U * small, "the 8192-row chunk's slot (linear sliding rows) holds at least two 128-row slots");
+    const std::uint64_t total = 1000U * large;
+    // Rows-proportional reservations of the two decoders (the device values come from
+    // MiniResidentDecoder::row_reservation_bytes, checked against its allocation at construction).
+    const std::uint64_t r_large = 9U * large + large, r_small = 3U * small + small;
+    // KV cap of one large slot: the chunk admits one slot, the incumbent several: refused with the smaller-chunk remedy.
+    {
+        const std::uint64_t free = 500U * large, kv = large;
+        const auto lanes = sv::resident_kv_slots(free, total, 0U, kv, large, 128U);
+        const auto incumbent = mini::mini_counterfactual_slots(free, total, 0U, kv, 128U, r_large, r_small, small);
+        require(lanes == 1U && incumbent == std::min<std::uint64_t>(large / small, 128U) && incumbent > 1U,
+                "KV cap: the incumbent slot count");
+        // the old comparison: both budgets divided by the candidate's slot bytes
+        require(sv::resident_kv_slots(free + r_large - r_small, total, 0U, kv, large, 128U) == 1U,
+                "KV cap: the old comparison saw one slot in both arms");
+        const auto refusal = mini::mini_slot_refusal(lanes, incumbent, 0U, false, 8192U, 128U, large);
+        require(refusal.find("--prefill-rows 128") != std::string::npos &&
+                    refusal.find("--slots 1 to accept fewer") != std::string::npos,
+                "KV cap: the default chunk that costs slots is refused with both remedies");
+        require(mini::mini_slot_refusal(lanes, incumbent, 1U, false, 8192U, 128U, large).empty() &&
+                    mini::mini_slot_refusal(lanes, incumbent, 0U, true, 8192U, 128U, large).empty(),
+                "KV cap: explicit --slots 1 or --prefill-rows 8192 accept it");
+    }
+    // Device budget, same slot geometry in both plans (isolates the reservation): the chunk's arenas exceed the
+    // incumbent's by a quarter slot, its backend workspaces by half a slot. Find free memory where the arena-only
+    // hand-back (the old arithmetic) sees no loss but the complete difference adds a slot: refused there.
+    {
+        const std::uint64_t s = small, a_large = 1000U + s / 4U, a_small = 1000U, b_large = 2000U + s / 2U,
+                            b_small = 2000U;
+        const std::uint64_t cur = a_large + b_large + s, inc = a_small + b_small + s, big = 1000U * s;
+        bool found = false;
+        for (std::uint64_t free = 2U * s; free < 140U * s && !found; free += s / 16U + 1U) {
+            const auto lanes = sv::resident_kv_slots(free, big, 0U, 0U, s, 128U);
+            const auto incumbent = mini::mini_counterfactual_slots(free, big, 0U, 0U, 128U, cur, inc, s);
+            require(incumbent == sv::resident_kv_slots(free + cur - inc, big, 0U, 0U, s, 128U),
+                    "device budget: the incumbent plan is counted by the same rule");
+            const auto arena_only = sv::resident_kv_slots(free + a_large - a_small, big, 0U, 0U, s, 128U);
+            if (lanes != 0U && lanes < 128U && arena_only == lanes && incumbent > lanes) {
+                found = true;
+                require(!mini::mini_slot_refusal(lanes, incumbent, 0U, false, 8192U, 128U, s).empty(),
+                        "device budget: refused at the boundary the arena-only hand-back missed");
+            }
+        }
+        require(found, "device budget: a boundary where only the complete reservation difference adds a slot");
+    }
+    // Zero slots: a KV cap below one large slot holds no slot of the chunk but incumbent slots: the refusal names the
+    // smaller-chunk remedy (not "--slots 0").
+    {
+        const std::uint64_t kv = large - 1U, free = 500U * large;
+        const auto lanes = sv::resident_kv_slots(free, total, 0U, kv, large, 128U);
+        const auto incumbent = mini::mini_counterfactual_slots(free, total, 0U, kv, 128U, r_large, r_small, small);
+        const auto refusal = mini::mini_slot_refusal(lanes, incumbent, 0U, false, 8192U, 128U, large);
+        require(lanes == 0U && incumbent == (large - 1U) / small && incumbent >= 1U && refusal.find("leaves 0 session slots") != std::string::npos &&
+                    refusal.find("--prefill-rows 128") != std::string::npos && refusal.find("--slots") == std::string::npos,
+                "zero slots: refused with the smaller-chunk remedy");
+        require(mini::mini_slot_refusal(0U, incumbent, 0U, true, 8192U, 128U, large).find("no session slots") !=
+                    std::string::npos,
+                "zero slots with an explicit chunk: no session slots");
+    }
+    // A backend that cannot price the incumbent plan refuses an unrequested larger chunk instead of guessing.
+    require(mini::mini_slot_refusal(4U, std::nullopt, 0U, false, 2048U, 128U, large).find("cannot be compared") !=
+                    std::string::npos &&
+                mini::mini_slot_refusal(4U, std::nullopt, 0U, true, 2048U, 128U, large).empty(),
+            "an unpriced incumbent plan is refused unless the chunk is requested");
+    // Insufficient free memory for the incumbent reservation, or a reservation above the used bytes: zero, not a wrap.
+    require(mini::mini_counterfactual_slots(1000U, 2000U, 0U, 0U, 128U, 500U, 5000U, 10U) == 0U &&
+                mini::mini_counterfactual_slots(1500U, 2000U, 0U, 0U, 128U, 600U, 100U, 10U) == 0U,
+            "counterfactual arithmetic never wraps");
+}
+
 int main(int argc, char** argv) try {
     require(argc == 2, "expected repository root");
     admission();
+    slot_counterfactual();
     sampling();
     for (const auto* backend : {"hip", "cuda"}) {
         wiring(argv[1], backend, false);

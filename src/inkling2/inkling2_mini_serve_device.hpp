@@ -13,6 +13,7 @@
 
 #include <iostream>
 #include <limits>
+#include <optional>
 
 namespace strix::inkling2 {
 
@@ -31,33 +32,58 @@ inline MiniServeCohort make_mini_device_cohort(
                                row_limit);
     const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, opt.weight_options);
     const auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view());
-    std::unique_ptr<MiniResidentDecoder> decoder;
-    try {
-        decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
-            false, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows,
-            mini_prefill_tail_capacity(opt.prefill_rows, opt.prefill_tail_divisor, opt.context));
-    } catch (const std::exception& e) {
-        throw std::runtime_error("Inkling decoder with a prefill chunk of " + std::to_string(opt.prefill_rows) +
-                                 " rows did not fit the device (" + e.what() + "); pass --prefill-rows " +
-                                 std::to_string(kMiniServeDefaultSlotRows) + " for the incumbent served chunk");
-    }
-    decoder->set_served_identity(opt.served_identity, opt.form_rows);
-    decoder->set_moe_w4a4(opt.moe_w4a4);
-    // Sized before any slot is committed: the slots the budget holds with this chunk, and with the incumbent chunk
-    // (its smaller rows-proportional arenas handed back); explicit --slots that do not fit and a default chunk that
-    // costs slots the incumbent chunk admits are refused (mini_slot_refusal), never silently fewer.
-    const auto memory = mini_gpu::memory_info();
-    const auto slot_bytes = decoder->slot_bytes();
-    const auto lanes = serve::resident_kv_slots(memory.free, memory.total, budget.device_bytes, opt.kv_bytes,
-                                               slot_bytes, rows);
+    const auto build = [&](unsigned chunk, unsigned tail_capacity) {
+        std::unique_ptr<MiniResidentDecoder> built;
+        try {
+            built = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, chunk,
+                false, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows, tail_capacity);
+        } catch (const std::exception& e) {
+            throw std::runtime_error("Inkling decoder with a prefill chunk of " + std::to_string(chunk) +
+                                     " rows did not fit the device (" + e.what() + "); pass --prefill-rows " +
+                                     std::to_string(kMiniServeDefaultSlotRows) + " for the incumbent served chunk");
+        }
+        built->set_served_identity(opt.served_identity, opt.form_rows);
+        built->set_moe_w4a4(opt.moe_w4a4);
+        return built;
+    };
+    unsigned chunk = opt.prefill_rows;
+    auto decoder = build(chunk, mini_prefill_tail_capacity(chunk, opt.prefill_tail_divisor, opt.context));
+    // Sized before any slot is committed: the slots the budget holds with this chunk, and the slots it would hold with
+    // the decoder at the incumbent chunk (both complete plans: the rows-proportional reservation, first slot included,
+    // and the per-slot KV layout of each chunk). Explicit --slots that do not fit and a default chunk that costs slots
+    // the incumbent chunk admits (or that cannot be compared) are refused (mini_slot_refusal), never silently fewer.
+    // The incumbent identity keeps its bits at any chunk that is a multiple of its form chunk, so a default chunk that
+    // costs slots is replaced by the incumbent chunk (the decoder is rebuilt; mini_slot_keep_incumbent) instead of
+    // refused; another identity, explicit pieces or an unpriced plan are refused below.
+    auto memory = mini_gpu::memory_info();
+    auto slot_bytes = decoder->slot_bytes();
+    auto lanes = serve::resident_kv_slots(memory.free, memory.total, budget.device_bytes, opt.kv_bytes, slot_bytes, rows);
     const auto incumbent_rows = std::min(kMiniServeDefaultSlotRows, opt.prefill_rows);
-    const auto handed_back = mini_row_arena_bytes(opt.prefill_rows, kHiddenWidth, kMiniResidentImages) -
-                             mini_row_arena_bytes(incumbent_rows, kHiddenWidth, kMiniResidentImages);
-    const auto lanes_incumbent = serve::resident_kv_slots(std::min(memory.total, memory.free + handed_back),
-                                                         memory.total, budget.device_bytes, opt.kv_bytes, slot_bytes,
-                                                         rows);
+    std::optional<unsigned> lanes_incumbent;
+    if (chunk > incumbent_rows) {
+        const auto capacity = MiniResidentDecoder::served_row_capacity(incumbent_rows, rows);
+        if (const auto reservation = MiniResidentDecoder::row_reservation_bytes(opt.context, capacity, false))
+            lanes_incumbent = mini_counterfactual_slots(memory.free, memory.total, budget.device_bytes, opt.kv_bytes,
+                                                        rows, decoder->allocated_row_reservation_bytes(), *reservation,
+                                                        MiniResidentDecoder::slot_bytes(opt.context, capacity));
+    }
+    if (mini_slot_keep_incumbent(lanes, lanes_incumbent, opt.slots, opt.prefill_rows_requested != 0U, chunk,
+                                 incumbent_rows) &&
+        opt.served_identity == MiniServedIdentity::incumbent && opt.prefill_rows_decoding == 0U) {
+        std::cerr << "Inkling: the default prefill chunk of " << chunk << " rows would leave " << lanes
+                  << " session slots where the incumbent " << incumbent_rows << "-row chunk leaves " << *lanes_incumbent
+                  << ": serving the incumbent chunk (same bits; one-pass prefill: --prefill-rows " << chunk
+                  << " --slots " << lanes << ")\n";
+        decoder.reset();
+        chunk = incumbent_rows;
+        decoder = build(chunk, 0U);
+        memory = mini_gpu::memory_info();
+        slot_bytes = decoder->slot_bytes();
+        lanes = serve::resident_kv_slots(memory.free, memory.total, budget.device_bytes, opt.kv_bytes, slot_bytes, rows);
+        lanes_incumbent.reset();
+    }
     if (const auto refusal = mini_slot_refusal(lanes, lanes_incumbent, opt.slots, opt.prefill_rows_requested != 0U,
-                                               opt.prefill_rows, incumbent_rows, slot_bytes);
+                                               chunk, incumbent_rows, slot_bytes);
         !refusal.empty())
         throw std::runtime_error(refusal);
 #if !defined(__HIPCC__)
@@ -79,7 +105,7 @@ inline MiniServeCohort make_mini_device_cohort(
 #else
     auto identity = device::cuda_cost_device_identity();
 #endif
-    return {std::move(cohort), weights, std::string_view(backend) == "HIP", std::move(identity)};
+    return {std::move(cohort), weights, std::string_view(backend) == "HIP", std::move(identity), chunk};
 }
 
 } // namespace strix::inkling2

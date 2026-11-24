@@ -19,9 +19,11 @@ struct MiniServeOptions {
     unsigned context = 8192;
     unsigned prefill_rows = 0;        // 0 = the served data's chunk (mini_serve_prefill), resolved by the server resolver
     unsigned prefill_rows_requested = 0; // --prefill-rows as given (0 = absent): main's implicit slot cap and form chunk
-    // Served identity (inkling2_mini_schedule.hpp kMiniServedIdentities): --served-identity, else [serve_prefill]
-    // identity; form_rows = the chunk whose forms served-incumbent keeps (main's 128, or the requested --prefill-rows).
+    // Served identity, bound from the shared profile resolution (the admitted identity variant served-cli-prefill,
+    // --identity-variant, else the incumbent); identity = Resolution::identity() for the startup and inspection lines.
+    // form_rows = the chunk whose forms the incumbent keeps (main's 128, or the requested --prefill-rows).
     MiniServedIdentity served_identity = MiniServedIdentity::incumbent;
+    std::string identity = "identity incumbent";
     unsigned form_rows = 0;
     unsigned prefill_tail_divisor = 0; // resolved: final-chunk tail absorption (0 = greedy chunks)
     unsigned prefill_rows_decoding = 0; // piece rows while another lane decodes as requested (0 = the device class's data, resolved at launch)
@@ -41,7 +43,14 @@ struct MiniServeCohort {
     weight::WeightLoadPlan weights;
     bool hip = true;
     std::string device_identity;  // strix/device/cost_identity.hpp key of the device (empty = not described)
+    unsigned prefill_rows = 0;    // the chunk the decoder was built with (the incumbent chunk when the default one
+                                  // would cost slots, mini_slot_keep_incumbent); 0 = the options' chunk
 };
+// The options the scheduler runs with: the chunk the device decoder was built with.
+inline MiniServeOptions mini_served_options(MiniServeOptions opt, const MiniServeCohort& device) {
+    if (device.prefill_rows != 0U) opt.prefill_rows = device.prefill_rows;
+    return opt;
+}
 
 MiniServeCohort make_mini_hip_cohort(const MiniServeOptions&);
 MiniServeCohort make_mini_cuda_cohort(const MiniServeOptions&);

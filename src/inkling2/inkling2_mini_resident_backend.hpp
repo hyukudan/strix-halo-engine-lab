@@ -162,7 +162,7 @@ public:
 #if defined(__HIPCC__)
           moe_activation_(mini_moe_activation_elements(max_rows_)),
 #endif
-          flags_((1U + (packed_decode ? std::min(max_rows_, kMiniMaxVerifyRows) : 1U)) * kLogicalVisits),
+          flags_(flag_elements(max_rows_, packed_decode)),
           zero_padding_(kHeadWidth) {
 #if !defined(__HIPCC__)
         if (const char* enable = strix::envcfg::text("STRIX_INKLING_K1BIND"); enable && std::string_view(enable) == "1") {
@@ -193,6 +193,42 @@ public:
             try { mini_gpu::synchronize(stream_); } catch (...) {}
             throw;
         }
+        // The served slot sizing prices another row capacity with row_buffer_bytes: it must be what was allocated.
+        if (const auto priced = row_buffer_bytes(max_rows_, packed_decode_); priced && *priced != allocated_row_buffer_bytes())
+            throw std::logic_error("Inkling 2 Mini: row buffer accounting differs from the backend's allocation");
+    }
+
+    // Device bytes of the backend buffers whose size follows max_rows (every other buffer is row independent). The
+    // served slot sizing (mini_counterfactual_slots) prices another row capacity with it; the constructor checks it
+    // against its own allocation. nullopt = not priced on this backend (CUDA: the dense context of a chunk above its
+    // row limit and the W4A4 operands reserve rows-dependent memory of their own).
+    [[nodiscard]] static std::optional<std::uint64_t> row_buffer_bytes(unsigned max_rows, bool packed_decode) {
+#if defined(__HIPCC__)
+        const unsigned rows = checked_chunk_rows(max_rows);
+        const unsigned tiles = moe_core::device_grouped::tile_bound(rows, kExpertsPerToken, kExperts, Moe::rows_per_tile);
+        const std::uint64_t floats = mini_controller_elements(rows) + attention_elements(rows) +
+            attn_core::dense::key_split_workspace_floats(rows, kQueryHeads, kHeadWidth) +
+            std::uint64_t{rows} * (kExperts + 2U * kExpertsPerToken) + mini_moe_workspace_elements(rows);
+        const std::uint64_t words = route_elements(rows, tiles) + Planner::scratch_bytes(rows) / sizeof(unsigned) +
+            flag_elements(rows, packed_decode);
+        const std::uint64_t halves = mini_moe_workspace_elements(rows) + mini_moe_activation_elements(rows);
+        return floats * sizeof(float) + words * sizeof(unsigned) + std::uint64_t{2U} * tiles * sizeof(Tile) +
+               halves * sizeof(std::uint16_t);
+#else
+        (void)max_rows;
+        (void)packed_decode;
+        return std::nullopt;
+#endif
+    }
+    [[nodiscard]] std::uint64_t allocated_row_buffer_bytes() const {
+        std::uint64_t bytes = controller_.span().size_bytes() + attention_.span().size_bytes() +
+            route_data_.span().size_bytes() + route_floats_.span().size_bytes() + route_scratch_.span().size_bytes() +
+            descriptors_.span().size_bytes() + moe_bf16_.span().size_bytes() + moe_fp32_.span().size_bytes() +
+            flags_.span().size_bytes();
+#if defined(__HIPCC__)
+        bytes += attention_partials_.span().size_bytes() + moe_activation_.span().size_bytes();
+#endif
+        return bytes;
     }
 
     [[nodiscard]] mini_gpu::Stream stream() const { return stream_; }
@@ -833,6 +869,10 @@ private:
     static constexpr std::size_t attention_elements(unsigned rows) {
         return std::size_t{rows} * (4U * kKvWidth + 2U * kKvHeads * kConvTaps +
             kQueryHeads * kRelativeWidth + 4U * kQueryWidth + kQueryHeads * kRelativeExtent + kQueryHeads);
+    }
+
+    static constexpr std::size_t flag_elements(unsigned rows, bool packed_decode) {
+        return (1U + (packed_decode ? std::min(rows, kMiniMaxVerifyRows) : 1U)) * std::size_t{kLogicalVisits};
     }
 
     static constexpr std::size_t route_elements(unsigned rows, unsigned tiles) {

@@ -108,6 +108,10 @@ public:
 #endif
         allocate_slots(1U);
         reset_gate_session();
+        // The served slot sizing prices another row capacity with row_reservation_bytes: it must be what was allocated.
+        if (const auto priced = row_reservation_bytes(max_positions, max_rows_, packed_decode);
+            priced && *priced != allocated_row_reservation_bytes())
+            throw std::logic_error("Inkling 2 Mini: row reservation accounting differs from the decoder's allocation");
     }
 
     ~MiniResidentDecoder() { backend_.abandon_capture(); }
@@ -157,6 +161,41 @@ public:
     // Independent serving lanes. Slot 0 is also the single-session slot used by
     // prefill/decode/verify above and the only one that records DSpark taps.
     [[nodiscard]] std::uint64_t slot_bytes() const { return layout_.kv_bytes() + layout_.convolution_bytes(); }
+    // Bytes of one session slot at a row capacity (the KV layout follows it: a sliding-window visit keeps a ring of
+    // window - 1 + max_rows rows when that is shorter than the context, else the full context).
+    [[nodiscard]] static std::uint64_t slot_bytes(unsigned max_positions, unsigned max_rows) {
+        const MiniSessionStatePlan layout(max_positions, max_rows);
+        return layout.kv_bytes() + layout.convolution_bytes();
+    }
+    // Row capacity of a decoder built for served lanes: prefill chunk + admitted tail and the decode rows (no verify).
+    [[nodiscard]] static unsigned served_row_capacity(unsigned chunk_rows, unsigned decode_rows) {
+        return std::max(MiniResidentBackend::checked_chunk_rows(chunk_rows),
+                        MiniResidentBackend::checked_chunk_rows(decode_rows));
+    }
+    [[nodiscard]] unsigned row_capacity() const noexcept { return max_rows_; }
+    // Device bytes the decoder reserves that follow its row capacity: the backend's row buffers, the activation,
+    // embedding and hidden arenas (and CUDA token ids), and the first session slot it commits. The served slot sizing
+    // prices the incumbent chunk with it (mini_counterfactual_slots); the constructor checks it against its own
+    // allocation. nullopt = not priced on this backend (MiniResidentBackend::row_buffer_bytes).
+    [[nodiscard]] static std::optional<std::uint64_t> row_reservation_bytes(unsigned max_positions, unsigned max_rows,
+                                                                            bool packed_decode) {
+        const auto backend = MiniResidentBackend::row_buffer_bytes(max_rows, packed_decode);
+        if (!backend) return std::nullopt;
+        const std::uint64_t floats = mini_resident_activation_elements(max_rows) + 2U * std::uint64_t{max_rows} * kHiddenWidth;
+        std::uint64_t bytes = *backend + floats * sizeof(float) + slot_bytes(max_positions, max_rows);
+#if !defined(__HIPCC__)
+        bytes += std::uint64_t{max_rows} * sizeof(std::uint32_t);
+#endif
+        return bytes;
+    }
+    [[nodiscard]] std::uint64_t allocated_row_reservation_bytes() const {
+        std::uint64_t bytes = backend_.allocated_row_buffer_bytes() + activations_.span().size_bytes() +
+            embeddings_.span().size_bytes() + hidden_.span().size_bytes() + slot_bytes();
+#if !defined(__HIPCC__)
+        bytes += token_ids_.span().size_bytes();
+#endif
+        return bytes;
+    }
 
     void allocate_slots(unsigned slots) {
         if (slots == 0U || slots > decode_rows_) throw std::invalid_argument("invalid Mini slot count");
@@ -209,7 +248,7 @@ public:
         identity_ = identity;
         form_rows_ = form_rows;
     }
-    [[nodiscard]] bool prefill_emits_first() const noexcept { return mini_served_identity(identity_).emits_first; }
+    [[nodiscard]] bool prefill_emits_first() const noexcept { return mini_served_emits_first(identity_); }
 
     // Rows beyond the nominal chunk the final prompt slice of a served lane may carry (admitted capacity, 0 = greedy
     // chunks). Each prefill call still absorbs only the remainder call_tail_rows admits.

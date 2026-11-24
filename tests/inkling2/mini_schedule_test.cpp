@@ -310,21 +310,9 @@ int incumbent_equals_main() {
             return 1;
         }
     // the incumbent's first id comes from the decode row (FixedKvCohort prefill_slot route), the variant's from prefill
-    if (mini_served_identity(MiniServedIdentity::incumbent).emits_first ||
-        !mini_served_identity(MiniServedIdentity::cli_prefill).emits_first ||
-        mini_resolve_served_identity("") != MiniServedIdentity::incumbent ||
-        mini_resolve_served_identity("served-cli-prefill") != MiniServedIdentity::cli_prefill) {
-        std::fprintf(stderr, "FAIL served identity registry\n");
-        return 1;
-    }
-    bool refused = false;
-    try {
-        (void)mini_resolve_served_identity("cli");
-    } catch (const std::invalid_argument&) {
-        refused = true;
-    }
-    if (!refused) {
-        std::fprintf(stderr, "FAIL an unknown served identity was accepted\n");
+    if (mini_served_emits_first(MiniServedIdentity::incumbent) ||
+        !mini_served_emits_first(MiniServedIdentity::cli_prefill)) {
+        std::fprintf(stderr, "FAIL served identity routes\n");
         return 1;
     }
     // Main's short tail of the prompt minus its final token: P = 4101 (4096 + 4) and 8209 (8192 + 16) run it as a short
@@ -342,8 +330,6 @@ int incumbent_equals_main() {
 // incumbent chunk admits refused with a message.
 static_assert(mini_serve_slot_cap(0U, 8192U) == 128U && mini_serve_slot_cap(0U, 64U) == 64U &&
               mini_serve_slot_cap(512U, 8192U) == 512U && mini_serve_slot_cap(512U, 300U) == 300U);
-static_assert(mini_row_arena_bytes(8192U, 2304U, 16U) - mini_row_arena_bytes(128U, 2304U, 16U) ==
-              std::uint64_t{8064U} * 2304U * 18U * 4U);
 int slot_refusals() {
     const bool ok = mini_slot_refusal(4U, 4U, 0U, false, 8192U, 128U, 1000U).empty() &&
                     mini_slot_refusal(4U, 4U, 4U, false, 8192U, 128U, 1000U).empty() &&
@@ -353,7 +339,24 @@ int slot_refusals() {
                         std::string::npos &&
                     mini_slot_refusal(3U, 4U, 0U, true, 8192U, 128U, 1000U).empty() &&   // chunk requested
                     mini_slot_refusal(3U, 4U, 0U, false, 128U, 128U, 1000U).empty() &&   // the incumbent chunk
-                    mini_slot_refusal(0U, 4U, 0U, true, 128U, 128U, 1000U).find("no session slots") != std::string::npos;
+                    mini_slot_refusal(0U, 4U, 0U, true, 128U, 128U, 1000U).find("no session slots") != std::string::npos &&
+                    // the default chunk that leaves none where the incumbent leaves some: the smaller-chunk remedy
+                    mini_slot_refusal(0U, 4U, 0U, false, 8192U, 128U, 1000U).find("--prefill-rows 128") !=
+                        std::string::npos &&
+                    mini_slot_refusal(0U, 0U, 0U, false, 8192U, 128U, 1000U).find("no session slots") !=
+                        std::string::npos &&
+                    // an incumbent plan the backend cannot price: refused unless the chunk or the slots are explicit
+                    !mini_slot_refusal(4U, std::nullopt, 0U, false, 2048U, 128U, 1000U).empty() &&
+                    mini_slot_refusal(4U, std::nullopt, 4U, false, 2048U, 128U, 1000U).empty() &&
+                    // the incumbent identity keeps its own chunk (same bits, its slots) when the default one costs
+                    // slots, none included; never for explicit slots or chunk, an equal count or an unpriced plan
+                    mini_slot_keep_incumbent(3U, 4U, 0U, false, 8192U, 128U) &&
+                    mini_slot_keep_incumbent(0U, 4U, 0U, false, 8192U, 128U) &&
+                    !mini_slot_keep_incumbent(3U, 4U, 4U, false, 8192U, 128U) &&
+                    !mini_slot_keep_incumbent(3U, 4U, 0U, true, 8192U, 128U) &&
+                    !mini_slot_keep_incumbent(4U, 4U, 0U, false, 8192U, 128U) &&
+                    !mini_slot_keep_incumbent(3U, std::nullopt, 0U, false, 8192U, 128U) &&
+                    !mini_slot_keep_incumbent(3U, 4U, 0U, false, 128U, 128U);
     if (!ok) {
         std::fprintf(stderr, "FAIL slot refusals\n");
         return 1;

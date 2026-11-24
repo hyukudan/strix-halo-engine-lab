@@ -5,9 +5,11 @@
 #include "strix/env_flags.hpp"
 #include "strix/model_data/inkling2_mini.hpp"
 #include "strix/serve/prompt_piece.hpp"
+#include "strix/serve/row_budget.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -170,39 +172,20 @@ constexpr MiniServePrefill mini_serve_prefill(bool hip, std::string_view device_
     return out;
 }
 
-// Served identities (EXACT serving routes of strix-serve --model inkling2-mini), ONE registry: the default is the
-// incumbent identity (what main served), any other bit-different route is a variant selected explicitly
-// (--served-identity NAME or [serve_prefill] identity), admitted here and printed in the route / receipt line.
-// - served-incumbent: the prompt minus its final token by prefill, in the forms of greedy form_rows-row chunks (main's
-//   served 128-row slices: a final remainder of 1..kKeySplitMaxRows rows is its own short chunk), then the final token
-//   by the grouped decode row, which gives the first id. Any chunk that is a multiple of form_rows keeps these bits
-//   (cuts at multiples of the 16-row wave tile, every piece longer than the key-split bound), so the CLI's large
-//   chunk (HIP 8192) serves the incumbent bits with one pass where main ran 64.
-// - served-cli-prefill: the whole prompt by prefill with the CLI's chunks and tail rule, the first id from its final
-//   row (= strix-inkling2-mini --grouped-decode bit for bit).
+// The served prompt route of strix-serve --model inkling2-mini, bound from the shared profile resolution (the identity
+// variant kMiniServedCliPrefill of kMiniProfile, include/strix/profiles/inkling2_mini.hpp; requested only by name and
+// admitted by profile::admit_variants, never chosen here):
+// - incumbent (the default): the prompt minus its final token by prefill, in the forms of greedy form_rows-row chunks
+//   (main's served 128-row slices: a final remainder of 1..kKeySplitMaxRows rows is its own short chunk), then the
+//   final token by the grouped decode row, which gives the first id. Any chunk that is a multiple of form_rows keeps
+//   these bits (cuts at multiples of the 16-row wave tile, every piece longer than the key-split bound), so the CLI's
+//   large chunk (HIP 8192) serves the incumbent bits with one pass where main ran 64.
+// - cli_prefill (variant served-cli-prefill): the whole prompt by prefill with the CLI's chunks and tail rule
+//   (mini_served_prefill_rows), the first id from its final row (= strix-inkling2-mini --grouped-decode bit for bit).
 enum class MiniServedIdentity { incumbent, cli_prefill };
-struct MiniServedIdentityEntry {
-    MiniServedIdentity identity;
-    std::string_view name;
-    std::string_view reference;  // the named EXACT reference the identity is bitwise equal to
-    bool emits_first;            // serve::FixedKvCohort route: the final prompt row by prefill (true) or by decode
-};
-inline constexpr MiniServedIdentityEntry kMiniServedIdentities[] = {
-    {MiniServedIdentity::incumbent, "served-incumbent", "main-served", false},
-    {MiniServedIdentity::cli_prefill, "served-cli-prefill", "cli-grouped-decode", true},
-};
-constexpr const MiniServedIdentityEntry& mini_served_identity(MiniServedIdentity identity) {
-    for (const auto& entry : kMiniServedIdentities)
-        if (entry.identity == identity) return entry;
-    return kMiniServedIdentities[0];
-}
-// The identity named by `name` (empty = the data's default, [serve_prefill] identity); throws on an unknown name.
-inline MiniServedIdentity mini_resolve_served_identity(std::string_view name) {
-    if (name.empty()) name = model_data::inkling2_mini::serve_prefill::identity;
-    for (const auto& entry : kMiniServedIdentities)
-        if (entry.name == name) return entry.identity;
-    throw std::invalid_argument("Inkling --served-identity requires served-incumbent or served-cli-prefill, got '" +
-                                std::string(name) + "'");
+// serve::FixedKvCohort route: the final prompt row by prefill (true) or by the decode row (false).
+constexpr bool mini_served_emits_first(MiniServedIdentity identity) {
+    return identity == MiniServedIdentity::cli_prefill;
 }
 // Rows of main's served chunk whose forms served-incumbent keeps (data: [serve_prefill] form_rows).
 inline constexpr unsigned kMiniIncumbentFormRows =
@@ -257,6 +240,22 @@ constexpr unsigned mini_resolve_serve_chunk(unsigned requested, unsigned context
     return mini_resolve_prefill_chunk(requested != 0U ? requested : mini_serve_prefill(hip).chunk, context, hip);
 }
 
+// Served prefill values of an identity: the chunk and the tail divisor (0 = greedy chunks). The incumbent takes the
+// served data's chunk (the caller rounds it to its form chunk) with no tail absorption; served-cli-prefill takes the
+// CLI's own values on every backend (mini_resolve_prefill_chunk and the CLI's tail rule with its
+// STRIX_INKLING_PREFILL_TAIL switch), so a request without --prefill-rows dispatches the CLI's calls (CUDA: one
+// 129-row call for a 129-token prompt, not 128 + 1).
+struct MiniServedPrefillRows {
+    unsigned chunk;
+    unsigned tail_divisor;
+};
+constexpr MiniServedPrefillRows mini_served_prefill_rows(MiniServedIdentity identity, unsigned requested,
+                                                         unsigned context, bool hip, unsigned cli_tail_divisor) {
+    if (identity == MiniServedIdentity::cli_prefill)
+        return {mini_resolve_prefill_chunk(requested, context, hip), cli_tail_divisor};
+    return {mini_resolve_serve_chunk(requested, context, hip), 0U};
+}
+
 // Tail rows a chunk may absorb (before the decoder's own admission, mini_admitted_tail_capacity). No capacity when the
 // context leaves no room past the chunk (an enlarged pass could never run there).
 constexpr unsigned mini_prefill_tail_capacity(unsigned chunk, unsigned divisor, unsigned context = ~0U) {
@@ -284,21 +283,52 @@ constexpr unsigned mini_serve_slot_cap(unsigned requested_prefill_rows, unsigned
     return rows < context ? rows : context;
 }
 
-// Device bytes of the decoder's rows-proportional activation, embedding and hidden arenas at a prefill capacity of
-// `rows` rows (MiniResidentDecoder: activations 16 images x 2304, embeddings and hidden 2304 floats per row). A lower
-// bound of what a larger chunk adds: the MoE / route / attention workspaces also grow with rows.
-constexpr std::uint64_t mini_row_arena_bytes(unsigned rows, unsigned hidden_width, unsigned images) {
-    return std::uint64_t{rows} * hidden_width * (std::uint64_t{images} + 2U) * sizeof(float);
+// Session slots the budget would hold with the decoder built at another row capacity (the incumbent chunk). `free` is
+// measured after the current decoder is built, its rows-proportional reservation and first slot committed
+// (`current_reservation`, MiniResidentDecoder::allocated_row_reservation_bytes); the other plan gets that back and pays
+// its own (`other_reservation`, its first slot included, MiniResidentDecoder::row_reservation_bytes), then its slots
+// are counted by the same rule as the current ones (serve::resident_kv_slots) with its own slot bytes.
+inline unsigned mini_counterfactual_slots(std::uint64_t free, std::uint64_t total, std::uint64_t device_limit,
+                                          std::uint64_t kv_limit, unsigned rows, std::uint64_t current_reservation,
+                                          std::uint64_t other_reservation, std::uint64_t other_slot_bytes) {
+    if (free > total || current_reservation > total - free) return 0U;  // the reservation is part of the used bytes
+    const std::uint64_t unreserved = free + current_reservation;
+    if (other_reservation > unreserved) return 0U;
+    return serve::resident_kv_slots(unreserved - other_reservation, total, device_limit, kv_limit, other_slot_bytes,
+                                    rows);
+}
+
+// True when the default chunk (--slots and --prefill-rows both absent) is above the incumbent chunk and leaves fewer
+// slots than the incumbent plan: the incumbent identity then serves its own chunk (same bits, the incumbent's slots).
+constexpr bool mini_slot_keep_incumbent(unsigned lanes, std::optional<unsigned> lanes_incumbent,
+                                        unsigned requested_slots, bool chunk_requested, unsigned chunk,
+                                        unsigned incumbent_chunk) {
+    return requested_slots == 0U && !chunk_requested && chunk > incumbent_chunk && lanes_incumbent.has_value() &&
+           lanes < *lanes_incumbent;
 }
 
 // Session slots the server admits after the decoder is built, sized before any slot is committed. `lanes` = the slots
 // the budget holds with the decoder at its chunk, `lanes_incumbent` = the slots it would hold with the decoder at the
-// incumbent chunk (lanes recomputed with the arena difference handed back). Refused with a message (empty = admitted):
-// explicit --slots the budget cannot hold (never silently fewer), and a chunk above the incumbent one that costs slots
-// the incumbent chunk admits when --slots and --prefill-rows are both absent.
-inline std::string mini_slot_refusal(unsigned lanes, unsigned lanes_incumbent, unsigned requested_slots,
+// incumbent chunk (mini_counterfactual_slots; nullopt = not priced on this backend). Refused with a message (empty =
+// admitted): a default chunk above the incumbent one that leaves fewer slots than the incumbent chunk, or that cannot
+// be compared, when --slots and --prefill-rows are both absent (also when it leaves none); a budget with no slot; and
+// explicit --slots the budget cannot hold (never silently fewer).
+inline std::string mini_slot_refusal(unsigned lanes, std::optional<unsigned> lanes_incumbent, unsigned requested_slots,
                                      bool chunk_requested, unsigned chunk, unsigned incumbent_chunk,
                                      std::uint64_t slot_bytes) {
+    if (requested_slots == 0U && !chunk_requested && chunk > incumbent_chunk) {
+        if (!lanes_incumbent)
+            return "Inkling: the slots of the default prefill chunk of " + std::to_string(chunk) +
+                   " rows cannot be compared with the incumbent " + std::to_string(incumbent_chunk) +
+                   "-row chunk on this backend; pass --prefill-rows " + std::to_string(incumbent_chunk) +
+                   " (or the chunk you want) or --slots N";
+        if (lanes < *lanes_incumbent)
+            return "Inkling: the default prefill chunk of " + std::to_string(chunk) + " rows leaves " +
+                   std::to_string(lanes) + " session slots where the incumbent " + std::to_string(incumbent_chunk) +
+                   "-row chunk leaves " + std::to_string(*lanes_incumbent) + "; pass --prefill-rows " +
+                   std::to_string(incumbent_chunk) + " to keep the slots" +
+                   (lanes != 0U ? ", or --slots " + std::to_string(lanes) + " to accept fewer" : std::string{});
+    }
     if (lanes == 0U)
         return "Inkling KV budget holds no session slots (prefill chunk " + std::to_string(chunk) + " rows, " +
                std::to_string(slot_bytes) + " bytes per slot)";
@@ -306,12 +336,6 @@ inline std::string mini_slot_refusal(unsigned lanes, unsigned lanes_incumbent, u
         return "Inkling --slots " + std::to_string(requested_slots) + " do not fit: with the prefill chunk of " +
                std::to_string(chunk) + " rows the memory budget holds " + std::to_string(lanes) + " slots of " +
                std::to_string(slot_bytes) + " bytes; lower --slots, --context or --prefill-rows";
-    if (requested_slots == 0U && !chunk_requested && chunk > incumbent_chunk && lanes < lanes_incumbent)
-        return "Inkling: the default prefill chunk of " + std::to_string(chunk) + " rows leaves " +
-               std::to_string(lanes) + " session slots where the incumbent " + std::to_string(incumbent_chunk) +
-               "-row chunk leaves " + std::to_string(lanes_incumbent) + "; pass --prefill-rows " +
-               std::to_string(incumbent_chunk) + " to keep the slots, or --slots " + std::to_string(lanes) +
-               " to accept fewer";
     return {};
 }
 

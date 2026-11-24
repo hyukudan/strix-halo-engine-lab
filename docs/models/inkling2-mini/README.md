@@ -180,24 +180,34 @@ restores greedy chunks. The server (`strix-serve --model inkling2-mini`) takes i
 (`--prefill-rows 2048` opts in). `--prefill-rows N` (alias `--prefill-chunk`) overrides the served chunk. The decode
 slot cap is `--slots`, else main's implicit cap: the requested `--prefill-rows`, else 128, clipped to the context. The
 slots are sized right after the decoder is built and before any is committed: explicit `--slots` the memory budget
-cannot hold are refused (never silently fewer), and so is a default chunk whose larger activation arenas would leave
-fewer slots than the incumbent 128-row chunk (the message names `--prefill-rows 128` and the slots that fit).
+cannot hold are refused (never silently fewer). A default chunk that would leave fewer slots than the incumbent
+128-row chunk is never taken silently: the incumbent identity then serves the 128-row chunk (same bits, the
+incumbent's slots; the startup line names `--prefill-rows N --slots S` for one-pass prefill with fewer slots), and
+the variant is refused with the `--prefill-rows 128` remedy. For example, at the default context 8192 with implicit
+slots, the 8192-row chunk leaves 55 slots where the 128-row chunk leaves 128 on gfx1151. The comparison prices both
+complete plans: the decoder's rows-proportional buffers (checked against what it allocated) and the per-slot KV
+layout of each chunk (a sliding-window layer keeps a ring for short chunks, linear rows for a chunk as long as the
+context), including the first slot the decoder commits. `--family-inspect` does no device work and prints the
+requested chunk.
 
-Served identities. Each one is an EXACT route with a named reference, registered in one place
-(`kMiniServedIdentities`, `src/inkling2/inkling2_mini_schedule.hpp`), selected by `--served-identity NAME` or the data
-(`[serve_prefill] identity`) and printed in the startup line (`Inkling served identity NAME reference REF ...`) and
-in `--family-inspect`. A change of the default is its own PR with a served A/B.
-- `served-incumbent` (default, reference `main-served`): the bits main served. The prompt minus its final token is
+Served identities. The default is the incumbent identity; the bit-different route is the identity variant
+`served-cli-prefill@1`, declared with the model's profile (`include/strix/profiles/inkling2_mini.hpp`) and admitted
+by the shared profile resolver only when requested (`--identity-variant served-cli-prefill[@1]`), on a backend it
+is declared for (HIP) and under a tier its row admits. The startup line and `--family-inspect` print
+`served identity incumbent` or `served identity served-cli-prefill@1`; the effective profile records the variant,
+its version and reference.
+- incumbent (default): the bits main served. The prompt minus its final token is
   prefilled in the forms of 128-row chunks (a final remainder of 1..16 rows is its own short chunk), and the final token
   runs as the grouped decode row, which gives the first token. Every chunk that is a multiple of 128 rows keeps these
   forms (cuts at 16-row wave-tile offsets, every piece longer than 16 rows), so the CLI's 8192-row chunk serves main's
   bits with one pass where main ran 64. Beside a decoding request it cuts at multiples of 128 rows. Host test over the
   partitioning, alone and in pieces under any grant (`incumbent_equals_main` in `tests/inkling2/mini_schedule_test.cpp`).
-- `served-cli-prefill` (variant, reference `cli-grouped-decode`): the whole prompt by prefill with the CLI's chunks
-  and tail rule, the first token from the prefill's last row. Its prefill rows take the CLI's chunks and routes at every
+- `served-cli-prefill` (variant, reference: the CLI with `--grouped-decode`): the whole prompt by prefill with the
+  CLI's chunk and tail rule of the backend (without `--prefill-rows`, the same calls as the CLI), the first token from
+  the prefill's last row. Its prefill rows take the CLI's chunks and routes at every
   prompt length, and a prefill row's expert body does not depend on the decode route (a 1-row chunk takes the prefill
   body in both). It equals CLI runs with `--grouped-decode`; the CLI default (packed decode) runs decode rows on another
-  expert body. It differs from `served-incumbent` in the final prompt row, and in the rows of a 1..16-row remainder
+  expert body. It differs from the incumbent in the final prompt row, and in the rows of a 1..16-row remainder
   after whole 128-row chunks of the prompt minus its final token (for example P = 4101 and 8209).
 
 The server has two regimes:

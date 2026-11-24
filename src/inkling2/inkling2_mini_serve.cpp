@@ -36,7 +36,6 @@ serve::CohortConfig scheduling(const MiniServeOptions& opt, bool hip, std::strin
 ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServeBackends& backends) {
     ResolvedService resolved;
     auto& out = resolved.options;
-    std::string identity_name;  // --served-identity (empty = the data's default)
     const auto& args = selection.arguments;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string_view name = args[i];
@@ -59,7 +58,8 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
         else if (name == "--context") out.context = static_cast<unsigned>(number(name, value, kMaxContext));
         else if (name == "--prefill-rows" || name == "--prefill-chunk")  // one spelling with the CLI; the old one kept
             out.prefill_rows = out.prefill_rows_requested = static_cast<unsigned>(number(name, value, 65535U));
-        else if (name == "--served-identity") identity_name = value;
+        else if (name == profile::kIdentityVariantOption)  // the shared request: admitted by resolve_mini_profile
+            profile::request_variant(kMiniProfile, out.weight_options.tier, value, profile::VariantOrigin::cli);
         else if (name == "--prefill-rows-decoding")
             out.prefill_rows_decoding = static_cast<unsigned>(number(name, value, 65535U));
         else if (name == "--prefill-gap-ms" || name == "--prompt-share") {
@@ -78,28 +78,35 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
             if (value != "off") throw std::invalid_argument("Inkling serving requires --speculation off");
         } else throw std::invalid_argument("unknown Inkling argument " + std::string(name));
     }
+    // The backend first: an identity variant is admitted per declared backend (profile::admit_variants).
+    if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
+    out.weight_options.tier.backend = std::string(resolved.backend);
     const auto resolution = resolve_mini_profile(out.weight_options, true);
     out.tier = resolution.profile;
     out.moe_w4a4 = mini_moe_w4a4_class(resolution);
+    // The served identity: the admitted variant only (Resolution::selected), else the incumbent.
+    out.served_identity = resolution.selected(kMiniServedCliPrefill) ? MiniServedIdentity::cli_prefill
+                                                                      : MiniServedIdentity::incumbent;
+    out.identity = resolution.identity();  // "identity incumbent" | "identity served-cli-prefill@1 reference REF"
+    for (const auto* variant : resolution.identity_variants)
+        out.identity += " reference " + std::string(variant->reference);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();
     if (out.context < 3U) throw std::invalid_argument("Inkling context must hold a prompt and a reply");
-    if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     // The served data (models/inkling2-mini.toml [serve_prefill], mini_serve_prefill): the chunk (HIP: the CLI's,
     // CUDA: the incumbent 128 rows), the CLI's tail rule and STRIX_INKLING_PREFILL_TAIL=0 off switch, the pieces.
     const bool hip = resolved.backend == "hip";
-    // The served identity (one registry, kMiniServedIdentities): served-incumbent keeps main's served bits at any
-    // chunk that is a multiple of main's served chunk (form_rows: the requested --prefill-rows, else 128, clipped to
-    // the context as main did), with no tail absorption; served-cli-prefill takes the CLI's chunks and tail rule.
-    out.served_identity = mini_resolve_served_identity(identity_name);
-    out.prefill_rows = mini_resolve_serve_chunk(out.prefill_rows, out.context, hip);
+    // The incumbent keeps main's served bits at any chunk that is a multiple of main's served chunk (form_rows: the
+    // requested --prefill-rows, else 128, clipped to the context as main did), with no tail absorption;
+    // served-cli-prefill takes the CLI's chunk and tail rule on every backend (mini_served_prefill_rows).
+    const auto values = mini_served_prefill_rows(out.served_identity, out.prefill_rows, out.context, hip,
+                                                 mini_prefill_schedule_from_env(hip).tail_divisor);
+    out.prefill_rows = values.chunk;
+    out.prefill_tail_divisor = values.tail_divisor;
     if (out.served_identity == MiniServedIdentity::incumbent) {
         out.form_rows = mini_serve_slot_cap(out.prefill_rows_requested, out.context);  // main's served chunk
         out.prefill_rows = std::max(out.form_rows, out.prefill_rows / out.form_rows * out.form_rows);
-        out.prefill_tail_divisor = 0U;
-    } else {
-        out.prefill_tail_divisor = mini_prefill_schedule_from_env(hip).tail_divisor;
     }
     // The scheduler's own checks (serve::validate_prompt_pieces) with the decoder's declared cut rule, before any device
     // work: inspection refuses what the launch would refuse. The device class's gap (unset here) is data-validated.
@@ -138,8 +145,9 @@ public:
                 const MiniServeTokenizer& tokenizer, MiniChat chat)
         : tokenizer_(tokenizer(opt.tokenizer)), device_(backend(opt)),
           queue_(std::max(64U, device_.backend->lanes())),
-          cohort_(queue_, *device_.backend, scheduling(opt, device_.hip, mini_device_class(device_.device_identity)),
-                  [min_prompt = mini_served_identity(opt.served_identity).emits_first ? 1U : 2U](
+          cohort_(queue_, *device_.backend,
+                  scheduling(mini_served_options(opt, device_), device_.hip, mini_device_class(device_.device_identity)),
+                  [min_prompt = mini_served_emits_first(opt.served_identity) ? 1U : 2U](
                       const serve::GenerationJob& job) {
               if (job.copy_rows) throw std::invalid_argument("Inkling serving does not support copy_rows");
               if (job.window_rows) throw std::invalid_argument("Inkling serving does not support window_rows");
@@ -154,10 +162,8 @@ public:
         // The resolved served prefill and its data row: receipts state the schedule and the decode route that ran.
         const auto device_class = mini_device_class(device_.device_identity);
         const auto data = mini_serve_prefill(device_.hip, device_class);
-        const auto config = scheduling(opt, device_.hip, device_class);
-        const auto& identity = mini_served_identity(opt.served_identity);
-        std::cerr << "Inkling served identity " << identity.name << " reference " << identity.reference
-                  << " form_rows " << opt.form_rows << " served prefill chunk " << config.prompt_slice << " tail_divisor " << opt.prefill_tail_divisor
+        const auto config = scheduling(mini_served_options(opt, device_), device_.hip, device_class);
+        std::cerr << "Inkling served " << opt.identity << " form_rows " << opt.form_rows << " served prefill chunk " << config.prompt_slice << " tail_divisor " << opt.prefill_tail_divisor
                   << " pieces " << config.prompt_slice_decoding << " gap_ms " << config.prompt_gap_ms
                   << " pass_fixed_ms " << config.prompt_pass_fixed_ms << " share " << config.prompt_share
                   << " device_class " << (device_class.empty() ? std::string_view("-") : device_class)
@@ -270,8 +276,7 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             out << " prompt_share ";
             if (opt.prompt_share >= 0.0) out << opt.prompt_share;
             else out << "device-class";
-            const auto& identity = mini_served_identity(opt.served_identity);
-            out << " served_identity " << identity.name << " reference " << identity.reference << " form_rows "
+            out << " served " << opt.identity << " form_rows "
                 << opt.form_rows
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
                 << " profile " << mini_profile_name(opt.tier) << " speculation off";
