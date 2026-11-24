@@ -36,8 +36,17 @@ struct Bf16ScaleSqrtDivTraits : DeclaredF32Traits<OutputForm::bf16_once> {
     }
 };
 
-// Parallel uses the lane-strided FMA and LDS halving tree. One lane retains
-// the ascending reference sum for device qualification.
+namespace detail {
+template <unsigned J>
+void launch_rms_wave_rows(const Bf16RmsRows& args, float epsilon, hipStream_t stream) {
+    const unsigned blocks = (args.rows + kWaveRows - 1U) / kWaveRows;
+    rmsnorm_wave_rows_kernel<Bf16ScaleSqrtDivTraits, J><<<dim3(blocks), 32U * kWaveRows, 0, stream>>>(
+        args.input, args.input_row, args.scale, 0, args.width, args.rows, epsilon, args.output, args.output_row);
+}
+}  // namespace detail
+
+// Parallel uses the lane-strided FMA and LDS halving tree (rows of at most 256 values: one wave per row with the same
+// tree and bits, rmsnorm_wave_rows_kernel). One lane retains the ascending reference sum for device qualification.
 inline hipError_t enqueue_rms_bf16_rows(const Bf16RmsRows& args, float epsilon, RmsRowsReduction reduction,
                                        hipStream_t stream) {
     constexpr unsigned lanes = 256;
@@ -52,6 +61,14 @@ inline hipError_t enqueue_rms_bf16_rows(const Bf16RmsRows& args, float epsilon, 
     if (reduction == RmsRowsReduction::serial_reference) {
         rmsnorm_strided_kernel<Traits, 1><<<dim3(args.rows), 1, 0, stream>>>(
             args.input, args.input_row, args.scale, 0, args.width, epsilon, args.output, args.output_row);
+    } else if (reduction == RmsRowsReduction::parallel && args.width <= 32U) {
+        detail::launch_rms_wave_rows<1>(args, epsilon, stream);
+    } else if (reduction == RmsRowsReduction::parallel && args.width <= 64U) {
+        detail::launch_rms_wave_rows<2>(args, epsilon, stream);
+    } else if (reduction == RmsRowsReduction::parallel && args.width <= 128U) {
+        detail::launch_rms_wave_rows<4>(args, epsilon, stream);
+    } else if (reduction == RmsRowsReduction::parallel && args.width <= lanes) {
+        detail::launch_rms_wave_rows<8>(args, epsilon, stream);
     } else if (reduction == RmsRowsReduction::parallel) {
         rmsnorm_strided_kernel<Traits, lanes><<<dim3(args.rows), lanes, 0, stream>>>(
             args.input, args.input_row, args.scale, 0, args.width, epsilon, args.output, args.output_row);
