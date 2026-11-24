@@ -250,6 +250,11 @@ if(BUILD_TESTING)
         add_executable(${_cc_mini_verify_target} ${_cc_root}/tests/inkling2/mini_verify_rows_cuda.cu)
         target_link_libraries(${_cc_mini_verify_target} PRIVATE
             strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core)
+        # Serving cohort lanes vs each lane alone: bitwise logits, appended K/V rows, histories + build digests.
+        add_executable(strix-cuda-inkling2-mini-cohort-lanes-test ${_cc_root}/tests/inkling2/mini_cohort_lanes_cuda.cu)
+        target_link_libraries(strix-cuda-inkling2-mini-cohort-lanes-test PRIVATE
+            strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core)
+        list(APPEND _cc_mini_verify_target strix-cuda-inkling2-mini-cohort-lanes-test)
     endif()
     foreach(t IN LISTS _cc_mini_tests _cc_mini_verify_target)
         target_include_directories(${t} PRIVATE ${_cc_root}/src ${_cc_root}/include)
