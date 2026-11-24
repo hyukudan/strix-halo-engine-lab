@@ -25,7 +25,7 @@ the flags below. The serve options can also come from a TOML file (`--serve-conf
 | `--http-model-id NAME` | `qwen3.8-flash-next` | model name reported by `/v1/models` and responses |
 | `--http-api-key-file FILE` | none | require `Authorization: Bearer KEY` or `x-api-key: KEY` on the API routes |
 | `--http-batch N` | AUTO | omitted: as many request slots as memory admits ([below](#batched-decoding)); `N`: at most N; `0`: one request at a time |
-| `--http-sampling greedy\|reject\|sample` | `sample` on a cohort-compatible launch with MTP sampling speculation, otherwise `reject` | requests with `temperature > 0`: run greedy and say so in the response, answer 400, or sample (sampling-v1, cohort runner only) |
+| `--http-sampling greedy\|reject\|sample` | `sample` on a fixed cohort (`--http-batch N` or `--deploy`) with MTP sampling speculation, otherwise `reject` | requests with `temperature > 0`: run greedy and say so in the response, answer 400, or sample (sampling-v1, cohort runner only) |
 | `--http-default-temperature`, `-top-k`, `-top-p`, `-min-p` | retired | refused at startup: a server-only sampling default would make the HTTP stream differ from the command line; send the value in the request |
 | `--http-default-max-tokens N` | `4096` | generation budget when a request gives none |
 | `--http-max-queue N` | `65536` | waiting requests before new ones get 429; explicit small limits retain rejection |
@@ -353,9 +353,9 @@ route needs prefix windows, the draft chain and window rows `{2,4,8}`; when they
 feature is set (state import, copy windows), AUTO serves one request at a time and says why on startup.
 `--http-batch N` caps the slots at N (an explicit N with incompatible options is an error) and `--http-batch 0`
 selects the one-at-a-time route. AUTO keeps the numerical profile and MTP assets. Sampling policy is
-selected before measuring capacity. If a sampling-enabled launch would fall back to the single runner,
-startup refuses it. A cap of 1 selects the one-slot cohort, and an explicit `--http-sampling reject`
-allows AUTO to use the single runner.
+selected from the arguments before measuring capacity: AUTO without `--http-batch` resolves `reject` at every
+slot count and keeps its measured single/cohort choice. A fixed cohort (`--http-batch N` or `--deploy`) samples;
+if its launch would fall back to the single runner, startup refuses it. A cap of 1 selects the one-slot cohort.
 
 - Sizing: every automatic T candidate reserves the compiled primary/tail arenas once, plus each native
   owner's separate PLE staging, projections, gates, convolution snapshot, hashes, deferred GDN banks

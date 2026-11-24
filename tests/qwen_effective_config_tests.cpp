@@ -391,12 +391,17 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         const auto one=resolve_http_bridge_capacity(10,cost,10,30,0,0);
         const auto two=resolve_http_bridge_capacity(10,cost,30,30,0,0);
         expect(one.slots==1 && two.slots==2 && !startup.http_batch_explicit,"Qwen HTTP: exercise measured auto capacity");
-        expect(startup.http_sampling_policy=="sample" && admit_http_batch_slots(startup,two.slots,false)==2,
-            "Qwen HTTP: compatible auto startup selects sampling");
+        // The automatic route pins one policy for every measured slot count and still starts at one slot.
+        expect(startup.http_sampling_policy=="reject" && admit_http_batch_slots(startup,two.slots,false)==2,
+            "Qwen HTTP: automatic startup pins the same policy at two slots");
+        expect(admit_http_batch_slots(startup,one.slots,false)==0,
+            "Qwen HTTP: automatic startup under one-slot pressure starts the single runner");
         bool refused=false;
-        try { (void)admit_http_batch_slots(startup,one.slots,false); }
+        const auto pinned=parse(args); // --http-batch 2
+        try { (void)admit_http_batch_slots(pinned,one.slots,false); }
         catch(const std::runtime_error& e) { refused=std::string_view(e.what()).find("HTTP sampling capability")!=std::string_view::npos; }
-        expect(refused,"Qwen HTTP: auto fallback must refuse startup before it changes the sampling policy");
+        expect(pinned.http_sampling_policy=="sample" && refused,
+            "Qwen HTTP: a fixed sampling cohort refuses startup instead of changing its policy");
         auto one_cohort=args;
         *(std::find(one_cohort.begin(),one_cohort.end(),"--http-batch")+1)="1";
         const auto fixed=parse(one_cohort);

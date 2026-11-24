@@ -1292,8 +1292,13 @@ inline void resolve_http_route(Options& o) {
         o.http_batch = o.http_batch_cap ? o.http_batch_cap : 1U;
         o.http_slot_reason = "capacity pending measured startup";
     }
+    // The policy is a function of the arguments only. An omitted --http-sampling samples only where the operator fixed
+    // the cohort route (--http-batch N or --deploy); the automatic route keeps its measured single/cohort choice and
+    // refuses sampled requests at every slot count, so one-slot memory pressure starts the single runner as before.
+    const bool fixed_route = o.http_batch_explicit || o.deployment_spec;
     if (o.http_sampling == "greedy") o.http_sampling_policy = "greedy";
-    else if (o.http_sampling != "reject" && o.http_batch && !o.session_live_control && o.mtp.sample_speculation)
+    else if (o.http_sampling != "reject" && (o.http_sampling || fixed_route) && o.http_batch && !o.session_live_control &&
+             o.mtp.sample_speculation)
         o.http_sampling_policy = "sample";
     else o.http_sampling_policy = "reject";
 }

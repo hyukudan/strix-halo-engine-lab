@@ -98,9 +98,10 @@ tested after narrowing to float, so `top_p = 0.999999999` is no filter on either
 defaults (the `--http-default-*` flags are retired and refused). A server that cannot sample (policy `reject`, which is
 also what Qwen's single-request route reports) answers a request that would sample, including a filter without a
 temperature, with HTTP 400 "sampling is refused on this server". Explicit temperature 0 selects greedy even with
-filters. Qwen HTTP selects its sampling policy before measuring slots. If a sampling-enabled launch would
-fall back to the single runner, startup fails with a capability error. `--http-batch 1` selects the one-slot
-cohort runner and `--http-sampling reject` allows the automatic single runner.
+filters. Qwen HTTP selects its sampling policy from the arguments before measuring slots. The automatic route
+(no `--http-batch`) uses `reject` at every slot count, so memory pressure that leaves one slot starts the single
+runner as before. Sampling needs a fixed cohort (`--http-batch N` or `--deploy`); if measured capacity cannot hold
+it, startup fails with a capability error. `--http-batch 1` selects the one-slot cohort runner.
 
 Coupled acceptance matches the plain sampled request when the target distributions match at every committed
 position. The host gate checks this rule on drafted rows. Full CLI and HTTP token equality applies to routes
