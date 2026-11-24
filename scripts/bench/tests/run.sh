@@ -92,6 +92,10 @@ grep -q -- '--exl3-arm models/nemotron/exl3' "$tmp/nemotron-quality"
 if grep -q -- '--verify-rows' "$tmp/nemotron-quality"; then printf 'quality must not run the Q4_K_M R8 verify\n' >&2; exit 1; fi
 grep -q 'SKIP verify-r8' "$tmp/nemotron-quality"
 if bash scripts/bench/bench.sh run --engine nemotron --profile r1 --dry-run >/dev/null 2>&1; then exit 1; fi
+bash scripts/bench/bench.sh run --engine minimax-pair --profile baseline --suite quick --only serve --peer node-b \
+    --peer-repo /path/to/repo --dry-run >"$tmp/minimax-baseline" 2>&1
+grep -q 'SKIP serve: the MiniMax baseline prefill order is rank-only' "$tmp/minimax-baseline"
+if grep -q 'strix-minimax-serve' "$tmp/minimax-baseline"; then printf 'the MiniMax baseline must not plan a server\n' >&2; exit 1; fi
 printf 'PASS all six dry-runs, no GPU/assets/SSH execution\n'
 bash scripts/bench/tests/effective_config.sh
 bash scripts/bench/tests/single_config.sh
