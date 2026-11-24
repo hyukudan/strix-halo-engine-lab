@@ -50,12 +50,10 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
 #if defined(__HIPCC__)
     if (hipGetDevice(&ordinal) != hipSuccess) return out;
     const auto visible = device::HipEnumerator{}.enumerate();
-    // The toolkit version of the loaded HIP runtime (major * 10^7 + minor * 10^5 + patch), not the HIP_VERSION_* macros of
-    // the translation unit: those come from whichever hip_version.h the include path finds first, which differed
-    // between the CLI and the server of one build.
-    int runtime = 0;
-    if (hipRuntimeGetVersion(&runtime) != hipSuccess || runtime <= 0) return out;
-    out.compiler_id = "hip-" + std::to_string(runtime / 10000000) + "." + std::to_string(runtime / 100000 % 100);
+    // The compiler that built the admitted kernels (clang of the HIP toolkit), not the HIP_VERSION_* macros nor the
+    // loaded runtime: the CLI and the server of one build differ in both (hip_version.h found first on the include path,
+    // libamdhip64 resolved at run time), while their kernels come from the same compiler.
+    out.compiler_id = "hip-clang-" + std::to_string(__clang_major__) + "." + std::to_string(__clang_minor__);
     const auto identity = weight::implementation_identity(lowbit ? std::span<const weight::ArithmeticId>(core::kResidentLowBitArithmeticHip)
                                                                  : std::span<const weight::ArithmeticId>(core::kResidentQ8ArithmeticHip));
 #else

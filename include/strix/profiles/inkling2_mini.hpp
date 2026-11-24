@@ -45,13 +45,13 @@ inline constexpr weight::Digest256 kMiniCheckpoint =
     weight::digest_from_hex("65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1");
 inline constexpr std::array<weight::WeightLoadDecision, 2> kMiniWeightLoadDecisionRows{{
     {kMiniFastWeightPolicy.id,
-     {weight::Backend::hip, "gfx1151", "hip-7.16", kMiniResidentRegime, kMiniLowBitBuild, kMiniCheckpoint},
+     {weight::Backend::hip, "gfx1151", "hip-clang-24.0", kMiniResidentRegime, kMiniLowBitBuild, kMiniCheckpoint},
      weight::digest_from_hex("8897c15c3422e4c7b8fc7d46d38aeba2c8b2367c196b20a04896092fbdbdc845"),
      weight::digest_from_hex("b7cf2ad497b6e102f939227822122a0ef86ccb40e3a0f76cfe991c699519fecf"),
      {"docs/engine/lowbit-calibration.md", "2026-11-24", 1008, 0},
      {}},
     {kMiniTurboWeightPolicy.id,
-     {weight::Backend::hip, "gfx1151", "hip-7.16", kMiniResidentRegime, kMiniLowBitBuild, kMiniCheckpoint},
+     {weight::Backend::hip, "gfx1151", "hip-clang-24.0", kMiniResidentRegime, kMiniLowBitBuild, kMiniCheckpoint},
      {},
      weight::digest_from_hex("c0c0cf7e6a832fccfc3c0f2ed074f8a871cfea1a42d3fbb19a1f799443bfb76c"),
      {"docs/engine/lowbit-calibration.md", "2026-11-24", 1008, 0},
