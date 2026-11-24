@@ -42,6 +42,7 @@ Exit 0 = PASS, 1 = FAIL, 2 = no verdict (bookkeeping defect, too few rows, label
 import argparse
 import json
 import math
+import os
 import pathlib
 import re
 import statistics
@@ -587,6 +588,7 @@ def qual(a):
               f"on {traced} of {len(windows)} windows (slots = prompt rows x traced layers)")
     p = verdict(windows, flips if flips else None, limits=limits,
                 allow_null_floor=getattr(a, 'allow_null_floor', False))
+    exit_code = EXIT[p["state"]]
     print(pooled_line(p, limits))
     if a.json:
         doc = {"schema": "strix-fast-gate-v2/v1", "limits": limits, "ref": a.ref, "cand": a.cand, "null": a.null,
@@ -596,8 +598,14 @@ def qual(a):
             doc["tier"] = tier
         pathlib.Path(a.json).write_text(json.dumps(doc, indent=1, sort_keys=True, default=str) + "\n", encoding="utf-8")
     if getattr(a, "r4_assess", None) is not None:
-        print_r4_assessment(a.r4_assess, windows, p, classes, manifest, limits)
-    return EXIT[p["state"]]
+        try:
+            print_r4_assessment(a.r4_assess, windows, p, classes, manifest, limits)
+        except BaseException as e:  # The ordinary verdict and receipt are already final.
+            try:
+                _write_r4_diagnostic(f"diagnostic unavailable: {type(e).__name__} {_r4_label(str(e)[:256])}\n")
+            except BaseException:
+                pass
+    return exit_code
 
 
 def window_class(case, classes, manifest):
@@ -616,6 +624,7 @@ def window_class(case, classes, manifest):
 
 
 R4_CLASS_MIN = 3
+R4_MAX_INPUT_BYTES = 1024 * 1024
 
 
 def _r4_class_stats(nlls, limits):
@@ -632,8 +641,36 @@ def _r4_label(text):
     return json.dumps(text).replace("PASS", r"\u0050ASS")
 
 
+def _read_r4_original(path):
+    with pathlib.Path(path).open("rb") as f:
+        data = f.read(R4_MAX_INPUT_BYTES + 1)
+    if len(data) > R4_MAX_INPUT_BYTES:
+        raise GateError(f"original NLL JSON exceeds size limit ({R4_MAX_INPUT_BYTES} bytes)")
+    source = data.decode("utf-8")
+    # Bound nesting before handing the text to the recursive JSON decoder. The schema needs two levels.
+    depth = 0
+    quoted = escaped = False
+    for char in source:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in "[{":
+            depth += 1
+            if depth > 2:
+                raise GateError("original NLL JSON exceeds nesting limit (2 levels)")
+        elif char in "]}":
+            depth = max(0, depth - 1)
+    return json.loads(source)
+
+
 def r4_assessment(path, windows, pooled, manifest, limits):
-    original = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    original = _read_r4_original(path)
     if not isinstance(original, dict) or not original:
         raise GateError("expected a JSON object mapping content classes to original reference NLLs")
     for nlls in original.values():
@@ -656,7 +693,7 @@ def r4_assessment(path, windows, pooled, manifest, limits):
         provisional = bar is None or rows < limits["min_rows"] or content[cls]["state"] == "unresolved"
         unresolved |= provisional
         lines.append(f"content class {_r4_label(cls)}: {n} original windows, {detail}; {rows} scored rows"
-                     + (" (provisional)" if provisional else "")
+                     + (" (provisional; UNRESOLVED)" if bar is None else " (provisional)" if provisional else "")
                      + (f"; off-distribution {_r4_label(', '.join(outliers))}" if outliers else ""))
     for band in sorted({window_class(case, None, manifest) for case in manifest}):
         rows = bands.get(band, {}).get("rows", 0)
@@ -671,16 +708,19 @@ def r4_assessment(path, windows, pooled, manifest, limits):
     return [*lines, f"frozen-bar assessment would be {state}"]
 
 
+def _write_r4_diagnostic(text):
+    if sys.stderr is sys.__stderr__:
+        # A failed buffered stderr write can fail again at interpreter shutdown and change the exit status.
+        os.write(sys.stderr.fileno(), text.encode("ascii"))
+    else:
+        sys.stderr.write(text)
+
+
 def print_r4_assessment(path, windows, pooled, classes, manifest, limits):
-    try:
-        if not classes or manifest is None:
-            raise GateError("requires --classes and --manifest for content and prompt-band checks")
-        lines = r4_assessment(path, windows, pooled, manifest, limits)
-    except (GateError, OSError, ValueError, OverflowError) as e:
-        lines = [f"assessment unavailable: {_r4_label(str(e))}"]
-    sys.stdout.flush()
-    for line in lines:
-        print(f"R4 DIAGNOSTIC ONLY: {line}", file=sys.stderr)
+    if not classes or manifest is None:
+        raise GateError("requires --classes and --manifest for content and prompt-band checks")
+    lines = r4_assessment(path, windows, pooled, manifest, limits)
+    _write_r4_diagnostic("".join(f"R4 DIAGNOSTIC ONLY: {line}\n" for line in lines))
 
 
 def main(argv=None):
