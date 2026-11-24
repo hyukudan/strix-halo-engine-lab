@@ -100,6 +100,49 @@ inline hipError_t enqueue_bf16_rows(const float* input, unsigned input_width, un
     return hipGetLastError();
 }
 
+// Rows whose activations arrive as a BF16 operand image (u16 [rows][input_width], element = the RNE BF16 encoding of
+// the FP32 value): the shared WMMA tile reads the image as is, the operand bits its FP32 staging makes of those values,
+// so each output keeps the bits enqueue_bf16_rows stores for the FP32 rows; half the activation bytes. The tile's
+// prefill shapes only (decode rows keep their FP32 sweep): callers check admits_bf16_image_projections before they
+// store the image.
+inline constexpr bool admits_bf16_image_rows(unsigned input_width, unsigned rows) noexcept {
+    return rows > gemv_rows::max_rows && rows <= 65535U * f16_tile_gemm::kBM && input_width >= f16_tile_gemm::kBK &&
+           input_width % f16_tile_gemm::kBK == 0U &&
+           input_width <= std::numeric_limits<unsigned>::max() - f16_tile_gemm::kBK;
+}
+
+// The image route for these projections, asked before the image is stored: the shape (admits_bf16_image_rows) and
+// every weight the image launch reads (contiguous rows, 16-byte aligned, outputs within max_outputs, one rounding
+// class). A projection outside it keeps its FP32 rows, where enqueue_bf16_rows serves pitched and unaligned weights.
+inline bool admits_bf16_image_projections(unsigned input_width, unsigned rows,
+                                          std::span<const Bf16RowProjection> projections,
+                                          unsigned max_outputs) noexcept {
+    constexpr auto max_elements = std::numeric_limits<std::size_t>::max() / sizeof(float);
+    if (!admits_bf16_image_rows(input_width, rows) || input_width > max_elements / rows || projections.empty() ||
+        projections.size() > kGroupMax)
+        return false;
+    const bool round_bf16 = projections.front().round_bf16;
+    return std::ranges::all_of(projections, [&](const Bf16RowProjection& projection) {
+        return projection.weights && projection.output && projection.outputs != 0U &&
+               projection.outputs <= max_outputs && projection.outputs <= max_elements / rows &&
+               projection.contiguous(input_width) &&
+               reinterpret_cast<std::uintptr_t>(projection.weights) % 16U == 0U && projection.round_bf16 == round_bf16;
+    });
+}
+
+inline hipError_t enqueue_bf16_image_rows(const std::uint16_t* input, unsigned input_width, unsigned rows,
+                                          std::span<const Bf16RowProjection> projections, unsigned max_outputs,
+                                          hipStream_t stream) {
+    if (!input || reinterpret_cast<std::uintptr_t>(input) % 16U != 0U ||
+        !admits_bf16_image_projections(input_width, rows, projections, max_outputs))
+        return hipErrorInvalidValue;
+    f16_tile_gemm::Bf16ProjectionGroup<kGroupMax> group{};
+    for (const auto& projection : projections)
+        group.append({projection.weights, projection.outputs, projection.output, projection.round_bf16});
+    f16_tile_gemm::gemm_bf16_projections_image(input, rows, input_width, group, stream);
+    return hipGetLastError();
+}
+
 // The [forget, gain] pair of a low-rank controller with the controller as the tile epilogue:
 // output[r][n] = controller_mix(current[r][n], message[r][n], forget sum, gain sum), the same bits as
 // enqueue_bf16_rows (FP32 sums) followed by the pointwise controller. hipErrorNotSupported where the shared WMMA tile
