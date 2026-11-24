@@ -79,8 +79,11 @@ grouped GEMM. Use `--packed-decode` or `--grouped-decode` to select the
 route explicitly. The packed route uses one kernel for gate/up with BF16
 activation and one for down with ordered expert combine.
 
-`strix-serve` resolves the same decode route: packed on HIP, grouped on CUDA,
-with the same two switches. With the packed route every decode lane of a
+`strix-serve` resolves the decode route once at start: on HIP packed below
+16 slots and grouped from 16 slots on (`grouped_decode_min_slots` in
+`models/inkling2-mini.toml`; without `--slots` the cohort width is
+`--prefill-rows`), grouped on CUDA, with the same two switches. The route line
+prints the form and why (`moe_decode packed moe_decode_choice slots<16`). With the packed route every decode lane of a
 cohort, at any cohort size, runs the packed form (rows launches of at most 8
 lanes whose row bits equal a one-row launch), so a served lane keeps the CLI's
 EXACT identity and does not depend on how many requests share the step. The

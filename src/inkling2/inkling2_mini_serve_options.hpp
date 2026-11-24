@@ -28,13 +28,30 @@ struct MiniServeOptions {
     // the class the profile line reports, as the CLI and the gate do.
     moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16;
     bool packed_decode = false;       // resolved decode expert form (mini_serve_packed_decode)
+    bool packed_decode_requested = false;  // --packed-decode / --grouped-decode given
 };
 
-// HIP serving resolves to the CLI default (kMiniPackedDecodeDefault): one EXACT identity for a served lane and the
-// CLI, at any cohort size. CUDA serving keeps the grouped tile kernel until its cohort decode is measured (the CUDA
-// packed form runs one launch per lane). --packed-decode / --grouped-decode override either backend.
-inline bool mini_serve_packed_decode(std::string_view backend, std::optional<bool> requested) {
-    return requested.value_or(backend == "hip" && kMiniPackedDecodeDefault);
+// Cohort width the served decode form is chosen for: the configured slots, or every prefill row without --slots
+// (make_mini_device_cohort sizes the cohort the same way).
+inline unsigned mini_serve_cohort_rows(const MiniServeOptions& opt) { return opt.slots ? opt.slots : opt.prefill_rows; }
+
+// HIP serving decodes experts on the CLI's packed form (kMiniPackedDecodeDefault) below kMiniGroupedDecodeMinSlots
+// cohort rows, and on the grouped tile kernel from there on. A server keeps its form for its whole life, so a lane's
+// tokens never depend on the cohort size; a packed server shares the CLI's EXACT identity. CUDA serving keeps the
+// grouped tile kernel until its cohort decode is measured (the CUDA packed form runs one launch per lane).
+// --packed-decode / --grouped-decode override either backend.
+inline bool mini_serve_packed_decode(std::string_view backend, std::optional<bool> requested, unsigned cohort_rows) {
+    if (requested) return *requested;
+    return backend == "hip" && kMiniPackedDecodeDefault && cohort_rows < kMiniGroupedDecodeMinSlots;
+}
+
+// Route line value of the choice: the form and why ("requested", "backend", "slots<N" or "slots>=N").
+inline std::string mini_serve_decode_form(const MiniServeOptions& opt, std::string_view backend) {
+    std::string form = opt.packed_decode ? "packed" : "grouped";
+    form += " moe_decode_choice ";
+    if (opt.packed_decode_requested) return form + "requested";
+    if (backend != "hip") return form + "backend";
+    return form + (opt.packed_decode ? "slots<" : "slots>=") + std::to_string(kMiniGroupedDecodeMinSlots);
 }
 
 struct MiniServeCohort {

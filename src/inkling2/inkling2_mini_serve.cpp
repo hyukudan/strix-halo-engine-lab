@@ -77,7 +77,8 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
-    out.packed_decode = mini_serve_packed_decode(resolved.backend, packed_decode);
+    out.packed_decode_requested = packed_decode.has_value();
+    out.packed_decode = mini_serve_packed_decode(resolved.backend, packed_decode, mini_serve_cohort_rows(out));
     return resolved;
 }
 

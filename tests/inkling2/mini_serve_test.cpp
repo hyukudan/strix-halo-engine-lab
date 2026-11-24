@@ -308,8 +308,11 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
         const strix::weight::WeightLoadScope scope{kind, {}, {}, {}, {}, {}};
         const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope);
-        // No switch: HIP serves the CLI's packed expert form, CUDA keeps the grouped tile kernel.
-        require(options.packed_decode == (kind == strix::weight::Backend::hip && mini::kMiniPackedDecodeDefault),
+        // No switch: HIP serves the CLI's packed expert form below the grouped cohort width, CUDA keeps the grouped
+        // tile kernel.
+        require(!options.packed_decode_requested &&
+                    options.packed_decode == (kind == strix::weight::Backend::hip && mini::kMiniPackedDecodeDefault &&
+                                              mini::mini_serve_cohort_rows(options) < mini::kMiniGroupedDecodeMinSlots),
                 "served decode expert form differs from the backend default");
         created = true;
         return mini::MiniServeCohort{
@@ -447,11 +450,36 @@ int main(int argc, char** argv) try {
         wiring(argv[1], backend, true);
     }
     wiring(argv[1], "cuda", false, true);
-    // Served decode expert form: the CLI default on HIP, grouped on CUDA, an explicit switch wins on either.
-    require(mini::mini_serve_packed_decode("hip", std::nullopt) == mini::kMiniPackedDecodeDefault &&
-            !mini::mini_serve_packed_decode("cuda", std::nullopt) &&
-            !mini::mini_serve_packed_decode("hip", false) && mini::mini_serve_packed_decode("cuda", true),
-            "served decode expert form resolution");
+    // Served decode expert form: the CLI default on HIP below the grouped cohort width (model data), grouped from it
+    // on and on CUDA, an explicit switch wins on either at any width.
+    static_assert(mini::kMiniGroupedDecodeMinSlots == 16U);
+    for (unsigned rows : {1U, 2U, 8U, 15U}) {
+        require(mini::mini_serve_packed_decode("hip", std::nullopt, rows) == mini::kMiniPackedDecodeDefault &&
+                    !mini::mini_serve_packed_decode("cuda", std::nullopt, rows),
+                "served decode expert form below the grouped width");
+    }
+    for (unsigned rows : {16U, 17U, 128U}) {
+        require(!mini::mini_serve_packed_decode("hip", std::nullopt, rows) &&
+                    mini::mini_serve_packed_decode("hip", true, rows) && mini::mini_serve_packed_decode("cuda", true, rows),
+                "served decode expert form at the grouped width");
+    }
+    require(!mini::mini_serve_packed_decode("hip", false, 1U) && mini::mini_serve_packed_decode("cuda", true, 1U),
+            "served decode expert form switch");
+    {
+        mini::MiniServeOptions opt;
+        opt.slots = 8U;
+        require(mini::mini_serve_cohort_rows(opt) == 8U, "cohort rows from --slots");
+        opt.slots = 0U;
+        require(mini::mini_serve_cohort_rows(opt) == opt.prefill_rows, "cohort rows without --slots");
+        opt.packed_decode = true;
+        require(mini::mini_serve_decode_form(opt, "hip") == "packed moe_decode_choice slots<16", "route line, packed");
+        opt.packed_decode = false;
+        require(mini::mini_serve_decode_form(opt, "hip") == "grouped moe_decode_choice slots>=16" &&
+                    mini::mini_serve_decode_form(opt, "cuda") == "grouped moe_decode_choice backend",
+                "route line, grouped");
+        opt.packed_decode_requested = true;
+        require(mini::mini_serve_decode_form(opt, "hip") == "grouped moe_decode_choice requested", "route line, flag");
+    }
     // Every lever value reaches the served decoder as its own class (mse used to run nearest@1 there).
     for (const auto& [value, expected] : {std::pair{"1", W4a4::nvfp4}, std::pair{"mse", W4a4::nvfp4_mse},
                                           std::pair{"mse-gate-up", W4a4::nvfp4_mse_gate_up}}) {

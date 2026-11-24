@@ -1,12 +1,18 @@
 #pragma once
 
+#include "strix/model_data/inkling2_mini.hpp"
+
 namespace strix::inkling2 {
 
 inline constexpr unsigned kMiniMaxVerifyRows = 8U;
 
-// Decode experts on the packed one-row form (moe_core::microscaled_r1). The CLI and HIP serving resolve to this
-// value, so a served lane and the CLI share one EXACT identity; --grouped-decode keeps the grouped tile kernel.
+// Decode experts on the packed one-row form (moe_core::microscaled_r1). The CLI and HIP serving below
+// kMiniGroupedDecodeMinSlots resolve to this value, so a served lane and the CLI share one EXACT identity;
+// --grouped-decode keeps the grouped tile kernel.
 inline constexpr bool kMiniPackedDecodeDefault = true;
+// Cohort width (server slots) from which HIP serving decodes experts on the grouped tile kernel (model data).
+inline constexpr unsigned kMiniGroupedDecodeMinSlots =
+    static_cast<unsigned>(model_data::inkling2_mini::moe::grouped_decode_min_slots);
 
 enum class MiniAppendKind { prefill, decode, verify };
 
