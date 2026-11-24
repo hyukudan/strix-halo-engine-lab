@@ -33,7 +33,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     ResolvedService resolved;
     auto& out = resolved.options;
     const auto& args = selection.arguments;
-    std::optional<bool> packed_decode;
+    std::optional<MiniDecodeRequest> decode_request;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string_view name = args[i];
         if (name == "--dspark") throw std::invalid_argument("Inkling serving does not support --dspark");
@@ -42,11 +42,14 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
             return args[i];
         };
         if (parse_mini_weight_option(out.weight_options, name, next, true)) continue;
-        if (name == "--packed-decode" || name == "--grouped-decode") {
-            const bool packed = name == "--packed-decode";
-            if (packed_decode && *packed_decode != packed)
-                throw std::invalid_argument("--packed-decode and --grouped-decode are mutually exclusive");
-            packed_decode = packed;
+        if (name == "--packed-decode" || name == "--grouped-decode" || name == "--decode-by-slots") {
+            const auto request = name == "--packed-decode"    ? MiniDecodeRequest::packed
+                                 : name == "--grouped-decode" ? MiniDecodeRequest::grouped
+                                                              : MiniDecodeRequest::by_slots;
+            if (decode_request && *decode_request != request)
+                throw std::invalid_argument(
+                    "--packed-decode, --grouped-decode and --decode-by-slots are mutually exclusive");
+            decode_request = request;
             continue;
         }
         const auto& value = next();
@@ -78,7 +81,10 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
-    out.packed_decode = mini_packed_decode(MiniDecodeEntry::serve, packed_decode);
+    const auto form = mini_decode_form(MiniDecodeEntry::serve, decode_request, mini_serve_cohort_rows(out),
+                                       resolved.backend == "hip");
+    out.packed_decode = form.packed;
+    out.decode_reason = form.reason;
     return resolved;
 }
 

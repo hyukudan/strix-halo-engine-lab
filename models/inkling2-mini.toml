@@ -26,6 +26,8 @@ rank = 64
 softcap = 30.0
 
 [moe]
+# strix-serve --decode-by-slots (opt-in, HIP): packed decode experts below this cohort width, grouped from it on.
+grouped_decode_min_slots = 16
 mxfp8_first = 20
 route_scale = 8.0
 gate_softcap = 4.0

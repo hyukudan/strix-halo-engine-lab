@@ -81,11 +81,17 @@ activation and one for down with ordered expert combine.
 
 `strix-serve` resolves the decode route with the same function and the same
 two switches; its default stays the grouped tile kernel on both backends, so
-existing served answers keep their bits. With `--packed-decode` every decode
-lane of a served cohort runs the packed form: on HIP the cohort runs in
-balanced passes of at most 16 lanes (the one-row cap of the dense rows family),
-so a served lane has the CLI's bits at any cohort size. The grouped route keeps
-one pass of every lane. The startup line reports `moe_decode packed|grouped`.
+existing served answers keep their bits. An explicit switch wins at any
+cohort width. `--decode-by-slots` (opt-in) chooses once at start by cohort
+width: on HIP packed below 16 slots and grouped from 16 slots on
+(`grouped_decode_min_slots` in `models/inkling2-mini.toml`; without `--slots`
+the cohort width is `--prefill-rows`), grouped on CUDA. With the packed route
+every decode lane of a served cohort runs the packed form: on HIP the cohort
+runs in balanced passes of at most 16 lanes (the one-row cap of the dense rows
+family), so a served lane has the CLI's bits at any cohort size. The grouped
+route keeps one pass of every lane. The startup line reports the form and why:
+`moe_decode grouped moe_decode_choice serve-default|requested|slots>=16|backend`
+or `moe_decode packed moe_decode_choice requested|slots<16`.
 
 On CUDA, a greedy pick that returns no logits row (decode steps and the last
 prompt row without `--logits`) runs the shared EXACT screened head

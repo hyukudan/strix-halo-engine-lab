@@ -309,8 +309,9 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
         const strix::weight::WeightLoadScope scope{kind, {}, {}, {}, {}, {}};
         const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope);
-        // No switch: both backends serve the incumbent grouped tile kernel (packed serving is opt-in).
-        require(!options.packed_decode, "served decode expert form differs from the serving default (grouped)");
+        // No switch: both backends serve the incumbent grouped tile kernel (packed and the slot rule are opt-in).
+        require(!options.packed_decode && options.decode_reason == mini::MiniDecodeReason::entry,
+                "served decode expert form differs from the serving default (grouped)");
         created = true;
         return mini::MiniServeCohort{
             std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable), 32U, 3U, 2U), weights};
@@ -361,13 +362,15 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         strings.pop_back();
     }
     {
-        // The two decode-form switches exclude each other before any native load.
-        std::ostringstream out, error;
-        strings.emplace_back("--packed-decode");
-        strings.emplace_back("--grouped-decode");
-        require(run({}, out, error) == 2 && !created && error.str().find("mutually exclusive") != std::string::npos,
-                "--packed-decode with --grouped-decode did not fail before native load");
-        strings.resize(strings.size() - 2U);
+        // The decode-form switches exclude each other before any native load.
+        for (const auto* other : {"--grouped-decode", "--decode-by-slots"}) {
+            std::ostringstream out, error;
+            strings.emplace_back("--packed-decode");
+            strings.emplace_back(other);
+            require(run({}, out, error) == 2 && !created && error.str().find("mutually exclusive") != std::string::npos,
+                    "two decode-form switches did not fail before native load");
+            strings.resize(strings.size() - 2U);
+        }
     }
     sv::ServeShell shell;
     shell.serve = [qualify_q8, sample_capable](const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
@@ -447,14 +450,56 @@ int main(int argc, char** argv) try {
         wiring(argv[1], backend, true);
     }
     wiring(argv[1], "cuda", false, true);
-    // One decode expert form resolver for the CLI and strix-serve: the incumbents (CLI packed, serving grouped),
-    // an explicit switch wins on either entry point.
+    // One decode expert form resolver for the CLI and strix-serve. Precedence: an explicit form at any width, then the
+    // opt-in slot rule (HIP: packed below the grouped cohort width of the model data, grouped from it on; CUDA
+    // grouped), then the entry's incumbent (CLI packed, serving grouped).
     using mini::MiniDecodeEntry;
+    using mini::MiniDecodeReason;
+    using mini::MiniDecodeRequest;
     require(mini::mini_packed_decode(MiniDecodeEntry::cli, std::nullopt) &&
             !mini::mini_packed_decode(MiniDecodeEntry::serve, std::nullopt) &&
             mini::mini_packed_decode(MiniDecodeEntry::serve, true) &&
             !mini::mini_packed_decode(MiniDecodeEntry::cli, false),
             "decode expert form resolution");
+    static_assert(mini::kMiniGroupedDecodeMinSlots == 16U);
+    for (unsigned rows : {1U, 2U, 8U, 15U, 16U, 17U, 128U}) {
+        const bool below = rows < 16U;
+        for (const bool hip : {true, false}) {
+            // Without a request serving stays grouped at every width (main's served identity).
+            const auto none = mini::mini_decode_form(MiniDecodeEntry::serve, std::nullopt, rows, hip);
+            require(!none.packed && none.reason == MiniDecodeReason::entry, "serving default is grouped at any width");
+            const auto slot_form =
+                mini::mini_decode_form(MiniDecodeEntry::serve, MiniDecodeRequest::by_slots, rows, hip);
+            require(slot_form.packed == (hip && below) &&
+                        slot_form.reason == (!hip ? MiniDecodeReason::backend
+                                              : below ? MiniDecodeReason::slots_below : MiniDecodeReason::slots_from),
+                    "slot rule: packed below 16 on HIP, grouped from 16 and on CUDA");
+            for (const auto request : {MiniDecodeRequest::packed, MiniDecodeRequest::grouped}) {
+                const auto form = mini::mini_decode_form(MiniDecodeEntry::serve, request, rows, hip);
+                require(form.packed == (request == MiniDecodeRequest::packed) &&
+                            form.reason == MiniDecodeReason::requested,
+                        "an explicit form wins at any width");
+            }
+        }
+    }
+    {
+        mini::MiniServeOptions opt;
+        opt.slots = 8U;
+        require(mini::mini_serve_cohort_rows(opt) == 8U, "cohort rows from --slots");
+        opt.slots = 0U;
+        require(mini::mini_serve_cohort_rows(opt) == opt.prefill_rows, "cohort rows without --slots");
+        require(mini::mini_serve_decode_form(opt) == "grouped moe_decode_choice serve-default", "route line, default");
+        opt.packed_decode = true;
+        opt.decode_reason = MiniDecodeReason::slots_below;
+        require(mini::mini_serve_decode_form(opt) == "packed moe_decode_choice slots<16", "route line, packed");
+        opt.packed_decode = false;
+        opt.decode_reason = MiniDecodeReason::slots_from;
+        require(mini::mini_serve_decode_form(opt) == "grouped moe_decode_choice slots>=16", "route line, grouped");
+        opt.decode_reason = MiniDecodeReason::backend;
+        require(mini::mini_serve_decode_form(opt) == "grouped moe_decode_choice backend", "route line, CUDA");
+        opt.decode_reason = MiniDecodeReason::requested;
+        require(mini::mini_serve_decode_form(opt) == "grouped moe_decode_choice requested", "route line, flag");
+    }
     // Every lever value reaches the served decoder as its own class (mse used to run nearest@1 there).
     for (const auto& [value, expected] : {std::pair{"1", W4a4::nvfp4}, std::pair{"mse", W4a4::nvfp4_mse},
                                           std::pair{"mse-gate-up", W4a4::nvfp4_mse_gate_up}}) {

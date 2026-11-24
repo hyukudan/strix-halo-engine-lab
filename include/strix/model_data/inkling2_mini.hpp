@@ -38,6 +38,7 @@ inline constexpr double softcap = 0x1.ep+4 /* 30 */;
 } // namespace head
 namespace moe {
 inline constexpr double gate_softcap = 0x1p+2 /* 4 */;
+inline constexpr std::int64_t grouped_decode_min_slots = 16;
 inline constexpr std::int64_t mxfp8_first = 20;
 inline constexpr double route_scale = 0x1p+3 /* 8 */;
 inline constexpr double up_softcap = 0x1.9p+4 /* 25 */;
