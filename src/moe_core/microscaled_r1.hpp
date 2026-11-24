@@ -1447,11 +1447,11 @@ inline cudaError_t enqueue_step(const StepArgs& args, cudaStream_t stream) {
     const auto& a = args.batch;
     constexpr auto limit = std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t);
     // Each step node submits one grid and checks that one.
-    const bool grid = GateUp ? gate_grid_launchable(a.intermediate, Rows, TopK, detail::kGateColumns, detail::kThreads,
+    const bool grid_ok = GateUp ? gate_grid_launchable(a.intermediate, Rows, TopK, detail::kGateColumns, detail::kThreads,
                                                     kBackendGridLimits)
                              : down_grid_launchable(a.hidden, Rows, detail::kDownColumns, detail::kThreads,
                                                     kBackendGridLimits);
-    if (!args.step || !fits<Format, TopK>(a) || a.intermediate > limit / Rows / TopK || !grid)
+    if (!args.step || !fits<Format, TopK>(a) || a.intermediate > limit / Rows / TopK || !grid_ok)
         return cudaErrorInvalidValue;
     if constexpr (GateUp) {
         const auto grid = gate_up_grid(a.intermediate, Rows, TopK, detail::kGateColumns);
