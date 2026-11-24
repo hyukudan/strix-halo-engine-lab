@@ -23,6 +23,8 @@ static_assert(strix::gdn_window_cohort_max_segments >= strix::kCohortWideMaxSess
               "GDN cohort segment capacity below the shared wide cohort session cap");
 #include "strix/recurrent_state_policy.hpp"
 #include "attn_core/recurrent_state.hpp"
+#include "ops/recur/gated_delta_rows.hpp"
+#include "ops/recur/gated_delta_step.hpp"
 #include "hip_gdn_identity.hpp"
 #include "strix/qpersist.hpp"
 #include "strix/prefill_identity.hpp"
@@ -98,6 +100,7 @@ inline bool gdn_window_tiled_enabled() {
 constexpr std::uint32_t kProjectionThreads = 256;
 constexpr std::uint32_t kRecurrentThreads = 128;
 constexpr std::uint32_t kValueTile = 32;
+static_assert(kRecurrentThreads == ops::recur::kStepThreads && kValueTile == ops::recur::kStepValueTile);
 constexpr std::uint64_t fnv_prime =
     1099511628211ULL;
 
@@ -1458,234 +1461,8 @@ void recurrent_step_kernel(
     std::uint32_t key_heads,
     std::uint32_t value_heads,
     std::uint32_t head_dim, std::uint32_t* graph_status) {
-    auto* state = reinterpret_cast<typename rstate::Codec<S>::Elem*>(state_raw);
-    __shared__ unsigned graph_reject;
-    if (graph_status != nullptr) {
-        if (threadIdx.x == 0) graph_reject = atomicAdd(graph_status, 0U) != 0;
-        __syncthreads();
-        if (graph_reject) return;
-    }
-    const auto tile_count =
-        head_dim /
-        kValueTile;
-    const auto block =
-        static_cast<std::uint32_t>(
-            blockIdx.x);
-    const auto value_head =
-        block /
-        tile_count;
-    const auto tile =
-        block %
-        tile_count;
-    const auto lane =
-        static_cast<std::uint32_t>(
-            threadIdx.x);
-
-    if (value_head >= value_heads ||
-        lane >= head_dim) {
-        return;
-    }
-
-    const auto key_head =
-        value_head %
-        key_heads;
-    const auto value_base =
-        tile *
-        kValueTile;
-
-    const auto q_base =
-        static_cast<std::uint64_t>(
-            key_head) *
-        head_dim;
-    const auto k_base =
-        static_cast<std::uint64_t>(
-            key_heads) *
-            head_dim +
-        q_base;
-    const auto v_base =
-        static_cast<std::uint64_t>(
-            key_heads) *
-            head_dim *
-            2ULL +
-        static_cast<std::uint64_t>(
-            value_head) *
-            head_dim;
-
-    __shared__ float reduction[
-        kRecurrentThreads *
-        kValueTile];
-    // The first reduction's broadcast must remain immutable while every wave
-    // reads it. Reusing reduction[column] for the next tree lets lane zero
-    // overwrite a delta before another wave has consumed it.
-    __shared__ float deltas[kValueTile];
-
-    float retained[kValueTile];
-    // 16-bit contracts: the thread's 32 contiguous elements load as packed 16-byte runs (one access per 8).
-    float packed_run[S == RecurrentStateType::f32 ? 1U : kValueTile];
-    if constexpr (S != RecurrentStateType::f32)
-        rstate::load_run<S, kValueTile>(state + (static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base,
-            packed_run);
-    else
-        (void)packed_run;
-#pragma unroll
-    for (std::uint32_t column = 0;
-         column < kValueTile;
-         ++column) {
-        const auto value_index =
-            value_base +
-            column;
-        const auto state_index =
-            (static_cast<std::uint64_t>(
-                 value_head) *
-                 head_dim +
-             lane) *
-                head_dim +
-            value_index;
-        float stored;
-        if constexpr (S == RecurrentStateType::f32) stored = state[state_index];
-        else stored = packed_run[column];
-        retained[column] =
-            stored *
-            expf(
-                gate[value_head]);
-        reduction[
-            static_cast<std::size_t>(
-                lane) *
-                kValueTile +
-            column] =
-            retained[column] *
-            qkv[
-                k_base +
-                lane];
-    }
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kRecurrentThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (lane < stride) {
-#pragma unroll
-            for (std::uint32_t column = 0;
-                 column < kValueTile;
-                 ++column) {
-                reduction[
-                    static_cast<std::size_t>(
-                        lane) *
-                        kValueTile +
-                    column] +=
-                    reduction[
-                        static_cast<std::size_t>(
-                            lane + stride) *
-                            kValueTile +
-                        column];
-            }
-        }
-        __syncthreads();
-    }
-
-    if (lane == 0) {
-#pragma unroll
-        for (std::uint32_t column = 0;
-             column < kValueTile;
-             ++column) {
-            const auto value_index =
-                value_base +
-                column;
-            deltas[column] =
-                (qkv[
-                     v_base +
-                     value_index] -
-                 reduction[column]) *
-                beta[value_head];
-        }
-    }
-    __syncthreads();
-
-#pragma unroll
-    for (std::uint32_t column = 0;
-         column < kValueTile;
-         ++column) {
-        const auto delta =
-            deltas[column];
-        retained[column] +=
-            qkv[
-                k_base +
-                lane] *
-            delta;
-        reduction[
-            static_cast<std::size_t>(
-                lane) *
-                kValueTile +
-            column] =
-            retained[column] *
-            qkv[
-                q_base +
-                lane];
-    }
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kRecurrentThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (lane < stride) {
-#pragma unroll
-            for (std::uint32_t column = 0;
-                 column < kValueTile;
-                 ++column) {
-                reduction[
-                    static_cast<std::size_t>(
-                        lane) *
-                        kValueTile +
-                    column] +=
-                    reduction[
-                        static_cast<std::size_t>(
-                            lane + stride) *
-                            kValueTile +
-                        column];
-            }
-        }
-        __syncthreads();
-    }
-
-    if (lane == 0) {
-#pragma unroll
-        for (std::uint32_t column = 0;
-             column < kValueTile;
-             ++column) {
-            core[
-                static_cast<std::uint64_t>(
-                    value_head) *
-                    head_dim +
-                value_base +
-                column] =
-                reduction[column];
-        }
-    }
-
-#pragma unroll
-    for (std::uint32_t column = 0;
-         column < kValueTile;
-         ++column) {
-        const auto value_index =
-            value_base +
-            column;
-        const auto state_index =
-            (static_cast<std::uint64_t>(
-                 value_head) *
-                 head_dim +
-             lane) *
-                head_dim +
-            value_index;
-        if constexpr (S == RecurrentStateType::f32)
-            state[state_index] = retained[column];
-        else
-            (void)state_index;
-    }
-    if constexpr (S != RecurrentStateType::f32)
-        rstate::store_run<S, kValueTile>(state + (static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base,
-            retained);
+    const ops::recur::ScalarGate policy{};  // F9 gated_delta, scalar gate (src/ops/recur)
+#include "ops/recur/gated_delta_step_body.inc"
 }
 
 // Rows of one window in one launch: the retained state tile stays in registers from row to row (the per-row kernel above
@@ -1702,74 +1479,8 @@ void recurrent_rows_kernel(
     const float* qkv, const float* beta, const float* gate, const float* state, float* state_out, float* core,
     std::uint32_t key_heads, std::uint32_t value_heads, std::uint32_t head_dim, std::uint32_t rows,
     std::uint64_t qkv_stride, std::uint64_t core_stride) {
-    const auto tile_count = head_dim / kValueTile;
-    const auto value_head = static_cast<std::uint32_t>(blockIdx.x) / tile_count;
-    const auto tile = static_cast<std::uint32_t>(blockIdx.x) % tile_count;
-    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
-    if (value_head >= value_heads || lane >= head_dim) return;
-    const auto key_head = value_head % key_heads;
-    const auto value_base = tile * kValueTile;
-    const auto q_base = static_cast<std::uint64_t>(key_head) * head_dim;
-    const auto k_base = static_cast<std::uint64_t>(key_heads) * head_dim + q_base;
-    const auto v_base = static_cast<std::uint64_t>(key_heads) * head_dim * 2ULL + static_cast<std::uint64_t>(value_head) * head_dim;
-    __shared__ float reduction[gdn_recurrent_lds::extent(F)];
-    __shared__ float deltas[kValueTile];
-    float retained[kValueTile];
-#pragma unroll
-    for (std::uint32_t column = 0; column < kValueTile; ++column)
-        retained[column] = state[(static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base + column];
-    for (std::uint32_t r = 0; r < rows; ++r) {
-        const float* q = qkv + r * qkv_stride;
-        const float* b = beta + static_cast<std::uint64_t>(r) * value_heads;
-        const float* g = gate + static_cast<std::uint64_t>(r) * value_heads;
-        float* out = core + r * core_stride;
-        const float decay = expf(g[value_head]);
-#pragma unroll
-        for (std::uint32_t column = 0; column < kValueTile; ++column) {
-            retained[column] = retained[column] * decay;
-            reduction[gdn_recurrent_lds::index(F, lane, column)] = retained[column] * q[k_base + lane];
-        }
-        __syncthreads();
-        for (std::uint32_t stride = kRecurrentThreads / 2U; stride > 0; stride >>= 1U) {
-            if (lane < stride) {
-#pragma unroll
-                for (std::uint32_t column = 0; column < kValueTile; ++column)
-                    reduction[gdn_recurrent_lds::index(F, lane, column)] +=
-                        reduction[gdn_recurrent_lds::index(F, lane + stride, column)];
-            }
-            __syncthreads();
-        }
-        if (lane == 0) {
-#pragma unroll
-            for (std::uint32_t column = 0; column < kValueTile; ++column)
-                deltas[column] = (q[v_base + value_base + column] - reduction[gdn_recurrent_lds::index(F, 0U, column)]) * b[value_head];
-        }
-        __syncthreads();
-#pragma unroll
-        for (std::uint32_t column = 0; column < kValueTile; ++column) {
-            retained[column] += q[k_base + lane] * deltas[column];
-            reduction[gdn_recurrent_lds::index(F, lane, column)] = retained[column] * q[q_base + lane];
-        }
-        __syncthreads();
-        for (std::uint32_t stride = kRecurrentThreads / 2U; stride > 0; stride >>= 1U) {
-            if (lane < stride) {
-#pragma unroll
-                for (std::uint32_t column = 0; column < kValueTile; ++column)
-                    reduction[gdn_recurrent_lds::index(F, lane, column)] +=
-                        reduction[gdn_recurrent_lds::index(F, lane + stride, column)];
-            }
-            __syncthreads();
-        }
-        if (lane == 0) {
-#pragma unroll
-            for (std::uint32_t column = 0; column < kValueTile; ++column)
-                out[static_cast<std::uint64_t>(value_head) * head_dim + value_base + column] = reduction[gdn_recurrent_lds::index(F, 0U, column)];
-        }
-        __syncthreads();  // the next row rewrites reduction[] and deltas[]
-    }
-#pragma unroll
-    for (std::uint32_t column = 0; column < kValueTile; ++column)
-        state_out[(static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base + column] = retained[column];
+    const ops::recur::ScalarGate policy{};  // F9 gated_delta rows form, scalar gate (src/ops/recur)
+#include "ops/recur/gated_delta_rows_body.inc"
 }
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
 template <unsigned Rows> struct GdnRecurrentWindowPointers {

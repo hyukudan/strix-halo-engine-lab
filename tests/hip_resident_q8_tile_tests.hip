@@ -10,6 +10,7 @@
 #include <limits>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -19,20 +20,27 @@ namespace staging = core::q8_f16_staging;
 namespace weight = strix::weight;
 using strix::hip_check;
 
-template <class Group>
+template <class Group, class Projection>
 constexpr bool check_projection_panels() {
     constexpr unsigned largest = std::numeric_limits<unsigned>::max() - 31U;
     constexpr unsigned largest_panels = std::numeric_limits<unsigned>::max() / 64U + 1U;
+    // Value-initialised entries (every field set, -Wmissing-field-initializers) with only the output count varied.
+    const auto entry = [](unsigned outputs) {
+        Projection projection{};
+        projection.outputs = outputs;
+        return projection;
+    };
     Group group{};
-    group.append({nullptr, 64U, nullptr});
-    group.append({nullptr, largest, nullptr});
-    group.append({nullptr, 65U, nullptr});
+    group.append(entry(64U));
+    group.append(entry(largest));
+    group.append(entry(65U));
     return group.count == 3U && group.first_panel[0] == 0U && group.first_panel[1] == 1U &&
         group.first_panel[2] == 1U + largest_panels && group.first_panel[3] == 3U + largest_panels;
 }
 
-static_assert(check_projection_panels<core::f16_tile_gemm::Q8ProjectionGroup<3>>());
-static_assert(check_projection_panels<core::f16_tile_gemm::Bf16ProjectionGroup<3>>());
+static_assert(check_projection_panels<core::f16_tile_gemm::Q8ProjectionGroup<3>, core::f16_tile_gemm::Q8Projection>());
+static_assert(
+    check_projection_panels<core::f16_tile_gemm::Bf16ProjectionGroup<3>, core::f16_tile_gemm::Bf16Projection>());
 
 template <class T>
 struct Buffer {
@@ -203,6 +211,117 @@ void check_projection(std::mt19937& rng) {
     std::cout << "PASS resident Q8_0 16-row tight identity\n";
 }
 
+// Pitched softcapped head rows (enqueue_resident_q8_softcap_head_rows): for 1 .. 2 x kResidentQ8RowBitsRows + 3 rows
+// every live score of row r equals, bit for bit, the one-row head of row r alone (cohort lanes keep their one-row
+// bits); rows land at r x pitch, and the softcap holds every live score inside [-cap, cap] (BF16 rounds 30 tanh to 30).
+void check_softcap_head_rows(std::mt19937& rng) {
+    constexpr unsigned width = 256U, stored = 1100U, live = 1037U;
+    constexpr unsigned pitch = static_cast<unsigned>(strix::head::logit_row_pitch(live));
+    static_assert(live <= pitch && pitch <= stored);
+    constexpr unsigned max_rows = 2U * core::kResidentQ8RowBitsRows + 3U;
+    constexpr float cap = 30.0F;
+    constexpr std::size_t stride = weight::Q8Storage::row_bytes(width);
+    constexpr std::array<std::uint16_t, 3> scales{0x2a01, 0xa807, 0x2902};
+    const auto bytes = make_weights(std::size_t{stored} * width / 32U, rng, scales);
+    std::vector<float> input(std::size_t{max_rows} * width);
+    for (auto& value : input) value = static_cast<float>(static_cast<int>(rng() % 2001U) - 1000) * 0x1p-7F;
+    const Buffer<std::uint8_t> weights(bytes.size());
+    const Buffer<float> x(input.size()), rows_out(std::size_t{max_rows} * pitch), one(live);
+    weights.upload(bytes);
+    x.upload(input);
+    const weight::ResidentMatrixView matrix{{weights.data, bytes.size()}, weight::kQ8WeightStorage, stored, width, stride};
+    std::vector<std::uint32_t> reference(std::size_t{max_rows} * live), got(std::size_t{max_rows} * pitch);
+    for (unsigned r = 0; r < max_rows; ++r) {
+        hip_check(core::enqueue_resident_q8_softcap_head(matrix, live, x.data + std::size_t{r} * width, 1U,
+                                                         {one.data, live}, cap, nullptr), "one-row head");
+        hip_check(hipMemcpy(reference.data() + std::size_t{r} * live, one.data, live * sizeof(float),
+                            hipMemcpyDeviceToHost), "one-row download");
+    }
+    for (unsigned rows = 1U; rows <= max_rows; ++rows) {
+        hip_check(hipMemset(rows_out.data, 0xff, std::size_t{max_rows} * pitch * sizeof(float)), "poison");
+        hip_check(core::enqueue_resident_q8_softcap_head_rows(matrix, live, pitch, x.data, rows,
+                                                              {rows_out.data, std::size_t{rows} * pitch}, cap, nullptr),
+                  "rows head");
+        hip_check(hipMemcpy(got.data(), rows_out.data, got.size() * sizeof(std::uint32_t), hipMemcpyDeviceToHost),
+                  "rows download");
+        for (unsigned r = 0; r < max_rows; ++r)
+            for (unsigned o = 0; o < live; ++o) {
+                const auto value = got[std::size_t{r} * pitch + o];
+                if (r >= rows) {
+                    if (value != 0xffffffffU) throw std::runtime_error("rows head wrote past its rows");
+                    continue;
+                }
+                if (value != reference[std::size_t{r} * live + o])
+                    throw std::runtime_error("rows head differs from the one-row head at rows " + std::to_string(rows));
+                const float score = std::bit_cast<float>(value);
+                if (!(std::abs(score) <= cap)) throw std::runtime_error("softcap bound");
+            }
+    }
+    const float* none = nullptr;
+    if (core::enqueue_resident_q8_softcap_head_rows(matrix, live, stored + 1U, x.data, 1U,
+                                                    {rows_out.data, stored + 1U}, cap, nullptr) == hipSuccess ||
+        core::enqueue_resident_q8_softcap_head_rows(matrix, live, pitch, x.data, 2U, {rows_out.data, pitch}, cap,
+                                                    nullptr) == hipSuccess ||
+        core::enqueue_resident_q8_softcap_head_rows(matrix, live, pitch, none, 0U, {rows_out.data, pitch}, cap,
+                                                    nullptr) == hipSuccess)
+        throw std::runtime_error("rows head accepted an invalid shape");
+    std::cout << "PASS resident Q8_0 pitched softcap head rows 1.." << max_rows << " = one-row head bits\n";
+}
+
+// Head of the Inkling 2 Mini shape (200,058 live of 201,024 stored rows x 2,304, Q8_0): 8 rows as one pitched rows
+// launch vs 8 one-row launches (the cohort decode step before / after), median ms and effective GB/s of head bytes.
+void bench_softcap_head_rows(std::mt19937& rng) {
+    constexpr unsigned width = 2304U, stored = 201024U, live = 200058U, rows = 8U;
+    constexpr unsigned pitch = static_cast<unsigned>(strix::head::logit_row_pitch(live));
+    constexpr std::size_t stride = weight::Q8Storage::row_bytes(width);
+    constexpr std::array<std::uint16_t, 3> scales{0x2a01, 0xa807, 0x2902};
+    const auto bytes = make_weights(std::size_t{stored} * width / 32U, rng, scales);
+    std::vector<float> input(std::size_t{rows} * width);
+    for (auto& value : input) value = static_cast<float>(static_cast<int>(rng() % 2001U) - 1000) * 0x1p-7F;
+    const Buffer<std::uint8_t> weights(bytes.size());
+    const Buffer<float> x(input.size()), y(std::size_t{rows} * pitch);
+    weights.upload(bytes);
+    x.upload(input);
+    const weight::ResidentMatrixView matrix{{weights.data, bytes.size()}, weight::kQ8WeightStorage, stored, width, stride};
+    const auto launch_rows = [&] {
+        hip_check(core::enqueue_resident_q8_softcap_head_rows(matrix, live, pitch, x.data, rows,
+                                                              {y.data, std::size_t{rows} * pitch}, 30.0F, nullptr));
+    };
+    const auto launch_per_row = [&] {
+        for (unsigned r = 0; r < rows; ++r)
+            hip_check(core::enqueue_resident_q8_softcap_head(matrix, live, x.data + std::size_t{r} * width, 1U,
+                                                             {y.data + std::size_t{r} * pitch, live}, 30.0F, nullptr));
+    };
+    hipEvent_t begin{}, end{};
+    hip_check(hipEventCreate(&begin));
+    hip_check(hipEventCreate(&end));
+    const auto time = [&](const auto& launch) {
+        hip_check(hipEventRecord(begin, nullptr));
+        launch();
+        hip_check(hipEventRecord(end, nullptr));
+        hip_check(hipEventSynchronize(end));
+        float ms{};
+        hip_check(hipEventElapsedTime(&ms, begin, end));
+        return ms;
+    };
+    time(launch_rows);
+    time(launch_per_row);
+    std::array<float, 9> rows_ms{}, per_row_ms{};
+    for (unsigned i = 0; i < rows_ms.size(); ++i) {
+        rows_ms[i] = time(launch_rows);
+        per_row_ms[i] = time(launch_per_row);
+    }
+    hip_check(hipEventDestroy(end));
+    hip_check(hipEventDestroy(begin));
+    std::ranges::sort(rows_ms);
+    std::ranges::sort(per_row_ms);
+    const double head_gb = static_cast<double>(pitch) * static_cast<double>(stride) * 1e-9;
+    const double rows_med = rows_ms[rows_ms.size() / 2U], per_row_med = per_row_ms[per_row_ms.size() / 2U];
+    std::cout << "BENCH resident Q8_0 softcap head 200058x2304 rows=8 median ms rows_launch=" << rows_med
+              << " per_row=" << per_row_med << " head_GBps rows_launch=" << head_gb / (rows_med * 1e-3)
+              << " per_row=" << rows * head_gb / (per_row_med * 1e-3) << '\n';
+}
+
 void bench_projection(std::mt19937& rng) {
     constexpr unsigned rows = 2048U, width = 2304U, n = 3072U;
     constexpr std::size_t stride = weight::Q8Storage::row_bytes(width);
@@ -269,7 +388,9 @@ int main(int argc, char** argv) {
         std::mt19937 rng(20261122U);
         check_staging(rng);
         check_projection(rng);
+        check_softcap_head_rows(rng);
         if (argc == 2 && std::string_view(argv[1]) == "--bench") bench_projection(rng);
+        if (argc == 2 && std::string_view(argv[1]) == "--bench-head") bench_softcap_head_rows(rng);
     } catch (const std::exception& error) {
         std::cerr << "FAIL resident Q8_0 tile: " << error.what() << '\n';
         return 1;

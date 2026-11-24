@@ -2,11 +2,15 @@
 // Invariant: every request's ids equal its solo greedy run, whatever joins, leaves, drafts or row plans happen.
 #include "strix/serve/cohort_decode.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <map>
 #include <set>
+#include <span>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace strix::serve;
@@ -411,6 +415,172 @@ void test_owner_callbacks_and_boundary() {
 
 }  // namespace
 
+// Bounded slices keep the bits (CohortConfig::prompt_slice_decoding). PieceBackend chunks each prefill call like a
+// resident decoder: chunks of kChunk rows, a remainder of up to kTail rows rides in the final chunk when it is longer
+// than kShort rows (the key-split bound); a row's bits are its route form: short chunk or not, and its kAlign-row wave
+// tile [start, end) counted from its chunk start. For every prompt length and several patterns of a decoding lane
+// (decoding throughout, finishing mid-prompt, arriving mid-prompt, absent), the served prompt rows take the forms of
+// ONE prefill call over the whole prompt (the CLI), the ids equal the solo run, and while another lane is live no call
+// runs more than one decoding slice (+ a short remainder).
+struct RowForm {
+    bool short_chunk = false;
+    std::uint64_t tile_start = 0, tile_end = 0;
+    bool operator==(const RowForm&) const = default;
+};
+class PieceBackend final : public CohortBackend {
+public:
+    static constexpr std::uint32_t kChunk = 64, kTail = 8, kShort = 4, kAlign = 4, kVocab = 23, kMarker = 100;
+    std::uint32_t lanes() const override { return 2; }
+    std::uint32_t rows_per_forward() const override { return 2; }
+    std::uint32_t max_positions() const override { return 4096; }
+    bool prefill_emits_first() const override { return true; }
+    std::uint32_t prompt_tail_rows() const override { return kTail; }
+    PromptPieceRule prompt_piece_rule() const override { return {kAlign, kShort}; }
+    std::uint64_t prompt_call_chunk(std::uint64_t rows) const override { return chunks(rows).front(); }
+    // The decoder's chunks of one call of `rows` rows.
+    static std::vector<std::uint64_t> chunks(std::uint64_t rows) {
+        const std::uint64_t r = rows % kChunk;
+        const bool absorb = rows > kChunk && r > kShort && r <= kTail;
+        std::vector<std::uint64_t> out;
+        for (std::uint64_t left = rows; left != 0;) {
+            const std::uint64_t take = absorb && left == kChunk + r ? left : std::min<std::uint64_t>(left, kChunk);
+            out.push_back(take);
+            left -= take;
+        }
+        return out;
+    }
+    static void record(std::vector<RowForm>& forms, std::uint64_t at, std::uint64_t rows) {
+        for (const auto c : chunks(rows)) {
+            for (std::uint64_t p = at; p < at + c; ++p) {
+                const std::uint64_t tile = at + (p - at) / kAlign * kAlign;
+                forms.at(p) = {c <= kShort, tile, std::min<std::uint64_t>(tile + kAlign, at + c)};
+            }
+            at += c;
+        }
+    }
+    void prefill(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) override {
+        auto& c = ctx_.at(lane);
+        if (first) {
+            c.clear();
+            live_.at(lane) = true;
+            watched_.at(lane) = tokens.front() != kMarker;
+        }
+        if (watched_.at(lane)) {
+            if (first) forms.assign(prompt_rows, RowForm{});
+            record(forms, c.size(), tokens.size());
+            if (live_.at(1U - lane)) max_busy_call = std::max<std::uint64_t>(max_busy_call, tokens.size());
+            ++calls;
+        }
+        c.insert(c.end(), tokens.begin(), tokens.end());
+        top_ = next_id(c, kVocab);
+    }
+    std::uint32_t prefill_top(std::uint32_t) override { return top_; }
+    void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
+                std::span<std::uint32_t> top) override {
+        window_.clear();
+        for (std::size_t g = 0; g < groups.size(); ++g) {
+            check(groups[g].rows == 1U, "piece backend: one row per lane");
+            auto c = ctx_.at(groups[g].lane);
+            c.push_back(tokens[g]);
+            top[g] = next_id(c, kVocab);
+            window_.emplace_back(groups[g].lane, tokens[g]);
+        }
+    }
+    void commit(std::span<const std::uint32_t>) override {
+        for (const auto& [lane, token] : window_) ctx_.at(lane).push_back(token);
+        window_.clear();
+    }
+    void release(std::uint32_t lane) override { live_.at(lane) = false; }
+
+    std::uint64_t prompt_rows = 0, max_busy_call = 0, calls = 0;
+    std::vector<RowForm> forms;
+
+private:
+    std::vector<std::vector<std::uint32_t>> ctx_ = std::vector<std::vector<std::uint32_t>>(2);
+    std::vector<bool> live_ = std::vector<bool>(2, false), watched_ = std::vector<bool>(2, false);  // watched: lane B
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> window_;
+    std::uint32_t top_ = 0;
+};
+
+void test_prompt_piece_rows() {
+    const PromptPieceRule rule{16, 16};
+    check(prompt_piece_rows(8192, 1024, 8192, rule) == 1024, "piece: a whole aligned step");
+    check(prompt_piece_rows(1029, 1024, 8192, rule) == 1029, "piece: a 5-row remainder rides in the piece");
+    check(prompt_piece_rows(1041, 1024, 8192, rule) == 1024, "piece: a 17-row remainder is its own piece");
+    check(prompt_piece_rows(1000, 1024, 8192, rule) == 1000, "piece: the chunk's rest fits the bound");
+    check(prompt_piece_rows(8196, 8192, 8192, rule) == 8176, "piece: no ride above the call cap, shrink one tile");
+    check(prompt_piece_rows(1030, 1030, 8192, rule) == 1030 && prompt_piece_rows(1100, 1030, 8192, rule) == 1024,
+          "piece: the step is a multiple of the alignment");
+    check(prompt_piece_rows(500, 100, 8192, PromptPieceRule{}) == 500, "piece: an uncuttable chunk runs whole");
+}
+
+void test_bounded_slices_keep_forms() {
+    using B = PieceBackend;
+    const std::uint32_t busy = 16;
+    std::uint64_t cases = 0;
+    for (std::uint32_t prompt = 1; prompt <= 300; ++prompt) {
+        // pattern 0: A decodes throughout; 1: A finishes while B reads; 2: A arrives after B's first slice; 3: B alone
+        for (int pattern = 0; pattern < 4; ++pattern) {
+            B be;
+            be.prompt_rows = prompt;
+            CohortConfig cfg;
+            cfg.context_draft = false;
+            cfg.prompt_slice = B::kChunk;
+            cfg.prompt_slice_decoding = busy;
+            cfg.prompt_share = 0.0;
+            CohortDecoder dec(be, cfg);
+            CohortRequest a, b;
+            a.id = 1;
+            a.prompt = {B::kMarker, 4};
+            a.max_tokens = pattern == 1 ? 3U : 400U;
+            b.id = 2;
+            b.prompt.resize(prompt);
+            for (std::uint32_t k = 0; k < prompt; ++k) b.prompt[k] = (k * 7U + 1U) % B::kVocab;
+            b.max_tokens = 2;
+            if (pattern == 0 || pattern == 1) {
+                dec.submit(a);
+                dec.step();
+            }
+            dec.submit(b);
+            if (pattern == 2) {
+                dec.step();
+                dec.submit(a);
+            }
+            dec.run();
+            std::vector<RowForm> cli(prompt);
+            B::record(cli, 0, prompt);
+            const std::string at = " P=" + std::to_string(prompt) + " pattern " + std::to_string(pattern);
+            check(be.forms == cli, "bounded slices: served row forms == one-call prefill" + at);
+            for (const auto& r : dec.take_finished())
+                check(r.error.empty() && r.ids == solo(r.id == 1 ? a : b, B::kVocab), "bounded slices: ids == solo" + at);
+            check(be.max_busy_call <= busy + B::kShort, "bounded slices: a call beside a live lane within one slice" + at);
+            if (pattern == 3) {  // alone: exactly the unbounded calls (prompt_slice + the admitted tail per call)
+                std::uint64_t unbounded = 0;
+                for (std::uint64_t read = 0; read < prompt; ++unbounded) {
+                    const std::uint64_t left = prompt - read;
+                    read += prompt_slice_rows(std::min<std::uint64_t>(B::kChunk, left), B::kChunk, left, B::kTail);
+                }
+                check(be.calls == unbounded, "bounded slices: alone, the prompt runs the unbounded calls" + at);
+            }
+            ++cases;
+        }
+    }
+    // Configuration: a backend without a piece rule refuses bounded slices; so does a slice the rule cannot cut.
+    FakeBackend plain(2, 4, 23);
+    CohortConfig bad;
+    bad.prompt_slice = 64;
+    bad.prompt_slice_decoding = 16;
+    bool refused = false;
+    try { CohortDecoder d(plain, bad); } catch (const std::invalid_argument&) { refused = true; }
+    check(refused, "bounded slices: refused without the backend's piece rule");
+    PieceBackend pb;
+    bad.prompt_slice_decoding = 12;  // 12 <= 2 * kShort + kAlign
+    refused = false;
+    try { CohortDecoder d(pb, bad); } catch (const std::invalid_argument&) { refused = true; }
+    check(refused, "bounded slices: refused below the piece rule's shortest cut");
+    std::cout << "bounded slices: " << cases << " cases, served row forms == one-call prefill\n";
+}
+
 int main() {
     test_owner_callbacks_and_boundary();
     test_mixed_drain();
@@ -423,6 +593,8 @@ int main() {
     test_admission_bytes();
     test_zero_output_refusal();
     test_short_first();
+    test_prompt_piece_rows();
+    test_bounded_slices_keep_forms();
     if (failures) {
         std::cerr << failures << " failure(s)\n";
         return 1;
