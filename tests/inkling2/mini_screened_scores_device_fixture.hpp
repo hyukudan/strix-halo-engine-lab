@@ -101,7 +101,9 @@ inline void screened_scores(const char* checkpoint, weight::FormatId storage) {
 #if defined(__HIPCC__)
     const bool screening = storage == weight::kBf16WeightStorage && core::hip_screened_head::enabled();
 #else
-    // The CUDA BF16 head screens greedy picks unless STRIX_SCREENED_HEAD=0; the compact (Q8_0) head never does.
+    // CUDA: the identity variant inkling2-mini-cuda-screened-head, built after the slot commitments as strix-serve does
+    // (mini_commit_slots_then_screen); the BF16 head screens unless STRIX_SCREENED_HEAD=0, the compact (Q8_0) head never.
+    decoder.build_screen();
     const bool screening = decoder.step_program_screen().get() != nullptr;
 #endif
     std::cout << "INFO screened head " << (screening ? "on" : "off") << '\n';

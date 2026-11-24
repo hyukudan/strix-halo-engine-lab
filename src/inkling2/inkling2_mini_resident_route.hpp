@@ -12,9 +12,10 @@ inline constexpr unsigned kMiniMaxVerifyRows = 8U;
 // - the CLI decodes on the packed one-row form (moe_core::microscaled_r1; single stream on gfx1151: 19.7 against
 //   16.0 tok/s on the grouped tile kernel);
 // - strix-serve decodes on the grouped tile kernel (both backends).
-// --packed-decode / --grouped-decode select either form on either entry point. Packed serving is opt-in: a served
-// lane then keeps the CLI's EXACT bits at any cohort width (mini_cohort_pass_cap), but its bits differ from the
-// grouped served answer, so it becomes the serving default only as its own admitted identity.
+// On strix-serve, packed is the identity variant inkling2-mini-moe-packed (strix/profiles/inkling2_mini.hpp, HIP):
+// requested by name (--packed-decode / --identity-variant) and admitted by the profile resolver, never by a Boolean. A
+// served lane then keeps the CLI's EXACT bits at any cohort width (mini_cohort_pass_cap); its bits differ from the
+// grouped served answer, the incumbent serving identity of both backends.
 enum class MiniDecodeEntry { cli, serve };
 
 constexpr bool mini_packed_decode(MiniDecodeEntry entry, std::optional<bool> requested) {
@@ -25,16 +26,6 @@ constexpr bool mini_packed_decode(MiniDecodeEntry entry, std::optional<bool> req
 // packed = every lane's own lone one-row decode, bit for bit (the CLI identity; device proof: HIP cohort rows C17 / C34
 // lanes == lone); grouped = the served grouped incumbent (one pass of every lane, no batch-invariance contract).
 constexpr const char* mini_decode_reference(bool packed) { return packed ? "lone-decode" : "served-grouped"; }
-
-// Served forms with a device comparison against their reference: grouped on both backends; packed on HIP only. CUDA
-// packed serving (eager passes and width programs) waits for its own device comparison against the lone decode.
-constexpr bool mini_serves_decode_form(bool packed, bool hip) { return !packed || hip; }
-
-inline void mini_require_served_decode_form(bool packed, bool hip) {
-    if (!mini_serves_decode_form(packed, hip))
-        throw std::invalid_argument("Inkling CUDA packed serving is held until its device comparison against the lone "
-                                    "decode; serve the grouped default");
-}
 
 enum class MiniAppendKind { prefill, decode, verify };
 
