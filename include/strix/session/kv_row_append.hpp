@@ -212,12 +212,10 @@ public:
         KvAppendChunk chunk;
     };
 
-    // Each contiguous group belongs to a different lane. Work enqueues all
-    // groups on one stream; publish all frontiers after one completion and
-    // reply validation. A failed batch retires all its lanes, so it needs no
-    // history or ring rollback images.
-    template <class Finish, class Work, class Validate>
-    static void append_batch(std::span<const AppendGroup> groups, Finish finish, Work work, Validate validate) {
+    // Every lane of a batch is present, distinct and admits its chunk; writes nothing. A cohort that runs as several
+    // append_batch passes calls it over the whole cohort first, so a bad lane in a later pass is refused before any
+    // pass writes.
+    static void require_batch(std::span<const AppendGroup> groups) {
         if (groups.empty()) throw std::invalid_argument("empty resident append batch");
         for (std::size_t i = 0; i < groups.size(); ++i) {
             const auto& group = groups[i];
@@ -227,6 +225,15 @@ public:
                 throw std::invalid_argument("invalid or duplicate resident append lane");
             group.state->require_append(group.chunk);
         }
+    }
+
+    // Each contiguous group belongs to a different lane. Work enqueues all
+    // groups on one stream; publish all frontiers after one completion and
+    // reply validation. A failed batch retires all its lanes, so it needs no
+    // history or ring rollback images.
+    template <class Finish, class Work, class Validate>
+    static void append_batch(std::span<const AppendGroup> groups, Finish finish, Work work, Validate validate) {
+        require_batch(groups);
         bool completed = false;
         try {
             work();
