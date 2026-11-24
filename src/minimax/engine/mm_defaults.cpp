@@ -429,6 +429,12 @@ void check_peer(const std::function<void(const void*, void*, std::size_t)>& exch
     check_peer(profile_resolution(process_env), exchange);
 }
 
+void require_serve_order(const Lookup& env) {
+    if (linear_order(env) == "invariant") return;
+    throw std::invalid_argument("STRIX_MMX_PF_ORDER=adaptive is not batch-invariant: its "
+                                "split follows the rows other requests put in a chunk, so the server would answer the "
+                                "same request differently under load; the server runs the invariant order only");
+}
 std::string linear_order(const Lookup& env) {
     for (const auto& r : resolve(env))  // a table default counts exactly like an explicit value
         if (std::strcmp(r.item->env, "STRIX_MMX_PF_ORDER") == 0) return r.value;
@@ -823,7 +829,11 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
     // Product profile 'fast' = the qualified FAST bundle mm-fast-pf-v2: nothing is exported here; every reader (the
     // engine, the cache identity, the rank agreement, this printing) resolves it from STRIX_MM_PRODUCT_PROFILE through
     // prefill_policy() (fast_profile_selects_bundle + fast_profile::profile_switch).
+    // The server's baseline keeps the invariant prefill order (the adaptive baseline column would let other requests'
+    // rows choose a request's split); an explicit value still wins and require_serve_order() refuses adaptive.
+    if (app == "serve" && baseline(process_env)) (void)export_env("STRIX_MMX_PF_ORDER", "invariant", 0);
     apply();
+    if (app == "serve") require_serve_order(process_env);
     (void)split_frame_policy();  // validate and record the lever on both entry points (rank CLI and serve)
     (void)pf_async_min_rows(process_env("STRIX_MM_PF_ASYNC_MIN_ROWS"));
     (void)effective_config(parse_cli(app, args), process_env);

@@ -367,6 +367,11 @@ void fixed_split_default() {
     for (const char* app : {"rank", "serve"})
         require(order_lines(effective_config(parse_cli(app, {}), adaptive)).find("batch_invariant=no\n") != std::string::npos,
                 "adaptive must be labelled not batch-invariant");
+    // The server refuses the adaptive order (its bits would follow other requests' rows); the default passes.
+    require_serve_order(empty);
+    bool refused = false;
+    try { require_serve_order(adaptive); } catch (const std::invalid_argument&) { refused = true; }
+    require(refused, "the server must refuse the not batch-invariant adaptive order");
     // The engine refuses an unmet invariant route instead of lowering it (behavior: minimax_route_host regression).
     const std::string engine = read_source("src/minimax/engine/engine.hip");
     require(engine.find("decline_default(\"STRIX_MMX_PF_ORDER\"") == std::string::npos &&

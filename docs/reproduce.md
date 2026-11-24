@@ -619,8 +619,9 @@ prefill (`glm_score.sh PEER BIN MODEL PROMPT OUT [ENV...]`, last 256 rows) and i
 ### MiniMax pair: chunk-invariant linear order
 
 `STRIX_MMX_PF_ORDER=invariant` is the default (table item `pf_order`; `adaptive` is the off switch and the
-`STRIX_MM_BASELINE=1` value; a defaulted value that cannot run on a load, e.g. `STRIX_MM_MOE=off`, declines to
-`adaptive` with a printed reason, an explicit `invariant` stays a hard error). Quality evidence: 6 x 32K units of
+`STRIX_MM_BASELINE=1` value of the rank command line; a load on which the invariant route cannot run, e.g.
+`STRIX_MM_MOE=off`, is refused with the reason instead of declining to `adaptive`; `strix-minimax-serve` refuses
+`adaptive`, whose split follows the rows other requests put in a chunk, and its `--baseline` keeps `invariant`). Quality evidence: 6 x 32K units of
 different content against 3 one-ulp L0 nulls each (`scripts/bench/chunkinv/gate32b_chain.sh`, `gate32b_stats.py`):
 pooled signed dNLL -0.053, 95 % CI [-0.148, +0.041], inside the null spread [-0.263, +0.240]; KL q50/q90 above every
 null in 0 of 6 units; needle/two-hop/QA task 40/42 in both orders. It binds the shared `moe_core::kGroupedSingleChainContract` (S = 1 for routed and shared

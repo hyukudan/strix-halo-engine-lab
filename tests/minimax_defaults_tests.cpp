@@ -223,9 +223,9 @@ void test_off_switches() {
             if (cli.app == "rank") {
                 std::size_t diff = 0;
                 for (const auto& l : off_lines) if (!l.starts_with("session_")) diff += on_lines.count(l) == 0 ? 1 : 0;
-                // The linear order also prints its request / effective inspection and names its cache identity, so its
-                // off form changes those three lines too.
-                const std::size_t want = std::strcmp(it.env, "STRIX_MMX_PF_ORDER") == 0 ? 4 : 1;
+                // The linear order also prints its request / effective / batch-invariant inspection and names its cache
+                // identity, so its off form changes those four lines too.
+                const std::size_t want = std::strcmp(it.env, "STRIX_MMX_PF_ORDER") == 0 ? 5 : 1;
                 check(diff == want, std::string(it.env) + " off changes one rank line (plus inspection + identity for the order)");
             }
         }
@@ -637,6 +637,9 @@ void test_apply() {
             []() -> std::unique_ptr<int> { throw std::runtime_error("must not initialize"); },
             [&](const std::string& line) { log = line; });
         check(!runtime && log == "session cache: off (baseline)", "--baseline continues ordinary serving");
+        const char* order = std::getenv("STRIX_MMX_PF_ORDER");
+        check(order != nullptr && std::strcmp(order, "invariant") == 0, "the server's baseline keeps the invariant order");
+        (void)::unsetenv("STRIX_MMX_PF_ORDER");
     }
 }
 

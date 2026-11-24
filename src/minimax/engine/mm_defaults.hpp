@@ -119,6 +119,9 @@ std::string prefill_identity(const Lookup& env);
 // Effective STRIX_MMX_PF_ORDER (table default or explicit): "adaptive" or "invariant" (identity mmx-pf-linear-s1-v1).
 // The default is invariant for rank and serve alike; "adaptive" is an explicit lever and is not batch-invariant.
 std::string linear_order(const Lookup& env);
+// The server admits only the invariant order: with adaptive, a request's bits would follow the rows that other requests
+// put in the same chunk. Throws std::invalid_argument with the reason; the rank CLI (one request) keeps both values.
+void require_serve_order(const Lookup& env);
 // Policy id of the index projection member for a canonical layer set ("minimax-index-proj-wmma-v1-l40-59").
 std::string idx_wmma_policy(const std::string& layers);
 // Rank agreement of the profile rows (strix::profile::check_peer over the process environment): both ranks call it at
