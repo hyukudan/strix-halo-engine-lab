@@ -44,6 +44,7 @@ import json
 import math
 import pathlib
 import re
+import statistics
 import sys
 
 import numpy as np
@@ -594,6 +595,8 @@ def qual(a):
         if tier != "fast":
             doc["tier"] = tier
         pathlib.Path(a.json).write_text(json.dumps(doc, indent=1, sort_keys=True, default=str) + "\n", encoding="utf-8")
+    if getattr(a, "r4_assess", None) is not None:
+        print_r4_assessment(a.r4_assess, windows, p, classes, manifest, limits)
     return EXIT[p["state"]]
 
 
@@ -610,6 +613,74 @@ def window_class(case, classes, manifest):
                 return f"prompt<={band // 1024}K"
         return "prompt>64K"
     return "all"
+
+
+R4_CLASS_MIN = 3
+
+
+def _r4_class_stats(nlls, limits):
+    n = len(nlls)
+    med = float(statistics.median(nlls)) if n >= R4_CLASS_MIN else None
+    bar = max(limits["ref_nll_factor"] * med, med + limits["ref_nll_margin"]) if med is not None else None
+    if bar is not None and not math.isfinite(bar):
+        raise GateError("derived bar must be finite")
+    return {"n": n, "median": med, "bar": bar}
+
+
+def _r4_label(text):
+    # Keep labels on one line and reserve the uppercase verdict token for "would be PASS".
+    return json.dumps(text).replace("PASS", r"\u0050ASS")
+
+
+def r4_assessment(path, windows, pooled, manifest, limits):
+    original = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    if not isinstance(original, dict) or not original:
+        raise GateError("expected a JSON object mapping content classes to original reference NLLs")
+    for nlls in original.values():
+        if not isinstance(nlls, list) or any(
+                type(nll) not in (int, float) or not math.isfinite(nll) or nll < 0 for nll in nlls):
+            raise GateError("original reference NLLs must be arrays of finite, nonnegative numbers")
+
+    lines, flagged = [], []
+    content = {c["name"]: c for c in class_verdicts(windows, limits)}
+    band_windows = [dict(w, **{"class": window_class(w["name"], None, manifest)}) for w in windows]
+    bands = {c["name"]: c for c in class_verdicts(band_windows, limits)}
+    unresolved = False
+    for cls in sorted(original.keys() | content.keys()):
+        stats = _r4_class_stats(original.get(cls, []), limits)
+        n, med, bar = stats["n"], stats["median"], stats["bar"]
+        detail = f"median {med:.3f}, bar {bar:.3f}" if bar is not None else f"bar unavailable (need {R4_CLASS_MIN} originals)"
+        outliers = [w["name"] for w in windows if w["class"] == cls and bar is not None and w["ref_nll"] > bar]
+        flagged.extend(outliers)
+        rows = content.get(cls, {}).get("rows", 0)
+        provisional = bar is None or rows < limits["min_rows"] or content[cls]["state"] == "unresolved"
+        unresolved |= provisional
+        lines.append(f"content class {_r4_label(cls)}: {n} original windows, {detail}; {rows} scored rows"
+                     + (" (provisional)" if provisional else "")
+                     + (f"; off-distribution {_r4_label(', '.join(outliers))}" if outliers else ""))
+    for band in sorted({window_class(case, None, manifest) for case in manifest}):
+        rows = bands.get(band, {}).get("rows", 0)
+        provisional = rows < limits["min_rows"] or bands[band]["state"] == "unresolved"
+        unresolved |= provisional
+        lines.append(f"prompt band {_r4_label(band)}: {rows} scored rows" + (" (provisional)" if provisional else ""))
+
+    failed = any(not ok for k, ok in pooled["checks"].items() if k != "classes") or any(
+        c["state"] == "fail" for c in (*content.values(), *bands.values()))
+    state = ("FAIL" if failed else "HOLD" if flagged or pooled["reference_suspect"]
+             else "UNRESOLVED" if unresolved else "PASS")
+    return [*lines, f"frozen-bar assessment would be {state}"]
+
+
+def print_r4_assessment(path, windows, pooled, classes, manifest, limits):
+    try:
+        if not classes or manifest is None:
+            raise GateError("requires --classes and --manifest for content and prompt-band checks")
+        lines = r4_assessment(path, windows, pooled, manifest, limits)
+    except (GateError, OSError, ValueError, OverflowError) as e:
+        lines = [f"assessment unavailable: {_r4_label(str(e))}"]
+    sys.stdout.flush()
+    for line in lines:
+        print(f"R4 DIAGNOSTIC ONLY: {line}", file=sys.stderr)
 
 
 def main(argv=None):
@@ -630,6 +701,8 @@ def main(argv=None):
     q.add_argument("--trace-diag", action="append", help="engine log with per-layer trace diag lines (no route tap)")
     q.add_argument("--classes", help="JSON {case: content class} declared before scoring (default: prompt-length band "
                    "with --manifest, else one class)")
+    q.add_argument("--r4-assess", metavar="ORIGINAL_NLLS", help="diagnostic only on stderr: JSON {content class: "
+                   "[original reference NLLs]} (requires --classes and --manifest)")
     q.add_argument("--json")
     q.add_argument("--tier", default="fast", choices=sorted(TIERS), help="acceptance limits: fast (default, "
                    "the FAST gate v2 bars) or turbo (TURBO_LIMITS, looser; explicit opt-in levers only)")

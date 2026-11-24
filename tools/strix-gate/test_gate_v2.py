@@ -1,5 +1,6 @@
 """Host tests of the FAST gate v2 statistics (gate_v2.py) and its two adapters (numpy only; no engine)."""
 import contextlib
+import hashlib
 import io
 import json
 import pathlib
@@ -512,6 +513,117 @@ class HeadFormat(unittest.TestCase):
             rc, out = self.gate(d)
             self.assertEqual(rc, 0, out)
             self.assertIn("engine trace on 12 of 13 windows", out)
+
+
+class FrozenR4Diagnostic(unittest.TestCase):
+    kit, gate = HeadFormat.kit, HeadFormat.gate
+    V, N, R = HeadFormat.V, HeadFormat.N, HeadFormat.R
+
+    def setUp(self):
+        self.rng = np.random.default_rng(12)
+
+    def test_r4_assessment_keeps_ordinary_hold_and_qualifies_every_diagnostic_pass_token(self):
+        cases = [f"toy-{i}" for i in range(4)]
+        cls = "essay-PASS"
+
+        def reduce_pair(ref, _arm, _format, **_kwargs):
+            nll = np.full(255, 4.0 if ref.stem == "toy-3-exact" else 1.0)
+            return dict(kl_rc=np.full(nll.size, 1 / 1024), agree=np.ones_like(nll), nll_r=nll, nll_c=nll,
+                        top1_r_is_label=np.zeros_like(nll), top1_c_is_label=np.zeros_like(nll)), {}
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(v2, "_option_qual_reduce", return_value=reduce_pair):
+            d = self.kit(tmp, cases, cand_ids=20)
+            classes = d / "classes.json"
+            classes.write_text(json.dumps(dict.fromkeys(cases, cls)), encoding="utf-8")
+            original = d / "original.json"
+            original.write_text(json.dumps({cls: [1.5, 2.0, 2.5]}), encoding="utf-8")
+            plain_err = io.StringIO()
+            with contextlib.redirect_stderr(plain_err):
+                plain = self.gate(d, "--classes", str(classes))
+            self.assertEqual(plain_err.getvalue(), "")
+            self.assertEqual(plain[0], 4)
+            self.assertIn("-> HOLD off-distribution reference toy-3", plain[1])
+            plain_json = (d / "g.json").read_bytes()
+            # Snapshots of the same synthetic run on origin/main (8820d1a29), with portable JSON line endings.
+            self.assertEqual(hashlib.sha256(plain[1].encode()).hexdigest(),
+                             "22b9da213c22c9c630ac6c8ad24f111bad980dc636e57884647d46d3a49f50a0")
+            self.assertEqual(hashlib.sha256(plain_json.replace(b"\r\n", b"\n")).hexdigest(),
+                             "1da7688904a3f72e8d061c655ca77201fb192cc2cf8db22a51439f104e35c766")
+
+            report = io.StringIO()
+            with contextlib.redirect_stderr(report):
+                scored = self.gate(d, "--classes", str(classes), "--r4-assess", str(original))
+            self.assertEqual(scored, plain)
+            self.assertEqual((d / "g.json").read_bytes(), plain_json)
+            self.assertTrue(all(line.startswith("R4 DIAGNOSTIC ONLY: ") for line in report.getvalue().splitlines()))
+            self.assertIn("3 original windows, median 2.000, bar 6.000", report.getvalue())
+            self.assertIn("frozen-bar assessment would be PASS", report.getvalue())
+            self.assertNotIn("PASS", report.getvalue().replace("would be PASS", ""))
+            self.assertNotIn("off-distribution", report.getvalue())
+
+            original.write_text(json.dumps({cls: [1.0, 1.0, 2.0]}), encoding="utf-8")
+            report = io.StringIO()
+            with contextlib.redirect_stderr(report):
+                self.assertEqual(self.gate(d, "--classes", str(classes), "--r4-assess", str(original)), plain)
+            self.assertIn('off-distribution "toy-3"', report.getvalue())
+            self.assertIn("frozen-bar assessment would be HOLD", report.getvalue())
+
+            original.write_text(json.dumps({cls: [1.5, 2.0]}), encoding="utf-8")
+            report = io.StringIO()
+            with contextlib.redirect_stderr(report):
+                self.assertEqual(self.gate(d, "--classes", str(classes), "--r4-assess", str(original)), plain)
+            self.assertIn("2 original windows, bar unavailable (need 3 originals); 1020 scored rows (provisional)",
+                          report.getvalue())
+            self.assertIn("frozen-bar assessment would be UNRESOLVED", report.getvalue())
+
+    def test_r4_assessment_checks_rows_in_both_dimensions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            original = pathlib.Path(tmp) / "original.json"
+            for thin_axis in ("content", "band"):
+                with self.subTest(thin_axis=thin_axis):
+                    code = "code" if thin_axis == "content" else "prose"
+                    ref = {"prose": [1.0, 1.0, 1.0], code: [1.0, 1.0, 1.0]}
+                    original.write_text(json.dumps(ref), encoding="utf-8")
+                    windows = [window(f"toy-{i}", 280, 0.005, 1.0, 0.0, 0.001, self.rng, cls="prose") for i in range(3)]
+                    windows.append(window("tail", 280, 0.005, 1.0, 0.0, 0.001, self.rng, cls=code))
+                    manifest = {w["name"]: np.zeros(64) for w in windows}
+                    if thin_axis == "band":
+                        manifest["tail"] = np.zeros(8192)
+                    plain = v2.verdict(windows)
+                    lines = v2.r4_assessment(original, windows, plain, manifest, v2.LIMITS)
+                    thin = ('content class "code": 3 original windows, median 1.000, bar 3.000;'
+                            if thin_axis == "content" else 'prompt band "prompt<=16K":')
+                    self.assertIn(f"{thin} 280 scored rows (provisional)", lines)
+                    self.assertEqual(lines[-1], "frozen-bar assessment would be UNRESOLVED")
+
+    def test_r4_assessment_keeps_ordinary_status_with_valid_or_invalid_originals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = [f"toy-{i}" for i in range(13)]
+            d = self.kit(tmp, cases, cand_ids=32)
+            classes = d / "classes.json"
+            classes.write_text(json.dumps(dict.fromkeys(cases, "prose")), encoding="utf-8")
+            original = d / "original.json"
+            args = ("--classes", str(classes))
+            for tier, rc, would_be in (("fast", 1, "FAIL"), ("turbo", 0, "UNRESOLVED"), ("turbo", 3, "UNRESOLVED")):
+                with self.subTest(tier=tier, rc=rc):
+                    if rc == 3:
+                        classes.write_text(json.dumps({**dict.fromkeys(cases, "prose"), cases[-1]: "code"}),
+                                           encoding="utf-8")
+                    tier_args = (*args, "--tier", tier)
+                    base = self.gate(d, *tier_args)
+                    self.assertEqual(base[0], rc, base[1])
+                    base_json = (d / "g.json").read_bytes()
+                    for calibration, expected in (
+                        ('{"prose": [1, 1, Infinity]}', "assessment unavailable"),
+                        ('{"prose": [1e308, 1e308, 1e308]}', "assessment unavailable"),
+                        ('{"prose": [3, 3, 3], "code": [3, 3, 3]}', f"would be {would_be}"),
+                    ):
+                        original.write_text(calibration, encoding="utf-8")
+                        report = io.StringIO()
+                        with contextlib.redirect_stderr(report):
+                            self.assertEqual(self.gate(d, *tier_args, "--r4-assess", str(original)), base)
+                        self.assertIn(expected, report.getvalue())
+                        self.assertEqual((d / "g.json").read_bytes(), base_json)
 
 
 if __name__ == "__main__":
