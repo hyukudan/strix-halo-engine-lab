@@ -81,40 +81,53 @@ activation and one for down with ordered expert combine.
 
 `strix-serve` resolves the decode route with the same function and the same
 two switches; its default stays the grouped tile kernel on both backends, so
-existing served answers keep their bits. An explicit switch wins at any
-cohort width, also together with `--decode-by-slots` (the two explicit switches
-exclude each other). `--decode-by-slots` (opt-in) chooses once at start by
-cohort width: on HIP packed below 16 slots and grouped from 16 slots on
+existing served answers keep their bits. Packed serving is the identity variant
+`inkling2-mini-moe-packed@1` of the profile resolver (HIP only). It is
+requested by name (`--packed-decode`, `--identity-variant
+inkling2-mini-moe-packed`, or the slot rule below) and admitted by the resolver
+under every tier, EXACT included, because it is an exact identity of its own.
+An explicit switch wins at any cohort width, also together with
+`--decode-by-slots` (packed and grouped exclude each other). `--decode-by-slots`
+(opt-in) chooses once at start by the configured cohort width: on HIP it
+requests the packed variant below 16 slots and keeps grouped from 16 slots on
 (`grouped_decode_min_slots` in `models/inkling2-mini.toml`; without `--slots`
-the cohort width is `--prefill-rows`), grouped on CUDA. With the packed route
-(HIP only) every decode lane of a served cohort runs the packed form in
-balanced passes of at most 16 lanes (the one-row cap of the dense rows family),
-so its reference is the lane's own lone one-row decode, the CLI's bits (checked
-on device for cohorts of 17 and 34 lanes). The grouped route keeps one pass of
-every lane; its reference is the grouped served incumbent. CUDA packed serving
-is held (an explicit `--packed-decode` is refused at launch) until it has its
-own device comparison against the lone decode. The startup line reports the
-form and why:
+the cohort width is `--prefill-rows`), grouped on CUDA. With the packed variant
+every decode lane of a served cohort runs the packed form in balanced passes of
+at most 16 lanes (the one-row cap of the dense rows family), so its reference is
+the lane's own lone one-row decode, the CLI's bits (checked on device for
+cohorts of 17 and 34 lanes); only this form is batch invariant. The grouped
+route keeps one pass of every lane; its reference is the grouped served
+incumbent. CUDA packed serving is refused at launch (the variant is not
+declared for CUDA) until it has its own device comparison against the lone
+decode. The startup line reports the form, why, and the admitted identity:
 `moe_decode grouped moe_decode_choice serve-default|requested|slots>=16|backend`
-or `moe_decode packed moe_decode_choice requested|slots<16`; the inspection
-line adds `moe_decode_reference lone-decode|served-grouped`, and the
-capabilities carry the form and reference as `moe_decode`.
+or `moe_decode packed moe_decode_choice requested|slots<16`, followed for the
+slot rule by `configured_width N`, then `identity incumbent|<id>@<version>`.
+The inspection line adds `moe_decode_reference lone-decode|served-grouped`. The
+capabilities carry the form and reference as `moe_decode` and the identity as
+`identity`.
 
 A served lane whose scores are read (sampling, log-probabilities, verify
 observers) always reads the full-head score row of its own step. A greedy lane
 whose scores nobody reads may keep a screened pick without a score row; the
 first read recomputes it from that step's head input.
 
-On CUDA, a greedy pick that returns no logits row (decode steps and the last
-prompt row without `--logits`) runs the shared EXACT screened head
+On CUDA the screened head is the identity variant
+`inkling2-mini-cuda-screened-head@1`, served only (`--screened-head` or
+`--identity-variant inkling2-mini-cuda-screened-head`). Without it CUDA serves
+the full head, as before. When it is admitted, a greedy pick that returns no
+logits row (decode steps and the last prompt row without `--logits`) runs the
+shared EXACT screened head
 (`src/cuda/core/head_screened.cuh`, plan in `src/core/screened_head_plan.hpp`):
 an 8-bit plane of the output matrix with a rigorous per-row error bound selects
 the rows that can win or tie, the incumbent FP32 row body recomputes them with
 the softcap store and the shared first-max rule picks the token. The token and
-the non-finite status equal the full head bit for bit. Both the resident route
-and `--step-program` bind it; sampling, `--logits`, prefill score rows and
-gate runs keep the full head. The plane is built at load (one byte per weight of
-the 200058 x 2304 head: +0.43 GiB device).
+the non-finite status equal the full head bit for bit. The served resident route binds it (the CLI refuses the variant); sampling, `--logits`, prefill score rows and
+gate runs keep the full head. The plane (one byte per weight of the
+200058 x 2304 head: +0.43 GiB device) is built only after the KV slots that the
+full-head budget admits are allocated. It stays only if it costs none of those
+slots and none of their runtime headroom; otherwise the server starts on the
+full head.
 `STRIX_SCREENED_HEAD=0` restores the full head; `STRIX_SCREENED_HEAD_STATS=1`
 prints how many rows the picks recomputed when the decoder closes.
 

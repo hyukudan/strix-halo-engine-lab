@@ -33,8 +33,8 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     ResolvedService resolved;
     auto& out = resolved.options;
     const auto& args = selection.arguments;
-    std::optional<MiniDecodeRequest> decode_request;  // explicit form (--packed-decode / --grouped-decode)
-    bool by_slots = false;                             // --decode-by-slots
+    bool grouped_decode = false;  // explicit incumbent form (--grouped-decode); packed is a variant request
+    bool by_slots = false;        // --decode-by-slots
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string_view name = args[i];
         if (name == "--dspark") throw std::invalid_argument("Inkling serving does not support --dspark");
@@ -43,17 +43,18 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
             return args[i];
         };
         if (parse_mini_weight_option(out.weight_options, name, next, true)) continue;
-        // An explicit form wins over the opt-in slot rule (mini_decode_form precedence), so a launcher that enables
-        // --decode-by-slots keeps working when the operator names a form; the two forms exclude each other.
+        // An explicit form wins over the opt-in slot rule (mini_serve_decode_request), so a launcher that enables
+        // --decode-by-slots keeps working when the operator names a form; packed and grouped exclude each other.
         if (name == "--decode-by-slots") {
             by_slots = true;
             continue;
         }
-        if (name == "--packed-decode" || name == "--grouped-decode") {
-            const auto request = name == "--packed-decode" ? MiniDecodeRequest::packed : MiniDecodeRequest::grouped;
-            if (decode_request && *decode_request != request)
-                throw std::invalid_argument("--packed-decode and --grouped-decode are mutually exclusive");
-            decode_request = request;
+        if (name == "--packed-decode") {  // the variant's option: one request path with --identity-variant
+            profile::request_variant(kMiniProfile, out.weight_options.tier, name, profile::VariantOrigin::cli);
+            continue;
+        }
+        if (name == "--grouped-decode") {
+            grouped_decode = true;
             continue;
         }
         const auto& value = next();
@@ -74,9 +75,6 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
             if (value != "off") throw std::invalid_argument("Inkling serving requires --speculation off");
         } else throw std::invalid_argument("unknown Inkling argument " + std::string(name));
     }
-    const auto resolution = resolve_mini_profile(out.weight_options, true);
-    out.tier = resolution.profile;
-    out.moe_w4a4 = mini_moe_w4a4_class(resolution);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();
@@ -85,12 +83,15 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
-    if (!decode_request && by_slots) decode_request = MiniDecodeRequest::by_slots;
-    const auto form = mini_decode_form(MiniDecodeEntry::serve, decode_request, mini_serve_cohort_rows(out),
-                                       resolved.backend == "hip");
-    out.packed_decode = form.packed;
-    out.decode_reason = form.reason;
-    mini_require_served_decode_form(out.packed_decode, resolved.backend == "hip");
+    // Explicit and slot-rule requests reach the same variant admission (profile resolver) with the backend.
+    out.decode_reason = mini_serve_decode_request(out.weight_options.tier, grouped_decode, by_slots,
+                                                  mini_serve_cohort_rows(out), resolved.backend == "hip");
+    const auto resolution = resolve_mini_profile(out.weight_options, true, resolved.backend);
+    out.tier = resolution.profile;
+    out.moe_w4a4 = mini_moe_w4a4_class(resolution);
+    out.packed_decode = resolution.selected(kMiniPackedVariant);
+    out.screened_head = resolution.selected(kMiniScreenedHeadVariant);
+    out.identity = resolution.identity();
     return resolved;
 }
 
@@ -115,7 +116,7 @@ public:
                   std::ranges::any_of(job.prompt, [](auto id) { return id >= kVocabulary; }))
                   throw std::invalid_argument("invalid Inkling prompt");
           }),
-          api_(api_config(model, opt.tier, opt.packed_decode, std::move(chat)), tokenizer_, queue_, device_.backend->max_positions(),
+          api_(api_config(model, opt, std::move(chat)), tokenizer_, queue_, device_.backend->max_positions(),
                device_.backend->supports_final_logits()) {}
 
     serve::SessionRuntime& runtime() override { return cohort_.runtime(); }
@@ -130,10 +131,11 @@ public:
     }
 
 private:
-    serve::ApiConfig api_config(const std::string& model, profile::Name tier, bool packed, MiniChat chat) {
+    serve::ApiConfig api_config(const std::string& model, const MiniServeOptions& opt, MiniChat chat) {
         serve::ApiConfig config;
         cohort_.configure_api(config);
-        config.capabilities_extra = [cohort = std::move(config.capabilities_extra), tier, packed,
+        config.capabilities_extra = [cohort = std::move(config.capabilities_extra), tier = opt.tier,
+                                     packed = opt.packed_decode, identity = opt.identity,
                                      weights = device_.weights](serve::Json& value) {
             cohort(value);
             value.set("profile", serve::Json(mini_profile_name(tier)));
@@ -142,6 +144,7 @@ private:
                 {"form", serve::Json(packed ? "packed" : "grouped")},
                 {"reference", serve::Json(mini_decode_reference(packed))},
             }));
+            value.set("identity", serve::Json(identity));  // profile::Resolution::identity()
             value.set("weight_load", serve::Json(serve::Json::Object{
                 {"storage", serve::Json(weights.storage.name)},
                 {"revision", serve::Json(static_cast<std::uint64_t>(weights.storage.revision))},
@@ -216,7 +219,7 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
                 << " profile " << mini_profile_name(opt.tier) << " speculation off"
                 << " moe_decode " << mini_serve_decode_form(opt) << " moe_decode_reference "
-                << mini_decode_reference(opt.packed_decode);
+                << mini_decode_reference(opt.packed_decode) << ' ' << opt.identity;
             if (kMiniWeightLoadDecisions.empty() || opt.tier == profile::Name::standard || opt.weight_options.disable_q8) {
                 const auto backend = resolved.backend == "hip" ? weight::Backend::hip : weight::Backend::cuda;
                 const weight::WeightLoadScope scope{backend, {}, {}, {}, {}, {}};

@@ -31,6 +31,15 @@ struct Options {
     profile::Resolution tier;
 };
 
+// Backend of this CLI build, for the identity-variant admission (empty on the CPU app: no variant is declared there).
+#if defined(__HIPCC__)
+inline constexpr std::string_view kMiniCliBackend = "hip";
+#elif defined(__CUDACC__)
+inline constexpr std::string_view kMiniCliBackend = "cuda";
+#else
+inline constexpr std::string_view kMiniCliBackend{};
+#endif
+
 inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily& family) {
     Options options;
     options.generation = serve::parse_serial_generation_cli(argc, argv, family,
@@ -81,7 +90,15 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
                  generation.tokenize_file || generation.generate_requested || generation.logits ||
                  generation.sampling_requested))
         throw std::invalid_argument("gate mode takes no prompt, --tokenize, --generate, --logits or sampling options");
-    options.tier = resolve_mini_profile(options.weights, !generation.tokenize_file);
+    options.tier = resolve_mini_profile(options.weights, !generation.tokenize_file, kMiniCliBackend);
+    // Identity variants on the CLI: the same requests and admission as strix-serve (mini_weight_options). The packed
+    // variant is the CLI's own decode (its reference is the lone decode), so only --grouped-decode conflicts with it;
+    // the screened-head variant is served only (its plane follows the served KV slot commitments).
+    if (options.tier.selected(kMiniPackedVariant) && !generation.packed_decode)
+        throw std::invalid_argument("--packed-decode and --grouped-decode are mutually exclusive");
+    if (options.tier.selected(kMiniScreenedHeadVariant))
+        throw std::invalid_argument("identity variant inkling2-mini-cuda-screened-head is served only (strix-serve); "
+                                    "the CLI decodes on the full head");
     if (options.gate_order_null && (!gate || options.tier.profile != profile::Name::standard))
         throw std::invalid_argument("--gate-order-null requires an exact gate arm");
     return options;

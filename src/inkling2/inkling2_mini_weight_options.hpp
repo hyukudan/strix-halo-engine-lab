@@ -19,6 +19,12 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
         if (tier != "exact" && tier != "fast" && tier != "turbo")
             throw std::invalid_argument("--profile must be exact, fast or turbo");
         options.tier.profile = profile::parse(tier);
+    } else if (argument == profile::kIdentityVariantOption) {
+        // Identity variants: one entry (profile::request_variant) for the CLI and strix-serve; admission in resolve.
+        const std::string token(value());
+        profile::request_variant(kMiniProfile, options.tier, token, profile::VariantOrigin::cli);
+    } else if (argument == "--screened-head") {
+        profile::request_variant(kMiniProfile, options.tier, argument, profile::VariantOrigin::cli);
     } else if (native && argument == "--qualify-q8") {
         options.qualify_q8 = true;
     } else if (native && argument == "--no-weight-q8") {
@@ -47,8 +53,22 @@ inline bool mini_moe_w4a4(const profile::Resolution& tier) {
     return mini_moe_w4a4_class(tier) != moe_core::grouped_w4a4::Activations::bf16;
 }
 
-inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options, bool native_execution) {
-    auto tier = profile::resolve(kMiniProfile, options.tier);
+// --grouped-decode names the incumbent serving form; beside a packed variant request (--packed-decode or
+// --identity-variant inkling2-mini-moe-packed, either order) it is a conflict, refused on every entry.
+inline void mini_require_one_decode_form(const profile::Inputs& inputs, bool grouped_decode) {
+    if (!grouped_decode) return;
+    for (const auto& request : inputs.variants)
+        if (request.id == kMiniPackedVariant)
+            throw std::invalid_argument("--packed-decode and --grouped-decode are mutually exclusive");
+}
+
+// `backend` ("hip", "cuda"; empty on the CPU app) admits identity variants: a variant request without a backend that
+// declares it is refused here, before any load.
+inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options, bool native_execution,
+                                                std::string_view backend = {}) {
+    auto inputs = options.tier;
+    inputs.backend = std::string(backend);
+    auto tier = profile::resolve(kMiniProfile, inputs);
     tier.weights.require_honoured();
     if (options.qualify_q8 && (tier.profile != profile::Name::fast || options.disable_q8 || !native_execution))
         throw std::invalid_argument("--qualify-q8 requires --profile fast and native model execution");

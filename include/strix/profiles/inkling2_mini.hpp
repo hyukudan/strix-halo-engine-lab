@@ -42,9 +42,30 @@ inline constexpr std::array<profile::Lever, 1> kMiniLevers{{
      false, {}, true},
 }};
 
+// Identity variants (profile::IdentityVariant): routes whose bits or plans differ from the incumbent serving identity of
+// a backend (grouped expert tile pass, full head). Selected only by name through the resolver; read only through
+// profile::Resolution::selected().
+inline constexpr std::string_view kMiniPackedVariant = "inkling2-mini-moe-packed";
+inline constexpr std::string_view kMiniScreenedHeadVariant = "inkling2-mini-cuda-screened-head";
+inline constexpr std::array<profile::IdentityVariant, 2> kMiniVariants{{
+    {kMiniPackedVariant, 1,
+     "served decode and verify rows run the MoE experts on the packed one-row form (moe_core::microscaled_r1) in passes "
+     "of at most the backend one-row cap, instead of one grouped tile pass of every lane",
+     "each lane's lone one-row decode (the CLI decode), bitwise at any cohort width", "hip",
+     {true, true, true, true}, true, "--packed-decode", "packed_decode",
+     "HIP cohort rows: packed C17 17/17 and C34 34/34 lanes == lone, grouped == main (node t6)"},
+    {kMiniScreenedHeadVariant, 1,
+     "greedy picks of lanes whose scores nobody reads come from a resident 8-bit screened head plane, built after the "
+     "KV slot commitments; a read score row is projected by the full head",
+     "full-head argmax token and status; full-head score rows on read", "cuda",
+     {true, true, true, true}, true, "--screened-head", "screened_head",
+     "RTX k3: screened-scores fixed tree PASS (CUDA screen on), greedy ids == main"},
+}};
+static_assert(profile::valid_variants(kMiniVariants));
+
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.
 inline constexpr profile::Engine kMiniProfile{
-    "inkling2-mini", "", kMiniLevers, false, "inkling2-mini-turbo-v1",
+    "inkling2-mini", "", kMiniLevers, false, "inkling2-mini-turbo-v1", {}, kMiniVariants,
 };
 
 }  // namespace strix::inkling2

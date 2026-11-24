@@ -7,12 +7,16 @@
 #include <algorithm>
 #include <cstdlib>
 #include <future>
+#include <initializer_list>
 #include <iostream>
 #include <map>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace {
 namespace sv = strix::serve;
@@ -69,6 +73,73 @@ private:
 
 using FixtureCohort = sv::FixedKvCohort<FixtureDecoder>;
 
+// A resident decoder for the order of the served commitments: device bytes come from one free pool.
+struct FakeScreenDecoder {
+    std::uint64_t free;
+    std::uint64_t plane;
+    std::uint64_t built = 0;
+    std::vector<std::string> log{};
+    [[nodiscard]] std::uint64_t screen_device_bytes() const { return built; }
+    void build_screen() {
+        log.emplace_back("plane");
+        if (plane <= free) free -= (built = plane);
+    }
+    void release_screen(const char* why) {
+        free += built;
+        built = 0;
+        log.emplace_back(std::string("release: ") + why);
+    }
+    void allocate_slot(std::uint64_t bytes) {
+        if (bytes > free) throw std::runtime_error("KV slot allocation failed");
+        free -= bytes;
+        log.emplace_back("slot");
+    }
+};
+
+// CUDA screened-head variant: the KV slots the full-head budget admits are committed first, the plane after them.
+void screen_after_slots() {
+    struct Memory {
+        std::uint64_t free, total;
+    };
+    const auto serve = [](FakeScreenDecoder& decoder, bool variant, std::uint32_t& lanes) {
+        decoder.allocate_slot(100);  // the decoder holds slot 0 when it is constructed
+        const auto memory = [&decoder] { return Memory{decoder.free, 1000}; };
+        return strix::inkling2::mini_commit_slots_then_screen(decoder, memory, 0, 0, 100, 5, variant, lanes,
+            [&decoder](std::uint32_t admitted) {
+                for (std::uint32_t slot = 1; slot < admitted; ++slot) decoder.allocate_slot(100);
+                return admitted;
+            });
+    };
+    // The reviewed case: the plane (30) and the first slot (100) each fit in 120 free bytes, both do not. Plane first
+    // (the old order) fails the first slot; slots first starts the incumbent full-head server.
+    FakeScreenDecoder old_order{120, 30};
+    old_order.build_screen();
+    bool failed = false;
+    try {
+        old_order.allocate_slot(100);
+    } catch (const std::runtime_error&) {
+        failed = true;
+    }
+    require(failed, "the reviewed memory state does not fail the plane-first order");
+    std::uint32_t lanes = 0;
+    FakeScreenDecoder tight{120, 30};
+    require(serve(tight, true, lanes) == 1U && lanes == 1U && tight.built == 0U &&
+                tight.log == std::vector<std::string>{"slot", "plane", "release: screened head variant: plane not built"},
+            "plane fits, first slot does not: the incumbent server must still start on the full head");
+    FakeScreenDecoder roomy{400, 10};  // 300 free after slot 0 -> 3 slots, then a 10-byte plane costs none of them
+    require(serve(roomy, true, lanes) == 3U && roomy.built == 10U &&
+                roomy.log == std::vector<std::string>{"slot", "slot", "slot", "plane"},
+            "a plane that costs no committed slot stays");
+    FakeScreenDecoder headroom{400, 80};  // the plane would eat the runtime headroom of the committed slots
+    require(serve(headroom, true, lanes) == 3U && headroom.built == 0U && headroom.free == 100U,
+            "a plane inside the runtime headroom is released");
+    FakeScreenDecoder off{400, 10};  // variant not admitted: the incumbent, no plane work at all
+    require(serve(off, false, lanes) == 3U && off.built == 0U &&
+                off.log == std::vector<std::string>{"slot", "slot", "slot"},
+            "the incumbent full-head server built a plane");
+    require(!strix::inkling2::mini_keep_screen(100, 100, 1000, 0, 0, 100, 5, 3), "no plane built is never kept");
+}
+
 void admission() {
     require(sv::fixed_kv_slots(99, 100, 3) == 0, "KV budget too small");
     require(sv::fixed_kv_slots(400, 100, 3) == 3, "row budget cap");
@@ -92,6 +163,7 @@ void admission() {
         const auto full = mini_serve_slots(1000, 1000, 0, 0, 100, 5, 50);
         require(full.lanes == sv::resident_kv_slots(1000, 1000, 0, 0, 100, 5), "free never exceeds total");
     }
+    screen_after_slots();
     const auto slots = sv::fixed_kv_slots(250, 100, 3);
     require(slots == 2, "KV budget holds two lanes");
     auto device = std::make_unique<FixtureDecoder>();
@@ -314,6 +386,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             W4a4 w4a4 = W4a4::bf16) {
     sv::ServiceFactories factories;
     bool created = false;
+    std::optional<std::pair<bool, std::string>> launch_expect;  // set: a slot-rule launch and what it must admit
     const auto create = [&](const mini::MiniServeOptions& options) {
         require(options.checkpoint == "MODEL.safetensors", "checkpoint did not reach native adapter");
         // The served prefill runs the operand class the profile resolved, never a class-less on/off.
@@ -323,9 +396,15 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
         const strix::weight::WeightLoadScope scope{kind, {}, {}, {}, {}, {}};
         const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope);
-        // No switch: both backends serve the incumbent grouped tile kernel (packed and the slot rule are opt-in).
-        require(!options.packed_decode && options.decode_reason == mini::MiniDecodeReason::entry,
-                "served decode expert form differs from the serving default (grouped)");
+        if (launch_expect) {  // a launch of the slot rule: the native adapter gets the admitted identity
+            require(options.packed_decode == launch_expect->first && options.identity == launch_expect->second,
+                    "launched decode identity differs from the resolver");
+        } else {
+            // No switch: both backends serve the incumbent grouped tile kernel (packed and the slot rule are opt-in).
+            require(!options.packed_decode && options.decode_reason == mini::MiniDecodeReason::entry &&
+                        options.identity == "identity incumbent",
+                    "served decode expert form differs from the serving default (grouped)");
+        }
         created = true;
         return mini::MiniServeCohort{
             std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable), 32U, 3U, 2U), weights};
@@ -407,14 +486,101 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         if (hip)
             served({"--decode-by-slots", "--packed-decode"},
                    "moe_decode packed moe_decode_choice requested moe_decode_reference lone-decode");
+        // The slot rule requests the packed VARIANT through the profile admission: at configured width 15 on HIP the
+        // line names the admitted identity, its reference and the width the rule read; at 16 the incumbent. EXACT
+        // admits the variant (an exact identity); an explicit form still wins; CUDA keeps the grouped incumbent.
+        auto tier = std::find(strings.begin(), strings.end(), std::string("fast"));
+        for (const char* word : {"fast", "exact"}) {
+            *tier = word;
+            strings.insert(strings.end(), {"--slots", "15"});
+            served({"--decode-by-slots"},
+                   hip ? "moe_decode packed moe_decode_choice slots<16 configured_width 15 moe_decode_reference "
+                         "lone-decode identity inkling2-mini-moe-packed@1"
+                       : "moe_decode grouped moe_decode_choice backend moe_decode_reference served-grouped identity "
+                         "incumbent");
+            served({"--grouped-decode", "--decode-by-slots"},
+                   "moe_decode grouped moe_decode_choice requested moe_decode_reference served-grouped identity "
+                   "incumbent");
+            strings.back() = "16";
+            served({"--decode-by-slots"},
+                   hip ? "moe_decode grouped moe_decode_choice slots>=16 configured_width 16 moe_decode_reference "
+                         "served-grouped identity incumbent"
+                       : "moe_decode grouped moe_decode_choice backend moe_decode_reference served-grouped identity "
+                         "incumbent");
+            strings.resize(strings.size() - 2U);
+        }
+        *tier = "fast";
+        // The launch takes the same resolution: the native adapter receives the admitted identity at 15 and 16.
+        sv::ServeShell quick;
+        quick.serve = [](const sv::HttpServerConfig&, sv::HttpHandler, sv::SessionRuntime& owner) {
+            std::thread control([&owner] { owner.run(); });
+            owner.shutdown();
+            control.join();
+        };
+        for (const char* width : {"15", "16"}) {
+            const bool packed = hip && std::string_view(width) == "15";
+            launch_expect.emplace(packed, packed ? "identity inkling2-mini-moe-packed@1" : "identity incumbent");
+            strings.insert(strings.end(), {"--slots", width, "--decode-by-slots"});
+            std::ostringstream out, error;
+            const auto rc = run(quick, out, error);
+            strings.resize(strings.size() - 3U);
+            require(rc == 0 && created, "slot-rule launch did not reach the native adapter");
+            created = false;
+        }
+        launch_expect.reset();
     }
     if (std::string_view(backend) == "cuda") {
         // CUDA packed serving has no device comparison against its reference (the lone decode) yet: held at launch.
         std::ostringstream out, error;
         strings.emplace_back("--packed-decode");
-        require(run({}, out, error) == 2 && !created && error.str().find("CUDA packed serving is held") != std::string::npos,
-                "CUDA --packed-decode serving was not held before native load");
+        require(run({}, out, error) == 2 && !created &&
+                    error.str().find("identity variant inkling2-mini-moe-packed@1 is not declared for backend cuda") !=
+                        std::string::npos,
+                "CUDA --packed-decode serving was not refused by the variant admission before native load");
         strings.pop_back();
+    }
+    {
+        // Identity variants through the real server parser: selected by name, admitted by backend and tier through the
+        // profile resolver, printed on the inspection line; every spelling of a request resolves to the same line.
+        const auto inspect_with = [&](std::initializer_list<const char*> extra, std::string& text) {
+            std::ostringstream out, error;
+            for (const auto* item : extra) strings.emplace_back(item);
+            strings.emplace_back("--family-inspect");
+            const auto rc = run({}, out, error);
+            strings.resize(strings.size() - extra.size() - 1U);
+            text = rc == 0 ? out.str() : error.str();
+            return rc;
+        };
+        const auto has = [](const std::string& text, const char* part) { return text.find(part) != std::string::npos; };
+        const bool hip = std::string_view(backend) == "hip";
+        std::string text, alias;
+        require(inspect_with({}, text) == 0 && has(text, "moe_decode_reference served-grouped identity incumbent"),
+                "default serving identity is not the incumbent");
+        const auto packed_rc = inspect_with({"--packed-decode"}, alias);
+        require(hip ? packed_rc == 0 && has(alias, "moe_decode packed moe_decode_choice requested "
+                                                   "moe_decode_reference lone-decode identity inkling2-mini-moe-packed@1")
+                    : packed_rc == 2 && has(alias, "is not declared for backend cuda"),
+                "packed variant admission");
+        require(inspect_with({"--identity-variant", "inkling2-mini-moe-packed@1"}, text) == packed_rc && text == alias,
+                "--identity-variant and the variant option resolve differently");
+        const auto screened_rc = inspect_with({"--screened-head"}, text);
+        require(hip ? screened_rc == 2 && has(text, "inkling2-mini-cuda-screened-head@1 is not declared for backend hip")
+                    : screened_rc == 0 && has(text, "moe_decode_reference served-grouped identity "
+                                                    "inkling2-mini-cuda-screened-head@1"),
+                "screened-head variant admission");
+        require(inspect_with({"--identity-variant", "inkling2-mini-nope"}, text) == 2 &&
+                    has(text, "unknown identity variant 'inkling2-mini-nope'"),
+                "an undeclared variant was not refused");
+        require(inspect_with({"--grouped-decode", "--identity-variant", "inkling2-mini-moe-packed"}, text) == 2 &&
+                    has(text, "mutually exclusive"),
+                "grouped with a packed variant request was not refused");
+        // EXACT admits the packed variant: it is an exact identity (bitwise == each lane's lone decode).
+        auto tier = std::find(strings.begin(), strings.end(), std::string("fast"));
+        *tier = "exact";
+        require(inspect_with({"--packed-decode"}, text) == packed_rc &&
+                    (!hip || has(text, "profile exact speculation off moe_decode packed")),
+                "EXACT admission of the exact packed identity variant");
+        *tier = "fast";
     }
     sv::ServeShell shell;
     shell.serve = [qualify_q8, sample_capable](const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
@@ -535,21 +701,22 @@ int main(int argc, char** argv) try {
         require(mini::mini_serve_decode_form(opt) == "grouped moe_decode_choice serve-default", "route line, default");
         opt.packed_decode = true;
         opt.decode_reason = MiniDecodeReason::slots_below;
-        require(mini::mini_serve_decode_form(opt) == "packed moe_decode_choice slots<16", "route line, packed");
+        require(mini::mini_serve_decode_form(opt) == "packed moe_decode_choice slots<16 configured_width 128",
+                "route line, packed");
         opt.packed_decode = false;
         opt.decode_reason = MiniDecodeReason::slots_from;
-        require(mini::mini_serve_decode_form(opt) == "grouped moe_decode_choice slots>=16", "route line, grouped");
+        opt.slots = 16U;
+        require(mini::mini_serve_decode_form(opt) == "grouped moe_decode_choice slots>=16 configured_width 16",
+                "route line, grouped");
         opt.decode_reason = MiniDecodeReason::backend;
         require(mini::mini_serve_decode_form(opt) == "grouped moe_decode_choice backend", "route line, CUDA");
         opt.decode_reason = MiniDecodeReason::requested;
         require(mini::mini_serve_decode_form(opt) == "grouped moe_decode_choice requested", "route line, flag");
     }
-    // Each served form names its reference; packed serving is admitted where a device comparison exists (HIP).
+    // Each served form names its reference.
     require(std::string_view(mini::mini_decode_reference(true)) == "lone-decode" &&
-            std::string_view(mini::mini_decode_reference(false)) == "served-grouped" &&
-            mini::mini_serves_decode_form(true, true) && !mini::mini_serves_decode_form(true, false) &&
-            mini::mini_serves_decode_form(false, true) && mini::mini_serves_decode_form(false, false),
-            "served decode form admission");
+            std::string_view(mini::mini_decode_reference(false)) == "served-grouped",
+            "served decode form reference");
     // Every lever value reaches the served decoder as its own class (mse used to run nearest@1 there).
     for (const auto& [value, expected] : {std::pair{"1", W4a4::nvfp4}, std::pair{"mse", W4a4::nvfp4_mse},
                                           std::pair{"mse-gate-up", W4a4::nvfp4_mse_gate_up}}) {

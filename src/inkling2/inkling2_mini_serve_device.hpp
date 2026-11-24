@@ -27,24 +27,23 @@ inline MiniServeCohort make_mini_device_cohort(
     auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
         opt.packed_decode, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows);
     decoder->set_moe_w4a4(opt.moe_w4a4);
-    const auto memory = mini_gpu::memory_info();
     const auto slot_bytes = decoder->slot_bytes();
-    const auto screen_bytes = decoder->screen_device_bytes();
-    const auto slot_plan = mini_serve_slots(memory.free, memory.total, budget.device_bytes, opt.kv_bytes, slot_bytes,
-                                            rows, screen_bytes);
-    if (screen_bytes != 0U && !slot_plan.keep_screen)
-        decoder->release_screen("the screened plane would cost a KV slot");
-    const auto lanes = slot_plan.lanes;
-    if (!lanes) throw std::runtime_error("Inkling KV budget holds no session slots");
+    auto& resident = *decoder;
+    std::uint32_t lanes = 0;
+    // Slots first (the incumbent full-head commitments), then the plane of an admitted screened-head variant.
+    auto cohort = mini_commit_slots_then_screen(resident, [] { return mini_gpu::memory_info(); }, budget.device_bytes,
+        opt.kv_bytes, slot_bytes, rows, opt.screened_head, lanes, [&](std::uint32_t admitted) {
+            return std::make_unique<serve::FixedKvCohort<MiniResidentDecoder>>(std::move(decoder), opt.context, rows,
+                                                                               admitted);
+        });
 #if !defined(__HIPCC__)
-    const auto programs = decoder->cohort_programs();
+    const auto programs = resident.cohort_programs();
 #endif
-    auto cohort = std::make_unique<serve::FixedKvCohort<MiniResidentDecoder>>(std::move(decoder), opt.context, rows, lanes);
     std::cerr << "Inkling " << backend << " slots " << lanes << " context " << opt.context
               << " KV and history bytes per slot " << slot_bytes
               << " profile " << mini_profile_name(opt.tier)
               << " moe_prefill " << moe_core::grouped_w4a4::identity(opt.moe_w4a4)
-              << " moe_decode " << mini_serve_decode_form(opt)
+              << " moe_decode " << mini_serve_decode_form(opt) << ' ' << opt.identity
               << " weight_storage " << weights.storage.name << '@' << weights.storage.revision
 #if !defined(__HIPCC__)
               << " cohort_programs " << (programs.enabled ? "on" : "off")
