@@ -42,6 +42,19 @@ def compare(label, reference, observed):
     require(not differences, f"{label}: mismatch in {', '.join(differences)}")
 
 
+EXECUTED = ("executed_max_streams", "executed_beside_prefill_calls")
+
+
+def overlap(batch, slots=8):
+    """Execution receipts, not scheduled views: some decode pass carried all slots' decode rows, and some request
+    decoded in a step where another request executed a sliced prefill call."""
+    require(batch and all(key in row for row in batch for key in EXECUTED),
+            "missing execution receipts for decode width and prefill overlap")
+    require(max(row["executed_max_streams"] for row in batch) == slots, f"no executed {slots}-stream decode pass")
+    require(any(row["executed_beside_prefill_calls"] > 0 for row in batch),
+            "no decode executed beside a sliced prefill call")
+
+
 def http(url, body=None, timeout=600):
     request = Request(url, body, {"Content-Type": "application/json"})
     with build_opener(ProxyHandler({})).open(request, timeout=timeout) as response:
@@ -131,15 +144,14 @@ def run(decode, serve, model, pack, rope, tokenizer, short, tail, port):
                         prompt_lengths.append(prompt_tokens)
                     else:
                         require(prompt_tokens == prompt_lengths[prompt], "rendered prompt length changed under load")
-                        batch.append(stats)
+                        batch.append(stats | {key: phase[key] for key in EXECUTED if key in phase})
                 print(json.dumps(dict(selection=selection, version=version, slots=slots, phase="server",
                                       prompt_lengths=prompt_lengths, batch=batch)), flush=True)
                 if slots == 1:
                     require(0 < prompt_lengths[0] < 512 and prompt_lengths[1] > 512 and
                             1 <= (prompt_lengths[1] - 1) % 512 <= 8,
                             f"need a short prompt and a 1–8 row tail after a full 512-row chunk, got {prompt_lengths}")
-            require(max(row["max_batch"] for row in batch) == 8 and
-                    any(row["steps_sharing_prefill"] > 0 for row in batch), "missing eight-slot/prefill overlap")
+            overlap(batch)
             print(json.dumps(dict(selection=selection, version=version, verdict="EXACT-WITHIN-IDENTITY",
                                   cli_reference=reference)), flush=True)
 

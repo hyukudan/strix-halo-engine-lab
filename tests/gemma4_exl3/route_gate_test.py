@@ -2,7 +2,7 @@
 
 import unittest
 
-from route_gate import compare, signature
+from route_gate import compare, overlap, signature
 
 
 class ReceiptTest(unittest.TestCase):
@@ -30,6 +30,21 @@ class ReceiptTest(unittest.TestCase):
                         {"exl3_max_streams": 1}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 self.record(**changes)
+
+
+class OverlapTest(unittest.TestCase):
+    def test_scheduled_counters_alone_are_refused(self):
+        scheduled = [dict(max_batch=8, steps_sharing_prefill=3)] * 8
+        with self.assertRaisesRegex(ValueError, "execution receipts"):
+            overlap(scheduled)
+
+    def test_execution_receipts(self):
+        row = dict(max_batch=8, steps_sharing_prefill=3, executed_max_streams=8, executed_beside_prefill_calls=1)
+        overlap([row, row | dict(executed_beside_prefill_calls=0)])
+        with self.assertRaisesRegex(ValueError, "8-stream"):
+            overlap([row | dict(executed_max_streams=7)])
+        with self.assertRaisesRegex(ValueError, "beside a sliced prefill"):
+            overlap([row | dict(executed_beside_prefill_calls=0)])
 
 
 if __name__ == "__main__":
