@@ -282,10 +282,7 @@ public:
                                      embeddings, hidden, [&] {
                     embed(pass_ids, embeddings, rows, kind);
                 }, [&](MiniConstRows output) {
-                    for (unsigned row = 0; row < rows; ++row)
-                        project_head(output.data() + std::size_t{row} * kHiddenWidth,
-                                     logits.subspan(::strix::head::logit_row_offset(row, kLogitPitch), kOutputVocabulary),
-                                     true);
+                    project_head_rows(output.data(), rows, scores.first(std::size_t{rows} * kLogitPitch));
                     greedy_.enqueue_rows(logits, rows, kLogitPitch, stream_.get());
                 }, [&] {
                     for (unsigned row = 0; row < rows; ++row) (void)checked_token(greedy_, row);
@@ -624,6 +621,41 @@ private:
             throw std::out_of_range("token id exceeds the Mini vocabulary");
     }
 
+    // Softcapped score rows of `rows` consecutive input rows (cohort lanes, verify windows) at the decoder's one row
+    // pitch: row r lands at logit_row_offset(r, kLogitPitch) for any row count. A HIP BF16 head with more than one row
+    // goes through the shared pitched rows head (core::enqueue_bf16_softcap_head_rows): up to gemv_rows::max_rows rows
+    // a launch read the head once and keep every row on its one-row body (same chunk order and wave sum), so the bits
+    // of the per-row launch; the pad outputs of a row are stored vocabulary rows nobody picks or reads. A HIP compact
+    // Q8_0 head takes the shared Q8_0 form of the same contract (core::enqueue_resident_q8_softcap_head_rows). CUDA
+    // heads and a single row take one launch per row.
+    void project_head_rows(const float* input, unsigned rows, std::span<float> scores) {
+        if (rows == 0U || scores.size() / kLogitPitch < rows)
+            throw std::invalid_argument("Inkling 2 Mini: head rows exceed the score rows");
+#if defined(__HIPCC__)
+        static_assert(kLogitPitch <= kVocabulary);
+        if (weights_.compact() && rows > 1U) {
+            backend_.check(core::enqueue_resident_q8_softcap_head_rows(
+                weights_.compact_head(), kOutputVocabulary, static_cast<unsigned>(kLogitPitch), input, rows,
+                scores.first(std::size_t{rows} * kLogitPitch), kLogitSoftcap, stream_.get()));
+            return;
+        }
+        if (rows > 1U) {
+            const auto matrix = weights_.bf16("unembed.weight");
+            backend_.check(core::enqueue_bf16_softcap_head_rows(
+                rows, core::gemv_rows::max_rows, {kHiddenWidth, kVocabulary, kOutputVocabulary, kLogitSoftcap},
+                static_cast<unsigned>(kLogitPitch), matrix, scores, stream_.get(),
+                [&](unsigned first, unsigned launch, std::span<const MiniHipDenseProjection> projections) {
+                    return enqueue_mini_hip_dense_rows(input + std::size_t{first} * kHiddenWidth, kHiddenWidth, launch,
+                                                       projections, stream_.get());
+                }));
+            return;
+        }
+#endif
+        for (unsigned row = 0; row < rows; ++row)
+            project_head(input + std::size_t{row} * kHiddenWidth,
+                         scores.subspan(::strix::head::logit_row_offset(row, kLogitPitch), kOutputVocabulary), true);
+    }
+
     // `rows` consecutive input rows (rows > 1 only without the softcap) into rows x vocabulary scores.
     void project_head(const float* input, std::span<float> row_scores, bool softcap, unsigned rows = 1U) {
         const auto stream = stream_.get();
@@ -707,8 +739,11 @@ private:
                         (pick_next ? std::size_t{1} : host_logits.size() / kOutputVocabulary);
                     const auto tail = hidden.last(head_rows * kHiddenWidth);
                     const auto scores = multi_pick ? verify_logits_->span() : logits_.span();
-                    // Use the single-row head for every score row. A wide dense
-                    // dispatch can select different arithmetic on the same device.
+                    // Verify rows: the decoder's one pitched rows head (project_head_rows, the cohort passes bind the
+                    // same): every row keeps its one-row bits. A one-row window and the full / screened single pick
+                    // stay on the one-row head in the loop below.
+                    const bool rows_head = multi_pick;
+                    if (rows_head) project_head_rows(tail.data(), static_cast<unsigned>(head_rows), scores);
                     for (std::size_t row = 0; row < head_rows; ++row) {
                         const auto* input = tail.data() + row * kHiddenWidth;
 #if defined(__HIPCC__)
@@ -721,7 +756,7 @@ private:
 #endif
                         const auto row_scores = scores.subspan(
                             ::strix::head::logit_row_offset(multi_pick ? static_cast<unsigned>(row) : 0U, kLogitPitch), kOutputVocabulary);
-                        project_head(input, row_scores, true);
+                        if (!rows_head) project_head(input, row_scores, true);
                         if (pick_next && !multi_pick) greedy.enqueue(row_scores, stream_.get());
                         if (!decode_step && !host_logits.empty())
                             mini_gpu::copy(staged_logits_.get() + row * kOutputVocabulary, row_scores.data(),

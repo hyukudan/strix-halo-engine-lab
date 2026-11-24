@@ -70,6 +70,24 @@ constexpr bool pitched_rows_admitted() {
            !pick::strided_rows_fit(ink::kOutputVocabulary, 0U, ink::kOutputVocabulary, ink::kOutputVocabulary);
 }
 
+// Verify rows / cohort lanes head (HIP BF16, MiniResidentDecoder::project_head_rows) through the shared pitched rows head
+// (core::enqueue_bf16_softcap_head_rows; its store layout is simulated by the shared logit-rows test). Mini binding:
+// every verify window is ONE launch under the HIP tight-row cap (gemv_rows::max_rows = 16), its kPitch rows fit
+// the stored head rows and the verify buffer of max verify rows x kPitch, and the greedy strided pick admits them.
+bool verify_rows_head_layout() {
+    constexpr std::size_t kTightRows = 16U;
+    for (unsigned rows = 2U; rows <= ink::kMiniMaxVerifyRows; ++rows) {
+        if (head::logit_rows_launch(rows, 0U, kTightRows).rows != rows) return false;
+        if (!head::pitched_rows_fit(rows, ink::kOutputVocabulary, kPitch, ink::kVocabulary,
+                                    std::size_t{ink::kMiniMaxVerifyRows} * kPitch))
+            return false;
+        if (!pick::strided_rows_fit(head::logit_rows_elements(rows, ink::kOutputVocabulary, kPitch), rows, kPitch,
+                                    ink::kOutputVocabulary))
+            return false;
+    }
+    return true;
+}
+
 static_assert(kPitch == 200060U, "the live 200058-float vocabulary rounds to 200060 floats");
 static_assert(packed_rows_refused());
 static_assert(head::logit_rows_elements(1U, ink::kOutputVocabulary, kPitch) == ink::kOutputVocabulary);
@@ -83,6 +101,10 @@ int main() {
     }
     if (!pitched_rows_admitted()) {
         std::cerr << "FAIL Inkling Mini score rows on the shared head pitch\n";
+        return 1;
+    }
+    if (!verify_rows_head_layout()) {
+        std::cerr << "FAIL Inkling Mini verify rows head stores do not match the pitched score layout\n";
         return 1;
     }
     std::cout << "PASS Inkling Mini logit rows (shared head pitch " << kPitch << " floats)\n";
