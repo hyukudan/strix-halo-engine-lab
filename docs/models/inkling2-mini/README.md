@@ -220,3 +220,11 @@ The earlier server default (128-row slices, no tail) waited 0.36 s with a first 
 (gap 1000, share 0, pieces of varying size): 2053, 8209 and 8236-row prompts served alone == beside the streaming
 request == the CLI with `--grouped-decode` (64 ids each). These are single runs on one node; other device classes,
 several decoding requests and consecutive arrivals are not measured.
+
+This tree (receipts srvmd_fix4 n1 / n2, the same gfx1151 node, EXACT, KV BF16, the served data defaults, one run per
+cell): served ids (16) == the CLI with `--grouped-decode` at P = 1, 17, 4101, 8192, 8193, 8208, 8209, 8292, 9216 and
+16389; the CLI's prefill score row with its default packed decode == with `--grouped-decode` at each P; 8193 and 8209
+beside a streaming request == alone. Gap row (1000 ms, share 0): 8K 5.7 s / 1.03 s, 32K 25.6 s / 1.03 s. In n1 the
+first piece waited 2.05 s (8K) and 2.10 s (32K) while every later piece held about 1 s: the streaming request's own
+short prompt had set the row cost the first piece was sized with; the scheduler now learns it from passes of at least
+the decoding floor only (n2).
