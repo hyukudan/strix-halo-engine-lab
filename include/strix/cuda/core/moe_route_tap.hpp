@@ -1,8 +1,8 @@
 #pragma once
 // CUDA binding of the shared FAST gate v2 route tap (include/strix/moe/route_file.hpp, route_tap_exchange.hpp).
 // A CUDA MoE engine calls route_tap() once per router call, right after its router wrote the selected ids and
-// weights and before the experts read them. Inactive (no STRIX_MOE_ROUTES_OUT / _IN / STRIX_MOE_ROUTE_NULL): one
-// cached test, no sync, no copy. Active: one stream sync and two contiguous copies each way per call; a stream being
+// weights and before the experts read them. Inactive (no STRIX_MOE_ROUTES_OUT / _IN / STRIX_MOE_ROUTE_NULL / _STATS):
+// one cached test, no sync, no copy. Active: one stream sync and two contiguous copies each way per call; a stream being
 // captured into a CUDA graph is refused (replay needs eager execution, the engine turns its graphs off when
 // route_tap_active()).
 

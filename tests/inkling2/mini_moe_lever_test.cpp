@@ -3,6 +3,7 @@
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 #include <string>
 
 namespace {
@@ -62,6 +63,15 @@ void test_resolution() {
                 "explicit opt-in is unqualified");
         options.tier = inputs(tier, "0");
         require(!mini::mini_moe_w4a4(mini::resolve_mini_profile(options, true)), "off switch");
+        using A = strix::moe_core::grouped_w4a4::Activations;
+        for (const auto& [value, expected] : {std::pair<const char*, A>{"1", A::nvfp4},
+                                              {"mse", A::nvfp4_mse},
+                                              {"mse-gate-up", A::nvfp4_mse_gate_up}}) {
+            options.tier = inputs(tier, value);
+            require(mini::mini_moe_w4a4_class(mini::resolve_mini_profile(options, true)) == expected,
+                    "lever value selects the shared activation class");
+            require(mini::mini_moe_w4a4(mini::resolve_mini_profile(options, true)), "candidate values run W4A4");
+        }
     }
     bool refused = false;
     try {

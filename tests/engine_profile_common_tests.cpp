@@ -1,3 +1,4 @@
+#include "glm_profile_overrides.hpp"
 #include "strix/engine_profile.hpp"
 #include "strix/deepseek41_pair_profile_table.hpp"
 
@@ -174,5 +175,110 @@ int main() {
     bool duplicate = false;
     try { (void)receipt.json(); } catch (const std::invalid_argument&) { duplicate = true; }
     require(duplicate, "duplicate digest rejected");
+
+    // Shared receipt summary and the loud empty-tier line (one form for every engine).
+    {
+        const Lookup none = [](const char*) -> const char* { return nullptr; };
+        static constexpr std::array<Lever, 0> empty_rows{};
+        static constexpr Engine empty{.tag = "empty-engine", .allow_env = "", .table = empty_rows,
+                                      .quality_rows = false, .turbo_version = "empty-turbo-v1"};
+        Inputs in;
+        in.env = none;
+        require(resolve(empty, in).summary() == "profile exact levers none", "exact summary");
+        require(resolve(empty, in).tier_notice().empty(), "exact has no tier notice");
+        in.profile = Name::fast;
+        const auto fast = resolve(empty, in);
+        require(fast.summary() == "profile fast levers none", "fast summary");
+        require(fast.tier_notice() ==
+            "empty-engine profile fast: FAST requested, 0 levers qualified on this device; runs the exact column",
+            "loud empty FAST");
+        require(fast.receipt_lines().size() == 2U && fast.notices().empty(), "notice kept out of notices()");
+
+        static constexpr std::array<Lever, 2> rows{
+            Lever{.name = "applied", .env = "STRIX_TEST_APPLIED", .option = "", .value = {"0", "1", "", ""},
+                  .builtin = "0", .kind = Kind::bit_changing, .ready = {true, true, true, true}, .target = "",
+                  .off = "", .source = "test receipt"},
+            Lever{.name = "waiting", .env = "STRIX_TEST_WAITING", .option = "", .value = {"0", "1", "", ""},
+                  .builtin = "0", .kind = Kind::bit_changing, .ready = {true, false, true, false}, .target = "x",
+                  .off = "", .source = "gate pending"},
+        };
+        static constexpr Engine two{.tag = "two-engine", .allow_env = "STRIX_TEST_ALLOW", .table = rows,
+                                    .quality_rows = false, .turbo_version = "two-turbo-v1"};
+        const auto applied = resolve(two, in);
+        require(applied.summary() == "profile fast levers applied=1", "applied lever listed, pending one not");
+        require(applied.tier_notice().empty() && applied.receipt_lines().size() == 1U, "no loud line once applied");
+        static constexpr std::array<Lever, 1> pending_rows{rows[1]};
+        static constexpr Engine waiting{.tag = "pending-engine", .allow_env = "STRIX_TEST_ALLOW", .table = pending_rows,
+                                        .quality_rows = false, .turbo_version = "p-turbo-v1"};
+        require(resolve(waiting, in).tier_notice() ==
+            "pending-engine profile fast: FAST requested, 0 levers qualified on this device; runs the exact column (1 pending)",
+            "pending count");
+        // An explicit setting of a bit-changing lever is an override, not the exact column: the line says so.
+        {
+            Inputs explicit_in = in;
+            explicit_in.env = [](const char* key) -> const char* {
+                return std::string_view(key) == "STRIX_TEST_WAITING" ? "1" : nullptr;
+            };
+            const auto explicit_run = resolve(waiting, explicit_in);
+            require(explicit_run.entries.front().status == Status::explicit_env, "explicit env recorded");
+            require(explicit_run.tier_notice() ==
+                "pending-engine profile fast: FAST requested, 0 levers qualified on this device; "
+                "runs with unqualified or explicit overrides (waiting=1), not the exact column",
+                "explicit override is not reported as the exact column");
+            require(explicit_run.tier_notice().find("runs the exact column") == std::string::npos, "no exact claim");
+        }
+        // Engine-attested overrides outside the table (GLM standalone MLA switch) also drop the exact claim.
+        {
+            auto plain = resolve(waiting, in);
+            require(plain.tier_notice().find("runs the exact column") != std::string::npos, "plain FAST says exact column");
+            const auto glm_env = [](const char* k) -> const char* {
+                return std::string_view(k) == "STRIX_GLM_PF_MLA_WMMA" ? "1" : nullptr;
+            };
+            require(strix::glm::explicit_prefill_overrides(glm_env) ==
+                    std::vector<std::string>{"STRIX_GLM_PF_MLA_WMMA=1"}, "standalone MLA override found");
+            require(strix::glm::explicit_prefill_overrides([](const char*) -> const char* { return nullptr; }).empty(),
+                    "no override when unset");
+            plain.engine_overrides = strix::glm::explicit_prefill_overrides(glm_env);
+            require(plain.tier_notice().find("STRIX_GLM_PF_MLA_WMMA=1), not the exact column") != std::string::npos,
+                    "standalone MLA override named, no exact claim");
+            require(strix::glm::explicit_prefill_overrides([](const char* k) -> const char* {
+                        return std::string_view(k) == "STRIX_GLM_PF_MLA_WMMA" ? "0" : nullptr;
+                    }).empty(),
+                    "an explicit opt-out is not an override");
+            require(plain.tier_notice().find("runs the exact column") == std::string::npos, "no exact claim with override");
+        }
+        // An unqualified row run under --allow-pending is not a qualified lever: the zero-qualified line stays.
+        {
+            static constexpr std::array<Lever, 1> runnable_rows{
+                Lever{.name = "runnable", .env = "STRIX_TEST_RUNNABLE", .option = "", .value = {"0", "1", "", ""},
+                      .builtin = "0", .kind = Kind::bit_changing, .ready = {true, false, true, false},
+                      .runnable = {true, true, true, true}, .target = "x", .off = "", .source = "gate pending"},
+            };
+            static constexpr Engine unqualified{.tag = "unq-engine", .allow_env = "STRIX_TEST_ALLOW",
+                                                .table = runnable_rows, .quality_rows = false, .turbo_version = "u-turbo-v1"};
+            Inputs pending_in = in;
+            pending_in.allow_pending = true;
+            const auto unq = resolve(unqualified, pending_in);
+            require(unq.entries.front().status == Status::unqualified, "unqualified row applied under allow-pending");
+            require(unq.profile_applied(), "the column was applied");
+            require(unq.tier_notice() ==
+                "unq-engine profile fast: FAST requested, 0 levers qualified on this device; "
+                "runs with unqualified or explicit overrides (runnable=1), not the exact column",
+                "unqualified row does not suppress the zero-qualified line");
+        }
+        in.profile = Name::turbo;
+        require(resolve(empty, in).tier_notice().find(": TURBO requested, 0 levers") != std::string::npos, "loud TURBO");
+        // A qualified TURBO on-the-fly weight pack changes arithmetic even if no speed lever was selected.
+        // The receipt must not claim that it runs the native-weight EXACT column.
+        auto weighted_engine = empty;
+        weighted_engine.weight_caps.source[1] = true; // onfly
+        weighted_engine.weight_caps.bits[4] = true;
+        in.weights.source = "onfly";
+        in.weights.bits = "4";
+        const auto weighted = resolve(weighted_engine, in);
+        require(weighted.weights.effective == turbo::Source::onfly, "onfly weights admitted");
+        require(weighted.tier_notice().find("uses onfly-int4-rtn-g32 weights (not the exact column)") != std::string::npos,
+                "no false EXACT equivalence when TURBO changes weights");
+    }
     std::cout << "common profile/receipt tests passed\n";
 }

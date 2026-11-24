@@ -788,10 +788,12 @@ inline constexpr exec::cuda_decode::R1Forms kMiniLatencyForms = mini_latency_for
 // mix 109.9, mix + MoE pipe 108.4 -> the default binds mix; the pipe stays opt-in (--latency-forms).
 inline constexpr unsigned kMiniDefaultForms = kMiniFormsMix;
 
-// moe_w4a4: resolved FAST W4A4 expert lever (mini_moe_w4a4), applied to the resident prefill before the program binds.
+// moe_w4a4: resolved operand class of the W4A4 expert lever (mini_moe_w4a4_class; bf16 = off), applied to the resident
+// prefill before the program binds.
 // dspark: the block drafter checkpoint (mtp.safetensors) or null; it is loaded only when the request may draft.
 template <bool EpilogueFusion, unsigned LatencyForms = kMiniDefaultForms>
-std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad&, bool moe_w4a4,
+std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad&,
+                                                                       moe_core::grouped_w4a4::Activations moe_w4a4,
                                                                        const char* dspark = nullptr);
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
@@ -1294,9 +1296,11 @@ inline void tune_mini_program_speculation(spec::BlockConfig& config, std::uint32
 
 template <bool EpilogueFusion, unsigned LatencyForms>
 inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad& load,
-                                                                              bool moe_w4a4, const char* dspark) {
+                                                                              moe_core::grouped_w4a4::Activations moe_w4a4,
+                                                                              const char* dspark) {
+    using Activations = moe_core::grouped_w4a4::Activations;
     struct Decoder final : serve::SerialGenerationDecoder {
-        Decoder(const serve::SerialGenerationLoad& input, bool w4a4, const char* drafter)
+        Decoder(const serve::SerialGenerationLoad& input, Activations w4a4, const char* drafter)
             : Decoder(input, w4a4, drafter,
                       session::step_replay_session_geometry(input.positions, input.prefill_chunk,
                           std::min(input.verify_rows, std::uint32_t{kMiniVerifyMaxRows}), kMaxContext)) {}
@@ -1304,7 +1308,7 @@ inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(co
         // the session plan admits the widest window (chunk) and its padding overhang (context). Without
         // speculation (verify_rows 0) the geometry is the request's. The drafter (block of 8, its
         // checkpoint loaded only for a drafting request) reads the feature taps the program stores.
-        Decoder(const serve::SerialGenerationLoad& input, bool w4a4, const char* drafter,
+        Decoder(const serve::SerialGenerationLoad& input, Activations w4a4, const char* drafter,
                 session::StepReplaySessionGeometry geometry)
             : resident(input.checkpoint, geometry.positions, input.prefill_chunk, input.packed_decode, false,
                        weight::kBf16WeightStorage, 0U, drafter != nullptr, 1U, 0U, geometry.append_rows),
@@ -1312,7 +1316,7 @@ inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(co
             if (drafter) block.emplace(resident, geometry.positions, drafter);
         }
         // Same order as the gate path: the lever (and its NVFP4 activation image) is set before the program binds.
-        static MiniResidentDecoder& with_w4a4(MiniResidentDecoder& decoder, bool w4a4) {
+        static MiniResidentDecoder& with_w4a4(MiniResidentDecoder& decoder, Activations w4a4) {
             decoder.set_moe_w4a4(w4a4);
             return decoder;
         }
