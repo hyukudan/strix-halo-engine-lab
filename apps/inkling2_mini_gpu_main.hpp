@@ -307,6 +307,20 @@ int main(int argc, char** argv) {
                 std::cerr << "0123456789abcdef"[scope.checkpoint.bytes[i] >> 4U]
                           << "0123456789abcdef"[scope.checkpoint.bytes[i] & 15U];
             std::cerr << '\n';
+            // The full scope a decision row of this load matches (digest literals for weight::digest_from_hex).
+            if (!(scope.checkpoint == strix::weight::Digest256{})) {
+                const auto hex = [](const strix::weight::Digest256& d) {
+                    std::string out;
+                    for (const auto byte : d.bytes) {
+                        out += "0123456789abcdef"[byte >> 4U];
+                        out += "0123456789abcdef"[byte & 15U];
+                    }
+                    return out;
+                };
+                std::cerr << "strix-weight-load-scope/v1 device " << scope.device_class << " compiler " << scope.compiler_id
+                          << " regime " << scope.regime << " build " << hex(scope.build) << " checkpoint "
+                          << hex(scope.checkpoint) << '\n';
+            }
         };
         if (options.gate_manifest) {
             write_profile();
