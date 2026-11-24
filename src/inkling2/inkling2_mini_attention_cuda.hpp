@@ -30,6 +30,34 @@ inline cudaError_t enqueue_mini_cuda_attention(
         stream, pipe, failure, device_position);
 }
 
+// The prompt route of enqueue_mini_cuda_attention with the relative bias projected inside the flash
+// (cuda_core::PreparedBf16Projection) from the clipped features [row][head][16] and the BF16 weights [16][extent]:
+// same output and cache bits, same failure flag, no image. Host positions, more than one row (a one-row call keeps
+// the image route with its grouped prepare), 16-byte aligned operands.
+inline bool mini_cuda_bias_in_attention(unsigned rows, const std::uint32_t* device_position, const float* features,
+                                        const std::uint16_t* weights) {
+    return rows > 1U && !device_position && features && weights &&
+           reinterpret_cast<std::uintptr_t>(features) % 16U == 0U &&
+           reinterpret_cast<std::uintptr_t>(weights) % 16U == 0U;
+}
+
+inline cudaError_t enqueue_mini_cuda_attention_projected(
+    LayerVisit visit, const MiniCudaAttentionRows& rows, MiniVisitKvCache cache, const float* features,
+    const std::uint16_t* weights, cudaStream_t stream, unsigned* failure = nullptr) {
+    if (!valid_mini_visit(visit) || rows.first_position >= kMaxContext ||
+        rows.count > kMaxContext - rows.first_position || !rows.keys || !rows.values || !rows.sinks ||
+        !mini_cuda_bias_in_attention(rows.count, nullptr, features, weights)) return cudaErrorInvalidValue;
+    const unsigned window = is_full_attention(visit.physical_layer) ? 0U : MiniPreparedGqaShape::kSlidingWindow;
+    const cuda_core::AttentionDims dims{kQueryHeads, kKvHeads, kHeadWidth,
+                                        MiniPreparedGqaShape::kScoreScale, cache.slots};
+    const cuda_core::PreparedBf16Flash shape{nullptr, rows.sinks, kRelativeExtent, window, cache.wrapped};
+    static_assert(MiniPreparedGqaShape::kRelativeWidth == cuda_core::kPreparedProjectedBiasWidth);
+    return cuda_core::append_attention_prepared_bf16(
+        dims, shape, cuda_core::PreparedBf16Projection{features, weights}, rows.queries, rows.keys, rows.values,
+        reinterpret_cast<__nv_bfloat16*>(cache.keys), reinterpret_cast<__nv_bfloat16*>(cache.values),
+        rows.first_position, rows.count, rows.output, stream, cuda_core::FlashPipe::pad2, failure);
+}
+
 // One-row windows of several lanes as one lane-batched append (shared contract strix/attn/prepared_lanes.hpp):
 // lane l is packed row l of `rows` with its own cache and position. Each lane's bits are those of
 // enqueue_mini_cuda_attention on that row alone. Host positions only.

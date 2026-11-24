@@ -33,6 +33,12 @@ struct MiniPreparedCudaBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGq
     }
 };
 
+// The prompt route whose flash projects the relative bias (cuda_core::PreparedBf16Projection): the shared
+// preparation skips the [row][head][distance] image and its producer; the flash computes the same logits.
+struct MiniPreparedCudaProjectedBackend : MiniPreparedCudaBackend {
+    bool relative_bias_in_attention(unsigned) const { return true; }
+};
+
 // The shared preparation issues all linear calls before the first round,
 // which consumes raw K. Retain the projection descriptors until that boundary.
 struct MiniPreparedCudaProjectionBatch : MiniPreparedCudaBackend {

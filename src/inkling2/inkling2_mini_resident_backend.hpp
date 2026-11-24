@@ -651,6 +651,20 @@ private:
                 check(enqueue_mini_hip_attention_projected<true>(visit, image_of(*single, 0U), cache_of(*single),
                                                                  work.relative_features, bias_weights, failure, stream_));
             } else
+#else
+            // A single multi-row prompt chunk in one window projects the relative bias inside the CUDA flash: the
+            // prepare stage skips the image and its producer, the flash computes the same logits and raises the
+            // same flag (cuda_core::PreparedBf16Projection). The null-order count needs the image producer and lane
+            // mode resolves positions on the device, so both keep the image route.
+            const auto* bias_weights =
+                attn_core::detail::bf16_projection(weights.projection(MiniAttentionProjection::relative_bias));
+            if (single && !cohort && !adapter.null_applications && route_.attention_rows >= rows &&
+                mini_cuda_bias_in_attention(rows, device_position, work.relative_features, bias_weights)) {
+                const detail::MiniResidentGqaBackend<detail::MiniPreparedCudaProjectedBackend> projected{{native}, nullptr};
+                check(prepare(projected));
+                check(enqueue_mini_cuda_attention_projected(visit, image_of(*single, 0U), single->state.kv,
+                                                            work.relative_features, bias_weights, stream_, failure));
+            } else
 #endif
             {
                 check(prepare_with(prepare));
