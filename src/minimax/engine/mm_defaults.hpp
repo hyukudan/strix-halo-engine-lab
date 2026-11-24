@@ -117,6 +117,7 @@ bool product_option(const std::string& a, const std::function<std::string()>& ne
 // MoE format. This field's omission alone does not establish complete cache compatibility.
 std::string prefill_identity(const Lookup& env);
 // Effective STRIX_MMX_PF_ORDER (table default or explicit): "adaptive" or "invariant" (identity mmx-pf-linear-s1-v1).
+// The default is invariant for rank and serve alike; "adaptive" is an explicit lever and is not batch-invariant.
 std::string linear_order(const Lookup& env);
 // Policy id of the index projection member for a canonical layer set ("minimax-index-proj-wmma-v1-l40-59").
 std::string idx_wmma_policy(const std::string& layers);

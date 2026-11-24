@@ -1357,7 +1357,7 @@ struct Engine::Impl {
             const char* order = strix::envcfg::text("STRIX_MMX_PF_ORDER");
             const bool inv = mmoe::prefill_order_invariant();
             rr::lever("minimax.linear_order", order != nullptr && *order != 0 ? order : "default",
-                      inv ? "invariant:mmx-pf-linear-s1-v1" : "adaptive", inv ? rr::Reason::selected : rr::Reason::disabled);
+                      inv ? "invariant:mmx-pf-linear-s1-v1" : "adaptive:not-batch-invariant", inv ? rr::Reason::selected : rr::Reason::disabled);
         }
         rr::lever("minimax.moe_kernels", moe_opt ? "1" : "0", moe_opt ? "1" : "0");
     }
@@ -2133,9 +2133,10 @@ struct Engine::Impl {
     }
     // Invariant prefill must cover every layer and every tail, even when the preferred dense routes are OFF.
     // With fixed S=1, workspace size is monotone in rows, so max_rows bounds every admitted chunk.
-    // A table default (pf_order) that cannot hold declines to adaptive with a printed reason, before receipts; an
-    // explicit STRIX_MMX_PF_ORDER=invariant keeps the hard error. Both ranks load the same config and weights, so the
-    // decision is the same on each rank (and the route receipt fingerprint checks it).
+    // Invariant is the default order and never degrades to adaptive: a defaulted or explicit invariant whose route is
+    // unmet (weights, workspace, geometry) is refused here with the reason, so memory or --max-rows never decides the
+    // arithmetic. STRIX_MMX_PF_ORDER=adaptive is the explicit, not batch-invariant lever. Both ranks load the same
+    // config and weights, so the decision is the same on each rank.
     void require_invariant_dense() const {
         if (!mmoe::prefill_order_invariant()) return;
         const char* unmet = nullptr;
@@ -2148,9 +2149,8 @@ struct Engine::Impl {
                 unmet = "STRIX_MMX_PF_ORDER=invariant requires supported resident q/k/v/o weights and sufficient prefill workspace";
         }
         if (unmet == nullptr) return;
-        if (!defaults::from_defaults("STRIX_MMX_PF_ORDER")) throw std::invalid_argument(unmet);
-        defaults::decline_default("STRIX_MMX_PF_ORDER", "adaptive", unmet);
-        mmoe::set_prefill_moe_order(0);
+        throw std::invalid_argument(std::string(unmet) + "; refusing adaptive fallback (set STRIX_MMX_PF_ORDER=adaptive "
+                                    "explicitly for the not batch-invariant order)");
     }
     template <std::size_t N> bool dense_admit(std::size_t n, const mmoe::PrefillDenseJob (&jobs)[N], bool preferred) const {
         if (gemv) return false;  // decode and verification retain their existing GEMV arithmetic

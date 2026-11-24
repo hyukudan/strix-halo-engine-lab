@@ -151,7 +151,7 @@ constexpr Item kItems[] = {
     {"pf_order", "STRIX_MMX_PF_ORDER", "invariant", "adaptive",
      "Chunk-invariant linear order mmx-pf-linear-s1-v1 (bits independent of chunking; cache identity prefill_order=): gate32 6 x 32K "
      "units vs 3 L0 nulls each, pooled dNLL -0.053 CI95 [-0.148,+0.041] inside null spread, task 40/42 == 40/42; "
-     "a defaulted value falls back to adaptive when the invariant route is unmet"},
+     "the default never falls back: an unmet invariant route is refused at load; 'adaptive' is an explicit lever and is NOT batch/chunk-invariant"},
     // transport (host path, bits unchanged)
     {"dist_crc_parallel", "STRIX_DIST_CRC_PARALLEL", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
     {"dist_host_crc_overlap", "STRIX_DIST_HOST_CRC_OVERLAP", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
@@ -708,7 +708,9 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
     // requested = how the order was asked (unset = "default"); effective resolves the pf_order table item like apply().
     const auto& order = strix::moe_core::resolve_grouped_order(linear_order(env).c_str());
     o << "STRIX_MMX_PF_ORDER.requested=" << (order_asked ? order_asked : "default") << "\n"
-      << "STRIX_MMX_PF_ORDER.effective=" << (order.invariant() ? "invariant" : "adaptive") << "\n";
+      << "STRIX_MMX_PF_ORDER.effective=" << (order.invariant() ? "invariant" : "adaptive") << "\n"
+      // The adaptive lever picks S from expert occupancy / chunk rows: not batch-invariant (explicit opt-in only).
+      << "STRIX_MMX_PF_ORDER.batch_invariant=" << (order.invariant() ? "yes" : "no") << "\n";
     o << "build.gu4_scalar=" << (STRIX_MM_GU4_SCALAR ? "on" : "off") << "\n";
     for (const Resolved& r : resolve(env)) o << r.item->env << "=" << r.value << "\n";
     {   // FAST prefill profile rows (default OFF): the same resolution the engine, the cache identity and the ranks use.

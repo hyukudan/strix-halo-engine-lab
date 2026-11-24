@@ -7,6 +7,7 @@
 #include "minimax/engine/mm_defaults.hpp"
 #include "minimax/rtxpf/fp32_identity.hpp"
 #include "strix/session/prefill_session.hpp"
+#include "moe_core/grouped_policy.hpp"
 
 #include <array>
 #include <filesystem>
@@ -318,6 +319,63 @@ void prefill_cuts() {
             "deferred append boundary");
     compare_tuple("draft-append", {8,0,0,0}, {static_cast<unsigned>(route::append_rows(32)),0,0,0});
 }
+// Default prefill order: fixed split per matrix for routed and shared gate/up (and down), identical resolution for the
+// rank CLI and the server, no silent fallback to the adaptive order, adaptive labelled as not batch-invariant.
+std::string order_lines(const std::string& config) {
+    std::string out;
+    std::size_t at = 0;
+    while (at < config.size()) {
+        const std::size_t end = config.find('\n', at);
+        const std::string line = config.substr(at, end - at);
+        if (line.rfind("STRIX_MMX_PF_ORDER", 0) == 0) out += line + "\n";
+        at = end == std::string::npos ? config.size() : end + 1;
+    }
+    return out;
+}
+std::string read_source(const char* relative) {
+    std::ifstream input(fs::path(STRIX_ROUTE_SOURCE_DIR) / relative, std::ios::binary);
+    require(input.good(), std::string("cannot inspect source: ") + relative);
+    return std::string((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+}
+void fixed_split_default() {
+    using namespace strix::minimax::defaults;
+    namespace mc = strix::moe_core;
+    const Lookup empty = [](const char*) -> const char* { return nullptr; };
+    // The default resolves to the invariant contract: S = 1 whatever the adaptive policy would choose.
+    const auto& order = mc::resolve_grouped_order(linear_order(empty).c_str());
+    require(linear_order(empty) == "invariant" && order.invariant(), "default prefill order must be invariant");
+    for (unsigned rows : {1U, 2U, 8U, 9U, 16U, 17U, 96U, 97U, 256U, 1024U, 4096U}) {  // expert occupancy or chunk/max_rows
+        for (unsigned bits : {4U, 5U, 6U}) {
+            const unsigned adaptive = route::gemm_splits(6144, 1536, bits, rows);
+            require(order.gate.resolve(adaptive) == 1 && order.up.resolve(adaptive) == 1 && order.down.resolve(adaptive) == 1,
+                    "routed/shared gate/up/down split must not follow occupancy or max_rows under the default");
+        }
+    }
+    require(!mc::resolve_grouped_order("adaptive").invariant() &&
+            mc::resolve_grouped_order("adaptive").gate.resolve(route::gemm_splits(6144, 1536, 4, 1)) == 16 &&
+            mc::resolve_grouped_order("adaptive").gate.resolve(route::gemm_splits(6144, 1536, 4, 9)) == 8,
+            "adaptive stays the explicit rows-dependent lever");
+    // Rank CLI and server resolve the same order lines.
+    const auto rank = order_lines(effective_config(parse_cli("rank", {}), empty));
+    const auto serve = order_lines(effective_config(parse_cli("serve", {}), empty));
+    require(!rank.empty() && rank == serve, "rank and serve must resolve the same prefill order");
+    require(rank.find("STRIX_MMX_PF_ORDER.effective=invariant\n") != std::string::npos &&
+            rank.find("STRIX_MMX_PF_ORDER.batch_invariant=yes\n") != std::string::npos, "default order lines");
+    const Lookup adaptive = [](const char* key) -> const char* {
+        return std::string_view(key) == "STRIX_MMX_PF_ORDER" ? "adaptive" : nullptr;
+    };
+    for (const char* app : {"rank", "serve"})
+        require(order_lines(effective_config(parse_cli(app, {}), adaptive)).find("batch_invariant=no\n") != std::string::npos,
+                "adaptive must be labelled not batch-invariant");
+    // The engine refuses an unmet invariant route instead of lowering it (behavior: minimax_route_host regression).
+    const std::string engine = read_source("src/minimax/engine/engine.hip");
+    require(engine.find("decline_default(\"STRIX_MMX_PF_ORDER\"") == std::string::npos &&
+            engine.find("set_prefill_moe_order(0)") == std::string::npos &&
+            engine.find("refusing adaptive fallback (set STRIX_MMX_PF_ORDER=adaptive") != std::string::npos,
+            "default invariant order must refuse, not decline to adaptive");
+    require(read_source("src/minimax/engine/mm_defaults.cpp").find("falls back to adaptive when the invariant route is unmet") == std::string::npos,
+            "pf_order table text claims a fallback");
+}
 void config_receipts() {
     using namespace strix::minimax::defaults;
     const Lookup empty = [](const char*) -> const char* { return nullptr; };
@@ -548,6 +606,7 @@ int main(int argc, char** argv) {
         decode_and_verify();
         prefill_cuts();
         config_receipts();
+        fixed_split_default();
         for (const auto& selector : selectors)
             if (selector.category == 'c' && std::string_view(selector.id) != "prefill-routed-split" &&
                 std::string_view(selector.id) != "prefill-shared-split")
