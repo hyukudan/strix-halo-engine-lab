@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "strix/device_allocation_error.hpp"
 #endif
 
 #include "strix/device/declaration.hpp"
@@ -60,7 +61,10 @@ inline void check(Status status, const char* operation) {
 #if defined(__HIPCC__)
     hip_check(status, operation);
 #else
-    if (status != cudaSuccess) throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+    if (status == cudaSuccess) return;
+    const auto message = std::string(operation) + ": " + cudaGetErrorString(status);
+    if (status == cudaErrorMemoryAllocation) throw DeviceAllocationError(message, static_cast<int>(status));
+    throw std::runtime_error(message);
 #endif
 }
 
