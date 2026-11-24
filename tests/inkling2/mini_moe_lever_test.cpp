@@ -51,14 +51,11 @@ void test_resolution() {
     require(exact.find(mini::kMiniMoeW4a4) != nullptr, "exact resolution carries the row");
     require(exact.qualification() == "qualified", "exact receipt");
     const profile::Engine legacy{"inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1"};
-    const auto exact_off = profile::resolve(mini::kMiniProfile, inputs(profile::Name::standard, nullptr, "0", "0"));
+    const auto exact_off = profile::resolve(mini::kMiniProfile, inputs(profile::Name::standard, nullptr, nullptr, "0"));
     require(exact_off.fingerprint() == profile::resolve(legacy, inputs(profile::Name::standard)).fingerprint(),
-            "exact identity unchanged by the additive rows while the down image and the round fold are off");
-    require(exact.fingerprint() != exact_off.fingerprint(), "the selected levers are part of the run identity");
-    require(profile::resolve(mini::kMiniProfile, inputs(profile::Name::standard, nullptr, "0")).fingerprint() !=
-                exact_off.fingerprint(), "the round fold alone is part of the run identity");
-    require(profile::resolve(mini::kMiniProfile, inputs(profile::Name::standard, nullptr, nullptr, "0")).fingerprint() !=
-                exact_off.fingerprint(), "the down image alone is part of the run identity");
+            "exact identity unchanged by the additive rows while the round fold is off");
+    const auto exact_on = profile::resolve(mini::kMiniProfile, inputs(profile::Name::standard, nullptr, "1", "0"));
+    require(exact_off.fingerprint() != exact_on.fingerprint(), "the selected down image is part of the run identity");
 
     mini::MiniWeightOptions options;
     for (const auto tier : {profile::Name::fast, profile::Name::turbo}) {
@@ -93,15 +90,15 @@ void test_resolution() {
     require(refused, "malformed W4A4 switch must be refused");
 }
 
-// The down-image lever: builtin off, on by the exact and fast rows (turbo takes the fast cell), one value for every entry
-// point (the CLI and the server resolve through resolve_mini_profile), an explicit 0 switches it off, a malformed value is
-// refused, and only gfx1151 admits the image route.
+// The down-image lever: off in every profile unless selected explicitly (STRIX_INK_COMBINE_IMAGE=1), one value for every
+// entry point (the CLI, the gate and the server resolve through resolve_mini_profile), a malformed value is refused, and
+// only gfx1151 admits the image route.
 void test_combine_image() {
     const auto* lever = &mini::kMiniProfile.table[1];
     require(lever->name == mini::kMiniCombineImage && lever->name == "inkling2-mini-combine-down-image@1", "image identity");
     require(lever->env == "STRIX_INK_COMBINE_IMAGE" && lever->off == "0" && lever->builtin == "0", "image off switch");
     require(lever->kind == profile::Kind::exact, "image lever is exact");
-    require(lever->value[0] == "1" && lever->value[1] == "1" && lever->value[3].empty(), "exact and fast on, turbo cell empty");
+    for (const auto& cell : lever->value) require(cell.empty(), "no profile column selects the image");
     const profile::Engine bare{"inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1"};
     require(profile::resolve(bare, inputs(profile::Name::standard)).find(mini::kMiniCombineImage) == nullptr &&
                 !mini::mini_combine_image(profile::resolve(bare, inputs(profile::Name::standard))),
@@ -110,7 +107,8 @@ void test_combine_image() {
     for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
         options.tier = inputs(tier);
         const auto resolved = mini::resolve_mini_profile(options, true);
-        require(mini::mini_combine_image(resolved), "exact, fast and turbo rows select the image");
+        require(!mini::mini_combine_image(resolved), "no profile selects the image by default");
+        require(resolved.find(mini::kMiniCombineImage)->value == "0", "default value is the builtin 0");
         if (tier == profile::Name::standard) require(resolved.qualification() == "qualified", "exact stays qualified");
         options.tier = inputs(tier, nullptr, "0");
         require(!mini::mini_combine_image(mini::resolve_mini_profile(options, true)), "explicit 0 switches the image off");
@@ -142,7 +140,7 @@ struct FakeDecoder {
 
 void test_configure() {
     mini::MiniWeightOptions options;
-    options.tier = inputs(profile::Name::standard);
+    options.tier = inputs(profile::Name::standard, nullptr, "1");
     const auto resolved = mini::resolve_mini_profile(options, true);
     FakeDecoder decoder;
     require(mini::configure_mini_decoder(decoder, resolved) && decoder.image_calls == 1 && decoder.image,
