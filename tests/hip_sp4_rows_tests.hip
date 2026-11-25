@@ -139,24 +139,25 @@ void check_rows(std::mt19937& rng) {
 }
 
 void bench(std::mt19937& rng) {
+    // Same bytes per weight (68 per 128); the time does not depend on the values: random codes, sane scales.
     constexpr std::size_t n = 200058, k = 2304;
-    const auto m = make_sp4(n, k, rng, 0.02F);
-    std::vector<std::uint8_t> q4(n * weight::Q4G64Storage::row_bytes(k));
-    {
-        std::uniform_real_distribution<float> d(-0.05F, 0.05F);
-        float block[128];
-        for (std::size_t b = 0; b < q4.size() / weight::Q4G64Storage::bytes; ++b) {
-            for (auto& v : block) v = d(rng);
-            static_cast<void>(weight::lowbit::encode_block<weight::Q4G64Storage>(block, q4.data() + b * weight::Q4G64Storage::bytes));
+    std::vector<std::uint8_t> sp4(n * S::row_bytes(k)), q4(n * weight::Q4G64Storage::row_bytes(k));
+    for (auto& b : sp4) b = static_cast<std::uint8_t>(rng());
+    for (auto& b : q4) b = static_cast<std::uint8_t>(rng());
+    for (std::size_t blk = 0; blk < sp4.size() / S::bytes; ++blk)
+        for (unsigned g = 0; g < 4U; ++g) sp4[blk * S::bytes + S::scale_offset + g] = static_cast<std::uint8_t>(64U + (rng() & 63U));
+    for (std::size_t blk = 0; blk < q4.size() / weight::Q4G64Storage::bytes; ++blk)
+        for (unsigned g = 0; g < 2U; ++g) {  // FP16 scale 2^-10 per group
+            q4[blk * weight::Q4G64Storage::bytes + weight::Q4G64Storage::scale_offset + 2U * g] = 0x00U;
+            q4[blk * weight::Q4G64Storage::bytes + weight::Q4G64Storage::scale_offset + 2U * g + 1U] = 0x14U;
         }
-    }
-    Buffer<std::uint8_t> ws(m.bytes.size()), wq(q4.size());
-    ws.upload(m.bytes);
+    Buffer<std::uint8_t> ws(sp4.size()), wq(q4.size());
+    ws.upload(sp4);
     wq.upload(q4);
     std::vector<float> x(16 * k, 0.5F);
     Buffer<float> dx(x.size()), dy(16 * n);
     dx.upload(x);
-    const auto vs = view(ws.data, m.bytes.size(), weight::kSP4TWeightStorage, n, k, S::row_bytes(k), m.header.base);
+    const auto vs = view(ws.data, sp4.size(), weight::kSP4TWeightStorage, n, k, S::row_bytes(k), -40);
     const auto vq = view(wq.data, q4.size(), weight::kQ4G64WeightStorage, n, k, weight::Q4G64Storage::row_bytes(k), 0);
     hipEvent_t a, b;
     hip_check(hipEventCreate(&a), "event");
