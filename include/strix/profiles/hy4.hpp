@@ -32,7 +32,9 @@ inline constexpr sp::Lever table[] = {
                "1024 = 2048 at 4,096 and 8,192 tokens); FAST gate v2 per regime: see `qualified`",
      .provisional = {false, false, false, false},
      // the width is scheduling inside this class (the pair's flow-shop picker chooses it): same bits, same qualification
-     .same_bits = "1024,2048,4096", .identity = {{{"0", "v1"}, {"4096", "v1"}}}},
+     .same_bits = "1024,2048,4096",
+     .identity = {{{"0", "v1"}, {"1024", "v1"}, {"2048", "v1"},
+                   {"4096", "v1"}}}},
     {.name = "head_q8", .env = "", .option = "--head-q8", .value = {"", "1", "", ""}, .builtin = "0",
      .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "1 (Q8_0 copy of the BF16 head for the decode head, weights.head.q8_0@1)", .off = "0",
@@ -69,6 +71,13 @@ struct Regime {
     std::uint64_t prompt_tokens = 0;  // the prompt of this run (an entry point that resolves earlier: the longest it admits)
     std::string_view execution{};     // sp::Regime::execution (caller-owned; empty: no ordinary timing row decides)
 };
+// The 11-25 timing receipt priced the full-model native rank, one GPU, device greedy,
+// capacity 8384, 64 outputs. Both timed arms included a warm-up pass. The width is a schedule within
+// FAST; it does not change the qualified window arithmetic.
+inline constexpr std::string_view single_greedy_8k = "hip/rank/single/full/greedy/8384/64";
+inline constexpr std::string_view single_greedy_8k_receipt =
+    "11-25 meas_main/hy4: same prompt and last-position digest; rows 2048 prefill 744.5 and decode 16.96 "
+    "tok/s vs rows 4096 prefill 781.8 and decode 14.25 tok/s; warm prefill + generation 14.718 vs 14.898 s";
 [[nodiscard]] inline Device device_of(std::string_view arch) {  // hipDeviceProp_t::gcnArchName; features after ':' ignored
     return arch.substr(0, arch.find(':')) == "gfx1151" ? Device::gfx1151 : Device::unknown;
 }
@@ -188,15 +197,21 @@ struct Resolved {
     constexpr auto fast = static_cast<unsigned>(sp::Name::fast);
     for (const auto& lever : table) {
         sp::Lever row = lever;
-        const auto* q = qualification(lever.name, lever.value[fast], regime, rows);
+        const auto nominal = lever.value[fast];
+        const bool scheduled = lever.name == "prompt_rows" && regime.device == Device::gfx1151 &&
+            regime.topology == Topology::one_node && regime.prompt_tokens == 8192 && regime.execution == single_greedy_8k;
+        if (scheduled) row.value[fast] = "2048";
+        const auto* q = qualification(lever.name, row.value[fast], regime, rows);
         row.ready[fast] = q != nullptr;
         // A frozen incumbent grant (not the quality row) keeps a cell that already ran before the ladder rule.
         if (lever.kind != sp::Kind::exact)
             for (const auto& grant : grants)
-                if (!grant.identity.empty() && sp::declared_identity(lever.identity, lever.value[fast]) == grant.identity &&
-                    qualification(lever.name, lever.value[fast], regime, std::span(&grant.qualified, 1)) != nullptr) {
-                    out->ladder.push_back(sp::incumbent_cell(lever.name, lever.value[fast], sp::Name::fast,
-                                                             grant.qualified.gate.receipt, grant.identity));
+                if (!grant.identity.empty() && sp::declared_identity(lever.identity, row.value[fast]) == grant.identity &&
+                    qualification(lever.name, nominal, regime, std::span(&grant.qualified, 1)) != nullptr &&
+                    (!scheduled || (sp::bit_class_member(lever.same_bits, nominal) &&
+                                    sp::bit_class_member(lever.same_bits, row.value[fast])))) {
+                    out->ladder.push_back(sp::incumbent_cell(lever.name, row.value[fast], sp::Name::fast,
+                        scheduled ? single_greedy_8k_receipt : grant.qualified.gate.receipt, grant.identity));
                     break;
                 }
         out->rows.push_back(row);

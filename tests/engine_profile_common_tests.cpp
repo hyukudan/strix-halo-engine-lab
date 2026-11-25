@@ -310,6 +310,26 @@ int main() try {
             in.allow_pending = false;
         }
 
+        const hy::Regime measured{hy::Device::gfx1151, hy::Topology::one_node, 8192, hy::single_greedy_8k};
+        for (const auto tier : {Name::fast, Name::turbo}) {
+            in.profile = tier;
+            const auto chosen = hy::resolve(measured, in);
+            require(chosen->find("prompt_rows")->value == "2048" && chosen->find("head_q8")->value == "1" &&
+                    chosen->find("pf_mha")->value == "1", "Hy4 measured 8K greedy rank uses the qualified 2048 schedule");
+            auto other = measured;
+            other.execution = {};
+            require(hy::resolve(other, in)->find("prompt_rows")->value == "4096", "unpriced Hy4 execution keeps its schedule");
+            other = measured;
+            other.prompt_tokens = 8191;
+            require(hy::resolve(other, in)->find("prompt_rows")->value == "4096", "adjacent Hy4 band keeps its schedule");
+            in.cli = {{"prompt_rows", "4096"}};
+            require(hy::resolve(measured, in)->find("prompt_rows")->value == "4096", "Hy4 explicit window width wins");
+            in.cli.clear();
+        }
+        in.profile = Name::standard;
+        require(hy::resolve(measured, in)->find("prompt_rows")->value == "0", "Hy4 BASE keeps the serial reference");
+        in.profile = Name::turbo;
+
         constexpr std::pair<const char*, const char*> switches[] = {
             {"pf_a8_producer", "STRIX_HY4_PF_A8_PRODUCER"},
             {"q8_store_epilogue", "STRIX_HY4_Q8_STORE_EPILOGUE"},

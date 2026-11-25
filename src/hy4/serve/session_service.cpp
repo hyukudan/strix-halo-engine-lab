@@ -1,4 +1,5 @@
 #include "hy4/serve/session_service.hpp"
+#include "strix/profiles/hy4.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/model_family_registry.hpp"
 #include "strix/weight/tensor_map.hpp"
@@ -56,8 +57,10 @@ const Prepared& prepared(const sv::ServiceSelection& selection) {
 
 }  // namespace
 
-Options parse_options(std::span<const std::string> args) {
+Options parse_options(std::span<const std::string> arguments) {
     Options o;
+    std::vector<std::string> args(arguments.begin(), arguments.end());
+    ::strix::profile::take_options(profile::engine(), args, o.profile);
     for (std::size_t i = 0; i < args.size(); ++i) {
         const auto& a = args[i];
         const auto value = [&]() -> const std::string& {
@@ -75,7 +78,8 @@ Options parse_options(std::span<const std::string> args) {
             if (o.model_id.empty()) throw std::invalid_argument("--model-id must not be empty");
             o.model_id_given = true;
         } else if (a == "--print-effective-config") o.print_effective_config = true;
-        else if (a == "--profile") (void)::strix::profile::parse(value()); // Host-only service inspection.
+        else if (a == "--prompt-rows") (void)number<std::uint32_t>(a, value());
+        else if (a == "--head-q8") (void)value();
         else if (a == "--help" || a == "-h") o.help = true;
         else throw std::invalid_argument("unknown hy4_flash option: " + a + " (see --help)");
     }
@@ -163,6 +167,8 @@ sv::Json effective_config(const Options& options, const PackFacts& pack) {
     out.set("values", std::move(values));
     out.set("request", std::move(request));
     out.set("serve_only", std::move(serve_only));
+    const auto resolved = profile::resolve({profile::Device::unknown, profile::Topology::one_node, ctx}, options.profile);
+    out.set("profile", sv::parse_json(resolved->resolution.json()));
     out.set("device", sv::Json("not built: hy4_hipbind / hy4_cudabind"));
     return out;
 }
@@ -183,11 +189,13 @@ void bind_api(sv::ApiConfig& config, const Options& options, const PackFacts& pa
 }
 
 const char* usage() {
-    return "hy4_flash family options (strix-serve --model hy4_flash -- OPTIONS; the same parser as the CLI):\n"
+    return "hy4_flash family options (strix-serve --model hy4_flash -- OPTIONS):\n"
            "  --gguf PATH               first part of the Hy4-flash pack (tokenizer, chat template, weights)\n"
            "  --ctx N                   context cap (default: the pack's context_length)\n"
            "  --max-tokens N            default reply cap (default 4096)\n"
            "  --model-id NAME           model id reported by the API (default hy4-flash)\n"
+           "  --profile exact|fast|turbo  tier to resolve for host inspection\n"
+           "  --prompt-rows N --head-q8 0|1  explicit profile overrides for inspection\n"
            "  --print-effective-config  print the effective values and the serve-only levers, then exit\n";
 }
 
