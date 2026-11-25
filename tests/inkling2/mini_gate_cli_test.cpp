@@ -1,10 +1,12 @@
 #if defined(STRIX_INKLING2_APP_CLI_TEST)
 #include "inkling2_mini_cli.hpp"
 #endif
+#include "inkling2/inkling2_mini_resident_route.hpp"
 #include "strix/session/cli_output.hpp"
 #include "strix/session/head_gate_cli.hpp"
 
 #include <iostream>
+#include <utility>
 
 #include <array>
 #include <bit>
@@ -85,8 +87,8 @@ cli::Options parse(std::initializer_list<std::string> arguments) {
     const strix::serve::SerialGenerationFamily family{"mini", "Mini", "MODEL",
         8U, 8U, 16U, 0U, nullptr, 8U, true, false,
         [](const std::string&) -> std::shared_ptr<const strix::serve::BpeTokenizer> { return {}; },
-        true, [](std::string_view) { return std::string{}; }, true};
-    auto options = cli::parse(static_cast<int>(argv.size()), argv.data(), family);
+        strix::inkling2::kMiniPackedDecodeDefault, [](std::string_view) { return std::string{}; }, true};
+    auto options = cli::parse(static_cast<int>(argv.size()), argv.data(), family, true);
     // Only use fields that own their values after the temporary argument storage expires.
     return options;
 }
@@ -198,12 +200,59 @@ void test_cuda_route_options() {
     expect_invalid([&] { (void)forms({"--latency-forms", "--no-latency-forms"}); });
 }
 
+void set_round_fold_env(const char* value) {
+#ifdef _WIN32
+    require(_putenv_s("STRIX_INK_PREPARED_ROUND_FOLD", value ? value : "") == 0, "cannot set the round fold switch");
+#else
+    require((value ? setenv("STRIX_INK_PREPARED_ROUND_FOLD", value, 1) : unsetenv("STRIX_INK_PREPARED_ROUND_FOLD")) == 0,
+            "cannot set the round fold switch");
+#endif
+}
+
+// The projected-bias attention lever per tier through the CLI parse: the same table the server test pins
+// (tests/inkling2/mini_serve_test.cpp): opt-in, so unset and 0 off, 1 on, anything else refused.
+void test_projected_bias_lever() {
+    const auto set = [](const char* value) {
+#ifdef _WIN32
+        require(_putenv_s("STRIX_INK_ATTN_PROJECTED_BIAS", value ? value : "") == 0, "cannot set the lever");
+#else
+        require((value ? setenv("STRIX_INK_ATTN_PROJECTED_BIAS", value, 1)
+                       : unsetenv("STRIX_INK_ATTN_PROJECTED_BIAS")) == 0, "cannot set the lever");
+#endif
+    };
+    for (const auto* tier : {"exact", "fast", "turbo"}) {
+        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
+            set(value);
+            require(strix::inkling2::mini_attn_projected_bias(parse({"1", "--profile", tier}).tier) == expected,
+                    "CLI projected-bias lever differs from the server table");
+        }
+    }
+    set("yes");
+    expect_invalid([] { (void)parse({"1", "--profile", "fast"}); });
+    set(nullptr);
+}
+
 void test_options() {
     using strix::profile::Name;
     require(parse({"1"}).tier.profile == Name::standard, "expected exact default");
     require(parse({"1", "--profile", "exact"}).tier.profile == Name::standard, "expected explicit exact");
     require(parse({"1", "--profile", "fast"}).tier.profile == Name::fast, "expected FAST");
     require(parse({"1", "--profile", "turbo"}).tier.profile == Name::turbo, "expected TURBO");
+    // The prepared-attention round fold is off in every profile by default; STRIX_INK_PREPARED_ROUND_FOLD=1 selects it
+    // through the same resolution the server reads (tests/inkling2/mini_serve_test.cpp).
+    set_round_fold_env(nullptr);
+    for (const auto* tier : {"exact", "fast", "turbo"})
+        require(!strix::inkling2::mini_prepared_round_fold(parse({"1", "--profile", tier}).tier), "round fold off by default");
+    set_round_fold_env("1");
+    for (const auto* tier : {"exact", "fast", "turbo"})
+        require(strix::inkling2::mini_prepared_round_fold(parse({"1", "--profile", tier}).tier), "explicit round fold");
+    set_round_fold_env(nullptr);
+    require(strix::inkling2::mini_controller_one_plane(parse({"1", "--profile", "fast", "--controller-planes", "1"}).tier),
+            "CLI must resolve the explicit one-plane candidate");
+    require(!strix::inkling2::mini_controller_one_plane(parse({"1", "--profile", "fast", "--controller-planes", "3"}).tier),
+            "CLI must resolve the three-plane incumbent");
+    expect_invalid([] { (void)parse({"1", "--profile", "exact", "--controller-planes", "1"}); });
+    expect_invalid([] { (void)parse({"1", "--profile", "fast", "--controller-planes", "2"}); });
     require(parse({"1", "--profile", "fast", "--qualify-q8"}).weights.qualify_q8, "expected Q8 qualification arm");
     require(parse({"1", "--profile", "fast", "--no-weight-q8"}).weights.disable_q8, "expected Q8 off switch");
     expect_invalid([] { (void)parse({"1", "--qualify-q8"}); });
@@ -213,6 +262,17 @@ void test_options() {
     require(parse({"1"}).generation.packed_decode, "expected packed default");
     require(!parse({"1", "--grouped-decode"}).generation.packed_decode, "expected grouped override");
     expect_invalid([] { (void)parse({"1", "--packed-decode", "--grouped-decode"}); });
+    // The command line's decode form for every tier and flag, against the shared resolver the server also calls
+    // (the server side of the same table is tested in mini_serve_test).
+    for (const char* tier : {"exact", "fast", "turbo"}) {
+        const bool packed = strix::inkling2::mini_packed_decode(false, false);
+        require(parse({"1", "--profile", tier}).generation.packed_decode == packed, "tier changed the default decode form");
+        require(parse({"1", "--profile", tier, "--packed-decode"}).generation.packed_decode ==
+                    strix::inkling2::mini_packed_decode(true, false), "--packed-decode not honoured");
+        require(parse({"1", "--profile", tier, "--grouped-decode"}).generation.packed_decode ==
+                    strix::inkling2::mini_packed_decode(false, true), "--grouped-decode not honoured");
+        expect_invalid([&] { (void)parse({"1", "--profile", tier, "--grouped-decode", "--packed-decode"}); });
+    }
     expect_invalid([] { (void)parse({"--messages", "chat.json", "--tokenize", "input.txt"}); });
     expect_invalid([] { (void)parse({"--tokenize", "input.txt", "--generate", "0"}); });
     expect_invalid([] { (void)parse({"--gate-rows", "64"}); });
@@ -250,6 +310,11 @@ void test_windows(const fs::path& directory) {
     const auto windows = read(HeadGateMode::decode, 2U);
     require(windows.size() == 2U && windows[0].name == "first" && windows[1].ids.back() == 7U,
             "parsed windows differ");
+#if defined(STRIX_INKLING2_APP_CLI_TEST)
+    const auto extent = cli::gate_weight_extent(windows);
+    require(extent.context == 4U && extent.lanes == 1U,
+            "the gate weight plan must use the longest full window and one decode lane");
+#endif
     expect_invalid([&] { (void)read(HeadGateMode::decode, 3U); });
     require(read(HeadGateMode::prefill, 3U).size() == 2U, "prefill permits an all-scored prompt");
     std::ofstream(manifest) << "dup 4 a.ids\ndup 3 b.ids\n";
@@ -300,6 +365,7 @@ int main() {
         const TempDir directory;
 #if defined(STRIX_INKLING2_APP_CLI_TEST)
         test_options();
+        test_projected_bias_lever();
     test_cuda_route_options();
 #endif
         test_windows(directory.path);

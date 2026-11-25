@@ -28,7 +28,9 @@
 #include "strix/wave_router_contract.hpp"
 #include <algorithm>
 #include <array>
+#include <memory>
 #include "strix/token_sampling.hpp"
+#include "strix/serve/job_sampling.hpp"
 #include "strix/mtp_draft_profiles.hpp"
 #include "strix/onfly_i4.hpp"
 #include "qwen_mtp_bundle.hpp"
@@ -206,12 +208,18 @@ struct MtpCliOptions {
     bool sample_speculation=true;       // off: no drafts, plain sampling from the target
     bool sample_timing_schedule=false;  // adaptive: measured-cost owner choice (not reproducible)
     std::uint32_t sample_repeats=1;     // independent requests with seeds seed..seed+N-1
+    TokenSamplerOptions sampler_options{SampledAcceptance::coupled};
 };
 inline TokenSamplingPolicy mtp_sampling_policy(const MtpCliOptions& m) noexcept {
     return {static_cast<float>(m.sample_temperature),m.sample_top_k,static_cast<float>(m.sample_top_p),
         static_cast<float>(m.sample_min_p),m.sample_seed};
 }
 inline bool mtp_sampling(const MtpCliOptions& m) noexcept {return m.sample_temperature>0.0;}
+// The one sampler of a Qwen MTP request: the command line (decode bridge, cohort) and the HTTP cohort build it here,
+// with the acceptance rule resolved at startup (coupled unless STRIX_MTP_SAMPLED_ACCEPT names rejection).
+[[nodiscard]] inline std::shared_ptr<TokenSampler> make_mtp_sampler(const TokenSamplingPolicy& policy, const MtpCliOptions& m) {
+    return std::make_shared<TokenSampler>(policy, m.sampler_options);
+}
 // This is execution evidence: a configured owner alone is not an attempted
 // native window (EOS, remaining budget/context and history can choose serial).
 // Without --mtp-spec-min-p a profiled draft (by sidecar SHA-256, D-055) uses its own value, any other
@@ -542,10 +550,9 @@ struct Options {
     bool http_responses = true, http_capabilities = true, http_stream_receipts = true;
     double http_sse_keepalive = 10.0;
     double http_sse_progress_interval = 1.0;
-    std::optional<double> http_default_temperature, http_default_top_p, http_default_min_p;
-    std::optional<std::uint32_t> http_default_top_k;
-    // Keep the explicit choice for the native capacity check. An omitted policy follows the admitted route.
+    // The requested override and the policy resolved from the startup arguments.
     std::optional<std::string> http_sampling;
+    std::string_view http_sampling_policy = "greedy"; // explicit: pinned before admission; omitted: set by admit_http_batch_slots
     // 0: one request at a time (each from the single request state). 1..8: batched decoding with that many
     // request slots: requests are admitted between decode cycles and decoded together (cohort windows).
     std::uint32_t http_batch = 0; // resolved route: zero selects the single adapter
@@ -1283,17 +1290,32 @@ inline void resolve_http_route(Options& o) {
         o.http_batch = o.http_batch_cap ? o.http_batch_cap : 1U;
         o.http_slot_reason = "capacity pending measured startup";
     }
+    // An explicit --http-sampling is pinned here. An omitted one is the single runner's "greedy" (a positive temperature
+    // runs greedy, announced as "downgrade" in /v1/capabilities) until admit_http_batch_slots resolves it from the
+    // admitted route: the cohort runner samples. Both are the policies an omitted flag always had.
+    if (!o.http_sampling || o.http_sampling == "greedy") o.http_sampling_policy = "greedy";
+    else if (o.http_sampling == "sample" && o.http_batch && !o.session_live_control && o.mtp.sample_speculation)
+        o.http_sampling_policy = "sample";
+    else o.http_sampling_policy = "reject";
 }
-struct HttpSampling {
-    std::string_view policy;
-    [[nodiscard]] bool supports_sampling() const noexcept { return policy == "sample"; }
-};
 
-[[nodiscard]] inline HttpSampling resolve_http_sampling(const Options& o, bool batch) {
-    if (o.http_sampling && *o.http_sampling != "sample") return {*o.http_sampling};
-    // The joint cohort planner can still issue predictor rows with --mtp-sample-speculation off.
-    // Elsewhere an omitted policy keeps the noted downgrade ("downgrade" in /v1/capabilities), as before.
-    return {batch && o.mtp.sample_speculation ? "sample" : "greedy"};
+// Keep the incumbent single/cohort route choice. Only an explicit --http-sampling sample is a startup requirement
+// (refused when measured capacity selects the single route); an omitted policy follows the admitted route.
+[[nodiscard]] inline std::uint32_t admit_http_batch_slots(Options& o, std::uint32_t capacity, bool deployment_planned) {
+    const bool cohort = capacity && o.http_batch && !o.session_live_control &&
+        (capacity > 1U || ((o.http_batch_explicit || deployment_planned) && o.http_batch_cap == 1U));
+    if (!cohort && o.http_sampling_policy == "sample")
+        throw std::runtime_error("HTTP sampling capability requires the cohort runner: measured capacity selects the single route; "
+            "use --http-batch 1 for a one-slot cohort or --http-sampling reject for a single runner");
+    if (!o.http_sampling) o.http_sampling_policy = cohort && o.mtp.sample_speculation ? "sample" : "greedy";
+    return cohort ? capacity : 0U;
+}
+
+// The HTTP cohort's sampler of one request: the job's resolved sampling (null at temperature 0, error set when the
+// policy is refused) with the startup acceptance rule, the same TokenSampler the command line builds (make_mtp_sampler).
+[[nodiscard]] inline std::shared_ptr<TokenSampler> make_http_mtp_sampler(const serve::SamplingParameters& s, std::string& error,
+                                                                         const Options& o) {
+    return serve::make_job_sampler(s, error, o.mtp.sampler_options);
 }
 
 // HTTP serving runs the tiled MTP route after one calibration replay.
@@ -1310,9 +1332,12 @@ inline void validate_http_serve(const Options& o, bool defer_prefill = false) {
             throw std::invalid_argument("--rtx-state-import-file requires a fresh single-request eager CLI route");
     }
     if (o.rtx_state_import_decode_threads > 64U) throw std::invalid_argument("--rtx-state-import-decode-threads is 0..64");
-    if (o.http_default_temperature.value_or(0.0) > 0.0 && o.http_sampling != "sample")
-        throw std::invalid_argument("--http-default-temperature > 0 requires --http-sampling sample");
     if (!o.http_serve) return;
+    // The HTTP cohort decides drafted rows by coupled acceptance (a seed keeps one stream whatever the draft schedule).
+    // The command line uses the same default; an explicit rejection override is refused on the server.
+    if (o.mtp.sampler_options.acceptance == SampledAcceptance::rejection)
+        throw std::invalid_argument("STRIX_MTP_SAMPLED_ACCEPT=rejection is refused with --http-serve: the server decides "
+            "drafted rows by coupled acceptance so that a seed gives one token stream");
     const char* pair = std::getenv("STRIX_QWEN_PF_PIPE");
     if ((pair && std::string_view(pair) == "1") ||
         (o.deployment_spec && o.deployment_spec->topology == "pipeline"))
@@ -1326,9 +1351,10 @@ inline void validate_http_serve(const Options& o, bool defer_prefill = false) {
         (o.http_sampling && *o.http_sampling != "greedy" && *o.http_sampling != "reject" && *o.http_sampling != "sample"))
         throw std::invalid_argument("--http-* values: port <= 65535, non-empty bind/model id, positive limits, batch cap or 0, "
             "sampling greedy|reject|sample, keepalive/progress seconds >= 0");
-    if (o.http_sampling == "sample" && (!o.http_batch_explicit || !o.http_batch || o.session_live_control))
-        throw std::invalid_argument("--http-sampling sample runs on the batched route (--http-batch N)");
-    if (o.http_sampling == "sample" && !resolve_http_sampling(o, true).supports_sampling())
+    if (o.http_sampling == "sample" && (!o.http_batch || o.session_live_control))
+        throw std::invalid_argument("--http-sampling sample runs on the batched route (automatic or --http-batch N; "
+            "it needs prefix windows over rows 2,4,8 and the draft chain)");
+    if (o.http_sampling == "sample" && o.http_sampling_policy != "sample")
         throw std::invalid_argument("--http-sampling sample requires --mtp-sample-speculation on for HTTP cohorts");
     if (o.http_batch && (!o.mtp.window_prefix || !o.mtp.draft_chain || o.mtp.window_rows_set != std::vector<std::uint32_t>{2U, 4U, 8U}))
         throw std::invalid_argument("--http-batch requires prefix windows over the row set 2,4,8 and the draft chain");
@@ -1784,17 +1810,20 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
     if(m.draft_q4 && m.draft_vocab.empty() && !m.draft_context_vocab)
         throw std::invalid_argument("MTP draft Q4 head requires a draft vocabulary subset");
     if(m.sample_options) {
-        validate_token_sampling_policy(mtp_sampling_policy(m));
-        if(!mtp_sampling(m) && (m.sample_top_k || m.sample_top_p!=1.0 || m.sample_min_p!=0.0 || !m.sample_speculation ||
-           m.sample_timing_schedule || m.sample_repeats!=1U))
-            throw std::invalid_argument("MTP sampling options require --mtp-sample-temperature above zero");
-        if(mtp_sampling(m) && m.sample_speculation && !m.draft_chain)
+        const auto policy=mtp_sampling_policy(m);
+        validate_token_sampling_policy(policy);
+        const bool samples=token_sampling_enabled(policy);
+        if(m.sample_temperature>0.0 && !samples)
+            throw std::invalid_argument("MTP sampling temperature is too small to sample with");
+        if(!samples && (!m.sample_speculation || m.sample_timing_schedule || m.sample_repeats!=1U))
+            throw std::invalid_argument("MTP sampling schedule options require --mtp-sample-temperature above zero");
+        if(samples && m.sample_speculation && !m.draft_chain)
             throw std::invalid_argument("MTP speculative sampling requires --mtp-draft-chain (or --mtp-sample-speculation off)");
-        if(!m.sample_repeats || (mtp_sampling(m) && (m.metadata_only || !m.golden_dump.empty())))
+        if(!m.sample_repeats || (samples && (m.metadata_only || !m.golden_dump.empty())))
             throw std::invalid_argument("MTP sampling needs a generation route and at least one request");
         // Not combined with the other request forms yet (each was qualified alone), except cohort requests on
         // the tiled prompt (the batched route samples per request).
-        if(mtp_sampling(m) && tiled==m.cohort.empty())
+        if(samples && tiled==m.cohort.empty())
             throw std::invalid_argument("MTP sampling combines with the tiled MTP prompt only for cohort requests, "
                 "and with cohort requests only on the tiled prompt");
     }
@@ -2853,23 +2882,11 @@ inline Options parse_options(
             else if (argument == "--release-manifest") options.release_manifest = value;
             else if (argument == "--http-api-key-file") options.http_api_key_file = value;
             else if (argument == "--http-sampling") options.http_sampling = value;
-            else if (argument == "--http-default-top-k") options.http_default_top_k = u32("HTTP default top_k");
-            else if (argument == "--http-default-temperature" || argument == "--http-default-top-p" || argument == "--http-default-min-p") {
-                const double v = parse_double(value, "HTTP default filter");
-                if (argument == "--http-default-temperature") {
-                    if (!std::isfinite(v) || v < 0 || v > 2 || (v > 0 && !(static_cast<float>(v) > 0.0F)))
-                        throw std::invalid_argument("--http-default-temperature must be 0 or in (0, 2] as a float");
-                    options.http_default_temperature = v;
-                } else if (argument == "--http-default-top-p") {
-                    if (!std::isfinite(v) || v <= 0 || v > 1 || !(static_cast<float>(v) > 0.0F))
-                        throw std::invalid_argument("--http-default-top-p must be in (0, 1] as a float");
-                    options.http_default_top_p = v;
-                } else {
-                    if (!std::isfinite(v) || v < 0 || v >= 1 || !(static_cast<float>(v) < 1.0F))
-                        throw std::invalid_argument("--http-default-min-p must be in [0, 1) as a float");
-                    options.http_default_min_p = v;
-                }
-            } else if (argument == "--http-default-max-tokens") options.http_default_max_tokens = u32("HTTP default max tokens");
+            else if (argument == "--http-default-temperature" || argument == "--http-default-top-k" ||
+                     argument == "--http-default-top-p" || argument == "--http-default-min-p")
+                throw std::invalid_argument(std::string(argument) + " is retired: a server-only sampling default would make the HTTP "
+                    "stream differ from the command line for the same levers; send the value in the request");
+            else if (argument == "--http-default-max-tokens") options.http_default_max_tokens = u32("HTTP default max tokens");
             else if (argument == "--http-max-queue") options.http_max_queue = u32("HTTP queue");
             else if (argument == "--http-batch") {
                 options.http_batch = options.http_batch_cap = u32("HTTP batch");
@@ -3812,6 +3829,7 @@ inline Options parse_options(
     if (!options.prefill_profile_deferred || options.route_owned || options.numerical_profile_explicit)
         validate_prefill_numerical_profile_cli(options);
     apply_mtp_draft_profile(options.mtp);
+    options.mtp.sampler_options = validate_sampling_startup_environment(SampledAcceptance::coupled);
     resolve_http_route(options);
     validate_mtp_cli(options);
     apply_prefix_cache_environment(options, [](const char* name) -> std::optional<std::string_view> {

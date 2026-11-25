@@ -5,7 +5,7 @@
 // (m = 0..3) of each output, so a staged x value read from LDS feeds O x 1 FMAs per lane and every lane runs half the
 // chains of the wave32 form. Tree: levels 128 and 64 in-lane (m with m + 2, then 0 with 1), level 32 = lane l + 32 into
 // lane l (v_permlane64), levels 16..1 the wave32 helpers (permlanex16, DPP row_shl) inside lanes 0..31. Lane 0 applies
-// the transform. Every add is gdn_window_add(lower, upper): the production operands in the production order.
+// the transform. Every add is gwin::add(lower, upper): the production operands in the production order.
 namespace qpf2k_gdn64 {
 template <unsigned O, unsigned W, unsigned RC, unsigned RB, unsigned Width = 2560U>
 __global__ __launch_bounds__(W * 64U)
@@ -68,15 +68,15 @@ void gdn_qpf2k_gates64_kernel(const std::uint16_t* input, std::uint64_t input_st
 #pragma unroll
             for (unsigned o = 0; o < O; ++o) {
                 float* v = sum[o];
-                v[0] = gdn_window_add(v[0], v[2]); v[1] = gdn_window_add(v[1], v[3]);   // level 128
-                float total = gdn_window_add(v[0], v[1]);                                // level 64
-                total = gdn_window_add(total, __uint_as_float(static_cast<unsigned>(
+                v[0] = gwin::add(v[0], v[2]); v[1] = gwin::add(v[1], v[3]);   // level 128
+                float total = gwin::add(v[0], v[1]);                                // level 64
+                total = gwin::add(total, __uint_as_float(static_cast<unsigned>(
                     STRIX_HIP_PERMLANE64(static_cast<int>(__float_as_uint(total))))));   // level 32: lane l + 32
-                total = gdn_window_add(total, gdn_window_down<16U>(total));
-                total = gdn_window_add(total, gdn_window_down<8U>(total));
-                total = gdn_window_add(total, gdn_window_down<4U>(total));
-                total = gdn_window_add(total, gdn_window_down<2U>(total));
-                total = gdn_window_add(total, gdn_window_down<1U>(total));
+                total = gwin::add(total, gwin::down<16U>(total));
+                total = gwin::add(total, gwin::down<8U>(total));
+                total = gwin::add(total, gwin::down<4U>(total));
+                total = gwin::add(total, gwin::down<2U>(total));
+                total = gwin::add(total, gwin::down<1U>(total));
                 if (lane == 0U) {
                     const unsigned g = g0 + o, row = first + r;
                     const bool alpha = g >= heads;

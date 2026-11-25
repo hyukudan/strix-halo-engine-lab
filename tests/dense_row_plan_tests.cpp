@@ -1,5 +1,6 @@
 #include "core/dense_row_plan.hpp"
 #include "core/residual_mix.hpp"
+#include "core/weight_certificate.hpp"
 #include "cuda/core/dense/row_plan.hpp"
 
 #include <algorithm>
@@ -10,6 +11,9 @@
 #include <initializer_list>
 #include <iostream>
 #include <limits>
+#include <memory_resource>
+#include <new>
+#include <stdexcept>
 #include <random>
 #include <span>
 #include <utility>
@@ -105,6 +109,33 @@ bool check_cuda_bf16_fast_terms() {
     return plan_bf16_row_projection(input, 32U, 2048U, short_limit, true, 1) == Bf16RowPath::big &&
            plan_bf16_row_projection(input, 3072U, 2048U, short_limit, true, 2) == Bf16RowPath::big &&
            plan_bf16_row_projection(input, 3072U, short_limit, short_limit, true, 1) == Bf16RowPath::short_rows;
+}
+
+// The planes a dispatch reports are those of the path each projection actually takes: a tall tile reports the term
+// count (3 exact, 1 BF16-exact declaration, 2 / 1 FAST), the FP32 row grid and short rows report none, and a mixed
+// dispatch the split that ran. Includes the tall 2048-row case, an output width of 17 (FP32 grid) and short rows.
+bool check_reported_planes() {
+    using strix::cuda_core::Bf16RowPath;
+    using strix::cuda_core::bf16_split_planes;
+    using strix::cuda_core::plan_bf16_row_projection;
+    constexpr unsigned short_limit = 16U;
+    const auto reported = [&](unsigned in, unsigned rows, std::initializer_list<unsigned> outs, int terms, bool tall = true) {
+        int planes = 0;
+        for (const unsigned out : outs)
+            planes = std::max(planes, bf16_split_planes(plan_bf16_row_projection(in, out, rows, short_limit, tall, terms), terms));
+        return planes;
+    };
+    for (const int terms : {1, 2, 3}) {
+        if (reported(2304U, 2048U, {3072U}, terms) != terms) return false;   // tall, plain big
+        if (reported(2304U, 2048U, {32U}, terms) != terms) return false;     // tall, compact tile for 3 terms
+        if (reported(64U, 2048U, {17U}, terms) != 0) return false;           // FP32 grid: the request splits nothing
+        if (reported(64U, 8U, {32U}, terms) != 0) return false;              // short rows
+        if (reported(64U, 2048U, {32U, 17U}, terms) != terms) return false;  // mixed reports the split that ran
+        if (reported(64U, 2048U, {17U, 32U}, terms) != terms) return false;
+        if (reported(2304U, 2048U, {3072U}, terms, false) != 0) return false;  // not an MMA request
+    }
+    return bf16_split_planes(Bf16RowPath::fp32_grid, 3) == 0 && bf16_split_planes(Bf16RowPath::short_rows, 3) == 0 &&
+           bf16_split_planes(Bf16RowPath::big, 1) == 1 && bf16_split_planes(Bf16RowPath::big_compact, 3) == 3;
 }
 
 // Host model of the split kernel (RN-even to BF16, FP32 subtraction) and of the
@@ -238,6 +269,61 @@ bool check_low_rank_bound() {
     return magnitudes && bf16 && bounds && tail;
 }
 
+namespace {
+
+// A memory resource that refuses every allocation: the scan scratch cannot be had.
+class RefusingResource final : public std::pmr::memory_resource {
+    void* do_allocate(std::size_t, std::size_t) override { throw std::bad_alloc(); }
+    void do_deallocate(void*, std::size_t, std::size_t) override {}
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
+};
+
+}  // namespace
+
+// The staged scan (device-resident bytes read back in bounded chunks): the maximum over chunk boundaries equals the
+// whole-tensor magnitude, a non-finite element in any chunk gives infinity, lack of scratch is a refusal (infinity,
+// no throw, no read), and an exception of the reader propagates.
+bool check_staged_scan() {
+    using strix::core::Bf16StagedScan;
+    const float inf = std::numeric_limits<float>::infinity();
+    std::vector<std::uint16_t> tensor(11, 0x3F80U);  // 1.0
+    tensor[10] = 0x4040U;                            // 3.0, in the last (short) chunk of a 4-element scratch
+    const auto reader = [&](std::size_t offset, std::span<std::uint16_t> host) {
+        std::copy_n(tensor.begin() + static_cast<std::ptrdiff_t>(offset), host.size(), host.begin());
+    };
+    Bf16StagedScan scan(std::pmr::get_default_resource(), 4U);
+    const bool finite = scan.available() && scan.magnitude_max(tensor.size(), reader) == 3.0F &&
+                        scan.magnitude_max(0U, reader) == 0.0F &&
+                        scan.magnitude_max(tensor.size(), reader) == strix::core::finite_magnitude_max_bf16(tensor);
+    tensor[5] = 0xFF80U;  // -inf in the middle chunk
+    std::size_t reads = 0;
+    const bool infinite = scan.magnitude_max(tensor.size(), [&](std::size_t offset, std::span<std::uint16_t> host) {
+                              ++reads;
+                              reader(offset, host);
+                          }) == inf && reads == 2U;  // stops at the chunk that holds it
+    tensor[5] = 0x7F00U;  // finite but huge: the scan reports the value, the model's bound refuses it
+    const bool huge = scan.magnitude_max(tensor.size(), reader) == std::bit_cast<float>(0x7F000000U);
+    RefusingResource refusing;
+    Bf16StagedScan declined(&refusing, 4U);
+    bool read_called = false;
+    const bool declines = !declined.available() &&
+                          declined.magnitude_max(tensor.size(), [&](std::size_t, std::span<std::uint16_t>) {
+                              read_called = true;
+                          }) == inf && !read_called;
+    bool propagates = false;
+    try {
+        (void)scan.magnitude_max(tensor.size(), [](std::size_t, std::span<std::uint16_t>) {
+            throw std::runtime_error("device copy failed");
+        });
+    } catch (const std::runtime_error&) {
+        propagates = true;
+    }
+    if (!finite || !infinite || !huge || !declines || !propagates)
+        std::cerr << "staged scan: finite " << finite << " infinite " << infinite << " huge " << huge << " declines "
+                  << declines << " propagates " << propagates << '\n';
+    return finite && infinite && huge && declines && propagates;
+}
+
 /// The image route plan: inside the incumbent groups the WMMA tile serves, whole-tile projections (pitched included)
 // go packed, narrow contiguous ones to the image tile, what neither reads keeps the FP32 rows; a group the incumbent
 // runs elsewhere (here: a misaligned weight) keeps every projection on the FP32 rows; a call below the height or the
@@ -256,7 +342,15 @@ static bool check_image_routes() {
                                                                       {2304U, 2304U, 0U, 1024U, 9216U},
                                                                       {2304U, 3072U, 0U, 1024U, 9216U},
                                                                       {2304U, 2304U, 3200U, 1024U, 9216U}}};
-    constexpr strix::core::ImageRoutePolicy policy{1024U, 64U, 128U, 2048U, 9216U, shapes};
+    // Measured launch groups (exact outputs in launch order, one pitch, own heights): a launch over several projections
+    // is only as measured as its listed tuple, whatever its members' single widths are.
+    static constexpr std::array<strix::core::ImageGroupRow, 6> groups{{{2304U, 0U, 2U, {3072U, 1024U}, 1024U, 9216U},
+                                                                      {2304U, 0U, 3U, {3072U, 1024U, 1024U}, 1024U, 9216U},
+                                                                      {2304U, 0U, 2U, {3072U, 128U}, 1024U, 8192U},
+                                                                      {2304U, 0U, 2U, {3072U, 384U}, 1024U, 9216U},
+                                                                      {2304U, 0U, 2U, {1024U, 1024U}, 1024U, 9216U},
+                                                                      {2304U, 0U, 3U, {1024U, 1024U, 1024U}, 1024U, 9216U}}};
+    constexpr strix::core::ImageRoutePolicy policy{1024U, 64U, 128U, 2048U, 9216U, shapes, groups};
     constexpr unsigned K = 2304U;
     constexpr unsigned kWide = 1U << 20U;
     const auto* w = std::bit_cast<const std::uint16_t*>(std::uintptr_t{0x10000U});
@@ -310,6 +404,35 @@ static bool check_image_routes() {
     if (!strix::core::plan_image_routes<3U>(policy, K, 4096U, four, kWide, routes, group_admits, image_admits) ||
         strix::core::for_each_image_route_run<3U>(four, routes, K, Status::ok, record) != Status::ok ||
         runs != decltype(runs){{R::packed, {1024U, 1024U, 1024U}}, {R::packed, {1024U}}})
+        return false;
+    // An unlisted grouping of measured widths: the launch cut stays the longest listed prefix (else one projection), but
+    // a call whose cut makes more packed launches than its uncut runs is not a priced plan: every projection keeps the
+    // FP32 rows, so the call makes the incumbent's launches (the plan counts the final launches, not packed columns).
+    const std::array<Bf16RowProjection, 4> qgkv{{{w, 3072U, y, false, 0U}, {w, 3072U, y, false, 0U},
+        {w, 1024U, y, false, 0U}, {w, 1024U, y, false, 0U}}};
+    runs.clear();
+    const std::array<ImageRoute, 4> qgkv_packed{R::packed, R::packed, R::packed, R::packed};
+    if (strix::core::plan_image_routes<4U>(policy, K, 8192U, qgkv, kWide, routes, group_admits, image_admits) ||
+        !std::all_of(routes.begin(), routes.begin() + 4, [](R r) { return r == R::fp32_rows; }) ||
+        strix::core::for_each_image_route_run<4U>(qgkv, qgkv_packed, K, Status::ok, record, &policy, 8192U) != Status::ok ||
+        runs != decltype(runs){{R::packed, {3072U}}, {R::packed, {3072U, 1024U, 1024U}}})
+        return false;
+    const std::array<Bf16RowProjection, 3> wide_pair{{{w, 3072U, y, false, 0U}, {w, 128U, y, false, 0U},
+        {w, 128U, y, false, 0U}}};
+    runs.clear();
+    const std::array<ImageRoute, 3> wide_packed{R::packed, R::packed, R::packed};
+    if (strix::core::plan_image_routes<4U>(policy, K, 8192U, wide_pair, kWide, routes, group_admits, image_admits) ||
+        !std::all_of(routes.begin(), routes.begin() + 3, [](R r) { return r == R::fp32_rows; }) ||
+        strix::core::for_each_image_route_run<4U>(wide_pair, wide_packed, K, Status::ok, record, &policy, 8192U) !=
+            Status::ok ||
+        runs != decltype(runs){{R::packed, {3072U, 128U}}, {R::packed, {128U}}} ||
+        strix::core::image_packed_schedule(policy, true, K, 8192U, wide_pair))
+        return false;
+    // A listed grouping is one packed launch and routes.
+    const std::array<Bf16RowProjection, 3> listed_group{{{w, 3072U, y, false, 0U}, {w, 1024U, y, false, 0U},
+        {w, 1024U, y, false, 0U}}};
+    if (!strix::core::plan_image_routes<4U>(policy, K, 8192U, listed_group, kWide, routes, group_admits, image_admits) ||
+        !routed({R::packed, R::packed, R::packed}))
         return false;
     // Rounded projections of different store policies (separate / incumbent) never share a run.
     const std::array<Bf16RowProjection, 3> policies{{{w, 1024U, y, true, 0U, true}, {w, 1024U, y, true, 0U, true},
@@ -398,6 +521,21 @@ static bool check_image_routes() {
     const std::array<Bf16RowProjection, 2> wide_n128{{{w, 3072U, y, false, 0U}, {w, 128U, y, false, 0U}}};
     const std::array<Bf16RowProjection, 2> wide_n256{{{w, 3072U, y, false, 0U}, {w, 256U, y, false, 0U}}};
     const std::array<Bf16RowProjection, 1> pitch3200{{{w, 2304U, y, false, 6400U}}};
+    // Individually measured widths in an unlisted group or order, or outside the group's own heights, are K32.
+    const std::array<Bf16RowProjection, 2> pair_3072{{{w, 3072U, y, false, 0U}, {w, 3072U, y, false, 0U}}};
+    const std::array<Bf16RowProjection, 3> qkv_swapped{{{w, 1024U, y, false, 0U}, {w, 3072U, y, false, 0U},
+                                                        {w, 1024U, y, false, 0U}}};
+    const std::array<Bf16RowProjection, 3> wide_128_128{{{w, 3072U, y, false, 0U}, {w, 128U, y, false, 0U},
+                                                         {w, 128U, y, false, 0U}}};
+    const std::array<Bf16RowProjection, 4> four_wide{{{w, 3072U, y, false, 0U}, {w, 3072U, y, false, 0U},
+                                                      {w, 1024U, y, false, 0U}, {w, 1024U, y, false, 0U}}};
+    if (image_packed_schedule(policy, true, K, 8192U, pair_3072) ||
+        image_packed_schedule(policy, true, K, 8192U, qkv_swapped) ||
+        image_packed_schedule(policy, true, K, 8192U, wide_128_128) ||
+        image_packed_schedule(policy, true, K, 8192U, four_wide) ||
+        image_packed_schedule(policy, true, K, 8192U, std::span(qkv).first(2U)) == false ||
+        image_packed_schedule(policy, true, K + 64U, 8192U, qkv))
+        return false;
     if (!image_packed_schedule(policy, true, K, 4096U, n128) || !image_packed_schedule(policy, true, K, 8192U, n128) ||
         image_packed_schedule(policy, true, K, 8193U, n128) || image_packed_schedule(policy, true, K, 8236U, n128) ||
         image_packed_schedule(policy, true, K, 4096U, n256) || image_packed_schedule(policy, true, K, 8192U, n256) ||
@@ -413,7 +551,7 @@ static bool check_image_routes() {
         return false;
     // The call that stores the image: the same rules per projection (a 256-output member stays off the packed route
     // and the 128-output one above 8,192 rows too; >= 16 wide tiles still route).
-    const std::array<Bf16RowProjection, 3> routed_mix{{{w, 3072U, y, false, 0U}, {w, 3072U, y, false, 0U},
+    const std::array<Bf16RowProjection, 3> routed_mix{{{w, 3072U, y, false, 0U}, {w, 1024U, y, false, 0U},
                                                        {w, 256U, y, false, 0U}}};
     if (!strix::core::plan_image_routes<3U>(policy, K, 8236U, routed_mix, kWide, routes, group_admits, image_admits) ||
         !routed({R::packed, R::packed, R::image}) ||
@@ -481,8 +619,9 @@ static bool check_image_route_order() {
 
 int main() {
     if (!check_row_chunks() || !check_projection_groups() || !check_cuda_bf16_paths() ||
-        !check_cuda_bf16_fast_terms() || !check_exact_operand_planes() || !check_image_routes() ||
-        !check_image_route_order() || !check_dense_declared() || !check_low_rank_bound()) {
+        !check_cuda_bf16_fast_terms() || !check_reported_planes() || !check_exact_operand_planes() || !check_image_routes() ||
+        !check_image_route_order() || !check_dense_declared() || !check_low_rank_bound() ||
+        !check_staged_scan()) {
         std::cerr << "Dense row or projection chunk policy failed\n";
         return 1;
     }

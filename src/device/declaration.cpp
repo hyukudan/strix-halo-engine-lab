@@ -158,7 +158,7 @@ Descriptor parse_device(const std::string& id, const Value& v) {
     const auto& t = table(v, key);
     only(t, {"kind", "vendor", "arch", "uuid", "pci", "name", "memory_bytes", "attach", "roles", "excluded", "reason", "cores",
              "byte_cap_gbytes_ps", "driver", "firmware", "corun_qualification", "profile", "memory_gib",
-             "bandwidth_gbytes_ps", "units", "count", "interconnect"}, key + ".");
+             "bandwidth_gbytes_ps", "units", "count", "interconnect", "lowbit_rows"}, key + ".");
     Descriptor d;
     d.id = id;
     try {
@@ -175,7 +175,7 @@ Descriptor parse_device(const std::string& id, const Value& v) {
         if (d.kind != Kind::npu && find(t, name)) bad(key + "." + std::string(name), "only a kind = \"npu\" unit takes this key");
     for (const std::string_view name : {"uuid", "pci", "attach", "memory_bytes"})
         if (cpu && find(t, name)) bad(key + "." + std::string(name), "a cpu unit takes no " + std::string(name));
-    for (const std::string_view name : {"profile", "bandwidth_gbytes_ps", "units", "count", "interconnect"})
+    for (const std::string_view name : {"profile", "bandwidth_gbytes_ps", "units", "count", "interconnect", "lowbit_rows"})
         if (d.kind != Kind::gpu && find(t, name)) bad(key + "." + std::string(name), "only a GPU entry takes this key");
     if (d.kind == Kind::npu && find(t, "memory_gib")) bad(key + ".memory_gib", "only a GPU or the cpu unit takes this key");
     const Profile* profile = nullptr;
@@ -202,6 +202,17 @@ Descriptor parse_device(const std::string& id, const Value& v) {
     if (profile && profile->name == "custom" && d.budget_bytes == 0) bad(key + ".memory_gib", "required with profile custom");
     if (const auto* x = find(t, "bandwidth_gbytes_ps")) d.bandwidth_gbytes_ps = rate(*x, key + ".bandwidth_gbytes_ps");
     if (const auto* x = find(t, "units")) d.units = static_cast<std::uint32_t>(integer(*x, key + ".units"));
+    if (const auto* x = find(t, "lowbit_rows")) {
+        const auto& rows = table(*x, key + ".lowbit_rows");
+        only(rows, {"small_rows", "wide_panels"}, key + ".lowbit_rows.");
+        for (const std::string_view name : {"small_rows", "wide_panels"}) {
+            const auto* value = find(rows, name);
+            if (!value) bad(key + ".lowbit_rows." + std::string(name), "required (omit lowbit_rows for one route)");
+            const auto n = integer(*value, key + ".lowbit_rows." + std::string(name));
+            if (n < 1 || n > 65535) bad(key + ".lowbit_rows." + std::string(name), "expected 1 to 65535");
+            (name == "small_rows" ? d.lowbit_rows.small_rows : d.lowbit_rows.wide_panels) = static_cast<std::uint32_t>(n);
+        }
+    }
     if (const auto* x = find(t, "count")) {
         const auto n = integer(*x, key + ".count");
         if (n < 1 || n > 64) bad(key + ".count", "expected 1 to 64");

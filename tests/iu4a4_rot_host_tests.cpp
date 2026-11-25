@@ -7,13 +7,17 @@
 //  4. rotation: W R . R x == W . x in FP64 before quantisation (R = fwht128, symmetric orthogonal), and the requantised
 //     pack round-trips: |W R - code * step| <= step / 2 per element;
 //  5. quality of the integer-relative scales against the FP32 per-group rule of a4_tiles (same rotation, same groups):
-//     squared error ratio <= 1.03 on Gaussian rows with outlier channels (printed).
+//     squared error ratio <= 1.03 on Gaussian rows with outlier channels (printed);
+//  6. weight rule trait: the explicit amax rule is the default image bit for bit (v1), mse_clip (v2) picks a clip
+//     candidate never above v1's step with a per-block error never above v1's, lowers the error on the test pack
+//     (printed), is deterministic, and keeps v1's step on zero and NaN blocks.
 #include "core/iu4a4_rot.hpp"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <random>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -201,6 +205,61 @@ int main() {
         const double ratio = e_rel / e_flt;
         std::printf("integer-relative / FP32 group scale squared error ratio %.4f\n", ratio);
         check(ratio <= 1.03, "5: integer-relative scales cost <= 3 % squared error");
+    }
+    {  // 6
+        constexpr unsigned blocks = in / rot::kBlock;
+        std::vector<std::uint8_t> rpack1(pack.size(), 0U), rpack2(pack.size(), 0U), rpack2b(pack.size(), 0U);
+        std::vector<float> wstep1(wstep.size()), wstep2(wstep.size()), wstep2b(wstep.size());
+        for (unsigned n = 0; n < outputs; ++n)
+            for (unsigned b = 0; b < blocks; ++b) {
+                rot::requantise_block(pack.data(), scales.data(), in, outputs, n, b, rpack1.data(), wstep1.data(), rot::WeightRule::amax);
+                rot::requantise_block(pack.data(), scales.data(), in, outputs, n, b, rpack2.data(), wstep2.data(), rot::WeightRule::mse_clip);
+                rot::requantise_block(pack.data(), scales.data(), in, outputs, n, b, rpack2b.data(), wstep2b.data(), rot::WeightRule::mse_clip);
+            }
+        check(rpack1 == rpack && wstep1 == wstep, "6: explicit amax rule == the default image (v1 unchanged)");
+        check(rpack2 == rpack2b && wstep2 == wstep2b, "6: mse_clip image is deterministic");
+        bool candidate = true, no_worse = true, clipped = false;
+        double e1 = 0.0, e2 = 0.0;
+        for (unsigned n = 0; n < outputs; ++n) {
+            std::vector<float> wr(in);
+            for (unsigned k = 0; k < in; ++k) wr[k] = static_cast<float>(wdeq[std::size_t(n) * in + k]);
+            for (unsigned b = 0; b < in; b += rot::kBlock) a4::fwht128(wr.data() + b);
+            for (unsigned b = 0; b < blocks; ++b) {
+                const float s1 = wstep1[std::size_t(n) * blocks + b], s2 = wstep2[std::size_t(n) * blocks + b];
+                float amax = 0.0f;
+                for (unsigned i = 0; i < rot::kBlock; ++i) amax = std::fmax(amax, std::fabs(wr[b * rot::kBlock + i]));
+                bool listed = false;
+                for (unsigned c = 0; c < im::kA4ClipSteps; ++c) listed = listed || s2 == im::a4_step_f(amax * im::a4_clip_ratio(c));
+                candidate = candidate && listed && s2 <= s1;
+                clipped = clipped || s2 < s1;
+                double b1 = 0.0, b2 = 0.0;
+                for (unsigned i = 0; i < rot::kBlock; ++i) {
+                    const unsigned k = b * rot::kBlock + i;
+                    const double d1 = double(wr[k]) - double(rot::pack_code(rpack1.data(), k, n, outputs)) * double(s1);
+                    const double d2 = double(wr[k]) - double(rot::pack_code(rpack2.data(), k, n, outputs)) * double(s2);
+                    b1 += d1 * d1;
+                    b2 += d2 * d2;
+                }
+                no_worse = no_worse && b2 <= b1 * (1.0 + 1e-5);
+                e1 += b1;
+                e2 += b2;
+            }
+        }
+        const double gain = e2 / e1;
+        std::printf("weight rule mse_clip / amax squared error %.4f\n", gain);
+        check(candidate, "6: the v2 step is one of the clip candidates and never above v1's");
+        check(no_worse, "6: per block, v2 error <= v1 error");
+        check(clipped && gain < 0.95, "6: v2 clips Gaussian blocks and lowers the error");
+        float zero[rot::kBlock] = {}, nan_block[rot::kBlock];
+        for (unsigned i = 0; i < rot::kBlock; ++i) nan_block[i] = float(i % 7U) - 3.0f;
+        nan_block[5] = std::nanf("");
+        check(rot::weight_step(zero, rot::WeightRule::mse_clip) == 1.0f && rot::weight_step(zero, rot::WeightRule::amax) == 1.0f,
+              "6: a zero block keeps step 1 under both rules");
+        check(rot::weight_step(nan_block, rot::WeightRule::mse_clip) == rot::weight_step(nan_block, rot::WeightRule::amax),
+              "6: a NaN block keeps the v1 step");
+        check(std::string_view(rot::identity(rot::WeightRule::amax)) == rot::kIdentity &&
+                  std::string_view(rot::identity(rot::WeightRule::mse_clip)) == "dense-iu4a4-rot-v2",
+              "6: contract ids v1 / v2");
     }
     if (failures == 0) std::printf("iu4a4_rot host tests PASS (%s)\n", rot::kIdentity);
     return failures == 0 ? 0 : 1;

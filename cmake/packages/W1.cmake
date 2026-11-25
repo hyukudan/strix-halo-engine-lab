@@ -12,7 +12,8 @@ if(BUILD_TESTING)
     set_tests_properties(weight_decoder_conformance PROPERTIES LABELS cpu)
 
     add_executable(weight_chunk_traits tests/weight_chunk_traits.cpp)
-    target_include_directories(weight_chunk_traits PRIVATE src)
+    # core/weight_decode.hpp includes strix/weight/host_lowbit.hpp (q4_g64 / q6_g64 storages).
+    target_include_directories(weight_chunk_traits PRIVATE src include)
     target_compile_features(weight_chunk_traits PRIVATE cxx_std_20)
     strix_target_warnings(weight_chunk_traits)
     add_test(NAME weight_chunk_traits COMMAND weight_chunk_traits)

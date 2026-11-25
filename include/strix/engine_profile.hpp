@@ -82,14 +82,17 @@ inline unsigned value_column(const Row& lever, Name profile) {
     return column;
 }
 
-// Identity variant: a route that computes different bits from the incumbent serving identity of a backend (another
-// reduction or grouping order, a screened head, a packed MoE pass). It is never a lever value and never a default: it
+// Legacy identity-variant API. These selections are explicit arithmetic levers, not permission for a separate
+// serving identity. CLI and HTTP must resolve the same default and selected values for each model/backend/tier.
+// A load, slot or cohort-width decision may change the schedule only with a bitwise identity proof.
+// The legacy API below still admits an explicit named route (another reduction/grouping order or packed MoE pass): it
 // runs only when requested by name ('--identity-variant ID[@VERSION]' or the variant's own option, a model TOML key, a
 // serve config) THROUGH resolve(), which admits it on a declared backend under a tier its row admits. EXACT admits only
 // a variant that is itself bitwise-defined (deterministic and batch invariant against its named reference) and declared
 // as an EXACT identity variant (`exact_identity`). An admitted variant prints "identity <id>@<version>" in the receipt,
 // the effective config and the startup line, and enters the rank fingerprint; with none admitted every output stays the
-// incumbent's, byte for byte. Engines read the decision only through Resolution::selected(id).
+// existing default's, byte for byte. This compatibility rule does not qualify CLI/server equality; divergent defaults
+// must be migrated with served A/B evidence. Engines read the decision only through Resolution::selected(id).
 struct IdentityVariant {
     std::string_view id;                        // "inkling2-mini-moe-packed"
     unsigned version = 0;                       // bumped when the arithmetic changes; a request may pin "id@version"

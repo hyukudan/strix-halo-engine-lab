@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/device/link_class.hpp"
+#include "strix/device/lowbit_rows.hpp"
 #include "strix/r1_rows_tiles.hpp"
 
 #include <cstdint>
@@ -137,6 +138,9 @@ struct Descriptor {
     std::uint64_t budget_bytes = 0;
     double bandwidth_gbytes_ps = 0.0; // overrides the profile's memory bandwidth; 0 = the profile's
     std::uint32_t units = 0;          // overrides the profile's SM / CU count; 0 = the profile's
+    // Optional measured switch points of the low-bit resident projection routes on THIS device (`lowbit_rows =
+    // { small_rows = N, wide_panels = M }`, both > 0; strix/device/lowbit_rows.hpp). {0, 0} = not declared: one route.
+    LowBitRows lowbit_rows;
     // Cluster shape: `count` identical devices joined by `interconnect` (a class in profiles.hpp). An entry with
     // count > 1, or a profile without an identity, is planned: the planners size it, the gate never binds it.
     std::uint32_t count = 1;

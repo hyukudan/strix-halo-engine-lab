@@ -128,8 +128,10 @@ struct SwigluOut {
 // Load time: expert matrix -> rotated image slot (codes, steps) on stream s.
 template <packed::MatrixFormat Format>
 inline void enqueue_requantise_expert(const packed::PackedMatrix& matrix, unsigned pair_rows, unsigned in, unsigned n,
-                                      std::uint8_t* codes, float* steps, hipStream_t s) {
-    dense::enqueue_requantise_source(ExpertSource<Format>{matrix, pair_rows}, in, n, codes, steps, s);
+                                      std::uint8_t* codes, float* steps, hipStream_t s,
+                                      rot::WeightRule rule = rot::WeightRule::amax) {
+    if (rule == rot::WeightRule::amax) dense::enqueue_requantise_source(ExpertSource<Format>{matrix, pair_rows}, in, n, codes, steps, s);
+    else dense::enqueue_requantise_source(ExpertRuleSource<Format>{{matrix, pair_rows}, rule}, in, n, codes, steps, s);
 }
 
 static_assert(kFaultBounds == dense::kBoundsFault, "one fault bit for the class and its core");

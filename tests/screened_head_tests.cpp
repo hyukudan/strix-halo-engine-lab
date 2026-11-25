@@ -299,6 +299,27 @@ void rescore_plan_tests() {
     bad = ok;
     bad.scratch = reinterpret_cast<std::uint8_t*>(std::numeric_limits<std::uintptr_t>::max() & ~std::uintptr_t{255});
     expect(!plan::rescore_launch_valid(bad), "scratch address range cannot wrap");
+    // The score image is rewritten in place: it may not reach the weights or the activations. One arena so adjacency is
+    // a deliberate address: weights [0, 1024), activations [1024, 1344) (lane 1 at 64 floats, 16 wide).
+    alignas(256) static std::uint8_t arena[4096];
+    bad = ok;
+    bad.scores = reinterpret_cast<float*>(weights);
+    expect(!plan::rescore_launch_valid(bad), "scores over the weights");
+    bad = ok;
+    bad.scores = x;
+    expect(!plan::rescore_launch_valid(bad), "scores over the activations");
+    auto near = ok;
+    near.head.weights = reinterpret_cast<const std::uint16_t*>(arena);
+    near.scores = reinterpret_cast<float*>(arena + 1024);
+    expect(plan::rescore_launch_valid(near), "scores starting where the weights end");
+    near.scores = reinterpret_cast<float*>(arena + 1020);
+    expect(!plan::rescore_launch_valid(near), "scores on the last weight bytes");
+    near = ok;
+    near.x = reinterpret_cast<const float*>(arena + 1024);
+    near.scores = reinterpret_cast<float*>(arena + 1344);
+    expect(plan::rescore_launch_valid(near), "scores starting where the activations end");
+    near.scores = reinterpret_cast<float*>(arena + 1340);
+    expect(!plan::rescore_launch_valid(near), "scores on the last activation");
 }
 
 void builder_tests() {

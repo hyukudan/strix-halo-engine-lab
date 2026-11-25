@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -89,12 +90,14 @@ bool check_decode() {
 }
 
 bool check_admission() {
-    alignas(16) std::array<float, 64> input{};
-    std::array<float, 2> output{};
+    // Admission reads the pointers' values only (alignment, byte ranges), never the memory: the activation and output
+    // addresses stand for buffers large enough for every row count below and far apart (2^20 / 2^44 bytes).
+    const auto* input = reinterpret_cast<const float*>(std::uintptr_t{1} << 20U);
+    auto* output = reinterpret_cast<float*>(std::uintptr_t{1} << 44U);
     alignas(16) std::array<std::uint8_t, 2U * 68U> packed{};
     const weight::ResidentMatrixView matrix{packed, weight::kQ8WeightStorage, 2, 64, 68};
     const auto admits = [&](const weight::ResidentMatrixView& view, unsigned rows, unsigned outputs = 1U) {
-        return core::valid_resident_q8_rows(view, outputs, input.data(), rows, output.data());
+        return core::valid_resident_q8_rows(view, outputs, input, rows, output);
     };
     constexpr auto row_limit = 65535U * core::f16_tile_gemm::kBM;
     for (unsigned rows : {1U, 2U, 4U, 8U, 16U})
@@ -113,8 +116,10 @@ bool check_admission() {
     bad.bytes = bad.bytes.subspan(1);
     if (admits(bad, 17U)) return false;
     bad.bytes = std::span(packed).first(packed.size() - 1U);
-    return !admits(bad, 17U) &&
-        !core::valid_resident_q8_rows(matrix, 1U, input.data() + 1, 17U, output.data());
+    // A misaligned activation, and an output inside the activation rows (aligned partial overlap), are refused.
+    return !admits(bad, 17U) && !core::valid_resident_q8_rows(matrix, 1U, input + 1, 17U, output) &&
+        !core::valid_resident_q8_rows(matrix, 1U, input, 17U, const_cast<float*>(input) + 4) &&
+        core::valid_resident_q8_rows(matrix, 1U, input, 17U, const_cast<float*>(input) + 17U * 64U);
 }
 }  // namespace
 

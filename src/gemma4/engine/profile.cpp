@@ -87,7 +87,7 @@ constexpr Lever table[] = {
      .required = {false, false, true}, .ready = {true, true, true}, .runnable = {true, true, true}, .kind = Kind::pack,
      .apps = all_apps, .asset = true, .source = "EXL3 pack route (--exl3-arm)"},
     // Fixed per pack and session from the arm and --streams (crossover table in exl3/format.hpp);
-    // STRIX_G4_EXL3_IDENTITY=v1|v2|v3 forces it.
+    // STRIX_G4_EXL3_IDENTITY=v1|v2|v3 forces it, the same for the command line and the server.
     {.name = "exl3_identity", .env = "STRIX_G4_EXL3_IDENTITY", .value = {"", "", "auto"}, .builtin = "auto",
      .required = {false, false, false}, .ready = {false, false, true}, .runnable = {false, false, true},
      .kind = Kind::pack, .apps = engine,

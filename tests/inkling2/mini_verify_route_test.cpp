@@ -1,8 +1,13 @@
 #include "attn_core/prepared_gqa_attention.hpp"
 #include "inkling2/inkling2_mini_resident_route.hpp"
+#include "strix/serve/cohort_passes.hpp"
 
 #include <array>
 #include <iostream>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -30,6 +35,92 @@ constexpr bool check_routes() {
 }
 
 static_assert(check_routes());
+
+// Packed decode (the one default of the command line and strix-serve): every lane of a cohort of any width runs the
+// packed expert form, in passes no wider than the one-row cap of the dense rows family (16 on HIP), exactly as
+// MiniResidentDecoder::decode_slots splits and routes them. A lone lane is the width-1 case.
+constexpr bool check_cohort_lanes() {
+    using strix::inkling2::mini_cohort_pass_cap;
+    if (!strix::inkling2::kMiniPackedDecodeDefault || !strix::inkling2::mini_packed_decode(false, false) ||
+        strix::inkling2::mini_packed_decode(false, true))
+        return false;
+    constexpr unsigned one_row_cap = 16U;
+    for (unsigned lanes = 1U; lanes <= 64U; ++lanes) {
+        const auto passes = strix::serve::plan_cohort_passes(lanes, mini_cohort_pass_cap(true, one_row_cap));
+        unsigned covered = 0U;
+        for (unsigned pass = 0; pass < passes.count; ++pass) {
+            const auto rows = passes.rows(pass);
+            if (rows == 0U || rows > one_row_cap || passes.first(pass) != covered) return false;
+            covered += rows;
+            const bool verify = rows <= strix::inkling2::kMiniMaxVerifyRows;
+            const auto kind = verify ? MiniAppendKind::verify : MiniAppendKind::decode;
+            if (!mini_resident_route(kind, rows, true, false, true).packed_moe) return false;
+            // Without packed cohort rows (no served route lever) a multi-row decode keeps the incumbent grouped form.
+            if (kind == MiniAppendKind::decode && mini_resident_route(kind, rows, true, false).packed_moe) return false;
+        }
+        if (covered != lanes) return false;
+        // Grouped decode keeps the incumbent served schedule: the whole cohort in one batched forward.
+        const auto grouped = strix::serve::plan_cohort_passes(lanes, mini_cohort_pass_cap(false, one_row_cap));
+        if (grouped.count != 1U || grouped.rows(0U) != lanes || grouped.first(0U) != 0U) return false;
+        if (mini_resident_route(MiniAppendKind::verify, 1U, false, false).packed_moe) return false;
+    }
+    return true;
+}
+
+static_assert(check_cohort_lanes());
+
+// The transaction MiniResidentDecoder::decode_slots runs (serve::run_cohort_passes, the production call): 17 lanes at
+// the HIP one-row cap 16 are passes of 9 + 8 rows; with ids = buf[0..17) and top = buf[1..18) the first pass's picks
+// would overwrite the first input of the second pass without the snapshot. A second pass that throws must leave every
+// output unchanged and retire the cohort once.
+bool check_cohort_transaction() {
+    constexpr unsigned lanes = 17U;
+    for (const bool fail_second : {false, true}) {
+        std::array<unsigned, lanes + 1U> buf{};
+        for (unsigned i = 0; i <= lanes; ++i) buf[i] = 100U + i;
+        const auto before = buf;
+        const auto ids = std::span<const unsigned>(buf).first(lanes);
+        const auto top = std::span<unsigned>(buf).subspan(1U, lanes);
+        std::vector<unsigned> snapshot, picks;
+        unsigned passes = 0U, retired = 0U;
+        std::array<bool, lanes> lane_retired{};
+        bool threw = false;
+        try {
+            strix::serve::run_cohort_passes(ids, top, strix::inkling2::mini_cohort_pass_cap(true, 16U), snapshot, picks,
+                [&](unsigned first, unsigned rows, std::span<const unsigned> pass_ids, std::span<unsigned> out) {
+                    if (passes++ == 1U && fail_second) throw std::runtime_error("pass two failed");
+                    if (first != (passes == 1U ? 0U : 9U) || rows != (passes == 1U ? 9U : 8U)) throw std::logic_error("split");
+                    for (unsigned r = 0; r < rows; ++r) out[r] = pass_ids[r] + 1000U;
+                    // A writer racing the outputs, on the successful arm only (the snapshot check): the failure arm
+                    // must leave the whole buffer untouched.
+                    if (!fail_second)
+                        for (unsigned r = 0; r < rows; ++r) buf[1U + first + r] = 7U;
+                }, [&] {
+                    ++retired;
+                    lane_retired.fill(true);  // the production retire poisons every lane of the cohort (decode_slots_served)
+                });
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        if (fail_second) {
+            // Nothing published: the whole buffer is unchanged (pass one's picks too), every lane retired once.
+            if (!threw || retired != 1U || passes != 2U || buf != before) return false;
+            for (const bool lane : lane_retired) if (!lane) return false;
+            continue;
+        }
+        if (threw || retired != 0U || passes != 2U) return false;
+        for (unsigned i = 0; i < lanes; ++i) if (buf[1U + i] != before[i] + 1000U) return false;  // inputs read unchanged
+    }
+    // Grouped decode: the whole cohort in one pass (the incumbent served schedule).
+    std::array<unsigned, 17> ids{}, top{};
+    std::vector<unsigned> snapshot, picks;
+    unsigned calls = 0U;
+    strix::serve::run_cohort_passes(ids, top, strix::inkling2::mini_cohort_pass_cap(false, 16U), snapshot, picks,
+        [&](unsigned first, unsigned rows, std::span<const unsigned>, std::span<unsigned>) {
+            calls += first == 0U && rows == 17U ? 1U : 100U;
+        }, [] {});
+    return calls == 1U;
+}
 
 struct Shape {
     static constexpr unsigned kQueryWidth = 4U;
@@ -71,6 +162,10 @@ bool check_windows() {
 }  // namespace
 
 int main() {
+    if (!check_cohort_transaction()) {
+        std::cerr << "FAIL Inkling Mini cohort pass transaction (snapshot, publish after the last pass, retire)\n";
+        return 1;
+    }
     if (!check_windows()) {
         std::cerr << "FAIL Inkling Mini verify attention row views\n";
         return 1;

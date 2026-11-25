@@ -6,12 +6,20 @@
 // rows on unaligned weights, the routed image entry, the K32 image tile and the K64 packed schedule), a projection
 // with round_bf16 and round_separate equals the plain projection followed by Bf16Round for every bit, and a projection
 // with round_bf16 alone keeps the incumbent function's bits, on inputs and weights holding quiet and signalling NaNs of
-// both signs and payloads, +-Inf and Inf x 0 next to finite neighbours; (4) the image stores, fed raw NaN sums with
-// low payload bits directly, store the incumbent / separate function's bits per policy. A payload case that no NaN
-// sum reached (a target whose operand path leaves no low payload bits) prints SKIPPED and the run does not pass.
+// both signs and payloads, +-Inf and Inf x 0 next to finite neighbours; every call reports the round store its launch
+// used (and the routed entry whether it took the image routes, the image entry its K32 / K64 launch) and a fallback
+// or a wrong store fails the case; (4) the image stores, and the function each reported store applies, fed raw NaN
+// sums with low payload bits directly, store the incumbent / separate function's bits per policy; (5) the ordinary and
+// the K32 image tile epilogue (the shared kernel body, instantiated with a test accumulator tap that substitutes raw
+// NaN / tie sums for the WMMA sums) store the function of their bound round store, so an epilogue that applies another
+// policy than its binding fails even when the host reports the right store. The routed entry also reports the image
+// launch and the weight pitch of its own dispatch, asserted for every arm. The FMA rows' case must also carry such a
+// NaN in its outputs: otherwise it prints SKIPPED and the run does not pass.
 #include "round_fold_support.hpp"
 #include "core/row_transforms.hpp"
 #include "core/short_convolution.hpp"
+
+#include <string>
 
 namespace {
 namespace core = strix::core;
@@ -140,44 +148,134 @@ const char* mode_name(Mode m) {
     return names[static_cast<unsigned>(m)];
 }
 
-// One call of `mode` on the projection p (its round flags decide the store). The direct image modes pick the store
-// policy as the template argument the shared entries take.
+// What one public call reported: the round store its launch was instantiated with, whether a routed call took the
+// image routes, and which image launch the image entry made.
+struct Observed {
+    core::RoundStore store{core::RoundStore::incumbent};
+    bool image_used{false};
+    core::ImageLaunch launched{core::ImageLaunch::k32_image};
+    std::size_t pitch{0U};  // routed entry: weight pitch (elements) of its last image launch
+};
+
+// One call of `mode` on the projection p (its round flags decide the store). Every mode goes through the public entry
+// and records what that call reports.
 void run_projection(Mode mode, const float* dx, unsigned width, unsigned rows, const core::Bf16RowProjection& p,
-                    unsigned outputs, std::uint16_t* image, std::span<std::uint16_t> image_span) {
-    const auto entry = [&](auto policy) {
-        constexpr core::RoundStore round = decltype(policy)::value;
-        ok(core::fma_rows::enqueue_bf16_operand_image(dx, width, rows, image, nullptr), "operand image");
-        core::f16_tile_gemm::Bf16ProjectionGroup<core::fma_rows::kGroupMax> group{};
-        group.append({p.weights, p.outputs, p.output, p.round_bf16});
-        if (mode == Mode::image_k32) {
-            core::f16_tile_gemm::gemm_bf16_projections_image<round>(image, rows, width, group, nullptr);
-            ok(hipGetLastError(), "image k32");
-        } else {
-            ok(core::f16_tile_gemm::gemm_bf16_projections_image_packed<round>(image, rows, width, group, nullptr),
-               "image packed");
-        }
-    };
+                    unsigned outputs, std::uint16_t* image, std::span<std::uint16_t> image_span, Observed& seen) {
     switch (mode) {
     case Mode::wmma:
     case Mode::fma:
-        ok(core::fma_rows::enqueue_bf16_rows(dx, width, rows, {&p, 1U}, outputs, nullptr), "rows");
+        ok(core::fma_rows::enqueue_bf16_rows(dx, width, rows, {&p, 1U}, outputs, nullptr, &seen.store), "rows");
         break;
     case Mode::routed:
-        ok(core::fma_rows::enqueue_bf16_rows_routed(dx, width, rows, {&p, 1U}, outputs, image_span, nullptr), "routed");
+        ok(core::fma_rows::enqueue_bf16_rows_routed(dx, width, rows, {&p, 1U}, outputs, image_span, nullptr,
+                                                    &seen.image_used, &seen.store, &seen.launched, &seen.pitch),
+           "routed");
         break;
     default:
-        core::fma_rows::with_round_store(p, entry);
+        ok(core::fma_rows::enqueue_bf16_operand_image(dx, width, rows, image, nullptr), "operand image");
+        ok(core::fma_rows::enqueue_bf16_image_rows(image, width, rows, {&p, 1U}, outputs, nullptr, &seen.launched,
+                                                   &seen.store),
+           "image rows");
     }
 }
 
-// One NaN case through `mode`: with round_bf16 + round_separate the store equals the separate Bf16Round pass over the
-// unrounded sums; with round_bf16 alone it equals the incumbent function on them. The call's launch is asserted
-// (path for the rows entries, the route the plan takes for the routed entry, the schedule's admission for the direct
-// image entries). A case in which no NaN sum with low payload bits reached the store is never PASS: SKIPPED where
-// the payload is required (the run then does not pass), EQUAL-ONLY where the operand path cannot carry it.
-bool store_case(Mode mode, unsigned width, unsigned outputs, unsigned rows, bool require_payload, std::mt19937& rng,
+// Raw sums substituted for the WMMA sums of the real tile epilogue: payload bits below BF16 width of both signs, ties,
+// canonical NaNs, Inf and signed zero. The two round functions differ on the NaN payloads by construction.
+constexpr unsigned kTapCount = 13U;
+constexpr std::uint32_t kHostTapPatterns[kTapCount] = {0x7FC12345U, 0xFFC12345U, 0x7F800001U, 0xFFBFFFFFU, 0x7FFFFFFFU,
+                                                       0x7FC00001U, 0x7FC00000U, 0x3F808000U, 0x3F818000U, 0x7F7F8000U,
+                                                       0x7F800000U, 0x80000000U, 0x3F80C000U};
+__device__ const std::uint32_t kTapPatterns[kTapCount] = {0x7FC12345U, 0xFFC12345U, 0x7F800001U, 0xFFBFFFFFU,
+                                                          0x7FFFFFFFU, 0x7FC00001U, 0x7FC00000U, 0x3F808000U,
+                                                          0x3F818000U, 0x7F7F8000U, 0x7F800000U, 0x80000000U,
+                                                          0x3F80C000U};
+constexpr unsigned tap_index(unsigned r, unsigned col) { return (r * 5U + col) % kTapCount; }
+
+struct PatternTap {
+    __device__ static __forceinline__ float apply(float, unsigned r, unsigned col) {
+        return __builtin_bit_cast(float, kTapPatterns[tap_index(r, col)]);
+    }
+};
+
+// The shared projection epilogue (core of f16_tile_gemm_core.inc) with the tap, under the round store R bound at
+// compile time like bf16_projection_kernel / bf16_projection_image_kernel bind it.
+template <bool kA16, core::RoundStore R>
+__global__ __launch_bounds__(core::f16_tile_gemm::kThreads) void epilogue_tap_kernel(
+    const float* a, const std::uint16_t* a16, unsigned rows, unsigned K,
+    core::f16_tile_gemm::Bf16ProjectionGroup<1> group) {
+    namespace tile = core::f16_tile_gemm;
+    const tile::Args p{kA16 ? nullptr : a, kA16 ? a16 : nullptr, K, 0U, nullptr, K, 0U, nullptr, 0U, 0U, rows, K, 0U, 1U};
+    __shared__ tile::Storage lds;
+    tile::core<false, 1U, false, kA16, R, PatternTap>(p, lds, group);
+}
+
+// One launch of the epilogue: outputs hold the stored function of the pattern their tap substituted.
+template <bool kA16, core::RoundStore R>
+bool epilogue_launch(bool round_bf16, const char* what) {
+    constexpr unsigned rows = 40U, K = 64U, outputs = 128U;
+    float* a = upload(std::vector<float>(std::size_t{rows} * K));
+    std::uint16_t* a16 = upload(std::vector<std::uint16_t>(std::size_t{rows} * K + 8U));
+    std::uint16_t* w = upload(std::vector<std::uint16_t>(std::size_t{outputs} * K + 8U));
+    float* y = upload(std::vector<float>(std::size_t{rows} * outputs));
+    core::f16_tile_gemm::Bf16ProjectionGroup<1> group{};
+    group.append({w, outputs, y, round_bf16});
+    const dim3 grid((group.first_panel[group.count] + 1U) / 2U,
+                    (rows + core::f16_tile_gemm::kBM - 1U) / core::f16_tile_gemm::kBM);
+    epilogue_tap_kernel<kA16, R><<<grid, core::f16_tile_gemm::kThreads>>>(a, a16, rows, K, group);
+    ok(hipGetLastError(), "epilogue launch");
+    ok(hipDeviceSynchronize(), "sync");
+    const auto got = download(y, std::size_t{rows} * outputs);
+    std::size_t bad = 0, payload_seen = 0;
+    for (unsigned r = 0; r < rows; ++r)
+        for (unsigned c = 0; c < outputs; ++c) {
+            const std::uint32_t pat = kHostTapPatterns[tap_index(r, c)];
+            const float v = sf::u2f(pat);
+            const std::uint32_t want =
+                !round_bf16 ? pat : R == core::RoundStore::separate ? separate_bits(v) : incumbent_bits(v);
+            const std::uint32_t have = sf::f2u(got[std::size_t{r} * outputs + c]);
+            bad += have != want;
+            payload_seen += pat == 0x7FC12345U && have == want;
+        }
+    const bool pass = bad == 0U && payload_seen != 0U;
+    std::printf("%s round-fold-hip epilogue-binding tile=%s store=%s round_bf16=%d mismatches=%zu "
+                "discriminating_checked=%zu\n", pass ? "PASS" : "FAIL", what,
+                R == core::RoundStore::separate ? "separate" : "incumbent", round_bf16 ? 1 : 0, bad, payload_seen);
+    (void)hipFree(a);
+    (void)hipFree(a16);
+    (void)hipFree(w);
+    (void)hipFree(y);
+    return pass;
+}
+
+// The ordinary (FP32 rows) and the K32 image epilogue under both bound stores, rounding on and off.
+bool epilogue_binding_case() {
+    bool pass = true;
+    for (const bool round : {true, false}) {
+        pass = epilogue_launch<false, core::RoundStore::separate>(round, "ordinary") && pass;
+        pass = epilogue_launch<false, core::RoundStore::incumbent>(round, "ordinary") && pass;
+        pass = epilogue_launch<true, core::RoundStore::separate>(round, "k32-image") && pass;
+        pass = epilogue_launch<true, core::RoundStore::incumbent>(round, "k32-image") && pass;
+    }
+    return pass;
+}
+
+// One NaN case through `mode` (weights pitched at `pitch` elements when pitch > width): with round_bf16 +
+// round_separate the store equals the separate Bf16Round pass over the unrounded sums; with round_bf16 alone it equals
+// the incumbent function on them. Each arm's call must report its launch: the round store it was instantiated with
+// (epilogue_binding_case runs the discriminating payloads through the real epilogue), for the routed entry that it
+// took the image routes with the K64 packed launch at the case's weight pitch (its own dispatch reports both; a
+// fallback to the FP32 rows or a K32 tile fails the case), for the image entry the K32 / K64 launch the case names.
+// The FMA rows (their sums keep the operand payload) must also show the payload in the outputs.
+bool store_case(Mode mode, unsigned width, unsigned outputs, unsigned rows, unsigned pitch, std::mt19937& rng,
                 bool& skipped) {
-    const auto o = make_operands(width, outputs, rows, true, rng);
+    auto o = make_operands(width, outputs, rows, true, rng);
+    const unsigned ld = pitch > width ? pitch : width;
+    if (ld != width) {  // re-lay the weights [outputs][ld] with zero padding
+        std::vector<std::uint16_t> wide(std::size_t{outputs} * ld + 1U, 0U);
+        for (unsigned n = 0; n < outputs; ++n)
+            std::copy_n(o.wall.begin() + 1 + std::ptrdiff_t{n} * width, width, wide.begin() + 1 + std::ptrdiff_t{n} * ld);
+        o.wall = wide;
+    }
     const std::vector<std::uint16_t> body(o.wall.begin() + 1, o.wall.end());
     float* dx = upload(o.x);
     std::uint16_t* dwall = upload(mode == Mode::fma ? o.wall : body);
@@ -190,10 +288,10 @@ bool store_case(Mode mode, unsigned width, unsigned outputs, unsigned rows, bool
     std::uint16_t* image = nullptr;
     ok(hipMalloc(&image, std::size_t{rows} * width * sizeof(std::uint16_t) + 16U), "image");
     const std::span<std::uint16_t> image_span(image, std::size_t{rows} * width);
-    const core::Bf16RowProjection raw{dw, outputs, yraw};
-    core::Bf16RowProjection separate{dw, outputs, ysep}, incumbent{dw, outputs, yinc};
+    core::Bf16RowProjection raw{dw, outputs, yraw}, separate{dw, outputs, ysep}, incumbent{dw, outputs, yinc};
     separate.round_bf16 = separate.round_separate = true;
     incumbent.round_bf16 = true;
+    if (ld != width) raw.row_bytes = separate.row_bytes = incumbent.row_bytes = std::size_t{ld} * sizeof(std::uint16_t);
 
     const auto path = core::fma_rows::bf16_rows_path(width, rows, {&separate, 1U}, outputs);
     bool launch_ok = true;
@@ -207,39 +305,49 @@ bool store_case(Mode mode, unsigned width, unsigned outputs, unsigned rows, bool
         launch = "fma-rows";
         launch_ok = path == core::fma_rows::Bf16RowsPath::fma;
         break;
-    case Mode::routed: {
-        core::ImageRoute routes[core::fma_rows::kImageRouteMaxProjections]{};
-        const bool planned = core::fma_rows::image_routes_device_qualified() &&
-            core::fma_rows::detail::plan_bf16_image_call(width, rows, {&separate, 1U}, outputs, image_span, routes);
-        const auto route = planned ? routes[0] : core::ImageRoute::fp32_rows;
-        launch = route == core::ImageRoute::packed ? "routed->packed-image"
-                 : route == core::ImageRoute::image ? "routed->k32-image" : "routed->fp32-rows";
-        // The case tests an image store only if the call ran one; a whole-tile K64 call on the measured class and
-        // heights takes the packed schedule.
-        launch_ok = route == core::ImageRoute::packed;
+    case Mode::routed:
+        launch = "routed";  // the routed call's own report (image_used) is checked below
         break;
-    }
     case Mode::image_k32:
         launch = "k32-image-tile";
         launch_ok = core::fma_rows::admits_bf16_image_projections(width, rows, {&separate, 1U}, outputs);
         break;
-    case Mode::image_packed: {
+    case Mode::image_packed:
         launch = "k64-packed-image";
-        core::f16_tile_gemm::Bf16ProjectionGroup<core::fma_rows::kGroupMax> group{};
-        group.append({dw, outputs, yref, true});
-        launch_ok = core::f16_tile_gemm::admits_packed_image_projections(width, group);
+        launch_ok = core::fma_rows::admits_bf16_image_projections(width, rows, {&separate, 1U}, outputs);
         break;
     }
-    }
     if (!launch_ok) {
-        std::printf("FAIL round-fold-hip store mode=%s width=%u outputs=%u rows=%u: expected launch not taken (%s)\n",
+        std::printf("FAIL round-fold-hip store mode=%s width=%u outputs=%u rows=%u: expected launch not planned (%s)\n",
                     mode_name(mode), width, outputs, rows, launch);
         return false;
     }
 
-    run_projection(mode, dx, width, rows, raw, outputs, image, image_span);
-    run_projection(mode, dx, width, rows, separate, outputs, image, image_span);
-    run_projection(mode, dx, width, rows, incumbent, outputs, image, image_span);
+    Observed raw_seen, sep_seen, inc_seen;
+    run_projection(mode, dx, width, rows, raw, outputs, image, image_span, raw_seen);
+    run_projection(mode, dx, width, rows, separate, outputs, image, image_span, sep_seen);
+    run_projection(mode, dx, width, rows, incumbent, outputs, image, image_span, inc_seen);
+    // Dispatch as the calls reported it.
+    bool dispatch_ok = sep_seen.store == core::RoundStore::separate && inc_seen.store == core::RoundStore::incumbent;
+    std::string reported;
+    if (mode == Mode::routed) {
+        dispatch_ok = dispatch_ok && raw_seen.image_used && sep_seen.image_used && inc_seen.image_used;
+        reported = std::string("image_used=") + (raw_seen.image_used ? "1" : "0") + (sep_seen.image_used ? "1" : "0") +
+                   (inc_seen.image_used ? "1" : "0");
+        // The routed dispatch's own report: the K64 packed launch at the weight pitch, for every arm.
+        const auto packed = [&](const Observed& o) {
+            return o.launched == core::ImageLaunch::k64_packed && o.pitch == ld;
+        };
+        dispatch_ok = dispatch_ok && packed(raw_seen) && packed(sep_seen) && packed(inc_seen);
+        reported += std::string(" routed=") + (packed(sep_seen) ? "k64-packed" : "other") + "@pitch" +
+                    std::to_string(sep_seen.pitch);
+    } else if (mode == Mode::image_k32 || mode == Mode::image_packed) {
+        const auto want = mode == Mode::image_packed ? core::ImageLaunch::k64_packed : core::ImageLaunch::k32_image;
+        dispatch_ok = dispatch_ok && sep_seen.launched == want && inc_seen.launched == want && raw_seen.launched == want;
+        reported = sep_seen.launched == core::ImageLaunch::k64_packed ? "launched=k64-packed" : "launched=k32-image";
+    } else {
+        reported = "launched=tile/rows";
+    }
     namespace rt = core::row_transforms;
     ok(hipMemcpy(yref, yraw, zeros.size() * sizeof(float), hipMemcpyDeviceToDevice), "copy");
     ok(rt::elements(zeros.size(), rt::Bf16Round{yref}, nullptr), "round projection");
@@ -253,14 +361,17 @@ bool store_case(Mode mode, unsigned width, unsigned outputs, unsigned rows, bool
         nan_outputs += is_nan_bits(sf::f2u(a[k]));
     }
     const std::size_t payload = discriminating(a);
-    const bool no_payload = require_payload && payload == 0U;
+    const bool no_payload = mode == Mode::fma && payload == 0U;
     if (no_payload) skipped = true;
-    const bool pass = bad_sep == 0U && bad_inc == 0U && nan_outputs != 0U;
-    std::printf("%s round-fold-hip store mode=%s launch=%s width=%u outputs=%u rows=%u nan_outputs=%zu "
-                "separate_mismatches=%zu incumbent_mismatches=%zu raw_low_payload_nans=%zu%s\n",
-                !pass ? "FAIL" : payload != 0U ? "PASS" : require_payload ? "SKIPPED" : "EQUAL-ONLY", mode_name(mode), launch,
-                width, outputs, rows, nan_outputs, bad_sep, bad_inc, payload,
-                payload == 0U ? " (no low-payload NaN sum reached this store: its payload bits are not tested here)" : "");
+    const bool pass = bad_sep == 0U && bad_inc == 0U && nan_outputs != 0U && dispatch_ok;
+    std::printf("%s round-fold-hip store mode=%s launch=%s %s width=%u pitch=%u outputs=%u rows=%u nan_outputs=%zu "
+                "separate_mismatches=%zu incumbent_mismatches=%zu raw_low_payload_nans=%zu reported_store=%s/%s "
+                "dispatch=%d%s\n",
+                !pass ? "FAIL" : no_payload ? "SKIPPED" : "PASS", mode_name(mode), launch, reported.c_str(), width, ld,
+                outputs, rows, nan_outputs, bad_sep, bad_inc, payload,
+                sep_seen.store == core::RoundStore::separate ? "separate" : "incumbent",
+                inc_seen.store == core::RoundStore::separate ? "separate" : "incumbent", dispatch_ok ? 1 : 0,
+                payload == 0U ? " (no low-payload NaN in the outputs: the epilogue binding case tests the payload)" : "");
     (void)hipFree(dx);
     (void)hipFree(dwall);
     (void)hipFree(yraw);
@@ -315,21 +426,27 @@ int main() {
     for (const unsigned rows : {1U, 4U, 16U}) all = projection_case(2304, 2304, rows, rng) && all;
     all = policy_refusals() && all;
     all = injected_store_case() && all;
-    // Every store at the measured prefill heights. The FMA rows keep the operand's payload bits in their sums: that
-    // case must carry low-payload NaNs. The tile and image stores read BF16 operand bits (no payload below BF16 width
-    // reaches their sums on every target), so their line may say EQUAL-ONLY while the injected-store case above
-    // tests the image stores' payload bits; a SKIPPED fma-rows line fails the run.
+    all = epilogue_binding_case() && all;
+    // Every store at the measured prefill heights. Each call reports the round store and the launch it made (the routed
+    // entry: that it took the image routes); the epilogue binding case puts the raw payload patterns through the real epilogues. The FMA rows keep
+    // the operand's payload bits in their sums, so that case must also carry low-payload NaNs in its outputs (a SKIPPED
+    // line fails the run); the tile and image sums hold BF16-width NaNs only, so their payload is tested through the
+    // reported store.
     for (const unsigned rows : {4096U, 4111U}) {
-        all = store_case(Mode::wmma, 2304, 2304, rows, false, rng, skipped) && all;
-        all = store_case(Mode::fma, 2304, 2304, rows, true, rng, skipped) && all;
-        all = store_case(Mode::routed, 2304, 2304, rows, false, rng, skipped) && all;
-        all = store_case(Mode::image_k32, 2304, 2304, rows, false, rng, skipped) && all;
-        all = store_case(Mode::image_packed, 2304, 2304, rows, false, rng, skipped) && all;
+        all = store_case(Mode::wmma, 2304, 2304, rows, 0U, rng, skipped) && all;
+        all = store_case(Mode::fma, 2304, 2304, rows, 0U, rng, skipped) && all;
+        all = store_case(Mode::routed, 2304, 2304, rows, 0U, rng, skipped) && all;
+        all = store_case(Mode::image_k32, 2272, 2304, rows, 0U, rng, skipped) && all;
+        all = store_case(Mode::image_packed, 2304, 2304, rows, 0U, rng, skipped) && all;
     }
+    // The pitched store policy: weights K = 3,072 at a 3,200-element pitch, 2,304 outputs (the pitched WMMA tile and the
+    // pitched packed route).
+    all = store_case(Mode::wmma, 3072, 2304, 4096U, 3200U, rng, skipped) && all;
+    all = store_case(Mode::routed, 3072, 2304, 4096U, 3200U, rng, skipped) && all;
     // A K32-aligned width that is not a multiple of 64 and a short height: the K32 image tile.
-    all = store_case(Mode::wmma, 2272, 384, 300U, false, rng, skipped) && all;
-    all = store_case(Mode::image_k32, 2272, 384, 300U, false, rng, skipped) && all;
-    all = store_case(Mode::fma, 2272, 384, 300U, true, rng, skipped) && all;
+    all = store_case(Mode::wmma, 2272, 384, 300U, 0U, rng, skipped) && all;
+    all = store_case(Mode::image_k32, 2272, 384, 300U, 0U, rng, skipped) && all;
+    all = store_case(Mode::fma, 2272, 384, 300U, 0U, rng, skipped) && all;
     std::puts(!all ? "round_fold_hip: FAIL"
                    : skipped ? "round_fold_hip: SKIPPED (a required payload case had no low-payload NaN sum)"
                              : "round_fold_hip: PASS");

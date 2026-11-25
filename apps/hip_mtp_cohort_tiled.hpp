@@ -52,7 +52,7 @@ inline MtpDecodeBatchServe make_cohort_tiled_run(const Options& options, const M
             if (mtp_sampling(m)) {
                 auto policy = mtp_sampling_policy(m);
                 policy.seed += q;
-                record.sampler = request.sampler = std::make_shared<TokenSampler>(policy);
+                record.sampler = request.sampler = make_mtp_sampler(policy, m);
             }
             request.on_tokens = [&record](std::span<const std::uint32_t> tokens) {
                 record.generated.insert(record.generated.end(), tokens.begin(), tokens.end());
