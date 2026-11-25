@@ -14,7 +14,12 @@
 
 namespace strix::inkling2::test {
 
-inline void verify_rows(const char* checkpoint, weight::FormatId storage, bool packed) {
+// level / round_fold: the verify rows lever (STRIX_INK_VERIFY_ROWS) and the prepared-attention round fold, set on the
+// decoder right after construction as configure_mini_decoder does. The reference is the decoder's own per-row decode
+// (a one-row decode takes the same route at every level), so level 1 with the fold checks that a partial commit
+// restores from the convolution tape the same BF16-rounded K/V history the replayed rows would leave.
+inline void verify_rows(const char* checkpoint, weight::FormatId storage, bool packed, unsigned level = 0U,
+                        bool round_fold = false) {
     // Cross a local KV ring wrap and global attention key tile boundaries.
     constexpr unsigned prefix_rows = 2047U;
     constexpr unsigned prefill_chunk = 128U;
@@ -28,6 +33,10 @@ inline void verify_rows(const char* checkpoint, weight::FormatId storage, bool p
     const auto ids = std::span(tokens);
     MiniResidentDecoder decoder(checkpoint, static_cast<unsigned>(ids.size()), prefill_chunk,
                                  packed, MiniResidentBackend::default_step_graphs, storage, max_width);
+    const bool folded = round_fold && decoder.set_prepared_round_fold(true);
+    const auto admitted = decoder.set_verify_rows(level);
+    std::cout << "INFO verify rows level " << admitted << " (" << level << " selected), round fold "
+              << (folded ? "on" : round_fold ? "declined" : "off") << '\n';
     const auto prompt = ids.first(prefix_rows);
     (void)decoder.prefill(prompt);
 
@@ -44,7 +53,8 @@ inline void verify_rows(const char* checkpoint, weight::FormatId storage, bool p
     std::vector<float> verified(std::size_t{max_width} * kOutputVocabulary);
     unsigned cursor = 0U;
     const auto storage_name = storage == weight::kQ8WeightStorage ? "q8_0" : "bf16";
-    const auto moe = packed ? "packed" : "grouped";
+    const auto moe = std::string(packed ? "packed" : "grouped") + (admitted != 0U ? " verify-rows" : "") +
+                     (folded ? " round-fold" : "");
     for (unsigned width = 2U; width <= max_width; ++width) {
         const auto window = ids.subspan(prefix_rows + cursor, width);
         const auto scores = std::span(verified).first(std::size_t{width} * kOutputVocabulary);
@@ -77,16 +87,21 @@ inline void verify_rows(const char* checkpoint, weight::FormatId storage, bool p
 int main(int argc, char** argv) {
     using namespace strix;
     try {
-        if (argc < 2) throw std::invalid_argument("expected MODEL.safetensors [--qualify-q8] [--grouped-decode]");
+        if (argc < 2)
+            throw std::invalid_argument(
+                "expected MODEL.safetensors [--qualify-q8] [--grouped-decode] [--verify-rows] [--round-fold]");
         auto storage = weight::kBf16WeightStorage;
-        bool packed = true;
+        bool packed = true, round_fold = false;
+        unsigned level = 0U;
         for (int i = 2; i < argc; ++i) {
             const std::string_view option{argv[i]};
             if (option == "--qualify-q8") storage = weight::kQ8WeightStorage;
             else if (option == "--grouped-decode") packed = false;
+            else if (option == "--verify-rows") level = 1U;
+            else if (option == "--round-fold") round_fold = true;
             else throw std::invalid_argument("unknown option: " + std::string(option));
         }
-        inkling2::test::verify_rows(argv[1], storage, packed);
+        inkling2::test::verify_rows(argv[1], storage, packed, level, round_fold);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL Inkling Mini verify rows: " << error.what() << '\n';
