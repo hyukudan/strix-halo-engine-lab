@@ -330,13 +330,26 @@ __global__ __launch_bounds__(256) void requantise_kernel(Src src, unsigned in, u
     const unsigned col = static_cast<unsigned>(id % n), b = static_cast<unsigned>(id / n);
     step[step_index(b, col, n)] = src.requantise(col, b, n, dst);
 }
-struct G64Source {
+struct G64Source {  // weight rule amax (contract v1): the incumbent kernel of every binder
     const std::uint8_t* pack;
     const std::uint16_t* scales;
     unsigned in;
-    rot::WeightRule rule = rot::WeightRule::amax;
     __device__ __forceinline__ float requantise(unsigned col, unsigned b, unsigned n, std::uint8_t* dst) const {
-        return rot::requantise_codes(pack, scales, in, n, col, b, dst, rule);
+        return rot::requantise_codes(pack, scales, in, n, col, b, dst);
+    }
+};
+// An explicit weight rule (enqueue_requantise with a rule other than amax): the value function of
+// iu4a4_rot::requantise_codes, its own call of requantise_values (requantise_codes keeps its one incumbent caller, so
+// G64Source's kernel inlines it as before).
+struct G64RuleSource : G64Source {
+    rot::WeightRule rule;
+    __device__ __forceinline__ float requantise(unsigned col, unsigned b, unsigned n, std::uint8_t* dst) const {
+        const auto value = [&](unsigned i) {
+            const unsigned k = b * rot::kBlock + i;
+            const float s = onfly::f16_bits_to_f32(scales[std::size_t(col) * (in / 64U) + k / 64U]);
+            return static_cast<float>(rot::pack_code(pack, k, col, n)) * s;
+        };
+        return rot::requantise_values(value, b, col, n, dst, rule);
     }
 };
 
@@ -442,9 +455,11 @@ __global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, 
     // Staged stores: column blocks run fastest (grid x): CTAs in flight share the same x rows and write neighbouring
     // 512 B windows of those rows. Rows fastest made every CTA in flight write the same window of different rows, which
     // with a row pitch of a multiple of 4 KiB lands on the same memory channels (2x slower stores). Other stores keep
-    // the incumbent order (row blocks fastest, grid x).
-    const unsigned cta_n = kStagedStore<Store> ? blockIdx.x : blockIdx.y, cta_m = kStagedStore<Store> ? blockIdx.y : blockIdx.x;
-    const unsigned nt0 = cta_n * kCtaTilesN + wn * kTw, mt0 = cta_m * kCtaTilesM + wm * kTm;
+    // the incumbent order (row blocks fastest, grid x). The CTA's column block is (kStagedStore<Store> ? blockIdx.x :
+    // blockIdx.y), its row block the other one, written out at each use: the constant condition folds in the front
+    // end, so the incumbent instantiation is the same IR as before the opt-in existed.
+    const unsigned nt0 = (kStagedStore<Store> ? blockIdx.x : blockIdx.y) * kCtaTilesN + wn * kTw,
+                   mt0 = (kStagedStore<Store> ? blockIdx.y : blockIdx.x) * kCtaTilesM + wm * kTm;
     const bool live = mt0 < mtiles;  // a wave without a live x tile still copies and meets the barriers
     unsigned nt[kTw], mt[kTm];
 #pragma unroll
@@ -453,14 +468,16 @@ __global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, 
     for (unsigned i = 0; i < kTm; ++i) mt[i] = mt0 + i < mtiles ? mt0 + i : mtiles - 1U;
     // Copy role: piece q of a block = unit 2 q + (tid >> 7); waves 0-1 / 4-5 copy W, 2-3 / 6-7 copy x; 16 B at tid % 64.
     const unsigned side = (tid >> 6U) & 1U, piece = tid & 63U, cu = tid >> 7U;
-    const unsigned stiles = side == 0U ? ntiles : mtiles, cbase = side == 0U ? cta_n * kCtaTilesN : cta_m * kCtaTilesM;
+    const unsigned stiles = side == 0U ? ntiles : mtiles, cbase = side == 0U ? (kStagedStore<Store> ? blockIdx.x : blockIdx.y) * kCtaTilesN
+                                                                           : (kStagedStore<Store> ? blockIdx.y : blockIdx.x) * kCtaTilesM;
     const unsigned ctile = cbase + (piece >> 3U) < stiles ? cbase + (piece >> 3U) : stiles - 1U;
     const std::size_t ustride = std::size_t(stiles) * 8U;  // one K16 unit of this side, in 16 B pieces
     const GI4* src = (side == 0U ? (const GI4*)w.codes : (const GI4*)a.codes) + std::size_t(cu) * ustride + std::size_t(ctile) * 8U + (piece & 7U);
     const unsigned dst = cu * kUnitBytes + side * 1024U + piece * 16U;
     // Side copy (waves 0-1): piece p < 32: steps of W tile p / 4 (16 floats = 4 pieces); p >= 32: u of x tile (p - 32) / 4.
     const bool scopy = tid < 64U;
-    const unsigned sq = tid & 31U, sstile = (tid < 32U ? cta_n * kCtaTilesN : cta_m * kCtaTilesM) + (sq >> 2U);
+    const unsigned sq = tid & 31U, sstile = (tid < 32U ? (kStagedStore<Store> ? blockIdx.x : blockIdx.y) * kCtaTilesN
+                                                       : (kStagedStore<Store> ? blockIdx.y : blockIdx.x) * kCtaTilesM) + (sq >> 2U);
     const unsigned slim = tid < 32U ? ntiles : mtiles, stc = sstile < slim ? sstile : slim - 1U;
     const std::size_t sstride = tid < 32U ? std::size_t(ntiles) * 4U : std::size_t(mp) / 4U;  // one block, in 16 B
     const GI4* ssrc = (tid < 32U ? (const GI4*)w.step : (const GI4*)a.u) + std::size_t(stc) * 4U + (sq & 3U);
@@ -815,7 +832,8 @@ inline void enqueue_grouped_gemm(const Src& src, unsigned tiles, unsigned max_ti
 }
 inline void enqueue_requantise(const std::uint8_t* pack, const std::uint16_t* scales, unsigned in, unsigned n, std::uint8_t* dst, float* step,
                                hipStream_t s, rot::WeightRule rule = rot::WeightRule::amax) {
-    enqueue_requantise_source(detail::G64Source{pack, scales, in, rule}, in, n, dst, step, s);
+    if (rule == rot::WeightRule::amax) enqueue_requantise_source(detail::G64Source{pack, scales, in}, in, n, dst, step, s);
+    else enqueue_requantise_source(detail::G64RuleSource{{pack, scales, in}, rule}, in, n, dst, step, s);
 }
 template <class Cols, class Store = f16_dense_tall::RawStore>
 inline void enqueue_gemm(const Weights& w, const Act& a, Cols cols, hipStream_t s, Store store = {}) {

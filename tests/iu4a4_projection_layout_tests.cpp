@@ -64,8 +64,8 @@ int main() {
         bool round_bf16;
         std::size_t row_bytes;
         bool round_separate;
-        constexpr P(const void* w, unsigned o, bool r, std::size_t pitch = 0U, bool separate = false)
-            : weights(w), outputs(o), round_bf16(r), row_bytes(pitch), round_separate(separate) {}
+        constexpr P(const void* weights_, unsigned outputs_, bool round_, std::size_t pitch_ = 0U, bool separate_ = false)
+            : weights(weights_), outputs(outputs_), round_bf16(round_), row_bytes(pitch_), round_separate(separate_) {}
     };
     static const int q = 0, rel = 0, sink = 0, gate = 0, k = 0, v = 0, out = 0, other = 0;
     const std::array<ip::SegmentKey, 6> keys{{{&q, 0U, 0U}, {&rel, 0U, 1U}, {&gate, 0U, 2U}, {&k, 0U, 3U}, {&v, 0U, 4U}, {&out, 1U, 0U}}};

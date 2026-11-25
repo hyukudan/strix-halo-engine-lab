@@ -51,7 +51,6 @@ template <packed::MatrixFormat Format>
 struct ExpertSource {
     packed::PackedMatrix matrix;
     unsigned pair_rows{};
-    rot::WeightRule rule = rot::WeightRule::amax;  // weight image rule (contract v1 / v2)
     STRIX_GI4_HD float value(std::size_t row, unsigned k) const {
         const packed::PackedOperand<Format> op{matrix};
         const unsigned k0 = k & ~15U, j = k - k0;
@@ -64,6 +63,17 @@ struct ExpertSource {
     STRIX_GI4_HD float requantise(unsigned col, unsigned b, unsigned n, std::uint8_t* dst) const {
         const std::size_t row = pair_rows != 0U ? rot::paired_column(col, pair_rows) : col;
         const auto v = [&](unsigned i) { return value(row, b * rot::kBlock + i); };
+        return rot::requantise_values(v, b, col, n, dst);
+    }
+};
+// The same source under an explicit weight image rule (contract v1 / v2; enqueue_requantise_expert with a rule other
+// than amax). ExpertSource stays the incumbent amax kernel of every binder.
+template <packed::MatrixFormat Format>
+struct ExpertRuleSource : ExpertSource<Format> {
+    rot::WeightRule rule = rot::WeightRule::amax;
+    STRIX_GI4_HD float requantise(unsigned col, unsigned b, unsigned n, std::uint8_t* dst) const {
+        const std::size_t row = this->pair_rows != 0U ? rot::paired_column(col, this->pair_rows) : col;
+        const auto v = [&](unsigned i) { return this->value(row, b * rot::kBlock + i); };
         return rot::requantise_values(v, b, col, n, dst, rule);
     }
 };
