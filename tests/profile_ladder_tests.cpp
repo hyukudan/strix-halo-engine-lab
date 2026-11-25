@@ -764,17 +764,6 @@ void hy4_new_quality_rows() {
     p::Inputs in;
     in.profile = p::Name::fast;
     in.env = none;
-    // The width change stays inside the incumbent's gated arithmetic and is inherited by TURBO.
-    const h::Regime measured{h::Device::gfx1151, h::Topology::one_node, 8192, h::single_greedy_8k};
-    for (const auto tier : {p::Name::fast, p::Name::turbo}) {
-        in.profile = tier;
-        const auto resolution = h::resolve(measured, in);
-        const auto* rows = resolution->find("prompt_rows");
-        require(rows->value == "2048" && rows->status == p::Status::set &&
-                    rows->ladder.find(h::single_greedy_8k_receipt) != std::string::npos,
-                "Hy4 picks the recorded 2048 schedule inside the gated window class");
-    }
-    in.profile = p::Name::fast;
     const h::Regime beyond{h::Device::gfx1151, h::Topology::one_node, 40000, "fixture-exec"};
     const h::Regime inside{h::Device::gfx1151, h::Topology::one_node, 32568, "fixture-exec"};
     require(h::resolve(inside, in)->find("prompt_rows")->value == "4096", "frozen grant: the qualified band still runs");
@@ -815,6 +804,92 @@ void hy4_new_quality_rows() {
     rows.push_back({h::Device::gfx1151, h::Topology::pair, {"prompt_rows", "4096", 0, 65536, "fixture wider pair gate"}});
     require(h::resolve(other, in, rows, h::incumbent_grants, timings)->find("prompt_rows")->value == "0",
             "pair topology declines the one-node measured row");
+}
+
+void hy4_measured_window_schedule() {
+    namespace h = strix::hy4::profile;
+    p::Inputs in;
+    in.env = [](const char*) -> const char* { return nullptr; };
+    in.profile = p::Name::fast;
+    const h::Regime legacy{h::Device::gfx1151, h::Topology::one_node, 8192, h::single_greedy_8k};
+    const auto baseline = h::resolve(legacy, in);
+    for (const auto& cell : baseline->ladder)
+        require(!cell.incumbent || cell.lever != "prompt_rows" || cell.value == "4096",
+                "Hy4 cannot use an incumbent grant to admit a different window width");
+
+    // Synthetic timing evidence, with the key fixed independently of the effective-arm builder.
+    const h::RankExecution rank{"gfx1151|Fixture A|cu40|mem137438953472|clk2900000|hip70000000|drv70000000",
+                                "fixture-q4_k_m", 8192, 8384, 64, 2};
+    const auto execution = h::rank_execution(rank, in);
+    const std::string reference = "ladder-arm/v4;" + execution +
+        ";prompt_rows=4096{v1},head_q8=1{v1},pf_mha=1{v1},decode_iu4=off{v1},pf_a8_producer=1{v1},"
+        "q8_store_epilogue=1{v1},pf_store_epilogue=1{v1},prompt_window_schedule=4096{v1};"
+        "candidate=prompt_window_schedule=2048{v1};tier=fast";
+    h::Measured receipt{h::Topology::one_node,
+        {"prompt_window_schedule", "2048", p::Name::fast, p::Phase::prefill, "gfx1151", 8192, 8192,
+         1, 1, 1.05, 0.02, "fixture warm timing over FAST 4096"}};
+    receipt.timing.over = reference;
+    auto regime = legacy;
+    regime.execution = execution;
+    const auto resolve = [&](const h::Regime& run) {
+        return h::resolve(run, in, h::qualified, h::incumbent_grants, std::span(&receipt, 1));
+    };
+    require(h::resolve(regime, in)->find("prompt_rows")->value == "4096", "Hy4 keeps 4096 without a registered receipt");
+    for (const auto tier : {p::Name::fast, p::Name::turbo}) {
+        in.profile = tier;
+        const auto selected = resolve(regime);
+        const auto& width = *selected->find("prompt_rows");
+        require(p::ladder_defect(selected->engine).empty(), "Hy4 window receipt is in the shared ladder");
+        require(width.value == "2048" && width.status == p::Status::set && width.ladder_reference == reference &&
+                    width.ladder.find("applies x1.050 noise 0.020") != std::string::npos,
+                "Hy4 admits only the measured schedule over the gated FAST width");
+        auto other = regime;
+        --other.prompt_tokens;
+        require(resolve(other)->find("prompt_rows")->value == "4096", "Hy4 neighboring prompt keeps 4096");
+        other = regime;
+        other.topology = h::Topology::pair;
+        require(resolve(other)->find("prompt_rows")->value == "4096", "Hy4 pair uses its previous width");
+        auto different = rank;
+        different.repeat = 1;
+        const auto cold = h::rank_execution(different, in);
+        other = regime;
+        other.execution = cold;
+        require(resolve(other)->find("prompt_rows")->value == "4096", "Hy4 cold run keeps 4096");
+        different = rank;
+        different.device = "gfx1151|Fixture B|cu40|mem137438953472|clk2900000|hip70000000|drv70000000";
+        const auto device = h::rank_execution(different, in);
+        other.execution = device;
+        require(resolve(other)->find("prompt_rows")->value == "4096", "Hy4 other gfx1151 product keeps 4096");
+
+        in.env = [](const char* name) -> const char* {
+            return std::string_view(name) == "STRIX_DECODE_FUSE" ? "0legacy" : nullptr;
+        };
+        const auto unfused = h::rank_execution(rank, in);
+        other.execution = unfused;
+        require(resolve(other)->find("prompt_rows")->value == "4096", "Hy4 unfused decode keeps 4096");
+        in.env = [](const char* name) -> const char* {
+            return std::string_view(name) == "STRIX_DECODE_FUSE" ? "1legacy" : nullptr;
+        };
+        require(h::rank_execution(rank, in) == execution, "Hy4 keys the effective value of the decode fuse");
+        in.cli = {{"head_q8", "0"}};
+        require(resolve(regime)->find("prompt_rows")->value == "4096", "Hy4 other arithmetic composition keeps 4096");
+        in.cli = {{"prompt_rows", "4096"}};
+        require(resolve(regime)->find("prompt_rows")->value == "4096", "Hy4 respects an explicit width");
+        in.cli.clear();
+        in.allow_pending = true;
+        receipt.timing.speedup = 1.012;
+        require(resolve(regime)->find("prompt_rows")->value == "4096", "Hy4 keeps 4096 within the noise margin");
+        receipt.timing.speedup = 0.94;
+        require(resolve(regime)->find("prompt_rows")->value == "4096", "Hy4 keeps 4096 when the measured schedule loses");
+        receipt.timing.speedup = 1.05;
+        require(resolve(legacy)->find("prompt_rows")->value == "4096", "Hy4 cannot benchmark an unmeasured width by default");
+        in.allow_pending = false;
+    }
+    in.profile = p::Name::standard;
+    require(resolve(regime)->find("prompt_rows")->value == "0", "Hy4 BASE keeps the serial reference with evidence");
+    in.profile = p::Name::fast;
+    const auto no_gate = h::resolve(regime, in, {}, h::incumbent_grants, std::span(&receipt, 1));
+    require(no_gate->find("prompt_rows")->value == "0", "Hy4 timing cannot admit ungated arithmetic");
 }
 
 // Ordinary timing rows decide only the comparison they measured (LadderRow::over), --allow-pending never runs a measured
@@ -1546,6 +1621,7 @@ int main(int argc, char** argv) try {
     turbo_nests_fast(engines);
     paired_rows();
     hy4_new_quality_rows();
+    hy4_measured_window_schedule();
     for (const auto& engine : engines) walk(engine);
     // Review r63 D: every engine table the ladder reads, the custom adapters' tables through their shared row view.
     EnumerationCount count;
