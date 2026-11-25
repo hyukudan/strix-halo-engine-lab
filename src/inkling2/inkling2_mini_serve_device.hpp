@@ -5,6 +5,7 @@
 #include "inkling2_mini_weight_device.hpp"
 #include "strix/device/gate.hpp"
 #include "strix/serve/fixed_kv_cohort.hpp"
+#include "strix/serve/prefill_chunk_fallback.hpp"
 
 #include <functional>
 #include <iostream>
@@ -51,16 +52,30 @@ inline MiniServeCohort make_mini_device_cohort(
         const bool calibrated = lowbit.admitted != nullptr;
         // The served route is admitted before constructing the decoder. The same load transaction
         // checks capacity and allocates the slots before publishing the cohort.
-        auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
-            opt.served_cli_route && kMiniPackedDecodeDefault, MiniResidentBackend::default_step_graphs,
-            weights.roles(), 0U, false, rows, opt.served_cli_route ? opt.prefill_tail : 0U,
-            opt.experts_nvfp4, opt.controller_one_plane, opt.served_cli_route, std::move(lowbit));
+        // An implicit held-back chunk retries once at the fallback rows (mini_served_prefill_fallback_rows) when its
+        // row-scaled device workspaces are refused (same shared rule as the command line; the chunk changes no output
+        // there), or when the --slots lanes do not fit beside its row-scaled per-slot state (sliding rings and
+        // convolution tapes hold the chunk's rows: 3.90 GB a slot at 8192 rows against 1.55 GB at 128, 36,864
+        // positions on gfx1151): the implicit chunk never costs a requested lane.
+        auto decoder = serve::load_with_chunk_fallback(opt.prefill_rows, opt.prefill_fallback_rows == 0U,
+                                                       opt.prefill_fallback_rows, std::cerr, [&](unsigned chunk) {
+            auto loaded = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, chunk,
+                opt.served_cli_route && kMiniPackedDecodeDefault, MiniResidentBackend::default_step_graphs,
+                weights.roles(), 0U, false, rows, opt.served_cli_route ? opt.prefill_tail : 0U,
+                opt.experts_nvfp4, opt.controller_one_plane, opt.served_cli_route, lowbit);
+            levers = configure_mini_decoder(*loaded, opt.moe_w4a4, opt.combine_image, opt.prepared_round_fold,
+                                            opt.attn_projected_bias, opt.screened_head, opt.verify_rows);
+            loaded->set_slot_windows(opt.speculation);  // include the per-slot tapes in the capacity check
+            if (mini_serve_chunk_costs_lanes(opt, chunk, rows, [&] {
+                    const auto memory = mini_gpu::memory_info();
+                    return serve::resident_kv_slots_with_plane(memory.free, memory.total, budget.device_bytes,
+                        opt.kv_bytes, loaded->slot_bytes(), rows, loaded->screen_device_bytes()).slots;
+                }))
+                throw DeviceAllocationError("the requested slots do not fit beside the implicit prefill chunk", 2);
+            return loaded;
+        });
         if (calibrated && !decoder->prefill_emits_first())
             throw std::logic_error("calibrated decode image on the held-back served prompt route");
-        levers = configure_mini_decoder(*decoder, opt.moe_w4a4, opt.combine_image, opt.prepared_round_fold,
-                                        opt.attn_projected_bias, opt.screened_head, opt.verify_rows);
-        // Admitted speculation: one-lane verify windows on any slot (per-slot tapes count in the slot's bytes).
-        decoder->set_slot_windows(opt.speculation);
         slot_bytes = decoder->slot_bytes();
         // Keep the CUDA screened plane only when it costs no slot, then enforce the calibrated load's slot promise.
         const auto memory = mini_gpu::memory_info();

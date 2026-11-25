@@ -81,9 +81,13 @@ Decode runs the experts on the one-row packed form by default on the command
 line (both backends; `--grouped-decode` selects the grouped tile kernel there,
 printed as `moe_decode` in `strix-decode-route/v1`). `strix-serve` keeps its
 existing route in every profile and takes no decode form flag: the last
-prompt token is held back and decoded, prompts run in 128-row chunks
-(`--prefill-rows`, clamped to the context, which without `--slots` also caps
-the lanes), and a cohort decodes with the grouped form in one batched forward
+prompt token is held back and decoded, prompts run in the command line's
+chunk without its tail (8192 rows on HIP; `--prefill-rows` sets it, clamped
+to the context, and an explicit value without `--slots` also caps the lanes,
+128 otherwise; the chunk changes no output). When the device refuses the
+chunk's workspaces, or the `--slots` lanes do not fit beside its per-slot
+rings and tapes, the server loads at 128 rows (HIP; CUDA: the command line's
+fallback) and prints a `strix-prefill-chunk` line. A cohort decodes with the grouped form in one batched forward
 (CUDA: its width programs), whose lane bits depend on the cohort width as
 before. The served route switch `STRIX_INK_SERVED_CLI_ROUTE=1`
 (`inkling2-mini-served-cli-route@1`, off in every profile column) makes a HIP
@@ -221,8 +225,8 @@ names its own size in place of 8192) and the
 depend on the chunk, so the generated ids are the same. Only a refused device
 allocation selects the smaller chunk; any other load error is reported as is.
 An explicit `--prefill-chunk` is never changed, and `--prefill-chunk 2048`
-selects the smaller chunk up front. The CUDA server is not affected: it keeps
-its own 128-row prompt chunks (`--prefill-rows`).
+selects the smaller chunk up front. The CUDA server applies the same chunk
+and fallback to its held-back prompt route (`--prefill-rows` overrides it).
 
 The greedy head stays the full head on CUDA in every profile. The exact switch
 `STRIX_INK_SCREENED_HEAD=1` (`inkling2-mini-screened-head@1`, off in every

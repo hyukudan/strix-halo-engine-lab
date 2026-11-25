@@ -127,14 +127,33 @@ inline MiniPrefillSchedule mini_prefill_schedule_from_env(bool hip, profile::Nam
 // Served prompt route. A HIP server with the served route lever (kMiniServedCliRoute, opt-in in every profile column)
 // serves the command line's schedule above with the first id taken from the final prefill row (emits-first; device
 // evidence: served prefill == CLI prefill bitwise, chunk and tail edges included). Without it, and on CUDA (not
-// qualified there), a server keeps the route it served before: 128-row chunks, no tail, the last prompt token held back
-// and decoded as the first decode row.
+// qualified there), a server keeps the held-back route: greedy chunks, no tail, the last prompt token held back and
+// decoded as the first decode row. Its chunk is the command line's chunk (the one schedule resolver above, no tail):
+// the resident prefill rows carry the same bits at any chunk on both backends (every chunk form, small remainders
+// included): CUDA (complete EXACT generations equal at 2048 and 8192 rows, 2050 / 5200 / 8192 / 8195-token prompts, RTX
+// receipt q15; FAST and TURBO run the same kernels while no lossy lever resolves there) and gfx1151 (served EXACT greedy
+// ids equal at 128 and 8192 rows on seven 2,280 / 9,116 / 35,170-token prompts, prefill 8K 602 -> 2,030 tok/s; command
+// line logits equal at 128 and 8192 rows, with and without the tail). Only the chunk changes: the held-back token, the
+// decode rows and the lane cap (kMiniServeLaneRows) stay. kMiniServedHeldBackChunk is the chunk this route had before.
 inline constexpr unsigned kMiniServedHeldBackChunk = 128U;
 constexpr bool mini_served_prefill_emits_first(bool hip, bool cli_route) noexcept { return hip && cli_route; }
 
+constexpr MiniPrefillSchedule mini_served_held_back_schedule(bool hip, profile::Name tier) noexcept {
+    return {mini_prefill_schedule(hip, tier).chunk, 0U};
+}
+
 inline MiniPrefillSchedule mini_served_prefill_schedule_from_env(bool hip, bool cli_route, profile::Name tier) {
     return mini_served_prefill_emits_first(hip, cli_route) ? mini_prefill_schedule_from_env(hip, tier)
-                                                           : MiniPrefillSchedule{kMiniServedHeldBackChunk, 0U};
+                                                           : mini_served_held_back_schedule(hip, tier);
+}
+
+// Device-memory fallback of the served held-back chunk (serve::load_with_chunk_fallback): CUDA the command line's
+// fallback rows, HIP the route's previous 128 rows (the command line keeps its single attempt there; the served chunk
+// also retries when the --slots lanes do not fit beside its row-scaled per-slot state, make_mini_device_cohort);
+// 0 = no retry (an explicit --prefill-rows is never retried).
+constexpr unsigned mini_served_prefill_fallback_rows(bool hip, bool cli_route, profile::Name tier) noexcept {
+    if (mini_served_prefill_emits_first(hip, cli_route)) return 0U;
+    return hip ? kMiniServedHeldBackChunk : mini_cli_prefill_fallback_rows(MiniPrefillBackend::cuda, tier);
 }
 
 // Tail rows a chunk may absorb (before the decoder's own admission, mini_admitted_tail_capacity). None when the

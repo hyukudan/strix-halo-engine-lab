@@ -578,14 +578,35 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const unsigned context = shape.context.value_or(8192U);
         require(options.context == context && options.slots == shape.slots.value_or(0U), "served shape options");
         if (!route) {
-            // Without the lever the served shape is the incumbent one, written out here from the rule the server had
+            // Without the lever the served shape is the held-back one, written out here from the rule the server had
             // before the lever existed: a 128-row chunk unless --prefill-rows, clamped to the context; lanes = --slots,
-            // else that clamped chunk; no tail; held-back prompt token; grouped decode.
-            const unsigned chunk = std::min(shape.prefill_rows.value_or(128U), context);
-            const unsigned lanes = shape.slots.value_or(0U) != 0U ? *shape.slots : chunk;
+            // else the clamped 128 rows / --prefill-rows; no tail; held-back prompt token; grouped decode. The one change:
+            // both backends take the command line's implicit chunk (CUDA 8192 EXACT, 2048 FAST / TURBO; HIP 8192), with
+            // a fallback (CUDA the command line's rows, HIP the route's previous 128 rows). The lane cap never follows
+            // the chunk.
+            const unsigned incumbent = std::min(shape.prefill_rows.value_or(128U), context);
+            const auto cli_rows = mini::mini_cli_prefill_rows(
+                hip_backend ? mini::MiniPrefillBackend::hip : mini::MiniPrefillBackend::cuda, options.tier);
+            const unsigned chunk = std::min(shape.prefill_rows.value_or(cli_rows), context);
+            const unsigned lanes = shape.slots.value_or(0U) != 0U ? *shape.slots : incumbent;
+            const unsigned fallback = shape.prefill_rows ? 0U
+                : hip_backend ? mini::kMiniServedHeldBackChunk
+                              : mini::mini_cli_prefill_fallback_rows(mini::MiniPrefillBackend::cuda, options.tier);
             require(options.prefill_rows == chunk && mini::mini_serve_lane_rows(options) == lanes &&
-                        options.prefill_tail == 0U && options.lane_rows == 0U,
-                    "lever off: the served chunk, lane cap and tail are the incumbent ones");
+                        options.prefill_tail == 0U && options.lane_rows == incumbent &&
+                        options.prefill_fallback_rows == fallback,
+                    "lever off: held-back chunk = the command line's, incumbent lane cap, no tail");
+            // The implicit chunk never costs a requested lane: with --slots and an implicit chunk above its fallback the
+            // load asks the device and gives way when fewer lanes fit; otherwise it never asks.
+            bool asked = false;
+            const auto fits = [&](std::uint32_t held) { return [&asked, held] { asked = true; return held; }; };
+            const unsigned want = mini::mini_serve_lane_rows(options);
+            const bool asks = fallback != 0U && shape.slots.value_or(0U) != 0U && chunk > fallback;
+            require(mini::mini_serve_chunk_costs_lanes(options, chunk, want, fits(want - (want != 0U ? 1U : 0U))) ==
+                            (asks && want != 0U) && asked == asks &&
+                        !mini::mini_serve_chunk_costs_lanes(options, chunk, want, fits(want)) &&
+                        !mini::mini_serve_chunk_costs_lanes(options, fallback, want, fits(0U)),
+                    "lever off: the implicit chunk gives way only when the --slots lanes do not fit");
         } else {
             // With the lever: the command line's chunk and tail rule, emits-first; lanes = --slots, else an explicit
             // (clamped) --prefill-rows, else the served lane cap.
@@ -916,8 +937,8 @@ int main(int argc, char** argv) try {
         // The deployed TURBO preset with the served route switch unset: the engine's TURBO column (the Q8_0
         // qualification arm is FAST only, so the served TURBO preset runs without it).
         wiring(argv[1], backend, false, false, W4a4::bf16, "turbo");
-        // Every tier keeps the incumbent served shape without the lever, also for chunks above the context and
-        // explicit slots.
+        // Every tier keeps the held-back served shape without the lever (CUDA: the command line's chunk, incumbent lane
+        // cap), also for chunks above the context and explicit slots.
         for (const auto* tier : {"exact", "fast", "turbo"})
             for (const ServedShape shape : {ServedShape{}, ServedShape{{}, 15U, {}}, ServedShape{8192U, 15U, {}},
                                             ServedShape{{}, 15U, 9U}, ServedShape{32U, {}, {}}, ServedShape{32U, {}, 4U}})

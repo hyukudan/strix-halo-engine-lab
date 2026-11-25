@@ -89,12 +89,22 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.moe_w4a4 = admit_mini_moe_w4a4(resolution, resolved.backend);
     // Backend admission of the served route lever (kMiniServedCliRoute): HIP runs the command line's route, a CUDA
     // server declines it (requested stays in the receipt, mini_served_route_startup_field).
-    out.served_cli_route = mini_served_prefill_emits_first(resolved.backend == "hip", out.served_route_requested);
-    // The prompt chunk: --prefill-rows, else the route's (the incumbent 128-row held-back chunks without the lever,
-    // the command line's chunk and tail rule with it), clamped to the context. Lanes: mini_serve_lane_rows.
-    const auto schedule = mini_served_prefill_schedule_from_env(true, out.served_cli_route, out.tier);
+    const bool hip = resolved.backend == "hip";
+    out.served_cli_route = mini_served_prefill_emits_first(hip, out.served_route_requested);
+    // The prompt chunk: --prefill-rows, else the route's from the command line's schedule resolver (the held-back
+    // route: the command line's chunk without its tail, retried at mini_served_prefill_fallback_rows when refused or
+    // when it would cost a --slots lane; the lever: the command line's chunk and tail rule), clamped to the context.
+    // Lanes: mini_serve_lane_rows.
+    const auto schedule = mini_served_prefill_schedule_from_env(hip, out.served_cli_route, out.tier);
     out.prefill_rows = std::min(explicit_rows.value_or(schedule.chunk), out.context);
-    if (out.served_cli_route) {
+    if (!out.served_cli_route) {
+        // Held-back route: the lane cap stays the incumbent one (an explicit --prefill-rows, else 128 rows, clamped),
+        // whatever chunk the schedule took; an implicit chunk retries at the command line's fallback rows when its
+        // device workspaces are refused (serve::load_with_chunk_fallback).
+        out.lane_rows = std::min(explicit_rows.value_or(kMiniServeLaneRows), out.context);
+        out.prefill_fallback_rows =
+            explicit_rows ? 0U : mini_served_prefill_fallback_rows(hip, out.served_cli_route, out.tier);
+    } else {
         if (out.prefill_rows == 0U) throw std::invalid_argument("--prefill-rows must be positive");
         // An explicit chunk without --slots also caps the lanes (the clamped chunk), as on the incumbent route.
         if (explicit_rows) out.lane_rows = out.prefill_rows;
