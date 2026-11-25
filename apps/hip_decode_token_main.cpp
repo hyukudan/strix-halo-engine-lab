@@ -1,3 +1,4 @@
+#include "device/hip_cost_identity.hpp"
 #include "strix/pair/link_flags.hpp"
 #include "strix/pair/chain_topology.hpp"
 #include "strix/device/process_topology.hpp"
@@ -1317,8 +1318,10 @@ static int run_decode_entry(
         pair_arguments = strix::pair::strip_flags(argc, argv, "STRIX_QWEN_PF_PIPE", strix::qwen_pp::pipe_enabled());
     }
     const auto* bound = strix::device::hip_bound();
+    const std::string device_product = bound ? strix::device::hip_cost_device_identity() : std::string{};
     auto options = parse_options(argc, argv, true, {}, strix::decode_cli::DecodeAssets::verify,
-                                 bound ? std::string_view(bound->visible.arch) : std::string_view{});
+                                 bound ? std::string_view(bound->visible.arch) : std::string_view{},
+                                 bound ? std::string_view(device_product) : std::string_view{});
     QwenDeployment deployment;
     if (options.deployment_spec && options.deployment_spec->topology == "pipeline") {
         const char* r = std::getenv("STRIX_QWEN_PF_PIPE_RANK");
