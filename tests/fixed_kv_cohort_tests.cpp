@@ -320,8 +320,10 @@ struct WindowDecoder : GreedyDecoder {
         if (first) history[lane].clear();
         history[lane].insert(history[lane].end(), tokens.begin(), tokens.end());
     }
+    bool fail_decode = false;  // the one-row pass throws (a device fault after the window was staged)
     void decode_slots(std::span<const std::uint32_t> slots, std::span<const std::uint32_t> tokens,
                       std::span<std::uint32_t> top) {
+        if (fail_decode) throw std::runtime_error("one-row pass failed");
         last_slots.assign(slots.begin(), slots.end());
         for (std::size_t row = 0; row < slots.size(); ++row) {
             if (staged.at(slots[row]) != 0U) throw std::logic_error("one-row decode over a staged window");
@@ -374,13 +376,14 @@ struct WindowRun {
     std::uint32_t windows = 0, max_live_with_window = 0;
 };
 
-WindowRun run_windows(std::uint32_t max_draft, std::vector<std::uint32_t> by_live, bool staggered) {
+WindowRun run_windows(std::uint32_t max_draft, std::vector<std::uint32_t> by_live, bool staggered,
+                      std::uint32_t stop = 9999U, std::uint32_t context = 512U) {
     using strix::serve::CohortConfig;
     using strix::serve::CohortDecoder;
     using strix::serve::CohortRequest;
     auto decoder = std::make_unique<WindowDecoder>();
     auto* raw = decoder.get();
-    FixedKvCohort<WindowDecoder> cohort(std::move(decoder), 512U, 4U, 4U);
+    FixedKvCohort<WindowDecoder> cohort(std::move(decoder), context, 4U, 4U);
     CohortConfig config;
     config.context_draft = max_draft != 0U;
     config.max_draft = max_draft;
@@ -393,8 +396,8 @@ WindowRun run_windows(std::uint32_t max_draft, std::vector<std::uint32_t> by_liv
         CohortRequest r;
         r.id = i + 1U;
         r.prompt = {31U + i, 32U, 33U, 34U, 35U, 30U + i};
-        r.max_tokens = 60U + 10U * i;
-        if (i == 2U) r.stop = {9999U};
+        r.max_tokens = context == 512U ? 60U + 10U * i : context - 6U;  // a short context: prompt + ids fill it
+        if (stop != 9999U || i == 2U) r.stop = {stop};  // a given stop applies to every request
         requests.push_back(r);
     }
     const auto count_live = [&] { raw->live_slots = scheduler.live(); };
@@ -403,7 +406,8 @@ WindowRun run_windows(std::uint32_t max_draft, std::vector<std::uint32_t> by_liv
         scheduler.submit(requests[1]);
         scheduler.submit(requests[2]);
     }
-    for (int step = 0; step < 400 && !(scheduler.idle()); ++step) {
+    // (staggered: keep stepping until the last arrival, even if an early stop left the cohort idle)
+    for (int step = 0; step < 400 && (!scheduler.idle() || (staggered && step <= 40)); ++step) {
         count_live();
         scheduler.step();
         // the second and third requests arrive while the first one drafts alone
@@ -459,7 +463,7 @@ void test_verify_windows() {
     cohort.prefill(1U, p1, true);
     cohort.prefill(2U, p2, true);
     {
-        const CohortGroup groups[] = {{1U, 1U}, {0U, 3U}, {2U, 1U}};
+        const CohortGroup groups[] = {{1U, 1U}, {0U, 3U, false}, {2U, 1U}};
         const std::uint32_t tokens[] = {40U, 41U, 42U, 43U, 44U};
         std::uint32_t top[5] = {};
         cohort.verify(groups, tokens, top);
@@ -477,13 +481,13 @@ void test_verify_windows() {
               "window: the kept prefix is committed");
     }
     {
-        const CohortGroup two[] = {{0U, 2U}, {1U, 2U}};
+        const CohortGroup two[] = {{0U, 2U, false}, {1U, 2U, false}};
         const std::uint32_t tokens[] = {1U, 2U, 3U, 4U};
         std::uint32_t top[4] = {};
         check(throws([&] { cohort.verify(two, tokens, top); }), "window: two windows in one verify refused");
     }
     {
-        const CohortGroup groups[] = {{2U, 2U}};
+        const CohortGroup groups[] = {{2U, 2U, false}};
         const std::uint32_t tokens[] = {50U, 51U};
         std::uint32_t top[2] = {};
         cohort.verify(groups, tokens, top);
@@ -491,6 +495,69 @@ void test_verify_windows() {
         const std::uint32_t keep[] = {2U};
         cohort.commit(keep);
         check(raw->discarded == 1U && raw->staged[2] == 0U, "window: a released lane's window is discarded");
+    }
+    {
+        // A score-reading drafted group is refused before staging: a window writes picks, not readable scores.
+        const CohortGroup read[] = {{0U, 2U, true}};
+        const std::uint32_t tokens[] = {60U, 61U};
+        std::uint32_t top[2] = {};
+        const auto before = raw->windows;
+        check(throws([&] { cohort.verify(read, tokens, top); }) && raw->windows == before && raw->staged[0] == 0U,
+              "window: a score-reading window refused before any staging");
+    }
+    {
+        // Release then reuse on a nonzero slot with no commit in between: the prefill of the reused slot discards the
+        // staged window first (the decoder refuses a prefill over a staged window).
+        const CohortGroup groups[] = {{2U, 3U, false}};
+        const std::uint32_t tokens[] = {52U, 53U, 54U};
+        std::uint32_t top[3] = {};
+        cohort.verify(groups, tokens, top);
+        cohort.release(2U);
+        const std::uint32_t reuse[] = {35U, 36U};
+        check(!throws([&] { cohort.prefill(2U, reuse, true); }), "window: release then reuse needs no commit");
+        check(raw->discarded == 2U && raw->staged[2] == 0U && raw->history[2] == std::vector<std::uint32_t>({35U, 36U}),
+              "window: the reused slot's staged window was discarded, its new prompt is the history");
+    }
+    {
+        // A verify that never got its commit: the next verify discards the window before staging another.
+        const auto h0 = raw->history[0];
+        const CohortGroup groups[] = {{0U, 2U, false}};
+        const std::uint32_t a[] = {55U, 56U}, b[] = {57U, 58U};
+        std::uint32_t top[2] = {};
+        cohort.verify(groups, a, top);
+        check(!throws([&] { cohort.verify(groups, b, top); }) && raw->discarded == 3U,
+              "window: an uncommitted window is discarded by the next verify");
+        const std::uint32_t keep[] = {1U};
+        cohort.commit(keep);
+        auto want = h0;
+        want.push_back(57U);
+        check(raw->history[0] == want, "window: only the committed window reaches the history");
+    }
+    {
+        // Mixed verify whose one-row companion pass throws after the window was staged: the window is unwound, the
+        // history is unchanged and the cohort serves the next verify.
+        auto throwing = std::make_unique<WindowDecoder>();
+        auto* t = throwing.get();
+        FixedKvCohort<WindowDecoder> mixed(std::move(throwing), 64U, 4U, 2U);
+        const std::uint32_t q0[] = {30U}, q1[] = {31U};
+        mixed.prefill(0U, q0, true);
+        mixed.prefill(1U, q1, true);
+        t->fail_decode = true;
+        const CohortGroup groups[] = {{0U, 3U, false}, {1U, 1U}};
+        const std::uint32_t tokens[] = {40U, 41U, 42U, 43U};
+        std::uint32_t top[4] = {};
+        check(throws([&] { mixed.verify(groups, tokens, top); }), "window: the companion pass throws");
+        check(t->windows == 1U && t->discarded == 1U && t->staged[0] == 0U &&
+                  t->history[0] == std::vector<std::uint32_t>({30U}),
+              "window: a failed mixed verify unwinds its staged window");
+        const std::uint32_t keep[] = {1U, 1U};
+        check(throws([&] { mixed.commit(keep); }), "window: a failed verify cannot be committed");
+        t->fail_decode = false;
+        mixed.verify(groups, tokens, top);
+        mixed.commit(keep);
+        check(t->history[0] == std::vector<std::uint32_t>({30U, 40U}) &&
+                  t->history[1] == std::vector<std::uint32_t>({31U, 43U}),
+              "window: the cohort serves the next verify after the unwind");
     }
 
     // Whole cohort: context drafts through windows give the ids of one-row decode, and the {4, 0} rule keeps every
@@ -503,6 +570,22 @@ void test_verify_windows() {
     check(on.max_live_with_window <= 1U, "cohort {4, 0}: windows only while one lane is live");
     const auto together = run_windows(4U, {4U, 0U}, false);
     check(together.ids == off.ids, "cohort: simultaneous arrivals keep the ids");
+    // Reachable stop ids (each one ends every request; some fall inside an accepted window prefix): delivery stops at
+    // the stop id exactly as the solo run does, with windows on.
+    std::uint64_t stop_accepted = 0;
+    for (const std::uint32_t stop : {30U, 31U, 32U, 33U, 34U, 35U, 15U, 2U}) {
+        const auto s = run_windows(4U, {4U, 0U}, true, stop);  // run_windows checks ids == the solo run
+        stop_accepted += s.accepted;
+    }
+    check(stop_accepted > 0U, "cohort stops: windows kept drafts while stops were armed");
+    // The final context row: prompt (6) + 42 ids fill a 48-position context exactly; windows near the end are
+    // capped by the remaining positions and the ids equal the one-row run.
+    const auto ctx_off = run_windows(0U, {}, true, 9999U, 48U);
+    const auto ctx_on = run_windows(4U, {4U, 0U}, true, 9999U, 48U);
+    check(ctx_on.ids == ctx_off.ids && ctx_on.windows > 0U, "cohort at the context end: ids with windows == without");
+    bool capped = true;
+    for (const auto& ids : ctx_off.ids) capped = capped && ids.size() == 42U;
+    check(capped, "cohort at the context end: every request reaches the last position");
     std::printf("verify windows: off windows %u; on windows %u drafted %llu accepted %llu\n", off.windows, on.windows,
                 static_cast<unsigned long long>(on.drafted), static_cast<unsigned long long>(on.accepted));
 }

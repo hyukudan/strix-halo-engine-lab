@@ -31,7 +31,12 @@ namespace strix::serve {
 // same verify run after the window as one decode_slots pass, so their score rows stay the readable ones. Such a
 // decoder holds one window at a time: a verify with two windows is refused (the cohort's live-lane rule,
 // CohortConfig::max_draft_by_live, keeps drafts to one lane). Greedy ids are the target's picks, so a window commits
-// exactly what one-row decode would have committed.
+// exactly what one-row decode would have committed. Windows are greedy-only: a window writes picks, not readable
+// scores, so a drafted group passed with reads_scores is refused before any work (the scheduler drafts only lanes with
+// no score consumer). A staged window is always resolved before any other backend work: commit() keeps its prefix, and
+// a verify or prefill that comes first (its lane was released and the slot reused, or the commit never came), or a
+// companion one-row pass that throws after staging, discards it with commit_slot_window(slot, tokens, 0), so the
+// decoder's one rollback checkpoint is never overwritten.
 // A decoder that offers BOTH prefill calls also declares which one it serves with at run time
 // (prefill_emits_first() const -> bool, fixed for its lifetime). This is an arithmetic lever whose resolved value
 // must match the CLI; it must never be selected by slot, cohort width or arrival order. Read once at construction.
@@ -63,6 +68,7 @@ public:
 
     void prefill_scoped(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first,
                         std::uint64_t prompt_tokens) override {
+        discard_staged();  // before any backend work: a staged window's rollback state must not be overwritten
         if (prefill_policy_) prefill_policy_(*decoder_, prompt_tokens, first);
         withdraw();  // a prefill call replaces the decoder's score rows: no verify window stays readable
         if constexpr (kEmitsFirst) {
@@ -101,6 +107,7 @@ public:
 
     void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                 std::span<std::uint32_t> top) override {
+        discard_staged();
         withdraw();
         // A decoder with the score-read hook may use a pick-only form when no lane needs final scores.
         bool reads_scores = false;
@@ -115,6 +122,8 @@ public:
                 if constexpr (!kWindows) throw std::logic_error("fixed KV cohort requires one decode row per lane");
                 if (group.rows == 0U || group.rows > max_window(group.lane) || !windows_.empty())
                     throw std::logic_error("fixed KV cohort: one verify window of at most max_slot_window() rows");
+                if (group.reads_scores)
+                    throw std::logic_error("fixed KV cohort: a verify window is greedy-only (no readable scores)");
                 windows_.push_back({group.lane, group.lane, static_cast<std::uint32_t>(offset), group.rows});
                 groups_.push_back(0U);
             }
@@ -122,24 +131,36 @@ public:
         }
         if (offset != tokens.size() || top.size() != tokens.size())
             throw std::invalid_argument("fixed KV cohort: verify tokens do not match the groups");
-        if constexpr (kWindows) {
-            for (const auto& w : windows_) {
-                const auto rows = tokens.subspan(w.offset, w.rows);
-                window_tokens_.assign(rows.begin(), rows.end());
-                verify_pending_ = true;  // a staged window is committed (or discarded) by commit()
-                decoder_->stage_slot_window(w.slot, rows, top.subspan(w.offset, w.rows));
+        try {
+            if constexpr (kWindows) {
+                for (const auto& w : windows_) {
+                    const auto rows = tokens.subspan(w.offset, w.rows);
+                    window_tokens_.assign(rows.begin(), rows.end());
+                    decoder_->stage_slot_window(w.slot, rows, top.subspan(w.offset, w.rows));
+                    staged_ = true;  // resolved by commit(), else discarded before the next backend work
+                    staged_slot_ = w.slot;
+                }
             }
-        }
-        if (!window_.empty()) {
-            if (windows_.empty()) {
-                decode(tokens, top, reads_scores);
-            } else {
-                one_tokens_.resize(window_.size());
-                one_top_.resize(window_.size());
-                for (std::size_t row = 0; row < window_.size(); ++row) one_tokens_[row] = tokens[window_rows_[row]];
-                decode(one_tokens_, one_top_, reads_scores);
-                for (std::size_t row = 0; row < window_.size(); ++row) top[window_rows_[row]] = one_top_[row];
+            if (!window_.empty()) {
+                if (windows_.empty()) {
+                    decode(tokens, top, reads_scores);
+                } else {
+                    one_tokens_.resize(window_.size());
+                    one_top_.resize(window_.size());
+                    for (std::size_t row = 0; row < window_.size(); ++row) one_tokens_[row] = tokens[window_rows_[row]];
+                    decode(one_tokens_, one_top_, reads_scores);
+                    for (std::size_t row = 0; row < window_.size(); ++row) top[window_rows_[row]] = one_top_[row];
+                }
             }
+        } catch (...) {
+            // This verify will never be committed: unwind its staged window now. The first error is the one reported;
+            // a discard that fails too stays staged and is retried before the next backend work.
+            try {
+                discard_staged();
+            } catch (...) {
+            }
+            withdraw();
+            throw;
         }
         verify_pending_ = true;
     }
@@ -184,6 +205,7 @@ public:
                 // A lane released since the verify discards its window: its slot is reset by its next first prefill.
                 decoder_->commit_slot_window(w.slot, std::span<const std::uint32_t>(window_tokens_),
                                              w.lane == kNoLane ? 0U : keep[g]);
+                staged_ = false;
             }
         }
         withdraw();
@@ -238,6 +260,15 @@ private:
         else decoder_->decode_slots(window_, tokens, top);
     }
 
+    // A window staged by a verify that was never committed: discard it (keep 0) so the decoder restores the slot.
+    void discard_staged() {
+        if constexpr (kWindows) {
+            if (!staged_) return;
+            decoder_->commit_slot_window(staged_slot_, std::span<const std::uint32_t>(window_tokens_), 0U);
+            staged_ = false;
+        }
+    }
+
     void withdraw() noexcept {
         window_.clear();
         window_rows_.clear();
@@ -268,6 +299,8 @@ private:
     std::vector<Window> windows_;               // at most one
     std::vector<std::uint32_t> groups_;         // per verify group: kOneRow, or 0 for the window
     std::vector<std::uint32_t> window_tokens_;  // the window's tokens, kept for its commit
+    bool staged_ = false;                       // the decoder holds a staged window on staged_slot_
+    std::uint32_t staged_slot_ = 0;
     std::vector<std::uint32_t> one_tokens_, one_top_;
     std::vector<float> logits_;
     // emits-first: the lane of the last prefill call and its first id, valid until the next backend call; kept apart
