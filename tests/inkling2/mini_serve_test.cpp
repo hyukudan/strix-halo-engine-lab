@@ -80,6 +80,11 @@ void admission() {
             "a calibrated decode image serves prompts emits-first on the default served route");
     require(!mini::mini_served_prompt_emits_first(false, false, false),
             "without a calibrated image, a W4A4 class or the route lever the held-back route stays");
+    // Decode-only pack: needs emits-first; full-image pack and unadmitted load: no promise (must not abort startup).
+    require(!mini::mini_decode_only_pack_route_ok(true, true, false), "decode-only pack on the held-back route");
+    require(mini::mini_decode_only_pack_route_ok(true, true, true), "decode-only pack emits first");
+    require(mini::mini_decode_only_pack_route_ok(true, false, false), "full-image pack on the default served route");
+    require(mini::mini_decode_only_pack_route_ok(false, false, false), "no admitted pack");
     require(sv::fixed_kv_slots(99, 100, 3) == 0, "KV budget too small");
     require(sv::fixed_kv_slots(400, 100, 3) == 3, "row budget cap");
     require(sv::fixed_kv_slots(400, 100, 3, 1) == 1, "explicit slot cap");
@@ -895,9 +900,9 @@ int main(int argc, char** argv) try {
     for (const auto* backend : {"hip", "cuda"}) {
         wiring(argv[1], backend, false);
         wiring(argv[1], backend, true);
-        // The deployed TURBO preset with the served route switch unset: the engine's TURBO column (the Q8_0
-        // qualification arm is FAST only, so the served TURBO preset runs without it).
-        wiring(argv[1], backend, false, false, W4a4::bf16, "turbo");
+        // The deployed TURBO preset with the served route switch unset: the engine's TURBO column; TURBO nests FAST, so
+        // the Q8_0 qualification arm stays admitted.
+        wiring(argv[1], backend, true, false, W4a4::bf16, "turbo");
         // Every tier keeps the incumbent served shape without the lever, also for chunks above the context and
         // explicit slots.
         for (const auto* tier : {"exact", "fast", "turbo"})

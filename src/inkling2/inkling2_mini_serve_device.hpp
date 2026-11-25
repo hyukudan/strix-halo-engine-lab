@@ -44,13 +44,14 @@ inline MiniServeCohort make_mini_device_cohort(
 #endif
     auto cohort = load_mini_weights(opt.checkpoint, weights, opt.tier, weight_options, scope.view(), extent, [&](MiniLowBitRows lowbit) {
         const bool calibrated = lowbit.admitted != nullptr;
+        const bool decode_only_pack = lowbit.decode_only;
         // The served route is admitted before constructing the decoder. The same load transaction
         // checks capacity and allocates the slots before publishing the cohort.
         auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
             opt.served_cli_route && kMiniPackedDecodeDefault, MiniResidentBackend::default_step_graphs,
             weights.roles(), 0U, false, rows, opt.served_cli_route ? opt.prefill_tail : 0U,
             opt.experts_nvfp4, opt.controller_one_plane, opt.served_cli_route, std::move(lowbit));
-        if (calibrated && !decoder->prefill_emits_first())
+        if (!mini_decode_only_pack_route_ok(calibrated, decode_only_pack, decoder->prefill_emits_first()))
             throw std::logic_error("calibrated decode image on the held-back served prompt route");
         levers = configure_mini_decoder(*decoder, opt.moe_w4a4, opt.combine_image, opt.prepared_round_fold,
                                         opt.attn_projected_bias, opt.screened_head, opt.verify_rows);

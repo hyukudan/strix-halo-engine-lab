@@ -118,6 +118,12 @@ inline constexpr bool mini_served_prompt_emits_first(bool served_cli_route, bool
     return served_cli_route || moe_w4a4_bound || calibrated_decode;
 }
 
+// The emits-first guard of an admitted pack: only the decode-only image has a BF16 prefill row that must serve the final
+// prompt token; a full-image pack (and an unadmitted load) carries no such promise.
+inline constexpr bool mini_decode_only_pack_route_ok(bool admitted, bool decode_only, bool emits_first) noexcept {
+    return !(admitted && decode_only) || emits_first;
+}
+
 // Lookup and drafter speculation must verify against the same incumbent target for every verify width. Until the
 // calibrated target supports both serial and multi-row verification, keep the whole speculative run on incumbent weights.
 inline constexpr bool mini_calibrated_row_allowed_for_cli(bool requested, bool speculation_requested,
@@ -363,8 +369,10 @@ inline constexpr std::string_view kMiniBuildBackend = "cuda";
 inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options, bool native_execution) {
     auto tier = profile::resolve(kMiniProfile, options.tier);
     tier.weights.require_honoured();
-    if (options.qualify_q8 && (tier.profile != profile::Name::fast || options.disable_q8 || !native_execution))
-        throw std::invalid_argument("--qualify-q8 requires --profile fast and native model execution");
+    // TURBO nests FAST: the Q8_0 arm is admitted wherever FAST admits it.
+    if (options.qualify_q8 && ((tier.profile != profile::Name::fast && tier.profile != profile::Name::turbo) ||
+                               options.disable_q8 || !native_execution))
+        throw std::invalid_argument("--qualify-q8 requires --profile fast or turbo and native model execution");
     // A low-bit arm is a FAST candidate or, failing the FAST gate, a TURBO one.
     if (options.qualify != nullptr &&
         ((tier.profile != profile::Name::fast && tier.profile != profile::Name::turbo) || options.disable_q8 ||
