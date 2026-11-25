@@ -1225,18 +1225,23 @@ template <class Row, class AdmitOf, class ExplicitOf = NoExplicitSetting>
 inline constexpr std::string_view kBandProbeExecution = "exec/v1 band-probe";
 // Binds the band receipts of `rows` to the run's own reference (LadderRow::band_bound). `storage` owns the spellings
 // (a deque: views stay valid) and must outlive the rows. Rows whose reference is empty (execution not known, a value
-// without a declared identity) stay unbound and decide nothing. Returns true when a row was bound.
+// without a declared identity) stay unbound and decide nothing. A row already bound is re-bound when its reference
+// changed: the reference of a later lever extends the cells the earlier rows admitted (the ladder chain), so a caller
+// repeats bind + arms until nothing changes (resolve() does). Returns true when a row's reference changed.
 inline bool bind_band_receipts(std::vector<LadderRow>& rows, const LadderArms& arms, std::deque<std::string>& storage) {
-    bool bound = false;
+    bool changed = false;
     for (auto& row : rows) {
-        if (!row.band_bound || row.incumbent || !row.joint.empty() || !row.over.empty()) continue;
+        if (!row.band_bound || row.incumbent || !row.joint.empty()) continue;
         auto over = arms.over(row.tier, row.lever, row.value);
-        if (over.empty()) continue;
-        storage.push_back(std::move(over));
-        row.over = storage.back();
-        bound = true;
+        if (over == row.over) continue;
+        if (over.empty()) row.over = {};
+        else {
+            storage.push_back(std::move(over));
+            row.over = storage.back();
+        }
+        changed = true;
     }
-    return bound;
+    return changed;
 }
 
 // Route line of one lever in one regime: 'strix-ladder/v1 <lever> <phase> ctx=<n> lanes=<n> dev=<device>:<steps>
@@ -1372,7 +1377,10 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         }, out.allow_pending); };
     auto arms = build_arms();
     std::deque<std::string> band_references;  // band receipts bind to this run's own reference
-    if (bind_band_receipts(ladder, arms, band_references)) arms = build_arms();
+    // A chain of k band-bound levers settles in at most k + 1 passes (each pass binds the next lever over the cells
+    // the previous pass admitted); the bound keeps a defective table from looping.
+    for (std::size_t pass = 0; pass <= ladder.size() && bind_band_receipts(ladder, arms, band_references); ++pass)
+        arms = build_arms();
     for (const auto& lever : engine.table) {
         const auto column = value_column(lever, profile_column);
         const std::string* cli = last_setting(inputs.cli, lever.name);  // the value the arms spelled (dispatch precedence)
