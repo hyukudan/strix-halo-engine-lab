@@ -1,12 +1,14 @@
 #pragma once
 
-#include "attn_plan.hpp"
+#include "attn_core/decode_plan.hpp"
 #include "strix/cuda_core/attention.hpp"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 namespace strix::cuda::core::attn {
+
+inline constexpr std::uint32_t kNativeSplitHeadDim = 256;
 
 struct DecodeInput {
     // Q is [row][head][dim], or [row][head][Q | gate] for sigmoid_interleaved.
@@ -32,11 +34,18 @@ struct DecodeInput {
     const cuda_core::KvShadowE4m3* shadow = nullptr;
 };
 
-// Enqueue a plan returned by make_decode_plan. Output is contiguous
+// Enqueue a plan made with kNativeSplitHeadDim. Output is contiguous
 // [row][head][dim]. The caller owns scratch and keeps all buffers alive until
 // the stream completes. Prepared MMA requires 16-byte aligned K/V planes.
 cudaError_t decode(const DecodePlan& plan, const DecodeInput& input, float* output,
                    float* scratch, std::size_t scratch_floats, cudaStream_t stream);
+
+// Position-canonical BF16 global-max decode, with packed Q and no output gate.
+// RowMap may reorder rows, select independent cache planes, and remap a row's
+// own key to a physical slot. The caller keeps the mapped K/V slots resident.
+// An out-of-range device position leaves its output row untouched.
+cudaError_t decode_position_split(const DecodePlan& plan, const DecodeInput& input, float* output,
+                                  float* scratch, std::size_t scratch_floats, cudaStream_t stream);
 
 namespace detail {
 

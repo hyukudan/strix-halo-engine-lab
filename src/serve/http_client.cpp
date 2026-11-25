@@ -5,6 +5,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <optional>
 
 #ifdef _WIN32
@@ -201,18 +202,28 @@ private:
     bool aborted_ = false;
 };
 
-Socket connect_to(const HttpClientRequest& request, const HttpClientSink& sink, HttpClientResult& result) {
+using AddrList = std::unique_ptr<addrinfo, decltype(&freeaddrinfo)>;
+
+AddrList resolve_tcp(const std::string& host, std::uint16_t port) {
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     addrinfo* list = nullptr;
-    const auto port = std::to_string(request.port);
-    if (getaddrinfo(request.host.c_str(), port.c_str(), &hints, &list) != 0 || !list) {
-        result.error = "cannot resolve " + request.host;
+    const auto service = std::to_string(port);
+    if (getaddrinfo(host.c_str(), service.c_str(), &hints, &list) != 0)
+        return {nullptr, freeaddrinfo};
+    return {list, freeaddrinfo};
+}
+
+Socket connect_to(const HttpClientRequest& request, const HttpClientSink& sink, HttpClientResult& result) {
+    const auto& host = request.connect_host.empty() ? request.host : request.connect_host;
+    const auto list = resolve_tcp(host, request.port);
+    if (!list) {
+        result.error = "cannot resolve " + host;
         return kNoSocket;
     }
     Socket connected = kNoSocket;
-    for (const addrinfo* a = list; a && connected == kNoSocket && !result.cancelled; a = a->ai_next) {
+    for (const addrinfo* a = list.get(); a && connected == kNoSocket && !result.cancelled; a = a->ai_next) {
         SocketGuard guard{::socket(a->ai_family, a->ai_socktype, a->ai_protocol)};
         if (guard.fd == kNoSocket) { result.error = socket_error(); continue; }
         if (!set_nonblocking(guard.fd)) { result.error = socket_error(); continue; }
@@ -233,7 +244,6 @@ Socket connect_to(const HttpClientRequest& request, const HttpClientSink& sink, 
         connected = guard.fd;
         guard.fd = kNoSocket;
     }
-    freeaddrinfo(list);
     return connected;
 }
 
@@ -259,6 +269,30 @@ bool send_all(Socket fd, std::string_view data, const HttpClientRequest& request
 
 } // namespace
 
+std::vector<std::string> resolve_http_hosts(const std::string& host, std::uint16_t port) {
+    std::vector<std::string> hosts;
+    if (!sockets_ready()) return hosts;
+    const auto list = resolve_tcp(host, port);
+    for (const addrinfo* a = list.get(); a; a = a->ai_next) {
+        char text[INET6_ADDRSTRLEN]{};
+        std::uint32_t scope = 0;
+        if (a->ai_family == AF_INET) {
+            const auto& v4 = *reinterpret_cast<const sockaddr_in*>(a->ai_addr);
+            if (!inet_ntop(AF_INET, &v4.sin_addr, text, sizeof(text))) continue;
+        } else if (a->ai_family == AF_INET6) {
+            const auto& v6 = *reinterpret_cast<const sockaddr_in6*>(a->ai_addr);
+            scope = v6.sin6_scope_id;
+            if (scope == 0 && IN6_IS_ADDR_V4MAPPED(&v6.sin6_addr)) {
+                if (!inet_ntop(AF_INET, &v6.sin6_addr.s6_addr[12], text, sizeof(text))) continue;
+            } else if (!inet_ntop(AF_INET6, &v6.sin6_addr, text, sizeof(text))) continue;
+        } else continue;
+        std::string numeric(text);
+        if (scope != 0) numeric += "%" + std::to_string(scope);
+        if (std::find(hosts.begin(), hosts.end(), numeric) == hosts.end()) hosts.push_back(std::move(numeric));
+    }
+    return hosts;
+}
+
 std::string HttpClientHead::header(std::string_view name) const {
     for (const auto& h : headers) if (h.first == name) return h.second;
     return {};
@@ -273,7 +307,9 @@ HttpClientResult http_exchange(const HttpClientRequest& request, const HttpClien
 
     result.stage = HttpClientStage::send;
     std::string head_out = request.method + " " + (request.target.empty() ? std::string("/") : request.target) + " HTTP/1.1\r\n";
-    head_out += "Host: " + request.host + ":" + std::to_string(request.port) + "\r\n";
+    const auto host = request.host.find(':') == std::string::npos
+        ? request.host : "[" + request.host.substr(0, request.host.find('%')) + "]";
+    head_out += "Host: " + host + ":" + std::to_string(request.port) + "\r\n";
     for (const auto& h : request.headers) head_out += h.first + ": " + h.second + "\r\n";
     if (!request.body.empty() || request.method == "POST" || request.method == "PUT" || request.method == "PATCH")
         head_out += "Content-Length: " + std::to_string(request.body.size()) + "\r\n";

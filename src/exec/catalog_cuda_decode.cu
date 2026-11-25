@@ -12,7 +12,7 @@
 #include "cuda/core/moe_r1_pipe.cuh"
 #include "cuda/core/mma_tile.cuh"
 #include "cuda/core/dense/rows_bf16_epilogue.cuh"
-#include "cuda/core/lookup_catalog.hpp"
+#include "core/lookup_catalog.hpp"
 #include "strix/attention_split_plan.hpp"
 #include "strix/cuda_core/attention.hpp"
 #include "strix/cuda_core/dense.hpp"
@@ -283,7 +283,7 @@ bool valid(const Bf16Fp32Epilogue& a) {
     return d.count == 1 && d.mode == Bf16DenseMode::fp32 &&
         d.projections[0].outputs <= std::numeric_limits<std::uint32_t>::max() - 7U &&
         cuda::detail::valid_bf16_dense_row_group({d.input, d.input_width, std::span(d.projections).first(1)},
-                                                1, cuda::DenseArith::fp32) &&
+                                                1, false) &&
         (a.form == graph::Form::store_bf16 ||
          (a.form == graph::Form::softcap && a.cap > 0.0F && std::isfinite(a.cap)));
 }
@@ -806,7 +806,7 @@ KernelBinding bind(const Bf16DenseGroup& a) {
     const auto projections = std::span(a.projections).first(a.count);
     const bool mma = a.mode != Bf16DenseMode::fp32;
     const auto arithmetic = mma ? cuda::DenseArith::mma3 : cuda::DenseArith::fp32;
-    if (!cuda::detail::valid_bf16_dense_row_group({a.input, a.input_width, projections}, 1, arithmetic))
+    if (!cuda::detail::valid_bf16_dense_row_group({a.input, a.input_width, projections}, 1, arithmetic == cuda::DenseArith::mma3))
         throw std::invalid_argument("invalid CUDA R1 dense group operands");
     const bool round_output = a.mode == Bf16DenseMode::mma3_round;
     std::uint32_t outputs = 0;
@@ -855,7 +855,7 @@ std::vector<KernelBinding> bind_projection_batch(const core::Bf16ProjectionBatch
     if (count) {
         const auto plan = rows::plan({std::span(jobs).first(count), 1, 0, rows::Packing::fewest_launches}, profile);
         for (const auto& launch : plan.launches()) {
-            const auto args = cuda::mma_group_args(launch);
+            const auto args = cuda::mma_group_args(launch, cuda::kRowsAddResidual, cuda::kRowsRoundBf16);
             auto leaf = bind_leaf(linear_independent, {{launch.tiles.total(), 1, 1}, {256, 1, 1}, 0}, args);
             // Encode which outputs are rounded in the chain identity used by the recipe/compiler.
             for (unsigned j = 0; j < args.tiles.count; ++j) leaf.chain_identity += args.jobs[j].round_bf16 ? 'r' : 'f';

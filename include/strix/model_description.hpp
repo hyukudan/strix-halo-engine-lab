@@ -29,7 +29,7 @@ struct ModelDescription {
 // Model launch metadata is consumed by the launcher. Family validators still
 // validate every field of their compiled tensor and arithmetic contracts.
 [[nodiscard]] constexpr bool is_launch_metadata(std::string_view root_key) noexcept {
-    return root_key == "presets" || root_key == "weights" || root_key == "drafter";
+    return root_key == "presets" || root_key == "weights" || root_key == "drafter" || root_key == "multi_device";
 }
 
 // Throws std::invalid_argument (with line/column) for malformed, duplicate or

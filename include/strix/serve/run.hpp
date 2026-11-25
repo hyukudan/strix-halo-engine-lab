@@ -98,6 +98,7 @@ struct ServeShell {
         std::optional<profile::Name> tier;
         std::string backend, asset, bind, port;
         bool print = false;
+        profile::multi_device::Query placement;   // --device-count N / --placement FORM (tier set by the resolver)
     };
     std::string registry_root = ".";
     std::function<int(const ServiceSelection&, const NativeRequest&, std::ostream&)> launch;

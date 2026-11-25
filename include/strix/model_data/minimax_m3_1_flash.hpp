@@ -56,6 +56,16 @@ inline constexpr bool selection_bias = true;
 } // namespace route
 inline constexpr std::int64_t top_k = 4;
 } // namespace moe
+namespace multi_device {
+namespace legacy_env {
+inline constexpr std::string_view STRIX_MM_PF_GROUP = "forms.layers.window_rows";
+inline constexpr std::string_view STRIX_MM_PF_MOE_GROUP = "forms.layers.window_rows";
+inline constexpr std::string_view STRIX_SPLIT = "forms.layers";
+inline constexpr std::string_view STRIX_SPLIT_BLOCK = "forms.layers.window_rows";
+inline constexpr std::string_view STRIX_SPLIT_CUT = "forms.layers.cut";
+inline constexpr std::string_view STRIX_TP2_EXCHANGE_FMT = "forms.tensor.wire";
+} // namespace legacy_env
+} // namespace multi_device
 inline constexpr std::string_view name = "minimax-m3.1-flash";
 namespace presets {
 inline constexpr std::string_view default_ = "fast";

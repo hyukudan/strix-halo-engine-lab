@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cuda/core/select_spec.hpp"
+#include "attn_core/select_spec.hpp"
 
 #include <cub/block/block_scan.cuh>
 #include <cuda_runtime.h>

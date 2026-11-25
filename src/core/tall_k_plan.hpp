@@ -1,11 +1,14 @@
 #pragma once
 
-#include "tall_family.cuh"
+#include "tall_bf16_plan.hpp"
+#include "tall_family.hpp"
 
 #include <cstddef>
 #include <vector>
 
-namespace strix::cuda::core::tall {
+namespace strix::core::tall {
+
+using ::strix::cuda::core::tall::Reduction;
 
 struct KPlan {
     std::vector<int> blocks;
@@ -28,14 +31,11 @@ inline KPlan k_plan(Reduction reduction, std::uint32_t in, std::uint32_t splits,
         }
     } else {
         const std::uint32_t blocks = in >> 5;
-        const std::uint32_t unit = reduction == Reduction::warp_chain ? 4 : 8;
-        const std::uint32_t groups = (blocks + unit - 1) / unit;
-        for (std::uint32_t warp = 0; warp < 8; ++warp) {
-            for (std::uint32_t group = warp; group < groups; group += 8)
-                for (std::uint32_t offset = 0; offset < unit && group * unit + offset < blocks; ++offset)
-                    plan.blocks.push_back(static_cast<int>(group * unit + offset));
-            plan.ends.push_back(static_cast<int>(plan.blocks.size()));
-        }
+        using strix::core::tall::Bf16ExactPlan;
+        const std::uint32_t unit = reduction == Reduction::warp_chain ? Bf16ExactPlan::blocks_per_group : 8U;
+        strix::core::tall::visit_warp_k_segments(blocks, unit,
+            [&](std::uint32_t block) { plan.blocks.push_back(static_cast<int>(block)); },
+            [&](std::uint32_t) { plan.ends.push_back(static_cast<int>(plan.blocks.size())); });
     }
     if (blocks_k > 1) {
         const auto step = static_cast<std::size_t>(blocks_k);
@@ -47,4 +47,4 @@ inline KPlan k_plan(Reduction reduction, std::uint32_t in, std::uint32_t splits,
     return plan;
 }
 
-}  // namespace strix::cuda::core::tall
+}  // namespace strix::core::tall

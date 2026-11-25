@@ -21,6 +21,7 @@ struct ReplicaState {
     ServeCapacity capacity;
     bool healthy = false;
     double ewma_ms_per_token = 0; // 0 = unknown
+    std::string worker_instance_id{}; // empty for a legacy status response
 };
 
 struct RouteRequest {

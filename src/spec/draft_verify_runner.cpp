@@ -1,8 +1,10 @@
 #include "strix/session/draft_verify_runner.hpp"
+#include "strix/session/linear_verify_step.hpp"
 
 #include "strix/spec/greedy_prefix.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <limits>
 
@@ -47,16 +49,11 @@ exec::StepBlock VerifyWindowPlan::describe(std::uint32_t width, std::uint64_t fr
     if (anchor == spec::kNoToken || std::ranges::find(drafts, spec::kNoToken) != drafts.end())
         throw std::invalid_argument("draft verify requires token IDs");
 
-    const auto valid = static_cast<std::uint32_t>(drafts.size()) + 1U;
-    exec::StepBlock step{};
-    step.h.rows = width;
-    step.h.valid_mask = (1U << valid) - 1U;
-    for (std::uint32_t i = 0; i < valid; ++i) {
-        step.row[i] = {i ? drafts[i - 1U] : anchor, static_cast<std::uint32_t>(frontier) + i, slot,
-                       i ? i - 1U : exec::kStepNoParent, (1U << i) - 1U,
-                       exec::step_valid | exec::step_pending_state, 0, 0};
-    }
-    return step;
+    std::array<std::uint32_t, max_width> ids{anchor};
+    std::ranges::copy(drafts, ids.begin() + 1);
+    const LinearVerifyWindow window{width, static_cast<std::uint32_t>(frontier), slot, 0U,
+                                    LinearVerifyRows::exclusive_pending};
+    return linear_verify_step(window, std::span(ids).first(drafts.size() + 1U));
 }
 
 namespace detail {

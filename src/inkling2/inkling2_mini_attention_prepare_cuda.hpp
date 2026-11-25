@@ -30,7 +30,8 @@ struct MiniPreparedCudaBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGq
     bool linear_admitted(const float* input, unsigned width, unsigned rows,
                          std::span<const MiniAttentionLinear> views) const {
         return core::for_each_bf16_projection_group<cuda_core::kMaxBf16RowProjections>(views, true, [&](auto group) {
-            return cuda_core::detail::valid_bf16_dense_row_group({input, width, group}, rows, arithmetic);
+            return cuda_core::detail::valid_bf16_dense_row_group({input, width, group}, rows,
+                                                                arithmetic == cuda_core::DenseArith::mma3);
         });
     }
 

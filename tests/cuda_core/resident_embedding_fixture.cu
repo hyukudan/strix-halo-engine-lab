@@ -1,6 +1,6 @@
 // Shared activation regression; no model, private kernel, or performance measurement.
 #include "cuda/core/dense/bf16_rows.hpp"
-#include "cuda/core/lookup_catalog.hpp"
+#include "core/lookup_catalog.hpp"
 #include "exec/catalog_cuda_decode.hpp"
 #include "strix/weight/formats/scalar_float.hpp"
 

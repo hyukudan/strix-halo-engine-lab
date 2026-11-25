@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <span>
 
+// Retain the existing names of types in device kernel signatures.
 namespace strix::cuda::core::head {
 
 namespace ha = ::strix::head_argmax;

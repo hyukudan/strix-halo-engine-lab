@@ -81,6 +81,12 @@ inline constexpr double ple_combine_scale = 0x1.6a09e6p-1 /* 0.7071067690849304 
 inline constexpr double ple_embedding_scale = 0x1p+4 /* 16 */;
 inline constexpr std::int64_t tap_layers[] = {5, 11, 17, 23, 35};
 } // namespace extras
+namespace multi_device {
+namespace legacy_env {
+inline constexpr std::string_view STRIX_G4_PAIR = "forms.layers";
+inline constexpr std::string_view STRIX_G4_PAIR_CUT = "forms.layers.cut";
+} // namespace legacy_env
+} // namespace multi_device
 inline constexpr std::string_view name = "nemotron-3.5-bolt-e4b";
 namespace presets {
 inline constexpr std::string_view default_ = "fast";

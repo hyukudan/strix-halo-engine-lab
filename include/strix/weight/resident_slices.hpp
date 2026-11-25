@@ -35,6 +35,8 @@ public:
         // An explicit format declares a compact [N,K] BF16-source matrix.
         std::optional<FormatId> matrix_storage{};
         std::uint64_t row_pitch{};  // Zero uses the natural layout.
+        // Pre-encoded bytes of matrix_storage (geometry.bytes long); replaces the BF16 conversion.
+        std::optional<Slice> prepacked{};
     };
 
     // Offsets are sorted within a shard so queued reads follow file order.
@@ -51,19 +53,26 @@ public:
         plan.ranges_.reserve(tensors.size());
         constexpr auto limit = std::numeric_limits<std::size_t>::max();
         const auto mask = alignment - 1U;
-        for (const auto& [name, raw, matrix_storage, row_pitch] : tensors) {
+        for (const auto& [name, raw, matrix_storage, row_pitch, prepacked] : tensors) {
             Slice payload{};
             if (const auto status = subslice(raw->payload, {0, raw->payload.range.bytes}, payload); !status)
                 throw std::invalid_argument("invalid resident tensor " + std::string(name) + ": " + status.detail);
             auto dtype = slice_dtype(raw->wire_dtype);
             MatrixLoadGeometry geometry{};
+            if (prepacked && (!matrix_storage || *matrix_storage == kBf16WeightStorage))
+                throw std::invalid_argument("prepacked resident tensor needs a packed matrix storage " + std::string(name));
             if (matrix_storage) {
                 if (dtype != SliceDtype::bf16)
                     throw std::invalid_argument("resident matrix requires BF16 source " + std::string(name));
                 if (const auto status = matrix_load_geometry(*matrix_storage, raw->shape, geometry); !status)
                     throw std::invalid_argument("invalid resident matrix " + std::string(name) + ": " + status.detail);
-                if (const auto status = prepare_bf16_matrix_slice(raw->payload, raw->shape, *matrix_storage, payload); !status)
+                if (prepacked) {
+                    if (prepacked->range.bytes != geometry.bytes)
+                        throw std::invalid_argument("prepacked resident matrix has wrong byte count " + std::string(name));
+                    payload = *prepacked;
+                } else if (const auto status = prepare_bf16_matrix_slice(raw->payload, raw->shape, *matrix_storage, payload); !status) {
                     throw std::invalid_argument("invalid resident matrix " + std::string(name) + ": " + status.detail);
+                }
                 if (*matrix_storage != kBf16WeightStorage) dtype = SliceDtype::bytes;
             }
             const auto rows = raw->shape.dims[0];

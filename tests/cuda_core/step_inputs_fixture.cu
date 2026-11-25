@@ -1,5 +1,6 @@
 // Build locally. Run only on the native test node.
 #include "cuda/core/head_emit.cuh"
+#include "cuda/core/step_inputs.cuh"
 #include "step_inputs_cases.hpp"
 
 #include <algorithm>

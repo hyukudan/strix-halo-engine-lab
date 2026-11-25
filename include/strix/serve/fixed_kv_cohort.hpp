@@ -85,11 +85,15 @@ public:
     void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                 std::span<std::uint32_t> top) override {
         withdraw();
+        // A decoder with the score-read hook may use a pick-only form when no lane needs final scores.
+        bool reads_scores = false;
         for (const auto& group : groups) {
             if (group.rows != 1U) throw std::logic_error("fixed KV cohort requires one decode row per lane");
             window_.push_back(group.lane);
+            reads_scores = reads_scores || group.reads_scores;
         }
-        decoder_->decode_slots(window_, tokens, top);
+        if constexpr (kScoreReads) decoder_->decode_slots(window_, tokens, top, reads_scores);
+        else decoder_->decode_slots(window_, tokens, top);
         verify_pending_ = true;
     }
 
@@ -129,6 +133,10 @@ private:
         { decoder.final_logits_supported() } -> std::convertible_to<bool>;
         { decoder.logit_width() } -> std::convertible_to<std::uint32_t>;
         decoder.read_slot_logits(std::uint32_t{}, out);
+    };
+    static constexpr bool kScoreReads = requires(Decoder& decoder, const std::vector<std::uint32_t>& window,
+                                                 std::span<const std::uint32_t> tokens, std::span<std::uint32_t> top) {
+        decoder.decode_slots(window, tokens, top, bool{});
     };
     static constexpr bool kPieces = requires(const Decoder& decoder) {
         { decoder.prefill_piece_rule() } -> std::convertible_to<PromptPieceRule>;

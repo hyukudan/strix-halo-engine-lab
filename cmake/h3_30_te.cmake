@@ -30,7 +30,7 @@ if(BUILD_TESTING)
 endif()
 
 # GPU text path (gfx1151). The pack reader is host code; the GPU gate is a separate executable.
-add_library(strix_h3_te_pack STATIC src/h3/te/te_pack_reader.cpp src/h3/te/te_sha256.cpp)
+add_library(strix_h3_te_pack STATIC src/h3/te/te_pack_reader.cpp src/core/sha256.cpp)
 target_link_libraries(strix_h3_te_pack PUBLIC strix_h3_te)
 if(MSVC)
     target_compile_options(strix_h3_te_pack PRIVATE /utf-8)

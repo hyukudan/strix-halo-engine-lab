@@ -1,5 +1,5 @@
 #include "strix/weight/source.hpp"
-#include "h3/te/te_sha256.hpp"
+#include "core/sha256.hpp"
 #include "strix/file_snapshot.hpp"
 #include <algorithm>
 #include <cstdio>
@@ -22,7 +22,7 @@
 namespace strix::weight {
 namespace {
 Digest256 digest(std::span<const Byte> bytes) {
-    h3::te::Sha256 hash; hash.update(bytes.data(),bytes.size()); return {hash.finish()};
+    core::Sha256 hash; hash.update(bytes.data(),bytes.size()); return {hash.finish()};
 }
 class FileSource final : public Source {
     struct Snapshot { std::array<std::uint64_t,6> words{}; bool operator==(const Snapshot&) const = default; };
@@ -84,7 +84,7 @@ public:
     Digest256 identity() const override {
         {std::lock_guard lock(mutex_);if(!(snapshot()==snapshot_))throw std::runtime_error("source changed after indexing");}
         std::call_once(digest_once_,[&] {
-            h3::te::Sha256 hash;std::array<Byte,65536> bytes;
+            core::Sha256 hash;std::array<Byte,65536> bytes;
             for(std::uint64_t at=0;at<size_;) {
                 const auto n=std::size_t(std::min<std::uint64_t>(bytes.size(),size_-at));
                 auto status=read({at,n},{bytes.data(),n});if(!status)throw std::runtime_error(status.detail);
@@ -171,7 +171,7 @@ std::shared_ptr<const Source> memory_source(std::span<const Byte> bytes,std::str
 std::shared_ptr<const Source> view_source(std::span<const Byte> bytes,std::shared_ptr<const void> owner,std::string shard){return std::make_shared<ViewSource>(bytes,std::move(owner),std::move(shard));}
 std::unique_ptr<std::istream> source_stream(std::shared_ptr<const Source> source) {return std::make_unique<SourceStream>(std::move(source));}
 TensorId tensor_id(const Source& source,std::string_view name,const Digest256& header) {
-    h3::te::Sha256 hash;const auto shard=source.shard_name();
+    core::Sha256 hash;const auto shard=source.shard_name();
     if(shard.empty()){auto d=source.identity();hash.update(d.bytes.data(),d.bytes.size());}
     else hash.update(shard.data(),shard.size());
     const char separator=0;hash.update(&separator,1);hash.update(header.bytes.data(),header.bytes.size());hash.update(name.data(),name.size());
@@ -180,7 +180,7 @@ TensorId tensor_id(const Source& source,std::string_view name,const Digest256& h
 std::shared_ptr<const Source> namespace_source(std::shared_ptr<const Source> source,std::string shard){return std::make_shared<NamespaceSource>(std::move(source),std::move(shard));}
 Status digest_slice(const Slice& slice,Digest256& out) {
     if(!slice.source || slice.range.offset>slice.source->size() || slice.range.bytes>slice.source->size()-slice.range.offset)return {Error::malformed,"digest slice outside source"};
-    h3::te::Sha256 hash;std::array<Byte,65536> bytes;
+    core::Sha256 hash;std::array<Byte,65536> bytes;
     for(std::uint64_t at=0;at<slice.range.bytes;) {
         const auto n=std::size_t(std::min<std::uint64_t>(bytes.size(),slice.range.bytes-at));
         auto status=slice.source->read({slice.range.offset+at,n},{bytes.data(),n});if(!status)return status;

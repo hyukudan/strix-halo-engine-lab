@@ -19,7 +19,7 @@
 #include "nvfp4_quant.cuh"
 #include "../../recur_norm.cuh"
 
-#include "../../tall_family.cuh"
+#include "../../../../core/tall_family.hpp"
 
 namespace strix::cuda::core::nvfp4::tile::sm120 {
 constexpr std::uint32_t kThreads = 256, kStages = 3, kSlotsA = 8, kSlotsB = 32;

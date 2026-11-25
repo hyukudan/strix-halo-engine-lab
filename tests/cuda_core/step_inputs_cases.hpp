@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cuda/core/step_inputs.cuh"
+#include "core/step_inputs_plan.hpp"
 #include "strix/head_argmax.hpp"
 
 #include <bit>

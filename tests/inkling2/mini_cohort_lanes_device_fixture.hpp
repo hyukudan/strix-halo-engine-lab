@@ -509,6 +509,74 @@ inline int served_prefill(const char* checkpoint, weight::FormatId storage, std:
     return 0;
 }
 
+#if !defined(__HIPCC__)
+// Fill the resident image and compare the CLI's resident session with the production serving cohort.
+inline int w4a4_prompt_parity(const char* checkpoint, weight::FormatId storage,
+                              moe_core::grouped_w4a4::Activations activations) {
+    constexpr unsigned chunk = 128U, generated = 4U, context = chunk + 1U + generated;
+    constexpr std::array lengths{2U, chunk - 1U, chunk, chunk + 1U};
+    std::array<std::vector<unsigned>, lengths.size()> prompts, expected_ids;
+    std::array<std::vector<float>, lengths.size()> expected_scores;
+    for (std::size_t i = 0; i < lengths.size(); ++i)
+        for (unsigned row = 0; row < lengths[i]; ++row) prompts[i].push_back(cohort_token(0U, row));
+    {
+        // Match the server's grouped decode arithmetic and use a singleton tail at chunk + 1.
+        MiniResidentDecoder decoder(checkpoint, context, chunk, false, MiniResidentBackend::default_step_graphs, storage);
+        std::vector<float> bf16_scores(kOutputVocabulary);
+        (void)decoder.prefill(prompts[2U], bf16_scores);
+        decoder.set_moe_w4a4(activations);
+        static_assert(MiniMoeConfig::format(0U) == weight::microscaled::MatrixFormat::nvfp4);
+        if (decoder.step_program_backend().moe_w4a4_class(0U) != activations)
+            throw std::logic_error("resident NVFP4 layer did not bind the selected W4A4 class");
+        for (std::size_t i = 0; i < lengths.size(); ++i) {
+            decoder.reset_gate_session();
+            auto& scores = expected_scores[i];
+            auto& ids = expected_ids[i];
+            scores.resize(kOutputVocabulary);
+            ids.push_back(decoder.prefill(prompts[i], scores));
+            while (ids.size() < generated && ids.back() != kMiniEosToken) ids.push_back(decoder.decode(ids.back()));
+        }
+        if (std::memcmp(expected_scores[2U].data(), bf16_scores.data(), bf16_scores.size() * sizeof(float)) == 0)
+            throw std::logic_error("W4A4 matched the BF16 control at full resident capacity");
+    }
+
+    auto decoder = std::make_unique<MiniResidentDecoder>(checkpoint, context, chunk, false,
+        MiniResidentBackend::default_step_graphs, storage);
+    decoder->set_moe_w4a4(activations);
+    serve::FixedKvCohort<MiniResidentDecoder> backend(std::move(decoder), context, 1U, 1U);
+    serve::CohortConfig config;
+    config.context_draft = false;
+    config.max_draft = 0U;
+    config.prompt_slice = chunk;
+    serve::CohortDecoder cohort(backend, config);
+    for (std::size_t i = 0; i < lengths.size(); ++i) {
+        bool saw_final_scores = false;
+        serve::CohortRequest request;
+        request.id = i + 1U;
+        request.prompt = prompts[i];
+        request.max_tokens = generated;
+        request.stop = {kMiniEosToken};
+        request.prefilled = [&](std::uint64_t rows) {
+            if (rows != lengths[i]) return;
+            const auto scores = backend.read_final_logits(0U);
+            if (scores.size() != expected_scores[i].size() ||
+                std::memcmp(scores.data(), expected_scores[i].data(), scores.size_bytes()) != 0)
+                throw std::logic_error("W4A4 CLI and served prompt logits differ");
+            saw_final_scores = true;
+        };
+        cohort.submit(std::move(request));
+        cohort.run();
+        const auto results = cohort.take_finished();
+        if (results.size() != 1U || !results[0].error.empty() || !results[0].first_from_prefill ||
+            !saw_final_scores || results[0].ids != expected_ids[i])
+            throw std::logic_error("W4A4 CLI and served generation differ");
+        std::cout << "PASS " << moe_core::grouped_w4a4::identity(activations) << " prompt rows " << lengths[i]
+                  << " (raw logits and all generated IDs)\n";
+    }
+    return 0;
+}
+#endif
+
 }  // namespace strix::inkling2::test
 
 int main(int argc, char** argv) {
@@ -531,6 +599,13 @@ int main(int argc, char** argv) {
         }
         if (served_prefill)
             return inkling2::test::served_prefill(argv[1], storage, prompt_lengths);
+#if !defined(__HIPCC__)
+        inkling2::MiniWeightOptions options;
+        options.tier.profile = profile::Name::fast;
+        const auto activations = inkling2::admit_mini_moe_w4a4(inkling2::resolve_mini_profile(options, true), "cuda");
+        if (moe_core::grouped_w4a4::w4a4_gate_up(activations))
+            return inkling2::test::w4a4_prompt_parity(argv[1], storage, activations);
+#endif
         // The production admission (the server's, inkling2_mini_serve.cpp), decided before the decoder is built.
 #if defined(__HIPCC__)
         constexpr bool hip_backend = true;

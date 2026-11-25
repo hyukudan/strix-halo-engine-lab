@@ -14,7 +14,8 @@ namespace strix::dist {
 
 // A Transport over a two-sided exchange (both ranks move one equal-size message each way, e.g. a communicator's tagged
 // host path between engine calls). Lets a pair engine whose only link is such an exchange run a protocol written
-// against Transport (serve::ReplicatedCohort / follow_cohort) without opening a second channel.
+// against Transport without opening a second channel. Replica use requires an Abort callback that ends pending
+// peer exchanges without destroying the adapter.
 //
 // send(m) is exchange(m, discarded) and receive(m) is exchange(zeros, m): a one-sided message costs one exchange of
 // the same size, so both ranks must make matching send / receive calls of equal sizes in the same order, which is the
@@ -43,11 +44,18 @@ public:
         exchange_(out, in);
     }
     [[nodiscard]] std::string name() const override { return name_; }
+    [[nodiscard]] bool supports_peer_abort() const noexcept override { return bool(abort_); }
     void abort(const std::string& why) override {
-        if (aborted_) return;
+        if (abort_delivered_ || (aborted_ && !abort_)) return;
         aborted_ = true;
-        why_ = why;
-        if (abort_) abort_(why);
+        if (abort_) {
+            abort_(why);
+            abort_delivered_ = true;
+        }
+        try {
+            why_ = why;
+        } catch (...) {  // A diagnostic allocation must not prevent cancellation.
+        }
     }
     [[nodiscard]] bool aborted() const noexcept { return aborted_; }
 
@@ -57,6 +65,7 @@ private:
     Abort abort_;
     std::vector<std::byte> scratch_, zeros_;
     bool aborted_ = false;
+    bool abort_delivered_ = false;
     std::string why_;
 };
 

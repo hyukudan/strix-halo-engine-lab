@@ -1,7 +1,7 @@
 #pragma once
 
 #include "head_argmax.cuh"
-#include "head_emit.hpp"
+#include "core/head_emit.hpp"
 
 #include <math_constants.h>
 

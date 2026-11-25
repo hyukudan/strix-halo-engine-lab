@@ -26,6 +26,20 @@ Campos comunes a todos los ficheros: `schema = "strix-model/v1"` y un `name` ún
 fichero es descriptivo: no elige kernel, calendario ni interruptor y no imprime ninguna identidad. Qué se comprueba, y
 contra qué, cambia según la familia; véase la lista de alcance más abajo.
 
+`[multi_device]` opcional (lo lee el resolver de perfiles común, `include/strix/profile/multi_device.hpp`): las formas
+de colocación que el modelo admite en varios dispositivos (`replica`, `layers`, `tensor`, `speculation`, con sus datos
+de corte, filas, cable y drafter) y `regimes` ordenados que eligen forma por fase, filas del prompt, peticiones listas y
+tier. Un modelo sin la sección resuelve `single` con cualquier número de dispositivos. El cable `reference` conserva
+cada unión exacta; un cable más estrecho nunca se resuelve en EXACT. `strix run|serve --device-count N --placement FORMA
+--print-effective-config` imprime la decisión y quién la ejecuta (`executed_by`). Inspeccionar y ejecutar son cosas
+distintas: un lanzamiento `run` / `serve` ejecuta un solo motor, así que solo se admite cuando la decisión es `single`;
+`replica` solo la ejecuta `strix-router`, que tiene los endpoints (cada worker se arranca con `--device-count 1` y
+después el router con las direcciones de los workers); cualquier otra forma se rechaza con su motivo hasta que un
+motor la consuma. Un régimen solo puede nombrar formas declaradas, y su `wire` solo formas que lo llevan (`layers`,
+`tensor`, `speculation`). Los interruptores
+locales de los motores (`STRIX_*_PF_PIPE_CUT`, ...) siguen actuando dentro del motor; la config efectiva lista los que
+están puestos en `multi_device.legacy_env`. Ese inventario son datos del propio modelo: cada modelo declara los interruptores que sus motores leen bajo `[multi_device.legacy_env]` (`STRIX_NOMBRE = "forms.layers.cut"`, la clave prevista para sustituirlo) y solo se listan los del modelo elegido. Una sección con solo `legacy_env` no declara política de colocación. El `wire` de un régimen que difiere del de la forma lo sustituye en el informe (`wire`, `settings.wire`); el de la forma se muestra al lado como `declared_wire`, y un wire que cambia bits es solo informe (`wire_status`) hasta que el resolvedor compartido resuelva una palanca cualificada (`lever` se lee, no se resuelve).
+
 El lector (`src/model_description.cpp`) acepta un subconjunto de TOML: claves simples y con puntos, tablas, tablas en
 línea, arrays, cadenas de una línea, enteros y decimales, booleanos. Cualquier otra cosa es un error con línea y
 columna.

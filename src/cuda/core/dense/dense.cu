@@ -8,6 +8,7 @@
 #include "dense_mma.hpp"
 #include "row_plan.hpp"
 #include "rows_bf16_epilogue.cuh"
+#include "rows_f32_input_major.cuh"
 
 #include <cmath>
 
@@ -540,6 +541,18 @@ cudaError_t dense_fp32_rows_grid(const DenseWeight& w, const float* x, float* y,
     // Two outputs reuse activation reads without the stack traffic of the four-output grid tile.
     if (w.out % 2U == 0) return enqueue.template operator()<WeightFormat::bf16, 2>();
     return enqueue.template operator()<WeightFormat::bf16, 1>();
+}
+
+cudaError_t dense_f32_input_major_rows(const float* x, const float* w, float* y,
+    std::size_t rows, unsigned in, unsigned out, unsigned out_stride, cudaStream_t stream) {
+    const auto grid = plan_f32_input_major_rows(rows, in, out, out_stride);
+    if (!grid.valid()) return cudaErrorInvalidValue;
+    if (grid.row_tiles == 0) return cudaSuccess;
+    if (!x || !w || !y) return cudaErrorInvalidValue;
+    using Tile = F32InputMajorRows;
+    dense_detail::f32_input_major_rows<Tile><<<dim3(grid.row_tiles, grid.output_tiles), Tile::outputs, 0, stream>>>(
+        x, w, y, rows, in, out, out_stride);
+    return cudaGetLastError();
 }
 
 }  // namespace strix::cuda_core
