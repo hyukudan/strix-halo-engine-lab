@@ -627,7 +627,7 @@ public:
 
     void prefill_gate_rows(std::span<const unsigned> prompt, std::span<float> logits) {
         backend_.abandon_capture();
-        pending_scores_ = {};
+        settle_pending_scores(false);
         auto& state = slots_.front()->state();
         validate_inputs(state, prompt, {});
         const auto rows = logits.size() / kOutputVocabulary;
@@ -696,6 +696,7 @@ private:
     void decode_cohort(std::span<const unsigned> slots, std::span<const unsigned> ids, std::span<unsigned> top,
                        std::uint32_t width) {
         const auto rows = static_cast<unsigned>(slots.size());
+        pending_scores_ = {};  // the cohort rewrites hidden_ and every score row it describes (last_logit_rows_)
         cohort_lanes_.clear();
         for (unsigned row = 0; row < rows; ++row)
             cohort_lanes_.push_back({slots[row], groups_[row].state->committed(), ids[row]});
@@ -974,7 +975,7 @@ private:
         const auto elements = ids.size() * kHiddenWidth;
         const auto embeddings = embeddings_.span().first(elements);
         reserve_staged_logits(host_logits.size());
-        pending_scores_ = {};
+        settle_pending_scores(pick_next && verify_top.size() <= 1U);
         const bool multi_pick = verify_top.size() > 1U;
         if (multi_pick && !verify_greedy_) {
             if (!verify_logits_) verify_logits_.emplace(std::size_t{max_verify_rows()} * kLogitPitch);
@@ -1123,14 +1124,30 @@ private:
     // first score read (read_slot_logits, e.g. a sampled served lane) from the head inputs that pick used (still in
     // hidden_: no forward ran since), through the same per-row project_head the unscreened pick runs at the same pitched
     // rows, so the reader gets the scores of this step, never those of an earlier one.
+    // The descriptor stays until every row is projected: a projection that throws leaves it pending, so a retried read
+    // recomputes the rows from the same inputs instead of reading the score rows of an earlier step.
     void materialize_scores() {
         if (pending_scores_.rows == 0U) return;
         const auto pending = pending_scores_;
-        pending_scores_ = {};
         for (unsigned row = 0; row < pending.rows; ++row)
             project_head(pending.input + std::size_t{row} * kHiddenWidth,
                          std::span<float>(pending.scores + ::strix::head::logit_row_offset(row, kLogitPitch),
                                           kOutputVocabulary), true);
+        pending_scores_ = {};
+    }
+
+    // Before an operation overwrites hidden_ (the head inputs of a deferred pick): score rows that stay readable after it
+    // (last_logit_rows_ still describes them: a multi-row verify writes its scores to verify_logits_, a prompt chunk
+    // writes none) are materialized first, so a late read_slot_logits gets this step's bits exactly as with eager scores;
+    // rows the operation itself rewrites (one deferred row and a one-row pick into row 0) or no longer describes
+    // (last_logit_rows_ == 0) are dropped. The one-row screened pick followed by the next one-row pick never projects.
+    void settle_pending_scores(bool rewrites_row0) {
+        if (pending_scores_.rows == 0U) return;
+        if (last_logit_rows_ == 0U || (rewrites_row0 && pending_scores_.rows == 1U)) {
+            pending_scores_ = {};
+            return;
+        }
+        materialize_scores();
     }
 
 #if defined(__HIPCC__)
