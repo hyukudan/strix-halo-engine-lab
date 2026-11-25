@@ -258,9 +258,12 @@ static bool check_image_routes() {
                                                                       {2304U, 2304U, 3200U, 1024U, 9216U}}};
     // Measured launch groups (exact outputs in launch order, one pitch, own heights): a launch over several projections
     // is only as measured as its listed tuple, whatever its members' single widths are.
-    static constexpr std::array<strix::core::ImageGroupRow, 3> groups{{{2304U, 0U, 2U, {3072U, 1024U}, 1024U, 9216U},
+    static constexpr std::array<strix::core::ImageGroupRow, 6> groups{{{2304U, 0U, 2U, {3072U, 1024U}, 1024U, 9216U},
                                                                       {2304U, 0U, 3U, {3072U, 1024U, 1024U}, 1024U, 9216U},
-                                                                      {2304U, 0U, 2U, {3072U, 128U}, 1024U, 8192U}}};
+                                                                      {2304U, 0U, 2U, {3072U, 128U}, 1024U, 8192U},
+                                                                      {2304U, 0U, 2U, {3072U, 384U}, 1024U, 9216U},
+                                                                      {2304U, 0U, 2U, {1024U, 1024U}, 1024U, 9216U},
+                                                                      {2304U, 0U, 3U, {1024U, 1024U, 1024U}, 1024U, 9216U}}};
     constexpr strix::core::ImageRoutePolicy policy{1024U, 64U, 128U, 2048U, 9216U, shapes, groups};
     constexpr unsigned K = 2304U;
     constexpr unsigned kWide = 1U << 20U;
@@ -316,23 +319,34 @@ static bool check_image_routes() {
         strix::core::for_each_image_route_run<3U>(four, routes, K, Status::ok, record) != Status::ok ||
         runs != decltype(runs){{R::packed, {1024U, 1024U, 1024U}}, {R::packed, {1024U}}})
         return false;
-    // An unlisted grouping of measured widths: the packed runs are cut into measured launches (the longest listed prefix,
-    // else one projection), and the image entry's launch is the K32 tile.
+    // An unlisted grouping of measured widths: the launch cut stays the longest listed prefix (else one projection), but
+    // a call whose cut makes more packed launches than its uncut runs is not a priced plan: every projection keeps the
+    // FP32 rows, so the call makes the incumbent's launches (the plan counts the final launches, not packed columns).
     const std::array<Bf16RowProjection, 4> qgkv{{{w, 3072U, y, false, 0U}, {w, 3072U, y, false, 0U},
         {w, 1024U, y, false, 0U}, {w, 1024U, y, false, 0U}}};
     runs.clear();
-    if (!strix::core::plan_image_routes<4U>(policy, K, 8192U, qgkv, kWide, routes, group_admits, image_admits) ||
-        !routed({R::packed, R::packed, R::packed, R::packed}) ||
-        strix::core::for_each_image_route_run<4U>(qgkv, routes, K, Status::ok, record, &policy, 8192U) != Status::ok ||
+    const std::array<ImageRoute, 4> qgkv_packed{R::packed, R::packed, R::packed, R::packed};
+    if (strix::core::plan_image_routes<4U>(policy, K, 8192U, qgkv, kWide, routes, group_admits, image_admits) ||
+        !std::all_of(routes.begin(), routes.begin() + 4, [](R r) { return r == R::fp32_rows; }) ||
+        strix::core::for_each_image_route_run<4U>(qgkv, qgkv_packed, K, Status::ok, record, &policy, 8192U) != Status::ok ||
         runs != decltype(runs){{R::packed, {3072U}}, {R::packed, {3072U, 1024U, 1024U}}})
         return false;
     const std::array<Bf16RowProjection, 3> wide_pair{{{w, 3072U, y, false, 0U}, {w, 128U, y, false, 0U},
         {w, 128U, y, false, 0U}}};
     runs.clear();
-    if (!strix::core::plan_image_routes<4U>(policy, K, 8192U, wide_pair, kWide, routes, group_admits, image_admits) ||
-        strix::core::for_each_image_route_run<4U>(wide_pair, routes, K, Status::ok, record, &policy, 8192U) != Status::ok ||
+    const std::array<ImageRoute, 3> wide_packed{R::packed, R::packed, R::packed};
+    if (strix::core::plan_image_routes<4U>(policy, K, 8192U, wide_pair, kWide, routes, group_admits, image_admits) ||
+        !std::all_of(routes.begin(), routes.begin() + 3, [](R r) { return r == R::fp32_rows; }) ||
+        strix::core::for_each_image_route_run<4U>(wide_pair, wide_packed, K, Status::ok, record, &policy, 8192U) !=
+            Status::ok ||
         runs != decltype(runs){{R::packed, {3072U, 128U}}, {R::packed, {128U}}} ||
         strix::core::image_packed_schedule(policy, true, K, 8192U, wide_pair))
+        return false;
+    // A listed grouping is one packed launch and routes.
+    const std::array<Bf16RowProjection, 3> listed_group{{{w, 3072U, y, false, 0U}, {w, 1024U, y, false, 0U},
+        {w, 1024U, y, false, 0U}}};
+    if (!strix::core::plan_image_routes<4U>(policy, K, 8192U, listed_group, kWide, routes, group_admits, image_admits) ||
+        !routed({R::packed, R::packed, R::packed}))
         return false;
     // Rounded projections of different store policies (separate / incumbent) never share a run.
     const std::array<Bf16RowProjection, 3> policies{{{w, 1024U, y, true, 0U, true}, {w, 1024U, y, true, 0U, true},
@@ -451,7 +465,7 @@ static bool check_image_routes() {
         return false;
     // The call that stores the image: the same rules per projection (a 256-output member stays off the packed route
     // and the 128-output one above 8,192 rows too; >= 16 wide tiles still route).
-    const std::array<Bf16RowProjection, 3> routed_mix{{{w, 3072U, y, false, 0U}, {w, 3072U, y, false, 0U},
+    const std::array<Bf16RowProjection, 3> routed_mix{{{w, 3072U, y, false, 0U}, {w, 1024U, y, false, 0U},
                                                        {w, 256U, y, false, 0U}}};
     if (!strix::core::plan_image_routes<3U>(policy, K, 8236U, routed_mix, kWide, routes, group_admits, image_admits) ||
         !routed({R::packed, R::packed, R::image}) ||
