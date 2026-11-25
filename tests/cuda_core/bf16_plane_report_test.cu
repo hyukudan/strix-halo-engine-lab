@@ -71,8 +71,11 @@ Outcome dispatch(const Case& test, core::Bf16Operand operand, const strix::devic
     if (!context) throw std::runtime_error("dense context");
     std::uint32_t seed = 0x5EEDU + test.width;
     Managed<float> input(std::size_t{test.rows} * test.width);
-    for (std::size_t i = 0; i < input.size; ++i)
-        input.data[i] = std::bit_cast<float>((next(seed) & 0xFFFFU) << 16U | 0x3C000000U);  // BF16-exact, no Inf/NaN
+    // BF16-exact and finite: a random sign and mantissa on the fixed exponent of 0x3C00 (magnitudes in [2^-7, 2^-6)).
+    for (std::size_t i = 0; i < input.size; ++i) {
+        const std::uint32_t bits = next(seed);
+        input.data[i] = std::bit_cast<float>(((bits & 0x8000U) | 0x3C00U | (bits & 0x007FU)) << 16U);
+    }
     std::vector<std::unique_ptr<Weights>> weights;
     std::vector<std::unique_ptr<Managed<float>>> outputs;
     std::vector<core::Bf16RowProjection> projections;
@@ -85,7 +88,9 @@ Outcome dispatch(const Case& test, core::Bf16Operand operand, const strix::devic
     const auto status = cc::enqueue_bf16_dense_rows(input.data, test.width, test.rows, projections, nullptr,
                                                     cc::DenseArith::mma3, context.get(), profile, operand, &planes);
     check(cudaDeviceSynchronize());
+    // The status and the plane observation come first; a rejected dispatch wrote no output, so none is read.
     result.clear();
+    if (status != cudaSuccess) return {status, planes};
     for (const auto& output : outputs) result.emplace_back(output->data, output->data + output->size);
     return {status, planes};
 }
