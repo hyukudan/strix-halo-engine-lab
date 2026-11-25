@@ -166,13 +166,77 @@ struct Options {
     float* dequant = nullptr;                  // optional n x k output: the decoded weights
 };
 
-// n x k source weights -> n rows of k / Storage::elements superblocks (out: n * Storage::row_bytes(k) bytes).
+// Codec policy of the calibrated row coder: the superblock geometry, the per-group scale choice (from the
+// error-updated weights, when the group's first column is reached), the code of one weight for that scale, its decoded
+// value and the superblock packing. FixedGridCodec is the q4_g64 / q6_g64 grid (FP16 scale per 64, signed linear
+// codes); StrixPackCodec is the Strix pack grid (scale byte per 32, sign + table index codes, sp::Header).
 template <class Storage>
-inline EncodeStatus encode_rows(const float* w, std::size_t n, std::size_t k, std::uint8_t* out, const Options& opt = {}) {
-    if (!w || !out || !n || !k || k % Storage::elements != 0U) throw std::invalid_argument("lowbit gptq: K % 128 == 0");
+struct FixedGridCodec {
+    static constexpr std::size_t elements = Storage::elements, group = Storage::group, groups = Storage::groups,
+                                 bytes = Storage::bytes;
+    struct State {
+        std::uint16_t bits = 0;
+        double sd = 0.0, inv = 0.0;
+    };
+    EncodeStatus::Code begin(const float* w, const float* importance, State& st) const {
+        int scratch[Storage::group];
+        if (const auto c = lowbit::detail::encode_group<Storage>(w, scratch, st.bits, importance); c != EncodeStatus::ok)
+            return c;
+        st.sd = static_cast<double>(f16_bits_to_f32(st.bits));
+        st.inv = st.sd > 0.0 ? 1.0 / st.sd : 0.0;
+        return EncodeStatus::ok;
+    }
+    int code(float w, const State& st) const { return st.sd > 0.0 ? lowbit::detail::quantise<Storage>(w, st.sd, st.inv) : 0; }
+    float value(int c, const State& st) const { return static_cast<float>(st.sd) * static_cast<float>(c); }
+    void pack(const int* q, const State* st, std::uint8_t* out) const {
+        std::uint16_t scales[Storage::groups];
+        for (std::size_t g = 0; g < Storage::groups; ++g) scales[g] = st[g].bits;
+        pack_block<Storage>(q, scales, out);
+    }
+};
+
+template <class S>
+struct StrixPackCodec {
+    static constexpr std::size_t elements = S::elements, group = S::group, groups = S::groups, bytes = S::bytes;
+    const sp::Header* header = nullptr;
+    struct State {
+        std::uint8_t byte = 0;
+        bool zero = true;
+        double s = 0.0;
+    };
+    EncodeStatus::Code begin(const float* w, const float* importance, State& st) const {
+        unsigned scratch[S::group];
+        sp::encode_group<S>(w, *header, scratch, st.byte, importance);
+        st.zero = true;
+        for (std::size_t j = 0; j < S::group; ++j) st.zero = st.zero && w[j] == 0.0F;
+        st.s = static_cast<double>(sp::scale_value(st.byte, header->base));
+        return EncodeStatus::ok;
+    }
+    int code(float w, const State& st) const {
+        return st.zero ? 0 : static_cast<int>(sp::quantise<S>(w, st.s, header->table.data()));
+    }
+    float value(int c, const State& st) const {
+        const auto u = static_cast<unsigned>(c);
+        const float m = static_cast<float>(header->table[u & (S::levels - 1U)]) * static_cast<float>(st.s);
+        return (u >> (S::bits - 1U)) != 0U ? -m : m;
+    }
+    void pack(const int* q, const State* st, std::uint8_t* out) const {
+        unsigned codes[S::elements];
+        std::uint8_t scales[S::groups];
+        for (std::size_t j = 0; j < S::elements; ++j) codes[j] = static_cast<unsigned>(q[j]);
+        for (std::size_t g = 0; g < S::groups; ++g) scales[g] = st[g].byte;
+        sp::pack_block<S>(codes, scales, out);
+    }
+};
+
+// n x k source weights -> n rows of k / Codec::elements superblocks (out: n * (k / elements) * bytes bytes).
+template <class Codec>
+inline EncodeStatus encode_rows_with(const Codec& codec, const float* w, std::size_t n, std::size_t k, std::uint8_t* out,
+                                     const Options& opt = {}) {
+    if (!w || !out || !n || !k || k % Codec::elements != 0U) throw std::invalid_argument("lowbit gptq: K % 128 == 0");
     for (std::size_t e = 0; e < n * k; ++e)
         if (!std::isfinite(w[e])) return {EncodeStatus::nonfinite};
-    const std::size_t blocks = k / Storage::elements, row_bytes = blocks * Storage::bytes;
+    const std::size_t blocks = k / Codec::elements, row_bytes = blocks * Codec::bytes;
     constexpr std::size_t kRowBlock = 16;  // rows coded together so each U row is read once per block
     const std::size_t row_blocks = (n + kRowBlock - 1U) / kRowBlock;
     std::vector<std::uint8_t> failed(row_blocks, 0);
@@ -180,9 +244,8 @@ inline EncodeStatus encode_rows(const float* w, std::size_t n, std::size_t k, st
         const NearestRounding nearest;
         const std::size_t r0 = b * kRowBlock, rn = std::min(n - r0, kRowBlock);
         std::vector<float> rows(rn * k), err(rn);
-        std::vector<int> q(rn * Storage::elements);
-        std::vector<std::uint16_t> scales(rn * Storage::groups);
-        std::vector<double> sd(rn), inv(rn);
+        std::vector<int> q(rn * Codec::elements);
+        std::vector<typename Codec::State> states(rn * Codec::groups);
         for (std::size_t r = 0; r < rn; ++r) {
             std::copy(w + (r0 + r) * k, w + (r0 + r + 1U) * k, rows.begin() + static_cast<std::ptrdiff_t>(r * k));
             if (opt.factor && opt.dead)
@@ -190,28 +253,23 @@ inline EncodeStatus encode_rows(const float* w, std::size_t n, std::size_t k, st
                     if (opt.dead[i]) rows[r * k + i] = 0.0F;
         }
         for (std::size_t i = 0; i < k; ++i) {
-            const std::size_t in_block = i % Storage::elements, group = in_block / Storage::group;
+            const std::size_t in_block = i % Codec::elements, group = in_block / Codec::group;
             for (std::size_t r = 0; r < rn; ++r) {
                 float* row = rows.data() + r * k;
-                if (in_block % Storage::group == 0U) {
-                    int scratch[Storage::group];
-                    auto& bits = scales[r * Storage::groups + group];
-                    if (lowbit::detail::encode_group<Storage>(row + i, scratch, bits, opt.importance ? opt.importance + i : nullptr) !=
-                        EncodeStatus::ok) {
-                        failed[b] = 1;
-                        return;
-                    }
-                    sd[r] = static_cast<double>(f16_bits_to_f32(bits));
-                    inv[r] = sd[r] > 0.0 ? 1.0 / sd[r] : 0.0;
+                auto& st = states[r * Codec::groups + group];
+                if (in_block % Codec::group == 0U &&
+                    codec.begin(row + i, opt.importance ? opt.importance + i : nullptr, st) != EncodeStatus::ok) {
+                    failed[b] = 1;
+                    return;
                 }
-                const int code = sd[r] > 0.0 ? lowbit::detail::quantise<Storage>(row[i], sd[r], inv[r]) : 0;
-                q[r * Storage::elements + in_block] = code;
-                const float dq = static_cast<float>(sd[r]) * static_cast<float>(code);
+                const int code = codec.code(row[i], st);
+                q[r * Codec::elements + in_block] = code;
+                const float dq = codec.value(code, st);
                 if (opt.dequant) opt.dequant[(r0 + r) * k + i] = dq;
                 err[r] = opt.factor ? (row[i] - dq) / opt.factor[i * k + i] : 0.0F;
-                if (in_block + 1U == Storage::elements)
-                    pack_block<Storage>(q.data() + r * Storage::elements, scales.data() + r * Storage::groups,
-                                        out + (r0 + r) * row_bytes + (i / Storage::elements) * Storage::bytes);
+                if (in_block + 1U == Codec::elements)
+                    codec.pack(q.data() + r * Codec::elements, states.data() + r * Codec::groups,
+                               out + (r0 + r) * row_bytes + (i / Codec::elements) * Codec::bytes);
             }
             if (!opt.factor) continue;
             const float* ui = opt.factor + i * k;
@@ -225,6 +283,21 @@ inline EncodeStatus encode_rows(const float* w, std::size_t n, std::size_t k, st
     for (const auto f : failed)
         if (f) return {EncodeStatus::scale_overflow};
     return {EncodeStatus::ok};
+}
+
+// q4_g64 / q6_g64: n x k source weights -> n rows of k / Storage::elements superblocks (n * Storage::row_bytes(k) bytes).
+template <class Storage>
+inline EncodeStatus encode_rows(const float* w, std::size_t n, std::size_t k, std::uint8_t* out, const Options& opt = {}) {
+    return encode_rows_with(FixedGridCodec<Storage>{}, w, n, k, out, opt);
+}
+
+// Strix pack: the same coder on the SP grid of header h (its table and base; see sp::make_header / sp::fit_table).
+template <class S>
+inline EncodeStatus encode_rows_sp(const sp::Header& h, const float* w, std::size_t n, std::size_t k, std::uint8_t* out,
+                                   const Options& opt = {}) {
+    StrixPackCodec<S> codec;
+    codec.header = &h;
+    return encode_rows_with(codec, w, n, k, out, opt);
 }
 
 // Output error of a coded matrix against its source under input second moments h (lower triangle, k x k):
