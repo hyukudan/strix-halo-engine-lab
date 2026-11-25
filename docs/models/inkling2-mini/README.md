@@ -107,10 +107,9 @@ pieces cut inside those chunks only at 16-row wave tiles and never shorter than
 17 rows, where every row keeps its route forms, so the answer does not depend
 on other requests. The CUDA command line prefills in 2048-row chunks. An
 explicit `--prefill-rows` without `--slots` also caps the served lanes at that
-many rows, as before. The server prints `served_route`, `prefill_chunk`,
-`prefill_tail` and `first_id` (`prefill` on the command line's route, `decode`
-otherwise) in its startup line; the command line prints
-`strix-prefill-route/v1`.
+many rows, as before. The server's startup line prints `served_route` (`off`
+or `declined` on the existing route; `on` adds `prefill_chunk`, `prefill_tail`
+and `first_id prefill`); the command line prints `strix-prefill-route/v1`.
 
 ## Execution and reuse
 
