@@ -234,7 +234,7 @@ void report(bool pass, const std::string& line) {
 int rows_select_ticket(const std::vector<unsigned>& shapes) {
     constexpr auto select = core::LowBitArithmetic::f16_rows_select;
     constexpr auto sweep = core::LowBitArithmetic::fp32_sweep;
-    const std::string arch(core::detail::current_device_arch());
+    const std::string arch{strix::hip::arch::current_device_arch_name()};
     {
         // The f16 form's incumbent at these rows is the small-M route of the device plan (unbound: the tile everywhere).
         int dev = 0;
