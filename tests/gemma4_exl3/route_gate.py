@@ -42,8 +42,10 @@ def compare(label, reference, observed):
     require(not differences, f"{label}: mismatch in {', '.join(differences)}")
 
 
-# Automatic identity per pack arm (format.hpp auto_version), then the other core forced as a within-identity control.
-ARMS = {"M5": (("auto", "v1"), ("forced", "v3")), "M4": (("auto", "v3"), ("forced", "v1")),
+# Automatic identity where it is slot-invariant (M4/M6 always v3), then the other core forced as a within-identity
+# control. Automatic M5 depends on the session's streams (format.hpp auto_version), so both M5 cores run as explicit
+# lever values, which the command line and the server resolve the same at one and eight slots.
+ARMS = {"M5": (("forced", "v1"), ("forced", "v3")), "M4": (("auto", "v3"), ("forced", "v1")),
         "M6": (("auto", "v3"), ("forced", "v1"))}
 EXECUTED = ("executed_max_streams", "executed_beside_prefill_calls")
 

@@ -86,12 +86,12 @@ constexpr Lever table[] = {
     {.name = "exl3_route", .option = "--exl3-arm", .value = {"", "", "pack"}, .builtin = "off",
      .required = {false, false, true}, .ready = {true, true, true}, .runnable = {true, true, true}, .kind = Kind::pack,
      .apps = all_apps, .asset = true, .source = "EXL3 pack route (--exl3-arm)"},
-    // Fixed per pack arm, independent of --streams and serve slots (table in exl3/format.hpp);
-    // STRIX_G4_EXL3_IDENTITY=v1|v2|v3 forces it.
+    // Fixed per pack and session from the arm and --streams (crossover table in exl3/format.hpp);
+    // STRIX_G4_EXL3_IDENTITY=v1|v2|v3 forces it, the same for the command line and the server.
     {.name = "exl3_identity", .env = "STRIX_G4_EXL3_IDENTITY", .value = {"", "", "auto"}, .builtin = "auto",
      .required = {false, false, false}, .ready = {false, false, true}, .runnable = {false, false, true},
      .kind = Kind::pack, .apps = engine,
-     .source = "auto-select per pack arm only (same for CLI and server): M4/M6 g4-exl3-v3, M5 and unknown arms v1"},
+     .source = "auto-select per pack and --streams: M4/M6 g4-exl3-v3 always, M5 v3 at >= 8 streams, else v1"},
     // Prompt prefill route. DEFAULT and QUALITY run prefill-exact. STRIX_G4_PREFILL_IDENTITY=exact keeps prefill-exact
     // (the OFF switch under fast); =v1 / =v2 select a WMMA route explicitly.
     // =a8 (only with STRIX_G4_IDENTITY=g4-a8-v1): g4-a8-v1 linears on 512-row chunks; prompt rows equal the a8

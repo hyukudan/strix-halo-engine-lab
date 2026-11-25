@@ -26,10 +26,10 @@ build does not contain.
 | `fast` | `g4-a8-v1` (int8 activations, qualified) + MTP drafter; decode attention at depth `g4-dattn-f2` (int8 KV copies for the global layers): qualification pending, exact attention runs until then | `g4-wmma-pf-v1` prompt prefill on Q4_K_M packs (FP16 WMMA linears, `g4-flash-attn-v1` prompt attention; the last <= 8 prompt rows and the anchor run the `g4-a8-v1` decode; qualified same-weight against exact prefill), `a8` on other non-EXL3 packs (prompt rows equal the a8 decode rows); neither is bitwise vs exact prefill; `STRIX_G4_PREFILL_IDENTITY=a8` keeps the previous route, `=exact` restores exact prefill | Named profile, qualified against frozen fidelity bands |
 | `quality` | EXL3 pack (`--exl3-arm DIR`), identity chosen once per pack and session (`g4-exl3-v1`/`v3`) | `prefill-exact` | Exact within its EXL3 identity; higher fidelity than Q4_K_M at similar size |
 
-The CLI and server select the EXL3 core identity once at startup from the pack arm. With automatic selection,
-M4 and M6 use `g4-exl3-v3`, and M5 uses `g4-exl3-v1` at every stream or slot count. This migrates M5 serving at
-eight slots from v3 to v1, a different arithmetic identity. `STRIX_G4_EXL3_IDENTITY=v3` selects the previous M5
-identity explicitly. The override accepts `v1`, `v2` or `v3` on both entry points.
+The identity of the EXL3 route is fixed at startup from the pack and `--streams`, never per step, so a session's
+output does not depend on load. With automatic selection M4 and M6 use `g4-exl3-v3`, and M5 uses `g4-exl3-v3` at
+eight or more streams and `g4-exl3-v1` below. `STRIX_G4_EXL3_IDENTITY=v1|v2|v3` forces it; an explicit value
+selects the same core on the command line and the server at every stream or slot count.
 
 ## Assets
 
@@ -144,9 +144,9 @@ and decode in the same target pass, new requests join between steps, and every r
 request served alone (verified for `default`, `fast` and `quality` with eight to eleven overlapping requests: greedy
 chat in four languages, a long document, seeded sampling, thinking-budget continuation, streaming and a client that
 disconnects mid-stream). One request at a time is unchanged (C1 with the drafter, same ids and speed).
-`STRIX_G4_SERVE_BATCH=0` restores one chat job at a time. For the M5 migration to v1, native CLI/server parity of
-complete token IDs, raw-logit digests and committed state is pending at one and eight server slots, including
-overlapping requests and short prompt tails.
+`STRIX_G4_SERVE_BATCH=0` restores one chat job at a time. When `--streams` is not given, the session-fixed EXL3 core
+identity is chosen for the slot count (eight), so an M5 pack selects `g4-exl3-v3` instead of `v1`; M4 and M6 always
+use `v3`. For one M5 core at every slot count, set `STRIX_G4_EXL3_IDENTITY` explicitly.
 
 | `default`, streaming, 128 tokens per request | 1 client | 4 clients | 8 clients |
 |---|---:|---:|---:|

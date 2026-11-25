@@ -2,7 +2,7 @@
 
 import unittest
 
-from route_gate import compare, overlap, signature
+from route_gate import ARMS, compare, overlap, signature
 
 
 class ReceiptTest(unittest.TestCase):
@@ -15,6 +15,11 @@ class ReceiptTest(unittest.TestCase):
 
     def record(self, ids=(100, 101), **changes):
         return signature(ids, self.phase | changes, "auto", "v1", 8, 2)
+
+    def test_m5_cores_run_as_explicit_values(self):
+        # Automatic M5 follows the session's streams, so CLI-versus-server evidence uses explicit values only.
+        self.assertEqual(ARMS["M5"], (("forced", "v1"), ("forced", "v3")))
+        self.assertEqual(ARMS["M4"][0], ("auto", "v3"))
 
     def test_complete_evidence(self):
         reference = self.record()
