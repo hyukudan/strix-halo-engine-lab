@@ -4,7 +4,7 @@
 #include "core/resident_row_plan.hpp"
 
 #if defined(__HIPCC__)
-#include "strix/hip/current_device_arch.hpp"
+#include "device/hip_current_device_arch.hpp"
 
 #include "core/dense_linear.hpp"
 #include "core/f16_tile_gemm_small.hpp"
