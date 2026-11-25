@@ -24,12 +24,15 @@ struct cudaGraphExecUpdateResultInfo {
 namespace cuda_status_stub {
 inline cudaError_t malloc_status = cudaSuccess;       // cudaMalloc (device memory)
 inline cudaError_t malloc_host_status = cudaSuccess;  // cudaMallocHost (pinned host memory)
+// Free device memory: a cudaMalloc larger than this is refused with cudaErrorMemoryAllocation (default: no limit).
+inline std::size_t malloc_free_bytes = static_cast<std::size_t>(-1);
 inline unsigned malloc_calls = 0, malloc_host_calls = 0;
 }  // namespace cuda_status_stub
 
 inline cudaError_t cudaMalloc(void** pointer, std::size_t bytes) {
     ++cuda_status_stub::malloc_calls;
     if (cuda_status_stub::malloc_status != cudaSuccess) return cuda_status_stub::malloc_status;
+    if (bytes > cuda_status_stub::malloc_free_bytes) return cudaErrorMemoryAllocation;
     *pointer = std::malloc(bytes);
     return cudaSuccess;
 }
