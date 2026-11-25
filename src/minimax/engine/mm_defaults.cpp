@@ -150,8 +150,7 @@ constexpr Item kItems[] = {
      "Admitted grouped async source lifetime; TP2 IDs identical, combined -2.3/-2.5 %; full state/workload qualification pending"},
     {"pf_order", "STRIX_MMX_PF_ORDER", "invariant", "adaptive",
      "Fixed K order for EXL3 prefill q/k/v/o and routed/shared gate/up/down (dense MLP tails with STRIX_MM_PF_DENSE_TAIL_FIXED=1); "
-     "unmet invariant routes are refused at load; "
-     "serve refuses adaptive, including the adaptive baseline"},
+     "a defaulted value falls back to adaptive when the invariant route is unmet (explicit invariant refuses)"},
     // transport (host path, bits unchanged)
     {"dist_crc_parallel", "STRIX_DIST_CRC_PARALLEL", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
     {"dist_host_crc_overlap", "STRIX_DIST_HOST_CRC_OVERLAP", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
@@ -429,18 +428,20 @@ void check_peer(const std::function<void(const void*, void*, std::size_t)>& exch
     check_peer(profile_resolution(process_env), exchange);
 }
 
-void require_serve_order(const Lookup& env) {
-    if (linear_order(env) == "invariant") return;
-    throw std::invalid_argument("STRIX_MMX_PF_ORDER=adaptive is not batch-invariant: its "
-                                "split follows the rows other requests put in a chunk, so the server would answer the "
-                                "same request differently under load; set STRIX_MMX_PF_ORDER=invariant for serve "
-                                "when using the baseline");
-}
 bool dense_tail_fixed(const Lookup& env) {
     const char* v = env("STRIX_MM_PF_DENSE_TAIL_FIXED");
     if (v == nullptr || std::strcmp(v, "0") == 0) return false;
-    if (std::strcmp(v, "1") == 0) return true;
-    throw std::invalid_argument("STRIX_MM_PF_DENSE_TAIL_FIXED: 0 (library dense MLP tails, default) or 1 (fixed order)");
+    if (std::strcmp(v, "1") != 0)
+        throw std::invalid_argument("STRIX_MM_PF_DENSE_TAIL_FIXED: 0 (library dense MLP tails, default) or 1 (fixed order)");
+    // The fixed tails exist only inside the invariant EXL3 order: refuse a combination that would print and stamp v2
+    // while another route runs (rank and serve validate it at startup, before the pair connects).
+    if (linear_order(env) != "invariant")
+        throw std::invalid_argument("STRIX_MM_PF_DENSE_TAIL_FIXED=1 needs STRIX_MMX_PF_ORDER=invariant (the adaptive order, "
+                                    "also selected by the baseline, keeps the library dense tails)");
+    if (route::fp32_profile(env("STRIX_MM_PREFILL_IDENTITY")))
+        throw std::invalid_argument("STRIX_MM_PF_DENSE_TAIL_FIXED=1 conflicts with STRIX_MM_PREFILL_IDENTITY=fp32 (the FP32 "
+                                    "prefill linears do not run the fixed-order dense tails)");
+    return true;
 }
 std::string invariant_order_id(const Lookup& env) {
     return dense_tail_fixed(env) ? kInvariantDenseTailOrderId : kInvariantOrderId;
@@ -842,10 +843,9 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
     // engine, the cache identity, the rank agreement, this printing) resolves it from STRIX_MM_PRODUCT_PROFILE through
     // prefill_policy() (fast_profile_selects_bundle + fast_profile::profile_switch).
     apply();
-    if (app == "serve") require_serve_order(process_env);
     (void)split_frame_policy();  // validate and record the lever on both entry points (rank CLI and serve)
     (void)pf_async_min_rows(process_env("STRIX_MM_PF_ASYNC_MIN_ROWS"));
-    (void)dense_tail_fixed(process_env);  // validate the opt-in on both entry points
+    (void)dense_tail_fixed(process_env);  // validate the opt-in and its order / FP32 conflicts on both entry points
     (void)effective_config(parse_cli(app, args), process_env);
     if (!print) {  // a weight request this build cannot honour refuses the run (printed, not refused, above)
         profile_resolution(process_env).weights.require_honoured();

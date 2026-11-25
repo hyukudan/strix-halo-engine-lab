@@ -2137,10 +2137,10 @@ struct Engine::Impl {
     }
     // Invariant prefill must cover every layer and every tail, even when the preferred dense routes are OFF.
     // With fixed S=1, workspace size is monotone in rows, so max_rows bounds every admitted chunk.
-    // Invariant is the default order and never degrades to adaptive: a defaulted or explicit invariant whose route is
-    // unmet (weights, workspace, geometry) is refused here with the reason, so memory or --max-rows never decides the
-    // arithmetic. STRIX_MMX_PF_ORDER=adaptive is the explicit, not batch-invariant lever. Both ranks load the same
-    // config and weights, so the decision is the same on each rank.
+    // A table default (pf_order) that cannot hold declines to adaptive with a printed reason, before receipts (the
+    // decline re-exports STRIX_MMX_PF_ORDER, so route receipt and cache identity name the effective order); an
+    // explicit STRIX_MMX_PF_ORDER=invariant, or STRIX_MM_PF_DENSE_TAIL_FIXED=1 (which needs the invariant order), keeps
+    // the hard error. Both ranks load the same config and weights, so the decision is the same on each rank.
     void require_invariant_dense() const {
         if (!mmoe::prefill_order_invariant()) return;
         const char* unmet = nullptr;
@@ -2159,8 +2159,9 @@ struct Engine::Impl {
             }
         }
         if (unmet == nullptr) return;
-        throw std::invalid_argument(std::string(unmet) + "; refusing adaptive fallback (set STRIX_MMX_PF_ORDER=adaptive "
-                                    "explicitly for the not batch-invariant order)");
+        if (!defaults::from_defaults("STRIX_MMX_PF_ORDER") || pf_dense_tail_fixed) throw std::invalid_argument(unmet);
+        defaults::decline_default("STRIX_MMX_PF_ORDER", "adaptive", unmet);
+        mmoe::set_prefill_moe_order(0);
     }
     template <std::size_t N> bool dense_admit(std::size_t n, const mmoe::PrefillDenseJob (&jobs)[N], bool preferred) const {
         if (gemv) return false;  // decode and verification retain their existing GEMV arithmetic

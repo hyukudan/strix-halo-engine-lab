@@ -747,8 +747,34 @@ void test_fast_prefill_profile() {
                           .find("STRIX_MMX_PF_ORDER.scope=exl3-prefill-k-order:q/k/v/o,routed/shared/dense-gate/up/down\n") !=
                       std::string::npos,
                   std::string("dense tail: the opt-in scope is printed by ") + app);
-        check(md::prefill_identity(lookup(EnvMap{{"STRIX_MM_PF_DENSE_TAIL_FIXED", "1"}, {"STRIX_MMX_PF_ORDER", "adaptive"}})).empty(),
-              "dense tail: no invariant identity under the adaptive order");
+        // The opt-in exists only inside the invariant order and outside the FP32 prefill identity: every reader
+        // (cache identity, effective config of rank and serve) refuses instead of stamping v2 on another route.
+        for (const EnvMap& bad : {EnvMap{{"STRIX_MM_PF_DENSE_TAIL_FIXED", "1"}, {"STRIX_MMX_PF_ORDER", "adaptive"}},
+                                  EnvMap{{"STRIX_MM_PF_DENSE_TAIL_FIXED", "1"}, {md::kBaselineEnv, "1"}},
+                                  EnvMap{{"STRIX_MM_PF_DENSE_TAIL_FIXED", "1"}, {"STRIX_MM_PREFILL_IDENTITY", "fp32"}}}) {
+            for (const char* app : {"rank", "serve"}) {
+                bool rejected = false;
+                try { (void)md::effective_config(md::parse_cli(app, {}), lookup(bad)); }
+                catch (const std::invalid_argument& e) {
+                    rejected = std::string(e.what()).find("STRIX_MM_PF_DENSE_TAIL_FIXED=1") != std::string::npos;
+                }
+                check(rejected, std::string("dense tail: conflicting order / FP32 identity refused by ") + app);
+            }
+            bool rejected = false;
+            try { (void)md::prefill_identity(lookup(bad)); } catch (const std::invalid_argument&) { rejected = true; }
+            check(rejected, "dense tail: no v2 cache identity for a conflicting order / FP32 identity");
+        }
+        // The lever is a row of the shared profile table: resolved, fingerprinted and agreed by both ranks when ON.
+        {
+            const auto pr = md::profile_resolution(lookup(tail));
+            const auto* row = pr.find("pf_dense_tail_fixed");
+            check(row != nullptr && row->value == "1" && row->status == strix::profile::Status::explicit_env &&
+                      fp(tail) != none_fp,
+                  "dense tail: explicit row of the shared profile table, part of the agreement fingerprint");
+            const auto* off_row = md::profile_resolution(lookup(off)).find("pf_dense_tail_fixed");
+            check(off_row != nullptr && off_row->value == "0" && off_row->status == strix::profile::Status::builtin,
+                  "dense tail: default OFF builtin row");
+        }
         check(fp(off) == none_fp, "fast profile: rows at builtin leave the legacy fingerprint unchanged");
         for (const auto& e : md::profile_resolution(lookup(off)).entries)
             check(e.status == strix::profile::Status::builtin && e.value == e.lever->builtin, "fast profile: builtin row " + std::string(e.lever->name));

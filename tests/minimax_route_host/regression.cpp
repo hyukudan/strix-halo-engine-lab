@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -13,6 +14,7 @@ namespace route = strix::minimax::route;
 namespace mmoe {
 inline bool invariant = true;
 bool prefill_order_invariant() { return invariant; }
+void set_prefill_moe_order(int value) { invariant = value != 0; }
 const auto& prefill_moe_order() {
     return strix::moe_core::resolve_grouped_order(invariant ? "invariant" : "adaptive");
 }
@@ -42,6 +44,14 @@ struct PrefillMoeView {
 namespace pfk { struct Item { std::byte metadata[256]; }; }
 struct WItem { std::byte metadata[256]; };
 #include "planner.inc"
+}
+
+// Defaults table stand-in: whether STRIX_MMX_PF_ORDER came from the table (not the user) and the declines seen.
+namespace defaults {
+inline bool order_defaulted = false;
+inline int declines = 0;
+bool from_defaults(const char*) { return order_defaulted; }
+void decline_default(const char*, const char*, const std::string&) { ++declines; }
 }
 
 struct Engine {
@@ -120,6 +130,22 @@ void startup_tests() {
     rejects([&] { startup(e); }, "missing workspace accepted invariant identity");
     mmoe::invariant = false;
     startup(e);  // adaptive keeps its existing fallback contract
+    // A defaulted (table) invariant order whose route is unmet declines to adaptive, as on the landing base; the dense
+    // tail lever needs the invariant order, so it keeps the hard error.
+    Engine d;
+    d.pf_dense_tail_fixed = false;
+    d.moe_opt = false;  // STRIX_MM_MOE=off with STRIX_MMX_PF_ORDER unset
+    defaults::order_defaulted = true;
+    mmoe::invariant = true;
+    startup(d);
+    require(!mmoe::invariant && defaults::declines == 1, "defaulted invariant order did not decline to adaptive");
+    mmoe::invariant = true;
+    d.pf_dense_tail_fixed = true;
+    rejects([&] { startup(d); }, "dense tail lever accepted a declined invariant order");
+    require(mmoe::invariant && defaults::declines == 1, "dense tail lever declined the order");
+    defaults::order_defaulted = false;
+    d.pf_dense_tail_fixed = false;
+    rejects([&] { startup(d); }, "explicit invariant order declined to adaptive");
 }
 void resources_tests() {
     Engine e;

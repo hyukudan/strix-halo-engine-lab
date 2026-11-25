@@ -118,7 +118,7 @@ environment variable, the shipped value, the value that restores the previous pa
 | minimax-pair | pf_tx_uncached | `STRIX_MM_PF_TX_UNCACHED` | 1 | 0 | Prefill exchange measurement: exact, exchange-send 0.23 -> 0.002 s GPU, ~1.3 % (prefill module route) |
 | minimax-pair | pf_async_start | `STRIX_MM_PF_ASYNC_START` | 1 | 0 | Grouped all-member >=2048-row gate (configurable); TP2 4096+3844 IDs identical, -2.3/-2.5 % with late fence; full state/workload qualification pending |
 | minimax-pair | pf_late_src_fence | `STRIX_MM_PF_LATE_SRC_FENCE` | 1 | 0 | Admitted grouped async source lifetime; TP2 IDs identical, combined -2.3/-2.5 %; full state/workload qualification pending |
-| minimax-pair | pf_order | `STRIX_MMX_PF_ORDER` | invariant | adaptive | Fixed K order for EXL3 prefill q/k/v/o and routed/shared gate/up/down (dense MLP tails with STRIX_MM_PF_DENSE_TAIL_FIXED=1); unmet invariant routes are refused at load; serve refuses adaptive, including the adaptive baseline |
+| minimax-pair | pf_order | `STRIX_MMX_PF_ORDER` | invariant | adaptive | Fixed K order for EXL3 prefill q/k/v/o and routed/shared gate/up/down (dense MLP tails with STRIX_MM_PF_DENSE_TAIL_FIXED=1); a defaulted value falls back to adaptive when the invariant route is unmet (explicit invariant refuses) |
 | minimax-pair | dist_crc_parallel | `STRIX_DIST_CRC_PARALLEL` | 1 | 0 | Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged |
 | minimax-pair | dist_host_crc_overlap | `STRIX_DIST_HOST_CRC_OVERLAP` | 1 | 0 | Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged |
 | minimax-pair | dist_host_chunk | `STRIX_DIST_HOST_CHUNK_BYTES` | 1048576 | 0 | Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged |

@@ -12,12 +12,13 @@ def run(command, args, **settings):
                           stderr=subprocess.STDOUT, timeout=15)
 
 
-def check(result, expected, refused=False):
+def check(result, expected, refused=False, tail="0"):
     needle = f"STRIX_MMX_PF_ORDER.effective={expected}"
     if refused:
-        ok = result.returncode == 2 and "STRIX_MMX_PF_ORDER=adaptive" in result.stdout
+        ok = result.returncode == 2 and expected in result.stdout
     else:
-        ok = result.returncode == 0 and needle in result.stdout.splitlines()
+        lines = result.stdout.splitlines()
+        ok = result.returncode == 0 and needle in lines and f"STRIX_MM_PF_DENSE_TAIL_FIXED={tail}" in lines
     if not ok:
         raise SystemExit(f"{result.args}: expected {'refusal' if refused else expected}; exit {result.returncode}\n{result.stdout}")
 
@@ -29,15 +30,24 @@ def main(rank, serve):
     serve_args = ["MODEL_DIR", "--rank", "0", "--transport", "usb4-auto"]
     check(run(rank, rank_args), "invariant")
     check(run(serve, serve_args), "invariant")
+    tail_needs_order = "STRIX_MM_PF_DENSE_TAIL_FIXED=1 needs STRIX_MMX_PF_ORDER=invariant"
     for options, env in [(["--baseline"], {}), ([], {"STRIX_MM_BASELINE": "1"})]:
+        # The historical baseline runs on both entry points (adaptive order), as on the landing base.
         check(run(rank, rank_args + options, **env), "adaptive")
-        check(run(serve, serve_args + options, **env), "adaptive", refused=True)
+        check(run(serve, serve_args + options, **env), "adaptive")
+        check(run(rank, rank_args + options, STRIX_MM_PF_DENSE_TAIL_FIXED="1", **env), tail_needs_order, refused=True)
+        check(run(serve, serve_args + options, STRIX_MM_PF_DENSE_TAIL_FIXED="1", **env), tail_needs_order, refused=True)
         env["STRIX_MMX_PF_ORDER"] = "invariant"
         check(run(rank, rank_args + options, **env), "invariant")
         check(run(serve, serve_args + options, **env), "invariant")
-    check(run(rank, rank_args, STRIX_MMX_PF_ORDER="adaptive"), "adaptive")
-    check(run(serve, serve_args, STRIX_MMX_PF_ORDER="adaptive"), "adaptive", refused=True)
-    print("rank/serve startup: default, baseline flag/environment and explicit orders passed")
+    for command, args in [(rank, rank_args), (serve, serve_args)]:
+        check(run(command, args, STRIX_MMX_PF_ORDER="adaptive"), "adaptive")
+        check(run(command, args, STRIX_MM_PF_DENSE_TAIL_FIXED="1"), "invariant", tail="1")
+        check(run(command, args, STRIX_MM_PF_DENSE_TAIL_FIXED="1", STRIX_MMX_PF_ORDER="adaptive"), tail_needs_order,
+              refused=True)
+        check(run(command, args, STRIX_MM_PF_DENSE_TAIL_FIXED="1", STRIX_MM_PREFILL_IDENTITY="fp32"),
+              "STRIX_MM_PF_DENSE_TAIL_FIXED=1 conflicts with STRIX_MM_PREFILL_IDENTITY=fp32", refused=True)
+    print("rank/serve startup: default, baseline, explicit orders and dense tail conflicts passed")
 
 
 if __name__ == "__main__":

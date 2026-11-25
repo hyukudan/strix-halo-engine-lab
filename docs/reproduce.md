@@ -618,16 +618,17 @@ prefill (`glm_score.sh PEER BIN MODEL PROMPT OUT [ENV...]`, last 256 rows) and i
 
 ### MiniMax pair: chunk-invariant linear order
 
-`STRIX_MMX_PF_ORDER=invariant` is the default for rank and serve. `--baseline` and `STRIX_MM_BASELINE=1`
-select the historical `adaptive` order unless explicitly overridden. Serve accepts only invariant, so it
-refuses the historical baseline with a diagnostic. Set `STRIX_MMX_PF_ORDER=invariant` explicitly to run
-serve with the other baseline settings.
+`STRIX_MMX_PF_ORDER=invariant` is the default for rank and serve (table item `pf_order`; `adaptive` is the off
+switch and the `--baseline` / `STRIX_MM_BASELINE=1` value on both). A defaulted value that cannot run on a load, e.g.
+`STRIX_MM_MOE=off`, declines to `adaptive` with a printed reason (the route receipt and the cache identity name the
+effective order); an explicit `invariant` stays a hard error.
 
 The invariant EXL3 prefill contract binds the shared `moe_core::kGroupedSingleChainContract` for routed and
 shared gate/up/down and `core::fixed_linear_contract` for q/k/v/o. The v4 core runs when the library would
 use a different chain. The cache field is `prefill_order=mmx-pf-linear-s1-v1`. The dense MLP of layers 0-2
 keeps the library chain except for the `STRIX_MM_PF_DENSE_MLP` preference on 4096-row pieces.
-`STRIX_MM_PF_DENSE_TAIL_FIXED=1` (opt-in, the same value on rank and serve) also binds dense MLP gate/up/down
+`STRIX_MM_PF_DENSE_TAIL_FIXED=1` (opt-in profile row, the same value on rank and serve, part of the rank agreement;
+refused with the adaptive order or baseline and with `STRIX_MM_PREFILL_IDENTITY=fp32`) also binds dense MLP gate/up/down
 to `core::fixed_linear_contract` at every cut; its cache field is `prefill_order=mmx-pf-linear-s1-v2`. The
 receipt lever is `minimax.linear_order`. Decode and verification retain their existing routes, including
 `STRIX_MM_LINEARS=load`. Startup requires resident supported weights and workspace for the required dense
