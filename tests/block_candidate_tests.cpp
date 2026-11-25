@@ -416,7 +416,10 @@ void incumbent_indexing_tests() {
         root.set(s.name, tensor); offset += elements * s.width;
     }
     // The incumbent entry hashes the whole source, so use a fully materialised in-memory file.
-    auto file = header_source(root.dump(), 0)->bytes; file.resize(file.size() + offset);
+    // The payload size is a fixture constant (24 + 20 + 32 + 1 bytes): a literal keeps the resize bound known.
+    constexpr std::size_t kPayloadBytes = 77;
+    check(offset == kPayloadBytes, "fixture payload size");
+    auto file = header_source(root.dump(), 0)->bytes; file.resize(file.size() + kPayloadBytes);
     const auto source = sw::memory_source(file);
     sw::TensorIndex two, three;
     { const auto st = sw::index_safetensors(source, two); check(bool(st), ("two-argument indexing: " + st.detail).c_str()); }
