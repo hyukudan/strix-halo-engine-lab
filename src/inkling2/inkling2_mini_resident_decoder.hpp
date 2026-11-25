@@ -143,7 +143,7 @@ public:
 #if !defined(__HIPCC__)
           token_ids_(max_rows_),
 #endif
-          weights_(upload_weights(controller_one_plane)), backend_(weights_, max_rows_, stream_.get(), packed_decode, step_graphs,
+          weights_(upload_weights(controller_one_plane, lowbit)), backend_(weights_, max_rows_, stream_.get(), packed_decode, step_graphs,
                                                      admits_served_route(served_route), lowbit.arithmetic),
           lowbit_timing_(std::move(lowbit.timing)), served_cli_route_(admits_served_route(served_route)),
           calibrated_decode_(lowbit.admitted != nullptr && lowbit.decode_only), greedy_(decode_rows_, kOutputVocabulary) {
@@ -881,10 +881,25 @@ private:
         return out;
     }
 
-    [[nodiscard]] MiniResidentWeights upload_weights(bool controller_one_plane) {
+    [[nodiscard]] MiniResidentWeights upload_weights(bool controller_one_plane, [[maybe_unused]] const MiniLowBitRows& lowbit) {
         auto weights = upload_mini_resident_weights(weight_plan_, weight_storage_.span(), stream_.get());
 #if defined(__HIPCC__)
         static_cast<void>(controller_one_plane);
+        const auto& lever = weight::kLowBitFoldedScaleLever;
+        const bool ladder_candidate = lowbit.timing && std::ranges::any_of(kMiniProfile.ladder, [&](const auto& row) {
+            return row.lever == lever.name && row.value == lever.target;
+        });
+        if (lowbit.arithmetic == core::LowBitArithmetic::f16_folded_scale || ladder_candidate) {
+            weights.certify_folded_scale([&](std::span<const std::uint8_t> staged, std::span<std::uint8_t> host) {
+                mini_gpu::copy(host.data(), staged.data(), staged.size_bytes(), mini_gpu::device_to_host, stream_.get());
+                mini_gpu::synchronize(stream_.get());
+            }, [](unsigned layer, unsigned role, std::string_view reason) {
+                std::cerr << "strix-lowbit-folded-scale/v1 "
+                          << (layer == kPhysicalLayers ? "head" : "layer=" + std::to_string(layer) +
+                              " projection=" + std::to_string(role))
+                          << " declined: " << reason << "; f16_group_scale\n";
+            });
+        }
 #else
         // CUDA certifies the staged controller weights rather than re-reading the checkpoint.
         if (controller_one_plane)

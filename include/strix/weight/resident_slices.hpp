@@ -20,6 +20,7 @@ struct ResidentMatrixView {
     std::span<const std::uint8_t> bytes;
     FormatId storage;
     std::uint64_t rows, columns, row_bytes;
+    bool folded_scale_admitted = false;
 };
 
 struct ResidentBf16Rows {

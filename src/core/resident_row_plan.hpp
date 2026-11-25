@@ -9,10 +9,13 @@
 #include "strix/weight/host_lowbit.hpp"
 #include "strix/weight/resident_slices.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <limits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace strix::core {
 
@@ -70,6 +73,58 @@ inline LowBitArithmetic resident_lowbit_arithmetic(const profile::Resolution& ti
     if (tier.profile != profile::Name::fast && tier.profile != profile::Name::turbo)
         throw std::invalid_argument(std::string(lever.env) + " requires FAST or TURBO");
     return LowBitArithmetic::f16_folded_scale;
+}
+
+namespace detail {
+template <class Storage, class Read>
+std::string_view folded_scale_decline(const weight::ResidentMatrixView& matrix, const Read& read) {
+    if (matrix.columns == 0U || matrix.columns % Storage::elements != 0U || matrix.rows == 0U ||
+        matrix.row_bytes != Storage::row_bytes(matrix.columns) || matrix.rows > matrix.bytes.size() / matrix.row_bytes)
+        return "invalid compact matrix geometry";
+    constexpr std::size_t chunk_bytes = (64U * 1024U / Storage::bytes) * Storage::bytes;
+    const auto size = static_cast<std::size_t>(matrix.rows * matrix.row_bytes);
+    std::vector<std::uint8_t> scratch(std::min(size, chunk_bytes));
+    for (std::size_t offset = 0U; offset < size;) {
+        const auto chunk = std::span(scratch).first(std::min(scratch.size(), size - offset));
+        read(matrix.bytes.subspan(offset, chunk.size()), chunk);
+        for (std::size_t pos = 0U; pos < chunk.size(); pos += Storage::bytes) {
+            const auto* block = chunk.data() + pos;
+            for (unsigned g = 0U; g < Storage::groups; ++g) {
+                const auto scale = weight::lowbit::f16_bits_to_f32(Storage::scale_bits(block, g));
+                if (!std::isfinite(scale)) return "nonfinite FP16 group scale";
+                for (unsigned j = g * Storage::group; j < (g + 1U) * Storage::group; ++j) {
+                    const auto product = scale * static_cast<float>(Storage::code(block, j));
+                    if (std::abs(product) > 65504.0F) return "scale x code exceeds finite FP16 range";
+                    if (weight::lowbit::f16_bits_to_f32(weight::lowbit::f32_to_f16_bits(product)) != product)
+                        return "scale x code is not exact in FP16";
+                }
+            }
+        }
+        offset += chunk.size();
+    }
+    return {};
+}
+}  // namespace detail
+
+// Certify the immutable staged compact image using a bounded host reader. Dispatch never dereferences device bytes.
+template <class Read>
+std::string_view certify_folded_scale(weight::ResidentMatrixView& matrix, const Read& read) {
+    matrix.folded_scale_admitted = false;
+    std::string_view decline;
+    if (matrix.storage == weight::kQ4G64WeightStorage)
+        decline = detail::folded_scale_decline<weight::Q4G64Storage>(matrix, read);
+    else if (matrix.storage == weight::kQ6G64WeightStorage)
+        decline = detail::folded_scale_decline<weight::Q6G64Storage>(matrix, read);
+    else
+        return "storage has no folded-scale staging";
+    matrix.folded_scale_admitted = decline.empty();
+    return decline;
+}
+
+constexpr LowBitArithmetic admitted_lowbit_arithmetic(LowBitArithmetic arithmetic,
+                                                       const weight::ResidentMatrixView& matrix) {
+    return arithmetic == LowBitArithmetic::f16_folded_scale && !matrix.folded_scale_admitted
+        ? LowBitArithmetic::f16_group_scale : arithmetic;
 }
 
 constexpr bool lowbit_f16_form(LowBitArithmetic arithmetic) { return arithmetic != LowBitArithmetic::fp32_sweep; }

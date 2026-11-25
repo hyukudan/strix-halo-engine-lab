@@ -13,7 +13,7 @@ inline constexpr profile::Lever kLowBitFoldedScaleLever{
     .source = "awaits gate v2 and regime timing receipts for HIP low-bit rows",
     .omit_builtin_fingerprint = true,
     .identity = {{{"f16_group_scale", "hip.lowbit.f16-group-scale-chain@1"},
-                   {"f16_folded_scale", "hip.lowbit.f16-folded-scale-tile@1"}}},
+                   {"f16_folded_scale", "hip.lowbit.f16-folded-scale-tile@2"}}},
 };
 
 }  // namespace strix::weight

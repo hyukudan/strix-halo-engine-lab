@@ -76,6 +76,7 @@ inline row_transforms::Status enqueue_resident_lowbit_rows(
     }
     f16_tile_gemm::Q8ProjectionGroup<1> group{};
     group.append({matrix.bytes.data(), live_outputs, output});
+    arithmetic = admitted_lowbit_arithmetic(arithmetic, matrix);
     return matrix.storage == weight::kQ4G64WeightStorage
                ? detail::launch_lowbit_group<weight::Q4G64Storage>(input, rows, width, group, stream, arithmetic)
                : detail::launch_lowbit_group<weight::Q6G64Storage>(input, rows, width, group, stream, arithmetic);
@@ -187,13 +188,18 @@ inline row_transforms::Status enqueue_resident_q8_projections(
         const bool tile = q4 || storage == weight::kQ6G64WeightStorage || use_resident_q8_tile(rows);
         if (tile) {
             f16_tile_gemm::Q8ProjectionGroup<Capacity> group{};
-            for (const auto& projection : run)
-                group.append({std::get<weight::ResidentMatrixView>(projection.weights).bytes.data(), projection.outputs,
-                              projection.output});
+            auto run_arithmetic = arithmetic;
+            for (const auto& projection : run) {
+                const auto& matrix = std::get<weight::ResidentMatrixView>(projection.weights);
+                group.append({matrix.bytes.data(), projection.outputs, projection.output});
+                run_arithmetic = admitted_lowbit_arithmetic(run_arithmetic, matrix);
+            }
             row_transforms::Status status;
-            if (q4) status = detail::launch_lowbit_group<weight::Q4G64Storage>(input, rows, width, group, stream, arithmetic);
+            if (q4) status = detail::launch_lowbit_group<weight::Q4G64Storage>(input, rows, width, group, stream,
+                                                                             run_arithmetic);
             else if (storage == weight::kQ6G64WeightStorage)
-                status = detail::launch_lowbit_group<weight::Q6G64Storage>(input, rows, width, group, stream, arithmetic);
+                status = detail::launch_lowbit_group<weight::Q6G64Storage>(input, rows, width, group, stream,
+                                                                          run_arithmetic);
             else status = f16_tile_gemm::gemm_q8_projections(input, rows, width, group, stream);
             if (status != success) return status;
         } else {

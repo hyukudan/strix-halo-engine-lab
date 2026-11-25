@@ -14,6 +14,7 @@
 //        (default: 3072 2304  1024 2304  2304 3072  384 2304  1000 2304  17 256; the last two have output tails)
 // Output: "check ... PASS|FAIL" lines, "bench fmt=F N=.. K=.. route=entry|small|tile rows=R bytes=.. dram=.. us=.. GBps=.."
 // lines, then "lowbit bench checks PASS|FAIL".
+#include "lowbit_folded_fixture.hpp"
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
 #include "core/resident_q8_rows.hpp"
@@ -384,23 +385,31 @@ int fold_ticket(const std::vector<unsigned>& shapes) {
         {
             ok(launch_arm(Arm::tile_group, q4, w4, n, k, dx, dy, check_rows), "group tile 129");
             const auto group = fetch_rows(dy, check_rows);
-            // The arithmetic value f16_folded_scale through the resident entry and a two-projection list: the small-M
-            // route (rows <= the bound plan's 64) keeps the group scale's bits, the tile route has the folded tile's.
+            auto matrix = view(q4, w4, n, k);
+            const auto decline = core::certify_folded_scale(matrix,
+                [](std::span<const std::uint8_t> staged, std::span<std::uint8_t> host) {
+                    ok(hipMemcpy(host.data(), staged.data(), staged.size_bytes(), hipMemcpyDeviceToHost),
+                       "read staged compact image");
+                });
             for (const unsigned rows : {1U, 16U, 64U, 65U, 129U}) {
-                const auto& want = rows <= 64U ? group : base;
-                poison(dy2, 2U * std::size_t(rows) * n);
-                ok(core::enqueue_resident_lowbit_rows(view(q4, w4, n, k), n, dx, rows, dy2, nullptr,
+                const bool folds = rows > 64U && decline.empty();
+                const auto& want = folds ? base : group;
+                const auto floats = std::size_t(rows) * n;
+                poison(dy2, floats);
+                ok(core::enqueue_resident_lowbit_rows(matrix, n, dx, rows, dy2, nullptr,
                                                       core::LowBitArithmetic::f16_folded_scale), "folded entry");
                 const auto diff = bit_diff(fetch_rows(dy2, rows), want, rows, n);
-                float* dz = dy2 + std::size_t(rows) * n;
-                const std::array<core::ResidentRowProjection, 2> list{{{view(q4, w4, n, k), n, dy2}, {view(q4, w4, n, k), n, dz}}};
-                ok(core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr, core::LowBitArithmetic::f16_folded_scale),
-                   "folded list");
+                float* dz = dy2 + floats;
+                const std::array<core::ResidentRowProjection, 2> list{{{matrix, n, dy2}, {matrix, n, dz}}};
+                ok(strix::test::launch_poisoned_folded_group(dy2, dz, floats, poison, [&] {
+                    return core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr,
+                                                                     core::LowBitArithmetic::f16_folded_scale);
+                }), "folded list");
                 const auto both = fetch(dy2, 2U * std::size_t(rows) * n);
                 const std::vector<float> second(both.begin() + std::ptrdiff_t(std::size_t(rows) * n), both.end());
                 const auto diff_list = bit_diff(both, want, rows, n) + bit_diff(second, want, rows, n);
                 report(diff == 0U && diff_list == 0U, tag + " f16_folded_scale entry rows=" + std::to_string(rows) + " route=" +
-                                                          (rows <= 64U ? "small(group)" : "tile(folded)") + " bits_diff=" +
+                                                          (folds ? "tile(folded)" : "group-scale") + " bits_diff=" +
                                                           std::to_string(diff) + " list_bits_diff=" + std::to_string(diff_list));
             }
             std::cout << "info " << tag << " folded_vs_group differing=" << bit_diff(group, base, check_rows, n) << " of "
