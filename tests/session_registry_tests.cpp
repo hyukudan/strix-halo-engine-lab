@@ -50,10 +50,11 @@ int main(int argc, char** argv) {
         {
             namespace profile = strix::profile;
             sv::ServiceFactories factories;
+            std::string expected_native_profile = "turbo";
             factories.install("gemma4", {
-                [](const sv::ServiceSelection& s) {
+                [&expected_native_profile](const sv::ServiceSelection& s) {
                     CHECK(profile::model_preset());
-                    CHECK(s.arguments == std::vector<std::string>({"model.gguf", "--profile", "fast", "--print-effective-config"}));
+                    CHECK(s.arguments == std::vector<std::string>({"model.gguf", "--profile", expected_native_profile, "--print-effective-config"}));
                 },
                 [](const sv::ServiceSelection&, std::ostream&) {},
                 [](const sv::ServiceSelection&) -> std::unique_ptr<sv::SessionService> {
@@ -87,6 +88,7 @@ int main(int argc, char** argv) {
             auto factory = *factories.find("gemma4");
             factory.serves_cuda = true;
             in_process.install("gemma4", std::move(factory));
+            expected_native_profile = "fast";
             const auto cuda = invoke(cuda_args, in_process, no_launch);
             CHECK(cuda.code == 0 && cuda.out.ends_with("native config\n"));
         }

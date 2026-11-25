@@ -97,7 +97,7 @@ namespace fast {
 inline constexpr std::string_view levers = "fast";
 } // namespace fast
 namespace turbo {
-inline constexpr std::string_view levers = "fast";
+inline constexpr std::string_view levers = "turbo";
 } // namespace turbo
 } // namespace presets
 inline constexpr std::string_view schema = "strix-model/v1";
