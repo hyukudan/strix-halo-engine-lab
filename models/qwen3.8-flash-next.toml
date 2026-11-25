@@ -113,9 +113,14 @@ levers = "exact"
 [presets.fast]
 levers = "fast"
 
-# Use the admitted FAST levers until this model has a qualified TURBO set.
+# Under a preset a provisional row stays pending (only qualified or measured TURBO rows apply).
 [presets.turbo]
 levers = "fast"
+
+# The HIP engine resolves its TURBO column (strix::qwen::profile): FAST plus the lossy rows with a measured gain over
+# FAST where their timing receipt covers the regime.
+[presets.turbo.hip]
+levers = "turbo"
 
 # Engine-read switches of this model that a [multi_device] key is planned to replace (listed in the effective
 # config when set; they still act inside the engine).
