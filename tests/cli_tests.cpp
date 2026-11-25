@@ -240,7 +240,9 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
                         "Inkling Mini implicit profile must remain EXACT");
             require(exact.levers == Name::standard && fast.levers == Name::fast && fast.requested == Name::fast,
                     "explicit exact and FAST select their native columns");
-            require(turbo.requested == Name::turbo && turbo.levers == fast.levers, "TURBO inherits FAST levers");
+            const bool dense_hip = entry.family == "qwen35" && std::string_view(backend) == "hip";
+            require(turbo.requested == Name::turbo && turbo.levers == (dense_hip ? Name::turbo : fast.levers),
+                    "Qwen dense HIP receives TURBO and resolves the FAST fallback in the native profile");
             require(exact.kv != "fp8" && fast.kv != "fp8", "FP8 KV shadow is TURBO only");
             require((turbo.kv == "fp8") == (entry.family == "qwen35" && std::string_view(backend) == "cuda"),
                     "only the CUDA dense route has an FP8 KV shadow");

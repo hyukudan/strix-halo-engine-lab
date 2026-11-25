@@ -75,9 +75,11 @@ std::vector<int> parse_ids(const std::string& s) {
 }  // namespace
 
 int main(int argc, char** argv) try {
-    if (strix::qwen35::hip_profile::take(strix::qwen35::hip_profile::App::decode, argc, argv)) return 0;
     const auto topo_cli = strix::device::take_topology_command_line(argc, argv);  // --topology FILE --node ID (TP rates)
     using namespace strix::qwen35;
+    const hip_profile::Command command(hip_profile::App::decode, argc, argv);
+    const auto& args = command.args;
+    bool inspect = false;
     std::string model, dump, ids_arg = "1";
     HipDenseSpecArgs spec_args;  // the family's shared speculation flags (hip_dense_spec_costs.hpp)
     PrefillFlags pf;  // prompt windows: engine defaults unless a width / row path is asked (prefill_windows.hpp)
@@ -88,18 +90,18 @@ int main(int argc, char** argv) try {
     double tp_trip_us = 0.0;       // --tp-trip-us override of the measured trip latency; 0 = measured at start-up
     double tp_gap_us = -1.0;       // --tp-gap-us: measured host gap per join of the staged route (a receipt value); < 0 = unknown
     bool tp_force = false;
-    for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const auto& a = args[i];
         auto next = [&]() -> std::string {
-            if (i + 1 >= argc) throw std::invalid_argument("missing value for " + a);
-            return argv[++i];
+            if (i + 1 >= args.size()) throw std::invalid_argument("missing value for " + a);
+            return args[++i];
         };
-        if (a == "--model") model = next();
+        if (a == "--print-effective-config") inspect = true;
+        else if (a == "--model") model = next();
         else if (a == "--prompt-ids") ids_arg = next();
         else if (a == "--gen") gen = strix::core::parse_u32(next());
         else if (a == "--rows") pf.rows = strix::core::parse_u32(next());  // diagnostic: prompt on the decode row path, windows of N rows
-        else if (a == "--wide") { pf.width = strix::core::parse_u32(next()); pf.exact = false; }  // explicit width N (N > 16 = FAST wide prefill)
-        else if (a == "--wide-exact") { pf.width = strix::core::parse_u32(next()); pf.exact = true; }  // explicit width N, EXACT class (bitwise to 16-row)
+        else if (hip_profile::take_window_flag(hip_profile::App::decode, a, [&] { return strix::core::parse_u32(next()); }, pf)) {}
         else if (a == "--dump-logits") { dump = next(); pf.dump = true; }
         else if (a == "--dump-window") pf.dump_window = true;  // wide path with --dump-logits: every row of the last wide window
         else if (a == "--tf-rows") pf.tf_rows = strix::core::parse_u32(next());  // wide path: the last N prompt tokens as <= 16-row windows (row path)
@@ -131,6 +133,8 @@ int main(int argc, char** argv) try {
         else if (a == "--tp-force") tp_force = true;
         else throw std::invalid_argument("unknown flag " + a);
     }
+    const auto profile = hip_profile::resolve_prefill(hip_profile::App::decode, command.inputs, pf, HipEngine::max_rows());
+    if (hip_profile::finish(hip_profile::App::decode, profile, inspect)) return 0;
     if (tp_rank > 1) throw std::invalid_argument("--tp-rank 0|1");
     // Tensor-parallel decode: every rank must pick the same verify windows, so the speculation costs are the compiled
     // table (identical bits on every rank; calibrated or learned walls are per rank and could differ). An explicit

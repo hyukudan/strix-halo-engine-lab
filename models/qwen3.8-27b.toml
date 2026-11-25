@@ -59,9 +59,12 @@ levers = "exact"
 [presets.fast]
 levers = "fast"
 
-# Use the admitted FAST levers until this model has a qualified TURBO set.
 [presets.turbo]
 levers = "fast"
+
+# HIP resolves TURBO itself and inherits the admitted FAST route.
+[presets.turbo.hip]
+levers = "turbo"
 
 # The CUDA dense decode route implements the E4M3 KV shadow.
 [presets.exact.cuda]

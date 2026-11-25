@@ -393,15 +393,14 @@ int fast4_emu() {
 }
 // STRIX_DENSE_A4W4 = 0 (default) | 1: the wide IU4 GEMMs of the layers run the shared A4W4 class (core/iu4a4_dense.hpp,
 // FAST, contract dense-iu4a4-rot-v1: Hadamard-128 rotated A4 g32 activations x rotated W4 per-128 weights on iu4 WMMA).
-// Every layer fails the FAST gate (KL 0.076); the qualified form is the layer table of the fast profile cell.
-// STRIX_DENSE_A4W4_LAYERS listing layers (the --profile fast cell, include/strix/profiles/qwen_dense_hip.hpp) turns the
-// class on for those layers; STRIX_DENSE_A4W4=0 keeps it off either way.
+// The all-layer arm failed the FAST gate (KL 0.076). STRIX_DENSE_A4W4_LAYERS explicitly enables the
+// listed layers. STRIX_DENSE_A4W4=0 disables the class.
 bool a4w4_on() {
     static const bool on = [] {
         const char* layers = strix::envcfg::text("STRIX_DENSE_A4W4_LAYERS");
         const bool listed = layers != nullptr && *layers != 0 && std::string_view(layers) != "none";
         const bool v = strix::envcfg::flag("STRIX_DENSE_A4W4", listed);
-        if (v) std::fprintf(stderr, "qwen35-hip: FAST class %s on the wide IU4 GEMMs of the STRIX_DENSE_A4W4_LAYERS set (qualified: 48-63)\n",
+        if (v) std::fprintf(stderr, "qwen35-hip: FAST class %s on the wide IU4 GEMMs of the selected layers\n",
                             core::iu4a4_dense::kIdentity);
         return v;
     }();
