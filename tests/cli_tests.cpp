@@ -240,15 +240,9 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
                         "Inkling Mini implicit profile must remain EXACT");
             require(exact.levers == Name::standard && fast.levers == Name::fast && fast.requested == Name::fast,
                     "explicit exact and FAST select their native columns");
-            const bool minimax_pair = entry.family == "minimax";
-            require(turbo.requested == Name::turbo && turbo.levers == (minimax_pair ? Name::turbo : fast.levers),
-                    "MiniMax launches its native TURBO column; other presets keep their FAST projection");
-            if (minimax_pair) {
-                std::vector<std::string> args;
-                turbo.append_options(args);
-                require(args == std::vector<std::string>{"--profile", "turbo"},
-                        "MiniMax passes --profile turbo to the pair engine");
-            }
+            require(turbo.requested == Name::turbo, "explicit TURBO keeps its requested tier");
+            if (entry.family != "glm5" && entry.family != "minimax")
+                require(turbo.levers == fast.levers, "other presets project TURBO to FAST");
             require(exact.kv != "fp8" && fast.kv != "fp8", "FP8 KV shadow is TURBO only");
             require((turbo.kv == "fp8") == (entry.family == "qwen35" && std::string_view(backend) == "cuda"),
                     "only the CUDA dense route has an FP8 KV shadow");
@@ -256,6 +250,12 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
                     "host configuration reports weight roles and drafter");
         }
     }
+
+    const auto minimax = strix::model_description::load((data / "models/minimax-m3.1-flash.toml").string());
+    std::vector<std::string> minimax_args;
+    profile::resolve_model_preset(minimax, Name::turbo, "hip").append_options(minimax_args);
+    require(minimax_args == std::vector<std::string>{"--profile", "turbo"},
+            "MiniMax passes --profile turbo to the pair engine");
 
     const auto dense = strix::model_description::load((data / "models/qwen3.8-27b.toml").string());
     probes.host = Platform::windows_host;
