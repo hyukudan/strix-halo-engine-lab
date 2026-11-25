@@ -344,10 +344,20 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const bool hip = std::string_view(backend) == "hip";
         const bool effective = mini::mini_prepared_round_fold_admitted(hip, "gfx1151");
         require(effective == hip, "the effective round fold follows the backend");
-        require(std::string_view(mini::mini_round_fold_name(options.prepared_round_fold && effective,
-                                                           options.prepared_round_fold)) ==
+        // The startup field comes from the function the native cohort prints it with, given the backend's admission result.
+        require(std::string_view(mini::mini_round_fold_startup_field(
+                                         options, {false, options.prepared_round_fold && effective})) ==
                     (!round_fold ? "off" : hip ? "on" : "declined"),
                 "the served round fold is reported by its effective state");
+        // Injected admission results: a declined fold never reads as the requested bit.
+        auto requested = options;
+        requested.prepared_round_fold = true;
+        require(std::string_view(mini::mini_round_fold_startup_field(requested, {false, false})) == "declined" &&
+                    std::string_view(mini::mini_round_fold_startup_field(requested, {false, true})) == "on",
+                "a requested fold the backend declines is reported declined");
+        requested.prepared_round_fold = false;
+        require(std::string_view(mini::mini_round_fold_startup_field(requested, {false, false})) == "off",
+                "an unrequested fold is reported off");
         // The served prefill resolves the down-image lever like the CLI and the gate do: off unless selected explicitly.
         require(options.combine_image == image, "down-image selection did not reach native adapter");
         // The served route lever (opt-in in every profile column): a HIP server runs the command line's route only when

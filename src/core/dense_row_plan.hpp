@@ -211,6 +211,11 @@ constexpr bool image_packed_schedule(const ImageRoutePolicy& policy, bool measur
     return measured_device && image_launch_measured(policy, input_width, rows, projections);
 }
 
+template <std::size_t Limit, class Status, class Launch>
+Status for_each_image_route_run(std::span<const Bf16RowProjection> projections, std::span<const ImageRoute> routes,
+                                unsigned input_width, Status success, const Launch& launch,
+                                const ImageRoutePolicy* measured = nullptr, unsigned rows = 0U);
+
 // Routes of the projections of one call on FP32 rows [rows][input_width] (routes.size() >= projections.size()).
 // The incumbent launches the call in groups of GroupMax consecutive projections; group_admits(group) tells whether
 // that launch runs the BF16 operand arithmetic the image routes keep (the WMMA tile). A group it refuses keeps every
@@ -218,7 +223,8 @@ constexpr bool image_packed_schedule(const ImageRoutePolicy& policy, bool measur
 // within max_outputs and the policy's measured shapes, 16-byte aligned weights, a row pitch of whole 16-byte units no shorter than the row and
 // outputs x pitch addressable; image = what image_admits(projection) accepts; fp32_rows otherwise. Returns false,
 // every route fp32_rows, when the call keeps its FP32 rows: a height outside [min_rows, max_rows], K not a multiple
-// of the stage, or fewer packed columns than min_packed_columns. A packed projection is a measured launch on its own
+// of the stage, fewer packed columns than min_packed_columns, or a packed plan whose measured cut makes more launches
+// than its uncut runs (a group of the call that is not a listed launch group). A packed projection is a measured launch on its own
 // (image_shape_measured); for_each_image_route_run, given the policy, launches the packed projections only as
 // measured launches (single projections, or the listed groups), so every launch a planned call makes is measured.
 template <std::size_t GroupMax, class GroupAdmits, class ImageAdmits>
@@ -253,7 +259,22 @@ bool plan_image_routes(const ImageRoutePolicy& policy, unsigned input_width, uns
             }
         }
     }
-    if (packed_columns >= policy.min_packed_columns) return true;
+    if (packed_columns >= policy.min_packed_columns) {
+        // The calibration prices the call's own launches: a group the measured cut would split into more packed launches
+        // than its uncut runs (an unlisted tuple such as [5120, 128, 128]) is not a priced plan, so the whole call keeps
+        // the incumbent.
+        std::size_t whole = 0, cut = 0;
+        const auto counter = [](std::size_t& n) {
+            return [&n](ImageRoute route, std::span<const Bf16RowProjection>) {
+                n += route == ImageRoute::packed ? 1U : 0U;
+                return true;
+            };
+        };
+        const auto planned = routes.first(projections.size());
+        for_each_image_route_run<GroupMax>(projections, planned, input_width, true, counter(whole));
+        for_each_image_route_run<GroupMax>(projections, planned, input_width, true, counter(cut), &policy, rows);
+        if (whole == cut) return true;
+    }
     std::fill_n(routes.begin(), projections.size(), ImageRoute::fp32_rows);
     return false;
 }
@@ -308,7 +329,7 @@ inline bool image_routes_order_free(const float* input, unsigned input_width, un
 template <std::size_t Limit, class Status, class Launch>
 Status for_each_image_route_run(std::span<const Bf16RowProjection> projections, std::span<const ImageRoute> routes,
                                 unsigned input_width, Status success, const Launch& launch,
-                                const ImageRoutePolicy* measured = nullptr, unsigned rows = 0U) {
+                                const ImageRoutePolicy* measured, unsigned rows) {
     static_assert(Limit > 0);
     const auto natural = std::size_t{input_width} * sizeof(std::uint16_t);
     const auto pitch = [natural](const Bf16RowProjection& p) { return p.row_bytes != 0U ? p.row_bytes : natural; };

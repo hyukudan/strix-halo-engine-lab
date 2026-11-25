@@ -49,7 +49,7 @@ inline MiniServeCohort make_mini_device_cohort(
               << " prefill_chunk " << opt.prefill_rows << " prefill_tail " << decoder_tail
               << " served_route " << (cli_route ? "cli" : "incumbent")
               << " first_id " << (cohort->prefill_emits_first() ? "prefill" : "decode")
-              << " prepared_round_fold " << mini_round_fold_name(levers.prepared_round_fold, opt.prepared_round_fold)
+              << " prepared_round_fold " << mini_round_fold_startup_field(opt, levers)
               << " down_image " << mini_down_image_name(levers.down_image, opt.combine_image)
               << " weight_storage " << weights.storage.name << '@' << weights.storage.revision
 #if !defined(__HIPCC__)

@@ -44,6 +44,12 @@ struct MiniServeOptions {
     bool combine_image = false;
 };
 
+// The prepared_round_fold field of the served startup line: the requested bit from the options and what the decoder's backend
+// admitted of it (MiniDecoderLevers::prepared_round_fold), so a fold the backend declines reads "declined", never "on".
+inline const char* mini_round_fold_startup_field(const MiniServeOptions& opt, const MiniDecoderLevers& levers) {
+    return mini_round_fold_name(levers.prepared_round_fold, opt.prepared_round_fold);
+}
+
 struct MiniServeCohort {
     std::unique_ptr<serve::CohortBackend> backend;
     weight::WeightLoadPlan weights;
