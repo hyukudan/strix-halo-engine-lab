@@ -28,8 +28,24 @@ enum class Leaf : unsigned {
 
 using Thunks = std::array<std::array<LaunchFn, static_cast<unsigned>(Leaf::count)>, widths.size()>;
 
+// The early-launch contract of each leaf body, the same contract the one-row decode step declares for
+// its dense and RMS leaves. The dense rows bodies (rows_body.inc, rows_mma_body.inc) and the RMS step
+// body (After<> operands, norm_body.inc) issue the grid dependency wait before they read any operand a
+// predecessor writes and before any global store; before it they read only kernel parameters, the step
+// descriptor uploaded before the graph and constant weights. Such a leaf takes a programmatic edge from
+// a preceding kernel. Every other leaf keeps a completion edge. A thunk table must honour this contract.
+[[nodiscard]] constexpr PdlLeaf pdl_contract(Leaf which) noexcept {
+    switch (which) {
+    case Leaf::dense_fp32:
+    case Leaf::dense_mma3:
+    case Leaf::dense_mma3_round:
+    case Leaf::rms: return {PdlWait::before_step_io, PdlOptOut::none};
+    default: return {PdlWait::undeclared, PdlOptOut::legacy_schedule};
+    }
+}
+
 // Separate width-indexed recipe table. Every thunk enqueues exactly one
-// matching kernel. Use completion edges when adding these bindings.
+// matching kernel. Bindings carry pdl_contract; append adds them under it.
 class Bindings {
 public:
     Bindings(const StepBlock* descriptor, unsigned rows, const Thunks& thunks);
@@ -51,12 +67,12 @@ public:
 
     template <class Args>
     void append(CudaProgramRecipe& recipe, const Args& args) const {
-        recipe.kernel(bind(args), false, widths[index_]);
+        recipe.kernel(bind(args), widths[index_]);
     }
 
     void append(CudaProgramRecipe& recipe, const Greedy& args) const {
-        recipe.kernel(bind_partial(args), false, widths[index_]);
-        recipe.kernel(bind(args), false, widths[index_]);
+        recipe.kernel(bind_partial(args), widths[index_]);
+        recipe.kernel(bind(args), widths[index_]);
     }
 
 private:

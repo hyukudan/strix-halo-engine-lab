@@ -72,6 +72,7 @@ KernelBinding Bindings::leaf(Leaf which, Grid grid, const Args& args) const {
     result.exact_identity = result.identity;
     result.grid = grid;
     result.predicted.launches = 1;
+    result.pdl = pdl_contract(which);
     const LaunchArgs<Args> launch{descriptor_, args};
     const auto bytes = std::as_bytes(std::span(&launch, 1));
     result.args.assign(bytes.begin(), bytes.end());
