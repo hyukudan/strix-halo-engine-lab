@@ -408,12 +408,14 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         if (std::string_view(field) == "--speculation") strings.pop_back();
         strings.pop_back();
     }
-    // The block-candidate switch through the production start-up parser (profile fast here): an explicit OFF starts,
-    // every other value is refused before native load with the same reason as the CLI.
+    // The block-candidate switch through the production start-up parser: an explicit OFF starts, every other value is
+    // refused before native load with the same reason as the CLI (EXACT refuses sampled verification by its profile).
+    const bool exact = std::string_view(tier_name) == "exact";
     for (const auto& [value, reason] : std::initializer_list<std::pair<const char*, const char*>>{
              {"off", ""},
              {"dflash2:8:greedy", "native forward and verify identity are not bound"},
-             {"dflash2:8:sampled", "sampled rejection hook unqualified and unbound"},
+             {"dflash2:8:sampled", exact ? "EXACT permits only greedy-identical verification"
+                                          : "sampled rejection hook unqualified and unbound"},
              {"dflash2:7:greedy", "requires block 8"}}) {
         std::ostringstream out, error;
         strings.emplace_back("--block-drafter");
