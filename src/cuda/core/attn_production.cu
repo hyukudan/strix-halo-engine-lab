@@ -814,6 +814,15 @@ cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const Prepare
         d.heads, d.kv_heads, d.head_dim, prepared.relative_extent, failure, stream);
 }
 
+namespace {
+std::atomic<void (*)()> append_boundary_hook{nullptr};  // test seam: runs between the K/V store and the flash launch
+}  // namespace
+
+// Test seam (declared by the fixture only): `hook` runs inside the projected append after its preparation and K/V store
+// and before the prepared launch is submitted (nullptr = none). Production never sets it: the append reads the pointer
+// once, with the preparation, and a null pointer costs one predicted branch on the host.
+void set_append_boundary_hook_for_test(void (*hook)()) { append_boundary_hook.store(hook); }
+
 cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
                                            const PreparedBf16Projection& projection,
                                            const float* q, const float* k, const float* v,
@@ -826,13 +835,14 @@ cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const Prepare
     if (auto refused = prepare_prepared_bf16_projected(d, prepared, projection, q, k_cache, v_cache, pos0, rows, out, pipe,
                                                        failure, launch);
         refused != cudaSuccess) return refused;
+    const auto hook = append_boundary_hook.load(std::memory_order_relaxed);  // read once, with the preparation
     const std::size_t kv_bytes = std::size_t{rows} * d.kv_heads * d.head_dim * sizeof(float);  // bounded by the admission
     if (!core::reads_disjoint_from_writes({{k, kv_bytes}, {v, kv_bytes}}, {{failure, sizeof(unsigned)}}))
         return cudaErrorInvalidValue;
     auto status = kv_store_prepared_bf16(d, k, v, k_cache, v_cache, pos0, rows, prepared.wrapped, stream);
     if (status != cudaSuccess) return status;
-    status = launch_prepared_bf16_projected(launch, d, prepared, projection, q, k_cache, v_cache, pos0, rows, out, stream,
-                                            failure);
+    if (hook) hook();  // test seam: null in production
+    status = launch_prepared_bf16_projected(launch, stream);
     if (status != cudaSuccess || !failure) return status;
     // The flash flagged the projected logits; the remaining operands are checked as on the image route.
     return attn_core::enqueue_validate_prepared_finite(

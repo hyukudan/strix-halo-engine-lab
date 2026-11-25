@@ -20,7 +20,8 @@
 #include <vector>
 
 namespace strix::cuda_core {
-void set_projected_optin_limit_for_test(int bytes);  // attn_flash.cu test seam
+void set_projected_optin_limit_for_test(int bytes);        // attn_flash.cu test seam
+void set_append_boundary_hook_for_test(void (*hook)());    // attn_production.cu test seam
 }
 
 namespace {
@@ -249,6 +250,12 @@ void overlaps() {
                 ok ? "PASS" : "FAIL");
 }
 
+int hook_calls = 0;
+void lower_limit_at_boundary() {
+    ++hook_calls;
+    cc::set_projected_optin_limit_for_test(48 * 1024);
+}
+
 // A refused device setup (opt-in limit below the extent's shared memory) returns an error with the K/V cache and the
 // output untouched; the same call then runs once the limit is real again.
 void setup_refusal() {
@@ -281,7 +288,7 @@ void setup_refusal() {
         out.fill(out_sentinel);
     };
     const auto same = [](const auto& a, const auto& b) { return std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0])) == 0; };
-    bool ok = true, once = true;
+    bool ok = true, once = true, boundary = true;
     for (const auto pipe : {cc::FlashPipe::pad2, cc::FlashPipe::swz3}) {
         reset();
         cc::set_projected_optin_limit_for_test(48 * 1024);  // below the pipe's K/V stages plus the 32 KB weight table
@@ -300,8 +307,9 @@ void setup_refusal() {
         const auto ref_k = kc.download(), ref_v = vc.download();
         const auto ref_o = out.download();
         ok = ok && accepted == cudaSuccess && std::memcmp(ref_k.data(), sentinel.data(), cache_elems * 2U) != 0;
-        // Setup once: prepared at the real limit, then the limit drops below this extent's shared memory between the
-        // preparation and the K/V store. A fresh preparation now refuses; the store and the prepared launch still run.
+        // Setup once, standalone: prepared at the real limit, then the limit drops below this extent's shared memory
+        // between the preparation and the K/V store. A fresh preparation now refuses and the refused value cannot be
+        // launched; the store and the prepared launch still run.
         reset();
         cc::PreparedProjectedLaunch launch, again;
         const auto first = cc::prepare_prepared_bf16_projected(dims, prepared, projection, dq.data(), kc.data(), vc.data(), 0,
@@ -309,18 +317,28 @@ void setup_refusal() {
         cc::set_projected_optin_limit_for_test(48 * 1024);
         const auto second = cc::prepare_prepared_bf16_projected(dims, prepared, projection, dq.data(), kc.data(), vc.data(), 0,
                                                                 rows, out.data(), pipe, nullptr, again);
-        const auto unprepared = cc::launch_prepared_bf16_projected(again, dims, prepared, projection, dq.data(), kc.data(),
-                                                                   vc.data(), 0, rows, out.data(), nullptr);
+        const auto unprepared = cc::launch_prepared_bf16_projected(again, nullptr);
         const auto stored = cc::kv_store_prepared_bf16(dims, dk.data(), dv.data(), kc.data(), vc.data(), 0, rows, false,
                                                        nullptr);
-        const auto launched = cc::launch_prepared_bf16_projected(launch, dims, prepared, projection, dq.data(), kc.data(),
-                                                                 vc.data(), 0, rows, out.data(), nullptr);
+        const auto launched = cc::launch_prepared_bf16_projected(launch, nullptr);
         cc::set_projected_optin_limit_for_test(0);
         check(cudaDeviceSynchronize(), "sync");
-        once = once && first == cudaSuccess && launch.smem_bytes > 0 && second == cudaErrorInvalidValue &&
-               again.smem_bytes == 0 && unprepared == cudaErrorInvalidValue && stored == cudaSuccess &&
-               launched == cudaSuccess && same(kc.download(), ref_k) && same(vc.download(), ref_v) &&
-               same(out.download(), ref_o);
+        once = once && first == cudaSuccess && launch.admitted() && second == cudaErrorInvalidValue && !again.admitted() &&
+               unprepared == cudaErrorInvalidValue && stored == cudaSuccess && launched == cudaSuccess &&
+               same(kc.download(), ref_k) && same(vc.download(), ref_v) && same(out.download(), ref_o);
+        // Setup once, through the production append: the hook lowers the limit at its prepared-to-submit boundary (after
+        // the K/V store is enqueued, before the flash is submitted). The append must still succeed with the bytes of the
+        // plain append; a launch that repeated the setup there would refuse and leave the output unwritten.
+        reset();
+        hook_calls = 0;
+        cc::set_append_boundary_hook_for_test(&lower_limit_at_boundary);
+        const auto through = cc::append_attention_prepared_bf16(dims, prepared, projection, dq.data(), dk.data(), dv.data(),
+                                                                kc.data(), vc.data(), 0, rows, out.data(), nullptr, pipe);
+        cc::set_append_boundary_hook_for_test(nullptr);
+        cc::set_projected_optin_limit_for_test(0);
+        check(cudaDeviceSynchronize(), "sync");
+        boundary = boundary && through == cudaSuccess && hook_calls == 1 && same(kc.download(), ref_k) &&
+                   same(vc.download(), ref_v) && same(out.download(), ref_o);
     }
     if (!ok) ++failures;
     std::printf("%s setup refusal (both pipes: error returned, K/V sentinel bytes and output unchanged; accepted once the "
@@ -328,6 +346,9 @@ void setup_refusal() {
     if (!once) ++failures;
     std::printf("%s setup once (both pipes: limit lowered after the preparation; a fresh preparation refuses, the K/V "
                 "store and the prepared launch run, cache and output equal the plain append)\n", once ? "PASS" : "FAIL");
+    if (!boundary) ++failures;
+    std::printf("%s setup once through the append (both pipes: limit lowered at the append's prepared-to-submit boundary; "
+                "the append succeeds, K/V cache and output equal the plain append)\n", boundary ? "PASS" : "FAIL");
 }
 
 // A failure word inside any operand the launch or the append reads or writes, or misaligned, is refused by the standalone

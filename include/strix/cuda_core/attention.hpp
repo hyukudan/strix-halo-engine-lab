@@ -222,26 +222,43 @@ cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const Prepare
 // The dynamic shared-memory ceiling of each flash specialization is set once per device (to the largest extent the
 // opt-in limit admits), so concurrent launches of different extents never change a kernel attribute.
 // prepare_prepared_bf16_projected does every fallible host step of a projected launch (admission, overlap, failure
-// word, device opt-in) without enqueuing anything and returns the admitted launch: the flash specialization and its
-// dynamic shared memory. launch_prepared_bf16_projected enqueues that launch on the same operands and current device
-// without repeating any of those steps, so its errors are only those of the launch itself (cudaErrorInvalidValue for a
-// launch that was never prepared). append_attention_prepared_bf16 prepares before it writes the K/V cache and launches
-// the prepared value after the write, so a refused append leaves the cache untouched and an admitted one always attends.
-struct PreparedProjectedLaunch {
-    FlashPipe pipe = FlashPipe::pad2;
-    int smem_bytes = 0;  // 0: not prepared
+// word, device opt-in) without enqueuing anything. The returned value is opaque and owns the validated launch: the flash
+// specialization, its dynamic shared memory, and the dims, operands, extent and failure word that were admitted, so a
+// submission cannot name a different shape or a different failure word than the one checked.
+// launch_prepared_bf16_projected enqueues exactly that launch on a stream (current device), without repeating any setup,
+// so its errors are only those of the launch itself (cudaErrorInvalidValue for a value that was never prepared or whose
+// preparation was refused). append_attention_prepared_bf16 prepares before it writes the K/V cache and launches the
+// prepared value after the write, so a refused append leaves the cache untouched and an admitted one always attends.
+class PreparedProjectedLaunch {
+public:
+    [[nodiscard]] bool admitted() const { return smem_bytes_ > 0; }
+
+private:
+    friend cudaError_t prepare_prepared_bf16_projected(const AttentionDims&, const PreparedBf16Flash&,
+                                                       const PreparedBf16Projection&, const float*,
+                                                       const __nv_bfloat16*, const __nv_bfloat16*, std::uint32_t,
+                                                       std::uint32_t, float*, FlashPipe, unsigned*,
+                                                       PreparedProjectedLaunch&);
+    friend cudaError_t launch_prepared_bf16_projected(const PreparedProjectedLaunch&, cudaStream_t);
+    FlashPipe pipe_ = FlashPipe::pad2;
+    int smem_bytes_ = 0;  // 0: not prepared
+    AttentionDims dims_{};
+    PreparedBf16Flash prepared_{};
+    PreparedBf16Projection projection_{};
+    const float* q_ = nullptr;
+    const __nv_bfloat16* k_cache_ = nullptr;
+    const __nv_bfloat16* v_cache_ = nullptr;
+    std::uint32_t pos0_ = 0, rows_ = 0;
+    float* out_ = nullptr;
+    unsigned* failure_ = nullptr;
 };
 [[nodiscard]] cudaError_t prepare_prepared_bf16_projected(const AttentionDims& d, const PreparedBf16Flash& prepared,
                                                           const PreparedBf16Projection& projection, const float* q,
                                                           const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
                                                           std::uint32_t pos0, std::uint32_t rows, float* out,
-                                                          FlashPipe pipe, const unsigned* failure,
+                                                          FlashPipe pipe, unsigned* failure,
                                                           PreparedProjectedLaunch& launch);
-cudaError_t launch_prepared_bf16_projected(const PreparedProjectedLaunch& launch, const AttentionDims& d,
-                                           const PreparedBf16Flash& prepared, const PreparedBf16Projection& projection,
-                                           const float* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
-                                           std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream,
-                                           unsigned* failure = nullptr);
+cudaError_t launch_prepared_bf16_projected(const PreparedProjectedLaunch& launch, cudaStream_t stream);
 cudaError_t attention_prefill_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
                                             const PreparedBf16Projection& projection, const float* q,
                                             const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
