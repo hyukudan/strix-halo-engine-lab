@@ -465,11 +465,14 @@ void test_profile() {
         turbo_args.insert(turbo_args.end(), {"--profile", "turbo", "--allow-pending"});
         const auto turbo = w.run(app, turbo_args);
         const auto* i4 = turbo.profile->find("moe_iu4");
-        check(i4 && i4->status == pr::Status::pending && i4->value == "0",
-              "IU4 stays off under TURBO (even --allow-pending) without a measured prefill row over FAST");
+        check(i4 && i4->status == pr::Status::builtin && i4->value == "0",
+              "IU4 is not a TURBO row (measured slower than FAST), even with --allow-pending");
         const auto* replay = turbo.profile->find("decoder_replay");
-        check(replay && replay->requested == "256" && replay->value == "0" && replay->status == pr::Status::pending,
-              "R256 is identified and stays pending without a matched TURBO receipt");
+        check(replay && replay->value == "256" && replay->status == pr::Status::provisional,
+              "TURBO nests the FAST decoder replay R256");
+        const auto* fast_replay = f.profile->find("decoder_replay");
+        check(fast_replay && fast_replay->value == "256" && fast_replay->status == pr::Status::provisional,
+              "FAST selects decoder replay R256 (gate v2 D1R)");
         auto i4_world = w;
         i4_world.env["STRIX_DS41_FAST_I4"] = "1";
         for (const auto* profile : {"fast", "turbo"}) {
@@ -483,10 +486,10 @@ void test_profile() {
         const std::vector<std::pair<std::string, std::string>> fast_set{
             {"STRIX_DS41_FAST_PREFILL", "1"}, {"STRIX_DS41_FAST_ATTN", "2"}, {"STRIX_DS41_FAST_MOE", "1"},
             {"STRIX_DS41_FAST_DENSE", "1"}, {"STRIX_DS41_FAST_DENSE_MIN_ROWS", "128"}, {"STRIX_DS41_FAST_ENGRAM", "1"},
-            {"STRIX_DS41_FAST_SHARED", "1"}, {"STRIX_DS41_FAST_MOE_F16", "1"}};
+            {"STRIX_DS41_FAST_SHARED", "1"}, {"STRIX_DS41_FAST_MOE_F16", "1"}, {"STRIX_DS41_DECODER_REPLAY", "256"}};
         fast_env.insert(fast_env.end(), fast_set.begin(), fast_set.end());
         check(f.args == base.args && std::is_permutation(f.set_env.begin(), f.set_env.end(), fast_env.begin(), fast_env.end()),
-              "fast: bundle ds41-fast-pf-v1 expanded as the switch, plus Engram, shared and MoE FP16 levers");
+              "fast: bundle ds41-fast-pf-v1 expanded as the switch, plus Engram, shared, MoE FP16 and replay R256");
         const auto value_of = [](const std::vector<std::pair<std::string, std::string>>& set, const char* key) {
             for (const auto& [k, v] : set) if (k == key) return v;
             return std::string();
@@ -510,9 +513,9 @@ void test_profile() {
                           cell->status == (fast_tier ? pr::Status::provisional : pr::Status::builtin),
                       std::string(name) + " preset: native cell and qualification status for " + row);
             }
-            check(preset.profile->find("decoder_replay")->value == "0" &&
+            check(preset.profile->find("decoder_replay")->value == (fast_tier ? "256" : "0") &&
                       preset.profile->find("moe_iu4")->value == "0",
-                  std::string(name) + " preset: replay and IU4 stay pending");
+                  std::string(name) + " preset: replay R256 in fast and turbo, IU4 off in every tier");
         }
         check(pr::export_environment(pr::kPresetEnv, previous ? previous->c_str() : ""), "restore model preset marker");
         World sw = w;

@@ -41,11 +41,10 @@ int main() {
             const auto turbo = pd::resolve(app, {"--profile", "turbo", "--allow-pending"},
                                            [](const char*) -> const char* { return nullptr; }, {}, {});
             const auto* i4 = turbo.profile->find("moe_iu4");
-            require(i4 && i4->status == strix::profile::Status::pending && i4->value == "0",
+            require(i4 && i4->status == strix::profile::Status::builtin && i4->value == "0",
                     "IU4 must stay off even with --allow-pending");
-            require(i4->lever->source.find("request prefill regime") != std::string_view::npos &&
-                    i4->lever->source.find("atomic replacement of relaxed MoE") != std::string_view::npos,
-                    "pending IU4 receipt must declare both promotion dependencies");
+            require(i4->lever->value[3].empty() && i4->lever->source.find("slower than FAST") != std::string_view::npos,
+                    "IU4 has no TURBO cell and its source states the measured loss");
         }
         const auto off = resolve({});
         const auto dense = resolve({{"STRIX_DS41_FAST_DENSE", "1"}});

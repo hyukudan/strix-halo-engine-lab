@@ -42,13 +42,15 @@ inline constexpr std::array<strix::profile::Lever, 13> profile_table{{
      {true, false, true, false}, {true, true, true, false}, "", "", "FAST dense dispatch threshold", false, {}, true, {}, {{{"128", "v1"}}}},
     // Prefill only: FAST policy ds41-decoder-replay-bounded-v1 (value R rows, a multiple of 128): every decoder layer runs
     // its last R rows, window keys floored at the cut, its dense products in the exact form (bounded run == full run
-    // with the floor, bit for bit; not bit-equal to the full decode). Explicit only, OFF in default / fast / quality;
-    // set, it enters the profile fingerprint (rank agreement, prefix-cache identity). TURBO R=256 is pending a
-    // matched timing and quality receipt on the executing key floor.
-    {"decoder_replay", "STRIX_DS41_DECODER_REPLAY", "", {"", "", "", "256"}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true, false}, {true, true, true, true}, "ds41-replay-r256-v1", "0",
-     "pending: TURBO timing over effective FAST and quality for R=256 with key floor round_down(T - R, 256); "
-     "the historical R=256 gate ran on floor T - R", false, {}, true, {},
+    // with the floor, bit for bit; not bit-equal to the full decode). 'fast' selects R=256 (key floor
+    // round_down(T - R, 256)) over the resolved fast set; TURBO nests it (empty cell). OFF in default / quality.
+    // Set, it enters the profile fingerprint (rank agreement, prefix-cache identity).
+    {"decoder_replay", "STRIX_DS41_DECODER_REPLAY", "", {"", "256", "", ""}, "0", strix::profile::Kind::bit_changing,
+     {true, false, true, false}, {true, true, true, true}, "", "0",
+     "FAST bounded decoder replay R=256 (ds41-replay-r256-v1, key floor round_down(T - R, 256)) on the resolved fast set; "
+     "FAST gate v2 D1R on fast set + R256: qualified for prompts <= 8,192 (8K class 14 windows, 882 rows, final PASS: "
+     "KL 0.0121, top-1 0.962, dNLL -0.0058 se 0.0059); provisional above (32K class pending)",
+     false, {false, true, false, false}, true, {},
      {{{"0", "v1"}, {"256", "ds41-replay-r256-v1"}}}},
     // Prefill only: the Engram KV projection on the shared FP16 WMMA core (ds41-engram-f16wmma-v1); views whose x would overflow FP16
     // keep the exact kernel. Not a bundle member (the env bundle ds41-fast-pf-v1 keeps its identity); 'fast' selects it.
@@ -68,13 +70,12 @@ inline constexpr std::array<strix::profile::Lever, 13> profile_table{{
      "FAST MoE down FP16 operands ds41-moe-f16wmma-v1 (#721) in the fast set; FAST gate v2 D1 on the resolved fast set (no replay): qualified for prompts <= 8,192 (8K class 14 windows, 882 rows, final PASS: KL 0.0116, top-1 0.962, dNLL -0.0072 se 0.0058); provisional above (32K class 126 rows < 800)",
      false, {false, true, false, false}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
     // Prefill only: routed experts as IU4 codes x A4 activations (gguf-iu4-direct-v1; the stored IQ2_XXS / Q2_K weights
-    // are decoded inside the product, no pack). Automatic TURBO admission needs the actual request prefill regime
-    // and must replace relaxed MoE atomically for execution and prefix identity. Explicit STRIX_DS41_FAST_I4=1
-    // already displaces the profile-selected relaxed MoE.
-    {"moe_iu4", "STRIX_DS41_FAST_I4", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true, false}, {true, false, true, true}, "gguf-iu4-direct-v1", "0",
-     "pending: TURBO prefill timing over FAST and quality (KL / top-1 / dNLL vs BF16) for gguf-iu4-direct-v1; "
-     "automatic admission requires the request prefill regime and atomic replacement of relaxed MoE", false,
+    // are decoded inside the product, no pack). No profile selects it: on the pair prefill it is slower than the
+    // relaxed MoE it replaces (source below). Explicit STRIX_DS41_FAST_I4=1 displaces the profile-selected relaxed MoE.
+    {"moe_iu4", "STRIX_DS41_FAST_I4", "", {"", "", "", ""}, "0", strix::profile::Kind::bit_changing,
+     {true, false, true, false}, {true, false, true, true}, "", "0",
+     "explicit only: no profile selects gguf-iu4-direct-v1 (pair prefill 8,192 tokens over the resolved fast set: "
+     "4,975 ms FAST, 18,116 ms scope all, 15,110 ms scope gu; slower than FAST, no TURBO row)", false,
      {}, true, {}, {{{"0", "v1"}, {"1", "gguf-iu4-direct-v1"}}}},
     {"moe_iu4_scope", "STRIX_DS41_FAST_I4_SCOPE", "", {"", "", "", ""}, "", strix::profile::Kind::bit_changing,
      {}, {true, true, true, true}, "", "", "explicit IU4 projection scope: all (default) or gu", false, {}, true, {}, {{{"", "all-v1"}, {"all", "all-v1"}, {"gu", "gu-v1"}}}},
@@ -88,9 +89,13 @@ inline constexpr std::array<strix::profile::Lever, 13> profile_table{{
 // FAST gate ledger (strix::profile::FastGate, tests/profile_fast_set_tests.cpp): the gate receipt behind each fast cell.
 inline constexpr std::string_view kFastGateD1 =
     "FAST gate v2 D1, resolved fast set, pair, prompts <= 8,192: 14 windows, 882 rows, final PASS (32K: provisional)";
+inline constexpr std::string_view kFastGateD1R =
+    "FAST gate v2 D1R, resolved fast set + decoder replay R=256, pair, prompts <= 8,192: 14 windows, 882 rows, final "
+    "PASS (32K: provisional)";
 inline constexpr strix::profile::FastGate fast_gates[] = {
     {"fast_prefill", "1", kFastGateD1}, {"engram_f16wmma", "1", kFastGateD1},
-    {"shared_f16", "1", kFastGateD1},   {"moe_f16wmma", "1", kFastGateD1}};
+    {"shared_f16", "1", kFastGateD1},   {"moe_f16wmma", "1", kFastGateD1},
+    {"decoder_replay", "256", kFastGateD1R}};
 
 // Ladder rows (strix::profile::LadderRow): incumbent grants for the cells the resolver ran before the ladder rule.
 // TURBO nests FAST: its column is empty for every member, so it resolves over the admitted FAST set.
@@ -104,6 +109,7 @@ inline constexpr strix::profile::LadderRow ladder_rows[] = {
     strix::profile::incumbent_cell("engram_f16wmma", "1", ladder_detail::kFast, kFastGateD1, "v1"),
     strix::profile::incumbent_cell("shared_f16", "1", ladder_detail::kFast, kFastGateD1, "v1"),
     strix::profile::incumbent_cell("moe_f16wmma", "1", ladder_detail::kFast, kFastGateD1, "v1"),
+    strix::profile::incumbent_cell("decoder_replay", "256", ladder_detail::kFast, kFastGateD1R, "ds41-replay-r256-v1"),
     strix::profile::incumbent_cell("moe_relaxed", "1", ladder_detail::kFast, strix::profile::kProvisionalBeforeLadder, "v1"),
     strix::profile::incumbent_cell("moe_relaxed", "1", ladder_detail::kTurbo, strix::profile::kProvisionalBeforeLadder, "v1")};
 

@@ -102,8 +102,8 @@ void families() {
                     ("ds41 turbo resolves every cell to its fast value: " + lever).c_str());
         }
     }
-    require(find(r, "moe_iu4")->value == "0" && find(r, "moe_iu4")->status == p::Status::pending,
-            "DeepSeek IU4 remains pending in TURBO");
+    require(find(r, "moe_iu4")->value == "0" && find(r, "moe_iu4")->status == p::Status::builtin,
+            "DeepSeek IU4 is not a TURBO row (measured slower than FAST)");
     std::size_t engram_rows = 0;
     for (const auto& row : profile_table)
         if (std::string_view(row.env) == "STRIX_DS41_FAST_ENGRAM") ++engram_rows;
@@ -111,7 +111,9 @@ void families() {
     const auto* engram = find(r, "engram_f16wmma");
     require(engram != nullptr && engram->value == "1" && engram->lever->value[3].empty(),
             "DeepSeek TURBO inherits the FAST Engram member");
-    require(find(r, "decoder_replay") != nullptr && find(r, "decoder_replay")->status == p::Status::pending, "ds41 replay pending");
+    require(find(r, "decoder_replay") != nullptr && find(r, "decoder_replay")->value == "256" &&
+                find(r, "decoder_replay")->lever->value[3].empty(),
+            "ds41 TURBO inherits the FAST decoder replay R256");
     generic(ds, p::Name::fast, none, r);
     require(find(r, "attention_f16wmma")->requested == "1", "ds41 fast unchanged (f16wmma)");
     generic(ds, p::Name::standard, none, r);
