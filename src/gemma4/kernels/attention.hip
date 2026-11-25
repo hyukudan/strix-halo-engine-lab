@@ -974,7 +974,7 @@ __global__ void __launch_bounds__(256) kv_partial_kernel(const KvRead* reads, un
     const auto first = std::uint64_t(chunk) * attention_chunk;
     if (first > range.last || first + attention_chunk <= range.first)
         return;
-    __shared__ float e[group][attention_chunk];
+    __shared__ float e[group * attention_chunk]; // flat: head h at e + h * attention_chunk (the shared loop indexes h * pitch)
     __shared__ const float* values[attention_chunk];
     __shared__ float maximum[group], wave_maxima[8][group];
     const auto first_chunk = range.first / attention_chunk, last_chunk = range.last / attention_chunk;
@@ -1006,17 +1006,17 @@ __global__ void __launch_bounds__(256) kv_partial_kernel(const KvRead* reads, un
     for (auto p = begin + threadIdx.x; p < end; p += blockDim.x) {
 #pragma unroll
         for (unsigned h = 0; h < group; ++h)
-            e[h][p - first] = declared_exp(scores[std::size_t(rh0 + h) * stride + p] - maximum[h]);
+            e[std::size_t(h) * attention_chunk + (p - first)] = declared_exp(scores[std::size_t(rh0 + h) * stride + p] - maximum[h]);
         values[p - first] = kv_at(r, p, true, failure);
     }
     __syncthreads();
     if (threadIdx.x < group)
         partials[(std::size_t(rh0 + threadIdx.x) * chunks + chunk) * (Dim + 1U) + Dim] =
-            chunk_denominator(e[threadIdx.x], first, begin, end);
+            chunk_denominator(e + std::size_t(threadIdx.x) * attention_chunk, first, begin, end);
     for (unsigned i = threadIdx.x; i < Dim; i += blockDim.x) {
         // Missing V rows skip only the numerator term, as before.
         float numerator[1][group];
-        chunk_numerators<Batch, group, 1U>(&e[0][0], attention_chunk, first, begin, end,
+        chunk_numerators<Batch, group, 1U>(e, attention_chunk, first, begin, end,
                                            [&](std::uint64_t p) { return values[p - first]; }, kv_head * Dim + i, 0U,
                                            numerator);
 #pragma unroll
@@ -1119,7 +1119,7 @@ __global__ void __launch_bounds__(256) group_partial_merge_kernel(const KvRead* 
     const unsigned chunks = (stride + attention_chunk - 1U) / attention_chunk;
     const unsigned chunk = compact_chunk(blockIdx.y, slots, chunks, range);
     const auto first = std::uint64_t(chunk) * attention_chunk;
-    __shared__ float e[group][attention_chunk];
+    __shared__ float e[group * attention_chunk]; // flat: head h at e + h * attention_chunk (the shared loop indexes h * pitch)
     __shared__ const float* values[attention_chunk];
     __shared__ float maximum[group], wave_maxima[8][group];
     __shared__ unsigned ticket;
@@ -1155,19 +1155,19 @@ __global__ void __launch_bounds__(256) group_partial_merge_kernel(const KvRead* 
         for (auto p = begin + threadIdx.x; p < end; p += blockDim.x) {
 #pragma unroll
             for (unsigned h = 0; h < group; ++h)
-                e[h][p - first] = declared_exp(scores[std::size_t(rh0 + h) * stride + p] - maximum[h]);
+                e[std::size_t(h) * attention_chunk + (p - first)] = declared_exp(scores[std::size_t(rh0 + h) * stride + p] - maximum[h]);
             values[p - first] = kv_at(r, p, true, failure);
         }
         __syncthreads();
         if (threadIdx.x < group)
             partials[(std::size_t(rh0 + threadIdx.x) * chunks + chunk) * (dim + 1U) + dim] =
-                chunk_denominator(e[threadIdx.x], first, begin, end);
+                chunk_denominator(e + std::size_t(threadIdx.x) * attention_chunk, first, begin, end);
         constexpr unsigned ValueBatch = Dim2 ? 8U : Batch;
         const auto value_row = [&](std::uint64_t p) { return values[p - first]; };
         if constexpr (Dim2) {
             const unsigned i = threadIdx.x;
             float numerator[2][group];
-            chunk_numerators<ValueBatch, group, 2U>(&e[0][0], attention_chunk, first, begin, end, value_row,
+            chunk_numerators<ValueBatch, group, 2U>(e, attention_chunk, first, begin, end, value_row,
                                                     kv_head * dim + i, 256U, numerator);
 #pragma unroll
             for (unsigned c = 0; c < 2; ++c)
@@ -1179,7 +1179,7 @@ __global__ void __launch_bounds__(256) group_partial_merge_kernel(const KvRead* 
         } else {
             for (unsigned i = threadIdx.x; i < dim; i += blockDim.x) {
                 float numerator[1][group];
-                chunk_numerators<Batch, group, 1U>(&e[0][0], attention_chunk, first, begin, end, value_row,
+                chunk_numerators<Batch, group, 1U>(e, attention_chunk, first, begin, end, value_row,
                                                    kv_head * dim + i, 0U, numerator);
 #pragma unroll
                 for (unsigned h = 0; h < group; ++h) {
