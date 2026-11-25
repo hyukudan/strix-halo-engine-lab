@@ -21,6 +21,12 @@
 // local route flips per layer (the arm's own ids vs the replayed ones) and the null's nudge count; with
 // STRIX_MOE_ROUTE_STATS=1 also "stats":{"layers":[{"layer":L,"calls":..,"rows":..,"assignments":..,"u_sum":..,
 // "pad16":..,"pad64":..}],"widths":[{"rows":M,"calls":..,"assignments":..,"u_sum":..}],"other":{...}}.
+//
+// Sequence segments (one process, several prompts): when STRIX_MOE_ROUTES_OUT or _IN contains "{seq}", the engine calls
+// route_tap_sequence(i) before prompt i (0, 1, ...). Each sequence is its own segment: "{seq}" becomes i in both paths,
+// every counter (records, flips, null index, stats) restarts and the closing segment prints its own receipt line. A
+// process that runs N sequences writes the same files and receipts as N processes that each run one of them with the
+// path written out. Without "{seq}" route_tap_sequence() changes nothing (one file and one receipt per process).
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -147,31 +153,39 @@ inline RouteTapConfig route_tap_config_from_env() {
 
 class RouteTap {
 public:
-    explicit RouteTap(RouteTapConfig config) : config_(std::move(config)) {
-        if (!config_.out_path.empty()) {
-            out_.open(config_.out_path, std::ios::binary | std::ios::trunc);
-            if (!out_) throw std::runtime_error("route tap: cannot create " + config_.out_path);
-            const std::uint32_t head[2] = {kRouteFileVersion, 0};
-            out_.write(kRouteFileMagic, 8);
-            out_.write(reinterpret_cast<const char*>(head), sizeof(head));
-        }
-        if (!config_.in_path.empty()) {
-            in_.open(config_.in_path, std::ios::binary);
-            if (!in_) throw std::runtime_error("route tap: cannot open " + config_.in_path);
-            char magic[8] = {};
-            std::uint32_t head[2] = {};
-            in_.read(magic, 8);
-            in_.read(reinterpret_cast<char*>(head), sizeof(head));
-            if (!in_ || std::memcmp(magic, kRouteFileMagic, 8) != 0 || head[0] != kRouteFileVersion)
-                throw std::runtime_error("route tap: " + config_.in_path + " is not a strix-route-file/v1");
-            in_total_ = count_records(config_.in_path);
-        }
+    explicit RouteTap(RouteTapConfig config)
+        : out_pattern_(config.out_path), in_pattern_(config.in_path), config_(std::move(config)) {
+        open_segment(0);
     }
     RouteTap(const RouteTap&) = delete;
     RouteTap& operator=(const RouteTap&) = delete;
 
     bool active() const { return config_.active(); }
     const RouteTapConfig& config() const { return config_; }
+    // True when a path names "{seq}": route_tap_sequence() then starts a new segment per prompt.
+    bool segmented() const { return has_seq(out_pattern_) || has_seq(in_pattern_); }
+    std::uint64_t sequence() const { return seq_; }
+
+    // Starts sequence `seq` (call before the prompt's first router call). Segmented: the current segment prints its
+    // receipt line (the same line a process prints at exit) and every counter restarts on the new paths. Not
+    // segmented, inactive or the current sequence: nothing changes. `sink` receives the closing receipt.
+    template <class Sink> void sequence(std::uint64_t seq, Sink&& sink) {
+        if (!active() || !segmented() || seq == seq_) return;
+        sink(receipt());
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (out_.is_open()) {
+            out_.close();
+            if (!out_) throw std::runtime_error("route tap: close failed on " + config_.out_path);
+        }
+        if (in_.is_open()) in_.close();
+        out_ = std::ofstream();
+        in_ = std::ifstream();
+        out_records_ = out_rows_ = in_total_ = in_consumed_ = in_rows_ = nudged_ = null_index_ = 0;
+        flips_.clear();
+        stats_ = RouteStats{};
+        seq_ = seq;
+        open_segment(seq);
+    }
     const RouteStats& stats() const { return stats_; }  // not locked: read after the calls
 
     // ids / weights: host copies of one router call, rows x top_k row-major. Returns true when they were changed
@@ -275,6 +289,39 @@ public:
     static RouteTap& instance();
 
 private:
+    static bool has_seq(const std::string& p) { return p.find("{seq}") != std::string::npos; }
+    static std::string segment_path(std::string p, std::uint64_t seq) {
+        for (auto at = p.find("{seq}"); at != std::string::npos; at = p.find("{seq}", at)) {
+            const auto v = std::to_string(seq);
+            p.replace(at, 5, v);
+            at += v.size();
+        }
+        return p;
+    }
+    // Resolves "{seq}" for sequence `seq` and opens the segment's files (the constructor's former body).
+    void open_segment(std::uint64_t seq) {
+        config_.out_path = segment_path(out_pattern_, seq);
+        config_.in_path = segment_path(in_pattern_, seq);
+        if (!config_.out_path.empty()) {
+            out_.open(config_.out_path, std::ios::binary | std::ios::trunc);
+            if (!out_) throw std::runtime_error("route tap: cannot create " + config_.out_path);
+            const std::uint32_t head[2] = {kRouteFileVersion, 0};
+            out_.write(kRouteFileMagic, 8);
+            out_.write(reinterpret_cast<const char*>(head), sizeof(head));
+        }
+        if (!config_.in_path.empty()) {
+            in_.open(config_.in_path, std::ios::binary);
+            if (!in_) throw std::runtime_error("route tap: cannot open " + config_.in_path);
+            char magic[8] = {};
+            std::uint32_t head[2] = {};
+            in_.read(magic, 8);
+            in_.read(reinterpret_cast<char*>(head), sizeof(head));
+            if (!in_ || std::memcmp(magic, kRouteFileMagic, 8) != 0 || head[0] != kRouteFileVersion)
+                throw std::runtime_error("route tap: " + config_.in_path + " is not a strix-route-file/v1");
+            in_total_ = count_records(config_.in_path);
+        }
+    }
+
     static std::string sums_json(const RouteStatsSums& t, bool layer_form) {
         std::string s = "\"calls\":" + std::to_string(t.calls);
         if (layer_form) s += ",\"rows\":" + std::to_string(t.rows);
@@ -331,7 +378,9 @@ private:
         return n;
     }
 
-    RouteTapConfig config_;
+    std::string out_pattern_, in_pattern_;  // as configured ("{seq}" unresolved)
+    RouteTapConfig config_;                  // the current segment's resolved paths
+    std::uint64_t seq_ = 0;
     std::mutex mutex_;
     std::ofstream out_;
     std::ifstream in_;
@@ -350,14 +399,22 @@ struct RouteTapProcess {
     RouteTapProcess(const RouteTapProcess&) = delete;
     RouteTapProcess& operator=(const RouteTapProcess&) = delete;
     ~RouteTapProcess() {
-        if (tap.active()) std::fprintf(stderr, "strix-route-file/v1 %s\n", tap.receipt().c_str());
+        if (tap.active()) print_receipt(tap.receipt());
     }
+    static void print_receipt(const std::string& receipt) { std::fprintf(stderr, "strix-route-file/v1 %s\n", receipt.c_str()); }
 };
 }  // namespace detail
 
 inline RouteTap& RouteTap::instance() {
     static detail::RouteTapProcess process;
     return process.tap;
+}
+
+// Engine hook: prompt `seq` of a prompt list starts (see "Sequence segments" above). No-op unless the process tap is
+// active and segmented.
+inline void route_tap_sequence(std::uint64_t seq) {
+    RouteTap& tap = RouteTap::instance();
+    tap.sequence(seq, [](const std::string& receipt) { detail::RouteTapProcess::print_receipt(receipt); });
 }
 
 }  // namespace strix::moe

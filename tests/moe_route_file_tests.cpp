@@ -7,8 +7,10 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -185,6 +187,95 @@ int main() {
     {
         RouteTapConfig c = strix::moe::route_tap_config_from_env();
         check(!c.stats_on && !c.active(), "env off: stats off and tap inactive");
+    }
+    {  // Sequence segments: one process with two sequences == two processes with one sequence each (files, receipts,
+       // replayed routes, null nudges and flips), so a gate can run a prompt list in one load.
+        struct Call { std::uint32_t layer, rows; std::vector<std::uint32_t> ids; std::vector<float> w; };
+        const std::vector<std::vector<Call>> seqs = {
+            {{0, 2, {3, 7, 1, 2}, {0.75F, 0.25F, 0.5F, 0.5F}}, {1, 1, {9, 4}, {0.6F, 0.4F}}},
+            {{0, 1, {5, 6}, {0.3F, 0.7F}}, {1, 2, {1, 2, 3, 4}, {0.1F, 0.9F, 0.2F, 0.8F}}}};
+        const auto pattern = temp_file("seq-{seq}.rte");
+        const std::string resolved[2] = {temp_file("seq-0.rte"), temp_file("seq-1.rte")};
+        const auto bytes = [](const std::string& p) {
+            std::ifstream f(p, std::ios::binary);
+            return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        };
+        // Each arm returns the receipts and every call's routes as the experts would read them.
+        struct Arm { std::vector<std::string> receipts; std::vector<std::uint32_t> ids; std::vector<float> w; };
+        const auto feed = [&](RouteTap& tap, const std::vector<Call>& calls, bool own, Arm& arm) {
+            for (const auto& call : calls) {
+                auto ids = call.ids;
+                auto w = call.w;
+                if (own) { std::swap(ids[0], ids[1]); ids[ids.size() - 1] += 10; w[0] += 0.01F; }  // the arm's own routes
+                tap.on_call(call.layer, call.rows, 2, ids.data(), w.data());
+                arm.ids.insert(arm.ids.end(), ids.begin(), ids.end());
+                arm.w.insert(arm.w.end(), w.begin(), w.end());
+            }
+        };
+        const auto one_process = [&](RouteTapConfig c, bool own) {
+            Arm arm;
+            RouteTap tap(c);
+            check(tap.segmented(), "a {seq} path is segmented");
+            tap.sequence(0, [&](const std::string& r) { arm.receipts.push_back(r); });  // the current sequence: no-op
+            check(arm.receipts.empty(), "sequence(current) prints nothing");
+            for (std::uint64_t s = 0; s < seqs.size(); ++s) {
+                tap.sequence(s, [&](const std::string& r) { arm.receipts.push_back(r); });
+                feed(tap, seqs[s], own, arm);
+            }
+            arm.receipts.push_back(tap.receipt());
+            return arm;
+        };
+        const auto per_process = [&](RouteTapConfig c, bool own) {
+            Arm arm;
+            for (std::size_t s = 0; s < seqs.size(); ++s) {
+                RouteTapConfig one = c;
+                if (!one.out_path.empty()) one.out_path = resolved[s];
+                if (!one.in_path.empty()) one.in_path = resolved[s];
+                RouteTap tap(one);
+                check(!tap.segmented(), "a written-out path is not segmented");
+                feed(tap, seqs[s], own, arm);
+                arm.receipts.push_back(tap.receipt());
+            }
+            return arm;
+        };
+        RouteTapConfig rec;
+        rec.out_path = pattern;
+        rec.stats_on = true;
+        const Arm a = one_process(rec, false);
+        const std::string fa[2] = {bytes(resolved[0]), bytes(resolved[1])};
+        const Arm b = per_process(rec, false);
+        check(fa[0] == bytes(resolved[0]) && fa[1] == bytes(resolved[1]) && !fa[0].empty() && fa[0] != fa[1],
+              "segmented record files == one process per sequence");
+        check(a.receipts == b.receipts && a.receipts.size() == 2, "segmented record receipts == one process per sequence");
+        check(a.receipts[1].find("\"records\":2") != std::string::npos && a.receipts[1].find("seq-1.rte") != std::string::npos,
+              "segment 1 counts its own records under its own path");
+        RouteTapConfig rep;
+        rep.in_path = pattern;
+        rep.null_on = true;
+        rep.null_layer = 0;
+        rep.null_seed = 5;
+        const Arm ra = one_process(rep, true);
+        const Arm rb = per_process(rep, true);
+        check(ra.ids == rb.ids && ra.w == rb.w, "segmented replay + null routes == one process per sequence");
+        check(ra.receipts == rb.receipts, "segmented replay receipts (flips, nudges, complete) == one process per sequence");
+        check(ra.receipts[0].find("\"complete\":true") != std::string::npos &&
+              ra.receipts[0].find("\"nudged\":4") != std::string::npos, "segment 0 replay complete, its own null count");
+        RouteTapConfig flat;
+        flat.out_path = temp_file("flat.rte");
+        RouteTap tap(flat);
+        int sunk = 0;
+        Arm sink_arm;
+        check(!tap.segmented(), "a plain path is not segmented");
+        feed(tap, seqs[0], false, sink_arm);
+        tap.sequence(1, [&](const std::string&) { ++sunk; });
+        feed(tap, seqs[1], false, sink_arm);
+        check(sunk == 0 && tap.receipt().find("\"records\":4") != std::string::npos,
+              "without {seq} sequence() changes nothing: one file, one receipt");
+        RouteTap off{RouteTapConfig{}};
+        off.sequence(3, [&](const std::string&) { ++sunk; });
+        check(sunk == 0 && !off.active(), "an inactive tap ignores sequence()");
+        for (const auto& p : resolved) std::filesystem::remove(p);
+        std::filesystem::remove(flat.out_path);
     }
     if (failures) return 1;
     std::printf("moe_route_file_tests: all passed\n");
