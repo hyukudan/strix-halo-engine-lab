@@ -735,10 +735,11 @@ void CohortDecoder::step() {
     // next round runs under the by-live draft cap, so a lone lane's long window must not shrink the next prompt's
     // grant. A round without drafts is recorded as measured, as in a cohort that never drafts.
     const std::uint32_t draft_rows = total_rows - static_cast<std::uint32_t>(n);
-    last_decode_ms_ = draft_rows == 0U
-        ? decode_ms
-        : std::max(0.0, decode_ms - static_cast<double>(draft_rows) *
-                                        fitted_cost(sums_, config_, static_cast<std::uint32_t>(n)).row_ms);
+    const bool next_prompt_lowers_cap = max_draft_for_live(config_, live() + 1U) < draft_cap;
+    last_decode_ms_ = next_prompt_lowers_cap && draft_rows != 0U
+        ? std::max(0.0, decode_ms - static_cast<double>(draft_rows) *
+                                        fitted_cost(sums_, config_, static_cast<std::uint32_t>(n)).row_ms)
+        : decode_ms;
     planner_.account(prompt_ms, decode_ms, 0.0, prompt_rows);
 
     std::vector<std::pair<Lane*, std::string>> done;
