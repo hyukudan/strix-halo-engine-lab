@@ -1,8 +1,11 @@
 // Device fixture of the A4W4 projection-call trait (core/iu4a4_projections.hpp) against the shared A4W4 dense class it
 // binds (core/iu4a4_dense.hpp, whose own fixture checks every bit against the contract dense-iu4a4-rot-v1):
 //   image   the segmented BF16 source's codes + steps == iu4a4_rot::requantise_values of the same BF16 rows (host);
-//   call    every segment's output == the plain GEMM's columns of the same image + activations, bit for bit, and
-//           round_bf16 == bf16_round of them (NaN rows NaN on both sides);
+//   call    every segment's output (staged epilogue, column-blocks-first grid) == the plain GEMM's columns of the same
+//           image + activations (incumbent RawStore epilogue and grid), bit for bit, and round_bf16 == bf16_round of
+//           them (NaN rows NaN on both sides);
+//   seal    a call whose rounding is not the image's sealed policy, an image sealed for the separate policy or for
+//           another input width is refused; the seal carries the builder's pitch and rule;
 //   gate    the gated call (x1 = gate logits) == the incumbent gate pass (row_transforms::Bf16SigmoidProduct) stored to
 //           FP32 + the ungated call, bit for bit.
 // Shapes: partial m CTAs, a single 16-column segment, an odd count of 128 blocks, pitched weight rows, and the Inkling 2
@@ -87,17 +90,32 @@ int run_case(const char* name, unsigned rows, unsigned in, std::vector<unsigned>
     src.layout = layout;
     for (std::size_t s = 0; s < outs.size(); ++s) src.weights[s] = dw[s], src.pitch[s] = pitch;
     CHECK(ip::enqueue_build_image(src, codes, step, nullptr));
-    const ip::Image image{codes, step, layout};
-    // Refusals: rows past the workspace, a missing output, a stride below the inputs.
+    // One image, sealed once per rounding policy of its calls (FP32 stores / incumbent BF16 rounding).
+    const ip::Image image{codes, step, layout, ip::seal_of(src, ip::RoundPolicy::none)};
+    const ip::Image image_round{codes, step, layout, ip::seal_of(src, ip::RoundPolicy::incumbent)};
+    // Refusals: rows past the workspace, a missing output, a stride below the inputs, a rounding other than the sealed
+    // one (both ways), an image sealed for the separate policy (no store of that policy here), a seal of another width.
     unsigned bad_refusal = 0;
     bad_refusal += ip::admits(image, rows + 1U, ws, false);
     std::vector<float*> missing = ys;
     missing.back() = nullptr;
     bad_refusal += ip::enqueue_call(dx, nullptr, in, rows, image, missing, false, ws, nullptr) != hipErrorInvalidValue;
     bad_refusal += ip::enqueue_call(dx, nullptr, in - 4U, rows, image, ys, false, ws, nullptr) != hipErrorInvalidValue;
+    bad_refusal += ip::enqueue_call(dx, nullptr, in, rows, image, yr, true, ws, nullptr) != hipErrorInvalidValue;
+    bad_refusal += ip::enqueue_call(dx, nullptr, in, rows, image_round, ys, false, ws, nullptr) != hipErrorInvalidValue;
+    const ip::Image image_separate{codes, step, layout, ip::seal_of(src, ip::RoundPolicy::separate)};
+    bad_refusal += ip::admits(image_separate, rows, ws, false);
+    bad_refusal += ip::enqueue_call(dx, nullptr, in, rows, image_separate, yr, true, ws, nullptr) != hipErrorInvalidValue;
+    ip::Image image_wide = image;
+    image_wide.seal.in = in + rot::kBlock;
+    bad_refusal += ip::admits(image_wide, rows, ws, false);
+    // The seal carries the builder's pitch and rule.
+    const ip::Seal sealed = image.seal;
+    bad_refusal += sealed.in != in || sealed.rule != static_cast<unsigned>(rot::WeightRule::amax);
+    for (std::size_t s = 0; s < outs.size(); ++s) bad_refusal += sealed.row_bytes[s] != std::size_t(pitch) * 2U;
 
     CHECK(ip::enqueue_call(dx, nullptr, in, rows, image, ys, false, ws, nullptr));
-    CHECK(ip::enqueue_call(dx, nullptr, in, rows, image, yr, true, ws, nullptr));
+    CHECK(ip::enqueue_call(dx, nullptr, in, rows, image_round, yr, true, ws, nullptr));
     // The plain GEMM over the same image and the same activations (the shared class's own fixture checks it).
     const ad::Act act{ws.codes, ws.u, ws.base, rows, in};
     ad::enqueue_quantise(dx, in, act, nullptr);

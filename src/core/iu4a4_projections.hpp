@@ -13,7 +13,11 @@
 //                 segment s's BF16 matrix (pitched rows), requantised by iu4a4_rot::requantise_values.
 //   SplitCols     Cols policy of the family's GEMM: column tile i -> the owning segment's output.
 //   RoundBf16Store  Store policy: the GEMM's output value (acc * base) rounded to BF16 (nearest even, NaN stays NaN)
-//                 and stored widened to FP32, for calls whose projections publish BF16-valued outputs.
+//                 and stored widened to FP32, for calls whose projections publish BF16-valued outputs. It and the FP32
+//                 calls' iu4a4_dense::StagedRawStore opt into the family's staged epilogue (whole 16 B row chunks,
+//                 column blocks first); the family's default store (every other binder) keeps the incumbent kernel.
+//   Seal          what an image was built from (input width, per-segment row pitch, weight rule) and its calls'
+//                 rounding policy (core/iu4a4_projection_layout.hpp); a call that differs is refused, not adapted.
 //   Bf16SigmoidGate  map2 functor of the family's quantiser: the gated product bf16(bf16(x) * sigmoid(bf16(g)))
 //                 (core/row_transforms.hpp Bf16SigmoidProduct, same operations), so a gated input is quantised without
 //                 storing the FP32 product.
@@ -56,6 +60,7 @@ struct SplitCols {
 };
 
 struct RoundBf16Store {
+    static constexpr bool kStagedEpilogue = true;  // the family's staged epilogue (opt-in, iu4a4_dense::detail::StagedOptIn)
     using Tile = f16_dense_tall::RawStore::Tile;
     __device__ __forceinline__ Tile open(unsigned i, const f16_dense_tall::ColumnTile& ct, unsigned c) const {
         return f16_dense_tall::RawStore{}.open(i, ct, c);
@@ -82,12 +87,24 @@ struct Bf16SigmoidGate {
     }
 };
 
-// A call's rotated weight image (built once at load by enqueue_build_image) and its layout.
+// A call's rotated weight image (built once at load by enqueue_build_image), its layout and its seal (seal_of: what
+// it was built from and the rounding of its calls; match_call and enqueue_call refuse a call that differs).
 struct Image {
     const std::uint8_t* codes = nullptr;  // layout.weight_code_bytes()
     const float* step = nullptr;          // layout.weight_step_bytes()
     Layout layout{};
+    Seal seal{};
 };
+
+// The seal of the image enqueue_build_image(src, ...) builds, for calls of rounding policy `round`.
+[[nodiscard]] inline Seal seal_of(const Bf16Segments& src, RoundPolicy round) noexcept {
+    Seal seal{};
+    seal.in = src.layout.in;
+    for (unsigned s = 0; s < src.layout.count && s < kMaxSegments; ++s) seal.row_bytes[s] = src.pitch[s] * sizeof(std::uint16_t);
+    seal.round = round;
+    seal.rule = static_cast<unsigned>(src.rule);
+    return seal;
+}
 
 // The quantised input of a call: Act buffers sized for capacity_rows rows of max_in inputs (16-byte aligned; the byte
 // sizes workspace_*_bytes(capacity_rows, max_in)), so one workspace serves every call of up to that height and width.
@@ -117,10 +134,11 @@ inline hipError_t enqueue_build_image(const Bf16Segments& src, std::uint8_t* cod
 }
 
 // Whether a call of `rows` rows of image.layout fits the workspace and the family's limits (asked before enqueueing).
+// The trait stores RoundPolicy none (FP32) and incumbent (RoundBf16Store); an image sealed for `separate` is refused.
 [[nodiscard]] inline bool admits(const Image& image, unsigned rows, const Workspace& ws, bool gated) {
     const Layout& l = image.layout;
-    return l.admitted() && ad::supported(l.in, l.n) && (!gated || ad::map2_supported(l.in)) && rows > 0U &&
-           rows <= ws.capacity_rows && l.in <= ws.max_in && image.codes && image.step && ws.codes && ws.u && ws.base &&
+    return l.admitted() && image.seal.in == l.in && image.seal.round != RoundPolicy::separate && ad::supported(l.in, l.n) &&
+           (!gated || ad::map2_supported(l.in)) && rows > 0U && rows <= ws.capacity_rows && l.in <= ws.max_in && image.codes && image.step && ws.codes && ws.u && ws.base &&
            detail::aligned16(image.codes) && detail::aligned16(image.step) && detail::aligned16(ws.codes) &&
            detail::aligned16(ws.u) && detail::aligned16(ws.base);
 }
@@ -128,11 +146,13 @@ inline hipError_t enqueue_build_image(const Bf16Segments& src, std::uint8_t* cod
 // One call: y_s[r][o] for every segment s, r < rows, from input rows x0 (row stride x_stride floats, a multiple of 4,
 // 16-byte aligned). Gate (non-null x1, same stride): the quantised value is Bf16SigmoidGate(x0, x1). outputs[s] is
 // segment s's output [rows][layout.outputs(s)]; outputs must not overlap the input, the workspace or each other.
+// round_bf16 must be the image's sealed policy (incumbent: true, none: false); any other call is refused.
 inline hipError_t enqueue_call(const float* x0, const float* x1, unsigned x_stride, unsigned rows, const Image& image,
                                std::span<float* const> outputs, bool round_bf16, const Workspace& ws, hipStream_t stream) {
     const Layout& l = image.layout;
     if (!x0 || !detail::aligned16(x0) || (x1 && !detail::aligned16(x1)) || x_stride < l.in || x_stride % 4U != 0U ||
-        !admits(image, rows, ws, x1 != nullptr) || outputs.size() != l.count)
+        !admits(image, rows, ws, x1 != nullptr) || outputs.size() != l.count ||
+        image.seal.round != (round_bf16 ? RoundPolicy::incumbent : RoundPolicy::none))
         return hipErrorInvalidValue;
     SplitCols cols{};
     cols.layout = l;
@@ -145,7 +165,7 @@ inline hipError_t enqueue_call(const float* x0, const float* x1, unsigned x_stri
     else ad::enqueue_quantise(x0, x_stride, act, stream);
     const ad::Weights w{image.codes, image.step, l.in, l.n};
     if (round_bf16) ad::enqueue_gemm(w, act, cols, stream, RoundBf16Store{});
-    else ad::enqueue_gemm(w, act, cols, stream);
+    else ad::enqueue_gemm(w, act, cols, stream, ad::StagedRawStore{});
     return hipGetLastError();
 }
 

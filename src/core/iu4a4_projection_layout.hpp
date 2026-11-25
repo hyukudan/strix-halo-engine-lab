@@ -63,10 +63,33 @@ struct Layout {
     return layout;
 }
 
+// Store rounding of a call (core::Bf16RowProjection round_bf16 / round_separate): none = the FP32 value, incumbent =
+// RoundStore::incumbent (round_bf16), separate = RoundStore::separate (round_bf16 + round_separate).
+enum class RoundPolicy : unsigned char { none, incumbent, separate };
+[[nodiscard]] constexpr bool round_policy(bool round_bf16, bool round_separate, RoundPolicy& policy) noexcept {
+    if (round_separate && !round_bf16) return false;  // not a policy (core::bf16_rows_path refuses it too)
+    policy = !round_bf16 ? RoundPolicy::none : (round_separate ? RoundPolicy::separate : RoundPolicy::incumbent);
+    return true;
+}
+
+// What an image was built from, sealed with it at load and checked at every match: the input width, each segment's
+// effective BF16 row pitch in bytes (the builder reads row r of segment s at weights[s] + r * pitch), the rounding
+// policy of the image's calls and the weight image rule (the integer value of iu4a4_rot::WeightRule). The weight
+// pointer and the output count alone do not name the image: the same base pointer and outputs at another pitch are
+// other weights after the first row.
+struct Seal {
+    unsigned in = 0U;
+    std::size_t row_bytes[kMaxSegments]{};
+    RoundPolicy round = RoundPolicy::none;
+    unsigned rule = 0U;
+};
+
 // Which image a call runs on. Built at load: one key per segment (the segment's BF16 weights, its image, its index).
-// A call matches image i when every segment of i is one projection of the call (same weights, the segment's outputs),
-// in segment order, and the matched projections share one rounding class; index[s] = the call position of segment s.
-// The call's other projections (no key, or keys of another image) keep their incumbent route. kNoImage: no match.
+// A call of `input_width` inputs under weight rule `rule` matches image i when every segment of i is one projection of
+// the call, in segment order, with the segment's weights, outputs and effective row pitch (row_bytes, 0 = the natural
+// input_width * 2 bytes), and every matched projection has the image's rounding policy, its input width and rule are
+// the image's (Seal); index[s] = the call position of segment s. The call's other projections (no key, or keys of
+// another image) keep their incumbent route. kNoImage: no match (any sealed field differs: refused, not adapted).
 struct SegmentKey {
     const void* weights = nullptr;
     unsigned image = 0U, segment = 0U;
@@ -75,7 +98,9 @@ inline constexpr unsigned kNoImage = 0xFFFFFFFFU;
 
 template <class Projection>
 [[nodiscard]] constexpr unsigned match_call(std::span<const SegmentKey> keys, std::span<const Layout> layouts,
+                                            std::span<const Seal> seals, unsigned input_width, unsigned rule,
                                             std::span<const Projection> call, unsigned (&index)[kMaxSegments]) noexcept {
+    const std::size_t natural = std::size_t(input_width) * 2U;
     const auto key_of = [&](const void* weights) -> const SegmentKey* {
         if (!weights) return nullptr;
         for (const auto& key : keys)
@@ -84,15 +109,19 @@ template <class Projection>
     };
     for (std::size_t first = 0; first < call.size(); ++first) {
         const SegmentKey* lead = key_of(call[first].weights);
-        if (!lead || lead->image >= layouts.size() || lead->segment != 0U) continue;
+        if (!lead || lead->image >= layouts.size() || lead->image >= seals.size() || lead->segment != 0U) continue;
         const Layout& layout = layouts[lead->image];
+        const Seal& seal = seals[lead->image];
         unsigned next = 0U;  // next segment to find
-        bool ok = layout.admitted();
+        bool ok = layout.admitted() && layout.in == input_width && seal.in == input_width && seal.rule == rule;
         for (std::size_t p = first; ok && p < call.size(); ++p) {
             const SegmentKey* key = key_of(call[p].weights);
             if (!key || key->image != lead->image) continue;
+            RoundPolicy round = RoundPolicy::none;
+            const std::size_t pitch = call[p].row_bytes != 0U ? std::size_t(call[p].row_bytes) : natural;
             ok = key->segment == next && next < layout.count && call[p].outputs == layout.outputs(next) &&
-                 call[p].round_bf16 == call[first].round_bf16;
+                 pitch == seal.row_bytes[next] && round_policy(call[p].round_bf16, call[p].round_separate, round) &&
+                 round == seal.round;
             if (ok) index[next++] = static_cast<unsigned>(p);
         }
         if (ok && next == layout.count) return lead->image;

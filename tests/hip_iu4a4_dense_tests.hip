@@ -1,7 +1,9 @@
 // Device fixture of the shared A4W4 class (core/iu4a4_dense.hpp) against the contract dense-iu4a4-rot-v1
 // (core/iu4a4_rot.hpp), bit for bit: the weight requantisation (codes + steps), the activation quantiser (codes, group
 // scales, row base; pad rows; a zero row; NaN / Inf rows) and every GEMM output (NaN rows: NaN on both sides).
-// Shapes cover partial CTAs in m and n, an odd count of 128 blocks and a single tile.
+// Shapes cover partial CTAs in m and n, an odd count of 128 blocks and a single tile; outputs at a row pitch, through
+// the default store (incumbent epilogue and grid) and through the opt-in StagedRawStore (staged epilogue, column
+// blocks first).
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
 #include "core/iu4a4_dense.hpp"
@@ -28,7 +30,7 @@ struct Mul {  // map2 functor of the fixture (an engine passes its gated unit)
     __device__ __forceinline__ static float apply(float a, float b) { return a * b; }
 };
 
-int run_case(unsigned rows, unsigned in, unsigned n, unsigned seed, bool map2 = false, unsigned pitch = 0U) {
+int run_case(unsigned rows, unsigned in, unsigned n, unsigned seed, bool map2 = false, unsigned pitch = 0U, bool staged = false) {
     const unsigned ys = pitch ? pitch : n;  // output row pitch (floats); columns n .. ys - 1 must stay untouched
     std::mt19937 g(seed);
     const unsigned mp = ad::padded_rows(rows), blocks = in / rot::kBlock;
@@ -74,7 +76,8 @@ int run_case(unsigned rows, unsigned in, unsigned n, unsigned seed, bool map2 = 
     ad::enqueue_requantise(dpack, dsc, in, n, dw, dstep, nullptr);
     if (map2) ad::enqueue_quantise_map2<Mul>(dx, dx2, in, act, nullptr);
     else ad::enqueue_quantise(dx, in, act, nullptr);
-    ad::enqueue_gemm(wt, act, ad::OutCols{dy, ys, n / 16U}, nullptr);
+    if (staged) ad::enqueue_gemm(wt, act, ad::OutCols{dy, ys, n / 16U}, nullptr, ad::StagedRawStore{});
+    else ad::enqueue_gemm(wt, act, ad::OutCols{dy, ys, n / 16U}, nullptr);
     CHECK(hipGetLastError());
     CHECK(hipDeviceSynchronize());
     std::vector<std::uint8_t> gw(ad::weight_code_bytes(in, n)), gcodes(ad::act_code_bytes(rows, in));
@@ -130,7 +133,7 @@ int run_case(unsigned rows, unsigned in, unsigned n, unsigned seed, bool map2 = 
     for (unsigned r = 0; r < rows; ++r)
         for (unsigned c = n; c < ys; ++c) bad_y += bits(gy[std::size_t(r) * ys + c]) != 0xffffffffU;  // pitch padding
     const bool ok = !(bad_w | bad_s | bad_a | bad_u | bad_b | bad_y);
-    std::printf("%s%s pitch %u rows %u in %u n %u: wcodes %u steps %u acodes %u u %u base %u y %u differ (NaN outputs %u)\n", ok ? "PASS" : "FAIL", map2 ? " map2" : "", ys, rows, in, n,
+    std::printf("%s%s%s pitch %u rows %u in %u n %u: wcodes %u steps %u acodes %u u %u base %u y %u differ (NaN outputs %u)\n", ok ? "PASS" : "FAIL", map2 ? " map2" : "", staged ? " staged" : "", ys, rows, in, n,
                 bad_w, bad_s, bad_a, bad_u, bad_b, bad_y, nan_y);
     return ok ? 0 : 1;
 }
@@ -197,8 +200,11 @@ int main() {
     fails += run_case(300, 2048, 400, 4U);  // 3 m CTAs, 25 W tiles
     fails += run_case(40, 17408, 32, 5U, true);  // map2 (gated-unit form), the longest CTA-quantiser row of the bound shapes
     fails += run_case(20, 24704, 32, 6U);        // past kCtaInputs: the wave-per-row quantiser
-    fails += run_case(70, 640, 96, 7U, false, 1024U);  // staged epilogue: 16 B aligned rows at a 4 KiB pitch
-    fails += run_case(37, 256, 48, 8U, false, 51U);    // staged epilogue: odd pitch (unaligned chunks, scalar stores)
+    fails += run_case(70, 640, 96, 7U, false, 1024U);  // incumbent epilogue at a 4 KiB pitch
+    fails += run_case(37, 256, 48, 8U, false, 51U);    // incumbent epilogue at an odd pitch
+    fails += run_case(70, 640, 96, 7U, false, 1024U, true);  // staged epilogue: 16 B aligned rows at a 4 KiB pitch
+    fails += run_case(37, 256, 48, 8U, false, 51U, true);    // staged epilogue: odd pitch (unaligned chunks, scalar stores)
+    fails += run_case(300, 2048, 400, 4U, false, 0U, true);  // staged epilogue: 3 m CTAs, 25 W tiles (partial n CTA)
     std::printf("%s\n", fails ? "iu4a4_dense tests FAILED" : "iu4a4_dense tests PASS");
     return fails ? 1 : 0;
 }

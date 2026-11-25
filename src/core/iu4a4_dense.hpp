@@ -72,6 +72,12 @@ struct OutCols {
     unsigned stride, tiles;
     __device__ __forceinline__ f16_dense_tall::ColumnTile tile(unsigned i) const { return {nullptr, y + 16U * i, stride, i < tiles}; }
 };
+// Store policy of enqueue_gemm: RawStore's values (acc * base, FP32) through the staged epilogue (whole 16 B chunks of
+// a row) and the column-blocks-first grid. Opt-in only (kStagedEpilogue); the default RawStore keeps the incumbent
+// epilogue and grid.
+struct StagedRawStore : f16_dense_tall::RawStore {
+    static constexpr bool kStagedEpilogue = true;
+};
 
 // Grouped trait (expert tiles; same contract per output): one CTA = 1..kCtaTilesM * 16 rows of one group tile that
 // share one weight image; grid x = tiles, grid y = blocks of kCtaTilesN W tiles, grid z = row slices of taller tiles. Src::active(t) refuses tiles past a
@@ -401,10 +407,16 @@ inline constexpr unsigned kStageStride = 36U;
 inline constexpr unsigned kStagedLds = 2U * kBlockBytes > kWavesN * kWavesM * kTm * 16U * kStageStride * 4U
                                            ? 2U * kBlockBytes
                                            : kWavesN * kWavesM * kTm * 16U * kStageStride * 4U;
-// Staged stores of the dense trait: RawStore, or a store with put_chunk(ct, r, c, v) = the 4 values of row r, columns
-// c .. c + 3 of column tile ct (c % 4 == 0), each exactly as put() would store it.
+// Staged epilogue + column-blocks-first grid of the dense trait: opt-in only. A store selects it with
+// `static constexpr bool kStagedEpilogue = true` and either put_chunk(ct, r, c, v) = the 4 values of row r, columns
+// c .. c + 3 of column tile ct (c % 4 == 0), each exactly as put() would store it, or no put_chunk and RawStore's put()
+// (StagedRawStore). Every other store (RawStore, every existing binder) keeps the incumbent epilogue, LDS size and grid
+// order: the same kernel as before the staged epilogue existed.
 template <class S> concept ChunkStore = requires(const S& s, const f16_dense_tall::ColumnTile& ct, F4 v) { s.put_chunk(ct, 0U, 0U, v); };
-template <class S> inline constexpr bool kStagedStore = ChunkStore<S> || std::is_same_v<S, f16_dense_tall::RawStore>;
+template <class S> concept StagedOptIn = requires { requires S::kStagedEpilogue; };
+template <class S> inline constexpr bool kStagedStore = StagedOptIn<S>;
+template <class S>
+inline constexpr bool kStagedStoreValid = !StagedOptIn<S> || ChunkStore<S> || std::is_base_of_v<f16_dense_tall::RawStore, S>;
 __device__ __forceinline__ void store_chunk(const f16_dense_tall::ColumnTile& ct, unsigned r, unsigned c, F4 v) {
     float* const y = ct.y + std::size_t(r) * ct.stride + c;
     if ((reinterpret_cast<std::uintptr_t>(y) & 15U) == 0U) {
@@ -421,15 +433,17 @@ __device__ __forceinline__ void put_chunk(const S& s, const f16_dense_tall::Colu
 }
 template <class Cols, class Store>
 __global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, Store store) {
+    static_assert(kStagedStoreValid<Store>, "a staged store has put_chunk or RawStore's put");
     __shared__ __attribute__((aligned(16))) std::uint8_t lds[kStagedStore<Store> ? kStagedLds : 2U * kBlockBytes];
     const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U, l16 = lane & 15U, hi = lane >> 4U;
     const unsigned ntiles = f16_dense_tall::detail::uni(w.n) / 16U, mp = padded_rows(f16_dense_tall::detail::uni(a.rows)), mtiles = mp / 16U;
     const unsigned in = f16_dense_tall::detail::uni(w.in), blocks = in / rot::kBlock;
     const unsigned wn = wave % kWavesN, wm = wave / kWavesN;
-    // Column blocks run fastest (grid x): CTAs in flight share the same x rows and write neighbouring 512 B windows of
-    // those rows. Rows fastest made every CTA in flight write the same window of different rows, which with a row pitch
-    // of a multiple of 4 KiB lands on the same memory channels (2x slower stores).
-    const unsigned cta_n = blockIdx.x, cta_m = blockIdx.y;
+    // Staged stores: column blocks run fastest (grid x): CTAs in flight share the same x rows and write neighbouring
+    // 512 B windows of those rows. Rows fastest made every CTA in flight write the same window of different rows, which
+    // with a row pitch of a multiple of 4 KiB lands on the same memory channels (2x slower stores). Other stores keep
+    // the incumbent order (row blocks fastest, grid x).
+    const unsigned cta_n = kStagedStore<Store> ? blockIdx.x : blockIdx.y, cta_m = kStagedStore<Store> ? blockIdx.y : blockIdx.x;
     const unsigned nt0 = cta_n * kCtaTilesN + wn * kTw, mt0 = cta_m * kCtaTilesM + wm * kTm;
     const bool live = mt0 < mtiles;  // a wave without a live x tile still copies and meets the barriers
     unsigned nt[kTw], mt[kTm];
@@ -806,7 +820,8 @@ inline void enqueue_requantise(const std::uint8_t* pack, const std::uint16_t* sc
 template <class Cols, class Store = f16_dense_tall::RawStore>
 inline void enqueue_gemm(const Weights& w, const Act& a, Cols cols, hipStream_t s, Store store = {}) {
     const unsigned mtiles = padded_rows(a.rows) / 16U, ntiles = w.n / 16U;
-    const dim3 grid((ntiles + kCtaTilesN - 1U) / kCtaTilesN, (mtiles + kCtaTilesM - 1U) / kCtaTilesM);
+    const unsigned gm = (mtiles + kCtaTilesM - 1U) / kCtaTilesM, gn = (ntiles + kCtaTilesN - 1U) / kCtaTilesN;
+    const dim3 grid = detail::kStagedStore<Store> ? dim3(gn, gm) : dim3(gm, gn);  // the kernel's CTA order (gemm_kernel)
     STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::gemm_kernel<Cols, Store>), grid, dim3(32U * kWavesN * kWavesM), 0, s, w, a, cols, store);
 }
 }  // namespace strix::core::iu4a4_dense
