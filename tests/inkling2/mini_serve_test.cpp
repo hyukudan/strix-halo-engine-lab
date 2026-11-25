@@ -480,12 +480,14 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                 "a decode form flag reached the server outside the shared lever row");
         strings.pop_back();
     }
-    // The block-candidate switch through the production start-up parser (profile fast here): an explicit OFF starts,
+    // The block-candidate switch through the production start-up parser (the tier under test; EXACT refuses sampled
+    // verification with its own reason, as in mini_block_drafter_test): an explicit OFF starts,
     // every other value is refused before native load with the same reason as the CLI.
     for (const auto& [value, reason] : std::initializer_list<std::pair<const char*, const char*>>{
              {"off", ""},
              {"dflash2:8:greedy", "native forward and verify identity are not bound"},
-             {"dflash2:8:sampled", "sampled rejection hook unqualified and unbound"},
+             {"dflash2:8:sampled", tier_name == "exact" ? "EXACT permits only greedy-identical verification"
+                                                        : "sampled rejection hook unqualified and unbound"},
              {"dflash2:7:greedy", "requires block 8"}}) {
         std::ostringstream out, error;
         strings.emplace_back("--block-drafter");
