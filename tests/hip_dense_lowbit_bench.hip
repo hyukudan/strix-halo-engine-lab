@@ -270,7 +270,7 @@ int rows_select_ticket(const std::vector<unsigned>& shapes) {
                 return fetch(y, std::size_t(rows) * n);
             };
             for (const unsigned rows : check_rows) {
-                const bool cell = core::lowbit_sweep_cell(arch, n, k, rows);
+                const bool cell = core::lowbit_sweep_cell(arch, format == wd::Format::q4_g64 ? 4U : 6U, n, k, rows);
                 const auto want = entry(dy, rows, cell ? sweep : f16_group_scale);
                 poison(dy2, y_floats);
                 const auto got = entry(dy2, rows, select);

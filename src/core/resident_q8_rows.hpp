@@ -44,14 +44,17 @@ inline std::string_view current_device_arch() {
     std::call_once(once[slot], [&] {
         hipDeviceProp_t prop{};
         if (hipGetDeviceProperties(&prop, dev) != hipSuccess) return;
-        for (std::size_t i = 0; i + 1U < names[slot].size() && prop.gcnArchName[i] != '\0' && prop.gcnArchName[i] != ':'; ++i)
-            names[slot][i] = prop.gcnArchName[i];
+        const char* arch = prop.gcnArchName;
+        for (std::size_t i = 0; i + 1U < names[slot].size() && arch[i] != '\0' && arch[i] != ':'; ++i) names[slot][i] = arch[i];
     });
     return names[slot].data();
 }
 // Lever "lowbit.rows-select": this launch runs the FP32 sweep (core/resident_row_plan.hpp kLowBitSweepCells).
-inline bool lowbit_rows_sweep(LowBitArithmetic arithmetic, unsigned outputs, unsigned width, unsigned rows) {
-    return arithmetic == LowBitArithmetic::f16_rows_select && lowbit_sweep_cell(current_device_arch(), outputs, width, rows);
+inline bool lowbit_rows_sweep(LowBitArithmetic arithmetic, weight::FormatId storage, unsigned outputs, unsigned width,
+                              unsigned rows) {
+    if (arithmetic != LowBitArithmetic::f16_rows_select) return false;
+    const unsigned bits = storage == weight::kQ4G64WeightStorage ? 4U : storage == weight::kQ6G64WeightStorage ? 6U : 0U;
+    return lowbit_sweep_cell(current_device_arch(), bits, outputs, width, rows);
 }
 // Low-bit projections sharing one input: one launch of the planned route (both routes compute the same bits).
 template <class Storage, unsigned Capacity>
@@ -86,7 +89,8 @@ inline row_transforms::Status enqueue_resident_lowbit_rows(
     if (!valid_resident_lowbit_rows(matrix, live_outputs, input, rows, output, arithmetic)) return row_transforms::invalid;
 #if defined(__HIPCC__)
     const auto width = static_cast<unsigned>(matrix.columns);
-    if (arithmetic == LowBitArithmetic::fp32_sweep || detail::lowbit_rows_sweep(arithmetic, live_outputs, width, rows)) {
+    if (arithmetic == LowBitArithmetic::fp32_sweep ||
+        detail::lowbit_rows_sweep(arithmetic, matrix.storage, live_outputs, width, rows)) {
         const dense_linear::View weights{matrix.bytes.data(), width, live_outputs, static_cast<std::size_t>(matrix.row_bytes)};
         return matrix.storage == weight::kQ4G64WeightStorage
                    ? detail::launch_lowbit_rows<weight_decode::Format::q4_g64>(weights, input, output, rows, stream)
@@ -208,7 +212,7 @@ inline row_transforms::Status enqueue_resident_q8_projections(
                 const auto& matrix = std::get<weight::ResidentMatrixView>(projection.weights);
                 // Lever "lowbit.rows-select": a projection in a measured sweep cell runs alone on the FP32 sweep.
                 if ((q4 || storage == weight::kQ6G64WeightStorage) &&
-                    detail::lowbit_rows_sweep(arithmetic, projection.outputs, width, rows)) {
+                    detail::lowbit_rows_sweep(arithmetic, storage, projection.outputs, width, rows)) {
                     const auto status = enqueue_resident_lowbit_rows(matrix, projection.outputs, input, rows,
                                                                      projection.output, stream, LowBitArithmetic::fp32_sweep);
                     if (status != success) return status;
