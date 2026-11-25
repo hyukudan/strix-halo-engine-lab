@@ -229,8 +229,8 @@ void report(bool pass, const std::string& line) {
 
 // ---- Lever "lowbit.rows-select" (LowBitArithmetic::f16_rows_select, a FAST / TURBO candidate) ----
 // strix-hip-dense-lowbit-bench rows-select N K ...: per shape and storage, the lever's launches equal bit for bit the
-// incumbent they select (the FP32 sweep inside a measured cell of this device, the f16 group-scale form elsewhere),
-// alone and in a two-projection list; how many outputs the sweep and the FP16 form share; then interleaved timings.
+// standalone route expected from the timing receipt. Lists always keep the f16 group-scale form.
+// Then compare the standalone arithmetics and print interleaved timings.
 int rows_select_ticket(const std::vector<unsigned>& shapes) {
     constexpr auto select = core::LowBitArithmetic::f16_rows_select;
     constexpr auto sweep = core::LowBitArithmetic::fp32_sweep;
@@ -270,22 +270,27 @@ int rows_select_ticket(const std::vector<unsigned>& shapes) {
                 return fetch(y, std::size_t(rows) * n);
             };
             for (const unsigned rows : check_rows) {
-                const bool cell = core::lowbit_sweep_cell(arch, format == wd::Format::q4_g64 ? 4U : 6U, n, k, rows);
-                const auto want = entry(dy, rows, cell ? sweep : f16_group_scale);
+                const bool large_shape = n == 1024U || n == 17408U;
+                const bool small_shape = n == 2304U && format == wd::Format::q4_g64;
+                const bool cell = arch == "gfx1151" && k == 5120U &&
+                    ((large_shape && (rows == 1U || rows == 2U || rows == 4U)) ||
+                     (small_shape && (rows == 1U || rows == 2U)));
+                const auto group_want = entry(dy, rows, f16_group_scale);
+                const auto want = cell ? entry(dy, rows, sweep) : group_want;
                 poison(dy2, y_floats);
                 const auto got = entry(dy2, rows, select);
                 const auto diff = bit_diff(got, want, rows, n);
-                // The same matrix twice in one list: each projection gets the bits of its selected route.
+                // One grouped launch keeps the group-scale bits even in a standalone sweep cell.
                 const core::ResidentRowProjection list[2]{{v, n, dy2}, {v, n, dz}};
                 poison(dy2, y_floats);
                 poison(dz, y_floats);
                 const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr, select);
                 ok(status, "list");
-                const auto diff_list = bit_diff(fetch(dy2, std::size_t(rows) * n), want, rows, n) +
-                                       bit_diff(fetch(dz, std::size_t(rows) * n), want, rows, n);
+                const auto diff_list = bit_diff(fetch(dy2, std::size_t(rows) * n), group_want, rows, n) +
+                                       bit_diff(fetch(dz, std::size_t(rows) * n), group_want, rows, n);
                 report(diff == 0U && diff_list == 0U, tag + " rows=" + std::to_string(rows) + " selects=" +
                                                          (cell ? "fp32-sweep" : "f16-group") + " bits_vs_selected=" +
-                                                         std::to_string(diff) + " list_bits_vs_selected=" + std::to_string(diff_list));
+                                                         std::to_string(diff) + " list_bits_vs_group=" + std::to_string(diff_list));
             }
             for (const unsigned rows : {1U, 2U}) {
                 const auto a = entry(dy, rows, sweep);

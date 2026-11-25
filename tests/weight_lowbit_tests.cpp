@@ -230,6 +230,25 @@ void check_lowbit_plan() {
 
 // Byte ranges of resident launches (core/resident_row_plan.hpp): a projection never writes its input, and a grouped
 // list never writes one byte twice, whatever the storages; a refused list calls no backend (nothing is written).
+void check_rows_select_cells() {
+    namespace co = strix::core;
+    // gfx1151 standalone timing receipt: the four large cells also won at M=4.
+    for (const unsigned bits : {4U, 6U}) {
+        for (const unsigned n : {1024U, 2304U, 17408U}) {
+            for (unsigned m = 0; m <= 17U; ++m) {
+                const bool won = n != 2304U ? m == 1U || m == 2U || m == 4U
+                                            : bits == 4U && (m == 1U || m == 2U);
+                check(co::lowbit_sweep_cell("gfx1151", bits, n, 5120U, m) == won,
+                      "only exact measured standalone rows select the sweep");
+            }
+        }
+    }
+    check(co::grouped_lowbit_arithmetic(co::LowBitArithmetic::f16_rows_select) ==
+              co::LowBitArithmetic::f16_group_scale, "grouped projections always keep the incumbent");
+    check(!co::lowbit_sweep_cell("", 4U, 1024U, 5120U, 2U) &&
+          !co::lowbit_sweep_cell("gfx1151", 4U, 1024U, 5121U, 2U), "unknown device and unmeasured K keep incumbent");
+}
+
 void check_resident_ranges() {
     namespace co = strix::core;
     namespace w = strix::weight;
@@ -586,6 +605,7 @@ int main() {
     check_format<wei::Q6G64Storage, wd::Format::q6_g64>("q6_g64");
     check_q8_unchanged();
     check_lowbit_plan();
+    check_rows_select_cells();
     check_resident_ranges();
     check_bf16_preflight();
     check_group_accumulator();

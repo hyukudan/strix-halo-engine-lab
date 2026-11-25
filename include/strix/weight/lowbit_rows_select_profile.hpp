@@ -13,7 +13,7 @@ inline constexpr profile::Lever kLowBitRowsSelectLever{
     .source = "awaits gate v2 and regime timing receipts for HIP low-bit rows",
     .omit_builtin_fingerprint = true,
     .identity = {{{"f16_group_scale", "hip.lowbit.f16-group-scale-chain@1"},
-                   {"f16_rows_select", "lowbit.rows-select.fp32-sweep-cells@1"}}},
+                   {"f16_rows_select", "lowbit.rows-select.fp32-sweep-cells@2"}}},
 };
 
 }  // namespace strix::weight

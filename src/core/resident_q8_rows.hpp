@@ -164,6 +164,7 @@ inline bool resident_q8_projections_admitted(const float* input, unsigned width,
                                              std::span<const ResidentRowProjection> projections,
                                              [[maybe_unused]] LowBitArithmetic arithmetic = LowBitArithmetic::fp32_sweep) {
     if (projections.empty() || projections.size() > Capacity) return false;
+    arithmetic = grouped_lowbit_arithmetic(arithmetic);
     for (const auto& projection : projections) {
         const auto* matrix = std::get_if<weight::ResidentMatrixView>(&projection.weights);
         if (!matrix || matrix->columns != width || matrix->rows != projection.outputs) return false;
@@ -211,17 +212,8 @@ inline row_transforms::Status enqueue_resident_q8_projections(
             f16_tile_gemm::Q8ProjectionGroup<Capacity> group{};
             for (const auto& projection : run) {
                 const auto& matrix = std::get<weight::ResidentMatrixView>(projection.weights);
-                // Lever "lowbit.rows-select": a projection in a measured sweep cell runs alone on the FP32 sweep.
-                if ((q4 || storage == weight::kQ6G64WeightStorage) &&
-                    detail::lowbit_rows_sweep(arithmetic, storage, projection.outputs, width, rows)) {
-                    const auto status = enqueue_resident_lowbit_rows(matrix, projection.outputs, input, rows,
-                                                                     projection.output, stream, LowBitArithmetic::fp32_sweep);
-                    if (status != success) return status;
-                    continue;
-                }
                 group.append({matrix.bytes.data(), projection.outputs, projection.output});
             }
-            if (group.count == 0U) continue;
             row_transforms::Status status;
             if (q4) status = detail::launch_lowbit_group<weight::Q4G64Storage>(input, rows, width, group, stream);
             else if (storage == weight::kQ6G64WeightStorage)
