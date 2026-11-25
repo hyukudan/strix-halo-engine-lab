@@ -294,6 +294,9 @@ inline int served_prefill(const char* checkpoint, weight::FormatId storage, bool
     MiniResidentDecoder decoder(checkpoint, kServedContext, schedule.chunk, packed_decode,
                                 MiniResidentBackend::default_step_graphs, storage, 0U, false, 2U, tail);
     decoder.allocate_slots(2U);
+    // The served route under test: the command line's (the served route lever; a CUDA decoder declines it).
+    const bool cli_route = decoder.set_served_cli_route(true);
+    if (cli_route != kHip) throw std::logic_error("served route admission");
     const auto capacity = decoder.prefill_tail_rows();
     const auto rule = decoder.prefill_piece_rule();
     std::cout << "ROUTE served_prefill chunk " << schedule.chunk << " tail " << capacity << " pieces "
