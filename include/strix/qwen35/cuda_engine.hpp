@@ -243,6 +243,20 @@ public:
     RowsOut prefill(const std::uint32_t* tokens, std::uint32_t n, LogitRows want = LogitRows::last, float* rows_out = nullptr,
                     bool rows_pre = false);
     [[nodiscard]] bool prefill_is_big() const;  // whether prefill() takes the large-M path for this engine
+    // Admission of the large-M route for an n-token prompt, BEFORE any prompt state changes: the shape / policy checks of
+    // prefill_is_big(), then the per-slot workspace (activations, EXACT attention scratch, GEMM reserve) of
+    // min(prefill_slots, chunks) slots is allocated and must leave `headroom_bytes` of device memory free (one slot when two
+    // do not fit). Declined: nothing stays allocated by it and prefill() runs its windows fallback until an admission
+    // succeeds. Without a call prefill() behaves as before (no budget check).
+    struct PrefillAdmission {
+        bool admitted = false;
+        std::string reason;                          // decline reason (empty when admitted)
+        std::uint32_t slots = 0, slots_wanted = 0;   // admitted slots / what the chunk plan wanted
+        std::uint32_t fallback_rows = 0;             // rows per window of prefill()'s own fallback
+        std::uint64_t workspace_bytes = 0;           // device memory this admission newly took
+        std::uint64_t free_bytes = 0;                // device memory free after it
+    };
+    PrefillAdmission admit_prefill(std::uint32_t n, std::uint64_t headroom_bytes);
     // Accepts the first k rows of the last forward_rows window (0 <= k <= rows). Async on stream().
     void commit(std::uint32_t k);
     // Token tree (strix/spec/tree_window.hpp): the rows of `tree` (tokens[tree.rows]) in one window; each row gets the bits a
