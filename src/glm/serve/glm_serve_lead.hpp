@@ -219,8 +219,8 @@ struct LeadStats {
 // The follower (rank 1): hello, then pure replay until shutdown.
 template<class Eng>
 void follow(Eng& eng, Channel& ch, const Hello& hello, std::uint32_t slots, std::uint64_t capacity,
-            bool sampling = false) {
-    ch.hello(hello, sampling);
+            bool sampling = false, bool* turbo_prefill = nullptr) {
+    ch.hello(hello, sampling, turbo_prefill);
     std::optional<PrefixCache> cache;
     if (hello.prefix_cache_bytes) cache.emplace(hello.prefix_cache_bytes);
     for (;;) {
@@ -349,6 +349,8 @@ private:
         std::uint32_t slot = 0;
         std::size_t done = 0;
         unsigned chunk = 0;  // fixed at admission
+        bool turbo = false;  // only a whole, fresh prefill with its own numerical identity
+        bool prefill_route_resolved = false;
         std::uint64_t root = 0;  // root row still to store (LeadConfig::prefix_root); 0: none
         Active a;
         // RTX route: the import this prompt waits for (0: none, or fallen back to the chunked prefill)
@@ -662,6 +664,16 @@ private:
             c.pflags = (p.a.mtp_ok ? kPrefillMtp : 0U) | (last ? kPrefillLast : 0U);
             chunk.assign(prompt.begin() + static_cast<std::ptrdiff_t>(p.done), prompt.begin() + static_cast<std::ptrdiff_t>(p.done + m));
         }
+        // Cached roots/suffixes, interleaving and sampled or image prompts keep the existing route.
+        if constexpr (requires { eng_.select_turbo_prefill(n, request(p.a).max_tokens, false); }) {
+            if (!p.prefill_route_resolved) {
+                p.prefill_route_resolved = true;
+                const bool fresh = !p.units && p.done == 0 && last && lanes == 0 && p.a.mtp_ok &&
+                    !p.a.sampler && !request(p.a).embeds && p.import_id == 0;
+                p.turbo = eng_.select_turbo_prefill(n, request(p.a).max_tokens, fresh);
+                if (p.turbo) c.pflags |= kPrefillTurbo;
+            }
+        }
         // Image rows: the engine of this rank resolves the chunk's virtual ids against the request's table; the
         // follower gets the rows of the chunk's spans in the embed frame after the tokens (once per image).
         if (request(p.a).embeds) {
@@ -732,7 +744,8 @@ private:
             runtime().publish_progress(p.a.state, {strix::serve::GenerationPhase::prefill, p.done, 0, n});
             return;
         }
-        if (cfg_.prefix_cache_bytes && !request(p.a).embeds) store_prefix(p);
+        // Native FAST snapshots must never restore WMMA state on an unmatched request.
+        if (cfg_.prefix_cache_bytes && !request(p.a).embeds && !p.turbo) store_prefix(p);
         const auto ready = cfg_.prefix_cache_bytes ? Clock::now() : t1;
         const std::uint32_t slot = p.slot;
         Active a = std::move(p.a);

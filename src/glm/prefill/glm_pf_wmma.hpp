@@ -11,12 +11,26 @@
 #include <stdexcept>
 
 namespace strix::glm::pf::wmma_x {
+// Profile-owned arithmetic is scoped to a whole prompt on its engine's submission thread.
+// Explicit switches keep their existing process-wide behavior.
+inline thread_local bool profile_enabled = false;
+class ProfileScope {
+public:
+    explicit ProfileScope(bool on) noexcept : previous_(profile_enabled) { profile_enabled = on; }
+    ~ProfileScope() { profile_enabled = previous_; }
+    ProfileScope(const ProfileScope&) = delete;
+    ProfileScope& operator=(const ProfileScope&) = delete;
+private:
+    bool previous_;
+};
+
 // STRIX_GLM_PF_WMMA=1 selects this identity for the exact prefill X3 calls (dense and MoE); unset or 0 = exact.
 // Part of the TP2 startup agreement (rank_defaults::kPfWmmaConfig): both ranks must resolve the same value.
-inline bool enabled() {
+inline bool configured() {
     const char* p = std::getenv("STRIX_GLM_PF_WMMA");
     return p && std::strcmp(p, "1") == 0;
 }
+inline bool enabled() { return profile_enabled || configured(); }
 inline std::atomic<std::uint64_t> dense_calls{0}, moe_calls{0}, iu4_moe_calls{0};
 }  // namespace strix::glm::pf::wmma_x
 
@@ -25,6 +39,7 @@ namespace strix::glm::pf::kda_wmma {
 // (STRIX_GLM_PF_WMMA=1); STRIX_GLM_PF_KDA_WMMA=0 opts out, =1 forces it. The exact route (FAST not selected,
 // switch unset) never takes it. Part of the TP2 startup agreement (rank_defaults::kPfKdaWmmaConfig).
 inline bool enabled() {
+    if (wmma_x::profile_enabled) return true;
     const char* p = std::getenv("STRIX_GLM_PF_KDA_WMMA");
     if (p == nullptr || *p == '\0') return wmma_x::enabled();
     if (std::strcmp(p, "0") == 0) return false;
@@ -49,6 +64,7 @@ namespace strix::glm::pf::mla_wmma {
 // never takes it. Part of the TP2 startup agreement (rank_defaults::kPfMlaWmmaConfig).
 inline bool enabled() {
     static env_arms::Resolved<bool> value;  // once per process (or per in-process arm, env_arms.hpp)
+    if (wmma_x::profile_enabled) return true;
     return value.get([] { return envcfg::flag("STRIX_GLM_PF_MLA_WMMA", wmma_x::enabled()); });
 }
 // With it: the fused flash core stores o-bar as the FP16 image the out GEMM's staging would make (half the o-bar bytes

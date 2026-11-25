@@ -119,7 +119,7 @@ void glm() {
         check(cli.mtp_spec.value == expected && server.mtp_spec.value == expected &&
               cli.mtp.value == expected && server.mtp.value == expected && server.prefill == "gemv",
               "GLM complete/missing assets and opt-out select intended MTP/prefill route");
-        const std::string_view expected_wmma = std::string_view(profile) == "turbo" ? "1" : "0";
+        const std::string_view expected_wmma = "0";  // no device or prompt known
         for (const auto* lever : {"pf_wmma", "mla_wmma", "kda_wmma", "attn_wmma"}) {
             const auto* cli_cell = cli.product->find(lever);
             const auto* serve_cell = server.product->find(lever);
@@ -128,6 +128,35 @@ void glm() {
         }
         gate("glm", values(sp::from_lines(rd::print(cli))), values(sp::from_lines(rd::print(server))), allowed);
     }
+    // The measured 8K/32K pair executions and each unmatched axis use the same product resolver.
+    const std::vector<std::string> turbo{"--world", "2", "--profile", "turbo"};
+    const auto measured_cli_args = rd::serve_request_args(turbo, true);
+    rd::ModelFacts complete;
+    complete.mtp_present = complete.mtp_complete = true;
+    const auto verify = [&](const rd::PrefillWork& work, const rd::EnvGet& env, bool on) {
+        const auto cli = rd::resolve(rd::scan(measured_cli_args), env, complete, work);
+        const auto serve = rd::resolve_serve(turbo, true, env, complete, work);
+        for (const auto* lever : {"pf_wmma", "mla_wmma", "kda_wmma", "attn_wmma"}) {
+            const auto* a = cli.product->find(lever);
+            const auto* b = serve.product->find(lever);
+            check(a && b && a->value == (on ? "1" : "0") && b->value == a->value,
+                  "GLM measured/fallback arithmetic agrees for " + std::string(lever));
+        }
+        gate("glm", values(sp::from_lines(rd::print(cli))), values(sp::from_lines(rd::print(serve))), allowed);
+    };
+    verify({true, 8108, 36864, 8192, 1, 64}, none, true);
+    verify({true, 31258, 36864, 8192, 1, 64}, none, true);
+    verify({false, 8108, 36864, 8192, 1, 64}, none, false);
+    verify({true, 4096, 36864, 8192, 1, 64}, none, false);
+    verify({true, 8109, 36864, 8192, 1, 64}, none, false);
+    verify({true, 8108, 36864, 4096, 1, 64}, none, false);
+    verify({true, 8108, 36864, 8192, 2, 64}, none, false);
+    verify({true, 8108, 36864, 8192, 1, 64}, [](const char* key) -> const char* {
+        return std::string_view(key) == "STRIX_GLM_PF_KDA_WMMA" ? "0" : nullptr;
+    }, false);
+    verify({true, 8108, 36864, 8192, 1, 64}, [](const char* key) -> const char* {
+        return std::string_view(key) == "STRIX_GLM_PF_ATTN_WMMA_T" ? "32" : nullptr;
+    }, false);
     // Sampled MTP (row serve_sampled_mtp): both entry points resolve and admit it in rd::resolve, so the same request
     // gives the same route, the same receipt line and the same refusals (the command line reports it inapplicable).
     for (const char* profile : {"exact", "fast", "turbo", "quality"})

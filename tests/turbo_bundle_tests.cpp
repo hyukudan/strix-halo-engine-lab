@@ -205,7 +205,7 @@ void families() {
             "allow-pending cannot bypass the missing MiniMax 0-59 adapter");
 
     generic(strix::glm::rank_defaults::product_profile_engine, p::Name::turbo, none, r);
-    require(find(r, "pf_wmma")->value == "1", "glm turbo inherits pf_wmma");
+    require(find(r, "pf_wmma")->value == "0", "GLM with no known workload keeps the FAST prefill route");
     require(find(r, "kda_state16")->status == p::Status::pending && find(r, "router_wmma")->status == p::Status::pending &&
                 find(r, "idxproj_wmma")->status == p::Status::pending, "GLM router/indexer and KDA16 pending");
 }
