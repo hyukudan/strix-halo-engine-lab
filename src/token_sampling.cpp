@@ -18,6 +18,13 @@ constexpr double tail_cutoff = 40.0;
 
 void require(bool ok,const char* message) {if(!ok) throw std::invalid_argument(message);}
 
+void validate_forced_rejection(const TokenSamplerOptions& options) {
+    require(options.force_reject_row==TokenSamplerOptions::forced_rejection_off ||
+        (options.acceptance==SampledAcceptance::coupled &&
+         (options.force_reject_row==TokenSamplerOptions::forced_rejection_rotate || options.force_reject_row<8U)),
+        "forced rejection requires coupled acceptance and a row 0..7 or rotate");
+}
+
 struct Entry {
     double z = 0.0; // (logit - max logit) / temperature, <= 0
     std::uint32_t token = 0;
@@ -99,8 +106,13 @@ bool token_sampling_request_identity_counts() {
     static const bool counter=[] {
         const char* v=std::getenv("STRIX_SAMPLING_REQUEST_IDENTITY");
         if(!v || !*v || std::strcmp(v,"0")==0 || std::strcmp(v,"single")==0) return false;
-        require(std::strcmp(v,"counter")==0,"STRIX_SAMPLING_REQUEST_IDENTITY must be single or counter");
-        return true;
+        // The counter mode gave each request an identity from its admission order, so the same request with the
+        // same seed drew different tokens depending on what arrived before it. It is retired: a client that wants
+        // distinct streams sends distinct seeds, which reproduce on every entry point.
+        require(std::strcmp(v,"counter")!=0,"STRIX_SAMPLING_REQUEST_IDENTITY=counter is retired: the tokens of a "
+            "request must not depend on its arrival order; send a distinct seed per request instead");
+        require(false,"STRIX_SAMPLING_REQUEST_IDENTITY must be single (counter is retired)");
+        return false;
     }();
     return counter;
 }
@@ -110,11 +122,27 @@ std::uint64_t next_token_sampling_request_identity() {
     return token_sampling_request_identity_counts()?next.fetch_add(1,std::memory_order_relaxed):1U;
 }
 
-TokenSamplerOptions token_sampler_options_from_environment() {
+TokenSamplerOptions validate_sampling_startup_environment(SampledAcceptance unset_acceptance) {
+    (void)token_sampling_request_identity_counts();
+    return token_sampler_options_from_environment(unset_acceptance);
+}
+
+TokenSamplerOptions validate_sampling_startup_environment_only(SampledAcceptance supported, const char* route) {
+    auto options=validate_sampling_startup_environment(supported);
+    if(options.acceptance!=supported)
+        throw std::invalid_argument(std::string(route)+" implements "+(supported==SampledAcceptance::coupled?"coupled":"rejection")+
+            " acceptance only: STRIX_MTP_SAMPLED_ACCEPT="+(options.acceptance==SampledAcceptance::coupled?"coupled":"rejection")+
+            " is refused (unset it or name the supported rule)");
+    return options;
+}
+
+TokenSamplerOptions token_sampler_options_from_environment(SampledAcceptance unset_acceptance) {
     TokenSamplerOptions out;
+    out.acceptance=unset_acceptance;
     if(const char* v=std::getenv("STRIX_MTP_SAMPLED_ACCEPT"); v && *v) {
         if(std::strcmp(v,"coupled")==0) out.acceptance=SampledAcceptance::coupled;
-        else require(std::strcmp(v,"rejection")==0,"STRIX_MTP_SAMPLED_ACCEPT must be rejection or coupled");
+        else if(std::strcmp(v,"rejection")==0) out.acceptance=SampledAcceptance::rejection;
+        else require(false,"STRIX_MTP_SAMPLED_ACCEPT must be rejection or coupled");
     }
     if(const char* v=std::getenv("STRIX_MTP_SAMPLED_ARGMAX_BELOW"); v && *v) {
         char* end=nullptr;
@@ -130,6 +158,7 @@ TokenSamplerOptions token_sampler_options_from_environment() {
             out.force_reject_row=static_cast<std::uint32_t>(v[0]-'0');
         }
     }
+    validate_forced_rejection(out);
     return out;
 }
 
@@ -307,9 +336,7 @@ TokenSampler::TokenSampler(TokenSamplingPolicy policy,TokenSamplerOptions option
         "argmax draft temperature must be finite and non-negative");
     // Forcing a rejection keeps the token only under coupled acceptance (rejection sampling would change the
     // distribution), so the test switch is refused otherwise.
-    require(options_.force_reject_row==TokenSamplerOptions::forced_rejection_off || (coupled() &&
-        (options_.force_reject_row==TokenSamplerOptions::forced_rejection_rotate || options_.force_reject_row<8U)),
-        "forced rejection requires coupled acceptance and a row 0..7 or rotate");
+    validate_forced_rejection(options_);
     // Below the gate a coupled draft is q's first entry by (z desc, id asc): the same transform with top-k 1.
     if(coupled() && policy_.temperature<options_.argmax_draft_below) draft_policy_.top_k=1U;
 }

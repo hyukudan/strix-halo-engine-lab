@@ -35,8 +35,11 @@ inline constexpr char identity_v3[] = "g4-exl3-v3";
 // Process-wide core identity: 1 (v1), 2 (v2) or 3 (v3), fixed once per process
 // (one pack and one session), never per step.
 // STRIX_G4_EXL3_IDENTITY=v1|v2|v3 forces it; unset or "auto" lets the app call
-// configure_identity() with the pack's arm and the session's maximum concurrency,
-// which applies auto_version(); without that call the identity is v1.
+// configure_identity() with the pack's arm and the session's maximum concurrency
+// (--streams; the server passes its slot count unless --streams is given), which
+// applies auto_version(); without that call the identity is v1. An explicit value
+// is resolved the same by the command line and the server at every stream or slot
+// count: STRIX_G4_EXL3_IDENTITY=v1 keeps an M5 pack on v1 at eight slots.
 [[nodiscard]] inline unsigned forced_version() {
     static const unsigned forced = [] {
         const auto* p = std::getenv("STRIX_G4_EXL3_IDENTITY");

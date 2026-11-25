@@ -32,6 +32,9 @@ __device__ __forceinline__ void cp_async16_zfill(std::uint32_t dst, const void* 
 __device__ __forceinline__ void cp_async8_zfill(std::uint32_t dst, const void* src, bool valid) {
     asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(dst), "l"(src), "r"(valid ? 8 : 0));
 }
+__device__ __forceinline__ void cp_async4(std::uint32_t dst, const void* src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(dst), "l"(src));
+}
 template <int N>
 __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
 

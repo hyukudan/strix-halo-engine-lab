@@ -249,3 +249,23 @@ this observation does not assert deployment of a remote user binary. Detailed
 receipts and original comparative inputs remain outside Git. See the
 [profile adoption record](../engine/decode/optimization-profile.md#qualified-adoption-2026-10-15)
 for the model identity, fallback policy, measurement scope and remaining gates.
+
+## Inkling 2 Mini Q8_0 attention and head on gfx1151
+
+**observed** (2026-11-23). Policy `weights.attention_head.q8_0@1` (attention projections and output head stored as
+Q8_0, converted from BF16 at load), HIP (device compiler clang 24.0.0git, commit d6f6cb691863) on gfx1151,
+checkpoint SHA-256 `65e60f51…39d1`. Gate v2 used the device's BASE reference (`--profile exact`), a null arm
+and 39 held-out windows of three content classes (prose, code, structured) at 8K, 32K and 64K context.
+
+- Prefill regime: PASS, 2,457 pooled rows (KL 0.00044, top-1 0.9963, dNLL -0.00066 ± 0.00053), every class, band
+  and window inside its limits. Prompt timing on the same device: 4K 2,544 -> 2,541 ms, 8K 4,684 -> 4,673 ms,
+  32K 20,650 -> 20,732 ms (no gain: the prompt projections are bound by the WMMA rate, not by weight bytes). The
+  decision row is therefore gate-only (`kMiniWeightLoadRows`, regime `prefill`, band <= 65,536).
+- Decode qualification is pending. The frozen R4 assessment is diagnostic. Registering a decode row requires a
+  PASS from the production gate and a speed receipt covering the regime.
+- One resident image serves prefill and decode. Automatic Q8_0 selection requires a gate v2 PASS in both regimes
+  and a measured gain covering the instance's context and lane count. FAST and TURBO currently default to BF16
+  for the serial CLI and all server slot and context settings. On a native resident route, `--profile fast
+  --qualify-q8` selects the explicit Q8_0 qualification arm for both phases.
+
+Detailed receipts (per-window reductions, tickets, timing summaries) remain outside Git.

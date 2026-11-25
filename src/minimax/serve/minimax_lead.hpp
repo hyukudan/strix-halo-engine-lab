@@ -98,6 +98,7 @@ struct Shared {
     bool prefix_reuse = false; // negotiated once, both ranks and alignment
     bool conversation = false; // negotiated once, both ranks, needs prefix_reuse
     bool sampling = false; // negotiated once before the first command
+    TokenSamplerOptions sampler_options{};
     strix::session::Identity prefix_identity;
     std::function<bool(std::uint64_t)> prefill_int4_regime;
     std::uint32_t dspark_live = 0, dspark_contexts = 0;
@@ -684,7 +685,7 @@ private:
         }
         std::optional<strix::TokenSampler> sampler;
         if constexpr (has_sampling_backend) {
-            try { sampler = sv::make_pair_sampler(pending->job); }
+            try { sampler = sv::make_pair_sampler(pending->job, sh_.sampler_options); }
             catch (const std::invalid_argument& error) {
                 sv::GenerationStats stats;
                 stats.error_status = 400;

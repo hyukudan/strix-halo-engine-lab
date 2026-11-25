@@ -127,7 +127,7 @@ void check_factory(const std::string& root) {
     const std::vector<std::vector<std::string>> cases{
         {},
         {"--http-batch", "0", "--http-sampling", "reject", "--http-logprobs", "off"},
-        {"--http-batch", "2", "--http-sampling", "sample", "--http-default-temperature", "0.5",
+        {"--http-batch", "2", "--http-sampling", "sample",
          "--http-constraints", "off", "--http-default-max-tokens", "24"}};
     for (const auto& extra : cases) {
         auto legacy = family;

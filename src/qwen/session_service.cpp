@@ -36,9 +36,7 @@ serve::Json inspect_http_options(const decode_cli::Options& options) {
     out.set("batch_cap", serve::Json(static_cast<std::uint64_t>(options.http_batch_cap)));
     out.set("batch_explicit", serve::Json(options.http_batch_explicit));
     out.set("slot_admission", serve::Json(options.http_slot_reason));
-    const auto sampling = decode_cli::resolve_http_sampling(options, decode_cli::ordinary_http_batch_slots(options) != 0);
-    out.set("sampling_policy", serve::Json(std::string(sampling.policy)));
-    if (options.http_default_temperature) out.set("default_temperature", serve::Json(*options.http_default_temperature));
+    out.set("sampling_policy", serve::Json(std::string(options.http_sampling_policy)));
     out.set("logprobs_requested", serve::Json(options.http_logprobs));
     out.set("structured_output_requested", serve::Json(options.http_constraints));
     out.set("session_resume_requested", serve::Json(options.session_management_requested));
@@ -82,6 +80,7 @@ void bind_http_sampled_fields(serve::ApiConfig& config) {
 void install_session_service(serve::ServiceFactories& factories, NativeHttp launch) {
     if (!launch) throw std::invalid_argument("Qwen service requires a native startup binding");
     serve::ServiceFactory factory;
+    factory.sampling_default = SampledAcceptance::coupled;
     factory.validate = [](const serve::ServiceSelection& selection) {
         qwen_description::assert_matches(ModelContract::qwen38_flash_next(), selection.description);
         auto result = std::make_shared<Prepared>();

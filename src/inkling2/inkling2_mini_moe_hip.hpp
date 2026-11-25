@@ -11,7 +11,9 @@
 namespace strix::inkling2 {
 
 #if defined(__HIPCC__)
-inline hipError_t enqueue_mini_hip_resident_moe(
+// Config = MiniMoeNarrowConfig dispatches a narrow expert image (every layer NVFP4); the checkpoint entry below is unchanged.
+template <class Config>
+inline hipError_t enqueue_mini_hip_resident_moe_for(
     unsigned physical, unsigned rows, std::span<const float> input,
     std::span<const float> router_logits, std::span<const float> bias, std::span<float> output,
     MiniMoeResidentRouteBuffers buffers, std::span<const MiniMoeExpert> matrices,
@@ -27,9 +29,19 @@ inline hipError_t enqueue_mini_hip_resident_moe(
                                 route.weights.data(), route_stream, tap);
         return status;
     };
-    return mini_grouped::enqueue_resident<MiniMoeConfig, MiniHipMoeBackend>(
+    return mini_grouped::enqueue_resident<Config, MiniHipMoeBackend>(
         physical, rows, input, router_logits, bias, output, buffers, matrices, csr, out, workspace, stream,
         mini_grouped::LogitExtent::exact, select);
+}
+
+inline hipError_t enqueue_mini_hip_resident_moe(
+    unsigned physical, unsigned rows, std::span<const float> input,
+    std::span<const float> router_logits, std::span<const float> bias, std::span<float> output,
+    MiniMoeResidentRouteBuffers buffers, std::span<const MiniMoeExpert> matrices,
+    moe_core::device_grouped::CsrTables csr, moe_core::device_grouped::Output out,
+    MiniMoeWorkspace workspace, hipStream_t stream, moe::RouteTap* tap = nullptr) {
+    return enqueue_mini_hip_resident_moe_for<MiniMoeConfig>(physical, rows, input, router_logits, bias, output, buffers,
+                                                            matrices, csr, out, workspace, stream, tap);
 }
 #endif
 

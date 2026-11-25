@@ -1,6 +1,7 @@
 #pragma once
 #include "integer_math.hpp"
 #include "integer_plan.hpp"
+#include "../ops/a8/a8_group_device.hpp"
 #include <type_traits>
 namespace strix::core {
 // Fixed register-array indices even when LLVM declines a pragma-unroll request.
@@ -70,14 +71,7 @@ template<class OperandPolicy, bool Relaxed = false> struct IntegerContract {
 };
 struct A8Result { signed char code; float delta; int sum; };
 __device__ __forceinline__ A8Result quantize_a8_row32(float x) {
-    float amax = fabsf(x);
-    for (int stride = 16; stride; stride /= 2) amax = fmaxf(amax, __shfl_xor(amax, stride, 32));
-    const bool tiny = amax > 0.0f && amax < 0x1p-119f;
-    const float d = amax == 0.0f || tiny ? 1.0f : amax / 127.0f;
-    const float rounded = tiny ? 0.0f : rintf(x / d);
-    const int code = int(fminf(127.0f, fmaxf(-127.0f, rounded)));
-    int sum = code;
-    for (int stride = 16; stride; stride /= 2) sum += __shfl_xor(sum, stride, 32);
-    return {static_cast<signed char>(code), d, sum};
+    const ops::a8::Group g = ops::a8::quantize_group(x);  // the one a8g32-v1 device body
+    return {static_cast<signed char>(g.code), g.delta, g.sum};
 }
 }

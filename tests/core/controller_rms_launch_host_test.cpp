@@ -13,7 +13,6 @@ struct dim3 { unsigned x; };
 
 unsigned launches = 0;
 
-hipError_t hipGetLastError() { return hipSuccess; }
 }  // namespace
 
 namespace strix::core::controller_rms_rows::detail {

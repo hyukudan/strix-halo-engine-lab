@@ -66,9 +66,12 @@ struct HipBackend {
     static constexpr auto launch_image = grouped_microscaled::launch_image<Format>;
     static constexpr auto combine_image = grouped_rows::combine_image;
     template<unsigned Experts, unsigned TopK>
+    using Planner = device_grouped::Planner<Experts, TopK>;
+    template<unsigned Experts, unsigned TopK>
     static constexpr auto materialize = device_grouped::enqueue<Experts, TopK>;
     // Rotated integer A4W4 operand class (moe_core/grouped_iu4a4.hpp; iu4 WMMA).
     static constexpr auto launch_iu4a4 = grouped_iu4a4::launch;
+    static constexpr bool small_form = true;  // grouped_microscaled::Form::small_f16
 #endif
 };
 #endif
@@ -88,6 +91,8 @@ struct CudaBackend {
     static constexpr auto gather = grouped_rows::gather;
     template<weight::microscaled::MatrixFormat Format>
     static constexpr auto launch_projection = cuda::core::mma::microscaled::launch<Format>;
+    template<unsigned Experts, unsigned TopK>
+    using Planner = device_grouped::Planner<Experts, TopK>;
     template<unsigned Experts, unsigned TopK>
     static constexpr auto materialize = device_grouped::enqueue<Experts, TopK>;
     // FAST W4A4 operand class (moe_core/grouped_w4a4.hpp; sm_120 block-scaled FP4).
@@ -281,10 +286,12 @@ struct HostPlan {
     std::vector<TileRows> down;
 };
 
+// prepare() for a plan whose projections run in `form`: the small form also admits every expert matrix with
+// grouped_microscaled::fits_small_matrix (prepare() itself is the BF16 tile's admission, unchanged).
 template<class Config, class Backend>
-inline HostPlan prepare(unsigned layer, unsigned rows, std::span<const std::uint32_t> experts,
-                        std::span<const float> weights, std::span<const ExpertWeights> matrices,
-                        Workspace workspace) {
+inline HostPlan prepare_form(unsigned layer, unsigned rows, std::span<const std::uint32_t> experts,
+                             std::span<const float> weights, std::span<const ExpertWeights> matrices,
+                             Workspace workspace, grouped_microscaled::Form form) {
     using Projection = typename Config::Projection;
     const auto need = workspace_elements<Config>(rows);
     if (layer >= Config::layers || matrices.size() != Config::experts ||
@@ -313,10 +320,23 @@ inline HostPlan prepare(unsigned layer, unsigned rows, std::span<const std::uint
             !fits_tile<Config, Backend>(layer, Projection::down, down)) {
             throw std::invalid_argument("grouped MoE: incompatible expert descriptor");
         }
+        if (form == grouped_microscaled::Form::small_f16 &&
+            (!grouped_microscaled::fits_small_matrix(matrix.gate_up, Config::hidden, gate_width) ||
+             !grouped_microscaled::fits_small_matrix(matrix.down, Config::intermediate, Config::hidden))) {
+            throw std::invalid_argument("grouped MoE: expert descriptor not admitted for the small form");
+        }
         plan.gate_up.push_back(gate_up);
         plan.down.push_back(down);
     }
     return plan;
+}
+
+template<class Config, class Backend>
+inline HostPlan prepare(unsigned layer, unsigned rows, std::span<const std::uint32_t> experts,
+                        std::span<const float> weights, std::span<const ExpertWeights> matrices,
+                        Workspace workspace) {
+    return prepare_form<Config, Backend>(layer, rows, experts, weights, matrices, workspace,
+                                         grouped_microscaled::Form::bf16_tile);
 }
 
 struct DevicePlan {
@@ -340,6 +360,10 @@ struct DevicePlan {
     // run on the backend's integer tile (Workspace::nvfp4 holds the activation images, grouped_iu4a4::act_bytes); a backend
     // without it, or images == nullptr: the tiles above.
     grouped_iu4a4::Selection iu4{};
+    // Operand form of both projections (FAST trait, grouped_microscaled::Form): small_f16 needs a backend with the small
+    // form (Backend::small_form) and BF16 activations; it runs gate-up without the activation epilogue. A row's bits are
+    // the same at every plan row count, so a binder selects it per launch class, never per row count.
+    grouped_microscaled::Form form = grouped_microscaled::Form::bf16_tile;
 };
 
 // Load-time admission of the W4A4 operand class for one layer's experts (stage copies need 16-byte code rows and 8-byte scale
@@ -358,6 +382,20 @@ inline bool admit_w4a4(unsigned layer, std::span<const ExpertWeights> matrices) 
     };
     for (const auto& m : matrices)
         if (!fits(m.gate_up, Config::hidden, gate_width) || !fits(m.down, Config::intermediate, Config::hidden)) return false;
+    return true;
+}
+
+// Load-time admission of the small form (grouped_microscaled::Form::small_f16) for one layer's experts: both banks
+// (gate-up and down) of every expert pass fits_small_matrix (shape, 16-byte codes, 4-byte aligned scale plane). A
+// caller that uploads its own descriptors (enqueue with DevicePlan::form = small_f16) admits them here or through
+// prepare_form(..., Form::small_f16); enqueue_resident admits them itself before it plans.
+template<class Config>
+inline bool admit_small(unsigned layer, std::span<const ExpertWeights> matrices) {
+    if (layer >= Config::layers || matrices.size() != Config::experts) return false;
+    constexpr unsigned gate_width = 2U * Config::intermediate;
+    for (const auto& m : matrices)
+        if (!grouped_microscaled::fits_small_matrix(m.gate_up, Config::hidden, gate_width) ||
+            !grouped_microscaled::fits_small_matrix(m.down, Config::intermediate, Config::hidden)) return false;
     return true;
 }
 
@@ -388,21 +426,28 @@ inline bool prepare_resident(unsigned layer, unsigned rows, RouteBuffers route,
     return true;
 }
 
-// Upload or build the plan on this stream before launching. Keep all buffers
-// alive through completion and check the device failure word before consuming output.
+namespace detail {
+
+struct Visit {
+    WorkspaceElements need;
+    unsigned assignments;
+    grouped_microscaled::Args gate_up, down;
+};
+
+// Admit the whole visit before any submission. The resident path also does this before routing and planning.
 template<class Config, class Backend>
-inline typename Backend::Status enqueue(
+inline bool preflight_visit(
     const DevicePlan& plan, std::span<const float> input, std::span<float> output,
-    Workspace workspace, typename Backend::Stream stream) {
+    Workspace workspace, Visit& visit) {
     const auto need = workspace_requirement<Config>(plan.rows);
-    if (need.bf16 == 0U) return Backend::invalid_value;
+    if (need.bf16 == 0U) return false;
     const unsigned assignments = plan.rows * Config::top_k;
     const auto row_elements = std::size_t{plan.rows} * Config::hidden;
     if (plan.physical_layer >= Config::layers || input.size() < row_elements || output.size() < row_elements ||
         workspace.bf16.size() < need.bf16 || workspace.fp32.size() < need.fp32 ||
         plan.assignment_rows.size() != assignments || plan.combine_rows.size() != assignments ||
         plan.assignment_weights.size() != assignments || plan.gate_up.size() != plan.down.size() ||
-        plan.gate_up.empty() || plan.gate_up.size() > grouped_microscaled::kMaxTiles) return Backend::invalid_value;
+        plan.gate_up.empty() || plan.gate_up.size() > grouped_microscaled::kMaxTiles) return false;
 
     constexpr unsigned gate_width = 2U * Config::intermediate;
     const auto tiles = static_cast<unsigned>(plan.gate_up.size());
@@ -414,7 +459,26 @@ inline typename Backend::Status enqueue(
     gate_up.mean_tile_rows = down.mean_tile_rows = (assignments + Config::experts - 1U) / Config::experts;
     gate_up.decode = down.decode = plan.decode;
     gate_up.schedule = down.schedule = plan.schedule;
-    if (!Backend::fits(gate_up) || !Backend::fits(down)) return Backend::invalid_value;
+    gate_up.form = down.form = plan.form;
+    if (plan.form != grouped_microscaled::Form::bf16_tile) {
+        if constexpr (!requires { Backend::small_form; }) return false;
+        if (plan.activations != grouped_w4a4::Activations::bf16 || plan.iu4.images) return false;
+        if (!grouped_microscaled::fits_small(gate_up) || !grouped_microscaled::fits_small(down))
+            return false;
+    }
+    if (!Backend::fits(gate_up) || !Backend::fits(down)) return false;
+    if constexpr (requires { Backend::token_rows; })
+        if (reinterpret_cast<std::uintptr_t>(workspace.bf16.data()) % 16U != 0U) return false;
+    visit = {need, assignments, gate_up, down};
+    return true;
+}
+
+template<class Config, class Backend>
+inline typename Backend::Status enqueue_visit(
+    const DevicePlan& plan, std::span<const float> input, std::span<float> output,
+    Workspace workspace, const Visit& visit, typename Backend::Stream stream) {
+    const auto& [need, assignments, gate_up, down] = visit;
+    constexpr unsigned gate_width = 2U * Config::intermediate;
     // A backend whose gate-up reads token rows in place writes the rows x hidden BF16 image of the token rows at
     // workspace.bf16 (the base the plan's gathered addresses are relative to) instead of top_k gathered copies; each
     // tile row then reads bf16_encode of the FP32 element the gather would have copied (same operand bits).
@@ -427,8 +491,8 @@ inline typename Backend::Status enqueue(
     if constexpr (requires { &Backend::launch_iu4a4; Config::Activation::gate_cap; Config::Activation::up_cap; }) {
         if (plan.iu4.images) {
             status = Backend::launch_iu4a4({input.data(), plan.rows, assignments, Config::hidden, Config::intermediate,
-                                            plan.assignment_rows.data(), plan.gate_up.data(), plan.down.data(), tiles,
-                                            max_tile_rows, plan.tile_count, plan.failure, workspace.bf16.data(),
+                                            plan.assignment_rows.data(), plan.gate_up.data(), plan.down.data(), gate_up.count,
+                                            gate_up.max_tile_rows, plan.tile_count, plan.failure, workspace.bf16.data(),
                                             workspace.fp32.data(), workspace.nvfp4.data(), workspace.nvfp4.size(),
                                             plan.iu4.images, Config::Activation::gate_cap, Config::Activation::up_cap,
                                             // verdict word = the plan's failure word (device memory the planner
@@ -502,7 +566,7 @@ inline typename Backend::Status enqueue(
     if (status != Backend::success) return status;
     bool epilogue = false;
     if constexpr (activation_epilogue<Config, Backend>)
-        epilogue = workspace.activation.size() >= need.activation &&
+        epilogue = plan.form == grouped_microscaled::Form::bf16_tile && workspace.activation.size() >= need.activation &&
                    reinterpret_cast<std::uintptr_t>(workspace.activation.data()) % 16U == 0U;
     if (epilogue) {
         // The plan's down inputs address BF16 activation rows in workspace.bf16: rebased into workspace.activation
@@ -556,6 +620,19 @@ inline typename Backend::Status enqueue(
          plan.rows, Config::top_k, Config::hidden, output.data(), Config::hidden, plan.failure}, stream);
 }
 
+}  // namespace detail
+
+// Upload or build the plan on this stream before launching. Keep all buffers
+// alive through completion and check the device failure word before consuming output.
+template<class Config, class Backend>
+inline typename Backend::Status enqueue(
+    const DevicePlan& plan, std::span<const float> input, std::span<float> output,
+    Workspace workspace, typename Backend::Stream stream) {
+    detail::Visit visit{};
+    if (!detail::preflight_visit<Config, Backend>(plan, input, output, workspace, visit)) return Backend::invalid_value;
+    return detail::enqueue_visit<Config, Backend>(plan, input, output, workspace, visit, stream);
+}
+
 #if defined(__HIPCC__) || defined(__CUDACC__)
 template<class Caps>
 struct SoftcappedSwigluBf16 {
@@ -569,6 +646,7 @@ struct SoftcappedSwigluBf16 {
 struct Bf16Combine {
     static constexpr auto launch = grouped_rows::combine;
 };
+#endif
 
 // The route hook owns selection. Its outputs feed the common CSR planner and
 // the same execution path used with an uploaded host plan.
@@ -581,8 +659,11 @@ inline typename Backend::Status enqueue_resident(
     grouped_microscaled::Decode decode = grouped_microscaled::Decode::reference,
     grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16,
     grouped_microscaled::Schedule schedule = grouped_microscaled::Schedule::automatic,
-    grouped_iu4a4::Selection iu4 = {}) {
-    using Planner = device_grouped::Planner<Config::experts, Config::top_k>;
+    grouped_iu4a4::Selection iu4 = {},
+    grouped_microscaled::Form form = grouped_microscaled::Form::bf16_tile) {
+    using Planner = typename Backend::template Planner<Config::experts, Config::top_k>;
+    if (form == grouped_microscaled::Form::small_f16 && !admit_small<Config>(layer, matrices))
+        return Backend::invalid_value;  // before routing or planning is queued
     device_grouped::Args args{};
     if (!prepare_resident<Config, Backend>(layer, rows, route, matrices, csr, out, workspace, args)) {
         return Backend::invalid_value;
@@ -593,18 +674,19 @@ inline typename Backend::Status enqueue_resident(
         bias.size() != Config::experts || route.scratch.size() < Planner::scratch_bytes(rows) / sizeof(unsigned)) {
         return Backend::invalid_value;
     }
-    auto status = select(logits, bias, route, rows, stream);
-    if (status != Backend::success) return status;
-    status = Backend::template materialize<Config::experts, Config::top_k>(args, route.scratch, stream);
-    if (status != Backend::success) return status;
-
     const auto assignments = std::size_t{rows} * Config::top_k;
     const auto tiles = args.out.tile_capacity;
     const DevicePlan plan{layer, rows, {args.csr.rows, assignments}, {args.out.combine_rows, assignments},
                           {args.out.assignment_weights, assignments}, {args.out.gate_up, tiles},
-                          {args.out.down, tiles}, args.out.tile_count, args.out.failure, decode, activations, schedule, iu4};
-    return enqueue<Config, Backend>(plan, input, output, workspace, stream);
+                          {args.out.down, tiles}, args.out.tile_count, args.out.failure, decode, activations, schedule, iu4, form};
+    detail::Visit visit{};
+    if (!detail::preflight_visit<Config, Backend>(plan, input, output, workspace, visit)) return Backend::invalid_value;
+
+    auto status = select(logits, bias, route, rows, stream);
+    if (status != Backend::success) return status;
+    status = Backend::template materialize<Config::experts, Config::top_k>(args, route.scratch, stream);
+    if (status != Backend::success) return status;
+    return detail::enqueue_visit<Config, Backend>(plan, input, output, workspace, visit, stream);
 }
-#endif
 
 }  // namespace strix::moe_core::grouped_dispatch

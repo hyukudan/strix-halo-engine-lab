@@ -4,6 +4,7 @@
 // No HIP or CUDA type appears here: a backend contributes only kernel bodies and its allocator / copy calls
 // (core/hip_screened_head.hpp, cuda/core/head_screened.cuh). The math and the invariant are in core/screened_head.hpp.
 // The rescore trait (end of this file) is the FAST form: exact rows for the largest scores of an approximate head.
+#include "core/byte_range.hpp"
 #include "core/screened_head.hpp"
 #include "strix/env_flags.hpp"
 
@@ -310,7 +311,8 @@ constexpr unsigned rescore_blocks(unsigned rows) noexcept {
 
 // One enqueue of the rescore trait over `lanes` rows of scores (all pointers are device pointers).
 // The required prefix of scratch must be disjoint from weights, activations and the score image (including pitch
-// tails). The enqueue owns this prefix exclusively until stream completion.
+// tails). The enqueue owns this prefix exclusively until stream completion. The score image (including pitch tails) is
+// rewritten in place, so it must be disjoint from the weights and the activations too.
 struct RescoreLaunch {
     HeadSpec head;          // incumbent BF16 rows and the post-transform cap (> 0)
     const float* x;         // activations [lanes][x_stride], 16-byte aligned
@@ -339,17 +341,19 @@ inline bool rescore_launch_valid(const RescoreLaunch& a) noexcept {
     if (!aligned(a.head.weights, 16U) || !aligned(a.x, 16U) || !aligned(a.scores, 4U) || !aligned(a.scratch, 256U))
         return false;
     const auto bytes = rescore_layout(a.head.rows, a.capacity, a.lanes).bytes;
-    const auto scratch = reinterpret_cast<std::uintptr_t>(a.scratch);
-    constexpr auto max_address = std::numeric_limits<std::uintptr_t>::max();
-    if (bytes == 0U || bytes > a.scratch_bytes || bytes > max_address - scratch) return false;
-    const auto disjoint = [&](const void* p, std::uint64_t size) {
-        const auto start = reinterpret_cast<std::uintptr_t>(p);
-        return size <= max_address - start && (start + size <= scratch || scratch + bytes <= start);
-    };
-    const auto activations = std::uint64_t{a.lanes - 1U} * a.x_stride + a.head.width;
-    return disjoint(a.head.weights, std::uint64_t{a.head.rows} * a.head.width * sizeof(std::uint16_t)) &&
-           disjoint(a.x, activations * sizeof(float)) &&
-           disjoint(a.scores, std::uint64_t{a.lanes} * a.pitch * sizeof(float));
+    if (bytes > a.scratch_bytes) return false;
+    const auto weight_bytes = std::uint64_t{a.head.rows} * a.head.width * sizeof(std::uint16_t);
+    const auto activation_bytes = (std::uint64_t{a.lanes - 1U} * a.x_stride + a.head.width) * sizeof(float);
+    const auto score_bytes = std::uint64_t{a.lanes} * a.pitch * sizeof(float);
+    constexpr auto max_size = std::numeric_limits<std::size_t>::max();
+    if (weight_bytes > max_size || activation_bytes > max_size || score_bytes > max_size) return false;
+    const ByteRange weights{a.head.weights, static_cast<std::size_t>(weight_bytes)};
+    const ByteRange activations{a.x, static_cast<std::size_t>(activation_bytes)};
+    const ByteRange scores{a.scores, static_cast<std::size_t>(score_bytes)};
+    const ByteRange scratch{a.scratch, bytes};
+    return byte_range_valid(weights) && byte_range_valid(activations) && byte_range_valid(scores) &&
+           byte_range_valid(scratch) && reads_disjoint_from_writes({weights, activations}, {scores, scratch}) &&
+           !byte_ranges_overlap(scores, scratch);
 }
 
 }  // namespace strix::core::screened_head_plan

@@ -6,10 +6,12 @@
 #include "strix/serve/serial_generation_cli.hpp"
 #include "strix/session/head_gate_cli.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <optional>
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -31,17 +33,17 @@ struct Options {
     profile::Resolution tier;
 };
 
-inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily& family) {
+inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily& family, bool native) {
     Options options;
     options.generation = serve::parse_serial_generation_cli(argc, argv, family,
         [&](std::string_view argument, const auto& value) {
-            if (parse_mini_weight_option(options.weights, argument, value, family.default_prefill_chunk != 0))
+            if (parse_mini_weight_option(options.weights, argument, value, native))
                 return true;
             if (argument == "--dspark") {
                 options.dspark = value();
                 return true;
             }
-            if (!family.default_prefill_chunk) return false;
+            if (!native) return false;
             if (argument == "--step-graph" || argument == "--no-step-graph")
                 options.step_graphs = argument == "--step-graph";
             else if (argument == "--gate-manifest") options.gate_manifest = value();
@@ -81,10 +83,18 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
                  generation.tokenize_file || generation.generate_requested || generation.logits ||
                  generation.sampling_requested))
         throw std::invalid_argument("gate mode takes no prompt, --tokenize, --generate, --logits or sampling options");
-    options.tier = resolve_mini_profile(options.weights, !generation.tokenize_file);
+    options.tier = resolve_mini_profile(options.weights, native && !generation.tokenize_file);
     if (options.gate_order_null && (!gate || options.tier.profile != profile::Name::standard))
         throw std::invalid_argument("--gate-order-null requires an exact gate arm");
     return options;
+}
+
+// A gate holds one sequence at a time and reuses one weight image across all windows.
+inline weight::WeightLoadExtent gate_weight_extent(std::span<const session::HeadGateWindow> windows) {
+    unsigned positions = 0;
+    for (const auto& window : windows)
+        positions = std::max(positions, static_cast<unsigned>(window.ids.size()));
+    return {positions, 1U};
 }
 
 // Exact R1 latency forms of the CUDA step program (mask: 1 tiled bank readout, 2 controller output split,
@@ -166,6 +176,7 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
             throw std::invalid_argument("latency forms select step-program leaves: decode through --step-program");
         return {false, requested_mode, {}};
     }
+    require_mini_expert_consumer(options.tier, false);
     if (options.gate_order_null)
         throw std::invalid_argument("--gate-order-null requires resident replay with --step-graph or --no-step-graph");
     if (options.dspark)

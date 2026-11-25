@@ -6,14 +6,14 @@
 // v (value_heads x 128) in FP32; conv_state the BF16 conv history (4 per channel, entries 1..3 = rows -3..-1);
 // rows.beta / rows.gate one value per (row, value head) after the production gates kernel (beta = sigmoid, gate =
 // log-decay); value head h reads key head h % key_heads; the FP32 state stays in its GdnRecurrentStorage layout.
-// The includer provides GdnRecurrentStorage, GdnPrefillRows, gdn_window_state_index, SmallWeightKind, load_small,
-// float_to_bf16, bf16_to_float, round_bf16, gdn_window_key_sum, kGdnWindowKernel and <hip/hip_runtime.h>,
+// The includer provides GdnRecurrentStorage, GdnPrefillRows, gwin (ops/recur/gated_delta_window.hpp), SmallWeightKind, load_small,
+// float_to_bf16, bf16_to_float, round_bf16, kGdnWindowKernel and <hip/hip_runtime.h>,
 // <cstdint>, <mutex>, <stdexcept>, <vector>.
 //
 // Contract (per value head h, key head kh = h % key_heads, chunks of 32 rows from the call start, m valid rows;
 // padded rows have q = k = v = 0, beta = 0, g = 0):
 //   q, k, v  production conv values: sum = 0, sum += x_j * w_j (j = 0..3, x = BF16 of the input or the history),
-//            SiLU sum / (1 + expf(-sum)), round_bf16. q, k L2-normed with the production tree (gdn_window_key_sum,
+//            SiLU sum / (1 + expf(-sum)), round_bf16. q, k L2-normed with the production tree (gwin::key_sum,
 //            rsqrtf(sum + eps)), q *= rsqrtf(128). Q16 = fp16(q), K16 = fp16(k); v stays exact (BF16 value).
 //   g_r      gate_r, values below -110 raised to -110 (NaN kept). G = inclusive prefix over the chunk (shuffle-up
 //            ladder 1, 2, 4, 8, 16). e_r = expf(G_r), f_r = expf(G_{m-1} - G_r), eL = e_{m-1}; padded rows
@@ -220,7 +220,7 @@ __global__ __launch_bounds__(256) void prep_kernel(GdnPrefillRows rows, std::uin
                     float sq[4];
 #pragma unroll
                     for (unsigned p = 0; p < 4U; ++p) sq[p] = v[p] * v[p];
-                    const float inv = rsqrtf(gdn_window_key_sum(sq) + epsilon);
+                    const float inv = rsqrtf(gwin::key_sum(sq) + epsilon);
 #pragma unroll
                     for (unsigned p = 0; p < 4U; ++p) v[p] = block == 0U ? v[p] * inv * q_scale : v[p] * inv;
                 }
@@ -406,7 +406,7 @@ __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6))) void s
     for (unsigned kt = 0; kt < 8U; ++kt)
 #pragma unroll
         for (unsigned e = 0; e < 8U; ++e)
-            st[kt][e] = state[gdn_window_state_index<Storage>(head, 16U * kt + 2U * e + rh, col, kD)];
+            st[kt][e] = state[gwin::state_index<Storage>(head, 16U * kt + 2U * e + rh, col, kD)];
     prefetch(0U);
     for (std::uint32_t c = 0; c < n; ++c) {
         const std::uint32_t first = c * kC, m = min(kC, count - first);
@@ -522,7 +522,7 @@ __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6))) void s
     for (unsigned kt = 0; kt < 8U; ++kt)
 #pragma unroll
         for (unsigned e = 0; e < 8U; ++e)
-            state[gdn_window_state_index<Storage>(head, 16U * kt + 2U * e + rh, col, kD)] = st[kt][e];
+            state[gwin::state_index<Storage>(head, 16U * kt + 2U * e + rh, col, kD)] = st[kt][e];
 }
 
 // The new conv history: the BF16 inputs of rows count - 4 .. count - 1 (the old history below row 0); launched after

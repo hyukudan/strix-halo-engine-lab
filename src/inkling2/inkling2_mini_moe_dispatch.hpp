@@ -29,6 +29,16 @@ struct MiniMoeConfig {
 #endif
 };
 
+// The narrow expert image (lever moe.experts.mxfp8-nvfp4@1): the checkpoint's MXFP8 layers are stored as NVFP4 at load
+// (weight/formats/microscaled_encode.hpp transcode_slab_to_nvfp4), so every physical layer of that image reads as NVFP4.
+// The checkpoint configuration above stays the one every other load dispatches with.
+inline constexpr weight::microscaled::MatrixFormat mini_narrow_expert_format(unsigned) {
+    return weight::microscaled::MatrixFormat::nvfp4;
+}
+struct MiniMoeNarrowConfig : MiniMoeConfig {
+    static constexpr auto format = mini_narrow_expert_format;
+};
+
 using MiniMoeWorkspace = mini_grouped::Workspace;
 using MiniMoeExpert = mini_grouped::ExpertWeights;
 using MiniMoeDevicePlan = mini_grouped::DevicePlan;

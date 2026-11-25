@@ -52,9 +52,9 @@ and splits each activation into `high = RNE16(x)` and
 run on high and low, and each output is `h + l * 2^-12` in FP32. In
 `hilo_k128` both chains restart every 128 inputs and the block parts are
 added in increasing K (`s = s + part`, separately rounded FP32 adds). `emulate_linear_v2`
-(`emulator.cpp`) is the specification; every device kernel (`hilo_gemm`,
-`hilo_direct`, `staged_hilo`, the fused gate/up with its low panel and the
-narrow tiles) equals it byte for byte in `strix-gemma4-prefill-device-tests`.
+(`emulator.cpp`) is the specification; the linears run on the shared FP16 tall
+GEMM's hi/lo form (`src/core/f16_dense_tall_hilo.hpp`), and it and the fused
+gate/up with its low panel equal it byte for byte in `strix-gemma4-prefill-device-tests`.
 The precision is chosen per linear by a `LinearPolicy`, a list of
 `regex=mode` rules (`fp16`, `exact`, `hilo`, `hilo_k128`; first match wins),
 for example `ple_model=fp16;.*=hilo`. `strix-gemma4-prefill-check` takes it as

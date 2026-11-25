@@ -60,7 +60,11 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     const auto resolution = resolve_mini_profile(out.weight_options, true);
     out.tier = resolution.profile;
     out.moe_w4a4 = mini_moe_w4a4_class(resolution);
+    out.prepared_round_fold = mini_prepared_round_fold(resolution);
+    out.experts_nvfp4 = mini_experts_nvfp4(resolution);
     out.combine_image = mini_combine_image(resolution);
+    out.attn_projected_bias = mini_attn_projected_bias(resolution);
+    out.controller_one_plane = mini_controller_one_plane(resolution);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();
@@ -188,15 +192,26 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             out << "backend " << resolved.backend << " context " << opt.context << " prefill_rows " << opt.prefill_rows
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
                 << " profile " << mini_profile_name(opt.tier) << " speculation off";
-            if (kMiniWeightLoadDecisions.empty() || opt.tier == profile::Name::standard || opt.weight_options.disable_q8) {
-                const auto backend = resolved.backend == "hip" ? weight::Backend::hip : weight::Backend::cuda;
+            const auto backend = resolved.backend == "hip" ? weight::Backend::hip : weight::Backend::cuda;
+            // Without a device the plan is exact unless a full row (gate + gain) of this backend could select for this
+            // instance's extent there (the same extent make_mini_device_cohort resolves with).
+            const auto of_backend = [backend](const weight::WeightLoadDecision& row) { return row.scope.backend == backend; };
+            const weight::WeightLoadExtent extent{opt.context, opt.slots};
+            const bool device_dependent = opt.tier != profile::Name::standard && !opt.weight_options.disable_q8 &&
+                std::ranges::any_of(kMiniWeightLoadDecisions, [&](const weight::WeightLoadDecision& row) {
+                    return of_backend(row) && weight::weight_load_gain_selects(row, extent);
+                });
+            if (!device_dependent) {
                 const weight::WeightLoadScope scope{backend, {}, {}, {}, {}, {}};
-                const auto plan = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope);
+                const auto plan = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope, extent);
                 out << " weight_storage " << plan.storage.name << '@' << plan.storage.revision
                     << " weight_status " << profile::status_name(plan.status);
             } else {
                 out << " weight_status pending-device";
             }
+            if (std::ranges::any_of(kMiniWeightLoadDecisions, of_backend))
+                out << " weight_rows " << weight::registered_regime_rows(kMiniWeightLoadPolicy, backend,
+                                                                         kMiniWeightLoadRegimes, kMiniWeightLoadDecisions);
             out << '\n';
         },
         [backends = std::move(backends), tokenizer = std::move(tokenizer), chat = std::move(chat)]

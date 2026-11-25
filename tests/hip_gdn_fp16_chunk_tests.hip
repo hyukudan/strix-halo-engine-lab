@@ -19,17 +19,12 @@
 #include <vector>
 
 #include "row_fixture_stride.hpp"
+#include "ops/recur/gated_delta_window.hpp"
 
-// Production definitions the route uses (copied from hip_gdn_launcher.hip).
-enum class GdnRecurrentStorage : std::uint32_t { key_value = 0, value_key = 1 };
+// Production definitions the route uses (copied from hip_gdn_launcher.hip; trees and layout from the shared form).
+using strix::GdnRecurrentStorage;
+namespace gwin = strix::ops::recur::window;  // state_index, key_sum
 struct GdnPrefillRows { float* qkv; float* z; float* beta; float* gate; float* core; std::uint64_t stride; };
-template <GdnRecurrentStorage Storage>
-__device__ __forceinline__ std::uint64_t gdn_window_state_index(std::uint32_t value_head, std::uint32_t lane,
-    std::uint32_t value_index, std::uint32_t head_dim) {
-    return (static_cast<std::uint64_t>(value_head) * head_dim +
-        (Storage == GdnRecurrentStorage::value_key ? value_index : lane)) * head_dim +
-        (Storage == GdnRecurrentStorage::value_key ? lane : value_index);
-}
 enum class SmallWeightKind : std::uint32_t { f32 = 0, f16 = 1, bf16 = 2 };
 __device__ float bf16_to_float(std::uint16_t bits) { return __uint_as_float(static_cast<std::uint32_t>(bits) << 16U); }
 __device__ std::uint16_t float_to_bf16(float value) {
@@ -45,30 +40,6 @@ __device__ float load_small(const void* values, SmallWeightKind kind, std::uint6
     }
 }
 constexpr std::uint32_t kGdnWindowKernel = 4;
-__device__ __forceinline__ float gdn_window_add(float lower, float upper) {
-    float result;
-    asm("v_add_f32 %0, %1, %2" : "=v"(result) : "v"(lower), "v"(upper));
-    return result;
-}
-template <unsigned Distance>
-__device__ __forceinline__ float gdn_window_down(float value) {
-    if constexpr (Distance == 16U) {
-        const auto bits = __float_as_uint(value);
-        return __uint_as_float(STRIX_HIP_EXCHANGE16(bits, bits, false, false));
-    } else {
-        const auto bits = __float_as_int(value);
-        return __int_as_float(__builtin_amdgcn_update_dpp(bits, bits, 0x100 + static_cast<int>(Distance), 0xf, 0xf, false));
-    }
-}
-__device__ __forceinline__ float gdn_window_key_sum(const float (&p)[4]) {
-    float sum = gdn_window_add(gdn_window_add(p[0], p[2]), gdn_window_add(p[1], p[3]));
-    sum = gdn_window_add(sum, gdn_window_down<16U>(sum));
-    sum = gdn_window_add(sum, gdn_window_down<8U>(sum));
-    sum = gdn_window_add(sum, gdn_window_down<4U>(sum));
-    sum = gdn_window_add(sum, gdn_window_down<2U>(sum));
-    sum = gdn_window_add(sum, gdn_window_down<1U>(sum));
-    return __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(sum)));
-}
 
 #include "../src/core/wave_uniform.hpp"
 #include "../src/hip_gdn_fp16_chunk.inc"
@@ -87,7 +58,7 @@ template <bool Wave> struct TestNormT {
         const unsigned lane = threadIdx.x % 32U;
         float square[4];
         for (unsigned p = 0; p < 4U; ++p) square[p] = value[p] * value[p];
-        const float inv = rsqrtf(gdn_window_key_sum(square) / 128.0F + epsilon);
+        const float inv = rsqrtf(gwin::key_sum(square) / 128.0F + epsilon);
         for (unsigned p = 0; p < 4U; ++p) {
             const float result = value[p] * inv * w[p] * (1.0F / (1.0F + expf(-z[p])));
             if constexpr (Wave) strix::core::wave_row(rows.core, row * rows.stride + head * 128U + p * 32U)[lane] = result;

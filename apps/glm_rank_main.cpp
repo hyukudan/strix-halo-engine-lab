@@ -1,3 +1,4 @@
+#include "strix/token_sampling.hpp"
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/env_arms.hpp"
 #include "strix/device/hip_gate.hpp"
@@ -137,6 +138,7 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);  // line-buffered: a killed run still leaves every printed line in its log
     std::setvbuf(stderr, nullptr, _IONBF, 0);  // unbuffered (the C default, made explicit): progress and errors land at once
     try {
+        strix::validate_sampling_startup_environment(); // refused before any rank starts protocol work
         if (strix::print_device_profile_if_requested(argc, argv)) return 0;
         if (argc < 2) {
             std::fprintf(stderr, "usage: %s MODEL_DIR --world 1|2 [--rank R --transport T] [modes] [--identity r1|r1b|r1b-all] [--idcheck N --prompt T.u32]\n"

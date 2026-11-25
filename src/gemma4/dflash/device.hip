@@ -1,6 +1,7 @@
 #include <hip/hip_runtime.h>
 #include "device.hpp"
 #include "gemma4/model/model.hpp"
+#include "attn_core/chunk_decode.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <numeric>
@@ -63,43 +64,38 @@ __device__ const float* at(Read r, std::uint64_t p, bool value, unsigned* failur
     if (r.tags[p % window] != p) { atomicOr(failure, 2U); return nullptr; }
     return (value ? r.v : r.k) + (p % window) * r.width;
 }
+namespace chunked = strix::attn_core::chunk_decode;
+static_assert(attention_chunk == chunked::kChunk, "chunked decode form chunk");
+// Key source of the shared runtime-width score chain: block rows after the anchor, ring rows before it.
+struct Keys {
+    const Read& r;
+    unsigned* failure;
+    std::uint64_t first, last;
+    unsigned kv_offset, dim;
+    __device__ const float* key(std::uint64_t p) const { return at(r, p, false, failure); }
+    __device__ float reduce(float x) const { return sum_wave(x); }
+    __device__ std::size_t index(std::uint64_t p) const { return std::size_t(p - r.base); }
+    __device__ float finish(float x) const {
+        x = x * attention_scale;
+        finite(x, failure);
+        return x;
+    }
+};
 // Scores are packed relative to an absolute chunk boundary. Rows differ only
 // in their left mask; the context/block boundary never splits a partial sum.
 __global__ void score_kernel(const float* q, Read r, float* scores, float* maxima, unsigned* failure) {
     const unsigned rh = blockIdx.y, row = rh / r.heads, head = rh % r.heads;
-    const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U;
     const auto begin = r.base + std::uint64_t(blockIdx.x) * attention_chunk;
-    const auto left = first(r, row), end = r.anchor + block;
-    auto* out = scores + std::size_t(rh) * r.chunks * attention_chunk;
-    for (unsigned j = wave; j < attention_chunk; j += 4U) {
-        const auto p = begin + j;
-        if (p < left || p >= end) continue;
-        const auto* k = at(r, p, false, failure);
-        float sum = 0.0F;
-        if (k)
-            for (unsigned i = lane; i < r.dim; i += 32U)
-                sum = sum + q[std::size_t(rh) * r.dim + i] * k[(head / 4U) * r.dim + i];
-        sum = sum_wave(sum);
-        if (!lane) { sum = sum * attention_scale; finite(sum, failure); out[p - r.base] = sum; }
-    }
-    __syncthreads();
-    if (!threadIdx.x) {
-        float m = bit_cast<float>(0xff800000U);
-        for (unsigned j = 0; j < attention_chunk; ++j) {
-            const auto p = begin + j;
-            if (p >= left && p < end) m = out[p - r.base] > m ? out[p - r.base] : m;
-        }
-        maxima[std::size_t(rh) * r.chunks + blockIdx.x] = m;
-    }
+    Keys src{r, failure, first(r, row), r.anchor + block - 1U, (head / 4U) * r.dim, r.dim};
+    chunked::score_chunk<0U, false>(q + std::size_t(rh) * r.dim, begin, src,
+                                    scores + std::size_t(rh) * r.chunks * attention_chunk, nullptr,
+                                    &maxima[std::size_t(rh) * r.chunks + blockIdx.x]);
 }
 __global__ void max_kernel(Read r, float* maxima) {
     if (threadIdx.x) return;
-    float m = bit_cast<float>(0xff800000U);
-    for (unsigned c = unsigned((first(r, blockIdx.x / r.heads) - r.base) / attention_chunk); c < r.chunks; ++c) {
-        const float value = maxima[std::size_t(blockIdx.x) * r.chunks + c];
-        m = value > m ? value : m;
-    }
-    maxima[std::size_t(block * r.heads) * r.chunks + blockIdx.x] = m;
+    const auto start = (first(r, blockIdx.x / r.heads) - r.base) / attention_chunk;
+    maxima[std::size_t(block * r.heads) * r.chunks + blockIdx.x] =
+        chunked::ordered_maximum(maxima + std::size_t(blockIdx.x) * r.chunks, start, r.chunks - 1U, 1U);
 }
 __global__ void partial_kernel(Read r, const float* scores, const float* maxima, float* partials, unsigned* failure) {
     const unsigned rh = blockIdx.y, row = rh / r.heads, head = rh % r.heads;
@@ -115,28 +111,22 @@ __global__ void partial_kernel(Read r, const float* scores, const float* maxima,
     __syncthreads();
     float* out = partials + (std::size_t(rh) * r.chunks + blockIdx.x) * (r.dim + 1U);
     if (!threadIdx.x) {
-        float denominator = 0.0F;
-        for (auto p = begin; p < end; ++p) denominator = denominator + e[p - chunk_begin];
+        const float denominator = chunked::chunk_denominator(e, chunk_begin, begin, end);
         out[r.dim] = denominator; finite(denominator, failure);
     }
     for (unsigned d = threadIdx.x; d < r.dim; d += blockDim.x) {
-        float numerator = 0.0F;
-        for (auto p = begin; p < end; ++p) {
-            const float* v = at(r, p, true, failure);
-            if (v) numerator = numerator + e[p - chunk_begin] * v[(head / 4U) * r.dim + d];
-        }
+        const float numerator = chunked::chunk_numerator<1U>(
+            e, chunk_begin, begin, end, [&](std::uint64_t p) { return at(r, p, true, failure); },
+            (head / 4U) * r.dim + d);
         out[d] = numerator; finite(numerator, failure);
     }
 }
 __global__ void merge_kernel(Read r, const float* partials, float* out, unsigned* failure) {
-    const auto start = unsigned((first(r, blockIdx.x / r.heads) - r.base) / attention_chunk);
-    float denominator = 0.0F;
-    for (unsigned c = start; c < r.chunks; ++c)
-        denominator = denominator + partials[(std::size_t(blockIdx.x) * r.chunks + c) * (r.dim + 1U) + r.dim];
+    const auto start = (first(r, blockIdx.x / r.heads) - r.base) / attention_chunk;
+    const float* merged = partials + std::size_t(blockIdx.x) * r.chunks * (r.dim + 1U);
+    const float denominator = chunked::ordered_sum<1>(merged + r.dim, start, r.chunks - 1U, r.dim + 1U);
     for (unsigned d = threadIdx.x; d < r.dim; d += blockDim.x) {
-        float numerator = 0.0F;
-        for (unsigned c = start; c < r.chunks; ++c)
-            numerator = numerator + partials[(std::size_t(blockIdx.x) * r.chunks + c) * (r.dim + 1U) + d];
+        const float numerator = chunked::ordered_sum<1>(merged + d, start, r.chunks - 1U, r.dim + 1U);
         const float value = numerator / denominator;
         out[std::size_t(blockIdx.x) * r.dim + d] = value; finite(value, failure);
     }

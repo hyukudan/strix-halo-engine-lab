@@ -25,11 +25,8 @@ the flags below. The serve options can also come from a TOML file (`--serve-conf
 | `--http-model-id NAME` | `qwen3.8-flash-next` | model name reported by `/v1/models` and responses |
 | `--http-api-key-file FILE` | none | require `Authorization: Bearer KEY` or `x-api-key: KEY` on the API routes |
 | `--http-batch N` | AUTO | omitted: as many request slots as memory admits ([below](#batched-decoding)); `N`: at most N; `0`: one request at a time |
-| `--http-sampling greedy\|reject\|sample` | `greedy` | requests with `temperature > 0`: run greedy and say so in the response, answer 400, or sample (sampling-v1, batched route only) |
-| `--http-default-temperature X` | `0` (built-in) | Qwen HTTP default in [0, 2]; positive values require `--http-sampling sample` |
-| `--http-default-top-k N` | `0` (built-in) | Qwen HTTP default non-negative integer, at most 4294967295 |
-| `--http-default-top-p X` | `1` (built-in) | Qwen HTTP default in (0, 1] |
-| `--http-default-min-p X` | `0` (built-in) | Qwen HTTP default in [0, 1) |
+| `--http-sampling greedy\|reject\|sample` | omitted: resolved from the admitted route: `sample` on the cohort runner (automatic with two or more admitted slots, `--http-batch N` or `--deploy`) with MTP sampling speculation, `greedy` on the single runner, as before; an explicit `sample` is a startup requirement (refused when capacity selects the single runner) | requests with `temperature > 0`: run greedy and say so in the response, answer 400, or sample (sampling-v1, cohort runner only) |
+| `--http-default-temperature`, `-top-k`, `-top-p`, `-min-p` | retired | refused at startup: a server-only sampling default would make the HTTP stream differ from the command line; send the value in the request |
 | `--http-default-max-tokens N` | `4096` | generation budget when a request gives none |
 | `--http-max-queue N` | `65536` | waiting requests before new ones get 429; explicit small limits retain rejection |
 | `--http-max-connections N` | `4096` | open connections before new ones get 503; independent of execution slot occupancy |
@@ -347,12 +344,12 @@ from these commands.
   partial buffers normally. Restore source leases use the same contract. Every HIP
   fence, copy, completion or drain error propagates, including OOM. Baseline explicit-cache capture and explicit
   session checkpoint operations retain their original failure contracts.
-- Decoding is greedy unless the batched route samples (below). A request with `temperature > 0` is decoded greedy
-  and the response carries `strix.note`; with `--http-sampling reject` it gets a 400 instead.
+- The single runner defaults to `reject` for sampled requests (HTTP 400). With explicit
+  `--http-sampling greedy` it decodes greedily and reports the downgrade in `strix.note`.
 
-Each sampling filter resolves independently: a non-null request value, then the configured server default,
-then the built-in value (`temperature: 0`, `top_k: 0`, `top_p: 1`, `min_p: 0`). The four default-filter flags
-are available on the Qwen command; the DeepSeek command remains greedy with built-in defaults.
+Qwen takes each non-null filter from the request, with built-in defaults `top_k: 0`, `top_p: 1` and
+`min_p: 0`. An omitted or null temperature resolves to 1 when a filter is active after conversion to float,
+and to 0 otherwise. The Qwen startup parser refuses the retired server-only defaults.
 Temperature, top-p and min-p must be finite numbers in their advertised ranges, even during greedy decoding.
 Top-k must be a non-negative integer in uint32 range. Seed must be an integer in [0, 2^63); strings,
 fractions and negative seeds are refused with a 400 naming the field before submission.
@@ -360,9 +357,7 @@ At temperature 0, filters do not change greedy argmax; non-neutral filters are a
 `filters ignored at temperature 0 (greedy)`. Positive temperature on a greedy-only engine retains the
 configured downgrade or rejection policy.
 
-A sampled request without a seed receives an API-generated 63-bit seed. The engine uses that seed and
-the policy receipt echoes it. Reusing it reproduces the run with the same model, numerical identity,
-sampler and position-keyed uniforms. Greedy receipts omit the seed.
+A sampled request without a seed uses seed 0, which the policy receipt echoes. Greedy receipts omit the seed.
 
 ## Batched decoding
 
@@ -370,7 +365,10 @@ Without `--http-batch` the server is batched with as many request slots as memor
 route needs prefix windows, the draft chain and window rows `{2,4,8}`; when they are missing, or a single-only
 feature is set (state import, copy windows), AUTO serves one request at a time and says why on startup.
 `--http-batch N` caps the slots at N (an explicit N with incompatible options is an error) and `--http-batch 0`
-selects the one-at-a-time route. AUTO never changes the numerical profile or adds MTP assets.
+selects the one-at-a-time route. AUTO keeps the numerical profile and MTP assets. Sampling policy is
+selected from the arguments before measuring capacity: AUTO without `--http-batch` resolves `reject` at every
+slot count and keeps its measured single/cohort choice. A fixed cohort (`--http-batch N` or `--deploy`) samples;
+if its launch would fall back to the single runner, startup refuses it. A cap of 1 selects the one-slot cohort.
 
 - Sizing: every automatic T candidate reserves the compiled primary/tail arenas once, plus each native
   owner's separate PLE staging, projections, gates, convolution snapshot, hashes, deferred GDN banks
@@ -461,9 +459,9 @@ window stream shared by all slots. The calibration replay runs once.
 - Greedy requests return exactly the tokens they return alone (and on the one-at-a-time route): every request keeps
   its own state and arithmetic, and the shared steps compute each row as the request's own window would.
 - `--http-sampling sample`: a request with `temperature > 0` samples with its own policy (`temperature`, `top_k`,
-  `top_p`, `min_p`) and `seed` (random when absent), with speculative decisions on its drafts (D-040; on the GPU as
-  in [sampled-decoding.md](../decode/sampled-decoding.md)). Its tokens follow the target distribution exactly; they are not
-  the same tokens as alone, because the drafts per cycle depend on how many requests share the cycle.
+  `top_p`, `min_p`) and `seed` (0 when absent). Coupled acceptance uses the plain draw on drafted rows.
+  Matching target distributions therefore give matching tokens across draft schedules. See the route
+  qualification scope in [sampled-decoding.md](../decode/sampled-decoding.md).
 - Statistics per request are those of the one-at-a-time route; `prefill_ms` runs from admission to the first
   token (it includes the decode cycles interleaved with the prompt), `queue_ms` from submission to admission.
   The receipt at shutdown is `"mode":"native-mtp-batch"` with slot, step and cohort window counts.

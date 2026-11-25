@@ -34,7 +34,14 @@ std::array<std::uint32_t, 64> decisions(strix::TokenSampler* sampler) {
 
 int main(int argc, char** argv) try {
     using namespace strix;
-    const bool counter = argc == 2 && std::string_view(argv[1]) == "counter";
+    if (argc == 2 && std::string_view(argv[1]) == "counter") {
+        // The arrival-order identity is retired: the server must refuse it, never draw a queue-dependent stream.
+        bool refused = false;
+        try { (void)strix::next_token_sampling_request_identity(); } catch (const std::invalid_argument&) { refused = true; }
+        expect(refused, "STRIX_SAMPLING_REQUEST_IDENTITY=counter is refused");
+        std::cout << "Qwen job sampling: counter identity refused\n";
+        return 0;
+    }
     const auto initial_identity = strix::next_token_sampling_request_identity();
     expect(initial_identity == 1, "initial request identity");
 
@@ -63,21 +70,16 @@ int main(int argc, char** argv) try {
            policy.top_p == static_cast<float>(job.sampling.top_p) && policy.min_p == static_cast<float>(job.sampling.min_p) &&
            policy.seed == job.sampling.seed, "adapter forwards the complete job sampling policy");
     expect(sampler->coupled(), "predictor drafts preserve the target draw");
-    expect(sampler->options().request_identity == (counter ? 2U : 1U), "adapter obtains the shared request identity");
+    expect(sampler->options().request_identity == 1U, "adapter obtains the shared request identity");
 
     const auto repeat = make_job_sampler(job.sampling, error, SampledAcceptance::coupled);
     expect(repeat && error.empty(), "repeat request produces an independent sampler");
-    if (counter) {
-        expect(repeat->options().request_identity == 3U && strix::next_token_sampling_request_identity() == 4U,
-               "greedy and invalid jobs consume no counter identities");
-    } else {
-        expect(decisions(sampler.get()) == decisions(repeat.get()), "same seed and policy reproduce the complete IDs");
-        ++job.sampling.seed;
-        const auto different = make_job_sampler(job.sampling, error, SampledAcceptance::coupled);
-        expect(different && error.empty() && decisions(sampler.get()) != decisions(different.get()),
-               "different seeds produce different IDs");
-    }
-    std::cout << "Qwen job sampling: " << (counter ? "counter identity" : "greedy parity, policy and seeded IDs") << " passed\n";
+    expect(decisions(sampler.get()) == decisions(repeat.get()), "same seed and policy reproduce the complete IDs");
+    ++job.sampling.seed;
+    const auto different = make_job_sampler(job.sampling, error, SampledAcceptance::coupled);
+    expect(different && error.empty() && decisions(sampler.get()) != decisions(different.get()),
+           "different seeds produce different IDs");
+    std::cout << "Qwen job sampling: greedy parity, policy and seeded IDs passed\n";
     return 0;
 } catch (const std::exception& e) {
     std::cerr << "Qwen job sampling: " << e.what() << '\n';

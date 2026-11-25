@@ -1,4 +1,5 @@
 #include <cassert>
+#include "strix/ds41_dense_geometry.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/pinned_host.hpp"
 #include "strix/file_snapshot.hpp"
@@ -459,7 +460,7 @@ struct DevicePrefill::Impl {
     bool dense_select = false, env_dense_q_b = false, env_dense_o_a = false;
     // q_b / o_a take the dense kernel only from this many rows per call (STRIX_DS41_PREFILL_DENSE_MIN_ROWS, default 256:
     // the selector's per-site forms start there; smaller chunks, cone tails and extends stay on the batch kernel)
-    std::uint32_t dense_min_rows = 256;
+    std::uint32_t dense_min_rows = ds41::dense_geometry::kPolicy.dense_min_rows;
 #ifdef STRIX_DS41_PREFILL_FP16_LT
     ds41::DenseFp16Cache dense_fp16;
 #endif
@@ -826,7 +827,7 @@ struct DevicePrefill::Impl {
         if (v = std::getenv("STRIX_DS41_PREFILL_JOINT_MAX_ROWS"); v != nullptr && *v != 0)
             joint_max_rows = static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10));
         dense_q_a = true, dense_kv = true, dense_q_b = false, dense_o_a = false;  // the member defaults
-        dense_min_rows = 256;
+        dense_min_rows = ds41::dense_geometry::kPolicy.dense_min_rows;
         if (v = std::getenv("STRIX_DS41_PREFILL_DENSE_SITES"); v != nullptr) {
             const std::string list = std::string(",") + v + ",";
             dense_q_a = list.find(",q_a,") != std::string::npos;
@@ -3513,7 +3514,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 // then down on the same core into this rank's shared rows. Below the FAST dense row floor, or for a view the
                 // core does not take, the exact expert kernels below (the whole expert in one form).
                 if (m.options.fast_shared && no >= m.fast_shared_min_rows) {
-                    constexpr std::uint32_t kSharedFastRows = 2048U;
+                    constexpr std::uint32_t kSharedFastRows = ds41::dense_geometry::kPolicy.shared_fast_rows;
                     const std::uint32_t pass = std::min(no, kSharedFastRows);
                     const auto product = [&](const std::uint8_t* weight, std::uint32_t width, std::uint32_t count, const std::int8_t* codes,
                                              const float* deltas, float* out, std::uint32_t rows) {

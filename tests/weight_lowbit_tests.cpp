@@ -1,12 +1,17 @@
 // Low-bit resident row storage (strix/weight/host_lowbit.hpp): the host encoder, the loader that produces it from BF16
-// rows (whole and partial reads), and the device chunk decoder of the dense rows family (core/weight_decode.hpp,
-// host build) agree element by element; hand-written bytes decode to their specified codes; ties round to even with
+// rows (whole and partial reads) and the incumbent sweep decoder agree; hand-written bytes
+// decode to their specified codes, and ties round to even with
 // fixed bytes in any rounding mode; a scale beyond FP16 is refused; the chosen scale never reconstructs worse than the
 // unclipped scale; the Q8_0 loader is unchanged by the shared block source.
 #include "core/iu4_onfly.hpp"
+#include "core/lowbit_f16_staging.hpp"
+#include "inkling2/inkling2_mini_dense_hip.hpp"
+#include "core/resident_row_plan.hpp"
 #include "core/weight_decode.hpp"
 #include "strix/weight/host_lowbit.hpp"
 #include "strix/weight/host_q8.hpp"
+#include "strix/weight/levers.hpp"
+#include "strix/device/declaration.hpp"
 
 #include <algorithm>
 #include <array>
@@ -18,6 +23,7 @@
 #include <random>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -100,7 +106,7 @@ void check_format(const char* name) {
                 const auto* block = row + (col / 128U) * Storage::bytes;
                 const float ref = wei::lowbit::decode<Storage>(block, col % 128U);
                 const float dev = chunk.at(e);
-                check(std::memcmp(&ref, &dev, 4) == 0, "chunk decode == reference decode");
+                check(std::memcmp(&ref, &dev, sizeof(ref)) == 0, "chunk decode == reference decode");
             }
         }
         for (unsigned g = 0; g < k / 64U; ++g) {
@@ -163,6 +169,301 @@ void check_q8_unchanged() {
     std::vector<std::byte> part(50);
     check(bool(packed.source->read({17, 50}, part)), "q8 partial read");
     check(std::memcmp(part.data(), expected.data() + 17, 50) == 0, "q8 partial bytes unchanged");
+}
+
+// Route plan of low-bit launches (core/resident_row_plan.hpp): device data, a function of the row count (and of the
+// panels for the small block); one arithmetic identity per storage for both routes (the
+// device fixture tests/hip_dense_lowbit_bench.hip checks that the routes give the same bits).
+void check_lowbit_plan() {
+    namespace co = strix::core;
+    {
+        // The route plan is data of the device's declaration (strix/device/declaration.hpp `lowbit_rows`), never a
+        // constant of the core header and never a compiled catalogue row: two declarations of the same device (one
+        // arch, one profile, one identity) carry their own switch points, a declaration without the key runs one
+        // route at every row count, and the plan a launch reads is the one bound to its device ordinal.
+        const auto plan_of = [](const std::string& extra) {
+            const auto d = strix::device::parse_declaration(
+                "schema = \"strix-devices-v1\"\n[devices.igpu]\nvendor = \"amd\"\narch = \"gfx1151\"\n"
+                "pci = \"0000:c5:00.0\"\nprofile = \"strix-halo-128\"\n" + extra);
+            const auto& rows = d.devices.at(0).lowbit_rows;
+            return co::LowBitRowPlan{rows.small_rows, rows.wide_panels};
+        };
+        const auto measured = plan_of("lowbit_rows = { small_rows = 64, wide_panels = 64 }\n");
+        const auto other = plan_of("lowbit_rows = { small_rows = 32, wide_panels = 8 }\n");
+        const auto absent = plan_of("");
+        check(measured.small_rows == 64U && measured.wide_panels == 64U && other.small_rows == 32U &&
+                  other.wide_panels == 8U,
+              "plan: two declarations of one device key keep their own switch points");
+        check(co::plan_lowbit_rows(48U, measured) == co::LowBitRoute::small_tile &&
+                  co::plan_lowbit_rows(48U, other) == co::LowBitRoute::tile && co::lowbit_wide_block(17U, 8U, other) &&
+                  !co::lowbit_wide_block(17U, 8U, measured),
+              "plan: each declaration's switch points decide its own routes");
+        for (unsigned rows = 1U; rows <= 64U; ++rows)
+            check(co::plan_lowbit_rows(rows, measured) == co::LowBitRoute::small_tile, "plan: declared rows <= 64 run small");
+        for (const unsigned rows : {65U, 128U, 512U, 65535U * 128U})
+            check(co::plan_lowbit_rows(rows, measured) == co::LowBitRoute::tile, "plan: declared wider windows run the tile");
+        check(!co::lowbit_wide_block(16U, 96U, measured) && co::lowbit_wide_block(17U, 64U, measured) &&
+                  co::lowbit_wide_block(32U, 96U, measured) && !co::lowbit_wide_block(17U, 63U, measured) &&
+                  !co::lowbit_wide_block(33U, 96U, measured),
+              "plan: declared 32-row blocks only for 17..32 rows of >= 64 panels");
+        for (const auto& one_route : {absent, co::LowBitRowPlan{}}) {
+            for (const unsigned rows : {1U, 16U, 17U, 32U, 64U, 65U, 512U})
+                check(co::plan_lowbit_rows(rows, one_route) == co::LowBitRoute::tile, "plan: no declared row = one route");
+            check(!co::lowbit_wide_block(24U, 1000U, one_route), "plan: no declared row keeps 16-row blocks");
+        }
+        // Binding (the device gate binds the declared points with the device): per device ordinal, unbound = one
+        // route, out-of-range ordinals bind nothing; the launchers read the bound points.
+        namespace dv = strix::device;
+        const dv::LowBitRows declared{measured.small_rows, measured.wide_panels};
+        check(co::bound_lowbit_row_plan(3).small_rows == 0U && dv::bind_lowbit_rows(3, declared) &&
+                  co::bound_lowbit_row_plan(3).small_rows == 64U && co::bound_lowbit_row_plan(3).wide_panels == 64U &&
+                  co::bound_lowbit_row_plan(4).small_rows == 0U && dv::bind_lowbit_rows(3, {}) &&
+                  co::bound_lowbit_row_plan(3).small_rows == 0U && !dv::bind_lowbit_rows(-1, declared) &&
+                  !dv::bind_lowbit_rows(dv::kLowBitRowSlots, declared) &&
+                  co::bound_lowbit_row_plan(dv::kLowBitRowSlots).small_rows == 0U,
+              "plan: bound per device ordinal, unbound and out-of-range = one route");
+    }
+    const auto& ids = co::kResidentLowBitTileArithmeticHip;
+    check(ids.size() == 2U && ids[0].name != ids[1].name && ids[0].revision && ids[1].revision,
+          "plan: one arithmetic identity per low-bit storage");
+}
+
+// Byte ranges of resident launches (core/resident_row_plan.hpp): a projection never writes its input, and a grouped
+// list never writes one byte twice, whatever the storages; a refused list calls no backend (nothing is written).
+void check_resident_ranges() {
+    namespace co = strix::core;
+    namespace w = strix::weight;
+    constexpr unsigned width = 128U, outputs = 64U, rows = 2U;
+    constexpr std::size_t q4_row = w::Q4G64Storage::row_bytes(width), q8_row = w::Q8Storage::row_bytes(width);
+    alignas(16) static std::uint8_t weights_a[outputs * q4_row]{};
+    alignas(16) static std::uint8_t weights_b[outputs * q4_row]{};
+    alignas(16) static std::uint8_t weights_q8[outputs * q8_row]{};
+    alignas(16) static float arena[rows * width + 4U * rows * outputs + 64U]{};
+    const auto view = [](std::span<const std::uint8_t> bytes, w::FormatId storage, std::uint64_t row_bytes) {
+        return w::ResidentMatrixView{bytes, storage, outputs, width, row_bytes};
+    };
+    const auto a = view(weights_a, w::kQ4G64WeightStorage, q4_row);
+    const auto b = view(weights_b, w::kQ4G64WeightStorage, q4_row);
+    const auto q8 = view(weights_q8, w::kQ8WeightStorage, q8_row);
+    const float* input = arena;
+    float* out0 = arena + rows * width;
+    float* out1 = out0 + rows * outputs;  // adjacent: disjoint
+    check(co::valid_resident_lowbit_rows(a, outputs, input, rows, out0) &&
+              co::valid_resident_q8_rows(q8, outputs, input, rows, out0),
+          "ranges: tight output after the input is valid");
+    // An aligned partial overlap of the output with the input (output = input + 4 floats), and the input itself.
+    float* inside = arena + 4;
+    check(!co::valid_resident_lowbit_rows(a, outputs, input, rows, inside) &&
+              !co::valid_resident_q8_rows(q8, outputs, input, rows, inside) &&
+              !co::valid_resident_lowbit_rows(a, outputs, input, rows, arena),
+          "ranges: an output overlapping the input is refused (low-bit and Q8_0)");
+    // An output ending exactly where the input starts is disjoint.
+    check(co::valid_resident_lowbit_rows(a, outputs, arena + outputs + 16U, 1U, arena + 16U),
+          "ranges: output ending at the input is valid");
+    using P = co::ResidentRowProjection;
+    const std::array<P, 2> same{{{a, outputs, out0}, {b, outputs, out0}}};
+    const std::array<P, 2> same_reversed{{{b, outputs, out0}, {a, outputs, out0}}};
+    const std::array<P, 2> partial{{{a, outputs, out0}, {q8, outputs, out0 + 4}}};
+    const std::array<P, 2> adjacent{{{a, outputs, out0}, {b, outputs, out1}}};
+    check(!co::resident_list_ranges_disjoint(input, width, rows, same) &&
+              !co::resident_list_ranges_disjoint(input, width, rows, same_reversed),
+          "ranges: two projections into one destination are refused (both orders)");
+    check(!co::resident_list_ranges_disjoint(input, width, rows, partial),
+          "ranges: a partial overlap across storages is refused");
+    check(co::resident_list_ranges_disjoint(input, width, rows, adjacent), "ranges: adjacent outputs are valid");
+    const std::array<P, 2> into_input{{{a, outputs, out0}, {b, outputs, inside}}};
+    check(!co::resident_list_ranges_disjoint(input, width, rows, into_input),
+          "ranges: a list output over the input is refused");
+    // An output over weights the list reads (1 row, K = 128, two Q4 projections of 64 outputs, aligned independent
+    // input, disjoint destinations otherwise): A writes from the first byte of B's weights; also over its own weights
+    // and over a Q8_0 run's weights, in both orders. The standalone validators refuse it too.
+    {
+        alignas(16) static std::uint8_t shared[outputs * q4_row + outputs * sizeof(float)]{};
+        const auto b_alias = view(std::span<const std::uint8_t>(shared, outputs * q4_row), w::kQ4G64WeightStorage, q4_row);
+        float* over_b = reinterpret_cast<float*>(shared);
+        float* over_q8 = reinterpret_cast<float*>(weights_q8 + 16);
+        for (const auto& list : {std::array<P, 2>{{{a, outputs, over_b}, {b_alias, outputs, out1}}},
+                                 std::array<P, 2>{{{b_alias, outputs, out1}, {a, outputs, over_b}}},
+                                 std::array<P, 2>{{{a, outputs, over_q8}, {q8, outputs, out1}}},
+                                 std::array<P, 2>{{{q8, outputs, out1}, {a, outputs, over_q8}}}})
+            check(!co::resident_list_ranges_disjoint(input, 1U, 1U, list) &&
+                      !co::resident_list_ranges_disjoint(input, width, 1U, list),
+                  "ranges: an output over weights another projection reads is refused (both orders)");
+        check(!co::valid_resident_lowbit_rows(b_alias, outputs, input, 1U, over_b) &&
+                  !co::valid_resident_q8_rows(q8, outputs, input, 1U, over_q8),
+              "ranges: a standalone output over its own weights is refused");
+        static const std::uint16_t bf16_w[outputs * width]{};
+        float* over_bf16 = const_cast<float*>(reinterpret_cast<const float*>(bf16_w + 8));
+        const std::array<P, 2> on_bf16{{{bf16_w, outputs, out1}, {a, outputs, over_bf16}}};
+        check(!co::resident_list_ranges_disjoint(input, width, 1U, on_bf16),
+              "ranges: an output over a BF16 run's weights is refused");
+    }
+    // The mixed BF16 / compact dispatcher refuses an overlapping list before any run is dispatched.
+    static const std::uint16_t bf16_bits[outputs * width]{};
+    const auto run = [](unsigned& calls) { return [&calls](auto) { ++calls; return 0; }; };
+    const auto admit = [](auto) { return true; };
+    for (const auto& list : {std::array<P, 2>{{{bf16_bits, outputs, out0}, {a, outputs, out0 + 8}}},
+                             std::array<P, 2>{{{a, outputs, out0 + 8}, {bf16_bits, outputs, out0}}}}) {
+        unsigned calls = 0;
+        const int status = co::dispatch_resident_rows<4>(input, width, rows, std::span<const P>(list), 0, 1,
+                                                         run(calls), run(calls), admit, admit);
+        check(status == 1 && calls == 0U, "ranges: an overlapping mixed list dispatches nothing");
+    }
+    unsigned calls = 0;
+    const std::array<P, 2> mixed{{{bf16_bits, outputs, out0}, {a, outputs, out1}}};
+    check(co::dispatch_resident_rows<4>(input, width, rows, std::span<const P>(mixed), 0, 1, run(calls), run(calls), admit, admit) == 0 &&
+              calls == 2U,
+          "ranges: a disjoint mixed list dispatches both runs");
+    // A valid BF16 run followed by a compact run the backend refuses (a Q4 view with a wrong row pitch): the whole
+    // list is refused before the BF16 run is submitted.
+    auto bad_pitch = a;
+    bad_pitch.row_bytes += 16U;
+    const auto backend_admits = [](std::span<const P> compact_run) {
+        for (const auto& p : compact_run) {
+            const auto& m = std::get<w::ResidentMatrixView>(p.weights);
+            if (!co::valid_resident_lowbit_rows(m, p.outputs, arena, rows, p.output)) return false;
+        }
+        return true;
+    };
+    for (const auto& list : {std::array<P, 2>{{{bf16_bits, outputs, out0}, {bad_pitch, outputs, out1}}},
+                             std::array<P, 2>{{{bad_pitch, outputs, out1}, {bf16_bits, outputs, out0}}}}) {
+        unsigned refused_calls = 0;
+        const int status = co::dispatch_resident_rows<4>(input, width, rows, std::span<const P>(list), 0, 1,
+                                                         run(refused_calls), run(refused_calls), admit, backend_admits);
+        check(status == 1 && refused_calls == 0U, "ranges: a malformed compact run after a BF16 run dispatches nothing");
+    }
+}
+
+void check_bf16_preflight() {
+    namespace co = strix::core;
+    namespace w = strix::weight;
+    using P = co::ResidentRowProjection;
+    constexpr unsigned width = 128U;
+    constexpr unsigned too_wide = strix::inkling2::kVocabulary + 1U;
+    alignas(16) static const float input[width]{};
+    alignas(16) static const std::uint8_t compact_bytes[w::Q4G64Storage::row_bytes(width)]{};
+    alignas(16) static const std::uint16_t bf16_weights[std::size_t{too_wide} * width]{};
+    static float compact_output;
+    static std::array<float, too_wide> bf16_output;
+    const w::ResidentMatrixView matrix{compact_bytes, w::kQ4G64WeightStorage, 1U, width, sizeof(compact_bytes)};
+    const P compact{matrix, 1U, &compact_output};
+
+    for (bool malformed : {false, true}) {
+        const P bf16{bf16_weights, malformed ? too_wide : 1U, bf16_output.data()};
+        for (const auto& list : {std::array{compact, bf16}, std::array{bf16, compact}}) {
+            compact_output = -1.0F;
+            bf16_output.fill(-1.0F);
+            const auto bf16_admitted = [](std::span<const co::Bf16RowProjection> run) {
+                return strix::inkling2::mini_hip_dense_rows_admitted(input, width, 1U, run);
+            };
+            const int status = co::dispatch_resident_rows<2>(input, width, 1U, list, 0, 1,
+                [&](std::span<const co::Bf16RowProjection> run) {
+                    if (!bf16_admitted(run)) return 1;  // Same rejection as the HIP launcher.
+                    run.front().output[0] = 0.0F;
+                    return 0;
+                },
+                [](std::span<const P> run) { run.front().output[0] = 0.0F; return 0; },
+                bf16_admitted,
+                [](std::span<const P> run) {
+                    return co::valid_resident_lowbit_rows(std::get<w::ResidentMatrixView>(run.front().weights),
+                        run.front().outputs, input, 1U, run.front().output, co::LowBitArithmetic::f16_group_scale);
+                });
+            if (malformed)
+                check(status == 1 && compact_output == -1.0F &&
+                          std::ranges::all_of(bf16_output, [](float value) { return value == -1.0F; }),
+                      "malformed BF16 run leaves both destinations untouched");
+            else
+                check(status == 0 && compact_output == 0.0F && bf16_output.front() == 0.0F,
+                      "valid mixed list submits both runs");
+        }
+    }
+
+    alignas(16) std::array<float, 17U * width> wide_input{};
+    std::array<float, 17U> wide_output{};
+    check(!co::valid_resident_lowbit_rows(matrix, 1U, wide_input.data(), 17U, wide_output.data()) &&
+              co::valid_resident_lowbit_rows(matrix, 1U, wide_input.data(), 17U, wide_output.data(),
+                                             co::LowBitArithmetic::f16_group_scale),
+          "wide low-bit rows require the explicit FP16 form");
+}
+
+void check_group_accumulator() {
+    using Fragment = std::array<float, 8>;
+    struct Unit {
+        Fragment operator()(Fragment a, Fragment b, Fragment sum) const {
+            for (std::size_t lane = 0; lane < sum.size(); ++lane)
+                sum[lane] = std::fma(a[lane], b[lane], sum[lane]);
+            return sum;
+        }
+    };
+    using Group = strix::core::lowbit_f16::GroupAccumulator<Fragment, Unit>;
+    Fragment acc{};
+    Fragment left{}, right{};
+    left.fill(1.0F);
+    const auto add = [&](Group& group, float unit) {
+        right.fill(unit);
+        group.add(left, right);
+    };
+    Group first{};
+    for (float unit : {0x1p25F, 1.0F, -0x1p25F, 3.0F}) add(first, unit);
+    first.apply(2.0F, acc);
+    check(acc == Fragment{6, 6, 6, 6, 6, 6, 6, 6}, "K16 units accumulate in insertion order before scaling");
+    Group next{};
+    add(next, 2.0F);
+    next.apply(-3.0F, acc);
+    check(acc == Fragment{}, "each group starts from zero and scales once into the previous sum");
+    add(next, -1.0F + 0x1p-23F);
+    acc.fill(-1.0F);
+    next.apply(1.0F - 0x1p-23F, acc);
+    check(std::ranges::all_of(acc, [](float value) { return value == -0x1p-46F; }),
+          "group scale uses a fused add on every lane");
+}
+
+// The resolver admits a per-role mix when the consumer supports each compact format.
+void check_lowbit_policies() {
+    const wei::WeightLoadScope scope{};
+    constexpr std::array all{wei::kBf16WeightStorage, wei::kQ8WeightStorage, wei::kQ4G64WeightStorage,
+                             wei::kQ6G64WeightStorage};
+    constexpr std::array no_q6{wei::kBf16WeightStorage, wei::kQ8WeightStorage, wei::kQ4G64WeightStorage};
+    const auto resolve = [&](const wei::WeightLoadPolicy& policy, strix::profile::Name tier,
+                             std::span<const wei::FormatId> consumers) {
+        return wei::resolve_weight_load(wei::builtin_registry(), policy, {tier, scope, consumers, true, true}, {});
+    };
+    const auto mix = resolve(wei::kAttentionQ4HeadQ6Policy, strix::profile::Name::fast, all);
+    check(mix.storage == wei::kQ4G64WeightStorage && mix.head_storage == wei::kQ6G64WeightStorage &&
+              mix.status == strix::profile::Status::unqualified, "mix resolves q4 attention + q6 head");
+    check(mix.storage_for(wei::Role::head) == wei::kQ6G64WeightStorage &&
+              mix.storage_for(wei::Role::attention_o) == wei::kQ4G64WeightStorage &&
+              mix.storage_for(std::nullopt) == wei::kBf16WeightStorage, "mix storage per role");
+    const auto missing = resolve(wei::kAttentionQ4HeadQ6Policy, strix::profile::Name::fast, no_q6);
+    check(missing.storage == wei::kBf16WeightStorage && missing.head_storage == wei::kBf16WeightStorage,
+          "mix without a q6 consumer stays BF16");
+    const auto turbo = resolve(wei::kAttentionHeadQ4Policy, strix::profile::Name::turbo, all);
+    check(turbo.storage == wei::kQ4G64WeightStorage && turbo.head_storage == wei::kQ4G64WeightStorage, "q4 turbo arm");
+    const auto exact = resolve(wei::kAttentionHeadQ6Policy, strix::profile::Name::standard, all);
+    check(exact.storage == wei::kBf16WeightStorage && exact.head_storage == wei::kBf16WeightStorage, "EXACT stays BF16");
+    const auto q8 = resolve(wei::kAttentionHeadQ8Policy, strix::profile::Name::fast, all);
+    check(q8.storage == wei::kQ8WeightStorage && q8.head_storage == wei::kQ8WeightStorage, "Q8_0 policy unchanged");
+    const auto bound = wei::with_legacy(wei::kAttentionQ4HeadQ6Policy, {"legacy-mix", 1});
+    check(bound.head_target() == wei::kQ6G64WeightStorage && bound.target == wei::kQ4G64WeightStorage,
+          "a legacy binding keeps the head format");
+    check(wei::find_weight_load_policy("weights.attention_q4_g64.head_q6_g64@1") == &wei::kAttentionQ4HeadQ6Policy,
+          "mix key finds its shared row");
+    // Head-only rows: every other tagged role stays BF16, the head takes the low-bit storage; EXACT stays BF16.
+    for (const auto* policy : {&wei::kHeadQ6Policy, &wei::kHeadQ4Policy}) {
+        const auto head = resolve(*policy, strix::profile::Name::fast, all);
+        check(head.storage == wei::kBf16WeightStorage && head.head_storage == policy->head_target() &&
+                  head.storage_for(wei::Role::head) == policy->head_target() &&
+                  head.storage_for(std::nullopt) == wei::kBf16WeightStorage,
+              "head-only row: low-bit head, BF16 elsewhere");
+        const auto off = resolve(*policy, strix::profile::Name::fast, no_q6);
+        check(policy == &wei::kHeadQ4Policy || off.head_storage == wei::kBf16WeightStorage,
+              "head-only q6 row needs a q6 consumer");
+        const auto standard = resolve(*policy, strix::profile::Name::standard, all);
+        check(standard.head_storage == wei::kBf16WeightStorage, "head-only row: EXACT stays BF16");
+    }
+    check(wei::find_weight_load_policy("weights.head.q4_g64@1") == &wei::kHeadQ4Policy &&
+              wei::find_weight_load_policy("weights.head.q6_g64@1") == &wei::kHeadQ6Policy,
+          "head-only keys find their shared rows");
 }
 
 
@@ -284,6 +585,11 @@ int main() {
     check_format<wei::Q4G64Storage, wd::Format::q4_g64>("q4_g64");
     check_format<wei::Q6G64Storage, wd::Format::q6_g64>("q6_g64");
     check_q8_unchanged();
+    check_lowbit_plan();
+    check_resident_ranges();
+    check_bf16_preflight();
+    check_group_accumulator();
+    check_lowbit_policies();
     check_layout_bytes<wei::Q4G64Storage, wd::Format::q4_g64>(
         "q4_g64", {{{0, 1, 1.0F}, {63, -8, -8.0F}, {64, 7, 14.0F}, {127, -1, -2.0F}}});
     check_layout_bytes<wei::Q6G64Storage, wd::Format::q6_g64>(
