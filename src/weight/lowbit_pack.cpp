@@ -67,8 +67,10 @@ std::string header_hex(const sp::Header& h) {
     return s;
 }
 
-// 32 lowercase hex digits -> a header: "" on success, otherwise the first violated rule.
-std::string parse_header(std::string_view s, sp::Header& out) {
+// 32 lowercase hex digits -> a header of the storage's bit width: "" on success, otherwise the first violated rule.
+// storage_bits 0 (a storage that carries no header) checks the header against its own width, so the storage rule
+// below names the defect.
+std::string parse_header(std::string_view s, unsigned storage_bits, sp::Header& out) {
     if (s.size() != 2U * sp::kHeaderBytes) return "bad header hex";
     std::uint8_t bytes[sp::kHeaderBytes];
     for (std::size_t i = 0; i < sp::kHeaderBytes; ++i) {
@@ -81,7 +83,7 @@ std::string parse_header(std::string_view s, sp::Header& out) {
         }
         bytes[i] = static_cast<std::uint8_t>(v);
     }
-    return sp::Header::read(bytes, out);
+    return sp::Header::read(bytes, storage_bits != 0U ? storage_bits : unsigned{bytes[1]}, out);
 }
 
 template <class T>
@@ -293,7 +295,7 @@ Status LowbitPack::open(const std::string& path, const Digest256& checkpoint, Lo
         e.storage = *storage;
         if (f.size() == 10U) {
             sp::Header tensor_header;
-            if (const auto why = parse_header(f[9], tensor_header); !why.empty())
+            if (const auto why = parse_header(f[9], e.storage == kSP4TWeightStorage ? 4U : 0U, tensor_header); !why.empty())
                 return fail(Error::malformed, e.tensor + ": Strix pack header: " + why);
             e.sp_header = tensor_header;
         }
