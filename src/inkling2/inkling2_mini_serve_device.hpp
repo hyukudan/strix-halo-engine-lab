@@ -46,6 +46,10 @@ inline MiniServeCohort make_mini_device_cohort(
 #if !defined(__HIPCC__)
     const auto programs = decoder->cohort_programs();
 #endif
+    // The projected-bias observation the server reports when it stops (the cohort owns the decoder until then).
+    std::function<std::uint64_t()> projected_bias_dispatches;
+    if (opt.attn_projected_bias)
+        projected_bias_dispatches = [observed = decoder.get()] { return observed->projected_attention_dispatches(); };
     auto cohort = std::make_unique<serve::FixedKvCohort<MiniResidentDecoder>>(std::move(decoder), opt.context, rows, lanes);
     std::cerr << "Inkling " << backend << " slots " << lanes << " context " << opt.context
               << " KV and history bytes per slot " << slot_bytes
@@ -62,7 +66,7 @@ inline MiniServeCohort make_mini_device_cohort(
 #endif
               << " weight_status " << profile::status_name(weights.status) << " (" << weights.reason << ")\n"
               << weight::weight_load_regime_receipt(weights) << '\n';
-    return {std::move(cohort), weights};
+    return {std::move(cohort), weights, std::move(projected_bias_dispatches)};
 }
 
 } // namespace strix::inkling2

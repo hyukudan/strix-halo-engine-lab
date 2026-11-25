@@ -3,6 +3,7 @@
 #include "moe_core/grouped_w4a4.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
 
+#include <cstdint>
 #include <string>
 
 namespace strix::inkling2 {
@@ -95,6 +96,13 @@ inline bool mini_attn_projected_bias(const profile::Resolution& tier) {
     if (entry == nullptr || entry->value == "0") return false;
     if (entry->value == "1") return true;
     throw std::invalid_argument("STRIX_INK_ATTN_PROJECTED_BIAS must be 0 or 1");
+}
+
+// The observed route of the projected-bias lever, one line for both entry points (with the lever selected): the
+// projected-bias appends the decoder submitted so far (0: every prompt chunk took the image route, whose bits are
+// equal). The command line prints it after each prefill, the server once when it stops.
+inline std::string mini_projected_bias_dispatches_line(std::uint64_t dispatches) {
+    return "Inkling attn_projected_bias dispatches " + std::to_string(dispatches);
 }
 
 // Resolved state of the served route lever (true: a HIP server runs the command line's route, kMiniServedCliRoute).

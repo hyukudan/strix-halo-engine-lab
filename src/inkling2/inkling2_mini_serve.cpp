@@ -131,6 +131,11 @@ public:
     void handle(const serve::HttpRequest& request, serve::HttpResponseWriter& writer) override {
         api_.handle(request, writer);
     }
+    // The command line's projected-bias observation, once the owner has stopped: what the served requests submitted.
+    void stopped() override {
+        if (device_.projected_bias_dispatches)
+            std::cerr << mini_projected_bias_dispatches_line(device_.projected_bias_dispatches()) << std::endl;
+    }
 
 private:
     serve::ApiConfig api_config(const std::string& model, const MiniServeOptions& opt, MiniChat chat) {

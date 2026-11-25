@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <functional>
 #include <future>
 #include <initializer_list>
 #include <iostream>
@@ -374,7 +375,7 @@ void profile_parity() {
     const auto create = [&](const mini::MiniServeOptions& options) {
         loaded = options;
         return mini::MiniServeCohort{
-            std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(), 32U, 3U, 2U), {}};
+            std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(), 32U, 3U, 2U), {}, {}};
     };
     sv::ServiceFactories factories;
     mini::install_mini_service(factories, {create, create},
@@ -446,6 +447,9 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             bool projected_bias = false) {
     sv::ServiceFactories factories;
     bool created = false;
+    // The fixture's projected-bias submissions: set only once the served requests have run, so a report taken before
+    // the server stops reads 0.
+    std::uint64_t served_dispatches = 0;
     const auto create = [&](const mini::MiniServeOptions& options) {
         require(options.checkpoint == "MODEL.safetensors", "checkpoint did not reach native adapter");
         // The served prefill runs the operand class the profile resolved, never a class-less on/off.
@@ -532,8 +536,12 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope,
                                                                        {options.context, options.slots});
         created = true;
+        // As the native cohort: an observer of the decoder's projected-bias submissions only with the lever selected.
+        std::function<std::uint64_t()> observed;
+        if (options.attn_projected_bias) observed = [&served_dispatches] { return served_dispatches; };
         return mini::MiniServeCohort{
-            std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable), 32U, 3U, 2U), weights};
+            std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable), 32U, 3U, 2U), weights,
+            std::move(observed)};
     };
     mini::MiniServeBackends backends;
     if (std::string_view(backend) == "hip") backends.hip = create;
@@ -632,8 +640,8 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                      "--block-drafter value was not refused with its reason before native load");
     }
     sv::ServeShell shell;
-    shell.serve = [qualify_q8, sample_capable, tier_name, cli_route, backend](const sv::HttpServerConfig&, sv::HttpHandler handle,
-                                                                          sv::SessionRuntime& owner) {
+    shell.serve = [qualify_q8, sample_capable, tier_name, cli_route, backend, &served_dispatches](
+                      const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
         std::exception_ptr failure;
         std::thread control([&] { try { owner.run(); } catch (...) { failure = std::current_exception(); } });
         try {
@@ -689,6 +697,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             handle(req, streaming);
             require(streaming.status == 200 && streaming.ended && streaming.body.find("data: [DONE]") != std::string::npos,
                     "shared SSE did not complete");
+            served_dispatches = 5U;
         } catch (...) {
             owner.shutdown();
             control.join();
@@ -698,10 +707,27 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         control.join();
         if (failure) std::rethrow_exception(failure);
     };
-    std::ostringstream out, error;
-    const auto rc = run(shell, out, error);
+    std::ostringstream out, error, report;
+    auto* const console = std::cerr.rdbuf(report.rdbuf());
+    int rc = 1;
+    try {
+        rc = run(shell, out, error);
+    } catch (...) {
+        std::cerr.rdbuf(console);
+        throw;
+    }
+    std::cerr.rdbuf(console);
     if (rc != 0) throw std::runtime_error(error.str());
     require(created, "selected backend was not constructed");
+    // With the lever selected the server reports the command line's projected-bias line once, when it stops (after the
+    // served requests: 5 here, never the 0 of startup); without it, no such line.
+    const auto line = mini::mini_projected_bias_dispatches_line(5U) + '\n';
+    const auto text = report.str();
+    const auto first = text.find("Inkling attn_projected_bias dispatches");
+    require(projected_bias ? first != std::string::npos && text.compare(first, line.size(), line) == 0 &&
+                                 text.find("Inkling attn_projected_bias dispatches", first + 1U) == std::string::npos
+                           : first == std::string::npos,
+            "the served projected-bias observation differs from the lever state");
     // The socket startup re-creates the service with its own arguments (default shape).
     if (!qualify_q8 && !shape.prefill_rows && !shape.context && !shape.slots && tier_name == "fast" &&
         (std::string_view(backend) == "hip" || sample_capable)) {

@@ -6,6 +6,7 @@
 #include "strix/serve/cohort_decode.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -79,6 +80,9 @@ inline const char* mini_round_fold_startup_field(const MiniServeOptions& opt, co
 struct MiniServeCohort {
     std::unique_ptr<serve::CohortBackend> backend;
     weight::WeightLoadPlan weights;
+    // With the projected-bias lever selected: the decoder's projected-bias submissions so far (the counter the command
+    // line reports), read once when the server stops (mini_projected_bias_dispatches_line). Empty: lever off.
+    std::function<std::uint64_t()> projected_bias_dispatches;
 };
 
 MiniServeCohort make_mini_hip_cohort(const MiniServeOptions&);
