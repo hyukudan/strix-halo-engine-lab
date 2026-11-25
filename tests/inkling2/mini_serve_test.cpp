@@ -84,6 +84,29 @@ void admission() {
     require(sv::resident_kv_slots(300, 1000, 699, 0, 100, 5) == 0, "resident allocations exceed declaration");
     require(sv::resident_kv_slots(300, 1000, 0, 99, 100, 5) == 0, "explicit budget includes initial slot");
     require(sv::resident_kv_slots(0, 100, 0, 0, 100, 5) == 1, "initial slot already resident");
+    // The screened-head lever's plane (CUDA) never costs a KV slot: with it 300 free of 1000 -> 3 slots of 100 bytes.
+    {
+        struct PlaneDecoder {
+            std::uint64_t plane = 0;
+            int releases = 0;
+            [[nodiscard]] std::uint64_t slot_bytes() const { return 100U; }
+            [[nodiscard]] std::uint64_t screen_device_bytes() const { return plane; }
+            void release_screen() { ++releases; plane = 0U; }
+        };
+        PlaneDecoder costly{50U};  // without it 350 free -> 4 slots
+        require(mini::mini_serve_kv_slots(costly, 300, 1000, 0, 0, 5) == 4U && costly.releases == 1,
+                "a screened plane that costs a KV slot is released before the slots are committed");
+        PlaneDecoder cheap{10U};  // without it 310 free -> 3 slots
+        require(mini::mini_serve_kv_slots(cheap, 300, 1000, 0, 0, 5) == 3U && cheap.releases == 0,
+                "a screened plane that costs no KV slot stays");
+        PlaneDecoder none{};  // lever off, or HIP's own binding: the incumbent budget, nothing released
+        require(mini::mini_serve_kv_slots(none, 300, 1000, 0, 0, 5) == sv::resident_kv_slots(300, 1000, 0, 0, 100, 5) &&
+                    none.releases == 0,
+                "without the lever's plane the served slot budget is the incumbent one");
+        PlaneDecoder declared{100U};  // declared device cap 800: 1 slot with the plane, 2 without
+        require(mini::mini_serve_kv_slots(declared, 300, 1000, 800, 0, 5) == 2U && declared.releases == 1,
+                "a declared device budget counts the plane too");
+    }
     const auto slots = sv::fixed_kv_slots(250, 100, 3);
     require(slots == 2, "KV budget holds two lanes");
     auto device = std::make_unique<FixtureDecoder>();
@@ -444,7 +467,7 @@ strix::profile::Name served_native_tier(std::string_view tier_name) {
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
             W4a4 w4a4 = W4a4::bf16, std::string_view tier_name = "fast", bool image = false, bool round_fold = false,
             bool cli_route = false, ServedShape shape = {}, bool controller_one_plane = false,
-            bool projected_bias = false) {
+            bool projected_bias = false, bool screened_head = false) {
     sv::ServiceFactories factories;
     bool created = false;
     // The fixture's projected-bias submissions: set only once the served requests have run, so a report taken before
@@ -531,6 +554,8 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                 "served profile differs from the native command line's resolution of the same --profile");
         // The projected-bias attention lever resolves in the one shared resolver the CLI also reads.
         require(options.attn_projected_bias == projected_bias, "projected-bias lever did not reach native adapter");
+        // The screened-head lever resolves in the same shared resolver (CLI = server) on both backends.
+        require(options.screened_head == screened_head, "screened-head lever did not reach native adapter");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
         const strix::weight::WeightLoadScope scope{kind, {}, {}, {}, {}, {}};
         const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope,
@@ -810,6 +835,19 @@ int main(int argc, char** argv) try {
         }
     }
     set_env("STRIX_INK_ATTN_PROJECTED_BIAS", nullptr);
+    // The screened-head lever per backend and tier (opt-in): unset and 0 keep the full head, 1 selects the screened head;
+    // tests/inkling2/mini_gate_cli_test.cpp pins the same table through the CLI.
+    for (const auto* backend : {"cuda", "hip"}) {
+        for (const auto* tier : {"exact", "fast", "turbo"}) {
+            for (const auto& [value, expected] :
+                 {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
+                set_env("STRIX_INK_SCREENED_HEAD", value);
+                wiring(argv[1], backend, false, false, W4a4::bf16, tier, false, false, false, {}, false, false,
+                       expected);
+            }
+        }
+    }
+    set_env("STRIX_INK_SCREENED_HEAD", nullptr);
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

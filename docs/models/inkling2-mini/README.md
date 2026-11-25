@@ -123,6 +123,25 @@ An explicit `--prefill-chunk` is never changed, and `--prefill-chunk 2048`
 selects the smaller chunk up front. The CUDA server is not affected: it keeps
 its own 128-row prompt chunks (`--prefill-rows`).
 
+The greedy head stays the full head on CUDA in every profile. The exact switch
+`STRIX_INK_SCREENED_HEAD=1` (`inkling2-mini-screened-head@1`, off in every
+profile column, a distinct run identity when set) makes CUDA greedy picks that
+return no score row run the shared EXACT screened head
+(`cuda/core/head_screened.cuh`, an 8-bit plane of the BF16 head built at
+load): the same token and status as the full head. Steps that return or read
+scores (`--logits`, sampled lanes, verify rows, cohort programs) keep the
+full head; a sampled served lane reads the scores of its own step, projected
+on the first read. A compact head, a plane that cannot be built, or (served) a
+plane that would cost a KV slot keeps the full head. HIP keeps its own
+screened head (`STRIX_SCREENED_HEAD=0` turns it off) and ignores the switch.
+The command line, the gate and the server print `inkling2 head` with
+`screened lever`, `full lever-off`, `full build-refused`, `full kv-slot` or,
+on HIP, `screened hip-binding` / `full hip-binding`; the server's startup
+line carries the same `head` field. With the switch, the first screened pick
+prints `inkling2 head screened first pick`, the decoder prints `inkling2 head
+screened picks N` when it closes, and the CUDA step program's install line
+ends with `head=screened`.
+
 ## Execution and reuse
 
 | Stage | Shared component | Mini binding |

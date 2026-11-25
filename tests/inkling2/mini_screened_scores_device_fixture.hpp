@@ -87,12 +87,24 @@ inline void screened_scores(const char* checkpoint, weight::FormatId storage) {
     MiniResidentDecoder decoder(checkpoint, 128U, 64U, false, MiniResidentBackend::default_step_graphs, storage, 0U,
                                 false, lanes);
     decoder.allocate_slots(lanes);
+    // The screened-head lever selected, as configure_mini_decoder passes it: CUDA builds the screened head over the BF16
+    // head (a compact Q8_0 head keeps the full head); HIP keeps its own binding (BF16 head, unless STRIX_SCREENED_HEAD=0).
+    const auto head = decoder.set_screened_head(true);
+    const bool screening = head.screened;
 #if defined(__HIPCC__)
-    const bool screening = storage == weight::kBf16WeightStorage && core::hip_screened_head::enabled();
+    if (screening != (storage == weight::kBf16WeightStorage && core::hip_screened_head::enabled()))
+        throw std::logic_error("the HIP head is not its own binding's");
+    // Every lone lane steps through append (no cohort programs on HIP).
+    const auto screened_lane = [&](unsigned) { return screening; };
 #else
-    const bool screening = false;
+    if (screening != (storage == weight::kBf16WeightStorage))
+        throw std::logic_error("the CUDA screened-head lever did not select the screened head on the BF16 head");
+    // A lone lane on a slot other than 0 runs its width-1 cohort program (the full head) while cohort programs are on.
+    const auto screened_lane = [&](unsigned slot) {
+        return screening && (slot == 0U || decoder.cohort_programs().width(1U, lanes) == 0U);
+    };
 #endif
-    std::cout << "INFO screened head " << (screening ? "on" : "off") << '\n';
+    std::cout << "INFO screened head " << (screening ? "on" : "off") << " (head " << mini_head_field(head) << ")\n";
     std::vector<unsigned> prompt(kScreenPromptRows);
     for (std::size_t i = 0; i < prompt.size(); ++i)
         prompt[i] = 1000U + static_cast<unsigned>((i * 173U + i / 13U) % 20000U);
@@ -108,14 +120,21 @@ inline void screened_scores(const char* checkpoint, weight::FormatId storage) {
     }
 
     std::vector<float> scores(kOutputVocabulary);
-    // A: one sampled lane stepping alone from its first step.
+    // A: one sampled lane stepping alone from its first step. Its greedy picks are those of the full head (check_step)
+    // and, with the screened head, every one of them ran screened (the decoder's count of screened picks).
     (void)decoder.prefill_slot_first(0U, prompt, true);
+    const auto picks_before = decoder.screened_picks();
     for (unsigned step = 0; step < kScreenSteps; ++step) {
         const auto top = step_lane(decoder, 0U, reference.ids[step]);
         decoder.read_slot_logits(0U, scores);
         check_step("lone sampled lane", step, scores, top, reference);
     }
-    std::cout << "PASS Inkling Mini screened scores: lone sampled lane, " << kScreenSteps << " steps\n";
+    const auto screened_steps = decoder.screened_picks() - picks_before;
+    if (screened_steps != (screened_lane(0U) ? kScreenSteps : 0U))
+        throw std::logic_error("lone lane: " + std::to_string(screened_steps) + " of " + std::to_string(kScreenSteps) +
+                               " greedy picks ran screened with the screened head " + (screening ? "on" : "off"));
+    std::cout << "PASS Inkling Mini screened scores: lone sampled lane, " << kScreenSteps << " steps, screened picks "
+              << screened_steps << '\n';
 
     // B: a packed two-lane step, then lane 0 greedy alone (scores never read), then lane 1 sampled alone.
     (void)decoder.prefill_slot_first(0U, prompt, true);
@@ -135,9 +154,9 @@ inline void screened_scores(const char* checkpoint, weight::FormatId storage) {
         const unsigned sampled = 1U - greedy;
         if (step_lane(decoder, greedy, reference.ids[step]) != reference.top[step])
             throw std::runtime_error("greedy lane: step " + std::to_string(step) + " pick differs from the full head");
-        // A screened greedy pick projects no score row (the BF16 head screens unless STRIX_SCREENED_HEAD=0).
+        // A screened greedy pick projects no score row (screened_lane: the lanes the screened head picks).
         const auto deferred = scores_deferred(decoder);
-        if (deferred && *deferred != screening)
+        if (deferred && *deferred != screened_lane(greedy))
             throw std::logic_error(std::string("greedy lane: score row ") + (*deferred ? "deferred" : "projected") +
                                    " with the screened head " + (screening ? "on" : "off"));
         const auto top = step_lane(decoder, sampled, reference.ids[step]);

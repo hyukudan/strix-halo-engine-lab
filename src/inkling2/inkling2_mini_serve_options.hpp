@@ -4,6 +4,7 @@
 #include "inkling2_mini_schedule.hpp"
 #include "inkling2_mini_weight_options.hpp"
 #include "strix/serve/cohort_decode.hpp"
+#include "strix/serve/row_budget.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -47,7 +48,23 @@ struct MiniServeOptions {
     // Resolved projected-bias attention lever (mini_attn_projected_bias), the value the CLI and the gate read.
     bool attn_projected_bias = false;
     bool controller_one_plane = false;
+    // Resolved screened-head lever (mini_screened_head), the value the CLI and the gate read.
+    bool screened_head = false;
 };
+
+// Served KV slots of a resident decoder whose screened-head lever may have built a plane (screen_device_bytes; 0 on HIP,
+// whose own binding keeps its incumbent budget, and without the lever): the plane stays only when it costs no KV slot
+// (serve::resident_kv_slots_with_plane); otherwise the decoder releases it before the cohort commits its slots and its
+// head reports "full kv-slot". Same tokens either way.
+template <class Decoder>
+std::uint32_t mini_serve_kv_slots(Decoder& decoder, std::uint64_t free, std::uint64_t total, std::uint64_t device_limit,
+                                  std::uint64_t kv_limit, std::uint32_t rows) {
+    const auto plane = decoder.screen_device_bytes();
+    const auto plan = ::strix::serve::resident_kv_slots_with_plane(free, total, device_limit, kv_limit,
+                                                                  decoder.slot_bytes(), rows, plane);
+    if (plane != 0U && !plan.keep_plane) decoder.release_screen();
+    return plan.slots;
+}
 
 // Lanes per batched forward: --slots, else, on the incumbent served route, the context-clamped prompt chunk (the cap
 // it always had); on the admitted served route lever an explicit --prefill-rows (clamped) or kMiniServeLaneRows.

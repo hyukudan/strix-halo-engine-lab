@@ -88,7 +88,16 @@ inline constexpr std::string_view kMiniAttnProjectedBias = "inkling2-mini-attn-p
 inline constexpr std::string_view kMiniServedCliRoute = "inkling2-mini-served-cli-route@1";
 // Draft CUDA controller schedule. One plane requires explicit selection and a resident weight certificate.
 inline constexpr std::string_view kMiniControllerPlanes = "inkling2-mini-controller-planes@1";
-inline constexpr std::array<profile::Lever, 8> kMiniLevers{{
+// Exact lever (opt-in): CUDA greedy picks that return no score row run the shared EXACT screened head
+// (cuda/core/head_screened.cuh over the BF16 unembed.weight, 8-bit plane built at load): the token and status of the full
+// head by construction (rigorous bound, every possible argmax is rescored by the incumbent row body and picked by the
+// incumbent rule). Steps that return or read scores (host logits, sampled lanes, verify rows, cohort programs) keep the
+// full head; a plane that cannot be built, or (served) would cost a KV slot, keeps the full head. CUDA only: HIP keeps its
+// own binding (screened by default, STRIX_SCREENED_HEAD=0 = full head). Off in every tier (builtin "0": the full head);
+// an explicit 1 selects it and is a distinct identity until an RTX identity receipt makes it a default.
+// Switch: STRIX_INK_SCREENED_HEAD=0/1.
+inline constexpr std::string_view kMiniScreenedHead = "inkling2-mini-screened-head@1";
+inline constexpr std::array<profile::Lever, 9> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
@@ -123,6 +132,13 @@ inline constexpr std::array<profile::Lever, 8> kMiniLevers{{
      .runnable = {true, true, true, true}, .target = "", .off = "0",
      .source = "waits for the served migration identity (served lanes against the incumbent served route); device "
                "evidence so far: served cohort lanes == the same served decoder's lone lane at cohort widths 2..17",
+     .omit_builtin_fingerprint = true},
+    {.name = kMiniScreenedHead, .env = "STRIX_INK_SCREENED_HEAD", .option = "",
+     .value = {"", "", "", ""}, .builtin = "0",
+     .kind = profile::Kind::exact, .ready = {false, false, false, false},
+     .runnable = {true, true, true, true}, .target = "1", .off = "0",
+     .source = "awaits the RTX identity receipt on the landing head (greedy ids against the full head, CLI and served) "
+               "before any default",
      .omit_builtin_fingerprint = true},
     spec::kBlockDraftLever,
 }};
