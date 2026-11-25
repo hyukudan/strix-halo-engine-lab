@@ -224,12 +224,6 @@ inline constexpr std::array<profile::Lever, 16> kMiniLevers{{
      .ready = {}, .runnable = {false, false, false, true}, .target = "1", .off = "0",
      .source = "docs/engine/lowbit-calibration.md (calibrated HIP decode at widths 1, 8 and 16)",
      .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
-    {.name = kMiniLowBitHead, .env = "STRIX_INK_LOWBIT_HEAD", .option = "",
-     .value = {"", "", "", ""}, .builtin = "0", .kind = profile::Kind::bit_changing,
-     .ready = {}, .runnable = {false, true, false, true}, .target = "sp4t", .off = "0",
-     .source = "pending: SP4 fixed-table head (emulated gate v2 0/39 FAST); awaits the device gate v2 receipt and a "
-               "decision row; HIP command line only",
-     .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"sp4t", "sp4t-head-v1"}}}},
     {.name = kMiniVerifyRows, .env = "STRIX_INK_VERIFY_ROWS", .option = "",
      .value = {"", "", "", ""}, .builtin = "0",
      .kind = profile::Kind::exact, .ready = {}, .runnable = {true, true, true, true}, .target = "1", .off = "0",
@@ -245,6 +239,12 @@ inline constexpr std::array<profile::Lever, 16> kMiniLevers{{
     weight::kAttentionHeadSP4Lever,
     weight::kAttentionHeadSP3Lever,
     weight::kAttentionHeadSP2Lever,
+    {.name = kMiniLowBitHead, .env = "STRIX_INK_LOWBIT_HEAD", .option = "",
+     .value = {"", "", "", ""}, .builtin = "0", .kind = profile::Kind::bit_changing,
+     .ready = {}, .runnable = {false, true, false, true}, .target = "sp4t", .off = "0",
+     .source = "pending: SP4 fixed-table head (emulated gate v2 0/39 FAST); awaits the device gate v2 receipt and a "
+               "decision row; HIP command line only",
+     .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"sp4t", "sp4t-head-v1"}}}},
 }};
 
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.
