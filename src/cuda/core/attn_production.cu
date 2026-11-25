@@ -11,6 +11,7 @@
 
 #include "common.cuh"
 #include "attn_core/prepared_gqa_attention.hpp"
+#include "core/byte_range.hpp"
 #include "strix/cuda_core/attention_row_walk.hpp"
 #include "strix/cuda_core/attention_score_reduce.hpp"
 
@@ -819,12 +820,19 @@ cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const Prepare
                                            __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, std::uint32_t pos0,
                                            std::uint32_t rows, float* out, cudaStream_t stream,
                                            FlashPipe pipe, unsigned* failure) {
-    if (!can_launch_prepared_bf16_projected(d, prepared, projection, q, k_cache, v_cache, pos0, rows, out, pipe))
+    // Every refusal (admission, overlap, failure word, device opt-in) happens here, before the K/V write is enqueued; the
+    // flash then launches with the prepared specialization and shared memory, repeating no fallible setup.
+    PreparedProjectedLaunch launch;
+    if (auto refused = prepare_prepared_bf16_projected(d, prepared, projection, q, k_cache, v_cache, pos0, rows, out, pipe,
+                                                       failure, launch);
+        refused != cudaSuccess) return refused;
+    const std::size_t kv_bytes = std::size_t{rows} * d.kv_heads * d.head_dim * sizeof(float);  // bounded by the admission
+    if (!core::reads_disjoint_from_writes({{k, kv_bytes}, {v, kv_bytes}}, {{failure, sizeof(unsigned)}}))
         return cudaErrorInvalidValue;
     auto status = kv_store_prepared_bf16(d, k, v, k_cache, v_cache, pos0, rows, prepared.wrapped, stream);
     if (status != cudaSuccess) return status;
-    status = attention_prefill_prepared_bf16(d, prepared, projection, q, k_cache, v_cache, pos0, rows, out, stream, pipe,
-                                             failure);
+    status = launch_prepared_bf16_projected(launch, d, prepared, projection, q, k_cache, v_cache, pos0, rows, out, stream,
+                                            failure);
     if (status != cudaSuccess || !failure) return status;
     // The flash flagged the projected logits; the remaining operands are checked as on the image route.
     return attn_core::enqueue_validate_prepared_finite(

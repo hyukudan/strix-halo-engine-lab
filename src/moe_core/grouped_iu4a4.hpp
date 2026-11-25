@@ -17,9 +17,11 @@ namespace dense = strix::core::iu4a4_dense;
 // out + a * out_row (assignment order: the destination derives from the admitted base, pitch and assignment interval;
 // the tile's own output fields are not read). admit(t) is the bounds rule: the weights are an expert slot of the image
 // (base + e * stride, e < experts), the index row is a whole row of the base, the rows equal the index tile's, are at
-// most max_rows and stay inside index_rows. The validation launch applies it to every active tile before any compute
-// launch; bind(t) applies it again and binds no rows (stores nothing) where it fails. active(t) reads the pass verdict
-// word, which no launch of the compute phase writes, so every wave of a CTA sees one value.
+// most max_rows and stay inside index_rows. own(t) is the same rule on the tile's own input address and pitch (the
+// interval the planner gave that tile). The validation launch applies admit() to every active gate/up and down tile and
+// requires each down tile to name its gate/up tile's expert and, through own(), its assignment interval, before any
+// compute launch; bind(t) applies admit() again and binds no rows (stores nothing) where it fails. active(t) reads the
+// pass verdict word, which no launch of the compute phase writes, so every wave of a CTA sees one value.
 struct TileSource {
     const TileRows* tiles{};
     const TileRows* index_tiles{};
@@ -42,8 +44,9 @@ struct TileSource {
     __device__ __forceinline__ bool active(unsigned t) const {
         return (!verdict || *verdict == 0U) && (!tile_count || t < *tile_count);
     }
-    __device__ __forceinline__ Bound admit(unsigned t) const {
-        const TileRows tile = tiles[t], index = index_tiles[t];
+    __device__ __forceinline__ Bound admit(unsigned t) const { return admit_rows(tiles[t], index_tiles[t]); }
+    __device__ __forceinline__ Bound own(unsigned t) const { return admit_rows(tiles[t], tiles[t]); }
+    __device__ __forceinline__ Bound admit_rows(const TileRows tile, const TileRows index) const {
         const auto wa = reinterpret_cast<std::uintptr_t>(tile.weights.codes), wb = reinterpret_cast<std::uintptr_t>(codes_from);
         const auto ia = reinterpret_cast<std::uintptr_t>(index.input), ib = reinterpret_cast<std::uintptr_t>(index_base);
         const std::size_t e = wa >= wb ? (wa - wb) / codes_stride : ~std::size_t{0};
@@ -66,8 +69,9 @@ struct TileSource {
 namespace detail {
 // Validation launch of a pass (one CTA, stream-ordered before every compute launch; Pass::fault). A planner failure is
 // copied into the verdict word. Otherwise kFaultBounds is set when the device count is zero or past the plan's tiles,
-// an active gate/up or down tile fails admit(), the active tiles do not cover [0, assignments) exactly once (row sum
-// and pairwise disjoint intervals; admit() keeps each inside), or a map entry names a token past token_rows.
+// an active gate/up or down tile fails admit(), a down tile names another expert than its gate/up tile or (own(): its
+// own input address and pitch) another assignment interval, the active tiles do not cover [0, assignments) exactly once
+// (row sum and pairwise disjoint intervals; admit() keeps each inside), or a map entry names a token past token_rows.
 __global__ __launch_bounds__(1024) void validate_kernel(TileSource gate, TileSource down, const unsigned* failure,
                                                         unsigned tiles, unsigned assignments, unsigned token_rows, unsigned* verdict) {
     __shared__ unsigned s_first[kMaxPassTiles], s_rows[kMaxPassTiles];
@@ -84,8 +88,8 @@ __global__ __launch_bounds__(1024) void validate_kernel(TileSource gate, TileSou
     if (tid == 0U) s_bad = count == 0U || count > tiles ? 1U : 0U, s_sum = 0ULL;
     __syncthreads();
     for (unsigned t = tid; t < live; t += blockDim.x) {
-        const TileSource::Bound g = gate.admit(t), d = down.admit(t);
-        const bool ok = g.ok && d.ok;
+        const TileSource::Bound g = gate.admit(t), d = down.admit(t), o = down.own(t);
+        const bool ok = g.ok && d.ok && o.ok && d.expert == g.expert && o.first == g.first;
         if (!ok) atomicOr(&s_bad, 1U);
         s_first[t] = ok ? static_cast<unsigned>(g.first) : 0U;
         s_rows[t] = ok ? g.rows : 0U;
@@ -133,10 +137,10 @@ static_assert(kFaultBounds == dense::kBoundsFault, "one fault bit for the class 
 // The pass (see Pass) on stream s: five launches, each submitted only after the previous one was accepted. Refuses
 // (hipErrorInvalidValue, nothing enqueued) what refusal() names and grids the grouped launch cannot take. Order:
 // validation (verdict word, see Pass::fault), token image, gate/up (paired SwiGLU -> h), h image, down (-> y). The
-// compute launches only read the verdict; when it is set none of them stores (the h image included), so no row a
-// tile did not write is read.
+// compute launches only read the verdict; when it is set none of them stores (both activation images included), so a
+// refused pass leaves the workspace and the outputs as they were and no row a tile did not write is read.
 inline hipError_t launch(const Pass& p, hipStream_t s) {
-    static_assert(kMaxIntermediate == dense::detail::kCtaInputs, "the verdict-gated h image is the one-CTA-per-row form");
+    static_assert(kMaxRowInputs == dense::detail::kCtaInputs, "the verdict-gated images are the one-CTA-per-row form");
     const unsigned gate_width = 2U * p.intermediate;
     if (refusal(p) != nullptr || !dense::grouped_supported(p.hidden, gate_width, true, p.tiles, p.max_tile_rows) ||
         !dense::grouped_supported(p.intermediate, p.hidden, false, p.tiles, p.max_tile_rows))
@@ -164,7 +168,7 @@ inline hipError_t launch(const Pass& p, hipStream_t s) {
     STRIX_HIP_LAUNCH_GGL(Rdna3Layout, detail::validate_kernel, dim3(1), dim3(1024), 0, s, gate, down, p.failure, p.tiles,
                          p.assignments, p.rows, p.fault);
     if (const auto e = hipGetLastError(); e != hipSuccess) return e;
-    dense::enqueue_quantise_rows(p.tokens, p.hidden, tokens, s);
+    dense::enqueue_quantise_rows_gated(p.fault, p.tokens, p.hidden, tokens, s);
     if (const auto e = hipGetLastError(); e != hipSuccess) return e;
     dense::enqueue_grouped_gemm(gate, p.tiles, p.max_tile_rows, gate_width, tokens, s, SwigluOut{p.gate_cap, p.up_cap});
     if (const auto e = hipGetLastError(); e != hipSuccess) return e;

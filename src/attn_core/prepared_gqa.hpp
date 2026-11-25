@@ -560,9 +560,10 @@ typename Backend::Status enqueue_prepared_gqa_output(
     if constexpr (requires { linear.row_bytes; }) linear.row_bytes = output_row_bytes;
     else if (output_row_bytes != 0U) return Backend::invalid;
     bool rounded = false;  // folded: the projection stores each completed sum rounded
-    if constexpr (detail::PreparedGqaFoldsRounds<Backend> && requires { linear.round_bf16; }) {
+    if constexpr (detail::PreparedGqaFoldsRounds<Backend> && requires { linear.round_bf16; linear.round_separate; }) {
         rounded = detail::folds_rounds(backend) && backend.store_round(rows);
         linear.round_bf16 = rounded;
+        linear.round_separate = rounded;  // the store of the separate Bf16Round pass (core::RoundStore::separate)
     }
     const std::array projection{linear};
     if constexpr (detail::PreparedGqaGateImage<Backend, decltype(linear)>) {

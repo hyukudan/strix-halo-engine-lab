@@ -86,6 +86,17 @@ public:
         produce_checked(std::forward<Producer>(produce), device_reply_, "enqueue produced HIP greedy reply");
         submitted_rows_ = 1;
     }
+    // Rows 0..rows-1 picked by one device producer (e.g. the lanes form of the EXACT screened head): `produce`
+    // enqueues them with the device-visible replies of the first launch group (rows <= hip_greedy_rows_max), row r
+    // at replies[r]; token(r) then reads them after the same stream fence.
+    template <class Producer>
+    void enqueue_produced_rows(unsigned rows, Producer&& produce) {
+        submitted_rows_ = 0;
+        if (rows == 0U || rows > capacity_ || rows > hip_greedy_rows_max)
+            throw std::invalid_argument("invalid resident HIP greedy produced rows");
+        produce_checked(std::forward<Producer>(produce), device_reply_, "enqueue produced HIP greedy replies");
+        submitted_rows_ = rows;
+    }
 
     // A producer may return its launch status (cudaError_t / hipError_t): a rejected launch must not publish the
     // reply of an earlier submission, so the status is checked (throws) before the row is marked submitted.

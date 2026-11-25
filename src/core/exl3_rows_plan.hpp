@@ -64,14 +64,15 @@ Layout<MaxJobs> plan(const Matrix* jobs, unsigned count, unsigned rows, const Li
     unsigned blocks = 0, max_in = 0;
     for (unsigned i = 0; i < count; ++i) {
         const Matrix& w = jobs[i];
-        if (w.input % 128 || w.output % 128 || w.bits < 3 || w.bits > 8 || w.bits == 7)
+        if (w.input == 0 || w.output == 0 || w.input % 128 || w.output % 128 || w.bits < 3 || w.bits > 8 || w.bits == 7)
             throw std::invalid_argument("exl3 rows plan: input/output multiples of 128, bits 3, 4, 5, 6 or 8");
         JobLayout& j = p.job[i];
         j.splits = std::min(SplitRule::splits(w.input, w.output), w.input / 16);
+        if (j.splits == 0) throw std::invalid_argument("exl3 rows plan: split rule returned zero");
         j.cta_begin = p.ctas;
         j.block_begin = blocks;
         if (w.col_count != 0 || w.col_begin != 0) {
-            if (count != 1 || w.col_count == 0 || w.col_begin % 128 || w.col_count % 128 || w.col_begin + w.col_count > w.output)
+            if (count != 1 || w.col_count == 0 || w.col_begin % 128 || w.col_count % 128 || w.col_begin > w.output || w.col_count > w.output - w.col_begin)
                 throw std::invalid_argument("exl3 rows plan: column range needs one job and 128-aligned columns inside the output");
             p.col_begin = w.col_begin;
             p.col_count = w.col_count;

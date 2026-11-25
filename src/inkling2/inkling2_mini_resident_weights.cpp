@@ -1,7 +1,9 @@
 #include "inkling2_mini_resident_weights.hpp"
 #include "inkling2_mini_attention_prepare.hpp"
 
+#include <algorithm>
 #include <stdexcept>
+#include <string_view>
 
 namespace strix::inkling2 {
 namespace {
@@ -79,6 +81,34 @@ MiniResidentWeights MiniResidentWeights::bind(const MiniResidentWeightPlan& plan
         }
     }
     return bound;
+}
+
+void MiniResidentWeights::certify_attention(
+    const std::function<void(std::span<const std::uint16_t>, std::span<std::uint16_t>)>& read) {
+    if (compact()) return;
+    constexpr std::array roles{MiniAttentionProjection::query, MiniAttentionProjection::key,
+                               MiniAttentionProjection::value, MiniAttentionProjection::key_taps,
+                               MiniAttentionProjection::value_taps, MiniAttentionProjection::relative,
+                               MiniAttentionProjection::relative_bias, MiniAttentionProjection::sink,
+                               MiniAttentionProjection::output_gate, MiniAttentionProjection::output};
+    MiniAttentionCertificate certificate;
+    std::vector<std::uint16_t> host;
+    for (const auto& spec : mini_text_tensor_schema()) {
+        const std::string_view name(spec.name);
+        if (!spec.resident || name.find(".layers.") == std::string_view::npos) continue;
+        // Every layer norm gain (attn_norm, q/k/v input norms, ...): a superset of the attention input gains.
+        const bool gain = name.ends_with("norm.weight");
+        const bool projection = std::ranges::any_of(roles, [&](MiniAttentionProjection role) {
+            return name.ends_with(mini_attention_projection_spec(role).tensor_suffix);
+        }) || name.ends_with("attn.k_sconv.weight") || name.ends_with("attn.v_sconv.weight");  // static channel taps
+        if (!gain && !projection) continue;
+        const auto staged = bf16(name.substr(kMiniTextTensorPrefix.size()));
+        host.resize(staged.size());
+        read(staged, host);
+        if (gain) certificate.add_gain(host);
+        else certificate.add_projection(host);
+    }
+    attention_certificate_ = certificate;
 }
 
 std::span<const std::uint16_t> MiniResidentWeights::bf16(std::string_view name) const {
