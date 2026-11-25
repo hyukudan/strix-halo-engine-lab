@@ -885,9 +885,9 @@ private:
         auto weights = upload_mini_resident_weights(weight_plan_, weight_storage_.span(), stream_.get());
 #if defined(__HIPCC__)
         static_cast<void>(controller_one_plane);
-        const auto& lever = weight::kLowBitFoldedScaleLever;
-        const bool ladder_candidate = lowbit.timing && std::ranges::any_of(kMiniProfile.ladder, [&](const auto& row) {
-            return row.lever == lever.name && row.value == lever.target;
+        const bool ladder_candidate = lowbit.timing && std::ranges::any_of(kMiniProfile.ladder, [](const auto& row) {
+            return row.lever == weight::kLowBitFoldedScaleLever.name &&
+                   row.value == weight::kLowBitFoldedScaleLever.target;
         });
         if (lowbit.arithmetic == core::LowBitArithmetic::f16_folded_scale || ladder_candidate) {
             weights.certify_folded_scale([&](std::span<const std::uint8_t> staged, std::span<std::uint8_t> host) {
