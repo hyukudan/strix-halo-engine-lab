@@ -120,7 +120,8 @@ std::vector<RowForm> served_forms(std::size_t prompt, MiniPrefillSchedule schedu
     const auto chunk = std::min(schedule.chunk, context);
     const auto capacity = mini_admitted_tail_capacity(chunk, mini_prefill_tail_capacity(chunk, schedule.tail_divisor, context),
                                                       admits_rows);
-    const auto rule = mini_prefill_piece_rule(hip);
+    // The served route lever is admitted on HIP only; this models its emits-first calls (CUDA: whole chunks here).
+    const auto rule = hip ? mini_prefill_piece_rule(true, true) : strix::serve::PromptPieceRule{};
     const auto call_tail = [&](std::uint64_t call) { return mini_call_tail_rows(call, chunk, capacity, admits_rows); };
     std::size_t at = 0;
     while (at < prompt) {
@@ -163,11 +164,11 @@ int served_prefill_gate() {
         }
     }
     // The resolver of both entry points takes the declared rows per backend and profile (mini_cli_prefill_rows): HIP
-    // 8192 rows with a chunk / 8 tail in every profile, CUDA greedy chunks of 8192 rows in EXACT and 2048 otherwise;
-    // cuts on HIP.
+    // 8192 rows with a chunk / 8 tail in every profile, CUDA greedy chunks of 8192 rows in every profile (FAST / TURBO
+    // resolve the EXACT prefill arithmetic there, so no tier is slower than the one below); cuts on HIP.
     for (const auto tier : {Name::standard, Name::quality, Name::fast, Name::turbo}) {
         const auto hip = mini_prefill_schedule(true, tier), cuda = mini_prefill_schedule(false, tier);
-        const unsigned cuda_rows = tier == Name::standard ? 8192U : 2048U;
+        const unsigned cuda_rows = 8192U;
         if (hip.chunk != 8192U || hip.tail_divisor != 8U || cuda.chunk != cuda_rows || cuda.tail_divisor != 0U ||
             hip.chunk != mini_cli_prefill_rows(MiniPrefillBackend::hip, tier) ||
             cuda.chunk != mini_cli_prefill_rows(MiniPrefillBackend::cuda, tier)) {
@@ -175,7 +176,15 @@ int served_prefill_gate() {
             failed = 41;
         }
     }
-    static_assert(mini_prefill_piece_rule(true).cuttable() && !mini_prefill_piece_rule(false).cuttable());
+    // Pieces: the HIP command line's route cuts at the wave tile; the HIP held-back route never cuts (its 128-row chunk
+    // is the piece); the CUDA held-back route cuts at 32-row steps, every piece longer than the short-row dense body.
+    static_assert(mini_prefill_piece_rule(true, true).cuttable() && !mini_prefill_piece_rule(true, false).cuttable());
+    constexpr auto cuda_rule = mini_prefill_piece_rule(false, false);
+    static_assert(cuda_rule.align == 32U && cuda_rule.short_rows == 32U);
+    constexpr auto tall = mini_served_chunk_ladder(8192U, 2048U), short_context = mini_served_chunk_ladder(1024U, 2048U);
+    static_assert(tall.count == 3U && tall.rows[1] == 2048U && tall.rows[2] == 128U);
+    static_assert(short_context.count == 2U && short_context.rows[1] == 128U);
+    static_assert(mini_served_chunk_ladder(8192U, 0U).count == 1U && mini_served_chunk_ladder(128U, 2048U).count == 1U);
     static_assert(mini_prefill_tail_capacity(8192U, 8U, 8192U) == 0U && mini_prefill_tail_capacity(8192U, 8U, 9000U) == 808U);
     static_assert(mini_call_first_chunk(8193U, 8192U, 0U) == 8192U && mini_call_first_chunk(8209U, 8192U, 17U) == 8209U);
     return failed;

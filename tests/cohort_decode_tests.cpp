@@ -1,14 +1,17 @@
 // Host-only tests for the shared multi-request decoder (strix/serve/cohort_decode.hpp) over a fake engine.
 // Invariant: every request's ids equal its solo greedy run, whatever joins, leaves, drafts or row plans happen.
 #include "strix/serve/cohort_decode.hpp"
+#include "strix/serve/prefill_chunk_fallback.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <iostream>
 #include <map>
 #include <set>
+#include <sstream>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -1188,6 +1191,65 @@ void test_piece_validation() {
     check(refused(c, rule, 8192), "validation: an infinite gap");
 }
 
+// The served chunk ladder (load_with_chunk_ladder): the largest candidate whose whole load keeps the incumbent's slot
+// capacity; the returned service is the last one loaded; one line names a change. Slots per chunk are a table here.
+void test_chunk_ladder() {
+    struct Service {
+        std::uint32_t chunk = 0;
+    };
+    using Admission = ChunkAdmission<Service>;
+    const std::vector<std::uint32_t> chunks{8192U, 2048U, 128U};
+    struct Case {
+        const char* name;
+        std::map<std::uint32_t, std::uint32_t> slots;  // admitted slots per chunk (0 = declined / refused)
+        std::map<std::uint32_t, std::uint32_t> bound;  // host bound per chunk (default: the slots)
+        bool oom_first;
+        std::uint32_t kept;
+        std::vector<std::uint32_t> loads;
+        bool line;
+    };
+    const std::vector<Case> cases{
+        {"roomy: the tall chunk at the cap",
+         {{8192U, 32U}, {2048U, 32U}, {128U, 32U}}, {}, false, 8192U, {8192U}, false},
+        {"tight: the tall chunk loses slots, 2048 keeps them",
+         {{8192U, 20U}, {2048U, 30U}, {128U, 30U}}, {}, false, 2048U, {8192U, 128U, 2048U}, true},
+        {"tighter: only the incumbent keeps its slots (bound skips 2048)",
+         {{8192U, 10U}, {2048U, 20U}, {128U, 30U}}, {}, false, 128U, {8192U, 128U}, true},
+        {"loose bound: 2048 loaded, short, the incumbent again",
+         {{8192U, 10U}, {2048U, 20U}, {128U, 30U}}, {{2048U, 31U}}, false, 128U, {8192U, 128U, 2048U, 128U}, true},
+        {"tall chunk refused by device memory, 2048 keeps the slots",
+         {{8192U, 0U}, {2048U, 12U}, {128U, 12U}}, {}, true, 2048U, {8192U, 128U, 2048U}, true},
+        {"capacity not memory bound: equal slots keep the tall chunk",
+         {{8192U, 8U}, {2048U, 8U}, {128U, 8U}}, {}, false, 8192U, {8192U, 128U, 8192U}, false},
+    };
+    for (const auto& c : cases) {
+        std::vector<std::uint32_t> loads;
+        std::ostringstream log;
+        const auto kept = load_with_chunk_ladder(std::span<const std::uint32_t>(chunks), 32U, log,
+            [&](std::uint32_t chunk, bool last) {
+                loads.push_back(chunk);
+                if (c.oom_first && chunk == chunks.front()) throw strix::DeviceAllocationError("out of memory", 2);
+                check(last == (chunk == chunks.back()),
+                      std::string("ladder: only the incumbent is the last load: ") + c.name);
+                return Admission{Service{chunk}, c.slots.at(chunk)};
+            },
+            [&](std::uint32_t chunk) { return c.bound.contains(chunk) ? c.bound.at(chunk) : c.slots.at(chunk); });
+        check(kept.chunk == c.kept && kept.service.chunk == c.kept && kept.slots == c.slots.at(c.kept),
+              std::string("ladder: kept chunk: ") + c.name);
+        check(loads == c.loads, std::string("ladder: load order: ") + c.name);
+        check(loads.back() == c.kept, std::string("ladder: the kept service is the last load: ") + c.name);
+        check(log.str().empty() == !c.line, std::string("ladder: one line per change: ") + c.name);
+    }
+    // One candidate (an explicit chunk): one load, the caller's refusals apply (last = true).
+    std::ostringstream log;
+    const std::array<std::uint32_t, 1> one{512U};
+    bool final_load = false;
+    const auto kept = load_with_chunk_ladder(std::span<const std::uint32_t>(one), 32U, log,
+        [&](std::uint32_t chunk, bool last) { final_load = last; return Admission{Service{chunk}, 1U}; },
+        [](std::uint32_t) { return 0U; });
+    check(kept.chunk == 512U && final_load && log.str().empty(), "ladder: one candidate is the final load");
+}
+
 int main() {
     test_owner_callbacks_and_boundary();
     test_mixed_drain();
@@ -1212,6 +1274,7 @@ int main() {
     test_gap_debt();
     test_gap_row_cost_floor();
     test_piece_validation();
+    test_chunk_ladder();
     if (failures) {
         std::cerr << failures << " failure(s)\n";
         return 1;

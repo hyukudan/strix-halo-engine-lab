@@ -105,17 +105,10 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     return resolved;
 }
 
-serve::CohortConfig scheduling(const MiniServeOptions& opt, const serve::CohortBackend& backend) {
-    serve::CohortConfig config;
-    config.context_draft = false;
-    config.max_draft = 0;
-    // A prompt runs as the command line's calls (whole chunks, the final one with its tail); beside a decoding lane
-    // the cohort cuts pieces of kMiniServeDecodingRows inside those chunks where the decoder's piece rule allows (HIP),
-    // so the bits never depend on other lanes (the backend's prompt_piece_rule; CUDA: none, whole chunks).
-    config.prompt_slice = opt.prefill_rows;
-    config.prompt_slice_decoding = opt.served_cli_route && backend.prompt_piece_rule().cuttable() &&
-                                   opt.prefill_rows > kMiniServeDecodingRows ? kMiniServeDecodingRows : 0U;
-    return config;
+serve::CohortConfig scheduling(const MiniServeOptions& opt, const MiniServeCohort& device) {
+    // The chunk the load admitted (the chunk ladder may keep a smaller one), never the requested one.
+    return mini_serve_scheduling(device.prefill_rows != 0U ? device.prefill_rows : opt.prefill_rows,
+                                 device.backend->prompt_piece_rule());
 }
 
 class MiniService final : public serve::SessionService {
@@ -124,7 +117,7 @@ public:
                 const MiniServeTokenizer& tokenizer, MiniChat chat)
         : tokenizer_(tokenizer(opt.tokenizer)), device_(backend(opt)),
           queue_(std::max(64U, device_.backend->lanes())),
-          cohort_(queue_, *device_.backend, scheduling(opt, *device_.backend), [](const serve::GenerationJob& job) {
+          cohort_(queue_, *device_.backend, scheduling(opt, device_), [](const serve::GenerationJob& job) {
               if (job.copy_rows) throw std::invalid_argument("Inkling serving does not support copy_rows");
               if (job.window_rows) throw std::invalid_argument("Inkling serving does not support window_rows");
               if (job.prompt.size() < 2 ||

@@ -19,6 +19,7 @@
 #include <sstream>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace {
 namespace sv = strix::serve;
@@ -404,7 +405,7 @@ void profile_parity() {
     const auto create = [&](const mini::MiniServeOptions& options) {
         loaded = options;
         return mini::MiniServeCohort{
-            std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(), 32U, 3U, 2U), {}, {}};
+            std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(), 32U, 3U, 2U), {}, {}, 0U};
     };
     sv::ServiceFactories factories;
     mini::install_mini_service(factories, {create, create},
@@ -582,8 +583,9 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             // Without the lever the served shape is the held-back one, written out here from the rule the server had
             // before the lever existed: a 128-row chunk unless --prefill-rows, clamped to the context; lanes = --slots,
             // else the clamped 128 rows / --prefill-rows; no tail; held-back prompt token; grouped decode. The one change:
-            // a chunk-invariant backend (CUDA) takes the command line's implicit chunk (8192 EXACT, 2048 FAST / TURBO)
-            // with the command line's device-memory fallback; HIP keeps 128 rows. The lane cap never follows the chunk.
+            // a chunk-invariant backend (CUDA) takes the command line's implicit chunk (8192 rows in every profile)
+            // with the chunk ladder 8192 -> 2048 -> 128 (the largest that keeps the incumbent slots); HIP keeps 128
+            // rows. The lane cap never follows the chunk.
             const unsigned incumbent = std::min(shape.prefill_rows.value_or(128U), context);
             const auto cli_rows = mini::mini_cli_prefill_rows(
                 hip_backend ? mini::MiniPrefillBackend::hip : mini::MiniPrefillBackend::cuda, options.tier);
@@ -595,6 +597,21 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                         options.prefill_tail == 0U && options.lane_rows == incumbent &&
                         options.prefill_fallback_rows == fallback,
                     "lever off: held-back chunk (CUDA: the command line's), incumbent lane cap, no tail");
+            // The load's candidates: an implicit CUDA chunk walks down to the incumbent 128 rows; one candidate else.
+            const auto ladder = mini::mini_served_chunk_ladder(options.prefill_rows, options.prefill_fallback_rows);
+            std::vector<std::uint32_t> expected{chunk};
+            if (fallback != 0U && fallback < chunk) expected.push_back(fallback);
+            if (fallback != 0U && 128U < expected.back()) expected.push_back(128U);
+            require(std::ranges::equal(ladder.view(), expected), "lever off: served chunk candidates");
+            // Beside a decoding lane the CUDA held-back route serves pieces of the incumbent 128 rows (bit-safe cuts of
+            // the decoder's rule); HIP keeps its whole 128-row slices.
+            const auto rule = mini::mini_prefill_piece_rule(hip_backend, false);
+            const auto config = mini::mini_serve_scheduling(chunk, rule);
+            require(config.prompt_slice == chunk && rule.cuttable() == !hip_backend &&
+                        config.prompt_slice_decoding == (!hip_backend && chunk > 128U ? 128U : 0U) &&
+                        config.max_draft == 0U && !config.context_draft,
+                    "lever off: one admitted chunk alone, 128-row pieces beside a decoding lane (CUDA)");
+            sv::validate_prompt_pieces(config, rule, chunk);
         } else {
             // With the lever: the command line's chunk and tail rule, emits-first; lanes = --slots, else an explicit
             // (clamped) --prefill-rows, else the served lane cap.
@@ -605,7 +622,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                                                                        : mini::kMiniServeLaneRows;
             require(options.prefill_rows == chunk && mini::mini_serve_lane_rows(options) == lanes &&
                         options.prefill_tail == mini::mini_prefill_tail_capacity(chunk, cli.tail_divisor, context) &&
-                        mini::mini_prefill_piece_rule(true).cuttable(),
+                        mini::mini_prefill_piece_rule(true, true).cuttable(),
                     "lever on: the command line's schedule and the served lane cap");
         }
         // The served tier is the registry preset's native column for the requested --profile (models/inkling2-mini.toml:
@@ -636,7 +653,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         if (options.attn_projected_bias) observed = [&served_dispatches] { return served_dispatches; };
         return mini::MiniServeCohort{
             std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable), 32U, 3U, 2U), weights,
-            std::move(observed)};
+            std::move(observed), 0U};
     };
     mini::MiniServeBackends backends;
     if (std::string_view(backend) == "hip") backends.hip = create;

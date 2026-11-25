@@ -260,6 +260,15 @@ public:
     // Independent serving lanes. Slot 0 is also the single-session slot used by
     // prefill/decode/verify above and the only one that records DSpark taps.
     [[nodiscard]] std::uint64_t slot_bytes() const { return layout_.kv_bytes() + layout_.convolution_bytes(); }
+    // slot_bytes() of a decoder built for the held-back served route (no tail, no verify rows) at `chunk` prefill rows
+    // and `decode_rows` lanes, before it is built (the served chunk ladder's host bound).
+    [[nodiscard]] static std::uint64_t held_back_slot_bytes(unsigned max_positions, unsigned chunk,
+                                                           unsigned decode_rows) {
+        const auto rows = std::max(MiniResidentBackend::checked_chunk_rows(chunk),
+                                   MiniResidentBackend::checked_chunk_rows(decode_rows));
+        const MiniSessionStatePlan layout(max_positions, rows);
+        return layout.kv_bytes() + layout.convolution_bytes();
+    }
 
     void allocate_slots(unsigned slots) {
         if (slots == 0U || slots > decode_rows_) throw std::invalid_argument("invalid Mini slot count");
@@ -312,10 +321,20 @@ public:
     // Admitted tail capacity (serve::CohortBackend::prompt_tail_rows), the cut rule of served pieces and the first
     // chunk of one prefill call (prompt_piece_rule / prompt_call_chunk).
     [[nodiscard]] unsigned prefill_tail_rows() const noexcept { return tail_rows_; }
-    // Pieces cut only on the command line's route (the held-back route runs its incumbent whole slices).
+    // Pieces cut on the command line's route (HIP) and on the held-back route of a chunk-invariant backend (CUDA,
+    // mini_prefill_piece_rule); never while a bit-changing prefill row is bound (a W4A4 expert class, a calibrated or
+    // narrow expert image): those prompts run whole calls.
     [[nodiscard]] serve::PromptPieceRule prefill_piece_rule() const noexcept {
-        return mini_prefill_piece_rule(served_cli_route_);
+#if defined(__HIPCC__)
+        constexpr bool hip = true;
+#else
+        constexpr bool hip = false;
+#endif
+        if (!served_cli_route_ && (prefill_emits_first() || weight_plan_.narrow_bytes() != 0U)) return {};
+        return mini_prefill_piece_rule(hip, served_cli_route_);
     }
+    // The prompt chunk this decoder was built with (its row-scaled workspaces and KV rings hold it).
+    [[nodiscard]] unsigned prefill_chunk_rows() const noexcept { return prefill_rows_; }
     [[nodiscard]] std::uint64_t prefill_call_chunk_rows(std::uint64_t rows) const noexcept {
         if (!served_cli_route_) return rows;  // the incumbent route: one call is one slice
         return mini_call_first_chunk(rows, prefill_rows_, call_tail_rows(static_cast<std::size_t>(rows)));

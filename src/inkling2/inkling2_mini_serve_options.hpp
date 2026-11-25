@@ -109,7 +109,23 @@ struct MiniServeCohort {
     // With the projected-bias lever selected: the decoder's projected-bias submissions so far (the counter the command
     // line reports), read once when the server stops (mini_projected_bias_dispatches_line). Empty: lever off.
     std::function<std::uint64_t()> projected_bias_dispatches;
+    // The prompt chunk the load admitted (serve::load_with_chunk_ladder; 0 = MiniServeOptions::prefill_rows): the
+    // cohort's prompt slice.
+    unsigned prefill_rows = 0;
 };
+
+// The served cohort's prompt service: alone, a prompt runs the admitted chunk per call (prompt_slice); beside a
+// decoding lane, pieces of kMiniServeDecodingRows (the incumbent 128-row mixed-service bound) cut inside those chunks
+// where the decoder's piece rule keeps the bits (CohortBackend::prompt_piece_rule: the HIP command line's route, the
+// CUDA held-back route); a decoder without a rule runs whole chunks.
+inline serve::CohortConfig mini_serve_scheduling(unsigned chunk, serve::PromptPieceRule rule) {
+    serve::CohortConfig config;
+    config.context_draft = false;
+    config.max_draft = 0;
+    config.prompt_slice = chunk;
+    config.prompt_slice_decoding = rule.cuttable() && chunk > kMiniServeDecodingRows ? kMiniServeDecodingRows : 0U;
+    return config;
+}
 
 MiniServeCohort make_mini_hip_cohort(const MiniServeOptions&);
 MiniServeCohort make_mini_cuda_cohort(const MiniServeOptions&);
