@@ -278,10 +278,11 @@ if(BUILD_TESTING)
         target_link_libraries(strix-cuda-inkling2-mini-cohort-lanes-test PRIVATE
             strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core)
         list(APPEND _cc_mini_verify_target strix-cuda-inkling2-mini-cohort-lanes-test)
-        # The resident attention operand class on staged device tensors (shared scan, backend factory, planes at the dispatch).
+        # The resident attention operand class through the production upload, binding and backend on a checkpoint-shaped
+        # staged model (generated in the test: no model file): one plane finite, three planes refused or without scan scratch.
         add_executable(strix-cuda-inkling2-mini-operand-class-test ${_cc_root}/tests/inkling2/mini_operand_class_cuda.cu)
         target_link_libraries(strix-cuda-inkling2-mini-operand-class-test PRIVATE
-            strix_cuda_core_kernels strix_inkling2_mini_checkpoint)
+            strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core)
         list(APPEND _cc_mini_tests strix-cuda-inkling2-mini-operand-class-test)
     endif()
     foreach(t IN LISTS _cc_mini_tests _cc_mini_verify_target)

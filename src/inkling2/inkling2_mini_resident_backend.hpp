@@ -197,6 +197,13 @@ public:
 
     [[nodiscard]] mini_gpu::Stream stream() const { return stream_; }
 #if !defined(__HIPCC__)
+    // The attention linears' backend (what attention() prepares with): the operand class the staged attention weights'
+    // certificate declares, on this backend's stream and dense context. `planes_report` observes each dispatch.
+    [[nodiscard]] detail::MiniPreparedCudaBackend attention_operand_backend(int* planes_report = nullptr) const {
+        return detail::mini_attention_backend(stream_, big_context_.get(), weights_.attention_certificate(), planes_report);
+    }
+#endif
+#if !defined(__HIPCC__)
     struct StepProgramBuffers {
         unsigned max_rows;
         bool packed_decode;
@@ -605,8 +612,7 @@ private:
         // Producer-backed operands: the attention inputs are rmsnorm_bf16 rows and the output projection reads the
         // BF16 gated product, so the linears declare bf16_exact (one plane, same bits) where the staged attention
         // weights are certified (finite, ranges kept finite); otherwise they keep FP32 operands (three planes).
-        const detail::MiniPreparedCudaBackend native =
-            detail::mini_attention_backend(stream_, big_context_.get(), weights_.attention_certificate());
+        const detail::MiniPreparedCudaBackend native = attention_operand_backend();
         const detail::MiniResidentGqaBackend<> adapter{native, gate_order_null_ ? &null_applications_ : nullptr};
         // One-row decode over native BF16 weights with a rows profile issues the
         // projection groups as one grouped rows call at the first round (the
