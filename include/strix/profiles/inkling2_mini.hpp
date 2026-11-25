@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/engine_profile.hpp"
+#include "strix/spec/block_draft_policy.hpp"
 #include "strix/weight/levers.hpp"
 #include "strix/weight/registry.hpp"
 
@@ -56,7 +57,7 @@ inline constexpr std::string_view kMiniPreparedRoundFold = "inkling2-mini-prepar
 // bits are the image route's, so the run identity at the default is the legacy one; an explicit 0 selects the image route
 // and is a distinct identity). Switch: STRIX_INK_ATTN_PROJECTED_BIAS=0/1.
 inline constexpr std::string_view kMiniAttnProjectedBias = "inkling2-mini-attn-projected-bias@1";
-inline constexpr std::array<profile::Lever, 4> kMiniLevers{{
+inline constexpr std::array<profile::Lever, 5> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
@@ -77,6 +78,7 @@ inline constexpr std::array<profile::Lever, 4> kMiniLevers{{
      {true, true, true, true}, {true, true, true, true}, "", "0",
      "relative bias projected inside the CUDA prompt flash: bitwise the image route (lever on vs off logits identity, EXACT and FAST)",
      false, {}, true},
+    spec::kBlockDraftLever,
 }};
 
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.

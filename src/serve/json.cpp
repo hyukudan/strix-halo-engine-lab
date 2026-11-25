@@ -336,6 +336,11 @@ private:
 
 Json parse_json_unique(std::string_view text) { return Parser(text, true, std::numeric_limits<std::size_t>::max()).document(); }
 
+Json parse_json_unique(std::string_view text, std::size_t max_bytes, std::size_t max_values) {
+    if (text.size() > max_bytes) throw JsonError("JSON byte limit exceeded");
+    return Parser(text, true, max_values).document();
+}
+
 Json parse_json(std::string_view text) { return Parser(text, false, std::numeric_limits<std::size_t>::max()).document(); }
 
 Json parse_request_json(std::string_view text) { return Parser(text, false, kMaxRequestJsonValues).document(); }
