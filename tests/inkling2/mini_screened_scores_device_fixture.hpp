@@ -6,10 +6,11 @@
 // shared sample_token_row with a fixed policy and fixed uniforms, so both runs sample the same ids exactly when
 // their scores agree. Covers a lane sampled alone from the first step, and a lane sampled alone after a packed
 // cohort step and after another lane's greedy step (whose scores are never read and never projected).
-// Verify rows level 2 (STRIX_INK_VERIFY_ROWS=2, set_verify_rows(2)): cohorts of 2 and 4 lanes whose groups declare no
-// score read pick through the lanes screened head (picks = the full head's, scores deferred and then read bit for bit),
-// an announced read keeps the full head (nothing deferred), and greedy verify windows of 2 and 4 rows pick the full head's
-// tokens through the lanes form, each window committed whole.
+// Verify rows level 2 (STRIX_INK_VERIFY_ROWS=2, set_verify_rows(2)): cohorts of 2..4 distinct lanes whose groups declare
+// no score read pick through the lanes screened head up to its capacity (lanes_picks counts it; scores deferred, then read
+// bit for bit against each lane's own full-head rows), wider cohorts and announced reads keep the full head, and deferred
+// rows read after a verify window or a held-back prompt on another slot still return the cohort's rows. Verify windows
+// at level 2 (partial commits, round fold, continuation) are the verify rows fixture's --lanes-pick arm.
 
 #include "inkling2/inkling2_mini_resident_decoder.hpp"
 #include "strix/token_sampling.hpp"
@@ -173,11 +174,51 @@ inline ScreenReference screened_scores(const char* checkpoint, weight::FormatId 
 }
 
 // Verify rows level 2 on a decoder built like the command line's verifying route plus four cohort rows.
-inline void lanes_pick_scores(const char* checkpoint, weight::FormatId storage, const ScreenReference& reference) {
-    constexpr unsigned lanes = 4U;
+// Verify rows level 2 over distinct lanes: lane l has its own prompt (length and ids), its own greedy continuation and
+// its own full-head score rows, taken from one-lane steps (a one-row pick takes the same head at every level, and a read
+// gets the per-row head every level-1 cohort row runs), so a swapped or stale deferred row fails against its own lane.
+inline constexpr unsigned kLaneSteps = 4U;
+
+struct LaneReference {
+    std::vector<unsigned> prompt;
+    std::vector<unsigned> ids;  // input of step s (ids[0] = the prefill's pick); ids[s + 1] = top[s]
+    std::vector<unsigned> top;
+    std::vector<float> scores;
+    [[nodiscard]] std::span<const float> row(unsigned step) const {
+        return std::span(scores).subspan(std::size_t{step} * kOutputVocabulary, kOutputVocabulary);
+    }
+};
+
+inline std::vector<unsigned> lane_prompt(unsigned lane) {
+    std::vector<unsigned> prompt(kScreenPromptRows - 3U * lane);
+    for (std::size_t i = 0; i < prompt.size(); ++i)
+        prompt[i] = 1000U + static_cast<unsigned>((i * 173U + i / 13U + 7919U * lane) % 20000U);
+    return prompt;
+}
+
+inline void check_lane(const std::string& where, const std::vector<LaneReference>& lanes, unsigned lane, unsigned step,
+                       std::span<const float> actual, std::optional<unsigned> top) {
+    const auto same = [&](const LaneReference& other, unsigned s) {
+        return std::memcmp(actual.data(), other.row(s).data(), actual.size_bytes()) == 0;
+    };
+    if (!same(lanes[lane], step)) {
+        std::string stale = "no reference row";
+        for (unsigned other = 0; other < lanes.size(); ++other)
+            for (unsigned s = 0; s < kLaneSteps; ++s)
+                if (same(lanes[other], s)) stale = "lane " + std::to_string(other) + " step " + std::to_string(s);
+        throw std::runtime_error(where + ": lane " + std::to_string(lane) + " step " + std::to_string(step) +
+                                 " read scores that differ from its full-head row (they equal " + stale + ")");
+    }
+    if (top && *top != lanes[lane].top[step])
+        throw std::runtime_error(where + ": lane " + std::to_string(lane) + " step " + std::to_string(step) +
+                                 " greedy pick differs from the full head");
+}
+
+inline void lanes_pick_scores(const char* checkpoint, weight::FormatId storage) {
+    constexpr unsigned slots = 4U;
     MiniResidentDecoder decoder(checkpoint, 128U, 64U, false, MiniResidentBackend::default_step_graphs, storage,
-                                MiniResidentDecoder::kMaxVerifyRows, false, lanes);
-    decoder.allocate_slots(lanes);
+                                MiniResidentDecoder::kMaxVerifyRows, false, slots);
+    decoder.allocate_slots(slots);
     const auto admitted = decoder.set_verify_rows(2U);
 #if defined(__HIPCC__)
     // Level 1 always (verify windows exist); the lanes pick only over the BF16 screened head.
@@ -186,55 +227,94 @@ inline void lanes_pick_scores(const char* checkpoint, weight::FormatId storage, 
 #else
     const unsigned expected = 0U;
 #endif
-    std::cout << "INFO verify rows level " << admitted << " (2 selected)\n";
+    const unsigned capacity = decoder.lanes_pick_capacity();
+    std::cout << "INFO verify rows level " << admitted << " (2 selected), lanes pick capacity " << capacity << '\n';
     if (admitted != expected)
         throw std::logic_error("verify rows level 2 must be admitted exactly when the BF16 screened head exists");
     if (admitted != 2U) {
+        if (capacity != 0U) throw std::logic_error("a declined lanes pick reports a capacity");
         std::cout << "PASS Inkling Mini lanes pick: declined without the BF16 screened head (level " << admitted << ")\n";
         return;
     }
-    std::vector<unsigned> prompt(kScreenPromptRows);
-    for (std::size_t i = 0; i < prompt.size(); ++i)
-        prompt[i] = 1000U + static_cast<unsigned>((i * 173U + i / 13U) % 20000U);
+    if (capacity < 2U) throw std::logic_error("level 2 admitted without two screened lanes");
+
+    std::vector<LaneReference> lanes(slots);
     std::vector<float> scores(kOutputVocabulary);
-    constexpr unsigned kCohortSteps = 4U;
-    for (const unsigned width : {2U, 4U}) {
-        for (unsigned lane = 0; lane < width; ++lane) (void)decoder.prefill_slot_first(lane, prompt, true);
-        std::array<unsigned, lanes> slots{0U, 1U, 2U, 3U}, ids{}, top{};
-        for (unsigned step = 0; step < kCohortSteps; ++step) {
+    for (unsigned lane = 0; lane < slots; ++lane) {
+        auto& reference = lanes[lane];
+        reference.prompt = lane_prompt(lane);
+        reference.scores.resize(std::size_t{kLaneSteps} * kOutputVocabulary);
+        reference.ids.push_back(decoder.prefill_slot_first(lane, reference.prompt, true));
+        for (unsigned step = 0; step < kLaneSteps; ++step) {
+            reference.top.push_back(step_lane(decoder, lane, reference.ids[step]));
+            decoder.read_slot_logits(0U, std::span(reference.scores).subspan(std::size_t{step} * kOutputVocabulary,
+                                                                              kOutputVocabulary));
+            reference.ids.push_back(reference.top[step]);
+        }
+    }
+    for (unsigned lane = 1; lane < slots; ++lane)
+        if (lanes[lane].ids == lanes[0].ids) throw std::logic_error("the lanes are not distinct");
+
+    // Cohorts of 2..4 distinct lanes: unread steps take the lanes pick up to the capacity (scores deferred, then read),
+    // wider cohorts and announced reads keep the full head; every lane against its own rows.
+    unsigned admitted_steps = 0U, declined_steps = 0U;
+    for (unsigned width = 2U; width <= slots; ++width) {
+        for (unsigned lane = 0; lane < width; ++lane)
+            if (decoder.prefill_slot_first(lane, lanes[lane].prompt, true) != lanes[lane].ids[0])
+                throw std::runtime_error("prefill pick differs on lane " + std::to_string(lane));
+        std::array<unsigned, slots> slot_ids{0U, 1U, 2U, 3U}, ids{}, top{};
+        for (unsigned step = 0; step < kLaneSteps; ++step) {
             const bool announced = step % 2U == 1U;
-            std::fill(ids.begin(), ids.end(), reference.ids[step]);
-            decoder.decode_slots(std::span(slots).first(width), std::span(ids).first(width), std::span(top).first(width),
-                                 announced);
-            const auto deferred = scores_deferred(decoder).value_or(!announced);
-            if (deferred == announced)
-                throw std::logic_error("cohort C" + std::to_string(width) + " step " + std::to_string(step) + ": " +
-                                       (announced ? "an announced read deferred its rows" : "unread rows were projected"));
+            for (unsigned lane = 0; lane < width; ++lane) ids[lane] = lanes[lane].ids[step];
+            const auto before = decoder.lanes_picks();
+            decoder.decode_slots(std::span(slot_ids).first(width), std::span(ids).first(width),
+                                 std::span(top).first(width), announced);
+            const bool expect_lanes = !announced && width <= capacity;
+            if (decoder.scores_deferred() != expect_lanes || decoder.lanes_picks() - before != (expect_lanes ? 1U : 0U))
+                throw std::logic_error("cohort C" + std::to_string(width) + " step " + std::to_string(step) +
+                                       (expect_lanes ? ": the lanes pick did not run" : ": the lanes pick ran"));
+            (expect_lanes ? admitted_steps : declined_steps) += announced ? 0U : 1U;
             for (unsigned lane = 0; lane < width; ++lane) {
                 decoder.read_slot_logits(lane, scores);
-                check_step(announced ? "level 2 cohort (announced read)" : "level 2 cohort (lanes pick, deferred read)",
-                           step, scores, top[lane], reference);
+                check_lane("cohort C" + std::to_string(width) + (expect_lanes ? " (lanes pick, deferred read)"
+                                                                               : announced ? " (announced read)"
+                                                                                           : " (full head)"),
+                           lanes, lane, step, scores, top[lane]);
             }
         }
     }
-    std::cout << "PASS Inkling Mini lanes pick: cohorts C2 and C4, " << kCohortSteps << " steps each\n";
+    std::cout << "PASS Inkling Mini lanes pick: cohorts C2..C" << slots << " of distinct lanes, unread steps "
+              << admitted_steps << " lanes / " << declined_steps << " above capacity " << capacity << '\n';
 
-    (void)decoder.prefill_slot_first(0U, prompt, true);
-    unsigned cursor = 0U;
-    for (const unsigned width : {2U, 4U}) {
-        const auto result =
-            decoder.forward_rows(reference.ids.data() + cursor, width, MiniResidentDecoder::LogitRows::all);
-        std::array<unsigned, MiniResidentDecoder::kMaxVerifyRows> top{};
-        decoder.read_top(result, width, top.data());
-        for (unsigned row = 0; row < width; ++row)
-            if (top[row] != reference.top[cursor + row])
-                throw std::runtime_error("level 2 verify window of " + std::to_string(width) + " rows: row " +
-                                         std::to_string(row) + " pick differs from the full head");
-        decoder.commit(width);
-        cursor += width;
+    // Another operation between a deferred cohort and its read: a verify window on slot 0 (its scores go to the verify
+    // buffer) and a held-back prompt on slot 0 overwrite the cohort's head inputs; the late reads still return the
+    // cohort's own rows, as level 1's eager rows do.
+    for (unsigned lane = 0; lane < 3U; ++lane) (void)decoder.prefill_slot_first(lane, lanes[lane].prompt, true);
+    const std::array<unsigned, 2> pair{1U, 2U};
+    std::array<unsigned, 2> pair_top{};
+    for (unsigned step = 0; step < 2U; ++step) {
+        const std::array<unsigned, 2> pair_ids{lanes[1].ids[step], lanes[2].ids[step]};
+        decoder.decode_slots(pair, pair_ids, pair_top, false);
+        if (!decoder.scores_deferred()) throw std::logic_error("the C2 cohort did not defer its scores");
+        const char* between = step == 0U ? "verify window" : "held-back prompt";
+        if (step == 0U) {
+            const auto result =
+                decoder.forward_rows(lanes[0].ids.data(), 2U, MiniResidentDecoder::LogitRows::all);
+            std::array<unsigned, 2> verify_top{};
+            decoder.read_top(result, 2U, verify_top.data());
+            if (verify_top[0] != lanes[0].top[0] || verify_top[1] != lanes[0].top[1])
+                throw std::runtime_error("the verify window on slot 0 picks differ from the full head");
+            decoder.commit(2U);
+        } else {
+            decoder.prefill_slot(0U, lanes[0].prompt, true);
+        }
+        for (unsigned row = 0; row < 2U; ++row) {
+            decoder.read_slot_logits(row, scores);
+            check_lane(std::string("deferred C2 read after a ") + between + " on slot 0", lanes, pair[row], step, scores,
+                       pair_top[row]);
+        }
     }
-    if (cursor > kScreenSteps) throw std::logic_error("verify windows outran the reference");
-    std::cout << "PASS Inkling Mini lanes pick: verify windows of 2 and 4 rows\n";
+    std::cout << "PASS Inkling Mini lanes pick: deferred rows read after a verify window and a prompt on another slot\n";
 }
 
 }  // namespace strix::inkling2::test
@@ -250,7 +330,8 @@ int main(int argc, char** argv) {
             else throw std::invalid_argument("unknown option: " + std::string(option));
         }
         const auto reference = inkling2::test::screened_scores(argv[1], storage);
-        inkling2::test::lanes_pick_scores(argv[1], storage, reference);
+        static_cast<void>(reference);
+        inkling2::test::lanes_pick_scores(argv[1], storage);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL Inkling Mini screened scores: " << error.what() << '\n';

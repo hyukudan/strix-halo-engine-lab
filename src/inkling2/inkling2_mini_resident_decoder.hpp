@@ -199,6 +199,16 @@ public:
     }
     // Greedy picks that ran screened so far (both routes; the CUDA step program counts its screened steps here).
     [[nodiscard]] std::uint64_t screened_picks() const noexcept { return screened_picks_; }
+    // Verify rows level 2: multi-row picks that ran through the lanes screened head (cohorts and verify windows), and the
+    // most rows one such pick screens (0 when the lanes pick is not admitted); wider ones keep the full head.
+    [[nodiscard]] std::uint64_t lanes_picks() const noexcept { return lanes_picks_; }
+    [[nodiscard]] unsigned lanes_pick_capacity() const noexcept {
+#if defined(__HIPCC__)
+        return verify_lanes_pick_ && screen_ ? screen_->max_lanes() : 0U;
+#else
+        return 0U;
+#endif
+    }
 
     // Return the token after the last prompt input. Only that row goes through
     // the output projection. If a later chunk fails after an earlier one
@@ -400,7 +410,10 @@ public:
         });
         for (std::size_t row = 0; row < top.size(); ++row) top[row] = greedy_.token(row);
 #if defined(__HIPCC__)
-        if (lanes_screened) pending_scores_ = {hidden_.data(), rows, logits.data()};
+        if (lanes_screened) {
+            pending_scores_ = {hidden_.data(), rows, logits.data()};
+            ++lanes_picks_;
+        }
 #endif
         last_logit_rows_ = rows;
     }
@@ -1074,6 +1087,9 @@ private:
             pending_scores_ = {hidden_.data() + elements - kHiddenWidth, 1U, logits_.data()};
             note_screened_pick();
         }
+#if defined(__HIPCC__)
+        if (lanes_screened) ++lanes_picks_;
+#endif
         return token;
     }
 
@@ -1227,6 +1243,7 @@ private:
     bool screened_graph_{false};
     MiniHead head_{};                  // the effective greedy head (set_screened_head / release_screen)
     std::uint64_t screened_picks_{};  // greedy picks that ran screened (note_screened_pick)
+    std::uint64_t lanes_picks_{};     // multi-row picks through the lanes screened head (lanes_picks)
     std::array<unsigned, kMaxVerifyRows> verify_ids_{}, verify_top_{};
     std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits_;
     std::size_t staged_logits_size_{};
