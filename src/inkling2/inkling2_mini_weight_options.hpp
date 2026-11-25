@@ -176,6 +176,13 @@ inline const char* mini_verify_rows_name(unsigned active, unsigned selected) {
     if (active >= kMiniVerifyLanesPick) return "on+lanes-pick";
     return selected >= kMiniVerifyLanesPick ? "on+lanes-pick-declined" : "on";
 }
+// The level a server runs of the decoder's admitted one (its startup receipt): the server stages no verify window, so
+// its lanes pick screens only cohorts of two or more distinct admitted slots on the incumbent served route. The served
+// CLI route (packed passes, decode_slots_served) and a one-slot server run level 1 (on+lanes-pick-declined); a one-slot
+// command line keeps the decoder's level (its verify windows screen through the lanes pick).
+inline unsigned mini_served_verify_rows(unsigned active, bool served_cli_route, std::size_t admitted_slots) {
+    return active >= kMiniVerifyLanesPick && (served_cli_route || admitted_slots < 2U) ? 1U : active;
+}
 
 // What the decoder's backend admitted of the resolved levers: the effective state every entry point reports.
 struct MiniDecoderLevers {
