@@ -2,6 +2,7 @@
 // tests/cuda/qwen_dense_ref.hpp, bit for bit.
 //   qwen_dense_tests                 host-only tests (no CUDA call)
 //   qwen_dense_tests --gpu           + CUDA vs host: synthetic edge cases, real Q8_0 weights, shared expert
+//   qwen_dense_tests --shared-activation-exact TABLES_DIR   production vs frozen CUDA, synthetic rows only
 //   ctest -R qwen_dense_rows16       isolated ON/OFF dispatch qualification (no model/table assets required)
 //   qwen_dense_tests --bench         GMAC/s of 8192 x 2560 x 16384 (GDN qkv||z shape)
 //   qwen_dense_tests --bench-shape M,K,N [...]  one site (M rows, K width, N outputs), best of 8, TOPS; repeatable, no model
@@ -9,6 +10,7 @@
 // Env: STRIX_QWEN_GGUF (model), STRIX_QRTX_TABLES (default qrtx-build\tables).
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -20,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -451,41 +454,92 @@ static void host_shared_expert(std::uint32_t rows, const std::vector<std::uint16
     });
 }
 
-static void gpu_shared_tests(const strix::qwen_gguf::Model* model, const strix::cuda::amdmath::Tables& tables, const ref::HostExpf& ex) {
-    // activation on synthetic gates over a wide range (exp overflow/underflow, subnormals, signed zeros)
-    {
-        const std::uint32_t rows = 64, I = 640, H = 2560;
-        const std::uint64_t stride = 2 * I + 7;
-        std::vector<float> ws(rows * stride);
-        Rng g(4242);
-        for (auto& v : ws) {
-            const std::uint32_t k = g.u32() % 16U;
-            if (k == 0) v = static_cast<float>(g.uni() * 240.0 - 120.0);
-            else if (k == 1) v = ref::bits_float(g.u32() & 0x807fffffU);
-            else if (k == 2) v = (g.u32() & 1) ? 0.0F : -0.0F;
-            else v = g.normal() * std::ldexp(1.0F, static_cast<int>(g.u32() % 12U) - 4);
-        }
-        std::vector<std::uint16_t> in(rows * H);
-        for (auto& v : in) v = ref::f2bf(g.normal());
-        std::vector<float> sc(H);
-        for (auto& v : sc) v = g.normal() * 0.05F;
-        for (std::uint32_t r = 0; r < 8; ++r) for (std::uint32_t f = 0; f < H; ++f) in[r * H + f] = ref::f2bf(g.normal() * 200.0F);  // saturated gates
-        Dev<float> dws(ws);
-        Dev<std::uint16_t> din(in);
-        Dev<float> dsc(sc);
-        CK(qd::shared_activation(nullptr, rows, dws.p, stride, din.p, H, dsc.p, I, H, tables));
-        CK(cudaDeviceSynchronize());
-        const auto got = dws.down();
-        auto expect = ws;
-        for (std::uint32_t r = 0; r < rows; ++r) ref::shared_activation_row(&expect[r * stride], I, &in[r * H], sc.data(), H, ex);
-        std::size_t bad = 0, first = SIZE_MAX;
-        for (std::size_t i = 0; i < got.size(); ++i) {
-            const bool nan_both = got[i] != got[i] && expect[i] != expect[i];
-            if (!nan_both && ref::float_bits(got[i]) != ref::float_bits(expect[i])) { ++bad; if (first == SIZE_MAX) first = i; }
-        }
-        check(bad == 0, "shared activation synthetic (" + std::to_string(got.size()) + " floats, mismatches " + std::to_string(bad) +
-                            (bad ? " first " + std::to_string(first) + " gpu " + hex(ref::float_bits(got[first])) + " host " + hex(ref::float_bits(expect[first])) : "") + ")");
+// Frozen pre-migration device body. The production and reference arms use
+// the same exp tables and start with identical workspace bytes.
+static __global__ __launch_bounds__(256) void frozen_shared_activation(
+    float* workspace_base, std::uint64_t workspace_stride, const std::uint16_t* input_base, std::uint64_t input_stride,
+    const float* scalar, std::uint32_t intermediate, std::uint32_t hidden, strix::cuda::amdmath::Tables tables) {
+    __shared__ float scratch[256];
+    float* workspace = workspace_base + blockIdx.y * workspace_stride;
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < intermediate) {
+        const float gate = workspace[index];
+        const float up = workspace[intermediate + index];
+        const float den = __fadd_rn(1.0F, strix::cuda::amdmath::amd_expf(tables, -gate));
+        workspace[index] = __fmul_rn(__fdiv_rn(gate, den), up);
     }
+    if (blockIdx.x != 0) return;
+    const std::uint16_t* input = input_base + blockIdx.y * input_stride;
+    float sum = 0.0F;
+    for (std::uint32_t feature = threadIdx.x; feature < hidden; feature += 256U)
+        sum = __fmaf_rn(scalar[feature], __uint_as_float(std::uint32_t{input[feature]} << 16U), sum);
+    scratch[threadIdx.x] = sum;
+    __syncthreads();
+    for (std::uint32_t stride = 128U; stride > 0U; stride >>= 1U) {
+        if (threadIdx.x < stride) scratch[threadIdx.x] = __fadd_rn(scratch[threadIdx.x + stride], scratch[threadIdx.x]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        workspace[intermediate] = __fdiv_rn(1.0F, __fadd_rn(1.0F, strix::cuda::amdmath::amd_expf(tables, -scratch[0])));
+}
+
+template <std::uint32_t I = 640, std::uint32_t H = 2560>
+static void gpu_shared_activation_test(const strix::cuda::amdmath::Tables& tables, const ref::HostExpf* ex) {
+    constexpr std::uint32_t rows = 64;
+    constexpr std::uint64_t stride = 2 * I + 7, input_stride = H + 5;
+    std::vector<float> ws(rows * stride);
+    Rng g(4242);
+    for (auto& v : ws) {
+        const std::uint32_t k = g.u32() % 16U;
+        if (k == 0) v = static_cast<float>(g.uni() * 240.0 - 120.0);
+        else if (k == 1) v = ref::bits_float(g.u32() & 0x807fffffU);
+        else if (k == 2) v = (g.u32() & 1) ? 0.0F : -0.0F;
+        else v = g.normal() * std::ldexp(1.0F, static_cast<int>(g.u32() % 12U) - 4);
+    }
+    std::vector<std::uint16_t> in(rows * input_stride);
+    for (auto& v : in) v = ref::f2bf(g.normal());
+    std::vector<float> sc(H);
+    for (auto& v : sc) v = g.normal() * 0.05F;
+    for (std::uint32_t r = 1; r <= 8; ++r)
+        for (std::uint32_t f = 0; f < H; ++f) in[r * input_stride + f] = ref::f2bf(g.normal() * 200.0F);
+    std::fill_n(in.begin(), H, std::uint16_t{0});
+    for (const auto f : {0U, 1U, 128U}) {
+        in[f] = ref::f2bf(1.0F);
+        for (std::uint32_t r = 1; r < rows; ++r) in[r * input_stride + f] = 0;
+    }
+    sc[0] = 0x1p24F;
+    sc[1] = 1.0F;
+    sc[128] = -0x1p24F;
+    Dev<float> actual(ws), frozen(ws);
+    Dev<std::uint16_t> din(in);
+    Dev<float> dsc(sc);
+    frozen_shared_activation<<<dim3((I + 255U) / 256U, rows), 256>>>(frozen.p, stride, din.p, input_stride, dsc.p, I, H, tables);
+    CK(cudaGetLastError());
+    CK(qd::shared_activation(nullptr, rows, actual.p, stride, din.p, input_stride, dsc.p, I, H, tables));
+    CK(cudaDeviceSynchronize());
+    const auto got = actual.down();
+    const auto old = frozen.down();
+    const bool exact = std::memcmp(got.data(), old.data(), got.size() * sizeof(float)) == 0;
+    const bool cancellation = old[I] > 0.7F && old[I] < 0.8F;
+    check(exact, "shared activation workspace vs frozen CUDA (including padding)");
+    check(cancellation, "shared activation cancellation row sigmoid(1)");
+    if (exact && cancellation) std::printf("Qwen shared activation: %zu workspace floats EXACT\n", got.size());
+    if (!ex) return;
+
+    auto expect = ws;
+    for (std::uint32_t r = 0; r < rows; ++r)
+        ref::shared_activation_row(&expect[r * stride], I, &in[r * input_stride], sc.data(), H, *ex);
+    std::size_t bad = 0, first = SIZE_MAX;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        const bool nan_both = got[i] != got[i] && expect[i] != expect[i];
+        if (!nan_both && ref::float_bits(got[i]) != ref::float_bits(expect[i])) { ++bad; if (first == SIZE_MAX) first = i; }
+    }
+    check(bad == 0, "shared activation synthetic (" + std::to_string(got.size()) + " floats, mismatches " + std::to_string(bad) +
+                        (bad ? " first " + std::to_string(first) + " gpu " + hex(ref::float_bits(got[first])) + " host " + hex(ref::float_bits(expect[first])) : "") + ")");
+}
+
+static void gpu_shared_tests(const strix::qwen_gguf::Model* model, const strix::cuda::amdmath::Tables& tables, const ref::HostExpf& ex) {
+    gpu_shared_activation_test(tables, &ex);
     if (!model) return;
     const auto gw = model->bytes("blk.0.ffn_gate_shexp.weight"), uw = model->bytes("blk.0.ffn_up_shexp.weight"),
                dwn = model->bytes("blk.0.ffn_down_shexp.weight"), scb = model->bytes("blk.0.ffn_gate_inp_shexp.weight");
@@ -701,6 +755,13 @@ static void replay_shared(const std::string& path, const strix::qwen_gguf::Model
 
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);  // a crash must not lose the log
+    if (argc == 3 && std::string_view(argv[1]) == "--shared-activation-exact") {
+        auto tables = strix::cuda::amdmath::load_tables(argv[2]);
+        gpu_shared_activation_test(tables, nullptr);
+        gpu_shared_activation_test<1, 257>(tables, nullptr);
+        strix::cuda::amdmath::free_tables(tables);
+        return g_fail ? 1 : 0;
+    }
 #ifdef STRIX_WFMT_CAPTURE
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::string_view(argv[i]) != "--wfmt-backend-capture") continue;

@@ -18,6 +18,7 @@
 //             ascending (:281); LDS tree strides 128..1, v_add_f32 (:301-401); 1/(1 + expf(-s)) (:416-457, IEEE div).
 #include "strix/env_flags.hpp"
 #include "strix/lever.hpp"
+#include "../../core/chain/collective.cuh"
 #include "../../core/imma_tile.cuh"
 #include "strix/cuda/core/decode_rows.hpp"
 #include "strix/cuda/qwen_dense.hpp"
@@ -229,33 +230,33 @@ struct DenseNumeric {
     }
 };
 // ---------------------------------------------------------------------------------------------------------------------
-// rows_shared_activation_scalar_kernel (src/hip_shared_expert_launcher.hip:535-562), 256 threads, blockIdx.y = row.
-__global__ __launch_bounds__(256) void shared_activation_kernel(float* workspace_base, std::uint64_t workspace_stride,
-                                                                const std::uint16_t* input_base, std::uint64_t input_stride,
-                                                                const float* scalar, std::uint32_t intermediate,
-                                                                std::uint32_t hidden, amdmath::Tables tables) {
-    __shared__ float scratch[256];
+namespace chain = ::strix::cuda::core::chain;
+using SharedSilu = chain::ActivationStep<chain::Form::act_silu_mul, 0, chain::Math::gfx1151_v1>;
+using SharedScalar = chain::List<chain::ActivationStep<chain::Form::gate_sigmoid_mul, 0, chain::Math::gfx1151_v1,
+                                                       chain::Fold::descending_upper_first_side_output>>;
+
+// Adapt Qwen's strided, in-place gate/up workspace to the shared chain entries.
+__global__ __launch_bounds__(chain::kThreads) void shared_activation_site(
+    float* workspace_base, std::uint64_t workspace_stride, const std::uint16_t* input_base, std::uint64_t input_stride,
+    const float* scalar, std::uint32_t intermediate, std::uint32_t hidden, amdmath::Tables tables) {
+    __shared__ float scratch[chain::kThreads];
     float* workspace = workspace_base + blockIdx.y * workspace_stride;
     const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    float* up = workspace + intermediate;
+    chain::ChainArgs args{};
     if (index < intermediate) {
-        const float gate = workspace[index];
-        const float up = workspace[intermediate + index];
-        const float den = __fadd_rn(1.0F, amdmath::amd_expf(tables, -gate));
-        workspace[index] = __fmul_rn(__fdiv_rn(gate, den), up);
+        const chain::Gfx1151Silu silu{up, tables};
+        args.aux[0] = &silu;
+        float gate = workspace[index];
+        chain::apply_element(SharedSilu{}, gate, index, args, {intermediate, 0});
+        workspace[index] = gate;
     }
     if (blockIdx.x != 0) return;
-    const std::uint16_t* input = input_base + blockIdx.y * input_stride;
-    float sum = 0.0F;
-    for (std::uint32_t feature = threadIdx.x; feature < hidden; feature += 256U)
-        sum = __fmaf_rn(scalar[feature], bf16_float(input[feature]), sum);   // v_dual_fmac_f32 (contracted in the ISA)
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-    for (std::uint32_t stride = 128U; stride > 0U; stride >>= 1U) {   // HIP :555-558, v_add_f32 upper + lower
-        if (threadIdx.x < stride) scratch[threadIdx.x] = __fadd_rn(scratch[threadIdx.x + stride], scratch[threadIdx.x]);
-        __syncthreads();
-    }
-    if (threadIdx.x == 0)
-        workspace[intermediate] = __fdiv_rn(1.0F, __fadd_rn(1.0F, amdmath::amd_expf(tables, -scratch[0])));
+    // Lane zero has consumed up[0]. Store the row sigmoid there for the down projection.
+    const chain::Gfx1151FoldedGate folded{input_base + blockIdx.y * input_stride, scalar, input_stride, hidden, tables, up};
+    args.aux[0] = &folded;
+    chain::RegisterRow<1> empty{};
+    chain::apply(SharedScalar{}, empty, args, {0, 0, 0, 0, 0, scratch});
 }
 
 
@@ -460,9 +461,9 @@ cudaError_t shared_activation(cudaStream_t stream, std::uint32_t rows, float* wo
                               std::uint32_t intermediate, std::uint32_t hidden, const amdmath::Tables& tables) {
     if (!rows) return cudaSuccess;
     if (!intermediate || workspace_stride < 2ULL * intermediate || !workspace || !input || !scalar) return cudaErrorInvalidValue;
-    const dim3 grid((intermediate + 255U) / 256U, rows);
-    shared_activation_kernel<<<grid, 256, 0, stream>>>(workspace, workspace_stride, input, input_stride, scalar, intermediate,
-                                                       hidden, tables);
+    const dim3 grid((intermediate + chain::kThreads - 1U) / chain::kThreads, rows);
+    shared_activation_site<<<grid, chain::kThreads, 0, stream>>>(workspace, workspace_stride, input, input_stride, scalar,
+                                                                intermediate, hidden, tables);
     return cudaGetLastError();
 }
 

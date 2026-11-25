@@ -1,5 +1,5 @@
 // Byte-identity + timing of the decode-row HC / router kernels: incumbent vs latency-hiding forms (rows 1..8).
-// Includes qwen_hc.cu so the (anonymous-namespace) kernels are called directly.
+// Includes qwen_hc.cu for the private HC and router-logit kernels. --route-exact compares the public selector only.
 // Build:  tests\cuda\build_qwen_test.bat <worktree> qwen_hc_rows_exact_test <outdir>   (adds gguf_reader + amd_math_tables)
 // Run:    qwen_hc_rows_exact_test.exe <tables dir, e.g. D:/tmp/qrtxpf-build/tables>   (GPU: via pro.sh)
 #include "../../src/cuda/models/qwen/qwen_hc.cu"
@@ -7,11 +7,16 @@
 #include "strix/cuda/amd_math_tables.hpp"
 #include <cstdio>
 #include <cstring>
+#include <iterator>
+#include <limits>
 #include <random>
+#include <string_view>
 #include <vector>
 
 namespace strix::cuda::qwen_hc {
 namespace {
+#include "../cuda_core/f3g_route_frozen.inc"
+
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { std::printf("CUDA %s @%d\n", cudaGetErrorString(e_), __LINE__); std::exit(2); } } while (0)
 int g_pass = 0, g_fail = 0;
 void* g_flush = nullptr;
@@ -52,6 +57,90 @@ std::mt19937 rng(12345);
 float nrm(float sd) { return std::normal_distribution<float>(0.0F, sd)(rng); }
 std::uint16_t bf16(float v) { std::uint32_t b; std::memcpy(&b, &v, 4); return static_cast<std::uint16_t>((b + 0x7fffU + ((b >> 16) & 1U)) >> 16); }
 
+std::vector<std::uint32_t> test_route_select(const std::vector<float>& logits, unsigned rows, unsigned top_k,
+                                             bool normalize, const am::Tables& tables, bool timing = false) {
+    const std::size_t slots = std::size_t{rows} * top_k;
+    constexpr std::uint32_t id_guard = 0xfeedU;
+    constexpr float weight_guard = 123.0F;
+    const std::vector<std::uint32_t> init_ids(slots + 1U, id_guard);
+    const std::vector<float> init_weights(slots + 1U, weight_guard);
+    auto* ld = dev(logits);
+    auto* frozen_ids = dev(init_ids);
+    auto* frozen_weights = dev(init_weights);
+    auto* bound_ids = dev(init_ids);
+    auto* bound_weights = dev(init_weights);
+    const auto block = [&] {
+        frozen::route_select_kernel<<<rows, 256U>>>(ld, top_k, normalize, frozen_ids, frozen_weights, tables);
+        CK(cudaGetLastError());
+    };
+    const auto warp = [&] {
+        frozen::route_select_warp_kernel<<<rows, 256U>>>(ld, top_k, normalize, frozen_ids, frozen_weights, tables);
+        CK(cudaGetLastError());
+    };
+    const auto bound = [&] { route_select(ld, rows, top_k, normalize, tables, bound_ids, bound_weights, nullptr); };
+    bound();
+    const auto ids = host(bound_ids, slots + 1U);
+    const auto weights = host(bound_weights, slots + 1U);
+    const auto matches = [&] {
+        return same(ids, host(frozen_ids, slots + 1U)) && same(weights, host(frozen_weights, slots + 1U));
+    };
+    block();
+    const bool block_exact = matches();
+    CK(cudaMemcpy(frozen_ids, init_ids.data(), init_ids.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(frozen_weights, init_weights.data(), init_weights.size() * sizeof(float), cudaMemcpyHostToDevice));
+    warp();
+    const bool warp_exact = matches();
+    if (!block_exact || !warp_exact) {
+        std::printf("route top_k=%u normalize=%d block_exact=%d warp_exact=%d\n",
+                    top_k, normalize, block_exact, warp_exact);
+    }
+    verdict("select", rows, block_exact && warp_exact && ids.back() == id_guard && weights.back() == weight_guard);
+    if (timing) std::printf("select   R=%u block %.2f us  warp %.2f us  bound %.2f us (b2b)\n",
+                            rows, time_b2b(block), time_b2b(warp), time_b2b(bound));
+    CK(cudaFree(bound_weights)); CK(cudaFree(bound_ids)); CK(cudaFree(frozen_weights)); CK(cudaFree(frozen_ids));
+    CK(cudaFree(ld));
+    return ids;
+}
+
+void test_route_exact(const am::Tables& tables) {
+    constexpr unsigned rows = 32U;
+    constexpr float neg_inf = -std::numeric_limits<float>::infinity();
+    constexpr float nan = std::numeric_limits<float>::quiet_NaN();
+    std::mt19937 random(0xF351U);
+    std::vector<float> logits(rows * kExperts);
+    for (float& v : logits) v = static_cast<float>(static_cast<int>(random() % 4096U) - 2048) / 64.0F;
+    std::fill_n(logits.data(), kExperts, neg_inf);
+    std::fill_n(logits.data() + kExperts, kExperts, nan);
+    logits[2U * kExperts + 319U] = nan;
+    logits[3U * kExperts + 511U] = -neg_inf;
+    std::fill_n(logits.data() + 4U * kExperts, kExperts, neg_inf);
+    constexpr unsigned tied[]{31U, 32U, 255U, 256U, 511U};
+    for (unsigned expert : tied) logits[4U * kExperts + expert] = 4.0F;
+    std::fill_n(logits.data() + 5U * kExperts, kExperts, -0.0F);
+    logits[5U * kExperts + 256U] = 0.0F;
+
+    unsigned cases = 0;
+    for (unsigned top_k = 1; top_k <= moe::kGfx1151RouteMaxTopK; ++top_k) {
+        for (bool normalize : {false, true}) {
+            const auto ids = test_route_select(logits, rows, top_k, normalize, tables);
+            bool valid = true;
+            for (unsigned row = 0; row < rows; ++row) {
+                for (unsigned slot = 0; slot < top_k; ++slot) {
+                    const auto id = ids[row * top_k + slot];
+                    valid &= row < 4U ? id == kExperts : id < kExperts;
+                }
+            }
+            verdict("invalid_route sentinel", rows, valid);
+            for (unsigned slot = 0; slot < top_k; ++slot) {
+                const unsigned sparse_id = slot < std::size(tied) ? tied[slot] : slot - static_cast<unsigned>(std::size(tied));
+                verdict("ties", rows, ids[4U * top_k + slot] == sparse_id && ids[5U * top_k + slot] == slot);
+            }
+            cases += rows;
+        }
+    }
+    if (!g_fail) std::printf("Qwen HC route: %u row/case comparisons to both frozen selectors EXACT, invalid_route PASS\n", cases);
+}
+
 template <unsigned R> void test_router(const float* wd, const std::uint16_t* hd, float* l_old, float* l_new, const am::Tables& tab, unsigned top_k, bool timing) {
     constexpr unsigned smem_old = kRtePerBlock * kRtePitch * 4U + R * (kHidden + 2U) * 2U;
     constexpr unsigned smem_new = kRtePerBlock * kRtvWP * 4U + R * kRtvXP * 2U;
@@ -67,18 +156,8 @@ template <unsigned R> void test_router(const float* wd, const std::uint16_t* hd,
         auto lg = host(l_old, R * kExperts);
         if (variant == 1) for (auto& v : lg) v = std::round(v * 4.0F) / 4.0F;
         if (variant == 2) lg[(R - 1) * kExperts + 7] = std::nanf("");
-        float* ld = dev(lg);
-        std::uint32_t *ia, *ib; float *wa, *wb;
-        CK(cudaMalloc(&ia, R * 32 * 4)); CK(cudaMalloc(&ib, R * 32 * 4)); CK(cudaMalloc(&wa, R * 32 * 4)); CK(cudaMalloc(&wb, R * 32 * 4));
-        for (int normalize = 0; normalize < 2; ++normalize) {
-            auto so = [&] { route_select_kernel<<<R, 256U>>>(ld, top_k, normalize != 0, ia, wa, tab); };
-            auto sn = [&] { route_select_warp_kernel<<<R, 256U>>>(ld, top_k, normalize != 0, ib, wb, tab); };
-            CK(cudaMemset(ia, 0, R * 128)); CK(cudaMemset(ib, 0, R * 128)); CK(cudaMemset(wa, 0, R * 128)); CK(cudaMemset(wb, 0, R * 128));
-            so(); sn(); CK(cudaDeviceSynchronize());
-            verdict("select", R, same(host(ia, R * top_k), host(ib, R * top_k)) && same(host(wa, R * top_k), host(wb, R * top_k)));
-            if (timing && variant == 0 && normalize == 1) std::printf("select   R=%u old %.2f us  new %.2f us (b2b)\n", R, time_b2b(so), time_b2b(sn));
-        }
-        cudaFree(ld); cudaFree(ia); cudaFree(ib); cudaFree(wa); cudaFree(wb);
+        for (bool normalize : {false, true})
+            test_route_select(lg, R, top_k, normalize, tab, timing && variant == 0 && normalize);
     }
 }
 
@@ -108,6 +187,12 @@ template <unsigned R> void test_all(const std::vector<float>& wv, const std::vec
 
 int main(int argc, char** argv) {
     using namespace strix::cuda::qwen_hc;
+    if (argc == 3 && std::string_view(argv[1]) == "--route-exact") {
+        auto tables = am::load_tables(argv[2]);
+        test_route_exact(tables);
+        am::free_tables(tables);
+        return g_fail ? 1 : 0;
+    }
     const std::string dir = argc > 1 ? argv[1] : ".";
     am::Tables tab = am::load_tables(dir);
     CK(cudaMalloc(&g_flush, kFlush));
