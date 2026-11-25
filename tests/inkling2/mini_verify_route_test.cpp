@@ -5,6 +5,9 @@
 #include <array>
 #include <iostream>
 #include <optional>
+#include <span>
+#include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -54,9 +57,9 @@ constexpr bool check_cohort_lanes() {
             if (!mini_resident_route(kind, rows, true, false).packed_moe) return false;
         }
         if (covered != lanes) return false;
-        // Grouped decode runs one lane per pass: a one-lane grouped pass is the lone grouped decode (width-invariant).
+        // Grouped decode keeps the incumbent served schedule: the whole cohort in one batched forward.
         const auto grouped = strix::serve::plan_cohort_passes(lanes, mini_cohort_pass_cap(false, one_row_cap));
-        if (grouped.count != lanes || grouped.rows(0U) != 1U || grouped.first(lanes - 1U) != lanes - 1U) return false;
+        if (grouped.count != 1U || grouped.rows(0U) != lanes || grouped.first(0U) != 0U) return false;
         if (mini_resident_route(MiniAppendKind::verify, 1U, false, false).packed_moe) return false;
     }
     return true;
@@ -64,23 +67,51 @@ constexpr bool check_cohort_lanes() {
 
 static_assert(check_cohort_lanes());
 
-// decode_slots copies its input ids before the first pass: with ids = buf[0..17) and top = buf[1..18) the 9-row first
-// pass would overwrite the first input of the second pass. Model of the loop: the copy reads every input unchanged.
-constexpr bool check_overlap_snapshot() {
+// The transaction MiniResidentDecoder::decode_slots runs (serve::run_cohort_passes, the production call): 17 lanes at
+// the HIP one-row cap 16 are passes of 9 + 8 rows; with ids = buf[0..17) and top = buf[1..18) the first pass's picks
+// would overwrite the first input of the second pass without the snapshot. A second pass that throws must leave every
+// output unchanged and retire the cohort once.
+bool check_cohort_transaction() {
     constexpr unsigned lanes = 17U;
-    unsigned buf[lanes + 1U]{};
-    for (unsigned i = 0; i < lanes; ++i) buf[i] = 100U + i;
-    unsigned snapshot[lanes]{};
-    for (unsigned i = 0; i < lanes; ++i) snapshot[i] = buf[i];
-    unsigned picks[lanes]{};
-    const auto passes = strix::serve::plan_cohort_passes(lanes, 16U);
-    for (unsigned pass = 0; pass < passes.count; ++pass)
-        for (unsigned row = 0; row < passes.rows(pass); ++row) picks[passes.first(pass) + row] = snapshot[passes.first(pass) + row] + 1U;
-    for (unsigned i = 0; i < lanes; ++i) buf[1U + i] = picks[i];  // publish after the last pass
-    return passes.count == 2U && picks[9] == 110U && buf[10] == 110U;
+    for (const bool fail_second : {false, true}) {
+        std::array<unsigned, lanes + 1U> buf{};
+        for (unsigned i = 0; i <= lanes; ++i) buf[i] = 100U + i;
+        const auto before = buf;
+        const auto ids = std::span<const unsigned>(buf).first(lanes);
+        const auto top = std::span<unsigned>(buf).subspan(1U, lanes);
+        std::vector<unsigned> snapshot, picks;
+        unsigned passes = 0U, retired = 0U;
+        bool threw = false;
+        try {
+            strix::serve::run_cohort_passes(ids, top, strix::inkling2::mini_cohort_pass_cap(true, 16U), snapshot, picks,
+                [&](unsigned first, unsigned rows, std::span<const unsigned> pass_ids, std::span<unsigned> out) {
+                    if (passes++ == 1U && fail_second) throw std::runtime_error("pass two failed");
+                    if (first != (passes == 1U ? 0U : 9U) || rows != (passes == 1U ? 9U : 8U)) throw std::logic_error("split");
+                    for (unsigned r = 0; r < rows; ++r) out[r] = pass_ids[r] + 1000U;
+                    for (unsigned r = 0; r < rows; ++r) buf[1U + first + r] = 7U;  // a writer racing the outputs
+                }, [&] { ++retired; });
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        if (fail_second) {
+            // The racing writes of pass one are the only change: top was never published, the cohort retired once.
+            if (!threw || retired != 1U || passes != 2U) return false;
+            for (unsigned i = 10U; i <= lanes; ++i) if (buf[i] != before[i]) return false;
+            continue;
+        }
+        if (threw || retired != 0U || passes != 2U) return false;
+        for (unsigned i = 0; i < lanes; ++i) if (buf[1U + i] != before[i] + 1000U) return false;  // inputs read unchanged
+    }
+    // Grouped decode: the whole cohort in one pass (the incumbent served schedule).
+    std::array<unsigned, 17> ids{}, top{};
+    std::vector<unsigned> snapshot, picks;
+    unsigned calls = 0U;
+    strix::serve::run_cohort_passes(ids, top, strix::inkling2::mini_cohort_pass_cap(false, 16U), snapshot, picks,
+        [&](unsigned first, unsigned rows, std::span<const unsigned>, std::span<unsigned>) {
+            calls += first == 0U && rows == 17U ? 1U : 100U;
+        }, [] {});
+    return calls == 1U;
 }
-
-static_assert(check_overlap_snapshot());
 
 struct Shape {
     static constexpr unsigned kQueryWidth = 4U;
@@ -122,6 +153,10 @@ bool check_windows() {
 }  // namespace
 
 int main() {
+    if (!check_cohort_transaction()) {
+        std::cerr << "FAIL Inkling Mini cohort pass transaction (snapshot, publish after the last pass, retire)\n";
+        return 1;
+    }
     if (!check_windows()) {
         std::cerr << "FAIL Inkling Mini verify attention row views\n";
         return 1;

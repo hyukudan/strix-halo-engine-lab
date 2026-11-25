@@ -66,6 +66,15 @@ inline bool mini_combine_image(const profile::Resolution& tier) {
     throw std::invalid_argument("STRIX_INK_COMBINE_IMAGE must be 0 or 1");
 }
 
+// Resolved state of the served route lever (true: a HIP server runs the command line's route, kMiniServedCliRoute).
+// 0 or absent = off: the served incumbent route.
+inline bool mini_served_cli_route(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniServedCliRoute);
+    if (entry == nullptr || entry->value == "0") return false;
+    if (entry->value == "1") return true;
+    throw std::invalid_argument("STRIX_INK_SERVED_CLI_ROUTE must be 0 or 1");
+}
+
 // "on", "off" or "declined" (selected, but the target does not run it): the state name of a lever in the startup lines
 // (down_image, prepared_round_fold), the same text in the CLI, the gate and the server.
 inline const char* mini_down_image_name(bool active, bool selected) { return active ? "on" : selected ? "declined" : "off"; }
@@ -104,6 +113,7 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
     static_cast<void>(mini_moe_w4a4(tier));  // refuse a malformed or unrunnable explicit switch early
     static_cast<void>(mini_prepared_round_fold(tier));
     static_cast<void>(mini_combine_image(tier));
+    static_cast<void>(mini_served_cli_route(tier));
     return tier;
 }
 

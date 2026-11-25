@@ -176,16 +176,18 @@ public:
 #endif
     }
 
-    // Served prompt route of this backend (serve::FixedKvCohort reads it once): HIP emits-first
-    // (prefill_slot_first), CUDA the held-back route (prefill_slot) until its identity ticket covers emits-first
-    // serving (mini_served_prefill_emits_first).
-    [[nodiscard]] bool prefill_emits_first() const noexcept {
+    // Served prompt route (serve::FixedKvCohort reads it once, at its construction): emits-first (prefill_slot_first)
+    // where set_served_cli_route admitted the command line's route (HIP), else the incumbent held-back route
+    // (prefill_slot). Returns whether the backend admitted it (CUDA declines: not qualified there).
+    bool set_served_cli_route(bool on) noexcept {
 #if defined(__HIPCC__)
-        return mini_served_prefill_emits_first(true);
+        served_cli_route_ = mini_served_prefill_emits_first(true, on);
 #else
-        return mini_served_prefill_emits_first(false);
+        served_cli_route_ = mini_served_prefill_emits_first(false, on);
 #endif
+        return served_cli_route_;
     }
+    [[nodiscard]] bool prefill_emits_first() const noexcept { return served_cli_route_; }
 
     // Held-back served prefill (the CUDA served route): a lane's prompt rows by greedy chunks with no score row; the
     // cohort holds back the last prompt token and decodes it as the lane's first decode row.
@@ -218,12 +220,9 @@ public:
     // Admitted tail capacity (serve::CohortBackend::prompt_tail_rows), the cut rule of served pieces and the first
     // chunk of one prefill call (prompt_piece_rule / prompt_call_chunk).
     [[nodiscard]] unsigned prefill_tail_rows() const noexcept { return tail_rows_; }
+    // Pieces cut only on the command line's route (the held-back route runs its incumbent whole slices).
     [[nodiscard]] serve::PromptPieceRule prefill_piece_rule() const noexcept {
-#if defined(__HIPCC__)
-        return mini_prefill_piece_rule(true);
-#else
-        return mini_prefill_piece_rule(false);
-#endif
+        return mini_prefill_piece_rule(served_cli_route_);
     }
     [[nodiscard]] std::uint64_t prefill_call_chunk_rows(std::uint64_t rows) const noexcept {
         return mini_call_first_chunk(rows, prefill_rows_, call_tail_rows(static_cast<std::size_t>(rows)));
@@ -261,7 +260,7 @@ public:
 #if !defined(__HIPCC__)
         // A cohort decode program per width (captured once, replayed for any slots and positions). The lone
         // slot-0 lane keeps its one-row step graph; DSpark taps step lanes one at a time.
-        if (backend_.packed_decode() && draft_taps_.span().empty() && !(slots.size() == 1U && slots.front() == 0U)) {
+        if (draft_taps_.span().empty() && !(slots.size() == 1U && slots.front() == 0U)) {
             const auto width = cohort_policy_.width(static_cast<std::uint32_t>(slots.size()), decode_rows_);
             if (width != 0U) {
                 decode_cohort(slots, ids, top, width);
@@ -279,45 +278,39 @@ public:
         }
 
         // Packed decode: balanced passes of at most kCohortPassRows lanes keep every dense row on the one-row body, so
-        // a lane's bits do not depend on the cohort width. Grouped decode runs one lane per pass (a lone grouped
-        // decode). Lane r's head scores land at logit row r for any pass split. The whole cohort is checked before
-        // the first pass writes (distinct lanes that admit their row), the input ids are copied before any pass
-        // (ids and top may overlap), and the picks are published only after every pass finished: a pass that throws
-        // retires every lane of the cohort, as one append_batch does, and top stays untouched.
+        // a lane's bits do not depend on the cohort width. Grouped decode keeps the incumbent served schedule: the
+        // whole cohort in one forward. Lane r's head scores land at logit row r for any pass split. The whole cohort
+        // is checked before the first pass writes (distinct lanes that admit their row); serve::run_cohort_passes
+        // copies the input ids before any pass (ids and top may overlap) and publishes the picks only after every
+        // pass finished: a pass that throws retires every lane of the cohort, as one append_batch does, and top
+        // stays untouched.
         const auto lanes = static_cast<unsigned>(ids.size());
-        const auto passes =
-            ::strix::serve::plan_cohort_passes(lanes, mini_cohort_pass_cap(backend_.packed_decode(), kCohortPassRows));
         MiniResidentSessionState::require_batch(groups_);
-        pass_picks_.assign(lanes, 0U);
-        try {
-            for (unsigned pass = 0; pass < passes.count; ++pass) {
-                const auto first = passes.first(pass);
-                const auto rows = passes.rows(pass);
-                const auto pass_ids = std::span<const unsigned>(pass_ids_).subspan(first, rows);
-                const auto embeddings = embeddings_.span().first(std::size_t{rows} * kHiddenWidth);
-                const auto hidden = hidden_.span().first(embeddings.size());
-                const auto scores = logits_.span().subspan(::strix::head::logit_row_offset(first, kLogitPitch));
-                const auto logits = scores.first(::strix::head::logit_rows_elements(rows, kOutputVocabulary, kLogitPitch));
-                // Verify routing gives each packed row the decode MoE and attention arithmetic.
-                const auto kind = rows <= kMaxVerifyRows ? MiniAppendKind::verify : MiniAppendKind::decode;
-                MiniResidentForward forward(backend_, workspace());
-                forward.append_batch(std::span<const MiniResidentAppendGroup>(groups_).subspan(first, rows), rows,
-                                     embeddings, hidden, [&] {
-                    embed(pass_ids, embeddings, rows, kind);
-                }, [&](MiniConstRows output) {
-                    project_head_rows(output.data(), rows, scores.first(std::size_t{rows} * kLogitPitch));
-                    greedy_.enqueue_rows(logits, rows, kLogitPitch, stream_.get());
-                }, [&] {
-                    for (unsigned row = 0; row < rows; ++row) (void)checked_token(greedy_, row);
-                });
-                for (unsigned row = 0; row < rows; ++row) pass_picks_[first + row] = greedy_.token(row);
-            }
-        } catch (...) {
+        ::strix::serve::run_cohort_passes(ids, top, mini_cohort_pass_cap(backend_.packed_decode(), kCohortPassRows),
+                                          pass_ids_, pass_picks_,
+                                          [&](unsigned first, unsigned rows, std::span<const unsigned> pass_ids,
+                                              std::span<unsigned> picks) {
+            const auto embeddings = embeddings_.span().first(std::size_t{rows} * kHiddenWidth);
+            const auto hidden = hidden_.span().first(embeddings.size());
+            const auto scores = logits_.span().subspan(::strix::head::logit_row_offset(first, kLogitPitch));
+            const auto logits = scores.first(::strix::head::logit_rows_elements(rows, kOutputVocabulary, kLogitPitch));
+            // Verify routing gives each packed row the decode MoE and attention arithmetic.
+            const auto kind = rows <= kMaxVerifyRows ? MiniAppendKind::verify : MiniAppendKind::decode;
+            MiniResidentForward forward(backend_, workspace());
+            forward.append_batch(std::span<const MiniResidentAppendGroup>(groups_).subspan(first, rows), rows,
+                                 embeddings, hidden, [&] {
+                embed(pass_ids, embeddings, rows, kind);
+            }, [&](MiniConstRows output) {
+                project_head_rows(output.data(), rows, scores.first(std::size_t{rows} * kLogitPitch));
+                greedy_.enqueue_rows(logits, rows, kLogitPitch, stream_.get());
+            }, [&] {
+                for (unsigned row = 0; row < rows; ++row) (void)checked_token(greedy_, row);
+            });
+            for (unsigned row = 0; row < rows; ++row) picks[row] = greedy_.token(row);
+        }, [&] {
             for (const auto& group : groups_) group.state->poison();
             last_logit_rows_ = 0U;
-            throw;
-        }
-        std::copy(pass_picks_.begin(), pass_picks_.end(), top.begin());
+        });
         last_logit_rows_ = lanes;
     }
 
@@ -881,6 +874,7 @@ private:
     std::vector<MiniResidentAppendGroup> groups_;
     std::vector<unsigned> pass_ids_;    // decode_slots input snapshot
     std::vector<unsigned> pass_picks_;  // decode_slots picks, published after the last pass
+    bool served_cli_route_ = false;     // served prompt route: emits-first (set_served_cli_route), else held-back
     core::ResidentGreedy greedy_;
     std::optional<mini_gpu::Buffer<float>> verify_logits_;
     std::optional<core::ResidentGreedy> verify_greedy_;

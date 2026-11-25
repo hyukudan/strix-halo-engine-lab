@@ -124,16 +124,17 @@ inline MiniPrefillSchedule mini_prefill_schedule_from_env(bool hip) {
     return schedule;
 }
 
-// Served prompt route per backend. HIP serves the command line's schedule above with the first id taken from the final
-// prefill row (emits-first; device evidence: served prefill == CLI prefill bitwise, chunk and tail edges included). A
-// CUDA server keeps the route it served before until its own identity ticket covers the command line's schedule:
-// 128-row chunks, no tail, the last prompt token held back and decoded as the first decode row.
+// Served prompt route. A HIP server with the served route lever (kMiniServedCliRoute, opt-in in every profile column)
+// serves the command line's schedule above with the first id taken from the final prefill row (emits-first; device
+// evidence: served prefill == CLI prefill bitwise, chunk and tail edges included). Without it, and on CUDA (not
+// qualified there), a server keeps the route it served before: 128-row chunks, no tail, the last prompt token held back
+// and decoded as the first decode row.
 inline constexpr unsigned kMiniServedHeldBackChunk = 128U;
-constexpr bool mini_served_prefill_emits_first(bool hip) noexcept { return hip; }
+constexpr bool mini_served_prefill_emits_first(bool hip, bool cli_route) noexcept { return hip && cli_route; }
 
-inline MiniPrefillSchedule mini_served_prefill_schedule_from_env(bool hip) {
-    return mini_served_prefill_emits_first(hip) ? mini_prefill_schedule_from_env(hip)
-                                                : MiniPrefillSchedule{kMiniServedHeldBackChunk, 0U};
+inline MiniPrefillSchedule mini_served_prefill_schedule_from_env(bool hip, bool cli_route) {
+    return mini_served_prefill_emits_first(hip, cli_route) ? mini_prefill_schedule_from_env(hip)
+                                                           : MiniPrefillSchedule{kMiniServedHeldBackChunk, 0U};
 }
 
 // Tail rows a chunk may absorb (before the decoder's own admission, mini_admitted_tail_capacity). None when the
@@ -153,7 +154,8 @@ constexpr serve::PromptPieceRule mini_prefill_piece_rule(bool hip) {
                : serve::PromptPieceRule{};
 }
 
-// Served lane cap without --slots, and the rows of one served prompt piece while another lane decodes (HIP).
+// Served lane cap without --slots (an explicit --prefill-rows without --slots caps the lanes at its rows, as it did
+// before the served chunk and the lane cap were separate), and the rows of one served prompt piece while another lane decodes (HIP).
 inline constexpr unsigned kMiniServeLaneRows = 128U;
 inline constexpr unsigned kMiniServeDecodingRows = 128U;
 static_assert(kMiniServeDecodingRows % kMiniPrefillWaveRows == 0U &&

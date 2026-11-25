@@ -16,10 +16,13 @@ inline constexpr unsigned kMiniMaxVerifyRows = 8U;
 // grouped form makes no batch-invariance contract. The same request gets the same form wherever it arrives.
 inline constexpr bool kMiniPackedDecodeDefault = true;
 
-// The served default is qualified per backend: HIP (served lanes == lone decode on the device, every cohort width) takes
-// the one default above; a CUDA server without a flag keeps the grouped form it served before until its own identity
-// ticket covers packed serving. Either flag selects the same form on both entry points.
-constexpr bool mini_served_packed_default(bool hip_backend) noexcept { return hip_backend && kMiniPackedDecodeDefault; }
+// Served default: the one default above only where the server runs the command line's route (a HIP server with the
+// served route lever, kMiniServedCliRoute: served lanes == lone decode on the device at every cohort width). Without
+// the lever, and on CUDA, a server without a flag keeps the grouped form it served before. Either flag selects the same
+// form on both entry points.
+constexpr bool mini_served_packed_default(bool hip_backend, bool cli_route) noexcept {
+    return hip_backend && cli_route && kMiniPackedDecodeDefault;
+}
 
 // --packed-decode (true) / --grouped-decode (false) / neither (the default above).
 constexpr bool mini_packed_decode(std::optional<bool> requested) noexcept {
@@ -55,11 +58,11 @@ constexpr MiniResidentRoute mini_resident_route(MiniAppendKind kind, unsigned ro
 
 // Row cap of one batched cohort decode pass (0 = the whole cohort in one pass, serve::plan_cohort_passes). Packed
 // decode promises that a lane's bits do not depend on the cohort width, so it runs passes of at most the backend's
-// one-row cap (the dense rows family keeps its one-row body up to that many rows). Grouped runs passes of ONE lane:
-// a one-lane grouped pass is the lone grouped decode, so an explicit --grouped-decode lane also keeps its bits at
-// any cohort width (the route line prints moe_decode=grouped).
+// one-row cap (the dense rows family keeps its one-row body up to that many rows). Grouped keeps the incumbent served
+// schedule: the whole cohort in one batched forward (the grouped form makes no batch-invariance contract; its lane bits
+// depend on the cohort width, as they did before).
 constexpr unsigned mini_cohort_pass_cap(bool packed_decode, unsigned backend_one_row_cap) noexcept {
-    return packed_decode ? backend_one_row_cap : 1U;
+    return packed_decode ? backend_one_row_cap : 0U;
 }
 
 // HIP targets the exact down-image lever (inkling2-mini-combine-down-image@1) is qualified on: the NaN identity fixture and

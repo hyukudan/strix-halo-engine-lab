@@ -308,6 +308,16 @@ void set_round_fold_env(const char* value) {
 #endif
 }
 
+// The served route lever value (process environment, as strix-serve reads it); nullptr clears it.
+void set_cli_route_env(const char* value) {
+#ifdef _WIN32
+    require(_putenv_s("STRIX_INK_SERVED_CLI_ROUTE", value ? value : "") == 0, "cannot set STRIX_INK_SERVED_CLI_ROUTE");
+#else
+    require((value ? setenv("STRIX_INK_SERVED_CLI_ROUTE", value, 1) : unsetenv("STRIX_INK_SERVED_CLI_ROUTE")) == 0,
+            "cannot set STRIX_INK_SERVED_CLI_ROUTE");
+#endif
+}
+
 // The served down-image lever value (process environment, as strix-serve reads it); nullptr clears it.
 void set_image_env(const char* value) {
 #ifdef _WIN32
@@ -320,7 +330,8 @@ void set_image_env(const char* value) {
 
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
             W4a4 w4a4 = W4a4::bf16, std::optional<bool> decode_form = std::nullopt,
-            std::string_view tier_name = "fast", bool image = false, bool round_fold = false) {
+            std::string_view tier_name = "fast", bool image = false, bool round_fold = false, bool cli_route = false,
+            unsigned prefill_rows = 0U) {
     sv::ServiceFactories factories;
     bool created = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
@@ -339,28 +350,33 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                 "the served round fold is reported by its effective state");
         // The served prefill resolves the down-image lever like the CLI and the gate do: off unless selected explicitly.
         require(options.combine_image == image, "down-image selection did not reach native adapter");
-        // One decode form per request on every entry point: the command line's default, or the flag given.
-        const bool served_hip = std::string_view(backend) == "hip";
-        require(options.packed_decode == decode_form.value_or(mini::mini_served_packed_default(served_hip)) &&
-                    (!decode_form || options.packed_decode == mini::mini_packed_decode(decode_form)) &&
-                    mini::kMiniPackedDecodeDefault && mini::mini_served_packed_default(true) &&
-                    !mini::mini_served_packed_default(false),
-                "served decode form differs from the command line's form for the same flags (HIP default packed; "
-                "CUDA keeps grouped without a flag until its identity ticket)");
-        // HIP serves the command line's prefill schedule (chunk and tail rule, the whole prompt by prefill, emits-first,
-        // pieces only where the decoder's rule cuts without changing bits). A CUDA server keeps its incumbent route
-        // (128-row chunks, no tail, the last prompt token decoded) until its identity ticket.
+        // The served route lever (opt-in in every profile column): a HIP server runs the command line's route only when
+        // STRIX_INK_SERVED_CLI_ROUTE=1 selects it; without it, and on CUDA, the incumbent served route.
         const bool hip_backend = std::string_view(backend) == "hip";
+        const bool route = cli_route && hip_backend;
+        require(options.served_cli_route == route, "served route lever: opt-in, HIP only");
+        // The decode form: a flag as on the command line; without one, the route's served default (packed on the
+        // command line's route, grouped on the incumbent served route).
+        require(options.packed_decode == decode_form.value_or(mini::mini_served_packed_default(hip_backend, cli_route)) &&
+                    (!decode_form || options.packed_decode == mini::mini_packed_decode(decode_form)) &&
+                    mini::kMiniPackedDecodeDefault && mini::mini_served_packed_default(true, true) &&
+                    !mini::mini_served_packed_default(true, false) && !mini::mini_served_packed_default(false, true),
+                "served decode form: a flag as on the command line, else packed only on the command line's route");
+        // The prompt route: the command line's schedule (chunk and tail rule, emits-first) on its route; the incumbent
+        // held-back route (128-row chunks, no tail, the last prompt token decoded) otherwise.
         const auto cli = mini::mini_prefill_schedule_from_env(hip_backend);
-        const auto schedule = mini::mini_served_prefill_schedule_from_env(hip_backend);
-        require(mini::mini_served_prefill_emits_first(hip_backend) == hip_backend &&
-                    (hip_backend ? schedule.chunk == cli.chunk && schedule.tail_divisor == cli.tail_divisor
-                                 : schedule.chunk == 128U && schedule.tail_divisor == 0U) &&
-                    options.prefill_rows == std::min(schedule.chunk, options.context) &&
+        const auto schedule = mini::mini_served_prefill_schedule_from_env(hip_backend, cli_route);
+        const auto chunk = prefill_rows != 0U ? prefill_rows : schedule.chunk;
+        require(mini::mini_served_prefill_emits_first(hip_backend, cli_route) == route &&
+                    (route ? schedule.chunk == cli.chunk && schedule.tail_divisor == cli.tail_divisor
+                           : schedule.chunk == 128U && schedule.tail_divisor == 0U) &&
+                    options.prefill_rows == std::min(chunk, options.context) &&
                     options.prefill_tail ==
                         mini::mini_prefill_tail_capacity(options.prefill_rows, schedule.tail_divisor, options.context) &&
-                    mini::mini_prefill_piece_rule(hip_backend).cuttable() == hip_backend,
-                "served prefill route: HIP = the command line's schedule, CUDA = the incumbent held-back route");
+                    mini::mini_prefill_piece_rule(route).cuttable() == route,
+                "served prefill route: the command line's schedule on its route, else the incumbent held-back route");
+        // An explicit --prefill-rows without --slots keeps capping the lanes as before (not the 128-lane default).
+        require(options.slots == 0U && options.lane_rows == prefill_rows, "explicit --prefill-rows lane cap");
         // The served tier is the native command line's resolution of the same --profile (TURBO included: the native
         // resolver inherits the admitted FAST levers), with the same lever classes.
         mini::MiniWeightOptions cli_weights;
@@ -397,6 +413,10 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                                      "--profile", std::string(tier_name), "--speculation", "off"};
     if (qualify_q8) strings.emplace_back("--qualify-q8");
     if (decode_form) strings.emplace_back(*decode_form ? "--packed-decode" : "--grouped-decode");
+    if (prefill_rows != 0U) {
+        strings.emplace_back("--prefill-rows");
+        strings.emplace_back(std::to_string(prefill_rows));
+    }
     const auto run = [&](sv::ServeShell shell, std::ostream& out, std::ostream& error) {
         std::vector<char*> argv;
         for (auto& arg : strings) argv.push_back(arg.data());
@@ -500,7 +520,8 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
     if (rc != 0) throw std::runtime_error(error.str());
     require(created, "selected backend was not constructed");
     // The socket startup re-creates the service with its own arguments (no decode flag).
-    if (!qualify_q8 && !decode_form && tier_name == "fast" && (std::string_view(backend) == "hip" || sample_capable)) {
+    if (!qualify_q8 && !decode_form && prefill_rows == 0U && tier_name == "fast" &&
+        (std::string_view(backend) == "hip" || sample_capable)) {
         const auto* factory = factories.find("inkling2");
         require(factory != nullptr, "Inkling service factory was not registered");
         socket_startup(*factory, backend, sample_capable);
@@ -512,6 +533,7 @@ int main(int argc, char** argv) try {
     require(argc == 2, "expected repository root");
     set_image_env(nullptr);
     set_round_fold_env(nullptr);
+    set_cli_route_env(nullptr);
     admission();
     sampling();
     for (const auto* backend : {"hip", "cuda"}) {
@@ -546,6 +568,19 @@ int main(int argc, char** argv) try {
     set_image_env("0");
     wiring(argv[1], "hip", false);
     set_image_env(nullptr);
+    // The served route lever: off by default in every tier (above); STRIX_INK_SERVED_CLI_ROUTE=1 selects the command
+    // line's route on HIP (CUDA declines it) in any tier, with or without a decode flag; an explicit 0 keeps it off.
+    set_cli_route_env("1");
+    for (const auto* backend : {"hip", "cuda"})
+        for (const auto* tier : {"exact", "fast", "turbo"})
+            for (const auto form : {std::optional<bool>{}, std::optional<bool>{false}})
+                wiring(argv[1], backend, false, false, W4a4::bf16, form, tier, false, false, true);
+    set_cli_route_env("0");
+    wiring(argv[1], "hip", false);
+    set_cli_route_env(nullptr);
+    // An explicit --prefill-rows without --slots caps the lanes at its rows on both routes.
+    for (const auto* backend : {"hip", "cuda"}) wiring(argv[1], backend, false, false, W4a4::bf16, std::nullopt, "fast",
+                                                       false, false, false, 32U);
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

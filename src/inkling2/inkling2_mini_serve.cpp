@@ -73,6 +73,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.moe_w4a4 = mini_moe_w4a4_class(resolution);
     out.prepared_round_fold = mini_prepared_round_fold(resolution);
     out.combine_image = mini_combine_image(resolution);
+    const bool cli_route = mini_served_cli_route(resolution);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();
@@ -80,12 +81,18 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
-    // The decode form through the one resolver the command line calls, with the backend's served default.
-    out.packed_decode =
-        serve::resolve_decode_form(packed_flag, grouped_flag, mini_served_packed_default(resolved.backend == "hip"));
-    // The served prompt route for this backend (mini_served_prefill_schedule_from_env): HIP the command line's chunk
-    // and tail rule; CUDA its incumbent held-back route until qualified.
-    const auto schedule = mini_served_prefill_schedule_from_env(resolved.backend == "hip");
+    // The served route: the command line's route where the served route lever selects it and the backend is qualified
+    // for it (HIP), else the incumbent served route (a CUDA server declines the lever).
+    const bool hip = resolved.backend == "hip";
+    out.served_cli_route = mini_served_prefill_emits_first(hip, cli_route);
+    // The decode form through the one resolver the command line calls, with the route's served default.
+    out.packed_decode = serve::resolve_decode_form(packed_flag, grouped_flag, mini_served_packed_default(hip, cli_route));
+    // The served prompt schedule of that route (mini_served_prefill_schedule_from_env): the command line's chunk and
+    // tail rule, or the incumbent held-back chunks.
+    const auto schedule = mini_served_prefill_schedule_from_env(hip, cli_route);
+    // An explicit --prefill-rows without --slots also caps the lanes, as it did before the served lane cap
+    // (kMiniServeLaneRows) was separate from the prefill chunk.
+    if (out.prefill_rows != 0U && out.slots == 0U) out.lane_rows = out.prefill_rows;
     if (out.prefill_rows == 0U) out.prefill_rows = schedule.chunk;
     out.prefill_rows = std::min(out.prefill_rows, out.context);
     out.prefill_tail = mini_prefill_tail_capacity(out.prefill_rows, schedule.tail_divisor, out.context);
@@ -211,7 +218,7 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             const auto& opt = resolved.options;
             out << "backend " << resolved.backend << " context " << opt.context << " prefill_rows " << opt.prefill_rows
                 << " prefill_tail " << opt.prefill_tail << " first_id "
-                << (mini_served_prefill_emits_first(resolved.backend == "hip") ? "prefill" : "decode")
+                << (opt.served_cli_route ? "prefill" : "decode")
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
                 << " profile " << mini_profile_name(opt.tier) << " speculation off";
             if (kMiniWeightLoadDecisions.empty() || opt.tier == profile::Name::standard || opt.weight_options.disable_q8) {

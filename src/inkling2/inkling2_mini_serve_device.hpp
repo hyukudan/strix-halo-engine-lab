@@ -21,14 +21,16 @@ inline device::Request mini_serve_device_request(const MiniServeOptions& opt) {
 inline MiniServeCohort make_mini_device_cohort(
     const MiniServeOptions& opt, const device::MemoryBudget& budget, std::string_view backend,
     unsigned row_limit = std::numeric_limits<unsigned>::max()) {
-    // Lanes per forward: --slots, else the served lane cap (independent of the prefill chunk).
-    const auto rows = std::min(opt.slots ? opt.slots : kMiniServeLaneRows, row_limit);
+    // Lanes per forward: --slots, else an explicit --prefill-rows (its former cap), else the served lane cap.
+    const auto rows = std::min(opt.slots ? opt.slots : opt.lane_rows ? opt.lane_rows : kMiniServeLaneRows, row_limit);
     const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, opt.weight_options);
     const auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view());
     // The served prefill chunk and tail capacity (inkling2_mini_serve.cpp resolve: the command line's on HIP).
     auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
         opt.packed_decode, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows, opt.prefill_tail);
     const auto levers = configure_mini_decoder(*decoder, opt.moe_w4a4, opt.combine_image, opt.prepared_round_fold);
+    // The served route before the cohort reads it (FixedKvCohort takes prefill_emits_first() at construction).
+    const bool cli_route = decoder->set_served_cli_route(opt.served_cli_route);
     const auto memory = mini_gpu::memory_info();
     const auto slot_bytes = decoder->slot_bytes();
     const auto lanes = serve::resident_kv_slots(memory.free, memory.total, budget.device_bytes, opt.kv_bytes,
@@ -45,6 +47,7 @@ inline MiniServeCohort make_mini_device_cohort(
               << " moe_prefill " << moe_core::grouped_w4a4::identity(opt.moe_w4a4)
               << " moe_decode " << mini_decode_form_name(opt.packed_decode)
               << " prefill_chunk " << opt.prefill_rows << " prefill_tail " << decoder_tail
+              << " served_route " << (cli_route ? "cli" : "incumbent")
               << " first_id " << (cohort->prefill_emits_first() ? "prefill" : "decode")
               << " prepared_round_fold " << mini_round_fold_name(levers.prepared_round_fold, opt.prepared_round_fold)
               << " down_image " << mini_down_image_name(levers.down_image, opt.combine_image)

@@ -163,6 +163,10 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool p
                 digest_state(decoder, slot, s, row, history);
                 print_digest("lanes", width, step, slot, s, all);
                 const auto expected = std::span(lone_logits).subspan((std::size_t{slot} * kCohortSteps + step) * vocab, vocab);
+                // Grouped decode keeps the incumbent served schedule (the whole cohort in one forward): its lanes keep
+                // the lone bits up to the verify rows (each row on the decode arithmetic) and make no contract past
+                // them, where only the digests are printed.
+                if (!packed_decode && width > kMiniMaxVerifyRows) continue;
                 if (std::memcmp(scores.data(), expected.data(), expected.size_bytes()) != 0) fail(width, step, slot, "logits");
                 if (s.top != lone[slot][step].top) fail(width, step, slot, "top");
                 if (s.position != lone[slot][step].position) fail(width, step, slot, "position");
@@ -179,8 +183,8 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool p
         std::cout << "COHORT w=" << width << " graph_width=" << graph_width
                   << " program=" << (program ? "replayed" : "eager") << '\n';
         // A width whose class cannot round up inside the slot capacity (exec::cohort_width_class: 17 lanes with classes
-        // and capacity 17), and every grouped cohort (one-lane passes), run eagerly: that is a valid outcome, not a miss.
-        const bool expect_program = packed_decode && graph_width != 0U;
+        // and capacity 17) runs eagerly: that is a valid outcome, not a miss. Both decode forms run the width programs.
+        const bool expect_program = graph_width != 0U;
         if (expect_program && !program) fail(width, 0U, 0U, "no cohort program at this width");
         if (!expect_program && program) fail(width, 0U, 0U, "cohort program at a width that must run eagerly");
 #endif
@@ -193,7 +197,7 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool p
         return 1;
     }
     std::cout << "PASS Inkling Mini cohort lanes == lone (" << mini_decode_form_name(packed_decode)
-              << ", widths 2 3 4 8 9 16 17, " << kCohortSteps
+              << (packed_decode ? ", widths 2 3 4 8 9 16 17, " : ", widths 2 3 4 8 (9 16 17 digests only), ") << kCohortSteps
               << " steps, logits + KV rows + histories bitwise)\n";
     return 0;
 }

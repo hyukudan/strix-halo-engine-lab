@@ -75,35 +75,41 @@ build-cuda/strix-inkling2-mini-cuda MODEL.safetensors \
 ```
 
 Decode runs the experts on the one-row packed form by default on the command
-line (both backends) and on `strix-serve` with HIP. A CUDA `strix-serve` without
-a flag keeps the grouped form it served before until its own identity ticket
-covers packed serving; `--packed-decode` selects packed there explicitly. On
-HIP a served lane keeps the bits of its own lone decode at any cohort width:
-cohorts run in passes of at most 16 lanes, the row limit of the dense one-row
-form. `--packed-decode` or `--grouped-decode` selects the form explicitly on
-either entry point, resolved by one function (`serve::resolve_decode_form`),
-and both entry points print it as `moe_decode` in their route line (the
-command line as `strix-decode-route/v1`); naming both flags is refused. The
-grouped form serves a cohort as passes of one lane, so an explicit grouped lane
-keeps the bits of its own lone grouped decode at any cohort width. A cohort
-decode copies its input ids before the first pass, checks every lane before any
-pass appends, and retires every lane of the cohort if a pass fails. The packed
-route uses one kernel for gate/up with BF16 activation and one for down with
-ordered expert combine.
+line (both backends). `strix-serve` keeps its existing route by default in
+every profile: the last prompt token is held back and decoded, prompts run in
+128-row chunks, and a cohort decodes with the grouped form in one batched
+forward (CUDA: its width programs), whose lane bits depend on the cohort width
+as before. The served route switch `STRIX_INK_SERVED_CLI_ROUTE=1`
+(`inkling2-mini-served-cli-route@1`, off in every profile column, reported as
+unqualified until its migration is qualified against the existing served
+route) makes a HIP server run the command line's route; a CUDA server declines
+it. On that route decode is packed by default and a served lane keeps the bits
+of its own lone decode at any cohort width: cohorts run in passes of at most 16
+lanes, the row limit of the dense one-row form. `--packed-decode` or
+`--grouped-decode` selects the form explicitly on either entry point, resolved
+by one function (`serve::resolve_decode_form`), and both entry points print it
+as `moe_decode` in their route line (the command line as
+`strix-decode-route/v1`); naming both flags is refused. A cohort decode checks
+every lane before any pass appends and runs its passes through
+`serve::run_cohort_passes`: the input ids are copied before the first pass, the
+picks are published after the last one, and every lane of the cohort is retired
+if a pass fails. The packed route uses one kernel for gate/up with BF16
+activation and one for down with ordered expert combine.
 
-On HIP, prefill follows one schedule on both entry points: chunks of 8192
-rows (`--prefill-chunk` on the command line, `--prefill-rows` on the server),
+On HIP, the command line prefills in chunks of 8192 rows (`--prefill-chunk`),
 and a remainder of up to chunk / 8 rows (and more than 16) rides in the final
-chunk (`STRIX_INKLING_PREFILL_TAIL=0` turns that off on both). The server reads
-the whole prompt by prefill and takes the first id from its final row, as the
-command line does. While another lane decodes it runs a prompt in 128-row
+chunk (`STRIX_INKLING_PREFILL_TAIL=0` turns that off). A HIP server on the
+command line's route uses the same schedule (`--prefill-rows` sets the chunk),
+reads the whole prompt by prefill and takes the first id from its final row, as
+the command line does. While another lane decodes it runs a prompt in 128-row
 pieces cut inside those chunks only at 16-row wave tiles and never shorter than
 17 rows, where every row keeps its route forms, so the answer does not depend
-on other requests. The CUDA command line prefills in 2048-row chunks; a CUDA
-server keeps its earlier route (128-row chunks, the last prompt token decoded)
-until its own identity check. The server prints `prefill_chunk`,
-`prefill_tail` and `first_id prefill` (CUDA: `first_id decode`) in its startup
-line; the command line prints `strix-prefill-route/v1`.
+on other requests. The CUDA command line prefills in 2048-row chunks. An
+explicit `--prefill-rows` without `--slots` also caps the served lanes at that
+many rows, as before. The server prints `served_route`, `prefill_chunk`,
+`prefill_tail` and `first_id` (`prefill` on the command line's route, `decode`
+otherwise) in its startup line; the command line prints
+`strix-prefill-route/v1`.
 
 ## Execution and reuse
 

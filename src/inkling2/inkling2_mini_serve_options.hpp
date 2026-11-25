@@ -17,21 +17,26 @@ struct MiniServeOptions {
     std::string device_id;
     std::string device_profile;
     unsigned context = 8192;
-    // Prefill chunk rows and tail capacity: --prefill-rows, else the command line's chunk for the backend
-    // (mini_prefill_schedule, resolved with the backend); the tail by the command line's rule
-    // (mini_prefill_tail_capacity, STRIX_INKLING_PREFILL_TAIL). The whole prompt is prefilled (emits-first).
+    // Prefill chunk rows and tail capacity: --prefill-rows, else the served route's chunk
+    // (mini_served_prefill_schedule_from_env: the command line's chunk and tail rule on its route, emits-first; the
+    // incumbent 128-row held-back chunks without a tail otherwise).
     unsigned prefill_rows = 0;
     unsigned prefill_tail = 0;
     unsigned slots = 0;
+    // Lane cap of an explicit --prefill-rows given without --slots (0: kMiniServeLaneRows), the cap it set before.
+    unsigned lane_rows = 0;
+    // Resolved served route (mini_served_cli_route, admitted on HIP only): the command line's route; false = the
+    // incumbent served route (held-back prompt token, grouped cohort decode without a flag).
+    bool served_cli_route = false;
     std::uint64_t kv_bytes = 0;
     MiniWeightOptions weight_options;
     profile::Name tier = profile::Name::standard;
     // Resolved operand class of the FAST W4A4 expert lever (mini_moe_w4a4_class; bf16 = off): the served prefill runs
     // the class the profile line reports, as the CLI and the gate do.
     moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16;
-    // Decode expert form: --packed-decode / --grouped-decode, else the one default of every entry point
-    // (mini_packed_decode, the command line's default too).
-    bool packed_decode = kMiniPackedDecodeDefault;
+    // Decode expert form: --packed-decode / --grouped-decode, else the served route's default
+    // (mini_served_packed_default: packed on the command line's route, grouped on the incumbent served route).
+    bool packed_decode = false;
     // Resolved prepared-attention round fold (mini_prepared_round_fold), the CLI's setting from the same resolution.
     bool prepared_round_fold = false;
     // Resolved exact down-image lever (mini_combine_image): the HIP resident prefill stores the BF16 down image where the

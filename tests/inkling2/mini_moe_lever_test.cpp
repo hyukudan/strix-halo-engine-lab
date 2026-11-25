@@ -32,7 +32,8 @@ profile::Inputs inputs(profile::Name tier, const char* value = nullptr, const ch
 // The engine resolves the W4A4 row: an unbound table would ignore STRIX_INK_MOE_W4A4 at every prompt length.
 void test_row() {
     require(mini::kMiniProfile.table.size() == mini::kMiniLevers.size(), "Inkling lever table bound to the engine");
-    require(mini::kMiniProfile.table.size() == 3U, "the W4A4 row, the down image row and the prepared round fold row");
+    require(mini::kMiniProfile.table.size() == 4U,
+            "the W4A4 row, the down image row, the prepared round fold row and the served route row");
     const auto& lever = mini::kMiniProfile.table.front();
     require(lever.name == mini::kMiniMoeW4a4 && lever.name == "inkling2-mini-moe-w4a4@1", "w4a4 identity");
     require(lever.env == "STRIX_INK_MOE_W4A4" && lever.off == "0" && lever.builtin == "0", "w4a4 off switch");
@@ -206,9 +207,37 @@ void test_round_fold_admission() {
 
 }  // namespace
 
+// The served route row: opt-in in every profile column (EXACT, FAST and TURBO keep the incumbent served route), an
+// explicit 1 selects it and labels the run unqualified until its migration is qualified, 0 keeps it off.
+void test_served_route() {
+    const profile::Lever* lever = nullptr;
+    for (const auto& row : mini::kMiniProfile.table)
+        if (row.name == mini::kMiniServedCliRoute) lever = &row;
+    require(lever != nullptr && lever->name == "inkling2-mini-served-cli-route@1" &&
+                lever->env == "STRIX_INK_SERVED_CLI_ROUTE" && lever->builtin == "0" && lever->off == "0" &&
+                lever->kind == profile::Kind::bit_changing && lever->omit_builtin_fingerprint,
+            "served route row identity");
+    for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
+        require(lever->value[static_cast<unsigned>(tier)].empty() && !lever->ready[static_cast<unsigned>(tier)],
+                "served route: no profile column selects it");
+        for (const char* value : {static_cast<const char*>(nullptr), "0", "1"}) {
+            mini::MiniWeightOptions options;
+            options.tier.profile = tier;
+            options.tier.env = [value](const char* key) -> const char* {
+                return std::strcmp(key, "STRIX_INK_SERVED_CLI_ROUTE") == 0 ? value : nullptr;
+            };
+            const auto resolution = mini::resolve_mini_profile(options, true);
+            const bool on = value != nullptr && std::strcmp(value, "1") == 0;
+            require(mini::mini_served_cli_route(resolution) == on, "served route: explicit opt-in only");
+            require((resolution.qualification() == "qualified") == !on, "served route: an opt-in run is unqualified");
+        }
+    }
+}
+
 int main() {
     try {
         test_row();
+        test_served_route();
         test_resolution();
         test_combine_image();
         test_configure();
