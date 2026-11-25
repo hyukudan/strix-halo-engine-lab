@@ -244,8 +244,6 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
                         (turbo.levers == fast.levers || ((entry.family == "hy4_flash" || entry.family == "gemma4") &&
                                                        turbo.levers == Name::turbo)),
                     "TURBO selects its declared native column or the incumbent FAST column");
-            if (entry.family == "gemma4")
-                require(turbo.levers == Name::turbo, "E4B TURBO reaches the native TURBO resolver");
             require(exact.kv != "fp8" && fast.kv != "fp8", "FP8 KV shadow is TURBO only");
             require((turbo.kv == "fp8") == (entry.family == "qwen35" && std::string_view(backend) == "cuda"),
                     "only the CUDA dense route has an FP8 KV shadow");
@@ -253,6 +251,10 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
                     "host configuration reports weight roles and drafter");
         }
     }
+
+    const auto e4b = strix::model_description::load((data / "models/nemotron-3.5-bolt-e4b.toml").string());
+    const auto e4b_turbo = profile::resolve_model_preset(e4b, Name::turbo, "hip");
+    require(e4b_turbo.levers == Name::turbo, "E4B TURBO reaches the native TURBO resolver");
 
     const auto dense = strix::model_description::load((data / "models/qwen3.8-27b.toml").string());
     probes.host = Platform::windows_host;
