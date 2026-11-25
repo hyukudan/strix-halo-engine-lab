@@ -27,6 +27,7 @@ STRIX_MICROSCALED_HD constexpr std::size_t physical_row(RowOrder order, std::siz
 
 inline constexpr std::size_t kNvfp4BlockColumns = 16;
 inline constexpr std::size_t kMxfp8BlockColumns = 32;
+inline constexpr std::size_t kMxfp4BlockColumns = 32;
 
 STRIX_MICROSCALED_HD float nvfp4_value(std::uint8_t code, float scale, float outer_scale) {
     return (scalar_float::e2m1(code) * scale) * outer_scale;
@@ -245,6 +246,32 @@ inline void decode_nvfp4_row(std::span<const std::uint8_t> codes,
             }
             output[i] = even;
             output[i + 1] = odd;
+        }
+    }
+}
+
+// Split MXFP4 storage: one E8M0 per 32 columns of each row, low nibble first.
+// Widen to FP32; the caller owns any later operand rounding.
+inline void decode_mxfp4_row(std::span<const std::uint8_t> codes,
+                             std::span<const std::uint8_t> block_scales,
+                             std::span<float> output) {
+    constexpr auto block_columns = kMxfp4BlockColumns;
+    if (output.empty() || output.size() % block_columns != 0 ||
+        codes.size() != output.size() / 2U || block_scales.size() != output.size() / block_columns)
+        throw std::invalid_argument("MXFP4 row has inconsistent dimensions");
+    for (std::size_t block = 0; block < block_scales.size(); ++block) {
+        const float scale = scalar_float::e8m0(block_scales[block]);
+        if (!std::isfinite(scale))
+            throw std::invalid_argument("MXFP4 block scale must be finite E8M0");
+        const auto first = block * block_columns;
+        for (std::size_t i = first; i < first + block_columns; i += 2U) {
+            const auto byte = codes[i / 2U];
+            const float even = scalar_float::e2m1(static_cast<std::uint8_t>(byte & 0x0fU)) * scale;
+            const float odd = scalar_float::e2m1(static_cast<std::uint8_t>(byte >> 4U)) * scale;
+            if (!std::isfinite(even) || !std::isfinite(odd))
+                throw std::invalid_argument("MXFP4 weight exceeds FP32 range");
+            output[i] = even;
+            output[i + 1U] = odd;
         }
     }
 }
