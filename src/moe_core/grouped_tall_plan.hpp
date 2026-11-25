@@ -170,6 +170,31 @@ STRIX_TALL_HD constexpr unsigned slab_offset(const Layout& l, unsigned output, u
     return output * l.slab_pitch + 2U * column;
 }
 
+// ---- block scales: staged once per CTA ----
+// The scale bytes of the CTA's 128 outputs over the whole K are copied once, before the ring, into a region after the tables
+// (4-byte chunks; consecutive threads take consecutive chunks of one output's scale row, so the global reads coalesce), and
+// each decode job reads its stage's scale byte there. The bytes are the same ones a direct load would read, so the arithmetic
+// is unchanged. A row whose byte count is not a whole number of 4-byte words is copied byte by byte.
+STRIX_TALL_HD constexpr unsigned scale_blocks(unsigned inputs, bool nvfp4) { return inputs / (nvfp4 ? 16U : 32U); }
+// Shared bytes per output: whole words, an odd word count (the byte reads of the 16 outputs of a warp hit distinct banks).
+STRIX_TALL_HD constexpr unsigned scale_pitch(unsigned inputs, bool nvfp4) {
+    const unsigned words = (scale_blocks(inputs, nvfp4) + 3U) / 4U;
+    return 4U * (words % 2U == 1U ? words : words + 1U);
+}
+STRIX_TALL_HD constexpr unsigned scale_bytes(unsigned inputs, bool nvfp4) { return kOutputs * scale_pitch(inputs, nvfp4); }
+// Offset of output `output`'s scale byte of block `block` (block = input / block columns).
+STRIX_TALL_HD constexpr unsigned scale_offset(const Layout& l, unsigned pitch, unsigned output, unsigned block) {
+    return l.smem + output * pitch + block;
+}
+// Dynamic shared bytes of a launch: the fixed layout plus the scale region of its K.
+STRIX_TALL_HD constexpr unsigned shared_bytes(const Layout& l, unsigned inputs, bool nvfp4) {
+    return l.smem + scale_bytes(inputs, nvfp4);
+}
+// Whether the scale rows copy as 4-byte chunks (else byte by byte): whole words per row on a word-aligned scale array.
+STRIX_TALL_HD constexpr bool scale_words(unsigned inputs, bool nvfp4, std::uintptr_t scale_address) {
+    return scale_blocks(inputs, nvfp4) % 4U == 0U && scale_address % 4U == 0U;
+}
+
 // ---- ring schedule ----
 // Prologue: copies of stages 0 .. stages - 2 (one commit group each), wait until prologue_pending() groups remain, barrier,
 // decode stage 0. Iteration s: wait until loop_pending() groups remain (stage s + 1 landed), barrier, copy stage
@@ -203,7 +228,7 @@ STRIX_TALL_HD constexpr bool valid(Form f, bool nvfp4) {
            (decode_columns(f) == 8U || decode_columns(f) == 16U) && act_chunks(f) % f.threads() == 0U &&
            (l.act_pitch / 16U) % 2U == 1U && (l.slab_pitch / 16U) % 2U == 1U && l.act_pitch % 16U == 0U &&
            l.act_bytes % 16U == 0U && l.code_row % 16U == 0U && l.stage_bytes % 16U == 0U && l.slab_bytes % 16U == 0U &&
-           l.table % 16U == 0U && (!nvfp4 || f.threads() >= kShiftCodes);
+           l.table % 16U == 0U && l.smem % 16U == 0U && (!nvfp4 || f.threads() >= kShiftCodes);
 }
 
 // Shapes a form takes: every K16 step of a stage exists, whole 128-output CTAs.
@@ -225,7 +250,7 @@ STRIX_TALL_HD constexpr FormId select(unsigned max_tile_rows) {
 inline bool fits(const grouped_microscaled::Args& args, FormId id, bool nvfp4, std::size_t shared_budget) {
     const Form f = form(id);
     return valid(f, nvfp4) && fits_shape(f, args.inputs, args.outputs) && args.max_tile_rows <= kMaxRows &&
-           layout(f, nvfp4).smem <= shared_budget;
+           shared_bytes(layout(f, nvfp4), args.inputs, nvfp4) <= shared_budget;
 }
 
 }  // namespace strix::moe_core::grouped_tall
