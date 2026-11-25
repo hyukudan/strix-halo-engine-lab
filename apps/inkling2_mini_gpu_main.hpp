@@ -29,28 +29,22 @@
 
 namespace strix::inkling2::cli {
 
-// Prefill chunk rows: a schedule choice, selected and retried by shared serve code (serve::admit_prefill_chunk);
-// this file supplies the numbers. Chunk-invariant logits are measured, not assumed: last-row logits bitwise equal at
-// 4K, 8K, 16K and 32K prompts across chunk sizes, and chunk 2048 against 8192 at 8K. Short tails that cross the dense
-// row-route boundary (for example a 2050-token prompt, whose two-row tail leaves the short dense route at chunk 2048)
-// are covered by the pending identity ticket, not by this comment.
-// gfx1151 (prose prompts, one chunk size per run, 2048 -> 8192 rows): 4K 3.47 -> 3.13 s, 8K 7.27 -> 6.23 s,
-// 16K 15.69 -> 14.06 s, 32K 35.6 -> 35.8 s. sm_120 (same prompts, 2048 -> 4096 -> 8192 rows, logits bitwise equal):
-// 4K 586.1 -> 516.9 ms, 8K 1,189.2 -> 1,053.1 -> 1,035.1 ms, 16K 2,434.8 -> 2,168.7 -> 2,135.4 ms.
+// Prefill chunk rows: a schedule choice, selected and retried by shared serve code (serve::admit_prefill_chunk); the
+// numbers are the declared selection strix::inkling2::mini_prefill_rows (backend and profile), read here and by the
+// HTTP server alike. Speed figures belong to the receipts of the tree that measured them, not to this file. Short tails
+// that cross the dense row-route boundary (for example a 2050-token prompt, whose two-row tail leaves the short dense
+// route at chunk 2048) are covered by the CUDA identity receipt, not by this comment.
 // Tail absorption (serve::prefill_tail_rows): a remainder of up to chunk / 8 rows rides in the final chunk. Every
-// chunk re-streams all expert weights of every layer, so a short tail chunk is weight-bound: gfx1151 8K prose
-// (8236 = 8192 + 44 rows) 5,021 -> 4,810 ms with one chunk, logits bitwise equal; equal halves (4160 + 4076) 5,069 ms.
+// chunk re-streams all expert weights of every layer, so a short tail chunk is weight-bound.
 // The decoder admits only a tail that takes the same route forms in both schedules (inkling2::mini_prefill_tail_rows:
 // more rows than the key-split bound, chunk a multiple of the 16-position wave tile, enlarged chunk admitted by the
 // device); any other tail runs as its own chunk. CUDA keeps greedy chunks until it is measured there.
 #if defined(__HIPCC__)
 inline constexpr unsigned kMiniPrefillTailDivisor = 8U;
-// HIP: the 8192-row default has no pressure retry (an allocation failure reports as before).
-inline constexpr unsigned kMiniPrefillPressureRows = 0U;
+inline constexpr auto kMiniPrefillBackend = strix::inkling2::MiniPrefillBackend::hip;
 #else
 inline constexpr unsigned kMiniPrefillTailDivisor = 0U;
-// CUDA qualified the 8192-row default with a retry at the previous 2048-row default.
-inline constexpr unsigned kMiniPrefillPressureRows = strix::inkling2::kMiniCliPrefillPressureRows;
+inline constexpr auto kMiniPrefillBackend = strix::inkling2::MiniPrefillBackend::cuda;
 #endif
 
 class DeviceCliDecoder final : public serve::SerialGenerationDecoder {
@@ -276,12 +270,12 @@ int main(int argc, char** argv) {
             executable, "Inkling 2 Mini", "MODEL.safetensors",
             kVocabulary, kOutputVocabulary, kMaxContext, kMiniEosToken,
             {},
-            strix::inkling2::kMiniCliPrefillRows, true, true,
+            // Placeholder: the profile is known after parsing; the --prefill-chunk option needs a non-zero default.
+            strix::inkling2::mini_prefill_rows(cli::kMiniPrefillBackend, strix::profile::Name::standard).cli, true, true,
             [](const std::string& path) {
                 return serve::BpeTokenizer::load_hf_json(path, serve::inkling2_mini_tokenizer_identity);
             },
             packed_decode_default, serve::render_inkling2_chat_request, true};
-        family.prefill_chunk_fallback = strix::inkling2::cli::kMiniPrefillPressureRows;
         // Off switch: STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks (same logits).
         family.prefill_tail_divisor =
             strix::env_flag_default_on("STRIX_INKLING_PREFILL_TAIL") ? strix::inkling2::cli::kMiniPrefillTailDivisor : 0U;
@@ -296,6 +290,12 @@ int main(int argc, char** argv) {
 #else
         auto options = cli::parse(argc, argv, family);
 #endif
+        {  // The declared selection of this backend and profile (the HTTP server reads the same one).
+            const auto rows = strix::inkling2::mini_prefill_rows(cli::kMiniPrefillBackend, options.tier.profile);
+            family.default_prefill_chunk = rows.cli;
+            family.prefill_chunk_fallback = rows.cli_pressure;
+            if (!options.generation.prefill_chunk_explicit) options.generation.prefill_chunk = rows.cli;
+        }
         const auto scope = mini_weight_scope(argv[1], options.tier.profile, options.weights);
         const auto weights = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view());
         const auto step_graphs = options.step_graphs.value_or(MiniResidentBackend::default_step_graphs);

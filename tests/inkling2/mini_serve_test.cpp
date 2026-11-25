@@ -319,6 +319,13 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         // The served prefill runs the operand class the profile resolved, never a class-less on/off.
         require(options.moe_w4a4 == w4a4, "W4A4 operand class did not reach native adapter");
         require(options.prefill_rows == prefill.rows, "HTTP prefill slice differs from its regime");
+        // The same declared selection the CLI reads (inkling2::mini_prefill_rows), for the backend and profile served.
+        if (prefill.extra.empty())
+            require(options.prefill_rows ==
+                        mini::mini_prefill_rows(std::string_view(backend) == "hip" ? mini::MiniPrefillBackend::hip
+                                                                                   : mini::MiniPrefillBackend::cuda,
+                                                options.tier).http,
+                    "HTTP prefill slice is not the declared selection");
         // The served prefill resolves the down-image lever like the CLI and the gate do: off unless selected explicitly.
         require(options.combine_image == image, "down-image selection did not reach native adapter");
         require(options.tier == strix::profile::Name::fast && options.weight_options.qualify_q8 == qualify_q8,

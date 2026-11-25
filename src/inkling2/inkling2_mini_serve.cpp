@@ -68,11 +68,14 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();
     if (out.context < 3U) throw std::invalid_argument("Inkling context must hold a prompt and a reply");
-    // The HTTP regime keeps small bounded slices (the 128-row default) so other lanes decode between slices.
-    out.prefill_rows = serve::resolve_prefill_rows(prefill_rows, kMiniHttpPrefillRows, out.context);
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
+    // The HTTP regime keeps small bounded slices so other lanes decode between slices: the declared selection of this
+    // backend and profile (the CLI reads the same one).
+    const auto declared = mini_prefill_rows(
+        resolved.backend == "hip" ? MiniPrefillBackend::hip : MiniPrefillBackend::cuda, out.tier);
+    out.prefill_rows = serve::resolve_prefill_rows(prefill_rows, declared.http, out.context);
     return resolved;
 }
 
