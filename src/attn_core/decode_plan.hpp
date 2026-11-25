@@ -31,11 +31,12 @@ struct DecodeSpec {
 inline constexpr unsigned kSplitKeys = 256;
 inline constexpr unsigned kFlashKeys = 32;
 inline constexpr unsigned kMaxGroup = 8;
+inline constexpr unsigned kMaxHeadDim = 512;
 
 // The native split ABI uses the same extent for the K/V plane and the score
 // workspace. Its key walk always starts at absolute key zero.
-[[nodiscard]] inline constexpr bool uses_native_split(const DecodeSpec& s) {
-    return s.head_dim == 256 && s.layout == KvLayout::head_major &&
+[[nodiscard]] inline constexpr bool uses_native_split(const DecodeSpec& s, std::uint32_t native_split_head_dim) {
+    return s.head_dim == native_split_head_dim && s.layout == KvLayout::head_major &&
            s.window == 0 && s.max_context == s.cache_slots;
 }
 
@@ -47,11 +48,14 @@ struct DecodePlan {
     std::size_t score_floats, stat_floats, scratch_floats;
 };
 
-[[nodiscard]] inline std::optional<DecodePlan> make_decode_plan(const DecodeSpec& s) {
+// The caller supplies the head dimension supported by its native split implementation.
+[[nodiscard]] inline std::optional<DecodePlan> make_decode_plan(const DecodeSpec& s,
+                                                               std::uint32_t native_split_head_dim) {
     constexpr auto max_context = std::numeric_limits<std::uint32_t>::max() - kSplitKeys;
     constexpr auto max_floats = std::numeric_limits<std::size_t>::max() / sizeof(float);
     constexpr auto max_bf16 = std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t);
-    if (s.head_dim == 0 || s.head_dim > 512 || s.heads == 0 || s.kv_heads == 0 ||
+    if (native_split_head_dim == 0 || native_split_head_dim > kMaxHeadDim ||
+        s.head_dim == 0 || s.head_dim > kMaxHeadDim || s.heads == 0 || s.kv_heads == 0 ||
         s.heads % s.kv_heads != 0 || s.heads / s.kv_heads > kMaxGroup ||
         s.rows == 0 || s.rows > 32 || s.heads > 65535U ||
         s.max_context < s.rows || s.max_context > max_context || s.cache_slots == 0 ||
@@ -87,7 +91,7 @@ struct DecodePlan {
         return DecodePlan{s, group, dim_class, 1, 0, 0, 0};
     }
     if (s.order == DecodeOrder::online_e4m3) {
-        if (!uses_native_split(s) || s.sinks || s.relative_extent != 0 ||
+        if (!uses_native_split(s, native_split_head_dim) || s.sinks || s.relative_extent != 0 ||
             (s.gate != OutputGate::none && s.gate != OutputGate::sigmoid_interleaved &&
              s.gate != OutputGate::sigmoid_strided)) return std::nullopt;
         const auto fp8 = strix::attn::fp8::make_plan(s.head_dim, s.heads, s.kv_heads, s.cache_slots);
@@ -97,7 +101,8 @@ struct DecodePlan {
     }
     if (s.order != DecodeOrder::global_max || s.sinks || s.relative_extent != 0 ||
         (s.gate != OutputGate::none && s.gate != OutputGate::sigmoid_interleaved &&
-         !(s.gate == OutputGate::sigmoid_strided && uses_native_split(s)))) return std::nullopt;
+         !(s.gate == OutputGate::sigmoid_strided && uses_native_split(s, native_split_head_dim))))
+        return std::nullopt;
 
     const auto splits = (s.max_context + kSplitKeys - 1U) / kSplitKeys;
     const auto row_heads = std::size_t{s.rows} * s.heads;

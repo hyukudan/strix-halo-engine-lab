@@ -46,7 +46,8 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
         static constexpr config_file::Option shell_options[] = {
             {"model", "--model", Kind::value}, {"registry_root", "--registry-root", Kind::path}, {"registry", "--registry", Kind::path},
             {"description", "--description", Kind::value}, {"bind", "--bind", Kind::value}, {"port", "--port", Kind::value},
-            {"profile", "--profile", Kind::value}, {"backend", "--backend", Kind::value}, {"asset", "--asset", Kind::path}};
+            {"profile", "--profile", Kind::value}, {"backend", "--backend", Kind::value}, {"asset", "--asset", Kind::path},
+            {"device_count", "--device-count", Kind::value}, {"placement", "--placement", Kind::value}};
         auto file = config_file::expand(argc, argv, shell_options);
         if (file.print) { out << file.effective; return 0; }
         std::vector<char*> expanded;
@@ -68,6 +69,7 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
             if (arg == "--help" || arg == "-h") {
                 out << "strix-serve --model FAMILY|ID|NAME [--profile exact|fast|turbo] [--asset PATH]\n"
                     "  --backend hip|cuda --print-effective-config [-- ENGINE_ARGS]\n"
+                    "  --device-count N --placement single|replica|layers|tensor|speculation\n"
                     "  --registry-root DIR --registry PATH --description PATH\n"
                     "  --list-models --inspect --family-inspect --bind ADDRESS --port N\n"
                     "Use -- before family arguments that overlap shell options.\n"
@@ -86,6 +88,19 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
                 request.backend = value(i);
                 if (request.backend != "hip" && request.backend != "cuda")
                     throw std::invalid_argument("--backend requires hip or cuda");
+            }
+            else if (arg == "--device-count") {
+                const auto number = value(i);
+                unsigned devices = 0;
+                const auto parsed = std::from_chars(number.data(), number.data() + number.size(), devices);
+                if (parsed.ec != std::errc{} || parsed.ptr != number.data() + number.size() || devices < 1 || devices > 64)
+                    throw std::invalid_argument("--device-count requires an integer in 1..64");
+                request.placement.devices = devices;
+            } else if (arg == "--placement") {
+                const auto form = value(i);
+                request.placement.placement = profile::multi_device::parse_form(form);
+                if (!request.placement.placement)
+                    throw std::invalid_argument("--placement requires single, replica, layers, tensor or speculation");
             }
             else if (arg == "--print-effective-config") request.print = true;
             else if (arg == "--list-models") list = true;
@@ -150,34 +165,66 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
             selection.arguments = std::move(local.args);
             if (request.backend.empty()) request.backend = std::move(local.backend);
         }
+        // A placement query alone does not apply a model preset: it is validated (below) against the effective tier,
+        // so a family-native --profile after `--` keeps its passthrough (same design as strix run/serve).
         const bool preset_requested = request.tier || request.print || !request.asset.empty() || !request.backend.empty();
+        const bool placement_requested = request.placement.placement || request.placement.devices != 1;
+        std::optional<std::string> native_word;
+        for (std::size_t i = 0; i < selection.arguments.size() && !native_word; ++i) {
+            const auto& a = selection.arguments[i];
+            if (a.starts_with("--profile=")) native_word = a.substr(10);
+            else if (a == "--profile" && i + 1 < selection.arguments.size()) native_word = selection.arguments[i + 1];
+        }
+        const bool native_profile = !request.tier && !request.print && native_word.has_value();
+        // The effective placement, resolved once: the native tier when one is given, else the shell resolver's.
+        const auto placement_for = [&](std::string_view backend_name) {
+            if (native_profile) {
+                auto query = request.placement;
+                try { query.tier = profile::parse_tier(*native_word); } catch (const std::invalid_argument&) {}   // the engine rejects it
+                return profile::multi_device::resolve(selection.description, query);
+            }
+            return profile::resolve_model_preset(selection.description, request.tier, backend_name, request.placement).placement;
+        };
         const std::string_view backend = request.backend.empty() ? "hip" : std::string_view(request.backend);
         if (request.print && request.asset.empty() && selection.arguments.empty()) {
-            out << profile::resolve_model_preset(selection.description, request.tier, backend).config.dump() << '\n';
+            out << profile::resolve_model_preset(selection.description, request.tier, backend, request.placement).config.dump() << '\n';
             return 0;
         }
         const bool external_cuda = backend == "cuda" && !(factory && factory->serves_cuda);
-        if (preset_requested && (!factory || external_cuda) && shell.launch)
+        if ((preset_requested || placement_requested) && (!factory || external_cuda) && shell.launch) {
+            // The native handoff carries the whole query (device count, placement) to the backend launcher, which
+            // resolves it again; refuse here first so no launch starts for a form one engine does not execute.
+            if (!request.print) profile::multi_device::admit(placement_for(backend), profile::multi_device::Executor::engine);
             return shell.launch(selection, request, out);
+        }
         if (!factory) {
             error << "known family '" << selection.model.family << "' has no built shared serve adapter; legacy entry points remain separate\n";
             return 3;
         }
         if (external_cuda) throw std::invalid_argument("no CUDA launcher in this build");
         std::optional<profile::PresetScope> scope;
+        if (placement_requested && !preset_requested)
+            profile::multi_device::admit(placement_for(backend), profile::multi_device::Executor::engine);
         if (preset_requested) {
             if (!request.asset.empty()) {
                 selection.arguments.insert(selection.arguments.begin(), request.asset);
                 if (!factory->asset_option.empty())
                     selection.arguments.emplace(selection.arguments.begin(), factory->asset_option);
             }
-            const auto preset = profile::resolve_model_preset(selection.description, request.tier, backend);
-            preset.append_options(selection.arguments);
-            if (request.print) {
-                out << preset.config.dump() << '\n' << std::flush;
-                selection.arguments.emplace_back("--print-effective-config");
+            if (native_profile) {
+                // The native --profile is the tier: no preset injection, the placement is admitted at that tier.
+                profile::multi_device::admit(placement_for(backend), profile::multi_device::Executor::engine);
+            } else {
+                const auto preset = profile::resolve_model_preset(selection.description, request.tier, backend, request.placement);
+                // This process serves one worker: only `single` executes here (replicas run behind strix-router).
+                if (!request.print) profile::multi_device::admit(preset.placement, profile::multi_device::Executor::engine);
+                preset.append_options(selection.arguments);
+                if (request.print) {
+                    out << preset.config.dump() << '\n' << std::flush;
+                    selection.arguments.emplace_back("--print-effective-config");
+                }
+                scope.emplace();
             }
-            scope.emplace();
         }
         selection.sampler_options = validate_sampling_startup_environment(factory->sampling_default);
         factory->validate(selection);

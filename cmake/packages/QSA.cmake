@@ -1,5 +1,5 @@
 if(BUILD_TESTING)
-    add_executable(strix-qsa-launch-plan-tests tests/cuda_core/attn_rowgroup_plan_tests.cpp)
+    add_executable(strix-qsa-launch-plan-tests tests/attn_core/attn_rowgroup_plan_tests.cpp)
     target_include_directories(strix-qsa-launch-plan-tests PRIVATE src)
     target_compile_features(strix-qsa-launch-plan-tests PRIVATE cxx_std_20)
     if(MSVC)

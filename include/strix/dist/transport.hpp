@@ -25,6 +25,8 @@ public:
         on_wire(context);
     }
     [[nodiscard]] virtual std::string name() const = 0;
+    // Whether abort (including with an empty reason) ends pending peer I/O without destroying the transport.
+    [[nodiscard]] virtual bool supports_peer_abort() const noexcept { return false; }
     // Stops the transport for good and closes its channel, so the peer's pending reads end at once (the peer sees
     // the close) instead of at its own deadline. Called by the communicator when a local wait expires.
     virtual void abort(const std::string& /*why*/) {}

@@ -1,8 +1,8 @@
 """Compile the actual engine predicates and dense workspace planner without HIP.
 
 Only resident buffers and device item metadata are doubles. No route decision or
-workspace calculation is reimplemented. ENGINE_SOURCE can select the unfixed head
-to demonstrate failing resource and decode regressions with the same tests.
+workspace calculation is reimplemented. ENGINE_SOURCE can select an older engine
+to run the same regression cases against it.
 """
 from pathlib import Path
 import sys
@@ -18,7 +18,10 @@ def between(text, start, end):
     return text[begin:text.index(end, begin)]
 
 
-methods = between(engine, "    static constexpr std::size_t kDenseQkvMinRows", "    void stage_attn(")
+methods = between(engine, "    static constexpr std::size_t kDenseQkvMinRows", "    bool stage_attn(")
+ffn = between(engine, "else if (const mmoe::PrefillDenseJob gu[2]", "mmoe::enqueue_prefill_dense(gu,")
+out.joinpath("dense_mlp.inc").write_text(ffn[5:ffn.rindex("{")] +
+                                        "return true;\nreturn false;\n", encoding="utf-8")
 has_startup = "void require_invariant_dense() const" in methods
 if engine_path.resolve() == (root / "src/minimax/engine/engine.hip").resolve():
     # Check that tested methods are wired into startup and both actual projection sites.
@@ -36,5 +39,16 @@ parts = [
     between(prefill, "constexpr std::size_t align256(", "\n"),
     between(prefill, "constexpr std::size_t kDenseItems", "// Pinned host staging"),
     between(prefill, "bool prefill_dense_supported(", "\nvoid enqueue_prefill_dense("),
+    between(prefill, "struct PGroup {", "struct Tables {"),
+    between(prefill, "struct Plan {", "// STRIX_MMX_PREFILL_TILE:"),
 ]
 out.joinpath("planner.inc").write_text("\n".join(parts), encoding="utf-8")
+
+# Compile the actual effective-config startup branches with the host resolver.
+# Native CTest runs the same checks through both full executables.
+rank = (root / "apps/minimax_rank_main.cpp").read_text(encoding="utf-8")
+out.joinpath("rank.inc").write_text(
+    between(rank, "    if (strix::minimax::defaults::print_or_apply(\"rank\"", "    if (argc < 5)"), encoding="utf-8")
+serve = (root / "src/minimax/serve/session_service.cpp").read_text(encoding="utf-8")
+out.joinpath("serve.inc").write_text(
+    between(serve, "    ServePreparation p;", "    if (arguments.empty()"), encoding="utf-8")

@@ -116,3 +116,13 @@ levers = "fast"
 # Use the admitted FAST levers until this model has a qualified TURBO set.
 [presets.turbo]
 levers = "fast"
+
+# Engine-read switches of this model that a [multi_device] key is planned to replace (listed in the effective
+# config when set; they still act inside the engine).
+[multi_device.legacy_env]
+STRIX_QWEN_PF_PIPE = "forms.layers"
+STRIX_QWEN_PF_PIPE_CUT = "forms.layers.cut"
+STRIX_QWEN_PAIR_HALF_CUT = "forms.layers.cut"
+STRIX_PAIR_STAGE_MAP = "forms.layers.cut"
+STRIX_QWEN_PF_PIPE_CHUNK = "forms.layers.window_rows"
+STRIX_QWEN_PAIR_CHUNK_POLICY = "forms.layers.window_rows"

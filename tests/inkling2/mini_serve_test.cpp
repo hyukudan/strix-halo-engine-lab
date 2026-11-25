@@ -377,13 +377,14 @@ void profile_parity() {
     const sv::SerialGenerationFamily family{"mini", "Mini", "MODEL", 8U, 8U, 16U, 0U, nullptr, 8U,
         true, false, [](const std::string&) -> std::shared_ptr<const sv::BpeTokenizer> { return {}; },
         true, {}, true};
-    const auto parse_cli = [&](const char* tier, std::initializer_list<const char*> input = {"1", "--generate", "2"}) {
+    const auto parse_cli = [&](const char* tier, std::string_view backend,
+                               std::initializer_list<const char*> input = {"1", "--generate", "2"}) {
         std::vector<std::string> args{"mini", "MODEL.safetensors"};
         args.insert(args.end(), input.begin(), input.end());
         args.insert(args.end(), {"--profile", tier});
         std::vector<char*> argv;
         for (auto& arg : args) argv.push_back(arg.data());
-        return mini::cli::parse(static_cast<int>(argv.size()), argv.data(), family, true);
+        return mini::cli::parse(static_cast<int>(argv.size()), argv.data(), family, backend);
     };
     const auto refuses = [](const auto& action, std::string_view diagnostic) {
         try { action(); }
@@ -415,42 +416,52 @@ void profile_parity() {
         selection.arguments[3] = backend;
         for (const auto* tier : {"fast", "turbo", "exact"}) {
             const bool exact = std::string_view(tier) == "exact";
-            set_w4a4_env(exact ? nullptr : "mse");
+            set_w4a4_env(exact || std::string_view(backend) == "hip" ? nullptr : "mse");
             selection.arguments.back() = tier;
             for (const auto* value : {static_cast<const char*>(nullptr), "0", "1"}) {
                 set_expert_env(value);
                 loaded.reset();
                 if (exact && value && std::string_view(value) == "1") {
-                    const bool cli_refused = refuses([&] { (void)parse_cli(tier); }, exact_error);
+                    const bool cli_refused = refuses([&] { (void)parse_cli(tier, backend); }, exact_error);
                     const bool server_refused = refuses([&] { (void)factory->create(selection); }, exact_error);
                     require(cli_refused && server_refused && !loaded, "CLI and server must refuse narrow EXACT");
                     continue;
                 }
-                const auto cli = parse_cli(tier);
+                const auto cli = parse_cli(tier, backend);
                 const auto service = factory->create(selection);
                 const bool narrow = value && std::string_view(value) == "1";
                 require(service && loaded && loaded->checkpoint == "MODEL.safetensors" &&
                         loaded->tier == cli.tier.profile &&
                         loaded->experts_nvfp4 == narrow && loaded->experts_nvfp4 == mini::mini_experts_nvfp4(cli.tier) &&
-                        loaded->moe_w4a4 == mini::mini_moe_w4a4_class(cli.tier) &&
+                        loaded->moe_w4a4 == cli.moe_w4a4 &&
                         loaded->combine_image == mini::mini_combine_image(cli.tier),
                         "CLI and server selected different decoder inputs");
             }
         }
     }
+    set_expert_env(nullptr);
+    set_w4a4_env("mse");
+    selection.arguments[3] = "hip";
+    selection.arguments.back() = "fast";
+    loaded.reset();
+    require(refuses([&] { (void)parse_cli("fast", "hip"); }, "CUDA only") &&
+            refuses([&] { (void)factory->create(selection); }, "CUDA only") && !loaded,
+            "CLI and server must refuse the same HIP W4A4 class before loading");
+
+    set_w4a4_env(nullptr);
     set_expert_env("1");
-    require(refuses([&] { (void)parse_cli("fast", {"--tokenize", "input.txt"}); }, consumer_error),
+    require(refuses([&] { (void)parse_cli("fast", "cuda", {"--tokenize", "input.txt"}); }, consumer_error),
             "tokenize-only CLI must refuse the narrow image");
     require(refuses([&] {
-        (void)parse_cli("exact", {"--gate-manifest", "windows.tsv", "--gate-out", "out", "--gate-arm", "NULL",
+        (void)parse_cli("exact", "cuda", {"--gate-manifest", "windows.tsv", "--gate-out", "out", "--gate-arm", "NULL",
                                 "--gate-rows", "2", "--gate-mode", "decode", "--gate-order-null", "--no-step-graph"});
     }, exact_error), "the evaluation-order null must use the checkpoint image");
     const auto cuda_route = [](const mini::cli::Options& options) {
         return mini::cli::resolve_cuda_step_route(options, {}, strix::weight::kBf16WeightStorage, false);
     };
-    require(refuses([&] { (void)cuda_route(parse_cli("fast")); }, consumer_error),
+    require(refuses([&] { (void)cuda_route(parse_cli("fast", "cuda")); }, consumer_error),
             "CUDA step program must refuse an image it cannot load");
-    const auto resident = parse_cli("fast", {"1", "--generate", "2", "--no-step-graph"});
+    const auto resident = parse_cli("fast", "cuda", {"1", "--generate", "2", "--no-step-graph"});
     require(!cuda_route(resident).program && mini::mini_experts_nvfp4(resident.tier),
             "CUDA resident replay must keep the explicit narrow image");
     std::cout << "inkling2-mini-profile-parity: ok\n";
@@ -664,6 +675,29 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         else require(rc == 2 && !created && error.str().find(reason) != std::string::npos,
                      "--block-drafter value was not refused with its reason before native load");
     }
+    // One strix-serve process serves one worker. An explicit replica placement resolves the model's two-device form, which only
+    // strix-router executes: with real model arguments (a checkpoint) the shell refuses before the adapter validates or
+    // creates anything. This is the documented standalone entry point (the `strix` CLI has no Inkling route).
+    {
+        std::ostringstream out, error;
+        strings.emplace_back("--device-count");
+        strings.emplace_back("2");
+        strings.emplace_back("--placement");
+        strings.emplace_back("replica");
+        require(run({}, out, error) == 2 && !created && error.str().find("runs behind strix-router") != std::string::npos,
+                "two-device Inkling launch with a checkpoint was not refused by strix-serve");
+        strings.resize(strings.size() - 4U);
+        // The same query inspected (no model arguments) reports the replica placement and its executor.
+        std::vector<std::string> inspection{"strix-serve", "--model", "inkling2-mini", "--registry-root", root,
+                                            "--device-count", "2", "--placement", "replica", "--print-effective-config"};
+        std::vector<char*> argv;
+        for (auto& arg : inspection) argv.push_back(arg.data());
+        std::ostringstream inspected, inspect_error;
+        require(sv::run(static_cast<int>(argv.size()), argv.data(), factories, inspected, inspect_error, {}) == 0 &&
+                inspected.str().find("\"form\":\"replica\"") != std::string::npos &&
+                inspected.str().find("\"executed_by\":\"router\"") != std::string::npos && !created,
+                "two-device Inkling inspection did not report the replica placement");
+    }
     sv::ServeShell shell;
     shell.serve = [qualify_q8, sample_capable, tier_name, cli_route, backend, &served_dispatches](
                       const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
@@ -761,6 +795,35 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         socket_startup(*factory, backend, sample_capable);
     }
 }
+
+// A selected W4A4 class on the HIP backend (no W4A4 tile there) is refused before any device work: the server never
+// starts a BF16 run whose startup line reports the class.
+void hip_refuses(const char* root, W4a4 selected) {
+    sv::ServiceFactories factories;
+    bool created = false;
+    mini::MiniServeBackends backends;
+    backends.hip = [&](const mini::MiniServeOptions&) -> mini::MiniServeCohort {
+        created = true;
+        throw std::logic_error("HIP adapter constructed for a W4A4 class");
+    };
+    mini::install_mini_service(factories, std::move(backends),
+        [](const std::string&) {
+            return sv::BpeTokenizer::from_parts({"a", "b"}, {1, 1}, {}, "o200k");
+        },
+        [](const sv::Json&, const sv::Json&, const sv::Json&) { return std::string("a"); });
+    const char* args[]{"strix-serve", "--model", "inkling2-mini", "--registry-root", root,
+                       "--checkpoint", "MODEL.safetensors", "--backend", "hip",
+                       "--profile", "fast", "--speculation", "off"};
+    std::vector<std::string> strings(std::begin(args), std::end(args));
+    std::vector<char*> argv;
+    for (auto& arg : strings) argv.push_back(arg.data());
+    std::ostringstream out, error;
+    const auto rc = sv::run(static_cast<int>(argv.size()), argv.data(), factories, out, error, {});
+    require(rc != 0 && !created, "HIP served a selected W4A4 class");
+    require(error.str().find(strix::moe_core::grouped_w4a4::identity(selected)) != std::string::npos &&
+                error.str().find("CUDA only") != std::string::npos,
+            "HIP refusal does not name the W4A4 class");
+}
 } // namespace
 
 int main(int argc, char** argv) try {
@@ -795,10 +858,16 @@ int main(int argc, char** argv) try {
     wiring(argv[1], "cuda", false, false, W4a4::bf16, "fast", false, false, false, {}, true);
     // Every lever value reaches the served decoder as its own class (mse used to run nearest@1 there).
     for (const auto& [value, expected] : {std::pair{"1", W4a4::nvfp4}, std::pair{"mse", W4a4::nvfp4_mse},
-                                          std::pair{"mse-gate-up", W4a4::nvfp4_mse_gate_up}}) {
+                                          std::pair{"mse-gate-up", W4a4::nvfp4_mse_gate_up},
+                                          std::pair{"mse-r2-gate-up", W4a4::nvfp4_mse_r2_gate_up},
+                                          std::pair{"mse-r2", W4a4::nvfp4_mse_r2},
+                                          std::pair{"r2", W4a4::nvfp4_r2}}) {
         set_w4a4_env(value);
         wiring(argv[1], "cuda", false, false, expected);
+        hip_refuses(argv[1], expected);
     }
+    set_w4a4_env("0");
+    wiring(argv[1], "hip", false);  // the off switch still serves HIP
     set_w4a4_env(nullptr);
     // Both selections are off by default (no profile selects them); an explicit 1 reaches the adapter, an explicit 0 keeps it off.
     set_round_fold_env(nullptr);

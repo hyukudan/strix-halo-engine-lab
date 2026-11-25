@@ -4,12 +4,12 @@
 
 #include <algorithm>
 
-namespace strix::cuda::mix {
+namespace strix::core::residual_mix {
 
 // Compatibility view of the generated CUDA rows. These are already in the
 // builtin catalogue. Callers building a custom catalogue can add this span.
-[[nodiscard]] inline std::span<const exec::KernelEntry> catalog_entries() noexcept {
-    const auto entries = exec::Catalog::builtin_entries(exec::Backend::cuda);
+[[nodiscard]] inline std::span<const exec::KernelEntry> catalog_entries(exec::Backend backend) noexcept {
+    const auto entries = exec::Catalog::builtin_entries(backend);
     const auto is_readout = [](const exec::KernelEntry& entry) {
         return entry.key.op == graph::Op::mix && entry.key.form == "residual.bank";
     };
@@ -17,4 +17,4 @@ namespace strix::cuda::mix {
     return {first, std::find_if_not(first, entries.end(), is_readout)};
 }
 
-} // namespace strix::cuda::mix
+} // namespace strix::core::residual_mix

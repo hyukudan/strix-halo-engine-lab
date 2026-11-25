@@ -177,6 +177,8 @@ std::optional<ReplicaState> replica_state_from_status(std::string_view status_js
     try { status = parse_json(status_json); } catch (const std::exception&) { return std::nullopt; }
     if (!status.is_object()) return std::nullopt;
     ReplicaState out;
+    const Json* instance = status.find("worker_instance_id");
+    if (instance && instance->is_string()) out.worker_instance_id = instance->as_string();
     const Json* capacity = status.find("capacity");
     if (capacity && capacity->is_object()) {
         out.capacity.slots_total = json_u64(capacity->find("slots_total"));

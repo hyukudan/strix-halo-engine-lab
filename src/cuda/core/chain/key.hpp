@@ -12,7 +12,10 @@ using graph::Form;
 enum class Scope : std::uint8_t { element, warp, row, unsupported };
 enum class Arg : std::uint8_t { none, scalar, aux, state };
 enum class Math : std::uint8_t { native, gfx1151_v1 };
-enum class Fold : std::uint8_t { none, descending_upper_first, descending_upper_first_side_output };
+enum class Fold : std::uint8_t {
+    none, descending_upper_first, descending_upper_first_side_output,
+    contiguous_four_xor_one_plus_gain, fused_split_half
+};
 
 struct FormInfo {
     Scope scope;
@@ -54,11 +57,31 @@ template <Form F, std::uint8_t Slot = 0, Math M = Math::native, Fold O = Fold::n
 using ActivationStep = std::conditional_t<M == Math::native && O == Fold::none,
                                           Step<F, Slot>, detail::ActivationVariant<F, Slot, M, O>>;
 
+// The warp owns a full 128-wide row. These variants use the same vocabulary
+// as the CTA forms and select a different numeric order and lane layout.
+template <Form F, std::uint8_t Slot = 0>
+struct WarpQuadStep {
+    static_assert(F == Form::norm_rms || F == Form::rope);
+    // A warp variant must not bind to a CTA Step overload.
+    static constexpr graph::Link link{F, Slot};
+    static constexpr Math math = Math::native;
+    static constexpr Fold fold = F == Form::norm_rms ? Fold::contiguous_four_xor_one_plus_gain
+                                                    : Fold::fused_split_half;
+};
+
 template <class... Steps>
 struct List {
     static_assert(sizeof...(Steps) <= 8);
     static constexpr graph::Chain description{{Steps::link...}, sizeof...(Steps)};
 };
+
+using PrepNorm = WarpQuadStep<Form::norm_rms, 0>;
+using PrepRope = WarpQuadStep<Form::rope, 1>;
+using PrepRawStore = Step<Form::store_f32, 2>;
+using PrepCacheStore = Step<Form::kv_append, 0>;
+using PrepRawChain = List<PrepNorm, PrepRope, PrepRawStore>;
+using PrepCacheChain = List<PrepNorm, PrepRope, PrepCacheStore>;
+using PrepValueChain = List<PrepCacheStore>;
 
 // Package-local chain component of the catalog key. The fixed-width encoding
 // preserves order and bindings without relying on the local ChainTable IDs.
@@ -89,14 +112,14 @@ struct KernelKey {
 
 template <class ChainList>
 inline constexpr auto static_key = []<class... Steps>(List<Steps...>) {
-    auto key = kernel_key(ChainList::description);
-    if (!key) return key;
+    auto chain_key = kernel_key(ChainList::description);
+    if (!chain_key) return chain_key;
     constexpr std::array<std::uint32_t, sizeof...(Steps)> traits{
         ((static_cast<std::uint32_t>(Steps::math) << 24U) | (static_cast<std::uint32_t>(Steps::fold) << 28U))...
     };
-    for (std::size_t i = 0; i < traits.size(); ++i) key->links[i] |= traits[i];
-    if constexpr (((Steps::fold != Fold::none) || ...)) key->scope = Scope::row;
-    return key;
+    for (std::size_t i = 0; i < traits.size(); ++i) chain_key->links[i] |= traits[i];
+    if constexpr (((Steps::fold != Fold::none) || ...)) chain_key->scope = Scope::row;
+    return chain_key;
 }(ChainList{});
 
 template <Form F>

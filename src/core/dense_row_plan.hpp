@@ -18,6 +18,29 @@ namespace strix::core {
 //              a separate Bf16Round pass over the stored FP32 sum for every sum, NaN payloads included.
 enum class RoundStore : unsigned char { incumbent, separate };
 
+enum class Bf16RowPath { short_rows, fp32_grid, big, big_compact };
+
+struct Bf16RowLimits {
+    unsigned short_rows;
+    unsigned grid_rows;
+    unsigned compact_outputs;
+    unsigned tall_input_alignment;
+    unsigned tall_output_alignment;
+};
+
+// A rejected tall shape can use the same FP32 reduction order on a row grid. `terms` is the activation plane count
+// of the tall split (3 exact mma3, 2 / 1 FAST mma2 / mma1). The compact tile is three-term only, so fewer terms
+// take plain big.
+[[nodiscard]] constexpr Bf16RowPath plan_bf16_row_projection(
+    unsigned in, unsigned out, unsigned rows, bool tall_mma, Bf16RowLimits limits, int terms = 3) noexcept {
+    if (!tall_mma || terms < 1 || terms > 3 || rows <= limits.short_rows || in == 0U || out == 0U)
+        return Bf16RowPath::short_rows;
+    if (limits.tall_input_alignment != 0U && limits.tall_output_alignment != 0U &&
+        in % limits.tall_input_alignment == 0U && out % limits.tall_output_alignment == 0U)
+        return out <= limits.compact_outputs && terms == 3 ? Bf16RowPath::big_compact : Bf16RowPath::big;
+    return rows <= limits.grid_rows ? Bf16RowPath::fp32_grid : Bf16RowPath::short_rows;
+}
+
 // Resident BF16 weights [output][input] and tight FP32 output [row][output].
 struct Bf16RowProjection {
     const std::uint16_t* weights{};

@@ -50,7 +50,7 @@ inline weight::WeightLoadPlan resolve_mini_weight_load(
 // FAST lever: W4A4 experts. Multi-row prompt-prefill chunks run the NVFP4 expert layers through the shared grouped W4A4
 // operand class (moe_core/grouped_w4a4.hpp, identity grouped-nvfp4-w4a4-f32-v1: activations quantised once per projection
 // input by the family NVFP4 rule, sm_120 block-scaled FP4 MMA, weights used as stored). MXFP8 layers, decode, verify and
-// one-row calls keep the BF16 tile. CUDA sm_120 only (HIP ignores it). Runnable, not ready: opt in with
+// one-row calls keep the BF16 tile. CUDA sm_120 only (HIP refuses a selected class). Runnable, not ready: opt in with
 // STRIX_INK_MOE_W4A4=1 until the FAST gate (prefill regime) and a prefill receipt exist. Off switch: STRIX_INK_MOE_W4A4=0.
 inline constexpr std::string_view kMiniMoeW4a4 = "inkling2-mini-moe-w4a4@1";
 // Narrow expert image: the checkpoint's MXFP8 expert layers are transcoded to NVFP4 at load (shared

@@ -93,7 +93,7 @@ void compare_bytes(const char* name, const std::vector<T>& want, const Device<T>
 }
 
 attn::DecodePlan plan_for(const attn::DecodeSpec& spec) {
-    const auto plan = attn::make_decode_plan(spec);
+    const auto plan = attn::make_decode_plan(spec, attn::kNativeSplitHeadDim);
     if (!plan) {
         std::fputs("k4c fixture plan rejected\n", stderr);
         std::exit(EXIT_FAILURE);

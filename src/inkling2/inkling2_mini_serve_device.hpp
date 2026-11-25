@@ -61,6 +61,7 @@ inline MiniServeCohort make_mini_device_cohort(
               << " down_image " << mini_down_image_name(levers.down_image, opt.combine_image)
               << " head " << mini_head_field(head)
               << " experts " << (opt.experts_nvfp4 ? "nvfp4" : "checkpoint")
+              << " prefill_route " << (cohort->prefill_emits_first() ? "emits-first" : "plain")
               << " weight_storage " << weights.storage.name << '@' << weights.storage.revision
 #if !defined(__HIPCC__)
               << " cohort_programs " << (programs.enabled ? "on" : "off")

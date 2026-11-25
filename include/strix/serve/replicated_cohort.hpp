@@ -30,6 +30,8 @@
 // beyond the block's inline area follow from rank 0 in frames of at most ReplicaOptions::frame_words words. Words are
 // host order: both ranks are the same architecture.
 //
+// Both ranks require a link whose abort wakes the peer and check that capability before sending or receiving a frame.
+//
 // Pure host code: no device types. Engines bind CohortBackend on each rank; the replication lives here.
 namespace strix::serve {
 
@@ -100,6 +102,7 @@ public:
     [[nodiscard]] std::uint64_t rounds() const noexcept { return round_; }  // control messages sent
 
 private:
+    void abort_replica(const char* reason) noexcept;
     void send(std::uint32_t op, std::uint32_t arg, std::uint32_t flag, std::span<const std::uint32_t> body);
     void defer(std::uint32_t kind, std::span<const std::uint32_t> head, std::span<const std::uint32_t> body);
 
@@ -109,6 +112,7 @@ private:
     std::vector<std::uint32_t> deferred_;  // encoded commit / release records not yet on the wire
     std::uint32_t deferred_records_ = 0;
     std::vector<std::uint32_t> body_;
+    std::vector<CohortGroup> read_groups_;  // verify groups as both ranks run them (every group read)
     std::uint64_t round_ = 0;
     bool closed_ = false;
 };

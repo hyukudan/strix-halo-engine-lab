@@ -104,12 +104,33 @@ void test_resolution() {
         using A = strix::moe_core::grouped_w4a4::Activations;
         for (const auto& [value, expected] : {std::pair<const char*, A>{"1", A::nvfp4},
                                               {"mse", A::nvfp4_mse},
-                                              {"mse-gate-up", A::nvfp4_mse_gate_up}}) {
+                                              {"mse-gate-up", A::nvfp4_mse_gate_up},
+                                              {"mse-r2-gate-up", A::nvfp4_mse_r2_gate_up},
+                                              {"mse-r2", A::nvfp4_mse_r2},
+                                              {"r2", A::nvfp4_r2}}) {
             options.tier = inputs(tier, value);
             require(mini::mini_moe_w4a4_class(mini::resolve_mini_profile(options, true)) == expected,
                     "lever value selects the shared activation class");
             require(mini::mini_moe_w4a4(mini::resolve_mini_profile(options, true)), "candidate values run W4A4");
+            // Backend admission (CLI, gate, step program, server): CUDA runs the class; HIP refuses it instead of
+            // running the BF16 tile under the class's name.
+            const auto resolved = mini::resolve_mini_profile(options, true);
+            require(mini::admit_mini_moe_w4a4(resolved, "cuda") == expected, "CUDA admits the selected class");
+            bool hip_refused = false;
+            try {
+                static_cast<void>(mini::admit_mini_moe_w4a4(resolved, "hip"));
+            } catch (const std::invalid_argument& error) {
+                hip_refused = std::string(error.what()).find(strix::moe_core::grouped_w4a4::identity(expected)) !=
+                              std::string::npos;
+            }
+            require(hip_refused, "HIP refuses a selected W4A4 class and names it");
         }
+        options.tier = inputs(tier, "0");
+        require(mini::admit_mini_moe_w4a4(mini::resolve_mini_profile(options, true), "hip") == A::bf16,
+                "HIP admits the off switch");
+        options.tier = inputs(tier);
+        require(mini::admit_mini_moe_w4a4(mini::resolve_mini_profile(options, true), "hip") == A::bf16,
+                "HIP admits the pending default (BF16 tile)");
     }
     bool refused = false;
     try {

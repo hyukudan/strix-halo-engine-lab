@@ -1,0 +1,8 @@
+if(BUILD_TESTING)
+    add_executable(strix-p1-02-plan-test tests/cuda_core/p1_02_plan_test.cpp)
+    target_include_directories(strix-p1-02-plan-test PRIVATE include src)
+    target_compile_features(strix-p1-02-plan-test PRIVATE cxx_std_20)
+    strix_target_warnings(strix-p1-02-plan-test)
+    add_test(NAME strix-p1-02-plan-test COMMAND strix-p1-02-plan-test)
+    set_tests_properties(strix-p1-02-plan-test PROPERTIES LABELS "cpu;plan;exactness")
+endif()

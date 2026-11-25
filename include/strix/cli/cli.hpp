@@ -26,6 +26,9 @@ struct Request {
     bool print_effective_config = false;
     std::string backend;
     std::string asset;
+    // run/serve: whole-model devices available (--device-count N; --devices stays the device-file option of strix plan and of engines) and an explicit multi-device form (--placement).
+    std::uint32_t device_count = 0;
+    std::string placement;
 };
 
 enum class Platform { linux_host, windows_host, macos_host, other };
@@ -49,6 +52,7 @@ struct Command {
     std::filesystem::path executable;
     std::vector<std::string> args;
     std::optional<profile::ModelPreset> preset = {};
+    std::optional<profile::multi_device::Decision> placement = {};   // also set when a native --profile skips the preset
 };
 using ExecutableExists = std::function<bool(const std::filesystem::path&)>;
 

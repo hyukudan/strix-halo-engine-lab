@@ -9,6 +9,12 @@
 
 namespace strix::model_data::hy4_flash {
 
+namespace multi_device {
+namespace legacy_env {
+inline constexpr std::string_view STRIX_HY4_TP_DRAFT = "forms.tensor.draft_placement";
+inline constexpr std::string_view STRIX_HY4_TP_JOIN_BF16 = "forms.tensor.wire";
+} // namespace legacy_env
+} // namespace multi_device
 inline constexpr std::string_view name = "hy4-flash";
 namespace presets {
 inline constexpr std::string_view default_ = "fast";

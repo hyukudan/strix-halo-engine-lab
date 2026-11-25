@@ -17,6 +17,18 @@ strix-router --listen 0.0.0.0:8090 \
 
 Clients use `http://ROUTER:8090` with the same routes, bodies and credentials as before (headers pass through).
 
+With `--description models/<name>.toml` the router first resolves the model's `[multi_device]` section with the
+same resolver as `strix run|serve --device-count N`: it starts only if the model admits the `replica` form for that many
+endpoints, and prints `effective-multi-device {...}` (form, ranks, wire, rule, reason). A model without the section,
+or with one endpoint, is refused with the reason. `--profile exact|fast|turbo` sets the tier of that check.
+Policy admission resolves each endpoint, refuses overlapping addresses (including scope and port), and requires a
+distinct `worker_instance_id` from each worker's status route. The router keeps the socket address that reported
+the ID for each worker. A later status poll excludes entries that report duplicate or missing IDs. Older workers
+without this field can still be used without `--description`.
+
+For scoped IPv6 endpoints, write `http://[fe80::1%25eth0]:8080` as a URI or `[fe80::1%eth0]:8080` as a bare endpoint.
+A numeric scope is the local interface index.
+
 ## Placement
 
 1. A named session (`/v1/sessions/<id>/...`, header `X-Session-Id`, or body field `session_id`) returns to the
@@ -39,7 +51,8 @@ the client (502, or a stream that ends without its terminator) and never retried
 ## Options
 
 `--poll-ms` (status poll period, default 250), `--connect-timeout-ms` (2000), `--idle-timeout-s` (0 = none),
-`--block-bytes` (1024), `--affinity-entries` (4096), `--max-connections` (256), `--status-target` (`/api/status`).
+`--block-bytes` (1024), `--affinity-entries` (4096), `--max-connections` (256), `--status-target` (`/api/status`),
+`--description` (none: no admission check), `--profile` (the model's `presets.default`).
 
 ## Roll back
 

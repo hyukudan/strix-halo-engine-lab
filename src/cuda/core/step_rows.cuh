@@ -1,36 +1,16 @@
 #pragma once
 
 #include "../../core/dense_row_plan.hpp"
+#include "../../core/step_rows_plan.hpp"
 #include "strix/exec/descriptor.hpp"
 
 #include <cuda_runtime.h>
 
 namespace strix::cuda::core {
 
-template <unsigned Rows>
-struct StepRows {
-    static constexpr unsigned width = Rows;
-    const exec::StepBlock* descriptor;
-
-    __device__ bool valid(unsigned row) const {
-        return row < Rows && exec::step_row_valid(*descriptor, row);
-    }
-
-    __device__ unsigned position(unsigned row) const {
-        return exec::step_row(*descriptor, row).position;
-    }
-};
-
 template <class F>
 auto dispatch_step_rows(unsigned width, F launch) {
-    switch (width) {
-    case 1: return launch.template operator()<1>();
-    case 2: return launch.template operator()<2>();
-    case 4: return launch.template operator()<4>();
-    case 8: return launch.template operator()<8>();
-    case 16: return launch.template operator()<16>();
-    default: return cudaErrorInvalidValue;
-    }
+    return dispatch_step_rows(width, cudaErrorInvalidValue, launch);
 }
 
 }  // namespace strix::cuda::core

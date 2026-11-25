@@ -98,4 +98,16 @@ inline std::string mini_head_field(MiniHead head) {
     return std::string(head.screened ? "screened " : "full ") + std::string(mini_head_reason_name(head.reason));
 }
 
+// The one prompt-row rule of an opted-in W4A4 expert class, shared by the CLI session and the served lanes: every
+// prefill-kind row runs the class whatever the chunk geometry, and decode / verify rows keep the BF16 tile. A one-row
+// prefill chunk therefore takes the grouped route (the packed one-row route has no W4A4 class).
+constexpr bool mini_w4a4_rows(bool w4a4_bound, MiniAppendKind kind) {
+    return w4a4_bound && kind == MiniAppendKind::prefill;
+}
+
+constexpr MiniResidentRoute mini_resident_chunk_route(MiniAppendKind kind, unsigned rows, bool packed_decode,
+                                                      bool w4a4_bound, bool cohort_rows = false) {
+    return mini_resident_route(kind, rows, packed_decode && !mini_w4a4_rows(w4a4_bound, kind), false, cohort_rows);
+}
+
 }  // namespace strix::inkling2

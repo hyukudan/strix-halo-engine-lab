@@ -319,6 +319,7 @@ public:
         receive(in);
     }
     std::string name() const override { return "test-queue"; }
+    bool supports_peer_abort() const noexcept override { return true; }
     void abort(const std::string&) override {
         std::lock_guard lock(wire_->m);
         wire_->aborted = true;

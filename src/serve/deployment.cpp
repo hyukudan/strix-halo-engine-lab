@@ -1,5 +1,8 @@
 #include "strix/serve/deployment.hpp"
 
+#include <cstdio>
+#include <random>
+
 namespace strix::serve {
 
 void deployment_health(Json& health, const DeploymentCallbacks& callbacks) {
@@ -17,6 +20,15 @@ void deployment_status(Json& status, const DeploymentCallbacks& callbacks,
     capacity.set("kv_bytes_free", c.kv_bytes_free ? Json(*c.kv_bytes_free) : Json());
     capacity.set("queue_depth", Json(c.queue_depth));
     status.set("capacity", std::move(capacity));
+    // Shared by every listener in this process, including custom API status providers.
+    static const std::string instance = [] {
+        std::random_device entropy;
+        char id[33]{};
+        std::snprintf(id, sizeof(id), "%08x%08x%08x%08x", static_cast<unsigned>(entropy()),
+            static_cast<unsigned>(entropy()), static_cast<unsigned>(entropy()), static_cast<unsigned>(entropy()));
+        return std::string(id);
+    }();
+    status.set("worker_instance_id", Json(instance));
     if (queue.draining()) {
         const auto* state = status.find("state");
         if (!state || !state->is_string() || state->as_string() != "failed") status.set("state", Json("draining"));

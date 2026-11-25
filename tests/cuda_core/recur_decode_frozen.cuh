@@ -1,7 +1,7 @@
 #pragma once
 // Frozen fixture reference from 453b063b1. Keep independent of K9G decode.
 // Donor: include/strix/cuda/qwen_gdn.hpp:24-46 and
-// src/cuda/models/qwen/qwen_gdn.cu:48-65,260-269,283-432,437-476.
+// src/cuda/models/qwen/qwen_gdn.cu:48-65,189-202,260-269,283-432,437-476.
 // The donor's shared recurrence is frozen here too (recur_lanes.cuh:39-186).
 #include "strix/cuda/amd_math.cuh"
 #include "strix/recurrent_state_type.hpp"
@@ -198,6 +198,20 @@ __device__ __forceinline__ std::uint16_t float_to_bf16(float v) {
     return static_cast<std::uint16_t>((b + 0x7fffU + ((b >> 16) & 1U)) >> 16);
 }
 __device__ __forceinline__ float round_bf16(float v) { return bf16_to_float(float_to_bf16(v)); }
+
+template <unsigned Threads = 256U>
+__global__ __launch_bounds__(Threads) void conv_rollback_kernel(const float* __restrict__ raw_qkv, std::uint32_t keep,
+    const std::uint16_t* __restrict__ before, std::uint16_t* __restrict__ conv_state) {
+    const unsigned ch = blockIdx.x * Threads + threadIdx.x;
+    if (ch >= kConvWidth) return;
+#pragma unroll
+    for (unsigned i = 0; i < kConvKernel; ++i) {
+        const int row = static_cast<int>(keep) - 4 + static_cast<int>(i);
+        conv_state[static_cast<std::uint64_t>(ch) * kConvKernel + i] = row >= 0
+            ? float_to_bf16(raw_qkv[static_cast<std::uint64_t>(row) * kConvWidth + ch])
+            : before[static_cast<std::uint64_t>(ch) * kConvKernel + static_cast<unsigned>(row + 4)];
+    }
+}
 
 // gdn_window_key_sum (hip_gdn_launcher.hip:2255-2262): lane l holds channels l, l+32, l+64, l+96 as p[0..3];
 // s = (p0+p2)+(p1+p3); then lane l (< d) adds lane l+d for d = 16 (permlanex16), 8, 4, 2, 1 (DPP row_shl); the root is

@@ -7,6 +7,7 @@
 // consecutive k of the 32-block (same permutation for A and B, so the sum is unchanged).
 #include "dense_mma.hpp"
 #include "rows_bf16_narrow.cuh"
+#include "core/dense_bf16_narrow_plan.hpp"
 #include "strix/attn/group_indexer.hpp"
 #include "strix/core/rows.hpp"
 #include "strix/weight/registry.hpp"
@@ -366,7 +367,7 @@ cudaError_t dense_mma3_rows_grouped(const rows::Plan& plan, cudaStream_t stream)
     }
 
     for (const auto& launch : plan.launches()) {
-        const MmaGroupArgs args{mma_group_args(launch)};
+        const MmaGroupArgs args{mma_group_args(launch, kRowsAddResidual, kRowsRoundBf16)};
         const auto status = launch.jobs[0].w.has_format(weight::kBf16WeightStorage)
             ? grouped_by_nt<WeightFormat::bf16>(args, plan.rows(), stream)
             : grouped_by_nt<WeightFormat::q8_0>(args, plan.rows(), stream);
@@ -398,7 +399,7 @@ cudaError_t dense_bf16_mma3_rows_round(const DenseWeight* ws, float* const* ys, 
 
 cudaError_t dense_bf16_mma3_r1_output_split(const DenseWeight& weight, float* output,
                                            const float* input, cudaStream_t stream) {
-    const auto blocks = bf16_narrow_blocks(weight.in, weight.out);
+    const auto blocks = core::bf16_narrow_blocks(weight.in, weight.out, 32U, 2U * kBf16NarrowOutputs);
     const auto aligned = [](const void* p, std::uintptr_t bytes) {
         return p && reinterpret_cast<std::uintptr_t>(p) % bytes == 0U;
     };

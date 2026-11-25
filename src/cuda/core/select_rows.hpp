@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cuda/core/select_spec.hpp"
+#include "attn_core/select_spec.hpp"
 #include "strix/exec/descriptor.hpp"
 
 #if defined(__CUDACC__)

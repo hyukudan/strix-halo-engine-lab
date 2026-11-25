@@ -11,6 +11,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <cstdlib>
 
 namespace {
 
@@ -79,7 +80,7 @@ struct Decoder {
 };
 
 #if defined(STRIX_INKLING2_APP_CLI_TEST)
-cli::Options parse(std::initializer_list<std::string> arguments) {
+cli::Options parse(std::initializer_list<std::string> arguments, std::string_view backend = "cuda") {
     std::vector<std::string> storage{"mini", "model"};
     storage.insert(storage.end(), arguments);
     std::vector<char*> argv;
@@ -88,9 +89,44 @@ cli::Options parse(std::initializer_list<std::string> arguments) {
         8U, 8U, 16U, 0U, nullptr, 8U, true, false,
         [](const std::string&) -> std::shared_ptr<const strix::serve::BpeTokenizer> { return {}; },
         strix::inkling2::kMiniPackedDecodeDefault, [](std::string_view) { return std::string{}; }, true};
-    auto options = cli::parse(static_cast<int>(argv.size()), argv.data(), family, true);
+    auto options = cli::parse(static_cast<int>(argv.size()), argv.data(), family, backend);
     // Only use fields that own their values after the temporary argument storage expires.
     return options;
+}
+
+void test_native_w4a4_admission() {
+    namespace w4a4 = strix::moe_core::grouped_w4a4;
+    using A = w4a4::Activations;
+    const auto set_lever = [](const char* value) {
+#if defined(_WIN32)
+        require(_putenv_s("STRIX_INK_MOE_W4A4", value) == 0, "cannot set the W4A4 lever");
+#else
+        require(setenv("STRIX_INK_MOE_W4A4", value, 1) == 0, "cannot set the W4A4 lever");
+#endif
+    };
+    const std::initializer_list<std::string> gate{"--gate-manifest", "missing.tsv", "--gate-out", "out", "--gate-arm",
+        "FAST", "--gate-rows", "2", "--gate-mode", "prefill", "--profile", "fast", "--qualify-q8"};
+    const std::initializer_list<std::string> generation{"1", "2", "--profile", "fast", "--qualify-q8"};
+    for (const auto& [value, expected] : std::array{
+            std::pair{"mse-r2-gate-up", A::nvfp4_mse_r2_gate_up}, std::pair{"mse-r2", A::nvfp4_mse_r2},
+            std::pair{"r2", A::nvfp4_r2}}) {
+        set_lever(value);
+        for (const auto& args : {gate, generation}) {
+            bool refused = false;
+            try {
+                (void)parse(args, "hip");
+            } catch (const std::invalid_argument& error) {
+                const std::string_view message = error.what();
+                refused = message.find(w4a4::identity(expected)) != std::string_view::npos &&
+                          message.find("CUDA only") != std::string_view::npos;
+            }
+            require(refused, "native CLI did not refuse the selected HIP W4A4 class before loading");
+            require(parse(args, "cuda").moe_w4a4 == expected, "native CLI lost the admitted CUDA class");
+        }
+    }
+    set_lever("0");
+    require(parse(gate, "hip").moe_w4a4 == A::bf16, "HIP gate with W4A4 off must still parse");
+    require(parse(generation, "hip").moe_w4a4 == A::bf16, "HIP generation with W4A4 off must still parse");
 }
 
 void test_cuda_route_options() {
@@ -390,6 +426,7 @@ int main() {
         test_options();
         test_projected_bias_lever();
         test_screened_head_lever();
+        test_native_w4a4_admission();
     test_cuda_route_options();
 #endif
         test_windows(directory.path);

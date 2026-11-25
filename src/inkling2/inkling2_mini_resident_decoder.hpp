@@ -258,9 +258,10 @@ public:
     }
 
     // Served prompt route (serve::FixedKvCohort reads it once, at its construction): emits-first (prefill_slot_first)
-    // where the decoder was built with the served route lever and the backend admits it (HIP), else the incumbent
-    // held-back route (prefill_slot). CUDA declines: not qualified there.
-    [[nodiscard]] bool prefill_emits_first() const noexcept { return served_cli_route_; }
+    // where the decoder was built with the served route lever and the backend admits it (HIP), or while a W4A4 expert
+    // class is bound (the final prompt token is then a prefill row on both entry points, so a served lane quantises
+    // exactly the prompt rows of the command line); else the incumbent held-back route (prefill_slot).
+    [[nodiscard]] bool prefill_emits_first() const noexcept { return served_cli_route_ || backend_.moe_w4a4_bound(); }
     // The decode expert form this decoder was built with (packed or grouped), for receipts and fixtures.
     [[nodiscard]] bool packed_decode() const noexcept { return backend_.packed_decode(); }
 
@@ -287,7 +288,7 @@ public:
         last_logit_rows_ = 0U;
         const auto token = state.append_sequence(ids, [&](std::span<const unsigned> chunk, bool last) {
             return append(state, chunk, last, {});
-        }, prefill_rows_, call_tail_rows(ids.size()));
+        }, prefill_rows_, served_cli_route_ ? call_tail_rows(ids.size()) : tail_rows_);
         last_logit_rows_ = 1U;
         return token;
     }

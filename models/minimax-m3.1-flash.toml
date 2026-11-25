@@ -69,3 +69,13 @@ levers = "fast"
 # Use the admitted FAST levers until this model has a qualified TURBO set.
 [presets.turbo]
 levers = "fast"
+
+# Engine-read switches of this model that a [multi_device] key is planned to replace (listed in the effective
+# config when set; they still act inside the engine).
+[multi_device.legacy_env]
+STRIX_SPLIT = "forms.layers"
+STRIX_SPLIT_CUT = "forms.layers.cut"
+STRIX_SPLIT_BLOCK = "forms.layers.window_rows"
+STRIX_MM_PF_GROUP = "forms.layers.window_rows"
+STRIX_MM_PF_MOE_GROUP = "forms.layers.window_rows"
+STRIX_TP2_EXCHANGE_FMT = "forms.tensor.wire"

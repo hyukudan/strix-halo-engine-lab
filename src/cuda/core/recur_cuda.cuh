@@ -1,12 +1,20 @@
 #pragma once
 
-#include "recur_decode_plan.hpp"
+#include "ops/recur/recur_decode_step.hpp"
 #include "recur_plan.hpp"
 #include "strix/numeric/math_gfx1151.hpp"
 
 #include <cuda_runtime_api.h>
 
 namespace strix::cuda::recur {
+
+using ops::recur::DecodeA8;
+using ops::recur::DecodeReplayStep;
+using ops::recur::DecodeRow;
+using ops::recur::DecodeState;
+using ops::recur::DecodeStep;
+using ops::recur::DecodeWeights;
+using ops::recur::GdnDecodeShape;
 
 struct Weights {
     const float* conv;      // [channels][taps], oldest first
@@ -39,10 +47,26 @@ cudaError_t enqueue(const Plan&, const Weights&, Rows, StateView matrix, StateVi
 cudaError_t enqueue_replay(const Plan&, const Weights&, StateView matrix, StateView history,
                            std::uint32_t accepted, cudaStream_t);
 
-// One row using the supplied gfx1151 tables. Row buffers are disjoint except
+// Decode launches require a compiled striped specialization for the supplied
+// shape. One row uses the supplied gfx1151 tables. Row buffers are disjoint except
 // for the documented QKV alias. State image selection and publication belong
 // to the caller. A8 is enabled by supplying both buffers.
-cudaError_t enqueue_decode(Gfx1151Decode, const DecodeWeights&, DecodeRow, DecodeState,
+cudaError_t enqueue_decode(GdnDecodeShape, const DecodeWeights&, DecodeRow, DecodeState,
                            const numeric::gfx1151::Tables&, DecodeA8, cudaStream_t);
+
+// X3 verify or cohort step. Each valid row writes its own state images and
+// optional pre-convolution FP32 capture. The slot directory remains read-only.
+// The only allowed row-buffer alias is prepared == qkv with equal strides.
+cudaError_t enqueue_decode_step(GdnDecodeShape, unsigned width, const DecodeWeights&, const DecodeStep&,
+                                const numeric::gfx1151::Tables&, cudaStream_t);
+
+// X3 replay policy for one contiguous chain. The final row leaves its images
+// in the selected spare. Rerun a shorter prefix from the same published inputs
+// to replace those images after partial acceptance. Zero acceptance leaves
+// the published images alone. The caller owns publication and synchronization.
+// Invalid device bindings/rows mask the whole step. Row-buffer rules match
+// enqueue_decode_step. Keep QKV (or restore it from raw_capture) for replay.
+cudaError_t enqueue_decode_replay_step(GdnDecodeShape, unsigned width, const DecodeWeights&, const DecodeReplayStep&,
+                                       const numeric::gfx1151::Tables&, cudaStream_t);
 
 }  // namespace strix::cuda::recur

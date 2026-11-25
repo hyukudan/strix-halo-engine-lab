@@ -1,0 +1,8 @@
+if(BUILD_TESTING)
+    add_executable(strix-rowgroup-plan-tests tests/attn_core/rowgroup_plan_test.cpp)
+    target_include_directories(strix-rowgroup-plan-tests PRIVATE src)
+    target_compile_features(strix-rowgroup-plan-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-rowgroup-plan-tests)
+    add_test(NAME strix-rowgroup-plan-tests COMMAND strix-rowgroup-plan-tests)
+    set_tests_properties(strix-rowgroup-plan-tests PROPERTIES LABELS "cpu;plan")
+endif()

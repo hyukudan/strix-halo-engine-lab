@@ -32,6 +32,8 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
     const auto regimes = request.regimes.empty() ? std::span<const std::string_view>(single) : request.regimes;
     const WeightLoadDecision* decision = nullptr;
     bool missing = false;
+    // A row without a gate v2 PASS is a TURBO row (measured gain, stated quality): only the TURBO tier finds it.
+    const bool turbo = request.tier == profile::Name::turbo;
     if (regimes.size() > plan.regimes.size()) {
         plan.status = profile::Status::pending;
         plan.reason = "more regimes than a weight load plan records";
@@ -43,7 +45,7 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
         if (!runnable) continue;
         auto scope = request.scope;
         scope.regime = regime;
-        entry.row = find_weight_load_gate(policy, scope, decisions, request.extent, &entry.outside_band);
+        entry.row = find_weight_load_gate(policy, scope, decisions, request.extent, &entry.outside_band, turbo);
         if (!entry.row) {
             missing = true;
             continue;
@@ -54,12 +56,21 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
         entry.qualification = full ? RegimeQualification::full : RegimeQualification::gate_only;
         if (full && !decision) decision = entry.row;
     }
-    if (missing) decision = nullptr;
+    const WeightLoadDecision* turbo_row = nullptr;
+    bool every_regime_faster = true;
+    for (const auto& entry : plan.regime_rows()) {
+        if (!turbo_row && entry.row && entry.row->gate_v2_pass == Digest256{}) turbo_row = entry.row;
+        every_regime_faster &= entry.qualification == RegimeQualification::full;
+    }
+    // A new TURBO image replaces FAST throughout the requested regimes. Each replacement needs its own gain.
+    const bool turbo_without_gain = turbo_row && !every_regime_faster;
+    if (missing || turbo_without_gain) decision = nullptr;
     plan.status = profile::admit_column(decision != nullptr, runnable, request.allow_pending);
     if (plan.status == profile::Status::pending) {
         plan.reason = !runnable ? "shared format consumer unavailable"
             : missing && regimes.size() > 1U ? "a regime of the image has no matching gate v2 PASS row"
             : missing ? "no matching gate v2 PASS and measured gain"
+            : turbo_without_gain ? "TURBO image requires a measured gain in every regime"
             : "gate v2 PASS without a measured gain in any regime";
         return plan;
     }
@@ -69,10 +80,34 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
     if (decision) {
         plan.gate_v2_pass = decision->gate_v2_pass;
         plan.measured_gain = decision->measured_gain;
-        plan.reason = regimes.size() > 1U ? "gate v2 PASS in every regime and a measured gain"
-                                          : "gate v2 PASS and measured gain";
+        plan.reason = turbo_row ? "TURBO row: measured gain, measured quality below the FAST gate"
+            : regimes.size() > 1U ? "gate v2 PASS in every regime and a measured gain"
+                                  : "gate v2 PASS and measured gain";
+        if (turbo_row) plan.turbo_quality = turbo_row->turbo_quality;
     }
     return plan;
+}
+
+std::string weight_load_scope_receipt(const WeightLoadScope& scope) {
+    const auto hex = [](const Digest256& d) {
+        std::string out;
+        for (const auto byte : d.bytes) {
+            out += "0123456789abcdef"[byte >> 4U];
+            out += "0123456789abcdef"[byte & 15U];
+        }
+        return out;
+    };
+    std::string out = "strix-weight-load-scope/v1 device ";
+    out += scope.device_class;
+    out += " compiler ";
+    out += scope.compiler_id;
+    out += " regime ";
+    out += scope.regime;
+    out += " build ";
+    out += hex(scope.build);
+    out += " checkpoint ";
+    out += hex(scope.checkpoint);
+    return out;
 }
 
 std::string weight_load_regime_receipt(const WeightLoadPlan& plan) {

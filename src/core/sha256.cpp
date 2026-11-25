@@ -1,4 +1,4 @@
-#include "h3/te/te_sha256.hpp"
+#include "core/sha256.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -12,7 +12,7 @@
 #include <immintrin.h>
 #endif
 
-namespace strix::h3::te {
+namespace strix::core {
 namespace {
 
 constexpr std::uint32_t kK[64] = {
@@ -185,4 +185,4 @@ std::string sha256_file_hex(const std::string& path) {
     return h.finish_hex();
 }
 
-}  // namespace strix::h3::te
+}  // namespace strix::core

@@ -165,8 +165,8 @@ int main() {
         prefill.regime = weight::kPrefillRegime;
         auto decode = scope;
         decode.regime = weight::kDecodeRegime;
-        const weight::WeightLoadEvidence pf_receipt{"receipts/prefill", "2026-11-23", 2457, 0};
-        const weight::WeightLoadEvidence banded{"receipts/decode", "2026-11-23", 2457, 65536};
+        const weight::WeightLoadEvidence pf_receipt{"receipts/prefill", "2026-11-23", 2457, 0, 0};
+        const weight::WeightLoadEvidence banded{"receipts/decode", "2026-11-23", 2457, 65536, 0};
         const auto& q8 = weight::kAttentionHeadQ8Policy;
         weight::WeightLoadRequest r{strix::profile::Name::fast, scope, formats, true, false, regimes, {32768, 0}};
         const auto resolve = [&](std::span<const weight::WeightLoadDecision> table) {
@@ -260,6 +260,76 @@ int main() {
         ok &= check(resolve(both).storage == weight::kQ8WeightStorage, "single-regime request keeps its old meaning");
         r.scope = prefill;
         ok &= check(resolve(both).storage == weight::kBf16WeightStorage, "single gate-only regime never selects");
+    }
+
+    // A row without a gate v2 PASS qualifies TURBO only, with a measured gain and a stated quality; FAST never takes it.
+    const auto& q4 = weight::kAttentionHeadQ4Policy;
+    constexpr std::array lowbit{weight::kBf16WeightStorage, weight::kQ4G64WeightStorage};
+    const std::array turbo{weight::WeightLoadDecision{q4.id, scope, {}, gain, {}, "kl=0.01 top1=0.94"}};
+    const std::array unstated{weight::WeightLoadDecision{q4.id, scope, {}, gain}};
+    const std::array unmeasured{weight::WeightLoadDecision{q4.id, scope, {}, {}, {}, "kl=0.01 top1=0.94"}};
+    weight::WeightLoadRequest lowbit_request{strix::profile::Name::turbo, scope, lowbit, true, false};
+    const auto turbo_plan = weight::resolve_weight_load(weight::builtin_registry(), q4, lowbit_request, turbo);
+    ok &= check(turbo_plan.status == strix::profile::Status::set && turbo_plan.storage == weight::kQ4G64WeightStorage &&
+                    turbo_plan.turbo_quality == "kl=0.01 top1=0.94" && turbo_plan.gate_v2_pass == Digest256{},
+                "TURBO takes a TURBO row and states its quality");
+    ok &= check(weight::resolve_weight_load(weight::builtin_registry(), q4, lowbit_request, unstated).storage ==
+                    weight::kBf16WeightStorage,
+                "a TURBO row without a stated quality is refused");
+    ok &= check(weight::resolve_weight_load(weight::builtin_registry(), q4, lowbit_request, unmeasured).storage ==
+                    weight::kBf16WeightStorage,
+                "a TURBO row without a measured gain is refused");
+    lowbit_request.tier = strix::profile::Name::fast;
+    const auto fast_plan = weight::resolve_weight_load(weight::builtin_registry(), q4, lowbit_request, turbo);
+    ok &= check(fast_plan.storage == weight::kBf16WeightStorage && fast_plan.turbo_quality.empty(),
+                "FAST never takes a TURBO row");
+    {
+        // Per-regime TURBO rows: TURBO takes the image when every regime has a row; a gate v2 PASS row of the same
+        // regime is preferred to the TURBO row; FAST still refuses.
+        const std::array<std::string_view, 2> regimes{weight::kPrefillRegime, weight::kDecodeRegime};
+        auto prefill = scope;
+        prefill.regime = weight::kPrefillRegime;
+        auto decode = scope;
+        decode.regime = weight::kDecodeRegime;
+        weight::WeightLoadRequest r{strix::profile::Name::turbo, scope, lowbit, true, false, regimes, {16384, 0}};
+        const std::array turbo_rows{weight::WeightLoadDecision{q4.id, prefill, {}, gain, {}, "kl=0.02"},
+                              weight::WeightLoadDecision{q4.id, decode, {}, gain, {}, "kl=0.03"}};
+        auto p = weight::resolve_weight_load(weight::builtin_registry(), q4, r, turbo_rows);
+        ok &= check(p.storage == weight::kQ4G64WeightStorage && p.turbo_quality == "kl=0.02" && p.regime_count == 2 &&
+                        p.regimes[1].row == &turbo_rows[1],
+                    "TURBO rows in every regime select the image and state the quality");
+        const std::array prefill_only{turbo_rows[0]};
+        ok &= check(weight::resolve_weight_load(weight::builtin_registry(), q4, r, prefill_only).storage ==
+                        weight::kBf16WeightStorage,
+                    "a regime without a TURBO row keeps the image BF16");
+        const std::array mixed{turbo_rows[0], weight::WeightLoadDecision{q4.id, decode, gate, gain, {}, {}}, turbo_rows[1]};
+        p = weight::resolve_weight_load(weight::builtin_registry(), q4, r, mixed);
+        ok &= check(p.regimes[1].row == &mixed[1] && p.turbo_quality == "kl=0.02",
+                    "a gate v2 PASS with a gain is preferred to its TURBO row");
+        const std::array without_prefill_gain{weight::WeightLoadDecision{q4.id, prefill, gate, {}}, turbo_rows[1]};
+        ok &= check(weight::resolve_weight_load(weight::builtin_registry(), q4, r, without_prefill_gain).storage ==
+                        weight::kBf16WeightStorage,
+                    "the TURBO image cannot replace BF16 in a regime without a measured gain");
+        r.tier = strix::profile::Name::fast;
+        ok &= check(weight::resolve_weight_load(weight::builtin_registry(), q4, r, turbo_rows).storage ==
+                        weight::kBf16WeightStorage,
+                    "FAST refuses per-regime TURBO rows");
+        // A decode row banded by step rows: the plan reports the band of the regime whose row matched.
+        r.tier = strix::profile::Name::turbo;
+        weight::WeightLoadRequest d{strix::profile::Name::turbo, decode, lowbit, true, false, {}, {16384, 0}};
+        const std::array banded{weight::WeightLoadDecision{q4.id, decode, {}, gain, {"r", "2026-11-24", 1008, 0, 0, 16}, "kl=0.03"}};
+        const auto bp = weight::resolve_weight_load(weight::builtin_registry(), q4, d, banded);
+        ok &= check(bp.storage == weight::kQ4G64WeightStorage && bp.row_band(weight::kDecodeRegime) == 16U &&
+                        bp.row_band(weight::kPrefillRegime) == 0U && p.row_band(weight::kDecodeRegime) == 0U,
+                    "decode step band of the matched row (unbanded rows and other regimes: 0)");
+    }
+    {
+        weight::WeightLoadScope s{weight::Backend::hip, "gfx1151", "hip-7.1", "resident", gate, gain};
+        ok &= check(weight::weight_load_scope_receipt(s) ==
+                        "strix-weight-load-scope/v1 device gfx1151 compiler hip-7.1 regime resident build "
+                        "0800000000000000000000000000000000000000000000000000000000000001 checkpoint "
+                        "0900000000000000000000000000000000000000000000000000000000000001",
+                    "scope receipt prints the digest literals");
     }
     return ok ? 0 : 1;
 }

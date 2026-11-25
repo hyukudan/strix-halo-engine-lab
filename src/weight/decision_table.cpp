@@ -33,17 +33,16 @@ Digest256 implementation_identity(std::span<const ArithmeticId> consumers) {
 
 namespace {
 // The one scope rule of every lookup: a complete request scope, and a row of the same backend, device, toolkit,
-// regime, consumer identity and checkpoint with a gate v2 PASS.
+// regime, consumer identity and checkpoint.
 bool complete_scope(const WeightLoadScope& scope) {
     return !scope.device_class.empty() && !scope.compiler_id.empty() && !scope.regime.empty() &&
            !(scope.build == Digest256{}) && !(scope.checkpoint == Digest256{});
 }
 
-bool same_scope_pass(const WeightLoadDecision& row, const WeightLoadScope& scope) {
+bool same_scope(const WeightLoadDecision& row, const WeightLoadScope& scope) {
     const auto& s = row.scope;
     return s.backend == scope.backend && s.device_class == scope.device_class && s.compiler_id == scope.compiler_id &&
-           s.regime == scope.regime && s.build == scope.build && s.checkpoint == scope.checkpoint &&
-           !(row.gate_v2_pass == Digest256{});
+           s.regime == scope.regime && s.build == scope.build && s.checkpoint == scope.checkpoint;
 }
 
 template <class SamePolicy>
@@ -51,7 +50,8 @@ const WeightLoadDecision* find_decision(SamePolicy same_policy, const WeightLoad
                                         std::span<const WeightLoadDecision> decisions, WeightLoadExtent extent) {
     if (!complete_scope(scope)) return nullptr;
     for (const auto& row : decisions)
-        if (same_policy(row.policy) && same_scope_pass(row, scope) && weight_load_gain_selects(row, extent)) return &row;
+        if (same_policy(row.policy) && same_scope(row, scope) && !(row.gate_v2_pass == Digest256{}) &&
+            weight_load_gain_selects(row, extent)) return &row;
     return nullptr;
 }
 }  // namespace
@@ -68,21 +68,26 @@ const WeightLoadDecision* find_weight_load_decision(const WeightLoadPolicy& poli
 
 const WeightLoadDecision* find_weight_load_gate(const WeightLoadPolicy& policy, const WeightLoadScope& scope,
                                                 std::span<const WeightLoadDecision> decisions, WeightLoadExtent extent,
-                                                const WeightLoadDecision** outside_band) {
+                                                const WeightLoadDecision** outside_band, bool turbo) {
     if (outside_band) *outside_band = nullptr;
     if (!complete_scope(scope)) return nullptr;
     const WeightLoadDecision* gate_only = nullptr;
+    const WeightLoadDecision* turbo_row = nullptr;
     for (const auto& row : decisions) {
-        if (!policy_has_id(policy, row.policy) || !same_scope_pass(row, scope)) continue;
+        if (!policy_has_id(policy, row.policy) || !same_scope(row, scope)) continue;
+        const bool pass = !(row.gate_v2_pass == Digest256{});
+        const bool gains = weight_load_gain_covers_lanes(row.evidence, extent.lanes) &&
+                           !(row.measured_gain == Digest256{});
+        if (!pass && (!turbo || !gains || row.turbo_quality.empty())) continue;
         if (!weight_load_context_in_band(row.evidence, extent.context)) {
             if (outside_band && !*outside_band) *outside_band = &row;
             continue;
         }
-        if (!(row.measured_gain == Digest256{}) && weight_load_gain_covers_lanes(row.evidence, extent.lanes))
-            return &row;
-        if (!gate_only) gate_only = &row;
+        if (pass && gains) return &row;
+        if (pass && !gate_only) gate_only = &row;
+        if (!pass && !turbo_row) turbo_row = &row;
     }
-    return gate_only;
+    return turbo_row ? turbo_row : gate_only;
 }
 
 Status validate_qualification(const Qualification& q) {

@@ -82,6 +82,13 @@ inline constexpr std::string_view scoring_func = "sqrtsoftplus";
 inline constexpr double swiglu_limit = 0x1.4p+3 /* 10 */;
 inline constexpr std::string_view topk_method = "noaux_tc";
 } // namespace moe
+namespace multi_device {
+namespace legacy_env {
+inline constexpr std::string_view STRIX_DS41_EXPERT_SLOTS = "forms.tensor.expert_partition";
+inline constexpr std::string_view STRIX_DS41_EXPERT_TP = "forms.tensor.expert_partition";
+inline constexpr std::string_view STRIX_DS41_EXPERT_TP_LAYOUT = "forms.tensor.expert_partition";
+} // namespace legacy_env
+} // namespace multi_device
 inline constexpr std::string_view name = "deepseek-v4.1-flash";
 namespace presets {
 inline constexpr std::string_view default_ = "fast";
