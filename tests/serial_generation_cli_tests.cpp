@@ -1,3 +1,4 @@
+#include "strix/device_allocation_error.hpp"
 #include "strix/serial_request.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
@@ -242,10 +243,13 @@ static void chunk_fallback_cases() {
     std::ostringstream log;
     std::vector<unsigned> tried;
     // The device holds at most `capacity` rows: larger loads throw `what`.
-    const auto loader = [&](unsigned capacity, const char* what = "reserve: out of memory") {
-        return [&tried, capacity, what](std::uint32_t rows) {
+    const auto loader = [&](unsigned capacity, const char* what = "reserve: out of memory", bool typed = true) {
+        return [&tried, capacity, what, typed](std::uint32_t rows) {
             tried.push_back(rows);
-            if (rows > capacity) throw std::runtime_error(what);
+            if (rows > capacity) {
+                if (typed) throw strix::DeviceAllocationError(what, 2);
+                throw std::runtime_error(what);
+            }
             return rows;
         };
     };
@@ -268,8 +272,14 @@ static void chunk_fallback_cases() {
     check(throws(true, 8192U, 2048U, loader(4096U)) && tried.size() == 1U && log.str().empty(),
           "explicit chunk is never changed");
     tried.clear();
-    check(throws(false, 8192U, 2048U, loader(4096U, "open checkpoint: no such file")) && tried.size() == 1U &&
+    check(throws(false, 8192U, 2048U, loader(4096U, "open checkpoint: no such file", false)) && tried.size() == 1U &&
           log.str().empty(), "a non-memory failure is not retried");
+    tried.clear();
+    check(throws(false, 8192U, 2048U, loader(4096U, "invalid checkpoint: out of memory in metadata key", false)) &&
+          tried.size() == 1U && log.str().empty(), "an untyped failure whose text says out of memory is not retried");
+    tried.clear();
+    check(throws(false, 8192U, 2048U, loader(4096U, "invalid checkpoint: out of memory in metadata key", false)) &&
+          tried.size() == 1U, "message text alone never selects the retry");
     tried.clear();
     check(throws(false, 8192U, 2048U, loader(1024U)) && tried.size() == 2U, "failure of the retry propagates");
     tried.clear();
@@ -277,11 +287,65 @@ static void chunk_fallback_cases() {
     tried.clear();
     check(throws(false, 8192U, 0U, loader(4096U)) && tried.size() == 1U, "no fallback configured");
     tried.clear();
-    check(sv::load_with_chunk_fallback(8192U, false, 2048U, log, [&](std::uint32_t rows) {
-              tried.push_back(rows);
-              if (rows > 2048U) throw std::bad_alloc();
-              return rows;
-          }) == 2048U, "bad_alloc counts as an allocation failure");
+    bool host_failure_escaped = false;
+    try {
+        (void)sv::load_with_chunk_fallback(8192U, false, 2048U, log, [&](std::uint32_t rows) -> std::uint32_t {
+            tried.push_back(rows);
+            throw std::bad_alloc();
+        });
+    } catch (const std::bad_alloc&) {
+        host_failure_escaped = true;
+    }
+    check(host_failure_escaped && tried.size() == 1U, "a host bad_alloc is not retried at fewer device rows");
+}
+
+// The shared CLI entry point: the implicit chunk (family default 6 rows, fallback 2) retries once after a typed
+// device allocation failure; an explicit --prefill-chunk, or a failure that only says "out of memory", never does.
+static void chunk_fallback_cli_cases() {
+    std::vector<std::uint32_t> loaded_rows;
+    bool typed = true;
+    SerialGenerationFamily pressure = family;
+    pressure.default_prefill_chunk = 6U;
+    pressure.prefill_chunk_fallback = 2U;
+    pressure.load = [&](const SerialGenerationLoad& load) -> std::unique_ptr<SerialGenerationDecoder> {
+        loaded_rows.push_back(load.prefill_chunk);
+        if (load.prefill_chunk > 3U) {
+            if (typed) throw strix::DeviceAllocationError("reserve: out of memory", 2);
+            throw std::runtime_error("invalid checkpoint: out of memory in metadata key");
+        }
+        return std::make_unique<Decoder>(std::min(8U, load.verify_rows));
+    };
+    const auto implicit = run({"8", "4", "1", "2", "3", "5"}, pressure);
+    check(implicit.code == 0 && loaded_rows == std::vector<std::uint32_t>{6U, 2U}, "implicit chunk retries once");
+    loaded_rows.clear();
+    const auto fits = run({"8", "4", "1", "2", "3", "5", "--prefill-chunk", "3"}, pressure);
+    check(fits.code == 0 && loaded_rows == std::vector<std::uint32_t>{3U}, "explicit chunk is used as given");
+    loaded_rows.clear();
+    const auto refused = run({"8", "4", "1", "2", "3", "5", "--prefill-chunk", "6"}, pressure);
+    check(refused.code != 0 && loaded_rows == std::vector<std::uint32_t>{6U}, "explicit chunk is never retried");
+    loaded_rows.clear();
+    typed = false;
+    const auto untyped = run({"8", "4", "1", "2", "3", "5"}, pressure);
+    check(untyped.code != 0 && loaded_rows == std::vector<std::uint32_t>{6U}, "untyped failure is not retried");
+
+    // The same out-of-memory runtime status through the shared classification of a failed runtime call: refused at a
+    // pinned host staging allocation (a general operation) it is never retried; refused at a device row allocation
+    // it retries once at the fallback rows.
+    constexpr int out_of_memory_status = 2;
+    auto operation = strix::RuntimeOperation::general;
+    pressure.load = [&](const SerialGenerationLoad& load) -> std::unique_ptr<SerialGenerationDecoder> {
+        loaded_rows.push_back(load.prefill_chunk);
+        if (load.prefill_chunk > 3U)
+            strix::throw_runtime_failure("allocate: out of memory", out_of_memory_status, true, operation);
+        return std::make_unique<Decoder>(std::min(8U, load.verify_rows));
+    };
+    loaded_rows.clear();
+    const auto staging = run({"8", "4", "1", "2", "3", "5"}, pressure);
+    check(staging.code != 0 && loaded_rows == std::vector<std::uint32_t>{6U}, "pinned staging refusal loads once");
+    loaded_rows.clear();
+    operation = strix::RuntimeOperation::device_allocation;
+    const auto rows = run({"8", "4", "1", "2", "3", "5"}, pressure);
+    check(rows.code == 0 && loaded_rows == std::vector<std::uint32_t>{6U, 2U}, "device row refusal loads twice");
 }
 
 // The one decode-form resolver (strix/serve/decode_form.hpp) against the expression it replaced in the command line:
@@ -310,6 +374,7 @@ static void decode_form_cases() {
 int main() try {
     decode_form_cases();
     chunk_fallback_cases();
+    chunk_fallback_cli_cases();
     {
         const auto family_with_media = media_family();
         media_messages([&](const std::string& path) {

@@ -220,8 +220,10 @@ inline hipError_t enqueue_screened_greedy(const PlaneView& plane, const screened
 inline constexpr unsigned kLanesWaves = 32U;
 
 // ---- Lanes: several activation rows against one head (verify rows, cohort lanes), screened_head_plan::Launch. ----
-// Pass 1 of a group of Lanes lanes: block row blockIdx.y serves lanes [y * Lanes, min(lanes, (y + 1) * Lanes)); xs holds
-// their activations ([Lanes][width]). Each plane row is loaded and decoded once for the group; every lane keeps its own
+// Pass 1 of a group of Lanes lanes: blockIdx.x serves lanes [x * Lanes, min(lanes, (x + 1) * Lanes)); blockIdx.y
+// walks the plane rows. Groups are the fastest grid dimension so blocks reading the same plane rows can share
+// those reads through the cache. Their activations live in xs ([Lanes][width]). Each plane row is loaded and
+// decoded once for the group; every lane keeps its own
 // FMA chain in pass1_kernel's order, so its upper[], its bound flag and its L* are the ones the one-row launch computes on
 // that lane. A lane whose prep raised the fallback flag is skipped (its compact runs every row, as in the one-row form).
 template <unsigned Bits, unsigned Lanes>
@@ -229,7 +231,7 @@ __global__ void __launch_bounds__(kLanesWaves * 32U) pass1_lanes_kernel(PlaneVie
                                                                         unsigned x_stride, screened_head::Bound bound,
                                                                         State* state, float* upper, unsigned upper_stride) {
     extern __shared__ float xs[];
-    const unsigned first = blockIdx.y * Lanes;
+    const unsigned first = blockIdx.x * Lanes;
     const unsigned live = lanes - first < Lanes ? lanes - first : Lanes;
     bool on[Lanes];
     float nx[Lanes];
@@ -258,7 +260,7 @@ __global__ void __launch_bounds__(kLanesWaves * 32U) pass1_lanes_kernel(PlaneVie
         lmax[l] = -__builtin_inff();
         bad[l] = false;
     }
-    for (unsigned row = blockIdx.x * kLanesWaves + wave; row < plane.rows; row += gridDim.x * kLanesWaves) {
+    for (unsigned row = blockIdx.y * kLanesWaves + wave; row < plane.rows; row += gridDim.y * kLanesWaves) {
         const std::uint8_t* base = plane.data + std::size_t{row} * plane.row_bytes;
         const std::uint16_t* scales = reinterpret_cast<const std::uint16_t*>(base + plane.scales_offset);
         float acc[Lanes];
@@ -362,7 +364,7 @@ inline hipError_t enqueue_screened_greedy_lanes(const screened_head_plan::Launch
     } else {
         // The same waves in flight as the one-row launch: grids.pass1 blocks of kPass1Waves -> blocks of kLanesWaves.
         const unsigned blocks = std::max(1U, a.grids.pass1 * kPass1Waves / kLanesWaves);
-        const dim3 grid(blocks, screened_head_plan::pass1_groups(a.lanes, per));
+        const dim3 grid(screened_head_plan::pass1_groups(a.lanes, per), blocks);
         const std::size_t lds = std::size_t{per} * a.head.width * sizeof(float);
         const auto stride = static_cast<unsigned>(layout.upper_stride);
         const auto run = [&](auto kernel) {

@@ -155,7 +155,8 @@ int main(int argc, char** argv) {
                                      {"routed_q_call", 2304U, {3072U, 384U, 24U, 3072U, 1024U, 1024U}, false, true, 0U, true},
                                      {"routed_o_pitched", 3072U, {2304U}, true, true, 3200U, true},
                                      {"routed_o_pitch3328", 3072U, {2304U}, true, true, 3328U, false},  // pitch not measured
-                                     {"routed_kv_narrow", 2304U, {1024U, 32U}, false, true, 0U, false}};
+                                     {"routed_kv_narrow", 2304U, {1024U, 32U}, false, true, 0U, false},
+                                     {"routed_wide_n128_pair", 2304U, {5120U, 128U, 128U}, false, true, 0U, true}};  // unmeasured group: the packed runs are cut into measured launches
     const std::vector<unsigned> heights = {1000U, 1024U, 4096U, 4100U, 8192U, 8209U, 8236U, 9216U, 9232U};  // 9,232: above the measured band
     std::mt19937 rng(20261124U);
     std::normal_distribution<float> nd(0.0F, 1.0F);
@@ -355,6 +356,18 @@ int main(int argc, char** argv) {
             {"n128_rows_8192", 2304U, {128U}, 8192U, 0, k64},
             {"n128_rows_8236", 2304U, {128U}, 8236U, 0, k32},
             {"wide_plus_n128_rows_8236", 2304U, {3072U, 128U}, 8236U, 0, k32},
+            // Individually measured widths in a launch group nobody measured: K32 (the narrow members would exit
+            // early in most blocks of the wide member's grid).
+            {"group_5120_128_128_8192", 2304U, {5120U, 128U, 128U}, 8192U, 0, k32},
+            {"group_5120_128_128_4096", 2304U, {5120U, 128U, 128U}, 4096U, 0, k32},
+            {"group_3072_1024_8192", 2304U, {3072U, 1024U}, 8192U, 0, k32},
+            {"group_3072_3072_8192", 2304U, {3072U, 3072U}, 8192U, 0, k64},  // measured production groups
+            {"group_1024_1024_8192", 2304U, {1024U, 1024U}, 8192U, 0, k64},
+            {"group_3072_3072_1024_9216", 2304U, {3072U, 3072U, 1024U}, 9216U, 0, k64},
+            {"group_3072_3072_1024_4096", 2304U, {3072U, 3072U, 1024U}, 4096U, 0, k64},
+            {"group_3072_3072_rows_4095", 2304U, {3072U, 3072U}, 4095U, 0, k32},
+            {"group_1024_1024_3072_8192", 2304U, {1024U, 1024U, 3072U}, 8192U, 0, k32},
+            {"group_qkv_order_swapped", 2304U, {1024U, 3072U, 1024U}, 8192U, 0, k32},
             {"n256_rows_4096", 2304U, {256U}, 4096U, 0, k32},
             {"n512_rows_8192", 2304U, {512U}, 8192U, 0, k32},
             {"wide_gfx1150", 2304U, {3072U, 1024U, 1024U}, 8192U, 1, k32},
@@ -411,6 +424,44 @@ int main(int argc, char** argv) {
             for (auto* p : img.outputs) require(hipFree(p), "free");
             for (auto* w : weights) require(hipFree(w), "free");
         }
+        {  // Production packed calls are the launches of the previous code (runs of kGroupMax = 3 packed projections), each
+           // one launch: the 4-projection call is [3072,3072,1024] + [1024], the q pair and the kv pair one launch each;
+           // an unlisted grouping is cut into single launches (literals).
+            using strix::core::ImageRoute;
+            struct Cut {
+                const char* name;
+                std::vector<unsigned> widths;
+                std::vector<std::size_t> runs;
+            };
+            const Cut cuts[] = {{"all_call", {3072U, 3072U, 1024U, 1024U}, {3U, 1U}},
+                                {"q_pair", {3072U, 3072U}, {2U}},
+                                {"kv_pair", {1024U, 1024U}, {2U}},
+                                {"qkv_group", {3072U, 1024U, 1024U}, {3U}},
+                                {"wide_n128_pair", {5120U, 128U, 128U}, {1U, 1U, 1U}}};
+            bool cuts_ok = true;
+            for (const auto& cut : cuts)
+                for (const unsigned rows : {4096U, 8192U, 8209U, 9216U}) {
+                    std::vector<Bf16RowProjection> projections;
+                    for (const unsigned width : cut.widths) projections.push_back({nullptr, width, nullptr, false});
+                    const ImageRoute routes[4] = {ImageRoute::packed, ImageRoute::packed, ImageRoute::packed,
+                                                  ImageRoute::packed};
+                    std::vector<std::size_t> got;
+                    // rows 8209 / 9216 keep the 128-wide members off the packed table: only the listed groups matter here
+                    require(strix::core::for_each_image_route_run<fma_rows::kGroupMax>(
+                        std::span<const Bf16RowProjection>(projections),
+                        std::span<const ImageRoute>(routes, projections.size()), 2304U, hipSuccess,
+                        [&](ImageRoute, std::span<const Bf16RowProjection> run) {
+                            got.push_back(run.size());
+                            return hipSuccess;
+                        },
+                        &fma_rows::kImageRoutePolicy, rows), "cut");
+                    const bool same = got == cut.runs;
+                    cuts_ok = cuts_ok && same;
+                    if (!same) std::cout << "select launches " << cut.name << " rows " << rows << " runs " << got.size() << " FAIL\n";
+                }
+            ok = ok && cuts_ok;
+            std::cout << "select launches production_groups_one_launch " << (cuts_ok ? "PASS" : "FAIL") << '\n';
+        }
         {  // the call that stores the image: the plan of an unmeasured K / width keeps the FP32 rows (literal)
             const Case c{"k64_n2048_routed", 64U, {2048U}, false, true};
             std::vector<std::uint16_t*> weights{device<std::uint16_t>(std::size_t{2048U} * 64U)};
@@ -426,6 +477,92 @@ int main(int argc, char** argv) {
             std::cout << "select k64_n2048_routed " << (planned_any ? "PLANNED FAIL" : "fp32-rows PASS") << '\n';
             for (auto* p : run.outputs) require(hipFree(p), "free");
             require(hipFree(weights[0]), "free");
+        }
+        {  // The device of an explicit stream decides, not the current device (a node has no second GPU: the stream's owner
+           // is injected as an unqualified class while the real current device stays the measured one). Default, legacy
+           // and per-thread streams are current-device sentinels. Both public entries, guards checked after a sync.
+            const fma_rows::ImageDeviceClass owner_other{"gfx1150", 32U, 40U, 1};
+            hipStream_t stream = nullptr;
+            require(hipStreamCreate(&stream), "stream");
+            const Case c{"stream_owner", 2304U, {3072U, 2304U}, false, true};
+            std::vector<std::uint16_t*> weights;
+            for (const unsigned width : c.widths) {
+                std::vector<std::uint16_t> w(std::size_t{width} * c.K);
+                for (auto& v : w) v = bf16(0.05F * nd(rng));
+                weights.push_back(device<std::uint16_t>(w.size()));
+                require(hipMemcpy(weights.back(), w.data(), w.size() * 2U, hipMemcpyHostToDevice), "w");
+            }
+            const unsigned rows = 8192U;
+            const Case ci{"stream_owner_image", 2304U, {3072U, 1024U, 1024U}, false};
+            std::vector<std::uint16_t*> iweights;
+            for (const unsigned width : ci.widths) {
+                std::vector<std::uint16_t> w(std::size_t{width} * ci.K);
+                for (auto& v : w) v = bf16(0.05F * nd(rng));
+                iweights.push_back(device<std::uint16_t>(w.size()));
+                require(hipMemcpy(iweights.back(), w.data(), w.size() * 2U, hipMemcpyHostToDevice), "w");
+            }
+            struct StreamCase {
+                const char* name;
+                hipStream_t stream;
+                bool foreign_owner;  // the injected owner of `stream` is the unqualified class
+                bool expect_packed;
+            };
+            const StreamCase stream_cases[] = {{"explicit_owner_qualified", stream, false, true},
+                                               {"explicit_owner_unqualified", stream, true, false},
+                                               {"default_sentinel", nullptr, false, true},
+                                               {"per_thread_sentinel", hipStreamPerThread, false, true}};
+            const bool legacy_is_current = fma_rows::image_routes_stream_device(hipStreamLegacy) ==
+                                           fma_rows::image_routes_current_device();
+            ok = ok && legacy_is_current;
+            std::cout << "select stream_owner legacy_is_current_device " << (legacy_is_current ? "PASS" : "FAIL") << '\n';
+            for (const auto& sc : stream_cases) {
+                const auto ref = make_run(c, weights, rows), got = make_run(c, weights, rows);
+                const auto iref = make_run(ci, iweights, rows), igot = make_run(ci, iweights, rows);
+                for (const Run* run : {&ref, &got, &iref, &igot}) seed(*run, rows);
+                require(strix::core::for_each_bf16_projection_group<fma_rows::kGroupMax>(ref.projections, hipSuccess,
+                            [&](std::span<const Bf16RowProjection> group) {
+                                return fma_rows::enqueue_bf16_rows(a, c.K, rows, group, kMaxOutputs, nullptr);
+                            }),
+                        "fp32 rows");
+                require(strix::core::for_each_bf16_projection_group<fma_rows::kGroupMax>(iref.projections, hipSuccess,
+                            [&](std::span<const Bf16RowProjection> group) {
+                                return fma_rows::enqueue_bf16_rows(a, ci.K, rows, group, kMaxOutputs, nullptr);
+                            }),
+                        "fp32 rows");
+                require(hipDeviceSynchronize(), "sync");
+                bool used = false;
+                using strix::core::ImageLaunch;
+                ImageLaunch launched = ImageLaunch::k32_image;
+                hipError_t routed_status = hipSuccess, image_status = hipSuccess;
+                {
+                    std::optional<fma_rows::ScopedImageStreamOwner> scoped;
+                    if (sc.foreign_owner) scoped.emplace(sc.stream, owner_other);
+                    routed_status = fma_rows::enqueue_bf16_rows_routed(a, c.K, rows, got.projections, kMaxOutputs,
+                                                                       std::span<std::uint16_t>(image, host_a.size()),
+                                                                       sc.stream, &used);
+                    require(hipStreamSynchronize(sc.stream), "stream sync");
+                    require(fma_rows::enqueue_bf16_operand_image(a, ci.K, rows, image, sc.stream), "image");
+                    image_status = fma_rows::enqueue_bf16_image_rows(image, ci.K, rows, igot.projections, kMaxOutputs,
+                                                                     sc.stream, &launched);
+                }
+                require(hipStreamSynchronize(sc.stream), "stream sync");
+                require(hipDeviceSynchronize(), "sync");
+                const auto x = fetch(ref, rows), y = fetch(got, rows), xi = fetch(iref, rows), yi = fetch(igot, rows);
+                const bool same = x.size() == y.size() && std::memcmp(x.data(), y.data(), x.size() * 4U) == 0 &&
+                                  xi.size() == yi.size() && std::memcmp(xi.data(), yi.data(), xi.size() * 4U) == 0;
+                const bool pass = routed_status == hipSuccess && image_status == hipSuccess && same &&
+                                  used == sc.expect_packed && (launched == ImageLaunch::k64_packed) == sc.expect_packed;
+                ok = ok && pass;
+                std::cout << "select stream_owner " << sc.name << " image_used " << used << " launch "
+                          << (launched == ImageLaunch::k64_packed ? "K64" : "K32") << " expect "
+                          << (sc.expect_packed ? "image/K64" : "rows/K32") << (same ? " same-bits" : " DIFFER")
+                          << (pass ? " PASS" : " FAIL") << '\n';
+                for (const Run* run : {&ref, &got, &iref, &igot})
+                    for (auto* p : run->outputs) require(hipFree(p), "free");
+            }
+            for (auto* w : weights) require(hipFree(w), "free");
+            for (auto* w : iweights) require(hipFree(w), "free");
+            require(hipStreamDestroy(stream), "stream destroy");
         }
         {  // the public routed entry: the real device takes the image routes, every injected class keeps the FP32 rows
             const Case c{"routed_injected", 2304U, {3072U, 2304U}, false, true};
@@ -485,6 +622,7 @@ int main(int argc, char** argv) {
             seed(ref, rows);
             seed(img, rows);
             const std::span<std::uint16_t> scratch(image, host_a.size());
+            bool image_used = false;  // what the public routed entry reports it did
             const auto fp32 = [&](const Run& run) {
                 return strix::core::for_each_bf16_projection_group<fma_rows::kGroupMax>(run.projections, hipSuccess,
                     [&](std::span<const Bf16RowProjection> group) {
@@ -494,7 +632,7 @@ int main(int argc, char** argv) {
             const auto image_arm = [&](const Run& run) {
                 if (c.routed)
                     return fma_rows::enqueue_bf16_rows_routed(a, c.K, rows, run.projections, kMaxOutputs, scratch,
-                                                              nullptr);
+                                                              nullptr, &image_used);
                 if (const auto status = fma_rows::enqueue_bf16_operand_image(a, c.K, rows, image, nullptr);
                     status != hipSuccess)
                     return status;
@@ -502,14 +640,18 @@ int main(int argc, char** argv) {
             };
             require(fp32(ref), "fp32 rows");
             bool admitted = fma_rows::admits_bf16_image_projections(c.K, rows, img.projections, kMaxOutputs);
+            bool expect_used = false;
             if (c.routed) {
                 strix::core::ImageRoute routes[fma_rows::kImageRouteMaxProjections]{};
                 const bool planned =
                     fma_rows::detail::plan_bf16_image_call(c.K, rows, img.projections, kMaxOutputs, scratch, routes);
-                admitted = planned == (c.expect_image && (rows == 4096U || rows == 4100U || rows == 8192U || rows == 8209U || rows == 8236U || rows == 9216U));  // literal
+                expect_used = c.expect_image && (rows == 4096U || rows == 4100U || rows == 8192U || rows == 8209U || rows == 8236U || rows == 9216U);  // literal
+                admitted = planned == expect_used;
             }
             require(image_arm(img), "image rows");
             require(hipDeviceSynchronize(), "sync");
+            // The public call itself must report the image route (a wrapper that always fell back would still match bits).
+            if (c.routed) admitted = admitted && image_used == expect_used;
             const auto x = fetch(ref, rows), y = fetch(img, rows);
             const bool finite = std::all_of(y.begin(), y.end(), [](float v) { return std::isfinite(v); });
             const bool same = x.size() == y.size() && std::memcmp(x.data(), y.data(), x.size() * 4U) == 0;
@@ -658,17 +800,6 @@ int main(int argc, char** argv) {
                                                                             kMaxOutputs, nullptr) == hipErrorNotSupported;
             const bool short_view = fma_rows::enqueue_bf16_rows_from_image(plan, scratch.first(1U), K, rows, {&pc, 1U},
                                                                            kMaxOutputs, nullptr) == hipErrorNotSupported;
-            require(hipDeviceSynchronize(), "sync");
-            std::vector<float> ho(std::size_t{rows} * N);
-            std::vector<std::uint16_t> hi(scratch.size());
-            require(hipMemcpy(ho.data(), out_b, ho.size() * 4U, hipMemcpyDeviceToHost), "out back");
-            require(hipMemcpy(hi.data(), scratch.data(), hi.size() * 2U, hipMemcpyDeviceToHost), "image back");
-            const bool guarded = std::all_of(ho.begin(), ho.end(), [](float v) {
-                                     std::uint32_t bits = 0;
-                                     std::memcpy(&bits, &v, 4U);
-                                     return bits == 0xFFFFFFFFU;
-                                 }) &&
-                                 std::all_of(hi.begin(), hi.end(), [](std::uint16_t v) { return v == 0x5A5AU; });
             // a refused admission (a one-element span) is a plan that launches nothing
             const auto inert = fma_rows::plan_bf16_rows_from_image(K, rows, {&pc, 1U}, kMaxOutputs, scratch.first(1U), sources);
             const bool inert_refused =
@@ -693,11 +824,55 @@ int main(int argc, char** argv) {
             device_bound = device_bound && remote.admitted() &&
                            fma_rows::enqueue_bf16_rows_from_image(remote, scratch, K, rows, {&pc, 1U}, kMaxOutputs,
                                                                   nullptr) == hipErrorNotSupported;
-            const bool pass = plan.admitted() && substituted && short_view && inert_refused && device_bound && guarded;
+            // the store policy is part of the admitted descriptor: a call that changes only it is refused
+            auto policy_changed = pc;
+            policy_changed.round_separate = !pc.round_separate;
+            const bool policy_bound = fma_rows::enqueue_bf16_rows_from_image(plan, scratch, K, rows, {&policy_changed, 1U},
+                                                                           kMaxOutputs, nullptr) == hipErrorNotSupported;
+            // a launch stream owned by another device than the admitted one is refused, the current device unchanged
+            // (the stream's owner is injected: a node has no second GPU); the default, legacy and per-thread streams
+            // belong to the current device
+            hipStream_t stream = nullptr;
+            require(hipStreamCreate(&stream), "stream");
+            const fma_rows::ImageDeviceClass stream_elsewhere{"gfx1151", 32U, 40U, here + 1};
+            bool stream_bound = false;
+            {
+                const fma_rows::ScopedImageStreamOwner owner(stream, stream_elsewhere);
+                stream_bound = fma_rows::enqueue_bf16_rows_from_image(plan, scratch, K, rows, {&pc, 1U}, kMaxOutputs,
+                                                                      stream) == hipErrorNotSupported;
+            }
+            // Every refused call above ran before this point: a launch that still returned the refusal code shows in
+            // the bytes after the synchronization.
+            require(hipStreamSynchronize(stream), "stream sync");
+            require(hipDeviceSynchronize(), "sync");
+            std::vector<float> ho(std::size_t{rows} * N);
+            std::vector<std::uint16_t> hi(scratch.size());
+            require(hipMemcpy(ho.data(), out_b, ho.size() * 4U, hipMemcpyDeviceToHost), "out back");
+            require(hipMemcpy(hi.data(), scratch.data(), hi.size() * 2U, hipMemcpyDeviceToHost), "image back");
+            const bool guarded = std::all_of(ho.begin(), ho.end(), [](float v) {
+                                     std::uint32_t bits = 0;
+                                     std::memcpy(&bits, &v, 4U);
+                                     return bits == 0xFFFFFFFFU;
+                                 }) &&
+                                 std::all_of(hi.begin(), hi.end(), [](std::uint16_t v) { return v == 0x5A5AU; });
+            const bool pass = plan.admitted() && substituted && short_view && inert_refused && device_bound &&
+                              policy_bound && stream_bound && guarded;
+            // controls after the guards: the same call on the admitted device's own explicit stream, on the per-thread
+            // stream and on the default stream is accepted
+            bool accepted = true;
+            for (hipStream_t s : {stream, hipStreamPerThread, static_cast<hipStream_t>(nullptr)}) {
+                accepted = accepted && fma_rows::enqueue_bf16_rows_from_image(plan, scratch, K, rows, {&pc, 1U},
+                                                                              kMaxOutputs, s) == hipSuccess;
+                require(hipStreamSynchronize(s), "control sync");
+            }
+            require(hipStreamDestroy(stream), "stream destroy");
             std::cout << "gate_image_plan_binding admitted " << plan.admitted() << " substituted "
                       << (substituted ? "refused" : "ADMITTED") << " short_view " << (short_view ? "refused" : "ADMITTED") << " device_bound " << (device_bound ? "refused" : "LAUNCHED")
-                      << (guarded ? " guard-intact" : " GUARD-CHANGED") << (pass ? " PASS" : " FAIL") << '\n';
-            ok = ok && pass;
+                      << " policy_bound " << (policy_bound ? "refused" : "LAUNCHED") << " stream_bound "
+                      << (stream_bound ? "refused" : "LAUNCHED") << (guarded ? " guard-intact" : " GUARD-CHANGED")
+                      << " own_streams " << (accepted ? "accepted" : "REFUSED") << (pass && accepted ? " PASS" : " FAIL")
+                      << '\n';
+            ok = ok && pass && accepted;
         }
         for (void* p : {static_cast<void*>(weights), static_cast<void*>(gate), static_cast<void*>(gated),
                         static_cast<void*>(out_a), static_cast<void*>(out_b)})

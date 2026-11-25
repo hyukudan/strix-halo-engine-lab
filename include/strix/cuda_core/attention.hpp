@@ -118,6 +118,11 @@ struct PreparedBf16Flash {
 // cache ranges (the append writes the cache before the flash reads the features, and CTAs write output rows while
 // others read the features); can_launch_prepared_bf16_projected and the launches refuse any byte overlap, host-side,
 // before any enqueue. Features and weights may share memory with each other and with q.
+// Failure word: the optional `failure` of the projected launches is one 4-byte-aligned unsigned that the flash (and the
+// append's finite check) raise atomically, so it must stay valid until the stream work that carries it has completed. It
+// must share no byte with any operand the launch or the append reads or writes: features, weights, q, sinks, the output
+// image, the whole K and V caches and (append) the K and V rows; prepare_prepared_bf16_projected and the launches refuse
+// any overlap or misalignment, host-side, before any enqueue.
 struct PreparedBf16Projection {
     const float* features = nullptr;
     const std::uint16_t* weights = nullptr;
@@ -216,14 +221,27 @@ cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const Prepare
                                                       FlashPipe pipe);
 // The dynamic shared-memory ceiling of each flash specialization is set once per device (to the largest extent the
 // opt-in limit admits), so concurrent launches of different extents never change a kernel attribute.
-// prepare_prepared_bf16_projected does every fallible host step of a projected launch (admission, overlap, device
-// opt-in) without enqueuing anything: append_attention_prepared_bf16 runs it before it writes the K/V cache, so a
-// refused append leaves the cache untouched.
+// prepare_prepared_bf16_projected does every fallible host step of a projected launch (admission, overlap, failure
+// word, device opt-in) without enqueuing anything and returns the admitted launch: the flash specialization and its
+// dynamic shared memory. launch_prepared_bf16_projected enqueues that launch on the same operands and current device
+// without repeating any of those steps, so its errors are only those of the launch itself (cudaErrorInvalidValue for a
+// launch that was never prepared). append_attention_prepared_bf16 prepares before it writes the K/V cache and launches
+// the prepared value after the write, so a refused append leaves the cache untouched and an admitted one always attends.
+struct PreparedProjectedLaunch {
+    FlashPipe pipe = FlashPipe::pad2;
+    int smem_bytes = 0;  // 0: not prepared
+};
 [[nodiscard]] cudaError_t prepare_prepared_bf16_projected(const AttentionDims& d, const PreparedBf16Flash& prepared,
                                                           const PreparedBf16Projection& projection, const float* q,
                                                           const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
                                                           std::uint32_t pos0, std::uint32_t rows, float* out,
-                                                          FlashPipe pipe);
+                                                          FlashPipe pipe, const unsigned* failure,
+                                                          PreparedProjectedLaunch& launch);
+cudaError_t launch_prepared_bf16_projected(const PreparedProjectedLaunch& launch, const AttentionDims& d,
+                                           const PreparedBf16Flash& prepared, const PreparedBf16Projection& projection,
+                                           const float* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                           std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream,
+                                           unsigned* failure = nullptr);
 cudaError_t attention_prefill_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
                                             const PreparedBf16Projection& projection, const float* q,
                                             const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,

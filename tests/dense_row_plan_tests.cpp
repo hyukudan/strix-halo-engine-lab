@@ -256,7 +256,12 @@ static bool check_image_routes() {
                                                                       {2304U, 2304U, 0U, 1024U, 9216U},
                                                                       {2304U, 3072U, 0U, 1024U, 9216U},
                                                                       {2304U, 2304U, 3200U, 1024U, 9216U}}};
-    constexpr strix::core::ImageRoutePolicy policy{1024U, 64U, 128U, 2048U, 9216U, shapes};
+    // Measured launch groups (exact outputs in launch order, one pitch, own heights): a launch over several projections
+    // is only as measured as its listed tuple, whatever its members' single widths are.
+    static constexpr std::array<strix::core::ImageGroupRow, 3> groups{{{2304U, 0U, 2U, {3072U, 1024U}, 1024U, 9216U},
+                                                                      {2304U, 0U, 3U, {3072U, 1024U, 1024U}, 1024U, 9216U},
+                                                                      {2304U, 0U, 2U, {3072U, 128U}, 1024U, 8192U}}};
+    constexpr strix::core::ImageRoutePolicy policy{1024U, 64U, 128U, 2048U, 9216U, shapes, groups};
     constexpr unsigned K = 2304U;
     constexpr unsigned kWide = 1U << 20U;
     const auto* w = std::bit_cast<const std::uint16_t*>(std::uintptr_t{0x10000U});
@@ -310,6 +315,24 @@ static bool check_image_routes() {
     if (!strix::core::plan_image_routes<3U>(policy, K, 4096U, four, kWide, routes, group_admits, image_admits) ||
         strix::core::for_each_image_route_run<3U>(four, routes, K, Status::ok, record) != Status::ok ||
         runs != decltype(runs){{R::packed, {1024U, 1024U, 1024U}}, {R::packed, {1024U}}})
+        return false;
+    // An unlisted grouping of measured widths: the packed runs are cut into measured launches (the longest listed prefix,
+    // else one projection), and the image entry's launch is the K32 tile.
+    const std::array<Bf16RowProjection, 4> qgkv{{{w, 3072U, y, false, 0U}, {w, 3072U, y, false, 0U},
+        {w, 1024U, y, false, 0U}, {w, 1024U, y, false, 0U}}};
+    runs.clear();
+    if (!strix::core::plan_image_routes<4U>(policy, K, 8192U, qgkv, kWide, routes, group_admits, image_admits) ||
+        !routed({R::packed, R::packed, R::packed, R::packed}) ||
+        strix::core::for_each_image_route_run<4U>(qgkv, routes, K, Status::ok, record, &policy, 8192U) != Status::ok ||
+        runs != decltype(runs){{R::packed, {3072U}}, {R::packed, {3072U, 1024U, 1024U}}})
+        return false;
+    const std::array<Bf16RowProjection, 3> wide_pair{{{w, 3072U, y, false, 0U}, {w, 128U, y, false, 0U},
+        {w, 128U, y, false, 0U}}};
+    runs.clear();
+    if (!strix::core::plan_image_routes<4U>(policy, K, 8192U, wide_pair, kWide, routes, group_admits, image_admits) ||
+        strix::core::for_each_image_route_run<4U>(wide_pair, routes, K, Status::ok, record, &policy, 8192U) != Status::ok ||
+        runs != decltype(runs){{R::packed, {3072U, 128U}}, {R::packed, {128U}}} ||
+        strix::core::image_packed_schedule(policy, true, K, 8192U, wide_pair))
         return false;
     // Rounded projections of different store policies (separate / incumbent) never share a run.
     const std::array<Bf16RowProjection, 3> policies{{{w, 1024U, y, true, 0U, true}, {w, 1024U, y, true, 0U, true},
@@ -398,6 +421,21 @@ static bool check_image_routes() {
     const std::array<Bf16RowProjection, 2> wide_n128{{{w, 3072U, y, false, 0U}, {w, 128U, y, false, 0U}}};
     const std::array<Bf16RowProjection, 2> wide_n256{{{w, 3072U, y, false, 0U}, {w, 256U, y, false, 0U}}};
     const std::array<Bf16RowProjection, 1> pitch3200{{{w, 2304U, y, false, 6400U}}};
+    // Individually measured widths in an unlisted group or order, or outside the group's own heights, are K32.
+    const std::array<Bf16RowProjection, 2> pair_3072{{{w, 3072U, y, false, 0U}, {w, 3072U, y, false, 0U}}};
+    const std::array<Bf16RowProjection, 3> qkv_swapped{{{w, 1024U, y, false, 0U}, {w, 3072U, y, false, 0U},
+                                                        {w, 1024U, y, false, 0U}}};
+    const std::array<Bf16RowProjection, 3> wide_128_128{{{w, 3072U, y, false, 0U}, {w, 128U, y, false, 0U},
+                                                         {w, 128U, y, false, 0U}}};
+    const std::array<Bf16RowProjection, 4> four_wide{{{w, 3072U, y, false, 0U}, {w, 3072U, y, false, 0U},
+                                                      {w, 1024U, y, false, 0U}, {w, 1024U, y, false, 0U}}};
+    if (image_packed_schedule(policy, true, K, 8192U, pair_3072) ||
+        image_packed_schedule(policy, true, K, 8192U, qkv_swapped) ||
+        image_packed_schedule(policy, true, K, 8192U, wide_128_128) ||
+        image_packed_schedule(policy, true, K, 8192U, four_wide) ||
+        image_packed_schedule(policy, true, K, 8192U, std::span(qkv).first(2U)) == false ||
+        image_packed_schedule(policy, true, K + 64U, 8192U, qkv))
+        return false;
     if (!image_packed_schedule(policy, true, K, 4096U, n128) || !image_packed_schedule(policy, true, K, 8192U, n128) ||
         image_packed_schedule(policy, true, K, 8193U, n128) || image_packed_schedule(policy, true, K, 8236U, n128) ||
         image_packed_schedule(policy, true, K, 4096U, n256) || image_packed_schedule(policy, true, K, 8192U, n256) ||

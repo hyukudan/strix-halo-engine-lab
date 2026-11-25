@@ -67,4 +67,11 @@ constexpr unsigned mini_cohort_pass_cap(bool packed_decode, unsigned backend_one
 // `arch` is the gcnArchName up to the first ':'.
 constexpr bool mini_combine_image_arch(std::string_view arch) { return arch == "gfx1151"; }
 
+// Where the prepared-attention round fold (inkling2-mini-prepared-round-fold@1) runs: the HIP prepared attention on the
+// qualified target (the fold fixture and the model receipts cover gfx1151 only). The CUDA preparation has no fold, so a
+// selection there is declined; `arch` is the gcnArchName up to the first ':' (ignored off HIP).
+constexpr bool mini_prepared_round_fold_admitted(bool hip_backend, std::string_view arch) {
+    return hip_backend && arch == "gfx1151";
+}
+
 }  // namespace strix::inkling2

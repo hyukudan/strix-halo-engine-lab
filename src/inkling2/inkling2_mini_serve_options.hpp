@@ -32,6 +32,8 @@ struct MiniServeOptions {
     // Decode expert form: --packed-decode / --grouped-decode, else the one default of every entry point
     // (mini_packed_decode, the command line's default too).
     bool packed_decode = kMiniPackedDecodeDefault;
+    // Resolved prepared-attention round fold (mini_prepared_round_fold), the CLI's setting from the same resolution.
+    bool prepared_round_fold = false;
     // Resolved exact down-image lever (mini_combine_image): the HIP resident prefill stores the BF16 down image where the
     // target is qualified.
     bool combine_image = false;

@@ -1,6 +1,6 @@
 #pragma once
 
-enum hipError_t { hipSuccess, hipErrorInvalidDevice, hipErrorInvalidValue };
+enum hipError_t { hipSuccess = 0, hipErrorInvalidValue = 1, hipErrorOutOfMemory = 2, hipErrorInvalidDevice = 101 };
 
 struct hipDeviceProp_t {
     char gcnArchName[32];
@@ -28,6 +28,7 @@ inline hipError_t hipGetDeviceProperties(hipDeviceProp_t* properties, int device
     return hipSuccess;
 }
 
-inline const char* hipGetErrorString(hipError_t) {
+inline const char* hipGetErrorString(hipError_t error) {
+    if (error == hipErrorOutOfMemory) return "out of memory";
     return "invalid device";
 }
