@@ -14,6 +14,7 @@
 // stamps the width). TURBO inherits FAST while no higher cell has evidence. Host-only.
 #include "strix/engine_profile.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -195,11 +196,18 @@ struct Resolved {
         if (row.topology == regime.topology && !row.timing.incumbent)
             out->ladder.push_back(row.timing);
     constexpr auto fast = static_cast<unsigned>(sp::Name::fast);
+    const bool measured_composition =
+        regime.device == Device::gfx1151 && regime.topology == Topology::one_node &&
+        regime.prompt_tokens == 8192 && regime.execution == single_greedy_8k &&
+        std::ranges::none_of(table, [&](const auto& lever) {
+            return lever.name != "prompt_rows" &&
+                ((!lever.env.empty() && sp::environment(inputs.env, lever.env) != nullptr) ||
+                 std::ranges::any_of(inputs.cli, [&](const auto& setting) { return setting.first == lever.name; }));
+        });
     for (const auto& lever : table) {
         sp::Lever row = lever;
         const auto nominal = lever.value[fast];
-        const bool scheduled = lever.name == "prompt_rows" && regime.device == Device::gfx1151 &&
-            regime.topology == Topology::one_node && regime.prompt_tokens == 8192 && regime.execution == single_greedy_8k;
+        const bool scheduled = measured_composition && lever.name == "prompt_rows";
         if (scheduled) row.value[fast] = "2048";
         const auto* q = qualification(lever.name, row.value[fast], regime, rows);
         row.ready[fast] = q != nullptr;
