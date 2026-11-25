@@ -4,6 +4,7 @@
 #include <map>
 #include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/deepseek41_pair_profile_table.hpp"
+#include "strix/deepseek41_prefill.hpp"
 #include "strix/deepseek41_serve_cache_policy.hpp"
 #include "strix/host_memory.hpp"
 #include "strix/session/speculation_default.hpp"
@@ -213,6 +214,37 @@ const strix::profile::Resolution& profile_resolution() {
     return *r;
 }
 
+std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::profile::Resolution& startup,
+    const PrefillOptions& o, std::uint64_t prompt_tokens, std::string_view device_product, bool measured_reference) {
+    namespace p = strix::profile;
+    // The quality-arm timing uses the same arithmetic as the gate. The native TTFT
+    // observation used row splitting, the exact cone and head1. It cannot widen this receipt.
+    if (!measured_reference || (!device_product.starts_with("gfx1151|") && !device_product.starts_with("gfx1151:")) ||
+        device_product.find("|AMD Radeon 8060S Graphics|") == std::string_view::npos ||
+        o.world != 2U || !o.tp_attention || o.row_split || o.cone || o.expert_tp || o.stream_experts ||
+        o.layers != 40U || o.max_positions != 8192U || (o.max_rows != 0U && o.max_rows != 8192U) ||
+        o.chunk_rows != 1024U || o.window_rows != 8U || o.attention_lanes != 4U || o.moe_chunk_rows != 4096U ||
+        !o.engram_direct_io || o.draft_rows != 0U || o.quality_head_rows != 64U ||
+        o.fp16_dense || o.bf16_attention || o.fast_attention || o.fast_dense || o.fast_moe ||
+        o.fast_engram || o.fast_shared || o.fast_moe_f16 || o.fast_i4 > 0 || o.null_ulp_layer >= 0 ||
+        o.approx_layer_first != 0U || o.approx_layer_end != PrefillOptions{}.approx_layer_end ||
+        o.decoder_replay_rows != 0U || o.trace ||
+        std::any_of(startup.entries.begin(), startup.entries.end(), [](const p::Entry& entry) {
+            return entry.status == p::Status::off || entry.status == p::Status::explicit_env ||
+                   entry.status == p::Status::explicit_cli;
+        }))
+        return std::nullopt;
+
+    const auto execution = p::ladder_execution({"hip", device_product,
+        {prompt_tokens, o.max_positions, 1U, o.chunk_rows, o.max_rows == 0U ? o.max_positions : o.max_rows},
+        "ds41-1017-q2,usb4-host-pair,ep,tp-attention,no-cone,head64,window8,attention-lanes4,moe-chunk-auto4096"});
+    p::Inputs inputs;
+    inputs.profile = startup.profile;
+    inputs.env = [](const char*) -> const char* { return nullptr; };
+    inputs.regime = {p::Phase::prefill, prompt_tokens, 1U, "gfx1151", execution};
+    return p::resolve(profile_engine(), inputs);
+}
+
 const std::vector<std::pair<std::string, std::string>>& baseline_off_items() {
     // 2026-10-25 release: D1 shared expert as grouped SwiGLU pairs. 2026-10-26 release: D1b fused shared
     // down, prefill MoE form 7, exact dense selector, attention window fold / live chunks / f16 tile, serve warm-up
@@ -265,41 +297,23 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
     }
     // Product profile first: its switches are environment for everything below (an explicit one wins).
     strix::profile::Inputs profile_inputs;
-    // The startup profile governs device prefill. The actual prompt and effective execution are not known yet.
+    // Startup resolves explicit switches. D1 waits for the actual prompt and effective execution.
     profile_inputs.regime = strix::profile::startup_prefill_regime();
-    // Resolve the bundle before admission, reporting and rank agreement. An explicit
-    // component OFF wins. Canonical strings are also exported for execution/cache readers.
-    // Shared bundle rules (strix/fast_profile.hpp); the dense row threshold is DS41's own auxiliary row.
-    // The bundle expands from its switch as the product profile selects it (fast_profile::profile_switch): a first
-    // resolution on the raw environment says whether the profile column applies the switch row; a set switch wins.
+    // Only the explicit legacy switch expands at startup. D1 is resolved atomically on the actual prompt.
     namespace fp = strix::fast_profile;
     const auto& bundle = strix::ds41::fast_profile::kBundle;
     strix::profile::take_options(profile_engine(), user, profile_inputs);
-    std::string selected;
-    {
-        const fp::Overrides none;
-        auto raw_inputs = profile_inputs;
-        raw_inputs.env = fp::lookup(none, raw_env);
-        const auto first = strix::profile::resolve(profile_engine(), raw_inputs);
-        for (const auto& e : first.entries)
-            if (e.lever->env == bundle.env && strix::profile::applied(e.status)) selected = e.value;
-    }
-    const fp::Getenv bundle_env = fp::profile_switch(bundle, selected, raw_env);
-    auto fast_env = fp::expand(bundle, bundle_env);
-    // Selected by the profile (switch unset): the switch row keeps the profile's status (set / provisional) in the
-    // receipt and the export; the expanded members are canonical overrides as with the switch.
-    if (!fp::set(raw_env(bundle.env))) fast_env.erase(bundle.env);
+    auto fast_env = fp::expand(bundle, raw_env);
     if (const char* value = raw_env("STRIX_DS41_FAST_DENSE_MIN_ROWS");
-        fp::set(value) || fp::switch_on(bundle_env(bundle.env)) || fp::switch_on(raw_env("STRIX_DS41_FAST_DENSE")))
+        fp::set(value) || fp::switch_on(raw_env(bundle.env)) || fp::switch_on(raw_env("STRIX_DS41_FAST_DENSE")))
         fast_env.emplace("STRIX_DS41_FAST_DENSE_MIN_ROWS", std::to_string(
             strix::ds41::fast_profile::dense_min_rows_value(value)));
     // The explicit Engram lever (not a bundle member): canonical value exported when set, like the members.
     if (const auto& e = strix::ds41::fast_profile::kEngram; fp::set(raw_env(e.env))) fast_env.emplace(e.env, fp::canonical(e, raw_env(e.env)));
     if (const auto& e = strix::ds41::fast_profile::kShared; fp::set(raw_env(e.env))) fast_env.emplace(e.env, fp::canonical(e, raw_env(e.env)));
     if (const auto& e = strix::ds41::fast_profile::kMoeF16; fp::set(raw_env(e.env))) fast_env.emplace(e.env, fp::canonical(e, raw_env(e.env)));
-    // Explicit IU4 (STRIX_DS41_FAST_I4=1, gguf-iu4-direct-v1) is a whole-model routed-expert policy: it replaces the
-    // relaxed MoE a profile would select (the two are distinct policies). An explicit FAST_MOE or bundle switch is left
-    // as set and still meets the prefix namespace's incompatibility check.
+    // Canonicalize the relaxed-MoE companion OFF for explicit IU4. An explicit FAST_MOE or bundle switch still wins
+    // and is subject to the prefix namespace's incompatibility check.
     if (const auto* i4 = raw_env("STRIX_DS41_FAST_I4"); i4 && std::string_view(i4) == "1" &&
         !fp::set(raw_env(bundle.env)) && !fp::set(raw_env("STRIX_DS41_FAST_MOE")))
         fast_env.insert_or_assign("STRIX_DS41_FAST_MOE", "0");

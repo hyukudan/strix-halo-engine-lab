@@ -23,6 +23,7 @@
 #endif
 #if defined(STRIX_PARITY_DS41)
 #include "strix/deepseek41_pair_defaults.hpp"
+#include "strix/deepseek41_prefill.hpp"
 #endif
 #if defined(STRIX_PARITY_GEMMA4)
 #include "gemma4/engine/runtime.hpp"
@@ -267,6 +268,31 @@ void ds41() {
         gate(std::string("ds41+preset+") + profile, native, preset, allowed);
         check(preset.at("arg:--slots") == "8", "ds41: serve uses the resolved eight slots");
     }
+    namespace ds = strix::deepseek41;
+    ds::PrefillOptions measured;
+    measured.world = 2;
+    measured.max_positions = 8192;
+    measured.moe_chunk_rows = 4096;
+    measured.row_split = false;
+    measured.cone = false;
+    measured.quality_head_rows = 64;
+    const auto request = [&](pd::App app, const char* rank, std::uint64_t prompt) {
+        const auto startup = pd::resolve(app, {model, "--rank", rank,
+            "--transport", app == pd::App::prefill ? "usb4-auto" : "usb4auto", "--profile", "turbo"},
+            [](const char*) -> const char* { return nullptr; }, probe, pd::Build{true});
+        const auto result = pd::resolve_prefill_profile(*startup.profile, measured, prompt,
+                                                       "gfx1151|AMD Radeon 8060S Graphics|fixture", true).value_or(*startup.profile);
+        return sp::Config{{"d1_prefill", result.find("d1_prefill")->value},
+                          {"fingerprint", pr::hex_identity(result.fingerprint())}};
+    };
+    for (const auto prompt : {8128U, 8193U, 32768U}) {
+        const auto cli = request(pd::App::prefill, "0", prompt);
+        const auto server = request(pd::App::serve, "1", prompt);
+        gate("ds41+prompt+" + std::to_string(prompt), cli, server, {});
+        check(cli.at("d1_prefill") == (prompt == 8128U ? "1" : "0"),
+              "ds41: both ranks use D1 only for a measured prompt");
+    }
+
 }
 #endif
 

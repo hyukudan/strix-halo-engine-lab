@@ -285,11 +285,11 @@ strix::deepseek41::PrefillOptions options(const Args& a, std::size_t rows) {
 strix::deepseek41::PrefillResult ttft_runs(const Args& a, strix::deepseek41::DevicePrefill& pre, const std::vector<std::uint32_t>& prompt,
                                            strix::dist::Communicator* comm, bool print, const std::string& loads_out) {
     strix::deepseek41::PrefillResult r;
-    const auto one = [&](std::span<const std::uint32_t> rows, std::uint32_t round, const char* label) {
+    const auto one = [&](std::span<const std::uint32_t> rows, std::uint32_t round, const char* label, bool full_prompt) {
         if (comm != nullptr) barrier(*comm, round);
         ttft_clock.line("barrier");
         const auto t0 = std::chrono::steady_clock::now();
-        r = pre.run(rows);
+        r = full_prompt ? pre.run_full_prompt(rows) : pre.run(rows);
         const double wall = TtftClock::ms(std::chrono::steady_clock::now() - t0);
         ttft_clock.line(label);
         if (print) {
@@ -300,12 +300,12 @@ strix::deepseek41::PrefillResult ttft_runs(const Args& a, strix::deepseek41::Dev
         }
     };
     if (a.ttft_warmup != 0U)
-        one(std::span<const std::uint32_t>(prompt).first(std::min<std::size_t>(a.ttft_warmup, prompt.size())), 900U, "warm-up run");
+        one(std::span<const std::uint32_t>(prompt).first(std::min<std::size_t>(a.ttft_warmup, prompt.size())), 900U, "warm-up run", false);
     strix::RepeatDigests repeats;  // the short warm-up is not a measured repetition
     for (std::uint32_t k = 0; k < a.repeat; ++k) {
         char label[32];
         std::snprintf(label, sizeof(label), "run %u", k);
-        one(prompt, k, label);
+        one(prompt, k, label, comm != nullptr && a.ttft_decode == 0U && a.extend_check == 0U);
         repeats.add(repeat_run(k, {}, r));
         if (print) print_result(comm == nullptr ? "prefill" : "rank prefill", r, prompt.size(), a.timing, loads_out);
     }
@@ -943,7 +943,9 @@ void run_rank(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint
                 arm = on ? "SEL" : "OFF";
                 if (print) std::printf("arm %s (run %u)\n", on ? "SEL" : "OFF", k);
             }
-            r = pre.run(prompt);
+            const bool whole = !a.select_ab && !a.embed_identity && a.extend_check == 0U &&
+                               !decode_reference && out_state == nullptr && a.task_levels.empty();
+            r = whole ? pre.run_full_prompt(prompt) : pre.run(prompt);
             repeats.add(repeat_run(k, arm, r));
             if (print) {
                 print_result(rank == 0U ? "rank 0 prefill" : "rank 1 prefill", r, prompt.size(), a.timing, rank == 0U ? a.loads_out : std::string{});

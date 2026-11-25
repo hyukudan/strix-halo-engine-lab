@@ -176,7 +176,7 @@ int main() try {
     inputs.profile = Name::fast;
     inputs.allow_pending = false;
     const auto shipped_fast = resolve(shipped, inputs);
-    require(shipped_fast.find("moe_relaxed")->status == Status::pending &&
+    require(shipped_fast.find("moe_relaxed")->status == Status::builtin &&
             shipped_fast.find("moe_relaxed")->value == "0", "unscoped shipped candidate declines");
     check_peer(legacy, [](auto out, auto in) { std::memcpy(in.data(), out.data(), out.size()); });
     bool mismatch = false;
