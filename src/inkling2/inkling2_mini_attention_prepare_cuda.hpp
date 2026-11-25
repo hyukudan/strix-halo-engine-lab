@@ -19,11 +19,16 @@ struct MiniPreparedCudaBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGq
     static constexpr auto invalid = cudaErrorInvalidValue;
     cuda_core::DenseArith arithmetic;
     cuda_core::BigCtx* big_context = nullptr;
+    // Operand class of every linear() input. FP32 (the default) keeps each input's low bits (the raw prepare and
+    // output entries take caller FP32 rows). A caller whose producers round every input to BF16 declares bf16_exact:
+    // the resident backend, whose q/k/v groups read rmsnorm_bf16 outputs and whose output projection reads the BF16
+    // sigmoid-gated product; the shared BF16 rows entry then runs the tall chain on one plane with the same bits.
+    core::Bf16Operand operand = core::Bf16Operand::fp32;
 
     Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
         return core::for_each_bf16_projection_group<cuda_core::kMaxBf16RowProjections>(views, success,
             [&](std::span<const MiniAttentionLinear> group) {
-                return enqueue_mini_cuda_dense_rows(input, width, rows, group, stream, arithmetic, big_context);
+                return enqueue_mini_cuda_dense_rows(input, width, rows, group, stream, arithmetic, big_context, operand);
             });
     }
 

@@ -61,6 +61,38 @@ struct TileBinding {
     }
 };
 
+// Args of a down projection that stores the BF16 image of its sums for grouped_rows::combine_image: a tile whose FP32
+// output is image_from + i stores bf16_encode(sum) at image + i, and a NaN sum also whole at image_from + i with
+// *nan_seen raised (gemm::Bf16NanExactStore). image holds as many elements as the FP32 region the tiles address.
+struct DownImageArgs : Args {
+    const float* image_from{};
+    std::uint16_t* image{};
+    unsigned* nan_seen{};
+};
+
+// TileBinding storing through gemm::Bf16NanExactStore: the same tiles, operands and accumulation chain.
+template <packed::MatrixFormat Format>
+struct ImageTileBinding {
+    using Args = DownImageArgs;
+    using Store = gemm::Bf16NanExactStore;
+    struct Tile {
+        gemm::Args shape;
+        Store store;
+        packed::PackedOperand<Format> weights;
+    };
+
+    __device__ static __forceinline__ bool active(const Args& args, unsigned tile) {
+        return TileBinding<Format>::active(args, tile);
+    }
+
+    __device__ static __forceinline__ Tile bind(const Args& args, unsigned tile) {
+        const auto base = TileBinding<Format>::bind(args, tile);
+        const TileRows rows = args.tiles[tile];
+        return {base.shape, {args.image + (rows.output - args.image_from), rows.output, args.nan_seen, rows.output_row, 0U},
+                base.weights};
+    }
+};
+
 // Gate-up with the expert activation as the tile epilogue: the CTA owns gate columns [64 x, 64 x + 64) and the matching
 // up columns (+ outputs / 2), and stores activate_bf16(gate sum, up sum) -- the bits the FP32 [gate | up] image plus
 // expert_activation::launch would store -- at row r, column c of the tile's activation rows.
@@ -164,6 +196,15 @@ template <packed::MatrixFormat Format>
 inline hipError_t launch(const Args& args, hipStream_t stream) {
     if (!fits(args)) return hipErrorInvalidValue;
     return launch_tiles<TileBinding<Format>>(args, stream);
+}
+
+// launch() storing the BF16 image of each sum (ImageTileBinding; same sums, same bits once widened, NaN sums kept whole).
+template <packed::MatrixFormat Format>
+inline hipError_t launch_image(const DownImageArgs& args, hipStream_t stream) {
+    if (!fits(args) || !args.image_from || !args.image || !args.nan_seen ||
+        reinterpret_cast<std::uintptr_t>(args.image) % alignof(std::uint16_t) != 0U)
+        return hipErrorInvalidValue;
+    return launch_tiles<ImageTileBinding<Format>>(args, stream);
 }
 
 // Same tiles; needs pair_rows (the down tiles of the same plan, row for row), the rebase pointers and outputs / 2 a

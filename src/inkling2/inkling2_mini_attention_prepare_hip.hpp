@@ -18,6 +18,17 @@ struct MiniPreparedHipBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGqa
     static constexpr auto success = hipSuccess;
     static constexpr auto invalid = hipErrorInvalidValue;
 
+    // The stage's plain BF16 rounds fold into their producers (attn_core::detail::PreparedGqaFoldsRounds) when `fold`
+    // is set (the resolved prepared-round-fold setting; off keeps every separate round): the convolutions round their
+    // reads and stores with scalar_float::bf16_round, and the output projection rounds each completed sum in its store
+    // at prefill heights with core::RoundStore::separate, the function of the separate Bf16Round pass, in every store of
+    // enqueue_bf16_rows (shared WMMA tile, image tiles, FMA rows): its bits for every sum, NaN payloads included. Decode
+    // heights (tight rows, whose epilogue has only the incumbent store) keep the separate round.
+    static constexpr bool kFoldRounds = true;
+    bool fold = false;
+    bool fold_rounds() const { return fold; }
+    static bool store_round(unsigned rows) { return rows > core::gemv_rows::max_rows; }
+
     Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
         return core::for_each_bf16_projection_group<core::fma_rows::kGroupMax>(views, success,
             [&](std::span<const MiniAttentionLinear> group) {
@@ -30,8 +41,44 @@ struct MiniPreparedHipBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGqa
     }
 };
 
+// The resident backend's prefill projections: each call goes through the shared routed entry, which stores the call's
+// BF16 operand image once in operand_image (rows x widest input u16) when its whole-tile projections pay for it
+// (same bits as linear() above; other calls make the launches linear() makes).
+struct MiniPreparedHipImageBackend : MiniPreparedHipBackend {
+    std::span<std::uint16_t> operand_image;
+
+    Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
+        return core::fma_rows::enqueue_bf16_rows_routed(input, width, rows, views, kVocabulary, operand_image, stream);
+    }
+
+    // The output gate stores the gated rows as that image when the output projection reads its whole call from it
+    // (attn_core::PreparedGqaGateImage; same bits as gate() + linear()). The plan is admitted before anything is
+    // enqueued: the image shares no byte with the gate's inputs, the weights or the outputs.
+    core::fma_rows::Bf16ImageCallPlan output_image_plan(unsigned width, unsigned rows,
+                                                        std::span<const MiniAttentionLinear> views, const float* input,
+                                                        const float* logits) const {
+        const float* sources[2] = {input, logits};
+        return core::fma_rows::plan_bf16_rows_from_image(width, rows, views, kVocabulary, operand_image, sources);
+    }
+    Status gate_image(const float* input, const float* logits, std::size_t elements) const {
+        if (elements > operand_image.size()) return hipErrorInvalidValue;
+        namespace prep = core::row_transforms;
+        return prep::elements(elements, prep::Bf16SigmoidProductImage{input, logits, operand_image.data()}, stream);
+    }
+    Status linear_image(const core::fma_rows::Bf16ImageCallPlan& plan, unsigned width, unsigned rows,
+                        std::span<const MiniAttentionLinear> views) const {
+        return core::fma_rows::enqueue_bf16_rows_from_image(plan, operand_image, width, rows, views, kVocabulary,
+                                                            stream);
+    }
+};
+
 // The same backend for a visit whose flash projects the relative bias (MiniHipAttentionProjectedPolicy).
 struct MiniPreparedHipProjectedBackend : MiniPreparedHipBackend {
+    bool relative_bias_in_attention(unsigned) const { return true; }
+};
+
+// The resident image backend for a visit whose flash projects the relative bias.
+struct MiniPreparedHipImageProjectedBackend : MiniPreparedHipImageBackend {
     bool relative_bias_in_attention(unsigned) const { return true; }
 };
 
@@ -40,23 +87,23 @@ struct MiniPreparedHipProjectedBackend : MiniPreparedHipBackend {
 inline hipError_t enqueue_mini_hip_attention_prepare(
     LayerVisit visit, unsigned first_position, unsigned rows, const MiniProjectionInputs& inputs,
     const MiniProjectionWeights& weights, const MiniProjectionWorkspace& work,
-    const MiniPreparedAttention& output, hipStream_t stream) {
+    const MiniPreparedAttention& output, hipStream_t stream, bool fold = false) {
     if (!valid_mini_visit(visit)) return hipErrorInvalidValue;
-    return attn_core::enqueue_prepared_gqa<MiniPreparedGqaShape>(detail::MiniPreparedHipBackend{{stream}},
+    return attn_core::enqueue_prepared_gqa<MiniPreparedGqaShape>(detail::MiniPreparedHipBackend{{stream}, fold},
         is_full_attention(visit.physical_layer), first_position, rows, inputs, weights, work, output);
 }
 
 inline hipError_t enqueue_mini_hip_attention_output(
     unsigned rows, const std::uint16_t* output_weight, const float* attended, const float* gate_logits,
-    float* gated, float* output, hipStream_t stream, std::size_t output_row_bytes = 0U) {
-    return attn_core::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(detail::MiniPreparedHipBackend{{stream}},
+    float* gated, float* output, hipStream_t stream, std::size_t output_row_bytes = 0U, bool fold = false) {
+    return attn_core::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(detail::MiniPreparedHipBackend{{stream}, fold},
                                                    rows, output_weight, attended, gate_logits, gated, output, output_row_bytes);
 }
 
 inline hipError_t enqueue_mini_hip_post_convolution(
     unsigned rows, const float* weights, const float* input,
-    float* history, float* output, hipStream_t stream) {
-    return attn_core::enqueue_prepared_gqa_post_convolution<MiniPreparedGqaShape>(detail::MiniPreparedHipBackend{{stream}},
+    float* history, float* output, hipStream_t stream, bool fold = false) {
+    return attn_core::enqueue_prepared_gqa_post_convolution<MiniPreparedGqaShape>(detail::MiniPreparedHipBackend{{stream}, fold},
                                                   rows, weights, input, history, output);
 }
 
@@ -67,7 +114,7 @@ inline hipError_t enqueue_mini_hip_attention_forward(
     const MiniProjectionWeights& weights, const MiniProjectionWorkspace& work, const MiniPreparedAttention& prepared,
     const MiniAttentionOutputRows& output, const MiniHipAttentionCache& cache, unsigned* failure, hipStream_t stream,
     std::span<float> workspace = {}, unsigned splits = 1, const std::uint32_t* device_position = nullptr,
-    bool project_bias = true) {
+    bool project_bias = true, bool fold = false) {
     const MiniHipAttentionRows attention{prepared.query, prepared.key, prepared.value, prepared.relative_logits,
                                         prepared.sinks, output.attended, first_position, rows};
     if (!can_enqueue_mini_hip_attention(visit, attention, cache, failure, workspace.size(), splits))
@@ -77,14 +124,14 @@ inline hipError_t enqueue_mini_hip_attention_forward(
         mini_hip_bias_in_attention(rows, splits, device_position, work.relative_features, bias_weights)) {
         // The flash projects the bias: the prepare stage skips the image and its producer (same logits, same flag).
         return attn_core::enqueue_prepared_gqa_forward<MiniPreparedGqaShape>(
-            detail::MiniPreparedHipProjectedBackend{{{stream}}}, is_full_attention(visit.physical_layer),
+            detail::MiniPreparedHipProjectedBackend{{{stream}, fold}}, is_full_attention(visit.physical_layer),
             first_position, rows, inputs, weights, work, prepared, output, failure, [&] {
                 return enqueue_mini_hip_attention_projected<true>(visit, attention, cache, work.relative_features,
                                                                   bias_weights, failure, stream);
             }, device_position);
     }
     return attn_core::enqueue_prepared_gqa_forward<MiniPreparedGqaShape>(
-        detail::MiniPreparedHipBackend{{stream}}, is_full_attention(visit.physical_layer), first_position, rows,
+        detail::MiniPreparedHipBackend{{stream}, fold}, is_full_attention(visit.physical_layer), first_position, rows,
         inputs, weights, work, prepared, output, failure, [&] {
             return enqueue_mini_hip_attention<true>(visit, attention, cache, failure, stream, workspace, splits,
                                                    device_position);

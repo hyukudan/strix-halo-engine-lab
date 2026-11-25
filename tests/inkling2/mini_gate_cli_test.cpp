@@ -198,12 +198,30 @@ void test_cuda_route_options() {
     expect_invalid([&] { (void)forms({"--latency-forms", "--no-latency-forms"}); });
 }
 
+void set_round_fold_env(const char* value) {
+#ifdef _WIN32
+    require(_putenv_s("STRIX_INK_PREPARED_ROUND_FOLD", value ? value : "") == 0, "cannot set the round fold switch");
+#else
+    require((value ? setenv("STRIX_INK_PREPARED_ROUND_FOLD", value, 1) : unsetenv("STRIX_INK_PREPARED_ROUND_FOLD")) == 0,
+            "cannot set the round fold switch");
+#endif
+}
+
 void test_options() {
     using strix::profile::Name;
     require(parse({"1"}).tier.profile == Name::standard, "expected exact default");
     require(parse({"1", "--profile", "exact"}).tier.profile == Name::standard, "expected explicit exact");
     require(parse({"1", "--profile", "fast"}).tier.profile == Name::fast, "expected FAST");
     require(parse({"1", "--profile", "turbo"}).tier.profile == Name::turbo, "expected TURBO");
+    // The prepared-attention round fold is off in every profile by default; STRIX_INK_PREPARED_ROUND_FOLD=1 selects it
+    // through the same resolution the server reads (tests/inkling2/mini_serve_test.cpp).
+    set_round_fold_env(nullptr);
+    for (const auto* tier : {"exact", "fast", "turbo"})
+        require(!strix::inkling2::mini_prepared_round_fold(parse({"1", "--profile", tier}).tier), "round fold off by default");
+    set_round_fold_env("1");
+    for (const auto* tier : {"exact", "fast", "turbo"})
+        require(strix::inkling2::mini_prepared_round_fold(parse({"1", "--profile", tier}).tier), "explicit round fold");
+    set_round_fold_env(nullptr);
     require(parse({"1", "--profile", "fast", "--qualify-q8"}).weights.qualify_q8, "expected Q8 qualification arm");
     require(parse({"1", "--profile", "fast", "--no-weight-q8"}).weights.disable_q8, "expected Q8 off switch");
     expect_invalid([] { (void)parse({"1", "--qualify-q8"}); });

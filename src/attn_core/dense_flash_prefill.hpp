@@ -127,6 +127,13 @@ template <class P> concept DenseSink = requires(const typename P::Args& a, float
 template <class P> concept DenseRebasedSink = DenseSink<P> && requires { P::kRebaseSink; } && P::kRebaseSink;
 template <class P> concept DenseValueRows = requires { P::kValueRows; } && P::kValueRows;
 template <class P> concept DenseRopeKey = requires { P::kRope; };
+// Test-only capture of the lane-score rescale (hip_dense_flash_bench): a policy that declares kRescaleProbe = true and
+// __device__ static void probe(const Args&, unsigned key_tile, unsigned frag, bool rescale, float alpha, const Acc& in,
+// const Acc& post, const Acc& incumbent) receives, per key tile and fragment, the incoming accumulator, the wave's
+// rescale vote, this lane's alpha, the accumulator the kernel hands to the matrix unit (post) and what the unconditional
+// multiply by the alpha factors yields (incumbent). Absent in every production policy: the probe code is discarded at
+// compile time and the production machine code is unchanged.
+template <class P> concept DenseRescaleProbe = requires { P::kRescaleProbe; } && P::kRescaleProbe;
 template <class P> constexpr unsigned rope_of() {
     if constexpr (DenseRopeKey<P>) return P::kRope;
     else return 0U;
@@ -466,40 +473,94 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
 #pragma unroll
                 for (unsigned i = 0; i < 8; ++i) own[i] = present ? __builtin_amdgcn_exp2f(sc[i] - m) : 0.0F;
                 float sum = 0.0F;
+                if constexpr (kLaneScores) {
+                    // Each lane rounds only its own 8 probabilities and the half-wave pair swaps the rounded operands
+                    // as packed 16-bit pairs: the same 16 operands in the same order as rounding all 16 floats.
+                    std::uint16_t ours[8];
+                    std::uint32_t theirs[4];
 #pragma unroll
-                for (unsigned j = 0; j < 16; ++j) {
-                    const float other = __shfl_xor(own[j % 8U], 16, 32);
-                    const float x = j / 8U == hw ? own[j % 8U] : other;
-                    if constexpr (Two) {
-                        const tile::Terms2 t = tile::to_operand2<O>(x);
-                        sum += tile::operand_value<O>(t.hi) + tile::operand_value<O>(t.lo);
-                        pa[j] = t.hi;
-                        pl[j] = t.lo;
-                    } else {
-                        const std::uint16_t p = tile::to_operand<O>(x);
+                    for (unsigned i = 0; i < 8; ++i) ours[i] = tile::to_operand<O>(own[i]);
+#pragma unroll
+                    for (unsigned k = 0; k < 4; ++k)
+                        theirs[k] = static_cast<std::uint32_t>(__shfl_xor(
+                            static_cast<int>(std::uint32_t{ours[2U * k]} | (std::uint32_t{ours[2U * k + 1U]} << 16U)),
+                            16, 32));
+#pragma unroll
+                    for (unsigned j = 0; j < 16; ++j) {
+                        const unsigned i = j % 8U;
+                        const std::uint16_t p = j / 8U == hw
+                            ? ours[i] : static_cast<std::uint16_t>(theirs[i / 2U] >> (16U * (i % 2U)));
                         sum += tile::operand_value<O>(p);
                         pa[j] = p;
+                    }
+                } else {
+#pragma unroll
+                    for (unsigned j = 0; j < 16; ++j) {
+                        const float other = __shfl_xor(own[j % 8U], 16, 32);
+                        const float x = j / 8U == hw ? own[j % 8U] : other;
+                        if constexpr (Two) {
+                            const tile::Terms2 t = tile::to_operand2<O>(x);
+                            sum += tile::operand_value<O>(t.hi) + tile::operand_value<O>(t.lo);
+                            pa[j] = t.hi;
+                            pl[j] = t.lo;
+                        } else {
+                            const std::uint16_t p = tile::to_operand<O>(x);
+                            sum += tile::operand_value<O>(p);
+                            pa[j] = p;
+                        }
                     }
                 }
                 denominator = denominator * alpha + sum;
                 maximum = m;
             }
-            float scale[8];
+            if constexpr (kLaneScores) {
+                // Tiles where no row of the wave moved its maximum: every factor is exactly 1.0F (a NaN alpha votes
+                // for the rescale) and c * 1.0F is c bit for bit: finite c including subnormals (IEEE denormal mode),
+                // +-0, +-Inf, and a quiet NaN (gfx11 v_mul_f32 in IEEE mode returns the NaN operand quieted, sign and
+                // payload kept); an accumulator only holds WMMA / FMA results, never a signalling NaN. So the rescale
+                // and its shuffles are skipped. Native evidence against the incumbent kernel, the same output bytes
+                // and failure word: hip_dense_flash_bench cases xn / xo / xt (NaN payloads in V, an FP32 PV overflow
+                // followed by alpha 0 and tied maxima, subnormal products and signed zeros).
+                const bool rescale = __any(alpha != 1.0F);
+                float scale[8] = {};
+                if (DenseRescaleProbe<P> || rescale) {
 #pragma unroll
-            for (unsigned e = 0; e < 8; ++e) scale[e] = __shfl(alpha, int(2U * e + hw), 32);
+                    for (unsigned e = 0; e < 8; ++e) scale[e] = __shfl(alpha, int(2U * e + hw), 32);
+                }
 #pragma unroll
-            for (unsigned f = 0; f < F; ++f) {
-                Acc c = acc[f];
+                for (unsigned f = 0; f < F; ++f) {
+                    Acc c = acc[f];
+                    [[maybe_unused]] const Acc incoming = c;
+                    if (rescale) {
 #pragma unroll
-                for (unsigned e = 0; e < 8; ++e) c[e] *= scale[e];
-                if constexpr (Two) {
-                    const unsigned at = d0 + 16U * f + rr;
-                    const Frag vh = tile::frag_slot32(vs, at);
-                    c = tile::mma<O>(pa, tile::frag_slot32(vs_lo, at), c);
-                    c = tile::mma<O>(pl, vh, c);
-                    acc[f] = tile::mma<O>(pa, vh, c);
-                } else {
+                        for (unsigned e = 0; e < 8; ++e) c[e] *= scale[e];
+                    }
+                    if constexpr (DenseRescaleProbe<P>) {
+                        Acc incumbent = incoming;
+#pragma unroll
+                        for (unsigned e = 0; e < 8; ++e) incumbent[e] *= scale[e];
+                        P::probe(a, kt >> 4U, f, rescale, alpha, incoming, c, incumbent);
+                    }
                     acc[f] = tile::mma<O>(pa, tile::frag_slot32(vs, d0 + 16U * f + rr), c);
+                }
+            } else {
+                float scale[8];
+#pragma unroll
+                for (unsigned e = 0; e < 8; ++e) scale[e] = __shfl(alpha, int(2U * e + hw), 32);
+#pragma unroll
+                for (unsigned f = 0; f < F; ++f) {
+                    Acc c = acc[f];
+#pragma unroll
+                    for (unsigned e = 0; e < 8; ++e) c[e] *= scale[e];
+                    if constexpr (Two) {
+                        const unsigned at = d0 + 16U * f + rr;
+                        const Frag vh = tile::frag_slot32(vs, at);
+                        c = tile::mma<O>(pa, tile::frag_slot32(vs_lo, at), c);
+                        c = tile::mma<O>(pl, vh, c);
+                        acc[f] = tile::mma<O>(pa, vh, c);
+                    } else {
+                        acc[f] = tile::mma<O>(pa, tile::frag_slot32(vs, d0 + 16U * f + rr), c);
+                    }
                 }
             }
         }

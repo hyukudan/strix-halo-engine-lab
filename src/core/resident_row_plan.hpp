@@ -3,6 +3,7 @@
 #include "core/dense_row_plan.hpp"
 #include "core/f16_tile_gemm.hpp"
 #include "core/gemv_rows.hpp"
+#include "strix/weight/host_lowbit.hpp"
 #include "strix/weight/resident_slices.hpp"
 
 #include <array>
@@ -33,6 +34,25 @@ inline bool valid_resident_q8_rows(const weight::ResidentMatrixView& matrix, uns
            matrix.rows <= matrix.bytes.size() / matrix.row_bytes;
 }
 
+// Low-bit resident rows (strix/weight/host_lowbit.hpp): decode / verify windows only (rows <= gemv_rows::max_rows) on
+// the dense rows family. Wider windows (prefill) have no tile consumer for these storages yet and are refused, so a
+// binding cannot silently re-stream the weights once per 16 rows.
+inline bool valid_resident_lowbit_rows(const weight::ResidentMatrixView& matrix, unsigned outputs,
+                                       const float* input, unsigned rows, const float* output) {
+    constexpr auto max_floats = std::numeric_limits<std::size_t>::max() / sizeof(float);
+    constexpr auto max_extent = std::numeric_limits<unsigned>::max() - 127U;
+    const bool q4 = matrix.storage == weight::kQ4G64WeightStorage;
+    if (!q4 && !(matrix.storage == weight::kQ6G64WeightStorage)) return false;
+    const auto row_bytes = q4 ? weight::Q4G64Storage::row_bytes(matrix.columns) : weight::Q6G64Storage::row_bytes(matrix.columns);
+    return input && output && input != output && reinterpret_cast<std::uintptr_t>(input) % 16U == 0U &&
+           matrix.bytes.data() && reinterpret_cast<std::uintptr_t>(matrix.bytes.data()) % 16U == 0U &&
+           rows != 0U && rows <= gemv_rows::max_rows && outputs != 0U && outputs <= matrix.rows &&
+           outputs <= max_extent && outputs <= max_floats / rows && matrix.columns != 0U &&
+           matrix.columns <= max_floats / rows && matrix.columns <= max_extent &&
+           matrix.columns % weight::Q4G64Storage::elements == 0U && matrix.row_bytes == row_bytes &&
+           matrix.rows <= matrix.bytes.size() / matrix.row_bytes;
+}
+
 // With valid tight Q8_0 rows, the tile's K and load alignment already hold.
 // Keep the tight sweep for decode/verify and when the tile row grid is too tall.
 inline constexpr bool use_resident_q8_tile(unsigned rows) {
@@ -50,6 +70,9 @@ static_assert(kResidentQ8ArithmeticHip[0].name != kResidentQ8ArithmeticHip[1].na
               kResidentQ8ArithmeticCuda[0].name != kResidentQ8ArithmeticCuda[1].name &&
               kResidentQ8ArithmeticHip[0].revision && kResidentQ8ArithmeticHip[1].revision &&
               kResidentQ8ArithmeticCuda[0].revision && kResidentQ8ArithmeticCuda[1].revision);
+
+inline constexpr std::array<weight::ArithmeticId, 2> kResidentLowBitArithmeticHip{{
+    {"hip.q4_g64.dense-linear-tight-rows", 1}, {"hip.q6_g64.dense-linear-tight-rows", 1}}};
 
 // Dispatch consecutive projections of each storage class together, preserving
 // order across BF16 and compact runs. The compact binding validates its format.

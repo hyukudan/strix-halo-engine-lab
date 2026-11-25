@@ -2,11 +2,14 @@
 
 #include "inkling2_mini_checkpoint.hpp"
 #include "inkling2_mini_moe_dispatch.hpp"
+#include "inkling2_mini_attention_operands.hpp"
 #include "attn_core/prepared_gqa.hpp"
 
 #include "strix/weight/resident_slices.hpp"
 #include "strix/weight/row_pitch.hpp"
 
+#include <functional>
+#include <span>
 #include <utility>
 
 namespace strix::inkling2 {
@@ -45,6 +48,12 @@ public:
     [[nodiscard]] std::span<const float> f32(std::string_view name) const;
     [[nodiscard]] std::span<const MiniMoeExpert> experts(unsigned physical) const;
     [[nodiscard]] bool compact() const { return head_.has_value(); }
+    // Certifies the attention operand class from the attention tensors this object holds (BF16 storage only; compact
+    // storage keeps the empty, refusing certificate): `read` copies a staged BF16 tensor to host memory (a device copy
+    // on CUDA). The certificate is a function of these bytes only.
+    void certify_attention(const std::function<void(std::span<const std::uint16_t> staged,
+                                                    std::span<std::uint16_t> host)>& read);
+    [[nodiscard]] const MiniAttentionCertificate& attention_certificate() const { return attention_certificate_; }
     [[nodiscard]] const weight::ResidentMatrixView& compact_head() const { return head_.value(); }
     [[nodiscard]] const attn_core::ResidentPreparedGqaWeights& compact_attention(unsigned physical) const {
         return attention_.at(physical);
@@ -57,6 +66,7 @@ private:
     std::vector<MiniMoeExpert> experts_;
     std::optional<weight::ResidentMatrixView> head_;
     std::array<attn_core::ResidentPreparedGqaWeights, kPhysicalLayers> attention_{};
+    MiniAttentionCertificate attention_certificate_;
 };
 
 }  // namespace strix::inkling2
