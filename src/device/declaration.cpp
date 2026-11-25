@@ -109,12 +109,56 @@ Link parse_link(const std::string& name, const Value& v) {
     return l;
 }
 
+// A measured R1 rows tile plan (strix/r1_rows_tiles.hpp): every key of the measured workload is required, so an entry
+// never covers more than was measured.
+r1_rows_tiles::DeviceTable parse_r1_rows_tiles(const std::string& name, const Value& v) {
+    const std::string key = "r1_rows_tiles." + name;
+    const auto& t = table(v, key);
+    only(t, {"arch", "multiprocessors", "experts", "hidden", "intermediate", "top_k", "formats", "cache_mib"}, key + ".");
+    const auto required = [&](std::string_view field) -> const Value& {
+        const auto* x = find(t, field);
+        if (!x) bad(key + "." + std::string(field), "required");
+        return *x;
+    };
+    const auto count = [&](std::string_view field) {
+        const auto n = integer(required(field), key + "." + std::string(field));
+        if (n == 0 || n > 0xFFFFFFFFULL) bad(key + "." + std::string(field), "expected 1 .. 4294967295");
+        return static_cast<unsigned>(n);
+    };
+    r1_rows_tiles::DeviceTable out;
+    out.name = name;
+    out.arch = string(required("arch"), key + ".arch");
+    if (out.arch.empty() || out.arch.find(':') != std::string::npos)
+        bad(key + ".arch", "expected the architecture name without feature suffix (e.g. gfx1151)");
+    out.multiprocessors = count("multiprocessors");
+    out.experts = count("experts");
+    out.hidden = count("hidden");
+    out.intermediate = count("intermediate");
+    out.top_k = count("top_k");
+    const auto* formats = std::get_if<Value::Array>(&required("formats").data);
+    if (!formats || formats->empty()) bad(key + ".formats", "expected a list of measured formats (nvfp4, mxfp8)");
+    for (const auto& f : *formats) {
+        const auto bit = r1_rows_tiles::format_bit(std::string_view(string(f, key + ".formats")));
+        if (bit == 0U) bad(key + ".formats", "unknown format (expected nvfp4 or mxfp8)");
+        out.formats |= bit;
+    }
+    const auto* mib = std::get_if<Value::Array>(&required("cache_mib").data);
+    if (!mib || mib->empty() || mib->size() > r1_rows_tiles::table_rows)
+        bad(key + ".cache_mib", "expected one budget per row count 0 .. 16 (at most 17 values)");
+    for (std::size_t rows = 0; rows < mib->size(); ++rows) {
+        const auto n = integer((*mib)[rows], key + ".cache_mib");
+        if (n > (std::uint64_t{1} << 20U)) bad(key + ".cache_mib", "budget above 1 TiB");
+        out.cache_bytes[rows] = n << 20U;
+    }
+    return out;
+}
+
 Descriptor parse_device(const std::string& id, const Value& v) {
     const std::string key = "devices." + id;
     const auto& t = table(v, key);
     only(t, {"kind", "vendor", "arch", "uuid", "pci", "name", "memory_bytes", "attach", "roles", "excluded", "reason", "cores",
              "byte_cap_gbytes_ps", "driver", "firmware", "corun_qualification", "profile", "memory_gib",
-             "bandwidth_gbytes_ps", "units", "count", "interconnect"}, key + ".");
+             "bandwidth_gbytes_ps", "units", "count", "interconnect", "lowbit_rows"}, key + ".");
     Descriptor d;
     d.id = id;
     try {
@@ -131,7 +175,7 @@ Descriptor parse_device(const std::string& id, const Value& v) {
         if (d.kind != Kind::npu && find(t, name)) bad(key + "." + std::string(name), "only a kind = \"npu\" unit takes this key");
     for (const std::string_view name : {"uuid", "pci", "attach", "memory_bytes"})
         if (cpu && find(t, name)) bad(key + "." + std::string(name), "a cpu unit takes no " + std::string(name));
-    for (const std::string_view name : {"profile", "bandwidth_gbytes_ps", "units", "count", "interconnect"})
+    for (const std::string_view name : {"profile", "bandwidth_gbytes_ps", "units", "count", "interconnect", "lowbit_rows"})
         if (d.kind != Kind::gpu && find(t, name)) bad(key + "." + std::string(name), "only a GPU entry takes this key");
     if (d.kind == Kind::npu && find(t, "memory_gib")) bad(key + ".memory_gib", "only a GPU or the cpu unit takes this key");
     const Profile* profile = nullptr;
@@ -158,6 +202,17 @@ Descriptor parse_device(const std::string& id, const Value& v) {
     if (profile && profile->name == "custom" && d.budget_bytes == 0) bad(key + ".memory_gib", "required with profile custom");
     if (const auto* x = find(t, "bandwidth_gbytes_ps")) d.bandwidth_gbytes_ps = rate(*x, key + ".bandwidth_gbytes_ps");
     if (const auto* x = find(t, "units")) d.units = static_cast<std::uint32_t>(integer(*x, key + ".units"));
+    if (const auto* x = find(t, "lowbit_rows")) {
+        const auto& rows = table(*x, key + ".lowbit_rows");
+        only(rows, {"small_rows", "wide_panels"}, key + ".lowbit_rows.");
+        for (const std::string_view name : {"small_rows", "wide_panels"}) {
+            const auto* value = find(rows, name);
+            if (!value) bad(key + ".lowbit_rows." + std::string(name), "required (omit lowbit_rows for one route)");
+            const auto n = integer(*value, key + ".lowbit_rows." + std::string(name));
+            if (n < 1 || n > 65535) bad(key + ".lowbit_rows." + std::string(name), "expected 1 to 65535");
+            (name == "small_rows" ? d.lowbit_rows.small_rows : d.lowbit_rows.wide_panels) = static_cast<std::uint32_t>(n);
+        }
+    }
     if (const auto* x = find(t, "count")) {
         const auto n = integer(*x, key + ".count");
         if (n < 1 || n > 64) bad(key + ".count", "expected 1 to 64");
@@ -391,7 +446,7 @@ std::string role_refusal(const Descriptor& device, std::string_view role) {
 Declaration parse_declaration(std::string_view toml, std::string source) {
     const auto parsed = model_description::parse(toml);
     const auto& root = parsed.fields;
-    only(root, {"schema", "machine", "devices", "device_policies", "links"}, "");
+    only(root, {"schema", "machine", "devices", "device_policies", "links", "r1_rows_tiles"}, "");
     const auto* schema = find(root, "schema");
     if (!schema) bad("schema", "required (strix-devices-v1)");
     if (string(*schema, "schema") != "strix-devices-v1") bad("schema", "expected strix-devices-v1");
@@ -420,6 +475,19 @@ Declaration parse_declaration(std::string_view toml, std::string source) {
                 if (it->kind == Kind::cpu) bad("links." + name + ".between", "a cpu unit takes no link");
             }
             out.links.push_back(std::move(link));
+        }
+    if (const auto* x = find(root, "r1_rows_tiles"))
+        for (const auto& [name, value] : table(*x, "r1_rows_tiles")) out.r1_rows_tiles.push_back(parse_r1_rows_tiles(name, value));
+    // Two entries covering one workload (same device and bank, a shared format) would make the budget depend on which
+    // entry comes first: refuse the file.
+    for (std::size_t i = 0; i < out.r1_rows_tiles.size(); ++i)
+        for (std::size_t j = i + 1; j < out.r1_rows_tiles.size(); ++j) {
+            const auto& a = out.r1_rows_tiles[i];
+            const auto& b = out.r1_rows_tiles[j];
+            if (a.arch == b.arch && a.multiprocessors == b.multiprocessors && a.experts == b.experts &&
+                a.hidden == b.hidden && a.intermediate == b.intermediate && a.top_k == b.top_k &&
+                (a.formats & b.formats) != 0U)
+                bad("r1_rows_tiles." + b.name, "covers the same device, bank and format as r1_rows_tiles." + a.name);
         }
     return out;
 }

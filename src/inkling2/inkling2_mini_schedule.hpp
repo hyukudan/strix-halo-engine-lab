@@ -2,6 +2,11 @@
 
 #include "attn_core/dense_flash_keysplit.hpp"
 #include "core/looped_layers.hpp"
+#include "inkling2/inkling2_mini_prefill_rows.hpp"
+#include "strix/env_flags.hpp"
+#include "strix/serve/prompt_piece.hpp"
+
+#include <cstddef>
 
 namespace strix::inkling2 {
 
@@ -61,5 +66,99 @@ constexpr unsigned mini_prefill_tail_rows(unsigned chunk_rows, unsigned tail_row
                             chunk_rows % kMiniPrefillWaveRows == 0U;
     return same_forms && enlarged_admitted ? tail_rows : 0U;
 }
+
+// Tail rows ONE prefill call of `rows` rows absorbs into its final chunk: the remainder after its whole chunks when it is
+// at most the decoder's admitted capacity and keeps the greedy bits (mini_prefill_tail_rows on the ACTUAL remainder;
+// admits(chunk + remainder) = the device row/grid admission). The one rule of the decoder's prefill() (the command line)
+// and of its served prefill_slot_first() calls: a remainder of 1..kKeySplitMaxRows rows runs as its own chunk in both.
+template <class Admits>
+constexpr unsigned mini_call_tail_rows(std::size_t rows, unsigned chunk, unsigned capacity, Admits&& admits) {
+    if (chunk == 0U || capacity == 0U || rows <= chunk) return 0U;
+    const auto remainder = static_cast<unsigned>(rows % chunk);
+    if (remainder == 0U || remainder > capacity) return 0U;
+    return mini_prefill_tail_rows(chunk, remainder, admits(chunk + remainder));
+}
+
+// Tail capacity the decoder keeps: the largest one <= `capacity` whose enlarged chunk the device admits (admission is
+// monotone in rows). Each call still absorbs only its actual remainder (mini_call_tail_rows). 0 when no tail longer
+// than the key-split bound keeps the forms or fits.
+template <class Admits>
+constexpr unsigned mini_admitted_tail_capacity(unsigned chunk, unsigned capacity, Admits&& admits) {
+    constexpr unsigned shortest = attn_core::dense::kKeySplitMaxRows + 1U;
+    if (chunk == 0U || chunk % kMiniPrefillWaveRows != 0U || capacity < shortest || !admits(chunk + shortest)) return 0U;
+    unsigned lo = shortest, hi = capacity;  // admits(chunk + lo) holds
+    while (lo < hi) {
+        const unsigned mid = lo + (hi - lo + 1U) / 2U;
+        if (admits(chunk + mid)) lo = mid;
+        else hi = mid - 1U;
+    }
+    return lo;
+}
+
+// Rows of the FIRST chunk one prefill call of `rows` rows runs (chunks of `chunk` rows, the final one enlarged by the
+// call's absorbed tail, mini_call_tail_rows): where a served piece may cut without crossing a chunk boundary.
+constexpr unsigned long long mini_call_first_chunk(unsigned long long rows, unsigned chunk, unsigned call_tail) {
+    if (rows <= chunk) return rows;
+    return call_tail != 0U && rows == static_cast<unsigned long long>(chunk) + call_tail ? rows : chunk;
+}
+
+// Prefill schedule: ONE resolver for the command line (apps/inkling2_mini_gpu_main.hpp) and the server
+// (inkling2_mini_serve.cpp), so the same request is prefilled by the same chunks on both entry points.
+// Every chunk re-streams all expert weights, so the chunk is as large as the backend qualified: the declared rows per
+// backend and profile (mini_cli_prefill_rows, inkling2_mini_prefill_rows.hpp). CUDA keeps greedy chunks (no tail).
+// Tail absorption: a remainder of up to chunk / tail_divisor rows rides in the final chunk when mini_call_tail_rows
+// admits it (gfx1151 8K prose, 8236 = 8192 + 44 rows: 5,021 -> 4,810 ms with one chunk, logits bitwise equal).
+// STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks on both entry points.
+struct MiniPrefillSchedule {
+    unsigned chunk;
+    unsigned tail_divisor;
+};
+
+constexpr MiniPrefillSchedule mini_prefill_schedule(bool hip, profile::Name tier) {
+    return {mini_cli_prefill_rows(hip ? MiniPrefillBackend::hip : MiniPrefillBackend::cuda, tier), hip ? 8U : 0U};
+}
+
+inline MiniPrefillSchedule mini_prefill_schedule_from_env(bool hip, profile::Name tier) {
+    auto schedule = mini_prefill_schedule(hip, tier);
+    if (!env_flag_default_on("STRIX_INKLING_PREFILL_TAIL")) schedule.tail_divisor = 0U;
+    return schedule;
+}
+
+// Served prompt route. A HIP server with the served route lever (kMiniServedCliRoute, opt-in in every profile column)
+// serves the command line's schedule above with the first id taken from the final prefill row (emits-first; device
+// evidence: served prefill == CLI prefill bitwise, chunk and tail edges included). Without it, and on CUDA (not
+// qualified there), a server keeps the route it served before: 128-row chunks, no tail, the last prompt token held back
+// and decoded as the first decode row.
+inline constexpr unsigned kMiniServedHeldBackChunk = 128U;
+constexpr bool mini_served_prefill_emits_first(bool hip, bool cli_route) noexcept { return hip && cli_route; }
+
+inline MiniPrefillSchedule mini_served_prefill_schedule_from_env(bool hip, bool cli_route, profile::Name tier) {
+    return mini_served_prefill_emits_first(hip, cli_route) ? mini_prefill_schedule_from_env(hip, tier)
+                                                           : MiniPrefillSchedule{kMiniServedHeldBackChunk, 0U};
+}
+
+// Tail rows a chunk may absorb (before the decoder's own admission, mini_admitted_tail_capacity). None when the
+// context leaves no room past the chunk.
+constexpr unsigned mini_prefill_tail_capacity(unsigned chunk, unsigned divisor, unsigned context = ~0U) {
+    if (divisor == 0U || chunk == 0U || context <= chunk) return 0U;
+    const unsigned capacity = chunk / divisor;
+    return capacity < context - chunk ? capacity : context - chunk;
+}
+
+// Served prompt pieces while another lane decodes (serve::CohortConfig::prompt_slice_decoding) cut a chunk only where
+// every row keeps its route forms: at multiples of the 16-position wave tile from the chunk start, every piece longer
+// than the key-split bound (no piece takes the small-row attention policy or the one-row packed MoE body). HIP only;
+// the CUDA forms are not qualified for cuts, so a CUDA prompt runs whole chunks.
+constexpr serve::PromptPieceRule mini_prefill_piece_rule(bool hip) {
+    return hip ? serve::PromptPieceRule{kMiniPrefillWaveRows, attn_core::dense::kKeySplitMaxRows}
+               : serve::PromptPieceRule{};
+}
+
+// Served lane cap without --slots (an explicit --prefill-rows without --slots caps the lanes at its rows, as it did
+// before the served chunk and the lane cap were separate), and the rows of one served prompt piece while another lane decodes (HIP).
+inline constexpr unsigned kMiniServeLaneRows = 128U;
+inline constexpr unsigned kMiniServeDecodingRows = 128U;
+static_assert(kMiniServeDecodingRows % kMiniPrefillWaveRows == 0U &&
+              kMiniServeDecodingRows > attn_core::dense::kKeySplitMaxRows, "a served piece keeps the long-chunk forms");
 
 }  // namespace strix::inkling2

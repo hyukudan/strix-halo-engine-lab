@@ -1,3 +1,4 @@
+#include "strix/token_sampling.hpp"
 #include "strix/serve/run.hpp"
 #include "strix/serve/serve_config.hpp"
 
@@ -178,6 +179,7 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
             }
             scope.emplace();
         }
+        selection.sampler_options = validate_sampling_startup_environment(factory->sampling_default);
         factory->validate(selection);
         if(factory->early_exit) if(auto result=factory->early_exit(selection,out)) return *result;
         if (family_inspect) { factory->inspect(selection, out); return 0; }

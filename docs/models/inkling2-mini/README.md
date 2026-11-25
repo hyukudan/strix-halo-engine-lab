@@ -74,51 +74,42 @@ build-cuda/strix-inkling2-mini-cuda MODEL.safetensors \
     TOKEN_ID TOKEN_ID --prefill-chunk 128 --generate 24
 ```
 
-HIP defaults to the one-row packed expert GEMV for decode. CUDA defaults to
-grouped GEMM. Use `--packed-decode` or `--grouped-decode` to select the
-route explicitly. The packed route uses one kernel for gate/up with BF16
+Decode runs the experts on the one-row packed form by default on the command
+line (both backends; `--grouped-decode` selects the grouped tile kernel there,
+printed as `moe_decode` in `strix-decode-route/v1`). `strix-serve` keeps its
+existing route in every profile and takes no decode form flag: the last
+prompt token is held back and decoded, prompts run in 128-row chunks
+(`--prefill-rows`, clamped to the context, which without `--slots` also caps
+the lanes), and a cohort decodes with the grouped form in one batched forward
+(CUDA: its width programs), whose lane bits depend on the cohort width as
+before. The served route switch `STRIX_INK_SERVED_CLI_ROUTE=1`
+(`inkling2-mini-served-cli-route@1`, off in every profile column) makes a HIP
+server run the command line's route; a CUDA server declines it. The startup
+line reports it as `served_route off`, `declined`, or `on qualification
+unqualified` with its form, chunk and tail; the command line prints
+`strix-served-route/v1 ... effective n/a`. On that route decode is packed and
+a served lane keeps the bits of its own lone decode at any cohort width:
+cohorts run in passes of at most 16 lanes, the row limit of the dense one-row
+form, with one head launch per pass; lanes default to 128 without `--slots`.
+A cohort decode on that route checks every lane before any pass appends and
+runs its passes through `serve::run_cohort_passes`: the input ids are copied
+before the first pass, the picks are published after the last one, and every
+lane of the cohort is retired if a pass fails. The packed route uses one kernel for gate/up with BF16
 activation and one for down with ordered expert combine.
 
-`strix-serve` resolves the decode route with the same function and the same
-two switches; its default stays the grouped tile kernel on both backends, so
-existing served answers keep their bits. Packed serving is the identity variant
-`inkling2-mini-moe-packed@1` of the profile resolver (`--packed-decode` or
-`--identity-variant inkling2-mini-moe-packed`, HIP only): it is selected only by
-name and admitted by the resolver under every tier, EXACT included, because it is
-an exact identity of its own. With it every decode lane of a served cohort runs the packed form in balanced passes of
-at most 16 lanes (the one-row cap of the dense rows family), so its reference is
-the lane's own lone one-row decode, the CLI's bits (checked on device for
-cohorts of 17 and 34 lanes). The grouped route keeps one pass of every lane; its
-reference is the grouped served incumbent. CUDA packed serving is refused at
-launch (the variant is declared for HIP only) until it has its own device
-comparison against the lone decode. The startup and inspection lines report
-`moe_decode packed|grouped`, `moe_decode_reference lone-decode|served-grouped`
-and `identity incumbent|<id>@<version>`; the capabilities carry the pair as
-`moe_decode` and the identity as `identity`.
-
-A served lane whose scores are read (sampling, log-probabilities, verify
-observers) always reads the full-head score row of its own step. A greedy lane
-whose scores nobody reads may keep a screened pick without a score row; the
-first read recomputes it from that step's head input.
-
-On CUDA the screened head is the identity variant
-`inkling2-mini-cuda-screened-head@1`, served only (`--screened-head` or
-`--identity-variant inkling2-mini-cuda-screened-head`). Without it CUDA serves
-the full head, as before. When it is admitted, a greedy pick that returns no
-logits row (decode steps and the last prompt row without `--logits`) runs the
-shared EXACT screened head
-(`src/cuda/core/head_screened.cuh`, plan in `src/core/screened_head_plan.hpp`):
-an 8-bit plane of the output matrix with a rigorous per-row error bound selects
-the rows that can win or tie, the incumbent FP32 row body recomputes them with
-the softcap store and the shared first-max rule picks the token. The token and
-the non-finite status equal the full head bit for bit. The served resident route binds it (the CLI refuses the variant); sampling, `--logits`, prefill score rows and
-gate runs keep the full head. The plane (one byte per weight of the
-200058 x 2304 head: +0.43 GiB device) is built only after the KV slots that the
-full-head budget admits are allocated. It stays only if it costs none of those
-slots and none of their runtime headroom; otherwise the server starts on the
-full head.
-`STRIX_SCREENED_HEAD=0` restores the full head; `STRIX_SCREENED_HEAD_STATS=1`
-prints how many rows the picks recomputed when the decoder closes.
+On HIP, the command line prefills in chunks of 8192 rows (`--prefill-chunk`),
+and a remainder of up to chunk / 8 rows (and more than 16) rides in the final
+chunk (`STRIX_INKLING_PREFILL_TAIL=0` turns that off). A HIP server on the
+command line's route uses the same schedule (`--prefill-rows` sets the chunk),
+reads the whole prompt by prefill and takes the first id from its final row, as
+the command line does. While another lane decodes it runs a prompt in 128-row
+pieces cut inside those chunks only at 16-row wave tiles and never shorter than
+17 rows, where every row keeps its route forms, so the answer does not depend
+on other requests. The CUDA command line prefills in 2048-row chunks. An
+explicit `--prefill-rows` without `--slots` also caps the served lanes at that
+many rows, as before. The server's startup line prints `served_route` (`off`
+or `declined` on the existing route; `on` adds `prefill_chunk`, `prefill_tail`
+and `first_id prefill`); the command line prints `strix-prefill-route/v1`.
 
 ## Execution and reuse
 

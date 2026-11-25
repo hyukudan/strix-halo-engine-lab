@@ -1,5 +1,6 @@
 #include "strix/hip_ds41_expert_tp.hpp"
 
+#include "strix/core/dense_site_policy.hpp"
 #include "strix/ds41_expert_tp.hpp"
 
 #include <hip/hip_runtime.h>
@@ -11,7 +12,10 @@
 namespace strix::ds41::expert_tp {
 namespace {
 
-constexpr unsigned full_row = 756U, part_row = 420U, last = 336U;  // 9 and 5 Q2_K blocks; rank 1's block 4 at byte 336
+// 9 and 5 Q2_K blocks; rank 1's block 4 at byte 336 (core::dense_sites::q2k_half_layout of the FFN half)
+constexpr auto layout = core::dense_sites::q2k_half_layout(half, static_cast<std::uint32_t>(q2_k_block_bytes), 256U,
+                                                              static_cast<std::uint32_t>(half_block_bytes));
+constexpr unsigned full_row = layout.full_row, part_row = layout.part_row, last = layout.last;
 
 // Source byte of byte j of a rank's packed row (pack_down_row): rank 0 the first 420 bytes; rank 1 blocks 5..8, then
 // block 4 with scales 8..15 over 0..7 and the codes of groups 4..7 over those of groups 0..3.
@@ -25,7 +29,7 @@ __device__ __forceinline__ unsigned source_byte(unsigned rank, unsigned j) {
 }
 
 // The packed form (pack_down_row_packed, 380 bytes): 4 whole blocks, then the rank's half of block 4 (scales, codes, d/dmin).
-constexpr unsigned packed_row = 380U;
+constexpr unsigned packed_row = layout.packed_row;
 __device__ __forceinline__ unsigned source_byte_packed(unsigned rank, unsigned j) {
     if (j < last) return rank == 0U ? j : part_row + j;
     const unsigned k = j - last;

@@ -17,9 +17,16 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
         plan.reason = "weight load lever disabled";
         return plan;
     }
-    const bool runnable = !policy.id.name.empty() && policy.id.revision &&
-        policy.target == kQ8WeightStorage && find_format(registry, policy.target) &&
-        std::ranges::find(request.consumer_formats, policy.target) != request.consumer_formats.end();
+    // Each compact role class needs a target the registry knows and every consumer of the request runs; a role class
+    // kept BF16 needs none (a head-only row). At least one class is compact.
+    const auto consumed = [&](FormatId format) {
+        return format == kBf16WeightStorage ||
+               (find_format(registry, format) &&
+                std::ranges::find(request.consumer_formats, format) != request.consumer_formats.end());
+    };
+    const bool compact = policy.target != kBf16WeightStorage || policy.head_target() != kBf16WeightStorage;
+    const bool runnable = !policy.id.name.empty() && policy.id.revision && compact && consumed(policy.target) &&
+        consumed(policy.head_target());
     // One image serves every listed regime: a full row in some regime selects it, and every regime needs a gate row.
     const std::string_view single[] = {request.scope.regime};
     const auto regimes = request.regimes.empty() ? std::span<const std::string_view>(single) : request.regimes;
@@ -36,12 +43,14 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
         if (!runnable) continue;
         auto scope = request.scope;
         scope.regime = regime;
-        entry.row = find_weight_load_gate(policy, scope, decisions, request.context, &entry.outside_band);
+        entry.row = find_weight_load_gate(policy, scope, decisions, request.extent, &entry.outside_band);
         if (!entry.row) {
             missing = true;
             continue;
         }
-        const bool full = !(entry.row->measured_gain == Digest256{});
+        const bool gain = !(entry.row->measured_gain == Digest256{});
+        entry.gain_outside_lanes = gain && !weight_load_gain_covers_lanes(entry.row->evidence, request.extent.lanes);
+        const bool full = gain && !entry.gain_outside_lanes;
         entry.qualification = full ? RegimeQualification::full : RegimeQualification::gate_only;
         if (full && !decision) decision = entry.row;
     }
@@ -55,6 +64,7 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
         return plan;
     }
     plan.storage = policy.target;
+    plan.head_storage = policy.head_target();
     plan.reason = "unqualified weight load arm";
     if (decision) {
         plan.gate_v2_pass = decision->gate_v2_pass;
@@ -85,6 +95,10 @@ std::string weight_load_regime_receipt(const WeightLoadPlan& plan) {
         if (entry.row && !entry.row->evidence.receipt.empty()) {
             out += ':';
             out += entry.row->evidence.receipt;
+        }
+        if (entry.row && entry.gain_outside_lanes) {
+            out += ":gain-lanes<=";
+            out += std::to_string(entry.row->evidence.max_lanes);
         } else if (!entry.row && entry.outside_band) {
             out += ":outside-band<=";
             out += std::to_string(entry.outside_band->evidence.max_context);

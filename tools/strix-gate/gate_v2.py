@@ -40,11 +40,21 @@ Exit 0 = PASS, 1 = FAIL, 2 = no verdict (bookkeeping defect, too few rows, label
      3 = UNRESOLVED (provisional: the lever stays opt-in for the unresolved classes), 4 = HOLD (reference check).
 """
 import argparse
+import contextlib
+import io
 import json
 import math
+import os
 import pathlib
 import re
+import stat
+import statistics
+import subprocess
 import sys
+import threading
+import time
+import traceback
+from concurrent.futures import Future
 
 import numpy as np
 
@@ -174,9 +184,10 @@ def check_held_out(windows):
     return {k: sum(w[k] * w["dnll_rows"] for w in windows) / rows for k in ("label_is_ref_top1", "label_is_cand_top1")}
 
 
-def read_routes(path):
+def read_routes(path, opener=None):
     """strix-route-file/v1 -> list of (layer, ids[rows, k] uint32, weights[rows, k] float32)."""
-    data = pathlib.Path(path).read_bytes()
+    with open(path, "rb", opener=opener) as f:
+        data = f.read()
     if len(data) < 16 or data[:8] != ROUTE_MAGIC or int.from_bytes(data[8:12], "little") != 1:
         raise GateError(f"{path}: not a strix-route-file/v1")
     out, at = [], 16
@@ -194,9 +205,9 @@ def read_routes(path):
     return out
 
 
-def route_flips(ref_path, arm_path):
+def route_flips(ref_path, arm_path, opener=None):
     """Ids of the reference's selected sets missing from the arm's, per layer (order-free). Same call sequence required."""
-    a, b = read_routes(ref_path), read_routes(arm_path)
+    a, b = read_routes(ref_path, opener), read_routes(arm_path, opener)
     if len(a) != len(b):
         raise GateError(f"{arm_path}: {len(b)} router calls, the reference has {len(a)}")
     per = {}
@@ -445,11 +456,13 @@ def _option_qual_reduce():
     return reduce_pair
 
 
-def read_manifest(path):
+def read_manifest(path, opener=None):
     """Prompt manifest rows NAME TOKENS IDS_PATH [ARMS] -> {name: ids}; the IDs file is whitespace-separated (a relative
     path is next to the manifest)."""
     path, rows = pathlib.Path(path), {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    with open(path, encoding="utf-8", opener=opener) as f:
+        lines = f.read().splitlines()
+    for line in lines:
         f = line.split()
         if not f or f[0].startswith("#"):
             continue
@@ -458,7 +471,8 @@ def read_manifest(path):
         if f[0] in rows:
             raise GateError(f"{path}: case {f[0]} twice")
         ids_path = pathlib.Path(f[2]) if pathlib.Path(f[2]).is_absolute() else path.parent / f[2]
-        ids = np.array(ids_path.read_text(encoding="utf-8").split(), dtype=np.int64)
+        with open(ids_path, encoding="utf-8", opener=opener) as ids_file:
+            ids = np.array(ids_file.read().split(), dtype=np.int64)
         if ids.size != int(f[1]):
             raise GateError(f"{path}: {f[0]} has {ids.size} IDs, the manifest says {f[1]}")
         rows[f[0]] = ids
@@ -468,14 +482,16 @@ def read_manifest(path):
 TRACE_DIAG = re.compile(r'^\{"diag":1,"case":"([^"]+)","arm":"([^"]+)"')
 
 
-def read_trace_diag(paths):
+def read_trace_diag(paths, opener=None):
     """Free-running route flips from an engine's per-layer trace, for engines without a route tap: lines
     {"diag":1,"case":C,"arm":A,...,"layers":[{"l":0,...,"router_ids":I,...},...]} where router_ids counts the
     reference's selected experts missing from the arm's selection on that layer (order-free, over the traced rows).
     Returns {(case, arm): (ids, layers)}; a diag line without layers (trace off) is skipped."""
     out = {}
     for p in paths or []:
-        for line in pathlib.Path(p).read_text(encoding="utf-8", errors="replace").splitlines():
+        with open(p, encoding="utf-8", errors="replace", opener=opener) as f:
+            lines = f.read().splitlines()
+        for line in lines:
             m = TRACE_DIAG.match(line)
             if not m:
                 continue
@@ -500,6 +516,24 @@ def null_moved(name, null_kls):
 def qual(a):
     """option_qual adapter: reduce every case's REF vs CAND / NULL logits, check replay receipts, count free flips."""
     out = pathlib.Path(a.out)
+    r4_input = getattr(a, "r4_assess", None)
+    protected = set()
+
+    def record_open(path, flags):
+        fd = os.open(path, flags)
+        try:
+            protected.add(_r4_identity(fd))
+        except OSError:
+            protected.add(None)
+        return fd
+
+    opener = record_open if r4_input is not None else None
+
+    def reduce(ref, cand, **kw):
+        if opener is None:
+            return reduce_pair(ref, cand, a.format, **kw)
+        return _r4_reduce_pair(reduce_pair, ref, cand, a.format, opener, **kw)
+
     tier = getattr(a, "tier", "fast") or "fast"
     if tier not in TIERS:
         raise GateError(f"unknown tier {tier}; tiers {sorted(TIERS)}")
@@ -510,8 +544,11 @@ def qual(a):
               f"qualifies a FAST lever)")
     reduce_pair = _option_qual_reduce()
     head = a.format == "head"
-    manifest = read_manifest(a.manifest) if a.manifest else None
-    classes = json.loads(pathlib.Path(a.classes).read_text(encoding="utf-8")) if getattr(a, "classes", None) else None
+    manifest = read_manifest(a.manifest, opener) if a.manifest else None
+    classes = None
+    if getattr(a, "classes", None):
+        with open(a.classes, encoding="utf-8", opener=opener) as f:
+            classes = json.load(f)
     if head and manifest is None:
         raise GateError("--format head needs --manifest (the prompt IDs are the held-out labels)")
     pattern = a.logits or ("{case}-{arm}.f32" if head else "logits/{case}.{arm}.bin")
@@ -524,7 +561,7 @@ def qual(a):
         cases = sorted(p.name[:-len(f".{a.ref}.bin")] for p in (out / "logits").glob(f"*.{a.ref}.bin"))
     if not cases:
         raise GateError(f"{out} holds no {a.ref} logits")
-    diag = read_trace_diag(a.trace_diag)
+    diag = read_trace_diag(a.trace_diag, opener)
     if diag and manifest is None:
         raise GateError("--trace-diag needs --manifest (flip slots = prompt rows x traced layers)")
     windows, flips, replay, traced = [], [], {}, 0
@@ -534,25 +571,30 @@ def qual(a):
         kw = {"ids": manifest[case], "rows": a.head_rows} if head else {}
         logit = lambda arm: path_of(case, arm)  # noqa: E731
         route = lambda arm: out / "routes" / f"{case}.{arm}.rte"  # noqa: E731
-        err = lambda arm: (out / "log" / f"{case}.{arm}.stderr").read_bytes()  # noqa: E731
-        ra, _ = reduce_pair(logit(a.ref), logit(a.cand), a.format, **kw)
-        nulls = [reduce_pair(logit(a.ref), logit(n), a.format, **kw)[0] for n in a.null]
+        def err(arm):
+            with open(out / "log" / f"{case}.{arm}.stderr", "rb", opener=opener) as f:
+                return f.read()
+
+        ra, _ = reduce(logit(a.ref), logit(a.cand), **kw)
+        nulls = [reduce(logit(a.ref), logit(n), **kw)[0] for n in a.null]
         null_moved(case, [float(x["kl_rc"].mean()) for x in nulls])
         w = window_stats(case, ra["kl_rc"], ra["agree"].astype(bool), ra["nll_r"], ra["nll_c"],
                          [float(x["kl_rc"].mean()) for x in nulls], ra["top1_r_is_label"], ra["top1_c_is_label"],
                          null_top1s=[float(x["agree"].mean()) for x in nulls], null_nlls=[x["nll_c"] for x in nulls],
                          cls=window_class(case, classes, manifest), null_kl_rows=nulls[0]["kl_rc"], limits=limits)
-        moe = route(a.ref).exists()
+        ref_route = route(a.ref)
+        moe = ref_route.exists()
         f = None
         if moe:
             ref_r = route_receipt(err(a.ref), f"{case}.{a.ref}")
-            replay[case] = {"cand": check_replay(ref_r, route_receipt(err(a.cand), f"{case}.{a.cand}"), route(a.ref), f"{case}.{a.cand}"),
-                            "null": [check_replay(ref_r, route_receipt(err(n), f"{case}.{n}"), route(a.ref), f"{case}.{n}", null=True)
+            replay[case] = {"cand": check_replay(ref_r, route_receipt(err(a.cand), f"{case}.{a.cand}"), ref_route, f"{case}.{a.cand}"),
+                            "null": [check_replay(ref_r, route_receipt(err(n), f"{case}.{n}"), ref_route, f"{case}.{n}", null=True)
                                      for n in a.null]}
             w["replay"] = replay[case]
             if not (a.cand_free and a.null_free):
                 raise GateError(f"{case}: MoE routes present: --cand-free and --null-free arms are required (R1 flip ratio)")
-            f = {"cand": route_flips(route(a.ref), route(a.cand_free)), "null": route_flips(route(a.ref), route(a.null_free))}
+            f = {"cand": route_flips(ref_route, route(a.cand_free), opener),
+                 "null": route_flips(ref_route, route(a.null_free), opener)}
             flips.append(f)
             w["flips"] = {k: {x: v[x] for x in ("slots", "ids", "rate")} for k, v in f.items()}
         elif diag:
@@ -586,6 +628,7 @@ def qual(a):
               f"on {traced} of {len(windows)} windows (slots = prompt rows x traced layers)")
     p = verdict(windows, flips if flips else None, limits=limits,
                 allow_null_floor=getattr(a, 'allow_null_floor', False))
+    exit_code = EXIT[p["state"]]
     print(pooled_line(p, limits))
     if a.json:
         doc = {"schema": "strix-fast-gate-v2/v1", "limits": limits, "ref": a.ref, "cand": a.cand, "null": a.null,
@@ -593,8 +636,24 @@ def qual(a):
                "windows": [{k: v for k, v in w.items() if k != "_rows"} for w in windows], "pooled": p}
         if tier != "fast":
             doc["tier"] = tier
-        pathlib.Path(a.json).write_text(json.dumps(doc, indent=1, sort_keys=True, default=str) + "\n", encoding="utf-8")
-    return EXIT[p["state"]]
+        with open(a.json, "w", encoding="utf-8", opener=opener) as f:
+            f.write(json.dumps(doc, indent=1, sort_keys=True, default=str) + "\n")
+    stdout = sys.stdout
+    # Ordinary stdout must finish before optional output, including in the plain CLI.
+    # Flush real Python stdio here so a daemon never owns its buffer lock at shutdown.
+    stdout_flushed = type(stdout) is io.TextIOWrapper
+    if stdout_flushed:
+        try:
+            stdout.flush()
+        except (OSError, ValueError):
+            return exit_code
+    if r4_input is not None:
+        try:
+            _run_r4_diagnostic(r4_input, windows, p, classes, manifest, limits, protected,
+                               stdout, sys.stderr, stdout_flushed)
+        except BaseException:
+            pass  # The ordinary verdict and receipt are already final.
+    return exit_code
 
 
 def window_class(case, classes, manifest):
@@ -610,6 +669,245 @@ def window_class(case, classes, manifest):
                 return f"prompt<={band // 1024}K"
         return "prompt>64K"
     return "all"
+
+
+R4_CLASS_MIN = 3
+R4_MAX_INPUT_BYTES = 1024 * 1024
+R4_MAX_OUTPUT_BYTES = 4096
+
+
+def _r4_class_stats(nlls, limits):
+    n = len(nlls)
+    med = float(statistics.median(nlls)) if n >= R4_CLASS_MIN else None
+    bar = max(limits["ref_nll_factor"] * med, med + limits["ref_nll_margin"]) if med is not None else None
+    if bar is not None and not math.isfinite(bar):
+        raise GateError("derived bar must be finite")
+    return {"n": n, "median": med, "bar": bar}
+
+
+def _r4_label(text):
+    # Keep labels on one line and reserve the uppercase verdict token for "would be PASS".
+    return json.dumps(text).replace("PASS", r"\u0050ASS")
+
+
+def _open_r4_original(path):
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0) | getattr(os, "O_BINARY", 0)
+    return os.fdopen(os.open(path, flags), "rb")
+
+
+def _read_r4_original(source):
+    with (contextlib.nullcontext(source) if isinstance(source, io.IOBase) else _open_r4_original(source)) as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise GateError("original NLL JSON must be a regular file")
+        data = f.read(R4_MAX_INPUT_BYTES + 1)
+    if len(data) > R4_MAX_INPUT_BYTES:
+        raise GateError(f"original NLL JSON exceeds size limit ({R4_MAX_INPUT_BYTES} bytes)")
+    source = data.decode("utf-8")
+    # Bound nesting before handing the text to the recursive JSON decoder. The schema needs two levels.
+    depth = 0
+    quoted = escaped = False
+    for char in source:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in "[{":
+            depth += 1
+            if depth > 2:
+                raise GateError("original NLL JSON exceeds nesting limit (2 levels)")
+        elif char in "]}":
+            depth = max(0, depth - 1)
+    return json.loads(source)
+
+
+def r4_assessment(path, windows, pooled, manifest, limits):
+    original = _read_r4_original(path)
+    if not isinstance(original, dict) or not original:
+        raise GateError("expected a JSON object mapping content classes to original reference NLLs")
+    for nlls in original.values():
+        if not isinstance(nlls, list) or any(
+                type(nll) not in (int, float) or not math.isfinite(nll) or nll < 0 for nll in nlls):
+            raise GateError("original reference NLLs must be arrays of finite, nonnegative numbers")
+
+    lines, flagged = [], []
+    content = {c["name"]: c for c in class_verdicts(windows, limits)}
+    band_windows = [dict(w, **{"class": window_class(w["name"], None, manifest)}) for w in windows]
+    bands = {c["name"]: c for c in class_verdicts(band_windows, limits)}
+    unresolved = False
+    for cls in sorted(original.keys() | content.keys()):
+        stats = _r4_class_stats(original.get(cls, []), limits)
+        n, med, bar = stats["n"], stats["median"], stats["bar"]
+        detail = f"median {med:.3f}, bar {bar:.3f}" if bar is not None else f"bar unavailable (need {R4_CLASS_MIN} originals)"
+        outliers = [w["name"] for w in windows if w["class"] == cls and bar is not None and w["ref_nll"] > bar]
+        flagged.extend(outliers)
+        rows = content.get(cls, {}).get("rows", 0)
+        provisional = bar is None or rows < limits["min_rows"] or content[cls]["state"] == "unresolved"
+        unresolved |= provisional
+        lines.append(f"content class {_r4_label(cls)}: {n} original windows, {detail}; {rows} scored rows"
+                     + (" (provisional; UNRESOLVED)" if bar is None else " (provisional)" if provisional else "")
+                     + (f"; off-distribution {_r4_label(', '.join(outliers))}" if outliers else ""))
+    for band in sorted({window_class(case, None, manifest) for case in manifest}):
+        rows = bands.get(band, {}).get("rows", 0)
+        provisional = rows < limits["min_rows"] or bands[band]["state"] == "unresolved"
+        unresolved |= provisional
+        lines.append(f"prompt band {_r4_label(band)}: {rows} scored rows" + (" (provisional)" if provisional else ""))
+
+    failed = any(not ok for k, ok in pooled["checks"].items() if k != "classes") or any(
+        c["state"] == "fail" for c in (*content.values(), *bands.values()))
+    state = ("FAIL" if failed else "HOLD" if flagged or pooled["reference_suspect"]
+             else "UNRESOLVED" if unresolved else "PASS")
+    return [*lines, f"frozen-bar assessment would be {state}"]
+
+
+def _r4_identity(fd):
+    info = os.fstat(fd)
+    return (info.st_dev, info.st_ino) if info.st_ino else None
+
+
+def _r4_reduce_pair(reduce_pair, ref, cand, fmt, opener, **kw):
+    # The shared readers accept descriptors and close them after reading.
+    # Reclaim descriptors that an early validation error left unopened.
+    pending = {}
+    try:
+        for path in (ref, cand):
+            fd = opener(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            pending[fd] = _r4_identity(fd)
+        return reduce_pair(*pending, fmt, **kw)
+    except BaseException as exc:
+        # Release any suspended reader generators before reclaiming unused descriptors.
+        traceback.clear_frames(exc.__traceback__)
+        for fd, identity in pending.items():
+            with contextlib.suppress(OSError):
+                if _r4_identity(fd) == identity:
+                    os.close(fd)
+        raise
+
+
+def _r4_alias(fd, protected):
+    info = os.fstat(fd)
+    if (stat.S_ISREG(info.st_mode) and not info.st_ino
+            or (stat.S_ISREG(info.st_mode) or stat.S_ISFIFO(info.st_mode)) and None in protected):
+        return True  # An unidentified regular file cannot safely receive the report.
+    return bool(info.st_ino and (info.st_dev, info.st_ino) in protected)
+
+
+def _r4_refusal(protected):
+    # A redirected stderr cannot carry its own refusal. Use a separate terminal if present.
+    tty = "CONOUT$" if os.name == "nt" else "/dev/tty"
+    fd = os.open(tty, os.O_WRONLY | getattr(os, "O_NONBLOCK", 0))
+    try:
+        if os.isatty(fd) and not _r4_alias(fd, protected):
+            return _start_r4_writer(fd, "diagnostic unavailable: stderr aliases a gate input or output\n")
+    finally:
+        os.close(fd)
+
+
+def _start_r4_writer(fd, text):
+    # The helper waits for authorization before writing, even if launching it stalls.
+    script = ("import os, sys\n"
+              "if os.read(0, 1):\n"
+              "    try: os.write(2, sys.argv[1].encode('ascii'))\n"
+              "    except OSError: pass\n")
+    return subprocess.Popen([sys.executable, "-I", "-S", "-c", script, text],
+                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=fd, bufsize=0)
+
+
+def _write_r4_diagnostic(fd, stderr, text, protected):
+    if fd is None:
+        stderr.write(text)  # In-memory capture in embedded calls.
+        return
+    # Hold a duplicate only for the handoff, and check the handle the helper will inherit.
+    fd = os.dup(fd)
+    try:
+        if _r4_alias(fd, protected):
+            return _r4_refusal(protected)
+        return _start_r4_writer(fd, text)
+    finally:
+        os.close(fd)
+
+
+def _run_r4_diagnostic(*args):
+    result = Future()
+    deadline = time.monotonic() + 0.5
+    threading.Thread(target=_r4_diagnostic, daemon=True, args=(*args, result)).start()
+    try:
+        writer = result.result(timeout=max(0, deadline - time.monotonic()))
+    except BaseException:
+        if result.cancel():
+            return
+        writer = result.result()  # The worker has claimed the handoff and is publishing it.
+    if writer is not None:
+        with writer:
+            try:
+                if time.monotonic() < deadline:
+                    writer.stdin.write(b"1")  # One byte fits in the empty control pipe.
+                    writer.wait(timeout=max(0, deadline - time.monotonic()))
+            finally:
+                if writer.poll() is None:
+                    writer.kill()
+
+
+def _r4_diagnostic(path, windows, pooled, classes, manifest, limits, protected, stdout, stderr,
+                   stdout_flushed, result):
+    fd, writer = None, None
+    try:
+        if stdout is stderr:
+            return
+        if not stdout_flushed:
+            stdout.flush()  # An embedded stream may block; keep it inside the deadline.
+        if result.cancelled():
+            return
+        if not isinstance(stderr, io.StringIO):
+            fd = stderr.fileno()
+            mode = os.fstat(fd).st_mode
+            if stat.S_ISREG(mode) or stat.S_ISFIFO(mode):
+                with contextlib.suppress(AttributeError, OSError, ValueError):
+                    identity = _r4_identity(stdout.fileno())
+                    if identity is not None:
+                        protected.add(identity)
+            if _r4_alias(fd, protected):
+                writer = _r4_refusal(protected)
+                return
+        try:
+            with _open_r4_original(path) as source:
+                try:
+                    protected.add(_r4_identity(source.fileno()))
+                except OSError:
+                    protected.add(None)
+                if fd is not None and _r4_alias(fd, protected):
+                    if not result.cancelled():
+                        writer = _r4_refusal(protected)
+                    return
+                if not classes or manifest is None:
+                    raise GateError("requires --classes and --manifest for content and prompt-band checks")
+                lines = r4_assessment(source, windows, pooled, manifest, limits)
+            text = "".join(f"R4 DIAGNOSTIC ONLY: {line}\n" for line in lines)
+            if len(text) > R4_MAX_OUTPUT_BYTES:  # Assessment lines are ASCII.
+                raise GateError(f"diagnostic output exceeds size limit ({R4_MAX_OUTPUT_BYTES} bytes)")
+            if not result.cancelled():
+                writer = _write_r4_diagnostic(fd, stderr, text, protected)
+        except BaseException as e:
+            if not result.cancelled():
+                if fd is not None and isinstance(e, OSError) and not isinstance(e, FileNotFoundError):
+                    protected.add(None)
+                if fd is not None and _r4_alias(fd, protected):
+                    writer = _r4_refusal(protected)
+                else:
+                    text = f"diagnostic unavailable: {type(e).__name__} {_r4_label(str(e)[:256])}\n"
+                    writer = _write_r4_diagnostic(fd, stderr, text, protected)
+    except BaseException:
+        pass
+    finally:
+        if result.set_running_or_notify_cancel():
+            result.set_result(writer)
+        elif writer is not None:
+            with writer:
+                writer.kill()
 
 
 def main(argv=None):
@@ -630,6 +928,8 @@ def main(argv=None):
     q.add_argument("--trace-diag", action="append", help="engine log with per-layer trace diag lines (no route tap)")
     q.add_argument("--classes", help="JSON {case: content class} declared before scoring (default: prompt-length band "
                    "with --manifest, else one class)")
+    q.add_argument("--r4-assess", metavar="ORIGINAL_NLLS", help="diagnostic only on stderr: JSON {content class: "
+                   "[original reference NLLs]} (requires --classes and --manifest)")
     q.add_argument("--json")
     q.add_argument("--tier", default="fast", choices=sorted(TIERS), help="acceptance limits: fast (default, "
                    "the FAST gate v2 bars) or turbo (TURBO_LIMITS, looser; explicit opt-in levers only)")

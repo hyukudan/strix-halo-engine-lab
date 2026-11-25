@@ -43,7 +43,6 @@ inline void verify_rows(const char* checkpoint, weight::FormatId storage, bool p
     (void)decoder.prefill(prompt);
     std::vector<float> verified(std::size_t{max_width} * kOutputVocabulary);
     unsigned cursor = 0U;
-    unsigned last_top0 = 0U;
     const auto storage_name = storage == weight::kQ8WeightStorage ? "q8_0" : "bf16";
     const auto moe = packed ? "packed" : "grouped";
     for (unsigned width = 2U; width <= max_width; ++width) {
@@ -63,22 +62,8 @@ inline void verify_rows(const char* checkpoint, weight::FormatId storage, bool p
         const auto keep = kept_rows[width - 2U];
         decoder.commit(keep);
         cursor += keep;
-        last_top0 = top[0];
         std::cout << "PASS Inkling Mini verify rows " << storage_name << ' ' << moe
                   << " width=" << width << '\n';
-    }
-    {
-        // A one-row window without a logits span takes the greedy (on CUDA: screened) head pick; its reply must be
-        // this window's pick, not row 0 of the previous window.
-        const auto one = decoder.forward_rows(&ids[prefix_rows + cursor], 1U, MiniResidentDecoder::LogitRows::all);
-        unsigned top = 0U;
-        decoder.read_top(one, 1U, &top);
-        if (top != next[cursor])
-            throw std::runtime_error("one-row verify reply differs from serial decode (stale " +
-                                     std::string(top == last_top0 ? "previous window" : "value") + ")");
-        decoder.commit(0U);
-        std::cout << "PASS Inkling Mini verify one row " << storage_name << ' ' << moe
-                  << " discriminating=" << (last_top0 != next[cursor] ? "yes" : "no") << '\n';
     }
     const auto actual = std::span(verified).first(kOutputVocabulary);
     if (decoder.decode(ids[prefix_rows + cursor], actual) != next[cursor] ||

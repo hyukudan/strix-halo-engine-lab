@@ -4,6 +4,7 @@
 #include "strix/ds41_exact_flags.hpp"
 
 #include "strix/ds41_moe.hpp"
+#include "strix/ds41_dense_geometry.hpp"
 #include "ops/glu/glu_device.hpp"  // shared SwiGLU op (enqueue_swiglu_f32 binds Round::none)
 
 #include <hip/hip_runtime.h>
@@ -66,15 +67,7 @@ void enqueue_swiglu_f32(const float* gate, const float* up, std::uint32_t rows, 
 // w1/w3/w2 and their 1152 TP slices, head rank slices) is one class R1..R8 (R-class run). Shapes not listed take
 // every count 1..8.
 std::uint32_t trellis_submit_sizes(std::uint32_t columns, std::uint32_t rows, std::uint32_t bits) noexcept {
-    const auto set = [](std::initializer_list<std::uint32_t> counts) {
-        std::uint32_t m = 0;
-        for (const auto c : counts) m |= 1U << (c - 1U);
-        return m;
-    };
-    if (bits == 5U && columns == 4096U && rows == 1024U) return set({1, 4, 8});  // wo_a group: split 16 at R 1, 4, 8 (32 else)
-    if (bits == 5U && columns == 5120U && rows == 2304U) return set({2, 3, 4, 5, 6, 7});  // shared w1 / w3: R1 | R2..R7 | R8
-    if (bits == 5U && columns == 2304U && rows == 5120U) return set({2, 3, 4, 5, 6, 7, 8});  // shared w2: R1 | R2..R8
-    return 0xffU;
+    return core::dense_sites::trellis_submit_sizes(dense_geometry::kGeometry, columns, rows, bits);
 }
 bool trellis_headout_enabled() noexcept {
     static const bool on = [] {
@@ -359,14 +352,12 @@ void* TrellisContext::library_context() const noexcept { return impl_->context; 
 
 namespace {
 [[maybe_unused]] bool tp_shape(const TrellisSite& s) {
-    if (s.bits != 4U && s.bits != 5U) return false;
-    return (s.columns == 1280U && s.rows == 16384U) || (s.columns == 4096U && s.rows == 5120U) ||
-           (s.columns == 5120U && (s.rows == 1152U || s.rows == 1280U || s.rows == 512U)) ||
-           (s.columns == 1152U && s.rows == 5120U)
 #if defined(STRIX_DS41_TRELLIS_DENSE_R1)
-           || (s.columns == 5120U && (s.rows == 64640U || s.rows == 129280U))
+    constexpr bool head_rows = true;
+#else
+    constexpr bool head_rows = false;
 #endif
-           ;
+    return core::dense_sites::tp_shape(dense_geometry::kGeometry, s.columns, s.rows, s.bits, head_rows);
 }
 }
 
@@ -410,7 +401,7 @@ void TrellisContext::submit(const TrellisSite& site, const float* x, std::size_t
 #elif defined(STRIX_DS41_TRELLIS_SPLITK)
         // Frozen per-shape selection: q_b K5 R8 retains the linear plan.
         // shared_down retains the qualified 0.3 kernel (zero workspace query).
-        tp = tp && !(site.columns == 1280U && site.rows == 16384U && site.bits == 5U && rows == 8U);
+        tp = tp && !(core::dense_sites::q_b_rank_rows(dense_geometry::kGeometry, site.columns, site.rows) && site.bits == 5U && rows == 8U);
         if (tp) {
             std::uint64_t required = 0;
             lib_check(strix_tp_dense_workspace_bytes(impl_->context, &d, 0, &required), "split-K plan workspace " + site.key);
@@ -546,7 +537,7 @@ void TrellisContext::reserve(void* stream, std::uint32_t max_rows) {
                 (void)impl_->split_workspace(s, r, hs, bytes);
             }
 #elif defined(STRIX_DS41_TRELLIS_SPLITK)
-            if (tp_shape(s) && !(s.columns == 1280U && s.rows == 16384U && s.bits == 5U && r == 8U)) {
+            if (tp_shape(s) && !(core::dense_sites::q_b_rank_rows(dense_geometry::kGeometry, s.columns, s.rows) && s.bits == 5U && r == 8U)) {
                 lib_check(strix_tp_dense_workspace_bytes(impl_->context, &d, 0, &bytes), "split-K workspace " + s.key);
                 if (bytes != 0U) (void)impl_->split_workspace(s, r, hs, bytes);
             }
@@ -567,11 +558,11 @@ void TrellisContext::reserve(void* stream, std::uint32_t max_rows) {
         for (std::uint32_t r = 1; r <= 8U; ++r) {
             strix_tp_dense_pair_desc d{};
             strix_tp_dense_pair_desc_init(&d);
-            set_tensor(d.input, reinterpret_cast<void*>(std::uintptr_t{1} << 40U), r, 5120U);
+            set_tensor(d.input, reinterpret_cast<void*>(std::uintptr_t{1} << 40U), r, dense_geometry::kGeometry.hidden);
             d.member[0].weights = static_cast<strix_weights>(qa.weights);
             d.member[1].weights = static_cast<strix_weights>(ki->weights);
-            set_tensor(d.member[0].output, reinterpret_cast<void*>(std::uintptr_t{1} << 41U), r, 1280U);
-            set_tensor(d.member[1].output, reinterpret_cast<void*>(std::uintptr_t{1} << 42U), r, 512U);
+            set_tensor(d.member[0].output, reinterpret_cast<void*>(std::uintptr_t{1} << 41U), r, dense_geometry::kGeometry.q_lora);
+            set_tensor(d.member[1].output, reinterpret_cast<void*>(std::uintptr_t{1} << 42U), r, dense_geometry::kGeometry.kv_rows);
             std::uint64_t bytes = 0;
 #if defined(STRIX_DS41_TRELLIS_DENSE_R1)
             lib_check(strix_tp_dense_pair_r1_workspace_bytes(impl_->context, &d, STRIX_DENSE_R1_LEGACY, &bytes), "pair workspace reserve");
@@ -765,14 +756,13 @@ std::uint64_t TrellisContext::staging_bytes_for(std::uint32_t max_columns, std::
 
 void enqueue_trellis_qakv(const TrellisSite& qa, const TrellisSite& kv, const float* x, float* q, float* k,
                           std::uint32_t rows, void* stream) {
-    if (qa.context == nullptr || qa.context != kv.context || qa.columns != 5120U || kv.columns != 5120U ||
-        qa.rows != 1280U || kv.rows != 512U)
+    if (qa.context == nullptr || qa.context != kv.context || !core::dense_sites::qa_kv_pair(dense_geometry::kGeometry, qa.columns, kv.columns, qa.rows, kv.rows))
         throw std::invalid_argument("ds41 trellis: invalid q_a+kv pair");
     for (std::uint32_t first = 0; first < rows; first += 8U) {
         const auto n = std::min(8U, rows - first);
-        const float* in = x + std::size_t{first} * 5120U;
-        float* qo = q + std::size_t{first} * 1280U;
-        float* ko = k + std::size_t{first} * 512U;
+        const float* in = x + std::size_t{first} * dense_geometry::kGeometry.hidden;
+        float* qo = q + std::size_t{first} * dense_geometry::kGeometry.q_lora;
+        float* ko = k + std::size_t{first} * dense_geometry::kGeometry.kv_rows;
 #if defined(STRIX_DS41_TRELLIS_SPLITK)
         auto& impl = qa.context->impl();
         const TrellisContext::Impl::PairKey key{reinterpret_cast<std::uintptr_t>(qa.weights),
@@ -793,11 +783,11 @@ void enqueue_trellis_qakv(const TrellisSite& qa, const TrellisSite& kv, const fl
             const auto created = std::chrono::steady_clock::now();
             strix_tp_dense_pair_desc d{};
             strix_tp_dense_pair_desc_init(&d);
-            set_tensor(d.input, const_cast<float*>(in), n, 5120U);
+            set_tensor(d.input, const_cast<float*>(in), n, dense_geometry::kGeometry.hidden);
             d.member[0].weights = static_cast<strix_weights>(qa.weights);
             d.member[1].weights = static_cast<strix_weights>(kv.weights);
-            set_tensor(d.member[0].output, qo, n, 1280U);
-            set_tensor(d.member[1].output, ko, n, 512U);
+            set_tensor(d.member[0].output, qo, n, dense_geometry::kGeometry.q_lora);
+            set_tensor(d.member[1].output, ko, n, dense_geometry::kGeometry.kv_rows);
             std::uint64_t bytes = 0;
 #if defined(STRIX_DS41_TRELLIS_DENSE_R1)
             lib_check(strix_tp_dense_pair_r1_workspace_bytes(impl.context, &d, STRIX_DENSE_R1_LEGACY, &bytes), "pair workspace");
@@ -833,8 +823,8 @@ void enqueue_trellis_qakv(const TrellisSite& qa, const TrellisSite& kv, const fl
         lib_check(strix_tp_dense_pair_plan_submit(it->second), "q_a+kv submit");
 #endif
 #else
-        enqueue_trellis_linear(qa, in, qo, n, 5120U, 1280U, false, stream);
-        enqueue_trellis_linear(kv, in, ko, n, 5120U, 512U, false, stream);
+        enqueue_trellis_linear(qa, in, qo, n, dense_geometry::kGeometry.hidden, dense_geometry::kGeometry.q_lora, false, stream);
+        enqueue_trellis_linear(kv, in, ko, n, dense_geometry::kGeometry.hidden, dense_geometry::kGeometry.kv_rows, false, stream);
 #endif
     }
 }
@@ -842,7 +832,7 @@ void enqueue_trellis_qakv(const TrellisSite& qa, const TrellisSite& kv, const fl
 void enqueue_trellis_shared_swiglu(const TrellisSite* const halves[4], const float* x, float* act, std::uint32_t rows,
                                    float limit, void* stream) {
 #if defined(STRIX_DS41_TRELLIS_LIB) && defined(STRIX_DS41_TRELLIS_DENSE_R1) && defined(STRIX_TP_SWIGLU_CLAMPED_DECLARED)
-    constexpr std::uint32_t H = 5120U, HALF = 1152U, I = 2U * HALF;
+    constexpr std::uint32_t H = dense_geometry::kGeometry.hidden, HALF = core::dense_sites::ffn_half(dense_geometry::kGeometry), I = 2U * HALF;
     for (int k = 0; k < 4; ++k)
         if (halves[k] == nullptr || halves[k]->context == nullptr || halves[k]->context != halves[0]->context ||
             halves[k]->columns != H || halves[k]->rows != HALF || halves[k]->bits != halves[0]->bits)
@@ -924,7 +914,7 @@ void enqueue_trellis_shared_swiglu(const TrellisSite* const halves[4], const flo
 #endif
 namespace {
 #if defined(STRIX_DS41_SHARED_DOWN_ROUTE)
-constexpr std::uint32_t shared_down_input = 2304U, shared_down_output = 5120U, shared_down_bits = 4U;
+constexpr std::uint32_t shared_down_input = dense_geometry::kGeometry.intermediate, shared_down_output = dense_geometry::kGeometry.hidden, shared_down_bits = 4U;
 #endif
 // read once: -1 unset/empty (implicit default), 1 explicit on, 0 any other value (off)
 int shared_down_env() noexcept {

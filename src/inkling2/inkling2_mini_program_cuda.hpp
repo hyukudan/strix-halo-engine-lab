@@ -1,7 +1,6 @@
 #pragma once
 
 #include "exec/cuda_decode_epilogue.hpp"
-#include "core/screened_head_plan.hpp"
 #include "exec/cuda_decode_lowering.hpp"
 #include "inkling2_mini_attention_prepare_device.hpp"
 #include "inkling2_mini_expert_layout.hpp"
@@ -11,11 +10,8 @@
 #include "strix/serve/serial_generation_cli.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cstring>
 #include <memory>
-#include <optional>
-#include <utility>
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 #include "inkling2_mini_resident_decoder.hpp"
@@ -61,11 +57,6 @@ struct MiniCudaStepRows {
     head_argmax::Pick* partials;
     std::uint32_t* picked;
     std::uint32_t* reply;
-    // EXACT screened greedy head (one lane; x is bound to the final hidden row): replaces the projection, the softcap pass
-    // and the two greedy leaves with the five screened stages, same picked word. screen_stats (optional, pinned) receives
-    // the pick's State for diagnostics.
-    const core::screened_head_plan::Launch* screen = nullptr;
-    core::screened_head_plan::State* screen_stats = nullptr;
 };
 
 struct MiniCudaStepMode {
@@ -129,22 +120,6 @@ public:
         using namespace exec::cuda_decode;
         recipe_.visit(-1);
         recipe_.stage("head");
-        if (rows.screen) {
-            auto launch = *rows.screen;
-            launch.x = hidden.data();
-            launch.lanes = 1U;
-            launch.x_stride = kHiddenWidth;
-            add_leaf(ScreenedHeadPrep{launch});
-            add_leaf(ScreenedHeadPass1{launch});
-            add_leaf(ScreenedHeadCompact{launch});
-            add_leaf(ScreenedHeadPass2{launch});
-            add_leaf(ScreenedHeadPick{launch, rows.picked});
-            if (rows.screen_stats)
-                recipe_.copy(exec::CudaNodeKind::copy_d2h_pinned,
-                             {rows.screen_stats, launch.scratch, sizeof(*rows.screen_stats)});
-            recipe_.copy(exec::CudaNodeKind::copy_d2h_pinned, {rows.reply, rows.picked, sizeof(*rows.reply)});
-            return;
-        }
         const std::array projection{core::Bf16RowProjection{weights_.bf16("unembed.weight").data(),
                                                           kOutputVocabulary, rows.logits.data()}};
         const Bf16Softcap tail{rows.logits.data(), rows.logits.size(), kLogitSoftcap};
@@ -316,7 +291,11 @@ public:
                 recipe_.host_action(bind_(RouteTapExchange{mode_.tap, layer, 1U, kExpertsPerToken, kExperts,
                                                            storage_.route_ids, storage_.route_weights}));
         };
-        const auto format = mini_expert_format(layer);
+        // The loaded image says the layer's format (narrow expert image); weights without one keep the checkpoint's.
+        const auto format = [&] {
+            if constexpr (requires { weights_.expert_format(layer); }) return weights_.expert_format(layer);
+            else return mini_expert_format(layer);
+        }();
         if (mode_.key.grouped) {
             const auto [plan, scratch, status] = mode_.grouped.bind(kExperts, kExpertsPerToken,
                 mini_grouped::CudaBackend::rows_per_tile, matrices, storage_.route_ids, storage_.route_weights,
@@ -554,10 +533,11 @@ inline constexpr exec::cuda_decode::R1Forms kMiniLatencyForms = mini_latency_for
 inline constexpr unsigned kMiniDefaultForms = kMiniFormsMix;
 
 // moe_w4a4: resolved operand class of the W4A4 expert lever (mini_moe_w4a4_class; bf16 = off), applied to the resident
-// prefill before the program binds.
+// prefill before the program binds. attn_projected_bias: the resolved projected-bias attention lever.
 template <bool EpilogueFusion, unsigned LatencyForms = kMiniDefaultForms>
 std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad&,
-                                                                       moe_core::grouped_w4a4::Activations moe_w4a4);
+                                                                       moe_core::grouped_w4a4::Activations moe_w4a4,
+                                                                       bool controller_one_plane, bool attn_projected_bias);
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 struct MiniCudaProgramDecoder::Impl {
@@ -582,16 +562,9 @@ struct MiniCudaProgramDecoder::Impl {
             staged_logits.reset(static_cast<float*>(address));
         }
         auto& greedy = decoder.step_program_greedy();
-        // A greedy step without host logits runs the screened head (its own program, graph_id 1); a step that returns
-        // the logits row keeps the full head program (graph_id 0, the incumbent key).
-        auto& screen = decoder.step_program_screen();
-        const bool screened = screen.get() != nullptr && host_logits.empty();
-        std::optional<core::screened_head_plan::Launch> launch;
-        if (screened) launch = screen.get()->launch(nullptr);
         const MiniCudaStepRows rows{decoder.step_program_embeddings(), decoder.step_program_hidden(),
             decoder.step_program_logits(), greedy.step_program_partials(), greedy.step_program_device_token(),
-            greedy.step_program_reply(), launch ? &*launch : nullptr, screened ? screen.stats_reply() : nullptr};
-        auto& cached = programs[screened ? 1U : 0U];
+            greedy.step_program_reply()};
         const auto raw = backend.step_program_buffers();
         const MiniCudaStepStorage storage{raw.max_rows, raw.controller, raw.attention, raw.lag_weights,
             raw.matrices, raw.route_ids, raw.route_logits, raw.route_weights, raw.expert_activation, raw.flags};
@@ -601,8 +574,7 @@ struct MiniCudaProgramDecoder::Impl {
             +[](void* to, const void* from, std::size_t bytes, void* stream) {
                 mini_gpu::copy(to, from, bytes, mini_gpu::device_to_device, static_cast<cudaStream_t>(stream));
             }, epilogue_fusion, backend.step_projection_profile(), exec::cuda_decode::bind_projection_batch};
-        auto key = mode.key.program;
-        key.graph_id = screened ? std::uint8_t{1} : std::uint8_t{0};
+        const auto key = mode.key.program;
         const auto bind = [](const auto& args) {
             using namespace exec::cuda_decode;
             using Args = std::remove_cvref_t<decltype(args)>;
@@ -635,8 +607,7 @@ struct MiniCudaProgramDecoder::Impl {
                 if (stats.captures != 1U || stats.instantiations != 1U ||
                     stats.nodes != plan.program.launches.size() || stats.kernels != plan.program.predicted.launches)
                     throw std::runtime_error("Inkling step program capture did not install the compiled plan");
-                std::cerr << "inkling2 step graph route=program head=" << (screened ? "screened" : "full")
-                          << " captures=1 nodes=" << stats.nodes
+                std::cerr << "inkling2 step graph route=program captures=1 nodes=" << stats.nodes
                           << " launches=" << stats.kernels
                           << " epilogue_fusion=" << (epilogue_fusion ? "on" : "off")
                           << " latency_forms=" << (forms == exec::cuda_decode::R1Forms{} ? "off" : "")
@@ -668,7 +639,6 @@ struct MiniCudaProgramDecoder::Impl {
                     lowering.submit_eager(step);
                 },
                 [&] {
-                    if (screened) screen.record();
                     picked = greedy.token();
                     if (picked >= kOutputVocabulary) throw std::runtime_error("Inkling 2 Mini: non-finite output logits");
                 },
@@ -699,9 +669,7 @@ struct MiniCudaProgramDecoder::Impl {
     moe::RouteTap* gate_tap{};
     bool reported_tap = false;
     std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits;
-    // One compiled program per head of the untapped route, keyed by the recipe: [0] the full head (logits row,
-    // graph_id 0, the incumbent key) and [1] the screened head (graph_id 1).
-    std::array<std::optional<std::pair<exec::cuda_decode::DecodeRecipeKey, exec::CudaRecipeProgram>>, 2> programs;
+    std::optional<std::pair<exec::cuda_decode::DecodeRecipeKey, exec::CudaRecipeProgram>> cached;
     exec::CudaExecutor executor{true, true, exec::CudaDescriptorLayout::x3};
 };
 
@@ -727,15 +695,19 @@ inline void MiniCudaProgramDecoder::prefill_gate_rows(std::span<const unsigned> 
 
 template <bool EpilogueFusion, unsigned LatencyForms>
 inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad& load,
-                                                                              moe_core::grouped_w4a4::Activations moe_w4a4) {
+                                                                              moe_core::grouped_w4a4::Activations moe_w4a4,
+                                                                              bool controller_one_plane,
+                                                                              bool attn_projected_bias) {
     using Activations = moe_core::grouped_w4a4::Activations;
     struct Decoder final : serve::SerialGenerationDecoder {
-        Decoder(const serve::SerialGenerationLoad& input, Activations w4a4)
-            : resident(input.checkpoint, input.positions, input.prefill_chunk, input.packed_decode, false),
-              program(with_w4a4(resident, w4a4), EpilogueFusion, mini_latency_forms(LatencyForms)) {}
-        // Same order as the gate path: the lever (and its NVFP4 activation image) is set before the program binds.
-        static MiniResidentDecoder& with_w4a4(MiniResidentDecoder& decoder, Activations w4a4) {
+        Decoder(const serve::SerialGenerationLoad& input, Activations w4a4, bool one_plane, bool projected_bias)
+            : resident(input.checkpoint, input.positions, input.prefill_chunk, input.packed_decode, false,
+                       weight::kBf16WeightStorage, 0U, false, 1U, 0U, false, one_plane),
+              program(with_levers(resident, w4a4, projected_bias), EpilogueFusion, mini_latency_forms(LatencyForms)) {}
+        // Same order as the gate path: the levers (and the NVFP4 activation image) are set before the program binds.
+        static MiniResidentDecoder& with_levers(MiniResidentDecoder& decoder, Activations w4a4, bool projected_bias) {
             decoder.set_moe_w4a4(w4a4);
+            decoder.set_attention_projected_bias(projected_bias);
             return decoder;
         }
         unsigned prefill(std::span<const unsigned> ids, std::span<float> logits) override {
@@ -745,7 +717,7 @@ inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(co
         MiniResidentDecoder resident;
         MiniCudaProgramDecoder program;
     };
-    return std::make_unique<Decoder>(load, moe_w4a4);
+    return std::make_unique<Decoder>(load, moe_w4a4, controller_one_plane, attn_projected_bias);
 }
 #endif
 

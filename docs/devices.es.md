@@ -34,6 +34,17 @@ memory_gib = 64               # RAM del host que las rutas pueden planificar (op
 Cualquier valor del perfil se puede sustituir en la entrada: `memory_gib = 30` (un presupuesto menor),
 `bandwidth_gbytes_ps`, `units`. `profile = "custom"` toma todos los valores de la entrada (`memory_gib` obligatorio).
 
+El núcleo residente HIP ofrece la aritmética FP16 con escala por grupo como selección explícita. El barrido FP32
+es la opción predeterminada. La declaración solo selecciona el esquema de ejecución para la forma FP16.
+
+Una entrada GPU puede declarar también los puntos de cambio de las rutas residentes de proyección de bajo bit
+(q4_g64 / q6_g64) medidos en ese dispositivo: `lowbit_rows = { small_rows = 64, wide_panels = 64 }` (los valores
+medidos en un Strix Halo, gfx1151 con 40 CU, con el fixture sin modelo `strix-hip-dense-lowbit-bench`). Los
+lanzamientos de como mucho `small_rows` filas usan entonces el esquema small-M, y los lanzamientos small-M de al menos
+`wide_panels` paneles de 64 columnas procesan de 17 a 32 filas como un solo bloque de 32 filas. Todas las rutas
+calculan los mismos bits, así que la clave solo cambia la velocidad. Sin ella, todos los lanzamientos usan una sola
+ruta.
+
 Un **clúster de tarjetas iguales** es una entrada sin identidad:
 
 ```toml
@@ -88,6 +99,42 @@ declarado. La memoria de las tarjetas NVIDIA es el total que informa el runtime.
 La RTX 5090 tiene la generación de SM y la velocidad de memoria de la RTX PRO 6000 con 170 de sus 188 SM: las fases
 limitadas por cómputo van un 10 % más lentas que en la PRO a igual memoria; la decodificación limitada por memoria, a
 igual residencia, queda cerca.
+
+## Datos de plan medidos
+
+Un plan medido en un dispositivo entra por la declaración, nunca por el binario. Sin entrada, el lanzador mantiene su
+plan incumbente. Los bits son los mismos en los dos casos; solo cambia el orden. El lanzamiento R1 por filas
+(`moe_core/microscaled_r1.hpp`) lee una tabla por carga medida. Todas las claves son obligatorias, así que una entrada
+nunca cubre una carga que no se midió:
+
+```toml
+[r1_rows_tiles.gfx1151-inkling-bank]
+arch = "gfx1151"                          # como lo informa el runtime, sin sufijo de features
+multiprocessors = 20                      # como lo informa el runtime (HIP cuenta WGP: 20, no 40)
+experts = 128
+hidden = 2304
+intermediate = 1152
+top_k = 8
+formats = ["nvfp4", "mxfp8"]
+cache_mib = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] # presupuesto por número de filas de 0 a 16; 0 conserva el orden anterior
+```
+
+Este ejemplo conserva el orden anterior. Fija un presupuesto mayor que cero solo tras verificar la medición para
+el dispositivo y la carga correspondientes. Para revertir, quita la tabla.
+
+Un lanzamiento de filas R1 puede abarcar hasta 16 filas enrutadas. Los lotes siguen usando trozos de hasta
+8 filas por defecto. Quien llama puede habilitar trozos mayores indicando cuántas filas caben en el espacio
+temporal de activación. El fixture sin modelo (`tests/moe_core/microscaled_r1_hip.hip`) mide las filas 4 y 8 con rutas uniformes,
+sesgadas y con colisiones. Para las filas de 9 a 16 compara un lanzamiento con los trozos por defecto y
+con un lanzamiento sin tesela, con rutas uniformes en todo el rango y también con rutas sesgadas y con
+colisiones en las filas 12 y 16.
+
+Dos tablas que cubren el mismo dispositivo, el mismo banco y algún formato común hacen que se rechace la declaración,
+así que el orden de las entradas nunca decide un presupuesto. Las tablas pertenecen al dispositivo que enlaza un
+arranque: se publican para ese dispositivo del runtime solo cuando el backend ya lo tiene, así que un arranque rechazado
+no publica nada y un arranque en otro dispositivo no las cambia. Un arranque posterior en el mismo dispositivo publica
+las tablas de su propia declaración; uno sin declaración las borra y el siguiente lanzamiento de ese dispositivo toma
+el orden incumbente.
 
 ## Planificar sin GPU
 

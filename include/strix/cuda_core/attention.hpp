@@ -108,6 +108,41 @@ struct PreparedBf16Flash {
     bool bidirectional = false;  // Entire block plus window preceding pos0; no bias or sinks.
 };
 
+// Projected relative bias of the prepared prompt flash (the shared attn_core::RelativeBiasProjection chain, width
+// kPreparedProjectedBiasWidth): the flash computes logit(row, head, d) itself from the features [query row][query
+// head][16] FP32 and the BF16 weights [16][extent] (extent = PreparedBf16Flash::relative_extent) with the chain and
+// rounding of the image's producer (core::row_transforms::ShortBf16Projection<16>, ascending), so the scores carry the
+// bits of the image route and PreparedBf16Flash::relative_bias is not read.
+// Live operands: features and weights are read by the launch itself, so they must stay valid and unmodified until the
+// stream work that carries it has completed. They must be disjoint from the output image and from the whole K and V
+// cache ranges (the append writes the cache before the flash reads the features, and CTAs write output rows while
+// others read the features); can_launch_prepared_bf16_projected and the launches refuse any byte overlap, host-side,
+// before any enqueue. Features and weights may share memory with each other and with q.
+// Failure word: the optional `failure` of the projected launches is one 4-byte-aligned unsigned that the flash (and the
+// append's finite check) raise atomically, so it must stay valid until the stream work that carries it has completed. It
+// must share no byte with any operand the launch or the append reads or writes: features, weights, q, sinks, the output
+// image, the whole K and V caches and (append) the K and V rows; prepare_prepared_bf16_projected and the launches refuse
+// any overlap or misalignment, host-side, before any enqueue.
+struct PreparedBf16Projection {
+    const float* features = nullptr;
+    const std::uint16_t* weights = nullptr;
+};
+inline constexpr std::uint32_t kPreparedProjectedBiasWidth = 16;
+inline constexpr std::uint32_t kPreparedProjectedBiasMaxExtent = 1024;  // [d][16] BF16 weights: 32 KB of smem
+
+// Schedule trait of the one-row prepared step with a device position (scheduling only, SAME bits): the relative bias of
+// the next 32-key tile is loaded while the current tile computes, instead of after its scores. Admitted by the launch shape: a sliding window of at least kPreparedFlashBiasAheadMinWindow keys that lies inside the bias extent, so
+// every visible key reads a bias value and a full window walks 8+ key tiles. Elsewhere (full causal prefix, a short
+// window, a window wider than the extent, no bias table) the incumbent instance runs unchanged.
+inline constexpr std::uint32_t kPreparedFlashBiasAheadMinWindow = 256;
+[[nodiscard]] inline bool prepared_flash_bias_ahead(const PreparedBf16Flash& p) {
+    return p.relative_bias != nullptr && !p.bidirectional && p.window >= kPreparedFlashBiasAheadMinWindow &&
+           p.window <= p.relative_extent;
+}
+
+// The shared launcher defaults to the incumbent. STRIX_CUDA_FLASH_BIAS_AHEAD=1 opts in on eligible shapes.
+[[nodiscard]] bool use_prepared_flash_bias_ahead(const PreparedBf16Flash& p);
+
 // Cache append for the prepared slot-major layout. K/V inputs are contiguous
 // [row][kv_head][dim] FP32 and cache values are rounded to BF16 nearest-even.
 // In wrapped mode, the caller reserves the live window tail as well as these rows.
@@ -185,6 +220,122 @@ cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const Prepare
                                            std::uint32_t rows, float* out, cudaStream_t stream,
                                            FlashPipe pipe = FlashPipe::pad2, unsigned* failure = nullptr,
                                            const std::uint32_t* device_position = nullptr);
+
+// The same append + attend with the relative bias projected inside the prompt flash (PreparedBf16Projection): no
+// [row][head][distance] image is read or checked, the output and the cache bytes are those of the image route on the
+// projected image, and `failure` is raised in the same cases (the flash reports a non-finite logit at any distance,
+// masked or not, as the image's finite check does).
+// prepared.relative_bias must be null and prepared.relative_extent in (0, kPreparedProjectedBiasMaxExtent], a multiple
+// of 8; features and weights 16-byte aligned. Prompt rows only: not bidirectional, no device position.
+[[nodiscard]] bool can_launch_prepared_bf16_projected(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                                      const PreparedBf16Projection& projection, const float* q,
+                                                      const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                                      std::uint32_t pos0, std::uint32_t rows, float* out,
+                                                      FlashPipe pipe);
+// The dynamic shared-memory ceiling of each flash specialization is set once per device (to the largest extent the
+// opt-in limit admits), so concurrent launches of different extents never change a kernel attribute.
+// prepare_prepared_bf16_projected does every fallible host step of a projected launch (admission, overlap, failure
+// word, device opt-in) without enqueuing anything. The returned value is opaque and owns the validated launch: the flash
+// specialization, its dynamic shared memory, and the dims, operands, extent and failure word that were admitted, so a
+// submission cannot name a different shape or a different failure word than the one checked.
+// launch_prepared_bf16_projected enqueues exactly that launch on a stream (current device), without repeating any setup,
+// so its errors are only those of the launch itself (cudaErrorInvalidValue for a value that was never prepared or whose
+// preparation was refused). append_attention_prepared_bf16 prepares before it writes the K/V cache and launches the
+// prepared value after the write, so a refused append leaves the cache untouched and an admitted one always attends.
+class PreparedProjectedLaunch {
+public:
+    [[nodiscard]] bool admitted() const { return smem_bytes_ > 0; }
+
+private:
+    friend cudaError_t prepare_prepared_bf16_projected(const AttentionDims&, const PreparedBf16Flash&,
+                                                       const PreparedBf16Projection&, const float*,
+                                                       const __nv_bfloat16*, const __nv_bfloat16*, std::uint32_t,
+                                                       std::uint32_t, float*, FlashPipe, unsigned*,
+                                                       PreparedProjectedLaunch&);
+    friend cudaError_t prepare_prepared_bf16_projected(const AttentionDims&, const PreparedBf16Flash&,
+                                                       const PreparedBf16Projection&, const float*,
+                                                       const __nv_bfloat16*, const __nv_bfloat16*, std::uint32_t,
+                                                       std::uint32_t, float*, FlashPipe, unsigned*,
+                                                       PreparedProjectedLaunch&, bool&);
+    friend cudaError_t launch_prepared_bf16_projected(const PreparedProjectedLaunch&, cudaStream_t);
+    FlashPipe pipe_ = FlashPipe::pad2;
+    int smem_bytes_ = 0;  // 0: not prepared
+    AttentionDims dims_{};
+    PreparedBf16Flash prepared_{};
+    PreparedBf16Projection projection_{};
+    const float* q_ = nullptr;
+    const __nv_bfloat16* k_cache_ = nullptr;
+    const __nv_bfloat16* v_cache_ = nullptr;
+    std::uint32_t pos0_ = 0, rows_ = 0;
+    float* out_ = nullptr;
+    unsigned* failure_ = nullptr;
+};
+[[nodiscard]] cudaError_t prepare_prepared_bf16_projected(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                                          const PreparedBf16Projection& projection, const float* q,
+                                                          const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                                          std::uint32_t pos0, std::uint32_t rows, float* out,
+                                                          FlashPipe pipe, unsigned* failure,
+                                                          PreparedProjectedLaunch& launch);
+// The same preparation with the refusal kept apart from runtime errors: cudaSuccess with `declined` true is a predictable
+// refusal (geometry, overlaps, failure word, an extent above the device opt-in), nothing enqueued; any other status is a
+// runtime error of the setup (`declined` false). The overload above reports a refusal as cudaErrorInvalidValue.
+[[nodiscard]] cudaError_t prepare_prepared_bf16_projected(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                                          const PreparedBf16Projection& projection, const float* q,
+                                                          const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                                          std::uint32_t pos0, std::uint32_t rows, float* out,
+                                                          FlashPipe pipe, unsigned* failure,
+                                                          PreparedProjectedLaunch& launch, bool& declined);
+cudaError_t launch_prepared_bf16_projected(const PreparedProjectedLaunch& launch, cudaStream_t stream);
+
+// A whole projected append (K/V store, then the projected flash, then the finite check), prepared once: the flash
+// preparation above, the K/V store admission and the disjointness of the K/V input rows from the failure word. The value
+// owns the admitted operands; submit_append_prepared_bf16 enqueues exactly that append and repeats no fallible setup, so a
+// caller may prepare, decide its route, enqueue its own producers of q / k / v, then submit.
+class PreparedProjectedAppend {
+public:
+    [[nodiscard]] bool admitted() const { return launch_.admitted(); }
+
+private:
+    friend cudaError_t prepare_append_prepared_bf16(const AttentionDims&, const PreparedBf16Flash&,
+                                                    const PreparedBf16Projection&, const float*, const float*,
+                                                    const float*, __nv_bfloat16*, __nv_bfloat16*, std::uint32_t,
+                                                    std::uint32_t, float*, FlashPipe, unsigned*,
+                                                    PreparedProjectedAppend&, bool&);
+    friend cudaError_t submit_append_prepared_bf16(const PreparedProjectedAppend&, cudaStream_t);
+    PreparedProjectedLaunch launch_;
+    AttentionDims dims_{};
+    const float* q_ = nullptr;
+    const float* k_ = nullptr;
+    const float* v_ = nullptr;
+    const float* sinks_ = nullptr;
+    __nv_bfloat16* k_cache_ = nullptr;
+    __nv_bfloat16* v_cache_ = nullptr;
+    std::uint32_t pos0_ = 0, rows_ = 0;
+    bool wrapped_ = false;
+    float* out_ = nullptr;
+    unsigned* failure_ = nullptr;
+};
+// cudaSuccess with `declined` true: a predictable refusal, nothing enqueued (the caller keeps another route); any other
+// status is a runtime error. append_attention_prepared_bf16 (projected) is prepare + submit, a refusal returned as
+// cudaErrorInvalidValue.
+[[nodiscard]] cudaError_t prepare_append_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                                       const PreparedBf16Projection& projection, const float* q,
+                                                       const float* k, const float* v, __nv_bfloat16* k_cache,
+                                                       __nv_bfloat16* v_cache, std::uint32_t pos0, std::uint32_t rows,
+                                                       float* out, FlashPipe pipe, unsigned* failure,
+                                                       PreparedProjectedAppend& append, bool& declined);
+cudaError_t submit_append_prepared_bf16(const PreparedProjectedAppend& append, cudaStream_t stream);
+cudaError_t attention_prefill_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                            const PreparedBf16Projection& projection, const float* q,
+                                            const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                            std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream,
+                                            FlashPipe pipe = FlashPipe::pad2, unsigned* failure = nullptr);
+cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                           const PreparedBf16Projection& projection,
+                                           const float* q, const float* k, const float* v,
+                                           __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, std::uint32_t pos0,
+                                           std::uint32_t rows, float* out, cudaStream_t stream,
+                                           FlashPipe pipe = FlashPipe::pad2, unsigned* failure = nullptr);
 
 // Decode lanes (strix/attn/prepared_lanes.hpp, the backend-neutral lane contract): lane l is packed
 // row l of these images, with its own cache and position. Row widths: queries/output heads x dim,

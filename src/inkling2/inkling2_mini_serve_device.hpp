@@ -21,35 +21,47 @@ inline device::Request mini_serve_device_request(const MiniServeOptions& opt) {
 inline MiniServeCohort make_mini_device_cohort(
     const MiniServeOptions& opt, const device::MemoryBudget& budget, std::string_view backend,
     unsigned row_limit = std::numeric_limits<unsigned>::max()) {
-    const auto rows = std::min(opt.slots ? opt.slots : opt.prefill_rows, row_limit);
-    const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, opt.weight_options);
-    const auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view());
-    auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
-        opt.packed_decode, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows);
-    decoder->set_moe_w4a4(opt.moe_w4a4);
+    const auto rows = std::min(mini_serve_lane_rows(opt), row_limit);
+    // The instance's extent for the weight rows: its configured context and its slot cap (0 = left to the memory
+    // budget: lane-banded gains do not select).
+    const weight::WeightLoadExtent extent{opt.context, opt.slots};
+    const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, opt.weight_options, extent);
+    const auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view(), extent);
+    // Without the served route lever: the incumbent served decoder (grouped decode, held-back 128-row chunks, no tail).
+    // With it (admitted on HIP only): the command line's decode form, chunk and tail capacity, packed cohort passes.
+    auto decoder = opt.served_cli_route
+        ? std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows, kMiniPackedDecodeDefault,
+              MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows, opt.prefill_tail,
+              opt.experts_nvfp4, opt.controller_one_plane, true)
+        : std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
+              false, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows, 0U, opt.experts_nvfp4,
+              opt.controller_one_plane);
+    const auto levers = configure_mini_decoder(*decoder, opt.moe_w4a4, opt.combine_image, opt.prepared_round_fold,
+                                               opt.attn_projected_bias);
+    const auto memory = mini_gpu::memory_info();
     const auto slot_bytes = decoder->slot_bytes();
-    auto& resident = *decoder;
-    std::uint32_t lanes = 0;
-    // Slots first (the incumbent full-head commitments), then the plane of an admitted screened-head variant.
-    auto cohort = mini_commit_slots_then_screen(resident, [] { return mini_gpu::memory_info(); }, budget.device_bytes,
-        opt.kv_bytes, slot_bytes, rows, opt.screened_head, lanes, [&](std::uint32_t admitted) {
-            return std::make_unique<serve::FixedKvCohort<MiniResidentDecoder>>(std::move(decoder), opt.context, rows,
-                                                                               admitted);
-        });
+    const auto lanes = serve::resident_kv_slots(memory.free, memory.total, budget.device_bytes, opt.kv_bytes,
+                                               slot_bytes, rows);
+    if (!lanes) throw std::runtime_error("Inkling KV budget holds no session slots");
 #if !defined(__HIPCC__)
-    const auto programs = resident.cohort_programs();
+    const auto programs = decoder->cohort_programs();
 #endif
+    auto cohort = std::make_unique<serve::FixedKvCohort<MiniResidentDecoder>>(std::move(decoder), opt.context, rows, lanes);
     std::cerr << "Inkling " << backend << " slots " << lanes << " context " << opt.context
               << " KV and history bytes per slot " << slot_bytes
               << " profile " << mini_profile_name(opt.tier)
               << " moe_prefill " << moe_core::grouped_w4a4::identity(opt.moe_w4a4)
-              << " moe_decode " << (opt.packed_decode ? "packed" : "grouped") << ' ' << opt.identity
+              << " served_route " << mini_served_route_startup_field(opt, cohort->prompt_tail_rows())
+              << " prepared_round_fold " << mini_round_fold_startup_field(opt, levers)
+              << " down_image " << mini_down_image_name(levers.down_image, opt.combine_image)
+              << " experts " << (opt.experts_nvfp4 ? "nvfp4" : "checkpoint")
               << " weight_storage " << weights.storage.name << '@' << weights.storage.revision
 #if !defined(__HIPCC__)
               << " cohort_programs " << (programs.enabled ? "on" : "off")
               << " widths " << exec::cohort_widths_name(programs.widths)
 #endif
-              << " weight_status " << profile::status_name(weights.status) << " (" << weights.reason << ")\n";
+              << " weight_status " << profile::status_name(weights.status) << " (" << weights.reason << ")\n"
+              << weight::weight_load_regime_receipt(weights) << '\n';
     return {std::move(cohort), weights};
 }
 

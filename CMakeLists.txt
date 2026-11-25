@@ -214,6 +214,18 @@ add_library(strix_spec STATIC src/spec/drafting.cpp src/spec/block_drafter.cpp s
 target_link_libraries(strix_spec PUBLIC strix_lookup strix_token_sampling)
 strix_target_warnings(strix_spec)
 
+# Host mathematical oracle and candidate adapter; production device paths stay unbound.
+add_library(strix_block_candidate STATIC src/core/block_draft_reference.cpp src/spec/block_candidate.cpp)
+target_link_libraries(strix_block_candidate PUBLIC strix_spec strix-weight)
+strix_target_warnings(strix_block_candidate)
+if(MSVC)
+    set_source_files_properties(src/weight/block_draft.cpp PROPERTIES COMPILE_OPTIONS "/W4;/WX")
+    target_compile_options(strix_block_candidate PRIVATE /fp:strict)
+else()
+    set_source_files_properties(src/weight/block_draft.cpp PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Wpedantic;-Wconversion;-Wshadow;-Werror")
+    target_compile_options(strix_block_candidate PRIVATE -ffp-contract=off)
+endif()
+
 if(STRIX_CUDA_DS41_ONLY)
 # Only what the deepseek41 family and the ds41 libraries link: GGUF reader, manifest, binding, content
 # hash and the family registry.
@@ -440,6 +452,17 @@ if(BUILD_TESTING)
     target_link_libraries(weight_resident_slices_tests PRIVATE strix-weight)
     strix_target_warnings(weight_resident_slices_tests)
     add_test(NAME weight-resident-slices COMMAND weight_resident_slices_tests)
+    add_executable(weight_lowbit_tests tests/weight_lowbit_tests.cpp)
+    target_link_libraries(weight_lowbit_tests PRIVATE strix-weight strix_device)
+    target_include_directories(weight_lowbit_tests PRIVATE src include)
+    strix_target_warnings(weight_lowbit_tests)
+    add_test(NAME weight-lowbit COMMAND weight_lowbit_tests)
+    add_executable(weight_microscaled_encode_test tests/weight/microscaled_encode_test.cpp)
+    target_link_libraries(weight_microscaled_encode_test PRIVATE strix-weight)
+    target_include_directories(weight_microscaled_encode_test PRIVATE include)
+    target_compile_features(weight_microscaled_encode_test PRIVATE cxx_std_20)
+    strix_target_warnings(weight_microscaled_encode_test)
+    add_test(NAME weight-microscaled-encode COMMAND weight_microscaled_encode_test)
     add_executable(weight_row_pitch_tests tests/weight_row_pitch_tests.cpp)
     target_link_libraries(weight_row_pitch_tests PRIVATE strix-weight)
     strix_target_warnings(weight_row_pitch_tests)
@@ -720,6 +743,16 @@ if(BUILD_TESTING)
     target_compile_features(strix-iu4a4-rot-host-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-iu4a4-rot-host-tests)
     add_test(NAME strix-iu4a4-rot-host-tests COMMAND strix-iu4a4-rot-host-tests)
+    add_executable(strix-iu4a4-projection-layout-tests tests/iu4a4_projection_layout_tests.cpp)
+    target_include_directories(strix-iu4a4-projection-layout-tests PRIVATE src)
+    target_compile_features(strix-iu4a4-projection-layout-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-iu4a4-projection-layout-tests)
+    add_test(NAME strix-iu4a4-projection-layout-tests COMMAND strix-iu4a4-projection-layout-tests)
+    add_executable(strix-grouped-iu4a4-host-tests tests/grouped_iu4a4_host_tests.cpp)
+    target_include_directories(strix-grouped-iu4a4-host-tests PRIVATE src include)
+    target_compile_features(strix-grouped-iu4a4-host-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-grouped-iu4a4-host-tests)
+    add_test(NAME strix-grouped-iu4a4-host-tests COMMAND strix-grouped-iu4a4-host-tests)
     add_executable(strix-dense-pair-map-host-tests tests/dense_pair_map_host_tests.cpp)
     target_include_directories(strix-dense-pair-map-host-tests PRIVATE src)
     target_compile_features(strix-dense-pair-map-host-tests PRIVATE cxx_std_20)
@@ -754,6 +787,19 @@ if(BUILD_TESTING)
     if(Python3_Interpreter_FOUND)
         add_test(NAME strix-hip-arch-target-host-tests COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip_arch_target_host_tests.py" --compiler "${CMAKE_CXX_COMPILER}")
+        set(controller_rms_host_inc "${CMAKE_CURRENT_BINARY_DIR}/controller_rms_launch_host.inc")
+        add_custom_command(OUTPUT "${controller_rms_host_inc}"
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/extract_controller_rms_launch.py"
+                "${controller_rms_host_inc}"
+            DEPENDS tests/core/extract_controller_rms_launch.py src/core/controller_rms_rows.hpp src/core/fma_bf16_rows.hpp
+            VERBATIM)
+        add_executable(strix-hip-controller-rms-launch-host-test tests/core/controller_rms_launch_host_test.cpp
+            "${controller_rms_host_inc}")
+        target_include_directories(strix-hip-controller-rms-launch-host-test PRIVATE
+            tests/stubs/hip_archguard include "${CMAKE_CURRENT_BINARY_DIR}")
+        target_compile_features(strix-hip-controller-rms-launch-host-test PRIVATE cxx_std_20)
+        strix_target_warnings(strix-hip-controller-rms-launch-host-test)
+        add_test(NAME strix-hip-controller-rms-launch-host-test COMMAND strix-hip-controller-rms-launch-host-test)
         add_subdirectory(tests/qwen_cuda_graph_host)
         add_test(NAME strix-hip-arch-caps-host-tests COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip_arch_caps_host_tests.py" --compiler "${CMAKE_CXX_COMPILER}")
@@ -1119,15 +1165,28 @@ if(BUILD_TESTING)
     set_tests_properties(strix-moe-decode-down-frame-test PROPERTIES LABELS "cpu;moe;exactness")
     add_executable(strix-microscaled-r1-rows-chunk-test tests/moe_core/microscaled_r1_rows_chunk_test.cpp)
     target_include_directories(strix-microscaled-r1-rows-chunk-test PRIVATE src)
-    target_link_libraries(strix-microscaled-r1-rows-chunk-test PRIVATE strix_core)
+    target_link_libraries(strix-microscaled-r1-rows-chunk-test PRIVATE strix_core strix_device)
     strix_target_warnings(strix-microscaled-r1-rows-chunk-test)
     add_test(NAME strix-microscaled-r1-rows-chunk-test COMMAND strix-microscaled-r1-rows-chunk-test)
     set_tests_properties(strix-microscaled-r1-rows-chunk-test PROPERTIES LABELS "cpu;moe;exactness")
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME strix-microscaled-r1-bench-status-test
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/moe_core/microscaled_r1_bench_status_test.py)
+        set_tests_properties(strix-microscaled-r1-bench-status-test PROPERTIES LABELS "cpu;moe")
+    endif()
     add_executable(strix-dense-linear-group-test tests/core/dense_linear_group_test.cpp)
     target_include_directories(strix-dense-linear-group-test PRIVATE src)
     strix_target_warnings(strix-dense-linear-group-test)
     add_test(NAME strix-dense-linear-group-test COMMAND strix-dense-linear-group-test)
     set_tests_properties(strix-dense-linear-group-test PROPERTIES LABELS "cpu;exactness")
+    # Byte-range overlap of launch operands (reads vs writes of one launch).
+    add_executable(strix-byte-range-test tests/core/byte_range_test.cpp)
+    target_compile_features(strix-byte-range-test PRIVATE cxx_std_17)
+    target_include_directories(strix-byte-range-test PRIVATE src)
+    target_compile_features(strix-byte-range-test PRIVATE cxx_std_20)
+    strix_target_warnings(strix-byte-range-test)
+    add_test(NAME strix-byte-range-test COMMAND strix-byte-range-test)
+    set_tests_properties(strix-byte-range-test PROPERTIES LABELS "cpu")
     # EXACT screened LM head: plane builder and the error bound (candidate set contains the true argmax and every tie).
     add_executable(strix-screened-head-tests tests/screened_head_tests.cpp)
     target_include_directories(strix-screened-head-tests PRIVATE src include)
@@ -1886,6 +1945,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-spec-pair-round-tests)
     add_test(NAME strix-spec-pair-round-tests COMMAND strix-spec-pair-round-tests)
     add_executable(strix-spec-block-parallel-tests tests/spec_block_parallel_tests.cpp)
+    add_executable(strix-block-candidate-tests tests/block_candidate_tests.cpp)
+    target_include_directories(strix-block-candidate-tests PRIVATE src)
+    target_link_libraries(strix-block-candidate-tests PRIVATE strix_block_candidate)
+    strix_target_warnings(strix-block-candidate-tests)
+    add_test(NAME strix-block-candidate-tests COMMAND strix-block-candidate-tests)
     target_link_libraries(strix-spec-block-parallel-tests PRIVATE strix_spec)
     strix_target_warnings(strix-spec-block-parallel-tests)
     add_test(NAME strix-spec-block-parallel-tests COMMAND strix-spec-block-parallel-tests)
@@ -2087,6 +2151,12 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-serve-api-tests)
     add_test(NAME strix-serve-api-tests COMMAND strix-serve-api-tests)
     add_test(NAME strix-serve-api-sampling-tests COMMAND strix-serve-api-tests --sampling-only)
+    add_executable(strix-serve-sampling-identity-tests tests/serve_sampling_identity_tests.cpp)
+    target_link_libraries(strix-serve-sampling-identity-tests PRIVATE strix_serve strix_core)
+    strix_target_warnings(strix-serve-sampling-identity-tests)
+    add_test(NAME strix-serve-sampling-identity-tests COMMAND strix-serve-sampling-identity-tests)
+    set_tests_properties(strix-serve-sampling-identity-tests PROPERTIES TIMEOUT 60 LABELS "cpu;parity"
+        ENVIRONMENT "STRIX_SAMPLING_REQUEST_IDENTITY=single")
     add_executable(strix-pair-lockstep-tests tests/pair_lockstep_tests.cpp)
     target_link_libraries(strix-pair-lockstep-tests PRIVATE strix_core)
     strix_target_warnings(strix-pair-lockstep-tests)
@@ -3283,6 +3353,7 @@ if(BUILD_TESTING)
 
     add_executable(strix-serial-generation-cli-tests tests/serial_generation_cli_tests.cpp)
     target_link_libraries(strix-serial-generation-cli-tests PRIVATE strix_serve)
+    target_include_directories(strix-serial-generation-cli-tests BEFORE PRIVATE tests/stubs/cuda_status)
     strix_target_warnings(strix-serial-generation-cli-tests)
     add_test(NAME strix-serial-generation-cli-tests COMMAND strix-serial-generation-cli-tests)
 
@@ -3823,6 +3894,15 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-resident-q8-tile-tests PRIVATE strix-weight "${STRIX_HIP_RUNTIME_LIBRARY}")
         strix_target_warnings(strix-hip-resident-q8-tile-tests)
         add_test(NAME strix-hip-resident-q8-tile-tests COMMAND strix-hip-resident-q8-tile-tests)
+        # No-model fixture of the resident dense rows storages (bf16 / q8_0 / q4_g64 / q6_g64): check + GB/s (GPU).
+        add_executable(strix-hip-dense-lowbit-bench tests/hip_dense_lowbit_bench.hip)
+        set_target_properties(strix-hip-dense-lowbit-bench PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-dense-lowbit-bench PRIVATE include src "${STRIX_HIP_INCLUDE_DIR}")
+        target_compile_options(strix-hip-dense-lowbit-bench PRIVATE
+            -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-dense-lowbit-bench PRIVATE strix-weight "${STRIX_HIP_RUNTIME_LIBRARY}")
+        strix_target_warnings(strix-hip-dense-lowbit-bench)
         # F9 recur: the rows launch against single-row step launches (padded strides, distinct gate rows); GPU run lanes only.
         add_executable(strix-hip-recur-gated-delta-rows-tests tests/recur_gated_delta_rows_hip_tests.hip)
         set_target_properties(strix-hip-recur-gated-delta-rows-tests PROPERTIES
@@ -3878,15 +3958,16 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
         set_target_properties(strix-hip-inkling2-mini-verify-rows-test PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        # Cohort decode lanes vs lone decode (packed: bitwise; grouped: hash for the main comparison); needs a checkpoint.
-        add_executable(strix-hip-inkling2-mini-cohort-rows-test tests/inkling2/mini_cohort_rows_hip.hip)
-        target_link_libraries(strix-hip-inkling2-mini-cohort-rows-test PRIVATE
-            strix_tiled_core strix_hip_runtime strix_inkling2_mini_checkpoint strix_core)
-        strix_target_warnings(strix-hip-inkling2-mini-cohort-rows-test)
-        target_compile_options(strix-hip-inkling2-mini-cohort-rows-test PRIVATE
+        # Serving cohort lanes vs each lane alone (bitwise logits, K/V rows, histories); needs the model checkpoint.
+        add_executable(strix-hip-inkling2-mini-cohort-lanes-test tests/inkling2/mini_cohort_lanes_hip.hip)
+        # strix_serve: the serving adapter the fixture drives (serve::FixedKvCohort over serve::CohortBackend).
+        target_link_libraries(strix-hip-inkling2-mini-cohort-lanes-test PRIVATE
+            strix_tiled_core strix_hip_runtime strix_inkling2_mini_checkpoint strix_embed_splice_hip strix_serve strix_core)
+        strix_target_warnings(strix-hip-inkling2-mini-cohort-lanes-test)
+        target_compile_options(strix-hip-inkling2-mini-cohort-lanes-test PRIVATE
             -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math
             -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
-        set_target_properties(strix-hip-inkling2-mini-cohort-rows-test PROPERTIES
+        set_target_properties(strix-hip-inkling2-mini-cohort-lanes-test PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         # Sampled serving lanes read the scores of their own (screened) step; also needs the model checkpoint.
         add_executable(strix-hip-inkling2-mini-screened-scores-test tests/inkling2/mini_screened_scores_hip.hip)
@@ -3900,10 +3981,24 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         add_executable(strix-hip-inkling2-mini-attention-prepare-test tests/inkling2/mini_attention_prepare_hip.hip)
         add_executable(strix-hip-inkling2-mini-attention-projected-bias-test tests/inkling2/mini_attention_projected_bias_hip.hip)
+        add_executable(strix-hip-inkling2-mini-prepared-round-fold-test tests/inkling2/mini_prepared_round_fold_hip.hip)
         add_executable(strix-hip-inkling2-mini-dense-test tests/inkling2/mini_dense_hip.hip)
         add_executable(strix-hip-inkling2-mini-gemv-test tests/inkling2/mini_gemv_hip.hip)
         add_executable(strix-hip-inkling2-mini-residual-test tests/inkling2/mini_residual_device.hip)
         add_executable(strix-hip-inkling2-mini-attention-test tests/inkling2/mini_attention_policy_hip.hip)
+        # No-model fixture of the FAST small-M form of the grouped microscaled tile: checks + ms / GB/s vs R1, the tile and
+        # the full route (GPU).
+        add_executable(strix-hip-grouped-small-microscaled-bench tests/moe_core/grouped_small_microscaled_hip.hip)
+        set_target_properties(strix-hip-grouped-small-microscaled-bench PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-grouped-small-microscaled-bench PRIVATE include src "${STRIX_HIP_INCLUDE_DIR}")
+        target_compile_options(strix-hip-grouped-small-microscaled-bench PRIVATE
+            -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-grouped-small-microscaled-bench PRIVATE strix_core strix-weight "${STRIX_HIP_RUNTIME_LIBRARY}")
+        strix_target_warnings(strix-hip-grouped-small-microscaled-bench)
+        # GPU check of the form (no timings): finite outputs, tile rows 1..64 per position, full route batch invariance.
+        add_test(NAME strix-hip-grouped-small-microscaled-check COMMAND strix-hip-grouped-small-microscaled-bench --check-only)
+        set_tests_properties(strix-hip-grouped-small-microscaled-check PROPERTIES LABELS "gpu;moe;fast")
         add_executable(strix-hip-inkling2-mini-attention-keysplit-test tests/inkling2/mini_attention_keysplit_hip.hip)
         add_executable(strix-hip-inkling2-mini-short-conv-test tests/inkling2/mini_short_conv_hip.hip)
         add_executable(strix-hip-inkling2-mini-grouped-test tests/inkling2/mini_grouped_microscaled_hip.hip)
@@ -3918,11 +4013,17 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-dense-flash-projected-bias-test tests/attn_core/dense_flash_projected_bias_hip.hip)
         add_executable(strix-hip-bf16-controller-rows-test tests/core/bf16_controller_rows_hip.hip)
         add_executable(strix-hip-controller-image-test tests/core/controller_image_hip.hip)
+        add_executable(strix-hip-projection-image-packed-test tests/core/projection_image_packed_hip.hip)
+        add_executable(strix-hip-controller-rms-test tests/core/controller_rms_hip.hip)
+        add_executable(strix-hip-mix-serial-registers-test tests/core/mix_serial_registers_hip.hip)
         add_executable(strix-hip-rms-wave-rows-test tests/core/rms_wave_rows_hip.hip)
         add_executable(strix-hip-dense-linear-tight-rows-test tests/core/dense_linear_tight_rows_hip.hip)
         add_executable(strix-hip-screened-head-test tests/core/screened_head_hip.hip)
         add_executable(strix-hip-round-fold-test tests/core/round_fold_hip.hip)
+        add_executable(strix-hip-round-store-incumbent-test tests/core/round_store_incumbent_hip.hip)
+        add_executable(strix-hip-combine-image-test tests/moe_core/combine_image_hip.hip)
         foreach(target strix-hip-inkling2-mini-attention-prepare-test strix-hip-inkling2-mini-attention-projected-bias-test
+                       strix-hip-inkling2-mini-prepared-round-fold-test
                        strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
                        strix-hip-inkling2-mini-gemv-test
                        strix-hip-inkling2-mini-attention-test strix-hip-inkling2-mini-short-conv-test
@@ -3932,9 +4033,13 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-inkling2-mini-dspark-test
                        strix-hip-inkling2-mini-nvfp4-table-test strix-hip-short-bf16-projection-test strix-hip-bf16-controller-rows-test
                        strix-hip-controller-image-test
+                       strix-hip-projection-image-packed-test
+                       strix-hip-controller-rms-test
+                       strix-hip-mix-serial-registers-test
                        strix-hip-rms-wave-rows-test
                        strix-hip-dense-linear-tight-rows-test strix-hip-dense-flash-projected-bias-test
-                       strix-hip-screened-head-test strix-hip-round-fold-test)
+                       strix-hip-screened-head-test strix-hip-round-fold-test strix-hip-combine-image-test
+                       strix-hip-round-store-incumbent-test)
             target_link_libraries(${target} PRIVATE strix_tiled_core)
             strix_target_warnings(${target})
             target_compile_options(${target} PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
@@ -3955,6 +4060,16 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         add_test(NAME strix-hip-screened-head-lanes-test COMMAND strix-hip-screened-head-lanes-test)
         set_tests_properties(strix-hip-screened-head-lanes-test PROPERTIES LABELS "hip;core")
+        # rescore trait of the screened head: exact rows for the largest approximate scores (--bench: no-model timing)
+        add_executable(strix-hip-screened-head-rescore-test tests/core/screened_head_rescore_hip.hip)
+        target_link_libraries(strix-hip-screened-head-rescore-test PRIVATE strix_tiled_core)
+        strix_target_warnings(strix-hip-screened-head-rescore-test)
+        target_compile_options(strix-hip-screened-head-rescore-test PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off
+            -fno-fast-math)
+        set_target_properties(strix-hip-screened-head-rescore-test PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        add_test(NAME strix-hip-screened-head-rescore-test COMMAND strix-hip-screened-head-rescore-test)
+        set_tests_properties(strix-hip-screened-head-rescore-test PROPERTIES LABELS "hip;core")
         target_compile_options(strix-hip-inkling2-mini-short-conv-test PRIVATE -fdenormal-fp-math=ieee)
         target_compile_options(strix-hip-inkling2-mini-nvfp4-table-test PRIVATE -fdenormal-fp-math=ieee)
         target_compile_options(strix-hip-short-bf16-projection-test PRIVATE -fdenormal-fp-math=ieee)
@@ -3978,6 +4093,15 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         add_test(NAME strix-hip-grouped-schedule-test COMMAND strix-hip-grouped-schedule-test)
         set_tests_properties(strix-hip-grouped-schedule-test PROPERTIES LABELS "hip;moe")
+        # Grouped rotated A4W4 expert class grouped-iu4a4-rot-v1 (moe_core/grouped_iu4a4.hpp): expert images and routed
+        # outputs bit for bit against iu4a4_rot (ctest); --bench [tokens] times the pass at Inkling shapes.
+        add_executable(strix-hip-grouped-iu4a4-tests tests/hip_grouped_iu4a4_tests.hip)
+        target_link_libraries(strix-hip-grouped-iu4a4-tests PRIVATE strix_hip_runtime strix_core)
+        target_include_directories(strix-hip-grouped-iu4a4-tests PRIVATE src include)
+        set_target_properties(strix-hip-grouped-iu4a4-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        add_test(NAME strix-hip-grouped-iu4a4-tests COMMAND strix-hip-grouped-iu4a4-tests)
+        set_tests_properties(strix-hip-grouped-iu4a4-tests PROPERTIES LABELS "hip;moe")
         # No-model check and bench of the R1 decode launch (Inkling shapes): rows-launch rows equal one-row launches,
         # per-case output digests for cross-build identity, --bench ms per launch; not a ctest (needs a GPU).
         add_executable(strix-hip-microscaled-r1-bench tests/moe_core/microscaled_r1_hip.hip)
@@ -3993,8 +4117,12 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-inkling2-mini-attention-keysplit-test strix-hip-inkling2-mini-dspark-test
                        strix-hip-inkling2-mini-attention-prepare-test strix-hip-bf16-controller-rows-test
                        strix-hip-controller-image-test
+                       strix-hip-projection-image-packed-test
+                       strix-hip-controller-rms-test
+                       strix-hip-mix-serial-registers-test
                        strix-hip-rms-wave-rows-test
-                       strix-hip-inkling2-mini-attention-projected-bias-test)
+                       strix-hip-inkling2-mini-attention-projected-bias-test
+                       strix-hip-inkling2-mini-prepared-round-fold-test)
             target_compile_options(${target} PRIVATE -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
         endforeach()
         target_link_libraries(strix-hip-inkling2-mini-moe-test PRIVATE strix_core)
@@ -4427,6 +4555,12 @@ int main() { return 0; }"
             target_link_libraries(strix-hip-iu4a4-dense-tests PRIVATE strix_hip_runtime strix_core)
             target_include_directories(strix-hip-iu4a4-dense-tests PRIVATE src)
             add_test(NAME strix-hip-iu4a4-dense-tests COMMAND strix-hip-iu4a4-dense-tests)
+            # A4W4 projection-call trait (one image per call, split outputs, BF16 rounding, fused gate) vs the class
+            add_executable(strix-hip-iu4a4-projections-tests tests/hip_iu4a4_projections_tests.hip)
+            set_target_properties(strix-hip-iu4a4-projections-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+            target_link_libraries(strix-hip-iu4a4-projections-tests PRIVATE strix_hip_runtime strix_core)
+            target_include_directories(strix-hip-iu4a4-projections-tests PRIVATE src include)
+            add_test(NAME strix-hip-iu4a4-projections-tests COMMAND strix-hip-iu4a4-projections-tests)
             # Shared FAST wide-window attention (flash over the dense_decode BF16 cache) vs the decode form
             add_executable(strix-hip-dense-decode-flash-tests tests/hip_dense_decode_flash_tests.hip)
             set_target_properties(strix-hip-dense-decode-flash-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
@@ -4913,6 +5047,7 @@ int main() { return 0; }"
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_compile_options(strix-hip-gdn-fp16-chunk-tests PRIVATE
             ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_include_directories(strix-hip-gdn-fp16-chunk-tests PRIVATE src)
         strix_target_warnings(strix-hip-gdn-fp16-chunk-tests)
         add_test(NAME strix-hip-gdn-fp16-chunk-tests COMMAND strix-hip-gdn-fp16-chunk-tests)
         set_tests_properties(strix-hip-gdn-fp16-chunk-tests PROPERTIES SKIP_RETURN_CODE 77)
@@ -6311,6 +6446,16 @@ if(BUILD_TESTING)
         target_compile_options(strix-ds41-integer-operand-host-tests PRIVATE -ffp-contract=off)
     endif()
     add_test(NAME strix-ds41-integer-operand-host-tests COMMAND strix-ds41-integer-operand-host-tests)
+    add_executable(strix-ops-a8-group-host-tests tests/ops_a8_group_host_tests.cpp)
+    target_include_directories(strix-ops-a8-group-host-tests PRIVATE tests/ds41_integer_host src include)
+    target_compile_features(strix-ops-a8-group-host-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-ops-a8-group-host-tests)
+    if(MSVC)
+        target_compile_options(strix-ops-a8-group-host-tests PRIVATE /fp:strict)
+    else()
+        target_compile_options(strix-ops-a8-group-host-tests PRIVATE -fno-fast-math -ffp-contract=off)
+    endif()
+    add_test(NAME strix-ops-a8-group-host-tests COMMAND strix-ops-a8-group-host-tests)
     add_executable(strix-ds41-prefill-tests tests/ds41_prefill_tests.cpp)
     target_link_libraries(strix-ds41-prefill-tests PRIVATE strix_ds41_prefill)
     strix_target_warnings(strix-ds41-prefill-tests)
@@ -8020,6 +8165,7 @@ include(cmake/packages/X6.cmake)
 include(cmake/packages/EPI.cmake)
 include(cmake/packages/MIXLAT.cmake)
 include(cmake/packages/HIPBB.cmake)
+include(cmake/packages/HIPTR.cmake)
 include(cmake/packages/LANESHIP.cmake)
 include(cmake/packages/MOER.cmake)
 include(cmake/packages/X6R.cmake)

@@ -92,6 +92,8 @@ inline constexpr std::size_t kMaxRequestJsonValues = std::size_t{1} << 21U;
 [[nodiscard]] Json parse_request_json(std::string_view text);
 // Asset parser also rejects duplicates, invalid UTF-8 and unpaired surrogates.
 [[nodiscard]] Json parse_json_unique(std::string_view text);
+// Bound input bytes before UTF-8 validation and DOM values before constructing each value.
+[[nodiscard]] Json parse_json_unique(std::string_view text, std::size_t max_bytes, std::size_t max_values);
 void append_json_string(std::string& out, std::string_view value);
 
 }  // namespace strix::serve

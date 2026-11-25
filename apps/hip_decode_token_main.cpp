@@ -1287,7 +1287,7 @@ static int run_decode_entry(
             "      [--prefix-cache-then-prompt FILE ...] (block-boundary prefix state cache, tiled known-prefix prefill only)\n"
             "  --rtx-state-import-file NAME.json (fresh CLI prefix import; NAME.bin beside it, --prompt-ids is full prompt)\n"
             "  --http-serve [--http-bind ADDR] [--http-port N] [--http-model-id NAME] [--http-api-key-file FILE]\n"
-            "      [--http-sampling greedy|reject] [--http-default-max-tokens N] [--http-max-queue N] [--http-max-connections N]\n"
+            "      [--http-sampling greedy|reject|sample] [--http-default-max-tokens N] [--http-max-queue N] [--http-max-connections N]\n"
             "      (OpenAI/Anthropic-compatible HTTP server on the tiled MTP route; the prompt is the calibration prompt)\n"
             "  --release-manifest FILE (HTTP only, no multi-input modes; verify assets rooted beside FILE)\n"
             "  --prefetch-q8-qsa-input (opt-in exact-tree Q8 input projections)\n"
@@ -4703,13 +4703,9 @@ static int run_decode_entry(
                 std::cerr << strix::serve::format_capacity_report(strix::serve::report_bridge_capacity(retained, serving,
                     fit_host, fit_device, headroom, headroom, options.http_batch_cap)) << '\n';
             }
-            batch_slots = !single_route && (capacity.slots > 1U ||
-                ((options.http_batch_explicit || deployment.plan) && options.http_batch_cap == 1U))
-                ? capacity.slots : 0U;
+            batch_slots = admit_http_batch_slots(options, capacity.slots, static_cast<bool>(deployment.plan));
             // The QSA MTP pool is charged per slot in `serving` on every HTTP route, so a one-slot fallback already fits it.
             resolve_batch_cache_scheduler(options, requested_environment, static_cast<std::uint32_t>(batch_slots));
-            if (!batch_slots && options.http_sampling == "sample")
-                throw std::runtime_error("HTTP sampling requires memory for the batched route");
         }
         std::size_t eager_slots = batch_slots;
         const auto rewarm_before_listen = [&] {

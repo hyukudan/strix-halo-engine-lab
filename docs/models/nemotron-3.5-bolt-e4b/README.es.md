@@ -28,7 +28,9 @@ declarado y una línea de stderr lo indica. Un perfil solo rechaza por un asset 
 | `quality` | Paquete EXL3 (`--exl3-arm DIR`), identidad elegida una vez por paquete y sesión (`g4-exl3-v1`/`v3`) | `prefill-exact` | Exacto dentro de su identidad EXL3; mayor fidelidad que Q4_K_M con un tamaño similar |
 
 La identidad de la ruta EXL3 se fija al arrancar a partir del paquete y de `--streams`, nunca por paso, así que la
-salida de una sesión no depende de la carga. `STRIX_G4_EXL3_IDENTITY=v1|v2|v3` la fuerza.
+salida de una sesión no depende de la carga. En selección automática, M4 y M6 usan `g4-exl3-v3`, y M5 usa
+`g4-exl3-v3` con ocho flujos o más y `g4-exl3-v1` por debajo. `STRIX_G4_EXL3_IDENTITY=v1|v2|v3` la fuerza; un valor
+explícito elige el mismo núcleo en la línea de órdenes y en el servidor con cualquier número de flujos o ranuras.
 
 ## Assets
 
@@ -152,7 +154,8 @@ tokens de cada petición son iguales a los de esa misma petición servida sola (
 semilla, continuación del presupuesto de razonamiento, streaming y un cliente que se desconecta a mitad). Una sola
 petición no cambia (C1 con el drafter, mismos ids y velocidad). `STRIX_G4_SERVE_BATCH=0` restaura un trabajo de chat
 cada vez. Si no se indica `--streams`, la identidad del núcleo EXL3, fijada por sesión, se elige para el número de
-ranuras (ocho), así que un paquete M5 selecciona `g4-exl3-v3` en lugar de `v1`; M4 y M6 usan siempre `v3`.
+ranuras (ocho), así que un paquete M5 selecciona `g4-exl3-v3` en lugar de `v1`; M4 y M6 usan siempre `v3`. Para un
+mismo núcleo M5 con cualquier número de ranuras, fije `STRIX_G4_EXL3_IDENTITY` explícitamente.
 
 | `default`, streaming, 128 tokens por petición | 1 cliente | 4 clientes | 8 clientes |
 |---|---:|---:|---:|

@@ -1,0 +1,193 @@
+#include "strix/weight/block_draft.hpp"
+#include "strix/serve/json.hpp"
+#include "strix/spec/block_draft_policy.hpp"
+#include "strix/spec/block_parallel.hpp"
+#include <algorithm>
+#include <bit>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
+
+namespace strix::weight {
+namespace {
+constexpr std::size_t kMaxConfigBytes = 16U * 1024U;
+constexpr std::size_t kMaxConfigValues = 256;
+constexpr std::size_t kMaxHeaderBytes = 64U * 1024U;
+constexpr std::size_t kMaxMetadataEntries = 16;
+// A tensor object, its dtype, a shape of rank <= 3, and two offsets.
+constexpr std::size_t kValuesPerTensor = 9;
+
+const serve::Json& field(const serve::Json& j, const char* key) {
+    const auto* p = j.find(key);
+    if (!p) throw std::invalid_argument(std::string("block draft: missing ") + key);
+    return *p;
+}
+std::uint32_t integer(const serve::Json& j, const char* key, bool zero = false) {
+    const auto v = field(j, key).as_int();
+    if (v < (zero ? 0 : 1) || v > 1048576) throw std::invalid_argument("block draft: invalid extent");
+    return static_cast<std::uint32_t>(v);
+}
+double positive(const serve::Json& j, const char* key) {
+    const auto v = field(j, key).as_double();
+    if (!std::isfinite(v) || v <= 0) throw std::invalid_argument("block draft: invalid scalar");
+    return v;
+}
+}
+
+BlockDraftConfig parse_block_draft_config(std::string_view json) {
+    const auto root = serve::parse_json_unique(json, kMaxConfigBytes, kMaxConfigValues);
+    const auto& d = field(root, "dflash_config");
+    BlockDraftConfig c;
+    c.hidden = integer(root, "hidden_size"); c.intermediate = integer(root, "intermediate_size");
+    c.layers = integer(root, "num_hidden_layers"); c.heads = integer(root, "num_attention_heads");
+    c.kv_heads = integer(root, "num_key_value_heads"); c.head_dim = integer(root, "head_dim");
+    c.vocab = integer(root, "vocab_size"); c.window = integer(root, "sliding_window");
+    c.block = integer(d, "block_size"); c.group = integer(d, "conv_group_size");
+    c.taps = integer(d, "conv_kernel_size"); c.rank = integer(d, "selector_rank");
+    c.top_k = integer(d, "selector_top_k"); c.mask = integer(d, "mask_token_id", true);
+    c.epsilon = positive(root, "rms_norm_eps"); c.softcap = positive(d, "final_logit_softcapping");
+    const auto& rope = field(root, "rope_parameters");
+    c.theta = positive(rope, "rope_theta");
+    const auto mode = field(d, "selector_softcap_mode").as_string();
+    if (mode != "after_correction" && mode != "before_correction")
+        throw std::invalid_argument("block draft: unknown selector softcap mode");
+    c.post_softcap = mode == "after_correction";
+    // Either location may carry a scale and neither has precedence: every value present must be unit.
+    for (const auto* name : {"input_embedding_scale", "output_multiplier"})
+        for (const auto* object : {&d, &root})
+            if (const auto* scale = object->find(name); scale && scale->as_double() != 1.0)
+                throw std::invalid_argument("block draft: non-unit embedding/head scale is unsupported");
+    if (const auto* dropout = root.find("attention_dropout"); dropout && dropout->as_double() != 0.0)
+        throw std::invalid_argument("block draft: inference dropout must be zero");
+    if (field(root, "attention_bias").as_bool() || field(root, "is_causal").as_bool() ||
+        field(root, "hidden_act").as_string() != "silu" ||
+        field(root, "dtype").as_string() != "bfloat16" ||
+        field(rope, "rope_type").as_string() != "default")
+        throw std::invalid_argument("block draft: unsupported arithmetic contract");
+    const auto& types = field(root, "layer_types").as_array();
+    if (types.size() != c.layers) throw std::invalid_argument("block draft: layer_types size");
+    for (const auto& type : types)
+        if (type.as_string() != "sliding_attention") throw std::invalid_argument("block draft: layer type");
+    const auto target_layers = integer(root, "num_target_layers");
+    for (const auto& id : field(d, "target_layer_ids").as_array()) {
+        const auto n = id.as_int();
+        if (n < 0 || n > target_layers || (!c.target_layers.empty() && n <= c.target_layers.back()))
+            throw std::invalid_argument("block draft: capture ids must be ordered, unique and in range");
+        c.target_layers.push_back(static_cast<std::uint32_t>(n));
+    }
+    if (c.target_layers.empty() || c.target_layers.size() > 64 || c.layers > 128 || c.block < 2 ||
+        c.block > 32 || c.hidden % c.group || c.heads % c.kv_heads || c.head_dim % 2 ||
+        c.taps != 2 || c.top_k > c.vocab || c.mask >= c.vocab)
+        throw std::invalid_argument("block draft: inconsistent geometry");
+    return c;
+}
+
+DraftShapes block_draft_shapes(const BlockDraftConfig& c) {
+    const std::uint64_t h = c.hidden, q = std::uint64_t(c.heads) * c.head_dim;
+    const std::uint64_t kv = std::uint64_t(c.kv_heads) * c.head_dim;
+    DraftShapes s{{"fc.weight", {h, h * c.target_layers.size()}}, {"hidden_norm.weight", {h}},
+        {"norm.weight", {h}}, {"candidate_selector.hidden_projection.weight", {c.rank, h}},
+        {"candidate_selector.predecessor_codebook", {c.vocab, c.rank}},
+        {"candidate_selector.successor_codebook", {c.vocab, c.rank}}};
+    for (std::uint32_t i = 0; i < c.layers; ++i) {
+        const auto p = "layers." + std::to_string(i) + ".";
+        s[p + "input_layernorm.weight"] = {h}; s[p + "post_attention_layernorm.weight"] = {h};
+        for (const auto* conv : {"attention_conv.", "mlp_conv."}) {
+            s[p + conv + "base_kernel"] = {2, c.taps, h};
+            s[p + conv + "kernel_projection.weight"] = {2 * c.taps * (h / c.group), h};
+        }
+        s[p + "self_attn.q_proj.weight"] = {q, h}; s[p + "self_attn.k_proj.weight"] = {kv, h};
+        s[p + "self_attn.v_proj.weight"] = {kv, h}; s[p + "self_attn.o_proj.weight"] = {h, q};
+        s[p + "self_attn.q_norm.weight"] = {c.head_dim}; s[p + "self_attn.k_norm.weight"] = {c.head_dim};
+        s[p + "mlp.gate_proj.weight"] = {c.intermediate, h}; s[p + "mlp.up_proj.weight"] = {c.intermediate, h};
+        s[p + "mlp.down_proj.weight"] = {h, c.intermediate};
+    }
+    return s;
+}
+
+void validate_block_candidate_geometry(const BlockDraftConfig& c) {
+    if (c.block != spec::kCandidateBlockRows) throw std::invalid_argument("candidate block: policy requires block 8");
+    if (c.layers == 0 || c.layers > spec::max_draft_layers ||
+        c.target_layers.empty() || c.target_layers.size() > spec::max_draft_layers)
+        throw std::invalid_argument("candidate block: policy layer limit");
+    if (std::any_of(c.target_layers.begin(), c.target_layers.end(), [](std::uint32_t id) {
+            return id > std::numeric_limits<std::uint16_t>::max();
+        }))
+        throw std::invalid_argument("candidate block: capture id limit");
+}
+
+Status index_block_draft(std::shared_ptr<const Source> source, std::string_view json, BlockDraftCheckpoint& out) {
+    try {
+        BlockDraftCheckpoint result;
+        result.config = parse_block_draft_config(json);
+        validate_block_candidate_geometry(result.config);
+        if (!source) return {Error::stale_source, "block draft: source absent"};
+        // Tensor ids hash the source's checkpoint name with the header and the tensor name. An unnamed source would
+        // need its full-file digest (a payload read) and one shared constant would give two different payloads with
+        // one header the same ids, so the caller names the checkpoint; content identity is the explicit payload digest.
+        if (source->shard_name().empty())
+            return {Error::malformed, "block draft: the caller must name the checkpoint (source shard name)"};
+        auto expected = block_draft_shapes(result.config);
+        const SafetensorsIndexLimits limits{kMaxHeaderBytes,
+            2 + expected.size() * kValuesPerTensor + kMaxMetadataEntries, // root and metadata objects
+            expected.size(), kMaxMetadataEntries};
+        auto status = index_safetensors(std::move(source), result.index, limits);
+        if (!status) return status;
+        for (const auto& t : result.index.tensors) {
+            const auto it = expected.find(t.name);
+            if (it == expected.end() || it->second != t.extents || t.wire_dtype != "BF16")
+                return {Error::malformed, "block draft: unexpected tensor, dtype or shape: " + t.name};
+            result.payload_bytes += t.payload.range.bytes;
+            expected.erase(it);
+        }
+        if (!expected.empty()) return {Error::malformed, "block draft: missing tensor " + expected.begin()->first};
+        result.config_digest = digest_bytes({reinterpret_cast<const Byte*>(json.data()), json.size()});
+        out = std::move(result);
+        return {Error::ok, {}};
+    } catch (const std::exception& e) { return {Error::malformed, e.what()}; }
+}
+
+Status index_block_draft(std::shared_ptr<const Source> source, const Source& config, BlockDraftCheckpoint& out) {
+    try {
+        const auto bytes = config.size();
+        if (bytes > kMaxConfigBytes) return {Error::malformed, "block draft: config JSON byte limit exceeded"};
+        std::string text(static_cast<std::size_t>(bytes), '\0');
+        const auto status = config.read({0, bytes}, {reinterpret_cast<Byte*>(text.data()), text.size()});
+        if (!status) return status;
+        return index_block_draft(std::move(source), text, out);
+    } catch (const std::exception& e) { return {Error::malformed, e.what()}; }
+}
+
+Status digest_block_draft_payload(const BlockDraftCheckpoint& c, std::map<std::string, Digest256>& out) {
+    std::map<std::string, Digest256> result;
+    for (const auto& t : c.index.tensors) {
+        Digest256 digest{};
+        auto status = digest_slice(t.payload, digest);
+        if (!status) return status;
+        result.emplace(t.name, digest);
+    }
+    out = std::move(result);
+    return {Error::ok, {}};
+}
+
+Status read_block_draft_tensor(const BlockDraftCheckpoint& c, std::string_view name, std::vector<float>& out) {
+    for (const auto& t : c.index.tensors) if (t.name == name) {
+        if (t.wire_dtype != "BF16" || t.payload.range.bytes % 2 ||
+            t.payload.range.bytes > std::numeric_limits<std::size_t>::max())
+            return {Error::malformed, "block draft: invalid BF16 payload"};
+        std::vector<Byte> bytes(static_cast<std::size_t>(t.payload.range.bytes));
+        const auto status = read_slice(t.payload, bytes);
+        if (!status) return status;
+        std::vector<float> values(bytes.size() / 2);
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            const auto word = std::to_integer<std::uint32_t>(bytes[2*i]) |
+                             (std::to_integer<std::uint32_t>(bytes[2*i+1]) << 8);
+            values[i] = std::bit_cast<float>(word << 16);
+            if (!std::isfinite(values[i])) return {Error::malformed, "block draft: nonfinite weight"};
+        }
+        out = std::move(values);
+        return {Error::ok, {}};
+    }
+    return {Error::malformed, "block draft: tensor not found"};
+}
+} // namespace strix::weight

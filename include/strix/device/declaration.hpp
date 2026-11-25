@@ -1,6 +1,8 @@
 #pragma once
 
 #include "strix/device/link_class.hpp"
+#include "strix/device/lowbit_rows.hpp"
+#include "strix/r1_rows_tiles.hpp"
 
 #include <cstdint>
 #include <string>
@@ -67,6 +69,16 @@
 //   roles = ["host", "aux"]                      # host: tokenizer, image, sampling, exchange fold, background work
 //   byte_cap_gbytes_ps = 10.0                    # background memory traffic ceiling while any decode is active
 //
+//   [r1_rows_tiles.gfx1151-inkling-bank]         # measured plan data: R1 rows tile budgets (strix/r1_rows_tiles.hpp)
+//   arch = "gfx1151"                             # as the runtime reports it, feature suffix removed
+//   multiprocessors = 20                         # as the runtime reports it (HIP multiProcessorCount)
+//   experts = 128                                # the measured bank: every key is required
+//   hidden = 2304
+//   intermediate = 1152
+//   top_k = 8
+//   formats = ["nvfp4", "mxfp8"]
+//   cache_mib = [0, 0, 0, 0, 24, 0, 0, 0, 24]    # per row count 0 .. 16; 0 or absent = incumbent order
+//
 // Unknown keys, a device without an identity, duplicate identities and unknown roles are errors. An NPU or CPU that
 // is not declared gets no work: there is no implicit non-GPU unit. `decode`, `prefill`, `pair`, `draft`, `replica`,
 // `front` and `experts` are GPU roles; an NPU takes only `aux`; a CPU takes only `host` and `aux`.
@@ -126,6 +138,9 @@ struct Descriptor {
     std::uint64_t budget_bytes = 0;
     double bandwidth_gbytes_ps = 0.0; // overrides the profile's memory bandwidth; 0 = the profile's
     std::uint32_t units = 0;          // overrides the profile's SM / CU count; 0 = the profile's
+    // Optional measured switch points of the low-bit resident projection routes on THIS device (`lowbit_rows =
+    // { small_rows = N, wide_panels = M }`, both > 0; strix/device/lowbit_rows.hpp). {0, 0} = not declared: one route.
+    LowBitRows lowbit_rows;
     // Cluster shape: `count` identical devices joined by `interconnect` (a class in profiles.hpp). An entry with
     // count > 1, or a profile without an identity, is planned: the planners size it, the gate never binds it.
     std::uint32_t count = 1;
@@ -155,6 +170,8 @@ struct Declaration {
     std::vector<Descriptor> devices;
     std::vector<Policy> policies;
     std::vector<Link> links;
+    // Measured R1 rows tile plans ([r1_rows_tiles.<name>]); the start gate publishes them (strix/r1_rows_tiles.hpp).
+    std::vector<r1_rows_tiles::DeviceTable> r1_rows_tiles;
 };
 
 // Throws std::invalid_argument naming the offending key.

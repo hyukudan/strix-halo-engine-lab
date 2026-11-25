@@ -19,6 +19,9 @@ using Config = std::map<std::string, std::string>;
 struct Allowed {
     std::string_view key;     // exact key, or a prefix ending in '*'
     std::string_view reason;  // why serving requires its own value; never empty
+    // Strict output parity accepts only a named, proven scheduling/metadata difference.
+    // A reason alone (or a wildcard family) is not an arithmetic identity proof.
+    std::string_view same_output_evidence{};
 };
 
 struct Finding {
@@ -37,7 +40,8 @@ inline constexpr std::string_view kAbsent = "<absent>";
     return pattern == key;
 }
 
-[[nodiscard]] inline Report compare(const Config& cli, const Config& server, std::span<const Allowed> allowed) {
+[[nodiscard]] inline Report compare(const Config& cli, const Config& server, std::span<const Allowed> allowed,
+                                    bool require_output_parity = false) {
     Report report;
     std::vector<bool> used(allowed.size(), false);
     const auto visit = [&](const std::string& key, std::string_view a, std::string_view b) {
@@ -46,6 +50,12 @@ inline constexpr std::string_view kAbsent = "<absent>";
         for (std::size_t i = 0; i < allowed.size(); ++i)
             if (matches(allowed[i].key, key) && !allowed[i].reason.empty()) {
                 used[i] = true;
+                if (require_output_parity && (allowed[i].same_output_evidence.empty() ||
+                    allowed[i].key.find('*') != std::string_view::npos)) {
+                    f.reason = "output equality unproven: " + std::string(allowed[i].reason);
+                    report.unexplained.push_back(std::move(f));
+                    return;
+                }
                 f.reason = std::string(allowed[i].reason);
                 report.explained.push_back(std::move(f));
                 return;

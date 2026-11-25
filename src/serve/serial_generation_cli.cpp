@@ -4,8 +4,10 @@
 #include "strix/serial_request.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
+#include "strix/serve/decode_form.hpp"
 #include "strix/serve/json.hpp"
 #include "strix/serve/media.hpp"
+#include "strix/serve/prefill_chunk_fallback.hpp"
 #include "strix/session/embed_rows.hpp"
 #include "strix/session/cli_output.hpp"
 #include "strix/spec/greedy_continuation.hpp"
@@ -16,6 +18,7 @@
 #include <charconv>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <numeric>
 #include <optional>
@@ -149,6 +152,7 @@ MediaPrompt render_media_prompt(const SerialGenerationFamily& family, const std:
 SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const SerialGenerationFamily& family,
                                                     const SerialCliOption& extra) {
     SerialGenerationOptions options;
+    options.sampler_options = validate_sampling_startup_environment();
     bool grouped_decode = false;
     options.prefill_chunk = family.default_prefill_chunk;
     if (family.supports_speculation) options.speculation = family.default_speculation;
@@ -189,6 +193,7 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
         else if (family.supports_packed_decode && argument == "--grouped-decode") grouped_decode = true;
         else if (family.default_prefill_chunk && argument == "--prefill-chunk") {
             options.prefill_chunk = core::parse_u32(value());
+            options.prefill_chunk_explicit = true;
             if (!options.prefill_chunk || options.prefill_chunk > family.max_context)
                 throw std::invalid_argument("prefill chunk size must be within the context");
         } else if (argument.starts_with("--")) {
@@ -206,11 +211,9 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
         throw std::invalid_argument("--tokenize takes no --generate, --logits or sampling options");
     if (options.tokenizer && !options.text && !options.messages && !options.tokenize_file)
         throw std::invalid_argument("--tokenizer requires --prompt, --messages or --tokenize");
-    if (options.packed_decode && grouped_decode)
-        throw std::invalid_argument("--packed-decode and --grouped-decode are exclusive");
-    options.packed_decode = options.packed_decode || (family.packed_decode_default && !grouped_decode);
-    const bool filtered = options.sampling.top_k || options.sampling.top_p < 1.0F || options.sampling.min_p > 0.0F;
-    options.sampling.temperature = temperature.value_or(filtered ? 1.0F : 0.0F);
+    options.packed_decode = resolve_decode_form(options.packed_decode, grouped_decode, family.packed_decode_default);
+    options.sampling.temperature = temperature.value_or(omitted_token_sampling_temperature(
+        options.sampling.top_k, options.sampling.top_p, options.sampling.min_p));
     validate_token_sampling_policy(options.sampling);
     if ((options.speculation == CliSpeculation::verify || options.speculation == CliSpeculation::lookup) &&
         token_sampling_enabled(options.sampling) && !family.sampled_speculation)
@@ -269,14 +272,18 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         ? options.generate - 1U : 0U;
     const auto load_start = Clock::now();
     const auto chunk = std::min(options.prefill_chunk, prompt_size);
-    auto decoder = family.load({checkpoint, positions, chunk, options.packed_decode, verify_rows,
-                                verify_rows ? options.speculation : CliSpeculation::off,
-                                prefill_tail_rows(prompt_size, chunk, family.prefill_tail_divisor)});
+    const auto fallback = std::min(family.prefill_chunk_fallback, prompt_size);
+    auto decoder = load_with_chunk_fallback(chunk, options.prefill_chunk_explicit, fallback, std::cerr,
+                                            [&](std::uint32_t rows) {
+        return family.load({checkpoint, positions, rows, options.packed_decode, verify_rows,
+                            verify_rows ? options.speculation : CliSpeculation::off,
+                            prefill_tail_rows(prompt_size, rows, family.prefill_tail_divisor)});
+    });
     if (family.report_load_timing) session::write_load_timing(out, load_start);
     if (on_loaded) on_loaded();
 
     std::optional<TokenSampler> sampler;
-    const TokenSamplerOptions sampler_options{};
+    const auto& sampler_options = options.sampler_options;
     if (!greedy) sampler.emplace(options.sampling, sampler_options);
     std::vector<float> logits((options.logits || sampler) ? family.output_vocabulary : 0U);
     const auto prefill_start = Clock::now();

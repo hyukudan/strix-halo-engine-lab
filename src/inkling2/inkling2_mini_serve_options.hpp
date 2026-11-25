@@ -1,13 +1,13 @@
 #pragma once
 
+#include "inkling2_mini_resident_route.hpp"
+#include "inkling2_mini_schedule.hpp"
 #include "inkling2_mini_weight_options.hpp"
 #include "strix/serve/cohort_decode.hpp"
-#include "strix/serve/row_budget.hpp"
 
-#include <algorithm>
 #include <cstdint>
 #include <memory>
-#include <stdexcept>
+#include <optional>
 #include <string>
 
 namespace strix::inkling2 {
@@ -19,82 +19,61 @@ struct MiniServeOptions {
     std::string device_id;
     std::string device_profile;
     unsigned context = 8192;
+    // Prefill chunk rows (resolve: --prefill-rows, else the route's chunk, clamped to the context).
     unsigned prefill_rows = 128;
     unsigned slots = 0;
+    // Served route lever (kMiniServedCliRoute): requested by the profile resolution, and admitted by the backend (HIP;
+    // a CUDA server declines). Only the admitted route reads the three fields below it.
+    bool served_route_requested = false;
+    bool served_cli_route = false;
+    // Tail capacity of the admitted route (the command line's tail rule).
+    unsigned prefill_tail = 0;
+    // Lane cap of the admitted route given an explicit --prefill-rows without --slots (0: kMiniServeLaneRows).
+    unsigned lane_rows = 0;
     std::uint64_t kv_bytes = 0;
     MiniWeightOptions weight_options;
     profile::Name tier = profile::Name::standard;
     // Resolved operand class of the FAST W4A4 expert lever (mini_moe_w4a4_class; bf16 = off): the served prefill runs
     // the class the profile line reports, as the CLI and the gate do.
     moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16;
-    // Served identity, read only from the resolution (profile::Resolution::selected): packed = identity variant
-    // inkling2-mini-moe-packed (HIP), screened_head = inkling2-mini-cuda-screened-head (CUDA). Both off: the incumbent
-    // grouped serving identity of the backend, as on main.
-    bool packed_decode = false;
-    bool screened_head = false;
-    std::string identity = "identity incumbent";  // profile::Resolution::identity(), printed on the route line
+    // Resolved prepared-attention round fold (mini_prepared_round_fold), the CLI's setting from the same resolution.
+    bool prepared_round_fold = false;
+    // Resolved narrow expert image lever (mini_experts_nvfp4): the MXFP8 expert layers load as NVFP4.
+    bool experts_nvfp4 = false;
+    // Resolved exact down-image lever (mini_combine_image): the HIP resident prefill stores the BF16 down image where the
+    // target is qualified.
+    bool combine_image = false;
+    // Resolved projected-bias attention lever (mini_attn_projected_bias), the value the CLI and the gate read.
+    bool attn_projected_bias = false;
+    bool controller_one_plane = false;
 };
 
-// Served KV slots, and whether the screened greedy head plane stays resident. The plane is an EXACT decode speed lever
-// (same picks as the full head). The HIP plane is built with the decoder (as on main), before the slot budget is read:
-// it stays only when it costs no KV slot, so screening never lowers the slot capacity the full head admits.
-struct MiniServeSlots {
-    std::uint32_t lanes;
-    bool keep_screen;
-};
-
-inline MiniServeSlots mini_serve_slots(std::uint64_t free, std::uint64_t total, std::uint64_t device_limit,
-                                       std::uint64_t kv_limit, std::uint64_t slot_bytes, std::uint32_t rows,
-                                       std::uint64_t screen_bytes) {
-    const auto with_screen = serve::resident_kv_slots(free, total, device_limit, kv_limit, slot_bytes, rows);
-    if (screen_bytes == 0U) return {with_screen, false};
-    const auto freed = free + std::min(screen_bytes, total - std::min(free, total));
-    const auto full_head = serve::resident_kv_slots(freed, total, device_limit, kv_limit, slot_bytes, rows);
-    return full_head > with_screen ? MiniServeSlots{full_head, false} : MiniServeSlots{with_screen, true};
+// Lanes per batched forward: --slots, else, on the incumbent served route, the context-clamped prompt chunk (the cap
+// it always had); on the admitted served route lever an explicit --prefill-rows (clamped) or kMiniServeLaneRows.
+inline unsigned mini_serve_lane_rows(const MiniServeOptions& opt) noexcept {
+    if (opt.slots) return opt.slots;
+    if (!opt.served_cli_route) return opt.prefill_rows;
+    return opt.lane_rows ? opt.lane_rows : kMiniServeLaneRows;
 }
 
-// The CUDA plane of the admitted screened-head variant is built only AFTER the KV slots the full-head budget admits are
-// allocated (`committed`, slot 0 included), so it can never take a committed slot. It stays when the shared budget,
-// re-read with the plane resident and the committed extra slots counted as free, still admits every committed slot, and
-// the plane leaves the runtime headroom that budget keeps (one eighth of the bytes it was given). Else the plane is
-// released and the incumbent full-head server runs (same tokens).
-inline bool mini_keep_screen(std::uint64_t free_before_plane, std::uint64_t free_after_plane, std::uint64_t total,
-                             std::uint64_t device_limit, std::uint64_t kv_limit, std::uint64_t slot_bytes,
-                             std::uint32_t rows, std::uint32_t committed) {
-    if (committed == 0U || free_after_plane >= free_before_plane) return false;  // nothing committed / no plane built
-    const auto extra = static_cast<std::uint64_t>(committed - 1U) * slot_bytes;
-    const auto budget_free = free_before_plane + extra;  // what the slot budget was given, before the plane
-    if (free_after_plane < budget_free / 8U) return false;
-    return serve::resident_kv_slots(free_after_plane + extra, total, device_limit, kv_limit, slot_bytes, rows) >= committed;
+// The served_route field of the startup and inspection lines: off, declined (requested, the backend does not run it)
+// or on, which states its qualification (the lever row is not qualified in any profile column) and its route.
+// `effective_tail`: the tail capacity the constructed decoder admitted (startup line); without a decoder (inspection)
+// the field states the offered capacity as prefill_tail_offered.
+inline std::string mini_served_route_startup_field(const MiniServeOptions& opt,
+                                                   std::optional<unsigned> effective_tail = std::nullopt) {
+    if (!opt.served_cli_route) return mini_down_image_name(false, opt.served_route_requested);
+    return "on qualification unqualified moe_decode " + std::string(mini_decode_form_name(kMiniPackedDecodeDefault)) +
+           " prefill_chunk " + std::to_string(opt.prefill_rows) +
+           (effective_tail ? " prefill_tail " + std::to_string(*effective_tail)
+                           : " prefill_tail_offered " + std::to_string(opt.prefill_tail)) +
+           " first_id prefill";
 }
 
-// The order of the served device commitments, one body for both backends (`Decoder` is the resident decoder; the host
-// test drives it with a fake). The decoder already holds slot 0. `memory()` returns {free, total}; `commit(lanes)`
-// allocates every admitted slot (the cohort) and returns it; `screen_variant`: the resolution admitted the CUDA
-// screened-head variant. Returns the cohort; `lanes` receives the slot count.
-template <class Decoder, class Memory, class Commit>
-auto mini_commit_slots_then_screen(Decoder& decoder, const Memory& memory, std::uint64_t device_limit,
-                                   std::uint64_t kv_limit, std::uint64_t slot_bytes, std::uint32_t rows,
-                                   bool screen_variant, std::uint32_t& lanes, Commit&& commit) {
-    const auto before = memory();
-    const auto resident_plane = decoder.screen_device_bytes();  // HIP: built at load; CUDA: 0 here
-    const auto plan = mini_serve_slots(before.free, before.total, device_limit, kv_limit, slot_bytes, rows,
-                                       resident_plane);
-    if (resident_plane != 0U && !plan.keep_screen) decoder.release_screen("the screened plane would cost a KV slot");
-    if (!plan.lanes) throw std::runtime_error("Inkling KV budget holds no session slots");
-    lanes = plan.lanes;
-    auto cohort = commit(plan.lanes);
-    if (screen_variant) {
-        const auto committed = memory();
-        decoder.build_screen();
-        const auto after = memory();
-        if (decoder.screen_device_bytes() == 0U)
-            decoder.release_screen("screened head variant: plane not built");
-        else if (!mini_keep_screen(committed.free, after.free, after.total, device_limit, kv_limit, slot_bytes, rows,
-                                   plan.lanes))
-            decoder.release_screen("screened head variant: the plane would cost a committed KV slot or headroom");
-    }
-    return cohort;
+// The prepared_round_fold field of the served startup line: the requested bit from the options and what the decoder's backend
+// admitted of it (MiniDecoderLevers::prepared_round_fold), so a fold the backend declines reads "declined", never "on".
+inline const char* mini_round_fold_startup_field(const MiniServeOptions& opt, const MiniDecoderLevers& levers) {
+    return mini_round_fold_name(levers.prepared_round_fold, opt.prepared_round_fold);
 }
 
 struct MiniServeCohort {

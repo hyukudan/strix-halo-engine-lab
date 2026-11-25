@@ -64,3 +64,7 @@ profile_host_test(strix-cluster-serve-cli-parity-tests "${STRIX_ROOT}/tests/serv
     "${STRIX_ROOT}/src/minimax/engine/mm_defaults.cpp" "${STRIX_ROOT}/src/deepseek41_pair_defaults.cpp")
 target_compile_definitions(strix-cluster-serve-cli-parity-tests PRIVATE
     STRIX_PARITY_GLM=1 STRIX_PARITY_MINIMAX=1 STRIX_PARITY_DS41=1)
+
+profile_host_test(strix-job-sampling-tests "${STRIX_ROOT}/tests/job_sampling_tests.cpp"
+    "${STRIX_ROOT}/src/token_sampling.cpp" "${STRIX_ROOT}/src/speculation_rng.cpp")
+set_tests_properties(strix-job-sampling-tests PROPERTIES ENVIRONMENT "STRIX_SAMPLING_REQUEST_IDENTITY=single")
