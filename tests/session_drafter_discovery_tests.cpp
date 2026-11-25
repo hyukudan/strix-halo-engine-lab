@@ -51,6 +51,30 @@ int main() try {
     found = discover_drafter_sidecar(model, registry, "best");
     require(found && found->path == dir / "export/best.gguf", "source path before logical name");
 
+    // The engine's drafter directory: the logical name inside MTP/ is found, after the source path and before the
+    // logical name beside the model; the recommended candidate still comes first.
+    {
+        const auto mtp_dir = dir / "mtpdir";
+        std::filesystem::create_directories(mtp_dir);
+        const auto mtp_model = mtp_dir / "model.gguf";
+        const std::array<DrafterCandidate, 2> shipped{{{"base", "MTP/base.gguf", "base.gguf", 1000, "MTP"},
+                                                      {"best", "export/best.gguf", "best.gguf", 2000, "MTP"}}};
+        make(mtp_dir / "MTP/base.gguf", 1000);
+        make(mtp_dir / "MTP/best.gguf", 2000);
+        auto in_mtp = discover_drafter_sidecar(mtp_model, shipped, "best");
+        require(in_mtp && in_mtp->name == "best" && in_mtp->path == mtp_dir / "MTP/best.gguf" &&
+            in_mtp->how == "registry drafter 'best' by logical name in MTP/", "recommended drafter found in MTP/ first");
+        make(mtp_dir / "best.gguf", 2000);
+        in_mtp = discover_drafter_sidecar(mtp_model, shipped, "best");
+        require(in_mtp && in_mtp->path == mtp_dir / "MTP/best.gguf", "drafter directory before the logical name beside the model");
+        make(mtp_dir / "export/best.gguf", 2000);
+        in_mtp = discover_drafter_sidecar(mtp_model, shipped, "best");
+        require(in_mtp && in_mtp->path == mtp_dir / "export/best.gguf", "source path before the drafter directory");
+        in_mtp = discover_drafter_sidecar(mtp_model, shipped, "");
+        require(in_mtp && in_mtp->name == "base" && in_mtp->how == "registry drafter 'base' at MTP/base.gguf",
+            "without a preferred name the registry order decides (base at its source path)");
+    }
+
     // A size-0 registry entry accepts any non-empty file only.
     const std::array<DrafterCandidate, 1> loose{{{"loose", "MTP/loose.gguf", "", 0}}};
     make(dir / "MTP/loose.gguf", 1);
