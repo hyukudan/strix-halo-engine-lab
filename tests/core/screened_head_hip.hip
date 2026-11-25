@@ -15,6 +15,7 @@
 #include <limits>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -30,6 +31,39 @@ void check(hipError_t status, const char* what) {
     if (status == hipSuccess) return;
     std::fprintf(stderr, "HIP error %s: %s\n", what, hipGetErrorString(status));
     std::exit(2);
+}
+
+__global__ void produce_two_replies(HipGreedyRowsReply* replies) {
+    replies[0] = {1U, 0U};
+    replies[1] = {2U, 0U};
+}
+
+void test_produced_rows_failure() {
+    strix::core::ResidentGreedy produced(2U, 3U);
+    produced.enqueue_produced_rows(2U, [](HipGreedyRowsReply* replies) {
+        produce_two_replies<<<1, 1>>>(replies);
+        return hipGetLastError();
+    });
+    check(hipDeviceSynchronize(), "sync produced rows");
+    const bool published = produced.token(0U) == 1U && produced.token(1U) == 2U;
+    bool threw = false;
+    try {
+        produced.enqueue_produced_rows(2U, [](HipGreedyRowsReply*) { return hipErrorInvalidValue; });
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    unsigned unpublished = 0;
+    for (unsigned row = 0; row < 2U; ++row) {
+        try {
+            (void)produced.token(row);
+        } catch (const std::out_of_range&) {
+            ++unpublished;
+        }
+    }
+    const bool ok = published && threw && unpublished == 2U;
+    if (!ok) ++failures;
+    std::printf("%s screened-head-hip produced-rows: published %d rejected-throws %d unpublished %u/2\n",
+                ok ? "PASS" : "FAIL", published ? 1 : 0, threw ? 1 : 0, unpublished);
 }
 
 __global__ void monotone_kernel(float cap, unsigned* bad) {
@@ -229,6 +263,7 @@ void bench(std::mt19937& rng) {
 }  // namespace
 
 int main() {
+    test_produced_rows_failure();
     for (const float cap : {30.0F, 15.0F, 50.0F}) monotone(cap);
     std::mt19937 rng(1234U);
     const Case cases[] = {{"random", 6000U, 0}, {"tie", 6000U, 1},   {"peaked", 6000U, 2},

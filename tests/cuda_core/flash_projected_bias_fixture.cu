@@ -3,7 +3,9 @@
 // element), then append_attention_prepared_bf16 runs once on the image and once with the projection. Output rows,
 // K/V cache bytes and the failure flag must be equal byte for byte; with a non-finite logit the flag must be raised by
 // both routes. Covers full and windowed masks, a continuation chunk on a filled cache, a wrapped cache, partial query
-// tiles, both pipes, a short extent, features whose bound fails while every logit is finite, and non-finite logits.
+// tiles, both pipes, a short extent, features whose bound fails while every logit is finite, and non-finite logits;
+// then the host-side refusals: admission, operand overlaps, the device setup (refused before the K/V store, never
+// repeated after it) and a failure word that aliases a live operand.
 #include "core/row_transforms.hpp"
 #include "strix/cuda_core/attention.hpp"
 #include "strix/weight/formats/scalar_float.hpp"
@@ -273,8 +275,15 @@ void setup_refusal() {
     const std::vector<float> out_sentinel = out.download();
     const cc::PreparedBf16Flash prepared{nullptr, nullptr, extent, 0, false};
     const cc::PreparedBf16Projection projection{df.data(), dw.data()};
-    bool ok = true;
+    const auto reset = [&] {
+        check(cudaMemcpy(kc.data(), sentinel.data(), cache_elems * 2U, cudaMemcpyHostToDevice), "sentinel");
+        check(cudaMemcpy(vc.data(), sentinel.data(), cache_elems * 2U, cudaMemcpyHostToDevice), "sentinel");
+        out.fill(out_sentinel);
+    };
+    const auto same = [](const auto& a, const auto& b) { return std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0])) == 0; };
+    bool ok = true, once = true;
     for (const auto pipe : {cc::FlashPipe::pad2, cc::FlashPipe::swz3}) {
+        reset();
         cc::set_projected_optin_limit_for_test(48 * 1024);  // below the pipe's K/V stages plus the 32 KB weight table
         const auto refused = cc::append_attention_prepared_bf16(dims, prepared, projection, dq.data(), dk.data(), dv.data(),
                                                                 kc.data(), vc.data(), 0, rows, out.data(), nullptr, pipe);
@@ -283,18 +292,101 @@ void setup_refusal() {
         const auto ck = kc.download(), cv = vc.download();
         const auto co = out.download();
         const bool untouched = std::memcmp(ck.data(), sentinel.data(), cache_elems * 2U) == 0 &&
-                               std::memcmp(cv.data(), sentinel.data(), cache_elems * 2U) == 0 &&
-                               std::memcmp(co.data(), out_sentinel.data(), co.size() * sizeof(float)) == 0;
+                               std::memcmp(cv.data(), sentinel.data(), cache_elems * 2U) == 0 && same(co, out_sentinel);
         ok = ok && refused == cudaErrorInvalidValue && untouched;
+        const auto accepted = cc::append_attention_prepared_bf16(dims, prepared, projection, dq.data(), dk.data(), dv.data(),
+                                                                 kc.data(), vc.data(), 0, rows, out.data(), nullptr, pipe);
+        check(cudaDeviceSynchronize(), "sync");
+        const auto ref_k = kc.download(), ref_v = vc.download();
+        const auto ref_o = out.download();
+        ok = ok && accepted == cudaSuccess && std::memcmp(ref_k.data(), sentinel.data(), cache_elems * 2U) != 0;
+        // Setup once: prepared at the real limit, then the limit drops below this extent's shared memory between the
+        // preparation and the K/V store. A fresh preparation now refuses; the store and the prepared launch still run.
+        reset();
+        cc::PreparedProjectedLaunch launch, again;
+        const auto first = cc::prepare_prepared_bf16_projected(dims, prepared, projection, dq.data(), kc.data(), vc.data(), 0,
+                                                               rows, out.data(), pipe, nullptr, launch);
+        cc::set_projected_optin_limit_for_test(48 * 1024);
+        const auto second = cc::prepare_prepared_bf16_projected(dims, prepared, projection, dq.data(), kc.data(), vc.data(), 0,
+                                                                rows, out.data(), pipe, nullptr, again);
+        const auto unprepared = cc::launch_prepared_bf16_projected(again, dims, prepared, projection, dq.data(), kc.data(),
+                                                                   vc.data(), 0, rows, out.data(), nullptr);
+        const auto stored = cc::kv_store_prepared_bf16(dims, dk.data(), dv.data(), kc.data(), vc.data(), 0, rows, false,
+                                                       nullptr);
+        const auto launched = cc::launch_prepared_bf16_projected(launch, dims, prepared, projection, dq.data(), kc.data(),
+                                                                 vc.data(), 0, rows, out.data(), nullptr);
+        cc::set_projected_optin_limit_for_test(0);
+        check(cudaDeviceSynchronize(), "sync");
+        once = once && first == cudaSuccess && launch.smem_bytes > 0 && second == cudaErrorInvalidValue &&
+               again.smem_bytes == 0 && unprepared == cudaErrorInvalidValue && stored == cudaSuccess &&
+               launched == cudaSuccess && same(kc.download(), ref_k) && same(vc.download(), ref_v) &&
+               same(out.download(), ref_o);
     }
-    const auto accepted = cc::append_attention_prepared_bf16(dims, prepared, projection, dq.data(), dk.data(), dv.data(),
-                                                             kc.data(), vc.data(), 0, rows, out.data(), nullptr);
-    check(cudaDeviceSynchronize(), "sync");
-    const auto after = kc.download();
-    ok = ok && accepted == cudaSuccess && std::memcmp(after.data(), sentinel.data(), cache_elems * 2U) != 0;
     if (!ok) ++failures;
     std::printf("%s setup refusal (both pipes: error returned, K/V sentinel bytes and output unchanged; accepted once the "
                 "limit is real)\n", ok ? "PASS" : "FAIL");
+    if (!once) ++failures;
+    std::printf("%s setup once (both pipes: limit lowered after the preparation; a fresh preparation refuses, the K/V "
+                "store and the prepared launch run, cache and output equal the plain append)\n", once ? "PASS" : "FAIL");
+}
+
+// A failure word inside any operand the launch or the append reads or writes, or misaligned, is refused by the standalone
+// launch and the append before any enqueue (K/V cache and output keep their sentinel bytes); a separate word runs.
+void failure_aliases() {
+    constexpr unsigned heads = 1, kv_heads = 1, dim = 128, width = cc::kPreparedProjectedBiasWidth, rows = 256, slots = 512,
+                       extent = 64;
+    const cc::AttentionDims dims{heads, kv_heads, dim, 0.0884F, slots};
+    const std::size_t out_floats = std::size_t{rows} * heads * dim, cache_elems = std::size_t{slots} * kv_heads * dim;
+    const std::size_t kv_floats = std::size_t{rows} * kv_heads * dim, feature_floats = std::size_t{rows} * heads * width;
+    Device<float> q(std::vector<float>(out_floats, 0.0F)), k(std::vector<float>(kv_floats, 0.0F)),
+        v(std::vector<float>(kv_floats, 0.0F)), f(std::vector<float>(feature_floats, 0.0F)),
+        s(std::vector<float>(std::size_t{rows} * heads, 0.0F)), o(out_floats);
+    Device<std::uint16_t> w(std::vector<std::uint16_t>(std::size_t{width} * extent, 0U));
+    Device<__nv_bfloat16> kc(cache_elems), vc(cache_elems);
+    Device<unsigned> flag(std::vector<unsigned>(2, 0U));
+    const std::vector<std::uint16_t> sentinel(cache_elems, 0x3C5AU);
+    const std::vector<float> out_sentinel(out_floats, -7.0F);
+    check(cudaMemcpy(kc.data(), sentinel.data(), cache_elems * 2U, cudaMemcpyHostToDevice), "sentinel");
+    check(cudaMemcpy(vc.data(), sentinel.data(), cache_elems * 2U, cudaMemcpyHostToDevice), "sentinel");
+    o.fill(out_sentinel);
+    const cc::PreparedBf16Flash prepared{nullptr, s.data(), extent, 0, false};
+    const cc::PreparedBf16Projection projection{f.data(), w.data()};
+    const auto alone = [&](unsigned* failure) {
+        return cc::attention_prefill_prepared_bf16(dims, prepared, projection, q.data(), kc.data(), vc.data(), 0, rows,
+                                                   o.data(), nullptr, cc::FlashPipe::pad2, failure);
+    };
+    const auto append = [&](unsigned* failure) {
+        return cc::append_attention_prepared_bf16(dims, prepared, projection, q.data(), k.data(), v.data(), kc.data(),
+                                                  vc.data(), 0, rows, o.data(), nullptr, cc::FlashPipe::pad2, failure);
+    };
+    const auto word = [](const void* base, std::size_t bytes) {
+        return reinterpret_cast<unsigned*>(const_cast<char*>(static_cast<const char*>(base)) + bytes);
+    };
+    const auto both = [&](unsigned* failure) {
+        return alone(failure) == cudaErrorInvalidValue && append(failure) == cudaErrorInvalidValue;
+    };
+    const bool in_weights = both(word(w.data(), 64)) && both(word(w.data(), std::size_t{width} * extent * 2U - 4U));
+    const bool in_features = both(word(f.data(), 1024)) && both(word(f.data(), feature_floats * 4U - 4U));
+    const bool in_output = both(word(o.data(), 4096)) && both(word(o.data(), out_floats * 4U - 4U));
+    const bool in_cache = both(word(kc.data(), 512)) && both(word(vc.data(), cache_elems * 2U - 4U));
+    const bool in_query = both(word(q.data(), 256)) && both(word(s.data(), 0));
+    const bool in_rows = append(word(k.data(), 128)) == cudaErrorInvalidValue &&
+                         append(word(v.data(), kv_floats * 4U - 4U)) == cudaErrorInvalidValue;
+    const bool misaligned = both(word(flag.data(), 1));
+    check(cudaDeviceSynchronize(), "sync");
+    const auto cache_k = kc.download(), cache_v = vc.download();
+    const auto image = o.download();
+    const bool untouched = std::memcmp(cache_k.data(), sentinel.data(), cache_elems * 2U) == 0 &&
+                           std::memcmp(cache_v.data(), sentinel.data(), cache_elems * 2U) == 0 &&
+                           std::memcmp(image.data(), out_sentinel.data(), out_floats * sizeof(float)) == 0;
+    const bool separate = alone(flag.data()) == cudaSuccess && append(flag.data()) == cudaSuccess;
+    check(cudaDeviceSynchronize(), "sync");
+    const bool ok = in_weights && in_features && in_output && in_cache && in_query && in_rows && misaligned && untouched &&
+                    separate;
+    if (!ok) ++failures;
+    std::printf("%s failure word (inside weights / features / output image / K and V cache / q / sinks / K and V rows, or "
+                "misaligned: refused with cache and output untouched; a separate word admitted and run)\n",
+                ok ? "PASS" : "FAIL");
 }
 
 // Two host threads, two streams, alternating extents 64 / 1024 on the same specialization: every launch must run and
@@ -377,6 +469,7 @@ int main() {
     refusals();
     overlaps();
     setup_refusal();
+    failure_aliases();
     concurrent_extents();
     std::printf("%s flash projected bias: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);
     return failures ? EXIT_FAILURE : EXIT_SUCCESS;

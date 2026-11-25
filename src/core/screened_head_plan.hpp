@@ -310,7 +310,8 @@ constexpr unsigned rescore_blocks(unsigned rows) noexcept {
 
 // One enqueue of the rescore trait over `lanes` rows of scores (all pointers are device pointers).
 // The required prefix of scratch must be disjoint from weights, activations and the score image (including pitch
-// tails). The enqueue owns this prefix exclusively until stream completion.
+// tails). The enqueue owns this prefix exclusively until stream completion. The score image (including pitch tails) is
+// rewritten in place, so it must be disjoint from the weights and the activations too.
 struct RescoreLaunch {
     HeadSpec head;          // incumbent BF16 rows and the post-transform cap (> 0)
     const float* x;         // activations [lanes][x_stride], 16-byte aligned
@@ -346,10 +347,17 @@ inline bool rescore_launch_valid(const RescoreLaunch& a) noexcept {
         const auto start = reinterpret_cast<std::uintptr_t>(p);
         return size <= max_address - start && (start + size <= scratch || scratch + bytes <= start);
     };
-    const auto activations = std::uint64_t{a.lanes - 1U} * a.x_stride + a.head.width;
-    return disjoint(a.head.weights, std::uint64_t{a.head.rows} * a.head.width * sizeof(std::uint16_t)) &&
-           disjoint(a.x, activations * sizeof(float)) &&
-           disjoint(a.scores, std::uint64_t{a.lanes} * a.pitch * sizeof(float));
+    // The score image is rewritten in place, so it may not alias the incumbent weights or the activations either.
+    const auto ranges_disjoint = [](const void* p, std::uint64_t p_size, const void* q, std::uint64_t q_size) {
+        const auto ps = reinterpret_cast<std::uintptr_t>(p), qs = reinterpret_cast<std::uintptr_t>(q);
+        return p_size <= max_address - ps && q_size <= max_address - qs && (ps + p_size <= qs || qs + q_size <= ps);
+    };
+    const auto weight_bytes = std::uint64_t{a.head.rows} * a.head.width * sizeof(std::uint16_t);
+    const auto activation_bytes = (std::uint64_t{a.lanes - 1U} * a.x_stride + a.head.width) * sizeof(float);
+    const auto score_bytes = std::uint64_t{a.lanes} * a.pitch * sizeof(float);
+    return disjoint(a.head.weights, weight_bytes) && disjoint(a.x, activation_bytes) && disjoint(a.scores, score_bytes) &&
+           ranges_disjoint(a.scores, score_bytes, a.head.weights, weight_bytes) &&
+           ranges_disjoint(a.scores, score_bytes, a.x, activation_bytes);
 }
 
 }  // namespace strix::core::screened_head_plan
