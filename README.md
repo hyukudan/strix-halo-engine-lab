@@ -152,7 +152,7 @@ the native resolver also prints its effective settings using the startup inputs 
 
 | Model | Device | Serve | CLI |
 |---|---|---|---|
-| Qwen3.8 Flash Next | Strix, one node | `strix-serve --model qwen3.8-flash-next --profile fast --asset MODEL.gguf` | `strix run qwen3.8-flash-next --profile fast --asset MODEL.gguf -- --prompt-ids prompt.ids --generate 256` |
+| Qwen3.8 Flash Next | Strix, one node | `strix-serve --model qwen3.8-flash-next --profile fast --asset MODEL.gguf -- --prompt-ids calibration.ids --generate 64 --http-batch 8` ([calibration prompt](docs/models/qwen3.8/README.md#serving-quick-start)) | `strix run qwen3.8-flash-next --profile fast --asset MODEL.gguf -- --prompt-ids prompt.ids --generate 256` |
 | Qwen3.8 Flash Next | Strix pair | Pair CLI | `strix run qwen3.8-flash-next --profile fast --asset MODEL.gguf -- --prompt-ids prompt.ids --generate 256 --deploy deploy.toml --rank R --transport usb4auto` |
 | Qwen3.8 Flash Next | RTX, Windows | `strix-serve --model qwen3.8-flash-next --profile fast --backend cuda --asset MODEL.gguf -- --tables TABLES --rope-table rope_cs.bin` | — |
 | Qwen3.8-27B | Strix, one node | — | `strix run qwen3.8-27b --profile fast --asset MODEL.gguf -- --prompt-ids @prompt.ids --gen 256` |
