@@ -91,16 +91,18 @@ pass appends, and retires every lane of the cohort if a pass fails. The packed
 route uses one kernel for gate/up with BF16 activation and one for down with
 ordered expert combine.
 
-Prefill follows one schedule on both entry points: chunks of 8192 rows on
-HIP and 2048 on CUDA (`--prefill-chunk` on the command line, `--prefill-rows`
-on the server), and on HIP a remainder of up to chunk / 8 rows (and more than
-16) rides in the final chunk (`STRIX_INKLING_PREFILL_TAIL=0` turns that off on
-both). The server reads the whole prompt by prefill and takes the first id from
-its final row, as the command line does. While another lane decodes it runs a
-prompt in 128-row pieces cut inside those chunks only at 16-row wave tiles and
-never shorter than 17 rows, where every row keeps its route forms, so the
-answer does not depend on other requests; CUDA runs whole chunks. The server
-prints `prefill_chunk`, `prefill_tail` and `first_id prefill` in its startup
+On HIP, prefill follows one schedule on both entry points: chunks of 8192
+rows (`--prefill-chunk` on the command line, `--prefill-rows` on the server),
+and a remainder of up to chunk / 8 rows (and more than 16) rides in the final
+chunk (`STRIX_INKLING_PREFILL_TAIL=0` turns that off on both). The server reads
+the whole prompt by prefill and takes the first id from its final row, as the
+command line does. While another lane decodes it runs a prompt in 128-row
+pieces cut inside those chunks only at 16-row wave tiles and never shorter than
+17 rows, where every row keeps its route forms, so the answer does not depend
+on other requests. The CUDA command line prefills in 2048-row chunks; a CUDA
+server keeps its earlier route (128-row chunks, the last prompt token decoded)
+until its own identity check. The server prints `prefill_chunk`,
+`prefill_tail` and `first_id prefill` (CUDA: `first_id decode`) in its startup
 line; the command line prints `strix-prefill-route/v1`.
 
 ## Execution and reuse
