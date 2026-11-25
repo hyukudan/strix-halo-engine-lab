@@ -8,6 +8,7 @@
 //    lanes of a wave hold one group per iteration); the norm's FP32 output row is still written;
 //  - quantize_rows_kernel<Pre>: the quantiser of an elementwise pre-op (the shared glu functions sigmoid_gate / swiglu) of
 //    two FP32 rows; same launch shape as quantize_a8_kernel (one wave per (group, row)).
+#include "a8_group_device.hpp"
 #include "../glu/glu.hpp"  // relative: binders of this header need not have src/ on their include path
 
 #include <hip/hip_runtime.h>
@@ -16,25 +17,6 @@
 #include <cstdint>
 
 namespace strix::ops::a8 {
-
-struct Group {
-    int code;
-    float delta;
-    int sum;
-};
-
-// x: this lane's value; all 32 lanes of the wave call (shuffles over the wave32).
-__device__ __forceinline__ Group quantize_group(float x) {
-    float amax = fabsf(x);
-    for (int stride = 16; stride; stride /= 2) amax = fmaxf(amax, __shfl_xor(amax, stride, 32));
-    const bool tiny = amax > 0.0F && amax < 0x1p-119F;
-    const float delta = amax == 0.0F || tiny ? 1.0F : amax / 127.0F;
-    const float rounded = tiny ? 0.0F : rintf(x / delta);
-    const int code = static_cast<int>(fminf(127.0F, fmaxf(-127.0F, rounded)));
-    int sum = code;
-    for (int stride = 16; stride; stride /= 2) sum += __shfl_xor(sum, stride, 32);
-    return {code, delta, sum};
-}
 
 // A8 rows: codes [rows][pitch], deltas / sums [rows][pitch / 32] (pitch % 32 == 0, pitch >= width).
 struct Rows {

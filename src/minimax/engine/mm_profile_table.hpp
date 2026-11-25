@@ -71,7 +71,7 @@ static_assert(msa_flash_policy(kMsaFlashLayers) != nullptr &&
               "the bundle member's policy id names the bundle's layer set");
 
 // Bundle selection is requested provenance; only effective members enter agreement.
-inline constexpr std::array<strix::profile::Lever, 9> profile_table{{
+inline constexpr std::array<strix::profile::Lever, 10> profile_table{{
     // Prefill only: MSA attention of windows > 8 rows; selection, block lists and K/V caches unchanged.
     // fast: member of the qualified bundle mm-fast-pf-v2 ('--profile fast' expands the bundle, mm_defaults.cpp
     // prefill_policy: same admission as STRIX_MM_FAST_PREFILL=1). The fast cells of the two members are the bundle's
@@ -106,6 +106,12 @@ inline constexpr std::array<strix::profile::Lever, 9> profile_table{{
      "mm-pf-router-wmma-v1, bundle mm-fast-pf-v2 (gate PASS 8K KL 0.0020 and 32K with the bundle)", false, {}, true},
     {"router_wmma_layers", "STRIX_MM_PF_ROUTER_WMMA_LAYERS", "", {"", "", "", ""}, kRouterWmmaLayers, strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, false}, "", "", "FAST router layer set (read only while router_wmma is on)", false, {}, true},
+    // Prefill only, explicit opt-in (no profile selects it): dense MLP gate/up/down of layers 0-2 on the fixed K order
+    // wherever the library split differs (identity mmx-pf-linear-s1-v2). Needs the invariant order; refused with the
+    // adaptive order / baseline and with STRIX_MM_PREFILL_IDENTITY=fp32 (mm_defaults.cpp dense_tail_fixed).
+    {"pf_dense_tail_fixed", "STRIX_MM_PF_DENSE_TAIL_FIXED", "", {"", "", "", ""}, "0", strix::profile::Kind::bit_changing,
+     {true, false, true, false}, {true, true, true, false}, "", "0",
+     "mmx-pf-linear-s1-v2 opt-in; native two-rank identity and workload receipt pending", false, {}, true},
 }};
 
 }  // namespace strix::minimax::defaults

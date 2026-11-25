@@ -6,10 +6,12 @@
 #include "strix/serve/serial_generation_cli.hpp"
 #include "strix/session/head_gate_cli.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <optional>
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -20,7 +22,6 @@ namespace strix::inkling2::cli {
 struct Options {
     serve::SerialGenerationOptions generation;
     const char* dspark{};
-    bool dspark_off{};  // --dspark off: no block drafter (not even mtp.safetensors beside the model)
     const char* gate_manifest{};
     const char* gate_out{};
     const char* gate_arm{};
@@ -32,19 +33,17 @@ struct Options {
     profile::Resolution tier;
 };
 
-inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily& family) {
+inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily& family, bool native) {
     Options options;
     options.generation = serve::parse_serial_generation_cli(argc, argv, family,
         [&](std::string_view argument, const auto& value) {
-            if (parse_mini_weight_option(options.weights, argument, value, family.default_prefill_chunk != 0))
+            if (parse_mini_weight_option(options.weights, argument, value, native))
                 return true;
             if (argument == "--dspark") {
-                const char* path = value();
-                options.dspark_off = std::string_view(path) == "off";
-                options.dspark = options.dspark_off ? nullptr : path;
+                options.dspark = value();
                 return true;
             }
-            if (!family.default_prefill_chunk) return false;
+            if (!native) return false;
             if (argument == "--step-graph" || argument == "--no-step-graph")
                 options.step_graphs = argument == "--step-graph";
             else if (argument == "--gate-manifest") options.gate_manifest = value();
@@ -74,10 +73,8 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
     const auto& generation = options.generation;
     if (options.dspark) {
         if (gate || generation.tokenize_file || generation.speculation != serve::CliSpeculation::automatic ||
-            (token_sampling_enabled(generation.sampling) && !family.sampled_speculation))
-            throw std::invalid_argument(family.sampled_speculation
-                ? "--dspark requires --speculation auto with model generation"
-                : "--dspark requires greedy --speculation auto with model generation");
+            token_sampling_enabled(generation.sampling))
+            throw std::invalid_argument("--dspark requires greedy --speculation auto with model generation");
         if (generation.logits && std::filesystem::exists(generation.logits) && std::filesystem::exists(options.dspark) &&
             std::filesystem::equivalent(generation.logits, options.dspark))
             throw std::invalid_argument("logits output must differ from the DSpark sidecar");
@@ -86,10 +83,19 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
                  generation.tokenize_file || generation.generate_requested || generation.logits ||
                  generation.sampling_requested))
         throw std::invalid_argument("gate mode takes no prompt, --tokenize, --generate, --logits or sampling options");
-    options.tier = resolve_mini_profile(options.weights, !generation.tokenize_file);
+    options.tier = resolve_mini_profile(options.weights, native && !generation.tokenize_file);
+    mini_cli_decline_served_route(options.tier);
     if (options.gate_order_null && (!gate || options.tier.profile != profile::Name::standard))
         throw std::invalid_argument("--gate-order-null requires an exact gate arm");
     return options;
+}
+
+// A gate holds one sequence at a time and reuses one weight image across all windows.
+inline weight::WeightLoadExtent gate_weight_extent(std::span<const session::HeadGateWindow> windows) {
+    unsigned positions = 0;
+    for (const auto& window : windows)
+        positions = std::max(positions, static_cast<unsigned>(window.ids.size()));
+    return {positions, 1U};
 }
 
 // Exact R1 latency forms of the CUDA step program (mask: 1 tiled bank readout, 2 controller output split,
@@ -171,6 +177,7 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
             throw std::invalid_argument("latency forms select step-program leaves: decode through --step-program");
         return {false, requested_mode, {}};
     }
+    require_mini_expert_consumer(options.tier, false);
     if (options.gate_order_null)
         throw std::invalid_argument("--gate-order-null requires resident replay with --step-graph or --no-step-graph");
     if (options.dspark)
@@ -185,24 +192,6 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
     if (requested_mode == Mode::automatic)
         return {true, Mode::off, "CUDA step program has no verifier"};
     return {true, Mode::off, {}};
-}
-
-// Block drafter checkpoint of a route that verifies windows (every backend): an explicit --dspark FILE, none with
-// --dspark off, else mtp.safetensors beside the model when the request drafts automatically (absent file: none).
-[[nodiscard]] inline std::string resolve_block_drafter(const Options& options, const std::string& checkpoint) {
-    if (options.dspark_off) return {};
-    if (options.dspark) return options.dspark;
-    if (options.generation.speculation != serve::CliSpeculation::automatic || options.gate_manifest ||
-        options.generation.tokenize_file)
-        return {};
-    std::error_code error;
-    const auto beside = std::filesystem::path(checkpoint).parent_path() / "mtp.safetensors";
-    return std::filesystem::is_regular_file(beside, error) ? beside.string() : std::string{};
-}
-
-// Receipt source of the resolved drafter: off | explicit | beside-model | absent.
-[[nodiscard]] inline std::string_view block_drafter_source(const Options& options, const std::string& drafter) {
-    return options.dspark_off ? "off" : options.dspark ? "explicit" : drafter.empty() ? "absent" : "beside-model";
 }
 
 inline void write_profile(const profile::Resolution& tier, std::ostream& output, bool device) {

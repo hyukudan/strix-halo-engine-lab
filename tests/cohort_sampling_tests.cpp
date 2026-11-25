@@ -49,8 +49,6 @@ public:
         bool greedy = false, sampled = false;
         for (const auto& g : groups) {
             const auto lane = g.lane;
-            // the driver names exactly the rows whose final logits a sampled lane will read
-            if (g.reads_scores != (markers_.at(lane) == 2U)) ++score_flag_errors;
             if (markers_.at(lane) == 2U) {
                 sampled = true;
                 check(g.rows == 1U, "sampled lane never verifies a context draft");
@@ -79,7 +77,6 @@ public:
     void release(std::uint32_t) override {}
 
     unsigned reads = 0;
-    unsigned score_flag_errors = 0;
     bool mixed_window = false;
 
 private:
@@ -152,7 +149,5 @@ int main() {
     check(alone.ids == first.at(sampled.id).ids && alone.ids != first.at(other_seed.id).ids,
           "same seed replays solo, different seeds differ");
     check(mixed.reads == 128U && reordered.reads == 128U && solo.reads == 64U, "one readback per sampled decision");
-    check(greedy_backend.score_flag_errors == 0U && mixed.score_flag_errors == 0U && reordered.score_flag_errors == 0U &&
-              solo.score_flag_errors == 0U, "verify groups flag exactly the lanes that read their final logits");
     return failures == 0 ? 0 : 1;
 }

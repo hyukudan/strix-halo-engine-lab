@@ -9,7 +9,7 @@ void decode_prepare_kernel(
     std::uint32_t kernel_size, float epsilon) {
     const unsigned head = blockIdx.x;
     const unsigned channel = head * head_dim + threadIdx.x;
-    conv_update_body(qkv, conv_state, conv_weights, conv_kind, kernel_size, channel);
+    core::causal_conv::ring_update<GdnBf16, GdnSmallLoad>(qkv, conv_state, conv_weights, conv_kind, kernel_size, channel);
     if (head < 2U * key_heads) {
         __shared__ float scratch[kRecurrentThreads];
         __syncthreads();
@@ -17,7 +17,7 @@ void decode_prepare_kernel(
         // rsqrtf(128) at compile time could differ from the device instruction.
         normalize_qk_body(qkv, key_heads, head_dim, epsilon, nullptr, head, scratch);
     } else if (head < 2U * key_heads + value_heads && threadIdx.x == 0) {
-        transform_beta_gate_body(beta, gate, dt, dt_kind, a, a_kind, head - 2U * key_heads);
+        ops::recur::gated_delta_gate_body<GdnGate, GdnBf16, GdnSmallLoad>(beta, gate, dt, dt_kind, a, a_kind, head - 2U * key_heads);
     }
 }
 
@@ -33,9 +33,9 @@ void decode_conv_gate_kernel(
     if (blockIdx.x < conv_blocks) {
         if (graph_status != nullptr && *graph_status != 0) return;
         const unsigned channel = blockIdx.x * kRecurrentThreads + threadIdx.x;
-        if (channel < channels) conv_update_body(qkv, conv_state, conv_weights, conv_kind, kernel_size, channel);
+        if (channel < channels) core::causal_conv::ring_update<GdnBf16, GdnSmallLoad>(qkv, conv_state, conv_weights, conv_kind, kernel_size, channel);
     } else {
         const unsigned head = (blockIdx.x - conv_blocks) * kRecurrentThreads + threadIdx.x;
-        if (head < heads) transform_beta_gate_body(beta, gate, dt, dt_kind, a, a_kind, head);
+        if (head < heads) ops::recur::gated_delta_gate_body<GdnGate, GdnBf16, GdnSmallLoad>(beta, gate, dt, dt_kind, a, a_kind, head);
     }
 }

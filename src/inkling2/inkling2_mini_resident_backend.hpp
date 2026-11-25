@@ -7,6 +7,9 @@
 #include "inkling2_mini_controller_device.hpp"
 #include "inkling2_mini_resident_route.hpp"
 #include "inkling2_mini_residual_device.hpp"
+#if !defined(__HIPCC__)
+#include "inkling2_mini_controller_operands_cuda.hpp"
+#endif
 #include "moe_core/microscaled_r1.hpp"
 
 #include <algorithm>
@@ -71,7 +74,7 @@ struct MiniResidentGqaBackend : Base {
 
     Status linear(const float* input, unsigned width, unsigned rows,
                   std::span<const core::ResidentRowProjection> views) const {
-        return core::dispatch_resident_rows<MiniProjectionWeights::role_count>(views, success, invalid,
+        return core::dispatch_resident_rows<MiniProjectionWeights::role_count>(input, width, rows, views, success, invalid,
             [&](std::span<const MiniAttentionLinear> group) {
                 return Base::linear(input, width, rows, group);
             },
@@ -82,6 +85,12 @@ struct MiniResidentGqaBackend : Base {
                     , this->big_context
 #endif
                 );
+            },
+            [&](std::span<const MiniAttentionLinear> group) {
+                return Base::linear_admitted(input, width, rows, group);
+            },
+            [&](std::span<const core::ResidentRowProjection> group) {
+                return core::resident_q8_projections_admitted<MiniProjectionWeights::role_count>(input, width, rows, group);
             });
     }
 
@@ -146,9 +155,9 @@ public:
 #endif
 
     MiniResidentBackend(const MiniResidentWeights& weights, unsigned max_rows, mini_gpu::Stream stream,
-                        bool packed_decode = false, bool step_graphs = default_step_graphs)
+                        bool packed_decode = false, bool step_graphs = default_step_graphs, bool cohort_rows = false)
         : weights_(weights), stream_(stream), max_rows_(checked_chunk_rows(max_rows)), packed_decode_(packed_decode),
-          step_graphs_(step_graphs),
+          cohort_rows_(packed_decode && cohort_rows), step_graphs_(step_graphs),
           tiles_(moe_core::device_grouped::tile_bound(max_rows_, kExpertsPerToken, kExperts, Moe::rows_per_tile)),
           controller_(mini_controller_elements(max_rows_)), attention_(attention_elements(max_rows_)),
 #if defined(__HIPCC__)
@@ -163,8 +172,9 @@ public:
 #if defined(__HIPCC__)
           moe_activation_(mini_moe_activation_elements(max_rows_)),
 #endif
-          // Packed decode keeps one route status per routed row (cohort decode: up to max_rows_ lanes).
-          flags_((1U + (packed_decode ? max_rows_ : 1U)) * kLogicalVisits),
+          // Packed decode keeps one route status per routed row: up to kMiniMaxVerifyRows verify rows, or, with packed
+          // cohort rows (the served route lever only), a cohort decode pass of up to max_rows_ lanes.
+          flags_((1U + (packed_decode ? (cohort_rows ? max_rows_ : std::min(max_rows_, kMiniMaxVerifyRows)) : 1U)) * kLogicalVisits),
           zero_padding_(kHeadWidth) {
 #if !defined(__HIPCC__)
         if (const char* enable = strix::envcfg::text("STRIX_INKLING_K1BIND"); enable && std::string_view(enable) == "1") {
@@ -198,6 +208,13 @@ public:
     }
 
     [[nodiscard]] mini_gpu::Stream stream() const { return stream_; }
+#if !defined(__HIPCC__)
+    // The attention linears' backend (what attention() prepares with): the operand class the staged attention weights'
+    // certificate declares, on this backend's stream and dense context. `planes_report` observes each dispatch.
+    [[nodiscard]] detail::MiniPreparedCudaBackend attention_operand_backend(int* planes_report = nullptr) const {
+        return detail::mini_attention_backend(stream_, big_context_.get(), weights_.attention_certificate(), planes_report);
+    }
+#endif
 #if !defined(__HIPCC__)
     struct StepProgramBuffers {
         unsigned max_rows;
@@ -234,6 +251,49 @@ public:
         null_applications_ = 0;
     }
     [[nodiscard]] std::uint64_t gate_null_applications() const { return null_applications_; }
+    // Resolved prepared-attention round fold (mini_prepared_round_fold): admitted on the qualified HIP target
+    // (mini_prepared_round_fold_admitted), declined on any other target and on CUDA, whose preparation has no fold. Set
+    // once after construction; a captured step graph made under another effective setting is dropped. Returns the
+    // effective state (false = off or declined); every entry point reports that, never the request.
+    bool set_prepared_round_fold(bool selected) {
+        bool effective = false;
+#if defined(__HIPCC__)
+        if (selected) {
+            hipDeviceProp_t properties{};
+            mini_gpu::check(hipGetDeviceProperties(&properties, mini_gpu::current_device()), "read HIP device properties");
+            const std::string_view target(properties.gcnArchName);
+            effective = mini_prepared_round_fold_admitted(true, target.substr(0, target.find(':')));
+        }
+        if (effective != prepared_round_fold_) {
+            graph_.invalidate();
+            invalidate_cohort_graphs();
+            prepared_round_fold_ = effective;
+        }
+#else
+        static_cast<void>(selected);
+#endif
+        return effective;
+    }
+
+    // Lever inkling2-mini-attn-projected-bias@1 (bit-identical to the image route): single multi-row prompt chunks project the
+    // relative bias inside the flash. Every entry point (gate, generation CLI, step program, server) passes the resolved value;
+    // HIP ignores it (its projected route is selected by its own binding).
+    void set_attention_projected_bias(bool enabled) {
+#if defined(__HIPCC__)
+        static_cast<void>(enabled);
+#else
+        attention_projected_bias_ = enabled;
+#endif
+    }
+    // CUDA projected-bias attention submissions so far (0 on HIP and with the lever off): what a test observes to tell the
+    // projected route from the image route, whose bits are equal.
+    [[nodiscard]] std::uint64_t projected_attention_dispatches() const {
+#if defined(__HIPCC__)
+        return 0U;
+#else
+        return projected_dispatches_;
+#endif
+    }
 
     // FAST W4A4 expert lever (inkling2-mini-moe-w4a4@1): multi-row prefill chunks run admitted NVFP4 expert layers through
     // the shared grouped W4A4 operand class. The NVFP4 image of the assignment rows is allocated only when the lever is on.
@@ -253,10 +313,40 @@ public:
 #endif
     }
 
+    // Exact down-image lever (inkling2-mini-combine-down-image@1; mini_combine_image resolves it): on the qualified HIP
+    // target (mini_combine_image_arch) the grouped MoE down stores a BF16 image the combine reads, with the NaN side-channel
+    // word allocated here, zeroed once. Unselected, or on any other target, no word exists and the dispatch keeps the
+    // FP32 down rows (null pointer). Returns whether the image route is active. CUDA ignores it.
+    // Verify rows lever (MiniResidentDecoder::set_verify_rows): HIP verify windows attend their rows in one lanes launch
+    // set. Verify windows run eagerly, so no captured graph depends on it. CUDA ignores it.
+    void set_verify_lanes(bool enabled) noexcept {
+#if defined(__HIPCC__)
+        verify_lanes_ = enabled;
+#else
+        static_cast<void>(enabled);
+#endif
+    }
+    bool set_combine_image(bool selected) {
+#if defined(__HIPCC__)
+        if (!selected || moe_nan_seen_) return moe_nan_seen_.has_value();
+        hipDeviceProp_t properties{};
+        mini_gpu::check(hipGetDeviceProperties(&properties, mini_gpu::current_device()), "read HIP device properties");
+        const std::string_view target(properties.gcnArchName);
+        if (!mini_combine_image_arch(target.substr(0, target.find(':')))) return false;
+        moe_nan_seen_.emplace(1U);
+        mini_gpu::clear(moe_nan_seen_->data(), moe_nan_seen_->span().size_bytes(), stream_);
+        mini_gpu::synchronize(stream_);
+        return true;
+#else
+        static_cast<void>(selected);
+        return false;
+#endif
+    }
+
     void start_chunk(unsigned rows, MiniAppendKind kind) {
         // Route capture/replay reads or writes host data synchronously. The step graph itself is
         // decided by try_step_graph; the route only picks the row geometry here.
-        route_ = mini_resident_route(kind, rows, packed_decode_, false);
+        route_ = mini_resident_route(kind, rows, packed_decode_, false, cohort_rows_);
         route_flag_rows_ = route_.packed_moe ? rows : 1U;
 #if !defined(__HIPCC__)
         chunk_w4a4_ = moe_w4a4_ && kind == MiniAppendKind::prefill && rows > 1U;
@@ -289,7 +379,7 @@ public:
 
     // The host route of a chunk whose device work replays (the captured start_chunk also clears the flags).
     void prepare_route(unsigned rows, MiniAppendKind kind) {
-        route_ = mini_resident_route(kind, rows, packed_decode_, false);
+        route_ = mini_resident_route(kind, rows, packed_decode_, false, cohort_rows_);
         route_flag_rows_ = route_.packed_moe ? rows : 1U;
         chunk_w4a4_ = moe_w4a4_ && kind == MiniAppendKind::prefill && rows > 1U;
     }
@@ -337,11 +427,12 @@ public:
     [[nodiscard]] bool packed_decode() const noexcept { return packed_decode_; }
 
     void finish() {
-        // Packed cohort decode keeps one status per routed lane (route_flag_rows_ up to max_rows_).
         std::array<unsigned, (1U + kMiniMaxVerifyRows) * kLogicalVisits> storage{};
         const auto active = active_flags().size();
-        if (active > storage.size()) wide_flags_.resize(active);
-        const auto flags = active > storage.size() ? std::span(wide_flags_) : std::span(storage).first(active);
+        // Packed cohort rows (served route lever) can route more rows than the verify window: a host copy that grows
+        // once to the widest routed call.
+        if (active > storage.size() && host_flags_.size() < active) host_flags_.resize(active);
+        const auto flags = active > storage.size() ? std::span(host_flags_).first(active) : std::span(storage).first(active);
         mini_gpu::copy(flags.data(), flags_.data(), flags.size_bytes(), mini_gpu::device_to_host, stream_);
         mini_gpu::synchronize(stream_);
         if (std::ranges::any_of(flags, [](unsigned flag) { return flag != 0U; }))
@@ -364,6 +455,15 @@ public:
 #endif
     }
 
+#if !defined(__HIPCC__)
+    // The opt-in CUDA schedule uses one plane for declared BF16 operands with certified resident weights.
+    void dense(const float* input, unsigned width, unsigned rows, std::span<const Projection> projections,
+               core::Bf16Operand operand) {
+        check(enqueue_controller_dense(weights_.controller_certificate(), input, width, rows, projections, stream_,
+                                       big_context_.get(), operand).status);
+    }
+#endif
+
 #if defined(__HIPCC__)
     // Projections on a BF16 operand image (the shared tile's image rows: same bits as dense on the FP32 rows).
     static bool admits_dense_bf16_image(unsigned width, unsigned rows, std::span<const Projection> projections) {
@@ -379,6 +479,19 @@ public:
                           const core::residual_mix::ControllerArgs& control) {
         const auto status = core::fma_rows::enqueue_bf16_controller_rows(input, width, rows, gates, control.current,
                                                                          control.message, control.output, stream_);
+        if (status == hipErrorNotSupported) return false;
+        check(status);
+        return true;
+    }
+
+    // The gate pair, the controller and rms() below (the shared BF16-rows norm, kMiniHipRmsEpsilon) as one row-owner
+    // launch writing the normalized rows to control.output; false = not admitted (the caller keeps the launches).
+    bool dense_controller_rms(const float* input, unsigned width, unsigned rows, std::span<const Projection> gates,
+                              const core::residual_mix::ControllerArgs& control, const std::uint16_t* scale) {
+        if (rows > kMaxContext) return false;
+        const auto status = core::fma_rows::enqueue_bf16_controller_rms_rows(
+            input, width, rows, gates, control.current, control.message, scale, kMiniHipRmsEpsilon, control.output,
+            stream_);
         if (status == hipErrorNotSupported) return false;
         check(status);
         return true;
@@ -469,6 +582,11 @@ private:
         };
         auto* attended = take(kQueryWidth);
         auto* gated = take(kQueryWidth);
+#if defined(__HIPCC__)
+        // The prefill projections' BF16 operand image: rows x the widest projection input (u16).
+        const std::span<std::uint16_t> operand_image(reinterpret_cast<std::uint16_t*>(take(kQueryWidth / 2U)),
+                                                     std::size_t{max_rows_} * kQueryWidth);
+#endif
         const auto* lag = mini_convolution_layer(lag_weights_.data(), visit);
         auto* failure = flags_.data() + visit.logical_layer;
         const auto* step = capture_descriptor();
@@ -502,7 +620,8 @@ private:
                                                 workspace(splits).size(), splits))
                 check(hipErrorInvalidValue);
         };
-        const detail::MiniResidentGqaBackend<> adapter{{{stream_}}, gate_order_null_ ? &null_applications_ : nullptr};
+        const detail::MiniResidentGqaBackend<detail::MiniPreparedHipImageBackend> adapter{
+            {{{stream_}, prepared_round_fold_}, operand_image}, gate_order_null_ ? &null_applications_ : nullptr};
         const auto prepare_with = [&](const auto& body) { return body(adapter); };
         auto* operand_failure = failure;
         const auto launch_group = [&](const MiniResidentAttentionGroup& group, std::size_t base) {
@@ -534,12 +653,13 @@ private:
                 kKvHeads, mini_prepared_gqa_window(visit), kRelativeExtent, image, lanes_, zero_padding_.data(),
                 failure, stream_, attention_partials_.span());
         };
-        // A verify window (one sequence, one-row decode windows, eager): its rows go into one lanes launch set on the
-        // sequence's cache, each lane at its own position with its one-row decode geometry, instead of one launch set
-        // per row. Lane bits = the per-window launch bits; the shared admission (sequence_lane_caches) holds because
-        // the window ring reserves window - 1 + max chunk rows.
-        const bool verify_lanes = single && !step && route_.attention_rows == 1U && single->chunk.rows > 1U &&
-                                  single->chunk.rows <= attn_core::dense::kMaxPreparedBf16Lanes;
+        // Verify rows lever (set_verify_lanes): a verify window (one sequence, one-row decode windows, eager) puts its
+        // rows into one lanes launch set on the sequence's cache, each lane at its own position with its one-row decode
+        // geometry, instead of one launch set per row. Lane bits = the per-window launch bits; the shared admission
+        // (sequence_lane_caches) holds because the window ring reserves window - 1 + the largest chunk rows
+        // (tests/inkling2/mini_schedule_test.cpp).
+        const bool verify_lanes = verify_lanes_ && single && !step && route_.attention_rows == 1U &&
+                                  single->chunk.rows > 1U && single->chunk.rows <= attn_core::dense::kMaxPreparedBf16Lanes;
         const auto launch_verify_lanes = [&] {
             lanes_.clear();
             const auto& kv = single->state.kv;
@@ -567,7 +687,10 @@ private:
         };
 #else
         const auto admit = [](const MiniResidentAttentionGroup&, std::size_t) {};
-        const detail::MiniPreparedCudaBackend native{{stream_}, cuda_core::DenseArith::mma3, big_context_.get()};
+        // Producer-backed operands: the attention inputs are rmsnorm_bf16 rows and the output projection reads the
+        // BF16 gated product, so the linears declare bf16_exact (one plane, same bits) where the staged attention
+        // weights are certified (finite, ranges kept finite); otherwise they keep FP32 operands (three planes).
+        const detail::MiniPreparedCudaBackend native = attention_operand_backend();
         const detail::MiniResidentGqaBackend<> adapter{native, gate_order_null_ ? &null_applications_ : nullptr};
         // One-row decode over native BF16 weights with a rows profile issues the
         // projection groups as one grouped rows call at the first round (the
@@ -664,15 +787,6 @@ private:
                     backend, is_full_attention(visit.physical_layer), single ? single->chunk.first_position : 0U,
                     rows, inputs, weights, work, prep, operand_failure, device_position, prep_groups_, prep_lanes);
             };
-            // A taped (verify) chunk keeps the raw K/V rows, the inputs of the two KV convolutions.
-            const auto keep_tape = [&] {
-                if (!single) return;
-                const auto kv_rows = std::size_t{rows} * kKvWidth;
-                if (const auto key_tape = single->state.tape[0]; !key_tape.empty())
-                    copy(std::span<const float>(work.raw_keys, kv_rows), key_tape);
-                if (const auto value_tape = single->state.tape[1]; !value_tape.empty())
-                    copy(std::span<const float>(work.raw_values, kv_rows), value_tape);
-            };
 #if defined(__HIPCC__)
             // A single prefill chunk in one window (the route mini_hip_bias_in_attention admits) projects the relative
             // bias inside the flash: the prepare stage skips the [row][head][distance] image and its producer, the
@@ -683,17 +797,57 @@ private:
             if (single && !adapter.null_applications && route_.attention_rows >= rows &&
                 mini_hip_bias_in_attention(rows, key_splits(image_of(*single, 0U)), device_position,
                                            work.relative_features, bias_weights)) {
-                const detail::MiniResidentGqaBackend<detail::MiniPreparedHipProjectedBackend> projected{{{{stream_}}}, nullptr};
+                const detail::MiniResidentGqaBackend<detail::MiniPreparedHipImageProjectedBackend> projected{
+                    {{{{stream_}, prepared_round_fold_}, operand_image}}, nullptr};
                 check(prepare(projected));
-                keep_tape();
                 check(enqueue_mini_hip_attention_projected<true>(visit, image_of(*single, 0U), cache_of(*single),
                                                                  work.relative_features, bias_weights, failure, stream_));
+            } else
+#else
+            // A single multi-row prompt chunk in one window projects the relative bias inside the CUDA flash (lever
+            // inkling2-mini-attn-projected-bias@1, off by default until its identity receipt): the prepare stage skips
+            // the image and its producer, the flash computes the same logits and raises the same flag
+            // (cuda_core::PreparedBf16Projection). The null-order count needs the image producer and lane mode
+            // resolves positions on the device, so both keep the image route. The whole projected append is prepared
+            // ONCE, BEFORE the image producer is dropped (prepare_mini_cuda_attention_projected): a declined value
+            // (e.g. the dynamic shared memory of the 1024-column projection above the device opt-in) keeps the image
+            // route, any other status is a real error, and the admitted value is the one submitted after the
+            // preparation of q / k / v, with no second admission.
+            const auto* bias_weights =
+                attn_core::detail::bf16_projection(weights.projection(MiniAttentionProjection::relative_bias));
+            bool projected_route = attention_projected_bias_ && single && !cohort && !adapter.null_applications &&
+                                   route_.attention_rows >= rows &&
+                                   mini_cuda_bias_in_attention(rows, device_position, work.relative_features, bias_weights);
+            if (projected_route) {
+                auto ran = MiniCudaAttentionRoute::image;
+                check(dispatch_mini_cuda_attention(
+                    visit, image_of(*single, 0U), single->state.kv, work.relative_features, bias_weights, failure, stream_,
+                    [&] {
+                        const detail::MiniResidentGqaBackend<detail::MiniPreparedCudaProjectedBackend> projected{{native},
+                                                                                                             nullptr};
+                        return prepare(projected);
+                    },
+                    [&] {
+                        check(prepare_with(prepare));
+                        launch_visits(visits);
+                        return cudaSuccess;
+                    },
+                    ran));
+                if (ran == MiniCudaAttentionRoute::projected) ++projected_dispatches_;
             } else
 #endif
             {
                 check(prepare_with(prepare));
-                keep_tape();
                 launch_visits(visits);
+            }
+            if (single) {
+                // A taped (staged verify) chunk keeps its raw K/V rows, the inputs of the two KV convolutions
+                // (verify rows lever: the shared session tape is bound only then).
+                const auto kv_rows = std::size_t{rows} * kKvWidth;
+                if (const auto key_tape = single->state.tape[0]; !key_tape.empty())
+                    copy(std::span<const float>(work.raw_keys, kv_rows), key_tape);
+                if (const auto value_tape = single->state.tape[1]; !value_tape.empty())
+                    copy(std::span<const float>(work.raw_values, kv_rows), value_tape);
             }
             check(attn_core::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(
                 adapter, rows, weights.projection(MiniAttentionProjection::output), attended, prep.gate_logits,
@@ -719,7 +873,7 @@ public:
         const auto rows = rows_of(input);
 #if defined(__HIPCC__)
         check(enqueue_mini_hip_post_convolution(rows, weights, input.data(),
-                                                history.data(), output.data(), stream_));
+                                                history.data(), output.data(), stream_, prepared_round_fold_));
 #else
         check(enqueue_mini_cuda_post_convolution(rows, weights, input.data(),
                                                  history.data(), output.data(), stream_));
@@ -778,7 +932,8 @@ public:
                                                     kExperts, kHiddenWidth}, rows, input, logits, stream_));
 #endif
 #if defined(__HIPCC__)
-        const MiniMoeWorkspace workspace{moe_bf16_.span(), moe_fp32_.span(), moe_activation_.span()};
+        const MiniMoeWorkspace workspace{moe_bf16_.span(), moe_fp32_.span(), moe_activation_.span(), {},
+                                         moe_nan_seen_ ? moe_nan_seen_->data() : nullptr};
 #else
         const bool w4a4 = chunk_w4a4_ && moe_w4a4_layer_[layer];
         const MiniMoeWorkspace workspace{moe_bf16_.span(), moe_fp32_.span(), {},
@@ -792,14 +947,23 @@ public:
             return;
         }
 #if defined(__HIPCC__)
-        check(enqueue_mini_hip_resident_moe(layer, rows, input, logits, bias, output, buffers,
-                                            matrices, csr, planned, workspace, stream_, gate_route_tap_));
+        if (weights_.narrow_experts())
+            check(enqueue_mini_hip_resident_moe_for<MiniMoeNarrowConfig>(layer, rows, input, logits, bias, output, buffers,
+                                                                         matrices, csr, planned, workspace, stream_,
+                                                                         gate_route_tap_));
+        else
+            check(enqueue_mini_hip_resident_moe(layer, rows, input, logits, bias, output, buffers,
+                                                matrices, csr, planned, workspace, stream_, gate_route_tap_));
 #else
-        check(enqueue_mini_cuda_resident_moe_decoded(moe_decode_, layer, rows, input, logits, bias, output, buffers,
-                                                     matrices, csr, planned, workspace, stream_, gate_route_tap_,
-                                                     w4a4 ? moe_w4a4_class_
-                                                          : moe_core::grouped_w4a4::Activations::bf16,
-                                                     moe_schedule_));
+        const auto w4a4_class = w4a4 ? moe_w4a4_class_ : moe_core::grouped_w4a4::Activations::bf16;
+        if (weights_.narrow_experts())
+            check(enqueue_mini_cuda_resident_moe_decoded<MiniMoeNarrowConfig>(
+                moe_decode_, layer, rows, input, logits, bias, output, buffers, matrices, csr, planned, workspace, stream_,
+                gate_route_tap_, w4a4_class, moe_schedule_));
+        else
+            check(enqueue_mini_cuda_resident_moe_decoded(moe_decode_, layer, rows, input, logits, bias, output, buffers,
+                                                         matrices, csr, planned, workspace, stream_, gate_route_tap_,
+                                                         w4a4_class, moe_schedule_));
 #endif
     }
 
@@ -828,21 +992,37 @@ private:
                               route.weights.data(), stream_, gate_route_tap_);
 #endif
         using weight::microscaled::MatrixFormat;
-        const auto format = mini_expert_format(layer);
+        const auto format = weights_.expert_format(layer);
 #if defined(__HIPCC__)
-        // HIP: microscaled_r1 rows launches of at most kMaxRows rows serve the routed rows (row r's bits are those
-        // of a one-row launch, ink_hip_dec; a cohort above kMaxRows lanes runs in stream-ordered chunks); the route
-        // status words stay one per row, contiguous from failure.
-        if (rows > 1U && moe_bf16_.span().size() >=
-                             std::size_t{std::min(rows, decode::kMaxRows)} * kExpertsPerToken * kExpertWidth) {
+        // HIP: one microscaled_r1 rows launch serves the routed rows (row r's bits are those of a one-row launch,
+        // ink_hip_dec); the route status words stay one per row, contiguous from failure.
+        if (!cohort_rows_ && rows > 1U && rows <= decode::kMaxRows &&
+            moe_bf16_.span().size() >= std::size_t{rows} * kExpertsPerToken * kExpertWidth) {
             const decode::Args args{
                 matrices.data(), route.ids.data(), route.weights.data(), failure, input.data(), moe_bf16_.data(),
                 output.data(), kExperts, kHiddenWidth, kExpertWidth, kMlpGateSoftcap, kMlpUpSoftcap,
             };
             if (format == MatrixFormat::nvfp4)
-                check(decode::launch_rows<MatrixFormat::nvfp4, kExpertsPerToken>(args, stream_, rows));
+                check(decode::launch<MatrixFormat::nvfp4, kExpertsPerToken>(args, stream_, rows));
             else
-                check(decode::launch_rows<MatrixFormat::mxfp8, kExpertsPerToken>(args, stream_, rows));
+                check(decode::launch<MatrixFormat::mxfp8, kExpertsPerToken>(args, stream_, rows));
+            return;
+        }
+        // Packed cohort rows (served route lever only): launch_rows runs chunks of at most rows_chunk_cap(scratch
+        // rows) rows, so a pass of up to kMaxLaunchRows (16) rows is ONE launch when the activation scratch holds
+        // that many rows; row r keeps the bits of a one-row launch.
+        const auto scratch_rows = static_cast<unsigned>(
+            std::min<std::size_t>(moe_bf16_.span().size() / (std::size_t{kExpertsPerToken} * kExpertWidth),
+                                  decode::kMaxLaunchRows));
+        if (cohort_rows_ && rows > 1U && scratch_rows != 0U) {
+            const decode::Args args{
+                matrices.data(), route.ids.data(), route.weights.data(), failure, input.data(), moe_bf16_.data(),
+                output.data(), kExperts, kHiddenWidth, kExpertWidth, kMlpGateSoftcap, kMlpUpSoftcap,
+            };
+            if (format == MatrixFormat::nvfp4)
+                check(decode::launch_rows<MatrixFormat::nvfp4, kExpertsPerToken>(args, stream_, rows, scratch_rows));
+            else
+                check(decode::launch_rows<MatrixFormat::mxfp8, kExpertsPerToken>(args, stream_, rows, scratch_rows));
             return;
         }
 #endif
@@ -872,7 +1052,11 @@ private:
 
     static constexpr std::size_t attention_elements(unsigned rows) {
         return std::size_t{rows} * (4U * kKvWidth + 2U * kKvHeads * kConvTaps +
-            kQueryHeads * kRelativeWidth + 4U * kQueryWidth + kQueryHeads * kRelativeExtent + kQueryHeads);
+            kQueryHeads * kRelativeWidth + 4U * kQueryWidth + kQueryHeads * kRelativeExtent + kQueryHeads
+#if defined(__HIPCC__)
+            + kQueryWidth / 2U  // the u16 operand image of the prefill projections
+#endif
+            );
     }
 
     static constexpr std::size_t route_elements(unsigned rows, unsigned tiles) {
@@ -882,6 +1066,7 @@ private:
     std::vector<attn_core::PreparedGqaGroup> prep_groups_;
 #if defined(__HIPCC__)
     std::vector<attn_core::dense::PreparedBf16Lane> lanes_;
+    bool verify_lanes_{false};  // verify rows lever (set_verify_lanes): verify windows attend in one lanes launch set
 #endif
 #if !defined(__HIPCC__)
     std::vector<attn::lanes::PreparedBf16Lane> lane_scratch_;  // cohort attention lanes of one visit
@@ -892,19 +1077,23 @@ private:
     mini_gpu::Stream stream_;
     unsigned max_rows_;
     bool packed_decode_;
+    bool cohort_rows_;  // packed cohort decode passes of up to max_rows_ lanes (served route lever only)
 #if !defined(__HIPCC__)
     moe_core::grouped_microscaled::Decode moe_decode_ = mini_cuda_moe_decode();
     moe_core::grouped_microscaled::Schedule moe_schedule_ = mini_cuda_moe_schedule();
     bool moe_w4a4_ = false, chunk_w4a4_ = false;
+    bool attention_projected_bias_ = false;  // lever inkling2-mini-attn-projected-bias@1 (resolved; set once after load)
+    std::uint64_t projected_dispatches_ = 0;  // projected-bias appends submitted (projected_attention_dispatches)
     moe_core::grouped_w4a4::Activations moe_w4a4_class_ = moe_core::grouped_w4a4::Activations::nvfp4;
     std::array<bool, kPhysicalLayers> moe_w4a4_layer_{};
     std::optional<mini_gpu::Buffer<std::uint8_t>> moe_nvfp4_;
 #endif
     bool step_graphs_;
     unsigned route_flag_rows_ = 1U;
-    std::vector<unsigned> wide_flags_;  // host route status of a cohort wider than kMiniMaxVerifyRows lanes
+    std::vector<unsigned> host_flags_;  // host copy of the route / attention status words of the last call
     MiniResidentRoute route_{};
     bool gate_order_null_{};
+    bool prepared_round_fold_{};
     std::uint64_t null_applications_{};
     std::optional<unsigned> step_token_;
     strix::moe::RouteTap* gate_route_tap_{};
@@ -923,6 +1112,9 @@ private:
     mini_gpu::Buffer<float> moe_fp32_;
 #if defined(__HIPCC__)
     mini_gpu::Buffer<std::uint16_t> moe_activation_;  // gate-up epilogue activations (grouped_dispatch)
+    // grouped_dispatch::Workspace::nan_seen: zeroed once; raised (sticky) by a down that stored a NaN sum.
+    // Allocated by set_combine_image; no word, no image route.
+    std::optional<mini_gpu::Buffer<unsigned>> moe_nan_seen_;  // only while the down-image lever is active
 #endif
     mini_gpu::Buffer<unsigned> flags_;
     mini_gpu::Buffer<std::uint16_t> zero_padding_;

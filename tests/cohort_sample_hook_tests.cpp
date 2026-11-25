@@ -78,8 +78,6 @@ public:
         std::size_t at = 0;
         std::string e = "V";
         groups_.assign(groups.begin(), groups.end());
-        // every request samples: host and device sampling both read the final scores of every group
-        for (const auto& g : groups) unread_groups += g.reads_scores ? 0U : 1U;
         for (const auto& g : groups) {
             window_[g.lane] = ctx_[g.lane];
             for (std::uint32_t r = 0; r < g.rows; ++r, ++at) {
@@ -120,7 +118,6 @@ public:
     void release(std::uint32_t lane) override { trace.push_back("R" + std::to_string(lane)); }
 
     std::vector<std::string> trace, samples;
-    unsigned unread_groups = 0;
 
 private:
     bool device_, emits_first_;
@@ -174,7 +171,6 @@ void host_trace_unchanged(bool emits_first) {
     check(host.trace == dev.trace, n + ": same calls at the same points");
     check(host.samples.empty(), n + ": the host backend never gets sample_final");
     check(!dev.samples.empty(), n + ": the device backend decides the sampled ids");
-    check(host.unread_groups == 0U && dev.unread_groups == 0U, n + ": host and device sampled lanes declare score reads");
 }
 
 // (2): C1 == C4 with the hook.

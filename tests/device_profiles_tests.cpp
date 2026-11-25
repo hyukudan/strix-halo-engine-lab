@@ -83,6 +83,23 @@ void declaration() {
                                                   "\"\nprofile = \"rtx-5090-32\"\nroles = [\"replica\"]\n"));
     require(d.devices.size() == 1 && d.devices[0].vendor == device::Vendor::nvidia, "vendor comes from the profile");
     require(d.devices[0].profile == "rtx-5090-32" && !d.devices[0].planned, "a profile with an identity binds");
+    {
+        // Optional measured low-bit route switch points of one declared GPU (core LowBitRowPlan): both keys > 0.
+        const std::string gpu = "[devices.a]\nvendor = \"amd\"\npci = \"0000:c5:00.0\"\nprofile = \"strix-halo-128\"\n";
+        const auto with = device::parse_declaration(decl(gpu + "lowbit_rows = { small_rows = 64, wide_panels = 32 }\n"));
+        const auto without = device::parse_declaration(decl(gpu));
+        require(with.devices.at(0).lowbit_rows.small_rows == 64U && with.devices.at(0).lowbit_rows.wide_panels == 32U &&
+                    without.devices.at(0).lowbit_rows.small_rows == 0U && without.devices.at(0).lowbit_rows.wide_panels == 0U,
+                "lowbit_rows: declared switch points, absent = none");
+        require(throws([&] { (void)device::parse_declaration(decl(gpu + "lowbit_rows = { small_rows = 64 }\n")); }, "required"),
+                "lowbit_rows: both keys required");
+        require(throws([&] { (void)device::parse_declaration(decl(gpu + "lowbit_rows = { small_rows = 0, wide_panels = 4 }\n")); }, "1 to 65535"),
+                "lowbit_rows: zero refused");
+        require(throws([&] { (void)device::parse_declaration(decl(gpu + "lowbit_rows = { small_rows = 4, wide_panels = 4, x = 1 }\n")); }, "unknown key"),
+                "lowbit_rows: unknown key refused");
+        require(throws([] { (void)device::parse_declaration(decl("[devices.host]\nkind = \"cpu\"\nlowbit_rows = { small_rows = 4, wide_panels = 4 }\n")); }, "only a GPU"),
+                "lowbit_rows: GPU entries only");
+    }
     require(throws([] { (void)device::parse_declaration(decl("[devices.a]\nuuid = \"GPU-11111111-2222-3333-4444-555555555555\"\nprofile = \"rtx-9999\"\n")); }, "unknown profile"),
             "unknown profile refused with the known list");
     require(throws([] { (void)device::parse_declaration(decl("[devices.a]\nvendor = \"amd\"\nuuid = \"GPU-11111111-2222-3333-4444-555555555555\"\nprofile = \"rtx-5090-32\"\n")); }, "contradicts"),

@@ -4,10 +4,14 @@
 #include "moe_core/expert_activation.hpp"
 #include "moe_core/expert_major_plan.hpp"
 #include "moe_core/grouped_rows.hpp"
+#include "moe_core/grouped_iu4a4_plan.hpp"
 #include "moe_core/grouped_w4a4.hpp"
 
 #if !defined(__CUDACC__) || defined(__HIPCC__)
 #include "moe_core/grouped_microscaled.hpp"
+#endif
+#if defined(__HIPCC__)
+#include "moe_core/grouped_iu4a4.hpp"
 #endif
 
 #if !defined(__HIPCC__)
@@ -57,8 +61,17 @@ struct HipBackend {
     static constexpr auto launch_indirect = grouped_microscaled::launch_indirect<Format>;
     template<weight::microscaled::MatrixFormat Format>
     static constexpr auto launch_activated_indirect = grouped_microscaled::launch_activated_indirect<Format>;
+    // Down storing the BF16 image of its sums + the combine reading it (Workspace::nan_seen; same output bits).
+    template<weight::microscaled::MatrixFormat Format>
+    static constexpr auto launch_image = grouped_microscaled::launch_image<Format>;
+    static constexpr auto combine_image = grouped_rows::combine_image;
+    template<unsigned Experts, unsigned TopK>
+    using Planner = device_grouped::Planner<Experts, TopK>;
     template<unsigned Experts, unsigned TopK>
     static constexpr auto materialize = device_grouped::enqueue<Experts, TopK>;
+    // Rotated integer A4W4 operand class (moe_core/grouped_iu4a4.hpp; iu4 WMMA).
+    static constexpr auto launch_iu4a4 = grouped_iu4a4::launch;
+    static constexpr bool small_form = true;  // grouped_microscaled::Form::small_f16
 #endif
 };
 #endif
@@ -78,6 +91,8 @@ struct CudaBackend {
     static constexpr auto gather = grouped_rows::gather;
     template<weight::microscaled::MatrixFormat Format>
     static constexpr auto launch_projection = cuda::core::mma::microscaled::launch<Format>;
+    template<unsigned Experts, unsigned TopK>
+    using Planner = device_grouped::Planner<Experts, TopK>;
     template<unsigned Experts, unsigned TopK>
     static constexpr auto materialize = device_grouped::enqueue<Experts, TopK>;
     // FAST W4A4 operand class (moe_core/grouped_w4a4.hpp; sm_120 block-scaled FP4).
@@ -127,6 +142,11 @@ struct Workspace {
     // Optional NVFP4 image of the assignment rows (256-byte aligned, WorkspaceElements::nvfp4 bytes) for the FAST W4A4 operand
     // class (DevicePlan::activations = nvfp4); both projections reuse it in stream order.
     std::span<std::uint8_t> nvfp4{};
+    // Optional device word (zero before the first use, then left to the dispatch) for the BF16 down image of the
+    // epilogue form (HIP): down stores bf16 sums into the bf16 rows, dead once gate-up has read them, and the combine
+    // reads that image (half the bytes of the FP32 rows); a NaN sum is also kept whole in fp32 and raises the word, so
+    // the combine reads it there (grouped_rows::combine_image: the output bits of combine for every sum).
+    unsigned* nan_seen{};
 };
 
 struct WorkspaceElements {
@@ -136,8 +156,11 @@ struct WorkspaceElements {
     std::size_t nvfp4{};       // Workspace::nvfp4 bytes for the W4A4 operand class.
 };
 
+// `activations` sizes WorkspaceElements::nvfp4 for that operand class (grouped_w4a4::image_bytes): every one-term class (and
+// the bf16 default) needs exactly the one-term image; only a two-term class reserves its larger image.
 template<class Config>
-constexpr WorkspaceElements workspace_requirement(unsigned rows) {
+constexpr WorkspaceElements workspace_requirement(
+    unsigned rows, grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16) {
     static_assert(Config::hidden > 0U && Config::intermediate > 0U &&
                   Config::intermediate <= std::numeric_limits<unsigned>::max() / 2U);
     static_assert(Config::top_k > 0U && Config::top_k <= Config::experts);
@@ -149,15 +172,23 @@ constexpr WorkspaceElements workspace_requirement(unsigned rows) {
     }
     const auto count = static_cast<std::size_t>(assignments);
     return {count * std::max(Config::hidden, Config::intermediate), count * fp32_width, count * Config::intermediate,
-            std::max(grouped_w4a4::image_layout(count, Config::hidden).bytes,
-                     grouped_w4a4::image_layout(count, Config::intermediate).bytes)};
+            grouped_w4a4::image_bytes(activations, count, Config::hidden, Config::intermediate)};
 }
 
 template<class Config>
-inline WorkspaceElements workspace_elements(unsigned rows) {
-    const auto need = workspace_requirement<Config>(rows);
+inline WorkspaceElements workspace_elements(
+    unsigned rows, grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16) {
+    const auto need = workspace_requirement<Config>(rows, activations);
     if (need.bf16 == 0U) throw std::invalid_argument("grouped MoE: invalid row count");
     return need;
+}
+
+// enqueue's image admission for the W4A4 operand class: a 256-byte aligned Workspace::nvfp4 of at least the class's image
+// bytes for `rows` (a one-term class admits exactly the one-term image).
+template<class Config>
+inline bool nvfp4_image_fits(std::span<const std::uint8_t> image, unsigned rows, grouped_w4a4::Activations activations) {
+    const auto need = workspace_requirement<Config>(rows, activations).nvfp4;
+    return need != 0U && image.size() >= need && reinterpret_cast<std::uintptr_t>(image.data()) % 256U == 0U;
 }
 
 template<class Config, class Backend>
@@ -222,6 +253,31 @@ inline typename Backend::Status project_activated(unsigned layer, const A& args,
     return Backend::invalid_value;
 }
 
+struct Bf16Combine;
+
+// A backend whose down stores the BF16 image of its sums for a combine that reads it, with the configuration's
+// combine being grouped_rows::combine (the one combine_image reproduces bit for bit).
+template<class Config, class Backend>
+inline constexpr bool down_image = requires {
+    Backend::template launch_image<weight::microscaled::MatrixFormat::nvfp4>;
+    Backend::combine_image;
+    requires std::is_same_v<typename Config::Combine, Bf16Combine>;
+};
+
+template<class Config, class Backend, class A>
+inline typename Backend::Status project_image(unsigned layer, const A& args, typename Backend::Stream stream) {
+    using weight::microscaled::MatrixFormat;
+    if constexpr (down_image<Config, Backend>) {
+        switch (Config::format(layer)) {
+        case MatrixFormat::nvfp4: return Backend::template launch_image<MatrixFormat::nvfp4>(args, stream);
+        case MatrixFormat::mxfp8: return Backend::template launch_image<MatrixFormat::mxfp8>(args, stream);
+        }
+    } else {
+        (void)layer, (void)args, (void)stream;
+    }
+    return Backend::invalid_value;
+}
+
 struct HostPlan {
     unsigned physical_layer;
     unsigned rows;
@@ -230,10 +286,12 @@ struct HostPlan {
     std::vector<TileRows> down;
 };
 
+// prepare() for a plan whose projections run in `form`: the small form also admits every expert matrix with
+// grouped_microscaled::fits_small_matrix (prepare() itself is the BF16 tile's admission, unchanged).
 template<class Config, class Backend>
-inline HostPlan prepare(unsigned layer, unsigned rows, std::span<const std::uint32_t> experts,
-                        std::span<const float> weights, std::span<const ExpertWeights> matrices,
-                        Workspace workspace) {
+inline HostPlan prepare_form(unsigned layer, unsigned rows, std::span<const std::uint32_t> experts,
+                             std::span<const float> weights, std::span<const ExpertWeights> matrices,
+                             Workspace workspace, grouped_microscaled::Form form) {
     using Projection = typename Config::Projection;
     const auto need = workspace_elements<Config>(rows);
     if (layer >= Config::layers || matrices.size() != Config::experts ||
@@ -262,10 +320,23 @@ inline HostPlan prepare(unsigned layer, unsigned rows, std::span<const std::uint
             !fits_tile<Config, Backend>(layer, Projection::down, down)) {
             throw std::invalid_argument("grouped MoE: incompatible expert descriptor");
         }
+        if (form == grouped_microscaled::Form::small_f16 &&
+            (!grouped_microscaled::fits_small_matrix(matrix.gate_up, Config::hidden, gate_width) ||
+             !grouped_microscaled::fits_small_matrix(matrix.down, Config::intermediate, Config::hidden))) {
+            throw std::invalid_argument("grouped MoE: expert descriptor not admitted for the small form");
+        }
         plan.gate_up.push_back(gate_up);
         plan.down.push_back(down);
     }
     return plan;
+}
+
+template<class Config, class Backend>
+inline HostPlan prepare(unsigned layer, unsigned rows, std::span<const std::uint32_t> experts,
+                        std::span<const float> weights, std::span<const ExpertWeights> matrices,
+                        Workspace workspace) {
+    return prepare_form<Config, Backend>(layer, rows, experts, weights, matrices, workspace,
+                                         grouped_microscaled::Form::bf16_tile);
 }
 
 struct DevicePlan {
@@ -279,11 +350,20 @@ struct DevicePlan {
     const unsigned* tile_count = nullptr;
     const unsigned* failure = nullptr;
     grouped_microscaled::Decode decode = grouped_microscaled::Decode::reference;  // weight decode form of both projections
-    // Activation operand class (FAST trait): nvfp4 runs NVFP4 layers through the W4A4 tile when the backend has it and
-    // Workspace::nvfp4 holds the image; the caller admits the expert matrices once (admit_w4a4). Other layers: BF16 tile.
+    // Activation operand class (FAST trait): a W4A4 class runs NVFP4 layers through the W4A4 tile when the backend has it;
+    // Workspace::nvfp4 must hold the class's image (else enqueue refuses, invalid value, nothing enqueued); the caller
+    // admits the expert matrices once (admit_w4a4) and passes bf16 for layers it did not admit. MXFP8 layers: BF16 tile.
     grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16;
     // Schedule of both BF16 projections (never changes bits): automatic = the backend's tall slab schedule where it fits.
     grouped_microscaled::Schedule schedule = grouped_microscaled::Schedule::automatic;
+    // Rotated integer A4W4 operand class (FAST / TURBO trait, grouped-iu4a4-rot-v1): with the layer's images both projections
+    // run on the backend's integer tile (Workspace::nvfp4 holds the activation images, grouped_iu4a4::act_bytes); a backend
+    // without it, or images == nullptr: the tiles above.
+    grouped_iu4a4::Selection iu4{};
+    // Operand form of both projections (FAST trait, grouped_microscaled::Form): small_f16 needs a backend with the small
+    // form (Backend::small_form) and BF16 activations; it runs gate-up without the activation epilogue. A row's bits are
+    // the same at every plan row count, so a binder selects it per launch class, never per row count.
+    grouped_microscaled::Form form = grouped_microscaled::Form::bf16_tile;
 };
 
 // Load-time admission of the W4A4 operand class for one layer's experts (stage copies need 16-byte code rows and 8-byte scale
@@ -302,6 +382,20 @@ inline bool admit_w4a4(unsigned layer, std::span<const ExpertWeights> matrices) 
     };
     for (const auto& m : matrices)
         if (!fits(m.gate_up, Config::hidden, gate_width) || !fits(m.down, Config::intermediate, Config::hidden)) return false;
+    return true;
+}
+
+// Load-time admission of the small form (grouped_microscaled::Form::small_f16) for one layer's experts: both banks
+// (gate-up and down) of every expert pass fits_small_matrix (shape, 16-byte codes, 4-byte aligned scale plane). A
+// caller that uploads its own descriptors (enqueue with DevicePlan::form = small_f16) admits them here or through
+// prepare_form(..., Form::small_f16); enqueue_resident admits them itself before it plans.
+template<class Config>
+inline bool admit_small(unsigned layer, std::span<const ExpertWeights> matrices) {
+    if (layer >= Config::layers || matrices.size() != Config::experts) return false;
+    constexpr unsigned gate_width = 2U * Config::intermediate;
+    for (const auto& m : matrices)
+        if (!grouped_microscaled::fits_small_matrix(m.gate_up, Config::hidden, gate_width) ||
+            !grouped_microscaled::fits_small_matrix(m.down, Config::intermediate, Config::hidden)) return false;
     return true;
 }
 
@@ -332,21 +426,28 @@ inline bool prepare_resident(unsigned layer, unsigned rows, RouteBuffers route,
     return true;
 }
 
-// Upload or build the plan on this stream before launching. Keep all buffers
-// alive through completion and check the device failure word before consuming output.
+namespace detail {
+
+struct Visit {
+    WorkspaceElements need;
+    unsigned assignments;
+    grouped_microscaled::Args gate_up, down;
+};
+
+// Admit the whole visit before any submission. The resident path also does this before routing and planning.
 template<class Config, class Backend>
-inline typename Backend::Status enqueue(
+inline bool preflight_visit(
     const DevicePlan& plan, std::span<const float> input, std::span<float> output,
-    Workspace workspace, typename Backend::Stream stream) {
+    Workspace workspace, Visit& visit) {
     const auto need = workspace_requirement<Config>(plan.rows);
-    if (need.bf16 == 0U) return Backend::invalid_value;
+    if (need.bf16 == 0U) return false;
     const unsigned assignments = plan.rows * Config::top_k;
     const auto row_elements = std::size_t{plan.rows} * Config::hidden;
     if (plan.physical_layer >= Config::layers || input.size() < row_elements || output.size() < row_elements ||
         workspace.bf16.size() < need.bf16 || workspace.fp32.size() < need.fp32 ||
         plan.assignment_rows.size() != assignments || plan.combine_rows.size() != assignments ||
         plan.assignment_weights.size() != assignments || plan.gate_up.size() != plan.down.size() ||
-        plan.gate_up.empty() || plan.gate_up.size() > grouped_microscaled::kMaxTiles) return Backend::invalid_value;
+        plan.gate_up.empty() || plan.gate_up.size() > grouped_microscaled::kMaxTiles) return false;
 
     constexpr unsigned gate_width = 2U * Config::intermediate;
     const auto tiles = static_cast<unsigned>(plan.gate_up.size());
@@ -358,7 +459,26 @@ inline typename Backend::Status enqueue(
     gate_up.mean_tile_rows = down.mean_tile_rows = (assignments + Config::experts - 1U) / Config::experts;
     gate_up.decode = down.decode = plan.decode;
     gate_up.schedule = down.schedule = plan.schedule;
-    if (!Backend::fits(gate_up) || !Backend::fits(down)) return Backend::invalid_value;
+    gate_up.form = down.form = plan.form;
+    if (plan.form != grouped_microscaled::Form::bf16_tile) {
+        if constexpr (!requires { Backend::small_form; }) return false;
+        if (plan.activations != grouped_w4a4::Activations::bf16 || plan.iu4.images) return false;
+        if (!grouped_microscaled::fits_small(gate_up) || !grouped_microscaled::fits_small(down))
+            return false;
+    }
+    if (!Backend::fits(gate_up) || !Backend::fits(down)) return false;
+    if constexpr (requires { Backend::token_rows; })
+        if (reinterpret_cast<std::uintptr_t>(workspace.bf16.data()) % 16U != 0U) return false;
+    visit = {need, assignments, gate_up, down};
+    return true;
+}
+
+template<class Config, class Backend>
+inline typename Backend::Status enqueue_visit(
+    const DevicePlan& plan, std::span<const float> input, std::span<float> output,
+    Workspace workspace, const Visit& visit, typename Backend::Stream stream) {
+    const auto& [need, assignments, gate_up, down] = visit;
+    constexpr unsigned gate_width = 2U * Config::intermediate;
     // A backend whose gate-up reads token rows in place writes the rows x hidden BF16 image of the token rows at
     // workspace.bf16 (the base the plan's gathered addresses are relative to) instead of top_k gathered copies; each
     // tile row then reads bf16_encode of the FP32 element the gather would have copied (same operand bits).
@@ -368,21 +488,49 @@ inline typename Backend::Status enqueue(
         return indirect;
     };
     typename Backend::Status status;
+    if constexpr (requires { &Backend::launch_iu4a4; Config::Activation::gate_cap; Config::Activation::up_cap; }) {
+        if (plan.iu4.images) {
+            status = Backend::launch_iu4a4({input.data(), plan.rows, assignments, Config::hidden, Config::intermediate,
+                                            plan.assignment_rows.data(), plan.gate_up.data(), plan.down.data(), gate_up.count,
+                                            gate_up.max_tile_rows, plan.tile_count, plan.failure, workspace.bf16.data(),
+                                            workspace.fp32.data(), workspace.nvfp4.data(), workspace.nvfp4.size(),
+                                            plan.iu4.images, Config::Activation::gate_cap, Config::Activation::up_cap,
+                                            // verdict word = the plan's failure word (device memory the planner
+                                            // writes): the pass's validation launch sets it before any compute launch
+                                            // reads it; the combine skips and the caller's failure check fails
+                                            const_cast<unsigned*>(plan.failure),
+                                            // down rows in assignment order: the combine's input rows
+                                            workspace.fp32.data()},
+                                           stream);
+            if (status != Backend::success) return status;
+            return Config::Combine::launch(
+                {workspace.fp32.data(), Config::hidden, plan.combine_rows.data(), plan.assignment_weights.data(),
+                 plan.rows, Config::top_k, Config::hidden, output.data(), Config::hidden, plan.failure}, stream);
+        }
+    }
     if constexpr (requires { &Backend::launch_w4a4; }) {
-        // FAST W4A4 operand class: quantise the gathered rows once per projection input (FP32 token rows by assignment, then
+        // FAST W4A4 operand class: quantise each projection input once (the FP32 token rows once per token, then
         // the BF16 activation rows) with the class's scale rule, run the projection(s) of the class on the block-scaled FP4
         // tile (nvfp4_mse_gate_up: the down projection reads the BF16 activation rows as the bf16 class does); plan, tiles
         // and outputs unchanged.
         if (grouped_w4a4::w4a4_gate_up(plan.activations) &&
-            Config::format(plan.physical_layer) == weight::microscaled::MatrixFormat::nvfp4 &&
-            workspace.nvfp4.size() >= need.nvfp4 && reinterpret_cast<std::uintptr_t>(workspace.nvfp4.data()) % 256U == 0U) {
+            Config::format(plan.physical_layer) == weight::microscaled::MatrixFormat::nvfp4) {
+            // A selected W4A4 class on an NVFP4 layer binds or is refused before any work is enqueued: a workspace that
+            // cannot hold the class's image (a two-term class on a one-term reservation, say) never runs the BF16 tile
+            // under the class's name. MXFP8 layers take the deliberate BF16 route below.
+            if (!nvfp4_image_fits<Config>(workspace.nvfp4, plan.rows, plan.activations)) return Backend::invalid_value;
             const auto rule = grouped_w4a4::scale_rule(plan.activations);
-            const auto hidden_image = grouped_w4a4::make_image(workspace.nvfp4.data(), assignments, Config::hidden);
-            status = Backend::quantize_w4a4(grouped_w4a4::QuantizeArgs<float>{input.data(), Config::hidden,
-                                                plan.assignment_rows.data(), assignments, Config::hidden, hidden_image,
-                                                plan.failure}, stream, rule);
+            // Token image: each token row is quantised once (plan.rows <= assignments rows, so the class's image bytes hold
+            // it) and the gate/up projection reads it through the assignment -> token map; the rows of a token's
+            // assignments are equal, so the image rows they read are the ones a per-assignment image would hold.
+            const unsigned gate_up_terms = grouped_w4a4::terms_gate_up(plan.activations);
+            const auto hidden_image = grouped_w4a4::make_image(workspace.nvfp4.data(), plan.rows, Config::hidden, gate_up_terms);
+            status = Backend::quantize_w4a4(grouped_w4a4::QuantizeArgs<float>{input.data(), Config::hidden, nullptr,
+                                                plan.rows, Config::hidden, hidden_image, plan.failure, gate_up_terms},
+                                            stream, rule);
             if (status != Backend::success) return status;
-            status = Backend::launch_w4a4({gate_up, workspace.bf16.data(), hidden_image}, stream);
+            status = Backend::launch_w4a4({gate_up, workspace.bf16.data(), hidden_image, plan.assignment_rows.data(),
+                                           gate_up_terms}, stream);
             if (status != Backend::success) return status;
             status = Config::Activation::launch({workspace.fp32.data(), workspace.bf16.data(), assignments,
                                                 Config::intermediate, gate_width, Config::intermediate, plan.failure}, stream);
@@ -394,12 +542,14 @@ inline typename Backend::Status enqueue(
                     {workspace.fp32.data(), Config::hidden, plan.combine_rows.data(), plan.assignment_weights.data(),
                      plan.rows, Config::top_k, Config::hidden, output.data(), Config::hidden, plan.failure}, stream);
             }
-            const auto inner_image = grouped_w4a4::make_image(workspace.nvfp4.data(), assignments, Config::intermediate);
+            const unsigned down_terms = grouped_w4a4::terms_down(plan.activations);
+            const auto inner_image =
+                grouped_w4a4::make_image(workspace.nvfp4.data(), assignments, Config::intermediate, down_terms);
             status = Backend::quantize_w4a4(grouped_w4a4::QuantizeArgs<std::uint16_t>{workspace.bf16.data(),
                                                 Config::intermediate, nullptr, assignments, Config::intermediate,
-                                                inner_image, plan.failure}, stream, rule);
+                                                inner_image, plan.failure, down_terms}, stream, rule);
             if (status != Backend::success) return status;
-            status = Backend::launch_w4a4({down, workspace.bf16.data(), inner_image}, stream);
+            status = Backend::launch_w4a4({down, workspace.bf16.data(), inner_image, nullptr, down_terms}, stream);
             if (status != Backend::success) return status;
             return Config::Combine::launch(
                 {workspace.fp32.data(), Config::hidden, plan.combine_rows.data(), plan.assignment_weights.data(),
@@ -416,7 +566,7 @@ inline typename Backend::Status enqueue(
     if (status != Backend::success) return status;
     bool epilogue = false;
     if constexpr (activation_epilogue<Config, Backend>)
-        epilogue = workspace.activation.size() >= need.activation &&
+        epilogue = plan.form == grouped_microscaled::Form::bf16_tile && workspace.activation.size() >= need.activation &&
                    reinterpret_cast<std::uintptr_t>(workspace.activation.data()) % 16U == 0U;
     if (epilogue) {
         // The plan's down inputs address BF16 activation rows in workspace.bf16: rebased into workspace.activation
@@ -433,6 +583,26 @@ inline typename Backend::Status enqueue(
         if constexpr (in_place) status = project_activated<Config, Backend>(plan.physical_layer, rows_in_place(activated), stream);
         else status = project_activated<Config, Backend>(plan.physical_layer, activated, stream);
         if (status != Backend::success) return status;
+#if defined(__HIPCC__)
+        if constexpr (down_image<Config, Backend>) {
+            // The gathered / token rows in workspace.bf16 are dead once gate-up has read them (stream order): down
+            // stores the BF16 image of its sums there, at the index of each FP32 sum (down reads workspace.activation).
+            // workspace.bf16 holds assignments x max(hidden, intermediate) elements (checked above): every down sum.
+            if (workspace.nan_seen) {
+                grouped_microscaled::DownImageArgs imaged{};
+                static_cast<grouped_microscaled::Args&>(imaged) = rebased;
+                imaged.image_from = workspace.fp32.data();
+                imaged.image = workspace.bf16.data();
+                imaged.nan_seen = workspace.nan_seen;
+                status = project_image<Config, Backend>(plan.physical_layer, imaged, stream);
+                if (status != Backend::success) return status;
+                return Backend::combine_image(
+                    {workspace.bf16.data(), workspace.fp32.data(), workspace.nan_seen, Config::hidden,
+                     plan.combine_rows.data(), plan.assignment_weights.data(), plan.rows, Config::top_k, Config::hidden,
+                     output.data(), Config::hidden, plan.failure}, stream);
+            }
+        }
+#endif
         status = project<Config, Backend>(plan.physical_layer, rebased, stream);
         if (status != Backend::success) return status;
     } else {
@@ -450,6 +620,19 @@ inline typename Backend::Status enqueue(
          plan.rows, Config::top_k, Config::hidden, output.data(), Config::hidden, plan.failure}, stream);
 }
 
+}  // namespace detail
+
+// Upload or build the plan on this stream before launching. Keep all buffers
+// alive through completion and check the device failure word before consuming output.
+template<class Config, class Backend>
+inline typename Backend::Status enqueue(
+    const DevicePlan& plan, std::span<const float> input, std::span<float> output,
+    Workspace workspace, typename Backend::Stream stream) {
+    detail::Visit visit{};
+    if (!detail::preflight_visit<Config, Backend>(plan, input, output, workspace, visit)) return Backend::invalid_value;
+    return detail::enqueue_visit<Config, Backend>(plan, input, output, workspace, visit, stream);
+}
+
 #if defined(__HIPCC__) || defined(__CUDACC__)
 template<class Caps>
 struct SoftcappedSwigluBf16 {
@@ -463,6 +646,7 @@ struct SoftcappedSwigluBf16 {
 struct Bf16Combine {
     static constexpr auto launch = grouped_rows::combine;
 };
+#endif
 
 // The route hook owns selection. Its outputs feed the common CSR planner and
 // the same execution path used with an uploaded host plan.
@@ -474,8 +658,12 @@ inline typename Backend::Status enqueue_resident(
     Workspace workspace, typename Backend::Stream stream, LogitExtent logit_extent, Route select,
     grouped_microscaled::Decode decode = grouped_microscaled::Decode::reference,
     grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16,
-    grouped_microscaled::Schedule schedule = grouped_microscaled::Schedule::automatic) {
-    using Planner = device_grouped::Planner<Config::experts, Config::top_k>;
+    grouped_microscaled::Schedule schedule = grouped_microscaled::Schedule::automatic,
+    grouped_iu4a4::Selection iu4 = {},
+    grouped_microscaled::Form form = grouped_microscaled::Form::bf16_tile) {
+    using Planner = typename Backend::template Planner<Config::experts, Config::top_k>;
+    if (form == grouped_microscaled::Form::small_f16 && !admit_small<Config>(layer, matrices))
+        return Backend::invalid_value;  // before routing or planning is queued
     device_grouped::Args args{};
     if (!prepare_resident<Config, Backend>(layer, rows, route, matrices, csr, out, workspace, args)) {
         return Backend::invalid_value;
@@ -486,18 +674,19 @@ inline typename Backend::Status enqueue_resident(
         bias.size() != Config::experts || route.scratch.size() < Planner::scratch_bytes(rows) / sizeof(unsigned)) {
         return Backend::invalid_value;
     }
-    auto status = select(logits, bias, route, rows, stream);
-    if (status != Backend::success) return status;
-    status = Backend::template materialize<Config::experts, Config::top_k>(args, route.scratch, stream);
-    if (status != Backend::success) return status;
-
     const auto assignments = std::size_t{rows} * Config::top_k;
     const auto tiles = args.out.tile_capacity;
     const DevicePlan plan{layer, rows, {args.csr.rows, assignments}, {args.out.combine_rows, assignments},
                           {args.out.assignment_weights, assignments}, {args.out.gate_up, tiles},
-                          {args.out.down, tiles}, args.out.tile_count, args.out.failure, decode, activations, schedule};
-    return enqueue<Config, Backend>(plan, input, output, workspace, stream);
+                          {args.out.down, tiles}, args.out.tile_count, args.out.failure, decode, activations, schedule, iu4, form};
+    detail::Visit visit{};
+    if (!detail::preflight_visit<Config, Backend>(plan, input, output, workspace, visit)) return Backend::invalid_value;
+
+    auto status = select(logits, bias, route, rows, stream);
+    if (status != Backend::success) return status;
+    status = Backend::template materialize<Config::experts, Config::top_k>(args, route.scratch, stream);
+    if (status != Backend::success) return status;
+    return detail::enqueue_visit<Config, Backend>(plan, input, output, workspace, visit, stream);
 }
-#endif
 
 }  // namespace strix::moe_core::grouped_dispatch

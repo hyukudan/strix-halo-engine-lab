@@ -21,4 +21,11 @@ enum class Bf16RowPath { short_rows, fp32_grid, big, big_compact };
     return rows <= kFp32GridMaxRows ? Bf16RowPath::fp32_grid : Bf16RowPath::short_rows;
 }
 
+// The activation planes a dispatch reports for one projection that took `path`: the term count of the tall split when
+// the path is a tall MMA one (big, big_compact), 0 when it splits no activation (FP32 grid, short rows). A dispatch
+// reports the largest over its projections, so a mixed one reports the split it ran.
+[[nodiscard]] constexpr int bf16_split_planes(Bf16RowPath path, int terms) {
+    return path == Bf16RowPath::big || path == Bf16RowPath::big_compact ? terms : 0;
+}
+
 }  // namespace strix::cuda_core

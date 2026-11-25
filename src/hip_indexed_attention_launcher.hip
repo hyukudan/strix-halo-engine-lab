@@ -28,6 +28,7 @@
 #include "hip_dense_f16_tiled.hpp"
 #include "hip_rounded_stage_image.hpp"
 #include "attn_core/selected_flash_prefill.hpp"
+#include "attn_core/select_radix3.hpp"
 #include "strix/hip_compact_qsa_diagnostic.hpp"
 #include "strix/hip_mtp_attention.hpp"
 #include "strix/qpersist.hpp"
@@ -1930,107 +1931,23 @@ __global__ void select_blocks_serial_kernel(float* block_scores, std::uint32_t n
 constexpr std::uint32_t kSelectThreads = 1024;
 constexpr std::uint32_t kSelectWaves = kSelectThreads / 32U;
 static_assert(kSelectWaves == 32U);
-__device__ __forceinline__ std::uint32_t select_key(float value) {
-    auto bits = __float_as_uint(value);
-    if ((bits & 0x7fffffffU) == 0) bits = 0;
-    return bits & 0x80000000U ? ~bits : bits | 0x80000000U;
-}
+// The schedule is the shared Radix3 select (src/attn_core/select_radix3.hpp); this file keeps the graph control.
+namespace radix3 = strix::attn_core::select::radix3;
+__device__ __forceinline__ std::uint32_t select_key(float value) { return radix3::order_key(value); }
 // Inclusive workgroup prefix sum; total is the workgroup sum.
 __device__ __forceinline__ std::uint32_t select_scan(std::uint32_t value, std::uint32_t* waves, std::uint32_t& total) {
-    const auto lane = threadIdx.x % 32U, wave = threadIdx.x / 32U;
-    for (unsigned d = 1; d < 32U; d <<= 1U) { const auto up = __shfl_up(value, d, 32); if (lane >= d) value += up; }
-    if (lane == 31U) waves[wave] = value;
-    __syncthreads();
-    if (wave == 0) {
-        auto sum = waves[lane];
-        for (unsigned d = 1; d < 32U; d <<= 1U) { const auto up = __shfl_up(sum, d, 32); if (lane >= d) sum += up; }
-        waves[lane] = sum;
-    }
-    __syncthreads();
-    total = waves[kSelectWaves - 1U];
-    value += wave ? waves[wave - 1U] : 0U;
-    __syncthreads();
-    return value;
+    return radix3::scan<kSelectThreads>(value, waves, total);
 }
+struct GraphSelectControl {
+    GraphSelectionArguments dynamic;
+    __device__ bool graph() const { return dynamic.position.position != nullptr; }
+    __device__ bool visible(std::uint32_t& tokens) const { return graph_visible(dynamic, tokens); }
+    __device__ std::uint32_t block_topk() const { return dynamic.block_topk; }
+};
 __device__ void select_blocks_parallel_body(float* block_scores, std::uint32_t num_blocks, std::uint32_t select_blocks,
     std::uint32_t compress_ratio, std::uint32_t visible_tokens, std::uint32_t* selected, GraphSelectionArguments dynamic, bool preserve_scores = false) {
-    const auto tid = static_cast<std::uint32_t>(threadIdx.x);
-    if (dynamic.position.position != nullptr) {
-        if (!graph_visible(dynamic, visible_tokens)) return;
-        num_blocks = visible_tokens / compress_ratio;
-        if (num_blocks <= dynamic.block_topk) {
-            for (auto token = tid; token < visible_tokens; token += kSelectThreads) selected[token] = token;
-            return;
-        }
-        select_blocks = dynamic.block_topk;
-    }
-    __shared__ std::uint32_t histogram[2048];
-    __shared__ std::uint32_t waves[kSelectWaves];
-    __shared__ std::uint32_t found_digit, found_need, found_count;
-    std::uint32_t prefix = 0, mask = 0, need = select_blocks, zeros = 0;
-    for (unsigned pass = 0; pass < 3U; ++pass) {
-        const unsigned shift = pass == 0 ? 21U : pass == 1 ? 10U : 0U;
-        const auto digits = pass == 2 ? 1024U : 2048U;
-        for (auto i = tid; i < 2048U; i += kSelectThreads) histogram[i] = 0;
-        __syncthreads();
-        for (std::uint32_t base = 0; base < num_blocks; base += kSelectThreads) {
-            const auto block = base + tid;
-            const float value = block < num_blocks ? block_scores[block] : -INFINITY;
-            const auto key = select_key(value);
-            const bool counted = value > -INFINITY && (key & mask) == prefix;
-            const auto digit = (key >> shift) & (digits - 1U);
-            // One atomic for the lanes sharing the first counted lane's digit.
-            const auto votes = __ballot(counted);
-            if (votes) {
-                const auto leader = static_cast<unsigned>(__builtin_ctzll(votes));
-                const auto lead = __shfl(digit, static_cast<int>(leader), 32);
-                const auto same = __ballot(counted && digit == lead);
-                if (counted && digit != lead) atomicAdd(&histogram[digit], 1U);
-                else if (tid % 32U == leader) atomicAdd(&histogram[lead], static_cast<std::uint32_t>(__popcll(same)));
-            }
-        }
-        __syncthreads();
-        const auto high = 2U * tid + 1U < digits ? histogram[2U * tid + 1U] : 0U;
-        const auto low = 2U * tid < digits ? histogram[2U * tid] : 0U;
-        std::uint32_t counted_total = 0;
-        const auto above = [&] { const auto inclusive = select_scan(high + low, waves, counted_total); return counted_total - inclusive; }();
-        if (pass == 0 && counted_total <= need) { zeros = need - counted_total; need = counted_total; break; }
-        if (above < need && need <= above + high) { found_digit = 2U * tid + 1U; found_need = need - above; found_count = high; }
-        else if (above + high < need && need <= above + high + low) { found_digit = 2U * tid; found_need = need - above - high; found_count = low; }
-        __syncthreads();
-        prefix |= found_digit << shift; mask |= (digits - 1U) << shift; need = found_need;
-        if (found_count == need) break;
-    }
-    for (auto token = tid; token < zeros * compress_ratio; token += kSelectThreads) selected[token] = token % compress_ratio;
-    std::uint32_t greater_before = 0, equal_before = 0;
-    for (std::uint32_t base = 0; base < num_blocks; base += 4U * kSelectThreads) {
-        const auto first = base + 4U * tid;
-        unsigned kind[4], greater = 0, equal = 0;
-        for (unsigned j = 0; j < 4U; ++j) {
-            const auto block = first + j;
-            const float value = block < num_blocks ? block_scores[block] : -INFINITY;
-            const auto masked = select_key(value) & mask;
-            kind[j] = !(value > -INFINITY) ? 0U : masked > prefix ? 1U : masked == prefix ? 2U : 0U;
-            greater += kind[j] == 1U; equal += kind[j] == 2U;
-        }
-        std::uint32_t tile = 0;
-        const auto packed = select_scan((greater << 16U) | equal, waves, tile);
-        auto g = greater_before + (packed >> 16U) - greater, e = equal_before + (packed & 0xffffU) - equal;
-        for (unsigned j = 0; j < 4U; ++j) {
-            if (kind[j] == 1U || (kind[j] == 2U && e < need)) {
-                const auto block = first + j, slot = zeros + g + min(e, need);
-                for (std::uint32_t offset = 0; offset < compress_ratio; ++offset)
-                    selected[slot * compress_ratio + offset] = block * compress_ratio + offset;
-                if (!preserve_scores) block_scores[block] = -INFINITY;
-            }
-            g += kind[j] == 1U; e += kind[j] == 2U;
-        }
-        greater_before += tile >> 16U; equal_before += tile & 0xffffU;
-    }
-    if (zeros && tid == 0 && !preserve_scores) block_scores[0] = -INFINITY;
-    const auto complete_tokens = num_blocks * compress_ratio, selected_complete = select_blocks * compress_ratio;
-    for (auto token = complete_tokens + tid; token < visible_tokens; token += kSelectThreads)
-        selected[selected_complete + token - complete_tokens] = token;
+    radix3::select_blocks<kSelectThreads>(block_scores, num_blocks, select_blocks, compress_ratio, visible_tokens, selected,
+        GraphSelectControl{dynamic}, preserve_scores);
 }
 
 __global__ __launch_bounds__(kSelectThreads) void select_blocks_kernel(float* block_scores, std::uint32_t num_blocks,

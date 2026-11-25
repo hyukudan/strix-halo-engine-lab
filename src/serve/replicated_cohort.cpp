@@ -188,11 +188,7 @@ void ReplicatedCohort::verify(std::span<const CohortGroup> groups, std::span<con
         throw std::invalid_argument("cohort replica: verify rows, tokens and top disagree");
     body_.insert(body_.end(), tokens.begin(), tokens.end());
     send(kOpVerify, words_of(groups.size(), "groups"), 0U, body_);
-    // The verify frame carries no score-read flag yet: both ranks run every group as read (CohortGroup's default), so
-    // rank 0 and rank 1 always take the same backend route (a collective one must not diverge).
-    read_groups_.assign(groups.begin(), groups.end());
-    for (auto& g : read_groups_) g.reads_scores = true;
-    local_.verify(read_groups_, tokens, top);
+    local_.verify(groups, tokens, top);
 }
 
 void ReplicatedCohort::commit(std::span<const std::uint32_t> accept) {
@@ -366,7 +362,7 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
                 if (2U * n > body.size()) throw pair::ProtocolError("cohort replica: truncated groups");
                 std::uint64_t rows = 0;
                 for (std::uint64_t g = 0; g < n; ++g) {
-                    groups.push_back({body[2U * g], body[2U * g + 1U], true});  // as rank 0: every group read
+                    groups.push_back({body[2U * g], body[2U * g + 1U]});
                     rows += body[2U * g + 1U];
                 }
                 tokens = body.subspan(2U * n);

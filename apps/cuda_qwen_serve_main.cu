@@ -32,6 +32,7 @@
 // steps (whole prompt blocks when nothing decodes). Every request's tokens equal it running alone.
 // --http-slots 1 or STRIX_QRTX_COHORT=0: the old serialized path (one request at a time, generate() to completion).
 // Token-block prefix checkpoints restore exact prompt state before the remaining prefill rows.
+#include "strix/token_sampling.hpp"
 #include "strix/device/cuda_enumerator.hpp"
 #include "strix/deploy/memory_plan.hpp"
 #include "cuda_qwen_prefix_cache.hpp"
@@ -128,6 +129,7 @@ void on_signal(int) { g_stop.store(true); }
 
 struct Options {
     qp::Config engine;                          // from the shared parser (qwen_options.hpp), serve role applied
+    strix::TokenSamplerOptions sampler_options{};
     std::string effective_config;               // --print-effective-config: JSON, printed instead of serving
     px::Settings prefix;
     std::string bind = "127.0.0.1", api_key_file, model_id = "qwen3.8-flash-next";
@@ -314,7 +316,7 @@ public:
                 st.error_status = 400; st.error_code = "invalid_request_error";
                 throw serve::GenerationRequestError(st, std::string(field) + " is unavailable with sampling");
             }
-            sampler = kSampling.make(job);
+            sampler = kSampling.make(job, o_.sampler_options);
             st.sampling = "sampling-v1";
         }
         // A request policy (thinking budget): selected on the host from each verified row's argmax (shared
@@ -807,7 +809,7 @@ private:
         }
         if (job.sampling.temperature != 0.0) {
             try {
-                s.sampler = kSampling.make(job);
+                s.sampler = kSampling.make(job, o_.sampler_options);
             } catch (const std::invalid_argument& ex) {
                 s.st.error_status = 400;
                 s.st.error_code = "invalid_request_error";
@@ -1144,7 +1146,9 @@ int main(int argc, char** argv) {
     // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
     try {
         const auto device_cli = strix::device::take_command_line(argc, argv);
+        const auto sampler_options = strix::validate_sampling_startup_environment();
         auto o = parse(argc, argv);
+        o.sampler_options = sampler_options;
         strix::device::Request device_request;
         device_request.select = device_cli.select;
         const auto& bound = strix::device::bind_cuda(std::move(device_request), device_cli.devices_path);

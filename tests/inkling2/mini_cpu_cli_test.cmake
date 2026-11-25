@@ -26,4 +26,11 @@ execute_process(COMMAND "${DECODER}" "${checkpoint}" 1 --generate 2 --speculatio
 if(NOT code EQUAL 1 OR NOT error MATCHES "--speculation verify requires greedy decoding")
     message(FATAL_ERROR "decoder admitted speculative sampling: ${error}")
 endif()
+
+execute_process(COMMAND "${CMAKE_COMMAND}" -E env STRIX_MOE_EXPERTS_NVFP4=1
+    "${DECODER}" "${checkpoint}" 1 --profile fast
+    RESULT_VARIABLE code ERROR_VARIABLE error)
+if(NOT code EQUAL 1 OR NOT error MATCHES "STRIX_MOE_EXPERTS_NVFP4=1 requires native resident model execution")
+    message(FATAL_ERROR "CPU decoder did not refuse the narrow image before loading: ${error}")
+endif()
 file(REMOVE_RECURSE "${directory}")

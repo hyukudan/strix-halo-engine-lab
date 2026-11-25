@@ -11,6 +11,7 @@
 
 #include "common.cuh"
 #include "attn_core/prepared_gqa_attention.hpp"
+#include "core/byte_range.hpp"
 #include "strix/cuda_core/attention_row_walk.hpp"
 #include "strix/cuda_core/attention_score_reduce.hpp"
 
@@ -811,6 +812,78 @@ cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const Prepare
     return attn_core::enqueue_validate_prepared_finite(
         {q, k, v, prepared.relative_bias, prepared.sinks, out, pos0, rows},
         d.heads, d.kv_heads, d.head_dim, prepared.relative_extent, failure, stream);
+}
+
+namespace {
+std::atomic<void (*)()> append_boundary_hook{nullptr};  // test seam: runs between the K/V store and the flash launch
+}  // namespace
+
+// Test seam (declared by the fixture only): `hook` runs inside the projected append after its preparation and K/V store
+// and before the prepared launch is submitted (nullptr = none). Production never sets it: the append reads the pointer
+// once per submission, and a null pointer costs one predicted branch on the host.
+void set_append_boundary_hook_for_test(void (*hook)()) { append_boundary_hook.store(hook); }
+
+cudaError_t prepare_append_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                         const PreparedBf16Projection& projection, const float* q, const float* k,
+                                         const float* v, __nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
+                                         std::uint32_t pos0, std::uint32_t rows, float* out, FlashPipe pipe,
+                                         unsigned* failure, PreparedProjectedAppend& append, bool& declined) {
+    // Every refusal of the append (flash admission, overlaps, failure word, device opt-in, K/V store admission, K/V input
+    // rows against the failure word) is decided here, before anything is enqueued.
+    append = {};
+    if (auto status = prepare_prepared_bf16_projected(d, prepared, projection, q, k_cache, v_cache, pos0, rows, out, pipe,
+                                                      failure, append.launch_, declined);
+        status != cudaSuccess || declined) return status;
+    const std::size_t kv_bytes = std::size_t{rows} * d.kv_heads * d.head_dim * sizeof(float);  // bounded by the admission
+    if (!prepared_store_admits(d, k, v, k_cache, v_cache, pos0, rows, prepared.wrapped) ||
+        !core::reads_disjoint_from_writes({{k, kv_bytes}, {v, kv_bytes}}, {{failure, sizeof(unsigned)}})) {
+        append = {};
+        declined = true;
+        return cudaSuccess;
+    }
+    append.dims_ = d;
+    append.q_ = q;
+    append.k_ = k;
+    append.v_ = v;
+    append.sinks_ = prepared.sinks;
+    append.k_cache_ = k_cache;
+    append.v_cache_ = v_cache;
+    append.pos0_ = pos0;
+    append.rows_ = rows;
+    append.wrapped_ = prepared.wrapped;
+    append.out_ = out;
+    append.failure_ = failure;
+    return cudaSuccess;
+}
+
+cudaError_t submit_append_prepared_bf16(const PreparedProjectedAppend& append, cudaStream_t stream) {
+    if (!append.admitted()) return cudaErrorInvalidValue;  // never prepared, or the preparation was refused
+    const auto hook = append_boundary_hook.load(std::memory_order_relaxed);  // read once per submission
+    auto status = kv_store_prepared_bf16(append.dims_, append.k_, append.v_, append.k_cache_, append.v_cache_, append.pos0_,
+                                         append.rows_, append.wrapped_, stream);
+    if (status != cudaSuccess) return status;
+    if (hook) hook();  // test seam: null in production
+    status = launch_prepared_bf16_projected(append.launch_, stream);
+    if (status != cudaSuccess || !append.failure_) return status;
+    // The flash flagged the projected logits; the remaining operands are checked as on the image route.
+    const auto& d = append.dims_;
+    return attn_core::enqueue_validate_prepared_finite(
+        {append.q_, append.k_, append.v_, nullptr, append.sinks_, append.out_, append.pos0_, append.rows_}, d.heads,
+        d.kv_heads, d.head_dim, 0U, append.failure_, stream);
+}
+
+cudaError_t append_attention_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                           const PreparedBf16Projection& projection,
+                                           const float* q, const float* k, const float* v,
+                                           __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, std::uint32_t pos0,
+                                           std::uint32_t rows, float* out, cudaStream_t stream,
+                                           FlashPipe pipe, unsigned* failure) {
+    PreparedProjectedAppend append;
+    bool declined = false;
+    if (auto status = prepare_append_prepared_bf16(d, prepared, projection, q, k, v, k_cache, v_cache, pos0, rows, out,
+                                                   pipe, failure, append, declined);
+        status != cudaSuccess) return status;
+    return declined ? cudaErrorInvalidValue : submit_append_prepared_bf16(append, stream);
 }
 
 cudaError_t append_attention_prepared_bf16_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,

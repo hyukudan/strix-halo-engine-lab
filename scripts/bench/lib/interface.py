@@ -160,6 +160,8 @@ def plan(out,dry,k):
         else:
             if engine=='minimax-pair':
                 argv=[exe('strix-minimax-serve'),md+'/minimax','--rank','0','--transport','usb4gpu','--capacity',str(capacity),'--port',os.environ.get('BENCH_PORT','18880')]
+                # The baseline serve arm runs: both ranks get STRIX_MM_BASELINE=1 from profile_environment
+                # (engines/minimax-pair.sh), the same switch as the rank arm.
                 if p['profile'] not in ('greedy','baseline'): argv+=['--dspark',md+'/minimax/dspark']
                 if os.environ.get('BENCH_MINIMAX_DRAFT_EXL3'): argv+=['--dspark-exl3',os.environ['BENCH_MINIMAX_DRAFT_EXL3']]
             else:

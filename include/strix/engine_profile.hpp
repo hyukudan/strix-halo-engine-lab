@@ -82,6 +82,65 @@ inline unsigned value_column(const Row& lever, Name profile) {
     return column;
 }
 
+// Legacy identity-variant API. These selections are explicit arithmetic levers, not permission for a separate
+// serving identity. CLI and HTTP must resolve the same default and selected values for each model/backend/tier.
+// A load, slot or cohort-width decision may change the schedule only with a bitwise identity proof.
+// The legacy API below still admits an explicit named route (another reduction/grouping order or packed MoE pass): it
+// runs only when requested by name ('--identity-variant ID[@VERSION]' or the variant's own option, a model TOML key, a
+// serve config) THROUGH resolve(), which admits it on a declared backend under a tier its row admits. EXACT admits only
+// a variant that is itself bitwise-defined (deterministic and batch invariant against its named reference) and declared
+// as an EXACT identity variant (`exact_identity`). An admitted variant prints "identity <id>@<version>" in the receipt,
+// the effective config and the startup line, and enters the rank fingerprint; with none admitted every output stays the
+// existing default's, byte for byte. This compatibility rule does not qualify CLI/server equality; divergent defaults
+// must be migrated with served A/B evidence. Engines read the decision only through Resolution::selected(id).
+struct IdentityVariant {
+    std::string_view id;                        // "inkling2-mini-moe-packed"
+    unsigned version = 0;                       // bumped when the arithmetic changes; a request may pin "id@version"
+    std::string_view changes;                   // what differs from the incumbent identity
+    std::string_view reference;                 // what the variant is qualified against
+    std::string_view backends;                  // comma list of the backends it is declared for ("hip", "hip,cuda")
+    std::array<bool, kProfileColumns> tiers{};  // tiers that may admit it (default, fast, quality, turbo)
+    bool exact_identity = false;                // bitwise-defined identity of its own: the only kind EXACT admits
+    std::string_view option{};                  // CLI alias of '--identity-variant <id>' (empty: none)
+    std::string_view toml_key{};                // model TOML / serve config key that requests it (empty: none)
+    std::string_view source{};                  // required qualification receipt
+};
+inline constexpr std::string_view kIdentityVariantOption = "--identity-variant";
+
+// Declaration rules, checked at compile time by the engine table and again by resolve().
+[[nodiscard]] constexpr bool valid_variants(std::span<const IdentityVariant> variants,
+                                            std::span<const Lever> levers = {}) {
+    for (std::size_t i = 0; i < variants.size(); ++i) {
+        const auto& v = variants[i];
+        if (v.id.empty() || v.version == 0U || v.changes.empty() || v.reference.empty() || v.backends.empty() ||
+            v.source.empty())
+            return false;
+        if (v.id.find_first_of("@, =") != std::string_view::npos) return false;
+        // CLI aliases must not consume existing profile/lever options before their own parser.
+        if (!v.option.empty()) {
+            if (!v.option.starts_with("--") || v.option.size() == 2U ||
+                v.option.find_first_of("@, =\t\r\n") != std::string_view::npos ||
+                v.option == "--profile" || v.option == "--allow-pending" || v.option == kIdentityVariantOption ||
+                v.option == turbo::kWeightsOption || v.option == turbo::kBitsOption || v.option == turbo::kPackOption)
+                return false;
+            for (const auto& lever : levers) if (v.option == lever.option) return false;
+        }
+        if (v.toml_key.find_first_of("@, =\t\r\n") != std::string_view::npos) return false;
+        if (v.tiers[0] && !v.exact_identity) return false;  // EXACT admits only an exact identity variant
+        bool admitted = false;
+        for (const bool tier : v.tiers) admitted = admitted || tier;
+        if (!admitted) return false;
+        for (std::size_t j = 0; j < i; ++j) {
+            const auto& w = variants[j];
+            if (w.id == v.id || (!v.option.empty() && w.option == v.option) ||
+                (!v.toml_key.empty() && w.toml_key == v.toml_key) ||
+                v.id == w.option || w.id == v.option || v.id == w.toml_key || w.id == v.toml_key)
+                return false;
+        }
+    }
+    return true;
+}
+
 // One engine: its receipt tag, the allow-pending variable and the table.
 struct Engine {
     std::string_view tag;                   // "deepseek41-pair", "glm-pair", "minimax-pair"
@@ -90,6 +149,7 @@ struct Engine {
     bool quality_rows = false;              // false: 'quality' runs default with one notice
     std::string_view turbo_version{};       // versioned TURBO name ("ds41-turbo-v1"); empty: turbo refused
     turbo::WeightCaps weight_caps{};        // weight sources / widths this build can load under turbo
+    std::span<const IdentityVariant> variants{};  // declared identity variants (empty: the incumbent identity only)
 };
 
 // Tier words: exact | fast | turbo; `exact` is the default column (spelled "default" in receipts, kept as an alias).
@@ -171,6 +231,10 @@ struct Entry {
     std::string requested{};    // what the profile column or the explicit setting asked for (empty: builtin)
 };
 
+struct Inputs;
+struct Resolution;
+inline Resolution resolve(const Engine&, const Inputs&);
+
 struct Resolution {
     const Engine* engine = nullptr;
     Name profile = Name::standard;
@@ -180,6 +244,40 @@ struct Resolution {
     // Bit-changing switches outside the lever table that the engine applied and can attest ("name=value"). The tier
     // notice names them and then never claims the exact column.
     std::vector<std::string> engine_overrides;
+    // Identity variants resolve() admitted, in declaration order; each points into engine->variants.
+    [[nodiscard]] const std::vector<const IdentityVariant*>& identity_variants() const {
+        if (!admitted_.empty() && (engine != admitted_engine_ || profile != admitted_profile_))
+            throw std::logic_error("the resolution was changed after admission (admitted for " +
+                                   std::string(admitted_engine_->tag) + " --profile " +
+                                   std::string(admitted_profile_ == Name::standard ? "exact" : name(admitted_profile_)) +
+                                   ")");
+        return admitted_;
+    }
+
+    [[nodiscard]] bool incumbent_identity() const { return identity_variants().empty(); }
+    // True when the declared variant `id` was requested and admitted. An id the engine does not declare is a defect of
+    // the caller (a route switch with no declaration), never a quiet false; so is a resolution whose engine or tier
+    // was changed after admission (the admitted set belongs to the engine and the tier resolve() checked).
+    [[nodiscard]] bool selected(std::string_view id) const {
+        const auto& variants = identity_variants();
+        const IdentityVariant* declared = nullptr;
+        if (engine != nullptr)
+            for (const auto& variant : engine->variants) if (variant.id == id) declared = &variant;
+        if (declared == nullptr)
+            throw std::logic_error("identity variant '" + std::string(id) + "' is not declared by " +
+                                   (engine != nullptr ? std::string(engine->tag) : std::string("an unresolved profile")));
+        for (const auto* variant : variants) if (variant == declared) return true;
+        return false;
+    }
+    // "identity incumbent" or "identity <id>@<version>[ <id>@<version>...]": the startup line's identity field.
+    [[nodiscard]] std::string identity() const {
+        const auto& variants = identity_variants();
+        if (variants.empty()) return "identity incumbent";
+        std::string out = "identity";
+        for (const auto* variant : variants)
+            out += ' ' + std::string(variant->id) + '@' + std::to_string(variant->version);
+        return out;
+    }
 
     [[nodiscard]] bool is_turbo() const { return profile == Name::turbo; }
     // Versioned product name: the turbo name under turbo, else the profile name.
@@ -251,6 +349,7 @@ struct Resolution {
     }
     // {"profile":...,"engine":...,"qualification":...,"levers":{...},"pending":[...],"unqualified":[...],"provisional":[...]}
     [[nodiscard]] std::string json() const {
+        const auto& variants = identity_variants();
         std::string levers, pending, unqualified, provisional;
         for (const auto& entry : entries) {
             const auto& lever = *entry.lever;
@@ -283,6 +382,18 @@ struct Resolution {
                 ",\"weights_reason\":" + json_string(weights.reason) +
                 ",\"cache_namespace\":" + json_string(cache_namespace()) + "}";
         if (quality_fallback()) out += ",\"note\":\"quality: no quality rows for this model, using default\"";
+        if (!variants.empty()) {  // absent for the incumbent identity: legacy JSON unchanged
+            out += ",\"identity\":[";
+            for (std::size_t i = 0; i < variants.size(); ++i) {
+                const auto& variant = *variants[i];
+                out += std::string(i == 0U ? "" : ",") + "{\"id\":" + json_string(variant.id) +
+                    ",\"version\":" + std::to_string(variant.version) +
+                    ",\"exact_identity\":" + (variant.exact_identity ? "true" : "false") +
+                    ",\"reference\":" + json_string(variant.reference) + ",\"changes\":" + json_string(variant.changes) +
+                    ",\"source\":" + json_string(variant.source) + "}";
+            }
+            out += "]";
+        }
         return out + ",\"levers\":{" + levers + "},\"pending\":[" + pending + "],\"unqualified\":[" + unqualified +
             "],\"provisional\":[" + provisional + "]}";
     }
@@ -306,6 +417,7 @@ struct Resolution {
     // as overrides and the line then does not claim the exact column. Empty for exact/quality or when at least one
     // profile row is qualified. Kept out of notices() so the per-row notice contract is unchanged.
     [[nodiscard]] std::string tier_notice() const {
+        const auto& variants = identity_variants();
         if (profile != Name::fast && profile != Name::turbo) return {};
         std::size_t pending = 0, qualified = 0;
         std::string overrides;
@@ -320,6 +432,9 @@ struct Resolution {
         }
         if (qualified != 0U) return {};
         for (const auto& extra : engine_overrides) overrides += (overrides.empty() ? "" : ",") + extra;
+        for (const auto* variant : variants)  // an admitted variant never runs "the exact column"
+            overrides += (overrides.empty() ? "identity " : ",identity ") + std::string(variant->id) + '@' +
+                std::to_string(variant->version);
         // TURBO may change weight representation even when its speed-lever column is empty.
         // Never describe a low-bit run as identical to the native-weight EXACT column.
         const bool nonnative_weights = is_turbo() && weights.effective != turbo::Source::native;
@@ -340,10 +455,12 @@ struct Resolution {
     [[nodiscard]] std::vector<std::string> receipt_lines() const {
         std::vector<std::string> out{summary()};
         if (auto notice = tier_notice(); !notice.empty()) out.push_back(std::move(notice));
+        if (!incumbent_identity()) out.push_back(identity());  // the incumbent's receipt lines are unchanged
         return out;
     }
     // Line form for line-oriented --print-effective-config outputs (appended after the engine's own lines).
     [[nodiscard]] std::string describe() const {
+        const auto& variants = identity_variants();
         std::string out = std::string("profile ") + name(profile) + "\nprofile qualification " + qualification() + "\n";
         if (quality_fallback()) out += "profile note quality: no quality rows for this model, using default\n";
         if (is_turbo())
@@ -358,11 +475,16 @@ struct Resolution {
             if (is_turbo() && !entry.reason.empty()) out += " reason " + entry.reason;
             out += "\n";
         }
+        for (const auto* variant : variants)
+            out += "identity " + std::string(variant->id) + '@' + std::to_string(variant->version) + " (" +
+                (variant->exact_identity ? "exact identity" : "bit-changing") + "; reference " +
+                std::string(variant->reference) + "; changes " + std::string(variant->changes) + ")\n";
         return out;
     }
     // FNV-1a 64 of what the ranks of a pair must share: the profile name, the qualification and every lever's
     // effective value (not how it was set: an explicit value equal to the profile's is the same run).
     [[nodiscard]] std::uint64_t fingerprint() const {
+        const auto& variants = identity_variants();
         std::uint64_t h = 1469598103934665603ULL;
         const auto mix = [&h](std::string_view s) {
             h = host_fnv::byte(host_fnv::text(s, h), 0xFFU);  // preserve legacy seed and separator
@@ -378,8 +500,20 @@ struct Resolution {
             mix(entry.lever->name);
             mix(entry.value);
         }
+        for (const auto* variant : variants) {  // nothing mixed for the incumbent: legacy fingerprints unchanged
+            mix("identity");
+            mix(variant->id);
+            mix(std::to_string(variant->version));
+        }
         return h;
     }
+
+private:
+    friend Resolution resolve(const Engine&, const Inputs&);
+    static std::vector<const IdentityVariant*> resolve_variants(const Engine&, const Inputs&, const Resolution&);
+    std::vector<const IdentityVariant*> admitted_;  // written only by resolve()
+    const Engine* admitted_engine_ = nullptr;       // the engine and tier the set was admitted for
+    Name admitted_profile_ = Name::standard;
 };
 
 // Rank agreement: both ranks of a pair must run the same resolved profile (a bit-changing row on one rank only
@@ -441,13 +575,59 @@ inline DefaultValue resolve_default(const DefaultItem& row, bool baseline, const
     return {row.on, DefaultSource::on};
 }
 using Pairs = std::vector<std::pair<std::string, std::string>>;
+// Where an identity-variant request came from (receipt provenance only: every origin is admitted by the same rule).
+enum class VariantOrigin { cli, toml, serve };
+struct VariantRequest {
+    std::string id;        // declared id (request_variant canonicalizes aliases)
+    unsigned version = 0;  // 0: any; else must equal the declared version
+    VariantOrigin origin = VariantOrigin::cli;
+};
+
 struct Inputs {
     std::optional<Name> profile;  // --profile; none: default
     Pairs cli;                    // levers set by their own CLI option: {lever name, value}
     Lookup env;                   // environment lookup; empty: the process environment
     bool allow_pending = false;   // --allow-pending
     turbo::WeightsRequest weights{};  // --turbo-weights / --turbo-weight-bits / --turbo-weights-pack
+    std::vector<VariantRequest> variants{};  // explicit identity-variant requests (request_variant)
+    std::string backend{};        // backend the run resolves to ("hip", "cuda"); required when a variant is requested
 };
+
+// Records an explicit identity-variant request: `token` is "id" or "id@version" from any origin, the variant's option
+// (cli) or its TOML key (toml). Every entry point (app CLI, take_options, server launcher, model TOML) goes through
+// this one function, so the same request selects the same variant everywhere. An undeclared token is refused here.
+inline void request_variant(const Engine& engine, Inputs& inputs, std::string_view token, VariantOrigin origin) {
+    if (!valid_variants(engine.variants, engine.table))
+        throw std::logic_error(std::string(engine.tag) + ": malformed identity variant declaration");
+    std::string_view id = token;
+    unsigned version = 0;
+    if (const auto at = token.find('@'); at != std::string_view::npos) {
+        id = token.substr(0, at);
+        const auto digits = token.substr(at + 1U);
+        for (const char c : digits) {
+            if (c < '0' || c > '9' || version > 100000U)
+                throw std::invalid_argument(std::string(engine.tag) + ": bad identity variant version in '" +
+                                            std::string(token) + "'");
+            version = version * 10U + static_cast<unsigned>(c - '0');
+        }
+        if (digits.empty() || version == 0U)
+            throw std::invalid_argument(std::string(engine.tag) + ": bad identity variant version in '" +
+                                        std::string(token) + "'");
+    }
+    const IdentityVariant* match = nullptr;
+    for (const auto& variant : engine.variants)
+        if (variant.id == id || (origin == VariantOrigin::cli && !variant.option.empty() && variant.option == id) ||
+            (origin == VariantOrigin::toml && !variant.toml_key.empty() && variant.toml_key == id))
+            match = &variant;
+    if (match == nullptr) {
+        std::string declared;
+        for (const auto& variant : engine.variants)
+            declared += (declared.empty() ? "" : ", ") + std::string(variant.id) + '@' + std::to_string(variant.version);
+        throw std::invalid_argument(std::string(engine.tag) + ": unknown identity variant '" + std::string(token) +
+                                    "' (declared: " + (declared.empty() ? "none" : declared) + ")");
+    }
+    inputs.variants.push_back({std::string(match->id), version, origin});
+}
 
 inline const char* environment(const Lookup& env, std::string_view key) {
     const std::string k(key);
@@ -475,6 +655,51 @@ inline Status admit_profile_column(bool ready, bool runnable, bool allow_pending
 inline bool model_preset() {
     const char* value = environment({}, kPresetEnv);
     return value && std::string_view(value) == "1";
+}
+
+// Identity-variant admission, the one rule for every engine and entry point: each request names a declared variant
+// (and its version when pinned), the run's backend is one the variant declares, and the tier column admits it (EXACT
+// only for an exact identity variant). Anything else refuses the run before any work; nothing falls back silently.
+inline std::vector<const IdentityVariant*> Resolution::resolve_variants(const Engine& engine, const Inputs& inputs,
+                                                                         const Resolution& out) {
+    if (!valid_variants(engine.variants, engine.table))
+        throw std::logic_error(std::string(engine.tag) + ": malformed identity variant declaration");
+    for (const auto& request : inputs.variants) {  // a hand-built request must still name a declared variant
+        bool declared = false;
+        for (const auto& variant : engine.variants) declared = declared || request.id == variant.id;
+        if (!declared)
+            throw std::invalid_argument(std::string(engine.tag) + ": unknown identity variant '" + request.id + "'");
+    }
+    std::vector<const IdentityVariant*> admitted;
+    for (const auto& variant : engine.variants) {
+        bool requested = false;
+        for (const auto& request : inputs.variants) {
+            if (request.id != variant.id) continue;
+            if (request.version != 0U && request.version != variant.version)
+                throw std::invalid_argument(std::string(engine.tag) + ": identity variant " + request.id + '@' +
+                                            std::to_string(request.version) + " is not built (this build declares @" +
+                                            std::to_string(variant.version) + ")");
+            requested = true;
+        }
+        if (!requested) continue;
+        const std::string label = std::string(engine.tag) + ": identity variant " + std::string(variant.id) + '@' +
+                                  std::to_string(variant.version);
+        if (inputs.backend.empty()) throw std::invalid_argument(label + " requires a resolved backend");
+        if (!bit_class_member(variant.backends, inputs.backend))
+            throw std::invalid_argument(label + " is not declared for backend " + inputs.backend + " (declared: " +
+                                        std::string(variant.backends) + ")");
+        const auto column = static_cast<std::size_t>(out.profile);
+        if (!variant.tiers[column] || (out.profile == Name::standard && !variant.exact_identity)) {
+            std::string admits;
+            for (std::size_t c = 0; c < kProfileColumns; ++c)
+                if (variant.tiers[c])
+                    admits += (admits.empty() ? "" : ",") + std::string(c == 0U ? "exact" : name(static_cast<Name>(c)));
+            throw std::invalid_argument(label + " is not admitted under --profile " + out.word() + " (admitted: " +
+                                        admits + ")");
+        }
+        admitted.push_back(&variant);
+    }
+    return admitted;
 }
 
 inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
@@ -512,6 +737,9 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         }
         out.entries.push_back(std::move(entry));
     }
+    out.admitted_ = Resolution::resolve_variants(engine, inputs, out);
+    out.admitted_engine_ = &engine;
+    out.admitted_profile_ = out.profile;
     return out;
 }
 
@@ -650,12 +878,15 @@ inline std::vector<std::string> profile_args(const Resolution& resolution) {
 }
 
 // Removes '--profile default|fast|quality|turbo' ('--profile=NAME'), '--allow-pending' and the turbo weight options
-// (--turbo-weights, --turbo-weight-bits, --turbo-weights-pack) from `args` into `inputs` and records
+// (--turbo-weights, --turbo-weight-bits, --turbo-weights-pack), '--identity-variant ID[@V]' and each declared variant's
+// own option (request_variant) from `args` into `inputs` and records
 // (without removing) the table's lever options as explicit CLI values. Any other '--profile' token ('--profile' followed
 // by something that is not a profile name, '--profile=OTHER') stays in `args` untouched, for the app's own parser: an
 // older meaning (GLM kernel timing, MiniMax timed session) or a value of another option keeps working. Only a second
 // profile name is an error.
 inline void take_options(const Engine& engine, std::vector<std::string>& args, Inputs& inputs) {
+    if (!valid_variants(engine.variants, engine.table))
+        throw std::logic_error(std::string(engine.tag) + ": malformed identity variant declaration");
     std::vector<std::string> kept;
     kept.reserve(args.size());
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -663,6 +894,20 @@ inline void take_options(const Engine& engine, std::vector<std::string>& args, I
         const auto equal = a.find('=');
         const std::string key = a.substr(0, equal);
         if (a == "--allow-pending") { inputs.allow_pending = true; continue; }
+        if (key == kIdentityVariantOption) {  // consumed: the app never sees a variant switch, only the resolution
+            std::string value;
+            if (equal != std::string::npos) value = a.substr(equal + 1U);
+            else if (i + 1 < args.size()) value = args[++i];
+            if (value.empty()) throw std::invalid_argument(key + " requires a value");
+            request_variant(engine, inputs, value, VariantOrigin::cli);
+            continue;
+        }
+        bool alias = false;
+        for (const auto& variant : engine.variants) alias = alias || (!variant.option.empty() && a == variant.option);
+        if (alias) {
+            request_variant(engine, inputs, a, VariantOrigin::cli);
+            continue;
+        }
         if (key == turbo::kWeightsOption || key == turbo::kBitsOption || key == turbo::kPackOption) {
             std::string value;
             if (equal != std::string::npos) value = a.substr(equal + 1U);

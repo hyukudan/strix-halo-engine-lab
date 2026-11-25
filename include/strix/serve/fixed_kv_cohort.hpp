@@ -23,9 +23,11 @@ namespace strix::serve {
 // single-session prefill does: a served lane then runs the same prefill rows
 // as that session. The call's final scores are its row 0 (read_slot_logits),
 // copied out only when a sampled lane asks, like a one-lane decode window.
-// A decoder whose decode_slots also takes `reads_scores` learns whether any lane of the window will read its final
-// scores (CohortGroup::reads_scores), so a greedy-only pick form serves only windows nobody reads.
+// A decoder that offers BOTH prefill calls also declares which one it serves with at run time
+// (prefill_emits_first() const -> bool, fixed for its lifetime). This is an arithmetic lever whose resolved value
+// must match the CLI; it must never be selected by slot, cohort width or arrival order. Read once at construction.
 template <class Decoder>
+
 class FixedKvCohort final : public CohortBackend {
 public:
     FixedKvCohort(std::unique_ptr<Decoder> decoder, std::uint32_t context,
@@ -33,6 +35,7 @@ public:
         : decoder_(std::move(decoder)), context_(context), rows_(rows), lanes_(lanes) {
         if (!decoder_ || context_ == 0U || lanes_ == 0U || lanes_ > rows_)
             throw std::invalid_argument("invalid fixed KV cohort geometry");
+        if constexpr (kSelectsRoute) emits_first_ = decoder_->prefill_emits_first();
         window_.reserve(lanes_);
         decoder_->allocate_slots(lanes_);
     }
@@ -41,27 +44,26 @@ public:
     std::uint32_t rows_per_forward() const override { return rows_; }
     std::uint32_t max_positions() const override { return context_; }
 
-    [[nodiscard]] bool prefill_emits_first() const override { return kEmitsFirst; }
+    [[nodiscard]] bool prefill_emits_first() const override { return emits_first_; }
 
     void prefill(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) override {
         withdraw();  // a prefill call replaces the decoder's score rows: no verify window stays readable
         if constexpr (kEmitsFirst) {
-            // The window is now this lane's prefill at row 0.
-            prefill_top_ = decoder_->prefill_slot_first(lane, tokens, first);
-            prefill_lane_ = lane;
-        } else {
-            decoder_->prefill_slot(lane, tokens, first);
+            if (emits_first_) {
+                // The window is now this lane's prefill at row 0.
+                prefill_top_ = decoder_->prefill_slot_first(lane, tokens, first);
+                prefill_lane_ = lane;
+                return;
+            }
         }
+        if constexpr (kPlainPrefill) decoder_->prefill_slot(lane, tokens, first);
     }
 
     [[nodiscard]] std::uint32_t prefill_top(std::uint32_t lane) override {
-        if constexpr (kEmitsFirst) {
-            if (lane == kNoLane || lane != prefill_lane_)
-                throw std::logic_error("fixed KV cohort: first id requested for a lane not just prefilled");
-            return prefill_top_;
-        } else {
-            return CohortBackend::prefill_top(lane);
-        }
+        if (!emits_first_) return CohortBackend::prefill_top(lane);
+        if (lane == kNoLane || lane != prefill_lane_)
+            throw std::logic_error("fixed KV cohort: first id requested for a lane not just prefilled");
+        return prefill_top_;
     }
 
     std::uint32_t prompt_tail_rows() const override {
@@ -83,14 +85,11 @@ public:
     void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                 std::span<std::uint32_t> top) override {
         withdraw();
-        bool reads_scores = false;
         for (const auto& group : groups) {
             if (group.rows != 1U) throw std::logic_error("fixed KV cohort requires one decode row per lane");
             window_.push_back(group.lane);
-            reads_scores = reads_scores || group.reads_scores;
         }
-        if constexpr (kScoreReads) decoder_->decode_slots(window_, tokens, top, reads_scores);
-        else decoder_->decode_slots(window_, tokens, top);
+        decoder_->decode_slots(window_, tokens, top);
         verify_pending_ = true;
     }
 
@@ -131,10 +130,6 @@ private:
         { decoder.logit_width() } -> std::convertible_to<std::uint32_t>;
         decoder.read_slot_logits(std::uint32_t{}, out);
     };
-    static constexpr bool kScoreReads = requires(Decoder& decoder, const std::vector<std::uint32_t>& window,
-                                                 std::span<const std::uint32_t> tokens, std::span<std::uint32_t> top) {
-        decoder.decode_slots(window, tokens, top, bool{});
-    };
     static constexpr bool kPieces = requires(const Decoder& decoder) {
         { decoder.prefill_piece_rule() } -> std::convertible_to<PromptPieceRule>;
         { decoder.prefill_call_chunk_rows(std::uint64_t{}) } -> std::convertible_to<std::uint64_t>;
@@ -142,6 +137,15 @@ private:
 
     static constexpr bool kEmitsFirst = requires(Decoder& decoder, std::span<const std::uint32_t> tokens) {
         { decoder.prefill_slot_first(std::uint32_t{}, tokens, bool{}) } -> std::convertible_to<std::uint32_t>;
+    };
+    static constexpr bool kPlainPrefill = requires(Decoder& decoder, std::span<const std::uint32_t> tokens) {
+        decoder.prefill_slot(std::uint32_t{}, tokens, bool{});
+    };
+    static_assert(kEmitsFirst || kPlainPrefill, "fixed KV cohort: the decoder offers no prefill call");
+    // Both calls offered and declared: the decoder's run-time identity picks one (prefill_emits_first()); undeclared,
+    // the emits-first call serves.
+    static constexpr bool kSelectsRoute = kEmitsFirst && kPlainPrefill && requires(const Decoder& decoder) {
+        { decoder.prefill_emits_first() } -> std::convertible_to<bool>;
     };
     static constexpr std::uint32_t kNoLane = ~std::uint32_t{0};
 
@@ -166,6 +170,7 @@ private:
     // emits-first: the lane of the last prefill call and its first id, valid until the next backend call; kept apart
     // from the verify window, so a commit right after a prefill is refused.
     std::uint32_t prefill_lane_ = kNoLane, prefill_top_ = 0;
+    bool emits_first_ = kEmitsFirst;  // the served route (kSelectsRoute: the decoder's identity)
 };
 
 } // namespace strix::serve

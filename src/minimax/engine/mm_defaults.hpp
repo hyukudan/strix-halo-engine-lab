@@ -116,7 +116,15 @@ bool product_option(const std::string& a, const std::function<std::string()>& ne
 // Cache / receipt identity of the active prefill policies; empty with every governed row at its builtin and the EXL3
 // MoE format. This field's omission alone does not establish complete cache compatibility.
 std::string prefill_identity(const Lookup& env);
-// Effective STRIX_MMX_PF_ORDER (table default or explicit): "adaptive" or "invariant" (identity mmx-pf-linear-s1-v1).
+inline constexpr char kInvariantOrderId[] = "mmx-pf-linear-s1-v1";
+// STRIX_MM_PF_DENSE_TAIL_FIXED=1 (opt-in row of profile_table, read the same way by rank and serve; unset or 0 =
+// library tails, other values throw): with the invariant order the dense MLP tails also take the fixed order. Throws
+// when the effective order is adaptive (explicit or baseline) or with STRIX_MM_PREFILL_IDENTITY=fp32.
+inline constexpr char kInvariantDenseTailOrderId[] = "mmx-pf-linear-s1-v2";
+bool dense_tail_fixed(const Lookup& env);
+// Identity of the invariant order: kInvariantOrderId, or kInvariantDenseTailOrderId with the dense tail lever.
+std::string invariant_order_id(const Lookup& env);
+// Effective STRIX_MMX_PF_ORDER: invariant by default, adaptive for the historical baseline or explicit selection.
 std::string linear_order(const Lookup& env);
 // Policy id of the index projection member for a canonical layer set ("minimax-index-proj-wmma-v1-l40-59").
 std::string idx_wmma_policy(const std::string& layers);
