@@ -13,6 +13,10 @@ inline constexpr FormatId kSP2WeightStorage{"strix.sp2", 1};
 [[nodiscard]] inline bool is_strixpack_storage(FormatId id) noexcept {
     return id == kSP4WeightStorage || id == kSP3WeightStorage || id == kSP2WeightStorage;
 }
+// Strix pack SP4 with the fixed 4-bit table {1,3,5,8,10,14,18,24} (strix/weight/host_lowbit.hpp sp::, 68 B per 128
+// weights, one scale byte per 32): produced only by strix-lowbit-calib-pack (calibrated pack, never at load). The
+// per-tensor base travels in the pack entry and reaches the consumers as ResidentMatrixView::outer_exponent.
+inline constexpr FormatId kSP4TWeightStorage{"strix.sp4t", 1};
 inline constexpr std::uint64_t plain_linear = 1ull << 0;
 inline constexpr std::uint64_t quantized_linear = 1ull << 1;
 inline constexpr std::uint64_t transformed_linear = 1ull << 2;

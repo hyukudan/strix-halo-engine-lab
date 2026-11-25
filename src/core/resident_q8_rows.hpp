@@ -70,6 +70,12 @@ inline row_transforms::Status enqueue_resident_lowbit_rows(
     }
     f16_tile_gemm::Q8ProjectionGroup<1> group{};
     group.append({matrix.bytes.data(), live_outputs, output});
+    if (matrix.storage == weight::kSP4TWeightStorage)
+        return f16_tile_gemm::small_m::gemm_sp4(input, rows, width, group,
+                                                f16_tile_gemm::small_m::OuterScales<1>{
+                                                    {std::ldexp(1.0F, matrix.outer_exponent)}},
+                                                stream, lowbit_wide_block(rows, group.first_panel[group.count],
+                                                                          detail::current_lowbit_row_plan()));
     return matrix.storage == weight::kQ4G64WeightStorage
                ? detail::launch_lowbit_group<weight::Q4G64Storage>(input, rows, width, group, stream)
                : detail::launch_lowbit_group<weight::Q6G64Storage>(input, rows, width, group, stream);
@@ -90,7 +96,8 @@ inline row_transforms::Status enqueue_resident_q8_rows(
 #endif
     , LowBitArithmetic arithmetic = LowBitArithmetic::fp32_sweep
 ) {
-    if (matrix.storage == weight::kQ4G64WeightStorage || matrix.storage == weight::kQ6G64WeightStorage)
+    if (matrix.storage == weight::kQ4G64WeightStorage || matrix.storage == weight::kQ6G64WeightStorage ||
+        matrix.storage == weight::kSP4TWeightStorage)
         return enqueue_resident_lowbit_rows(matrix, live_outputs, input, rows, output, stream, arithmetic);
     if (!valid_resident_q8_rows(matrix, live_outputs, input, rows, output)) return row_transforms::invalid;
 

@@ -19,7 +19,8 @@
 // Strix pack rules (sp4 / sp3 / sp2, strix/weight/host_lowbit.hpp sp::) code the matrix on the SP grid with the default
 // table (--table fixed) or a per-tensor fitted table (--table auto: sp::fit_table on a row sample, importance-weighted
 // when the technique uses importance); every coded superblock is decoded again and must equal the coder's own decode.
-// SP has no device consumer yet, so --out refuses SP rules; --dequant-out writes the decoded selected matrices as a
+// --out writes sp4 rules with --table fixed as strix.sp4t entries (the tensor header in the entry line, the HIP SP4
+// consumer); it refuses sp3 / sp2 and fitted tables (no device consumer yet). --dequant-out writes the decoded selected matrices as a
 // BF16 safetensors file (SP weights are exact in BF16; the tool refuses a value that is not) for an emulation through
 // the existing BF16 routes. The report gives the relative output error and the weight-space SQNR of every arm.
 #include "strix/serve/json.hpp"
@@ -149,8 +150,9 @@ Args parse(int argc, char** argv) {
         throw std::invalid_argument("need --model, --moments, at least one --heldout gate manifest and one --storage rule");
     if (!a.out.empty())
         for (const auto& r : a.rules)
-            if (is_sp(r.format))
-                throw std::invalid_argument("--out: a Strix pack rule has no device consumer yet (use --dequant-out)");
+            if (is_sp(r.format) && (r.format != Format::sp4 || a.table_auto))
+                throw std::invalid_argument("--out: only sp4 with --table fixed has a device consumer (strix.sp4t); "
+                                            "use --dequant-out for the other Strix pack arms");
     if (a.threads == 0U) a.threads = std::max(1U, std::thread::hardware_concurrency());
     return a;
 }
@@ -170,6 +172,7 @@ struct Coded {
     std::vector<std::uint8_t> bytes;
     std::vector<float> dequant;
     std::string table = "-";  // SP: "fixed|auto:t0,t1,...;base=B;flags=F"
+    std::optional<wei::sp::Header> header{};  // SP: the tensor header of the bytes
 };
 
 double weight_sqnr_db(const std::vector<float>& w, const std::vector<float>& q) {
@@ -237,6 +240,7 @@ Coded code_sp(const std::vector<float>& w, std::size_t n, std::size_t k, Techniq
                 if (std::memcmp(&v, &c.dequant[r * k + b * S::elements + j], sizeof v) != 0)
                     throw std::runtime_error("Strix pack bytes do not decode to the coded values");
             }
+    c.header = h;
     std::string text = fit ? "auto:" : "fixed:";
     for (unsigned i = 0; i < S::levels; ++i) text += (i ? "," : "") + std::to_string(h.table[i]);
     text += ";base=" + std::to_string(int{h.base}) + ";flags=" + std::to_string(unsigned{h.flags});
@@ -443,8 +447,10 @@ int main(int argc, char** argv) {
                         wei::Digest256 digest{};
                         if (const auto status = wei::digest_slice(t->payload, digest); !status)
                             throw std::runtime_error(t->name + ": " + status.detail);
-                        writer.add(t->name, a.format == Format::q4 ? wei::kQ4G64WeightStorage : wei::kQ6G64WeightStorage, n, k, digest,
-                                   std::move(coded.bytes));
+                        const auto storage = a.format == Format::q4   ? wei::kQ4G64WeightStorage
+                                             : a.format == Format::sp4 ? wei::kSP4TWeightStorage
+                                                                       : wei::kQ6G64WeightStorage;
+                        writer.add(t->name, storage, n, k, digest, std::move(coded.bytes), coded.header);
                     }
                 }
             }

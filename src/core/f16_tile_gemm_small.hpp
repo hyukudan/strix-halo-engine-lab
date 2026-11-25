@@ -85,6 +85,40 @@ struct LowBitOperand {
     }
 };
 
+// Operand trait of the Strix pack SP4 rows with the fixed table (weight::kSP4TWeightStorage, strix/weight/host_lowbit.hpp
+// sp::SP4Storage: 64 code bytes then 4 scale bytes per 128 elements). Unit u of group gi (K32) = the exact FP16 values
+// +-table[index] of elements 32 gi + 16 u .. + 16; scale = the scale byte b = e << 3 | m as (1 + m / 8) 2^e, exact in
+// FP32. The tensor's 2^base is the binding's (Sp4ProjectionTile::store), as NVFP4's outer scale: a power of two, so
+// the row's bits equal those with 2^base inside every group multiplier whenever the outputs are normal FP32 numbers.
+struct Sp4Operand {
+    using Storage = weight::sp::SP4Storage;
+    static constexpr unsigned kGroup = Storage::group, kUnits = kGroup / 16U, kSuperK = Storage::elements;
+    static_assert(kGroup == 32U && kSuperK == 64U * kGroups && Storage::scale_offset == 64U);
+    static constexpr lowbit_f16::SignIndexTable kTable = lowbit_f16::sign_index_table(weight::sp::default_table<4>());
+    using Row = const std::uint8_t*;
+    struct Words {
+        lowbit_f16::Words4 c[4];  // 64 code bytes, element j in nibble j of the byte stream
+        std::uint32_t scale;      // scale byte of group gi in bits 8 gi .. 8 gi + 7
+    };
+    __device__ __forceinline__ static Words load(Row row, unsigned index) {
+        const auto* block = row + std::size_t{index} * Storage::bytes;
+        Words w{};
+#pragma unroll
+        for (unsigned i = 0; i < 4U; ++i) w.c[i] = *(lowbit_f16::Words4G*)(block + 16U * i);
+        w.scale = *(lowbit_f16::WordsG*)(block + Storage::scale_offset);
+        return w;
+    }
+    __device__ __forceinline__ static void unit(const Words& w, unsigned gi, unsigned u, std::uint32_t (&words)[8]) {
+        const unsigned word = 4U * gi + 2U * u;  // 8 elements per code word
+        lowbit_f16::sign_index_pairs<kTable>(w.c[word / 4U][word % 4U], words);
+        lowbit_f16::sign_index_pairs<kTable>(w.c[word / 4U][word % 4U + 1U], words + 4);
+    }
+    __device__ __forceinline__ static float scale(const Words& w, unsigned gi) {
+        // (e + 127) << 23 | m << 20 = (byte + 127 * 8) << 20.
+        return __builtin_bit_cast(float, (((w.scale >> (8U * gi)) & 0xFFU) + 127U * 8U) << 20U);
+    }
+};
+
 // The K loop of the small-M schedule over one bound tile. Operand: the weight trait (LowBitOperand, or
 // core/microscaled_f16_staging.hpp): kGroup elements per scale group (a multiple of 16, dividing 64), kUnits = kGroup / 16
 // WMMA units per group, kSuperK = 128 elements per superblock (one stage), Words = the superblock of a column, load(row,
@@ -215,6 +249,31 @@ struct ProjectionTile {
     }
 };
 
+// The projection binding with one outer FP32 factor per projection (a power of two: the Strix pack tensor base).
+template <unsigned Capacity>
+struct OuterScales {
+    float value[Capacity];
+};
+struct Sp4ProjectionTile : ProjectionTile {
+    float outer;
+    __device__ __forceinline__ void store(unsigned r, unsigned column, float sum) const {
+        ProjectionTile::store(r, column, sum * outer);
+    }
+};
+
+template <unsigned RowTiles, unsigned Capacity>
+__global__ __launch_bounds__(128)  // Schedule::kThreads
+void sp4_kernel(const float* a, unsigned rows, unsigned K, std::size_t w_row_bytes, Q8ProjectionGroup<Capacity> group,
+                OuterScales<Capacity> outer) {
+    const unsigned panel = blockIdx.x;
+    unsigned index = 0U;
+    while (index + 1U < group.count && panel >= group.first_panel[index + 1U]) ++index;
+    const auto& projection = group.projections[index];
+    const unsigned col0 = (panel - group.first_panel[index]) * kProjectionPanel;
+    const Sp4ProjectionTile tile{{a, rows, K, w_row_bytes, &projection}, outer.value[index]};
+    run<Sp4Operand, RowTiles>(tile, blockIdx.y, col0);
+}
+
 template <class Storage, unsigned RowTiles, unsigned Capacity>
 __global__ __launch_bounds__(128)  // Schedule::kThreads
 void lowbit_kernel(const float* a, unsigned rows, unsigned K, std::size_t w_row_bytes, Q8ProjectionGroup<Capacity> group) {
@@ -242,6 +301,23 @@ inline hipError_t gemm_lowbit(const float* a, unsigned rows, unsigned K, const Q
     static_assert(Capacity <= 32U);
     if (wide_block) launch<Storage, 2U>(a, rows, K, group, stream);
     else launch<Storage, 1U>(a, rows, K, group, stream);
+    return hipGetLastError();
+}
+
+// SP4 rows (weight::kSP4TWeightStorage), the small-M schedule at every row count (rows >= 1, rows <= 65535 x 16 x the
+// row tiles, K % 128 == 0); `outer` = 2^base of each projection of the group.
+template <unsigned Capacity>
+inline hipError_t gemm_sp4(const float* a, unsigned rows, unsigned K, const Q8ProjectionGroup<Capacity>& group,
+                           const OuterScales<Capacity>& outer, hipStream_t stream, bool wide_block = false) {
+    static_assert(Capacity <= 32U);
+    const auto w_row_bytes = static_cast<std::size_t>(weight::sp::SP4Storage::row_bytes(K));
+    if (wide_block) {
+        const dim3 grid(group.first_panel[group.count], (rows + 31U) / 32U);
+        STRIX_HIP_LAUNCH(Rdna3Layout, sp4_kernel<2U, Capacity><<<grid, 128, 0, stream>>>(a, rows, K, w_row_bytes, group, outer));
+    } else {
+        const dim3 grid(group.first_panel[group.count], (rows + 15U) / 16U);
+        STRIX_HIP_LAUNCH(Rdna3Layout, sp4_kernel<1U, Capacity><<<grid, 128, 0, stream>>>(a, rows, K, w_row_bytes, group, outer));
+    }
     return hipGetLastError();
 }
 

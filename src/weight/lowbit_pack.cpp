@@ -20,10 +20,12 @@ const Status kOk{Error::ok, {}};
 
 std::uint64_t align_up(std::uint64_t v) { return (v + kAlign - 1U) / kAlign * kAlign; }
 
-bool supported(FormatId id) { return id == kQ4G64WeightStorage || id == kQ6G64WeightStorage; }
+bool supported(FormatId id) {
+    return id == kQ4G64WeightStorage || id == kQ6G64WeightStorage || id == kSP4TWeightStorage;
+}
 
 std::optional<FormatId> parse_format(std::string_view name, std::uint32_t version) {
-    for (const auto id : {kQ4G64WeightStorage, kQ6G64WeightStorage})
+    for (const auto id : {kQ4G64WeightStorage, kQ6G64WeightStorage, kSP4TWeightStorage})
         if (name == id.name && version == id.revision) return id;
     return std::nullopt;
 }
@@ -51,6 +53,35 @@ bool parse_hex(std::string_view s, Digest256& d) {
         d.bytes[i] = static_cast<std::uint8_t>(hi * 16 + lo);
     }
     return true;
+}
+
+std::string header_hex(const sp::Header& h) {
+    std::uint8_t bytes[sp::kHeaderBytes];
+    h.write(bytes);
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string s;
+    for (const auto b : bytes) {
+        s.push_back(digits[b >> 4U]);
+        s.push_back(digits[b & 15U]);
+    }
+    return s;
+}
+
+// 32 lowercase hex digits -> a header: "" on success, otherwise the first violated rule.
+std::string parse_header(std::string_view s, sp::Header& out) {
+    if (s.size() != 2U * sp::kHeaderBytes) return "bad header hex";
+    std::uint8_t bytes[sp::kHeaderBytes];
+    for (std::size_t i = 0; i < sp::kHeaderBytes; ++i) {
+        unsigned v = 0;
+        for (std::size_t d = 0; d < 2U; ++d) {
+            const char c = s[2U * i + d];
+            if (c >= '0' && c <= '9') v = v * 16U + static_cast<unsigned>(c - '0');
+            else if (c >= 'a' && c <= 'f') v = v * 16U + static_cast<unsigned>(c - 'a' + 10);
+            else return "bad header hex";
+        }
+        bytes[i] = static_cast<std::uint8_t>(v);
+    }
+    return sp::Header::read(bytes, out);
 }
 
 template <class T>
@@ -107,8 +138,20 @@ Status pack_identity(const Source& file, std::size_t header_bytes, std::span<con
 
 }  // namespace
 
+bool lowbit_storage_has_header(FormatId storage) noexcept { return storage == kSP4TWeightStorage; }
+
+std::string lowbit_header_defect(FormatId storage, const std::optional<sp::Header>& header) {
+    if (!lowbit_storage_has_header(storage)) return header ? "a q4_g64 / q6_g64 entry carries no header" : "";
+    if (!header) return "a Strix pack entry needs its tensor header";
+    if (const char* why = header->invalid(); *why != '\0') return why;
+    if (header->bits != 4U || header->table != sp::default_table<4>())
+        return "strix.sp4t needs 4 bits and the fixed table {1,3,5,8,10,14,18,24}";
+    return {};
+}
+
 void LowbitPackWriter::add(std::string tensor, FormatId storage, std::uint64_t rows, std::uint64_t columns,
-                           const Digest256& source, std::vector<std::uint8_t> bytes) {
+                           const Digest256& source, std::vector<std::uint8_t> bytes,
+                           std::optional<sp::Header> sp_header) {
     Item item;
     item.entry.tensor = std::move(tensor);
     item.entry.storage = storage;
@@ -116,6 +159,7 @@ void LowbitPackWriter::add(std::string tensor, FormatId storage, std::uint64_t r
     item.entry.columns = columns;
     item.entry.bytes = bytes.size();
     item.entry.source = source;
+    item.entry.sp_header = sp_header;
     item.payload = std::move(bytes);
     items_.push_back(std::move(item));
 }
@@ -129,6 +173,8 @@ Status LowbitPackWriter::write(const std::string& path) const {
             return fail(Error::malformed, "invalid tensor name in low-bit pack: " + e.tensor);
         if (!names.insert(e.tensor).second) return fail(Error::malformed, "duplicate tensor " + e.tensor);
         if (!supported(e.storage)) return fail(Error::unknown_format, "unsupported pack format for " + e.tensor);
+        if (const auto why = lowbit_header_defect(e.storage, e.sp_header); !why.empty())
+            return fail(Error::malformed, e.tensor + ": " + why);
         std::uint64_t want = 0;
         if (const auto status = expected_bytes(e.storage, e.rows, e.columns, want); !status) return status;
         if (want != e.bytes) return fail(Error::malformed, "payload size mismatch for " + e.tensor);
@@ -143,7 +189,8 @@ Status LowbitPackWriter::write(const std::string& path) const {
             header += "tensor " + e.tensor + " " + std::string(e.storage.name) + " " +
                       std::to_string(e.storage.revision) + " " + std::to_string(e.rows) + " " +
                       std::to_string(e.columns) + " " + std::to_string(offsets[i]) + " " +
-                      std::to_string(e.bytes) + " " + hex(e.source) + "\n";
+                      std::to_string(e.bytes) + " " + hex(e.source) +
+                      (e.sp_header ? " " + header_hex(*e.sp_header) : std::string{}) + "\n";
         }
         header += "end\n";
     };
@@ -234,7 +281,7 @@ Status LowbitPack::open(const std::string& path, const Digest256& checkpoint, Lo
         const auto f = split(lines[static_cast<std::size_t>(i) + 2U]);
         std::uint32_t version = 0;
         LowbitPackEntry e{};
-        if (f.size() != 9U || f[0] != "tensor" || f[1].empty() || !parse_num(f[3], version) ||
+        if ((f.size() != 9U && f.size() != 10U) || f[0] != "tensor" || f[1].empty() || !parse_num(f[3], version) ||
             !parse_num(f[4], e.rows) || !parse_num(f[5], e.columns) || !parse_num(f[6], e.offset) ||
             !parse_num(f[7], e.bytes) || !parse_hex(f[8], e.source))
             return fail(Error::malformed, "bad low-bit pack entry line " + std::to_string(i + 3U));
@@ -244,6 +291,14 @@ Status LowbitPack::open(const std::string& path, const Digest256& checkpoint, Lo
         const auto storage = parse_format(f[2], version);
         if (!storage) return fail(Error::unknown_format, "unsupported low-bit pack format for " + e.tensor);
         e.storage = *storage;
+        if (f.size() == 10U) {
+            sp::Header header;
+            if (const auto why = parse_header(f[9], header); !why.empty())
+                return fail(Error::malformed, e.tensor + ": Strix pack header: " + why);
+            e.sp_header = header;
+        }
+        if (const auto why = lowbit_header_defect(e.storage, e.sp_header); !why.empty())
+            return fail(Error::malformed, e.tensor + ": " + why);
         if (!names.insert(e.tensor).second) return fail(Error::malformed, "duplicate tensor " + e.tensor);
         std::uint64_t want = 0;
         if (const auto status = expected_bytes(e.storage, e.rows, e.columns, want); !status)
@@ -275,8 +330,9 @@ Status LowbitPack::verify_identity() const {
 }
 
 Status LowbitPack::find(std::string_view tensor, FormatId storage, const RawTensor& source,
-                        std::optional<Slice>& out) const {
+                        std::optional<Slice>& out, std::int32_t* outer_exponent) const {
     out.reset();
+    if (outer_exponent) *outer_exponent = 0;
     const auto it = std::ranges::find(entries_, tensor, &LowbitPackEntry::tensor);
     if (it == entries_.end()) return kOk;
     const std::string name(tensor);
@@ -291,6 +347,7 @@ Status LowbitPack::find(std::string_view tensor, FormatId storage, const RawTens
     if (const auto status = digest_slice(source.payload, digest); !status) return status;
     if (digest.bytes != it->source.bytes) return fail(Error::stale_source, "pack source digest mismatch for " + name);
     out = Slice{file_, {it->offset, it->bytes}};
+    if (outer_exponent && it->sp_header) *outer_exponent = it->sp_header->base;
     return kOk;
 }
 

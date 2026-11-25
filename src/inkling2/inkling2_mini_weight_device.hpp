@@ -68,7 +68,7 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
     out.compiler_id = lowbit ? "hip-clang-" + std::to_string(__clang_major__) + "." + std::to_string(__clang_minor__)
                              : weight::hip_clang_compiler_id(__clang_version__);
     const auto identity = weight::implementation_identity(lowbit
-        ? std::span<const weight::ArithmeticId>(kMiniLowBitConsumers)
+        ? mini_lowbit_consumers(options.qualify ? options.qualify->head_target() : weight::kQ4G64WeightStorage)
         : std::span<const weight::ArithmeticId>(core::kResidentQ8ArithmeticHip));
     if (lowbit) out.regime = kMiniWeightRegime;
 #else
