@@ -107,6 +107,7 @@ Options parse_options(int argc, char** argv) {
         else throw std::invalid_argument("unknown option: "+arg);
     }
     if (o.help) return o;
+    validate_sampling_startup_environment();
     o.request.sampling.validate();
     if (!o.threads || !o.streams || !o.request.max_tokens || o.model.empty() || (o.rope.empty() && !o.deploy_check)) throw std::invalid_argument("model, --rope-tables and positive limits required; use --help");
     if (o.output != "json" && o.output != "ids" && o.output != "text") throw std::invalid_argument("output must be json/ids/text");

@@ -24,8 +24,8 @@ namespace strix::serve {
 // as that session. The call's final scores are its row 0 (read_slot_logits),
 // copied out only when a sampled lane asks, like a one-lane decode window.
 // A decoder that offers BOTH prefill calls also declares which one it serves with at run time
-// (prefill_emits_first() const -> bool, fixed for its lifetime): its serving identity (e.g. the incumbent
-// prefill_slot route as the default, the emits-first route as a selected variant), read once at construction.
+// (prefill_emits_first() const -> bool, fixed for its lifetime). This is an arithmetic lever whose resolved value
+// must match the CLI; it must never be selected by slot, cohort width or arrival order. Read once at construction.
 template <class Decoder>
 
 class FixedKvCohort final : public CohortBackend {

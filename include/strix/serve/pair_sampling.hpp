@@ -18,8 +18,8 @@ namespace strix::serve {
 inline bool pair_sampling_replays_seeds() { return !token_sampling_request_identity_counts(); }
 
 // A per-request sampler held by value in the pair schedulers (the shared translation, strix/serve/job_sampling.hpp).
-inline std::optional<TokenSampler> make_pair_sampler(const GenerationJob& job) {
-    const auto shared = make_job_sampler(job.sampling);
+inline std::optional<TokenSampler> make_pair_sampler(const GenerationJob& job, const TokenSamplerOptions& options = {}) {
+    const auto shared = make_job_sampler(job.sampling, options);
     if (!shared) return std::nullopt;
     return std::optional<TokenSampler>(std::in_place, shared->policy(), shared->options());
 }

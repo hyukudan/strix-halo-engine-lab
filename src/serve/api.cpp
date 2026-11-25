@@ -11,6 +11,7 @@
 #include "strix/serve/request_fields.hpp"
 #include "strix/serve/session_api.hpp"
 #include "strix/serve/token_memo.hpp"
+#include "strix/token_sampling.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -879,6 +880,7 @@ struct ApiService::Impl {
             try { return finite_number(value, field, low, high, open_low, open_high); }
             catch (const RequestFieldError& e) { throw ApiError(400, "invalid_request_error", e.what(), e.param); }
         };
+        // An omitted temperature is the server default or 0 (greedy), filters or not: the existing HTTP contract.
         s.temperature = real(resolve("temperature", config.default_temperature, 0.0), "temperature", 0, config.maximum_temperature, false, false);
         s.top_k = static_cast<std::uint32_t>(unsigned_integer(resolve("top_k", config.default_top_k, std::uint64_t{0}), "top_k", UINT32_MAX));
         s.top_p = real(resolve("top_p", config.default_top_p, 1.0), "top_p", 0, 1, true, false);
@@ -916,8 +918,9 @@ struct ApiService::Impl {
             if (!(static_cast<float>(s.min_p) < 1.0F)) throw ApiError(400, "invalid_request_error", "min_p is too close to 1 to sample with", "min_p");
         }
         if (s.temperature > 0.0 && !s.seeded) {
-            std::random_device entropy;
-            s.seed = ((static_cast<std::uint64_t>(entropy()) << 32U) | entropy()) & INT64_MAX;
+            // The same omitted seed as the CLI. Entropy here made identical HTTP
+            // requests differ even when all declared sampling levers were equal.
+            s.seed = TokenSamplingPolicy{}.seed;
             s.seeded = true;
         }
         return s;
@@ -1521,7 +1524,7 @@ struct ApiService::Impl {
     std::shared_ptr<GenerationTicket> submit(std::vector<std::uint32_t> prompt, std::uint32_t max_tokens, const ResolvedSampling& sampling,
         const Json& body, std::uint32_t stable_prefix = 0, std::shared_ptr<const ConstraintSpec> spec = {}, std::shared_ptr<GenerationContext> context = {}) {
         if (sampling.requested_sample && !engine_samples && config.sampling_policy == "reject")
-            throw ApiError(400, "invalid_request_error", "this server decodes greedy only; send temperature 0", "temperature");
+            throw ApiError(400, "invalid_request_error", "sampling is refused on this server (sampling policy reject): send temperature 0 and no top_k, top_p or min_p", "temperature");
         (void)bool_or(body, "return_token_ids", false); // reject malformed presentation before admission
         const bool trace_emissions = bool_or(body, "return_token_emissions", false);
         if (api_request_scope) {

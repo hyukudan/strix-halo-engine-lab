@@ -152,6 +152,7 @@ MediaPrompt render_media_prompt(const SerialGenerationFamily& family, const std:
 SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const SerialGenerationFamily& family,
                                                     const SerialCliOption& extra) {
     SerialGenerationOptions options;
+    options.sampler_options = validate_sampling_startup_environment();
     bool grouped_decode = false;
     options.prefill_chunk = family.default_prefill_chunk;
     if (family.supports_speculation) options.speculation = family.default_speculation;
@@ -211,8 +212,8 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
     if (options.tokenizer && !options.text && !options.messages && !options.tokenize_file)
         throw std::invalid_argument("--tokenizer requires --prompt, --messages or --tokenize");
     options.packed_decode = resolve_decode_form(options.packed_decode, grouped_decode, family.packed_decode_default);
-    const bool filtered = options.sampling.top_k || options.sampling.top_p < 1.0F || options.sampling.min_p > 0.0F;
-    options.sampling.temperature = temperature.value_or(filtered ? 1.0F : 0.0F);
+    options.sampling.temperature = temperature.value_or(omitted_token_sampling_temperature(
+        options.sampling.top_k, options.sampling.top_p, options.sampling.min_p));
     validate_token_sampling_policy(options.sampling);
     if ((options.speculation == CliSpeculation::verify || options.speculation == CliSpeculation::lookup) &&
         token_sampling_enabled(options.sampling) && !family.sampled_speculation)
@@ -282,7 +283,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     if (on_loaded) on_loaded();
 
     std::optional<TokenSampler> sampler;
-    const TokenSamplerOptions sampler_options{};
+    const auto& sampler_options = options.sampler_options;
     if (!greedy) sampler.emplace(options.sampling, sampler_options);
     std::vector<float> logits((options.logits || sampler) ? family.output_vocabulary : 0U);
     const auto prefill_start = Clock::now();

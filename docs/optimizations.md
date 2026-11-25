@@ -1421,11 +1421,10 @@ use only controls exposed by the current source and require the corresponding de
 Serving features that change no generated token: a stateless `POST /v1/responses` route translated onto the chat
 prompt path, a versioned `GET /v1/capabilities` document, the applied policy (requested vs effective sampling and
 output limit, each sampling filter with its source, the effective seed of a sampled request) at the start and end of
-every stream, and SSE keepalive comments while a stream waits. Sampling filters resolve request -> server default
-(`--http-default-temperature`, `--http-default-top-k`, `--http-default-top-p`, `--http-default-min-p`; a positive
-default temperature is a token-changing operator choice and needs `--http-sampling sample`) -> built-in greedy; an
-unseeded sampled request gets a seed, echoed in the receipt (stream receipts on), so the same request with that seed
-reproduces it.
+every stream, and SSE keepalive comments while a stream waits. Sampling filters resolve request -> built-in (no server-only
+defaults: the `--http-default-temperature/-top-k/-top-p/-min-p` flags are retired), and an omitted temperature is
+greedy whatever filters the request carries, as before. An unseeded sampled request takes the command line's seed
+(0), echoed in the receipt (stream receipts on), so the same request reproduces it.
 
 - **Preconditions:** `--http-serve` (Qwen) or the DeepSeek serve app.
 - **Automatic selection:** Always on in the server; a request disables its keepalive with `"strix":{"keepalive":false}`.

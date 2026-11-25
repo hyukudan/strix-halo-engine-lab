@@ -413,7 +413,12 @@ void install_session_service(sv::ServiceFactories& factories, SessionAssetLoader
         defaults::Cli cli;cli.app="serve";cli.transport=p.transport_spec;cli.slots=p.opt.slots;cli.capacity=p.opt.capacity;cli.max_rows=p.opt.max_rows;
         out<<defaults::effective_config(cli,[](const char* k){return std::getenv(k);});
     };
-    f.create=[loader](const sv::ServiceSelection& s) {const auto& p=prepared(s);return std::make_unique<Service>(p,loader(p));};
+    f.create=[loader](const sv::ServiceSelection& s) {
+        const auto& p=prepared(s);
+        auto assets=loader(p);
+        if (assets) assets->shared.sampler_options=s.sampler_options;
+        return std::make_unique<Service>(p,std::move(assets));
+    };
     factories.install("minimax",std::move(f));
 }
 int legacy_serve(int argc,char** argv) {

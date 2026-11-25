@@ -1,3 +1,4 @@
+#include "strix/token_sampling.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "strix/dist/open_transport.hpp"
 #include "strix/ds41_dspark_vocab.hpp"
@@ -2070,6 +2071,8 @@ int main(int argc, char** argv) try {
     strix::device::bind_hip_main(argc, argv);
     // KV precision (--kv): native-only here; refuses any other value by name and prints the "strix-kv:" receipt line.
     (void)strix::session::kv_precision::bind_main(argc, argv, strix::deepseek41::pair_defaults::kKvCaps);
+    // Sampling environment (retired counter identity, acceptance switches): refused before any rank starts protocol work.
+    strix::validate_sampling_startup_environment();
     const strix::deepseek41::pair_defaults::Effective production_defaults(strix::deepseek41::pair_defaults::App::rank, argc, argv, strix::deepseek41::pair_defaults::this_build());  // before any option or env read
     Args a;
     for (int i = 1; i < argc; ++i) {

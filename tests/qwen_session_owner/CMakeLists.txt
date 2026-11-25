@@ -59,7 +59,7 @@ add_test(NAME qwen-session-owner-readiness COMMAND qwen_session_owner_tests --re
 set_tests_properties(qwen-session-owner-readiness PROPERTIES TIMEOUT 15 LABELS "cpu;session;qwen;readiness")
 add_test(NAME qwen-session-owner-counter COMMAND qwen_session_owner_tests --sampling-counter)
 set_tests_properties(qwen-session-owner-counter PROPERTIES TIMEOUT 30 LABELS "cpu;session;qwen"
-    ENVIRONMENT "STRIX_SAMPLING_REQUEST_IDENTITY=counter")
+    ENVIRONMENT "STRIX_SAMPLING_REQUEST_IDENTITY=single")
 add_test(NAME qwen-session-owner-checks COMMAND "${CMAKE_COMMAND}" "-DBINARY=$<TARGET_FILE:qwen_session_owner_tests>"
     -DCHECK_FAILURE=ON -P "${CMAKE_CURRENT_LIST_DIR}/extract_reference.cmake")
 set_tests_properties(qwen-session-owner-checks PROPERTIES TIMEOUT 10 LABELS "cpu;session;qwen")
