@@ -2,6 +2,7 @@
 
 #include "strix/serve/decode_form.hpp"
 
+#include <string>
 #include <string_view>
 
 namespace strix::inkling2 {
@@ -59,6 +60,51 @@ constexpr bool mini_combine_image_arch(std::string_view arch) { return arch == "
 // selection there is declined; `arch` is the gcnArchName up to the first ':' (ignored off HIP).
 constexpr bool mini_prepared_round_fold_admitted(bool hip_backend, std::string_view arch) {
     return hip_backend && arch == "gfx1151";
+}
+
+// The greedy head a resident decoder runs (screened-head lever, inkling2-mini-screened-head@1). Screened: a greedy pick
+// that returns no score row runs the shared EXACT screened head (same token and status as the full head); a step that
+// returns or reads scores keeps the full head. `reason` says why: lever_off (unset or 0), lever (selected and built),
+// build_refused (selected; the plane could not be built: unsupported shape, non-finite weight, no device memory),
+// kv_slot (served: the plane would cost a KV slot and was released), hip_binding (HIP keeps its own binding).
+enum class MiniHeadReason : unsigned char { lever_off, lever, build_refused, kv_slot, hip_binding };
+struct MiniHead {
+    bool screened = false;
+    MiniHeadReason reason = MiniHeadReason::lever_off;
+    friend constexpr bool operator==(MiniHead, MiniHead) = default;
+};
+
+// The lever decides; `build()` (the plane) runs only when the lever selects the screened head, and a plane it cannot
+// build keeps the full head.
+template <class Build>
+MiniHead mini_select_head(bool selected, Build&& build) {
+    if (!selected) return {};
+    return build() ? MiniHead{true, MiniHeadReason::lever} : MiniHead{false, MiniHeadReason::build_refused};
+}
+
+// The startup "head" field, the same text in the command line, the gate and the server: "screened lever",
+// "full lever-off", "full build-refused", "full kv-slot", "screened hip-binding" or "full hip-binding".
+constexpr std::string_view mini_head_reason_name(MiniHeadReason reason) noexcept {
+    switch (reason) {
+    case MiniHeadReason::lever_off: return "lever-off";
+    case MiniHeadReason::lever: return "lever";
+    case MiniHeadReason::build_refused: return "build-refused";
+    case MiniHeadReason::kv_slot: return "kv-slot";
+    case MiniHeadReason::hip_binding: return "hip-binding";
+    }
+    return "unknown";
+}
+inline std::string mini_head_field(MiniHead head) {
+    return std::string(head.screened ? "screened " : "full ") + std::string(mini_head_reason_name(head.reason));
+}
+
+// Whether one append's greedy pick runs the built screened head (skips the score row): a single pick without host
+// scores. The screened-head lever admits only prefill / decode picks: a verify append (a one-row verify window, the
+// partial-commit replay of a kept row) keeps the full head under the lever. HIP's own binding keeps its rule.
+constexpr bool mini_screened_pick(MiniHeadReason reason, bool built, MiniAppendKind kind, bool pick_next,
+                                  bool multi_pick, bool host_scores) {
+    if (!built || !pick_next || multi_pick || host_scores) return false;
+    return kind != MiniAppendKind::verify || reason == MiniHeadReason::hip_binding;
 }
 
 // The one prompt-row rule of an opted-in W4A4 expert class, shared by the CLI session and the served lanes: every

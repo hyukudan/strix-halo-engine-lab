@@ -4,8 +4,10 @@
 #include "inkling2_mini_schedule.hpp"
 #include "inkling2_mini_weight_options.hpp"
 #include "strix/serve/cohort_decode.hpp"
+#include "strix/serve/row_budget.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -45,8 +47,27 @@ struct MiniServeOptions {
     bool combine_image = false;
     // Resolved projected-bias attention lever (mini_attn_projected_bias), the value the CLI and the gate read.
     bool attn_projected_bias = false;
+    // Resolved verify rows lever (mini_verify_rows), the value the CLI and the gate read. A served lane decodes one row
+    // per step (no verify window): the server reports what its decoder admitted and runs the same steps either way.
+    bool verify_rows = false;
     bool controller_one_plane = false;
+    // Resolved screened-head lever (mini_screened_head), the value the CLI and the gate read.
+    bool screened_head = false;
 };
+
+// Served KV slots of a resident decoder whose screened-head lever may have built a plane (screen_device_bytes; 0 on HIP,
+// whose own binding keeps its incumbent budget, and without the lever): the plane stays only when it costs no KV slot
+// (serve::resident_kv_slots_with_plane); otherwise the decoder releases it before the cohort commits its slots and its
+// head reports "full kv-slot". Same tokens either way.
+template <class Decoder>
+std::uint32_t mini_serve_kv_slots(Decoder& decoder, std::uint64_t free, std::uint64_t total, std::uint64_t device_limit,
+                                  std::uint64_t kv_limit, std::uint32_t rows) {
+    const auto plane = decoder.screen_device_bytes();
+    const auto plan = ::strix::serve::resident_kv_slots_with_plane(free, total, device_limit, kv_limit,
+                                                                  decoder.slot_bytes(), rows, plane);
+    if (plane != 0U && !plan.keep_plane) decoder.release_screen();
+    return plan.slots;
+}
 
 // Lanes per batched forward: --slots, else, on the incumbent served route, the context-clamped prompt chunk (the cap
 // it always had); on the admitted served route lever an explicit --prefill-rows (clamped) or kMiniServeLaneRows.
@@ -79,6 +100,9 @@ inline const char* mini_round_fold_startup_field(const MiniServeOptions& opt, co
 struct MiniServeCohort {
     std::unique_ptr<serve::CohortBackend> backend;
     weight::WeightLoadPlan weights;
+    // With the projected-bias lever selected: the decoder's projected-bias submissions so far (the counter the command
+    // line reports), read once when the server stops (mini_projected_bias_dispatches_line). Empty: lever off.
+    std::function<std::uint64_t()> projected_bias_dispatches;
 };
 
 MiniServeCohort make_mini_hip_cohort(const MiniServeOptions&);

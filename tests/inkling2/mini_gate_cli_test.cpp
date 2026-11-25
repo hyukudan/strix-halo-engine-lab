@@ -268,6 +268,29 @@ void test_projected_bias_lever() {
     set(nullptr);
 }
 
+// The screened-head lever per tier through the CLI parse: the same table the server test pins
+// (tests/inkling2/mini_serve_test.cpp): opt-in, so unset and 0 the full head, 1 the screened head, anything else refused.
+void test_screened_head_lever() {
+    const auto set = [](const char* value) {
+#ifdef _WIN32
+        require(_putenv_s("STRIX_INK_SCREENED_HEAD", value ? value : "") == 0, "cannot set the lever");
+#else
+        require((value ? setenv("STRIX_INK_SCREENED_HEAD", value, 1) : unsetenv("STRIX_INK_SCREENED_HEAD")) == 0,
+                "cannot set the lever");
+#endif
+    };
+    for (const auto* tier : {"exact", "fast", "turbo"}) {
+        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
+            set(value);
+            require(strix::inkling2::mini_screened_head(parse({"1", "--profile", tier}).tier) == expected,
+                    "CLI screened-head lever differs from the server table");
+        }
+    }
+    set("yes");
+    expect_invalid([] { (void)parse({"1", "--profile", "fast"}); });
+    set(nullptr);
+}
+
 void test_options() {
     using strix::profile::Name;
     require(parse({"1"}).tier.profile == Name::standard, "expected exact default");
@@ -406,6 +429,7 @@ int main() {
 #if defined(STRIX_INKLING2_APP_CLI_TEST)
         test_options();
         test_projected_bias_lever();
+        test_screened_head_lever();
         test_native_w4a4_admission();
     test_cuda_route_options();
 #endif

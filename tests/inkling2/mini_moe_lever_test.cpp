@@ -59,8 +59,9 @@ void test_controller_planes() {
 // The engine resolves the W4A4 row: an unbound table would ignore STRIX_INK_MOE_W4A4 at every prompt length.
 void test_row() {
     require(mini::kMiniProfile.table.size() == mini::kMiniLevers.size(), "Inkling lever table bound to the engine");
-    require(mini::kMiniProfile.table.size() == 9U,
-            "the opt-in low-bit row extends the incumbent lever table");
+    require(mini::kMiniProfile.table.size() == 11U,
+            "W4A4, down image, prepared round fold, narrow experts, controller planes, projected-bias, served route, "
+            "screened head, calibrated low-bit, verify rows and the block-candidate row");
     const auto& lever = mini::kMiniProfile.table.front();
     require(lever.name == mini::kMiniMoeW4a4 && lever.name == "inkling2-mini-moe-w4a4@1", "w4a4 identity");
     require(lever.env == "STRIX_INK_MOE_W4A4" && lever.off == "0" && lever.builtin == "0", "w4a4 off switch");
@@ -180,15 +181,21 @@ void test_combine_image() {
 }
 
 // A decoder that records what it was configured with: every entry point configures through configure_mini_decoder.
-// `runs` / `folds` are what the target's backend admits of each selected lever.
+// `runs` / `folds` are what the target's backend admits of each selected lever; `builds` whether the screened plane can
+// be built (the decoder's head decision is the shared mini_select_head, as in MiniResidentDecoder::set_screened_head).
 struct FakeDecoder {
     strix::moe_core::grouped_w4a4::Activations w4a4 = strix::moe_core::grouped_w4a4::Activations::bf16;
-    int image_calls = 0;
-    bool image = false, runs = true, fold = false, folds = true, projected = false;
+    int image_calls = 0, screen_builds = 0;
+    bool image = false, runs = true, fold = false, folds = true, projected = false, builds = true;
+    bool verify = false, verifies = true;
     void set_attention_projected_bias(bool enabled) { projected = enabled; }
     bool set_prepared_round_fold(bool selected) { fold = selected; return selected && folds; }
     void set_moe_w4a4(strix::moe_core::grouped_w4a4::Activations a) { w4a4 = a; }
     bool set_combine_image(bool selected) { ++image_calls; image = selected; return selected && runs; }
+    mini::MiniHead set_screened_head(bool selected) {
+        return mini::mini_select_head(selected, [this] { ++screen_builds; return builds; });
+    }
+    bool set_verify_rows(bool selected) { verify = selected; return selected && verifies; }
 };
 
 void test_configure() {
@@ -217,6 +224,7 @@ void test_configure() {
         require(!levers.down_image && !levers.prepared_round_fold && !by_default.fold && !by_default.image,
                 "no other lever is applied by default");
         require(!by_default.projected, "the projected-bias route is opt-in: off by default");
+        require(!by_default.verify && !levers.verify_rows, "the verify rows lever is opt-in: off by default");
     }
     options.tier = inputs(profile::Name::standard, nullptr, nullptr, "1");
     FakeDecoder fold_on;
@@ -313,6 +321,65 @@ void test_projected_bias() {
 
 // The narrow expert image row: bit-changing, off in EXACT, pending (off) in FAST and TURBO until its gate and served
 // receipt; an explicit STRIX_MOE_EXPERTS_NVFP4=1 opts in (unqualified), 0 is the off switch, other values are refused.
+// The verify rows row: an exact lever, opt-in (off in every tier, builtin the per-row incumbent), bound to the engine,
+// switchable by STRIX_INK_VERIFY_ROWS, refused on a malformed value, and reaching the decoder through the one helper.
+// It is appended after main's rows; the block-candidate row stays last.
+void test_verify_rows() {
+    const auto& row = mini::kMiniLevers[mini::kMiniLevers.size() - 2U];
+    require(row.name == mini::kMiniVerifyRows && row.name == "inkling2-mini-verify-rows@1", "verify rows row identity");
+    require(mini::kMiniLevers.back().name == strix::spec::kBlockDraftLever.name, "the block-candidate row stays last");
+    require(row.env == "STRIX_INK_VERIFY_ROWS" && row.off == "0" && row.builtin == "0" &&
+                row.kind == profile::Kind::exact, "verify rows row is an exact lever, off by default");
+    for (std::size_t column = 0; column < profile::kProfileColumns; ++column)
+        require(row.value[column].empty() && !row.ready[column] && !row.provisional[column] && row.runnable[column],
+                "no profile column selects the verify rows route before its device identity");
+    const auto in = [](profile::Name tier, const char* value) {
+        profile::Inputs inputs;
+        inputs.profile = tier;
+        inputs.env = [value](const char* key) -> const char* {
+            return value != nullptr && std::strcmp(key, "STRIX_INK_VERIFY_ROWS") == 0 ? value : nullptr;
+        };
+        return inputs;
+    };
+    mini::MiniWeightOptions options;
+    for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
+        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
+            options.tier = in(tier, value);
+            for (const bool native : {false, true}) {
+                const auto resolved = mini::resolve_mini_profile(options, native);
+                require(mini::mini_verify_rows(resolved) == expected,
+                        "verify rows lever resolves one value per tier for every entry point");
+                FakeDecoder decoder;
+                require(mini::configure_mini_decoder(decoder, resolved).verify_rows == expected &&
+                            decoder.verify == expected, "the resolved verify rows lever reaches the decoder");
+            }
+        }
+    }
+    const profile::Engine legacy{"inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1"};
+    require(profile::resolve(mini::kMiniProfile, in(profile::Name::standard, nullptr)).fingerprint() ==
+                profile::resolve(legacy, in(profile::Name::standard, nullptr)).fingerprint(),
+            "default identity unchanged by the verify rows row (builtin omitted from the fingerprint)");
+    require(profile::resolve(mini::kMiniProfile, in(profile::Name::standard, "1")).fingerprint() !=
+                profile::resolve(mini::kMiniProfile, in(profile::Name::standard, nullptr)).fingerprint(),
+            "an explicit verify rows selection is a distinct identity");
+    // A backend that does not run it (CUDA): the request reaches the decoder, the reported state is declined.
+    options.tier = in(profile::Name::standard, "1");
+    FakeDecoder cuda;
+    cuda.verifies = false;
+    const auto levers = mini::configure_mini_decoder(cuda, mini::resolve_mini_profile(options, true));
+    require(cuda.verify && !levers.verify_rows &&
+                std::string(mini::mini_verify_rows_name(levers.verify_rows, true)) == "declined",
+            "a declined verify rows lever is reported declined, not on");
+    options.tier = in(profile::Name::standard, "2");
+    bool refused = false;
+    try {
+        static_cast<void>(mini::resolve_mini_profile(options, true));
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    require(refused, "a malformed verify rows value is refused before any load");
+}
+
 void test_narrow_experts() {
     const auto& lever = mini::kMiniProfile.table[3];
     require(lever.name == mini::kMiniExpertsNvfp4 && lever.name == "moe.experts.mxfp8-nvfp4@1", "narrow identity");
@@ -354,6 +421,134 @@ void test_narrow_experts() {
         refused = true;
     }
     require(refused, "malformed narrow switch must be refused");
+}
+// The screened-head row: an exact lever, opt-in (off by default in every tier, builtin the full head), bound to the
+// engine after main's rows (the block-candidate row stays last), switchable by STRIX_INK_SCREENED_HEAD, refused on a
+// malformed value; the explicit 1 is a distinct run identity, the default keeps the legacy one.
+void test_screened_head_row() {
+    const profile::Lever* lever = nullptr;
+    std::size_t index = 0;
+    for (std::size_t i = 0; i < mini::kMiniProfile.table.size(); ++i)
+        if (mini::kMiniProfile.table[i].name == mini::kMiniScreenedHead) {
+            lever = &mini::kMiniProfile.table[i];
+            index = i;
+        }
+    require(lever != nullptr && lever->name == "inkling2-mini-screened-head@1" && index == 7U &&
+                mini::kMiniProfile.table[6].name == mini::kMiniServedCliRoute &&
+                mini::kMiniProfile.table.back().name == strix::spec::kBlockDraftLever.name,
+            "screened head row identity and position (appended; the block-candidate row stays last)");
+    require(lever->env == "STRIX_INK_SCREENED_HEAD" && lever->off == "0" && lever->builtin == "0" &&
+                lever->kind == profile::Kind::exact && lever->omit_builtin_fingerprint && lever->option.empty(),
+            "screened head row is an exact lever, off by default");
+    for (std::size_t column = 0; column < profile::kProfileColumns; ++column)
+        require(lever->value[column].empty() && !lever->ready[column] && !lever->provisional[column] &&
+                    lever->runnable[column],
+                "no profile column selects the screened head before its RTX identity receipt");
+    const auto in = [](profile::Name tier, const char* value) {
+        profile::Inputs inputs;
+        inputs.profile = tier;
+        inputs.env = [value](const char* key) -> const char* {
+            return value != nullptr && std::strcmp(key, "STRIX_INK_SCREENED_HEAD") == 0 ? value : nullptr;
+        };
+        return inputs;
+    };
+    mini::MiniWeightOptions options;
+    for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
+        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
+            options.tier = in(tier, value);
+            for (const bool native : {false, true}) {
+                const auto resolution = mini::resolve_mini_profile(options, native);
+                require(mini::mini_screened_head(resolution) == expected,
+                        "screened head lever resolves one value per tier for every entry point");
+                require(resolution.incumbent_identity(), "the lever is a row, not an identity variant");
+            }
+        }
+        // Distinct identity for 1 in every tier; unset and 0 keep the tier's default identity.
+        const auto unset = profile::resolve(mini::kMiniProfile, in(tier, nullptr)).fingerprint();
+        require(profile::resolve(mini::kMiniProfile, in(tier, "0")).fingerprint() == unset,
+                "an explicit 0 is the default identity");
+        require(profile::resolve(mini::kMiniProfile, in(tier, "1")).fingerprint() != unset,
+                "an explicit 1 is a distinct run identity");
+    }
+    const profile::Engine legacy{"inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1"};
+    require(profile::resolve(mini::kMiniProfile, in(profile::Name::standard, nullptr)).fingerprint() ==
+                profile::resolve(legacy, in(profile::Name::standard, nullptr)).fingerprint(),
+            "default identity unchanged: the default is the row's builtin, which the fingerprint omits");
+    for (const char* bad : {"yes", "2"}) {
+        options.tier = in(profile::Name::fast, bad);
+        bool refused = false;
+        try {
+            static_cast<void>(mini::resolve_mini_profile(options, true));
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        require(refused, "malformed screened head switch must be refused");
+    }
+}
+
+// The head decision (MiniResidentDecoder::set_screened_head through configure_mini_decoder): lever off -> the full head
+// without building the plane, even where it could be built; on -> screened; a plane that cannot be built -> the full
+// head with the reason; the startup field names each state.
+void test_screened_head_decision() {
+    int builds = 0;
+    const auto buildable = [&] { ++builds; return true; };
+    require(mini::mini_select_head(false, buildable) == mini::MiniHead{} && builds == 0,
+            "lever off: full head, the plane is never built");
+    require(mini::mini_select_head(true, buildable) == mini::MiniHead{true, mini::MiniHeadReason::lever} && builds == 1,
+            "lever on: screened head");
+    require(mini::mini_select_head(true, [] { return false; }) ==
+                mini::MiniHead{false, mini::MiniHeadReason::build_refused},
+            "lever on, plane refused: full head and why");
+    require(mini::mini_head_field({true, mini::MiniHeadReason::lever}) == "screened lever" &&
+                mini::mini_head_field({}) == "full lever-off" &&
+                mini::mini_head_field({false, mini::MiniHeadReason::build_refused}) == "full build-refused" &&
+                mini::mini_head_field({false, mini::MiniHeadReason::kv_slot}) == "full kv-slot" &&
+                mini::mini_head_field({true, mini::MiniHeadReason::hip_binding}) == "screened hip-binding" &&
+                mini::mini_head_field({false, mini::MiniHeadReason::hip_binding}) == "full hip-binding",
+            "head startup field names");
+    // The per-append pick (MiniResidentDecoder::append): under the lever a one-row decode / prefill pick without host
+    // scores runs screened; a one-row verify window (verify_top of one row) and the partial-commit replay of one kept
+    // row (commit -> append(keep == 1, no scores, verify)) keep the full head; HIP's own binding is unchanged.
+    using mini::MiniAppendKind;
+    constexpr auto lever = mini::MiniHeadReason::lever;
+    constexpr auto hip = mini::MiniHeadReason::hip_binding;
+    require(mini::mini_screened_pick(lever, true, MiniAppendKind::decode, true, false, false) &&
+                mini::mini_screened_pick(lever, true, MiniAppendKind::prefill, true, false, false),
+            "lever: decode / prefill greedy pick runs screened");
+    require(!mini::mini_screened_pick(lever, true, MiniAppendKind::verify, true, false, false),
+            "lever: one-row verify window and the keep == 1 commit replay keep the full head");
+    require(!mini::mini_screened_pick(lever, true, MiniAppendKind::verify, false, false, false) &&
+                !mini::mini_screened_pick(lever, true, MiniAppendKind::verify, true, true, false),
+            "lever: replay without a pick and multi-row verify keep the full head");
+    require(!mini::mini_screened_pick(lever, true, MiniAppendKind::decode, true, false, true) &&
+                !mini::mini_screened_pick(lever, false, MiniAppendKind::decode, true, false, false),
+            "lever: host scores or an unbuilt plane keep the full head");
+    require(mini::mini_screened_pick(hip, true, MiniAppendKind::verify, true, false, false) &&
+                !mini::mini_screened_pick(hip, false, MiniAppendKind::verify, true, false, false),
+            "HIP binding keeps its rule");
+    const auto with = [](const char* value) {
+        mini::MiniWeightOptions options;
+        options.tier = inputs(profile::Name::standard);
+        options.tier.env = [value](const char* key) -> const char* {
+            return value != nullptr && std::strcmp(key, "STRIX_INK_SCREENED_HEAD") == 0 ? value : nullptr;
+        };
+        return mini::resolve_mini_profile(options, true);
+    };
+    for (const char* value : {static_cast<const char*>(nullptr), "0"}) {
+        FakeDecoder decoder;
+        const auto levers = mini::configure_mini_decoder(decoder, with(value));
+        require(levers.head == mini::MiniHead{} && decoder.screen_builds == 0,
+                "unset or 0: every entry point keeps the full head and builds no plane");
+    }
+    FakeDecoder on;
+    require(mini::configure_mini_decoder(on, with("1")).head == mini::MiniHead{true, mini::MiniHeadReason::lever} &&
+                on.screen_builds == 1,
+            "1: the resolved lever reaches the decoder through configure_mini_decoder");
+    FakeDecoder refused;
+    refused.builds = false;
+    require(mini::configure_mini_decoder(refused, with("1")).head ==
+                mini::MiniHead{false, mini::MiniHeadReason::build_refused},
+            "1 with a plane that cannot be built: the full head, reported build-refused");
 }
 }  // namespace
 
@@ -421,7 +616,10 @@ int main() {
         test_configure();
         test_round_fold_admission();
         test_projected_bias();
+        test_verify_rows();
         test_narrow_experts();
+        test_screened_head_row();
+        test_screened_head_decision();
     } catch (const std::exception& error) {
         std::cerr << "inkling2-mini-moe-lever: " << error.what() << '\n';
         return 1;

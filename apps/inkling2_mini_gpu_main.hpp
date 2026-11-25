@@ -43,15 +43,18 @@ public:
                      const char* dspark,
                      moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16,
                      bool combine_image = false, bool prepared_round_fold = false, bool narrow_experts = false,
-                     bool controller_one_plane = false, bool attn_projected_bias = false, MiniLowBitRows lowbit = {})
+                     bool controller_one_plane = false, bool attn_projected_bias = false, bool screened_head = false,
+                     bool verify_rows = false, MiniLowBitRows lowbit = {})
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
                    load.verify_rows, dspark != nullptr, 1U, load.prefill_tail, narrow_experts, controller_one_plane, false, lowbit),
           projected_bias_(attn_projected_bias) {
+        const auto levers = configure_mini_decoder(decoder_, moe_w4a4, combine_image, prepared_round_fold,
+                                                   attn_projected_bias, screened_head, verify_rows);
         require_mini_calibrated_cli_slot(lowbit, decoder_.slot_bytes());
-        const auto levers = configure_mini_decoder(decoder_, moe_w4a4, combine_image, prepared_round_fold, attn_projected_bias);
         std::cerr << "Inkling down_image " << mini_down_image_name(levers.down_image, combine_image) << '\n';
         std::cerr << "Inkling prepared_round_fold " << mini_round_fold_name(levers.prepared_round_fold, prepared_round_fold)
                   << '\n';
+        std::cerr << "Inkling verify_rows " << mini_verify_rows_name(levers.verify_rows, verify_rows) << '\n';
         if (dspark) drafter_.emplace(decoder_, load.positions, dspark);
         // Calibration statistics (off unless STRIX_CALIB_MOMENTS=FILE): the prompt's attention / output-projection /
         // head input rows accumulate into strix/weight/calib_moments.hpp second moments, written after each prefill.
@@ -76,7 +79,7 @@ public:
         // With the lever selected, the observed route: projected-bias appends submitted so far (0: every chunk declined
         // or was not admissible, so the image route ran).
         if (projected_bias_)
-            std::cerr << "Inkling attn_projected_bias dispatches " << decoder_.projected_attention_dispatches() << '\n';
+            std::cerr << mini_projected_bias_dispatches_line(decoder_.projected_attention_dispatches()) << '\n';
         return next;
     }
 
@@ -143,21 +146,24 @@ inline void run_gate(const char* checkpoint, const Options& options, std::span<c
     const auto prefix_positions = mode == session::HeadGateMode::decode ? positions - options.gate_rows : positions;
     const auto max_rows = std::min(options.generation.prefill_chunk, prefix_positions);
     const auto load_start = session::CliClock::now();
+    MiniDecoderLevers levers;
     auto resident = load_mini_weights(checkpoint, weights, options.tier.profile, options.weights, scope, extent,
                                      [&](MiniLowBitRows lowbit) {
         auto decoder = std::make_unique<MiniResidentDecoder>(checkpoint, positions, max_rows, options.generation.packed_decode,
             options.step_graphs.value_or(MiniResidentBackend::default_step_graphs), weights.roles(),
             0U, false, 1U, 0U, mini_experts_nvfp4(options.tier),
             mini_controller_one_plane(options.tier), false, lowbit);
+        levers = configure_mini_decoder(*decoder, options.tier);
         require_mini_calibrated_cli_slot(lowbit, decoder->slot_bytes());
         return decoder;
     });
     auto& decoder = *resident;
     cli::write_weight_load_plan(std::cerr, weights);
-    const auto levers = configure_mini_decoder(decoder, options.tier);
     std::cerr << "Inkling down_image " << mini_down_image_name(levers.down_image, mini_combine_image(options.tier)) << '\n';
     std::cerr << "Inkling prepared_round_fold "
               << mini_round_fold_name(levers.prepared_round_fold, mini_prepared_round_fold(options.tier)) << '\n';
+    std::cerr << "Inkling verify_rows " << mini_verify_rows_name(levers.verify_rows, mini_verify_rows(options.tier))
+              << '\n';
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
     std::optional<MiniCudaProgramDecoder> program;
     if (step_program) program.emplace(decoder, epilogue_fusion, mini_latency_forms(latency_forms));
@@ -226,7 +232,8 @@ static_assert(kLatencyFormsMix == kMiniFormsMix && kLatencyFormsMoe == kMiniForm
               kLatencyFormsAll == kMiniFormsAll && kMiniDefaultForms == kMiniFormsMix);
 
 using MiniCudaProgramLoad = std::unique_ptr<serve::SerialGenerationDecoder> (*)(const serve::SerialGenerationLoad&,
-                                                                                moe_core::grouped_w4a4::Activations, bool, bool);
+                                                                                moe_core::grouped_w4a4::Activations, bool, bool,
+                                                                                bool);
 
 // The exact R1 latency forms are a template parameter of the loader; map the CLI mask to its instance.
 inline MiniCudaProgramLoad select_mini_cuda_program(bool fuse, unsigned forms) {
@@ -314,6 +321,9 @@ int main(int argc, char** argv) {
             family.default_prefill_chunk = mini_prefill_schedule(cli::kMiniHipSchedule, options.tier.profile).chunk;
             options.generation.prefill_chunk = family.default_prefill_chunk;
         }
+        // The implicit chunk's pressure fallback of this backend and profile (shared load; never an explicit chunk).
+        family.prefill_chunk_fallback = mini_cli_prefill_fallback_rows(
+            cli::kMiniHipSchedule ? MiniPrefillBackend::hip : MiniPrefillBackend::cuda, options.tier.profile);
         // The serial CLI resolves its one lane at load using prompt + generated positions. A gate knows its
         // resident context from the manifest. CUDA step routing precedes serial loading and has no banded CUDA row.
         struct ResolvedWeights {
@@ -346,9 +356,9 @@ int main(int argc, char** argv) {
                                                                         program_options.latency_forms),
                            moe_w4a4,
                            controller_one_plane = mini_controller_one_plane(options.tier),
-                           projected_bias = mini_attn_projected_bias(options.tier)](
-                              const serve::SerialGenerationLoad& load) {
-                return program_load(load, moe_w4a4, controller_one_plane, projected_bias);
+                           projected_bias = mini_attn_projected_bias(options.tier),
+                           screened_head = mini_screened_head(options.tier)](const serve::SerialGenerationLoad& load) {
+                return program_load(load, moe_w4a4, controller_one_plane, projected_bias, screened_head);
             };
         else
 #endif
@@ -358,14 +368,25 @@ int main(int argc, char** argv) {
                        round_fold = mini_prepared_round_fold(options.tier),
                        narrow = mini_experts_nvfp4(options.tier),
                        controller_one_plane = mini_controller_one_plane(options.tier),
-                       projected_bias = mini_attn_projected_bias(options.tier)](const serve::SerialGenerationLoad& load) {
+                       projected_bias = mini_attn_projected_bias(options.tier),
+                       screened_head = mini_screened_head(options.tier),
+                       verify_rows = mini_verify_rows(options.tier)](const serve::SerialGenerationLoad& load) {
             const strix::weight::WeightLoadExtent extent{load.positions, 1U};
             loaded = resolve_weights(extent);
             return load_mini_weights(load.checkpoint, loaded->plan, options.tier.profile, options.weights, loaded->scope.view(),
                                      extent, [&](MiniLowBitRows lowbit) {
                 return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, loaded->plan.roles(), dspark,
-                    moe_w4a4, combine_image, round_fold, narrow, controller_one_plane, projected_bias, std::move(lowbit));
+                    moe_w4a4, combine_image, round_fold, narrow, controller_one_plane, projected_bias, screened_head,
+                    verify_rows, std::move(lowbit));
             });
+        };
+        // The rows the decoder was loaded with once the shared load fell back (strix-prefill-chunk line): a second load
+        // happens only then, and the prefill route receipt names the chunk that ran.
+        unsigned loads = 0U;
+        std::uint32_t fallback_chunk = 0U;
+        family.load = [load = std::move(family.load), &loads, &fallback_chunk](const serve::SerialGenerationLoad& request) {
+            if (loads++ != 0U) fallback_chunk = request.prefill_chunk;
+            return load(request);
         };
         const auto write_profile = [&] {
             const auto& resolved = loaded ? *loaded : early;
@@ -377,7 +398,8 @@ int main(int argc, char** argv) {
             // The admitted W4A4 class, the same identity the gate prints and the server reports as moe_prefill.
             if (mini_moe_w4a4(options.tier))
                 std::cerr << "strix-moe-w4a4 class " << strix::moe_core::grouped_w4a4::identity(moe_w4a4) << '\n';
-            std::cerr << "strix-prefill-route/v1 chunk " << options.generation.prefill_chunk << " tail_divisor "
+            std::cerr << "strix-prefill-route/v1 chunk " << (fallback_chunk ? fallback_chunk : options.generation.prefill_chunk)
+                      << " tail_divisor "
                       << family.prefill_tail_divisor << " first_id prefill\n";
             std::cerr << "strix-decode-route/v1 moe_decode " << mini_decode_form_name(options.generation.packed_decode)
                       << '\n';

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/resident_row_plan.hpp"
+#include "inkling2_mini_resident_route.hpp"
 #include "moe_core/grouped_w4a4.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
@@ -10,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <ostream>
 #include <span>
@@ -185,6 +187,31 @@ inline bool mini_attn_projected_bias(const profile::Resolution& tier) {
     throw std::invalid_argument("STRIX_INK_ATTN_PROJECTED_BIAS must be 0 or 1");
 }
 
+// The observed route of the projected-bias lever, one line for both entry points (with the lever selected): the
+// projected-bias appends the decoder submitted so far (0: every prompt chunk took the image route, whose bits are
+// equal). The command line prints it after each prefill, the server once when it stops.
+inline std::string mini_projected_bias_dispatches_line(std::uint64_t dispatches) {
+    return "Inkling attn_projected_bias dispatches " + std::to_string(dispatches);
+}
+
+// Resolved state of the screened-head lever (true: CUDA greedy picks without a score row run the EXACT screened head;
+// the same token and status as the full head). One value for the CLI, the gate and the server.
+inline bool mini_screened_head(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniScreenedHead);
+    if (entry == nullptr || entry->value == "0") return false;
+    if (entry->value == "1") return true;
+    throw std::invalid_argument("STRIX_INK_SCREENED_HEAD must be 0 or 1");
+}
+
+// Resolved state of the verify rows lever (true: a HIP verify window takes the pitched rows head, one lanes attention
+// launch set and the convolution tape, kMiniVerifyRows). 0 or absent = off: the per-row incumbent.
+inline bool mini_verify_rows(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniVerifyRows);
+    if (entry == nullptr || entry->value == "0") return false;
+    if (entry->value == "1") return true;
+    throw std::invalid_argument("STRIX_INK_VERIFY_ROWS must be 0 or 1");
+}
+
 // Resolved state of the served route lever (true: a HIP server runs the command line's route, kMiniServedCliRoute).
 // 0 or absent = off: the served incumbent route. Read (and validated) by the server only: the command line always runs
 // its own route and reports the lever as not applicable (mini_served_route_cli_line).
@@ -219,11 +246,14 @@ inline bool mini_controller_one_plane(const profile::Resolution& tier) {
 // (down_image, prepared_round_fold), the same text in the CLI, the gate and the server.
 inline const char* mini_down_image_name(bool active, bool selected) { return active ? "on" : selected ? "declined" : "off"; }
 inline const char* mini_round_fold_name(bool active, bool selected) { return mini_down_image_name(active, selected); }
+inline const char* mini_verify_rows_name(bool active, bool selected) { return mini_down_image_name(active, selected); }
 
 // What the decoder's backend admitted of the resolved levers: the effective state every entry point reports.
 struct MiniDecoderLevers {
     bool down_image = false;           // the BF16 down image route is active
     bool prepared_round_fold = false;  // the prepared-attention round fold runs
+    MiniHead head{};                   // the greedy head the decoder runs (screened-head lever) and why
+    bool verify_rows = false;          // verify windows take the rows head, lanes attention and convolution tape
 };
 
 // The one place a resident decoder takes its resolved profile levers; the serial CLI, the gate and the server all call
@@ -231,19 +261,23 @@ struct MiniDecoderLevers {
 // does not run is declined, not silently reported as on).
 template <class Decoder>
 MiniDecoderLevers configure_mini_decoder(Decoder& decoder, moe_core::grouped_w4a4::Activations moe_w4a4,
-                                         bool combine_image, bool prepared_round_fold, bool attn_projected_bias) {
+                                         bool combine_image, bool prepared_round_fold, bool attn_projected_bias,
+                                         bool screened_head, bool verify_rows) {
     decoder.set_moe_w4a4(moe_w4a4);
     decoder.set_attention_projected_bias(attn_projected_bias);
     MiniDecoderLevers levers;
     levers.prepared_round_fold = decoder.set_prepared_round_fold(prepared_round_fold);
     levers.down_image = decoder.set_combine_image(combine_image);
+    levers.head = decoder.set_screened_head(screened_head);
+    levers.verify_rows = decoder.set_verify_rows(verify_rows);
     return levers;
 }
 
 template <class Decoder>
 MiniDecoderLevers configure_mini_decoder(Decoder& decoder, const profile::Resolution& tier) {
     return configure_mini_decoder(decoder, mini_moe_w4a4_class(tier), mini_combine_image(tier),
-                                  mini_prepared_round_fold(tier), mini_attn_projected_bias(tier));
+                                  mini_prepared_round_fold(tier), mini_attn_projected_bias(tier),
+                                  mini_screened_head(tier), mini_verify_rows(tier));
 }
 
 // The W4A4 class a run on `backend` ("hip", "cuda") executes. Only the CUDA backend holds the grouped W4A4 tile: a
@@ -283,6 +317,8 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
     static_cast<void>(mini_prepared_round_fold(tier));
     static_cast<void>(mini_combine_image(tier));
     static_cast<void>(mini_attn_projected_bias(tier));
+    static_cast<void>(mini_screened_head(tier));
+    static_cast<void>(mini_verify_rows(tier));
     require_mini_expert_consumer(tier, native_execution);
     static_cast<void>(mini_controller_one_plane(tier));
     static_cast<void>(mini_lowbit_turbo(tier));
@@ -363,13 +399,17 @@ inline weight::WeightLoadPlan mini_plain_weight_fallback(profile::Name tier, con
 
 // Called after the resident image and first slot are allocated; free bytes already account for
 // both BF16 and any compact copies. A calibrated load must retain the requested slot capacity.
+inline void require_mini_weight_slot_capacity(std::uint32_t slots, std::uint32_t requested, bool calibrated) {
+    if (calibrated && slots < requested)
+        throw std::runtime_error("calibrated image cannot retain the requested slot capacity");
+    if (!slots) throw std::runtime_error("Inkling KV budget holds no session slots");
+}
+
 inline std::uint32_t mini_weight_slot_capacity(std::uint64_t free, std::uint64_t total, std::uint64_t device_limit,
                                                std::uint64_t kv_limit, std::uint64_t slot_bytes,
                                                std::uint32_t requested, bool calibrated) {
     const auto slots = serve::resident_kv_slots(free, total, device_limit, kv_limit, slot_bytes, requested);
-    if (calibrated && slots < requested)
-        throw std::runtime_error("calibrated image cannot retain the requested slot capacity");
-    if (!slots) throw std::runtime_error("Inkling KV budget holds no session slots");
+    require_mini_weight_slot_capacity(slots, requested, calibrated);
     return slots;
 }
 

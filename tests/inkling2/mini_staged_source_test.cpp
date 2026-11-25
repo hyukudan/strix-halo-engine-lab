@@ -39,14 +39,24 @@ bool run() {
                 std::cerr << "expert layer " << layer << ": " << status.detail << '\n';
                 return false;
             }
-            // The resident bind reads the sidecars from the source and checks them; the packed spans are only measured.
-            const std::uint8_t anchor = 0;
+            // The resident bind reads the sidecars from the source and checks them; it forms one pointer per expert into
+            // the packed spans, so they are backed by real storage of the complete slab (one slab at a time, never read:
+            // left uninitialised so the pages are not touched).
+            const auto code_bytes = static_cast<std::size_t>(view.codes.range.bytes);
+            const auto scale_bytes = static_cast<std::size_t>(view.block_scales.range.bytes);
+            const auto codes = std::make_unique_for_overwrite<std::uint8_t[]>(code_bytes);
+            const auto scales = std::make_unique_for_overwrite<std::uint8_t[]>(scale_bytes);
             std::vector<wei::microscaled::PackedMatrix> out(view.experts);
-            const auto status = view.bind_storage(
-                {&anchor, static_cast<std::size_t>(view.codes.range.bytes)},
-                {&anchor, static_cast<std::size_t>(view.block_scales.range.bytes)}, out);
+            const auto status = view.bind_storage({codes.get(), code_bytes}, {scales.get(), scale_bytes}, out);
             if (!status) {
                 std::cerr << "expert bind layer " << layer << ": " << status.detail << '\n';
+                return false;
+            }
+            // Every expert's pointers are the slab base plus its own stride: the last expert ends at the slab end.
+            const auto& last = out.back();
+            if (last.codes != codes.get() + code_bytes - code_bytes / view.experts ||
+                last.block_scales != scales.get() + scale_bytes - scale_bytes / view.experts) {
+                std::cerr << "expert bind layer " << layer << ": expert pointers leave the slab\n";
                 return false;
             }
             ++slabs;

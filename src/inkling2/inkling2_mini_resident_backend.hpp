@@ -190,7 +190,11 @@ public:
         if (max_rows_ > cuda_core::kMaxRows) {
             big_context_.reset(cuda_core::dense_big_ctx_create());
             if (!big_context_) throw std::runtime_error("Inkling 2 Mini: could not allocate CUDA dense context");
-            check(cuda_core::dense_big_reserve(max_rows_, 2U * kHiddenWidth, 0U, 3, big_context_.get()));
+            // Row-scaled device workspaces (cudaMalloc): an out-of-memory refusal is the typed device allocation
+            // failure, as for the Buffer members above (the implicit chunk's pressure fallback keys on it).
+            mini_gpu::check_device_allocation(
+                cuda_core::dense_big_reserve(max_rows_, 2U * kHiddenWidth, 0U, 3, big_context_.get()),
+                "Inkling 2 Mini: reserve CUDA dense rows");
         }
 #endif
         try {
@@ -362,6 +366,15 @@ public:
     // target (mini_combine_image_arch) the grouped MoE down stores a BF16 image the combine reads, with the NaN side-channel
     // word allocated here, zeroed once. Unselected, or on any other target, no word exists and the dispatch keeps the
     // FP32 down rows (null pointer). Returns whether the image route is active. CUDA ignores it.
+    // Verify rows lever (MiniResidentDecoder::set_verify_rows): HIP verify windows attend their rows in one lanes launch
+    // set. Verify windows run eagerly, so no captured graph depends on it. CUDA ignores it.
+    void set_verify_lanes(bool enabled) noexcept {
+#if defined(__HIPCC__)
+        verify_lanes_ = enabled;
+#else
+        static_cast<void>(enabled);
+#endif
+    }
     bool set_combine_image(bool selected) {
 #if defined(__HIPCC__)
         if (!selected || moe_nan_seen_) return moe_nan_seen_.has_value();
@@ -691,9 +704,30 @@ private:
                 kKvHeads, mini_prepared_gqa_window(visit), kRelativeExtent, image, lanes_, zero_padding_.data(),
                 failure, stream_, attention_partials_.span());
         };
+        // Verify rows lever (set_verify_lanes): a verify window (one sequence, one-row decode windows, eager) puts its
+        // rows into one lanes launch set on the sequence's cache, each lane at its own position with its one-row decode
+        // geometry, instead of one launch set per row. Lane bits = the per-window launch bits; the shared admission
+        // (sequence_lane_caches) holds because the window ring reserves window - 1 + the largest chunk rows
+        // (tests/inkling2/mini_schedule_test.cpp).
+        const bool verify_lanes = verify_lanes_ && single && !step && route_.attention_rows == 1U &&
+                                  single->chunk.rows > 1U && single->chunk.rows <= attn_core::dense::kMaxPreparedBf16Lanes;
+        const auto launch_verify_lanes = [&] {
+            lanes_.clear();
+            const auto& kv = single->state.kv;
+            for (unsigned row = 0; row < single->chunk.rows; ++row)
+                lanes_.push_back({kv.keys, kv.values, single->chunk.first_position + row, kv.slots,
+                                  kv.wrapped ? 1U : 0U});
+            return attn_core::dense::append_prepared_bf16_lanes<detail::MiniHipAttentionPolicy>(
+                kKvHeads, mini_prepared_gqa_window(visit), kRelativeExtent, image_of(*single, 0U), lanes_,
+                zero_padding_.data(), failure, stream_, attention_partials_.span());
+        };
         const auto launch_visits = [&](std::span<const MiniResidentAttentionGroup> lanes) {
             if (decode_lanes) {
                 check(launch_lanes());
+                return;
+            }
+            if (verify_lanes) {
+                check(launch_verify_lanes());
                 return;
             }
             std::size_t base = 0;
@@ -856,6 +890,25 @@ private:
             {
                 check(prepare_with(prepare));
                 launch_visits(visits);
+            }
+            if (single) {
+                // A taped (staged verify) chunk keeps its raw K/V rows, the inputs of the two KV convolutions
+                // (verify rows lever: the shared session tape is bound only then).
+                const auto kv_rows = std::size_t{rows} * kKvWidth;
+                if (const auto key_tape = single->state.tape[0]; !key_tape.empty())
+                    copy(std::span<const float>(work.raw_keys, kv_rows), key_tape);
+                if (const auto value_tape = single->state.tape[1]; !value_tape.empty())
+                    copy(std::span<const float>(work.raw_values, kv_rows), value_tape);
+#if defined(__HIPCC__)
+                // The history stores the BF16-rounded K/V inputs. Without the round fold the stage rounds raw_keys /
+                // raw_values in place before the convolution (the tape copied rounded rows); with the fold the
+                // convolution rounds its inputs on the fly and the raw rows stay FP32, so the tape takes the same
+                // round here and a partial commit restores the history the replayed rows would leave.
+                if (prepared_round_fold_) {
+                    for (const auto tape : {single->state.tape[0], single->state.tape[1]})
+                        if (!tape.empty()) check(adapter.round(tape.data(), kv_rows));
+                }
+#endif
             }
             check(attn_core::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(
                 adapter, rows, weights.projection(MiniAttentionProjection::output), attended, prep.gate_logits,
@@ -1096,6 +1149,7 @@ private:
     std::vector<attn_core::PreparedGqaGroup> prep_groups_;
 #if defined(__HIPCC__)
     std::vector<attn_core::dense::PreparedBf16Lane> lanes_;
+    bool verify_lanes_{false};  // verify rows lever (set_verify_lanes): verify windows attend in one lanes launch set
 #endif
 #if !defined(__HIPCC__)
     std::vector<attn::lanes::PreparedBf16Lane> lane_scratch_;  // cohort attention lanes of one visit
