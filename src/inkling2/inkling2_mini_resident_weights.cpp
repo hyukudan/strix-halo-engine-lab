@@ -76,7 +76,7 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
         }
         tensors.push_back({name, raw, compact ? std::optional(role_storage) : std::nullopt, pitch, std::move(prepacked)});
     }
-    if (pack && plan.keep_bf16_) mini_require_calibrated_pack_matrix_count(plan.prepacked_, expected_prepacked);
+    if (pack) mini_require_calibrated_pack_matrix_count(plan.prepacked_, expected_prepacked);
     plan.slices_ = weight::ResidentSlicePlan::make(std::move(tensors), kAlignment);
     for (unsigned layer = 0; layer < kPhysicalLayers; ++layer)
         for (unsigned i = 0; i < kProjections.size(); ++i)
