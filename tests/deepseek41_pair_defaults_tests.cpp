@@ -502,14 +502,13 @@ void test_profile() {
             const auto preset = w.run(app, args);
             check(pr::export_environment(pr::kPresetEnv, previous ? previous->c_str() : ""), "restore model preset marker");
             const bool fast_tier = std::string_view(name) != "exact";
-            check(std::is_permutation(preset.set_env.begin(), preset.set_env.end(), native.set_env.begin(), native.set_env.end()),
-                  std::string(name) + " preset: exports the same switches as the native CLI");
-            for (const char* row : {"fast_prefill", "engram_f16wmma", "shared_f16", "moe_f16wmma"}) {
+            for (const char* row : {"fast_prefill", "engram_f16wmma", "shared_f16", "moe_f16wmma", "moe_relaxed"}) {
                 const auto* cell = preset.profile->find(row);
-                check(cell && cell->value == (fast_tier ? "1" : "0") &&
-                          cell->status == (fast_tier ? pr::Status::provisional : pr::Status::builtin),
-                      std::string(name) + " preset: native cell and qualification status for " + row);
+                check(cell && cell->value == "0",
+                      std::string(name) + " preset: startup refuses provisional incumbent " + row);
             }
+            if (!fast_tier)
+                check(preset.profile->fingerprint() == native.profile->fingerprint(), "EXACT preset preserves identity");
             check(preset.profile->find("decoder_replay")->value == "0" &&
                       preset.profile->find("moe_iu4")->value == "0",
                   std::string(name) + " preset: replay and IU4 stay pending");

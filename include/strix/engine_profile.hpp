@@ -474,7 +474,6 @@ struct Engine {
     turbo::WeightCaps weight_caps{};        // weight sources / widths this build can load under turbo
     std::span<const IdentityVariant> variants{};  // declared identity variants (empty: the incumbent identity only)
     std::span<const LadderRow> ladder{};    // measured regimes of the lossy cells (ladder rule above)
-    bool preset_keeps_provisional_incumbents = false;  // opt in to native parity for granted cells
 };
 
 // Tier words: exact | fast | turbo; `exact` is the default column (spelled "default" in receipts, kept as an alias).
@@ -977,8 +976,7 @@ inline const char* environment(const Lookup& env, std::string_view key) {
 
 inline constexpr char kPresetEnv[] = "STRIX_INTERNAL_MODEL_PRESET";
 
-// Model presets normally filter provisional cells. An engine can preserve native incumbent grants
-// under the same tier word; those cells still report qualification in progress.
+// Model presets automatically admit qualified cells. Provisional experiments require an explicit opt-in.
 inline Status admit_profile_column(bool ready, bool runnable, bool allow_pending, bool provisional,
                                    bool preset) {
     if (preset && !allow_pending && provisional) return Status::pending;
@@ -1363,14 +1361,7 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         return envcfg::parse_flag(raw, lever.builtin == "1", *lever.env_flag_match) ? "1" : "0";
     };
     const auto admit = [&](const Lever& lever, unsigned column) {
-        bool filter_provisional = preset;
-        if (preset && engine.preset_keeps_provisional_incumbents && lever.provisional[column]) {
-            const auto value = lever.value[column];
-            const auto grant = ladder_judge(engine.ladder, lever.name, value, static_cast<Name>(column),
-                                            {}, {}, declared_identity(lever.identity, value));
-            filter_provisional = grant.rung != Rung::incumbent;
-        }
-        return column_admission(lever, column, out.allow_pending, filter_provisional);
+        return column_admission(lever, column, out.allow_pending, preset);
     };
     std::vector<LadderRow> ladder(engine.ladder.begin(), engine.ladder.end());
     const auto build_arms = [&] { return ladder_arms(engine.table, std::span<const LadderRow>(ladder), inputs.regime,
