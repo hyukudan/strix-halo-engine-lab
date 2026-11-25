@@ -128,7 +128,9 @@ auto load_mini_weights(const std::string& model, weight::WeightLoadPlan& plan, p
     auto incumbent_scope = scope;
     incumbent_scope.regime = {};
 #if defined(__HIPCC__)
-    incumbent_scope.compiler_id = weight::hip_clang_compiler_id(__clang_version__);
+    // WeightLoadScope stores a string_view; keep the compiler id alive through load_mini_weight_pack.
+    const auto incumbent_compiler_id = weight::hip_clang_compiler_id(__clang_version__);
+    incumbent_scope.compiler_id = incumbent_compiler_id;
     incumbent_scope.build = weight::implementation_identity(core::kResidentQ8ArithmeticHip);
 #endif
     return load_mini_weight_pack(plan, tier, options, incumbent_scope, extent, path,
