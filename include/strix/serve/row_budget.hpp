@@ -23,6 +23,19 @@ namespace strix::serve {
 [[nodiscard]] std::uint32_t resident_kv_slots(std::uint64_t free, std::uint64_t total,
     std::uint64_t device_limit, std::uint64_t kv_limit, std::uint64_t slot_bytes, std::uint32_t rows);
 
+// resident_kv_slots beside an optional resident plane (`plane_bytes`, already allocated when `free` was read) that only
+// speeds a path whose result is the same without it (e.g. an EXACT screened greedy head plane): the plane stays only
+// when it costs no slot. Releasing it would return its bytes to `free` (never past `total`); when that admits more
+// slots, keep_plane is false and `slots` is the count without the plane, so the caller releases the plane before it
+// commits the slots. plane_bytes 0: resident_kv_slots, keep_plane false.
+struct PlaneKvSlots {
+    std::uint32_t slots = 0;
+    bool keep_plane = false;
+};
+[[nodiscard]] PlaneKvSlots resident_kv_slots_with_plane(std::uint64_t free, std::uint64_t total,
+    std::uint64_t device_limit, std::uint64_t kv_limit, std::uint64_t slot_bytes, std::uint32_t rows,
+    std::uint64_t plane_bytes);
+
 // Cycle time model: fixed_ms + row_ms * rows + lane_ms * running lanes + draft_row_ms * drafted rows,
 // where a lane with r rows drafts r - 1 of them. The defaults are priors; callers pass measured costs.
 struct CycleCost {
