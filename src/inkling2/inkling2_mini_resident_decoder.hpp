@@ -931,6 +931,8 @@ private:
             backend_.abandon_capture();
             screened_graph_ = screened;
         }
+#else
+        static_cast<void>(scores_read);  // only the HIP verify rows level 2 tells reads apart
 #endif
         try {
             backend_.set_step_token(decode_step ? std::optional<unsigned>{ids.front()} : std::nullopt);
