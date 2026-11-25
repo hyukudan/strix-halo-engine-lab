@@ -10,6 +10,8 @@
 
 #include <array>
 #include <limits>
+#include <span>
+#include <string_view>
 #include <utility>
 #include <variant>
 
@@ -57,12 +59,52 @@ inline bool valid_resident_q8_rows(const weight::ResidentMatrixView& matrix, uns
 // mode fold; gfx1151: the folded tile faster on every measured shape, the folded small-M schedule no faster at 1-16
 // rows and slower at 32-64). A row's bits then depend on its launch's route. A FAST / TURBO candidate lever value: it
 // changes rounding, is never EXACT and no profile selects it until its gate and receipts exist.
-enum class LowBitArithmetic { fp32_sweep, f16_group_scale, f16_folded_scale };
+// f16_rows_select: the lever "lowbit.rows-select" (a FAST / TURBO candidate value; no profile selects it until its gate
+// and receipts exist): the f16 group-scale form, except launches whose (outputs, width, rows) fall in a measured cell of
+// the device (kLowBitSweepCells below), which run the FP32 sweep. The sweep and the FP16 form round differently, so a
+// row's bits then depend on the launch's row count: never EXACT.
+enum class LowBitArithmetic { fp32_sweep, f16_group_scale, f16_folded_scale, f16_rows_select };
 
 constexpr bool lowbit_f16_form(LowBitArithmetic arithmetic) { return arithmetic != LowBitArithmetic::fp32_sweep; }
 constexpr unsigned lowbit_max_rows(LowBitArithmetic arithmetic) {
     return lowbit_f16_form(arithmetic) ? 65535U * f16_tile_gemm::kBM : gemv_rows::max_rows;
 }
+
+// One measured cell of the lever "lowbit.rows-select": on devices of architecture `arch`, a low-bit launch of exactly
+// `bits` (4: q4_g64, 6: q6_g64) storage of exactly `outputs` x `width` with at most `max_rows` rows (<=
+// gemv_rows::max_rows) runs the FP32 sweep. The cells are the lever's data: a cell is added, removed or moved only with
+// an interleaved receipt of the no-model fixture (tests/hip_dense_lowbit_bench.hip, mode rows-select) on that device,
+// and every change bumps the identity revision. gfx1151 (two interleaved rounds, spread <= 1 %): a cell where the sweep
+// beats the small-M f16 route by >= 5 % at every row count up to max_rows; measured and left out: 3072x2304,
+// 3072x6144, 5120x2304 (sweep -3..+2 % at 1-2 rows) and q6_g64 2304x5120 (sweep -2..-3 %).
+struct LowBitSweepCell {
+    std::string_view arch;
+    unsigned bits, outputs, width, max_rows;
+};
+inline constexpr weight::ArithmeticId kLowBitRowsSelectIdentity{"lowbit.rows-select.fp32-sweep-cells", 1};
+inline constexpr std::array<LowBitSweepCell, 5> kLowBitSweepCells{{
+    {"gfx1151", 4U, 1024U, 5120U, 4U},   // +69 / +65 / +19 % at 1 / 2 / 4 rows
+    {"gfx1151", 4U, 2304U, 5120U, 2U},   // +13 / +10 %
+    {"gfx1151", 4U, 17408U, 5120U, 4U},  // +17 / +16 / +6 %
+    {"gfx1151", 6U, 1024U, 5120U, 4U},   // +36 / +35 / +7 %
+    {"gfx1151", 6U, 17408U, 5120U, 4U},  // +10 / +9 / +5 %
+}};
+// True when the cells send this launch to the FP32 sweep (an empty arch matches nothing).
+constexpr bool lowbit_sweep_cell(std::string_view arch, unsigned bits, unsigned outputs, unsigned width, unsigned rows,
+                                 std::span<const LowBitSweepCell> cells = kLowBitSweepCells) {
+    if (arch.empty()) return false;
+    for (const auto& cell : cells)
+        if (cell.arch == arch && cell.bits == bits && cell.outputs == outputs && cell.width == width && rows <= cell.max_rows)
+            return true;
+    return false;
+}
+static_assert([] {
+    for (const auto& cell : kLowBitSweepCells)
+        if ((cell.bits != 4U && cell.bits != 6U) || cell.max_rows == 0U || cell.max_rows > gemv_rows::max_rows ||
+            cell.width % 128U != 0U)
+            return false;
+    return true;
+}());
 inline bool valid_resident_lowbit_rows(const weight::ResidentMatrixView& matrix, unsigned outputs,
                                        const float* input, unsigned rows, const float* output,
                                        LowBitArithmetic arithmetic = LowBitArithmetic::fp32_sweep) {

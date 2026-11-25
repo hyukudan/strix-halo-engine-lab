@@ -440,6 +440,96 @@ int fold_ticket(const std::vector<unsigned>& shapes) {
     return failures == 0 ? 0 : 1;
 }
 
+// ---- Lever "lowbit.rows-select" (LowBitArithmetic::f16_rows_select, a FAST / TURBO candidate) ----
+// strix-hip-dense-lowbit-bench rows-select N K ...: per shape and storage, the lever's launches equal bit for bit the
+// incumbent they select (the FP32 sweep inside a measured cell of this device, the f16 group-scale form elsewhere),
+// alone and in a two-projection list; how many outputs the sweep and the FP16 form share; then interleaved timings.
+int rows_select_ticket(const std::vector<unsigned>& shapes) {
+    constexpr auto select = core::LowBitArithmetic::f16_rows_select;
+    constexpr auto sweep = core::LowBitArithmetic::fp32_sweep;
+    const std::string arch(strix::hip::arch::current_device_arch());
+    {
+        // The f16 form's incumbent at these rows is the small-M route of the device plan (unbound: the tile everywhere).
+        int dev = 0;
+        ok(hipGetDevice(&dev), "device");
+        report(strix::device::bind_lowbit_rows(dev, {64U, 64U}), "rows-select: bind the declared plan small_rows=64 wide_panels=64");
+    }
+    std::cout << "rows-select arch=" << arch << " identity=" << core::kLowBitRowsSelectIdentity.name << '@'
+              << core::kLowBitRowsSelectIdentity.revision << '\n';
+    const std::vector<unsigned> check_rows{1U, 2U, 3U, 4U, 8U, 16U, 17U}, bench_rows{1U, 2U, 4U, 8U};
+    for (std::size_t s = 0; s + 1 < shapes.size(); s += 2) {
+        const unsigned n = shapes[s], k = shapes[s + 1];
+        std::mt19937 rng(11U + n + k);
+        std::normal_distribution<float> normal(0.0F, 0.02F);
+        std::vector<std::uint16_t> bits(std::size_t(n) * k);
+        for (auto& b : bits) b = to_bf16(normal(rng));
+        std::vector<float> x(std::size_t(32U) * k);
+        for (auto& v : x) v = normal(rng) * 50.0F;
+        const std::size_t y_floats = std::size_t(32U) * n;
+        float *dx = nullptr, *dy = nullptr, *dy2 = nullptr, *dz = nullptr;
+        ok(hipMalloc(&dx, x.size() * 4U), "malloc x");
+        ok(hipMalloc(&dy, y_floats * 4U), "malloc y");
+        ok(hipMalloc(&dy2, y_floats * 4U), "malloc y2");
+        ok(hipMalloc(&dz, y_floats * 4U), "malloc z");
+        ok(hipMemcpy(dx, x.data(), x.size() * 4U, hipMemcpyHostToDevice), "copy x");
+        for (const auto format : {wd::Format::q4_g64, wd::Format::q6_g64}) {
+            const auto p = pack(format, bits, n, k);
+            const auto dev = upload(p.bytes.data(), p.bytes.size());
+            const std::uint8_t* w = dev.w;
+            const auto v = view(p, w, n, k);
+            const std::string tag = std::string("fmt=") + name(format) + " N=" + std::to_string(n) + " K=" + std::to_string(k);
+            const auto entry = [&](float* y, unsigned rows, core::LowBitArithmetic a) {
+                ok(core::enqueue_resident_lowbit_rows(v, n, dx, rows, y, nullptr, a), "entry");
+                return fetch(y, std::size_t(rows) * n);
+            };
+            for (const unsigned rows : check_rows) {
+                const bool cell = core::lowbit_sweep_cell(arch, format == wd::Format::q4_g64 ? 4U : 6U, n, k, rows);
+                const auto want = entry(dy, rows, cell ? sweep : f16_group_scale);
+                poison(dy2, y_floats);
+                const auto got = entry(dy2, rows, select);
+                const auto diff = bit_diff(got, want, rows, n);
+                // The same matrix twice in one list: each projection gets the bits of its selected route.
+                const core::ResidentRowProjection list[2]{{v, n, dy2}, {v, n, dz}};
+                poison(dy2, y_floats);
+                poison(dz, y_floats);
+                const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr, select);
+                ok(status, "list");
+                const auto diff_list = bit_diff(fetch(dy2, std::size_t(rows) * n), want, rows, n) +
+                                       bit_diff(fetch(dz, std::size_t(rows) * n), want, rows, n);
+                report(diff == 0U && diff_list == 0U, tag + " rows=" + std::to_string(rows) + " selects=" +
+                                                         (cell ? "fp32-sweep" : "f16-group") + " bits_vs_selected=" +
+                                                         std::to_string(diff) + " list_bits_vs_selected=" + std::to_string(diff_list));
+            }
+            for (const unsigned rows : {1U, 2U}) {
+                const auto a = entry(dy, rows, sweep);
+                const auto b = entry(dy2, rows, f16_group_scale);
+                std::cout << "info " << tag << " rows=" << rows << " fp32-sweep_vs_f16-group differing=" << bit_diff(a, b, rows, n)
+                          << " of " << std::size_t(rows) * n << '\n';
+            }
+            const auto bench = [&](const char* arm, core::LowBitArithmetic a, unsigned rows, int round) {
+                const double us = time_us(dev.copies, [&](std::size_t c) {
+                    return core::enqueue_resident_lowbit_rows(view(p, dev.w + c * dev.stride, n, k), n, dx, rows, dy, nullptr, a);
+                });
+                std::cout << "bench rows-select " << tag << " arm=" << arm << " rows=" << rows << " round=" << round
+                          << " us=" << us << " Gwps=" << double(n) * k / (us * 1e3) << '\n';
+            };
+            for (int round = 0; round < 2; ++round)
+                for (const unsigned rows : bench_rows) {
+                    bench("f16-group", f16_group_scale, rows, round);
+                    bench("rows-select", select, rows, round);
+                    bench("fp32-sweep", sweep, rows, round);
+                }
+            ok(hipFree(dev.w), "free w");
+        }
+        ok(hipFree(dx), "free x");
+        ok(hipFree(dy), "free y");
+        ok(hipFree(dy2), "free y2");
+        ok(hipFree(dz), "free z");
+    }
+    std::cout << "lowbit rows-select checks " << (failures == 0 ? "PASS" : "FAIL") << '\n';
+    return failures == 0 ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -454,6 +544,18 @@ int main(int argc, char** argv) {
             return 2;
         }
         return fold_ticket(fold_shapes);
+    }
+    if (argc > 1 && std::strcmp(argv[1], "rows-select") == 0) {
+        std::vector<unsigned> select_shapes;
+        for (int i = 2; i < argc; ++i) select_shapes.push_back(static_cast<unsigned>(std::strtoul(argv[i], nullptr, 10)));
+        bool valid = !select_shapes.empty() && select_shapes.size() % 2U == 0U;
+        for (std::size_t i = 0; valid && i < select_shapes.size(); i += 2)
+            valid = select_shapes[i] != 0U && select_shapes[i + 1] != 0U && select_shapes[i + 1] % 128U == 0U;
+        if (!valid) {
+            std::cerr << "usage: strix-hip-dense-lowbit-bench rows-select N K [N K ...], K a positive multiple of 128\n";
+            return 2;
+        }
+        return rows_select_ticket(select_shapes);
     }
     // Default shapes: the decode projections, then two output tails (N not a multiple of 64 outputs).
     std::vector<unsigned> shapes{3072, 2304, 1024, 2304, 2304, 3072, 384, 2304, 1000, 2304, 17, 256};
