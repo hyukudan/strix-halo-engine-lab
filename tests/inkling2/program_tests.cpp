@@ -273,6 +273,12 @@ exec::KernelBinding bind_physical_fixture(const A& a) {
                     ? "packed-nvfp4-down-combine-r1-k8-pdl" : "packed-mxfp8-down-combine-r1-k8-pdl";
                 return {name, grid(r1_geometry::down_blocks(a.args.hidden, r1_geometry::kCudaGeometry.down_columns))};
             }
+            if constexpr (std::is_same_v<A, RoutedPackedGateUp>)
+                return {"packed-routed-gate-up", grid(r1_geometry::gate_blocks(a.args.intermediate,
+                        r1_geometry::kCudaGeometry.gate_columns), 256U, 8U)};
+            if constexpr (std::is_same_v<A, PackedDownCombineTail>)
+                return {"packed-down-combine-tail", grid(r1_geometry::down_blocks(a.args.hidden,
+                        r1_geometry::kCudaGeometry.down_columns))};
             if constexpr (std::is_same_v<A, GreedyPartial>) return {"greedy-partial-r1", grid(a.chunks)};
             if constexpr (std::is_same_v<A, GreedyFinal>) return {"greedy-final-r1", grid(1U)};
             if constexpr (std::is_same_v<A, ScreenedHeadPrep>) return {"screened-head-prep", grid(a.launch.lanes)};
@@ -635,7 +641,7 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
     std::vector<float> values_scratch(decode::GroupedDecodeScratch::value_count(kHiddenWidth, kExpertWidth, kExpertsPerToken));
     std::vector<strix::moe_core::device_grouped::TileRows> descriptors(2U * kExpertsPerToken);
     const auto build_recipe = [&](bool fusion, bool reject_fp32 = false, bool grouped_projections = false,
-                                   decode::R1Forms forms = {}) {
+                                   decode::R1Forms forms = {}, bool moe_tail = false, bool moe_route_inline = false) {
         auto state = make_state();
         // Advance the frontier without touching buffers.
         PositionOnly skip;
@@ -646,6 +652,8 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
             +[](void*, const void*, std::size_t, void* count) { ++*static_cast<unsigned*>(count); }};
         if (!fusion) mode.epilogue_fusion = false;
         mode.key.forms = forms;
+        mode.moe_tail = moe_tail;
+        mode.moe_route_inline = moe_route_inline;
 #if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
         strix::device::Profile profile{};
         profile.units = 1;
@@ -985,6 +993,19 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
     check_projection_recipe(result, false);
 #endif
     if (key.program.tap) return result.program.identity;
+    if (position == 7U && !key.grouped && !screened) {
+        const auto check_moe = [&](bool tail, bool route) {
+            const auto arm = build_recipe(false, false, false, {}, tail, route);
+            const unsigned removed = kLogicalVisits * ((tail ? 2U : 0U) + (route ? 1U : 0U));
+            check(arm.program.predicted.launches + removed == result.program.predicted.launches &&
+                  arm.program.launches.size() + removed == result.program.launches.size() &&
+                  arm.program.identity != result.program.identity,
+                  "packed MoE opt-in must use one tail launch and one routed gate-up per visit");
+        };
+        check_moe(true, false);
+        check_moe(false, true);
+        check_moe(true, true);
+    }
 
     const auto fused = build_recipe(true);
 #if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)

@@ -18,6 +18,7 @@
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 #include "inkling2_mini_resident_decoder.hpp"
 #include "inkling2_mini_weight_options.hpp"
+#include "strix/env_flags.hpp"
 #include <iostream>
 #else
 #include "exec/scheduled_stage_graph.hpp"
@@ -74,6 +75,8 @@ struct MiniCudaStepMode {
     bool epilogue_fusion = true;
     const device::Profile* projection_profile = nullptr;
     decltype(&exec::cuda_decode::bind_projection_batch) bind_projections = nullptr;
+    bool moe_tail = false;
+    bool moe_route_inline = false;
 };
 
 // Bind the resident traversal's exact native leaves. The same traversal
@@ -82,6 +85,7 @@ template <class Weights, class Bind, class Dispatch, class Finish>
 class MiniCudaStepLowering {
     using Shape = MiniPreparedGqaShape;
     using Mode = exec::cuda_decode::Bf16DenseMode;
+    using MoeTail = moe_core::r1_tail::ConvResidualTail<exec::cuda_decode::kPackedConvTailTaps>;
     static constexpr float epsilon = 1.0e-6F;
 
 public:
@@ -293,6 +297,26 @@ public:
     }
 
     void moe(LayerVisit visit, MiniConstRows input, MiniMutableRows output) {
+        lower_moe(visit, input, output, nullptr);
+    }
+
+    [[nodiscard]] bool moe_tail_enabled() const noexcept {
+        return mode_.moe_tail && !mode_.key.grouped && !mode_.key.forms.moe_pipe && !mode_.key.program.tap;
+    }
+
+    void moe_tail(LayerVisit visit, MiniConstRows input, MiniMutableRows output, MiniMutableRows history,
+                  MiniConstRows residual, MiniMutableRows convolution, MiniMutableRows sum) {
+        static_assert(Shape::kConvTaps == exec::cuda_decode::kPackedConvTailTaps);
+        const MoeTail tail{
+            attn_core::prepared_gqa_post_convolution_plan<Shape>(),
+            mini_post_convolution_weights(storage_.lag_weights, visit, true), history.data(), convolution.data(),
+            residual.data(), sum.data(), attn_core::kPreparedGqaPostConvolutionRound, true,
+        };
+        lower_moe(visit, input, output, &tail);
+    }
+
+private:
+    void lower_moe(LayerVisit visit, MiniConstRows input, MiniMutableRows output, const MoeTail* tail) {
         using namespace exec::cuda_decode;
         recipe_.stage("moe");
         const auto layer = visit.physical_layer;
@@ -301,9 +325,9 @@ public:
         lower_dense(input.data(), kHiddenWidth, router, true, add());
         auto* failure = storage_.flags.data() + kLogicalVisits + visit.logical_layer;
         const auto* matrices = storage_.matrices.data() + std::size_t{layer} * kExperts;
+        const auto* bias = weights_.f32(parameter(layer, "mlp.gate.bias")).data();
         const auto select = [&](unsigned* status) {
-            add_leaf(CheckedWaveRoute{storage_.route_logits, weights_.f32(parameter(layer, "mlp.gate.bias")).data(),
-                                      storage_.route_ids, storage_.route_weights, status});
+            add_leaf(CheckedWaveRoute{storage_.route_logits, bias, storage_.route_ids, storage_.route_weights, status});
             if (mode_.key.program.tap)
                 recipe_.host_action(bind_(RouteTapExchange{mode_.tap, layer, 1U, kExpertsPerToken, kExperts,
                                                            storage_.route_ids, storage_.route_weights}));
@@ -322,7 +346,6 @@ public:
                                  add(), [this](auto clear) { recipe_.clear(clear); });
             return;
         }
-        select(failure);
         static_assert(kExpertsPerToken == kPackedExpertsPerToken);
         const moe_core::microscaled_r1::Args args{
             matrices, storage_.route_ids, storage_.route_weights,
@@ -330,15 +353,26 @@ public:
             kMlpGateSoftcap, kMlpUpSoftcap,
         };
         if (mode_.key.forms.moe_pipe) {
+            select(failure);
             add_leaf(PackedGateUpPipe{args, format});
             add_leaf(PackedDownCombinePipe{args, format});
             return;
         }
-        add_leaf(PackedGateUp{args, format});
-        add_leaf(PackedDownCombine{args, format});
+        if (mode_.moe_route_inline && !mode_.key.program.tap) {
+            add_leaf(RoutedPackedGateUp{args, format, storage_.route_logits, bias,
+                                        storage_.route_ids, storage_.route_weights, failure}, true);
+        } else {
+            select(failure);
+            add_leaf(PackedGateUp{args, format});
+        }
+        if (tail) {
+            require(moe_core::microscaled_r1::admits_tail(args, *tail, 1U, kPackedExpertsPerToken));
+            add_leaf(PackedDownCombineTail{args, format, *tail}, true);
+        } else {
+            add_leaf(PackedDownCombine{args, format});
+        }
     }
 
-private:
     void begin() {
         recording_ = true;
         recipe_.stage("flags");
@@ -595,12 +629,14 @@ struct MiniCudaProgramDecoder::Impl {
         const MiniCudaStepStorage storage{raw.max_rows, raw.controller, raw.attention, raw.lag_weights,
             raw.matrices, raw.route_ids, raw.route_logits, raw.route_weights, raw.expert_activation, raw.flags};
         const bool tapped = gate_tap ? gate_tap->active() : cuda::core::route_tap_active();
+        const bool packed_r1 = !grouped && !forms.moe_pipe && !tapped;
         const MiniCudaStepMode mode{{grouped, {.tap = tapped, .graph_id = static_cast<std::uint8_t>(screened ? 1U : 0U)},
                                      forms},
             {grouped_words.span(), grouped_values.span(), grouped_descriptors.span()}, gate_tap, backend.stream(),
             +[](void* to, const void* from, std::size_t bytes, void* stream) {
                 mini_gpu::copy(to, from, bytes, mini_gpu::device_to_device, static_cast<cudaStream_t>(stream));
-            }, epilogue_fusion, backend.step_projection_profile(), exec::cuda_decode::bind_projection_batch};
+            }, epilogue_fusion, backend.step_projection_profile(), exec::cuda_decode::bind_projection_batch,
+            packed_r1 && moe_tail, packed_r1 && moe_route_inline};
         const auto key = mode.key.program;
         const auto bind = [](const auto& args) {
             using namespace exec::cuda_decode;
@@ -608,6 +644,9 @@ struct MiniCudaProgramDecoder::Impl {
             if constexpr (std::is_same_v<Args, CheckedWaveRoute>)
                 return bind_checked_wave<MiniRoutePolicy, detail::MiniMoeMath, moe::RouteWaveTraits<true>>(
                     args, "cuda-sm120-checked-wave-mini-route-r1-v1");
+            else if constexpr (std::is_same_v<Args, RoutedPackedGateUp>)
+                return bind_routed_gate_up<MiniRoutePolicy, detail::MiniMoeMath, moe::RouteWaveTraits<true>>(
+                    args, "mini-route");
             else if constexpr (std::is_same_v<Args, GroupedPlanLeaf>)
                 return bind_grouped_plan<kExperts, kExpertsPerToken>(args);
             else if constexpr (std::is_same_v<Args, RouteTapExchange>)
@@ -640,7 +679,10 @@ struct MiniCudaProgramDecoder::Impl {
                           << " epilogue_fusion=" << (epilogue_fusion ? "on" : "off")
                           << " latency_forms=" << (forms == exec::cuda_decode::R1Forms{} ? "off" : "")
                           << (forms.bank_tiled ? "B" : "") << (forms.output_split ? "S" : "")
-                          << (forms.moe_pipe ? "P" : "") << (screened ? " head=screened" : "") << '\n';
+                          << (forms.moe_pipe ? "P" : "") << (screened ? " head=screened" : "")
+                          << (moe_tail ? (mode.moe_tail ? " moe_tail=on" : " moe_tail=declined") : "")
+                          << (moe_route_inline ? (mode.moe_route_inline ? " moe_route=inline" : " moe_route=declined") : "")
+                          << '\n';
             }
             if (tapped && !reported_tap) {
                 std::cerr << "inkling2 step graph route=program captures=0 nodes=" << plan.program.launches.size()
@@ -692,6 +734,8 @@ struct MiniCudaProgramDecoder::Impl {
     const bool grouped;
     const bool epilogue_fusion;
     const exec::cuda_decode::R1Forms forms;
+    const bool moe_tail = strix::envcfg::flag("STRIX_MOE_TAIL", false);
+    const bool moe_route_inline = strix::envcfg::flag("STRIX_MOE_ROUTE_INLINE", false);
     mini_gpu::Buffer<unsigned> grouped_words;
     mini_gpu::Buffer<float> grouped_values;
     mini_gpu::Buffer<moe_core::device_grouped::TileRows> grouped_descriptors;
