@@ -436,7 +436,7 @@ int main(int argc, char** argv) {
         std::printf("grouped_tall_cuda: FAIL (%d)\n", failures);
         return 1;
     }
-    std::printf("grouped_tall_cuda: PASS (5 tall forms + automatic = staged bitwise; nvfp4 ref/shift, mxfp8; K 32..2304; "
+    std::printf("grouped_tall_cuda: PASS (6 tall forms + automatic = staged bitwise; nvfp4 ref/shift, mxfp8; K 32..2304; "
                 "runs 1..300; tile count, failure word; opt-in shared %d B)\n", optin);
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
         std::vector<unsigned> tokens;
