@@ -3,6 +3,7 @@
 #include "strix/model_registry.hpp"
 #include "strix/profile/model_preset.hpp"
 #include "strix/serve/session_runtime.hpp"
+#include "strix/token_sampling.hpp"
 
 #include <cstddef>
 #include <iosfwd>
@@ -20,6 +21,7 @@ struct ServiceSelection {
     // Family arguments only, in original order, with empty arguments intact.
     std::vector<std::string> arguments;
     mutable std::shared_ptr<const ServicePreparation> preparation = {};
+    TokenSamplerOptions sampler_options{};
 };
 // An adapter owns its assets, engine, store, queue, runtime and production
 // handler. Members must be ordered so assets outlive their users. No main()
@@ -63,6 +65,7 @@ struct ServiceFactory {
     // True when the family serves the CUDA backend in process; otherwise a CUDA preset launch goes to the
     // external backend launcher of the shell.
     bool serves_cuda = false;
+    SampledAcceptance sampling_default = SampledAcceptance::rejection;
 };
 class ServiceFactories {
 public:

@@ -40,10 +40,12 @@ STRIX_SCALAR_FLOAT_HD float e8m0_half(std::uint8_t e) {
     return u2f(e == 255U ? 0x7FC00000U : b);
 }
 // E4M3: bias 7, subnormals m * 2^-9, S.1111.111 NaN, no infinities.
+STRIX_SCALAR_FLOAT_HD constexpr bool e4m3_is_nan(std::uint8_t c) { return (c & 0x7FU) == 0x7FU; }
+
 STRIX_SCALAR_FLOAT_HD float e4m3(std::uint8_t c) {
     const std::uint32_t e = (c >> 3U) & 15U, m = c & 7U;
     const float normal = u2f(((e + 120U) << 23U) | (m << 20U)), sub = static_cast<float>(m) * 0.001953125F;
-    const std::uint32_t mag = (c & 0x7FU) == 0x7FU ? 0x7FC00000U : f2u(e == 0U ? sub : normal);
+    const std::uint32_t mag = e4m3_is_nan(c) ? 0x7FC00000U : f2u(e == 0U ? sub : normal);
     return u2f(mag | (static_cast<std::uint32_t>(c & 0x80U) << 24U));
 }
 // Round to nearest even, saturate to +-448; NaN -> 0x7f.

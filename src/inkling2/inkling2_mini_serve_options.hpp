@@ -26,11 +26,14 @@ struct MiniServeOptions {
     moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16;
     // Resolved prepared-attention round fold (mini_prepared_round_fold), the CLI's setting from the same resolution.
     bool prepared_round_fold = false;
+    // Resolved narrow expert image lever (mini_experts_nvfp4): the MXFP8 expert layers load as NVFP4.
+    bool experts_nvfp4 = false;
     // Resolved exact down-image lever (mini_combine_image): the HIP resident prefill stores the BF16 down image where the
     // target is qualified.
     bool combine_image = false;
     // Resolved projected-bias attention lever (mini_attn_projected_bias), the value the CLI and the gate read.
     bool attn_projected_bias = false;
+    bool controller_one_plane = false;
 };
 
 // The prepared_round_fold field of the served startup line: the requested bit from the options and what the decoder's backend

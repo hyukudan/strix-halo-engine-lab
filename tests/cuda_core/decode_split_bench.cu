@@ -177,6 +177,14 @@ unsigned check_args(unsigned& launches) {
           kAll);
     admit(!cc::can_launch_prefill_flash({1U, 1U, cc::kPrefillFlashHeadDim, kScale, kAll}, kAll - 100U, 50U), "plain control key ceiling",
           kAll - 100U, 50U);
+    // the bias look-ahead instance of the one-row step: a sliding window of 256+ keys inside the bias extent only
+    admit(cc::prepared_flash_bias_ahead({bias, sinks, kExtent, 1024U, true, false}), "bias-ahead window = extent", 1024U, kExtent);
+    admit(cc::prepared_flash_bias_ahead({bias, sinks, kExtent, 256U, true, false}), "bias-ahead window = minimum", 256U, kExtent);
+    admit(!cc::prepared_flash_bias_ahead({bias, sinks, kExtent, 255U, true, false}), "incumbent window < minimum", 255U, kExtent);
+    admit(!cc::prepared_flash_bias_ahead({bias, sinks, kExtent, 0U, false, false}), "incumbent full prefix", 0U, kExtent);
+    admit(!cc::prepared_flash_bias_ahead({bias, sinks, kExtent, 1025U, true, false}), "incumbent window > extent", 1025U, kExtent);
+    admit(!cc::prepared_flash_bias_ahead({nullptr, sinks, kExtent, 1024U, true, false}), "incumbent no bias table", 1024U, kExtent);
+    admit(!cc::prepared_flash_bias_ahead({bias, sinks, kExtent, 1024U, false, true}), "incumbent bidirectional", 1024U, kExtent);
     return refused;
 }
 
@@ -408,10 +416,11 @@ void run_case(const Case& c, int iters, bool check_only) {
     const unsigned walked = c.position - lo + 1U;
     const double kv_bytes = 2.0 * walked * kKv * kDim * sizeof(std::uint16_t);
     const auto gbs = [&](float t) { return t > 0 ? kv_bytes / (1000.0 * t) : 0.0; };
+    const bool ahead = cc::use_prepared_flash_bias_ahead(prepared);  // the instance the one-row flash launches ran
     std::printf("TIME %s pos=%u flash_us=%.2f split_us=%.2f ratio=%.2f swz3_us=%.2f swz3/pad2=%.3f kv_MB=%.2f "
-                "GBs_pad2=%.0f GBs_swz3=%.0f\n",
+                "GBs_pad2=%.0f GBs_swz3=%.0f instance=%s\n",
                 c.name, c.position, us[0], us[1], us[1] > 0 ? us[0] / us[1] : 0.0f, us[2], us[0] > 0 ? us[2] / us[0] : 0.0f,
-                kv_bytes / 1e6, gbs(us[0]), gbs(us[2]));
+                kv_bytes / 1e6, gbs(us[0]), gbs(us[2]), ahead ? "bias-ahead" : "incumbent");
 }
 
 }  // namespace

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "inkling2_mini_config.hpp"
-#include "core/dense_row_plan.hpp"
+#include "core/bf16_rows_plan.hpp"
 #include "ops/norm/rms_bf16_rows.hpp"
 
 #if defined(__HIPCC__)
@@ -18,6 +18,11 @@ namespace strix::inkling2 {
 using MiniHipDenseProjection = core::Bf16RowProjection;
 using MiniHipRmsRows = ops::norm::Bf16RmsRows;
 using MiniHipRmsReduction = ops::norm::RmsRowsReduction;
+
+inline bool mini_hip_dense_rows_admitted(const float* input, unsigned width, unsigned rows,
+                                         std::span<const MiniHipDenseProjection> projections) {
+    return core::fma_rows::bf16_rows_call_admitted(input, width, rows, projections, kVocabulary);
+}
 
 #if defined(__HIPCC__)
 

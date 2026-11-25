@@ -29,6 +29,11 @@ struct MiniPreparedHipBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGqa
     bool fold_rounds() const { return fold; }
     static bool store_round(unsigned rows) { return rows > core::gemv_rows::max_rows; }
 
+    bool linear_admitted(const float* input, unsigned width, unsigned rows,
+                         std::span<const MiniAttentionLinear> views) const {
+        return mini_hip_dense_rows_admitted(input, width, rows, views);
+    }
+
     Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
         return core::for_each_bf16_projection_group<core::fma_rows::kGroupMax>(views, success,
             [&](std::span<const MiniAttentionLinear> group) {

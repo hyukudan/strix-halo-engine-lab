@@ -31,6 +31,8 @@
 #include "strix/q8_projection_organization.hpp"
 #include <filesystem>
 #include <chrono>
+#include <optional>
+#include <tuple>
 
 // POSIX test controls, backed by the MSVC process environment on host builds.
 #ifdef _WIN32
@@ -353,6 +355,157 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         {"--mtp-window-expert-union-bytes","65536"},{"--mtp-target-window-rows-set","2,4,8"},
         {"--mtp-draft-vocab","auto:assets/draft-vocab"},{"--mtp-draft-context-vocab","4096"},
         {"--mtp-spec-min-p","0.7"}}) set(flag,value);
+    {
+        // An omitted --mtp-sample-temperature is greedy whatever filters are given, as an HTTP request without temperature
+        // (main refused these command lines, so no output that ran before changes); only a positive temperature samples.
+        const auto greedy = [](const std::vector<std::string>& cli, const char* message) {
+            try { expect(!mtp_sampling(parse(cli).mtp), message); }
+            catch (const std::invalid_argument& e) { std::cerr << e.what() << '\n'; expect(false, message); }
+        };
+        auto filtered=mtp_fixture();
+        filtered.push_back("--mtp-draft-chain");
+        filtered.insert(filtered.end(),{"--mtp-sample-top-k","2"});
+        greedy(filtered,"Qwen CLI: a filter without a temperature decodes greedy, as HTTP");
+        auto neutral=mtp_fixture();
+        neutral.insert(neutral.end(),{"--mtp-sample-top-p","0.999999999"});
+        greedy(neutral,"Qwen CLI: a top-p without a temperature decodes greedy");
+        auto zero=filtered;
+        zero.insert(zero.end(),{"--mtp-sample-temperature","0"});
+        greedy(zero,"Qwen CLI: an explicit temperature 0 ignores filters");
+        greedy(mtp_fixture(),"Qwen CLI: no sampling option decodes greedy");
+        auto schedule=zero;
+        schedule.insert(schedule.end(),{"--mtp-sample-schedule","adaptive"});
+        bool schedule_refused=false;
+        try { (void)parse(schedule); }
+        catch (const std::invalid_argument& e) { schedule_refused=std::string_view(e.what()).find("above zero")!=std::string_view::npos; }
+        expect(schedule_refused,"Qwen CLI: an adaptive draft schedule still requires a sampled request");
+        for(const char* flag : {"--http-default-temperature","--http-default-top-k","--http-default-top-p","--http-default-min-p"}) {
+            auto retired=args;
+            retired.insert(retired.end(),{flag,"1"});
+            bool refused=false;
+            try { (void)parse(retired); } catch(const std::invalid_argument& e) { refused=std::string(e.what()).find("retired")!=std::string::npos; }
+            expect(refused,"Qwen HTTP server-only sampling default is retired");
+        }
+        auto automatic=args;
+        const auto cap=std::find(automatic.begin(),automatic.end(),"--http-batch");
+        automatic.erase(cap,cap+2);
+        const auto startup=parse(automatic);
+        const HttpServingMemory cost{0,0,10,10};
+        const auto one=resolve_http_bridge_capacity(10,cost,10,30,0,0);
+        const auto two=resolve_http_bridge_capacity(10,cost,30,30,0,0);
+        expect(one.slots==1 && two.slots==2 && !startup.http_batch_explicit,"Qwen HTTP: exercise measured auto capacity");
+        // An omitted policy follows the admitted route, as before the policy existed: the automatic cohort samples at
+        // two slots and one-slot pressure starts the single runner, which runs a positive temperature greedy ("downgrade").
+        auto auto_two=startup;
+        expect(admit_http_batch_slots(auto_two,two.slots,false)==2 && auto_two.http_sampling_policy=="sample",
+            "Qwen HTTP: automatic startup with two admitted slots samples");
+        auto auto_one=startup;
+        expect(admit_http_batch_slots(auto_one,one.slots,false)==0 && auto_one.http_sampling_policy=="greedy",
+            "Qwen HTTP: automatic startup under one-slot pressure starts the single runner");
+        auto pinned=parse(args); // --http-batch 2, --http-sampling omitted
+        expect(admit_http_batch_slots(pinned,two.slots,false)==2 && pinned.http_sampling_policy=="sample",
+            "Qwen HTTP: a fixed cohort with an omitted policy samples");
+        pinned=parse(args);
+        expect(admit_http_batch_slots(pinned,one.slots,false)==0 && pinned.http_sampling_policy=="greedy",
+            "Qwen HTTP: a fixed cap under one-slot pressure falls back to the single runner");
+        auto one_cohort=args;
+        *(std::find(one_cohort.begin(),one_cohort.end(),"--http-batch")+1)="1";
+        auto fixed=parse(one_cohort);
+        expect(admit_http_batch_slots(fixed,one.slots,false)==1 && fixed.http_sampling_policy=="sample",
+            "Qwen HTTP: a one-slot cohort samples");
+        // Only an explicit --http-sampling sample is a startup requirement; it runs on AUTO too.
+        auto explicit_sample=automatic;
+        explicit_sample.insert(explicit_sample.end(),{"--http-sampling","sample"});
+        auto sampling=parse(explicit_sample);
+        expect(sampling.http_sampling_policy=="sample" && admit_http_batch_slots(sampling,two.slots,false)==2,
+            "Qwen HTTP: --http-sampling sample alone admits the automatic cohort");
+        bool refused=false;
+        sampling=parse(explicit_sample);
+        try { (void)admit_http_batch_slots(sampling,one.slots,false); }
+        catch(const std::runtime_error& e) { refused=std::string_view(e.what()).find("HTTP sampling capability")!=std::string_view::npos; }
+        expect(refused,"Qwen HTTP: explicit sampling refuses startup when capacity selects the single route");
+        auto capped=args;
+        capped.insert(capped.end(),{"--http-sampling","sample"});
+        auto capped_sampling=parse(capped);
+        refused=false;
+        try { (void)admit_http_batch_slots(capped_sampling,one.slots,false); }
+        catch(const std::runtime_error& e) { refused=std::string_view(e.what()).find("HTTP sampling capability")!=std::string_view::npos; }
+        expect(refused,"Qwen HTTP: explicit sampling with a cap refuses instead of changing its policy");
+        automatic.insert(automatic.end(),{"--http-sampling","reject"});
+        auto rejecting=parse(automatic);
+        expect(admit_http_batch_slots(rejecting,two.slots,false)==2 && rejecting.http_sampling_policy=="reject",
+            "Qwen HTTP: an explicit reject policy is kept on the automatic cohort");
+        rejecting=parse(automatic);
+        expect(admit_http_batch_slots(rejecting,one.slots,false)==0 && rejecting.http_sampling_policy=="reject",
+            "Qwen HTTP: an explicit reject policy keeps the auto single runner");
+
+        // The production sampler bindings: the command line (decode bridge and cohort: make_mtp_sampler) and the HTTP
+        // cohort (make_http_mtp_sampler) build the same sampler from their parsed options. Drafted rows with the same
+        // logits as the draft separate coupled from rejection acceptance; odd rows carry no draft.
+        auto sampled=mtp_fixture();
+        sampled.push_back("--mtp-draft-chain");
+        sampled.insert(sampled.end(),{"--mtp-sample-temperature","0.8","--mtp-sample-top-k","4"});
+        const auto stream = [](TokenSampler& sampler) {
+            const std::vector<std::uint32_t> ids{0,1,2,3,4,5,6,7};
+            std::vector<std::uint32_t> out;
+            for (std::uint64_t position=0; position<64; ++position) {
+                const float tilt=static_cast<float>(position%5U)*0.1F;
+                const std::vector<float> logits{1.0F+tilt,1.0F,0.9F-tilt,0.8F,0.2F,0.1F,0.0F,-1.0F};
+                if (position%2U==0U) {
+                    const auto draft=sampler.draft(logits,ids,position);
+                    const auto decision=sampler.decide(logits,position,&draft);
+                    out.insert(out.end(),{decision.token,decision.accepted?1U:0U});
+                } else {
+                    out.push_back(sampler.decide(logits,position,nullptr).token);
+                }
+            }
+            return out;
+        };
+        const auto http_job = [](std::optional<std::uint64_t> seed) {
+            serve::SamplingParameters job;
+            job.temperature=0.8; job.top_k=4;
+            // The HTTP API resolves an omitted seed to the command line's default (serve_api_tests).
+            job.seed=seed.value_or(TokenSamplingPolicy{}.seed); job.seeded=true;
+            return job;
+        };
+        for (const std::optional<std::uint64_t> seed : {std::optional<std::uint64_t>{}, std::optional<std::uint64_t>{7}}) {
+            auto cli_args=sampled;
+            if (seed) cli_args.insert(cli_args.end(),{"--mtp-sample-seed",std::to_string(*seed)});
+            const auto cli=parse(cli_args);
+            auto server=parse(args);
+            (void)admit_http_batch_slots(server,two.slots,false);
+            std::string error;
+            const auto http_sampler=make_http_mtp_sampler(http_job(seed),error,server);
+            const auto cli_sampler=make_mtp_sampler(mtp_sampling_policy(cli.mtp),cli.mtp);
+            expect(mtp_sampling(cli.mtp) && http_sampler && error.empty() && cli_sampler->coupled() && http_sampler->coupled(),
+                "Qwen sampler binding: CLI and HTTP build coupled samplers");
+            const auto policy_tuple=[](const TokenSamplingPolicy& p) { return std::tuple(p.temperature,p.top_k,p.top_p,p.min_p,p.seed); };
+            expect(policy_tuple(cli_sampler->policy())==policy_tuple(http_sampler->policy()),
+                "Qwen sampler binding: CLI and HTTP resolve the same policy and seed");
+            const auto cli_ids=stream(*cli_sampler);
+            expect(cli_ids==stream(*http_sampler),"Qwen sampler binding: CLI and HTTP draw the same drafted and plain rows");
+            TokenSampler rejection(cli_sampler->policy(),TokenSamplerOptions{});
+            expect(!rejection.coupled() && stream(rejection)!=cli_ids,
+                "Qwen sampler binding: the fixture separates coupled from rejection acceptance");
+            if (seed) {
+                auto omitted=make_mtp_sampler(mtp_sampling_policy(parse(sampled).mtp),parse(sampled).mtp);
+                expect(stream(*omitted)!=cli_ids,"Qwen sampler binding: an explicit seed changes the stream");
+            }
+            serve::SamplingParameters greedy_job=http_job(seed); greedy_job.temperature=0.0;
+            expect(!make_http_mtp_sampler(greedy_job,error,server) && error.empty(),
+                "Qwen sampler binding: temperature 0 builds no sampler (greedy reference)");
+        }
+        const auto* previous=std::getenv("STRIX_MTP_SAMPLED_ACCEPT");
+        const auto saved=previous?std::optional<std::string>(previous):std::nullopt;
+        setenv("STRIX_MTP_SAMPLED_ACCEPT","rejection",1);
+        expect(parse(sampled).mtp.sampler_options.acceptance==SampledAcceptance::rejection,
+            "Qwen CLI: explicit rejection reaches the sampler options");
+        refused=false;
+        try { (void)parse(args); }
+        catch(const std::invalid_argument& e) { refused=std::string_view(e.what()).find("by coupled acceptance")!=std::string_view::npos; }
+        expect(refused,"Qwen HTTP: explicit rejection is refused during startup");
+        if(saved) setenv("STRIX_MTP_SAMPLED_ACCEPT",saved->c_str(),1); else unsetenv("STRIX_MTP_SAMPLED_ACCEPT");
+    }
     RequestedOptions request{parse(args),{{"STRIX_BATCH_PROMPT_SMALL","0"}}};
     PrefillMemory memory;
     memory.available=131766833152ULL; memory.gtt_limit=125829120000ULL; memory.gtt_used=23539712U;
@@ -443,7 +596,9 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
             {"env:STRIX_INTPREFILL_DENSE_ROWS","organisation of the tiled prefill admitted at serving startup"},
             {"env:STRIX_DISPATCH_FUSE","serial-route dispatch fusion; the tiled serving route does not use it"},
         };
-        const auto report=sp::compare(view(cli),view(served),allowed);
+        // Opt-in strict audit keeps unresolved output differences visible instead of blessing broad allowances.
+        const auto report=sp::compare(view(cli),view(served),allowed,
+            std::getenv("STRIX_TEST_SERVE_OUTPUT_PARITY") != nullptr);
         if(!report.ok()) std::cerr<<sp::text("qwen",report);
         expect(report.ok(),"qwen: projected CLI/server route fields and environment match within the listed allowances");
     }

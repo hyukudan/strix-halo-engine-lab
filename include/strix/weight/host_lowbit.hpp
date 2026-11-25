@@ -116,7 +116,8 @@ inline int quantise(float w, float s) {
 
 namespace detail {
 // One 64-element group of finite inputs, with round-to-nearest installed by encode_block.
-// An all-zero group gets scale 0 and codes 0.
+// An all-zero group gets scale 0 and codes 0. The FP32 error sums choose the clip step, so callers must
+// build without FP contraction (strix-weight: -ffp-contract=off or /fp:strict).
 template <class Storage>
 inline EncodeStatus::Code encode_group(const float* w, int* q, std::uint16_t& scale) {
     float pos = 0.0F, neg = 0.0F;

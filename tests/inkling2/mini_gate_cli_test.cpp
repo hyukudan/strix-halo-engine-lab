@@ -87,7 +87,7 @@ cli::Options parse(std::initializer_list<std::string> arguments) {
         8U, 8U, 16U, 0U, nullptr, 8U, true, false,
         [](const std::string&) -> std::shared_ptr<const strix::serve::BpeTokenizer> { return {}; },
         true, [](std::string_view) { return std::string{}; }, true};
-    auto options = cli::parse(static_cast<int>(argv.size()), argv.data(), family);
+    auto options = cli::parse(static_cast<int>(argv.size()), argv.data(), family, true);
     // Only use fields that own their values after the temporary argument storage expires.
     return options;
 }
@@ -209,7 +209,7 @@ void set_round_fold_env(const char* value) {
 }
 
 // The projected-bias attention lever per tier through the CLI parse: the same table the server test pins
-// (tests/inkling2/mini_serve_test.cpp): unset and 1 on, 0 off, anything else refused.
+// (tests/inkling2/mini_serve_test.cpp): opt-in, so unset and 0 off, 1 on, anything else refused.
 void test_projected_bias_lever() {
     const auto set = [](const char* value) {
 #ifdef _WIN32
@@ -220,7 +220,7 @@ void test_projected_bias_lever() {
 #endif
     };
     for (const auto* tier : {"exact", "fast", "turbo"}) {
-        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, true}, {"0", false}, {"1", true}}) {
+        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
             set(value);
             require(strix::inkling2::mini_attn_projected_bias(parse({"1", "--profile", tier}).tier) == expected,
                     "CLI projected-bias lever differs from the server table");
@@ -246,6 +246,12 @@ void test_options() {
     for (const auto* tier : {"exact", "fast", "turbo"})
         require(strix::inkling2::mini_prepared_round_fold(parse({"1", "--profile", tier}).tier), "explicit round fold");
     set_round_fold_env(nullptr);
+    require(strix::inkling2::mini_controller_one_plane(parse({"1", "--profile", "fast", "--controller-planes", "1"}).tier),
+            "CLI must resolve the explicit one-plane candidate");
+    require(!strix::inkling2::mini_controller_one_plane(parse({"1", "--profile", "fast", "--controller-planes", "3"}).tier),
+            "CLI must resolve the three-plane incumbent");
+    expect_invalid([] { (void)parse({"1", "--profile", "exact", "--controller-planes", "1"}); });
+    expect_invalid([] { (void)parse({"1", "--profile", "fast", "--controller-planes", "2"}); });
     require(parse({"1", "--profile", "fast", "--qualify-q8"}).weights.qualify_q8, "expected Q8 qualification arm");
     require(parse({"1", "--profile", "fast", "--no-weight-q8"}).weights.disable_q8, "expected Q8 off switch");
     expect_invalid([] { (void)parse({"1", "--qualify-q8"}); });
@@ -292,6 +298,11 @@ void test_windows(const fs::path& directory) {
     const auto windows = read(HeadGateMode::decode, 2U);
     require(windows.size() == 2U && windows[0].name == "first" && windows[1].ids.back() == 7U,
             "parsed windows differ");
+#if defined(STRIX_INKLING2_APP_CLI_TEST)
+    const auto extent = cli::gate_weight_extent(windows);
+    require(extent.context == 4U && extent.lanes == 1U,
+            "the gate weight plan must use the longest full window and one decode lane");
+#endif
     expect_invalid([&] { (void)read(HeadGateMode::decode, 3U); });
     require(read(HeadGateMode::prefill, 3U).size() == 2U, "prefill permits an all-scored prompt");
     std::ofstream(manifest) << "dup 4 a.ids\ndup 3 b.ids\n";

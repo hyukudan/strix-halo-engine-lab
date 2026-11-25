@@ -28,6 +28,11 @@ static bool available(std::mutex& mutex) {
 }
 struct Receipt { std::string json() const { return "{\"witness\":7}"; } };
 struct Options { std::uint64_t context_tokens=64; Receipt product_profile; };
+// The production binding calls make_http_mtp_sampler (apps/hip_decode_options.hpp) with the server options; here the
+// startup acceptance is the HTTP default, coupled.
+inline std::shared_ptr<TokenSampler> make_http_mtp_sampler(const serve::SamplingParameters& s, std::string& error, const Options&) {
+    return serve::make_job_sampler(s, error, TokenSamplerOptions{SampledAcceptance::coupled});
+}
 struct MtpConstraintRow {};
 struct HttpConstraintRequests {
     std::shared_ptr<MtpConstraintRow> make(const std::shared_ptr<const serve::ConstraintSpec>& s) {
@@ -454,7 +459,8 @@ static void native_boundary_contracts(bool counter=false) {
     named_mutex=nullptr;
     CHECK(!failed && queue.snapshot().running==0 && queue.snapshot().queued==0);
     if(counter) {
-        CHECK(std::count(events.begin(),events.end(),"sampler:41:1")==1 && std::count(events.begin(),events.end(),"sampler:41:2")==1);
+        // Two requests with one seed draw the same stream (identity 1) whatever their admission order.
+        CHECK(std::count(events.begin(),events.end(),"sampler:41:1")==2 && std::count(events.begin(),events.end(),"sampler:41:2")==0);
     } else {
         const auto named=std::find(events.begin(),events.end(),"named:barrier");CHECK(named!=events.end());
         CHECK(std::find(events.begin(),named,"output:12")!=named && std::find(events.begin(),named,"output:21")!=named);

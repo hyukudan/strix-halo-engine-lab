@@ -17,9 +17,16 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
         plan.reason = "weight load lever disabled";
         return plan;
     }
-    const bool runnable = !policy.id.name.empty() && policy.id.revision &&
-        policy.target == kQ8WeightStorage && find_format(registry, policy.target) &&
-        std::ranges::find(request.consumer_formats, policy.target) != request.consumer_formats.end();
+    // Each compact role class needs a target the registry knows and every consumer of the request runs; a role class
+    // kept BF16 needs none (a head-only row). At least one class is compact.
+    const auto consumed = [&](FormatId format) {
+        return format == kBf16WeightStorage ||
+               (find_format(registry, format) &&
+                std::ranges::find(request.consumer_formats, format) != request.consumer_formats.end());
+    };
+    const bool compact = policy.target != kBf16WeightStorage || policy.head_target() != kBf16WeightStorage;
+    const bool runnable = !policy.id.name.empty() && policy.id.revision && compact && consumed(policy.target) &&
+        consumed(policy.head_target());
     // One image serves every listed regime: a full row in some regime selects it, and every regime needs a gate row.
     const std::string_view single[] = {request.scope.regime};
     const auto regimes = request.regimes.empty() ? std::span<const std::string_view>(single) : request.regimes;
@@ -57,6 +64,7 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
         return plan;
     }
     plan.storage = policy.target;
+    plan.head_storage = policy.head_target();
     plan.reason = "unqualified weight load arm";
     if (decision) {
         plan.gate_v2_pass = decision->gate_v2_pass;

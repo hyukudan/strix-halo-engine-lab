@@ -19,6 +19,8 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
         if (tier != "exact" && tier != "fast" && tier != "turbo")
             throw std::invalid_argument("--profile must be exact, fast or turbo");
         options.tier.profile = profile::parse(tier);
+    } else if (native && argument == "--controller-planes") {
+        options.tier.cli.emplace_back(kMiniControllerPlanes, value());
     } else if (argument == "--block-drafter") {
         options.tier.cli.emplace_back(std::string(spec::kBlockDraftLeverName), value());
     } else if (native && argument == "--qualify-q8") {
@@ -59,6 +61,22 @@ inline bool mini_prepared_round_fold(const profile::Resolution& tier) {
     throw std::invalid_argument("STRIX_INK_PREPARED_ROUND_FOLD must be 0 or 1");
 }
 
+// Resolved state of the narrow expert image lever (true: the checkpoint's MXFP8 expert layers load as NVFP4).
+inline bool mini_experts_nvfp4(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniExpertsNvfp4);
+    if (entry == nullptr || entry->value == "0") return false;
+    if (entry->value == "1") return true;
+    throw std::invalid_argument("STRIX_MOE_EXPERTS_NVFP4 must be 0 or 1");
+}
+
+inline void require_mini_expert_consumer(const profile::Resolution& tier, bool supports_narrow_experts) {
+    if (!mini_experts_nvfp4(tier)) return;
+    if (tier.profile == profile::Name::standard)
+        throw std::invalid_argument("STRIX_MOE_EXPERTS_NVFP4=1 is forbidden under --profile exact");
+    if (!supports_narrow_experts)
+        throw std::invalid_argument("STRIX_MOE_EXPERTS_NVFP4=1 requires native resident model execution");
+}
+
 // Resolved state of the exact down-image lever (true: the HIP resident prefill stores the BF16 down image on the qualified
 // target). 0 or absent = off.
 inline bool mini_combine_image(const profile::Resolution& tier) {
@@ -75,6 +93,15 @@ inline bool mini_attn_projected_bias(const profile::Resolution& tier) {
     if (entry == nullptr || entry->value == "0") return false;
     if (entry->value == "1") return true;
     throw std::invalid_argument("STRIX_INK_ATTN_PROJECTED_BIAS must be 0 or 1");
+}
+
+inline bool mini_controller_one_plane(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniControllerPlanes);
+    if (entry == nullptr || entry->value == "3") return false;
+    if (entry->value != "1") throw std::invalid_argument("controller planes must be 1 or 3");
+    if (tier.profile != profile::Name::fast && tier.profile != profile::Name::turbo)
+        throw std::invalid_argument("one controller plane requires --profile fast or turbo");
+    return true;
 }
 
 // "on", "off" or "declined" (selected, but the target does not run it): the state name of a lever in the startup lines
@@ -118,6 +145,8 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
     static_cast<void>(mini_prepared_round_fold(tier));
     static_cast<void>(mini_combine_image(tier));
     static_cast<void>(mini_attn_projected_bias(tier));
+    require_mini_expert_consumer(tier, native_execution);
+    static_cast<void>(mini_controller_one_plane(tier));
     spec::require_block_draft_execution(spec::block_draft_selection(tier));
     return tier;
 }
@@ -126,10 +155,14 @@ inline const char* mini_profile_name(profile::Name tier) {
     return tier == profile::Name::standard ? "exact" : profile::name(tier);
 }
 
+// The one resolver of the CLI and the server: `extent` is what the instance holds (resident context, decode lanes;
+// see resolve_mini_weight_load); the receipt line weight::weight_load_regime_receipt says which regime rows are active.
 inline weight::WeightLoadPlan resolve_mini_resident_weight_load(profile::Name tier, const MiniWeightOptions& options,
-                                                              const weight::WeightLoadScope& scope) {
+                                                              const weight::WeightLoadScope& scope,
+                                                              weight::WeightLoadExtent extent) {
     constexpr std::array consumers{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
-    const auto plan = resolve_mini_weight_load(tier, scope, consumers, !options.disable_q8, options.qualify_q8);
+    const auto plan = resolve_mini_weight_load(tier, scope, consumers, !options.disable_q8, options.qualify_q8,
+                                               kMiniWeightLoadDecisions, extent);
     if (options.qualify_q8 && plan.storage != weight::kQ8WeightStorage)
         throw std::invalid_argument("native Q8_0 weights were not admitted");
     return plan;
