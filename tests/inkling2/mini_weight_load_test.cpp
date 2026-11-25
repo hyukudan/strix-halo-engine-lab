@@ -2,6 +2,7 @@
 #include "inkling2/inkling2_mini_checkpoint.hpp"
 #include "inkling2/inkling2_mini_expert_layout.hpp"
 #include "inkling2/inkling2_mini_schedule.hpp"
+#include "inkling2/inkling2_mini_resident_weights.hpp"
 #include "inkling2/inkling2_mini_weight_options.hpp"
 #include "strix/ggml_dequant.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
@@ -428,6 +429,19 @@ void test_calibrated_row_speculation_admission() {
             "an unset calibrated lever remains off");
 }
 
+void test_calibrated_pack_requires_complete_inventory() {
+    mini::mini_require_calibrated_pack_matrix_count(4U, 4U);
+    for (const auto [observed, expected] : {std::pair{0U, 4U}, std::pair{3U, 4U}, std::pair{0U, 0U}}) {
+        bool refused = false;
+        try {
+            mini::mini_require_calibrated_pack_matrix_count(observed, expected);
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        require(refused, "empty or partial calibrated pack inventory must be refused");
+    }
+}
+
 // Changing Q8_0 consumer arithmetic retires its receipt.
 void test_committed_rows() {
     constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
@@ -578,6 +592,7 @@ int main() {
         test_pack_admission();
         test_capacity_and_pack_fallback();
     test_calibrated_row_speculation_admission();
+        test_calibrated_pack_requires_complete_inventory();
         test_token_bytes();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

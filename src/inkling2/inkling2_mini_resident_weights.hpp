@@ -14,12 +14,19 @@
 
 #include <functional>
 #include <span>
+#include <string>
 #include <utility>
 
 namespace strix::inkling2 {
 
 using MiniResidentRange = weight::ResidentSliceRange;
 using MiniReadControllerBits = std::function<void(std::span<const std::uint16_t>, std::span<std::uint16_t>)>;
+
+inline void mini_require_calibrated_pack_matrix_count(unsigned observed, unsigned expected) {
+    if (expected == 0U || observed != expected)
+        throw std::runtime_error("calibrated pack matrix count mismatch: observed " + std::to_string(observed) +
+                                 ", expected " + std::to_string(expected));
+}
 
 // The certificate describes the exact BF16 bytes of these resident slices. The reader transfers those slices to host.
 [[nodiscard]] MiniControllerCertificate read_mini_controller_certificate(const weight::ResidentSlices& slices,

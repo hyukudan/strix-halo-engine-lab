@@ -48,6 +48,7 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
     std::deque<std::string> copy_names;  // the plan copies names; these outlive make() only as long as needed
     std::vector<weight::ResidentSlicePlan::NamedTensor> tensors;
     tensors.reserve(schema.size());
+    unsigned expected_prepacked = 0U;
     for (const auto& spec : schema) {
         if (!spec.resident || narrowed_tensors.contains(spec.name)) continue;
         const auto role_storage = spec.load_matrix_role == weight::Role::head ? storage.head : storage.attention;
@@ -55,6 +56,9 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
         const auto pitch = !compact && spec.load_matrix_role == weight::Role::attention_o ? output_pitch : 0U;
         const auto* raw = weights.find(spec.name);
         std::optional<weight::Slice> prepacked;
+        if (pack && compact && raw &&
+            (role_storage == weight::kQ4G64WeightStorage || role_storage == weight::kQ6G64WeightStorage))
+            ++expected_prepacked;
         if (pack && compact && raw &&
             (role_storage == weight::kQ4G64WeightStorage || role_storage == weight::kQ6G64WeightStorage)) {
             check(pack->find(spec.name, role_storage, *raw, prepacked));
@@ -72,6 +76,7 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
         }
         tensors.push_back({name, raw, compact ? std::optional(role_storage) : std::nullopt, pitch, std::move(prepacked)});
     }
+    if (pack && plan.keep_bf16_) mini_require_calibrated_pack_matrix_count(plan.prepacked_, expected_prepacked);
     plan.slices_ = weight::ResidentSlicePlan::make(std::move(tensors), kAlignment);
     for (unsigned layer = 0; layer < kPhysicalLayers; ++layer)
         for (unsigned i = 0; i < kProjections.size(); ++i)
