@@ -34,6 +34,8 @@
 #include "strix/cuda/qwen_mtp_draft.hpp"
 #include "strix/cuda/qwen_plemtp.hpp"
 #include "strix/cuda/qwen_qsa.hpp"
+#include "qwen_qsa_rowgroup.hpp"
+#include "qwen_qsa_segments.hpp"
 #include "strix/mtp_draft_split.hpp"
 #include "strix/spec/commit_tail.hpp"
 #include "strix/cuda/qwen_transcode.hpp"
@@ -440,8 +442,8 @@ struct Prefill::Impl : BlockFields {
     // device table that the replay writes first (one graph per window, no cuts); same kernels and order as qsa_layer.
     // Maps [0, 12) = the window's QSA layers, [12, 12 + 7) = the draft chain's steps.
     static constexpr std::uint32_t kQsaMaps = 12U + kMaxStepRows;
-    qsa::SegmentMap* qsa_maps = nullptr;           // device [kQsaMaps]
-    qsa::SegmentMap* qsa_maps_pinned = nullptr;    // host source of the captured copy
+    qsa::ReplaySegmentMap* qsa_maps = nullptr;           // device [kQsaMaps]
+    qsa::ReplaySegmentMap* qsa_maps_pinned = nullptr;    // host source of the captured copy
     bool qsa_graph = true;
     const qsa::MultiShape* qsa_dev_shape = nullptr;  // capture: run_block emits qsa_layer_dev with this shape
     qsa::LayerWeights qsa_weights(std::uint32_t l) const;
@@ -1140,9 +1142,9 @@ void Prefill::Impl::allocate() {
             gdn_replay = dev_alloc<gdn::ReplayWindow>(1, "GDN replay window");
             ck(cudaMallocHost(&gdn_replay_pinned, sizeof(gdn::ReplayWindow)), "pinned GDN replay window");
         }
-        qsa_maps = dev_zero<qsa::SegmentMap>(kQsaMaps, "qsa segment maps");
-        ck(cudaMallocHost(&qsa_maps_pinned, kQsaMaps * sizeof(qsa::SegmentMap)), "pinned qsa segment maps");
-        for (std::uint32_t i = 0; i < kQsaMaps; ++i) qsa_maps_pinned[i] = qsa::SegmentMap{};
+        qsa_maps = dev_zero<qsa::ReplaySegmentMap>(kQsaMaps, "qsa segment maps");
+        ck(cudaMallocHost(&qsa_maps_pinned, kQsaMaps * sizeof(qsa::ReplaySegmentMap)), "pinned qsa segment maps");
+        for (std::uint32_t i = 0; i < kQsaMaps; ++i) qsa_maps_pinned[i] = qsa::ReplaySegmentMap{};
         ck(cudaMallocHost(&moe_sticky_pinned, (1 + kMaxWindowRows) * 4), "pinned moe sticky");
         win_rows = dev_zero<float>(std::uint64_t{36} * kMaxWindowRows * gdn_stride, "window gdn rows");
         win_raw = dev_zero<float>(std::uint64_t{36} * kMaxWindowRows * gdn::kConvWidth, "window conv inputs");
@@ -1404,6 +1406,7 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
                                      " (select a card with --device-id or STRIX_DEVICE)");
         ck(cudaSetDevice(bound.visible.ordinal), "set device");
     }
+    if (m.cfg.forms.qsa_mma) qsa::prepare_attention_mma();
     // Residency is decided before our first allocation. Fully resident (automatic when the model fits, or full): nothing
     // below this block changes, no allocation, launch or sync is added. Tiered: the experts stay in the memory-mapped GGUF,
     // the card keeps a slot pool of the hot ones, blocks are capped to the exchange's rows, the position limit may shrink.
@@ -1931,7 +1934,7 @@ void Prefill::Impl::qsa_core(std::uint32_t l, const Segment& seg) {
     const auto o = qsa_ordinal(l);
     SessionState& ss = *seg.s;
     const qsa::LayerState st{ss.kv[o], ss.raw_index[o], ss.pooled[o], &ss.pooled_valid[o]};
-    qsa::layer_core(rb, seg.rows, seg.p0, qw, st, rope, tables, qws, stream, cfg.forms.qsa_mma && !window);
+    qsa::layer_core_prepared(rb, seg.rows, seg.p0, qw, st, rope, tables, qws, stream, cfg.forms.qsa_mma && !window);
     executed_forms.qsa_mma |= cfg.forms.qsa_mma && !window && seg.rows != 0;
 }
 
@@ -2571,7 +2574,7 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
                 };
                 ck(cudaStreamBeginCapture(m.stream, cudaStreamCaptureModeRelaxed), "begin capture");
                 if (dev_qsa) {  // one graph: the QSA cores read the maps the replay copies first
-                    ck(cudaMemcpyAsync(m.qsa_maps, m.qsa_maps_pinned, 12U * sizeof(qsa::SegmentMap), cudaMemcpyHostToDevice, m.stream),
+                    ck(cudaMemcpyAsync(m.qsa_maps, m.qsa_maps_pinned, 12U * sizeof(qsa::ReplaySegmentMap), cudaMemcpyHostToDevice, m.stream),
                        "qsa maps");
                     m.qsa_dev_shape = &dev_shape;
                 } else {
@@ -3325,7 +3328,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
             ck(cudaMemcpyAsync(m.draft_token, m.draft_pos_pinned + kMaxStepRows, 4, cudaMemcpyHostToDevice, m.stream), "draft pending");
         ck(cudaMemcpyAsync(m.draft_pos, m.draft_pos_pinned, kMaxStepRows * sizeof(std::uint64_t), cudaMemcpyHostToDevice, m.stream),
            "draft positions");
-        ck(cudaMemcpyAsync(m.qsa_maps + 12 + k0, m.qsa_maps_pinned + 12 + k0, (k1 - k0) * sizeof(qsa::SegmentMap), cudaMemcpyHostToDevice,
+        ck(cudaMemcpyAsync(m.qsa_maps + 12 + k0, m.qsa_maps_pinned + 12 + k0, (k1 - k0) * sizeof(*m.qsa_maps), cudaMemcpyHostToDevice,
                            m.stream),
            "draft qsa maps");
     }

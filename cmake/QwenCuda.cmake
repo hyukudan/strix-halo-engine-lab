@@ -211,6 +211,13 @@ target_compile_options(qwen_qsa_rowgroup_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>
 add_executable(qwen_qsa_score_tree_test tests/cuda/qwen_qsa_score_tree_test.cu)
 target_link_libraries(qwen_qsa_score_tree_test PRIVATE strix_qwen_cuda)
 target_compile_options(qwen_qsa_score_tree_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+# The legacy fixture readers use the Windows CRT. The selection-only mode needs no assets.
+if(WIN32)
+    add_executable(qwen_qsa_tests tests/cuda/qwen_qsa_tests.cu)
+    target_link_libraries(qwen_qsa_tests PRIVATE strix_qwen_cuda)
+    target_compile_options(qwen_qsa_tests PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
 
 # Prefix storage and compatibility planning are host-only; no CUDA initialization in their tests.
 add_library(strix_qwen_prefix STATIC src/prefix_state_cache.cpp src/cuda/models/qwen/qwen_prefix_identity.cpp)
