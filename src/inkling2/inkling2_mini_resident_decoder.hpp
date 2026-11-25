@@ -51,6 +51,32 @@ struct MiniPinnedLogitsDeleter {
 };
 }  // namespace detail
 
+// The resident upload of the Mini text weights into `storage` (plan.bytes() long) and the views bound over it: the one
+// the decoder runs, shared with the operand-class fixture so that nothing in it is a second copy. On CUDA the staged
+// attention tensors are then certified (the declaration the attention linears read) through the shared bounded scan:
+// in chunks, no host copy of a whole tensor; no scan scratch leaves the certificate empty (three planes) and the load
+// complete. The HIP load path is unchanged.
+[[nodiscard]] inline MiniResidentWeights upload_mini_resident_weights(const MiniResidentWeightPlan& plan,
+                                                                      std::span<std::uint8_t> storage,
+                                                                      [[maybe_unused]] mini_gpu::Stream stream) {
+#if defined(__HIPCC__)
+    core::HipWeightUploader uploader;
+#else
+    strix::cuda::core::WeightUploader uploader;
+#endif
+    core::WeightSliceLoader loader(uploader, {});
+    auto weights = MiniResidentWeights::bind(plan, storage);
+    loader.load_resident(plan.slices(), storage);
+#if !defined(__HIPCC__)
+    core::Bf16StagedScan scan;
+    weights.certify_attention(scan, [&](std::span<const std::uint16_t> staged, std::span<std::uint16_t> host) {
+        mini_gpu::copy(host.data(), staged.data(), staged.size_bytes(), mini_gpu::device_to_host, stream);
+        mini_gpu::synchronize(stream);
+    });
+#endif
+    return weights;
+}
+
 // One unpadded token stream, bound to the selected device and stream for its
 // lifetime. All checkpoint tensors and live cache slots stay on the device.
 // The owner is serial. Calls return after the stream and state commit finish.
@@ -547,23 +573,7 @@ private:
     }
 
     [[nodiscard]] MiniResidentWeights upload_weights() {
-#if defined(__HIPCC__)
-        core::HipWeightUploader uploader;
-#else
-        strix::cuda::core::WeightUploader uploader;
-#endif
-        core::WeightSliceLoader loader(uploader, {});
-        auto weights = MiniResidentWeights::bind(weight_plan_, weight_storage_.span());
-        loader.load_resident(weight_plan_.slices(), weight_storage_.span());
-#if !defined(__HIPCC__)
-        // Only the CUDA attention declaration consumes the certificate: it reads the staged attention tensors back
-        // instead of re-reading the checkpoint, so the HIP load path is unchanged.
-        weights.certify_attention([&](std::span<const std::uint16_t> staged, std::span<std::uint16_t> host) {
-            mini_gpu::copy(host.data(), staged.data(), staged.size_bytes(), mini_gpu::device_to_host, stream_.get());
-            mini_gpu::synchronize(stream_.get());
-        });
-#endif
-        return weights;
+        return upload_mini_resident_weights(weight_plan_, weight_storage_.span(), stream_.get());
     }
 
     void validate_inputs(const MiniResidentSessionState& state, std::span<const unsigned> tokens,

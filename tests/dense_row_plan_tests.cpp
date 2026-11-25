@@ -1,5 +1,6 @@
 #include "core/dense_row_plan.hpp"
 #include "core/residual_mix.hpp"
+#include "core/weight_certificate.hpp"
 #include "cuda/core/dense/row_plan.hpp"
 
 #include <algorithm>
@@ -10,6 +11,9 @@
 #include <initializer_list>
 #include <iostream>
 #include <limits>
+#include <memory_resource>
+#include <new>
+#include <stdexcept>
 #include <random>
 #include <span>
 #include <utility>
@@ -105,6 +109,33 @@ bool check_cuda_bf16_fast_terms() {
     return plan_bf16_row_projection(input, 32U, 2048U, short_limit, true, 1) == Bf16RowPath::big &&
            plan_bf16_row_projection(input, 3072U, 2048U, short_limit, true, 2) == Bf16RowPath::big &&
            plan_bf16_row_projection(input, 3072U, short_limit, short_limit, true, 1) == Bf16RowPath::short_rows;
+}
+
+// The planes a dispatch reports are those of the path each projection actually takes: a tall tile reports the term
+// count (3 exact, 1 BF16-exact declaration, 2 / 1 FAST), the FP32 row grid and short rows report none, and a mixed
+// dispatch the split that ran. Includes the tall 2048-row case, an output width of 17 (FP32 grid) and short rows.
+bool check_reported_planes() {
+    using strix::cuda_core::Bf16RowPath;
+    using strix::cuda_core::bf16_split_planes;
+    using strix::cuda_core::plan_bf16_row_projection;
+    constexpr unsigned short_limit = 16U;
+    const auto reported = [&](unsigned in, unsigned rows, std::initializer_list<unsigned> outs, int terms, bool tall = true) {
+        int planes = 0;
+        for (const unsigned out : outs)
+            planes = std::max(planes, bf16_split_planes(plan_bf16_row_projection(in, out, rows, short_limit, tall, terms), terms));
+        return planes;
+    };
+    for (const int terms : {1, 2, 3}) {
+        if (reported(2304U, 2048U, {3072U}, terms) != terms) return false;   // tall, plain big
+        if (reported(2304U, 2048U, {32U}, terms) != terms) return false;     // tall, compact tile for 3 terms
+        if (reported(64U, 2048U, {17U}, terms) != 0) return false;           // FP32 grid: the request splits nothing
+        if (reported(64U, 8U, {32U}, terms) != 0) return false;              // short rows
+        if (reported(64U, 2048U, {32U, 17U}, terms) != terms) return false;  // mixed reports the split that ran
+        if (reported(64U, 2048U, {17U, 32U}, terms) != terms) return false;
+        if (reported(2304U, 2048U, {3072U}, terms, false) != 0) return false;  // not an MMA request
+    }
+    return bf16_split_planes(Bf16RowPath::fp32_grid, 3) == 0 && bf16_split_planes(Bf16RowPath::short_rows, 3) == 0 &&
+           bf16_split_planes(Bf16RowPath::big, 1) == 1 && bf16_split_planes(Bf16RowPath::big_compact, 3) == 3;
 }
 
 // Host model of the split kernel (RN-even to BF16, FP32 subtraction) and of the
@@ -236,6 +267,61 @@ bool check_low_rank_bound() {
         std::cerr << "low-rank operand bound: magnitudes " << magnitudes << " bf16 " << bf16 << " bounds " << bounds
                   << " tail " << tail << '\n';
     return magnitudes && bf16 && bounds && tail;
+}
+
+namespace {
+
+// A memory resource that refuses every allocation: the scan scratch cannot be had.
+class RefusingResource final : public std::pmr::memory_resource {
+    void* do_allocate(std::size_t, std::size_t) override { throw std::bad_alloc(); }
+    void do_deallocate(void*, std::size_t, std::size_t) override {}
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
+};
+
+}  // namespace
+
+// The staged scan (device-resident bytes read back in bounded chunks): the maximum over chunk boundaries equals the
+// whole-tensor magnitude, a non-finite element in any chunk gives infinity, lack of scratch is a refusal (infinity,
+// no throw, no read), and an exception of the reader propagates.
+bool check_staged_scan() {
+    using strix::core::Bf16StagedScan;
+    const float inf = std::numeric_limits<float>::infinity();
+    std::vector<std::uint16_t> tensor(11, 0x3F80U);  // 1.0
+    tensor[10] = 0x4040U;                            // 3.0, in the last (short) chunk of a 4-element scratch
+    const auto reader = [&](std::size_t offset, std::span<std::uint16_t> host) {
+        std::copy_n(tensor.begin() + static_cast<std::ptrdiff_t>(offset), host.size(), host.begin());
+    };
+    Bf16StagedScan scan(std::pmr::get_default_resource(), 4U);
+    const bool finite = scan.available() && scan.magnitude_max(tensor.size(), reader) == 3.0F &&
+                        scan.magnitude_max(0U, reader) == 0.0F &&
+                        scan.magnitude_max(tensor.size(), reader) == strix::core::finite_magnitude_max_bf16(tensor);
+    tensor[5] = 0xFF80U;  // -inf in the middle chunk
+    std::size_t reads = 0;
+    const bool infinite = scan.magnitude_max(tensor.size(), [&](std::size_t offset, std::span<std::uint16_t> host) {
+                              ++reads;
+                              reader(offset, host);
+                          }) == inf && reads == 2U;  // stops at the chunk that holds it
+    tensor[5] = 0x7F00U;  // finite but huge: the scan reports the value, the model's bound refuses it
+    const bool huge = scan.magnitude_max(tensor.size(), reader) == std::bit_cast<float>(0x7F000000U);
+    RefusingResource refusing;
+    Bf16StagedScan declined(&refusing, 4U);
+    bool read_called = false;
+    const bool declines = !declined.available() &&
+                          declined.magnitude_max(tensor.size(), [&](std::size_t, std::span<std::uint16_t>) {
+                              read_called = true;
+                          }) == inf && !read_called;
+    bool propagates = false;
+    try {
+        (void)scan.magnitude_max(tensor.size(), [](std::size_t, std::span<std::uint16_t>) {
+            throw std::runtime_error("device copy failed");
+        });
+    } catch (const std::runtime_error&) {
+        propagates = true;
+    }
+    if (!finite || !infinite || !huge || !declines || !propagates)
+        std::cerr << "staged scan: finite " << finite << " infinite " << infinite << " huge " << huge << " declines "
+                  << declines << " propagates " << propagates << '\n';
+    return finite && infinite && huge && declines && propagates;
 }
 
 /// The image route plan: inside the incumbent groups the WMMA tile serves, whole-tile projections (pitched included)
@@ -533,8 +619,9 @@ static bool check_image_route_order() {
 
 int main() {
     if (!check_row_chunks() || !check_projection_groups() || !check_cuda_bf16_paths() ||
-        !check_cuda_bf16_fast_terms() || !check_exact_operand_planes() || !check_image_routes() ||
-        !check_image_route_order() || !check_dense_declared() || !check_low_rank_bound()) {
+        !check_cuda_bf16_fast_terms() || !check_reported_planes() || !check_exact_operand_planes() || !check_image_routes() ||
+        !check_image_route_order() || !check_dense_declared() || !check_low_rank_bound() ||
+        !check_staged_scan()) {
         std::cerr << "Dense row or projection chunk policy failed\n";
         return 1;
     }

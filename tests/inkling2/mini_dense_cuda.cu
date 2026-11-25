@@ -1,4 +1,5 @@
 #include "inkling2/inkling2_mini_attention_prepare_cuda.hpp"
+#include "mini_dense_cuda_support.hpp"
 #include "strix/attn/group_indexer.hpp"
 
 #include <algorithm>
@@ -9,6 +10,8 @@
 #include <iostream>
 #include <memory>
 #include <span>
+#include <string>
+#include <string_view>
 #include <utility>
 
 namespace {
@@ -16,25 +19,8 @@ namespace {
 namespace mini = strix::inkling2;
 namespace cc = strix::cuda_core;
 using Role = mini::MiniAttentionProjection;
+using namespace mini_dense_fixture;
 
-void require(cudaError_t status) {
-    if (status == cudaSuccess) return;
-    std::cerr << cudaGetErrorString(status) << '\n';
-    std::exit(1);
-}
-
-template <class T>
-struct Buffer {
-    explicit Buffer(std::size_t count, T value = {}) : size(count) {
-        require(cudaMallocManaged(&data, count * sizeof(T)));
-        std::fill_n(data, count, value);
-    }
-    ~Buffer() { require(cudaFree(data)); }
-    Buffer(const Buffer&) = delete;
-    Buffer& operator=(const Buffer&) = delete;
-    T* data = nullptr;
-    std::size_t size = 0;
-};
 
 bool check_norm_and_embedding() {
     constexpr unsigned width = mini::kHiddenWidth;
@@ -252,29 +238,6 @@ bool check_declared_operand(unsigned rows) {
 
 }  // namespace
 
-// Three-plane reference of one BF16 projection on tall rows (the exact BF16 split, hi / mid / lo into one accumulator).
-void three_plane_reference(cc::BigCtx* ctx, const std::uint16_t* weights, unsigned out, unsigned width, unsigned rows,
-                           const float* input, float* result, cc::BigEpi epilogue = cc::BigEpi::none) {
-    const cc::DenseWeight matrix{weights, cc::WeightFormat::bf16, out, width};
-    if (!cc::dense_big_supported(matrix)) {
-        std::cerr << "tall reference: matrix not supported by the big route\n";
-        std::exit(1);
-    }
-    cc::BigAct act{};
-    require(cc::dense_big_split(input, rows, width, cc::WeightFormat::bf16, 3, &act, nullptr, ctx));
-    require(cc::dense_big_gemm(matrix, act, result, nullptr, epilogue, nullptr, ctx));
-    // Callers read the managed result on the host (and Windows has no concurrent managed access): finish here.
-    require(cudaDeviceSynchronize());
-}
-
-void fill_bf16_weights(Buffer<std::uint16_t>& weight, std::uint32_t& seed) {
-    for (std::size_t i = 0; i < weight.size; ++i) {
-        seed = 1664525U * seed + 1013904223U;
-        weight.data[i] = static_cast<std::uint16_t>(0x3C00U | ((seed >> 16U) & 0x8000U) | ((seed >> 12U) & 0x01FFU));
-    }
-}
-
-bool same_floats(const float* a, const float* b, std::size_t count) { return !std::memcmp(a, b, count * sizeof(float)); }
 
 // The raw prepare entry on tall rows (above the short-route limit): it keeps FP32 operands, so FP32 rows with residuals
 // below BF16 give the three-plane bits of the key and value projections; the stage then rounds its raw key and value

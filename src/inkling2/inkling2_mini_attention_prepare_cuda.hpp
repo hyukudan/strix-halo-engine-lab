@@ -2,6 +2,7 @@
 
 #include "core/bf16_lm_head.hpp"
 #include "inkling2_mini_attention_prepare_device.hpp"
+#include "inkling2_mini_attention_operands.hpp"
 #include "inkling2_mini_dense_cuda.hpp"
 
 namespace strix::inkling2 {
@@ -24,11 +25,13 @@ struct MiniPreparedCudaBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGq
     // the resident backend, whose q/k/v groups read rmsnorm_bf16 outputs and whose output projection reads the BF16
     // sigmoid-gated product; the shared BF16 rows entry then runs the tall chain on one plane with the same bits.
     core::Bf16Operand operand = core::Bf16Operand::fp32;
+    int* planes_report = nullptr;  // receives the planes each linear() dispatch selected (qualification only)
 
     Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
         return core::for_each_bf16_projection_group<cuda_core::kMaxBf16RowProjections>(views, success,
             [&](std::span<const MiniAttentionLinear> group) {
-                return enqueue_mini_cuda_dense_rows(input, width, rows, group, stream, arithmetic, big_context, operand);
+                return enqueue_mini_cuda_dense_rows(input, width, rows, group, stream, arithmetic, big_context, operand,
+                                                  planes_report);
             });
     }
 
@@ -43,6 +46,15 @@ struct MiniPreparedCudaBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGq
 struct MiniPreparedCudaProjectedBackend : MiniPreparedCudaBackend {
     bool relative_bias_in_attention(unsigned) const { return true; }
 };
+
+// The resident decoder's attention backend: the one-plane operand class is declared only where the staged attention
+// weights are certified (finite, ranges kept finite); otherwise the FP32 class (three planes) runs.
+inline MiniPreparedCudaBackend mini_attention_backend(cudaStream_t stream, cuda_core::BigCtx* big_context,
+                                                      const MiniAttentionCertificate& certificate,
+                                                      int* planes_report = nullptr) {
+    return {{stream}, cuda_core::DenseArith::mma3, big_context, certificate.route(core::Bf16Operand::bf16_exact),
+            planes_report};
+}
 
 // The shared preparation issues all linear calls before the first round,
 // which consumes raw K. Retain the projection descriptors until that boundary.

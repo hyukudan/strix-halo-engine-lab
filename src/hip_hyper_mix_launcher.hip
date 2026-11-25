@@ -19,6 +19,7 @@
 #include "strix/distributed_stage_resources.hpp"
 #include "strix/lane_chain_hyper_output.hpp"
 #include "core/hc_geometry.hpp"
+#include "core/hc_lane_chain.hpp"
 #include "strix/model/bind.hpp"
 #include "strix/model_data/qwen3_8_flash_next.hpp"
 #include <cstdio>
@@ -1504,12 +1505,10 @@ __global__ __launch_bounds__(32) void lane_chain_hyper_projection_kernel(const f
                 for(unsigned b=0;b<8U;++b){
                     const auto bits=static_cast<unsigned short>(lane_chain_q8_byte(packed[p],b*34U)|(lane_chain_q8_byte(packed[p],b*34U+1U)<<8U));
                     const float scale=__half2float(__ushort_as_half(bits));
-#pragma unroll
-                    for(unsigned k=0;k<32U;++k){
-                        const auto code=static_cast<signed char>(lane_chain_q8_byte(packed[p],b*34U+2U+k));
-                        const float coefficient=scale*static_cast<float>(code);
-                        sum+=normalized[input_row+static_cast<std::uint64_t>(first+p)*256U+b*32U+k]*coefficient;
-                    }
+                    ::strix::core::hc::lane_chain_block<true,1U>(scale,
+                        [&](unsigned k) STRIX_HC_LANE_ACCESSOR {return static_cast<signed char>(lane_chain_q8_byte(packed[p],b*34U+2U+k));},
+                        [&](unsigned,unsigned k) STRIX_HC_LANE_ACCESSOR {return normalized[input_row+static_cast<std::uint64_t>(first+p)*256U+b*32U+k];},
+                        [&](unsigned) STRIX_HC_LANE_ACCESSOR ->float&{return sum;});
                 }
             }
         }
@@ -1645,8 +1644,7 @@ __global__ void lane_chain_hyper_output_kernel(const float* normalized,const flo
     extern __shared__ __align__(16) unsigned char staging[];
     const auto lane=threadIdx.x&31U,stream=threadIdx.x/32U;
     const std::uint64_t row=blockIdx.y,first=static_cast<std::uint64_t>(blockIdx.x)*32U;
-    const std::uint64_t block_bytes=Q6?26U:34U;
-    const std::uint64_t tile_bytes=block_bytes*rank,row_bytes=static_cast<std::uint64_t>(rank/32U)*block_bytes;
+    const std::uint64_t tile_bytes=::strix::core::hc::LaneChainTile<Q6>::tile_bytes(rank),row_bytes=::strix::core::hc::LaneChainTile<Q6>::row_bytes(rank);
     auto* stage=staging+stream*tile_bytes;
     const auto* source=static_cast<const unsigned char*>(up)+(static_cast<std::uint64_t>(stream)*hidden+first)*row_bytes;
     stage_tile16(stage,source,tile_bytes,lane);
@@ -1655,23 +1653,14 @@ __global__ void lane_chain_hyper_output_kernel(const float* normalized,const flo
     for(std::uint32_t block=0;block<rank/32U;++block){
         if constexpr (Q6) {
             const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes;
-            const float scale=lane_chain_scale<true>(weight,rank,block);
-            for(std::uint32_t g=0;g<4U;++g){
-                const auto codes=lane_chain_codes<true>(weight,rank,block,g);
-                for(std::uint32_t l=0;l<8U;++l){
-                    const float coefficient=scale*static_cast<float>(static_cast<signed char>(codes>>(8U*l)));
-                    gate+=low[row*rank+static_cast<std::uint64_t>(block)*32U+8U*g+l]*coefficient;
-                }
-            }
+            ::strix::core::hc::lane_chain_block8<false,1U>(lane_chain_scale<true>(weight,rank,block),
+                [&](std::uint32_t g) STRIX_HC_LANE_ACCESSOR {return lane_chain_codes<true>(weight,rank,block,g);},
+                [&](std::uint32_t,std::uint32_t g,std::uint32_t l) STRIX_HC_LANE_ACCESSOR {return low[row*rank+static_cast<std::uint64_t>(block)*32U+8U*g+l];},[&](std::uint32_t) STRIX_HC_LANE_ACCESSOR ->float&{return gate;});
             continue;
         }
         const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes+static_cast<std::uint64_t>(block)*34U;
-        const auto scale_bits=static_cast<unsigned short>(static_cast<unsigned>(weight[0])|(static_cast<unsigned>(weight[1])<<8U));
-        const float scale=__half2float(__ushort_as_half(scale_bits));
-        for(std::uint32_t k=0;k<32U;++k){
-            const float coefficient=scale*static_cast<float>(static_cast<signed char>(weight[2U+k]));
-            gate+=low[row*rank+static_cast<std::uint64_t>(block)*32U+k]*coefficient;
-        }
+        ::strix::core::hc::lane_chain_q8_block<false,1U>(weight,[&](std::uint32_t,std::uint32_t k) STRIX_HC_LANE_ACCESSOR {return low[row*rank+static_cast<std::uint64_t>(block)*32U+k];},
+            [&](std::uint32_t) STRIX_HC_LANE_ACCESSOR ->float&{return gate;});
     }
     auto* sig=reinterpret_cast<float*>(staging+static_cast<std::uint64_t>(streams)*tile_bytes);
     sig[stream*32U+lane]=sigmoid(gate);
@@ -1690,7 +1679,7 @@ __global__ void deferred_lane_chain_hyper_output_kernel(const Storage* raw,const
     extern __shared__ __align__(16) unsigned char staging[];
     const auto lane=threadIdx.x&31U,stream=threadIdx.x/32U;
     const std::uint64_t row=blockIdx.y,first=static_cast<std::uint64_t>(blockIdx.x)*32U;
-    const std::uint64_t tile_bytes=34ULL*rank,row_bytes=static_cast<std::uint64_t>(rank/32U)*34U;
+    const std::uint64_t tile_bytes=::strix::core::hc::LaneChainTile<false>::tile_bytes(rank),row_bytes=::strix::core::hc::LaneChainTile<false>::row_bytes(rank);
     auto* stage=staging+stream*tile_bytes;
     const auto* source=static_cast<const unsigned char*>(up)+(static_cast<std::uint64_t>(stream)*hidden+first)*row_bytes;
     stage_tile16(stage,source,tile_bytes,lane);
@@ -1698,12 +1687,8 @@ __global__ void deferred_lane_chain_hyper_output_kernel(const Storage* raw,const
     float gate=0.0F;
     for(std::uint32_t block=0;block<rank/32U;++block){
         const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes+static_cast<std::uint64_t>(block)*34U;
-        const auto scale_bits=static_cast<unsigned short>(static_cast<unsigned>(weight[0])|(static_cast<unsigned>(weight[1])<<8U));
-        const float scale=__half2float(__ushort_as_half(scale_bits));
-        for(std::uint32_t k=0;k<32U;++k){
-            const float coefficient=scale*static_cast<float>(static_cast<signed char>(weight[2U+k]));
-            gate+=low[row*rank+static_cast<std::uint64_t>(block)*32U+k]*coefficient;
-        }
+        ::strix::core::hc::lane_chain_q8_block<false,1U>(weight,[&](std::uint32_t,std::uint32_t k) STRIX_HC_LANE_ACCESSOR {return low[row*rank+static_cast<std::uint64_t>(block)*32U+k];},
+            [&](std::uint32_t) STRIX_HC_LANE_ACCESSOR ->float&{return gate;});
     }
     auto* sig=reinterpret_cast<float*>(staging+static_cast<std::uint64_t>(streams)*tile_bytes);
     sig[stream*32U+lane]=sigmoid(gate);
@@ -2230,8 +2215,7 @@ __global__ void rows_lane_chain_hyper_output_kernel(Rows rows, std::uint32_t cou
     extern __shared__ __align__(16) unsigned char staging[];
     const auto lane=threadIdx.x&31U,stream=threadIdx.x/32U;
     const std::uint64_t first=static_cast<std::uint64_t>(blockIdx.x)*32U;
-    const std::uint64_t block_bytes=Q6?26U:34U;
-    const std::uint64_t tile_bytes=block_bytes*rank,row_bytes=static_cast<std::uint64_t>(rank/32U)*block_bytes;
+    const std::uint64_t tile_bytes=::strix::core::hc::LaneChainTile<Q6>::tile_bytes(rank),row_bytes=::strix::core::hc::LaneChainTile<Q6>::row_bytes(rank);
     auto* stage=staging+stream*tile_bytes;
     const auto* source=static_cast<const unsigned char*>(up)+(static_cast<std::uint64_t>(stream)*hidden+first)*row_bytes;
     stage_tile16(stage,source,tile_bytes,lane);
@@ -2248,30 +2232,14 @@ __global__ void rows_lane_chain_hyper_output_kernel(Rows rows, std::uint32_t cou
     for(std::uint32_t block=0;block<rank/32U;++block){
         if constexpr (Q6) {
             const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes;
-            const float scale=lane_chain_scale<true>(weight,rank,block);
-#pragma unroll
-            for(std::uint32_t g=0;g<4U;++g){
-                const auto codes=lane_chain_codes<true>(weight,rank,block,g);
-#pragma unroll
-                for(std::uint32_t l=0;l<8U;++l){
-                    const float coefficient=scale*static_cast<float>(static_cast<signed char>(codes>>(8U*l)));
-#pragma unroll
-                    for(std::uint32_t t=0;t<Count;++t)
-                        gate[t]+=low[t][static_cast<std::uint64_t>(block)*32U+8U*g+l]*coefficient;
-                }
-            }
+            ::strix::core::hc::lane_chain_block8<true,Count>(lane_chain_scale<true>(weight,rank,block),
+                [&](std::uint32_t g) STRIX_HC_LANE_ACCESSOR {return lane_chain_codes<true>(weight,rank,block,g);},
+                [&](std::uint32_t t,std::uint32_t g,std::uint32_t l) STRIX_HC_LANE_ACCESSOR {return low[t][static_cast<std::uint64_t>(block)*32U+8U*g+l];},[&](std::uint32_t t) STRIX_HC_LANE_ACCESSOR ->float&{return gate[t];});
             continue;
         }
         const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes+static_cast<std::uint64_t>(block)*34U;
-        const auto scale_bits=static_cast<unsigned short>(static_cast<unsigned>(weight[0])|(static_cast<unsigned>(weight[1])<<8U));
-        const float scale=__half2float(__ushort_as_half(scale_bits));
-#pragma unroll
-        for(std::uint32_t k=0;k<32U;++k){
-            const float coefficient=scale*static_cast<float>(static_cast<signed char>(weight[2U+k]));
-#pragma unroll
-            for(std::uint32_t t=0;t<Count;++t)
-                gate[t]+=low[t][static_cast<std::uint64_t>(block)*32U+k]*coefficient;
-        }
+        ::strix::core::hc::lane_chain_q8_block<true,Count>(weight,[&](std::uint32_t t,std::uint32_t k) STRIX_HC_LANE_ACCESSOR {return low[t][static_cast<std::uint64_t>(block)*32U+k];},
+            [&](std::uint32_t t) STRIX_HC_LANE_ACCESSOR ->float&{return gate[t];});
     }
 #pragma unroll
     for(std::uint32_t t=0;t<Count;++t) sig[(t*streams+stream)*32U+lane]=sigmoid(gate[t]);
@@ -2282,23 +2250,14 @@ __global__ void rows_lane_chain_hyper_output_kernel(Rows rows, std::uint32_t cou
         for(std::uint32_t block=0;block<rank/32U;++block){
             if constexpr (Q6) {
                 const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes;
-                const float scale=lane_chain_scale<true>(weight,rank,block);
-                for(std::uint32_t g=0;g<4U;++g){
-                    const auto codes=lane_chain_codes<true>(weight,rank,block,g);
-                    for(std::uint32_t l=0;l<8U;++l){
-                        const float coefficient=scale*static_cast<float>(static_cast<signed char>(codes>>(8U*l)));
-                        gate+=low[static_cast<std::uint64_t>(block)*32U+8U*g+l]*coefficient;
-                    }
-                }
+                ::strix::core::hc::lane_chain_block8<false,1U>(lane_chain_scale<true>(weight,rank,block),
+                    [&](std::uint32_t g) STRIX_HC_LANE_ACCESSOR {return lane_chain_codes<true>(weight,rank,block,g);},
+                    [&](std::uint32_t,std::uint32_t g,std::uint32_t l) STRIX_HC_LANE_ACCESSOR {return low[static_cast<std::uint64_t>(block)*32U+8U*g+l];},[&](std::uint32_t) STRIX_HC_LANE_ACCESSOR ->float&{return gate;});
                 continue;
             }
             const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes+static_cast<std::uint64_t>(block)*34U;
-            const auto scale_bits=static_cast<unsigned short>(static_cast<unsigned>(weight[0])|(static_cast<unsigned>(weight[1])<<8U));
-            const float scale=__half2float(__ushort_as_half(scale_bits));
-            for(std::uint32_t k=0;k<32U;++k){
-                const float coefficient=scale*static_cast<float>(static_cast<signed char>(weight[2U+k]));
-                gate+=low[static_cast<std::uint64_t>(block)*32U+k]*coefficient;
-            }
+            ::strix::core::hc::lane_chain_q8_block<false,1U>(weight,[&](std::uint32_t,std::uint32_t k) STRIX_HC_LANE_ACCESSOR {return low[static_cast<std::uint64_t>(block)*32U+k];},
+                [&](std::uint32_t) STRIX_HC_LANE_ACCESSOR ->float&{return gate;});
         }
         sig[(t*streams+stream)*32U+lane]=sigmoid(gate);
     }
@@ -2339,15 +2298,8 @@ __global__ void rows_lane_chain_split_hyper_output_kernel(Rows rows, const void*
     for(std::uint32_t i=0;i<Own;++i){ low[i]=tiled(rows.low[group+G*i], rows.tile_normalized, rows, blockIdx.z * looped_tiles(rows) + z); gate[i]=0.0F; }
     for(std::uint32_t block=0;block<rank/32U;++block){
         const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes+static_cast<std::uint64_t>(block)*34U;
-        const auto scale_bits=static_cast<unsigned short>(static_cast<unsigned>(weight[0])|(static_cast<unsigned>(weight[1])<<8U));
-        const float scale=__half2float(__ushort_as_half(scale_bits));
-#pragma unroll
-        for(std::uint32_t k=0;k<32U;++k){
-            const float coefficient=scale*static_cast<float>(static_cast<signed char>(weight[2U+k]));
-#pragma unroll
-            for(std::uint32_t i=0;i<Own;++i)
-                gate[i]+=low[i][static_cast<std::uint64_t>(block)*32U+k]*coefficient;
-        }
+        ::strix::core::hc::lane_chain_q8_block<true,Own>(weight,[&](std::uint32_t i,std::uint32_t k) STRIX_HC_LANE_ACCESSOR {return low[i][static_cast<std::uint64_t>(block)*32U+k];},
+            [&](std::uint32_t i) STRIX_HC_LANE_ACCESSOR ->float&{return gate[i];});
     }
 #pragma unroll
     for(std::uint32_t i=0;i<Own;++i) sig[((group+G*i)*streams+stream)*32U+lane]=sigmoid(gate[i]);
@@ -2400,21 +2352,18 @@ __global__ void rows_lane_chain_hyper_output_regs_kernel(Rows rows, const void* 
             const auto scale_bits = static_cast<unsigned short>(byte_at(block * 34U) | (byte_at(block * 34U + 1U) << 8U));
             scale = __half2float(__ushort_as_half(scale_bits));
         }
-#pragma unroll
-        for (std::uint32_t k = 0; k < 32U; ++k) {
-            signed char code;
+        const auto code = [&](std::uint32_t k) STRIX_HC_LANE_ACCESSOR -> signed char {
             if constexpr (Q6) {
                 const auto o = q6p::chunk_offsets(320U, block / 8U);
                 const std::uint32_t g = k / 8U;
                 const auto codes = q6p::codes8(words[(o.qs + 16U * (block % 8U) + 4U * g) / 4U],
                     words[(o.qh + 8U * (block % 8U) + 4U * (g / 2U)) / 4U], 4U * (g & 1U));
-                code = static_cast<signed char>(codes >> (8U * (k % 8U)));
-            } else code = static_cast<signed char>(byte_at(block * 34U + 2U + k));
-            const float coefficient = scale * static_cast<float>(code);
-#pragma unroll
-            for (std::uint32_t t = 0; t < Count; ++t)
-                gate[t] += low[t][static_cast<std::uint64_t>(block) * 32U + k] * coefficient;
-        }
+                return static_cast<signed char>(codes >> (8U * (k % 8U)));
+            } else return static_cast<signed char>(byte_at(block * 34U + 2U + k));
+        };
+        ::strix::core::hc::lane_chain_block<true, Count>(scale, code,
+            [&](std::uint32_t t, std::uint32_t k) STRIX_HC_LANE_ACCESSOR { return low[t][static_cast<std::uint64_t>(block) * 32U + k]; },
+            [&](std::uint32_t t) STRIX_HC_LANE_ACCESSOR -> float& { return gate[t]; });
     }
 #pragma unroll
     for (std::uint32_t t = 0; t < Count; ++t) sig[(t * streams + stream) * 32U + lane] = sigmoid(gate[t]);
@@ -2705,12 +2654,9 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
         for (std::uint32_t block = 0; block < kBlocks; ++block) {
             const auto bits = static_cast<unsigned short>(byte_at(block * 34U) | (byte_at(block * 34U + 1U) << 8U));
             const float scale = __half2float(__ushort_as_half(bits));
-#pragma unroll
-            for (std::uint32_t k = 0; k < 32U; ++k) {
-                const float coefficient = scale * static_cast<float>(static_cast<signed char>(byte_at(block * 34U + 2U + k)));
-#pragma unroll
-                for (std::uint32_t t = 0; t < Count; ++t) gate[t] += low_lds[block * 32U + k][t] * coefficient;
-            }
+::strix::core::hc::lane_chain_block<true, Count>(scale,
+    [&](std::uint32_t k) STRIX_HC_LANE_ACCESSOR { return static_cast<signed char>(byte_at(block * 34U + 2U + k)); },
+    [&](std::uint32_t t, std::uint32_t k) STRIX_HC_LANE_ACCESSOR { return low_lds[block * 32U + k][t]; }, [&](std::uint32_t t) STRIX_HC_LANE_ACCESSOR -> float& { return gate[t]; });
         }
 #pragma unroll
         for (std::uint32_t t = 0; t < Count; ++t) sig[t][c_stream][32U * c_group + lane] = sigmoid(gate[t]);
@@ -3095,12 +3041,9 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
         for (std::uint32_t block = 0; block < kBlocks; ++block) {
             const auto scale_bits = static_cast<unsigned short>(byte_at(block * 34U) | (byte_at(block * 34U + 1U) << 8U));
             const float scale = __half2float(__ushort_as_half(scale_bits));
-#pragma unroll
-            for (std::uint32_t k = 0; k < 32U; ++k) {
-                const float coefficient = scale * static_cast<float>(static_cast<signed char>(byte_at(block * 34U + 2U + k)));
-#pragma unroll
-                for (std::uint32_t t = 0; t < Count; ++t) gate[t] += low_lds[block * 32U + k][t] * coefficient;
-            }
+::strix::core::hc::lane_chain_block<true, Count>(scale,
+    [&](std::uint32_t k) STRIX_HC_LANE_ACCESSOR { return static_cast<signed char>(byte_at(block * 34U + 2U + k)); },
+    [&](std::uint32_t t, std::uint32_t k) STRIX_HC_LANE_ACCESSOR { return low_lds[block * 32U + k][t]; }, [&](std::uint32_t t) STRIX_HC_LANE_ACCESSOR -> float& { return gate[t]; });
         }
 #pragma unroll
         for (std::uint32_t t = 0; t < Count; ++t) sig[t][c_stream][32U * c_group + lane] = sigmoid(gate[t]);
