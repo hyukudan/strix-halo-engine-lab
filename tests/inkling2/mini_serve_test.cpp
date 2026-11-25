@@ -317,7 +317,7 @@ void set_image_env(const char* value) {
 }
 
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
-            W4a4 w4a4 = W4a4::bf16, bool image = false, bool round_fold = false, bool projected_bias = false,
+            W4a4 w4a4 = W4a4::bf16, bool image = false, bool round_fold = false, bool projected_bias = true,
             const char* tier_name = "fast") {
     sv::ServiceFactories factories;
     bool created = false;
@@ -501,10 +501,9 @@ int main(int argc, char** argv) try {
     set_image_env("0");
     wiring(argv[1], "hip", false);
     set_image_env(nullptr);
-    // The projected-bias lever per tier: unset and 0 keep the image route (off until its identity receipt), 1 selects the
-    // projected flash; tests/inkling2/mini_gate_cli_test.cpp pins the same table through the CLI.
+    // The projected-bias lever per tier: unset and 1 select the projected flash (the default), 0 keeps the image route; tests/inkling2/mini_gate_cli_test.cpp pins the same table through the CLI.
     for (const auto* tier : {"exact", "fast", "turbo"}) {
-        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
+        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, true}, {"0", false}, {"1", true}}) {
             set_env("STRIX_INK_ATTN_PROJECTED_BIAS", value);
             wiring(argv[1], "cuda", false, false, W4a4::bf16, false, false, expected, tier);
         }

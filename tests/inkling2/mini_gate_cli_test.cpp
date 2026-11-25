@@ -209,7 +209,7 @@ void set_round_fold_env(const char* value) {
 }
 
 // The projected-bias attention lever per tier through the CLI parse: the same table the server test pins
-// (tests/inkling2/mini_serve_test.cpp): unset and 0 off, 1 on, anything else refused.
+// (tests/inkling2/mini_serve_test.cpp): unset and 1 on, 0 off, anything else refused.
 void test_projected_bias_lever() {
     const auto set = [](const char* value) {
 #ifdef _WIN32
@@ -220,7 +220,7 @@ void test_projected_bias_lever() {
 #endif
     };
     for (const auto* tier : {"exact", "fast", "turbo"}) {
-        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
+        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, true}, {"0", false}, {"1", true}}) {
             set(value);
             require(strix::inkling2::mini_attn_projected_bias(parse({"1", "--profile", tier}).tier) == expected,
                     "CLI projected-bias lever differs from the server table");

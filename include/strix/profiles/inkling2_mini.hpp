@@ -52,9 +52,9 @@ inline constexpr std::string_view kMiniPreparedRoundFold = "inkling2-mini-prepar
 // round per distance, same failure contract: bitwise the image route for every launch it admits (single prompt chunk of
 // two or more rows, host positions, no null-order count). A launch it cannot admit (e.g. the device's dynamic
 // shared-memory opt-in below the 1024-column projection's need) keeps the image route; real errors stay visible. CUDA only
-// (HIP selects its projected route in its own binding). Off until its same-head identity receipt (lever on vs off,
-// --logits bitwise, EXACT 4K..32K and TURBO 8K); the flip is data: value cells {"1","1","1","1"} (all tiers, every cell
-// already ready and runnable). Switch: STRIX_INK_ATTN_PROJECTED_BIAS=0/1.
+// (HIP selects its projected route in its own binding). On by default in every tier (value cells "1", builtin "1": the
+// bits are the image route's, so the run identity at the default is the legacy one; an explicit 0 selects the image route
+// and is a distinct identity). Switch: STRIX_INK_ATTN_PROJECTED_BIAS=0/1.
 inline constexpr std::string_view kMiniAttnProjectedBias = "inkling2-mini-attn-projected-bias@1";
 inline constexpr std::array<profile::Lever, 4> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
@@ -73,9 +73,9 @@ inline constexpr std::array<profile::Lever, 4> kMiniLevers{{
      .source = "tests/core/round_fold_hip.hip (every store: the separate round's bits) and the isolated fold off/on "
                "identity ticket of the HIP prepared attention",
      .omit_builtin_fingerprint = true},
-    {kMiniAttnProjectedBias, "STRIX_INK_ATTN_PROJECTED_BIAS", "", {"", "", "", ""}, "0", profile::Kind::exact,
+    {kMiniAttnProjectedBias, "STRIX_INK_ATTN_PROJECTED_BIAS", "", {"1", "1", "1", "1"}, "1", profile::Kind::exact,
      {true, true, true, true}, {true, true, true, true}, "", "0",
-     "relative bias projected inside the CUDA prompt flash: bitwise the image route (same-head identity receipt pending)",
+     "relative bias projected inside the CUDA prompt flash: bitwise the image route (lever on vs off logits identity, EXACT and FAST)",
      false, {}, true},
 }};
 

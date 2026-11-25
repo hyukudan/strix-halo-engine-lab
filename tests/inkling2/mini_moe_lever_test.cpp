@@ -166,8 +166,8 @@ void test_configure() {
     {
         const auto levers = mini::configure_mini_decoder(by_default, mini::resolve_mini_profile(options, true));
         require(!levers.down_image && !levers.prepared_round_fold && !by_default.fold && !by_default.image,
-                "no lever is applied by default");
-        require(!by_default.projected, "the projected-bias route is off by default");
+                "no other lever is applied by default");
+        require(by_default.projected, "the projected-bias route is on by default");
     }
     options.tier = inputs(profile::Name::standard, nullptr, nullptr, "1");
     FakeDecoder fold_on;
@@ -222,8 +222,9 @@ void test_round_fold_admission() {
 void test_projected_bias() {
     const auto& row = mini::kMiniLevers[3];
     require(row.name == mini::kMiniAttnProjectedBias && row.name == "inkling2-mini-attn-projected-bias@1", "row identity");
-    require(row.env == "STRIX_INK_ATTN_PROJECTED_BIAS" && row.off == "0" && row.builtin == "0" &&
-                row.kind == profile::Kind::exact, "row is an exact lever, off by default");
+    require(row.env == "STRIX_INK_ATTN_PROJECTED_BIAS" && row.off == "0" && row.builtin == "1" &&
+                row.kind == profile::Kind::exact, "row is an exact lever, on by default");
+    for (const auto& cell : row.value) require(cell == "1", "every profile column selects the projected route");
     const auto in = [](profile::Name tier, const char* value) {
         profile::Inputs inputs;
         inputs.profile = tier;
@@ -234,7 +235,7 @@ void test_projected_bias() {
     };
     mini::MiniWeightOptions options;
     for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
-        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
+        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, true}, {"0", false}, {"1", true}}) {
             options.tier = in(tier, value);
             for (const bool native : {false, true})
                 require(mini::mini_attn_projected_bias(mini::resolve_mini_profile(options, native)) == expected,
@@ -244,7 +245,10 @@ void test_projected_bias() {
     const profile::Engine legacy{"inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1"};
     require(profile::resolve(mini::kMiniProfile, in(profile::Name::standard, nullptr)).fingerprint() ==
                 profile::resolve(legacy, in(profile::Name::standard, nullptr)).fingerprint(),
-            "default identity unchanged by the additive row");
+            "default identity unchanged: the default is the row's builtin, which the fingerprint omits");
+    require(profile::resolve(mini::kMiniProfile, in(profile::Name::standard, "0")).fingerprint() !=
+                profile::resolve(legacy, in(profile::Name::standard, nullptr)).fingerprint(),
+            "an explicit off is a distinct run identity");
     options.tier = in(profile::Name::fast, "yes");
     bool refused = false;
     try {
