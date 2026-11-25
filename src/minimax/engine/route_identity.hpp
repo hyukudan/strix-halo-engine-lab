@@ -10,6 +10,8 @@
 #include <string_view>
 #include <vector>
 
+#include "core/numeric_partition.hpp"
+
 namespace strix::minimax::route {
 inline std::vector<std::vector<std::uint32_t>> expert_rows(std::span<const std::uint32_t> ids, unsigned rows,
                                                          unsigned experts, unsigned top_k) {
@@ -23,46 +25,20 @@ inline std::vector<std::vector<std::uint32_t>> expert_rows(std::span<const std::
         }
     return grouped;
 }
+// Every MiniMax matrix is mul1 (codebook 2). The split / tile policy is the shared numeric partition policy v1
+// (src/core/numeric_partition.hpp); these forwarders only bind the codebook.
+inline constexpr unsigned kMul1Codebook = 2;
 constexpr bool medium_prefill_candidate(unsigned input, unsigned output, unsigned bits, unsigned rows) {
-    if (rows < 32) return false;
-    if (rows >= 256) return (bits == 6 && input == 5120 && output == 1280) || (bits == 5 && input == 4096 && output == 1024);
-    if (bits == 6) return input == 5120 && output == 1280;
-    if (bits != 5) return false;
-    return (input == 1280 && output == 32768) || (input == 8192 && output == 5120) || (input == 5120 && output == 2304) ||
-           (input == 2304 && output == 5120) || (input == 4096 && output == 1024);
+    return strix::core::partition::medium(input, output, bits, kMul1Codebook, rows);
 }
 constexpr unsigned measured_vector_splits(unsigned input, unsigned output, unsigned bits, unsigned rows) {
-    if (bits == 5) {
-        if (input == 4096 && output == 1024 && (rows == 1 || rows == 4 || rows == 8)) return 16;
-        if (input == 5120 && output == 2304 && rows == 8) return 8;
-    }
-    return output <= 1024 ? 32U : (output <= 4096 && input >= 4096 ? 16U : 4U);
+    return strix::core::partition::vector_splits(input, output, bits, kMul1Codebook, rows);
 }
 constexpr unsigned gemm_tile_rows(unsigned input, unsigned output, unsigned bits, unsigned rows) {
-    return medium_prefill_candidate(input, output, bits, rows) || (rows >= 256 && output >= 2304) ||
-                   (rows >= 64 && output >= 32768 && bits == 5) ? 64U : 16U;
+    return strix::core::partition::bucket_rows(input, output, bits, kMul1Codebook, rows);
 }
 constexpr unsigned gemm_splits(unsigned input, unsigned output, unsigned bits, unsigned rows) {
-    std::size_t requested;
-    if (rows > 8) {
-        const std::size_t tile_m = gemm_tile_rows(input, output, bits, rows);
-        const std::size_t groups = ((rows + tile_m - 1) / tile_m) * ((output + 63U) / 64U);
-        if (medium_prefill_candidate(input, output, bits, rows)) {
-            if (output >= 32768) {
-                requested = rows < 64 ? 4U : 1U;
-            } else {
-                const std::size_t target = rows > 64 && rows % 64 ? 512U : 256U;
-                requested = 1;
-                while (groups * requested < target && requested < 16) requested *= 2;
-            }
-        } else {
-            requested = 1;
-            while (groups * requested < 160 && requested < 32) requested *= 2;
-        }
-    } else {
-        requested = measured_vector_splits(input, output, bits, rows);
-    }
-    return static_cast<unsigned>(std::min<std::size_t>(requested, input / 16));
+    return strix::core::partition::gemm_splits(input, output, bits, kMul1Codebook, rows);
 }
 constexpr unsigned mt_class(unsigned rows) { return rows <= 16 ? 0U : rows <= 32 ? 1U : rows <= 64 ? 2U : 3U; }
 constexpr unsigned mt_of_class(unsigned cls) { return 1U << cls; }
