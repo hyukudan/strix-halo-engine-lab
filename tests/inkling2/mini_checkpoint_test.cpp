@@ -10,6 +10,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <optional>
 #include <vector>
 
 namespace {
@@ -104,6 +105,7 @@ bool check_mixed_dispatch() {
     const std::array<std::uint16_t, 32> bf16{};
     const std::array<std::uint8_t, 34> packed{};
     std::array<float, 5> outputs{};
+    alignas(16) const std::array<float, 32> input{};  // one activation row of width 32, apart from the outputs
     const wei::ResidentMatrixView matrix{packed, wei::kQ8WeightStorage, 1, 32, 34};
     const std::array projections{ResidentRowProjection{bf16.data(), 1, &outputs[0]},
                                  ResidentRowProjection{bf16.data(), 1, &outputs[1]},
@@ -128,11 +130,15 @@ bool check_mixed_dispatch() {
         }
         return 0;
     };
-    if (strix::core::dispatch_resident_rows<5>(projections, 0, -1, exact, compact) != 0 ||
+    const auto admitted = [](std::span<const ResidentRowProjection> run) { return run.size() == 2U; };
+    const auto bf16_admitted = [](std::span<const Bf16RowProjection>) { return true; };
+    if (strix::core::dispatch_resident_rows<5>(input.data(), 32U, 1U, projections, 0, -1, exact, compact,
+                                               bf16_admitted, admitted) != 0 ||
         seen != std::vector<std::ptrdiff_t>{0, 1, 2, 3, 4}) return false;
     seen.clear();
     const auto failure = [](std::span<const ResidentRowProjection>) { return 7; };
-    return strix::core::dispatch_resident_rows<5>(projections, 0, -1, exact, failure) == 7 &&
+    return strix::core::dispatch_resident_rows<5>(input.data(), 32U, 1U, projections, 0, -1, exact, failure,
+                                                  bf16_admitted, admitted) == 7 &&
         seen == std::vector<std::ptrdiff_t>{0, 1};
 }
 
@@ -344,6 +350,65 @@ bool check_attention_certificate() {
            mini::MiniAttentionCertificate{}.route(one) == three;
 }
 
+// The controller certificate is a function of the bytes added to it: a checkpoint with an infinite forget coefficient
+// and one with finite weights give different routes, an oversized finite down weight is refused, and an empty
+// certificate (no controller tensor seen) never admits the one-plane class.
+bool check_controller_certificate() {
+    const std::vector<std::uint16_t> finite(64, 0x3F80U), infinite{0x3F80U, 0x7F80U}, oversized(64, 0x7F00U);
+    const auto route = [&finite](const std::vector<std::uint16_t>& down, const std::vector<std::uint16_t>& forget) {
+        mini::MiniControllerCertificate certificate;
+        certificate.add_down(down);
+        certificate.add_gate(forget);
+        certificate.add_gate(finite);
+        return certificate.route(strix::core::Bf16Operand::bf16_exact);
+    };
+    constexpr auto one = strix::core::Bf16Operand::bf16_exact, three = strix::core::Bf16Operand::fp32;
+    return route(finite, finite) == one && route(finite, infinite) == three && route(oversized, finite) == three &&
+           route(finite, finite) == one && mini::MiniControllerCertificate{}.route(one) == three;
+}
+
+bool check_controller_residency(const Fixture& fixture) {
+    constexpr auto one = strix::core::Bf16Operand::bf16_exact, three = strix::core::Bf16Operand::fp32;
+    const auto route = [&](std::uint16_t forget_bits, std::uint16_t down_bits) {
+        const auto source = std::make_shared<HeaderSource>(fixture.header.dump(), fixture.payload_size);
+        wei::TensorIndex index;
+        mini::MiniTextWeights weights;
+        if (!wei::index_safetensors(source, index) || !weights.bind(index)) return std::optional<strix::core::Bf16Operand>{};
+        std::vector<wei::ResidentSlicePlan::NamedTensor> tensors;
+        for (const auto& tensor : index.tensors) {
+            const std::string_view name(tensor.name);
+            if (name.find(".controllers.") != std::string_view::npos)
+                tensors.push_back({name.substr(mini::kMiniTextTensorPrefix.size()), weights.find(name)});
+        }
+        const auto plan = wei::ResidentSlicePlan::make(std::move(tensors), alignof(float));
+        std::vector<std::uint16_t> backing(plan.bytes() / sizeof(std::uint16_t));
+        auto bytes = std::span(reinterpret_cast<std::uint8_t*>(backing.data()), plan.bytes());
+        const auto stage = [&](std::string_view name, std::uint16_t bits) {
+            const auto& slice = weights.find(name)->payload;
+            auto& payload = source->stage(slice);
+            payload[0] = static_cast<wei::Byte>(bits & 0xFFU);
+            payload[1] = static_cast<wei::Byte>(bits >> 8U);
+            const auto location = std::ranges::find(plan.ranges(), slice.range.offset,
+                [](const wei::ResidentSliceRange& range) { return range.source.range.offset; });
+            return location != plan.ranges().end() &&
+                   static_cast<bool>(location->source.source->read(location->source.range,
+                       std::as_writable_bytes(bytes.subspan(location->destination_offset, location->bytes))));
+        };
+        const auto prefix = "model.llm.layers." + std::to_string(mini::kCoreFirst) + ".controllers.attn.";
+        if (!stage(prefix + "forget_weight", forget_bits) || !stage(prefix + "down_weight", down_bits))
+            return std::optional<strix::core::Bf16Operand>{};
+        const auto resident = wei::ResidentSlices::bind(plan, bytes);
+        const auto certificate = mini::read_mini_controller_certificate(resident,
+            [](std::span<const std::uint16_t> bits, std::span<std::uint16_t> host) {
+                std::ranges::copy(bits, host.begin());
+            });
+        if (source->payload_reads() != 2U) return std::optional<strix::core::Bf16Operand>{};
+        return std::optional{certificate.route(one)};
+    };
+    return route(0x7F80U, 0x3F80U) == three && route(0x3F80U, 0x3F80U) == one &&
+           route(0x3F80U, 0x7F00U) == three;
+}
+
 // The staging path itself: certify_mini_attention walks the schema's attention tensors and layer norm gains, scans each
 // staged tensor through the shared bounded scan and yields the operand class the resident backend declares. A
 // checkpoint-shaped fixture (one small tensor per name, a few chunks long) gives one plane only while every projection
@@ -416,10 +481,15 @@ bool check_attention_staging() {
 
 int main() {
     if (!check_attention_certificate()) return 91;
+    if (!check_controller_certificate()) return 90;
     if (!check_attention_staging()) return 92;
     Fixture fixture;
     for (const auto& tensor : mini::mini_text_tensor_schema()) fixture.add(tensor);
     fixture.add({"model.visual.test.weight", "BF16", {4, 4}});
+    if (!check_controller_residency(fixture)) {
+        std::cerr << "controller routing must follow bytes staged from each checkpoint\n";
+        return 91;
+    }
 
     wei::TensorIndex indexed;
     const auto source = std::make_shared<HeaderSource>(fixture.header.dump(), fixture.payload_size);

@@ -228,10 +228,18 @@ struct Nvfp4Slab {
     std::atomic<std::size_t> next{0};
     // Join before inspecting results, including when launching a later worker throws.
     try {
-        std::vector<std::jthread> pool;
-        pool.reserve(threads);
+        // Plain threads joined on scope exit: std::jthread's stop state pulls the atomic-wait runtime into every
+        // translation unit that includes this header (HIP ones too), which not every toolchain's libstdc++ provides.
+        struct Workers {
+            std::vector<std::thread> list;
+            ~Workers() {
+                for (auto& worker : list)
+                    if (worker.joinable()) worker.join();
+            }
+        } pool;
+        pool.list.reserve(threads);
         for (unsigned t = 0; t < threads; ++t)
-            pool.emplace_back([&] {
+            pool.list.emplace_back([&] {
                 for (std::size_t expert = next++; expert < slab.experts; expert = next++) {
                     auto& entry = experts[expert];
                     try {

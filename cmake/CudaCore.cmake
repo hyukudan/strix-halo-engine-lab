@@ -238,6 +238,8 @@ endif()
 if(BUILD_TESTING)
     add_executable(strix-cuda-inkling2-mini-dense-test ${_cc_root}/tests/inkling2/mini_dense_cuda.cu)
     target_link_libraries(strix-cuda-inkling2-mini-dense-test PRIVATE strix_cuda_core_kernels)
+    add_executable(strix-cuda-inkling2-mini-controller-operand-test ${_cc_root}/tests/inkling2/mini_controller_operand_cuda.cu)
+    target_link_libraries(strix-cuda-inkling2-mini-controller-operand-test PRIVATE strix_cuda_core_kernels)
     add_executable(strix-cuda-inkling2-mini-residual-test ${_cc_root}/tests/inkling2/mini_residual_device.cu)
     target_link_libraries(strix-cuda-inkling2-mini-residual-test PRIVATE strix_cuda_core_kernels)
     add_executable(strix-cuda-inkling2-mini-short-conv-test ${_cc_root}/tests/inkling2/mini_short_conv_cuda.cu)
@@ -248,7 +250,7 @@ if(BUILD_TESTING)
     target_link_libraries(strix-cuda-resident-lowbit-refusal-test PRIVATE strix_cuda_core_kernels)
     set(_cc_mini_tests strix-cuda-inkling2-mini-short-conv-test strix-cuda-inkling2-mini-attention-test
         strix-cuda-inkling2-mini-dense-test strix-cuda-inkling2-mini-residual-test strix-cuda-inkling2-mini-step-graph-test
-        strix-cuda-resident-lowbit-refusal-test)
+        strix-cuda-inkling2-mini-controller-operand-test strix-cuda-resident-lowbit-refusal-test)
     if(TARGET strix_inkling2_mini_checkpoint)
         add_executable(strix-cuda-inkling2-mini-dspark-test ${_cc_root}/tests/inkling2/mini_dspark_device.cu)
         target_link_libraries(strix-cuda-inkling2-mini-dspark-test PRIVATE

@@ -64,8 +64,10 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.tier = resolution.profile;
     out.moe_w4a4 = mini_moe_w4a4_class(resolution);
     out.prepared_round_fold = mini_prepared_round_fold(resolution);
+    out.experts_nvfp4 = mini_experts_nvfp4(resolution);
     out.combine_image = mini_combine_image(resolution);
     out.served_route_requested = mini_served_cli_route(resolution);
+    out.controller_one_plane = mini_controller_one_plane(resolution);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();
@@ -115,7 +117,7 @@ public:
                   std::ranges::any_of(job.prompt, [](auto id) { return id >= kVocabulary; }))
                   throw std::invalid_argument("invalid Inkling prompt");
           }),
-          api_(api_config(model, opt.tier, std::move(chat)), tokenizer_, queue_, device_.backend->max_positions(),
+          api_(api_config(model, opt, std::move(chat)), tokenizer_, queue_, device_.backend->max_positions(),
                device_.backend->supports_final_logits()) {}
 
     serve::SessionRuntime& runtime() override { return cohort_.runtime(); }
@@ -130,13 +132,22 @@ public:
     }
 
 private:
-    serve::ApiConfig api_config(const std::string& model, profile::Name tier, MiniChat chat) {
+    serve::ApiConfig api_config(const std::string& model, const MiniServeOptions& opt, MiniChat chat) {
         serve::ApiConfig config;
         cohort_.configure_api(config);
-        config.capabilities_extra = [cohort = std::move(config.capabilities_extra), tier,
+        config.capabilities_extra = [cohort = std::move(config.capabilities_extra), tier = opt.tier,
+                                     requested = opt.served_route_requested, admitted = opt.served_cli_route,
                                      weights = device_.weights](serve::Json& value) {
             cohort(value);
             value.set("profile", serve::Json(mini_profile_name(tier)));
+            // The served route lever, only when requested (absent: the incumbent route, as before the lever): what was
+            // requested, what this backend admitted, and the qualification of the admitted route.
+            if (requested)
+                value.set("served_route", serve::Json(serve::Json::Object{
+                    {"requested", serve::Json(true)},
+                    {"admitted", serve::Json(admitted)},
+                    {"qualification", serve::Json(admitted ? "unqualified" : "n/a")},
+                }));
             value.set("weight_load", serve::Json(serve::Json::Object{
                 {"storage", serve::Json(weights.storage.name)},
                 {"revision", serve::Json(static_cast<std::uint64_t>(weights.storage.revision))},
@@ -211,15 +222,26 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
                 << " served_route " << mini_served_route_startup_field(opt)
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
                 << " profile " << mini_profile_name(opt.tier) << " speculation off";
-            if (kMiniWeightLoadDecisions.empty() || opt.tier == profile::Name::standard || opt.weight_options.disable_q8) {
-                const auto backend = resolved.backend == "hip" ? weight::Backend::hip : weight::Backend::cuda;
+            const auto backend = resolved.backend == "hip" ? weight::Backend::hip : weight::Backend::cuda;
+            // Without a device the plan is exact unless a full row (gate + gain) of this backend could select for this
+            // instance's extent there (the same extent make_mini_device_cohort resolves with).
+            const auto of_backend = [backend](const weight::WeightLoadDecision& row) { return row.scope.backend == backend; };
+            const weight::WeightLoadExtent extent{opt.context, opt.slots};
+            const bool device_dependent = opt.tier != profile::Name::standard && !opt.weight_options.disable_q8 &&
+                std::ranges::any_of(kMiniWeightLoadDecisions, [&](const weight::WeightLoadDecision& row) {
+                    return of_backend(row) && weight::weight_load_gain_selects(row, extent);
+                });
+            if (!device_dependent) {
                 const weight::WeightLoadScope scope{backend, {}, {}, {}, {}, {}};
-                const auto plan = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope);
+                const auto plan = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope, extent);
                 out << " weight_storage " << plan.storage.name << '@' << plan.storage.revision
                     << " weight_status " << profile::status_name(plan.status);
             } else {
                 out << " weight_status pending-device";
             }
+            if (std::ranges::any_of(kMiniWeightLoadDecisions, of_backend))
+                out << " weight_rows " << weight::registered_regime_rows(kMiniWeightLoadPolicy, backend,
+                                                                         kMiniWeightLoadRegimes, kMiniWeightLoadDecisions);
             out << '\n';
         },
         [backends = std::move(backends), tokenizer = std::move(tokenizer), chat = std::move(chat)]
