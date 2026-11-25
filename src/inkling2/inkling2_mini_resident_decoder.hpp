@@ -275,9 +275,9 @@ public:
     // class is bound (the final prompt token is then a prefill row on both entry points, so a served lane quantises
     // exactly the prompt rows of the command line); else the incumbent held-back route (prefill_slot).
     // A calibrated decode-only image (the TURBO low-bit row) takes the same form: the final prompt token is a BF16
-    // prefill row on both entry points, never a compact decode row on the server alone.
+    // prefill row on both entry points, never a compact decode row on the server alone (mini_served_prompt_emits_first).
     [[nodiscard]] bool prefill_emits_first() const noexcept {
-        return served_cli_route_ || backend_.moe_w4a4_bound() || calibrated_decode_;
+        return mini_served_prompt_emits_first(served_cli_route_, backend_.moe_w4a4_bound(), calibrated_decode_);
     }
     // The decode expert form this decoder was built with (packed or grouped), for receipts and fixtures.
     [[nodiscard]] bool packed_decode() const noexcept { return backend_.packed_decode(); }

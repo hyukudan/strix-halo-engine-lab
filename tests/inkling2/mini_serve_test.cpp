@@ -76,11 +76,10 @@ private:
 using FixtureCohort = sv::FixedKvCohort<FixtureDecoder>;
 
 void admission() {
-    require(!mini::mini_server_calibrated_row_allowed(true, false),
-            "a held-back HTTP prompt anchor cannot enter the calibrated decode row");
-    require(mini::mini_server_calibrated_row_allowed(true, true),
-            "the calibrated row remains available when served prefill emits its first token");
-    require(!mini::mini_server_calibrated_row_allowed(false, true), "unset calibration stays off on the served route");
+    require(mini::mini_served_prompt_emits_first(false, false, true),
+            "a calibrated decode image serves prompts emits-first on the default served route");
+    require(!mini::mini_served_prompt_emits_first(false, false, false),
+            "without a calibrated image, a W4A4 class or the route lever the held-back route stays");
     require(sv::fixed_kv_slots(99, 100, 3) == 0, "KV budget too small");
     require(sv::fixed_kv_slots(400, 100, 3) == 3, "row budget cap");
     require(sv::fixed_kv_slots(400, 100, 3, 1) == 1, "explicit slot cap");
@@ -601,8 +600,8 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                     "lever on: the command line's schedule and the served lane cap");
         }
         // The served tier is the registry preset's native column for the requested --profile (models/inkling2-mini.toml:
-        // TURBO keeps the FAST column until this model has a qualified TURBO set), resolved by the native command line's
-        // resolver with the same lever classes.
+        // TURBO runs the engine's TURBO column), resolved by the native command line's resolver with the same lever
+        // classes.
         const auto native = served_native_tier(tier_name);
         mini::MiniWeightOptions cli_weights;
         cli_weights.tier.profile = native;
@@ -896,8 +895,9 @@ int main(int argc, char** argv) try {
     for (const auto* backend : {"hip", "cuda"}) {
         wiring(argv[1], backend, false);
         wiring(argv[1], backend, true);
-        // The deployed TURBO preset with the served route switch unset: main's preset column, Q8 qualification included.
-        wiring(argv[1], backend, true, false, W4a4::bf16, "turbo");
+        // The deployed TURBO preset with the served route switch unset: the engine's TURBO column (the Q8_0
+        // qualification arm is FAST only, so the served TURBO preset runs without it).
+        wiring(argv[1], backend, false, false, W4a4::bf16, "turbo");
         // Every tier keeps the incumbent served shape without the lever, also for chunks above the context and
         // explicit slots.
         for (const auto* tier : {"exact", "fast", "turbo"})
