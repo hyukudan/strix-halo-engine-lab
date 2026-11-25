@@ -3,6 +3,7 @@
 set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
+source "$(dirname "${BASH_SOURCE[0]}")/gate-ticket.sh"
 rows=64
 vocabulary=200058
 # Candidate weight arm: STRIX_INKLING_GATE_WEIGHTS = shared policy key (default the Q8_0 policy; low-bit mixes
@@ -30,6 +31,7 @@ case "$cand_route" in
     row|decode-arm) [[ $lowbit_candidate == 1 ]] || { echo "$cand_route needs a low-bit candidate policy" >&2; exit 2; } ;;
     *) echo "STRIX_INKLING_GATE_ROUTE must be row, decode-arm or arm" >&2; exit 2 ;;
 esac
+ticket_settings="tier=$cand_tier policy=$weight_policy storage=$cand_storage route=$cand_route"
 
 usage() {
     echo "usage: $0 arm BIN MODEL MANIFEST OUT REF|REF2|NULL|CAND|CANDF|NULLF prefill|decode [--case NAME ...] [ENGINE_ARGS...]" >&2
@@ -123,8 +125,8 @@ check_outputs() {
 
 check_ticket() {
     local arm=$1
-    [[ -s "$out/$arm.ticket" ]] || fail "missing completed ticket: $arm"
-    [[ $(head -n 1 "$out/$arm.ticket") == "$mode $rows $inputs" ]] || fail "different gate inputs: $arm"
+    strix_gate_ticket_matches "$out/$arm.ticket" "$mode $rows $inputs $ticket_settings" ||
+        fail "different gate inputs, tier, policy, storage or route: $arm"
     cmp -s -- "$out/REF.ticket" "$out/$arm.ticket" || fail "different binary or checkpoint: $arm"
     shift
     if [[ -d "$out/tickets" ]]; then
@@ -219,7 +221,7 @@ case "$action" in
         # Checkpoint identity for this same-machine kit without re-reading the weights.
         model_identity=$(stat -Lc '%d %i %s %y %n' -- "$model")
         engine_args_hash=$(printf '%s\0' "$@" | sha256sum)
-        ticket=$(printf '%s\n' "$mode $rows $inputs" "$binary_hash" "$model_identity" "$engine_args_hash")
+        ticket=$(printf '%s\n' "$mode $rows $inputs $ticket_settings" "$binary_hash" "$model_identity" "$engine_args_hash")
         if [[ $arm != REF ]]; then
             check_ticket REF "${selected[@]}"
         fi
