@@ -398,6 +398,10 @@ int main(int argc, char** argv) {
             const char* dspark = drafter.enabled() && load.speculation == serve::CliSpeculation::automatic
                                      ? drafter.path.c_str() : nullptr;
             const strix::weight::WeightLoadExtent extent{load.positions, 1U};
+            if (const auto decline = mini_lowbit_row_decline(options.tier.profile, weight_options, kMiniWeightBackend,
+                                                             extent);
+                !decline.empty())
+                std::cerr << "strix-lowbit-pack/v2 declined (" << decline << "); using incumbent weights\n";
             loaded = resolve_weights(extent);
             const auto moe_w4a4 = mini_prompt_moe(weight_options, loaded->scope.device_class,
                                                  load.prompt_tokens, false, &options.tier);

@@ -88,10 +88,36 @@ inline bool mini_may_load_lowbit_row(profile::Name tier, const MiniWeightOptions
            });
 }
 
-// The HTTP held-back route sends each prompt's last token through decode_slots. It is still prefill work and must use
-// the BF16 route used to qualify the calibrated row. Only an emits-first served route can admit that row safely.
-inline constexpr bool mini_server_calibrated_row_allowed(bool requested, bool emits_first) noexcept {
-    return requested && emits_first;
+// Why a requested TURBO low-bit row does not load (empty: it may load, or it was not requested): the receipt line the
+// command line and the server print before loading the incumbent weights. The bands are the decision row's evidence.
+inline std::string mini_lowbit_row_decline(profile::Name tier, const MiniWeightOptions& options,
+                                           weight::Backend backend, weight::WeightLoadExtent extent) {
+    if (tier != profile::Name::turbo || !options.lowbit_turbo || mini_may_load_lowbit_row(tier, options, backend, extent))
+        return {};
+    if (options.disable_q8) return "--no-weight-q8 keeps every role BF16";
+    if (options.qualify != nullptr || options.qualify_q8) return "an explicit qualification arm names its own weights";
+    if (backend != weight::Backend::hip) return "measured on HIP gfx1151 only";
+    const auto& measured = kMiniLowBitMeasuredExtent;
+    if (extent.context == 0U || extent.context > measured.context)
+        return "context " + std::to_string(extent.context) + " outside the measured 1.." +
+               std::to_string(measured.context);
+    if (extent.lanes == 0U)
+        return "lanes not known (slot count left to the memory budget; --slots 1.." + std::to_string(measured.lanes) +
+               " admits it)";
+    if (extent.lanes > measured.lanes)
+        return "lanes " + std::to_string(extent.lanes) + " above the measured " + std::to_string(measured.lanes);
+    return "outside the row's measured regime";
+}
+
+// The served prompt form of a resident decoder (serve::FixedKvCohort reads it once, at its construction): emits-first
+// (the final prompt token is a prefill row of the lane's last prompt chunk) where the served route lever is admitted, a
+// W4A4 expert class is bound, or the calibrated decode-only image is bound; else the incumbent held-back route, which
+// sends the final prompt token through decode_slots. The calibrated image therefore never meets the held-back route:
+// its final prompt token is a BF16 prefill row on every served route, as on the command line, and only decode steps
+// read the compact copies.
+inline constexpr bool mini_served_prompt_emits_first(bool served_cli_route, bool moe_w4a4_bound,
+                                                     bool calibrated_decode) noexcept {
+    return served_cli_route || moe_w4a4_bound || calibrated_decode;
 }
 
 // Lookup and drafter speculation must verify against the same incumbent target for every verify width. Until the

@@ -241,7 +241,9 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
             require(exact.levers == Name::standard && fast.levers == Name::fast && fast.requested == Name::fast,
                     "explicit exact and FAST select their native columns");
             require(turbo.requested == Name::turbo, "explicit TURBO keeps its requested tier");
-            if (entry.family != "glm5" && entry.family != "minimax")
+            if (entry.family == "inkling2")
+                require(turbo.levers == Name::turbo, "Inkling served TURBO selects its native column");
+            else if (entry.family != "glm5" && entry.family != "minimax")
                 require(turbo.levers == fast.levers, "other presets project TURBO to FAST");
             require(exact.kv != "fp8" && fast.kv != "fp8", "FP8 KV shadow is TURBO only");
             require((turbo.kv == "fp8") == (entry.family == "qwen35" && std::string_view(backend) == "cuda"),

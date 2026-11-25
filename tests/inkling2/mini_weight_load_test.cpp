@@ -321,14 +321,28 @@ void test_lowbit_receipts() {
     const auto pick = [&](weight::WeightLoadScope scope, weight::WeightLoadExtent shape) {
         return mini::resolve_mini_resident_weight_load(profile::Name::turbo, options, scope, shape);
     };
+    // No TURBO default (slower than FAST at B=1 with the screened BF16 head): the row loads only on explicit request.
     options.lowbit_turbo = mini::mini_lowbit_turbo(mini::resolve_mini_profile(options, true));
     require(!options.lowbit_turbo && !is_q4(pick(turbo.scope, extent)),
             "TURBO defaults to the incumbent with a matching receipt");
+    require(mini::mini_lowbit_row_decline(profile::Name::turbo, options, weight::Backend::hip, {16384U, 0U}).empty(),
+            "an unrequested row prints no decline");
 
     options.tier.env = [](std::string_view key) { return key == "STRIX_INK_LOWBIT_TURBO" ? "1" : nullptr; };
     options.lowbit_turbo = mini::mini_lowbit_turbo(mini::resolve_mini_profile(options, true));
     require(options.lowbit_turbo && is_q4(pick(turbo.scope, extent)),
-            "TURBO opt-in admits a matching row at the measured caps");
+            "explicit TURBO opt-in admits a matching row at the measured caps");
+    require(mini::mini_lowbit_row_decline(profile::Name::turbo, options, weight::Backend::hip, extent).empty(),
+            "no decline inside the measured regime");
+    require(!mini::mini_lowbit_row_decline(profile::Name::turbo, options, weight::Backend::hip, {16384U, 0U}).empty() &&
+                !mini::mini_lowbit_row_decline(profile::Name::turbo, options, weight::Backend::hip, {16385U, 1U}).empty() &&
+                !mini::mini_lowbit_row_decline(profile::Name::turbo, options, weight::Backend::cuda, extent).empty(),
+            "outside the measured regime the receipt states the decline");
+    for (const auto below : {profile::Name::standard, profile::Name::fast}) {
+        auto lower = options;
+        lower.tier.profile = below;
+        require(!mini::mini_lowbit_turbo(mini::resolve_mini_profile(lower, true)), "EXACT and FAST keep BF16 weights");
+    }
     require(is_q4(pick(turbo.scope, {8192U, 1U})), "the caps include serial decode");
     for (const auto outside : {weight::WeightLoadExtent{16385U, 16U}, {16384U, 17U}, {0U, 16U}, {16384U, 0U}})
         require(!is_q4(pick(turbo.scope, outside)), "out-of-band or unknown extent keeps the incumbent");

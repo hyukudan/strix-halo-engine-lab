@@ -65,9 +65,10 @@ levers = "exact"
 [presets.fast]
 levers = "fast"
 
-# Use the admitted FAST levers until this model has a qualified TURBO set.
+# The engine's TURBO column: a TURBO cell without its own value takes the FAST one, and explicit TURBO levers (the
+# calibrated q4 decode row, STRIX_INK_LOWBIT_TURBO=1) resolve on the served route as on the command line.
 [presets.turbo]
-levers = "fast"
+levers = "turbo"
 
 # Multi-device placement, resolved by the shared profile resolver (strix-serve --model inkling2-mini --device-count N, strix-router
 # --description). Two whole-model nodes serve independent requests as replicas behind strix-router: each request

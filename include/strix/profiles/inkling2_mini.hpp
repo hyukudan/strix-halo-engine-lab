@@ -42,7 +42,13 @@ inline constexpr std::span<const weight::WeightLoadDecision> kMiniWeightLoadDeci
 // head row passed every class and the pooled bars but failed dNLL on two prose windows, so FAST keeps the BF16 image
 // and the q4 head is part of the TURBO mix only.
 inline constexpr weight::WeightLoadPolicy kMiniFastWeightPolicy = weight::kHeadQ4Policy;
-// The explicit TURBO lever can admit this mix through a matching low-bit decision row.
+// The explicit TURBO lever (STRIX_INK_LOWBIT_TURBO=1) admits this mix, attention projections and head in q4_g64 from
+// the calibrated pack, only through a matching low-bit decision row (kMiniLowBitDecisions: backend, device, measured
+// context / lanes / step widths); outside the row the incumbent BF16 image loads and the receipt says why
+// (mini_lowbit_row_decline). It is not a TURBO default: since the HIP greedy pick screens the BF16 head, the row decodes
+// slower than FAST at B=1 (served, 16 slots, context 16384, ABBA: 20.08 / 20.10 against 23.10 / 23.70 tok/s) and within
+// FAST's own spread at C8 / C16 (48.80 / 48.80 against 47.60 / 49.02; 58.79 / 59.02 against 55.74 / 58.19), so the
+// ladder rule leaves TURBO on the tier below. The row's stated gain (kMiniLowBitDecisionRows) predates the screened head.
 inline constexpr std::string_view kMiniLowBitTurbo = "inkling2-mini-lowbit-turbo@1";
 inline constexpr std::string_view kMiniLowBitPackFile = "inkling2-mini-q4.lowbit-pack";
 inline constexpr weight::WeightLoadPolicy kMiniTurboWeightPolicy = weight::kAttentionHeadQ4Policy;
@@ -226,7 +232,8 @@ inline constexpr std::array<profile::Lever, 13> kMiniLevers{{
     {.name = kMiniLowBitTurbo, .env = "STRIX_INK_LOWBIT_TURBO", .option = "",
      .value = {"", "", "", ""}, .builtin = "0", .kind = profile::Kind::bit_changing,
      .ready = {}, .runnable = {false, false, false, true}, .target = "1", .off = "0",
-     .source = "docs/engine/lowbit-calibration.md (calibrated HIP decode at widths 1, 8 and 16)",
+     .source = "docs/engine/lowbit-calibration.md (calibrated HIP decode at widths 1, 8 and 16); no TURBO default: "
+               "slower than FAST at B=1 with the screened BF16 head, within noise at C8 / C16",
      .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniVerifyRows, .env = "STRIX_INK_VERIFY_ROWS", .option = "",
      .value = {"", "", "", ""}, .builtin = "0",
