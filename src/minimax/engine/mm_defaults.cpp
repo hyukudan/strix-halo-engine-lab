@@ -340,7 +340,26 @@ const profile::Engine& profile_engine() {
     return engine;
 }
 
+namespace {
+// STRIX_MM_PF_DENSE_TAIL_FIXED as profile_resolution reads it: unset / 0 / 1, and 1 only inside the invariant
+// EXL3 order outside the FP32 prefill identity. A combination that would print and stamp v2 while another route
+// runs throws (rank and serve resolve it at startup, before the pair connects).
+void validate_dense_tail_request(const Lookup& env) {
+    const char* v = env("STRIX_MM_PF_DENSE_TAIL_FIXED");
+    if (v == nullptr || std::strcmp(v, "0") == 0) return;
+    if (std::strcmp(v, "1") != 0)
+        throw std::invalid_argument("STRIX_MM_PF_DENSE_TAIL_FIXED: 0 (library dense MLP tails, default) or 1 (fixed order)");
+    if (linear_order(env) != "invariant")
+        throw std::invalid_argument("STRIX_MM_PF_DENSE_TAIL_FIXED=1 needs STRIX_MMX_PF_ORDER=invariant (the adaptive order, "
+                                    "also selected by the baseline, keeps the library dense tails)");
+    if (route::fp32_profile(env("STRIX_MM_PREFILL_IDENTITY")))
+        throw std::invalid_argument("STRIX_MM_PF_DENSE_TAIL_FIXED=1 conflicts with STRIX_MM_PREFILL_IDENTITY=fp32 (the FP32 "
+                                    "prefill linears do not run the fixed-order dense tails)");
+}
+}  // namespace
+
 profile::Resolution profile_resolution(const Lookup& env) {
+    validate_dense_tail_request(env);  // the dense tail row is resolved and validated here, once, for every reader
     const auto p = prefill_policy(env);
     const auto base = strix::fast_profile::lookup(p.canonical, env);
     const std::string effective_mode = std::to_string(p.msa_flash);
@@ -429,19 +448,11 @@ void check_peer(const std::function<void(const void*, void*, std::size_t)>& exch
 }
 
 bool dense_tail_fixed(const Lookup& env) {
-    const char* v = env("STRIX_MM_PF_DENSE_TAIL_FIXED");
-    if (v == nullptr || std::strcmp(v, "0") == 0) return false;
-    if (std::strcmp(v, "1") != 0)
-        throw std::invalid_argument("STRIX_MM_PF_DENSE_TAIL_FIXED: 0 (library dense MLP tails, default) or 1 (fixed order)");
-    // The fixed tails exist only inside the invariant EXL3 order: refuse a combination that would print and stamp v2
-    // while another route runs (rank and serve validate it at startup, before the pair connects).
-    if (linear_order(env) != "invariant")
-        throw std::invalid_argument("STRIX_MM_PF_DENSE_TAIL_FIXED=1 needs STRIX_MMX_PF_ORDER=invariant (the adaptive order, "
-                                    "also selected by the baseline, keeps the library dense tails)");
-    if (route::fp32_profile(env("STRIX_MM_PREFILL_IDENTITY")))
-        throw std::invalid_argument("STRIX_MM_PF_DENSE_TAIL_FIXED=1 conflicts with STRIX_MM_PREFILL_IDENTITY=fp32 (the FP32 "
-                                    "prefill linears do not run the fixed-order dense tails)");
-    return true;
+    // One authority: the row of the shared profile resolution, validated inside it (the same answer the
+    // fingerprint, the effective config and the rank agreement carry). A conflicting request throws there.
+    const auto pr = profile_resolution(env);
+    const auto* row = pr.find("pf_dense_tail_fixed");
+    return row != nullptr && row->value == "1";
 }
 std::string invariant_order_id(const Lookup& env) {
     return dense_tail_fixed(env) ? kInvariantDenseTailOrderId : kInvariantOrderId;

@@ -94,8 +94,9 @@ grep -q 'SKIP verify-r8' "$tmp/nemotron-quality"
 if bash scripts/bench/bench.sh run --engine nemotron --profile r1 --dry-run >/dev/null 2>&1; then exit 1; fi
 bash scripts/bench/bench.sh run --engine minimax-pair --profile baseline --suite quick --only serve --peer node-b \
     --peer-repo /path/to/repo --dry-run >"$tmp/minimax-baseline" 2>&1
-grep -q 'SKIP serve: the MiniMax baseline prefill order is rank-only' "$tmp/minimax-baseline"
-if grep -q 'strix-minimax-serve' "$tmp/minimax-baseline"; then printf 'the MiniMax baseline must not plan a server\n' >&2; exit 1; fi
+if grep -q 'SKIP serve' "$tmp/minimax-baseline"; then printf 'the MiniMax baseline serve arm must be planned\n' >&2; exit 1; fi
+grep -q '^node A: env STRIX_MM_BASELINE=1 [^ ]*strix-minimax-serve .*--rank 0 ' "$tmp/minimax-baseline"
+grep '^node B (SSH, setsid' "$tmp/minimax-baseline" | grep 'STRIX_MM_BASELINE=1' | grep 'strix-minimax-serve' | grep -q 'rank.*1'
 printf 'PASS all six dry-runs, no GPU/assets/SSH execution\n'
 bash scripts/bench/tests/effective_config.sh
 bash scripts/bench/tests/single_config.sh

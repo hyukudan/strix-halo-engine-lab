@@ -763,6 +763,25 @@ void test_fast_prefill_profile() {
             bool rejected = false;
             try { (void)md::prefill_identity(lookup(bad)); } catch (const std::invalid_argument&) { rejected = true; }
             check(rejected, "dense tail: no v2 cache identity for a conflicting order / FP32 identity");
+            // The shared resolution itself is the one authority: it refuses, so dispatch, fingerprint and rank
+            // agreement can never record an explicit ON beside a route that does not run it.
+            for (const bool via_dispatch : {false, true}) {
+                bool refused = false;
+                try {
+                    if (via_dispatch) (void)md::dense_tail_fixed(lookup(bad));
+                    else (void)md::profile_resolution(lookup(bad));
+                } catch (const std::invalid_argument& e) {
+                    refused = std::string(e.what()).find("STRIX_MM_PF_DENSE_TAIL_FIXED=1") != std::string::npos;
+                }
+                check(refused, via_dispatch ? "dense tail: the dispatch reader refuses a conflicting request"
+                                            : "dense tail: the shared resolution refuses a conflicting request");
+            }
+        }
+        for (const char* junk : {"2", "on"}) {
+            bool refused = false;
+            try { (void)md::profile_resolution(lookup(EnvMap{{"STRIX_MM_PF_DENSE_TAIL_FIXED", junk}})); }
+            catch (const std::invalid_argument&) { refused = true; }
+            check(refused, std::string("dense tail: the resolution refuses value '") + junk + "'");
         }
         // The lever is a row of the shared profile table: resolved, fingerprinted and agreed by both ranks when ON.
         {
@@ -771,9 +790,16 @@ void test_fast_prefill_profile() {
             check(row != nullptr && row->value == "1" && row->status == strix::profile::Status::explicit_env &&
                       fp(tail) != none_fp,
                   "dense tail: explicit row of the shared profile table, part of the agreement fingerprint");
-            const auto* off_row = md::profile_resolution(lookup(off)).find("pf_dense_tail_fixed");
+            check(md::dense_tail_fixed(lookup(tail)), "dense tail: the dispatch reader returns the resolved ON row");
+            const auto off_pr = md::profile_resolution(lookup(off));  // keep the resolution alive while its row is read
+            const auto* off_row = off_pr.find("pf_dense_tail_fixed");
             check(off_row != nullptr && off_row->value == "0" && off_row->status == strix::profile::Status::builtin,
                   "dense tail: default OFF builtin row");
+            const EnvMap zero{{"STRIX_MM_PF_DENSE_TAIL_FIXED", "0"}};
+            const auto zero_pr = md::profile_resolution(lookup(zero));
+            const auto* zero_row = zero_pr.find("pf_dense_tail_fixed");
+            check(zero_row != nullptr && zero_row->value == "0" && !md::dense_tail_fixed(lookup(zero)),
+                  "dense tail: explicit 0 resolves OFF");
         }
         check(fp(off) == none_fp, "fast profile: rows at builtin leave the legacy fingerprint unchanged");
         for (const auto& e : md::profile_resolution(lookup(off)).entries)
