@@ -39,6 +39,17 @@ inline void verify_rows(const char* checkpoint, weight::FormatId storage, bool p
     const unsigned capacity = decoder.lanes_pick_capacity();
     std::cout << "INFO verify rows level " << admitted << " (" << level << " selected), round fold "
               << (folded ? "on" : round_fold ? "declined" : "off") << ", lanes pick capacity " << capacity << '\n';
+    // A fallback must not silently qualify the HIP verification route. CUDA deliberately declines it;
+    // HIP level 2 may fall back to level 1 when the screened head cannot supply multiple lanes.
+#if defined(__HIPCC__)
+    const bool correct_level = level == 0U ? admitted == 0U :
+                               level == 1U ? admitted == 1U : (admitted == 1U || admitted == 2U);
+#else
+    const bool correct_level = admitted == 0U;
+#endif
+    if (!correct_level)
+        throw std::logic_error("verify rows admission mismatch: selected " + std::to_string(level) +
+                               ", admitted " + std::to_string(admitted));
     if ((admitted == 2U) != (capacity >= 2U)) throw std::logic_error("verify rows level 2 without its lanes capacity");
     const auto prompt = ids.first(prefix_rows);
     (void)decoder.prefill(prompt);
