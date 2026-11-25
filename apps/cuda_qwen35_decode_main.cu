@@ -519,7 +519,8 @@ int main(int argc, char** argv) {
             for (auto t : top1) std::printf(" %u", t);
             std::printf("\n");
         }
-        std::fprintf(stderr, "prefill %zu tokens in %.2f s (rows %u)\n", prompt.size(), prefill_s, rows_cap);
+        if (pf_arith.empty() || df)  // the windows loop ran (the large route prints its prefill[i/n] lines above)
+            std::fprintf(stderr, "prefill %zu tokens in %.2f s (rows %u)\n", prompt.size(), prefill_s, rows_cap);
 
         // greedy decode; decode_rows > 1 times an R-row window (tokens = the greedy token repeated, all committed)
         std::vector<std::uint32_t> gen;
