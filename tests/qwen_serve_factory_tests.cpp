@@ -212,6 +212,31 @@ void check_discovered_drafter(const std::string& root) {
     std::error_code ignored;
     std::filesystem::remove_all(dir, ignored);
 }
+// The documented serving quick start (docs/models/qwen3.8/README.md): calibration ids, a bundle and a long
+// context, with no --mtp pins, no golden flags and no --known-prefix-* flags, resolves the tiled MTP route.
+void check_quick_start(const std::string& root) {
+    const auto dir = std::filesystem::temp_directory_path() / "strix-serve-quick-start";
+    std::filesystem::create_directories(dir);
+    const auto ids = dir / "calibration.ids";
+    {
+        std::ofstream file(ids);
+        for (unsigned id = 1; id <= 17; ++id) file << id << (id == 17 ? "\n" : " ");
+    }
+    const auto bundle = (std::filesystem::path(root) / "recipes/qwen-distill-g-yarn.mtp-bundle.json").string();
+    for (const char* context : {"8192", "36864"}) {
+        const auto options = legacy_options({"strix-hip-decode-token", "fixture-missing.gguf", "--prompt-ids", ids.string(),
+            "--generate", "64", "--context", context, "--mtp-bundle", bundle, "--http-serve"});
+        CHECK(options.http_serve && options.mtp.enabled && options.mtp_native_bundle && options.mtp.golden.empty() &&
+              !options.known_prefix_window);
+    }
+    // The bare command (no calibration prompt) is refused: the requirement is inherent.
+    bool refused = false;
+    try { (void)legacy_options({"strix-hip-decode-token", "fixture-missing.gguf", "--mtp-bundle", bundle, "--http-serve"}); }
+    catch (const std::exception&) { refused = true; }
+    CHECK(refused);
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -220,6 +245,7 @@ int main(int argc, char** argv) {
         check_factory(argv[1]);
         check_http_capabilities();
         check_discovered_drafter(argv[1]);
+        check_quick_start(argv[1]);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
