@@ -143,7 +143,8 @@ public:
 #endif
           weights_(upload_weights(controller_one_plane)), backend_(weights_, max_rows_, stream_.get(), packed_decode, step_graphs,
                                                      admits_served_route(served_route)),
-          served_cli_route_(admits_served_route(served_route)), greedy_(decode_rows_, kOutputVocabulary) {
+          served_cli_route_(admits_served_route(served_route)),
+          calibrated_decode_(lowbit.admitted != nullptr && lowbit.decode_only), greedy_(decode_rows_, kOutputVocabulary) {
 #if defined(__HIPCC__)
         // EXACT screened greedy head (core/hip_screened_head.hpp) over the BF16 head: same token and status as the
         // full head. A compact head keeps its own full head.
@@ -264,7 +265,11 @@ public:
     // where the decoder was built with the served route lever and the backend admits it (HIP), or while a W4A4 expert
     // class is bound (the final prompt token is then a prefill row on both entry points, so a served lane quantises
     // exactly the prompt rows of the command line); else the incumbent held-back route (prefill_slot).
-    [[nodiscard]] bool prefill_emits_first() const noexcept { return served_cli_route_ || backend_.moe_w4a4_bound(); }
+    // A calibrated decode-only image (the TURBO low-bit row) takes the same form: the final prompt token is a BF16
+    // prefill row on both entry points, never a compact decode row on the server alone.
+    [[nodiscard]] bool prefill_emits_first() const noexcept {
+        return served_cli_route_ || backend_.moe_w4a4_bound() || calibrated_decode_;
+    }
     // The decode expert form this decoder was built with (packed or grouped), for receipts and fixtures.
     [[nodiscard]] bool packed_decode() const noexcept { return backend_.packed_decode(); }
 
@@ -1162,6 +1167,7 @@ private:
     std::vector<unsigned> pass_ids_;    // decode_slots input snapshot
     std::vector<unsigned> pass_picks_;  // decode_slots picks, published after the last pass
     bool served_cli_route_;             // served route lever, fixed at construction (admits_served_route)
+    bool calibrated_decode_;            // calibrated decode-only image bound (BF16 prefill rows, compact decode rows)
     core::ResidentGreedy greedy_;
     std::optional<mini_gpu::Buffer<float>> verify_logits_;
     std::optional<core::ResidentGreedy> verify_greedy_;
