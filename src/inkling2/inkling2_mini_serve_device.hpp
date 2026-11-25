@@ -23,6 +23,12 @@ inline device::Request mini_serve_device_request(const MiniServeOptions& opt) {
     return request;
 }
 
+#if defined(__HIPCC__)
+inline constexpr bool kServeHip = true;
+#else
+inline constexpr bool kServeHip = false;
+#endif
+
 inline MiniServeCohort make_mini_device_cohort(
     const MiniServeOptions& opt, const device::MemoryBudget& budget, std::string_view backend,
     unsigned row_limit = std::numeric_limits<unsigned>::max()) {
@@ -61,7 +67,7 @@ inline MiniServeCohort make_mini_device_cohort(
         const auto ladder = mini_served_chunk_ladder(opt.prefill_rows, opt.prefill_fallback_rows);
         const auto load = [&](std::uint32_t chunk, bool last) {
             auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, chunk,
-                opt.served_cli_route && kMiniPackedDecodeDefault, MiniResidentBackend::default_step_graphs,
+                mini_served_packed_decode(kServeHip, opt.served_cli_route), MiniResidentBackend::default_step_graphs,
                 weights.roles(), 0U, false, rows, opt.served_cli_route ? opt.prefill_tail : 0U,
                 opt.experts_nvfp4, opt.controller_one_plane, opt.served_cli_route, lowbit);
             levers = configure_mini_decoder(*decoder, opt.moe_w4a4, opt.combine_image, opt.prepared_round_fold,
@@ -118,7 +124,10 @@ inline MiniServeCohort make_mini_device_cohort(
         return std::move(admitted.service);
     });
     std::cerr << "Inkling " << backend << " slots " << lanes << " context " << opt.context
-              << " prefill_chunk " << chunk_rows << " KV and history bytes per slot " << slot_bytes
+              << " prefill_chunk " << chunk_rows
+              << " moe_decode " << mini_decode_form_name(mini_served_packed_decode(kServeHip, opt.served_cli_route))
+              << (!kServeHip && kMiniPackedDecodeDefault ? "-lone" : "")
+              << " KV and history bytes per slot " << slot_bytes
               << " slot budget free bytes " << admission_free
               << " profile " << mini_profile_name(opt.tier)
               << " moe_prefill " << moe_core::grouped_w4a4::identity(opt.moe_w4a4)

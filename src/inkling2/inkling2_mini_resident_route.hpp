@@ -22,6 +22,15 @@ constexpr bool mini_packed_decode(bool packed_flag, bool grouped_flag) {
 
 constexpr const char* mini_decode_form_name(bool packed_decode) noexcept { return packed_decode ? "packed" : "grouped"; }
 
+// Served decode expert form, fixed at decoder construction. HIP: the packed form only with the admitted served route
+// lever (`cli_route`, which also packs cohort rows); without it the incumbent grouped form. CUDA: the packed form, as the
+// command line: a lone lane runs the packed one-row body (RTX q36, origin/main: CLI grouped 66.3 vs packed 89.1 tok/s,
+// served C1 66.5 = the grouped form); a cohort pass of two or more lanes keeps the grouped tile kernel (no packed cohort
+// rows without the lever), and every lane's bits equal its lone packed run (cohort-lanes fixture, widths 2..17).
+constexpr bool mini_served_packed_decode(bool hip, bool cli_route) noexcept {
+    return hip ? cli_route && kMiniPackedDecodeDefault : kMiniPackedDecodeDefault;
+}
+
 enum class MiniAppendKind { prefill, decode, verify };
 
 struct MiniResidentRoute {
