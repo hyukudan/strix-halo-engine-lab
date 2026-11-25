@@ -235,6 +235,12 @@ int rows_select_ticket(const std::vector<unsigned>& shapes) {
     constexpr auto select = core::LowBitArithmetic::f16_rows_select;
     constexpr auto sweep = core::LowBitArithmetic::fp32_sweep;
     const std::string arch(core::detail::current_device_arch());
+    {
+        // The f16 form's incumbent at these rows is the small-M route of the device plan (unbound: the tile everywhere).
+        int dev = 0;
+        ok(hipGetDevice(&dev), "device");
+        report(strix::device::bind_lowbit_rows(dev, {64U, 64U}), "rows-select: bind the declared plan small_rows=64 wide_panels=64");
+    }
     std::cout << "rows-select arch=" << arch << " identity=" << core::kLowBitRowsSelectIdentity.name << '@'
               << core::kLowBitRowsSelectIdentity.revision << '\n';
     const std::vector<unsigned> check_rows{1U, 2U, 3U, 4U, 8U, 16U, 17U}, bench_rows{1U, 2U, 4U, 8U};
