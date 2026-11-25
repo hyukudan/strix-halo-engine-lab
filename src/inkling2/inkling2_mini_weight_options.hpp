@@ -34,9 +34,9 @@ struct MiniWeightOptions {
 
 // The bindings a qualification key may name: the model's Q8_0 binding (legacy id included), the shared low-bit mixes and
 // the shared head-only low-bit rows (attention BF16).
-inline constexpr std::array<weight::WeightLoadPolicy, 6> kMiniQualifiablePolicies{
+inline constexpr std::array<weight::WeightLoadPolicy, 7> kMiniQualifiablePolicies{
     kMiniWeightLoadPolicy, weight::kAttentionHeadQ6Policy, weight::kAttentionQ4HeadQ6Policy,
-    weight::kAttentionHeadQ4Policy, weight::kHeadQ6Policy, weight::kHeadQ4Policy};
+    weight::kAttentionHeadQ4Policy, weight::kHeadQ6Policy, weight::kHeadQ4Policy, kMiniSp4HeadPolicy};
 
 inline const weight::WeightLoadPolicy& mini_weight_load_policy(const MiniWeightOptions& options) {
     if (options.qualify == nullptr || weight::same_id(options.qualify->id, kMiniWeightLoadPolicy.id))
@@ -49,7 +49,13 @@ inline constexpr auto kMiniLowBitArithmetic = core::LowBitArithmetic::f16_group_
 inline constexpr auto& kMiniLowBitConsumers = core::kResidentLowBitTileArithmeticHip;
 
 inline bool mini_lowbit_storage(weight::FormatId f) {
-    return f == weight::kQ4G64WeightStorage || f == weight::kQ6G64WeightStorage;
+    return f == weight::kQ4G64WeightStorage || f == weight::kQ6G64WeightStorage || f == weight::kSP4TWeightStorage;
+}
+
+// Consumer identity of a low-bit load: the SP4 head runs its own arithmetic (core::kResidentSp4ArithmeticHip).
+inline std::span<const weight::ArithmeticId> mini_lowbit_consumers(weight::FormatId head) {
+    if (head == weight::kSP4TWeightStorage) return core::kResidentSp4ArithmeticHip;
+    return kMiniLowBitConsumers;
 }
 
 // The decode-only qualification arm keeps the incumbent BF16 tensors beside the compact
@@ -75,6 +81,24 @@ inline bool mini_lowbit_turbo(const profile::Resolution& tier) {
     if (entry == nullptr || entry->value == "0") return false;
     if (entry->value != "1") throw std::invalid_argument("STRIX_INK_LOWBIT_TURBO must be 0 or 1");
     return tier.profile == profile::Name::turbo;
+}
+
+// STRIX_INK_LOWBIT_HEAD: "sp4t" selects the SP4 head arm in FAST or TURBO; "0" (builtin) leaves the head as is.
+inline bool mini_lowbit_head(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniLowBitHead);
+    if (entry == nullptr || entry->value == "0") return false;
+    if (entry->value != "sp4t") throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD must be 0 or sp4t");
+    return tier.profile == profile::Name::fast || tier.profile == profile::Name::turbo;
+}
+
+// The lever's arm is the decode-only head qualification arm of kMiniSp4HeadPolicy: it needs STRIX_LOWBIT_PACK and
+// combines with no other weight arm.
+inline void apply_mini_lowbit_head(MiniWeightOptions& options, const profile::Resolution& tier) {
+    if (!mini_lowbit_head(tier)) return;
+    if (options.qualify != nullptr || options.qualify_q8 || options.lowbit_turbo || options.disable_q8)
+        throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD=sp4t combines with no other weight arm");
+    options.qualify = &kMiniSp4HeadPolicy;
+    options.qualify_decode_only = true;
 }
 
 inline bool mini_may_load_lowbit_row(profile::Name tier, const MiniWeightOptions& options,
@@ -119,12 +143,13 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
         options.qualify_decode_only = argument == "--qualify-decode-weights";
         const std::string_view key(value());
         options.qualify = weight::find_weight_load_policy(key, kMiniQualifiablePolicies);
-        bool bound = false;
+        const bool strixpack = options.qualify && weight::is_strixpack_storage(options.qualify->target);
+        bool bound = strixpack;
         for (const auto& binding : kMiniQualifiablePolicies)
             bound = bound || (options.qualify != nullptr && weight::same_id(binding.id, options.qualify->id));
         if (!bound) throw std::invalid_argument("--qualify-weights: unknown or unbound weight policy " + std::string(key));
         options.qualify_q8 = weight::same_id(options.qualify->id, kMiniWeightLoadPolicy.id);
-        if (options.qualify_decode_only && !mini_lowbit_storage(options.qualify->head_target()))
+        if (options.qualify_decode_only && !strixpack && !mini_lowbit_storage(options.qualify->head_target()))
             throw std::invalid_argument("--qualify-decode-weights requires a low-bit head");
     } else if (native && argument == "--no-weight-q8") {
         options.disable_q8 = true;
@@ -334,8 +359,31 @@ inline constexpr std::string_view kMiniBuildBackend = "hip";
 inline constexpr std::string_view kMiniBuildBackend = "cuda";
 #endif
 
+inline profile::Resolution resolve_mini_weight_profile(const MiniWeightOptions& options, profile::Inputs inputs) {
+    if (options.qualify && weight::is_strixpack_storage(options.qualify->target)) {
+        const auto entry = std::ranges::find_if(kMiniProfile.table, [&](const profile::Lever& lever) {
+            return weight::id_has_key(options.qualify->id, lever.name);
+        });
+        if (entry != kMiniProfile.table.end()) inputs.cli.emplace_back(entry->name, entry->target);
+    }
+    return profile::resolve(kMiniProfile, inputs);
+}
+
+inline std::optional<weight::StrixPackLoad> admit_mini_strixpack_receipt(profile::Resolution& tier) {
+    const auto load = weight::bind_strixpack_load(tier);
+    if (!tier.allow_pending)
+        std::erase_if(tier.entries, [](const profile::Entry& entry) {
+            const auto* policy = entry.lever ? weight::find_weight_load_policy(entry.lever->name) : nullptr;
+            return policy && weight::is_strixpack_storage(policy->target) && entry.reason.empty();
+        });
+    return load;
+}
+
 inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options, bool native_execution) {
-    auto tier = profile::resolve(kMiniProfile, options.tier);
+    auto tier = resolve_mini_weight_profile(options, options.tier);
+    // Native CLI (including the CUDA step program), gate and server admit the weight request before routing.
+    if (const auto load = admit_mini_strixpack_receipt(tier); native_execution && load)
+        load->require_loadable();
     tier.weights.require_honoured();
     if (options.qualify_q8 && (tier.profile != profile::Name::fast || options.disable_q8 || !native_execution))
         throw std::invalid_argument("--qualify-q8 requires --profile fast and native model execution");
@@ -354,6 +402,7 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
     require_mini_expert_consumer(tier, native_execution);
     static_cast<void>(mini_controller_one_plane(tier));
     static_cast<void>(mini_lowbit_turbo(tier));
+    static_cast<void>(mini_lowbit_head(tier));
     spec::require_block_draft_execution(spec::block_draft_selection(tier));
     return tier;
 }
@@ -380,7 +429,8 @@ inline moe_core::grouped_w4a4::Activations mini_prompt_moe(const MiniWeightOptio
                                                          bool print = true, profile::Resolution* receipt = nullptr) {
     auto inputs = options.tier;
     inputs.regime = {profile::Phase::prefill, tokens, 1, device};
-    auto selected = profile::resolve(kMiniProfile, inputs);
+    auto selected = resolve_mini_weight_profile(options, inputs);
+    admit_mini_strixpack_receipt(selected);
     if (print)
         for (const auto& entry : selected.entries)
             if (!entry.ladder.empty()) std::cerr << entry.ladder << '\n';
@@ -413,20 +463,35 @@ inline std::string admit_mini_lowbit_pack(const std::string& file, const weight:
 inline weight::WeightLoadPlan resolve_mini_resident_weight_load(profile::Name tier, const MiniWeightOptions& options,
                                                               const weight::WeightLoadScope& scope,
                                                               weight::WeightLoadExtent extent = {}) {
+    auto inputs = options.tier;
+    inputs.profile = tier;
+    auto resolved = resolve_mini_weight_profile(options, std::move(inputs));
+    const auto strixpack = weight::bind_strixpack_load(resolved);
+    if (strixpack && strixpack->refused) {
+        weight::WeightLoadPlan refused{strixpack->policy, weight::kBf16WeightStorage, profile::Status::pending,
+                                       strixpack->reason()};
+        refused.strixpack = strixpack;
+        return refused;
+    }
     constexpr std::array consumers{weight::kBf16WeightStorage, weight::kQ8WeightStorage,
-                                   weight::kQ4G64WeightStorage, weight::kQ6G64WeightStorage};
-    const std::span<const weight::FormatId> formats(consumers.data(), scope.backend == weight::Backend::hip ? 4U : 2U);
+                                   weight::kQ4G64WeightStorage, weight::kQ6G64WeightStorage,
+                                   weight::kSP4TWeightStorage};
+    const std::span<const weight::FormatId> formats(consumers.data(), scope.backend == weight::Backend::hip ? 5U : 2U);
     const auto& policy = mini_weight_load_policy(options);
     const bool qualify = options.qualify_q8 || options.qualify != nullptr;
     if (mini_may_load_lowbit_row(tier, options, scope.backend, extent)) {
         auto candidate = mini_lowbit_receipt_plan(tier, scope, extent);
-        if (mini_lowbit_storage(candidate.head_storage)) return candidate;
+        if (mini_lowbit_storage(candidate.head_storage)) {
+            candidate.strixpack = strixpack;
+            return candidate;
+        }
     }
     // The resident image serves every request from one position and one lane up to extent.
     auto plan = weight::resolve_weight_load(weight::builtin_registry(), policy,
         {tier, scope, formats, !options.disable_q8, qualify, kMiniWeightLoadRegimes, extent, {1, 1}}, kMiniWeightLoadDecisions);
     if (qualify && (plan.storage != policy.target || plan.head_storage != policy.head_target()))
         throw std::invalid_argument("the qualified compact weights were not admitted on this backend");
+    plan.strixpack = strixpack;
     return plan;
 }
 
@@ -473,6 +538,7 @@ template <class Load>
 auto load_mini_weight_pack(weight::WeightLoadPlan& plan, profile::Name tier, const MiniWeightOptions& options,
                            const weight::WeightLoadScope& incumbent_scope, weight::WeightLoadExtent extent,
                            const std::string& path, const weight::Digest256* measured, std::ostream& receipt, Load load) {
+    plan.require_loadable();
     const bool decode_only = measured || options.qualify_decode_only;
     if (path.empty() && !decode_only) return load(MiniLowBitRows{});
     try {

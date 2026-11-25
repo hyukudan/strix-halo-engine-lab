@@ -25,7 +25,8 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
                                                     const weight::LowbitPack* pack, bool keep_bf16) {
     const auto stored = [](weight::FormatId format) {
         return format == weight::kBf16WeightStorage || format == weight::kQ8WeightStorage ||
-               format == weight::kQ4G64WeightStorage || format == weight::kQ6G64WeightStorage;
+               format == weight::kQ4G64WeightStorage || format == weight::kQ6G64WeightStorage ||
+               format == weight::kSP4TWeightStorage;
     };
     if (!stored(storage.attention) || !stored(storage.head))
         throw std::invalid_argument("invalid Inkling 2 Mini resident weight storage");
@@ -56,12 +57,13 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
         const auto pitch = !compact && spec.load_matrix_role == weight::Role::attention_o ? output_pitch : 0U;
         const auto* raw = weights.find(spec.name);
         std::optional<weight::Slice> prepacked;
-        if (pack && compact && raw &&
-            (role_storage == weight::kQ4G64WeightStorage || role_storage == weight::kQ6G64WeightStorage))
+        std::int32_t outer_exponent = 0;
+        const bool packed_role = role_storage == weight::kQ4G64WeightStorage ||
+                                 role_storage == weight::kQ6G64WeightStorage || role_storage == weight::kSP4TWeightStorage;
+        if (pack && compact && raw && packed_role)
             ++expected_prepacked;
-        if (pack && compact && raw &&
-            (role_storage == weight::kQ4G64WeightStorage || role_storage == weight::kQ6G64WeightStorage)) {
-            check(pack->find(spec.name, role_storage, *raw, prepacked));
+        if (pack && compact && raw && packed_role) {
+            check(pack->find(spec.name, role_storage, *raw, prepacked, &outer_exponent));
             if (!prepacked && plan.keep_bf16_)
                 throw std::runtime_error("measured pack lacks tensor " + spec.name);
             if (prepacked) ++plan.prepacked_;
@@ -71,10 +73,11 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
             const auto bf16_pitch = spec.load_matrix_role == weight::Role::attention_o ? output_pitch : 0U;
             tensors.push_back({name, raw, std::nullopt, bf16_pitch, std::nullopt});
             tensors.push_back({copy_names.emplace_back(std::string(kMiniLowBitImage) + std::string(name)), raw,
-                               role_storage, 0U, std::move(prepacked)});
+                               role_storage, 0U, std::move(prepacked), outer_exponent});
             continue;
         }
-        tensors.push_back({name, raw, compact ? std::optional(role_storage) : std::nullopt, pitch, std::move(prepacked)});
+        tensors.push_back({name, raw, compact ? std::optional(role_storage) : std::nullopt, pitch, std::move(prepacked),
+                           outer_exponent});
     }
     if (pack) mini_require_calibrated_pack_matrix_count(plan.prepacked_, expected_prepacked);
     plan.slices_ = weight::ResidentSlicePlan::make(std::move(tensors), kAlignment);

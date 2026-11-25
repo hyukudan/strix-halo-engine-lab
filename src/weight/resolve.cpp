@@ -7,10 +7,46 @@
 #include <limits>
 #include <sstream>
 namespace strix::weight {
+std::optional<StrixPackLoad> bind_strixpack_load(profile::Resolution& resolution) {
+    std::optional<StrixPackLoad> selected;
+    unsigned selected_priority = 0U;
+    for (auto& entry : resolution.entries) {
+        if (!entry.lever) continue;
+        const auto* policy = find_weight_load_policy(entry.lever->name);
+        if (!policy || !is_strixpack_storage(policy->target)) continue;
+        const bool active = entry.value == entry.lever->target;
+        if (!active && entry.status != profile::Status::pending) continue;
+        const bool explicit_request = active && (entry.status == profile::Status::explicit_cli ||
+                                                 entry.status == profile::Status::explicit_env);
+        const StrixPackLoad candidate{policy->id, explicit_request};
+        const unsigned priority = explicit_request ? 3U : active ? 2U : 1U;
+        if (priority > selected_priority) {
+            selected = candidate;
+            selected_priority = priority;
+        }
+        // A receipt can name the candidate, but the profile's effective receipt must agree with load admission.
+        if (active) {
+            entry.status = profile::Status::pending;
+            entry.value = entry.lever->builtin;
+            entry.target = entry.lever->target;
+            entry.reason = candidate.reason();
+            entry.ladder.clear();
+            entry.ladder_lowered = false;
+        }
+    }
+    return selected;
+}
+
 WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPolicy& policy,
                                    const WeightLoadRequest& request,
                                    std::span<const WeightLoadDecision> decisions) {
     WeightLoadPlan plan{policy.id, kBf16WeightStorage, profile::Status::builtin, "BF16 tier"};
+    if (is_strixpack_storage(policy.target) || is_strixpack_storage(policy.head_target())) {
+        plan.strixpack = StrixPackLoad{policy.id, request.allow_pending};
+        plan.status = profile::Status::pending;
+        plan.reason = plan.strixpack->reason();
+        return plan;
+    }
     if (request.tier != profile::Name::fast && request.tier != profile::Name::turbo) return plan;
     if (!request.enabled) {
         plan.status = profile::Status::off;

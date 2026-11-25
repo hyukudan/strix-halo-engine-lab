@@ -82,11 +82,13 @@ struct Decoder {
 };
 
 #if defined(STRIX_INKLING2_APP_CLI_TEST)
-cli::Options parse(std::initializer_list<std::string> arguments, std::string_view backend = "cuda") {
+cli::Options parse(const std::vector<std::string>& arguments, std::string_view backend = "cuda",
+                   cli::StepProgramOptions* program = nullptr) {
     std::vector<std::string> storage{"mini", "model"};
-    storage.insert(storage.end(), arguments);
+    storage.insert(storage.end(), arguments.begin(), arguments.end());
     std::vector<char*> argv;
     for (auto& value : storage) argv.push_back(value.data());
+    if (program) *program = cli::extract_step_program(argv);
     const strix::serve::SerialGenerationFamily family{"mini", "Mini", "MODEL",
         8U, 8U, 16U, 0U, nullptr, 8U, true, false,
         [](const std::string&) -> std::shared_ptr<const strix::serve::BpeTokenizer> { return {}; },
@@ -236,6 +238,82 @@ void test_cuda_route_options() {
     require(forms({"--latency-forms=mix"}).latency_forms == cli::kLatencyFormsMix, "--latency-forms=mix");
     require(forms({"--latency-forms=moe"}).latency_forms == cli::kLatencyFormsMoe, "--latency-forms=moe");
     expect_invalid([&] { (void)forms({"--latency-forms", "--no-latency-forms"}); });
+}
+
+void test_strixpack_entry_points() {
+    namespace mini = strix::inkling2;
+    namespace weight = strix::weight;
+    struct Entry {
+        const char* name;
+        const char* backend;
+        bool step_program;
+        bool explicit_program = false;
+        bool gate = false;
+    };
+    constexpr Entry entries[]{
+        {"HIP CLI", "hip", false},
+        {"CUDA CLI", "cuda", false},
+        {"automatic CUDA step program", "cuda", true},
+        {"explicit CUDA step program", "cuda", true, true},
+        {"HIP gate", "hip", false, false, true},
+        {"CUDA gate", "cuda", true, false, true},
+    };
+    unsigned failures = 0;
+    for (const auto& entry : entries) {
+        const bool hip = std::string_view(entry.backend) == "hip";
+        const weight::WeightLoadScope scope{hip ? weight::Backend::hip : weight::Backend::cuda, {}, {}, {}, {}, {}};
+        const weight::WeightLoadExtent extent{4U, 1U};
+        unsigned loads = 0;
+        const auto run = [&](const char* policy) {
+            std::vector<std::string> args{"--profile", "fast"};
+            if (entry.gate)
+                args.insert(args.end(), {"--gate-manifest", "windows.tsv", "--gate-out", "out",
+                                         "--gate-arm", "FAST", "--gate-rows", "2", "--gate-mode", "decode"});
+            else
+                args.insert(args.end(), {"1", "--generate", "3"});
+            if (!hip && !entry.step_program) args.emplace_back("--no-step-graph");
+            if (entry.explicit_program) args.emplace_back("--step-program");
+            if (policy) args.insert(args.end(), {"--qualify-weights", policy});
+            cli::StepProgramOptions program;
+            auto options = parse(args, entry.backend, hip ? nullptr : &program);
+            auto plan = mini::resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope, extent);
+            if (!hip) {
+                options.gate_manifest = entry.gate ? "windows.tsv" : nullptr;
+                const auto route = cli::resolve_cuda_step_route(options, program, plan.storage, false);
+                require(route.program == entry.step_program, "SP test selected the wrong CUDA route");
+                if (route.program && !entry.gate) {
+                    ++loads;
+                    return plan;
+                }
+            }
+            std::ostringstream receipt;
+            mini::load_mini_weight_pack(plan, options.tier.profile, options.weights, scope, extent, {}, nullptr, receipt,
+                [&](const mini::MiniLowBitRows&) { ++loads; return 0; });
+            return plan;
+        };
+        constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
+        const auto incumbent = mini::resolve_mini_weight_load(strix::profile::Name::fast, scope, formats, true, false,
+                                                               mini::kMiniWeightLoadDecisions, extent);
+        const auto unset = run(nullptr);
+        require(loads == 1U && weight::same_id(unset.policy, incumbent.policy) && unset.storage == incumbent.storage &&
+                    unset.head_storage == incumbent.head_storage && unset.status == incumbent.status &&
+                    unset.reason == incumbent.reason, "unset SP changed the incumbent FAST load");
+        for (const char* policy : {"weights.attention_head.sp2@1", "weights.attention_head.sp3@1",
+                                   "weights.attention_head.sp4@1"}) {
+            loads = 0;
+            bool refused = false;
+            try {
+                (void)run(policy);
+            } catch (const std::invalid_argument& error) {
+                refused = std::string_view(error.what()) == "refused: loader not present";
+            }
+            if (!refused || loads != 0U) {
+                std::cerr << entry.name << ": " << policy << " reached routing without the SP refusal\n";
+                ++failures;
+            }
+        }
+    }
+    require(failures == 0U, "explicit SP must refuse before the load callback");
 }
 
 void set_round_fold_env(const char* value) {
@@ -474,6 +552,7 @@ int main() {
         test_screened_head_lever();
         test_native_w4a4_admission();
         test_cuda_route_options();
+        test_strixpack_entry_points();
 #endif
         test_windows(directory.path);
     } catch (const std::exception& error) {

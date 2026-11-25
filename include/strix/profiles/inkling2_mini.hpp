@@ -45,6 +45,11 @@ inline constexpr weight::WeightLoadPolicy kMiniFastWeightPolicy = weight::kHeadQ
 // The explicit TURBO lever can admit this mix through a matching low-bit decision row.
 inline constexpr std::string_view kMiniLowBitTurbo = "inkling2-mini-lowbit-turbo@1";
 inline constexpr std::string_view kMiniLowBitPackFile = "inkling2-mini-q4.lowbit-pack";
+// Head in Strix pack SP4 (fixed table) from an explicit calibrated pack (STRIX_LOWBIT_PACK, strix-lowbit-calib-pack
+// --storage unembed.weight=sp4 --table fixed): the decode-only head arm (BF16 image kept for prefill, verify and the
+// widths outside the band). Pending in FAST and TURBO: no decision row until its device gate v2 receipt.
+inline constexpr std::string_view kMiniLowBitHead = "inkling2-mini-lowbit-head@1";
+inline constexpr weight::WeightLoadPolicy kMiniSp4HeadPolicy = weight::kHeadSP4TPolicy;
 inline constexpr weight::WeightLoadPolicy kMiniTurboWeightPolicy = weight::kAttentionHeadQ4Policy;
 // The row covers decode steps only. The low-bit copies are resident beside the BF16 image used for
 // prefill, verify and decode widths outside the receipt.
@@ -172,7 +177,7 @@ inline constexpr std::string_view kMiniVerifyRows = "inkling2-mini-verify-rows@1
 // mini_vision_media_tier); a text-only run never applies it (mini_defer_vision_recipe), and at its builtin the row
 // stays out of the fingerprint and the receipt, so a text-only run resolves as before the row.
 inline constexpr std::string_view kMiniVisionRecipe = "inkling2-vision-recipe";
-inline constexpr std::array<profile::Lever, 12> kMiniLevers{{
+inline constexpr std::array<profile::Lever, 16> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
@@ -231,6 +236,15 @@ inline constexpr std::array<profile::Lever, 12> kMiniLevers{{
      "and CUDA",
      false, {}, true, {}, {{{"legacy", "v1"}, {"axial@1", "v1"}}}},
     spec::kBlockDraftLever,
+    weight::kAttentionHeadSP4Lever,
+    weight::kAttentionHeadSP3Lever,
+    weight::kAttentionHeadSP2Lever,
+    {.name = kMiniLowBitHead, .env = "STRIX_INK_LOWBIT_HEAD", .option = "",
+     .value = {"", "", "", ""}, .builtin = "0", .kind = profile::Kind::bit_changing,
+     .ready = {}, .runnable = {false, true, false, true}, .target = "sp4t", .off = "0",
+     .source = "pending: SP4 fixed-table head (emulated gate v2 0/39 FAST); awaits the device gate v2 receipt and a "
+               "decision row; HIP command line only",
+     .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"sp4t", "sp4t-head-v1"}}}},
 }};
 
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.

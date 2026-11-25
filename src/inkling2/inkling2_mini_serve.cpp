@@ -63,6 +63,9 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     const auto resolution = resolve_mini_profile(out.weight_options, true);
     out.tier = resolution.profile;
     out.weight_options.lowbit_turbo = mini_lowbit_turbo(resolution);
+    if (mini_lowbit_head(resolution))
+        std::cerr << "STRIX_INK_LOWBIT_HEAD=sp4t declined: the SP4 head arm runs on the command line only (no served "
+                     "identity yet); using incumbent weights\n";
     out.prepared_round_fold = mini_prepared_round_fold(resolution);
     out.experts_nvfp4 = mini_experts_nvfp4(resolution);
     out.combine_image = mini_combine_image(resolution);
