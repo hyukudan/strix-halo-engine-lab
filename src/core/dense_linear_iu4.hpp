@@ -32,6 +32,7 @@
 #include "strix/decode_projection_group.hpp"
 #include "strix/decode_weight_sweep.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/hip/legacy_launch.hpp"  // STRIX_HIP_LAUNCH, LaunchRequirement::Rdna3Layout
 #include "dense_iu4_rows.hpp"
 #include "iu4_x_pairs.hpp"
 #include "w4a16.hpp"
