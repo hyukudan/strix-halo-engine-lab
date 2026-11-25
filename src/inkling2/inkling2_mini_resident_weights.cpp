@@ -83,16 +83,16 @@ MiniResidentWeights MiniResidentWeights::bind(const MiniResidentWeightPlan& plan
     return bound;
 }
 
-void MiniResidentWeights::certify_attention(
-    const std::function<void(std::span<const std::uint16_t>, std::span<std::uint16_t>)>& read) {
-    if (compact()) return;
+MiniAttentionCertificate certify_mini_attention(core::Bf16StagedScan& scan, const MiniStagedLookup& staged,
+                                                const MiniStagedRead& read) {
+    // No scan scratch: the empty (refusing) certificate, three planes; the checkpoint still loads.
+    if (!scan.available()) return {};
     constexpr std::array roles{MiniAttentionProjection::query, MiniAttentionProjection::key,
                                MiniAttentionProjection::value, MiniAttentionProjection::key_taps,
                                MiniAttentionProjection::value_taps, MiniAttentionProjection::relative,
                                MiniAttentionProjection::relative_bias, MiniAttentionProjection::sink,
                                MiniAttentionProjection::output_gate, MiniAttentionProjection::output};
     MiniAttentionCertificate certificate;
-    std::vector<std::uint16_t> host;
     for (const auto& spec : mini_text_tensor_schema()) {
         const std::string_view name(spec.name);
         if (!spec.resident || name.find(".layers.") == std::string_view::npos) continue;
@@ -102,13 +102,19 @@ void MiniResidentWeights::certify_attention(
             return name.ends_with(mini_attention_projection_spec(role).tensor_suffix);
         }) || name.ends_with("attn.k_sconv.weight") || name.ends_with("attn.v_sconv.weight");  // static channel taps
         if (!gain && !projection) continue;
-        const auto staged = bf16(name.substr(kMiniTextTensorPrefix.size()));
-        host.resize(staged.size());
-        read(staged, host);
-        if (gain) certificate.add_gain(host);
-        else certificate.add_projection(host);
+        const auto tensor = staged(name.substr(kMiniTextTensorPrefix.size()));
+        const float top = scan.magnitude_max(tensor.size(), [&](std::size_t offset, std::span<std::uint16_t> host) {
+            read(tensor.subspan(offset, host.size()), host);
+        });
+        if (gain) certificate.add_gain(top);
+        else certificate.add_projection(top);
     }
-    attention_certificate_ = certificate;
+    return certificate;
+}
+
+void MiniResidentWeights::certify_attention(core::Bf16StagedScan& scan, const MiniStagedRead& read) {
+    if (compact()) return;
+    attention_certificate_ = certify_mini_attention(scan, [this](std::string_view name) { return bf16(name); }, read);
 }
 
 std::span<const std::uint16_t> MiniResidentWeights::bf16(std::string_view name) const {

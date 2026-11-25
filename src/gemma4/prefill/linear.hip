@@ -2,6 +2,7 @@
 #include "strix/hip/legacy_launch.hpp"
 #include "device.hpp"
 #include "gemma4/exl3/device.hpp"
+#include "../../core/f16_dense_tall_hilo.hpp"
 #include <hip/hip_runtime.h>
 #include <cstdlib>
 #include <stdexcept>
@@ -26,9 +27,6 @@ __device__ inline Raw16 raw16(const _Float16* p) {
 // address per load). Same bytes as raw16() at base + element.
 __device__ inline __amdgpu_buffer_rsrc_t panel_rsrc(const _Float16* base) {
     return STRIX_HIP_BUFFER_RSRC(const_cast<_Float16*>(base), 0, 0x7fffffff, 0x31004000);
-}
-__device__ inline Raw8 raw8_buf(__amdgpu_buffer_rsrc_t rsrc, unsigned lane_element, unsigned uniform_bytes) {
-    return __builtin_bit_cast(Raw8, STRIX_HIP_RAW_LOAD_B128(rsrc, int(lane_element * 2U), int(uniform_bytes), 0));
 }
 __device__ inline Raw16 raw16_buf(__amdgpu_buffer_rsrc_t rsrc, unsigned lane_element, unsigned uniform_bytes) {
     const auto v = int(lane_element * 2U), s0 = int(uniform_bytes);
@@ -109,126 +107,6 @@ __device__ inline void v2_merge(float h, float l, float& s) {
     asm volatile("" : "+v"(scaled));
     const float part = h + scaled;
     s = Blocked ? s + part : part;
-}
-// Corrected linear over prepared FP16 weight panels: four waves own TM x TN
-// output tiles of 16x16 each (2x2 waves); every output keeps independent high
-// and low accumulators over increasing K16 and, when blocked, restarts them at
-// +0 every v2_block inputs.
-template <bool Blocked, unsigned TM, unsigned TN, bool Guard>
-__global__ __launch_bounds__(128) void hilo_gemm(const _Float16* weights, const _Float16* x, unsigned rows, unsigned outputs,
-                                                unsigned stride, float* out, unsigned* failure) {
-    const unsigned lane = threadIdx.x % 32, wave = threadIdx.x / 32;
-    const unsigned m0 = blockIdx.y * (32 * TM) + (wave / 2) * (16 * TM), n0 = blockIdx.x * (32 * TN) + (wave % 2) * (16 * TN);
-    const auto* xl = x + std::size_t(rows) * stride;
-    Float8 h[TM][TN]{}, l[TM][TN]{};
-    float s[TM][TN][8]{};
-    // Workgroup-uniform bases advance per K16; lane offsets stay 32-bit.
-    unsigned wo[TN];
-#pragma unroll
-    for (unsigned j = 0; j < TN; ++j) {
-        const auto n = n0 + j * 16 + lane % 16;
-        wo[j] = (n / 16) * (stride / 16) * 256 + (n % 16) * 16;
-    }
-    const auto rx = panel_rsrc(x), rxl = panel_rsrc(xl), rw = panel_rsrc(weights);
-    for (unsigned k0 = 0; k0 < stride; k0 += 16) {
-        const unsigned xs = k0 * rows * 2U, ws = (k0 / 16) * 512U;
-        Raw16 ah[TM], al[TM], b[TN];
-#pragma unroll
-        for (unsigned i = 0; i < TM; ++i) {
-            const auto r = m0 + i * 16 + lane % 16;
-            ah[i] = !Guard || r < rows ? raw16_buf(rx, r * 16, xs) : Raw16{};
-            al[i] = !Guard || r < rows ? raw16_buf(rxl, r * 16, xs) : Raw16{};
-        }
-#pragma unroll
-        for (unsigned j = 0; j < TN; ++j) {
-            const auto n = n0 + j * 16 + lane % 16;
-            b[j] = !Guard || n < outputs ? raw16_buf(rw, wo[j], ws) : Raw16{};
-        }
-#pragma unroll
-        for (unsigned i = 0; i < TM; ++i)
-#pragma unroll
-            for (unsigned j = 0; j < TN; ++j) {
-                h[i][j] = wmma(ah[i], b[j], h[i][j]);
-                l[i][j] = wmma(al[i], b[j], l[i][j]);
-            }
-        if (Blocked && ((k0 + 16) % v2_block == 0 || k0 + 16 >= stride)) {
-#pragma unroll
-            for (unsigned i = 0; i < TM; ++i)
-#pragma unroll
-                for (unsigned j = 0; j < TN; ++j) {
-#pragma unroll
-                    for (unsigned e = 0; e < 8; ++e) v2_merge<true>(h[i][j][e], l[i][j][e], s[i][j][e]);
-                    h[i][j] = Float8{}; l[i][j] = Float8{};
-                }
-        }
-    }
-    unsigned bad = 0;
-#pragma unroll
-    for (unsigned i = 0; i < TM; ++i)
-#pragma unroll
-        for (unsigned j = 0; j < TN; ++j)
-#pragma unroll
-            for (unsigned e = 0; e < 8; ++e) {
-                const auto r = m0 + i * 16 + 2 * e + lane / 16, n = n0 + j * 16 + lane % 16;
-                float y;
-                if constexpr (Blocked) y = s[i][j][e];
-                else { v2_merge<false>(h[i][j][e], l[i][j][e], y); }
-                if (r < rows && n < outputs) {
-                    bad |= (bit_cast<unsigned>(y) & 0x7f800000U) == 0x7f800000U;
-                    out[std::size_t(r) * outputs + n] = y;
-                }
-            }
-    if (bad) atomicOr(failure, 1U);
-}
-// Unblocked v2 (hilo) in the register-only style of direct_gemm: eight waves,
-// each owning 64 rows x 32 outputs with high and low accumulators (16 WMMAs
-// per 10 operand loads per K16), 128 rows x 128 outputs per workgroup.
-// Guard = false: full tiles only (rows % 128 == 0, outputs % 128 == 0), no
-// per-lane load predicates.
-template <bool Guard>
-__global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8, 8))) void hilo_direct(const _Float16* weights, const _Float16* x, unsigned rows, unsigned outputs,
-                                                  unsigned stride, float* out, unsigned* failure) {
-    const unsigned lane = threadIdx.x % 32, wave = threadIdx.x / 32;
-    const unsigned m0 = blockIdx.y * 128 + (wave / 4) * 64, n0 = blockIdx.x * 128 + (wave % 4) * 32;
-    const auto* xl = x + std::size_t(rows) * stride;
-    Float8 h[4][2]{}, l[4][2]{};
-    for (unsigned k0 = 0; k0 < stride; k0 += 16) {
-        Raw16 b[2];
-#pragma unroll
-        for (unsigned j = 0; j < 2; ++j) {
-            const auto n = n0 + j * 16 + lane % 16;
-            b[j] = !Guard || n < outputs ? raw16_at(weights, unsigned((std::size_t(n / 16) * (stride / 16) + k0 / 16) * 256 + (n % 16) * 16)) : Raw16{};
-        }
-        // One row tile's operands live at a time: 192 VGPRs (occupancy 8) without spills.
-#pragma unroll
-        for (unsigned i = 0; i < 4; ++i) {
-            const auto r = m0 + i * 16 + lane % 16;
-            const Raw16 ah = !Guard || r < rows ? raw16_at(x, unsigned(std::size_t(k0) * rows + r * 16)) : Raw16{};
-            const Raw16 al = !Guard || r < rows ? raw16_at(xl, unsigned(std::size_t(k0) * rows + r * 16)) : Raw16{};
-#pragma unroll
-            for (unsigned j = 0; j < 2; ++j) {
-                h[i][j] = wmma(ah, b[j], h[i][j]);
-                l[i][j] = wmma(al, b[j], l[i][j]);
-            }
-            __builtin_amdgcn_sched_barrier(0);
-        }
-    }
-    unsigned bad = 0;
-#pragma unroll
-    for (unsigned i = 0; i < 4; ++i)
-#pragma unroll
-        for (unsigned j = 0; j < 2; ++j)
-#pragma unroll
-            for (unsigned e = 0; e < 8; ++e) {
-                const auto r = m0 + i * 16 + 2 * e + lane / 16, n = n0 + j * 16 + lane % 16;
-                float y;
-                v2_merge<false>(h[i][j][e], l[i][j][e], y);
-                if (r < rows && n < outputs) {
-                    bad |= (bit_cast<unsigned>(y) & 0x7f800000U) == 0x7f800000U;
-                    out[std::size_t(r) * outputs + n] = y;
-                }
-            }
-    if (bad) atomicOr(failure, 1U);
 }
 // Corrected (hilo) gate and up of the same split input in one workgroup: each
 // wave owns 32 rows x 32 outputs of both with high/low accumulators, the
@@ -376,171 +254,6 @@ __global__ __launch_bounds__(256) void gelu_pair_hilo_k128(const _Float16* gate,
     if (bad) atomicOr(failure, bad);
     for (unsigned d = 16; d; d >>= 1U) high = max(high, __shfl_down(high, d, 32));
     if (lane == 0) atomicMax(maximum, high);
-}
-// LDS-staged v2 linear for long-K projections (down): eight waves own 32 x 32
-// outputs each (4 x 2 waves, 128 rows x 64 outputs per workgroup) with high and
-// low accumulators and, when blocked, the block sum. High and low input
-// panels and the weight panel are staged K32 at a time in double-buffered LDS,
-// the next stage prefetched into registers. Same K16 chains, restarts and merge
-// order as hilo_gemm / emulate_linear_v2. Requires stride % 32 == 0.
-template <bool Blocked>
-__global__ __launch_bounds__(256) void staged_hilo(const _Float16* weights, const _Float16* x, unsigned rows, unsigned outputs,
-                                                  unsigned stride, float* out, unsigned* failure) {
-    constexpr unsigned threads = 256, tile_m = 128, tile_n = 64;
-    constexpr unsigned a_loads = 2 * tile_m * 32 / 8 / threads, b_loads = tile_n * 32 / 8 / threads;
-    using Vec = unsigned __attribute__((ext_vector_type(4)));
-    // [stage][k16 of the stage][high/low][row][16] and [stage][k16][output][16]
-    __shared__ _Float16 la[2][2][2][tile_m * 16], lb[2][2][tile_n * 16];
-    const unsigned tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
-    const unsigned m_tile = blockIdx.y * tile_m, n_tile = blockIdx.x * tile_n;
-    const unsigned wm = (wave / 2) * 32, wn = (wave % 2) * 32;
-    const unsigned k16s = stride / 16, n16s = (outputs + 15U) / 16U;
-    const auto* xl = x + std::size_t(rows) * stride;
-    Vec ra[a_loads], rb[b_loads];
-    // Buffer resources: the stage's K16 offset is workgroup-uniform (scalar),
-    // each thread keeps one 32-bit element offset per load.
-    const auto rx = panel_rsrc(x), rxl = panel_rsrc(xl), rw = panel_rsrc(weights);
-    auto fetch = [&](unsigned k0) {
-#pragma unroll
-        for (unsigned i = 0; i < a_loads; ++i) {
-            // [half][k16][row][2 parts]
-            const unsigned v = tid + i * threads, which = v / (tile_m * 4), h = (v / (tile_m * 2)) % 2;
-            const unsigned row = (v / 2) % tile_m, part = v % 2, r = m_tile + row;
-            const unsigned uniform = (k0 / 16 + h) * rows * 32U;
-            ra[i] = r < rows ? __builtin_bit_cast(Vec, raw8_buf(which ? rxl : rx, r * 16 + part * 8, uniform)) : Vec{};
-        }
-#pragma unroll
-        for (unsigned i = 0; i < b_loads; ++i) {
-            const unsigned v = tid + i * threads, h = v / (tile_n * 2), n = (v / 2) % tile_n, part = v % 2;
-            const unsigned j = (n_tile + n) / 16;
-            rb[i] = j < n16s ? __builtin_bit_cast(Vec, raw8_buf(rw, j * k16s * 256 + (n % 16) * 16 + part * 8, (k0 / 16 + h) * 512U))
-                             : Vec{};
-        }
-    };
-    auto store = [&](unsigned slot) {
-#pragma unroll
-        for (unsigned i = 0; i < a_loads; ++i) {
-            const unsigned v = tid + i * threads, which = v / (tile_m * 4), h = (v / (tile_m * 2)) % 2;
-            const unsigned row = (v / 2) % tile_m, part = v % 2;
-            *reinterpret_cast<Vec*>(&la[slot][h][which][row * 16 + part * 8]) = ra[i];
-        }
-#pragma unroll
-        for (unsigned i = 0; i < b_loads; ++i) {
-            const unsigned v = tid + i * threads, h = v / (tile_n * 2), n = (v / 2) % tile_n, part = v % 2;
-            *reinterpret_cast<Vec*>(&lb[slot][h][n * 16 + part * 8]) = rb[i];
-        }
-    };
-    Float8 hi[2][2]{}, lo[2][2]{};
-    float s[2][2][8]{};
-    fetch(0); store(0);
-    __syncthreads();
-    for (unsigned k0 = 0; k0 < stride; k0 += 32) {
-        const unsigned slot = (k0 / 32) % 2;
-        if (k0 + 32 < stride) fetch(k0 + 32);
-#pragma unroll
-        for (unsigned h = 0; h < 2; ++h) {
-            Raw16 ah[2], al[2], b[2];
-#pragma unroll
-            for (unsigned i = 0; i < 2; ++i) {
-                ah[i] = raw16(&la[slot][h][0][(wm + i * 16 + lane % 16) * 16]);
-                al[i] = raw16(&la[slot][h][1][(wm + i * 16 + lane % 16) * 16]);
-                b[i] = raw16(&lb[slot][h][(wn + i * 16 + lane % 16) * 16]);
-            }
-#pragma unroll
-            for (unsigned i = 0; i < 2; ++i)
-#pragma unroll
-                for (unsigned j = 0; j < 2; ++j) {
-                    hi[i][j] = wmma(ah[i], b[j], hi[i][j]);
-                    lo[i][j] = wmma(al[i], b[j], lo[i][j]);
-                }
-            const unsigned k_end = k0 + 16 * (h + 1);
-            if (Blocked && (k_end % v2_block == 0 || k_end >= stride)) {
-#pragma unroll
-                for (unsigned i = 0; i < 2; ++i)
-#pragma unroll
-                    for (unsigned j = 0; j < 2; ++j) {
-#pragma unroll
-                        for (unsigned e = 0; e < 8; ++e) v2_merge<true>(hi[i][j][e], lo[i][j][e], s[i][j][e]);
-                        hi[i][j] = Float8{}; lo[i][j] = Float8{};
-                    }
-            }
-        }
-        if (k0 + 32 < stride) store(slot ^ 1U);
-        __syncthreads();
-    }
-    unsigned bad = 0;
-#pragma unroll
-    for (unsigned i = 0; i < 2; ++i)
-#pragma unroll
-        for (unsigned j = 0; j < 2; ++j)
-#pragma unroll
-            for (unsigned e = 0; e < 8; ++e) {
-                const auto r = m_tile + wm + i * 16 + 2 * e + lane / 16, n = n_tile + wn + j * 16 + lane % 16;
-                float y;
-                if constexpr (Blocked) y = s[i][j][e];
-                else { v2_merge<false>(hi[i][j][e], lo[i][j][e], y); }
-                if (r < rows && n < outputs) {
-                    bad |= (bit_cast<unsigned>(y) & 0x7f800000U) == 0x7f800000U;
-                    out[std::size_t(r) * outputs + n] = y;
-                }
-            }
-    if (bad) atomicOr(failure, 1U);
-}
-// Blocked v2 (hilo_k128) register variant for long-K projections: eight waves,
-// each owning 32 rows x 32 outputs with high/low accumulators and the
-// block sum, 128 rows x 64 outputs per workgroup, one row tile's
-// operands live at a time.
-__global__ __launch_bounds__(256) void hilo_direct_k128(const _Float16* weights, const _Float16* x, unsigned rows, unsigned outputs,
-                                                       unsigned stride, float* out, unsigned* failure) {
-    const unsigned lane = threadIdx.x % 32, wave = threadIdx.x / 32;
-    const unsigned m0 = blockIdx.y * 128 + (wave / 2) * 32, n0 = blockIdx.x * 64 + (wave % 2) * 32;
-    const auto* xl = x + std::size_t(rows) * stride;
-    Float8 h[2][2]{}, l[2][2]{};
-    float s[2][2][8]{};
-    for (unsigned k0 = 0; k0 < stride; k0 += 16) {
-        Raw16 b[2];
-#pragma unroll
-        for (unsigned j = 0; j < 2; ++j) {
-            const auto n = n0 + j * 16 + lane % 16;
-            b[j] = n < outputs ? raw16_at(weights, unsigned((std::size_t(n / 16) * (stride / 16) + k0 / 16) * 256 + (n % 16) * 16)) : Raw16{};
-        }
-#pragma unroll
-        for (unsigned i = 0; i < 2; ++i) {
-            const auto r = m0 + i * 16 + lane % 16;
-            const Raw16 ah = r < rows ? raw16_at(x, unsigned(std::size_t(k0) * rows + r * 16)) : Raw16{};
-            const Raw16 al = r < rows ? raw16_at(xl, unsigned(std::size_t(k0) * rows + r * 16)) : Raw16{};
-#pragma unroll
-            for (unsigned j = 0; j < 2; ++j) {
-                h[i][j] = wmma(ah, b[j], h[i][j]);
-                l[i][j] = wmma(al, b[j], l[i][j]);
-            }
-        }
-        if ((k0 + 16) % v2_block == 0 || k0 + 16 >= stride) {
-#pragma unroll
-            for (unsigned i = 0; i < 2; ++i)
-#pragma unroll
-                for (unsigned j = 0; j < 2; ++j) {
-#pragma unroll
-                    for (unsigned e = 0; e < 8; ++e) v2_merge<true>(h[i][j][e], l[i][j][e], s[i][j][e]);
-                    h[i][j] = Float8{}; l[i][j] = Float8{};
-                }
-        }
-    }
-    unsigned bad = 0;
-#pragma unroll
-    for (unsigned i = 0; i < 2; ++i)
-#pragma unroll
-        for (unsigned j = 0; j < 2; ++j)
-#pragma unroll
-            for (unsigned e = 0; e < 8; ++e) {
-                const auto r = m0 + i * 16 + 2 * e + lane / 16, n = n0 + j * 16 + lane % 16;
-                const float y = s[i][j][e];
-                if (r < rows && n < outputs) {
-                    bad |= (bit_cast<unsigned>(y) & 0x7f800000U) == 0x7f800000U;
-                    out[std::size_t(r) * outputs + n] = y;
-                }
-            }
-    if (bad) atomicOr(failure, 1U);
 }
 // Panels are [N16][K16][N][K]. Packing is outside prompt timing and consumes
 // exactly the same decoded FP32 coefficients and FP16 conversion as gemm.
@@ -936,20 +649,6 @@ __global__ __launch_bounds__(256) void gelu_pair_gemm(const _Float16* gate, cons
     if (lane == 0) atomicMax(maximum, high);
 }
 } // namespace
-bool hilo_narrow_enabled() {
-    static const bool enabled = [] {
-        const auto* p = std::getenv("STRIX_G4_PREFILL_HILO_NARROW");
-        return !p || std::string_view(p) != "0";
-    }();
-    return enabled;
-}
-bool hilo_direct_enabled() {
-    static const bool enabled = [] {
-        const auto* p = std::getenv("STRIX_G4_PREFILL_HILO_DIRECT");
-        return !p || std::string_view(p) != "0";
-    }();
-    return enabled;
-}
 // Unguarded full-tile instantiations of the hilo kernels (same bytes);
 // STRIX_G4_PREFILL_FULL_TILES=0 keeps the guarded loads everywhere.
 bool full_tiles_enabled() {
@@ -1094,40 +793,12 @@ void linear(LinearView w, const float* x, unsigned rows, float* out, void* scrat
                 throw std::runtime_error(hipGetErrorString(e));
         const auto* panels = prepared->panels().as<_Float16>();
         const auto* input = static_cast<const _Float16*>(scratch);
-        const bool blocked = precision == LinearPrecision::hilo_k128;
-#define G4_HILO(B, TM, TN) do { \
-            const dim3 grid((w.outputs + 32 * TN - 1) / (32 * TN), (rows + 32 * TM - 1) / (32 * TM)); \
-            if (rows % (32 * TM) == 0 && w.outputs % (32 * TN) == 0 && full_tiles_enabled()) \
-                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (hilo_gemm<B, TM, TN, false>), grid, dim3(128), 0, q, panels, input, rows, w.outputs, stride, out, failure); \
-            else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (hilo_gemm<B, TM, TN, true>), grid, dim3(128), 0, q, panels, input, rows, w.outputs, stride, out, failure); \
-        } while (false)
-        // Long-K blocked projections (down under K128) stage through LDS; the
-        // unblocked staged form measured slower than hilo_direct (314 vs 291 ms
-        // for down at 2K), so it is not used.
-        const bool staged = blocked && staged_enabled() && stride % 32 == 0 && stride >= 8192 && rows > 16;
-        if (blocked && rows > 16 && stride >= 8192 && !staged_enabled())
-            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, hilo_direct_k128, dim3((w.outputs + 63U) / 64U, (rows + 127U) / 128U), dim3(256), 0, q,
-                               panels, input, rows, w.outputs, stride, out, failure);
-        else if (staged && blocked)
-            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, staged_hilo<true>, dim3((w.outputs + 63U) / 64U, (rows + 127U) / 128U), dim3(256), 0, q,
-                               panels, input, rows, w.outputs, stride, out, failure);
-        else if (staged)
-            STRIX_HIP_LAUNCH_GGL(Rdna3Layout, staged_hilo<false>, dim3((w.outputs + 63U) / 64U, (rows + 127U) / 128U), dim3(256), 0, q,
-                               panels, input, rows, w.outputs, stride, out, failure);
-        else if (rows <= 16) { if (blocked) G4_HILO(true, 1, 4); else G4_HILO(false, 1, 4); }
-        else if (blocked) G4_HILO(true, 2, 2);
-        // Narrow projections (K/V, PLE gate) need more workgroups than 128x128 tiles give.
-        else if (w.outputs <= 1024 && hilo_narrow_enabled()) G4_HILO(false, 2, 2);
-        else if (hilo_direct_enabled())
-        {
-            const dim3 grid((w.outputs + 127U) / 128U, (rows + 127U) / 128U);
-            if (rows % 128 == 0 && w.outputs % 128 == 0 && full_tiles_enabled())
-                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, hilo_direct<false>, grid, dim3(256), 0, q, panels, input, rows, w.outputs, stride, out, failure);
-            else
-                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, hilo_direct<true>, grid, dim3(256), 0, q, panels, input, rows, w.outputs, stride, out, failure);
-        }
-        else G4_HILO(false, 2, 4);
-#undef G4_HILO
+        // Shared hi/lo tall GEMM (same chains, block restarts and merge as emulate_linear_v2).
+        namespace hl = strix::core::f16_dense_tall::hilo;
+        if (precision == LinearPrecision::hilo_k128)
+            hl::launch_panels<v2_block / 16U, v2_low_unscale>(panels, input, rows, w.outputs, stride, out, failure, q);
+        else
+            hl::launch_panels<0U, v2_low_unscale>(panels, input, rows, w.outputs, stride, out, failure, q);
         checked();
         return;
     }

@@ -5,8 +5,6 @@
 #include "core/weight_certificate.hpp"
 
 #include <algorithm>
-#include <cstdint>
-#include <span>
 
 namespace strix::inkling2 {
 
@@ -24,12 +22,14 @@ namespace strix::inkling2 {
 // (at most one). Every dot is bounded by operand L1 x weight_max < 2^126.
 class MiniAttentionCertificate {
 public:
-    void add_projection(std::span<const std::uint16_t> bf16_bits) {
-        weight_max_ = std::max(weight_max_, core::finite_magnitude_max_bf16(bf16_bits));
+    // Largest magnitude of one staged tensor (core::finite_magnitude_max_bf16 / core::Bf16StagedScan; +infinity when any
+    // element is not finite).
+    void add_projection(float magnitude_max) {
+        weight_max_ = std::max(weight_max_, magnitude_max);
         ++projections_;
     }
-    void add_gain(std::span<const std::uint16_t> bf16_bits) {
-        gain_max_ = std::max(gain_max_, core::finite_magnitude_max_bf16(bf16_bits));
+    void add_gain(float magnitude_max) {
+        gain_max_ = std::max(gain_max_, magnitude_max);
         ++gains_;
     }
     [[nodiscard]] bool bounded() const {

@@ -3549,7 +3549,6 @@
         "resource",
         "staged_enabled",
         "staged_gemm",
-        "staged_hilo",
         "tiled_enabled",
         "tiles",
         "volatile",
