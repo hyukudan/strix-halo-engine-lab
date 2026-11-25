@@ -417,6 +417,17 @@ void test_capacity_and_pack_fallback() {
     std::filesystem::remove(path);
 }
 
+void test_calibrated_row_speculation_admission() {
+    require(mini::mini_calibrated_row_allowed_for_cli(true, false, false),
+            "serial calibrated decode remains available without speculation");
+    require(!mini::mini_calibrated_row_allowed_for_cli(true, true, false),
+            "lookup or verify speculation keeps the incumbent target for every verify width");
+    require(!mini::mini_calibrated_row_allowed_for_cli(true, false, true),
+            "drafter speculation keeps the incumbent target for every verify width");
+    require(!mini::mini_calibrated_row_allowed_for_cli(false, false, false),
+            "an unset calibrated lever remains off");
+}
+
 // Changing Q8_0 consumer arithmetic retires its receipt.
 void test_committed_rows() {
     constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
@@ -566,6 +577,7 @@ int main() {
         test_lowbit_receipts();
         test_pack_admission();
         test_capacity_and_pack_fallback();
+    test_calibrated_row_speculation_admission();
         test_token_bytes();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

@@ -330,9 +330,17 @@ int main(int argc, char** argv) {
             MiniWeightScope scope;
             strix::weight::WeightLoadPlan plan;
         };
-        const auto resolve_weights = [&options, model = std::string(argv[1])](strix::weight::WeightLoadExtent extent) {
-            auto scope = mini_weight_scope(model, options.tier.profile, options.weights, extent);
-            const auto plan = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view(), extent);
+        auto weight_options = options.weights;
+        const bool calibrated_cli_allowed = mini_calibrated_row_allowed_for_cli(
+            weight_options.lowbit_turbo, options.generation.speculation != serve::CliSpeculation::off,
+            options.dspark != nullptr);
+        if (weight_options.lowbit_turbo && !calibrated_cli_allowed) {
+            weight_options.lowbit_turbo = false;
+            std::cerr << "strix-lowbit-pack/v2 declined (speculative verification needs incumbent weights); using incumbent weights\n";
+        }
+        const auto resolve_weights = [&options, &weight_options, model = std::string(argv[1])](strix::weight::WeightLoadExtent extent) {
+            auto scope = mini_weight_scope(model, options.tier.profile, weight_options, extent);
+            const auto plan = resolve_mini_resident_weight_load(options.tier.profile, weight_options, scope.view(), extent);
             return ResolvedWeights{std::move(scope), plan};
         };
         const auto gate_windows = options.gate_manifest
@@ -362,7 +370,7 @@ int main(int argc, char** argv) {
             };
         else
 #endif
-        family.load = [&loaded, &resolve_weights, &options, step_graphs, dspark = options.dspark,
+        family.load = [&loaded, &resolve_weights, &options, &weight_options, step_graphs, dspark = options.dspark,
                        moe_w4a4,
                        combine_image = mini_combine_image(options.tier),
                        round_fold = mini_prepared_round_fold(options.tier),
@@ -373,7 +381,7 @@ int main(int argc, char** argv) {
                        verify_rows = mini_verify_rows(options.tier)](const serve::SerialGenerationLoad& load) {
             const strix::weight::WeightLoadExtent extent{load.positions, 1U};
             loaded = resolve_weights(extent);
-            return load_mini_weights(load.checkpoint, loaded->plan, options.tier.profile, options.weights, loaded->scope.view(),
+            return load_mini_weights(load.checkpoint, loaded->plan, options.tier.profile, weight_options, loaded->scope.view(),
                                      extent, [&](MiniLowBitRows lowbit) {
                 return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, loaded->plan.roles(), dspark,
                     moe_w4a4, combine_image, round_fold, narrow, controller_one_plane, projected_bias, screened_head,
