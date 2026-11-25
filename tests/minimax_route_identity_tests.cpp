@@ -7,6 +7,7 @@
 #include "minimax/engine/mm_defaults.hpp"
 #include "minimax/rtxpf/fp32_identity.hpp"
 #include "strix/session/prefill_session.hpp"
+#include "moe_core/grouped_policy.hpp"
 
 #include <array>
 #include <filesystem>
@@ -318,6 +319,26 @@ void prefill_cuts() {
             "deferred append boundary");
     compare_tuple("draft-append", {8,0,0,0}, {static_cast<unsigned>(route::append_rows(32)),0,0,0});
 }
+// Contract check. The host route fixture evaluates the engine branches and launch planners.
+void fixed_split_default() {
+    using namespace strix::minimax::defaults;
+    namespace mc = strix::moe_core;
+    const Lookup empty = [](const char*) -> const char* { return nullptr; };
+    // The default resolves to the invariant contract: S = 1 whatever the adaptive policy would choose.
+    const auto& order = mc::resolve_grouped_order(linear_order(empty).c_str());
+    require(linear_order(empty) == "invariant" && order.invariant(), "default prefill order must be invariant");
+    for (unsigned rows : {1U, 2U, 8U, 9U, 16U, 17U, 96U, 97U, 256U, 1024U, 4096U}) {  // expert occupancy or chunk/max_rows
+        for (unsigned bits : {4U, 5U, 6U}) {
+            const unsigned adaptive = route::gemm_splits(6144, 1536, bits, rows);
+            require(order.gate.resolve(adaptive) == 1 && order.up.resolve(adaptive) == 1 && order.down.resolve(adaptive) == 1,
+                    "routed/shared gate/up/down split must not follow occupancy or max_rows under the default");
+        }
+    }
+    require(!mc::resolve_grouped_order("adaptive").invariant() &&
+            mc::resolve_grouped_order("adaptive").gate.resolve(route::gemm_splits(6144, 1536, 4, 1)) == 16 &&
+            mc::resolve_grouped_order("adaptive").gate.resolve(route::gemm_splits(6144, 1536, 4, 9)) == 8,
+            "adaptive stays the explicit rows-dependent lever");
+}
 void config_receipts() {
     using namespace strix::minimax::defaults;
     const Lookup empty = [](const char*) -> const char* { return nullptr; };
@@ -337,6 +358,10 @@ void config_receipts() {
         require(config.find(std::string("STRIX_MMX_PF_ORDER.effective=") +
                             (invariant ? "invariant" : "adaptive") + "\n") != std::string::npos,
                 "effective chunk order inspection");
+        require(config.find(std::string("STRIX_MMX_PF_ORDER.batch_invariant=") + (invariant ? "yes" : "no") + "\n") !=
+                    std::string::npos &&
+                config.find("STRIX_MMX_PF_ORDER.scope=exl3-prefill-k-order:q/k/v/o,routed/shared\n") !=
+                    std::string::npos, "chunk order inspection must name its operator scope");
     }
     require(resolve(empty).size() == items().size(), "defaults registry");
     const auto& dense_mlp = allow("prefill-dense-mlp");
@@ -548,6 +573,7 @@ int main(int argc, char** argv) {
         decode_and_verify();
         prefill_cuts();
         config_receipts();
+        fixed_split_default();
         for (const auto& selector : selectors)
             if (selector.category == 'c' && std::string_view(selector.id) != "prefill-routed-split" &&
                 std::string_view(selector.id) != "prefill-shared-split")

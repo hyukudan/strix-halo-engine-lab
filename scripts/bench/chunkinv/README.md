@@ -1,7 +1,7 @@
 # chunkinv bench kit (MiniMax M3.1 prefill numeric order)
 
-Measures the opt-in invariant prefill order (`STRIX_MMX_PF_ORDER=invariant`, identity `mmx-pf-linear-s1-v1`, MoE +
-dense) against today's adaptive default on a two-rank pair. No engine change lives here; the only source patch is the
+Measures the invariant prefill order (`STRIX_MMX_PF_ORDER=invariant`, MoE and dense) against the historical adaptive
+order on a two-rank pair. The identity depends on the binary under test. The only source patch in this kit is the
 diagnostic null control, applied to a scratch copy for the gate binary and never merged.
 
 Configuration: `kit.env.sh` (`KIT`, `BIN`, `MODEL`, `PROMPTS`, `PEER`, `GATE`). Every GPU step runs inside one pair GPU
