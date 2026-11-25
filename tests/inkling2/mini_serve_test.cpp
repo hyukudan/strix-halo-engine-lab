@@ -370,6 +370,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         require(options.tier == strix::profile::parse(tier_name) && options.tier == cli_tier.profile &&
                     options.moe_w4a4 == mini::mini_moe_w4a4_class(cli_tier) &&
                     options.combine_image == mini::mini_combine_image(cli_tier) &&
+                    options.prepared_round_fold == mini::mini_prepared_round_fold(cli_tier) &&
                     options.weight_options.qualify_q8 == qualify_q8,
                 "served profile differs from the native command line's resolution of the same --profile");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
