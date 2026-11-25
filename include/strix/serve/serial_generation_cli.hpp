@@ -161,6 +161,7 @@ struct SerialGenerationOptions {
     bool prefill_chunk_explicit{};
     bool packed_decode{};
     bool generate_requested{}, sampling_requested{};
+    bool speculation_requested{};  // --speculation was given (an engine's resolved default applies otherwise)
     TokenSamplingPolicy sampling;
     TokenSamplerOptions sampler_options;
     CliSpeculation speculation = CliSpeculation::off;
