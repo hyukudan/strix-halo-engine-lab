@@ -1,0 +1,1030 @@
+A deepseek41-pair fast attention_f16wmma=0 s4
+A deepseek41-pair fast moe_relaxed=1 s7
+A deepseek41-pair fast dense_f16=0 s3
+A deepseek41-pair fast fast_prefill=1 s7
+A deepseek41-pair fast dense_min_rows=128 s3
+A deepseek41-pair fast decoder_replay=0 s3
+A deepseek41-pair fast engram_f16wmma=1 s7
+A deepseek41-pair fast shared_f16=1 s7
+A deepseek41-pair fast moe_f16wmma=1 s7
+A deepseek41-pair fast moe_iu4=0 s3
+A deepseek41-pair fast moe_iu4_scope= s3
+A deepseek41-pair fast prefill_bf16_attention=0 s3
+A deepseek41-pair fast prefill_fp16_dense_lt=0 s3
+A deepseek41-pair turbo attention_f16wmma=0 s4
+A deepseek41-pair turbo moe_relaxed=1 s7
+A deepseek41-pair turbo dense_f16=0 s3
+A deepseek41-pair turbo fast_prefill=1 s7
+A deepseek41-pair turbo dense_min_rows=128 s3
+A deepseek41-pair turbo decoder_replay=0 s4
+A deepseek41-pair turbo engram_f16wmma=1 s7
+A deepseek41-pair turbo shared_f16=1 s7
+A deepseek41-pair turbo moe_f16wmma=1 s7
+A deepseek41-pair turbo moe_iu4=0 s4
+A deepseek41-pair turbo moe_iu4_scope= s3
+A deepseek41-pair turbo prefill_bf16_attention=0 s3
+A deepseek41-pair turbo prefill_fp16_dense_lt=0 s3
+A deepseek41-rtx fast lean_state=on s3
+A deepseek41-rtx fast q8_r1=on s3
+A deepseek41-rtx fast dsrtxk=on s3
+A deepseek41-rtx fast fuse=on s3
+A deepseek41-rtx fast decode_forms=on s3
+A deepseek41-rtx fast evict_auto=on s3
+A deepseek41-rtx fast controller=on s3
+A deepseek41-rtx fast draft_keep=on s3
+A deepseek41-rtx fast draft_vocab_auto=on s3
+A deepseek41-rtx fast wb_defer=on s3
+A deepseek41-rtx fast ce_pacing=on s3
+A deepseek41-rtx fast wb_stream=on s3
+A deepseek41-rtx fast file_tier=on s3
+A deepseek41-rtx fast residency_auto=on s3
+A deepseek41-rtx fast warmup_graphs=on s3
+A deepseek41-rtx fast engram_cache=on s3
+A deepseek41-rtx fast prompt_layer_major=off s4
+A deepseek41-rtx fast host_promote=on s3
+A deepseek41-rtx fast batch_long=off s4
+A deepseek41-rtx fast fp16_dense_prefill=off s4
+A deepseek41-rtx turbo throws deepseek41-rtx: --profile turbo is not declared for this engine
+A glm-pair fast pf_wmma=0 s3
+A glm-pair fast stored_i4=exl3 s3
+A glm-pair fast mla_wmma=0 s3
+A glm-pair fast mla_ob16=0 s3
+A glm-pair fast kda_wmma=0 s3
+A glm-pair fast attn_wmma=0 s3
+A glm-pair fast idxproj_wmma=0 s3
+A glm-pair fast router_wmma=0 s3
+A glm-pair fast idx_scores=exact s3
+A glm-pair fast kda_state16=0 s3
+A glm-pair turbo pf_wmma=1 s0
+A glm-pair turbo stored_i4=exl3 s4
+A glm-pair turbo mla_wmma=0 s4
+A glm-pair turbo mla_ob16=0 s3
+A glm-pair turbo kda_wmma=0 s4
+A glm-pair turbo attn_wmma=0 s4
+A glm-pair turbo idxproj_wmma=0 s4
+A glm-pair turbo router_wmma=0 s4
+A glm-pair turbo idx_scores=exact s4
+A glm-pair turbo kda_state16=0 s4
+A minimax-pair fast msa_flash=1 s0
+A minimax-pair fast msa_flash_layers=40-59 s3
+A minimax-pair fast model_format=exl3 s3
+A minimax-pair fast iu4_layers=none s3
+A minimax-pair fast iu4_a8=0 s3
+A minimax-pair fast idx_wmma=0 s3
+A minimax-pair fast idx_wmma_layers=40-59 s3
+A minimax-pair fast tp2_exchange_fmt=f32 s3
+A minimax-pair fast router_wmma=1 s0
+A minimax-pair fast router_wmma_layers=40-59 s3
+A minimax-pair fast pf_dense_tail_fixed=0 s3
+A minimax-pair turbo msa_flash=1 s0
+A minimax-pair turbo msa_flash_layers=40-59 s4
+A minimax-pair turbo model_format=exl3 s3
+A minimax-pair turbo iu4_layers=none s4
+A minimax-pair turbo iu4_a8=0 s3
+A minimax-pair turbo idx_wmma=0 s3
+A minimax-pair turbo idx_wmma_layers=40-59 s3
+A minimax-pair turbo tp2_exchange_fmt=f32 s3
+A minimax-pair turbo router_wmma=1 s0
+A minimax-pair turbo router_wmma_layers=40-59 s3
+A minimax-pair turbo pf_dense_tail_fixed=0 s3
+A qwen35 fast prefill_arith=exact s4
+A qwen35 fast prefill_gdn=serial s4
+A qwen35 fast prefill_hid=f32 s4
+A qwen35 fast prefill_attn8=off s4
+A qwen35 fast split_k=exact s4
+A qwen35 fast decode_attn8=off s4
+A qwen35 fast kv_fp8=native s3
+A qwen35 fast dense_activation=off s3
+A qwen35 fast drafter_window=7 s3
+A qwen35 turbo prefill_arith=exact s4
+A qwen35 turbo prefill_gdn=serial s4
+A qwen35 turbo prefill_hid=f32 s4
+A qwen35 turbo prefill_attn8=off s4
+A qwen35 turbo split_k=exact s4
+A qwen35 turbo decode_attn8=off s4
+A qwen35 turbo kv_fp8=native s4
+A qwen35 turbo dense_activation=off s4
+A qwen35 turbo drafter_window=7 s4
+A qwen35-hip-decode fast wide_rows=engine default (64-row EXACT windows, IU4) s4
+A qwen35-hip-decode fast a4w4_layers=48-63 s0
+A qwen35-hip-decode turbo throws qwen35-hip-decode: --profile turbo is not declared for this engine
+A qwen35-hip-spec fast a4w4_layers=48-63 s0
+A qwen35-hip-spec fast prefill_rows=engine default (64-row EXACT windows, IU4) s4
+A qwen35-hip-spec turbo throws qwen35-hip-spec: --profile turbo is not declared for this engine
+A hy4-hip fast prompt_rows=0 s4
+A hy4-hip fast head_q8=0 s4
+A hy4-hip fast pf_mha=0 s4
+A hy4-hip fast decode_iu4=off s3
+A hy4-hip fast pf_a8_producer=1 s3
+A hy4-hip fast q8_store_epilogue=1 s3
+A hy4-hip fast pf_store_epilogue=1 s3
+A hy4-hip turbo prompt_rows=0 s4
+A hy4-hip turbo head_q8=0 s4
+A hy4-hip turbo pf_mha=0 s4
+A hy4-hip turbo decode_iu4=off s4
+A hy4-hip turbo pf_a8_producer=1 s3
+A hy4-hip turbo q8_store_epilogue=1 s3
+A hy4-hip turbo pf_store_epilogue=1 s3
+A inkling2-mini fast inkling2-mini-moe-w4a4@1=0 s4
+A inkling2-mini fast inkling2-mini-combine-down-image@1=0 s3
+A inkling2-mini fast inkling2-mini-prepared-round-fold@1=0 s3
+A inkling2-mini fast moe.experts.mxfp8-nvfp4@1=0 s3
+A inkling2-mini fast inkling2-mini-controller-planes@1=3 s3
+A inkling2-mini fast inkling2-mini-attn-projected-bias@1=0 s3
+A inkling2-mini fast inkling2-mini-served-cli-route@1=0 s3
+A inkling2-mini fast inkling2-mini-screened-head@1=0 s3
+A inkling2-mini fast inkling2-mini-lowbit-turbo@1=0 s3
+A inkling2-mini fast inkling2-mini-verify-rows@1=0 s3
+A inkling2-mini fast inkling2-vision-recipe=legacy s3
+A inkling2-mini fast spec.block-candidate@1=off s3
+A inkling2-mini turbo inkling2-mini-moe-w4a4@1=0 s4
+A inkling2-mini turbo inkling2-mini-combine-down-image@1=0 s3
+A inkling2-mini turbo inkling2-mini-prepared-round-fold@1=0 s3
+A inkling2-mini turbo moe.experts.mxfp8-nvfp4@1=0 s4
+A inkling2-mini turbo inkling2-mini-controller-planes@1=3 s3
+A inkling2-mini turbo inkling2-mini-attn-projected-bias@1=0 s3
+A inkling2-mini turbo inkling2-mini-served-cli-route@1=0 s3
+A inkling2-mini turbo inkling2-mini-screened-head@1=0 s3
+A inkling2-mini turbo inkling2-mini-lowbit-turbo@1=0 s3
+A inkling2-mini turbo inkling2-mini-verify-rows@1=0 s3
+A inkling2-mini turbo inkling2-vision-recipe=legacy s3
+A inkling2-mini turbo spec.block-candidate@1=off s3
+B qwen-hip fast ctx=0 qsa_budget=1536 s7
+B qwen-hip fast ctx=0 moe_route_bf16=1 s7
+B qwen-hip fast ctx=0 gdn_fp16_chunk=1 s7
+B qwen-hip fast ctx=0 output_head=default s4
+B qwen-cuda fast moe_route_bf16=0 s4
+B qwen-cuda fast qsa_budget=default s4
+B qwen-cuda fast gdn_fp16_chunk=0 s4
+B qwen-cuda fast output_head=default s4
+B qwen-cuda fast hc_mma=1 s7
+B qwen-cuda fast qsa_mma=1 s7
+B qwen-cuda fast expert_fast=1 s7
+B qwen-cuda fast mtp_defer_prompt=1 s0
+B qwen-hip fast ctx=1 qsa_budget=1536 s0
+B qwen-hip fast ctx=1 moe_route_bf16=1 s0
+B qwen-hip fast ctx=1 gdn_fp16_chunk=1 s0
+B qwen-hip fast ctx=1 output_head=default s4
+B qwen-cuda fast moe_route_bf16=0 s4
+B qwen-cuda fast qsa_budget=default s4
+B qwen-cuda fast gdn_fp16_chunk=0 s4
+B qwen-cuda fast output_head=default s4
+B qwen-cuda fast hc_mma=1 s7
+B qwen-cuda fast qsa_mma=1 s7
+B qwen-cuda fast expert_fast=1 s7
+B qwen-cuda fast mtp_defer_prompt=1 s0
+B qwen-hip fast ctx=4096 qsa_budget=1536 s0
+B qwen-hip fast ctx=4096 moe_route_bf16=1 s0
+B qwen-hip fast ctx=4096 gdn_fp16_chunk=1 s0
+B qwen-hip fast ctx=4096 output_head=default s4
+B qwen-cuda fast moe_route_bf16=0 s4
+B qwen-cuda fast qsa_budget=default s4
+B qwen-cuda fast gdn_fp16_chunk=0 s4
+B qwen-cuda fast output_head=default s4
+B qwen-cuda fast hc_mma=1 s7
+B qwen-cuda fast qsa_mma=1 s7
+B qwen-cuda fast expert_fast=1 s7
+B qwen-cuda fast mtp_defer_prompt=1 s0
+B qwen-hip fast ctx=8192 qsa_budget=1536 s0
+B qwen-hip fast ctx=8192 moe_route_bf16=1 s0
+B qwen-hip fast ctx=8192 gdn_fp16_chunk=1 s0
+B qwen-hip fast ctx=8192 output_head=default s4
+B qwen-cuda fast moe_route_bf16=0 s4
+B qwen-cuda fast qsa_budget=default s4
+B qwen-cuda fast gdn_fp16_chunk=0 s4
+B qwen-cuda fast output_head=default s4
+B qwen-cuda fast hc_mma=1 s7
+B qwen-cuda fast qsa_mma=1 s7
+B qwen-cuda fast expert_fast=1 s7
+B qwen-cuda fast mtp_defer_prompt=1 s0
+B qwen-hip fast ctx=8193 qsa_budget=1536 s7
+B qwen-hip fast ctx=8193 moe_route_bf16=1 s7
+B qwen-hip fast ctx=8193 gdn_fp16_chunk=1 s7
+B qwen-hip fast ctx=8193 output_head=default s4
+B qwen-cuda fast moe_route_bf16=0 s4
+B qwen-cuda fast qsa_budget=default s4
+B qwen-cuda fast gdn_fp16_chunk=0 s4
+B qwen-cuda fast output_head=default s4
+B qwen-cuda fast hc_mma=1 s7
+B qwen-cuda fast qsa_mma=1 s7
+B qwen-cuda fast expert_fast=1 s7
+B qwen-cuda fast mtp_defer_prompt=1 s0
+B qwen-hip fast ctx=32768 qsa_budget=1536 s7
+B qwen-hip fast ctx=32768 moe_route_bf16=1 s7
+B qwen-hip fast ctx=32768 gdn_fp16_chunk=1 s7
+B qwen-hip fast ctx=32768 output_head=default s4
+B qwen-cuda fast moe_route_bf16=0 s4
+B qwen-cuda fast qsa_budget=default s4
+B qwen-cuda fast gdn_fp16_chunk=0 s4
+B qwen-cuda fast output_head=default s4
+B qwen-cuda fast hc_mma=1 s7
+B qwen-cuda fast qsa_mma=1 s7
+B qwen-cuda fast expert_fast=1 s7
+B qwen-cuda fast mtp_defer_prompt=1 s0
+B qwen-hip turbo ctx=0 qsa_budget=1536 s7
+B qwen-hip turbo ctx=0 moe_route_bf16=1 s7
+B qwen-hip turbo ctx=0 moe_route_prune=off s4
+B qwen-hip turbo ctx=0 gdn_fp16_chunk=1 s7
+B qwen-hip turbo ctx=0 index_proj_wmma=1 s7
+B qwen-hip turbo ctx=0 index_score_wmma=1 s7
+B qwen-hip turbo ctx=0 ple_rows_f16=1 s7
+B qwen-hip turbo ctx=0 gdn_gates_f16=1 s7
+B qwen-hip turbo ctx=0 output_head=default s4
+B qwen-hip turbo ctx=0 moe_route_ctrl=0 s4
+B qwen-cuda turbo moe_route_bf16=0 s4
+B qwen-cuda turbo qsa_budget=default s4
+B qwen-cuda turbo gdn_fp16_chunk=0 s4
+B qwen-cuda turbo output_head=default s4
+B qwen-cuda turbo hc_mma=1 s7
+B qwen-cuda turbo qsa_mma=1 s7
+B qwen-cuda turbo moe_mma=0 s3
+B qwen-cuda turbo expert_turbo=1 s7
+B qwen-cuda turbo expert_turbo_rows=512 s7
+B qwen-cuda turbo expert_fast=1 s7
+B qwen-cuda turbo mtp_defer_prompt=1 s0
+B qwen-hip turbo ctx=1 qsa_budget=1536 s0
+B qwen-hip turbo ctx=1 moe_route_bf16=1 s0
+B qwen-hip turbo ctx=1 moe_route_prune=off s4
+B qwen-hip turbo ctx=1 gdn_fp16_chunk=1 s0
+B qwen-hip turbo ctx=1 index_proj_wmma=1 s7
+B qwen-hip turbo ctx=1 index_score_wmma=1 s7
+B qwen-hip turbo ctx=1 ple_rows_f16=1 s7
+B qwen-hip turbo ctx=1 gdn_gates_f16=1 s7
+B qwen-hip turbo ctx=1 output_head=default s4
+B qwen-hip turbo ctx=1 moe_route_ctrl=0 s4
+B qwen-cuda turbo moe_route_bf16=0 s4
+B qwen-cuda turbo qsa_budget=default s4
+B qwen-cuda turbo gdn_fp16_chunk=0 s4
+B qwen-cuda turbo output_head=default s4
+B qwen-cuda turbo hc_mma=1 s7
+B qwen-cuda turbo qsa_mma=1 s7
+B qwen-cuda turbo moe_mma=0 s3
+B qwen-cuda turbo expert_turbo=1 s7
+B qwen-cuda turbo expert_turbo_rows=512 s7
+B qwen-cuda turbo expert_fast=1 s7
+B qwen-cuda turbo mtp_defer_prompt=1 s0
+B qwen-hip turbo ctx=4096 qsa_budget=1536 s0
+B qwen-hip turbo ctx=4096 moe_route_bf16=1 s0
+B qwen-hip turbo ctx=4096 moe_route_prune=off s4
+B qwen-hip turbo ctx=4096 gdn_fp16_chunk=1 s0
+B qwen-hip turbo ctx=4096 index_proj_wmma=1 s7
+B qwen-hip turbo ctx=4096 index_score_wmma=1 s7
+B qwen-hip turbo ctx=4096 ple_rows_f16=1 s7
+B qwen-hip turbo ctx=4096 gdn_gates_f16=1 s7
+B qwen-hip turbo ctx=4096 output_head=default s4
+B qwen-hip turbo ctx=4096 moe_route_ctrl=0 s4
+B qwen-cuda turbo moe_route_bf16=0 s4
+B qwen-cuda turbo qsa_budget=default s4
+B qwen-cuda turbo gdn_fp16_chunk=0 s4
+B qwen-cuda turbo output_head=default s4
+B qwen-cuda turbo hc_mma=1 s7
+B qwen-cuda turbo qsa_mma=1 s7
+B qwen-cuda turbo moe_mma=0 s3
+B qwen-cuda turbo expert_turbo=1 s7
+B qwen-cuda turbo expert_turbo_rows=512 s7
+B qwen-cuda turbo expert_fast=1 s7
+B qwen-cuda turbo mtp_defer_prompt=1 s0
+B qwen-hip turbo ctx=8192 qsa_budget=1536 s0
+B qwen-hip turbo ctx=8192 moe_route_bf16=1 s0
+B qwen-hip turbo ctx=8192 moe_route_prune=off s4
+B qwen-hip turbo ctx=8192 gdn_fp16_chunk=1 s0
+B qwen-hip turbo ctx=8192 index_proj_wmma=1 s7
+B qwen-hip turbo ctx=8192 index_score_wmma=1 s7
+B qwen-hip turbo ctx=8192 ple_rows_f16=1 s7
+B qwen-hip turbo ctx=8192 gdn_gates_f16=1 s7
+B qwen-hip turbo ctx=8192 output_head=default s4
+B qwen-hip turbo ctx=8192 moe_route_ctrl=0 s4
+B qwen-cuda turbo moe_route_bf16=0 s4
+B qwen-cuda turbo qsa_budget=default s4
+B qwen-cuda turbo gdn_fp16_chunk=0 s4
+B qwen-cuda turbo output_head=default s4
+B qwen-cuda turbo hc_mma=1 s7
+B qwen-cuda turbo qsa_mma=1 s7
+B qwen-cuda turbo moe_mma=0 s3
+B qwen-cuda turbo expert_turbo=1 s7
+B qwen-cuda turbo expert_turbo_rows=512 s7
+B qwen-cuda turbo expert_fast=1 s7
+B qwen-cuda turbo mtp_defer_prompt=1 s0
+B qwen-hip turbo ctx=8193 qsa_budget=1536 s7
+B qwen-hip turbo ctx=8193 moe_route_bf16=1 s7
+B qwen-hip turbo ctx=8193 moe_route_prune=off s4
+B qwen-hip turbo ctx=8193 gdn_fp16_chunk=1 s7
+B qwen-hip turbo ctx=8193 index_proj_wmma=1 s7
+B qwen-hip turbo ctx=8193 index_score_wmma=1 s7
+B qwen-hip turbo ctx=8193 ple_rows_f16=1 s7
+B qwen-hip turbo ctx=8193 gdn_gates_f16=1 s7
+B qwen-hip turbo ctx=8193 output_head=default s4
+B qwen-hip turbo ctx=8193 moe_route_ctrl=0 s4
+B qwen-cuda turbo moe_route_bf16=0 s4
+B qwen-cuda turbo qsa_budget=default s4
+B qwen-cuda turbo gdn_fp16_chunk=0 s4
+B qwen-cuda turbo output_head=default s4
+B qwen-cuda turbo hc_mma=1 s7
+B qwen-cuda turbo qsa_mma=1 s7
+B qwen-cuda turbo moe_mma=0 s3
+B qwen-cuda turbo expert_turbo=1 s7
+B qwen-cuda turbo expert_turbo_rows=512 s7
+B qwen-cuda turbo expert_fast=1 s7
+B qwen-cuda turbo mtp_defer_prompt=1 s0
+B qwen-hip turbo ctx=32768 qsa_budget=1536 s7
+B qwen-hip turbo ctx=32768 moe_route_bf16=1 s7
+B qwen-hip turbo ctx=32768 moe_route_prune=off s4
+B qwen-hip turbo ctx=32768 gdn_fp16_chunk=1 s7
+B qwen-hip turbo ctx=32768 index_proj_wmma=1 s7
+B qwen-hip turbo ctx=32768 index_score_wmma=1 s7
+B qwen-hip turbo ctx=32768 ple_rows_f16=1 s7
+B qwen-hip turbo ctx=32768 gdn_gates_f16=1 s7
+B qwen-hip turbo ctx=32768 output_head=default s4
+B qwen-hip turbo ctx=32768 moe_route_ctrl=0 s4
+B qwen-cuda turbo moe_route_bf16=0 s4
+B qwen-cuda turbo qsa_budget=default s4
+B qwen-cuda turbo gdn_fp16_chunk=0 s4
+B qwen-cuda turbo output_head=default s4
+B qwen-cuda turbo hc_mma=1 s7
+B qwen-cuda turbo qsa_mma=1 s7
+B qwen-cuda turbo moe_mma=0 s3
+B qwen-cuda turbo expert_turbo=1 s7
+B qwen-cuda turbo expert_turbo_rows=512 s7
+B qwen-cuda turbo expert_fast=1 s7
+B qwen-cuda turbo mtp_defer_prompt=1 s0
+C qwen35-cuda-dense fast w0 r0 ctx=0 prefill_arith=exact s4
+C qwen35-cuda-dense fast w0 r0 ctx=0 prefill_gdn=serial s4
+C qwen35-cuda-dense fast w0 r0 ctx=0 prefill_hid=f32 s4
+C qwen35-cuda-dense fast w0 r0 ctx=0 prefill_attn8=off s4
+C qwen35-cuda-dense fast w0 r0 ctx=0 split_k=exact s4
+C qwen35-cuda-dense fast w0 r0 ctx=0 decode_attn8=off s4
+C qwen35-cuda-dense fast w0 r0 ctx=0 kv_fp8=native s3
+C qwen35-cuda-dense fast w0 r0 ctx=0 dense_activation=off s3
+C qwen35-cuda-dense fast w0 r0 ctx=4096 prefill_arith=exact s4
+C qwen35-cuda-dense fast w0 r0 ctx=4096 prefill_gdn=serial s4
+C qwen35-cuda-dense fast w0 r0 ctx=4096 prefill_hid=f32 s4
+C qwen35-cuda-dense fast w0 r0 ctx=4096 prefill_attn8=off s4
+C qwen35-cuda-dense fast w0 r0 ctx=4096 split_k=exact s4
+C qwen35-cuda-dense fast w0 r0 ctx=4096 decode_attn8=off s4
+C qwen35-cuda-dense fast w0 r0 ctx=4096 kv_fp8=native s3
+C qwen35-cuda-dense fast w0 r0 ctx=4096 dense_activation=off s3
+C qwen35-cuda-dense fast w0 r0 ctx=8191 prefill_arith=exact s4
+C qwen35-cuda-dense fast w0 r0 ctx=8191 prefill_gdn=serial s4
+C qwen35-cuda-dense fast w0 r0 ctx=8191 prefill_hid=f32 s4
+C qwen35-cuda-dense fast w0 r0 ctx=8191 prefill_attn8=off s4
+C qwen35-cuda-dense fast w0 r0 ctx=8191 split_k=exact s4
+C qwen35-cuda-dense fast w0 r0 ctx=8191 decode_attn8=off s4
+C qwen35-cuda-dense fast w0 r0 ctx=8191 kv_fp8=native s3
+C qwen35-cuda-dense fast w0 r0 ctx=8191 dense_activation=off s3
+C qwen35-cuda-dense fast w0 r0 ctx=8192 prefill_arith=exact s4
+C qwen35-cuda-dense fast w0 r0 ctx=8192 prefill_gdn=serial s4
+C qwen35-cuda-dense fast w0 r0 ctx=8192 prefill_hid=f32 s4
+C qwen35-cuda-dense fast w0 r0 ctx=8192 prefill_attn8=off s4
+C qwen35-cuda-dense fast w0 r0 ctx=8192 split_k=exact s4
+C qwen35-cuda-dense fast w0 r0 ctx=8192 decode_attn8=off s4
+C qwen35-cuda-dense fast w0 r0 ctx=8192 kv_fp8=native s3
+C qwen35-cuda-dense fast w0 r0 ctx=8192 dense_activation=off s3
+C qwen35-cuda-dense fast w0 r0 ctx=32768 prefill_arith=exact s4
+C qwen35-cuda-dense fast w0 r0 ctx=32768 prefill_gdn=serial s4
+C qwen35-cuda-dense fast w0 r0 ctx=32768 prefill_hid=f32 s4
+C qwen35-cuda-dense fast w0 r0 ctx=32768 prefill_attn8=off s4
+C qwen35-cuda-dense fast w0 r0 ctx=32768 split_k=exact s4
+C qwen35-cuda-dense fast w0 r0 ctx=32768 decode_attn8=off s4
+C qwen35-cuda-dense fast w0 r0 ctx=32768 kv_fp8=native s3
+C qwen35-cuda-dense fast w0 r0 ctx=32768 dense_activation=off s3
+C qwen35-cuda-dense fast w0 r1 ctx=0 split_k=exact s4
+C qwen35-cuda-dense fast w0 r1 ctx=0 decode_attn8=off s4
+C qwen35-cuda-dense fast w0 r1 ctx=0 kv_fp8=native s3
+C qwen35-cuda-dense fast w0 r1 ctx=0 dense_activation=off s3
+C qwen35-cuda-dense fast w0 r1 ctx=4096 split_k=exact s4
+C qwen35-cuda-dense fast w0 r1 ctx=4096 decode_attn8=off s4
+C qwen35-cuda-dense fast w0 r1 ctx=4096 kv_fp8=native s3
+C qwen35-cuda-dense fast w0 r1 ctx=4096 dense_activation=off s3
+C qwen35-cuda-dense fast w0 r1 ctx=8191 split_k=exact s4
+C qwen35-cuda-dense fast w0 r1 ctx=8191 decode_attn8=off s4
+C qwen35-cuda-dense fast w0 r1 ctx=8191 kv_fp8=native s3
+C qwen35-cuda-dense fast w0 r1 ctx=8191 dense_activation=off s3
+C qwen35-cuda-dense fast w0 r1 ctx=8192 split_k=exact s4
+C qwen35-cuda-dense fast w0 r1 ctx=8192 decode_attn8=off s4
+C qwen35-cuda-dense fast w0 r1 ctx=8192 kv_fp8=native s3
+C qwen35-cuda-dense fast w0 r1 ctx=8192 dense_activation=off s3
+C qwen35-cuda-dense fast w0 r1 ctx=32768 split_k=exact s4
+C qwen35-cuda-dense fast w0 r1 ctx=32768 decode_attn8=off s4
+C qwen35-cuda-dense fast w0 r1 ctx=32768 kv_fp8=native s3
+C qwen35-cuda-dense fast w0 r1 ctx=32768 dense_activation=off s3
+C qwen35-cuda-dense fast w1 r0 ctx=0 prefill_arith=exact s4
+C qwen35-cuda-dense fast w1 r0 ctx=0 prefill_gdn=serial s4
+C qwen35-cuda-dense fast w1 r0 ctx=0 prefill_hid=f32 s4
+C qwen35-cuda-dense fast w1 r0 ctx=0 prefill_attn8=off s4
+C qwen35-cuda-dense fast w1 r0 ctx=0 split_k=exact s4
+C qwen35-cuda-dense fast w1 r0 ctx=0 decode_attn8=off s4
+C qwen35-cuda-dense fast w1 r0 ctx=0 kv_fp8=native s3
+C qwen35-cuda-dense fast w1 r0 ctx=0 dense_activation=off s3
+C qwen35-cuda-dense fast w1 r0 ctx=4096 prefill_arith=exact s4
+C qwen35-cuda-dense fast w1 r0 ctx=4096 prefill_gdn=serial s4
+C qwen35-cuda-dense fast w1 r0 ctx=4096 prefill_hid=f32 s4
+C qwen35-cuda-dense fast w1 r0 ctx=4096 prefill_attn8=off s4
+C qwen35-cuda-dense fast w1 r0 ctx=4096 split_k=exact s4
+C qwen35-cuda-dense fast w1 r0 ctx=4096 decode_attn8=off s4
+C qwen35-cuda-dense fast w1 r0 ctx=4096 kv_fp8=native s3
+C qwen35-cuda-dense fast w1 r0 ctx=4096 dense_activation=off s3
+C qwen35-cuda-dense fast w1 r0 ctx=8191 prefill_arith=exact s4
+C qwen35-cuda-dense fast w1 r0 ctx=8191 prefill_gdn=serial s4
+C qwen35-cuda-dense fast w1 r0 ctx=8191 prefill_hid=f32 s4
+C qwen35-cuda-dense fast w1 r0 ctx=8191 prefill_attn8=off s4
+C qwen35-cuda-dense fast w1 r0 ctx=8191 split_k=exact s4
+C qwen35-cuda-dense fast w1 r0 ctx=8191 decode_attn8=off s4
+C qwen35-cuda-dense fast w1 r0 ctx=8191 kv_fp8=native s3
+C qwen35-cuda-dense fast w1 r0 ctx=8191 dense_activation=off s3
+C qwen35-cuda-dense fast w1 r0 ctx=8192 prefill_arith=exact s4
+C qwen35-cuda-dense fast w1 r0 ctx=8192 prefill_gdn=serial s4
+C qwen35-cuda-dense fast w1 r0 ctx=8192 prefill_hid=f32 s4
+C qwen35-cuda-dense fast w1 r0 ctx=8192 prefill_attn8=off s4
+C qwen35-cuda-dense fast w1 r0 ctx=8192 split_k=exact s4
+C qwen35-cuda-dense fast w1 r0 ctx=8192 decode_attn8=off s4
+C qwen35-cuda-dense fast w1 r0 ctx=8192 kv_fp8=native s3
+C qwen35-cuda-dense fast w1 r0 ctx=8192 dense_activation=off s3
+C qwen35-cuda-dense fast w1 r0 ctx=32768 prefill_arith=exact s4
+C qwen35-cuda-dense fast w1 r0 ctx=32768 prefill_gdn=serial s4
+C qwen35-cuda-dense fast w1 r0 ctx=32768 prefill_hid=f32 s4
+C qwen35-cuda-dense fast w1 r0 ctx=32768 prefill_attn8=off s4
+C qwen35-cuda-dense fast w1 r0 ctx=32768 split_k=exact s4
+C qwen35-cuda-dense fast w1 r0 ctx=32768 decode_attn8=off s4
+C qwen35-cuda-dense fast w1 r0 ctx=32768 kv_fp8=native s3
+C qwen35-cuda-dense fast w1 r0 ctx=32768 dense_activation=off s3
+C qwen35-cuda-dense fast w1 r1 ctx=0 split_k=exact s4
+C qwen35-cuda-dense fast w1 r1 ctx=0 decode_attn8=off s4
+C qwen35-cuda-dense fast w1 r1 ctx=0 kv_fp8=native s3
+C qwen35-cuda-dense fast w1 r1 ctx=0 dense_activation=off s3
+C qwen35-cuda-dense fast w1 r1 ctx=4096 split_k=exact s4
+C qwen35-cuda-dense fast w1 r1 ctx=4096 decode_attn8=off s4
+C qwen35-cuda-dense fast w1 r1 ctx=4096 kv_fp8=native s3
+C qwen35-cuda-dense fast w1 r1 ctx=4096 dense_activation=off s3
+C qwen35-cuda-dense fast w1 r1 ctx=8191 split_k=exact s4
+C qwen35-cuda-dense fast w1 r1 ctx=8191 decode_attn8=off s4
+C qwen35-cuda-dense fast w1 r1 ctx=8191 kv_fp8=native s3
+C qwen35-cuda-dense fast w1 r1 ctx=8191 dense_activation=off s3
+C qwen35-cuda-dense fast w1 r1 ctx=8192 split_k=exact s4
+C qwen35-cuda-dense fast w1 r1 ctx=8192 decode_attn8=off s4
+C qwen35-cuda-dense fast w1 r1 ctx=8192 kv_fp8=native s3
+C qwen35-cuda-dense fast w1 r1 ctx=8192 dense_activation=off s3
+C qwen35-cuda-dense fast w1 r1 ctx=32768 split_k=exact s4
+C qwen35-cuda-dense fast w1 r1 ctx=32768 decode_attn8=off s4
+C qwen35-cuda-dense fast w1 r1 ctx=32768 kv_fp8=native s3
+C qwen35-cuda-dense fast w1 r1 ctx=32768 dense_activation=off s3
+C qwen35-cuda-dense fast w2 r0 ctx=0 prefill_arith=fast4 s0
+C qwen35-cuda-dense fast w2 r0 ctx=0 prefill_gdn=chunk16tc s0
+C qwen35-cuda-dense fast w2 r0 ctx=0 prefill_hid=f32 s4
+C qwen35-cuda-dense fast w2 r0 ctx=0 prefill_attn8=off s4
+C qwen35-cuda-dense fast w2 r0 ctx=0 split_k=exact s4
+C qwen35-cuda-dense fast w2 r0 ctx=0 decode_attn8=off s4
+C qwen35-cuda-dense fast w2 r0 ctx=0 kv_fp8=native s3
+C qwen35-cuda-dense fast w2 r0 ctx=0 dense_activation=off s3
+C qwen35-cuda-dense fast w2 r0 ctx=4096 prefill_arith=fast4 s0
+C qwen35-cuda-dense fast w2 r0 ctx=4096 prefill_gdn=chunk16tc s0
+C qwen35-cuda-dense fast w2 r0 ctx=4096 prefill_hid=f32 s4
+C qwen35-cuda-dense fast w2 r0 ctx=4096 prefill_attn8=off s4
+C qwen35-cuda-dense fast w2 r0 ctx=4096 split_k=exact s4
+C qwen35-cuda-dense fast w2 r0 ctx=4096 decode_attn8=off s4
+C qwen35-cuda-dense fast w2 r0 ctx=4096 kv_fp8=native s3
+C qwen35-cuda-dense fast w2 r0 ctx=4096 dense_activation=off s3
+C qwen35-cuda-dense fast w2 r0 ctx=8191 prefill_arith=fast4 s0
+C qwen35-cuda-dense fast w2 r0 ctx=8191 prefill_gdn=chunk16tc s0
+C qwen35-cuda-dense fast w2 r0 ctx=8191 prefill_hid=f32 s4
+C qwen35-cuda-dense fast w2 r0 ctx=8191 prefill_attn8=off s4
+C qwen35-cuda-dense fast w2 r0 ctx=8191 split_k=exact s4
+C qwen35-cuda-dense fast w2 r0 ctx=8191 decode_attn8=off s4
+C qwen35-cuda-dense fast w2 r0 ctx=8191 kv_fp8=native s3
+C qwen35-cuda-dense fast w2 r0 ctx=8191 dense_activation=off s3
+C qwen35-cuda-dense fast w2 r0 ctx=8192 prefill_arith=fast4 s0
+C qwen35-cuda-dense fast w2 r0 ctx=8192 prefill_gdn=chunk16tc s0
+C qwen35-cuda-dense fast w2 r0 ctx=8192 prefill_hid=f32 s4
+C qwen35-cuda-dense fast w2 r0 ctx=8192 prefill_attn8=on s0
+C qwen35-cuda-dense fast w2 r0 ctx=8192 split_k=exact s4
+C qwen35-cuda-dense fast w2 r0 ctx=8192 decode_attn8=off s4
+C qwen35-cuda-dense fast w2 r0 ctx=8192 kv_fp8=native s3
+C qwen35-cuda-dense fast w2 r0 ctx=8192 dense_activation=off s3
+C qwen35-cuda-dense fast w2 r0 ctx=32768 prefill_arith=fast4 s0
+C qwen35-cuda-dense fast w2 r0 ctx=32768 prefill_gdn=chunk16tc s0
+C qwen35-cuda-dense fast w2 r0 ctx=32768 prefill_hid=f32 s4
+C qwen35-cuda-dense fast w2 r0 ctx=32768 prefill_attn8=on s0
+C qwen35-cuda-dense fast w2 r0 ctx=32768 split_k=exact s4
+C qwen35-cuda-dense fast w2 r0 ctx=32768 decode_attn8=off s4
+C qwen35-cuda-dense fast w2 r0 ctx=32768 kv_fp8=native s3
+C qwen35-cuda-dense fast w2 r0 ctx=32768 dense_activation=off s3
+C qwen35-cuda-dense fast w2 r1 ctx=0 split_k=fast s0
+C qwen35-cuda-dense fast w2 r1 ctx=0 decode_attn8=off s4
+C qwen35-cuda-dense fast w2 r1 ctx=0 kv_fp8=native s3
+C qwen35-cuda-dense fast w2 r1 ctx=0 dense_activation=off s3
+C qwen35-cuda-dense fast w2 r1 ctx=4096 split_k=fast s0
+C qwen35-cuda-dense fast w2 r1 ctx=4096 decode_attn8=off s4
+C qwen35-cuda-dense fast w2 r1 ctx=4096 kv_fp8=native s3
+C qwen35-cuda-dense fast w2 r1 ctx=4096 dense_activation=off s3
+C qwen35-cuda-dense fast w2 r1 ctx=8191 split_k=fast s0
+C qwen35-cuda-dense fast w2 r1 ctx=8191 decode_attn8=off s4
+C qwen35-cuda-dense fast w2 r1 ctx=8191 kv_fp8=native s3
+C qwen35-cuda-dense fast w2 r1 ctx=8191 dense_activation=off s3
+C qwen35-cuda-dense fast w2 r1 ctx=8192 split_k=fast s0
+C qwen35-cuda-dense fast w2 r1 ctx=8192 decode_attn8=off s4
+C qwen35-cuda-dense fast w2 r1 ctx=8192 kv_fp8=native s3
+C qwen35-cuda-dense fast w2 r1 ctx=8192 dense_activation=off s3
+C qwen35-cuda-dense fast w2 r1 ctx=32768 split_k=fast s0
+C qwen35-cuda-dense fast w2 r1 ctx=32768 decode_attn8=off s4
+C qwen35-cuda-dense fast w2 r1 ctx=32768 kv_fp8=native s3
+C qwen35-cuda-dense fast w2 r1 ctx=32768 dense_activation=off s3
+C qwen35-cuda-dense turbo w0 r0 ctx=0 prefill_arith=exact s4
+C qwen35-cuda-dense turbo w0 r0 ctx=0 prefill_gdn=serial s4
+C qwen35-cuda-dense turbo w0 r0 ctx=0 prefill_hid=f32 s4
+C qwen35-cuda-dense turbo w0 r0 ctx=0 prefill_attn8=off s4
+C qwen35-cuda-dense turbo w0 r0 ctx=0 split_k=exact s4
+C qwen35-cuda-dense turbo w0 r0 ctx=0 decode_attn8=off s4
+C qwen35-cuda-dense turbo w0 r0 ctx=0 kv_fp8=native s3
+C qwen35-cuda-dense turbo w0 r0 ctx=0 dense_activation=off s4
+C qwen35-cuda-dense turbo w0 r0 ctx=4096 prefill_arith=exact s4
+C qwen35-cuda-dense turbo w0 r0 ctx=4096 prefill_gdn=serial s4
+C qwen35-cuda-dense turbo w0 r0 ctx=4096 prefill_hid=f32 s4
+C qwen35-cuda-dense turbo w0 r0 ctx=4096 prefill_attn8=off s4
+C qwen35-cuda-dense turbo w0 r0 ctx=4096 split_k=exact s4
+C qwen35-cuda-dense turbo w0 r0 ctx=4096 decode_attn8=off s4
+C qwen35-cuda-dense turbo w0 r0 ctx=4096 kv_fp8=native s3
+C qwen35-cuda-dense turbo w0 r0 ctx=4096 dense_activation=off s4
+C qwen35-cuda-dense turbo w0 r0 ctx=8191 prefill_arith=exact s4
+C qwen35-cuda-dense turbo w0 r0 ctx=8191 prefill_gdn=serial s4
+C qwen35-cuda-dense turbo w0 r0 ctx=8191 prefill_hid=f32 s4
+C qwen35-cuda-dense turbo w0 r0 ctx=8191 prefill_attn8=off s4
+C qwen35-cuda-dense turbo w0 r0 ctx=8191 split_k=exact s4
+C qwen35-cuda-dense turbo w0 r0 ctx=8191 decode_attn8=off s4
+C qwen35-cuda-dense turbo w0 r0 ctx=8191 kv_fp8=native s3
+C qwen35-cuda-dense turbo w0 r0 ctx=8191 dense_activation=off s4
+C qwen35-cuda-dense turbo w0 r0 ctx=8192 prefill_arith=exact s4
+C qwen35-cuda-dense turbo w0 r0 ctx=8192 prefill_gdn=serial s4
+C qwen35-cuda-dense turbo w0 r0 ctx=8192 prefill_hid=f32 s4
+C qwen35-cuda-dense turbo w0 r0 ctx=8192 prefill_attn8=off s4
+C qwen35-cuda-dense turbo w0 r0 ctx=8192 split_k=exact s4
+C qwen35-cuda-dense turbo w0 r0 ctx=8192 decode_attn8=off s4
+C qwen35-cuda-dense turbo w0 r0 ctx=8192 kv_fp8=native s3
+C qwen35-cuda-dense turbo w0 r0 ctx=8192 dense_activation=off s4
+C qwen35-cuda-dense turbo w0 r0 ctx=32768 prefill_arith=exact s4
+C qwen35-cuda-dense turbo w0 r0 ctx=32768 prefill_gdn=serial s4
+C qwen35-cuda-dense turbo w0 r0 ctx=32768 prefill_hid=f32 s4
+C qwen35-cuda-dense turbo w0 r0 ctx=32768 prefill_attn8=off s4
+C qwen35-cuda-dense turbo w0 r0 ctx=32768 split_k=exact s4
+C qwen35-cuda-dense turbo w0 r0 ctx=32768 decode_attn8=off s4
+C qwen35-cuda-dense turbo w0 r0 ctx=32768 kv_fp8=native s3
+C qwen35-cuda-dense turbo w0 r0 ctx=32768 dense_activation=off s4
+C qwen35-cuda-dense turbo w0 r1 ctx=0 split_k=exact s4
+C qwen35-cuda-dense turbo w0 r1 ctx=0 decode_attn8=off s4
+C qwen35-cuda-dense turbo w0 r1 ctx=0 kv_fp8=native s3
+C qwen35-cuda-dense turbo w0 r1 ctx=0 dense_activation=off s4
+C qwen35-cuda-dense turbo w0 r1 ctx=4096 split_k=exact s4
+C qwen35-cuda-dense turbo w0 r1 ctx=4096 decode_attn8=off s4
+C qwen35-cuda-dense turbo w0 r1 ctx=4096 kv_fp8=native s3
+C qwen35-cuda-dense turbo w0 r1 ctx=4096 dense_activation=off s4
+C qwen35-cuda-dense turbo w0 r1 ctx=8191 split_k=exact s4
+C qwen35-cuda-dense turbo w0 r1 ctx=8191 decode_attn8=off s4
+C qwen35-cuda-dense turbo w0 r1 ctx=8191 kv_fp8=native s3
+C qwen35-cuda-dense turbo w0 r1 ctx=8191 dense_activation=off s4
+C qwen35-cuda-dense turbo w0 r1 ctx=8192 split_k=exact s4
+C qwen35-cuda-dense turbo w0 r1 ctx=8192 decode_attn8=off s4
+C qwen35-cuda-dense turbo w0 r1 ctx=8192 kv_fp8=native s3
+C qwen35-cuda-dense turbo w0 r1 ctx=8192 dense_activation=off s4
+C qwen35-cuda-dense turbo w0 r1 ctx=32768 split_k=exact s4
+C qwen35-cuda-dense turbo w0 r1 ctx=32768 decode_attn8=off s4
+C qwen35-cuda-dense turbo w0 r1 ctx=32768 kv_fp8=native s3
+C qwen35-cuda-dense turbo w0 r1 ctx=32768 dense_activation=off s4
+C qwen35-cuda-dense turbo w1 r0 ctx=0 prefill_arith=exact s4
+C qwen35-cuda-dense turbo w1 r0 ctx=0 prefill_gdn=serial s4
+C qwen35-cuda-dense turbo w1 r0 ctx=0 prefill_hid=f32 s4
+C qwen35-cuda-dense turbo w1 r0 ctx=0 prefill_attn8=off s4
+C qwen35-cuda-dense turbo w1 r0 ctx=0 split_k=exact s4
+C qwen35-cuda-dense turbo w1 r0 ctx=0 decode_attn8=off s4
+C qwen35-cuda-dense turbo w1 r0 ctx=0 kv_fp8=native s3
+C qwen35-cuda-dense turbo w1 r0 ctx=0 dense_activation=off s4
+C qwen35-cuda-dense turbo w1 r0 ctx=4096 prefill_arith=exact s4
+C qwen35-cuda-dense turbo w1 r0 ctx=4096 prefill_gdn=serial s4
+C qwen35-cuda-dense turbo w1 r0 ctx=4096 prefill_hid=f32 s4
+C qwen35-cuda-dense turbo w1 r0 ctx=4096 prefill_attn8=off s4
+C qwen35-cuda-dense turbo w1 r0 ctx=4096 split_k=exact s4
+C qwen35-cuda-dense turbo w1 r0 ctx=4096 decode_attn8=off s4
+C qwen35-cuda-dense turbo w1 r0 ctx=4096 kv_fp8=native s3
+C qwen35-cuda-dense turbo w1 r0 ctx=4096 dense_activation=off s4
+C qwen35-cuda-dense turbo w1 r0 ctx=8191 prefill_arith=exact s4
+C qwen35-cuda-dense turbo w1 r0 ctx=8191 prefill_gdn=serial s4
+C qwen35-cuda-dense turbo w1 r0 ctx=8191 prefill_hid=f32 s4
+C qwen35-cuda-dense turbo w1 r0 ctx=8191 prefill_attn8=off s4
+C qwen35-cuda-dense turbo w1 r0 ctx=8191 split_k=exact s4
+C qwen35-cuda-dense turbo w1 r0 ctx=8191 decode_attn8=off s4
+C qwen35-cuda-dense turbo w1 r0 ctx=8191 kv_fp8=native s3
+C qwen35-cuda-dense turbo w1 r0 ctx=8191 dense_activation=off s4
+C qwen35-cuda-dense turbo w1 r0 ctx=8192 prefill_arith=exact s4
+C qwen35-cuda-dense turbo w1 r0 ctx=8192 prefill_gdn=serial s4
+C qwen35-cuda-dense turbo w1 r0 ctx=8192 prefill_hid=f32 s4
+C qwen35-cuda-dense turbo w1 r0 ctx=8192 prefill_attn8=off s4
+C qwen35-cuda-dense turbo w1 r0 ctx=8192 split_k=exact s4
+C qwen35-cuda-dense turbo w1 r0 ctx=8192 decode_attn8=off s4
+C qwen35-cuda-dense turbo w1 r0 ctx=8192 kv_fp8=native s3
+C qwen35-cuda-dense turbo w1 r0 ctx=8192 dense_activation=off s4
+C qwen35-cuda-dense turbo w1 r0 ctx=32768 prefill_arith=exact s4
+C qwen35-cuda-dense turbo w1 r0 ctx=32768 prefill_gdn=serial s4
+C qwen35-cuda-dense turbo w1 r0 ctx=32768 prefill_hid=f32 s4
+C qwen35-cuda-dense turbo w1 r0 ctx=32768 prefill_attn8=off s4
+C qwen35-cuda-dense turbo w1 r0 ctx=32768 split_k=exact s4
+C qwen35-cuda-dense turbo w1 r0 ctx=32768 decode_attn8=off s4
+C qwen35-cuda-dense turbo w1 r0 ctx=32768 kv_fp8=native s3
+C qwen35-cuda-dense turbo w1 r0 ctx=32768 dense_activation=off s4
+C qwen35-cuda-dense turbo w1 r1 ctx=0 split_k=exact s4
+C qwen35-cuda-dense turbo w1 r1 ctx=0 decode_attn8=off s4
+C qwen35-cuda-dense turbo w1 r1 ctx=0 kv_fp8=native s3
+C qwen35-cuda-dense turbo w1 r1 ctx=0 dense_activation=off s4
+C qwen35-cuda-dense turbo w1 r1 ctx=4096 split_k=exact s4
+C qwen35-cuda-dense turbo w1 r1 ctx=4096 decode_attn8=off s4
+C qwen35-cuda-dense turbo w1 r1 ctx=4096 kv_fp8=native s3
+C qwen35-cuda-dense turbo w1 r1 ctx=4096 dense_activation=off s4
+C qwen35-cuda-dense turbo w1 r1 ctx=8191 split_k=exact s4
+C qwen35-cuda-dense turbo w1 r1 ctx=8191 decode_attn8=off s4
+C qwen35-cuda-dense turbo w1 r1 ctx=8191 kv_fp8=native s3
+C qwen35-cuda-dense turbo w1 r1 ctx=8191 dense_activation=off s4
+C qwen35-cuda-dense turbo w1 r1 ctx=8192 split_k=exact s4
+C qwen35-cuda-dense turbo w1 r1 ctx=8192 decode_attn8=off s4
+C qwen35-cuda-dense turbo w1 r1 ctx=8192 kv_fp8=native s3
+C qwen35-cuda-dense turbo w1 r1 ctx=8192 dense_activation=off s4
+C qwen35-cuda-dense turbo w1 r1 ctx=32768 split_k=exact s4
+C qwen35-cuda-dense turbo w1 r1 ctx=32768 decode_attn8=off s4
+C qwen35-cuda-dense turbo w1 r1 ctx=32768 kv_fp8=native s3
+C qwen35-cuda-dense turbo w1 r1 ctx=32768 dense_activation=off s4
+C qwen35-cuda-dense turbo w2 r0 ctx=0 prefill_arith=fast4 s0
+C qwen35-cuda-dense turbo w2 r0 ctx=0 prefill_gdn=chunk16tc s0
+C qwen35-cuda-dense turbo w2 r0 ctx=0 prefill_hid=f32 s4
+C qwen35-cuda-dense turbo w2 r0 ctx=0 prefill_attn8=off s4
+C qwen35-cuda-dense turbo w2 r0 ctx=0 split_k=exact s4
+C qwen35-cuda-dense turbo w2 r0 ctx=0 decode_attn8=off s4
+C qwen35-cuda-dense turbo w2 r0 ctx=0 kv_fp8=native s3
+C qwen35-cuda-dense turbo w2 r0 ctx=0 dense_activation=off s4
+C qwen35-cuda-dense turbo w2 r0 ctx=4096 prefill_arith=fast4 s0
+C qwen35-cuda-dense turbo w2 r0 ctx=4096 prefill_gdn=chunk16tc s0
+C qwen35-cuda-dense turbo w2 r0 ctx=4096 prefill_hid=f32 s4
+C qwen35-cuda-dense turbo w2 r0 ctx=4096 prefill_attn8=off s4
+C qwen35-cuda-dense turbo w2 r0 ctx=4096 split_k=exact s4
+C qwen35-cuda-dense turbo w2 r0 ctx=4096 decode_attn8=off s4
+C qwen35-cuda-dense turbo w2 r0 ctx=4096 kv_fp8=native s3
+C qwen35-cuda-dense turbo w2 r0 ctx=4096 dense_activation=off s4
+C qwen35-cuda-dense turbo w2 r0 ctx=8191 prefill_arith=fast4 s0
+C qwen35-cuda-dense turbo w2 r0 ctx=8191 prefill_gdn=chunk16tc s0
+C qwen35-cuda-dense turbo w2 r0 ctx=8191 prefill_hid=f32 s4
+C qwen35-cuda-dense turbo w2 r0 ctx=8191 prefill_attn8=off s4
+C qwen35-cuda-dense turbo w2 r0 ctx=8191 split_k=exact s4
+C qwen35-cuda-dense turbo w2 r0 ctx=8191 decode_attn8=off s4
+C qwen35-cuda-dense turbo w2 r0 ctx=8191 kv_fp8=native s3
+C qwen35-cuda-dense turbo w2 r0 ctx=8191 dense_activation=off s4
+C qwen35-cuda-dense turbo w2 r0 ctx=8192 prefill_arith=fast4 s0
+C qwen35-cuda-dense turbo w2 r0 ctx=8192 prefill_gdn=chunk16tc s0
+C qwen35-cuda-dense turbo w2 r0 ctx=8192 prefill_hid=f32 s4
+C qwen35-cuda-dense turbo w2 r0 ctx=8192 prefill_attn8=on s0
+C qwen35-cuda-dense turbo w2 r0 ctx=8192 split_k=exact s4
+C qwen35-cuda-dense turbo w2 r0 ctx=8192 decode_attn8=off s4
+C qwen35-cuda-dense turbo w2 r0 ctx=8192 kv_fp8=native s3
+C qwen35-cuda-dense turbo w2 r0 ctx=8192 dense_activation=off s4
+C qwen35-cuda-dense turbo w2 r0 ctx=32768 prefill_arith=fast4 s0
+C qwen35-cuda-dense turbo w2 r0 ctx=32768 prefill_gdn=chunk16tc s0
+C qwen35-cuda-dense turbo w2 r0 ctx=32768 prefill_hid=f32 s4
+C qwen35-cuda-dense turbo w2 r0 ctx=32768 prefill_attn8=on s0
+C qwen35-cuda-dense turbo w2 r0 ctx=32768 split_k=exact s4
+C qwen35-cuda-dense turbo w2 r0 ctx=32768 decode_attn8=off s4
+C qwen35-cuda-dense turbo w2 r0 ctx=32768 kv_fp8=native s3
+C qwen35-cuda-dense turbo w2 r0 ctx=32768 dense_activation=off s4
+C qwen35-cuda-dense turbo w2 r1 ctx=0 split_k=fast s0
+C qwen35-cuda-dense turbo w2 r1 ctx=0 decode_attn8=off s4
+C qwen35-cuda-dense turbo w2 r1 ctx=0 kv_fp8=native s3
+C qwen35-cuda-dense turbo w2 r1 ctx=0 dense_activation=off s4
+C qwen35-cuda-dense turbo w2 r1 ctx=4096 split_k=fast s0
+C qwen35-cuda-dense turbo w2 r1 ctx=4096 decode_attn8=off s4
+C qwen35-cuda-dense turbo w2 r1 ctx=4096 kv_fp8=native s3
+C qwen35-cuda-dense turbo w2 r1 ctx=4096 dense_activation=off s4
+C qwen35-cuda-dense turbo w2 r1 ctx=8191 split_k=fast s0
+C qwen35-cuda-dense turbo w2 r1 ctx=8191 decode_attn8=off s4
+C qwen35-cuda-dense turbo w2 r1 ctx=8191 kv_fp8=native s3
+C qwen35-cuda-dense turbo w2 r1 ctx=8191 dense_activation=off s4
+C qwen35-cuda-dense turbo w2 r1 ctx=8192 split_k=fast s0
+C qwen35-cuda-dense turbo w2 r1 ctx=8192 decode_attn8=off s4
+C qwen35-cuda-dense turbo w2 r1 ctx=8192 kv_fp8=native s3
+C qwen35-cuda-dense turbo w2 r1 ctx=8192 dense_activation=off s4
+C qwen35-cuda-dense turbo w2 r1 ctx=32768 split_k=fast s0
+C qwen35-cuda-dense turbo w2 r1 ctx=32768 decode_attn8=off s4
+C qwen35-cuda-dense turbo w2 r1 ctx=32768 kv_fp8=native s3
+C qwen35-cuda-dense turbo w2 r1 ctx=32768 dense_activation=off s4
+D gemma4 fast app1 decode_identity=g4-a8-v1 s0
+D gemma4 fast app1 decode_attention=exact s4
+D gemma4 fast app1 a8_ffn_ple_fuse=1 s3
+D gemma4 fast app1 draft=off s6
+D gemma4 fast app1 draft_mode=auto s3
+D gemma4 fast app1 draft_window=auto s3
+D gemma4 fast app1 draft_window_long=auto s3
+D gemma4 fast app1 draft_lookup=auto s3
+D gemma4 fast app1 serve_batch=continuous s3
+D gemma4 fast app1 prefill_route=fast s0
+D gemma4 fast app1 prefill_route_attention=flash s0
+D gemma4 fast app1 mtp_q8=0 s4
+D gemma4 fast app2 decode_identity=g4-a8-v1 s0
+D gemma4 fast app2 decode_attention=exact s4
+D gemma4 fast app2 a8_ffn_ple_fuse=1 s3
+D gemma4 fast app4 throws profile 'fast' requires prefill_linears = wmma: the prefill bench runs WMMA prefill linears (g4-wmma-pf-v1; STRIX_G4_PREFILL_LINEAR_POLICY selects g4-wmma-pf-v2), stamped unqualified here: the engine applies the qualified identity per profile and pack; measure prefill-exact through strix-gemma4-decode prompt prefill (--allow-pending runs the unqualified implementation, benchmarking only)
+E ds41-rtx fast app1 lean_state=on s0
+E ds41-rtx fast app1 q8_r1=on s0
+E ds41-rtx fast app1 dsrtxk=on s0
+E ds41-rtx fast app1 fuse=on s0
+E ds41-rtx fast app1 decode_forms=on s0
+E ds41-rtx fast app1 evict_auto=on s0
+E ds41-rtx fast app1 controller=on s0
+E ds41-rtx fast app1 draft_keep=on s0
+E ds41-rtx fast app1 draft_vocab_auto=on s0
+E ds41-rtx fast app1 wb_defer=on s0
+E ds41-rtx fast app1 ce_pacing=on s0
+E ds41-rtx fast app1 wb_stream=on s0
+E ds41-rtx fast app1 file_tier=on s0
+E ds41-rtx fast app1 residency_auto=on s0
+E ds41-rtx fast app1 warmup_graphs=on s0
+E ds41-rtx fast app1 engram_cache=on s0
+E ds41-rtx fast app1 prompt_layer_major=off s5
+E ds41-rtx fast app2 host_promote=on s0
+E ds41-rtx fast app2 batch_long=off s5
+E ds41-rtx fast app2 fp16_dense_prefill=off s5
+D gemma4 turbo app1 decode_identity=g4-a8-v1 s0
+D gemma4 turbo app1 decode_attention=exact s4
+D gemma4 turbo app1 a8_ffn_ple_fuse=1 s3
+D gemma4 turbo app1 draft=off s6
+D gemma4 turbo app1 draft_mode=auto s3
+D gemma4 turbo app1 draft_window=auto s3
+D gemma4 turbo app1 draft_window_long=auto s3
+D gemma4 turbo app1 draft_lookup=auto s3
+D gemma4 turbo app1 serve_batch=continuous s3
+D gemma4 turbo app1 prefill_route=fast s0
+D gemma4 turbo app1 prefill_route_attention=flash s0
+D gemma4 turbo app1 mtp_q8=0 s4
+D gemma4 turbo app2 decode_identity=g4-a8-v1 s0
+D gemma4 turbo app2 decode_attention=exact s4
+D gemma4 turbo app2 a8_ffn_ple_fuse=1 s3
+D gemma4 turbo app4 throws profile 'turbo' requires prefill_linears = wmma: the prefill bench runs WMMA prefill linears (g4-wmma-pf-v1; STRIX_G4_PREFILL_LINEAR_POLICY selects g4-wmma-pf-v2), stamped unqualified here: the engine applies the qualified identity per profile and pack; measure prefill-exact through strix-gemma4-decode prompt prefill (--allow-pending runs the unqualified implementation, benchmarking only)
+E ds41-rtx turbo app1 throws ds41 RTX: --profile turbo is not bound on this backend yet (pending: RTX cache namespace and turbo column; use the pair engine's ds41-turbo-v1)
+E ds41-rtx turbo app2 throws ds41 RTX: --profile turbo is not bound on this backend yet (pending: RTX cache namespace and turbo column; use the pair engine's ds41-turbo-v1)
+F glm-rtx fast expert_tier=tierstream s0
+F glm-rtx fast placement=on s0
+F glm-rtx fast eviction_policy=auto s0
+F glm-rtx fast spare_share=5 s0
+F glm-rtx fast row_tile=auto s0
+F glm-rtx fast prefill_tile_crossover=0 s0
+F glm-rtx fast cuda_graphs=on s0
+F glm-rtx fast restore_decode_residency=on s0
+F glm-rtx fast flush_ready=on s0
+F glm-rtx fast predicted_prefetch=0 s3
+F glm-rtx fast skip_empty_expert_groups=0 s3
+F glm-rtx fast persistent_dense_fp16=0 s3
+F glm-rtx fast prefill_overlap=1 s0
+F glm-rtx fast dsa_short_skip=1 s0
+F glm-rtx fast decode_row_kernels=1 s0
+F glm-rtx fast mtp_self_spec=0 s3
+F glm-rtx fast lookup_drafts=0 s3
+F glm-rtx fast prefill_tile_large=off s3
+F glm-rtx fast dsa_index_mma=fp32 s3
+G hy4 fast d0 t0 ctx=0 prompt_rows=0 s4
+G hy4 fast d0 t0 ctx=0 head_q8=0 s4
+G hy4 fast d0 t0 ctx=0 pf_mha=0 s4
+G hy4 fast d0 t0 ctx=0 decode_iu4=off s3
+G hy4 fast d0 t0 ctx=0 pf_a8_producer=1 s3
+G hy4 fast d0 t0 ctx=0 q8_store_epilogue=1 s3
+G hy4 fast d0 t0 ctx=0 pf_store_epilogue=1 s3
+G hy4 fast d0 t0 ctx=4096 prompt_rows=0 s4
+G hy4 fast d0 t0 ctx=4096 head_q8=0 s4
+G hy4 fast d0 t0 ctx=4096 pf_mha=0 s4
+G hy4 fast d0 t0 ctx=4096 decode_iu4=off s3
+G hy4 fast d0 t0 ctx=4096 pf_a8_producer=1 s3
+G hy4 fast d0 t0 ctx=4096 q8_store_epilogue=1 s3
+G hy4 fast d0 t0 ctx=4096 pf_store_epilogue=1 s3
+G hy4 fast d0 t0 ctx=8192 prompt_rows=0 s4
+G hy4 fast d0 t0 ctx=8192 head_q8=0 s4
+G hy4 fast d0 t0 ctx=8192 pf_mha=0 s4
+G hy4 fast d0 t0 ctx=8192 decode_iu4=off s3
+G hy4 fast d0 t0 ctx=8192 pf_a8_producer=1 s3
+G hy4 fast d0 t0 ctx=8192 q8_store_epilogue=1 s3
+G hy4 fast d0 t0 ctx=8192 pf_store_epilogue=1 s3
+G hy4 fast d0 t0 ctx=32768 prompt_rows=0 s4
+G hy4 fast d0 t0 ctx=32768 head_q8=0 s4
+G hy4 fast d0 t0 ctx=32768 pf_mha=0 s4
+G hy4 fast d0 t0 ctx=32768 decode_iu4=off s3
+G hy4 fast d0 t0 ctx=32768 pf_a8_producer=1 s3
+G hy4 fast d0 t0 ctx=32768 q8_store_epilogue=1 s3
+G hy4 fast d0 t0 ctx=32768 pf_store_epilogue=1 s3
+G hy4 fast d0 t1 ctx=0 prompt_rows=0 s4
+G hy4 fast d0 t1 ctx=0 head_q8=0 s4
+G hy4 fast d0 t1 ctx=0 pf_mha=0 s4
+G hy4 fast d0 t1 ctx=0 decode_iu4=off s3
+G hy4 fast d0 t1 ctx=0 pf_a8_producer=1 s3
+G hy4 fast d0 t1 ctx=0 q8_store_epilogue=1 s3
+G hy4 fast d0 t1 ctx=0 pf_store_epilogue=1 s3
+G hy4 fast d0 t1 ctx=4096 prompt_rows=0 s4
+G hy4 fast d0 t1 ctx=4096 head_q8=0 s4
+G hy4 fast d0 t1 ctx=4096 pf_mha=0 s4
+G hy4 fast d0 t1 ctx=4096 decode_iu4=off s3
+G hy4 fast d0 t1 ctx=4096 pf_a8_producer=1 s3
+G hy4 fast d0 t1 ctx=4096 q8_store_epilogue=1 s3
+G hy4 fast d0 t1 ctx=4096 pf_store_epilogue=1 s3
+G hy4 fast d0 t1 ctx=8192 prompt_rows=0 s4
+G hy4 fast d0 t1 ctx=8192 head_q8=0 s4
+G hy4 fast d0 t1 ctx=8192 pf_mha=0 s4
+G hy4 fast d0 t1 ctx=8192 decode_iu4=off s3
+G hy4 fast d0 t1 ctx=8192 pf_a8_producer=1 s3
+G hy4 fast d0 t1 ctx=8192 q8_store_epilogue=1 s3
+G hy4 fast d0 t1 ctx=8192 pf_store_epilogue=1 s3
+G hy4 fast d0 t1 ctx=32768 prompt_rows=0 s4
+G hy4 fast d0 t1 ctx=32768 head_q8=0 s4
+G hy4 fast d0 t1 ctx=32768 pf_mha=0 s4
+G hy4 fast d0 t1 ctx=32768 decode_iu4=off s3
+G hy4 fast d0 t1 ctx=32768 pf_a8_producer=1 s3
+G hy4 fast d0 t1 ctx=32768 q8_store_epilogue=1 s3
+G hy4 fast d0 t1 ctx=32768 pf_store_epilogue=1 s3
+G hy4 fast d1 t0 ctx=0 prompt_rows=4096 s0
+G hy4 fast d1 t0 ctx=0 head_q8=1 s0
+G hy4 fast d1 t0 ctx=0 pf_mha=1 s0
+G hy4 fast d1 t0 ctx=0 decode_iu4=off s3
+G hy4 fast d1 t0 ctx=0 pf_a8_producer=1 s3
+G hy4 fast d1 t0 ctx=0 q8_store_epilogue=1 s3
+G hy4 fast d1 t0 ctx=0 pf_store_epilogue=1 s3
+G hy4 fast d1 t0 ctx=4096 prompt_rows=4096 s0
+G hy4 fast d1 t0 ctx=4096 head_q8=1 s0
+G hy4 fast d1 t0 ctx=4096 pf_mha=1 s0
+G hy4 fast d1 t0 ctx=4096 decode_iu4=off s3
+G hy4 fast d1 t0 ctx=4096 pf_a8_producer=1 s3
+G hy4 fast d1 t0 ctx=4096 q8_store_epilogue=1 s3
+G hy4 fast d1 t0 ctx=4096 pf_store_epilogue=1 s3
+G hy4 fast d1 t0 ctx=8192 prompt_rows=4096 s0
+G hy4 fast d1 t0 ctx=8192 head_q8=1 s0
+G hy4 fast d1 t0 ctx=8192 pf_mha=1 s0
+G hy4 fast d1 t0 ctx=8192 decode_iu4=off s3
+G hy4 fast d1 t0 ctx=8192 pf_a8_producer=1 s3
+G hy4 fast d1 t0 ctx=8192 q8_store_epilogue=1 s3
+G hy4 fast d1 t0 ctx=8192 pf_store_epilogue=1 s3
+G hy4 fast d1 t0 ctx=32768 prompt_rows=0 s4
+G hy4 fast d1 t0 ctx=32768 head_q8=1 s0
+G hy4 fast d1 t0 ctx=32768 pf_mha=0 s4
+G hy4 fast d1 t0 ctx=32768 decode_iu4=off s3
+G hy4 fast d1 t0 ctx=32768 pf_a8_producer=1 s3
+G hy4 fast d1 t0 ctx=32768 q8_store_epilogue=1 s3
+G hy4 fast d1 t0 ctx=32768 pf_store_epilogue=1 s3
+G hy4 fast d1 t1 ctx=0 prompt_rows=4096 s0
+G hy4 fast d1 t1 ctx=0 head_q8=1 s0
+G hy4 fast d1 t1 ctx=0 pf_mha=0 s4
+G hy4 fast d1 t1 ctx=0 decode_iu4=off s3
+G hy4 fast d1 t1 ctx=0 pf_a8_producer=1 s3
+G hy4 fast d1 t1 ctx=0 q8_store_epilogue=1 s3
+G hy4 fast d1 t1 ctx=0 pf_store_epilogue=1 s3
+G hy4 fast d1 t1 ctx=4096 prompt_rows=4096 s0
+G hy4 fast d1 t1 ctx=4096 head_q8=1 s0
+G hy4 fast d1 t1 ctx=4096 pf_mha=0 s4
+G hy4 fast d1 t1 ctx=4096 decode_iu4=off s3
+G hy4 fast d1 t1 ctx=4096 pf_a8_producer=1 s3
+G hy4 fast d1 t1 ctx=4096 q8_store_epilogue=1 s3
+G hy4 fast d1 t1 ctx=4096 pf_store_epilogue=1 s3
+G hy4 fast d1 t1 ctx=8192 prompt_rows=4096 s0
+G hy4 fast d1 t1 ctx=8192 head_q8=1 s0
+G hy4 fast d1 t1 ctx=8192 pf_mha=0 s4
+G hy4 fast d1 t1 ctx=8192 decode_iu4=off s3
+G hy4 fast d1 t1 ctx=8192 pf_a8_producer=1 s3
+G hy4 fast d1 t1 ctx=8192 q8_store_epilogue=1 s3
+G hy4 fast d1 t1 ctx=8192 pf_store_epilogue=1 s3
+G hy4 fast d1 t1 ctx=32768 prompt_rows=0 s4
+G hy4 fast d1 t1 ctx=32768 head_q8=1 s0
+G hy4 fast d1 t1 ctx=32768 pf_mha=0 s4
+G hy4 fast d1 t1 ctx=32768 decode_iu4=off s3
+G hy4 fast d1 t1 ctx=32768 pf_a8_producer=1 s3
+G hy4 fast d1 t1 ctx=32768 q8_store_epilogue=1 s3
+G hy4 fast d1 t1 ctx=32768 pf_store_epilogue=1 s3
+G hy4 turbo d0 t0 ctx=0 prompt_rows=0 s4
+G hy4 turbo d0 t0 ctx=0 head_q8=0 s4
+G hy4 turbo d0 t0 ctx=0 pf_mha=0 s4
+G hy4 turbo d0 t0 ctx=0 decode_iu4=off s4
+G hy4 turbo d0 t0 ctx=0 pf_a8_producer=1 s3
+G hy4 turbo d0 t0 ctx=0 q8_store_epilogue=1 s3
+G hy4 turbo d0 t0 ctx=0 pf_store_epilogue=1 s3
+G hy4 turbo d0 t0 ctx=4096 prompt_rows=0 s4
+G hy4 turbo d0 t0 ctx=4096 head_q8=0 s4
+G hy4 turbo d0 t0 ctx=4096 pf_mha=0 s4
+G hy4 turbo d0 t0 ctx=4096 decode_iu4=off s4
+G hy4 turbo d0 t0 ctx=4096 pf_a8_producer=1 s3
+G hy4 turbo d0 t0 ctx=4096 q8_store_epilogue=1 s3
+G hy4 turbo d0 t0 ctx=4096 pf_store_epilogue=1 s3
+G hy4 turbo d0 t0 ctx=8192 prompt_rows=0 s4
+G hy4 turbo d0 t0 ctx=8192 head_q8=0 s4
+G hy4 turbo d0 t0 ctx=8192 pf_mha=0 s4
+G hy4 turbo d0 t0 ctx=8192 decode_iu4=off s4
+G hy4 turbo d0 t0 ctx=8192 pf_a8_producer=1 s3
+G hy4 turbo d0 t0 ctx=8192 q8_store_epilogue=1 s3
+G hy4 turbo d0 t0 ctx=8192 pf_store_epilogue=1 s3
+G hy4 turbo d0 t0 ctx=32768 prompt_rows=0 s4
+G hy4 turbo d0 t0 ctx=32768 head_q8=0 s4
+G hy4 turbo d0 t0 ctx=32768 pf_mha=0 s4
+G hy4 turbo d0 t0 ctx=32768 decode_iu4=off s4
+G hy4 turbo d0 t0 ctx=32768 pf_a8_producer=1 s3
+G hy4 turbo d0 t0 ctx=32768 q8_store_epilogue=1 s3
+G hy4 turbo d0 t0 ctx=32768 pf_store_epilogue=1 s3
+G hy4 turbo d0 t1 ctx=0 prompt_rows=0 s4
+G hy4 turbo d0 t1 ctx=0 head_q8=0 s4
+G hy4 turbo d0 t1 ctx=0 pf_mha=0 s4
+G hy4 turbo d0 t1 ctx=0 decode_iu4=off s4
+G hy4 turbo d0 t1 ctx=0 pf_a8_producer=1 s3
+G hy4 turbo d0 t1 ctx=0 q8_store_epilogue=1 s3
+G hy4 turbo d0 t1 ctx=0 pf_store_epilogue=1 s3
+G hy4 turbo d0 t1 ctx=4096 prompt_rows=0 s4
+G hy4 turbo d0 t1 ctx=4096 head_q8=0 s4
+G hy4 turbo d0 t1 ctx=4096 pf_mha=0 s4
+G hy4 turbo d0 t1 ctx=4096 decode_iu4=off s4
+G hy4 turbo d0 t1 ctx=4096 pf_a8_producer=1 s3
+G hy4 turbo d0 t1 ctx=4096 q8_store_epilogue=1 s3
+G hy4 turbo d0 t1 ctx=4096 pf_store_epilogue=1 s3
+G hy4 turbo d0 t1 ctx=8192 prompt_rows=0 s4
+G hy4 turbo d0 t1 ctx=8192 head_q8=0 s4
+G hy4 turbo d0 t1 ctx=8192 pf_mha=0 s4
+G hy4 turbo d0 t1 ctx=8192 decode_iu4=off s4
+G hy4 turbo d0 t1 ctx=8192 pf_a8_producer=1 s3
+G hy4 turbo d0 t1 ctx=8192 q8_store_epilogue=1 s3
+G hy4 turbo d0 t1 ctx=8192 pf_store_epilogue=1 s3
+G hy4 turbo d0 t1 ctx=32768 prompt_rows=0 s4
+G hy4 turbo d0 t1 ctx=32768 head_q8=0 s4
+G hy4 turbo d0 t1 ctx=32768 pf_mha=0 s4
+G hy4 turbo d0 t1 ctx=32768 decode_iu4=off s4
+G hy4 turbo d0 t1 ctx=32768 pf_a8_producer=1 s3
+G hy4 turbo d0 t1 ctx=32768 q8_store_epilogue=1 s3
+G hy4 turbo d0 t1 ctx=32768 pf_store_epilogue=1 s3
+G hy4 turbo d1 t0 ctx=0 prompt_rows=4096 s0
+G hy4 turbo d1 t0 ctx=0 head_q8=1 s0
+G hy4 turbo d1 t0 ctx=0 pf_mha=1 s0
+G hy4 turbo d1 t0 ctx=0 decode_iu4=off s4
+G hy4 turbo d1 t0 ctx=0 pf_a8_producer=1 s3
+G hy4 turbo d1 t0 ctx=0 q8_store_epilogue=1 s3
+G hy4 turbo d1 t0 ctx=0 pf_store_epilogue=1 s3
+G hy4 turbo d1 t0 ctx=4096 prompt_rows=4096 s0
+G hy4 turbo d1 t0 ctx=4096 head_q8=1 s0
+G hy4 turbo d1 t0 ctx=4096 pf_mha=1 s0
+G hy4 turbo d1 t0 ctx=4096 decode_iu4=off s4
+G hy4 turbo d1 t0 ctx=4096 pf_a8_producer=1 s3
+G hy4 turbo d1 t0 ctx=4096 q8_store_epilogue=1 s3
+G hy4 turbo d1 t0 ctx=4096 pf_store_epilogue=1 s3
+G hy4 turbo d1 t0 ctx=8192 prompt_rows=4096 s0
+G hy4 turbo d1 t0 ctx=8192 head_q8=1 s0
+G hy4 turbo d1 t0 ctx=8192 pf_mha=1 s0
+G hy4 turbo d1 t0 ctx=8192 decode_iu4=off s4
+G hy4 turbo d1 t0 ctx=8192 pf_a8_producer=1 s3
+G hy4 turbo d1 t0 ctx=8192 q8_store_epilogue=1 s3
+G hy4 turbo d1 t0 ctx=8192 pf_store_epilogue=1 s3
+G hy4 turbo d1 t0 ctx=32768 prompt_rows=0 s4
+G hy4 turbo d1 t0 ctx=32768 head_q8=1 s0
+G hy4 turbo d1 t0 ctx=32768 pf_mha=0 s4
+G hy4 turbo d1 t0 ctx=32768 decode_iu4=off s4
+G hy4 turbo d1 t0 ctx=32768 pf_a8_producer=1 s3
+G hy4 turbo d1 t0 ctx=32768 q8_store_epilogue=1 s3
+G hy4 turbo d1 t0 ctx=32768 pf_store_epilogue=1 s3
+G hy4 turbo d1 t1 ctx=0 prompt_rows=4096 s0
+G hy4 turbo d1 t1 ctx=0 head_q8=1 s0
+G hy4 turbo d1 t1 ctx=0 pf_mha=0 s4
+G hy4 turbo d1 t1 ctx=0 decode_iu4=off s4
+G hy4 turbo d1 t1 ctx=0 pf_a8_producer=1 s3
+G hy4 turbo d1 t1 ctx=0 q8_store_epilogue=1 s3
+G hy4 turbo d1 t1 ctx=0 pf_store_epilogue=1 s3
+G hy4 turbo d1 t1 ctx=4096 prompt_rows=4096 s0
+G hy4 turbo d1 t1 ctx=4096 head_q8=1 s0
+G hy4 turbo d1 t1 ctx=4096 pf_mha=0 s4
+G hy4 turbo d1 t1 ctx=4096 decode_iu4=off s4
+G hy4 turbo d1 t1 ctx=4096 pf_a8_producer=1 s3
+G hy4 turbo d1 t1 ctx=4096 q8_store_epilogue=1 s3
+G hy4 turbo d1 t1 ctx=4096 pf_store_epilogue=1 s3
+G hy4 turbo d1 t1 ctx=8192 prompt_rows=4096 s0
+G hy4 turbo d1 t1 ctx=8192 head_q8=1 s0
+G hy4 turbo d1 t1 ctx=8192 pf_mha=0 s4
+G hy4 turbo d1 t1 ctx=8192 decode_iu4=off s4
+G hy4 turbo d1 t1 ctx=8192 pf_a8_producer=1 s3
+G hy4 turbo d1 t1 ctx=8192 q8_store_epilogue=1 s3
+G hy4 turbo d1 t1 ctx=8192 pf_store_epilogue=1 s3
+G hy4 turbo d1 t1 ctx=32768 prompt_rows=0 s4
+G hy4 turbo d1 t1 ctx=32768 head_q8=1 s0
+G hy4 turbo d1 t1 ctx=32768 pf_mha=0 s4
+G hy4 turbo d1 t1 ctx=32768 decode_iu4=off s4
+G hy4 turbo d1 t1 ctx=32768 pf_a8_producer=1 s3
+G hy4 turbo d1 t1 ctx=32768 q8_store_epilogue=1 s3
+G hy4 turbo d1 t1 ctx=32768 pf_store_epilogue=1 s3
+H minimax fast msa_flash=1 router_wmma=1 bundle=1 id=prefill_msa=msa-flash-bf16-l40-v1;prefill_router=mm-pf-router-wmma-v1-l40-59;prefill_order=mmx-pf-linear-s1-v1
+H minimax fast msa_flash=1 s0
+H minimax fast msa_flash_layers=40-59 s1
+H minimax fast model_format=exl3 s3
+H minimax fast iu4_layers=none s3
+H minimax fast iu4_a8=0 s3
+H minimax fast idx_wmma=0 s3
+H minimax fast idx_wmma_layers=40-59 s3
+H minimax fast tp2_exchange_fmt=f32 s3
+H minimax fast router_wmma=1 s0
+H minimax fast router_wmma_layers=40-59 s1
+H minimax fast pf_dense_tail_fixed=0 s3
+H minimax turbo msa_flash=1 router_wmma=1 bundle=1 id=prefill_msa=msa-flash-bf16-l40-v1;prefill_router=mm-pf-router-wmma-v1-l40-59;prefill_order=mmx-pf-linear-s1-v1;turbo=minimax-turbo-v1,levers=5aeff99dc1ac4bf4,weights=native
+H minimax turbo msa_flash=1 s0
+H minimax turbo msa_flash_layers=40-59 s1
+H minimax turbo model_format=exl3 s3
+H minimax turbo iu4_layers=none s4
+H minimax turbo iu4_a8=0 s3
+H minimax turbo idx_wmma=0 s3
+H minimax turbo idx_wmma_layers=40-59 s3
+H minimax turbo tp2_exchange_fmt=f32 s3
+H minimax turbo router_wmma=1 s0
+H minimax turbo router_wmma_layers=40-59 s1
+H minimax turbo pf_dense_tail_fixed=0 s3

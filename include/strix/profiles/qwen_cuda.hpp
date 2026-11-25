@@ -31,27 +31,27 @@ inline constexpr Lever table[] = {
      .value = {"", "1", ""}, .builtin = "0",
      .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {true, true, true},
      .target = "BF16 MoE route storage (cuda-qwen-a8-prefill+moeroute-bf16-rne-v1)", .off = "0",
-     .source = "same arithmetic as the HIP row; unqualified; the engine declines it with MTP sidecar/graphs/cohort/hand-off/prefix cache; changes logits"},
+     .source = "same arithmetic as the HIP row; unqualified; the engine declines it with MTP sidecar/graphs/cohort/hand-off/prefix cache; changes logits", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = "qsa_budget", .env = "STRIX_QPF2K_QSA_BUDGET", .option = "--qsa-budget",
      .value = {"", "1536", ""}, .builtin = "default",
      .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {false, false, false},
      .target = "1536", .off = "0", .source = "HIP prefill ranked-block budget; not implemented on CUDA",
-     .provisional = {false, true, false}},
+     .provisional = {false, true, false}, .identity = {{{"default", "v1"}, {"1536", "v1"}, {"0", "v1"}}}},
     {.name = "gdn_fp16_chunk", .env = "STRIX_QPF2K_GDN_FP16_CHUNK", .option = "--gdn-fp16-chunk",
      .value = {"", "1", ""}, .builtin = "0",
      .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {false, false, false},
      .target = "qwen-gdn-fp16-chunk", .off = "0", .source = "HIP chunked GDN prefill on FP16 WMMA; not implemented on CUDA",
-     .provisional = {false, true, false}},
+     .provisional = {false, true, false}, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = "output_head", .env = "", .option = "--output-head-profile",
      .value = {"", "fp16-output-head", ""}, .builtin = "default",
      .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {false, false, false},
-     .target = "fp16 output-head projection", .off = "off", .source = "pending output-head implementation and qualification"},
+     .target = "fp16 output-head projection", .off = "off", .source = "pending output-head implementation and qualification", .identity = {{{"default", "v1"}, {"fp16-output-head", "v1"}, {"off", "v1"}}}},
     {.name = "hc_mma", .env = "STRIX_QRTX_HC_MMA", .option = "--hc-mma",
      .value = {"", "1", ""}, .builtin = "0",
      .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {false, true, false},
      .target = "qwen-cuda-hc-f16mma-v2", .off = "0",
      .source = "hyper-connection projection/output on FP16 tensor cores, FP32 accumulation; qualification in progress; changes logits",
-     .provisional = {false, true, false}},
+     .provisional = {false, true, false}, .identity = {{{"0", "v1"}, {"1", "qwen-cuda-hc-f16mma-v2"}}}},
     // Not a member of the FAST or TURBO bundle: it only changes the draft head's prompt K/V (prompt MTP rows, after the
     // first token under mtp_defer_prompt), which the prompt-logit gate does not see, and its effect on draft acceptance in
     // decode is unmeasured, so TURBO decode would no longer be FAST decode. Explicit in both (--mtp-mma on).
@@ -60,14 +60,14 @@ inline constexpr Lever table[] = {
      .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {false, true, false, true},
      .target = "qwen-cuda-mtp-f16mma-v1", .off = "0",
      .source = "MTP fused projection on FP16 tensor cores, FP32 accumulation; qualification in progress; changes logits",
-     .provisional = {false, true, false, true}},
+     .provisional = {false, true, false, true}, .identity = {{{"0", "v1"}}}},
     {.name = "qsa_mma", .env = "STRIX_QRTX_QSA_MMA", .option = "--qsa-mma",
      .value = {"", "1", ""}, .builtin = "0",
      .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {false, true, false},
      .target = "qwen-cuda-qsa-bf16mma-v2", .off = "0",
      .source = "QSA prefill attention on the shared row-group core (core/attention_rowgroup.cuh: union of 4 rows' keys, BF16 "
                "tensor cores, FP32 accumulation); union byte-equal in its fixture; logit gate pending; changes logits",
-     .provisional = {false, true, false}},
+     .provisional = {false, true, false}, .identity = {{{"0", "v1"}, {"1", "qwen-cuda-qsa-bf16mma-v2"}}}},
     // Opt-in under fast (not a FAST bundle member until its gate receipt): the PLE key/value projections (Q8_0 weights) on
     // the shared dense A8 projection (qwen_dense::quantize_project, int8 tensor cores, one FP32 FMA chain per output, the
     // dense-a8-v1 projection contract of the GDN/QSA projections) instead of the FP32 lane chain of ple_project_kernel.
@@ -76,7 +76,7 @@ inline constexpr Lever table[] = {
      .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {false, true, false},
      .target = "qwen-cuda-ple-a8-v1", .off = "0",
      .source = "PLE key/value projections on the shared dense A8 projection (int8 tensor cores); FAST gate v2 pending; changes logits",
-     .provisional = {false, true, false}},
+     .provisional = {false, true, false}, .identity = {{{"0", "v1"}}}},
     // fast cell empty and turbo cell "0" (builtin): FAST experts are the expert_fast row, TURBO experts the integer
     // expert_turbo row; the single-chain moe_mma form refuses a non-incumbent expert arithmetic (qwen_options.hpp resolve),
     // and `--moe-mma on` (with `--expert-fast off` under fast) stays available explicitly, e.g. for a non-GSQ pack.
@@ -85,7 +85,7 @@ inline constexpr Lever table[] = {
      .kind = Kind::bit_changing, .ready = {true, false, true, true}, .runnable = {false, true, false, true},
      .target = "qwen-cuda-moe-i8fma-v1", .off = "0",
      .source = "routed-MoE prefill gate/up and down on int8 tensor cores with one FP32 FMA chain per output; qualification in progress; changes logits",
-     .provisional = {false, true, false}},
+     .provisional = {false, true, false}, .identity = {{{"0", "v1"}}}},
     // TURBO only: routed GSQ experts on int8 tensor cores (gsq-iq-i8mma-turbo-cuda-v1, src/cuda/core/turbo_i8.hpp), selected
     // ahead of qualification by `--profile turbo` (provisional), in its regime only (expert_turbo_rows): prefill blocks of
     // at least that many rows; decode/verify windows and smaller blocks keep the run's other experts (under TURBO the
@@ -98,7 +98,7 @@ inline constexpr Lever table[] = {
      .source = "routed GSQ experts: A8 int8 activations x integer codes on int8 IMMA, one FP32 FMA per group; 32K logit gate "
                "(4 prompts x 128 rows) PASS: regime (default rows) KL 0.00906 top-1 0.9844 dNLL +0.00102, int8 in every call "
                "KL 0.00948 top-1 0.9785 dNLL +0.00543; speed regime per expert_turbo_rows; changes logits",
-     .provisional = {false, false, false, true}},
+     .provisional = {false, false, false, true}, .identity = {{{"0", "v1"}, {"1", "gsq-iq-i8mma-turbo-cuda-v1"}}}},
     // Regime of expert_turbo (read only when it is on): prefill blocks of at least N rows run the int8 experts, every other
     // MoE call the run's other expert arithmetic; `off` = int8 in every MoE call (decode windows included). Measured: the
     // no-model expert bench (one routed-expert call, IQ3_S gate/up + IQ4_NL down) has int8 / BF16 time 0.954 / 0.967 /
@@ -112,7 +112,7 @@ inline constexpr Lever table[] = {
      .target = "", .off = "off",
      .source = "int8 experts on prefill blocks of >= N rows only (decode windows: the FAST experts); expert bench int8/BF16 "
                "0.95-0.97 at 1-512 rows, 0.90-0.92 at 2048-8192, in-situ decode windows +9-15 % per step with int8: N = 512",
-     .provisional = {false, false, false, true}},
+     .provisional = {false, false, false, true}, .identity = {{{"512", "v1"}, {"off", "v1"}}}},
     // FAST (and TURBO outside expert_turbo's regime): routed GSQ experts on BF16 tensor cores (gsq-iq-bf16mma-cuda-v1), the
     // expert member of the FAST bundle; its empty turbo cell is the fast cell.
     // Same admission as expert_turbo: GSQ expert storage only (another pack refuses the start); `--expert-fast off` (or
@@ -123,14 +123,14 @@ inline constexpr Lever table[] = {
      .target = "gsq-iq-bf16mma-cuda-v1", .off = "0",
      .source = "routed GSQ experts: BF16 activations x exact BF16 codes on tensor cores, FP32 accumulation; alone: logit gate "
                "PASS (pooled KL 0.00679, top-1 0.9912, dNLL -0.00145); bundle gate pending; changes logits",
-     .provisional = {false, true, false, false}},
+     .provisional = {false, true, false, false}, .identity = {{{"0", "v1"}, {"1", "gsq-iq-bf16mma-cuda-v1"}}}},
     // Exact (logits and state unchanged): the prompt's MTP rows run after the first token, as the identical call. Member
     // of the FAST bundle (moves the MTP prompt K/V out of TTFT); runs only with an MTP sidecar.
     {.name = "mtp_defer_prompt", .env = "STRIX_QRTX_MTP_DEFER_PROMPT", .option = "--mtp-defer-prompt",
      .value = {"", "1", ""}, .builtin = "0",
      .kind = Kind::exact, .ready = {true, true, true, true}, .runnable = {true, true, true, true},
      .target = "", .off = "0",
-     .source = "deferred prompt MTP rows: exact (the identical MTP call after the first token; MTP fixture byte-equal)"},
+     .source = "deferred prompt MTP rows: exact (the identical MTP call after the first token; MTP fixture byte-equal)", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     // Exact schedule trait of the tensor-core GSQ experts (FAST / expert_fast arithmetic only): steps of <= 16 rows (decode
     // and MTP verify windows) run the decode tile form (one m16 block, three-group weight-field ring), bitwise the tile
     // form (same field values, same MMA and scale-FMA order per output). On in every profile (an absent row = on: the
@@ -139,7 +139,7 @@ inline constexpr Lever table[] = {
      .value = {"", "", "", ""}, .builtin = "1",
      .kind = Kind::exact, .ready = {true, true, true, true}, .runnable = {true, true, true, true},
      .target = "", .off = "0",
-     .source = "decode tile form of the tensor-core GSQ experts: exact (bitwise the tile form; greedy ids equal on prose/edit/json)"},
+     .source = "decode tile form of the tensor-core GSQ experts: exact (bitwise the tile form; greedy ids equal on prose/edit/json)", .identity = {{{"1", "v1"}, {"0", "v1"}}}},
     // Exact schedule trait of the tensor-core GSQ experts: launches averaging >= N rows per expert (the row's value; `on` =
     // native_mma::kWideMinAvgRows = the RTX PRO TILEWIDE; N from the device's no-model tile bench) run 128-row CSR tiles in
     // 512-thread blocks (one weight row per lane), so a 128-row run of an expert decodes its codes once instead of twice;
@@ -149,9 +149,20 @@ inline constexpr Lever table[] = {
      .value = {"", "", "", ""}, .builtin = "0",
      .kind = Kind::exact, .ready = {true, true, true, true}, .runnable = {true, true, true, true},
      .target = "", .off = "0",
-     .source = "wide 128-row tile form of the tensor-core GSQ experts: exact by construction (bitwise the tile form); timing pending"},
+     .source = "wide 128-row tile form of the tensor-core GSQ experts: exact by construction (bitwise the tile form); timing pending", .identity = {{{"0", "v1"}}}},
 };
 inline std::span<const Lever> levers() { return table; }
+// Ladder rows of this table: incumbent grants of the cells the resolver ran (provisional) before the ladder rule.
+inline constexpr ::strix::profile::LadderRow ladder_rows[] = {
+    ::strix::profile::incumbent_cell("expert_fast", "1", ::strix::profile::Name::fast, ::strix::profile::kProvisionalBeforeLadder, "gsq-iq-bf16mma-cuda-v1"),
+    ::strix::profile::incumbent_cell("hc_mma", "1", ::strix::profile::Name::fast, ::strix::profile::kProvisionalBeforeLadder, "qwen-cuda-hc-f16mma-v2"),
+    ::strix::profile::incumbent_cell("qsa_mma", "1", ::strix::profile::Name::fast, ::strix::profile::kProvisionalBeforeLadder, "qwen-cuda-qsa-bf16mma-v2"),
+    ::strix::profile::incumbent_cell("expert_fast", "1", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder, "gsq-iq-bf16mma-cuda-v1"),
+    ::strix::profile::incumbent_cell("expert_turbo", "1", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder, "gsq-iq-i8mma-turbo-cuda-v1"),
+    ::strix::profile::incumbent_cell("expert_turbo_rows", "512", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder, "v1"),
+    ::strix::profile::incumbent_cell("hc_mma", "1", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder, "qwen-cuda-hc-f16mma-v2"),
+    ::strix::profile::incumbent_cell("qsa_mma", "1", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder, "qwen-cuda-qsa-bf16mma-v2"),
+};
 
 // The RTX Qwen FAST bundle = the fast column above: its members are the rows the fast profile selects, qualified TOGETHER
 // by one logit gate (KL <= 0.02, top-1 >= 0.93, dNLL <= 0.01 against the exact reference). The id names that set; any
@@ -347,7 +358,7 @@ inline ::strix::profile::ExecutionReceipt receipt(const Choice& c, std::string_v
     return out;
 }
 inline pr::Resolution resolve(pr::Name profile, const pr::Inputs& inputs = {}) {
-    auto out = pr::resolve(profile, inputs, levers());
+    auto out = pr::resolve(profile, inputs, levers(), ladder_rows);
     (void)choose(out);  // refuses malformed explicit values here, not at first use
     return out;
 }

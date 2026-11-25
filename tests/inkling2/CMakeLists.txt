@@ -29,6 +29,7 @@ function(inkling2_mini_test name source)
 endfunction()
 
 inkling2_mini_test(schedule mini_schedule_test.cpp)
+inkling2_mini_test(calibrated-route mini_calibrated_route_test.cpp)
 inkling2_mini_test(moe mini_moe_test.cpp)
 inkling2_mini_test(moe-planning mini_moe_planning_test.cpp)
 if(TARGET strix_core)
@@ -80,7 +81,7 @@ if(TARGET strix_inkling2_mini_checkpoint)
     inkling2_mini_test(dspark-shapes mini_dspark_shapes_test.cpp)
     target_link_libraries(inkling2-mini-dspark-shapes-test PRIVATE strix-weight)
     inkling2_mini_test(weight-load mini_weight_load_test.cpp)
-    target_link_libraries(inkling2-mini-weight-load-test PRIVATE strix_inkling2_mini_checkpoint)
+    target_link_libraries(inkling2-mini-weight-load-test PRIVATE strix_inkling2_mini_checkpoint strix_serve)
     add_test(NAME inkling2-mini-cpu-cli
         COMMAND "${CMAKE_COMMAND}" "-DDECODER=$<TARGET_FILE:strix-inkling2-mini-cpu>"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/mini_cpu_cli_test.cmake")

@@ -3,6 +3,7 @@
 // the graph and the arithmetic; an adapter only names tensors, states its resize rule and patch order, runs its
 // projector through DenseOps and describes the span the language model sees.
 #include "strix/vision/encoder.hpp"
+#include "strix/vision/image.hpp"
 
 #include <array>
 #include <cstdint>
@@ -13,8 +14,6 @@
 #include <vector>
 
 namespace strix::vision {
-
-struct Image;  // decoded pixels (preprocess library)
 
 // Resize contract of a family, as data: sides are multiples of `multiple`, the area is kept inside
 // [min_pixels, max_pixels], the row count after the projector never exceeds max_rows.
@@ -84,6 +83,7 @@ public:
     virtual EncoderConfig config() const = 0;
     virtual std::string identity() const = 0;  // weights digest + arithmetic id: cache key and capability hash
     virtual ResizeRule resize() const = 0;
+    virtual ColorPolicy color_policy() const { return {}; }
     virtual PatchGrid patches(const Image&) const = 0;
     virtual void bind(WeightSource&, EncoderWeights&) = 0;  // tensor-name mapping only
     virtual PositionInputs positions(const EncoderConfig& c, const EncoderWeights& w, const PatchGrid& g) const {
@@ -98,7 +98,8 @@ public:
     virtual EncoderOptions device_options() const { return {}; }
     // Start-time preparation (prepare_backend): the projector linears (built and uploaded with the tower), the largest
     // tower input the adapter admits (0: unknown, the workspace grows on demand) and whether project() reads the
-    // hidden rows only through DenseOps::merge_project() (they may then stay on the device).
+    // hidden rows only through DenseOps::merge_project() (they may then stay on the device; only for the row-major
+    // projector: the packed-cell layout takes host rows and refuses a device-resident output).
     virtual std::vector<std::pair<Tensor, Tensor>> projector_linears() const { return {}; }
     virtual unsigned max_encoder_rows() const { return 0; }
     virtual bool device_resident_hidden() const { return false; }

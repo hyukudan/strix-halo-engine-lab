@@ -1084,10 +1084,33 @@ void profile_tests(){
           bench.find("predicted_prefetch")->status==rp::Status::unqualified&&bench.find("dsa_index_mma")->status==rp::Status::pending,
           "--allow-pending runs pending rows that are in this build only (dsa_index_mma stays pending)");
     check(bench.qualification()=="unqualified: predicted_prefetch,skip_empty_expert_groups,persistent_dense_fp16,mtp_self_spec,lookup_drafts,prefill_tile_large","the receipt is stamped unqualified");
+    {
+        namespace shared = strix::profile;
+        shared::LadderRow timing{"prefill_tile_large", "8192", shared::Name::fast, shared::Phase::prefill,
+                                  "fixture", 8192, 8192, 1, 1, 1.10, 0.02, "fixture timing"};
+        rp::Inputs measured;
+        measured.args = {"--profile", "fast", "--allow-pending"};
+        measured.env = lookup({});
+        measured.regime = {shared::Phase::prefill, 8192, 1, "fixture", "fixture-exec"};
+        // The row is measured over the execution that runs under the cell (LadderArms::over), the --allow-pending
+        // benchmark cells included.
+        const auto unmeasured = rp::resolve(rp::App::decode_service, measured);
+        const auto* unmeasured_tile = unmeasured.find("prefill_tile_large");
+        const std::string tile_reference = unmeasured_tile ? unmeasured_tile->ladder_reference : std::string();
+        check(tile_reference.starts_with("ladder-arm/v4;"), "GLM reports the reference of the tile cell");
+        timing.over = tile_reference;
+        measured.ladder = std::span(&timing, 1);
+        const auto experiment = rp::resolve(rp::App::decode_service, measured);
+        const auto* tile = experiment.find("prefill_tile_large");
+        check(tile && tile->value == "8192" && tile->status == rp::Status::unqualified &&
+              tile->ladder.find("applies x1.100") != std::string::npos,
+              "measured tile stays unqualified pending its quality gate");
+    }
     check(run({},{{"STRIX_GLM_RTX_PROFILE_ALLOW_PENDING","1"}}).allow_pending,"STRIX_GLM_RTX_PROFILE_ALLOW_PENDING=1");
     // stderr notices: one line per pending row, one for an unqualified run
     auto n=fast.notices();check(n.size()==7&&n[0].rfind("profile fast: predicted_prefetch pending, not used (",0)==0,"pending stderr lines");
-    check(bench.notices().back()=="profile fast: unqualified: predicted_prefetch,skip_empty_expert_groups,persistent_dense_fp16,mtp_self_spec,lookup_drafts,prefill_tile_large (--allow-pending: benchmarks only)","unqualified stderr line");
+    const auto benchmark_notices = bench.notices();
+    check(std::ranges::find(benchmark_notices, "profile fast: unqualified: predicted_prefetch,skip_empty_expert_groups,persistent_dense_fp16,mtp_self_spec,lookup_drafts,prefill_tile_large (--allow-pending: benchmarks only)") != benchmark_notices.end(), "unqualified stderr line");
     // the JSON (--print-effective-config / the first receipt event's "profile")
     auto j=strix::serve::parse_json(fast.json([](std::string_view l){return l=="row_tile"?std::string("auto (planner rule)"):std::string();}));
     check(j.find("profile")->as_string()=="fast"&&j.find("app")->as_string()=="decode-service"&&j.find("qualification")->as_string()=="qualified"&&!j.find("allow_pending")->as_bool(),

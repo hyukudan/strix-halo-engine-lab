@@ -15,11 +15,20 @@ namespace strix::deepseek41::quality {
 // qa kv qb oa ob (projections; none = all), l<first>t<end> (layers), a8 (FP16 operands from the A8 codes), r<rows>
 // (FP16 only at calls of >= rows rows), f (FP16 output form: STRIX_DS41_PREFILL_FP16_FAST), s<seed> (null: +-1 ulp by a
 // hash of the seed instead of the last-bit flip, so seeds sample the noise floor).
+// Prefix i4_ (any arm, e.g. i4_fast3): routed experts on the TURBO candidate gguf-iu4-direct-v1 (IU4 codes x A4), replacing
+// the relaxed MoE of the arm; the receipt profile is "diagnostic".
 // Prefix eng_ (any arm, e.g. eng_fast3, eng_exact; labels are [a-z0-9_]): adds the FAST lever ds41-engram-f16wmma-v1 (Engram projection on WMMA).
 inline PrefillOptions arm_precision(const std::string& label) {
+    if (label.rfind("i4_", 0) == 0 && label.size() > 3) {  // routed experts on gguf-iu4-direct-v1 instead of the relaxed MoE
+        PrefillOptions o = arm_precision(label.substr(3));
+        o.fast_i4 = 1;
+        o.fast_moe = false;
+        o.fast_moe_f16 = false;
+        return o;
+    }
     if (label.rfind("m16_", 0) == 0 && label.size() > 4) {  // + ds41-moe-f16wmma-v1 (relaxed MoE FP16 operands)
         PrefillOptions e = arm_precision(label.substr(4));
-        e.fast_moe_f16 = true;
+        e.fast_moe_f16 = e.fast_i4 == 0;
         return e;
     }
     if (label.rfind("sh_", 0) == 0 && label.size() > 3) {  // + ds41-shared-f16-v1 (shared expert on the FAST dense core)
@@ -33,6 +42,7 @@ inline PrefillOptions arm_precision(const std::string& label) {
         return e;
     }
     PrefillOptions o;
+    o.fast_i4 = 0;  // named controls must not inherit the candidate from the process
     o.decoder_replay_override = true;  // every named arm is explicit, including exact/null OFF
     if (label == "exact") return o;
     if (label == "dense") { o.fp16_dense = true; return o; }
@@ -88,6 +98,20 @@ inline PrefillOptions arm_precision(const std::string& label) {
     return o;
 }
 
+// Both diagnostic ranks use the same manifest. Check candidate scope before entering the timed prefill.
+template<class Communicator, class TagKind>
+inline void verify_i4_scope(const PrefillOptions& arm, Communicator& comm, TagKind kind) {
+    if (arm.fast_i4 != 1) return;
+    using ds41::fast_profile::MoeI4Scope;
+    const auto scope = ds41::fast_profile::moe_i4_scope();
+    auto peer = MoeI4Scope::invalid;
+    comm.exchange_host(std::as_bytes(std::span(&scope, 1)), std::as_writable_bytes(std::span(&peer, 1)),
+                       {static_cast<std::uint32_t>(kind), 0x69347363U, 0U});
+    if (scope == MoeI4Scope::invalid || peer == MoeI4Scope::invalid)
+        throw std::invalid_argument("STRIX_DS41_FAST_I4_SCOPE must be all or gu on both ranks");
+    if (scope != peer) throw std::invalid_argument("ranks disagree on STRIX_DS41_FAST_I4_SCOPE");
+}
+
 // Profile of an arm for the gate's execution witness: "exact" (incumbent arithmetic; the null controls perturb it),
 // "fast-prefill" (the FAST prefill levers fast3 / fast3b<R>), else "diagnostic" (no floor-rule role).
 inline PrefillOptions executed_precision(PrefillOptions o, const PrefillResult& run) {
@@ -97,7 +121,7 @@ inline PrefillOptions executed_precision(PrefillOptions o, const PrefillResult& 
 }
 
 inline std::string arm_profile(const PrefillOptions& o) {
-    if (!o.decoder_replay_override && o.decoder_replay_rows == 0U) return "diagnostic";  // unresolved inheritance
+    if (o.fast_i4 != 0 || (!o.decoder_replay_override && o.decoder_replay_rows == 0U)) return "diagnostic";
     const bool fast3 = o.fast_attention && o.fast_attention_flash && o.fast_moe && o.fast_dense;
     const bool other = o.fp16_dense || o.bf16_attention || o.fp16_fast || o.fp16_keep_a8 || o.fp16_wsplit ||
                        o.fp16_projections != 31U || o.approx_layer_first != 0U || o.approx_layer_end != 1000U || o.fp16_min_rows != 0U;

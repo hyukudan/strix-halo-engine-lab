@@ -14,7 +14,8 @@ las tablas y qué cubre "exacto": [metodología](../../methodology.es.md).
 
 ## Perfiles
 
-Un solo interruptor lo selecciona todo: `--profile default|fast|quality` (predeterminado: `default`). Una opción
+Un solo interruptor lo selecciona todo: `--profile default|fast|quality|turbo` (predeterminado: `default`; `turbo`
+ejecuta las celdas de fast mientras ninguna celda superior tenga un régimen medido). Una opción
 explícita o una variable de entorno siempre prevalece sobre el perfil. Cada recibo registra el perfil, el valor y el
 origen de cada palanca y cualquier fila pendiente. Una fila pendiente (aún no cualificada) nunca se aplica: el perfil
 ejecuta todas las filas listas, la fila pendiente conserva el comportamiento exacto, el recibo la lista con su objetivo

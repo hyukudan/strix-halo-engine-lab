@@ -2,6 +2,7 @@
 // strix-cuda-qwen35-decode: qwen35 (bf16 / q8_0) on one CUDA device through strix::qwen35::CudaEngine. Exact greedy decode,
 // C1 timing, real GGUF or on-device synthetic full-size weights (--synthetic-full bf16|q8_0, no disk).
 // Home: specific (CLI of the qwen35 family); engine in src/qwen35/cuda, arithmetic in src/cuda_core.
+#include "../src/device/cuda_cost_identity.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -172,8 +173,14 @@ int main(int argc, char** argv) {
         std::string pf_tile_feed;                 // --prefill-tile-feed bulk|lsu (EngineOptions::prefill_tile_feed; FAST4 only, bitwise)
         std::uint32_t pf_chunk = 2048, pf_repeat = 1, pf_slots = 2, pf_wave_min = 0;
         std::uint32_t pf_inflight = q::EngineOptions{}.prefill_inflight, pf_ramp = 0;  // bounded submission / ramp
+        bool joint_workload = true;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
+            // Joint receipts describe the plain single-session workload. Other execution forms need their own binding.
+            joint_workload &= strix::profile::bit_class_member(
+                "--model,--prompt-ids,--n-gen,--rows,--decode-rows,--max-pos,--profile,--prefill-arith,--prefill-gdn,"
+                "--prefill-hid,--prefill-attn8,--split-k,--decode-attn8,--dense-activation,--turbo-weights,"
+                "--prefill-chunk,--print-effective-config", a);
             auto next = [&]() -> std::string {
                 if (i + 1 >= argc) throw std::runtime_error("missing value for " + a);
                 return argv[++i];
@@ -297,6 +304,19 @@ int main(int argc, char** argv) {
         regime.device = binding.visible.name;
         regime.arch = binding.visible.arch;
         regime.linear_session = slots == 0 && !step_program;
+        const std::uint64_t total_ctx = ctx_fill + (slots ? static_cast<std::uint64_t>(n_gen) * (ab_pairs + 1) * 2 : 0)
+            + prompt.size() + prompt_len + static_cast<std::uint64_t>(n_gen) * decode_rows + 64;
+        const auto context_capacity = std::max<std::uint64_t>(max_pos, total_ctx);
+        std::string cost_device;
+        // The device product and priced workload bind every timing receipt (paired and ordinary) of a lossy tier; the
+        // timing evidence of this table is on the converted NVFP4 pack only.
+        if (joint_workload && (profile == strix::profile::Name::fast || profile == strix::profile::Name::turbo) &&
+            !qp::turbo_evidence.empty() && !model.empty() && !prompt.empty() &&
+            opt.turbo_weights == q::TurboWeights::converted) {
+            cost_device = strix::device::cuda_cost_device_identity();
+            regime.cost_device = cost_device;
+            regime.workload = {regime.prompt_tokens, context_capacity, 1, pf_chunk, rows_cap, decode_rows, 0, n_gen};
+        }
         const auto resolved = qp::resolve(profile, regime, lever_cli);
         qp::apply(opt, *resolved);
         qp::observe_kv(kv, *resolved);
@@ -324,8 +344,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         std::unique_ptr<q::CudaEngine> E;
-        const std::uint64_t total_ctx = ctx_fill + (slots ? static_cast<std::uint64_t>(n_gen) * (ab_pairs + 1) * 2 : 0) + prompt.size() + prompt_len + static_cast<std::uint64_t>(n_gen) * decode_rows + 64;
-        opt.max_positions = static_cast<std::uint32_t>(std::max<std::uint64_t>(max_pos, total_ctx));
+        opt.max_positions = static_cast<std::uint32_t>(context_capacity);
         if (!model.empty()) {
             E = q::CudaEngine::from_gguf(model, opt);
         } else {

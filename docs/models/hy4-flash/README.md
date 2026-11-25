@@ -86,8 +86,10 @@ Build with `-DSTRIX_ENABLE_HIP_RUNTIME=ON -DSTRIX_FAMILY_HY4=ON -DSTRIX_BUILD_EX
 One node:
 
 ```
-strix-hy4-rank PART1.gguf PART2.gguf --ids-file prompt.ids --gen 128 --context 4160 --top 0 [--prompt-rows 2048] [--profile fast]
+strix-hy4-rank PART1.gguf PART2.gguf --ids-file prompt.ids --gen 128 --context 4160 --top 0 [--prompt-rows 2048] [--profile fast|turbo]
 ```
+
+`--profile turbo` (`hy4-turbo-v1`) runs the fast cells until a higher cell has a measured regime.
 
 `--ids-file` holds token ids (comma or space separated). `--prompt-rows R` runs the prompt in batched windows of R rows.
 Without it the prompt runs position by position under the default tier word. `--top 0` prints only the greedy id.

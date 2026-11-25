@@ -54,12 +54,22 @@ class BenchTests(unittest.TestCase):
 
     def test_minimax_cli_receipt_matches_policy(self):
         env = {key: value for key, value in os.environ.items() if not key.startswith("STRIX_")}
-        result = run(HELPER, "--minimax-cli", "--profile", "turbo", "--print-effective-config", env=env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+        def effective(profile):
+            result = run(HELPER, "--minimax-cli", "--profile", profile, "--print-effective-config", env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+        values = effective("turbo")
         self.assertEqual(values["STRIX_MM_PF_MSA_FLASH"], values["prefill.msa_flash_requested"])
         self.assertEqual(values["STRIX_MM_PF_MSA_FLASH_LAYERS"], values["prefill.msa_flash_layers_requested"])
-        self.assertEqual(values["STRIX_MM_PF_MSA_FLASH"], "0")
+        # TURBO nests FAST: the admitted FAST bundle runs in TURBO with the same prefill members and layer sets.
+        fast = effective("fast")
+        self.assertEqual(values["STRIX_MM_PF_MSA_FLASH"], "1")
+        for key in ("STRIX_MM_PF_MSA_FLASH", "STRIX_MM_PF_MSA_FLASH_LAYERS", "STRIX_MM_PF_ROUTER_WMMA",
+                    "prefill.fast_policies", "prefill.msa_flash_requested", "prefill.msa_flash_layers_requested"):
+            with self.subTest(key=key):
+                self.assertEqual(values.get(key), fast.get(key))
 
     def test_ticket_size_validation(self):
         for value in ("1", "0", "-1", "abc", "2.5", "08", "999999999999999999999"):

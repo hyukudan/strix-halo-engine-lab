@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <concepts>
+#include <functional>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -30,9 +31,11 @@ template <class Decoder>
 
 class FixedKvCohort final : public CohortBackend {
 public:
+    using PrefillPolicy = std::function<void(Decoder&, std::uint64_t, bool)>;
+
     FixedKvCohort(std::unique_ptr<Decoder> decoder, std::uint32_t context,
-                  std::uint32_t rows, std::uint32_t lanes)
-        : decoder_(std::move(decoder)), context_(context), rows_(rows), lanes_(lanes) {
+                  std::uint32_t rows, std::uint32_t lanes, PrefillPolicy policy = {})
+        : decoder_(std::move(decoder)), context_(context), rows_(rows), lanes_(lanes), prefill_policy_(std::move(policy)) {
         if (!decoder_ || context_ == 0U || lanes_ == 0U || lanes_ > rows_)
             throw std::invalid_argument("invalid fixed KV cohort geometry");
         if constexpr (kSelectsRoute) emits_first_ = decoder_->prefill_emits_first();
@@ -47,6 +50,12 @@ public:
     [[nodiscard]] bool prefill_emits_first() const override { return emits_first_; }
 
     void prefill(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) override {
+        prefill_scoped(lane, tokens, first, 0);
+    }
+
+    void prefill_scoped(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first,
+                        std::uint64_t prompt_tokens) override {
+        if (prefill_policy_) prefill_policy_(*decoder_, prompt_tokens, first);
         withdraw();  // a prefill call replaces the decoder's score rows: no verify window stays readable
         if constexpr (kEmitsFirst) {
             if (emits_first_) {
@@ -171,6 +180,7 @@ private:
 
     std::unique_ptr<Decoder> decoder_;
     std::uint32_t context_, rows_, lanes_;
+    PrefillPolicy prefill_policy_;
     // The last verify window (lane per decode row; kNoLane = released since), readable until commit.
     std::vector<std::uint32_t> window_;
     bool verify_pending_ = false;

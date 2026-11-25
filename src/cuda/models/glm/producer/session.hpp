@@ -1,6 +1,6 @@
 #pragma once
 #include "../dsa_selection.hpp"
-#include "../../../core/chunk_contract.hpp"
+#include "core/chunk_contract.hpp"
 // Host-only single-session decode contract (draft identity glm-dec-rtx-native-v1).
 // One pending token: for logical sequence S of length N, trunk state holds rows
 // S[0..N-2], MTP holds pairs (hidden[j],S[j+1]) for j<N-1, S[N-1] is pending and

@@ -1,7 +1,9 @@
 #include "strix/weight/source.hpp"
+#include "strix/weight/confined_file.hpp"
 #include "core/sha256.hpp"
 #include "strix/file_snapshot.hpp"
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -14,16 +16,24 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <winternl.h>
 #include <io.h>
+#include <fcntl.h>
 #else
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <unistd.h>
 #endif
 namespace strix::weight {
 namespace {
 Digest256 digest(std::span<const Byte> bytes) {
     core::Sha256 hash; hash.update(bytes.data(),bytes.size()); return {hash.finish()};
 }
+struct FileClose {
+    void operator()(std::FILE* file) const noexcept { std::fclose(file); }
+};
+using FileHandle = std::unique_ptr<std::FILE, FileClose>;
+
 class FileSource final : public Source {
     struct Snapshot { std::array<std::uint64_t,6> words{}; bool operator==(const Snapshot&) const = default; };
     std::FILE* file_; std::uint64_t size_; std::string shard_; Snapshot snapshot_;
@@ -41,6 +51,12 @@ class FileSource final : public Source {
     }
     mutable std::mutex mutex_; mutable std::optional<Digest256> digest_; mutable std::once_flag digest_once_;
 public:
+    explicit FileSource(FileHandle file, std::string shard)
+        : file_(file.get()), size_(0), shard_(std::move(shard)) {
+        snapshot_ = snapshot();
+        size_ = snapshot_.words[0];
+        (void)file.release();
+    }
     explicit FileSource(const std::string& path,std::string shard) : file_(std::fopen(path.c_str(),"rb")), size_(0),
         shard_(shard.empty()?std::filesystem::path(path).filename().generic_string():std::move(shard)) {
         if (!file_) throw std::runtime_error("cannot open source");
@@ -52,6 +68,30 @@ public:
         }catch(...){std::fclose(file_);throw; }
     }
     ~FileSource() override { std::fclose(file_); }
+    FileKey key() const {
+#ifdef _WIN32
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (!GetFileInformationByHandle(reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(file_))), &info))
+            throw std::runtime_error("cannot identify source handle");
+        return {info.dwVolumeSerialNumber, (std::uint64_t(info.nFileIndexHigh) << 32U) | info.nFileIndexLow};
+#else
+        struct stat st{};
+        if (fstat(fileno(file_), &st)) throw std::runtime_error("cannot identify source handle");
+        return {std::uint64_t(st.st_dev), std::uint64_t(st.st_ino)};
+#endif
+    }
+    std::string read_all(std::size_t cap, std::optional<std::size_t> exact) const {
+        if (size_ > cap || (exact && size_ != *exact))
+            throw std::runtime_error(shard_ + ": file length outside bounds");
+        // This is a fresh handle. The EOF probe should go to the file.
+        if (std::setvbuf(file_, nullptr, _IONBF, 0) != 0) throw std::runtime_error("cannot configure source handle");
+        std::string data(static_cast<std::size_t>(size_), '\0');
+        if (const auto status = read({0, size_}, {reinterpret_cast<Byte*>(data.data()), data.size()}); !status)
+            throw std::runtime_error(shard_ + ": " + status.detail);
+        if (std::fgetc(file_) != EOF || std::ferror(file_) || snapshot() != snapshot_)
+            throw std::runtime_error(shard_ + ": file changed during read");
+        return data;
+    }
     std::uint64_t size() const noexcept override { return size_; }
     void discard(ByteRange range) const noexcept override {
 #ifndef _WIN32
@@ -162,8 +202,158 @@ class SourceStream final:public std::istream {
 public: explicit SourceStream(std::shared_ptr<const Source> source):std::istream(nullptr),buffer_(std::move(source)){rdbuf(&buffer_);}
 };
 }
+
+struct ConfinedDirectory::Impl {
+#ifdef _WIN32
+    HANDLE handle;
+    explicit Impl(const std::filesystem::path& path)
+        : handle(CreateFileW(path.c_str(), FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr)) {
+        if (handle == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open directory");
+        FILE_ATTRIBUTE_TAG_INFO info{};
+        if (!GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &info, sizeof info) ||
+            (info.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != FILE_ATTRIBUTE_DIRECTORY) {
+            CloseHandle(handle);
+            throw std::runtime_error("not a directory");
+        }
+    }
+    ~Impl() { CloseHandle(handle); }
+#else
+    int handle;
+    explicit Impl(const std::filesystem::path& path) : handle(::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)) {
+        if (handle < 0) throw std::runtime_error("cannot open directory");
+    }
+    ~Impl() { ::close(handle); }
+#endif
+
+    std::shared_ptr<FileSource> open(const std::filesystem::path& name, bool missing_ok) const {
+        const auto& basename = name.native();
+        using Char = std::filesystem::path::value_type;
+        if (basename.empty() || basename.size() > 255 || name == "." || name == ".." ||
+            basename.find_first_of(std::filesystem::path("/\\:").native()) != std::filesystem::path::string_type::npos ||
+            basename.find(Char{}) != std::filesystem::path::string_type::npos ||
+            basename.back() == static_cast<Char>('.') || basename.back() == static_cast<Char>(' '))
+            throw std::invalid_argument("confined file: expected a basename");
+#ifdef _WIN32
+        // Win32 CreateFile has no root-handle argument. NtCreateFile opens the
+        // component relative to this directory even if its path was replaced.
+        static const auto create = std::bit_cast<decltype(&NtCreateFile)>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile"));
+        if (!create) throw std::runtime_error("relative file open unavailable");
+        UNICODE_STRING relative{};
+        relative.Length = static_cast<USHORT>(basename.size() * sizeof(wchar_t));
+        relative.MaximumLength = relative.Length;
+        relative.Buffer = const_cast<wchar_t*>(basename.data());
+        OBJECT_ATTRIBUTES attrs{};
+        InitializeObjectAttributes(&attrs, &relative, OBJ_CASE_INSENSITIVE, handle, nullptr);
+        IO_STATUS_BLOCK io{};
+        HANDLE child = INVALID_HANDLE_VALUE;
+        const NTSTATUS status = create(&child, FILE_GENERIC_READ, &attrs, &io, nullptr, 0,
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
+                                       FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT | FILE_NON_DIRECTORY_FILE,
+                                       nullptr, 0);
+        if (status < 0) {
+            constexpr unsigned long name_not_found = 0xc0000034UL;
+            if (missing_ok && static_cast<unsigned long>(status) == name_not_found) return {};
+            throw std::runtime_error("cannot open confined file: " + name.string());
+        }
+        FILE_ATTRIBUTE_TAG_INFO info{};
+        if (GetFileType(child) != FILE_TYPE_DISK ||
+            !GetFileInformationByHandleEx(child, FileAttributeTagInfo, &info, sizeof info) ||
+            (info.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE))) {
+            CloseHandle(child);
+            throw std::runtime_error("not a confined regular file: " + name.string());
+        }
+        const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(child), _O_RDONLY | _O_BINARY | _O_NOINHERIT);
+        if (fd < 0) {
+            CloseHandle(child);
+            throw std::runtime_error("cannot adopt confined file: " + name.string());
+        }
+        FileHandle file(_fdopen(fd, "rb"));
+        if (!file) _close(fd);
+#else
+        const int fd = ::openat(handle, basename.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) {
+            if (missing_ok && errno == ENOENT) return {};
+            throw std::runtime_error("cannot open confined file: " + name.string());
+        }
+        struct stat st{};
+        if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+            ::close(fd);
+            throw std::runtime_error("not a confined regular file: " + name.string());
+        }
+        FileHandle file(::fdopen(fd, "rb"));
+        if (!file) ::close(fd);
+#endif
+        if (!file) throw std::runtime_error("cannot adopt confined file: " + name.string());
+        return std::make_shared<FileSource>(std::move(file), name.string());
+    }
+};
+
+ConfinedDirectory::ConfinedDirectory(const std::filesystem::path& directory)
+    : directory_(std::make_unique<Impl>(directory)) {}
+ConfinedDirectory::~ConfinedDirectory() = default;
+
+std::shared_ptr<const Source> ConfinedDirectory::open(const std::filesystem::path& name) const {
+    return directory_->open(name, false);
+}
+
+std::optional<std::string> ConfinedDirectory::read(const std::filesystem::path& name, std::size_t max_bytes,
+                                                   bool missing_ok, std::optional<std::size_t> exact_bytes,
+                                                   std::optional<FileKey>* key) const {
+    auto file = directory_->open(name, missing_ok);
+    if (!file) return std::nullopt;
+    if (key) *key = file->key();
+    return file->read_all(max_bytes, exact_bytes);
+}
+
 Digest256 digest_bytes(std::span<const Byte> bytes) {return digest(bytes);}
+namespace {
+struct PinnedSource {
+    std::mutex mutex;
+    std::string path;
+    std::shared_ptr<const Source> source;
+    std::size_t uses = 0;
+};
+PinnedSource& pinned_source() { static PinnedSource pin; return pin; }
+}  // namespace
+std::optional<FileKey> source_file_key(const Source& source) {
+    const auto* file = dynamic_cast<const FileSource*>(&source);
+    if (!file) return std::nullopt;
+    return file->key();
+}
+SourcePin::SourcePin(std::string path, std::shared_ptr<const Source> source) {
+    auto& pin = pinned_source();
+    std::lock_guard lock(pin.mutex);
+    if (pin.source) throw std::logic_error("a source is already pinned");
+    if (!source || path.empty()) throw std::invalid_argument("source pin needs a path and a source");
+    pin.path = std::move(path);
+    pin.source = std::move(source);
+    pin.uses = 0;
+}
+SourcePin::~SourcePin() {
+    auto& pin = pinned_source();
+    std::lock_guard lock(pin.mutex);
+    pin.source.reset();
+    pin.path.clear();
+}
+std::size_t SourcePin::uses() const {
+    auto& pin = pinned_source();
+    std::lock_guard lock(pin.mutex);
+    return pin.uses;
+}
 Status open_source(const std::string& path,std::shared_ptr<const Source>& out,std::string shard) {
+    {
+        auto& pin = pinned_source();
+        std::lock_guard lock(pin.mutex);
+        if (pin.source && path == pin.path) {  // the held file, under the shard name this path gives
+            if (shard.empty()) shard = std::filesystem::path(path).filename().generic_string();
+            out = shard == pin.source->shard_name() ? pin.source : namespace_source(pin.source, std::move(shard));
+            ++pin.uses;
+            return {Error::ok, {}};
+        }
+    }
     try {auto source=std::make_shared<FileSource>(path,std::move(shard));out=std::move(source);return {Error::ok,{}};}
     catch(const std::exception& e){return {Error::malformed,e.what()};}
 }

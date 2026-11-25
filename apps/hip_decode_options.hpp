@@ -2139,14 +2139,14 @@ enum class DecodeAssets { verify, defer };
 inline Options parse_options(
     int argc,
     char** argv, bool defer_qpf2k_defaults = false, std::string bundle_path = {},
-    DecodeAssets assets = DecodeAssets::verify) {
+    DecodeAssets assets = DecodeAssets::verify, std::string_view device_class = {}) {
     if (bundle_path.empty()) {  // --serve-config FILE: validated and expanded before anything is read or loaded
         auto file = strix::serve::config_file::expand(argc, argv, hip_serve_config_options());
         if (file.print) { std::cout << file.effective << std::flush; std::exit(0); }
         if (file.used) {
             std::vector<char*> pointers;
             for (auto& arg : file.argv) pointers.push_back(arg.data());
-            return parse_options(static_cast<int>(pointers.size()), pointers.data(), defer_qpf2k_defaults, bundle_path, assets);
+            return parse_options(static_cast<int>(pointers.size()), pointers.data(), defer_qpf2k_defaults, bundle_path, assets, device_class);
         }
     }
     if (argc>=2 && bundle_path.empty()) {
@@ -2222,7 +2222,7 @@ inline Options parse_options(
                 std::vector<char*> pointers;
                 for (auto& arg:expanded) pointers.push_back(arg.data());
                 auto result=parse_options(static_cast<int>(pointers.size()),pointers.data(),defer_qpf2k_defaults,
-                    off?"serial-retry":bundle, assets);
+                    off?"serial-retry":bundle, assets, device_class);
                 result.mtp.runtime_automatic = !off && decision.source=="default";
                 if (off) {result.mtp_bundle_path.clear();result.yarn_decode_source="env";}
                 else if (assets == DecodeAssets::verify)
@@ -2427,6 +2427,7 @@ inline Options parse_options(
             if (value.empty() || value.starts_with("--"))
                 throw std::invalid_argument("dense Q6P32 pack requires a nonempty path");
             options.dense_q6p_pack_path = value;
+            options.product_profile_inputs.cli.emplace_back("dense_q6p_pack", "selected");
             continue;
         }
         if (argument == "--dense-trellis-pack" || argument.starts_with("--dense-trellis-pack=")) {
@@ -2435,6 +2436,7 @@ inline Options parse_options(
                 (index + 1 < argc ? std::string_view(argv[++index]) : std::string_view{}) : argument.substr(std::string_view("--dense-trellis-pack=").size());
             if (value.empty() || value.starts_with("--")) throw std::invalid_argument("dense trellis pack requires a nonempty path");
             options.dense_trellis_pack_path = value;
+            options.product_profile_inputs.cli.emplace_back("dense_trellis_pack", "selected");
             continue;
         }
         if (argument == "--teacher-logits-file" || argument.starts_with("--teacher-logits-file=")) {
@@ -2482,6 +2484,7 @@ inline Options parse_options(
                 throw std::invalid_argument("--numerical-profile requires a supported numerical recipe");
             options.numerical_profile = *parsed;
             options.numerical_profile_explicit = true;
+            options.product_profile_inputs.cli.emplace_back("decode_numerical_profile", value);
             continue;
         }
         if (argument == "--prefill-numerical-profile" || argument.starts_with("--prefill-numerical-profile=")) {
@@ -3843,6 +3846,9 @@ inline Options parse_options(
     options.product_profile_inputs.max_prompt_tokens =
         options.tokens.empty() ? options.context_tokens : static_cast<std::uint64_t>(options.tokens.size());
     options.product_profile_inputs.regimes = strix::qwen::profile::fast_regimes;
+    // A serving capacity is not a request's actual prompt length.
+    options.product_profile_inputs.regime = options.http_serve ? strix::profile::startup_prefill_regime(device_class)
+        : strix::profile::Regime{strix::profile::Phase::prefill, options.tokens.size(), 1, device_class};
     options.product_profile = strix::qwen::profile::resolve(
         options.product_profile_requested.value_or(strix::qwen::profile::Name::standard), options.product_profile_inputs);
     // KV precision: native BF16 in every tier (no FP8 here, so turbo keeps BF16 with a note); only --kv changes it.

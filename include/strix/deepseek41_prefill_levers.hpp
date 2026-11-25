@@ -128,7 +128,7 @@ inline constexpr PrefillLever kPrefillLevers[] = {
     {"STRIX_DS41_FAST_DENSE_BATCH", PrefillLeverClass::cached},  // scheduling only (batched o_a groups), same bits
     {"STRIX_DS41_FAST_DENSE_MIN_ROWS", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_FAST_ENGRAM", PrefillLeverClass::reload},  // startup pair resolver exports the Engram policy
-    {"STRIX_DS41_FAST_I4", PrefillLeverClass::runtime},
+    {"STRIX_DS41_FAST_I4", PrefillLeverClass::reload},  // startup pair resolver derives FAST_MOE from IU4; use explicit per-object precision for resident A/B
     {"STRIX_DS41_FAST_I4_SCOPE", PrefillLeverClass::reload},
     {"STRIX_DS41_FAST_MOE", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_FAST_MOE_DOWN_ROWS", PrefillLeverClass::runtime},  // getenv on every call

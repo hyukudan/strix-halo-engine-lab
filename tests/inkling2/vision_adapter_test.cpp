@@ -4,11 +4,12 @@
 // MergeProjector) is compared with an independent double-precision forward of the unfolded checkpoint graph
 // (class row first, explicit ln_pre and LayerScale, separate q / k / v, slot-major 2 x 2 concatenation).
 // No GPU, no checkpoint.
-#include "inkling2/inkling2_vision_adapter.hpp"
+#include "inkling2/inkling2_vision.hpp"
 
 #include "strix/vision/image.hpp"
 #include "strix/vision/lookup_weights.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -59,24 +60,23 @@ struct MapSource final : vis::WeightSource {
     const std::vector<float>& v(const std::string& name) const { return t.find(name)->second; }
 };
 
-ink::VisionConfig toy_config() {
-    ink::VisionConfig c;
-    c.hidden_size = 16;
-    c.num_hidden_layers = 2;
-    c.num_attention_heads = 2;
+ink::VisionSpec toy_config() {
+    ink::VisionSpec c;
+    c.width = 16;
+    c.layers = 2;
+    c.heads = 2;
     c.mlp_width = 24;
-    c.native_patch_size = 2;
-    c.temporal_patch_size = 2;
-    c.adapter_merge_size = 2;
-    c.posemb_grid_size = 4;
-    c.projection_hidden_dim = 20;
-    c.text_hidden_size = 12;
+    c.patch = 2;
+    c.merge = 2;
+    c.pos_grid = 4;
+    c.projection = 20;
+    c.text_width = 12;
     return c;
 }
 
-void fill_source(MapSource& s, const ink::VisionConfig& c) {
-    const std::size_t W = c.hidden_size, M = c.mlp_width, G = c.posemb_grid_size;
-    const std::size_t pd = 3U * c.native_patch_size * c.native_patch_size;  // 2-D stored patch weight
+void fill_source(MapSource& s, const ink::VisionSpec& c) {
+    const std::size_t W = c.width, M = c.mlp_width, G = c.pos_grid;
+    const std::size_t pd = 3U * c.patch * c.patch;  // 2-D stored patch weight
     const std::string e = "model.visual.backbone.embeddings.";
     s.add(e + "patch_embedding.weight", W, pd, 0.1F);
     s.add(e + "position_embedding", G * G, W, 0.3F);
@@ -84,8 +84,8 @@ void fill_source(MapSource& s, const ink::VisionConfig& c) {
     s.add(e + "cls_position_embedding", W, 1, 0.3F);
     s.add("model.visual.backbone.ln_pre.weight", W, 1, 0.2F, 1.0F);
     s.add("model.visual.backbone.ln_pre.bias", W, 1, 0.1F);
-    const float ws = 1.0F / static_cast<float>(c.num_attention_heads * 4U);
-    for (unsigned l = 0; l < c.num_hidden_layers; ++l) {
+    const float ws = 1.0F / static_cast<float>(c.heads * 4U);
+    for (unsigned l = 0; l < c.layers; ++l) {
         const std::string p = "model.visual.backbone.layers." + std::to_string(l) + ".";
         for (const char* n : {"ln_1", "ln_2"}) {
             s.add(p + n + ".weight", W, 1, 0.2F, 1.0F);
@@ -102,9 +102,9 @@ void fill_source(MapSource& s, const ink::VisionConfig& c) {
         s.add(p + "mlp.c_proj.weight", W, M, 0.2F);
         s.add(p + "mlp.c_proj.bias", W, 1, 0.1F);
     }
-    const std::size_t R = c.adapter_merge_size;
-    s.add("model.visual.proj_in.weight", c.projection_hidden_dim, W * R * R, 0.15F);
-    s.add("model.visual.proj_out.weight", c.text_hidden_size, c.projection_hidden_dim, 0.2F);
+    const std::size_t R = c.merge;
+    s.add("model.visual.proj_in.weight", c.projection, W * R * R, 0.15F);
+    s.add("model.visual.proj_out.weight", c.text_width, c.projection, 0.2F);
 }
 
 vis::Image test_image(int w, int h) {
@@ -143,10 +143,11 @@ std::vector<double> layernorm(const std::vector<double>& x, const std::vector<fl
 
 double gelu(double v) { return 0.5 * v * (1.0 + std::erf(v * 0.70710678118654752440)); }
 
-// Unfolded checkpoint graph, class row FIRST. Positions: the shared interpolation of the table (not under test).
-std::vector<double> independent(const MapSource& s, const ink::VisionConfig& c, const vis::PatchGrid& g,
-                                const vis::PositionInputs& pos) {
-    const std::size_t W = c.hidden_size, H = c.num_attention_heads, D = W / H, M = c.mlp_width;
+// Unfolded checkpoint graph in raster order with the class row first. The axial
+// arm computes its own pixels, learned positions and rotations.
+std::vector<double> independent(const MapSource& s, const ink::VisionSpec& c, const vis::PatchGrid& g,
+                                const vis::PositionInputs& pos, const vis::Image* axial_image = nullptr) {
+    const std::size_t W = c.width, H = c.heads, D = W / H, M = c.mlp_width;
     const std::size_t N = std::size_t{g.grid_h} * g.grid_w, pd = g.patch_dim;
     const std::string e = "model.visual.backbone.embeddings.";
     Rows x(N + 1U, std::vector<double>(W));
@@ -154,21 +155,69 @@ std::vector<double> independent(const MapSource& s, const ink::VisionConfig& c, 
         x[0][i] = static_cast<double>(s.v(e + "class_embedding")[i]) + static_cast<double>(s.v(e + "cls_position_embedding")[i]);
     for (std::size_t r = 0; r < N; ++r) {
         std::vector<double> p(pd);
-        for (std::size_t i = 0; i < pd; ++i) p[i] = g.data[r * pd + i];
+        const std::size_t patch_y = r / g.grid_w, patch_x = r % g.grid_w;
+        if (axial_image) {
+            const auto width = static_cast<std::size_t>(axial_image->width);
+            const auto height = static_cast<std::size_t>(axial_image->height);
+            for (std::size_t i = 0; i < pd; ++i) {
+                const auto py = patch_y * c.patch + i / (3U * c.patch);
+                const auto px = patch_x * c.patch + (i / 3U) % c.patch;
+                const double raw = py < height && px < width ? axial_image->rgb[(py * width + px) * 3U + i % 3U] : -1.0;
+                p[i] = (raw - 127.5) / 127.5;
+            }
+        } else {
+            for (std::size_t i = 0; i < pd; ++i) p[i] = g.data[r * pd + i];
+        }
         const auto y = lin(s.v(e + "patch_embedding.weight"), nullptr, p, W);
-        for (std::size_t i = 0; i < W; ++i) x[r + 1U][i] = y[i] + static_cast<double>(pos.addend[r * W + i]);
+        if (axial_image) {
+            const auto coordinate = [side = c.pos_grid](std::size_t index, unsigned length) {
+                return std::clamp((static_cast<double>(index) + 0.5) * side / length - 0.5, 0.0, side - 1.0);
+            };
+            const auto iy = coordinate(patch_y, g.grid_h), ix = coordinate(patch_x, g.grid_w);
+            const auto y0 = static_cast<std::size_t>(iy), x0 = static_cast<std::size_t>(ix);
+            const auto y1 = std::min<std::size_t>(y0 + 1U, c.pos_grid - 1U);
+            const auto x1 = std::min<std::size_t>(x0 + 1U, c.pos_grid - 1U);
+            const auto& table = s.v(e + "position_embedding");
+            for (std::size_t i = 0; i < W; ++i) {
+                const auto at = [&](std::size_t ty, std::size_t tx) { return table[(ty * c.pos_grid + tx) * W + i]; };
+                const auto frac_x = ix - static_cast<double>(x0), frac_y = iy - static_cast<double>(y0);
+                const double top = std::lerp(static_cast<double>(at(y0, x0)), static_cast<double>(at(y0, x1)), frac_x);
+                const double bottom = std::lerp(static_cast<double>(at(y1, x0)), static_cast<double>(at(y1, x1)), frac_x);
+                x[r + 1U][i] = y[i] + std::lerp(top, bottom, frac_y);
+            }
+        } else {
+            for (std::size_t i = 0; i < W; ++i) x[r + 1U][i] = y[i] + static_cast<double>(pos.addend[r * W + i]);
+        }
     }
     for (auto& row : x)
-        row = layernorm(row, s.v("model.visual.backbone.ln_pre.weight"), s.v("model.visual.backbone.ln_pre.bias"), c.layer_norm_eps);
-    for (unsigned l = 0; l < c.num_hidden_layers; ++l) {
+        row = layernorm(row, s.v("model.visual.backbone.ln_pre.weight"), s.v("model.visual.backbone.ln_pre.bias"), c.eps);
+    for (unsigned l = 0; l < c.layers; ++l) {
         const std::string p = "model.visual.backbone.layers." + std::to_string(l) + ".";
         const std::string a = p + "self_attn.";
         Rows q(N + 1U), k(N + 1U), v(N + 1U);
         for (std::size_t r = 0; r <= N; ++r) {
-            const auto h = layernorm(x[r], s.v(p + "ln_1.weight"), s.v(p + "ln_1.bias"), c.layer_norm_eps);
+            const auto h = layernorm(x[r], s.v(p + "ln_1.weight"), s.v(p + "ln_1.bias"), c.eps);
             q[r] = lin(s.v(a + "q_proj.weight"), &s.v(a + "q_proj.bias"), h, W);
             k[r] = lin(s.v(a + "k_proj.weight"), &s.v(a + "k_proj.bias"), h, W);
             v[r] = lin(s.v(a + "v_proj.weight"), &s.v(a + "v_proj.bias"), h, W);
+            if (axial_image && r > 0U) {
+                const std::size_t frequencies = D / 4U;
+                const std::size_t raster = r - 1U;
+                for (std::size_t head = 0; head < H; ++head)
+                    for (std::size_t axis = 0; axis < 2U; ++axis)
+                        for (std::size_t f = 0; f < frequencies; ++f) {
+                            const auto index = head * D + 2U * (axis * frequencies + f);
+                            const auto position = axis == 0U ? raster % g.grid_w : raster / g.grid_w;
+                            const auto angle = static_cast<double>(position + 1U) /
+                                               std::pow(static_cast<double>(c.rope_theta), static_cast<double>(f) /
+                                                        static_cast<double>(frequencies));
+                            for (auto* row : {&q[r], &k[r]}) {
+                                const auto even = (*row)[index], odd = (*row)[index + 1U];
+                                (*row)[index] = even * std::cos(angle) - odd * std::sin(angle);
+                                (*row)[index + 1U] = odd * std::cos(angle) + even * std::sin(angle);
+                            }
+                        }
+            }
         }
         Rows att(N + 1U, std::vector<double>(W, 0.0));
         for (std::size_t hd = 0; hd < H; ++hd)
@@ -189,7 +238,7 @@ std::vector<double> independent(const MapSource& s, const ink::VisionConfig& c, 
         for (std::size_t r = 0; r <= N; ++r) {
             const auto o = lin(s.v(a + "out_proj.weight"), &s.v(a + "out_proj.bias"), att[r], W);
             for (std::size_t i = 0; i < W; ++i) x[r][i] += static_cast<double>(s.v(p + "ls_1.gamma")[i]) * o[i];
-            const auto h = layernorm(x[r], s.v(p + "ln_2.weight"), s.v(p + "ln_2.bias"), c.layer_norm_eps);
+            const auto h = layernorm(x[r], s.v(p + "ln_2.weight"), s.v(p + "ln_2.bias"), c.eps);
             auto m = lin(s.v(p + "mlp.c_fc.weight"), &s.v(p + "mlp.c_fc.bias"), h, M);
             for (auto& t : m) t = gelu(t);
             const auto y = lin(s.v(p + "mlp.c_proj.weight"), &s.v(p + "mlp.c_proj.bias"), m, W);
@@ -197,7 +246,7 @@ std::vector<double> independent(const MapSource& s, const ink::VisionConfig& c, 
         }
     }
     // Drop the class row; slot-major 2 x 2 concatenation in raster cells; proj_in, GELU, proj_out.
-    const std::size_t R = c.adapter_merge_size, mh = g.grid_h / R, mw = g.grid_w / R;
+    const std::size_t R = c.merge, mh = g.grid_h / R, mw = g.grid_w / R;
     std::vector<double> out;
     for (std::size_t my = 0; my < mh; ++my)
         for (std::size_t mx = 0; mx < mw; ++mx) {
@@ -207,16 +256,16 @@ std::vector<double> independent(const MapSource& s, const ink::VisionConfig& c, 
                     const std::size_t row = 1U + (my * R + dy) * g.grid_w + mx * R + dx;
                     for (std::size_t i = 0; i < W; ++i) f[(dy * R + dx) * W + i] = x[row][i];
                 }
-            auto h = lin(s.v("model.visual.proj_in.weight"), nullptr, f, c.projection_hidden_dim);
+            auto h = lin(s.v("model.visual.proj_in.weight"), nullptr, f, c.projection);
             for (auto& t : h) t = gelu(t);
-            const auto y = lin(s.v("model.visual.proj_out.weight"), nullptr, h, c.text_hidden_size);
+            const auto y = lin(s.v("model.visual.proj_out.weight"), nullptr, h, c.text_width);
             out.insert(out.end(), y.begin(), y.end());
         }
     return out;
 }
 
 void test_geometry() {
-    const ink::VisionConfig c = toy_config();  // cell = 4 px
+    const ink::VisionSpec c = toy_config();  // cell = 4 px
     ink::VisionAdapter a(c, "sha");
     CHECK(a.canvas(10, 6) == (vis::Size{12, 8}));
     CHECK(a.tokens(10, 6) == 6U);
@@ -232,7 +281,7 @@ void test_geometry() {
     CHECK(s.width >= s.height);  // aspect kept
     CHECK(a.identity() != b.identity());
     // Real geometry: 1024 x 768 -> 1040 x 800 -> 26 x 20 = 520 rows; 40 x 40 -> one row.
-    ink::VisionAdapter real(ink::VisionConfig{}, "sha");
+    ink::VisionAdapter real(ink::VisionSpec{}, "sha");
     CHECK(real.canvas(1024, 768) == (vis::Size{1040, 800}));
     CHECK(real.tokens(1024, 768) == 520U);
     CHECK(real.tokens(40, 40) == 1U);
@@ -243,7 +292,7 @@ void test_geometry() {
 }
 
 void test_patches_and_layout() {
-    const ink::VisionConfig c = toy_config();
+    const ink::VisionSpec c = toy_config();
     ink::VisionAdapter a(c, "sha");
     const vis::PatchGrid g = a.patches(test_image(10, 6));
     CHECK(g.grid_w == 6U && g.grid_h == 4U);
@@ -258,7 +307,7 @@ void test_patches_and_layout() {
 }
 
 void test_mapping_matches_unfolded_graph() {
-    const ink::VisionConfig c = toy_config();
+    const ink::VisionSpec c = toy_config();
     MapSource src;
     fill_source(src, c);
     ink::VisionAdapter a(c, "sha");
@@ -271,10 +320,10 @@ void test_mapping_matches_unfolded_graph() {
     vis::EncoderOutput h = enc.encode(g, p);
     vis::ProjectedRows rows;
     a.project(h, g, enc, rows);
-    CHECK(rows.rows == 6U && rows.width == c.text_hidden_size);
+    CHECK(rows.rows == 6U && rows.width == c.text_width);
 
     vis::PositionInputs img_pos = p;  // the image rows' addend (the class row is the last one)
-    img_pos.addend.resize(std::size_t{24} * c.hidden_size);
+    img_pos.addend.resize(std::size_t{24} * c.width);
     const std::vector<double> want = independent(src, c, g, img_pos);
     CHECK(want.size() == rows.bf16.size());
     double num = 0.0, den = 0.0, worst = 0.0;
@@ -307,11 +356,67 @@ void test_mapping_matches_unfolded_graph() {
     CHECK(std::sqrt(num2 / den) > 1e-2);
 }
 
+class ProjectorProbe final : public vis::DenseOps {
+public:
+    explicit ProjectorProbe(vis::ReferenceEncoder& encoder) : encoder_(encoder) {}
+    void linear(const vis::Tensor& w, const vis::Tensor& b, const float* x, std::size_t rows, float* y) override {
+        encoder_.linear(w, b, x, rows, y);
+    }
+    void merge_project(const vis::EncoderOutput& hidden, unsigned h, unsigned w, const vis::MergeProjector& m,
+                       float* out) override {
+        CHECK(m.layout == vis::MergeProjector::Layout::packed_cells && m.row_offset == 1U);
+        ++calls;
+        vis::DenseOps::merge_project(hidden, h, w, m, out);
+    }
+    unsigned calls = 0;
+
+private:
+    vis::ReferenceEncoder& encoder_;
+};
+
+void test_axial_mapping_matches_unfolded_graph() {
+    const auto spec = toy_config();
+    MapSource source;
+    fill_source(source, spec);
+    ink::VisionAdapter adapter(spec, "sha", ink::VisionIdentity::axial_v1);
+    const ink::VisionAdapter incumbent(spec, "sha");
+    vis::EncoderWeights weights;
+    adapter.bind(source, weights);
+    const auto config = adapter.config();
+    const auto image = test_image(10, 6);
+    const auto grid = adapter.patches(image);
+    const auto legacy_grid = incumbent.patches(image);
+    CHECK(incumbent.config().pos == vis::EncoderConfig::Pos::learned_interp &&
+          config.pos == vis::EncoderConfig::Pos::rope2d_plus_learned);
+    CHECK(legacy_grid.rows == grid.rows && legacy_grid.data != grid.data);
+    const ink::VisionAdapter capped_legacy(spec, "sha", ink::VisionIdentity::legacy, 28);
+    const ink::VisionAdapter capped_axial(spec, "sha", ink::VisionIdentity::axial_v1, 28);
+    const auto tall = test_image(20, 82);
+    CHECK(capped_legacy.layout(capped_legacy.patches(tall)).rows() == 18U);
+    CHECK(capped_axial.layout(capped_axial.patches(tall)).rows() == 27U);
+    vis::ReferenceEncoder encoder(config, weights);
+    auto hidden = encoder.encode(grid, adapter.positions(config, weights, grid));
+    ProjectorProbe projector(encoder);
+    vis::ProjectedRows got;
+    adapter.project(hidden, grid, projector, got);
+    CHECK(projector.calls == 1U);
+    CHECK(grid.grid_w == 6U && grid.grid_h == 4U && grid.patch_dim == 12U && got.rows == 6U);
+    const auto want = independent(source, spec, grid, {}, &image);
+    CHECK(want.size() == got.bf16.size());
+    double diff = 0.0, norm = 0.0;
+    for (std::size_t i = 0; i < want.size() && i < got.bf16.size(); ++i) {
+        const double error = vis::from_bf16(got.bf16[i]) - want[i];
+        diff += error * error;
+        norm += want[i] * want[i];
+    }
+    CHECK(norm > 0.0 && std::sqrt(diff / norm) < 4e-3);
+}
+
 void test_bind_rejects_shapes() {
-    const ink::VisionConfig c = toy_config();
+    const ink::VisionSpec c = toy_config();
     MapSource src;
     fill_source(src, c);
-    src.add("model.visual.proj_out.weight", c.text_hidden_size + 1U, c.projection_hidden_dim, 0.1F);
+    src.add("model.visual.proj_out.weight", c.text_width + 1U, c.projection, 0.1F);
     ink::VisionAdapter a(c, "sha");
     vis::EncoderWeights w;
     bool threw = false;
@@ -326,8 +431,8 @@ void test_bind_rejects_shapes() {
 // --checkpoint SHARD: the exact tower inventory of the official file, then bind + host reference on an 80 x 40
 // image (2 LM rows, 8 tower rows + the class row). Prints the row RMS; checks shapes and finite values. CPU only.
 int probe(const char* shard) {
-    const ink::VisionConfig c{};
-    const auto specs = ink::vision_tensor_schema(c);
+    const ink::VisionSpec c{};
+    const auto specs = ink::vision_tensor_specs(c);
     strix::weight::TensorLookup lookup;
     const strix::weight::TensorSchema schema{strix::weight::Container::safetensors, "safetensors@1", specs,
                                              ink::kVisionIgnoredPrefix};
@@ -382,6 +487,7 @@ int main(int argc, char** argv) {
         test_geometry();
         test_patches_and_layout();
         test_mapping_matches_unfolded_graph();
+        test_axial_mapping_matches_unfolded_graph();
         test_bind_rejects_shapes();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL exception: %s\n", e.what());

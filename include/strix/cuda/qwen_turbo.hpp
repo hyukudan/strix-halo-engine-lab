@@ -11,7 +11,7 @@
 #include <string>
 
 #include "strix/cuda/qwen_prefill.hpp"
-#include "strix/profiles/qwen.hpp"
+#include "strix/profiles/qwen_cuda.hpp"
 
 namespace strix::cuda::qwen_turbo {
 
@@ -65,7 +65,8 @@ struct Resolved {
 inline Resolved resolve(const Request& r, std::span<const pq::Lever> rows = {}) {
     pq::Inputs inputs = r.inputs;
     inputs.caps = &pq::kCudaWeightCaps;
-    Resolved out{pq::resolve(r.profile.value_or(pq::Name::standard), inputs, rows), false, {}};
+    Resolved out{pq::resolve(r.profile.value_or(pq::Name::standard), inputs, rows,
+                             ::strix::qwen::cuda_profile::ladder_rows), false, {}};
     out.resolution.weights.require_honoured();
     out.onfly_nvfp4 = out.resolution.is_turbo() && out.resolution.weights.effective == tb::Source::onfly;
     out.cache_namespace = out.resolution.cache_namespace();

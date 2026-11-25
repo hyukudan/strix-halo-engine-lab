@@ -76,6 +76,11 @@ private:
 using FixtureCohort = sv::FixedKvCohort<FixtureDecoder>;
 
 void admission() {
+    require(!mini::mini_server_calibrated_row_allowed(true, false),
+            "a held-back HTTP prompt anchor cannot enter the calibrated decode row");
+    require(mini::mini_server_calibrated_row_allowed(true, true),
+            "the calibrated row remains available when served prefill emits its first token");
+    require(!mini::mini_server_calibrated_row_allowed(false, true), "unset calibration stays off on the served route");
     require(sv::fixed_kv_slots(99, 100, 3) == 0, "KV budget too small");
     require(sv::fixed_kv_slots(400, 100, 3) == 3, "row budget cap");
     require(sv::fixed_kv_slots(400, 100, 3, 1) == 1, "explicit slot cap");
@@ -440,6 +445,52 @@ void profile_parity() {
         }
     }
     set_expert_env(nullptr);
+    set_w4a4_env(nullptr);
+    const auto previous_arguments = selection.arguments;
+    selection.arguments.back() = "exact";
+    for (const auto* backend : {"hip", "cuda"}) {
+        selection.arguments[3] = backend;
+        for (const auto* head : {static_cast<const char*>(nullptr), "1"}) {
+            set_env("STRIX_INK_SCREENED_HEAD", head);
+            for (const auto& [rows, level] : {std::pair<const char*, unsigned>{nullptr, 0U},
+                                             {"0", 0U}, {"1", 1U}, {"2", 2U}}) {
+                set_env("STRIX_INK_VERIFY_ROWS", rows);
+                loaded.reset();
+                const auto cli = parse_cli("exact", backend);
+                const auto service = factory->create(selection);
+                require(service && loaded && loaded->screened_head == (head != nullptr) &&
+                            loaded->screened_head == mini::mini_screened_head(cli.tier) &&
+                            loaded->verify_rows == level && loaded->verify_rows == mini::mini_verify_rows(cli.tier),
+                        "CLI and server must resolve both opt-in rows independently");
+            }
+        }
+    }
+    set_env("STRIX_INK_SCREENED_HEAD", nullptr);
+    set_env("STRIX_INK_VERIFY_ROWS", nullptr);
+    selection.arguments = previous_arguments;
+
+    selection.arguments[3] = "hip";
+    for (const auto* tier : {"exact", "fast", "turbo"}) {
+        selection.arguments.back() = tier;
+        for (const auto* value : {static_cast<const char*>(nullptr), "0", "1"}) {
+            set_env("STRIX_INK_LOWBIT_TURBO", value);
+            loaded.reset();
+            const auto cli = parse_cli(tier, "hip");
+            const auto service = factory->create(selection);
+            const bool expected = std::string_view(tier) == "turbo" && value && std::string_view(value) == "1";
+            require(service && loaded && cli.weights.lowbit_turbo == expected &&
+                        loaded->weight_options.lowbit_turbo == expected,
+                    "CLI and server require the same explicit TURBO weight lever");
+        }
+    }
+    set_env("STRIX_INK_LOWBIT_TURBO", nullptr);
+    selection.arguments.back() = "fast";
+    selection.arguments.emplace_back("--qualify-q8");
+    std::ostringstream receipt;
+    factory->inspect(selection, receipt);
+    require(receipt.str().find("weight_storage gguf.q8_0@1 weight_status unqualified") != std::string::npos,
+            "inspect keeps the incumbent device-independent Q8 qualification receipt");
+    selection.arguments.pop_back();
     set_w4a4_env("mse");
     selection.arguments[3] = "hip";
     selection.arguments.back() = "fast";

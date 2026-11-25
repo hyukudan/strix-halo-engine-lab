@@ -1,3 +1,4 @@
+#include "inkling2/inkling2_mini_resident_route.hpp"
 #include "inkling2/inkling2_mini_schedule.hpp"
 #include "inkling2/inkling2_mini_state.hpp"
 #include "strix/serve/cohort_decode.hpp"
@@ -251,6 +252,16 @@ int main() {
     constexpr MiniSessionStatePlan contiguous_session(2048, 1024);
     static_assert(contiguous_session.visit(schedule[6]).kv.ring == 0);
     static_assert(contiguous_session.visit(schedule[6]).window == kSlidingWindow);
+
+    // HIP verify lanes (verify rows lever; attn_core sequence_lane_caches): a sliding-window ring sized for a verify
+    // window's chunk holds window - 1 + rows, so storing every row of the window before its flash reuses no slot a row
+    // still reads.
+    for (unsigned rows = 2U; rows <= kMiniMaxVerifyRows; ++rows) {
+        const auto verify_plan = visit_state_plan(schedule[6], kMaxContext, rows);
+        if (verify_plan.window != kSlidingWindow || verify_plan.kv.ring == 0U ||
+            verify_plan.kv.ring < kSlidingWindow - 1U + rows)
+            return 35;
+    }
 
     constexpr unsigned max_chunk = 2048;
     constexpr MiniSessionStatePlan session(kMaxContext, max_chunk);

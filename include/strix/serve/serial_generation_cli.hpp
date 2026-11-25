@@ -6,8 +6,10 @@
 #include <vector>
 
 #include <cstdint>
+#include <filesystem>
 #include <iosfwd>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -76,14 +78,33 @@ struct SerialGenerationLoad {
     // Rows the final prefill chunk takes beyond prefill_chunk (prompt_windows::append_chunks tail_rows); the decoder's
     // chunk capacity is prefill_chunk + prefill_tail. Zero unless the family opts in (prefill_tail_divisor).
     std::uint32_t prefill_tail = 0;
+    std::uint32_t prompt_tokens = 0;
 };
 
 // Image input of --messages: owns the family's media adapter (e.g. vision::ApiMediaBridge over its VisionAdapter,
 // encoder backend, weights and interner) for one run.
+// Device and file number of the file `path` names now (links followed; nullopt: nothing there). Equal keys name one
+// file, whatever the paths (hard links, links, aliases).
+struct FileKey {
+    std::uint64_t device{}, file{};
+    bool operator==(const FileKey&) const = default;
+};
+[[nodiscard]] std::optional<FileKey> file_key(const std::filesystem::path& path);
+[[nodiscard]] std::optional<FileKey> descriptor_file_key(int descriptor);  // of an open C runtime descriptor
+
 class SerialMediaInput {
 public:
     virtual ~SerialMediaInput() = default;
     [[nodiscard]] virtual ApiMediaAdapter& adapter() = 0;
+    // Keys of the handles the input read (config sidecars, weights): the CLI refuses a --logits output that is one of
+    // those files, before any device work.
+    [[nodiscard]] virtual std::vector<FileKey> input_keys() const { return {}; }
+    // Runs the language model load of `checkpoint`. An input that read weights from the checkpoint makes the load
+    // read that same opened file (not a second lookup of the name) and refuses a load that did not.
+    virtual void load_checkpoint(const std::string& checkpoint, const std::function<void()>& load) const {
+        static_cast<void>(checkpoint);
+        load();
+    }
 };
 
 struct SerialGenerationFamily {

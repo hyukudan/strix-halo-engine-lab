@@ -190,7 +190,7 @@ const char* app_name(App app) {
 
 const strix::profile::Engine& profile_engine() {
     static const strix::profile::Engine engine{"deepseek41-pair", "STRIX_DS41_PROFILE_ALLOW_PENDING", profile_table, false,
-                                              "ds41-turbo-v1"};
+                                              "ds41-turbo-v1", {}, {}, ladder_rows};
     return engine;
 }
 
@@ -295,6 +295,12 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
     if (const auto& e = strix::ds41::fast_profile::kEngram; fp::set(raw_env(e.env))) fast_env.emplace(e.env, fp::canonical(e, raw_env(e.env)));
     if (const auto& e = strix::ds41::fast_profile::kShared; fp::set(raw_env(e.env))) fast_env.emplace(e.env, fp::canonical(e, raw_env(e.env)));
     if (const auto& e = strix::ds41::fast_profile::kMoeF16; fp::set(raw_env(e.env))) fast_env.emplace(e.env, fp::canonical(e, raw_env(e.env)));
+    // Explicit IU4 (STRIX_DS41_FAST_I4=1, gguf-iu4-direct-v1) is a whole-model routed-expert policy: it replaces the
+    // relaxed MoE a profile would select (the two are distinct policies). An explicit FAST_MOE or bundle switch is left
+    // as set and still meets the prefix namespace's incompatibility check.
+    if (const auto* i4 = raw_env("STRIX_DS41_FAST_I4"); i4 && std::string_view(i4) == "1" &&
+        !fp::set(raw_env(bundle.env)) && !fp::set(raw_env("STRIX_DS41_FAST_MOE")))
+        fast_env.insert_or_assign("STRIX_DS41_FAST_MOE", "0");
     profile_inputs.env = fp::lookup(fast_env, raw_env);
     r.profile = strix::profile::resolve(profile_engine(), profile_inputs);
     const auto profile_env = strix::profile::exports(*r.profile, fast_env);

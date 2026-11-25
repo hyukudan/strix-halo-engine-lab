@@ -244,6 +244,8 @@ void fake_plan_matches_fresh() {
     }
     const auto reload = run(R"({"name":"R","env":{"FAKE_UNDECLARED":"1"}})", "reload-unknown");
     for (const auto& r : reload) check(r.error.find("reload") != std::string::npos, "undeclared lever refused");
+    const auto iu4 = run(R"({"name":"R","env":{"STRIX_DS41_FAST_I4":"1"}})", "reload-iu4");
+    for (const auto& r : iu4) check(r.error.find("reload") != std::string::npos, "startup-derived IU4 policy refused in generic resident arms");
     const auto split = run(R"({"name":"R","env":{"STRIX_DS41_PREFILL_SPLIT_MIN_ROWS":"32769"}})", "reload-split");
     for (const auto& r : split) check(r.error.find("reload") != std::string::npos, "split threshold refused");
     check(std::getenv("STRIX_DS41_HC_SITE_FAST") == nullptr || std::getenv("STRIX_DS41_HC_SITE_FAST")[0] == 0,

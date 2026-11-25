@@ -55,7 +55,6 @@
 // rank with exit code 86 near the OOM line.
 // --print-model-graph / STRIX_PRINT_MODEL_GRAPH=1: validated description dump; exits before device work.
 #include "glm_rank_defaults.hpp"
-#include "glm_profile_overrides.hpp"
 #include "../src/glm/load/glm_model_description.hpp"
 #include "glm/prefill/glm_pf_load_admission.hpp"
 #include "strix/device_profile.hpp"
@@ -306,7 +305,6 @@ int main(int argc, char** argv) {
         rd::apply_env(eff, [](const char* k, const char* v) { (void)::setenv(k, v, 0); });
         if (eff.product) {
             std::fprintf(stderr, "profile %s\n", eff.product->json().c_str());
-            eff.product->engine_overrides = strix::glm::explicit_prefill_overrides([](const char* k) { return std::getenv(k); });
             for (const auto& line : eff.product->receipt_lines()) std::fprintf(stderr, "%s\n", line.c_str());
             for (const auto& notice : eff.product->notices()) std::fprintf(stderr, "%s\n", notice.c_str());
         }

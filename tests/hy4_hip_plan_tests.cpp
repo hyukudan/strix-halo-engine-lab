@@ -180,7 +180,7 @@ void check_stage_windows() {
 
 // The tier word through the shared resolver: default leaves the plain invocation (prompt position by position); the
 // batched prompt failed its gate, so fast leaves it pending (runs only with --allow-pending, stamped unqualified); an
-// explicit --prompt-rows wins and stamps the run unqualified; turbo is refused (no version).
+// explicit --prompt-rows wins and stamps the run unqualified; TURBO inherits FAST until a higher cell is qualified.
 void check_profile() {
     namespace sp = strix::profile;
     const auto& engine = strix::hy4::profile::engine();
@@ -205,13 +205,9 @@ void check_profile() {
           st == is(sp::Status::explicit_cli, "unqualified: prompt_rows"));
     CHECK(rows({"--prompt-rows", "2048"}, &st) == "2048" && st == is(sp::Status::explicit_cli, "unqualified: prompt_rows"));
     CHECK(rows({"--prompt-rows", "0"}, &st) == "0" && st == is(sp::Status::off, "qualified"));
-    bool refused = false;
-    try {
-        (void)rows({"--profile", "turbo"}, &st);
-    } catch (const std::invalid_argument&) {
-        refused = true;
-    }
-    CHECK(refused);
+    CHECK(rows({"--profile", "turbo"}, &st) == "0" && st == is(sp::Status::pending, "qualified"));
+    CHECK(rows({"--profile", "turbo", "--prompt-rows", "512"}, &st) == "512" &&
+          st == is(sp::Status::explicit_cli, "unqualified: prompt_rows"));
 }
 
 // Per regime (strix/profiles/hy4.hpp resolve): fast applies the windows only where a gate receipt covers the device,
@@ -246,6 +242,8 @@ void check_profile_regime() {
     CHECK(run(g, one, gated, {"--profile", "fast"}, &st) == "4096" && st == "profile / qualified");
     CHECK(run(g, one, 16384, {"--profile", "fast"}, &st) == "4096" && st == "profile / qualified");
     CHECK(run(g, one, gated + 1U, {"--profile", "fast"}, &st) == "0" && st == "pending / qualified +reason");
+    CHECK(run(g, one, gated, {"--profile", "turbo"}, &st) == "4096" && st == "profile / qualified");
+    CHECK(run(g, one, gated + 1U, {"--profile", "turbo"}, &st) == "0" && st == "pending / qualified +reason");
     CHECK(run(hp::Device::unknown, one, 17, {"--profile", "fast"}, &st) == "0" && st == "pending / qualified +reason");
     // the pair inherits each width's one-node gate by identity (same bits at the same width), over the same prompt range
     const auto pair = hp::Topology::pair;

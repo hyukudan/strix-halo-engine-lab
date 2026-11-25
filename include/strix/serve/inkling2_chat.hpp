@@ -11,7 +11,7 @@ extern const BpeTokenizer::HfIdentity inkling2_mini_tokenizer_identity;
 // alias, a number in [0, 0.99], or null for the default. Messages support text parts
 // and the template's tool protocol. With images, an image part (image, input_image, image_url) of a user or tool
 // message renders the template's frame <|content_image|><|unused_200054|><|end_message|>; the placeholder is expanded
-// to the tower rows by the vision path (src/inkling2/inkling2_vision_adapter.hpp). Without images they are refused.
+// to the tower rows by the vision path (src/inkling2/inkling2_vision.hpp). Without images they are refused.
 // The checkpoint template emits no BOS or assistant generation prefix.
 [[nodiscard]] std::string render_inkling2_chat(const Json& messages, const Json& tools = {},
                                               const Json& reasoning_effort = {}, bool images = false);

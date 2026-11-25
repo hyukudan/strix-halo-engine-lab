@@ -54,20 +54,38 @@ int main() {
                 "fast: the wide cell is pending, effective value equals exact");
         require(win(fast, app).target == "64-row FAST wide windows (dense-q8a8-f16-v1)", "pending target reported");
         require(!sp::applied(win(fast, app).status), "fast applies no window lever without allow-pending");
-        // the A4W4 layer table: qualified fast cell (environment lever, no argument), left alone by exact / default
-        require(sp::applied(a4(fast).status) && a4(fast).value == "48-63", "fast applies the qualified A4W4 layer table");
+        // The qualified layer table ran before the ladder rule: its incumbent grant keeps it in every regime.
+        require(sp::applied(a4(fast).status) && a4(fast).value == "48-63" &&
+                    a4(fast).ladder.find("incumbent") != std::string::npos,
+                "fast keeps the qualified A4W4 layer table (incumbent grant)");
         require(!sp::applied(a4(exact).status) && !sp::applied(a4(dflt).status) && !sp::applied(a4(none).status),
                 "exact / default / no word leave the A4W4 layer table alone");
         std::vector<std::pair<std::string, std::string>> put;
         sp::apply(fast.resolution, [&](const char* k, const char* v) { put.emplace_back(k, v); return true; });
         require(put == std::vector<std::pair<std::string, std::string>>{{"STRIX_DENSE_A4W4_LAYERS", "48-63"}},
                 "fast exports exactly STRIX_DENSE_A4W4_LAYERS=48-63");
+        put.clear();
+        sp::LadderRow timing{"a4w4_layers", "48-63", sp::Name::fast, sp::Phase::prefill, "fixture",
+                             8192, 8192, 1, 1, 1.04, 0.01, "fixture"};
+        auto engine = hp::engine(app);
+        // The row is measured over the execution that runs under the cell (LadderArms::over).
+        const auto granted = hp::resolve_args(engine, with_fast, no_env, {sp::Phase::prefill, 8192, 1, "fixture", "fixture-exec"});
+        const auto* granted_entry = granted.resolution.find("a4w4_layers");
+        const std::string reference = granted_entry ? granted_entry->ladder_reference : std::string();
+        require(reference.starts_with("ladder-arm/v4;"), "Qwen dense HIP reports the reference of the layer table");
+        timing.over = reference;
+        engine.ladder = std::span(&timing, 1);
+        const auto measured = hp::resolve_args(engine, with_fast, no_env, {sp::Phase::prefill, 8192, 1, "fixture", "fixture-exec"});
+        sp::apply(measured.resolution, [&](const char* k, const char* v) { put.emplace_back(k, v); return true; });
+        require(put == std::vector<std::pair<std::string, std::string>>{{"STRIX_DENSE_A4W4_LAYERS", "48-63"}},
+                "a matching measured run exports the FAST layer table");
         const sp::Lookup user_env = [](const char* key) -> const char* {
             return std::string(key) == "STRIX_DENSE_A4W4_LAYERS" ? "none" : nullptr;
         };
         const auto off = run(app, with_fast, user_env);
         require(a4(off).value == "none" && !sp::applied(a4(off).status), "an explicit STRIX_DENSE_A4W4_LAYERS wins over fast");
-        // allow-pending (flag and env) applies the runnable pending cell, in front of the user's options.
+        // allow-pending (flag and env, benchmarks only) applies the runnable pending cell in an unmeasured regime, in front
+        // of the user's options, stamped unqualified (main's contract; the route line says it is a benchmark arm).
         Args allow{"--profile", "fast", "--allow-pending"};
         const auto applied = run(app, allow);
         require(applied.args == Args{opt, "64"}, "fast --allow-pending adds the 64-row option in front");

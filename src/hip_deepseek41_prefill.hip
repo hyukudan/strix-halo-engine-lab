@@ -1690,6 +1690,7 @@ void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
     o.fast_engram = p.fast_engram;
     o.fast_shared = p.fast_shared;
     o.fast_moe_f16 = p.fast_moe_f16;
+    o.fast_i4 = p.fast_i4;
     // no process-wide switch: run_from installs these options as the precision of its own execution (another
     // DevicePrefill of the process keeps its own; strix/ds41_prefill_precision.hpp)
     impl_->rebuild_dense_classes();             // the FAST dense routes of this owner changed
@@ -1713,7 +1714,8 @@ std::uint32_t DevicePrefill::positions() const noexcept { return impl_->rows_don
 PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std::uint32_t start) {
     auto& m = *impl_;
     // this object's FAST dense / MoE precision for every dispatch of the run (thread of the run: caller or task worker)
-    const ds41::PrefillPrecisionScope precision_scope(ds41::PrefillPrecision{m.options.fast_dense, m.options.fast_moe, m.options.fast_moe_f16});
+    const ds41::PrefillPrecisionScope precision_scope(ds41::PrefillPrecision{m.options.fast_dense, m.options.fast_moe, m.options.fast_moe_f16,
+                                                                       m.options.fast_i4});
     // provided embedding rows of this run (none: text, nothing below changes)
     const strix::session::EmbedSplice embeds = std::exchange(m.embed_run, {});
     const ds41::RnWideOff own_kernels;  // the prefill keeps its own Q8_0 x A8 kernels (P12: the multi-row form is -1 %)

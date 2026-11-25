@@ -7,8 +7,8 @@ file(WRITE "${checkpoint}" "invalid checkpoint")
 
 execute_process(COMMAND "${DECODER}" "${checkpoint}" 1 --logits "${checkpoint}"
     RESULT_VARIABLE code ERROR_VARIABLE error)
-if(NOT code EQUAL 1 OR NOT error MATCHES "logits output must differ from the checkpoint")
-    message(FATAL_ERROR "decoder did not reject checkpoint as output: ${error}")
+if(NOT code EQUAL 1 OR NOT error MATCHES "logits output exists")
+    message(FATAL_ERROR "decoder did not refuse an existing logits output: ${error}")
 endif()
 file(READ "${checkpoint}" payload)
 if(NOT payload STREQUAL "invalid checkpoint")
@@ -19,6 +19,10 @@ execute_process(COMMAND "${DECODER}" "${checkpoint}" 1 --logits "${output}"
     RESULT_VARIABLE code ERROR_VARIABLE error)
 if(NOT code EQUAL 1 OR error MATCHES "filesystem error|logits output must differ" OR EXISTS "${output}")
     message(FATAL_ERROR "fresh logits path prevented checkpoint validation: ${error}")
+endif()
+file(GLOB staged "${directory}/.strix-logits-*")
+if(staged)
+    message(FATAL_ERROR "a failed run left a staged logits dump: ${staged}")
 endif()
 
 execute_process(COMMAND "${DECODER}" "${checkpoint}" 1 --generate 2 --speculation verify --temperature 1

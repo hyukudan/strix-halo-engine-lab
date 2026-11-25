@@ -215,6 +215,7 @@ inline Resolved resolve(const Request& r, Entry entry, std::string_view default_
             row.value = "0";
             row.status = pr::Status::off;
             row.reason = c.route_policy->reason;
+            if (!row.ladder.empty()) row.ladder += " / declined by route: " + row.reason + " -> default=" + row.value;
         }
     }
     if(c.expert_arithmetic!=qwen_packs::ExpertArithmetic::incumbent) {

@@ -18,12 +18,15 @@
 #include <fstream>
 #include <functional>
 #include <initializer_list>
+#include <iterator>
 #include <new>
 #include <optional>
 #include <iostream>
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -145,6 +148,13 @@ std::string text_render(std::string_view) { return "ab"; }
 std::vector<std::uint32_t> embedded_inputs;
 std::shared_ptr<const strix::session::EmbedTable> embedded_table;
 unsigned media_opens = 0;
+unsigned media_encodes = 0;
+unsigned media_verifies = 0;
+std::vector<std::filesystem::path> media_inputs;  // what the fake media input reports it read
+bool media_same_checkpoint = true;                 // whether the loaded checkpoint is the pinned one
+bool media_decode_fails = false;                   // decode throws (a run that fails after its logits were written)
+std::function<void()> media_during_decode;         // runs inside decode (the dump is written, not yet published)
+std::function<void()> media_after_read;            // runs after the fake input keyed its files (a name swap)
 
 class MediaDecoder final : public SerialGenerationDecoder {
 public:
@@ -160,7 +170,11 @@ public:
         embedded_table = table;
         return 1;
     }
-    std::uint32_t decode(std::uint32_t, std::span<float>) override { return 2; }
+    std::uint32_t decode(std::uint32_t, std::span<float>) override {
+        if (media_during_decode) media_during_decode();
+        if (media_decode_fails) throw std::runtime_error("injected decode failure");
+        return 2;
+    }
 };
 
 class FakeImages final : public ApiMediaAdapter {
@@ -169,6 +183,7 @@ public:
     std::string placeholder() const override { return "<img>"; }
     std::uint32_t max_rows() const override { return 2; }
     ApiMediaSpan encode(const media::MediaItem& item, std::uint32_t budget) override {
+        ++media_encodes;
         check(budget >= 2 && item.width == 1 && item.height == 1, "image item and row budget");
         strix::session::EmbedRows rows;
         rows.digest[0] = 7;
@@ -187,8 +202,20 @@ private:
 class FakeMediaInput final : public SerialMediaInput {
 public:
     ApiMediaAdapter& adapter() override { return images_; }
+    FakeMediaInput() {  // keys the files when it "opens" them, as a held handle would
+        for (const auto& input : media_inputs)
+            if (const auto key = file_key(input)) keys_.push_back(*key);
+        if (media_after_read) media_after_read();
+    }
+    std::vector<FileKey> input_keys() const override { return keys_; }
+    void load_checkpoint(const std::string&, const std::function<void()>& load) const override {
+        ++media_verifies;
+        load();
+        if (!media_same_checkpoint) throw std::runtime_error("not the shard the image tower was read from");
+    }
 private:
     FakeImages images_;
+    std::vector<FileKey> keys_;
 };
 
 SerialGenerationFamily media_family() {
@@ -246,6 +273,111 @@ void media_messages(const std::function<std::pair<int, std::string>(const std::s
           embedded_inputs == std::vector<std::uint32_t>{'a', 'b'}, "text body is unchanged");
     std::filesystem::remove(image);
     std::filesystem::remove(text);
+}
+
+// --logits with an image prompt: the dump is a file without a name in the held destination directory, created before
+// any input is read and given the name, only when the run succeeds, by an operation that never replaces. An existing name (an
+// input under any name, a link, one that appears during the run) fails the run and keeps its bytes.
+void media_output_guards(const SerialGenerationFamily& with_media) {
+    namespace fs = std::filesystem;
+    std::random_device rd;
+    const auto dir = fs::temp_directory_path() / ("strix-serial-media-out-" + std::to_string(rd()));
+    fs::create_directories(dir);
+    const auto write = [&](const char* name, const std::string& text) {
+        std::ofstream(dir / name, std::ios::binary) << text;
+        return dir / name;
+    };
+    const auto read = [](const fs::path& path) {
+        std::ifstream input(path, std::ios::binary);
+        return std::string{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    };
+    const std::string png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    const auto messages = write("messages.json",
+        R"({"messages":[{"role":"user","content":[{"type":"text","text":"q"},{"type":"image_url","image_url":{"url":")" +
+        png + R"("}}]}]})");
+    const std::string config = R"({"vision_config":{}})";
+    const auto sidecar = write("config.json", config);
+    media_inputs = {sidecar};
+    const auto run_with = [&](const fs::path& output, std::vector<std::string> extra = {}) {
+        std::vector<std::string> owned{"fixture", "checkpoint", "--messages", messages.string(), "--logits",
+                                       output.string()};
+        owned.insert(owned.end(), extra.begin(), extra.end());
+        std::vector<char*> argv;
+        for (auto& arg : owned) argv.push_back(arg.data());
+        std::ostringstream out, error;
+        const int code = run_serial_generation_cli(static_cast<int>(argv.size()), argv.data(), with_media, out, error);
+        return std::pair{code, error.str()};
+    };
+    const auto encodes = media_encodes;
+    // An existing name is refused before any input is read: the validated sidecar, another name of it, a link (even
+    // a dangling one). There is no option that replaces an existing file.
+    auto [code, error] = run_with(sidecar);
+    check(code != 0 && error.find("logits output exists") != std::string::npos, "existing output refused");
+    std::tie(code, error) = run_with(dir / "option.f32", {"--logits-overwrite"});
+    check(code != 0 && error.find("unknown option --logits-overwrite") != std::string::npos &&
+              !fs::exists(dir / "option.f32"),
+          "there is no --logits-overwrite (unknown option on a fresh output, nothing written)");
+    std::error_code link_error;
+    fs::create_hard_link(sidecar, dir / "alias.json", link_error);
+    if (!link_error) {
+        std::tie(code, error) = run_with(dir / "alias.json");
+        check(code != 0 && error.find("logits output exists") != std::string::npos, "alias output refused");
+    }
+    fs::create_symlink(dir / "absent.f32", dir / "dangling.f32", link_error);
+    if (!link_error) {
+        std::tie(code, error) = run_with(dir / "dangling.f32");
+        check(code != 0 && error.find("logits output exists") != std::string::npos && !fs::exists(dir / "absent.f32"),
+              "a dangling link is refused and its target is not created");
+    }
+    check(read(sidecar) == config && media_encodes == encodes, "sidecar intact, no image encoded");
+    // A fresh output is published on success; it then exists, so a rerun is refused.
+    const auto fresh = dir / "logits.f32";
+    std::tie(code, error) = run_with(fresh);
+    check(code == 0 && fs::file_size(fresh) == 16U && media_encodes == encodes + 1U, "fresh output written");
+    std::tie(code, error) = run_with(fresh);
+    check(code != 0 && error.find("logits output exists") != std::string::npos && fs::file_size(fresh) == 16U,
+          "rerun refuses the existing output");
+    // A checkpoint that is not the pinned shard is refused after the load and nothing is published.
+    media_same_checkpoint = false;
+    const auto verifies = media_verifies;
+    std::tie(code, error) = run_with(dir / "other.f32");
+    check(code != 0 && error.find("not the shard") != std::string::npos && media_verifies == verifies + 1U &&
+          !fs::exists(dir / "other.f32"), "a different checkpoint is refused and leaves no output");
+    media_same_checkpoint = true;
+    // While decode runs the dump is written but has no name; a decode failure then publishes nothing.
+    bool visible_during_decode = true;
+    media_during_decode = [&] { visible_during_decode = fs::exists(dir / "late.f32"); };
+    media_decode_fails = true;
+    std::tie(code, error) = run_with(dir / "late.f32", {"--generate", "2"});
+    check(code != 0 && error.find("injected decode failure") != std::string::npos && !visible_during_decode &&
+              !fs::exists(dir / "late.f32"),
+          "the final name is absent while decode runs, and a failing decode leaves no output");
+    media_decode_fails = false;
+    media_during_decode = nullptr;
+#ifndef _WIN32
+    // The destination name may be as long as the file system allows (255 bytes): no staging name is derived from it.
+    const auto longest = dir / (std::string(251, 'n') + ".f32");
+    std::tie(code, error) = run_with(longest);
+    check(code == 0 && fs::file_size(longest) == 16U, "a 255-byte destination name is published");
+#endif
+    // The name appears during the run (a file, or a link to the validated sidecar): publication never replaces it, the
+    // run fails and what appeared keeps its bytes.
+    const auto raced = dir / "raced.f32";
+    media_after_read = [&] { std::ofstream(raced, std::ios::binary) << "raced"; };
+    std::tie(code, error) = run_with(raced);
+    check(code != 0 && error.find("appeared during the run") != std::string::npos && read(raced) == "raced",
+          "a name that appears during the run is not replaced");
+    const auto linked = dir / "linked.f32";
+    media_after_read = [&] { fs::create_symlink(sidecar, linked, link_error); };
+    std::tie(code, error) = run_with(linked);
+    if (!link_error)
+        check(code != 0 && error.find("appeared during the run") != std::string::npos && read(sidecar) == config,
+              "a link to the sidecar that appears during the run is not replaced, the sidecar keeps its bytes");
+    media_after_read = nullptr;
+    for (const auto& entry : fs::directory_iterator(dir))
+        check(entry.path().filename().string().find(".strix-logits-") == std::string::npos, "no staged dump is left");
+    media_inputs.clear();
+    fs::remove_all(dir);
 }
 
 // Implicit prefill chunk: one retry at the fallback rows, only after an allocation failure.
@@ -429,6 +561,7 @@ int main() try {
             if (outcome.code != 0) std::cerr << outcome.error;
             return std::pair{outcome.code, outcome.out};
         });
+        media_output_guards(family_with_media);
     }
     const auto greedy = run({"8", "4", "--generate", "4"});
     check(greedy.code == 0 && greedy.out.starts_with("next_token 1\ngenerated 1 2\n"), "greedy IDs and EOS");

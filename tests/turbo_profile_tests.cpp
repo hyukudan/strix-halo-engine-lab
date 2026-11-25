@@ -34,18 +34,31 @@ bool throws(F&& f) {
 constexpr p::Lever kRows[] = {
     {.name = "flash", .env = "T_FLASH", .option = "--flash", .value = {"", "1", "", ""}, .builtin = "0",
      .kind = p::Kind::bit_changing, .ready = {true, true, true, false}, .runnable = {true, true, true, true},
-     .target = "", .off = "0", .source = "fixture"},
+     .target = "", .off = "0", .source = "fixture", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = "replay", .env = "T_REPLAY", .option = "", .value = {"", "", "", "128"}, .builtin = "256",
      .kind = p::Kind::bit_changing, .ready = {true, true, true, false}, .runnable = {true, true, true, true},
-     .target = "", .off = "256", .source = "fixture", .provisional = {false, false, false, true}},
+     .target = "", .off = "256", .source = "fixture", .provisional = {false, false, false, true}, .identity = {{{"256", "v1"}, {"128", "v1"}}}},
     {.name = "dense", .env = "T_DENSE", .option = "", .value = {"", "1", "", "0"}, .builtin = "0",
      .kind = p::Kind::bit_changing, .ready = {true, true, true, true}, .runnable = {true, true, true, true},
-     .target = "", .off = "0", .source = "fixture"},
+     .target = "", .off = "0", .source = "fixture", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = "head", .env = "", .option = "--head", .value = {"", "", "", "fp16"}, .builtin = "default",
      .kind = p::Kind::bit_changing, .ready = {true, true, true, false}, .runnable = {true, true, true, false},
-     .target = "fp16 head", .off = "off", .source = "pending fixture"},
+     .target = "fp16 head", .off = "off", .source = "pending fixture", .identity = {{{"default", "v1"}, {"fp16", "v1"}, {"off", "v1"}}}},
 };
-const p::Engine kEngine{"turbo-fixture", "", kRows, false, "fixture-turbo-v1"};
+constexpr p::Regime kRegime{p::Phase::prefill, 8, 1, "fixture", "fixture-exec"};
+constexpr p::LadderRow kTiming[] = {
+    // Every row names the execution it was measured over (LadderRow::over): the levers before it at its tier (cells of
+    // one tier compose in table order), itself and the later levers at the tier below.
+    {"flash", "1", p::Name::fast, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture", false, {}, {},
+     "ladder-arm/v4;fixture-exec;flash=0{v1},replay=256{v1},dense=0{v1},head=default{v1};candidate=flash=1{v1};tier=fast"},
+    {"replay", "128", p::Name::turbo, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture", false, {}, {},
+     "ladder-arm/v4;fixture-exec;flash=1{v1},replay=256{v1},dense=1{v1},head=default{v1};candidate=replay=128{v1};tier=turbo"},
+    {"dense", "1", p::Name::fast, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture", false, {}, {},
+     "ladder-arm/v4;fixture-exec;flash=1{v1},replay=256{v1},dense=0{v1},head=default{v1};candidate=dense=1{v1};tier=fast"},
+    {"dense", "0", p::Name::turbo, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture", false, {}, {},
+     "ladder-arm/v4;fixture-exec;flash=1{v1},replay=128{v1},dense=1{v1},head=default{v1};candidate=dense=0{v1};tier=turbo"},
+};
+const p::Engine kEngine{"turbo-fixture", "", kRows, false, "fixture-turbo-v1", {}, {}, kTiming};
 const p::Engine kNoTurbo{"no-turbo-fixture", "", kRows, false};
 
 p::Lookup env_of(const std::map<std::string, std::string>& vars) {
@@ -63,6 +76,7 @@ const p::Entry& entry(const p::Resolution& r, const char* name) {
 p::Resolution through(std::vector<std::string> args, const std::map<std::string, std::string>& vars) {
     p::Inputs in;
     in.env = env_of(vars);
+    in.regime = kRegime;
     p::take_options(kEngine, args, in);
     return p::resolve(kEngine, in);
 }
@@ -94,7 +108,8 @@ void turbo_column() {
     const auto r = through({"--profile", "turbo"}, vars);
     require(entry(r, "flash").value == "1" && entry(r, "flash").status == p::Status::set, "empty turbo cell takes the fast cell");
     require(entry(r, "replay").value == "128" && entry(r, "replay").status == p::Status::provisional, "turbo-only provisional lever runs");
-    require(entry(r, "dense").value == "0" && entry(r, "dense").status == p::Status::builtin, "turbo cell = off keeps a FAST lever out");
+    require(entry(r, "dense").value == "0" && entry(r, "dense").status == p::Status::builtin,
+            "measured TURBO can select the builtin over FAST (stamped builtin, as resolve() does)");
     require(entry(r, "head").status == p::Status::pending && entry(r, "head").value == "default", "unrunnable turbo cell is pending");
     require(r.describe().find("profile version fixture-turbo-v1") != std::string::npos, "describe prints the versioned name");
     require(r.describe().find("requested fp16") != std::string::npos, "describe prints requested beside effective");
@@ -264,8 +279,10 @@ void qwen_adapter() {
     const auto def = q::resolve(p::Name::standard, in);
     require(!turbo.cache_namespace().empty() && def.cache_namespace().empty(), "qwen turbo has its own cache space");
     require(turbo.cache_namespace().find("turbo=qwen-turbo-v1") == 0, "qwen namespace names qwen-turbo-v1");
+    const auto fast = q::resolve(p::Name::fast, in);
     const auto* qsa = turbo.find("qsa_budget");
-    require(qsa != nullptr && qsa->value == "1536", "qwen turbo inherits the FAST lever cells");
+    require(qsa && qsa->value == fast.find("qsa_budget")->value && qsa->value == "1536",
+            "qwen turbo inherits the FAST lever cells (incumbent grant)");
     // Every Qwen lever off: still a turbo namespace, never the default's.
     std::map<std::string, std::string> off;
     for (const auto& row : q::levers()) if (!row.env.empty() && !row.off.empty()) off[std::string(row.env)] = std::string(row.off);

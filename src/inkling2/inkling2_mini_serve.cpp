@@ -62,12 +62,14 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     }
     const auto resolution = resolve_mini_profile(out.weight_options, true);
     out.tier = resolution.profile;
+    out.weight_options.lowbit_turbo = mini_lowbit_turbo(resolution);
     out.prepared_round_fold = mini_prepared_round_fold(resolution);
     out.experts_nvfp4 = mini_experts_nvfp4(resolution);
     out.combine_image = mini_combine_image(resolution);
     out.served_route_requested = mini_served_cli_route(resolution);
     out.attn_projected_bias = mini_attn_projected_bias(resolution);
     out.screened_head = mini_screened_head(resolution);
+    out.verify_rows = mini_verify_rows(resolution);
     out.controller_one_plane = mini_controller_one_plane(resolution);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
@@ -159,6 +161,7 @@ private:
             value.set("weight_load", serve::Json(serve::Json::Object{
                 {"storage", serve::Json(weights.storage.name)},
                 {"revision", serve::Json(static_cast<std::uint64_t>(weights.storage.revision))},
+                {"head_storage", serve::Json(weights.head_storage.name)},
                 {"status", serve::Json(profile::status_name(weights.status))},
                 {"reason", serve::Json(weights.reason)},
             }));
@@ -236,13 +239,17 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             const auto of_backend = [backend](const weight::WeightLoadDecision& row) { return row.scope.backend == backend; };
             const weight::WeightLoadExtent extent{opt.context, opt.slots};
             const bool device_dependent = opt.tier != profile::Name::standard && !opt.weight_options.disable_q8 &&
-                std::ranges::any_of(kMiniWeightLoadDecisions, [&](const weight::WeightLoadDecision& row) {
-                    return of_backend(row) && weight::weight_load_gain_selects(row, extent);
-                });
+                ((opt.weight_options.qualify != nullptr && !opt.weight_options.qualify_q8) ||
+                 mini_may_load_lowbit_row(opt.tier, opt.weight_options, backend, extent) ||
+                 std::ranges::any_of(kMiniWeightLoadDecisions, [&](const weight::WeightLoadDecision& row) {
+                     return of_backend(row) && weight::weight_load_gain_selects(row, extent);
+                 }));
             if (!device_dependent) {
                 const weight::WeightLoadScope scope{backend, {}, {}, {}, {}, {}};
                 const auto plan = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope, extent);
                 out << " weight_storage " << plan.storage.name << '@' << plan.storage.revision
+                    << (plan.head_storage != plan.storage ? " weight_head_storage " : "")
+                    << (plan.head_storage != plan.storage ? plan.head_storage.name : "")
                     << " weight_status " << profile::status_name(plan.status);
             } else {
                 out << " weight_status pending-device";

@@ -70,6 +70,11 @@ public:
     // Starts or continues the lane's prompt: appends `tokens` to the lane's committed state (no logits needed).
     // first = true resets the lane before the rows.
     virtual void prefill(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) = 0;
+    // For profile policies based on the whole prompt even when serving yields between slices.
+    virtual void prefill_scoped(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first,
+                                std::uint64_t /*prompt_tokens*/) {
+        prefill(lane, tokens, first);
+    }
     // One forward over `groups` (tokens in group order). top[i] = greedy id after row i. The rows stay a pending
     // window until commit(). A greedy-only backend may already commit the
     // guaranteed row inside verify() when every group has exactly one row.

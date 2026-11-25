@@ -176,10 +176,13 @@ inline std::string describe() {
 
 // Boolean switch. default_on=true: unset/empty is ON and only "0" disables;
 // default_on=false: only "1" enables. `match` keeps legacy byte-0 readers.
+inline bool parse_flag(const char* raw, bool default_on, EnvFlagMatch match = EnvFlagMatch::first_character) {
+    return default_on ? !detail::env_flag_matches(raw, "0", match) : detail::env_flag_matches(raw, "1", match);
+}
+
 inline bool flag(const char* name, bool default_on, EnvFlagMatch match = EnvFlagMatch::first_character) {
     const char* raw = std::getenv(name);
-    const bool on = default_on ? !detail::env_flag_matches(raw, "0", match)
-                               : detail::env_flag_matches(raw, "1", match);
+    const bool on = parse_flag(raw, default_on, match);
     record(name, raw, on ? "1" : "0");
     return on;
 }

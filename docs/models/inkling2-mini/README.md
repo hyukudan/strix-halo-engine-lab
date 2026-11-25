@@ -64,7 +64,10 @@ Chat files may carry images as base64 `image_url` parts; see
 [Inkling 2 Mini image input](../../engine/vision-adapters.md#inkling-2-mini).
 
 Generation defaults to greedy selection and can emit one FP32 prompt logits row
-with `--logits FILE`. CPU and device generation accept `--temperature`,
+with `--logits FILE`. The file appears only when the run succeeds (a failed run leaves none) and an existing file
+is never replaced: a name that exists at the start, or that appears during the run, fails the run and keeps its
+bytes. On Linux the output directory must be on a file system that supports `O_TMPFILE` (the dump has no name
+until the run succeeds). Repeating the example below needs a new name (or removing the previous file). CPU and device generation accept `--temperature`,
 `--top-k` and `--seed` through the shared sampler.
 
 ```sh
@@ -168,6 +171,32 @@ forma `replica`; `strix-serve --model inkling2-mini --device-count 2 --placement
 nativa para Inkling) y el mismo `host:puerto` repetido no cuenta como dos
 réplicas. Para volver atrás, arranca el router sin `--description` o sirve
 desde un nodo.
+
+Verify windows (lookup and drafter speculation on the command line) project
+and attend each row with its own launches by default. The exact switch
+`STRIX_INK_VERIFY_ROWS=1` (`inkling2-mini-verify-rows@1`, off in every profile
+column, HIP only; CUDA declines it) projects a window of 2..8 rows through one
+pitched rows head launch set, attends its rows in one lanes launch set (each
+row at its own position with its one-row geometry) and records the window's
+convolution inputs, so a partial commit rebuilds the histories by copies
+instead of replaying the kept rows. Every row keeps its one-row arithmetic.
+The command line prints `Inkling verify_rows on|off|declined`, the server's
+startup line `verify_rows` (served lanes decode one row per step, so the
+server's output does not change). It stays opt-in until device identity
+against the per-row route.
+
+`STRIX_INK_VERIFY_ROWS=2` adds the lanes pick: greedy picks whose scores
+nobody reads (verify windows without a sampled or observing reader, served
+cohorts of 2+ lanes whose groups declare no score read) go through the lanes
+form of the EXACT screened head (BF16 head only; one read of the head plane
+for all lanes, each lane with its one-row token). A later score read of a
+served cohort lane recomputes the skipped rows through the per-row head, also
+after another slot's verify window or prompt chunk (the rows are materialized
+before their head inputs are overwritten); a verify window picked this way has
+no later score reader. The tokens are those of the full head; it is a distinct
+identity, and the startup lines print `on+lanes-pick`
+(`on+lanes-pick-declined` without the BF16 screened head, and on a server with
+one admitted slot or on the served CLI route, whose cohorts keep level 1).
 
 On HIP, the command line prefills in chunks of 8192 rows (`--prefill-chunk`),
 and a remainder of up to chunk / 8 rows (and more than 16) rides in the final

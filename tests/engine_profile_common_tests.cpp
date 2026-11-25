@@ -1,6 +1,7 @@
-#include "glm_profile_overrides.hpp"
+#include "strix/glm_pair_profile_table.hpp"
 #include "strix/engine_profile.hpp"
 #include "strix/deepseek41_pair_profile_table.hpp"
+#include "strix/profiles/hy4.hpp"
 
 #include <iostream>
 #include <map>
@@ -19,7 +20,7 @@ void require(bool value, const char* message) {
 }
 }
 
-int main() {
+int main() try {
     using namespace strix::profile;
     static_assert(strix::host_fnv::text("") == 0xcbf29ce484222325ULL);
     static_assert(strix::host_fnv::text("hello") == 0xa430d84680aabd0bULL);
@@ -47,11 +48,15 @@ int main() {
     }
 
     const Lever pending{"item", "SWITCH", "--item", {"0", "1", ""}, "0",
-        Kind::bit_changing, {}, {false, true, false}, "candidate", "0", "pending"};
+        Kind::bit_changing, {}, {false, true, false}, "candidate", "0", "pending", false, {}, false, {}, {{{"0", "v1"}, {"1", "v1"}}}};
     const std::array table{pending};
-    const Engine engine{"test", "ALLOW", table};
+    constexpr Regime measured{Phase::prefill, 8, 1, "fixture", "fixture-exec"};
+    const LadderRow timing{"item", "1", Name::fast, Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "test",
+                           false, {}, {}, "ladder-arm/v4;fixture-exec;item=0{v1};candidate=item=1{v1};tier=fast"};
+    const Engine engine{"test", "ALLOW", table, false, {}, {}, {}, std::span(&timing, 1)};
     Inputs inputs;
     inputs.env = env;
+    inputs.regime = measured;
     inputs.profile = Name::fast;
     const auto refused = resolve(engine, inputs);
     require(refused.entries[0].status == Status::pending, "FAST pending refusal");
@@ -72,13 +77,13 @@ int main() {
     {
         const Lever ready_fast{.name = "rows", .env = "", .option = "--rows", .value = {"", "64", "", ""}, .builtin = "0",
             .kind = Kind::bit_changing, .ready = {false, true, false, false}, .runnable = {true, true, false, false},
-            .target = "", .off = "0", .source = "gate receipt"};
+            .target = "", .off = "0", .source = "gate receipt", .identity = {{{"0", "v1"}, {"64", "v1"}}}};
         const Lever provisional_fast{.name = "window", .env = "", .option = "--window", .value = {"", "2048", "", ""},
             .builtin = "0", .kind = Kind::bit_changing, .ready = {}, .runnable = {true, true, false, false}, .target = "",
-            .off = "0", .source = "gate failed", .provisional = {false, true, false, false}};
+            .off = "0", .source = "gate failed", .provisional = {false, true, false, false}, .identity = {{{"0", "v1"}, {"2048", "v1"}}}};
         const Lever exact{.name = "order", .env = "", .option = "--order", .value = {"", "1", "", ""}, .builtin = "0",
             .kind = Kind::exact, .ready = {true, true, false, false}, .runnable = {true, true, false, false}, .target = "",
-            .off = "0", .source = "bitwise"};
+            .off = "0", .source = "bitwise", .identity = {{{"0", "v1"}, {"1", "v1"}}}};
         const std::array rows{ready_fast, provisional_fast, exact};
         const Engine e{"explicit", "ALLOW", rows};
         const Lookup none = [](const char*) -> const char* { return nullptr; };
@@ -103,10 +108,10 @@ int main() {
     {
         const Lever width{.name = "rows", .env = "", .option = "--rows", .value = {"", "4096", "", ""}, .builtin = "0",
             .kind = Kind::bit_changing, .ready = {false, true, false, false}, .runnable = {true, true, false, false},
-            .target = "", .off = "0", .source = "gate receipt; 1024 / 2048 / 4096 bitwise", .same_bits = "1024,2048,4096"};
+            .target = "", .off = "0", .source = "gate receipt; 1024 / 2048 / 4096 bitwise", .same_bits = "1024,2048,4096", .identity = {{{"0", "v1"}, {"4096", "v1"}}}};
         const Lever unready{.name = "window", .env = "", .option = "--window", .value = {"", "4096", "", ""}, .builtin = "0",
             .kind = Kind::bit_changing, .ready = {}, .runnable = {true, true, false, false}, .target = "", .off = "0",
-            .source = "pending", .same_bits = "2048,4096"};
+            .source = "pending", .same_bits = "2048,4096", .identity = {{{"0", "v1"}, {"4096", "v1"}}}};
         const std::array rows{width, unready};
         const Engine e{"same_bits", "ALLOW", rows};
         const Lookup none = [](const char*) -> const char* { return nullptr; };
@@ -134,8 +139,10 @@ int main() {
     require(legacy.fingerprint() == hash, "legacy fingerprint bytes");
     const Engine shipped{"deepseek41-pair", "ALLOW", strix::deepseek41::pair_defaults::profile_table};
     inputs.profile = Name::fast;
+    inputs.allow_pending = false;
     const auto shipped_fast = resolve(shipped, inputs);
-    require(shipped_fast.find("moe_relaxed")->status == Status::provisional, "shipped table positional compatibility");
+    require(shipped_fast.find("moe_relaxed")->status == Status::pending &&
+            shipped_fast.find("moe_relaxed")->value == "0", "unscoped shipped candidate declines");
     check_peer(legacy, [](auto out, auto in) { std::memcpy(in.data(), out.data(), out.size()); });
     bool mismatch = false;
     try {
@@ -197,13 +204,16 @@ int main() {
         static constexpr std::array<Lever, 2> rows{
             Lever{.name = "applied", .env = "STRIX_TEST_APPLIED", .option = "", .value = {"0", "1", "", ""},
                   .builtin = "0", .kind = Kind::bit_changing, .ready = {true, true, true, true}, .target = "",
-                  .off = "", .source = "test receipt"},
+                  .off = "", .source = "test receipt", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
             Lever{.name = "waiting", .env = "STRIX_TEST_WAITING", .option = "", .value = {"0", "1", "", ""},
                   .builtin = "0", .kind = Kind::bit_changing, .ready = {true, false, true, false}, .target = "x",
-                  .off = "", .source = "gate pending"},
+                  .off = "", .source = "gate pending", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
         };
+        static constexpr LadderRow applied_timing{"applied", "1", Name::fast, Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "test",
+                                                  false, {}, {}, "ladder-arm/v4;fixture-exec;applied=0{v1},waiting=0{v1};candidate=applied=1{v1};tier=fast"};
+        in.regime = measured;
         static constexpr Engine two{.tag = "two-engine", .allow_env = "STRIX_TEST_ALLOW", .table = rows,
-                                    .quality_rows = false, .turbo_version = "two-turbo-v1"};
+                                    .quality_rows = false, .turbo_version = "two-turbo-v1", .ladder = std::span(&applied_timing, 1)};
         const auto applied = resolve(two, in);
         require(applied.summary() == "profile fast levers applied=1", "applied lever listed, pending one not");
         require(applied.tier_notice().empty() && applied.receipt_lines().size() == 1U, "no loud line once applied");
@@ -227,35 +237,32 @@ int main() {
                 "explicit override is not reported as the exact column");
             require(explicit_run.tier_notice().find("runs the exact column") == std::string::npos, "no exact claim");
         }
-        // Engine-attested overrides outside the table (GLM standalone MLA switch) also drop the exact claim.
+        // The GLM standalone MLA switch is an explicit table override.
         {
-            auto plain = resolve(waiting, in);
-            require(plain.tier_notice().find("runs the exact column") != std::string::npos, "plain FAST says exact column");
-            const auto glm_env = [](const char* k) -> const char* {
+            const auto& glm_engine = strix::glm::rank_defaults::product_profile_engine;
+            auto glm = in;
+            glm.env = [](const char* k) -> const char* {
                 return std::string_view(k) == "STRIX_GLM_PF_MLA_WMMA" ? "1" : nullptr;
             };
-            require(strix::glm::explicit_prefill_overrides(glm_env) ==
-                    std::vector<std::string>{"STRIX_GLM_PF_MLA_WMMA=1"}, "standalone MLA override found");
-            require(strix::glm::explicit_prefill_overrides([](const char*) -> const char* { return nullptr; }).empty(),
-                    "no override when unset");
-            plain.engine_overrides = strix::glm::explicit_prefill_overrides(glm_env);
-            require(plain.tier_notice().find("STRIX_GLM_PF_MLA_WMMA=1), not the exact column") != std::string::npos,
+            require(resolve(glm_engine, glm).tier_notice().find("mla_wmma=1), not the exact column") != std::string::npos,
                     "standalone MLA override named, no exact claim");
-            require(strix::glm::explicit_prefill_overrides([](const char* k) -> const char* {
-                        return std::string_view(k) == "STRIX_GLM_PF_MLA_WMMA" ? "0" : nullptr;
-                    }).empty(),
-                    "an explicit opt-out is not an override");
-            require(plain.tier_notice().find("runs the exact column") == std::string::npos, "no exact claim with override");
+            glm.env = [](const char* k) -> const char* {
+                return std::string_view(k) == "STRIX_GLM_PF_MLA_WMMA" ? "0" : nullptr;
+            };
+            require(resolve(glm_engine, glm).tier_notice().find("runs the exact column") != std::string::npos,
+                    "an explicit opt-out keeps the exact column");
         }
         // An unqualified row run under --allow-pending is not a qualified lever: the zero-qualified line stays.
         {
             static constexpr std::array<Lever, 1> runnable_rows{
                 Lever{.name = "runnable", .env = "STRIX_TEST_RUNNABLE", .option = "", .value = {"0", "1", "", ""},
                       .builtin = "0", .kind = Kind::bit_changing, .ready = {true, false, true, false},
-                      .runnable = {true, true, true, true}, .target = "x", .off = "", .source = "gate pending"},
+                      .runnable = {true, true, true, true}, .target = "x", .off = "", .source = "gate pending", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
             };
+            static constexpr LadderRow candidate_timing{"runnable", "1", Name::fast, Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "test",
+                                                          false, {}, {}, "ladder-arm/v4;fixture-exec;runnable=0{v1};candidate=runnable=1{v1};tier=fast"};
             static constexpr Engine unqualified{.tag = "unq-engine", .allow_env = "STRIX_TEST_ALLOW",
-                                                .table = runnable_rows, .quality_rows = false, .turbo_version = "u-turbo-v1"};
+                                                .table = runnable_rows, .quality_rows = false, .turbo_version = "u-turbo-v1", .ladder = std::span(&candidate_timing, 1)};
             Inputs pending_in = in;
             pending_in.allow_pending = true;
             const auto unq = resolve(unqualified, pending_in);
@@ -280,5 +287,66 @@ int main() {
         require(weighted.tier_notice().find("uses onfly-int4-rtn-g32 weights (not the exact column)") != std::string::npos,
                 "no false EXACT equivalence when TURBO changes weights");
     }
+    {
+        namespace hy = strix::hy4::profile;
+        Inputs in;
+        vars.clear();
+        in.env = env;
+        for (const auto regime : {hy::Regime{}, hy::Regime{hy::Device::gfx1151, hy::Topology::one_node, 8192},
+                                  hy::Regime{hy::Device::gfx1151, hy::Topology::pair, 8192}}) {
+            in.profile = Name::fast;
+            const auto fast = hy::resolve(regime, in);
+            in.profile = Name::turbo;
+            const auto turbo = hy::resolve(regime, in);
+            for (const auto& entry : fast->resolution.entries) {
+                const auto* selected = turbo->find(entry.lever->name);
+                require(selected != nullptr && selected->value == entry.value, "Hy4 TURBO inherits FAST");
+            }
+            in.allow_pending = true;
+            const auto allow_pending = hy::resolve(regime, in);
+            const auto* iu4 = allow_pending->find("decode_iu4");
+            require(iu4 != nullptr && iu4->status == Status::pending && iu4->value == "off",
+                    "Hy4 TURBO IU4 stays off and pending even with --allow-pending");
+            in.allow_pending = false;
+        }
+
+        constexpr std::pair<const char*, const char*> switches[] = {
+            {"pf_a8_producer", "STRIX_HY4_PF_A8_PRODUCER"},
+            {"q8_store_epilogue", "STRIX_HY4_Q8_STORE_EPILOGUE"},
+            {"pf_store_epilogue", "STRIX_HY4_PF_STORE_EPILOGUE"},
+        };
+        struct FlagCase {
+            const char* raw;
+            std::string_view effective;
+            Status status;
+        };
+        constexpr FlagCase cases[] = {
+            {nullptr, "1", Status::builtin}, {"", "1", Status::explicit_env},
+            {"0", "0", Status::off}, {"1", "1", Status::explicit_env},
+            {"off", "1", Status::explicit_env}, {"0legacy", "0", Status::off},
+            {"1legacy", "1", Status::explicit_env},
+        };
+        bool receipts_match = true;
+        for (const auto& [lever, key] : switches) {
+            for (const auto& test : cases) {
+                if (test.raw != nullptr) vars[key] = test.raw;
+                const auto resolved = hy::resolve({}, in);
+                const auto* entry = resolved->find(lever);
+                if (entry == nullptr || entry->value != test.effective || entry->status != test.status ||
+                    entry->requested != (test.raw != nullptr ? test.raw : "")) {
+                    std::cerr << key << " raw=" << (test.raw != nullptr ? json_string(test.raw) : "<unset>")
+                              << " expected " << test.effective << ' ' << status_name(test.status);
+                    if (entry != nullptr) std::cerr << ", got " << json_string(entry->value) << ' ' << status_name(entry->status);
+                    std::cerr << '\n';
+                    receipts_match = false;
+                }
+                vars.erase(key);
+            }
+        }
+        require(receipts_match, "Hy4 exact switch receipts match the runtime readers");
+    }
     std::cout << "common profile/receipt tests passed\n";
+} catch (const std::exception& error) {
+    std::cerr << error.what() << '\n';
+    return 1;
 }

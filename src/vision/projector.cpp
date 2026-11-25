@@ -44,7 +44,9 @@ layout::ProjectorGeometry layout::projector_geometry(const EncoderOutput& hidden
     const std::uint64_t in = std::uint64_t{hidden.width} * m.ratio * m.ratio;
     // Leave room for GEMM panel padding in unsigned dimensions on both backends.
     constexpr auto limit = std::numeric_limits<unsigned>::max() - 127U;
-    if (!hidden.width || !rows || !m.w1 || !m.w2 || hidden.rows != g.rows || in > limit || m.w1.cols != in ||
+    if (!hidden.width || !rows || !m.w1 || !m.w2 || hidden.rows != std::uint64_t{g.rows} + m.row_offset ||
+        (m.layout == MergeProjector::Layout::packed_cells && (grid_h % m.ratio || grid_w % m.ratio)) ||
+        in > limit || m.w1.cols != in ||
         m.w1.rows > limit || m.w2.rows > limit || m.w2.cols != m.w1.rows)
         throw std::invalid_argument("vision encoder: merge projector operands");
     const auto elements = [](std::size_t n, std::size_t width) {
@@ -52,7 +54,7 @@ layout::ProjectorGeometry layout::projector_geometry(const EncoderOutput& hidden
             throw std::invalid_argument("vision encoder: merge projector storage range");
         return n * width;
     };
-    const auto hidden_size = elements(g.rows, hidden.width);
+    const auto hidden_size = elements(hidden.rows, hidden.width);
     if (!resident && hidden.hidden.size() != hidden_size)
         throw std::invalid_argument("vision encoder: merge projector hidden rows");
     g.in = static_cast<unsigned>(in);
@@ -81,21 +83,26 @@ void DenseOps::merge_project(const EncoderOutput& hidden, unsigned grid_h, unsig
     const auto g = layout::projector_geometry(hidden, grid_h, grid_w, m, rows);
     const unsigned mh = g.mh, mw = g.mw, tokens = g.tokens;
     const std::size_t in = g.in, P = m.w1.rows;
-    // Unshuffle; the vector starts as zeros, so cells past the grid edge stay zero.
-    std::vector<float> merged(std::size_t{tokens} * in);
-    for (unsigned my = 0; my < mh; ++my)
-        for (unsigned mx = 0; mx < mw; ++mx) {
-            float* dst = &merged[(std::size_t{my} * mw + mx) * in];
-            for (unsigned dy = 0; dy < R; ++dy)
-                for (unsigned dx = 0; dx < R; ++dx) {
-                    if (my * R + dy >= grid_h || mx * R + dx >= grid_w) continue;
-                    const float* src = &hidden.hidden[(std::size_t{my * R + dy} * grid_w + mx * R + dx) * W];
-                    const unsigned slot = m.row_major ? dy * R + dx : dx * R + dy;
-                    for (unsigned c = 0; c < W; ++c) dst[std::size_t{c} * R * R + slot] = src[c];
-                }
-        }
+    const float* input = hidden.hidden.data() + std::size_t{m.row_offset} * W;
+    std::vector<float> merged;
+    if (m.layout == MergeProjector::Layout::raster) {
+        // Unshuffle; the vector starts as zeros, so cells past the grid edge stay zero.
+        merged.resize(std::size_t{tokens} * in);
+        for (unsigned my = 0; my < mh; ++my)
+            for (unsigned mx = 0; mx < mw; ++mx) {
+                float* dst = &merged[(std::size_t{my} * mw + mx) * in];
+                for (unsigned dy = 0; dy < R; ++dy)
+                    for (unsigned dx = 0; dx < R; ++dx) {
+                        if (my * R + dy >= grid_h || mx * R + dx >= grid_w) continue;
+                        const float* src = input + (std::size_t{my * R + dy} * grid_w + mx * R + dx) * W;
+                        const unsigned slot = m.row_major ? dy * R + dx : dx * R + dy;
+                        for (unsigned c = 0; c < W; ++c) dst[std::size_t{c} * R * R + slot] = src[c];
+                    }
+            }
+        input = merged.data();
+    }
     std::vector<float> mid(std::size_t{tokens} * P);
-    linear(m.w1, m.b1, merged.data(), tokens, mid.data());
+    linear(m.w1, m.b1, input, tokens, mid.data());
     merged = {};
     layout::parallel_ranges(mid.size(), 16U, [&](std::size_t i0, std::size_t i1) {  // elementwise: the split cannot change a value
         for (std::size_t i = i0; i < i1; ++i) mid[i] = activate(m.act, mid[i]);
