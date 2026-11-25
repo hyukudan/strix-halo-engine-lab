@@ -26,6 +26,8 @@
 #endif
 #if defined(STRIX_PARITY_GEMMA4)
 #include "gemma4/engine/runtime.hpp"
+#include <chrono>
+#include <fstream>
 #endif
 
 namespace {
@@ -301,6 +303,27 @@ void gemma() {
         {"streams", "the server decodes up to STRIX_G4_SERVE_SLOTS requests together"},
     };
     gate("gemma", cli, config(served.options), allowed);
+
+    namespace fs = std::filesystem;
+    const auto model = fs::temp_directory_path() /
+        ("strix-gemma4-draft-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto drafter = model / "drafter-mtp";
+    fs::create_directories(drafter);
+    const auto expect_drafter = [&](const std::string& tier, const fs::path& model_path, const fs::path& expected) {
+        std::vector<std::string> args{"x", "--model", model_path.string(), "--rope-tables", "rope", "--profile", tier};
+        std::vector<char*> pointers;
+        for (auto& arg : args) pointers.push_back(arg.data());
+        const auto options = e::parse_options(static_cast<int>(pointers.size()), pointers.data());
+        const auto server = e::prepare_serve(static_cast<int>(pointers.size()), pointers.data());
+        check(!server.exit_code && options.draft_mtp == expected && server.options.draft_mtp == expected,
+              "gemma " + tier + ": discover only a drafter with its weights file");
+    };
+    for (const auto* tier : {"exact", "fast", "turbo"}) expect_drafter(tier, model / "target.gguf", {});
+    std::ofstream(drafter / "model.safetensors").put('x');
+    for (const auto* tier : {"exact", "fast", "turbo"}) expect_drafter(tier, model / "target.gguf", drafter);
+    fs::remove(drafter / "model.safetensors");
+    fs::remove(drafter);
+    fs::remove(model);
 }
 #endif
 

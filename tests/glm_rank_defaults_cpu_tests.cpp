@@ -374,7 +374,9 @@ void test_mtp_default() {
     const auto split = names.size() / 2;
     write_shard("indexed.safetensors", 0, split);
     write_shard("mtp.safetensors", split, names.size());
-    CHECK(rd::probe_model_mtp(dir).mtp_complete);
+    const auto split_facts = rd::probe_model_mtp(dir);
+    CHECK(split_facts.mtp_complete);
+    CHECK((split_facts.mtp_files == std::vector<std::filesystem::path>{dir / "indexed.safetensors", dir / "mtp.safetensors"}));
     write_shard("mtp.safetensors", split - 1, names.size());
     facts = rd::probe_model_mtp(dir);
     CHECK(!facts.mtp_complete && facts.reason.find("tensor defined twice") != std::string::npos);

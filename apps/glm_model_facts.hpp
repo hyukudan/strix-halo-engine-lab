@@ -11,7 +11,11 @@
 #include <utility>
 
 namespace strix::glm::rank_defaults {
-struct ModelFacts { bool mtp_present = false, mtp_complete = false; std::string reason = "missing mtp.safetensors"; };
+struct ModelFacts {
+    bool mtp_present = false, mtp_complete = false;
+    std::string reason = "missing mtp.safetensors";
+    std::vector<std::filesystem::path> mtp_files{};
+};
 struct MtpTensorRole {
     std::string name, dtype;
     std::vector<std::uint64_t> shape;
@@ -87,6 +91,7 @@ inline ModelFacts probe_model_mtp(const std::filesystem::path& dir) {
         files.insert(files.end(), unlisted.begin(), unlisted.end());
         struct Metadata { engine::detail::Json json; std::uint64_t payload; };
         std::map<std::string, Metadata> tensors;
+        std::vector<std::filesystem::path> mtp_files;
         for (const auto& file : files) {
             const auto path = dir / file;
             std::ifstream f(path, std::ios::binary);
@@ -100,13 +105,19 @@ inline ModelFacts probe_model_mtp(const std::filesystem::path& dir) {
             std::string header(static_cast<std::size_t>(length), '\0');
             if (!f.read(header.data(), static_cast<std::streamsize>(length))) throw std::runtime_error("short JSON header: " + file);
             const auto json = engine::detail::parse_json(header.data(), header.data() + header.size());
+            bool has_next_layer = false;
             for (const auto& [name, metadata] : json.obj()) {
                 if (name == "__metadata__") continue;
-                if (name.starts_with("model.language_model.layers.45.")) facts.mtp_present = true;
+                has_next_layer |= name.starts_with("model.language_model.layers.45.");
                 if (!tensors.emplace(name, Metadata{metadata, size - 8 - length}).second)
                     throw std::runtime_error("tensor defined twice: " + name);
             }
+            if (has_next_layer) {
+                facts.mtp_present = true;
+                mtp_files.push_back(path);
+            }
         }
+        if (!facts.mtp_present) return facts;
         const std::map<std::string, std::uint64_t> sizes = {
             {"BOOL", 1}, {"U8", 1}, {"I8", 1}, {"F8_E4M3", 1}, {"F8_E5M2", 1},
             {"U16", 2}, {"I16", 2}, {"F16", 2}, {"BF16", 2},
@@ -152,6 +163,7 @@ inline ModelFacts probe_model_mtp(const std::filesystem::path& dir) {
         }
         facts.mtp_complete = true;
         facts.reason = "complete layer-45 inventory";
+        facts.mtp_files = std::move(mtp_files);
     } catch (const std::exception& e) { facts.reason = std::string("invalid MTP header: ") + e.what(); }
     return facts;
 }
