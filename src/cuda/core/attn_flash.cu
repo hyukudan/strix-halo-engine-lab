@@ -717,12 +717,15 @@ cudaError_t projected_ceiling(int& ceiling) {
 }
 
 // Every fallible host step of the projected launch: the dynamic shared memory of this extent must fit the ceiling.
+// A runtime failure is returned; `fits` false (with cudaSuccess) is the predictable refusal of a too-wide extent.
 template <class LY>
-cudaError_t projected_setup(std::uint32_t extent, int& smem) {
+cudaError_t projected_setup(std::uint32_t extent, int& smem, bool& fits) {
     smem = smem_bytes<LY>() + static_cast<int>(projected_smem_bytes(extent));
+    fits = false;
     int ceiling = 0;
     if (auto e = projected_ceiling<LY>(ceiling); e != cudaSuccess) return e;
-    return smem <= ceiling ? cudaSuccess : cudaErrorInvalidValue;
+    fits = smem <= ceiling;
+    return cudaSuccess;
 }
 }  // namespace
 
@@ -764,15 +767,23 @@ cudaError_t prepare_prepared_bf16_projected(const AttentionDims& d, const Prepar
                                             const PreparedBf16Projection& projection, const float* q,
                                             const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
                                             std::uint32_t pos0, std::uint32_t rows, float* out, FlashPipe pipe,
-                                            unsigned* failure, PreparedProjectedLaunch& launch) {
+                                            unsigned* failure, PreparedProjectedLaunch& launch, bool& declined) {
     launch = {};
+    declined = true;
     if (!can_launch_prepared_bf16_projected(d, prepared, projection, q, k_cache, v_cache, pos0, rows, out, pipe) ||
         !projected_failure_admitted(d, prepared, projection, q, k_cache, v_cache, rows, out, failure))
-        return cudaErrorInvalidValue;
+        return cudaSuccess;
     int smem = 0;
-    const auto status = pipe == FlashPipe::swz3 ? projected_setup<SwzLayoutShape<128>>(prepared.relative_extent, smem)
-                                                : projected_setup<PadLayoutShape<128>>(prepared.relative_extent, smem);
-    if (status != cudaSuccess) return status;
+    bool fits = false;
+    const auto status = pipe == FlashPipe::swz3
+        ? projected_setup<SwzLayoutShape<128>>(prepared.relative_extent, smem, fits)
+        : projected_setup<PadLayoutShape<128>>(prepared.relative_extent, smem, fits);
+    if (status != cudaSuccess) {
+        declined = false;  // a runtime error, not a refusal
+        return status;
+    }
+    if (!fits) return cudaSuccess;
+    declined = false;
     launch.pipe_ = pipe;
     launch.smem_bytes_ = smem;
     launch.dims_ = d;
@@ -786,6 +797,17 @@ cudaError_t prepare_prepared_bf16_projected(const AttentionDims& d, const Prepar
     launch.out_ = out;
     launch.failure_ = failure;
     return cudaSuccess;
+}
+
+cudaError_t prepare_prepared_bf16_projected(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                            const PreparedBf16Projection& projection, const float* q,
+                                            const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                            std::uint32_t pos0, std::uint32_t rows, float* out, FlashPipe pipe,
+                                            unsigned* failure, PreparedProjectedLaunch& launch) {
+    bool declined = false;
+    const auto status = prepare_prepared_bf16_projected(d, prepared, projection, q, k_cache, v_cache, pos0, rows, out, pipe,
+                                                        failure, launch, declined);
+    return status != cudaSuccess ? status : declined ? cudaErrorInvalidValue : cudaSuccess;
 }
 
 cudaError_t launch_prepared_bf16_projected(const PreparedProjectedLaunch& launch, cudaStream_t stream) {

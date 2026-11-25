@@ -252,6 +252,11 @@ private:
                                                        const __nv_bfloat16*, const __nv_bfloat16*, std::uint32_t,
                                                        std::uint32_t, float*, FlashPipe, unsigned*,
                                                        PreparedProjectedLaunch&);
+    friend cudaError_t prepare_prepared_bf16_projected(const AttentionDims&, const PreparedBf16Flash&,
+                                                       const PreparedBf16Projection&, const float*,
+                                                       const __nv_bfloat16*, const __nv_bfloat16*, std::uint32_t,
+                                                       std::uint32_t, float*, FlashPipe, unsigned*,
+                                                       PreparedProjectedLaunch&, bool&);
     friend cudaError_t launch_prepared_bf16_projected(const PreparedProjectedLaunch&, cudaStream_t);
     FlashPipe pipe_ = FlashPipe::pad2;
     int smem_bytes_ = 0;  // 0: not prepared
@@ -271,7 +276,55 @@ private:
                                                           std::uint32_t pos0, std::uint32_t rows, float* out,
                                                           FlashPipe pipe, unsigned* failure,
                                                           PreparedProjectedLaunch& launch);
+// The same preparation with the refusal kept apart from runtime errors: cudaSuccess with `declined` true is a predictable
+// refusal (geometry, overlaps, failure word, an extent above the device opt-in), nothing enqueued; any other status is a
+// runtime error of the setup (`declined` false). The overload above reports a refusal as cudaErrorInvalidValue.
+[[nodiscard]] cudaError_t prepare_prepared_bf16_projected(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                                          const PreparedBf16Projection& projection, const float* q,
+                                                          const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                                          std::uint32_t pos0, std::uint32_t rows, float* out,
+                                                          FlashPipe pipe, unsigned* failure,
+                                                          PreparedProjectedLaunch& launch, bool& declined);
 cudaError_t launch_prepared_bf16_projected(const PreparedProjectedLaunch& launch, cudaStream_t stream);
+
+// A whole projected append (K/V store, then the projected flash, then the finite check), prepared once: the flash
+// preparation above, the K/V store admission and the disjointness of the K/V input rows from the failure word. The value
+// owns the admitted operands; submit_append_prepared_bf16 enqueues exactly that append and repeats no fallible setup, so a
+// caller may prepare, decide its route, enqueue its own producers of q / k / v, then submit.
+class PreparedProjectedAppend {
+public:
+    [[nodiscard]] bool admitted() const { return launch_.admitted(); }
+
+private:
+    friend cudaError_t prepare_append_prepared_bf16(const AttentionDims&, const PreparedBf16Flash&,
+                                                    const PreparedBf16Projection&, const float*, const float*,
+                                                    const float*, __nv_bfloat16*, __nv_bfloat16*, std::uint32_t,
+                                                    std::uint32_t, float*, FlashPipe, unsigned*,
+                                                    PreparedProjectedAppend&, bool&);
+    friend cudaError_t submit_append_prepared_bf16(const PreparedProjectedAppend&, cudaStream_t);
+    PreparedProjectedLaunch launch_;
+    AttentionDims dims_{};
+    const float* q_ = nullptr;
+    const float* k_ = nullptr;
+    const float* v_ = nullptr;
+    const float* sinks_ = nullptr;
+    __nv_bfloat16* k_cache_ = nullptr;
+    __nv_bfloat16* v_cache_ = nullptr;
+    std::uint32_t pos0_ = 0, rows_ = 0;
+    bool wrapped_ = false;
+    float* out_ = nullptr;
+    unsigned* failure_ = nullptr;
+};
+// cudaSuccess with `declined` true: a predictable refusal, nothing enqueued (the caller keeps another route); any other
+// status is a runtime error. append_attention_prepared_bf16 (projected) is prepare + submit, a refusal returned as
+// cudaErrorInvalidValue.
+[[nodiscard]] cudaError_t prepare_append_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                                       const PreparedBf16Projection& projection, const float* q,
+                                                       const float* k, const float* v, __nv_bfloat16* k_cache,
+                                                       __nv_bfloat16* v_cache, std::uint32_t pos0, std::uint32_t rows,
+                                                       float* out, FlashPipe pipe, unsigned* failure,
+                                                       PreparedProjectedAppend& append, bool& declined);
+cudaError_t submit_append_prepared_bf16(const PreparedProjectedAppend& append, cudaStream_t stream);
 cudaError_t attention_prefill_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
                                             const PreparedBf16Projection& projection, const float* q,
                                             const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,

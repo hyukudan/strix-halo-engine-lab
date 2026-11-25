@@ -1,11 +1,13 @@
-// The Inkling 2 Mini projected-bias attention route through its binding (enqueue_mini_cuda_attention_projected and its
-// preflight) against the incumbent image route (enqueue_mini_cuda_attention on the image the production producer makes
+// The Inkling 2 Mini projected-bias attention route through the dispatcher the resident backend runs
+// (dispatch_mini_cuda_attention: one preparation, route decision, submission of that admitted value) against the
+// incumbent image route (enqueue_mini_cuda_attention on the image the production producer makes
 // from the same features and weights). K/V cache bytes, output bytes and the failure flag must be equal. Cases: two rows,
 // a partial 128-row tile, continuation positions on a filled cache, a wrapped sliding window, and non-finite bias values
 // (a NaN feature and an infinite weight at a masked distance: the image's finite check flags them, so must the flash).
-// Then the transition: with the device's dynamic shared-memory opt-in below the 1024-column projection's need (pad2:
-// 68,624 bytes) the preflight refuses with cudaErrorInvalidValue, the route decision selects the image route (no error)
-// and that route runs; any other preflight status stays an error.
+// Every admitted arm must report an observed projected dispatch. Then the transition: with the device's dynamic
+// shared-memory opt-in below the 1024-column projection's need (pad2: 68,624 bytes) still in effect, the dispatcher
+// declines (no error), runs the image route (observed image dispatch) and its bytes equal the projected route's; a limit
+// lowered after the preparation (between the route decision and the submission) does not refuse the admitted value.
 #include "core/row_transforms.hpp"
 #include "inkling2/inkling2_mini_attention_cuda.hpp"
 
@@ -137,7 +139,23 @@ struct Result {
 
 enum class Route { image, projected };
 
-Result run_route(const Fixture& f, Route route) {
+// The image route of `rows`: the production image producer, then the image flash.
+cudaError_t image_route(const Fixture& f, mini::MiniCudaAttentionRows rows, mini::MiniVisitKvCache cache, const float* features,
+                        const std::uint16_t* weights, float* image, unsigned* flag) {
+    using Wide = prep::ShortBf16Projection<kWidth, false, 4U>;
+    if (!Wide::fits(features, weights, image, kExtent)) {
+        std::fprintf(stderr, "FAIL %s: producer layout\n", f.c.name);
+        std::exit(EXIT_FAILURE);
+    }
+    check(prep::elements(Wide::launch_size(std::size_t{f.c.rows} * kHeads, kExtent), Wide{features, weights, image, kExtent},
+                         cudaStream_t{}), "image producer");
+    rows.relative_logits = image;
+    return mini::enqueue_mini_cuda_attention(f.visit, rows, cache, nullptr, cc::FlashPipe::pad2, flag);
+}
+
+// `between` runs at the dispatcher's prepared-to-submit boundary of an admitted arm (where the resident backend enqueues
+// the q / k / v preparation). `ran` is the route the dispatcher took.
+Result run_route(const Fixture& f, Route route, mini::MiniCudaAttentionRoute* ran = nullptr, void (*between)() = nullptr) {
     const auto& c = f.c;
     Device<float> dq(f.q), dk(f.k), dv(f.v), ds(f.sinks), df(f.features);
     Device<std::uint16_t> dw(f.weights), kc(f.cache), vc(f.cache);
@@ -147,18 +165,18 @@ Result run_route(const Fixture& f, Route route) {
     mini::MiniCudaAttentionRows rows{dq.data(), dk.data(), dv.data(), nullptr, ds.data(), out.data(), c.first, c.rows};
     const mini::MiniVisitKvCache cache{kc.data(), vc.data(), c.slots, c.wrapped};
     if (route == Route::image) {
-        using Wide = prep::ShortBf16Projection<kWidth, false, 4U>;
-        if (!Wide::fits(df.data(), dw.data(), image.data(), kExtent)) {
-            std::fprintf(stderr, "FAIL %s: producer layout\n", c.name);
-            std::exit(EXIT_FAILURE);
-        }
-        check(prep::elements(Wide::launch_size(std::size_t{c.rows} * kHeads, kExtent),
-                             Wide{df.data(), dw.data(), image.data(), kExtent}, cudaStream_t{}), "image producer");
-        rows.relative_logits = image.data();
-        check(mini::enqueue_mini_cuda_attention(f.visit, rows, cache, nullptr, cc::FlashPipe::pad2, flag.data()), "image route");
+        check(image_route(f, rows, cache, df.data(), dw.data(), image.data(), flag.data()), "image route");
     } else {
-        check(mini::enqueue_mini_cuda_attention_projected(f.visit, rows, cache, df.data(), dw.data(), nullptr, flag.data()),
-              "projected route");
+        auto taken = mini::MiniCudaAttentionRoute::image;
+        check(mini::dispatch_mini_cuda_attention(
+                  f.visit, rows, cache, df.data(), dw.data(), flag.data(), cudaStream_t{},
+                  [between] {
+                      if (between) between();
+                      return cudaSuccess;
+                  },
+                  [&] { return image_route(f, rows, cache, df.data(), dw.data(), image.data(), flag.data()); }, taken),
+              "dispatched route");
+        if (ran) *ran = taken;
     }
     check(cudaDeviceSynchronize(), "sync");
     return {kc.download(), vc.download(), out.download(), flag.download()[0]};
@@ -167,9 +185,14 @@ Result run_route(const Fixture& f, Route route) {
 void run(const Case& c) {
     const Fixture f(c);
     const auto image = run_route(f, Route::image);
-    const auto projected = run_route(f, Route::projected);
+    auto ran = mini::MiniCudaAttentionRoute::image;
+    const auto projected = run_route(f, Route::projected, &ran);
     const bool flagged = c.poison != Poison::none;
     bool ok = image.flag == projected.flag;
+    if (ran != mini::MiniCudaAttentionRoute::projected) {
+        std::fprintf(stderr, "FAIL %s: the admitted arm did not dispatch the projected route\n", c.name);
+        ok = false;
+    }
     if (image.flag != (flagged ? 1U : 0U)) {
         std::fprintf(stderr, "FAIL %s: image route flag %u, expected %u\n", c.name, image.flag, flagged ? 1U : 0U);
         ++failures;
@@ -177,46 +200,43 @@ void run(const Case& c) {
     }
     ok = same_bytes(c.name, "K cache", image.k_cache, projected.k_cache) && ok;
     ok = same_bytes(c.name, "V cache", image.v_cache, projected.v_cache) && ok;
-    if (!flagged) ok = same_bytes(c.name, "output", image.output, projected.output) && ok;
+    if (c.poison != Poison::nan_feature) ok = same_bytes(c.name, "output", image.output, projected.output) && ok;
     if (!ok) ++failures;
     std::printf("%s %s rows %u first %u %s slots %u%s flag %u\n", ok ? "PASS" : "FAIL", c.name, c.rows, c.first,
                 c.full_attention ? "full" : "sliding", c.slots, c.wrapped ? " wrapped" : "", projected.flag);
 }
 
-// The transition: the preflight refuses below the opt-in the projection needs, the decision keeps the image route (not an
-// error) and that route's bytes equal the projected route's at the real limit; a real error is not absorbed.
+// The transition, through the dispatcher the resident backend runs. At the real limit the projected route is observed;
+// with the 48 KiB opt-in still in effect the dispatcher declines without an error, the image route is observed and its
+// output, cache and flag equal the projected route's; a limit lowered after the preparation does not refuse the
+// admitted value (setup once): the projected route runs with the same bytes.
+void lower_limit() { cc::set_projected_optin_limit_for_test(48 * 1024); }
+
 void transition() {
     const Case c{"transition", true, 130, 300, 4096, false, Poison::none};
     const Fixture f(c);
-    const auto projected = run_route(f, Route::projected);
-    Device<float> dq(f.q), dk(f.k), dv(f.v), ds(f.sinks), df(f.features), out(f.q.size());
-    Device<std::uint16_t> dw(f.weights), kc(f.cache), vc(f.cache);
-    const mini::MiniCudaAttentionRows rows{dq.data(), dk.data(), dv.data(), nullptr, ds.data(), out.data(), c.first, c.rows};
-    const mini::MiniVisitKvCache cache{kc.data(), vc.data(), c.slots, c.wrapped};
-    bool selected = false;
-    const auto admitted = mini::mini_cuda_projected_decision(
-        mini::preflight_mini_cuda_attention_projected(f.visit, rows, cache, df.data(), dw.data()), selected);
+    auto real = mini::MiniCudaAttentionRoute::image;
+    const auto projected = run_route(f, Route::projected, &real);
     cc::set_projected_optin_limit_for_test(48 * 1024);
-    bool refused_selected = true;
-    const auto refused_status = mini::preflight_mini_cuda_attention_projected(f.visit, rows, cache, df.data(), dw.data());
-    const auto refused = mini::mini_cuda_projected_decision(refused_status, refused_selected);
-    // The append itself refuses at that limit BEFORE any write: the K/V cache keeps its initial bytes.
-    const auto append_status = mini::enqueue_mini_cuda_attention_projected(f.visit, rows, cache, df.data(), dw.data(), nullptr);
-    check(cudaDeviceSynchronize(), "sync");
-    const bool untouched = append_status == cudaErrorInvalidValue && kc.download() == f.cache && vc.download() == f.cache;
+    auto limited = mini::MiniCudaAttentionRoute::projected;
+    const auto declined = run_route(f, Route::projected, &limited);
     cc::set_projected_optin_limit_for_test(0);
-    bool error_selected = true;
-    const auto error = mini::mini_cuda_projected_decision(cudaErrorMemoryAllocation, error_selected);
-    const auto image = run_route(f, Route::image);
-    bool ok = admitted == cudaSuccess && selected && refused_status == cudaErrorInvalidValue && refused == cudaSuccess &&
-              !refused_selected && error == cudaErrorMemoryAllocation && !error_selected && untouched;
-    ok = same_bytes(c.name, "K cache", image.k_cache, projected.k_cache) && ok;
-    ok = same_bytes(c.name, "V cache", image.v_cache, projected.v_cache) && ok;
-    ok = same_bytes(c.name, "output", image.output, projected.output) && ok;
+    auto late = mini::MiniCudaAttentionRoute::image;
+    const auto lowered = run_route(f, Route::projected, &late, &lower_limit);
+    cc::set_projected_optin_limit_for_test(0);
+    bool ok = real == mini::MiniCudaAttentionRoute::projected && limited == mini::MiniCudaAttentionRoute::image &&
+              late == mini::MiniCudaAttentionRoute::projected && declined.flag == projected.flag &&
+              lowered.flag == projected.flag;
+    ok = same_bytes(c.name, "K cache (declined)", declined.k_cache, projected.k_cache) && ok;
+    ok = same_bytes(c.name, "V cache (declined)", declined.v_cache, projected.v_cache) && ok;
+    ok = same_bytes(c.name, "output (declined)", declined.output, projected.output) && ok;
+    ok = same_bytes(c.name, "K cache (lowered after preparation)", lowered.k_cache, projected.k_cache) && ok;
+    ok = same_bytes(c.name, "V cache (lowered after preparation)", lowered.v_cache, projected.v_cache) && ok;
+    ok = same_bytes(c.name, "output (lowered after preparation)", lowered.output, projected.output) && ok;
     if (!ok) ++failures;
-    std::printf("%s transition (real limit: projected route; 48 KiB opt-in: preflight refuses, decision keeps the image route "
-                "without an error, its bytes equal the projected route's; the refused append leaves the K/V cache untouched; another "
-                "status stays an error)\n", ok ? "PASS" : "FAIL");
+    std::printf("%s transition (real limit: projected dispatch; 48 KiB opt-in in effect: declined, image dispatch, same "
+                "output, cache and flag; limit lowered after the preparation: the admitted projected value still runs, same "
+                "bytes)\n", ok ? "PASS" : "FAIL");
 }
 }  // namespace
 

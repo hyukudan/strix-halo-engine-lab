@@ -52,7 +52,8 @@ public:
                      bool combine_image = false, bool prepared_round_fold = false, bool narrow_experts = false,
                      bool controller_one_plane = false, bool attn_projected_bias = false)
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
-                   load.verify_rows, dspark != nullptr, 1U, load.prefill_tail, narrow_experts, controller_one_plane) {
+                   load.verify_rows, dspark != nullptr, 1U, load.prefill_tail, narrow_experts, controller_one_plane),
+          projected_bias_(attn_projected_bias) {
         const auto levers = configure_mini_decoder(decoder_, moe_w4a4, combine_image, prepared_round_fold, attn_projected_bias);
         std::cerr << "Inkling down_image " << mini_down_image_name(levers.down_image, combine_image) << '\n';
         std::cerr << "Inkling prepared_round_fold " << mini_round_fold_name(levers.prepared_round_fold, prepared_round_fold)
@@ -61,7 +62,13 @@ public:
     }
 
     unsigned prefill(std::span<const unsigned> ids, std::span<float> logits) override {
-        return decoder_.prefill(ids, logits);
+        const auto next = decoder_.prefill(ids, logits);
+        // With the lever selected, the observed route: projected-bias appends submitted so far (0: every chunk declined
+        // or was not admissible, so the image route ran).
+        if (projected_bias_)
+            std::cerr << "Inkling attn_projected_bias dispatches " << decoder_.projected_attention_dispatches() << '
+';
+        return next;
     }
 
     unsigned decode(unsigned token, std::span<float> logits) override {
@@ -90,6 +97,7 @@ private:
     MiniResidentDecoder decoder_;
     spec::EngineVerifyTarget<MiniResidentDecoder> target_{decoder_};
     std::optional<MiniResidentDSpark> drafter_;
+    bool projected_bias_ = false;
 };
 
 inline void run_gate(const char* checkpoint, const Options& options, std::span<const session::HeadGateWindow> windows,

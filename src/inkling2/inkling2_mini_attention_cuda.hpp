@@ -65,36 +65,61 @@ inline bool mini_cuda_projected_route(LayerVisit visit, const MiniCudaAttentionR
     return true;
 }
 
-// Preflight of the ENTIRE projected route (admission, operand overlaps, failure word, device shared-memory opt-in): the
-// same preparation the append runs before its K/V store, without enqueuing anything. cudaSuccess = the append will be
-// admitted; cudaErrorInvalidValue = a predictable refusal (the caller keeps the image route, which has not been dropped
-// yet); any other status is a real device error and stays visible.
-inline cudaError_t preflight_mini_cuda_attention_projected(
-    LayerVisit visit, const MiniCudaAttentionRows& rows, MiniVisitKvCache cache, const float* features,
-    const std::uint16_t* weights, unsigned* failure = nullptr) {
+// The ENTIRE projected append prepared once (shared cuda_core::prepare_append_prepared_bf16: admission, operand
+// overlaps, failure word, device shared-memory opt-in, K/V store admission, K/V input rows against the failure word),
+// without enqueuing anything. The value binds the pointers of the rows the GQA preparation will produce, so it can be
+// prepared before the image producer is dropped and submitted after the preparation ran. cudaSuccess with `declined`
+// true is a predictable refusal (the caller keeps the image route); any other status is a runtime error.
+inline cudaError_t prepare_mini_cuda_attention_projected(LayerVisit visit, const MiniCudaAttentionRows& rows,
+                                                         MiniVisitKvCache cache, const float* features,
+                                                         const std::uint16_t* weights, unsigned* failure,
+                                                         cuda_core::PreparedProjectedAppend& append, bool& declined) {
     MiniCudaProjectedRoute route;
-    if (!mini_cuda_projected_route(visit, rows, cache, features, weights, route)) return cudaErrorInvalidValue;
-    cuda_core::PreparedProjectedLaunch launch;
-    return cuda_core::prepare_prepared_bf16_projected(route.dims, route.shape, route.projection, rows.queries,
-                                                      route.key_cache, route.value_cache, rows.first_position, rows.count,
-                                                      rows.output, cuda_core::FlashPipe::pad2, failure, launch);
+    if (!mini_cuda_projected_route(visit, rows, cache, features, weights, route)) {
+        append = {};
+        declined = true;
+        return cudaSuccess;
+    }
+    return cuda_core::prepare_append_prepared_bf16(route.dims, route.shape, route.projection, rows.queries, rows.keys,
+                                                   rows.values, route.key_cache, route.value_cache, rows.first_position,
+                                                   rows.count, rows.output, cuda_core::FlashPipe::pad2, failure, append,
+                                                   declined);
 }
 
-// The route a preflight status selects: success keeps the projected route; cudaErrorInvalidValue (a predictable refusal of
-// the prepared launch) selects the image route and is not an error; every other status is returned to the caller.
-inline cudaError_t mini_cuda_projected_decision(cudaError_t preflight, bool& projected) {
-    projected = preflight == cudaSuccess;
-    return preflight == cudaErrorInvalidValue ? cudaSuccess : preflight;
+enum class MiniCudaAttentionRoute : unsigned char { image, projected };
+
+// The route decision and submission of one admissible single-chunk prompt attention, the one the resident backend runs
+// (and its fixture drives): the projected append is prepared once; a declined value runs `image()` (image producer,
+// prepare stage and flash); an admitted one runs `projected_prepare()` (q / k / v without the image) and submits that same
+// admitted value. Any non-decline status of the preparation is returned before anything is enqueued. `route` names the
+// route that ran.
+template <class ProjectedPrepare, class Image>
+cudaError_t dispatch_mini_cuda_attention(LayerVisit visit, const MiniCudaAttentionRows& rows, MiniVisitKvCache cache,
+                                         const float* features, const std::uint16_t* weights, unsigned* failure,
+                                         cudaStream_t stream, ProjectedPrepare&& projected_prepare, Image&& image,
+                                         MiniCudaAttentionRoute& route) {
+    route = MiniCudaAttentionRoute::image;
+    cuda_core::PreparedProjectedAppend append;
+    bool declined = false;
+    if (auto status = prepare_mini_cuda_attention_projected(visit, rows, cache, features, weights, failure, append,
+                                                            declined);
+        status != cudaSuccess) return status;
+    if (declined) return image();
+    route = MiniCudaAttentionRoute::projected;
+    if (cudaError_t status = projected_prepare(); status != cudaSuccess) return status;
+    return cuda_core::submit_append_prepared_bf16(append, stream);
 }
 
+// Prepare + submit in one call (the fixture's projected arm); a refusal is cudaErrorInvalidValue.
 inline cudaError_t enqueue_mini_cuda_attention_projected(
     LayerVisit visit, const MiniCudaAttentionRows& rows, MiniVisitKvCache cache, const float* features,
     const std::uint16_t* weights, cudaStream_t stream, unsigned* failure = nullptr) {
-    MiniCudaProjectedRoute route;
-    if (!mini_cuda_projected_route(visit, rows, cache, features, weights, route)) return cudaErrorInvalidValue;
-    return cuda_core::append_attention_prepared_bf16(
-        route.dims, route.shape, route.projection, rows.queries, rows.keys, rows.values, route.key_cache,
-        route.value_cache, rows.first_position, rows.count, rows.output, stream, cuda_core::FlashPipe::pad2, failure);
+    cuda_core::PreparedProjectedAppend append;
+    bool declined = false;
+    if (auto status = prepare_mini_cuda_attention_projected(visit, rows, cache, features, weights, failure, append,
+                                                            declined);
+        status != cudaSuccess) return status;
+    return declined ? cudaErrorInvalidValue : cuda_core::submit_append_prepared_bf16(append, stream);
 }
 
 // One-row windows of several lanes as one lane-batched append (shared contract strix/attn/prepared_lanes.hpp):

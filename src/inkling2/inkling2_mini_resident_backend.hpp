@@ -282,6 +282,9 @@ public:
         attention_projected_bias_ = enabled;
 #endif
     }
+    // CUDA projected-bias attention submissions so far (0 on HIP and with the lever off): what a test observes to tell the
+    // projected route from the image route, whose bits are equal.
+    [[nodiscard]] std::uint64_t projected_attention_dispatches() const { return projected_dispatches_; }
 
     // FAST W4A4 expert lever (inkling2-mini-moe-w4a4@1): multi-row prefill chunks run admitted NVFP4 expert layers through
     // the shared grouped W4A4 operand class. The NVFP4 image of the assignment rows is allocated only when the lever is on.
@@ -759,26 +762,32 @@ private:
             // inkling2-mini-attn-projected-bias@1, off by default until its identity receipt): the prepare stage skips
             // the image and its producer, the flash computes the same logits and raises the same flag
             // (cuda_core::PreparedBf16Projection). The null-order count needs the image producer and lane mode
-            // resolves positions on the device, so both keep the image route. The whole projected launch is prepared
-            // BEFORE the image producer is dropped: a predictable refusal (cudaErrorInvalidValue: e.g. the dynamic
-            // shared memory of the 1024-column projection above the device opt-in) keeps the image route, any other
-            // status is a real error.
+            // resolves positions on the device, so both keep the image route. The whole projected append is prepared
+            // ONCE, BEFORE the image producer is dropped (prepare_mini_cuda_attention_projected): a declined value
+            // (e.g. the dynamic shared memory of the 1024-column projection above the device opt-in) keeps the image
+            // route, any other status is a real error, and the admitted value is the one submitted after the
+            // preparation of q / k / v, with no second admission.
             const auto* bias_weights =
                 attn_core::detail::bf16_projection(weights.projection(MiniAttentionProjection::relative_bias));
             bool projected_route = attention_projected_bias_ && single && !cohort && !adapter.null_applications &&
                                    route_.attention_rows >= rows &&
                                    mini_cuda_bias_in_attention(rows, device_position, work.relative_features, bias_weights);
             if (projected_route) {
-                check(mini_cuda_projected_decision(
-                    preflight_mini_cuda_attention_projected(visit, image_of(*single, 0U), single->state.kv,
-                                                            work.relative_features, bias_weights, failure),
-                    projected_route));
-            }
-            if (projected_route) {
-                const detail::MiniResidentGqaBackend<detail::MiniPreparedCudaProjectedBackend> projected{{native}, nullptr};
-                check(prepare(projected));
-                check(enqueue_mini_cuda_attention_projected(visit, image_of(*single, 0U), single->state.kv,
-                                                            work.relative_features, bias_weights, stream_, failure));
+                auto ran = MiniCudaAttentionRoute::image;
+                check(dispatch_mini_cuda_attention(
+                    visit, image_of(*single, 0U), single->state.kv, work.relative_features, bias_weights, failure, stream_,
+                    [&] {
+                        const detail::MiniResidentGqaBackend<detail::MiniPreparedCudaProjectedBackend> projected{{native},
+                                                                                                             nullptr};
+                        return prepare(projected);
+                    },
+                    [&] {
+                        check(prepare_with(prepare));
+                        launch_visits(visits);
+                        return cudaSuccess;
+                    },
+                    ran));
+                if (ran == MiniCudaAttentionRoute::projected) ++projected_dispatches_;
             } else
 #endif
             {
@@ -1000,6 +1009,7 @@ private:
     moe_core::grouped_microscaled::Schedule moe_schedule_ = mini_cuda_moe_schedule();
     bool moe_w4a4_ = false, chunk_w4a4_ = false;
     bool attention_projected_bias_ = false;  // lever inkling2-mini-attn-projected-bias@1 (resolved; set once after load)
+    std::uint64_t projected_dispatches_ = 0;  // projected-bias appends submitted (projected_attention_dispatches)
     moe_core::grouped_w4a4::Activations moe_w4a4_class_ = moe_core::grouped_w4a4::Activations::nvfp4;
     std::array<bool, kPhysicalLayers> moe_w4a4_layer_{};
     std::optional<mini_gpu::Buffer<std::uint8_t>> moe_nvfp4_;
