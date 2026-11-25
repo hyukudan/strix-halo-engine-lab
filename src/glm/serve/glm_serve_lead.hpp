@@ -17,6 +17,7 @@
 #include "strix/serve/engine.hpp"
 #include "strix/serve/prefill_interleave.hpp"
 #include "strix/session/prefill_session.hpp"
+#include "strix/session/embed_rows.hpp"
 #include "strix/session/mark_plan.hpp"
 #include "glm/serve/glm_session_owner.hpp"
 #include "strix/serve/glm_chat.hpp"
@@ -165,8 +166,22 @@ struct LeadConfig {
     // to rank 1 over the pair link before the restore.
     bool import_dsa_once = false;
     bool sampling = false;
+    // Sampled requests (temperature > 0) decode through MTP at one request (C1): the lead's sampler decides every verify
+    // row with the resolved acceptance (strix::serve::decide_pair_window); coupled keeps the tokens of plain sampling of
+    // the same seed when verify rows equal plain-step rows bit for bit (gate SP1a). Never in batched verify (G2). Off:
+    // plain steps. Set only from the resolved row serve_sampled_mtp (rank_defaults::resolve_sampled_mtp).
+    bool sampled_mtp = false;
+    // The entry point's sampler options (strix::validate_sampling_startup_environment with the acceptance rule the row
+    // resolved: coupled or rejection with sampled MTP on; off: the shared default, which plain steps ignore).
     TokenSamplerOptions sampler_options{};
 };
+
+// The sampled-MTP flags of a request's sampler: drafts are drawn from the drafter rows unless coupled acceptance draws
+// them as the drafter's argmax (below its temperature gate), which the engine's merged argmax already is.
+inline std::uint32_t sampled_run_flags(const strix::TokenSampler& sampler) {
+    const bool argmax_drafts = sampler.coupled() && sampler.draft_policy().top_k == 1U;
+    return kRunSample | (argmax_drafts ? 0U : kRunSampleDrafts) | (sampler.coupled() ? 0U : kRunRejection);
+}
 
 
 // Self-test trace (Lead::set_trace): what happened when, per request (key = its ticket). first: the request's prefill
@@ -249,7 +264,9 @@ public:
                   bye.cmd = static_cast<std::uint32_t>(Cmd::shutdown);
                   (void)ch_.exchange(bye);
                   count_round();
-              }, [this] { failing_ = true; }) {
+              }, [this] { failing_ = true; },
+              // image prompts are admitted only on an engine that takes their rows
+              requires(Eng& e, std::shared_ptr<const strix::session::EmbedTable> t) { e.bind_embeds(t); }) {
         if (cfg_.prefix_cache_bytes) prefix_cache_.emplace(cfg_.prefix_cache_bytes);
         for (unsigned n = 0; n <= kMaxRows; ++n)
             for (unsigned r = 0; r <= kMaxRows; ++r) cost_[n][r] = 30.0 + 11.0 * r + 2.5 * n;  // ms, measured EMA from here
@@ -473,6 +490,13 @@ private:
                 return reject(400, "invalid_request", "temperature: sessions require greedy selection");
         }
         if (n == 0) return reject(400, "invalid_request", "empty prompt");
+        // An image prompt (virtual ids, GenerationJob::embeds) is prefilled by the pair itself and never enters the
+        // prefix cache: handles are process-local, so a key of virtual ids means nothing on the other rank.
+        const bool image = job.embeds != nullptr;
+        if (image) {
+            if (!job.session.empty() || !job.session_id.empty())
+                return reject(400, "invalid_request", "image input does not take sessions");
+        }
         if (n >= cfg_.capacity)
             return reject(400, "context_length_exceeded",
                           "prompt of " + std::to_string(n) + " tokens does not fit the context of " + std::to_string(cfg_.capacity) + " positions");
@@ -494,16 +518,17 @@ private:
             if (std::find(p.a.stops.begin(), p.a.stops.end(), t) == p.a.stops.end()) p.a.stops.push_back(t);
         p.a.t_admit = Clock::now();
         p.a.sampler = std::move(sampler);
-        // MTP prefill and verify produce greedy choices. Sampled requests use plain forwards throughout.
-        p.a.mtp_ok = !p.a.sampler && mtp_on_.load();
+        // MTP prefill and verify produce greedy choices; a sampled request decodes through MTP only with sampled_mtp
+        // (its verify rows are then decided by its sampler), otherwise by plain forwards throughout.
+        p.a.mtp_ok = (!p.a.sampler || cfg_.sampled_mtp) && mtp_on_.load();
         p.chunk = p.a.mtp_ok && !cfg_.prefill_chunk_mtp ? 0U : chunk_.load();
         runtime().publish_progress(p.a.state, {strix::serve::GenerationPhase::prefill, 0, 0, n});
         // Preserve the optional FAST import route's identity selection; native snapshots never replace an eligible import.
-        const bool import_route = !p.a.sampler && cfg_.rtx_prefill && route_on_.load() && !imp_ &&
+        const bool import_route = !image && !p.a.sampler && cfg_.rtx_prefill && route_on_.load() && !imp_ &&
                                   n >= 2 && n >= cfg_.import_min_tokens;
         // A restore that reaches the root leaves nothing to store (prefill_chunk compares it with `done`).
-        p.root = cfg_.prefix_cache_bytes && cfg_.prefix_root && !import_route ? prefix_root_row(request(p.a).stable_prefix, n) : 0;
-        if (cfg_.prefix_cache_bytes) {
+        p.root = cfg_.prefix_cache_bytes && cfg_.prefix_root && !import_route && !image ? prefix_root_row(request(p.a).stable_prefix, n) : 0;
+        if (cfg_.prefix_cache_bytes && !image) {
             const auto* e = import_route ? nullptr : prefix_cache_->lookup(request(p.a).prompt, p.a.mtp_ok, cfg_.prefix_identity);
             const std::uint64_t held = e ? e->id : 0;
             if (held) (void)prefix_cache_->acquire(held);  // the entry being restored cannot be a pressure victim
@@ -576,7 +601,7 @@ private:
         strix::serve::GenerationStats st;
         st.finish = "cancelled";
         st.prompt_tokens = request(p->a).prompt.size();
-        if (p->a.sampler) st.sampling = "sampling-v1";
+        strix::serve::record_job_sampling(st, p->a.sampler ? &*p->a.sampler : nullptr);
         runtime().complete_native(p->a.state, std::move(st));
         table_.release(p->slot);
         p.reset();
@@ -636,6 +661,14 @@ private:
             c.plen = static_cast<std::uint32_t>(m);
             c.pflags = (p.a.mtp_ok ? kPrefillMtp : 0U) | (last ? kPrefillLast : 0U);
             chunk.assign(prompt.begin() + static_cast<std::ptrdiff_t>(p.done), prompt.begin() + static_cast<std::ptrdiff_t>(p.done + m));
+        }
+        // Image rows: the engine of this rank resolves the chunk's virtual ids against the request's table; the
+        // follower gets the rows of the chunk's spans in the embed frame after the tokens (once per image).
+        if (request(p.a).embeds) {
+            if constexpr (requires { eng_.bind_embeds(request(p.a).embeds); }) eng_.bind_embeds(request(p.a).embeds);
+            else throw std::logic_error("image prompt on an engine without embedding rows");
+            if (std::any_of(chunk.begin(), chunk.end(), [](std::uint32_t id) { return strix::session::is_embed_id(id); }))
+                c.pflags |= kPrefillEmbeds;
         }
         const bool timeline = cfg_.prefill_timeline != 0 && (p.done != 0 || !last || p.units);  // chunked prompts only
         strix::serve::PrefillTimeline::Chunk tc;
@@ -699,7 +732,7 @@ private:
             runtime().publish_progress(p.a.state, {strix::serve::GenerationPhase::prefill, p.done, 0, n});
             return;
         }
-        if (cfg_.prefix_cache_bytes) store_prefix(p);
+        if (cfg_.prefix_cache_bytes && !request(p.a).embeds) store_prefix(p);
         const auto ready = cfg_.prefix_cache_bytes ? Clock::now() : t1;
         const std::uint32_t slot = p.slot;
         Active a = std::move(p.a);
@@ -713,9 +746,13 @@ private:
         active_[slot] = std::move(a);
         if (cfg_.state_digest) digest_state(slot, n);
         if (request(*active_[slot]).max_tokens == 0) return finish(slot, "length");
+        const bool sampled = active_[slot]->sampler.has_value();
         emit(slot, out.at(0));
         trace(key, TraceEvent::first);  // after its first token: the steady window counts decode tokens only
-        if (mtp_ok) seed_slot_ = static_cast<int>(slot);
+        // A sampled first token differs from the greedy one the MTP prefill seeded its drafter with: the decoder opens
+        // from mtp_enter on the prompt's last row (it produced the sampled token) instead of that seed.
+        if (mtp_ok && !sampled) seed_slot_ = static_cast<int>(slot);
+        else if (mtp_ok && active_[slot]) last_rows_ = {WireRow{slot, out.at(0), n - 1}};
     }
 
     void sync_prefix_stats() {
@@ -817,6 +854,7 @@ private:
         const std::string w = why;
         if (w != "stop" && w != "length") return;  // cancelled / context / failed: not a committed reply
         const auto& prompt = request(a).prompt;
+        if (request(a).embeds) return;  // an image prompt has no cache key (admit)
         const bool exact = !a.mtp_ok && a.imported == 0 && a.generated >= 2 && a.emitted.size() == a.generated &&
                            a.pos == prompt.size() + a.emitted.size() - 1 && a.pos < cfg_.capacity;
         if (!exact) {
@@ -915,7 +953,7 @@ private:
         st.finish = why;
         st.prompt_tokens = request(a).prompt.size();
         st.generated_tokens = a.generated;
-        if (a.sampler) st.sampling = "sampling-v1";
+        strix::serve::record_job_sampling(st, a.sampler ? &*a.sampler : nullptr);  // sampling-v1 and its receipt
         st.prefill_ms = a.prefill_ms;
         st.decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - a.t_first).count();
         st.first_token_ms = a.first_token_ms;
@@ -1126,7 +1164,7 @@ private:
         if (!a.mtp_ok) return false;
         if (mtp_slot_ != static_cast<int>(s)) {
             const SlotSpec& st = eng_.spec_state(s);
-            if (seed_slot_ != static_cast<int>(s) && st.seeded && !st.disabled && st.drafts.size() == 1 && st.p == a.pos) {
+            if (!a.sampler && seed_slot_ != static_cast<int>(s) && st.seeded && !st.disabled && st.drafts.size() == 1 && st.p == a.pos) {
                 // from batched self-speculation: the slot's drafter seed of its last window
                 Control e;
                 e.cmd = static_cast<std::uint32_t>(Cmd::mtp_enter);
@@ -1144,8 +1182,15 @@ private:
                 Control e;
                 e.cmd = static_cast<std::uint32_t>(Cmd::mtp_enter);
                 e.pslot = static_cast<std::uint32_t>(r);
+                // sampled drafts: the seed draft is drawn from the drafter row too (the lead's sampler)
+                strix::serve::PairSamplingRow enter_choice;
+                if (a.sampler && (sampled_run_flags(*a.sampler) & kRunSampleDrafts) != 0) {
+                    e.pflags = sampled_run_flags(*a.sampler);
+                    enter_choice.sampler = &*a.sampler;
+                }
                 e.row[0] = {s, a.last, a.pos - 1};  // the step row that produced a.last
-                (void)engine_round(e);
+                (void)engine_round(e, nullptr, enter_choice.sampler ? std::span(&enter_choice, 1) :
+                                   std::span<strix::serve::PairSamplingRow>{});
                 seed_slot_ = static_cast<int>(s);
                 std::lock_guard<std::mutex> l(m_);
                 ++stats_.mtp_enters;
@@ -1159,8 +1204,15 @@ private:
         c.pslot = s;
         c.budget = mtp_budget_;
         c.cycles = std::clamp(cfg_.mtp_cycles, 1U, kMaxMtpCycles);
+        strix::serve::PairSamplingRow choice;
+        if (a.sampler) {
+            c.pflags = sampled_run_flags(*a.sampler);
+            choice.sampler = &*a.sampler;
+            choice.stops = a.stops;  // the window ends at a stop id: no row past it is decided or committed
+        }
         const auto t0 = Clock::now();
-        const auto out = engine_round(c);
+        const auto out = engine_round(c, nullptr, choice.sampler ? std::span(&choice, 1) :
+                                      std::span<strix::serve::PairSamplingRow>{});
         {
             std::lock_guard<std::mutex> l(m_);
             ++stats_.mtp_rounds;
@@ -1182,7 +1234,7 @@ private:
         if (!g2_on_.load() || !mtp_on_.load()) return false;
         unsigned n = 0;
         for (const auto& a : active_) {
-            if (a && !a->mtp_ok) return false;
+            if (a && (!a->mtp_ok || a->sampler)) return false;  // batched verify decides greedily
             n += a ? 1U : 0U;
         }
         return n > 0;
@@ -1348,7 +1400,7 @@ private:
             if (*p) {
                 strix::serve::GenerationStats st;
                 st.prompt_tokens = request((*p)->a).prompt.size();
-                if ((*p)->a.sampler) st.sampling = "sampling-v1";
+                strix::serve::record_job_sampling(st, (*p)->a.sampler ? &*(*p)->a.sampler : nullptr);
                 runtime().complete_native((*p)->a.state, std::move(st), error);
                 table_.release((*p)->slot);
                 p->reset();

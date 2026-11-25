@@ -807,9 +807,71 @@ void test_pf_variants() {
     CHECK(sb.find("STRIX_GLM_PF_OBAR=2 (baseline, item pf-obar-v10; resolved v2)\n") != std::string::npos);
 }
 
+// Sampled MTP on the server: one typed row (off / coupled / rejection) resolved by rd::resolve for the command line and
+// the server alike, printed in the effective receipt and admitted by tier there (no private switch). Written against
+// names that existed before the row was resolved here: the receipt line and the refusals below fail on that tree.
+void test_sampled_mtp_admission() {
+    const auto line_of = [](const rd::Effective& e) {
+        const auto s = rd::print(e);
+        const auto at = s.find("effective serve-sampled-mtp=");
+        return at == std::string::npos ? std::string() : s.substr(at, s.find('\n', at) - at);
+    };
+    const auto args = cat(kDeploy, kDecodeWork);
+    const auto refused = [&](const std::vector<std::string>& a, std::map<std::string, std::string> env, const char* needle) {
+        try { (void)resolve(a, env); } catch (const std::invalid_argument& x) { return std::string(x.what()).find(needle) != std::string::npos; }
+        return false;
+    };
+    // default: off, builtin, in the receipt of both entry points; the rank command line names it inapplicable
+    const auto def = resolve(args, {});
+    CHECK(def.sampled_mtp.route == rd::SampledMtp::off && def.sampled_mtp.source == "builtin" && !def.product);
+    CHECK(line_of(def).rfind("effective serve-sampled-mtp=off (builtin, row serve_sampled_mtp, identity none;", 0) == 0);
+    CHECK(line_of(def).find("inapplicable there") != std::string::npos);
+    CHECK(resolve(args, {{"STRIX_GLM_SERVE_SAMPLED_MTP", "0"}}).sampled_mtp.route == rd::SampledMtp::off);
+    // coupled: any profile, also without one (resolved from the same table for the default column)
+    for (const char* profile : {"", "exact", "quality", "fast", "turbo"}) {
+        auto a = args;
+        if (*profile) a = cat(a, {"--profile", profile});
+        const auto e = resolve(a, {{"STRIX_GLM_SERVE_SAMPLED_MTP", "coupled"}});
+        CHECK(e.sampled_mtp.route == rd::SampledMtp::coupled && e.sampled_mtp.source == "explicit");
+        CHECK(e.sampled_mtp.acceptance() == strix::SampledAcceptance::coupled);
+        CHECK(line_of(e).find("=coupled (explicit, row serve_sampled_mtp, identity glm-sampled-mtp-coupled-v1;") != std::string::npos);
+    }
+    // the previous 0|1 switch and unknown words are refused; the shared acceptance switch may not contradict the row
+    CHECK(refused(args, {{"STRIX_GLM_SERVE_SAMPLED_MTP", "1"}}, "must be 0, coupled or rejection"));
+    CHECK(refused(args, {{"STRIX_GLM_SERVE_SAMPLED_MTP", "yes"}}, "must be 0, coupled or rejection"));
+    CHECK(refused(args, {{"STRIX_GLM_SERVE_SAMPLED_MTP", "coupled"}, {"STRIX_MTP_SAMPLED_ACCEPT", "rejection"}}, "conflicts with"));
+    // rejection: refused without a profile and under exact / quality, admitted by fast / turbo as an engine override
+    CHECK(refused(args, {{"STRIX_GLM_SERVE_SAMPLED_MTP", "rejection"}}, "only --profile fast or turbo"));
+    CHECK(refused(cat(args, {"--profile", "quality"}), {{"STRIX_GLM_SERVE_SAMPLED_MTP", "rejection"}}, "only --profile fast or turbo"));
+    const auto fast = resolve(cat(args, {"--profile", "fast"}), {{"STRIX_GLM_SERVE_SAMPLED_MTP", "rejection"}});
+    CHECK(fast.sampled_mtp.route == rd::SampledMtp::rejection && fast.sampled_mtp.acceptance() == strix::SampledAcceptance::rejection);
+    CHECK(fast.product && fast.product->engine_overrides.size() == 1 &&
+          fast.product->engine_overrides[0] == "STRIX_GLM_SERVE_SAMPLED_MTP=rejection");
+    CHECK(line_of(fast).find("identity glm-sampled-mtp-rejection-v1;") != std::string::npos);
+    // the two rules and off are distinct resolution identities; unset keeps the legacy (pre-row) fingerprint
+    const auto fp = [&](const char* v) {
+        std::map<std::string, std::string> env;
+        if (v) env["STRIX_GLM_SERVE_SAMPLED_MTP"] = v;
+        return resolve(cat(args, {"--profile", "fast"}), env).product->fingerprint();
+    };
+    CHECK(fp("coupled") != fp("rejection") && fp("coupled") != fp(nullptr) && fp("rejection") != fp(nullptr));
+    const auto builtin = resolve(cat(args, {"--profile", "fast"}), {});
+    const auto* row = builtin.product->find("serve_sampled_mtp");
+    CHECK(row != nullptr && row->value == "0" && row->lever->omit_builtin_fingerprint);
+    auto legacy = *builtin.product;
+    std::erase_if(legacy.entries, [](const auto& entry) { return entry.lever->name == "serve_sampled_mtp"; });
+    CHECK(legacy.fingerprint() == builtin.product->fingerprint());
+    // the server's resolution path (rd::resolve_serve) resolves the same row
+    const rd::EnvGet coupled_env = [](const char* k) -> const char* {
+        return std::string(k) == "STRIX_GLM_SERVE_SAMPLED_MTP" ? "coupled" : nullptr;
+    };
+    CHECK(rd::resolve_serve(kDeploy, true, coupled_env).sampled_mtp.route == rd::SampledMtp::coupled);
+}
+
 }  // namespace
 
 int main() {
+    test_sampled_mtp_admission();
     test_pf_variants();
     test_mtp_default();
     test_plain_equals_receipt();

@@ -51,6 +51,14 @@ inline Tower make_tower(EncoderConfig cfg, std::uint64_t seed, unsigned projecto
         if (ln) b.norm1_b = t.fill(W, 1, 0.1F, rng);
         b.qkv_w = t.fill(3U * W, W, ws, rng);
         if (c.qkv_bias) b.qkv_b = t.fill(3U * W, 1, 0.1F, rng);
+        if (c.qk_norm) {
+            b.q_norm_w = t.fill(c.head_dim(), 1, 0.2F, rng, 1.0F);
+            b.k_norm_w = t.fill(c.head_dim(), 1, 0.2F, rng, 1.0F);
+            if (ln) {
+                b.q_norm_b = t.fill(c.head_dim(), 1, 0.1F, rng);
+                b.k_norm_b = t.fill(c.head_dim(), 1, 0.1F, rng);
+            }
+        }
         b.out_w = t.fill(W, W, ws, rng);
         if (c.out_bias) b.out_b = t.fill(W, 1, 0.1F, rng);
         b.norm2_w = t.fill(W, 1, 0.2F, rng, 1.0F);

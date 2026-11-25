@@ -85,6 +85,10 @@ public:
     virtual ResizeRule resize() const = 0;
     virtual ColorPolicy color_policy() const { return {}; }
     virtual PatchGrid patches(const Image&) const = 0;
+    // Rows of layout() for an image of this decoded size, from the geometry alone (no pixels): lets a caller refuse a
+    // request's row budget before decoding. 0: the adapter does not state it (the caller decodes and asks layout()).
+    // Throws std::invalid_argument for a size the adapter refuses.
+    virtual std::uint64_t rows_for_size(int /*width*/, int /*height*/) const { return 0; }
     virtual void bind(WeightSource&, EncoderWeights&) = 0;  // tensor-name mapping only
     virtual PositionInputs positions(const EncoderConfig& c, const EncoderWeights& w, const PatchGrid& g) const {
         return default_positions(c, w, g);

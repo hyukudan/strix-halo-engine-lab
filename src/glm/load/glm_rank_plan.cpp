@@ -128,17 +128,6 @@ std::string read_text(const std::string& path) {
     ss << f.rdbuf();
     return ss.str();
 }
-std::uint64_t dtype_bytes(const std::string& t) {
-    if (t == "F32" || t == "I32" || t == "U32") return 4;
-    if (t == "F16" || t == "BF16" || t == "I16" || t == "U16") return 2;
-    if (t == "U8" || t == "I8" || t == "F8_E4M3" || t == "BOOL") return 1;
-    if (t == "F64" || t == "I64") return 8;
-    throw std::runtime_error("unknown dtype " + t);
-}
-std::uint64_t u64(double d) {
-    if (d < 0 || d != static_cast<double>(static_cast<std::uint64_t>(d))) throw std::runtime_error("json: not a byte count");
-    return static_cast<std::uint64_t>(d);
-}
 
 }  // namespace
 

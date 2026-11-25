@@ -1,6 +1,7 @@
 // Host tests of the shared vision encoder: FP32 reference tower on synthetic towers (hand-computed rows and graph
 // invariants), default positions, the device plan, the embed cache and the row splice. No GPU, no checkpoint.
 #include "strix/vision/embed_cache.hpp"
+#include "strix/vision/host_math.hpp"
 
 #include "../src/attn_core/two_term_model.hpp"
 #include "../src/vision/encoder_layout.hpp"
@@ -140,6 +141,39 @@ std::vector<float> hand_single_row(const Tower& t, const PatchGrid& g, const Pos
     std::vector<float> out(x.size());
     for (std::size_t i = 0; i < x.size(); ++i) out[i] = static_cast<float>(x[i]);
     return out;
+}
+
+// The shared host row norm and clamped SwiGLU (vision/host_math.hpp), against the formulas written out in double.
+void test_host_math() {
+    const std::vector<float> x{1.0F, 2.0F, 3.0F, 4.0F, -2.0F, 0.5F, 8.0F, 1.0F};
+    const std::vector<float> w{1.0F, 0.5F, -2.0F, 3.0F}, b{0.25F, 0.0F, -1.0F, 2.0F};
+    const float eps = 1e-5F;
+    for (const bool center : {true, false}) {
+        for (const bool bias : {true, false}) {
+            std::vector<float> y(x.size()), inplace = x;
+            strix::vision::norm_rows(x.data(), 2, 4, w.data(), bias ? b.data() : nullptr, eps, center, y.data());
+            strix::vision::norm_rows(inplace.data(), 2, 4, w.data(), bias ? b.data() : nullptr, eps, center, inplace.data());
+            CHECK(y == inplace);
+            for (std::size_t r = 0; r < 2; ++r) {
+                double mean = 0.0, sq = 0.0;
+                if (center) {
+                    for (std::size_t i = 0; i < 4; ++i) mean += static_cast<double>(x[r * 4 + i]);
+                    mean /= 4.0;
+                }
+                for (std::size_t i = 0; i < 4; ++i) sq += (static_cast<double>(x[r * 4 + i]) - mean) * (static_cast<double>(x[r * 4 + i]) - mean);
+                const double inv = 1.0 / std::sqrt(sq / 4.0 + static_cast<double>(eps));
+                for (std::size_t i = 0; i < 4; ++i)
+                    CHECK(y[r * 4 + i] == static_cast<float>((static_cast<double>(x[r * 4 + i]) - mean) * inv * static_cast<double>(w[i]) +
+                                                             (bias ? static_cast<double>(b[i]) : 0.0)));
+            }
+        }
+    }
+    // Clamped gate: the gate is capped above only, the up value on both sides; limit 0 is unclamped.
+    const auto silu_mul = [](double g, double u) { return static_cast<float>(g / (1.0 + std::exp(-g)) * u); };
+    CHECK(strix::vision::clamped_swiglu(10.0F, -9.0F, 7.0) == silu_mul(7.0, -7.0));
+    CHECK(strix::vision::clamped_swiglu(-10.0F, 9.0F, 7.0) == silu_mul(-10.0, 7.0));
+    CHECK(strix::vision::clamped_swiglu(10.0F, -9.0F, 0.0) == silu_mul(10.0, -9.0));
+    CHECK(strix::vision::clamped_swiglu(0.5F, 0.25F, 7.0) == silu_mul(0.5, 0.25));
 }
 
 void test_bf16() {
@@ -287,6 +321,87 @@ void test_embed_norm() {
         }
         CHECK(threw);
     }
+}
+
+// qk_norm: one block without rotary positions against a direct FP64 computation (each head's q and k normed over
+// head_dim before the scores), for both norm kinds. The device plans refuse the option.
+void test_qk_norm() {
+    for (const auto norm : {EncoderConfig::Norm::layernorm, EncoderConfig::Norm::rmsnorm}) {
+        EncoderConfig c = base_config();
+        c.layers = 1;
+        c.norm = norm;
+        c.qk_norm = true;
+        Tower t = make_tower(c, 91);
+        const PatchGrid g = make_grid(t.cfg, 2, 3, 92);
+        const PositionInputs p = default_positions(t.cfg, t.w, g);
+        const EncoderOutput got = reference_encode(t.cfg, t.w, g, p);
+
+        const std::size_t N = g.rows, W = c.width, H = c.heads, D = c.head_dim(), M = c.mlp_width;
+        const auto& b = t.w.blocks[0];
+        std::vector<std::vector<double>> x(N), q(N), k(N), v(N);
+        for (std::size_t r = 0; r < N; ++r) {
+            const std::vector<double> patch(g.data.begin() + static_cast<std::ptrdiff_t>(r * g.patch_dim),
+                                            g.data.begin() + static_cast<std::ptrdiff_t>((r + 1U) * g.patch_dim));
+            x[r] = matvec(t.w.patch_w, t.w.patch_b, patch, 0, W);
+            for (std::size_t i = 0; i < W; ++i) x[r][i] += static_cast<double>(p.addend[r * W + i]);
+            const auto n = norm1(c, b.norm1_w, b.norm1_b, x[r]);
+            q[r] = matvec(b.qkv_w, b.qkv_b, n, 0, W);
+            k[r] = matvec(b.qkv_w, b.qkv_b, n, W, W);
+            v[r] = matvec(b.qkv_w, b.qkv_b, n, 2U * W, W);
+            for (std::size_t h = 0; h < H; ++h) {
+                const auto first = static_cast<std::ptrdiff_t>(h * D), last = static_cast<std::ptrdiff_t>((h + 1U) * D);
+                const auto qn = norm1(c, b.q_norm_w, b.q_norm_b, std::vector<double>(q[r].begin() + first, q[r].begin() + last));
+                const auto kn = norm1(c, b.k_norm_w, b.k_norm_b, std::vector<double>(k[r].begin() + first, k[r].begin() + last));
+                std::copy(qn.begin(), qn.end(), q[r].begin() + first);
+                std::copy(kn.begin(), kn.end(), k[r].begin() + first);
+            }
+        }
+        std::vector<float> want(N * W);
+        for (std::size_t r = 0; r < N; ++r) {
+            std::vector<double> att(W, 0.0);
+            for (std::size_t h = 0; h < H; ++h) {
+                std::vector<double> e(N);
+                double sum = 0.0;
+                for (std::size_t j = 0; j < N; ++j) {
+                    double dot = 0.0;
+                    for (std::size_t d = 0; d < D; ++d) dot += q[r][h * D + d] * k[j][h * D + d];
+                    e[j] = std::exp(dot / std::sqrt(static_cast<double>(D)));
+                    sum += e[j];
+                }
+                for (std::size_t j = 0; j < N; ++j)
+                    for (std::size_t d = 0; d < D; ++d) att[h * D + d] += e[j] / sum * v[j][h * D + d];
+            }
+            std::vector<double> y = x[r];
+            const auto o = matvec(b.out_w, b.out_b, att, 0, W);
+            for (std::size_t i = 0; i < W; ++i) y[i] += o[i];
+            const auto m = matvec(b.mlp1_w, b.mlp1_b, norm1(c, b.norm2_w, b.norm2_b, y), 0, M);
+            std::vector<double> a(M);
+            for (std::size_t j = 0; j < M; ++j) a[j] = 0.5 * m[j] * (1.0 + std::erf(m[j] / std::sqrt(2.0)));
+            const auto o2 = matvec(b.mlp2_w, b.mlp2_b, a, 0, W);
+            for (std::size_t i = 0; i < W; ++i) want[r * W + i] = static_cast<float>(y[i] + o2[i]);
+        }
+        CHECK(max_diff(got.hidden, want) < 2e-5);
+
+        // The norm takes part: the same tower without it gives other rows.
+        EncoderConfig plain = c;
+        plain.qk_norm = false;
+        CHECK(max_diff(got.hidden, reference_encode(plain, t.w, g, p).hidden) > 1e-3);
+
+        EncoderWeights missing = t.w;
+        missing.blocks[0].k_norm_w = Tensor{};
+        CHECK(throws([&] { validate(t.cfg, missing); }));
+        EncoderWeights narrow = t.w;
+        narrow.blocks[0].q_norm_w.rows = D - 1U;
+        CHECK(throws([&] { validate(t.cfg, narrow); }));
+    }
+    EncoderConfig c = rms_config();
+    c.width = 128;
+    c.heads = 2;  // head dimension 64: a shape the device plan takes
+    std::string why;
+    CHECK(hip_supported(c, &why));
+    c.qk_norm = true;
+    CHECK(!hip_supported(c, &why) && why.find("q/k norm") != std::string::npos);
+    CHECK(throws([&] { (void)plan(c, 16, 1); }));
 }
 
 void test_single_row() {
@@ -1059,11 +1174,13 @@ int main(int argc, char** argv) {
             CHECK(std::strcmp(Encoder::effective_arithmetic(2U), device ? "vision-f16-attn2-v1-project-device-f64-v1" : "vision-f16-attn2-v1") == 0);
             return failures ? 1 : 0;
         }
+        test_host_math();
         test_bf16();
         test_validate();
         test_positions();
         test_single_row();
         test_embed_norm();
+        test_qk_norm();
         test_mean_attention();
         test_permutation();
         test_rope_translation();

@@ -188,7 +188,8 @@ bool GreedyDecoder::cycle() {
         rec.extend += elapsed;
         if (control.on_sample) control.on_sample({2, 1, 0, elapsed});
         if (m.flagged) { disabled = true; break; }
-        drafts.push_back(m.id.at(0));
+        const auto index = static_cast<unsigned>(drafts.size());
+        drafts.push_back(policy.pick_draft ? policy.pick_draft(0, p + 1 + index, index) : m.id.at(0));
         confidences.push_back(m.confidence);
         hp = e.mtp_hidden();
         add_estimate(m.confidence);
@@ -198,7 +199,7 @@ bool GreedyDecoder::cycle() {
     rows.insert(rows.end(), drafts.begin(), drafts.end());
     auto cv = control.next(1);
     const auto tv = Clock::now();
-    const auto v = e.verify(slot, rows, p, cv);
+    auto v = e.verify(slot, rows, p, cv);
     rec.verify = ms(tv, Clock::now());
     control.consume(cv);
     control.observe(rec.k + 1, rec.verify);
@@ -207,7 +208,16 @@ bool GreedyDecoder::cycle() {
     for (unsigned j = 0; j <= rec.k; ++j)
         if (v.flag.at(j) != 0 && first_flag == kNoFlag) first_flag = j;
     if (v.replay_flag) throw std::runtime_error("non-finite committed KDA row (replay)");
-    const auto acc = accept_greedy(drafts, v.id, first_flag, Terminal{kNoFlag, remaining});
+    Accepted acc;
+    const unsigned rows_needed = std::min({rec.k + 1U, first_flag, remaining});
+    if (policy.pick_targets && rows_needed > 0) {  // sampled: the lead's sampler decides the rows plain decoding processes
+        // a decided stop id is terminal: no row after it is committed or caught up, and a flagged row after it is
+        // never required (plain sampling stops there too)
+        const auto picked = policy.pick_targets(drafts, rows_needed, p + 1, std::span<std::uint32_t>(v.id));
+        acc = accept_decided(drafts, v.id, picked.accepted, first_flag, Terminal{picked.stop, remaining});
+    } else {
+        acc = accept_greedy(drafts, v.id, first_flag, Terminal{kNoFlag, remaining});
+    }
     if (acc.abort) throw std::runtime_error("non-finite required row: request aborted (as plain greedy)");
     for (unsigned d = 1; d <= rec.k; ++d) {
         auto& depth = out.depths[d];
@@ -272,7 +282,8 @@ bool GreedyDecoder::cycle() {
         control.observe(10, rec.catchup);
         if (control.on_sample) control.on_sample({3, acc.m + 1, 0, rec.catchup});
         disabled = disabled || m.flagged;
-        set_seed(m.id.at(acc.m), m.confidence);
+        // the next cycle's first draft proposes the token after the new frontier p + acc.rows
+        set_seed(policy.pick_draft && !disabled ? policy.pick_draft(acc.m, p + acc.rows + 1, 0) : m.id.at(acc.m), m.confidence);
         hp = e.mtp_hidden() + static_cast<std::size_t>(acc.m) * 4096;
     }
     p += acc.rows;

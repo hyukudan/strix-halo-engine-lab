@@ -712,6 +712,14 @@ void test_refusals() {
     }
     CHECK(throws([&] { vision::GgufWeights w(good_path, limits, under); }, "host budget"));
     CHECK(throws([&] { vision::GgufWeights w(good_path, limits, other); }, "admitted file"));
+    {  // the caller's schema hook sees the opened file's own tensor table before its bytes are read
+        vision::HostBudget hooked = exact;
+        std::size_t seen = 0;
+        hooked.admit = [&](const gguf::FileInfo& info) { seen = info.tensors.size(); };
+        CHECK(vision::GgufWeights(good_path, limits, hooked).bytes().size() == good.size() && seen == 26);
+        hooked.admit = [](const gguf::FileInfo&) { throw std::invalid_argument("schema refused"); };
+        CHECK(throws([&] { vision::GgufWeights w(good_path, limits, hooked); }, "schema refused"));
+    }
     vision::HostBudget tiny;
     tiny.max_bytes = 1024;
     CHECK(throws([&] { vision::GgufWeights w(junk_path, limits, tiny); }, "host budget"));  // refused unread, not parsed

@@ -538,6 +538,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_GLM_MOE` | glm | fast | [glm-moe-fast](optimizations.md#glm-moe-fast) |
 | `STRIX_GLM_POST` | glm | fast | [glm-post-exchange-fast](optimizations.md#glm-post-exchange-fast) |
 | `STRIX_GLM_SERVE_G2` | glm | on (with MTP) | [glm-serve-g2](optimizations.md#glm-serve-g2) |
+| `STRIX_GLM_SERVE_SAMPLED_MTP` | glm | off | [glm-serve-sampled-mtp](optimizations.md#glm-serve-sampled-mtp) |
 | `STRIX_GLM_SERVE_PREFILL_UNITS` | glm | 1 | a long prompt admitted under load is cut into layer units, not token chunks; `0` = token chunks; [GLM page](models/glm-5.3/README.md) |
 | `STRIX_GLM_STEP_FLAG` | glm | 1 (engine default) | [glm-step-flag](optimizations.md#glm-step-flag) |
 | `STRIX_GLM_TIERB` | glm | fused | [glm-attn-tierb-fused](optimizations.md#glm-attn-tierb-fused) |

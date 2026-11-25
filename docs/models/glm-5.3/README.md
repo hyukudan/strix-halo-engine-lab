@@ -93,6 +93,31 @@ same `MODEL_DIR/tokenizer.json` the server loads) on the command line. `--identi
 
 Prefill MLA switches: `STRIX_GLM_PF_SCORES=6` and `STRIX_GLM_PF_OBAR=7` (o-bar v7; `=5` v5) restore earlier stages; default o-bar v10 stages 2 k per batch with the same chains (pair logits bitwise equal to v7 at 8K and 32K; o-bar time 7-9 % lower, TTFT 8K -0.7 %, 32K -0.3 %). `STRIX_GLM_PF_MLA_GEMM=2` restores GEMM v2 (`=1` legacy); default v3 keeps the ascending-k FMA chains (pair logits and state bitwise equal to v2 at 8K and 32K; MLA GEMM time 41-43 % lower, TTFT 8K -1.9 %, 32K -2.3 %).
 
+<a id="glm-image"></a>
+
+## Image input: the pair (draft)
+
+A prompt can carry images through the model's projector file (a separate GGUF, `clip.projector_type = glm5v`). The
+tower runs on the CPU ahead of the run and the ranks splice its rows into the prompt prefill:
+
+```sh
+./build/strix-glm5-vision encode MMPROJ.gguf IMAGE.png IMAGE.rows
+./build/strix-glm5-vision expand PROMPT.u32 PROMPT.image.u32 IMAGE.rows
+./build/strix-glm5-rank MODEL_DIR --world 2 --rank R --transport usb4-auto \
+    --prompt PROMPT.image.u32 --embed-rows IMAGE.rows --decode 64
+```
+
+The server takes `image_url` parts of chat requests with `--vision MMPROJ.gguf` on rank 0; it encodes each new
+image on its CPU and sends the rows to rank 1 once.
+
+Draft: the host half is tested on synthetic projector files and a fake engine. On the pair (2026-11-24, gfx1151,
+one USB4 cable) the device half compiles and runs with the real projector file (`mmproj-F16.gguf`, `glm5v`): through
+`strix-glm5-serve --vision`, two synthetic images were answered correctly (red | blue halves; a filled circle beside
+an outlined square), greedy and sampled, 5-8 s per request. Not run yet: `strix-glm5-rank --embed-rows`, images
+large enough to span prefill chunks or units, and text-prompt identity against the previous build. Commands, status and limits:
+[image input](../../engine/vision.md#glm-53-flash); the adapter and its gate:
+[vision adapters](../../engine/vision-adapters.md#glm-53-flash).
+
 <a id="glm-serve"></a>
 
 ## Serve: the pair
@@ -109,7 +134,12 @@ and read the tokenizer from `MODEL_DIR/tokenizer.json`:
 Defaults: 8 request slots (`--slots`, at most 8), 8192 positions per slot (`--capacity`), exact MTP self-speculation
 with one request in flight, batched MTP verify with more (`STRIX_GLM_SERVE_G2=0` = batched plain steps), decode-first
 chunked prefill of 512 tokens while others decode (`--prefill-chunk 0` = whole prompts). The chunk is resolved by the same route policy as the CLI: both ranks print `effective serve-prefill-chunk=...` with the dense core its calls take, and the reason whenever a chunk declines the large-call core. After a prompt's first chunk the chunks are grouped by the decode cohort (up to 4 x 512 tokens while at most two requests decode, admitted by a 3 s stall estimate from the latest call, not a latency ceiling, with base and tail dense routes preserved and decode debt retained across prompt completion; `STRIX_SERVE_PREFILL_INTERLEAVE=0` = one 512-token chunk per round; rank 0 prints `effective serve-prefill-interleave=...`): an 8,192-token prompt admitted while one request decodes reaches its first token in 15.0 to 15.1 s against 18.5 to 18.7 s (three runs each, fast profile, same 16 tokens as the prompt alone), and the decoding request receives 2.3 to 2.5 tokens/s during that prefill against 2.0, with a longest gap of 1.8 s against 1.2 to 1.3 s. `--serial` admits one
-request at a time; `--api-key-file F` requires a bearer key. `--selftest N` on rank 0 (no HTTP) runs N built-in
+request at a time; `--api-key-file F` requires a bearer key.
+Sampled requests (`temperature > 0`) decode by plain steps unless `STRIX_GLM_SERVE_SAMPLED_MTP` names a rule on both
+ranks (opt-in, pending its pair gates on this build, see [glm-serve-sampled-mtp](../../optimizations.md#glm-serve-sampled-mtp);
+values `0` = off, `coupled`, `rejection`; resolved by the same profile resolution as every lever and printed as
+`effective serve-sampled-mtp=...`). With `coupled` one sampled request in flight decodes through MTP, and rank 0 decides every verify row with the request's sampler over the
+row's full vocabulary (rank 1 sends its half), accepting a draft only when it equals that sampled token, so a seed gives the tokens of plain sampling. From temperature 0.7 the drafts are drawn from the drafter's rows the same way. `rejection` selects rejection sampling (exact in distribution, not the tokens of plain sampling; `--profile fast` or `turbo` only). Draft counts are in `strix.sampling_receipt`; the response's `strix.mtp_*` fields read 0 on this server, greedy or sampled. `--selftest N` on rank 0 (no HTTP) runs N built-in
 prompts together and each alone and reports EXACT/FAIL with tok/s per concurrency level.
 
 `--prefix-cache-gib G` sets the host-RAM prompt snapshot LRU to G GiB per rank (default 4;

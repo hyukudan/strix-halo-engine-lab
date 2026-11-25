@@ -98,6 +98,32 @@ las [familias de modelos](../model-families.md) y la [cualificación/rendimiento
 
 Interruptores MLA del prefill: `STRIX_GLM_PF_SCORES=6` y `STRIX_GLM_PF_OBAR=7` (o-bar v7; `=5` v5) restauran etapas anteriores; la o-bar v10, predeterminada, prepara 2 k por lote con las mismas cadenas (logits del par idénticos bit a bit a la v7 con 8K y 32K; tiempo de o-bar un 7-9 % menor, TTFT con 8K −0.7 % y con 32K −0.3 %). `STRIX_GLM_PF_MLA_GEMM=2` restaura la GEMM v2 (`=1`, la heredada); la v3, predeterminada, conserva las cadenas FMA con k ascendente (logits y estado del par idénticos bit a bit a la v2 con 8K y 32K; tiempo de la GEMM MLA un 41-43 % menor, TTFT con 8K −1.9 % y con 32K −2.3 %).
 
+<a id="glm-image"></a>
+
+## Entrada de imágenes: el par (borrador)
+
+Un prompt puede llevar imágenes mediante el fichero de proyector del modelo (un GGUF aparte,
+`clip.projector_type = glm5v`). La torre se ejecuta en CPU antes de la ejecución y los ranks insertan sus filas en
+el prefill del prompt:
+
+```sh
+./build/strix-glm5-vision encode MMPROJ.gguf IMAGE.png IMAGE.rows
+./build/strix-glm5-vision expand PROMPT.u32 PROMPT.image.u32 IMAGE.rows
+./build/strix-glm5-rank MODEL_DIR --world 2 --rank R --transport usb4-auto \
+    --prompt PROMPT.image.u32 --embed-rows IMAGE.rows --decode 64
+```
+
+El servidor acepta partes `image_url` de las peticiones de chat con `--vision MMPROJ.gguf` en el rank 0; codifica cada
+imagen nueva en su CPU y envía las filas al rank 1 una sola vez.
+
+Borrador: la mitad de host está probada con ficheros de proyector sintéticos y un motor simulado. En el par
+(2026-11-24, gfx1151, un cable USB4) la mitad de dispositivo compila y se ejecuta con el fichero de proyector real
+(`mmproj-F16.gguf`, `glm5v`): con `strix-glm5-serve --vision` se respondieron bien dos imágenes sintéticas (mitades
+roja | azul; un círculo relleno junto a un cuadrado solo con contorno), voraz y muestreado, 5-8 s por petición. Aún sin
+ejecutar: `strix-glm5-rank --embed-rows`, imágenes que ocupen varios trozos o unidades de prefill, y la identidad de un
+prompt de texto frente a la build anterior.
+Órdenes, estado y límites: [entrada de imágenes](../../engine/vision.es.md#glm-53-flash).
+
 <a id="glm-serve"></a>
 
 ## Servicio: el par
@@ -115,7 +141,15 @@ Valores predeterminados: 8 slots de petición (`--slots`, 8 como máximo), 8192 
 autoespeculación MTP exacta con una sola petición en curso, verificación MTP por lotes con varias
 (`STRIX_GLM_SERVE_G2=0` = pasos simples por lotes) y prefill por chunks de 512 tokens con prioridad al decode mientras
 otras peticiones decodifican (`--prefill-chunk 0` = prompts enteros). Tras el primer chunk de un prompt, los chunks se agrupan según la cohorte en decode (hasta 4 x 512 tokens con dos peticiones en decode como máximo, con una estimación de admisión de 3 s basada en la última llamada, no un límite de latencia, conservando las rutas densas de los chunks base y las colas y las rondas pendientes tras completar el prompt; `STRIX_SERVE_PREFILL_INTERLEAVE=0` = un chunk de 512 tokens por ronda; el rango 0 imprime `effective serve-prefill-interleave=...`): un prompt de 8,192 tokens admitido mientras una petición decodifica llega a su primer token en 15.0 a 15.1 s frente a 18.5 a 18.7 s (tres ejecuciones por brazo, perfil fast, los mismos 16 tokens que el prompt solo), y la petición en decode recibe 2.3 a 2.5 tokens/s durante ese prefill frente a 2.0, con un hueco máximo de 1.8 s frente a 1.2 a 1.3 s. El chunk lo resuelve la misma regla de rutas que la CLI: ambos rangos imprimen `effective serve-prefill-chunk=...` con el núcleo denso que toman sus llamadas y el motivo cuando un chunk no alcanza el núcleo de llamadas grandes. `--serial` admite una petición cada vez;
-`--api-key-file F` exige una clave bearer. `--selftest N` en el rank 0 (sin HTTP) ejecuta N prompts integrados juntos
+`--api-key-file F` exige una clave bearer.
+Las peticiones muestreadas (`temperature > 0`) decodifican con pasos simples salvo que `STRIX_GLM_SERVE_SAMPLED_MTP`
+nombre una regla en los dos ranks (opcional, pendiente de sus gates del par en esta versión, ver
+[glm-serve-sampled-mtp](../../optimizations.md#glm-serve-sampled-mtp); valores `0` = apagado, `coupled`, `rejection`;
+lo resuelve la misma resolución de perfil que cualquier palanca y se imprime como `effective serve-sampled-mtp=...`).
+Con `coupled` una petición muestreada en vuelo
+decodifica por MTP, y el rank 0 decide cada fila de verificación con el muestreador de la petición sobre el vocabulario
+completo de la fila (el rank 1 envía su mitad), aceptando un borrador solo cuando coincide con ese token muestreado, de modo que una semilla da los tokens del muestreo simple. Desde temperatura 0.7 los borradores se extraen de las filas del borrador de la misma forma. `rejection` selecciona muestreo por rechazo (exacto en distribución, no los tokens del muestreo simple; solo con `--profile fast` o `turbo`). Los recuentos de borradores están en `strix.sampling_receipt`; los campos `strix.mtp_*` de la respuesta valen 0 en este servidor, voraz o muestreado.
+`--selftest N` en el rank 0 (sin HTTP) ejecuta N prompts integrados juntos
 y cada uno por separado e informa EXACT/FAIL con tok/s por nivel de concurrencia.
 
 `--prefix-cache-gib G` fija la LRU de snapshots de prompts en RAM en G GiB por rango

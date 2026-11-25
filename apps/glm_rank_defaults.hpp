@@ -19,6 +19,7 @@
 #include "strix/session/kv_precision.hpp"
 #include "strix/glm_pair_profile_table.hpp"
 #include "strix/session/speculation_default.hpp"
+#include "strix/token_sampling.hpp"
 #include "xport/split_frame.hpp"
 
 #include <cstdint>
@@ -241,6 +242,33 @@ struct Value {
     std::string source;  // default | explicit | baseline | auto-8192 | auto-4096-memory
 };
 
+// Sampled requests through MTP on the server: row serve_sampled_mtp of the pair profile table, resolved by the shared
+// profile resolution (resolve below, the one resolver of the command line and the server). Off unless
+// STRIX_GLM_SERVE_SAMPLED_MTP names a rule; no profile column selects it. coupled: a draft is accepted only when it
+// equals the row's plainly sampled token, so a seed gives the tokens of plain sampling (EXACT class, explicit opt-in
+// pending its pair gates). rejection: speculative rejection sampling, exact in distribution but per-seed tokens differ
+// from plain sampling, so only --profile fast / turbo admit it (pending its acceptance/state oracle and quality gate).
+// The rank command line decodes greedy: there the row is resolved and admitted the same way and reported inapplicable.
+enum class SampledMtp { off, coupled, rejection };
+struct SampledMtpPolicy {
+    SampledMtp route = SampledMtp::off;
+    std::string source = "builtin";  // builtin | explicit
+    [[nodiscard]] bool on() const noexcept { return route != SampledMtp::off; }
+    [[nodiscard]] const char* name() const noexcept {
+        return route == SampledMtp::coupled ? "coupled" : route == SampledMtp::rejection ? "rejection" : "off";
+    }
+    // Versioned identity of the decode route (printed in the effective receipt, hashed into the pair's hello).
+    [[nodiscard]] const char* identity() const noexcept {
+        return route == SampledMtp::coupled     ? kSampledMtpCoupledIdentity
+               : route == SampledMtp::rejection ? kSampledMtpRejectionIdentity
+                                                : "none";
+    }
+    // Acceptance rule of the sampler options (off: the shared default, as before this row existed).
+    [[nodiscard]] strix::SampledAcceptance acceptance() const noexcept {
+        return route == SampledMtp::coupled ? strix::SampledAcceptance::coupled : strix::SampledAcceptance::rejection;
+    }
+};
+
 struct Effective {
     std::optional<strix::profile::Resolution> product;
     bool baseline = false;
@@ -257,11 +285,48 @@ struct Effective {
     unsigned kmax = 3;
     bool adaptive = true;
     bool spec_arbiter = false;  // STRIX_SPEC_ARBITER (env_items row; MTP decode only)
+    SampledMtpPolicy sampled_mtp;  // row serve_sampled_mtp (resolve_sampled_mtp)
     std::string prefill;  // resolved: gemv | ref | wmma
     std::string xch;
     std::map<std::string, Value> env;  // env name -> effective value
     std::shared_ptr<const strix::weight::FamilyPlans> weight_plans{};
 };
+
+// The row's value comes from the shared profile resolution of the pair table: the request's own resolution when it has
+// one (a profile, --allow-pending or a weight request), else the same table resolved for the default column (which
+// exports nothing: only an explicit STRIX_GLM_SERVE_SAMPLED_MTP sets the row). Values: unset or 0 (off), coupled,
+// rejection; anything else is refused. A set STRIX_MTP_SAMPLED_ACCEPT (shared sampler switch) must name the same rule.
+inline void resolve_sampled_mtp(Effective& e, const EnvGet& env) {
+    std::optional<strix::profile::Resolution> own;
+    if (!e.product) {
+        strix::profile::Inputs inputs;
+        inputs.env = env;
+        own = strix::profile::resolve(product_profile_engine, inputs);
+    }
+    const auto* row = (e.product ? *e.product : *own).find("serve_sampled_mtp");
+    if (row == nullptr) throw std::logic_error("pair profile table: row serve_sampled_mtp missing");
+    const bool set = row->status == strix::profile::Status::explicit_env || row->status == strix::profile::Status::off;
+    const std::string& v = row->value;
+    SampledMtpPolicy p;
+    p.source = set ? "explicit" : "builtin";
+    if (v == "0" || (!set && v == row->lever->builtin)) p.route = SampledMtp::off;
+    else if (v == "coupled") p.route = SampledMtp::coupled;
+    else if (v == "rejection") p.route = SampledMtp::rejection;
+    else throw std::invalid_argument("STRIX_GLM_SERVE_SAMPLED_MTP must be 0, coupled or rejection (got '" + v + "')");
+    if (p.on()) {
+        if (const char* a = env("STRIX_MTP_SAMPLED_ACCEPT"); a != nullptr && *a != '\0' && std::string(a) != p.name())
+            throw std::invalid_argument(std::string("STRIX_MTP_SAMPLED_ACCEPT=") + a + " conflicts with STRIX_GLM_SERVE_SAMPLED_MTP=" +
+                                        p.name() + ": the GLM row names the acceptance rule (unset the shared switch)");
+    }
+    if (p.route == SampledMtp::rejection) {
+        const auto profile = e.product ? e.product->profile : strix::profile::Name::standard;
+        if (profile != strix::profile::Name::fast && profile != strix::profile::Name::turbo)
+            throw std::invalid_argument("STRIX_GLM_SERVE_SAMPLED_MTP=rejection changes per-seed tokens: only --profile fast or "
+                                        "turbo admits it (coupled keeps plain sampling's tokens)");
+        e.product->engine_overrides.push_back("STRIX_GLM_SERVE_SAMPLED_MTP=rejection");
+    }
+    e.sampled_mtp = p;
+}
 
 inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& facts = {}) {
     Effective e;
@@ -419,6 +484,7 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
     if (arbiter != "0" && arbiter != "1") throw std::invalid_argument("STRIX_SPEC_ARBITER must be 0 or 1");
     e.spec_arbiter = arbiter == "1";
     e.world = r.world;
+    resolve_sampled_mtp(e, env);
     return e;
 }
 
@@ -507,6 +573,9 @@ inline std::string print(const Effective& e) {
     s += "effective prefill-units=" + e.prefill_units.value + " (" + e.prefill_units.source +
          "; serving-only: a long prompt beside decoding requests pauses at layer boundaries of its max_rows pieces, "
          "8 decode rows reserved above max_rows; the CLI has no decode cohort and prefills whole prompts)\n";
+    s += std::string("effective serve-sampled-mtp=") + e.sampled_mtp.name() + " (" + e.sampled_mtp.source +
+         ", row serve_sampled_mtp, identity " + e.sampled_mtp.identity() +
+         "; serving-only: sampled requests through MTP; the rank command line decodes greedy, inapplicable there)\n";
     line("decode-xch", e.decode_xch);
     line("split-frame", e.split_frame);
     line("max-rows", e.max_rows);

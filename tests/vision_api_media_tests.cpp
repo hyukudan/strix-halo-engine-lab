@@ -38,10 +38,11 @@ public:
         ++decoded;
         return vision_toy::make_grid(tower_.cfg, 2, 2, static_cast<std::uint64_t>(image.width) * 131U + static_cast<std::uint64_t>(image.height));
     }
+    std::uint64_t rows_for_size(int, int) const override { ++sized; return 4; }  // the fixed 2 x 2 grid
     void bind(WeightSource& s, EncoderWeights& w) override { inner_.bind(s, w); }
     void project(EncoderOutput& h, const PatchGrid& g, DenseOps& d, ProjectedRows& out) override { inner_.project(h, g, d, out); }
     SpanLayout layout(const PatchGrid& g) const override { return inner_.layout(g); }
-    mutable unsigned decoded = 0;
+    mutable unsigned decoded = 0, sized = 0;
     unsigned projections() const { return inner_.projections; }
 
 private:
@@ -180,6 +181,8 @@ int main(int argc, char** argv) {
     // over the row budget: 400 before the encoder runs
     CHECK(status_of([&] { (void)bridge.encode(item_of(png, 3), 3); }) == 400);
     CHECK(adapter.projections() == 2U);
+    // the budget is judged from the header geometry: no decode, no patch grid (patches() did not run again)
+    CHECK(adapter.decoded == 2U && adapter.sized >= 1U);
     // WebP stays refused with a client error naming the formats that work
     const std::string webp = std::string("RIFF\x24\x00\x00\x00WEBPVP8 ", 16) + std::string(24, '\0');
     int webp_status = 0;

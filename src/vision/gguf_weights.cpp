@@ -31,7 +31,8 @@ std::vector<std::byte> read_all(const std::filesystem::path& path, const gguf::L
         throw std::invalid_argument("vision weights: " + name + " is " + std::to_string(size) + " bytes, over the host budget of " +
                                     std::to_string(budget.max_bytes));
     in.seekg(0, std::ios::beg);
-    (void)gguf::read(in, size, limits);  // throws on a malformed header; the tensor table is re-read from the bytes
+    const auto header = gguf::read(in, size, limits);  // throws on a malformed header; the tensor table is re-read from the bytes
+    if (budget.admit) budget.admit(header);            // the caller's schema, judged before any allocation
     in.clear();
     in.seekg(0, std::ios::beg);
     if (!in) throw std::runtime_error("vision weights: cannot rewind " + name);

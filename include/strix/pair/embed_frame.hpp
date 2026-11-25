@@ -8,7 +8,7 @@
 // (session::remap_embed_ids), so both ranks resolve the same rows for the same positions.
 //
 // Sent once per new digest: both ends keep an EmbedFrameLedger of what the peer holds, updated in manifest order by
-// the same rule (LRU of a fixed number of spans), so the sender knows without a round trip which payloads to omit.
+// the same rule (LRU bounded by a span count and a payload byte budget), so the sender knows without a round trip which payloads to omit.
 // A frame naming a digest the receiver no longer holds is a protocol error (the ledgers diverged).
 // Encoding, receiving and transport failures are terminal for the pair's frame session: updates may already
 // have touched either ledger. Do not retry with those objects; restart both ends with fresh ledgers/receivers.
@@ -45,6 +45,9 @@ inline constexpr std::uint32_t kEmbedFrameMagic = 0x46424D45U;  // "EMBF"
 inline constexpr std::uint32_t kEmbedFrameVersion = 1U;
 inline constexpr std::size_t kEmbedFrameHeaderBytes = 16U, kEmbedFrameEntryBytes = 64U;
 inline constexpr std::uint32_t kEmbedFrameLedgerSpans = 64U;  // spans a peer keeps (default of both ends)
+// Payload bytes a peer keeps (default of both ends): 256 MiB = 32768 rows at width 4096, a quarter of a 131072 context
+// of image rows, several large images; a larger span is held alone. Both ends must use the same value.
+inline constexpr std::uint64_t kEmbedFrameLedgerBytes = std::uint64_t{256} << 20U;
 
 // Transfer an already agreed frame length in ordered, bounded exchanges. Exactly one of out/in carries
 // the frame: the sender discards replies, the receiver sends zeros. Both peers use the same max_bytes
@@ -66,30 +69,57 @@ void transfer_embed_frame_bytes(std::span<const std::byte> out, std::span<std::b
 }
 
 // What the peer holds, by digest, most recent first. Both ends apply touch() to the manifest entries in order;
-// touch returns the digest it evicted (if any) so the receiver drops that payload.
+// touch returns the digests it evicted so the receiver drops those payloads. Two bounds, the same on both ends: the
+// span count and the payload bytes (rows x width x 2 per span, from the manifest). The newest span is always kept, so
+// a span larger than the byte budget is held alone.
 class EmbedFrameLedger {
 public:
-    explicit EmbedFrameLedger(std::uint32_t capacity = kEmbedFrameLedgerSpans) : capacity_(capacity) {
+    explicit EmbedFrameLedger(std::uint32_t capacity = kEmbedFrameLedgerSpans, std::uint64_t byte_budget = kEmbedFrameLedgerBytes)
+        : capacity_(capacity), byte_budget_(byte_budget) {
         if (capacity_ == 0U) throw std::invalid_argument("embed frame ledger: capacity 0");
+        if (byte_budget_ == 0U) throw std::invalid_argument("embed frame ledger: byte budget 0");
     }
     [[nodiscard]] bool holds(const session::EmbedDigest& d) const {
-        return std::find(lru_.begin(), lru_.end(), d) != lru_.end();
+        return std::any_of(lru_.begin(), lru_.end(), [&](const Item& i) { return i.digest == d; });
     }
-    // Marks d as held and most recent; returns true and sets *evicted when another digest fell out.
+    // Marks d (of `bytes` payload bytes) as held and most recent; appends every digest that fell out to *evicted.
+    void touch(const session::EmbedDigest& d, std::uint64_t bytes, std::vector<session::EmbedDigest>* evicted) {
+        const auto it = std::find_if(lru_.begin(), lru_.end(), [&](const Item& i) { return i.digest == d; });
+        if (it != lru_.end()) {
+            bytes_ -= it->bytes;
+            lru_.erase(it);
+        }
+        lru_.push_front(Item{d, bytes});
+        bytes_ += bytes;
+        while (lru_.size() > 1U && (lru_.size() > capacity_ || bytes_ > byte_budget_)) {
+            if (evicted) evicted->push_back(lru_.back().digest);
+            bytes_ -= lru_.back().bytes;
+            lru_.pop_back();
+        }
+    }
+    // Span count only (no byte weight): returns true and sets *evicted when another digest fell out.
     bool touch(const session::EmbedDigest& d, session::EmbedDigest* evicted) {
-        if (const auto it = std::find(lru_.begin(), lru_.end(), d); it != lru_.end()) lru_.erase(it);
-        lru_.push_front(d);
-        if (lru_.size() <= capacity_) return false;
-        if (evicted) *evicted = lru_.back();
-        lru_.pop_back();
+        std::vector<session::EmbedDigest> out;
+        touch(d, 0U, &out);
+        if (out.empty()) return false;
+        if (evicted) *evicted = out.front();
         return true;
     }
-    void clear() noexcept { lru_.clear(); }
+    void clear() noexcept {
+        lru_.clear();
+        bytes_ = 0;
+    }
     [[nodiscard]] std::size_t size() const noexcept { return lru_.size(); }
+    [[nodiscard]] std::uint64_t bytes() const noexcept { return bytes_; }
 
 private:
+    struct Item {
+        session::EmbedDigest digest;
+        std::uint64_t bytes;
+    };
     std::uint32_t capacity_;
-    std::list<session::EmbedDigest> lru_;
+    std::uint64_t byte_budget_, bytes_ = 0;
+    std::list<Item> lru_;
 };
 
 namespace embed_frame_detail {
@@ -156,7 +186,7 @@ inline std::size_t payload_bytes(std::uint32_t rows, std::uint32_t width, std::u
             std::memcpy(p, s.data.data(), s.data.size() * 2U);
             pcrc = crc(std::span<const std::byte>(payload.data() + at, payload.size() - at));
         }
-        peer.touch(s.digest, nullptr);
+        peer.touch(s.digest, std::uint64_t{s.rows} * s.width * 2U, nullptr);
         d::put32(entries, handles[i]);
         d::put32(entries, s.rows);
         d::put32(entries, s.width);
@@ -183,7 +213,8 @@ inline std::size_t payload_bytes(std::uint32_t rows, std::uint32_t width, std::u
 // The receiving end: its own interner, the payloads it holds (by digest) and the mirror of the sender's ledger.
 class EmbedFrameReceiver {
 public:
-    explicit EmbedFrameReceiver(std::uint32_t capacity = kEmbedFrameLedgerSpans) : ledger_(capacity) {}
+    explicit EmbedFrameReceiver(std::uint32_t capacity = kEmbedFrameLedgerSpans, std::uint64_t byte_budget = kEmbedFrameLedgerBytes)
+        : ledger_(capacity, byte_budget) {}
 
     struct Received {
         std::shared_ptr<const session::EmbedTable> table;  // this process's handles
@@ -254,8 +285,9 @@ public:
                 lease = it->second;
                 if (lease.rows().rows != m.rows || lease.rows().width != m.width) throw std::runtime_error("embed frame: held span of another shape");
             }
-            session::EmbedDigest evicted{};
-            if (ledger_.touch(m.digest, &evicted)) held_.erase(evicted);
+            std::vector<session::EmbedDigest> evicted;
+            ledger_.touch(m.digest, std::uint64_t{m.rows} * m.width * 2U, &evicted);
+            for (const auto& gone : evicted) held_.erase(gone);
             if (std::none_of(leases.begin(), leases.end(), [&](const session::EmbedLease& l) { return l.handle() == lease.handle(); }))
                 leases.push_back(std::move(lease));
         }

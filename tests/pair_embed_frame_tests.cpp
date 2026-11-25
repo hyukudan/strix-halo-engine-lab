@@ -151,6 +151,37 @@ int main() {
     const auto dids = dl.ids();
     CHECK(throws([&] { (void)pair::encode_embed_frame(dt, dids, dpeer, crc); }));
 
+    {  // byte budget: both ledgers drop the oldest spans past it (same rule, from the manifest), so a span that fell out
+       // travels again and the receiver never holds more than the budget; a span above the budget is held alone
+        session::EmbedInterner bi;
+        const auto ba = bi.intern(span(11, 4, 8)), bb = bi.intern(span(12, 4, 8)), bc = bi.intern(span(13, 4, 8));  // 64 bytes each
+        const session::EmbedTable ball(std::vector<session::EmbedLease>{ba, bb, bc});
+        std::vector<std::uint32_t> bids;
+        for (const auto* l : {&ba, &bb, &bc}) {
+            const auto one = l->ids();
+            bids.insert(bids.end(), one.begin(), one.end());
+        }
+        pair::EmbedFrameLedger btx(64, 150);
+        pair::EmbedFrameReceiver brx(64, 150);
+        const auto bf1 = pair::encode_embed_frame(ball, bids, btx, crc);
+        CHECK(btx.size() == 2 && btx.bytes() == 128 && !btx.holds(ba.rows().digest) && btx.holds(bc.rows().digest));
+        CHECK(brx.receive(bf1, bids, crc).sent == 3 && brx.held() == 2);
+        const session::EmbedTable only_a(std::vector<session::EmbedLease>{ba});
+        const auto ids_a = ba.ids();
+        const auto bf2 = pair::encode_embed_frame(only_a, ids_a, btx, crc);  // a fell out: its rows travel again
+        CHECK(brx.receive(bf2, ids_a, crc).sent == 1 && brx.held() == 2 && btx.bytes() == 128);
+        const session::EmbedTable only_c(std::vector<session::EmbedLease>{bc});
+        const auto ids_c = bc.ids();
+        const auto bf3 = pair::encode_embed_frame(only_c, ids_c, btx, crc);  // c is still held: manifest only
+        CHECK(brx.receive(bf3, ids_c, crc).sent == 0);
+        pair::EmbedFrameLedger tiny(64, 10);
+        std::vector<session::EmbedDigest> gone;
+        tiny.touch(ba.rows().digest, 64, &gone);
+        tiny.touch(bb.rows().digest, 64, &gone);
+        CHECK(tiny.size() == 1 && tiny.bytes() == 64 && gone.size() == 1 && gone[0] == ba.rows().digest);
+        CHECK(throws([] { pair::EmbedFrameLedger zero_budget(4, 0); (void)zero_budget; }));
+    }
+
     // regime rule: an empty table (no receipts) is always rank0
     using M = pair::EmbedEncodeMode;
     CHECK(pair::select_embed_encode_mode({4U, 20000U}, {}) == M::rank0);

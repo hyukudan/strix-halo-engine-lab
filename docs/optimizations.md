@@ -4909,6 +4909,38 @@ over to batched plain steps.
 - **Measured gain:** `--selftest 8` (8 built-in short chat prompts in the GLM chat template, 22-59 prompt tokens (mean ~33), up to 128 greedy tokens each, barrier start, prefix cache off), steady-state aggregate decode, G2 on (off): C2 53.03 (37.83) tok/s (+40 %), C4 59.88 (53.64) (+12 %), C6 62.50 (62.44), C8 69.48 (69.37) (handed over); C1 39.97 tok/s through MTP vs 25.30 plain
 - **Implementation / evidence:** [server](../apps/glm_serve_main.cpp), [lead loop](../src/glm/serve/glm_serve_lead.hpp)
 
+<a id="glm-serve-sampled-mtp"></a>
+
+### Server MTP for sampled requests
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_SERVE_SAMPLED_MTP` = `0` | `coupled` | `rejection` (lever row `serve_sampled_mtp` of the pair profile table, resolved and admitted by the shared profile resolution for the command line and the server; receipt line `effective serve-sampled-mtp=`, route identities `glm-sampled-mtp-coupled-v1` / `glm-sampled-mtp-rejection-v1`; the rank command line decodes greedy and reports it inapplicable). **Default:** off (explicit opt-in under every profile; the pair gates of this tree are pending, see below).
+
+With the row set to `coupled`, a sampled request (`temperature > 0`, identity `sampling-v1`) in `strix-glm5-serve` decodes through
+the single-request MTP route instead of plain steps. After each verify, rank 1 sends its vocabulary half of every
+row rank 0 reaches; rank 0 decides the rows in order with the request's sampler under coupled acceptance (a row is
+sampled as without a draft, with the uniform of its absolute position; the draft is accepted when it equals that
+token), then sends the decided tokens and the number of accepted drafts back, and both ranks commit exactly the
+accepted drafts plus the token of the first row that did not accept, then catch up the drafter from them
+([shared window decision](../include/strix/serve/pair_sampling.hpp) `decide_pair_window`; the commit never compares
+tokens with drafts, since a rejected row can keep a token equal to its draft). Both ranks pass the window's row budget
+and rank 1 refuses a request for a row past it. Below temperature 0.7 (the shared argmax gate) drafts are the
+drafter's greedy tokens; from 0.7 up each draft is drawn from the drafter's full row with the uniform of the position
+it proposes (`pick_pair_draft`), so a drafter close to the target proposes the very token the row will sample. A
+sampled first token re-seeds the drafter from the prompt's last row (`mtp_enter`). `STRIX_GLM_SERVE_SAMPLED_MTP=rejection`
+selects speculative rejection sampling instead (drafts always drawn from the drafter rows, the shared lookup arbiter is
+off for those requests): exact in distribution, but the tokens of a seed then depend on the drafts, so only
+`--profile fast` or `turbo` admits it (the resolution names it as an engine override; the default and quality profiles
+refuse it at startup).
+
+- **Preconditions:** `strix-glm5-serve` with MTP on and sampling available (both ranks vote for it in the hello); one sampled request decoding (C1).
+- **Automatic selection:** none; batched MTP verify (G2) never takes a sampled request (with one decoding, the server uses batched plain steps).
+- **Fallback notice:** every sampled response carries `sampling_receipt`: its acceptance rule (`coupled` / `rejection`), drafted rows accepted and rejected (both zero when it decoded by plain steps) and drafts drawn from the drafter rows. The startup line `serve sampled-mtp=off|coupled|rejection` states the resolved route.
+- **Exactness evidence (this tree, host):** host fake pair: three sampled requests x 40 tokens equal plain sampling of the same seeds, with greedy drafts (T 0.5), with drafts drawn from the drafter rows (T 0.9), with a rejection forced at row 0 of every window (its token equals the draft), and beside a greedy request with G2 on; rejection completes with accepted and rejected rows (not token-compared by design). Shared tests: coupled windows equal plain sampling on both ranks with the accepted count agreed, a same-token rejection accepts no draft, cut windows send no extra rows, the follower refuses a row past the budget, rejection windows equal `decide_rows`, drafts picked across the pair equal the sampler's own draft. Pair gates of this tree (seeded tokens and committed-row logits / state against plain sampling, forced rejection, batch handover, prefix restore, stops; rejection through an acceptance / state oracle and a distribution gate): pending.
+- **Timing:** not measured on this tree; published with its pair gates.
+- **Off switch:** unset or `STRIX_GLM_SERVE_SAMPLED_MTP=0` (plain steps); a set `STRIX_MTP_SAMPLED_ACCEPT` must name the row's rule; `STRIX_GLM_SERVE_MTP=0` turns off MTP for every request
+- **Draft counters:** on the GLM pair server `strix.mtp_cycles`, `strix.mtp_accepted` and `strix.mtp_proposed` in responses read 0 for every request, greedy and sampled, while MTP runs. Sampled requests report their drafts in `strix.sampling_receipt` (`drafts`, `accepted`, `rejected`); greedy requests report none in the response. Every request's counts are on rank 0's stderr as one `strix-spec-stats` line.
+- **Implementation / evidence:** [lead loop](../src/glm/serve/glm_serve_lead.hpp), [server adapter](../apps/glm_serve_main.cpp), [decoder hook](../src/glm/spec/glm_spec_run.cpp), [tests](../tests/glm_serve_cpu_tests.cpp)
+
 <a id="glm-serve-prefill-chunk"></a>
 
 ### Server decode-first chunked prefill
