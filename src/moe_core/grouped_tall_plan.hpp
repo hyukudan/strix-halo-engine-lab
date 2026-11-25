@@ -48,6 +48,11 @@ struct Form {
     unsigned stages;   // ring slots (>= 3)
     unsigned warps_m;  // warps along M
     unsigned warps_n;  // warps along N (128 outputs)
+    // Block-scale source (bit-neutral): true = the CTA's scale bytes staged once in shared memory ("block scales" below),
+    // false = one global byte load per decode job per stage, one stage ahead. Staging pays where a CTA spans 128 rows
+    // (no-model bench, T = 2048 / 8192, NVFP4 shift: gate-up -9.1 % / -6.6 %); a 64-row CTA repays the copy over half the
+    // multiplies (+1.8 % / +3.2 %), so r64 keeps the direct loads.
+    bool staged_scales;
 
     STRIX_TALL_HD constexpr unsigned threads() const { return 32U * warps_m * warps_n; }
     STRIX_TALL_HD constexpr unsigned warps() const { return warps_m * warps_n; }
@@ -59,13 +64,13 @@ struct Form {
 STRIX_TALL_HD constexpr Form form(FormId id) {
     switch (id) {
     // 8 warps, warp tile 32 rows x 64 outputs: a tile's last rows engage only the warp rows they reach.
-    case FormId::r128_k32_s4: return {128U, 32U, 4U, 4U, 2U};
-    case FormId::r128_k32_s3: return {128U, 32U, 3U, 4U, 2U};
-    case FormId::r128_w16_k32_s4: return {128U, 32U, 4U, 4U, 4U};  // 16 warps, warp tile 32 x 32
-    case FormId::r64_k32_s4: return {64U, 32U, 4U, 2U, 4U};        // 8 warps, warp tile 32 x 32
-    case FormId::r128_n4_k32_s4: return {128U, 32U, 4U, 2U, 4U};   // 8 warps, warp tile 64 x 32
+    case FormId::r128_k32_s4: return {128U, 32U, 4U, 4U, 2U, true};
+    case FormId::r128_k32_s3: return {128U, 32U, 3U, 4U, 2U, true};
+    case FormId::r128_w16_k32_s4: return {128U, 32U, 4U, 4U, 4U, true};  // 16 warps, warp tile 32 x 32
+    case FormId::r64_k32_s4: return {64U, 32U, 4U, 2U, 4U, false};        // 8 warps, warp tile 32 x 32
+    case FormId::r128_n4_k32_s4: return {128U, 32U, 4U, 2U, 4U, true};   // 8 warps, warp tile 64 x 32
     }
-    return {128U, 32U, 4U, 4U, 2U};
+    return {128U, 32U, 4U, 4U, 2U, true};
 }
 
 STRIX_TALL_HD constexpr const char* name(FormId id) {
@@ -186,9 +191,9 @@ STRIX_TALL_HD constexpr unsigned scale_bytes(unsigned inputs, bool nvfp4) { retu
 STRIX_TALL_HD constexpr unsigned scale_offset(const Layout& l, unsigned pitch, unsigned output, unsigned block) {
     return l.smem + output * pitch + block;
 }
-// Dynamic shared bytes of a launch: the fixed layout plus the scale region of its K.
-STRIX_TALL_HD constexpr unsigned shared_bytes(const Layout& l, unsigned inputs, bool nvfp4) {
-    return l.smem + scale_bytes(inputs, nvfp4);
+// Dynamic shared bytes of a launch: the fixed layout plus, for a form with staged scales, the scale region of its K.
+STRIX_TALL_HD constexpr unsigned shared_bytes(Form f, const Layout& l, unsigned inputs, bool nvfp4) {
+    return l.smem + (f.staged_scales ? scale_bytes(inputs, nvfp4) : 0U);
 }
 // Whether the scale rows copy as 4-byte chunks (else byte by byte): whole words per row on a word-aligned scale array.
 STRIX_TALL_HD constexpr bool scale_words(unsigned inputs, bool nvfp4, std::uintptr_t scale_address) {
@@ -250,7 +255,7 @@ STRIX_TALL_HD constexpr FormId select(unsigned max_tile_rows) {
 inline bool fits(const grouped_microscaled::Args& args, FormId id, bool nvfp4, std::size_t shared_budget) {
     const Form f = form(id);
     return valid(f, nvfp4) && fits_shape(f, args.inputs, args.outputs) && args.max_tile_rows <= kMaxRows &&
-           shared_bytes(layout(f, nvfp4), args.inputs, nvfp4) <= shared_budget;
+           shared_bytes(f, layout(f, nvfp4), args.inputs, nvfp4) <= shared_budget;
 }
 
 }  // namespace strix::moe_core::grouped_tall

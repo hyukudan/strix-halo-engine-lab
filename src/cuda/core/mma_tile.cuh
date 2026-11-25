@@ -530,21 +530,23 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
         code_src[j] = source.tile16_address(first_output + (chunk ? c.output : 0U), 16U * c.tile).codes;
         code_dst[j] = base + tall::code_offset(L, c.output, c.tile);
     }
-    // Block scales of the CTA's outputs over the whole K, staged once (plan: "block scales"); the 4-byte copies join stage 0's
-    // commit group, the byte copies are plain stores; both are visible after the prologue barrier.
-    const unsigned scale_row = tall::scale_blocks(args.inputs, Operand::kNvfp4);
+    // Form::staged_scales: the block scales of the CTA's outputs over the whole K, staged once (plan: "block scales"); the
+    // 4-byte copies join stage 0's commit group, the byte copies are plain stores; both are visible after the prologue barrier.
     const unsigned scale_pitch = tall::scale_pitch(args.inputs, Operand::kNvfp4);
-    if (tall::scale_words(args.inputs, Operand::kNvfp4, reinterpret_cast<std::uintptr_t>(rows.weights.block_scales))) {
-        const unsigned words = scale_row / 4U;
-        for (unsigned c = thread; c < tall::kOutputs * words; c += F.threads()) {
-            const unsigned o = c / words, w = c % words;
-            ptx::cp_async4(base + tall::scale_offset(L, scale_pitch, o, 4U * w),
-                           source.tile16_address(first_output + o, 0U).scale_code + 4U * w);
-        }
-    } else {
-        for (unsigned c = thread; c < tall::kOutputs * scale_row; c += F.threads()) {
-            const unsigned o = c / scale_row, b = c % scale_row;
-            smem[tall::scale_offset(L, scale_pitch, o, b)] = source.tile16_address(first_output + o, 0U).scale_code[b];
+    if constexpr (F.staged_scales) {
+        const unsigned scale_row = tall::scale_blocks(args.inputs, Operand::kNvfp4);
+        if (tall::scale_words(args.inputs, Operand::kNvfp4, reinterpret_cast<std::uintptr_t>(rows.weights.block_scales))) {
+            const unsigned words = scale_row / 4U;
+            for (unsigned c = thread; c < tall::kOutputs * words; c += F.threads()) {
+                const unsigned o = c / words, w = c % words;
+                ptx::cp_async4(base + tall::scale_offset(L, scale_pitch, o, 4U * w),
+                               source.tile16_address(first_output + o, 0U).scale_code + 4U * w);
+            }
+        } else {
+            for (unsigned c = thread; c < tall::kOutputs * scale_row; c += F.threads()) {
+                const unsigned o = c / scale_row, b = c % scale_row;
+                smem[tall::scale_offset(L, scale_pitch, o, b)] = source.tile16_address(first_output + o, 0U).scale_code[b];
+            }
         }
     }
 
@@ -575,11 +577,14 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
         }
     }
 
-    // Decode job: kColumns inputs of one output per stage; its scale byte of stage s is staged_scale(s).
+    // Decode job: kColumns inputs of one output per stage. Its scale byte of stage s: staged_scale(s) (staged scales), or a
+    // direct global byte prefetched one iteration ahead into `ahead`.
     const tall::DecodeJob job = tall::decode_job(F, thread);
     const unsigned scale_first =
         tall::scale_offset(L, scale_pitch, job.output, job.column / static_cast<unsigned>(Operand::kBlockColumns));
     const auto staged_scale = [&](unsigned stage) { return smem[scale_first + stage * kScaleStride]; };
+    const std::uint8_t* scale_src = source.tile16_address(first_output + job.output, job.column).scale_code;
+    std::uint8_t ahead = 0U;
     const auto decode = [&](unsigned stage, std::uint8_t scale_code) {
         const std::uint8_t* raw = smem + tall::slot(F, stage) * L.stage_bytes + tall::decode_code_offset(L, job);
         std::uint32_t words[kWords];
@@ -640,6 +645,7 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
     };
 
     const unsigned steps = args.inputs / F.k_slab;
+    if constexpr (!F.staged_scales) ahead = *scale_src;
 #pragma unroll
     for (unsigned s = 0; s + 1U < F.stages; ++s) {
         if (s < steps) issue(s);
@@ -647,7 +653,12 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
     }
     ptx::cp_async_wait<static_cast<int>(tall::prologue_pending(F))>();
     __syncthreads();
-    decode(0U, staged_scale(0U));
+    if constexpr (F.staged_scales) {
+        decode(0U, staged_scale(0U));
+    } else {
+        decode(0U, ahead);
+        if (steps > 1U) ahead = scale_src[kScaleStride];
+    }
     for (unsigned s = 0; s < steps; ++s) {
         ptx::cp_async_wait<static_cast<int>(tall::loop_pending(F))>();
         __syncthreads();  // stage s + 1 landed for all; every warp is past stage s - 1 (its slot and slab are free)
@@ -656,7 +667,12 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
 #pragma unroll 1
         for (unsigned phase = 0; phase < 2U; ++phase) {  // decode stage s + 1 and multiply stage s, in the warp row's order
             if ((phase == 0U) == decode_first) {
-                if (s + 1U < steps) decode(s + 1U, staged_scale(s + 1U));
+                if constexpr (F.staged_scales) {
+                    if (s + 1U < steps) decode(s + 1U, staged_scale(s + 1U));
+                } else if (s + 1U < steps) {
+                    decode(s + 1U, ahead);
+                    if (s + 2U < steps) ahead = scale_src[std::size_t{s + 2U} * kScaleStride];
+                }
             } else if (warp_live) {
                 compute(s);
             }
@@ -697,7 +713,7 @@ inline cudaError_t launch_tall_form(const view::Args& args, cudaStream_t stream)
     auto* kernel = projection_tall<Format, Id, false>;
     if constexpr (Format == packed::MatrixFormat::nvfp4)
         if (args.decode == view::Decode::shift) kernel = projection_tall<Format, Id, true>;
-    const unsigned shared = tall::shared_bytes(L, args.inputs, Format == packed::MatrixFormat::nvfp4);
+    const unsigned shared = tall::shared_bytes(F, L, args.inputs, Format == packed::MatrixFormat::nvfp4);
     if (const auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                  static_cast<int>(shared)); status != cudaSuccess) return status;
     kernel<<<grid, F.threads(), shared, stream>>>(args);

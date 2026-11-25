@@ -337,16 +337,21 @@ void scales(tall::FormId id, bool nvfp4, unsigned inputs, std::uintptr_t scale_a
     const tall::Layout l = tall::layout(f, nvfp4);
     const unsigned blocks = tall::scale_blocks(inputs, nvfp4), pitch = tall::scale_pitch(inputs, nvfp4);
     const unsigned block_columns = nvfp4 ? 16U : 32U, stride = f.k_slab / block_columns;
+    if (!f.staged_scales) {  // direct loads: no region, the incumbent shared bytes
+        check(tall::shared_bytes(f, l, inputs, nvfp4) == l.smem, "direct-scale form adds no shared bytes", id, nvfp4);
+        return;
+    }
     bool ok = blocks * block_columns == inputs && pitch % 4U == 0U && (pitch / 4U) % 2U == 1U && pitch >= blocks &&
               tall::scale_bytes(inputs, nvfp4) == tall::kOutputs * pitch &&
-              tall::shared_bytes(l, inputs, nvfp4) == l.smem + tall::scale_bytes(inputs, nvfp4) && l.smem >= l.table + l.table_bytes;
+              tall::shared_bytes(f, l, inputs, nvfp4) == l.smem + tall::scale_bytes(inputs, nvfp4) &&
+              l.smem >= l.table + l.table_bytes;
     check(ok, "scale region after the tables, odd word pitch", id, nvfp4);
 
     // Copy map: global byte (output o, block b) lands at scale_offset(o, b), each exactly once.
     std::vector<unsigned> hits(tall::kOutputs * blocks, 0U);
     const auto land = [&](unsigned o, unsigned b, unsigned dst) {
         if (o >= tall::kOutputs || b >= blocks || dst != tall::scale_offset(l, pitch, o, b) ||
-            dst >= tall::shared_bytes(l, inputs, nvfp4))
+            dst >= tall::shared_bytes(f, l, inputs, nvfp4))
             return false;
         ++hits[o * blocks + b];
         return true;
