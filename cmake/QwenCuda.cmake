@@ -29,7 +29,8 @@ add_library(strix_qwen_cuda STATIC
     src/cuda/models/qwen/qwen_gdn.cu src/cuda/models/qwen/qwen_qsa.cu src/cuda/models/qwen/qwen_moe.cu
     src/cuda/models/qwen/qwen_plemtp.cu src/cuda/models/qwen/qwen_mtp_draft.cu src/cuda/models/qwen/qwen_transcode.cu src/cuda/tiered_experts.cu src/cuda/weight/registry.cu ${STRIX_CUDA_CORE_AMD_MATH_SOURCES} src/gguf_reader.cpp
     src/cuda/core/nvfp4_a8.cu src/cuda/core/nvfp4_a8_reference.cpp src/cuda/core/nvfp4_reference.cpp
-    src/cuda/core/recur_decode.cu)
+    src/cuda/core/recur_decode.cu
+    src/cuda/core/lookup_cuda.cu)
 # Public headers reach shared src/ headers (strix/onfly_i4.hpp -> core/iu4_rows_plan.hpp), as strix_core exports.
 target_include_directories(strix_qwen_cuda PUBLIC include src src/cuda/models/qwen)
 target_link_libraries(strix_qwen_cuda PUBLIC strix-weight strix_nvfp4)

@@ -34,6 +34,7 @@
 #include "strix/cuda/qwen_hc.hpp"
 #include "strix/cuda/qwen_hc_exact_shape.hpp"
 #include "strix/cuda/amd_math.cuh"
+#include "../../core/lookup_cuda.cuh"
 #include "../../core/mma_tile.cuh"
 #include "../../core/route_softmax.cuh"
 
@@ -1073,6 +1074,9 @@ __global__ __launch_bounds__(256) void hc_mix_epilogue_kernel(const float* __res
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Elementwise.
+// The K10c fixture extracts this incumbent as its independent byte oracle.
+// Leave it uninstantiated in the engine.
+template <class = void>
 __global__ void embedding_kernel(const unsigned char* __restrict__ table, const std::uint32_t* __restrict__ ids,
     std::uint16_t* __restrict__ out) {
     const unsigned row = blockIdx.x;
@@ -1609,8 +1613,8 @@ void hc_mix(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, u
 
 void token_embedding(const void* table, const std::uint32_t* ids, std::uint32_t rows, std::uint16_t* out, cudaStream_t stream) {
     if (!rows) return;
-    embedding_kernel<<<rows, 256U, 0, stream>>>(static_cast<const unsigned char*>(table), ids, out);
-    check(cudaGetLastError(), "embedding launch");
+    const core::lookup::View view{{table, kVocab, kHidden}, core::lookup::Form::q8_0_to_bf16, out, rows};
+    check(core::lookup::enqueue(view, core::lookup::TokenIds{ids}, stream), "embedding launch");
 }
 void hyper_expand(const std::uint16_t* in, std::uint32_t rows, std::uint16_t* out, cudaStream_t stream) {
     const std::size_t total = std::size_t{rows} * kWide;

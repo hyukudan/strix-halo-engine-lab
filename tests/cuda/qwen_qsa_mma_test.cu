@@ -1,6 +1,6 @@
 // Model-free device test of the QSA FAST attention form (Config::forms.qsa_mma): qsa::attention_mma against the exact
 // qsa::attention on the same random inputs (selection built like select_kernel's output: all tokens while <= 512 complete
-// blocks, else 512 random 4-token blocks in random order + the tail). Reports max abs / relative L2 of attn_out and the
+// blocks, else 512 random 4-token blocks in ascending order + the tail). Reports max abs / relative L2 of attn_out and the
 // per-row relative L2 spread (errors must be uniform), then times both at 8K rows (history 0) and at a 32K position.
 //   qwen_qsa_mma_test <tables dir> [nofail]
 #include "strix/cuda/qwen_qsa.hpp"
@@ -64,6 +64,7 @@ Inputs make_inputs(std::uint32_t rows, std::uint64_t first, float qscale) {
         blocks.resize(nb);
         for (std::uint32_t i = 0; i < nb; ++i) blocks[i] = i;
         for (std::uint32_t i = 0; i < qsa::kTopK; ++i) std::swap(blocks[i], blocks[i + rng() % (nb - i)]);
+        std::sort(blocks.begin(), blocks.begin() + qsa::kTopK);
         for (std::uint32_t i = 0; i < qsa::kTopK; ++i)
             for (std::uint32_t o = 0; o < qsa::kRatio; ++o) s[i * qsa::kRatio + o] = blocks[i] * qsa::kRatio + o;
         for (std::uint32_t t = nb * qsa::kRatio; t < visible; ++t) s[qsa::kTopK * qsa::kRatio + t - nb * qsa::kRatio] = t;
