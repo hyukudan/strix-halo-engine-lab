@@ -254,8 +254,19 @@ void ds41() {
         {"arg:--prefill-path", "the server prefills prompts on the device batch path; the CLI's prompt goes through its decode windows"},
         {"arg:--prefill-rows", "row budget of the server's device prefill path (auto)"},
     };
+    namespace pr = strix::profile;
     for (const char* profile : {"exact", "fast", "turbo", "quality"})
         gate(std::string("ds41+") + profile, config(pd::App::rank, profile), config(pd::App::serve, profile), allowed);
+    const char* marker = pr::environment({}, pr::kPresetEnv);
+    const auto previous = marker ? std::optional<std::string>(marker) : std::nullopt;
+    for (const char* profile : {"exact", "fast", "turbo"}) {
+        const auto native = config(pd::App::rank, profile);
+        check(pr::export_environment(pr::kPresetEnv, "1"), "enable DeepSeek model preset marker");
+        const auto preset = config(pd::App::serve, profile);
+        check(pr::export_environment(pr::kPresetEnv, previous ? previous->c_str() : ""), "restore model preset marker");
+        gate(std::string("ds41+preset+") + profile, native, preset, allowed);
+        check(preset.at("arg:--slots") == "8", "ds41: serve uses the resolved eight slots");
+    }
 }
 #endif
 

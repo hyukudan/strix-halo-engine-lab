@@ -240,7 +240,14 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
                         "Inkling Mini implicit profile must remain EXACT");
             require(exact.levers == Name::standard && fast.levers == Name::fast && fast.requested == Name::fast,
                     "explicit exact and FAST select their native columns");
-            require(turbo.requested == Name::turbo && turbo.levers == fast.levers, "TURBO inherits FAST levers");
+            if (entry.family == "deepseek41") {
+                require(turbo.requested == Name::turbo && turbo.levers == Name::turbo,
+                        "DeepSeek preset forwards TURBO to the native resolver");
+                require(implicit.requested == Name::standard && implicit.levers == Name::standard,
+                        "DeepSeek implicit preset keeps EXACT arithmetic");
+            } else {
+                require(turbo.requested == Name::turbo && turbo.levers == fast.levers, "TURBO inherits FAST levers");
+            }
             require(exact.kv != "fp8" && fast.kv != "fp8", "FP8 KV shadow is TURBO only");
             require((turbo.kv == "fp8") == (entry.family == "qwen35" && std::string_view(backend) == "cuda"),
                     "only the CUDA dense route has an FP8 KV shadow");
