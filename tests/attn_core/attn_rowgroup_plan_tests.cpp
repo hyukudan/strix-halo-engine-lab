@@ -1,6 +1,7 @@
-#include "cuda/core/attn_rowgroup_plan.hpp"
+#include "attn_core/rowgroup_plan.hpp"
 
 #include <cstdio>
+#include <limits>
 
 namespace rg = strix::cuda::core::rowgroup;
 
@@ -28,20 +29,26 @@ static_assert(!rg::LaunchPolicy<BadDim> && !rg::LaunchPolicy<EmptyDim>);
 static_assert(!rg::LaunchPolicy<EmptyHeads> && !rg::LaunchPolicy<TooManyHeads> && !rg::LaunchPolicy<TooManyRows>);
 static_assert(!rg::LaunchPolicy<EmptyCap> && !rg::LaunchPolicy<TooManyKeys> && !rg::LaunchPolicy<WrongRowType>);
 static_assert(!rg::LaunchPolicy<Nontrivial> && !rg::LaunchPolicy<BadScale> && !rg::LaunchPolicy<int>);
-static_assert(rg::kUnionThreads == 256);
-
-constexpr auto empty = rg::make_launch_plan<QwenShape>(0, 0);
-constexpr auto full = rg::make_launch_plan<QwenShape>(4, 2);
-constexpr auto partial = rg::make_launch_plan<QwenShape>(7, 2);
-constexpr auto odd = rg::make_launch_plan<Narrow>(3, 1);
+constexpr rg::GridLimits large_grid{0x7fffffffU, 65535U};
+constexpr auto empty = rg::make_launch_plan<QwenShape>(0, 0, {0, 0});
+constexpr auto full = rg::make_launch_plan<QwenShape>(4, 2, large_grid);
+constexpr auto partial = rg::make_launch_plan<QwenShape>(7, 2, large_grid);
+constexpr auto odd = rg::make_launch_plan<Narrow>(3, 1, large_grid);
 static_assert(empty && empty->tiles == 0 && empty->kv_heads == 0);
 static_assert(full && full->tiles == 1 && full->kv_heads == 2);
 static_assert(partial && partial->tiles == 2 && partial->kv_heads == 2);
 static_assert(odd && odd->tiles == 3 && odd->kv_heads == 1);
-static_assert(rg::make_launch_plan<Wide>(17, 3)->tiles == 3);
-static_assert(rg::make_launch_plan<Narrow>(65535, 1).has_value());
-static_assert(!rg::make_launch_plan<Narrow>(65536, 1) && !rg::make_launch_plan<QwenShape>(7, 0));
-static_assert(!rg::make_launch_plan<QwenShape>(0xffffffffU, 1) && !rg::make_launch_plan<Narrow>(1, 0x80000000U));
+static_assert(rg::make_launch_plan<Wide>(17, 3, large_grid)->tiles == 3);
+static_assert(rg::make_launch_plan<Narrow>(65535, 0x7fffffffU, large_grid).has_value());
+static_assert(!rg::make_launch_plan<Narrow>(65536, 1, large_grid));
+static_assert(!rg::make_launch_plan<QwenShape>(7, 0, large_grid));
+static_assert(!rg::make_launch_plan<QwenShape>(0xffffffffU, 1, large_grid));
+static_assert(!rg::make_launch_plan<Narrow>(1, 0x80000000U, large_grid));
+
+constexpr rg::GridLimits small_grid{3, 2};
+static_assert(rg::make_launch_plan<QwenShape>(8, 3, small_grid).has_value());
+static_assert(!rg::make_launch_plan<QwenShape>(9, 3, small_grid));
+static_assert(!rg::make_launch_plan<QwenShape>(8, 4, small_grid));
 }  // namespace
 
 int main() {

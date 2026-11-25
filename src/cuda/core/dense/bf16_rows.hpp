@@ -1,8 +1,9 @@
 #pragma once
 
+#include "row_plan.hpp"
+#include "cuda/core/dense/bf16_row_abi.hpp"
 #include "core/dense_row_plan.hpp"
 #include "cuda/core/lookup_cuda.cuh"
-#include "row_plan.hpp"
 #include "strix/core/rows.hpp"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/cuda_core/dense_big.hpp"
@@ -17,19 +18,7 @@
 
 namespace strix::cuda_core {
 
-inline constexpr std::size_t kMaxBf16RowProjections = 4;
-
-struct Bf16DenseRowGroup {
-    const float* input;
-    unsigned input_width;
-    std::span<const core::Bf16RowProjection> projections;
-};
-
 namespace detail {
-
-inline bool bf16_mma3_tile(unsigned in, unsigned out) {
-    return in % core::rows::kBlockIn == 0 && out % core::rows::kTileOut == 0;
-}
 
 // Activation planes of the tall BF16 split: mma3 3 (exact), mma2 2, mma1 1
 // (FAST); 0 for fp32, which has no tall MMA path. A BF16-exact operand needs one
@@ -43,33 +32,6 @@ constexpr int bf16_tall_terms(DenseArith arithmetic, core::Bf16Operand operand =
     case DenseArith::fp32: break;
     }
     return 0;
-}
-
-inline bool valid_bf16_dense_row_group(const Bf16DenseRowGroup& group, unsigned rows, DenseArith arithmetic) {
-    const auto& [input, input_width, projections] = group;
-    const auto aligned = [](const void* pointer) {
-        return pointer && reinterpret_cast<std::uintptr_t>(pointer) % 16U == 0;
-    };
-    constexpr auto max_floats = std::numeric_limits<std::size_t>::max() / sizeof(float);
-    if (!aligned(input) || input_width == 0 || input_width % 8U != 0 || rows == 0 ||
-        input_width > max_floats / rows || projections.empty() || projections.size() > kMaxBf16RowProjections)
-        return false;
-
-    // The rounded epilogue is requested only as mma3, short and tall (tall: three
-    // planes, or one for a BF16-exact operand, same bits).
-    const bool round_bf16 = projections.front().round_bf16;
-    if (round_bf16 && arithmetic != DenseArith::mma3) return false;
-    std::uint64_t total_outputs = 0;
-    for (const auto& projection : projections) {
-        if (!projection.contiguous(input_width) || projection.round_bf16 != round_bf16 ||
-            (round_bf16 && !bf16_mma3_tile(input_width, projection.outputs)) ||
-            projection.outputs == 0 || projection.outputs > max_floats / rows ||
-            !aligned(projection.weights) || !aligned(projection.output) || projection.output == input ||
-            projection.outputs > std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t) / input_width)
-            return false;
-        total_outputs += projection.outputs;
-    }
-    return total_outputs <= std::numeric_limits<unsigned>::max();
 }
 
 }  // namespace detail
@@ -86,7 +48,7 @@ inline cudaError_t enqueue_bf16_dense_row_groups(std::span<const Bf16DenseRowGro
     std::array<plan_rows::Job, plan_rows::kMaxJobs> jobs;
     std::size_t total = 0, job_count = 0;
     for (const auto& group : groups) {
-        if (!detail::valid_bf16_dense_row_group(group, rows, DenseArith::mma3)) return cudaErrorInvalidValue;
+        if (!detail::valid_bf16_dense_row_group(group, rows, true)) return cudaErrorInvalidValue;
         total += group.projections.size();
         if (total > plan_rows::kMaxJobs) return cudaErrorInvalidValue;
         for (const auto& projection : group.projections) {
@@ -148,7 +110,7 @@ inline cudaError_t enqueue_bf16_dense_rows(const float* input, unsigned input_wi
     const Bf16DenseRowGroup group{input, input_width, projections};
     if (profile && arithmetic == DenseArith::mma3 && rows <= kMaxRows)
         return enqueue_bf16_dense_row_groups(std::span(&group, 1), rows, *profile, stream);
-    if (!detail::valid_bf16_dense_row_group(group, rows, arithmetic)) return cudaErrorInvalidValue;
+    if (!detail::valid_bf16_dense_row_group(group, rows, arithmetic == DenseArith::mma3)) return cudaErrorInvalidValue;
 
     const bool round_bf16 = projections.front().round_bf16;
     std::array<DenseWeight, kMaxBf16RowProjections> short_weights{};
@@ -159,9 +121,9 @@ inline cudaError_t enqueue_bf16_dense_rows(const float* input, unsigned input_wi
     int split_planes = 0;
     for (const auto& projection : projections) {
         const DenseWeight weight{projection.weights, WeightFormat::bf16, projection.outputs, input_width};
-        const auto path = plan_bf16_row_projection(input_width, weight.out, rows, kMaxRows,
-                                                  context && terms > 0, terms);
-        if (path == Bf16RowPath::big || path == Bf16RowPath::big_compact) {
+        constexpr core::Bf16RowLimits limits{kMaxRows, kFp32GridMaxRows, kCompactBf16Outputs, 32U, 16U};
+        const auto path = core::plan_bf16_row_projection(input_width, weight.out, rows, context && terms > 0, limits, terms);
+        if (path == core::Bf16RowPath::big || path == core::Bf16RowPath::big_compact) {
             if (activation.planes == nullptr) {
                 const auto status = dense_big_split(input, rows, input_width, WeightFormat::bf16, terms,
                                                     &activation, stream, context);
@@ -169,11 +131,11 @@ inline cudaError_t enqueue_bf16_dense_rows(const float* input, unsigned input_wi
             }
             split_planes = std::max(split_planes, bf16_split_planes(path, terms));
             const auto epilogue = round_bf16 ? BigEpi::round_bf16 : BigEpi::none;
-            const auto status = path == Bf16RowPath::big_compact
+            const auto status = path == core::Bf16RowPath::big_compact
                 ? dense_big_bf16_compact(weight, activation, projection.output, epilogue, stream, context)
                 : dense_big_gemm(weight, activation, projection.output, nullptr, epilogue, stream, context);
             if (status != cudaSuccess) return status;
-        } else if (path == Bf16RowPath::fp32_grid) {
+        } else if (path == core::Bf16RowPath::fp32_grid) {
             const auto status = dense_fp32_rows_grid(weight, input, projection.output, rows, stream);
             if (status != cudaSuccess) return status;
         } else {

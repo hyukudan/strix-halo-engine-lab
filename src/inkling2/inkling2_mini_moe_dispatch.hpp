@@ -54,6 +54,10 @@ inline std::size_t mini_moe_activation_elements(unsigned rows) {
     return mini_grouped::workspace_elements<MiniMoeConfig>(rows).activation;
 }
 
+inline std::size_t mini_moe_nvfp4_image_bytes(unsigned rows, moe_core::grouped_w4a4::Activations activations) {
+    return mini_grouped::workspace_elements<MiniMoeConfig>(rows, activations).nvfp4;
+}
+
 template<class Backend>
 inline constexpr auto prepare_mini_moe = mini_grouped::prepare<MiniMoeConfig, Backend>;
 

@@ -60,7 +60,7 @@ std::string cli_outcome(std::string_view tier, std::string_view value) {
         [](const std::string&) -> std::shared_ptr<const strix::serve::BpeTokenizer> { return {}; },
         true, [](std::string_view) { return std::string{}; }, true};
     return outcome([&] {
-        const auto options = strix::inkling2::cli::parse(static_cast<int>(argv.size()), argv.data(), family, false);
+        const auto options = strix::inkling2::cli::parse(static_cast<int>(argv.size()), argv.data(), family);
         check(!sp::block_draft_selection(options.tier).enabled(), "CLI selection must stay OFF");
     });
 }

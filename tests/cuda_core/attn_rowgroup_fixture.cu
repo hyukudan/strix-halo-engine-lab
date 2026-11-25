@@ -40,7 +40,7 @@ template <class T> struct Buffer {
 
 int compare(cudaStream_t stream) {
     constexpr unsigned rows = 7, first = 15;
-    constexpr auto plan = *rg::make_launch_plan<Layout>(rows, baseline::kKvHeads);
+    constexpr auto plan = *rg::make_launch_plan<Layout>(rows, baseline::kKvHeads, rg::kFlashGridLimits);
     constexpr auto scratch_bytes = rg::workspace_bytes<Layout>(plan.tiles);
     static_assert(scratch_bytes == 82048);
     std::vector<std::uint32_t> selected(std::size_t{rows} * baseline::kMaxSelected);

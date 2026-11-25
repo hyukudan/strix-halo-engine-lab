@@ -1,4 +1,5 @@
 #include "attn_core/prepared_gqa_attention.hpp"
+#include "inkling2/inkling2_mini_moe_dispatch.hpp"
 #include "inkling2/inkling2_mini_resident_route.hpp"
 #include "strix/serve/cohort_passes.hpp"
 
@@ -35,6 +36,49 @@ constexpr bool check_routes() {
 }
 
 static_assert(check_routes());
+
+// The prompt-row rule of a bound W4A4 class: every prefill row runs the class (a one-row prefill chunk on the grouped
+// route, so a lone prompt row or a singleton tail is quantised like a row of a wide chunk); decode and verify rows never
+// do and keep their routes; with no class bound every route is the incumbent one.
+constexpr bool check_w4a4_rows() {
+    using strix::inkling2::mini_resident_chunk_route;
+    using strix::inkling2::mini_w4a4_rows;
+    for (bool packed : {false, true}) {
+        for (unsigned rows = 1; rows <= 128U; rows = rows * 2U + 1U) {
+            for (auto kind : {MiniAppendKind::prefill, MiniAppendKind::decode, MiniAppendKind::verify}) {
+                const auto incumbent = mini_resident_route(kind, rows, packed, false);
+                const auto off = mini_resident_chunk_route(kind, rows, packed, false);
+                const auto on = mini_resident_chunk_route(kind, rows, packed, true);
+                if (mini_w4a4_rows(false, kind) || mini_w4a4_rows(true, kind) != (kind == MiniAppendKind::prefill))
+                    return false;
+                if (off.attention_rows != incumbent.attention_rows || off.packed_moe != incumbent.packed_moe ||
+                    off.step_graph != incumbent.step_graph || on.attention_rows != incumbent.attention_rows ||
+                    on.step_graph != incumbent.step_graph)
+                    return false;
+                if (on.packed_moe != (kind == MiniAppendKind::prefill ? false : incumbent.packed_moe)) return false;
+            }
+        }
+    }
+    return true;
+}
+
+static_assert(check_w4a4_rows());
+
+bool check_w4a4_reservation() {
+    using namespace strix::inkling2;
+    using A = strix::moe_core::grouped_w4a4::Activations;
+    constexpr unsigned rows = 128U;
+    const auto one_term = mini_moe_nvfp4_image_bytes(rows, A::nvfp4);
+    for (auto activations : {A::nvfp4_mse_r2_gate_up, A::nvfp4_mse_r2, A::nvfp4_r2}) {
+        const auto bytes = mini_moe_nvfp4_image_bytes(rows, activations);
+        if (bytes <= one_term) return false;
+        std::vector<std::uint8_t> storage(bytes + 255U);
+        auto* aligned = storage.data() + (256U - reinterpret_cast<std::uintptr_t>(storage.data()) % 256U) % 256U;
+        if (!mini_grouped::nvfp4_image_fits<MiniMoeConfig>({aligned, bytes}, rows, activations) ||
+            mini_grouped::nvfp4_image_fits<MiniMoeConfig>({aligned, one_term}, rows, activations)) return false;
+    }
+    return true;
+}
 
 // Packed decode (the one default of the command line and strix-serve): every lane of a cohort of any width runs the
 // packed expert form, in passes no wider than the one-row cap of the dense rows family (16 on HIP), exactly as
@@ -162,6 +206,10 @@ bool check_windows() {
 }  // namespace
 
 int main() {
+    if (!check_w4a4_reservation()) {
+        std::cerr << "FAIL Inkling Mini resident W4A4 reservation\n";
+        return 1;
+    }
     if (!check_cohort_transaction()) {
         std::cerr << "FAIL Inkling Mini cohort pass transaction (snapshot, publish after the last pass, retire)\n";
         return 1;

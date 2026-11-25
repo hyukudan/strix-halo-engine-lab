@@ -731,12 +731,13 @@ struct Engine::Impl {
     unsigned pf_flash_keys = 2;
     unsigned pf_rg_rows = 0;  // STRIX_MM_PF_MSA_RG_ROWS=0 (auto) | 4 | 8: row-group flash rows per work-group (same bits)
     std::array<std::uint64_t, 7> pf_flash_launches{};
-    // STRIX_MM_PF_DENSE_MLP (default ON, exact): the dense MLP of layers 0..kFirstMoe-1 (gate + up, then down) on the v4
-    // prefill core for 4096-row pieces (dense_mlp), the q/k/v core contract (== strix_gemm bitwise); 0 keeps strix_gemm.
+    // STRIX_MM_PF_DENSE_MLP prefers v4 for 4096-row pieces. STRIX_MM_PF_DENSE_TAIL_FIXED=1 (opt-in, identity
+    // mmx-pf-linear-s1-v2) also requires it with the invariant order wherever the library split differs (any tail).
     bool pf_dense_mlp = true;
+    bool pf_dense_tail_fixed = false;
     bool pf_headless_logged = false;
     std::uint64_t pf_headless_chunks = 0;  // chunks that ran their last layer cache-only
-    std::uint64_t pf_dense_mlp_calls = 0;  // dense MLP pieces that ran on the v4 core
+    std::uint64_t pf_dense_mlp_calls = 0;  // preferred 4096-row v4 MLP pieces (A/B coverage)
     bool pf_msa_batch = true;  // STRIX_MM_PF_MSA_BATCH (default ON, exact measurement): independent scratch per prefill window
     unsigned pf_msa_windows = 0;
     float *pf_scores = nullptr, *pf_partial = nullptr;
@@ -976,6 +977,7 @@ struct Engine::Impl {
             pf_rg_rows = mode == "4" ? 4U : mode == "8" ? 8U : 0U;
         }
         pf_dense_mlp = env_flag("STRIX_MM_PF_DENSE_MLP", true);
+        pf_dense_tail_fixed = defaults::dense_tail_fixed(strix::envcfg::text);
         if (const char* value = std::getenv("STRIX_MM_PF_IDX_CONC")) {
             const std::string mode(value);
             if (mode != "0" && mode != "1" && mode != "2")
@@ -1357,7 +1359,8 @@ struct Engine::Impl {
             const char* order = strix::envcfg::text("STRIX_MMX_PF_ORDER");
             const bool inv = mmoe::prefill_order_invariant();
             rr::lever("minimax.linear_order", order != nullptr && *order != 0 ? order : "default",
-                      inv ? "invariant:mmx-pf-linear-s1-v1" : "adaptive", inv ? rr::Reason::selected : rr::Reason::disabled);
+                      inv ? std::string("invariant:") + defaults::invariant_order_id(strix::envcfg::text) : "adaptive:not-batch-invariant",
+                      inv ? rr::Reason::selected : rr::Reason::disabled);
         }
         rr::lever("minimax.moe_kernels", moe_opt ? "1" : "0", moe_opt ? "1" : "0");
     }
@@ -2111,7 +2114,7 @@ struct Engine::Impl {
     // Prefill q/k/v on the v4 core: measured faster than three strix_gemm calls from 1024 rows (bench pfdv4 q+k+v
     // T1024 0.78, T4096 0.70; o alone is slower at 1024 rows and stays on the library).
     static constexpr std::size_t kDenseQkvMinRows = 1024;
-    // Invariant order (STRIX_MMX_PF_ORDER=invariant, identity mmx-pf-linear-s1-v1): strix_gemm's split follows the rows
+    // Invariant order (STRIX_MMX_PF_ORDER=invariant): strix_gemm's split follows the rows
     // (route::gemm_splits; <= 8 rows a GEMV chain), so a call whose library split differs from the fixed contract runs on
     // the v4 core with S = kDenseFixedSplits. Where they agree (> 8 rows, S = 1) both give the same bits
     // (test_prefill_dense: v4 == strix_gemm bitwise at equal S) and the measured route choice stays.
@@ -2127,15 +2130,17 @@ struct Engine::Impl {
     }
     template <std::size_t N> bool dense_available(std::size_t n, const mmoe::PrefillDenseJob (&jobs)[N]) const {
         if (pf_ws == nullptr) return false;
-        for (const auto& j : jobs)  // raw weights loaded, same input width, implemented bit width
-            if (j.w.trellis == nullptr || j.w.input != jobs[0].w.input || !mmoe::prefill_dense_supported(j.w)) return false;
+        for (const auto& j : jobs)
+            if (j.w.trellis == nullptr || j.w.suh == nullptr || j.w.svh == nullptr || j.w.input == 0 || j.w.output == 0 ||
+                j.w.input != jobs[0].w.input || !mmoe::prefill_dense_supported(j.w)) return false;
         return mmoe::prefill_dense_workspace_bytes(jobs, static_cast<unsigned>(N), static_cast<unsigned>(n)) <= pf_ws_bytes;
     }
     // Invariant prefill must cover every layer and every tail, even when the preferred dense routes are OFF.
     // With fixed S=1, workspace size is monotone in rows, so max_rows bounds every admitted chunk.
-    // A table default (pf_order) that cannot hold declines to adaptive with a printed reason, before receipts; an
-    // explicit STRIX_MMX_PF_ORDER=invariant keeps the hard error. Both ranks load the same config and weights, so the
-    // decision is the same on each rank (and the route receipt fingerprint checks it).
+    // A table default (pf_order) that cannot hold declines to adaptive with a printed reason, before receipts (the
+    // decline re-exports STRIX_MMX_PF_ORDER, so route receipt and cache identity name the effective order); an
+    // explicit STRIX_MMX_PF_ORDER=invariant, or STRIX_MM_PF_DENSE_TAIL_FIXED=1 (which needs the invariant order), keeps
+    // the hard error. Both ranks load the same config and weights, so the decision is the same on each rank.
     void require_invariant_dense() const {
         if (!mmoe::prefill_order_invariant()) return;
         const char* unmet = nullptr;
@@ -2146,9 +2151,15 @@ struct Engine::Impl {
             const mmoe::PrefillDenseJob o1[1] = {{y.ro, part}};
             if (!dense_available(opt.max_rows, qkv) || !dense_available(opt.max_rows, o1))
                 unmet = "STRIX_MMX_PF_ORDER=invariant requires supported resident q/k/v/o weights and sufficient prefill workspace";
+            else if (pf_dense_tail_fixed && !y.moe && !fp32_prefill) {
+                const mmoe::PrefillDenseJob gu[2] = {{y.rdense.gate, big1}, {y.rdense.up, big2}};
+                const mmoe::PrefillDenseJob dn[1] = {{y.rdense.down, part}};
+                if (!dense_available(opt.max_rows, gu) || !dense_available(opt.max_rows, dn))
+                    unmet = "STRIX_MMX_PF_ORDER=invariant requires supported resident dense MLP gate/up/down weights and sufficient prefill workspace";
+            }
         }
         if (unmet == nullptr) return;
-        if (!defaults::from_defaults("STRIX_MMX_PF_ORDER")) throw std::invalid_argument(unmet);
+        if (!defaults::from_defaults("STRIX_MMX_PF_ORDER") || pf_dense_tail_fixed) throw std::invalid_argument(unmet);
         defaults::decline_default("STRIX_MMX_PF_ORDER", "adaptive", unmet);
         mmoe::set_prefill_moe_order(0);
     }
@@ -2172,13 +2183,15 @@ struct Engine::Impl {
         return dense_admit(n, job, pf_dense_o && n == kDenseORows);
     }
 
-    // Prefill dense MLP (layers 0..kFirstMoe-1) on the v4 core: gate + up in one call, down in another, the dense_qkv
-    // contract (== strix_gemm bitwise). Only 4096-row pieces (the size measured; others keep strix_gemm).
-    bool dense_mlp(std::size_t n, const mmoe::PrefillDenseJob* jobs, unsigned count) const {
-        if (!pf_dense_mlp || n != kDenseORows || pf_ws == nullptr) return false;
-        for (unsigned i = 0; i < count; ++i)  // raw weights loaded, same input width, implemented bit width
-            if (jobs[i].w.trellis == nullptr || jobs[i].w.input != jobs[0].w.input || !mmoe::prefill_dense_supported(jobs[i].w)) return false;
-        return mmoe::prefill_dense_workspace_bytes(jobs, count, static_cast<unsigned>(n)) <= pf_ws_bytes;
+    // With STRIX_MM_PF_DENSE_TAIL_FIXED=1 the three projections move together so an off-contract gate, up or down cannot
+    // send the chain to the library. Default: the 4096-row preference only; other tails keep the library chain.
+    bool dense_mlp(std::size_t n, const mmoe::PrefillDenseJob (&gu)[2], const mmoe::PrefillDenseJob (&dn)[1]) const {
+        const bool forced = pf_dense_tail_fixed && (dense_forced(n, gu) || dense_forced(n, dn));
+        if (!forced && !(pf_dense_mlp && n == kDenseORows)) return false;
+        const bool available = dense_available(n, gu) && dense_available(n, dn);
+        if (forced && !available)
+            throw std::runtime_error("STRIX_MMX_PF_ORDER=invariant dense MLP route unavailable; refusing adaptive fallback");
+        return available;
     }
 
     // Layer L up to the attention partial: q/k/v + index projections, MSA, o_proj -> out (n rows; h / hn: the rows').
@@ -2545,11 +2558,11 @@ struct Engine::Impl {
                     }
                 } else if (const mmoe::PrefillDenseJob gu[2] = {{y.rdense.gate, big1}, {y.rdense.up, big2}},
                            dn[1] = {{y.rdense.down, out}};
-                           !gemv && dense_mlp(n, gu, 2) && dense_mlp(n, dn, 1)) {  // STRIX_MM_PF_DENSE_MLP
+                           !gemv && dense_mlp(n, gu, dn)) {  // STRIX_MM_PF_DENSE_MLP
                     mmoe::enqueue_prefill_dense(gu, 2, hn, static_cast<unsigned>(n), pf_ws, pf_ws_bytes, nullptr);
                     STRIX_HIP_LAUNCH_GGL(Rdna3Layout, swiglu_kernel, dim3(grid(n * kDenseLocal)), dim3(256), 0, nullptr, big1, big2, big1, n * kDenseLocal);
                     mmoe::enqueue_prefill_dense(dn, 1, big1, static_cast<unsigned>(n), pf_ws, pf_ws_bytes, nullptr);
-                    ++pf_dense_mlp_calls;
+                    if (pf_dense_mlp && n == kDenseORows) ++pf_dense_mlp_calls;
                 } else {
                     run_mlp(y.dense, hn, n, kDenseLocal, out);
                 }

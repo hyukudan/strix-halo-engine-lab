@@ -1,4 +1,4 @@
-#include "cuda/core/tall_k_plan.hpp"
+#include "core/tall_k_plan.hpp"
 
 #include <array>
 #include <bit>
@@ -8,6 +8,8 @@
 #include <vector>
 
 namespace tall = strix::cuda::core::tall;
+using strix::core::tall::KPlan;
+using strix::core::tall::k_plan;
 using enum tall::Reduction;
 using enum tall::Store;
 
@@ -37,7 +39,7 @@ static_assert(Fp4::tile.rows == 256 && Fp4::tile.outputs == 128 && Fp4::tile.k =
 static_assert(Fp4::scale == tall::Scale::row_tensor && Fp4::glu_outputs == 64 && Fp4::admits(glu) && !Fp4::admits(glu_bf16));
 static_assert(Fp4Bulk::tile.threads == 384 && Fp4Bulk::tile.stages == 3 && Fp4Bulk::admits(glu_bf16) && !Fp4Bulk::admits(glu));
 
-static void check(const tall::KPlan& actual, const std::vector<int>& blocks,
+static void check(const KPlan& actual, const std::vector<int>& blocks,
                   const std::vector<int>& ends, const char* name) {
     if (actual.blocks != blocks || actual.ends != ends) {
         std::fprintf(stderr, "FAIL %s K plan\n", name);
@@ -47,7 +49,7 @@ static void check(const tall::KPlan& actual, const std::vector<int>& blocks,
 
 int main() {
     // The 33rd K32 goes back to warp zero after eight four-block groups.
-    const auto bf16 = tall::k_plan(warp_chain, 1056, 0, 1);
+    const auto bf16 = k_plan(warp_chain, 1056, 0, 1);
     check(bf16,
           {0, 1, 2, 3, 32, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
            16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31},
@@ -72,15 +74,15 @@ int main() {
     }
     // The 65th through 68th K32s go back to warp zero with the Q8 fold's
     // eight-block group size. Two-block units preserve segment boundaries.
-    check(tall::k_plan(q8_group_fold, 2176, 0, 2),
+    check(k_plan(q8_group_fold, 2176, 0, 2),
           {0, 2, 4, 6, 64, 66, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30,
            32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62},
           {6, 10, 14, 18, 22, 26, 30, 34}, "Q8 group fold");
-    check(tall::k_plan(warp_chain, 128, 0, 1), {0, 1, 2, 3}, {4, 4, 4, 4, 4, 4, 4, 4}, "empty BF16 warp segments");
-    check(tall::k_plan(nvfp4_split, 640, 3, 1),
+    check(k_plan(warp_chain, 128, 0, 1), {0, 1, 2, 3}, {4, 4, 4, 4, 4, 4, 4, 4}, "empty BF16 warp segments");
+    check(k_plan(nvfp4_split, 640, 3, 1),
           {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19},
           {4, 12, 20}, "F16 uneven NVFP4 split");
-    check(tall::k_plan(nvfp4_split, 640, 3, 2),
+    check(k_plan(nvfp4_split, 640, 3, 2),
           {0, 2, 4, 6, 8, 10, 12, 14, 16, 18}, {2, 6, 10}, "F16 two-block pipeline");
     std::puts("PASS K2c CUDA tall host oracle");
 }

@@ -18,7 +18,8 @@ namespace rec = strix::cuda::recur;
 namespace frozen = rec::test::frozen;
 namespace am = strix::cuda::amdmath;
 using strix::RecurrentStateType;
-using L = rec::Gfx1151Decode;
+constexpr auto kShape = strix::ops::recur::shape::gdn_2560_16x48x128;
+using L = strix::ops::recur::GdnDecodeLayout<kShape>;
 
 static_assert(L::channels == frozen::kConvWidth && L::value_width == frozen::kValueWidth &&
               L::matrix_elements == frozen::kMatrixFloats && L::history_elements == frozen::kConvStateHalfs);
@@ -156,7 +157,7 @@ void run(const am::Tables& tables, bool a8) {
                              work.beta, work.gate, work.out, a8 ? work.raw : nullptr};
     const rec::DecodeState state{work.history, work.matrix_in, a8 ? work.matrix_in : work.matrix_out, Type};
     const rec::DecodeA8 quant = a8 ? rec::DecodeA8{work.codes, work.deltas} : rec::DecodeA8{};
-    check(rec::enqueue_decode({}, w, row, state, tables, quant, nullptr));
+    check(rec::enqueue_decode(kShape, w, row, state, tables, quant, nullptr));
     check(cudaDeviceSynchronize());
 
     compare("prepared QKV", a8 ? work.qkv : work.prepared, ref.qkv);

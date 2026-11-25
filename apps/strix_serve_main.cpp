@@ -4,6 +4,9 @@
 
 #if defined(STRIX_SERVE_NATIVE_LAUNCH) || defined(STRIX_SERVE_CLI_ONLY)
 #include "strix/cli/cli.hpp"
+#if defined(STRIX_SERVE_NATIVE_LAUNCH)
+#include "strix/serve/native_handoff.hpp"
+#endif
 #include <filesystem>
 #include <iostream>
 #endif
@@ -25,17 +28,8 @@ int main(int argc, char** argv) {
         shell.registry_root = cli::data_directory(cli::executable_directory()).string();
 #endif
     shell.launch = [](const sv::ServiceSelection& selection, const sv::ServeShell::NativeRequest& request, std::ostream& out) {
-        cli::Request native;
-        native.verb = cli::Verb::serve;
-        native.model = selection.model.name;
-        native.asset = request.asset;
-        native.args = selection.arguments;
-        native.profile = request.tier;
-        native.backend = request.backend;
-        native.host = request.bind;
-        native.port = request.port;
-        native.print_effective_config = request.print;
-        return cli::launch_native(native, selection.model, selection.description, selection.root, out);
+        return cli::launch_native(sv::native_serve_request(selection, request), selection.model, selection.description,
+                                  selection.root, out);
     };
     return sv::run(argc, argv, factories, std::cout, std::cerr, shell);
 #else

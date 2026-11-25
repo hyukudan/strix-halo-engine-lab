@@ -137,9 +137,11 @@ inline constexpr std::string_view kDecodeRegime = "decode";
 // the measured gain covers when the gain was banded by lanes (0: not banded): outside that band the row keeps its gate
 // v2 PASS (it admits its regime) but its gain does not select the image. Quality does not depend on the lane count
 // only when every lane keeps its one-row arithmetic in the consumers; the gate receipt is what states that.
+// max_rows bounds the active step rows for an image that also keeps the incumbent resident.
+// A zero row bound is unlimited.
 struct WeightLoadEvidence {
     std::string_view receipt, date;
-    std::uint32_t rows = 0, max_context = 0, max_lanes = 0;
+    std::uint32_t rows = 0, max_context = 0, max_lanes = 0, max_rows = 0;
 };
 
 // What an instance holds when it resolves its image: resident context capacity in tokens and concurrent decode lanes
@@ -161,11 +163,15 @@ struct WeightLoadExtent {
 
 // A row with a zero measured_gain records a gate v2 PASS without a speed gain in its regime: it never selects the
 // storage by itself, but admits its regime onto an image another regime's full row selects (see WeightLoadRequest).
+// A row with a gate v2 PASS qualifies FAST and TURBO. A row without one (zero gate_v2_pass) qualifies TURBO only, and
+// only with a measured gain and its measured quality against BF16 stated in `turbo_quality` (receipt text such as
+// 'kl=... top1=... dnll=... flip_ratio=... receipt=...'); FAST never takes it.
 struct WeightLoadDecision {
     Id policy;
     WeightLoadScope scope;
     Digest256 gate_v2_pass, measured_gain;
     WeightLoadEvidence evidence{};
+    std::string_view turbo_quality{};
 };
 
 // The measured gain of `row` could select its image for an instance of this extent (bands only; the scope and the
@@ -224,6 +230,7 @@ struct WeightLoadPlan {
     std::string_view reason;
     Digest256 gate_v2_pass{}, measured_gain{};
     FormatId head_storage = kBf16WeightStorage;
+    std::string_view turbo_quality{};  // non-empty: admitted by a TURBO-only row (quality below the FAST gate, stated)
     std::array<RegimeWeightLoad, kMaxWeightLoadRegimes> regimes{};  // per regime, in request order
     std::size_t regime_count = 0;
 
@@ -232,6 +239,12 @@ struct WeightLoadPlan {
     }
     [[nodiscard]] RoleStorage roles() const { return {storage, head_storage}; }
     [[nodiscard]] std::span<const RegimeWeightLoad> regime_rows() const { return std::span(regimes).first(regime_count); }
+    // The step band of `regime` (its matched row's evidence.max_rows; 0: no row, or not banded).
+    [[nodiscard]] std::uint32_t row_band(std::string_view regime) const {
+        for (const auto& r : regime_rows())
+            if (r.regime == regime && r.row != nullptr) return r.row->evidence.max_rows;
+        return 0U;
+    }
 };
 
 // A 64-hex content digest literal for receipt rows compiled into a decision table. A malformed literal yields the
@@ -266,11 +279,16 @@ const WeightLoadDecision* find_weight_load_decision(const WeightLoadPolicy&, con
 // The gate v2 PASS row of `scope.regime`, matched like the above and inside its context band for `extent.context`
 // (0: unknown): rows whose gain selects for `extent.lanes` first (full), then any other PASS row (gate-only, or a
 // gain outside its lane band). `outside_band` (optional) receives a row that matched but whose context band misses.
+// With turbo, a TURBO-only gain may select when no FAST gain applies.
 const WeightLoadDecision* find_weight_load_gate(const WeightLoadPolicy&, const WeightLoadScope&,
                                                 std::span<const WeightLoadDecision>, WeightLoadExtent extent,
-                                                const WeightLoadDecision** outside_band = nullptr);
+                                                const WeightLoadDecision** outside_band = nullptr, bool turbo = false);
 WeightLoadPlan resolve_weight_load(const Registry&, const WeightLoadPolicy&,
                                    const WeightLoadRequest&, std::span<const WeightLoadDecision>);
+
+// Receipt line of the scope a decision row must match: 'strix-weight-load-scope/v1 device <class> compiler <id> regime
+// <regime> build <hex> checkpoint <hex>' (64-digit digests, the literals weight::digest_from_hex reads).
+[[nodiscard]] std::string weight_load_scope_receipt(const WeightLoadScope& scope);
 
 // Per-regime receipt line of a plan: 'strix-weight-load-regimes/v1 <policy id> <storage id> <status> <regime>=<q>'
 // per regime, <q> = full | gate-only | none, then ':<receipt id>' of the matched row (plus ':gain-lanes<=N' when its

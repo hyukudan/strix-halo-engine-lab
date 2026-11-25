@@ -69,6 +69,16 @@ inline constexpr std::int64_t full_attention_layers = 1;
 inline constexpr bool hidden_state_source_layer_explicit = false;
 inline constexpr bool use_dedicated_embeddings = false;
 } // namespace mtp
+namespace multi_device {
+namespace legacy_env {
+inline constexpr std::string_view STRIX_PAIR_STAGE_MAP = "forms.layers.cut";
+inline constexpr std::string_view STRIX_QWEN_PAIR_CHUNK_POLICY = "forms.layers.window_rows";
+inline constexpr std::string_view STRIX_QWEN_PAIR_HALF_CUT = "forms.layers.cut";
+inline constexpr std::string_view STRIX_QWEN_PF_PIPE = "forms.layers";
+inline constexpr std::string_view STRIX_QWEN_PF_PIPE_CHUNK = "forms.layers.window_rows";
+inline constexpr std::string_view STRIX_QWEN_PF_PIPE_CUT = "forms.layers.cut";
+} // namespace legacy_env
+} // namespace multi_device
 inline constexpr std::string_view name = "qwen3.8-flash-next";
 namespace norm {
 inline constexpr double rms_epsilon = 0x1.0c6f7a0b5ed8dp-20 /* 1e-06 */;

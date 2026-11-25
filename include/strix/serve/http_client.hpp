@@ -25,6 +25,8 @@ struct HttpClientRequest {
     // (a generation may think for a long time before its first token).
     int idle_timeout_ms = 0;
     std::uint64_t max_head_bytes = 64ULL << 10U;
+    // Optional numeric socket destination. The HTTP Host still uses host.
+    std::string connect_host;
 };
 
 struct HttpClientHead {
@@ -56,6 +58,10 @@ struct HttpClientResult {
     std::uint64_t body_bytes = 0;
     std::string error;               // empty when ok
 };
+
+// Numeric TCP destinations in dial order, including the numeric IPv6 scope when present.
+// IPv4-mapped addresses compare as IPv4. Empty when the host cannot be resolved.
+[[nodiscard]] std::vector<std::string> resolve_http_hosts(const std::string& host, std::uint16_t port);
 
 [[nodiscard]] HttpClientResult http_exchange(const HttpClientRequest& request, const HttpClientSink& sink);
 

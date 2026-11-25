@@ -1,6 +1,8 @@
 // strix-router: places API requests across independent engine replicas (one full engine per node).
 // Each replica is an ordinary strix HTTP server; the router only reads its status route and forwards bytes.
 
+#include "strix/model_description.hpp"
+#include "strix/profile/model_preset.hpp"
 #include "strix/serve/http_server.hpp"
 #include "strix/serve/replica_proxy.hpp"
 
@@ -10,6 +12,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -31,6 +34,10 @@ void usage() {
         "  --affinity-entries N      affinity table slots (default 4096)\n"
         "  --max-connections N       concurrent client connections (default 256)\n"
         "  --status-target PATH      replica status route (default /api/status)\n"
+        "  --description PATH        model TOML: admit the replicas only if its [multi_device] resolves the\n"
+        "                            replica form for this many endpoints (same resolver as strix run/serve --device-count N)\n"
+        "  --placement replica      select the declared replica form explicitly\n"
+        "  --profile exact|fast|turbo  tier of that admission (default: the model's presets.default)\n"
         "Placement: named session, then longest shared prompt prefix (unless that replica is more than one\n"
         "slot busier), then least busy. Router routes: GET /router/status, GET /health.\n";
 }
@@ -53,6 +60,9 @@ int main(int argc, char** argv) {
         server_config.port = 8090;
         server_config.max_connections = 256;
         int poll_ms = 250;
+        std::string description_path;
+        std::optional<strix::profile::Name> tier;
+        bool explicit_replica = false;
         for (int i = 1; i < argc; ++i) {
             const std::string_view arg = argv[i];
             if (arg == "--help" || arg == "-h") { usage(); return 0; }
@@ -74,14 +84,27 @@ int main(int argc, char** argv) {
             else if (arg == "--affinity-entries") proxy_config.affinity_entries = static_cast<std::size_t>(number(arg, value, 1, 1 << 24));
             else if (arg == "--max-connections") server_config.max_connections = static_cast<unsigned>(number(arg, value, 1, 65535));
             else if (arg == "--status-target") proxy_config.status_target = std::string(value);
+            else if (arg == "--description") description_path = std::string(value);
+            else if (arg == "--placement") {
+                if (value != "replica") throw std::invalid_argument("--placement requires replica");
+                explicit_replica = true;
+            } else if (arg == "--profile") tier = strix::profile::parse_tier(value);
             else throw std::invalid_argument("unknown option " + std::string(arg));
         }
         if (proxy_config.replicas.empty()) { usage(); return 2; }
         if (proxy_config.replicas.size() > strix::serve::ReplicaRouter::kMaxReplicas)
             throw std::invalid_argument("at most 64 replicas");
-
         strix::serve::ReplicaProxy proxy(proxy_config);
-        proxy.refresh();
+        if (!description_path.empty()) {
+            const auto preset = strix::profile::resolve_replica_router(strix::model_description::load(description_path),
+                tier, static_cast<std::uint32_t>(proxy_config.replicas.size()), explicit_replica);
+            proxy.admit_distinct_workers();
+            std::cout << "effective-multi-device " << preset.config.find("multi_device")->dump() << std::endl;
+        } else {
+            if (tier) throw std::invalid_argument("--profile needs --description");
+            if (explicit_replica) throw std::invalid_argument("--placement needs --description");
+            proxy.refresh();
+        }
         strix::serve::HttpServer server(server_config,
             [&](const strix::serve::HttpRequest& request, strix::serve::HttpResponseWriter& response) {
                 proxy.handle(request, response);

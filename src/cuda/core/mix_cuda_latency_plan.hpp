@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/mix_latency_plan.hpp"
 #include "core/residual_mix.hpp"
 
 #include <cstddef>
@@ -10,16 +11,10 @@ inline constexpr unsigned kLatencyTile = 512U;
 inline constexpr unsigned kLatencyBankThreads = 128U;
 inline constexpr unsigned kLatencyMaxWidth = 4096U;
 
-struct LatencyGrid {
-    unsigned tiles;
-    unsigned queries;
-    unsigned banks;
-};
+using LatencyGrid = ::strix::core::residual_mix::LatencyGrid;
 
 [[nodiscard]] inline LatencyGrid latency_grid(const ::strix::core::residual_mix::MixArgs& args) {
-    if (args.rows != 1U || args.width > kLatencyMaxWidth || !::strix::core::residual_mix::fits(args))
-        return {};
-    return {(args.width - 1U) / kLatencyTile + 1U, args.query_count, args.bank_count};
+    return ::strix::core::residual_mix::latency_grid(args, kLatencyTile, kLatencyMaxWidth);
 }
 
 // grid.queries counts the jobs of every set (blockIdx.y = job).

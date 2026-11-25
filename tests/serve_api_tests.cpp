@@ -2473,6 +2473,10 @@ int main(int argc, char** argv) try {
         for (const auto& recent : at(status, "requests").as_array()) check(!recent.find("power"), "request power receipt served without the API key");
         check(strix::power::sampler_enabled(), "authorization fixture needs the sampler enabled");
         const auto keyed = parse_json(http(port, "GET", "/api/status", "", auth).body);
+        const auto* instance = status.find("worker_instance_id");
+        check(instance && instance->is_string() && !instance->as_string().empty() &&
+              at(keyed, "worker_instance_id").as_string() == instance->as_string(),
+              "status exposes the same worker instance with and without authentication");
         check(keyed.find("power") && at(*keyed.find("power"), "schema").as_string() == "strix-power-status-v1", "power view with the API key");
         const auto& keyed_recent = at(keyed, "requests").as_array();
         check(!keyed_recent.empty() && keyed_recent[0].find("power"), "keyed recent request must carry an actual power receipt");

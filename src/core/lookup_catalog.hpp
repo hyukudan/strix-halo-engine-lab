@@ -1,6 +1,6 @@
 #pragma once
 
-#include "lookup_cuda.cuh"
+#include "core/lookup_plan.hpp"
 #include "strix/exec/catalog.hpp"
 
 #include <array>

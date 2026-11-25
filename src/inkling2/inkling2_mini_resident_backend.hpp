@@ -10,6 +10,7 @@
 #if !defined(__HIPCC__)
 #include "inkling2_mini_controller_operands_cuda.hpp"
 #endif
+#include "inkling2_mini_weight_options.hpp"
 #include "moe_core/microscaled_r1.hpp"
 
 #include <algorithm>
@@ -298,18 +299,37 @@ public:
     // FAST W4A4 expert lever (inkling2-mini-moe-w4a4@1): multi-row prefill chunks run admitted NVFP4 expert layers through
     // the shared grouped W4A4 operand class. The NVFP4 image of the assignment rows is allocated only when the lever is on.
     // `activations` is the shared operand class the lever value selects (moe_core/grouped_w4a4.hpp: nvfp4 = nearest@1 scale
-    // rule, nvfp4_mse = mse@1, nvfp4_mse_gate_up = mse@1 gate-up with the down projection on BF16 activations).
+    // rule, nvfp4_mse = mse@1, nvfp4_mse_gate_up = mse@1 gate-up with the down projection on BF16 activations,
+    // nvfp4_mse_r2_gate_up / nvfp4_mse_r2 = two-term activations on gate-up / on both projections, nvfp4_r2 = two nearest@1
+    // terms on both projections).
     // bf16 = lever off. Every entry point (gate, generation CLI, step program, server) passes the resolved class.
     void set_moe_w4a4(moe_core::grouped_w4a4::Activations activations) {
-#if defined(__HIPCC__)
-        static_cast<void>(activations);
-#else
+        // Admission for this build's backend: a class the backend cannot run is refused (HIP holds no W4A4 tile).
+        static_cast<void>(admit_mini_moe_w4a4(activations, kMiniBuildBackend));
+#if !defined(__HIPCC__)
         moe_w4a4_ = activations != moe_core::grouped_w4a4::Activations::bf16;
         moe_w4a4_class_ = activations;
         if (!moe_w4a4_) return;
         for (unsigned layer = 0; layer < kPhysicalLayers; ++layer)
             moe_w4a4_layer_[layer] = mini_grouped::admit_w4a4<MiniMoeConfig>(layer, weights_.experts(layer));
-        if (!moe_nvfp4_) moe_nvfp4_.emplace(mini_grouped::workspace_elements<MiniMoeConfig>(max_rows_).nvfp4);
+        // The shared dispatch refuses an image too small for the selected class.
+        const auto bytes = mini_moe_nvfp4_image_bytes(max_rows_, activations);
+        if (!moe_nvfp4_ || moe_nvfp4_->span().size() < bytes) moe_nvfp4_.emplace(bytes);
+#endif
+    }
+
+#if !defined(__HIPCC__)
+    [[nodiscard]] moe_core::grouped_w4a4::Activations moe_w4a4_class(unsigned layer) const noexcept {
+        return moe_w4a4_ && moe_w4a4_layer_[layer] ? moe_w4a4_class_ : moe_core::grouped_w4a4::Activations::bf16;
+    }
+#endif
+
+    // True while a W4A4 class is bound (CUDA only; HIP refuses a selected class in set_moe_w4a4).
+    [[nodiscard]] bool moe_w4a4_bound() const noexcept {
+#if defined(__HIPCC__)
+        return false;
+#else
+        return moe_w4a4_;
 #endif
     }
 
@@ -337,11 +357,7 @@ public:
     void start_chunk(unsigned rows, MiniAppendKind kind) {
         // Route capture/replay reads or writes host data synchronously. The step graph itself is
         // decided by try_step_graph; the route only picks the row geometry here.
-        route_ = mini_resident_route(kind, rows, packed_decode_, false, cohort_rows_);
-        route_flag_rows_ = route_.packed_moe ? rows : 1U;
-#if !defined(__HIPCC__)
-        chunk_w4a4_ = moe_w4a4_ && kind == MiniAppendKind::prefill && rows > 1U;
-#endif
+        select_route(rows, kind);
         clear_flags();
     }
 
@@ -370,9 +386,7 @@ public:
 
     // The host route of a chunk whose device work replays (the captured start_chunk also clears the flags).
     void prepare_route(unsigned rows, MiniAppendKind kind) {
-        route_ = mini_resident_route(kind, rows, packed_decode_, false, cohort_rows_);
-        route_flag_rows_ = route_.packed_moe ? rows : 1U;
-        chunk_w4a4_ = moe_w4a4_ && kind == MiniAppendKind::prefill && rows > 1U;
+        select_route(rows, kind);
     }
 
     // False: nothing ran (programs off, a gate tap or order-null arm, or this width declined); run eagerly.
@@ -896,9 +910,10 @@ public:
         const MiniMoeWorkspace workspace{moe_bf16_.span(), moe_fp32_.span(), moe_activation_.span(), {},
                                          moe_nan_seen_ ? moe_nan_seen_->data() : nullptr};
 #else
-        const bool w4a4 = chunk_w4a4_ && moe_w4a4_layer_[layer];
+        using A = moe_core::grouped_w4a4::Activations;
+        const auto activations = chunk_w4a4_ ? moe_w4a4_class(layer) : A::bf16;
         const MiniMoeWorkspace workspace{moe_bf16_.span(), moe_fp32_.span(), {},
-                                         w4a4 ? moe_nvfp4_->span() : std::span<std::uint8_t>{}};
+                                         activations != A::bf16 ? moe_nvfp4_->span() : std::span<std::uint8_t>{}};
 #endif
         const MiniMoeResidentRouteBuffers buffers{{ids, assignments}, {status, max_rows_},
                                                   route_scratch_.span(), route_weights};
@@ -916,19 +931,29 @@ public:
             check(enqueue_mini_hip_resident_moe(layer, rows, input, logits, bias, output, buffers,
                                                 matrices, csr, planned, workspace, stream_, gate_route_tap_));
 #else
-        const auto w4a4_class = w4a4 ? moe_w4a4_class_ : moe_core::grouped_w4a4::Activations::bf16;
         if (weights_.narrow_experts())
             check(enqueue_mini_cuda_resident_moe_decoded<MiniMoeNarrowConfig>(
                 moe_decode_, layer, rows, input, logits, bias, output, buffers, matrices, csr, planned, workspace, stream_,
-                gate_route_tap_, w4a4_class, moe_schedule_));
+                gate_route_tap_, activations, moe_schedule_));
         else
             check(enqueue_mini_cuda_resident_moe_decoded(moe_decode_, layer, rows, input, logits, bias, output, buffers,
                                                          matrices, csr, planned, workspace, stream_, gate_route_tap_,
-                                                         w4a4_class, moe_schedule_));
+                                                         activations, moe_schedule_));
 #endif
     }
 
 private:
+    // The row geometry of a chunk and the prompt-row rule of the bound W4A4 class (mini_resident_chunk_route). The class
+    // quantises each token row on its own and sums each (row, output) in a fixed K order, so a prompt row's bits do not
+    // depend on how the prompt is chunked.
+    void select_route(unsigned rows, MiniAppendKind kind) {
+        route_ = mini_resident_chunk_route(kind, rows, packed_decode_, moe_w4a4_bound(), cohort_rows_);
+#if !defined(__HIPCC__)
+        chunk_w4a4_ = mini_w4a4_rows(moe_w4a4_, kind);
+#endif
+        route_flag_rows_ = route_.packed_moe ? rows : 1U;
+    }
+
     void clear_flags() {
         mini_gpu::clear(flags_.data(), active_flags().size_bytes(), stream_);
     }

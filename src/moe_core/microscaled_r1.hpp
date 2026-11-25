@@ -6,6 +6,8 @@
 #include "moe_core/grouped_rows.hpp"
 #include "moe_core/r1_route.hpp"
 #include "moe_core/r1_tail.hpp"
+
+#include "moe_core/microscaled_r1_geometry.hpp"
 #include "strix/exec/descriptor.hpp"
 #include "strix/r1_rows_tiles.hpp"
 
@@ -32,7 +34,6 @@
 #include "cuda/core/common.cuh"
 #endif
 
-// Geometry helpers run on the host (launch grids) and in the kernels (column and row maps).
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #define STRIX_R1_HD __host__ __device__
 #else
@@ -180,20 +181,6 @@ inline bool admits_route(const Args& args, const r1_route::Inline<Policy, Math, 
            !r1_tail::overlap(writes[1], writes[2]);
 }
 
-// Launch geometry. A wave owns `columns` consecutive outputs and streams their rows together (gate_up: the gate and
-// up rows of each column; down_combine: one row per column per routed expert). Each row keeps its own accumulator,
-// lane->K mapping and butterfly, so the column count changes no output bit. It sets how many rows share one wave's
-// dependent load chain (ids -> matrices -> codes -> scales): on gfx1151 one row per wave left that chain carrying
-// 1.3 KB (gate) / 0.65 KB (down) and the kernels at 61 % / 53 % of the byte roof.
-// sm_120 (no-model bench cuda_core_moe_r1_geometry_bench, synthetic top-8 2304 / 1152 experts, rows 1): one column
-// per warp left gate_up / down_combine at 880 / 655-700 GB/s (NVFP4); two / four columns are 10 % / 14-19 % faster
-// per launch, with the same bits.
-struct Geometry {
-    unsigned gate_columns, down_columns;
-};
-inline constexpr unsigned kWavesPerBlock = 8;
-inline constexpr Geometry kHipGeometry{2U, 4U};
-inline constexpr Geometry kCudaGeometry{2U, 4U};
 #if defined(__HIPCC__)
 inline constexpr Geometry kGeometry = kHipGeometry;
 #else
@@ -207,14 +194,6 @@ inline constexpr Geometry kGeometry = kCudaGeometry;
 template <unsigned MaxRows>
 inline constexpr Geometry kUnionGeometry =
     MaxRows <= 4U ? kCudaGeometry : (MaxRows <= 8U ? Geometry{1U, 2U} : Geometry{1U, 1U});
-
-STRIX_R1_HD constexpr unsigned gate_blocks(unsigned intermediate, unsigned columns) {
-    return (intermediate - 1U) / (kWavesPerBlock * columns) + 1U;
-}
-STRIX_R1_HD constexpr unsigned gate_first_column(unsigned block, unsigned wave, unsigned columns) {
-    return (block * kWavesPerBlock + wave) * columns;
-}
-STRIX_R1_HD constexpr unsigned down_blocks(unsigned hidden, unsigned columns) { return (hidden - 1U) / columns + 1U; }
 
 // Launch-grid limits are backend data. The shared geometry is computed in 64 bits; every launch checks the grid(s) it
 // submits against the limits of the backend that submits them before anything is enqueued (a call no form can
@@ -308,18 +287,6 @@ STRIX_R1_HD constexpr unsigned staged_input_bytes(unsigned hidden) {
     const unsigned bytes = staged_input_slot(hidden, chunk) * static_cast<unsigned>(sizeof(float));
     return bytes <= kStagedInputMaxBytes ? bytes : 0U;
 }
-// Grid of the rows launch (x = column blocks, y = CTAs over rows): gate_up has one CTA per (row, route slot),
-// down_combine one per row. The decode rows launch and the verify step launch both use it, so a verify row is
-// the decode row's CTA.
-struct RowsGrid {
-    unsigned x, y;
-};
-STRIX_R1_HD constexpr RowsGrid gate_up_grid(unsigned intermediate, unsigned rows, unsigned top_k, unsigned columns) {
-    return {gate_blocks(intermediate, columns), rows * top_k};
-}
-STRIX_R1_HD constexpr RowsGrid down_combine_grid(unsigned hidden, unsigned rows, unsigned columns) {
-    return {down_blocks(hidden, columns), rows};
-}
 // Start order of the HIP gate_up rows kernel (gate_up_rows; one-dimensional grid of units x blocks CTAs, unit =
 // routed assignment). CTAs start in linear order. The column blocks are cut into tiles of `tile` blocks; a tile runs
 // every unit in turn, each unit's blocks of the tile consecutive. tile = blocks is the (block, unit) grid order of the
@@ -378,13 +345,6 @@ STRIX_R1_HD constexpr RowsOrder gate_up_rows_order(unsigned intermediate, unsign
     return rows_order(rows * top_k, gate_blocks(intermediate, columns), gate_up_cta_bytes<Format>(hidden, columns),
                       cache_bytes);
 }
-// Weight row read by output slot i of a wave whose first column is col; `live` columns remain in the matrix.
-// Slots past the live columns re-read the first valid row (their results are never stored).
-STRIX_R1_HD constexpr unsigned slot_row(unsigned col, unsigned i, unsigned columns, unsigned stride, unsigned live) {
-    const unsigned offset = i % columns < live ? i % columns : 0U;
-    return col + offset + (i / columns) * stride;
-}
-
 // A batch of more than `cap` routed rows (cap = rows_chunk_cap(scratch rows), kMaxRows by default) runs as consecutive
 // rows launches of at most `cap` rows. Chunk `first`
 // sees rows [first, first + count): input, ids, weights, failure words and output start at row `first`; the
@@ -939,8 +899,21 @@ __global__ __launch_bounds__(kThreads, kMinWavesPerEu) void gate_up_rows(Args ar
 // columns run side by side (one serial thread with every column staged held 4x the registers and serialized the tail
 // stores). The empty pack is the incumbent kernel (signature (Args), same machine code).
 // The body (blockIdx.y = row) is shared by the rows launch (down_combine) and the verify launch (down_combine_step).
-template <packed::MatrixFormat Format, unsigned TopK, unsigned DownColumns, bool TailAhead = false, class... Tail>
-__device__ __forceinline__ void down_combine_row(Args args, Tail... tail) {
+struct StableExpertRank {
+    template <unsigned TopK>
+    __device__ __forceinline__ unsigned position(const Args& args, unsigned slot, unsigned expert) const {
+        unsigned rank = 0;
+#pragma unroll
+        for (unsigned i = 0; i < TopK; ++i) {
+            const auto other = args.ids[i];
+            rank += other < expert || (other == expert && i < slot);
+        }
+        return rank;
+    }
+};
+
+template <packed::MatrixFormat Format, unsigned TopK, unsigned DownColumns, bool TailAhead, class Rank, class... Tail>
+__device__ __forceinline__ void down_combine_ranked(Args args, Rank rank_of, Tail... tail) {
     static_assert(sizeof...(Tail) <= 1U);
     constexpr bool kTail = sizeof...(Tail) == 1U;
     if (args.failure && args.failure[blockIdx.y] != 0U) return;
@@ -966,12 +939,7 @@ __device__ __forceinline__ void down_combine_row(Args args, Tail... tail) {
                                       input, args.intermediate, lane, projected);
 #endif
         if (lane == 0U) {
-            unsigned rank = 0;
-#pragma unroll
-            for (unsigned i = 0; i < TopK; ++i) {
-                const auto other = args.ids[i];
-                rank += other < expert || (other == expert && i < slot);
-            }
+            const unsigned rank = rank_of.template position<TopK>(args, slot, expert);
 #pragma unroll
             for (unsigned i = 0; i < DownColumns; ++i) {
                 terms[i][rank] = combine::weighted_bf16<false>(args.weights[slot], projected[i]);
@@ -1013,6 +981,12 @@ __device__ __forceinline__ void down_combine_row(Args args, Tail... tail) {
             args.output[col + i] = combined;
         }
     }
+}
+
+
+template <packed::MatrixFormat Format, unsigned TopK, unsigned DownColumns, bool TailAhead = false, class... Tail>
+__device__ __forceinline__ void down_combine_row(Args args, Tail... tail) {
+    down_combine_ranked<Format, TopK, DownColumns, TailAhead>(args, StableExpertRank{}, tail...);
 }
 
 

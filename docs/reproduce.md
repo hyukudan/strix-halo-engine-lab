@@ -618,21 +618,25 @@ prefill (`glm_score.sh PEER BIN MODEL PROMPT OUT [ENV...]`, last 256 rows) and i
 
 ### MiniMax pair: chunk-invariant linear order
 
-`STRIX_MMX_PF_ORDER=invariant` is the default (table item `pf_order`; `adaptive` is the off switch and the
-`STRIX_MM_BASELINE=1` value; a defaulted value that cannot run on a load, e.g. `STRIX_MM_MOE=off`, declines to
-`adaptive` with a printed reason, an explicit `invariant` stays a hard error). Quality evidence: 6 x 32K units of
-different content against 3 one-ulp L0 nulls each (`scripts/bench/chunkinv/gate32b_chain.sh`, `gate32b_stats.py`):
-pooled signed dNLL -0.053, 95 % CI [-0.148, +0.041], inside the null spread [-0.263, +0.240]; KL q50/q90 above every
-null in 0 of 6 units; needle/two-hop/QA task 40/42 in both orders. It binds the shared `moe_core::kGroupedSingleChainContract` (S = 1 for routed and shared
-gate/up/down, MoE part `mmx-pf-moe-s1-v1`) and `core::fixed_linear_contract` for the dense q/k/v/o (S = 1; the v4 core
-runs every call whose `strix_gemm` split would differ): together the identity `mmx-pf-linear-s1-v1`, cache field
-`prefill_order=mmx-pf-linear-s1-v1`, receipt lever `minimax.linear_order`. `adaptive` keeps the former rows-dependent
-splits. Invariant order applies only to prefill; decode and verification retain their existing routes, including
-`STRIX_MM_LINEARS=load`. Startup rejects `STRIX_MM_LINEARS=off`, `STRIX_MM_MOE=off`, unsupported or missing dense
-weights, and insufficient dense workspace. Mandatory dense dispatch fails explicitly instead of falling back.
+`STRIX_MMX_PF_ORDER=invariant` is the default for rank and serve (table item `pf_order`; `adaptive` is the off
+switch and the `--baseline` / `STRIX_MM_BASELINE=1` value on both). A defaulted value that cannot run on a load, e.g.
+`STRIX_MM_MOE=off`, declines to `adaptive` with a printed reason (the route receipt and the cache identity name the
+effective order); an explicit `invariant` stays a hard error.
+
+The invariant EXL3 prefill contract binds the shared `moe_core::kGroupedSingleChainContract` for routed and
+shared gate/up/down and `core::fixed_linear_contract` for q/k/v/o. The v4 core runs when the library would
+use a different chain. The cache field is `prefill_order=mmx-pf-linear-s1-v1`. The dense MLP of layers 0-2
+keeps the library chain except for the `STRIX_MM_PF_DENSE_MLP` preference on 4096-row pieces.
+`STRIX_MM_PF_DENSE_TAIL_FIXED=1` (opt-in profile row, the same value on rank and serve, part of the rank agreement;
+refused with the adaptive order or baseline and with `STRIX_MM_PREFILL_IDENTITY=fp32`) also binds dense MLP gate/up/down
+to `core::fixed_linear_contract` at every cut; its cache field is `prefill_order=mmx-pf-linear-s1-v2`. The
+receipt lever is `minimax.linear_order`. Decode and verification retain their existing routes, including
+`STRIX_MM_LINEARS=load`. Startup requires resident supported weights and workspace for the required dense
+projections. Effective config reports the scope of the K-order contract. Complete-workload invariance and
+quality of the opt-in identity require native qualification.
 Host engine-route regressions: configure `tests/minimax_route_host`, build Release, then run `ctest --output-on-failure -C Release`.
-Dense device gate: `strix-hip-mmx-moe-bench --test --tests test_prefill_dense` (chunks 256/1024/4096/whole,
-4096 + 1..17 tails, 1..17-row calls, library cross-check, adaptive control). Quality: the FAST logit gate floor rule with
+Dense device gate: `strix-hip-mmx-moe-bench --tests test_prefill_dense_chunk_invariance` (including the composed
+dense MLP at 4096/9/1-row cuts, library cross-check and adaptive control). Quality: the FAST logit gate floor rule with
 layer-0 nulls (`tools/strix-gate/README.md`, onset-matched floor). Gates:
 `strix-chunk-order-contract-tests` (host order reference, chunks 256/1024/4096/whole and 1..17-row tails) and
 `strix-hip-mmx-moe-bench --test --tests test_prefill_chunk_invariance` (device bytes). One pair run (TTFT, state FNV,
