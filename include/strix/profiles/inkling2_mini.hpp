@@ -162,7 +162,8 @@ inline constexpr std::string_view kMiniScreenedHead = "inkling2-mini-screened-he
 // bitwise the incumbent) makes it a default. Value 2 adds the lanes pick: greedy picks whose scores nobody reads (verify
 // windows, served cohorts whose groups declare no score read) take the lanes form of the EXACT screened head (BF16).
 inline constexpr std::string_view kMiniVerifyRows = "inkling2-mini-verify-rows@1";
-// Exact lever, default auto in every tier (receipts in its source): greedy speculation, exact by construction (a drafted row is committed
+// Exact lever, builtin auto: the default of every tier, and the legacy identity (omit_builtin_fingerprint: only an explicit
+// off is fingerprinted; receipts in its source). Greedy speculation, exact by construction (a drafted row is committed
 // only when it equals the target's own pick, so the ids are the ids of one-row decode). "auto" resolves the speculation
 // mode of the command line and the server alike (an explicit --speculation wins): the command line's resident route
 // loads the model's MTP block drafter beside the checkpoint (strix/spec/drafter_source.hpp; --dspark FILE|off wins) and
@@ -170,7 +171,7 @@ inline constexpr std::string_view kMiniVerifyRows = "inkling2-mini-verify-rows@1
 // drafter) through one-lane verify windows, while one lane is live (the model's max_draft_by_live). Either way the
 // verify body is the verify rows lever at level >= 1. Speculation and a requested low-bit row never share a run
 // (mini_speculation_policy). CUDA: the step program declines (no verifier), the server
-// declines. Values: off (builtin), auto.
+// declines. Values: auto (builtin), off.
 inline constexpr std::string_view kMiniSpeculation = "inkling2-mini-speculation@1";
 // Image pre-processing recipe of the one vision adapter (src/inkling2/inkling2_vision.*), resolved here with the other
 // rows by the resolver the CLI and the server share. "legacy" (builtin, image identity inkling2-vision-v1) or "axial@1"
@@ -236,8 +237,8 @@ inline constexpr std::array<profile::Lever, 13> kMiniLevers{{
                "partial commit bitwise the per-row incumbent, BF16 and Q8_0 heads); HIP only",
      .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniSpeculation, .env = "STRIX_INK_SPECULATION", .option = "",
-     .value = {"auto", "auto", "auto", "auto"}, .builtin = "off",
-     .kind = profile::Kind::exact, .ready = {true, true, true, true}, .runnable = {true, true, true, true},
+     .value = {"", "", "", ""}, .builtin = "auto",
+     .kind = profile::Kind::exact, .ready = {}, .runnable = {true, true, true, true},
      .target = "", .off = "off",
      .source = "ink_draft t1c/t2 (cluster1 gfx1151, BF16, greedy): ids with drafting == without, CLI 3/3 and served "
                "46/46; CLI 160 tokens code / prose / JSON 28.40 / 28.31 / 29.06 -> 29.46 / 32.77 / 42.64 tok/s, served "

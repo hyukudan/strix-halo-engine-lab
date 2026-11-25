@@ -460,7 +460,10 @@ void profile_parity() {
                 const auto service = factory->create(selection);
                 require(service && loaded && loaded->screened_head == (head != nullptr) &&
                             loaded->screened_head == mini::mini_screened_head(cli.tier) &&
-                            loaded->verify_rows == level && loaded->verify_rows == mini::mini_verify_rows(cli.tier),
+                            // a speculating server takes the verify rows body (level >= 1), as the command line does
+                            loaded->verify_rows == mini::mini_speculation_verify_rows(level, loaded->speculation) &&
+                            loaded->verify_rows ==
+                                mini::mini_speculation_verify_rows(mini::mini_verify_rows(cli.tier), loaded->speculation),
                         "CLI and server must resolve both opt-in rows independently");
             }
         }

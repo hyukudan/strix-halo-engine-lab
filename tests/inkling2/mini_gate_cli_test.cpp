@@ -136,7 +136,16 @@ void test_cuda_route_options() {
     using Mode = strix::serve::CliSpeculation;
     constexpr auto bf16 = strix::weight::kBf16WeightStorage;
     constexpr auto q8 = strix::weight::kQ8WeightStorage;
-    auto options = parse({"1", "--generate", "4"});
+    // The row default (auto) on the CUDA step program: the program runs, speculation is declined with its reason.
+    {
+        auto by_row = parse({"1", "--generate", "4"});
+        cli::StepProgramOptions defaults;
+        const auto route = cli::resolve_cuda_step_route(by_row, defaults, bf16, false);
+        require(by_row.generation.speculation == Mode::automatic && route.program && route.speculation == Mode::off &&
+                    !route.speculation_reason.empty(),
+                "the speculation row default on the CUDA step program: declined with its reason");
+    }
+    auto options = parse({"1", "--generate", "4", "--speculation", "off"});
     cli::StepProgramOptions program;
     const auto resolve = [&](strix::weight::FormatId storage = strix::weight::kBf16WeightStorage,
                              bool resident_k1 = false) {
@@ -380,9 +389,8 @@ void test_options() {
             "expected evaluation-order null arm");
     std::ostringstream profile_line;
     cli::write_profile(gate.tier, profile_line, true);
-    // The speculation row is auto in every tier: the exact receipt names it (a gate run itself never drafts).
-    require(profile_line.str() == "profile exact levers inkling2-mini-speculation@1=auto reference BASE\n",
-            "device profile receipt differs");
+    // The speculation row's builtin (auto) keeps the legacy receipt: no lever applied, none reported.
+    require(profile_line.str() == "profile exact levers none reference BASE\n", "device profile receipt differs");
 }
 
 #endif

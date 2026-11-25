@@ -66,26 +66,26 @@ void test_row() {
     require(mini::kMiniProfile.table.size() == 13U,
             "W4A4, down image, prepared round fold, narrow experts, controller planes, projected-bias, served route, "
             "screened head, calibrated low-bit, verify rows, speculation, image recipe and the block-candidate row");
-    // The speculation row: exact, builtin off in every tier until its device receipts, both values identified.
+    // The speculation row: exact, builtin auto (the default of every tier, legacy identity), off explicit.
     const auto* speculation = std::ranges::find_if(mini::kMiniLevers, [](const profile::Lever& lever) {
         return lever.name == mini::kMiniSpeculation;
     });
     require(speculation != mini::kMiniLevers.end() && speculation->kind == profile::Kind::exact &&
-                speculation->builtin == "off" && speculation->target == "auto" &&
+                speculation->builtin == "auto" && speculation->off == "off" &&
                 std::ranges::all_of(speculation->value, [](std::string_view v) { return v.empty(); }),
-            "speculation row: exact, off by default, target auto");
+            "speculation row: exact, auto by default (builtin), off explicit");
     for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
         mini::MiniWeightOptions options;
         options.tier = inputs(tier);
         const auto incumbent = mini::resolve_mini_profile(options, true);
-        require(!mini::mini_speculation(incumbent), "speculation resolves off");
+        require(mini::mini_speculation(incumbent), "speculation resolves auto (the builtin)");
         options.tier = inputs(tier);
         options.tier.env = [](const char* key) -> const char* {
-            return std::strcmp(key, "STRIX_INK_SPECULATION") == 0 ? "auto" : nullptr;
+            return std::strcmp(key, "STRIX_INK_SPECULATION") == 0 ? "off" : nullptr;
         };
         const auto selected = mini::resolve_mini_profile(options, true);
-        require(mini::mini_speculation(selected) && selected.fingerprint() != incumbent.fingerprint(),
-                "STRIX_INK_SPECULATION=auto selects speculation under its own identity, in every tier");
+        require(!mini::mini_speculation(selected) && selected.fingerprint() != incumbent.fingerprint(),
+                "STRIX_INK_SPECULATION=off switches speculation off under its own identity, in every tier");
     }
     require(mini::kMiniLevers[11].name == mini::kMiniVisionRecipe, "image recipe sits before the block-candidate row");
     const auto& lever = mini::kMiniProfile.table.front();
