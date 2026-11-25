@@ -50,9 +50,11 @@ public:
     // checkpoint identity) is refused with stale_source. Framing, bounds and the identity are read from one open file.
     static Status open(const std::string& path, const Digest256& checkpoint, LowbitPack& out);
     [[nodiscard]] const std::vector<LowbitPackEntry>& entries() const { return entries_; }
-    // SHA-256 of the header text (through the "end" line, without padding).
+    // SHA-256 of the header text and payloads in entry order (without padding).
     [[nodiscard]] const Digest256& identity() const { return identity_; }
     [[nodiscard]] const Digest256& checkpoint() const { return checkpoint_; }
+    // Re-read the same opened source after staging to confirm the admitted content.
+    [[nodiscard]] Status verify_identity() const;
     // No entry for the tensor: ok with nullopt. An entry that disagrees with the request or the complete source
     // payload: error (stale_source for a payload whose digest differs).
     Status find(std::string_view tensor, FormatId storage, const RawTensor& source, std::optional<Slice>& out) const;
@@ -61,6 +63,7 @@ private:
     std::string path_;
     std::shared_ptr<const Source> file_;
     std::vector<LowbitPackEntry> entries_;
+    std::size_t header_bytes_{};
     Digest256 identity_{}, checkpoint_{};
 };
 
