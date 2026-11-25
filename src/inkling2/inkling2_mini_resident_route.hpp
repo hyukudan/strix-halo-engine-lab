@@ -11,8 +11,8 @@ inline constexpr unsigned kMiniMaxVerifyRows = 8U;
 
 // Decode expert form default of the command line (and of a server running its route through the served route lever,
 // kMiniServedCliRoute): the packed one-row form (moe_core::microscaled_r1), whose row bits equal a one-row launch at any
-// cohort width. --grouped-decode selects the grouped tile kernel on the command line. Without the lever a server keeps
-// its incumbent grouped decode and takes no form flag.
+// cohort width. --grouped-decode selects the grouped tile kernel on the command line and on a CUDA server
+// (mini_served_packed_decode); a HIP server without the lever keeps its incumbent grouped decode and takes no form flag.
 inline constexpr bool kMiniPackedDecodeDefault = true;
 
 // The same value from the two flags, through the resolver the command line also calls (serve::resolve_decode_form).
@@ -26,9 +26,11 @@ constexpr const char* mini_decode_form_name(bool packed_decode) noexcept { retur
 // lever (`cli_route`, which also packs cohort rows); without it the incumbent grouped form. CUDA: the packed form, as the
 // command line: a lone lane runs the packed one-row body (RTX q36, origin/main: CLI grouped 66.3 vs packed 89.1 tok/s,
 // served C1 66.5 = the grouped form); a cohort pass of two or more lanes keeps the grouped tile kernel (no packed cohort
-// rows without the lever), and every lane's bits equal its lone packed run (cohort-lanes fixture, widths 2..17).
-constexpr bool mini_served_packed_decode(bool hip, bool cli_route) noexcept {
-    return hip ? cli_route && kMiniPackedDecodeDefault : kMiniPackedDecodeDefault;
+// rows without the lever), and every lane's bits equal its lone packed run (cohort-lanes fixture, widths 2..17). The
+// CUDA server takes the command line's flags through the same resolver (--grouped-decode = the grouped form for a lone
+// lane too; naming both is refused); a HIP server refuses them (its form follows the lever row, resolve).
+constexpr bool mini_served_packed_decode(bool hip, bool cli_route, bool packed_flag = false, bool grouped_flag = false) {
+    return hip ? cli_route && kMiniPackedDecodeDefault : mini_packed_decode(packed_flag, grouped_flag);
 }
 
 enum class MiniAppendKind { prefill, decode, verify };

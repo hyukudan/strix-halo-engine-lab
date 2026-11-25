@@ -42,6 +42,10 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
             return args[i];
         };
         if (parse_mini_weight_option(out.weight_options, name, next, true)) continue;
+        if (name == "--packed-decode" || name == "--grouped-decode") {
+            (name == "--packed-decode" ? out.packed_decode_flag : out.grouped_decode_flag) = true;
+            continue;
+        }
         const auto& value = next();
         if (name == "--checkpoint") out.checkpoint = value;
         else if (name == "--tokenizer") out.tokenizer = value;
@@ -84,6 +88,9 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     // server declines it (requested stays in the receipt, mini_served_route_startup_field).
     const bool hip = resolved.backend == "hip";
     out.served_cli_route = mini_served_prefill_emits_first(hip, out.served_route_requested);
+    if (hip && (out.packed_decode_flag || out.grouped_decode_flag))
+        throw std::invalid_argument("a HIP Inkling server takes no decode form flag (the served route lever row sets it)");
+    (void)mini_served_packed_decode(hip, out.served_cli_route, out.packed_decode_flag, out.grouped_decode_flag);
     // The prompt chunk: --prefill-rows, else the route's from the command line's schedule resolver (the held-back
     // route: the command line's chunk where the backend's prefill is chunk-invariant (CUDA), else 128 rows; the lever:
     // the command line's chunk and tail rule), clamped to the context. Lanes: mini_serve_lane_rows.

@@ -28,7 +28,9 @@ namespace mini = strix::inkling2;
 // Served decode form: HIP packs only with the admitted lever; CUDA runs the command line's packed form at a lone lane.
 static_assert(strix::inkling2::mini_served_packed_decode(true, true) &&
               !strix::inkling2::mini_served_packed_decode(true, false) &&
-              strix::inkling2::mini_served_packed_decode(false, false));
+              strix::inkling2::mini_served_packed_decode(false, false) &&
+              !strix::inkling2::mini_served_packed_decode(false, false, false, true) &&
+              strix::inkling2::mini_served_packed_decode(false, false, true, false));
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -728,14 +730,27 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         if (std::string_view(field) == "--speculation") strings.pop_back();
         strings.pop_back();
     }
-    // The server takes no decode form flag: a served form is selected only through the served route lever's row.
+    // Decode form flags: a CUDA server takes the command line's (mini_served_packed_decode; naming both is refused before
+    // native load); a HIP server refuses them, its form follows the served route lever's row.
+    const bool hip_backend = std::string_view(backend) == "hip";
     for (const auto* flag : {"--packed-decode", "--grouped-decode"}) {
         std::ostringstream out, error;
-        strings.emplace_back(flag);
-        require(run({}, out, error) == 2 && !created &&
-                    error.str().find(std::string("unknown Inkling argument ") + flag) != std::string::npos,
-                "a decode form flag reached the server outside the shared lever row");
-        strings.pop_back();
+        strings.insert(strings.end(), {flag, "--family-inspect"});
+        const auto rc = run({}, out, error);
+        strings.resize(strings.size() - 2U);
+        if (hip_backend)
+            require(rc == 2 && !created && error.str().find("takes no decode form flag") != std::string::npos,
+                    "a decode form flag reached the HIP server outside the shared lever row");
+        else require(rc == 0 && !created, "the CUDA server refused a decode form flag");
+    }
+    {
+        std::ostringstream out, error;
+        strings.insert(strings.end(), {"--packed-decode", "--grouped-decode"});
+        const auto rc = run({}, out, error);
+        strings.resize(strings.size() - 2U);
+        require(rc == 2 && !created &&
+                    error.str().find(hip_backend ? "takes no decode form flag" : "are exclusive") != std::string::npos,
+                "both decode form flags did not fail before native load");
     }
     // The block-candidate switch through the production start-up parser (the tier under test; EXACT refuses sampled
     // verification with its own reason, as in mini_block_drafter_test): an explicit OFF starts,

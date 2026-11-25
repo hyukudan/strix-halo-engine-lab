@@ -79,13 +79,21 @@ build-cuda/strix-inkling2-mini-cuda MODEL.safetensors \
 
 Decode runs the experts on the one-row packed form by default on the command
 line (both backends; `--grouped-decode` selects the grouped tile kernel there,
-printed as `moe_decode` in `strix-decode-route/v1`). `strix-serve` keeps its
-existing route in every profile and takes no decode form flag: the last
-prompt token is held back and decoded, prompts run in 128-row chunks
-(`--prefill-rows`, clamped to the context, which without `--slots` also caps
-the lanes), and a cohort decodes with the grouped form in one batched forward
-(CUDA: its width programs), whose lane bits depend on the cohort width as
-before. The served route switch `STRIX_INK_SERVED_CLI_ROUTE=1`
+printed as `moe_decode` in `strix-decode-route/v1`). `strix-serve` holds
+the last prompt token back and decodes it. On HIP it keeps its existing
+route in every profile and takes no decode form flag: prompts run in 128-row
+chunks (`--prefill-rows`, clamped to the context, which without `--slots`
+also caps the lanes), and a cohort decodes with the grouped form in one
+batched forward, whose lane bits depend on the cohort width as before. On
+CUDA it runs the command line's decode form (a lone lane takes the packed
+one-row body, a cohort of two or more lanes the grouped tile, every lane's
+bits equal to its lone run; `--packed-decode` / `--grouped-decode` as on the
+command line) and, without `--prefill-rows`, the command line's prompt chunk:
+it keeps the largest of 8192, 2048 and 128 rows whose load leaves the slot
+count of the 128-row chunk (startup line `prefill_chunk`), and a prompt
+admitted beside a decoding lane runs in pieces of 128 rows (plus a remainder
+of at most 32 rows) so the lane keeps stepping; the bits do not change with
+the chunk or the pieces. The served route switch `STRIX_INK_SERVED_CLI_ROUTE=1`
 (`inkling2-mini-served-cli-route@1`, off in every profile column) makes a HIP
 server run the command line's route; a CUDA server declines it. The startup
 line reports it as `served_route off`, `declined`, or `on qualification

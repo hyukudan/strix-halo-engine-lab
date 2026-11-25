@@ -45,6 +45,9 @@ inline MiniServeCohort make_mini_device_cohort(
     const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, weight_options, extent);
     auto weights = resolve_mini_resident_weight_load(opt.tier, weight_options, scope.view(), extent);
     if (!(scope.checkpoint == weight::Digest256{})) std::cerr << weight::weight_load_scope_receipt(scope.view()) << '\n';
+    // Decode expert form, the CLI's on CUDA (flags included), fixed for every candidate load.
+    const bool packed_decode =
+        mini_served_packed_decode(kServeHip, opt.served_cli_route, opt.packed_decode_flag, opt.grouped_decode_flag);
     std::uint64_t slot_bytes = 0;
     unsigned lanes = 0;
     MiniDecoderLevers levers;
@@ -67,7 +70,7 @@ inline MiniServeCohort make_mini_device_cohort(
         const auto ladder = mini_served_chunk_ladder(opt.prefill_rows, opt.prefill_fallback_rows);
         const auto load = [&](std::uint32_t chunk, bool last) {
             auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, chunk,
-                mini_served_packed_decode(kServeHip, opt.served_cli_route), MiniResidentBackend::default_step_graphs,
+                packed_decode, MiniResidentBackend::default_step_graphs,
                 weights.roles(), 0U, false, rows, opt.served_cli_route ? opt.prefill_tail : 0U,
                 opt.experts_nvfp4, opt.controller_one_plane, opt.served_cli_route, lowbit);
             levers = configure_mini_decoder(*decoder, opt.moe_w4a4, opt.combine_image, opt.prepared_round_fold,
@@ -125,8 +128,8 @@ inline MiniServeCohort make_mini_device_cohort(
     });
     std::cerr << "Inkling " << backend << " slots " << lanes << " context " << opt.context
               << " prefill_chunk " << chunk_rows
-              << " moe_decode " << mini_decode_form_name(mini_served_packed_decode(kServeHip, opt.served_cli_route))
-              << (!kServeHip && kMiniPackedDecodeDefault ? "-lone" : "")
+              << " moe_decode " << mini_decode_form_name(packed_decode)
+              << (!kServeHip && packed_decode ? "-lone" : "")
               << " KV and history bytes per slot " << slot_bytes
               << " slot budget free bytes " << admission_free
               << " profile " << mini_profile_name(opt.tier)

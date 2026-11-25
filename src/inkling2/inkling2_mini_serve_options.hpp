@@ -36,6 +36,10 @@ struct MiniServeOptions {
     // Held-back route: rows the decoder load retries at when the implicit chunk's device workspaces are refused
     // (mini_served_prefill_fallback_rows, serve::load_with_chunk_fallback); 0 = no retry.
     unsigned prefill_fallback_rows = 0;
+    // Decode form flags of a CUDA server (--packed-decode / --grouped-decode, mini_served_packed_decode); a HIP server
+    // refuses them.
+    bool packed_decode_flag = false;
+    bool grouped_decode_flag = false;
     std::uint64_t kv_bytes = 0;
     MiniWeightOptions weight_options;
     profile::Name tier = profile::Name::standard;
