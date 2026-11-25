@@ -47,19 +47,29 @@ struct Pipe {
     std::condition_variable cv;
     std::deque<std::vector<std::byte>> q[2];
     std::uint64_t exchanges[2] = {0, 0};
+    bool aborted = false;
     sd::ExchangeTransport::Exchange side(int rank) {
         return [this, rank](std::span<const std::byte> out, std::span<std::byte> in) {
             std::unique_lock lock(m);
+            if (aborted) throw std::runtime_error("pipe: aborted");
             q[1 - rank].emplace_back(out.begin(), out.end());
             ++exchanges[rank];
             cv.notify_all();
-            if (!cv.wait_for(lock, std::chrono::seconds(10), [&] { return !q[rank].empty(); }))
+            if (!cv.wait_for(lock, std::chrono::seconds(10), [&] { return aborted || !q[rank].empty(); }))
                 throw std::runtime_error("pipe: the peer never exchanged");
+            if (aborted) throw std::runtime_error("pipe: aborted");
             auto got = std::move(q[rank].front());
             q[rank].pop_front();
             if (got.size() != in.size()) throw std::runtime_error("pipe: the ranks exchanged different sizes");
             std::memcpy(in.data(), got.data(), got.size());
         };
+    }
+    sd::ExchangeTransport transport(int rank) {
+        return sd::ExchangeTransport(side(rank), "pipe", [this](const std::string&) {
+            std::lock_guard lock(m);
+            aborted = true;
+            cv.notify_all();
+        });
     }
 };
 
@@ -185,7 +195,7 @@ std::vector<sv::CohortResult> run(sv::CohortBackend& be, const std::vector<sv::C
 
 void replicated_over_exchange() {
     Pipe pipe;
-    sd::ExchangeTransport t0(pipe.side(0)), t1(pipe.side(1));
+    auto t0 = pipe.transport(0), t1 = pipe.transport(1);
     Backend be0, be1;
     std::string error;
     std::thread follower([&] {
@@ -212,7 +222,7 @@ void replicated_over_exchange() {
               "replicated over exchange: request " + std::to_string(i + 1) + " ids equal the single-rank run");
     // the frames of a long verify body ride one-sided send / receive (frame_words smaller than a message)
     Pipe pipe2;
-    sd::ExchangeTransport u0(pipe2.side(0)), u1(pipe2.side(1));
+    auto u0 = pipe2.transport(0), u1 = pipe2.transport(1);
     Backend c0, c1;
     sv::ReplicaOptions small;
     small.frame_words = 3;

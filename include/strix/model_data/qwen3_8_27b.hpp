@@ -53,6 +53,12 @@ inline constexpr std::string_view adapter = "qwen35-dense-v1";
 inline constexpr std::string_view attention_pattern = "gdn,gdn,gdn,attn";
 inline constexpr std::string_view ffn_pattern = "dense:0-63";
 } // namespace graph
+namespace multi_device {
+namespace legacy_env {
+inline constexpr std::string_view STRIX_TP_F16_GATHER = "forms.tensor.wire";
+inline constexpr std::string_view STRIX_TP_SPLIT_DRAFT = "forms.tensor.draft_placement";
+} // namespace legacy_env
+} // namespace multi_device
 inline constexpr std::string_view name = "qwen3.8-27b";
 namespace presets {
 inline constexpr std::string_view default_ = "fast";

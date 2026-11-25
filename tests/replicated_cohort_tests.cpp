@@ -4,27 +4,73 @@
 // with the same per-lane state; every request's ids equal its solo run; one control message per forward when commit
 // and release are rank-local; a dropped / altered control message stops rank 1 before its backend sees it.
 #include "strix/pair/lockstep.hpp"
+#include "strix/dist/exchange_transport.hpp"
 #include "strix/serve/replicated_cohort.hpp"
 
+#ifdef STRIX_TEST_REPLICA_TRANSPORTS
+#include "strix/dist/communicator.hpp"
+#include "strix/dist/host_copy.hpp"
+
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 using namespace strix::serve;
+
+#ifdef STRIX_TEST_REPLICA_TRANSPORTS
+namespace strix::dist {
+void enqueue_host_d2h_copy(void* mapped_host, const void* device, std::size_t bytes, hipStream_t) {
+    std::memcpy(mapped_host, device, bytes);
+}
+}
+#endif
+
+namespace {
+// A one-shot allocation failure on the calling rank only.
+thread_local std::size_t fail_allocation_size = 0;
+thread_local bool fail_next_allocation = false;
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+void free_test_allocation(void* ptr) noexcept { std::free(ptr); }
+}
+
+void* operator new(std::size_t size) {
+    if (fail_next_allocation || (fail_allocation_size != 0 && size == fail_allocation_size)) {
+        fail_next_allocation = false;
+        fail_allocation_size = 0;
+        throw std::bad_alloc{};
+    }
+    if (void* ptr = std::malloc(size == 0 ? 1 : size)) return ptr;
+    throw std::bad_alloc{};
+}
+
+void operator delete(void* ptr) noexcept { free_test_allocation(ptr); }
+void operator delete(void* ptr, std::size_t) noexcept { ::operator delete(ptr); }
 
 namespace {
 int failures = 0;
@@ -67,6 +113,7 @@ public:
         receive(in);
     }
     std::string name() const override { return "test-queue"; }
+    bool supports_peer_abort() const noexcept override { return true; }
     void abort(const std::string& why) override {
         std::lock_guard lock(wire_->m);
         if (!wire_->aborted) wire_->why = why;
@@ -124,7 +171,9 @@ public:
     }
     void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                 std::span<std::uint32_t> top) override {
+        if (on_verify) on_verify();
         check(window_.empty(), "verify with an open window");
+        withheld_.clear();
         std::string rec = "V";
         std::size_t base = 0;
         for (const auto& g : groups) {
@@ -135,11 +184,19 @@ public:
             }
             window_.push_back({g.lane, std::vector<std::uint32_t>(tokens.begin() + static_cast<std::ptrdiff_t>(base),
                                                                   tokens.begin() + static_cast<std::ptrdiff_t>(base + g.rows))});
-            rec += std::to_string(g.lane) + "x" + std::to_string(g.rows) + ';';
+            rec += std::to_string(g.lane) + "x" + std::to_string(g.rows) + (g.reads_scores ? "r" : "") + ';';
+            if (!g.reads_scores) withheld_.push_back(g.lane);
             base += g.rows;
         }
         log.push_back(rec + join(tokens));
         ++forwards;
+    }
+    // A score-aware backend: a group verified as unread has no scores to read (a pick-only route).
+    std::span<const float> read_final_logits(std::uint32_t lane) override {
+        if (std::ranges::find(withheld_, lane) != withheld_.end()) throw std::logic_error("scores withheld");
+        log.push_back("L" + std::to_string(lane));
+        scores_.assign(4, static_cast<float>(lane));
+        return scores_;
     }
     void commit(std::span<const std::uint32_t> accept) override {
         check(accept.size() == window_.size(), "one keep count per group");
@@ -193,6 +250,7 @@ public:
         ++controls;
     }
     std::vector<std::vector<std::uint32_t>> retained;
+    std::function<void()> on_verify;
     bool restores = true;  // false: this rank's store cannot restore (a diverging replica)
     bool whole = false;    // prefill_emits_first: restore may return the whole prompt
     const std::vector<std::vector<std::uint32_t>>& state() const { return ctx_; }
@@ -204,6 +262,8 @@ private:
     std::uint32_t lanes_, rows_, vocab_;
     std::vector<std::vector<std::uint32_t>> ctx_;
     std::vector<std::pair<std::uint32_t, std::vector<std::uint32_t>>> window_;
+    std::vector<std::uint32_t> withheld_;  // lanes of the open window verified as unread
+    std::vector<float> scores_;
 };
 
 std::vector<CohortRequest> requests(std::uint32_t count, std::uint32_t vocab) {
@@ -226,13 +286,19 @@ struct Pair {
     QueueTransport t0{wire, 0}, t1{wire, 1};
 };
 
+strix::dist::ExchangeTransport exchange_adapter(QueueTransport& link) {
+    return strix::dist::ExchangeTransport(
+        [&link](auto out, auto in) { link.exchange(out, in); }, "test-exchange",
+        [&link](const std::string& why) { link.abort(why); });
+}
+
 // Runs rank 1 on its own thread; returns its round count (or the error it stopped with).
 struct Follower {
     std::thread thread;
     std::uint64_t rounds = 0;
     std::string error;
     bool protocol_error = false;
-    void start(FakeBackend& be, QueueTransport& link, ReplicaOptions options) {
+    void start(FakeBackend& be, strix::dist::Transport& link, ReplicaOptions options) {
         thread = std::thread([this, &be, &link, options] {
             try {
                 rounds = follow_cohort(be, link, options);
@@ -432,6 +498,342 @@ void run_bind_control(bool local_ops) {
           name + ": control message count (" + std::to_string(follower.rounds) + ")");
 }
 
+// The verify frame carries no score-read flag: both ranks run every group as read whatever rank 0 was told, so a
+// backend that picks its route from the flag takes the same route on both ranks, and both can read the scores after.
+void run_score_reads(strix::dist::Transport& t0, strix::dist::Transport& t1) {
+    const std::string name = "score reads (collective)";
+    FakeBackend be0(3, 8, 23), be1(3, 8, 23);
+    ReplicaOptions options;
+    options.collective_reads = true;
+    options.frame_words = 5;
+    Follower follower;
+    follower.start(be1, t1, options);
+    float read0 = -1.0F, read1 = -1.0F;
+    try {
+        ReplicatedCohort rep(be0, t0, options);
+        const std::vector<std::uint32_t> p = {1, 2, 3};
+        rep.prefill(0, p, true);
+        rep.prefill(1, p, true);
+        const CohortGroup groups[2] = {{0, 1, true}, {1, 1, false}};
+        const std::uint32_t tokens[2] = {4, 5};
+        std::uint32_t top[2] = {};
+        rep.verify(groups, tokens, top);
+        read0 = rep.read_final_logits(0)[0];
+        read1 = rep.read_final_logits(1)[0];
+        const std::uint32_t accept[2] = {1, 1};
+        rep.commit(accept);
+        rep.close();
+    } catch (const std::exception& e) {
+        check(false, name + ": rank 0 failed (" + e.what() + ")");
+    }
+    follower.thread.join();
+    check(follower.error.empty(), name + ": rank 1 finished cleanly (" + follower.error + ")");
+    check(be0.log == be1.log, name + ": both ranks ran the same verify route and reads");
+    check(std::ranges::find(be1.log, "V0x1r;1x1r;4,5,") != be1.log.end(), name + ": rank 1 ran both groups as read");
+    check(read0 == 0.0F && read1 == 1.0F, name + ": both lanes' scores read back on rank 0");
+}
+
+void run_verify_allocation_failure() {
+    Pair link;
+    FakeBackend be0(1, 4, 23), be1(1, 4, 23);
+    Follower follower;
+    follower.start(be1, link.t1, {});
+    {
+        ReplicatedCohort rep(be0, link.t0);
+        rep.bind_lane(0, 1, {});  // A queued record must survive a failure before publication.
+        const CohortGroup group{0, 2, false};
+        const std::uint32_t tokens[] = {4, 5};
+        std::uint32_t top[2] = {};
+        // The inline frame has four body words, so this targets the first group allocation only.
+        fail_allocation_size = sizeof(CohortGroup);
+        bool threw = false;
+        try {
+            rep.verify({&group, 1}, tokens, top);
+        } catch (const std::bad_alloc&) {
+            threw = true;
+        }
+        fail_allocation_size = 0;
+        check(threw, "verify allocation: rank 0 throws bad_alloc");
+        check(rep.rounds() == 0, "verify allocation: no frame was published");
+        if (threw && rep.rounds() == 0) {
+            rep.verify({&group, 1}, tokens, top);
+            const std::uint32_t accept[] = {1};
+            rep.commit(accept);
+            rep.close();
+        }
+    }
+    follower.thread.join();
+    check(follower.error.empty(), "verify allocation: rank 1 finishes cleanly after retry");
+    check(be0.log == be1.log && be0.binds == 1 && be0.forwards == 1 && be0.commits == 1,
+          "verify allocation: retry delivers the queued bind and verify once on both ranks");
+}
+
+void run_verify_backend_failure() {
+    Pair link;
+    FakeBackend be0(1, 4, 23), be1(1, 4, 23);
+    be0.on_verify = [] { throw std::runtime_error("rank 0 verify failed"); };
+    be1.on_verify = [&] {
+        std::byte unused{};
+        link.t1.receive({&unused, 1});  // Simulate waiting for rank 0 inside the backend collective.
+    };
+    Follower follower;
+    follower.start(be1, link.t1, {});
+    {
+        ReplicatedCohort rep(be0, link.t0);
+        const CohortGroup group{0, 1, false};
+        const std::uint32_t token = 4;
+        std::uint32_t top = 0;
+        bool rethrew = false;
+        try {
+            rep.verify({&group, 1}, {&token, 1}, {&top, 1});
+        } catch (const std::runtime_error& e) {
+            rethrew = std::string_view(e.what()) == "rank 0 verify failed";
+        }
+        check(rethrew && rep.rounds() == 1, "verify backend: rank 0 rethrows the failure after publishing");
+        bool aborted = false;
+        {
+            std::lock_guard lock(link.wire->m);
+            aborted = link.wire->aborted;
+        }
+        check(aborted, "verify backend: rank 0 aborts immediately while the replica still exists");
+        if (!aborted) link.t0.abort("test cleanup");
+        bool closed = false;
+        try {
+            rep.keepalive();
+        } catch (const std::logic_error&) {
+            closed = true;
+        } catch (const std::runtime_error&) {
+            // The regressed path tries to use the aborted link.
+        }
+        check(closed, "verify backend: rank 0 refuses further work on the replica");
+        follower.thread.join();
+        check(follower.error == "link aborted: rank 0 verify failed", "verify backend: rank 1 exits its collective");
+    }
+}
+
+void run_exchange_abort_allocation_failure() {
+    const std::string reason(256, 'x');
+    unsigned callbacks = 0;
+    strix::dist::ExchangeTransport link([](auto, auto) {}, "exchange",
+                                       [&](const std::string&) { ++callbacks; });
+    fail_next_allocation = true;
+    try {
+        link.abort(reason);
+    } catch (const std::bad_alloc&) {
+        link.abort({});
+    }
+    const bool allocation_failed = !fail_next_allocation;
+    fail_next_allocation = false;
+    link.abort({});
+    check(allocation_failed && link.aborted() && callbacks == 1,
+          "exchange abort: failed reason capture still cancels exactly once");
+
+    bool retried = false;
+    strix::dist::ExchangeTransport retry([](auto, auto) {}, "exchange", [&](const std::string& why) {
+        if (!why.empty()) throw std::bad_alloc{};
+        retried = true;
+    });
+    try {
+        retry.abort(reason);
+    } catch (const std::bad_alloc&) {
+        retry.abort({});
+    }
+    check(retry.aborted() && retried, "exchange abort: a failed callback does not swallow the empty retry");
+}
+
+void run_callbackless_exchange_rejection() {
+    unsigned frames = 0;
+    const auto exchange = [&](auto, auto) {
+        ++frames;
+        throw std::runtime_error("unexpected frame");
+    };
+    strix::dist::ExchangeTransport t0(exchange), t1(exchange);
+    FakeBackend be0(1, 4, 23), be1(1, 4, 23);
+    bool leader_rejected = false, follower_rejected = false;
+    try {
+        ReplicatedCohort rep(be0, t0);
+        rep.keepalive();
+    } catch (const std::invalid_argument& e) {
+        leader_rejected = std::string_view(e.what()).find("peer cancellation") != std::string_view::npos;
+    } catch (const std::runtime_error&) {}
+    try {
+        (void)follow_cohort(be1, t1);
+    } catch (const std::invalid_argument& e) {
+        follower_rejected = std::string_view(e.what()).find("peer cancellation") != std::string_view::npos;
+    } catch (const std::runtime_error&) {}
+    check(leader_rejected && follower_rejected && frames == 0,
+          "exchange admission: both ranks reject a missing abort callback before any frame");
+}
+
+void run_verify_publication_failure() {
+    using namespace std::chrono_literals;
+    struct PayloadFailure { unsigned frame; };
+    Pair wire;
+    auto t0 = exchange_adapter(wire.t0), t1 = exchange_adapter(wire.t1);
+    FakeBackend be0(1, 4, 23), be1(1, 4, 23);
+    std::promise<void> receiving_payload;
+    auto waiting = receiving_payload.get_future();
+    wire.t1.tamper = [&](auto&, std::uint64_t index) {
+        if (index == 1) receiving_payload.set_value();
+    };
+    wire.t0.tamper = [&](auto&, std::uint64_t index) {
+        if (index != 1) return;
+        if (waiting.wait_for(5s) != std::future_status::ready)
+            throw std::runtime_error("follower did not enter the continuation exchange");
+        throw PayloadFailure{1};
+    };
+    ReplicatedCohort rep(be0, t0);
+    auto follow = std::async(std::launch::async, [&] {
+        try {
+            (void)follow_cohort(be1, t1);
+        } catch (const std::exception& e) {
+            return std::string(e.what());
+        }
+        return std::string{};
+    });
+    const CohortGroup group{0, kReplicaBlockWords, false};
+    const std::uint32_t tokens[kReplicaBlockWords] = {};
+    std::uint32_t top[kReplicaBlockWords] = {};
+    bool rethrew = false;
+    try {
+        rep.verify({&group, 1}, tokens, top);
+    } catch (const PayloadFailure& error) {
+        rethrew = error.frame == 1;
+    } catch (const std::exception&) {}
+    wire.t0.tamper = {};
+    check(rethrew && rep.rounds() == 0, "verify publication: rethrows the original continuation failure");
+    const bool cancelled = follow.wait_for(2s) == std::future_status::ready;
+    check(cancelled && t0.aborted(), "verify publication: abort wakes the follower while both adapters live");
+    if (!cancelled) wire.t0.abort("test cleanup");
+    check(follow.get() == "link aborted: " && be0.forwards == 0 && be1.forwards == 0,
+          "verify publication: empty abort reason reaches the peer before either backend runs");
+    bool closed = false;
+    try {
+        rep.keepalive();
+    } catch (const std::logic_error&) {
+        closed = true;
+    } catch (const std::runtime_error&) {}
+    check(closed, "verify publication: rank 0 refuses reuse of the replica");
+}
+
+void run_follower_abort_allocation_failure() {
+    Pair wire;
+    FakeBackend be0(1, 4, 23), be1(1, 4, 23);
+    const std::runtime_error original(std::string(256, 'x'));
+    be1.on_verify = [&] {
+        fail_next_allocation = true;
+        throw original;
+    };
+    auto follow = std::async(std::launch::async, [&] {
+        try {
+            (void)follow_cohort(be1, wire.t1);
+        } catch (const std::runtime_error& e) {
+            return std::string_view(e.what()) == original.what();
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+        return false;
+    });
+    ReplicatedCohort rep(be0, wire.t0);
+    const CohortGroup group{0, 1, false};
+    const std::uint32_t token = 4;
+    std::uint32_t top = 0;
+    rep.verify({&group, 1}, {&token, 1}, {&top, 1});
+    check(follow.get(), "follower abort: preserves the original verify exception under allocation failure");
+    std::lock_guard lock(wire.wire->m);
+    check(wire.wire->aborted, "follower abort: cancels the link when building the reason fails");
+}
+
+void run_verify_transport_failure(strix::dist::Transport& t0, strix::dist::Transport& t1) {
+    using namespace std::chrono_literals;
+    const auto name = t0.name();
+    FakeBackend be0(1, 4, 23), be1(1, 4, 23);
+    std::promise<void> entered;
+    auto waiting = entered.get_future();
+    be0.on_verify = [&] {
+        if (waiting.wait_for(5s) != std::future_status::ready)
+            throw std::runtime_error("follower did not enter verify");
+        throw std::runtime_error("rank 0 verify failed");
+    };
+    be1.on_verify = [&] {
+        std::byte unused{};
+        entered.set_value();
+        t1.receive({&unused, 1});
+        throw std::runtime_error("test cleanup byte received");
+    };
+    auto follow = std::async(std::launch::async, [&] {
+        try {
+            (void)follow_cohort(be1, t1);
+        } catch (const std::exception& e) {
+            return std::string(e.what());
+        }
+        return std::string{};
+    });
+    ReplicatedCohort rep(be0, t0);
+    const CohortGroup group{0, 1, false};
+    const std::uint32_t token = 4;
+    std::uint32_t top = 0;
+    bool rethrew = false;
+    try {
+        rep.verify({&group, 1}, {&token, 1}, {&top, 1});
+    } catch (const std::runtime_error& e) {
+        rethrew = std::string_view(e.what()) == "rank 0 verify failed";
+    }
+    check(rethrew && rep.rounds() == 1, name + ": rank 0 rethrows after publishing verify");
+    const bool cancelled = follow.wait_for(2s) == std::future_status::ready;
+    check(cancelled, name + ": abort wakes the collective before its deadline with both links alive");
+    if (!cancelled) {
+        const std::byte cleanup{};
+        // Unblock the baseline's still-open transport instead of waiting for its full receive timeout.
+        try { t0.send({&cleanup, 1}); } catch (const std::exception&) {}
+    }
+    const auto error = follow.get();
+    check(!error.empty() && error != "test cleanup byte received" && error.find("timed out") == std::string::npos,
+          name + ": follower exits with a cancellation error");
+}
+
+void run_exchange_verify_failure() {
+    Pair wire;
+    auto t0 = exchange_adapter(wire.t0), t1 = exchange_adapter(wire.t1);
+    run_verify_transport_failure(t0, t1);
+}
+
+#ifdef STRIX_TEST_REPLICA_TRANSPORTS
+void run_real_transports() {
+    using namespace std::chrono_literals;
+    using namespace strix::dist;
+    auto [mem0, mem1] = memory_pair();
+    run_score_reads(*mem0, *mem1);
+    run_verify_transport_failure(*mem0, *mem1);
+
+    int sockets[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0)
+        throw std::runtime_error("USB4 host fixture: socketpair failed");
+    auto usb0 = usb4_host_descriptors({sockets[0]}, {"stream"}, {1}, 0, 5s);
+    auto usb1 = usb4_host_descriptors({sockets[1]}, {"stream"}, {1}, 0, 5s);
+    run_score_reads(*usb0, *usb1);
+    run_verify_transport_failure(*usb0, *usb1);
+
+    // Use an ephemeral loopback port so concurrent test invocations normally get distinct listeners.
+    const int probe = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (probe < 0) throw std::runtime_error("TCP fixture: socket failed");
+    sockaddr_in loopback{};
+    loopback.sin_family = AF_INET;
+    loopback.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t length = sizeof(loopback);
+    const bool bound = ::bind(probe, reinterpret_cast<sockaddr*>(&loopback), length) == 0 &&
+                       ::getsockname(probe, reinterpret_cast<sockaddr*>(&loopback), &length) == 0;
+    ::close(probe);
+    if (!bound) throw std::runtime_error("TCP fixture: could not choose a loopback port");
+    const auto port = ntohs(loopback.sin_port);
+    auto listen = std::async(std::launch::async, [port] { return tcp_listen(port, 5s); });
+    auto tcp1 = tcp_connect("127.0.0.1", port, 5s);
+    auto tcp0 = listen.get();
+    run_score_reads(*tcp0, *tcp1);
+    run_verify_transport_failure(*tcp0, *tcp1);
+}
+#endif
+
 // One long prefill split into many frames arrives intact, and a closed replica refuses further calls.
 void run_frames() {
     Pair link;
@@ -507,6 +909,18 @@ int main() {
     run_hooks(true, true);
     run_hooks(false, true);
     run_tamper();
+    Pair wire;
+    run_score_reads(wire.t0, wire.t1);
+    run_verify_allocation_failure();
+    run_verify_backend_failure();
+    run_exchange_abort_allocation_failure();
+    run_callbackless_exchange_rejection();
+    run_exchange_verify_failure();
+    run_verify_publication_failure();
+    run_follower_abort_allocation_failure();
+#ifdef STRIX_TEST_REPLICA_TRANSPORTS
+    run_real_transports();
+#endif
     if (failures != 0) {
         std::cerr << failures << " failure(s)\n";
         return 1;

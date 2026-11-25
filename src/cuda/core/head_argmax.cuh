@@ -13,21 +13,9 @@
 
 #include "common.cuh"
 #include "step_rows.cuh"
-#include "strix/head_argmax.hpp"
+#include "../../core/head_argmax_plan.hpp"
 
 namespace strix::cuda::core::head_argmax {
-
-namespace ha = ::strix::head_argmax;
-
-struct View {
-    const float* logits = nullptr;
-    std::uint64_t stride = 0;       // floats between rows (0 = count)
-    std::uint32_t count = 0;        // logits per row
-    std::uint32_t rows = 0;
-    std::uint32_t first_index = 0;  // global index of position 0 (vocabulary slices)
-    std::uint32_t chunks = 0;       // 0 = ha::default_chunks(count); <= ha::kMaxChunks
-    ha::Pick* partial = nullptr;    // ha::workspace_bytes(rows, chunks) of device memory
-};
 
 // plain: both kernels launched with <<<>>> (stream order). pdl: both launched with launch_pdl (programmatic dependent
 // launch when pdl_enabled()); the partial kernel triggers its dependents and waits before reading the logits, the
@@ -119,11 +107,6 @@ __global__ __launch_bounds__(kThreads) void final_step_kernel(View v, Emit emit,
 #include "head_argmax_final.inc"
 }
 
-inline bool prepare_split_view(View& v) {
-    if (v.stride == 0U) v.stride = v.count;
-    if (v.chunks == 0U) v.chunks = ha::default_chunks(v.count);
-    return v.logits && v.partial && v.count != 0U && v.chunks <= ha::kMaxChunks && v.stride >= v.count;
-}
 }  // namespace detail
 
 // The caller orders the partial launch before the final launch.
@@ -157,10 +140,7 @@ cudaError_t pick_final(View v, Emit emit, cudaStream_t stream) {
 template <Launch L = Launch::plain, class P = ha::Pick, class Emit>
 cudaError_t pick_rows(View v, Emit emit, cudaStream_t stream) {
     if (v.rows == 0U) return cudaSuccess;
-    if (v.stride == 0U) v.stride = v.count;
-    if (v.chunks == 0U) v.chunks = ha::default_chunks(v.count);
-    if (!v.logits || !v.partial || v.count == 0U || v.chunks > ha::kMaxChunks || v.stride < v.count)
-        return cudaErrorInvalidValue;
+    if (!detail::prepare_split_view(v)) return cudaErrorInvalidValue;
     const dim3 partial_grid(v.chunks, v.rows), block(detail::kThreads);
     if constexpr (L == Launch::pdl) {
         namespace cc = ::strix::cuda_core;

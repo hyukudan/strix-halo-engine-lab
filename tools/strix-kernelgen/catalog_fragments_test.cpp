@@ -1,4 +1,4 @@
-#include "cuda/core/mix_catalog.hpp"
+#include "core/mix_catalog.hpp"
 #include "strix/exec/catalog.hpp"
 
 #include <algorithm>
@@ -119,7 +119,7 @@ std::size_t check_declaration(const Declaration& expected) {
     const auto op = parse_enum(expected.op, ops);
     const auto act = parse_enum(expected.act, operands);
     const auto& catalog = Catalog::builtin(Backend::cuda);
-    const auto mix_rows = strix::cuda::mix::catalog_entries();
+    const auto mix_rows = strix::core::residual_mix::catalog_entries(strix::exec::Backend::cuda);
     const std::array first{1U, 2U, 9U, 33U};
     const std::array last{1U, 8U, 32U, std::numeric_limits<std::uint32_t>::max()};
     std::size_t count = 0;

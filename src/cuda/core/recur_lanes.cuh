@@ -1,15 +1,13 @@
 #pragma once
-// Shared CUDA Gated DeltaNet recurrence in the "lanes" order (HIP gdn_prefill_lanes_kernel): exact FP32, token-serial,
-// G lanes per state column, tree reductions, no barrier per row; 48 value heads x 4 column blocks = 192 CTAs at the
-// Qwen GDN geometry (16 key heads, 48 value heads, head dim 128; the GdnDims defaults of strix/cuda_core/gdn.hpp).
-// Bound by the Qwen MoE CUDA engine (src/cuda/models/qwen/qwen_gdn.cu: prefill, multi-segment and fused decode kernels).
-// Row view: any type with float* qkv / beta / gate / core and std::uint64_t stride (floats between consecutive rows).
-// The dense CUDA engine keeps delta_body (gdn.cu): its exact order (sequential 128-term sums, mul + add without FMA,
-// prefill == decode) is a different numerical identity, so binding it there is a dense identity change, not a move.
+// Shared CUDA Gated DeltaNet recurrence in the lanes order (HIP gdn_prefill_lanes_kernel): token-serial
+// FP32, G lanes per state column, tree reductions and no barrier per row.
+// Row view: float pointers qkv / beta / gate / core with a uint64_t stride (floats between rows).
+// The sequential sums and separate multiply/add in delta_body (gdn.cu) use a different exact order.
 #include <cstdint>
 
 #include <cuda_runtime.h>
 
+#include "ops/recur/recur_decode_plan.hpp"
 #include "strix/cuda/amd_math.cuh"
 #include "strix/recurrent_state_type.hpp"
 #include <cuda_fp16.h>
@@ -20,29 +18,32 @@ namespace strix::cuda_core::gdn_lanes {
 namespace am = strix::cuda::amdmath;
 namespace rstate = strix::attn_core::rstate;
 inline constexpr unsigned kFull = 0xffffffffU;
-inline constexpr std::uint32_t kKeyHeads = 16, kValueHeads = 48, kHeadDim = 128;
-inline constexpr std::uint32_t kKeyWidth = kKeyHeads * kHeadDim;  // 2048
+// Preserve the incumbent lane binding while callers migrate to explicit layouts.
+using DefaultLayout = ops::recur::GdnDecodeLayout<ops::recur::shape::gdn_2560_16x48x128>;
+inline constexpr auto kKeyHeads = DefaultLayout::key_heads, kValueHeads = DefaultLayout::value_heads;
+inline constexpr auto kHeadDim = DefaultLayout::head_dim, kKeyWidth = DefaultLayout::key_width;
 
 // ---------------------------------------------------------------------------------------------------------------- K5
 // gdn_prefill_lanes_kernel (:2896-2994, #pragma clang fp contract(off)). Lane `sub` of a G-lane column group owns keys
 // sub + j*G. Per row, in this order: S = S*decay; p = S*k; pred = tree(p); delta = (v - pred)*beta; S = fma(k, delta, S);
-// out = tree(S*q). Tree = the 128-leaf pairing of keys i, i+d for d = 64, 32, ..., 1: in-lane j, j+half (keys differ
+// out = tree(S*q). Tree = the pairing of keys i, i+d for d = head_dim/2, ..., 1: in-lane j, j+half (keys differ
 // half*G) for half = K/2..1, then xor G/2..1 inside the group (HIP: DPP row_xmask G/2..1, every lane gets the root).
 // decay = expf(gate) (computed when the row is staged, :2951). Rows strictly ascending; state read once, written once.
-// Mapping (CUDA): a block owns 32 columns of one value head (32*G threads; 48*4 = 192 blocks); thread = column*G + sub.
+// Mapping (CUDA): a block owns 32 columns of one value head (32*G threads); thread = column*G + sub.
 // q/k of Chunk rows are staged in shared memory transposed by key residue (key[r][sub][j] = k[sub + j*G], pitch K+4 so
 // the G distinct float4 reads of a warp hit distinct banks), v/beta/decay alongside; double-buffered through registers
 // (the next chunk's global loads are in flight while the current chunk computes), as the HIP kernel stages them.
 // decay = expf(gate) is computed by decay_kernel for all (row, head) before the recurrence (same value as the HIP commit-time
 // expf; an fp64-based amd_expf inside the serial loop cost ~0.7 ms of 3.4 at T=8192). Rows are unrolled by 2 so the
 // out tree of row r can overlap the delta chain of row r+1 (the arithmetic of each row is unchanged).
-template <unsigned G> struct RecShape {
-    static constexpr unsigned Columns = 32, Threads = 32 * G, K = kHeadDim / G, Pitch = K + 4, Chunk = G >= 16 ? 8 : 16;
-    static constexpr unsigned KQ = Chunk * 64 / Threads;                                  // float4 of k|q per thread
+template <unsigned G, unsigned HeadDim = kHeadDim> struct RecShape {
+    static constexpr unsigned Columns = 32, Threads = 32 * G, K = HeadDim / G, Pitch = K + 4, Chunk = G >= 16 ? 8 : 16;
+    static constexpr unsigned KeyVectors = HeadDim / 4U, PairVectors = 2U * KeyVectors;
+    static constexpr unsigned KQ = Chunk * PairVectors / Threads;                                  // float4 of k|q per thread
     static constexpr unsigned VQ = (Chunk * Columns / 4 + Threads - 1) / Threads;          // float4 of v per thread
 };
-template <unsigned G> struct RecStage {
-    using S = RecShape<G>;
+template <unsigned G, unsigned HeadDim = kHeadDim> struct RecStage {
+    using S = RecShape<G, HeadDim>;
     alignas(16) float key[S::Chunk][G][S::Pitch];
     alignas(16) float query[S::Chunk][G][S::Pitch];
     alignas(16) float value[S::Chunk][S::Columns];
@@ -53,29 +54,30 @@ template <unsigned G> struct RecStage {
 // ST = stored element of the state (f32 = incumbent code; f16 / bf16: FP32 arithmetic, widened on load, narrowed on store).
 // RR (16-bit only) = round the register state through the stored type after EVERY row (decode / window / commit replay: as
 // if stored per token); prefill (RR false) keeps FP32 inside the call and narrows once at the end. Elements of one thread
-// are G*128 apart, so the 16-bit access is scalar through the codec.
-template <unsigned G, RecurrentStateType ST, bool RR, bool Fused = false, typename RowView>
+// are G*head_dim apart, so the 16-bit access is scalar through the codec.
+template <unsigned G, RecurrentStateType ST, bool RR, bool Fused = false, class Layout = DefaultLayout, typename RowView>
 __device__ __forceinline__ void recurrence_body(const RowView& rows, std::uint32_t count, const float* state_in, float* state_out,
     const float* __restrict__ decays, const am::Tables* tables = nullptr) {
-    using Sh = RecShape<G>;
+    using Sh = RecShape<G, Layout::head_dim>;
     constexpr unsigned Columns = Sh::Columns, Threads = Sh::Threads, K = Sh::K, Chunk = Sh::Chunk, KQ = Sh::KQ, VQ = Sh::VQ;
-    static_assert(Chunk * 64 % Threads == 0 && 2 * Chunk <= Threads);
-    __shared__ RecStage<G> stage[2];
+    constexpr unsigned KeyVectors = Sh::KeyVectors, PairVectors = Sh::PairVectors;
+    static_assert(Chunk * PairVectors % Threads == 0 && 2 * Chunk <= Threads);
+    __shared__ RecStage<G, Layout::head_dim> stage[2];
     const unsigned thread = threadIdx.x, sub = thread % G, local = thread / G;
-    constexpr unsigned Blocks = kHeadDim / Columns;
+    constexpr unsigned Blocks = Layout::head_dim / Columns;
     const unsigned value_head = blockIdx.x / Blocks, column_base = blockIdx.x % Blocks * Columns, column = column_base + local;
-    const unsigned key_offset = value_head % kKeyHeads * kHeadDim;  // value head h reads key head h mod 16 (:2922)
-    const unsigned value_offset = 2U * kKeyWidth + value_head * kHeadDim + column_base;
+    const unsigned key_offset = value_head % Layout::key_heads * Layout::head_dim;  // value head h reads key head h mod key_heads
+    const unsigned value_offset = 2U * Layout::key_width + value_head * Layout::head_dim + column_base;
     float4 kq[KQ], vv[VQ];
     float scalar = 0.0F;
     const auto fetch = [&](unsigned first) {
 #pragma unroll
         for (unsigned i = 0; i < KQ; ++i) {
-            const unsigned q = thread + i * Threads, r = q / 64U, w = q % 64U;
+            const unsigned q = thread + i * Threads, r = q / PairVectors, w = q % PairVectors;
             kq[i] = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
             if (first + r < count) {
                 const float* row = rows.qkv + static_cast<std::uint64_t>(first + r) * rows.stride + key_offset;
-                kq[i] = *reinterpret_cast<const float4*>(w < 32U ? row + kKeyWidth + w * 4U : row + (w - 32U) * 4U);
+                kq[i] = *reinterpret_cast<const float4*>(w < KeyVectors ? row + Layout::key_width + w * 4U : row + (w - KeyVectors) * 4U);
             }
         }
 #pragma unroll
@@ -88,13 +90,13 @@ __device__ __forceinline__ void recurrence_body(const RowView& rows, std::uint32
         if (thread < 2U * Chunk && first + thread % Chunk < count)
             scalar = thread < Chunk ? rows.beta[static_cast<std::uint64_t>(first + thread) * rows.stride + value_head]
                    : Fused ? am::amd_expf(*tables, rows.gate[static_cast<std::uint64_t>(first + thread - Chunk) * rows.stride + value_head])
-                           : decays[(first + thread - Chunk) * kValueHeads + value_head];
+                           : decays[(first + thread - Chunk) * Layout::value_heads + value_head];
     };
-    const auto commit = [&](RecStage<G>& s) {
+    const auto commit = [&](RecStage<G, Layout::head_dim>& s) {
 #pragma unroll
         for (unsigned i = 0; i < KQ; ++i) {
-            const unsigned q = thread + i * Threads, r = q / 64U, w = q % 64U, key = (w % 32U) * 4U;
-            float (&target)[G][Sh::Pitch] = w < 32U ? s.key[r] : s.query[r];
+            const unsigned q = thread + i * Threads, r = q / PairVectors, w = q % PairVectors, key = (w % KeyVectors) * 4U;
+            float (&target)[G][Sh::Pitch] = w < KeyVectors ? s.key[r] : s.query[r];
             const float parts[4] = {kq[i].x, kq[i].y, kq[i].z, kq[i].w};
 #pragma unroll
             for (unsigned c = 0; c < 4U; ++c) target[(key + c) % G][(key + c) / G] = parts[c];
@@ -110,7 +112,7 @@ __device__ __forceinline__ void recurrence_body(const RowView& rows, std::uint32
     float S[K];
 #pragma unroll
     for (unsigned j = 0; j < K; ++j) {
-        const std::uint64_t at = (static_cast<std::uint64_t>(value_head) * kHeadDim + sub + j * G) * kHeadDim + column;
+        const std::uint64_t at = (static_cast<std::uint64_t>(value_head) * Layout::head_dim + sub + j * G) * Layout::head_dim + column;
         if constexpr (ST == RecurrentStateType::f32) S[j] = state_in[at];
         else S[j] = rstate::Codec<ST>::load(reinterpret_cast<const std::uint16_t*>(state_in)[at]);
     }
@@ -121,9 +123,9 @@ __device__ __forceinline__ void recurrence_body(const RowView& rows, std::uint32
     for (unsigned c = 0; c < chunks; ++c) {
         const bool more = c + 1U < chunks;
         if (more) fetch((c + 1U) * Chunk);
-        const RecStage<G>& s = stage[c & 1U];
+        const RecStage<G, Layout::head_dim>& s = stage[c & 1U];
         const unsigned first = c * Chunk, n = min(Chunk, count - first);
-        float* core = rows.core + static_cast<std::uint64_t>(first) * rows.stride + value_head * kHeadDim + column;
+        float* core = rows.core + static_cast<std::uint64_t>(first) * rows.stride + value_head * Layout::head_dim + column;
 #pragma unroll 2
         for (unsigned r = 0; r < n; ++r) {
             const float4* key = reinterpret_cast<const float4*>(s.key[r][sub]);
@@ -179,7 +181,7 @@ __device__ __forceinline__ void recurrence_body(const RowView& rows, std::uint32
     }
 #pragma unroll
     for (unsigned j = 0; j < K; ++j) {
-        const std::uint64_t at = (static_cast<std::uint64_t>(value_head) * kHeadDim + sub + j * G) * kHeadDim + column;
+        const std::uint64_t at = (static_cast<std::uint64_t>(value_head) * Layout::head_dim + sub + j * G) * Layout::head_dim + column;
         if constexpr (ST == RecurrentStateType::f32) state_out[at] = S[j];
         else reinterpret_cast<std::uint16_t*>(state_out)[at] = rstate::Codec<ST>::store(S[j]);
     }

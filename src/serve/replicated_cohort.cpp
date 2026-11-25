@@ -95,23 +95,32 @@ TokenSampler sampler_of(std::span<const std::uint32_t> w) {
     return TokenSampler(p, o);
 }
 
-void check_frame(std::uint32_t frame_words) {
+void check_replica_link(const dist::Transport& link, std::uint32_t frame_words) {
     if (frame_words == 0U) throw std::invalid_argument("cohort replica: frame_words >= 1");
+    if (!link.supports_peer_abort()) throw std::invalid_argument("cohort replica: transport requires peer cancellation");
+}
+
+void abort_link(dist::Transport& link, const char* reason) noexcept {
+    try {
+        link.abort(reason);
+    } catch (...) {
+        // Under memory pressure even building the reason string can fail. Retry without it.
+        try {
+            link.abort({});
+        } catch (...) {  // Keep the original exception.
+        }
+    }
 }
 
 }  // namespace
 
 ReplicatedCohort::ReplicatedCohort(CohortBackend& local, dist::Transport& link, ReplicaOptions options)
     : local_(local), link_(link), options_(options) {
-    check_frame(options_.frame_words);
+    check_replica_link(link_, options_.frame_words);
 }
 
 ReplicatedCohort::~ReplicatedCohort() {
-    if (closed_) return;
-    try {
-        link_.abort("cohort replica: rank 0 ended without close()");
-    } catch (...) {  // a destructor reports nothing further; rank 1 sees the aborted link
-    }
+    if (!closed_) abort_link(link_, "cohort replica: rank 0 ended without close()");
 }
 
 std::uint32_t ReplicatedCohort::lanes() const { return local_.lanes(); }
@@ -130,6 +139,11 @@ std::uint32_t ReplicatedCohort::sample_final(std::uint32_t lane, TokenSampler& s
 bool ReplicatedCohort::prefill_emits_first() const { return local_.prefill_emits_first(); }
 std::uint32_t ReplicatedCohort::prefill_top(std::uint32_t lane) { return local_.prefill_top(lane); }
 std::uint32_t ReplicatedCohort::max_window(std::uint32_t lane) const { return local_.max_window(lane); }
+
+void ReplicatedCohort::abort_replica(const char* reason) noexcept {
+    closed_ = true;
+    abort_link(link_, reason);
+}
 
 void ReplicatedCohort::send(std::uint32_t op, std::uint32_t arg, std::uint32_t flag, std::span<const std::uint32_t> body) {
     if (closed_) throw std::logic_error("cohort replica: call after close()");
@@ -160,8 +174,10 @@ void ReplicatedCohort::send(std::uint32_t op, std::uint32_t arg, std::uint32_t f
             at += n;
         }
     } catch (const std::exception& error) {
-        closed_ = true;  // the pair is out of step: nothing further may run on either rank
-        link_.abort(error.what());
+        abort_replica(error.what());
+        throw;
+    } catch (...) {
+        abort_replica("");
         throw;
     }
     deferred_.clear();
@@ -187,8 +203,20 @@ void ReplicatedCohort::verify(std::span<const CohortGroup> groups, std::span<con
     if (rows != tokens.size() || top.size() != tokens.size())
         throw std::invalid_argument("cohort replica: verify rows, tokens and top disagree");
     body_.insert(body_.end(), tokens.begin(), tokens.end());
+    // The verify frame carries no score-read flag yet: both ranks run every group as read (CohortGroup's default), so
+    // rank 0 and rank 1 always take the same backend route. Finish any group allocation before rank 1 can start.
+    read_groups_.assign(groups.begin(), groups.end());
+    for (auto& g : read_groups_) g.reads_scores = true;
     send(kOpVerify, words_of(groups.size(), "groups"), 0U, body_);
-    local_.verify(groups, tokens, top);
+    try {
+        local_.verify(read_groups_, tokens, top);
+    } catch (const std::exception& error) {
+        abort_replica(error.what());
+        throw;
+    } catch (...) {
+        abort_replica("cohort replica: rank 0 verify failed");
+        throw;
+    }
 }
 
 void ReplicatedCohort::commit(std::span<const std::uint32_t> accept) {
@@ -302,7 +330,7 @@ void ReplicatedCohort::close() {
 }
 
 std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, ReplicaOptions options) {
-    check_frame(options.frame_words);
+    check_replica_link(link, options.frame_words);
     std::uint64_t round = 0;
     Block out{}, in{};
     std::vector<std::uint32_t> payload, top;
@@ -362,7 +390,7 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
                 if (2U * n > body.size()) throw pair::ProtocolError("cohort replica: truncated groups");
                 std::uint64_t rows = 0;
                 for (std::uint64_t g = 0; g < n; ++g) {
-                    groups.push_back({body[2U * g], body[2U * g + 1U]});
+                    groups.push_back({body[2U * g], body[2U * g + 1U], true});  // as rank 0: every group read
                     rows += body[2U * g + 1U];
                 }
                 tokens = body.subspan(2U * n);
@@ -447,7 +475,10 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
             }
         }
     } catch (const std::exception& error) {
-        link.abort(error.what());
+        abort_link(link, error.what());
+        throw;
+    } catch (...) {
+        abort_link(link, "cohort replica: rank 1 failed");
         throw;
     }
 }

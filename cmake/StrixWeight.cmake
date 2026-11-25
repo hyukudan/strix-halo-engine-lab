@@ -3,6 +3,8 @@ get_filename_component(STRIX_WEIGHT_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE
 add_library(strix-weight STATIC
     ${STRIX_WEIGHT_ROOT}/src/weight/block_draft.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/host_q8.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/lowbit_pack.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/calib_provenance.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/source.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/admission.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/model_binding.cpp

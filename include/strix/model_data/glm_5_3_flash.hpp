@@ -87,6 +87,12 @@ inline constexpr bool selection_bias = true;
 inline constexpr std::int64_t shared = 1;
 inline constexpr std::int64_t top_k = 8;
 } // namespace moe
+namespace multi_device {
+namespace legacy_env {
+inline constexpr std::string_view STRIX_GLM_PF_PIPELINE = "forms.layers";
+inline constexpr std::string_view STRIX_GLM_PF_STAGED = "forms.layers";
+} // namespace legacy_env
+} // namespace multi_device
 inline constexpr std::string_view name = "glm-5.3-flash";
 namespace presets {
 inline constexpr std::string_view default_ = "fast";

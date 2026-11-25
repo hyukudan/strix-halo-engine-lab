@@ -1,17 +1,21 @@
 #include "attn_decode.cuh"
 
 #include "attn_core/masks.hpp"
+#include "attn_core/position_split.hpp"
 #include "attn_core/relative_bias.hpp"
 #include "core/row_transforms.hpp"
 #include "common.cuh"
 #include "ptx.cuh"
 #include "strix/cuda_core/attention_score_reduce.hpp"
 
+#include <type_traits>
+
 namespace strix::cuda::core::attn {
 namespace {
 
 namespace legacy = ::strix::cuda_core;
 constexpr unsigned kWarps = kSplitKeys / 32U;
+static_assert(kSplitKeys == attn_core::position_split_keys);
 
 // Only the generic kernels' device operands are passed to the fallback grid.
 struct FallbackInput {
@@ -34,6 +38,16 @@ struct Job {
     __device__ unsigned first() const {
         return in.device_position ? *in.device_position : in.first_position;
     }
+    __device__ __forceinline__ unsigned row_start(unsigned) const { return first(); }
+    __device__ __forceinline__ bool valid_start(unsigned start) const {
+        return start <= plan.spec.max_context - plan.spec.rows;
+    }
+    __device__ __forceinline__ unsigned position(unsigned start, unsigned row) const {
+        return start + row;
+    }
+    __device__ __forceinline__ unsigned first_key(unsigned pos) const {
+        return attn_core::mask::window_lo(pos, plan.spec.window);
+    }
     __device__ std::size_t row_head(unsigned row, unsigned head) const {
         return std::size_t{row} * plan.spec.heads + head;
     }
@@ -48,6 +62,10 @@ struct Job {
             return (std::size_t{head} * spec.cache_slots + key) * spec.head_dim + dim;
         const unsigned slot = spec.layout == KvLayout::ring ? key % spec.cache_slots : key;
         return (std::size_t{slot} * spec.kv_heads + head) * spec.head_dim + dim;
+    }
+    __device__ __forceinline__ std::size_t key_offset(unsigned, unsigned, unsigned head,
+                                                      unsigned key, unsigned dim = 0) const {
+        return kv_offset(head, key, dim);
     }
     __device__ void store(unsigned row, unsigned head, unsigned dim, float value) const {
         const auto offset = row_head(row, head) * plan.spec.head_dim + dim;
@@ -68,22 +86,46 @@ struct Job {
     }
 };
 
+struct PositionJob : Job {
+    attn_core::PositionSplitPlan geometry;
+    legacy::RowMap map;
+
+    __device__ __forceinline__ unsigned row_start(unsigned row) const {
+        return map.pos ? map.pos[row] : first();
+    }
+    __device__ __forceinline__ bool valid_start(unsigned start) const {
+        return map.pos ? start < geometry.context : Job::valid_start(start);
+    }
+    __device__ __forceinline__ unsigned position(unsigned start, unsigned row) const {
+        return map.pos ? start : Job::position(start, row);
+    }
+    __device__ __forceinline__ unsigned first_key(unsigned pos) const {
+        return geometry.first_key(pos);
+    }
+    __device__ __forceinline__ std::size_t key_offset(unsigned row, unsigned pos, unsigned head,
+                                                      unsigned key, unsigned dim = 0) const {
+        const auto base = map.slot ? map.slot[row] * map.slot_stride : 0;
+        const auto slot = map.self && key == pos ? map.self[row] : key;
+        return base + kv_offset(head, slot, dim);
+    }
+};
+
 // FP32 split fallback for shapes outside the native D256 head-major ABI. A CTA
 // shares a K/V chunk among the heads of one group. The transposed butterfly
 // preserves the order of each dot, and no chunk normalizes independently.
-template <int GT, bool Dim256>
-__global__ void __launch_bounds__(256, 2) score_splits(Job job) {
+template <int GT, bool Dim256, class Work>
+__global__ void __launch_bounds__(256, 2) score_splits(Work job) {
     using namespace legacy::score_reduce;
     constexpr int P = score_positions(GT);
     using Map = ScoreMap<GT, P>;
     __shared__ float warp_max[kWarps][GT];
     const auto& spec = job.plan.spec;
     const unsigned row = blockIdx.z, kv_head = blockIdx.y, split = blockIdx.x;
-    const unsigned first = job.first();
-    if (first > spec.max_context - spec.rows) return;
-    const unsigned pos = first + row;
-    const unsigned lo = attn_core::mask::window_lo(pos, spec.window);
-    const unsigned begin = split * kSplitKeys, end = min(pos + 1U, begin + kSplitKeys);
+    const unsigned first = job.row_start(row);
+    if (!job.valid_start(first)) return;
+    const unsigned pos = job.position(first, row);
+    const unsigned lo = job.first_key(pos);
+    const unsigned begin = attn_core::position_split_begin(split), end = min(pos + 1U, begin + kSplitKeys);
     if (begin >= end || end <= lo) return;
     const unsigned lane = threadIdx.x & 31U, warp = threadIdx.x >> 5;
     const unsigned head0 = kv_head * job.plan.group;
@@ -113,7 +155,7 @@ __global__ void __launch_bounds__(256, 2) score_splits(Job job) {
         for (int j = 0; j < P; ++j) {
             const unsigned key = p0 + j * kWarps;
             if (key < lo || key >= end) continue;
-            const auto* k = job.in.k + job.kv_offset(kv_head, key);
+            const auto* k = job.in.k + job.key_offset(row, pos, kv_head, key);
             if constexpr (Dim256) {
                 const uint4 packed = __ldg(reinterpret_cast<const uint4*>(k + dim0));
                 const float values[8] = {
@@ -167,24 +209,24 @@ __global__ void __launch_bounds__(256, 2) score_splits(Job job) {
     }
 }
 
-template <unsigned Dim>
-__global__ void __launch_bounds__(256) value_splits(Job job) {
+template <unsigned Dim, class Work>
+__global__ void __launch_bounds__(256) value_splits(Work job) {
     __shared__ float maxima[kMaxGroup], warp_sum[kMaxGroup][kWarps];
     __shared__ float weights[kSplitKeys][kMaxGroup];
     const auto& spec = job.plan.spec;
     const unsigned row = blockIdx.z, kv_head = blockIdx.y, split = blockIdx.x;
-    const unsigned first = job.first();
-    if (first > spec.max_context - spec.rows) return;
-    const unsigned pos = first + row;
-    const unsigned lo = attn_core::mask::window_lo(pos, spec.window);
-    const unsigned begin = split * kSplitKeys, end = min(pos + 1U, begin + kSplitKeys);
+    const unsigned first = job.row_start(row);
+    if (!job.valid_start(first)) return;
+    const unsigned pos = job.position(first, row);
+    const unsigned lo = job.first_key(pos);
+    const unsigned begin = attn_core::position_split_begin(split), end = min(pos + 1U, begin + kSplitKeys);
     if (begin >= end || end <= lo) return;
     const unsigned tid = threadIdx.x, lane = tid & 31U, warp = tid >> 5;
     const auto rh = job.row_head(row, kv_head * job.plan.group);
     const unsigned dim = Dim == 0 ? spec.head_dim : Dim;
     if (warp < job.plan.group) {
         float mx = attn_core::mask::excluded_score;
-        for (unsigned c = lo / kSplitKeys + lane; c <= pos / kSplitKeys; c += 32U)
+        for (unsigned c = attn_core::position_split(lo) + lane; c <= attn_core::position_split(pos); c += 32U)
             mx = fmaxf(mx, job.maxima(rh + warp)[c]);
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
@@ -210,7 +252,7 @@ __global__ void __launch_bounds__(256) value_splits(Job job) {
     for (unsigned d = tid; d < dim; d += kSplitKeys) {
         float acc[kMaxGroup]{};
         for (unsigned p = max(lo, begin); p < end; ++p) {
-            const float value = __bfloat162float(job.in.v[job.kv_offset(kv_head, p, d)]);
+            const float value = __bfloat162float(job.in.v[job.key_offset(row, pos, kv_head, p, d)]);
             for (unsigned g = 0; g < job.plan.group; ++g)
                 acc[g] = __fadd_rn(acc[g], __fmul_rn(weights[p - begin][g], value));
         }
@@ -218,16 +260,20 @@ __global__ void __launch_bounds__(256) value_splits(Job job) {
     }
 }
 
-__global__ void __launch_bounds__(256) merge_splits(Job job) {
+template <class Work>
+__global__ void __launch_bounds__(256) merge_splits(Work job) {
     const auto& spec = job.plan.spec;
-    const unsigned first = job.first();
-    if (first > spec.max_context - spec.rows) return;
-    const unsigned head = blockIdx.x, row = blockIdx.y, pos = first + row;
-    const unsigned begin = attn_core::mask::window_lo(pos, spec.window) / kSplitKeys;
+    const unsigned first = [&] {
+        if constexpr (std::is_same_v<Work, Job>) return job.first();
+        else return job.row_start(blockIdx.y);
+    }();
+    if (!job.valid_start(first)) return;
+    const unsigned head = blockIdx.x, row = blockIdx.y, pos = job.position(first, row);
+    const unsigned begin = attn_core::position_split(job.first_key(pos));
     const auto rh = job.row_head(row, head);
     for (unsigned d = threadIdx.x; d < spec.head_dim; d += kSplitKeys) {
         float denom = 0.0F, acc = 0.0F;
-        for (unsigned c = begin; c <= pos / kSplitKeys; ++c) {
+        for (unsigned c = begin; c <= attn_core::position_split(pos); ++c) {
             denom = __fadd_rn(denom, job.denoms(rh)[c]);
             acc = __fadd_rn(acc, job.partial(rh, c)[d]);
         }
@@ -235,11 +281,23 @@ __global__ void __launch_bounds__(256) merge_splits(Job job) {
     }
 }
 
-template <bool Dim256>
-void launch_scores(Job job, dim3 grid, cudaStream_t stream) {
+template <bool Dim256, class Work>
+void launch_scores(Work job, dim3 grid, cudaStream_t stream) {
     if (job.plan.group <= 4) score_splits<4, Dim256><<<grid, kSplitKeys, 0, stream>>>(job);
     else if (job.plan.group <= 6) score_splits<6, Dim256><<<grid, kSplitKeys, 0, stream>>>(job);
     else score_splits<8, Dim256><<<grid, kSplitKeys, 0, stream>>>(job);
+}
+
+template <unsigned Dim, class Work>
+cudaError_t launch_global(Work job, unsigned splits, cudaStream_t stream) {
+    const auto& spec = job.plan.spec;
+    const dim3 grid(splits, spec.kv_heads, spec.rows);
+    launch_scores<Dim == 256>(job, grid, stream);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) return status;
+    value_splits<Dim><<<grid, kSplitKeys, 0, stream>>>(job);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) return status;
+    merge_splits<<<dim3(spec.heads, spec.rows), kSplitKeys, 0, stream>>>(job);
+    return cudaGetLastError();
 }
 
 // Prepared BF16 fallback for dimensions and views outside the native flash ABI.
@@ -428,13 +486,7 @@ cudaError_t launch(Job job, cudaStream_t stream) {
     }
     const unsigned splits = job.in.device_position ? job.plan.splits :
         (job.in.first_position + spec.rows + kSplitKeys - 1U) / kSplitKeys;
-    const dim3 grid(splits, spec.kv_heads, spec.rows);
-    launch_scores<Dim == 256>(job, grid, stream);
-    if (auto status = cudaGetLastError(); status != cudaSuccess) return status;
-    value_splits<Dim><<<grid, kSplitKeys, 0, stream>>>(job);
-    if (auto status = cudaGetLastError(); status != cudaSuccess) return status;
-    merge_splits<<<dim3(spec.heads, spec.rows), kSplitKeys, 0, stream>>>(job);
-    return cudaGetLastError();
+    return launch_global<Dim>(job, splits, stream);
 }
 
 }  // namespace
@@ -457,7 +509,7 @@ cudaError_t decode(const DecodePlan& plan, const DecodeInput& in, float* out,
 
     const cuda_core::AttentionDims dims{spec.heads, spec.kv_heads, spec.head_dim, spec.scale, spec.cache_slots};
     const detail::PlanPosition position{in.device_position, in.first_position, spec.max_context - spec.rows};
-    if (uses_native_split(spec)) {
+    if (uses_native_split(spec, kNativeSplitHeadDim)) {
         const bool interleaved = spec.gate == OutputGate::sigmoid_interleaved;
         const auto stride = spec.head_dim * (interleaved ? 2U : 1U);
         const cuda_core::GroupedView packed{spec.rows, spec.heads, spec.head_dim};
@@ -480,7 +532,8 @@ cudaError_t decode(const DecodePlan& plan, const DecodeInput& in, float* out,
         return detail::decode_split(dims, in.q, q_view, gate, gate_view, in.k, in.v, position, spec.rows,
                                     out, scratch, stream, in.row_map);
     }
-    if (mapped || strided || in.shadow) return cudaErrorInvalidValue;
+    if (mapped || strided || in.shadow || spec.order == DecodeOrder::online_e4m3 ||
+        spec.gate == OutputGate::sigmoid_strided) return cudaErrorInvalidValue;
     if (spec.order == DecodeOrder::online_bf16 && spec.head_dim == 128) {
         const cuda_core::PreparedBf16Flash prepared{
             in.relative_bias, spec.sinks ? in.sinks : nullptr, spec.relative_extent, spec.window,
@@ -503,6 +556,31 @@ cudaError_t decode(const DecodePlan& plan, const DecodeInput& in, float* out,
         case 512: return launch<512>(job, stream);
         default: return launch<0>(job, stream);
     }
+}
+
+cudaError_t decode_position_split(const DecodePlan& plan, const DecodeInput& in, float* out,
+                                  float* scratch, std::size_t scratch_floats, cudaStream_t stream) {
+    const auto& spec = plan.spec;
+    const auto& map = in.row_map;
+    const auto plane = std::size_t{spec.cache_slots} * spec.kv_heads * spec.head_dim;
+    if (spec.order != DecodeOrder::global_max || spec.gate != OutputGate::none ||
+        in.shadow || in.q_view.n || in.gate_view.n || !in.q || !in.k || !in.v ||
+        !out || in.q == out || !scratch || scratch_floats < plan.scratch_floats ||
+        (map.slot && map.slot_stride < plane) ||
+        (!map.pos && !in.device_position && in.first_position > spec.max_context - spec.rows))
+        return cudaErrorInvalidValue;
+
+    if (spec.head_dim == 256 &&
+        ((reinterpret_cast<std::uintptr_t>(in.k) | reinterpret_cast<std::uintptr_t>(in.v)) % 16U != 0 ||
+         (map.slot && map.slot_stride % 8U != 0))) return cudaErrorInvalidValue;
+
+    const attn_core::PositionSplitPlan geometry{spec.max_context, spec.window};
+    const PositionJob job{{plan, {in.q, in.k, in.v, nullptr, nullptr, nullptr,
+                                 in.first_position, in.device_position}, out, scratch}, geometry, map};
+    const unsigned splits = map.pos || in.device_position ? geometry.split_count() :
+        attn_core::position_split(in.first_position + spec.rows - 1U) + 1U;
+    if (spec.head_dim == 256) return launch_global<256>(job, splits, stream);
+    return launch_global<0>(job, splits, stream);
 }
 
 }  // namespace strix::cuda::core::attn

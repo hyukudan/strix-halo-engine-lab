@@ -2,7 +2,7 @@
 #include "strix/cuda_core/dense_big.hpp"
 #include "strix/spec/engine_target.hpp"
 #include "../../src/core/dense_linear.hpp"
-#include "../../src/cuda/core/tall_k_plan.hpp"
+#include "../../src/core/tall_k_plan.hpp"
 #include "strix/env_flags.hpp"
 #include <algorithm>
 #include <memory>

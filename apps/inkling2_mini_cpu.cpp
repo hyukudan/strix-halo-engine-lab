@@ -102,7 +102,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     try {
-        auto options = cli::parse(argc, argv, family, false);
+        auto options = cli::parse(argc, argv, family);
         if (const auto* dspark = options.dspark) {
             family.load = [dspark](const serve::SerialGenerationLoad& load) {
                 return std::make_unique<CpuCliDecoder>(load.checkpoint, load.positions, dspark);

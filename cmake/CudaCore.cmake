@@ -6,6 +6,7 @@ endif()
 enable_language(CUDA)
 include(CTest)
 include("${CMAKE_CURRENT_LIST_DIR}/CudaTokenSampling.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/CoreRowsPlan.cmake")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,10 +43,13 @@ add_library(strix_cuda_core_kernels STATIC
     ${_cc_root}/src/cuda/core/attn_flash8.cu
     ${_cc_root}/src/cuda/core/recur_parity.cu
     ${_cc_root}/src/cuda/core/recur_chunk.cu  # FAST chunked GDN prefill (gdn-chunk16-f32-v1)
+    ${_cc_root}/src/cuda/core/attn_decode.cu  # decode_position_split (attn_core/position_split.hpp) and the decode kernels
+    ${_cc_root}/src/cuda/core/recur_decode.cu  # enqueue_decode_replay_step (GDN decode replay step)
+    ${_cc_root}/src/cuda/core/amd_math_tables.cu  # gfx1151 math tables read by recur_decode.cu
     ${_cc_root}/src/cuda/core/step_inputs.cu  # X3 step-input scatter (plain / tree / fed rows / slots)
     ${_cc_root}/src/cuda/core/lookup_cuda.cu  # K10c token lookup family
     ${_cc_root}/src/cuda/core/embed_splice.cu)  # provided embedding rows (session/embed_splice_device.hpp)
-target_link_libraries(strix_cuda_core_kernels PUBLIC strix_cuda_token_sampling)
+target_link_libraries(strix_cuda_core_kernels PUBLIC strix_cuda_token_sampling strix_core_rows_plan)
 target_include_directories(strix_cuda_core_kernels PUBLIC ${_cc_root}/include PRIVATE ${_cc_root}/src)
 # Identity: no FMA contraction, IEEE division and sqrt, no flush-to-zero (as the existing Qwen CUDA build).
 target_compile_options(strix_cuda_core_kernels PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
@@ -58,7 +62,7 @@ include(${CMAKE_CURRENT_LIST_DIR}/StrixDevice.cmake)
 add_library(strix_qwen35_cuda STATIC ${_cc_root}/src/qwen35/cuda/engine.cu ${_cc_root}/src/gguf_reader.cpp
     ${_cc_root}/src/qwen35/config.cpp ${_cc_root}/src/qwen35/family.cpp ${_cc_root}/src/model_family_registry.cpp)
 target_link_libraries(strix_qwen35_cuda PUBLIC strix_cuda_core_kernels)
-target_include_directories(strix_qwen35_cuda PUBLIC ${_cc_root}/include)
+target_include_directories(strix_qwen35_cuda PUBLIC ${_cc_root}/include PRIVATE ${_cc_root}/src)
 target_compile_options(strix_qwen35_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 if(MSVC)
     target_compile_options(strix_qwen35_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
@@ -249,7 +253,7 @@ if(BUILD_TESTING)
     add_executable(strix-cuda-inkling2-mini-projected-bias-test ${_cc_root}/tests/inkling2/mini_projected_bias_cuda.cu)
     target_link_libraries(strix-cuda-inkling2-mini-projected-bias-test PRIVATE strix_cuda_core_kernels)
     add_executable(strix-cuda-resident-lowbit-refusal-test ${_cc_root}/tests/cuda/resident_lowbit_refusal_tests.cu)
-    target_link_libraries(strix-cuda-resident-lowbit-refusal-test PRIVATE strix_cuda_core_kernels)
+    target_link_libraries(strix-cuda-resident-lowbit-refusal-test PRIVATE strix_cuda_core_kernels strix-weight)
     set(_cc_mini_tests strix-cuda-inkling2-mini-short-conv-test strix-cuda-inkling2-mini-attention-test
         strix-cuda-inkling2-mini-dense-test strix-cuda-inkling2-mini-residual-test strix-cuda-inkling2-mini-step-graph-test
         strix-cuda-inkling2-mini-projected-bias-test
@@ -282,7 +286,7 @@ if(BUILD_TESTING)
         add_executable(strix-cuda-inkling2-mini-cohort-lanes-test ${_cc_root}/tests/inkling2/mini_cohort_lanes_cuda.cu
             ${_cc_root}/src/serve/cohort_decode.cpp ${_cc_root}/src/serve/step_planner.cpp)
         target_link_libraries(strix-cuda-inkling2-mini-cohort-lanes-test PRIVATE
-            strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core)
+            strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core strix_serve)
         list(APPEND _cc_mini_verify_target strix-cuda-inkling2-mini-cohort-lanes-test)
         # The resident attention operand class through the production upload, binding and backend on a checkpoint-shaped
         # staged model (generated in the test: no model file): one plane finite, three planes refused or without scan scratch.

@@ -64,33 +64,38 @@ bool check_projection_groups() {
 }
 
 bool check_cuda_bf16_paths() {
-    using strix::cuda_core::Bf16RowPath;
-    using strix::cuda_core::kFp32GridMaxRows;
-    using strix::cuda_core::plan_bf16_row_projection;
+    using strix::core::Bf16RowPath;
+    constexpr strix::core::Bf16RowLimits limits{32U, 65535U * 8U, 32U, 32U, 16U};
+    const auto plan = [&](unsigned in, unsigned out, unsigned rows, bool tall) {
+        return strix::core::plan_bf16_row_projection(in, out, rows, tall, limits);
+    };
     constexpr unsigned input = 2304U;
-    constexpr unsigned short_limit = 32U;
     for (const unsigned rows : {33U, 2048U}) {
         for (const unsigned out : {384U, 1024U, 3072U})
-            if (plan_bf16_row_projection(input, out, rows, short_limit, true) != Bf16RowPath::big) return false;
+            if (plan(input, out, rows, true) != Bf16RowPath::big) return false;
         for (const unsigned out : {16U, 32U})
-            if (plan_bf16_row_projection(input, out, rows, short_limit, true) != Bf16RowPath::big_compact) return false;
-        if (plan_bf16_row_projection(input, 24U, rows, short_limit, true) != Bf16RowPath::fp32_grid ||
-            plan_bf16_row_projection(input + 8U, 32U, rows, short_limit, true) != Bf16RowPath::fp32_grid)
+            if (plan(input, out, rows, true) != Bf16RowPath::big_compact) return false;
+        if (plan(input, 24U, rows, true) != Bf16RowPath::fp32_grid ||
+            plan(input + 8U, 32U, rows, true) != Bf16RowPath::fp32_grid)
             return false;
     }
-    return plan_bf16_row_projection(input, 24U, kFp32GridMaxRows, short_limit, true) == Bf16RowPath::fp32_grid &&
-           plan_bf16_row_projection(input, 24U, kFp32GridMaxRows + 1U, short_limit, true) == Bf16RowPath::short_rows &&
-           plan_bf16_row_projection(input, 32U, short_limit, short_limit, true) == Bf16RowPath::short_rows &&
-           plan_bf16_row_projection(input, 3072U, 2048U, short_limit, false) == Bf16RowPath::short_rows;
+    return plan(input, 24U, limits.grid_rows, true) == Bf16RowPath::fp32_grid &&
+           plan(input, 24U, limits.grid_rows + 1U, true) == Bf16RowPath::short_rows &&
+           plan(input, 32U, limits.short_rows, true) == Bf16RowPath::short_rows &&
+           plan(input, 3072U, 2048U, false) == Bf16RowPath::short_rows;
 }
 
 // FAST mma2 / mma1 take the tall path where mma3 does, except that the
 // three-term compact tile becomes plain big. Explicit terms 3 is the default.
 bool check_cuda_bf16_fast_terms() {
-    using strix::cuda_core::Bf16RowPath;
-    using strix::cuda_core::plan_bf16_row_projection;
+    using strix::core::Bf16RowPath;
     constexpr unsigned input = 2304U;
     constexpr unsigned short_limit = 32U;
+    const auto plan_bf16_row_projection = [](unsigned in, unsigned out, unsigned rows, unsigned short_rows, bool tall,
+                                             int terms = 3) {
+        const strix::core::Bf16RowLimits limits{short_rows, 65535U * 8U, 32U, 32U, 16U};
+        return strix::core::plan_bf16_row_projection(in, out, rows, tall, limits, terms);
+    };
     for (const unsigned rows : {16U, 32U, 33U, 2048U, 70000U})
         for (const unsigned in : {input, input + 8U})
             for (const unsigned out : {16U, 24U, 32U, 48U, 384U, 3072U})

@@ -1,6 +1,6 @@
 #include "lookup_cases.hpp"
 
-#include "cuda/core/lookup_catalog.hpp"
+#include "core/lookup_catalog.hpp"
 
 #include <algorithm>
 #include <cstdio>

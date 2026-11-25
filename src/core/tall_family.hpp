@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+// Keep the instantiated CUDA trait types stable for existing kernel symbols.
 namespace strix::cuda::core::tall {
 
 enum class Operand { bf16, f16, fp8, fp4 };

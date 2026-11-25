@@ -1,4 +1,4 @@
-#include "cuda/core/head_emit.hpp"
+#include "core/head_emit.hpp"
 
 #include <array>
 #include <bit>

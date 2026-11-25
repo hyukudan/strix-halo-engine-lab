@@ -134,8 +134,6 @@ inline void run_gate(const char* checkpoint, const Options& options, std::span<c
               << mini_round_fold_name(levers.prepared_round_fold, mini_prepared_round_fold(options.tier)) << '\n';
     std::cerr << "Inkling verify_rows " << mini_verify_rows_name(levers.verify_rows, mini_verify_rows(options.tier))
               << '\n';
-    if (mini_moe_w4a4(options.tier))
-        std::cerr << "strix-moe-w4a4 class " << moe_core::grouped_w4a4::identity(mini_moe_w4a4_class(options.tier)) << '\n';
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
     std::optional<MiniCudaProgramDecoder> program;
     if (step_program) program.emplace(decoder, epilogue_fusion, mini_latency_forms(latency_forms));
@@ -284,9 +282,9 @@ int main(int argc, char** argv) {
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         std::vector<char*> arguments(argv, argv + argc);
         const auto program_options = cli::extract_step_program(arguments);
-        auto options = cli::parse(static_cast<int>(arguments.size()), arguments.data(), family, true);
+        auto options = cli::parse(static_cast<int>(arguments.size()), arguments.data(), family, kMiniBuildBackend);
 #else
-        auto options = cli::parse(argc, argv, family, true);
+        auto options = cli::parse(argc, argv, family, kMiniBuildBackend);
 #endif
         if (!options.generation.prefill_chunk_explicit) {  // the declared chunk of this backend and profile
             family.default_prefill_chunk = mini_prefill_schedule(cli::kMiniHipSchedule, options.tier.profile).chunk;
@@ -312,6 +310,7 @@ int main(int argc, char** argv) {
         std::optional<ResolvedWeights> loaded;
         const auto& weights = early.plan;
         const auto step_graphs = options.step_graphs.value_or(MiniResidentBackend::default_step_graphs);
+        const auto moe_w4a4 = options.moe_w4a4;
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         const char* grouped_prepare = strix::envcfg::text("STRIX_INKLING_K1BIND");
         const bool resident_k1 = grouped_prepare && std::string_view(grouped_prepare) == "1";
@@ -321,7 +320,7 @@ int main(int argc, char** argv) {
         if (step_program)
             family.load = [program_load = cli::select_mini_cuda_program(program_options.epilogue_fusion,
                                                                         program_options.latency_forms),
-                           moe_w4a4 = mini_moe_w4a4_class(options.tier),
+                           moe_w4a4,
                            controller_one_plane = mini_controller_one_plane(options.tier),
                            projected_bias = mini_attn_projected_bias(options.tier)](
                               const serve::SerialGenerationLoad& load) {
@@ -330,7 +329,7 @@ int main(int argc, char** argv) {
         else
 #endif
         family.load = [&loaded, &resolve_weights, step_graphs, dspark = options.dspark,
-                       moe_w4a4 = mini_moe_w4a4_class(options.tier),
+                       moe_w4a4,
                        combine_image = mini_combine_image(options.tier),
                        round_fold = mini_prepared_round_fold(options.tier),
                        narrow = mini_experts_nvfp4(options.tier),
@@ -349,6 +348,9 @@ int main(int argc, char** argv) {
             cli::write_profile(options.tier, std::cerr, true);
             cli::write_weight_load_plan(std::cerr, plan);
             std::cerr << strix::weight::weight_load_regime_receipt(plan) << '\n';
+            // The admitted W4A4 class, the same identity the gate prints and the server reports as moe_prefill.
+            if (mini_moe_w4a4(options.tier))
+                std::cerr << "strix-moe-w4a4 class " << strix::moe_core::grouped_w4a4::identity(moe_w4a4) << '\n';
             std::cerr << "strix-prefill-route/v1 chunk " << options.generation.prefill_chunk << " tail_divisor "
                       << family.prefill_tail_divisor << " first_id prefill\n";
             std::cerr << "strix-decode-route/v1 moe_decode " << mini_decode_form_name(options.generation.packed_decode)

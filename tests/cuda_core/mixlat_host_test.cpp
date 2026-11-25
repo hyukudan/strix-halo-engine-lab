@@ -1,4 +1,5 @@
-#include "cuda/core/dense/rows_bf16_narrow_plan.hpp"
+#include "core/dense_bf16_narrow_plan.hpp"
+#include "core/mix_latency_plan.hpp"
 #include "cuda/core/mix_cuda_latency_plan.hpp"
 #include "strix/exec/catalog.hpp"
 
@@ -20,28 +21,37 @@ void geometry() {
     float storage[3]{};
     core::residual_mix::MixArgs mix{.banks = {storage}, .queries = storage + 1, .output = {storage + 2},
                                    .rows = 1, .width = 2304, .bank_count = 1, .query_count = 1, .epsilon = 1e-6F};
-    auto grid = cuda::mix::latency_grid(mix);
+    const auto plan = [&](unsigned tile = 512U, unsigned maximum = 4096U) {
+        return core::residual_mix::latency_grid(mix, tile, maximum);
+    };
+    auto grid = plan();
     require(grid.tiles == 5 && grid.queries == 1 && grid.banks == 1, "width 2304 has a partial final tile");
     mix.width = 513;
-    grid = cuda::mix::latency_grid(mix);
+    grid = plan();
     require(grid.tiles == 2, "width 513 has a one-element tail");
+    require(plan(256U, 1024U).tiles == 3 && plan(256U, 512U).tiles == 0 && plan(0U).tiles == 0,
+            "caller tile and width limit are checked");
     mix.width = 4096;
-    require(cuda::mix::latency_grid(mix).tiles == 8, "maximum width fits");
+    require(plan().tiles == 8, "maximum width fits");
     ++mix.width;
-    require(cuda::mix::latency_grid(mix).tiles == 0, "oversized width declined");
+    require(plan().tiles == 0, "oversized width declined");
     mix.width = 2304;
     mix.rows = 2;
-    require(cuda::mix::latency_grid(mix).tiles == 0, "multi-row declined");
+    require(plan().tiles == 0, "multi-row declined");
     mix.rows = 0;
-    require(cuda::mix::latency_grid(mix).tiles == 0, "empty readout declined");
+    require(plan().tiles == 0, "empty readout declined");
 
-    using cuda_core::bf16_narrow_blocks;
-    static_assert(bf16_narrow_blocks(4608, 64) == 8);
-    static_assert(bf16_narrow_blocks(32, 16) == 2);
-    static_assert(bf16_narrow_blocks(32, 8) == 0);
-    static_assert(bf16_narrow_blocks(31, 16) == 0);
-    static_assert(bf16_narrow_blocks(0, 16) == 0);
-    static_assert(bf16_narrow_blocks(32, 0) == 0);
+    using core::bf16_narrow_blocks;
+    static_assert(bf16_narrow_blocks(4608, 64, 32, 16) == 8);
+    static_assert(bf16_narrow_blocks(32, 16, 32, 16) == 2);
+    static_assert(bf16_narrow_blocks(32, 8, 32, 16) == 0);
+    static_assert(bf16_narrow_blocks(31, 16, 32, 16) == 0);
+    static_assert(bf16_narrow_blocks(0, 16, 32, 16) == 0);
+    static_assert(bf16_narrow_blocks(32, 0, 32, 16) == 0);
+    static_assert(bf16_narrow_blocks(16, 32, 16, 32) == 2);
+    static_assert(bf16_narrow_blocks(32, 16, 0, 16) == 0);
+    static_assert(bf16_narrow_blocks(32, 16, 32, 0) == 0);
+    static_assert(bf16_narrow_blocks(32, 15, 32, 15) == 0);
 }
 
 // The batch contract: jobs numbered set by set, each job = one single-query readout, disjoint outputs required.
