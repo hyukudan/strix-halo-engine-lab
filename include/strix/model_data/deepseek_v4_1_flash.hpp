@@ -91,7 +91,7 @@ inline constexpr std::string_view STRIX_DS41_EXPERT_TP_LAYOUT = "forms.tensor.ex
 } // namespace multi_device
 inline constexpr std::string_view name = "deepseek-v4.1-flash";
 namespace presets {
-inline constexpr std::string_view default_ = "fast";
+inline constexpr std::string_view default_ = "exact";
 namespace exact {
 inline constexpr std::string_view levers = "exact";
 } // namespace exact
@@ -100,7 +100,7 @@ inline constexpr std::string_view levers = "fast";
 } // namespace fast
 inline constexpr std::string_view native_kv = "fp8 ring + fp4 compressed (model-defined)";
 namespace turbo {
-inline constexpr std::string_view levers = "fast";
+inline constexpr std::string_view levers = "turbo";
 } // namespace turbo
 } // namespace presets
 inline constexpr std::string_view schema = "strix-model/v1";

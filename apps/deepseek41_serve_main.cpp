@@ -12,7 +12,7 @@
 // of running it alone.
 //
 //   strix-deepseek41-serve MODEL.gguf --rank R --transport usb4auto|usb4gpu|tcp-listen:P|tcp-connect:H:P|emulate
-//       [--group-manifest FILE] [--layers 40] [--context 4096] [--slots 4] [--prompt-rows 8] [--tp-attention]
+//       [--group-manifest FILE] [--layers 40] [--context 4096] [--slots 8] [--prompt-rows 8] [--tp-attention]
 //       [--pool-positions N] (a shared KV pool of N positions over all slots: a request holds prompt + max_tokens of it)
 //       [--engram-direct] [--http-bind 127.0.0.1] [--http-port 0] [--http-api-key-file F] [--http-max-queue 64]
 //       [--http-max-connections 64] [--http-responses on|off] [--http-capabilities on|off]

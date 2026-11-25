@@ -190,7 +190,8 @@ const char* app_name(App app) {
 
 const strix::profile::Engine& profile_engine() {
     static const strix::profile::Engine engine{"deepseek41-pair", "STRIX_DS41_PROFILE_ALLOW_PENDING", profile_table, false,
-                                              "ds41-turbo-v1", {}, {}, ladder_rows};
+                                              "ds41-turbo-v1", {}, {}, ladder_rows,
+                                              /*preset_keeps_provisional_incumbents=*/true};
     return engine;
 }
 
@@ -265,6 +266,8 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
     }
     // Product profile first: its switches are environment for everything below (an explicit one wins).
     strix::profile::Inputs profile_inputs;
+    // The startup profile governs device prefill. The actual prompt and effective execution are not known yet.
+    profile_inputs.regime = strix::profile::startup_prefill_regime();
     // Resolve the bundle before admission, reporting and rank agreement. An explicit
     // component OFF wins. Canonical strings are also exported for execution/cache readers.
     // Shared bundle rules (strix/fast_profile.hpp); the dense row threshold is DS41's own auxiliary row.

@@ -43,11 +43,13 @@ inline constexpr std::array<strix::profile::Lever, 13> profile_table{{
     // Prefill only: FAST policy ds41-decoder-replay-bounded-v1 (value R rows, a multiple of 128): every decoder layer runs
     // its last R rows, window keys floored at the cut, its dense products in the exact form (bounded run == full run
     // with the floor, bit for bit; not bit-equal to the full decode). Explicit only, OFF in default / fast / quality;
-    // set, it enters the profile fingerprint (rank agreement, prefix-cache identity). The turbo cell (R=128 under
-    // ds41-replay-r128) stays pending: v1 refuses bounds below 256.
-    {"decoder_replay", "STRIX_DS41_DECODER_REPLAY", "", {"", "", "", "128"}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true, false}, {true, true, true, false}, "", "0",
-     "explicit FAST policy ds41-decoder-replay-bounded-v1, R >= 256 (smaller bounds refused); not qualified on its key floor round_down(T - R, 256) (the R = 256 gate ran on the floor T - R), so no profile sets it; turbo R=128 (ds41-replay-r128) pending", false, {}, true, {}, {{{"0", "v1"}, {"128", "v1"}}}},
+    // set, it enters the profile fingerprint (rank agreement, prefix-cache identity). TURBO R=256 is pending a
+    // matched timing and quality receipt on the executing key floor.
+    {"decoder_replay", "STRIX_DS41_DECODER_REPLAY", "", {"", "", "", "256"}, "0", strix::profile::Kind::bit_changing,
+     {true, false, true, false}, {true, true, true, true}, "ds41-replay-r256-v1", "0",
+     "pending: TURBO timing over effective FAST and quality for R=256 with key floor round_down(T - R, 256); "
+     "the historical R=256 gate ran on floor T - R", false, {}, true, {},
+     {{{"0", "v1"}, {"256", "ds41-replay-r256-v1"}}}},
     // Prefill only: the Engram KV projection on the shared FP16 WMMA core (ds41-engram-f16wmma-v1); views whose x would overflow FP16
     // keep the exact kernel. Not a bundle member (the env bundle ds41-fast-pf-v1 keeps its identity); 'fast' selects it.
     {"engram_f16wmma", "STRIX_DS41_FAST_ENGRAM", "", {"", "1", "", ""}, "0", strix::profile::Kind::bit_changing,
