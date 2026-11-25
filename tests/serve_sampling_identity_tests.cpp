@@ -206,8 +206,12 @@ int main() try {
         {"explicit zero", R"(,"temperature":1,"seed":0)", {"--temperature", "1", "--seed", "0"}},
         {"null seed", R"(,"temperature":1,"seed":null)", {"--temperature", "1"}},
         {"explicit 37", R"(,"temperature":1,"seed":37)", {"--temperature", "1", "--seed", "37"}},
-        {"filter only", R"(,"top_k":2)", {"--top-k", "2"}},
-        {"filter only, seed 5", R"(,"top_p":0.5,"seed":5)", {"--top-p", "0.5", "--seed", "5"}},
+        // An HTTP request without temperature is greedy, filters or not (the existing HTTP contract); the command line
+        // samples a filter alone at temperature 1. The same levers are therefore the explicit temperature on each side.
+        {"filter only", R"(,"top_k":2)", {"--temperature", "0", "--top-k", "2"}},
+        {"filter only, seed 5", R"(,"top_p":0.5,"seed":5)", {"--temperature", "0", "--top-p", "0.5", "--seed", "5"}},
+        {"filter, temperature 1", R"(,"temperature":1,"top_k":2)", {"--top-k", "2"}},
+        {"filter, temperature 1, seed 5", R"(,"temperature":1,"top_p":0.5,"seed":5)", {"--top-p", "0.5", "--seed", "5"}},
         {"rounds to no filter", R"(,"top_p":0.999999999)", {"--top-p", "0.999999999"}},
         {"greedy", R"(,"temperature":0)", {"--temperature", "0"}},
         {"greedy with filters", R"(,"temperature":0,"top_k":2)", {"--temperature", "0", "--top-k", "2"}},
@@ -218,6 +222,8 @@ int main() try {
     require(expected["rounds to no filter"] == std::vector<std::uint32_t>(64, 2U), "CLI top_p 0.999999999 must stay greedy");
     require(expected["greedy"] == expected["rounds to no filter"], "CLI greedy differs");
     require(expected["greedy"] == expected["greedy with filters"], "CLI filters changed greedy tokens");
+    require(expected["filter only"] == expected["greedy"] && expected["filter, temperature 1"] != expected["greedy"],
+            "HTTP filter-only must be greedy and the sampled filter must differ from greedy");
     // Per case, alone: the request equals the command line of the same levers exactly.
     for (const auto& c : cases) {
         const auto before = engine.served.size();
@@ -249,7 +255,7 @@ int main() try {
     require(got == want, "interleaved requests differ from the command-line streams");
     const auto matched = engine.served.size() - cases.size();
     std::cout << "PASS API/CLI parity through the real CLI parser and sampler: " << cases.size()
-              << " lever sets (seed 0/37, filter-only, top_p rounding to no filter, greedy); " << matched
+              << " lever sets (seed 0/37, filter-only greedy, sampled filters, top_p rounding to no filter, greedy); " << matched
               << " interleaved requests; counter identity refused at startup\n";
     return 0;
 } catch (const std::exception& e) {

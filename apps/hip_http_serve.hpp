@@ -517,7 +517,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                 std::string error;
                 // Coupled acceptance, the command line's default too: a drafted row draws the same keyed target uniform as
                 // a plain row, so a seed gives the same tokens whatever the cohort's draft schedule (exact in distribution).
-                if (samples) request.sampler = serve::make_job_sampler(job.sampling, error, options.mtp.sampler_options);
+                if (samples) request.sampler = make_http_mtp_sampler(job.sampling, error, options);
                 else error = "temperature must be 0 when Qwen HTTP sampling is disabled";
                 if (!request.sampler) {
                     serve::GenerationStats stats;

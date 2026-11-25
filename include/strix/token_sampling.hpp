@@ -46,7 +46,7 @@ void validate_token_sampling_policy(const TokenSamplingPolicy&);
 // False for every accepted STRIX_SAMPLING_REQUEST_IDENTITY value; throws for counter or any other value.
 [[nodiscard]] bool token_sampling_request_identity_counts();
 // Temperature of a policy whose temperature was not given: 1 when a filter (top_k > 0, top_p < 1 or min_p > 0) was
-// given, otherwise 0 (greedy). The command line and the HTTP API both resolve an omitted temperature through this.
+// given, otherwise 0 (greedy): the shared serial command line's rule. An HTTP request without temperature stays greedy.
 // The filters are the float values the sampler sees: resolve after narrowing, so top_p = 0.999999999 (1.0F) is no filter.
 [[nodiscard]] constexpr float omitted_token_sampling_temperature(std::uint32_t top_k, float top_p,
                                                                  float min_p) noexcept {

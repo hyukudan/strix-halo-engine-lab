@@ -28,6 +28,11 @@ static bool available(std::mutex& mutex) {
 }
 struct Receipt { std::string json() const { return "{\"witness\":7}"; } };
 struct Options { std::uint64_t context_tokens=64; Receipt product_profile; };
+// The production binding calls make_http_mtp_sampler (apps/hip_decode_options.hpp) with the server options; here the
+// startup acceptance is the HTTP default, coupled.
+inline std::shared_ptr<TokenSampler> make_http_mtp_sampler(const serve::SamplingParameters& s, std::string& error, const Options&) {
+    return serve::make_job_sampler(s, error, TokenSamplerOptions{SampledAcceptance::coupled});
+}
 struct MtpConstraintRow {};
 struct HttpConstraintRequests {
     std::shared_ptr<MtpConstraintRow> make(const std::shared_ptr<const serve::ConstraintSpec>& s) {

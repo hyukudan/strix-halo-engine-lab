@@ -92,16 +92,18 @@ The request identity is 1 for every request. A client that wants distinct stream
 
 `STRIX_SAMPLING_REQUEST_IDENTITY=counter` is retired and refused at startup: it numbered server requests in
 admission order, so the same request with the same seed drew different tokens depending on what arrived before it.
-An omitted seed is 0 on both entry points. An omitted temperature is 1 when a filter (`top_k`, `top_p`, `min_p`)
-is active, otherwise 0. The filters are
-tested after narrowing to float, so `top_p = 0.999999999` is no filter on either. Qwen has no server-only sampling
-defaults (the `--http-default-*` flags are retired and refused). A server that cannot sample (policy `reject`, which is
-also what Qwen's single-request route reports) answers a request that would sample, including a filter without a
-temperature, with HTTP 400 "sampling is refused on this server". Explicit temperature 0 selects greedy even with
-filters. Qwen HTTP selects its sampling policy from the arguments before measuring slots. The automatic route
-(no `--http-batch`) uses `reject` at every slot count, so memory pressure that leaves one slot starts the single
-runner as before. Sampling needs a fixed cohort (`--http-batch N` or `--deploy`); if measured capacity cannot hold
-it, startup fails with a capability error. `--http-batch 1` selects the one-slot cohort runner.
+An omitted seed is 0 on both entry points. An omitted temperature keeps each entry point's existing contract: an
+HTTP request without `temperature` is greedy whatever filters it carries; the shared serial command line samples a
+filter alone (`--top-k`, `--top-p`, `--min-p`) at temperature 1; the Qwen MTP command line decodes filters without
+`--mtp-sample-temperature` greedy, as HTTP. Send the temperature explicitly to get the same tokens from every entry point.
+Filters are tested after narrowing to float, so `top_p = 0.999999999` is no filter. Qwen has no server-only sampling
+defaults (the `--http-default-*` flags are retired and refused). A server with policy `reject` answers a positive
+temperature with HTTP 400 "sampling is refused on this server"; policy `greedy` runs it greedy and says so
+(`downgrade` in `/v1/capabilities`). Explicit temperature 0 selects greedy even with filters. With `--http-sampling`
+omitted, Qwen HTTP resolves the policy from the admitted route: `sample` on the cohort runner (two or more admitted
+slots on the automatic route, `--http-batch N` or `--deploy`), `greedy` on the single runner, the policies an omitted
+flag always had. An explicit `--http-sampling sample` is a startup requirement: if measured capacity selects the
+single runner, startup fails with a capability error. `--http-batch 1` selects the one-slot cohort runner.
 
 Coupled acceptance matches the plain sampled request when the target distributions match at every committed
 position. The host gate checks this rule on drafted rows. Full CLI and HTTP token equality applies to routes

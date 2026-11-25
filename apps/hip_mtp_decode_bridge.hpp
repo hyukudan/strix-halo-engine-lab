@@ -2590,8 +2590,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     if(serial_split)target->set_prompt_execution(*parents->prompt.compiled);
     // Sampled decoding: the final prompt row and every generated row select by the sampler;
     // earlier prompt rows keep first-max selection (their predictions are never emitted).
-    const auto sampler=mtp_sampling(m) && !dump && !qualify ? std::make_shared<TokenSampler>(mtp_sampling_policy(m),
-                                                                  m.sampler_options)
+    const auto sampler=mtp_sampling(m) && !dump && !qualify ? make_mtp_sampler(mtp_sampling_policy(m), m)
                                                            : std::shared_ptr<TokenSampler>{};
     const bool separated_prompt=mtp_prompt_phase_separation(options);
     if(separated_prompt && (qualify || component_diagnostic || !parents->retire_prompt || !parents->prepare_prompt_pool))

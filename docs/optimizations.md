@@ -1422,8 +1422,8 @@ Serving features that change no generated token: a stateless `POST /v1/responses
 prompt path, a versioned `GET /v1/capabilities` document, the applied policy (requested vs effective sampling and
 output limit, each sampling filter with its source, the effective seed of a sampled request) at the start and end of
 every stream, and SSE keepalive comments while a stream waits. Sampling filters resolve request -> built-in (no server-only
-defaults: the `--http-default-temperature/-top-k/-top-p/-min-p` flags are retired), and an omitted temperature is 1 when
-a filter is given, otherwise greedy, as on the command line. An unseeded sampled request takes the command line's seed
+defaults: the `--http-default-temperature/-top-k/-top-p/-min-p` flags are retired), and an omitted temperature is
+greedy whatever filters the request carries, as before. An unseeded sampled request takes the command line's seed
 (0), echoed in the receipt (stream receipts on), so the same request reproduces it.
 
 - **Preconditions:** `--http-serve` (Qwen) or the DeepSeek serve app.
