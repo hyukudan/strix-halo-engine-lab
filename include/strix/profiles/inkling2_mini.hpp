@@ -3,6 +3,7 @@
 #include "strix/engine_profile.hpp"
 #include "strix/spec/block_draft_policy.hpp"
 #include "strix/weight/levers.hpp"
+#include "strix/weight/lowbit_rows_select_profile.hpp"
 #include "strix/weight/registry.hpp"
 
 #include <array>
@@ -172,7 +173,7 @@ inline constexpr std::string_view kMiniVerifyRows = "inkling2-mini-verify-rows@1
 // mini_vision_media_tier); a text-only run never applies it (mini_defer_vision_recipe), and at its builtin the row
 // stays out of the fingerprint and the receipt, so a text-only run resolves as before the row.
 inline constexpr std::string_view kMiniVisionRecipe = "inkling2-vision-recipe";
-inline constexpr std::array<profile::Lever, 12> kMiniLevers{{
+inline constexpr std::array<profile::Lever, 13> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
@@ -231,11 +232,15 @@ inline constexpr std::array<profile::Lever, 12> kMiniLevers{{
      "and CUDA",
      false, {}, true, {}, {{{"legacy", "v1"}, {"axial@1", "v1"}}}},
     spec::kBlockDraftLever,
+    weight::kLowBitRowsSelectLever,
 }};
+
+// Gate v2 and timing receipts extend this table without changing the candidate's FAST or TURBO columns.
+inline constexpr std::array<profile::LadderRow, 0> kMiniLadder{};
 
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.
 inline constexpr profile::Engine kMiniProfile{
-    "inkling2-mini", "", kMiniLevers, false, "inkling2-mini-turbo-v1",
+    "inkling2-mini", "", kMiniLevers, false, "inkling2-mini-turbo-v1", {}, {}, kMiniLadder,
 };
 
 // The image recipe applies only to a request with image input. The text resolution (resolve_mini_profile, shared by

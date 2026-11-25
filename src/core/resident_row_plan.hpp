@@ -5,6 +5,7 @@
 #include "core/f16_tile_gemm.hpp"
 #include "core/gemv_rows.hpp"
 #include "strix/device/lowbit_rows.hpp"
+#include "strix/weight/lowbit_rows_select_profile.hpp"
 #include "strix/weight/host_lowbit.hpp"
 #include "strix/weight/resident_slices.hpp"
 
@@ -58,6 +59,18 @@ inline bool valid_resident_q8_rows(const weight::ResidentMatrixView& matrix, uns
 // the device (kLowBitSweepCells below), which run the FP32 sweep. The sweep and the FP16 form round differently, so a
 // row's bits then depend on the launch's row count: never EXACT.
 enum class LowBitArithmetic { fp32_sweep, f16_group_scale, f16_rows_select };
+
+// Both product entry points and qualification arms bind the same resolved value to the launch policy.
+inline LowBitArithmetic resident_lowbit_arithmetic(const profile::Resolution& tier) {
+    const auto& lever = weight::kLowBitRowsSelectLever;
+    const auto* entry = tier.find(lever.name);
+    if (!entry || entry->value == lever.builtin || entry->value == "off") return LowBitArithmetic::f16_group_scale;
+    if (entry->value != lever.target)
+        throw std::invalid_argument(std::string(lever.env) + " requires " + std::string(lever.target) + " or off");
+    if (tier.profile != profile::Name::fast && tier.profile != profile::Name::turbo)
+        throw std::invalid_argument(std::string(lever.env) + " requires FAST or TURBO");
+    return LowBitArithmetic::f16_rows_select;
+}
 
 constexpr bool lowbit_f16_form(LowBitArithmetic arithmetic) { return arithmetic != LowBitArithmetic::fp32_sweep; }
 constexpr unsigned lowbit_max_rows(LowBitArithmetic arithmetic) {
