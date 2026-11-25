@@ -480,6 +480,23 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                 "a decode form flag reached the server outside the shared lever row");
         strings.pop_back();
     }
+    // The block-candidate switch through the production start-up parser (profile fast here): an explicit OFF starts,
+    // every other value is refused before native load with the same reason as the CLI.
+    for (const auto& [value, reason] : std::initializer_list<std::pair<const char*, const char*>>{
+             {"off", ""},
+             {"dflash2:8:greedy", "native forward and verify identity are not bound"},
+             {"dflash2:8:sampled", "sampled rejection hook unqualified and unbound"},
+             {"dflash2:7:greedy", "requires block 8"}}) {
+        std::ostringstream out, error;
+        strings.emplace_back("--block-drafter");
+        strings.emplace_back(value);
+        strings.emplace_back("--family-inspect");
+        const auto rc = run({}, out, error);
+        strings.resize(strings.size() - 3U);
+        if (*reason == '\0') require(rc == 0 && !created, "explicit --block-drafter off did not start");
+        else require(rc == 2 && !created && error.str().find(reason) != std::string::npos,
+                     "--block-drafter value was not refused with its reason before native load");
+    }
     sv::ServeShell shell;
     shell.serve = [qualify_q8, sample_capable, tier_name](const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
         std::exception_ptr failure;

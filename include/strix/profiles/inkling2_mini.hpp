@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/engine_profile.hpp"
+#include "strix/spec/block_draft_policy.hpp"
 #include "strix/weight/levers.hpp"
 #include "strix/weight/registry.hpp"
 
@@ -54,7 +55,7 @@ inline constexpr std::string_view kMiniPreparedRoundFold = "inkling2-mini-prepar
 // grouped cohort decode) until the migration is qualified against it. Select it with STRIX_INK_SERVED_CLI_ROUTE=1 (any
 // profile); a CUDA server declines it. The command line always runs this route and does not read the switch.
 inline constexpr std::string_view kMiniServedCliRoute = "inkling2-mini-served-cli-route@1";
-inline constexpr std::array<profile::Lever, 4> kMiniLevers{{
+inline constexpr std::array<profile::Lever, 5> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
@@ -78,6 +79,7 @@ inline constexpr std::array<profile::Lever, 4> kMiniLevers{{
      .source = "waits for the served migration identity (served lanes against the incumbent served route); device "
                "evidence so far: served lanes == the command line's lone decode at cohort widths 2..17",
      .omit_builtin_fingerprint = true},
+    spec::kBlockDraftLever,
 }};
 
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.
