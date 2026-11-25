@@ -90,17 +90,17 @@ bool check_resident_operand_class(unsigned rows, bool disable_one_plane) {
     }
     const bool control_differs = !same_floats(forced.data, reference.data, forced.size);
     const auto oversized = run(huge_bits, false);
-    const auto gain = run(good_value, true);
+    const auto poisoned_gain = run(good_value, true);
     const bool ok = finite.certified && finite.planes == 1 && finite.equals_three_planes && !infinite.certified &&
                     infinite.planes == 3 && infinite.equals_three_planes && control_differs && !oversized.certified &&
-                    oversized.planes == 3 && oversized.equals_three_planes && !gain.certified && gain.planes == 3 &&
-                    gain.equals_three_planes;
+                    oversized.planes == 3 && oversized.equals_three_planes && !poisoned_gain.certified && poisoned_gain.planes == 3 &&
+                    poisoned_gain.equals_three_planes;
     // One flushed line per case: the expected values are in the notes of this fixture.
     std::cout << "CUDA Mini operand class, rows " << rows << ": finite planes " << finite.planes << " equal "
               << finite.equals_three_planes << "; inf planes " << infinite.planes << " equal "
               << infinite.equals_three_planes << " forced-one-plane differs " << control_differs << "; oversized planes "
-              << oversized.planes << " equal " << oversized.equals_three_planes << "; inf gain planes " << gain.planes
-              << " equal " << gain.equals_three_planes << std::endl;
+              << oversized.planes << " equal " << oversized.equals_three_planes << "; inf gain planes " << poisoned_gain.planes
+              << " equal " << poisoned_gain.equals_three_planes << std::endl;
     return ok;
 }
 
