@@ -2,6 +2,7 @@
 // Compiled for sm_120a only (cvt.e2m1x2 / cvt.e4m3x2 PTX); see cmake/CudaCore.cmake.
 #include "strix/cuda_core/nvfp4.hpp"
 #include "rows_fp4.cuh"
+#include "../../../core/rows_plan.hpp"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/weight/formats/scalar_float.hpp"
 #include "strix/weight/registry.hpp"
@@ -850,6 +851,27 @@ namespace {
 
 namespace rows = core::rows;
 
+bool aligned(const void* p, std::uintptr_t bytes) {
+    return reinterpret_cast<std::uintptr_t>(p) % bytes == 0;
+}
+
+bool valid_rows_launch(const rows::Launch& launch) {
+    for (unsigned q = 0; q < launch.tiles.count; ++q) {
+        const auto& job = launch.jobs[q];
+        const bool bf16 = job.w.has_format(weight::kBf16WeightStorage);
+        const bool q8 = job.w.has_format(weight::kQ8WeightStorage);
+        if (launch.form == rows::Form::row_tile && !bf16 && !q8) return false;
+        const auto alignment = launch.form == rows::Form::nvfp4_split_k ? Nvfp4Decoder::kAlign :
+                               q8 && job.in % 256 != 0 ? 2U : Mxfp8Decoder::kAlign;
+        if (!aligned(job.w.data, alignment) || !aligned(job.x.data, 16) || !aligned(job.y.data, alignof(float)))
+            return false;
+        if (job.epilogue != 0 &&
+            !(job.epilogue == kRowsAddResidual && job.aux[0].data && aligned(job.aux[0].data, alignof(float))) &&
+            !(job.epilogue == kRowsRoundBf16 && bf16)) return false;
+    }
+    return true;
+}
+
 std::size_t split_workspace(const rows::Launch& launch, std::uint32_t count) {
     std::size_t bytes = 0;
     for (unsigned q = 0; q < launch.tiles.count; ++q) {
@@ -924,29 +946,13 @@ std::size_t rows_split_k_workspace(const core::rows::Plan& plan) {
 
 cudaError_t cuda_rows_grouped(const core::rows::Plan& plan, float* workspace, std::size_t workspace_bytes,
                               cudaStream_t stream) {
-    const auto aligned = [](const void* p, std::uintptr_t bytes) {
-        return reinterpret_cast<std::uintptr_t>(p) % bytes == 0;
-    };
     const auto needed = rows_split_k_workspace(plan);
     if (plan.launches().empty() || plan.prologue() != 0 || needed > workspace_bytes ||
         (needed != 0 && (!workspace || !aligned(workspace, alignof(float))))) return cudaErrorInvalidValue;
 
     // Admit all jobs before submitting any work, including the step-1 forms.
-    for (const auto& launch : plan.launches()) {
-        for (unsigned q = 0; q < launch.tiles.count; ++q) {
-            const auto& job = launch.jobs[q];
-            const bool bf16 = job.w.has_format(weight::kBf16WeightStorage);
-            const bool q8 = job.w.has_format(weight::kQ8WeightStorage);
-            if (launch.form == rows::Form::row_tile && !bf16 && !q8) return cudaErrorInvalidValue;
-            const auto alignment = launch.form == rows::Form::nvfp4_split_k ? Nvfp4Decoder::kAlign :
-                                   q8 && job.in % 256 != 0 ? 2U : Mxfp8Decoder::kAlign;
-            if (!aligned(job.w.data, alignment) || !aligned(job.x.data, 16) || !aligned(job.y.data, alignof(float)))
-                return cudaErrorInvalidValue;
-            if (job.epilogue != 0 &&
-                !(job.epilogue == kRowsAddResidual && job.aux[0].data && aligned(job.aux[0].data, alignof(float))) &&
-                !(job.epilogue == kRowsRoundBf16 && bf16)) return cudaErrorInvalidValue;
-        }
-    }
+    for (const auto& launch : plan.launches())
+        if (!valid_rows_launch(launch)) return cudaErrorInvalidValue;
 
     for (std::size_t i = 0; i < plan.launches().size(); ++i) {
         const auto& launch = plan.launches()[i];
@@ -965,6 +971,35 @@ cudaError_t cuda_rows_grouped(const core::rows::Plan& plan, float* workspace, st
         if (status != cudaSuccess) return status;
     }
     return cudaSuccess;
+}
+
+namespace {
+
+const rows::Launch* mxfp8_launch(const rows::RowsPlan& plan, std::size_t index) {
+    if (index >= plan.launches().size()) return nullptr;
+    const auto& launch = plan.launches()[index].launch;
+    if (launch.form != rows::Form::mxfp8_split_k) return nullptr;
+    constexpr unsigned max_grid_y = 65535;
+    for (unsigned q = 0; q < launch.tiles.count; ++q)
+        if (launch.splits[q] > max_grid_y) return nullptr;
+    return &launch;
+}
+
+}  // namespace
+
+std::size_t mxfp8_rows_workspace(const rows::RowsPlan& plan, std::size_t index) {
+    const auto* launch = mxfp8_launch(plan, index);
+    return launch ? split_workspace(*launch, plan.rows()) : 0;
+}
+
+cudaError_t cuda_mxfp8_rows(const rows::RowsPlan& plan, std::size_t index, float* workspace,
+                            std::size_t workspace_bytes, cudaStream_t stream) {
+    const auto* launch = mxfp8_launch(plan, index);
+    if (!launch || !valid_rows_launch(*launch)) return cudaErrorInvalidValue;
+    const auto needed = split_workspace(*launch, plan.rows());
+    if (needed > workspace_bytes || (needed != 0 && (!workspace || !aligned(workspace, alignof(float)))))
+        return cudaErrorInvalidValue;
+    return run_split_rows<false>(*launch, workspace, plan.rows(), stream);
 }
 
 // ------------------------------------------------------------------------------------------------- host reference

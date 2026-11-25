@@ -58,6 +58,20 @@ levers = "exact"
 [presets.fast]
 levers = "fast"
 
-# TURBO: the FAST levers plus the measured TURBO weight mix the engine resolves (its decision row states the quality).
+# Use the admitted FAST levers until this model has a qualified TURBO set.
 [presets.turbo]
-levers = "turbo"
+levers = "fast"
+
+# Multi-device placement, resolved by the shared profile resolver (strix-serve --model inkling2-mini --device-count N, strix-router
+# --description). Two whole-model nodes serve independent requests as replicas behind strix-router: each request
+# runs on one node with the single-node identity. One device resolves single, exactly as before. Staged prefill
+# and tensor forms are not bound for this model: a regime that uses one arrives with the declared form and its
+# qualification. Only strix-router executes the replica form; each worker is a one-device launch.
+[multi_device]
+version = 1
+default = "single"
+fallback = "single"
+
+[multi_device.forms.replica]
+ranks = 2
+objective = "throughput"

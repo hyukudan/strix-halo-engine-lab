@@ -4,6 +4,9 @@
 #include "inkling2_mini_weight_options.hpp"
 #include "strix/model_content_hash.hpp"
 
+#include <algorithm>
+#include <iostream>
+
 #if defined(__HIPCC__)
 #include "strix/device/hip_enumerator.hpp"
 #include "strix/device/hip_gate.hpp"
@@ -15,9 +18,12 @@
 namespace strix::inkling2 {
 
 // The scope a load-time weight decision row is matched against: the current device's architecture, the toolkit
-// this binary was built with, the resident regime, the resident Q8_0 consumers' implementation identity and the raw
-// checkpoint SHA-256 (shared persistent stat-keyed cache: only the first FAST run of a checkpoint reads it whole).
-// Hash only for explicit qualification or when a default decision row can match (its calibrated pack is present).
+// this binary was built with, the resident Q8_0 consumers' implementation identity and the raw checkpoint SHA-256
+// (shared persistent stat-keyed cache: only the first FAST run of a checkpoint reads it whole). The resolver sets
+// the regime of each lookup (kMiniWeightLoadRegimes). Hash only for explicit qualification or when a committed FULL
+// row of this backend, device, toolkit and consumer identity could select for `extent` (its context band holds the
+// instance's context and its gain's lane band its lanes): a gate-only row, or a gain outside its band, never selects,
+// so it never costs a whole-checkpoint read (which also evicts the page cache of running servers on a node).
 // Owns the strings; view() builds the scope on use, so copies and moves never leave a view dangling.
 struct MiniWeightScope {
     weight::Backend backend{};
@@ -36,14 +42,11 @@ inline constexpr auto kMiniWeightBackend = weight::Backend::cuda;
 #endif
 
 inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name tier,
-                                         const MiniWeightOptions& options) {
+                                         const MiniWeightOptions& options, weight::WeightLoadExtent extent) {
+    const bool qualify = options.qualify_q8 || options.qualify != nullptr;
     const bool compact_tier = tier == profile::Name::fast || tier == profile::Name::turbo;
-    const bool needed = compact_tier && !options.disable_q8 &&
-        (options.qualify != nullptr ||
-         (mini_has_decision_rows(options, tier) && mini_lowbit_pack_present(model)));
-    // The admitted consumers' arithmetic: the Q8_0 routes, or the low-bit routes of a low-bit mix (HIP only).
-    const auto& policy = mini_weight_load_policy(options, tier);
-    const bool lowbit = policy.target != weight::kQ8WeightStorage;
+    const bool needed = compact_tier && !options.disable_q8 && (qualify ||
+        std::ranges::any_of(kMiniWeightLoadDecisions, [](const auto& row) { return row.scope.backend == kMiniWeightBackend; }));
     MiniWeightScope out;
     out.backend = kMiniWeightBackend;
     if (!needed) return out;
@@ -51,23 +54,28 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
 #if defined(__HIPCC__)
     if (hipGetDevice(&ordinal) != hipSuccess) return out;
     const auto visible = device::HipEnumerator{}.enumerate();
-    // The compiler that built the admitted kernels (clang of the HIP toolkit), not the HIP_VERSION_* macros nor the
-    // loaded runtime: the CLI and the server of one build differ in both (hip_version.h found first on the include path,
-    // libamdhip64 resolved at run time), while their kernels come from the same compiler.
-    out.compiler_id = "hip-clang-" + std::to_string(__clang_major__) + "." + std::to_string(__clang_minor__);
-    const auto identity = weight::implementation_identity(lowbit ? std::span<const weight::ArithmeticId>(core::kResidentLowBitArithmeticHip)
-                                                                 : std::span<const weight::ArithmeticId>(core::kResidentQ8ArithmeticHip));
+    out.compiler_id = weight::hip_clang_compiler_id(__clang_version__);  // one id for CLI and server
+    const bool lowbit = options.qualify && (mini_lowbit_storage(options.qualify->target) ||
+                                             mini_lowbit_storage(options.qualify->head_target()));
+    const auto identity = weight::implementation_identity(lowbit
+        ? std::span<const weight::ArithmeticId>(core::kResidentLowBitArithmeticHip)
+        : std::span<const weight::ArithmeticId>(core::kResidentQ8ArithmeticHip));
+    if (lowbit) out.regime = kMiniWeightRegime;
 #else
     if (cudaGetDevice(&ordinal) != cudaSuccess) return out;
     const auto visible = device::CudaEnumerator{}.enumerate();
     out.compiler_id = "cuda-" + std::to_string(CUDART_VERSION / 1000) + "." + std::to_string(CUDART_VERSION % 1000 / 10);
-    static_cast<void>(lowbit);  // no CUDA low-bit consumer: the resolver refuses a low-bit arm there
     const auto identity = weight::implementation_identity(core::kResidentQ8ArithmeticCuda);
 #endif
     for (const auto& device : visible)
         if (device.ordinal == ordinal) out.device_class = device.arch;
-    out.regime = kMiniWeightRegime;
     out.build = identity;
+    const auto row_matches = [&out, extent](const weight::WeightLoadDecision& row) {
+        return row.scope.backend == out.backend && row.scope.device_class == out.device_class &&
+               row.scope.compiler_id == out.compiler_id && row.scope.build == out.build &&
+               weight::weight_load_gain_selects(row, extent);
+    };
+    if (!qualify && std::ranges::none_of(kMiniWeightLoadDecisions, row_matches)) return out;
     out.checkpoint = weight::Digest256{sha256_file_content(model).bytes};
     return out;
 }
@@ -78,13 +86,36 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
 // Without a declaration the lone integrated device binds implicitly and runs one route.
 inline void bind_mini_lowbit_device(const weight::WeightLoadPlan& plan) {
 #if defined(__HIPCC__)
-    const auto lowbit = [](const weight::FormatId& storage) {
-        return storage == weight::kQ4G64WeightStorage || storage == weight::kQ6G64WeightStorage;
-    };
-    if (lowbit(plan.storage) || lowbit(plan.head_storage)) static_cast<void>(device::bind_hip());
+    if (mini_lowbit_storage(plan.storage) || mini_lowbit_storage(plan.head_storage))
+        static_cast<void>(device::bind_hip());
 #else
     static_cast<void>(plan);
 #endif
+}
+
+// Only an explicitly supplied sidecar may trigger a second load. The failed decoder has
+// unwound before the incumbent is built, so a partially uploaded image is never published.
+template <class Load>
+auto load_mini_weights(weight::WeightLoadPlan& plan, profile::Name tier, const MiniWeightOptions& options,
+                       const weight::WeightLoadScope& scope, weight::WeightLoadExtent extent, Load load) {
+    const bool lowbit = mini_lowbit_storage(plan.storage) || mini_lowbit_storage(plan.head_storage);
+    if (lowbit) bind_mini_lowbit_device(plan);
+    const char* path = lowbit ? envcfg::text("STRIX_LOWBIT_PACK") : nullptr;
+    if ((!path || !*path) && !options.qualify_decode_only) return load(MiniLowBitRows{});
+    try {
+        if (!path || !*path) throw std::runtime_error("--qualify-decode-weights requires STRIX_LOWBIT_PACK");
+        return load(open_mini_weight_pack(path, scope.checkpoint, options.qualify_decode_only));
+    } catch (const std::runtime_error& error) {
+        std::cerr << "strix-lowbit-pack/v2 declined (" << error.what() << "); retrying incumbent weights\n";
+        auto incumbent_scope = scope;
+        incumbent_scope.regime = {};
+#if defined(__HIPCC__)
+        incumbent_scope.build = weight::implementation_identity(core::kResidentQ8ArithmeticHip);
+#endif
+        plan = mini_plain_weight_fallback(tier, options, incumbent_scope, extent,
+                                          "calibrated pack declined; incumbent weights");
+        return load(MiniLowBitRows{});
+    }
 }
 
 } // namespace strix::inkling2

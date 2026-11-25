@@ -677,6 +677,7 @@ bool Coordinator::advance(std::span<const LaneAdvance> lanes, bool subset) {
         // the same rows in groups of at most eight.
         std::vector<bool> prefilled(slots_.size(), false);
         std::size_t rowed = live; // streams left for this step's forward_rows pass
+        bool prefill_call_ran = false; // a prefill_rows call executed in this step (execution receipt)
         // Continuation mixes all ready rows in the bounded forward below,
         // including a legacy request's long prompt. Legacy-only calls retain
         // their existing many-row prefill scheduling and arithmetic.
@@ -818,6 +819,7 @@ bool Coordinator::advance(std::span<const LaneAdvance> lanes, bool subset) {
                 s.prompt_processed += n;
                 s.out.prefill_ms += elapsed(begin);
                 ++s.out.prefill_calls; s.out.prefill_host_ms += elapsed(begin)-call_ms+rows.host_ms;
+                prefill_call_ran = true;
                 prefilled[i] = true;
                 --rowed;
                 }
@@ -1039,9 +1041,13 @@ bool Coordinator::advance(std::span<const LaneAdvance> lanes, bool subset) {
             }
         }
         const double ms = elapsed(start);
+        const auto decoders = std::uint64_t(std::count_if(work.begin(),work.end(),[](const Work& w) { return !w.prefill; }));
         for (const auto& w : work) {
             auto& s = *slots_[w.slot];
             if (w.prefill) s.out.prefill_ms += ms; else s.out.decode_ms += ms;
+            if (w.prefill) continue;
+            s.out.decode_pass_streams_max = std::max(s.out.decode_pass_streams_max,decoders);
+            if (prefill_call_ran) ++s.out.decode_beside_prefill_calls;
         }
         // Only complete C1 cycles qualify auto. Diagnostic state hashing is
         // outside decode timing and runs once at completion/cancellation.
@@ -1098,7 +1104,11 @@ Json Coordinator::receipt(std::size_t slot) const {
     switches.set("STRIX_G4_DFLASH",s.dflash_enabled);
     j.set("off_switches",switches); j.set("finish_reason",status_name(r.status)); j.set("frontier",r.frontier);
     j.set("state_digest",r.status == Status::running ? s.state->digest() : r.digest);
-    if (logits_digest_enabled()) { j.set("logits_fnv64",std::to_string(r.logits_fnv64)); j.set("logits_rows",r.logits_rows); }
+    if (logits_digest_enabled()) {
+        j.set("logits_fnv64",std::to_string(r.logits_fnv64)); j.set("logits_rows",r.logits_rows);
+        // Identity checks only (default receipt bytes unchanged): executed decode width and overlap with prefill calls.
+        j.set("executed_max_streams",r.decode_pass_streams_max); j.set("executed_beside_prefill_calls",r.decode_beside_prefill_calls);
+    }
     j.set("target_calls",r.target_calls); j.set("target_rows",r.target_rows);
     const auto& a = r.acceptance;
     acceptance.set("cycles",a.cycles); acceptance.set("attempted",a.attempted); acceptance.set("eligible",a.eligible);

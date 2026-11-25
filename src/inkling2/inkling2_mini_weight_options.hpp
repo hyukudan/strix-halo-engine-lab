@@ -8,13 +8,13 @@
 
 #include <algorithm>
 #include <array>
-#include <filesystem>
 #include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
-#include <system_error>
 #include <string_view>
+
+#include <string>
 
 namespace strix::inkling2 {
 
@@ -24,6 +24,7 @@ struct MiniWeightOptions {
     bool disable_q8{};  // off switch of every compact weight storage
     // The shared policy of an explicit qualification arm (--qualify-weights KEY); nullptr: none.
     const weight::WeightLoadPolicy* qualify{};
+    bool qualify_decode_only{};
 };
 
 // The bindings a qualification key may name: the model's Q8_0 binding (legacy id included), the shared low-bit mixes and
@@ -32,64 +33,32 @@ inline constexpr std::array<weight::WeightLoadPolicy, 6> kMiniQualifiablePolicie
     kMiniWeightLoadPolicy, weight::kAttentionHeadQ6Policy, weight::kAttentionQ4HeadQ6Policy,
     weight::kAttentionHeadQ4Policy, weight::kHeadQ6Policy, weight::kHeadQ4Policy};
 
-// The binding a load resolves under: an explicit arm's policy (the model's own row for the Q8_0 policy, so its legacy
-// records match); else the TURBO mix for --profile turbo, the FAST mix for --profile fast and the Q8_0 binding for
-// EXACT (which keeps BF16 whatever the policy).
-inline const weight::WeightLoadPolicy& mini_weight_load_policy(const MiniWeightOptions& options, profile::Name tier) {
-    if (options.qualify == nullptr)
-        return tier == profile::Name::turbo ? kMiniTurboWeightPolicy
-            : tier == profile::Name::fast   ? kMiniFastWeightPolicy
-                                            : kMiniWeightLoadPolicy;
-    if (weight::same_id(options.qualify->id, kMiniWeightLoadPolicy.id)) return kMiniWeightLoadPolicy;
+inline const weight::WeightLoadPolicy& mini_weight_load_policy(const MiniWeightOptions& options) {
+    if (options.qualify == nullptr || weight::same_id(options.qualify->id, kMiniWeightLoadPolicy.id))
+        return kMiniWeightLoadPolicy;
     return *options.qualify;
-}
-
-// The calibrated low-bit pack file of a checkpoint: STRIX_LOWBIT_PACK, else kMiniLowBitPackFile next to it.
-inline std::string mini_lowbit_pack_file(const std::string& checkpoint) {
-    if (const char* env = envcfg::text("STRIX_LOWBIT_PACK"); env && *env) return env;
-    return (std::filesystem::path(checkpoint).parent_path() / kMiniLowBitPackFile).string();
-}
-
-// A regular file at the pack path (no throw: a filesystem error reads as absent).
-inline bool mini_lowbit_pack_present(const std::string& checkpoint) {
-    std::error_code error;
-    return std::filesystem::is_regular_file(mini_lowbit_pack_file(checkpoint), error);
 }
 
 inline bool mini_lowbit_storage(weight::FormatId f) {
     return f == weight::kQ4G64WeightStorage || f == weight::kQ6G64WeightStorage;
 }
 
-// How the resident image carries a low-bit plan. A decision row (FAST or TURBO) keeps the BF16 image, adds the low-bit
-// copies of its roles from the pack it was measured with (`pack`, its identity), and runs them only in decode-regime
-// steps of at most `band` rows (0: every step width); prompt-prefill chunks read BF16. An explicit qualification arm
-// (`every_chunk`) loads the low-bit roles in place of BF16 and runs them in every chunk, so the gate scores the arm in
-// prefill and in decode.
-// `checkpoint`: the raw SHA-256 of the checkpoint (the load scope's), which a pack must be bound to. `admitted`: the
-// pack object the decision row's admission opened and verified (resolve_mini_resident_weight_load); the load reads
-// that same open object, so the file cannot change between admission and use.
+// The decode-only qualification arm keeps the incumbent BF16 tensors beside the compact
+// tensors. Ordinary weight qualification replaces the selected tensors.
 struct MiniLowBitRows {
-    const weight::Digest256* pack = nullptr;
-    std::uint32_t band = 0;
-    bool every_chunk = false;
-    weight::Digest256 checkpoint{};
+    bool decode_only = false;
     std::shared_ptr<const weight::LowbitPack> admitted{};
 };
 
-inline MiniLowBitRows mini_lowbit_rows(const weight::WeightLoadPlan& plan, const MiniWeightOptions& options,
-                                       const weight::Digest256& checkpoint,
-                                       std::shared_ptr<const weight::LowbitPack> admitted = {}) {
-    if (!mini_lowbit_storage(plan.storage) && !mini_lowbit_storage(plan.head_storage)) return {};
-    if (options.qualify != nullptr) return {nullptr, 0U, true, checkpoint, nullptr};
-    return {&kMiniLowBitPackIdentity, plan.row_band(kMiniWeightRegime), false, checkpoint, std::move(admitted)};
-}
-
-// A committed decision row exists for the policy this tier resolves (a TURBO row never makes FAST or EXACT compute the
-// device scope at load).
-inline bool mini_has_decision_rows(const MiniWeightOptions& options, profile::Name tier) {
-    const auto& policy = mini_weight_load_policy(options, tier);
-    return std::ranges::any_of(kMiniWeightLoadDecisions,
-                               [&](const weight::WeightLoadDecision& row) { return weight::policy_has_id(policy, row.policy); });
+inline weight::WeightLoadPlan mini_lowbit_receipt_plan(
+    profile::Name tier, weight::WeightLoadScope scope, weight::WeightLoadExtent extent, std::uint32_t rows,
+    const weight::Digest256& pack_identity, std::span<const weight::WeightLoadDecision> decisions = kMiniLowBitDecisions) {
+    constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ4G64WeightStorage};
+    const auto& policy = tier == profile::Name::turbo ? kMiniTurboWeightPolicy : kMiniFastWeightPolicy;
+    const bool enabled = scope.backend == weight::Backend::hip && scope.regime == weight::kDecodeRegime &&
+                         mini_lowbit_decode_receipt(extent, rows) && pack_identity == kMiniLowBitPackIdentity;
+    return weight::resolve_weight_load(weight::builtin_registry(), policy, {tier, scope, formats, enabled, false,
+                                                                             {}, extent}, decisions);
 }
 
 template <class Value>
@@ -100,10 +69,16 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
         if (tier != "exact" && tier != "fast" && tier != "turbo")
             throw std::invalid_argument("--profile must be exact, fast or turbo");
         options.tier.profile = profile::parse(tier);
+    } else if (native && argument == "--controller-planes") {
+        options.tier.cli.emplace_back(kMiniControllerPlanes, value());
+    } else if (argument == "--block-drafter") {
+        options.tier.cli.emplace_back(std::string(spec::kBlockDraftLeverName), value());
     } else if (native && argument == "--qualify-q8") {
+        options.qualify_decode_only = false;
         options.qualify_q8 = true;
         options.qualify = &weight::kAttentionHeadQ8Policy;
-    } else if (native && argument == "--qualify-weights") {
+    } else if (native && (argument == "--qualify-weights" || argument == "--qualify-decode-weights")) {
+        options.qualify_decode_only = argument == "--qualify-decode-weights";
         const std::string_view key(value());
         options.qualify = weight::find_weight_load_policy(key, kMiniQualifiablePolicies);
         bool bound = false;
@@ -111,6 +86,8 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
             bound = bound || (options.qualify != nullptr && weight::same_id(binding.id, options.qualify->id));
         if (!bound) throw std::invalid_argument("--qualify-weights: unknown or unbound weight policy " + std::string(key));
         options.qualify_q8 = weight::same_id(options.qualify->id, kMiniWeightLoadPolicy.id);
+        if (options.qualify_decode_only && !mini_lowbit_storage(options.qualify->head_target()))
+            throw std::invalid_argument("--qualify-decode-weights requires a low-bit head");
     } else if (native && argument == "--no-weight-q8") {
         options.disable_q8 = true;
     } else {
@@ -120,8 +97,10 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
 }
 
 // Resolved operand class of the W4A4 expert lever (multi-row prefill chunks run NVFP4 expert layers through the shared
-// grouped W4A4 class on CUDA): 0 = bf16 (off), 1 = nvfp4 (nearest@1), mse = nvfp4_mse, mse-gate-up = nvfp4_mse_gate_up.
-// mse / mse-gate-up are candidate values of the route-flip re-qualification, not yet gated.
+// grouped W4A4 class on CUDA): 0 = bf16 (off), 1 = nvfp4 (nearest@1), mse = nvfp4_mse, mse-gate-up = nvfp4_mse_gate_up,
+// mse-r2-gate-up = nvfp4_mse_r2_gate_up, mse-r2 = nvfp4_mse_r2 (two-term activation rule r2@1 of moe_core/nvfp4_act_rule.hpp),
+// r2 = nvfp4_r2 (two nearest@1 terms on both projections).
+// Every value but 0 / 1 is a candidate of the route-flip re-qualification, not yet gated.
 inline moe_core::grouped_w4a4::Activations mini_moe_w4a4_class(const profile::Resolution& tier) {
     using A = moe_core::grouped_w4a4::Activations;
     const auto* entry = tier.find(kMiniMoeW4a4);
@@ -129,13 +108,144 @@ inline moe_core::grouped_w4a4::Activations mini_moe_w4a4_class(const profile::Re
     if (entry->value == "1") return A::nvfp4;
     if (entry->value == "mse") return A::nvfp4_mse;
     if (entry->value == "mse-gate-up") return A::nvfp4_mse_gate_up;
-    throw std::invalid_argument("STRIX_INK_MOE_W4A4 must be 0, 1, mse or mse-gate-up");
+    if (entry->value == "mse-r2-gate-up") return A::nvfp4_mse_r2_gate_up;
+    if (entry->value == "mse-r2") return A::nvfp4_mse_r2;
+    if (entry->value == "r2") return A::nvfp4_r2;
+    throw std::invalid_argument("STRIX_INK_MOE_W4A4 must be 0, 1, mse, mse-gate-up, mse-r2-gate-up, mse-r2 or r2");
 }
 
 // Resolved state of the W4A4 expert lever (true: multi-row prefill chunks run NVFP4 expert layers as W4A4 on CUDA).
 inline bool mini_moe_w4a4(const profile::Resolution& tier) {
     return mini_moe_w4a4_class(tier) != moe_core::grouped_w4a4::Activations::bf16;
 }
+
+// Resolved state of the prepared-attention round fold (HIP: the stage's plain BF16 rounds fold into their producers,
+// same bits; off unless STRIX_INK_PREPARED_ROUND_FOLD=1 selects it, in any profile). The serial CLI and the server
+// read it from the same resolution.
+inline bool mini_prepared_round_fold(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniPreparedRoundFold);
+    if (entry == nullptr || entry->value == "0") return false;
+    if (entry->value == "1") return true;
+    throw std::invalid_argument("STRIX_INK_PREPARED_ROUND_FOLD must be 0 or 1");
+}
+
+// Resolved state of the narrow expert image lever (true: the checkpoint's MXFP8 expert layers load as NVFP4).
+inline bool mini_experts_nvfp4(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniExpertsNvfp4);
+    if (entry == nullptr || entry->value == "0") return false;
+    if (entry->value == "1") return true;
+    throw std::invalid_argument("STRIX_MOE_EXPERTS_NVFP4 must be 0 or 1");
+}
+
+inline void require_mini_expert_consumer(const profile::Resolution& tier, bool supports_narrow_experts) {
+    if (!mini_experts_nvfp4(tier)) return;
+    if (tier.profile == profile::Name::standard)
+        throw std::invalid_argument("STRIX_MOE_EXPERTS_NVFP4=1 is forbidden under --profile exact");
+    if (!supports_narrow_experts)
+        throw std::invalid_argument("STRIX_MOE_EXPERTS_NVFP4=1 requires native resident model execution");
+}
+
+// Resolved state of the exact down-image lever (true: the HIP resident prefill stores the BF16 down image on the qualified
+// target). 0 or absent = off.
+inline bool mini_combine_image(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniCombineImage);
+    if (entry == nullptr || entry->value == "0") return false;
+    if (entry->value == "1") return true;
+    throw std::invalid_argument("STRIX_INK_COMBINE_IMAGE must be 0 or 1");
+}
+
+// Resolved state of the projected-bias attention lever (true: the CUDA prompt flash projects the relative bias; bitwise the
+// image route). One value for the CLI, the gate and the server: every entry point reads it from the resolution.
+inline bool mini_attn_projected_bias(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniAttnProjectedBias);
+    if (entry == nullptr || entry->value == "0") return false;
+    if (entry->value == "1") return true;
+    throw std::invalid_argument("STRIX_INK_ATTN_PROJECTED_BIAS must be 0 or 1");
+}
+
+// Resolved state of the served route lever (true: a HIP server runs the command line's route, kMiniServedCliRoute).
+// 0 or absent = off: the served incumbent route. Read (and validated) by the server only: the command line always runs
+// its own route and reports the lever as not applicable (mini_served_route_cli_line).
+inline bool mini_served_cli_route(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniServedCliRoute);
+    if (entry == nullptr || entry->value == "0") return false;
+    if (entry->value == "1") return true;
+    throw std::invalid_argument("STRIX_INK_SERVED_CLI_ROUTE must be 0 or 1");
+}
+
+// The command line's receipt of the served route lever: the requested value as the resolution holds it (unparsed, so a
+// malformed server setting never aborts the command line) and that it does not apply here.
+inline std::string mini_served_route_cli_line(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniServedCliRoute);
+    const std::string_view requested = entry == nullptr ? std::string_view("0")
+                                       : entry->requested.empty() ? std::string_view(entry->value)
+                                                                  : std::string_view(entry->requested);
+    return "strix-served-route/v1 requested " + std::string(requested) +
+           " effective n/a (strix-serve only; the command line runs its own route)";
+}
+
+inline bool mini_controller_one_plane(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniControllerPlanes);
+    if (entry == nullptr || entry->value == "3") return false;
+    if (entry->value != "1") throw std::invalid_argument("controller planes must be 1 or 3");
+    if (tier.profile != profile::Name::fast && tier.profile != profile::Name::turbo)
+        throw std::invalid_argument("one controller plane requires --profile fast or turbo");
+    return true;
+}
+
+// "on", "off" or "declined" (selected, but the target does not run it): the state name of a lever in the startup lines
+// (down_image, prepared_round_fold), the same text in the CLI, the gate and the server.
+inline const char* mini_down_image_name(bool active, bool selected) { return active ? "on" : selected ? "declined" : "off"; }
+inline const char* mini_round_fold_name(bool active, bool selected) { return mini_down_image_name(active, selected); }
+
+// What the decoder's backend admitted of the resolved levers: the effective state every entry point reports.
+struct MiniDecoderLevers {
+    bool down_image = false;           // the BF16 down image route is active
+    bool prepared_round_fold = false;  // the prepared-attention round fold runs
+};
+
+// The one place a resident decoder takes its resolved profile levers; the serial CLI, the gate and the server all call
+// it, so a lever cannot reach one entry point and not the others. Returns what the backend admitted (a lever the target
+// does not run is declined, not silently reported as on).
+template <class Decoder>
+MiniDecoderLevers configure_mini_decoder(Decoder& decoder, moe_core::grouped_w4a4::Activations moe_w4a4,
+                                         bool combine_image, bool prepared_round_fold, bool attn_projected_bias) {
+    decoder.set_moe_w4a4(moe_w4a4);
+    decoder.set_attention_projected_bias(attn_projected_bias);
+    MiniDecoderLevers levers;
+    levers.prepared_round_fold = decoder.set_prepared_round_fold(prepared_round_fold);
+    levers.down_image = decoder.set_combine_image(combine_image);
+    return levers;
+}
+
+template <class Decoder>
+MiniDecoderLevers configure_mini_decoder(Decoder& decoder, const profile::Resolution& tier) {
+    return configure_mini_decoder(decoder, mini_moe_w4a4_class(tier), mini_combine_image(tier),
+                                  mini_prepared_round_fold(tier), mini_attn_projected_bias(tier));
+}
+
+// The W4A4 class a run on `backend` ("hip", "cuda") executes. Only the CUDA backend holds the grouped W4A4 tile: a
+// selected class that the backend cannot run is refused, never replaced by the BF16 tile under the class's name. Every
+// entry point (generation CLI, gate, step program, server) admits through here before it reports or binds the class.
+inline moe_core::grouped_w4a4::Activations admit_mini_moe_w4a4(moe_core::grouped_w4a4::Activations activations,
+                                                                std::string_view backend) {
+    if (activations != moe_core::grouped_w4a4::Activations::bf16 && backend != "cuda")
+        throw std::invalid_argument(std::string("STRIX_INK_MOE_W4A4 selects ") +
+                                    moe_core::grouped_w4a4::identity(activations) + ": the " + std::string(backend) +
+                                    " backend has no grouped W4A4 tile (CUDA only); select 0 to run the BF16 tile");
+    return activations;
+}
+
+inline moe_core::grouped_w4a4::Activations admit_mini_moe_w4a4(const profile::Resolution& tier, std::string_view backend) {
+    return admit_mini_moe_w4a4(mini_moe_w4a4_class(tier), backend);
+}
+
+// Backend of this translation unit's device build, for the entry points compiled once per backend.
+#if defined(__HIPCC__)
+inline constexpr std::string_view kMiniBuildBackend = "hip";
+#else
+inline constexpr std::string_view kMiniBuildBackend = "cuda";
+#endif
 
 inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options, bool native_execution) {
     auto tier = profile::resolve(kMiniProfile, options.tier);
@@ -148,58 +258,78 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
          !native_execution))
         throw std::invalid_argument("--qualify-weights requires --profile fast or turbo and native model execution");
     static_cast<void>(mini_moe_w4a4(tier));  // refuse a malformed or unrunnable explicit switch early
+    static_cast<void>(mini_prepared_round_fold(tier));
+    static_cast<void>(mini_combine_image(tier));
+    static_cast<void>(mini_attn_projected_bias(tier));
+    require_mini_expert_consumer(tier, native_execution);
+    static_cast<void>(mini_controller_one_plane(tier));
+    spec::require_block_draft_execution(spec::block_draft_selection(tier));
     return tier;
+}
+
+// The command line's resolution never runs the served route lever (its own route is the command line's): an explicit
+// request stays visible as `requested` with the reason, and its effective value is the builtin, so the native summary,
+// qualification and fingerprint carry no server-only setting (mini_served_route_cli_line prints the request).
+inline void mini_cli_decline_served_route(profile::Resolution& tier) {
+    for (auto& entry : tier.entries) {
+        if (entry.lever == nullptr || entry.lever->name != kMiniServedCliRoute) continue;
+        if (entry.value == entry.lever->builtin && entry.requested.empty()) continue;
+        if (entry.requested.empty()) entry.requested = entry.value;
+        entry.value = std::string(entry.lever->builtin);
+        entry.status = profile::Status::off;
+        entry.reason = "strix-serve only: the command line runs its own route";
+    }
 }
 
 inline const char* mini_profile_name(profile::Name tier) {
     return tier == profile::Name::standard ? "exact" : profile::name(tier);
 }
 
-// Admission of the calibrated pack a decision row was measured with, before the plan is committed: the file must open
-// (framing, bounds, identity read through one open file), be bound to this checkpoint's bytes (scope.checkpoint) and
-// carry the row's pack identity. Empty: admitted, and `admitted` (when given) holds the open pack the load then reads;
-// otherwise why not.
+// Open once against the checkpoint identity. The same source is used for tensor validation
+// and staging, which retains the shared stale-source checks.
 inline std::string admit_mini_lowbit_pack(const std::string& file, const weight::Digest256& checkpoint,
-                                          std::shared_ptr<const weight::LowbitPack>* admitted = nullptr) {
-    std::error_code error;
-    if (!std::filesystem::is_regular_file(file, error)) return "no pack at " + file;
+                                          std::shared_ptr<const weight::LowbitPack>& admitted,
+                                          const weight::Digest256* measured = nullptr) {
+    admitted.reset();
     auto pack = std::make_shared<weight::LowbitPack>();
     if (const auto opened = weight::LowbitPack::open(file, checkpoint, *pack); !opened) return opened.detail;
-    if (!(pack->identity() == kMiniLowBitPackIdentity)) return file + " is not the measured pack (other content)";
-    if (admitted) *admitted = std::move(pack);
+    if (measured && !(pack->identity() == *measured)) return "pack content does not match the receipt";
+    admitted = std::move(pack);
     return {};
 }
 
-// `checkpoint` (when known): a decision row that selected low-bit roles applies only when its calibrated pack is
-// admitted (admit_mini_lowbit_pack); otherwise the load keeps BF16, the plan's reason says so and `pack_note` (when
-// given) receives the refusal detail for the receipt; an admitted pack is handed back open in `admitted` (when given)
-// for mini_lowbit_rows, so the load uses the object that was verified. No sidecar I/O happens for a plan without such
-// a row (EXACT, lever off, no matching row). An explicit qualification arm keeps its failures explicit (the decoder
-// throws).
 inline weight::WeightLoadPlan resolve_mini_resident_weight_load(profile::Name tier, const MiniWeightOptions& options,
                                                               const weight::WeightLoadScope& scope,
-                                                              const std::string& checkpoint = {},
-                                                              std::string* pack_note = nullptr,
-                                                              std::shared_ptr<const weight::LowbitPack>* admitted = nullptr) {
-    // Consumers of this backend's resident routes: the HIP projections and head also read the low-bit storages.
+                                                              weight::WeightLoadExtent extent = {}) {
     constexpr std::array consumers{weight::kBf16WeightStorage, weight::kQ8WeightStorage,
                                    weight::kQ4G64WeightStorage, weight::kQ6G64WeightStorage};
     const std::span<const weight::FormatId> formats(consumers.data(), scope.backend == weight::Backend::hip ? 4U : 2U);
-    const auto& policy = mini_weight_load_policy(options, tier);
-    const auto resolve = [&](std::span<const weight::WeightLoadDecision> rows) {
-        return resolve_mini_weight_load(tier, scope, formats, !options.disable_q8, options.qualify != nullptr, rows, policy);
-    };
-    auto plan = resolve(kMiniWeightLoadDecisions);
-    if (options.qualify == nullptr && !checkpoint.empty() && mini_lowbit_rows(plan, options, scope.checkpoint).pack != nullptr) {
-        if (auto refused = admit_mini_lowbit_pack(mini_lowbit_pack_file(checkpoint), scope.checkpoint, admitted);
-            !refused.empty()) {
-            plan = resolve({});
-            plan.reason = "calibrated low-bit pack refused (strix-lowbit-pack/v2 line): BF16 image";
-            if (pack_note) *pack_note = "refused " + std::move(refused) + "; BF16 image";
-        }
-    }
-    if (options.qualify != nullptr && (plan.storage != policy.target || plan.head_storage != policy.head_target()))
+    const auto& policy = mini_weight_load_policy(options);
+    const bool qualify = options.qualify_q8 || options.qualify != nullptr;
+    auto plan = weight::resolve_weight_load(weight::builtin_registry(), policy,
+        {tier, scope, formats, !options.disable_q8, qualify, kMiniWeightLoadRegimes, extent}, kMiniWeightLoadDecisions);
+    if (qualify && (plan.storage != policy.target || plan.head_storage != policy.head_target()))
         throw std::invalid_argument("the qualified compact weights were not admitted on this backend");
+    return plan;
+}
+
+inline MiniLowBitRows open_mini_weight_pack(const std::string& file, const weight::Digest256& checkpoint,
+                                           bool decode_only) {
+    MiniLowBitRows rows{decode_only, {}};
+    if (auto detail = admit_mini_lowbit_pack(file, checkpoint, rows.admitted); !detail.empty())
+        throw std::runtime_error("calibrated low-bit pack refused: " + detail);
+    return rows;
+}
+
+inline weight::WeightLoadPlan mini_plain_weight_fallback(profile::Name tier, const MiniWeightOptions& options,
+                                                        const weight::WeightLoadScope& scope,
+                                                        weight::WeightLoadExtent extent, std::string_view reason) {
+    auto incumbent = options;
+    incumbent.qualify = nullptr;
+    incumbent.qualify_q8 = false;
+    incumbent.qualify_decode_only = false;
+    auto plan = resolve_mini_resident_weight_load(tier, incumbent, scope, extent);
+    plan.reason = reason;
     return plan;
 }
 

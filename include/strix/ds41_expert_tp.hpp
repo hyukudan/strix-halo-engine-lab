@@ -20,6 +20,8 @@
 #include "strix/ds41_formats.hpp"
 #include "strix/ds41_moe.hpp"
 
+#include "strix/ds41_dense_geometry.hpp"
+
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -27,8 +29,8 @@
 namespace strix::ds41::expert_tp {
 
 inline constexpr const char* identity = "ds41-expert-tp2-i1152-v1";
-inline constexpr std::uint32_t ranks = 2;
-inline constexpr std::uint32_t inter = 2304;         // the full intermediate size this layout is declared for
+inline constexpr std::uint32_t ranks = dense_geometry::kTpWorld;
+inline constexpr std::uint32_t inter = dense_geometry::kGeometry.intermediate;  // the full intermediate size (model constants)
 inline constexpr std::uint32_t half = inter / 2U;     // 1152 intermediate rows per rank
 inline constexpr std::uint32_t half_groups = half / 32U;  // 36 Q2_K / A8 groups per rank
 inline constexpr std::uint32_t down_blocks = 5;       // Q2_K blocks stored per rank and down row (4.5 used)

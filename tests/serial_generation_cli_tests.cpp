@@ -1,6 +1,8 @@
+#include "strix/device_allocation_error.hpp"
 #include "strix/serial_request.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
+#include "strix/serve/decode_form.hpp"
 #include "strix/serve/prefill_chunk_fallback.hpp"
 #include "strix/serve/serial_generation_cli.hpp"
 #include "strix/session/embed_rows.hpp"
@@ -17,12 +19,23 @@
 #include <functional>
 #include <initializer_list>
 #include <new>
+#include <optional>
 #include <iostream>
 #include <random>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
 #include <vector>
+
+// The native runtime header and the CUDA weight uploader are the two production call sites of the chunk retry: they
+// compile here against the host runtime stub (tests/stubs/cuda_status), which injects a refused allocation at the
+// exact runtime call. Keep these last, after the headers the runtime header itself includes: the macro only selects the native section of the runtime header.
+#include "strix/device/declaration.hpp"
+#include "strix/session/step_replay.hpp"
+#include "core/weight_load_queue.hpp"
+#define __CUDACC__ 1
+#include "cuda/core/weight_uploader.hpp"
+#include "strix/device/runtime.hpp"
 
 namespace {
 
@@ -241,10 +254,13 @@ static void chunk_fallback_cases() {
     std::ostringstream log;
     std::vector<unsigned> tried;
     // The device holds at most `capacity` rows: larger loads throw `what`.
-    const auto loader = [&](unsigned capacity, const char* what = "reserve: out of memory") {
-        return [&tried, capacity, what](std::uint32_t rows) {
+    const auto loader = [&](unsigned capacity, const char* what = "reserve: out of memory", bool typed = true) {
+        return [&tried, capacity, what, typed](std::uint32_t rows) {
             tried.push_back(rows);
-            if (rows > capacity) throw std::runtime_error(what);
+            if (rows > capacity) {
+                if (typed) throw strix::DeviceAllocationError(what, 2);
+                throw std::runtime_error(what);
+            }
             return rows;
         };
     };
@@ -267,8 +283,14 @@ static void chunk_fallback_cases() {
     check(throws(true, 8192U, 2048U, loader(4096U)) && tried.size() == 1U && log.str().empty(),
           "explicit chunk is never changed");
     tried.clear();
-    check(throws(false, 8192U, 2048U, loader(4096U, "open checkpoint: no such file")) && tried.size() == 1U &&
+    check(throws(false, 8192U, 2048U, loader(4096U, "open checkpoint: no such file", false)) && tried.size() == 1U &&
           log.str().empty(), "a non-memory failure is not retried");
+    tried.clear();
+    check(throws(false, 8192U, 2048U, loader(4096U, "invalid checkpoint: out of memory in metadata key", false)) &&
+          tried.size() == 1U && log.str().empty(), "an untyped failure whose text says out of memory is not retried");
+    tried.clear();
+    check(throws(false, 8192U, 2048U, loader(4096U, "invalid checkpoint: out of memory in metadata key", false)) &&
+          tried.size() == 1U, "message text alone never selects the retry");
     tried.clear();
     check(throws(false, 8192U, 2048U, loader(1024U)) && tried.size() == 2U, "failure of the retry propagates");
     tried.clear();
@@ -276,15 +298,130 @@ static void chunk_fallback_cases() {
     tried.clear();
     check(throws(false, 8192U, 0U, loader(4096U)) && tried.size() == 1U, "no fallback configured");
     tried.clear();
-    check(sv::load_with_chunk_fallback(8192U, false, 2048U, log, [&](std::uint32_t rows) {
-              tried.push_back(rows);
-              if (rows > 2048U) throw std::bad_alloc();
-              return rows;
-          }) == 2048U, "bad_alloc counts as an allocation failure");
+    bool host_failure_escaped = false;
+    try {
+        (void)sv::load_with_chunk_fallback(8192U, false, 2048U, log, [&](std::uint32_t rows) -> std::uint32_t {
+            tried.push_back(rows);
+            throw std::bad_alloc();
+        });
+    } catch (const std::bad_alloc&) {
+        host_failure_escaped = true;
+    }
+    check(host_failure_escaped && tried.size() == 1U, "a host bad_alloc is not retried at fewer device rows");
+}
+
+// The shared CLI entry point: the implicit chunk (family default 6 rows, fallback 2) retries once after a typed
+// device allocation failure; an explicit --prefill-chunk, or a failure that only says "out of memory", never does.
+static void chunk_fallback_cli_cases() {
+    std::vector<std::uint32_t> loaded_rows;
+    bool typed = true;
+    SerialGenerationFamily pressure = family;
+    pressure.default_prefill_chunk = 6U;
+    pressure.prefill_chunk_fallback = 2U;
+    pressure.load = [&](const SerialGenerationLoad& load) -> std::unique_ptr<SerialGenerationDecoder> {
+        loaded_rows.push_back(load.prefill_chunk);
+        if (load.prefill_chunk > 3U) {
+            if (typed) throw strix::DeviceAllocationError("reserve: out of memory", 2);
+            throw std::runtime_error("invalid checkpoint: out of memory in metadata key");
+        }
+        return std::make_unique<Decoder>(std::min(8U, load.verify_rows));
+    };
+    const auto implicit = run({"8", "4", "1", "2", "3", "5"}, pressure);
+    check(implicit.code == 0 && loaded_rows == std::vector<std::uint32_t>{6U, 2U}, "implicit chunk retries once");
+    loaded_rows.clear();
+    const auto fits = run({"8", "4", "1", "2", "3", "5", "--prefill-chunk", "3"}, pressure);
+    check(fits.code == 0 && loaded_rows == std::vector<std::uint32_t>{3U}, "explicit chunk is used as given");
+    loaded_rows.clear();
+    const auto refused = run({"8", "4", "1", "2", "3", "5", "--prefill-chunk", "6"}, pressure);
+    check(refused.code != 0 && loaded_rows == std::vector<std::uint32_t>{6U}, "explicit chunk is never retried");
+    loaded_rows.clear();
+    // A backend without a qualified fallback (family data zero): the implicit default has one attempt only.
+    pressure.prefill_chunk_fallback = 0U;
+    const auto unqualified = run({"8", "4", "1", "2", "3", "5"}, pressure);
+    check(unqualified.code != 0 && loaded_rows == std::vector<std::uint32_t>{6U}, "no fallback datum: no retry route");
+    pressure.prefill_chunk_fallback = 2U;
+    loaded_rows.clear();
+    // The prompt bounds the chunk (a 3-row prompt loads 3 rows) and the fallback.
+    const auto bounded = run({"8", "4", "1"}, pressure);
+    check(bounded.code == 0 && loaded_rows == std::vector<std::uint32_t>{3U}, "prompt bounds the implicit chunk");
+    loaded_rows.clear();
+    typed = false;
+    const auto untyped = run({"8", "4", "1", "2", "3", "5"}, pressure);
+    check(untyped.code != 0 && loaded_rows == std::vector<std::uint32_t>{6U}, "untyped failure is not retried");
+
+    // The same out-of-memory runtime status, injected into the runtime stub at the two ACTUAL allocation call sites.
+    // A pinned host staging allocation (the CUDA weight uploader) fails as the generic std::runtime_error: never
+    // retried, one load. A device row buffer (device::native::Buffer, the device-allocation boundary) fails as the
+    // typed DeviceAllocationError: retried once at the fallback rows, two loads.
+    namespace stub = cuda_status_stub;
+    const auto refused_as = [](auto&& allocate, bool typed_error) {
+        try {
+            allocate();
+        } catch (const strix::DeviceAllocationError& error) {
+            return typed_error && error.status == static_cast<int>(cudaErrorMemoryAllocation);
+        } catch (const std::runtime_error& error) {
+            return !typed_error && std::string(error.what()).find("out of memory") != std::string::npos;
+        }
+        return false;
+    };
+    const auto pinned_staging = [] {
+        strix::cuda::core::WeightUploader uploader;
+        (void)uploader.allocate(4096U);
+    };
+    const auto device_rows = [] { strix::device::native::Buffer<std::uint8_t> rows(4096U); };
+    stub::malloc_host_status = cudaErrorMemoryAllocation;
+    check(refused_as(pinned_staging, false) && stub::malloc_host_calls == 1U, "pinned staging refusal is a plain runtime error");
+    stub::malloc_host_status = cudaSuccess;
+    stub::malloc_status = cudaErrorMemoryAllocation;
+    check(refused_as(device_rows, true) && stub::malloc_calls == 1U, "device row refusal is a DeviceAllocationError");
+    stub::malloc_status = cudaSuccess;
+
+    std::function<void()> site = pinned_staging;
+    pressure.load = [&](const SerialGenerationLoad& load) -> std::unique_ptr<SerialGenerationDecoder> {
+        loaded_rows.push_back(load.prefill_chunk);
+        if (load.prefill_chunk > 3U) site();
+        return std::make_unique<Decoder>(std::min(8U, load.verify_rows));
+    };
+    stub::malloc_host_status = cudaErrorMemoryAllocation;
+    loaded_rows.clear();
+    const auto staging = run({"8", "4", "1", "2", "3", "5"}, pressure);
+    check(staging.code != 0 && loaded_rows == std::vector<std::uint32_t>{6U}, "pinned staging refusal loads once");
+    stub::malloc_host_status = cudaSuccess;
+    stub::malloc_status = cudaErrorMemoryAllocation;
+    site = device_rows;
+    loaded_rows.clear();
+    const auto rows = run({"8", "4", "1", "2", "3", "5"}, pressure);
+    check(rows.code == 0 && loaded_rows == std::vector<std::uint32_t>{6U, 2U}, "device row refusal loads twice");
+    stub::malloc_status = cudaSuccess;
+}
+
+// The one decode-form resolver (strix/serve/decode_form.hpp) against the expression it replaced in the command line:
+// the same outcome for every flag pair and either family default, and the same refusal of both flags.
+static void decode_form_cases() {
+    for (const bool family_default : {false, true})
+        for (const bool packed : {false, true})
+            for (const bool grouped : {false, true}) {
+                if (packed && grouped) {
+                    bool refused = false;
+                    try {
+                        (void)resolve_decode_form(packed, grouped, family_default);
+                    } catch (const std::invalid_argument&) {
+                        refused = true;
+                    }
+                    check(refused, "both decode-form flags are refused");
+                    continue;
+                }
+                const bool before = packed || (family_default && !grouped);
+                check(resolve_decode_form(packed, grouped, family_default) == before, "decode form equals the old rule");
+            }
+    static_assert(resolve_decode_form(false, false, true) && !resolve_decode_form(false, true, true));
+    static_assert(resolve_decode_form(true, false, false) && !resolve_decode_form(false, false, false));
 }
 
 int main() try {
+    decode_form_cases();
     chunk_fallback_cases();
+    chunk_fallback_cli_cases();
     {
         const auto family_with_media = media_family();
         media_messages([&](const std::string& path) {

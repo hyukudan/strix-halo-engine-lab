@@ -530,6 +530,26 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
         code_src[j] = source.tile16_address(first_output + (chunk ? c.output : 0U), 16U * c.tile).codes;
         code_dst[j] = base + tall::code_offset(L, c.output, c.tile);
     }
+    // Form::staged_scales: the block scales of the CTA's outputs over the whole K, staged once (plan: "block scales"); the
+    // 4-byte copies join stage 0's commit group, the byte copies are plain stores; both are visible after the prologue barrier.
+    const unsigned scale_pitch = tall::scale_pitch(args.inputs, Operand::kNvfp4);
+    if constexpr (F.staged_scales) {
+        const unsigned scale_row = tall::scale_blocks(args.inputs, Operand::kNvfp4);
+        if (tall::scale_words(args.inputs, Operand::kNvfp4, reinterpret_cast<std::uintptr_t>(rows.weights.block_scales))) {
+            const unsigned words = scale_row / 4U;
+            for (unsigned c = thread; c < tall::kOutputs * words; c += F.threads()) {
+                const unsigned o = c / words, w = c % words;
+                ptx::cp_async4(base + tall::scale_offset(L, scale_pitch, o, 4U * w),
+                               source.tile16_address(first_output + o, 0U).scale_code + 4U * w);
+            }
+        } else {
+            for (unsigned c = thread; c < tall::kOutputs * scale_row; c += F.threads()) {
+                const unsigned o = c / scale_row, b = c % scale_row;
+                smem[tall::scale_offset(L, scale_pitch, o, b)] = source.tile16_address(first_output + o, 0U).scale_code[b];
+            }
+        }
+    }
+
     const auto issue = [&](unsigned stage) {
         const std::uint32_t slot = tall::slot(F, stage) * L.stage_bytes;
 #pragma unroll
@@ -557,9 +577,14 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
         }
     }
 
-    // Decode job: kColumns inputs of one output per stage; its scale byte is prefetched one iteration ahead.
+    // Decode job: kColumns inputs of one output per stage. Its scale byte of stage s: staged_scale(s) (staged scales), or a
+    // direct global byte prefetched one iteration ahead into `ahead`.
     const tall::DecodeJob job = tall::decode_job(F, thread);
+    const unsigned scale_first =
+        tall::scale_offset(L, scale_pitch, job.output, job.column / static_cast<unsigned>(Operand::kBlockColumns));
+    const auto staged_scale = [&](unsigned stage) { return smem[scale_first + stage * kScaleStride]; };
     const std::uint8_t* scale_src = source.tile16_address(first_output + job.output, job.column).scale_code;
+    std::uint8_t ahead = 0U;
     const auto decode = [&](unsigned stage, std::uint8_t scale_code) {
         const std::uint8_t* raw = smem + tall::slot(F, stage) * L.stage_bytes + tall::decode_code_offset(L, job);
         std::uint32_t words[kWords];
@@ -620,7 +645,7 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
     };
 
     const unsigned steps = args.inputs / F.k_slab;
-    std::uint8_t scale_code = *scale_src;
+    if constexpr (!F.staged_scales) ahead = *scale_src;
 #pragma unroll
     for (unsigned s = 0; s + 1U < F.stages; ++s) {
         if (s < steps) issue(s);
@@ -628,8 +653,12 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
     }
     ptx::cp_async_wait<static_cast<int>(tall::prologue_pending(F))>();
     __syncthreads();
-    decode(0U, scale_code);
-    if (steps > 1U) scale_code = scale_src[kScaleStride];
+    if constexpr (F.staged_scales) {
+        decode(0U, staged_scale(0U));
+    } else {
+        decode(0U, ahead);
+        if (steps > 1U) ahead = scale_src[kScaleStride];
+    }
     for (unsigned s = 0; s < steps; ++s) {
         ptx::cp_async_wait<static_cast<int>(tall::loop_pending(F))>();
         __syncthreads();  // stage s + 1 landed for all; every warp is past stage s - 1 (its slot and slab are free)
@@ -638,9 +667,11 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
 #pragma unroll 1
         for (unsigned phase = 0; phase < 2U; ++phase) {  // decode stage s + 1 and multiply stage s, in the warp row's order
             if ((phase == 0U) == decode_first) {
-                if (s + 1U < steps) {
-                    decode(s + 1U, scale_code);
-                    if (s + 2U < steps) scale_code = scale_src[std::size_t{s + 2U} * kScaleStride];
+                if constexpr (F.staged_scales) {
+                    if (s + 1U < steps) decode(s + 1U, staged_scale(s + 1U));
+                } else if (s + 1U < steps) {
+                    decode(s + 1U, ahead);
+                    if (s + 2U < steps) ahead = scale_src[std::size_t{s + 2U} * kScaleStride];
                 }
             } else if (warp_live) {
                 compute(s);
@@ -682,9 +713,30 @@ inline cudaError_t launch_tall_form(const view::Args& args, cudaStream_t stream)
     auto* kernel = projection_tall<Format, Id, false>;
     if constexpr (Format == packed::MatrixFormat::nvfp4)
         if (args.decode == view::Decode::shift) kernel = projection_tall<Format, Id, true>;
-    if (const auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                 static_cast<int>(L.smem)); status != cudaSuccess) return status;
-    kernel<<<grid, F.threads(), L.smem, stream>>>(args);
+    const unsigned shared = tall::shared_bytes(F, L, args.inputs, Format == packed::MatrixFormat::nvfp4);
+    if constexpr (F.staged_scales) {
+        // The opt-in attribute belongs to the specialization, not the stream. Never lower it
+        // to a request's K-dependent extent: another host thread may be launching a wider K.
+        // Use the same ceiling on every call, including after a CUDA context reset.
+        int device = 0, optin = 0;
+        cudaFuncAttributes attributes{};
+        if (const auto status = cudaGetDevice(&device); status != cudaSuccess) return status;
+        if (const auto status = cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+            status != cudaSuccess) return status;
+        if (const auto status = cudaFuncGetAttributes(&attributes, kernel); status != cudaSuccess) return status;
+        if (optin <= 0 || attributes.sharedSizeBytes >= static_cast<std::size_t>(optin))
+            return cudaErrorInvalidValue;
+        const int ceiling = optin - static_cast<int>(attributes.sharedSizeBytes);
+        if (shared > static_cast<unsigned>(ceiling)) return cudaErrorInvalidValue;
+        if (attributes.maxDynamicSharedSizeBytes != ceiling) {
+            if (const auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, ceiling);
+                status != cudaSuccess) return status;
+        }
+    } else {
+        if (const auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                     static_cast<int>(shared)); status != cudaSuccess) return status;
+    }
+    kernel<<<grid, F.threads(), shared, stream>>>(args);
     return cudaGetLastError();
 }
 
@@ -694,6 +746,8 @@ inline cudaError_t launch_tall(tall::FormId id, const view::Args& args, cudaStre
     switch (id) {
     case tall::FormId::r128_k32_s4: return launch_tall_form<Format, tall::FormId::r128_k32_s4>(args, stream);
     case tall::FormId::r64_k32_s4: return launch_tall_form<Format, tall::FormId::r64_k32_s4>(args, stream);
+    case tall::FormId::r128_k32_s4_direct:
+        return launch_tall_form<Format, tall::FormId::r128_k32_s4_direct>(args, stream);
     default: return cudaErrorInvalidValue;
     }
 }
@@ -708,8 +762,8 @@ inline cudaError_t launch(const view::Args& args, cudaStream_t stream) {
     if (!fits(args)) return cudaErrorInvalidValue;
     const bool tile = output_tile(args.outputs, args.max_tile_rows) == kTileOutputs;
     if (args.schedule == view::Schedule::tall || (args.schedule == view::Schedule::automatic && tile)) {
-        const auto id = tall::select(args.max_tile_rows);
-        if (tall::fits(args, id, Format == packed::MatrixFormat::nvfp4, detail::shared_budget()))
+        tall::FormId id{};
+        if (tall::resolve(args, Format == packed::MatrixFormat::nvfp4, detail::shared_budget(), id))
             return detail::launch_tall<Format>(id, args, stream);
         if (args.schedule == view::Schedule::tall) return cudaErrorInvalidValue;
     }

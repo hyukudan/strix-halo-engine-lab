@@ -34,6 +34,9 @@ memory_gib = 64               # RAM del host que las rutas pueden planificar (op
 Cualquier valor del perfil se puede sustituir en la entrada: `memory_gib = 30` (un presupuesto menor),
 `bandwidth_gbytes_ps`, `units`. `profile = "custom"` toma todos los valores de la entrada (`memory_gib` obligatorio).
 
+El núcleo residente HIP ofrece la aritmética FP16 con escala por grupo como selección explícita. El barrido FP32
+es la opción predeterminada. La declaración solo selecciona el esquema de ejecución para la forma FP16.
+
 Una entrada GPU puede declarar también los puntos de cambio de las rutas residentes de proyección de bajo bit
 (q4_g64 / q6_g64) medidos en ese dispositivo: `lowbit_rows = { small_rows = 64, wide_panels = 64 }` (los valores
 medidos en un Strix Halo, gfx1151 con 40 CU, con el fixture sin modelo `strix-hip-dense-lowbit-bench`). Los

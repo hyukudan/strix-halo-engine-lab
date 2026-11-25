@@ -280,6 +280,10 @@ struct Result {
     double prefill_host_ms = 0;
     // PREFILL_BATCH: this request's chunks that shared a prefill call with other streams, and the widest such call.
     std::uint64_t prefill_batched_calls = 0, prefill_batch_streams = 0;
+    // Executed, not scheduled: the most streams whose decode rows one forward_rows pass carried with this request's,
+    // and this request's decode passes that ran in a step where another stream executed a prefill_rows call
+    // (receipt fields with STRIX_G4_LOGITS_DIGEST=1 only).
+    std::uint64_t decode_pass_streams_max = 0, decode_beside_prefill_calls = 0;
 };
 const char* status_name(Status status);
 

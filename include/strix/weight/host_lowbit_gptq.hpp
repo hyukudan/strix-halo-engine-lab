@@ -196,7 +196,7 @@ inline EncodeStatus encode_rows(const float* w, std::size_t n, std::size_t k, st
                 if (in_block % Storage::group == 0U) {
                     int scratch[Storage::group];
                     auto& bits = scales[r * Storage::groups + group];
-                    if (encode_group<Storage>(row + i, scratch, bits, opt.importance ? opt.importance + i : nullptr) !=
+                    if (lowbit::detail::encode_group<Storage>(row + i, scratch, bits, opt.importance ? opt.importance + i : nullptr) !=
                         EncodeStatus::ok) {
                         failed[b] = 1;
                         return;

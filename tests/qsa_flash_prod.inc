@@ -18,6 +18,7 @@
 #include <hip/hip_fp16.h>
 #include "../src/hip_rounded_stage_image.hpp"
 #include "../src/attn_core/selected_flash_prefill.hpp"
+#include "../src/attn_core/select_radix3.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -69,6 +70,8 @@ template <SmallWeightKind Kind> __device__ float load_small_weight(const void* w
 // ---- verbatim production kernels (hip_indexed_attention_launcher.hip) ----
 constexpr std::uint32_t kSelectThreads = 1024;
 constexpr std::uint32_t kSelectWaves = kSelectThreads / 32U;
+// hip_qsa_prefill_flash.inc names the shared Radix3 select schedule through this alias, as the launcher does.
+namespace radix3 = strix::attn_core::select::radix3;
 __device__ __forceinline__ std::uint32_t select_key(float value) {
     auto bits = __float_as_uint(value);
     if ((bits & 0x7fffffffU) == 0) bits = 0;

@@ -2,6 +2,7 @@
 
 #include "strix/engine_profile.hpp"
 #include "strix/model_description.hpp"
+#include "strix/profile/multi_device.hpp"
 #include "strix/serve/json.hpp"
 
 #include <filesystem>
@@ -15,15 +16,25 @@ struct ModelPreset {
     Name levers;
     std::string kv;
     serve::Json config;
+    multi_device::Decision placement;   // also config["multi_device"]
 
     void append_options(std::vector<std::string>& args) const;
 };
 
 [[nodiscard]] std::string_view tier_word(Name);
 [[nodiscard]] Name parse_tier(std::string_view);
+// `placement` carries --device-count / --placement (its tier is replaced by the resolved tier). Every launcher (CLI, server,
+// replica router) passes the same query so the effective "multi_device" member is identical for the same request.
+// The preset is inspection: a launcher that executes it first calls multi_device::admit(preset.placement, its executor).
 [[nodiscard]] ModelPreset resolve_model_preset(const model_description::ModelDescription&,
-                                               std::optional<Name>, std::string_view backend);
+                                               std::optional<Name>, std::string_view backend,
+                                               const multi_device::Query& placement = {});
 [[nodiscard]] serve::Json description_json(const model_description::Value&);
+// The replica router's admission through the same resolver: `replicas` whole-model endpoints must resolve the
+// model's replica form (else std::invalid_argument with the rule and reason). The result's
+// config["multi_device"] is what CLI / serve print for --device-count N with the same tier.
+[[nodiscard]] ModelPreset resolve_replica_router(const model_description::ModelDescription&, std::optional<Name>,
+                                                 std::uint32_t replicas, bool explicit_replica = false);
 
 struct ModelLaunch {
     std::string asset, backend;

@@ -89,6 +89,7 @@ struct Channel {
     std::mutex mutex;
     std::condition_variable ready;
     std::deque<std::vector<std::byte>> messages;
+    bool closed = false;
 };
 class MemoryTransport final : public Transport {
 public:
@@ -96,14 +97,16 @@ public:
     void send(std::span<const std::byte> message) override {
         {
             std::lock_guard lock(out_->mutex);
+            if (out_->closed) fail("in-process channel closed");
             out_->messages.emplace_back(message.begin(), message.end());
         }
         out_->ready.notify_one();
     }
     void receive(std::span<std::byte> message) override {
         std::unique_lock lock(in_->mutex);
-        if (!in_->ready.wait_for(lock, std::chrono::seconds(30), [&] { return !in_->messages.empty(); }))
+        if (!in_->ready.wait_for(lock, std::chrono::seconds(30), [&] { return in_->closed || !in_->messages.empty(); }))
             fail("in-process receive timed out");
+        if (in_->closed) fail("in-process channel closed");
         auto front = std::move(in_->messages.front());
         in_->messages.pop_front();
         if (front.size() != message.size()) fail("in-process message size differs from the expected size");
@@ -114,6 +117,15 @@ public:
         receive(in);
     }
     [[nodiscard]] std::string name() const override { return "memory"; }
+    [[nodiscard]] bool supports_peer_abort() const noexcept override { return true; }
+    void abort(const std::string&) override {
+        {
+            std::scoped_lock lock(out_->mutex, in_->mutex);
+            out_->closed = in_->closed = true;
+        }
+        out_->ready.notify_all();
+        in_->ready.notify_all();
+    }
 
 private:
     std::shared_ptr<Channel> out_, in_;
@@ -767,6 +779,7 @@ private:
     }
 
 public:
+    [[nodiscard]] bool supports_peer_abort() const noexcept override { return true; }
     void abort(const std::string& why) override {
         {
             std::lock_guard lock(root_mutex_);
@@ -1365,6 +1378,11 @@ public:
         }
     }
     [[nodiscard]] std::string name() const override { return "tcp"; }
+    [[nodiscard]] bool supports_peer_abort() const noexcept override { return true; }
+    void abort(const std::string&) override {
+        // Wake both directions and leave the descriptor owned until the worker has joined.
+        (void)::shutdown(fd_, SHUT_RDWR);
+    }
 
 private:
     void wait_for(short events, const char* what) const {

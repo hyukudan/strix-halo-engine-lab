@@ -10,6 +10,11 @@
 //   Weights, once at load, from the IU4 g64 pack (core/iu4.hpp layout, dense_linear_iu4.hpp:150): per column n and
 //     block of kBlock = 128 inputs: dequantise (q * fp16 scale, exact in FP32), fwht128, step = a4_step_f(amax),
 //     code = a4_code_f. Output: the same tile layout as the pack (codes) + FP32 steps [N][K/128].
+//     Weight rule trait (WeightRule): `amax` is the rule above (contract v1). `mse_clip` (contract v2) takes, among the
+//     clip candidates step_i = a4_step_f(amax * a4_clip_ratio(i)), i = 0..kA4ClipSteps-1 (ratio 1.00 down to 0.60),
+//     the first one with the least block error sum_k (y_k - step_i * code_i(y_k))^2 (FP32, ascending k, no
+//     contraction; a NaN error keeps candidate 0). Load time only: the codes keep [-7, 7], the dot and every kernel
+//     are unchanged; only the weight image bits differ. Each binder names its rule (v1 stays the default).
 //   Dot (bit-defined; the kernel performs exactly these operations):
 //     C = cumulative integer dot over k (never reset; |C| <= K * 49 < 2^23 for K <= kMaxInputs);
 //     per block b: t = lead_b * C_before_b + sum_{g in b} e_g * C_after_g, where e_g = u_g - u_{g+1} (u past the
@@ -35,6 +40,11 @@
 
 namespace strix::core::iu4a4_rot {
 inline constexpr const char* kIdentity = "dense-iu4a4-rot-v1";
+// Weight image rule (see the contract above): `amax` = v1 (the default of every binder), `mse_clip` = v2.
+enum class WeightRule : std::uint8_t { amax = 1, mse_clip = 2 };
+inline constexpr const char* identity(WeightRule rule) {
+    return rule == WeightRule::mse_clip ? "dense-iu4a4-rot-v2" : kIdentity;
+}
 inline constexpr unsigned kBlock = 128;   // Hadamard block = weight group
 inline constexpr unsigned kGroupA = 32;   // activation group
 inline constexpr unsigned kGroupsPerBlock = kBlock / kGroupA;
@@ -109,28 +119,65 @@ STRIX_ROT_HD inline void put_code(std::uint8_t* packed, unsigned k, unsigned n, 
 
 // Weight side, one column n of one block b, from the g64 pack (codes + fp16 scales [N][K/64] as raw bits) into the
 // rotated pack (same tile layout) + FP32 step wstep[n * (K / kBlock) + b]. Load-time; host or one device thread.
+// Column order of a paired (gate / up) weight image: rotated column n holds source row half * pair_rows + 16 (n / 32) +
+// n % 16 with half = (n / 16) % 2, pair_rows = the rows of one half (so 16-column tiles alternate gate, up of the same
+// outputs and a paired epilogue meets both in one lane).
+STRIX_ROT_HD inline unsigned paired_column(unsigned n, unsigned pair_rows) {
+    return ((n / 16U) % 2U) * pair_rows + 16U * (n / 32U) + n % 16U;
+}
 // requantise_codes writes the codes and returns the step (a device kernel stores it in its own layout).
-STRIX_ROT_HD inline float requantise_codes(const std::uint8_t* src, const std::uint16_t* src_scales, unsigned in, unsigned outputs,
-                                          unsigned n, unsigned b, std::uint8_t* dst) {
+// requantise_values is the rule for any FP32 source: value(i) = input b * kBlock + i of the source column that becomes
+// rotated column n of `dst` (a source may map n to another stored row, e.g. an interleaved gate/up image).
+// The step of one rotated block under `rule` (contract above): amax / 7, or the least-error clip candidate.
+STRIX_ROT_HD inline float weight_step(const float (&v)[kBlock], WeightRule rule) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    float amax = 0.0f;
+    for (unsigned i = 0; i < kBlock; ++i) amax = a4_tiles::fabs_(v[i]) > amax ? a4_tiles::fabs_(v[i]) : amax;
+    float step = integer_math::a4_step_f(amax);
+    if (rule != WeightRule::mse_clip) return step;
+    float best = 0.0f;
+    for (unsigned c = 0; c < integer_math::kA4ClipSteps; ++c) {
+        const float s = integer_math::a4_step_f(amax * integer_math::a4_clip_ratio(c));
+        float err = 0.0f;
+        for (unsigned i = 0; i < kBlock; ++i) {
+            const float d = v[i] - s * static_cast<float>(integer_math::a4_code_f(v[i], s));
+            err += d * d;
+        }
+        if (c == 0U || err < best) {  // strict: the first (widest) candidate wins a tie; a NaN error never wins
+            best = err;
+            step = s;
+        }
+    }
+    return step;
+}
+template <class Value>
+STRIX_ROT_HD inline float requantise_values(const Value& value, unsigned b, unsigned n, unsigned outputs, std::uint8_t* dst,
+                                            WeightRule rule = WeightRule::amax) {
 #if defined(__clang__)
 #pragma clang fp contract(off)
 #endif
     float v[kBlock];
-    for (unsigned i = 0; i < kBlock; ++i) {
-        const unsigned k = b * kBlock + i;
-        const float s = onfly::f16_bits_to_f32(src_scales[std::size_t(n) * (in / 64U) + k / 64U]);
-        v[i] = static_cast<float>(pack_code(src, k, n, outputs)) * s;
-    }
+    for (unsigned i = 0; i < kBlock; ++i) v[i] = value(i);
     a4_tiles::fwht128(v);
-    float amax = 0.0f;
-    for (unsigned i = 0; i < kBlock; ++i) amax = a4_tiles::fabs_(v[i]) > amax ? a4_tiles::fabs_(v[i]) : amax;
-    const float step = integer_math::a4_step_f(amax);
+    const float step = weight_step(v, rule);
     for (unsigned i = 0; i < kBlock; ++i) put_code(dst, b * kBlock + i, n, outputs, integer_math::a4_code_f(v[i], step));
     return step;
 }
+STRIX_ROT_HD inline float requantise_codes(const std::uint8_t* src, const std::uint16_t* src_scales, unsigned in, unsigned outputs,
+                                          unsigned n, unsigned b, std::uint8_t* dst, WeightRule rule = WeightRule::amax) {
+    const auto value = [&](unsigned i) {
+        const unsigned k = b * kBlock + i;
+        const float s = onfly::f16_bits_to_f32(src_scales[std::size_t(n) * (in / 64U) + k / 64U]);
+        return static_cast<float>(pack_code(src, k, n, outputs)) * s;
+    };
+    return requantise_values(value, b, n, outputs, dst, rule);
+}
 STRIX_ROT_HD inline void requantise_block(const std::uint8_t* src, const std::uint16_t* src_scales, unsigned in, unsigned outputs,
-                                         unsigned n, unsigned b, std::uint8_t* dst, float* wstep) {
-    wstep[std::size_t(n) * (in / kBlock) + b] = requantise_codes(src, src_scales, in, outputs, n, b, dst);
+                                         unsigned n, unsigned b, std::uint8_t* dst, float* wstep,
+                                         WeightRule rule = WeightRule::amax) {
+    wstep[std::size_t(n) * (in / kBlock) + b] = requantise_codes(src, src_scales, in, outputs, n, b, dst, rule);
 }
 
 // The bit-defined dot of one output (row codes/u/base, rotated column n of the requantised pack).

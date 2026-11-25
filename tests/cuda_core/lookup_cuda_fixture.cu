@@ -1,4 +1,5 @@
 #include "lookup_cases.hpp"
+#include "cuda/core/lookup_cuda.cuh"
 
 #include "cuda/models/minimax/mm_rtx_kernels.cuh"
 #include "cuda/weight/arch/sm120_sources.cuh"

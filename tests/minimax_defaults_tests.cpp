@@ -223,9 +223,9 @@ void test_off_switches() {
             if (cli.app == "rank") {
                 std::size_t diff = 0;
                 for (const auto& l : off_lines) if (!l.starts_with("session_")) diff += on_lines.count(l) == 0 ? 1 : 0;
-                // The linear order also prints its request / effective inspection and names its cache identity, so its
-                // off form changes those three lines too.
-                const std::size_t want = std::strcmp(it.env, "STRIX_MMX_PF_ORDER") == 0 ? 4 : 1;
+                // The linear order also prints its request / effective / batch-invariant inspection and names its cache
+                // identity, so its off form changes those four lines too.
+                const std::size_t want = std::strcmp(it.env, "STRIX_MMX_PF_ORDER") == 0 ? 5 : 1;
                 check(diff == want, std::string(it.env) + " off changes one rank line (plus inspection + identity for the order)");
             }
         }
@@ -623,12 +623,13 @@ void test_apply() {
     }
     char* argv2[] = {app, m, r0, tr, out};
     check(!md::print_or_apply("rank", 5, argv2), "print_or_apply without the flag");
-    // Both argv orders resolve OFF. --session-cache is the CLI form of ON.
+    // Both argv orders resolve OFF with an admissible serving order. --session-cache is the CLI form of ON.
     char baseline[] = "--baseline", cache[] = "--session-cache", on[] = "on";
     char* baseline_first[] = {app, m, baseline, cache, on};
     char* baseline_last[] = {app, m, cache, on, baseline};
     for (auto args : {baseline_first, baseline_last}) {
         (void)::unsetenv(md::kBaselineEnv);
+        (void)::setenv("STRIX_MMX_PF_ORDER", "invariant", 1);
         check(!md::print_or_apply("serve", 5, args), "baseline ordinary startup");
         auto config = md::session_config(md::Cli{}, [](const char* key) { return std::getenv(key); }, 100ULL << 30);
         check(!config.enabled && config.reason == "baseline", "--baseline wins in either argv order");
@@ -637,7 +638,10 @@ void test_apply() {
             []() -> std::unique_ptr<int> { throw std::runtime_error("must not initialize"); },
             [&](const std::string& line) { log = line; });
         check(!runtime && log == "session cache: off (baseline)", "--baseline continues ordinary serving");
+        const char* order = std::getenv("STRIX_MMX_PF_ORDER");
+        check(order != nullptr && std::strcmp(order, "invariant") == 0, "explicit invariant order survives baseline startup");
     }
+    (void)::unsetenv(md::kBaselineEnv);
 }
 
 // TURBO product profile: '--profile turbo' of rank and serve (exported as STRIX_MM_PRODUCT_PROFILE by print_or_apply)
@@ -722,16 +726,81 @@ void test_fast_prefill_profile() {
               "fast profile: plain invocation runs nothing");
         // The chunk-invariant linear order is the table default (pf_order): a plain invocation names it; the
         // baseline switch and the explicit off form keep the legacy (empty) identity.
-        check(md::prefill_identity(lookup(off)) == "prefill_order=mmx-pf-linear-s1-v1" && md::linear_order(lookup(off)) == "invariant",
+        check(md::prefill_identity(lookup(off)) == kOrderId && md::linear_order(lookup(off)) == "invariant",
               "fast profile: plain cache identity names the default invariant order");
         const EnvMap base{{md::kBaselineEnv, "1"}};
         check(md::prefill_identity(lookup(base)).empty() && md::linear_order(lookup(base)) == "adaptive",
               "linear order: baseline restores the adaptive order and the legacy cache identity");
         EnvMap inv{{"STRIX_MMX_PF_ORDER", "invariant"}}, ada{{"STRIX_MMX_PF_ORDER", "adaptive"}};
-        check(md::prefill_identity(lookup(inv)) == "prefill_order=mmx-pf-linear-s1-v1" && md::linear_order(lookup(inv)) == "invariant",
+        check(md::prefill_identity(lookup(inv)) == kOrderId && md::linear_order(lookup(inv)) == "invariant",
               "linear order: invariant names its cache identity");
         check(md::prefill_identity(lookup(ada)).empty() && md::linear_order(lookup(ada)) == "adaptive",
               "linear order: adaptive keeps the legacy cache identity");
+        // Dense MLP tails on the fixed order are an explicit lever with their own identity; the default keeps v1.
+        check(!md::dense_tail_fixed(lookup(off)) && md::invariant_order_id(lookup(off)) == std::string(md::kInvariantOrderId),
+              "dense tail: the default keeps the library tails (v1)");
+        const EnvMap tail{{"STRIX_MM_PF_DENSE_TAIL_FIXED", "1"}};
+        check(md::prefill_identity(lookup(tail)) == "prefill_order=mmx-pf-linear-s1-v2",
+              "dense tail: the opt-in names its cache identity");
+        for (const char* app : {"rank", "serve"})
+            check(md::effective_config(md::parse_cli(app, {}), lookup(tail))
+                          .find("STRIX_MMX_PF_ORDER.scope=exl3-prefill-k-order:q/k/v/o,routed/shared/dense-gate/up/down\n") !=
+                      std::string::npos,
+                  std::string("dense tail: the opt-in scope is printed by ") + app);
+        // The opt-in exists only inside the invariant order and outside the FP32 prefill identity: every reader
+        // (cache identity, effective config of rank and serve) refuses instead of stamping v2 on another route.
+        for (const EnvMap& bad : {EnvMap{{"STRIX_MM_PF_DENSE_TAIL_FIXED", "1"}, {"STRIX_MMX_PF_ORDER", "adaptive"}},
+                                  EnvMap{{"STRIX_MM_PF_DENSE_TAIL_FIXED", "1"}, {md::kBaselineEnv, "1"}},
+                                  EnvMap{{"STRIX_MM_PF_DENSE_TAIL_FIXED", "1"}, {"STRIX_MM_PREFILL_IDENTITY", "fp32"}}}) {
+            for (const char* app : {"rank", "serve"}) {
+                bool rejected = false;
+                try { (void)md::effective_config(md::parse_cli(app, {}), lookup(bad)); }
+                catch (const std::invalid_argument& e) {
+                    rejected = std::string(e.what()).find("STRIX_MM_PF_DENSE_TAIL_FIXED=1") != std::string::npos;
+                }
+                check(rejected, std::string("dense tail: conflicting order / FP32 identity refused by ") + app);
+            }
+            bool rejected = false;
+            try { (void)md::prefill_identity(lookup(bad)); } catch (const std::invalid_argument&) { rejected = true; }
+            check(rejected, "dense tail: no v2 cache identity for a conflicting order / FP32 identity");
+            // The shared resolution itself is the one authority: it refuses, so dispatch, fingerprint and rank
+            // agreement can never record an explicit ON beside a route that does not run it.
+            for (const bool via_dispatch : {false, true}) {
+                bool refused = false;
+                try {
+                    if (via_dispatch) (void)md::dense_tail_fixed(lookup(bad));
+                    else (void)md::profile_resolution(lookup(bad));
+                } catch (const std::invalid_argument& e) {
+                    refused = std::string(e.what()).find("STRIX_MM_PF_DENSE_TAIL_FIXED=1") != std::string::npos;
+                }
+                check(refused, via_dispatch ? "dense tail: the dispatch reader refuses a conflicting request"
+                                            : "dense tail: the shared resolution refuses a conflicting request");
+            }
+        }
+        for (const char* junk : {"2", "on"}) {
+            bool refused = false;
+            try { (void)md::profile_resolution(lookup(EnvMap{{"STRIX_MM_PF_DENSE_TAIL_FIXED", junk}})); }
+            catch (const std::invalid_argument&) { refused = true; }
+            check(refused, std::string("dense tail: the resolution refuses value '") + junk + "'");
+        }
+        // The lever is a row of the shared profile table: resolved, fingerprinted and agreed by both ranks when ON.
+        {
+            const auto pr = md::profile_resolution(lookup(tail));
+            const auto* row = pr.find("pf_dense_tail_fixed");
+            check(row != nullptr && row->value == "1" && row->status == strix::profile::Status::explicit_env &&
+                      fp(tail) != none_fp,
+                  "dense tail: explicit row of the shared profile table, part of the agreement fingerprint");
+            check(md::dense_tail_fixed(lookup(tail)), "dense tail: the dispatch reader returns the resolved ON row");
+            const auto off_pr = md::profile_resolution(lookup(off));  // keep the resolution alive while its row is read
+            const auto* off_row = off_pr.find("pf_dense_tail_fixed");
+            check(off_row != nullptr && off_row->value == "0" && off_row->status == strix::profile::Status::builtin,
+                  "dense tail: default OFF builtin row");
+            const EnvMap zero{{"STRIX_MM_PF_DENSE_TAIL_FIXED", "0"}};
+            const auto zero_pr = md::profile_resolution(lookup(zero));
+            const auto* zero_row = zero_pr.find("pf_dense_tail_fixed");
+            check(zero_row != nullptr && zero_row->value == "0" && !md::dense_tail_fixed(lookup(zero)),
+                  "dense tail: explicit 0 resolves OFF");
+        }
         check(fp(off) == none_fp, "fast profile: rows at builtin leave the legacy fingerprint unchanged");
         for (const auto& e : md::profile_resolution(lookup(off)).entries)
             check(e.status == strix::profile::Status::builtin && e.value == e.lever->builtin, "fast profile: builtin row " + std::string(e.lever->name));

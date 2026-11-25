@@ -33,6 +33,9 @@ memory_gib = 64               # host RAM the routes may plan for (optional)
 Any profile value can be overridden in the entry: `memory_gib = 30` (a smaller budget), `bandwidth_gbytes_ps`,
 `units`. `profile = "custom"` takes every value from the entry (`memory_gib` required).
 
+The HIP resident core offers FP16 group-scaled arithmetic as an explicit form. The default is the FP32 sweep.
+The device declaration only schedules work after a caller selects the FP16 form.
+
 A GPU entry may also state the switch points of the low-bit (q4_g64 / q6_g64) resident projection routes measured on
 that device: `lowbit_rows = { small_rows = 64, wide_panels = 64 }` (the values measured on a Strix Halo, gfx1151 with
 40 CUs, by the no-model fixture `strix-hip-dense-lowbit-bench`). Launches of at most `small_rows` rows then run the

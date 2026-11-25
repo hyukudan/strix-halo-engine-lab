@@ -1,3 +1,4 @@
+#include "strix/ds41_dense_geometry.hpp"
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
 #include "strix/hip_check.hpp"
@@ -22,6 +23,7 @@
 #include "strix/hip_ds41_formats.hpp"
 #include "engram/hip/inject_kernel.hpp"  // shared Engram injection kernel (folded form)
 #include "ops/glu/glu_device.hpp"
+#include "ops/a8/a8_group_device.hpp"  // a8g32-v1 group scale / code (shared device steps)
 #include "ops/rope/rope_device.hpp"      // shared RoPE op (enqueue_rope binds Round::none)
 
 #include <hip/hip_fp16.h>
@@ -115,9 +117,10 @@ __device__ __forceinline__ void site_copies(auto sub, const float* __restrict__ 
 __device__ inline void a8_group(float y, unsigned l, std::int8_t* code, float* delta, std::int32_t* sum) {
     float amax = fmaxf(0.0F, fabsf(y));
     for (int d = 16; d; d >>= 1) amax = fmaxf(amax, __shfl_xor(amax, d, wave));
-    const bool tiny = amax > 0.0F && amax < 0x1p-119F;
-    const float dl = amax == 0.0F || tiny ? 1.0F : amax / 127.0F;
-    float rounded = tiny ? 0.0F : __builtin_rintf(y / dl);
+    const auto scale = strix::ops::a8::group_scale(amax);
+    const float dl = scale.delta;
+    // the clamp stays in the select form: the min/max form of code_of schedules this kernel differently (same value for every input)
+    float rounded = scale.tiny ? 0.0F : __builtin_rintf(y / dl);
     rounded = -127.0F < rounded ? rounded : -127.0F;  // std::max(-127, rounded)
     rounded = rounded < 127.0F ? rounded : 127.0F;    // std::min(127, .)
     const int c = static_cast<int>(rounded);
@@ -430,9 +433,10 @@ __device__ __forceinline__ void site_a8_group(float y, unsigned l, std::int8_t* 
     amax = fmaxf(amax, site_xor<4>(amax));
     amax = fmaxf(amax, site_xor<2>(amax));
     amax = fmaxf(amax, site_xor<1>(amax));
-    const bool tiny = amax > 0.0F && amax < 0x1p-119F;
-    const float dl = amax == 0.0F || tiny ? 1.0F : amax / 127.0F;
-    float rounded = tiny ? 0.0F : __builtin_rintf(y / dl);
+    const auto scale = strix::ops::a8::group_scale(amax);
+    const float dl = scale.delta;
+    // the clamp stays in the select form: the min/max form of code_of schedules this kernel differently (same value for every input)
+    float rounded = scale.tiny ? 0.0F : __builtin_rintf(y / dl);
     rounded = -127.0F < rounded ? rounded : -127.0F;  // std::max(-127, rounded)
     rounded = rounded < 127.0F ? rounded : 127.0F;    // std::min(127, .)
     const int c = static_cast<int>(rounded);
@@ -1594,11 +1598,10 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
                     const float x0 = ys[rt * OT + 2U * g], x1 = ys[rt * OT + 2U * g + 1U];
                     float amax = fmaxf(fabsf(x0), fabsf(x1));
                     for (int stride = 8; stride; stride /= 2) amax = fmaxf(amax, __shfl_xor(amax, stride, 16));
-                    const bool tiny = amax > 0.0F && amax < 0x1p-119F;
-                    const float dl = amax == 0.0F || tiny ? 1.0F : amax / 127.0F;
-                    const float rounded0 = tiny ? 0.0F : rintf(x0 / dl), rounded1 = tiny ? 0.0F : rintf(x1 / dl);
-                    const int c0 = static_cast<int>(fminf(127.0F, fmaxf(-127.0F, rounded0)));
-                    const int c1 = static_cast<int>(fminf(127.0F, fmaxf(-127.0F, rounded1)));
+                    const auto scale = strix::ops::a8::group_scale(amax);
+                    const float dl = scale.delta;
+                    const int c0 = strix::ops::a8::code_of(x0, scale);
+                    const int c1 = strix::ops::a8::code_of(x1, scale);
                     int sum = c0 + c1;
                     for (int stride = 8; stride; stride /= 2) sum += __shfl_xor(sum, stride, 16);
                     const unsigned r = r0 + rt * 16U + 2U * w + (l >> 4U), o = o0 + g * 32U;
@@ -2543,8 +2546,8 @@ static EngramWideFlag& engram_wide_flag(void* stream) {
 }
 
 bool engram_f16_pf_supported(const F16RowsView& v) noexcept {
-    return v.weight && !v.weight_f8 && v.x && v.out && v.width == 6144U && v.count == 25600U && v.first == 0U && v.rows >= 32U &&
-           v.rows <= 8192U && v.x_stride >= v.width && v.x_stride % 4U == 0U && v.out_stride >= v.count &&
+    return v.weight && !v.weight_f8 && v.x && v.out && core::dense_sites::engram_prefill_shape(dense_geometry::kGeometry, dense_geometry::kPolicy, v.width, v.count, v.first, v.rows) &&
+           v.x_stride >= v.width && v.x_stride % 4U == 0U && v.out_stride >= v.count &&
            (reinterpret_cast<std::uintptr_t>(v.x) & 15U) == 0U && (reinterpret_cast<std::uintptr_t>(v.weight) & 15U) == 0U;
 }
 
@@ -3361,13 +3364,8 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
         // buffer limit take the Lean 0 form of the same tile.
         const bool lean_ok = static_cast<std::size_t>(v.rows) * v.x_stride < 0x7fffffffULL &&
                              static_cast<std::size_t>(v.count) * ((v.row_width ? v.row_width : v.width) / 32U * 34U) < 0x7fffffffULL;
-        unsigned pick = 0U;
-        if (v.rows >= 256U) {
-            if (v.width == 5120U && v.count <= 1536U) pick = v.rows >= 6144U ? 914U : 814U;
-            else if (v.width <= 1536U && v.count >= 4096U) pick = 814U;
-            else if (v.width == 4096U && v.count == 1024U) pick = v.rows >= 512U ? 914U : 822U;
-            else if (v.row_width == 8192U && v.width == 4096U) pick = 822U;
-        }
+        unsigned pick = core::dense_sites::tall_lean_pick(dense_geometry::kGeometry, dense_geometry::kPolicy, v.rows, v.width,
+                                                          v.count, v.row_width);
         // STRIX_DS41_DENSE_TALL_ROTATE=1 (exactness gates only): every call takes the next of 814 / 914 / 822 in turn,
         // whatever its shape, so one --reference run covers the three selector forms on every site
         static strix::lever_cache<bool> rotate_cache{[] {
@@ -3379,9 +3377,7 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
         if (rotate) pick = std::array<unsigned, 3>{814U, 914U, 822U}[turn.fetch_add(1U, std::memory_order_relaxed) % 3U];
         if (pick != 0U && !lean_ok) pick = pick == 914U ? 114U : pick == 822U ? 22U : 14U;
         tall = pick != 0U ? pick
-               : v.rows >= 3072U || (v.rows >= 2048U && v.count >= 1024U) ? 14U
-               : v.rows >= 256U && v.count >= 4096U && v.width >= 4096U  ? 12U
-                                                                          : 0U;
+               : core::dense_sites::tall_earlier_pick(dense_geometry::kPolicy, v.rows, v.width, v.count);
     }
     // STRIX_DS41_DENSE_STATS=1 (diagnostics): calls and rows per (form, width, count, row_width), printed at exit
     static strix::lever_cache<bool> stats_cache{[] {

@@ -183,6 +183,7 @@ int main(int argc, char** argv) {
         std::ofstream report;
         if (!args.report.empty()) {
             report.open(args.report, std::ios::trunc);
+            if (!report) throw std::runtime_error("cannot open report " + args.report);
             report << "tensor\tinput\tcal_rows\teval_rows\tformat\ttechnique\trel_error\tselected\n";
         }
         wei::LowbitPackWriter writer(checkpoint);
@@ -261,7 +262,7 @@ int main(int argc, char** argv) {
                     const bool chosen = b == bits && tech == args.technique;
                     if (b == bits && tech == Technique::rtn) total_rtn += err.error;
                     if (chosen) total_sel += err.error;
-                    if (report)
+                    if (!args.report.empty())
                         report << t->name << '\t' << input_name << '\t' << input->rows << '\t' << held->rows << "\tq" << b
                                << '\t' << technique_name(tech) << '\t' << err.relative() << '\t' << (chosen ? 1 : 0) << '\n';
                     if (chosen && !args.out.empty()) {
@@ -274,6 +275,10 @@ int main(int argc, char** argv) {
                 }
             }
             std::cerr << input_name << " (" << tensors.size() << " matrices, K " << k << ") " << seconds_since(t1) << " s\n";
+        }
+        if (!args.report.empty()) {
+            report.close();
+            if (!report) throw std::runtime_error("cannot finish report " + args.report);
         }
         if (!args.out.empty())
             if (const auto status = writer.write(args.out); !status) throw std::runtime_error("write pack: " + status.detail);

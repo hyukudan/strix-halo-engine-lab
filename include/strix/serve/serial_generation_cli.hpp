@@ -141,6 +141,7 @@ struct SerialGenerationOptions {
     bool packed_decode{};
     bool generate_requested{}, sampling_requested{};
     TokenSamplingPolicy sampling;
+    TokenSamplerOptions sampler_options;
     CliSpeculation speculation = CliSpeculation::off;
 };
 

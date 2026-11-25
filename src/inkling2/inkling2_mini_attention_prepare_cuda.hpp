@@ -2,6 +2,7 @@
 
 #include "core/bf16_lm_head.hpp"
 #include "inkling2_mini_attention_prepare_device.hpp"
+#include "inkling2_mini_attention_operands.hpp"
 #include "inkling2_mini_dense_cuda.hpp"
 
 namespace strix::inkling2 {
@@ -19,11 +20,26 @@ struct MiniPreparedCudaBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGq
     static constexpr auto invalid = cudaErrorInvalidValue;
     cuda_core::DenseArith arithmetic;
     cuda_core::BigCtx* big_context = nullptr;
+    // Operand class of every linear() input. FP32 (the default) keeps each input's low bits (the raw prepare and
+    // output entries take caller FP32 rows). A caller whose producers round every input to BF16 declares bf16_exact:
+    // the resident backend, whose q/k/v groups read rmsnorm_bf16 outputs and whose output projection reads the BF16
+    // sigmoid-gated product; the shared BF16 rows entry then runs the tall chain on one plane with the same bits.
+    core::Bf16Operand operand = core::Bf16Operand::fp32;
+    int* planes_report = nullptr;  // receives the planes each linear() dispatch selected (qualification only)
+
+    bool linear_admitted(const float* input, unsigned width, unsigned rows,
+                         std::span<const MiniAttentionLinear> views) const {
+        return core::for_each_bf16_projection_group<cuda_core::kMaxBf16RowProjections>(views, true, [&](auto group) {
+            return cuda_core::detail::valid_bf16_dense_row_group({input, width, group}, rows,
+                                                                arithmetic == cuda_core::DenseArith::mma3);
+        });
+    }
 
     Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
         return core::for_each_bf16_projection_group<cuda_core::kMaxBf16RowProjections>(views, success,
             [&](std::span<const MiniAttentionLinear> group) {
-                return enqueue_mini_cuda_dense_rows(input, width, rows, group, stream, arithmetic, big_context);
+                return enqueue_mini_cuda_dense_rows(input, width, rows, group, stream, arithmetic, big_context, operand,
+                                                  planes_report);
             });
     }
 
@@ -33,6 +49,21 @@ struct MiniPreparedCudaBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGq
     }
 };
 
+// The prompt route whose flash projects the relative bias (cuda_core::PreparedBf16Projection): the shared
+// preparation skips the [row][head][distance] image and its producer; the flash computes the same logits.
+struct MiniPreparedCudaProjectedBackend : MiniPreparedCudaBackend {
+    bool relative_bias_in_attention(unsigned) const { return true; }
+};
+
+// The resident decoder's attention backend: the one-plane operand class is declared only where the staged attention
+// weights are certified (finite, ranges kept finite); otherwise the FP32 class (three planes) runs.
+inline MiniPreparedCudaBackend mini_attention_backend(cudaStream_t stream, cuda_core::BigCtx* big_context,
+                                                      const MiniAttentionCertificate& certificate,
+                                                      int* planes_report = nullptr) {
+    return {{stream}, cuda_core::DenseArith::mma3, big_context, certificate.route(core::Bf16Operand::bf16_exact),
+            planes_report};
+}
+
 // The shared preparation issues all linear calls before the first round,
 // which consumes raw K. Retain the projection descriptors until that boundary.
 struct MiniPreparedCudaProjectionBatch : MiniPreparedCudaBackend {
@@ -41,6 +72,12 @@ struct MiniPreparedCudaProjectionBatch : MiniPreparedCudaBackend {
     mutable std::array<MiniAttentionLinear, core::rows::kMaxJobs> projections{};
     mutable std::array<cuda_core::Bf16DenseRowGroup, core::rows::kMaxJobs> groups{};
     mutable std::size_t projection_count = 0, group_count = 0;
+
+    bool linear_admitted(const float* input, unsigned width, unsigned rows,
+                         std::span<const MiniAttentionLinear> views) const {
+        return rows == row_count && views.size() <= projections.size() - projection_count &&
+               MiniPreparedCudaBackend::linear_admitted(input, width, rows, views);
+    }
 
     Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
         if (rows != row_count || views.size() > projections.size() - projection_count) return invalid;

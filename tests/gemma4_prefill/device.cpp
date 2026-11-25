@@ -446,8 +446,8 @@ void v2_tests() {
                 for (const auto precision : {pf::LinearPrecision::hilo, pf::LinearPrecision::hilo_k128})
                     v2_case(format, width, rows, 83, precision);
     }
-    // Production routes: outputs > 1024 select hilo_direct (unblocked) and,
-    // with K >= 8192 blocked, staged_hilo; 256 x 2560 is all full tiles.
+    // Production shapes on the shared hi/lo tall GEMM (one launch form for every
+    // shape); 256 x 2560 is all full tiles.
     struct Shape { unsigned width, rows, outputs; };
     for (const auto& shape : {Shape{2560, 256, 2560}, Shape{2560, 130, 1040}, Shape{10240, 130, 1040}})
         for (const auto precision : {pf::LinearPrecision::hilo, pf::LinearPrecision::hilo_k128})

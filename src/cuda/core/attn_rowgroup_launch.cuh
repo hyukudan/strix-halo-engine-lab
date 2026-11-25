@@ -2,15 +2,21 @@
 
 #include <cuda_runtime.h>
 
+#include "attn_core/rowgroup_plan.hpp"
 #include "attention_rowgroup.cuh"
-#include "attn_rowgroup_plan.hpp"
 
 #include <limits>
 #include <stdexcept>
 #include <string>
 
 namespace strix::cuda::core::rowgroup {
+
+// CUDA x/y limits for the flash grid (KV heads, tiles).
+inline constexpr GridLimits kFlashGridLimits{0x7fffffffU, 65535U};
+
 namespace detail {
+
+inline constexpr unsigned kUnionThreads = 256;
 
 template <LaunchPolicy P>
 __global__ __launch_bounds__(kUnionThreads) void rowgroup_union_kernel(P p, Union u) { union_body(p, u); }
@@ -57,7 +63,7 @@ template <LaunchPolicy P> void prepare_rowgroup() {
 template <LaunchPolicy P>
 void enqueue_rowgroup(P p, unsigned kv_heads, void* workspace, std::size_t bytes, cudaStream_t stream) {
     if (p.rows == 0U) return;
-    const auto plan = make_launch_plan<P>(p.rows, kv_heads);
+    const auto plan = make_launch_plan<P>(p.rows, kv_heads, kFlashGridLimits);
     if (!plan) throw std::invalid_argument("rowgroup launch grid is out of range");
     if (workspace == nullptr || bytes < workspace_bytes<P>(plan->tiles) ||
         reinterpret_cast<std::uintptr_t>(workspace) % alignof(std::uint32_t) != 0U)

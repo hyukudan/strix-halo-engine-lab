@@ -25,34 +25,49 @@ void launch_q8_tight_rows(dense_linear::View weights, const float* input, float*
             weights, weights, input, output, rows);
 }
 // The low-bit route plan bound to the current device (strix/device/lowbit_rows.hpp: the device gate binds the points
-// its declaration states); the empty plan
-// (one route) when nothing was bound or the device cannot be read.
+// its declaration states). When no plan is bound, the FP16 form uses the large tile at every row count.
 inline LowBitRowPlan current_lowbit_row_plan() {
     int dev = 0;
     return hipGetDevice(&dev) == hipSuccess ? bound_lowbit_row_plan(dev) : LowBitRowPlan{};
 }
 // Low-bit projections sharing one input: one launch of the planned route (both routes compute the same bits).
 template <class Storage, unsigned Capacity>
-hipError_t launch_lowbit_group(const float* input, unsigned rows, unsigned width,
-                               const f16_tile_gemm::Q8ProjectionGroup<Capacity>& group, hipStream_t stream) {
+row_transforms::Status launch_lowbit_group(const float* input, unsigned rows, unsigned width,
+                                           const f16_tile_gemm::Q8ProjectionGroup<Capacity>& group,
+                                           row_transforms::Stream stream) {
     const auto plan = current_lowbit_row_plan();
     if (plan_lowbit_rows(rows, plan) == LowBitRoute::small_tile)
         return f16_tile_gemm::small_m::gemm_lowbit<Storage>(
             input, rows, width, group, stream, lowbit_wide_block(rows, group.first_panel[group.count], plan));
     return f16_tile_gemm::gemm_lowbit_projections<Storage>(input, rows, width, group, stream);
 }
+template <weight_decode::Format Format>
+row_transforms::Status launch_lowbit_rows(dense_linear::View weights, const float* input, float* output,
+                                         unsigned rows, row_transforms::Stream stream) {
+    if (rows == 1U) launch_q8_tight_rows<1, Format>(weights, input, output, rows, stream);
+    else if (rows <= 2U) launch_q8_tight_rows<2, Format>(weights, input, output, rows, stream);
+    else if (rows <= 4U) launch_q8_tight_rows<4, Format>(weights, input, output, rows, stream);
+    else if (rows <= 8U) launch_q8_tight_rows<8, Format>(weights, input, output, rows, stream);
+    else launch_q8_tight_rows<16, Format>(weights, input, output, rows, stream);
+    return hipGetLastError();
+}
 }  // namespace detail
 #endif
 
-// Low-bit resident rows (q4_g64 / q6_g64), one launch of the real row count on the planned route (plan_lowbit_rows):
-// the small-M schedule or the 128-row projection tile, one arithmetic. HIP only today; the CUDA dense family has no
-// decoder for these storages.
+// HIP low-bit resident rows. Selecting f16_group_scale explicitly enables the two WMMA schedules.
 inline row_transforms::Status enqueue_resident_lowbit_rows(
     const weight::ResidentMatrixView& matrix, unsigned live_outputs, const float* input,
-    unsigned rows, float* output, row_transforms::Stream stream) {
-    if (!valid_resident_lowbit_rows(matrix, live_outputs, input, rows, output)) return row_transforms::invalid;
+    unsigned rows, float* output, row_transforms::Stream stream,
+    LowBitArithmetic arithmetic = LowBitArithmetic::fp32_sweep) {
+    if (!valid_resident_lowbit_rows(matrix, live_outputs, input, rows, output, arithmetic)) return row_transforms::invalid;
 #if defined(__HIPCC__)
     const auto width = static_cast<unsigned>(matrix.columns);
+    if (arithmetic == LowBitArithmetic::fp32_sweep) {
+        const dense_linear::View weights{matrix.bytes.data(), width, live_outputs, static_cast<std::size_t>(matrix.row_bytes)};
+        return matrix.storage == weight::kQ4G64WeightStorage
+                   ? detail::launch_lowbit_rows<weight_decode::Format::q4_g64>(weights, input, output, rows, stream)
+                   : detail::launch_lowbit_rows<weight_decode::Format::q6_g64>(weights, input, output, rows, stream);
+    }
     f16_tile_gemm::Q8ProjectionGroup<1> group{};
     group.append({matrix.bytes.data(), live_outputs, output});
     return matrix.storage == weight::kQ4G64WeightStorage
@@ -117,14 +132,16 @@ inline row_transforms::Status enqueue_resident_q8_rows(
 // (dispatch_resident_rows) runs it for every compact run before its first launch.
 template <unsigned Capacity>
 inline bool resident_q8_projections_admitted(const float* input, unsigned width, unsigned rows,
-                                             std::span<const ResidentRowProjection> projections) {
+                                             std::span<const ResidentRowProjection> projections,
+                                             [[maybe_unused]] LowBitArithmetic arithmetic = LowBitArithmetic::fp32_sweep) {
     if (projections.empty() || projections.size() > Capacity) return false;
     for (const auto& projection : projections) {
         const auto* matrix = std::get_if<weight::ResidentMatrixView>(&projection.weights);
         if (!matrix || matrix->columns != width || matrix->rows != projection.outputs) return false;
         const bool lowbit = matrix->storage == weight::kQ4G64WeightStorage || matrix->storage == weight::kQ6G64WeightStorage;
 #if defined(__HIPCC__)
-        if (lowbit ? !valid_resident_lowbit_rows(*matrix, projection.outputs, input, rows, projection.output)
+        if (lowbit ? arithmetic != LowBitArithmetic::f16_group_scale ||
+                         !valid_resident_lowbit_rows(*matrix, projection.outputs, input, rows, projection.output, arithmetic)
                    : !valid_resident_q8_rows(*matrix, projection.outputs, input, rows, projection.output))
             return false;
 #else
@@ -143,10 +160,11 @@ inline row_transforms::Status enqueue_resident_q8_projections(
 #if !defined(__HIPCC__)
     , cuda_core::BigCtx* context = nullptr
 #endif
+    , LowBitArithmetic arithmetic = LowBitArithmetic::fp32_sweep
 ) {
-    // Every descriptor is checked before anything is enqueued (a refused list writes nothing); a live prefix projects
-    // through the standalone entry.
-    if (!resident_q8_projections_admitted<Capacity>(input, width, rows, projections)) return row_transforms::invalid;
+    // Every descriptor is checked before submission. A live prefix uses the standalone entry.
+    if (!resident_q8_projections_admitted<Capacity>(input, width, rows, projections, arithmetic))
+        return row_transforms::invalid;
 #if defined(__HIPCC__)
     constexpr auto success = hipSuccess;
     // Runs of consecutive projections of one storage, in any order of storages: a low-bit run is one launch of its
@@ -165,7 +183,7 @@ inline row_transforms::Status enqueue_resident_q8_projections(
             for (const auto& projection : run)
                 group.append({std::get<weight::ResidentMatrixView>(projection.weights).bytes.data(), projection.outputs,
                               projection.output});
-            hipError_t status;
+            row_transforms::Status status;
             if (q4) status = detail::launch_lowbit_group<weight::Q4G64Storage>(input, rows, width, group, stream);
             else if (storage == weight::kQ6G64WeightStorage)
                 status = detail::launch_lowbit_group<weight::Q6G64Storage>(input, rows, width, group, stream);

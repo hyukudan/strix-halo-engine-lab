@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cuda/core/lookup_cuda.cuh"
+#include "core/lookup_plan.hpp"
 
 #include <array>
 #include <bit>

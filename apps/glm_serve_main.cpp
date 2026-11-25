@@ -861,6 +861,7 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::setvbuf(stderr, nullptr, _IONBF, 0);
     try {
+        const auto sampler_options = strix::validate_sampling_startup_environment();
         if (argc < 2) {
             std::fprintf(stderr, "usage: %s MODEL_DIR --world 1|2 [--rank R --transport T] [--slots S] [--capacity C] [--serial] "
                                  "[--host H] [--port P] [--profile default|fast|quality] [--deploy FILE|auto] [--deploy-check] [--prefix-cache-gib G] [--selftest N [--selftest-tokens M] [--selftest-prefix [--selftest-prefix-long L]]] "
@@ -1329,6 +1330,7 @@ int main(int argc, char** argv) {
         lc.prefill_units_admit = [&eng](std::uint64_t rows) { return eng.prefill_units_admit(rows); };
         lc.mtp = mtp_on;
         lc.sampling = sampling;
+        lc.sampler_options = sampler_options;
         lc.mtp_cycles = mtp_cycles;
         lc.g2 = g2_on;
         lc.kmax = eff.kmax;

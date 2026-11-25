@@ -5,6 +5,7 @@
 #include "inkling2_mini_media.hpp"
 #endif
 
+#include "inkling2/inkling2_mini_prefill_rows.hpp"
 #include "inkling2/inkling2_mini_resident_decoder.hpp"
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 #include "inkling2/inkling2_mini_program_cuda.hpp"
@@ -23,24 +24,17 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 
 namespace strix::inkling2::cli {
 
-// Prefill chunk rows. The logits are chunk-invariant (same bits for every chunk), so this is a schedule choice only.
-// gfx1151 (prose prompts, one chunk size per run, 2048 -> 8192 rows): 4K 3.47 -> 3.13 s, 8K 7.27 -> 6.23 s,
-// 16K 15.69 -> 14.06 s, 32K 35.6 -> 35.8 s. CUDA keeps 2048 rows until it is measured there.
-// Tail absorption (serve::prefill_tail_rows): a remainder of up to chunk / 8 rows rides in the final chunk. Every
-// chunk re-streams all expert weights of every layer, so a short tail chunk is weight-bound: gfx1151 8K prose
-// (8236 = 8192 + 44 rows) 5,021 -> 4,810 ms with one chunk, logits bitwise equal; equal halves (4160 + 4076) 5,069 ms.
-// The decoder admits only a tail that takes the same route forms in both schedules (inkling2::mini_prefill_tail_rows:
-// more rows than the key-split bound, chunk a multiple of the 16-position wave tile, enlarged chunk admitted by the
-// device); any other tail runs as its own chunk. CUDA keeps greedy chunks until it is measured there.
+// Prefill chunk rows and tail rule: the one schedule of the command line and the server (mini_prefill_schedule in
+// src/inkling2/inkling2_mini_schedule.hpp, with the STRIX_INKLING_PREFILL_TAIL switch). Its chunk is the declared rows
+// per backend and profile (inkling2::mini_cli_prefill_rows); the profile's own value is applied after parsing.
 #if defined(__HIPCC__)
-inline constexpr unsigned kMiniDefaultPrefillChunk = 8192U;
-inline constexpr unsigned kMiniPrefillTailDivisor = 8U;
+inline constexpr bool kMiniHipSchedule = true;
 #else
-inline constexpr unsigned kMiniDefaultPrefillChunk = 2048U;
-inline constexpr unsigned kMiniPrefillTailDivisor = 0U;
+inline constexpr bool kMiniHipSchedule = false;
 #endif
 
 class DeviceCliDecoder final : public serve::SerialGenerationDecoder {
@@ -48,10 +42,15 @@ public:
     DeviceCliDecoder(const serve::SerialGenerationLoad& load, bool step_graphs, weight::RoleStorage storage,
                      const char* dspark,
                      moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16,
-                     MiniLowBitRows lowbit = {})
+                     bool combine_image = false, bool prepared_round_fold = false, bool narrow_experts = false,
+                     bool controller_one_plane = false, bool attn_projected_bias = false, MiniLowBitRows lowbit = {})
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
-                   load.verify_rows, dspark != nullptr, 1U, load.prefill_tail, lowbit) {
-        decoder_.set_moe_w4a4(moe_w4a4);
+                   load.verify_rows, dspark != nullptr, 1U, load.prefill_tail, narrow_experts, controller_one_plane, false, lowbit),
+          projected_bias_(attn_projected_bias) {
+        const auto levers = configure_mini_decoder(decoder_, moe_w4a4, combine_image, prepared_round_fold, attn_projected_bias);
+        std::cerr << "Inkling down_image " << mini_down_image_name(levers.down_image, combine_image) << '\n';
+        std::cerr << "Inkling prepared_round_fold " << mini_round_fold_name(levers.prepared_round_fold, prepared_round_fold)
+                  << '\n';
         if (dspark) drafter_.emplace(decoder_, load.positions, dspark);
         // Calibration statistics (off unless STRIX_CALIB_MOMENTS=FILE): the prompt's attention / output-projection /
         // head input rows accumulate into strix/weight/calib_moments.hpp second moments, written after each prefill.
@@ -73,6 +72,10 @@ public:
             std::cerr << weight::calib::kMomentFileTag << " rows " << ids.size() << " inputs " << calibration_->inputs().size()
                       << " file " << calibration_path_ << '\n';
         }
+        // With the lever selected, the observed route: projected-bias appends submitted so far (0: every chunk declined
+        // or was not admissible, so the image route ran).
+        if (projected_bias_)
+            std::cerr << "Inkling attn_projected_bias dispatches " << decoder_.projected_attention_dispatches() << '\n';
         return next;
     }
 
@@ -104,18 +107,18 @@ private:
     std::optional<MiniResidentDSpark> drafter_;
     std::optional<weight::calib::MomentSet> calibration_;
     std::string calibration_path_;
+    bool projected_bias_ = false;
 };
 
-inline void run_gate(const char* checkpoint, const Options& options, const weight::WeightLoadPlan& weights,
-                     MiniLowBitRows lowbit
+inline void run_gate(const char* checkpoint, const Options& options, std::span<const session::HeadGateWindow> windows,
+                     weight::WeightLoadExtent extent, weight::WeightLoadPlan& weights,
+                     const weight::WeightLoadScope& scope
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                      , bool step_program, bool epilogue_fusion, unsigned latency_forms
 #endif
 ) {
     namespace fs = std::filesystem;
     const auto mode = *options.gate_mode;
-    const auto windows = session::read_head_gate_manifest(options.gate_manifest, mode, options.gate_rows,
-                                                          kMaxContext, kOutputVocabulary);
     const auto route_config = moe::route_tap_config_from_env();
     if (route_config.null_on)
         throw std::invalid_argument("use --gate-order-null for the Inkling evaluation-order null");
@@ -135,17 +138,23 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
     const fs::path out(options.gate_out);
     fs::create_directories(out);
     fs::create_directories(out / "log");
-    unsigned positions = 0;
-    for (const auto& window : windows) positions = std::max(positions, static_cast<unsigned>(window.ids.size()));
+    const auto positions = extent.context;
     const auto prefix_positions = mode == session::HeadGateMode::decode ? positions - options.gate_rows : positions;
     const auto max_rows = std::min(options.generation.prefill_chunk, prefix_positions);
     const auto load_start = session::CliClock::now();
-    MiniResidentDecoder decoder(checkpoint, positions, max_rows, options.generation.packed_decode,
-                                 options.step_graphs.value_or(MiniResidentBackend::default_step_graphs), weights.roles(),
-                                 0U, false, 1U, 0U, lowbit);
-    decoder.set_moe_w4a4(mini_moe_w4a4_class(options.tier));
-    if (mini_moe_w4a4(options.tier))
-        std::cerr << "strix-moe-w4a4 class " << moe_core::grouped_w4a4::identity(mini_moe_w4a4_class(options.tier)) << '\n';
+    auto resident = load_mini_weights(weights, options.tier.profile, options.weights, scope, extent,
+                                     [&](MiniLowBitRows lowbit) {
+        return std::make_unique<MiniResidentDecoder>(checkpoint, positions, max_rows, options.generation.packed_decode,
+            options.step_graphs.value_or(MiniResidentBackend::default_step_graphs), weights.roles(),
+            0U, false, 1U, 0U, mini_experts_nvfp4(options.tier),
+            mini_controller_one_plane(options.tier), false, std::move(lowbit));
+    });
+    auto& decoder = *resident;
+    cli::write_weight_load_plan(std::cerr, weights);
+    const auto levers = configure_mini_decoder(decoder, options.tier);
+    std::cerr << "Inkling down_image " << mini_down_image_name(levers.down_image, mini_combine_image(options.tier)) << '\n';
+    std::cerr << "Inkling prepared_round_fold "
+              << mini_round_fold_name(levers.prepared_round_fold, mini_prepared_round_fold(options.tier)) << '\n';
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
     std::optional<MiniCudaProgramDecoder> program;
     if (step_program) program.emplace(decoder, epilogue_fusion, mini_latency_forms(latency_forms));
@@ -214,7 +223,7 @@ static_assert(kLatencyFormsMix == kMiniFormsMix && kLatencyFormsMoe == kMiniForm
               kLatencyFormsAll == kMiniFormsAll && kMiniDefaultForms == kMiniFormsMix);
 
 using MiniCudaProgramLoad = std::unique_ptr<serve::SerialGenerationDecoder> (*)(const serve::SerialGenerationLoad&,
-                                                                                moe_core::grouped_w4a4::Activations);
+                                                                                moe_core::grouped_w4a4::Activations, bool, bool);
 
 // The exact R1 latency forms are a template parameter of the loader; map the CLI mask to its instance.
 inline MiniCudaProgramLoad select_mini_cuda_program(bool fuse, unsigned forms) {
@@ -246,7 +255,8 @@ int main(int argc, char** argv) {
     constexpr auto executable = "strix-inkling2-mini-cuda";
     // RTX PRO 6000, ink_cuda_opt p3 (128 tokens): with graphs, R1 ran at 58.1 vs 43.4 tok/s short and 45.2 vs 36.6 at 4K. Eager short was 44.3 vs 34.1.
 #endif
-    constexpr bool packed_decode_default = true;
+    // The one decode default of every entry point (strix-serve resolves the same flags to the same form).
+    constexpr bool packed_decode_default = kMiniPackedDecodeDefault;
     if (argc < 3) {
         std::cerr << "usage: " << executable
                   << " MODEL.safetensors (TOKEN [TOKEN ...] | --prompt TEXT | --messages FILE) [--tokenizer FILE]"
@@ -268,7 +278,8 @@ int main(int argc, char** argv) {
 #endif
                      "\n"
                      "       MODEL.safetensors --tokenize FILE [--tokenizer FILE]\n"
-                     "       --profile exact|fast|turbo (default exact) [--qualify-q8 | --no-weight-q8]\n";
+                     "       --profile exact|fast|turbo (default exact) [--qualify-q8 | --no-weight-q8]\n"
+                     "       --controller-planes 3|1 (default 3; 1 is a CUDA FAST/TURBO candidate)\n";
         return 2;
     }
     try {
@@ -276,14 +287,15 @@ int main(int argc, char** argv) {
             executable, "Inkling 2 Mini", "MODEL.safetensors",
             kVocabulary, kOutputVocabulary, kMaxContext, kMiniEosToken,
             {},
-            strix::inkling2::cli::kMiniDefaultPrefillChunk, true, true,
+            // The parse default; the profile's own value is applied after parsing (mini_cli_prefill_rows).
+            mini_prefill_schedule(strix::inkling2::cli::kMiniHipSchedule, strix::profile::Name::standard).chunk, true, true,
             [](const std::string& path) {
                 return serve::BpeTokenizer::load_hf_json(path, serve::inkling2_mini_tokenizer_identity);
             },
             packed_decode_default, serve::render_inkling2_chat_request, true};
-        // Off switch: STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks (same logits).
+        // The served schedule's resolver (STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks on both entry points).
         family.prefill_tail_divisor =
-            strix::env_flag_default_on("STRIX_INKLING_PREFILL_TAIL") ? strix::inkling2::cli::kMiniPrefillTailDivisor : 0U;
+            mini_prefill_schedule_from_env(strix::inkling2::cli::kMiniHipSchedule, strix::profile::Name::standard).tail_divisor;
 #if defined(STRIX_INKLING2_MEDIA)
         family.media = cli::open_mini_media;
         family.render_media_messages = serve::render_inkling2_chat_media_request;
@@ -291,18 +303,35 @@ int main(int argc, char** argv) {
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         std::vector<char*> arguments(argv, argv + argc);
         const auto program_options = cli::extract_step_program(arguments);
-        auto options = cli::parse(static_cast<int>(arguments.size()), arguments.data(), family);
+        auto options = cli::parse(static_cast<int>(arguments.size()), arguments.data(), family, kMiniBuildBackend);
 #else
-        auto options = cli::parse(argc, argv, family);
+        auto options = cli::parse(argc, argv, family, kMiniBuildBackend);
 #endif
-        const auto scope = mini_weight_scope(argv[1], options.tier.profile, options.weights);
-        std::string pack_note;
-        std::shared_ptr<const strix::weight::LowbitPack> admitted_pack;  // the verified open pack the load reads
-        const auto weights = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view(),
-                                                               argv[1], &pack_note, &admitted_pack);
-        if (!pack_note.empty()) std::cerr << "strix-lowbit-pack/v2 " << pack_note << '\n';
-        bind_mini_lowbit_device(weights);
+        if (!options.generation.prefill_chunk_explicit) {  // the declared chunk of this backend and profile
+            family.default_prefill_chunk = mini_prefill_schedule(cli::kMiniHipSchedule, options.tier.profile).chunk;
+            options.generation.prefill_chunk = family.default_prefill_chunk;
+        }
+        // The serial CLI resolves its one lane at load using prompt + generated positions. A gate knows its
+        // resident context from the manifest. CUDA step routing precedes serial loading and has no banded CUDA row.
+        struct ResolvedWeights {
+            MiniWeightScope scope;
+            strix::weight::WeightLoadPlan plan;
+        };
+        const auto resolve_weights = [&options, model = std::string(argv[1])](strix::weight::WeightLoadExtent extent) {
+            auto scope = mini_weight_scope(model, options.tier.profile, options.weights, extent);
+            const auto plan = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view(), extent);
+            return ResolvedWeights{std::move(scope), plan};
+        };
+        const auto gate_windows = options.gate_manifest
+            ? strix::session::read_head_gate_manifest(options.gate_manifest, *options.gate_mode, options.gate_rows,
+                                                      kMaxContext, kOutputVocabulary)
+            : std::vector<strix::session::HeadGateWindow>{};
+        const auto gate_extent = cli::gate_weight_extent(gate_windows);
+        auto early = resolve_weights(options.gate_manifest ? gate_extent : strix::weight::WeightLoadExtent{});
+        std::optional<ResolvedWeights> loaded;
+        auto& weights = early.plan;
         const auto step_graphs = options.step_graphs.value_or(MiniResidentBackend::default_step_graphs);
+        const auto moe_w4a4 = options.moe_w4a4;
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         const char* grouped_prepare = strix::envcfg::text("STRIX_INKLING_K1BIND");
         const bool resident_k1 = grouped_prepare && std::string_view(grouped_prepare) == "1";
@@ -312,27 +341,51 @@ int main(int argc, char** argv) {
         if (step_program)
             family.load = [program_load = cli::select_mini_cuda_program(program_options.epilogue_fusion,
                                                                         program_options.latency_forms),
-                           moe_w4a4 = mini_moe_w4a4_class(options.tier)](const serve::SerialGenerationLoad& load) {
-                return program_load(load, moe_w4a4);
+                           moe_w4a4,
+                           controller_one_plane = mini_controller_one_plane(options.tier),
+                           projected_bias = mini_attn_projected_bias(options.tier)](
+                              const serve::SerialGenerationLoad& load) {
+                return program_load(load, moe_w4a4, controller_one_plane, projected_bias);
             };
         else
 #endif
-        family.load = [step_graphs, storage = weights.roles(), dspark = options.dspark,
-                       moe_w4a4 = mini_moe_w4a4_class(options.tier),
-                       lowbit = mini_lowbit_rows(weights, options.weights, scope.checkpoint, admitted_pack)](
-                          const serve::SerialGenerationLoad& load) {
-            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, moe_w4a4, lowbit);
+        family.load = [&loaded, &resolve_weights, &options, step_graphs, dspark = options.dspark,
+                       moe_w4a4,
+                       combine_image = mini_combine_image(options.tier),
+                       round_fold = mini_prepared_round_fold(options.tier),
+                       narrow = mini_experts_nvfp4(options.tier),
+                       controller_one_plane = mini_controller_one_plane(options.tier),
+                       projected_bias = mini_attn_projected_bias(options.tier)](const serve::SerialGenerationLoad& load) {
+            const strix::weight::WeightLoadExtent extent{load.positions, 1U};
+            loaded = resolve_weights(extent);
+            return load_mini_weights(loaded->plan, options.tier.profile, options.weights, loaded->scope.view(),
+                                     extent, [&](MiniLowBitRows lowbit) {
+                return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, loaded->plan.roles(), dspark,
+                    moe_w4a4, combine_image, round_fold, narrow, controller_one_plane, projected_bias, std::move(lowbit));
+            });
         };
         const auto write_profile = [&] {
+            const auto& resolved = loaded ? *loaded : early;
+            const auto& plan = resolved.plan;
+            const auto& scope = resolved.scope;
             cli::write_profile(options.tier, std::cerr, true);
-            cli::write_weight_load_plan(std::cerr, weights);
+            cli::write_weight_load_plan(std::cerr, plan);
+            std::cerr << strix::weight::weight_load_regime_receipt(plan) << '\n';
+            // The admitted W4A4 class, the same identity the gate prints and the server reports as moe_prefill.
+            if (mini_moe_w4a4(options.tier))
+                std::cerr << "strix-moe-w4a4 class " << strix::moe_core::grouped_w4a4::identity(moe_w4a4) << '\n';
+            std::cerr << "strix-prefill-route/v1 chunk " << options.generation.prefill_chunk << " tail_divisor "
+                      << family.prefill_tail_divisor << " first_id prefill\n";
+            std::cerr << "strix-decode-route/v1 moe_decode " << mini_decode_form_name(options.generation.packed_decode)
+                      << '\n';
+            std::cerr << mini_served_route_cli_line(options.tier) << '\n';
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
             if (!route.speculation_reason.empty())
                 std::cerr << "strix-speculation-route/v1 requested auto effective off ("
                           << route.speculation_reason << ")\n";
 #endif
-            std::cerr << "strix-weight-load-status/v1 " << strix::profile::status_name(weights.status) << " ("
-                      << weights.reason << ") device " << (scope.device_class.empty() ? "-" : scope.device_class)
+            std::cerr << "strix-weight-load-status/v1 " << strix::profile::status_name(plan.status) << " ("
+                      << plan.reason << ") device " << (scope.device_class.empty() ? "-" : scope.device_class)
                       << " compiler " << (scope.compiler_id.empty() ? "-" : scope.compiler_id) << " checkpoint ";
             if (scope.checkpoint == strix::weight::Digest256{}) std::cerr << '-';
             for (std::size_t i = 0; i < 8 && !(scope.checkpoint == strix::weight::Digest256{}); ++i)
@@ -344,13 +397,12 @@ int main(int argc, char** argv) {
                 std::cerr << strix::weight::weight_load_scope_receipt(scope.view()) << '\n';
         };
         if (options.gate_manifest) {
-            write_profile();
-            cli::run_gate(argv[1], options, weights,
-                          mini_lowbit_rows(weights, options.weights, scope.checkpoint, admitted_pack)
+            cli::run_gate(argv[1], options, gate_windows, gate_extent, weights, early.scope.view()
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                           , step_program, program_options.epilogue_fusion, program_options.latency_forms
 #endif
             );
+            write_profile();
             return 0;
         }
         if (options.generation.tokenize_file) cli::write_profile(options.tier, std::cerr, true);

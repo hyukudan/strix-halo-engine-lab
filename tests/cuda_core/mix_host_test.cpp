@@ -1,4 +1,4 @@
-#include "cuda/core/mix_catalog.hpp"
+#include "core/mix_catalog.hpp"
 #include "mix_oracle.hpp"
 
 #include <array>
@@ -69,7 +69,7 @@ exec::EntryLaunch resolve(void* context, const exec::LauncherRef& launcher, cons
 void catalog() {
     exec::Catalog table;
     table.add(exec::Catalog::builtin_entries(exec::Backend::cuda));
-    const auto fragment = strix::cuda::mix::catalog_entries();
+    const auto fragment = strix::core::residual_mix::catalog_entries(strix::exec::Backend::cuda);
     require(fragment.size() == 4U, "one entry per row class");
     const std::array bounds{1U, 2U, 9U, 33U};
     const std::array ends{1U, 8U, 32U, 65536U};

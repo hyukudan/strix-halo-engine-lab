@@ -38,37 +38,9 @@ cudaError_t enqueue_schedule(const ::strix::core::residual_mix::MixArgs& args, c
 }
 #endif
 
+#include "core/residual_mix_plan.hpp"
+
 namespace strix::core::residual_mix {
-
-inline constexpr unsigned kMaxBanks = 8;
-inline constexpr unsigned kMaxQueries = 8;
-
-struct NormalizeArgs {
-    const float* input{};
-    float* output{};
-    unsigned rows{};
-    unsigned width{};
-    float epsilon{};
-    std::size_t input_stride{};   // Zero selects width.
-    std::size_t output_stride{};
-    bool round_bf16{};
-};
-
-struct NormalizePairArgs {
-    NormalizeArgs first, second;
-};
-
-struct MixArgs {
-    const float* banks[kMaxBanks]{};   // Each bank is [rows][width].
-    const float* queries{};           // [query_count][width], shared by tokens.
-    float* output[kMaxQueries]{};     // Each output is [rows][width], disjoint from banks.
-    unsigned rows{};
-    unsigned width{};
-    unsigned bank_count{};
-    unsigned query_count{};
-    float epsilon{};
-    bool normalized{};               // Banks are already normalized as FP32.
-};
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #define STRIX_RESIDUAL_MIX_HD __host__ __device__
@@ -119,19 +91,6 @@ struct BankJob {
     return {args.set_count, 0U};
 }
 
-struct AddArgs {
-    const float* lhs{};
-    const float* rhs{};
-    float* output{};
-    std::size_t elements{};
-    bool round_bf16{};
-};
-
-struct RoundArgs {
-    const float* input{};
-    float* output{};
-    std::size_t elements{};
-};
 
 // Widest row a transition owns in one block (16 strided register values per virtual lane of 256).
 inline constexpr unsigned kTransitionMaxWidth = 4096;
@@ -169,53 +128,6 @@ struct TransitionArgs {
     for (unsigned q = 0; q < args.mix.query_count && q < kMaxQueries; ++q) count += args.norm[q].output ? 1U : 0U;
     return count;
 }
-
-struct ControllerArgs {
-    const float* current{};
-    const float* message{};
-    const float* forget{};
-    const float* gain{};
-    float* output{};
-    std::size_t elements{};
-};
-
-namespace detail {
-
-inline constexpr std::size_t kMaxElements = std::numeric_limits<std::size_t>::max() / sizeof(float);
-inline constexpr unsigned kThreads = 256;
-
-inline bool valid_rows(unsigned rows, unsigned width, std::size_t stride) {
-    return width != 0U && stride >= width && rows <= kMaxElements / stride;
-}
-
-}  // namespace detail
-
-inline bool fits(NormalizeArgs args) {
-    if (args.rows == 0U) return true;
-    return args.input && args.output && args.epsilon > 0.0F && std::isfinite(args.epsilon) &&
-           detail::valid_rows(args.rows, args.width, args.input_stride ? args.input_stride : args.width) &&
-           detail::valid_rows(args.rows, args.width, args.output_stride ? args.output_stride : args.width);
-}
-
-inline bool fits(const MixArgs& args) {
-    if (args.rows == 0U) return true;
-    if (!args.queries || args.bank_count == 0U || args.bank_count > kMaxBanks ||
-        args.query_count == 0U || args.query_count > kMaxQueries ||
-        !detail::valid_rows(args.rows, args.width, args.width) ||
-        !detail::valid_rows(args.query_count, args.width, args.width) ||
-        (!args.normalized && (!(args.epsilon > 0.0F) || !std::isfinite(args.epsilon)))) return false;
-    for (unsigned bank = 0; bank < args.bank_count; ++bank)
-        if (!args.banks[bank]) return false;
-    for (unsigned query = 0; query < args.query_count; ++query) {
-        if (!args.output[query] || args.output[query] == args.queries) return false;
-        for (unsigned bank = 0; bank < args.bank_count; ++bank)
-            if (args.banks[bank] == args.output[query]) return false;
-        for (unsigned other = 0; other < query; ++other)
-            if (args.output[other] == args.output[query]) return false;
-    }
-    return true;
-}
-
 // The single-query readout that job j of the batch performs.
 [[nodiscard]] inline MixArgs job_args(const BankBatchArgs& args, unsigned job) {
     const auto where = locate(args, job);
@@ -234,7 +146,6 @@ inline bool fits(const MixArgs& args) {
     mix.normalized = args.normalized;
     return mix;
 }
-
 // Every job fits as a single-query readout, and every set's output image ([count][width]) is disjoint from the
 // banks, from every query image and from the other outputs: all jobs run concurrently.
 inline bool fits(const BankBatchArgs& args) {
@@ -316,6 +227,45 @@ inline bool fits(const TransitionArgs& args) {
         for (unsigned other = 0; other < w; ++other)
             if (overlaps(written[w], written[other])) return false;
     }
+    return true;
+}
+
+struct LowRankController {
+    unsigned width;
+    unsigned rank;
+    unsigned message_count;
+    float epsilon;
+    bool round_operands_bf16;
+    bool round_latent_bf16;
+
+    constexpr std::size_t scratch_elements_per_row() const {
+        return 4U * std::size_t{width} + rank;
+    }
+
+    constexpr std::size_t scratch_elements(unsigned rows) const {
+        return rows * scratch_elements_per_row();
+    }
+
+    // The down operand of one row: the normalised raw row and one normalised readout, independent of message_count
+    // (the number of readout banks).
+    constexpr std::size_t down_operand_elements() const {
+        return std::size_t{kLowRankDownRows} * width;
+    }
+
+    // One-plane admission of the controller's operands from the weight maxima (core/dense_row_plan.hpp). Holds for
+    // finite residual rows only; message_count plays no part.
+    bool operands_bounded(float down_max, float gate_max) const {
+        return low_rank_operands_bounded(width, rank, down_max, gate_max);
+    }
+};
+
+// Admission of the HIP transition body (residual_mix::launch_transition): the contract, a paired-bank block of at
+// least 256 threads (bank_count >= 2, the readout launch_mix runs for one row of more than one bank), the register
+// width of that readout, and no a8g32 image (the HIP decode leaves store none). Anything else runs the separate leaves.
+[[nodiscard]] inline bool hip_transition_admits(const TransitionArgs& args) {
+    if (!fits(args) || args.mix.bank_count < 2U || args.mix.width > kTransitionMaxWidth) return false;
+    for (const auto& norm : args.norm)
+        if (norm.codes || norm.deltas || norm.sums) return false;
     return true;
 }
 
@@ -603,14 +553,13 @@ __device__ __forceinline__ void emit_registers(const Args& args, std::size_t off
 // The parallel schedule launches one blockDim.y slice per bank. Each x thread
 // owns virtual lanes x and x+128, so their first add is stage 128 of the original
 // tree. All slices enter the remaining stages and their block barriers together.
-// SerialRegisters selects the register form of the serial schedule (false = its loop form, for the identity fixture).
-template <bool Normalized, bool ParallelBanks = false, class Args = MixArgs, bool SerialRegisters = kMixSerialRegisterForm>
-static __global__ void mix(Args args) {
+// The mix body over rows first, first + step, ... (every thread of the block runs it; each row ends with a block
+// barrier). The mix kernel runs it from blockIdx.x by gridDim.x; the transition body runs its one row (0, 1).
+template <bool Normalized, bool ParallelBanks, bool SerialRegisters = kMixSerialRegisterForm, class Args>
+__device__ __forceinline__ void mix_rows(Args args, unsigned first, unsigned step, float* scratch,
+                                         float* inverse, float (*probability)[kMaxBanks]) {
     using Jobs = MixJobs<Args>;
     constexpr unsigned bank_threads = ParallelBanks ? kPairedBankThreads : kThreads;
-    __shared__ float scratch[ParallelBanks ? bank_threads * kMaxBanks : kThreads];
-    __shared__ float inverse[kMaxBanks];
-    __shared__ float probability[kMaxQueries][kMaxBanks];
     const unsigned lane = threadIdx.x;
     const unsigned first_bank = ParallelBanks ? threadIdx.y : 0U;
     const unsigned banks_per_slice = ParallelBanks ? 1U : args.bank_count;
@@ -619,7 +568,7 @@ static __global__ void mix(Args args) {
     auto* bank_scratch = scratch + first_bank * bank_threads;
     const float score_scale = 1.0F / pool::sqrt_rn(static_cast<float>(args.width));
     const bool registers = kMixRegisterForm && (ParallelBanks || SerialRegisters) && args.width <= kMixRegisterWidth;
-    for (std::size_t row = blockIdx.x; row < Jobs::rows(args); row += gridDim.x) {
+    for (std::size_t row = first; row < Jobs::rows(args); row += step) {
         const auto offset = row * args.width;
         if constexpr (ParallelBanks && kMixRegisterForm) {
             if (registers)
@@ -692,6 +641,17 @@ static __global__ void mix(Args args) {
         __syncthreads();
     }
 }
+
+// SerialRegisters selects the register form of the serial schedule (false selects the loop fixture).
+template <bool Normalized, bool ParallelBanks = false, class Args = MixArgs, bool SerialRegisters = kMixSerialRegisterForm>
+static __global__ void mix(Args args) {
+    constexpr unsigned bank_threads = ParallelBanks ? kPairedBankThreads : kThreads;
+    __shared__ float scratch[ParallelBanks ? bank_threads * kMaxBanks : kThreads];
+    __shared__ float inverse[kMaxBanks];
+    __shared__ float probability[kMaxQueries][kMaxBanks];
+    mix_rows<Normalized, ParallelBanks, SerialRegisters>(args, blockIdx.x, gridDim.x, scratch, inverse, probability);
+}
+
 #endif
 
 struct AddRound {
@@ -888,23 +848,6 @@ inline Error launch_capture_message_bank(std::span<const ConstRows> inputs, std:
     return success;
 }
 
-struct LowRankController {
-    unsigned width;
-    unsigned rank;
-    unsigned message_count;
-    float epsilon;
-    bool round_operands_bf16;
-    bool round_latent_bf16;
-
-    constexpr std::size_t scratch_elements_per_row() const {
-        return 4U * std::size_t{width} + rank;
-    }
-
-    constexpr std::size_t scratch_elements(unsigned rows) const {
-        return rows * scratch_elements_per_row();
-    }
-};
-
 struct ControllerWeights {
     ConstRows query;
     const std::uint16_t* down;
@@ -952,7 +895,7 @@ void enqueue_low_rank_controller_tail(LowRankController plan, ControllerWeights 
     const auto conditioned = scratch.subspan(3U * elements, elements);
     const auto latent = scratch.subspan(4U * elements, std::size_t{rows} * plan.rank);
     const auto width = plan.width;
-    const auto stride = 2U * width;
+    const auto stride = kLowRankDownRows * width;
     const detail::NormalizePair normalize{{
         {raw.data(), operands.data(), rows, width, plan.epsilon, width, stride, plan.round_operands_bf16},
         {message.data(), operands.data() + width, rows, width, plan.epsilon, width, stride, plan.round_operands_bf16},

@@ -39,13 +39,19 @@ void validate_token_sampling_policy(const TokenSamplingPolicy&);
 // Counter-based random identity: seed, a request identity (1 = the single-request identity every sampler used
 // before request identities existed) and the policy identity.
 [[nodiscard]] SpeculationRngIdentity token_sampling_rng(const TokenSamplingPolicy&,std::uint64_t request_identity = 1);
-// The request identity of a new HTTP request. STRIX_SAMPLING_REQUEST_IDENTITY=counter: 1, 2, 3, ... in admission
-// order within one process (the first request keeps identity 1, the command line's); otherwise always 1 (default:
-// one seed gives one token stream for every request, as before).
+// The request identity of a new request: always 1, the command line's, so one seed and policy give one token stream
+// on every entry point whatever arrived before. STRIX_SAMPLING_REQUEST_IDENTITY accepts unset, empty, 0 or single;
+// the retired arrival-order mode (counter) and any other value throw std::invalid_argument.
 [[nodiscard]] std::uint64_t next_token_sampling_request_identity();
-// True when STRIX_SAMPLING_REQUEST_IDENTITY=counter (every request draws its own stream); false for unset, empty,
-// 0 or single (one seed gives one token stream for every request). Any other value is rejected.
+// False for every accepted STRIX_SAMPLING_REQUEST_IDENTITY value; throws for counter or any other value.
 [[nodiscard]] bool token_sampling_request_identity_counts();
+// Temperature of a policy whose temperature was not given: 1 when a filter (top_k > 0, top_p < 1 or min_p > 0) was
+// given, otherwise 0 (greedy): the shared serial command line's rule. An HTTP request without temperature stays greedy.
+// The filters are the float values the sampler sees: resolve after narrowing, so top_p = 0.999999999 (1.0F) is no filter.
+[[nodiscard]] constexpr float omitted_token_sampling_temperature(std::uint32_t top_k, float top_p,
+                                                                 float min_p) noexcept {
+    return top_k != 0U || top_p < 1.0F || min_p > 0.0F ? 1.0F : 0.0F;
+}
 
 // How a drafted row is decided. Neither choice changes the policy identity or the plain (no-draft) decision.
 //   rejection (default): speculative sampling; the draft is drawn with U(n, draft) and accepted with U(n, accept),
@@ -68,10 +74,19 @@ struct TokenSamplerOptions {
     static constexpr std::uint32_t forced_rejection_off = UINT32_MAX, forced_rejection_rotate = UINT32_MAX - 1U;
     std::uint32_t force_reject_row = forced_rejection_off;
 };
-// STRIX_MTP_SAMPLED_ACCEPT=rejection|coupled (unset: rejection), STRIX_MTP_SAMPLED_ARGMAX_BELOW=T (default 0.7,
+// STRIX_MTP_SAMPLED_ACCEPT=rejection|coupled (unset: `unset_acceptance`, rejection unless the entry says otherwise;
+// Qwen's command line and HTTP server both pass coupled), STRIX_MTP_SAMPLED_ARGMAX_BELOW=T (default 0.7,
 // 0 = always sample drafts), STRIX_MTP_SAMPLED_FORCE_REJECT=0..7|rotate (test-only, unset: off; requires coupled);
 // request identity 1.
-[[nodiscard]] TokenSamplerOptions token_sampler_options_from_environment();
+[[nodiscard]] TokenSamplerOptions token_sampler_options_from_environment(
+    SampledAcceptance unset_acceptance = SampledAcceptance::rejection);
+// Resolve and validate the environment before loading a model, starting ranks or accepting requests.
+// Keep the returned options for execution so the entry point uses the policy it admitted.
+TokenSamplerOptions validate_sampling_startup_environment(
+    SampledAcceptance unset_acceptance = SampledAcceptance::rejection);
+// Startup validation for a route whose verifier implements one acceptance rule only: an explicit
+// STRIX_MTP_SAMPLED_ACCEPT naming the other rule is refused here, never replaced after admission.
+TokenSamplerOptions validate_sampling_startup_environment_only(SampledAcceptance supported, const char* route);
 
 // Kept entries in sampling order with normalized probabilities.
 class TokenDistribution {

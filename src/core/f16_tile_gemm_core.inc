@@ -4,15 +4,28 @@
 #define STRIX_F16_TILE_PROJECTIONS
 #endif
 #if defined(STRIX_F16_TILE_PACKED_OPERANDS)
+// A binding can reuse the packed tile inside a grid with different row and column origins.
+struct PackedTileOrigin {
+    unsigned row, column;
+};
+
 template <Layout L, class Store, bool kA16, class Weights, class Pair = UnpairedColumns, class Rows = DirectRows,
-          class Sched = IncumbentSchedule>
+          class Sched = IncumbentSchedule, bool kBoundOrigin = false>
 __device__ __forceinline__ void core(const Args& p, typename Sched::Storage& lds, const Store& store,
-                                     const Weights& weights, const Pair& pair = {}, const Rows& source = {}) {
-    static_assert(kA16 && L == Layout::NK);
+                                     const Weights& weights, const Pair& pair = {}, const Rows& source = {},
+                                     PackedTileOrigin origin = {}) {
+    static_assert(kA16 && L == Layout::NK && (!kBoundOrigin || !Pair::kPaired));
 #elif defined(STRIX_F16_TILE_PLAIN_BF16)
+// Test hook: apply(sum, row, output column of the projection) sees each completed sum before the projection epilogue;
+// the identity default leaves production launches unchanged. A fixture substitutes sums to put chosen payloads through
+// the real epilogue.
+struct AccumulatorTap {
+    __device__ static __forceinline__ float apply(float sum, unsigned, unsigned) { return sum; }
+};
 // kA16: A arrives as BF16 bits (Args::a16), loaded as is: the operand bits the FP32 staging (pack2<bf16>, RNE) makes of
 // the values the image was encoded from. No K16 tail form.
-template <bool kHalfTail, unsigned Capacity, bool kGated = false, bool kA16 = false>
+template <bool kHalfTail, unsigned Capacity, bool kGated = false, bool kA16 = false,
+          RoundStore Round = RoundStore::incumbent, class Tap = AccumulatorTap>
 __device__ __forceinline__ void core(const Args& p, Storage& lds, const Bf16ProjectionGroup<Capacity>& group,
                                      const ControllerRows& gate = {}) {
     static_assert(!(kA16 && (kHalfTail || kGated)));
@@ -51,13 +64,16 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
     const RawStore store{projection.output + (left != 0U ? col0 : 0U), projection.outputs, 0U};
 #else
     const unsigned nt = p.N / kBN;
-    const unsigned n0 = (p.order == 2U ? blockIdx.x % nt : blockIdx.x) * kBN;
 #if defined(STRIX_F16_TILE_PACKED_OPERANDS)
-    const unsigned r0 = (p.order == 1U ? blockIdx.z : blockIdx.y) * Sched::kRows;
+    const unsigned n0 = kBoundOrigin ? origin.column : (p.order == 2U ? blockIdx.x % nt : blockIdx.x) * kBN;
+    const unsigned r0 = kBoundOrigin ? origin.row : (p.order == 1U ? blockIdx.z : blockIdx.y) * Sched::kRows;
+    const unsigned b = kBoundOrigin ? 0U : p.order == 0U ? blockIdx.z : p.order == 1U ? blockIdx.y :
+                       blockIdx.z * p.group + blockIdx.x / nt;
 #else
+    const unsigned n0 = (p.order == 2U ? blockIdx.x % nt : blockIdx.x) * kBN;
     const unsigned r0 = (p.order == 1U ? blockIdx.z : blockIdx.y) * kBM;
-#endif
     const unsigned b = p.order == 0U ? blockIdx.z : p.order == 1U ? blockIdx.y : blockIdx.z * p.group + blockIdx.x / nt;
+#endif
 #endif
 #if defined(STRIX_F16_TILE_PACKED_OPERANDS)
     // Live 16-row WMMA tiles of this wave (rows past `rows` are never multiplied or stored).
@@ -97,6 +113,9 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
     for (unsigned j = 0; j < kWC; ++j) {
         const unsigned wl = ar + kRowStep * j;
         wcol[j] = Pair::kPaired ? (wl < 64U ? 64U * blockIdx.x + wl : pair.half + 64U * blockIdx.x + (wl - 64U)) : n0 + wl;
+        if constexpr (kBoundOrigin) {
+            if (wcol[j] >= p.N) wcol[j] = n0;  // pad a partial output tile with a valid weight row
+        }
     }
 #elif defined(STRIX_F16_TILE_Q8)
     const unsigned wc = (tid >> 1U) % kProjectionPanel;
@@ -251,7 +270,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
     // Group-scaled staging (low-bit codes): each kGroupK group is a WMMA chain from +0 into sum, then
     // acc = fma(sum, d, acc) with the column's group scale (the small-M schedule's arithmetic).
     constexpr bool kGroupScaled = detail::group_scaled<Staging>;
-    [[maybe_unused]] Float8 sum[2][4] = {};
+    [[maybe_unused]] detail::LowBitGroup sum[2][4] = {};
 #endif
     load(0U);
     for (unsigned k0 = 0; k0 < p.K; k0 += kBK) {
@@ -269,7 +288,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #pragma unroll
                 for (unsigned m = 0; m < 2U; ++m)
 #pragma unroll
-                    for (unsigned t = 0; t < 4U; ++t) sum[m][t] = Float8{};
+                    for (unsigned t = 0; t < 4U; ++t) sum[m][t] = {};
         }
 #endif
 #pragma unroll
@@ -305,8 +324,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #if defined(STRIX_F16_TILE_Q8)
                     {
                         if constexpr (kGroupScaled)
-                            sum[m][t] = STRIX_HIP_WMMA_F16(
-                                __builtin_bit_cast(Half16, fa[m]), __builtin_bit_cast(Half16, fb[t]), sum[m][t]);
+                            sum[m][t].add(fa[m], fb[t]);
                         else
                             acc[m][t] = STRIX_HIP_WMMA_F16(
                                 __builtin_bit_cast(Half16, fa[m]), __builtin_bit_cast(Half16, fb[t]), acc[m][t]);
@@ -325,9 +343,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
                     const float d = Staging::scale(&lds.b[64U * wn + 16U * t + c][0]);
 #pragma unroll
                     for (unsigned m = 0; m < 2U; ++m)
-                        if (m < live_tiles)
-#pragma unroll
-                            for (unsigned j = 0; j < 8U; ++j) acc[m][t][j] = __builtin_fmaf(sum[m][t][j], d, acc[m][t][j]);
+                        if (m < live_tiles) sum[m][t].apply(d, acc[m][t]);
                 }
             }
         }
@@ -424,10 +440,11 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #if defined(STRIX_F16_TILE_Q8)
                     if (col < left) store.put(b, r, col, acc[m][t][j]);
 #else
-                    // Projections with round_bf16 store the BF16-rounded FP32 sum (same rounding as fma_rows).
-                    if (col < left)
-                        store.put(b, r, col, projection.round_bf16 ? strix::attn::group_indexer::bf16_round(acc[m][t][j])
-                                                                   : acc[m][t][j]);
+                    // Projections with round_bf16 store the BF16-rounded FP32 sum (same rounding as fma_rows; Round selects the function).
+                    if (col < left) {
+                        const float sum = Tap::apply(acc[m][t][j], r, col0 + col);
+                        store.put(b, r, col, projection.round_bf16 ? round_stored<Round>(sum) : sum);
+                    }
 #endif
                 }
 #else

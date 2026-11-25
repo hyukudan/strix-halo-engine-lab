@@ -17,6 +17,7 @@
 #include "core/resident_q8_rows.hpp"
 #include "core/f16_tile_gemm_small.hpp"
 #include "core/iu4_onfly.hpp"
+#include "inkling2/inkling2_mini_dense_hip.hpp"
 
 #include <algorithm>
 #include <array>
@@ -35,6 +36,7 @@ namespace wei = strix::weight;
 namespace core = strix::core;
 namespace tg = strix::core::f16_tile_gemm;
 namespace wd = strix::core::weight_decode;
+constexpr auto f16_group_scale = core::LowBitArithmetic::f16_group_scale;
 
 void ok(hipError_t e, const char* what) {
     if (e != hipSuccess) {
@@ -127,9 +129,9 @@ wei::ResidentMatrixView view(const Packed& p, const std::uint8_t* w, unsigned n,
     return {{w, p.bytes.size()}, p.storage, n, k, p.row_bytes};
 }
 
-enum class Route { entry, small, tile, rt1, rt2 };
+enum class Route { entry, small, tile, rt1, rt2, fp32_sweep };
 const char* name(Route r) {
-    constexpr const char* names[] = {"entry", "small", "tile", "small_rt1", "small_rt2"};
+    constexpr const char* names[] = {"entry", "small", "tile", "small_rt1", "small_rt2", "fp32-sweep"};
     return names[static_cast<int>(r)];
 }
 
@@ -142,7 +144,12 @@ hipError_t launch(const Packed& p, const std::uint8_t* w, unsigned n, unsigned k
         else core::detail::launch_q8_tight_rows<16, wd::Format::bf16>(dense, x, y, rows, nullptr);
         return hipGetLastError();
     }
-    if (route == Route::entry) return core::enqueue_resident_q8_rows(view(p, w, n, k), n, x, rows, y, nullptr);
+    if (route == Route::fp32_sweep)
+        return core::enqueue_resident_q8_rows(view(p, w, n, k), n, x, rows, y, nullptr);
+    if (route == Route::entry)
+        return lowbit(p.format)
+            ? core::enqueue_resident_lowbit_rows(view(p, w, n, k), n, x, rows, y, nullptr, f16_group_scale)
+            : core::enqueue_resident_q8_rows(view(p, w, n, k), n, x, rows, y, nullptr);
     tg::Q8ProjectionGroup<1> group{};
     group.append({w, n, y});
     const bool q4 = p.format == wd::Format::q4_g64;
@@ -333,7 +340,24 @@ int main(int argc, char** argv) {
                            " bits_vs_129=" + std::to_string(diff));
             }
             if (lb) {
-                // Forced routes at the same rows give the same bits (small runs 129 rows as three 48-row blocks).
+                // The incumbent FP32 sweep remains available and still refuses row 17.
+                for (const unsigned rows : {1U, 2U, 3U, 4U, 8U, 13U, 16U, 17U}) {
+                    poison(dy, y_floats);
+                    const auto status = launch(p, w, n, k, dx, dy, rows, Route::fp32_sweep);
+                    const auto y = fetch(dy, y_floats);
+                    std::size_t bad = 0U;
+                    if (rows <= 16U)
+                        for (std::size_t at = 0; at < std::size_t{rows} * n; ++at)
+                            if (!std::isfinite(y[at]) ||
+                                std::fabs(double(y[at]) - ref[at]) >= 1e-4 * (mag[at] + 1e-30))
+                                ++bad;
+                    const bool valid = rows <= 16U;
+                    const auto past = overwritten(y, valid ? std::size_t{rows} * n : 0U);
+                    report(status == (valid ? hipSuccess : hipErrorInvalidValue) && bad == 0U && past == 0U,
+                           tag + " route=fp32-sweep rows=" + std::to_string(rows) + " bad=" + std::to_string(bad) +
+                               " past_rows_written=" + std::to_string(past));
+                }
+                // Forced routes at the same row count give the same bits across every row block boundary.
                 for (const unsigned rows : {16U, 40U, 48U, 129U})
                     for (const Route route : {Route::small, Route::tile, Route::rt1, Route::rt2}) {
                         ok(launch(p, w, n, k, dx, dy, rows, route), "launch forced");
@@ -348,7 +372,7 @@ int main(int argc, char** argv) {
                     const std::array<core::ResidentRowProjection, 2> pair{{{lowbit_view, n, dy}, {lowbit_view, n, dy2}}};
                     poison(dy, y_floats);
                     poison(dy2, y_floats);
-                    const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, pair, nullptr);
+                    const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, pair, nullptr, f16_group_scale);
                     const auto y1 = fetch(dy, y_floats), y2 = fetch(dy2, y_floats);
                     const auto d1 = bit_diff(y1, base, rows, n), d2 = bit_diff(y2, base, rows, n);
                     const auto past = overwritten(y1, std::size_t(rows) * n) + overwritten(y2, std::size_t(rows) * n);
@@ -372,13 +396,13 @@ int main(int argc, char** argv) {
                     ok(hipMalloc(&dy3, tail_floats * 4U), "malloc y3");
                     const auto tail_view = view(tail, dt, tail_n, k);
                     for (const unsigned rows : {65U, 129U}) {
-                        ok(core::enqueue_resident_q8_rows(tail_view, tail_n, dx, rows, dy3, nullptr), "tail alone");
+                        ok(core::enqueue_resident_lowbit_rows(tail_view, tail_n, dx, rows, dy3, nullptr, f16_group_scale), "tail alone");
                         const auto tail_alone = fetch(dy3, tail_floats);
                         const std::array<core::ResidentRowProjection, 2> list{
                             {{tail_view, tail_n, dy3}, {lowbit_view, n, dy}}};
                         poison(dy3, tail_floats);  // a skipped projection keeps poison: both lists must be written
                         poison(dy, y_floats);
-                        const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr);
+                        const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr, f16_group_scale);
                         const auto y3 = fetch(dy3, tail_floats), y1 = fetch(dy, y_floats);
                         const auto d1 = bit_diff(y3, tail_alone, rows, tail_n);
                         const auto d2 = bit_diff(y1, base, rows, n);
@@ -398,7 +422,7 @@ int main(int argc, char** argv) {
                             {lowbit_first ? a : b, lowbit_first ? b : a}};
                         poison(dy, y_floats);
                         poison(dy2, y_floats);
-                        const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr);
+                        const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr, f16_group_scale);
                         const auto d1 = bit_diff(fetch(dy, y_floats), base, rows, n);
                         const auto d2 = bit_diff(fetch(dy2, y_floats), q8_alone, rows, n);
                         report(status == hipSuccess && d1 == 0U && d2 == 0U,
@@ -418,7 +442,7 @@ int main(int argc, char** argv) {
                                 {bad_first ? bad : good, bad_first ? good : bad}};
                             poison(dy, y_floats);
                             poison(dy2, y_floats);
-                            const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr);
+                            const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr, f16_group_scale);
                             const auto written =
                                 overwritten(fetch(dy, y_floats), 0U) + overwritten(fetch(dy2, y_floats), 0U);
                             report(status == core::row_transforms::invalid && written == 0U,
@@ -438,7 +462,7 @@ int main(int argc, char** argv) {
                                 const std::array<core::ResidentRowProjection, 2> list{
                                     {swap ? second : first, swap ? first : second}};
                                 poison(dy, y_floats);
-                                const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr);
+                                const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr, f16_group_scale);
                                 const auto written = overwritten(fetch(dy, y_floats), 0U);
                                 report(status == core::row_transforms::invalid && written == 0U,
                                        tag + " grouped overlap refused " + (cross ? "lowbit+q8_0" : "lowbit+lowbit") +
@@ -466,7 +490,7 @@ int main(int argc, char** argv) {
                                 b{b_view, n, dy};
                             const std::array<core::ResidentRowProjection, 2> list{{swap ? b : a, swap ? a : b}};
                             poison(dy, y_floats);
-                            const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr);
+                            const auto status = core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr, f16_group_scale);
                             std::vector<std::uint8_t> before(weight_bytes), after(weight_bytes);
                             ok(hipMemcpy(before.data(), read_view.bytes.data(), weight_bytes, hipMemcpyDeviceToHost), "fetch w");
                             ok(hipMemcpy(after.data(), alias, weight_bytes, hipMemcpyDeviceToHost), "fetch alias");
@@ -506,10 +530,13 @@ int main(int argc, char** argv) {
                                 },
                                 [&](std::span<const core::ResidentRowProjection> run) {
                                     ++launched;
-                                    return core::enqueue_resident_q8_projections<2>(dx, k, rows, run, nullptr);
+                                    return core::enqueue_resident_q8_projections<2>(dx, k, rows, run, nullptr, f16_group_scale);
+                                },
+                                [&](std::span<const core::Bf16RowProjection> run) {
+                                    return strix::inkling2::mini_hip_dense_rows_admitted(dx, k, rows, run);
                                 },
                                 [&](std::span<const core::ResidentRowProjection> run) {
-                                    return core::resident_q8_projections_admitted<2>(dx, k, rows, run);
+                                    return core::resident_q8_projections_admitted<2>(dx, k, rows, run, f16_group_scale);
                                 });
                             ok(hipDeviceSynchronize(), "sync mixed");
                             const auto written = overwritten(fetch(dy, y_floats), 0U) + overwritten(fetch(dy2, y_floats), 0U);
@@ -535,6 +562,7 @@ int main(int argc, char** argv) {
             };
             for (const unsigned rows : lb ? lowbit_bench : sweep_bench) bench(rows, Route::entry);
             if (lb) {
+                for (const unsigned rows : {1U, 8U, 16U}) bench(rows, Route::fp32_sweep);
                 for (const unsigned rows : switch_bench)
                     for (const Route route : {Route::small, Route::tile}) bench(rows, route);
                 for (const unsigned rows : {24U, 32U, 40U, 64U})
@@ -546,6 +574,40 @@ int main(int argc, char** argv) {
         ok(hipFree(dx), "free x");
         ok(hipFree(dy), "free y");
         ok(hipFree(dy2), "free y2");
+    }
+    {
+        // Geometry passes byte-range checks, but Inkling's BF16 adapter refuses outputs above its vocabulary.
+        constexpr unsigned k = 128U, bad_outputs = strix::inkling2::kVocabulary + 1U;
+        const auto q4 = pack(wd::Format::q4_g64, std::vector<std::uint16_t>(k), 1U, k);
+        std::uint8_t* dw = nullptr;
+        std::uint16_t* db = nullptr;
+        float *dx = nullptr, *dy = nullptr, *dy_bf16 = nullptr;
+        ok(hipMalloc(&dw, q4.bytes.size()), "malloc q4");
+        ok(hipMalloc(&db, std::size_t{bad_outputs} * k * sizeof(*db)), "malloc BF16");
+        ok(hipMalloc(&dx, k * sizeof(*dx)), "malloc input");
+        ok(hipMalloc(&dy, sizeof(*dy)), "malloc compact output");
+        ok(hipMalloc(&dy_bf16, bad_outputs * sizeof(*dy_bf16)), "malloc BF16 output");
+        ok(hipMemcpy(dw, q4.bytes.data(), q4.bytes.size(), hipMemcpyHostToDevice), "copy q4");
+        ok(hipMemset(dx, 0, k * sizeof(*dx)), "init input");
+        const core::ResidentRowProjection compact{view(q4, dw, 1U, k), 1U, dy};
+        const core::ResidentRowProjection bf16{static_cast<const std::uint16_t*>(db), bad_outputs, dy_bf16};
+        for (const auto& list : {std::array{compact, bf16}, std::array{bf16, compact}}) {
+            poison(dy, 1U);
+            poison(dy_bf16, bad_outputs);
+            const auto status = core::dispatch_resident_rows<2>(dx, k, 1U, list, hipSuccess, hipErrorInvalidValue,
+                [&](auto run) { return strix::inkling2::enqueue_mini_hip_dense_rows(dx, k, 1U, run, nullptr); },
+                [&](auto run) { return core::enqueue_resident_q8_projections<2>(dx, k, 1U, run, nullptr, f16_group_scale); },
+                [&](auto run) { return strix::inkling2::mini_hip_dense_rows_admitted(dx, k, 1U, run); },
+                [&](auto run) { return core::resident_q8_projections_admitted<2>(dx, k, 1U, run, f16_group_scale); });
+            const auto written = overwritten(fetch(dy, 1U), 0U) + overwritten(fetch(dy_bf16, bad_outputs), 0U);
+            report(status == hipErrorInvalidValue && written == 0U,
+                   "mixed malformed BF16 refused with destinations untouched, written=" + std::to_string(written));
+        }
+        ok(hipFree(dw), "free q4");
+        ok(hipFree(db), "free BF16");
+        ok(hipFree(dx), "free input");
+        ok(hipFree(dy), "free compact output");
+        ok(hipFree(dy_bf16), "free BF16 output");
     }
     if (default_shapes) {
         // q | k | v of one input as ONE grouped launch through the entry (3072 + 1024 + 1024 outputs, K 2304).
@@ -577,7 +639,7 @@ int main(int argc, char** argv) {
                         {{view(pq, w, nq, k), nq, dy},
                          {view(pk, w + at_k, nk, k), nk, dy + std::size_t(rows) * nq},
                          {view(pk, w + at_v, nk, k), nk, dy + std::size_t(rows) * (nq + nk)}}};
-                    return core::enqueue_resident_q8_projections<3>(dx, k, rows, list, nullptr);
+                    return core::enqueue_resident_q8_projections<3>(dx, k, rows, list, nullptr, f16_group_scale);
                 });
                 std::cout << "bench fmt=" << name(format) << " qkv N=" << nq + 2U * nk << " K=" << k
                           << " route=entry rows=" << rows << " bytes=" << bytes

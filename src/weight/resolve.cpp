@@ -45,21 +45,32 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
         if (!runnable) continue;
         auto scope = request.scope;
         scope.regime = regime;
-        entry.row = find_weight_load_gate(policy, scope, decisions, request.context, &entry.outside_band, turbo);
+        entry.row = find_weight_load_gate(policy, scope, decisions, request.extent, &entry.outside_band, turbo);
         if (!entry.row) {
             missing = true;
             continue;
         }
-        const bool full = !(entry.row->measured_gain == Digest256{});
+        const bool gain = !(entry.row->measured_gain == Digest256{});
+        entry.gain_outside_lanes = gain && !weight_load_gain_covers_lanes(entry.row->evidence, request.extent.lanes);
+        const bool full = gain && !entry.gain_outside_lanes;
         entry.qualification = full ? RegimeQualification::full : RegimeQualification::gate_only;
         if (full && !decision) decision = entry.row;
     }
-    if (missing) decision = nullptr;
+    const WeightLoadDecision* turbo_row = nullptr;
+    bool every_regime_faster = true;
+    for (const auto& entry : plan.regime_rows()) {
+        if (!turbo_row && entry.row && entry.row->gate_v2_pass == Digest256{}) turbo_row = entry.row;
+        every_regime_faster &= entry.qualification == RegimeQualification::full;
+    }
+    // A new TURBO image replaces FAST throughout the requested regimes. Each replacement needs its own gain.
+    const bool turbo_without_gain = turbo_row && !every_regime_faster;
+    if (missing || turbo_without_gain) decision = nullptr;
     plan.status = profile::admit_column(decision != nullptr, runnable, request.allow_pending);
     if (plan.status == profile::Status::pending) {
         plan.reason = !runnable ? "shared format consumer unavailable"
             : missing && regimes.size() > 1U ? "a regime of the image has no matching gate v2 PASS row"
             : missing ? "no matching gate v2 PASS and measured gain"
+            : turbo_without_gain ? "TURBO image requires a measured gain in every regime"
             : "gate v2 PASS without a measured gain in any regime";
         return plan;
     }
@@ -69,10 +80,6 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
     if (decision) {
         plan.gate_v2_pass = decision->gate_v2_pass;
         plan.measured_gain = decision->measured_gain;
-        // A TURBO row in any regime makes the image a TURBO image: the plan states that row's measured quality.
-        const WeightLoadDecision* turbo_row = nullptr;
-        for (const auto& entry : plan.regime_rows())
-            if (!turbo_row && entry.row && entry.row->gate_v2_pass == Digest256{}) turbo_row = entry.row;
         plan.reason = turbo_row ? "TURBO row: measured gain, measured quality below the FAST gate"
             : regimes.size() > 1U ? "gate v2 PASS in every regime and a measured gain"
                                   : "gate v2 PASS and measured gain";
@@ -123,6 +130,10 @@ std::string weight_load_regime_receipt(const WeightLoadPlan& plan) {
         if (entry.row && !entry.row->evidence.receipt.empty()) {
             out += ':';
             out += entry.row->evidence.receipt;
+        }
+        if (entry.row && entry.gain_outside_lanes) {
+            out += ":gain-lanes<=";
+            out += std::to_string(entry.row->evidence.max_lanes);
         } else if (!entry.row && entry.outside_band) {
             out += ":outside-band<=";
             out += std::to_string(entry.outside_band->evidence.max_context);

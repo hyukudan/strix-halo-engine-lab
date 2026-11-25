@@ -17,8 +17,9 @@ namespace cuda_qwen_serve {
 
 // The shared request translation (strix/serve/job_sampling.hpp), held by value per request. The host decision below
 // reads the final logits row back (4 x vocab bytes) until the shared CUDA device sampler binds here.
-inline std::optional<strix::TokenSampler> make_job_sampler(const strix::serve::GenerationJob& job) {
-    const auto shared = strix::serve::make_job_sampler(job.sampling);
+inline std::optional<strix::TokenSampler> make_job_sampler(const strix::serve::GenerationJob& job,
+    const strix::TokenSamplerOptions& options = {}) {
+    const auto shared = strix::serve::make_job_sampler(job.sampling, options);
     if (!shared) return std::nullopt;
     return std::optional<strix::TokenSampler>(std::in_place, shared->policy(), shared->options());
 }

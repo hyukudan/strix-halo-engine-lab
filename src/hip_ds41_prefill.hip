@@ -7,6 +7,7 @@
 #include "strix/ds41_fast_profile.hpp"
 #include "strix/ds41_prefill_precision.hpp"
 #include "strix/hip_ds41_prefill.hpp"
+#include "strix/moe/route_project.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -277,7 +278,7 @@ __global__ __launch_bounds__(256) void prefill_router_select_kernel(RouterView v
     __shared__ unsigned chosen[16];
     const unsigned r = blockIdx.x, t = threadIdx.x;
     const float* scores = view.scores + static_cast<unsigned long long>(r) * view.experts;
-    const float* bias = view.image_rows && view.image_rows[r] ? view.bias_image : view.bias;
+    const float* bias = strix::moe::route_row_bias(view.image_rows, r, view.bias_image, view.bias);
     for (unsigned e = t; e < view.experts; e += 256U) biased[e] = scores[e] + bias[e];
     __syncthreads();
     for (unsigned k = 0; k < view.top_k; ++k) {

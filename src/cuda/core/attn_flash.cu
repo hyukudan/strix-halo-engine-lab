@@ -12,12 +12,23 @@
 #include "attn_core/masks.hpp"
 #include "attn_core/prepared_step.hpp"
 #include "attn_core/relative_bias.hpp"
+#include "core/byte_range.hpp"
 #include "core/row_transforms.hpp"
+#include "strix/env_flags.hpp"
 
+#include <atomic>
 #include <cmath>
 #include <limits>
+#include <map>
+#include <mutex>
 
 namespace strix::cuda_core {
+
+bool use_prepared_flash_bias_ahead(const PreparedBf16Flash& p) {
+    static const bool enabled = envcfg::flag("STRIX_CUDA_FLASH_BIAS_AHEAD", false, EnvFlagMatch::exact);
+    return enabled && prepared_flash_bias_ahead(p);
+}
+
 namespace {
 
 constexpr int QB = 128, KT = 32;
@@ -138,7 +149,7 @@ static_assert(kPW == 16U && kPreparedProjectedBiasMaxExtent % 8U == 0U, "project
 constexpr std::uint32_t projected_smem_bytes(std::uint32_t extent) { return extent * kPW * 2U + 16U; }
 
 template <class LY, bool Prepared, bool Bf16Gate = false, bool Bidirectional = false, class Keys = ContiguousFlashKeys,
-          bool Projected = false>
+          bool Projected = false, bool BiasAhead = false>
 __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, GroupedView qv, const float* gate, GroupedView gv,
                                            const __nv_bfloat16* kc, const __nv_bfloat16* vc, std::uint32_t pos0,
                                            std::uint32_t rows, float* out, std::uint32_t nqb, std::uint32_t n_full,
@@ -271,6 +282,25 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
         }
     }
 
+    // BiasAhead (a compile-time trait; the host picks the instance per launch): the relative bias of a key tile is
+    // loaded one tile ahead. Same values (score_bias guards the extent and the causal side, qr < rows the row) and the
+    // same arithmetic, but the load latency overlaps the previous tile instead of following this tile's scores. Masked
+    // keys load a value that is never added. BiasAhead = false is the incumbent body (no look-ahead code is emitted).
+    constexpr bool kTileBias = Prepared && !Bidirectional && !Projected && BiasAhead;
+    [[maybe_unused]] float bias_next[4][4] = {};
+    [[maybe_unused]] const auto load_bias = [&](std::uint32_t key0, float (&dst)[4][4]) {
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const std::uint32_t kp = key0 + nt * 8 + 2 * q4 + (j & 1);
+                const std::uint32_t qp = j < 2 ? qpos0 : qpos1, qr = j < 2 ? qrow0 : qrow1;
+                dst[nt][j] = qr < rows ? bias.score_bias(qr, head, qp, kp) : 0.0f;
+            }
+    };
+    if constexpr (kTileBias)
+        if (act && ntiles != 0) load_bias(tile_start, bias_next);
+
     std::uint32_t stage_idx = 0;  // t % STAGES
     for (std::uint32_t t = 0; t < ntiles; ++t) {
         const std::uint32_t stage = stage_idx * LY::STAGE;
@@ -302,6 +332,14 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
             const unsigned char* sK = smem + stage;
             const std::uint32_t sV = smem_base + stage;
             float s[4][4];
+            [[maybe_unused]] float bias_tile[4][4];
+            if constexpr (kTileBias) {
+#pragma unroll
+                for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) bias_tile[nt][j] = bias_next[nt][j];
+                if (t + 1 < ntiles) load_bias(tile_start + (t + 1) * KT, bias_next);
+            }
 #pragma unroll
             for (int nt = 0; nt < 4; ++nt) s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.0f;
 #pragma unroll
@@ -342,6 +380,8 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
                                     b = attn_core::relative_bias_chain<kPW>(j < 2 ? bx0 : bx1, pairs);
                                 }
                                 v += b * log2e;
+                            } else if constexpr (kTileBias) {
+                                v += bias_tile[nt][j] * log2e;
                             } else {
                                 v += bias.score_bias(qr, head, qp, kp) * log2e;
                             }
@@ -464,6 +504,16 @@ void flash_prepared_step_kernel(AttentionDims d, PreparedBf16Flash prepared, con
                          *position, 1U, out, 1U, d.heads, 8, prepared);
 }
 
+// The same step with the relative bias loaded one key tile ahead (use_prepared_flash_bias_ahead picks it per launch).
+template <class LY>
+__global__ __launch_bounds__(256, 1)
+void flash_prepared_step_bias_ahead_kernel(AttentionDims d, PreparedBf16Flash prepared, const float* q,
+                                           const __nv_bfloat16* kc, const __nv_bfloat16* vc,
+                                           const std::uint32_t* position, float* out) {
+    flash_body<LY, true, false, false, ContiguousFlashKeys, false, true>(d, q, {1U, d.heads, d.head_dim}, nullptr, {}, kc, vc,
+                                                                 *position, 1U, out, 1U, d.heads, 8, prepared);
+}
+
 template <unsigned Rows, class LY>
 __global__ __launch_bounds__(256, 1) void flash_prepared_step_rows(attn_core::PreparedStepFlash args) {
     const unsigned r = blockIdx.y;
@@ -492,10 +542,11 @@ cudaError_t launch_flash_prepared(const AttentionDims& d, const PreparedBf16Flas
                                  std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream,
                                  const std::uint32_t* device_position) {
     if (device_position) {
-        if (auto e = cudaFuncSetAttribute(flash_prepared_step_kernel<LY>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                          smem_bytes<LY>()); e != cudaSuccess) return e;
-        flash_prepared_step_kernel<LY><<<d.heads, 256, smem_bytes<LY>(), stream>>>(
-            d, prepared, q, k_cache, v_cache, device_position, out);
+        const auto kernel = !Bidirectional && use_prepared_flash_bias_ahead(prepared) ? flash_prepared_step_bias_ahead_kernel<LY>
+                                                                                   : flash_prepared_step_kernel<LY>;
+        if (auto e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<LY>()); e != cudaSuccess)
+            return e;
+        kernel<<<d.heads, 256, smem_bytes<LY>(), stream>>>(d, prepared, q, k_cache, v_cache, device_position, out);
         return cudaGetLastError();
     }
     const auto tiles = (rows + QB - 1U) / QB;
@@ -627,20 +678,148 @@ bool can_launch_prepared_bf16_projected(const AttentionDims& d, const PreparedBf
         rows == 0 || d.heads == 0 || d.heads > max_floats / rows / kPW) return false;
     auto geometry = prepared;  // every other operand is admitted as the image route admits it
     geometry.relative_extent = 0;
-    return can_launch_prepared_bf16_flash(d, geometry, q, k_cache, v_cache, pos0, rows, out, pipe);
+    if (!can_launch_prepared_bf16_flash(d, geometry, q, k_cache, v_cache, pos0, rows, out, pipe)) return false;
+    // Live-through-launch operands vs everything the append and the launch write: the output image and both whole caches
+    // (the geometry admission above bounds each product below).
+    const std::size_t cache_bytes = std::size_t{d.max_positions} * d.kv_heads * d.head_dim * sizeof(__nv_bfloat16);
+    return core::reads_disjoint_from_writes(
+        {{projection.features, std::size_t{rows} * d.heads * kPW * sizeof(float)},
+         {projection.weights, std::size_t{extent} * kPW * sizeof(std::uint16_t)}},
+        {{out, std::size_t{rows} * d.heads * d.head_dim * sizeof(float)}, {k_cache, cache_bytes}, {v_cache, cache_bytes}});
 }
 
+namespace {
+std::atomic<int> projected_optin_override{0};  // test seam: a smaller opt-in limit than the device's (0 = none)
+
+// The dynamic shared-memory ceiling of one projected specialization on one device: set once, at the largest extent the
+// device's opt-in limit admits, and never changed again, so launches of different extents (other threads, other
+// streams) only ever read it. A refused setup is not remembered.
 template <class LY>
-cudaError_t launch_flash_projected(const AttentionDims& d, const PreparedBf16Flash& prepared, const FlashProjection& projection,
-                                   const float* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
-                                   std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream) {
+cudaError_t projected_ceiling(int& ceiling) {
+    static std::mutex guard;
+    static std::map<int, int> per_device;
+    int device = 0;
+    if (auto e = cudaGetDevice(&device); e != cudaSuccess) return e;
+    const std::lock_guard lock(guard);
+    auto found = per_device.find(device);
+    if (found == per_device.end()) {
+        int optin = 0;
+        if (auto e = cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device); e != cudaSuccess) return e;
+        const int widest = smem_bytes<LY>() + static_cast<int>(projected_smem_bytes(kPreparedProjectedBiasMaxExtent));
+        const int set = widest < optin ? widest : optin;
+        if (auto e = cudaFuncSetAttribute(flash_prepared_projected_kernel<LY>, cudaFuncAttributeMaxDynamicSharedMemorySize, set);
+            e != cudaSuccess) return e;
+        found = per_device.emplace(device, set).first;
+    }
+    ceiling = found->second;
+    if (const int cap = projected_optin_override.load(); cap != 0 && cap < ceiling) ceiling = cap;
+    return cudaSuccess;
+}
+
+// Every fallible host step of the projected launch: the dynamic shared memory of this extent must fit the ceiling.
+// A runtime failure is returned; `fits` false (with cudaSuccess) is the predictable refusal of a too-wide extent.
+template <class LY>
+cudaError_t projected_setup(std::uint32_t extent, int& smem, bool& fits) {
+    smem = smem_bytes<LY>() + static_cast<int>(projected_smem_bytes(extent));
+    fits = false;
+    int ceiling = 0;
+    if (auto e = projected_ceiling<LY>(ceiling); e != cudaSuccess) return e;
+    fits = smem <= ceiling;
+    return cudaSuccess;
+}
+}  // namespace
+
+// Test seam (declared by the fixture only): behave as if the device's shared-memory opt-in limit were `bytes` (0 = real).
+void set_projected_optin_limit_for_test(int bytes) { projected_optin_override.store(bytes); }
+
+// Enqueue only: the dynamic shared memory was fixed by projected_setup when the launch was prepared.
+template <class LY>
+cudaError_t launch_flash_projected(int smem, const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                   const FlashProjection& projection, const float* q, const __nv_bfloat16* k_cache,
+                                   const __nv_bfloat16* v_cache, std::uint32_t pos0, std::uint32_t rows, float* out,
+                                   cudaStream_t stream) {
     const auto tiles = (rows + QB - 1U) / QB;
-    const int smem = smem_bytes<LY>() + static_cast<int>(projected_smem_bytes(prepared.relative_extent));
-    if (auto e = cudaFuncSetAttribute(flash_prepared_projected_kernel<LY>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        e != cudaSuccess) return e;
     flash_prepared_projected_kernel<LY><<<tiles * d.heads, 256, smem, stream>>>(d, prepared, projection, q, k_cache, v_cache,
                                                                               pos0, rows, out, tiles);
     return cudaGetLastError();
+}
+
+namespace {
+// The failure word is raised atomically by the flash (and by the append's finite check after it): it must be aligned and
+// share no byte with any operand the launch reads or writes. Runs after the geometry admission has bounded every size.
+bool projected_failure_admitted(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                const PreparedBf16Projection& projection, const float* q, const __nv_bfloat16* k_cache,
+                                const __nv_bfloat16* v_cache, std::uint32_t rows, const float* out, const unsigned* failure) {
+    if (failure == nullptr) return true;
+    if (reinterpret_cast<std::uintptr_t>(failure) % alignof(unsigned) != 0) return false;
+    const std::size_t image = std::size_t{rows} * d.heads;
+    const std::size_t cache_bytes = std::size_t{d.max_positions} * d.kv_heads * d.head_dim * sizeof(__nv_bfloat16);
+    return core::reads_disjoint_from_writes(
+        {{q, image * d.head_dim * sizeof(float)}, {prepared.sinks, image * sizeof(float)},
+         {projection.features, image * kPW * sizeof(float)},
+         {projection.weights, std::size_t{prepared.relative_extent} * kPW * sizeof(std::uint16_t)},
+         {out, image * d.head_dim * sizeof(float)}, {k_cache, cache_bytes}, {v_cache, cache_bytes}},
+        {{failure, sizeof(unsigned)}});
+}
+}  // namespace
+
+cudaError_t prepare_prepared_bf16_projected(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                            const PreparedBf16Projection& projection, const float* q,
+                                            const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                            std::uint32_t pos0, std::uint32_t rows, float* out, FlashPipe pipe,
+                                            unsigned* failure, PreparedProjectedLaunch& launch, bool& declined) {
+    launch = {};
+    declined = true;
+    if (!can_launch_prepared_bf16_projected(d, prepared, projection, q, k_cache, v_cache, pos0, rows, out, pipe) ||
+        !projected_failure_admitted(d, prepared, projection, q, k_cache, v_cache, rows, out, failure))
+        return cudaSuccess;
+    int smem = 0;
+    bool fits = false;
+    const auto status = pipe == FlashPipe::swz3
+        ? projected_setup<SwzLayoutShape<128>>(prepared.relative_extent, smem, fits)
+        : projected_setup<PadLayoutShape<128>>(prepared.relative_extent, smem, fits);
+    if (status != cudaSuccess) {
+        declined = false;  // a runtime error, not a refusal
+        return status;
+    }
+    if (!fits) return cudaSuccess;
+    declined = false;
+    launch.pipe_ = pipe;
+    launch.smem_bytes_ = smem;
+    launch.dims_ = d;
+    launch.prepared_ = prepared;
+    launch.projection_ = projection;
+    launch.q_ = q;
+    launch.k_cache_ = k_cache;
+    launch.v_cache_ = v_cache;
+    launch.pos0_ = pos0;
+    launch.rows_ = rows;
+    launch.out_ = out;
+    launch.failure_ = failure;
+    return cudaSuccess;
+}
+
+cudaError_t prepare_prepared_bf16_projected(const AttentionDims& d, const PreparedBf16Flash& prepared,
+                                            const PreparedBf16Projection& projection, const float* q,
+                                            const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                            std::uint32_t pos0, std::uint32_t rows, float* out, FlashPipe pipe,
+                                            unsigned* failure, PreparedProjectedLaunch& launch) {
+    bool declined = false;
+    const auto status = prepare_prepared_bf16_projected(d, prepared, projection, q, k_cache, v_cache, pos0, rows, out, pipe,
+                                                        failure, launch, declined);
+    return status != cudaSuccess ? status : declined ? cudaErrorInvalidValue : cudaSuccess;
+}
+
+cudaError_t launch_prepared_bf16_projected(const PreparedProjectedLaunch& launch, cudaStream_t stream) {
+    if (!launch.admitted()) return cudaErrorInvalidValue;  // never prepared, or the preparation was refused
+    const FlashProjection bound{launch.projection_.features, launch.projection_.weights, launch.failure_};
+    if (launch.pipe_ == FlashPipe::swz3)
+        return launch_flash_projected<SwzLayoutShape<128>>(launch.smem_bytes_, launch.dims_, launch.prepared_, bound,
+                                                           launch.q_, launch.k_cache_, launch.v_cache_, launch.pos0_,
+                                                           launch.rows_, launch.out_, stream);
+    return launch_flash_projected<PadLayoutShape<128>>(launch.smem_bytes_, launch.dims_, launch.prepared_, bound, launch.q_,
+                                                       launch.k_cache_, launch.v_cache_, launch.pos0_, launch.rows_,
+                                                       launch.out_, stream);
 }
 
 cudaError_t attention_prefill_prepared_bf16(const AttentionDims& d, const PreparedBf16Flash& prepared,
@@ -648,12 +827,11 @@ cudaError_t attention_prefill_prepared_bf16(const AttentionDims& d, const Prepar
                                             const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
                                             std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream,
                                             FlashPipe pipe, unsigned* failure) {
-    if (!can_launch_prepared_bf16_projected(d, prepared, projection, q, k_cache, v_cache, pos0, rows, out, pipe))
-        return cudaErrorInvalidValue;
-    const FlashProjection bound{projection.features, projection.weights, failure};
-    if (pipe == FlashPipe::swz3)
-        return launch_flash_projected<SwzLayoutShape<128>>(d, prepared, bound, q, k_cache, v_cache, pos0, rows, out, stream);
-    return launch_flash_projected<PadLayoutShape<128>>(d, prepared, bound, q, k_cache, v_cache, pos0, rows, out, stream);
+    PreparedProjectedLaunch launch;
+    if (auto refused = prepare_prepared_bf16_projected(d, prepared, projection, q, k_cache, v_cache, pos0, rows, out, pipe,
+                                                       failure, launch);
+        refused != cudaSuccess) return refused;
+    return launch_prepared_bf16_projected(launch, stream);
 }
 
 template <unsigned Rows>
@@ -694,15 +872,35 @@ __global__ void __launch_bounds__(256, 1)
                                        b.pos0, 1U, b.out, 1U, d.heads, 8, b.prepared);
 }
 
+// The lanes with the relative bias loaded one key tile ahead (lanes_bias_ahead picks it per launch; same bits).
+template <class LY>
+__global__ void __launch_bounds__(256, 1)
+    flash_prepared_lanes_bias_ahead_kernel(AttentionDims d, PreparedBf16Flash shape, PreparedBf16LaneImages images,
+                                           attn::lanes::LaneBlock block) {
+    const auto b = lanes_detail::bind_lane(d, shape, images, block.lane[blockIdx.y],
+                                           std::size_t{block.first_row} + blockIdx.y);
+    flash_body<LY, true, false, false, ContiguousFlashKeys, false, true>(b.dims, b.q, {1U, d.heads, d.head_dim}, nullptr, {},
+                                                                 b.k_cache, b.v_cache, b.pos0, 1U, b.out, 1U, d.heads,
+                                                                 8, b.prepared);
+}
+
+// Every lane binds its bias rows from images.relative_bias with the launch's window and extent, so the one-row
+// step's rule (use_prepared_flash_bias_ahead) holds for all lanes of a launch alike.
+[[nodiscard]] bool lanes_bias_ahead(PreparedBf16Flash shape, const PreparedBf16LaneImages& images) {
+    shape.relative_bias = images.relative_bias;
+    return use_prepared_flash_bias_ahead(shape);
+}
+
 template <class LY>
 cudaError_t launch_flash_prepared_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
                                         const PreparedBf16LaneImages& images, const attn::lanes::LaneBlock& block,
                                         cudaStream_t stream) {
     if (block.count == 0U) return cudaErrorInvalidValue;
-    if (auto e = cudaFuncSetAttribute(flash_prepared_lanes_kernel<LY>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                      smem_bytes<LY>()); e != cudaSuccess) return e;
-    flash_prepared_lanes_kernel<LY><<<dim3(d.heads, block.count), 256, smem_bytes<LY>(), stream>>>(
-        d, shape, images, block);
+    const auto kernel = lanes_bias_ahead(shape, images) ? flash_prepared_lanes_bias_ahead_kernel<LY>
+                                                        : flash_prepared_lanes_kernel<LY>;
+    if (auto e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<LY>());
+        e != cudaSuccess) return e;
+    kernel<<<dim3(d.heads, block.count), 256, smem_bytes<LY>(), stream>>>(d, shape, images, block);
     return cudaGetLastError();
 }
 
@@ -719,14 +917,26 @@ __global__ void __launch_bounds__(256, 1)
 }
 
 template <class LY>
+__global__ void __launch_bounds__(256, 1)
+    flash_prepared_step_lanes_bias_ahead_kernel(AttentionDims d, PreparedBf16Flash shape,
+                                                PreparedBf16LaneImages images, PreparedBf16StepLanes lanes) {
+    const auto b = lanes_detail::bind_lane(d, shape, images, lanes_detail::resolve_step_lane(lanes, blockIdx.y),
+                                           blockIdx.y);
+    flash_body<LY, true, false, false, ContiguousFlashKeys, false, true>(b.dims, b.q, {1U, d.heads, d.head_dim}, nullptr, {},
+                                                                 b.k_cache, b.v_cache, b.pos0, 1U, b.out, 1U, d.heads,
+                                                                 8, b.prepared);
+}
+
+template <class LY>
 cudaError_t launch_flash_prepared_step_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
                                              const PreparedBf16LaneImages& images, const PreparedBf16StepLanes& lanes,
                                              cudaStream_t stream) {
     if (lanes.lanes.lanes == 0U) return cudaErrorInvalidValue;
-    if (auto e = cudaFuncSetAttribute(flash_prepared_step_lanes_kernel<LY>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                      smem_bytes<LY>()); e != cudaSuccess) return e;
-    flash_prepared_step_lanes_kernel<LY><<<dim3(d.heads, lanes.lanes.lanes), 256, smem_bytes<LY>(), stream>>>(
-        d, shape, images, lanes);
+    const auto kernel = lanes_bias_ahead(shape, images) ? flash_prepared_step_lanes_bias_ahead_kernel<LY>
+                                                        : flash_prepared_step_lanes_kernel<LY>;
+    if (auto e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<LY>());
+        e != cudaSuccess) return e;
+    kernel<<<dim3(d.heads, lanes.lanes.lanes), 256, smem_bytes<LY>(), stream>>>(d, shape, images, lanes);
     return cudaGetLastError();
 }
 

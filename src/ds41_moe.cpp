@@ -1,5 +1,5 @@
 #include "strix/ds41_moe.hpp"
-#include "strix/moe/route_policy.hpp"
+#include "strix/moe/route_project.hpp"
 
 #include <algorithm>
 #include <array>
@@ -77,32 +77,20 @@ RouterOutput reference_router(std::span<const float> x, std::uint32_t rows, std:
         weight.size() < static_cast<std::size_t>(experts) * hidden || bias.size() < experts ||
         (!image_rows.empty() && (image_rows.size() < rows || bias_image.size() < experts)))
         throw std::invalid_argument("ds41 router inputs are inconsistent");
+    // Scores, selection and weights: the shared projected router (include/strix/moe/route_project.hpp: unfused lane
+    // chain, router_score, per-row bias class, policy from the model description).
+    struct Math {
+        static float exp(float v) { return declared_exp(v); }
+        static float log1p(float v) { return declared_log1p(v); }
+        static float sqrt(float v) { return declared_sqrt(v); }
+    };
     RouterOutput out;
     out.scores.resize(static_cast<std::size_t>(rows) * experts);
-    for (std::uint32_t r = 0; r < rows; ++r)
-        for (std::uint32_t e = 0; e < experts; ++e) {
-            std::array<float, product_lanes> lanes{};
-            for (std::uint32_t i = 0; i < hidden; ++i)
-                lanes[i % product_lanes] = lanes[i % product_lanes] + weight[static_cast<std::size_t>(e) * hidden + i] *
-                    x[static_cast<std::size_t>(r) * hidden + i];
-            for (unsigned d = 16U; d; d /= 2U) {
-                std::array<float, product_lanes> next{};
-                for (unsigned l = 0; l < product_lanes; ++l) next[l] = lanes[l] + lanes[l ^ d];
-                lanes = next;
-            }
-            out.scores[static_cast<std::size_t>(r) * experts + e] = router_score(lanes[0]);
-        }
     out.ids.resize(static_cast<std::size_t>(rows) * top_k);
     out.weights.resize(static_cast<std::size_t>(rows) * top_k);
-    // Selection and weights: the shared router (include/strix/moe/route_policy.hpp) on the DS41 policy.
-    const strix::moe::RoutePolicy policy = route_policy(experts, top_k, route_scale);
-    const std::span<const float> scores(out.scores);
-    for (std::uint32_t r = 0; r < rows; ++r) {
-        const auto at = static_cast<std::size_t>(r) * top_k;
-        strix::moe::route_select_ref(policy, scores.subspan(static_cast<std::size_t>(r) * experts, experts),
-                              !image_rows.empty() && image_rows[r] ? bias_image : bias,
-                              std::span<std::uint32_t>(out.ids).subspan(at, top_k), std::span<float>(out.weights).subspan(at, top_k));
-    }
+    strix::moe::route_project_rows_ref<strix::moe::RouteLaneDot<strix::moe::RouteAccMulAdd, product_lanes>, Math>(
+        route_policy(experts, top_k, route_scale), x, rows, hidden, weight, bias, bias_image, image_rows, out.scores,
+        out.ids, out.weights);
     return out;
 }
 

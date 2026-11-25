@@ -5,10 +5,14 @@ if(TARGET strix_cohort_session AND TARGET strix_inkling2_mini_checkpoint)
     strix_target_warnings(strix_inkling2_mini_service)
     if(BUILD_TESTING)
         add_executable(inkling2-mini-serve-test tests/inkling2/mini_serve_test.cpp)
+        target_include_directories(inkling2-mini-serve-test PRIVATE apps)
         target_link_libraries(inkling2-mini-serve-test PRIVATE strix_inkling2_mini_service strix_session_shell)
         strix_target_warnings(inkling2-mini-serve-test)
         add_test(NAME inkling2-mini-serve COMMAND inkling2-mini-serve-test "${CMAKE_SOURCE_DIR}")
-        set_tests_properties(inkling2-mini-serve PROPERTIES LABELS "cpu;inkling2" TIMEOUT 30)
+        add_test(NAME inkling2-mini-profile-parity COMMAND inkling2-mini-serve-test
+            "${CMAKE_SOURCE_DIR}" --profile-parity)
+        set_tests_properties(inkling2-mini-serve inkling2-mini-profile-parity
+            PROPERTIES LABELS "cpu;inkling2" TIMEOUT 30)
         set(STRIX_INKLING2_SERVE_CHECKPOINT "" CACHE FILEPATH "Inkling checkpoint for real CPU cohort ID parity")
         add_executable(inkling2-mini-serve-cpu-model-test EXCLUDE_FROM_ALL tests/inkling2/mini_serve_cpu_model_test.cpp
             src/inkling2/inkling2_mini_host.cpp src/inkling2/inkling2_mini_dspark_reference.cpp)

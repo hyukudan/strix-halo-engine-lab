@@ -6,6 +6,7 @@ endif()
 enable_language(CUDA)
 include(CTest)
 include("${CMAKE_CURRENT_LIST_DIR}/CudaTokenSampling.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/CoreRowsPlan.cmake")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,10 +43,13 @@ add_library(strix_cuda_core_kernels STATIC
     ${_cc_root}/src/cuda/core/attn_flash8.cu
     ${_cc_root}/src/cuda/core/recur_parity.cu
     ${_cc_root}/src/cuda/core/recur_chunk.cu  # FAST chunked GDN prefill (gdn-chunk16-f32-v1)
+    ${_cc_root}/src/cuda/core/attn_decode.cu  # decode_position_split (attn_core/position_split.hpp) and the decode kernels
+    ${_cc_root}/src/cuda/core/recur_decode.cu  # enqueue_decode_replay_step (GDN decode replay step)
+    ${_cc_root}/src/cuda/core/amd_math_tables.cu  # gfx1151 math tables read by recur_decode.cu
     ${_cc_root}/src/cuda/core/step_inputs.cu  # X3 step-input scatter (plain / tree / fed rows / slots)
     ${_cc_root}/src/cuda/core/lookup_cuda.cu  # K10c token lookup family
     ${_cc_root}/src/cuda/core/embed_splice.cu)  # provided embedding rows (session/embed_splice_device.hpp)
-target_link_libraries(strix_cuda_core_kernels PUBLIC strix_cuda_token_sampling)
+target_link_libraries(strix_cuda_core_kernels PUBLIC strix_cuda_token_sampling strix_core_rows_plan)
 target_include_directories(strix_cuda_core_kernels PUBLIC ${_cc_root}/include PRIVATE ${_cc_root}/src)
 # Identity: no FMA contraction, IEEE division and sqrt, no flush-to-zero (as the existing Qwen CUDA build).
 target_compile_options(strix_cuda_core_kernels PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
@@ -58,7 +62,7 @@ include(${CMAKE_CURRENT_LIST_DIR}/StrixDevice.cmake)
 add_library(strix_qwen35_cuda STATIC ${_cc_root}/src/qwen35/cuda/engine.cu ${_cc_root}/src/gguf_reader.cpp
     ${_cc_root}/src/qwen35/config.cpp ${_cc_root}/src/qwen35/family.cpp ${_cc_root}/src/model_family_registry.cpp)
 target_link_libraries(strix_qwen35_cuda PUBLIC strix_cuda_core_kernels)
-target_include_directories(strix_qwen35_cuda PUBLIC ${_cc_root}/include)
+target_include_directories(strix_qwen35_cuda PUBLIC ${_cc_root}/include PRIVATE ${_cc_root}/src)
 target_compile_options(strix_qwen35_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 if(MSVC)
     target_compile_options(strix_qwen35_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
@@ -158,6 +162,15 @@ target_link_libraries(cuda_core_decode_split_lanes_fixture PRIVATE strix_cuda_co
 if(MSVC)
     target_compile_options(cuda_core_decode_split_lanes_fixture PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
+# Device fixture: the planes enqueue_bf16_dense_rows reports are the planes of the tall split that ran (tall tile, FP32 row grid,
+# mixed, short rows, device profile, rejected), never the requested count or a stale value.
+add_executable(cuda_core_bf16_plane_report_test ${_cc_root}/tests/cuda_core/bf16_plane_report_test.cu)
+target_link_libraries(cuda_core_bf16_plane_report_test PRIVATE strix_cuda_core_kernels)
+target_include_directories(cuda_core_bf16_plane_report_test PRIVATE ${_cc_root}/include ${_cc_root}/src)
+target_compile_options(cuda_core_bf16_plane_report_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(cuda_core_bf16_plane_report_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
 add_executable(cuda_core_dense_big_test ${_cc_root}/tests/cuda_core/dense_big_test.cu)
 target_link_libraries(cuda_core_dense_big_test PRIVATE strix_cuda_core_kernels)
 target_compile_options(cuda_core_dense_big_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
@@ -190,6 +203,7 @@ endif()
 if(NOT DEFINED STRIX_WARNINGS_AS_ERRORS OR STRIX_WARNINGS_AS_ERRORS)
     list(APPEND _cc_mini_warnings ${_cc_mini_host_werror} -Werror=all-warnings)
 endif()
+target_compile_options(cuda_core_bf16_plane_report_test PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${_cc_mini_warnings}>")
 
 if(TARGET strix_inkling2_mini_checkpoint)
     add_executable(strix-inkling2-mini-cuda ${_cc_root}/apps/inkling2_mini_cuda.cu)
@@ -228,17 +242,22 @@ endif()
 if(BUILD_TESTING)
     add_executable(strix-cuda-inkling2-mini-dense-test ${_cc_root}/tests/inkling2/mini_dense_cuda.cu)
     target_link_libraries(strix-cuda-inkling2-mini-dense-test PRIVATE strix_cuda_core_kernels)
+    add_executable(strix-cuda-inkling2-mini-controller-operand-test ${_cc_root}/tests/inkling2/mini_controller_operand_cuda.cu)
+    target_link_libraries(strix-cuda-inkling2-mini-controller-operand-test PRIVATE strix_cuda_core_kernels)
     add_executable(strix-cuda-inkling2-mini-residual-test ${_cc_root}/tests/inkling2/mini_residual_device.cu)
     target_link_libraries(strix-cuda-inkling2-mini-residual-test PRIVATE strix_cuda_core_kernels)
     add_executable(strix-cuda-inkling2-mini-short-conv-test ${_cc_root}/tests/inkling2/mini_short_conv_cuda.cu)
     add_executable(strix-cuda-inkling2-mini-step-graph-test ${_cc_root}/tests/inkling2/step_graph_cuda.cu)
     add_executable(strix-cuda-inkling2-mini-attention-test ${_cc_root}/tests/inkling2/mini_attention_reference_cuda.cu)
     target_link_libraries(strix-cuda-inkling2-mini-attention-test PRIVATE strix_cuda_core_kernels)
+    add_executable(strix-cuda-inkling2-mini-projected-bias-test ${_cc_root}/tests/inkling2/mini_projected_bias_cuda.cu)
+    target_link_libraries(strix-cuda-inkling2-mini-projected-bias-test PRIVATE strix_cuda_core_kernels)
     add_executable(strix-cuda-resident-lowbit-refusal-test ${_cc_root}/tests/cuda/resident_lowbit_refusal_tests.cu)
-    target_link_libraries(strix-cuda-resident-lowbit-refusal-test PRIVATE strix_cuda_core_kernels)
+    target_link_libraries(strix-cuda-resident-lowbit-refusal-test PRIVATE strix_cuda_core_kernels strix-weight)
     set(_cc_mini_tests strix-cuda-inkling2-mini-short-conv-test strix-cuda-inkling2-mini-attention-test
         strix-cuda-inkling2-mini-dense-test strix-cuda-inkling2-mini-residual-test strix-cuda-inkling2-mini-step-graph-test
-        strix-cuda-resident-lowbit-refusal-test)
+        strix-cuda-inkling2-mini-projected-bias-test
+        strix-cuda-inkling2-mini-controller-operand-test strix-cuda-resident-lowbit-refusal-test)
     if(TARGET strix_inkling2_mini_checkpoint)
         add_executable(strix-cuda-inkling2-mini-dspark-test ${_cc_root}/tests/inkling2/mini_dspark_device.cu)
         target_link_libraries(strix-cuda-inkling2-mini-dspark-test PRIVATE
@@ -264,10 +283,24 @@ if(BUILD_TESTING)
         target_link_libraries(${_cc_mini_verify_target} PRIVATE
             strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core)
         # Serving cohort lanes vs each lane alone: bitwise logits, appended K/V rows, histories + build digests.
-        add_executable(strix-cuda-inkling2-mini-cohort-lanes-test ${_cc_root}/tests/inkling2/mini_cohort_lanes_cuda.cu)
+        add_executable(strix-cuda-inkling2-mini-cohort-lanes-test ${_cc_root}/tests/inkling2/mini_cohort_lanes_cuda.cu
+            ${_cc_root}/src/serve/cohort_decode.cpp ${_cc_root}/src/serve/step_planner.cpp)
         target_link_libraries(strix-cuda-inkling2-mini-cohort-lanes-test PRIVATE
-            strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core)
+            strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core strix_serve)
         list(APPEND _cc_mini_verify_target strix-cuda-inkling2-mini-cohort-lanes-test)
+        # The resident attention operand class through the production upload, binding and backend on a checkpoint-shaped
+        # staged model (generated in the test: no model file): one plane finite, three planes refused or without scan scratch.
+        add_executable(strix-cuda-inkling2-mini-operand-class-test ${_cc_root}/tests/inkling2/mini_operand_class_cuda.cu)
+        target_link_libraries(strix-cuda-inkling2-mini-operand-class-test PRIVATE
+            strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core)
+        list(APPEND _cc_mini_tests strix-cuda-inkling2-mini-operand-class-test)
+        # Block candidate tap (no model file): forced rows at the session end through append_tap, a compiled and
+        # executed recipe, and the complete multi-tap BF16 store against a serial reference with canaries.
+        add_executable(strix-cuda-inkling2-mini-block-candidate-test ${_cc_root}/tests/inkling2/mini_block_candidate_cuda.cu
+            ${_cc_root}/src/inkling2/inkling2_mini_block_candidate_cuda.cu)
+        target_link_libraries(strix-cuda-inkling2-mini-block-candidate-test PRIVATE
+            strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core strix_exec)
+        list(APPEND _cc_mini_tests strix-cuda-inkling2-mini-block-candidate-test)
     endif()
     foreach(t IN LISTS _cc_mini_tests _cc_mini_verify_target)
         target_include_directories(${t} PRIVATE ${_cc_root}/src ${_cc_root}/include)
@@ -283,7 +316,7 @@ if(BUILD_TESTING)
         set_tests_properties(${t} PROPERTIES LABELS "gpu;cuda;inkling2")
     endforeach()
     add_test(NAME gguf_pack_writer_test COMMAND gguf_pack_writer_test)
-    foreach(t cuda_core_test qwen35_cuda_engine_test cuda_core_nvfp4_test cuda_core_dense_big_test)
+    foreach(t cuda_core_test qwen35_cuda_engine_test cuda_core_nvfp4_test cuda_core_dense_big_test cuda_core_bf16_plane_report_test)
         add_test(NAME ${t} COMMAND ${t})
         set_tests_properties(${t} PROPERTIES LABELS "gpu;cuda")
     endforeach()

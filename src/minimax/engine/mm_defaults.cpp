@@ -104,7 +104,7 @@ constexpr Item kItems[] = {
     // prefill
     {"pf_msa_batch", "STRIX_MM_PF_MSA_BATCH", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
     {"pf_dense_mlp", "STRIX_MM_PF_DENSE_MLP", "1", "0",
-     "Prefill: exact (== strix_gemm bitwise, the pf_dense_qkv contract); dense MLP of layers 0-2 on the v4 core for 4096-row pieces"},
+     "Prefers dense MLP v4 for 4096-row pieces (== strix_gemm bitwise, the pf_dense_qkv contract)"},
     {"pf_flash_keys", "STRIX_MM_PF_FLASH_KEYS", "2", "0",
      "Prefill: schedule only, same bits (FAST flash output fnv identical); key fragments in two halves around the value loads (attn_core kKsKeysHalves)"},
     {"pf_msa_rg_rows", "STRIX_MM_PF_MSA_RG_ROWS", "auto", "4",
@@ -149,9 +149,8 @@ constexpr Item kItems[] = {
     {"pf_late_src_fence", "STRIX_MM_PF_LATE_SRC_FENCE", "1", "0",
      "Admitted grouped async source lifetime; TP2 IDs identical, combined -2.3/-2.5 %; full state/workload qualification pending"},
     {"pf_order", "STRIX_MMX_PF_ORDER", "invariant", "adaptive",
-     "Chunk-invariant linear order mmx-pf-linear-s1-v1 (bits independent of chunking; cache identity prefill_order=): gate32 6 x 32K "
-     "units vs 3 L0 nulls each, pooled dNLL -0.053 CI95 [-0.148,+0.041] inside null spread, task 40/42 == 40/42; "
-     "a defaulted value falls back to adaptive when the invariant route is unmet"},
+     "Fixed K order for EXL3 prefill q/k/v/o and routed/shared gate/up/down (dense MLP tails with STRIX_MM_PF_DENSE_TAIL_FIXED=1); "
+     "a defaulted value falls back to adaptive when the invariant route is unmet (explicit invariant refuses)"},
     // transport (host path, bits unchanged)
     {"dist_crc_parallel", "STRIX_DIST_CRC_PARALLEL", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
     {"dist_host_crc_overlap", "STRIX_DIST_HOST_CRC_OVERLAP", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
@@ -341,7 +340,26 @@ const profile::Engine& profile_engine() {
     return engine;
 }
 
+namespace {
+// STRIX_MM_PF_DENSE_TAIL_FIXED as profile_resolution reads it: unset / 0 / 1, and 1 only inside the invariant
+// EXL3 order outside the FP32 prefill identity. A combination that would print and stamp v2 while another route
+// runs throws (rank and serve resolve it at startup, before the pair connects).
+void validate_dense_tail_request(const Lookup& env) {
+    const char* v = env("STRIX_MM_PF_DENSE_TAIL_FIXED");
+    if (v == nullptr || std::strcmp(v, "0") == 0) return;
+    if (std::strcmp(v, "1") != 0)
+        throw std::invalid_argument("STRIX_MM_PF_DENSE_TAIL_FIXED: 0 (library dense MLP tails, default) or 1 (fixed order)");
+    if (linear_order(env) != "invariant")
+        throw std::invalid_argument("STRIX_MM_PF_DENSE_TAIL_FIXED=1 needs STRIX_MMX_PF_ORDER=invariant (the adaptive order, "
+                                    "also selected by the baseline, keeps the library dense tails)");
+    if (route::fp32_profile(env("STRIX_MM_PREFILL_IDENTITY")))
+        throw std::invalid_argument("STRIX_MM_PF_DENSE_TAIL_FIXED=1 conflicts with STRIX_MM_PREFILL_IDENTITY=fp32 (the FP32 "
+                                    "prefill linears do not run the fixed-order dense tails)");
+}
+}  // namespace
+
 profile::Resolution profile_resolution(const Lookup& env) {
+    validate_dense_tail_request(env);  // the dense tail row is resolved and validated here, once, for every reader
     const auto p = prefill_policy(env);
     const auto base = strix::fast_profile::lookup(p.canonical, env);
     const std::string effective_mode = std::to_string(p.msa_flash);
@@ -429,6 +447,16 @@ void check_peer(const std::function<void(const void*, void*, std::size_t)>& exch
     check_peer(profile_resolution(process_env), exchange);
 }
 
+bool dense_tail_fixed(const Lookup& env) {
+    // One authority: the row of the shared profile resolution, validated inside it (the same answer the
+    // fingerprint, the effective config and the rank agreement carry). A conflicting request throws there.
+    const auto pr = profile_resolution(env);
+    const auto* row = pr.find("pf_dense_tail_fixed");
+    return row != nullptr && row->value == "1";
+}
+std::string invariant_order_id(const Lookup& env) {
+    return dense_tail_fixed(env) ? kInvariantDenseTailOrderId : kInvariantOrderId;
+}
 std::string linear_order(const Lookup& env) {
     for (const auto& r : resolve(env))  // a table default counts exactly like an explicit value
         if (std::strcmp(r.item->env, "STRIX_MMX_PF_ORDER") == 0) return r.value;
@@ -437,6 +465,7 @@ std::string linear_order(const Lookup& env) {
 }
 
 std::string prefill_identity(const Lookup& env) {
+    (void)dense_tail_fixed(env);  // a conflicting dense tail request never yields a cache identity
     const auto p = prefill_policy(env);
     // MSA attention policies under prefill_msa (unchanged form), the index projection member under prefill_idxproj.
     std::string msa, idx;
@@ -454,9 +483,8 @@ std::string prefill_identity(const Lookup& env) {
         out += std::string(out.empty() ? "" : ";") + "tp2_exchange_fmt=" + strix::xport::exchange_format_name(p.exchange_fmt);
     if (p.router_wmma) out += std::string(out.empty() ? "" : ";") + "prefill_router=mm-pf-router-wmma-v1-l" + p.router_wmma_layers;
     if (fast_i4_format(env)) out += std::string(out.empty() ? "" : ";") + "moe_prefill_format=fast_i4";
-    // Chunk-invariant linear order (MoE gate/up/down + dense q/k/v/o, fixed S = 1): different bits from the adaptive
-    // order, so a parked state written under one never restores into the other.
-    if (linear_order(env) == "invariant") out += std::string(out.empty() ? "" : ";") + "prefill_order=mmx-pf-linear-s1-v1";
+    // v2 adds the dense MLP tails (STRIX_MM_PF_DENSE_TAIL_FIXED=1), whose K chain differs from the library route.
+    if (linear_order(env) == "invariant") out += std::string(out.empty() ? "" : ";") + "prefill_order=" + invariant_order_id(env);
     // TURBO: versioned name + effective levers + weight identity, even with every lever off (empty outside turbo).
     if (const auto pr = profile_resolution(env); pr.is_turbo())
         out += std::string(out.empty() ? "" : ";") + pr.cache_namespace();
@@ -708,7 +736,11 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
     // requested = how the order was asked (unset = "default"); effective resolves the pf_order table item like apply().
     const auto& order = strix::moe_core::resolve_grouped_order(linear_order(env).c_str());
     o << "STRIX_MMX_PF_ORDER.requested=" << (order_asked ? order_asked : "default") << "\n"
-      << "STRIX_MMX_PF_ORDER.effective=" << (order.invariant() ? "invariant" : "adaptive") << "\n";
+      << "STRIX_MMX_PF_ORDER.effective=" << (order.invariant() ? "invariant" : "adaptive") << "\n"
+      // The adaptive lever picks S from expert occupancy / chunk rows: not batch-invariant (explicit opt-in only).
+      << "STRIX_MMX_PF_ORDER.batch_invariant=" << (order.invariant() ? "yes" : "no") << "\n"
+      << "STRIX_MMX_PF_ORDER.scope=exl3-prefill-k-order:q/k/v/o,routed/shared"
+      << (dense_tail_fixed(env) ? "/dense-gate/up/down" : "") << "\n";
     o << "build.gu4_scalar=" << (STRIX_MM_GU4_SCALAR ? "on" : "off") << "\n";
     for (const Resolved& r : resolve(env)) o << r.item->env << "=" << r.value << "\n";
     {   // FAST prefill profile rows (default OFF): the same resolution the engine, the cache identity and the ranks use.
@@ -747,6 +779,7 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
           << "profile_fingerprint=" << profile::hex_identity(pr.fingerprint()) << "\n";
     }
     o << "STRIX_MM_PF_ASYNC_MIN_ROWS=" << pf_async_min_rows(env("STRIX_MM_PF_ASYNC_MIN_ROWS")) << "\n";
+    o << "STRIX_MM_PF_DENSE_TAIL_FIXED=" << (dense_tail_fixed(env) ? 1 : 0) << "\n";
     const auto prior = dspark::parse_prior(cli.dspark_prior.empty() ? env("STRIX_MM_DSPARK_PRIOR") : cli.dspark_prior.c_str());
     o << "dspark.prior=" << dspark::prior_name(prior) << "\n";
     if (cli.app == "serve") {
@@ -824,6 +857,7 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
     apply();
     (void)split_frame_policy();  // validate and record the lever on both entry points (rank CLI and serve)
     (void)pf_async_min_rows(process_env("STRIX_MM_PF_ASYNC_MIN_ROWS"));
+    (void)dense_tail_fixed(process_env);  // validate the opt-in and its order / FP32 conflicts on both entry points
     (void)effective_config(parse_cli(app, args), process_env);
     if (!print) {  // a weight request this build cannot honour refuses the run (printed, not refused, above)
         profile_resolution(process_env).weights.require_honoured();

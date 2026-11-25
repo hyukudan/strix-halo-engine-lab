@@ -5,8 +5,11 @@
 // prefill call until the next call or the lane's release, and commit needs a pending verify window.
 #include "strix/serve/fixed_kv_cohort.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -139,6 +142,68 @@ void test_sampled_logits() {
     check(!cohort.supports_final_logits(), "decoder may decline at run time");
 }
 
+// Decoder that takes the window's score-read requirement (CohortGroup::reads_scores of any lane).
+struct ScoreReadDecoder : LogitsDecoder {
+    std::vector<int> reads;  // per decode_slots call: 1 = some lane reads its final scores
+    void decode_slots(std::span<const std::uint32_t> slots, std::span<const std::uint32_t> tokens,
+                      std::span<std::uint32_t> top, bool reads_scores) {
+        reads.push_back(reads_scores ? 1 : 0);
+        LogitsDecoder::decode_slots(slots, tokens, top);
+    }
+};
+
+void test_score_reads() {
+    auto decoder = std::make_unique<ScoreReadDecoder>();
+    auto* raw = decoder.get();
+    FixedKvCohort<ScoreReadDecoder> cohort(std::move(decoder), 64U, 4U, 4U);
+    const std::uint32_t tokens[] = {1U, 2U};
+    const std::uint32_t keep[] = {1U, 1U};
+    std::uint32_t top[2] = {};
+    const CohortGroup greedy[] = {{2U, 1U, false}, {0U, 1U, false}};
+    cohort.verify(greedy, tokens, top);
+    cohort.commit(keep);
+    const CohortGroup mixed[] = {{2U, 1U, false}, {0U, 1U, true}};
+    cohort.verify(mixed, tokens, top);
+    check(cohort.read_final_logits(0U)[1] == 0.0F, "the sampled lane reads its row");
+    cohort.commit(keep);
+    check(raw->reads == std::vector<int>{0, 1}, "decode_slots learns whether any lane of the window reads scores");
+    check(top[0] == 2001U && top[1] == 2U, "the score-read form returns the same picks");
+}
+
+// A score-aware decoder that withholds the scores of a window passed as unread (its reads return NaN), as a pick-only
+// form would: a caller that names no requirement ({lane, rows}) must still read exact scores.
+struct WithholdingDecoder : LogitsDecoder {
+    bool withheld = false;
+    void decode_slots(std::span<const std::uint32_t> slots, std::span<const std::uint32_t> tokens,
+                      std::span<std::uint32_t> top, bool reads_scores) {
+        withheld = !reads_scores;
+        LogitsDecoder::decode_slots(slots, tokens, top);
+    }
+    void read_slot_logits(std::uint32_t row, std::span<float> out) const {
+        LogitsDecoder::read_slot_logits(row, out);
+        if (withheld) std::fill(out.begin(), out.end(), std::numeric_limits<float>::quiet_NaN());
+    }
+};
+
+void test_unannotated_groups_read() {
+    auto decoder = std::make_unique<WithholdingDecoder>();
+    auto* raw = decoder.get();
+    FixedKvCohort<WithholdingDecoder> cohort(std::move(decoder), 64U, 4U, 4U);
+    const std::uint32_t tokens[] = {1U, 2U};
+    const std::uint32_t keep[] = {1U, 1U};
+    std::uint32_t top[2] = {};
+    const CohortGroup legacy[] = {{2U, 1U}, {0U, 1U}};
+    cohort.verify(legacy, tokens, top);
+    check(!raw->withheld, "a group that names no requirement is read (default reads_scores)");
+    const auto lane0 = cohort.read_final_logits(0U);
+    check(!std::isnan(lane0[0]) && lane0[0] == 1.0F && lane0[1] == 0.0F, "the unannotated caller reads exact scores");
+    cohort.commit(keep);
+    const CohortGroup none[] = {{2U, 1U, false}, {0U, 1U, false}};
+    cohort.verify(none, tokens, top);
+    check(raw->withheld, "only an explicit no-consumer window may take the pick form");
+    cohort.commit(keep);
+}
+
 // Emits-first decoder: each prefill call returns id 7000 + 10 * lane + rows; its final scores are row 0 of the window
 // (LogitsDecoder: {0, lane, 0, lane}).
 struct EmitsDecoder : LogitsDecoder {
@@ -252,6 +317,8 @@ int main() {
     test_geometry();
     test_greedy_window();
     test_sampled_logits();
+    test_score_reads();
+    test_unannotated_groups_read();
     test_prefill_emits_first();
     test_prefill_route_selected();
     if (failures != 0) {

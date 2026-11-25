@@ -1,6 +1,6 @@
 #include "strix/weight/lowbit_pack.hpp"
 
-#include "h3/te/te_sha256.hpp"
+#include "core/sha256.hpp"
 #include "strix/weight/host_q8.hpp"
 
 #include <algorithm>
@@ -233,7 +233,7 @@ Status LowbitPack::open(const std::string& path, const Digest256& checkpoint, Lo
 
     // The identity names the content: the header and every payload byte, so packs coded from other statistics or
     // settings differ even when their tensors, shapes and sources match.
-    h3::te::Sha256 hash;
+    core::Sha256 hash;
     hash.update(header.data(), header.size());
     std::vector<Byte> chunk(std::size_t{1} << 20);
     for (const auto& e : entries)

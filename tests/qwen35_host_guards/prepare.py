@@ -114,7 +114,7 @@ b = text.index(";", a) + 1
 
 # The host window guard records scratch writes with its existing CPU mocks.
 # Project the shared scatter views into the mocks' by-value inputs.
-(out / "window_types.inc").write_text(f'#include "{(root / "src/cuda/core/step_inputs.cuh").as_posix()}"\n' + r'''
+(out / "window_types.inc").write_text(f'#include "{(root / "src/core/step_inputs_plan.hpp").as_posix()}"\n' + r'''
 #include <bit>
 #include <cstring>
 namespace exec = strix::exec;

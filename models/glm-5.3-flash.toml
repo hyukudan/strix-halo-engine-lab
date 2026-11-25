@@ -100,3 +100,9 @@ levers = "fast"
 # Use the admitted FAST levers until this model has a qualified TURBO set.
 [presets.turbo]
 levers = "fast"
+
+# Engine-read switches of this model that a [multi_device] key is planned to replace (listed in the effective
+# config when set; they still act inside the engine).
+[multi_device.legacy_env]
+STRIX_GLM_PF_PIPELINE = "forms.layers"
+STRIX_GLM_PF_STAGED = "forms.layers"

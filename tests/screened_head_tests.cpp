@@ -7,12 +7,14 @@
 //   3. whenever the overflow / non-finite guard passes, every incumbent logit is finite.
 // It prints the mean candidate counts (the screen's tightness) for Gaussian-like and peaked rows.
 #include "core/screened_head.hpp"
+#include "core/screened_head_plan.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <random>
 #include <span>
@@ -183,6 +185,143 @@ void softcap_monotone_host() {
     }
 }
 
+void rescore_plan_tests() {
+    namespace plan = strix::core::screened_head_plan;
+    // The order key is monotone over every non-NaN float (bf16 grid, both zeros, both infinities).
+    std::vector<float> grid;
+    for (std::uint32_t b = 0; b < 65536U; ++b) {
+        const float f = strix::weight::scalar_float::u2f(b << 16U);
+        if (!std::isnan(f)) grid.push_back(f);
+    }
+    std::sort(grid.begin(), grid.end());
+    for (std::size_t i = 1; i < grid.size(); ++i)
+        if (grid[i] > grid[i - 1]) expect(plan::order_key(grid[i]) > plan::order_key(grid[i - 1]), "order key monotone");
+    const float negative_nan = std::bit_cast<float>(0xffc00000U);
+    const float positive_nan = std::bit_cast<float>(0x7fc12345U);
+    const float signaling_nan = std::bit_cast<float>(0x7f800001U);
+    const float infinity = std::numeric_limits<float>::infinity();
+    const float mixed[] = {negative_nan, 1.0F, positive_nan, signaling_nan, infinity};
+    const auto nan_cutoff = plan::rescore_threshold(mixed, 1U);
+    unsigned selected_nans = 0U;
+    for (float v : mixed) selected_nans += plan::order_key(v) >= nan_cutoff ? 1U : 0U;
+    expect(plan::order_key(negative_nan) == plan::order_key(positive_nan) &&
+               plan::order_key(positive_nan) == plan::order_key(signaling_nan) &&
+               plan::order_key(negative_nan) > plan::order_key(infinity),
+           "NaN signs and payloads share the highest key");
+    expect(selected_nans == 3U, "all NaNs selected at k=1, overflowing a capacity of two", selected_nans);
+    const float zeros[] = {-0.0F, 0.0F, -1.0F};
+    expect(plan::order_key(zeros[0]) == plan::order_key(zeros[1]) &&
+               plan::order_key(zeros[0]) >= plan::rescore_threshold(zeros, 1U),
+           "signed zeros share the numeric tie at k=1");
+    // The threshold selects the exact top-k plus the rows sharing the k-th key's 24-bit prefix, never fewer than k.
+    std::mt19937 rng(11U);
+    std::normal_distribution<float> normal(0.0F, 3.0F);
+    for (const unsigned k : {1U, 2U, 64U, 300U}) {
+        for (unsigned trial = 0; trial < 4U; ++trial) {
+            std::vector<float> s(5003U);
+            for (auto& v : s) v = normal(rng);
+            if (trial == 1U) std::fill(s.begin() + 100, s.begin() + 900, s[0]);  // a block of equal scores
+            if (trial == 2U) s[17] = std::numeric_limits<float>::quiet_NaN();    // NaN: the largest key
+            const auto t = plan::rescore_threshold(s, k);
+            expect((t & 0xffU) == 0U, "threshold low byte clear", t);
+            std::vector<std::uint32_t> keys(s.size());
+            std::transform(s.begin(), s.end(), keys.begin(), [](float v) { return plan::order_key(v); });
+            std::vector<std::uint32_t> sorted = keys;
+            std::sort(sorted.begin(), sorted.end(), std::greater<>{});
+            expect(t == (sorted[k - 1U] & ~0xffU), "threshold = k-th key prefix", t, sorted[k - 1U]);
+            unsigned selected = 0U, above = 0U;
+            for (const auto key : keys) {
+                selected += key >= t ? 1U : 0U;
+                above += key > sorted[k - 1U] ? 1U : 0U;
+            }
+            expect(selected >= k && above < k, "selection holds the exact top-k", selected, above);
+            for (const auto key : keys)
+                if (key >= t) expect((key >> 8U) >= (sorted[k - 1U] >> 8U), "selected rows share or pass the prefix");
+        }
+    }
+    expect(plan::rescore_threshold(std::vector<float>(40U, 1.0F), 64U) == 0U, "fewer rows than k: every row");
+    // Scratch layout: 256-byte parts, the cleared prefix ends where the ids start.
+    const auto l = plan::rescore_layout(200058U, plan::kCapacity, 16U);
+    expect(l.hist % 256U == 0U && l.ids % 256U == 0U && l.y % 256U == 0U && l.cleared == l.ids, "rescore layout parts");
+    expect(l.hist >= 16U * sizeof(plan::RescoreState) && l.bytes >= l.y + 16U * 200058U * 4U, "rescore layout sizes");
+    expect(plan::rescore_blocks(200058U) == 98U && plan::rescore_blocks(1U) == 1U &&
+               plan::rescore_blocks(1U << 30U) == 128U,
+           "rescore blocks");
+    constexpr unsigned huge = std::numeric_limits<unsigned>::max();
+    expect(plan::rescore_blocks(huge) == 128U, "histogram grid rounds without wrap");
+    // Host storage stands in for device ranges. Put lane 1 at a scratch-aligned address.
+    alignas(256) static std::uint8_t scratch[plan::rescore_layout(32U, 16U, 2U).bytes];
+    alignas(256) static std::uint16_t weights[32U * 16U];
+    alignas(256) static float x[128];
+    alignas(256) static float scores[128];
+    const plan::RescoreLaunch ok{{weights, 32U, 16U, 30.0F}, x, scores, scratch, 2U, 64U, 64U, 4U, 16U, 64U,
+                                 sizeof(scratch)};
+    expect(plan::rescore_launch_valid(ok), "valid rescore launch");
+    auto bad = ok;
+    bad.k = 0U;
+    expect(!plan::rescore_launch_valid(bad), "k 0");
+    bad = ok;
+    bad.capacity = 3U;
+    expect(!plan::rescore_launch_valid(bad), "capacity < k");
+    bad = ok;
+    bad.head.softcap = 0.0F;
+    expect(!plan::rescore_launch_valid(bad), "softcap 0");
+    bad = ok;
+    bad.pitch = 31U;
+    expect(!plan::rescore_launch_valid(bad), "pitch < rows");
+    bad = ok;
+    bad.x_stride = 6U;
+    expect(!plan::rescore_launch_valid(bad), "x stride < width");
+    bad = ok;
+    for (unsigned width : {8U, 20U}) {
+        bad.head.width = width;
+        expect(!plan::rescore_launch_valid(bad), "width leaves a mapped BF16 tail", width);
+    }
+    bad = ok;
+    bad.head.rows = huge;
+    bad.pitch = huge;
+    expect(!plan::rescore_launch_valid(bad), "row loops and all-row mapping cannot wrap");
+    bad = ok;
+    bad.pass2_blocks = huge / 128U + 1U;
+    expect(!plan::rescore_launch_valid(bad), "pass-2 grid must fit the 32-bit work-item limit");
+    bad = ok;
+    bad.scratch = scratch + 16;
+    expect(!plan::rescore_launch_valid(bad), "scratch alignment");
+    bad = ok;
+    --bad.scratch_bytes;
+    expect(!plan::rescore_launch_valid(bad), "undersized scratch");
+    for (const void* overlap : {static_cast<const void*>(scores + 64), static_cast<const void*>(x + 64),
+                                static_cast<const void*>(weights)}) {
+        bad = ok;
+        bad.scratch = reinterpret_cast<std::uint8_t*>(const_cast<void*>(overlap));
+        expect(!plan::rescore_launch_valid(bad), "scratch overlaps a live input or score lane");
+    }
+    bad = ok;
+    bad.scratch = reinterpret_cast<std::uint8_t*>(std::numeric_limits<std::uintptr_t>::max() & ~std::uintptr_t{255});
+    expect(!plan::rescore_launch_valid(bad), "scratch address range cannot wrap");
+    // The score image is rewritten in place: it may not reach the weights or the activations. One arena so adjacency is
+    // a deliberate address: weights [0, 1024), activations [1024, 1344) (lane 1 at 64 floats, 16 wide).
+    alignas(256) static std::uint8_t arena[4096];
+    bad = ok;
+    bad.scores = reinterpret_cast<float*>(weights);
+    expect(!plan::rescore_launch_valid(bad), "scores over the weights");
+    bad = ok;
+    bad.scores = x;
+    expect(!plan::rescore_launch_valid(bad), "scores over the activations");
+    auto near = ok;
+    near.head.weights = reinterpret_cast<const std::uint16_t*>(arena);
+    near.scores = reinterpret_cast<float*>(arena + 1024);
+    expect(plan::rescore_launch_valid(near), "scores starting where the weights end");
+    near.scores = reinterpret_cast<float*>(arena + 1020);
+    expect(!plan::rescore_launch_valid(near), "scores on the last weight bytes");
+    near = ok;
+    near.x = reinterpret_cast<const float*>(arena + 1024);
+    near.scores = reinterpret_cast<float*>(arena + 1344);
+    expect(plan::rescore_launch_valid(near), "scores starting where the activations end");
+    near.scores = reinterpret_cast<float*>(arena + 1340);
+    expect(!plan::rescore_launch_valid(near), "scores on the last activation");
+}
+
 void builder_tests() {
     expect(sh::plane_layout(2304U, 4U).row_bytes == 1296U, "layout 2304x4");
     expect(sh::plane_layout(2304U, 8U).row_bytes == 2448U, "layout 2304x8");
@@ -255,6 +394,7 @@ void builder_tests() {
 int main() {
     builder_tests();
     softcap_monotone_host();
+    rescore_plan_tests();
     const Scenario scenarios[] = {
         {"gaussian", 1500, 256, 0.02F, 1.0F, 0.0F, false, false, 1.0F},
         {"gaussian-k2304", 1200, 2304, 0.02F, 1.0F, 0.0F, false, false, 1.0F},

@@ -260,6 +260,10 @@ void classes() {
     check(two.code_row == 2304U && two.scale_row == 288U && one.code_row == 1152U && one.scale_row == 144U,
           "image rows hold terms x K/2 code bytes and terms x K/16 scale bytes");
     check(gw::fits_image(two, 2U * 2304U) && !gw::fits_image(one, 2U * 2304U), "a two-term projection needs a two-term image");
+    check(!gw::w4a4_gate_up(gw::Activations::iu4_rot) && !gw::w4a4_down(gw::Activations::iu4_rot) &&
+              gw::terms_gate_up(gw::Activations::iu4_rot) == 1U && gw::terms_down(gw::Activations::iu4_rot) == 1U &&
+              std::strcmp(gw::identity(gw::Activations::iu4_rot), "iu4a4-rot@1") == 0,
+          "iu4_rot: declined by the NVFP4 class (the integer class runs it)");
     check(std::strcmp(gw::identity(gw::Activations::nvfp4_mse), "nvfp4-mse@1") == 0 &&
               std::strcmp(act::identity(act::ScaleRule::nearest), "nvfp4-act-scale-nearest@1") == 0, "identities");
 }

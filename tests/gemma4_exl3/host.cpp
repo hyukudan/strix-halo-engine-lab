@@ -20,7 +20,7 @@ void require(bool value, const char* reason) { if (!value) throw std::runtime_er
 }
 int main() {
     try {
-        // Identity auto-selection table: fixed per pack and session maximum concurrency.
+        // Identity auto-selection table: fixed per pack and session maximum concurrency (incumbent M5 crossover).
         static_assert(ex::auto_version("M4", 8) == 3 && ex::auto_version("M4", 4) == 3 && ex::auto_version("M4", 1) == 3);
         static_assert(ex::auto_version("M5", 8) == 3 && ex::auto_version("M5", 4) == 1 && ex::auto_version("M5", 1) == 1);
         static_assert(ex::auto_version("M6", 1) == 3 && ex::auto_version("M6", 8) == 3 && ex::auto_version("U5", 8) == 1);

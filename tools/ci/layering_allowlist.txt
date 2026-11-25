@@ -43,9 +43,7 @@ model-include src/weight/formats/exl3.cpp 1
 model-include src/weight/formats/fp8.cpp 1
 model-include src/weight/formats/gsq.cpp 4
 model-include src/weight/formats/packed.cpp 1
-model-include src/weight/host_q8.cpp 1
 model-include src/weight/reference.cpp 1
-model-include src/weight/source.cpp 1
 model-kernel src/cuda/models/ds41/ds41_attention.cu 12
 model-kernel src/cuda/models/ds41/ds41_attention_export.cu 1
 model-kernel src/cuda/models/ds41/ds41_core.cu 2
@@ -100,7 +98,7 @@ model-kernel src/gemma4/kv/transactions.hip 4
 model-kernel src/gemma4/prefill/a8_linear.hip 5
 model-kernel src/gemma4/prefill/attention.hip 4
 model-kernel src/gemma4/prefill/canonical.hip 5
-model-kernel src/gemma4/prefill/linear.hip 17
+model-kernel src/gemma4/prefill/linear.hip 13
 model-kernel src/gemma4/prefill/target.hip 5
 model-kernel src/glm/attn/glm_attn_fast.hip 15
 model-kernel src/glm/attn/glm_attn_tierb.hip 1
@@ -291,7 +289,7 @@ raw-getenv src/gemma4/prefill/attention.cpp 2
 raw-getenv src/gemma4/prefill/attention.hip 4
 raw-getenv src/gemma4/prefill/canonical.hip 8
 raw-getenv src/gemma4/prefill/check_main.cpp 1
-raw-getenv src/gemma4/prefill/linear.hip 10
+raw-getenv src/gemma4/prefill/linear.hip 8
 raw-getenv src/gemma4/prefill/prefill.hpp 1
 raw-getenv src/gemma4/prefill/target.hip 6
 raw-getenv src/gemma4/ref/target.cpp 1

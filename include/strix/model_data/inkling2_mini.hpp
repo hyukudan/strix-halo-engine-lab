@@ -42,6 +42,17 @@ inline constexpr std::int64_t mxfp8_first = 20;
 inline constexpr double route_scale = 0x1p+3 /* 8 */;
 inline constexpr double up_softcap = 0x1.9p+4 /* 25 */;
 } // namespace moe
+namespace multi_device {
+inline constexpr std::string_view default_ = "single";
+inline constexpr std::string_view fallback = "single";
+namespace forms {
+namespace replica {
+inline constexpr std::string_view objective = "throughput";
+inline constexpr std::int64_t ranks = 2;
+} // namespace replica
+} // namespace forms
+inline constexpr std::int64_t version = 1;
+} // namespace multi_device
 inline constexpr std::string_view name = "inkling2-mini";
 namespace presets {
 inline constexpr std::string_view default_ = "exact";

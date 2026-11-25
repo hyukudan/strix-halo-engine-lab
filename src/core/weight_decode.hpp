@@ -3,8 +3,9 @@
 // GEMV_ROWS_CHUNK / GEMV_ROWS_LOAD_CHUNK to these). One copy for BF16 and Q8_0 rows:
 //   bf16  weight = float(bits << 16)                        (exact)
 //   q8_0  34-byte blocks {f16 d, int8 q[32]}; weight = d * float(q)   (one FP32 product, as the g4 chunk decoder)
-//   q4_g64 / q6_g64  128-element superblocks (strix/weight/host_lowbit.hpp): row bytes only here; their rows are
-//         decoded by the low-bit staging of the tile and small-M cores (core/lowbit_f16_staging.hpp).
+//   q4_g64 / q6_g64  128-element superblocks (strix/weight/host_lowbit.hpp): weight = d * float(q), d the FP16 scale of
+//         the element's 64-group; a 16-weight chunk never crosses a group, its code words load 8 + 4 bytes aligned.
+//         This is the FP32 sweep decoder. The opt-in FP16 tile decodes integer operands via lowbit_f16_staging.hpp.
 #include "strix/weight/host_lowbit.hpp"
 
 #include <cstddef>
@@ -124,6 +125,48 @@ STRIX_WEIGHT_CHUNK_INLINE float half_scale(std::uint16_t h, HalfScale scale) {
     return std::bit_cast<float>(software_half_bits(h));
 #endif
 }
+// The 4-byte word at a 4-byte aligned superblock offset (low-bit planes).
+STRIX_WEIGHT_CHUNK_INLINE unsigned load_word(const std::uint8_t* p) {
+#if defined(__HIPCC__) || defined(__HIP__)
+    return *static_cast<const unsigned*>(__builtin_assume_aligned(p, 4));
+#else
+    unsigned v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+#endif
+}
+template <class Storage, HalfScale Scale>
+struct LowBitChunk {
+    unsigned lo0, lo1, hi;
+    float d;
+    STRIX_WEIGHT_CHUNK_DEVICE LowBitChunk() = default;
+    STRIX_WEIGHT_CHUNK_DEVICE LowBitChunk(const std::uint8_t* row, unsigned i) {
+        const std::uint8_t* block = row + std::size_t(i / Storage::elements) * Storage::bytes;
+        const unsigned j = i % Storage::elements;
+        lo0 = load_word(block + j / 2U);
+        lo1 = load_word(block + j / 2U + 4U);
+        if constexpr (Storage::high_bytes != 0U) hi = load_word(block + Storage::low_bytes + j / 4U);
+        else hi = 0U;
+        d = half_scale(Storage::scale_bits(block, j / Storage::group), Scale);
+    }
+    STRIX_WEIGHT_CHUNK_DEVICE float at(unsigned e) const {
+        const unsigned low = ((e < 8U ? lo0 : lo1) >> ((e % 8U) * 4U)) & 15U;
+        int q;
+        if constexpr (Storage::high_bytes != 0U)
+            q = static_cast<int>((low | (((hi >> (e * 2U)) & 3U) << 4U)) << 26U) >> 26;
+        else
+            q = static_cast<int>(low << 28U) >> 28;
+        return d * float(q);
+    }
+};
+template <bool Streaming, HalfScale Scale>
+struct Chunk<Format::q4_g64, Streaming, Scale> : LowBitChunk<weight::Q4G64Storage, Scale> {
+    using LowBitChunk<weight::Q4G64Storage, Scale>::LowBitChunk;
+};
+template <bool Streaming, HalfScale Scale>
+struct Chunk<Format::q6_g64, Streaming, Scale> : LowBitChunk<weight::Q6G64Storage, Scale> {
+    using LowBitChunk<weight::Q6G64Storage, Scale>::LowBitChunk;
+};
 inline constexpr std::size_t row_bytes(Format f, std::size_t inputs) {
     return f == Format::bf16     ? inputs * 2U
            : f == Format::q8_0   ? (inputs / 32U) * 34U

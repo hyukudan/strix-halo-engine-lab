@@ -2863,8 +2863,48 @@ struct Bench {
         }
         hip_ok(hipDeviceSynchronize(), "dense segments");
     }
+    void test_dense_mlp_cuts() {
+        std::vector<DenseSite*> gu, dn;
+        for (auto& ds : dense) {
+            if (ds.name == "dense_gate" || ds.name == "dense_up") gu.push_back(&ds);
+            if (ds.name == "dense_down") dn.push_back(&ds);
+        }
+        if (gu.size() != 2 || dn.size() != 1) throw std::logic_error("dense MLP cut gate requires gate/up/down weights");
+        constexpr unsigned T = 4096 + 9 + 1;
+        const unsigned K = gu[0]->input, I = gu[0]->output, O = dn[0]->output;
+        opt::set_prefill_moe_order(1);
+        std::vector<float> input(std::size_t{T} * K);
+        std::normal_distribution<float> nd(0.0F, 1.0F);
+        for (auto& x : input) x = nd(rng);
+        float* in = dupload(input);
+        float* g = dalloc<float>(std::size_t{T} * I);
+        float* u = dalloc<float>(std::size_t{T} * I);
+        float* out = dalloc<float>(std::size_t{T} * O);
+        void* ws = nullptr;
+        hip_ok(hipMalloc(&ws, std::max(dense_v4_bytes(gu, T), dense_v4_bytes(dn, T))), "dense MLP cut workspace");
+        auto run = [&](std::initializer_list<unsigned> cuts) {
+            hip_ok(hipMemset(out, 0xff, std::size_t{T} * O * sizeof(float)), "poison dense MLP output");
+            unsigned first = 0;
+            for (const unsigned n : cuts) {
+                run_dense_segments(gu, in + std::size_t{first} * K, {g, u}, n, n, ws);
+                const auto count = std::size_t{n} * I;
+                STRIX_HIP_LAUNCH_GGL(Rdna3Layout, swiglu_kernel, dim3(grid(count)), dim3(256), 0, nullptr, g, u, g, count);
+                run_dense_segments(dn, g, {out + std::size_t{first} * O}, n, n, ws);
+                first += n;
+            }
+            return d2h(out, std::size_t{T} * O);
+        };
+        const auto whole = run({T}), pieces = run({4096, 9, 1});
+        const bool same = std::all_of(whole.begin(), whole.end(), [](float x) { return std::isfinite(x); }) &&
+                          same_bits(whole, pieces);
+        check(same, "dense MLP composed fixed order differs across 4096/9/1-row cuts");
+        std::printf("dense MLP cuts rank %u T4106 vs 4096+9+1: %s\n", o.rank, same ? "bitwise" : "DIFF");
+        for (auto* ptr : {in, g, u, out}) hip_ok(hipFree(ptr), "free");
+        hip_ok(hipFree(ws), "free");
+    }
     void test_prefill_dense_chunk_invariance() {
         struct Restore { ~Restore() { opt::set_prefill_moe_order(-1); } } restore;
+        test_dense_mlp_cuts();
         struct Case { unsigned T; std::vector<unsigned> segs; };
         std::vector<Case> cases = {{8192, {256, 1024, 4096}}};
         for (unsigned t = 1; t <= 17; ++t) cases.push_back({4096 + t, {4096}});

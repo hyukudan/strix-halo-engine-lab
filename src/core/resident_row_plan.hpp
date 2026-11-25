@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/byte_range.hpp"
 #include "core/dense_row_plan.hpp"
 #include "core/f16_tile_gemm.hpp"
 #include "core/gemv_rows.hpp"
@@ -8,9 +9,8 @@
 #include "strix/weight/resident_slices.hpp"
 
 #include <array>
-#include <utility>
 #include <limits>
-#include <string_view>
+#include <utility>
 #include <variant>
 
 namespace strix::core {
@@ -25,8 +25,8 @@ struct ResidentRowProjection {
 
 // Byte ranges of resident launches: [a, a + a_bytes) and [b, b + b_bytes) share no byte.
 inline bool disjoint_byte_ranges(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes) {
-    const auto first = reinterpret_cast<std::uintptr_t>(a), second = reinterpret_cast<std::uintptr_t>(b);
-    return first >= second ? first - second >= b_bytes : second - first >= a_bytes;
+    const ByteRange first{a, a_bytes}, second{b, b_bytes};
+    return byte_range_valid(first) && byte_range_valid(second) && !byte_ranges_overlap(first, second);
 }
 // The same for float counts the caller has bounded (count * sizeof(float) fits in std::size_t).
 inline bool disjoint_float_ranges(const float* a, std::size_t a_floats, const float* b, std::size_t b_floats) {
@@ -50,10 +50,15 @@ inline bool valid_resident_q8_rows(const weight::ResidentMatrixView& matrix, uns
                                 matrix.bytes.size());
 }
 
-// Low-bit resident rows (strix/weight/host_lowbit.hpp) on HIP: every row count up to the tile grid limit; the route
-// (plan_lowbit_rows below) picks the small-M WMMA schedule or the 128-row projection tile (same bits per row).
+// The FP32 sweep is the incumbent. The explicit FP16 form uses one arithmetic across both tile schedules.
+enum class LowBitArithmetic { fp32_sweep, f16_group_scale };
+
+constexpr unsigned lowbit_max_rows(LowBitArithmetic arithmetic) {
+    return arithmetic == LowBitArithmetic::f16_group_scale ? 65535U * f16_tile_gemm::kBM : gemv_rows::max_rows;
+}
 inline bool valid_resident_lowbit_rows(const weight::ResidentMatrixView& matrix, unsigned outputs,
-                                       const float* input, unsigned rows, const float* output) {
+                                       const float* input, unsigned rows, const float* output,
+                                       LowBitArithmetic arithmetic = LowBitArithmetic::fp32_sweep) {
     constexpr auto max_floats = std::numeric_limits<std::size_t>::max() / sizeof(float);
     constexpr auto max_extent = std::numeric_limits<unsigned>::max() - 127U;
     const bool q4 = matrix.storage == weight::kQ4G64WeightStorage;
@@ -61,7 +66,7 @@ inline bool valid_resident_lowbit_rows(const weight::ResidentMatrixView& matrix,
     const auto row_bytes = q4 ? weight::Q4G64Storage::row_bytes(matrix.columns) : weight::Q6G64Storage::row_bytes(matrix.columns);
     return input && output && reinterpret_cast<std::uintptr_t>(input) % 16U == 0U &&
            matrix.bytes.data() && reinterpret_cast<std::uintptr_t>(matrix.bytes.data()) % 16U == 0U &&
-           rows != 0U && rows <= 65535U * f16_tile_gemm::kBM && outputs != 0U && outputs <= matrix.rows &&
+           rows != 0U && rows <= lowbit_max_rows(arithmetic) && outputs != 0U && outputs <= matrix.rows &&
            outputs <= max_extent && outputs <= max_floats / rows && matrix.columns != 0U &&
            matrix.columns <= max_floats / rows && matrix.columns <= max_extent &&
            matrix.columns % weight::Q4G64Storage::elements == 0U && matrix.row_bytes == row_bytes &&
@@ -124,8 +129,9 @@ inline LowBitRowPlan bound_lowbit_row_plan(int device) noexcept {
     return {rows.small_rows, rows.wide_panels};
 }
 
-// The arithmetic every low-bit resident launch of a storage runs on HIP (both routes, see above).
 inline constexpr std::array<weight::ArithmeticId, 2> kResidentLowBitArithmeticHip{{
+    {"hip.q4_g64.dense-linear-tight-rows", 1}, {"hip.q6_g64.dense-linear-tight-rows", 1}}};
+inline constexpr std::array<weight::ArithmeticId, 2> kResidentLowBitTileArithmeticHip{{
     {"hip.q4_g64.f16-group-scale-chain", 1}, {"hip.q6_g64.f16-group-scale-chain", 1}}};
 
 // The weight bytes one projection of a list reads: a BF16 projection outputs tight rows of width elements, a compact
@@ -169,44 +175,44 @@ inline bool resident_list_ranges_disjoint(const float* input, unsigned width, un
     return true;
 }
 
-// Dispatch consecutive projections of each storage class together, preserving order across BF16 and compact runs.
-// Nothing is submitted before the whole list is admitted: its byte ranges (resident_list_ranges_disjoint) and every
-// compact run through the backend's own descriptor check (`compact_admitted`, the check its `compact` launcher runs),
-// so a refused list writes nothing, whichever run is malformed.
-template <std::size_t Limit, class Status, class Bf16, class Compact, class CompactAdmitted>
+// Validate every run with the backend's descriptor checks before any run can write output.
+template <std::size_t Limit, class Status, class Bf16, class Compact, class Bf16Admitted, class CompactAdmitted>
 Status dispatch_resident_rows(const float* input, unsigned width, unsigned rows,
                               std::span<const ResidentRowProjection> projections, Status success, Status invalid,
-                              const Bf16& bf16, const Compact& compact, const CompactAdmitted& compact_admitted) {
+                              const Bf16& bf16, const Compact& compact, const Bf16Admitted& bf16_admitted,
+                              const CompactAdmitted& compact_admitted) {
     if (projections.empty() || projections.size() > Limit ||
         !resident_list_ranges_disjoint(input, width, rows, projections))
         return invalid;
-    for (std::size_t i = 0; i < projections.size();) {
-        if (std::holds_alternative<const std::uint16_t*>(projections[i].weights)) {
-            ++i;
-            continue;
+
+    const auto for_each_run = [&](const auto& visit_bf16, const auto& visit_compact) {
+        std::array<Bf16RowProjection, Limit> run{};
+        for (std::size_t i = 0; i < projections.size();) {
+            const auto first = i;
+            if (std::holds_alternative<const std::uint16_t*>(projections[i].weights)) {
+                while (i < projections.size()) {
+                    const auto& projection = projections[i];
+                    const auto* bits = std::get_if<const std::uint16_t*>(&projection.weights);
+                    if (!bits) break;
+                    run[i - first] = {*bits, projection.outputs, projection.output};
+                    ++i;
+                }
+                if (const auto status = visit_bf16(std::span<const Bf16RowProjection>(run).first(i - first));
+                    status != success) return status;
+            } else {
+                while (i < projections.size() &&
+                       std::holds_alternative<weight::ResidentMatrixView>(projections[i].weights)) ++i;
+                if (const auto status = visit_compact(projections.subspan(first, i - first)); status != success)
+                    return status;
+            }
         }
-        const auto first = i++;
-        while (i < projections.size() && std::holds_alternative<weight::ResidentMatrixView>(projections[i].weights)) ++i;
-        if (!compact_admitted(projections.subspan(first, i - first))) return invalid;
-    }
-    std::array<Bf16RowProjection, Limit> run{};
-    std::size_t count = 0;
-    for (std::size_t i = 0; i < projections.size();) {
-        const auto& projection = projections[i];
-        if (const auto* bits = std::get_if<const std::uint16_t*>(&projection.weights)) {
-            run[count++] = {*bits, projection.outputs, projection.output};
-            ++i;
-            continue;
-        }
-        if (count != 0) {
-            if (auto status = bf16(std::span(run).first(count)); status != success) return status;
-            count = 0;
-        }
-        const auto first = i++;
-        while (i < projections.size() && std::holds_alternative<weight::ResidentMatrixView>(projections[i].weights)) ++i;
-        if (auto status = compact(projections.subspan(first, i - first)); status != success) return status;
-    }
-    return count != 0 ? bf16(std::span(run).first(count)) : success;
+        return success;
+    };
+    const auto admitted = for_each_run(
+        [&](auto run) { return bf16_admitted(run) ? success : invalid; },
+        [&](auto run) { return compact_admitted(run) ? success : invalid; });
+    if (admitted != success) return admitted;
+    return for_each_run(bf16, compact);
 }
 
 }  // namespace strix::core
