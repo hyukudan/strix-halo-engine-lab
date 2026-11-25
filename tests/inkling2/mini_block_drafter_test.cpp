@@ -3,12 +3,14 @@
 // environment and, when the app header is available, the real CLI parser. The server start-up arm
 // runs through the production argument parser in mini_serve_test.cpp.
 #include "strix/profiles/inkling2_mini.hpp"
+#include "inkling2/inkling2_mini_block_candidate_cuda.hpp"
 #include "inkling2/inkling2_mini_weight_options.hpp"
 #include "strix/spec/block_draft_policy.hpp"
 #if defined(STRIX_INKLING2_APP_CLI_TEST)
 #include "inkling2_mini_cli.hpp"
 #include <vector>
 #endif
+#include <array>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -17,6 +19,7 @@
 
 namespace sp = strix::spec;
 namespace pf = strix::profile;
+namespace mini = strix::inkling2;
 namespace {
 void check(bool ok, const std::string& what) { if (!ok) throw std::runtime_error(what); }
 
@@ -107,10 +110,53 @@ void policy_tests() {
 #endif
                  " agree, OFF in all tiers\n";
 }
+
+void cuda_candidate_step_tests() {
+    const auto& engine = mini::kMiniProfile;
+    pf::Inputs options;
+    options.env = [](const char*) -> const char* { return nullptr; };
+    const auto off = [&] {
+        return !mini::MiniCudaBlockCandidateStep::prepare(pf::resolve(engine, options), {}, 0U, 0U);
+    };
+    for (auto tier : {pf::Name::standard, pf::Name::fast, pf::Name::turbo}) {
+        options.profile = tier;
+        options.cli.clear();
+        check(off(), "default OFF must bypass CUDA candidate preparation");
+        options.cli.emplace_back(sp::kBlockDraftLeverName, "off");
+        check(off(), "explicit OFF must bypass CUDA candidate preparation");
+    }
+
+    options.cli.front().second = "dflash2:8:greedy";
+    const auto greedy = pf::resolve(engine, options);
+    const std::array ids{11U, 17U, 23U};
+    const auto step = mini::MiniCudaBlockCandidateStep::prepare(greedy, ids, mini::kMaxContext - 4U, mini::kMaxContext);
+    check(step.has_value(), "explicit greedy selection must prepare a descriptor");
+    const auto& block = step->descriptor();
+    check(block.h.rows == 4U && block.h.valid_mask == 7U && block.h.feed_mask == 0U,
+          "three forced rows need a width-four descriptor with masked padding");
+    check(block.h.step == mini::kMaxContext - 4U, "descriptor must carry the absolute first position");
+    for (unsigned row = 0; row < ids.size(); ++row) {
+        const auto& data = block.row[row];
+        check(strix::exec::step_row_valid(block, row) && data.token == ids[row] && data.position == block.h.step + row &&
+              data.slot == 0U && data.flags == strix::exec::step_valid &&
+              data.parent == (row == 0U ? strix::exec::kStepNoParent : row - 1U) &&
+              data.ancestors == (1U << (row + 1U)) - 1U, "forced-row token, position and causal order");
+    }
+    check(!strix::exec::step_row_valid(block, 3U), "padding must not write features or state");
+    check_outcome(outcome([&] {
+        (void)mini::MiniCudaBlockCandidateStep::prepare(greedy, ids, mini::kMaxContext - 3U, mini::kMaxContext);
+    }), "padded verify window exceeds session capacity", "CUDA candidate at the context cap");
+
+    options.cli.front().second = "dflash2:8:sampled";
+    check_outcome(outcome([&] {
+        (void)mini::MiniCudaBlockCandidateStep::prepare(pf::resolve(engine, options), ids, 0U, 8U);
+    }), "sampled rejection hook unqualified and unbound", "CUDA sampled candidate");
+}
 }  // namespace
 int main() {
     try {
         policy_tests();
+        cuda_candidate_step_tests();
     } catch (const std::exception& e) {
         std::cerr << "inkling2-mini-block-drafter: " << e.what() << '\n';
         return 1;
