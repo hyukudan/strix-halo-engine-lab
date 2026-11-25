@@ -33,15 +33,10 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     ResolvedService resolved;
     auto& out = resolved.options;
     const auto& args = selection.arguments;
-    bool packed_flag = false;   // --packed-decode / --grouped-decode, as on the command line
-    bool grouped_flag = false;
+    std::optional<unsigned> explicit_rows;  // --prefill-rows
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string_view name = args[i];
         if (name == "--dspark") throw std::invalid_argument("Inkling serving does not support --dspark");
-        if (name == "--packed-decode" || name == "--grouped-decode") {
-            (name == "--packed-decode" ? packed_flag : grouped_flag) = true;
-            continue;
-        }
         const auto next = [&]() -> const std::string& {
             if (++i == args.size()) throw std::invalid_argument("missing value for " + std::string(name));
             return args[i];
@@ -58,10 +53,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
         else if (name == "--device-id") out.device_id = value;
         else if (name == "--device-profile") out.device_profile = value;
         else if (name == "--context") out.context = static_cast<unsigned>(number(name, value, kMaxContext));
-        else if (name == "--prefill-rows") {
-            out.prefill_rows = static_cast<unsigned>(number(name, value, 65535U));
-            if (out.prefill_rows == 0U) throw std::invalid_argument("--prefill-rows must be positive");
-        }
+        else if (name == "--prefill-rows") explicit_rows = static_cast<unsigned>(number(name, value, 65535U));
         else if (name == "--slots") out.slots = static_cast<unsigned>(number(name, value, 65535U));
         else if (name == "--kv-bytes") out.kv_bytes = number(name, value, UINT64_MAX);
         else if (name == "--speculation") {
@@ -73,7 +65,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.moe_w4a4 = mini_moe_w4a4_class(resolution);
     out.prepared_round_fold = mini_prepared_round_fold(resolution);
     out.combine_image = mini_combine_image(resolution);
-    const bool cli_route = mini_served_cli_route(resolution);
+    out.served_route_requested = mini_served_cli_route(resolution);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();
@@ -81,21 +73,19 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
-    // The served route: the command line's route where the served route lever selects it and the backend is qualified
-    // for it (HIP), else the incumbent served route (a CUDA server declines the lever).
-    const bool hip = resolved.backend == "hip";
-    out.served_cli_route = mini_served_prefill_emits_first(hip, cli_route);
-    // The decode form through the one resolver the command line calls, with the route's served default.
-    out.packed_decode = serve::resolve_decode_form(packed_flag, grouped_flag, mini_served_packed_default(hip, cli_route));
-    // The served prompt schedule of that route (mini_served_prefill_schedule_from_env): the command line's chunk and
-    // tail rule, or the incumbent held-back chunks.
-    const auto schedule = mini_served_prefill_schedule_from_env(hip, cli_route);
-    // An explicit --prefill-rows without --slots also caps the lanes, as it did before the served lane cap
-    // (kMiniServeLaneRows) was separate from the prefill chunk.
-    if (out.prefill_rows != 0U && out.slots == 0U) out.lane_rows = out.prefill_rows;
-    if (out.prefill_rows == 0U) out.prefill_rows = schedule.chunk;
-    out.prefill_rows = std::min(out.prefill_rows, out.context);
-    out.prefill_tail = mini_prefill_tail_capacity(out.prefill_rows, schedule.tail_divisor, out.context);
+    // Backend admission of the served route lever (kMiniServedCliRoute): HIP runs the command line's route, a CUDA
+    // server declines it (requested stays in the receipt, mini_served_route_startup_field).
+    out.served_cli_route = mini_served_prefill_emits_first(resolved.backend == "hip", out.served_route_requested);
+    // The prompt chunk: --prefill-rows, else the route's (the incumbent 128-row held-back chunks without the lever,
+    // the command line's chunk and tail rule with it), clamped to the context. Lanes: mini_serve_lane_rows.
+    const auto schedule = mini_served_prefill_schedule_from_env(true, out.served_cli_route);
+    out.prefill_rows = std::min(explicit_rows.value_or(schedule.chunk), out.context);
+    if (out.served_cli_route) {
+        if (out.prefill_rows == 0U) throw std::invalid_argument("--prefill-rows must be positive");
+        // An explicit chunk without --slots also caps the lanes (the clamped chunk), as on the incumbent route.
+        if (explicit_rows) out.lane_rows = out.prefill_rows;
+        out.prefill_tail = mini_prefill_tail_capacity(out.prefill_rows, schedule.tail_divisor, out.context);
+    }
     return resolved;
 }
 
@@ -107,7 +97,8 @@ serve::CohortConfig scheduling(const MiniServeOptions& opt, const serve::CohortB
     // the cohort cuts pieces of kMiniServeDecodingRows inside those chunks where the decoder's piece rule allows (HIP),
     // so the bits never depend on other lanes (the backend's prompt_piece_rule; CUDA: none, whole chunks).
     config.prompt_slice = opt.prefill_rows;
-    config.prompt_slice_decoding = backend.prompt_piece_rule().cuttable() && opt.prefill_rows > kMiniServeDecodingRows ? kMiniServeDecodingRows : 0U;
+    config.prompt_slice_decoding = opt.served_cli_route && backend.prompt_piece_rule().cuttable() &&
+                                   opt.prefill_rows > kMiniServeDecodingRows ? kMiniServeDecodingRows : 0U;
     return config;
 }
 
@@ -217,8 +208,7 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             const auto resolved = resolve(selection, backends);
             const auto& opt = resolved.options;
             out << "backend " << resolved.backend << " context " << opt.context << " prefill_rows " << opt.prefill_rows
-                << " prefill_tail " << opt.prefill_tail << " first_id "
-                << (opt.served_cli_route ? "prefill" : "decode")
+                << " served_route " << mini_served_route_startup_field(opt)
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
                 << " profile " << mini_profile_name(opt.tier) << " speculation off";
             if (kMiniWeightLoadDecisions.empty() || opt.tier == profile::Name::standard || opt.weight_options.disable_q8) {

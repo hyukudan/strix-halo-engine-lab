@@ -41,8 +41,8 @@ static_assert(check_routes());
 // MiniResidentDecoder::decode_slots splits and routes them. A lone lane is the width-1 case.
 constexpr bool check_cohort_lanes() {
     using strix::inkling2::mini_cohort_pass_cap;
-    if (!strix::inkling2::mini_packed_decode(std::nullopt) || !strix::inkling2::mini_packed_decode(true) ||
-        strix::inkling2::mini_packed_decode(false))
+    if (!strix::inkling2::kMiniPackedDecodeDefault || !strix::inkling2::mini_packed_decode(false, false) ||
+        strix::inkling2::mini_packed_decode(false, true))
         return false;
     constexpr unsigned one_row_cap = 16U;
     for (unsigned lanes = 1U; lanes <= 64U; ++lanes) {
@@ -54,7 +54,9 @@ constexpr bool check_cohort_lanes() {
             covered += rows;
             const bool verify = rows <= strix::inkling2::kMiniMaxVerifyRows;
             const auto kind = verify ? MiniAppendKind::verify : MiniAppendKind::decode;
-            if (!mini_resident_route(kind, rows, true, false).packed_moe) return false;
+            if (!mini_resident_route(kind, rows, true, false, true).packed_moe) return false;
+            // Without packed cohort rows (no served route lever) a multi-row decode keeps the incumbent grouped form.
+            if (kind == MiniAppendKind::decode && mini_resident_route(kind, rows, true, false).packed_moe) return false;
         }
         if (covered != lanes) return false;
         // Grouped decode keeps the incumbent served schedule: the whole cohort in one batched forward.
@@ -81,6 +83,7 @@ bool check_cohort_transaction() {
         const auto top = std::span<unsigned>(buf).subspan(1U, lanes);
         std::vector<unsigned> snapshot, picks;
         unsigned passes = 0U, retired = 0U;
+        std::array<bool, lanes> lane_retired{};
         bool threw = false;
         try {
             strix::serve::run_cohort_passes(ids, top, strix::inkling2::mini_cohort_pass_cap(true, 16U), snapshot, picks,
@@ -88,15 +91,21 @@ bool check_cohort_transaction() {
                     if (passes++ == 1U && fail_second) throw std::runtime_error("pass two failed");
                     if (first != (passes == 1U ? 0U : 9U) || rows != (passes == 1U ? 9U : 8U)) throw std::logic_error("split");
                     for (unsigned r = 0; r < rows; ++r) out[r] = pass_ids[r] + 1000U;
-                    for (unsigned r = 0; r < rows; ++r) buf[1U + first + r] = 7U;  // a writer racing the outputs
-                }, [&] { ++retired; });
+                    // A writer racing the outputs, on the successful arm only (the snapshot check): the failure arm
+                    // must leave the whole buffer untouched.
+                    if (!fail_second)
+                        for (unsigned r = 0; r < rows; ++r) buf[1U + first + r] = 7U;
+                }, [&] {
+                    ++retired;
+                    lane_retired.fill(true);  // the production retire poisons every lane of the cohort (decode_slots_served)
+                });
         } catch (const std::runtime_error&) {
             threw = true;
         }
         if (fail_second) {
-            // The racing writes of pass one are the only change: top was never published, the cohort retired once.
-            if (!threw || retired != 1U || passes != 2U) return false;
-            for (unsigned i = 10U; i <= lanes; ++i) if (buf[i] != before[i]) return false;
+            // Nothing published: the whole buffer is unchanged (pass one's picks too), every lane retired once.
+            if (!threw || retired != 1U || passes != 2U || buf != before) return false;
+            for (const bool lane : lane_retired) if (!lane) return false;
             continue;
         }
         if (threw || retired != 0U || passes != 2U) return false;

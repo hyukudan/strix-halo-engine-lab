@@ -103,12 +103,25 @@ inline void print_digest(std::string_view route, unsigned width, unsigned step, 
     std::cout << line << '\n';
 }
 
-inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool packed_decode) {
-    // The serving construction (inkling2_mini_serve_device.hpp): the resolved decode form (packed by default, as on
-    // the command line), default step graphs, no verify rows, no DSpark taps, one decode row per slot.
-    std::cout << "ROUTE moe_decode " << mini_decode_form_name(packed_decode) << " slots " << kCohortSlots << '\n';
-    MiniResidentDecoder decoder(checkpoint, kCohortContext, kCohortChunk, packed_decode,
-                                MiniResidentBackend::default_step_graphs, storage, 0U, false, kCohortSlots);
+// The serving construction (make_mini_device_cohort, inkling2_mini_serve_device.hpp) for the backend's admission of
+// the served route lever: with it the command line's decode form and packed cohort passes; without it (lever off, or a
+// backend that declines it) the incumbent served decoder (grouped decode).
+inline std::unique_ptr<MiniResidentDecoder> served_decoder(const char* checkpoint, unsigned context, unsigned chunk,
+                                                           weight::FormatId storage, unsigned lanes, unsigned tail,
+                                                           bool served_route) {
+    return served_route
+        ? std::make_unique<MiniResidentDecoder>(checkpoint, context, chunk, kMiniPackedDecodeDefault,
+              MiniResidentBackend::default_step_graphs, storage, 0U, false, lanes, tail, true)
+        : std::make_unique<MiniResidentDecoder>(checkpoint, context, chunk, false,
+              MiniResidentBackend::default_step_graphs, storage, 0U, false, lanes);
+}
+
+inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool served_route) {
+    const auto owned = served_decoder(checkpoint, kCohortContext, kCohortChunk, storage, kCohortSlots, 0U, served_route);
+    auto& decoder = *owned;
+    const bool packed_decode = decoder.prefill_emits_first();  // the admitted served route runs packed
+    std::cout << "ROUTE served_route " << (packed_decode ? "on" : served_route ? "declined" : "off") << " moe_decode "
+              << mini_decode_form_name(packed_decode) << " slots " << kCohortSlots << '\n';
     decoder.allocate_slots(kCohortSlots);
     const std::size_t vocab = kOutputVocabulary;
     std::vector<std::uint16_t> row;
@@ -163,10 +176,13 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool p
                 digest_state(decoder, slot, s, row, history);
                 print_digest("lanes", width, step, slot, s, all);
                 const auto expected = std::span(lone_logits).subspan((std::size_t{slot} * kCohortSteps + step) * vocab, vocab);
-                // Grouped decode keeps the incumbent served schedule (the whole cohort in one forward): its lanes keep
-                // the lone bits up to the verify rows (each row on the decode arithmetic) and make no contract past
-                // them, where only the digests are printed.
-                if (!packed_decode && width > kMiniMaxVerifyRows) continue;
+                // The incumbent served decoder (grouped, the whole cohort in one forward) keeps the lone bits up to the
+                // verify rows (each row on the decode arithmetic) and makes no lane contract past them: those rows are
+                // printed as UNCHECKED; their identity with the base build is the base/head digest comparison.
+                if (!packed_decode && width > kMiniMaxVerifyRows) {
+                    std::cout << "UNCHECKED w=" << width << " step=" << step << " slot=" << slot << '\n';
+                    continue;
+                }
                 if (std::memcmp(scores.data(), expected.data(), expected.size_bytes()) != 0) fail(width, step, slot, "logits");
                 if (s.top != lone[slot][step].top) fail(width, step, slot, "top");
                 if (s.position != lone[slot][step].position) fail(width, step, slot, "position");
@@ -181,7 +197,7 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool p
         const bool program = graph_width != 0U && decoder.cohort_graphs().policy().ready(graph_width) &&
                              !decoder.cohort_graphs().policy().failed(graph_width);
         std::cout << "COHORT w=" << width << " graph_width=" << graph_width
-                  << " program=" << (program ? "replayed" : "eager") << '\n';
+                  << " program=" << (program ? "ready" : "eager") << '\n';
         // A width whose class cannot round up inside the slot capacity (exec::cohort_width_class: 17 lanes with classes
         // and capacity 17) runs eagerly: that is a valid outcome, not a miss. Both decode forms run the width programs.
         const bool expect_program = graph_width != 0U;
@@ -282,8 +298,7 @@ inline std::uint64_t digest_planes(MiniResidentDecoder& decoder, unsigned slot, 
     return kv.value;
 }
 
-inline int served_prefill(const char* checkpoint, weight::FormatId storage, bool packed_decode,
-                          std::span<const unsigned> prompt_lengths) {
+inline int served_prefill(const char* checkpoint, weight::FormatId storage, std::span<const unsigned> prompt_lengths) {
 #if defined(__HIPCC__)
     constexpr bool kHip = true;
 #else
@@ -291,12 +306,17 @@ inline int served_prefill(const char* checkpoint, weight::FormatId storage, bool
 #endif
     const auto schedule = mini_prefill_schedule(kHip);
     const unsigned tail = mini_prefill_tail_capacity(schedule.chunk, schedule.tail_divisor, kServedContext);
-    MiniResidentDecoder decoder(checkpoint, kServedContext, schedule.chunk, packed_decode,
-                                MiniResidentBackend::default_step_graphs, storage, 0U, false, 2U, tail);
+    const auto owned = served_decoder(checkpoint, kServedContext, schedule.chunk, storage, 2U, tail, true);
+    auto& decoder = *owned;
+    // The served route under test: the command line's (the served route lever; a CUDA decoder declines it, and then
+    // this arm has nothing to run: the incumbent held-back route never calls the emits-first prefill).
+    if (decoder.prefill_emits_first() != kHip) throw std::logic_error("served route admission");
+    if (!decoder.prefill_emits_first()) {
+        std::cout << "SKIP served_prefill: the backend declines the served route lever\n";
+        return 0;
+    }
     decoder.allocate_slots(2U);
-    // The served route under test: the command line's (the served route lever; a CUDA decoder declines it).
-    const bool cli_route = decoder.set_served_cli_route(true);
-    if (cli_route != kHip) throw std::logic_error("served route admission");
+    const bool packed_decode = kMiniPackedDecodeDefault;
     const auto capacity = decoder.prefill_tail_rows();
     const auto rule = decoder.prefill_piece_rule();
     std::cout << "ROUTE served_prefill chunk " << schedule.chunk << " tail " << capacity << " pieces "
@@ -424,25 +444,29 @@ int main(int argc, char** argv) {
     using namespace strix;
     try {
         if (argc < 2)
-            throw std::invalid_argument("expected MODEL.safetensors [--qualify-q8] [--packed-decode | --grouped-decode] [--served-prefill [--served-prompts LIST]]");
+            throw std::invalid_argument("expected MODEL.safetensors [--qualify-q8] [--served-route] [--served-prefill [--served-prompts LIST]]");
         auto storage = weight::kBf16WeightStorage;
-        std::optional<bool> decode_form;
+        bool served_route = false;  // the served route lever (off: the incumbent served decoder)
         bool served_prefill = false;
         std::vector<unsigned> prompt_lengths(inkling2::test::kServedPrompt.begin(), inkling2::test::kServedPrompt.end());
         for (int i = 2; i < argc; ++i) {
             const std::string_view option{argv[i]};
             if (option == "--qualify-q8") storage = weight::kQ8WeightStorage;
-            else if (option == "--packed-decode") decode_form = true;
-            else if (option == "--grouped-decode") decode_form = false;
+            else if (option == "--served-route") served_route = true;
             else if (option == "--served-prefill") served_prefill = true;
             else if (option == "--served-prompts" && i + 1 < argc)
                 prompt_lengths = inkling2::test::parse_served_prompts(argv[++i]);
             else throw std::invalid_argument("unknown option: " + std::string(option));
         }
         if (served_prefill)
-            return inkling2::test::served_prefill(argv[1], storage, inkling2::mini_packed_decode(decode_form),
-                                                  prompt_lengths);
-        return inkling2::test::cohort_lanes(argv[1], storage, inkling2::mini_packed_decode(decode_form));
+            return inkling2::test::served_prefill(argv[1], storage, prompt_lengths);
+#if defined(__HIPCC__)
+        const bool admitted = served_route;
+#else
+        const bool admitted = false;  // a CUDA server declines the lever
+#endif
+        if (served_route && !admitted) std::cout << "NOTE served route lever declined by this backend\n";
+        return inkling2::test::cohort_lanes(argv[1], storage, served_route);
     } catch (const std::exception& error) {
         std::cerr << "FAIL Inkling Mini cohort lanes: " << error.what() << '\n';
         return 1;

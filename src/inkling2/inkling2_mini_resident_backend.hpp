@@ -146,9 +146,9 @@ public:
 #endif
 
     MiniResidentBackend(const MiniResidentWeights& weights, unsigned max_rows, mini_gpu::Stream stream,
-                        bool packed_decode = false, bool step_graphs = default_step_graphs)
+                        bool packed_decode = false, bool step_graphs = default_step_graphs, bool cohort_rows = false)
         : weights_(weights), stream_(stream), max_rows_(checked_chunk_rows(max_rows)), packed_decode_(packed_decode),
-          step_graphs_(step_graphs),
+          cohort_rows_(packed_decode && cohort_rows), step_graphs_(step_graphs),
           tiles_(moe_core::device_grouped::tile_bound(max_rows_, kExpertsPerToken, kExperts, Moe::rows_per_tile)),
           controller_(mini_controller_elements(max_rows_)), attention_(attention_elements(max_rows_)),
 #if defined(__HIPCC__)
@@ -163,8 +163,9 @@ public:
 #if defined(__HIPCC__)
           moe_activation_(mini_moe_activation_elements(max_rows_)),
 #endif
-          // Packed decode keeps one route status per routed row (a cohort decode of up to max_rows_ lanes).
-          flags_((1U + (packed_decode ? max_rows_ : 1U)) * kLogicalVisits),
+          // Packed decode keeps one route status per routed row: up to kMiniMaxVerifyRows verify rows, or, with packed
+          // cohort rows (the served route lever only), a cohort decode pass of up to max_rows_ lanes.
+          flags_((1U + (packed_decode ? (cohort_rows ? max_rows_ : std::min(max_rows_, kMiniMaxVerifyRows)) : 1U)) * kLogicalVisits),
           zero_padding_(kHeadWidth) {
 #if !defined(__HIPCC__)
         if (const char* enable = strix::envcfg::text("STRIX_INKLING_K1BIND"); enable && std::string_view(enable) == "1") {
@@ -300,7 +301,7 @@ public:
     void start_chunk(unsigned rows, MiniAppendKind kind) {
         // Route capture/replay reads or writes host data synchronously. The step graph itself is
         // decided by try_step_graph; the route only picks the row geometry here.
-        route_ = mini_resident_route(kind, rows, packed_decode_, false);
+        route_ = mini_resident_route(kind, rows, packed_decode_, false, cohort_rows_);
         route_flag_rows_ = route_.packed_moe ? rows : 1U;
 #if !defined(__HIPCC__)
         chunk_w4a4_ = moe_w4a4_ && kind == MiniAppendKind::prefill && rows > 1U;
@@ -333,7 +334,7 @@ public:
 
     // The host route of a chunk whose device work replays (the captured start_chunk also clears the flags).
     void prepare_route(unsigned rows, MiniAppendKind kind) {
-        route_ = mini_resident_route(kind, rows, packed_decode_, false);
+        route_ = mini_resident_route(kind, rows, packed_decode_, false, cohort_rows_);
         route_flag_rows_ = route_.packed_moe ? rows : 1U;
         chunk_w4a4_ = moe_w4a4_ && kind == MiniAppendKind::prefill && rows > 1U;
     }
@@ -381,9 +382,12 @@ public:
     [[nodiscard]] bool packed_decode() const noexcept { return packed_decode_; }
 
     void finish() {
+        std::array<unsigned, (1U + kMiniMaxVerifyRows) * kLogicalVisits> storage{};
         const auto active = active_flags().size();
-        if (host_flags_.size() < active) host_flags_.resize(active);  // grows once to the widest routed call
-        const auto flags = std::span(host_flags_).first(active);
+        // Packed cohort rows (served route lever) can route more rows than the verify window: a host copy that grows
+        // once to the widest routed call.
+        if (active > storage.size() && host_flags_.size() < active) host_flags_.resize(active);
+        const auto flags = active > storage.size() ? std::span(host_flags_).first(active) : std::span(storage).first(active);
         mini_gpu::copy(flags.data(), flags_.data(), flags.size_bytes(), mini_gpu::device_to_host, stream_);
         mini_gpu::synchronize(stream_);
         if (std::ranges::any_of(flags, [](unsigned flag) { return flag != 0U; }))
@@ -867,14 +871,27 @@ private:
         using weight::microscaled::MatrixFormat;
         const auto format = mini_expert_format(layer);
 #if defined(__HIPCC__)
-        // HIP: microscaled_r1 rows launches serve the routed rows (row r's bits are those of a one-row launch,
-        // ink_hip_dec): launch_rows runs chunks of at most rows_chunk_cap(scratch rows) rows, so a pass of up to
-        // kMaxLaunchRows (16) rows is ONE launch when the activation scratch holds that many rows. The route status
-        // words stay one per row, contiguous from failure.
+        // HIP: one microscaled_r1 rows launch serves the routed rows (row r's bits are those of a one-row launch,
+        // ink_hip_dec); the route status words stay one per row, contiguous from failure.
+        if (!cohort_rows_ && rows > 1U && rows <= decode::kMaxRows &&
+            moe_bf16_.span().size() >= std::size_t{rows} * kExpertsPerToken * kExpertWidth) {
+            const decode::Args args{
+                matrices.data(), route.ids.data(), route.weights.data(), failure, input.data(), moe_bf16_.data(),
+                output.data(), kExperts, kHiddenWidth, kExpertWidth, kMlpGateSoftcap, kMlpUpSoftcap,
+            };
+            if (format == MatrixFormat::nvfp4)
+                check(decode::launch<MatrixFormat::nvfp4, kExpertsPerToken>(args, stream_, rows));
+            else
+                check(decode::launch<MatrixFormat::mxfp8, kExpertsPerToken>(args, stream_, rows));
+            return;
+        }
+        // Packed cohort rows (served route lever only): launch_rows runs chunks of at most rows_chunk_cap(scratch
+        // rows) rows, so a pass of up to kMaxLaunchRows (16) rows is ONE launch when the activation scratch holds
+        // that many rows; row r keeps the bits of a one-row launch.
         const auto scratch_rows = static_cast<unsigned>(
             std::min<std::size_t>(moe_bf16_.span().size() / (std::size_t{kExpertsPerToken} * kExpertWidth),
                                   decode::kMaxLaunchRows));
-        if (rows > 1U && scratch_rows != 0U) {
+        if (cohort_rows_ && rows > 1U && scratch_rows != 0U) {
             const decode::Args args{
                 matrices.data(), route.ids.data(), route.weights.data(), failure, input.data(), moe_bf16_.data(),
                 output.data(), kExperts, kHiddenWidth, kExpertWidth, kMlpGateSoftcap, kMlpUpSoftcap,
@@ -936,6 +953,7 @@ private:
     mini_gpu::Stream stream_;
     unsigned max_rows_;
     bool packed_decode_;
+    bool cohort_rows_;  // packed cohort decode passes of up to max_rows_ lanes (served route lever only)
 #if !defined(__HIPCC__)
     moe_core::grouped_microscaled::Decode moe_decode_ = mini_cuda_moe_decode();
     moe_core::grouped_microscaled::Schedule moe_schedule_ = mini_cuda_moe_schedule();

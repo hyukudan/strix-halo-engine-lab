@@ -301,6 +301,7 @@ int main(int argc, char** argv) {
                       << family.prefill_tail_divisor << " first_id prefill\n";
             std::cerr << "strix-decode-route/v1 moe_decode " << mini_decode_form_name(options.generation.packed_decode)
                       << '\n';
+            std::cerr << mini_served_route_cli_line(options.tier) << '\n';
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
             if (!route.speculation_reason.empty())
                 std::cerr << "strix-speculation-route/v1 requested auto effective off ("

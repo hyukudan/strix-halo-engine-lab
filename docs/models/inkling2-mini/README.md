@@ -75,25 +75,26 @@ build-cuda/strix-inkling2-mini-cuda MODEL.safetensors \
 ```
 
 Decode runs the experts on the one-row packed form by default on the command
-line (both backends). `strix-serve` keeps its existing route by default in
-every profile: the last prompt token is held back and decoded, prompts run in
-128-row chunks, and a cohort decodes with the grouped form in one batched
-forward (CUDA: its width programs), whose lane bits depend on the cohort width
-as before. The served route switch `STRIX_INK_SERVED_CLI_ROUTE=1`
-(`inkling2-mini-served-cli-route@1`, off in every profile column, reported as
-unqualified until its migration is qualified against the existing served
-route) makes a HIP server run the command line's route; a CUDA server declines
-it. On that route decode is packed by default and a served lane keeps the bits
-of its own lone decode at any cohort width: cohorts run in passes of at most 16
-lanes, the row limit of the dense one-row form. `--packed-decode` or
-`--grouped-decode` selects the form explicitly on either entry point, resolved
-by one function (`serve::resolve_decode_form`), and both entry points print it
-as `moe_decode` in their route line (the command line as
-`strix-decode-route/v1`); naming both flags is refused. A cohort decode checks
-every lane before any pass appends and runs its passes through
-`serve::run_cohort_passes`: the input ids are copied before the first pass, the
-picks are published after the last one, and every lane of the cohort is retired
-if a pass fails. The packed route uses one kernel for gate/up with BF16
+line (both backends; `--grouped-decode` selects the grouped tile kernel there,
+printed as `moe_decode` in `strix-decode-route/v1`). `strix-serve` keeps its
+existing route in every profile and takes no decode form flag: the last
+prompt token is held back and decoded, prompts run in 128-row chunks
+(`--prefill-rows`, clamped to the context, which without `--slots` also caps
+the lanes), and a cohort decodes with the grouped form in one batched forward
+(CUDA: its width programs), whose lane bits depend on the cohort width as
+before. The served route switch `STRIX_INK_SERVED_CLI_ROUTE=1`
+(`inkling2-mini-served-cli-route@1`, off in every profile column) makes a HIP
+server run the command line's route; a CUDA server declines it. The startup
+line reports it as `served_route off`, `declined`, or `on qualification
+unqualified` with its form, chunk and tail; the command line prints
+`strix-served-route/v1 ... effective n/a`. On that route decode is packed and
+a served lane keeps the bits of its own lone decode at any cohort width:
+cohorts run in passes of at most 16 lanes, the row limit of the dense one-row
+form, with one head launch per pass; lanes default to 128 without `--slots`.
+A cohort decode on that route checks every lane before any pass appends and
+runs its passes through `serve::run_cohort_passes`: the input ids are copied
+before the first pass, the picks are published after the last one, and every
+lane of the cohort is retired if a pass fails. The packed route uses one kernel for gate/up with BF16
 activation and one for down with ordered expert combine.
 
 On HIP, the command line prefills in chunks of 8192 rows (`--prefill-chunk`),

@@ -230,7 +230,26 @@ void test_served_route() {
             const bool on = value != nullptr && std::strcmp(value, "1") == 0;
             require(mini::mini_served_cli_route(resolution) == on, "served route: explicit opt-in only");
             require((resolution.qualification() == "qualified") == !on, "served route: an opt-in run is unqualified");
+            require(mini::mini_served_route_cli_line(resolution) ==
+                        std::string("strix-served-route/v1 requested ") + (on ? "1" : "0") +
+                            " effective n/a (strix-serve only; the command line runs its own route)",
+                    "served route: the command line reports the lever as not applicable to its route");
         }
+        // A malformed setting is the server's refusal only: the shared resolution (the command line's) does not abort.
+        mini::MiniWeightOptions options;
+        options.tier.profile = tier;
+        options.tier.env = [](const char* key) -> const char* {
+            return std::strcmp(key, "STRIX_INK_SERVED_CLI_ROUTE") == 0 ? "2" : nullptr;
+        };
+        const auto resolution = mini::resolve_mini_profile(options, true);
+        bool refused = false;
+        try {
+            (void)mini::mini_served_cli_route(resolution);
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        require(refused && mini::mini_served_route_cli_line(resolution).find("requested 2 effective n/a") != std::string::npos,
+                "served route: a malformed setting is refused by the server and reported by the command line");
     }
 }
 

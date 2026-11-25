@@ -3,6 +3,8 @@
 #include "moe_core/grouped_w4a4.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
 
+#include <string>
+
 namespace strix::inkling2 {
 
 struct MiniWeightOptions {
@@ -67,12 +69,21 @@ inline bool mini_combine_image(const profile::Resolution& tier) {
 }
 
 // Resolved state of the served route lever (true: a HIP server runs the command line's route, kMiniServedCliRoute).
-// 0 or absent = off: the served incumbent route.
+// 0 or absent = off: the served incumbent route. Read (and validated) by the server only: the command line always runs
+// its own route and reports the lever as not applicable (mini_served_route_cli_line).
 inline bool mini_served_cli_route(const profile::Resolution& tier) {
     const auto* entry = tier.find(kMiniServedCliRoute);
     if (entry == nullptr || entry->value == "0") return false;
     if (entry->value == "1") return true;
     throw std::invalid_argument("STRIX_INK_SERVED_CLI_ROUTE must be 0 or 1");
+}
+
+// The command line's receipt of the served route lever: the requested value as the resolution holds it (unparsed, so a
+// malformed server setting never aborts the command line) and that it does not apply here.
+inline std::string mini_served_route_cli_line(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniServedCliRoute);
+    return "strix-served-route/v1 requested " + std::string(entry ? entry->value : std::string_view("0")) +
+           " effective n/a (strix-serve only; the command line runs its own route)";
 }
 
 // "on", "off" or "declined" (selected, but the target does not run it): the state name of a lever in the startup lines
@@ -113,7 +124,6 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
     static_cast<void>(mini_moe_w4a4(tier));  // refuse a malformed or unrunnable explicit switch early
     static_cast<void>(mini_prepared_round_fold(tier));
     static_cast<void>(mini_combine_image(tier));
-    static_cast<void>(mini_served_cli_route(tier));
     return tier;
 }
 

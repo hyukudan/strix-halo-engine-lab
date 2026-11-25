@@ -328,10 +328,16 @@ void set_image_env(const char* value) {
 #endif
 }
 
+// Shape of one served start: --prefill-rows / --context / --slots as given (nullopt: omitted).
+struct ServedShape {
+    std::optional<unsigned> prefill_rows;
+    std::optional<unsigned> context;
+    std::optional<unsigned> slots;
+};
+
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
-            W4a4 w4a4 = W4a4::bf16, std::optional<bool> decode_form = std::nullopt,
-            std::string_view tier_name = "fast", bool image = false, bool round_fold = false, bool cli_route = false,
-            unsigned prefill_rows = 0U) {
+            W4a4 w4a4 = W4a4::bf16, std::string_view tier_name = "fast", bool image = false, bool round_fold = false,
+            bool cli_route = false, ServedShape shape = {}) {
     sv::ServiceFactories factories;
     bool created = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
@@ -361,32 +367,39 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         // The served prefill resolves the down-image lever like the CLI and the gate do: off unless selected explicitly.
         require(options.combine_image == image, "down-image selection did not reach native adapter");
         // The served route lever (opt-in in every profile column): a HIP server runs the command line's route only when
-        // STRIX_INK_SERVED_CLI_ROUTE=1 selects it; without it, and on CUDA, the incumbent served route.
+        // STRIX_INK_SERVED_CLI_ROUTE=1 selects it; a CUDA server declines it and keeps the requested bit in its receipt.
         const bool hip_backend = std::string_view(backend) == "hip";
         const bool route = cli_route && hip_backend;
-        require(options.served_cli_route == route, "served route lever: opt-in, HIP only");
-        // The decode form: a flag as on the command line; without one, the route's served default (packed on the
-        // command line's route, grouped on the incumbent served route).
-        require(options.packed_decode == decode_form.value_or(mini::mini_served_packed_default(hip_backend, cli_route)) &&
-                    (!decode_form || options.packed_decode == mini::mini_packed_decode(decode_form)) &&
-                    mini::kMiniPackedDecodeDefault && mini::mini_served_packed_default(true, true) &&
-                    !mini::mini_served_packed_default(true, false) && !mini::mini_served_packed_default(false, true),
-                "served decode form: a flag as on the command line, else packed only on the command line's route");
-        // The prompt route: the command line's schedule (chunk and tail rule, emits-first) on its route; the incumbent
-        // held-back route (128-row chunks, no tail, the last prompt token decoded) otherwise.
-        const auto cli = mini::mini_prefill_schedule_from_env(hip_backend);
-        const auto schedule = mini::mini_served_prefill_schedule_from_env(hip_backend, cli_route);
-        const auto chunk = prefill_rows != 0U ? prefill_rows : schedule.chunk;
-        require(mini::mini_served_prefill_emits_first(hip_backend, cli_route) == route &&
-                    (route ? schedule.chunk == cli.chunk && schedule.tail_divisor == cli.tail_divisor
-                           : schedule.chunk == 128U && schedule.tail_divisor == 0U) &&
-                    options.prefill_rows == std::min(chunk, options.context) &&
-                    options.prefill_tail ==
-                        mini::mini_prefill_tail_capacity(options.prefill_rows, schedule.tail_divisor, options.context) &&
-                    mini::mini_prefill_piece_rule(route).cuttable() == route,
-                "served prefill route: the command line's schedule on its route, else the incumbent held-back route");
-        // An explicit --prefill-rows without --slots keeps capping the lanes as before (not the 128-lane default).
-        require(options.slots == 0U && options.lane_rows == prefill_rows, "explicit --prefill-rows lane cap");
+        require(options.served_route_requested == cli_route && options.served_cli_route == route,
+                "served route lever: opt-in, HIP only");
+        const auto field = mini::mini_served_route_startup_field(options);
+        require(route ? field.starts_with("on qualification unqualified moe_decode packed ")
+                      : field == (cli_route ? "declined" : "off"),
+                "served route receipt: off, declined or on with its qualification");
+        const unsigned context = shape.context.value_or(8192U);
+        require(options.context == context && options.slots == shape.slots.value_or(0U), "served shape options");
+        if (!route) {
+            // Without the lever the served shape is the incumbent one, written out here from the rule the server had
+            // before the lever existed: a 128-row chunk unless --prefill-rows, clamped to the context; lanes = --slots,
+            // else that clamped chunk; no tail; held-back prompt token; grouped decode.
+            const unsigned chunk = std::min(shape.prefill_rows.value_or(128U), context);
+            const unsigned lanes = shape.slots.value_or(0U) != 0U ? *shape.slots : chunk;
+            require(options.prefill_rows == chunk && mini::mini_serve_lane_rows(options) == lanes &&
+                        options.prefill_tail == 0U && options.lane_rows == 0U,
+                    "lever off: the served chunk, lane cap and tail are the incumbent ones");
+        } else {
+            // With the lever: the command line's chunk and tail rule, emits-first; lanes = --slots, else an explicit
+            // (clamped) --prefill-rows, else the served lane cap.
+            const auto cli = mini::mini_prefill_schedule_from_env(true);
+            const unsigned chunk = std::min(shape.prefill_rows.value_or(cli.chunk), context);
+            const unsigned lanes = shape.slots.value_or(0U) != 0U ? *shape.slots
+                                   : shape.prefill_rows                ? chunk
+                                                                       : mini::kMiniServeLaneRows;
+            require(options.prefill_rows == chunk && mini::mini_serve_lane_rows(options) == lanes &&
+                        options.prefill_tail == mini::mini_prefill_tail_capacity(chunk, cli.tail_divisor, context) &&
+                        mini::mini_prefill_piece_rule(true).cuttable(),
+                    "lever on: the command line's schedule and the served lane cap");
+        }
         // The served tier is the native command line's resolution of the same --profile (TURBO included: the native
         // resolver inherits the admitted FAST levers), with the same lever classes.
         mini::MiniWeightOptions cli_weights;
@@ -422,10 +435,11 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                                      "--checkpoint", "MODEL.safetensors", "--backend", backend,
                                      "--profile", std::string(tier_name), "--speculation", "off"};
     if (qualify_q8) strings.emplace_back("--qualify-q8");
-    if (decode_form) strings.emplace_back(*decode_form ? "--packed-decode" : "--grouped-decode");
-    if (prefill_rows != 0U) {
-        strings.emplace_back("--prefill-rows");
-        strings.emplace_back(std::to_string(prefill_rows));
+    for (const auto& [flag, value] : {std::pair{"--prefill-rows", shape.prefill_rows}, std::pair{"--context", shape.context},
+                                      std::pair{"--slots", shape.slots}}) {
+        if (!value) continue;
+        strings.emplace_back(flag);
+        strings.emplace_back(std::to_string(*value));
     }
     const auto run = [&](sv::ServeShell shell, std::ostream& out, std::ostream& error) {
         std::vector<char*> argv;
@@ -457,14 +471,13 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         if (std::string_view(field) == "--speculation") strings.pop_back();
         strings.pop_back();
     }
-    {
-        // Both decode flags together are refused before any native work, on every tier and flag combination.
+    // The server takes no decode form flag: a served form is selected only through the served route lever's row.
+    for (const auto* flag : {"--packed-decode", "--grouped-decode"}) {
         std::ostringstream out, error;
-        strings.emplace_back("--packed-decode");
-        strings.emplace_back("--grouped-decode");
-        require(run({}, out, error) == 2 && !created && error.str().find("exclusive") != std::string::npos,
-                "exclusive decode flags did not fail before native load");
-        strings.pop_back();
+        strings.emplace_back(flag);
+        require(run({}, out, error) == 2 && !created &&
+                    error.str().find(std::string("unknown Inkling argument ") + flag) != std::string::npos,
+                "a decode form flag reached the server outside the shared lever row");
         strings.pop_back();
     }
     sv::ServeShell shell;
@@ -529,8 +542,8 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
     const auto rc = run(shell, out, error);
     if (rc != 0) throw std::runtime_error(error.str());
     require(created, "selected backend was not constructed");
-    // The socket startup re-creates the service with its own arguments (no decode flag).
-    if (!qualify_q8 && !decode_form && prefill_rows == 0U && tier_name == "fast" &&
+    // The socket startup re-creates the service with its own arguments (default shape).
+    if (!qualify_q8 && !shape.prefill_rows && !shape.context && !shape.slots && tier_name == "fast" &&
         (std::string_view(backend) == "hip" || sample_capable)) {
         const auto* factory = factories.find("inkling2");
         require(factory != nullptr, "Inkling service factory was not registered");
@@ -549,11 +562,12 @@ int main(int argc, char** argv) try {
     for (const auto* backend : {"hip", "cuda"}) {
         wiring(argv[1], backend, false);
         wiring(argv[1], backend, true);
-        for (const bool packed : {false, true}) wiring(argv[1], backend, false, false, W4a4::bf16, packed);
-        // The decode form is the same for every tier: no flag, either flag, through the server's option parser.
+        // Every tier keeps the incumbent served shape without the lever, also for chunks above the context and
+        // explicit slots.
         for (const auto* tier : {"exact", "fast", "turbo"})
-            for (const auto form : {std::optional<bool>{}, std::optional<bool>{true}, std::optional<bool>{false}})
-                wiring(argv[1], backend, false, false, W4a4::bf16, form, tier);
+            for (const ServedShape shape : {ServedShape{}, ServedShape{{}, 15U, {}}, ServedShape{8192U, 15U, {}},
+                                            ServedShape{{}, 15U, 9U}, ServedShape{32U, {}, {}}, ServedShape{32U, {}, 4U}})
+                wiring(argv[1], backend, false, false, W4a4::bf16, tier, false, false, false, shape);
     }
     wiring(argv[1], "cuda", false, true);
     // Every lever value reaches the served decoder as its own class (mse used to run nearest@1 there).
@@ -568,29 +582,27 @@ int main(int argc, char** argv) try {
     set_image_env(nullptr);
     wiring(argv[1], "hip", false);
     set_round_fold_env("1");
-    for (const auto* backend : {"hip", "cuda"}) wiring(argv[1], backend, false, false, W4a4::bf16, std::nullopt, "fast", false, true);
+    for (const auto* backend : {"hip", "cuda"}) wiring(argv[1], backend, false, false, W4a4::bf16, "fast", false, true);
     set_round_fold_env("0");
     wiring(argv[1], "hip", false);
     set_round_fold_env(nullptr);
     set_image_env("1");
     for (const auto* backend : {"hip", "cuda"})
-        wiring(argv[1], backend, false, false, W4a4::bf16, std::nullopt, "fast", true);
+        wiring(argv[1], backend, false, false, W4a4::bf16, "fast", true);
     set_image_env("0");
     wiring(argv[1], "hip", false);
     set_image_env(nullptr);
     // The served route lever: off by default in every tier (above); STRIX_INK_SERVED_CLI_ROUTE=1 selects the command
-    // line's route on HIP (CUDA declines it) in any tier, with or without a decode flag; an explicit 0 keeps it off.
+    // line's route on HIP (CUDA declines it and keeps the incumbent shape) in any tier; an explicit 0 keeps it off.
     set_cli_route_env("1");
     for (const auto* backend : {"hip", "cuda"})
         for (const auto* tier : {"exact", "fast", "turbo"})
-            for (const auto form : {std::optional<bool>{}, std::optional<bool>{false}})
-                wiring(argv[1], backend, false, false, W4a4::bf16, form, tier, false, false, true);
+            for (const ServedShape shape : {ServedShape{}, ServedShape{{}, 15U, {}}, ServedShape{8192U, 15U, {}},
+                                            ServedShape{32U, {}, {}}, ServedShape{{}, {}, 9U}})
+                wiring(argv[1], backend, false, false, W4a4::bf16, tier, false, false, true, shape);
     set_cli_route_env("0");
     wiring(argv[1], "hip", false);
     set_cli_route_env(nullptr);
-    // An explicit --prefill-rows without --slots caps the lanes at its rows on both routes.
-    for (const auto* backend : {"hip", "cuda"}) wiring(argv[1], backend, false, false, W4a4::bf16, std::nullopt, "fast",
-                                                       false, false, false, 32U);
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
