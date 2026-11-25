@@ -104,7 +104,10 @@ inline constexpr std::string_view levers = "fast";
 } // namespace fast
 inline constexpr std::string_view native_kv = "bf16 MLA latent";
 namespace turbo {
+namespace cuda {
 inline constexpr std::string_view levers = "fast";
+} // namespace cuda
+inline constexpr std::string_view levers = "turbo";
 } // namespace turbo
 } // namespace presets
 inline constexpr std::string_view schema = "strix-model/v1";
