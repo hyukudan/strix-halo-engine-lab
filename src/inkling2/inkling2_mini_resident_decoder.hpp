@@ -922,9 +922,10 @@ private:
         const bool decode_step = kind == MiniAppendKind::decode && rows == 1U &&
                                  &state == &slots_.front()->state() && draft_taps_.span().empty();
         // Only a one-row greedy pick without host logits may skip the full logits row (the screened head: HIP's own
-        // binding, CUDA the screened-head lever). A captured step graph replays the head it captured, so a change of
-        // head between decode steps drops the graph (it is captured again).
-        const bool screened = screen_.has_value() && pick_next && !multi_pick && host_logits.empty();
+        // binding, CUDA the screened-head lever, never a verify row). A captured step graph replays the head it
+        // captured, so a change of head between decode steps drops the graph (it is captured again).
+        const bool screened =
+            mini_screened_pick(head_.reason, screen_.has_value(), kind, pick_next, multi_pick, !host_logits.empty());
         if (decode_step && screened != screened_graph_) {
             backend_.abandon_capture();
             screened_graph_ = screened;

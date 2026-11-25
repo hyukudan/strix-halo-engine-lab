@@ -444,6 +444,26 @@ void test_screened_head_decision() {
                 mini::mini_head_field({true, mini::MiniHeadReason::hip_binding}) == "screened hip-binding" &&
                 mini::mini_head_field({false, mini::MiniHeadReason::hip_binding}) == "full hip-binding",
             "head startup field names");
+    // The per-append pick (MiniResidentDecoder::append): under the lever a one-row decode / prefill pick without host
+    // scores runs screened; a one-row verify window (verify_top of one row) and the partial-commit replay of one kept
+    // row (commit -> append(keep == 1, no scores, verify)) keep the full head; HIP's own binding is unchanged.
+    using mini::MiniAppendKind;
+    constexpr auto lever = mini::MiniHeadReason::lever;
+    constexpr auto hip = mini::MiniHeadReason::hip_binding;
+    require(mini::mini_screened_pick(lever, true, MiniAppendKind::decode, true, false, false) &&
+                mini::mini_screened_pick(lever, true, MiniAppendKind::prefill, true, false, false),
+            "lever: decode / prefill greedy pick runs screened");
+    require(!mini::mini_screened_pick(lever, true, MiniAppendKind::verify, true, false, false),
+            "lever: one-row verify window and the keep == 1 commit replay keep the full head");
+    require(!mini::mini_screened_pick(lever, true, MiniAppendKind::verify, false, false, false) &&
+                !mini::mini_screened_pick(lever, true, MiniAppendKind::verify, true, true, false),
+            "lever: replay without a pick and multi-row verify keep the full head");
+    require(!mini::mini_screened_pick(lever, true, MiniAppendKind::decode, true, false, true) &&
+                !mini::mini_screened_pick(lever, false, MiniAppendKind::decode, true, false, false),
+            "lever: host scores or an unbuilt plane keep the full head");
+    require(mini::mini_screened_pick(hip, true, MiniAppendKind::verify, true, false, false) &&
+                !mini::mini_screened_pick(hip, false, MiniAppendKind::verify, true, false, false),
+            "HIP binding keeps its rule");
     const auto with = [](const char* value) {
         mini::MiniWeightOptions options;
         options.tier = inputs(profile::Name::standard);

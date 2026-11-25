@@ -17,6 +17,7 @@
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 #include "inkling2_mini_resident_decoder.hpp"
+#include "inkling2_mini_weight_options.hpp"
 #include <iostream>
 #else
 #include "exec/scheduled_stage_graph.hpp"
@@ -735,7 +736,8 @@ inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(co
             : resident(input.checkpoint, input.positions, input.prefill_chunk, input.packed_decode, false,
                        weight::kBf16WeightStorage, 0U, false, 1U, 0U, false, one_plane),
               program(with_levers(resident, w4a4, projected_bias, screened), EpilogueFusion,
-                      mini_latency_forms(LatencyForms)) {}
+                      mini_latency_forms(LatencyForms)),
+              projected_bias_(projected_bias) {}
         // Same order as the gate path: the levers (and the NVFP4 activation image) are set before the program binds.
         static MiniResidentDecoder& with_levers(MiniResidentDecoder& decoder, Activations w4a4, bool projected_bias,
                                                 bool screened) {
@@ -745,11 +747,16 @@ inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(co
             return decoder;
         }
         unsigned prefill(std::span<const unsigned> ids, std::span<float> logits) override {
-            return program.prefill(ids, logits);
+            const auto next = program.prefill(ids, logits);
+            // The same observed-route line as the resident command line and the server (lever selected only).
+            if (projected_bias_)
+                std::cerr << mini_projected_bias_dispatches_line(resident.projected_attention_dispatches()) << '\n';
+            return next;
         }
         unsigned decode(unsigned token, std::span<float> logits) override { return program.decode(token, logits); }
         MiniResidentDecoder resident;
         MiniCudaProgramDecoder program;
+        bool projected_bias_;
     };
     return std::make_unique<Decoder>(load, moe_w4a4, controller_one_plane, attn_projected_bias, screened_head);
 }

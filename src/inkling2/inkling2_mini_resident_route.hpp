@@ -98,6 +98,15 @@ inline std::string mini_head_field(MiniHead head) {
     return std::string(head.screened ? "screened " : "full ") + std::string(mini_head_reason_name(head.reason));
 }
 
+// Whether one append's greedy pick runs the built screened head (skips the score row): a single pick without host
+// scores. The screened-head lever admits only prefill / decode picks: a verify append (a one-row verify window, the
+// partial-commit replay of a kept row) keeps the full head under the lever. HIP's own binding keeps its rule.
+constexpr bool mini_screened_pick(MiniHeadReason reason, bool built, MiniAppendKind kind, bool pick_next,
+                                  bool multi_pick, bool host_scores) {
+    if (!built || !pick_next || multi_pick || host_scores) return false;
+    return kind != MiniAppendKind::verify || reason == MiniHeadReason::hip_binding;
+}
+
 // The one prompt-row rule of an opted-in W4A4 expert class, shared by the CLI session and the served lanes: every
 // prefill-kind row runs the class whatever the chunk geometry, and decode / verify rows keep the BF16 tile. A one-row
 // prefill chunk therefore takes the grouped route (the packed one-row route has no W4A4 class).
