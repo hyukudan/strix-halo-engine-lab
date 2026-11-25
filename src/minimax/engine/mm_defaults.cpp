@@ -454,6 +454,7 @@ std::string linear_order(const Lookup& env) {
 }
 
 std::string prefill_identity(const Lookup& env) {
+    (void)dense_tail_fixed(env);  // a conflicting dense tail request never yields a cache identity
     const auto p = prefill_policy(env);
     // MSA attention policies under prefill_msa (unchanged form), the index projection member under prefill_idxproj.
     std::string msa, idx;
