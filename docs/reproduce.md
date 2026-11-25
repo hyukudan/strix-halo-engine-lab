@@ -1,5 +1,7 @@
 # Reproduce engine measurements
 
+See [benchmark campaigns](benchmark-campaigns.md) for the product-default matrix and the public DeepSeek fixed-prompt protocol.
+
 The kit records token-identified workloads and produces issue-ready JSON and Markdown.
 This guide describes the current kit, rather than asserting reproduction of every README campaign.
 

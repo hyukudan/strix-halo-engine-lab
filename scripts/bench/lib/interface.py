@@ -7,12 +7,28 @@ import shlex
 import subprocess
 import sys
 
+DEEPSEEK_CAMPAIGN_TIERS = ('exact', 'fast', 'turbo')
+
 ENGINES = ['qwen', 'deepseek', 'glm', 'minimax', 'deepseek-rtx', 'nemotron']
 ALIASES = {'deepseek': 'deepseek-pair', 'glm': 'glm-pair', 'minimax': 'minimax-pair'}
 ALLOW = {'qwen': ['default', 'plain', 'baseline', 'gsq', *['mtp-k'+str(i) for i in range(1,9)]],
-         'deepseek-pair': ['default','greedy','dspark','baseline'], 'glm-pair': ['r1b','r1','mtp','baseline'],
+         'deepseek-pair': ['default','greedy','dspark','baseline', *DEEPSEEK_CAMPAIGN_TIERS], 'glm-pair': ['r1b','r1','mtp','baseline'],
          'minimax-pair': ['default','greedy','dspark','baseline'], 'deepseek-rtx': ['default','baseline'],
          'nemotron': ['default','fast','quality']}
+
+def deepseek_campaign_tier(tier, kit):
+    # Read the native tier column from the same model description as the product launcher.
+    if tier not in DEEPSEEK_CAMPAIGN_TIERS:
+        return None
+    description = (kit.parents[1] / 'models/deepseek-v4.1-flash.toml').read_text(encoding='utf-8')
+    parts = re.split(r'(?m)^[ \t]*\[([^\]]+)\][ \t]*(?:#.*)?$', description)
+    for heading, body in zip(parts[1::2], parts[2::2]):
+        if heading == f'presets.{tier}':
+            native = re.search(r'(?m)^\s*levers\s*=\s*"(exact|fast|turbo)"[ \t]*(?:#.*)?$', body)
+            if native and DEEPSEEK_CAMPAIGN_TIERS.index(native[1]) <= DEEPSEEK_CAMPAIGN_TIERS.index(tier):
+                return native[1]
+    raise ValueError(f'missing or invalid DeepSeek model preset for {tier}')
+
 
 def resolve(args, kit):
     engine,suite,ctx,gen,conc,rep,warm,profile,prompts,only,serve = args
@@ -37,13 +53,20 @@ def resolve(args, kit):
     modes=only.split(',')
     if not modes or any(x not in ('decode','prefill','serve','exactness') for x in modes): raise ValueError('invalid --only subset')
     if serve=='1' and 'serve' not in modes: modes.append('serve')
+    if engine == 'deepseek-pair' and profile in DEEPSEEK_CAMPAIGN_TIERS:
+        if (contexts, generation, repeats, warmup, prompts, set(modes)) != (
+                [1024, 8192, 32768], 256, 3, 1, 'kit', {'decode', 'prefill', 'exactness'}):
+            raise ValueError('DeepSeek campaign requires the fixed protocol in docs/models/deepseek-v4.1/campaign-issue-116.md')
     texts=prompt_set(prompts,kit)
     # Validate even for dry runs, never execute the contents of a prompt file.
     params=dict(engine=engine.replace('-pair',''),suite=suite,contexts=contexts,gen_tokens=generation,
                 concurrency=levels,repeat=repeats,warmup=warmup,profile=profile,
                 prompts='kit' if prompts=='kit' else 'file',only=modes,serve='serve' in modes)
+    campaign_tier = deepseek_campaign_tier(profile, kit) if engine == 'deepseek-pair' else None
+    if campaign_tier:
+        params['native_tier'] = campaign_tier
     vals=dict(gen_tokens=generation,repeats=repeats,warmup=warmup,profile=profile,only=','.join(modes),
-              serve=int('serve' in modes),resolved_params=json.dumps(params))
+              serve=int('serve' in modes),resolved_params=json.dumps(params),campaign_tier=campaign_tier or '')
     for key,value in vals.items(): print(key+'='+shlex.quote(str(value)))
     print('context_values=('+ ' '.join(map(str,contexts))+')')
     print('prompt_names=('+ ' '.join(shlex.quote(x['id']) for x in texts)+')')
@@ -66,6 +89,9 @@ def prompt_set(source,kit):
 
 def help_text():
     print('''bench.sh list [--json] | check --engine E [--peer HOST] [--json]
+bench.sh campaign default --dry-run | --hardware H --out DIR --ledger FILE
+bench.sh campaign compare --ledger FILE RECEIPTS...
+See docs/benchmark-campaigns.md for campaign options and the public DeepSeek protocol.
 bench.sh run --engine qwen|deepseek|glm|minimax|deepseek-rtx|nemotron|all [options]
 Aliases: deepseek-pair, glm-pair, minimax-pair.
 --contexts 1k,8k,32k  --gen-tokens N  --concurrency 1,4,8
@@ -101,20 +127,34 @@ def plan(out,dry,k):
     decode=any(x in p['only'] for x in ('decode','exactness'))
     capacity=max(p['contexts'])+p['gen_tokens']+64
     if engine=='deepseek-pair':
+        tier = p.get('native_tier')
         if decode:
-            modes=['greedy','spec'] if p['profile']=='default' else ['spec' if p['profile']=='dspark' else 'greedy']
-            for mode in modes:
-                rows=[dict(x,mode=mode,generation=p['gen_tokens']) for x in order([f'{x}-ctx{n}' for n in p['contexts'] for x in names])]
-                label='decode-'+mode
+            modes = ['greedy', 'spec'] if p['profile'] == 'default' or tier else ['spec' if p['profile'] == 'dspark' else 'greedy']
+            if tier:
+                # Separate native arms alternate their order each round; rotate prompt order within each arm.
+                schedule = []
+                for r in range(p['repeat']):
+                    rotated = names[r:] + names[:r]
+                    for mode in (modes if r % 2 == 0 else reversed(modes)):
+                        rows = [dict(prompt_id=x, warmup=warm, round=r + 1)
+                                for warm in (True, False) for x in rotated]
+                        schedule.append((f'decode-{mode}-r{r + 1}', mode, rows))
+            else:
+                schedule = [('decode-' + mode, mode, order([f'{x}-ctx{n}' for n in p['contexts'] for x in names]))
+                            for mode in modes]
+            for label, mode, rows in schedule:
+                rows = [dict(x, mode=mode, generation=p['gen_tokens']) for x in rows]
                 prompt_file=out+'/'+label+'.ids'
                 if not dry:
                     Path(prompt_file).write_text(''.join(','.join(map(str,k.ids_read(out+'/'+x['prompt_id']+'.ids')))+'\n' for x in rows),encoding='ascii')
-                argv=[exe('strix-deepseek41-dspark-rank'),md+'/'+k.DS,md+'/DeepSeek-V4.1-Flash-1017-DSpark-MXFP4.gguf','--rank','0','--transport','usb4auto','--mode',mode,'--prompt-file',prompt_file,'--generate',str(p['gen_tokens']),'--max-positions',str(capacity),'--draft','split','--vocab','auto:'+md+'/vocab']
+                argv=[exe('strix-deepseek41-dspark-rank'),md+'/'+k.DS,md+'/'+k.DS_DRAFT,'--rank','0','--transport','usb4auto','--mode',mode,'--prompt-file',prompt_file,'--generate',str(p['gen_tokens']),'--max-positions',str(capacity),'--draft','split','--vocab','auto:'+md+'/vocab']
                 if p['profile']!='baseline': argv+=['--tp-attention','--engram-direct']
                 add(label,argv,rows)
         if 'prefill' in p['only']:
             for n in p['contexts']:
-                add('prefill-'+str(n),[exe('strix-deepseek41-prefill'),md+'/'+k.DS,'--rank','0','--world','2','--transport','usb4-gpu','--prompt',out+f'/prefill-{n}.ids','--rows',str(n),'--repeat',str(p['repeat']+p['warmup']),'--ttft-timing','--ttft-warmup','0'],[dict(x,mode='ttft',generation=1) for x in order(['prefill-'+str(n)])])
+                argv = [exe('strix-deepseek41-prefill'),md+'/'+k.DS,'--rank','0','--world','2','--transport','usb4-gpu','--prompt',out+f'/prefill-{n}.ids','--rows',str(n),'--repeat',str(p['repeat']+p['warmup']),'--ttft-timing','--ttft-warmup','0']
+                if tier: argv += ['--profile', tier]
+                add('prefill-'+str(n), argv, [dict(x,mode='ttft',generation=1) for x in order(['prefill-'+str(n)])])
     elif engine=='glm-pair':
         base=[exe('strix-glm5-rank'),md+'/glm','--rank','0','--world','2','--transport','usb4gpu','--capacity',str(capacity)]
         if p['profile']=='r1': base+=['--identity','r1']
