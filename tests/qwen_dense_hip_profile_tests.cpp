@@ -52,7 +52,7 @@ int main() {
         require(fast.resolution.entries.size() == 2U && win(fast, app).status == sp::Status::pending &&
                     win(fast, app).value == win(exact, app).value,
                 "fast: the wide cell is pending, effective value equals exact");
-        require(win(fast, app).target == "64-row FAST wide windows (dense-q8a8-f16-v1)", "pending target reported");
+        require(win(fast, app).target == "512-row FAST wide windows (dense-iu4a16-f16-v1)", "pending target reported");
         require(!sp::applied(win(fast, app).status), "fast applies no window lever without allow-pending");
         // The qualified layer table ran before the ladder rule: its incumbent grant keeps it in every regime.
         require(sp::applied(a4(fast).status) && a4(fast).value == "48-63" &&
@@ -88,7 +88,7 @@ int main() {
         // of the user's options, stamped unqualified (main's contract; the route line says it is a benchmark arm).
         Args allow{"--profile", "fast", "--allow-pending"};
         const auto applied = run(app, allow);
-        require(applied.args == Args{opt, "64"}, "fast --allow-pending adds the 64-row option in front");
+        require(applied.args == Args{opt, "512"}, "fast --allow-pending adds the 512-row option in front");
         require(win(applied, app).status == sp::Status::unqualified, "allow-pending is stamped unqualified");
         const sp::Lookup allow_env = [](const char* key) -> const char* {
             return std::string(key) == std::string(hp::kAllowEnv) ? "1" : nullptr;
@@ -110,10 +110,13 @@ int main() {
     // the decode app does not see the spec spelling and vice versa
     require(win(run(hp::App::decode, Args{"--prefill-rows", "8"}), hp::App::decode).status == sp::Status::builtin,
             "decode engine ignores --prefill-rows");
-    bool refused = false;
-    try { run(hp::App::spec, Args{"--profile", "turbo"}); }
-    catch (const std::exception& e) { refused = std::string_view(e.what()).find("decode_attn8 (FP8 QK/PV)") != std::string_view::npos; }
-    require(refused, "HIP names the unavailable FP8 arm");
+    for (const auto app : {hp::App::decode, hp::App::spec}) {
+        const auto turbo = run(app, Args{"--profile", "turbo"});
+        const auto fast = run(app, Args{"--profile", "fast"});
+        require(turbo.args == fast.args && a4(turbo).value == a4(fast).value &&
+                    win(turbo, app).status == sp::Status::pending,
+                "HIP TURBO inherits FAST while the wide schedule awaits workload admission");
+    }
     if (failures == 0) std::printf("qwen dense hip profile: PASS\n");
     return failures == 0 ? 0 : 1;
 }
