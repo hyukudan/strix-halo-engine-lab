@@ -284,7 +284,13 @@ public:
     }
     // CUDA projected-bias attention submissions so far (0 on HIP and with the lever off): what a test observes to tell the
     // projected route from the image route, whose bits are equal.
-    [[nodiscard]] std::uint64_t projected_attention_dispatches() const { return projected_dispatches_; }
+    [[nodiscard]] std::uint64_t projected_attention_dispatches() const {
+#if defined(__HIPCC__)
+        return 0U;
+#else
+        return projected_dispatches_;
+#endif
+    }
 
     // FAST W4A4 expert lever (inkling2-mini-moe-w4a4@1): multi-row prefill chunks run admitted NVFP4 expert layers through
     // the shared grouped W4A4 operand class. The NVFP4 image of the assignment rows is allocated only when the lever is on.
