@@ -3935,6 +3935,15 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         target_link_libraries(strix-hip-dense-lowbit-bench PRIVATE strix-weight "${STRIX_HIP_RUNTIME_LIBRARY}")
         strix_target_warnings(strix-hip-dense-lowbit-bench)
+        # No-model fixture of candidate block layouts on the dense kernels (sweep / small-M / tile traits, A8 probe): GPU.
+        add_executable(strix-hip-strixpack-bench tests/hip_strixpack_bench.hip)
+        set_target_properties(strix-hip-strixpack-bench PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-strixpack-bench PRIVATE include src "${STRIX_HIP_INCLUDE_DIR}")
+        target_compile_options(strix-hip-strixpack-bench PRIVATE
+            -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-strixpack-bench PRIVATE strix-weight "${STRIX_HIP_RUNTIME_LIBRARY}")
+        strix_target_warnings(strix-hip-strixpack-bench)
         # F9 recur: the rows launch against single-row step launches (padded strides, distinct gate rows); GPU run lanes only.
         add_executable(strix-hip-recur-gated-delta-rows-tests tests/recur_gated_delta_rows_hip_tests.hip)
         set_target_properties(strix-hip-recur-gated-delta-rows-tests PROPERTIES
