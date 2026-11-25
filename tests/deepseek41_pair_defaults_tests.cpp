@@ -497,16 +497,25 @@ void test_profile() {
         // The model frontend supplies this marker when it selects a TOML preset.
         const char* marker = pr::environment({}, pr::kPresetEnv);
         const auto previous = marker ? std::optional<std::string>(marker) : std::nullopt;
+        std::map<std::string, std::vector<std::pair<std::string, std::string>>> native_env;
+        for (const char* name : {"exact", "fast", "turbo"}) {
+            auto args = plain_args;
+            args.insert(args.end(), {"--profile", name});
+            native_env[name] = w.run(app, args).set_env;
+        }
+        check(std::is_permutation(native_env["fast"].begin(), native_env["fast"].end(), fast_env.begin(), fast_env.end()),
+              "native fast: the FAST set with replay R256");
         check(pr::export_environment(pr::kPresetEnv, "1"), "enable model preset marker");
         for (const char* name : {"exact", "fast", "turbo"}) {
             auto args = plain_args;
             args.insert(args.end(), {"--profile", name});
             const auto preset = w.run(app, args);
             const bool fast_tier = std::string_view(name) != "exact";
-            check(std::is_permutation(preset.set_env.begin(), preset.set_env.end(),
-                                      fast_tier ? fast_env.begin() : base.set_env.begin(),
-                                      fast_tier ? fast_env.end() : base.set_env.end()),
-                  std::string(name) + " preset: exports the same switches as the native CLI");
+            const auto& want_env = native_env[name];
+            std::string got_switches;
+            for (const auto& [k, v] : preset.set_env) got_switches += " " + k + "=" + v;
+            check(std::is_permutation(preset.set_env.begin(), preset.set_env.end(), want_env.begin(), want_env.end()),
+                  std::string(name) + " preset: exports the same switches as the native CLI (got" + got_switches + ")");
             for (const char* row : {"fast_prefill", "engram_f16wmma", "shared_f16", "moe_f16wmma"}) {
                 const auto* cell = preset.profile->find(row);
                 check(cell && cell->value == (fast_tier ? "1" : "0") &&

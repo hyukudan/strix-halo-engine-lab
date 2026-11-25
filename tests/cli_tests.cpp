@@ -243,8 +243,8 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
             if (entry.family == "deepseek41") {
                 require(turbo.requested == Name::turbo && turbo.levers == Name::turbo,
                         "DeepSeek preset forwards TURBO to the native resolver");
-                require(implicit.requested == Name::standard && implicit.levers == Name::standard,
-                        "DeepSeek implicit preset keeps EXACT arithmetic");
+                require(implicit.requested == Name::fast && implicit.levers == Name::fast,
+                        "DeepSeek implicit preset is the FAST product default");
             } else {
                 require(turbo.requested == Name::turbo && turbo.levers == fast.levers, "TURBO inherits FAST levers");
             }
