@@ -215,6 +215,26 @@ void fixture_case(const Case& c, view::Decode decode, std::mt19937& rng) {
         CK(cudaDeviceSynchronize());
         std::snprintf(label, sizeof label, "%s arm %s", what, arm_name(arm));
         if (!same(label)) ++failures;
+        if (arm == Arm::r128_s4) {
+            // All fixture K values (including the narrow calls after wider calls) must
+            // leave the same function-wide ceiling. A per-launch K-sized attribute
+            // can invalidate a concurrent wider launch on another host thread.
+            auto* kernel = tile::detail::projection_tall<F, tall::FormId::r128_k32_s4, false>;
+            if constexpr (Operand::kNvfp4)
+                if (decode == view::Decode::shift)
+                    kernel = tile::detail::projection_tall<F, tall::FormId::r128_k32_s4, true>;
+            int device = 0, optin = 0;
+            cudaFuncAttributes attributes{};
+            CK(cudaGetDevice(&device));
+            CK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+            CK(cudaFuncGetAttributes(&attributes, kernel));
+            if (optin <= 0 || attributes.sharedSizeBytes >= static_cast<std::size_t>(optin) ||
+                attributes.maxDynamicSharedSizeBytes != optin - static_cast<int>(attributes.sharedSizeBytes)) {
+                std::printf("FAIL %s: K-dependent tall shared-memory ceiling (%d)\n", what,
+                            attributes.maxDynamicSharedSizeBytes);
+                ++failures;
+            }
+        }
     }
     // A device tile count below the launch count: tiles past it are not touched (same in both schedules).
     to_device(tile_count, std::vector<unsigned>{count / 2U});
