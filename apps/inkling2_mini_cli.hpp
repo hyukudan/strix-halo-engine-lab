@@ -105,6 +105,7 @@ inline weight::WeightLoadExtent gate_weight_extent(std::span<const session::Head
 // Exact R1 latency forms of the CUDA step program (mask: 1 tiled bank readout, 2 controller output split,
 // 4 packed MoE pipe); the values mirror kMiniFormsMix/Moe/All (checked in the CUDA main).
 inline constexpr unsigned kLatencyFormsMix = 3U, kLatencyFormsMoe = 4U, kLatencyFormsAll = 7U;
+inline constexpr unsigned kLatencyFormsBatch = kLatencyFormsMix | 8U, kLatencyFormsB3 = kLatencyFormsBatch | 16U;
 
 struct StepProgramOptions {
     bool requested = false;
@@ -135,11 +136,14 @@ inline StepProgramOptions extract_step_program(std::vector<char*>& args) {
             continue;
         }
         if (value == "--latency-forms" || value == "--latency-forms=mix" || value == "--latency-forms=moe" ||
+            value == "--latency-forms=batch" || value == "--latency-forms=b3" ||
             value == "--no-latency-forms") {
             if (options.latency_forms_set) throw std::invalid_argument("duplicate latency forms option");
             options.latency_forms_set = true;
             options.latency_forms = value == "--no-latency-forms" ? 0U
                                   : value == "--latency-forms=mix" ? kLatencyFormsMix
+                                  : value == "--latency-forms=batch" ? kLatencyFormsBatch
+                                  : value == "--latency-forms=b3" ? kLatencyFormsB3
                                   : value == "--latency-forms=moe" ? kLatencyFormsMoe : kLatencyFormsAll;
             continue;
         }

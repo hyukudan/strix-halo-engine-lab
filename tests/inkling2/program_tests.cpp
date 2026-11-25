@@ -190,7 +190,15 @@ struct FixtureWeights {
         }
         return std::span(bf).subspan(offset, size);
     }
+    // Set by the bank-batch check: the two learned message-query tensors have their checkpoint size.
+    bool message_query_tensors = false;
+    std::vector<float> message_queries = std::vector<float>(std::size_t{mini::kMiniMessageQueryRows} * mini::kHiddenWidth);
+    std::vector<float> message_kv_queries =
+        std::vector<float>(std::size_t{mini::kMiniMessageQueryRows} * mini::kHiddenWidth);
+
     std::span<const float> f32(std::string_view name) const {
+        if (message_query_tensors && name == "middle_cycle_cross_pass_queries") return message_queries;
+        if (message_query_tensors && name == "middle_cycle_cross_pass_kv_queries") return message_kv_queries;
         return std::span(fp).subspan((std::hash<std::string_view>{}(name) % 64U) * 4U);
     }
 };
@@ -245,6 +253,10 @@ exec::KernelBinding bind_physical_fixture(const A& a) {
             if constexpr (std::is_same_v<A, HeadClipBf16>) return {"head-clip-bf16-r1", grid(a.heads, a.width <= 32U ? 32U : 128U)};
             if constexpr (std::is_same_v<A, residual::NormalizeArgs>) return {"residual-bank-norm-r1", grid(1U)};
             if constexpr (std::is_same_v<A, residual::MixArgs>) return {"residual-bank-mix-r1", grid(1U, a.bank_count == 1 ? 256U : 128U, 1U, a.bank_count)};
+            if constexpr (std::is_same_v<A, residual::BankBatchArgs>)
+                return {"residual-bank-batch-tiled-r1", grid(5U, 128U, 48U, 2U)};
+            if constexpr (std::is_same_v<A, residual::TransitionArgs>)
+                return {"residual-transition-r1", grid(1U, 128U, 1U, a.mix.bank_count < 2U ? 2U : a.mix.bank_count)};
             if constexpr (std::is_same_v<A, residual::AddArgs>) return {"residual-add-r1", pointwise(a.elements)};
             if constexpr (std::is_same_v<A, residual::ControllerArgs>) return {"residual-controller-r1", pointwise(a.elements)};
             if constexpr (std::is_same_v<A, residual::NormalizePairArgs>) return {"controller-pair-norm-r1", grid(1U, 256U, 2U)};
@@ -564,6 +576,103 @@ void check_latency_forms(const exec::CudaRecipeProgram& base, const exec::CudaRe
               << " output_split=" << moved[1] << " moe_pipe=" << (moved[2] + moved[3] + moved[4] + moved[5])
               << " grouped=" << grouped << '\n';
 }
+
+// Argument bytes include struct padding, so other leaves compare by entry, grid and argument size (as the one-for-one
+// forms check does); the residual leaves the transition absorbs are compared field by field.
+bool same_launch(const exec::BoundLaunch& x, const exec::BoundLaunch& y) {
+    return x.identity == y.identity && x.grid.blocks == y.grid.blocks && x.grid.threads == y.grid.threads &&
+           x.args_bytes == y.args_bytes;
+}
+
+// The residual transition replaces, in place, each run [residual add] + bank readout + [input norms of its rows] of
+// the program without it by one residual.transition leaf holding the same operands; every other leaf is unchanged
+// and in the same order. Inkling 2 Mini decode: 45 end-of-visit adds (3 precede a core-entry copy or bank capture),
+// 40 mid-visit adds, 56 pass-0 input norms (incl. the output norm) join 90 of the 96 readouts.
+void check_transition(const exec::CudaRecipeProgram& base, const exec::CudaRecipeProgram& fused) {
+    constexpr std::string_view transition = "cuda-sm120-residual-transition-r1-v1";
+    const auto& a = base.program.launches;
+    const auto& b = fused.program.launches;
+    std::size_t i = 0, j = 0;
+    unsigned leaves = 0, adds = 0, norms = 0;
+    bool ok = true;
+    while (ok && i < a.size() && j < b.size()) {
+        if (b[j].identity != transition) {
+            ok = same_launch(a[i], b[j]);
+            ++i;
+            ++j;
+            continue;
+        }
+        const auto t = launch_args<residual::TransitionArgs>(fused, b[j++]);
+        ++leaves;
+        if (residual::has_prologue(t)) {
+            ok = a[i].identity == "cuda-sm120-residual-add-r1-v1";
+            if (!ok) break;
+            const auto add = launch_args<residual::AddArgs>(base, a[i++]);
+            ok = add.lhs == t.add.lhs && add.rhs == t.add.rhs && add.output == t.add.output &&
+                 add.elements == t.add.elements && add.round_bf16 == t.add.round_bf16;
+            ++adds;
+        }
+        ok = ok && i < a.size() && a[i].identity == "cuda-sm120-residual-bank-softmax-tiled-r1-v1";
+        if (!ok) break;
+        const auto read = launch_args<decode::BankReadoutTiled>(base, a[i++]).args;
+        ok = read.queries == t.mix.queries && read.bank_count == t.mix.bank_count &&
+             read.query_count == t.mix.query_count && read.width == t.mix.width && read.epsilon == t.mix.epsilon &&
+             read.normalized == t.mix.normalized;
+        for (unsigned k = 0; ok && k < residual::kMaxBanks; ++k) ok = read.banks[k] == t.mix.banks[k];
+        for (unsigned k = 0; ok && k < residual::kMaxQueries; ++k) ok = read.output[k] == t.mix.output[k];
+        unsigned attached = 0;
+        while (ok && attached < residual::norm_count(t) && i < a.size() &&
+               a[i].identity == "cuda-sm120-rms-bf16-image-r1-v1") {
+            const auto rms = launch_args<decode::RmsBf16>(base, a[i++]);
+            bool found = false;
+            for (unsigned q = 0; q < t.mix.query_count; ++q)
+                found = found || (rms.input == t.mix.output[q] && rms.output == t.norm[q].output &&
+                                  rms.gain == t.norm[q].gain && rms.epsilon == t.norm_epsilon && rms.groups == 1U);
+            ok = found;
+            ++attached;
+        }
+        ok = ok && attached == residual::norm_count(t);
+        norms += attached;
+    }
+    if (!ok || i != a.size() || j != b.size())
+        std::cout << "inkling2_program_host transition diverges at base " << i << ' '
+                  << (i < a.size() ? a[i].identity : std::string("end")) << " fused " << j << ' '
+                  << (j < b.size() ? b[j].identity : std::string("end")) << '\n';
+    check(ok && i == a.size() && j == b.size(), "transition replaces add + readout + norms runs and nothing else");
+    check(leaves == 90U && adds == 85U && norms == 56U, "transition counts (90 leaves, 85 adds, 56 norms)");
+    check(a.size() == b.size() + adds + norms && fused.program.predicted.launches + adds + norms ==
+                                                    base.program.predicted.launches, "transition node count");
+    std::cout << "inkling2_program_host transition nodes " << a.size() << " -> " << b.size() << " leaves=" << leaves
+              << " adds=" << adds << " norms=" << norms << '\n';
+}
+
+// The bank batch removes the 96 per-controller message readouts of passes 1-2 and adds one batch per captured bank;
+// every pass 1-2 controller pair norm reads its message row from the batch rows.
+void check_bank_batch(const exec::CudaRecipeProgram& base, const exec::CudaRecipeProgram& batch, const float* message,
+                      const float* queries, const float* kv_queries) {
+    std::size_t batches = 0, pairs = 0, messages = 0;
+    for (const auto& launch : batch.program.launches) {
+        if (launch.identity == "cuda-sm120-residual-bank-batch-tiled-r1-v1") {
+            const auto a = launch_args<residual::BankBatchArgs>(batch, launch);
+            check(a.bank_count == 2U && a.set_count == 2U && a.width == mini::kHiddenWidth && a.normalized &&
+                      a.sets[0].count == 24U && a.sets[1].count == 24U && a.sets[0].output == message &&
+                      a.sets[1].output == message + 24U * mini::kHiddenWidth && a.sets[0].queries == queries &&
+                      a.sets[1].queries == kv_queries && residual::fits(a), "bank batch operands");
+            ++batches;
+        } else if (launch.identity == "cuda-sm120-controller-pair-norm-r1-v1") {
+            const auto a = launch_args<residual::NormalizePairArgs>(batch, launch);
+            check(a.second.input >= message && a.second.input < message + 48U * mini::kHiddenWidth,
+                  "controller pair reads its batch message row");
+            ++pairs;
+        } else if (launch.identity == "cuda-sm120-residual-bank-softmax-tiled-r1-v1") {
+            messages += launch_args<decode::BankReadoutTiled>(batch, launch).args.normalized ? 1U : 0U;
+        }
+    }
+    check(batches == 2U && pairs == 96U && messages == 0U, "bank batch replaces the 96 message readouts");
+    check(base.program.launches.size() == batch.program.launches.size() + 96U - 2U, "bank batch node count");
+    std::cout << "inkling2_program_host bank_batch nodes " << base.program.launches.size() << " -> "
+              << batch.program.launches.size() << '\n';
+}
 #endif
 
 // A one-lane screened head launch over aligned placeholders, as ResidentScreen::launch(nullptr) records it (the host plan
@@ -615,7 +724,8 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
     };
 
     std::vector<float> activations(mini_resident_activation_elements(rows));
-    std::vector<float> controller(4U * kHiddenWidth + kControllerRank), attention(50000U);
+    std::vector<float> controller(decode::low_rank_controller_scratch(kHiddenWidth, kControllerRank)), attention(50000U);
+    std::vector<float> message_batch(kMiniMessageBatchElements);
     std::vector<float> lag(kMiniConvLayerElements * kPhysicalLayers);
     std::vector<strix::moe_core::device_grouped::ExpertWeights> matrices(kPhysicalLayers * kExperts);
     std::array<unsigned, kExpertsPerToken> ids{};
@@ -624,7 +734,7 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
     std::array<std::uint16_t, kExpertsPerToken * kHiddenWidth> expert_activation{};
     std::array<unsigned, 2U * kLogicalVisits> flags{};
     const MiniCudaStepStorage scratch{rows, controller, attention, lag.data(), matrices, ids.data(),
-        scores.data(), route_weights.data(), expert_activation.data(), flags};
+        scores.data(), route_weights.data(), expert_activation.data(), flags, message_batch};
     std::vector<float> embeddings(kHiddenWidth), hidden(kHiddenWidth), logits(kOutputVocabulary);
     std::array<strix::head_argmax::Pick, 128U> partials{};
     std::uint32_t picked{}, reply{};
@@ -1006,7 +1116,19 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
     }
     report(fused, true);
 #if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
-    check_latency_forms(fused, build_recipe(true, false, false, kMiniLatencyForms), key.grouped);
+    // One-for-one forms (tiled readout, output split, MoE pipe); the B3 chain forms change the node list below.
+    check_latency_forms(fused, build_recipe(true, false, false, mini_latency_forms(kMiniFormsMix | kMiniFormsMoe)),
+                        key.grouped);
+    check_transition(build_recipe(true, false, false, mini_latency_forms(kMiniFormsMix)),
+                     build_recipe(true, false, false, mini_latency_forms(kMiniFormsMix | 16U)));
+    weights.message_query_tensors = true;
+    const auto tiled = build_recipe(true, false, false, mini_latency_forms(kMiniFormsMix));
+    const auto batch = build_recipe(true, false, false, mini_latency_forms(kMiniFormsBatch));
+    check_bank_batch(tiled, batch, message_batch.data(),
+                     weights.message_queries.data(), weights.message_kv_queries.data());
+    // The default mix set = batch + transition.
+    check_transition(batch, build_recipe(true, false, false, mini_latency_forms(kMiniFormsB3)));
+    weights.message_query_tensors = false;
 #endif
     return fused.program.identity;
 }
