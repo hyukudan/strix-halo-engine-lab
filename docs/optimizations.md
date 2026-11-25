@@ -5777,14 +5777,15 @@ integrity check): a failure ends the run with an error before any result is prin
 ### Qwen 27B pair prefill: decode relay to one node
 
 **Engine:** `qwen35` (HIP, pair layer split app `strix-hip-qwen35-pair`). **Control:** `STRIX_PAIR_DECODE_RELAY`.
-**Default:** off (layer-owned decode). With `=1` and every node's memory declared, the shared chain planner may choose
-a decoder that holds the whole model; after the layered prefill each stage's layer state moves to it once and it
-decodes alone (a layer split only serialises one-row decode).
-- **Off switch:** `STRIX_PAIR_DECODE_RELAY=0` or unset.
-- **Exactness evidence:** none on this tree yet. The default stays off until a pair run on this tree records the
-  placement line, the relayed state size and time, decode tok/s and ids equal to the one-node reference, for both
-  settings.
-- **Measured gain:** not measured on this tree.
+**Default:** on. With every node's memory declared, the shared chain planner may choose a decoder that holds the whole
+model; after the layered prefill each stage's layer state moves to it once and it decodes alone (a layer split only
+serialises one-row decode). Undeclared memory or no fitting decoder keeps the layer-owned decode.
+- **Off switch:** `STRIX_PAIR_DECODE_RELAY=0`.
+- **Exactness evidence:** two gfx1151 nodes, USB4, 8,192-token prompt, `--wide 512 --gen 32`, same binary on both
+  ranks: the 32 generated ids are equal with the relay, with the layer-owned decode, and to the one-node reference.
+  Placement `relay to b`, state 345.9 MB per stage in 32 layer messages, ~115-120 ms once.
+- **Measured gain:** decode 80.03 -> 75.76 ms/token (12.49 -> 13.20 tok/s, +5.7 %); prefill unchanged (1,201 vs 1,213
+  tok/s warm). The one-time state move costs about as much as 28 decoded tokens.
 
 <a id="hy4-rows-expert-union"></a>
 
