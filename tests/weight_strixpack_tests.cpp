@@ -64,15 +64,23 @@ void check_header() {
               raw[8] == 1U && raw[15] == 24U,
           "header bytes at their offsets");
     sp::Header back;
-    check(*sp::Header::read(raw, back) == '\0' && back.base == -37 && back.table == h.table && back.bits == 4U,
+    check(*sp::Header::read(raw, 4U, back) == '\0' && back.base == -37 && back.table == h.table && back.bits == 4U,
           "header round trip");
+    for (std::size_t len = 0U; len < sp::kHeaderBytes; ++len) {
+        sp::Header out;
+        out.base = 99;
+        check(*sp::Header::read(std::span(raw).first(len), 4U, out) != '\0' && out.base == 99,
+              "short on-disk header is refused before reading");
+    }
+    check(*sp::Header::read(raw, 3U, back) != '\0' && back.bits == 4U,
+          "valid SP4 header cannot describe SP3 storage");
     const auto refused = [&](auto mutate, const char* what) {
         std::uint8_t r[sp::kHeaderBytes];
         h.write(r);
         mutate(r);
         sp::Header out;
         out.base = 99;
-        check(*sp::Header::read(r, out) != '\0' && out.base == 99, what);
+        check(*sp::Header::read(r, 4U, out) != '\0' && out.base == 99, what);
     };
     refused([](std::uint8_t* r) { r[0] = 2; }, "version refused");
     refused([](std::uint8_t* r) { r[1] = 5; }, "bits 5 refused");

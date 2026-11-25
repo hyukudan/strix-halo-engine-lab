@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <span>
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #define STRIX_LOWBIT_HD __host__ __device__
@@ -314,8 +315,9 @@ struct Header {
         }
         return "";
     }
-    // Parses 16 bytes; reserved bytes must be zero. Returns the first violated rule or "".
-    static const char* read(const std::uint8_t* in, Header& out) noexcept {
+    // Parse the leading header of a tensor in the declared storage width. Leave out unchanged on failure.
+    static const char* read(std::span<const std::uint8_t> in, unsigned storage_bits, Header& out) noexcept {
+        if (in.size() < kHeaderBytes) return "short Strix pack header";
         if (in[5] != 0U || in[6] != 0U || in[7] != 0U) return "reserved bytes not zero";
         Header h;
         h.version = in[0];
@@ -325,6 +327,7 @@ struct Header {
         h.base = static_cast<std::int8_t>(in[4]);
         for (unsigned i = 0; i < 8U; ++i) h.table[i] = in[8U + i];
         if (const char* why = h.invalid(); *why != '\0') return why;
+        if (h.bits != storage_bits) return "Strix pack header/storage bit-width mismatch";
         out = h;
         return "";
     }
