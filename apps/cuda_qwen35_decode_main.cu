@@ -168,7 +168,7 @@ int main(int argc, char** argv) {
         std::optional<strix::profile::Name> profile;  // --profile exact|default|fast|quality|turbo (strix/profiles/qwen_dense_cuda.hpp)
         strix::profile::Pairs lever_cli;             // per-lever options: override the profile, recorded as explicit
         strix::session::kv_precision::Request kv_request;  // --kv native|bf16|fp8 (fp8 = the attn8 levers' e4m3 KV shadow)
-        std::string pf_arith, pf_dump;            // --prefill-arith exact|flash|fast|fast2: large-M prefill (absent: windows of --rows)
+        std::string pf_arith, pf_dump;            // set from the resolved prefill_arith when the large-M route runs (qp::prompt_route)
         std::string pf_norm_fold;                 // --prefill-norm-fold on|off (EngineOptions::prefill_norm_fold; FAST4 only, bitwise)
         std::string pf_tile_feed;                 // --prefill-tile-feed bulk|lsu (EngineOptions::prefill_tile_feed; FAST4 only, bitwise)
         std::uint32_t pf_chunk = 2048, pf_repeat = 1, pf_slots = 2, pf_wave_min = 0;
@@ -320,9 +320,10 @@ int main(int argc, char** argv) {
         const auto resolved = qp::resolve(profile, regime, lever_cli);
         qp::apply(opt, *resolved);
         qp::observe_kv(kv, *resolved);
-        if (const auto* e = resolved->find("prefill_arith"); e && e->status != strix::profile::Status::builtin && e->status != strix::profile::Status::pending)
-            pf_arith = e->value;  // the large-M prefill route of this CLI follows the resolved arithmetic
-        const std::string profile_text = qp::describe(*resolved) + "  kv: " + kv.receipt() + "\n";
+        // the prompt route follows the RESOLVED arithmetic, builtin or explicit alike (shared adapter, one receipt line)
+        const auto route = qp::prompt_route(*resolved, !dump.empty() || !dump_mtp.empty());
+        if (route.large) pf_arith = route.arith;
+        const std::string profile_text = qp::describe(*resolved) + "  kv: " + kv.receipt() + "\n" + qp::describe_route(route, rows_cap);
         if (!pf_norm_fold.empty()) opt.prefill_norm_fold = q::parse_prefill_norm_fold(pf_norm_fold);
         if (!pf_tile_feed.empty()) opt.prefill_tile_feed = q::parse_prefill_tile_feed(pf_tile_feed);
         opt.prefill_chunk = pf_chunk;

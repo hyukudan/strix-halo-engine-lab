@@ -487,6 +487,37 @@ void apply(Options& o, const Resolved& r) {
     if (dense) o.dense_activation = *dense;
 }
 
+// The prompt route of the decode CLI follows the RESOLVED prefill_arith value, builtin, profile or explicit alike (a pending
+// column keeps the builtin value): the builtin 'exact' takes the large-M route exactly as an explicit '--prefill-arith exact'
+// does (bitwise equal to the windows, cuda_engine.hpp PrefillArith::exact). per_row_output: --dump-logits / --dump-mtp read
+// every prompt row, which only the windows route produces; the arithmetic must then be exact and the reason is printed.
+struct PromptRoute {
+    bool large = false;  // CudaEngine::prefill (large-M, chunked); false: forward_rows windows of --rows + commit
+    std::string arith;   // the resolved prefill_arith value ("" when the route does not offer the lever)
+    std::string reason;  // why the windows route runs (empty when large)
+};
+inline PromptRoute prompt_route(const Resolved& r, bool per_row_output) {
+    PromptRoute out;
+    if (const auto* e = r.find("prefill_arith")) out.arith = e->value;
+    if (out.arith.empty()) {
+        out.reason = "prefill_arith not offered on this route";
+    } else if (per_row_output) {
+        if (out.arith != "exact" && out.arith != "windows")
+            throw std::invalid_argument("qwen35-cuda-dense: --dump-logits / --dump-mtp read every prompt row on the windows route "
+                                        "(exact arithmetic); prefill_arith " + out.arith + " cannot run there: drop the profile "
+                                        "word or set --prefill-arith exact");
+        out.reason = "--dump-logits / --dump-mtp read every prompt row";
+    } else {
+        out.large = true;
+    }
+    return out;
+}
+// One receipt line: what the prompt route really runs.
+inline std::string describe_route(const PromptRoute& p, std::uint32_t rows) {
+    return p.large ? "  prompt-route: large-M prefill, prefill_arith " + p.arith + "\n"
+                   : "  prompt-route: windows of " + std::to_string(rows) + " rows (" + p.reason + ")\n";
+}
+
 // The resolved lever set for the effective config. Empty under the default (exact) profile: its effective config stays
 // byte-identical to the build without a profile word.
 inline std::string describe(const Resolved& r) {

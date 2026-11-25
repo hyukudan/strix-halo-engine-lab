@@ -57,7 +57,8 @@ using strix::profile::Name;
 using strix::profile::Pairs;
 
 Options run(std::optional<Name> profile, TurboWeights w, qp::Route route, std::uint64_t tokens, const Pairs& cli = {},
-            std::string* text = nullptr, std::span<const qp::Qualified> rows = qp::qualified) {
+            std::string* text = nullptr, std::span<const qp::Qualified> rows = qp::qualified,
+            qp::PromptRoute* route_out = nullptr, bool per_row = false) {
     Options o;
     o.turbo_weights = w;
     auto regime = qp::regime_of(o, route, tokens);
@@ -100,7 +101,15 @@ Options run(std::optional<Name> profile, TurboWeights w, qp::Route route, std::u
     const auto r = qp::resolve(profile, regime, cli, rows, evidence);
     qp::apply(o, *r);
     if (text) *text = qp::describe(*r);
+    if (route_out) *route_out = qp::prompt_route(*r, per_row);
     return o;
+}
+// The decode CLI's prompt route for one resolution (qp::prompt_route on the same resolve as run()).
+qp::PromptRoute route_of(std::optional<Name> profile, TurboWeights w, qp::Route route, std::uint64_t tokens,
+                         const Pairs& cli = {}, bool per_row = false) {
+    qp::PromptRoute pr;
+    (void)run(profile, w, route, tokens, cli, nullptr, qp::qualified, &pr, per_row);
+    return pr;
 }
 bool throws(const auto& fn, const char* needle) {
     try {
@@ -620,6 +629,33 @@ int main() {
         small.prompt_tokens = 4096;
         check(lever_value(*qp::resolve(Name::fast, small, {}, rows), "prefill_attn8") == "off",
               "a wider quality band is not a wider grant");
+    }
+
+    {  // the decode CLI's prompt route follows the RESOLVED prefill_arith, builtin or explicit alike
+        const auto pr_w = TurboWeights::converted;
+        const auto pr_lp = qp::Route::large_prefill;
+        const auto pr_none = route_of(std::nullopt, pr_w, pr_lp, 32768);
+        check(pr_none.large && pr_none.arith == "exact" && pr_none.reason.empty(), "no tier word: builtin exact takes the large route");
+        check(run(std::nullopt, pr_w, pr_lp, 32768) == run(std::nullopt, pr_w, pr_lp, 32768, {{"prefill_arith", "exact"}}),
+              "builtin exact and explicit exact leave the same options");
+        const auto pr_ex = route_of(Name::standard, pr_w, pr_lp, 32768);
+        check(pr_ex.large && pr_ex.arith == "exact", "--profile exact: large route, exact arithmetic");
+        const auto pr_exp = route_of(Name::standard, pr_w, pr_lp, 32768, {{"prefill_arith", "exact"}});
+        check(pr_exp.large == pr_ex.large && pr_exp.arith == pr_ex.arith, "explicit --prefill-arith exact = builtin exact");
+        const auto pr_fast = route_of(Name::fast, pr_w, pr_lp, 8192);
+        check(pr_fast.large && pr_fast.arith == "fast4", "FAST 8K: large route, fast4");
+        const auto pr_win = route_of(std::nullopt, pr_w, pr_lp, 2048, {{"prefill_arith", "windows"}});
+        check(pr_win.large && pr_win.arith == "windows", "explicit windows keeps the engine's windows inside prefill()");
+        const auto pr_dump = route_of(Name::standard, pr_w, pr_lp, 2048, {}, true);
+        check(!pr_dump.large && pr_dump.arith == "exact" && pr_dump.reason.find("--dump-mtp") != std::string::npos,
+              "per-row dumps run the windows route and say why");
+        check(qp::describe_route(pr_dump, 16).find("windows of 16 rows") != std::string::npos &&
+                  qp::describe_route(pr_ex, 16) == "  prompt-route: large-M prefill, prefill_arith exact\n",
+              "the receipt line names the route that runs");
+        check(throws([&] { (void)route_of(Name::fast, pr_w, pr_lp, 8192, {}, true); }, "cannot run there"),
+              "per-row dumps refuse a lossy prefill arithmetic instead of dropping it silently");
+        const auto pr_spec = route_of(Name::standard, pr_w, qp::Route::windows, 2048);
+        check(!pr_spec.large && pr_spec.arith.empty(), "windows route (spec CLI): prefill_arith not offered, no large route");
     }
 
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "ALL PASS", g_fail);
