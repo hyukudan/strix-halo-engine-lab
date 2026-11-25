@@ -232,8 +232,9 @@ inline constexpr ImageShapeRow kImageShapeRows[] = {
 
 // The launch groups the K64 schedule was measured on (one launch over all members, in this order; K 2,304, contiguous,
 // 4,096 / 8,192 / 8,209 / 9,216 rows, K64 / K32 image tile time): 3,072 + 1,024 + 1,024 0.90-0.91; 3,072 + 3,072
-// 0.90-0.91; 1,024 + 1,024 0.89-0.92; 3,072 + 3,072 + 1,024 (with 1,024 as its own launch: the 4-projection call in runs
-// of kGroupMax, 0.60-0.64 together). A group outside this list (for example 5,120 + 128 + 128) keeps the K32 image tile.
+// 0.90-0.91; 1,024 + 1,024 0.89-0.92; 3,072 + 3,072 + 1,024 0.86-0.87 (its own launch, at 4,096 / 6,144 / 8,192 / 8,209 /
+// 9,216 rows). A group outside this list (for example 5,120 + 128 + 128) keeps the K32 image tile in the standalone
+// entry, and a routed call that would cut it into more launches keeps its FP32 rows (plan_image_routes).
 inline constexpr ImageGroupRow kImageGroupRows[] = {{2304U, 0U, 3U, {3072U, 1024U, 1024U}, 4096U, 9216U},
                                                     {2304U, 0U, 2U, {3072U, 3072U}, 4096U, 9216U},
                                                     {2304U, 0U, 2U, {1024U, 1024U}, 4096U, 9216U},
