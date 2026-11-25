@@ -29,6 +29,7 @@ struct RankRef {
 struct LayerBlob {
     std::vector<std::uint8_t> bytes;
     std::array<RankRef, 2> r;
+    // w_post and w_next address effective Gemma RMSNorm gains (1 + weight).
     std::size_t wik = 0, q_w = 0, k_w = 0, iq_w = 0, ik_w = 0, w_post = 0, w_next = 0, router = 0, bias = 0;
     bool moe = false;
 };
@@ -51,7 +52,7 @@ struct DevRank {
 };
 struct DevLayer {
     std::array<DevRank, 2> r;
-    const float *wik = nullptr, *q_w = nullptr, *k_w = nullptr, *iq_w = nullptr, *ik_w = nullptr, *w_post = nullptr, *w_next = nullptr;
+    const float *wik = nullptr, *q_w = nullptr, *k_w = nullptr, *iq_w = nullptr, *ik_w = nullptr;
     const float *router = nullptr, *bias = nullptr;
     bool moe = false;
 };
