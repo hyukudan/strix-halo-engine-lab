@@ -82,7 +82,8 @@ inline constexpr std::array<strix::profile::Lever, 11> profile_table{{
      {true, true, true, false}, {true, true, true, false}, "", "0",
      "msa-flash-bf16-l40-v1, bundle mm-fast-pf-v2 (EXL3 gate PASS 8K KL 0.0012, 32K KL 0.0029; docs/optimizations.md#fast-key-split-msa-attention-core-mm-pf-msa-flash); "
      "2 = explicit two-term operands; TURBO inherits FAST on the incumbent layer set",
-     false, {}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
+     false, {}, true, {}, {{{"0", "v1"}, {"1", "v1"}, {"2", "msa-flash-bf16-2term-v1"},
+                             {"3", "msa-flash-bf16-rowgroup-v1"}}}},
     {"msa_flash_layers", "STRIX_MM_PF_MSA_FLASH_LAYERS", "", {"", "", "", "0-59"}, kMsaFlashLayers, strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, false}, "", "", "FAST MSA flash layer set (read only while msa_flash is on); pending turbo adapter admission/export for 0-59, then per-prompt qualification with scripts/bench/mmflash",
      false, {}, true, {}, {{{kMsaFlashLayers, "v1"}, {"0-59", "v1"}}}},
@@ -98,7 +99,7 @@ inline constexpr std::array<strix::profile::Lever, 11> profile_table{{
        {"down", "minimax-iu4-a8-down-v1"}, {"all", "minimax-iu4-a8-all-v1"}}}},
     // Prefill only: index projections of rows > 8 on the shared FP16 WMMA core; K/V caches and MSA attention unchanged.
     {"idx_wmma", "STRIX_MM_PF_IDX_WMMA", "", {"", "", "", ""}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true, false}, {true, true, true, false}, "", "0", "minimax-index-proj-wmma-v1 (opt-in; FAST gate e3wire)", false, {}, true, {}, {{{"0", "v1"}}}},
+     {true, false, true, false}, {true, true, true, false}, "", "0", "minimax-index-proj-wmma-v1 (opt-in; FAST gate e3wire)", false, {}, true, {}, {{{"0", "v1"}, {"1", kIdxWmmaPolicy}}}},
     {"idx_wmma_layers", "STRIX_MM_PF_IDX_WMMA_LAYERS", "", {"", "", "", ""}, kIdxWmmaLayers, strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, false}, "", "", "FAST index projection layer set (read only while idx_wmma is on)", false, {}, true, {}, {{{kIdxWmmaLayers, "v1"}}}},
     // Explicit only: 32K quality gate failed; no profile selects f16.

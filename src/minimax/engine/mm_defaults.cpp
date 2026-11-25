@@ -300,12 +300,12 @@ PrefillPolicy prefill_policy(const Lookup& env) {
         p.note = std::string(flash.policy) + " not selected by " + (p.bundle_from_profile ? std::string("--profile ") + env(kProductProfileEnv) : std::string(kFastBundle.env)) +
                  " on STRIX_MMX_MODEL_FORMAT=fast_i4";
     // Index projections on the shared WMMA core (opt-in member, mm_profile_table.hpp kIdxWmmaPolicy).
-    const char* iw = env("STRIX_MM_PF_IDX_WMMA");
+    const char* iw = setting("STRIX_MM_PF_IDX_WMMA", "idx_wmma");
     if (fp::set(iw) && std::strcmp(iw, "0") != 0 && std::strcmp(iw, "1") != 0)
         throw std::invalid_argument("STRIX_MM_PF_IDX_WMMA must be 0 or 1");
     p.idx_wmma_asked = fp::set(iw) ? iw : "default";
     p.idx_wmma = fp::set(iw) && std::strcmp(iw, "1") == 0;
-    const char* il = env("STRIX_MM_PF_IDX_WMMA_LAYERS");
+    const char* il = setting("STRIX_MM_PF_IDX_WMMA_LAYERS", "idx_wmma_layers");
     const auto imask = strix::core::parse_layer_set(fp::set(il) ? il : kIdxWmmaLayers, 0, kMsaLayers, "STRIX_MM_PF_IDX_WMMA_LAYERS");
     p.idx_wmma_layers = fp::layer_ranges(kMsaLayers, [&](unsigned l) { return imask.test(l); });
     if (p.idx_wmma && imask.count() == 0) {
@@ -336,7 +336,7 @@ PrefillPolicy prefill_policy(const Lookup& env) {
     if (fp::set(router) && std::strcmp(router, "0") != 0 && std::strcmp(router, "1") != 0)
         throw std::invalid_argument("STRIX_MM_PF_ROUTER_WMMA must be 0 or 1");
     const auto rit = p.canonical.find("STRIX_MM_PF_ROUTER_WMMA");
-    const char* rlayers = env("STRIX_MM_PF_ROUTER_WMMA_LAYERS");
+    const char* rlayers = setting("STRIX_MM_PF_ROUTER_WMMA_LAYERS", "router_wmma_layers");
     const auto rmask = strix::core::parse_layer_set(fp::set(rlayers) ? rlayers : kRouterWmmaLayers, 0, kMsaLayers,
                                                     "STRIX_MM_PF_ROUTER_WMMA_LAYERS");
     p.router_wmma_layers = fp::layer_ranges(kMsaLayers, [&](unsigned l) { return rmask.test(l); });
@@ -459,11 +459,12 @@ bool product_option(const std::string& a, const std::function<std::string()>& ne
         *timing = next();
         return true;
     }
-    if (a != "--profile") return false;
-    const std::string value = next();
+    const bool attached = a.starts_with("--profile=");
+    if (a != "--profile" && !attached) return false;
+    const std::string value = attached ? a.substr(10) : next();
     if (profile::is_name(value)) return true;  // the product profile, exported by print_or_apply()
     // Explicit compatibility: the old timing spelling NAME:PROMPT.u32:STEPS keeps working on rank, with one notice.
-    if (timing == nullptr || value.find(':') == std::string::npos)
+    if (attached || timing == nullptr || value.find(':') == std::string::npos)
         throw std::invalid_argument("--profile must be exact (default), fast, quality or turbo (got '" + value +
                                     "'); the per-phase timing session is --timing-profile NAME:PROMPT.u32:STEPS");
     std::fprintf(stderr, "strix-minimax-rank: '--profile %s' is the old spelling of '--timing-profile %s'; "
@@ -867,6 +868,12 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
         // Product profile and TURBO weight toggle: the CLI value wins over an inherited variable (CLI > environment).
         if (a == "--profile" && i + 1 < argc && profile::is_name(argv[i + 1])) {
             (void)export_env(kProductProfileEnv, argv[++i], 1);
+            continue;
+        }
+        if (a.starts_with("--profile=")) {
+            const auto value = a.substr(10);
+            (void)product_option(a, {}, nullptr);  // validate the attached product word before exporting it
+            (void)export_env(kProductProfileEnv, value.c_str(), 1);
             continue;
         }
         if (a == profile::turbo::kWeightsOption || a == profile::turbo::kBitsOption || a == profile::turbo::kPackOption) {
