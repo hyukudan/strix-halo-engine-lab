@@ -395,6 +395,7 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
         }
         else if (argument == "--logits") options.logits = value();
         else if (family.supports_speculation && argument == "--speculation") {
+            options.speculation_requested = true;
             const std::string_view mode(value());
             if (mode == "off") options.speculation = CliSpeculation::off;
             else if (mode == "auto") options.speculation = CliSpeculation::automatic;
