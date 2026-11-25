@@ -287,20 +287,23 @@ public:
     void stage_slot_window(std::uint32_t slot, std::span<const std::uint32_t> ids, std::span<std::uint32_t> top) {
         if (!slot_windows_ || ids.size() < 2U || ids.size() > max_verify_rows() || top.size() != ids.size())
             throw std::invalid_argument("invalid Mini served verify window");
-        for (const auto& held : slots_)
-            if (held->state().staged()) throw std::logic_error("Mini served verify: one staged window at a time");
+        // The staged slot is tracked here: an idle slot holds no state to ask (device ticket t1 try 2).
+        if (staged_window_) throw std::logic_error("Mini served verify: one staged window at a time");
         auto& state = slots_.at(slot)->state();
         validate_inputs(state, ids, {});
         last_logit_rows_ = 0U;  // the window's score rows are not a decode_slots window
         const auto picks = std::span(verify_top_).first(ids.size());
         (void)append(state, ids, true, {}, MiniAppendKind::verify, picks);
+        staged_window_ = slot;
         std::ranges::copy(picks, top.begin());
     }
 
     // Keeps the window's leading `keep` rows (0 discards it); `ids` are the staged window's tokens.
     void commit_slot_window(std::uint32_t slot, std::span<const std::uint32_t> ids, std::uint32_t keep) {
         auto& state = slots_.at(slot)->state();
-        if (!state.staged() || keep > ids.size()) throw std::logic_error("invalid Mini served verify commit");
+        if (staged_window_ != slot || !state.staged() || keep > ids.size())
+            throw std::logic_error("invalid Mini served verify commit");
+        staged_window_.reset();
         state.commit_staged(backend_, keep, [&](unsigned kept) {
             (void)append(state, ids.first(kept), kept == 1U, {}, MiniAppendKind::verify);
         });
@@ -1323,6 +1326,7 @@ private:
     std::optional<mini_gpu::Buffer<float>> conv_tape_;
     // Served verify windows (set_slot_windows) and the convolution tapes of slots 1.. (slot 0 binds conv_tape_).
     bool slot_windows_{false};
+    std::optional<std::uint32_t> staged_window_;  // the slot holding the one staged served window
     std::optional<mini_gpu::Buffer<float>> slot_tapes_;
 
     [[nodiscard]] std::uint64_t slot_tape_elements() const {
