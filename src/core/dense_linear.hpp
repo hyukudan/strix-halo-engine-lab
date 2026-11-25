@@ -77,7 +77,7 @@ namespace strix::core::dense_linear {
 // One launch for up to kTightGroupMax projections of one input (decode rows). Block b of the launch belongs to the
 // projection p with first[p] <= b < first[p + 1] and runs p's single-projection body as its block b - first[p], so
 // every stored value is computed by the same instructions as in p's own launch (bitwise equal).
-inline constexpr unsigned kTightGroupMax = 4U;
+inline constexpr unsigned kTightGroupMax = 6U;  // 6 = the 3-column-role attention prepare (q, relative, sink, gate, k, v) of one layer
 
 struct TightBlocks {
     unsigned first[kTightGroupMax + 1U]{};
