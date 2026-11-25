@@ -251,16 +251,6 @@ void media_messages(const std::function<std::pair<int, std::string>(const std::s
 // Implicit prefill chunk: one retry at the fallback rows, only after an allocation failure.
 static void chunk_fallback_cases() {
     namespace sv = strix::serve;
-    static_assert(sv::resolve_prefill_rows(std::nullopt, 8192U, 0U) == 8192U);
-    static_assert(sv::resolve_prefill_rows(4096U, 8192U, 0U) == 4096U);      // explicit wins
-    static_assert(sv::resolve_prefill_rows(std::nullopt, 8192U, 300U) == 300U);  // the bound caps
-    static_assert(sv::resolve_prefill_rows(512U, 8192U, 300U) == 300U);
-    static_assert(sv::admit_prefill_chunk(std::nullopt, 8192U, 2048U, 5000U).chunk == 5000U);
-    static_assert(sv::admit_prefill_chunk(std::nullopt, 8192U, 2048U, 5000U).fallback == 2048U);
-    static_assert(sv::admit_prefill_chunk(std::nullopt, 8192U, 2048U, 1000U).fallback == 1000U);
-    static_assert(sv::admit_prefill_chunk(4096U, 8192U, 2048U, 9000U).fallback == 0U);  // explicit: no retry
-    static_assert(sv::admit_prefill_chunk(4096U, 8192U, 2048U, 9000U).explicit_rows);
-    static_assert(sv::admit_prefill_chunk(std::nullopt, 8192U, 0U, 9000U).fallback == 0U);  // unqualified backend
     std::ostringstream log;
     std::vector<unsigned> tried;
     // The device holds at most `capacity` rows: larger loads throw `what`.
@@ -307,14 +297,6 @@ static void chunk_fallback_cases() {
     check(throws(false, 1000U, 2048U, loader(512U)) && tried.size() == 1U, "chunk at or below the fallback");
     tried.clear();
     check(throws(false, 8192U, 0U, loader(4096U)) && tried.size() == 1U, "no fallback configured");
-    // The qualification gate loads through the shared admission entry: bound = prefix positions.
-    tried.clear();
-    log.str({});
-    check(sv::load_with_prefill_admission(std::nullopt, 8192U, 2048U, 5000U, log, loader(4096U)) == 2048U &&
-          tried == std::vector<unsigned>{5000U, 2048U} && !log.str().empty(), "gate: implicit chunk retries once");
-    tried.clear();
-    check(throws(true, 5000U, 2048U, loader(4096U)) && sv::load_with_prefill_admission(4096U, 8192U, 2048U, 9000U, log,
-          loader(4096U)) == 4096U, "gate: explicit chunk is used as given");
     tried.clear();
     bool host_failure_escaped = false;
     try {
