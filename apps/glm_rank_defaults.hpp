@@ -15,6 +15,7 @@
 #include "glm/prefill/glm_pf_variants.hpp"
 #include "glm/prefill/glm_pf_capacity_policy.hpp"
 #include "strix/engine_profile.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/session/kv_precision.hpp"
 #include "strix/glm_pair_profile_table.hpp"
 #include "strix/session/speculation_default.hpp"
@@ -265,10 +266,16 @@ struct Effective {
 inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& facts = {}) {
     Effective e;
     e.baseline = baseline_requested(r, env);
+    const auto profile_env = [&](const char* key) -> const char* {
+        const char* value = env(key);
+        // GLM uses exact WMMA rescoring for an empty switch. Explicit 0 is the exact VALU route.
+        if (value != nullptr && *value == '\0' && std::string_view(key) == "STRIX_IDX_WMMA") return "exact";
+        return value;
+    };
     if (r.product.profile || r.product.allow_pending ||
         strix::profile::turbo::has_weight_request(r.product.weights, env)) {
         auto inputs = r.product;
-        inputs.env = env;
+        inputs.env = profile_env;
         e.product = strix::profile::resolve(product_profile_engine, inputs);
         // Baseline vetoes profile additions; explicit environment values still win.
         if (e.baseline) for (auto& entry : e.product->entries) {
@@ -276,6 +283,35 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
                 entry.value = std::string(entry.lever->off);
                 entry.status = strix::profile::Status::off;
                 entry.reason = "baseline";
+                entry.ladder.clear();
+                entry.ladder_lowered = false;
+            }
+        }
+        // These GLM routes inherit the umbrella after the baseline veto. Only report the inherited
+        // value: the runtime owns the fallback and must still see the original environment.
+        const bool wmma = e.product->find("pf_wmma")->value == "1";
+        for (auto& entry : e.product->entries) {
+            using strix::profile::Status;
+            const auto name = entry.lever->name;
+            if (name != "mla_wmma" && name != "kda_wmma" && name != "attn_wmma") continue;
+            if (entry.status == Status::builtin || (entry.status == Status::pending && wmma) ||
+                (entry.status == Status::explicit_env && entry.value.empty())) {
+                entry.value = wmma ? "1" : "0";
+                entry.status = Status::builtin;
+                entry.target.clear();
+                if (wmma) {
+                    entry.reason = "inherits pf_wmma";
+                    entry.ladder.clear();
+                    entry.ladder_lowered = false;
+                }
+            } else if (name == "mla_wmma" &&
+                       (entry.status == Status::explicit_env ||
+                        (entry.status == Status::off && entry.requested == "off"))) {
+                // MLA uses the legacy first-character parser with the umbrella as its default.
+                const bool matches = strix::detail::env_flag_matches(
+                    entry.value.c_str(), wmma ? "0" : "1", EnvFlagMatch::first_character);
+                entry.value = (wmma != matches) ? "1" : "0";
+                entry.status = entry.value == "1" ? Status::explicit_env : Status::off;
             }
         }
     }

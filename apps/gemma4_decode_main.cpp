@@ -49,7 +49,7 @@ int main(int argc, char** argv) {
                 "  --draft DRAFT.gguf --draft-rope TABLE.g4dr (DFlash), --draft-eagle EAGLE.gguf (e4b-eagle fallback)\n"
                 "env: STRIX_G4_DRAFT_KIND=dflash|mtp|eagle (how --draft is read), STRIX_G4_MTP_TOPK=1..64 (clusters, default 64),\n"
                 "  STRIX_G4_MTP_Q8=1 (Q8_0 assistant matrices), STRIX_G4_MTP_GRAPHS=0 (no HIP graph replay), STRIX_G4_DFLASH=0 (no drafting)\n"
-                "profiles: --profile default|fast|quality (default: default; explicit options and env win); the MTP drafter is found at\n"
+                "profiles: --profile exact|fast|turbo|quality (default: exact; explicit options and env win); the MTP drafter is found at\n"
                 "  <model dir>/drafter-mtp unless --draft-mtp DIR is given; --draft off or STRIX_G4_DRAFT=0 disables it\n";
             return 0;
         }

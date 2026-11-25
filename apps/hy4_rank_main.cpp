@@ -580,7 +580,7 @@ int run(int argc, char** argv) {
     bool print_config = false;
     std::string dump_path;  // --dump-logits F: every host logits row (FP32, vocab floats per step) appended to F
     std::vector<strix::hy4::hipbind::PairWindowCost> window_costs;  // --window-costs ROWS:MS,... (pair calibration)
-    // The tier word (--profile default|fast|quality, --allow-pending) through the shared resolver; the lever options
+    // The tier word (--profile exact|fast|turbo, --allow-pending) through the shared resolver; the lever options
     // stay in args and are parsed below (an explicit option wins over the profile).
     std::vector<std::string> args(argv + 1, argv + argc);
     strix::profile::Inputs inputs;
@@ -674,7 +674,7 @@ int run(int argc, char** argv) {
         if (!e.reason.empty()) std::cerr << e.lever->name << ": " << e.reason << '\n';
     if (o.parts.empty() || prompt.empty())
         throw std::invalid_argument("usage: strix-hy4-rank PART1.gguf [PART2.gguf] --ids-file F [--gen N] [--teacher F] [--layers D] "
-                                    "[--context C] [--top K] [--timing] [--prompt-rows R] [--dump-logits F] [--profile default|fast] "
+                                    "[--context C] [--top K] [--timing] [--prompt-rows R] [--dump-logits F] [--profile exact|fast|turbo] "
                                     "[--rank 0|1 --cut K | --stage-map C0,C1,..,L|off --repeat K --port P --pipe-guess copy|off --window-costs ROWS:MS,...]");
     // Pair default: the shared interleaved stage map with v from the shared planner at this width (strix/pair/stage_map.hpp
     // plan_stages over the measured pair cost; bitwise equal to the two-stage cut, measured faster); --stage-map off, --cut,

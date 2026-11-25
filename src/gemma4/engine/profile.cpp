@@ -25,14 +25,14 @@ constexpr std::string_view fast_prefill_attention_receipt =
 // because a8 prefill rows are byte-identical to g4-a8-v1 decode rows (byte receipt 4e914dcf: KV and per-row logits on
 // 56/56 teacher-v2 parents; served ids equal to decode-fed rows at C1/C4).
 [[maybe_unused]] constexpr std::string_view fast_a8_prefill_receipt = "g4-a8-v1 9ba0cf53 + a8 prefill byte receipt 4e914dcf";
-// Profile columns: default, fast, quality. One row per lever; an owner merge (or a passed gate) flips its
-// own `runnable` / `ready` column (and, if its switch name differs, `env`) on its own row.
+// Profile columns: default, fast, quality, turbo (an empty turbo cell reads the fast cell). One row per lever;
+// an owner merge (or a passed gate) flips its own `runnable` / `ready` column (and, if its switch name differs, `env`) on its own row.
 constexpr Lever table[] = {
     {.name = "decode_identity", .env = "STRIX_G4_IDENTITY", .value = {"g4-v1", "g4-a8-v1", ""}, .builtin = "g4-v1",
      .required = {false, true, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::bit_changing, .apps = engine | decode_bench,
      .source = "g4-a8-v1 (A8G32 activations, integer dots; byte gates exact); "
-               "qualified: held-out fidelity bands met"},
+               "qualified: held-out fidelity bands met", .identity = {{{"g4-v1", "v1"}, {"g4-a8-v1", "v1"}}}},
     // FAST decode attention at depth (global layers): int8 KV groups (one FP16 scale per 16 features) from the
     // per-stream mirror, split-K over 128-key tiles, FP32 softmax and sums, ordered merge (g4-dattn-f2; g4-dattn-f1 =
     // FP16 operands, selectable). Pending its fast-parity receipt (decode after 8K/32K/64K prompts); until
@@ -40,58 +40,58 @@ constexpr Lever table[] = {
     {.name = "decode_attention", .env = "STRIX_G4_DECODE_ATTN", .value = {"exact", "g4-dattn-f2", "exact"},
      .builtin = "exact", .required = {false, true, false}, .ready = {true, false, true}, .runnable = {true, true, true},
      .kind = Kind::bit_changing, .apps = engine | decode_bench, .target = "g4-dattn-f2",
-     .source = "pending: g4-dattn-f2 qualification receipt (fast-parity, decode after 8K/32K/64K prompts)"},
+     .source = "pending: g4-dattn-f2 qualification receipt (fast-parity, decode after 8K/32K/64K prompts)", .identity = {{{"exact", "v1"}, {"g4-dattn-f2", "v1"}}}},
     // A8 FFN epilogue fused into the A8 PLE-gate linear prologue: active whenever the g4-a8-v1 decode identity
     // runs (a no-op otherwise); ids and bytes equal the separate epilogue. STRIX_G4_A8_FFN_PLE_FUSE=0 switches it off.
     {.name = "a8_ffn_ple_fuse", .env = "STRIX_G4_A8_FFN_PLE_FUSE", .value = {"1", "1", "1"}, .builtin = "1",
      .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = engine | decode_bench, .off = "0",
-     .source = "g4-a8-v1 FFN epilogue fused into the PLE-gate linear: ids and bytes == separate epilogue (0 = off)"},
+     .source = "g4-a8-v1 FFN epilogue fused into the PLE-gate linear: ids and bytes == separate epilogue (0 = off)", .identity = {{{"1", "v1"}, {"0", "v1"}}}},
     // Drafter: <model dir>/drafter-mtp when present, --draft-mtp DIR overrides, --draft off or
     // STRIX_G4_DRAFT=0 switches it off. Missing weights never fail: decode runs exact without it.
     {.name = "draft", .env = "STRIX_G4_DRAFT", .option = "--draft-mtp", .value = {"mtp-auto", "mtp-auto", "mtp-auto"},
      .builtin = "off", .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = engine, .asset = true, .off = "0",
-     .source = "MTP assistant drafter: ids == OFF on g4-v1, g4-a8-v1 and g4-exl3-v3; C2..C8 auto k<=1 (STRIX_G4_DRAFT_MULTI=0 off)"},
+     .source = "MTP assistant drafter: ids == OFF on g4-v1, g4-a8-v1 and g4-exl3-v3; C2..C8 auto k<=1 (STRIX_G4_DRAFT_MULTI=0 off)", .identity = {{{"off", "v1"}, {"mtp-auto", "v1"}, {"0", "v1"}}}},
     {.name = "draft_mode", .env = "STRIX_G4_DFLASH", .option = "--dflash", .value = {"auto", "auto", "auto"},
      .builtin = "auto", .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
-     .kind = Kind::exact, .apps = engine, .off = "0", .source = "draft admission auto: C1 drafts, C2..C8 plain"},
+     .kind = Kind::exact, .apps = engine, .off = "0", .source = "draft admission auto: C1 drafts, C2..C8 plain", .identity = {{{"auto", "v1"}, {"0", "v1"}}}},
     // C1 MTP drafter-confidence window: the window only selects how many drafted tokens are verified (ids == OFF).
     // Unset = per drafter (drafter-mtp/config.json confidence_tau, else the builtin tau for known weights, else 0.6);
     // a number forces tau; STRIX_G4_MTP_CONF=0 switches it off (AutoPolicy windows as before).
     {.name = "draft_window", .env = "STRIX_G4_MTP_CONF", .value = {"auto", "auto", "auto"}, .builtin = "auto",
      .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = engine, .off = "0",
-     .source = "gemma4/e4b-mtp2: confidence-gated C1 MTP window, ids == OFF; gate EN untuned 85.6 -> 97.6 tok/s"},
+     .source = "gemma4/e4b-mtp2: confidence-gated C1 MTP window, ids == OFF; gate EN untuned 85.6 -> 97.6 tok/s", .identity = {{{"auto", "v1"}, {"0", "v1"}}}},
     // Cost-aware long-context window: when the stream's measured draft cost per depth is >= 0.04 x its measured one-row
     // pass (long contexts), start at one depth, extend while P >= 0.6, verify P >= 0.15. Exact. 0 = off.
     {.name = "draft_window_long", .env = "STRIX_G4_MTP_CONF_LONG", .value = {"auto", "auto", "auto"}, .builtin = "auto",
      .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = engine, .off = "0",
-     .source = "cost-aware long-context MTP window (measured draft cost per depth vs one-row pass), ids == OFF"},
+     .source = "cost-aware long-context MTP window (measured draft cost per depth vs one-row pass), ids == OFF", .identity = {{{"auto", "v1"}, {"0", "v1"}}}},
     // Prompt lookup (n-gram) drafting, exact: auto = per-request selector beside the MTP drafter (drafts only on a strong
     // match, backs off on misses; measured equal to the drafter alone) and lookup drafting when no drafter is loaded
     // (agent prompts 48.2 -> 114.9, 49.3 -> 122.9 tok/s); 0 = off.
     {.name = "draft_lookup", .env = "STRIX_G4_LOOKUP", .value = {"auto", "auto", "auto"}, .builtin = "auto",
      .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = engine, .off = "0",
-     .source = "prompt-lookup drafting, ids == OFF; beside the MTP drafter equal, without a drafter agent 48.2 -> 114.9 tok/s"},
+     .source = "prompt-lookup drafting, ids == OFF; beside the MTP drafter equal, without a drafter agent 48.2 -> 114.9 tok/s", .identity = {{{"auto", "v1"}, {"0", "v1"}}}},
     // HTTP serve: up to eight chat requests share one coordinator and decode together; each request's ids equal the
     // request served alone. STRIX_G4_SERVE_BATCH=0 serves one chat job at a time.
     {.name = "serve_batch", .env = "STRIX_G4_SERVE_BATCH", .value = {"continuous", "continuous", "continuous"},
      .builtin = "continuous", .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = engine, .off = "0",
      .source = "continuous batching in serve: concurrent requests == each alone (greedy, seeded sampling, thinking "
-               "budget, streaming) on g4-v1, g4-a8-v1 and g4-exl3-v3"},
+               "budget, streaming) on g4-v1, g4-a8-v1 and g4-exl3-v3", .identity = {{{"continuous", "v1"}, {"0", "v1"}}}},
     {.name = "exl3_route", .option = "--exl3-arm", .value = {"", "", "pack"}, .builtin = "off",
      .required = {false, false, true}, .ready = {true, true, true}, .runnable = {true, true, true}, .kind = Kind::pack,
-     .apps = all_apps, .asset = true, .source = "EXL3 pack route (--exl3-arm)"},
+     .apps = all_apps, .asset = true, .source = "EXL3 pack route (--exl3-arm)", .identity = {{{"off", "v1"}, {"pack", "v1"}}}},
     // Fixed per pack and session from the arm and --streams (crossover table in exl3/format.hpp);
     // STRIX_G4_EXL3_IDENTITY=v1|v2|v3 forces it, the same for the command line and the server.
     {.name = "exl3_identity", .env = "STRIX_G4_EXL3_IDENTITY", .value = {"", "", "auto"}, .builtin = "auto",
      .required = {false, false, false}, .ready = {false, false, true}, .runnable = {false, false, true},
      .kind = Kind::pack, .apps = engine,
-     .source = "auto-select per pack and --streams: M4/M6 g4-exl3-v3 always, M5 v3 at >= 8 streams, else v1"},
+     .source = "auto-select per pack and --streams: M4/M6 g4-exl3-v3 always, M5 v3 at >= 8 streams, else v1", .identity = {{{"auto", "v1"}}}},
     // Prompt prefill route. DEFAULT and QUALITY run prefill-exact. STRIX_G4_PREFILL_IDENTITY=exact keeps prefill-exact
     // (the OFF switch under fast); =v1 / =v2 select a WMMA route explicitly.
     // =a8 (only with STRIX_G4_IDENTITY=g4-a8-v1): g4-a8-v1 linears on 512-row chunks; prompt rows equal the a8
@@ -104,7 +104,7 @@ constexpr Lever table[] = {
                "prompt rows and the anchor run the g4-a8-v1 decode; frozen FAST gate + v1/a8 pair receipt; not bitwise "
                "vs exact prefill), a8 on other non-EXL3 packs; =a8 keeps the previous fast route; default and quality run "
                "prefill-exact as many-row chunks (STRIX_G4_PREFILL_EXACT_MANYROW=0 = eight-row passes); =v1 / =v2 select "
-               "g4-wmma-pf-v1 / -v2 on any non-EXL3 pack"},
+               "g4-wmma-pf-v1 / -v2 on any non-EXL3 pack", .identity = {{{"exact", "v1"}, {"fast", "g4-wmma-pf-v1"}}}},
     // Engine prompt attention on the WMMA prefill routes (v1/v2 only; exact, a8 and EXL3 routes ignore it):
     // fast runs g4-flash-attn-v1 (shared dense flash core: big query tiles, K/V once per work-group in LDS, FP16
     // WMMA, FP32 online softmax); =wmma selects g4-wmma-attn-v1, =canonical is the OFF switch.
@@ -112,14 +112,14 @@ constexpr Lever table[] = {
      .builtin = "canonical", .required = {false, false, false}, .ready = {true, !fast_prefill_attention_receipt.empty(), true},
      .runnable = {true, true, true}, .kind = Kind::bit_changing, .apps = engine, .target = "g4-flash-attn-v1",
      .source = "fast: g4-flash-attn-v1 prompt attention on the g4-wmma-pf-v1 route (Q4_K_M); =wmma selects "
-               "g4-wmma-attn-v1, =canonical keeps the canonical attention; default and quality never reach a WMMA prefill route"},
+               "g4-wmma-attn-v1, =canonical keeps the canonical attention; default and quality never reach a WMMA prefill route", .identity = {{{"canonical", "v1"}, {"flash", "g4-flash-attn-v1"}}}},
     // EXL3 packs: the pack's held-out bands were measured on g4-exl3-wmma-pf-v1 prompts (panel WMMA linears,
     // canonical attention); QUALITY targets that identity once its receipt lands, exact runs until then.
     {.name = "exl3_prefill", .env = "STRIX_G4_EXL3_PREFILL", .value = {"", "", "wmma"}, .builtin = "exact",
      .required = {false, false, false}, .ready = {false, false, false}, .runnable = {false, false, true},
      .kind = Kind::bit_changing, .apps = engine, .target = "g4-exl3-wmma-pf-v1",
      .source = "pending: g4-exl3-wmma-pf-v1 qualification receipt (EXL3 FP16 panels on the WMMA prefill GEMMs); "
-               "exact runs the many-row EXL3 core until then"},
+               "exact runs the many-row EXL3 core until then", .identity = {{{"exact", "v1"}, {"wmma", "g4-exl3-wmma-pf-v1"}}}},
     // The prefill bench (DevicePrefill) implements only g4-wmma-pf-v1 linears: its builtin is unqualified, so the
     // bench refuses every profile without --allow-pending (measure exact prefill through the decode app's prompt).
     {.name = "prefill_linears", .env = "STRIX_G4_PREFILL", .value = {"exact", "wmma", "exact"}, .builtin = "wmma",
@@ -128,15 +128,20 @@ constexpr Lever table[] = {
      .target = "g4-wmma-pf-v1",
      .source = "the prefill bench runs WMMA prefill linears (g4-wmma-pf-v1; STRIX_G4_PREFILL_LINEAR_POLICY selects "
                "g4-wmma-pf-v2), stamped unqualified here: the engine applies the qualified identity per profile and "
-               "pack; measure prefill-exact through strix-gemma4-decode prompt prefill"},
+               "pack; measure prefill-exact through strix-gemma4-decode prompt prefill", .identity = {{{"wmma", "v1"}, {"exact", "g4-wmma-pf-v1"}}}},
     {.name = "prefill_attention", .env = "STRIX_G4_PREFILL_ATTN", .value = {"canonical", "wmma", "canonical"},
      .builtin = "canonical", .required = {false, true, false}, .ready = {true, false, true}, .runnable = {true, true, true},
      .kind = Kind::bit_changing, .apps = prefill_bench, .target = "g4-wmma-attn-v1",
-     .source = "pending: WMMA attention is unqualified; the qualified prefill identities use canonical attention"},
+     .source = "pending: WMMA attention is unqualified; the qualified prefill identities use canonical attention", .identity = {{{"canonical", "v1"}, {"wmma", "g4-wmma-attn-v1"}}}},
     {.name = "prefill_canonical_kernel", .env = "STRIX_G4_PREFILL_CANON_KERNEL", .value = {"1", "1", "1"},
      .builtin = "1", .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = prefill_bench,
-     .source = "whole-chunk canonical attention, byte-equal to the 8-row loop"},
+     .source = "whole-chunk canonical attention, byte-equal to the 8-row loop", .identity = {{{"1", "v1"}}}},
+    {.name = "mtp_q8", .env = "STRIX_G4_MTP_Q8", .value = {"0", "0", "0"}, .builtin = "0",
+     .kind = Kind::exact, .apps = engine, .off = "0",
+     .source = "explicit-only Q8_0 assistant weights at load; target verification owns the emitted tokens", .identity = {{{"0", "v1"}, {"1", "g4-mtp-q8_0-v1"}}}},
+    {.name = "prefill_linear_policy", .env = "STRIX_G4_PREFILL_LINEAR_POLICY", .kind = Kind::bit_changing,
+     .apps = prefill_bench, .source = "explicit-only per-site WMMA operand policy; app-level v1/v2 identities own the runtime policy", .identity = {{{"", "g4-wmma-pf-v1"}}}},
 };
 using strix::profile::environment;
 void escape(std::string& out, std::string_view text) {
@@ -155,6 +160,15 @@ const std::string* lookup(const Pairs& pairs, std::string_view key) {
     for (const auto& [k, v] : pairs) if (k == key) found = &v;
     return found;
 }
+// Ladder rows of this table (resolve() always reads them): incumbent grants of the qualified fast cells the resolver ran
+// before the ladder rule.
+constexpr strix::profile::LadderRow ladder_rows[] = {
+    strix::profile::incumbent_cell("decode_identity", "g4-a8-v1", strix::profile::Name::fast,
+                                   "g4-a8-v1: held-out fidelity bands met", "v1"),
+    strix::profile::incumbent_cell("prefill_route", "fast", strix::profile::Name::fast, fast_prefill_receipt, "g4-wmma-pf-v1"),
+    strix::profile::incumbent_cell("prefill_route_attention", "flash", strix::profile::Name::fast,
+                                   fast_prefill_attention_receipt, "g4-flash-attn-v1"),
+};
 } // namespace
 
 std::span<const Lever> levers() { return table; }
@@ -174,10 +188,8 @@ const char* status_name(Status status) {
 }
 Name parse(std::string_view value) {
     // Preserve the app's legacy diagnostic while sharing the name parser.
-    // 'turbo' is a shared name, but gemma4 has no versioned TURBO name and its rows have three columns
-    // (strix/profiles/gemma4.hpp Lever::value): refused here, before any column index.
-    if (!strix::profile::is_name(value) || value == "turbo")
-        throw std::invalid_argument("profile must be exact (default), fast or quality");
+    if (!strix::profile::is_name(value))
+        throw std::invalid_argument("profile must be exact (default), fast, turbo or quality");
     return strix::profile::parse(value);
 }
 strix::profile::ExecutionReceipt host_receipt(strix::profile::NumericalIdentity known) {
@@ -251,6 +263,10 @@ std::string Resolution::json() const {
         escape(out, kind_name(entry.lever->kind));
         out += ",\"source\":";
         escape(out, entry.lever->source);
+        if (!entry.ladder.empty()) {
+            out += ",\"ladder\":";
+            escape(out, entry.ladder);
+        }
         out += '}';
         if (entry.status == Status::pending) {
             if (!pending.empty()) pending += ',';
@@ -272,17 +288,44 @@ std::string Resolution::json() const {
 }
 
 Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const Lever> levers) {
-    if (profile == Name::turbo) throw std::invalid_argument("Gemma does not support profile turbo");
     Resolution out;
     out.name = profile;
     out.app = app;
+    std::vector<strix::profile::LadderRow> ladder(inputs.ladder.begin(), inputs.ladder.end());
+    ladder.insert(ladder.end(), std::begin(ladder_rows), std::end(ladder_rows));
     const auto* allow = environment(inputs.env, "STRIX_G4_PROFILE_ALLOW_PENDING");
     out.allow_pending = inputs.allow_pending || (allow && std::string_view(allow) == "1");
-    const auto column = unsigned(profile);
+    // The lower arm the ladder rows are bound to: the explicit settings below run in every tier; a lever outside this
+    // app never runs (its builtin).
+    const auto arms = strix::profile::ladder_arms(levers, std::span<const strix::profile::LadderRow>(ladder),
+        inputs.regime,
+        [&](const Lever& lever, unsigned c) {
+            return strix::profile::column_admission(lever, c, out.allow_pending, strix::profile::model_preset());
+        },
+        [&](const Lever& lever) -> std::optional<std::string_view> {
+            if (!(lever.apps & unsigned(app))) return std::string_view(lever.builtin);
+            const auto off = [&](std::string_view v) { return !lever.off.empty() && (v == lever.off || v == "off"); };
+            const auto* given = lookup(inputs.cli, lever.name);
+            const char* exported = lever.env.empty() ? nullptr : environment(inputs.env, std::string(lever.env).c_str());
+            if ((given && off(*given)) || (!given && exported && off(exported))) return std::string_view("off");
+            if (given) return std::string_view(*given);
+            if (exported && !lever.asset) return std::string_view(exported);
+            // An asset lever runs what discovery resolved, requested or not (dispatch below: the asset found, else the
+            // builtin): its arm spells that, never the column word, so a present and a missing asset are two keys. A
+            // discovered asset has no declared identity, so its arm spells no key and no timing receipt decides there.
+            if (lever.asset) {
+                const auto* asset = lookup(inputs.assets, lever.name);
+                return asset ? std::string_view(*asset) : std::string_view(lever.builtin);
+            }
+            return std::nullopt;
+        }, out.allow_pending);
     for (const auto& lever : levers) {
         if (!(lever.apps & unsigned(app))) continue;
+        const auto column = strix::profile::value_column(lever, profile);
         const auto& wanted = lever.value[column];
-        const bool required = lever.required[column] && !wanted.empty();
+        const auto admit = [&](unsigned c) {
+            return strix::profile::column_admission(lever, c, out.allow_pending, strix::profile::model_preset());
+        };
         const auto refuse = [&](std::string_view why) {
             throw std::invalid_argument(std::string("profile '") + profile::name(profile) + "' requires " +
                                         std::string(lever.name) + " = " + std::string(wanted) + ": " + std::string(why));
@@ -308,40 +351,44 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
             else { entry.value = std::string(lever.builtin); entry.status = Status::absent; }
         } else if (wanted.empty()) {
             continue;
-        } else if (const auto admission = strix::profile::admit_column(
-                       lever.ready[column], lever.runnable[column], out.allow_pending);
-                   admission != strix::profile::Status::set) {
-            if (admission == strix::profile::Status::unqualified) {
-                // Benchmarking only: run the pending implementation and stamp the receipt.
-                entry.status = Status::unqualified;
+        } else {
+            auto cell = strix::profile::select_profile_cell(lever, ladder, profile, inputs.regime, admit, out.allow_pending,
+                                                            arms);
+            entry.ladder = std::move(cell.route);
+            entry.ladder_reference = std::move(cell.reference);
+            const bool lowered_turbo = profile == Name::turbo && cell.tier == Name::fast;
+            const auto selected_column = lowered_turbo ? strix::profile::value_column(lever, cell.tier) : column;
+            const auto admission = cell.benchmark ? strix::profile::Status::unqualified : admit(selected_column);
+            if (profile == Name::turbo) entry.value = cell.value;
+            if ((!entry.ladder.empty() && cell.value == lever.builtin) ||
+                admission == strix::profile::Status::pending) {
+                if (lever.builtin_unqualified)
+                    refuse(std::string(lever.source) + (entry.ladder.empty()
+                        ? (lever.runnable[column] ? " (--allow-pending runs the unqualified implementation, benchmarking only)" : "")
+                        : ": " + entry.ladder));
+                entry.target = lever.target.empty() ? wanted : lever.target;
+                entry.value = lever.builtin;
+                entry.status = Status::pending;
+            } else if (admission == strix::profile::Status::set && entry.value == lever.builtin) {
+                entry.status = Status::builtin;
+            } else {
+                if (admission == strix::profile::Status::unqualified) entry.status = Status::unqualified;
                 if (lever.asset) {
                     if (asset) entry.value = *asset;
-                    else { entry.value = std::string(lever.builtin); entry.status = Status::absent; }
+                    else if (lever.required[selected_column] && admission == strix::profile::Status::set)
+                        refuse("pass " + std::string(lever.option) + (app == App::engine ? "" : " (not available in this app)"));
+                    else { entry.value = lever.builtin; entry.status = Status::absent; }
                 }
-            } else if (lever.builtin_unqualified) {
-                // A bench tool whose fallback is itself unqualified: refuse rather than run it silently.
-                refuse(std::string(lever.source) + (lever.runnable[column] ?
-                    " (--allow-pending runs the unqualified implementation, benchmarking only)" : ""));
-            } else {
-                // Never refuse for a pending row: it is not applied, the builtin keeps running, the
-                // receipt lists the declared target and apply() prints one stderr line.
-                entry.target = std::string(lever.target.empty() ? wanted : lever.target);
-                entry.value = std::string(lever.builtin);
-                entry.status = Status::pending;
             }
-        } else if (wanted == lever.builtin) {
-            entry.status = Status::builtin;
-        } else if (lever.asset) {
-            if (asset) entry.value = *asset;
-            else if (required) refuse("pass " + std::string(lever.option) + (app == App::engine ? "" : " (not available in this app)"));
-            else { entry.value = std::string(lever.builtin); entry.status = Status::absent; }
         }
         if ((entry.status == Status::explicit_env || entry.status == Status::explicit_cli) && !lever.asset &&
             entry.value != lever.builtin) {
             // An explicit request for a value that a column declares but no column can run here is refused.
             bool declared = false, runnable = false;
-            for (unsigned p = 0; p < 3; ++p)
+            for (std::size_t p = 0; p < lever.value.size(); ++p) {
+                if (p == static_cast<std::size_t>(Name::turbo) && lever.value[p].empty()) continue;
                 if (lever.value[p] == entry.value) { declared = true; runnable |= lever.runnable[p]; }
+            }
             if (declared && !runnable)
                 throw std::invalid_argument(std::string(lever.env.empty() ? lever.option : lever.env) + "=" + entry.value +
                                             " is not in this build (" + std::string(lever.source) + ")");
@@ -357,6 +404,7 @@ std::vector<std::string> Resolution::notices() const {
         if (entry.status == Status::pending)
             out.push_back(std::string("profile ") + profile::name(name) + ": " + std::string(entry.lever->name) + " pending " +
                           entry.target + " (" + entry.value + " runs)");
+    for (const auto& entry : entries) if (!entry.ladder.empty()) out.push_back(entry.ladder);
     return out;
 }
 
@@ -396,7 +444,7 @@ void apply(const Resolution& resolution) {
 bool take_option(int argc, char** argv, int& i, std::optional<Name>& out) {
     if (std::string_view(argv[i]) != "--profile" || i + 1 >= argc) return false;
     const std::string_view next = argv[i + 1];
-    if (!strix::profile::is_name(next)) return false;  // shared tier words; parse() refuses turbo with its reason
+    if (!strix::profile::is_name(next)) return false;
     out = parse(next);
     ++i;
     return true;

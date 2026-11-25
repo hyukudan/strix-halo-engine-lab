@@ -302,6 +302,9 @@ void overrides() {
     check(r.config.moe_route_bf16 == true && r.contract == "qwen-cuda;prefill=fast;forms=none;moe_route_bf16=1", "route storage on: " + r.contract);
     // The bundle's bf16mma experts refuse the route storage (qwen_options.hpp resolve: unqualified composition).
     check(refuses({"--profile", "fast", "--allow-pending"}), "fast bundle + pending route storage: refused, never silent");
+    r = one({"--profile", "fast", "--expert-fast", "off"}, qo::Entry::cli);
+    check(status(r, "moe_route_bf16") == "pending",
+          "without an explicit opt-in the profile leaves the unmeasured storage pending");
     r = one({"--profile", "fast", "--expert-fast", "off", "--allow-pending"}, qo::Entry::cli);
     check(r.config.moe_route_bf16 == true && status(r, "moe_route_bf16") == "unqualified", "--allow-pending runs the route storage as unqualified");
     check(status(r, "qsa_budget") == "pending", "not-runnable rows stay pending under --allow-pending");

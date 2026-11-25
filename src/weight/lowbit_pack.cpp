@@ -84,6 +84,27 @@ Status expected_bytes(FormatId storage, std::uint64_t rows, std::uint64_t column
     return kOk;
 }
 
+Status pack_identity(const Source& file, std::size_t header_bytes, std::span<const LowbitPackEntry> entries,
+                     Digest256& result) {
+    core::Sha256 hash;
+    std::vector<Byte> chunk(std::size_t{1} << 20);
+    const auto add = [&](ByteRange range) -> Status {
+        for (std::uint64_t done = 0; done < range.bytes;) {
+            const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(range.bytes - done, chunk.size()));
+            if (const auto status = file.read({range.offset + done, n}, std::span(chunk).first(n)); !status)
+                return status;
+            hash.update(chunk.data(), n);
+            done += n;
+        }
+        return kOk;
+    };
+    if (const auto status = add({0, header_bytes}); !status) return status;
+    for (const auto& entry : entries)
+        if (const auto status = add({entry.offset, entry.bytes}); !status) return status;
+    result = Digest256{hash.finish()};
+    return kOk;
+}
+
 }  // namespace
 
 void LowbitPackWriter::add(std::string tensor, FormatId storage, std::uint64_t rows, std::uint64_t columns,
@@ -231,24 +252,23 @@ Status LowbitPack::open(const std::string& path, const Digest256& checkpoint, Lo
         entries.push_back(std::move(e));
     }
 
-    // The identity names the content: the header and every payload byte, so packs coded from other statistics or
-    // settings differ even when their tensors, shapes and sources match.
-    core::Sha256 hash;
-    hash.update(header.data(), header.size());
-    std::vector<Byte> chunk(std::size_t{1} << 20);
-    for (const auto& e : entries)
-        for (std::uint64_t done = 0; done < e.bytes;) {
-            const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(e.bytes - done, chunk.size()));
-            if (const auto status = read_at(e.offset + done, std::span(chunk).first(n)); !status)
-                return fail(Error::malformed, "short read of " + path);
-            hash.update(chunk.data(), n);
-            done += n;
-        }
+    Digest256 identity;
+    if (const auto status = pack_identity(*file, header.size(), entries, identity); !status) return status;
     out.path_ = path;
     out.file_ = std::move(file);
     out.entries_ = std::move(entries);
-    out.identity_ = Digest256{hash.finish()};
+    out.header_bytes_ = header.size();
+    out.identity_ = identity;
     out.checkpoint_ = declared;
+    return kOk;
+}
+
+Status LowbitPack::verify_identity() const {
+    if (!file_) return fail(Error::stale_source, "calibrated pack was not opened");
+    Digest256 current;
+    if (const auto status = pack_identity(*file_, header_bytes_, entries_, current); !status)
+        return fail(status.code, "calibrated pack changed during upload: " + status.detail);
+    if (!(current == identity_)) return fail(Error::stale_source, "calibrated pack digest changed during upload");
     return kOk;
 }
 

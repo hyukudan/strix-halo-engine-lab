@@ -6,6 +6,9 @@
 namespace pr = strix::qwen::profile;
 namespace dc = strix::decode_cli;
 namespace {
+static_assert(!std::is_pointer_v<decltype(pr::Resolution{}.find("moe_route_prune"))>,
+              "a temporary profile must not lend a pointer to an entry");
+
 unsigned checks = 0, fixtures = 0;
 bool emit = false;
 using Env = std::map<std::string, std::string>;
@@ -151,6 +154,60 @@ void defaults_matrix() {
     }
     strix::qpf2k::baseline=saved;
 }
+// Registered native controls (decode numerical recipe, GSQ pack, MoE prefill schedules, dense packs) and the TURBO
+// candidates without a speed row change no resolved value: every tier, with or without --allow-pending, runs the
+// builtin until a ladder row shows the TURBO cell faster than FAST in the regime.
+void registered_controls_resolve_builtin() {
+    const char* registered[] = {"decode_numerical_profile", "gsq_expert_pack", "hc_output_wmma", "moe_small", "moe_tile64",
+        "moe_direct_b", "moe_tiers", "moe_down_lds_epi", "moe_route_ctrl", "gsq_prefill_f16", "dense_q6p_pack",
+        "dense_trellis_pack"};
+    for (const char* key : registered) {
+        const pr::Lever* row = nullptr;
+        for (const auto& lever : pr::levers()) if (lever.name == key) row = &lever;
+        check(row != nullptr, "registered control has a profile row");
+        check(row->value[0].empty() && row->value[1].empty(), "registered control sets no exact or fast cell");
+    }
+    for (const bool allow : {false, true}) {
+        Env env;
+        if (allow) env["STRIX_QWEN_PROFILE_ALLOW_PENDING"] = "1";
+        for (const auto tier : {pr::Name::standard, pr::Name::fast, pr::Name::turbo}) {
+            pr::Inputs input{{}, lookup(env), false};
+            input.regime = {strix::profile::Phase::prefill, 8192, 1, "gfx1151"};
+            const auto r = pr::resolve(tier, input);
+            for (const char* key : registered) {
+                const auto* entry = r.find(key);
+                check(!entry || !strix::profile::applied(entry->status) || entry->value == entry->lever->builtin,
+                    "a registered control without a speed row keeps its builtin");
+            }
+            check(tier == pr::Name::turbo || !r.find("moe_route_prune"), "exact and fast have no automatic prune entry");
+        }
+        pr::Inputs input{{}, lookup(env), false};
+        const auto pending = [](const pr::Resolution& resolution) {
+            const auto* prune = resolution.find("moe_route_prune");
+            check(prune != nullptr, "TURBO must report the cap9 candidate");
+            check(prune->status == pr::Status::pending && prune->value == "off",
+                  "TURBO cap9 stays pending without a receipt for its composition");
+        };
+        for (const std::uint64_t context : {0U, 2048U, 4096U, 8192U, 8193U, 32767U, 32768U, 65536U}) {
+            input.regime = {strix::profile::Phase::prefill, context, 1, "gfx1151"};
+            const auto resolution = pr::resolve(pr::Name::turbo, input);
+            pending(resolution);
+        }
+        input.regime = {strix::profile::Phase::prefill, 8192, 1, "sm_120"};
+        const auto outside_device = pr::resolve(pr::Name::turbo, input);
+        pending(outside_device);
+    }
+    const pr::Lever* recipe = nullptr;
+    for (const auto& lever : pr::levers()) if (lever.name == "decode_numerical_profile") recipe = &lever;
+    check(recipe && recipe->value[3].empty() && strix::parse_decode_numerical_profile(recipe->builtin).has_value(),
+          "the decode recipe row is explicit-only and its builtin names a parsed recipe");
+    // An explicit recipe resolves as set on the command line (the option parser records it in the resolution).
+    constexpr const char* a8 = "hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1";
+    check(strix::parse_decode_numerical_profile(a8).has_value(), "the explicit recipe parses");
+    pr::Inputs explicit_input{{{"decode_numerical_profile", a8}}, {}, false};
+    const auto r = pr::resolve(pr::Name::standard, explicit_input);
+    check(r.find("decode_numerical_profile")->status == pr::Status::explicit_cli, "an explicit recipe stays explicit");
+}
 void pending_weights_inspection() {
     const auto o = options({"decoder", "model.gguf", "1", "--profile", "turbo", "--turbo-weights", "converted",
                             "--print-effective-config"});
@@ -163,6 +220,25 @@ void pending_weights_inspection() {
     try { pr::apply(c.options.product_profile, [&](const char*, const char*) { exported = true; return true; }); }
     catch (const std::invalid_argument&) { refused = true; }
     check(refused && !exported, "execution must refuse pending weights before exporting");
+}
+void route_prune_startup_binding() {
+    constexpr auto key = "STRIX_QPF2K_MOE_ROUTE_PRUNE";
+    const char* before = std::getenv(key);
+    const auto saved = before ? std::optional<std::string>(before) : std::nullopt;
+    check(pr::erase_environment(key), "clear prune before memory planning");
+    (void)strix::moe_core::route_prune_active_tag(true);
+    const auto exact_identity = strix::prefill_identity_hash(0U, 0U, 0U);
+    check(strix::moe_core::route_prune_active_tag().empty(), "early planning sees pruning off");
+    check(pr::export_environment(key, "cap9"), "export admitted pruning after planning");
+    check(strix::moe_core::route_prune_active_tag(true) == "cap9" &&
+        strix::moe_core::route_prune_active().active(), "execution sees the admitted cap9");
+    check(strix::prefill_identity_hash(0U, 0U, 0U) != exact_identity, "pruning is in the arithmetic identity");
+    check(pr::erase_environment(key), "withdraw incompatible inherited pruning");
+    check(strix::moe_core::route_prune_active_tag(true).empty() &&
+        !strix::moe_core::route_prune_active().active(), "execution sees the withdrawn cap9");
+    check(strix::prefill_identity_hash(0U, 0U, 0U) == exact_identity, "withdrawal restores the unpruned identity");
+    if (saved) check(pr::export_environment(key, saved->c_str()), "restore prune environment");
+    (void)strix::moe_core::route_prune_active_tag(true);
 }
 
 void config_matrix() {
@@ -256,6 +332,8 @@ void common_adapters() {
 int main(int argc,char** argv) try {
     emit=argc==2 && std::string_view(argv[1])=="--fixtures";
     pending_weights_inspection();
+    route_prune_startup_binding();
+    registered_controls_resolve_builtin();
     product_matrix(); admission_matrix(); defaults_matrix(); config_matrix(); identities();
 #ifndef STRIX_STEP1_ORIGINAL
     common_adapters();

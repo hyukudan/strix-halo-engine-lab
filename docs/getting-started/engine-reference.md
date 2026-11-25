@@ -173,10 +173,13 @@ explicit or off; explicit off prevents profile application. An explicit request
 for unavailable code is refused. `--allow-pending` (or
 `STRIX_QWEN_PROFILE_ALLOW_PENDING=1`) is for benchmarking: only runnable genuinely
 pending rows execute, with `unqualified: <rows>` in the qualification stamp and
-an `unqualified` list. If both types apply, the stamp lists qualification in
-progress first, then `; unqualified: <rows>`. The three pending rows currently
-remain pending even with this flag. The existing `--prefill-moe-route-bf16 on|off`
-contract is unchanged. On YaRN, proposed exports are checked against rotary
+an `unqualified` list. The default admits a lossy cell in a regime where a timing
+row shows a gain over the tier below or an incumbent grant covers settings used
+before the ladder rule. The FAST benchmark opt-in can also run a build-supported
+candidate before timing or quality evidence exists. Its receipt marks that
+selection unqualified. A server that resolves at startup uses an unknown prompt
+length and declines prompt-banded timing rows until it can select per request.
+On YaRN, proposed exports are checked against rotary
 admission first: a refused row stays pending with the admission reason, is not
 exported, and is not stamped as applied. Explicit switches retain their existing
 admission contracts.

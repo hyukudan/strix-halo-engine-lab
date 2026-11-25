@@ -2,6 +2,7 @@
 #include "types.hpp"
 #include <bit>
 #include <istream>
+#include <optional>
 namespace strix::weight {
 // Decode one little-endian F32 from four source bytes, at any byte alignment.
 inline float decode_f32_le(const Byte* bytes) {
@@ -22,6 +23,24 @@ struct Source {
 };
 Digest256 digest_bytes(std::span<const Byte>);
 Status open_source(const std::string&, std::shared_ptr<const Source>&, std::string shard = {});
+// Device and file number of an opened file: equal keys name one file, whatever its names.
+struct FileKey {
+  std::uint64_t device{}, file{};
+  bool operator==(const FileKey&) const = default;
+};
+// The key of the file a source opened from a file holds (nullopt: not a file source).
+std::optional<FileKey> source_file_key(const Source&);
+// While alive, open_source of exactly `path` returns `source` (a file the caller already holds open, under the shard
+// name open_source gives that path) instead of looking the name up again: two loaders of one run read one file. One
+// pin per process at a time; uses() counts the opens it served.
+class SourcePin {
+public:
+  SourcePin(std::string path, std::shared_ptr<const Source> source);
+  ~SourcePin();
+  SourcePin(const SourcePin&) = delete;
+  SourcePin& operator=(const SourcePin&) = delete;
+  [[nodiscard]] std::size_t uses() const;
+};
 std::shared_ptr<const Source> memory_source(std::span<const Byte>, std::string shard = {});
 // The span must remain immutable; owner retains the complete referenced allocation.
 std::shared_ptr<const Source> view_source(std::span<const Byte>, std::shared_ptr<const void>, std::string shard = {});

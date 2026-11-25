@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 #include "strix/engine_profile.hpp"
+#include "core/layer_set.hpp"
 #include "strix/session/kv_precision.hpp"
 #include "xport/split_frame.hpp"
 #include "xport/exchange_format.hpp"
@@ -67,6 +68,8 @@ std::vector<Resolved> resolve(const Lookup& env);  // pure: same order as items(
 // config and the rank agreement all call it. Invalid member values throw std::invalid_argument naming the variable.
 struct PrefillPolicy {
     std::map<std::string, std::string> canonical;  // expanded bundle switch and members (strix/fast_profile.hpp)
+    bool fast_i4 = false;
+    strix::core::LayerSet iu4_layers;
     unsigned msa_flash = 0;                        // 0 exact in-block kernel, 1 one-term BF16, 2 two-term operands
     unsigned msa_flash_requested = 0;              // selected before static execution guards
     std::string msa_flash_layers;                  // layer set text the engine parses (builtin kMsaFlashLayers)
@@ -103,8 +106,8 @@ profile::Resolution profile_resolution(const Lookup& env);
 // '--timing-profile NAME:PROMPT.u32:STEPS'; the old '--profile NAME:PROMPT.u32:STEPS' stays accepted with one notice.
 inline constexpr const char* kProductProfileEnv = "STRIX_MM_PRODUCT_PROFILE";
 // The product profile's column (shared resolver, profile_table, no environment) applies every member of the FAST bundle
-// mm-fast-pf-v2 with its bundle value: today 'fast' (qualified cells, gate PASS 8K + 32K); default / quality never,
-// turbo not while its cells are pending.
+// mm-fast-pf-v2 with its bundle value: 'fast' (qualified cells, gate PASS 8K + 32K) and 'turbo', which nests FAST (its
+// pending proposals leave the FAST cells); default / quality never.
 bool profile_column_selects_bundle(const Lookup& env);
 // ... and the bundle switch (STRIX_MM_FAST_PREFILL) is unset: prefill_policy() then expands the bundle from the word
 // (fast_profile::profile_switch), the same members, admission and prefill identity as the switch; nothing is exported.

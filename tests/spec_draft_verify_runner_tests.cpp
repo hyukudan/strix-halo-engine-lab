@@ -1,4 +1,5 @@
 #include "strix/session/draft_verify_runner.hpp"
+#include "strix/session/linear_verify_step.hpp"
 #include "strix/graph/model_decl.hpp"
 
 #include "executor_cpu_binding.hpp"
@@ -11,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <span>
 
 namespace {
 
@@ -292,6 +294,77 @@ void plan_test() {
     std::puts("PASS B1 X3 verify keys and padding");
 }
 
+// The incumbent draft-verify descriptor, kept here verbatim as the byte reference of the shared builder.
+ex::StepBlock incumbent_describe(std::uint32_t width, std::uint64_t frontier, std::uint32_t lane,
+                                 std::uint32_t anchor, std::span<const std::uint32_t> drafts) {
+    const auto valid = static_cast<std::uint32_t>(drafts.size()) + 1U;
+    ex::StepBlock step{};
+    step.h.rows = width;
+    step.h.valid_mask = (1U << valid) - 1U;
+    for (std::uint32_t i = 0; i < valid; ++i) {
+        step.row[i] = {i ? drafts[i - 1U] : anchor, static_cast<std::uint32_t>(frontier) + i, lane,
+                       i ? i - 1U : ex::kStepNoParent, (1U << i) - 1U,
+                       ex::step_valid | ex::step_pending_state, 0, 0};
+    }
+    return step;
+}
+
+void linear_descriptor_test() {
+    const se::VerifyWindowPlan plan(se::RingPlan(4, 3, 8));
+    check(std::ranges::equal(plan.widths(), std::array{1U, 2U, 4U, 8U}), "descriptor plan widths");
+    constexpr std::array<std::uint32_t, 7> drafts{101U, 7U, 65535U, 3U, 0U, 99U, 12U};
+    constexpr auto max = std::numeric_limits<std::uint32_t>::max();
+    std::size_t cases = 0;
+    for (const auto width : plan.widths()) {
+        for (std::uint32_t count = 0; count < width; ++count) {
+            for (const std::uint64_t frontier : {std::uint64_t{0}, std::uint64_t{100}, std::uint64_t{2047},
+                                                 std::uint64_t{max} - width}) {
+                for (const std::uint32_t lane : {0U, 5U}) {
+                    const auto used = std::span(drafts).first(count);
+                    const auto shared = plan.describe(width, frontier, lane, 42U, used);
+                    const auto reference = incumbent_describe(width, frontier, lane, 42U, used);
+                    check(std::memcmp(&shared, &reference, sizeof(shared)) == 0,
+                          "draft verify descriptor bytes changed");
+                    ++cases;
+                }
+            }
+        }
+    }
+
+    // Forced rows: three ids at position 100 in a width-four program. Row 1 sees row 0 and itself (the
+    // CUDA pending-row K/V lookup matches inclusive ancestors only); the draft-verify window shows row 0.
+    constexpr std::array<std::uint32_t, 3> forced{11U, 17U, 23U};
+    const auto inclusive = se::linear_verify_step({4U, 100U, 0U, 100U, se::LinearVerifyRows::inclusive_valid}, forced);
+    const auto exclusive = se::linear_verify_step({4U, 100U, 0U, 0U, se::LinearVerifyRows::exclusive_pending}, forced);
+    check(inclusive.h.rows == 4U && inclusive.h.valid_mask == 7U && inclusive.h.step == 100U &&
+          inclusive.h.feed_mask == 0U, "forced descriptor header");
+    for (std::uint32_t row = 0; row < forced.size(); ++row) {
+        const auto& in = inclusive.row[row];
+        const auto& ex_row = exclusive.row[row];
+        check(in.token == forced[row] && in.position == 100U + row && in.slot == 0U &&
+              in.parent == (row == 0U ? ex::kStepNoParent : row - 1U) && in.flags == ex::step_valid &&
+              in.ancestors == (2U << row) - 1U, "inclusive forced row");
+        check(ex_row.parent == in.parent && ex_row.ancestors == (1U << row) - 1U &&
+              ex_row.flags == (ex::step_valid | ex::step_pending_state), "exclusive forced row");
+    }
+    check(inclusive.row[1].ancestors == 0b11U && exclusive.row[1].ancestors == 0b01U, "row 1 visibility");
+    const ex::StepRow zero{};
+    check(std::memcmp(&inclusive.row[3], &zero, sizeof(zero)) == 0 && !ex::step_row_valid(inclusive, 3U),
+          "padding row must stay masked and zero");
+
+    rejects<std::invalid_argument>([&] {
+        (void)se::linear_verify_step({2U, 0U, 0U, 0U, se::LinearVerifyRows::inclusive_valid}, forced);
+    }, "linear window wider than its program was accepted");
+    rejects<std::invalid_argument>([&] {
+        (void)se::linear_verify_step({4U, 0U, 0U, 0U, se::LinearVerifyRows::inclusive_valid}, {});
+    }, "empty linear window was accepted");
+    rejects<std::invalid_argument>([&] {
+        (void)se::linear_verify_step({4U, max - 1U, 0U, 0U, se::LinearVerifyRows::inclusive_valid}, forced);
+    }, "linear window past the last position was accepted");
+    std::printf("PASS B1 linear verify descriptor: %zu draft-verify windows byte-identical, forced rows inclusive\n",
+                cases);
+}
+
 void greedy_test() {
     Fixture fixture;
     auto draft = fixture.drafter();
@@ -359,6 +432,7 @@ void retry_test() {
 int main() {
     try {
         plan_test();
+        linear_descriptor_test();
         greedy_test();
         retry_test();
     } catch (const std::exception& error) {

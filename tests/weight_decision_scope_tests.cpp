@@ -6,7 +6,9 @@
 
 #include <array>
 #include <cstdio>
+#include <limits>
 #include <span>
+#include <set>
 #include <string>
 #include <string_view>
 
@@ -53,20 +55,33 @@ int main() {
     ok &= check(toolkit == "hip-clang-24.0.0git-d6f6cb691863", "HIP toolkit id from the device compiler text");
     ok &= check(weight::hip_clang_compiler_id("20.0.0") == "hip-clang-20.0.0", "HIP toolkit id without a commit");
     weight::WeightLoadScope scope{weight::Backend::hip, "gfx1151", toolkit, "resident", impl, checkpoint};
-    const std::array rows{weight::WeightLoadDecision{policy, scope, gate, gain}};
-    ok &= check(weight::find_weight_load_decision(policy, scope, rows) == rows.data(), "matching scope selects the row");
+    // The point lookup takes the ladder's timing decision: a row selects with a measured gain beyond noise.
+    // Every point lookup below names a known regime: an unknown context or lane count never selects (see below).
+    constexpr weight::WeightLoadExtent known{4096, 1};
+    const weight::WeightLoadEvidence point_timing{"receipts/timing", "2026-11-24", 16, 0, 0, 1.10, 0.02};
+    const std::array untimed_rows{weight::WeightLoadDecision{policy, scope, gate, gain}};
+    ok &= check(!weight::find_weight_load_decision(policy, scope, untimed_rows, known), "a gain digest without a speedup never selects");
+    const std::array rows{weight::WeightLoadDecision{policy, scope, gate, gain, point_timing}};
+    ok &= check(weight::find_weight_load_decision(policy, scope, rows, known) == rows.data(), "matching scope selects the row");
+    // Point and extent lookups share the known-endpoint rule: an unknown context or lane count (0) never selects
+    // storage, even for a winning row with unbounded bands.
+    for (const weight::WeightLoadExtent unknown : {weight::WeightLoadExtent{}, weight::WeightLoadExtent{4096, 0},
+                                                   weight::WeightLoadExtent{0, 1}}) {
+        ok &= check(!weight::find_weight_load_decision(policy, scope, rows, unknown),
+                    "an unknown point never selects an unbounded win");
+    }
     auto other = scope;
     other.build = weight::implementation_identity(bumped);
-    ok &= check(!weight::find_weight_load_decision(policy, other, rows), "row retired by a consumer revision bump");
+    ok &= check(!weight::find_weight_load_decision(policy, other, rows, known), "row retired by a consumer revision bump");
     other.build = weight::implementation_identity({});
-    ok &= check(!weight::find_weight_load_decision(policy, other, rows), "zero implementation identity never matches");
+    ok &= check(!weight::find_weight_load_decision(policy, other, rows, known), "zero implementation identity never matches");
     other = scope;
     other.checkpoint = gate;
-    ok &= check(!weight::find_weight_load_decision(policy, other, rows), "another checkpoint never matches");
+    ok &= check(!weight::find_weight_load_decision(policy, other, rows, known), "another checkpoint never matches");
     const auto runtime_compiler = weight::current_compiler_id();
     other = scope;
     other.compiler_id = runtime_compiler;
-    ok &= check(!weight::find_weight_load_decision(policy, other, rows),
+    ok &= check(!weight::find_weight_load_decision(policy, other, rows, known),
                 "the runtime compiler id cannot match a HIP weight-load row");
 
     // Generic weight-load lever ids: one shared policy per role set and format; a model binds it and keeps the
@@ -107,22 +122,23 @@ int main() {
     ok &= check(hy4_head, "Hy4 head row names the generic head policy");
     // A decision row recorded under the former model-named key still selects the generic policy; another
     // policy, another revision or another key does not.
-    const std::array renamed{weight::WeightLoadDecision{legacy, scope, gate, gain},
-                             weight::WeightLoadDecision{attention_head.id, scope, gate, gain}};
-    ok &= check(weight::find_weight_load_decision(attention_head, scope, renamed) == renamed.data(),
+    const weight::WeightLoadEvidence timed{"receipts/timing", "2026-11-24", 16, 0, 0, 1.10, 0.02};
+    const std::array renamed{weight::WeightLoadDecision{legacy, scope, gate, gain, timed},
+                             weight::WeightLoadDecision{attention_head.id, scope, gate, gain, timed}};
+    ok &= check(weight::find_weight_load_decision(attention_head, scope, renamed, known) == renamed.data(),
                 "legacy decision row matches the generic policy");
-    ok &= check(weight::find_weight_load_decision(attention_head, scope, std::span(renamed).last(1)) == &renamed[1],
+    ok &= check(weight::find_weight_load_decision(attention_head, scope, std::span(renamed).last(1), known) == &renamed[1],
                 "generic decision row matches");
-    ok &= check(!weight::find_weight_load_decision(head, scope, renamed), "another policy never matches");
-    ok &= check(!weight::find_weight_load_decision(attention_head.id, scope, std::span(renamed).first(1)),
+    ok &= check(!weight::find_weight_load_decision(head, scope, renamed, known), "another policy never matches");
+    ok &= check(!weight::find_weight_load_decision(attention_head.id, scope, std::span(renamed).first(1), known),
                 "the plain id lookup accepts no alias");
     const std::array bumped_legacy{weight::WeightLoadDecision{{legacy.name, 2}, scope, gate, gain}};
-    ok &= check(!weight::find_weight_load_decision(attention_head, scope, bumped_legacy),
+    ok &= check(!weight::find_weight_load_decision(attention_head, scope, bumped_legacy, known),
                 "another legacy revision never matches");
 
     // The resolver and its receipt line use the generic id, whatever key the decision row was stored under.
     constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
-    weight::WeightLoadRequest request{strix::profile::Name::fast, scope, formats, true, false};
+    weight::WeightLoadRequest request{strix::profile::Name::fast, scope, formats, true, false, {}, {4096, 1}};
     const auto plan = weight::resolve_weight_load(weight::builtin_registry(), attention_head, request,
                                                   std::span(renamed).first(1));
     ok &= check(plan.status == strix::profile::Status::set && plan.storage == weight::kQ8WeightStorage,
@@ -158,17 +174,20 @@ int main() {
     }
 
     // Per-regime rows: one resident image serves prefill and decode. A gate-only row (gate v2 PASS, no measured
-    // gain) never selects the image; a full row selects it only when every regime of the image has a gate row.
+    // gain) never selects the image nor admits its regime (ladder rule); the image needs a full row with a measured
+    // speedup beyond noise in every regime it serves.
     {
         const std::array<std::string_view, 2> regimes{weight::kPrefillRegime, weight::kDecodeRegime};
         auto prefill = scope;
         prefill.regime = weight::kPrefillRegime;
         auto decode = scope;
         decode.regime = weight::kDecodeRegime;
-        const weight::WeightLoadEvidence pf_receipt{"receipts/prefill", "2026-11-23", 2457, 0, 0};
-        const weight::WeightLoadEvidence banded{"receipts/decode", "2026-11-23", 2457, 65536, 0};
+        const weight::WeightLoadEvidence pf_receipt{"receipts/prefill", "2026-11-23", 2457, 0};
+        const weight::WeightLoadEvidence banded{"receipts/decode", "2026-11-23", 2457, 65536, 0, 1.158, 0.02};
+        const weight::WeightLoadEvidence pf_timed{"receipts/prefill", "2026-11-23", 2457, 0, 0, 1.05, 0.02};
+        const weight::WeightLoadEvidence pf_slower{"receipts/prefill", "2026-11-23", 2457, 0, 0, 0.997, 0.02};
         const auto& q8 = weight::kAttentionHeadQ8Policy;
-        weight::WeightLoadRequest r{strix::profile::Name::fast, scope, formats, true, false, regimes, {32768, 0}};
+        weight::WeightLoadRequest r{strix::profile::Name::fast, scope, formats, true, false, regimes, {32768, 1}};
         const auto resolve = [&](std::span<const weight::WeightLoadDecision> table) {
             return weight::resolve_weight_load(weight::builtin_registry(), q8, r, table);
         };
@@ -189,22 +208,69 @@ int main() {
         const std::array both{weight::WeightLoadDecision{q8.id, prefill, gate, {}, pf_receipt},
                               weight::WeightLoadDecision{q8.id, decode, gate, gain, banded}};
         p = resolve(both);
+        ok &= check(p.storage == weight::kBf16WeightStorage && p.status == strix::profile::Status::pending &&
+                        p.regimes[0].qualification == weight::RegimeQualification::gate_only &&
+                        p.regimes[1].qualification == weight::RegimeQualification::full,
+                    "ladder: a gate-only prefill row no longer admits prefill onto the decode image");
+        const std::array slower{weight::WeightLoadDecision{q8.id, prefill, gate, gain, pf_slower},
+                                weight::WeightLoadDecision{q8.id, decode, gate, gain, banded}};
+        p = resolve(slower);
+        ok &= check(p.storage == weight::kBf16WeightStorage && p.status == strix::profile::Status::pending &&
+                        p.regimes[0].qualification == weight::RegimeQualification::gate_only,
+                    "ladder: a timed prefill row inside the noise margin (x0.997) keeps the image BF16");
+        const std::array untimed{weight::WeightLoadDecision{q8.id, decode, gate, gain, pf_receipt}};
+        r.regimes = {};
+        r.scope = decode;
+        ok &= check(resolve(untimed).storage == weight::kBf16WeightStorage,
+                    "ladder: a gain digest without a measured speedup never selects");
+        r.regimes = regimes;
+        r.scope = scope;
+        const std::array full_both{weight::WeightLoadDecision{q8.id, prefill, gate, gain, pf_timed},
+                                   weight::WeightLoadDecision{q8.id, decode, gate, gain, banded}};
+        p = resolve(full_both);
         ok &= check(p.storage == weight::kQ8WeightStorage && p.status == strix::profile::Status::set &&
-                        p.measured_gain == gain && p.regimes[1].qualification == weight::RegimeQualification::full,
-                    "gate rows in every regime plus one full row select the image");
+                        p.measured_gain == gain && p.regimes[0].qualification == weight::RegimeQualification::full &&
+                        p.regimes[1].qualification == weight::RegimeQualification::full,
+                    "a measured ladder gain in every regime selects the image");
+        {
+            // Point and extent lookups share one timing decision: a broad gain (1..65,536) with a measured losing
+            // 16,384..32,768 sub-band of the same comparison is refused at 20,000 by both entry points.
+            const weight::WeightLoadEvidence broad{"receipts/broad", "2026-11-25", 2457, 65536, 0, 1.10, 0.02};
+            const weight::WeightLoadEvidence losing{"receipts/losing", "2026-11-25", 2457, 32768, 0, 0.95, 0.02, 16384};
+            const std::array mixed{weight::WeightLoadDecision{q8.id, decode, gate, gain, broad},
+                                   weight::WeightLoadDecision{q8.id, decode, gate, gain, losing}};
+            ok &= check(weight::find_weight_load_decision(q8, decode, mixed, {20000, 1}) == nullptr &&
+                            weight::find_weight_load_decision(q8.id, decode, mixed, {20000, 1}) == nullptr,
+                        "point lookup: the losing sub-band vetoes the broad win at 20,000");
+            ok &= check(weight::find_weight_load_decision(q8, decode, mixed, {8192, 1}) == &mixed[0],
+                        "point lookup: outside the losing sub-band the broad win selects");
+            ok &= check(weight::find_weight_load_decision(q8, decode, std::span(mixed).last(1), {20000, 1}) == nullptr,
+                        "point lookup: a measured loser never selects itself");
+            auto at = r;
+            at.scope = decode;
+            at.regimes = {};
+            at.extent = {20000, 1};
+            weight::RegimeWeightLoad point{};
+            weight::match_weight_load_evidence(q8, decode, mixed, at, weight::kBf16WeightStorage, point);
+            ok &= check(!point.faster, "extent matcher refuses the same losing point");
+            at.extent = {8192, 1};
+            weight::RegimeWeightLoad clear{};
+            weight::match_weight_load_evidence(q8, decode, mixed, at, weight::kBf16WeightStorage, clear);
+            ok &= check(clear.faster && clear.row == &mixed[0], "extent matcher selects outside the losing sub-band");
+        }
         r.extent.context = 131072;
-        p = resolve(both);
+        p = resolve(full_both);
         ok &= check(p.storage == weight::kBf16WeightStorage && p.regimes[1].row == nullptr &&
-                        p.regimes[1].outside_band == &both[1], "a context outside the gate band is refused");
-        ok &= check(weight::weight_load_regime_receipt(p).ends_with("decode=none:outside-band<=65536"),
+                        p.regimes[1].outside_band == &full_both[1], "a context outside the gate band is refused");
+        ok &= check(weight::weight_load_regime_receipt(p).ends_with("decode=none:outside-band context=1..65536 lanes=1..*"),
                     "outside-band receipt");
         r.extent.context = 0;
-        ok &= check(resolve(both).storage == weight::kBf16WeightStorage, "unknown context never meets a banded row");
+        ok &= check(resolve(full_both).storage == weight::kBf16WeightStorage, "unknown context never meets a banded row");
         r.extent.context = 32768;
         // A decode gain banded by lanes: inside the band (and only with known lanes) the row is full; outside it
         // keeps its gate v2 PASS (admits decode) but never selects; the receipt says why.
-        const weight::WeightLoadEvidence one_lane{"receipts/decode", "2026-11-24", 2649, 65536, 1};
-        const std::array lane_banded{weight::WeightLoadDecision{q8.id, prefill, gate, {}, pf_receipt},
+        const weight::WeightLoadEvidence one_lane{"receipts/decode", "2026-11-24", 2649, 65536, 1, 1.10, 0.02};
+        const std::array lane_banded{weight::WeightLoadDecision{q8.id, prefill, gate, gain, pf_timed},
                                      weight::WeightLoadDecision{q8.id, decode, gate, gain, one_lane}};
         ok &= check(weight::find_weight_load_decision(q8.id, decode, lane_banded) == nullptr,
                     "a direct id lookup with unknown extent cannot select a banded decision");
@@ -218,6 +284,7 @@ int main() {
                         !weight::find_weight_load_decision(q8, decode, lane_banded, {0, 1}) &&
                         !weight::find_weight_load_decision(q8, decode, lane_banded, {65536, 0}),
                     "full decision lookups reject each band independently, including unknown bounds");
+        r.extent.lanes = 0;
         p = resolve(lane_banded);
         ok &= check(p.storage == weight::kBf16WeightStorage && p.regimes[1].row == &lane_banded[1] &&
                         p.regimes[1].qualification == weight::RegimeQualification::gate_only &&
@@ -228,7 +295,7 @@ int main() {
                         p.regimes[1].qualification == weight::RegimeQualification::full && !p.regimes[1].gain_outside_lanes,
                     "one lane inside the lane band selects the image");
         ok &= check(weight::weight_load_regime_receipt(p) == "strix-weight-load-regimes/v1 weights.attention_head.q8_0@1 "
-                        "gguf.q8_0@1 profile prefill=gate-only:receipts/prefill decode=full:receipts/decode",
+                        "gguf.q8_0@1 profile prefill=full:receipts/prefill decode=full:receipts/decode",
                     "lane band receipt inside the band");
         r.extent.lanes = 8;
         p = resolve(lane_banded);
@@ -241,34 +308,132 @@ int main() {
                         weight::find_weight_load_gate(q8, decode, lane_banded, {131072, 1}) == nullptr,
                     "the gate lookup keeps a lane-banded PASS row and still applies the context band");
         ok &= check(weight::registered_regime_rows(q8, weight::Backend::hip, regimes, lane_banded) ==
-                        "prefill=gate-only@" + std::string(scope.device_class) + ",decode=full@" +
+                        "prefill=full@" + std::string(scope.device_class) + ",decode=full@" +
                         std::string(scope.device_class) + "/lanes<=1", "committed rows show the lane band");
         ok &= check(weight::weight_load_gain_selects(lane_banded[1], {32768, 1}) &&
                         !weight::weight_load_gain_selects(lane_banded[1], {32768, 2}) &&
                         !weight::weight_load_gain_selects(lane_banded[1], {131072, 1}) &&
-                        !weight::weight_load_gain_selects(lane_banded[0], {32768, 1}),
+                        !weight::weight_load_gain_selects(gate_only[0], {32768, 1}),
                     "a gain selects only inside both bands; a gate-only row never");
-        r.extent.lanes = 0;
+        r.extent.lanes = 1;
         r.tier = strix::profile::Name::standard;
-        ok &= check(resolve(both).storage == weight::kBf16WeightStorage, "EXACT never takes a regime row");
+        ok &= check(resolve(full_both).storage == weight::kBf16WeightStorage, "EXACT never takes a regime row");
         r.tier = strix::profile::Name::fast;
         r.enabled = false;
-        ok &= check(resolve(both).status == strix::profile::Status::off, "off switch");
+        ok &= check(resolve(full_both).status == strix::profile::Status::off, "off switch");
         r.enabled = true;
         r.regimes = {};
         r.scope = decode;
-        ok &= check(resolve(both).storage == weight::kQ8WeightStorage, "single-regime request keeps its old meaning");
+        ok &= check(resolve(full_both).storage == weight::kQ8WeightStorage, "single-regime request keeps its old meaning");
         r.scope = prefill;
         ok &= check(resolve(both).storage == weight::kBf16WeightStorage, "single gate-only regime never selects");
     }
+    request.tier = strix::profile::Name::fast;
+    auto narrow = renamed.front();
+    narrow.evidence.min_context = 4096;
+    narrow.evidence.max_context = 8192;
+    narrow.evidence.min_lanes = 2;
+    narrow.evidence.max_lanes = 4;
+    narrow.evidence.speedup = 1.008;
+    narrow.evidence.noise = 0.002;
+    const auto selected = [&](const weight::WeightLoadRequest& run, const weight::WeightLoadDecision& row) {
+        return weight::resolve_weight_load(weight::builtin_registry(), attention_head, run, std::span(&row, 1)).storage;
+    };
+    request.extent.lanes = 2;
+    ok &= check(selected(request, narrow) == weight::kQ8WeightStorage, "lower band edge and small measured gain");
+    request.extent.lanes = 4;
+    request.extent.context = 8192;
+    ok &= check(selected(request, narrow) == weight::kQ8WeightStorage, "upper band edge");
+    request.extent.lanes = 5;
+    ok &= check(selected(request, narrow) == weight::kBf16WeightStorage, "lane above band declines");
+    request.extent.lanes = 1;
+    ok &= check(selected(request, narrow) == weight::kBf16WeightStorage, "lane below band declines");
+    request.extent.lanes = 2;
+    request.extent.context = 4095;
+    ok &= check(selected(request, narrow) == weight::kBf16WeightStorage, "context below band declines");
+    request.extent.context = 4096;
+    auto other_device = request;
+    other_device.scope.device_class = "other";
+    ok &= check(selected(other_device, narrow) == weight::kBf16WeightStorage, "other device declines");
+    {   // The weight device class is the shared cost-device identity: a row measured on one product never serves another
+        // of the same architecture, even with equal unit count and memory (name, clock, runtime and driver are keyed too).
+        strix::device::CostDeviceFacts base{"gfx1151", "fixture card", 20, 128ULL << 30, 2900000, "hip", 7, 7};
+        const auto card_a = weight::device_class_key(base);
+        auto variant = base;
+        variant.units = 40;
+        const auto card_b = weight::device_class_key(variant);
+        variant = base;
+        variant.memory = 96ULL << 30;
+        const auto card_c = weight::device_class_key(variant);
+        variant = base;
+        variant.name = "faster product";
+        const auto card_d = weight::device_class_key(variant);
+        variant = base;
+        variant.clock_khz = 2400000;
+        const auto card_e = weight::device_class_key(variant);
+        variant = base;
+        variant.driver = 8;
+        const auto card_f = weight::device_class_key(variant);
+        ok &= check(card_a == strix::device::cost_device_identity(base), "weight class is the shared cost-device identity");
+        const std::set<std::string> distinct{card_a, card_b, card_c, card_d, card_e, card_f};
+        ok &= check(distinct.size() == 6, "device class keys separate units, memory, product name, clock and driver");
+        auto measured = narrow;
+        measured.scope.device_class = card_a;
+        const auto select_on = [&](const std::string& card) {
+            auto run = request;
+            run.scope.device_class = card;
+            return selected(run, measured);
+        };
+        ok &= check(select_on(card_a) == weight::kQ8WeightStorage, "the measured card selects its row");
+        ok &= check(select_on(card_b) == weight::kBf16WeightStorage, "same architecture, other unit count declines");
+        ok &= check(select_on(card_c) == weight::kBf16WeightStorage, "same architecture, other memory declines");
+        ok &= check(select_on(card_d) == weight::kBf16WeightStorage, "equal resources, different product name declines");
+        ok &= check(select_on(card_e) == weight::kBf16WeightStorage, "equal resources, different clock limit declines");
+        ok &= check(select_on(card_f) == weight::kBf16WeightStorage, "different driver declines");
+    }
+    auto malformed = narrow;
+    malformed.evidence.receipt = {};
+    ok &= check(selected(request, malformed) == weight::kBf16WeightStorage, "missing receipt declines");
+    malformed = narrow;
+    malformed.evidence.noise = std::numeric_limits<double>::quiet_NaN();
+    ok &= check(selected(request, malformed) == weight::kBf16WeightStorage, "NaN noise declines");
+    malformed = narrow;
+    malformed.evidence.speedup = std::numeric_limits<double>::infinity();
+    ok &= check(selected(request, malformed) == weight::kBf16WeightStorage, "infinite speedup declines");
+    malformed = narrow;
+    malformed.evidence.min_lanes = 0;
+    ok &= check(selected(request, malformed) == weight::kBf16WeightStorage, "zero lower lane bound declines");
+    auto envelope = request;
+    envelope.extent.lanes = 4;
+    envelope.first.lanes = 1;
+    ok &= check(selected(envelope, narrow) == weight::kBf16WeightStorage, "an image needs the entire lane envelope");
+    envelope.first.lanes = 2;
+    ok &= check(selected(envelope, narrow) == weight::kQ8WeightStorage, "covering image receipt applies");
+    auto slower_subset = narrow;
+    slower_subset.evidence.min_lanes = slower_subset.evidence.max_lanes = 3;
+    slower_subset.evidence.speedup = 0.95;
+    const std::array overlapping{narrow, slower_subset};
+    ok &= check(weight::resolve_weight_load(weight::builtin_registry(), attention_head, envelope, overlapping).storage ==
+                    weight::kBf16WeightStorage, "a measured losing sub-band vetoes the image");
+    request.tier = strix::profile::Name::turbo;
+    ok &= check(selected(request, narrow) == weight::kQ8WeightStorage, "TURBO inherits the effective FAST storage");
+    auto upper = narrow;
+    upper.evidence.tier = strix::profile::Name::turbo;
+    upper.evidence.reference = weight::kQ8WeightStorage;
+    ok &= check(selected(request, upper) == weight::kBf16WeightStorage, "wrong FAST reference declines");
+    upper.evidence.reference = weight::kBf16WeightStorage;
+    ok &= check(selected(request, upper) == weight::kQ8WeightStorage, "correct effective FAST reference applies");
 
-    // A row without a gate v2 PASS qualifies TURBO only, with a measured gain and a stated quality; FAST never takes it.
+    // A row without a gate v2 PASS qualifies TURBO only, with a measured ladder gain over the image below (its timing
+    // receipt, tier TURBO) and a stated quality; FAST never takes it.
+    weight::WeightLoadEvidence turbo_timing{"receipts/turbo", "2026-11-24", 16, 0, 0, 1.10, 0.02};
+    turbo_timing.tier = strix::profile::Name::turbo;
     const auto& q4 = weight::kAttentionHeadQ4Policy;
     constexpr std::array lowbit{weight::kBf16WeightStorage, weight::kQ4G64WeightStorage};
-    const std::array turbo{weight::WeightLoadDecision{q4.id, scope, {}, gain, {}, "kl=0.01 top1=0.94"}};
-    const std::array unstated{weight::WeightLoadDecision{q4.id, scope, {}, gain}};
-    const std::array unmeasured{weight::WeightLoadDecision{q4.id, scope, {}, {}, {}, "kl=0.01 top1=0.94"}};
-    weight::WeightLoadRequest lowbit_request{strix::profile::Name::turbo, scope, lowbit, true, false};
+    const std::array turbo{weight::WeightLoadDecision{q4.id, scope, {}, gain, turbo_timing, "kl=0.01 top1=0.94"}};
+    const std::array unstated{weight::WeightLoadDecision{q4.id, scope, {}, gain, turbo_timing}};
+    const std::array unmeasured{weight::WeightLoadDecision{q4.id, scope, {}, {}, turbo_timing, "kl=0.01 top1=0.94"}};
+    weight::WeightLoadRequest lowbit_request{strix::profile::Name::turbo, scope, lowbit, true, false, {}, {16384, 1}};
     const auto turbo_plan = weight::resolve_weight_load(weight::builtin_registry(), q4, lowbit_request, turbo);
     ok &= check(turbo_plan.status == strix::profile::Status::set && turbo_plan.storage == weight::kQ4G64WeightStorage &&
                     turbo_plan.turbo_quality == "kl=0.01 top1=0.94" && turbo_plan.gate_v2_pass == Digest256{},
@@ -291,9 +456,9 @@ int main() {
         prefill.regime = weight::kPrefillRegime;
         auto decode = scope;
         decode.regime = weight::kDecodeRegime;
-        weight::WeightLoadRequest r{strix::profile::Name::turbo, scope, lowbit, true, false, regimes, {16384, 0}};
-        const std::array turbo_rows{weight::WeightLoadDecision{q4.id, prefill, {}, gain, {}, "kl=0.02"},
-                              weight::WeightLoadDecision{q4.id, decode, {}, gain, {}, "kl=0.03"}};
+        weight::WeightLoadRequest r{strix::profile::Name::turbo, scope, lowbit, true, false, regimes, {16384, 1}};
+        const std::array turbo_rows{weight::WeightLoadDecision{q4.id, prefill, {}, gain, turbo_timing, "kl=0.02"},
+                              weight::WeightLoadDecision{q4.id, decode, {}, gain, turbo_timing, "kl=0.03"}};
         auto p = weight::resolve_weight_load(weight::builtin_registry(), q4, r, turbo_rows);
         ok &= check(p.storage == weight::kQ4G64WeightStorage && p.turbo_quality == "kl=0.02" && p.regime_count == 2 &&
                         p.regimes[1].row == &turbo_rows[1],
@@ -302,7 +467,7 @@ int main() {
         ok &= check(weight::resolve_weight_load(weight::builtin_registry(), q4, r, prefill_only).storage ==
                         weight::kBf16WeightStorage,
                     "a regime without a TURBO row keeps the image BF16");
-        const std::array mixed{turbo_rows[0], weight::WeightLoadDecision{q4.id, decode, gate, gain, {}, {}}, turbo_rows[1]};
+        const std::array mixed{turbo_rows[0], weight::WeightLoadDecision{q4.id, decode, gate, gain, turbo_timing, {}}, turbo_rows[1]};
         p = weight::resolve_weight_load(weight::builtin_registry(), q4, r, mixed);
         ok &= check(p.regimes[1].row == &mixed[1] && p.turbo_quality == "kl=0.02",
                     "a gate v2 PASS with a gain is preferred to its TURBO row");
@@ -316,8 +481,10 @@ int main() {
                     "FAST refuses per-regime TURBO rows");
         // A decode row banded by step rows: the plan reports the band of the regime whose row matched.
         r.tier = strix::profile::Name::turbo;
-        weight::WeightLoadRequest d{strix::profile::Name::turbo, decode, lowbit, true, false, {}, {16384, 0}};
-        const std::array banded{weight::WeightLoadDecision{q4.id, decode, {}, gain, {"r", "2026-11-24", 1008, 0, 0, 16}, "kl=0.03"}};
+        weight::WeightLoadRequest d{strix::profile::Name::turbo, decode, lowbit, true, false, {}, {16384, 1}};
+        auto stepped = turbo_timing;
+        stepped.max_rows = 16;
+        const std::array banded{weight::WeightLoadDecision{q4.id, decode, {}, gain, stepped, "kl=0.03"}};
         const auto bp = weight::resolve_weight_load(weight::builtin_registry(), q4, d, banded);
         ok &= check(bp.storage == weight::kQ4G64WeightStorage && bp.row_band(weight::kDecodeRegime) == 16U &&
                         bp.row_band(weight::kPrefillRegime) == 0U && p.row_band(weight::kDecodeRegime) == 0U,
@@ -331,5 +498,6 @@ int main() {
                         "0900000000000000000000000000000000000000000000000000000000000001",
                     "scope receipt prints the digest literals");
     }
+    if (ok) std::puts("weight decision scope tests: PASS");
     return ok ? 0 : 1;
 }

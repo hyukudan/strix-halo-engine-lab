@@ -1113,19 +1113,21 @@ void test_entry_points_host_defaults() {
         if (row.optimization) check(md::host_default_value(row, "rank", lookup(base)) == nullptr, std::string(row.name) + " off under the baseline");
 }
 
-// '--profile fast' = the qualified bundle mm-fast-pf-v2: the product profile selects STRIX_MM_FAST_PREFILL only while
+// FAST and TURBO select the qualified bundle mm-fast-pf-v2: the product profile selects STRIX_MM_FAST_PREFILL only while
 // the switch is unset (a set switch, "0" included, wins). After print_or_apply's export the run is the switch's run:
 // same members and cache identity; the receipt rows carry both members (the switch is provenance, not a table row).
 void test_fast_product_profile_bundle() {
     const char* pp = md::kProductProfileEnv;
     check(!md::fast_profile_selects_bundle(lookup(EnvMap{})), "product bundle: no profile, no bundle");
-    for (const char* name : {"default", "quality", "turbo", "junk"})
-        check(!md::fast_profile_selects_bundle(lookup(EnvMap{{pp, name}})), "product bundle: only fast selects it");
-    check(md::fast_profile_selects_bundle(lookup(EnvMap{{pp, "fast"}})), "product bundle: fast selects it");
-    check(!md::fast_profile_selects_bundle(lookup(EnvMap{{pp, "fast"}, {"STRIX_MM_FAST_PREFILL", "0"}})),
-          "product bundle: explicit 0 wins");
-    check(!md::fast_profile_selects_bundle(lookup(EnvMap{{pp, "fast"}, {"STRIX_MM_FAST_PREFILL", "1"}})),
-          "product bundle: a set switch needs no export");
+    for (const char* name : {"default", "quality", "junk"})
+        check(!md::fast_profile_selects_bundle(lookup(EnvMap{{pp, name}})), "product bundle: inactive outside fast and turbo");
+    for (const char* name : {"fast", "turbo"}) {
+        check(md::fast_profile_selects_bundle(lookup(EnvMap{{pp, name}})), "product bundle: fast and turbo select it");
+        check(!md::fast_profile_selects_bundle(lookup(EnvMap{{pp, name}, {"STRIX_MM_FAST_PREFILL", "0"}})),
+              "product bundle: explicit 0 wins");
+        check(!md::fast_profile_selects_bundle(lookup(EnvMap{{pp, name}, {"STRIX_MM_FAST_PREFILL", "1"}})),
+              "product bundle: a set switch needs no export");
+    }
     const EnvMap exported{{pp, "fast"}, {"STRIX_MM_FAST_PREFILL", "1"}};  // what print_or_apply leaves for --profile fast
     const EnvMap switched{{"STRIX_MM_FAST_PREFILL", "1"}};
     const auto p = md::prefill_policy(lookup(exported));

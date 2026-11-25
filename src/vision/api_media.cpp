@@ -32,7 +32,8 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 
 ApiMediaBridge::ApiMediaBridge(VisionAdapter& adapter, EncoderBackend& backend, const EncoderWeights& weights, EmbedCache* cache,
                                session::EmbedInterner& interner, ApiMediaOptions options)
-    : adapter_(adapter), backend_(backend), weights_(weights), cache_(cache), interner_(interner), options_(std::move(options)) {
+    : adapter_(adapter), backend_(backend), weights_(weights), cache_(cache), interner_(interner),
+      options_(std::move(options)), color_(adapter.color_policy()) {
     if (options_.placeholder.empty() || options_.max_rows == 0U || options_.max_rows > session::kEmbedMaxRows || options_.lm_width == 0U)
         throw std::invalid_argument("vision media bridge: placeholder, max_rows and lm_width are required");
     // the cache key and the capability hash: the adapter's identity (weights digest + recipe) and the arithmetic
@@ -79,7 +80,8 @@ serve::ApiMediaSpan ApiMediaBridge::encode(const serve::media::MediaItem& item, 
     if (!lease) {
         Image image;
         try {
-            image = decode(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(item.bytes.data()), item.bytes.size()), options_.limits);
+            image = decode(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(item.bytes.data()),
+                                                       item.bytes.size()), options_.limits, color_);
         } catch (const ImageError& e) {
             ++stats_.refused;
             refuse_image(e);

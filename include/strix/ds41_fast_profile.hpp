@@ -35,6 +35,16 @@ inline bool shared_on() { return strix::fast_profile::switch_on(strix::envcfg::t
 // (STRIX_DS41_FAST_MOE_F16=1, policy ds41-moe-f16wmma-v1; src/hip_ds41_prefill.hip). Changes logits.
 inline constexpr strix::fast_profile::Member kMoeF16{"STRIX_DS41_FAST_MOE_F16", "1", "ds41-moe-f16wmma-v1"};
 inline bool moe_f16_on() { return strix::fast_profile::switch_on(strix::envcfg::text(kMoeF16.env)); }
+inline bool moe_i4_on() {
+    const char* value = strix::envcfg::text("STRIX_DS41_FAST_I4");
+    return value && std::string_view(value) == "1";
+}
+enum class MoeI4Scope : unsigned char { all, gate_up, invalid };
+inline MoeI4Scope moe_i4_scope(const char* raw = strix::envcfg::text("STRIX_DS41_FAST_I4_SCOPE")) noexcept {
+    if (!raw || std::string_view(raw) == "all") return MoeI4Scope::all;
+    if (std::string_view(raw) == "gu") return MoeI4Scope::gate_up;
+    return MoeI4Scope::invalid;
+}
 // Preserve decimal-prefix parsing and unsigned wrap, including zero and negative values.
 // Also accepts the canonical unsigned value exported by the pair resolver.
 inline unsigned dense_min_rows_value(const char* raw) {

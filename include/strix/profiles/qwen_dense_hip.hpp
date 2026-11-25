@@ -36,28 +36,33 @@ inline constexpr sp::Lever table[] = {
     {.name = "wide_rows", .env = "", .option = "--wide", .value = {"", "64", "", ""}, .builtin = "engine default (64-row EXACT windows, IU4)",
      .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "64-row FAST wide windows (dense-q8a8-f16-v1)", .off = "16",
-     .source = "composite FAST gate (wide prefill rows > 16) pending"},
+     .source = "composite FAST gate (wide prefill rows > 16) pending", .identity = {{{"engine default (64-row EXACT windows, IU4)", "v1"}, {"64", "v1"}, {"16", "v1"}}}},
     {.name = "a4w4_layers", .env = "STRIX_DENSE_A4W4_LAYERS", .option = "", .value = {"", "48-63", "", ""},
      .builtin = "no A4W4 layer (STRIX_DENSE_A4W4=1: every layer, unqualified)", .kind = sp::Kind::bit_changing,
      .ready = {true, true, true, false}, .runnable = {true, true, true, false}, .target = "", .off = "none",
-     .source = "FAST gate v2 PASS, layers 48-63 (docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast)"},
+     .source = "FAST gate v2 PASS, layers 48-63 (docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast)", .identity = {{{"no A4W4 layer (STRIX_DENSE_A4W4=1: every layer, unqualified)", "v1"}, {"48-63", "v1"}, {"none", "v1"}}}},
     {.name = "prefill_rows", .env = "", .option = "--prefill-rows", .value = {"", "64", "", ""},
      .builtin = "engine default (64-row EXACT windows, IU4)",
      .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "64-row FAST wide windows (dense-q8a8-f16-v1)", .off = "16",
-     .source = "composite FAST gate (wide prefill rows > 16) pending"},
+     .source = "composite FAST gate (wide prefill rows > 16) pending", .identity = {{{"engine default (64-row EXACT windows, IU4)", "v1"}, {"64", "v1"}, {"16", "v1"}}}},
 };
 inline constexpr std::string_view kAllowEnv = "STRIX_QWEN35_HIP_PROFILE_ALLOW_PENDING";
 // FAST gate ledger (strix::profile::FastGate): the qualified fast cells and their receipts.
 inline constexpr sp::FastGate kFastGates[] = {
     {"a4w4_layers", "48-63", "docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast"},
 };
+// Ladder rows: incumbent grant of the qualified fast cell the resolver ran before the ladder rule.
+inline constexpr sp::LadderRow kLadderRows[] = {
+    sp::incumbent_cell("a4w4_layers", "48-63", sp::Name::fast,
+                       "FAST gate v2 PASS, layers 48-63 (docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast)", "v1"),
+};
 
 // One engine per app: each app owns only its own spelling of the window lever; both take the A4W4 layer table.
 inline sp::Engine engine(App app) {
     const std::span<const sp::Lever> rows(table);
     return {app == App::spec ? "qwen35-hip-spec" : "qwen35-hip-decode", kAllowEnv,
-            app == App::spec ? rows.subspan(1U, 2U) : rows.subspan(0U, 2U)};
+            app == App::spec ? rows.subspan(1U, 2U) : rows.subspan(0U, 2U), false, {}, {}, {}, kLadderRows};
 }
 
 struct Result {
@@ -67,9 +72,10 @@ struct Result {
 
 // Pure form (host-testable): args without argv[0]. The word and --allow-pending are consumed; the options the
 // profile applies are put in front, so the app's own parser sees the user's explicit option last.
-inline Result resolve_args(const sp::Engine& eng, std::vector<std::string> args, const sp::Lookup& env = {}) {
+inline Result resolve_args(const sp::Engine& eng, std::vector<std::string> args, const sp::Lookup& env = {}, const sp::Regime& regime = {}) {
     sp::Inputs in;
     in.env = env;
+    in.regime = regime;
     sp::take_options(eng, args, in);
     if (in.profile == sp::Name::turbo)
         throw std::invalid_argument(std::string(eng.tag) +
@@ -96,10 +102,12 @@ inline bool take(App app, int& argc, char**& argv) {
         return true;
     }
     sp::apply(result.resolution);
-    for (const auto& entry : result.resolution.entries)
+    for (const auto& entry : result.resolution.entries) {
+        if (!entry.ladder.empty()) std::fprintf(stderr, "%s\n", entry.ladder.c_str());
         if (entry.status == sp::Status::pending)
             std::fprintf(stderr, "profile %s: %s pending %s (%s runs)\n", sp::name(result.resolution.profile),
                          std::string(entry.lever->name).c_str(), entry.target.c_str(), entry.value.c_str());
+    }
     storage.assign(1U, argc > 0 ? argv[0] : "");
     storage.insert(storage.end(), result.args.begin(), result.args.end());
     pointers.clear();

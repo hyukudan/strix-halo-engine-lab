@@ -3,9 +3,35 @@
 set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
+source "$(dirname "${BASH_SOURCE[0]}")/gate-ticket.sh"
 rows=64
 vocabulary=200058
-weight_policy=inkling2-mini-attention-head-bf16-q8_0@1
+# Candidate weight arm: STRIX_INKLING_GATE_WEIGHTS = shared policy key (default the Q8_0 policy; low-bit mixes
+# weights.attention_head.q6_g64@1, weights.attention_q4_g64.head_q6_g64@1, weights.attention_head.q4_g64@1,
+# weights.head.q6_g64@1, weights.head.q4_g64@1),
+# STRIX_INKLING_GATE_TIER = fast (default) or turbo, STRIX_INKLING_GATE_STORAGE = the expected receipt storage text.
+# A low-bit candidate pins its calibrated pack: STRIX_LOWBIT_PACK = the pack file (required; every case of CAND and CANDF
+# must load that one file, its engine receipt must name a calibrated identity). "qual" writes OUT/qual-MODE.receipt:
+# the reducer source digest and command, the pack digest and the reducer output; a decision row cites that file.
+# STRIX_INKLING_GATE_ROUTE=row scores the admitted TURBO row with STRIX_INK_LOWBIT_TURBO=1 on a decode manifest
+# within its receipt caps. decode-arm (the low-bit default) uses --qualify-decode-weights to collect evidence on
+# BF16 prefill plus compact decode without a decision row. arm uses --qualify-weights (one image for all chunks).
+# Each candidate process must report its route and the full identity of the opened pack.
+weight_policy=${STRIX_INKLING_GATE_WEIGHTS:-weights.attention_head.q8_0@1}
+default_policy=weights.attention_head.q8_0@1  # the policy the BF16 arms resolve under (no qualification arm)
+legacy_policy=inkling2-mini-attention-head-bf16-q8_0@1
+cand_tier=${STRIX_INKLING_GATE_TIER:-fast}
+cand_storage=${STRIX_INKLING_GATE_STORAGE:-gguf.q8_0@1}
+case "$cand_tier" in fast|turbo) ;; *) echo "STRIX_INKLING_GATE_TIER must be fast or turbo" >&2; exit 2 ;; esac
+lowbit_candidate=0
+[[ $weight_policy == *q4_g64* || $weight_policy == *q6_g64* ]] && lowbit_candidate=1
+cand_route=${STRIX_INKLING_GATE_ROUTE:-$([[ $lowbit_candidate == 1 ]] && echo decode-arm || echo arm)}
+case "$cand_route" in
+    arm) ;;
+    row|decode-arm) [[ $lowbit_candidate == 1 ]] || { echo "$cand_route needs a low-bit candidate policy" >&2; exit 2; } ;;
+    *) echo "STRIX_INKLING_GATE_ROUTE must be row, decode-arm or arm" >&2; exit 2 ;;
+esac
+ticket_settings="tier=$cand_tier policy=$weight_policy storage=$cand_storage route=$cand_route"
 
 usage() {
     echo "usage: $0 arm BIN MODEL MANIFEST OUT REF|REF2|NULL|CAND|CANDF|NULLF prefill|decode [--case NAME ...] [ENGINE_ARGS...]" >&2
@@ -70,8 +96,8 @@ PY
 }
 
 check_outputs() {
-    local arm=$1 case_name dump storage=plain.bf16@1
-    case "$arm" in CAND|CANDF) storage=gguf.q8_0@1 ;; esac
+    local arm=$1 case_name dump storage=plain.bf16@1 policy=$default_policy
+    case "$arm" in CAND|CANDF) storage=$cand_storage policy=$weight_policy ;; esac
     shift
     for case_name in "$@"; do
         dump="$out/$case_name-$arm.f32"
@@ -80,7 +106,8 @@ check_outputs() {
         [[ -f "$out/$case_name-$arm.ids" && $(wc -l < "$out/$case_name-$arm.ids") == "$rows" ]] ||
             fail "missing or wrong-size ID dump: $case_name $arm"
         [[ -s "$out/log/$case_name.$arm.stderr" ]] || fail "missing route receipt for $case_name $arm"
-        grep -Fxq -- "strix-weight-load/v1 $weight_policy $storage" "$out/log/$case_name.$arm.stderr" ||
+        { grep -Fxq -- "strix-weight-load/v1 $policy $storage" "$out/log/$case_name.$arm.stderr" ||
+            grep -Fxq -- "strix-weight-load/v1 $legacy_policy $storage" "$out/log/$case_name.$arm.stderr"; } ||
             fail "missing effective $storage receipt for $case_name $arm"
         case "$arm" in
             NULL|NULLF)
@@ -98,8 +125,8 @@ check_outputs() {
 
 check_ticket() {
     local arm=$1
-    [[ -s "$out/$arm.ticket" ]] || fail "missing completed ticket: $arm"
-    [[ $(head -n 1 "$out/$arm.ticket") == "$mode $rows $inputs" ]] || fail "different gate inputs: $arm"
+    strix_gate_ticket_matches "$out/$arm.ticket" "$mode $rows $inputs $ticket_settings" ||
+        fail "different gate inputs, tier, policy, storage or route: $arm"
     cmp -s -- "$out/REF.ticket" "$out/$arm.ticket" || fail "different binary or checkpoint: $arm"
     shift
     if [[ -d "$out/tickets" ]]; then
@@ -153,7 +180,7 @@ case "$action" in
         weight_args=(--no-weight-q8)
         for option in "$@"; do
             case "$option" in
-                --case|--profile|--qualify-q8|--no-weight-q8|--gate-*) fail "the gate kit controls $option" ;;
+                --case|--profile|--qualify-q8|--qualify-weights|--qualify-decode-weights|--no-weight-q8|--gate-*) fail "the gate kit controls $option" ;;
             esac
         done
         case "$arm" in
@@ -161,22 +188,71 @@ case "$action" in
             CAND|NULL) export STRIX_MOE_ROUTES_IN="$out/routes/{case}.REF.rte" ;;
             *) usage ;;
         esac
-        case "$arm" in CAND|CANDF) tier=fast; weight_args=(--qualify-q8) ;; esac
+        case "$arm" in
+            CAND|CANDF)
+                tier=$cand_tier
+                case "$cand_route" in
+                    row)
+                        [[ $mode == decode && $tier == turbo && ${STRIX_INK_LOWBIT_TURBO:-0} == 1 ]] ||
+                            fail "row requires decode mode, the turbo tier and STRIX_INK_LOWBIT_TURBO=1"
+                        weight_args=()
+                        ;;
+                    decode-arm)
+                        [[ $mode == decode ]] || fail "decode-arm requires decode mode"
+                        weight_args=(--qualify-decode-weights "$weight_policy")
+                        ;;
+                    arm) weight_args=(--qualify-weights "$weight_policy") ;;
+                esac
+                ;;
+        esac
+        pack_line=
+        case "$arm" in
+            CAND|CANDF)
+                if [[ $lowbit_candidate == 1 ]]; then
+                    [[ -n ${STRIX_LOWBIT_PACK:-} && -f $STRIX_LOWBIT_PACK ]] ||
+                        fail "a low-bit candidate pins its calibrated pack: set STRIX_LOWBIT_PACK to the pack file"
+                    pack_line="pack $(sha256sum < "$STRIX_LOWBIT_PACK" | cut -d' ' -f1) route $cand_route"
+                fi
+                ;;
+            *) unset STRIX_LOWBIT_PACK ;;
+        esac
         case "$arm" in NULL|NULLF) weight_args+=(--gate-order-null) ;; esac
         binary_hash=$(sha256sum < "$binary")
         # Checkpoint identity for this same-machine kit without re-reading the weights.
         model_identity=$(stat -Lc '%d %i %s %y %n' -- "$model")
         engine_args_hash=$(printf '%s\0' "$@" | sha256sum)
-        ticket=$(printf '%s\n' "$mode $rows $inputs" "$binary_hash" "$model_identity" "$engine_args_hash")
+        ticket=$(printf '%s\n' "$mode $rows $inputs $ticket_settings" "$binary_hash" "$model_identity" "$engine_args_hash")
         if [[ $arm != REF ]]; then
             check_ticket REF "${selected[@]}"
         fi
         if [[ -e "$out/REF.ticket" ]]; then
             [[ $(< "$out/REF.ticket") == "$ticket" ]] || fail "use the reference binary, checkpoint and engine options"
         fi
+        # The engine's load receipts (one process for every selected case) are kept next to the per-case logs.
+        mkdir -p -- "$out/log"
+        process_log="$out/log/$arm.$(date +%s).$$.process.stderr"
+        status=0
         timeout "${STRIX_INKLING_GATE_TIMEOUT:-110s}" "$binary" "$model" "$@" --profile "$tier" "${weight_args[@]}" \
-            --gate-manifest "$capture_manifest" --gate-out "$out" --gate-arm "$arm" --gate-rows "$rows" --gate-mode "$mode"
+            --gate-manifest "$capture_manifest" --gate-out "$out" --gate-arm "$arm" --gate-rows "$rows" --gate-mode "$mode" \
+            2> "$process_log" || status=$?
+        cat -- "$process_log" >&2
+        (( status == 0 )) || exit "$status"
         check_outputs "$arm" "${selected[@]}"
+        if [[ -n $pack_line ]]; then
+            # The pack this process opened (full identity) and the route it admitted: the decision row keeps the BF16
+            # image for the prompt prefill and runs the low-bit copies in decode steps; the arm runs one image.
+            route_re='$'
+            [[ $cand_route != arm ]] && route_re=' image bf16\+lowbit decode widths 1,8,16 \(prefill bf16\)$'
+            opened=$(grep -E "^strix-lowbit-pack/v2 calibrated identity [0-9a-f]{64} matrices [0-9]+/[0-9]+$route_re" \
+                "$process_log" | sort -u)
+            [[ -n $opened && $(printf '%s\n' "$opened" | wc -l) == 1 ]] ||
+                fail "the candidate did not load its calibrated pack on the $cand_route route: $arm ${selected[*]}"
+            pack_line+=" identity $(printf '%s\n' "$opened" | cut -d' ' -f4)"
+            if [[ -e "$out/candidate.pack" ]]; then
+                [[ $(< "$out/candidate.pack") == "$pack_line" ]] || fail "every candidate case uses one pack and route"
+            fi
+            printf '%s\n' "$pack_line" > "$out/candidate.pack"
+        fi
         printf '%s\n' "$ticket" > "$out/$arm.ticket"
         if [[ -d "$out/tickets" ]]; then
             for case_name in "${selected[@]}"; do touch -- "$out/tickets/$arm-$case_name"; done
@@ -195,10 +271,17 @@ case "$action" in
             esac
         done
         reducer=(python3 "$repo/tools/strix-gate/gate_v2.py" qual "$out" --format head --manifest "$manifest"
-            --head-rows "$rows" --ref REF --null NULL --cand CAND --cand-free CANDF --null-free NULLF "$@")
-        "${reducer[@]}" --classes "$(dirname "$manifest")/classes.json" --json "$out/gate-$mode.json"
+            --head-rows "$rows" --ref REF --null NULL --cand CAND --cand-free CANDF --null-free NULLF --tier "$cand_tier" "$@")
+        receipt="$out/qual-$mode.receipt"
+        {
+            echo "strix-gate-qual/v1 mode $mode tier $cand_tier policy $weight_policy storage $cand_storage route $cand_route inputs $inputs"
+            echo "reducer $(sha256sum < "$repo/tools/strix-gate/gate_v2.py" | cut -d' ' -f1) ${reducer[*]}"
+            if [[ -f "$out/candidate.pack" ]]; then cat -- "$out/candidate.pack"; else echo "pack none"; fi
+        } > "$receipt"
+        "${reducer[@]}" --classes "$(dirname "$manifest")/classes.json" --json "$out/gate-$mode.json" | tee -a -- "$receipt"
         if [[ -f "$(dirname "$manifest")/bands.json" ]]; then
-            "${reducer[@]}" --classes "$(dirname "$manifest")/bands.json" --json "$out/gate-$mode-bands.json"
+            "${reducer[@]}" --classes "$(dirname "$manifest")/bands.json" --json "$out/gate-$mode-bands.json" |
+                tee -a -- "$receipt"
         fi
         ;;
     --expect-identical)

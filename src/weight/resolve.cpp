@@ -27,13 +27,21 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
     const bool compact = policy.target != kBf16WeightStorage || policy.head_target() != kBf16WeightStorage;
     const bool runnable = !policy.id.name.empty() && policy.id.revision && compact && consumed(policy.target) &&
         consumed(policy.head_target());
-    // One image serves every listed regime: a full row in some regime selects it, and every regime needs a gate row.
+    // TURBO inherits the actual FAST image. The current policy has one alternative storage per role class,
+    // so when FAST already chose it there is no further storage change to qualify.
+    auto lower = plan;
+    if (request.tier == profile::Name::turbo) {
+        auto fast = request;
+        fast.tier = profile::Name::fast;
+        fast.allow_pending = false;
+        lower = resolve_weight_load(registry, policy, fast, decisions);
+        if (lower.storage == policy.target && lower.head_storage == policy.head_target()) return lower;
+    }
+    // A fixed image must be faster in every regime that will consume it.
     const std::string_view single[] = {request.scope.regime};
     const auto regimes = request.regimes.empty() ? std::span<const std::string_view>(single) : request.regimes;
     const WeightLoadDecision* decision = nullptr;
     bool missing = false;
-    // A row without a gate v2 PASS is a TURBO row (measured gain, stated quality): only the TURBO tier finds it.
-    const bool turbo = request.tier == profile::Name::turbo;
     if (regimes.size() > plan.regimes.size()) {
         plan.status = profile::Status::pending;
         plan.reason = "more regimes than a weight load plan records";
@@ -45,15 +53,14 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
         if (!runnable) continue;
         auto scope = request.scope;
         scope.regime = regime;
-        entry.row = find_weight_load_gate(policy, scope, decisions, request.extent, &entry.outside_band, turbo);
+        match_weight_load_evidence(policy, scope, decisions, request, lower.storage, entry);
         if (!entry.row) {
             missing = true;
             continue;
         }
-        const bool gain = !(entry.row->measured_gain == Digest256{});
-        entry.gain_outside_lanes = gain && !weight_load_gain_covers_lanes(entry.row->evidence, request.extent.lanes);
-        const bool full = gain && !entry.gain_outside_lanes;
+        const bool full = entry.faster;
         entry.qualification = full ? RegimeQualification::full : RegimeQualification::gate_only;
+        if (!full) missing = true;  // a gate-only regime would run the lossy image with no measured gain
         if (full && !decision) decision = entry.row;
     }
     const WeightLoadDecision* turbo_row = nullptr;
@@ -68,10 +75,9 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
     plan.status = profile::admit_column(decision != nullptr, runnable, request.allow_pending);
     if (plan.status == profile::Status::pending) {
         plan.reason = !runnable ? "shared format consumer unavailable"
-            : missing && regimes.size() > 1U ? "a regime of the image has no matching gate v2 PASS row"
-            : missing ? "no matching gate v2 PASS and measured gain"
             : turbo_without_gain ? "TURBO image requires a measured gain in every regime"
-            : "gate v2 PASS without a measured gain in any regime";
+            : regimes.size() > 1U ? "a regime of the image has no qualifying row with a measured ladder gain"
+            : "no matching qualifying row with a measured ladder gain";
         return plan;
     }
     plan.storage = policy.target;
@@ -132,11 +138,19 @@ std::string weight_load_regime_receipt(const WeightLoadPlan& plan) {
             out += entry.row->evidence.receipt;
         }
         if (entry.row && entry.gain_outside_lanes) {
-            out += ":gain-lanes<=";
-            out += std::to_string(entry.row->evidence.max_lanes);
+            const auto& evidence = entry.row->evidence;
+            if (evidence.min_lanes == 1U && evidence.max_lanes != 0U) {
+                out += ":gain-lanes<=" + std::to_string(evidence.max_lanes);
+            } else {
+                out += ":gain-lanes=" + std::to_string(evidence.min_lanes) + ".." +
+                       (evidence.max_lanes ? std::to_string(evidence.max_lanes) : "*");
+            }
         } else if (!entry.row && entry.outside_band) {
-            out += ":outside-band<=";
-            out += std::to_string(entry.outside_band->evidence.max_context);
+            const auto& evidence = entry.outside_band->evidence;
+            out += ":outside-band context=" + std::to_string(evidence.min_context) + ".." +
+                   (evidence.max_context ? std::to_string(evidence.max_context) : "*") +
+                   " lanes=" + std::to_string(evidence.min_lanes) + ".." +
+                   (evidence.max_lanes ? std::to_string(evidence.max_lanes) : "*");
         }
     }
     return out;

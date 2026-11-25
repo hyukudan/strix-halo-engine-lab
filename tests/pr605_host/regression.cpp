@@ -1,4 +1,5 @@
 #include "deepseek41_quality_arms.hpp"
+#include "strix/ds41_prefill_precision.hpp"
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -8,9 +9,85 @@ using strix::deepseek41::PrefillOptions;
 using strix::deepseek41::PrefillResult;
 namespace quality = strix::deepseek41::quality;
 #include "replay_host.hpp"
+#include "iu4_host.hpp"
 
 static void require(bool ok, const char* message) {
     if (!ok) throw std::runtime_error(message);
+}
+
+static void set_env(const char* key, const char* value) {
+#ifdef _WIN32
+    require(_putenv_s(key, value ? value : "") == 0, "set IU4 environment");
+#else
+    require((value ? setenv(key, value, 1) : unsetenv(key)) == 0, "set IU4 environment");
+#endif
+}
+
+static void resident_iu4_arms() {
+    struct Arm { const char* label; bool i4; bool relaxed; bool relaxed_f16; const char* profile; };
+    const Arm arms[] = {
+        {"exact", false, false, false, "exact"},
+        {"n_l0_s1", false, false, false, "exact"},
+        {"fast3", false, true, false, "fast-prefill"},
+        {"m16_sh_eng_fast3", false, true, true, "fast-prefill"},
+        {"i4_m16_sh_eng_fast3", true, false, false, "diagnostic"},
+        {"m16_i4_fast3", true, false, false, "diagnostic"},
+        {"fast3", false, true, false, "fast-prefill"},
+        {"exact", false, false, false, "exact"},
+    };
+    for (const char* inherited : {"1", static_cast<const char*>(nullptr)}) {
+        set_env("STRIX_DS41_FAST_I4", inherited);
+        PrefillOptions loaded;
+        require(resolve_iu4(loaded) == (inherited != nullptr), "ordinary options must retain IU4 inheritance");
+        for (const auto& arm : arms) {
+            const auto precision = quality::arm_precision(arm.label);
+            apply_iu4(loaded, precision);
+            if (resolve_iu4(loaded) != arm.i4 || loaded.fast_moe != arm.relaxed || loaded.fast_moe_f16 != arm.relaxed_f16)
+                throw std::runtime_error(std::string("wrong resident routed-expert dispatch: ") + arm.label +
+                                         " with inherited IU4 " + (inherited ? inherited : "unset"));
+            require(quality::arm_profile(precision) == arm.profile, "receipt must name the executed arm profile");
+        }
+        require(strix::ds41::fast_i4() == (inherited != nullptr), "resident arms must leave the process setting alone");
+    }
+    PrefillOptions unresolved_iu4;
+    unresolved_iu4.decoder_replay_override = true;
+    require(quality::arm_profile(unresolved_iu4) == "diagnostic", "inherited IU4 cannot attest exact");
+}
+
+static void resident_iu4_scope() {
+    using strix::ds41::fast_profile::MoeI4Scope;
+    struct Peer {
+        struct Tag { std::uint32_t kind, layer; std::uint64_t request; };
+        MoeI4Scope local_scope, peer_scope;
+        bool exchanged = false;
+        void exchange_host(std::span<const std::byte> local, std::span<std::byte> remote, const Tag& tag) {
+            require(tag.kind == 4U, "IU4 agreement must be a control frame");
+            require(local.size() == 1 && remote.size() == 1 && local[0] == static_cast<std::byte>(local_scope),
+                    "both ranks must send the same shape and their effective scope");
+            remote[0] = static_cast<std::byte>(peer_scope);
+            exchanged = true;
+        }
+    };
+    const auto exact = quality::arm_precision("exact");
+    const auto candidate = quality::arm_precision("i4_fast3");
+    const auto check_scope = [&](const char* setting, MoeI4Scope local, MoeI4Scope remote, bool reject) {
+        set_env("STRIX_DS41_FAST_I4_SCOPE", setting);
+        Peer peer{local, remote};
+        quality::verify_i4_scope(exact, peer, 4U);
+        require(!peer.exchanged, "controls must not use the candidate scope or wire exchange");
+        bool refused = false;
+        try { quality::verify_i4_scope(candidate, peer, 4U); }
+        catch (const std::invalid_argument&) { refused = true; }
+        require(peer.exchanged && refused == reject, "candidate scope must be validated after both ranks exchange");
+    };
+    check_scope(nullptr, MoeI4Scope::all, MoeI4Scope::all, false);
+    check_scope("all", MoeI4Scope::all, MoeI4Scope::all, false);
+    check_scope("gu", MoeI4Scope::gate_up, MoeI4Scope::gate_up, false);
+    check_scope("all", MoeI4Scope::all, MoeI4Scope::gate_up, true);
+    check_scope("gu", MoeI4Scope::gate_up, MoeI4Scope::all, true);
+    check_scope("bogus", MoeI4Scope::invalid, MoeI4Scope::all, true);
+    check_scope("all", MoeI4Scope::all, MoeI4Scope::invalid, true);
+    require(strix::ds41::fast_profile::moe_i4_scope("") == MoeI4Scope::invalid, "empty scope remains invalid");
 }
 
 static void replay_reference() {
@@ -82,8 +159,9 @@ static void manifest_positions() {
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 2) throw std::runtime_error("expected replay or model");
+        if (argc != 2) throw std::runtime_error("expected replay, iu4 or model");
         if (std::string_view(argv[1]) == "replay") { replay_reference(); manifest_positions(); }
+        else if (std::string_view(argv[1]) == "iu4") { resident_iu4_arms(); resident_iu4_scope(); }
         else if (std::string_view(argv[1]) == "model") model_content();
         else throw std::runtime_error("unknown test");
         return 0;

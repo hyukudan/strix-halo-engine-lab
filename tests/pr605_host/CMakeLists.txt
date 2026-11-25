@@ -7,7 +7,8 @@ get_filename_component(ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 include("${ROOT}/cmake/StrixCpuIsa.cmake")
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/extract.py" "${ROOT}/src/hip_deepseek41_prefill.hip")
+    "${CMAKE_CURRENT_SOURCE_DIR}/extract.py" "${ROOT}/src/hip_deepseek41_prefill.hip"
+    "${ROOT}/src/hip_ds41_prefill.hip")
 execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract.py"
     "${ROOT}" "${CMAKE_CURRENT_BINARY_DIR}" COMMAND_ERROR_IS_FATAL ANY)
 add_executable(pr605-host regression.cpp "${ROOT}/src/model_content_hash.cpp"
@@ -22,6 +23,7 @@ else()
     target_compile_options(pr605-host PRIVATE -Wall -Wextra -Wpedantic -Werror)
 endif()
 add_test(NAME pr605-replay-reference COMMAND pr605-host replay)
+add_test(NAME ds41-resident-iu4-arms COMMAND pr605-host iu4)
 add_test(NAME pr605-model-content COMMAND pr605-host model)
 
 add_executable(pr605-prefill "${ROOT}/tests/ds41_prefill_tests.cpp" "${ROOT}/src/ds41_prefill.cpp")

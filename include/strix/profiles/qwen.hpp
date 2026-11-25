@@ -60,9 +60,14 @@ struct Resolution {
     std::string cache_namespace() const {
         return is_turbo() ? ::strix::profile::turbo::cache_namespace(kTurboVersion, fingerprint(), weights.identity()) : std::string();
     }
-    const Entry* find(std::string_view key) const {
+    const Entry* find(std::string_view key) const & {
         for (const auto& entry : entries) if (entry.lever->name == key) return &entry;
         return nullptr;
+    }
+    // A temporary resolution can return an owned entry, never a borrowed pointer.
+    std::optional<Entry> find(std::string_view key) const && {
+        if (const auto* entry = find(key)) return *entry;
+        return std::nullopt;
     }
     std::string qualification() const {
         std::string provisional, unqualified;
@@ -80,6 +85,7 @@ struct Resolution {
         std::vector<std::string> out;
         if (profile == Name::quality) out.emplace_back("quality: no quality rows for this model, using default");
         if (!weights.honoured()) out.push_back("profile turbo: " + weights.describe().substr(0, weights.describe().size() - 1U));
+        for (const auto& entry : entries) if (entry.ladder_lowered) out.push_back(entry.ladder);
         for (const auto& entry : entries) if (entry.status == Status::provisional)
             out.push_back(std::string("profile ") + name(profile) + ": " + std::string(entry.lever->name) +
                 " is bit-changing; qualification in progress");
@@ -103,6 +109,7 @@ struct Resolution {
             row.set("switch", serve::Json(std::string(lever.env.empty() ? lever.option : lever.env)));
             row.set("kind", serve::Json(kind_name(lever.kind)));
             row.set("source", serve::Json(std::string(lever.source)));
+            if (!entry.ladder.empty()) row.set("ladder", serve::Json(entry.ladder));
             if (!entry.reason.empty()) row.set("reason", serve::Json(entry.reason));
             rows.set(std::string(lever.name), std::move(row));
             if (entry.status == Status::pending) {
@@ -147,6 +154,8 @@ struct Inputs {
     // the rows that qualify fast cells per regime (the HIP engine passes fast_regimes; empty: table flags only).
     std::uint64_t max_prompt_tokens = 0;
     std::span<const ::strix::profile::RegimeGate> regimes{};
+    ::strix::profile::Regime regime{};
+    std::span<const ::strix::profile::LadderRow> ladder{};
 };
 // CUDA engine (sm_120): onfly 4-bit = NVFP4 images of the dense Q8_0 roles (src/cuda/qwen_prefill_driver.cu
 // convert_onfly, shared core strix/cuda/core/nvfp4_a8.hpp); converted packs need the owner's OK (pending).
@@ -164,32 +173,48 @@ inline std::string marker_key(const Lever& lever) { return "STRIX_QWEN_PROFILE_O
 inline std::string marker(Name profile, Status status, std::string_view value) {
     return std::string(name(profile)) + ":" + status_name(status) + ":" + std::string(value);
 }
-inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<const Lever> rows = levers()) {
+// `registered`: the ladder rows of `rows` (timing receipts and incumbent grants), always read; inputs.ladder adds rows.
+inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<const Lever> rows = levers(),
+                          std::span<const ::strix::profile::LadderRow> registered = ladder_rows) {
     Resolution out{profile, {}, {}, {}};
+    std::vector<::strix::profile::LadderRow> ladder(inputs.ladder.begin(), inputs.ladder.end());
+    ladder.insert(ladder.end(), registered.begin(), registered.end());
     const char* allow = environment(inputs.env, "STRIX_QWEN_PROFILE_ALLOW_PENDING");
     const bool allow_pending = inputs.allow_pending || (allow && std::string_view(allow) == "1");
     const bool preset = ::strix::profile::model_preset();
     out.weights = ::strix::profile::turbo::resolve_weights(out.is_turbo(), inputs.weights,
         [&inputs](const char* key) { return environment(inputs.env, key); }, inputs.caps ? *inputs.caps : kWeightCaps);
+    const auto admit_of = [&](const Lever& lever, unsigned c) {
+        const bool qualified = c == static_cast<unsigned>(Name::fast) &&
+            ::strix::profile::regime_gate(inputs.regimes, lever.name, lever.value[c], inputs.max_prompt_tokens);
+        return ::strix::profile::admit_profile_column(
+            lever.ready[c] || qualified, lever.runnable[c], allow_pending,
+            lever.provisional[c] && !qualified, preset);
+    };
+    // An env value this profile exported itself (marker) is inherited, not explicit.
+    const auto inherited_env = [&](const Lever& lever, const char* env) {
+        bool inherited = false;
+        const char* owned = environment(inputs.env, marker_key(lever));
+        for (const auto status : {Status::set, Status::unqualified, Status::provisional})
+            inherited |= owned && std::string_view(owned) == marker(profile, status, env);
+        return inherited;
+    };
+    const auto arms = ::strix::profile::ladder_arms(rows, std::span<const ::strix::profile::LadderRow>(ladder),
+        inputs.regime, admit_of, [&](const Lever& lever) -> std::optional<std::string_view> {
+            if (const auto* cli = ::strix::profile::last_setting(inputs.cli, lever.name)) return std::string_view(*cli);
+            const char* env = lever.env.empty() ? nullptr : environment(inputs.env, std::string(lever.env));
+            if (env && !inherited_env(lever, env)) return env;
+            return std::nullopt;
+        }, allow_pending);
     for (const auto& lever : rows) {
         const auto column = ::strix::profile::value_column(lever, profile);  // empty turbo cell: the fast cell
         const std::string* cli = nullptr;
         for (const auto& [key, value] : inputs.cli) if (key == lever.name) cli = &value;
         const char* env = lever.env.empty() ? nullptr : environment(inputs.env, std::string(lever.env));
         const auto wanted = lever.value[column];
-        // A fast cell inside a qualified regime reads as ready (not provisional); elsewhere the table's flags.
-        const bool regime = column == static_cast<unsigned>(Name::fast) &&
-            ::strix::profile::regime_gate(inputs.regimes, lever.name, wanted, inputs.max_prompt_tokens) != nullptr;
-        const bool cell_ready = lever.ready[column] || regime;
-        const bool cell_provisional = lever.provisional[column] && !regime;
-        const auto admission = ::strix::profile::admit_profile_column(
-            cell_ready, lever.runnable[column], allow_pending, cell_provisional, preset);
-        bool inherited = false;
-        if (env && !cli && !wanted.empty() && std::string_view(env) == wanted) {
-            const char* owned = environment(inputs.env, marker_key(lever));
-            inherited = owned && std::string_view(owned) == marker(profile, admission, env) &&
-                (admission != Status::pending);
-        }
+        const auto admit = [&](unsigned c) { return admit_of(lever, c); };
+        const auto admission = admit(column);
+        const bool inherited = env && !cli && inherited_env(lever, env);
         Entry entry{&lever, std::string(lever.builtin), Status::builtin, {}, false, {}, std::string(wanted)};
         if (cli || (env && !inherited)) {
             entry.cli_override = cli != nullptr;
@@ -211,6 +236,8 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
             entry.status = admission;
             if (entry.status == Status::set && wanted == lever.builtin) entry.status = Status::builtin;
         }
+        if (!cli && (!env || inherited))
+            ::strix::profile::apply_ladder(entry, ladder, profile, inputs.regime, admit, allow_pending, arms);
         out.entries.push_back(std::move(entry));
     }
     return out;
@@ -229,7 +256,8 @@ inline bool erase_environment(const char* key) {
 // switches whose matching marker proves profile ownership; explicit env wins.
 inline void withdraw_declined(const Resolution& resolution, const Lookup& get = {}, const Erase& erase = erase_environment) {
     for (const auto& entry : resolution.entries) {
-        if (entry.status != Status::pending || entry.reason.empty() || entry.lever->env.empty()) continue;
+        if (::strix::profile::applied(entry.status) || entry.cli_override || entry.lever->env.empty() ||
+            (entry.status != Status::pending && entry.status != Status::builtin)) continue;
         const auto key = std::string(entry.lever->env), owned_key = marker_key(*entry.lever);
         const char* value = environment(get, key);
         const char* owned = environment(get, owned_key);

@@ -865,12 +865,12 @@ struct Engine::Impl {
     // experts, shared) in the FP32 identity of src/minimax/rtxpf (FP32 activations, one fmaf chain per output), which the
     // RTX PRO prefill service reproduces bit for bit. Decode steps are unchanged.
     bool fp32_prefill = false;
-    bool model_fast_i4 = false;   // STRIX_MMX_MODEL_FORMAT=fast_i4
+    bool model_fast_i4 = false;   // transient IU4 policy from defaults::prefill_policy
     bool i4_shadow = false;      // STRIX_MMX_FAST_I4_SHADOW (measurement only)
     float* i4_shadow_outputs = nullptr;  // two max_rows x kHidden buffers: exact and fakeq
     float* i4_shadow_sums = nullptr;     // two pairs of {squared error, exact energy}
     fast_i4::Scope i4_scope = fast_i4::Scope::all;
-    strix::core::LayerSet i4_exl3_layers;  // STRIX_MMX_FAST_I4_EXL3_LAYERS: MoE layers that keep the EXL3 operator
+    strix::core::LayerSet iu4_layers;     // resolved absolute trunk layers that use transient IU4
     unsigned i4_a8 = 0;                    // STRIX_MMX_FAST_I4_A8: bit 0 gate/up input, bit 1 down input as two A4 planes
     strix::core::LayerSet i4_a8_layers;    // STRIX_MMX_FAST_I4_A8_LAYERS: the layers it applies to (unset: all MoE layers)
     bool pf_i4_chain = mmoe::prefill_i4_chain(); // per prompt: prefill_begin sets it from the prompt rows
@@ -1037,11 +1037,6 @@ struct Engine::Impl {
         if (fp32_prefill && (!linears_loaded || !moe_opt)) throw std::invalid_argument("STRIX_MM_PREFILL_IDENTITY=fp32 needs STRIX_MM_LINEARS and STRIX_MM_MOE on");
         // FAST_I4 is opt-in and lossy: EXL3 stays resident, with per-layer conversion into two
         // reusable IU4 buffers during prefill. Decode, including MTP, always reads EXL3.
-        if (const char* mf = std::getenv("STRIX_MMX_MODEL_FORMAT"); mf != nullptr && *mf != '\0') {
-            const std::string m(mf);
-            if (m == "fast_i4") model_fast_i4 = true;
-            else if (m != "exl3") throw std::invalid_argument("STRIX_MMX_MODEL_FORMAT must be exl3 or fast_i4");
-        }
         i4_shadow = env_flag("STRIX_MMX_FAST_I4_SHADOW", false);
         // FAST identity (lossy): 1 = one-term BF16 operands, 2 = two-term (hi + lo) queries and probabilities, 0 = the
         // exact in-block kernel (default: opt-in, also with the FAST_I4 format, whose INT4 layers amplify the change
@@ -1051,6 +1046,8 @@ struct Engine::Impl {
         // identity and the rank agreement; STRIX_MM_FAST_PREFILL=1 selects mode 1 unless the format is fast_i4.
         {
             const auto policy = defaults::prefill_policy(strix::envcfg::text);
+            model_fast_i4 = policy.fast_i4;
+            iu4_layers = policy.iu4_layers;
             // Keep the selection for runtime rework controls; dispatch applies the same guards.
             pf_msa_flash = policy.msa_flash_requested;
             pf_msa_flash_asked = policy.msa_flash_asked;
@@ -1082,11 +1079,6 @@ struct Engine::Impl {
             else if (!mmoe::iu4_built()) why = "needs a build with the IU4 core (strix_tiled_core)";
             if (why != nullptr) throw std::invalid_argument(std::string("STRIX_MMX_MODEL_FORMAT=fast_i4 ") + why);
             i4_scope = fast_i4::scope(std::getenv("STRIX_MMX_FAST_I4_SCOPE"));
-            {
-                const char* keep = std::getenv("STRIX_MMX_FAST_I4_EXL3_LAYERS");
-                i4_exl3_layers = strix::core::parse_layer_set(keep == nullptr || keep[0] == 0 ? fast_i4::kQualityExl3Layers : keep,
-                                                              kFirstMoe, kLayers, "STRIX_MMX_FAST_I4_EXL3_LAYERS");
-            }
             {
                 const char* a8 = std::getenv("STRIX_MMX_FAST_I4_A8");
                 const std::string_view s = a8 == nullptr ? "" : a8;
@@ -1303,16 +1295,17 @@ struct Engine::Impl {
                     jit.size(), static_cast<double>(jit.size() * pk) / 1073741824.0, jit.size() * pk,
                     static_cast<double>((kLayers - kFirstMoe) * mmoe::i4_source_bytes()) / 1048576.0,
                     static_cast<double>(pf_ws_bytes) / 1073741824.0,
-                    i4_scope == fast_i4::Scope::all ? "all" : "gate_up", jit_prefetch ? 1U : 0U, i4_exl3_layers.count(), i4_min_rows,
+                    i4_scope == fast_i4::Scope::all ? "all" : "gate_up", jit_prefetch ? 1U : 0U,
+                    kLayers - kFirstMoe - iu4_layers.count(), i4_min_rows,
                     static_cast<std::size_t>(opt.capacity), static_cast<std::size_t>(opt.slots));
         std::fflush(stdout);
     }
-    bool i4_jit_layer(unsigned L) const { return model_fast_i4 && L >= kFirstMoe && L < kLayers && !i4_exl3_layers.test(L); }
+    bool i4_jit_layer(unsigned L) const { return model_fast_i4 && iu4_layers.test(L); }
     // Shared route receipt (strix/route_receipt.hpp): why a MoE layer's prefill runs IU4 or keeps the EXL3 operator.
     strix::route::Reason route_i4_reason(unsigned L, bool i4) const {
         using R = strix::route::Reason;
         return i4 ? R::selected : !model_fast_i4 || !mmoe::prefill_iu4() ? R::disabled : !task.i4.on ? R::short_call :
-               i4_exl3_layers.test(L) ? R::layer_mask : R::no_match;
+               !i4_jit_layer(L) ? R::layer_mask : R::no_match;
     }
     void route_levers() const {
         namespace rr = strix::route;
@@ -1323,6 +1316,7 @@ struct Engine::Impl {
         rr::numerical_variant("minimax.moe_prefill_order", order_asked ? order_asked : "default",
                               invariant ? "invariant" : "adaptive", "adaptive");
         const char* asked = strix::envcfg::text("STRIX_MMX_MODEL_FORMAT");
+        if (asked == nullptr || *asked == 0) asked = strix::envcfg::text("STRIX_MM_IU4_LAYERS");
         // Use the same resolved policies as the dispatch sites (including the IU4 override).
         const bool iu4 = model_fast_i4 && mmoe::prefill_iu4();
         const auto mask = [](const auto& layers, unsigned first) {
@@ -1333,7 +1327,8 @@ struct Engine::Impl {
         std::string effective = "exl3";
         if (iu4) {
             effective = std::string("iu4:") + (i4_scope == fast_i4::Scope::all ? "all" : "gate_up") + ":min_rows=" + std::to_string(i4_min_rows) +
-                        ":a8=" + std::to_string(i4_a8) + ":exl3_layers=" + mask(i4_exl3_layers, kFirstMoe);
+                        ":a8=" + std::to_string(i4_a8) + ":exl3_layers=";
+            for (unsigned L = kFirstMoe; L < kLayers; ++L) effective += iu4_layers.test(L) ? '0' : '1';
             if (i4_a8) effective += ":a8_layers=" + mask(i4_a8_layers, kFirstMoe);
         }
         rr::lever("minimax.moe_prefill_format", asked != nullptr && *asked != 0 ? asked : "default", effective,
@@ -1414,7 +1409,7 @@ struct Engine::Impl {
     }
     void jit_begin() { jit_collect(); jit_schedule.begin(); }
     const mmoe::I4Layer* jit_acquire(unsigned L, unsigned end) {
-        const unsigned s = jit_schedule.acquire(L, end, jit_prefetch,
+        const unsigned s = jit_schedule.acquire(L, end, jit_prefetch && i4_jit_layer(L + 1U),
             [&](unsigned slot, unsigned layer, bool side) {
                 auto& j = jit[slot];
                 hipStream_t stream = side ? jit_stream : nullptr;

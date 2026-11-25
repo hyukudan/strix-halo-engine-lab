@@ -239,6 +239,7 @@ int main(int argc,char** argv) try {
                 if(!gate_dir.empty() && rank==0)write_witnesses(gate_dir,gate_arms,rank,gate_binary,gate_model);
                 return 0;
             }
+            strix::deepseek41::quality::verify_i4_scope(precision,comm,strix::dist::TagKind::control);
             prefill.set_precision_for_new_sequence(precision);
             if(!gate_dir.empty()){
                 if(n<192)throw std::runtime_error("gate mode: prompts of at least 192 tokens");

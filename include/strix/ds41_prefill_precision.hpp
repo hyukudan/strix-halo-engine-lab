@@ -14,6 +14,7 @@ struct PrefillPrecision {
     bool fast_dense = false;  // ds41-dense-f16-v1
     bool fast_moe = false;    // ds41-moe-relaxed-v1
     bool fast_moe_f16 = false;  // ds41-moe-f16wmma-v1 (with fast_moe: the relaxed kernels' FP16-operand form)
+    int fast_i4 = -1;  // -1: legacy environment/fixture; 0/1: this dispatch
 };
 
 namespace prefill_precision_detail {

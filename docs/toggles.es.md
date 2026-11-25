@@ -49,11 +49,13 @@ el resolvedor compartido para ambas CLI: `fast` enciende cada palanca solo en el
 | `--decode-attn8 on` | pendiente en ambas CLI (sin régimen cualificado: gate a 8K / 28K / 64K sin ejecutar). Atención de decode / verify en tensor cores e4m3 sobre la sombra e4m3 del K/V, identidad `-d8`; las filas de verify dan los mismos bits que el decode de una fila; en la CLI spec cubre también las ventanas de prefill. `--decode-attn8 on` explícito lo ejecuta en cualquier régimen | `--decode-attn8 off` |
 
 La CLI spec hace el prefill con ventanas de decode, así que allí solo se ofrecen `split_k` y `decode_attn8`.
-GLM rank acepta `--profile default|fast|quality` (también `--profile=NAME`); `--profile` sin valor sigue activando
-los tiempos de kernels y se puede combinar con un perfil con nombre. En GLM, `fast` solo activa `STRIX_GLM_PF_WMMA=1`;
-un valor explícito del entorno prevalece y `--baseline` / `STRIX_GLM_BASELINE=1` veta la adición del perfil.
-`quality` usa los ajustes por defecto y lo avisa. Ambos ranks deben acordar el valor efectivo de WMMA;
-siguen vigentes las guardas de arranque existentes.
+GLM rank acepta `--profile exact|fast|quality|turbo` (también `--profile=NAME` y `default` como alias de `exact`).
+`--profile` sin valor sigue activando los tiempos de kernels y se puede combinar con un perfil con nombre. En GLM,
+`fast` no selecciona ninguna palanca de prefill. `turbo` selecciona el ajuste existente `STRIX_GLM_PF_WMMA=1`, que
+también activa WMMA en MLA, KDA y atención fusionada si sus propios interruptores están vacíos o sin definir.
+Los valores explícitos prevalecen y `--baseline` / `STRIX_GLM_BASELINE=1` veta la adición del perfil. `quality` usa
+los ajustes por defecto y lo avisa. Ambos rangos deben acordar los valores efectivos de WMMA. Siguen vigentes
+las guardas de arranque existentes.
 
 Véanse los [perfiles Qwen](optimizations.md#qwen-product-profiles),
 [perfiles del par DeepSeek](optimizations.md#product-profiles-pair) y la [fila FAST de GLM](optimizations.md#glm-pf-wmma-x).
@@ -69,7 +71,7 @@ FAST cambia la numérica. Úsalo cuando el rendimiento importe más que una sali
 | `STRIX_DS41_FAST_ATTN=2` | deepseek | off | Opcional. Atención dispersa BF16 de una pasada sobre el núcleo flash compartido (`ds41-attn-bf16flash-v1`; `1` = la forma f16 WMMA anterior, más lenta que exacto). Puerta sola (1,280 filas): KL 0.0108, top-1 97.2 %, dNLL +0.0120: pasa el límite relativo al suelo +0.0155, falla el límite fijo de dNLL 0.01. |
 | `STRIX_DS41_FAST_DENSE=1` | deepseek | off | Opcional. Productos densos Q8_0 x A8 (q_b, o_a, o_b; llamadas de al menos `STRIX_DS41_FAST_DENSE_MIN_ROWS`, por defecto 128) en una cadena FP16 WMMA sobre el núcleo denso compartido, política `dense-q8a8-f16-v1`. Puerta sola (1,280 filas): KL 0.0100, top-1 98.1 %, dNLL +0.0146: pasa el límite relativo al suelo +0.0155, falla el límite fijo de dNLL 0.01. |
 | `STRIX_F16_Q8A8_WPACK=0` | compartido (lo enlaza DeepSeek) | on | Decodificación de pesos de la política `dense-q8a8-f16-v1`: on = dos pesos Q8_0 por operación FP16 empaquetada (perm, resta y producto empaquetados); `0` = un producto FP32 por peso, la forma anterior. Mismos bits (las 65.536 escalas x 256 códigos por el stager y todas las formas DS41); denso DS41 rango 0 a 11,6K entre -1,2 % (trozos de 1.024 filas) y -3,3 % (cola de 680). Kit: `ds41/dense-forms` (docs/benchmarking.md). |
-| `STRIX_GLM_PF_WMMA=1` | glm | off (on con `--profile fast` en rank) | Prefill WMMA. Identidad FAST opcional; `=0` la desactiva incluso en `fast`. |
+| `STRIX_GLM_PF_WMMA=1` | glm | activo con `--profile turbo`, inactivo en los demás perfiles | Prefill WMMA. `=1` lo activa explícitamente y `=0` desactiva el interruptor general incluso en `turbo`. |
 
 ## La regla de régimen
 
@@ -193,6 +195,7 @@ llegar el núcleo en mosaico compartido (`src/core`), con los mismos bits.
 | `STRIX_GLM_PF_SCORE_SEQ=1`, `STRIX_GLM_PF_SCORE_BLOCK=<1..8>` | glm | off, `1` | Arnés de calidad (`STRIX_GLM_PF_SCORE_LAST`): un fichero de puntuación por llamada de prefill y filas por llamada de la cabeza. Solo medición. |
 | `STRIX_GLM_PF_STREAMS=1` | glm | off | Un solo stream de cómputo para el prefill seqpar TP2. Mismos bits; no fue más rápido en las primeras muestras. |
 | `STRIX_MMX_MODEL_FORMAT=fast_i4` | minimax | `exl3` | Prefill borrador con pérdida: cada capa MoE se convierte a INT4 durante el prefill en dos buffers reutilizables (+3,6 GiB); el decode sigue en EXL3. Ver [prefill agrupado de MiniMax](minimax-grouped-prefill.md#draft-fast_i4). |
+| `STRIX_MM_IU4_LAYERS` | minimax | sin fijar | Capas MoE absolutas para prefill IU4 temporal, por ejemplo `38-59`. Esta selección prevalece sobre `STRIX_MMX_FAST_I4_EXL3_LAYERS`. `none` desactiva IU4. Un `STRIX_MMX_MODEL_FORMAT=exl3` explícito tiene prioridad. |
 | `STRIX_DS41_PREFILL_LEASE=1`, `STRIX_DS41_ENGRAM_DEVICE_READY=1`, `STRIX_DS41_SEED_EARLY=1` | deepseek | off | Opciones de estructura del prefill (intercambio con lease, Engram listo por capa, semilla temprana del draft). Mismos bits; sin ganancia medida todavía. |
 
 ### Solo depuración
@@ -296,7 +299,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_GLM_PF_SEQPAR` | glm | auto | [glm-pf-seqpar](optimizations.md#glm-pf-seqpar) |
 | `STRIX_GLM_PF_STAGED` | glm | 1 | [glm-pf-staged](optimizations.md#glm-pf-staged) |
 | `STRIX_GLM_PF_SUMEXP` | glm | 1, 1 | [glm-pf-sumexp](optimizations.md#glm-pf-sumexp) |
-| `STRIX_GLM_PF_WMMA` | glm | off (opt-in FAST identity) | [glm-pf-wmma-x](optimizations.md#glm-pf-wmma-x) |
+| `STRIX_GLM_PF_WMMA` | glm | activo con `--profile turbo`, inactivo en los demás perfiles | [glm-pf-wmma-x](optimizations.md#glm-pf-wmma-x) |
 | `STRIX_GLM_PF_WMMA_LIVE_FRAG` | glm | 1 | [glm-pf-wmma-live-fragments](optimizations.md#glm-pf-wmma-live-fragments) |
 | `STRIX_GLM_PF_WMMA_SHARED128` | glm | 1 | [glm-pf-wmma-shared128](optimizations.md#glm-pf-wmma-shared128) |
 | `STRIX_HY4_PF_STORE_EPILOGUE` | hy4 | on | [hy4-pf-store-epilogue](optimizations.md#hy4-pf-store-epilogue) |

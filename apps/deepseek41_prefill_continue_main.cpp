@@ -94,7 +94,9 @@ int main(int argc, char** argv) try {
                 return 0;
             }
             if (label.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_") != std::string::npos) throw std::runtime_error("arm label");
-            pre.set_precision_for_new_sequence(strix::deepseek41::quality::arm_precision(label));
+            const auto precision = strix::deepseek41::quality::arm_precision(label);
+            strix::deepseek41::quality::verify_i4_scope(precision, comm, strix::dist::TagKind::control);
+            pre.set_precision_for_new_sequence(precision);
             const auto res = pre.run(r.ids);
             auto state = pre.export_state();
             state.tokens = r.ids;

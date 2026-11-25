@@ -1,5 +1,6 @@
 #pragma once
 
+#include "inkling2_mini_calibration.hpp"
 #include "inkling2_mini_dspark_taps.hpp"
 #include "inkling2_mini_messages.hpp"
 #include "inkling2_mini_state.hpp"
@@ -204,6 +205,7 @@ private:
             residual_read(hidden_, "attn_res.output_query", 1);
             backend_.norm(MiniConstRows(readout_[0]), "norm.weight", output);
             capture_draft_tap(kLogicalVisits, output);
+            capture_calibration(MiniCalibrationInput::head, 0U, MiniConstRows(output));
         }
 
         void save_core_entry() {
@@ -249,6 +251,13 @@ private:
             }
             const MiniConstRows query = attention_input_[0], key = attention_input_[separate ? 1U : 0U],
                                 value = attention_input_[separate ? 2U : 0U];
+            if (separate) {
+                capture_calibration(MiniCalibrationInput::query, physical, query);
+                capture_calibration(MiniCalibrationInput::key, physical, key);
+                capture_calibration(MiniCalibrationInput::value, physical, value);
+            } else {
+                capture_calibration(MiniCalibrationInput::query, physical, query, true);
+            }
             if constexpr (Batched) backend_.attention_batch(visit, visit_groups_, query, key, value, operator_output_);
             else backend_.attention(visit, chunk_, query, key, value, visit_state_, operator_output_);
             convolve(visit, MiniConvolutionStream::attention, operator_output_, residual_);
@@ -269,6 +278,26 @@ private:
         }
 
     private:
+        // Calibration statistics (backend set_calibration_moments): eager single-sequence chunks only. `shared`: the
+        // query rows also feed the key and value projections (one input image), added to all three inputs.
+        void capture_calibration(MiniCalibrationInput input, unsigned physical, MiniConstRows rows, bool shared = false) {
+            if constexpr (!Batched && requires { backend_.calibration_moments(); }) {
+                auto* moments = backend_.calibration_moments();
+                if (!moments) return;
+                std::array<weight::calib::InputMoments*, 3> targets{
+                    &mini_calibration_input(*moments, input, physical), nullptr, nullptr};
+                std::size_t count = 1U;
+                if (shared) {
+                    targets[1] = &mini_calibration_input(*moments, MiniCalibrationInput::key, physical);
+                    targets[2] = &mini_calibration_input(*moments, MiniCalibrationInput::value, physical);
+                    count = 3U;
+                }
+                backend_.capture_calibration(rows.data(), chunk_.rows, std::span(targets).first(count));
+            } else {
+                (void)input, (void)physical, (void)rows, (void)shared;
+            }
+        }
+
         void capture_draft_tap(unsigned visit, MiniConstRows source) {
             if constexpr (requires { backend_.store_draft_tap(source, taps_); }) {
                 if (taps_.empty()) return;
@@ -303,6 +332,8 @@ private:
                 }
             } else {
                 backend_.convolve(visit, stream, input, visit_state_.history[path], output);
+                // A taped (staged verify) chunk keeps every input row of the stream for its partial commit.
+                if (const auto tape = visit_state_.tape[path]; !tape.empty()) backend_.copy(input, tape);
             }
         }
 

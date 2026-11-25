@@ -69,7 +69,8 @@ inline ExchangeFormatChoice resolve_exchange_format(const char* raw, bool fast_p
 inline constexpr profile::Lever exchange_format_lever() {
     return {"tp2_exchange_fmt", kExchangeFormatEnv, "", {"", "", "", ""}, "f32", profile::Kind::bit_changing,
             {true, false, true, false}, {true, true, true, false}, "", "f32",
-            "TP2 prefill exchange element format: f32 exact; f16 FAST only (rounded partials, fixed rank-order sum)", false, {}, true};
+            "TP2 prefill exchange element format: f32 exact; f16 FAST only (rounded partials, fixed rank-order sum)", false, {}, true,
+            {}, {{{"f32", "v1"}, {"f16", "v1"}}}};
 }
 
 // One receipt line per prefill: format, messages, bytes per message, and the mean wire ms per message of the

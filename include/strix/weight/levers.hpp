@@ -1,6 +1,7 @@
 #pragma once
 #include "registry.hpp"
 #include "resolve.hpp"
+#include <strix/device/cost_identity.hpp>
 #include <strix/engine_profile.hpp>
 #include <strix/lever.hpp>
 
@@ -121,9 +122,18 @@ static_assert(valid_weight_load_policies());
 // `checkpoint` is the raw SHA-256 of the checkpoint content the gate and timing receipts ran on.
 struct WeightLoadScope {
     Backend backend;
-    std::string_view device_class, compiler_id, regime;
+    std::string_view device_class, compiler_id, regime;  // device_class: device_class_key below
     Digest256 build, checkpoint;
 };
+
+// Device class of a weight-load scope and of the decision rows measured on it: the shared cost-device identity
+// (strix/device/cost_identity.hpp: architecture, product name, compute units, memory, clock, runtime and driver
+// versions), the same key the persisted cost tables use. Two products that report the same architecture and resource
+// counts but a different name or clock limit never share a receipt. The HIP and CUDA queries
+// (device/hip_cost_identity.hpp, device/cuda_cost_identity.hpp) fill the facts of the current device.
+[[nodiscard]] inline std::string device_class_key(const device::CostDeviceFacts& facts) {
+    return device::cost_device_identity(facts);
+}
 
 // Regimes a decision row is qualified for (WeightLoadScope::regime): the gate v2 regime of its quality receipt.
 // Prompt rows of a prefill chunk are the prefill regime; one-row steps (and their verify rows) the decode regime.
@@ -133,36 +143,44 @@ inline constexpr std::string_view kDecodeRegime = "decode";
 // Where a row's evidence lives. `receipt` is a stable repository-relative id of the gate report (or receipt set),
 // `date` its ISO date, `rows` the scored rows of the regime. `max_context` is the largest context the gate covered
 // when it was banded by context (0: not banded); a banded row applies only to an engine whose resident context is
-// known and inside the band. `max_lanes` is the largest number of concurrent decode lanes (sequences one step serves)
-// the measured gain covers when the gain was banded by lanes (0: not banded): outside that band the row keeps its gate
-// v2 PASS (it admits its regime) but its gain does not select the image. Quality does not depend on the lane count
-// only when every lane keeps its one-row arithmetic in the consumers; the gate receipt is what states that.
+// known and inside the band. A decode lane band limits the measured gain; a lane miss keeps the gate PASS.
+// The gain must cover the whole resident extent and beat the lower tier by more than its stated noise.
 // max_rows bounds the active step rows for an image that also keeps the incumbent resident.
 // A zero row bound is unlimited.
 struct WeightLoadEvidence {
     std::string_view receipt, date;
-    std::uint32_t rows = 0, max_context = 0, max_lanes = 0, max_rows = 0;
+    std::uint32_t rows = 0, max_context = 0, max_lanes = 0;
+    double speedup = 0.0, noise = 0.0;
+    std::uint32_t min_context = 1, min_lanes = 1;
+    profile::Name tier = profile::Name::fast;
+    FormatId reference = kBf16WeightStorage;
+    std::uint32_t max_rows = 0;
 };
 
 // What an instance holds when it resolves its image: resident context capacity in tokens and concurrent decode lanes
-// (serial CLI: 1; server: its slot cap). 0 = unknown: context-banded rows then never apply and lane-banded gains
-// never select.
+// (serial CLI: 1; server: its slot cap). 0 = unknown: context-banded rows then never apply, and no measured gain
+// selects storage (point and extent lookups alike, unbounded bands included).
 struct WeightLoadExtent {
     std::uint32_t context = 0, lanes = 0;
 };
 
 // A measured gain with this evidence applies to `lanes` concurrent decode lanes (no lane band: always).
 [[nodiscard]] constexpr bool weight_load_gain_covers_lanes(const WeightLoadEvidence& evidence, std::uint32_t lanes) {
-    return evidence.max_lanes == 0U || (lanes != 0U && lanes <= evidence.max_lanes);
+    if (evidence.min_lanes == 0U) return false;
+    return (evidence.min_lanes == 1U && evidence.max_lanes == 0U) ||
+           (lanes != 0U && lanes >= evidence.min_lanes && (evidence.max_lanes == 0U || lanes <= evidence.max_lanes));
 }
 
 // The context band of this evidence holds `context` (no band: always; a band never holds an unknown context).
 [[nodiscard]] constexpr bool weight_load_context_in_band(const WeightLoadEvidence& evidence, std::uint32_t context) {
-    return evidence.max_context == 0U || (context != 0U && context <= evidence.max_context);
+    if (evidence.min_context == 0U) return false;
+    return (evidence.min_context == 1U && evidence.max_context == 0U) ||
+           (context != 0U && context >= evidence.min_context && (evidence.max_context == 0U || context <= evidence.max_context));
 }
 
 // A row with a zero measured_gain records a gate v2 PASS without a speed gain in its regime: it never selects the
-// storage by itself, but admits its regime onto an image another regime's full row selects (see WeightLoadRequest).
+// storage, and under the ladder rule it does not admit its regime onto the policy image either (the regime would run
+// lossy weights with no measured gain); it is reported as gate-only.
 // A row with a gate v2 PASS qualifies FAST and TURBO. A row without one (zero gate_v2_pass) qualifies TURBO only, and
 // only with a measured gain and its measured quality against BF16 stated in `turbo_quality` (receipt text such as
 // 'kl=... top1=... dnll=... flip_ratio=... receipt=...'); FAST never takes it.
@@ -190,10 +208,12 @@ struct WeightLoadRequest {
     bool enabled = true;
     bool allow_pending = false;  // Explicit, stamped qualification-arm opt-in.
     // Every regime that runs on the one resident image (empty: scope.regime alone). The image takes the policy storage
-    // only when some regime has a full row (gate v2 PASS and measured gain) and every listed regime has a gate v2 PASS
-    // row: a regime the gate did not pass would need a second resident image, which this resolver never selects.
+    // only when every listed regime has a full row (gate v2 PASS and a measured ladder gain): a regime without one would
+    // run lossy weights slower than (or no faster than) the tier below. An engine that keeps a second image asks each
+    // regime alone and routes per regime.
     std::span<const std::string_view> regimes{};
-    WeightLoadExtent extent{};  // resident context and decode lanes of the instance (bands of the rows)
+    WeightLoadExtent extent{};
+    WeightLoadExtent first{};  // lower endpoint of the resident image; 0 uses the corresponding extent value
 };
 
 // Resolved storage of the two tagged role classes (the output head, every other tagged role). One FormatId converts to
@@ -217,8 +237,9 @@ struct RegimeWeightLoad {
     std::string_view regime;
     RegimeQualification qualification = RegimeQualification::none;
     const WeightLoadDecision* row = nullptr;          // matched row (nullptr: none)
-    const WeightLoadDecision* outside_band = nullptr;  // a row of this regime whose context band misses the request
-    bool gain_outside_lanes = false;  // the matched row has a measured gain whose lane band misses the request
+    const WeightLoadDecision* outside_band = nullptr;  // a row whose quality context band misses
+    bool gain_outside_lanes = false;  // the matched row's timing lane band misses
+    bool faster = false;  // a covering gain with no conflicting timing row
 };
 
 inline constexpr std::size_t kMaxWeightLoadRegimes = 4;
@@ -270,7 +291,7 @@ struct WeightLoadPlan {
 
 // A gate v2 PASS row with measured gain inside both bands for the given extent. Its receipts must come from the
 // same consumer implementation identity, checkpoint, backend, device, compiler and regime. The default extent
-// leaves context and lanes unknown, so only unbanded gains can select.
+// leaves context and lanes unknown, so no gain selects (the extent lookup's known-endpoint rule).
 const WeightLoadDecision* find_weight_load_decision(Id, const WeightLoadScope&,
                                                   std::span<const WeightLoadDecision>, WeightLoadExtent extent = {});
 // As above, also matching rows recorded under the policy's legacy id.
@@ -283,6 +304,10 @@ const WeightLoadDecision* find_weight_load_decision(const WeightLoadPolicy&, con
 const WeightLoadDecision* find_weight_load_gate(const WeightLoadPolicy&, const WeightLoadScope&,
                                                 std::span<const WeightLoadDecision>, WeightLoadExtent extent,
                                                 const WeightLoadDecision** outside_band = nullptr, bool turbo = false);
+// Resolve ladder evidence using the same policy and scope match as the point lookups.
+void match_weight_load_evidence(const WeightLoadPolicy&, const WeightLoadScope&,
+                                std::span<const WeightLoadDecision>, const WeightLoadRequest&,
+                                FormatId reference, RegimeWeightLoad&);
 WeightLoadPlan resolve_weight_load(const Registry&, const WeightLoadPolicy&,
                                    const WeightLoadRequest&, std::span<const WeightLoadDecision>);
 

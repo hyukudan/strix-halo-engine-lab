@@ -10,7 +10,7 @@ inline constexpr profile::Lever kBlockDraftLever{
     kBlockDraftLeverName, "STRIX_BLOCK_DRAFTER", "--block-drafter", {"", "", "", ""}, "off",
     profile::Kind::exact, {}, {}, "", "off",
     "host reference only; native verify identity, model fidelity and complete workload receipts pending",
-    false, {}, true};
+    false, {}, true, {}, {{{"off", "v1"}}}};
 struct BlockDraftSelection {
     std::string drafter;
     std::uint32_t block{};

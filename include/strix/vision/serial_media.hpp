@@ -31,6 +31,7 @@ struct SerialMediaSpec {
     std::string placeholder;                   // template text of the image token (one id)
     std::uint32_t lm_width = 0;
     unsigned axes = 0;                         // 0: the LM position of a row is its prompt index
+    std::shared_ptr<const weight::Source> shard_source;  // already-open shard, when part of a confined asset set
 };
 
 class SerialMedia final : public serve::SerialMediaInput {
@@ -42,7 +43,9 @@ public:
         if (!adapter_ || !make_backend) throw std::invalid_argument("serial media: adapter and backend are required");
         const weight::TensorSchema schema{weight::Container::safetensors, spec_.schema_version, spec_.tensors,
                                           spec_.ignored_prefix};
-        if (const auto status = lookup_.open_safetensors(spec_.shard, schema); !status)
+        const auto status = spec_.shard_source ? lookup_.open_safetensors(std::move(spec_.shard_source), schema)
+                                                : lookup_.open_safetensors(spec_.shard, schema);
+        if (!status)
             throw std::runtime_error("serial media: tower tensors: " + status.detail);
         adapter_->bind(source_, weights_);
         backend_ = make_backend(adapter_->config(), weights_);
