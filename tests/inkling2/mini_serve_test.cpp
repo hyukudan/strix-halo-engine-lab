@@ -432,6 +432,14 @@ void profile_parity() {
     std::cout << "inkling2-mini-profile-parity: ok\n";
 }
 
+// The native column the registry preset forwards for a served --profile (models/inkling2-mini.toml [presets.*]).
+strix::profile::Name served_native_tier(std::string_view tier_name) {
+    namespace presets = strix::model_data::inkling2_mini::presets;
+    return strix::profile::parse(tier_name == "exact" ? presets::exact::levers
+                                 : tier_name == "fast" ? presets::fast::levers
+                                                       : presets::turbo::levers);
+}
+
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
             W4a4 w4a4 = W4a4::bf16, std::string_view tier_name = "fast", bool image = false, bool round_fold = false,
             bool cli_route = false, ServedShape shape = {}, bool controller_one_plane = false) {
@@ -505,11 +513,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         // The served tier is the registry preset's native column for the requested --profile (models/inkling2-mini.toml:
         // TURBO keeps the FAST column until this model has a qualified TURBO set), resolved by the native command line's
         // resolver with the same lever classes.
-        namespace presets = strix::model_data::inkling2_mini::presets;
-        const auto column = tier_name == "exact" ? presets::exact::levers
-                            : tier_name == "fast" ? presets::fast::levers
-                                                  : presets::turbo::levers;
-        const auto native = strix::profile::parse(column);
+        const auto native = served_native_tier(tier_name);
         mini::MiniWeightOptions cli_weights;
         cli_weights.tier.profile = native;
         cli_weights.qualify_q8 = qualify_q8;
@@ -644,7 +648,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             const auto effective = sv::parse_json(capabilities.body);
             const auto* profile = effective.find("profile");
             const auto* weights = effective.find("weight_load");
-            require(capabilities.status == 200 && profile && profile->as_string() == tier_name && weights &&
+            require(capabilities.status == 200 && profile && profile->as_string() == mini::mini_profile_name(served_native_tier(tier_name)) && weights &&
                     (tier_name != "fast" ||  // the FAST plan; the other tiers carry their own weight plan
                      (weights->find("storage")->as_string() == (qualify_q8 ? "gguf.q8_0" : "plain.bf16") &&
                       weights->find("status")->as_string() == (qualify_q8 ? "unqualified" : "pending"))),

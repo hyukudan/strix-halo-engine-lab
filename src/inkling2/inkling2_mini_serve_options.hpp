@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace strix::inkling2 {
@@ -53,12 +54,17 @@ inline unsigned mini_serve_lane_rows(const MiniServeOptions& opt) noexcept {
     return opt.lane_rows ? opt.lane_rows : kMiniServeLaneRows;
 }
 
-// The served_route field of the startup and capability lines: off, declined (requested, the backend does not run it)
+// The served_route field of the startup and inspection lines: off, declined (requested, the backend does not run it)
 // or on, which states its qualification (the lever row is not qualified in any profile column) and its route.
-inline std::string mini_served_route_startup_field(const MiniServeOptions& opt) {
+// `effective_tail`: the tail capacity the constructed decoder admitted (startup line); without a decoder (inspection)
+// the field states the offered capacity as prefill_tail_offered.
+inline std::string mini_served_route_startup_field(const MiniServeOptions& opt,
+                                                   std::optional<unsigned> effective_tail = std::nullopt) {
     if (!opt.served_cli_route) return mini_down_image_name(false, opt.served_route_requested);
     return "on qualification unqualified moe_decode " + std::string(mini_decode_form_name(kMiniPackedDecodeDefault)) +
-           " prefill_chunk " + std::to_string(opt.prefill_rows) + " prefill_tail " + std::to_string(opt.prefill_tail) +
+           " prefill_chunk " + std::to_string(opt.prefill_rows) +
+           (effective_tail ? " prefill_tail " + std::to_string(*effective_tail)
+                           : " prefill_tail_offered " + std::to_string(opt.prefill_tail)) +
            " first_id prefill";
 }
 

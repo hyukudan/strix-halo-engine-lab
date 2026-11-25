@@ -8,6 +8,7 @@
 
 #include "inkling2/inkling2_mini_resident_decoder.hpp"
 #include "strix/serve/cohort_decode.hpp"
+#include "strix/serve/fixed_kv_cohort.hpp"
 #include "strix/serve/prompt_piece.hpp"
 
 #include <algorithm>
@@ -103,53 +104,102 @@ inline void print_digest(std::string_view route, unsigned width, unsigned step, 
     std::cout << line << '\n';
 }
 
-// The serving construction (make_mini_device_cohort, inkling2_mini_serve_device.hpp) for the backend's admission of
-// the served route lever: with it the command line's decode form and packed cohort passes; without it (lever off, or a
-// backend that declines it) the incumbent served decoder (grouped decode).
+// The serving construction (make_mini_device_cohort, inkling2_mini_serve_device.hpp) for an ADMITTED served route: with
+// it the command line's decode form and packed cohort passes; without it (lever off, or a backend that declines it: the
+// caller passes the production admission, mini_served_prefill_emits_first) the incumbent served decoder (grouped decode).
 inline std::unique_ptr<MiniResidentDecoder> served_decoder(const char* checkpoint, unsigned context, unsigned chunk,
                                                            weight::FormatId storage, unsigned lanes, unsigned tail,
-                                                           bool served_route) {
-    return served_route
+                                                           bool admitted) {
+    return admitted
         ? std::make_unique<MiniResidentDecoder>(checkpoint, context, chunk, kMiniPackedDecodeDefault,
-              MiniResidentBackend::default_step_graphs, storage, 0U, false, lanes, tail, true)
+              MiniResidentBackend::default_step_graphs, storage, 0U, false, lanes, tail, false, false, true)
         : std::make_unique<MiniResidentDecoder>(checkpoint, context, chunk, false,
               MiniResidentBackend::default_step_graphs, storage, 0U, false, lanes);
 }
 
-inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool served_route) {
-    const auto owned = served_decoder(checkpoint, kCohortContext, kCohortChunk, storage, kCohortSlots, 0U, served_route);
+using MiniFixedCohort = serve::FixedKvCohort<MiniResidentDecoder>;
+
+// One lane's prompt through the production adapter, as the server ingests it: emits-first prefills the whole prompt
+// and takes the first id from its final row; the incumbent route prefills all but the last prompt token, which the
+// first generated step feeds (decoded with the cohort).
+inline void ingest_prompt(MiniFixedCohort& cohort, unsigned slot) {
+    const auto prompt = cohort_prompt(slot);
+    const auto tokens = cohort.prefill_emits_first() ? std::span<const unsigned>(prompt)
+                                                     : std::span<const unsigned>(prompt).first(prompt.size() - 1U);
+    cohort.prefill(slot, tokens, true);
+}
+
+// The id a lane feeds at generated step `step` (step 0 = the first generated id: on the incumbent route that step
+// decodes the held-back prompt token).
+inline unsigned step_token(bool emits_first, unsigned slot, unsigned step) {
+    return emits_first ? cohort_token(slot, kPromptRows[slot] + step) : cohort_token(slot, kPromptRows[slot] - 1U + step);
+}
+
+inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool requested, bool admitted) {
+    auto owned = served_decoder(checkpoint, kCohortContext, kCohortChunk, storage, kCohortSlots, 0U, admitted);
     auto& decoder = *owned;
-    const bool packed_decode = decoder.prefill_emits_first();  // the admitted served route runs packed
-    std::cout << "ROUTE served_route " << (packed_decode ? "on" : served_route ? "declined" : "off") << " moe_decode "
-              << mini_decode_form_name(packed_decode) << " slots " << kCohortSlots << '\n';
-    decoder.allocate_slots(kCohortSlots);
+    MiniFixedCohort cohort(std::move(owned), kCohortContext, kCohortSlots, kCohortSlots);
+    const bool emits_first = cohort.prefill_emits_first();
+    const bool packed_decode = decoder.packed_decode();
+    std::cout << "ROUTE served_route " << (admitted ? "on" : requested ? "declined" : "off") << " prompt "
+              << (emits_first ? "emits-first" : "held-back") << " moe_decode " << mini_decode_form_name(packed_decode)
+              << " slots " << kCohortSlots << '\n';
+    // The forms the server runs: admitted = the command line's route (emits-first, packed); otherwise the incumbent.
+    if (emits_first != admitted || packed_decode != admitted)
+        throw std::logic_error("served decoder runs a form its admission did not select");
     const std::size_t vocab = kOutputVocabulary;
     std::vector<std::uint16_t> row;
-    std::vector<float> history, scores(vocab);
+    std::vector<float> history;
     Fnv64 all;
+    std::vector<serve::CohortGroup> groups;
+    std::vector<std::uint32_t> keep, ids, top;
 
-    // Reference: every slot's sequence stepped alone through slot 0 (the lone-lane decode route).
+    // Generated step `step` of the given lanes through the adapter: step 0 of an emits-first lane is its prefill's
+    // first id (prefill_top + its final row); every other step is one verify window of one row per lane + commit.
+    // Calls `seen(r, top, logits)` per lane row before the commit.
+    const auto run_step = [&](std::span<const unsigned> slots, unsigned step, auto&& seen) {
+        if (step == 0U && emits_first) {
+            for (unsigned r = 0; r < slots.size(); ++r) {
+                ingest_prompt(cohort, slots[r]);
+                const auto first = cohort.prefill_top(slots[r]);
+                seen(r, first, cohort.read_final_logits(slots[r]));
+            }
+            return;
+        }
+        if (step == 0U)
+            for (const auto slot : slots) ingest_prompt(cohort, slot);
+        groups.clear();
+        ids.resize(slots.size());
+        top.resize(slots.size());
+        for (unsigned r = 0; r < slots.size(); ++r) {
+            groups.push_back({slots[r], 1U});
+            ids[r] = step_token(emits_first, slots[r], step);
+        }
+        cohort.verify(groups, ids, top);
+        for (unsigned r = 0; r < slots.size(); ++r) seen(r, top[r], cohort.read_final_logits(slots[r]));
+        keep.assign(slots.size(), 1U);
+        cohort.commit(keep);
+    };
+
+    // Reference: every slot's sequence alone (the lone-lane route), the first generated id included.
     std::vector<float> lone_logits(std::size_t{kCohortSlots} * kCohortSteps * vocab);
     std::array<std::array<LaneStep, kCohortSteps>, kCohortSlots> lone{};
     for (unsigned slot = 0; slot < kCohortSlots; ++slot) {
-        const auto prompt = cohort_prompt(slot);
-        (void)decoder.prefill_slot_first(0U, prompt, true);
-        for (unsigned step = 0; step < kCohortSteps; ++step) {
-            const std::array<unsigned, 1> slots{0U};
-            const std::array<unsigned, 1> ids{cohort_token(slot, kPromptRows[slot] + step)};
-            std::array<unsigned, 1> top{};
-            decoder.decode_slots(slots, ids, top);
-            const auto out = std::span(lone_logits).subspan((std::size_t{slot} * kCohortSteps + step) * vocab, vocab);
-            decoder.read_slot_logits(0U, out);
-            auto& s = lone[slot][step];
-            s.top = top[0];
-            Fnv64 h;
-            h.add(out.data(), out.size_bytes());
-            s.logits = h.value;
-            digest_state(decoder, 0U, s, row, history);
-            if (s.position != kPromptRows[slot] + step) throw std::logic_error("lone lane position");
-            print_digest("lone", 1U, step, slot, s, all);
-        }
+        const std::array<unsigned, 1> one{slot};
+        for (unsigned step = 0; step < kCohortSteps; ++step)
+            run_step(one, step, [&](unsigned, unsigned pick, std::span<const float> logits) {
+                const auto out = std::span(lone_logits).subspan((std::size_t{slot} * kCohortSteps + step) * vocab, vocab);
+                if (logits.size() != out.size()) throw std::logic_error("lone lane logit width");
+                std::memcpy(out.data(), logits.data(), out.size_bytes());
+                auto& s = lone[slot][step];
+                s.top = pick;
+                Fnv64 h;
+                h.add(out.data(), out.size_bytes());
+                s.logits = h.value;
+                digest_state(decoder, slot, s, row, history);
+                if (s.position != kPromptRows[slot] + step) throw std::logic_error("lone lane position");
+                print_digest("lone", 1U, step, slot, s, all);
+            });
     }
 
     unsigned failures = 0;
@@ -159,50 +209,49 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool s
     };
     for (const auto width : kCohortWidths) {
         // Lane row r is slot (r + 1) % width: lane 0 of the cohort is not slot 0.
-        std::vector<unsigned> slots(width), ids(width), top(width);
+        std::vector<unsigned> slots(width);
         for (unsigned r = 0; r < width; ++r) slots[r] = (r + 1U) % width;
-        for (const auto slot : slots) (void)decoder.prefill_slot_first(slot, cohort_prompt(slot), true);
-        for (unsigned step = 0; step < kCohortSteps; ++step) {
-            for (unsigned r = 0; r < width; ++r) ids[r] = cohort_token(slots[r], kPromptRows[slots[r]] + step);
-            decoder.decode_slots(slots, ids, top);
-            for (unsigned r = 0; r < width; ++r) {
+        for (unsigned step = 0; step < kCohortSteps; ++step)
+            run_step(slots, step, [&](unsigned r, unsigned pick, std::span<const float> scores) {
                 const auto slot = slots[r];
-                decoder.read_slot_logits(r, scores);
                 LaneStep s;
-                s.top = top[r];
+                s.top = pick;
                 Fnv64 h;
-                h.add(scores.data(), scores.size() * sizeof(float));
+                h.add(scores.data(), scores.size_bytes());
                 s.logits = h.value;
                 digest_state(decoder, slot, s, row, history);
                 print_digest("lanes", width, step, slot, s, all);
                 const auto expected = std::span(lone_logits).subspan((std::size_t{slot} * kCohortSteps + step) * vocab, vocab);
                 // The incumbent served decoder (grouped, the whole cohort in one forward) keeps the lone bits up to the
                 // verify rows (each row on the decode arithmetic) and makes no lane contract past them: those rows are
-                // printed as UNCHECKED; their identity with the base build is the base/head digest comparison.
+                // printed as UNCHECKED; their identity with the base build is the served base/head identity ticket
+                // (complete ids + raw logits of the real server at 9 lanes), not this fixture.
                 if (!packed_decode && width > kMiniMaxVerifyRows) {
                     std::cout << "UNCHECKED w=" << width << " step=" << step << " slot=" << slot << '\n';
-                    continue;
+                    return;
                 }
-                if (std::memcmp(scores.data(), expected.data(), expected.size_bytes()) != 0) fail(width, step, slot, "logits");
+                if (scores.size() != expected.size() ||
+                    std::memcmp(scores.data(), expected.data(), expected.size_bytes()) != 0)
+                    fail(width, step, slot, "logits");
                 if (s.top != lone[slot][step].top) fail(width, step, slot, "top");
                 if (s.position != lone[slot][step].position) fail(width, step, slot, "position");
                 if (s.kv != lone[slot][step].kv) fail(width, step, slot, "kv rows");
                 if (s.history != lone[slot][step].history) fail(width, step, slot, "histories");
-            }
-        }
+            });
 #if !defined(__HIPCC__)
         // The program width the policy resolves for these lanes (STRIX_COHORT_WIDTHS=classes: 3 lanes replay the width-4
-        // program, 9 lanes the width-16 one); readiness and a declined capture are read at that width.
+        // program, 9 lanes the width-16 one); readiness, a declined capture and a COMPLETED replay are read at that width.
+        // A width whose class cannot round up inside the slot capacity (exec::cohort_width_class: 17 lanes with classes
+        // and capacity 17) resolves no program and runs eagerly: a valid outcome, not a miss.
         const auto graph_width = decoder.cohort_programs().width(width, kCohortSlots);
         const bool program = graph_width != 0U && decoder.cohort_graphs().policy().ready(graph_width) &&
                              !decoder.cohort_graphs().policy().failed(graph_width);
+        const bool replayed = graph_width != 0U && decoder.cohort_replay_completed(graph_width);
         std::cout << "COHORT w=" << width << " graph_width=" << graph_width
-                  << " program=" << (program ? "ready" : "eager") << '\n';
-        // A width whose class cannot round up inside the slot capacity (exec::cohort_width_class: 17 lanes with classes
-        // and capacity 17) runs eagerly: that is a valid outcome, not a miss. Both decode forms run the width programs.
-        const bool expect_program = graph_width != 0U;
-        if (expect_program && !program) fail(width, 0U, 0U, "no cohort program at this width");
-        if (!expect_program && program) fail(width, 0U, 0U, "cohort program at a width that must run eagerly");
+                  << " program=" << (program ? "ready" : graph_width != 0U ? "declined" : "eager")
+                  << " replay=" << (replayed ? "complete" : "none") << '\n';
+        if (graph_width != 0U && !program) fail(width, 0U, 0U, "no cohort program at this width");
+        if (graph_width != 0U && !replayed) fail(width, 0U, 0U, "the cohort program never completed a replay");
 #endif
     }
     char line[64];
@@ -214,22 +263,25 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool s
     }
     std::cout << "PASS Inkling Mini cohort lanes == lone (" << mini_decode_form_name(packed_decode)
               << (packed_decode ? ", widths 2 3 4 8 9 16 17, " : ", widths 2 3 4 8 (9 16 17 digests only), ") << kCohortSteps
-              << " steps, logits + KV rows + histories bitwise)\n";
+              << " steps from the first id through the serving adapter, logits + KV rows + histories bitwise)\n";
     return 0;
 }
 
-// Served prefill == the command line's prefill (--served-prefill). One decoder in the served construction (chunk =
-// the command line's, tail capacity, two lanes). For each prompt length around the chunk, tail and key-split edges:
-//   cli    : prefill() of slot 0 (the single-session call of the command line), host logits = the full head;
+// Served prefill call forms (--served-prefill), lever ON. One decoder in the served construction (chunk = the command
+// line's, tail capacity, two lanes). For each prompt length around the chunk, tail and key-split edges:
+//   single : prefill() of slot 0 (the single-session call form) on THIS construction, host logits = the full head;
 //   served : prefill_slot_first() of the whole prompt as the cohort issues it with no other lane decoding (regions of
 //            prompt_slice_rows with the decoder's tail capacity), the first id from it, scores read_slot_logits(0);
 //   pieces : the same prompt in the cohort's pieces beside a decoding lane (prompt_piece_rows inside each chunk of a
 //            region, prefill_call_chunk_rows / prefill_piece_rule), one decode step of lane 1 between pieces;
 //   repeat : served again (two identical served requests).
 // First id, raw final scores (memcmp), the K/V rows of every committed position and the histories after the prompt, then four decode
-// steps (ids, scores, last K/V rows, histories) must be equal across the four arms. The command line builds its
-// decoder per prompt (chunk clamped to the prompt, tail = the actual remainder); the host test
-// inkling2-mini-schedule-test proves those calls give every row the same chunk forms as this construction.
+// steps (ids, scores, last K/V rows, histories) must be equal across the four arms.
+// SCOPE: this is call-form invariance of one served decoder, not the native command line's decoder (built per prompt:
+// chunk clamped to the prompt, tail = the actual remainder) and not the served scheduler; the host test
+// inkling2-mini-schedule-test proves those calls give every row the same chunk forms, and native CLI == real server
+// (seeded and greedy, prompts 8192..8209 + an absorbed tail, a decode lane overlapping the prefill) is the HTTP
+// identity kit's lever-on arm.
 inline constexpr unsigned kServedContext = 8320U;
 inline constexpr unsigned kServedSteps = 4U;
 inline constexpr std::array<unsigned, 8> kServedPrompt{1U, 17U, 127U, 128U, 129U, 4113U, 8193U, 8209U};
@@ -355,7 +407,7 @@ inline int served_prefill(const char* checkpoint, weight::FormatId storage, std:
         for (unsigned i = 0; i < rows; ++i) prompt[i] = cohort_token(5U, i);
         const std::span<const unsigned> ids(prompt);
         std::array<PrefillArm, 4> arms;
-        // cli
+        // single
         arms[0].scores.resize(vocab);
         decoder.reset_gate_session();  // a fresh single session, as the command line starts
         arms[0].first = decoder.prefill(ids, arms[0].scores);
@@ -403,7 +455,7 @@ inline int served_prefill(const char* checkpoint, weight::FormatId storage, std:
             decoder.read_slot_logits(0U, arms[2].scores);
             finish(arms[2]);
         }
-        static constexpr std::array<const char*, 4> kNames{"cli", "served", "pieces", "repeat"};
+        static constexpr std::array<const char*, 4> kNames{"single", "served", "pieces", "repeat"};
         for (unsigned a = 0; a < 4U; ++a) {
             Fnv64 h;
             h.add(arms[a].scores.data(), arms[a].scores.size() * sizeof(float));
@@ -432,7 +484,7 @@ inline int served_prefill(const char* checkpoint, weight::FormatId storage, std:
         std::cout << "FAIL Inkling Mini served prefill: " << failures << " mismatches\n";
         return 1;
     }
-    std::cout << "PASS Inkling Mini served prefill == CLI prefill (" << prompt_lengths.size()
+    std::cout << "PASS Inkling Mini served prefill call forms single == served == pieces == repeat (" << prompt_lengths.size()
               << " prompt lengths, whole / pieces beside a decoding lane / repeat; first id, scores, KV planes, "
                  "histories, " << kServedSteps << " decode steps bitwise)\n";
     return 0;
@@ -460,13 +512,15 @@ int main(int argc, char** argv) {
         }
         if (served_prefill)
             return inkling2::test::served_prefill(argv[1], storage, prompt_lengths);
+        // The production admission (the server's, inkling2_mini_serve.cpp), decided before the decoder is built.
 #if defined(__HIPCC__)
-        const bool admitted = served_route;
+        constexpr bool hip_backend = true;
 #else
-        const bool admitted = false;  // a CUDA server declines the lever
+        constexpr bool hip_backend = false;
 #endif
+        const bool admitted = inkling2::mini_served_prefill_emits_first(hip_backend, served_route);
         if (served_route && !admitted) std::cout << "NOTE served route lever declined by this backend\n";
-        return inkling2::test::cohort_lanes(argv[1], storage, served_route);
+        return inkling2::test::cohort_lanes(argv[1], storage, served_route, admitted);
     } catch (const std::exception& error) {
         std::cerr << "FAIL Inkling Mini cohort lanes: " << error.what() << '\n';
         return 1;
