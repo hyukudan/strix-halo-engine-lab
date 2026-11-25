@@ -61,9 +61,10 @@ inline void verify_rows(const char* checkpoint, weight::FormatId storage, bool p
     unsigned lanes_windows = 0U, declined_windows = 0U;
     for (unsigned width = 2U; width <= max_width; ++width) {
         const auto window = ids.subspan(prefix_rows + cursor, width);
-        // Level 2: windows 2 and 5 announce their scores (full head, bits against the serial rows); the others ask for
-        // picks only (the lanes pick up to the capacity, the full head beyond it), committed none (7), some (3) or all.
-        const bool picks_only = admitted == 2U && width != 2U && width != 5U;
+        // Level 2: windows 5 and 6 announce their scores (full head, bits against the serial rows); the others ask for
+        // picks only (the lanes pick up to the capacity, the full head beyond it); the narrow ones commit none (2), some
+        // (3) or all (4) of their rows (all three through the lanes pick on a device that screens four lanes).
+        const bool picks_only = admitted == 2U && width != 5U && width != 6U;
         const auto scores =
             picks_only ? std::span<float>{} : std::span(verified).first(std::size_t{width} * kOutputVocabulary);
         const auto lanes_before = decoder.lanes_picks();
@@ -87,7 +88,7 @@ inline void verify_rows(const char* checkpoint, weight::FormatId storage, bool p
                                          ", row " + std::to_string(row) + ", position " +
                                          std::to_string(prefix_rows + cursor + row));
         }
-        const auto keep = kept_rows[width - 2U];
+        const auto keep = admitted == 2U && width == 2U ? 0U : kept_rows[width - 2U];
         decoder.commit(keep);
         cursor += keep;
         std::cout << "PASS Inkling Mini verify rows " << storage_name << ' ' << moe << " width=" << width
