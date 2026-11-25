@@ -28,6 +28,9 @@ namespace strix::vision {
 
 struct ApiMediaOptions {
     std::string placeholder;      // text that tokenizes to exactly one id (the family's image token)
+    // Template text around the placeholder of one item (a family whose image is framed by vocabulary tokens, e.g. a
+    // begin and an end marker). The renderer receives part_prefix + placeholder + part_suffix; both empty by default.
+    std::string part_prefix, part_suffix;
     std::uint32_t max_rows = 0;   // largest span of one image (the adapter's limit)
     std::uint32_t lm_width = 0;   // LM hidden width; rows of another width are refused at construction time of a span
     unsigned axes = 0;            // position axes the family reads (span_embed_rows)
@@ -46,6 +49,9 @@ public:
 
     [[nodiscard]] std::string identity() const override { return identity_; }
     [[nodiscard]] std::string placeholder() const override { return options_.placeholder; }
+    [[nodiscard]] std::string part_text(std::size_t) const override {
+        return options_.part_prefix + options_.placeholder + options_.part_suffix;
+    }
     [[nodiscard]] std::uint32_t max_rows() const override { return options_.max_rows; }
     [[nodiscard]] serve::ApiMediaSpan encode(const serve::media::MediaItem& item, std::uint32_t row_budget) override;
     [[nodiscard]] std::uint64_t epoch() const override { return interner_.epoch(); }

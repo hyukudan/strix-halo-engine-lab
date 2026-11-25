@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -21,6 +22,9 @@ namespace strix::vision {
 struct HostBudget {
     std::uint64_t max_bytes = std::uint64_t{4} << 30U;  // largest file held in host memory
     std::uint64_t exact_bytes = 0;                      // nonzero: the admitted file's length; any other is refused
+    // Optional: judges the tensor table read from the opened file itself, before its bytes are allocated or read (a
+    // model's schema; throw to refuse). Unset: the generic well-formedness check only.
+    std::function<void(const gguf::FileInfo&)> admit{};
 };
 
 class GgufWeights final : public WeightSource {

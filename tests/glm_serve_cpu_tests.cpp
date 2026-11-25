@@ -6,6 +6,7 @@
 #include "glm/serve/glm_serve_lead.hpp"
 #include "glm/serve/glm_serve_import.hpp"
 #include "glm/serve/glm_serve_selftest.hpp"
+#include "glm/serve/glm_serve_vision.hpp"
 #include "glm/rtxpf/import/glm_import_socket.hpp"
 
 #include <cctype>
@@ -20,10 +21,12 @@
 #include <map>
 #include <optional>
 #include <mutex>
+#include <semaphore>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace gs = strix::glm::serve;
@@ -90,8 +93,44 @@ std::vector<std::uint8_t> relay_full(unsigned rank) {
     return gs::merge_dsa(relay_part(false, rank), relay_part(true, 0), kRelayLayout);
 }
 
+std::uint32_t fake_frame_crc(std::span<const std::byte> bytes) noexcept {
+    std::uint32_t h = 2166136261U;
+    for (const std::byte b : bytes) h = (h ^ static_cast<std::uint32_t>(b)) * 16777619U;
+    return h;
+}
+
 struct FakeEng {
     std::uint32_t slots;
+    // Image input, with the real adapter's PromptEmbeds: this rank's table and frames. A provided row enters the
+    // slot's chain as a hash of its data instead of its token, so the ranks' tokens agree only when both hold the
+    // same rows at the same positions.
+    gs::PromptEmbeds embeds{&fake_frame_crc};
+    std::uint64_t embed_rows = 0, embed_frames = 0, embed_frame_bytes = 0;
+    std::vector<std::uint32_t> effective;
+    void bind_embeds(std::shared_ptr<const strix::session::EmbedTable> table) { embeds.bind(std::move(table)); }
+    std::vector<std::byte> embed_frame(std::span<const std::uint32_t> ids) {
+        auto frame = embeds.frame(ids);
+        ++embed_frames;
+        embed_frame_bytes += frame.size();
+        return frame;
+    }
+    void embed_frame_received(std::span<const std::byte> frame, std::vector<std::uint32_t>& ids) {
+        embeds.received(frame, ids);
+        ++embed_frames;
+        embed_frame_bytes += frame.size();
+    }
+    std::span<const std::uint32_t> provide(std::span<const std::uint32_t> t) {
+        if (!gs::PromptEmbeds::holds_virtual_ids(t)) return t;
+        const auto run = embeds.resolve(t);
+        effective = run.tokens;
+        for (const auto& seg : run.splice.segments)
+            for (std::uint32_t j = 0; j < seg.rows; ++j) {
+                const auto* row = seg.data + std::size_t{j} * run.splice.width;
+                effective[seg.run_row + j] = 0x40000000U | (fake_frame_crc(std::as_bytes(std::span(row, run.splice.width))) >> 2U);
+                ++embed_rows;
+            }
+        return effective;
+    }
     bool stops = true;
     std::uint32_t corrupt_call = 0;  // > 0: the n-th step returns a different first token
     unsigned delay_us = 0;           // per step / verify cycle
@@ -190,7 +229,9 @@ struct FakeEng {
         last_rows.clear();
         last_out.clear();
     }
-    void wait() const {
+    std::function<void()> on_first_decode;
+    void wait() {
+        if (auto hook = std::exchange(on_first_decode, {})) hook();
         if (delay_us) std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
     }
     // one trunk row of `slot` at its frontier
@@ -231,6 +272,7 @@ struct FakeEng {
         plain_call();
         if (units_open) throw std::runtime_error("fake prefill: another prompt's prefill units session is open");
         if (!ready.at(s) || pos0 != frontier[s]) throw std::runtime_error("fake prefill: not at the slot frontier / without reset");
+        t = provide(t);
         for (const auto x : t) h[s] = fold(h[s], x);
         frontier[s] = pos0 + t.size();
         ++calls;
@@ -410,6 +452,7 @@ struct FakeEng {
         if (start) {
             if (units_open) throw std::runtime_error("fake units: a session is already open");
             units_open = true;
+            t = provide(t);  // as the real adapter: resolved once, at the start of the session
             units_tokens.assign(t.begin(), t.end());
             units_slot = s;
             units_pos = pos0;
@@ -686,6 +729,482 @@ void queued_successor_interleave() {
 
 }
 
+
+
+// FakeEng with logits for sampled requests: a row's logits are a function of the chain state after its input (both
+// ranks hold the same states), over a 64-id vocabulary split 32 / 32 between the ranks, with one strong peak (the
+// row's argmax). Plain sampled rows go through sample_pair_rows, sampled MTP windows through decide_pair_window, so
+// a sampled request's tokens must not depend on the route.
+constexpr std::uint32_t kFakeVocab = 64, kFakeSlice = 32;
+struct SampledFake : FakeEng {
+    using FakeEng::FakeEng;
+    using FakeEng::mtp_run;
+    struct RowAt { std::uint32_t slot; std::uint32_t token; std::uint64_t pos; std::uint64_t x; };
+    std::vector<RowAt> last_sampled;  // rows of the last step / prefill call (sample_outputs reads them)
+    bool last_prefill = false;
+    std::uint64_t sampled_runs = 0, window_rows = 0, draft_picks = 0, sampled_enters = 0;
+    // windows that ended at an accepted stop draft in row 0 with more rows allowed; the frontier at each mtp_leave
+    std::uint64_t stop_cuts_row0 = 0;
+    std::vector<std::uint64_t> leave_frontier;
+    std::uint64_t lead_accepted = 0, lead_rejected = 0;
+    bool lead_coupled = true;
+    std::uint32_t dec_flags = 0;
+    // the fake drafter's rows: the target's peak a little lower and other noise, so q is close to p but not equal
+    static float draft_logit(std::uint64_t x, std::uint32_t t) {
+        if (t == peak(x)) return 6.0F;
+        const std::uint64_t m = (x ^ (std::uint64_t{t} * 0xD6E8FEB86659FD93ULL)) * 0x94D049BB133111EBULL;
+        return static_cast<float>((m >> 40) % 1000U) / 400.0F;
+    }
+    std::vector<float> draft_slice(std::uint64_t x, bool paired) const {
+        const std::uint32_t lo = paired ? rank * kFakeSlice : 0U, n = paired ? kFakeSlice : kFakeVocab;
+        std::vector<float> v(n);
+        for (std::uint32_t i = 0; i < n; ++i) v[i] = draft_logit(x, lo + i);
+        return v;
+    }
+    static std::uint32_t peak(std::uint64_t x) { return static_cast<std::uint32_t>((x >> 13) % kFakeVocab); }
+    static float logit(std::uint64_t x, std::uint32_t t) {
+        if (t == peak(x)) return 7.0F;
+        const std::uint64_t m = (x ^ (std::uint64_t{t} * 0x9E3779B97F4A7C15ULL)) * 0xBF58476D1CE4E5B9ULL;
+        return static_cast<float>((m >> 40) % 1000U) / 400.0F;
+    }
+    std::vector<float> slice(std::uint64_t x, bool paired) const {
+        const std::uint32_t lo = paired ? rank * kFakeSlice : 0U, n = paired ? kFakeSlice : kFakeVocab;
+        std::vector<float> v(n);
+        for (std::uint32_t i = 0; i < n; ++i) v[i] = logit(x, lo + i);
+        return v;
+    }
+    std::vector<std::uint32_t> step(std::span<const gs::WireRow> rows) {
+        auto out = FakeEng::step(rows);
+        last_sampled.clear();
+        for (std::size_t i = 0; i < rows.size(); ++i) last_sampled.push_back({rows[i].slot, rows[i].token, rows[i].pos, h[rows[i].slot]});
+        last_prefill = false;
+        return out;
+    }
+    std::uint32_t prefill(std::uint32_t s, std::span<const std::uint32_t> t, std::uint64_t pos0) {
+        const auto y = FakeEng::prefill(s, t, pos0);
+        last_sampled = {{s, t.empty() ? 0U : t.back(), pos0 + t.size() - 1, h[s]}};
+        last_prefill = true;
+        return y;
+    }
+    std::uint32_t prefill_mtp(std::uint32_t s, std::span<const std::uint32_t> t, std::uint64_t pos0, bool last) {
+        const auto y0 = prefill(s, t, pos0);
+        log.back() += last ? " mtp last" : " mtp";
+        if (last) {
+            seed = Seed{s, y0, pos0 + t.size()};
+            seed_spec(s);
+        }
+        return y0;
+    }
+    void sample_outputs(gs::Channel& ch, std::uint32_t mask, std::span<const sv::PairSamplingRow> choices,
+                        std::span<std::uint32_t> out) {
+        std::uint64_t chunk = 0;
+        std::vector<float> local;
+        sv::sample_pair_rows(mask, ch.rank() == 0, ch.paired() ? kFakeSlice : 0U, kFakeVocab, choices, out,
+            [&](std::size_t r) { local = slice(last_sampled.at(r).x, ch.paired()); return std::span<const float>(local); },
+            [&](std::span<const float> a, std::span<float> b) { ch.exchange_sampling_logits(a, b, chunk++); });
+        // the sampled token is what the row produced (mtp_enter seeds from it); the follower learns it from the lead's
+        // next command, so only the lead's record can hold it here: both records are rebuilt from mtp_enter's row
+        if (ch.rank() != 0) return;
+        if (last_prefill) {
+            last_rows = {gs::WireRow{last_sampled[0].slot, last_sampled[0].token, last_sampled[0].pos}};
+            last_out = {out[0]};
+        } else {
+            for (std::size_t r = 0; r < out.size() && r < last_out.size(); ++r) last_out[r] = out[r];
+        }
+    }
+    // mtp_enter from a sampled row: the follower's record does not hold the sampled token, so the row is checked
+    // against the state (slot, position) only; the token is taken from the command.
+    void mtp_enter(std::uint32_t r, const gs::WireRow& w, bool from_seed) {
+        if (!from_seed && r < last_sampled.size() && last_sampled[r].slot == w.slot && last_sampled[r].pos == w.pos &&
+            frontier[w.slot] == w.pos + 1) {
+            last_rows = {gs::WireRow{w.slot, last_sampled[r].token, w.pos}};
+            last_out.assign(r + 1, 0);
+            last_rows.resize(r + 1, last_rows[0]);
+            last_rows[r] = gs::WireRow{w.slot, last_sampled[r].token, w.pos};
+            last_out[r] = w.token;
+        }
+        FakeEng::mtp_enter(r, w, from_seed);
+    }
+    void mtp_enter(std::uint32_t r, const gs::WireRow& w, bool from_seed, gs::SampledRun run) {
+        if (from_seed || (run.flags & gs::kRunSampleDrafts) == 0) throw std::runtime_error("fake sampled mtp_enter: flags");
+        ++sampled_enters;
+        mtp_enter(r, w, from_seed);
+    }
+    std::vector<std::uint32_t> mtp_run(std::uint32_t s, std::uint32_t budget, std::uint32_t n, gs::SampledRun run) {
+        if (dec && dec_flags != run.flags) throw std::runtime_error("fake sampled mtp_run: flags changed under an open decoder");
+        if (!dec) {
+            if (!seed || seed->slot != s || frontier[s] != seed->p) throw std::runtime_error("fake sampled mtp_run without a fresh seed");
+            dec = Dec{s, seed->y0, budget, 1};
+            dec_flags = run.flags;
+            seed.reset();
+            spec[s] = {};
+        } else if (dec->slot != s) {
+            throw std::runtime_error("fake sampled mtp_run: other slot");
+        }
+        const bool paired = run.ch->paired();
+        std::uint64_t chunk = 0;
+        std::vector<std::uint32_t> out;
+        for (std::uint32_t c = 0; c < n && dec->emitted < dec->budget && !dec_stopped; ++c) {
+            const unsigned remaining = dec->budget - dec->emitted;
+            const unsigned k = std::min(1U + static_cast<unsigned>(h[s] % 3U), remaining - 1U);
+            std::vector<std::uint32_t> inputs{dec->last}, drafts, ids;
+            std::vector<std::uint64_t> xs{fold(h[s], dec->last)};
+            const std::uint64_t first = frontier[s] + 1;
+            std::vector<strix::TokenDraft> td;
+            std::vector<float> local;
+            for (unsigned i = 0; i < k; ++i) {  // the fake drafter: the row's argmax, wrong for a quarter of the states
+                const auto x = xs.back();
+                std::uint32_t d = ((x >> 17) % 4U) != 0 ? peak(x) : (peak(x) + 1U) % kFakeVocab;
+                strix::TokenDraft kept;
+                if ((run.flags & gs::kRunSampleDrafts) != 0) {  // drawn from the drafter's row on the lead
+                    d = sv::pick_pair_draft(run.sampler != nullptr, paired ? kFakeSlice : 0U, kFakeVocab, run.sampler, first + i,
+                        [&] { local = draft_slice(x, paired); return std::span<const float>(local); },
+                        [&](std::span<const float> a, std::span<float> b) { run.ch->exchange_sampling_logits(a, b, chunk++); },
+                        [&](std::span<const std::uint32_t> a, std::span<std::uint32_t> b) { run.ch->exchange_sampling_words(a, b, chunk++); },
+                        &kept);
+                    ++draft_picks;
+                }
+                if (run.sampler == nullptr || (run.flags & gs::kRunSampleDrafts) == 0) {
+                    kept = strix::TokenDraft{};
+                    kept.token = d;
+                }
+                kept.position = first + i;
+                td.push_back(std::move(kept));
+                drafts.push_back(d);
+                inputs.push_back(d);
+                xs.push_back(fold(x, d));
+            }
+            for (const auto x : xs) ids.push_back(peak(x));
+            const auto window = sv::decide_pair_window(run.sampler != nullptr, paired ? kFakeSlice : 0U, kFakeVocab, run.sampler,
+                first, td, std::min(k + 1U, remaining), run.stops,
+                [&](std::size_t r) { local = slice(xs.at(r), paired); return std::span<const float>(local); },
+                [&](std::span<const float> a, std::span<float> b) { run.ch->exchange_sampling_logits(a, b, chunk++); },
+                [&](std::span<const std::uint32_t> a, std::span<std::uint32_t> b) { run.ch->exchange_sampling_words(a, b, chunk++); });
+            window_rows += window.tokens.size();
+            if (window.stop && window.accepted == 1U && window.tokens.size() == 1U && std::min(k + 1U, remaining) > 1U) ++stop_cuts_row0;
+            std::copy(window.tokens.begin(), window.tokens.end(), ids.begin());
+            // as the engine's cycle (glm_spec_run): commit by the window's accepted count, not by token equality; a
+            // decided stop id is terminal
+            const auto acc = strix::glm::spec::accept_decided(drafts, ids, window.accepted, strix::glm::spec::kNoFlag,
+                strix::glm::spec::Terminal{window.stop ? window.tokens.back() : strix::glm::spec::kNoFlag, remaining});
+            if (acc.stop) dec_stopped = true;
+            for (unsigned j = 0; j < acc.rows; ++j) (void)row(s, inputs[j]);
+            if (run.sampler) {
+                lead_accepted = run.sampler->stats().accepted;
+                lead_rejected = run.sampler->stats().rejected;
+                lead_coupled = run.sampler->coupled();
+            }
+            for (unsigned j = 0; j < acc.m; ++j) out.push_back(drafts[j]);
+            if (acc.has_bonus) out.push_back(acc.bonus);
+            dec->emitted += acc.m + (acc.has_bonus ? 1U : 0U);
+            dec->last = out.back();
+            ++cycles;
+            ++sampled_runs;
+        }
+        anchor[s] = dec->last;
+        log.push_back("sampled run " + std::to_string(s) + " -> " + std::to_string(out.size()));
+        return out;
+    }
+    bool dec_stopped = false;
+    void mtp_leave(std::uint32_t s) {
+        leave_frontier.push_back(frontier.at(s));
+        FakeEng::mtp_leave(s);
+        dec_flags = 0;
+        dec_stopped = false;
+    }
+};
+
+struct SampledServe {
+    std::vector<std::vector<std::uint32_t>> tokens;
+    std::vector<std::string> log0;
+    std::uint64_t mtp_rounds = 0, sampled_runs = 0, steps = 0, g2_cycles = 0, draft_picks = 0, sampled_enters = 0;
+    std::uint64_t lead_accepted = 0, lead_rejected = 0;
+    bool lead_coupled = true;
+    std::vector<std::string> receipts;  // each request's sampling_receipt ("" when none)
+    std::string error;
+    std::uint64_t window_rows = 0, stop_cuts_row0 = 0;
+    std::vector<std::uint64_t> leave_frontier0, leave_frontier1;  // the committed frontier at each mtp_leave, per rank
+};
+// One pair (loopback) serving `jobs`; sequential = one request at a time (the C1 route), otherwise all queued at once.
+SampledServe serve_sampled(const std::vector<sv::GenerationJob>& jobs, bool sampled_mtp, bool sequential, bool g2 = false,
+                           strix::SampledAcceptance accept = strix::SampledAcceptance::coupled,
+                           std::uint32_t force_reject_row = strix::TokenSamplerOptions::forced_rejection_off) {
+    SampledServe out;
+    Loopback lb;
+    SampledFake e0(4), e1(4);
+    e1.rank = 1;
+    e0.stops = e1.stops = false;
+    gs::Channel c0(lb.side(0), 0), c1(lb.side(1), 1);
+    const gs::Hello h = hello_for(4, 4096, 2);
+    std::thread follower([&] {
+        try {
+            gs::follow(e1, c1, h, 4, 4096, true);
+        } catch (const std::exception& e) {
+            out.error += std::string("follower: ") + e.what();
+        }
+    });
+    std::atomic<bool> stop{false};
+    sv::GenerationQueue queue(16);
+    gs::LeadConfig lc;
+    lc.slots = 4;
+    lc.capacity = 4096;
+    lc.heartbeat_seconds = 0.01;
+    lc.mtp = true;
+    lc.mtp_cycles = 2;
+    lc.prefill_chunk = 0;
+    lc.g2 = g2;
+    lc.sampling = c0.hello(h, true);
+    lc.sampled_mtp = sampled_mtp;
+    lc.sampler_options.acceptance = accept;
+    lc.sampler_options.force_reject_row = force_reject_row;
+    try {
+        gs::Lead<SampledFake> lead(e0, c0, queue, lc, stop);
+        std::thread runner([&] {
+            try {
+                lead.loop();
+            } catch (const std::exception& e) {
+                out.error += std::string("lead: ") + e.what();
+                queue.shutdown();
+            }
+        });
+        std::vector<std::shared_ptr<sv::GenerationTicket>> tickets;
+        out.tokens.resize(jobs.size());
+        const auto drain = [&](std::size_t i) {
+            if (!tickets[i]) {
+                out.error += " request " + std::to_string(i) + " not queued";
+                return;
+            }
+            bool done = false;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+            while (!done && std::chrono::steady_clock::now() < deadline) {
+                const auto t = tickets[i]->wait(std::chrono::milliseconds(100), done);
+                out.tokens[i].insert(out.tokens[i].end(), t.begin(), t.end());
+            }
+            if (!done) out.error += " request " + std::to_string(i) + " timed out";
+            std::string receipt;
+            for (const auto& [k, v] : tickets[i]->stats().engine_extra)
+                if (k == "sampling_receipt") receipt = v;
+            out.receipts.push_back(receipt);
+        };
+        for (std::size_t i = 0; i < jobs.size(); ++i) {
+            tickets.push_back(queue.submit(sv::GenerationJob(jobs[i])));
+            if (sequential) drain(i);
+        }
+        if (!sequential)
+            for (std::size_t i = 0; i < jobs.size(); ++i) drain(i);
+        stop.store(true);
+        runner.join();
+        out.mtp_rounds = lead.stats().mtp_rounds;
+        out.steps = lead.stats().steps;
+        out.g2_cycles = lead.stats().g2_cycles;
+    } catch (const std::exception& e) {
+        out.error += std::string("setup: ") + e.what();
+    }
+    follower.join();
+    out.log0 = e0.log;
+    out.sampled_runs = e0.sampled_runs;
+    out.draft_picks = e0.draft_picks;
+    out.sampled_enters = e0.sampled_enters;
+    out.lead_accepted = e0.lead_accepted;
+    out.lead_rejected = e0.lead_rejected;
+    out.lead_coupled = e0.lead_coupled;
+    out.window_rows = e0.window_rows;
+    out.stop_cuts_row0 = e0.stop_cuts_row0;
+    out.leave_frontier0 = e0.leave_frontier;
+    out.leave_frontier1 = e1.leave_frontier;
+    return out;
+}
+
+sv::GenerationJob sampled_job(unsigned i, double temperature, std::uint32_t max_tokens) {
+    sv::GenerationJob j;
+    for (unsigned k = 0; k < 9 + 5 * i; ++k) j.prompt.push_back(100U + 13U * i + k);
+    j.max_tokens = max_tokens;
+    j.sampling.temperature = temperature;
+    j.sampling.seed = 1000U + i;
+    j.sampling.seeded = true;
+    return j;
+}
+
+void test_sampled_drafts_serve() {
+    // coupled, temperature 0.9 (above the argmax gate): drafts drawn from the drafter rows, tokens of plain sampling
+    std::vector<sv::GenerationJob> hot, cool;
+    for (unsigned i = 0; i < 3; ++i) {
+        hot.push_back(sampled_job(i, 0.9, 40));
+        cool.push_back(sampled_job(i, 0.5, 40));
+    }
+    const auto hot_plain = serve_sampled(hot, false, true), hot_spec = serve_sampled(hot, true, true);
+    CHECK(hot_plain.error.empty() && hot_spec.error.empty() && hot_plain.tokens == hot_spec.tokens);
+    CHECK(hot_spec.draft_picks > 0 && hot_spec.sampled_enters > 0 && hot_spec.lead_accepted > 0);
+    // temperature 0.5 (below the gate): greedy drafts, no drafter row crosses the pair
+    const auto cool_plain = serve_sampled(cool, false, true), cool_spec = serve_sampled(cool, true, true);
+    CHECK(cool_plain.error.empty() && cool_spec.error.empty() && cool_plain.tokens == cool_spec.tokens);
+    CHECK(cool_spec.mtp_rounds > 0 && cool_spec.draft_picks == 0 && cool_spec.sampled_enters == 0);
+    // rejection (opt-in): exact in distribution, not token-equal to plain sampling; every request completes
+    const auto rej = serve_sampled(hot, true, true, false, strix::SampledAcceptance::rejection);
+    CHECK(rej.error.empty() && !rej.lead_coupled && rej.draft_picks > 0 && rej.lead_accepted + rej.lead_rejected > 0);
+    for (const auto& t : rej.tokens) CHECK(t.size() == 40);
+    // every sampled response states its acceptance rule and what its drafts did (plain steps: no drafted rows)
+    const auto has = [](const std::vector<std::string>& r, const std::string& needle) {
+        return r.size() == 3 && std::all_of(r.begin(), r.end(), [&](const std::string& x) { return x.find(needle) != std::string::npos; });
+    };
+    CHECK(has(hot_plain.receipts, "\"acceptance\":\"coupled\"") && has(hot_plain.receipts, "\"accepted\":0,\"rejected\":0"));
+    CHECK(has(hot_spec.receipts, "\"acceptance\":\"coupled\"") && !has(hot_spec.receipts, "\"accepted\":0,"));
+    CHECK(has(rej.receipts, "\"acceptance\":\"rejection\""));
+    if (!hot_spec.error.empty() || !cool_spec.error.empty() || !rej.error.empty())
+        std::fprintf(stderr, "sampled drafts errors: %s | %s | %s\n", hot_spec.error.c_str(), cool_spec.error.c_str(), rej.error.c_str());
+    std::printf("sampled drafts: T0.9 coupled == plain (%llu draft picks, %llu accepted), T0.5 no draft exchange, "
+                "rejection completes (%llu accepted / %llu rejected)\n",
+                static_cast<unsigned long long>(hot_spec.draft_picks), static_cast<unsigned long long>(hot_spec.lead_accepted),
+                static_cast<unsigned long long>(rej.lead_accepted), static_cast<unsigned long long>(rej.lead_rejected));
+}
+
+void test_sampled_mtp_serve() {
+    std::vector<sv::GenerationJob> jobs;
+    for (unsigned i = 0; i < 3; ++i) jobs.push_back(sampled_job(i, 0.9, 40));
+    const auto plain = serve_sampled(jobs, false, true);
+    const auto spec = serve_sampled(jobs, true, true);
+    CHECK(plain.error.empty() && spec.error.empty());
+    if (!plain.error.empty() || !spec.error.empty()) std::fprintf(stderr, "sampled serve errors: %s | %s\n", plain.error.c_str(), spec.error.c_str());
+    CHECK(plain.tokens == spec.tokens);
+    for (const auto& t : spec.tokens) CHECK(t.size() == 40);
+    CHECK(plain.mtp_rounds == 0 && plain.sampled_runs == 0);  // switch off: sampled requests decode by plain steps
+    // a rejection whose token equals its draft (coupled, forced at row 0 of every window): the row after it was never
+    // decided, so nothing past the rejected row may be committed; the tokens stay those of plain sampling
+    const auto forced = serve_sampled(jobs, true, true, false, strix::SampledAcceptance::coupled, 0);
+    CHECK(forced.error.empty() && forced.tokens == plain.tokens && forced.lead_rejected > 0);
+    if (!forced.error.empty()) std::fprintf(stderr, "forced rejection serve error: %s\n", forced.error.c_str());
+    CHECK(spec.mtp_rounds > 0 && spec.sampled_runs > 0);
+    // the sampled prefill's seed (drawn from its greedy first token) is never used: the decoder opens from mtp_enter
+    unsigned enters = 0, seed_enters = 0;
+    for (const auto& l : spec.log0) {
+        enters += l.rfind("enter ", 0) == 0;
+        seed_enters += l.rfind("enter-seed", 0) == 0;
+    }
+    CHECK(enters >= 3 && seed_enters == 0);
+    // a greedy request beside sampled ones with batched verify on: the sampled tokens stay those of plain sampling
+    std::vector<sv::GenerationJob> mixed = jobs;
+    sv::GenerationJob greedy = sampled_job(5, 0.0, 40);
+    mixed.insert(mixed.begin() + 1, greedy);
+    const auto both = serve_sampled(mixed, true, false, true);
+    CHECK(both.error.empty());
+    if (!both.error.empty()) std::fprintf(stderr, "mixed serve error: %s\n", both.error.c_str());
+    CHECK(both.tokens.size() == 4 && both.tokens[0] == plain.tokens[0] && both.tokens[2] == plain.tokens[1] && both.tokens[3] == plain.tokens[2]);
+    std::printf("sampled MTP serve: tokens == plain sampling (3 x 40), %llu MTP rounds / %llu sampled cycles, %u re-seeds; "
+                "mixed with greedy + G2: sampled tokens unchanged (%llu G2 cycles)\n",
+                static_cast<unsigned long long>(spec.mtp_rounds), static_cast<unsigned long long>(spec.sampled_runs), enters,
+                static_cast<unsigned long long>(both.g2_cycles));
+}
+
+// A sampled MTP window never decides, commits or catches up a row past a stop id of the request, on either rank: the
+// request's stop token is taken from its free-running output, so some window accepts it as the draft of row 0 while
+// more rows were allowed. The tokens are those of plain sampling (up to and including the stop), the lead decides no
+// row after it, and the frontier each rank holds when the decoder leaves never passes prompt + emitted - 1 (the stop
+// token is never processed as input).
+void test_sampled_mtp_stop() {
+    const sv::GenerationJob base = sampled_job(0, 0.9, 40);
+    const auto free_run = serve_sampled({base}, false, true);
+    CHECK(free_run.error.empty() && free_run.tokens.size() == 1 && free_run.tokens[0].size() == 40);
+    if (free_run.tokens.size() != 1 || free_run.tokens[0].size() != 40) return;
+    const auto& all = free_run.tokens[0];
+    unsigned tried = 0, cut_at = 0;
+    for (std::size_t k = 1; k + 1 < all.size() && cut_at == 0; ++k) {
+        if (std::find(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(k), all[k]) != all.begin() + static_cast<std::ptrdiff_t>(k))
+            continue;  // the stop must end the output at its first occurrence
+        auto job = base;
+        job.stop_tokens = {all[k]};
+        const std::vector<std::uint32_t> want(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(k) + 1);
+        const auto plain = serve_sampled({job}, false, true), spec = serve_sampled({job}, true, true);
+        ++tried;
+        CHECK(plain.error.empty() && spec.error.empty());
+        if (!plain.error.empty() || !spec.error.empty())
+            std::fprintf(stderr, "sampled stop errors: %s | %s\n", plain.error.c_str(), spec.error.c_str());
+        CHECK(plain.tokens.size() == 1 && plain.tokens[0] == want && spec.tokens.size() == 1 && spec.tokens[0] == want);
+        CHECK(spec.window_rows <= want.size());
+        const std::uint64_t bound = job.prompt.size() + want.size() - 1U;
+        CHECK(!spec.leave_frontier0.empty() && !spec.leave_frontier1.empty());
+        for (const auto f : spec.leave_frontier0) CHECK(f <= bound);
+        for (const auto f : spec.leave_frontier1) CHECK(f <= bound);
+        if (spec.stop_cuts_row0 > 0) cut_at = static_cast<unsigned>(k);
+    }
+    CHECK(cut_at > 0);
+    std::printf("sampled MTP stop: an accepted stop draft in row 0 ends the window (stop at output %u, %u stop ids tried); "
+                "tokens == plain sampling, no row past the stop on either rank\n", cut_at, tried);
+}
+
+// FakeEng with the sampled MTP entry points: records what replay hands them.
+struct SampledProbe : FakeEng {
+    using FakeEng::FakeEng;
+    using FakeEng::mtp_enter;
+    using FakeEng::mtp_run;
+    std::vector<gs::SampledRun> runs, enters;
+    std::vector<std::uint32_t> mtp_run(std::uint32_t, std::uint32_t, std::uint32_t, gs::SampledRun run) {
+        runs.push_back(run);
+        return {5, 6};
+    }
+    void mtp_enter(std::uint32_t, const gs::WireRow&, bool, gs::SampledRun run) { enters.push_back(run); }
+};
+
+void test_sampled_mtp_replay() {
+    gs::Channel solo({}, 0);
+    solo.hello(hello_for(2, 64, 1));
+    strix::TokenSamplingPolicy policy;
+    policy.temperature = 0.8F;
+    strix::TokenSampler sampler(policy, strix::TokenSamplerOptions{});
+    const std::array<sv::PairSamplingRow, 1> choice{{{&sampler, 0}}};
+    std::vector<std::uint32_t> none;
+    gs::Control run;
+    run.cmd = static_cast<std::uint32_t>(gs::Cmd::mtp_run);
+    run.pslot = 1;
+    run.budget = 9;
+    run.cycles = 2;
+    run.pflags = gs::kRunSample;
+    CHECK(gs::decode(gs::encode(run)).pflags == gs::kRunSample);
+    FakeEng plain(2);  // no sampled entry points: a sampled command is a protocol error, not a greedy run
+    CHECK(throws_with([&] { (void)gs::replay(plain, solo, run, none, true, 2, 64, nullptr, choice); }, "sampled MTP unavailable"));
+    SampledProbe probe(2);
+    const auto out = gs::replay(probe, solo, run, none, true, 2, 64, nullptr, choice);
+    CHECK(out == (std::vector<std::uint32_t>{5, 6}) && probe.runs.size() == 1);
+    CHECK(probe.runs.at(0).ch == &solo && probe.runs.at(0).sampler == &sampler && probe.runs.at(0).flags == gs::kRunSample);
+    (void)gs::replay(probe, solo, run, none, false, 2, 64);  // the follower runs the same command without a sampler
+    CHECK(probe.runs.size() == 2 && probe.runs.at(1).sampler == nullptr && probe.runs.at(1).flags == gs::kRunSample);
+    CHECK(throws_with([&] { (void)gs::replay(probe, solo, run, none, true, 2, 64); }, "sampled MTP without a sampler"));
+    run.pflags = gs::kRunSample | 16U;
+    CHECK(throws_with([&] { (void)gs::replay(probe, solo, run, none, true, 2, 64, nullptr, choice); }, "mtp_run flags"));
+    run.pflags = gs::kRunSampleDrafts;  // sampled drafts need sampled targets
+    CHECK(throws_with([&] { (void)gs::replay(probe, solo, run, none, true, 2, 64, nullptr, choice); }, "mtp_run flags"));
+    run.pflags = gs::kRunSample | gs::kRunRejection;  // rejection needs the drafts' distributions: sampled drafts
+    CHECK(throws_with([&] { (void)gs::replay(probe, solo, run, none, true, 2, 64, nullptr, choice); }, "mtp_run flags"));
+    gs::Control enter;
+    enter.cmd = static_cast<std::uint32_t>(gs::Cmd::mtp_enter);
+    enter.pslot = 0;
+    enter.row[0] = {1, 4, 7};
+    enter.pflags = gs::kRunSample | gs::kRunSampleDrafts;
+    (void)gs::replay(probe, solo, enter, none, true, 2, 64, nullptr, choice);
+    CHECK(probe.enters.size() == 1 && probe.enters.at(0).flags == (gs::kRunSample | gs::kRunSampleDrafts) &&
+          probe.enters.at(0).sampler == &sampler);
+    // A sampled final units call that the engine did not complete keeps kPrefillPending (the lead's unit check then
+    // fails loudly) instead of a token sampled from rows that are not the prompt's last.
+    {
+        SampledFake units(2);
+        units.unit_rows = 4;
+        units.unit_layers = 2;
+        gs::Control pf;
+        pf.cmd = static_cast<std::uint32_t>(gs::Cmd::prefill);
+        pf.pslot = 1;
+        pf.resets = 1U << 1;
+        pf.ppos = 0;
+        pf.pflags = gs::kPrefillMtp | gs::kPrefillUnits | gs::kPrefillStart | gs::kPrefillLast | gs::kPrefillSample;
+        pf.budget = 1;  // one unit of several: the engine is still pending
+        std::vector<std::uint32_t> prompt{5, 6, 7, 8, 9, 10, 11, 12, 13};
+        pf.plen = static_cast<std::uint32_t>(prompt.size());
+        std::vector<std::uint32_t> first;
+        const bool threw = throws_with([&] { first = gs::replay(units, solo, pf, prompt, true, 2, 64, nullptr, choice); }, "");
+        CHECK(!threw && first.size() == 1 && first[0] == gs::kPrefillPending);
+    }
+    CHECK(gs::kControlVersion == 14);
+    std::printf("sampled MTP replay: flags and the lead's sampler reach the engine; unknown flags and engines refused\n");
+}
+
 }  // namespace
 
 // Host protocol regressions: geometry decline and imports ready inside/between pieces.
@@ -888,6 +1407,174 @@ void import_route_receipts() {
 // root_mark(stable, n, 1024, 2) on its way through the prefill (the fake snapshot throws unless the slot is exactly at
 // that frontier); a sibling (same system prompt, other user turn) restores there and its tokens equal its cold run;
 // the producer's tokens equal its run without a root; a restore that reached the root stores none.
+// Image prompts on the pair: the lead flags each prefill chunk that holds virtual ids, the embed frame of its spans
+// follows the tokens, and the follower prefills the same rows. Tokens must not depend on chunking or on MTP, image
+// prompts must stay out of the prefix cache, and the rows must matter (the same ids as plain tokens give other text).
+struct ImageRun {
+    std::vector<std::uint32_t> image, text, repeat;
+    std::string error, session_error;
+    std::uint64_t rows0 = 0, rows1 = 0, frames0 = 0, frames1 = 0, bytes0 = 0, prefix_stores = 0, prefix_lookups = 0;
+    std::uint64_t first_frame_bytes = 0;
+    bool logs_equal = false, chunked = false;
+};
+ImageRun image_run(bool mtp, unsigned chunk, bool neighbour, unsigned units_rows = 0) {
+    ImageRun out;
+    const std::uint32_t slots = 2, width = strix::glm::kLanguageHidden, rows = 40, image_token = strix::glm::kImageToken;
+    strix::session::EmbedInterner interner;
+    strix::session::EmbedRows span;
+    span.rows = rows;
+    span.width = width;
+    span.real_token_id = image_token;
+    span.digest.fill(7);
+    span.data.resize(std::size_t{rows} * width);
+    for (std::size_t i = 0; i < span.data.size(); ++i) span.data[i] = static_cast<std::uint16_t>(i * 2654435761U >> 13U);
+    const auto lease = interner.intern(std::move(span));
+    const auto table = std::make_shared<const strix::session::EmbedTable>(std::vector<strix::session::EmbedLease>{lease});
+    std::vector<std::uint32_t> prompt, plain;
+    for (std::uint32_t k = 0; k < 30; ++k) prompt.push_back(500U + k);
+    prompt.push_back(strix::glm::kImageBeginToken);
+    for (const auto id : lease.ids()) prompt.push_back(id);
+    prompt.push_back(strix::glm::kImageEndToken);
+    for (std::uint32_t k = 0; k < 25; ++k) prompt.push_back(900U + k);
+    for (const auto id : prompt) plain.push_back(strix::session::is_embed_id(id) ? image_token : id);
+
+    Loopback lb;
+    FakeEng e0(slots), e1(slots);
+    Pipe pipe;
+    e0.pipe = e1.pipe = &pipe;
+    e1.rank = 1;
+    e0.stops = e1.stops = false;
+    e0.unit_rows = e1.unit_rows = units_rows;
+    e0.unit_layers = e1.unit_layers = units_rows ? 4U : 0U;
+    std::binary_semaphore neighbour_decoding(0), image_queued(0);
+    if (neighbour) {
+        e0.on_first_decode = [&] {
+            neighbour_decoding.release();
+            if (!image_queued.try_acquire_for(std::chrono::seconds(3)))
+                throw std::runtime_error("image: timed out waiting for the image request");
+        };
+    }
+    gs::Channel c0(lb.side(0), 0), c1(lb.side(1), 1);
+    gs::Hello h0 = hello_for(slots, 4096, 2), h1 = hello_for(slots, 4096, 2);
+    h0.prefix_cache_bytes = h1.prefix_cache_bytes = 1U << 22;
+    h0.mtp = h1.mtp = mtp ? 1U : 0U;
+    std::string follow_error, lead_error, driver_error;
+    std::thread follower([&] {
+        try { gs::follow(e1, c1, h1, slots, 4096); } catch (const std::exception& e) { follow_error = e.what(); }
+    });
+    std::atomic<bool> stop{false};
+    sv::GenerationQueue queue(16);
+    gs::LeadConfig lc;
+    lc.prefix_cache_bytes = h0.prefix_cache_bytes;
+    lc.slots = slots;
+    lc.capacity = 4096;
+    lc.heartbeat_seconds = 0.01;
+    lc.mtp = mtp;
+    lc.mtp_cycles = 2;
+    lc.prefill_chunk = chunk;
+    lc.interleave.select = sv::PrefillInterleave::Select::off;
+    if (units_rows) {
+        lc.prefill_units_rows = units_rows;
+        lc.prefill_units_layers = 4;
+        lc.prefill_units_admit = [](std::uint64_t) { return true; };
+    }
+    try {
+        c0.hello(h0);
+        gs::Lead<FakeEng> lead(e0, c0, queue, lc, stop);
+        std::thread driver([&] {
+            try {
+                const auto submit = [&](const std::vector<std::uint32_t>& p, bool image, std::uint32_t max_tokens, const std::string& session = {}) {
+                    sv::GenerationJob job;
+                    job.prompt = p;
+                    if (image) job.embeds = table;
+                    job.session_id = session;
+                    job.max_tokens = max_tokens;
+                    auto t = queue.submit(std::move(job));
+                    if (!t) throw std::runtime_error("image: queue refused a job");
+                    return t;
+                };
+                const auto collect = [](const std::shared_ptr<sv::GenerationTicket>& t, std::string* error = nullptr) {
+                    std::vector<std::uint32_t> got_all;
+                    for (bool done = false; !done;) {
+                        const auto got = t->wait(std::chrono::milliseconds(200), done);
+                        got_all.insert(got_all.end(), got.begin(), got.end());
+                    }
+                    if (error) *error = t->error();
+                    return got_all;
+                };
+                // A neighbour that keeps decoding makes the scheduler cut the image prompt into chunks.
+                std::shared_ptr<sv::GenerationTicket> busy;
+                if (neighbour) {
+                    std::vector<std::uint32_t> other;
+                    for (std::uint32_t k = 0; k < 9; ++k) other.push_back(40U + k);
+                    busy = submit(other, false, 400);
+                    if (!neighbour_decoding.try_acquire_for(std::chrono::seconds(3)))
+                        throw std::runtime_error("image: neighbour did not start decoding");
+                }
+                const auto before = lead.stats();
+                const auto first_image = submit(prompt, true, 12);
+                if (neighbour) image_queued.release();
+                out.image = collect(first_image, &out.error);
+                out.first_frame_bytes = e0.embed_frame_bytes;
+                out.prefix_stores = lead.stats().prefix_stores - before.prefix_stores;
+                out.prefix_lookups = lead.stats().prefix_hits + lead.stats().prefix_misses - before.prefix_hits - before.prefix_misses;
+                out.repeat = collect(submit(prompt, true, 12));
+                if (busy) (void)collect(busy);
+                out.text = collect(submit(plain, false, 12));
+                (void)collect(submit(prompt, true, 12, "conversation-1"), &out.session_error);
+            } catch (const std::exception& e) {
+                driver_error = e.what();
+            }
+            stop.store(true);
+        });
+        try {
+            lead.loop();
+        } catch (const std::exception& e) {
+            lead_error = e.what();
+            queue.shutdown();
+        }
+        driver.join();
+    } catch (const std::exception& e) {
+        lead_error = e.what();
+    }
+    follower.join();
+    if (!lead_error.empty() || !follow_error.empty() || !driver_error.empty()) {
+        std::printf("image: lead '%s' follow '%s' driver '%s'\n", lead_error.c_str(), follow_error.c_str(), driver_error.c_str());
+        out.error = "pair failed";
+    }
+    out.rows0 = e0.embed_rows;
+    out.rows1 = e1.embed_rows;
+    out.frames0 = e0.embed_frames;
+    out.frames1 = e1.embed_frames;
+    out.bytes0 = e0.embed_frame_bytes;
+    out.logs_equal = e0.log == e1.log;
+    unsigned image_calls = 0;  // prefill calls of the first image request's slot before it decodes
+    for (const auto& l : e0.log) image_calls += l.rfind("prefill ", 0) == 0 || l.rfind("units ", 0) == 0 ? 1U : 0U;
+    out.chunked = image_calls > 4;
+    return out;
+}
+void image_prompts() {
+    const std::uint64_t span_bytes = 40ULL * strix::glm::kLanguageHidden * 2U;
+    const ImageRun whole = image_run(false, 0, false);
+    CHECK(whole.error.empty() && whole.image.size() == 12 && whole.image == whole.repeat);
+    CHECK(whole.image != whole.text);                       // the provided rows are what the model saw
+    CHECK(whole.logs_equal && whole.rows0 == 80 && whole.rows1 == 80);  // two image requests, 40 rows each, on both ranks
+    CHECK(whole.frames0 == 2 && whole.frames1 == 2);
+    CHECK(whole.first_frame_bytes > span_bytes && whole.bytes0 < whole.first_frame_bytes + 1024);  // the rows travel once
+    CHECK(whole.prefix_stores == 0 && whole.prefix_lookups == 0);       // an image prompt has no cache key
+    CHECK(whole.session_error.find("image input does not take sessions") != std::string::npos);
+    struct Case { bool mtp; unsigned chunk; bool neighbour; unsigned units; };
+    for (const Case k : {Case{true, 0, false, 0}, Case{false, 16, true, 0}, Case{true, 16, true, 0}, Case{true, 16, true, 64}}) {
+        const ImageRun r = image_run(k.mtp, k.chunk, k.neighbour, k.units);
+        CHECK(r.error.empty() && r.image == whole.image && r.repeat == whole.image && r.text == whole.text);
+        CHECK(r.logs_equal && r.rows0 == 80 && r.rows1 == 80 && r.frames0 == r.frames1);
+        CHECK(r.prefix_stores == 0 && r.prefix_lookups == 0);
+        CHECK(r.first_frame_bytes > span_bytes && r.bytes0 < r.first_frame_bytes + 8192);
+        if (k.neighbour && k.units == 0) CHECK(r.chunked && r.frames0 > 2);  // one frame per chunk that holds image rows
+    }
+    std::printf("image prompts: %s\n", failures == 0 ? "PASS" : "FAIL");
+}
+
 void prefix_root_sibling() {
     CHECK(gs::prefix_root_row(2100, 2300) == 2048);
     CHECK(gs::prefix_root_row(1024, 5000) == 0);     // strictly inside the system prompt
@@ -983,6 +1670,10 @@ void prefix_root_sibling() {
 }
 
 int main(int argc, char** argv) {
+    test_sampled_mtp_replay();
+    test_sampled_mtp_serve();
+    test_sampled_mtp_stop();
+    test_sampled_drafts_serve();
     if (argc == 2 && std::string(argv[1]) == "--prefix-root") {
         prefix_root_sibling();
         return failures == 0 ? 0 : 1;
@@ -999,7 +1690,12 @@ int main(int argc, char** argv) {
         queued_successor_interleave();
         return failures == 0 ? 0 : 1;
     }
+    if (argc == 2 && std::string(argv[1]) == "--image-only") {
+        image_prompts();
+        return failures == 0 ? 0 : 1;
+    }
     const bool prefix_only = argc == 2 && std::string(argv[1]) == "--prefix-only";
+    image_prompts();
     prefix_root_sibling();
     // ---- admission order: LeadConfig::short_first feeds SessionRuntime::reserve_fifo(wait, short_first), which takes
     // from the shared queue with this selection; off keeps FIFO
@@ -1469,6 +2165,25 @@ int main(int argc, char** argv) {
             CHECK(gs::decode(gs::encode(old_peer)).version == gs::kControlVersion);
             std::printf("v5-layout peer block: refused at the version check\n");
         }
+        // Builds of earlier layouts (v13: no stop decision in a sampled window; v12: the 10-word sampled decision; v11: the
+        // contributor's; v9: main before this change) are refused at the first exchange on either rank, before any later
+        // field is read.
+        for (const std::uint32_t old : {13U, 12U, 11U, 9U})
+            for (const std::uint32_t rank : {0U, 1U}) {
+                gs::Channel ch(
+                    [&](std::span<const std::byte> out, std::span<std::byte> in, std::uint32_t, std::uint64_t) {
+                        std::memcpy(in.data(), out.data(), in.size());
+                        std::memcpy(in.data() + offsetof(gs::Control, version), &old, sizeof old);
+                        const std::uint32_t peer_rank = rank ^ 1U;
+                        std::memcpy(in.data() + offsetof(gs::Control, rank), &peer_rank, sizeof peer_rank);
+                    },
+                    rank);
+                gs::Control hello;
+                hello.cmd = static_cast<std::uint32_t>(gs::Cmd::heartbeat);
+                CHECK(throws_with([&] { (void)ch.exchange(hello); },
+                                  "protocol version " + std::to_string(old) + " from the peer, expected 14"));
+            }
+        std::printf("v13 / v12 / v11 / v9 peers: refused at the first exchange on rank 0 and rank 1\n");
         std::vector<gs::WireRow> rows = {{0, 1, 3}, {1, 1, 3}, {2, 1, 9}};
         CHECK(gs::consecutive_slots(rows));
         gs::check_rows(rows, 8, 16);
@@ -1591,7 +2306,8 @@ int main(int argc, char** argv) {
             go = true;
         }
         gcv.notify_all();
-        for (int i = 0; i < 2000 && (st.status(1) == gs::ImportStatus::pending || st.status(2) == gs::ImportStatus::pending); ++i)
+        for (int i = 0; i < 2000 &&
+             (st.status(1) == gs::ImportStatus::listening || st.status(2) == gs::ImportStatus::pending); ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         CHECK(st.status(1) == gs::ImportStatus::ready && st.payload(1).size() == 9 && st.payload(1)[0] == 1);
         CHECK(st.status(2) == gs::ImportStatus::failed && st.error(2).find("model hash") != std::string::npos);
@@ -2191,6 +2907,144 @@ int main(int argc, char** argv) {
         CHECK(a3.size() == 5 && t3->stats().finish == "length");
         stop.store(true);
         runner.join();
+    }
+    {  // Embed frame round: receive bounds and paired refusals (host only). The follower must fail the pair before it
+       // enters a further collective: its wire-call count shows how far it got (1: summary only, 2: summary and bytes).
+        namespace sess = strix::session;
+        sess::EmbedInterner interner;
+        sess::EmbedRows span;
+        span.rows = 6;
+        span.width = 16;
+        span.real_token_id = strix::glm::kImageToken;
+        span.digest.fill(9);
+        span.data.assign(std::size_t{6} * 16U, 0x3F80);
+        const auto lease = interner.intern(std::move(span));
+        const auto table = std::make_shared<const sess::EmbedTable>(std::vector<sess::EmbedLease>{lease});
+        const auto all_ids = lease.ids();
+        CHECK(all_ids.size() == 6);
+
+        // The row bound: per handle the span limit and the rows the chunk and the room after it can hold.
+        const std::vector<std::uint32_t> head3(all_ids.begin(), all_ids.begin() + 3);
+        CHECK(gs::embed_frame_rows_bound(head3, 0) == 3);
+        CHECK(gs::embed_frame_rows_bound(head3, 3) == 6);
+        CHECK(gs::embed_frame_rows_bound(head3, std::uint64_t{1} << 40U) == sess::kEmbedMaxRows);
+        CHECK(gs::embed_frame_rows_bound(std::vector<std::uint32_t>{11, 12}, 100) == 0);
+
+        struct RefuseEng {
+            std::vector<std::byte> embed_frame(std::span<const std::uint32_t>) { return {}; }
+            void embed_frame_received(std::span<const std::byte>, std::vector<std::uint32_t>&) { throw std::runtime_error("refused here"); }
+        };
+        struct Outcome {
+            std::string lead_error, follow_error;
+            unsigned follower_calls = 0;
+        };
+        // lead_fn drives rank 0 on its channel; the follower runs the real round on `eng` for `chunk`.
+        const auto drive = [&](const std::function<void(gs::Channel&)>& lead_fn, auto& eng, const std::vector<std::uint32_t>& chunk,
+                               std::uint64_t capacity, std::uint64_t room_after) {
+            Outcome o;
+            Loopback lb;
+            std::atomic<unsigned> calls{0};
+            auto w1 = lb.side(1);
+            gs::Channel c0(lb.side(0), 0);
+            gs::Channel c1([&](std::span<const std::byte> out, std::span<std::byte> in, std::uint32_t layer, std::uint64_t request) {
+                ++calls;
+                w1(out, in, layer, request);
+            }, 1);
+            std::thread lead([&] {
+                try { lead_fn(c0); } catch (const std::exception& e) { o.lead_error = e.what(); }
+            });
+            std::vector<std::uint32_t> prompt1 = chunk;
+            try { gs::embed_frame_round(eng, c1, prompt1, false, capacity, room_after); } catch (const std::exception& e) { o.follow_error = e.what(); }
+            lead.join();
+            o.follower_calls = calls.load();
+            return o;
+        };
+        const auto frame_of = [&](const std::vector<std::uint32_t>& chunk) {  // a fresh ledger each time: rows always travel
+            FakeEng probe(2);
+            probe.bind_embeds(table);
+            return probe.embed_frame(chunk);
+        };
+        const auto send_summary = [](gs::Channel& ch, std::array<std::uint32_t, gs::kEmbedFrameSummaryWords> s) {
+            std::vector<std::uint32_t> v(s.begin(), s.end());
+            ch.tokens(v, v.size(), true, gs::kEmbedFrameMessage);
+        };
+        const auto send_bytes = [](gs::Channel& ch, const std::vector<std::byte>& frame) {
+            std::vector<std::uint32_t> w((frame.size() + 3U) / 4U, 0U);
+            std::memcpy(w.data(), frame.data(), frame.size());
+            ch.tokens(w, w.size(), true, gs::kEmbedFrameMessage + 1U);
+        };
+        const std::uint64_t cap = std::uint64_t{1} << 17U;
+
+        {  // the whole span in the chunk, bound met: applied
+            FakeEng e0(2), e1(2);
+            e0.bind_embeds(table);
+            std::vector<std::uint32_t> p0 = all_ids;
+            const auto o = drive([&](gs::Channel& ch) { gs::embed_frame_round(e0, ch, p0, true, cap, 0); }, e1, all_ids, cap, 0);
+            CHECK(o.lead_error.empty() && o.follow_error.empty() && o.follower_calls == 2 && e1.embed_frames == 1);
+        }
+        {  // a chunk of one handle whose summary claims the whole span (6 rows), but the chunk holds 3 and the context room
+           // after it is zero: the bound is 3 rows, so the follower refuses on the summary, before any payload storage
+            FakeEng e1(2);
+            const auto frame = frame_of(head3);
+            const auto o = drive([&](gs::Channel& ch) { send_summary(ch, gs::embed_frame_summary(frame)); }, e1, head3, cap, 0);
+            CHECK(o.follow_error.find("summary out of range") != std::string::npos);
+            CHECK(o.follower_calls == 1 && e1.embed_frames == 0);
+        }
+        {  // spans of the summary differ from the chunk's distinct handles
+            FakeEng e1(2);
+            auto s = gs::embed_frame_summary(frame_of(all_ids));
+            s[1] = 2;
+            const auto o = drive([&](gs::Channel& ch) { send_summary(ch, s); }, e1, all_ids, cap, 0);
+            CHECK(o.follow_error.find("summary out of range") != std::string::npos && o.follower_calls == 1);
+        }
+        {  // width above the model's
+            FakeEng e1(2);
+            auto s = gs::embed_frame_summary(frame_of(all_ids));
+            s[3] = 1U << 17U;
+            const auto o = drive([&](gs::Channel& ch) { send_summary(ch, s); }, e1, all_ids, cap, 0);
+            CHECK(o.follow_error.find("summary out of range") != std::string::npos && o.follower_calls == 1);
+        }
+        {  // the bytes disagree with the summary: an entry claims other rows / width / axes than the summary says
+            const auto good = frame_of(all_ids);
+            const std::size_t at = strix::pair::kEmbedFrameHeaderBytes;  // first entry; rows at +4, width at +8, axes at +16
+            for (const std::size_t field : {std::size_t{4}, std::size_t{8}, std::size_t{16}}) {
+                FakeEng e1(2);
+                auto bad = good;
+                std::uint32_t v = 0;
+                std::memcpy(&v, bad.data() + at + field, 4);
+                v = field == 16U ? 1U : v - 1U;
+                std::memcpy(bad.data() + at + field, &v, 4);
+                const auto o = drive([&](gs::Channel& ch) { send_summary(ch, gs::embed_frame_summary(good)); send_bytes(ch, bad); }, e1,
+                                     all_ids, cap, 0);
+                CHECK(o.follow_error.find("does not match its summary") != std::string::npos);
+                CHECK(o.follower_calls == 2 && e1.embed_frames == 0);
+            }
+        }
+        {  // a byte length that the entries do not imply (two trailing bytes under a summary that states them)
+            FakeEng e1(2);
+            auto longer = frame_of(all_ids);
+            auto s = gs::embed_frame_summary(longer);
+            longer.insert(longer.end(), 2, std::byte{0});
+            s[0] = static_cast<std::uint32_t>(longer.size());
+            const auto o = drive([&](gs::Channel& ch) { send_summary(ch, s); send_bytes(ch, longer); }, e1, all_ids, cap, 0);
+            CHECK(o.follow_error.find("does not match its summary") != std::string::npos);
+            CHECK(o.follower_calls == 2 && e1.embed_frames == 0);
+        }
+        {  // receiver refusal: the engine cannot apply a frame that matches its summary; the pair fails on the follower
+            RefuseEng refuse;
+            const auto good = frame_of(all_ids);
+            const auto o = drive([&](gs::Channel& ch) { send_summary(ch, gs::embed_frame_summary(good)); send_bytes(ch, good); }, refuse,
+                                 all_ids, cap, 0);
+            CHECK(o.follow_error.find("control channel: embed frame: refused here") != std::string::npos);
+            CHECK(o.follower_calls == 2);
+        }
+        {  // peer teardown: the lead leaves after the summary; the follower's byte exchange fails (loopback timeout, 5 s)
+           // and the round throws instead of returning a half-received frame
+            FakeEng e1(2);
+            const auto good = frame_of(all_ids);
+            const auto o = drive([&](gs::Channel& ch) { send_summary(ch, gs::embed_frame_summary(good)); }, e1, all_ids, cap, 0);
+            CHECK(!o.follow_error.empty() && e1.embed_frames == 0);
+        }
     }
     if (failures == 0) std::printf("glm serve cpu tests: ALL PASS\n");
     else std::printf("glm serve cpu tests: %d FAILED\n", failures);

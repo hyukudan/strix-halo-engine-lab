@@ -8,6 +8,14 @@
 
 namespace strix::glm::spec {
 
+Accepted accept_decided(std::span<const std::uint32_t> drafts, std::span<const std::uint32_t> target, unsigned accepted,
+                        unsigned first_flagged, Terminal term) {
+    if (accepted > drafts.size()) throw std::invalid_argument("accept_decided: more accepted rows than drafts");
+    for (unsigned j = 0; j < accepted && j < target.size(); ++j)
+        if (target[j] != drafts[j]) throw std::invalid_argument("accept_decided: an accepted row's token is not its draft");
+    return accept_greedy(drafts.first(accepted), target, first_flagged, term);
+}
+
 Accepted accept_greedy(std::span<const std::uint32_t> drafts, std::span<const std::uint32_t> target, unsigned first_flagged,
                        Terminal term) {
     const std::size_t valid = std::min<std::size_t>(drafts.size() + 1, first_flagged);

@@ -48,6 +48,12 @@ struct Terminal {
 };
 Accepted accept_greedy(std::span<const std::uint32_t> drafts, std::span<const std::uint32_t> target,
                        unsigned first_flagged = kNoFlag, Terminal term = {});
+// Sampled verify: the sampler decided target[0 .. n) and accepted the first `accepted` drafts. Commits exactly those
+// drafts and then row `accepted`'s token, as accept_greedy over drafts[0 .. accepted) would; a rejected row whose token
+// equals its draft (coupled acceptance keeps the plain sample) ends the window like any rejection. Throws when an
+// accepted row's token is not its draft or `accepted` exceeds the drafts.
+Accepted accept_decided(std::span<const std::uint32_t> drafts, std::span<const std::uint32_t> target, unsigned accepted,
+                        unsigned first_flagged = kNoFlag, Terminal term = {});
 
 // ---- replicated window control for TP2 (design notes section 2.1). Rank 0 owns the timing EMAs and publishes them as a
 // CostTable inside its half of the verify argmax exchange of cycle c (version-stamped); from the draft phase of cycle c

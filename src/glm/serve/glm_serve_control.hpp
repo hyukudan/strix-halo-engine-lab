@@ -10,6 +10,7 @@
 // Checks on every round (both ranks): magic, version, the round number (no duplicate / stale round), the peer's
 // acknowledgement of the previous round, and the echo: the round, count, last token and FNV-1a of the tokens the
 // peer's last command produced must equal this rank's own (both ranks compute every token; a disagreement aborts both).
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +18,7 @@
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <map>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -24,25 +26,41 @@
 
 #include "glm/serve/glm_serve_import.hpp"
 #include "glm/serve/glm_serve_prefix_cache.hpp"
+#include "strix/pair/embed_frame.hpp"
 #include "strix/pair/lockstep.hpp"
 
 namespace strix::glm::serve {
 
 inline constexpr std::uint32_t kControlMagic = 0x434D4C47U;  // "GLMC" (little-endian bytes)
-inline constexpr std::uint32_t kControlVersion = 9;  // v9: MTP prompt-end key = the prompt (plen == ppos); v8: prefill units (kPrefillUnits, budget = layer units); v7 paired prefix snapshots
+inline constexpr std::uint32_t kControlVersion = 14;  // v14: a sampled MTP window may end at a stop id (kPairWindowStop decision); v13: the sampled MTP window decision carries the accepted-draft count (11 words; a v12 build exchanged 10); v12: embed frame summary before its bytes; v11: sampled MTP (kRunSample / kRunSampleDrafts on mtp_run / mtp_enter); v10: prefill embed frame (kPrefillEmbeds); v9: MTP prompt-end key = the prompt (plen == ppos); v8: prefill units (kPrefillUnits, budget = layer units); v7 paired prefix snapshots
 inline constexpr std::uint32_t kPrefillMtp = 1U;   // prefill pflags: exact chunked MTP bootstrap (prefill_mtp)
 inline constexpr std::uint32_t kPrefillLast = 2U;  // prefill pflags: the prompt's last chunk (MTP: its seed is kept)
 // prefill pflags (with kPrefillMtp): a prefill_mtp session of layer units; `budget` = units to run (0: cancel it).
 // kPrefillStart begins it over the plen tokens that follow at ppos; later calls carry no tokens.
 inline constexpr std::uint32_t kPrefillUnits = 32U;
 inline constexpr std::uint32_t kPrefillStart = 64U;
-inline constexpr std::uint32_t kPrefillSample = 128U;  // final plain prefill chunk
+inline constexpr std::uint32_t kPrefillSample = 128U;  // final prefill chunk (plain or MTP bootstrap)
+// prefill pflags: the chunk's tokens hold virtual ids (strix/session/embed_rows.hpp, image input). On the pair the
+// embed frame of its spans (strix/pair/embed_frame.hpp) follows the tokens: one summary message (byte length, spans,
+// rows, width, axes; checked before any allocation), then the bytes as 32-bit words. The follower re-interns the rows
+// and remaps the ids to its own handles.
+inline constexpr std::uint32_t kPrefillEmbeds = 256U;
+inline constexpr std::uint32_t kEmbedFrameMaxBytes = 1U << 30U;
+inline constexpr std::size_t kEmbedFrameMessage = std::size_t{1} << 19U;  // first message index of a frame (prompt messages stay below)
 inline constexpr std::uint32_t kStepSample = 1U << 31;  // step pflags carries a sampled-row mask
 inline constexpr std::uint32_t kHelloSamplingVote = 1U;
 inline constexpr std::uint32_t kPrefillPending = 0xFFFFFFFEU;  // a prefill units call that did not complete the prompt
 inline constexpr std::uint32_t kMaxMtpCycles = 64;
 inline constexpr std::uint32_t kPrefixReply = 8U;     // prefix_prepare pflags: reply-end snapshot (default: prompt-end)
 inline constexpr std::uint32_t kPrefixPressure = 16U; // prefix_evict pflags: eviction under memory pressure
+// mtp_run / mtp_enter pflags: the request samples (temperature > 0). kRunSample: the decoder's verify rows are decided
+// by the lead's sampler (strix::serve::decide_pair_window); kRunSampleDrafts (only with kRunSample): drafts are drawn
+// from the drafter's rows too (strix::serve::pick_pair_draft). Both ranks run the same exchanges.
+inline constexpr std::uint32_t kRunSample = 1U;
+inline constexpr std::uint32_t kRunSampleDrafts = 2U;
+// kRunRejection (only with kRunSampleDrafts): the sampler decides drafted rows by rejection sampling (it reads the
+// drafts' distributions; the shared lookup arbiter is off, its drafts have none).
+inline constexpr std::uint32_t kRunRejection = 8U;
 inline constexpr std::uint32_t kEnterSeed = 4U;   // mtp_enter pflags: open the C1 decoder from the slot's batched-spec seed
 inline constexpr std::uint32_t kImportFailed = ~0U;  // import_state's token on a rank whose restore failed
 inline constexpr std::uint32_t kImportDsaOnce = 8U;  // import_state pflags: hand-off v2, rank 0 relays the DSA components to rank 1
@@ -329,12 +347,13 @@ public:
     }
 
     // Prompt tokens after a prefill block: the lead sends `tokens`, the follower receives `n` of them.
-    void tokens(std::vector<std::uint32_t>& tokens, std::size_t n, bool sender) {
+    // k0: index of the first message inside the round (a second transfer of one round takes its own range).
+    void tokens(std::vector<std::uint32_t>& tokens, std::size_t n, bool sender, std::size_t k0 = 0) {
         if (sender && tokens.size() != n) throw std::logic_error("control channel: prompt size");
         if (!wire_) return;
         if (!sender) tokens.assign(n, 0);
         std::vector<std::uint32_t> out, in;
-        for (std::size_t c0 = 0, k = 0; c0 < n; c0 += kTokensPerMessage, ++k) {
+        for (std::size_t c0 = 0, k = k0; c0 < n; c0 += kTokensPerMessage, ++k) {
             const std::size_t m = std::min(kTokensPerMessage, n - c0);
             out.assign(m, 0);
             in.assign(m, 0);
@@ -369,6 +388,10 @@ public:
     void exchange_sampling_logits(std::span<const float> out, std::span<float> in, std::uint64_t chunk) {
         wire_(std::as_bytes(out), std::as_writable_bytes(in), 2, (lock_.round() << 20) | chunk);
     }
+    // Decision words of a sampled window or draft: one message index space with exchange_sampling_logits per round.
+    void exchange_sampling_words(std::span<const std::uint32_t> out, std::span<std::uint32_t> in, std::uint64_t chunk) {
+        wire_(std::as_bytes(out), std::as_writable_bytes(in), 2, (lock_.round() << 20) | chunk);
+    }
     [[nodiscard]] bool paired() const noexcept { return static_cast<bool>(wire_); }
     [[nodiscard]] std::uint64_t round() const noexcept { return lock_.round(); }
     [[nodiscard]] std::uint32_t rank() const noexcept { return lock_.rank(); }
@@ -379,6 +402,167 @@ private:
     std::uint64_t echo_round_ = kNoRound;
     std::uint32_t echo_count_ = 0, echo_token_ = 0, echo_hash_ = 2166136261U;
 };
+
+// A sampled MTP command as the engine adapter sees it: the pair's channel (its sampling exchanges), the lead's sampler
+// (null on the follower) and the kRunSample / kRunSampleDrafts flags.
+struct SampledRun {
+    Channel* ch = nullptr;
+    strix::TokenSampler* sampler = nullptr;
+    std::uint32_t flags = 0;
+    // The request's effective stop ids (the lead's; empty on the follower): a verify window ends at the first one
+    // decided and the decoder ends with it (the follower learns it from the window's kPairWindowStop decision).
+    std::span<const std::uint32_t> stops{};
+};
+
+// The sampled-MTP flags of an mtp_run / mtp_enter command (kEnterSeed excluded), checked; with flags the lead must hold
+// the request's sampler.
+inline SampledRun sampled_run(const Control& c, Channel& ch, bool sender, std::span<const strix::serve::PairSamplingRow> choices,
+                              std::uint32_t other_flags, const char* what) {
+    SampledRun run{&ch, nullptr, c.pflags & ~other_flags};
+    const bool drafts = (run.flags & kRunSampleDrafts) != 0, rejection = (run.flags & kRunRejection) != 0;
+    if ((run.flags & ~(kRunSample | kRunSampleDrafts | kRunRejection)) != 0 ||
+        ((drafts || rejection) && (run.flags & kRunSample) == 0) || (rejection && !drafts))
+        throw ProtocolError(std::string("control channel: ") + what + " flags");
+    if (run.flags != 0 && sender) {
+        if (choices.empty() || choices[0].sampler == nullptr) throw std::logic_error("control channel: sampled MTP without a sampler");
+        run.sampler = choices[0].sampler;
+        run.stops = choices[0].stops;
+    }
+    return run;
+}
+
+// The embed frame of a prefill chunk with virtual ids (kPrefillEmbeds), after its tokens. Eng: embed_frame(ids) ->
+// frame bytes (the lead: the rows of the spans its peer does not hold yet, for the table it was bound to);
+// embed_frame_received(frame, ids) (the follower: re-interns the rows, binds its table and rewrites ids to its own
+// handles); optional embed_row_width() (the language model width every row must have). World 1 sends nothing: the
+// lead resolves the ids against its own table.
+//
+// Wire: one message of kEmbedFrameSummaryWords (frame bytes, spans, payload rows, widest row, most axes), then the
+// bytes as 32-bit words. The follower checks the summary before it allocates anything: the spans are exactly the
+// chunk's distinct virtual ids, the rows fit embed_frame_rows_bound (per span: the span limit and the context room
+// after the chunk, not the whole slot capacity), the width is the model's, and the byte length is at most what those
+// spans and rows can take (and kEmbedFrameMaxBytes). The received bytes are then reconciled with the summary
+// (embed_frame_matches_summary: every entry's rows, width and axes, the exact byte length) before the parser sees them,
+// which then runs on the received words (the interner holds its own copy of each new span).
+// A refusal throws ProtocolError on the follower before the next collective; the lead, still in this exchange or the
+// next one, sees the follower leave (wire error or timeout) and fails the pair; neither rank continues alone.
+inline constexpr std::size_t kEmbedFrameSummaryWords = 5U;
+inline constexpr std::uint32_t kEmbedFrameMaxAxes = 4U;
+inline constexpr std::uint32_t kEmbedFrameMaxWidth = 1U << 16U;  // without embed_row_width()
+
+// The summary of an encoded frame (the sender's own bytes): spans, rows of the payloads that follow, widest row, axes.
+inline std::array<std::uint32_t, kEmbedFrameSummaryWords> embed_frame_summary(std::span<const std::byte> frame) {
+    namespace fd = strix::pair::embed_frame_detail;
+    std::array<std::uint32_t, kEmbedFrameSummaryWords> s{};
+    s[0] = static_cast<std::uint32_t>(frame.size());
+    s[1] = fd::get32(frame, 8U);
+    std::uint64_t rows = 0;
+    for (std::size_t e = 0; e < s[1]; ++e) {
+        const std::size_t at = strix::pair::kEmbedFrameHeaderBytes + e * strix::pair::kEmbedFrameEntryBytes;
+        if ((fd::get32(frame, at + 20U) & 1U) == 0U) continue;  // no payload: the peer holds the rows
+        rows += fd::get32(frame, at + 4U);
+        s[3] = std::max(s[3], fd::get32(frame, at + 8U));
+        s[4] = std::max(s[4], fd::get32(frame, at + 16U));
+    }
+    if (rows > 0xFFFFFFFFU) throw std::logic_error("control channel: embed frame rows");
+    s[2] = static_cast<std::uint32_t>(rows);
+    return s;
+}
+
+// Most payload rows the frame of this chunk can carry, from data both ranks hold (the chunk's ids, the context room
+// after it). A span has at most kEmbedMaxRows rows; its rows up to the highest one in this chunk are known, and the
+// rest are placeholder ids of the same prompt that must fit the context after the chunk. A chunk of one handle is thus
+// bounded by that span, not by the slot capacity. A frame only carries rows the peer lacks, so this is an upper bound.
+inline std::uint64_t embed_frame_rows_bound(std::span<const std::uint32_t> ids, std::uint64_t room_after) {
+    std::map<std::uint32_t, std::uint32_t> top;  // handle -> highest row index seen
+    for (const auto id : ids)
+        if (strix::session::is_embed_id(id)) {
+            auto& t = top[strix::session::embed_handle(id)];
+            t = std::max(t, strix::session::embed_row(id));
+        }
+    std::uint64_t bound = 0;
+    for (const auto& kv : top)
+        bound += std::min<std::uint64_t>(strix::session::kEmbedMaxRows, std::uint64_t{kv.second} + 1U + room_after);
+    return bound;
+}
+
+// The received bytes against the summary both ranks agreed on: length, span count, payload rows, widest row, most axes
+// and the exact byte length that the entries (rows, width, axes) imply. The caller has checked that the length holds
+// the header and the entries. False on any difference; the parser then never sees the frame.
+inline bool embed_frame_matches_summary(std::span<const std::byte> frame, const std::array<std::uint32_t, kEmbedFrameSummaryWords>& s,
+                                        std::uint32_t max_width) {
+    namespace fd = strix::pair::embed_frame_detail;
+    const std::uint64_t head = strix::pair::kEmbedFrameHeaderBytes + std::uint64_t{s[1]} * strix::pair::kEmbedFrameEntryBytes;
+    if (frame.size() != s[0] || frame.size() < head || fd::get32(frame, 8U) != s[1]) return false;
+    std::uint64_t rows = 0, bytes = head;
+    std::uint32_t width = 0, axes = 0;
+    for (std::uint32_t e = 0; e < s[1]; ++e) {
+        const std::size_t at = strix::pair::kEmbedFrameHeaderBytes + std::size_t{e} * strix::pair::kEmbedFrameEntryBytes;
+        const std::uint32_t r = fd::get32(frame, at + 4U), w = fd::get32(frame, at + 8U), a = fd::get32(frame, at + 16U),
+                            flags = fd::get32(frame, at + 20U);
+        if (r == 0U || r > strix::session::kEmbedMaxRows || w == 0U || w > max_width || a > kEmbedFrameMaxAxes || (flags & ~1U) != 0U)
+            return false;
+        if ((flags & 1U) == 0U) continue;
+        rows += r;
+        bytes += fd::payload_bytes(r, w, a);
+        width = std::max(width, w);
+        axes = std::max(axes, a);
+    }
+    return rows == s[2] && width == s[3] && axes == s[4] && bytes == frame.size();
+}
+
+// room_after: context positions after this chunk (capacity - pos - length).
+template<class Eng>
+void embed_frame_round(Eng& eng, Channel& ch, std::vector<std::uint32_t>& prompt, bool sender, std::uint64_t capacity,
+                       std::uint64_t room_after) {
+    if constexpr (requires(std::span<const std::byte> f) { eng.embed_frame(std::span<const std::uint32_t>{}); eng.embed_frame_received(f, prompt); }) {
+        if (!ch.paired()) return;
+        std::vector<std::byte> frame;
+        std::vector<std::uint32_t> summary(kEmbedFrameSummaryWords, 0), words;
+        if (sender) {
+            frame = eng.embed_frame(std::span<const std::uint32_t>(prompt));
+            if (frame.empty() || frame.size() > kEmbedFrameMaxBytes) throw std::logic_error("control channel: embed frame size");
+            const auto s = embed_frame_summary(frame);
+            std::copy(s.begin(), s.end(), summary.begin());
+        }
+        ch.tokens(summary, kEmbedFrameSummaryWords, sender, kEmbedFrameMessage);
+        const std::uint32_t length = summary[0], spans = summary[1], rows = summary[2], width = summary[3], axes = summary[4];
+        std::uint32_t max_width = kEmbedFrameMaxWidth;
+        if constexpr (requires { eng.embed_row_width(); }) max_width = static_cast<std::uint32_t>(eng.embed_row_width());
+        const std::size_t expected_spans = strix::pair::embed_frame_handles(std::span<const std::uint32_t>(prompt)).size();
+        if (length == 0 || length > kEmbedFrameMaxBytes || spans == 0 || spans != expected_spans || rows > capacity ||
+            rows > embed_frame_rows_bound(std::span<const std::uint32_t>(prompt), room_after) ||
+            width > max_width || axes > kEmbedFrameMaxAxes || (rows != 0 && width == 0))
+            throw ProtocolError("control channel: embed frame summary out of range");
+        const std::uint64_t most = std::uint64_t{strix::pair::kEmbedFrameHeaderBytes} +
+                                   std::uint64_t{spans} * (strix::pair::kEmbedFrameEntryBytes + 3U) +
+                                   strix::pair::embed_frame_detail::payload_bytes(rows, width, axes);
+        if (length < strix::pair::kEmbedFrameHeaderBytes + std::uint64_t{spans} * strix::pair::kEmbedFrameEntryBytes ||
+            length > most)
+            throw ProtocolError("control channel: embed frame length does not match its summary");
+        const std::size_t n = (std::size_t{length} + 3U) / 4U;
+        words.assign(n, 0);
+        if (sender) std::memcpy(words.data(), frame.data(), frame.size());
+        ch.tokens(words, n, sender, kEmbedFrameMessage + 1U);
+        if (!sender) {
+            const auto bytes = std::as_bytes(std::span<const std::uint32_t>(words)).first(length);
+            std::array<std::uint32_t, kEmbedFrameSummaryWords> agreed{};
+            std::copy(summary.begin(), summary.end(), agreed.begin());
+            bool same = false;
+            try { same = embed_frame_matches_summary(bytes, agreed, max_width); } catch (const std::exception&) {}
+            if (!same) throw ProtocolError("control channel: embed frame does not match its summary");
+            try {
+                eng.embed_frame_received(bytes, prompt);
+            } catch (const std::exception& e) {  // a frame the follower cannot apply leaves the ranks apart: fatal for the pair
+                throw ProtocolError(std::string("control channel: embed frame: ") + e.what());
+            }
+        }
+    } else {
+        (void)capacity;
+        (void)room_after;
+        throw ProtocolError("control channel: this engine takes no embedding rows");
+    }
+}
 
 // The engine calls of one command, made identically by both ranks (the lead after sending it, the follower after
 // receiving it). Eng: reset(slot); prefill(slot, tokens, pos0) -> next; step(span<const WireRow>) -> tokens;
@@ -505,8 +689,10 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
             return out;
         }
         case Cmd::prefill: {
-            if (sample_mask && (c.pflags & (kPrefillLast | kPrefillMtp | kPrefillUnits)) != kPrefillLast)
-                throw ProtocolError("control channel: sampling requires the final plain prefill chunk");
+            // The MTP bootstrap (whole or in layer units) restores the prompt's last-row logits after seeding its
+            // drafter, so the call that completes the prompt can be sampled on either route.
+            if (sample_mask && (c.pflags & kPrefillLast) == 0U)
+                throw ProtocolError("control channel: sampling requires the final prefill chunk");
             if ((c.pflags & kPrefillUnits) != 0U && (c.pflags & kPrefillStart) == 0U) {  // resume / cancel: no tokens
                 if (c.pslot >= slots || (c.pflags & kPrefillMtp) == 0U || c.plen != 0)
                     throw ProtocolError("control channel: prefill units resume out of range");
@@ -521,6 +707,7 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
             if (c.plen == 0 || c.ppos >= capacity || c.plen >= capacity - c.ppos)
                 throw ProtocolError("control channel: prompt chunk out of range");
             ch.tokens(prompt, c.plen, sender);
+            if ((c.pflags & kPrefillEmbeds) != 0U) embed_frame_round(eng, ch, prompt, sender, capacity, capacity - c.ppos - c.plen);
             const std::span<const std::uint32_t> p(prompt);
             if ((c.pflags & kPrefillUnits) != 0U) {
                 if ((c.pflags & kPrefillMtp) == 0U || c.budget == 0)
@@ -575,12 +762,26 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
         case Cmd::mtp_enter: {
             if (c.pslot >= kMaxRows || c.row[0].slot >= slots || c.row[0].pos + 1 >= capacity)
                 throw ProtocolError("control channel: mtp_enter out of range");
-            eng.mtp_enter(c.pslot, c.row[0], (c.pflags & kEnterSeed) != 0);
+            const SampledRun run = sampled_run(c, ch, sender, choices, kEnterSeed, "mtp_enter");
+            if (run.flags == 0) {
+                eng.mtp_enter(c.pslot, c.row[0], (c.pflags & kEnterSeed) != 0);
+            } else if constexpr (requires { eng.mtp_enter(c.pslot, c.row[0], true, run); }) {
+                eng.mtp_enter(c.pslot, c.row[0], (c.pflags & kEnterSeed) != 0, run);
+            } else {
+                throw ProtocolError("control channel: sampled MTP unavailable");
+            }
             return out;
         }
         case Cmd::mtp_run: {
             if (c.pslot >= slots || c.cycles == 0 || c.budget == 0) throw ProtocolError("control channel: mtp_run out of range");
-            out = eng.mtp_run(c.pslot, c.budget, c.cycles);
+            const SampledRun run = sampled_run(c, ch, sender, choices, 0U, "mtp_run");
+            if (run.flags == 0) {
+                out = eng.mtp_run(c.pslot, c.budget, c.cycles);
+            } else if constexpr (requires { eng.mtp_run(c.pslot, c.budget, c.cycles, run); }) {
+                out = eng.mtp_run(c.pslot, c.budget, c.cycles, run);
+            } else {
+                throw ProtocolError("control channel: sampled MTP unavailable");
+            }
             break;
         }
         case Cmd::spec_verify: {
@@ -622,7 +823,10 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
     }
     // Both ranks still echo the paired head's result. Only the lead's returned tokens are replaced.
     ch.record(ch.round() - 1, out);
-    if (sample_mask) {
+    // A units call the engine did not complete keeps kPrefillPending on both ranks: the lead's unit arithmetic check
+    // then fails loudly instead of emitting a token sampled from rows that are not the prompt's last.
+    const bool pending = cmd == Cmd::prefill && !out.empty() && out[0] == kPrefillPending;
+    if (sample_mask && !pending) {
         if constexpr (requires { eng.sample_outputs(ch, sample_mask, choices, std::span(out)); })
             eng.sample_outputs(ch, sample_mask, choices, std::span(out));
         else

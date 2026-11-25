@@ -14,6 +14,10 @@
 //   --g3 TOKENS.u32 [--layers N]     teacher-forced first N layers (default 6), slot 0: writes the residual after every
 //                                    token to --out (raw f32 [T][4][4096]) and prints its FNV-1a + the state hash
 //   --decode N --prompt TOKENS.u32   prefill (default auto = exact chunked gemv identity when admissible; --prefill ref = decode row by row)
+//   --embed-rows A.rows[,B.rows,...] image input of that one prompt (strix-glm5-vision encode / expand): the n-th run of
+//                                    image tokens takes the rows of the n-th file instead of the embedding table.
+//                                    Chunked prefill only (with MTP speculation: --prefill gemv); give both ranks the
+//                                    same files.
 //                                    then N greedy steps; prints tokens, ms/token
 //   --batch R --steps N              R slots decoding together (one row each) for N steps; aggregate tok/s
 //   --spec-oracle K --pattern M,M,.. --decode N --prompt T.u32   gate SP1a (needs --spec 1): plain greedy run of N tokens,
@@ -71,6 +75,8 @@
 #include "glm/attn/glm_attn_tierb.hpp"
 #include "glm/common/glm_math.hpp"
 #include "glm/engine/glm_mem.hpp"
+#include "glm/engine/glm_embed_splice.hpp"
+#include "strix/session/embed_rows_file.hpp"
 #include "glm/engine/glm_r1b.hpp"
 #include "bitcalc_measurement.hpp"
 #include "glm/engine/glm_fast_moe.hpp"
@@ -153,6 +159,7 @@ int main(int argc, char** argv) {
         GlmDeployment deployment;
         opt.model_dir = argv[1];
         std::string transport_spec, g3_tokens, prompt, out_path, tf_tokens, state_out, state_in;
+        std::string embed_rows_arg;  // --embed-rows A.rows[,B.rows,...]: provided embedding rows of the one --prompt
         std::string mtp_prefill = "ref", mtp_prefill_gate;
         std::string prefill_mode = "auto", pf_gate, pf_ttft, pf_ttft_mode = "gemv", pf_null_study, pf_nulls;
         std::string pf_ttft_arms;  // strix::env_arms spec: in-process ABAB arms for --pf-ttft (bundle tickets)
@@ -195,6 +202,7 @@ int main(int argc, char** argv) {
             else if (a == "--layers") g3_layers = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--decode") decode_n = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--prompt") prompt = next();
+            else if (a == "--embed-rows") embed_rows_arg = next();
             else if (a == "--prompt-max") prompt_max = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--split-ab") {
                 const std::string v = next();
@@ -339,6 +347,12 @@ int main(int argc, char** argv) {
         if (prefill_mode == "auto")
             prefill_mode = rd::resolve_prefill_auto(opt.mtp, opt.spec, g3_only, smoke_head, mem_plan, r1b_all, idcheck_n, reference_gate, mtp_spec_on);
         if (prefill_mode != eff.prefill) throw std::logic_error("prefill resolution differs from --print-effective-config");
+        if (!embed_rows_arg.empty() && prefill_mode == "ref")
+            throw std::invalid_argument("--embed-rows needs a chunked prefill (--prefill gemv|wmma), not the row-by-row reference");
+        // With MTP speculation the prompt runs through the chunked bootstrap (prefill_mtp), which is the gemv identity;
+        // any other prefill bootstraps row by row, where no row can be provided.
+        if (!embed_rows_arg.empty() && mtp_spec_on && prefill_mode != "gemv")
+            throw std::invalid_argument("--embed-rows with MTP speculation needs --prefill gemv (or --mtp 0 for plain decode)");
         if (batch_r > opt.slots) opt.slots = batch_r;
         for (unsigned r : split_ab_rs) opt.slots = std::max<std::uint32_t>(opt.slots, r);
         if (g4_rmax > opt.slots) opt.slots = g4_rmax;
@@ -378,6 +392,35 @@ int main(int argc, char** argv) {
             }
             for (unsigned byte = 0; byte < 4; ++byte)
                 prompt_hash = (prompt_hash ^ ((static_cast<std::uint32_t>(decode_prompts.size()) >> (8 * byte)) & 255U)) * 16777619U;
+        }
+        // --embed-rows: the rows files of the prompt's image spans, in prompt order. Their content is part of the
+        // prompt agreement, so two ranks given different rows refuse each other before any forward.
+        strix::session::EmbedSplice embed_splice;
+        if (!embed_rows_arg.empty()) {
+            if (decode_prompts.size() != 1) throw std::invalid_argument("--embed-rows takes --decode N with one --prompt");
+            // Headers first: the files' rows and bytes are budgeted against the prompt before any payload is read.
+            std::vector<std::string> row_files;
+            std::vector<strix::session::EmbedRowsFileInfo> row_infos;
+            for (std::size_t a = 0; a <= embed_rows_arg.size();) {
+                const auto b = std::min(embed_rows_arg.find(',', a), embed_rows_arg.size());
+                row_files.push_back(embed_rows_arg.substr(a, b - a));
+                row_infos.push_back(strix::session::read_embed_rows_file_info(row_files.back(), strix::glm::kHidden));
+                a = b + 1;
+            }
+            ge::check_embed_row_headers(decode_prompts[0], row_infos, strix::glm::kHidden);
+            std::vector<strix::session::EmbedRows> spans;
+            // The payload pass holds each file to its admitted header (a replacement in between is refused before
+            // any row is allocated).
+            for (std::size_t f = 0; f < row_files.size(); ++f)
+                spans.push_back(strix::session::read_embed_rows_file(row_files[f], row_infos[f]));
+            embed_splice = ge::prompt_embed_splice(decode_prompts[0], std::move(spans), strix::glm::kHidden);
+            for (const auto& seg : embed_splice.segments) {
+                const std::uint64_t h = strix::session::embed_rows_fnv(seg.data, static_cast<std::size_t>(seg.rows) * strix::glm::kHidden);
+                for (const std::uint32_t w : {seg.run_row, seg.rows, static_cast<std::uint32_t>(h), static_cast<std::uint32_t>(h >> 32U)})
+                    for (unsigned byte = 0; byte < 4; ++byte) prompt_hash = (prompt_hash ^ ((w >> (8 * byte)) & 255U)) * 16777619U;
+            }
+            std::printf("rank %u embed rows: %zu image span(s), %llu of %zu prompt rows provided\n", opt.rank, embed_splice.segments.size(),
+                        static_cast<unsigned long long>(embed_splice.rows()), decode_prompts[0].size());
         }
         std::unique_ptr<strix::dist::Communicator> comm;
         std::shared_ptr<strix::glm::xfer::XferExchange> xfer_exchange;
@@ -1053,6 +1096,8 @@ int main(int argc, char** argv) {
         }
         for (const auto& toks : decode_prompts) {
             eng.reset(0);
+            // The image rows of this prompt's prefill; set before the free-memory reading (the staging is allocated here).
+            if (!embed_splice.empty()) eng.set_embed_rows(embed_splice);
             if (!bitcalc_cases.empty() && (setenv("STRIX_BITCALC_FORCE_TOKENS", bitcalc_cases[pi].first.c_str(), 1) != 0 ||
                                            setenv("STRIX_BITCALC_LOGITS_OUT", bitcalc_cases[pi].second.c_str(), 1) != 0))
                 throw std::runtime_error("STRIX_GLM_BITCALC_CASES: setenv");

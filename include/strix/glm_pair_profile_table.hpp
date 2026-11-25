@@ -6,11 +6,14 @@
 
 namespace strix::glm::rank_defaults {
 
+inline constexpr char kSampledMtpCoupledIdentity[] = "glm-sampled-mtp-coupled-v1";
+inline constexpr char kSampledMtpRejectionIdentity[] = "glm-sampled-mtp-rejection-v1";
+
 // Default/quality export nothing. FAST selects no lever: the FAST prefill set (pf_wmma) fails the 8K quality gate, so it
 // is UNQUALIFIED for fast and runs only with an explicit STRIX_GLM_PF_WMMA=1. TURBO keeps pf_wmma (incumbent grant
 // below). The other bit-changing prefill switches are rows so that an explicit setting is named in the receipt; their
 // TURBO cells are candidates that stay at the builtin until a timing row shows them faster in the regime.
-inline constexpr std::array<strix::profile::Lever, 10> product_profile_table{{
+inline constexpr std::array<strix::profile::Lever, 11> product_profile_table{{
     {"pf_wmma", "STRIX_GLM_PF_WMMA", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, true}, {true, true, true, true}, "glm-pf-wmma-x", "0",
      "docs/optimizations.md#glm-pf-wmma-x: UNQUALIFIED for fast: the FAST prefill set fails the 8K quality gate (KL 0.0587 and "
@@ -37,6 +40,15 @@ inline constexpr std::array<strix::profile::Lever, 10> product_profile_table{{
     {"kda_state16", "STRIX_GLM_PF_KDA_STATE16", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {false, false, false, false}, "", "0",
      "pending: KDA recurrent state in 16-bit (not covered by STRIX_GLM_PF_WMMA)", false, {}, false, {}, {{{"0", "v1"}, {"1", "v1"}}}},
+    // Server: sampled requests decode through MTP only by explicit opt-in. Coupled keeps the tokens of plain
+    // sampling. Rejection changes per-seed tokens and is admitted by fast / turbo only. CLI and serve share
+    // rank_defaults::resolve_sampled_mtp. The builtin keeps the legacy fingerprint.
+    {"serve_sampled_mtp", "STRIX_GLM_SERVE_SAMPLED_MTP", "", {}, "0", strix::profile::Kind::exact,
+     {false, false, false, false}, {true, true, true, true}, "coupled", "0",
+     "pending: pair gates of sampled MTP (coupled: seeded tokens and committed rows == plain sampling, forced rejection, "
+     "batch handover, prefix restore, stops; rejection: acceptance/state oracle + distribution gate)",
+     false, {}, true, {}, {{{"0", "glm-plain-sampling-v1"},
+                           {"coupled", kSampledMtpCoupledIdentity}, {"rejection", kSampledMtpRejectionIdentity}}}},
 }};
 // Ladder rows (strix::profile::LadderRow): incumbent grant for the turbo cell the resolver ran before the ladder rule.
 inline constexpr strix::profile::LadderRow product_ladder_rows[] = {

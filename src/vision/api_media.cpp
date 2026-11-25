@@ -78,6 +78,24 @@ serve::ApiMediaSpan ApiMediaBridge::encode(const serve::media::MediaItem& item, 
         }
     }
     if (!lease) {
+        // Geometry first: a request whose row budget cannot hold the image is refused from the encoded header, before the
+        // image is decoded or any canvas or patch grid is built. Only inside the decode limits (an image over them is
+        // refused by decode() as before) and only for an adapter that states its rows.
+        if (item.bytes.size() <= options_.limits.max_bytes) {
+            std::uint64_t rows = 0;
+            try {
+                const ImageInfo info = probe(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(item.bytes.data()), item.bytes.size()));
+                if (info.width > 0 && info.height > 0 &&
+                    std::uint64_t(info.width) * std::uint64_t(info.height) <= options_.limits.max_pixels) {
+                    const bool turned = options_.limits.apply_exif_orientation && info.orientation >= 5 && info.orientation <= 8;
+                    rows = adapter_.rows_for_size(turned ? info.height : info.width, turned ? info.width : info.height);
+                }
+            } catch (const ImageError& e) {
+                ++stats_.refused;
+                refuse_image(e);
+            }
+            if (rows > budget) over_budget(static_cast<std::size_t>(rows));
+        }
         Image image;
         try {
             image = decode(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(item.bytes.data()),

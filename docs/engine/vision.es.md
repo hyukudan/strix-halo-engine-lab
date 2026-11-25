@@ -7,7 +7,8 @@ en el par de dos nodos. Un [runtime de visión compartido](shared-cores.es.md#lo
 | Modelo | Entrada de imágenes |
 |---|---|
 | DeepSeek V4.1 | sí, en el par, con `--vision` |
-| Qwen, GLM, MiniMax, Gemma | todavía no |
+| GLM-5.3 Flash | borrador: `strix-glm5-rank --embed-rows` y `strix-glm5-serve --vision`, torre en CPU; el servidor funciona en el par (dos imágenes bien respondidas), `--embed-rows` aún sin ejecutar |
+| Qwen, MiniMax, Gemma | todavía no |
 
 ## Uso
 
@@ -24,6 +25,31 @@ curl http://localhost:8080/v1/chat/completions -H 'Content-Type: application/jso
     {"type": "text", "text": "Describe this image."},
     {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}]}]}'
 ```
+
+## GLM-5.3 Flash
+
+La torre de imagen es un fichero GGUF de proyector aparte (`clip.projector_type = glm5v`, almacenado en FP32 / FP16 /
+BF16). Se ejecuta en CPU, sobre la referencia FP32 compartida, antes de la ejecución: `strix-glm5-vision` escribe las
+filas proyectadas de una imagen en un fichero de filas y ambos ranks leen ese fichero, así insertan los mismos bytes.
+
+```sh
+./build/strix-glm5-vision encode MMPROJ.gguf IMAGE.png IMAGE.rows
+./build/strix-glm5-vision expand PROMPT.u32 PROMPT.image.u32 IMAGE.rows   # PROMPT.u32 lleva un <|image|> por imagen
+./build/strix-glm5-rank MODEL_DIR --world 2 --rank R --transport usb4-auto \
+    --prompt PROMPT.image.u32 --embed-rows IMAGE.rows --decode 64
+./build/strix-glm5-serve MODEL_DIR --world 2 --rank 0 --transport usb4-auto --vision MMPROJ.gguf   # servidor, rank 0
+```
+
+Con `--vision` el servidor acepta partes `image_url` en las peticiones de chat: el rank 0 codifica cada imagen nueva
+en su CPU y envía las filas al rank 1 una vez por imagen. Los prompts con imagen usan el mismo planificador (trozos,
+MTP), no entran en la caché de prefijos ni en la ruta RTX y rechazan `session_id`.
+
+Estado: el adaptador, la herramienta, la mitad de host del servidor y el protocolo del par (con un motor simulado)
+están probados en el host con ficheros de proyector sintéticos. La mitad de dispositivo (`Engine::set_embed_rows` en
+el prefill normal y en el de MTP, `--embed-rows`, el `main` del servidor) compila para gfx1151 y, en un par (2026-11-24,
+un cable USB4), el servidor funciona con el fichero de proyector real (`mmproj-F16.gguf`): dos imágenes sintéticas se
+respondieron bien, voraz y muestreado. Aún sin ejecutar: `strix-glm5-rank --embed-rows`, imágenes que ocupen varios
+trozos o unidades de prefill, y la identidad de un prompt de texto frente a la build anterior en el dispositivo. Detalles, coste en CPU y límites: [versión en inglés](vision.md#glm-53-flash).
 
 ## Ruta de datos
 

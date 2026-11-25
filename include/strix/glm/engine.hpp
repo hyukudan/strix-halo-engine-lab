@@ -14,6 +14,7 @@
 // unless a declared arithmetic deviation is approved. Implementations are installed with Engine::set_*() before load() or between
 // calls; the engine owns weights and state, seams own only their scratch.
 #include "glm/spec/glm_spec_merge.hpp"
+#include "strix/session/embed_splice.hpp"
 #include "strix/pair/producer_publish.hpp"
 #include "strix/block_summary_state.hpp"
 
@@ -404,6 +405,14 @@ public:
     // (prefill: set_prefill(pf::make_prefill_path(...))) it runs in chunks of Options::max_rows rows through that seam;
     // the head runs on the last row only, and the slot's MTP cache is not filled (mtp() refuses the slot until reset).
     std::uint32_t prefill(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0);
+    // Provided embedding rows of the NEXT prefill(), prefill_mtp() or prefill_mtp_begin() call (image input;
+    // strix/session/embed_splice.hpp): the run rows the splice names take their layer-0 input from it instead of the
+    // embedding table, in all four residual streams; run row i is tokens[i] of that call, whose id must still be a
+    // vocabulary token. prefill_mtp also gives the drafter the provided row where it embeds the next prompt row.
+    // Consumed by that call, also when it throws. It needs a chunked PrefillPath (the row-by-row reference prefill
+    // refuses it). With two ranks both must be given the same splice. The device staging (rows of one chunk, 2 bytes
+    // per element) is allocated here, never inside a prefill.
+    void set_embed_rows(session::EmbedSplice splice);
     // One decode step of up to 8 rows; returns each row's greedy token (identical on both ranks).
     std::vector<std::uint32_t> step(std::span<const Row> rows);
     // Reset a slot (sequence start): token caches emptied, KDA / conv state zeroed.
