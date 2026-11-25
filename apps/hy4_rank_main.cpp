@@ -654,10 +654,6 @@ int run(int argc, char** argv) {
     hp::Regime regime;
     regime.topology = std::getenv("HY4_RANK") != nullptr ? hp::Topology::pair : hp::Topology::one_node;
     regime.prompt_tokens = prompt.size();
-    if (regime.topology == hp::Topology::one_node && tp_rank < 0 && o.depth == 0U && gen == 64U &&
-        o.context == 8384U && top == 0U && o.verify_rows == 0U && !gref.on && teacher.empty() && !timing &&
-        dump_path.empty())
-        regime.execution = hp::single_greedy_8k;
     {
         int dev = 0;
         hipDeviceProp_t prop{};

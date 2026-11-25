@@ -764,17 +764,6 @@ void hy4_new_quality_rows() {
     p::Inputs in;
     in.profile = p::Name::fast;
     in.env = none;
-    // The width change stays inside the incumbent's gated arithmetic and is inherited by TURBO.
-    const h::Regime measured{h::Device::gfx1151, h::Topology::one_node, 8192, h::single_greedy_8k};
-    for (const auto tier : {p::Name::fast, p::Name::turbo}) {
-        in.profile = tier;
-        const auto resolution = h::resolve(measured, in);
-        const auto* rows = resolution->find("prompt_rows");
-        require(rows->value == "2048" && rows->status == p::Status::set &&
-                    rows->ladder.find(h::single_greedy_8k_receipt) != std::string::npos,
-                "Hy4 picks the recorded 2048 schedule inside the gated window class");
-    }
-    in.profile = p::Name::fast;
     const h::Regime beyond{h::Device::gfx1151, h::Topology::one_node, 40000, "fixture-exec"};
     const h::Regime inside{h::Device::gfx1151, h::Topology::one_node, 32568, "fixture-exec"};
     require(h::resolve(inside, in)->find("prompt_rows")->value == "4096", "frozen grant: the qualified band still runs");
