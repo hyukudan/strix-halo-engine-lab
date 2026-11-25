@@ -261,6 +261,18 @@ struct RegimeWeightLoad {
 
 inline constexpr std::size_t kMaxWeightLoadRegimes = 4;
 
+// Candidate admission is separate from the effective (incumbent) storage of a pending load.
+struct StrixPackLoad {
+    Id policy;
+    bool refused = false;
+
+    [[nodiscard]] constexpr std::string_view reason() const {
+        return refused ? "refused: loader not present" : "loader not present";
+    }
+};
+
+[[nodiscard]] std::optional<StrixPackLoad> bind_strixpack_load(profile::Resolution& resolution);
+
 struct WeightLoadPlan {
     Id policy;
     FormatId storage;  // every tagged role but the head
@@ -271,6 +283,11 @@ struct WeightLoadPlan {
     std::string_view turbo_quality{};  // non-empty: admitted by a TURBO-only row (quality below the FAST gate, stated)
     std::array<RegimeWeightLoad, kMaxWeightLoadRegimes> regimes{};  // per regime, in request order
     std::size_t regime_count = 0;
+    std::optional<StrixPackLoad> strixpack{};
+
+    void require_loadable() const {
+        if (strixpack && strixpack->refused) throw std::invalid_argument(std::string(strixpack->reason()));
+    }
 
     [[nodiscard]] FormatId storage_for(std::optional<Role> role) const {
         return !role ? kBf16WeightStorage : *role == Role::head ? head_storage : storage;

@@ -699,6 +699,28 @@ void strixpack_candidates() {
                     std::string(candidate->name) + ": SP stays off without a loader and receipt");
         }
     }
+    const auto& candidate = kAttentionHeadSP4Lever;
+    const p::Regime regime{p::Phase::decode, 64U, 1U, "gfx1151", kExec};
+    const auto arms = p::ladder_arms(engine.table, engine.ladder,
+        regime, [](const p::Lever& row, unsigned column) { return p::column_admission(row, column, false, false); });
+    for (const auto tier : {p::Name::fast, p::Name::turbo}) {
+        const auto reference = arms.over(tier, candidate.name, candidate.target);
+        require(!reference.empty(), "SP4 has a complete reference key");
+        const p::LadderRow receipt{candidate.name, candidate.target, tier, regime.phase, regime.device,
+                                   regime.context, regime.context, 1, 1, 1.2, 0.01, "fixture/sp4", false, {}, {}, reference};
+        auto measured = engine;
+        measured.ladder = std::span(&receipt, 1);
+        require(p::ladder_defect(measured).empty(), "SP4 synthetic receipt is valid");
+        for (const auto applied : {tier, p::Name::turbo}) {
+            auto granted = resolve(measured, applied, regime);
+            const auto* entry = granted.find(candidate.name);
+            require(entry && entry->value == candidate.target, "same SP4 identity resolves in either tier");
+            const auto plan = bind_strixpack_load(granted);
+            require(plan && same_id(plan->policy, kAttentionHeadSP4Policy.id) && !plan->refused &&
+                        entry && entry->value == "off" && entry->status == p::Status::pending && entry->ladder.empty(),
+                    "the admission binding demotes a receipt grant until the loader exists");
+        }
+    }
 }
 
 void incumbents(const char* golden, bool write) {

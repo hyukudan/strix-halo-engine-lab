@@ -520,7 +520,7 @@ int main() {
             const std::array sp_formats{storage};
             const auto sp_plan = weight::resolve_weight_load(registry, *policy_sp, {tier, scope, sp_formats, true, true}, {});
             ok &= check(sp_plan.status == strix::profile::Status::pending && sp_plan.storage == weight::kBf16WeightStorage &&
-                        sp_plan.reason.find("requires the Strix pack loader") != std::string_view::npos,
+                        sp_plan.strixpack && sp_plan.strixpack->refused && sp_plan.reason == "refused: loader not present",
                         "SP load cannot be selected by an opt-in");
         }
     }
