@@ -38,6 +38,16 @@ per token do not change; only the codes and scales do.
   (`require_separation` in `calib_provenance.hpp`), so no held-out row enters a reported error. It also writes a
   table of the relative output error of every matrix for every technique, measured on the evaluation statistics.
 
+- Strix pack SP4 with the fixed table (`strix.sp4t`, `strix/weight/host_lowbit.hpp` `sp::`): 68 bytes per 128 weights
+  like `q4_g64`, sign + magnitude-index codes on the table {1,3,5,8,10,14,18,24}, one scale byte per 32 weights and a
+  per-tensor base. `--storage SUBSTRING=sp4 --table fixed --out PACK` writes it; its pack line carries a tenth field, the
+  16-byte tensor header in hex (part of the identity; a header with another table is refused). There is no load-time
+  encoder: a `strix.sp4t` matrix comes from a pack. The base reaches the consumer as `ResidentMatrixView::outer_exponent`.
+  HIP consumer: the small-M schedule's `Sp4Operand` (`core/f16_tile_gemm_small.hpp`; table values as exact FP16
+  operands, one FP32 multiplier per 32-weight group, 2^base at the store), FP16 form only
+  (`hip.sp4t.f16-group32-scale-chain@1`). Inkling 2 Mini binds it as the head arm `weights.head.sp4t@1`
+  (`--qualify-decode-weights`, or the pending lever `STRIX_INK_LOWBIT_HEAD=sp4t`, command line only).
+
 ## Procedure
 
 1. Collect statistics with an engine that binds the taps (Inkling 2 Mini: `STRIX_CALIB_MOMENTS=FILE` on an EXACT
