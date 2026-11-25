@@ -1,40 +1,17 @@
 #pragma once
-// Prompt-state declarations of every family for strix/pair/state_owners.hpp: tensors only (owner, bytes, layers).
+// Prompt-state declarations for strix/pair/state_owners.hpp: tensors only (owner, bytes, layers). MiniMax and GLM are
+// bound from their model TOML in include/strix/{minimax,glm}/pair_state.hpp (same namespace); DeepSeek V4.1 and Qwen
+// stay literals here because their description readers reject keys outside their generated contract.
 // No family decides here what crosses which link; the shared planner does. Sizes are the consumer's import contract
 // today (file:line in each piece); a format change updates the row here and the host test that pins its totals.
 #include <array>
+#include <cstddef>
+#include <cstdint>
 
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/pair/state_owners.hpp"
 
 namespace strix::pair::state::decl {
-
-// MiniMax M3.1, TP2 (2 KV heads per rank), 60 layers, rows = P = N - 1 (the last prompt token runs on the ranks).
-// K/V are per rank, the index keys IK are the same bytes for both ranks (mm_rtx_kernels.cu:632-639 copies the one IK
-// into both rank blocks): shared. Today 153,600 B/row (both ranks get IK), one copy 138,240 B/row.
-inline constexpr std::array<Piece, 3> minimax_pieces{{
-    {"k", 0, Owner::per_rank, Extent::rows, 512, 60, 0, 1, 1, 0, "src/minimax/engine/engine.hip:3193-3207"},
-    {"v", 1, Owner::per_rank, Extent::rows, 512, 60, 0, 1, 1, 0, "src/minimax/engine/engine.hip:3193-3207"},
-    {"ik", 2, Owner::shared, Extent::rows, 256, 60, 0, 1, 1, 0, "src/minimax/rtxpf/cuda/mm_rtx_kernels.cu:639"},
-}};
-inline constexpr Family minimax{"minimax-m3.1", "P = N - 1", minimax_pieces, 2, 64, false, false,
-                                "opt-in until the pair receipt (wave4 MINST1)"};
-
-// GLM-5.3 pair: 34 KDA layers with 64 heads split 32 + 32 (per rank, FP32 S and conv), 11 DSA + 1 MTP layer whose
-// latent / index key / gate / pooled keys are the same bytes on both ranks (runtime.cu:660 one download): shared.
-// Component ids = glm_import.hpp:139. Pool: one FP32 128-vector per closed 4-row block. rows = P = N - 1.
-inline constexpr std::array<Piece, 6> glm_pieces{{
-    {"kda_s", 0, Owner::per_rank, Extent::fixed, 32U * 128U * 128U * 4U, 34, 0, 1, 1, 0, "src/glm/kernels/glm_tier_a.hip:153-190"},
-    {"kda_conv", 1, Owner::per_rank, Extent::fixed, 3U * 32U * 128U * 3U * 4U, 34, 0, 1, 1, 0, "src/glm/kernels/glm_tier_a.hip:153-190"},
-    {"dsa_latent", 2, Owner::shared, Extent::rows, 1024, 12, 0, 1, 1, 0, "src/glm/kernels/glm_dsa.hip:54-87"},
-    {"dsa_ikey", 3, Owner::shared, Extent::rows, 256, 12, 0, 1, 1, 0, "src/glm/kernels/glm_dsa.hip:120-153"},
-    {"dsa_igate", 4, Owner::shared, Extent::rows, 256, 12, 0, 1, 1, 0, "src/glm/kernels/glm_dsa.hip:120-153"},
-    {"dsa_pool", 5, Owner::shared, Extent::rows, 512, 12, 0, 1, 4, 0, "src/glm/kernels/glm_dsa.hip:167-180"},
-}};
-// v2 ("DSA once", gs::dsa_relay) is the shipped relay of the same bytes; default ON since the v1 / v2 rank-1 payload
-// equal-bits receipt: rank 1 merged v2 payload == its v1 payload (tests/glm_serve_cpu_tests.cpp "dsa relay protocol").
-inline constexpr Family glm{"glm-5.3", "P = N - 1", glm_pieces, 2, 64, false, true,
-                            "glm v1/v2 rank payload equal bits (host receipt, wave4 MINST1)"};
 
 // DeepSeek V4.1 pair: the whole serialized state is the same on both ranks; the serve app already takes ONE copy and
 // rank 0 relays it (apps/deepseek41_serve_main.cpp:2874-2875). Four KV sources (three ratio-2 at N/2 entries, one at
@@ -94,6 +71,6 @@ inline constexpr std::array<Piece, 14> qwen_pieces{{
 inline constexpr Family qwen_pair{"qwen3.8-flash-next", "N", qwen_pieces, 2, 64, false, false, "no shared pieces"};
 inline constexpr Family qwen_single{"qwen3.8-flash-next", "N", qwen_pieces, 1, 64, false, false, "single destination"};
 
-inline constexpr std::array<const Family*, 5> all{&minimax, &glm, &ds41, &qwen_pair, &qwen_single};
+inline constexpr std::array<const Family*, 3> all{&ds41, &qwen_pair, &qwen_single};
 
 }  // namespace strix::pair::state::decl

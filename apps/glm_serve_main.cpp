@@ -50,6 +50,7 @@
 // C1 MTP: with one request in flight (none waiting) it decodes through the engine's exact single-slot self-speculation
 // (verify / commit / adaptive K, the CLI --decode route); rank 1 replays mtp_enter / mtp_run / mtp_leave. Any second
 // request ends the decoder at a cycle boundary (deferred rows flushed) and batched plain steps follow.
+#include "strix/glm/pair_state.hpp"
 #include "strix/pair/state_decls.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "glm_rank_defaults.hpp"
@@ -1126,7 +1127,7 @@ int main(int argc, char** argv) {
         if (opt.world != 1 && opt.world != 2) throw std::invalid_argument("--world 1|2");
         if (opt.rank >= opt.world) throw std::invalid_argument("--rank must be < --world");
         {
-            // One resolver for the hand-off owners (strix/pair/state_owners.hpp, GLM declaration in state_decls.hpp): the
+            // One resolver for the hand-off owners (strix/pair/state_owners.hpp, GLM declaration in glm/pair_state.hpp): the
             // flag, then STRIX_HANDOFF_SHARED_ONCE, then the family default (DSA once, v2: the same bytes, relayed). The
             // automatic default applies where v2 runs (import receiver on, a pair); an explicit request elsewhere refuses below.
             namespace ps = strix::pair::state;

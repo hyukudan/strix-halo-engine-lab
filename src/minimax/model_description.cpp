@@ -209,9 +209,9 @@ void validate(const Model& model) {
         for (const auto& [key, v] : table) {
             if (prefix.empty() && model_description::is_launch_metadata(key)) continue;
             const auto path = prefix + key;
-            // [moe.route] is bound by typed code from the generated constants (moe::route_policy_named), which rejects a
-            // wrong word or width at compile time; it is not part of this contract.
-            if (path == "moe.route" || path.starts_with("moe.route.")) continue;
+            // [moe.route] and [pair] are bound by typed code from the generated constants (moe::route_policy_named,
+            // pair::state::pieces_of), which rejects a wrong word or width at compile time; not part of this contract.
+            if (path == "pair" || path.starts_with("pair.") || path == "moe.route" || path.starts_with("moe.route.")) continue;
             if (const auto* child = std::get_if<Value::Table>(&v.data); child && !child->empty()) self(self, *child, path + '.');
             else if (!fields.contains(path)) check.errors.push_back(path + ": expected supported adapter field, actual " + repr(&v));
         }

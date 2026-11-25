@@ -13,7 +13,7 @@ namespace attention {
 inline constexpr std::int64_t candidate_block_size = 8;
 inline constexpr std::int64_t candidate_source_layer_id = 20;
 inline constexpr std::int64_t candidate_topk_blocks = 2048;
-inline constexpr std::int64_t compress_ratios[] = {0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 
+inline constexpr std::int64_t compress_ratios[] = {0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1,
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0};
 inline constexpr double compress_rope_theta = 0x1.388p+17 /* 160000 */;
 inline constexpr std::int64_t index_head_dim = 128;
