@@ -294,6 +294,13 @@ if(BUILD_TESTING)
         target_link_libraries(strix-cuda-inkling2-mini-operand-class-test PRIVATE
             strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core)
         list(APPEND _cc_mini_tests strix-cuda-inkling2-mini-operand-class-test)
+        # Block candidate tap (no model file): forced rows at the session end through append_tap, a compiled and
+        # executed recipe, and the complete multi-tap BF16 store against a serial reference with canaries.
+        add_executable(strix-cuda-inkling2-mini-block-candidate-test ${_cc_root}/tests/inkling2/mini_block_candidate_cuda.cu
+            ${_cc_root}/src/inkling2/inkling2_mini_block_candidate_cuda.cu)
+        target_link_libraries(strix-cuda-inkling2-mini-block-candidate-test PRIVATE
+            strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core strix_exec)
+        list(APPEND _cc_mini_tests strix-cuda-inkling2-mini-block-candidate-test)
     endif()
     foreach(t IN LISTS _cc_mini_tests _cc_mini_verify_target)
         target_include_directories(${t} PRIVATE ${_cc_root}/src ${_cc_root}/include)

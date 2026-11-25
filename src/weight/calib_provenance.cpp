@@ -1,6 +1,6 @@
 #include "strix/weight/calib_provenance.hpp"
 
-#include "h3/te/te_sha256.hpp"
+#include "core/sha256.hpp"
 
 #include <algorithm>
 #include <array>
@@ -13,7 +13,7 @@
 namespace strix::weight::calib {
 namespace {
 
-void hash_ids(h3::te::Sha256& hash, std::span<const std::uint32_t> ids) {
+void hash_ids(core::Sha256& hash, std::span<const std::uint32_t> ids) {
     std::array<std::uint8_t, 4> le{};
     for (const auto id : ids) {
         for (unsigned i = 0; i < 4U; ++i) le[i] = static_cast<std::uint8_t>((id >> (8U * i)) & 0xffU);
@@ -34,13 +34,13 @@ std::string hex_prefix(const Digest256& d) {
 }  // namespace
 
 Digest256 window_identity(std::span<const std::uint32_t> ids) {
-    h3::te::Sha256 hash;
+    core::Sha256 hash;
     hash_ids(hash, ids);
     return Digest256{hash.finish()};
 }
 
 std::uint64_t shingle_hash(std::span<const std::uint32_t, kShingleTokens> ids) {
-    h3::te::Sha256 hash;
+    core::Sha256 hash;
     hash_ids(hash, ids);
     const auto d = hash.finish();
     std::uint64_t v = 0;

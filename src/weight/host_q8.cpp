@@ -1,7 +1,7 @@
 #include "strix/weight/host_q8.hpp"
 #include "strix/weight/host_lowbit.hpp"
 #include "core/iu4_onfly.hpp"
-#include "h3/te/te_sha256.hpp"
+#include "core/sha256.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -18,7 +18,7 @@ class RowSource final : public Source {
 public:
  RowSource(std::shared_ptr<const Source> source,std::uint64_t rows,std::uint64_t logical,
            std::uint64_t stride,std::uint64_t prefix):source_(std::move(source)),rows_(rows),logical_(logical),stride_(stride),prefix_(prefix) {
-  h3::te::Sha256 hash;
+  core::Sha256 hash;
   std::array<Byte,65536> bytes{};
   for(std::uint64_t offset=0;offset<size();) {
    const auto count=static_cast<std::size_t>(std::min<std::uint64_t>(bytes.size(),size()-offset));

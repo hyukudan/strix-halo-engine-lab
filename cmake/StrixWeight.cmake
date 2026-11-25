@@ -59,7 +59,7 @@ add_library(strix-weight STATIC
     ${STRIX_WEIGHT_ROOT}/src/q6p_registry.cpp
     ${STRIX_WEIGHT_ROOT}/src/cuda/core/nvfp4_reference.cpp
     ${STRIX_WEIGHT_ROOT}/src/gemma4/exl3/host.cpp
-    ${STRIX_WEIGHT_ROOT}/src/h3/te/te_sha256.cpp
+    ${STRIX_WEIGHT_ROOT}/src/core/sha256.cpp
     ${STRIX_WEIGHT_ROOT}/src/serve/json.cpp)
 target_include_directories(strix-weight PUBLIC ${STRIX_WEIGHT_ROOT}/include PRIVATE ${STRIX_WEIGHT_ROOT}/src)
 target_compile_features(strix-weight PUBLIC cxx_std_20)
