@@ -502,6 +502,31 @@ public:
     bool set_combine_image(bool selected) { return backend_.set_combine_image(selected); }
     // Resolved projected-bias attention lever (mini_attn_projected_bias); set once after construction.
     void set_attention_projected_bias(bool enabled) { backend_.set_attention_projected_bias(enabled); }
+    // Resolved verify rows lever (mini_verify_rows, kMiniVerifyRows); set once after construction, before any append.
+    // Admitted on HIP when verify windows of two or more rows exist: a window's score rows take the pitched rows head
+    // (project_head_rows), its attention one lanes launch set, and slot 0 records the convolution inputs of a staged
+    // window (the shared session tape), so a partial commit rebuilds the histories by copies instead of replaying the
+    // kept rows. Declined on CUDA (false): every window keeps the per-row incumbent. Returns the effective state.
+    bool set_verify_rows(bool selected) {
+#if defined(__HIPCC__)
+        const bool effective = selected && max_verify_rows() > 1U;
+#else
+        static_cast<void>(selected);
+        const bool effective = false;
+#endif
+        if (effective == verify_rows_) return effective;
+        auto& slot = *slots_.front();
+        if (effective) {
+            if (!conv_tape_)
+                conv_tape_.emplace(static_cast<std::size_t>(max_verify_rows() * slot.convolution_row_elements()));
+            slot.bind_convolution_tape(conv_tape_->span(), max_verify_rows());
+        } else {
+            slot.bind_convolution_tape({}, 0U);
+        }
+        backend_.set_verify_lanes(effective);
+        verify_rows_ = effective;
+        return effective;
+    }
     [[nodiscard]] std::uint64_t projected_attention_dispatches() const { return backend_.projected_attention_dispatches(); }
     [[nodiscard]] std::uint64_t gate_null_applications() const { return backend_.gate_null_applications(); }
 
@@ -886,6 +911,16 @@ private:
                     const auto scores = multi_pick ? verify_logits_->span() : logits_.span();
                     // Use the single-row head for every score row. A wide dense
                     // dispatch can select different arithmetic on the same device.
+                    // Verify rows lever (HIP): the decoder's one pitched rows head projects every row of the window in
+                    // one launch set, each row on its one-row body (project_head_rows; served cohort lanes bind the
+                    // same head). A one-row window and the single pick stay in the loop below.
+                    bool rows_head = false;
+#if defined(__HIPCC__)
+                    if (verify_rows_ && multi_pick) {
+                        project_head_rows(tail.data(), static_cast<unsigned>(head_rows), scores);
+                        rows_head = true;
+                    }
+#endif
                     for (std::size_t row = 0; row < head_rows; ++row) {
                         const auto* input = tail.data() + row * kHiddenWidth;
 #if defined(__HIPCC__)
@@ -898,7 +933,7 @@ private:
 #endif
                         const auto row_scores = scores.subspan(
                             ::strix::head::logit_row_offset(multi_pick ? static_cast<unsigned>(row) : 0U, kLogitPitch), kOutputVocabulary);
-                        project_head(input, row_scores, true);
+                        if (!rows_head) project_head(input, row_scores, true);
                         if (pick_next && !multi_pick) greedy.enqueue(row_scores, stream_.get());
                         if (!decode_step && !host_logits.empty())
                             mini_gpu::copy(staged_logits_.get() + row * kOutputVocabulary, row_scores.data(),
@@ -1016,6 +1051,9 @@ private:
     core::ResidentGreedy greedy_;
     std::optional<mini_gpu::Buffer<float>> verify_logits_;
     std::optional<core::ResidentGreedy> verify_greedy_;
+    // Verify rows lever (set_verify_rows): effective state and slot 0's convolution tape.
+    bool verify_rows_{false};
+    std::optional<mini_gpu::Buffer<float>> conv_tape_;
     // Head input and score row of the last pick that skipped its scores (materialize_scores).
     struct PendingScores {
         const float* input = nullptr;
