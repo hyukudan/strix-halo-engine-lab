@@ -6,6 +6,14 @@
 
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
+#include <string>
+
+// The native device runtime header (its HIP section) over the host stub: the actual device-allocation boundary.
+#include "strix/device/declaration.hpp"
+#include "strix/session/step_replay.hpp"
+#define __HIPCC__ 1
+#include "strix/device/runtime.hpp"
 
 namespace a = strix::hip::arch;
 namespace mock = hip_archguard_test;
@@ -119,7 +127,38 @@ bool allocation_status() {
             }
         }
     }
-    return true;
+    // The same status at the native boundaries: the generic native check stays a plain runtime error; only the
+    // device-buffer allocation (Buffer, check_device_allocation) raises the typed exception.
+    namespace native = strix::device::native;
+    const auto classify = [](auto&& call) {  // 0 other, 1 plain runtime_error, 2 DeviceAllocationError
+        try {
+            call();
+        } catch (const strix::DeviceAllocationError& error) {
+            return error.status == static_cast<int>(hipErrorOutOfMemory) &&
+                           std::strcmp(error.what(), "device buffer: out of memory") == 0
+                       ? 2
+                       : 0;
+        } catch (const std::runtime_error& error) {
+            return std::strcmp(error.what(), "device buffer: out of memory") == 0 ? 1 : 0;
+        }
+        return 0;
+    };
+    if (classify([] { native::check(hipErrorOutOfMemory, "device buffer"); }) != 1) return false;
+    if (classify([] { native::check_device_allocation(hipErrorOutOfMemory, "device buffer"); }) != 2) return false;
+    if (classify([] { native::check_device_allocation(hipErrorInvalidDevice, "device buffer"); }) != 0) return false;
+    hip_archguard_test::malloc_status = hipErrorOutOfMemory;
+    const int buffer_failure = [&] {
+        try {
+            native::Buffer<unsigned char> rows(64U);
+        } catch (const strix::DeviceAllocationError& error) {
+            return error.status == static_cast<int>(hipErrorOutOfMemory) ? 2 : 0;
+        } catch (const std::runtime_error&) {
+            return 1;
+        }
+        return 0;
+    }();
+    hip_archguard_test::malloc_status = hipSuccess;
+    return buffer_failure == 2;
 }
 
 int main() {

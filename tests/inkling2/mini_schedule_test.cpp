@@ -16,6 +16,7 @@
 namespace {
 
 using namespace strix::inkling2;
+using strix::profile::Name;
 
 struct ForwardFixture {
     int hidden = 0;
@@ -147,8 +148,8 @@ int served_prefill_gate() {
                                    16384U, 16401U, 20000U};
     int failed = 0;
     for (const bool hip : {true, false}) {
-        for (const unsigned divisor : {mini_prefill_schedule(hip).tail_divisor, 0U}) {
-            const MiniPrefillSchedule schedule{mini_prefill_schedule(hip).chunk, divisor};
+        for (const unsigned divisor : {mini_prefill_schedule(hip, Name::standard).tail_divisor, 0U}) {
+            const MiniPrefillSchedule schedule{mini_prefill_schedule(hip, Name::standard).chunk, divisor};
             for (const auto prompt : lengths) {
                 const auto cli = cli_forms(prompt, schedule);
                 for (const bool decoding : {false, true})
@@ -160,9 +161,19 @@ int served_prefill_gate() {
             }
         }
     }
-    // The resolver of both entry points: HIP 8192 rows with a chunk / 8 tail, CUDA 2048-row greedy chunks; cuts on HIP.
-    static_assert(mini_prefill_schedule(true).chunk == 8192U && mini_prefill_schedule(true).tail_divisor == 8U);
-    static_assert(mini_prefill_schedule(false).chunk == 2048U && mini_prefill_schedule(false).tail_divisor == 0U);
+    // The resolver of both entry points takes the declared rows per backend and profile (mini_cli_prefill_rows): HIP
+    // 8192 rows with a chunk / 8 tail in every profile, CUDA greedy chunks of 8192 rows in EXACT and 2048 otherwise;
+    // cuts on HIP.
+    for (const auto tier : {Name::standard, Name::quality, Name::fast, Name::turbo}) {
+        const auto hip = mini_prefill_schedule(true, tier), cuda = mini_prefill_schedule(false, tier);
+        const unsigned cuda_rows = tier == Name::standard ? 8192U : 2048U;
+        if (hip.chunk != 8192U || hip.tail_divisor != 8U || cuda.chunk != cuda_rows || cuda.tail_divisor != 0U ||
+            hip.chunk != mini_cli_prefill_rows(MiniPrefillBackend::hip, tier) ||
+            cuda.chunk != mini_cli_prefill_rows(MiniPrefillBackend::cuda, tier)) {
+            std::fprintf(stderr, "FAIL schedule != declared prefill rows (profile %u)\n", static_cast<unsigned>(tier));
+            failed = 41;
+        }
+    }
     static_assert(mini_prefill_piece_rule(true).cuttable() && !mini_prefill_piece_rule(false).cuttable());
     static_assert(mini_prefill_tail_capacity(8192U, 8U, 8192U) == 0U && mini_prefill_tail_capacity(8192U, 8U, 9000U) == 808U);
     static_assert(mini_call_first_chunk(8193U, 8192U, 0U) == 8192U && mini_call_first_chunk(8209U, 8192U, 17U) == 8209U);

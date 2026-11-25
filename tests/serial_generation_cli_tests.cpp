@@ -19,12 +19,23 @@
 #include <functional>
 #include <initializer_list>
 #include <new>
+#include <optional>
 #include <iostream>
 #include <random>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
 #include <vector>
+
+// The native runtime header and the CUDA weight uploader are the two production call sites of the chunk retry: they
+// compile here against the host runtime stub (tests/stubs/cuda_status), which injects a refused allocation at the
+// exact runtime call. Keep these last, after the headers the runtime header itself includes: the macro only selects the native section of the runtime header.
+#include "strix/device/declaration.hpp"
+#include "strix/session/step_replay.hpp"
+#include "core/weight_load_queue.hpp"
+#define __CUDACC__ 1
+#include "cuda/core/weight_uploader.hpp"
+#include "strix/device/runtime.hpp"
 
 namespace {
 
@@ -324,28 +335,64 @@ static void chunk_fallback_cli_cases() {
     const auto refused = run({"8", "4", "1", "2", "3", "5", "--prefill-chunk", "6"}, pressure);
     check(refused.code != 0 && loaded_rows == std::vector<std::uint32_t>{6U}, "explicit chunk is never retried");
     loaded_rows.clear();
+    // A backend without a qualified fallback (family data zero): the implicit default has one attempt only.
+    pressure.prefill_chunk_fallback = 0U;
+    const auto unqualified = run({"8", "4", "1", "2", "3", "5"}, pressure);
+    check(unqualified.code != 0 && loaded_rows == std::vector<std::uint32_t>{6U}, "no fallback datum: no retry route");
+    pressure.prefill_chunk_fallback = 2U;
+    loaded_rows.clear();
+    // The prompt bounds the chunk (a 3-row prompt loads 3 rows) and the fallback.
+    const auto bounded = run({"8", "4", "1"}, pressure);
+    check(bounded.code == 0 && loaded_rows == std::vector<std::uint32_t>{3U}, "prompt bounds the implicit chunk");
+    loaded_rows.clear();
     typed = false;
     const auto untyped = run({"8", "4", "1", "2", "3", "5"}, pressure);
     check(untyped.code != 0 && loaded_rows == std::vector<std::uint32_t>{6U}, "untyped failure is not retried");
 
-    // The same out-of-memory runtime status through the shared classification of a failed runtime call: refused at a
-    // pinned host staging allocation (a general operation) it is never retried; refused at a device row allocation
-    // it retries once at the fallback rows.
-    constexpr int out_of_memory_status = 2;
-    auto operation = strix::RuntimeOperation::general;
+    // The same out-of-memory runtime status, injected into the runtime stub at the two ACTUAL allocation call sites.
+    // A pinned host staging allocation (the CUDA weight uploader) fails as the generic std::runtime_error: never
+    // retried, one load. A device row buffer (device::native::Buffer, the device-allocation boundary) fails as the
+    // typed DeviceAllocationError: retried once at the fallback rows, two loads.
+    namespace stub = cuda_status_stub;
+    const auto refused_as = [](auto&& allocate, bool typed_error) {
+        try {
+            allocate();
+        } catch (const strix::DeviceAllocationError& error) {
+            return typed_error && error.status == static_cast<int>(cudaErrorMemoryAllocation);
+        } catch (const std::runtime_error& error) {
+            return !typed_error && std::string(error.what()).find("out of memory") != std::string::npos;
+        }
+        return false;
+    };
+    const auto pinned_staging = [] {
+        strix::cuda::core::WeightUploader uploader;
+        (void)uploader.allocate(4096U);
+    };
+    const auto device_rows = [] { strix::device::native::Buffer<std::uint8_t> rows(4096U); };
+    stub::malloc_host_status = cudaErrorMemoryAllocation;
+    check(refused_as(pinned_staging, false) && stub::malloc_host_calls == 1U, "pinned staging refusal is a plain runtime error");
+    stub::malloc_host_status = cudaSuccess;
+    stub::malloc_status = cudaErrorMemoryAllocation;
+    check(refused_as(device_rows, true) && stub::malloc_calls == 1U, "device row refusal is a DeviceAllocationError");
+    stub::malloc_status = cudaSuccess;
+
+    std::function<void()> site = pinned_staging;
     pressure.load = [&](const SerialGenerationLoad& load) -> std::unique_ptr<SerialGenerationDecoder> {
         loaded_rows.push_back(load.prefill_chunk);
-        if (load.prefill_chunk > 3U)
-            strix::throw_runtime_failure("allocate: out of memory", out_of_memory_status, true, operation);
+        if (load.prefill_chunk > 3U) site();
         return std::make_unique<Decoder>(std::min(8U, load.verify_rows));
     };
+    stub::malloc_host_status = cudaErrorMemoryAllocation;
     loaded_rows.clear();
     const auto staging = run({"8", "4", "1", "2", "3", "5"}, pressure);
     check(staging.code != 0 && loaded_rows == std::vector<std::uint32_t>{6U}, "pinned staging refusal loads once");
+    stub::malloc_host_status = cudaSuccess;
+    stub::malloc_status = cudaErrorMemoryAllocation;
+    site = device_rows;
     loaded_rows.clear();
-    operation = strix::RuntimeOperation::device_allocation;
     const auto rows = run({"8", "4", "1", "2", "3", "5"}, pressure);
     check(rows.code == 0 && loaded_rows == std::vector<std::uint32_t>{6U, 2U}, "device row refusal loads twice");
+    stub::malloc_status = cudaSuccess;
 }
 
 // The one decode-form resolver (strix/serve/decode_form.hpp) against the expression it replaced in the command line:

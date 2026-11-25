@@ -375,7 +375,7 @@ inline int served_prefill(const char* checkpoint, weight::FormatId storage, std:
 #else
     constexpr bool kHip = false;
 #endif
-    const auto schedule = mini_prefill_schedule(kHip);
+    const auto schedule = mini_prefill_schedule(kHip, profile::Name::standard);  // the EXACT command line
     const unsigned tail = mini_prefill_tail_capacity(schedule.chunk, schedule.tail_divisor, kServedContext);
     const auto owned = served_decoder(checkpoint, kServedContext, schedule.chunk, storage, 2U, tail, true);
     auto& decoder = *owned;

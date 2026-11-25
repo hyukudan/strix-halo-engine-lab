@@ -81,7 +81,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.served_cli_route = mini_served_prefill_emits_first(resolved.backend == "hip", out.served_route_requested);
     // The prompt chunk: --prefill-rows, else the route's (the incumbent 128-row held-back chunks without the lever,
     // the command line's chunk and tail rule with it), clamped to the context. Lanes: mini_serve_lane_rows.
-    const auto schedule = mini_served_prefill_schedule_from_env(true, out.served_cli_route);
+    const auto schedule = mini_served_prefill_schedule_from_env(true, out.served_cli_route, out.tier);
     out.prefill_rows = std::min(explicit_rows.value_or(schedule.chunk), out.context);
     if (out.served_cli_route) {
         if (out.prefill_rows == 0U) throw std::invalid_argument("--prefill-rows must be positive");

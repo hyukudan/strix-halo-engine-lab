@@ -2,6 +2,7 @@
 
 #include "attn_core/dense_flash_keysplit.hpp"
 #include "core/looped_layers.hpp"
+#include "inkling2/inkling2_mini_prefill_rows.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/serve/prompt_piece.hpp"
 
@@ -103,9 +104,8 @@ constexpr unsigned long long mini_call_first_chunk(unsigned long long rows, unsi
 
 // Prefill schedule: ONE resolver for the command line (apps/inkling2_mini_gpu_main.hpp) and the server
 // (inkling2_mini_serve.cpp), so the same request is prefilled by the same chunks on both entry points.
-// Every chunk re-streams all expert weights, so the chunk is as large as the backend qualified. gfx1151 (prose
-// prompts, one chunk size per run, 2048 -> 8192 rows): 4K 3.47 -> 3.13 s, 8K 7.27 -> 6.23 s, 16K 15.69 -> 14.06 s,
-// 32K 35.6 -> 35.8 s. CUDA keeps 2048-row greedy chunks until it is measured there.
+// Every chunk re-streams all expert weights, so the chunk is as large as the backend qualified: the declared rows per
+// backend and profile (mini_cli_prefill_rows, inkling2_mini_prefill_rows.hpp). CUDA keeps greedy chunks (no tail).
 // Tail absorption: a remainder of up to chunk / tail_divisor rows rides in the final chunk when mini_call_tail_rows
 // admits it (gfx1151 8K prose, 8236 = 8192 + 44 rows: 5,021 -> 4,810 ms with one chunk, logits bitwise equal).
 // STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks on both entry points.
@@ -114,12 +114,12 @@ struct MiniPrefillSchedule {
     unsigned tail_divisor;
 };
 
-constexpr MiniPrefillSchedule mini_prefill_schedule(bool hip) {
-    return hip ? MiniPrefillSchedule{8192U, 8U} : MiniPrefillSchedule{2048U, 0U};
+constexpr MiniPrefillSchedule mini_prefill_schedule(bool hip, profile::Name tier) {
+    return {mini_cli_prefill_rows(hip ? MiniPrefillBackend::hip : MiniPrefillBackend::cuda, tier), hip ? 8U : 0U};
 }
 
-inline MiniPrefillSchedule mini_prefill_schedule_from_env(bool hip) {
-    auto schedule = mini_prefill_schedule(hip);
+inline MiniPrefillSchedule mini_prefill_schedule_from_env(bool hip, profile::Name tier) {
+    auto schedule = mini_prefill_schedule(hip, tier);
     if (!env_flag_default_on("STRIX_INKLING_PREFILL_TAIL")) schedule.tail_divisor = 0U;
     return schedule;
 }
@@ -132,8 +132,8 @@ inline MiniPrefillSchedule mini_prefill_schedule_from_env(bool hip) {
 inline constexpr unsigned kMiniServedHeldBackChunk = 128U;
 constexpr bool mini_served_prefill_emits_first(bool hip, bool cli_route) noexcept { return hip && cli_route; }
 
-inline MiniPrefillSchedule mini_served_prefill_schedule_from_env(bool hip, bool cli_route) {
-    return mini_served_prefill_emits_first(hip, cli_route) ? mini_prefill_schedule_from_env(hip)
+inline MiniPrefillSchedule mini_served_prefill_schedule_from_env(bool hip, bool cli_route, profile::Name tier) {
+    return mini_served_prefill_emits_first(hip, cli_route) ? mini_prefill_schedule_from_env(hip, tier)
                                                            : MiniPrefillSchedule{kMiniServedHeldBackChunk, 0U};
 }
 

@@ -5,6 +5,7 @@
 #include "inkling2_mini_media.hpp"
 #endif
 
+#include "inkling2/inkling2_mini_prefill_rows.hpp"
 #include "inkling2/inkling2_mini_resident_decoder.hpp"
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 #include "inkling2/inkling2_mini_program_cuda.hpp"
@@ -28,7 +29,8 @@
 namespace strix::inkling2::cli {
 
 // Prefill chunk rows and tail rule: the one schedule of the command line and the server (mini_prefill_schedule in
-// src/inkling2/inkling2_mini_schedule.hpp, with its receipts and the STRIX_INKLING_PREFILL_TAIL switch).
+// src/inkling2/inkling2_mini_schedule.hpp, with the STRIX_INKLING_PREFILL_TAIL switch). Its chunk is the declared rows
+// per backend and profile (inkling2::mini_cli_prefill_rows); the profile's own value is applied after parsing.
 #if defined(__HIPCC__)
 inline constexpr bool kMiniHipSchedule = true;
 #else
@@ -262,13 +264,15 @@ int main(int argc, char** argv) {
             executable, "Inkling 2 Mini", "MODEL.safetensors",
             kVocabulary, kOutputVocabulary, kMaxContext, kMiniEosToken,
             {},
-            mini_prefill_schedule(strix::inkling2::cli::kMiniHipSchedule).chunk, true, true,
+            // The parse default; the profile's own value is applied after parsing (mini_cli_prefill_rows).
+            mini_prefill_schedule(strix::inkling2::cli::kMiniHipSchedule, strix::profile::Name::standard).chunk, true, true,
             [](const std::string& path) {
                 return serve::BpeTokenizer::load_hf_json(path, serve::inkling2_mini_tokenizer_identity);
             },
             packed_decode_default, serve::render_inkling2_chat_request, true};
         // The served schedule's resolver (STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks on both entry points).
-        family.prefill_tail_divisor = mini_prefill_schedule_from_env(strix::inkling2::cli::kMiniHipSchedule).tail_divisor;
+        family.prefill_tail_divisor =
+            mini_prefill_schedule_from_env(strix::inkling2::cli::kMiniHipSchedule, strix::profile::Name::standard).tail_divisor;
 #if defined(STRIX_INKLING2_MEDIA)
         family.media = cli::open_mini_media;
         family.render_media_messages = serve::render_inkling2_chat_media_request;
@@ -280,6 +284,10 @@ int main(int argc, char** argv) {
 #else
         auto options = cli::parse(argc, argv, family, true);
 #endif
+        if (!options.generation.prefill_chunk_explicit) {  // the declared chunk of this backend and profile
+            family.default_prefill_chunk = mini_prefill_schedule(cli::kMiniHipSchedule, options.tier.profile).chunk;
+            options.generation.prefill_chunk = family.default_prefill_chunk;
+        }
         // The serial CLI resolves its one lane at load using prompt + generated positions. A gate knows its
         // resident context from the manifest. CUDA step routing precedes serial loading and has no banded CUDA row.
         struct ResolvedWeights {

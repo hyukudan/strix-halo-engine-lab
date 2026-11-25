@@ -501,7 +501,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         } else {
             // With the lever: the command line's chunk and tail rule, emits-first; lanes = --slots, else an explicit
             // (clamped) --prefill-rows, else the served lane cap.
-            const auto cli = mini::mini_prefill_schedule_from_env(true);
+            const auto cli = mini::mini_prefill_schedule_from_env(true, options.tier);
             const unsigned chunk = std::min(shape.prefill_rows.value_or(cli.chunk), context);
             const unsigned lanes = shape.slots.value_or(0U) != 0U ? *shape.slots
                                    : shape.prefill_rows                ? chunk
