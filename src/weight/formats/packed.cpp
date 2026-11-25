@@ -2,9 +2,15 @@
 #include "strix/ds41_packed.hpp"
 #include "strix/ggml_dequant.hpp"
 #include "strix/q6p_registry.hpp"
+#include "strix/weight/host_lowbit.hpp"
 #include <algorithm>
 #include <cstring>
 namespace strix::weight::detail {
+template <unsigned Bits>
+FormatDescriptor strixpack_descriptor(FormatId id, std::string_view layout) {
+ using S = sp::Storage<Bits>;
+ return descriptor(id, layout, quantized_linear, false, fixed<S::elements, S::bytes, S::group>);
+}
 std::span<const FormatDescriptor> packed_formats() {
  static const FormatDescriptor formats[] = {
   descriptor({"image.cb4",1},"derived-cb4",quantized_linear,true,fixed<32,18>),
@@ -12,7 +18,10 @@ std::span<const FormatDescriptor> packed_formats() {
   descriptor({"image.u6",1},"derived-u6",quantized_linear,true,fixed<32,26>),
   descriptor({"image.q6p32",1},"derived-q6p32",quantized_linear,true,fixed<32,26>),
   descriptor(kQ4G64WeightStorage,"derived-q4g64",quantized_linear,false,fixed<128,68,64>),
-  descriptor(kQ6G64WeightStorage,"derived-q6g64",quantized_linear,false,fixed<128,100,64>)
+  descriptor(kQ6G64WeightStorage,"derived-q6g64",quantized_linear,false,fixed<128,100,64>),
+  strixpack_descriptor<4>(kSP4WeightStorage,"derived-sp4"),
+  strixpack_descriptor<3>(kSP3WeightStorage,"derived-sp3"),
+  strixpack_descriptor<2>(kSP2WeightStorage,"derived-sp2")
  };
  return formats;
 }

@@ -6,6 +6,13 @@ inline constexpr FormatId kQ8WeightStorage{"gguf.q8_0", 1};
 // Low-bit resident row storages produced at load from a BF16 matrix (strix/weight/host_lowbit.hpp layout).
 inline constexpr FormatId kQ4G64WeightStorage{"strix.q4_g64", 1};
 inline constexpr FormatId kQ6G64WeightStorage{"strix.q6_g64", 1};
+// Geometry-only entries until the Strix pack loader and device consumers land.
+inline constexpr FormatId kSP4WeightStorage{"strix.sp4", 1};
+inline constexpr FormatId kSP3WeightStorage{"strix.sp3", 1};
+inline constexpr FormatId kSP2WeightStorage{"strix.sp2", 1};
+[[nodiscard]] inline bool is_strixpack_storage(FormatId id) noexcept {
+    return id == kSP4WeightStorage || id == kSP3WeightStorage || id == kSP2WeightStorage;
+}
 inline constexpr std::uint64_t plain_linear = 1ull << 0;
 inline constexpr std::uint64_t quantized_linear = 1ull << 1;
 inline constexpr std::uint64_t transformed_linear = 1ull << 2;

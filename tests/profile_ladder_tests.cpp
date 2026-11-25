@@ -679,6 +679,28 @@ std::vector<std::string> selections() {
     return out;
 }
 
+
+void strixpack_candidates() {
+    using namespace strix::weight;
+    const auto& engine = strix::inkling2::kMiniProfile;
+    for (const auto* candidate : {&kAttentionHeadSP4Lever, &kAttentionHeadSP3Lever, &kAttentionHeadSP2Lever}) {
+        const auto lever = std::ranges::find(engine.table, candidate->name, &p::Lever::name);
+        require(lever != engine.table.end() && p::identity_defect(*lever).empty(), std::string(candidate->name) + ": declared row and identities");
+        if (lever == engine.table.end()) continue;
+        for (const auto tier : {p::Name::standard, p::Name::fast, p::Name::turbo}) {
+            p::Inputs in;
+            in.profile = tier;
+            in.allow_pending = true;
+            in.env = [](const char*) -> const char* { return nullptr; };
+            const auto resolution = p::resolve(engine, in);
+            const auto* entry = resolution.find(candidate->name);
+            require(entry && entry->value == "off" &&
+                        entry->status == (tier == p::Name::standard ? p::Status::builtin : p::Status::pending),
+                    std::string(candidate->name) + ": SP stays off without a loader and receipt");
+        }
+    }
+}
+
 void incumbents(const char* golden, bool write) {
     const auto now = selections();
     if (write) {
@@ -1501,6 +1523,7 @@ int main(int argc, char** argv) try {
         return 0;
     }
     incumbents(argv[2], false);
+    strixpack_candidates();
     verdicts();
     bound_evidence();
     defects();

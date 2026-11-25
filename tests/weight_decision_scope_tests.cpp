@@ -1,6 +1,7 @@
 // Load-time weight decisions are scoped to the consumers' versioned arithmetic (weight::implementation_identity)
 // and to the checkpoint content digest, never to the executable that holds the decision table.
 #include <strix/profiles/hy4.hpp>
+#include <strix/weight/host_q8.hpp>
 #include <strix/weight/levers.hpp>
 #include <strix/weight/runtime.hpp>
 
@@ -497,6 +498,31 @@ int main() {
                         "0800000000000000000000000000000000000000000000000000000000000001 checkpoint "
                         "0900000000000000000000000000000000000000000000000000000000000001",
                     "scope receipt prints the digest literals");
+    }
+    for (const auto* policy_sp : {&weight::kAttentionHeadSP4Policy, &weight::kAttentionHeadSP3Policy,
+                                  &weight::kAttentionHeadSP2Policy}) {
+        const auto storage = policy_sp->target;
+        const auto key = weight::serialize_id(policy_sp->id);
+        ok &= check(weight::find_weight_load_policy(key) == policy_sp, "registered SP load policy");
+        const auto& registry = weight::builtin_registry();
+        const auto* descriptor = weight::find_format(registry, storage);
+        ok &= check(descriptor && !descriptor->semantic_decode_supported, "SP storage has geometry but no decoder");
+        weight::Geometry geometry{};
+        const auto geometry_status = weight::format_geometry(storage, {}, geometry);
+        const auto bytes = storage == weight::kSP4WeightStorage ? 68U : storage == weight::kSP3WeightStorage ? 52U : 36U;
+        ok &= check(geometry_status && geometry.block_elements == 128U && geometry.block_bytes == bytes,
+                    "SP storage geometry matches its layout");
+        weight::MatrixLoadGeometry load{};
+        const auto refused = weight::matrix_load_geometry(storage, {{1, 128}, 2}, load);
+        ok &= check(!refused && refused.detail.find("requires the Strix pack loader") != std::string::npos,
+                    "SP matrix load is refused with a loader diagnostic");
+        for (const auto tier : {strix::profile::Name::fast, strix::profile::Name::turbo}) {
+            const std::array sp_formats{storage};
+            const auto sp_plan = weight::resolve_weight_load(registry, *policy_sp, {tier, scope, sp_formats, true, true}, {});
+            ok &= check(sp_plan.status == strix::profile::Status::pending && sp_plan.storage == weight::kBf16WeightStorage &&
+                        sp_plan.reason.find("requires the Strix pack loader") != std::string_view::npos,
+                        "SP load cannot be selected by an opt-in");
+        }
     }
     if (ok) std::puts("weight decision scope tests: PASS");
     return ok ? 0 : 1;

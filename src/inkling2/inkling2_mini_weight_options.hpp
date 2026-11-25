@@ -119,6 +119,8 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
         options.qualify_decode_only = argument == "--qualify-decode-weights";
         const std::string_view key(value());
         options.qualify = weight::find_weight_load_policy(key, kMiniQualifiablePolicies);
+        if (options.qualify && weight::is_strixpack_storage(options.qualify->target))
+            throw std::invalid_argument("--qualify-weights: Strix pack storage requires the Strix pack loader");
         bool bound = false;
         for (const auto& binding : kMiniQualifiablePolicies)
             bound = bound || (options.qualify != nullptr && weight::same_id(binding.id, options.qualify->id));

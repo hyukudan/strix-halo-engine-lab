@@ -17,6 +17,11 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
         plan.reason = "weight load lever disabled";
         return plan;
     }
+    if (is_strixpack_storage(policy.target) || is_strixpack_storage(policy.head_target())) {
+        plan.status = profile::Status::pending;
+        plan.reason = "Strix pack storage requires the Strix pack loader";
+        return plan;
+    }
     // Each compact role class needs a target the registry knows and every consumer of the request runs; a role class
     // kept BF16 needs none (a head-only row). At least one class is compact.
     const auto consumed = [&](FormatId format) {
