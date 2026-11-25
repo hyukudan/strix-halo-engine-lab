@@ -358,6 +358,11 @@ struct WindowDecoder : GreedyDecoder {
     }
 };
 
+// A window decoder whose window shares its checkpoint with the one-row appends: windows run alone.
+struct AloneWindowDecoder : WindowDecoder {
+    [[nodiscard]] bool slot_window_alone() const { return true; }
+};
+
 std::vector<std::uint32_t> solo_ids(const strix::serve::CohortRequest& request) {
     std::vector<std::uint32_t> h(request.prompt.begin(), request.prompt.end());
     std::vector<std::uint32_t> ids;
@@ -558,6 +563,26 @@ void test_verify_windows() {
         check(t->history[0] == std::vector<std::uint32_t>({30U, 40U}) &&
                   t->history[1] == std::vector<std::uint32_t>({31U, 43U}),
               "window: the cohort serves the next verify after the unwind");
+    }
+    {
+        // A decoder that runs windows alone: a mixed verify is refused before any staging, a lone window runs.
+        auto alone = std::make_unique<AloneWindowDecoder>();
+        auto* a = alone.get();
+        FixedKvCohort<AloneWindowDecoder> cohort_alone(std::move(alone), 64U, 4U, 2U);
+        const std::uint32_t q0[] = {30U}, q1[] = {31U};
+        cohort_alone.prefill(0U, q0, true);
+        cohort_alone.prefill(1U, q1, true);
+        const CohortGroup mixed[] = {{0U, 3U, false}, {1U, 1U}};
+        const std::uint32_t tokens[] = {40U, 41U, 42U, 43U};
+        std::uint32_t top[4] = {};
+        check(throws([&] { cohort_alone.verify(mixed, tokens, top); }) && a->windows == 0U && a->last_slots.empty(),
+              "window alone: a mixed verify refused before any work");
+        const CohortGroup lone[] = {{0U, 3U, false}};
+        cohort_alone.verify(lone, std::span<const std::uint32_t>(tokens).first(3), std::span<std::uint32_t>(top).first(3));
+        const std::uint32_t keep[] = {2U};
+        cohort_alone.commit(keep);
+        check(a->windows == 1U && a->history[0] == std::vector<std::uint32_t>({30U, 40U, 41U}),
+              "window alone: a lone window runs and commits");
     }
 
     // Whole cohort: context drafts through windows give the ids of one-row decode, and the {4, 0} rule keeps every

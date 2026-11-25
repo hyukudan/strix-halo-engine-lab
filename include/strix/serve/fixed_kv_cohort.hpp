@@ -36,7 +36,9 @@ namespace strix::serve {
 // no score consumer). A staged window is always resolved before any other backend work: commit() keeps its prefix, and
 // a verify or prefill that comes first (its lane was released and the slot reused, or the commit never came), or a
 // companion one-row pass that throws after staging, discards it with commit_slot_window(slot, tokens, 0), so the
-// decoder's one rollback checkpoint is never overwritten.
+// decoder's one rollback checkpoint is never overwritten. A decoder whose window checkpoint is shared with its eager
+// one-row appends declares slot_window_alone() const -> true: a verify mixing its window with one-row lanes is then
+// refused before any work.
 // A decoder that offers BOTH prefill calls also declares which one it serves with at run time
 // (prefill_emits_first() const -> bool, fixed for its lifetime). This is an arithmetic lever whose resolved value
 // must match the CLI; it must never be selected by slot, cohort width or arrival order. Read once at construction.
@@ -131,6 +133,12 @@ public:
         }
         if (offset != tokens.size() || top.size() != tokens.size())
             throw std::invalid_argument("fixed KV cohort: verify tokens do not match the groups");
+        if constexpr (kWindowAlone) {
+            // A decoder whose staged window shares its rollback checkpoint with the eager one-row appends runs a window
+            // only alone; refused before any work (the by-live draft cap keeps windows to one live lane).
+            if (!windows_.empty() && !window_.empty() && decoder_->slot_window_alone())
+                throw std::logic_error("fixed KV cohort: this decoder runs a verify window alone");
+        }
         try {
             if constexpr (kWindows) {
                 for (const auto& w : windows_) {
@@ -235,6 +243,10 @@ private:
         decoder.stage_slot_window(std::uint32_t{}, tokens, top);
         decoder.commit_slot_window(std::uint32_t{}, tokens, std::uint32_t{});
         { decoder.max_slot_window() } -> std::convertible_to<std::uint32_t>;
+    };
+    // Optional: slot_window_alone() const -> bool, true when a window may not share its verify with one-row lanes.
+    static constexpr bool kWindowAlone = kWindows && requires(const Decoder& decoder) {
+        { decoder.slot_window_alone() } -> std::convertible_to<bool>;
     };
     static constexpr bool kPieces = requires(const Decoder& decoder) {
         { decoder.prefill_piece_rule() } -> std::convertible_to<PromptPieceRule>;
