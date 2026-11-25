@@ -2,6 +2,7 @@
 
 #include "inkling2_mini_config.hpp"
 #include "strix/exec/descriptor.hpp"
+#include "strix/session/linear_verify_step.hpp"
 #include "strix/spec/block_draft_policy.hpp"
 
 #include <cstdint>
@@ -32,17 +33,14 @@ public:
         if (width > positions - first_position)
             throw std::invalid_argument("Inkling CUDA block candidate: padded verify window exceeds session capacity");
 
-        exec::StepBlock descriptor{};
-        descriptor.h.rows = width;
-        descriptor.h.step = first_position;
-        for (unsigned row = 0; row < rows; ++row) {
-            if (ids[row] >= kVocabulary)
+        for (const auto id : ids) {
+            if (id >= kVocabulary)
                 throw std::invalid_argument("Inkling CUDA block candidate: verify token out of range");
-            descriptor.h.valid_mask |= 1U << row;
-            descriptor.row[row] = {ids[row], first_position + row, 0U, row == 0U ? exec::kStepNoParent : row - 1U,
-                                   descriptor.h.valid_mask, exec::step_valid, 0U, 0U};
         }
-        return MiniCudaBlockCandidateStep(descriptor, positions);
+        // The CUDA attention consumer finds each forced row's own K/V through its inclusive ancestor mask.
+        const session::LinearVerifyWindow window{width, first_position, 0U, first_position,
+                                                 session::LinearVerifyRows::inclusive_valid};
+        return MiniCudaBlockCandidateStep(session::linear_verify_step(window, ids), positions);
     }
 
     [[nodiscard]] const exec::StepBlock& descriptor() const noexcept { return descriptor_; }
