@@ -42,7 +42,14 @@ STRIX_INT_HD inline int a4_code_f(float value, float step) {
 // Clip candidates of a load-time MSE step search (the schedule of the host low-bit packers, weight/host_lowbit.hpp):
 // ratio 1.00, 0.98, ..., 0.60 of the unclipped maximum.
 inline constexpr unsigned kA4ClipSteps = 21;
-STRIX_INT_HD inline float a4_clip_ratio(unsigned i) { return 1.0f - 0.02f * static_cast<float>(i); }
+// The ratio is one product then one difference, each rounded (a fused multiply-add gives other ratios, steps and
+// codes): the device compiler contracts by default, so contraction is off here as in its callers.
+STRIX_INT_HD inline float a4_clip_ratio(unsigned i) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    return 1.0f - 0.02f * static_cast<float>(i);
+}
 // High-class-bit-first butterfly. Low-bit-first changes the output bits.
 STRIX_INT_HD inline float tree32(float (&v)[32]) {
     for (unsigned s = 16; s; s /= 2)
