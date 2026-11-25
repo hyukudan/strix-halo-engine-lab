@@ -74,7 +74,6 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     // One speculation row for the command line and the server (an explicit --speculation wins); its verify windows
     // take the verify rows body.
     out.speculation_requested = explicit_speculation.value_or(mini_speculation(resolution));
-    out.verify_rows = mini_speculation_verify_rows(mini_verify_rows(resolution), out.speculation_requested);
     out.controller_one_plane = mini_controller_one_plane(resolution);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
@@ -85,6 +84,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
     // Served verify windows are admitted on HIP (the verify rows body and per-slot tapes); a CUDA server declines.
     out.speculation = out.speculation_requested && resolved.backend == "hip";
+    out.verify_rows = mini_speculation_verify_rows(mini_verify_rows(resolution), out.speculation);
     // The W4A4 class is admitted for the resolved backend (HIP refuses a selected class instead of running BF16).
     out.moe_w4a4 = admit_mini_moe_w4a4(resolution, resolved.backend);
     // Backend admission of the served route lever (kMiniServedCliRoute): HIP runs the command line's route, a CUDA

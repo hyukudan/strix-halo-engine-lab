@@ -61,7 +61,8 @@ inline MiniServeCohort make_mini_device_cohort(
                                                        opt.prefill_fallback_rows, std::cerr, [&](unsigned chunk) {
             auto loaded = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, chunk,
                 opt.served_cli_route && kMiniPackedDecodeDefault, MiniResidentBackend::default_step_graphs,
-                weights.roles(), 0U, false, rows, opt.served_cli_route ? opt.prefill_tail : 0U,
+                weights.roles(), opt.speculation ? std::min(opt.context, kMiniMaxVerifyRows) : 0U,
+                false, rows, opt.served_cli_route ? opt.prefill_tail : 0U,
                 opt.experts_nvfp4, opt.controller_one_plane, opt.served_cli_route, lowbit);
             levers = configure_mini_decoder(*loaded, opt.moe_w4a4, opt.combine_image, opt.prepared_round_fold,
                                             opt.attn_projected_bias, opt.screened_head, opt.verify_rows);
