@@ -1,5 +1,6 @@
 #include "mini_dense_cuda_support.hpp"
 #include "inkling2/inkling2_mini_resident_decoder.hpp"
+#include "mini_staged_source.hpp"
 
 #include <algorithm>
 #include <array>
@@ -39,92 +40,6 @@ namespace {
 // of the Inf weight differs from it (the zero planes meet 0 x inf), so the refused case is discriminating.
 constexpr unsigned kRows = 512U;
 
-struct Poison {
-    std::string tensor;  // full tensor name; empty = none
-    std::uint64_t element = 0;
-    std::uint16_t bits = 0;
-};
-
-class StagedSource final : public wei::Source {
-public:
-    explicit StagedSource(Poison poison) : poison_(std::move(poison)) {
-        std::string header = "{";
-        std::uint64_t offset = 0;
-        for (const auto& spec : mini::mini_text_tensor_schema()) {
-            std::uint64_t count = 1;
-            std::string shape;
-            for (const auto dim : spec.extents) {
-                count *= dim;
-                shape += (shape.empty() ? "" : ",") + std::to_string(dim);
-            }
-            const std::uint64_t width = spec.wire_dtype == "F32" ? 4U : (spec.wire_dtype == "BF16" ? 2U : 1U);
-            const std::uint64_t bytes = count * width;
-            header += (header.size() > 1U ? "," : "") + std::string("\"") + spec.name + "\":{\"dtype\":\"" +
-                      std::string(spec.wire_dtype) + "\",\"shape\":[" + shape + "],\"data_offsets\":[" +
-                      std::to_string(offset) + "," + std::to_string(offset + bytes) + "]}";
-            tensors_.push_back({offset, offset + bytes, spec.wire_dtype == "BF16", spec.name});
-            offset += bytes;
-        }
-        header += "}";
-        payload_ = offset;
-        for (unsigned shift = 0; shift < 64; shift += 8)
-            header_.push_back(static_cast<char>((static_cast<std::uint64_t>(header.size()) >> shift) & 0xFFU));
-        header_ += header;
-        std::uint32_t seed = 0x0DDBA11U;
-        for (std::size_t i = 0; i < pattern_.size(); i += 2U) {
-            seed = 1664525U * seed + 1013904223U;
-            const auto value = static_cast<std::uint16_t>(0x3C00U | ((seed >> 16U) & 0x8000U) | ((seed >> 12U) & 0x01FFU));
-            pattern_[i] = static_cast<wei::Byte>(value & 0xFFU);
-            pattern_[i + 1U] = static_cast<wei::Byte>(value >> 8U);
-        }
-    }
-    wei::Status read(wei::ByteRange range, std::span<wei::Byte> out) const override {
-        if (range.bytes != out.size()) return {wei::Error::malformed, "staged source: size mismatch"};
-        if (range.offset < header_.size()) {
-            if (range.bytes > header_.size() - range.offset) return {wei::Error::malformed, "staged source: header range"};
-            std::memcpy(out.data(), header_.data() + range.offset, out.size());
-            return {wei::Error::ok, {}};
-        }
-        const auto begin = range.offset - header_.size(), end = begin + range.bytes;
-        if (end > payload_) return {wei::Error::malformed, "staged source: payload range"};
-        std::memset(out.data(), 0, out.size());
-        for (const auto& tensor : tensors_) {
-            if (tensor.end <= begin || tensor.begin >= end) continue;
-            const auto first = std::max(begin, tensor.begin), last = std::min(end, tensor.end);
-            if (tensor.bf16)
-                for (auto at = first; at < last;) {
-                    const auto inside = (at - tensor.begin) % pattern_.size();
-                    const auto run = std::min<std::uint64_t>(last - at, pattern_.size() - inside);
-                    std::memcpy(out.data() + (at - begin), pattern_.data() + inside, static_cast<std::size_t>(run));
-                    at += run;
-                }
-            if (!poison_.tensor.empty() && tensor.name == poison_.tensor) {
-                const auto at = tensor.begin + 2U * poison_.element;
-                if (at >= first && at + 2U <= last) {
-                    out[static_cast<std::size_t>(at - begin)] = static_cast<wei::Byte>(poison_.bits & 0xFFU);
-                    out[static_cast<std::size_t>(at - begin) + 1U] = static_cast<wei::Byte>(poison_.bits >> 8U);
-                }
-            }
-        }
-        return {wei::Error::ok, {}};
-    }
-    std::uint64_t size() const noexcept override { return header_.size() + payload_; }
-    wei::Digest256 identity() const override { throw std::logic_error("staged source has no digest"); }
-    std::string shard_name() const override { return std::string(mini::kMiniCheckpointShard); }
-
-private:
-    struct Tensor {
-        std::uint64_t begin, end;
-        bool bf16;
-        std::string name;
-    };
-    std::string header_;
-    std::uint64_t payload_ = 0;
-    std::vector<Tensor> tensors_;
-    Poison poison_;
-    std::array<wei::Byte, 4096> pattern_{};
-};
-
 class Refusing final : public std::pmr::memory_resource {
     void* do_allocate(std::size_t, std::size_t) override { throw std::bad_alloc(); }
     void do_deallocate(void*, std::size_t, std::size_t) override {}
@@ -139,11 +54,11 @@ struct Outcome {
     bool forced_one_plane_ran;
 };
 
-Outcome run(const char* label, Poison poison, bool refuse_scan_scratch) {
+Outcome run(const char* label, mini_staged::Poison poison, bool refuse_scan_scratch) {
     using namespace mini;
     using namespace mini_dense_fixture;
     const std::string query_name = "layers.0." + std::string(mini_attention_projection_spec(Role::query).tensor_suffix);
-    const auto source = std::make_shared<StagedSource>(std::move(poison));
+    const auto source = std::make_shared<mini_staged::StagedSource>(std::move(poison));
     wei::TensorIndex index;
     if (const auto status = wei::index_safetensors(source, index); !status) throw std::runtime_error(status.detail);
     MiniTextWeights text;
