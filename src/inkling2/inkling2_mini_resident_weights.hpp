@@ -14,6 +14,7 @@
 
 #include <functional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <utility>
 

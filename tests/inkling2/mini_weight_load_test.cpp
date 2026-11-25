@@ -591,7 +591,7 @@ int main() {
         test_lowbit_receipts();
         test_pack_admission();
         test_capacity_and_pack_fallback();
-    test_calibrated_row_speculation_admission();
+        test_calibrated_row_speculation_admission();
         test_calibrated_pack_requires_complete_inventory();
         test_token_bytes();
     } catch (const std::exception& error) {
