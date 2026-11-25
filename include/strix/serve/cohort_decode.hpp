@@ -206,6 +206,10 @@ struct CohortResult {
     std::string_view finish = "error";
 };
 
+struct CohortConfig;
+// The draft rows a lane may carry while `live` lanes hold a request (CohortConfig::max_draft_by_live).
+[[nodiscard]] std::uint32_t max_draft_for_live(const CohortConfig& config, std::uint32_t live) noexcept;
+
 struct CohortConfig {
     static MtpContextDraftConfig default_draft() {
         MtpContextDraftConfig c;
@@ -216,6 +220,11 @@ struct CohortConfig {
     MtpContextDraftConfig draft = default_draft();  // n-gram suffix drafts plus long copy spans (copy_edit)
     double min_p = 0.0;                 // the drafter's min_probability
     std::uint32_t max_draft = 7;        // draft rows per lane per step (window = 1 + drafts)
+    // Draft rows per lane by live lanes (the engine's data): entry n - 1 caps max_draft while n lanes hold a request
+    // (prompting or decoding); lanes beyond the table take its last entry; empty = max_draft at every width. A prompt
+    // that arrives raises the live count at once, so a lane that drafts alone drops to the capped window at its next
+    // round. Example {7, 0}: drafts only while one lane is live (a backend whose windows are their own forward).
+    std::vector<std::uint32_t> max_draft_by_live{};
     CycleCost prior{};                  // the engine's measured prior: fixed + row * rows + lane * lanes (ms)
     bool learn_cost = true;             // replace the prior by the fit of the observed steps
     std::uint32_t fit_min_steps = 8;    // steps with at least two distinct row counts before the fit is used
