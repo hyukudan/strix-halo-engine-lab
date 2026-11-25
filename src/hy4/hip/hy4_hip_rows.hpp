@@ -30,6 +30,10 @@ namespace strix::hy4::hipbind::rows {
 // Rows of one verify pass: the q8_rows direct / stepped forms keep the single-row arithmetic up to 8 rows and the shared
 // device greedy selects 1..8 rows (strix::hip_greedy_rows_max).
 inline constexpr std::uint32_t kMaxVerifyRows = 8;
+// Seeds of the speculative decode (the record route, strix-hy4-rows --mtp): the verify-pass byte model's bandwidth (GB/s)
+// and the chain's stated confidence, the host oracle's prose conditionals P(run >= k) .714 .452 .197 .133 .034 .017.
+inline constexpr double kVerifySeedGbps = 207.0;
+inline constexpr std::array<double, 6> kChainSurvival{0.714, 0.633, 0.436, 0.675, 0.256, 0.5};
 // Routed experts of a verify window in the shared A8 union rows form (each distinct expert read once, rows bitwise == the
 // per-row loop). Off switch: STRIX_HY4_ROWS_EXPERT_UNION=0.
 inline constexpr bool kExpertUnionDefault = true;  // measured bitwise (ROWS 30/30) and faster at R >= 2

@@ -764,15 +764,15 @@ void hy4_new_quality_rows() {
     p::Inputs in;
     in.profile = p::Name::fast;
     in.env = none;
-    // The width change stays inside the incumbent's gated arithmetic and is inherited by TURBO.
-    const h::Regime measured{h::Device::gfx1151, h::Topology::one_node, 8192, h::single_greedy_8k};
+    // No timing row prices another width inside the gated window class: the 8K greedy execution keeps the frozen 4096
+    // grant in FAST and TURBO (r89 on #1310).
+    const h::Regime measured{h::Device::gfx1151, h::Topology::one_node, 8192, "hip/rank/single/full/greedy/8384/64"};
     for (const auto tier : {p::Name::fast, p::Name::turbo}) {
         in.profile = tier;
         const auto resolution = h::resolve(measured, in);
         const auto* rows = resolution->find("prompt_rows");
-        require(rows->value == "2048" && rows->status == p::Status::set &&
-                    rows->ladder.find(h::single_greedy_8k_receipt) != std::string::npos,
-                "Hy4 picks the recorded 2048 schedule inside the gated window class");
+        require(rows->value == "4096" && rows->status == p::Status::set,
+                "Hy4 keeps the incumbent 4096 width without a matched timing row");
     }
     in.profile = p::Name::fast;
     const h::Regime beyond{h::Device::gfx1151, h::Topology::one_node, 40000, "fixture-exec"};

@@ -1,10 +1,12 @@
 #include "hy4/serve/session_service.hpp"
+#include "hy4/hy4_speculation.hpp"
 #include "strix/profiles/hy4.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/model_family_registry.hpp"
 #include "strix/weight/tensor_map.hpp"
 #include <algorithm>
 #include <charconv>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -80,6 +82,7 @@ Options parse_options(std::span<const std::string> arguments) {
         } else if (a == "--print-effective-config") o.print_effective_config = true;
         else if (a == "--prompt-rows") (void)number<std::uint32_t>(a, value());
         else if (a == "--head-q8") (void)value();
+        else if (::strix::session::speculation_opt_out_argument(a)) o.no_mtp = true;
         else if (a == "--help" || a == "-h") o.help = true;
         else throw std::invalid_argument("unknown hy4_flash option: " + a + " (see --help)");
     }
@@ -102,6 +105,8 @@ PackFacts read_pack_facts(const Options& options) {
         throw std::invalid_argument(options.gguf + ": eos_token_id " + std::to_string(*eos->unsigned_value) + " differs from the template's 120025");
     if (const auto* ctx = info.find_metadata(std::string(kArchitecture) + ".context_length"); ctx && ctx->unsigned_value)
         facts.context_length = *ctx->unsigned_value;
+    if (const auto* nextn = info.find_metadata(std::string(kArchitecture) + ".nextn_predict_layers"); nextn && nextn->unsigned_value)
+        facts.next_token_block = *nextn->unsigned_value > 0U;
     if (const auto* t = info.find_metadata("general.sampling.temp"); t && t->floating_value) {
         facts.card_temperature = *t->floating_value;
         facts.card_from_pack = true;
@@ -169,6 +174,17 @@ sv::Json effective_config(const Options& options, const PackFacts& pack) {
     out.set("serve_only", std::move(serve_only));
     const auto resolved = profile::resolve({profile::Device::unknown, profile::Topology::one_node, ctx}, options.profile);
     out.set("profile", sv::parse_json(resolved->resolution.json()));
+    // The decode route the native rank resolves for a whole-model request (one node): the same shared decision.
+    ::strix::hy4::SpeculationRun run;
+    run.block_in_pack = pack.next_token_block;
+    run.no_mtp = options.no_mtp;
+    run.environment = std::getenv(::strix::session::speculation_environment);
+    const auto decision = ::strix::hy4::speculation(run);
+    auto speculation = sv::Json::object();
+    speculation.set("enabled", sv::Json(decision.enabled));
+    speculation.set("source", sv::Json(std::string(decision.source)));
+    speculation.set("exact", sv::Json(true));
+    out.set("speculation", std::move(speculation));
     out.set("device", sv::Json("not built: hy4_hipbind / hy4_cudabind"));
     return out;
 }
@@ -196,6 +212,8 @@ const char* usage() {
            "  --model-id NAME           model id reported by the API (default hy4-flash)\n"
            "  --profile exact|fast|turbo  tier to resolve for host inspection\n"
            "  --prompt-rows N --head-q8 0|1  explicit profile overrides for inspection\n"
+           "  --no-mtp                  plain decode instead of the exact speculative default (also STRIX_MTP=0)
+"
            "  --print-effective-config  print the effective values and the serve-only levers, then exit\n";
 }
 

@@ -32,6 +32,7 @@ struct Options {
     bool ctx_given = false, max_tokens_given = false, model_id_given = false;
     bool print_effective_config = false;    // --print-effective-config: print effective_config and exit
     bool help = false;                      // --help
+    bool no_mtp = false;                    // --no-mtp: the shared speculation opt-out (as the native rank)
 };
 
 // The family argument parser (argument 0 is NOT a program name). Throws std::invalid_argument on an unknown option,
@@ -43,6 +44,7 @@ struct PackFacts {
     sv::Hy4ChatDialect dialect{};          // official ":opensource" release when no pack is given
     bool dialect_from_pack = false;
     std::uint64_t context_length = 0;       // 0 = unknown (no pack)
+    bool next_token_block = false;          // <arch>.nextn_predict_layers > 0: the pack ships the MTP drafter block
     // The model's sampling card: generation_config.json, or the pack's general.sampling.* when present. Documented in the
     // effective config; requests use them only when the client sends them (the default stays exact greedy).
     double card_temperature = 0.9, card_top_p = 1.0;

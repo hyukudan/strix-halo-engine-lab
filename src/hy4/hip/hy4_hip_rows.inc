@@ -141,6 +141,13 @@ void linear_vrows(const std::string& name, const float* x, std::uint32_t width, 
         return;
     }
     const auto& tw = t(name);
+    // The FAST head copy (head_q8) is the step's decode head (linear("output.weight")): the verify rows read the same Q8_0
+    // rows through the shared q8 rows form, so a row stays bitwise the step at that position with the copy on too.
+    if (head_q8 != nullptr && name == "output.weight") {
+        if (tw.dims.at(0) != width) throw std::runtime_error("hy4 hip forward: shape of " + name);
+        linear_vrows_w(head_q8, 8U, x, width, outputs, R, y, round, bias);
+        return;
+    }
     if (tw.dims.at(0) != width || tw.bytes != row_bytes(tw.type, width) * outputs)
         throw std::runtime_error("hy4 hip forward: shape of " + name);
     linear_vrows_w(tw.p, tw.type, x, width, outputs, R, y, round, bias);
