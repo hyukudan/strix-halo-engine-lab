@@ -110,6 +110,9 @@ serve::CohortConfig scheduling(const MiniServeOptions& opt, const serve::CohortB
     config.context_draft = opt.speculation;
     config.max_draft = opt.speculation ? kMiniMaxVerifyRows - 1U : 0U;
     if (opt.speculation) config.max_draft_by_live = mini_served_draft_by_live();
+    // The measured one-node prior until the cohort's own fit takes over (gfx1151 BF16: a served B=1 step 42.4 ms, an
+    // extra verify row 10.2 ms): fixed 32.2 + 10.2 per row.
+    if (opt.speculation) config.prior = {32.2, 10.2, 0.0, 0.0};
     // A prompt runs as the command line's calls (whole chunks, the final one with its tail); beside a decoding lane
     // the cohort cuts pieces of kMiniServeDecodingRows inside those chunks where the decoder's piece rule allows (HIP),
     // so the bits never depend on other lanes (the backend's prompt_piece_rule; CUDA: none, whole chunks).
