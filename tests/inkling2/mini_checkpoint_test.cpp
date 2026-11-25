@@ -376,7 +376,7 @@ bool check_attention_staging() {
         return certificate.route(one);
     };
     bool refused = true;
-    for (const auto target : {suffix(mini::MiniAttentionProjection::query), suffix(mini::MiniAttentionProjection::key),
+    for (const auto& target : {suffix(mini::MiniAttentionProjection::query), suffix(mini::MiniAttentionProjection::key),
                               suffix(mini::MiniAttentionProjection::output), std::string("attn.v_sconv.weight"),
                               std::string("attn_norm.weight")})
         for (const std::size_t element : {std::size_t{0}, std::size_t{17}, kElements - 1U})
