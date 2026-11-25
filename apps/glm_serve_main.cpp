@@ -12,6 +12,9 @@
 // Options (both ranks must pass the same engine options; hello refuses a mismatch):
 //   --slots S (default 8, <= 8 rows per step) --capacity C (positions per slot, default 8192)
 //   --serial or STRIX_GLM_SERVE_BATCH=0: serial admission (one request at a time; the OFF switch of batching)
+//   --vision MMPROJ.gguf (rank 0; off by default): image parts of chat requests through the model's projector file
+//   (clip.projector_type = glm5v). The tower runs on the host CPU; the rows reach rank 1 in an embed frame. Needs a
+//   chunked prefill (with MTP: --prefill gemv). Image prompts skip the prefix cache and the RTX route.
 //   --short-first on|off or STRIX_GLM_SERVE_SHORT_FIRST=0|1 (default on; flag > env): shortest waiting prompt admitted first
 //   (shared 8-overtake starvation bound); off = FIFO. Reorders admission only, never changes tokens.
 //   --prefill-chunk N (decode-first prefill interleave: while requests decode, one N-token chunk of a new prompt per
@@ -76,6 +79,8 @@
 #include "glm/serve/glm_serve_import.hpp"
 #include "glm/serve/glm_serve_lead.hpp"
 #include "glm/serve/glm_serve_selftest.hpp"
+#include "glm/serve/glm_serve_vision.hpp"
+#include "strix/dist/communicator.hpp"
 #include "glm/spec/glm_spec_run.hpp"
 
 #include <netdb.h>
@@ -233,6 +238,24 @@ struct EngineOps {
     // per slot: the prompt tokens (both ranks see the same chunks), the shared arbiter's lookup context
     std::vector<std::vector<std::uint32_t>> context{};
     std::size_t sampling_vocab = 0;
+    // Image input (--vision on rank 0): the table of the prompt in prefill and the pair's embed frames. A prompt chunk
+    // with virtual ids becomes vocabulary ids plus the engine's splice for the prefill call that follows; a text chunk
+    // comes back as it is and touches none of this.
+    gs::PromptEmbeds embeds{&strix::dist::crc32c};
+    std::vector<std::uint32_t> real_tokens{};
+    void bind_embeds(std::shared_ptr<const strix::session::EmbedTable> table) { embeds.bind(std::move(table)); }
+    std::vector<std::byte> embed_frame(std::span<const std::uint32_t> ids) { return embeds.frame(ids); }
+    void embed_frame_received(std::span<const std::byte> frame, std::vector<std::uint32_t>& ids) { embeds.received(frame, ids); }
+    static constexpr std::uint32_t embed_row_width() noexcept { return gs::PromptEmbeds::row_width(); }
+    std::span<const std::uint32_t> provide(std::span<const std::uint32_t> tokens, bool mtp) {
+        if (!gs::PromptEmbeds::holds_virtual_ids(tokens)) return tokens;
+        // The reference MTP bootstrap runs decode steps, where no row can be provided (startup refuses --vision with it).
+        if (mtp && bootstrap != sp::BootstrapPolicy::Chunked) throw std::logic_error("image prompt: MTP needs the chunked bootstrap");
+        auto run = embeds.resolve(tokens);
+        real_tokens = std::move(run.tokens);
+        eng.set_embed_rows(std::move(run.splice));
+        return real_tokens;
+    }
     void remember(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
         if (!policy.spec_arbiter) return;
         auto& c = context.at(slot);
@@ -275,6 +298,7 @@ struct EngineOps {
     std::uint32_t prefill(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
         plain_call();
         spec.at(slot) = {};
+        tokens = provide(tokens, false);
         remember(slot, tokens, pos0);
         return eng.prefill(slot, tokens, pos0);
     }
@@ -397,6 +421,7 @@ struct EngineOps {
             hp_row.at(slot) = 0;
             prefix_bootstrap_pending &= ~(1U << slot);
         }
+        tokens = provide(tokens, true);
         remember(slot, tokens, pos0);
         if (pos0 == 0 && last) {
             seed = sp::bootstrap(eng, slot, tokens, bootstrap, control);
@@ -473,6 +498,7 @@ struct EngineOps {
                 control.calibration = sp::Calibration{};
                 control.cycle = control.step = 0;
             }
+            tokens = provide(tokens, true);
             eng.prefill_mtp_begin(slot, tokens, pos0);
             units_end = pos0 + tokens.size();
         }
@@ -678,6 +704,15 @@ struct EngineOps {
         spec.at(slot) = {};
         import_done = gs::ImportReport{id, static_cast<std::uint32_t>(gs::ImportStatus::failed), 0};
     }
+    // Sampled drafts (kRunSampleDrafts): the seed draft is drawn from the drafter row of the seed call.
+    void mtp_enter(std::uint32_t r, const gs::WireRow& row, bool from_seed, gs::SampledRun run) {
+        if (from_seed || (run.flags & gs::kRunSampleDrafts) == 0) throw std::logic_error("mtp_enter: sampled seeds come from a step row");
+        mtp_enter(r, row, false);
+        sample_run = run;
+        sample_chunk = 0;
+        kept_drafts.clear();
+        if (!seed->flagged) seed->draft = pick_draft_row(0, seed->p + 1, 0);
+    }
     // Seed from the last step's row r (it produced row.token at row.pos): the drafter pair (h_r, token) at row.pos,
     // as decode_greedy's catch-up does after a verify.
     // from_seed: the C1 decoder takes over the slot's batched-spec drafter seed (its first draft, h' row hp_row).
@@ -715,10 +750,101 @@ struct EngineOps {
     // Up to `cycles` verify cycles; the first call opens the decoder from the fresh seed (budget includes the seed's y0,
     // already emitted). Returns the tokens after the ones already returned.
     std::vector<std::uint32_t> mtp_run(std::uint32_t slot, std::uint32_t budget, std::uint32_t cycles) {
+        return mtp_run(slot, budget, cycles, gs::SampledRun{});
+    }
+    // Sampled MTP (kRunSample): the decoder's verify rows are decided by the lead's sampler over full rows assembled from
+    // both ranks' slices (strix::serve::decide_pair_window, the round's sampling exchanges). A decoder keeps the flags it
+    // was opened with; the channel and the lead's sampler are this round's.
+    gs::SampledRun sample_run{};
+    std::uint32_t dec_flags = 0;
+    std::uint64_t sample_chunk = 0;
+    std::vector<float> sample_local{};
+    // Lead only, kRunSampleDrafts: the drafts of the open window as drawn (with their distributions), by index.
+    std::vector<strix::TokenDraft> kept_drafts{};
+    bool sample_lead() const {
+        const bool lead = sample_run.sampler != nullptr;
+        if (lead != (control.rank == 0) || sample_run.ch == nullptr) throw std::logic_error("sampled MTP: the lead holds the sampler");
+        return lead;
+    }
+    // This rank's logits slice of row `row` of the last engine call (verify rows, or the drafter rows after mtp()).
+    std::span<const float> sample_row(std::size_t row) {
+        const std::size_t width = eng.vocab_slice();
+        sample_local.resize(width);
+        const auto status = hipMemcpy(sample_local.data(), eng.last_logits() + row * width, width * sizeof(float), hipMemcpyDeviceToHost);
+        if (status != hipSuccess) throw std::runtime_error(std::string("sampling logits: ") + hipGetErrorString(status));
+        return std::span<const float>(sample_local);
+    }
+    // Draft `index` of the window, drawn from drafter row `row` of the last mtp() call (pick_pair_draft).
+    std::uint32_t pick_draft_row(unsigned row, std::uint64_t position, unsigned index) {
+        const bool lead = sample_lead();
+        auto& ch = *sample_run.ch;
+        strix::TokenDraft kept;
+        const auto token = sv::pick_pair_draft(lead, ch.paired() ? eng.vocab_slice() : 0U, sampling_vocab, sample_run.sampler, position,
+            [&] { return sample_row(row); },
+            [&](std::span<const float> send, std::span<float> receive) { ch.exchange_sampling_logits(send, receive, sample_chunk++); },
+            [&](std::span<const std::uint32_t> send, std::span<std::uint32_t> receive) {
+                ch.exchange_sampling_words(send, receive, sample_chunk++);
+            },
+            lead ? &kept : nullptr);
+        if (lead) {
+            kept_drafts.resize(index);
+            kept_drafts.push_back(std::move(kept));
+        }
+        return token;
+    }
+    // Decides the window's rows into ids[0 .. n) and returns how many leading drafts the acceptance rule accepted
+    // (the commit follows that count, not token equality: a rejected row's token can equal its draft).
+    // A window ending at a stop id of the request (the lead's stop list, kPairWindowStop on the follower) returns it:
+    // the cycle commits nothing after that row and the decoder ends, on both ranks.
+    sp::DecodePolicy::Picked pick_window(std::span<const std::uint32_t> drafts, unsigned rows, std::uint64_t first,
+                                          std::span<std::uint32_t> ids) {
+        const bool lead = sample_lead();
+        auto& ch = *sample_run.ch;
+        const std::size_t width = eng.vocab_slice();
+        std::vector<strix::TokenDraft> td(drafts.size());
+        for (std::size_t i = 0; i < drafts.size(); ++i) {
+            if (lead && (dec_flags & gs::kRunRejection) != 0) {  // rejection reads the distribution each draft came from
+                if (i >= kept_drafts.size() || kept_drafts[i].token != drafts[i] || kept_drafts[i].position != first + i)
+                    throw std::logic_error("sampled MTP: a rejection window's draft was not drawn by the sampler");
+                td[i] = kept_drafts[i];
+                continue;
+            }
+            td[i].position = first + i;  // coupled: only the draft token is read
+            td[i].token = drafts[i];
+        }
+        const auto window = sv::decide_pair_window(lead, ch.paired() ? width : 0, sampling_vocab, sample_run.sampler, first,
+            std::span<const strix::TokenDraft>(td), rows, sample_run.stops,
+            [&](std::size_t row) { return sample_row(row); },
+            [&](std::span<const float> send, std::span<float> receive) { ch.exchange_sampling_logits(send, receive, sample_chunk++); },
+            [&](std::span<const std::uint32_t> send, std::span<std::uint32_t> receive) {
+                ch.exchange_sampling_words(send, receive, sample_chunk++);
+            });
+        const auto& tokens = window.tokens;
+        // The decided span is exact: rows 0 .. accepted - 1 accepted, row `accepted` decided the last token, or every one
+        // of `rows` rows accepted (no bonus row is read then). Anything else would leave a verify row's greedy id in
+        // place of a decision.
+        if (tokens.empty() || tokens.size() > rows || tokens.size() > ids.size() || window.accepted > drafts.size() ||
+            window.accepted > tokens.size() || window.accepted + 1U < tokens.size() ||
+            (window.accepted == tokens.size() && tokens.size() != rows && !window.stop))
+            throw std::logic_error("sampled MTP: the window decided no row, too many, or left a required row undecided");
+        std::copy(tokens.begin(), tokens.end(), ids.begin());
+        return {window.accepted, window.stop ? tokens.back() : sp::kNoFlag};
+    }
+    std::vector<std::uint32_t> mtp_run(std::uint32_t slot, std::uint32_t budget, std::uint32_t cycles, gs::SampledRun run) {
+        if (dec && dec_flags != run.flags) throw std::logic_error("mtp_run: the open decoder was opened with other sampling flags");
+        sample_run = run;
+        sample_chunk = 0;
         if (!dec) {
             if (!seed || seed_slot != slot) throw std::logic_error("mtp_run without a fresh drafter seed");
             auto pol = policy;
             if (pol.spec_arbiter) pol.context = &context.at(slot);
+            if ((run.flags & gs::kRunSample) != 0)
+                pol.pick_targets = [this](std::span<const std::uint32_t> drafts, unsigned rows, std::uint64_t first,
+                                          std::span<std::uint32_t> ids) { return pick_window(drafts, rows, first, ids); };
+            if ((run.flags & gs::kRunSampleDrafts) != 0)
+                pol.pick_draft = [this](unsigned row, std::uint64_t position, unsigned index) { return pick_draft_row(row, position, index); };
+            if ((run.flags & gs::kRunRejection) != 0) pol.spec_arbiter = false;  // lookup drafts carry no distribution
+            dec_flags = run.flags;
             dec = std::make_unique<sp::GreedyDecoder>(eng, slot, *seed, pol, budget, control);
             dec_slot = slot;
             seed.reset();
@@ -741,6 +867,9 @@ struct EngineOps {
                 context.at(slot).insert(context.at(slot).end(), emitted.begin(), emitted.end());
             }
             dec->finish();
+            dec_flags = 0;
+            sample_run = {};
+            kept_drafts.clear();
             if (control.rank == 0 && !dec->result().spec_stats.empty())
                 std::fprintf(stderr, "strix-spec-stats %s\n", dec->result().spec_stats.c_str());
             dec.reset();
@@ -753,6 +882,9 @@ struct EngineOps {
     // Tentative device state is abandoned with the failing engine, never reused.
     void owner_abandon() {
         dec.reset();
+        dec_flags = 0;
+        sample_run = {};
+        kept_drafts.clear();
         seed.reset();
         stager.reset();
     }
@@ -861,7 +993,6 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::setvbuf(stderr, nullptr, _IONBF, 0);
     try {
-        const auto sampler_options = strix::validate_sampling_startup_environment();
         if (argc < 2) {
             std::fprintf(stderr, "usage: %s MODEL_DIR --world 1|2 [--rank R --transport T] [--slots S] [--capacity C] [--serial] "
                                  "[--host H] [--port P] [--profile default|fast|quality] [--deploy FILE|auto] [--deploy-check] [--prefix-cache-gib G] [--selftest N [--selftest-tokens M] [--selftest-prefix [--selftest-prefix-long L]]] "
@@ -890,6 +1021,7 @@ int main(int argc, char** argv) {
         int short_first_flag = -1;  // --short-first on|off (-1: unset); overrides STRIX_GLM_SERVE_SHORT_FIRST
         // RTX prefill route: every rank receives its hand-off on --import-listen; rank 0 asks the RTX producer
         // (--rtx-prefill host:port) for prompts of >= --import-min-tokens and names rank 1's --import-peer endpoint.
+        std::string vision_file;  // --vision: image input on the HTTP front door (rank 0; empty: off)
         std::string import_listen, import_key_file, import_model_sha, import_node, rtx_prefill, import_peer;
         std::uint64_t import_min_tokens = 4096;
         double import_timeout_s = 120.0;
@@ -937,6 +1069,7 @@ int main(int argc, char** argv) {
             else if (a == "--slots") opt.slots = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--capacity") opt.capacity = std::stoull(next());
             else if (a == "--serial") serial = true;
+            else if (a == "--vision") vision_file = next();
             else if (a == "--short-first") {
                 const std::string v = next();
                 if (v != "on" && v != "off") throw std::invalid_argument("--short-first must be on|off");
@@ -1015,6 +1148,11 @@ int main(int argc, char** argv) {
         // bootstrap when the model has a complete MTP head; STRIX_GLM_SERVE_MTP=0 resolves as --mtp-spec 0). Automatic
         // max-rows runs the CLI's load-time admission (rd::admit_auto_rows) and a row merge between the two ranks.
         auto eff = rd::resolve_serve(rank_args, serve_mtp, rd::process_env(), rd::probe_model_mtp(argv[1]));
+        // Sampled MTP is resolved and admitted inside that resolution (row serve_sampled_mtp; coupled under any profile,
+        // rejection fast / turbo only); execution and the receipt read eff.sampled_mtp only. The sampler options are
+        // validated here, before any rank connects or the model loads, with the acceptance rule the row resolved (off:
+        // the shared default, as on main).
+        const auto sampler_options = strix::validate_sampling_startup_environment(eff.sampled_mtp.acceptance());
         const bool mtp_on = eff.mtp_spec.value == "1" && (eff.prefill == "gemv" || eff.prefill == "ref");
         if (!deployment.file.empty() || deployment.check) {
             opt.mtp = mtp_on; opt.spec = mtp_on;
@@ -1044,6 +1182,11 @@ int main(int argc, char** argv) {
                         opt.slots, static_cast<unsigned long long>(opt.capacity), serial ? "serial" : "on", short_first ? "on" : "off", prefill_chunk,
                         prefill_chunk_mtp ? 1 : 0,
                         mtp_on ? "on" : "off", eff.kmax, eff.adaptive ? 1 : 0, mtp_cycles);
+            // Sampled requests through MTP at C1 (resolved row serve_sampled_mtp; opt-in until its pair gates pass).
+            std::printf("serve sampled-mtp=%s (STRIX_GLM_SERVE_SAMPLED_MTP, identity %s) sampled-accept=%s\n",
+                        eff.sampled_mtp.on() ? (mtp_on ? eff.sampled_mtp.name() : "off (MTP off)") : "off",
+                        eff.sampled_mtp.identity(),
+                        sampler_options.acceptance == strix::SampledAcceptance::rejection ? "rejection" : "coupled");
             // The RTX import route (FAST identity glm-pf-rtx-native-v1: imported prompts are not bitwise the pair's own
             // prefill; off unless --rtx-prefill / --import-listen are given).
             std::printf("serve import-route=%s import-listen=%s wire=v%u index-rows=%s identity=%s\n", rtx_prefill.empty() ? "off" : "rtx",
@@ -1184,6 +1327,16 @@ int main(int argc, char** argv) {
         if (mtp_on && serve_g2 && !g2_on)
             std::printf("rank %u: batched self-speculation off (the attention seam verifies one slot per call)\n", opt.rank);
         hello.g2 = g2_on ? 1U : 0U;
+        if (!vision_file.empty()) {
+            if (opt.rank != 0) {
+                std::fprintf(stderr, "--vision: ignored on rank %u (rank 0 holds the image tower)\n", opt.rank);
+                vision_file.clear();
+            } else if (prefill_mode == "ref") {
+                throw std::invalid_argument("--vision needs a chunked prefill (--prefill gemv|wmma): the reference prefill runs decode steps");
+            } else if (mtp_on && prefill_mode != "gemv") {
+                throw std::invalid_argument("--vision with MTP needs --prefill gemv (the chunked MTP bootstrap), or --mtp-spec 0");
+            }
+        }
         EngineOps ops{eng, {eff.kmax, eff.adaptive, eff.kmax, opt.capacity},
                       prefill_mode == "gemv" ? sp::BootstrapPolicy::Chunked : sp::BootstrapPolicy::Reference, {}, {}, 0, {}, 0, {}, {}};
         ops.control.rank = opt.rank;
@@ -1330,6 +1483,7 @@ int main(int argc, char** argv) {
         lc.prefill_units_admit = [&eng](std::uint64_t rows) { return eng.prefill_units_admit(rows); };
         lc.mtp = mtp_on;
         lc.sampling = sampling;
+        lc.sampled_mtp = eff.sampled_mtp.on();  // the resolved row (rd::resolve_sampled_mtp), nothing else
         lc.sampler_options = sampler_options;
         lc.mtp_cycles = mtp_cycles;
         lc.g2 = g2_on;
@@ -1649,7 +1803,18 @@ int main(int argc, char** argv) {
             return result.exact ? 0 : 3;
         }
 
+        // --vision: declared before `config` and `api`, which refer to it; destroyed after them.
+        std::unique_ptr<gs::VisionStack> vision_stack;
         sv::ApiConfig config;
+        if (!vision_file.empty()) {
+            vision_stack = gs::make_vision_stack(vision_file, [&tokenizer](const std::string& text) { return tokenizer->encode(text, true); },
+                                                 config.vision.media.limits);
+            config.vision.adapters = {vision_stack->bridge};
+            // Image prompts never enter the prefix cache or a session, so no cached state holds virtual ids of an
+            // earlier interner epoch: nothing to withdraw.
+            config.vision.on_epoch = [](std::uint64_t) {};
+            std::fprintf(stderr, "strix serve: image input on, tower on the host CPU (vision %s)\n", vision_stack->adapter->identity().c_str());
+        }
         config.model_id = model_id;
         config.default_max_tokens = max_tokens;
         config.http_slots = serial ? 1U : opt.slots;
@@ -1676,7 +1841,10 @@ int main(int argc, char** argv) {
                                     " slots, " + (serial ? "serial" : "batched") + " decode" +
                                     (mtp_on ? ", MTP self-speculation at C1" : "") +
                                     (g2_on ? " and in the batch" : "") + ", greedy, exact per request" +
-                                    (lead.supports_sampling() ? "; sampling-v1 uses plain decode" : "") +
+                                    (lead.supports_sampling() ? (lc.sampled_mtp && mtp_on ? (lc.sampler_options.acceptance == strix::SampledAcceptance::coupled
+                                                                 ? "; sampling-v1 through MTP at C1 (coupled, tokens of plain sampling)"
+                                                                 : "; sampling-v1 through MTP at C1 (rejection, exact in distribution)")
+                                                              : "; sampling-v1 uses plain decode") : "") +
                                     (rtx_prefill.empty() ? std::string()
                                                          : std::string("; prompts of >= ") + std::to_string(import_min_tokens) +
                                                                " tokens may take the RTX prefill route (FAST identity glm-pf-rtx-native-v1, wire v" +

@@ -22,7 +22,10 @@ The interface is `strix::vision::VisionAdapter` (`include/strix/vision/adapter.h
 2. **`config()`**: fill `EncoderConfig` from the validated metadata. Check `vision::hip_supported(config)`.
    A checkpoint that norms the embedded rows (patch embedding plus position addend) before the first block, such
    as a `ln_pre`, sets `embed_norm` and binds `embed_norm_w` / `embed_norm_b`; the HIP runner applies it with the
-   same norm kernel as the blocks, in place, and the host reference after the addend.
+   same norm kernel as the blocks, in place, and the host reference after the addend. A tower that norms each
+   head's q and k over the head dimension before the rotary step sets `qk_norm` and binds `q_norm_w` / `k_norm_w`
+   (`[head_dim]`, shared by the heads); only the host reference implements it, `hip_supported` and
+   `cuda_supported` refuse it, so such a tower runs on `ReferenceEncoder`.
 3. **`bind()`**: map tensor names to `EncoderWeights` through a `WeightSource` (`GgufWeights` for GGUF files,
    `LookupWeights` over a `weight::TensorLookup` for safetensors: each tensor read once to owned FP32). `GgufWeights` returns a tensor
    with GGUF dimensions `(d0, ..., dn)` as the matrix `[dn][d0 * ... * d(n-1)]`, which is the source framework's
@@ -189,6 +192,85 @@ other. Other vision adapters on the shared encoder get the same default.
 Measured tower time on one node (warm, no per-layer synchronisation): 111 ms for 1,521 patches (the minimum
 image), 388 ms for 3,888, 1,907 ms for 9,216 (the token cap); about 2.1 x, 1.8 x and 1.4 x that with split
 activations. The aligner adds 22 to 83 ms.
+
+## GLM-5.3 Flash
+
+`src/glm/vision/glm_vision.{hpp,cpp}`, validator `glm::validate_vision`, host tests `glm5-vision` and
+`glm5-embed-splice`, host tool `strix-glm5-vision`, gate inputs `tools/vision/glm5_ref.py`.
+
+The tower ships as a separate GGUF projector file (`general.architecture = clip`, `clip.projector_type = glm5v`),
+stored as FP32, FP16 or BF16; a quantized file is refused. Its tower needs per-head q/k norm, which the device
+towers do not implement: it runs on the shared FP32 host reference (`ReferenceEncoder`, arithmetic
+`vision-ref-f32`), on the CPU.
+
+| Stage | Shared component | Model-specific code |
+|---|---|---|
+| Decode PNG / JPEG | `vision::decode` | none |
+| Canvas and resample | `vision::resize` (bicubic, antialias) | the canvas rule (`VisionAdapter::target`), image at the top left on black |
+| Normalise, patchify | `vision::normalize_div255`, `vision::patchify` (2 frames, 2x2 block order) | mean and standard deviation from the file |
+| Patch embedding | tower linear over the flattened patch | the two patch kernels joined as one `[width][channel][frame][y][x]` weight |
+| Blocks | `ReferenceEncoder`: RMSNorm, attention with per-head q/k norm (`EncoderConfig::qk_norm`) and 2D rotary positions, clamped SwiGLU (`swiglu_limit`) | tensor names; q, k and v joined when the file stores them apart; `[gate \| up]` joined; zero rows for a bias a block lacks |
+| Rotary angles | `VisionAdapter::positions` hook | the FP32 product chain `pos * s * s ...` per axis |
+| Projector | `DenseOps::linear` for its five linears, `vision::activate` (GELU) | 2x2 merge layout, LayerNorm, clamped SwiGLU |
+| Span | `vision::span_embed_rows`, `session::EmbedRows` | image rows only; begin and end markers are vocabulary tokens |
+| Rows to the engine | `session::EmbedSplice`, `session::enqueue_embed_splice`, embed rows file | `Engine::set_embed_rows`, row ownership under sequence-parallel prefill, the drafter's next-row embedding |
+| Serving | `vision::ApiMediaBridge`, `vision::EmbedCache`, virtual ids and `session::resolve_embed_run`, `pair::EmbedFrame` | `--vision`, the frame after a prefill chunk's tokens in the GLM control channel (`kPrefillEmbeds`) |
+
+Files under the model directory and why they are not shared: `src/glm/vision/glm_vision.{hpp,cpp}` (the file
+contract, tensor names and projector of this family), `src/glm/engine/glm_embed_splice.hpp` (which rows a rank of
+the GLM pair embeds, a property of its prefill schedule, and the drafter's row shift),
+`src/glm/serve/glm_serve_vision.hpp` (the stack of this family's adapter and the binding of the shared frame and
+resolver to the GLM control channel). Shared pieces this work adds: `EncoderConfig::qk_norm`, the embed rows file,
+`ApiMediaOptions::part_prefix` / `part_suffix` (template text around an item's placeholder).
+
+Read from the file: block count, width, head count, MLP width, projection width, patch size, merge size (2 when
+absent), the pixel bounds of the canvas, the norm epsilon, the SwiGLU clamp, mean and standard deviation, and from
+the tensor inventory: fused or separate q/k/v, which biases exist, a `v.pre_ln` / `v.post_ln` norm, the merge
+width and the projector MLP width. The validator refuses an unknown tensor, a missing one, a shape that differs
+and a file whose MLP activation is not SiLU.
+
+**Not stated by the file.** Each is a field of `glm::VisionRecipe` or a rule of the adapter, part of the adapter
+identity, and taken from the reference implementation of this file format:
+
+| Parameter | Value |
+|---|---|
+| Canvas | each side rounded up to a multiple of patch x merge; under the minimum area the image is scaled up by `sqrt(min / area)` (sides rounded up) first; over the maximum, the largest content height whose aligned canvas fits, the width following the aspect ratio (an aspect ratio no canvas holds collapses to one cell) |
+| Placement | the image is scaled to fit the canvas, never up once it has the minimum area, sizes rounded down; top left; margin black; an image already of that size is not resampled |
+| Resampler | bicubic with antialias (the separable 8-bit resampler of `vision::resize`) |
+| Pixels | `(v / 255 - mean) / std` in FP32 with a true division |
+| Patch rows | 2x2 block order: block row, block column, then row and column inside the block |
+| Rotary positions | base 10000, `head_dim / 4` frequencies per axis, row angles then column angles, pairs `(i, i + head_dim / 2)` |
+| Projector | merge feature `c * 4 + dy * 2 + dx`; linear without bias; LayerNorm epsilon 1e-5; GELU (exact, erf); SwiGLU with the tower's clamp |
+| Span | image rows only, 1D positions; the prompt carries `<\|begin_of_image\|>` (154830) and `<\|end_of_image\|>` (154831) as tokens and one `<\|image\|>` (154854) per row |
+
+### Gate
+
+```
+python3 tools/vision/glm5_ref.py synth --out REF      # synthetic files (needs the gguf Python package)
+python3 tools/vision/glm5_ref.py images --out REF
+strix-glm5-vision encode FILE.gguf REF/NAME.png OUT.rows --f32 REF/NAME.f32 --patches REF/NAME.patches
+python3 tools/vision/glm5_ref.py compare REF/NAME.f32 OTHER.f32 --min-cos 0.9999 --max-rel-l2 1e-2
+```
+
+`--reference-f16-conv` is a diagnostic arm: the reference implementation of the file format rounds the inputs of its
+two convolution-shaped linears (patch embedding, 2x2 merge) to FP16; the arm models that, as another recipe with
+another identity. The default keeps every operand FP32.
+
+### Gate status
+
+No GLM-5.3 Flash projector file was available where this was written: the checks below ran on four synthetic files
+(`synth`: separate and fused q/k/v, with and without biases, with `v.pre_ln` / `v.post_ln`, FP32 and FP16
+storage) and the eight images of `images`, on one x86 host, CPU only.
+
+| Check | Result |
+|---|---|
+| Strict validation of files written by the format's own writer | pass |
+| Host tests (`glm5-vision`): projector against a direct FP64 computation, fused equals separate bit for bit, canvas table, patch order and padding, refusals | pass |
+| The real projector file | pending on this build (qualification with a real projector on the command line and the server) |
+| Server host half (`glm5-serve-vision`): file to bridge to interned rows, embed frame lead to follower, both ranks' chunk resolution | pass: identical tokens and row bytes on both ranks for chunks that cut a span; an image's rows travel once |
+| Pair protocol on a fake engine (`strix-glm5-serve-cpu-tests --image-only`): whole prompt, chunks beside a decoding request, MTP, prefill units | pass: the same tokens in every arm, equal call logs on both ranks, no prefix cache entry, `session_id` refused |
+| Device splice into the GLM prefill (`Engine::set_embed_rows` in `prefill` and `prefill_mtp`, `--embed-rows`, `apps/glm_serve_main.cpp`) | compiles for gfx1151; the server path runs on the pair (whole short image prompts); `--embed-rows`, prompts that span chunks or units, and text-prompt identity against the previous build **not run** |
+| Language model answers on images | pass on two synthetic images, greedy and sampled (red \| blue halves: "The left side is red and the right side is blue."; filled circle beside an outlined square: "A solid black filled circle sits on the left, while an unfilled square outline appears on the right.") |
 
 ## Inkling 2
 
@@ -358,3 +440,40 @@ Memory: `deepseek41::vision_memory` (`src/deepseek41/vision_splice.hpp`) lists t
 once per rank (tower panels and workspace from `vision::plan`, the aligner panels, the splice staging at the
 longest run plus a conservative second staging allocation during growth) and the host bytes of one largest image; `add_vision_capacity` adds them to the pools of a slot
 capacity report. No served route enables image input yet.
+
+### GLM-5.3 Flash
+
+`Engine::set_embed_rows(splice)` names the provided rows of the next `Engine::prefill` call. The embed stage looks
+every token up as before and then overwrites the rows of the splice in all four residual streams with the shared
+device splice (`copies = 4`). The engine has no per-row extras: an image row is handled as the token row it
+replaces, and its position is the prompt index. The staging holds the provided rows of one chunk (2 bytes per
+element) and is allocated in `set_embed_rows`, never inside a prefill.
+
+- Chunked prefill only: the row-by-row reference prefill refuses a splice.
+- MTP bootstrap (`prefill_mtp`, also as a session of layer units): the trunk splice runs in the first layer range
+  of each piece. The drafter joins the hidden row of prompt row i with the embedding of row i + 1, so it takes the
+  provided row there (`glm::engine::mtp_pair_splice`: the run's splice one row later). Decode needs nothing: the
+  drafter embeds generated tokens only. The drafter's rows change drafts, never tokens: MTP on and off must give
+  the same tokens on an image prompt, as on text.
+- Sequence-parallel prefill: a rank embeds only the rows it owns, so it splices only those
+  (`glm::engine::embed_pieces`, host test `glm5-embed-splice`: both ranks together write every provided row
+  exactly once, for both pipelines and for spans cut by chunks).
+- Both ranks must be given the same rows. `strix-glm5-rank --embed-rows` mixes the rows' checksum into the prompt
+  agreement the ranks exchange before the first forward.
+- Serving (`strix-glm5-serve --vision`, rank 0): the API layer expands each image part to
+  `<|begin_of_image|>`, the virtual ids of its rows and `<|end_of_image|>`. The lead flags every prefill command
+  whose tokens hold virtual ids (`kPrefillEmbeds`, control version 13); on the pair a fixed-size summary of the
+  chunk's embed frame (byte length, span count, rows, width, axes) follows the tokens, and the follower checks it
+  against the chunk's distinct virtual ids, the model width and the chunk's row bound (`embed_frame_rows_bound`)
+  before it allocates; the frame itself follows, with the rows only for spans the follower does not hold yet, and
+  each entry must match the summary. Both ends evict held spans by count and by bytes alike. Each rank resolves the
+  chunk against its own table (`session::resolve_embed_run`: vocabulary ids plus the splice) and calls
+  `set_embed_rows` before the same `prefill` / `prefill_mtp` call it makes for text. A frame the follower cannot
+  apply is a protocol error for the pair. Image prompts take no prefix cache entry (handles are process-local, so
+  a key of virtual ids means nothing on the other rank), no root store, no RTX route and no session.
+
+Status: compiles for gfx1151; on a pair the server path passes a synthetic HTTP smoke (a generated image is admitted,
+its rows reach both ranks and a reply is returned). That smoke does not show image correctness: correctness on real
+images with the real projector file is pending. Identity for text prompts is by construction (no splice: nothing is
+launched or uploaded and no kernel of the text path is changed); the native device comparison (tokens, logits and
+state digest of a text prompt against the previous build) is pending.

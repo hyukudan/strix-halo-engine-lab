@@ -32,6 +32,9 @@ struct EncoderConfig {  // filled by the adapter from the checkpoint metadata
     float swiglu_limit = 0.0F;      // 0 = no clamp; else gate <= limit and up in [-limit, limit] before the product
     bool swiglu_gate_first = true;  // first half of the 2 * mlp_width outputs is the SiLU gate
     bool qkv_bias = false, out_bias = false, mlp_bias = false, patch_bias = true;
+    // Each head's q and k vector is normed over head_dim (the tower's norm kind and eps, weights of head_dim shared by
+    // every head) before the rotary step. Host reference only: the device backends refuse it.
+    bool qk_norm = false;
     Pos pos = Pos::rope2d;
     float rope_theta = 10000.0F;
     RopePairing rope_pairing = RopePairing::half;
@@ -63,6 +66,7 @@ struct Tensor {
 struct BlockWeights {
     Tensor norm1_w, norm1_b;
     Tensor qkv_w, qkv_b;    // [3 width][width]: q, k, v
+    Tensor q_norm_w, q_norm_b, k_norm_w, k_norm_b;  // [head_dim]: EncoderConfig::qk_norm
     Tensor out_w, out_b;    // [width][width]
     Tensor norm2_w, norm2_b;
     Tensor mlp1_w, mlp1_b;  // [mlp_out][width]

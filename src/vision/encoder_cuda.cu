@@ -85,6 +85,7 @@ bool cuda_supported(const EncoderConfig& c, std::string* why) {
     const unsigned d = c.head_dim();
     if (d == 0 || d > 128U) return no("head dimension above 128");
     if (c.has_rope() && d % 2U) return no("odd head dimension with rotary positions");
+    if (c.qk_norm) return no("per-head q/k norm runs on the host reference only");
     return true;
 }
 

@@ -2954,6 +2954,17 @@
   },
   {
     "engine": "glm",
+    "name": "Server MTP for sampled requests",
+    "flag_or_env": "STRIX_GLM_SERVE_SAMPLED_MTP",
+    "default": "off (explicit opt-in under every profile; pair gates of this tree pending)",
+    "exact": "Coupled acceptance: tokens equal plain sampling of the same seed when verify rows equal plain-step rows bitwise; both ranks commit by the window's accepted-draft count. Host fake pair on this tree: 3 sampled requests x 40 tokens equal plain sampling (greedy drafts, drawn drafts, rejection forced at row 0, beside a greedy request with G2 on). Rejection acceptance: exact in distribution only, admitted by --profile fast / turbo. Pair gates of this tree pending; historical receipts of the contributor build c1f5686e (before the merge) in the doc section do not qualify it.",
+    "gain": "Not measured on this tree; published with its pair gates.",
+    "preconditions": "strix-glm5-serve with MTP on and sampling available; one sampled request decoding (C1); never in batched verify (G2).",
+    "off_switch": "STRIX_GLM_SERVE_SAMPLED_MTP=0 or unset (plain steps); =coupled keeps the tokens of plain sampling; =rejection (--profile fast or turbo only) selects rejection sampling, exact in distribution, not token-equal to plain sampling.",
+    "doc_anchor": "docs/optimizations.md#glm-serve-sampled-mtp"
+  },
+  {
+    "engine": "glm",
     "name": "Server decode-first chunked prefill",
     "flag_or_env": "--prefill-chunk",
     "default": "512 (adaptive: whole prompt when nothing decodes)",

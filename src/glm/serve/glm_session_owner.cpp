@@ -37,9 +37,10 @@ strix::serve::SessionHooks control_hooks(
 }
 }
 
-GlmSessionOwner::ControlEngine::ControlEngine(std::uint64_t context, std::uint32_t slots) {
+GlmSessionOwner::ControlEngine::ControlEngine(std::uint64_t context, std::uint32_t slots, bool embed_rows) {
     caps_.max_context = context; caps_.max_slots = slots; caps_.max_batch = slots;
     caps_.owner_control = true;
+    caps_.embed_rows = embed_rows;
 }
 void GlmSessionOwner::ControlEngine::prefill(std::span<const std::uint32_t>, session::KvHandle&) { unsupported(); }
 session::StepResult GlmSessionOwner::ControlEngine::decode(session::KvHandle&, const session::SamplerState&) { unsupported(); }
@@ -47,8 +48,8 @@ session::StepResult GlmSessionOwner::ControlEngine::decode(session::KvHandle&, c
 GlmSessionOwner::GlmSessionOwner(strix::serve::GenerationQueue& queue, std::uint64_t context,
     std::uint32_t slots, std::function<void(strix::serve::SessionRuntime&)> turn,
     std::function<bool()> drained, std::function<bool()> stop, std::function<void()> closing,
-    std::function<void()> stopped, std::function<void()> failed)
-    : engine_(context, slots), leases_(slots, 2, logical_hooks()),
+    std::function<void()> stopped, std::function<void()> failed, bool embed_rows)
+    : engine_(context, slots, embed_rows), leases_(slots, 2, logical_hooks()),
       runtime_(queue, engine_, leases_, no_retention(), control_hooks(std::move(turn), std::move(drained),
           std::move(stop), std::move(closing), std::move(stopped), std::move(failed))) {}
 
