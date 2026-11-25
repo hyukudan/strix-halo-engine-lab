@@ -15,13 +15,13 @@ namespace strix {
 // 9..16 requests (kMtpJointGroupLanesMax) reads the weights once instead of throwing in the launcher.
 inline constexpr std::uint32_t kCohortWideMaxSessions = 16U;
 
-// A shared combine bypasses the members' step hooks. If a member still owes
-// a join for this layer, use the member steps so those hooks enqueue the wait.
-template<class Member, std::size_t Extent, class JoinPending>
-constexpr bool cohort_combine_admitted(std::span<Member, Extent> members, std::size_t layer, JoinPending join_pending) {
-    return std::none_of(members.begin(), members.end(), [&](const auto& member) {
-        return join_pending(member, layer);
-    });
+// The producer and combine may use different scopes. Order every detached
+// producer before selecting the wide, chunk or member combine on their common stream.
+template<class Owner, class Member, class MemberOwner, class Join>
+void join_cohort_combine(std::span<Owner* const> primaries, std::span<Member> members,
+                        std::uint32_t layer, MemberOwner member_owner, Join join) {
+    for (auto* primary : primaries) if (primary) join(*primary, layer);
+    for (auto& member : members) join(member_owner(member), layer);
 }
 
 struct CohortRowLaunch {

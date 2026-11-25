@@ -40,23 +40,60 @@ void check_row_splits() {
     require(rejected);
 }
 void check_combine_admission() {
-    // Each lane has its own pending joins. A chunk primary's join cannot
-    // discharge a member's dependency, even when every lane has a slot.
-    std::array<std::array<bool, 2>, 4> lanes{};
-    const auto pending = [](const auto& lane, std::size_t layer) { return lane[layer]; };
-    const auto cohort = std::span(lanes);
-    const auto first_chunk = cohort.first(2);
-    const auto second_chunk = cohort.last(2);
-    require(strix::cohort_combine_admitted(cohort, 0, pending));
-    for (std::size_t lane = 0; lane < lanes.size(); ++lane) {
-        lanes[lane][0] = true;
-        require(!strix::cohort_combine_admitted(cohort, 0, pending));
-        require(strix::cohort_combine_admitted(first_chunk, 0, pending) == (lane >= 2));
-        require(strix::cohort_combine_admitted(second_chunk, 0, pending) == (lane < 2));
-        require(strix::cohort_combine_admitted(cohort, 1, pending));
-        lanes[lane][0] = false;
-    }
-    require(strix::cohort_combine_admitted(cohort, 0, pending));
+    struct Owner {
+        int id;
+        std::array<bool, 2> pending{};
+    };
+    Owner first{1}, last{2}, joiner{3}, replacement{4};
+    Owner chunk_a{5}, chunk_b{6};
+    std::vector<int> waits;
+    const auto owner = [](Owner* member) -> Owner& { return *member; };
+    const auto wait = [&](Owner& source, std::uint32_t layer) {
+        if (!source.pending.at(layer)) return;
+        waits.push_back(source.id);
+        source.pending[layer] = false;
+    };
+    const auto combine = [&](std::span<Owner* const> primaries, std::span<Owner*> members,
+                             std::uint32_t layer, const std::vector<int>& expected) {
+        waits.clear();
+        strix::join_cohort_combine(primaries, members, layer, owner, wait);
+        require(waits == expected);
+    };
+
+    // A two-client window can bind an individual producer and a chunk primary.
+    // Membership is leased until the combine, then it can change at a boundary.
+    Owner* first_primary[]{&chunk_a};
+    Owner* pair[]{&first, &last};
+    first.pending[0] = true;
+    chunk_a.pending[0] = true;
+    last.pending[1] = true;
+    combine(first_primary, pair, 0, {5, 1});
+    combine(first_primary, pair, 1, {2});
+
+    // Two more clients join the next window. A wide combine waits for both
+    // chunk primaries and any member-local producers on the same layer.
+    Owner* both_primaries[]{&chunk_a, &chunk_b};
+    Owner* four[]{&first, &last, &joiner, &replacement};
+    chunk_a.pending[0] = chunk_b.pending[0] = true;
+    last.pending[0] = replacement.pending[0] = true;
+    combine(both_primaries, four, 0, {5, 6, 2, 4});
+
+    // Two clients leave. Two singleton chunks need no primaries and neither
+    // a departed client nor the old primary can contribute a stale wait.
+    Owner* no_primaries[]{nullptr, nullptr};
+    Owner* survivors[]{&first, &replacement};
+    replacement.pending[0] = true;
+    combine(no_primaries, survivors, 0, {4});
+    combine(no_primaries, survivors, 0, {});
+
+    first.pending[0] = true;
+    replacement.pending[0] = true;
+    bool threw = false;
+    try {
+        strix::join_cohort_combine(std::span<Owner* const>(no_primaries), std::span<Owner*>(survivors), 0,
+            owner, [](Owner&, std::uint32_t) { throw std::runtime_error("wait failed"); });
+    } catch (const std::runtime_error&) { threw = true; }
+    require(threw && first.pending[0] && replacement.pending[0]);
 }
 void check(std::span<const std::uint32_t> rows, std::size_t old_steps, std::size_t new_steps) {
     const auto old_plan = strix::cohort_step_plan(rows, 8U);

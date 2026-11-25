@@ -1924,14 +1924,6 @@ struct HipKnownPrefixWindow::Impl {
         static const bool on = strix::envcfg::flag("STRIX_COHORT_SHARED_EXPERT", true);
         return on;
     }
-    static bool cohort_can_combine(std::size_t i, std::span<CohortMember> members) {
-        const auto layer = members.front().impl->serial.execution.steps[i].layer;
-        if (!layer) return false;
-        return cohort_combine_admitted(members, *layer, [](const CohortMember& member, std::size_t l) {
-            const auto& detach = member.impl->shared_detach;
-            return detach && (l >= detach->pending.size() || detach->pending[l] != 0U);
-        });
-    }
     // Step i of a cohort runs once for every member's rows on the primary.
     bool cohort_step_shared(std::size_t i, std::span<CohortMember> members) const {
         if (!cohort_shared_enabled()) return false;
@@ -1953,7 +1945,7 @@ struct HipKnownPrefixWindow::Impl {
             if (!m.run->wide_step(i) || m.impl->window.mode[i] != mode) return false;
             if (mode == KnownWindowStepMode::qsa_rows && m.run->rows() != 2U && m.run->rows() != 4U && m.run->rows() != 8U) return false;
         }
-        return mode != KnownWindowStepMode::moe_combine_rows || cohort_can_combine(i, members);
+        return true;
     }
     // Wide cohort steps (one launch for the rows of every chunk, 9..32 rows, per-row arithmetic as in the chunk)
     // are the default: cohort_step_rows() is 16 unless STRIX_COHORT_AUTO=0 or STRIX_COHORT_STEP_ROWS says otherwise.
@@ -2019,7 +2011,7 @@ struct HipKnownPrefixWindow::Impl {
         case KnownWindowStepMode::lm_head_rows: return cohort_wide_enabled("head");
         case KnownWindowStepMode::inject_rows: return cohort_wide_enabled("inject");
         case KnownWindowStepMode::moe_combine_rows:
-            return all_chunked && cohort_wide_enabled("combine") && cohort_can_combine(i, members);
+            return all_chunked && cohort_wide_enabled("combine");
         case KnownWindowStepMode::routed_expert_union: return cohort_wide_union(members);
         case KnownWindowStepMode::qsa_rows:
             // 16 / 32 rows: dense A8 only (the launcher also requires a Q8_0 output projection).
@@ -2333,10 +2325,9 @@ struct HipKnownPrefixWindow::Impl {
             for (std::size_t i = 0; i < steps; ++i) {
                 const auto& step = lead.serial.execution.steps[i];
                 if (step.op == SerialOp::moe_combine && step.layer) {
-                    // The shared expert and its combine choose their launch scopes independently.
-                    // A chunk-shared or wide combine can consume outputs detached by individual members.
-                    for (auto& chunk : chunks) if (chunk.primary) chunk.primary->join_shared(*step.layer);
-                    for (auto& m : members) m.impl->join_shared(*step.layer);
+                    join_cohort_combine(primaries, members, *step.layer,
+                        [](CohortMember& member) -> Impl& { return *member.impl; },
+                        [](Impl& owner, std::uint32_t layer) { owner.join_shared(layer); });
                 }
                 if ((chunks.size() > 1U || cohort_step_rows()==16U) && cohort_wide_step(i, members, all_chunked)) {
                     ++wide_count;

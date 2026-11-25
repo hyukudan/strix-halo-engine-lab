@@ -291,11 +291,54 @@ def export_roundtrip(args, prompts):
     print("EXACT: terminal R4 saved components, prompt digest, imported IDs and every committed target component")
 
 
+def cohort_regression(args, prompts):
+    """Check full IDs and actual cohort execution at the four-slot memory limit."""
+    require(len(prompts) == 4 and len({tuple(prompt) for prompt in prompts}) == 4,
+            "cohort regression requires four distinct prompt fixtures")
+    with server(args, "single-reference", "0"):
+        reference = [completion(args.port, prompt, args.generate)["strix"]["token_ids"]
+                     for prompt in prompts]
+    require(all(reference), "NO-REFERENCE: missing solo completion token IDs")
+    (args.out / "cohort-reference.json").write_text(json.dumps(reference, indent=2) + "\n")
+    name = "slots-4"
+    log_path = args.out / (name + ".log")
+    with server(args, name, "4", {"STRIX_COHORT_WIDE_LOG": "2", "STRIX_PROMPT_BATCH_LOG": "2"}):
+        for wave, clients in enumerate((2, 4, 2), start=1):
+            log_start = log_path.stat().st_size
+            barrier = threading.Barrier(clients)
+            indices = list(range(4))[-2:] if wave == 3 else list(range(clients))
+
+            def request(index):
+                barrier.wait()
+                return completion(args.port, prompts[index], args.generate)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=clients) as pool:
+                results = list(pool.map(request, indices))
+            (args.out / f"cohort-wave-{wave}.json").write_text(json.dumps(results, indent=2) + "\n")
+            for index, result in zip(indices, results):
+                require(result["strix"]["token_ids"] == reference[index],
+                        f"MISMATCH: wave {wave}, prompt {index}")
+                headers = {key.lower(): value for key, value in result["http_headers"].items()}
+                require(headers.get("x-strix-http-slots") == "4", "NO-WITNESS: four slots were not admitted")
+            with log_path.open("rb") as log:
+                log.seek(log_start)
+                wave_log = log.read().decode(errors="replace")
+            require(re.search(rf"cohort call \d+: \d+ chunks, {clients} sessions,", wave_log),
+                    f"NO-WITNESS: wave {wave} has no {clients}-session native cohort")
+            print(f"TOKEN MATCH: wave {wave}, {clients} clients, all requests completed", flush=True)
+        with urllib.request.urlopen(f"http://127.0.0.1:{args.port}/health", timeout=10) as response:
+            require(response.status == 200, "server did not survive the cohort waves")
+    require("Qwen serve-prefill: automatic T8192" in log_path.read_text(),
+            "NO-WITNESS: automatic T8192 was not admitted")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     arms = parser.add_mutually_exclusive_group()
     arms.add_argument("--export-roundtrip", action="store_true", help="run only the opt-in terminal-R4 export/import gate")
     arms.add_argument("--window-state-arm", choices=("digest-only", "live-continuation", "history-exhaustion"))
+    arms.add_argument("--cohort-regression", action="store_true",
+                      help="compare 2/4/2 native cohorts to solo IDs at a four-slot cap")
     parser.add_argument("--export-block-rows", type=int, default=8192)
     parser.add_argument("--suffix-token", type=int)
     parser.add_argument("--prompt", action="append", required=True, help="token ID file; repeat for varied prompts")
@@ -319,6 +362,9 @@ def main():
         return
     if args.window_state_arm:
         window_state_arm(args, prompts)
+        return
+    if args.cohort_regression:
+        cohort_regression(args, prompts)
         return
     with server(args, "single-reference", "0"):
         reference = [signature(completion(args.port, p, args.generate)) for p in prompts]
