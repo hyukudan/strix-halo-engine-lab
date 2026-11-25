@@ -25,7 +25,7 @@ struct Options {
     std::uint32_t deploy_node = 0;
     std::uint16_t port = 8080;
     Request request;
-    profile::Resolution profile; // --profile default|fast|quality, resolved and exported by parse_options
+    profile::Resolution profile; // --profile exact|fast|turbo|quality, resolved and exported by parse_options
     bool inspect = false, help = false;
 };
 Options parse_options(int argc, char** argv);
