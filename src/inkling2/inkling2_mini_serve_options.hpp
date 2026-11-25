@@ -29,6 +29,8 @@ struct MiniServeOptions {
     // Resolved exact down-image lever (mini_combine_image): the HIP resident prefill stores the BF16 down image where the
     // target is qualified.
     bool combine_image = false;
+    // Resolved projected-bias attention lever (mini_attn_projected_bias), the value the CLI and the gate read.
+    bool attn_projected_bias = false;
 };
 
 struct MiniServeCohort {

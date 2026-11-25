@@ -529,10 +529,11 @@ inline constexpr exec::cuda_decode::R1Forms kMiniLatencyForms = mini_latency_for
 inline constexpr unsigned kMiniDefaultForms = kMiniFormsMix;
 
 // moe_w4a4: resolved operand class of the W4A4 expert lever (mini_moe_w4a4_class; bf16 = off), applied to the resident
-// prefill before the program binds.
+// prefill before the program binds. attn_projected_bias: the resolved projected-bias attention lever.
 template <bool EpilogueFusion, unsigned LatencyForms = kMiniDefaultForms>
 std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad&,
-                                                                       moe_core::grouped_w4a4::Activations moe_w4a4);
+                                                                       moe_core::grouped_w4a4::Activations moe_w4a4,
+                                                                       bool attn_projected_bias);
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 struct MiniCudaProgramDecoder::Impl {
@@ -690,15 +691,17 @@ inline void MiniCudaProgramDecoder::prefill_gate_rows(std::span<const unsigned> 
 
 template <bool EpilogueFusion, unsigned LatencyForms>
 inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(const serve::SerialGenerationLoad& load,
-                                                                              moe_core::grouped_w4a4::Activations moe_w4a4) {
+                                                                              moe_core::grouped_w4a4::Activations moe_w4a4,
+                                                                              bool attn_projected_bias) {
     using Activations = moe_core::grouped_w4a4::Activations;
     struct Decoder final : serve::SerialGenerationDecoder {
-        Decoder(const serve::SerialGenerationLoad& input, Activations w4a4)
+        Decoder(const serve::SerialGenerationLoad& input, Activations w4a4, bool projected_bias)
             : resident(input.checkpoint, input.positions, input.prefill_chunk, input.packed_decode, false),
-              program(with_w4a4(resident, w4a4), EpilogueFusion, mini_latency_forms(LatencyForms)) {}
-        // Same order as the gate path: the lever (and its NVFP4 activation image) is set before the program binds.
-        static MiniResidentDecoder& with_w4a4(MiniResidentDecoder& decoder, Activations w4a4) {
+              program(with_levers(resident, w4a4, projected_bias), EpilogueFusion, mini_latency_forms(LatencyForms)) {}
+        // Same order as the gate path: the levers (and the NVFP4 activation image) are set before the program binds.
+        static MiniResidentDecoder& with_levers(MiniResidentDecoder& decoder, Activations w4a4, bool projected_bias) {
             decoder.set_moe_w4a4(w4a4);
+            decoder.set_attention_projected_bias(projected_bias);
             return decoder;
         }
         unsigned prefill(std::span<const unsigned> ids, std::span<float> logits) override {
@@ -708,7 +711,7 @@ inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(co
         MiniResidentDecoder resident;
         MiniCudaProgramDecoder program;
     };
-    return std::make_unique<Decoder>(load, moe_w4a4);
+    return std::make_unique<Decoder>(load, moe_w4a4, attn_projected_bias);
 }
 #endif
 

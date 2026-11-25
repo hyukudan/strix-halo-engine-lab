@@ -286,15 +286,15 @@ void socket_startup(const sv::ServiceFactory& factory, const char* backend, bool
 
 using W4a4 = strix::moe_core::grouped_w4a4::Activations;
 
-// The served W4A4 lever value (process environment, as strix-serve reads it); nullptr clears it.
-void set_w4a4_env(const char* value) {
+// One lever switch of the served process environment, as strix-serve reads it; nullptr clears it.
+void set_env(const char* name, const char* value) {
 #ifdef _WIN32
-    require(_putenv_s("STRIX_INK_MOE_W4A4", value ? value : "") == 0, "cannot set STRIX_INK_MOE_W4A4");
+    require(_putenv_s(name, value ? value : "") == 0, "cannot set a lever switch");
 #else
-    require((value ? setenv("STRIX_INK_MOE_W4A4", value, 1) : unsetenv("STRIX_INK_MOE_W4A4")) == 0,
-            "cannot set STRIX_INK_MOE_W4A4");
+    require((value ? setenv(name, value, 1) : unsetenv(name)) == 0, "cannot set a lever switch");
 #endif
 }
+void set_w4a4_env(const char* value) { set_env("STRIX_INK_MOE_W4A4", value); }
 
 // The prepared-attention round fold switch of the served process (off unless 1 selects it, in any profile).
 void set_round_fold_env(const char* value) {
@@ -317,7 +317,8 @@ void set_image_env(const char* value) {
 }
 
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
-            W4a4 w4a4 = W4a4::bf16, bool image = false, bool round_fold = false) {
+            W4a4 w4a4 = W4a4::bf16, bool image = false, bool round_fold = false, bool projected_bias = false,
+            const char* tier_name = "fast") {
     sv::ServiceFactories factories;
     bool created = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
@@ -336,8 +337,13 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                 "the served round fold is reported by its effective state");
         // The served prefill resolves the down-image lever like the CLI and the gate do: off unless selected explicitly.
         require(options.combine_image == image, "down-image selection did not reach native adapter");
-        require(options.tier == strix::profile::Name::fast && options.weight_options.qualify_q8 == qualify_q8,
-                "FAST request did not reach native adapter");
+        // The served Inkling resolution maps the turbo word to its fast column (the profile resolver's decision).
+        const auto want = std::string_view(tier_name) == "exact" ? strix::profile::Name::standard
+                                                                 : strix::profile::Name::fast;
+        require(options.tier == want && options.weight_options.qualify_q8 == qualify_q8,
+                "profile request did not reach native adapter");
+        // The projected-bias attention lever resolves in the one shared resolver the CLI also reads.
+        require(options.attn_projected_bias == projected_bias, "projected-bias lever did not reach native adapter");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
         const strix::weight::WeightLoadScope scope{kind, {}, {}, {}, {}, {}};
         const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope);
@@ -359,7 +365,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         });
     const char* args[]{"strix-serve", "--model", "inkling2-mini", "--registry-root", root,
                        "--checkpoint", "MODEL.safetensors", "--backend", backend,
-                       "--profile", "fast", "--speculation", "off"};
+                       "--profile", tier_name, "--speculation", "off"};
     std::vector<std::string> strings(std::begin(args), std::end(args));
     if (qualify_q8) strings.emplace_back("--qualify-q8");
     const auto run = [&](sv::ServeShell shell, std::ostream& out, std::ostream& error) {
@@ -375,7 +381,9 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         require(rc == 0 && !created, "Inkling profile inspection should run without device work");
         const auto expected = qualify_q8 ? "weight_storage gguf.q8_0@1 weight_status unqualified" :
                                            "weight_storage plain.bf16@1 weight_status pending";
-        require(out.str().find(expected) != std::string::npos, "inspection weight plan differs from CLI plan");
+        // The FAST weight plan is what this check pins; the exact and turbo columns resolve their own plan.
+        if (std::string_view(tier_name) == "fast")
+            require(out.str().find(expected) != std::string::npos, "inspection weight plan differs from CLI plan");
     };
     inspect();
 
@@ -391,7 +399,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         strings.pop_back();
     }
     sv::ServeShell shell;
-    shell.serve = [qualify_q8, sample_capable](const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
+    shell.serve = [qualify_q8, sample_capable, fast = std::string_view(tier_name) == "fast"](const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
         std::exception_ptr failure;
         std::thread control([&] { try { owner.run(); } catch (...) { failure = std::current_exception(); } });
         try {
@@ -409,9 +417,11 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             const auto effective = sv::parse_json(capabilities.body);
             const auto* profile = effective.find("profile");
             const auto* weights = effective.find("weight_load");
-            require(capabilities.status == 200 && profile && profile->as_string() == "fast" && weights &&
-                    weights->find("storage")->as_string() == (qualify_q8 ? "gguf.q8_0" : "plain.bf16") &&
-                    weights->find("status")->as_string() == (qualify_q8 ? "unqualified" : "pending"),
+            // The FAST column's plan is pinned here; the exact and turbo columns resolve their own weight plan.
+            require(capabilities.status == 200 && profile && weights &&
+                    (!fast || (profile->as_string() == "fast" &&
+                               weights->find("storage")->as_string() == (qualify_q8 ? "gguf.q8_0" : "plain.bf16") &&
+                               weights->find("status")->as_string() == (qualify_q8 ? "unqualified" : "pending"))),
                     "Inkling capability response does not match the loaded plan");
             const auto* sampling = effective.find("sampling");
             const auto* temperature = sampling ? sampling->find("positive_temperature") : nullptr;
@@ -491,6 +501,15 @@ int main(int argc, char** argv) try {
     set_image_env("0");
     wiring(argv[1], "hip", false);
     set_image_env(nullptr);
+    // The projected-bias lever per tier: unset and 0 keep the image route (off until its identity receipt), 1 selects the
+    // projected flash; tests/inkling2/mini_gate_cli_test.cpp pins the same table through the CLI.
+    for (const auto* tier : {"exact", "fast", "turbo"}) {
+        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
+            set_env("STRIX_INK_ATTN_PROJECTED_BIAS", value);
+            wiring(argv[1], "cuda", false, false, W4a4::bf16, false, false, expected, tier);
+        }
+    }
+    set_env("STRIX_INK_ATTN_PROJECTED_BIAS", nullptr);
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

@@ -48,10 +48,10 @@ public:
     DeviceCliDecoder(const serve::SerialGenerationLoad& load, bool step_graphs, weight::FormatId storage,
                      const char* dspark,
                      moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16,
-                     bool combine_image = false, bool prepared_round_fold = false)
+                     bool combine_image = false, bool prepared_round_fold = false, bool attn_projected_bias = false)
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
                    load.verify_rows, dspark != nullptr, 1U, load.prefill_tail) {
-        const auto levers = configure_mini_decoder(decoder_, moe_w4a4, combine_image, prepared_round_fold);
+        const auto levers = configure_mini_decoder(decoder_, moe_w4a4, combine_image, prepared_round_fold, attn_projected_bias);
         std::cerr << "Inkling down_image " << mini_down_image_name(levers.down_image, combine_image) << '\n';
         std::cerr << "Inkling prepared_round_fold " << mini_round_fold_name(levers.prepared_round_fold, prepared_round_fold)
                   << '\n';
@@ -199,7 +199,7 @@ static_assert(kLatencyFormsMix == kMiniFormsMix && kLatencyFormsMoe == kMiniForm
               kLatencyFormsAll == kMiniFormsAll && kMiniDefaultForms == kMiniFormsMix);
 
 using MiniCudaProgramLoad = std::unique_ptr<serve::SerialGenerationDecoder> (*)(const serve::SerialGenerationLoad&,
-                                                                                moe_core::grouped_w4a4::Activations);
+                                                                                moe_core::grouped_w4a4::Activations, bool);
 
 // The exact R1 latency forms are a template parameter of the loader; map the CLI mask to its instance.
 inline MiniCudaProgramLoad select_mini_cuda_program(bool fuse, unsigned forms) {
@@ -292,16 +292,19 @@ int main(int argc, char** argv) {
         if (step_program)
             family.load = [program_load = cli::select_mini_cuda_program(program_options.epilogue_fusion,
                                                                         program_options.latency_forms),
-                           moe_w4a4 = mini_moe_w4a4_class(options.tier)](const serve::SerialGenerationLoad& load) {
-                return program_load(load, moe_w4a4);
+                           moe_w4a4 = mini_moe_w4a4_class(options.tier),
+                           projected_bias = mini_attn_projected_bias(options.tier)](const serve::SerialGenerationLoad& load) {
+                return program_load(load, moe_w4a4, projected_bias);
             };
         else
 #endif
         family.load = [step_graphs, storage = weights.storage, dspark = options.dspark,
                        moe_w4a4 = mini_moe_w4a4_class(options.tier),
                        combine_image = mini_combine_image(options.tier),
-                       round_fold = mini_prepared_round_fold(options.tier)](const serve::SerialGenerationLoad& load) {
-            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, moe_w4a4, combine_image, round_fold);
+                       round_fold = mini_prepared_round_fold(options.tier),
+                       projected_bias = mini_attn_projected_bias(options.tier)](const serve::SerialGenerationLoad& load) {
+            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, moe_w4a4, combine_image, round_fold,
+                                                           projected_bias);
         };
         const auto write_profile = [&] {
             cli::write_profile(options.tier, std::cerr, true);

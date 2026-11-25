@@ -32,7 +32,7 @@ profile::Inputs inputs(profile::Name tier, const char* value = nullptr, const ch
 // The engine resolves the W4A4 row: an unbound table would ignore STRIX_INK_MOE_W4A4 at every prompt length.
 void test_row() {
     require(mini::kMiniProfile.table.size() == mini::kMiniLevers.size(), "Inkling lever table bound to the engine");
-    require(mini::kMiniProfile.table.size() == 3U, "the W4A4 row, the down image row and the prepared round fold row");
+    require(mini::kMiniProfile.table.size() == 4U, "the W4A4, down image, prepared round fold and projected-bias rows");
     const auto& lever = mini::kMiniProfile.table.front();
     require(lever.name == mini::kMiniMoeW4a4 && lever.name == "inkling2-mini-moe-w4a4@1", "w4a4 identity");
     require(lever.env == "STRIX_INK_MOE_W4A4" && lever.off == "0" && lever.builtin == "0", "w4a4 off switch");
@@ -135,7 +135,8 @@ void test_combine_image() {
 struct FakeDecoder {
     strix::moe_core::grouped_w4a4::Activations w4a4 = strix::moe_core::grouped_w4a4::Activations::bf16;
     int image_calls = 0;
-    bool image = false, runs = true, fold = false, folds = true;
+    bool image = false, runs = true, fold = false, folds = true, projected = false;
+    void set_attention_projected_bias(bool enabled) { projected = enabled; }
     bool set_prepared_round_fold(bool selected) { fold = selected; return selected && folds; }
     void set_moe_w4a4(strix::moe_core::grouped_w4a4::Activations a) { w4a4 = a; }
     bool set_combine_image(bool selected) { ++image_calls; image = selected; return selected && runs; }
@@ -149,12 +150,24 @@ void test_configure() {
     require(mini::configure_mini_decoder(decoder, resolved).down_image && decoder.image_calls == 1 && decoder.image,
             "the resolved image lever reaches the decoder");
     require(!decoder.fold, "the round fold stays off while only the image is selected");
+    // The projected-bias lever reaches every decoder through the same helper the CLI, the gate and the server call.
+    {
+        profile::Inputs on = inputs(profile::Name::standard);
+        on.env = [](const char* key) -> const char* {
+            return std::strcmp(key, "STRIX_INK_ATTN_PROJECTED_BIAS") == 0 ? "1" : nullptr;
+        };
+        options.tier = on;
+        FakeDecoder projected;
+        mini::configure_mini_decoder(projected, mini::resolve_mini_profile(options, true));
+        require(projected.projected, "the resolved projected-bias lever reaches the decoder through configure_mini_decoder");
+    }
     options.tier = inputs(profile::Name::standard);
     FakeDecoder by_default;
     {
         const auto levers = mini::configure_mini_decoder(by_default, mini::resolve_mini_profile(options, true));
         require(!levers.down_image && !levers.prepared_round_fold && !by_default.fold && !by_default.image,
                 "no lever is applied by default");
+        require(!by_default.projected, "the projected-bias route is off by default");
     }
     options.tier = inputs(profile::Name::standard, nullptr, nullptr, "1");
     FakeDecoder fold_on;
@@ -204,6 +217,44 @@ void test_round_fold_admission() {
         require(!mini::mini_prepared_round_fold_admitted(false, arch), "the CUDA backend declines the fold");
 }
 
+// The projected-bias row: an exact (bit-identical) lever, off by default in every tier, bound to the engine, switchable by
+// STRIX_INK_ATTN_PROJECTED_BIAS, and refused on a malformed value. Native execution does not change the resolution.
+void test_projected_bias() {
+    const auto& row = mini::kMiniLevers[3];
+    require(row.name == mini::kMiniAttnProjectedBias && row.name == "inkling2-mini-attn-projected-bias@1", "row identity");
+    require(row.env == "STRIX_INK_ATTN_PROJECTED_BIAS" && row.off == "0" && row.builtin == "0" &&
+                row.kind == profile::Kind::exact, "row is an exact lever, off by default");
+    const auto in = [](profile::Name tier, const char* value) {
+        profile::Inputs inputs;
+        inputs.profile = tier;
+        inputs.env = [value](const char* key) -> const char* {
+            return value != nullptr && std::strcmp(key, "STRIX_INK_ATTN_PROJECTED_BIAS") == 0 ? value : nullptr;
+        };
+        return inputs;
+    };
+    mini::MiniWeightOptions options;
+    for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
+        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
+            options.tier = in(tier, value);
+            for (const bool native : {false, true})
+                require(mini::mini_attn_projected_bias(mini::resolve_mini_profile(options, native)) == expected,
+                        "projected-bias lever resolves one value per tier for every entry point");
+        }
+    }
+    const profile::Engine legacy{"inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1"};
+    require(profile::resolve(mini::kMiniProfile, in(profile::Name::standard, nullptr)).fingerprint() ==
+                profile::resolve(legacy, in(profile::Name::standard, nullptr)).fingerprint(),
+            "default identity unchanged by the additive row");
+    options.tier = in(profile::Name::fast, "yes");
+    bool refused = false;
+    try {
+        static_cast<void>(mini::resolve_mini_profile(options, true));
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    require(refused, "malformed projected-bias switch must be refused");
+}
+
 }  // namespace
 
 int main() {
@@ -213,6 +264,7 @@ int main() {
         test_combine_image();
         test_configure();
         test_round_fold_admission();
+        test_projected_bias();
     } catch (const std::exception& error) {
         std::cerr << "inkling2-mini-moe-lever: " << error.what() << '\n';
         return 1;

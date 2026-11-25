@@ -47,7 +47,16 @@ inline constexpr std::string_view kMiniCombineImage = "inkling2-mini-combine-dow
 // (core::RoundStore::separate). Opt-in: off in every profile column (all cells empty, builtin 0); select it with
 // STRIX_INK_PREPARED_ROUND_FOLD=1 (any profile), through the one resolver the CLI, the gate and the server share.
 inline constexpr std::string_view kMiniPreparedRoundFold = "inkling2-mini-prepared-round-fold@1";
-inline constexpr std::array<profile::Lever, 3> kMiniLevers{{
+// Exact lever: the CUDA prompt flash projects the relative bias itself (cuda_core::PreparedBf16Projection) instead of
+// reading the [row][head][distance] image the prepare stage produces. Same FP32 FMA chain in feature order, same BF16
+// round per distance, same failure contract: bitwise the image route for every launch it admits (single prompt chunk of
+// two or more rows, host positions, no null-order count). A launch it cannot admit (e.g. the device's dynamic
+// shared-memory opt-in below the 1024-column projection's need) keeps the image route; real errors stay visible. CUDA only
+// (HIP selects its projected route in its own binding). Off until its same-head identity receipt (lever on vs off,
+// --logits bitwise, EXACT 4K..32K and TURBO 8K); the flip is data: value cells {"1","1","1","1"} (all tiers, every cell
+// already ready and runnable). Switch: STRIX_INK_ATTN_PROJECTED_BIAS=0/1.
+inline constexpr std::string_view kMiniAttnProjectedBias = "inkling2-mini-attn-projected-bias@1";
+inline constexpr std::array<profile::Lever, 4> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
@@ -64,6 +73,10 @@ inline constexpr std::array<profile::Lever, 3> kMiniLevers{{
      .source = "tests/core/round_fold_hip.hip (every store: the separate round's bits) and the isolated fold off/on "
                "identity ticket of the HIP prepared attention",
      .omit_builtin_fingerprint = true},
+    {kMiniAttnProjectedBias, "STRIX_INK_ATTN_PROJECTED_BIAS", "", {"", "", "", ""}, "0", profile::Kind::exact,
+     {true, true, true, true}, {true, true, true, true}, "", "0",
+     "relative bias projected inside the CUDA prompt flash: bitwise the image route (same-head identity receipt pending)",
+     false, {}, true},
 }};
 
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.

@@ -5,6 +5,7 @@
 #include "strix/session/head_gate_cli.hpp"
 
 #include <iostream>
+#include <utility>
 
 #include <array>
 #include <bit>
@@ -207,6 +208,29 @@ void set_round_fold_env(const char* value) {
 #endif
 }
 
+// The projected-bias attention lever per tier through the CLI parse: the same table the server test pins
+// (tests/inkling2/mini_serve_test.cpp): unset and 0 off, 1 on, anything else refused.
+void test_projected_bias_lever() {
+    const auto set = [](const char* value) {
+#ifdef _WIN32
+        require(_putenv_s("STRIX_INK_ATTN_PROJECTED_BIAS", value ? value : "") == 0, "cannot set the lever");
+#else
+        require((value ? setenv("STRIX_INK_ATTN_PROJECTED_BIAS", value, 1)
+                       : unsetenv("STRIX_INK_ATTN_PROJECTED_BIAS")) == 0, "cannot set the lever");
+#endif
+    };
+    for (const auto* tier : {"exact", "fast", "turbo"}) {
+        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
+            set(value);
+            require(strix::inkling2::mini_attn_projected_bias(parse({"1", "--profile", tier}).tier) == expected,
+                    "CLI projected-bias lever differs from the server table");
+        }
+    }
+    set("yes");
+    expect_invalid([] { (void)parse({"1", "--profile", "fast"}); });
+    set(nullptr);
+}
+
 void test_options() {
     using strix::profile::Name;
     require(parse({"1"}).tier.profile == Name::standard, "expected exact default");
@@ -318,6 +342,7 @@ int main() {
         const TempDir directory;
 #if defined(STRIX_INKLING2_APP_CLI_TEST)
         test_options();
+        test_projected_bias_lever();
     test_cuda_route_options();
 #endif
         test_windows(directory.path);
