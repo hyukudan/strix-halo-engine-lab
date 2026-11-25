@@ -51,10 +51,17 @@ inline bool valid_resident_q8_rows(const weight::ResidentMatrixView& matrix, uns
 }
 
 // The FP32 sweep is the incumbent. The explicit FP16 form uses one arithmetic across both tile schedules.
-enum class LowBitArithmetic { fp32_sweep, f16_group_scale };
+// f16_folded_scale: the FP16 form whose tile route (launches above the device plan's small_rows) folds the scale into
+// the operand (fp16(code x d), one WMMA chain per output; core/lowbit_f16_staging.hpp ScalePolicy::folded) while the
+// small-M route keeps the group scale: per-regime selection from the no-model fixture (tests/hip_dense_lowbit_bench.hip
+// mode fold; gfx1151: the folded tile faster on every measured shape, the folded small-M schedule no faster at 1-16
+// rows and slower at 32-64). A row's bits then depend on its launch's route. A FAST / TURBO candidate lever value: it
+// changes rounding, is never EXACT and no profile selects it until its gate and receipts exist.
+enum class LowBitArithmetic { fp32_sweep, f16_group_scale, f16_folded_scale };
 
+constexpr bool lowbit_f16_form(LowBitArithmetic arithmetic) { return arithmetic != LowBitArithmetic::fp32_sweep; }
 constexpr unsigned lowbit_max_rows(LowBitArithmetic arithmetic) {
-    return arithmetic == LowBitArithmetic::f16_group_scale ? 65535U * f16_tile_gemm::kBM : gemv_rows::max_rows;
+    return lowbit_f16_form(arithmetic) ? 65535U * f16_tile_gemm::kBM : gemv_rows::max_rows;
 }
 inline bool valid_resident_lowbit_rows(const weight::ResidentMatrixView& matrix, unsigned outputs,
                                        const float* input, unsigned rows, const float* output,
@@ -145,6 +152,8 @@ inline constexpr std::array<weight::ArithmeticId, 2> kResidentLowBitTileArithmet
 // Strix pack SP4 (fixed table) on the small-M schedule: table values as exact FP16 operands, one WMMA chain per K32
 // group from +0, acc = fma(group sum, (1 + m / 8) 2^e, acc) in ascending groups, then x 2^base at the store.
 inline constexpr std::array<weight::ArithmeticId, 1> kResidentSp4ArithmeticHip{{{"hip.sp4t.f16-group32-scale-chain", 1}}};
+inline constexpr std::array<weight::ArithmeticId, 2> kResidentLowBitFoldedArithmeticHip{{
+    {"hip.q4_g64.f16-folded-scale-tile", 1}, {"hip.q6_g64.f16-folded-scale-tile", 1}}};
 
 // The weight bytes one projection of a list reads: a BF16 projection outputs tight rows of width elements, a compact
 // one its whole view. Empty (nullptr, 0) when the descriptor has no weights or the extent does not fit.

@@ -66,8 +66,11 @@ __device__ __forceinline__ BlockWords<Storage> load_block(const std::uint8_t* ro
 
 // Operand trait of the q4_g64 / q6_g64 resident rows: Words = one superblock (two groups) of one column, unit u of group
 // gi = the exact FP16 integer codes of elements 64 gi + 16 u .. + 16 of the block, scale = the group's FP16 scale.
-template <class Storage>
+// ScalePolicy::folded (FAST / TURBO candidate, core/lowbit_f16_staging.hpp): unit = fp16(code x d) pairs and kFolded,
+// so run() chains every unit into the accumulator (the tile's folded staging arithmetic, bit for bit).
+template <class Storage, lowbit_f16::ScalePolicy Policy = lowbit_f16::ScalePolicy::group>
 struct LowBitOperand {
+    static constexpr bool kFolded = Policy == lowbit_f16::ScalePolicy::folded;
     static constexpr unsigned kGroup = Storage::group, kUnits = Storage::group / 16U, kSuperK = Storage::elements;
     static_assert(kGroup == 64U && kSuperK == 64U * kGroups);
     using Row = const std::uint8_t*;
@@ -78,7 +81,10 @@ struct LowBitOperand {
         const unsigned word = 8U * gi + 2U * u;
         std::uint32_t hi = 0U;
         if constexpr (Storage::high_bytes != 0U) hi = w.h[gi][u];
-        lowbit_f16::integer_pairs<Storage>(w.c[word / 4U][word % 4U], w.c[word / 4U][word % 4U + 1U], hi, words);
+        if constexpr (kFolded)
+            lowbit_f16::folded_pairs<Storage>(w.c[word / 4U][word % 4U], w.c[word / 4U][word % 4U + 1U], hi,
+                                              w.scale >> (16U * gi), words);
+        else lowbit_f16::integer_pairs<Storage>(w.c[word / 4U][word % 4U], w.c[word / 4U][word % 4U + 1U], hi, words);
     }
     __device__ __forceinline__ static float scale(const Words& w, unsigned gi) {
         return lowbit_f16::scale_value(w.scale >> (16U * gi));
@@ -122,10 +128,13 @@ struct Sp4Operand {
 // The K loop of the small-M schedule over one bound tile. Operand: the weight trait (LowBitOperand, or
 // core/microscaled_f16_staging.hpp): kGroup elements per scale group (a multiple of 16, dividing 64), kUnits = kGroup / 16
 // WMMA units per group, kSuperK = 128 elements per superblock (one stage), Words = the superblock of a column, load(row,
-// index), unit() = FP16 pairs of 16 of its elements, scale() = the group's FP32 multiplier. Tile (a binding): K (% 128 ==
+// index), unit() = FP16 pairs of 16 of its elements, scale() = the group's FP32 multiplier (an Operand with kFolded true
+// has the scale inside unit() and every unit chains into the accumulator). Tile (a binding): K (% 128 ==
 // 0), rows (live rows of the tile), columns() (output columns), row(column) (the column's weight row), AChunk / load_a(row, k, kl, in) /
 // pack_a (8 A elements of row `row` from k + kl, zero when !in, as 4 FP16 pair words) and store(row, column, sum); an optional
 // before_store() runs on every thread before the stores. The CTA covers rows 16 RowTiles row_block .. + 16 RowTiles.
+template <class Operand> inline constexpr bool folded_operand = requires { requires Operand::kFolded; };
+
 template <class Operand, unsigned RowTiles, class Tile>
 __device__ __forceinline__ void run(const Tile& tile, unsigned row_block, unsigned col0) {
     constexpr unsigned kDepth = kPrefetch, kStageGroups = 64U * kGroups / Operand::kGroup;
@@ -183,6 +192,18 @@ __device__ __forceinline__ void run(const Tile& tile, unsigned row_block, unsign
             if (t + 1U < stages) load_a(t + 1U);  // in flight across this stage's WMMAs
             const Words w = ring[p];
             if (t + kDepth < stages) ring[p] = Operand::load(wrow, t + kDepth);
+            if constexpr (folded_operand<Operand>) {
+#pragma unroll
+                for (unsigned v = 0; v < kStageGroups * Operand::kUnits; ++v) {
+                    std::uint32_t words[8];
+                    Operand::unit(w, v / Operand::kUnits, v % Operand::kUnits, words);
+                    const Frag fb{words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]};
+#pragma unroll
+                    for (unsigned m = 0; m < RowTiles; ++m)
+                        if (m < live_tiles) acc[m] = detail::LowBitMma{}(detail::fragment(&lds.a[16U * m + c][8U * v]), fb, acc[m]);
+                }
+                continue;
+            }
 #pragma unroll
             for (unsigned gi = 0; gi < kStageGroups; ++gi) {
                 detail::LowBitGroup sum[RowTiles] = {};
@@ -274,7 +295,7 @@ void sp4_kernel(const float* a, unsigned rows, unsigned K, std::size_t w_row_byt
     run<Sp4Operand, RowTiles>(tile, blockIdx.y, col0);
 }
 
-template <class Storage, unsigned RowTiles, unsigned Capacity>
+template <class Storage, unsigned RowTiles, unsigned Capacity, lowbit_f16::ScalePolicy Policy = lowbit_f16::ScalePolicy::group>
 __global__ __launch_bounds__(128)  // Schedule::kThreads
 void lowbit_kernel(const float* a, unsigned rows, unsigned K, std::size_t w_row_bytes, Q8ProjectionGroup<Capacity> group) {
     const unsigned panel = blockIdx.x;
@@ -283,24 +304,24 @@ void lowbit_kernel(const float* a, unsigned rows, unsigned K, std::size_t w_row_
     const auto& projection = group.projections[index];
     const unsigned col0 = (panel - group.first_panel[index]) * kProjectionPanel;
     const ProjectionTile tile{a, rows, K, w_row_bytes, &projection};
-    run<LowBitOperand<Storage>, RowTiles>(tile, blockIdx.y, col0);
+    run<LowBitOperand<Storage, Policy>, RowTiles>(tile, blockIdx.y, col0);
 }
 
-template <class Storage, unsigned RowTiles, unsigned Capacity>
+template <class Storage, unsigned RowTiles, unsigned Capacity, lowbit_f16::ScalePolicy Policy = lowbit_f16::ScalePolicy::group>
 inline void launch(const float* a, unsigned rows, unsigned K, const Q8ProjectionGroup<Capacity>& group, hipStream_t stream) {
     const dim3 grid(group.first_panel[group.count], (rows + 16U * RowTiles - 1U) / (16U * RowTiles));
     const auto w_row_bytes = static_cast<std::size_t>(Storage::row_bytes(K));
-    STRIX_HIP_LAUNCH(Rdna3Layout, lowbit_kernel<Storage, RowTiles, Capacity><<<grid, 128, 0, stream>>>(a, rows, K, w_row_bytes, group));
+    STRIX_HIP_LAUNCH(Rdna3Layout, lowbit_kernel<Storage, RowTiles, Capacity, Policy><<<grid, 128, 0, stream>>>(a, rows, K, w_row_bytes, group));
 }
 
 // rows >= 1, K % 128 == 0: 16-row blocks, or one 32-row block per 32 rows when `wide_block` (the caller's device plan,
 // core/resident_row_plan.hpp lowbit_wide_block; speed only: both blocks give the same bits per row).
-template <class Storage, unsigned Capacity>
+template <class Storage, unsigned Capacity, lowbit_f16::ScalePolicy Policy = lowbit_f16::ScalePolicy::group>
 inline hipError_t gemm_lowbit(const float* a, unsigned rows, unsigned K, const Q8ProjectionGroup<Capacity>& group,
                               hipStream_t stream, bool wide_block = false) {
     static_assert(Capacity <= 32U);
-    if (wide_block) launch<Storage, 2U>(a, rows, K, group, stream);
-    else launch<Storage, 1U>(a, rows, K, group, stream);
+    if (wide_block) launch<Storage, 2U, Capacity, Policy>(a, rows, K, group, stream);
+    else launch<Storage, 1U, Capacity, Policy>(a, rows, K, group, stream);
     return hipGetLastError();
 }
 
