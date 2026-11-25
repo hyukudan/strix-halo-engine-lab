@@ -130,10 +130,13 @@ inline void ingest_prompt(MiniFixedCohort& cohort, unsigned slot) {
 }
 
 // The id a lane feeds at generated step `step` (step 0 = the first generated id: on the incumbent route that step
-// decodes the held-back prompt token).
-inline unsigned step_token(bool emits_first, unsigned slot, unsigned step) {
-    return emits_first ? cohort_token(slot, kPromptRows[slot] + step) : cohort_token(slot, kPromptRows[slot] - 1U + step);
-}
+// decodes the held-back prompt token; an emits-first lane takes step 0 from its prefill and calls this from step 1).
+// Both routes feed input index prompt - 1 + step, so step 1 consumes index `prompt` on either route.
+inline unsigned step_token(unsigned slot, unsigned step) { return cohort_token(slot, kPromptRows[slot] - 1U + step); }
+
+// The last committed position after generated step `step` on either route: the held-back route commits prompt - 1 rows
+// in prefill and one at step 0, emits-first commits the whole prompt in prefill; each later step commits one row.
+inline unsigned step_position(unsigned slot, unsigned step) { return kPromptRows[slot] - 1U + step; }
 
 inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool requested, bool admitted) {
     auto owned = served_decoder(checkpoint, kCohortContext, kCohortChunk, storage, kCohortSlots, 0U, admitted);
@@ -173,7 +176,7 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool r
         top.resize(slots.size());
         for (unsigned r = 0; r < slots.size(); ++r) {
             groups.push_back({slots[r], 1U});
-            ids[r] = step_token(emits_first, slots[r], step);
+            ids[r] = step_token(slots[r], step);
         }
         cohort.verify(groups, ids, top);
         for (unsigned r = 0; r < slots.size(); ++r) seen(r, top[r], cohort.read_final_logits(slots[r]));
@@ -197,7 +200,10 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool r
                 h.add(out.data(), out.size_bytes());
                 s.logits = h.value;
                 digest_state(decoder, slot, s, row, history);
-                if (s.position != kPromptRows[slot] + step) throw std::logic_error("lone lane position");
+                if (s.position != step_position(slot, step))
+                    throw std::logic_error("lone lane position: slot " + std::to_string(slot) + " step " +
+                                           std::to_string(step) + " committed " + std::to_string(s.position) +
+                                           " expected " + std::to_string(step_position(slot, step)));
                 print_digest("lone", 1U, step, slot, s, all);
             });
     }
@@ -211,6 +217,12 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool r
         // Lane row r is slot (r + 1) % width: lane 0 of the cohort is not slot 0.
         std::vector<unsigned> slots(width);
         for (unsigned r = 0; r < width; ++r) slots[r] = (r + 1U) % width;
+#if !defined(__HIPCC__)
+        // Replay counters before this lane count: the witness below credits only replays of THIS arm (a lifetime
+        // per-width flag could have been set by a smaller lane count padded to the same program width).
+        const std::array<std::uint64_t, 2> replays_before{decoder.cohort_replay_count(false),
+                                                          decoder.cohort_replay_count(true)};
+#endif
         for (unsigned step = 0; step < kCohortSteps; ++step)
             run_step(slots, step, [&](unsigned r, unsigned pick, std::span<const float> scores) {
                 const auto slot = slots[r];
@@ -246,12 +258,19 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool r
         const auto graph_width = decoder.cohort_programs().width(width, kCohortSlots);
         const bool program = graph_width != 0U && decoder.cohort_graphs().policy().ready(graph_width) &&
                              !decoder.cohort_graphs().policy().failed(graph_width);
-        const bool replayed = graph_width != 0U && decoder.cohort_replay_completed(graph_width);
+        // The mode this lane count implies: padded when the program is wider than the lanes, else full-width. This arm
+        // must have completed at least one replay in that mode and none in the other.
+        const bool padded = graph_width > width;
+        const auto replays = decoder.cohort_replay_count(padded) - replays_before[padded ? 1U : 0U];
+        const auto other = decoder.cohort_replay_count(!padded) - replays_before[padded ? 0U : 1U];
+        const bool replayed = graph_width != 0U && replays != 0U;
         std::cout << "COHORT w=" << width << " graph_width=" << graph_width
                   << " program=" << (program ? "ready" : graph_width != 0U ? "declined" : "eager")
-                  << " replay=" << (replayed ? "complete" : "none") << '\n';
+                  << " replay=" << (replayed ? "complete" : "none") << " mode=" << (padded ? "padded" : "full")
+                  << " replays=" << replays << " other_mode=" << other << '\n';
         if (graph_width != 0U && !program) fail(width, 0U, 0U, "no cohort program at this width");
-        if (graph_width != 0U && !replayed) fail(width, 0U, 0U, "the cohort program never completed a replay");
+        if (graph_width != 0U && !replayed) fail(width, 0U, 0U, "this lane count completed no replay of its program");
+        if (other != 0U) fail(width, 0U, 0U, "this lane count replayed a program in the other padding mode");
 #endif
     }
     char line[64];

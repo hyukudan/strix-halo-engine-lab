@@ -398,6 +398,11 @@ public:
         return width != 0U && width <= exec::kStepMaxRows &&
                (reported_cohort_replays_.test(width - 1U) || reported_padded_cohort_replays_.test(width - 1U));
     }
+    // Completed cohort program replays so far, padded (fewer lanes than the program width) or full-width: a caller reads
+    // it before and after a run to witness that THIS run replayed, in the mode its lane count implies.
+    [[nodiscard]] std::uint64_t cohort_replay_count(bool padded) const noexcept {
+        return padded ? padded_cohort_replays_ : full_cohort_replays_;
+    }
 #endif
 
     // Final-row scores of the last decode_slots() call, exactly as the greedy pick saw them (after the
@@ -615,6 +620,7 @@ private:
             for (std::size_t row = 0; row < top.size(); ++row) (void)checked_token(greedy_, row);
         });
         if (launched && had_graph) {
+            ++(rows < width ? padded_cohort_replays_ : full_cohort_replays_);
             auto& reported = rows < width ? reported_padded_cohort_replays_ : reported_cohort_replays_;
             if (!reported.test(width - 1U)) {
                 reported.set(width - 1U);
@@ -1034,6 +1040,8 @@ private:
     std::vector<MiniResidentAppendGroup> padded_groups_;
     std::bitset<exec::kStepMaxRows> reported_cohort_replays_;
     std::bitset<exec::kStepMaxRows> reported_padded_cohort_replays_;
+    std::uint64_t full_cohort_replays_ = 0;
+    std::uint64_t padded_cohort_replays_ = 0;
 #endif
 };
 
