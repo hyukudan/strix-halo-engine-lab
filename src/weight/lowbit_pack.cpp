@@ -292,10 +292,10 @@ Status LowbitPack::open(const std::string& path, const Digest256& checkpoint, Lo
         if (!storage) return fail(Error::unknown_format, "unsupported low-bit pack format for " + e.tensor);
         e.storage = *storage;
         if (f.size() == 10U) {
-            sp::Header header;
-            if (const auto why = parse_header(f[9], header); !why.empty())
+            sp::Header tensor_header;
+            if (const auto why = parse_header(f[9], tensor_header); !why.empty())
                 return fail(Error::malformed, e.tensor + ": Strix pack header: " + why);
-            e.sp_header = header;
+            e.sp_header = tensor_header;
         }
         if (const auto why = lowbit_header_defect(e.storage, e.sp_header); !why.empty())
             return fail(Error::malformed, e.tensor + ": " + why);
