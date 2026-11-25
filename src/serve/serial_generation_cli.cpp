@@ -23,8 +23,29 @@
 #include <numeric>
 #include <optional>
 #include <ostream>
+#include <random>
 #include <stdexcept>
+#include <string>
 #include <vector>
+
+#include <cerrno>
+#include <cstdio>
+#include <fcntl.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <io.h>
+#include <process.h>
+#include <share.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace strix::serve {
 namespace {
@@ -80,17 +101,218 @@ Number parse_number(std::string_view value, const char* error) {
     return result;
 }
 
-void protect_asset(const char* output, const fs::path& asset, const char* error) {
-    if (output && fs::exists(output) && fs::equivalent(asset, output)) throw std::invalid_argument(error);
+// The --logits file. The dump has no name until the run succeeds: on Linux it is an unnamed file (O_TMPFILE) of the
+// destination directory, which is held open from the start; on Windows a file under a bounded random name of that
+// directory, created exclusively, delete-on-close and not shareable for deletion or writing, whose handle stays open.
+// It is written (and flushed) through its descriptor only, and published on success by an operation that never
+// replaces: linkat of the descriptor under the name relative to the held directory (EEXIST when the name exists), or
+// a by-handle rename with ReplaceIfExists = FALSE relative to the held directory handle followed by clearing the
+// delete-on-close disposition. No name is resolved again after creation. A name that exists (a file, a link, even a
+// dangling one) is refused at the start and, if it appeared during the run, at publication, and is left untouched. A
+// run that fails publishes nothing and leaves nothing behind (closing the descriptor discards the dump). Linux needs a
+// file system with O_TMPFILE support in the destination directory; otherwise --logits is refused (no named fallback).
+class LogitsOutput {
+public:
+    explicit LogitsOutput(const fs::path& path)
+        : path_(path), directory_(path.has_parent_path() ? path.parent_path() : fs::path(".")) {
+        const auto name = path.filename();
+        if (name.empty() || name == "." || name == "..") throw std::invalid_argument("logits output must name a file");
+#ifdef _WIN32
+        dir_ = CreateFileW(directory_.c_str(), FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_TRAVERSE | SYNCHRONIZE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,
+                           nullptr);
+        if (dir_ == INVALID_HANDLE_VALUE) throw std::invalid_argument("could not open the logits output directory");
+        if (name_taken()) {
+            discard();
+            throw std::invalid_argument("logits output exists (an existing file is never replaced)");
+        }
+        std::random_device random;
+        for (unsigned attempt = 0; fd_ < 0; ++attempt) {
+            std::wstring staged = L".strix-logits-";
+            for (int part = 0; part < 4; ++part) {
+                wchar_t hex[9]{};
+                (void)swprintf(hex, 9, L"%08x", unsigned(random()));
+                staged += hex;
+            }
+            staged += L".tmp";
+            const HANDLE file = CreateFileW((directory_ / staged).c_str(), GENERIC_WRITE | DELETE | SYNCHRONIZE,
+                                            FILE_SHARE_READ, nullptr, CREATE_NEW,
+                                            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+            if (file == INVALID_HANDLE_VALUE) {
+                if (GetLastError() == ERROR_FILE_EXISTS && attempt < 15U) continue;
+                discard();
+                throw std::invalid_argument("could not create the logits output");
+            }
+            fd_ = _open_osfhandle(reinterpret_cast<intptr_t>(file), _O_WRONLY | _O_BINARY);
+            if (fd_ < 0) {
+                CloseHandle(file);  // delete-on-close: nothing is left
+                discard();
+                throw std::runtime_error("could not create the logits output");
+            }
+        }
+#else
+        dir_ = ::open(directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dir_ < 0) throw std::invalid_argument("could not open the logits output directory");
+        if (name_taken()) {
+            discard();
+            throw std::invalid_argument("logits output exists (an existing file is never replaced)");
+        }
+#ifdef O_TMPFILE
+        fd_ = ::openat(dir_, ".", O_TMPFILE | O_WRONLY | O_CLOEXEC, 0600);
+        const int error = errno;
+#else
+        const int error = EOPNOTSUPP;
+#endif
+        if (fd_ < 0) {
+            discard();
+            if (error == EOPNOTSUPP || error == EISDIR || error == ENOENT || error == EINVAL)
+                throw std::invalid_argument("--logits needs a file system that supports unnamed files (O_TMPFILE) in "
+                                            "the output directory; this one does not");
+            throw std::invalid_argument("could not create the logits output");
+        }
+#endif
+        key_ = descriptor_file_key(fd_);
+        if (!key_) {
+            discard();
+            throw std::runtime_error("could not identify logits output");
+        }
+    }
+    ~LogitsOutput() { discard(); }  // a run that fails publishes nothing
+    LogitsOutput(const LogitsOutput&) = delete;
+    LogitsOutput& operator=(const LogitsOutput&) = delete;
+
+    void refuse(const std::optional<FileKey>& input, const char* error) const {
+        if (input && input == key_) throw std::invalid_argument(error);
+    }
+    void refuse(const fs::path& input, const char* error) const { refuse(file_key(input), error); }
+    void write(std::span<const float> logits) {  // through the descriptor only; visible under the name after publish()
+        const auto bytes = session::logits_bytes(logits);
+        bool ok = fd_ >= 0;
+        for (std::size_t at = 0; ok && at < bytes.size();) {
+#ifdef _WIN32
+            const auto n = _write(fd_, bytes.data() + at, unsigned(std::min<std::size_t>(bytes.size() - at, 1U << 30U)));
+#else
+            const auto n = ::write(fd_, bytes.data() + at, bytes.size() - at);
+#endif
+            ok = n > 0;
+            at += ok ? std::size_t(n) : 0U;
+        }
+#ifdef _WIN32
+        ok = ok && _commit(fd_) == 0;
+#else
+        ok = ok && ::fsync(fd_) == 0;
+#endif
+        if (!ok) throw std::runtime_error("could not write logits output");
+        written_ = true;
+    }
+    void publish() {  // the success boundary of the run: never replaces a name that exists
+        if (!written_) return;
+        bool taken = false, published = false;
+#ifdef _WIN32
+        const HANDLE file = reinterpret_cast<HANDLE>(_get_osfhandle(fd_));
+        const std::wstring name = path_.filename().wstring();
+        std::vector<unsigned char> buffer(sizeof(FILE_RENAME_INFO) + name.size() * sizeof(wchar_t));
+        auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
+        rename->ReplaceIfExists = FALSE;
+        rename->RootDirectory = dir_;
+        rename->FileNameLength = DWORD(name.size() * sizeof(wchar_t));
+        std::copy(name.begin(), name.end(), rename->FileName);
+        // NtSetInformationFile, not SetFileInformationByHandle: the latter refuses RootDirectory and resolves a relative
+        // name against the process's current directory.
+        struct IoStatus {
+            union {
+                LONG status;
+                PVOID pointer;
+            };
+            ULONG_PTR information;
+        } io{};
+        using SetInformation = LONG(NTAPI*)(HANDLE, IoStatus*, PVOID, ULONG, int);
+        const auto set_information = reinterpret_cast<SetInformation>(
+            reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationFile")));
+        constexpr int file_rename_information = 10;
+        constexpr LONG name_collision = LONG(0xC0000035L);  // STATUS_OBJECT_NAME_COLLISION
+        const LONG status = set_information ? set_information(file, &io, rename, ULONG(buffer.size()),
+                                                              file_rename_information)
+                                            : name_collision + 1;
+        if (status == 0) {
+            FILE_DISPOSITION_INFO_EX keep{};
+            keep.Flags = FILE_DISPOSITION_FLAG_ON_CLOSE;  // without FILE_DISPOSITION_FLAG_DELETE: clears delete-on-close
+            published = SetFileInformationByHandle(file, FileDispositionInfoEx, &keep, sizeof(keep)) != 0;
+        } else {
+            taken = status == name_collision;
+        }
+#else
+        const auto self = "/proc/self/fd/" + std::to_string(fd_);
+        published = ::linkat(AT_FDCWD, self.c_str(), dir_, path_.filename().c_str(), AT_SYMLINK_FOLLOW) == 0;
+        taken = !published && errno == EEXIST;
+#endif
+        discard();  // closes the descriptor (an unpublished dump goes with it) and the directory
+        if (!published)
+            throw std::runtime_error(taken ? "logits output exists (it appeared during the run and is never replaced)"
+                                           : "could not publish logits output");
+    }
+
+private:
+    bool name_taken() const {  // anything under the name, a dangling link included
+#ifdef _WIN32
+        std::error_code ignored;
+        return fs::symlink_status(path_, ignored).type() != fs::file_type::not_found;
+#else
+        struct stat info {};
+        return ::fstatat(dir_, path_.filename().c_str(), &info, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT;
+#endif
+    }
+    void discard() {
+#ifdef _WIN32
+        if (fd_ >= 0) (void)_close(fd_);
+        if (dir_ != INVALID_HANDLE_VALUE) CloseHandle(dir_);
+        dir_ = INVALID_HANDLE_VALUE;
+#else
+        if (fd_ >= 0) (void)::close(fd_);
+        if (dir_ >= 0) (void)::close(dir_);
+        dir_ = -1;
+#endif
+        fd_ = -1;
+    }
+    fs::path path_, directory_;
+    bool written_ = false;
+    int fd_ = -1;
+#ifdef _WIN32
+    HANDLE dir_ = INVALID_HANDLE_VALUE;
+#else
+    int dir_ = -1;
+#endif
+    std::optional<FileKey> key_;
+};
+
+struct TextInput {
+    std::string text;
+    std::optional<FileKey> key;  // of the handle the text was read from
+};
+
+TextInput read_text_input(const char* path) {
+    std::FILE* file = nullptr;
+#ifdef _WIN32
+    if (fopen_s(&file, path, "rb") != 0) file = nullptr;
+#else
+    file = std::fopen(path, "rb");
+#endif
+    if (!file) throw std::runtime_error("could not open text input: " + std::string(path));
+    TextInput input;
+#ifdef _WIN32
+    input.key = descriptor_file_key(_fileno(file));
+#else
+    input.key = descriptor_file_key(fileno(file));
+#endif
+    char buffer[1U << 16U];
+    for (std::size_t n; (n = std::fread(buffer, 1, sizeof buffer, file)) > 0;) input.text.append(buffer, n);
+    const bool failed = std::ferror(file) != 0;
+    std::fclose(file);
+    if (failed) throw std::runtime_error("could not read text input: " + std::string(path));
+    return input;
 }
 
-std::string read_text(const char* path) {
-    std::ifstream input(path, std::ios::binary);
-    if (!input) throw std::runtime_error("could not open text input: " + std::string(path));
-    std::string text{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    if (input.bad()) throw std::runtime_error("could not read text input: " + std::string(path));
-    return text;
-}
+std::string read_text(const char* path) { return read_text_input(path).text; }
 
 }  // namespace
 
@@ -104,7 +326,8 @@ struct MediaPrompt {
 
 MediaPrompt render_media_prompt(const SerialGenerationFamily& family, const std::string& checkpoint,
                                 const BpeTokenizer& tokenizer, std::string_view body_text,
-                                std::uint32_t reserve_tokens, std::unique_ptr<SerialMediaInput>& media) {
+                                std::uint32_t reserve_tokens, std::unique_ptr<SerialMediaInput>& media,
+                                const LogitsOutput* output) {
     MediaPrompt out;
     auto body = parse_json(body_text);
     if (body.is_array()) {  // a bare messages array is the body {"messages": [...]}
@@ -119,6 +342,9 @@ MediaPrompt render_media_prompt(const SerialGenerationFamily& family, const std:
     }
     media = family.media(checkpoint);
     if (!media) throw std::runtime_error("the family opened no media input");
+    if (output)  // before the encoder runs: the output may be none of the files the media input read
+        for (const auto& input : media->input_keys())
+            output->refuse(input, "logits output must differ from the image input files");
     auto& adapter = media->adapter();
     const auto placeholder_ids = tokenizer.encode(adapter.placeholder(), true);
     if (placeholder_ids.size() != 1U || session::is_embed_id(placeholder_ids[0]))
@@ -225,14 +451,19 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
 void run_serial_generation(const std::string& checkpoint, SerialGenerationOptions options,
                            const SerialGenerationFamily& family, std::ostream& out,
                            const std::function<void()>& on_loaded) {
-    protect_asset(options.logits, checkpoint, "logits output must differ from the checkpoint");
+    std::optional<LogitsOutput> output;  // opened first: every input below is checked against the opened file
+    if (options.logits) output.emplace(options.logits);
+    const auto protect_asset = [&](const fs::path& asset, const char* error) {
+        if (output) output->refuse(asset, error);
+    };
+    protect_asset(checkpoint, "logits output must differ from the checkpoint");
     std::shared_ptr<const BpeTokenizer> tokenizer;
     std::unique_ptr<SerialMediaInput> media;            // outlives the prefill: it owns the interned rows' adapter
     std::shared_ptr<const session::EmbedTable> embeds;  // rows of the virtual ids of an image prompt
     if (options.text || options.messages || options.tokenize_file) {
         const fs::path asset = options.tokenizer ? fs::path(options.tokenizer) :
             fs::path(checkpoint).parent_path() / "tokenizer.json";
-        protect_asset(options.logits, asset, "logits output must differ from the tokenizer");
+        protect_asset(asset, "logits output must differ from the tokenizer");
         tokenizer = family.load_tokenizer(asset.string());
         if (options.tokenize_file) {
             for (const auto id : tokenizer->encode(read_text(options.tokenize_file), false)) out << id << '\n';
@@ -240,10 +471,12 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
             return;
         }
         if (options.messages) {
-            protect_asset(options.logits, options.messages, "logits output must differ from the messages file");
-            const auto body = read_text(options.messages);
+            const auto input = read_text_input(options.messages);
+            if (output) output->refuse(input.key, "logits output must differ from the messages file");
+            const auto& body = input.text;
             if (family.media && family.render_media_messages) {
-                auto prompt = render_media_prompt(family, checkpoint, *tokenizer, body, options.generate, media);
+                auto prompt = render_media_prompt(family, checkpoint, *tokenizer, body, options.generate, media,
+                                                  output ? &*output : nullptr);
                 options.prompt = std::move(prompt.tokens);
                 embeds = std::move(prompt.table);
             } else {
@@ -273,12 +506,17 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     const auto load_start = Clock::now();
     const auto chunk = std::min(options.prefill_chunk, prompt_size);
     const auto fallback = std::min(family.prefill_chunk_fallback, prompt_size);
-    auto decoder = load_with_chunk_fallback(chunk, options.prefill_chunk_explicit, fallback, std::cerr,
-                                            [&](std::uint32_t rows) {
-        return family.load({checkpoint, positions, rows, options.packed_decode, verify_rows,
-                            verify_rows ? options.speculation : CliSpeculation::off,
-                            prefill_tail_rows(prompt_size, rows, family.prefill_tail_divisor)});
-    });
+    std::unique_ptr<SerialGenerationDecoder> decoder;
+    const auto load = [&] {
+        decoder = load_with_chunk_fallback(chunk, options.prefill_chunk_explicit, fallback, std::cerr,
+                                           [&](std::uint32_t rows) {
+            return family.load({checkpoint, positions, rows, options.packed_decode, verify_rows,
+                                verify_rows ? options.speculation : CliSpeculation::off,
+                                prefill_tail_rows(prompt_size, rows, family.prefill_tail_divisor), prompt_size});
+        });
+    };
+    if (media) media->load_checkpoint(checkpoint, load);  // the model reads the file the image rows came from
+    else load();
     if (family.report_load_timing) session::write_load_timing(out, load_start);
     if (on_loaded) on_loaded();
 
@@ -290,7 +528,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     auto next = embeds ? decoder->prefill_embedded(options.prompt, embeds, logits) : decoder->prefill(options.prompt, logits);
     if (sampler) next = sampler->decide(logits, prompt_size, nullptr).token;
     const auto prefill_ms = session::cli_milliseconds(Clock::now() - prefill_start);
-    if (options.logits) session::write_logits(options.logits, logits);
+    if (output) output->write(logits);
     if (!sampler) logits.clear();
 
     out << "next_token " << next << '\n';
@@ -404,6 +642,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     }
     if (tokenizer && !generated.generated_tokens.empty())
         out << "text " << tokenizer->decode(generated.generated_tokens, true) << '\n';
+    if (output) output->publish();  // the run succeeded: the logits dump becomes visible under its name
 }
 
 std::uint32_t SerialGenerationDecoder::prefill_embedded(std::span<const std::uint32_t> ids,

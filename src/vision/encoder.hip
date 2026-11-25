@@ -1019,7 +1019,12 @@ void Encoder::merge_project(const EncoderOutput& hidden, unsigned grid_h, unsign
     const bool resident = hidden.device_epoch != 0;
     if (resident && (!hidden.resident_for(im.owner, im.epoch) || !im.hid))
         throw std::logic_error("vision encoder: the device hidden rows of this output were overwritten");
-    if (!project_device()) {  // host graph through linear(); encode_for_projection() downloaded the rows
+    if (!project_device() || m.layout == MergeProjector::Layout::packed_cells) {
+        // Packed cells already have the GEMM order. Use the shared host graph through device linear(): it reads host
+        // hidden rows only, so a device-resident output is refused here by name.
+        if (resident)
+            throw std::invalid_argument("vision encoder: the packed-cell merge projector takes host hidden rows "
+                                        "(encode(), not a device-resident encode_for_projection() output)");
         DenseOps::merge_project(hidden, grid_h, grid_w, m, rows);
         return;
     }
@@ -1038,6 +1043,7 @@ void Encoder::merge_project(const EncoderOutput& hidden, unsigned grid_h, unsign
         src = im.phid.as<const float>();
         pitch = W;
     }
+    src += std::size_t{m.row_offset} * pitch;
     const std::size_t x1 = std::size_t{tokens} * p1.inp, y1 = std::size_t{tokens} * p1.n16, x2 = std::size_t{tokens} * p2.inp,
                       y2 = std::size_t{tokens} * p2.n16;
     grow(im.px, x1 * 4U);

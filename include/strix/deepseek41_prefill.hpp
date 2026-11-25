@@ -61,6 +61,7 @@ struct PrefillOptions {
     // FAST lever ds41-moe-f16wmma-v1 (STRIX_DS41_FAST_MOE_F16=1, explicit; acts with fast_moe): the relaxed routed-expert kernels
     // in their FP16-operand form (A8 rows and decoded weights rounded once to FP16, FP32 accumulation over the whole K).
     bool fast_moe_f16 = false;
+    int fast_i4 = -1;  // -1: environment; explicit 0/1 for resident A/B arms
     // Diagnostics/selection for the non-exact paths (no effect while both switches above are off, except null_ulp_layer):
     // projection bits 1 q_a, 2 kv, 4 q_b, 8 o_a, 16 o_b; layers [approx_layer_first, approx_layer_end); FP16 only at
     // calls of at least fp16_min_rows rows; fp16_keep_a8: FP16 operands from the A8 codes (the exact path's activations)
@@ -422,6 +423,8 @@ public:
     //                                   per-row flag + the fixture "group member i == solo run i under FAST Engram".
     [[nodiscard]] static const char* group_decline_reason(const PrefillOptions& o) noexcept {
         if (o.fp16_dense) return "fp16-solver-geometry-unpinned";
+        if (o.fast_i4 > 0 || (o.fast_i4 < 0 && ds41::fast_profile::moe_i4_on()))
+            return "moe-iu4-group-unqualified";
         if (o.trace || o.stream_hashes || o.routing_loads || o.quality_head_rows > 1U || o.null_ulp_layer >= 0 || o.verify_embed_extras)
             return "diagnostic-output-not-segmented";
         if (o.fast_shared) return "shared-fast-group-unqualified";

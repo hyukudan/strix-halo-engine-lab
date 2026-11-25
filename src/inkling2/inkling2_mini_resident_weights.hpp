@@ -7,17 +7,27 @@
 #include "attn_core/prepared_gqa.hpp"
 
 #include "strix/weight/formats/microscaled_encode.hpp"
+#include "strix/weight/levers.hpp"
+#include "strix/weight/lowbit_pack.hpp"
 #include "strix/weight/resident_slices.hpp"
 #include "strix/weight/row_pitch.hpp"
 
 #include <functional>
 #include <span>
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace strix::inkling2 {
 
 using MiniResidentRange = weight::ResidentSliceRange;
 using MiniReadControllerBits = std::function<void(std::span<const std::uint16_t>, std::span<std::uint16_t>)>;
+
+inline void mini_require_calibrated_pack_matrix_count(unsigned observed, unsigned expected) {
+    if (expected == 0U || observed != expected)
+        throw std::runtime_error("calibrated pack matrix count mismatch: observed " + std::to_string(observed) +
+                                 ", expected " + std::to_string(expected));
+}
 
 // The certificate describes the exact BF16 bytes of these resident slices. The reader transfers those slices to host.
 [[nodiscard]] MiniControllerCertificate read_mini_controller_certificate(const weight::ResidentSlices& slices,
@@ -39,10 +49,16 @@ public:
 
     // The input has already passed the Mini text schema. NVFP4 host-only
     // sidecars are fetched separately when the resident expert views bind.
-    // rule: channel-safe pitch for the BF16 attention-output rows (0 = packed); Q8_0 compact rows stay packed.
+    // rule: channel-safe pitch for the BF16 attention-output rows (0 = packed); compact rows stay packed.
+    // storage: per role class (attention q / k / v / o, output head): BF16, Q8_0, q4_g64 or q6_g64.
+    // pack: optional calibrated low-bit sidecar (strix/weight/lowbit_pack.hpp); a q4_g64 / q6_g64 matrix it holds is
+    // loaded from it instead of the load-time conversion (same format and bytes count, other codes).
+    // keep_bf16: the compact roles are added beside their BF16 rows (kMiniLowBitImage names) instead of replacing them,
+    // so a step can read either (a decision row's decode band); false: one image, the compact rows replace BF16.
     [[nodiscard]] static MiniResidentWeightPlan make(
-        const MiniTextWeights& weights, weight::FormatId storage = weight::kBf16WeightStorage,
-        weight::RowPitchRule rule = {}, bool narrow_experts = false);
+        const MiniTextWeights& weights, weight::RoleStorage storage = {}, weight::RowPitchRule rule = {},
+        bool narrow_experts = false, const weight::LowbitPack* pack = nullptr, bool keep_bf16 = false);
+    [[nodiscard]] unsigned prepacked() const noexcept { return prepacked_; }
     [[nodiscard]] const weight::ResidentSlicePlan& slices() const { return slices_; }
     [[nodiscard]] std::size_t bytes() const { return slices_.bytes(); }
     [[nodiscard]] std::span<const MiniResidentRange> ranges() const { return slices_.ranges(); }
@@ -68,12 +84,17 @@ public:
 private:
     friend class MiniResidentWeights;
     weight::ResidentSlicePlan slices_;
-    weight::FormatId storage_ = weight::kBf16WeightStorage;
+    weight::RoleStorage storage_;
+    bool keep_bf16_{};
+    unsigned prepacked_{};
     std::array<std::array<MiniExpertLayerView, 2>, kPhysicalLayers> slabs_;
     bool narrow_experts_ = false;
     std::array<std::array<NarrowRange, 2>, kPhysicalLayers> narrow_ranges_{};
     std::size_t narrow_bytes_ = 0;
 };
+
+// Name prefix of the compact copy of a role kept beside its BF16 rows.
+inline constexpr std::string_view kMiniLowBitImage = "lowbit:";
 
 // Borrow immutable resident bytes. Once bound, the views are independent of
 // the checkpoint file and valid for as long as the storage is allocated.
@@ -86,7 +107,11 @@ public:
     [[nodiscard]] weight::ResidentBf16Rows bf16_rows(std::string_view name) const;
     [[nodiscard]] std::span<const float> f32(std::string_view name) const;
     [[nodiscard]] std::span<const MiniMoeExpert> experts(unsigned physical) const;
-    [[nodiscard]] bool compact() const { return head_.has_value(); }
+    // Compact (non-BF16) attention projections and head are bound independently (a policy may keep either BF16).
+    // bf16_bound(): the BF16 rows of the compact roles stay resident too (two images; the caller picks per step).
+    [[nodiscard]] bool compact() const { return compact_attention_; }
+    [[nodiscard]] bool bf16_bound() const { return bf16_kept_; }
+    [[nodiscard]] bool compact_head_bound() const { return head_.has_value(); }
     // Certifies the attention operand class from the attention tensors this object holds (BF16 storage only; compact
     // storage keeps the empty, refusing certificate), through the shared bounded scan (core::Bf16StagedScan): `read`
     // copies a slice of a staged BF16 tensor into the scan's scratch (a device copy on CUDA; its exceptions
@@ -116,6 +141,7 @@ private:
     std::vector<MiniMoeExpert> experts_;
     std::optional<weight::ResidentMatrixView> head_;
     bool narrow_ = false;
+    bool compact_attention_ = false, bf16_kept_ = false;
     std::array<attn_core::ResidentPreparedGqaWeights, kPhysicalLayers> attention_{};
     MiniAttentionCertificate attention_certificate_;
     MiniControllerCertificate controller_certificate_;

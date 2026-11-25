@@ -93,7 +93,6 @@ int main(int argc, char** argv) {
         },
         false, serve::render_inkling2_chat_request, true};
 #if defined(STRIX_INKLING2_MEDIA)
-    family.media = cli::open_mini_media;
     family.render_media_messages = serve::render_inkling2_chat_media_request;
 #endif
     if (argc < 3) {
@@ -103,6 +102,9 @@ int main(int argc, char** argv) {
     }
     try {
         auto options = cli::parse(argc, argv, family);
+#if defined(STRIX_INKLING2_MEDIA)
+        family.media = cli::mini_media_opener(options.tier, std::cerr);  // image recipe: this run's resolution
+#endif
         if (const auto* dspark = options.dspark) {
             family.load = [dspark](const serve::SerialGenerationLoad& load) {
                 return std::make_unique<CpuCliDecoder>(load.checkpoint, load.positions, dspark);

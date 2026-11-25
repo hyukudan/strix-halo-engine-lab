@@ -6,6 +6,7 @@
 #include "minimax/engine/mm_defaults.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/host_memory.hpp"
+#include "minimax/engine/mm_fast_i4.hpp"
 #include "minimax/engine/mm_profile_table.hpp"
 #include "minimax/engine/route_identity.hpp"
 #include "core/layer_set.hpp"
@@ -209,9 +210,14 @@ std::vector<Resolved> resolve(const Lookup& env) {
 }
 
 namespace {
-bool fast_i4_format(const Lookup& env) {
-    const char* f = env("STRIX_MMX_MODEL_FORMAT");
-    return f != nullptr && std::strcmp(f, "fast_i4") == 0;
+// The product profile word's resolution for the startup-scoped switches (strict: an unknown word throws; else it is
+// ignored, as prefill_policy() always did).
+profile::Resolution resolve_startup_profile(const Lookup& env, const Lookup& settings, bool strict) {
+    profile::Inputs in;
+    if (const char* name = env(kProductProfileEnv); name != nullptr && *name != 0 && (strict || profile::is_name(name)))
+        in.profile = profile::parse(name);
+    in.env = settings;
+    return profile::resolve(profile_engine(), in);
 }
 }  // namespace
 
@@ -229,14 +235,34 @@ PrefillPolicy prefill_policy(const Lookup& env) {
     if (fp::set(raw) && std::strcmp(raw, "0") != 0 && !fp::accepted(flash, raw))
         throw std::invalid_argument("STRIX_MM_PF_MSA_FLASH must be 0, 1, 2 or 3");
     PrefillPolicy p;
+    const auto profile = resolve_startup_profile(env, env, false);
+    const auto setting = [&](const char* key, std::string_view row) -> const char* {
+        if (const char* value = env(key)) return value;
+        const auto* entry = profile.find(row);
+        return entry && strix::profile::applied(entry->status) ? entry->value.c_str() : nullptr;
+    };
+    const char* format = setting("STRIX_MMX_MODEL_FORMAT", "model_format");
+    const bool legacy_i4 = fp::set(format) && std::strcmp(format, "fast_i4") == 0;
+    if (fp::set(format) && !legacy_i4 && std::strcmp(format, "exl3") != 0)
+        throw std::invalid_argument("STRIX_MMX_MODEL_FORMAT must be exl3 or fast_i4");
+    if (const char* layers = setting("STRIX_MM_IU4_LAYERS", "iu4_layers"); fp::set(layers) && (legacy_i4 || !fp::set(format))) {
+        p.iu4_layers = strix::core::parse_layer_set(layers, kFirstIu4Layer, kMsaLayers, "STRIX_MM_IU4_LAYERS");
+        p.fast_i4 = p.iu4_layers.count() != 0;
+    } else if (legacy_i4) {
+        const char* keep = env("STRIX_MMX_FAST_I4_EXL3_LAYERS");
+        const auto exl3 = strix::core::parse_layer_set(fp::set(keep) ? keep : engine::fast_i4::kQualityExl3Layers,
+                                                     kFirstIu4Layer, kMsaLayers, "STRIX_MMX_FAST_I4_EXL3_LAYERS");
+        for (unsigned l = kFirstIu4Layer; l < kMsaLayers; ++l) if (!exl3.test(l)) p.iu4_layers.set(l);
+        p.fast_i4 = true;
+    }
     // The MSA flash member runs on the exact EXL3 MoE base only (its gate fails on FAST_I4); an explicit value still wins.
-    const bool i4 = fast_i4_format(env);
+    const bool i4 = p.fast_i4;
     // The bundle switch as the product profile selects it (fp::profile_switch): '--profile fast' expands the same
     // members, admission and canonical values as STRIX_MM_FAST_PREFILL=1; a set switch ("0" included) wins.
     p.bundle_column = profile_column_selects_bundle(env);
     p.bundle_from_profile = p.bundle_column && !fp::set(env(kFastBundle.env));
     if (p.bundle_from_profile && baseline(env))
-        throw std::invalid_argument(std::string("--profile fast selects the FAST bundle ") + kFastBundle.profile + "; " +
+        throw std::invalid_argument(std::string("--profile ") + env(kProductProfileEnv) + " selects the FAST bundle " + kFastBundle.profile + "; " +
                                     kBaselineEnv + "=1 (--baseline) is the exact baseline: drop one of the two");
     const fp::Getenv bundle_env = fp::profile_switch(kFastBundle, p.bundle_from_profile ? "1" : "", env);
     p.canonical = fp::expand(kFastBundle, bundle_env, [&](const fp::Member&) { return !i4; });
@@ -246,7 +272,7 @@ PrefillPolicy prefill_policy(const Lookup& env) {
     p.msa_flash = mode == "0" ? 0U : static_cast<unsigned>(mode[0] - '0');
     p.msa_flash_requested = p.msa_flash;
     p.msa_flash_asked = fp::set(raw) ? raw : it != p.canonical.end() ? "fast_prefill" : "default";
-    const char* layers = env("STRIX_MM_PF_MSA_FLASH_LAYERS");
+    const char* layers = setting("STRIX_MM_PF_MSA_FLASH_LAYERS", "msa_flash_layers");
     p.msa_flash_layers_requested = fp::set(layers) ? layers : kMsaFlashLayers;
     const auto mask = strix::core::parse_layer_set(p.msa_flash_layers_requested.c_str(), 0, kMsaLayers, "STRIX_MM_PF_MSA_FLASH_LAYERS");
     p.msa_flash_layers = fp::layer_ranges(kMsaLayers, [&](unsigned l) { return mask.test(l); });
@@ -271,7 +297,7 @@ PrefillPolicy prefill_policy(const Lookup& env) {
                          ? std::string(msa_flash_policy(p.msa_flash_layers))
                          : std::string("msa-flash-bf16") + (p.msa_flash == 2 ? "-2term" : p.msa_flash == 3 ? "-rg4" : "") + "-l" + p.msa_flash_layers;
     if (i4 && fp::switch_on(bundle_env(kFastBundle.env)) && !fp::set(raw))
-        p.note = std::string(flash.policy) + " not selected by " + (p.bundle_from_profile ? "--profile fast" : kFastBundle.env) +
+        p.note = std::string(flash.policy) + " not selected by " + (p.bundle_from_profile ? std::string("--profile ") + env(kProductProfileEnv) : std::string(kFastBundle.env)) +
                  " on STRIX_MMX_MODEL_FORMAT=fast_i4";
     // Index projections on the shared WMMA core (opt-in member, mm_profile_table.hpp kIdxWmmaPolicy).
     const char* iw = env("STRIX_MM_PF_IDX_WMMA");
@@ -336,7 +362,7 @@ strix::pair::PipelineChoice pair_pipeline_choice(std::uint64_t rows) {
 }
 
 const profile::Engine& profile_engine() {
-    static const profile::Engine engine{"minimax-pair", "", profile_table, false, "minimax-turbo-v1"};
+    static const profile::Engine engine{"minimax-pair", "", profile_table, false, "minimax-turbo-v1", {}, {}, ladder_rows};
     return engine;
 }
 
@@ -363,8 +389,17 @@ profile::Resolution profile_resolution(const Lookup& env) {
     const auto p = prefill_policy(env);
     const auto base = strix::fast_profile::lookup(p.canonical, env);
     const std::string effective_mode = std::to_string(p.msa_flash);
-    profile::Inputs in;
-    in.env = [&](const char* key) -> const char* {
+    const char* format = env("STRIX_MMX_MODEL_FORMAT");
+    const char* iu4 = env("STRIX_MM_IU4_LAYERS");
+    const std::string iu4_ranges = strix::fast_profile::layer_ranges(kMsaLayers, [&](unsigned l) { return p.iu4_layers.test(l); });
+    const auto settings = [&](const char* key) -> const char* {
+        if (std::strcmp(key, "STRIX_MMX_MODEL_FORMAT") == 0) {
+            if (p.fast_i4) return "fast_i4";
+            return strix::fast_profile::set(format) ? "exl3" : nullptr;
+        }
+        if (std::strcmp(key, "STRIX_MM_IU4_LAYERS") == 0)
+            return strix::fast_profile::set(iu4) ? iu4_ranges.c_str() : nullptr;
+        if (std::strcmp(key, "STRIX_MMX_FAST_I4_A8") == 0) return p.fast_i4 ? env(key) : nullptr;
         // The layer set is read only while the flash attention runs: an unused setting is not part of the identity.
         // Bundle members (msa_flash, router_wmma): where the product profile's column applies the bundle, a member
         // that does not run reads "0" (switch 0, member 0, fast_i4 admission, static guard), and a member the word
@@ -389,8 +424,7 @@ profile::Resolution profile_resolution(const Lookup& env) {
         return base(key);
     };
     // Product profile: '--profile NAME' of rank and serve, exported by print_or_apply() (one value for both apps).
-    if (const char* name = env(kProductProfileEnv); name != nullptr && *name != 0) in.profile = profile::parse(name);
-    return profile::resolve(profile_engine(), in);
+    return resolve_startup_profile(env, settings, true);
 }
 
 bool profile_column_selects_bundle(const Lookup& env) {
@@ -482,7 +516,11 @@ std::string prefill_identity(const Lookup& env) {
     if (p.exchange_fmt != strix::xport::ExchangeFormat::f32)
         out += std::string(out.empty() ? "" : ";") + "tp2_exchange_fmt=" + strix::xport::exchange_format_name(p.exchange_fmt);
     if (p.router_wmma) out += std::string(out.empty() ? "" : ";") + "prefill_router=mm-pf-router-wmma-v1-l" + p.router_wmma_layers;
-    if (fast_i4_format(env)) out += std::string(out.empty() ? "" : ";") + "moe_prefill_format=fast_i4";
+    if (p.fast_i4) {
+        out += std::string(out.empty() ? "" : ";") + "moe_prefill_format=fast_i4";
+        if (strix::fast_profile::set(env("STRIX_MM_IU4_LAYERS")))
+            out += ":layers=" + strix::fast_profile::layer_ranges(kMsaLayers, [&](unsigned l) { return p.iu4_layers.test(l); });
+    }
     // v2 adds the dense MLP tails (STRIX_MM_PF_DENSE_TAIL_FIXED=1), whose K chain differs from the library route.
     if (linear_order(env) == "invariant") out += std::string(out.empty() ? "" : ";") + "prefill_order=" + invariant_order_id(env);
     // TURBO: versioned name + effective levers + weight identity, even with every lever off (empty outside turbo).

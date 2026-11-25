@@ -6,6 +6,8 @@
 #include "strix/session/head_gate_cli.hpp"
 
 #include <iostream>
+#include <sstream>
+#include <string_view>
 #include <utility>
 
 #include <array>
@@ -268,6 +270,29 @@ void test_projected_bias_lever() {
     set(nullptr);
 }
 
+// The screened-head lever per tier through the CLI parse: the same table the server test pins
+// (tests/inkling2/mini_serve_test.cpp): opt-in, so unset and 0 the full head, 1 the screened head, anything else refused.
+void test_screened_head_lever() {
+    const auto set = [](const char* value) {
+#ifdef _WIN32
+        require(_putenv_s("STRIX_INK_SCREENED_HEAD", value ? value : "") == 0, "cannot set the lever");
+#else
+        require((value ? setenv("STRIX_INK_SCREENED_HEAD", value, 1) : unsetenv("STRIX_INK_SCREENED_HEAD")) == 0,
+                "cannot set the lever");
+#endif
+    };
+    for (const auto* tier : {"exact", "fast", "turbo"}) {
+        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
+            set(value);
+            require(strix::inkling2::mini_screened_head(parse({"1", "--profile", tier}).tier) == expected,
+                    "CLI screened-head lever differs from the server table");
+        }
+    }
+    set("yes");
+    expect_invalid([] { (void)parse({"1", "--profile", "fast"}); });
+    set(nullptr);
+}
+
 void test_options() {
     using strix::profile::Name;
     require(parse({"1"}).tier.profile == Name::standard, "expected exact default");
@@ -295,6 +320,10 @@ void test_options() {
     expect_invalid([] { (void)parse({"1", "--profile", "turbo", "--qualify-q8"}); });
     expect_invalid([] { (void)parse({"1", "--profile", "fast", "--no-weight-q8", "--qualify-q8"}); });
     expect_invalid([] { (void)parse({"--tokenize", "input.txt", "--profile", "fast", "--qualify-q8"}); });
+    require(parse({"1", "--profile", "turbo", "--qualify-weights", "weights.attention_head.q4_g64@1"}).weights.qualify ==
+                &strix::weight::kAttentionHeadQ4Policy, "expected low-bit TURBO qualification arm");
+    expect_invalid([] { (void)parse({"1", "--qualify-weights", "weights.attention_head.q4_g64@1"}); });
+    expect_invalid([] { (void)parse({"1", "--profile", "fast", "--qualify-weights", "weights.unknown@1"}); });
     require(parse({"1"}).generation.packed_decode, "expected packed default");
     require(!parse({"1", "--grouped-decode"}).generation.packed_decode, "expected grouped override");
     expect_invalid([] { (void)parse({"1", "--packed-decode", "--grouped-decode"}); });
@@ -396,14 +425,55 @@ void test_windows(const fs::path& directory) {
 
 }  // namespace
 
+// Review r63 P3 / r75 P3: the command line writes the weight regime receipt once (one emitter, write_weight_load_plan),
+// checked through the receipt writers the GPU command line itself calls (gate window receipt and run receipt).
+void test_weight_receipt_once() {
+    const auto count = [](const std::string& text, std::string_view key) {
+        std::size_t n = 0;
+        for (auto at = text.find(key); at != std::string::npos; at = text.find(key, at + key.size())) ++n;
+        return n;
+    };
+    namespace weight = strix::weight;
+    const auto& policy = weight::kAttentionQ4HeadQ6Policy;
+    weight::WeightLoadPlan plan{};
+    plan.policy = policy.id;
+    plan.storage = policy.target;
+    plan.head_storage = policy.head_target();
+    plan.turbo_quality = "fixture quality";
+    const auto check = [&](const std::string& text) {
+        constexpr std::string_view plan_and_quality =
+            "strix-weight-load/v1 weights.attention_q4_g64.head_q6_g64@1 strix.q4_g64@1 head strix.q6_g64@1\n"
+            "strix-weight-load-quality/v1 weights.attention_q4_g64.head_q6_g64@1 fixture quality\n"
+            "strix-weight-load-regimes/v1 ";
+        require(count(text, "strix-weight-load/v1 ") == 1U, "one weight plan record");
+        require(count(text, "strix-weight-load-quality/v1 ") == 1U, "one weight quality record");
+        require(count(text, "strix-weight-load-regimes/v1 ") == 1U, "one weight regime record");
+        require(text.find(plan_and_quality) != std::string::npos,
+                "weight plan with head storage, then quality, then regimes");
+    };
+    std::ostringstream gate;
+    cli::write_gate_receipt(gate, plan, "{\"version\":1}");
+    check(gate.str());
+    require(count(gate.str(), "strix-route-file/v1 ") == 1U, "gate receipt: one route record");
+#if defined(STRIX_INKLING2_APP_CLI_TEST)
+    for (const char* tier : {"exact", "fast", "turbo"}) {
+        std::ostringstream run;
+        cli::write_run_receipt(parse({"1", "--profile", tier}).tier, plan, run);
+        check(run.str());
+    }
+#endif
+}
+
 int main() {
     try {
         const TempDir directory;
+        test_weight_receipt_once();
 #if defined(STRIX_INKLING2_APP_CLI_TEST)
         test_options();
         test_projected_bias_lever();
+        test_screened_head_lever();
         test_native_w4a4_admission();
-    test_cuda_route_options();
+        test_cuda_route_options();
 #endif
         test_windows(directory.path);
     } catch (const std::exception& error) {

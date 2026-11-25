@@ -1316,10 +1316,9 @@ static int run_decode_entry(
         // the rank is required only when the pair pipe runs.
         pair_arguments = strix::pair::strip_flags(argc, argv, "STRIX_QWEN_PF_PIPE", strix::qwen_pp::pipe_enabled());
     }
-    auto options =
-        parse_options(
-            argc,
-            argv, true);
+    const auto* bound = strix::device::hip_bound();
+    auto options = parse_options(argc, argv, true, {}, strix::decode_cli::DecodeAssets::verify,
+                                 bound ? std::string_view(bound->visible.arch) : std::string_view{});
     QwenDeployment deployment;
     if (options.deployment_spec && options.deployment_spec->topology == "pipeline") {
         const char* r = std::getenv("STRIX_QWEN_PF_PIPE_RANK");
@@ -1710,9 +1709,17 @@ static int run_decode_entry(
         std::vector<std::uint32_t>{}.swap(yarn_mtp_request->options.tokens);
     }
     auto effective = strix::decode_cli::resolve_effective_config(
-        {options, requested_environment, !target_input_export}, model, info, manifest,
+        {options, requested_environment, !target_input_export, strix::qwen_pp::pipe_enabled()}, model, info, manifest,
         admitted_content, prompt_capabilities, prompt_memory);
     options = effective.options;
+    // Inspection leaves process switches alone. Execution binds pruning only
+    // after route admission, because memory planning can read its identity early.
+    if (!options.print_effective_config) {
+        strix::qwen::profile::withdraw_declined(options.product_profile);
+        strix::qwen::profile::apply(options.product_profile);
+        if (options.product_profile.find("moe_route_prune"))
+            (void)strix::moe_core::route_prune_active_tag(true);
+    }
     if (options.mtp.enabled) {
         const auto& mtp = options.mtp;
         std::cerr << "MTP runtime budget: requested=" << mtp.runtime_bytes
@@ -1760,12 +1767,6 @@ static int run_decode_entry(
             rr::lever("qwen.prefill_arithmetic", "auto", "fallback", rr::Reason::no_match, true, effective.arithmetic_fallback);
         if (!effective.tile_fallback.empty())
             rr::lever("qwen.prefill_tile", "auto", "fallback", rr::Reason::no_match, true, effective.tile_fallback);
-    }
-    // Export only after the resolved route has admitted the profile proposals.
-    // --print-effective-config always prints and exits: it must not write the process environment.
-    if (!options.print_effective_config) {
-        strix::qwen::profile::withdraw_declined(options.product_profile);
-        strix::qwen::profile::apply(options.product_profile);
     }
     for (const auto& notice : options.product_profile.notices()) std::cerr << notice << '\n';
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)

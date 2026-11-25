@@ -545,8 +545,9 @@ void CohortDecoder::step() {
         // 8192 + 16) carries two fixed costs and is not a sample
         const bool one_pass = config_.prompt_slice_decoding == 0U || l.prompt_read + prompt_rows <= l.chunk_end;
         const double t0 = now_ms();
-        backend_.prefill(plan.prompt.front().lane,
-                         std::span<const std::uint32_t>(l.request.prompt.data() + l.prompt_read, prompt_rows), l.prompt_read == 0);
+        backend_.prefill_scoped(plan.prompt.front().lane,
+                                std::span<const std::uint32_t>(l.request.prompt.data() + l.prompt_read, prompt_rows),
+                                l.prompt_read == 0, l.request.prompt.size());
         prompt_ms = now_ms() - t0;
         prompt_ms_ += prompt_ms;
         // The gap's row cost is learned from passes of at least the decoding floor only: a shorter pass (a lone short

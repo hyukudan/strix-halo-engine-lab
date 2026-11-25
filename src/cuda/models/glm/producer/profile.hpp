@@ -16,6 +16,8 @@
 // listed as pending; --allow-pending (STRIX_GLM_RTX_PROFILE_ALLOW_PENDING=1) runs a pending column whose implementation
 // is in this build, for benchmarks only, and stamps the receipt "unqualified: <rows>". GLM RTX has no --baseline switch,
 // so the DS baseline statuses do not occur here.
+#include "strix/engine_profile.hpp"
+
 #include <array>
 #include <functional>
 #include <span>
@@ -35,7 +37,7 @@ struct Option {
 
 struct Lever {
     std::string_view name;                  // receipt key
-    std::string_view env;                   // the lever's own environment switch (empty: none)
+    std::string_view env{};                 // the lever's own environment switch (empty: none)
     std::array<Option, 4> options{};        // CLI options that set the lever explicitly (unused entries empty)
     std::array<std::string_view, 3> value;  // per profile (default, fast, quality); empty: the profile leaves it alone
     std::string_view builtin;               // this build with no profile, option or variable
@@ -44,6 +46,7 @@ struct Lever {
     Kind kind = Kind::exact;
     unsigned apps = 0;                      // mask of App values the lever concerns
     std::string_view source;                // owner commit; for a pending column, what it waits for
+    strix::profile::Identities identity{}; // declared identity per value (strix::profile::Lever::identity)
 };
 [[nodiscard]] std::span<const Lever> levers();
 
@@ -56,6 +59,8 @@ struct Entry {
     std::string value;   // the value the resolution asks for ("on", "off", an option's argument, ...)
     Status status = Status::profile;
     std::string wanted;  // pending / unqualified: the profile's value
+    std::string ladder{};
+    std::string ladder_reference{};  // the reference its timing rows must name (LadderRow::over)
 };
 
 struct Resolution {
@@ -83,6 +88,8 @@ using Lookup = std::function<const char*(const char*)>;
 struct Inputs {
     std::vector<std::string> args;  // the service options (argv[1..])
     Lookup env;                     // environment lookup; empty: the process environment
+    strix::profile::Regime regime{};
+    std::span<const strix::profile::LadderRow> ladder{};
 };
 // --profile NAME (else STRIX_GLM_RTX_PROFILE, else default) and --allow-pending (or STRIX_GLM_RTX_PROFILE_ALLOW_PENDING=1)
 // out of the options; throws std::invalid_argument on a bad name or a missing value.

@@ -24,18 +24,25 @@ struct cudaGraphExecUpdateResultInfo {
 namespace cuda_status_stub {
 inline cudaError_t malloc_status = cudaSuccess;       // cudaMalloc (device memory)
 inline cudaError_t malloc_host_status = cudaSuccess;  // cudaMallocHost (pinned host memory)
+// Free device memory: a cudaMalloc larger than this is refused with cudaErrorMemoryAllocation (default: no limit).
+inline std::size_t malloc_free_bytes = static_cast<std::size_t>(-1);
 inline unsigned malloc_calls = 0, malloc_host_calls = 0;
+// The runtime's last-error slot: a failed call records its status, cudaGetLastError reads and resets it.
+inline cudaError_t last_error = cudaSuccess;
+inline cudaError_t fail(cudaError_t status) { return last_error = status; }
 }  // namespace cuda_status_stub
 
 inline cudaError_t cudaMalloc(void** pointer, std::size_t bytes) {
     ++cuda_status_stub::malloc_calls;
-    if (cuda_status_stub::malloc_status != cudaSuccess) return cuda_status_stub::malloc_status;
+    if (cuda_status_stub::malloc_status != cudaSuccess) return cuda_status_stub::fail(cuda_status_stub::malloc_status);
+    if (bytes > cuda_status_stub::malloc_free_bytes) return cuda_status_stub::fail(cudaErrorMemoryAllocation);
     *pointer = std::malloc(bytes);
     return cudaSuccess;
 }
 inline cudaError_t cudaMallocHost(void** pointer, std::size_t bytes) {
     ++cuda_status_stub::malloc_host_calls;
-    if (cuda_status_stub::malloc_host_status != cudaSuccess) return cuda_status_stub::malloc_host_status;
+    if (cuda_status_stub::malloc_host_status != cudaSuccess)
+        return cuda_status_stub::fail(cuda_status_stub::malloc_host_status);
     *pointer = std::malloc(bytes);
     return cudaSuccess;
 }
@@ -52,7 +59,11 @@ inline cudaError_t cudaGetDevice(int* device) {
     return cudaSuccess;
 }
 inline cudaError_t cudaSetDevice(int) { return cudaSuccess; }
-inline cudaError_t cudaGetLastError() { return cudaSuccess; }
+inline cudaError_t cudaGetLastError() {
+    const auto status = cuda_status_stub::last_error;
+    cuda_status_stub::last_error = cudaSuccess;
+    return status;
+}
 inline const char* cudaGetErrorString(cudaError_t error) {
     return error == cudaErrorMemoryAllocation ? "out of memory" : error == cudaSuccess ? "no error" : "invalid value";
 }

@@ -106,10 +106,10 @@ struct DownAdapter : RouteAdapter {
     template<bool = false> __device__ __forceinline__ void finish_rows(const Tile&, const float*, const unsigned*, int, int) const {}
 };
 bool fast_i4_down() {
-    const char* scope = std::getenv("STRIX_DS41_FAST_I4_SCOPE");
-    if (!scope || std::strcmp(scope, "all") == 0) return true;
-    if (std::strcmp(scope, "gu") == 0) return false;
-    throw std::invalid_argument("STRIX_DS41_FAST_I4_SCOPE must be all or gu");
+    const auto scope = fast_profile::moe_i4_scope();
+    if (scope == fast_profile::MoeI4Scope::invalid)
+        throw std::invalid_argument("STRIX_DS41_FAST_I4_SCOPE must be all or gu");
+    return scope == fast_profile::MoeI4Scope::all;
 }
 unsigned integer_prefill_band() {
     const char* v = std::getenv("STRIX_DS41_PREFILL_MOE_BAND");

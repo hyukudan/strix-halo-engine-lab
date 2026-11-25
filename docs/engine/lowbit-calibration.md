@@ -46,12 +46,36 @@ per token do not change; only the codes and scales do.
 2. Pack the matrices:
    `strix-lowbit-calib-pack --model MODEL.safetensors --moments fit.moments --eval eval.moments --heldout GATE_MANIFEST --storage SUBSTRING=q4|q6 ... --technique both --out PACK --report table.tsv`
    Add `--compare` to measure the other techniques and the other format for every matrix too.
-3. Load it with the low-bit weight policy (Inkling 2 Mini: `STRIX_LOWBIT_PACK=PACK`). The receipt line
-   `strix-lowbit-pack/v2` names the pack identity (SHA-256 over the header and every payload byte, so packs coded with
-   other statistics or settings differ) and how many matrices came from it. Without a pack it reads
-   `none (load-time round-to-nearest)`.
-4. A decision row that admits a calibrated mix names the pack identity it was measured with; the engine refuses
-   another pack for that row (its stated quality is that pack's).
+3. Qualify the pack with `STRIX_LOWBIT_PACK=PACK` and `--qualify-weights POLICY` on Inkling 2 Mini.
+   `--qualify-decode-weights POLICY` instead retains BF16 beside the compact copies and uses compact weights on the
+   selected decode widths. The `strix-lowbit-pack/v2` receipt gives the pack identity (SHA-256 of its header and
+   payloads) and the matrix count.
+4. A registered row requires its measured pack identity. The CLI and server account for the resident copies before
+   admitting the requested slots and verify the opened pack again after upload. A missing, stale or mismatched pack,
+   or insufficient slot capacity, produces a decline receipt and retries the incumbent BF16 load.
+
+## Inkling 2 Mini rows (gfx1151, HIP 7.1)
+
+Pack: technique `both`, damp 0.1, q4_g64 for the attention projections (q, k, v, o of every layer) and the head,
+statistics from 4,290 calibration rows (evaluation set 1,324 rows; the packer checked both against the gate's held-out
+windows: no shared 32-token run). The engine looks for it as `inkling2-mini-q4.lowbit-pack` next to the checkpoint (or
+`STRIX_LOWBIT_PACK`), identity `b0bd0103dcdd9ffd`. Offline relative output error on the evaluation rows: 0.362 of the
+load-time round-to-nearest pack of the same format (mean over the matrices).
+
+The historical TURBO row requires `STRIX_INK_LOWBIT_TURBO=1` with the engine's native `--profile turbo`.
+Configured context and lane capacity must be known and at most 16,384 tokens and 16 lanes. Compact weights run on
+decode widths 1, 8 and 16 using the measured FP16 tile arithmetic. Other widths, prefill and verify use the resident BF16 image. EXACT, FAST and TURBO
+with the lever unset use the incumbent weights. The final calibrated q4 head lacks a passing FAST receipt.
+
+| profile | mix | gate v2 vs BF16, decode (39 held-out windows, prose / code / structured, 8K-64K context, 2,457 rows) | served B=1 / C8 / C16 decode, 8K prefill (16 slots, context 16384) |
+|---|---|---|---|
+| EXACT, FAST | BF16 | bitwise | 23.36 / 53.76 / 66.74 tok/s, 14.15 s |
+| (FAST candidate) | head q4_g64, every other role BF16 | every class and the pooled bars pass (KL 0.0010, top-1 0.993, dNLL +0.0011, route flips 0), but two prose windows fail dNLL: not a FAST row | 23.96 / 64.55 / 81.52 tok/s, 14.15 s |
+| TURBO opt-in | attention and head q4_g64 | scored on the production route (BF16 prefill of the teacher prefix, q4 decode steps): KL 0.0033, top-1 0.980, dNLL +0.0027, route flips 0.00x the null, every window inside the TURBO window bar; a TURBO row (its q4 head fails the FAST bar on two prose windows) | 27.03 / 68.48 / 86.60 tok/s, 14.38 s |
+
+TURBO prints its quality in the `weight_status` receipt line (`turbo_quality ...`).
 
 Quality is measured with the gate (`tools/strix-gate/gate_v2.py` through the engine's gate kit) on the loaded pack,
-never inferred from the offline table.
+never inferred from the offline table. `STRIX_INKLING_GATE_ROUTE=decode-arm` scores the two-image route via
+`--qualify-decode-weights`, including when collecting evidence for a new receipt. Use `=row` to score the admitted
+TURBO row within its caps, or `=arm` to score one compact image for the entire run.

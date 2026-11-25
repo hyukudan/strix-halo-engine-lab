@@ -117,14 +117,15 @@ void test_glm_exports_and_precedence() {
     CHECK(rd::print(rd::resolve(timing, lookup(absent))) == rd::print(plain));
 }
 
+Env exports(const rd::Effective& e) {
+    Env result;
+    rd::apply_env(e, [&](const char* key, const char* value) { result[key] = value; });
+    return result;
+}
+
 void test_glm_product_profiles() {
     const Env absent;
     const auto empty = lookup(absent);
-    const auto exports = [&](const rd::Effective& e) {
-        Env result;
-        rd::apply_env(e, [&](const char* key, const char* value) { result[key] = value; });
-        return result;
-    };
     const auto plain = rd::resolve(rd::scan({"--decode", "64"}), empty);
     CHECK(!plain.product);
     const auto normal_exports = exports(plain);
@@ -144,6 +145,20 @@ void test_glm_product_profiles() {
     CHECK(fast.product->qualification() == "qualified");
     CHECK(rd::print(fast).find("profile lever pf_wmma 1") == std::string::npos);
     CHECK(rd::print(fast) == rd::print(plain) + fast.product->describe());
+    const auto turbo = rd::resolve(rd::scan({"--profile", "turbo", "--allow-pending", "--decode", "64"}), empty);
+    // The independent TURBO candidates stay at their builtin without a timing row.
+    CHECK(turbo.product && turbo.product->find("pf_wmma")->value == "1");
+    const auto* stored = turbo.product->find("stored_i4");
+    CHECK(stored && stored->value == "exl3" && stored->lever->runnable[3]);
+    for (const char* lever : {"idxproj_wmma", "router_wmma"})
+        CHECK(turbo.product->find(lever) && turbo.product->find(lever)->value == "0");
+    CHECK(turbo.product->find("idx_scores") && turbo.product->find("idx_scores")->value == "exact");
+    CHECK(exports(turbo).count("STRIX_GLM_MODEL_FORMAT") == 0);
+    CHECK(exports(turbo).count("STRIX_IDX_WMMA") == 0);
+    const Env explicit_i4{{"STRIX_GLM_MODEL_FORMAT", "fast_i4"}, {"STRIX_GLM_PF_WMMA", "1"}};
+    const auto i4 = rd::resolve(rd::scan({"--profile", "turbo"}), lookup(explicit_i4));
+    CHECK(i4.product->find("stored_i4") && i4.product->find("stored_i4")->value == "fast_i4");
+    CHECK(i4.product->find("pf_wmma")->value == "1");
     for (const char* value : {"0", "1", "", "1tail"}) {
         const Env env{{"STRIX_GLM_PF_WMMA", value}};
         const auto e = rd::resolve(rd::scan({"--profile=fast", "--decode", "64"}), lookup(env));
@@ -175,6 +190,72 @@ void test_glm_product_profiles() {
     }
 }
 
+void test_glm_inherited_wmma() {
+    using profile::Status;
+    const auto turbo = rd::scan({"--profile", "turbo", "--allow-pending"});
+    auto baseline = turbo;
+    baseline.baseline_flag = true;
+    struct Case {
+        const rd::Request& request;
+        const char* umbrella;
+        bool on;
+    };
+    for (const Case& arm : {Case{turbo, nullptr, true}, Case{baseline, nullptr, false},
+                            Case{turbo, "0", false}, Case{turbo, "1", true}, Case{baseline, "1", true},
+                            Case{turbo, "", false}, Case{turbo, "1tail", false}}) {
+        for (const char* value : {static_cast<const char*>(nullptr), "", "0", "1"}) {
+            Env env;
+            if (arm.umbrella) env["STRIX_GLM_PF_WMMA"] = arm.umbrella;
+            if (value) {
+                for (const char* key : {"STRIX_GLM_PF_MLA_WMMA", "STRIX_GLM_PF_KDA_WMMA", "STRIX_GLM_PF_ATTN_WMMA"})
+                    env[key] = value;
+            }
+            const bool inherited = value == nullptr || *value == '\0';
+            const std::string expected = (inherited ? arm.on : *value == '1') ? "1" : "0";
+            const auto effective = rd::resolve(arm.request, lookup(env));
+            const auto exported = exports(effective);
+            const auto printed = rd::print(effective);
+            if (arm.request.baseline_flag) CHECK(printed.find("strix-ladder/v1 pf_wmma ") == std::string::npos);
+            for (const char* key : {"mla_wmma", "kda_wmma", "attn_wmma"}) {
+                const auto* entry = effective.product->find(key);
+                CHECK(entry && entry->value == expected);
+                CHECK(printed.find(std::string("profile lever ") + key + " " + expected + " (") != std::string::npos);
+                if (entry) {
+                    CHECK(!exported.contains(std::string(entry->lever->env)));
+                    if (!inherited) CHECK(entry->status == (expected == "1" ? Status::explicit_env : Status::off));
+                    if (inherited && arm.on) {
+                        CHECK(entry->ladder.empty() && !entry->ladder_lowered);
+                        CHECK(entry->reason == "inherits pf_wmma");
+                    }
+                }
+            }
+        }
+        Env legacy{{"STRIX_GLM_PF_MLA_WMMA", "off"}};
+        if (arm.umbrella) legacy["STRIX_GLM_PF_WMMA"] = arm.umbrella;
+        const auto effective = rd::resolve(arm.request, lookup(legacy));
+        const auto* mla = effective.product->find("mla_wmma");
+        CHECK(mla && mla->value == (arm.on ? "1" : "0"));
+        CHECK(mla && mla->status == (arm.on ? Status::explicit_env : Status::off));
+    }
+}
+
+void test_glm_exact_index_score_routes() {
+    const auto fast = rd::scan({"--profile", "fast"});
+    for (const char* setting : {static_cast<const char*>(nullptr), "", "exact", "0", "f16"}) {
+        Env env;
+        if (setting) env["STRIX_IDX_WMMA"] = setting;
+        const std::string expected = (setting && *setting) ? setting : "exact";
+        const auto effective = rd::resolve(fast, lookup(env));
+        const auto* entry = effective.product->find("idx_scores");
+        CHECK(entry && entry->value == expected);
+        CHECK(rd::print(effective).find("profile lever idx_scores " + expected + " (") != std::string::npos);
+        const bool exact = expected != "f16";
+        CHECK((effective.product->tier_notice().find("runs the exact column") != std::string::npos) == exact);
+        CHECK((effective.product->qualification() == "qualified") == exact);
+        CHECK(!exports(effective).contains("STRIX_IDX_WMMA"));
+    }
+}
+
 void test_common_profile_admission() {
     // Synthetic levers, never applied to the GLM process environment or rank CLI.
     const auto levers = [] {
@@ -189,6 +270,7 @@ void test_common_profile_admission() {
             row.value = {"0", "1", ""};
             row.kind = profile::Kind::bit_changing;
             row.target = "candidate";
+            row.identity = {{{"0", "v1"}, {"1", "v1"}}};
             rows.push_back(row);
         }
         rows[0].ready[1] = true;
@@ -198,10 +280,29 @@ void test_common_profile_admission() {
         rows[4].provisional[1] = true;
         return rows;
     }();
-    const profile::Engine engine{"glm-host-test", "ALLOW_PENDING", levers};
+    // Each row names its reference (every lever in table order: earlier cells at FAST, later ones at their incumbent
+    // FAST value). Both timed cells are timed over the default FAST execution and over the --allow-pending one, where
+    // the benchmark cells pending and provisional run.
+    constexpr std::array timing{
+        profile::LadderRow{"qualified", "1", profile::Name::fast, profile::Phase::prefill, "fixture",
+                           1, 4096, 1, 1, 1.10, 0.02, "fixture/qualified", false, {}, {},
+                           "ladder-arm/v4;fixture-exec;qualified=0{v1},pending=0{v1},unavailable=0{v1},provisional=0{v1},provisional-unavailable=0{v1};candidate=qualified=1{v1};tier=fast"},
+        profile::LadderRow{"provisional", "1", profile::Name::fast, profile::Phase::prefill, "fixture",
+                           1, 4096, 1, 1, 1.10, 0.02, "fixture/provisional", false, {}, {},
+                           "ladder-arm/v4;fixture-exec;qualified=1{v1},pending=0{v1},unavailable=0{v1},provisional=0{v1},provisional-unavailable=0{v1};candidate=provisional=1{v1};tier=fast"},
+        profile::LadderRow{"provisional", "1", profile::Name::fast, profile::Phase::prefill, "fixture",
+                           1, 4096, 1, 1, 1.10, 0.02, "fixture/provisional-with-pending", false, {}, {},
+                           "ladder-arm/v4;fixture-exec;qualified=1{v1},pending=1{v1},unavailable=0{v1},provisional=0{v1},provisional-unavailable=0{v1};candidate=provisional=1{v1};tier=fast"},
+        // Under --allow-pending the later benchmark cells (pending, provisional) run, so the earlier cell extends that
+        // execution and needs its own row there.
+        profile::LadderRow{"qualified", "1", profile::Name::fast, profile::Phase::prefill, "fixture",
+                           1, 4096, 1, 1, 1.10, 0.02, "fixture/qualified-with-pending", false, {}, {},
+                           "ladder-arm/v4;fixture-exec;qualified=0{v1},pending=1{v1},unavailable=0{v1},provisional=1{v1},provisional-unavailable=0{v1};candidate=qualified=1{v1};tier=fast"}};
+    const profile::Engine engine{"glm-host-test", "ALLOW_PENDING", levers, false, {}, {}, {}, timing};
     const Env absent;
     profile::Inputs input;
     input.env = lookup(absent);
+    input.regime = {profile::Phase::prefill, 8, 1, "fixture"};
     const auto standard = profile::resolve(engine, input);
     CHECK(standard.profile == profile::Name::standard);
     CHECK(standard.qualification() == "qualified");
@@ -213,6 +314,10 @@ void test_common_profile_admission() {
         CHECK(entry.value == "0" && entry.status == profile::Status::builtin);
     }
     input.profile = profile::Name::fast;
+    const auto unmeasured = profile::resolve(engine, input);
+    CHECK(unmeasured.find("qualified")->status == profile::Status::pending);
+    CHECK(unmeasured.find("provisional")->status == profile::Status::pending);
+    input.regime = {profile::Phase::prefill, 4096, 1, "fixture", "fixture-exec"};
     auto fast = profile::resolve(engine, input);
     CHECK(fast.find("qualified")->status == profile::Status::set);
     CHECK(fast.find("pending")->status == profile::Status::pending);
@@ -232,6 +337,7 @@ void test_common_profile_admission() {
         CHECK(allowed.allow_pending);
         CHECK(allowed.find("pending")->value == "1");
         CHECK(allowed.find("pending")->status == profile::Status::unqualified);
+        CHECK(allowed.find("pending")->ladder.find("unqualified benchmark opt-in") != std::string::npos);
         CHECK(allowed.find("unavailable")->status == profile::Status::pending);
         CHECK(allowed.find("provisional")->status == profile::Status::provisional);
         CHECK(allowed.find("provisional-unavailable")->status == profile::Status::pending);
@@ -407,6 +513,8 @@ int main() {
     test_glm_exports_and_precedence();
     test_common_profile_admission();
     test_glm_product_profiles();
+    test_glm_inherited_wmma();
+    test_glm_exact_index_score_routes();
     test_partial_receipt();
     std::printf("glm defaults common cpu tests: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

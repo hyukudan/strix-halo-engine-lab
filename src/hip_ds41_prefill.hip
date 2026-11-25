@@ -742,8 +742,8 @@ bool fast_moe_f16() {
 int fast_i4_mode = -1;
 void set_fast_i4(int mode) { fast_i4_mode = mode; }
 bool fast_i4() {
-    const char* e = std::getenv("STRIX_DS41_FAST_I4");
-    return fast_i4_mode < 0 ? (e && std::strcmp(e, "1") == 0) : fast_i4_mode != 0;
+    if (const auto* p = active_prefill_precision(); p && p->fast_i4 >= 0) return p->fast_i4 != 0;
+    return fast_i4_mode < 0 ? fast_profile::moe_i4_on() : fast_i4_mode != 0;
 }
 // STRIX_DS41_PF_CORE (resolved once per run, at the first product) or set_pf_core (harness override, may change between
 // calls): which prefill products run on the shared tiled core (src/core) instead of the kernels of this file. 0 = none,

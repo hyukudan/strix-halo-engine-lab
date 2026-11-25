@@ -166,6 +166,7 @@ Options parse(int argc, char** argv) {
     Options o;
     if (const char* v = std::getenv("STRIX_QRTX_PREFIX_CACHE")) o.prefix.enabled = v[0] != '0';
     qo::Request request;  // common engine + profile options; serve differences are named in resolve()
+    request.inputs.regime = strix::profile::startup_prefill_regime();  // no request length or admitted device yet
     if (const char* v = std::getenv("STRIX_QRTX_HTTP_SLOTS")) o.http_slots = static_cast<std::uint32_t>(std::stoul(v));
     if (const char* v = std::getenv("STRIX_QRTX_SLOT_MARGIN_MIB")) o.slot_margin_mib = static_cast<std::uint32_t>(std::stoul(v));
     strix::residency::CliOptions residency_cli;

@@ -81,8 +81,10 @@ bool fast_cell_live(const p::Lever& l) {
 }
 
 // extra_fast: the engine's fast profile also selects a FAST bundle outside these rows (checked by the caller).
-void check_table(std::string_view tag, std::span<const p::Lever> rows, bool extra_fast = false) {
-    const p::Engine engine{tag, "", rows};
+// `ladder`: the engine's ladder rows (incumbent grants keep the cells that ran before the ladder rule).
+void check_table(std::string_view tag, std::span<const p::Lever> rows, bool extra_fast = false,
+                 std::span<const p::LadderRow> ladder = {}) {
+    const p::Engine engine{tag, "", rows, false, {}, {}, {}, ladder};
     const auto exact = run(engine, p::Name::standard);
     const auto fast = run(engine, p::Name::fast);
     bool any = extra_fast;
@@ -111,12 +113,13 @@ void check_table(std::string_view tag, std::span<const p::Lever> rows, bool extr
 
 // A FAST bundle qualified for the word: each member is a qualified fast cell carrying the member's value, and the
 // resolved fast set applies it. A bundle without profile_receipt is a switch only (nothing to check here).
-void check_bundle(std::string_view tag, std::span<const p::Lever> rows, const strix::fast_profile::Bundle& bundle) {
+void check_bundle(std::string_view tag, std::span<const p::Lever> rows, const strix::fast_profile::Bundle& bundle,
+                  std::span<const p::LadderRow> ladder = {}) {
     if (bundle.profile_receipt == nullptr) {
         if (!fixture) std::printf("%-22s bundle %s: switch only (no profile receipt)\n", std::string(tag).c_str(), bundle.profile);
         return;
     }
-    const p::Engine engine{tag, "", rows};
+    const p::Engine engine{tag, "", rows, false, {}, {}, {}, ladder};
     const auto fast = run(engine, p::Name::fast);
     for (const auto& m : bundle.members) {
         const std::string where = std::string(tag) + "/" + bundle.profile + "/" + m.env;
@@ -346,16 +349,20 @@ void qwen_hip_regimes() {
 int main() {
     tier_words();
     negative_fixtures();
-    check_table("deepseek41-pair", strix::deepseek41::pair_defaults::profile_table);
-    check_bundle("deepseek41-pair", strix::deepseek41::pair_defaults::profile_table, strix::ds41::fast_profile::kBundle);
-    check_table("glm-pair", strix::glm::rank_defaults::product_profile_table);
+    check_table("deepseek41-pair", strix::deepseek41::pair_defaults::profile_table, false,
+                strix::deepseek41::pair_defaults::ladder_rows);
+    check_bundle("deepseek41-pair", strix::deepseek41::pair_defaults::profile_table, strix::ds41::fast_profile::kBundle,
+                 strix::deepseek41::pair_defaults::ladder_rows);
+    check_table("glm-pair", strix::glm::rank_defaults::product_profile_table, false,
+                strix::glm::rank_defaults::product_ladder_rows);
     check_table("deepseek41-rtx", strix::ds41::rtx::profile::shared_rows());
     minimax_bundle();
-    check_table("minimax-pair", strix::minimax::defaults::profile_table);
-    check_bundle("minimax-pair", strix::minimax::defaults::profile_table, strix::minimax::defaults::kFastBundle);
-    check_table("qwen-hip", strix::qwen::profile::table);
-    check_table("qwen-cuda", strix::qwen::cuda_profile::table);
-    check_table("qwen35-hip-dense", strix::qwen35::hip_profile::table);
+    check_table("minimax-pair", strix::minimax::defaults::profile_table, false, strix::minimax::defaults::ladder_rows);
+    check_bundle("minimax-pair", strix::minimax::defaults::profile_table, strix::minimax::defaults::kFastBundle,
+                 strix::minimax::defaults::ladder_rows);
+    check_table("qwen-hip", strix::qwen::profile::table, false, strix::qwen::profile::ladder_rows);
+    check_table("qwen-cuda", strix::qwen::cuda_profile::table, false, strix::qwen::cuda_profile::ladder_rows);
+    check_table("qwen35-hip-dense", strix::qwen35::hip_profile::table, false, strix::qwen35::hip_profile::kLadderRows);
     qwen_dense_regimes();
     regime_gate_rows();
     qwen_hip_regimes();

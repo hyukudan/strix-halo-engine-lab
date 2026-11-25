@@ -13,7 +13,8 @@ switches. How the tables are read and what "exact" covers: [methodology](../../m
 
 ## Profiles
 
-One switch selects everything: `--profile default|fast|quality` (default: `default`). An explicit option or
+One switch selects everything: `--profile default|fast|quality|turbo` (default: `default`; `turbo` runs the fast
+cells until a higher cell has a measured regime). An explicit option or
 environment variable always wins over the profile. Every receipt records the profile, each lever's value and source,
 and any pending row. A pending (not yet qualified) row is never applied: the profile runs every ready row, the pending
 row keeps the exact behaviour, the receipt lists it with its declared target, and one stderr line says so. A profile

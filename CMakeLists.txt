@@ -1639,6 +1639,7 @@ add_library(strix_serve STATIC
     src/serve/hy4_chat.cpp
     src/serve/inkling2_chat.cpp
     src/serve/serial_generation_cli.cpp
+    src/serve/file_key.cpp
     src/serve/http_server.cpp
     src/serve/engine.cpp
     src/serve/api.cpp
@@ -2664,6 +2665,15 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-profile-fast-set-tests)
     add_test(NAME strix-profile-fast-set-tests COMMAND strix-profile-fast-set-tests)
     set_tests_properties(strix-profile-fast-set-tests PROPERTIES LABELS "cpu;profile" TIMEOUT 60)
+    # Ladder rule over every engine table: no regime resolves to a cell not measured faster than the cell below it.
+    add_executable(strix-profile-ladder-tests tests/profile_ladder_tests.cpp src/minimax/engine/mm_defaults.cpp
+        src/ds41_rtx_profile.cpp src/gemma4/engine/profile.cpp src/cuda/models/glm/producer/profile.cpp)
+    target_link_libraries(strix-profile-ladder-tests PRIVATE strix_core strix_serve_json strix-weight strix_model_registry)
+    target_include_directories(strix-profile-ladder-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    strix_target_warnings(strix-profile-ladder-tests)
+    add_test(NAME strix-profile-ladder-tests COMMAND strix-profile-ladder-tests "${CMAKE_CURRENT_SOURCE_DIR}/models/registry.toml"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/profile_selections.txt")
+    set_tests_properties(strix-profile-ladder-tests PROPERTIES LABELS "cpu;profile" TIMEOUT 60)
 
     # FAST gate v2, engine side: shared MoE route record / replay / one-ulp null tap.
     add_executable(strix-moe-route-file-tests tests/moe_route_file_tests.cpp)
@@ -3899,7 +3909,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_link_libraries(strix_tiled_core PUBLIC "${STRIX_HIP_RUNTIME_LIBRARY}")
 
     add_executable(strix-inkling2-mini-hip apps/inkling2_mini_hip.hip)
-    target_link_libraries(strix-inkling2-mini-hip PRIVATE strix_tiled_core strix_hip_runtime strix_inkling2_mini_checkpoint strix_core strix_serve)
+    target_link_libraries(strix-inkling2-mini-hip PRIVATE strix_tiled_core strix_hip_runtime strix_inkling2_mini_checkpoint strix_core strix_serve strix_device_hip)  # a low-bit load binds its declared device
     strix_target_warnings(strix-inkling2-mini-hip)
     target_compile_options(strix-inkling2-mini-hip PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math
         -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)

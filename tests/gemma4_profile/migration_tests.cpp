@@ -22,7 +22,7 @@ pr::Lookup lookup(std::map<std::string, std::string> values = {}) {
 void rows() {
     for (const auto& row : pr::levers()) {
         const auto table = std::span(&row, 1);
-        for (const auto p : {pr::Name::standard, pr::Name::fast, pr::Name::quality}) {
+        for (const auto p : {pr::Name::standard, pr::Name::fast, pr::Name::quality, pr::Name::turbo}) {
             for (const auto app : {pr::App::engine, pr::App::decode_bench, pr::App::prefill_bench}) {
                 const auto label = std::string(row.name) + "/" + pr::name(p) + "/" + pr::app_name(app);
                 const bool applies = (row.apps & unsigned(app)) != 0;
@@ -85,7 +85,7 @@ void admission() {
                               .runnable = {runnable, runnable, runnable}, .apps = 1};
                 pr::Inputs inputs; inputs.env = lookup(); inputs.allow_pending = allow;
                 const auto admitted = common::admit_column(ready, runnable, allow);
-                for (const auto p : {pr::Name::standard, pr::Name::fast, pr::Name::quality}) {
+                for (const auto p : {pr::Name::standard, pr::Name::fast, pr::Name::quality, pr::Name::turbo}) {
                     auto r = pr::resolve(p, pr::App::engine, inputs, std::span(&row, 1));
                     const auto expected = ready ? pr::Status::set : allow && runnable ? pr::Status::unqualified : pr::Status::pending;
                     check(r.entries[0].status == expected, "adapter admission");

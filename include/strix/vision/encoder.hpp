@@ -128,11 +128,15 @@ float activate(Activation, float);
 // Merged row (my, mx) of the ratio x ratio cell has feature c * ratio^2 + slot, slot = row_major ? dy * ratio + dx :
 // dx * ratio + dy; cells past the grid edge are zeros. rows[t][w2.rows] = linear2(act(linear1(merged))) for the
 // t = my * ceil(grid_w / ratio) + mx merged rows.
+// Packed cells already store a complete cell in projector input order and skip the unshuffle.
 struct MergeProjector {
+    enum class Layout { raster, packed_cells };
     unsigned ratio = 1;
     bool row_major = true;
     Activation act = Activation::gelu;
     Tensor w1, b1, w2, b2;
+    Layout layout = Layout::raster;
+    unsigned row_offset = 0;  // number of leading non-image rows
     unsigned tokens(unsigned grid_h, unsigned grid_w) const;  // throws on empty or unrepresentable geometry
 };
 
@@ -156,7 +160,9 @@ class EncoderBackend : public DenseOps {
 public:
     virtual EncoderOutput encode(const PatchGrid&, const PositionInputs&) = 0;
     // encode() for a merge_project() of this backend that follows at once: a device backend may keep the hidden rows
-    // on the device (EncoderOutput::device_epoch). Default: encode().
+    // on the device (EncoderOutput::device_epoch). Default: encode(). A resident output feeds only the backend's
+    // row-major merge projector; the packed-cell layout (MergeProjector::Layout::packed_cells) takes host rows from
+    // encode() and refuses a resident output.
     virtual EncoderOutput encode_for_projection(const PatchGrid& g, const PositionInputs& p) { return encode(g, p); }
     // Start-time hook: hold the workspace of `rows` rows in `tiles` attention tiles from now on. Host: nothing.
     virtual void reserve(unsigned rows, unsigned tiles) {

@@ -309,10 +309,33 @@ void drain_tests() {
     auto one = lanes(1, 1, 6, 10);
     check(plan_rows(one, c8, drain).rows == plan_rows(one, c8, open).rows, "drain: a single lane plans as open");
 }
+// A resident plane that only speeds an exact path stays only when it costs no KV slot.
+void plane_slot_tests() {
+    // Without a plane: 300 free of 1000 -> 3 slots of 100 bytes.
+    check(resident_kv_slots(300, 1000, 0, 0, 100, 5) == 3, "plane: incumbent budget");
+    const auto none = resident_kv_slots_with_plane(300, 1000, 0, 0, 100, 5, 0);
+    check(none.slots == 3 && !none.keep_plane, "plane: no plane is the incumbent budget");
+    const auto cheap = resident_kv_slots_with_plane(300, 1000, 0, 0, 100, 5, 10);  // without it 310 free: 3 slots
+    check(cheap.slots == 3 && cheap.keep_plane, "plane: a plane that costs no slot stays");
+    const auto costly = resident_kv_slots_with_plane(300, 1000, 0, 0, 100, 5, 50);  // without it 350 free: 4 slots
+    check(costly.slots == 4 && !costly.keep_plane, "plane: a plane that costs a slot is released");
+    check(costly.slots == resident_kv_slots(350, 1000, 0, 0, 100, 5), "plane: released count is the full budget");
+    const auto declared = resident_kv_slots_with_plane(300, 1000, 800, 0, 100, 5, 100);  // declared cap: 1 -> 2
+    check(declared.slots == 2 && !declared.keep_plane, "plane: a declared device budget counts the plane too");
+    const auto capped = resident_kv_slots_with_plane(300, 1000, 0, 200, 100, 5, 50);  // KV cap 2 slots either way
+    check(capped.slots == 2 && capped.keep_plane, "plane: an explicit KV cap the plane does not lower keeps it");
+    const auto rows = resident_kv_slots_with_plane(300, 1000, 0, 0, 100, 3, 50);  // 3 rows either way
+    check(rows.slots == 3 && rows.keep_plane, "plane: a row cap the plane does not lower keeps it");
+    // A plane larger than the used bytes never frees more than they hold.
+    const auto oversized = resident_kv_slots_with_plane(900, 1000, 0, 0, 10, 1000, 5000);
+    check(oversized.slots == resident_kv_slots(900, 1000, 0, 0, 10, 1000) && oversized.keep_plane,
+          "plane: released bytes are capped by the used bytes");
+}
 }  // namespace
 
 int main() {
     cost_model_tests(); monotone_tests(); limit_tests(); table_tests(); starvation_tests(); snap_tests(); drain_tests();
+    plane_slot_tests();
     std::cout << "row budget failures: " << failures << '\n';
     return failures ? 1 : 0;
 }

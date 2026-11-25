@@ -292,6 +292,7 @@ int main(int argc, char** argv) {
             for (const auto& entry : prompts)
                 regime.uniform_prompt_length &= entry.second.size() == first_prompt_size;
         }
+        // Multiple arms and variable verify widths do not describe one complete joint timing workload.
         const auto resolved = qp::resolve(profile, regime, lever_cli);
         if (const auto* draft = resolved->find("drafter_window"); draft &&
             draft->status != strix::profile::Status::builtin && draft->status != strix::profile::Status::pending)

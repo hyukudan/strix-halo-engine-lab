@@ -8,6 +8,7 @@
 #include <ostream>
 #include <span>
 #include <stdexcept>
+#include <string>
 
 namespace strix::session {
 
@@ -21,20 +22,22 @@ inline void write_load_timing(std::ostream& output, CliClock::time_point start) 
     output << "timing load_ms " << cli_milliseconds(CliClock::now() - start) << '\n';
 }
 
-inline void write_logits(const std::filesystem::path& path, std::span<const float> logits) {
+// The --logits file format: the row's float32 values, little-endian.
+inline std::string logits_bytes(std::span<const float> logits) {
     static_assert(sizeof(float) == sizeof(std::uint32_t));
+    std::string bytes(logits.size_bytes(), '\0');
+    for (std::size_t i = 0; i < logits.size(); ++i) {
+        const auto bits = std::bit_cast<std::uint32_t>(logits[i]);
+        for (unsigned b = 0; b < 4; ++b) bytes[4U * i + b] = static_cast<char>(bits >> (8U * b));
+    }
+    return bytes;
+}
+
+inline void write_logits(const std::filesystem::path& path, std::span<const float> logits) {
+    const auto bytes = logits_bytes(logits);
     std::ofstream output(path, std::ios::binary);
     if (!output) throw std::runtime_error("could not open logits output");
-    if constexpr (std::endian::native == std::endian::little) {
-        output.write(reinterpret_cast<const char*>(logits.data()), static_cast<std::streamsize>(logits.size_bytes()));
-    } else {
-        for (float value : logits) {
-            const auto bits = std::bit_cast<std::uint32_t>(value);
-            unsigned char encoded[4];
-            for (unsigned i = 0; i < 4; ++i) encoded[i] = static_cast<unsigned char>(bits >> (8U * i));
-            output.write(reinterpret_cast<const char*>(encoded), sizeof(encoded));
-        }
-    }
+    output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     output.close();
     if (!output) throw std::runtime_error("could not write logits output");
 }

@@ -49,10 +49,12 @@ identity names every applied lever.
 | `--decode-attn8 on` | pending on both CLIs (no qualified regime yet: gate at 8K / 28K / 64K not run). Decode / verify attention on e4m3 tensor cores over the e4m3 K/V shadow, identity `-d8`; verify rows give the same bits as one-row decode; on the spec CLI it also covers the prefill windows. Explicit `--decode-attn8 on` runs it in any regime | `--decode-attn8 off` |
 
 The spec CLI prefills through decode windows, so only `split_k` and `decode_attn8` are offered there.
-GLM rank accepts `--profile default|fast|quality` (also `--profile=NAME`); its bare `--profile` still enables kernel timing
-and can be combined with a named profile. GLM `fast` sets only `STRIX_GLM_PF_WMMA=1`; an explicit environment
-value wins, and `--baseline` / `STRIX_GLM_BASELINE=1` vetoes the profile addition. `quality` uses default settings
-with a notice. Both ranks must agree on the effective WMMA setting; existing startup guards still apply.
+GLM rank accepts `--profile exact|fast|quality|turbo` (also `--profile=NAME` and `default` as an alias for `exact`).
+Bare `--profile` still enables kernel timing and can be combined with a named profile. GLM `fast` selects no prefill
+lever. `turbo` selects the incumbent `STRIX_GLM_PF_WMMA=1`, which also enables MLA, KDA and fused attention WMMA
+when their own switches are unset or empty. Explicit settings win, and `--baseline` / `STRIX_GLM_BASELINE=1` vetoes
+the profile addition. `quality` uses default settings with a notice. Both ranks must agree on the effective WMMA
+settings. The existing startup guards still apply.
 
 See the [Qwen profiles](optimizations.md#qwen-product-profiles),
 [DeepSeek pair profiles](optimizations.md#product-profiles-pair) and [GLM FAST row](optimizations.md#glm-pf-wmma-x).
@@ -72,7 +74,7 @@ FAST changes the numerics. Use it when throughput matters more than bit-identica
 | `STRIX_DS41_FAST_SHARED=1` | deepseek | off | Opt-in, explicit (not a member of `STRIX_DS41_FAST_PREFILL`). Policy `ds41-shared-f16-v1`: the prefill shared expert's gate, up and down (Q8_0 x A8) on the FAST dense core (`dense-q8a8-f16-v1`, FP16 WMMA) with the exact `swiglu_a8` epilogue between them, as the CUDA FAST shared expert. Calls under `STRIX_DS41_FAST_DENSE_MIN_ROWS` keep the exact kernels. Changes logits (FAST gate). |
 | `STRIX_DS41_FAST_MOE_F16=1` | deepseek | off | Opt-in, explicit, acts with `STRIX_DS41_FAST_MOE` (relaxed routed experts). Policy `ds41-moe-f16wmma-v1`: the relaxed kernels in their FP16-operand form (A8 rows times an exact per-row power of two and decoded weights each rounded once to FP16, `v_wmma_f32_16x16x16_f16`, FP32 accumulation over the whole K, no per-group epilogue). Changes logits (FAST gate). |
 | `STRIX_F16_Q8A8_WPACK=0` | shared (DeepSeek binds it) | on | Weight decode of policy `dense-q8a8-f16-v1`: on = two Q8_0 weights per packed FP16 operation (perm, packed subtract, packed multiply); `0` = one FP32 product per weight, the previous form. Same bits (all 65,536 scales x 256 codes through the stager, plus every DS41 shape); DS41 rank-0 dense at 11.6K about -1.2 % (1,024-row chunks) to -3.3 % (680-row tail). Kit: `ds41/dense-forms` (docs/benchmarking.md). |
-| `STRIX_GLM_PF_WMMA=1` | glm | off (on in rank `--profile fast`) | WMMA prefill. Opt-in FAST identity; `=0` disables even in `fast`. |
+| `STRIX_GLM_PF_WMMA=1` | glm | on with `--profile turbo`, otherwise off | WMMA prefill. Set `=1` to opt in or `=0` to disable the umbrella even in `turbo`. |
 
 `STRIX_RECURRENT_STATE` (FAST, opt-in, never part of a profile) stores the GDN recurrent state matrix as `f16` or `bf16` instead of `f32`: kernels widen each element, update in f32 and narrow on store (round to nearest even), so outputs differ from the f32 run. Equal storage types alone do not establish equality across routes with different rounding boundaries. One resolver (`strix::recurrent_state_policy()`) sets `ModelContract::recurrent_state`, the single source for HIP dispatch, matrix sizing (half the bytes) and session layout identity. Shared session restore rejects cross-type layouts. CUDA application startup currently refuses typed state until prefill rounding is independent of scheduling and prefix history; low-level typed CUDA kernels remain experimental. RTX handoff/import also refuses typed state on both ends until the wire protocol negotiates a producer state contract; equal f16/bf16 byte counts and an echoed consumer identity are insufficient. F32 behavior and identities are unchanged. Routes that still read the state as f32 refuse a 16-bit type through `recurrent_state_route_refusal`. Kernel-level ABAB of the storage types: `scripts/bench/gdn-state/run.sh BIN OUT` (fixture `bench-state16`); these measurements do not qualify application performance or model fidelity.
 
@@ -198,6 +200,7 @@ the shared tiled core (`src/core`) landed, with the same bits.
 | `STRIX_GLM_PF_SCORE_SEQ=1`, `STRIX_GLM_PF_SCORE_BLOCK=<1..8>` | glm | off, `1` | Quality harness (`STRIX_GLM_PF_SCORE_LAST`): one score file per prefill call, and rows per head call. Measurement only. |
 | `STRIX_GLM_PF_STREAMS=1` | glm | off | Single compute stream for the seqpar TP2 prefill schedule. Same bits; not faster in the first samples. |
 | `STRIX_MMX_MODEL_FORMAT=fast_i4` | minimax | `exl3` | Draft lossy prefill: each MoE layer is converted to INT4 during prefill in two reusable buffers (+3.6 GiB); decode stays on EXL3. See [MiniMax grouped prefill](minimax-grouped-prefill.md#draft-fast_i4). |
+| `STRIX_MM_IU4_LAYERS` | minimax | unset | Explicit absolute MoE layers for transient IU4 prefill, for example `38-59`. This selection overrides `STRIX_MMX_FAST_I4_EXL3_LAYERS`. `none` disables IU4. An explicit `STRIX_MMX_MODEL_FORMAT=exl3` takes precedence. |
 | `STRIX_DS41_PREFILL_LEASE=1`, `STRIX_DS41_ENGRAM_DEVICE_READY=1`, `STRIX_DS41_SEED_EARLY=1` | deepseek | off | Prefill structure options (lease-fenced exchange, per-layer Engram readiness, early draft seed). Same bits; no gain measured yet. |
 
 ### Debug only
@@ -301,7 +304,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_GLM_PF_SEQPAR` | glm | auto | [glm-pf-seqpar](optimizations.md#glm-pf-seqpar) |
 | `STRIX_GLM_PF_STAGED` | glm | 1 | [glm-pf-staged](optimizations.md#glm-pf-staged) |
 | `STRIX_GLM_PF_SUMEXP` | glm | 1, 1 | [glm-pf-sumexp](optimizations.md#glm-pf-sumexp) |
-| `STRIX_GLM_PF_WMMA` | glm | off (opt-in FAST identity) | [glm-pf-wmma-x](optimizations.md#glm-pf-wmma-x) |
+| `STRIX_GLM_PF_WMMA` | glm | on with `--profile turbo`, otherwise off | [glm-pf-wmma-x](optimizations.md#glm-pf-wmma-x) |
 | `STRIX_GLM_PF_WMMA_LIVE_FRAG` | glm | 1 | [glm-pf-wmma-live-fragments](optimizations.md#glm-pf-wmma-live-fragments) |
 | `STRIX_GLM_PF_WMMA_SHARED128` | glm | 1 | [glm-pf-wmma-shared128](optimizations.md#glm-pf-wmma-shared128) |
 | `STRIX_HY4_PF_STORE_EPILOGUE` | hy4 | on | [hy4-pf-store-epilogue](optimizations.md#hy4-pf-store-epilogue) |

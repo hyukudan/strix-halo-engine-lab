@@ -62,6 +62,7 @@ struct Lever {
     unsigned apps = 0;                      // mask of App values the lever concerns
     bool baseline = true;                   // --baseline / STRIX_DS41_RTX_BASELINE=1 turn it off
     std::string_view source;                // owner commit / branch; for a pending column, what it waits for
+    strix::profile::Identities identity{}; // declared identity per value (strix::profile::Lever::identity)
 };
 [[nodiscard]] std::span<const Lever> levers();
 // The same rows as strix::profile::Lever (first option as the CLI switch, a three-column value padded with an empty turbo
@@ -76,6 +77,8 @@ struct Entry {
     std::string value;   // the value the resolution asks for ("on", "off", an option's argument, ...)
     Status status = Status::profile;
     std::string wanted;  // pending / unqualified: the profile's value
+    std::string ladder{};
+    std::string ladder_reference{};  // the reference its timing rows must name (LadderRow::over)
 };
 
 struct Resolution {
@@ -103,6 +106,8 @@ using strix::profile::Lookup;
 struct Inputs {
     std::vector<std::string> args;  // the launch options (argv[2..])
     Lookup env;                     // environment lookup; empty: the process environment
+    strix::profile::Regime regime{};
+    std::span<const strix::profile::LadderRow> ladder{};
 };
 // --profile NAME (else STRIX_DS41_PROFILE, else default) and --allow-pending (or STRIX_DS41_PROFILE_ALLOW_PENDING=1) out
 // of the options; throws std::invalid_argument on a bad name or a missing value.

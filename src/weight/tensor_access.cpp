@@ -56,6 +56,12 @@ Status TensorLookup::open_safetensors(const std::string& path, const TensorSchem
     return bind(std::move(index), schema);
 }
 
+Status TensorLookup::open_safetensors(std::shared_ptr<const Source> source, const TensorSchema& schema) {
+    TensorIndex index;
+    if (const auto status = index_safetensors(std::move(source), index); !status) return status;
+    return bind(std::move(index), schema);
+}
+
 Status TensorLookup::bind(TensorIndex index, const TensorSchema& schema) {
     TensorSchemaSummary summary;
     if (const auto status = validate_tensor_schema(index, schema, summary); !status) return status;

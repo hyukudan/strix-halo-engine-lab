@@ -39,6 +39,7 @@ struct RequestedOptions {
     Options options;
     Environment environment;
     bool permit_generation_defaults = true;
+    bool paired_prefill = false;
 };
 struct PrefillCapabilities {
     bool a8_runtime = false;
@@ -603,6 +604,7 @@ inline void admit_product_profile(Options& o) {
         entry.target = std::string(entry.lever->target);
         entry.value = std::string(entry.lever->builtin);
         entry.reason = reason;
+        if (!entry.ladder.empty()) entry.ladder += " / declined by route: " + reason + " -> default=" + entry.value;
     }
 }
 
@@ -1841,6 +1843,19 @@ inline void charge_moe_direct_b(PrefillRequirements& r, const MoeDirectBPolicy& 
         r.device_base=prefill_checked_add(r.device_base,extra);
     }
 }
+inline bool moe_da16_writer_supported(const ModelContract& model, const ModelManifest& manifest) {
+    const bool geometry = model.hidden_size == 2560U && model.moe_intermediate_size % 128U == 0U &&
+        model.moe_intermediate_size >= 320U && model.moe_intermediate_size <= 640U &&
+        model.num_experts > 0U && model.num_experts <= 512U &&
+        model.num_experts_per_token > 0U && model.num_experts_per_token <= 10U;
+    bool formats = true;
+    for (const auto& t : manifest.tensors) {
+        if (t.name.ends_with(".ffn_gate_exps.weight") || t.name.ends_with(".ffn_up_exps.weight"))
+            formats = formats && (t.ggml_type == 12U || t.ggml_type == 13U);
+        if (t.name.ends_with(".ffn_down_exps.weight")) formats = formats && (t.ggml_type == 7U || t.ggml_type == 8U);
+    }
+    return geometry && formats;
+}
 inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     const ModelContract& model, const gguf::FileInfo& info, const ModelManifest& manifest,
     std::string_view content, const PrefillCapabilities& capabilities, const PrefillMemory& memory) {
@@ -1848,6 +1863,9 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     // options and model writers; no candidate reaches process switch readers yet.
     auto proposed = request;
     admit_product_profile(proposed.options);
+    if (const auto* prune = proposed.options.product_profile.find("moe_route_prune");
+        prune && prune->status == qwen::profile::Status::pending)
+        proposed.environment.erase(std::string(prune->lever->env));
     qwen::profile::propose_exports(proposed.options.product_profile, [&](const char* key, const char* value) {
         if (!qwen::profile::metadata_environment(key)) proposed.environment[key] = value;
         return true;
@@ -1870,22 +1888,10 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     const bool profile_route = moe_route_bf16_profile_owned(o);
     std::string route_error;
     resolve_moe_route_bf16(o, result.environment, result.gsq_owner, capabilities.fp16_operands, route_error);
-    if (o.prefill_moe_route_bf16) {
-        const bool geometry = model.hidden_size == 2560U && model.moe_intermediate_size % 128U == 0U &&
-            model.moe_intermediate_size >= 320U && model.moe_intermediate_size <= 640U &&
-            model.num_experts > 0U && model.num_experts <= 512U &&
-            model.num_experts_per_token > 0U && model.num_experts_per_token <= 10U;
-        bool formats = true;
-        for (const auto& t : manifest.tensors) {
-            if (t.name.ends_with(".ffn_gate_exps.weight") || t.name.ends_with(".ffn_up_exps.weight"))
-                formats = formats && (t.ggml_type == 12U || t.ggml_type == 13U);
-            if (t.name.ends_with(".ffn_down_exps.weight")) formats = formats && (t.ggml_type == 7U || t.ggml_type == 8U);
-        }
-        if (!geometry || !formats) {
-            o.prefill_moe_route_bf16 = false;
-            o.prefill_moe_route_bf16_reason = "unsupported DA16 geometry or writer format";
-            route_error = "MoE route BF16 candidate declined: " + o.prefill_moe_route_bf16_reason;
-        }
+    if (o.prefill_moe_route_bf16 && !moe_da16_writer_supported(model, manifest)) {
+        o.prefill_moe_route_bf16 = false;
+        o.prefill_moe_route_bf16_reason = "unsupported DA16 geometry or writer format";
+        route_error = "MoE route BF16 candidate declined: " + o.prefill_moe_route_bf16_reason;
     }
     if (profile_route && !o.prefill_moe_route_bf16) {
         for (auto& entry : o.product_profile.entries) if (entry.lever->name == "moe_route_bf16") {
@@ -1893,9 +1899,35 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
             entry.target = std::string(entry.lever->target);
             entry.value = std::string(entry.lever->builtin);
             entry.reason = o.prefill_moe_route_bf16_reason;
+            if (!entry.ladder.empty()) entry.ladder += " / declined by route: " + entry.reason + " -> default=" + entry.value;
             result.environment.erase(std::string(entry.lever->env));
         }
     } else if (!route_error.empty()) result.error = std::move(route_error);
+    for (auto& entry : o.product_profile.entries) {
+        if (entry.lever->name != "moe_route_prune" || !profile::applied(entry.status)) continue;
+        // An explicit request still reaches the launcher's existing hard checks.
+        std::string_view refusal = moe_da16_route_refusal(o, result.environment, result.gsq_owner, capabilities.fp16_operands);
+        if (request.paired_prefill) refusal = "pair prefill is unsupported";
+        else if (o.prefill_exact_fp16 || (result.environment.contains("STRIX_PREFILL_EXACT_FP16") &&
+                 result.environment.at("STRIX_PREFILL_EXACT_FP16").starts_with('1')))
+            refusal = "prefill-exact-fp16 disables route pruning";
+        else if (refusal.empty() && !moe_da16_writer_supported(model, manifest))
+            refusal = "unsupported DA16 geometry or writer format";
+        else if (refusal.empty() && (!env_is(result.environment, "STRIX_QPF2K_MOE_MC", "1") ||
+                 !env_is(result.environment, "STRIX_QPF2K_MOE_DA16", "1") ||
+                 !env_is(result.environment, "STRIX_QPF2K_MOE_ROUTE", "14")))
+            refusal = "certified DA16 merge+commit schedule is inactive";
+        if (refusal.empty()) break;
+        entry.status = qwen::profile::Status::pending;
+        entry.target = entry.requested;
+        entry.value = entry.lever->builtin;
+        entry.reason = refusal;
+        entry.ladder += " / declined by route: " + entry.reason + " -> default=" + entry.value;
+        entry.ladder_lowered = true;
+        result.environment.erase(std::string(entry.lever->env));
+        result.environment[std::string(profile::turbo::kCacheNamespaceEnv)] = o.product_profile.cache_namespace();
+        break;
+    }
     const auto direct=moe_direct_b_policy(o,result.environment,manifest,capabilities.fp16_operands);
     o.prefill_moe_direct_b_requested=direct.requested;
     o.prefill_moe_direct_b=direct.effective;

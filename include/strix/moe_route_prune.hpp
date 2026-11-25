@@ -65,12 +65,15 @@ inline std::string route_prune_tag(RoutePrune p) {
 }
 inline std::string route_prune_tag(std::string_view text) { return route_prune_tag(parse_route_prune(text)); }
 
-// Process-wide request (restart to change it), as the other prefill drafts.
-inline const std::string& route_prune_active_tag() {
-    static const std::string tag = [] {
+// Process-wide request. Startup may bind the final environment after admission;
+// execution uses the cached policy for the lifetime of the run.
+inline const std::string& route_prune_active_tag(bool bind = false) {
+    const auto read = [] {
         const char* value = strix::envcfg::text("STRIX_QPF2K_MOE_ROUTE_PRUNE");
         return route_prune_tag(value ? value : "");
-    }();
+    };
+    static std::string tag = read();
+    if (bind) tag = read();
     return tag;
 }
 inline RoutePrune route_prune_active() { return parse_route_prune(route_prune_active_tag()); }

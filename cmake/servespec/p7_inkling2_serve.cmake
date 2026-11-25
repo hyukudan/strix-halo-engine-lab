@@ -48,7 +48,7 @@ if(TARGET strix_cohort_session AND TARGET strix_inkling2_mini_checkpoint)
     if(_inkling_backend STREQUAL "hip" AND TARGET strix-inkling2-mini-hip)
         add_library(strix_inkling2_mini_serve_device STATIC src/inkling2/inkling2_mini_serve_hip.hip)
         target_link_libraries(strix_inkling2_mini_serve_device PRIVATE strix_inkling2_mini_service
-            strix_inkling2_mini_checkpoint strix_tiled_core strix_hip_runtime strix_core strix_device_hip)
+            strix_inkling2_mini_checkpoint strix_tiled_core strix_hip_runtime strix_core strix_device_hip strix_device)
         strix_target_warnings(strix_inkling2_mini_serve_device)
         target_compile_options(strix_inkling2_mini_serve_device PRIVATE
             -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math

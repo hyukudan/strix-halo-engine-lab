@@ -1,9 +1,10 @@
 // Full-model diagnostics are an explicit CLI, never a ctest or admission token.
 #include <array>
+#include "check_profile.hpp"
 #include "device.hpp"
 #include "qualification.hpp"
-#include "strix/profiles/gemma4.hpp"
 #include "gemma4/ref/npz.hpp"
+#include "strix/serve/json.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -487,16 +488,13 @@ void telemetry() {
 int main(int argc, char** argv) try {
     const auto args = arguments(argc, argv);
     // Product profile: exported before the cached prefill switches are first read.
-    const auto product = g4::profile::resolve(args.product.value_or(g4::profile::Name::standard), g4::profile::App::prefill_bench,
-                                              {.cli = {}, .assets = {}, .env = {}, .allow_pending = args.allow_pending});
+    auto product = pf::resolve_check_profile(args.product.value_or(g4::profile::Name::standard),
+                                             args.linear_policy, args.allow_pending);
     g4::profile::apply(product);
     // DevicePrefill implements only g4-wmma-pf-v1 linears; never report another route than the one that runs.
     if (const auto* linears = product.find("prefill_linears"); linears && linears->value != "wmma")
         throw std::invalid_argument("strix-gemma4-prefill-check runs only g4-wmma-pf-v1 linears; requested prefill route '" +
                                     linears->value + "' (measure prefill-exact through strix-gemma4-decode)");
-    std::cout << "{\"profile\":" << product.json() << "}\n";
-    std::cout << std::setprecision(12);
-    telemetry();
     auto model = std::filesystem::is_directory(args.model) ? g4::load_safetensors_model(args.model) : g4::load_gguf_model(args.model);
     const auto weights = g4::bind_host_weights(model);
     const bool quantized = std::any_of(model.tensors.begin(), model.tensors.end(), [](const auto& tensor) {
@@ -504,7 +502,15 @@ int main(int argc, char** argv) try {
     });
     auto tables = g4::load_rope_tables(args.rope);
     pf::DevicePrefill prefill(weights, tables.view, pf::Residency::host, args.profile, pf::attention_mode(), args.linears);
-    if (!args.linear_policy.empty()) prefill.set_linear_policy(pf::LinearPolicy::parse(args.linear_policy));
+    if (const auto* policy = product.find(pf::check_linear_policy_lever); policy && policy->status == g4::profile::Status::explicit_cli)
+        prefill.set_linear_policy(pf::LinearPolicy::parse(policy->value));
+    const auto& stats = prefill.stats();
+    const char* non_wmma_identity = stats.linears == pf::Linears::exact ? "prefill-exact"
+        : stats.linears == pf::Linears::a8 ? "prefill-a8" : nullptr;
+    const auto [linear_policy, applied_identity] = pf::check_linear_receipt(product, stats.linear_policy, non_wmma_identity);
+    std::cout << "{\"profile\":" << product.json() << "}\n";
+    std::cout << std::setprecision(12);
+    telemetry();
     std::unique_ptr<pf::DevicePrefill> canonical_reference;
     if (args.canonical_reference)
         canonical_reference = std::make_unique<pf::DevicePrefill>(prefill.borrow_device_weights(), tables.view, pf::Residency::device, false, pf::AttentionMode::canonical);
@@ -519,13 +525,10 @@ int main(int argc, char** argv) try {
         profiled = std::make_unique<pf::DevicePrefill>(prefill.borrow_device_weights(), tables.view, pf::Residency::device, true, prefill.stats().attention);
         canonical_profile = std::make_unique<pf::DevicePrefill>(prefill.borrow_device_weights(), tables.view, pf::Residency::device, true, pf::AttentionMode::canonical);
     }
-    // The applied route: --linear-policy replaces the v1 identity (the declared v2 policy names g4-wmma-pf-v2).
-    const std::string applied_identity = args.linears == pf::Linears::exact ? "prefill-exact" : args.linears == pf::Linears::a8 ? "prefill-a8"
-        : args.linear_policy.empty() ? pf::identity : args.linear_policy == pf::v2_policy ? pf::v2_identity : "g4-wmma-pf-policy";
     std::string policy_json;
-    for (const char c : args.linear_policy) { if (c == '"' || c == '\\') policy_json += '\\'; policy_json += c; }
+    strix::serve::append_json_string(policy_json, linear_policy);
     std::cout << "{\"decode_identity\":\"" << (args.linears == pf::Linears::a8 ? g4::a8::arithmetic_id : "g4-v1") << "\",\"prefill_identity\":\""
-              << applied_identity << "\",\"linear_policy\":\"" << policy_json << "\",\"model_hash\":\"" << model.model_hash
+              << applied_identity << "\",\"linear_policy\":" << policy_json << ",\"model_hash\":\"" << model.model_hash
               << "\",\"rope_hash\":\"" << tables.view.hash << "\",\"cache_dtype\":\"F32\",\"chunk_rows\":512,\"shared_tiling\":"
               << (prefill.stats().tiled ? "true" : "false") << ",\"prepared_weights\":" << (prefill.stats().prepared ? "true" : "false")
               << ",\"direct_mode\":" << prefill.stats().direct
