@@ -41,21 +41,60 @@ inline bool mini_cuda_bias_in_attention(unsigned rows, const std::uint32_t* devi
            reinterpret_cast<std::uintptr_t>(weights) % 16U == 0U;
 }
 
+// The operands both the preflight and the enqueue of the projected route admit and bind (one place, so they cannot differ).
+struct MiniCudaProjectedRoute {
+    cuda_core::AttentionDims dims;
+    cuda_core::PreparedBf16Flash shape;
+    cuda_core::PreparedBf16Projection projection;
+    __nv_bfloat16* key_cache;
+    __nv_bfloat16* value_cache;
+};
+
+inline bool mini_cuda_projected_route(LayerVisit visit, const MiniCudaAttentionRows& rows, MiniVisitKvCache cache,
+                                      const float* features, const std::uint16_t* weights, MiniCudaProjectedRoute& route) {
+    if (!valid_mini_visit(visit) || rows.first_position >= kMaxContext ||
+        rows.count > kMaxContext - rows.first_position || !rows.keys || !rows.values || !rows.sinks ||
+        !mini_cuda_bias_in_attention(rows.count, nullptr, features, weights)) return false;
+    const unsigned window = is_full_attention(visit.physical_layer) ? 0U : MiniPreparedGqaShape::kSlidingWindow;
+    static_assert(MiniPreparedGqaShape::kRelativeWidth == cuda_core::kPreparedProjectedBiasWidth);
+    route = {{kQueryHeads, kKvHeads, kHeadWidth, MiniPreparedGqaShape::kScoreScale, cache.slots},
+             {nullptr, rows.sinks, kRelativeExtent, window, cache.wrapped},
+             {features, weights},
+             reinterpret_cast<__nv_bfloat16*>(cache.keys),
+             reinterpret_cast<__nv_bfloat16*>(cache.values)};
+    return true;
+}
+
+// Preflight of the ENTIRE projected route (admission, operand overlaps, failure word, device shared-memory opt-in): the
+// same preparation the append runs before its K/V store, without enqueuing anything. cudaSuccess = the append will be
+// admitted; cudaErrorInvalidValue = a predictable refusal (the caller keeps the image route, which has not been dropped
+// yet); any other status is a real device error and stays visible.
+inline cudaError_t preflight_mini_cuda_attention_projected(
+    LayerVisit visit, const MiniCudaAttentionRows& rows, MiniVisitKvCache cache, const float* features,
+    const std::uint16_t* weights, unsigned* failure = nullptr) {
+    MiniCudaProjectedRoute route;
+    if (!mini_cuda_projected_route(visit, rows, cache, features, weights, route)) return cudaErrorInvalidValue;
+    cuda_core::PreparedProjectedLaunch launch;
+    return cuda_core::prepare_prepared_bf16_projected(route.dims, route.shape, route.projection, rows.queries,
+                                                      route.key_cache, route.value_cache, rows.first_position, rows.count,
+                                                      rows.output, cuda_core::FlashPipe::pad2, failure, launch);
+}
+
+// The route a preflight status selects: success keeps the projected route; cudaErrorInvalidValue (a predictable refusal of
+// the prepared launch) selects the image route and is not an error; every other status is returned to the caller.
+inline cudaError_t mini_cuda_projected_decision(cudaError_t preflight, bool& projected) {
+    projected = preflight == cudaSuccess;
+    return preflight == cudaErrorInvalidValue ? cudaSuccess : preflight;
+}
+
 inline cudaError_t enqueue_mini_cuda_attention_projected(
     LayerVisit visit, const MiniCudaAttentionRows& rows, MiniVisitKvCache cache, const float* features,
     const std::uint16_t* weights, cudaStream_t stream, unsigned* failure = nullptr) {
-    if (!valid_mini_visit(visit) || rows.first_position >= kMaxContext ||
-        rows.count > kMaxContext - rows.first_position || !rows.keys || !rows.values || !rows.sinks ||
-        !mini_cuda_bias_in_attention(rows.count, nullptr, features, weights)) return cudaErrorInvalidValue;
-    const unsigned window = is_full_attention(visit.physical_layer) ? 0U : MiniPreparedGqaShape::kSlidingWindow;
-    const cuda_core::AttentionDims dims{kQueryHeads, kKvHeads, kHeadWidth,
-                                        MiniPreparedGqaShape::kScoreScale, cache.slots};
-    const cuda_core::PreparedBf16Flash shape{nullptr, rows.sinks, kRelativeExtent, window, cache.wrapped};
-    static_assert(MiniPreparedGqaShape::kRelativeWidth == cuda_core::kPreparedProjectedBiasWidth);
+    MiniCudaProjectedRoute route;
+    if (!mini_cuda_projected_route(visit, rows, cache, features, weights, route)) return cudaErrorInvalidValue;
     return cuda_core::append_attention_prepared_bf16(
-        dims, shape, cuda_core::PreparedBf16Projection{features, weights}, rows.queries, rows.keys, rows.values,
-        reinterpret_cast<__nv_bfloat16*>(cache.keys), reinterpret_cast<__nv_bfloat16*>(cache.values),
-        rows.first_position, rows.count, rows.output, stream, cuda_core::FlashPipe::pad2, failure);
+        route.dims, route.shape, route.projection, rows.queries, rows.keys, rows.values, route.key_cache,
+        route.value_cache, rows.first_position, rows.count, rows.output, stream, cuda_core::FlashPipe::pad2, failure);
 }
 
 // One-row windows of several lanes as one lane-batched append (shared contract strix/attn/prepared_lanes.hpp):

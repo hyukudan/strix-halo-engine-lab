@@ -343,6 +343,8 @@ public:
     // Resolved exact down-image lever (mini_combine_image); set once after construction. True when the image route is
     // active (HIP, qualified target); every entry point that resolves the profile passes the resolved state.
     bool set_combine_image(bool selected) { return backend_.set_combine_image(selected); }
+    // Resolved projected-bias attention lever (mini_attn_projected_bias); set once after construction.
+    void set_attention_projected_bias(bool enabled) { backend_.set_attention_projected_bias(enabled); }
     [[nodiscard]] std::uint64_t gate_null_applications() const { return backend_.gate_null_applications(); }
 
     void prefill_gate_rows(std::span<const unsigned> prompt, std::span<float> logits) {

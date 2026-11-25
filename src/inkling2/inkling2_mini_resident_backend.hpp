@@ -256,6 +256,17 @@ public:
         return effective;
     }
 
+    // Lever inkling2-mini-attn-projected-bias@1 (bit-identical to the image route): single multi-row prompt chunks project the
+    // relative bias inside the flash. Every entry point (gate, generation CLI, step program, server) passes the resolved value;
+    // HIP ignores it (its projected route is selected by its own binding).
+    void set_attention_projected_bias(bool enabled) {
+#if defined(__HIPCC__)
+        static_cast<void>(enabled);
+#else
+        attention_projected_bias_ = enabled;
+#endif
+    }
+
     // FAST W4A4 expert lever (inkling2-mini-moe-w4a4@1): multi-row prefill chunks run admitted NVFP4 expert layers through
     // the shared grouped W4A4 operand class. The NVFP4 image of the assignment rows is allocated only when the lever is on.
     // `activations` is the shared operand class the lever value selects (moe_core/grouped_w4a4.hpp: nvfp4 = nearest@1 scale
@@ -721,14 +732,26 @@ private:
                                                                  work.relative_features, bias_weights, failure, stream_));
             } else
 #else
-            // A single multi-row prompt chunk in one window projects the relative bias inside the CUDA flash: the
-            // prepare stage skips the image and its producer, the flash computes the same logits and raises the
-            // same flag (cuda_core::PreparedBf16Projection). The null-order count needs the image producer and lane
-            // mode resolves positions on the device, so both keep the image route.
+            // A single multi-row prompt chunk in one window projects the relative bias inside the CUDA flash (lever
+            // inkling2-mini-attn-projected-bias@1, off by default until its identity receipt): the prepare stage skips
+            // the image and its producer, the flash computes the same logits and raises the same flag
+            // (cuda_core::PreparedBf16Projection). The null-order count needs the image producer and lane mode
+            // resolves positions on the device, so both keep the image route. The whole projected launch is prepared
+            // BEFORE the image producer is dropped: a predictable refusal (cudaErrorInvalidValue: e.g. the dynamic
+            // shared memory of the 1024-column projection above the device opt-in) keeps the image route, any other
+            // status is a real error.
             const auto* bias_weights =
                 attn_core::detail::bf16_projection(weights.projection(MiniAttentionProjection::relative_bias));
-            if (single && !cohort && !adapter.null_applications && route_.attention_rows >= rows &&
-                mini_cuda_bias_in_attention(rows, device_position, work.relative_features, bias_weights)) {
+            bool projected_route = attention_projected_bias_ && single && !cohort && !adapter.null_applications &&
+                                   route_.attention_rows >= rows &&
+                                   mini_cuda_bias_in_attention(rows, device_position, work.relative_features, bias_weights);
+            if (projected_route) {
+                check(mini_cuda_projected_decision(
+                    preflight_mini_cuda_attention_projected(visit, image_of(*single, 0U), single->state.kv,
+                                                            work.relative_features, bias_weights, failure),
+                    projected_route));
+            }
+            if (projected_route) {
                 const detail::MiniResidentGqaBackend<detail::MiniPreparedCudaProjectedBackend> projected{{native}, nullptr};
                 check(prepare(projected));
                 check(enqueue_mini_cuda_attention_projected(visit, image_of(*single, 0U), single->state.kv,
@@ -944,6 +967,7 @@ private:
     moe_core::grouped_microscaled::Decode moe_decode_ = mini_cuda_moe_decode();
     moe_core::grouped_microscaled::Schedule moe_schedule_ = mini_cuda_moe_schedule();
     bool moe_w4a4_ = false, chunk_w4a4_ = false;
+    bool attention_projected_bias_ = false;  // lever inkling2-mini-attn-projected-bias@1 (resolved; set once after load)
     moe_core::grouped_w4a4::Activations moe_w4a4_class_ = moe_core::grouped_w4a4::Activations::nvfp4;
     std::array<bool, kPhysicalLayers> moe_w4a4_layer_{};
     std::optional<mini_gpu::Buffer<std::uint8_t>> moe_nvfp4_;
