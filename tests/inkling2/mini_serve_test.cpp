@@ -579,14 +579,22 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const unsigned context = shape.context.value_or(8192U);
         require(options.context == context && options.slots == shape.slots.value_or(0U), "served shape options");
         if (!route) {
-            // Without the lever the served shape is the incumbent one, written out here from the rule the server had
+            // Without the lever the served shape is the held-back one, written out here from the rule the server had
             // before the lever existed: a 128-row chunk unless --prefill-rows, clamped to the context; lanes = --slots,
-            // else that clamped chunk; no tail; held-back prompt token; grouped decode.
-            const unsigned chunk = std::min(shape.prefill_rows.value_or(128U), context);
-            const unsigned lanes = shape.slots.value_or(0U) != 0U ? *shape.slots : chunk;
+            // else the clamped 128 rows / --prefill-rows; no tail; held-back prompt token; grouped decode. The one change:
+            // a chunk-invariant backend (CUDA) takes the command line's implicit chunk (8192 EXACT, 2048 FAST / TURBO)
+            // with the command line's device-memory fallback; HIP keeps 128 rows. The lane cap never follows the chunk.
+            const unsigned incumbent = std::min(shape.prefill_rows.value_or(128U), context);
+            const auto cli_rows = mini::mini_cli_prefill_rows(
+                hip_backend ? mini::MiniPrefillBackend::hip : mini::MiniPrefillBackend::cuda, options.tier);
+            const unsigned chunk = hip_backend ? incumbent : std::min(shape.prefill_rows.value_or(cli_rows), context);
+            const unsigned lanes = shape.slots.value_or(0U) != 0U ? *shape.slots : incumbent;
+            const unsigned fallback = hip_backend || shape.prefill_rows ? 0U
+                : mini::mini_cli_prefill_fallback_rows(mini::MiniPrefillBackend::cuda, options.tier);
             require(options.prefill_rows == chunk && mini::mini_serve_lane_rows(options) == lanes &&
-                        options.prefill_tail == 0U && options.lane_rows == 0U,
-                    "lever off: the served chunk, lane cap and tail are the incumbent ones");
+                        options.prefill_tail == 0U && options.lane_rows == incumbent &&
+                        options.prefill_fallback_rows == fallback,
+                    "lever off: held-back chunk (CUDA: the command line's), incumbent lane cap, no tail");
         } else {
             // With the lever: the command line's chunk and tail rule, emits-first; lanes = --slots, else an explicit
             // (clamped) --prefill-rows, else the served lane cap.
@@ -898,8 +906,8 @@ int main(int argc, char** argv) try {
         wiring(argv[1], backend, true);
         // The deployed TURBO preset with the served route switch unset: main's preset column, Q8 qualification included.
         wiring(argv[1], backend, true, false, W4a4::bf16, "turbo");
-        // Every tier keeps the incumbent served shape without the lever, also for chunks above the context and
-        // explicit slots.
+        // Every tier keeps the held-back served shape without the lever (CUDA: the command line's chunk, incumbent lane
+        // cap), also for chunks above the context and explicit slots.
         for (const auto* tier : {"exact", "fast", "turbo"})
             for (const ServedShape shape : {ServedShape{}, ServedShape{{}, 15U, {}}, ServedShape{8192U, 15U, {}},
                                             ServedShape{{}, 15U, 9U}, ServedShape{32U, {}, {}}, ServedShape{32U, {}, 4U}})

@@ -4,7 +4,8 @@
 
 // Inkling 2 Mini implicit CLI / qualification prefill chunk, as data per backend and profile. Host-only. The shared
 // serial-generation code applies it (an explicit --prefill-chunk always wins; the chunk is capped by the prompt). The
-// HTTP server keeps its own bounded prompt slice (MiniServeOptions::prefill_rows) and does not read this.
+// HTTP server reads it through the served schedule (inkling2_mini_schedule.hpp: the served route lever, and the
+// held-back route of a chunk-invariant backend); an explicit --prefill-rows always wins there.
 namespace strix::inkling2 {
 
 enum class MiniPrefillBackend : unsigned char { hip, cuda };

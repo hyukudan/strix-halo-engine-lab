@@ -30,8 +30,12 @@ struct MiniServeOptions {
     bool served_cli_route = false;
     // Tail capacity of the admitted route (the command line's tail rule).
     unsigned prefill_tail = 0;
-    // Lane cap of the admitted route given an explicit --prefill-rows without --slots (0: kMiniServeLaneRows).
+    // Lane cap without --slots. Admitted route: an explicit --prefill-rows (0: kMiniServeLaneRows). Held-back route
+    // (resolve): the incumbent cap, an explicit --prefill-rows else kMiniServeLaneRows, clamped (0: the chunk).
     unsigned lane_rows = 0;
+    // Held-back route: rows the decoder load retries at when the implicit chunk's device workspaces are refused
+    // (mini_served_prefill_fallback_rows, serve::load_with_chunk_fallback); 0 = no retry.
+    unsigned prefill_fallback_rows = 0;
     std::uint64_t kv_bytes = 0;
     MiniWeightOptions weight_options;
     profile::Name tier = profile::Name::standard;
@@ -70,11 +74,12 @@ std::uint32_t mini_serve_kv_slots(Decoder& decoder, std::uint64_t free, std::uin
     return plan.slots;
 }
 
-// Lanes per batched forward: --slots, else, on the incumbent served route, the context-clamped prompt chunk (the cap
-// it always had); on the admitted served route lever an explicit --prefill-rows (clamped) or kMiniServeLaneRows.
+// Lanes per batched forward: --slots, else, on the held-back served route, the cap it always had (an explicit
+// --prefill-rows, else 128 rows, context-clamped: lane_rows from resolve, the chunk for options built without it);
+// on the admitted served route lever an explicit --prefill-rows (clamped) or kMiniServeLaneRows.
 inline unsigned mini_serve_lane_rows(const MiniServeOptions& opt) noexcept {
     if (opt.slots) return opt.slots;
-    if (!opt.served_cli_route) return opt.prefill_rows;
+    if (!opt.served_cli_route) return opt.lane_rows ? opt.lane_rows : opt.prefill_rows;
     return opt.lane_rows ? opt.lane_rows : kMiniServeLaneRows;
 }
 
