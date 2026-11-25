@@ -137,6 +137,7 @@ A inkling2-mini fast inkling2-mini-lowbit-turbo@1=0 s3
 A inkling2-mini fast inkling2-mini-verify-rows@1=0 s3
 A inkling2-mini fast inkling2-vision-recipe=legacy s3
 A inkling2-mini fast spec.block-candidate@1=off s3
+A inkling2-mini fast lowbit.folded-scale=f16_group_scale s4
 A inkling2-mini turbo inkling2-mini-moe-w4a4@1=0 s4
 A inkling2-mini turbo inkling2-mini-combine-down-image@1=0 s3
 A inkling2-mini turbo inkling2-mini-prepared-round-fold@1=0 s3
@@ -149,6 +150,7 @@ A inkling2-mini turbo inkling2-mini-lowbit-turbo@1=0 s3
 A inkling2-mini turbo inkling2-mini-verify-rows@1=0 s3
 A inkling2-mini turbo inkling2-vision-recipe=legacy s3
 A inkling2-mini turbo spec.block-candidate@1=off s3
+A inkling2-mini turbo lowbit.folded-scale=f16_group_scale s4
 B qwen-hip fast ctx=0 qsa_budget=1536 s7
 B qwen-hip fast ctx=0 moe_route_bf16=1 s7
 B qwen-hip fast ctx=0 gdn_fp16_chunk=1 s7

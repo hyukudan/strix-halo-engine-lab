@@ -73,6 +73,7 @@ struct MiniResidentGqaBackend : Base {
     using Base::success;
     using Base::invalid;
     std::uint64_t* null_applications{};
+    core::LowBitArithmetic lowbit_arithmetic = kMiniLowBitArithmetic;
 
     Status linear(const float* input, unsigned width, unsigned rows,
                   std::span<const core::ResidentRowProjection> views) const {
@@ -86,14 +87,14 @@ struct MiniResidentGqaBackend : Base {
 #if !defined(__HIPCC__)
                     , this->big_context
 #endif
-                    , kMiniLowBitArithmetic);
+                    , lowbit_arithmetic);
             },
             [&](std::span<const MiniAttentionLinear> group) {
                 return Base::linear_admitted(input, width, rows, group);
             },
             [&](std::span<const core::ResidentRowProjection> group) {
                 return core::resident_q8_projections_admitted<MiniProjectionWeights::role_count>(
-                    input, width, rows, group, kMiniLowBitArithmetic);
+                    input, width, rows, group, lowbit_arithmetic);
             });
     }
 
@@ -158,9 +159,10 @@ public:
 #endif
 
     MiniResidentBackend(const MiniResidentWeights& weights, unsigned max_rows, mini_gpu::Stream stream,
-                        bool packed_decode = false, bool step_graphs = default_step_graphs, bool cohort_rows = false)
+                        bool packed_decode = false, bool step_graphs = default_step_graphs, bool cohort_rows = false,
+                        core::LowBitArithmetic lowbit_arithmetic = kMiniLowBitArithmetic)
         : weights_(weights), stream_(stream), max_rows_(checked_chunk_rows(max_rows)), packed_decode_(packed_decode),
-          cohort_rows_(packed_decode && cohort_rows), step_graphs_(step_graphs),
+          cohort_rows_(packed_decode && cohort_rows), lowbit_arithmetic_(lowbit_arithmetic), step_graphs_(step_graphs),
           tiles_(moe_core::device_grouped::tile_bound(max_rows_, kExpertsPerToken, kExperts, Moe::rows_per_tile)),
           controller_(mini_controller_elements(max_rows_)), attention_(attention_elements(max_rows_)),
 #if defined(__HIPCC__)
@@ -399,6 +401,12 @@ public:
     }
     // The current chunk reads the compact roles (attention projections here, the head in the decoder).
     [[nodiscard]] bool lowbit_chunk() const noexcept { return lowbit_chunk_; }
+    [[nodiscard]] core::LowBitArithmetic lowbit_arithmetic() const noexcept { return lowbit_arithmetic_; }
+    void set_lowbit_arithmetic(core::LowBitArithmetic arithmetic) noexcept {
+        if (lowbit_arithmetic_ == arithmetic) return;
+        reset_step_graph();
+        lowbit_arithmetic_ = arithmetic;
+    }
 
     void start_chunk(unsigned rows, MiniAppendKind kind, unsigned decode_cohort_width = 0U) {
         // Route capture/replay reads or writes host data synchronously. The step graph itself is
@@ -476,6 +484,7 @@ public:
 
     // Decode expert form this backend was built with (packed one-row form or the grouped tile kernel).
     [[nodiscard]] bool packed_decode() const noexcept { return packed_decode_; }
+    [[nodiscard]] bool step_graphs() const noexcept { return step_graphs_; }
 
     void finish() {
         std::array<unsigned, (1U + kMiniMaxVerifyRows) * kLogicalVisits> storage{};
@@ -672,7 +681,7 @@ private:
                 check(hipErrorInvalidValue);
         };
         const detail::MiniResidentGqaBackend<detail::MiniPreparedHipImageBackend> adapter{
-            {{{stream_}, prepared_round_fold_}, operand_image}, gate_order_null_ ? &null_applications_ : nullptr};
+            {{{stream_}, prepared_round_fold_}, operand_image}, gate_order_null_ ? &null_applications_ : nullptr, lowbit_arithmetic_};
         const auto prepare_with = [&](const auto& body) { return body(adapter); };
         auto* operand_failure = failure;
         const auto launch_group = [&](const MiniResidentAttentionGroup& group, std::size_t base) {
@@ -849,7 +858,7 @@ private:
                 mini_hip_bias_in_attention(rows, key_splits(image_of(*single, 0U)), device_position,
                                            work.relative_features, bias_weights)) {
                 const detail::MiniResidentGqaBackend<detail::MiniPreparedHipImageProjectedBackend> projected{
-                    {{{{stream_}, prepared_round_fold_}, operand_image}}, nullptr};
+                    {{{{stream_}, prepared_round_fold_}, operand_image}}, nullptr, lowbit_arithmetic_};
                 check(prepare(projected));
                 check(enqueue_mini_hip_attention_projected<true>(visit, image_of(*single, 0U), cache_of(*single),
                                                                  work.relative_features, bias_weights, failure, stream_));
@@ -1171,6 +1180,7 @@ private:
     std::array<bool, kPhysicalLayers> moe_w4a4_layer_{};
     std::optional<mini_gpu::Buffer<std::uint8_t>> moe_nvfp4_;
 #endif
+    core::LowBitArithmetic lowbit_arithmetic_;
     bool step_graphs_;
     unsigned route_flag_rows_ = 1U;
     std::vector<unsigned> host_flags_;  // host copy of the route / attention status words of the last call

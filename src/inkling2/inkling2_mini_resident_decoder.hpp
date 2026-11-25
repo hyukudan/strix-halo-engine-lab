@@ -144,8 +144,8 @@ public:
           token_ids_(max_rows_),
 #endif
           weights_(upload_weights(controller_one_plane)), backend_(weights_, max_rows_, stream_.get(), packed_decode, step_graphs,
-                                                     admits_served_route(served_route)),
-          served_cli_route_(admits_served_route(served_route)),
+                                                     admits_served_route(served_route), lowbit.arithmetic),
+          lowbit_timing_(std::move(lowbit.timing)), served_cli_route_(admits_served_route(served_route)),
           calibrated_decode_(lowbit.admitted != nullptr && lowbit.decode_only), greedy_(decode_rows_, kOutputVocabulary) {
 #if defined(__HIPCC__)
         // EXACT screened greedy head (core/hip_screened_head.hpp) over the BF16 head: same token and status as the
@@ -400,6 +400,7 @@ public:
         const bool lanes_screened = !backend_.lowbit_applies(MiniAppendKind::decode, rows) &&
                                     verify_lanes_pick_ && !reads_scores && rows > 1U && rows <= screen_->max_lanes();
 #endif
+        select_lowbit_cohort(groups_, rows);
         MiniResidentForward forward(backend_, workspace());
         forward.append_batch(groups_, rows, embeddings, hidden, [&] {
             embed(ids, embeddings, rows, kind, rows);
@@ -470,8 +471,10 @@ public:
             const auto logits = scores.first(::strix::head::logit_rows_elements(rows, kOutputVocabulary, kLogitPitch));
             // Verify routing gives each packed row the decode MoE and attention arithmetic.
             const auto kind = rows <= kMaxVerifyRows ? MiniAppendKind::verify : MiniAppendKind::decode;
+            const auto groups = std::span<const MiniResidentAppendGroup>(groups_).subspan(first, rows);
+            select_lowbit_cohort(groups, lanes);
             MiniResidentForward forward(backend_, workspace());
-            forward.append_batch(std::span<const MiniResidentAppendGroup>(groups_).subspan(first, rows), rows,
+            forward.append_batch(groups, rows,
                                  embeddings, hidden, [&] {
                 embed(pass_ids, embeddings, rows, kind, lanes);
             }, [&](MiniConstRows output) {
@@ -780,6 +783,25 @@ private:
                 taps ? draft_taps_.span() : std::span<std::uint16_t>{}};
     }
 
+    void select_lowbit_arithmetic(MiniAppendKind kind, std::uint64_t context, unsigned lanes, unsigned rows) {
+        if (!lowbit_timing_) return;
+        const auto phase = kind == MiniAppendKind::prefill ? profile::Phase::prefill : profile::Phase::decode;
+        const std::string route = " packed=" + std::to_string(backend_.packed_decode()) +
+            " tail=" + std::to_string(tail_rows_) + " served=" + std::to_string(served_cli_route_) +
+            " graphs=" + std::to_string(backend_.step_graphs());
+        backend_.set_lowbit_arithmetic(lowbit_timing_->select(phase, context, lanes, rows, prefill_rows_, route));
+    }
+
+    void select_lowbit_cohort(std::span<const MiniResidentAppendGroup> groups, unsigned lanes) {
+        if (!lowbit_timing_) return;
+        const auto context = groups.front().state->committed();
+        const bool uniform = std::ranges::all_of(groups, [context](const auto& group) {
+            return group.state->committed() == context;
+        });
+        select_lowbit_arithmetic(MiniAppendKind::decode, uniform ? context + 1U : 0U,
+                                 lanes, static_cast<unsigned>(groups.size()));
+    }
+
     [[nodiscard]] static unsigned checked_token(const core::ResidentGreedy& greedy, std::size_t row) {
         const auto selected = greedy.token(row);
         if (selected >= kOutputVocabulary) throw std::runtime_error("Inkling 2 Mini: non-finite output logits");
@@ -935,7 +957,7 @@ private:
         if (weights_.compact_head_bound() && backend_.lowbit_chunk() && rows > 1U) {
             backend_.check(core::enqueue_resident_q8_softcap_head_rows(
                 weights_.compact_head(), kOutputVocabulary, static_cast<unsigned>(kLogitPitch), input, rows,
-                scores.first(std::size_t{rows} * kLogitPitch), kLogitSoftcap, stream_.get(), kMiniLowBitArithmetic));
+                scores.first(std::size_t{rows} * kLogitPitch), kLogitSoftcap, stream_.get(), backend_.lowbit_arithmetic()));
             return;
         }
         if (rows > 1U) {
@@ -962,14 +984,14 @@ private:
             const auto& head = weights_.compact_head();
             if (softcap)
                 backend_.check(core::enqueue_resident_q8_softcap_head(head, kOutputVocabulary, input, 1U,
-                                                                     row_scores, kLogitSoftcap, stream, kMiniLowBitArithmetic));
+                                                                     row_scores, kLogitSoftcap, stream, backend_.lowbit_arithmetic()));
             else
                 backend_.check(core::enqueue_resident_q8_rows(head, kOutputVocabulary, input, rows,
                                                              row_scores.data(), stream
 #if !defined(__HIPCC__)
                                                              , nullptr
 #endif
-                                                             , kMiniLowBitArithmetic));
+                                                             , backend_.lowbit_arithmetic()));
             return;
         }
         const auto matrix = weights_.bf16("unembed.weight");
@@ -1011,6 +1033,8 @@ private:
         const auto embeddings = embeddings_.span().first(elements);
         reserve_staged_logits(host_logits.size());
         settle_pending_scores(pick_next && verify_top.size() <= 1U);
+        const auto context = kind == MiniAppendKind::verify ? 0U : state.committed() + rows;
+        select_lowbit_arithmetic(kind, context, 1U, rows);
         const bool multi_pick = verify_top.size() > 1U;
         if (multi_pick && !verify_greedy_) {
             if (!verify_logits_) verify_logits_.emplace(std::size_t{max_verify_rows()} * kLogitPitch);
@@ -1273,6 +1297,7 @@ private:
 #endif
     MiniResidentWeights weights_;
     MiniResidentBackend backend_;
+    std::optional<MiniLowBitTiming> lowbit_timing_;
     std::vector<std::unique_ptr<Slot>> slots_;
     std::vector<MiniResidentAppendGroup> groups_;
     std::vector<unsigned> pass_ids_;    // decode_slots input snapshot
