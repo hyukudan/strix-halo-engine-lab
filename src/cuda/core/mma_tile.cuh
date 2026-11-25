@@ -714,8 +714,28 @@ inline cudaError_t launch_tall_form(const view::Args& args, cudaStream_t stream)
     if constexpr (Format == packed::MatrixFormat::nvfp4)
         if (args.decode == view::Decode::shift) kernel = projection_tall<Format, Id, true>;
     const unsigned shared = tall::shared_bytes(F, L, args.inputs, Format == packed::MatrixFormat::nvfp4);
-    if (const auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                 static_cast<int>(shared)); status != cudaSuccess) return status;
+    if constexpr (F.staged_scales) {
+        // The opt-in attribute belongs to the specialization, not the stream. Never lower it
+        // to a request's K-dependent extent: another host thread may be launching a wider K.
+        // Use the same ceiling on every call, including after a CUDA context reset.
+        int device = 0, optin = 0;
+        cudaFuncAttributes attributes{};
+        if (const auto status = cudaGetDevice(&device); status != cudaSuccess) return status;
+        if (const auto status = cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+            status != cudaSuccess) return status;
+        if (const auto status = cudaFuncGetAttributes(&attributes, kernel); status != cudaSuccess) return status;
+        if (optin <= 0 || attributes.sharedSizeBytes >= static_cast<std::size_t>(optin))
+            return cudaErrorInvalidValue;
+        const int ceiling = optin - static_cast<int>(attributes.sharedSizeBytes);
+        if (shared > static_cast<unsigned>(ceiling)) return cudaErrorInvalidValue;
+        if (attributes.maxDynamicSharedSizeBytes != ceiling) {
+            if (const auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, ceiling);
+                status != cudaSuccess) return status;
+        }
+    } else {
+        if (const auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                     static_cast<int>(shared)); status != cudaSuccess) return status;
+    }
     kernel<<<grid, F.threads(), shared, stream>>>(args);
     return cudaGetLastError();
 }
