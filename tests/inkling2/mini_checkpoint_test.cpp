@@ -5,6 +5,11 @@
 
 #include <algorithm>
 #include <iostream>
+#include <memory_resource>
+#include <new>
+#include <span>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -325,24 +330,93 @@ bool check_attention_certificate() {
         oversized(64, 0x7F00U), large_gain(64, 0x5F80U);  // 2^64
     const auto route = [&ordinary](const std::vector<std::uint16_t>& weights, const std::vector<std::uint16_t>& gain) {
         mini::MiniAttentionCertificate certificate;
-        certificate.add_projection(ordinary);
-        certificate.add_projection(weights);
-        certificate.add_gain(gain);
+        certificate.add_projection(strix::core::finite_magnitude_max_bf16(ordinary));
+        certificate.add_projection(strix::core::finite_magnitude_max_bf16(weights));
+        certificate.add_gain(strix::core::finite_magnitude_max_bf16(gain));
         return certificate.route(strix::core::Bf16Operand::bf16_exact);
     };
     constexpr auto one = strix::core::Bf16Operand::bf16_exact, three = strix::core::Bf16Operand::fp32;
     mini::MiniAttentionCertificate only_weights;
-    only_weights.add_projection(ordinary);
+    only_weights.add_projection(strix::core::finite_magnitude_max_bf16(ordinary));
     return route(ordinary, ordinary) == one && route(infinite, ordinary) == three && route(nan, ordinary) == three &&
            route(oversized, ordinary) == three && route(ordinary, large_gain) == three &&
            route(ordinary, infinite) == three && only_weights.route(one) == three &&
            mini::MiniAttentionCertificate{}.route(one) == three;
 }
 
+// The staging path itself: certify_mini_attention walks the schema's attention tensors and layer norm gains, scans each
+// staged tensor through the shared bounded scan and yields the operand class the resident backend declares. A
+// checkpoint-shaped fixture (one small tensor per name, a few chunks long) gives one plane only while every projection
+// and gain is finite and bounded; a single Inf, NaN or oversized finite coefficient in any attention tensor or gain
+// (the first, the last, or in a later chunk) refuses it; a scan without scratch refuses without reading anything and
+// still loads; a failing copy propagates instead of being read as a refusal.
+bool check_attention_staging() {
+    namespace core = strix::core;
+    constexpr auto one = core::Bf16Operand::bf16_exact, three = core::Bf16Operand::fp32;
+    constexpr std::size_t kElements = 40U;  // ten chunks of the 4-element scan scratch below
+    const std::vector<std::uint16_t> ordinary(kElements, 0x3F80U);
+    const auto suffix = [](mini::MiniAttentionProjection role) {
+        return std::string(mini::mini_attention_projection_spec(role).tensor_suffix);
+    };
+    // `bad` replaces one element of every tensor whose name ends with `target`.
+    const auto route = [&](std::string_view target, std::size_t element, std::uint16_t bad, std::size_t* reads = nullptr) {
+        std::vector<std::uint16_t> poisoned = ordinary;
+        if (element < poisoned.size()) poisoned[element] = bad;
+        core::Bf16StagedScan scan(std::pmr::get_default_resource(), 4U);
+        const auto certificate = mini::certify_mini_attention(
+            scan,
+            [&](std::string_view name) -> std::span<const std::uint16_t> {
+                return !target.empty() && name.ends_with(target) ? std::span<const std::uint16_t>(poisoned)
+                                                                  : std::span<const std::uint16_t>(ordinary);
+            },
+            [&](std::span<const std::uint16_t> staged, std::span<std::uint16_t> host) {
+                if (reads) ++*reads;
+                std::ranges::copy(staged, host.begin());
+            });
+        return certificate.route(one);
+    };
+    bool refused = true;
+    for (const auto target : {suffix(mini::MiniAttentionProjection::query), suffix(mini::MiniAttentionProjection::key),
+                              suffix(mini::MiniAttentionProjection::output), std::string("attn.v_sconv.weight"),
+                              std::string("attn_norm.weight")})
+        for (const std::size_t element : {std::size_t{0}, std::size_t{17}, kElements - 1U})
+            for (const std::uint16_t bad : {std::uint16_t{0xFF80U}, std::uint16_t{0x7FC0U}, std::uint16_t{0x7F00U}})
+                refused = refused && route(target, element, bad) == three;
+    std::size_t reads = 0;
+    const bool finite = route("", 0U, 0U, &reads) == one && reads > 100U;  // every attention tensor was scanned
+    // Without scratch (refusing allocation) the certificate is empty: three planes, no read, no throw.
+    class Refusing final : public std::pmr::memory_resource {
+        void* do_allocate(std::size_t, std::size_t) override { throw std::bad_alloc(); }
+        void do_deallocate(void*, std::size_t, std::size_t) override {}
+        bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
+    } refusing;
+    core::Bf16StagedScan declined(&refusing, 4U);
+    bool read_called = false;
+    const bool no_scratch =
+        mini::certify_mini_attention(
+            declined, [&](std::string_view) -> std::span<const std::uint16_t> { return ordinary; },
+            [&](std::span<const std::uint16_t>, std::span<std::uint16_t>) { read_called = true; })
+                .route(one) == three && !read_called;
+    bool propagates = false;
+    core::Bf16StagedScan scan(std::pmr::get_default_resource(), 4U);
+    try {
+        (void)mini::certify_mini_attention(
+            scan, [&](std::string_view) -> std::span<const std::uint16_t> { return ordinary; },
+            [](std::span<const std::uint16_t>, std::span<std::uint16_t>) { throw std::runtime_error("device copy failed"); });
+    } catch (const std::runtime_error&) {
+        propagates = true;
+    }
+    if (!refused || !finite || !no_scratch || !propagates)
+        std::cerr << "attention staging: refused " << refused << " finite " << finite << " no scratch " << no_scratch
+                  << " propagates " << propagates << '\n';
+    return refused && finite && no_scratch && propagates;
+}
+
 }  // namespace
 
 int main() {
     if (!check_attention_certificate()) return 91;
+    if (!check_attention_staging()) return 92;
     Fixture fixture;
     for (const auto& tensor : mini::mini_text_tensor_schema()) fixture.add(tensor);
     fixture.add({"model.visual.test.weight", "BF16", {4, 4}});

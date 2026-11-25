@@ -582,9 +582,8 @@ private:
         // Producer-backed operands: the attention inputs are rmsnorm_bf16 rows and the output projection reads the
         // BF16 gated product, so the linears declare bf16_exact (one plane, same bits) where the staged attention
         // weights are certified (finite, ranges kept finite); otherwise they keep FP32 operands (three planes).
-        const detail::MiniPreparedCudaBackend native{
-            {stream_}, cuda_core::DenseArith::mma3, big_context_.get(),
-            weights_.attention_certificate().route(core::Bf16Operand::bf16_exact)};
+        const detail::MiniPreparedCudaBackend native =
+            detail::mini_attention_backend(stream_, big_context_.get(), weights_.attention_certificate());
         const detail::MiniResidentGqaBackend<> adapter{native, gate_order_null_ ? &null_applications_ : nullptr};
         // One-row decode over native BF16 weights with a rows profile issues the
         // projection groups as one grouped rows call at the first round (the
