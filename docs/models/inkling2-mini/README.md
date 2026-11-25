@@ -190,11 +190,42 @@ reads the whole prompt by prefill and takes the first id from its final row, as
 the command line does. While another lane decodes it runs a prompt in 128-row
 pieces cut inside those chunks only at 16-row wave tiles and never shorter than
 17 rows, where every row keeps its route forms, so the answer does not depend
-on other requests. The CUDA command line prefills in 2048-row chunks. An
+on other requests. The CUDA command line prefills in 8192-row chunks on the
+EXACT profile and in 2048-row chunks on the others. An
 explicit `--prefill-rows` without `--slots` also caps the served lanes at that
 many rows, as before. The server's startup line prints `served_route` (`off`
 or `declined` on the existing route; `on` adds `prefill_chunk`, `prefill_tail`
 and `first_id prefill`); the command line prints `strix-prefill-route/v1`.
+
+Under memory pressure on CUDA, a GPU that cannot hold the 8192-row workspaces
+of the EXACT default loads with 2048-row chunks instead: the command line
+prints `strix-prefill-chunk 8192 -> 2048 (device memory)` (a shorter prompt
+names its own size in place of 8192) and the
+`strix-prefill-route/v1` line names the 2048-row chunk. EXACT output does not
+depend on the chunk, so the generated ids are the same. Only a refused device
+allocation selects the smaller chunk; any other load error is reported as is.
+An explicit `--prefill-chunk` is never changed, and `--prefill-chunk 2048`
+selects the smaller chunk up front. The CUDA server is not affected: it keeps
+its own 128-row prompt chunks (`--prefill-rows`).
+
+The greedy head stays the full head on CUDA in every profile. The exact switch
+`STRIX_INK_SCREENED_HEAD=1` (`inkling2-mini-screened-head@1`, off in every
+profile column, a distinct run identity when set) makes CUDA greedy picks that
+return no score row run the shared EXACT screened head
+(`cuda/core/head_screened.cuh`, an 8-bit plane of the BF16 head built at
+load): the same token and status as the full head. Steps that return or read
+scores (`--logits`, sampled lanes, verify rows, cohort programs) keep the
+full head; a sampled served lane reads the scores of its own step, projected
+on the first read. A compact head, a plane that cannot be built, or (served) a
+plane that would cost a KV slot keeps the full head. HIP keeps its own
+screened head (`STRIX_SCREENED_HEAD=0` turns it off) and ignores the switch.
+The command line, the gate and the server print `inkling2 head` with
+`screened lever`, `full lever-off`, `full build-refused`, `full kv-slot` or,
+on HIP, `screened hip-binding` / `full hip-binding`; the server's startup
+line carries the same `head` field. With the switch, the first screened pick
+prints `inkling2 head screened first pick`, the decoder prints `inkling2 head
+screened picks N` when it closes, and the CUDA step program's install line
+ends with `head=screened`.
 
 ## Execution and reuse
 

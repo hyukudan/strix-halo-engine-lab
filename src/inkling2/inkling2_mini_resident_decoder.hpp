@@ -11,6 +11,7 @@
 #include "core/hip_weight_uploader.hpp"
 #else
 #include "cuda/core/head_argmax.cuh"
+#include "cuda/core/head_screened.cuh"
 #include "cuda/core/weight_uploader.hpp"
 #endif
 
@@ -99,6 +100,12 @@ public:
                   "every score row starts on the shared head alignment");
     using Rows = std::span<const unsigned>;
     enum class LogitRows { all };
+    // The resident EXACT screened greedy head of this backend (same plan, core/screened_head_plan.hpp).
+#if defined(__HIPCC__)
+    using Screen = core::hip_screened_head::ResidentScreen;
+#else
+    using Screen = ::strix::cuda::core::head_screened::ResidentScreen;
+#endif
 
     // tail_rows: prefill() lets its final chunk take up to tail_rows rows beyond max_chunk_rows when that keeps the
     // bits of the greedy schedule (mini_prefill_tail_rows: the tail takes the same route forms in both schedules and
@@ -142,6 +149,7 @@ public:
                             stream_.get());
             if (!screen_->usable()) screen_.reset();
         }
+        head_ = {screen_.has_value(), MiniHeadReason::hip_binding};
 #endif
 #if !defined(__HIPCC__)
         cohort_context_ = max_positions;
@@ -150,7 +158,49 @@ public:
         reset_gate_session();
     }
 
-    ~MiniResidentDecoder() { backend_.abandon_capture(); }
+    ~MiniResidentDecoder() {
+        backend_.abandon_capture();
+        // The run's witness of the lever's screened route (0: no greedy pick ran screened).
+        if (head_.reason == MiniHeadReason::lever) std::cerr << "inkling2 head screened picks " << screened_picks_ << '\n';
+    }
+
+    // Screened-head lever (mini_screened_head), set once after construction through configure_mini_decoder (or the
+    // CUDA step program's load). CUDA: selected -> the EXACT screened head (cuda/core/head_screened.cuh) over the BF16
+    // head is built now; a compact (Q8_0) head or a plane that cannot be built keeps the full head. Greedy picks that
+    // return no score row then run it; host logits, score reads (materialized on the first read), verify rows and
+    // cohort programs keep the full head. HIP keeps its own binding (built with the decoder unless
+    // STRIX_SCREENED_HEAD=0) and ignores the lever. Returns the effective head; prints the "inkling2 head" line.
+    MiniHead set_screened_head(bool selected) {
+#if defined(__HIPCC__)
+        static_cast<void>(selected);
+#else
+        backend_.abandon_capture();
+        screened_graph_ = false;
+        screen_.reset();
+        head_ = mini_select_head(selected, [&] { return build_screen(); });
+#endif
+        std::cerr << "inkling2 head " << mini_head_field(head_);
+        if (head_.screened && screen_) std::cerr << " plane_mib " << (screen_->device_bytes() >> 20U);
+        std::cerr << '\n';
+        return head_;
+    }
+    [[nodiscard]] MiniHead head() const noexcept { return head_; }
+    // Device bytes of the plane the lever built (0: none; HIP's own binding is not the lever's and reports 0), for the
+    // served slot budget (mini_serve_kv_slots): the plane stays only when it costs no KV slot.
+    [[nodiscard]] std::uint64_t screen_device_bytes() const noexcept {
+        return head_.reason == MiniHeadReason::lever && screen_ ? screen_->device_bytes() : 0U;
+    }
+    // Frees the lever's plane before the first served pick (the full head picks the same tokens).
+    void release_screen() {
+        if (head_.reason != MiniHeadReason::lever) return;
+        backend_.abandon_capture();
+        screened_graph_ = false;
+        screen_.reset();
+        head_ = {false, MiniHeadReason::kv_slot};
+        std::cerr << "inkling2 head " << mini_head_field(head_) << '\n';
+    }
+    // Greedy picks that ran screened so far (both routes; the CUDA step program counts its screened steps here).
+    [[nodiscard]] std::uint64_t screened_picks() const noexcept { return screened_picks_; }
 
     // Return the token after the last prompt input. Only that row goes through
     // the output projection. If a later chunk fails after an earlier one
@@ -265,6 +315,11 @@ public:
     [[nodiscard]] std::span<float> step_program_hidden() noexcept { return hidden_.span().first(kHiddenWidth); }
     [[nodiscard]] std::span<float> step_program_logits() noexcept { return logits_.span().first(kOutputVocabulary); }
     [[nodiscard]] core::ResidentGreedy& step_program_greedy() noexcept { return greedy_; }
+    // The lever's screened head (nullptr: the full head) and the count of a step the program picked through it.
+    [[nodiscard]] const Screen* step_program_screen() const noexcept {
+        return head_.reason == MiniHeadReason::lever && screen_ ? &*screen_ : nullptr;
+    }
+    void step_program_screened_pick() { note_screened_pick(); }
 #endif
 
     // One forward for all lanes. Every row keeps single-row decode arithmetic,
@@ -891,15 +946,15 @@ private:
         // taps and the other slots bind position- or slot-dependent addresses, so they stay eager.
         const bool decode_step = kind == MiniAppendKind::decode && rows == 1U &&
                                  &state == &slots_.front()->state() && draft_taps_.span().empty();
-#if defined(__HIPCC__)
-        // Only a one-row greedy pick without host logits may skip the full logits row. A captured step graph replays
-        // the head it captured, so a change of head between decode steps drops the graph (it is captured again).
-        const bool screened = screen_.has_value() && pick_next && !multi_pick && host_logits.empty();
+        // Only a one-row greedy pick without host logits may skip the full logits row (the screened head: HIP's own
+        // binding, CUDA the screened-head lever, never a verify row). A captured step graph replays the head it
+        // captured, so a change of head between decode steps drops the graph (it is captured again).
+        const bool screened =
+            mini_screened_pick(head_.reason, screen_.has_value(), kind, pick_next, multi_pick, !host_logits.empty());
         if (decode_step && screened != screened_graph_) {
             backend_.abandon_capture();
             screened_graph_ = screened;
         }
-#endif
         try {
             backend_.set_step_token(decode_step ? std::optional<unsigned>{ids.front()} : std::nullopt);
             MiniResidentForward forward(backend_, state, workspace(&state));
@@ -924,14 +979,19 @@ private:
 #endif
                     for (std::size_t row = 0; row < head_rows; ++row) {
                         const auto* input = tail.data() + row * kHiddenWidth;
-#if defined(__HIPCC__)
                         if (screened) {
+#if defined(__HIPCC__)
                             greedy.enqueue_produced([&](HipGreedyRowsReply* reply) {
                                 backend_.check(screen_->enqueue(input, reply, stream_.get()));
                             });
+#else
+                            greedy.enqueue_produced([&](std::uint32_t* device_token) {
+                                return screen_->enqueue(input,
+                                    ::strix::cuda::core::head_argmax::EmitIndexOrNone{device_token}, stream_.get());
+                            }, stream_.get());
+#endif
                             continue;
                         }
-#endif
                         const auto row_scores = scores.subspan(
                             ::strix::head::logit_row_offset(multi_pick ? static_cast<unsigned>(row) : 0U, kLogitPitch), kOutputVocabulary);
                         if (!rows_head) project_head(input, row_scores, true);
@@ -967,12 +1027,39 @@ private:
             throw;
         }
         if (!host_logits.empty()) std::copy_n(staged_logits_.get(), host_logits.size(), host_logits.data());
-#if defined(__HIPCC__)
-        // The screened pick skipped the score row; a later score read recomputes it from this head input.
-        if (screened) pending_scores_ = {hidden_.data() + elements - kHiddenWidth, logits_.data()};
-#endif
+        if (screened) {
+            // The screened pick skipped the score row; a later score read recomputes it from this head input.
+            pending_scores_ = {hidden_.data() + elements - kHiddenWidth, logits_.data()};
+            note_screened_pick();
+        }
         return token;
     }
+
+    // Counts a greedy pick that ran screened; the lever's first one is reported once (the route ran, not only built).
+    void note_screened_pick() {
+        if (screened_picks_++ == 0U && head_.reason == MiniHeadReason::lever)
+            std::cerr << "inkling2 head screened first pick\n";
+    }
+
+#if !defined(__HIPCC__)
+    // The lever's plane over the BF16 head (true: built and usable). A compact (Q8_0) head has its own full head; a
+    // plane that cannot be built (e.g. no device memory left for it) keeps the full head and says why.
+    bool build_screen() {
+        if (weights_.compact()) return false;
+        try {
+            screen_.emplace(weights_.bf16("unembed.weight").data(), kOutputVocabulary, kHiddenWidth, kLogitSoftcap,
+                            stream_.get());
+        } catch (const std::exception& error) {
+            screen_.reset();
+            static_cast<void>(cudaGetLastError());
+            std::cerr << "inkling2 head screened plane not built: " << error.what() << '\n';
+            return false;
+        }
+        if (screen_->usable()) return true;
+        screen_.reset();
+        return false;
+    }
+#endif
 
     // The score row a screened pick skipped: recomputed on the first score read (read_slot_logits, e.g. a sampled
     // served lane) from the head input that pick used (still in hidden_: no forward ran since), through the same
@@ -1060,10 +1147,10 @@ private:
         const float* input = nullptr;
         float* scores = nullptr;
     } pending_scores_;
-#if defined(__HIPCC__)
-    std::optional<core::hip_screened_head::ResidentScreen> screen_;
+    std::optional<Screen> screen_;
     bool screened_graph_{false};
-#endif
+    MiniHead head_{};                  // the effective greedy head (set_screened_head / release_screen)
+    std::uint64_t screened_picks_{};  // greedy picks that ran screened (note_screened_pick)
     std::array<unsigned, kMaxVerifyRows> verify_ids_{}, verify_top_{};
     std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits_;
     std::size_t staged_logits_size_{};

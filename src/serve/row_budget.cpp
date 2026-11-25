@@ -26,6 +26,17 @@ std::uint32_t resident_kv_slots(std::uint64_t free, std::uint64_t total, std::ui
     return fixed_kv_slots(kv_limit == 0U ? slot_budget : std::min(kv_limit, slot_budget), slot_bytes, rows);
 }
 
+PlaneKvSlots resident_kv_slots_with_plane(std::uint64_t free, std::uint64_t total, std::uint64_t device_limit,
+                                          std::uint64_t kv_limit, std::uint64_t slot_bytes, std::uint32_t rows,
+                                          std::uint64_t plane_bytes) {
+    const auto with_plane = resident_kv_slots(free, total, device_limit, kv_limit, slot_bytes, rows);
+    if (plane_bytes == 0U) return {with_plane, false};
+    const auto used = total - std::min(free, total);
+    const auto without = resident_kv_slots(free + std::min(plane_bytes, used), total, device_limit, kv_limit,
+                                           slot_bytes, rows);
+    return without > with_plane ? PlaneKvSlots{without, false} : PlaneKvSlots{with_plane, true};
+}
+
 namespace {
 
 struct Lane {

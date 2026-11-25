@@ -67,8 +67,12 @@ inline void check(Status status, const char* operation) {
 
 // The status of a DEVICE-memory allocation (Buffer and the row-dependent buffers). Only here is an out-of-memory
 // status typed as DeviceAllocationError; check() keeps every other operation generic (pinned host staging included).
+// The refused call also recorded its status in the runtime's last-error slot; the exception now carries it, so the slot
+// is read back to success here: a caller that recovers (a retry with smaller buffers) must not find the old refusal in
+// its next launch check.
 inline void check_device_allocation(Status status, const char* operation) {
     if (status == STRIX_DEVICE_RT(Success)) return;
+    static_cast<void>(STRIX_DEVICE_RT(GetLastError)());
 #if defined(__HIPCC__)
     const bool out_of_memory = status == hipErrorOutOfMemory;
 #else
