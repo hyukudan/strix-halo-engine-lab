@@ -63,10 +63,31 @@ void test_controller_planes() {
 // The engine resolves the W4A4 row: an unbound table would ignore STRIX_INK_MOE_W4A4 at every prompt length.
 void test_row() {
     require(mini::kMiniProfile.table.size() == mini::kMiniLevers.size(), "Inkling lever table bound to the engine");
-    require(mini::kMiniProfile.table.size() == 12U,
+    require(mini::kMiniProfile.table.size() == 13U,
             "W4A4, down image, prepared round fold, narrow experts, controller planes, projected-bias, served route, "
-            "screened head, calibrated low-bit, verify rows, image recipe and the block-candidate row");
-    require(mini::kMiniLevers[10].name == mini::kMiniVisionRecipe, "image recipe sits before the block-candidate row");
+            "screened head, calibrated low-bit, verify rows, speculation, image recipe and the block-candidate row");
+    // The speculation row: exact, builtin off in every tier until its device receipts, both values identified.
+    const auto* speculation = std::ranges::find_if(mini::kMiniLevers, [](const profile::Lever& lever) {
+        return lever.name == mini::kMiniSpeculation;
+    });
+    require(speculation != mini::kMiniLevers.end() && speculation->kind == profile::Kind::exact &&
+                speculation->builtin == "off" && speculation->target == "auto" &&
+                std::ranges::all_of(speculation->value, [](std::string_view v) { return v.empty(); }),
+            "speculation row: exact, off by default, target auto");
+    for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
+        mini::MiniWeightOptions options;
+        options.tier = inputs(tier);
+        const auto incumbent = mini::resolve_mini_profile(options, true);
+        require(!mini::mini_speculation(incumbent), "speculation resolves off");
+        options.tier = inputs(tier);
+        options.tier.env = [](const char* key) -> const char* {
+            return std::strcmp(key, "STRIX_INK_SPECULATION") == 0 ? "auto" : nullptr;
+        };
+        const auto selected = mini::resolve_mini_profile(options, true);
+        require(mini::mini_speculation(selected) && selected.fingerprint() != incumbent.fingerprint(),
+                "STRIX_INK_SPECULATION=auto selects speculation under its own identity, in every tier");
+    }
+    require(mini::kMiniLevers[11].name == mini::kMiniVisionRecipe, "image recipe sits before the block-candidate row");
     const auto& lever = mini::kMiniProfile.table.front();
     require(lever.name == mini::kMiniMoeW4a4 && lever.name == "inkling2-mini-moe-w4a4@1", "w4a4 identity");
     require(lever.env == "STRIX_INK_MOE_W4A4" && lever.off == "0" && lever.builtin == "0", "w4a4 off switch");

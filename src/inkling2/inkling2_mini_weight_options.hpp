@@ -4,6 +4,7 @@
 #include "inkling2_mini_resident_route.hpp"
 #include "moe_core/grouped_w4a4.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/model_data/inkling2_mini.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
 #include "strix/serve/row_budget.hpp"
 #include "strix/weight/lowbit_pack.hpp"
@@ -19,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace strix::inkling2 {
 
@@ -228,6 +230,29 @@ inline unsigned mini_verify_rows(const profile::Resolution& tier) {
     if (entry->value == "1") return 1U;
     if (entry->value == "2") return kMiniVerifyLanesPick;
     throw std::invalid_argument("STRIX_INK_VERIFY_ROWS must be 0, 1 or 2");
+}
+
+// Resolved speculation row (kMiniSpeculation): true = auto. The one default of the command line and the server; an
+// explicit --speculation of either entry point wins over it.
+inline bool mini_speculation(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniSpeculation);
+    if (entry == nullptr || entry->value == "off") return false;
+    if (entry->value == "auto") return true;
+    throw std::invalid_argument("STRIX_INK_SPECULATION must be off or auto");
+}
+
+// The verify rows level a speculating run selects: its verify windows take the rows body (level >= 1, an exact lever);
+// a run that does not speculate keeps the row's own level.
+inline unsigned mini_speculation_verify_rows(unsigned verify_rows, bool speculating) noexcept {
+    return speculating ? std::max(verify_rows, 1U) : verify_rows;
+}
+
+// Draft rows per lane by live lanes of the served cohort (models/inkling2-mini.toml [speculation]).
+inline std::vector<std::uint32_t> mini_served_draft_by_live() {
+    std::vector<std::uint32_t> rows;
+    for (const auto value : model_data::inkling2_mini::speculation::max_draft_by_live)
+        rows.push_back(static_cast<std::uint32_t>(value));
+    return rows;
 }
 
 // Resolved state of the served route lever (true: a HIP server runs the command line's route, kMiniServedCliRoute).
