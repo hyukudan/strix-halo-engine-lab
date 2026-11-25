@@ -51,10 +51,14 @@ inline bool valid_resident_q8_rows(const weight::ResidentMatrixView& matrix, uns
 }
 
 // The FP32 sweep is the incumbent. The explicit FP16 form uses one arithmetic across both tile schedules.
-enum class LowBitArithmetic { fp32_sweep, f16_group_scale };
+// f16_folded_scale: the FP16 form with the scale folded into the operand (fp16(code x d), one WMMA chain per output;
+// core/lowbit_f16_staging.hpp ScalePolicy::folded), also one arithmetic across both schedules. A FAST / TURBO
+// candidate lever value: it changes rounding, is never EXACT and no profile selects it until its gate and receipts exist.
+enum class LowBitArithmetic { fp32_sweep, f16_group_scale, f16_folded_scale };
 
+constexpr bool lowbit_f16_form(LowBitArithmetic arithmetic) { return arithmetic != LowBitArithmetic::fp32_sweep; }
 constexpr unsigned lowbit_max_rows(LowBitArithmetic arithmetic) {
-    return arithmetic == LowBitArithmetic::f16_group_scale ? 65535U * f16_tile_gemm::kBM : gemv_rows::max_rows;
+    return lowbit_f16_form(arithmetic) ? 65535U * f16_tile_gemm::kBM : gemv_rows::max_rows;
 }
 inline bool valid_resident_lowbit_rows(const weight::ResidentMatrixView& matrix, unsigned outputs,
                                        const float* input, unsigned rows, const float* output,
@@ -133,6 +137,8 @@ inline constexpr std::array<weight::ArithmeticId, 2> kResidentLowBitArithmeticHi
     {"hip.q4_g64.dense-linear-tight-rows", 1}, {"hip.q6_g64.dense-linear-tight-rows", 1}}};
 inline constexpr std::array<weight::ArithmeticId, 2> kResidentLowBitTileArithmeticHip{{
     {"hip.q4_g64.f16-group-scale-chain", 1}, {"hip.q6_g64.f16-group-scale-chain", 1}}};
+inline constexpr std::array<weight::ArithmeticId, 2> kResidentLowBitFoldedArithmeticHip{{
+    {"hip.q4_g64.f16-folded-scale-chain", 1}, {"hip.q6_g64.f16-folded-scale-chain", 1}}};
 
 // The weight bytes one projection of a list reads: a BF16 projection outputs tight rows of width elements, a compact
 // one its whole view. Empty (nullptr, 0) when the descriptor has no weights or the extent does not fit.
