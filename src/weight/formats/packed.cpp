@@ -10,7 +10,9 @@ std::span<const FormatDescriptor> packed_formats() {
   descriptor({"image.cb4",1},"derived-cb4",quantized_linear,true,fixed<32,18>),
   descriptor({"image.u5",1},"derived-u5",quantized_linear,true,fixed<32,22>),
   descriptor({"image.u6",1},"derived-u6",quantized_linear,true,fixed<32,26>),
-  descriptor({"image.q6p32",1},"derived-q6p32",quantized_linear,true,fixed<32,26>)
+  descriptor({"image.q6p32",1},"derived-q6p32",quantized_linear,true,fixed<32,26>),
+  descriptor(kQ4G64WeightStorage,"derived-q4g64",quantized_linear,false,fixed<128,68,64>),
+  descriptor(kQ6G64WeightStorage,"derived-q6g64",quantized_linear,false,fixed<128,100,64>)
  };
  return formats;
 }

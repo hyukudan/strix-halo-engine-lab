@@ -1,4 +1,5 @@
 #include "core/dense_row_plan.hpp"
+#include "core/residual_mix.hpp"
 #include "cuda/core/dense/row_plan.hpp"
 
 #include <algorithm>
@@ -199,6 +200,44 @@ bool check_dense_declared() {
 
 }  // namespace
 
+bool check_low_rank_bound() {
+    using strix::core::finite_magnitude_max;
+    using strix::core::finite_magnitude_max_bf16;
+    using strix::core::low_rank_operands_bounded;
+    const float inf = std::numeric_limits<float>::infinity(), nan = std::numeric_limits<float>::quiet_NaN();
+    const float finite[] = {0.5F, -3.0F, 2.0F}, with_inf[] = {1.0F, -inf}, with_nan[] = {nan, 1.0F};
+    const bool magnitudes = finite_magnitude_max(finite) == 3.0F && finite_magnitude_max(with_inf) == inf &&
+                            finite_magnitude_max(with_nan) == inf && finite_magnitude_max({}) == 0.0F;
+    const std::uint16_t bf_finite[] = {0x3F80U, 0xC040U, 0x7F7FU}, bf_inf[] = {0x3F80U, 0xFF80U}, bf_nan[] = {0x7FC0U};
+    const bool bf16 = finite_magnitude_max_bf16(bf_finite) == std::bit_cast<float>(0x7F7F0000U) &&
+                      finite_magnitude_max_bf16(bf_inf) == inf && finite_magnitude_max_bf16(bf_nan) == inf &&
+                      finite_magnitude_max_bf16({}) == 0.0F;
+    // Inkling's controller shape (width 2304, rank 64): ordinary weights pass, any non-finite weight or a maximum that
+    // lets the latent or a gate sum reach 2^126 keeps the FP32 class.
+    const bool bounds = low_rank_operands_bounded(2304, 64, 4.0F, 4.0F) &&
+                        !low_rank_operands_bounded(2304, 64, inf, 1.0F) &&
+                        !low_rank_operands_bounded(2304, 64, 1.0F, nan) &&
+                        !low_rank_operands_bounded(2304, 64, 0x1p115F, 1.0F) &&   // latent ~ 2^127.2
+                        low_rank_operands_bounded(2304, 64, 0x1p100F, 0x1p7F) &&   // gate sum ~ 2^125.2
+                        !low_rank_operands_bounded(2304, 64, 0x1p100F, 0x1p8F);    // gate sum ~ 2^126.2
+    // Tail geometry: the down operand is raw + one readout whatever message_count says. The review's example (width 1,
+    // two normalised operands equal to 1, down coefficients 2^127 into one latent, unit gate weights) overflows the
+    // latent, so it is refused with a zero, a one and a large bank count alike.
+    bool tail = true;
+    for (const unsigned banks : {0U, 1U, 2U, 64U}) {
+        const strix::core::residual_mix::LowRankController plan{1U, 1U, banks, 1e-6F, true, true};
+        tail = tail && plan.down_operand_elements() == 2U && !plan.operands_bounded(0x1p127F, 1.0F) &&
+               plan.operands_bounded(1.0F, 1.0F) && !plan.operands_bounded(inf, 1.0F);
+        const strix::core::residual_mix::LowRankController wide{2304U, 64U, banks, 1e-6F, true, true};
+        tail = tail && wide.down_operand_elements() == 4608U && wide.operands_bounded(4.0F, 4.0F) &&
+               !wide.operands_bounded(0x1p115F, 1.0F);
+    }
+    if (!magnitudes || !bf16 || !bounds || !tail)
+        std::cerr << "low-rank operand bound: magnitudes " << magnitudes << " bf16 " << bf16 << " bounds " << bounds
+                  << " tail " << tail << '\n';
+    return magnitudes && bf16 && bounds && tail;
+}
+
 /// The image route plan: inside the incumbent groups the WMMA tile serves, whole-tile projections (pitched included)
 // go packed, narrow contiguous ones to the image tile, what neither reads keeps the FP32 rows; a group the incumbent
 // runs elsewhere (here: a misaligned weight) keeps every projection on the FP32 rows; a call below the height or the
@@ -217,7 +256,12 @@ static bool check_image_routes() {
                                                                       {2304U, 2304U, 0U, 1024U, 9216U},
                                                                       {2304U, 3072U, 0U, 1024U, 9216U},
                                                                       {2304U, 2304U, 3200U, 1024U, 9216U}}};
-    constexpr strix::core::ImageRoutePolicy policy{1024U, 64U, 128U, 2048U, 9216U, shapes};
+    // Measured launch groups (exact outputs in launch order, one pitch, own heights): a launch over several projections
+    // is only as measured as its listed tuple, whatever its members' single widths are.
+    static constexpr std::array<strix::core::ImageGroupRow, 3> groups{{{2304U, 0U, 2U, {3072U, 1024U}, 1024U, 9216U},
+                                                                      {2304U, 0U, 3U, {3072U, 1024U, 1024U}, 1024U, 9216U},
+                                                                      {2304U, 0U, 2U, {3072U, 128U}, 1024U, 8192U}}};
+    constexpr strix::core::ImageRoutePolicy policy{1024U, 64U, 128U, 2048U, 9216U, shapes, groups};
     constexpr unsigned K = 2304U;
     constexpr unsigned kWide = 1U << 20U;
     const auto* w = std::bit_cast<const std::uint16_t*>(std::uintptr_t{0x10000U});
@@ -271,6 +315,24 @@ static bool check_image_routes() {
     if (!strix::core::plan_image_routes<3U>(policy, K, 4096U, four, kWide, routes, group_admits, image_admits) ||
         strix::core::for_each_image_route_run<3U>(four, routes, K, Status::ok, record) != Status::ok ||
         runs != decltype(runs){{R::packed, {1024U, 1024U, 1024U}}, {R::packed, {1024U}}})
+        return false;
+    // An unlisted grouping of measured widths: the packed runs are cut into measured launches (the longest listed prefix,
+    // else one projection), and the image entry's launch is the K32 tile.
+    const std::array<Bf16RowProjection, 4> qgkv{{{w, 3072U, y, false, 0U}, {w, 3072U, y, false, 0U},
+        {w, 1024U, y, false, 0U}, {w, 1024U, y, false, 0U}}};
+    runs.clear();
+    if (!strix::core::plan_image_routes<4U>(policy, K, 8192U, qgkv, kWide, routes, group_admits, image_admits) ||
+        !routed({R::packed, R::packed, R::packed, R::packed}) ||
+        strix::core::for_each_image_route_run<4U>(qgkv, routes, K, Status::ok, record, &policy, 8192U) != Status::ok ||
+        runs != decltype(runs){{R::packed, {3072U}}, {R::packed, {3072U, 1024U, 1024U}}})
+        return false;
+    const std::array<Bf16RowProjection, 3> wide_pair{{{w, 3072U, y, false, 0U}, {w, 128U, y, false, 0U},
+        {w, 128U, y, false, 0U}}};
+    runs.clear();
+    if (!strix::core::plan_image_routes<4U>(policy, K, 8192U, wide_pair, kWide, routes, group_admits, image_admits) ||
+        strix::core::for_each_image_route_run<4U>(wide_pair, routes, K, Status::ok, record, &policy, 8192U) != Status::ok ||
+        runs != decltype(runs){{R::packed, {3072U, 128U}}, {R::packed, {128U}}} ||
+        strix::core::image_packed_schedule(policy, true, K, 8192U, wide_pair))
         return false;
     // Rounded projections of different store policies (separate / incumbent) never share a run.
     const std::array<Bf16RowProjection, 3> policies{{{w, 1024U, y, true, 0U, true}, {w, 1024U, y, true, 0U, true},
@@ -359,6 +421,21 @@ static bool check_image_routes() {
     const std::array<Bf16RowProjection, 2> wide_n128{{{w, 3072U, y, false, 0U}, {w, 128U, y, false, 0U}}};
     const std::array<Bf16RowProjection, 2> wide_n256{{{w, 3072U, y, false, 0U}, {w, 256U, y, false, 0U}}};
     const std::array<Bf16RowProjection, 1> pitch3200{{{w, 2304U, y, false, 6400U}}};
+    // Individually measured widths in an unlisted group or order, or outside the group's own heights, are K32.
+    const std::array<Bf16RowProjection, 2> pair_3072{{{w, 3072U, y, false, 0U}, {w, 3072U, y, false, 0U}}};
+    const std::array<Bf16RowProjection, 3> qkv_swapped{{{w, 1024U, y, false, 0U}, {w, 3072U, y, false, 0U},
+                                                        {w, 1024U, y, false, 0U}}};
+    const std::array<Bf16RowProjection, 3> wide_128_128{{{w, 3072U, y, false, 0U}, {w, 128U, y, false, 0U},
+                                                         {w, 128U, y, false, 0U}}};
+    const std::array<Bf16RowProjection, 4> four_wide{{{w, 3072U, y, false, 0U}, {w, 3072U, y, false, 0U},
+                                                      {w, 1024U, y, false, 0U}, {w, 1024U, y, false, 0U}}};
+    if (image_packed_schedule(policy, true, K, 8192U, pair_3072) ||
+        image_packed_schedule(policy, true, K, 8192U, qkv_swapped) ||
+        image_packed_schedule(policy, true, K, 8192U, wide_128_128) ||
+        image_packed_schedule(policy, true, K, 8192U, four_wide) ||
+        image_packed_schedule(policy, true, K, 8192U, std::span(qkv).first(2U)) == false ||
+        image_packed_schedule(policy, true, K + 64U, 8192U, qkv))
+        return false;
     if (!image_packed_schedule(policy, true, K, 4096U, n128) || !image_packed_schedule(policy, true, K, 8192U, n128) ||
         image_packed_schedule(policy, true, K, 8193U, n128) || image_packed_schedule(policy, true, K, 8236U, n128) ||
         image_packed_schedule(policy, true, K, 4096U, n256) || image_packed_schedule(policy, true, K, 8192U, n256) ||
@@ -443,7 +520,7 @@ static bool check_image_route_order() {
 int main() {
     if (!check_row_chunks() || !check_projection_groups() || !check_cuda_bf16_paths() ||
         !check_cuda_bf16_fast_terms() || !check_exact_operand_planes() || !check_image_routes() ||
-        !check_image_route_order() || !check_dense_declared()) {
+        !check_image_route_order() || !check_dense_declared() || !check_low_rank_bound()) {
         std::cerr << "Dense row or projection chunk policy failed\n";
         return 1;
     }

@@ -6,6 +6,8 @@
 #include <limits>
 #include <span>
 
+#include "weight_certificate.hpp"
+
 namespace strix::core {
 
 // The function a projection store applies to each completed FP32 sum when the projection rounds BF16 (a compile-time
@@ -41,8 +43,9 @@ enum class Bf16Operand : unsigned char { fp32, bf16_exact };
 // Activation planes the exact BF16 split needs. The split writes hi = RN_bf16(x),
 // mid = RN_bf16(x - hi), lo = RN_bf16(x - hi - mid), and each K16 step of the tall
 // chain issues lo, mid, hi into one accumulator that starts at +0. For a BF16-exact
-// finite x, mid and lo are +0, so the two leading MMAs add only zero products to an
-// accumulator that is never -0: one plane (hi) gives the same bits. This is an EXACT
+// finite x, mid and lo are +0, so the two leading MMAs add only zero products (finite
+// weights: 0 x inf would be NaN) to an accumulator that is never -0, and with sums that
+// stay finite one plane (hi) gives the same bits. This is an EXACT
 // schedule of the three-term arithmetic, not a FAST operand class.
 constexpr int exact_bf16_planes(Bf16Operand operand) {
     return operand == Bf16Operand::bf16_exact ? 1 : 3;
@@ -58,6 +61,24 @@ void dense_declared(Operations& operations, const float* input, unsigned width, 
         operations.dense(input, width, rows, projections, rounded ? Bf16Operand::bf16_exact : Bf16Operand::fp32);
     else
         operations.dense(input, width, rows, projections);
+}
+
+// Normalised rows the down projection of a low-rank controller reads as ONE operand: the raw row and one message
+// readout, concatenated. This is the whole operand whatever the number of readout banks.
+constexpr unsigned kLowRankDownRows = 2;
+
+// Admission of a low-rank controller's declared operands to the one-plane class (core/weight_certificate.hpp: down
+// reads kLowRankDownRows RMS-normalised BF16 rows of `width`, the gates read `rank` latent values). Precondition: the
+// residual rows are finite, so each normalised row has |row|_2 <= sqrt(width) up to rounding and the down operand has
+// |x|_1 <= 1.01 kLowRankDownRows width; with the weight maxima (finite_magnitude_max*) the latent is at most that
+// times down_max and each gate sum at most rank times latent times gate_max. With finite weights and both bounds below
+// 2^126, no partial sum, product or BF16 rounding of either chain leaves the finite range, so the one-plane bits are
+// the three-plane bits. False keeps the FP32 operand class. Non-finite residual rows are non-finite under either class.
+inline bool low_rank_operands_bounded(unsigned width, unsigned rank, float down_max, float gate_max) {
+    const float down_l1 = 1.01F * static_cast<float>(kLowRankDownRows) * static_cast<float>(width);
+    if (!one_plane_sum_bounded(down_l1, down_max)) return false;
+    const float latent = down_l1 * down_max;
+    return one_plane_sum_bounded(static_cast<float>(rank) * latent, gate_max);
 }
 
 // Verify step rows of the BF16 -> FP32 dense family: one warp reads its weight row once for a tile of up to
@@ -102,11 +123,24 @@ struct ImageShapeRow {
     unsigned max_rows{};
 };
 
+// One measured launch group: the packed schedule run once over `count` (2..4) projections of K input values whose
+// output counts are exactly outputs[0..count) in this order, all on one weight row pitch (pitch_elements, 0 = K), for
+// call heights [min_rows, max_rows]. Several projections in one launch share a grid; a group is calibrated as a launch,
+// not from its members' single widths.
+struct ImageGroupRow {
+    unsigned k{};
+    unsigned pitch_elements{};
+    unsigned count{};
+    unsigned outputs[4]{};
+    unsigned min_rows{};
+    unsigned max_rows{};
+};
+
 // Backend tile data of the image routes (not model data): the height from which the packed schedule is faster, its K
 // stage and tile width, the packed columns one call needs to pay for its image pass (the image costs rows x K x 6
 // bytes; the packed schedule saves a share of each whole tile's FP32-route time; both scale with rows x K), the
-// heights [min_rows, max_rows] and the shapes (K, output tiles, pitch) the measurements cover. A call outside any of
-// them keeps the incumbent launches (an image call the K32 image tile, an FP32 call its FP32 rows); no shape listed
+// heights [min_rows, max_rows], the shapes (K, output tiles, pitch) of single-projection launches and the launch
+// groups the measurements cover. A call outside any of them keeps the incumbent launches (an image call the K32 image tile, an FP32 call its FP32 rows); no shape listed
 // means none is measured.
 struct ImageRoutePolicy {
     unsigned min_rows{};
@@ -115,6 +149,7 @@ struct ImageRoutePolicy {
     unsigned min_packed_columns{};
     unsigned max_rows{};
     std::span<const ImageShapeRow> shapes{};
+    std::span<const ImageGroupRow> groups{};
 };
 
 // Whether the policy's measurements cover a call of this height.
@@ -142,17 +177,38 @@ constexpr bool image_shape_measured(const ImageRoutePolicy& policy, unsigned inp
     return false;
 }
 
+// Whether one packed launch over these projections is a measured launch: a single projection of a measured shape, or
+// several projections that match a listed group exactly (order, outputs, one pitch, height).
+constexpr bool image_launch_measured(const ImageRoutePolicy& policy, unsigned input_width, unsigned rows,
+                                     std::span<const Bf16RowProjection> projections) noexcept {
+    if (projections.empty()) return false;
+    if (projections.size() == 1U)
+        return image_shape_measured(policy, input_width, projections[0].outputs, projections[0].row_bytes, rows);
+    if (!image_rows_measured(policy, rows)) return false;
+    const auto natural = std::size_t{input_width} * sizeof(std::uint16_t);
+    for (const auto& row : policy.groups) {
+        if (row.k != input_width || row.count != projections.size() || rows < row.min_rows || rows > row.max_rows)
+            continue;
+        const auto measured_pitch = row.pitch_elements != 0U ? std::size_t{row.pitch_elements} * sizeof(std::uint16_t)
+                                                              : std::size_t{row.k} * sizeof(std::uint16_t);
+        bool same = true;
+        for (std::size_t i = 0; i < projections.size() && same; ++i)
+            same = projections[i].outputs == row.outputs[i] &&
+                   (projections[i].row_bytes != 0U ? std::size_t{projections[i].row_bytes} : natural) == measured_pitch;
+        if (same) return true;
+    }
+    return false;
+}
+
 // Which launch an image call takes.
 enum class ImageLaunch : unsigned char { k32_image, k64_packed };
 
 // Whether a call on an existing BF16 image takes the packed schedule instead of the image tile: only on the device
-// class the policy was measured on, and only when every projection is inside the measured heights and shapes.
+// class the policy was measured on, and only when the launch itself (this projection or this group, at this height) is
+// a measured one.
 constexpr bool image_packed_schedule(const ImageRoutePolicy& policy, bool measured_device, unsigned input_width,
                                      unsigned rows, std::span<const Bf16RowProjection> projections) noexcept {
-    if (!measured_device || projections.empty()) return false;
-    for (const auto& projection : projections)
-        if (!image_shape_measured(policy, input_width, projection.outputs, projection.row_bytes, rows)) return false;
-    return true;
+    return measured_device && image_launch_measured(policy, input_width, rows, projections);
 }
 
 // Routes of the projections of one call on FP32 rows [rows][input_width] (routes.size() >= projections.size()).
@@ -162,7 +218,9 @@ constexpr bool image_packed_schedule(const ImageRoutePolicy& policy, bool measur
 // within max_outputs and the policy's measured shapes, 16-byte aligned weights, a row pitch of whole 16-byte units no shorter than the row and
 // outputs x pitch addressable; image = what image_admits(projection) accepts; fp32_rows otherwise. Returns false,
 // every route fp32_rows, when the call keeps its FP32 rows: a height outside [min_rows, max_rows], K not a multiple
-// of the stage, or fewer packed columns than min_packed_columns.
+// of the stage, or fewer packed columns than min_packed_columns. A packed projection is a measured launch on its own
+// (image_shape_measured); for_each_image_route_run, given the policy, launches the packed projections only as
+// measured launches (single projections, or the listed groups), so every launch a planned call makes is measured.
 template <std::size_t GroupMax, class GroupAdmits, class ImageAdmits>
 bool plan_image_routes(const ImageRoutePolicy& policy, unsigned input_width, unsigned rows,
                        std::span<const Bf16RowProjection> projections, unsigned max_outputs,
@@ -242,12 +300,15 @@ inline bool image_routes_order_free(const float* input, unsigned input_width, un
 }
 
 // The launches of a routed call: for each route (packed, image, fp32_rows) the projections of that route in call order,
-// in runs of at most Limit that share the rounding class and the row pitch; launch(route, run). An fp32_rows run stays
+// in runs of at most Limit that share the rounding class and the row pitch; launch(route, run). With a policy the packed
+// runs are cut into measured launches: from the front of a run, the longest prefix that image_launch_measured lists
+// (a single projection when no group matches), so the packed schedule never launches an unmeasured grouping. An fp32_rows run stays
 // inside one incumbent group (Limit consecutive projections, as plan_image_routes groups them), so it never joins a
 // projection of a group the incumbent runs on the WMMA tile with one of a group it runs elsewhere.
 template <std::size_t Limit, class Status, class Launch>
 Status for_each_image_route_run(std::span<const Bf16RowProjection> projections, std::span<const ImageRoute> routes,
-                                unsigned input_width, Status success, const Launch& launch) {
+                                unsigned input_width, Status success, const Launch& launch,
+                                const ImageRoutePolicy* measured = nullptr, unsigned rows = 0U) {
     static_assert(Limit > 0);
     const auto natural = std::size_t{input_width} * sizeof(std::uint16_t);
     const auto pitch = [natural](const Bf16RowProjection& p) { return p.row_bytes != 0U ? p.row_bytes : natural; };
@@ -255,7 +316,17 @@ Status for_each_image_route_run(std::span<const Bf16RowProjection> projections, 
         Bf16RowProjection run[Limit]{};
         std::size_t count = 0, group = 0;
         const auto flush = [&]() {
-            const auto status = count == 0U ? success : launch(route, std::span<const Bf16RowProjection>(run, count));
+            Status status = success;
+            std::size_t at = 0;
+            while (at < count && status == success) {
+                std::size_t n = count - at;
+                if (measured && route == ImageRoute::packed)
+                    while (n > 1U && !image_launch_measured(*measured, input_width, rows,
+                                                            std::span<const Bf16RowProjection>(run + at, n)))
+                        --n;
+                status = launch(route, std::span<const Bf16RowProjection>(run + at, n));
+                at += n;
+            }
             count = 0;
             return status;
         };

@@ -52,11 +52,13 @@ public:
     DeviceCliDecoder(const serve::SerialGenerationLoad& load, bool step_graphs, weight::FormatId storage,
                      const char* dspark,
                      moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16,
-                     bool combine_image = false)
+                     bool combine_image = false, bool prepared_round_fold = false)
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
                    load.verify_rows, dspark != nullptr, 1U, load.prefill_tail) {
-        const bool down_image = configure_mini_decoder(decoder_, moe_w4a4, combine_image);
-        std::cerr << "Inkling down_image " << mini_down_image_name(down_image, combine_image) << '\n';
+        const auto levers = configure_mini_decoder(decoder_, moe_w4a4, combine_image, prepared_round_fold);
+        std::cerr << "Inkling down_image " << mini_down_image_name(levers.down_image, combine_image) << '\n';
+        std::cerr << "Inkling prepared_round_fold " << mini_round_fold_name(levers.prepared_round_fold, prepared_round_fold)
+                  << '\n';
         if (dspark) drafter_.emplace(decoder_, load.positions, dspark);
     }
 
@@ -136,8 +138,10 @@ inline void run_gate(const char* checkpoint, const Options& options, const serve
                 options.step_graphs.value_or(MiniResidentBackend::default_step_graphs), weights.storage);
         });
     auto& decoder = *resident;
-    const bool down_image = configure_mini_decoder(decoder, options.tier);
-    std::cerr << "Inkling down_image " << mini_down_image_name(down_image, mini_combine_image(options.tier)) << '\n';
+    const auto levers = configure_mini_decoder(decoder, options.tier);
+    std::cerr << "Inkling down_image " << mini_down_image_name(levers.down_image, mini_combine_image(options.tier)) << '\n';
+    std::cerr << "Inkling prepared_round_fold "
+              << mini_round_fold_name(levers.prepared_round_fold, mini_prepared_round_fold(options.tier)) << '\n';
     if (mini_moe_w4a4(options.tier))
         std::cerr << "strix-moe-w4a4 class " << moe_core::grouped_w4a4::identity(mini_moe_w4a4_class(options.tier)) << '\n';
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
@@ -315,8 +319,9 @@ int main(int argc, char** argv) {
 #endif
         family.load = [step_graphs, storage = weights.storage, dspark = options.dspark,
                        moe_w4a4 = mini_moe_w4a4_class(options.tier),
-                       combine_image = mini_combine_image(options.tier)](const serve::SerialGenerationLoad& load) {
-            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, moe_w4a4, combine_image);
+                       combine_image = mini_combine_image(options.tier),
+                       round_fold = mini_prepared_round_fold(options.tier)](const serve::SerialGenerationLoad& load) {
+            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, moe_w4a4, combine_image, round_fold);
         };
         const auto write_profile = [&] {
             cli::write_profile(options.tier, std::cerr, true);

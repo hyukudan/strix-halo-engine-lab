@@ -220,8 +220,10 @@ inline hipError_t enqueue_screened_greedy(const PlaneView& plane, const screened
 inline constexpr unsigned kLanesWaves = 32U;
 
 // ---- Lanes: several activation rows against one head (verify rows, cohort lanes), screened_head_plan::Launch. ----
-// Pass 1 of a group of Lanes lanes: block row blockIdx.y serves lanes [y * Lanes, min(lanes, (y + 1) * Lanes)); xs holds
-// their activations ([Lanes][width]). Each plane row is loaded and decoded once for the group; every lane keeps its own
+// Pass 1 of a group of Lanes lanes: blockIdx.x serves lanes [x * Lanes, min(lanes, (x + 1) * Lanes)); blockIdx.y
+// walks the plane rows. Groups are the fastest grid dimension so blocks reading the same plane rows can share
+// those reads through the cache. Their activations live in xs ([Lanes][width]). Each plane row is loaded and
+// decoded once for the group; every lane keeps its own
 // FMA chain in pass1_kernel's order, so its upper[], its bound flag and its L* are the ones the one-row launch computes on
 // that lane. A lane whose prep raised the fallback flag is skipped (its compact runs every row, as in the one-row form).
 template <unsigned Bits, unsigned Lanes>
@@ -229,7 +231,7 @@ __global__ void __launch_bounds__(kLanesWaves * 32U) pass1_lanes_kernel(PlaneVie
                                                                         unsigned x_stride, screened_head::Bound bound,
                                                                         State* state, float* upper, unsigned upper_stride) {
     extern __shared__ float xs[];
-    const unsigned first = blockIdx.y * Lanes;
+    const unsigned first = blockIdx.x * Lanes;
     const unsigned live = lanes - first < Lanes ? lanes - first : Lanes;
     bool on[Lanes];
     float nx[Lanes];
@@ -258,7 +260,7 @@ __global__ void __launch_bounds__(kLanesWaves * 32U) pass1_lanes_kernel(PlaneVie
         lmax[l] = -__builtin_inff();
         bad[l] = false;
     }
-    for (unsigned row = blockIdx.x * kLanesWaves + wave; row < plane.rows; row += gridDim.x * kLanesWaves) {
+    for (unsigned row = blockIdx.y * kLanesWaves + wave; row < plane.rows; row += gridDim.y * kLanesWaves) {
         const std::uint8_t* base = plane.data + std::size_t{row} * plane.row_bytes;
         const std::uint16_t* scales = reinterpret_cast<const std::uint16_t*>(base + plane.scales_offset);
         float acc[Lanes];
@@ -362,7 +364,7 @@ inline hipError_t enqueue_screened_greedy_lanes(const screened_head_plan::Launch
     } else {
         // The same waves in flight as the one-row launch: grids.pass1 blocks of kPass1Waves -> blocks of kLanesWaves.
         const unsigned blocks = std::max(1U, a.grids.pass1 * kPass1Waves / kLanesWaves);
-        const dim3 grid(blocks, screened_head_plan::pass1_groups(a.lanes, per));
+        const dim3 grid(screened_head_plan::pass1_groups(a.lanes, per), blocks);
         const std::size_t lds = std::size_t{per} * a.head.width * sizeof(float);
         const auto stride = static_cast<unsigned>(layout.upper_stride);
         const auto run = [&](auto kernel) {
@@ -392,6 +394,181 @@ inline hipError_t enqueue_screened_greedy_lanes(const screened_head_plan::Launch
         pick_kernel<<<1, 256, 0, stream>>>(lane_y, lane_ids, state + l, a.head.rows, a.capacity, a.head.softcap,
                                            device_replies + l);
     }
+    return hipGetLastError();
+}
+
+// ---- Rescore trait (screened_head_plan::RescoreLaunch): exact rows for the largest approximate scores. ----
+// Launches (blockIdx.y = lane for every launch but pass 2): clear, digit 1 histogram, digit 1 select, digit 2 histogram,
+// digit 2 select, compact, pass 2 (the incumbent mapped_rows_kernel per lane, as in the lanes form above), scatter.
+// The histograms count integers, so the threshold and the selected set never depend on the block / atomic order; the
+// compacted order of the ids may, and nothing reads it but the scatter, which writes each id's own score.
+using screened_head_plan::kRescoreBins;
+using screened_head_plan::RescoreState;
+inline constexpr unsigned kRescoreThreads = 256U;
+inline constexpr unsigned kRescoreBinsPerThread = kRescoreBins / kRescoreThreads;
+static_assert(kRescoreBinsPerThread == 16U, "16 bins per select thread");
+
+template <unsigned Digit>
+__global__ void __launch_bounds__(kRescoreThreads) rescore_hist_kernel(const float* scores, unsigned pitch,
+                                                                       unsigned rows, const RescoreState* states,
+                                                                       unsigned* hist, std::size_t hist_stride) {
+    __shared__ unsigned counts[kRescoreBins];
+    const unsigned lane = blockIdx.y;
+    const float* s = scores + std::size_t{lane} * pitch;
+    unsigned* h = hist + std::size_t{lane} * hist_stride + (Digit == 1U ? 0U : kRescoreBins);
+    const unsigned first = Digit == 1U ? 0U : states[lane].digit;
+    for (unsigned b = threadIdx.x; b < kRescoreBins; b += kRescoreThreads) counts[b] = 0U;
+    __syncthreads();
+    for (unsigned i = blockIdx.x * kRescoreThreads + threadIdx.x; i < rows; i += gridDim.x * kRescoreThreads) {
+        const unsigned key = screened_head_plan::rescore_order_key_bits(__float_as_uint(s[i]));
+        if (Digit == 1U) atomicAdd(&counts[key >> 20U], 1U);
+        else if ((key >> 20U) == first) atomicAdd(&counts[(key >> 8U) & (kRescoreBins - 1U)], 1U);
+    }
+    __syncthreads();
+    for (unsigned b = threadIdx.x; b < kRescoreBins; b += kRescoreThreads)
+        if (counts[b] != 0U) atomicAdd(&h[b], counts[b]);
+}
+
+// One block per lane: the largest bin whose suffix count (bins >= it) reaches the rank still needed; none -> the
+// threshold falls to 0 (every row: the lane has fewer rows than k). Thread t owns bins [16 t, 16 t + 16).
+template <unsigned Digit>
+__global__ void __launch_bounds__(kRescoreThreads) rescore_select_kernel(RescoreState* states, const unsigned* hist,
+                                                                         std::size_t hist_stride, unsigned k) {
+    __shared__ unsigned suffix[kRescoreThreads + 1U];
+    __shared__ unsigned found;
+    const unsigned lane = blockIdx.x;
+    RescoreState& st = states[lane];
+    const unsigned* h = hist + std::size_t{lane} * hist_stride + (Digit == 1U ? 0U : kRescoreBins);
+    const unsigned need = Digit == 1U ? k : st.need;
+    const unsigned t = threadIdx.x;
+    unsigned own[kRescoreBinsPerThread];
+    unsigned sum = 0U;
+#pragma unroll
+    for (unsigned j = 0; j < kRescoreBinsPerThread; ++j) {
+        own[j] = h[t * kRescoreBinsPerThread + j];
+        sum += own[j];
+    }
+    suffix[t] = sum;
+    if (t == 0U) {
+        suffix[kRescoreThreads] = 0U;
+        found = 0U;
+    }
+    __syncthreads();
+    if (t == 0U)  // suffix[u] = count of bins >= 16 u (integer sums: no order question)
+        for (unsigned u = kRescoreThreads; u-- > 0U;) suffix[u] += suffix[u + 1U];
+    __syncthreads();
+    // The one owner of the answer: its range holds the bin where the suffix count first reaches `need` (need >= 1).
+    if (need != 0U && suffix[t] >= need && suffix[t + 1U] < need) {
+        unsigned above = suffix[t + 1U];
+        unsigned bin = t * kRescoreBinsPerThread;
+        bool done = false;
+#pragma unroll
+        for (int j = static_cast<int>(kRescoreBinsPerThread) - 1; j >= 0; --j) {
+            if (done) continue;
+            if (above + own[j] >= need) {
+                bin = t * kRescoreBinsPerThread + static_cast<unsigned>(j);
+                done = true;
+            } else {
+                above += own[j];
+            }
+        }
+        found = 1U;
+        if (Digit == 1U) {
+            st.digit = bin;
+            st.need = need - above;
+        } else {
+            st.key = (st.digit << 20U) | (bin << 8U);
+        }
+    }
+    __syncthreads();
+    if (t == 0U && found == 0U) {  // fewer than `need` rows: select every row
+        if (Digit == 1U) {
+            st.digit = 0U;
+            st.need = 0U;
+        } else {
+            st.key = 0U;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(kRescoreThreads) rescore_compact_kernel(const float* scores, unsigned pitch,
+                                                                          unsigned rows, RescoreState* states,
+                                                                          std::uint32_t* ids, std::size_t ids_stride,
+                                                                          unsigned capacity) {
+    const unsigned l = blockIdx.y;
+    const float* s = scores + std::size_t{l} * pitch;
+    RescoreState& st = states[l];
+    std::uint32_t* lane_ids = ids + std::size_t{l} * ids_stride;
+    const unsigned threshold = st.key;
+    const unsigned lane = threadIdx.x % static_cast<unsigned>(warpSize);
+    for (unsigned base = blockIdx.x * kRescoreThreads; base < rows; base += gridDim.x * kRescoreThreads) {
+        const unsigned i = base + threadIdx.x;
+        const bool hit = i < rows && screened_head_plan::rescore_order_key_bits(__float_as_uint(s[i])) >= threshold;
+        const unsigned long long mask = __ballot(hit);
+        if (mask == 0ULL) continue;
+        const unsigned leader = static_cast<unsigned>(__ffsll(static_cast<long long>(mask))) - 1U;
+        unsigned first = 0U;
+        if (lane == leader) first = atomicAdd(&st.count, static_cast<unsigned>(__popcll(mask)));
+        first = __shfl(first, static_cast<int>(leader));
+        const unsigned slot = first + static_cast<unsigned>(__popcll(mask & ((1ULL << lane) - 1ULL)));
+        if (hit && slot < capacity) lane_ids[slot] = i;
+    }
+}
+
+// Writes the recomputed rows back: output o of pass 2 is row ids[o] (or row o when the count overflowed: every row).
+__global__ void __launch_bounds__(kRescoreThreads) rescore_scatter_kernel(float* scores, unsigned pitch, unsigned rows,
+                                                                          const RescoreState* states,
+                                                                          const std::uint32_t* ids,
+                                                                          std::size_t ids_stride, const float* y,
+                                                                          std::size_t y_stride, unsigned capacity,
+                                                                          float cap) {
+    const unsigned l = blockIdx.y;
+    const unsigned count = states[l].count;
+    const bool all = count > capacity;
+    const unsigned n = all ? rows : count;
+    float* s = scores + std::size_t{l} * pitch;
+    const std::uint32_t* lane_ids = ids + std::size_t{l} * ids_stride;
+    const float* lane_y = y + std::size_t{l} * y_stride;
+    for (unsigned o = blockIdx.x * kRescoreThreads + threadIdx.x; o < n; o += gridDim.x * kRescoreThreads)
+        s[all ? o : lane_ids[o]] = head_transform(lane_y[o], cap);
+}
+
+// The rescore trait on `a.lanes` rows of approximate scores (screened_head_plan.hpp states the selection rule). Graph
+// capture safe: one memset node and fixed grids, no host read.
+inline hipError_t enqueue_rescore_rows(const screened_head_plan::RescoreLaunch& a, hipStream_t stream) {
+    if (!screened_head_plan::rescore_launch_valid(a)) return hipErrorInvalidValue;
+    const auto layout = screened_head_plan::rescore_layout(a.head.rows, a.capacity, a.lanes);
+    auto* states = reinterpret_cast<RescoreState*>(a.scratch);
+    auto* hist = reinterpret_cast<unsigned*>(a.scratch + layout.hist);
+    auto* ids = reinterpret_cast<std::uint32_t*>(a.scratch + layout.ids);
+    auto* y = reinterpret_cast<float*>(a.scratch + layout.y);
+    if (const auto e = hipMemsetAsync(a.scratch, 0, layout.cleared, stream); e != hipSuccess) return e;
+    const dim3 grid(screened_head_plan::rescore_blocks(a.head.rows), a.lanes);
+    rescore_hist_kernel<1U><<<grid, kRescoreThreads, 0, stream>>>(a.scores, a.pitch, a.head.rows, states, hist,
+                                                                  layout.hist_stride);
+    if (const auto e = hipGetLastError(); e != hipSuccess) return e;
+    rescore_select_kernel<1U><<<a.lanes, kRescoreThreads, 0, stream>>>(states, hist, layout.hist_stride, a.k);
+    if (const auto e = hipGetLastError(); e != hipSuccess) return e;
+    rescore_hist_kernel<2U><<<grid, kRescoreThreads, 0, stream>>>(a.scores, a.pitch, a.head.rows, states, hist,
+                                                                  layout.hist_stride);
+    if (const auto e = hipGetLastError(); e != hipSuccess) return e;
+    rescore_select_kernel<2U><<<a.lanes, kRescoreThreads, 0, stream>>>(states, hist, layout.hist_stride, a.k);
+    if (const auto e = hipGetLastError(); e != hipSuccess) return e;
+    rescore_compact_kernel<<<grid, kRescoreThreads, 0, stream>>>(a.scores, a.pitch, a.head.rows, states, ids,
+                                                                 layout.ids_stride, a.capacity);
+    if (const auto e = hipGetLastError(); e != hipSuccess) return e;
+    const dense_linear::View view{reinterpret_cast<const std::uint8_t*>(a.head.weights), a.head.width, a.head.rows,
+                                  std::size_t{a.head.width} * sizeof(std::uint16_t)};
+    for (unsigned l = 0; l < a.lanes; ++l) {
+        dense_linear::mapped_rows_kernel<weight_decode::Format::bf16>
+            <<<a.pass2_blocks, screened_head_plan::kRescorePass2Threads, 0, stream>>>(
+            view, a.x + std::size_t{l} * a.x_stride, y + std::size_t{l} * layout.y_stride,
+            dense_linear::MappedRows{ids + std::size_t{l} * layout.ids_stride, &states[l].count, a.capacity});
+        if (const auto e = hipGetLastError(); e != hipSuccess) return e;
+    }
+    rescore_scatter_kernel<<<grid, kRescoreThreads, 0, stream>>>(a.scores, a.pitch, a.head.rows, states, ids,
+                                                                 layout.ids_stride, y, layout.y_stride, a.capacity,
+                                                                 a.head.softcap);
     return hipGetLastError();
 }
 

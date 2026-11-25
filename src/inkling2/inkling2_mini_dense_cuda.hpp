@@ -10,8 +10,9 @@ using MiniCudaDenseProjection = core::Bf16RowProjection;
 inline cudaError_t enqueue_mini_cuda_dense_rows(
     const float* input, unsigned input_width, unsigned rows, std::span<const MiniCudaDenseProjection> projections,
     cudaStream_t stream, cuda_core::DenseArith arithmetic = cuda_core::DenseArith::mma3,
-    cuda_core::BigCtx* context = nullptr) {
-    return cuda_core::enqueue_bf16_dense_rows(input, input_width, rows, projections, stream, arithmetic, context);
+    cuda_core::BigCtx* context = nullptr, core::Bf16Operand operand = core::Bf16Operand::fp32) {
+    return cuda_core::enqueue_bf16_dense_rows(input, input_width, rows, projections, stream, arithmetic, context,
+                                              nullptr, operand);
 }
 
 inline cudaError_t enqueue_mini_cuda_rmsnorm(const float* input, const std::uint16_t* gain, float* output,

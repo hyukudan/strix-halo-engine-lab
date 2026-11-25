@@ -1,4 +1,6 @@
+#include "inkling2/inkling2_mini_resident_route.hpp"
 #include "inkling2/inkling2_mini_serve.hpp"
+#include "inkling2/inkling2_mini_weight_options.hpp"
 #include "strix/serve/fixed_kv_cohort.hpp"
 #include "strix/serve/http_client.hpp"
 #include "strix/serve/replica_router.hpp"
@@ -300,6 +302,16 @@ void set_w4a4_env(const char* value) {
 #endif
 }
 
+// The prepared-attention round fold switch of the served process (off unless 1 selects it, in any profile).
+void set_round_fold_env(const char* value) {
+#ifdef _WIN32
+    require(_putenv_s("STRIX_INK_PREPARED_ROUND_FOLD", value ? value : "") == 0, "cannot set STRIX_INK_PREPARED_ROUND_FOLD");
+#else
+    require((value ? setenv("STRIX_INK_PREPARED_ROUND_FOLD", value, 1) : unsetenv("STRIX_INK_PREPARED_ROUND_FOLD")) == 0,
+            "cannot set STRIX_INK_PREPARED_ROUND_FOLD");
+#endif
+}
+
 // The served down-image lever value (process environment, as strix-serve reads it); nullptr clears it.
 void set_image_env(const char* value) {
 #ifdef _WIN32
@@ -311,7 +323,8 @@ void set_image_env(const char* value) {
 }
 
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
-            W4a4 w4a4 = W4a4::bf16, bool image = false, const PrefillCase& prefill = {{}, 128U}) {
+            W4a4 w4a4 = W4a4::bf16, bool image = false, bool round_fold = false,
+            const PrefillCase& prefill = {{}, 128U}) {
     sv::ServiceFactories factories;
     bool created = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
@@ -326,6 +339,16 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                                                                                    : mini::MiniPrefillBackend::cuda,
                                                 options.tier).http,
                     "HTTP prefill slice is not the declared selection");
+        require(options.prepared_round_fold == round_fold, "prepared round fold did not reach native adapter");
+        // What the served backend then runs: the CUDA preparation has no fold, so a requested fold is declined there and the
+        // startup line must say so; the qualified HIP target admits it. Same admission and same name as the CLI and the gate.
+        const bool hip = std::string_view(backend) == "hip";
+        const bool effective = mini::mini_prepared_round_fold_admitted(hip, "gfx1151");
+        require(effective == hip, "the effective round fold follows the backend");
+        require(std::string_view(mini::mini_round_fold_name(options.prepared_round_fold && effective,
+                                                           options.prepared_round_fold)) ==
+                    (!round_fold ? "off" : hip ? "on" : "declined"),
+                "the served round fold is reported by its effective state");
         // The served prefill resolves the down-image lever like the CLI and the gate do: off unless selected explicitly.
         require(options.combine_image == image, "down-image selection did not reach native adapter");
         require(options.tier == strix::profile::Name::fast && options.weight_options.qualify_q8 == qualify_q8,
@@ -455,6 +478,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
 int main(int argc, char** argv) try {
     require(argc == 2, "expected repository root");
     set_image_env(nullptr);
+    set_round_fold_env(nullptr);
     admission();
     sampling();
     for (const auto* backend : {"hip", "cuda"}) {
@@ -463,9 +487,9 @@ int main(int argc, char** argv) try {
     }
     wiring(argv[1], "cuda", false, true);
     for (const auto* backend : {"hip", "cuda"}) {
-        wiring(argv[1], backend, false, false, W4a4::bf16, false, PrefillCase{{std::string("--prefill-rows"), std::string("1024")}, 1024U});
-        wiring(argv[1], backend, false, false, W4a4::bf16, false, PrefillCase{{std::string("--context"), std::string("64")}, 64U});
-        wiring(argv[1], backend, false, false, W4a4::bf16, false, PrefillCase{{"--context", "64", "--prefill-rows", "4096"}, 64U});
+        wiring(argv[1], backend, false, false, W4a4::bf16, false, false, PrefillCase{{std::string("--prefill-rows"), std::string("1024")}, 1024U});
+        wiring(argv[1], backend, false, false, W4a4::bf16, false, false, PrefillCase{{std::string("--context"), std::string("64")}, 64U});
+        wiring(argv[1], backend, false, false, W4a4::bf16, false, false, PrefillCase{{"--context", "64", "--prefill-rows", "4096"}, 64U});
     }
     // Every lever value reaches the served decoder as its own class (mse used to run nearest@1 there).
     for (const auto& [value, expected] : {std::pair{"1", W4a4::nvfp4}, std::pair{"mse", W4a4::nvfp4_mse},
@@ -474,9 +498,15 @@ int main(int argc, char** argv) try {
         wiring(argv[1], "cuda", false, false, expected);
     }
     set_w4a4_env(nullptr);
-    // Default off (no profile selects it); an explicit selection reaches the adapter, an explicit 0 keeps it off.
+    // Both selections are off by default (no profile selects them); an explicit 1 reaches the adapter, an explicit 0 keeps it off.
+    set_round_fold_env(nullptr);
     set_image_env(nullptr);
     wiring(argv[1], "hip", false);
+    set_round_fold_env("1");
+    for (const auto* backend : {"hip", "cuda"}) wiring(argv[1], backend, false, false, W4a4::bf16, false, true);
+    set_round_fold_env("0");
+    wiring(argv[1], "hip", false);
+    set_round_fold_env(nullptr);
     set_image_env("1");
     for (const auto* backend : {"hip", "cuda"}) wiring(argv[1], backend, false, false, W4a4::bf16, true);
     set_image_env("0");
