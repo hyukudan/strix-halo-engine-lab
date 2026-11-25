@@ -324,6 +324,9 @@ int main() try {
             require(hy::resolve(other, in)->find("prompt_rows")->value == "4096", "adjacent Hy4 band keeps its schedule");
             in.cli = {{"prompt_rows", "4096"}};
             require(hy::resolve(measured, in)->find("prompt_rows")->value == "4096", "Hy4 explicit window width wins");
+            in.cli = {{"head_q8", "0"}};
+            require(hy::resolve(measured, in)->find("prompt_rows")->value == "4096",
+                    "unpriced Hy4 head override keeps the incumbent schedule");
             in.cli.clear();
         }
         in.profile = Name::standard;
