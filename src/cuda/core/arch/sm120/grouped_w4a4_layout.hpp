@@ -15,8 +15,10 @@
 // per MAC 0.031 B (was 0.043). 4 stages in a cp.async ring (80 KiB dynamic shared memory, one CTA per SM), one barrier per stage.
 // The registers a lane holds and the MMA order per accumulator (stage ascending, 64-input block ascending) are those of the
 // 64-row form, so every output element has the same bits (identity grouped-nvfp4-w4a4-f32-v1 unchanged).
-// Rows: a warp whose n8 block starts at or past the tile's live rows issues neither its B loads nor its MMAs, and the stage copy
-// skips activation rows past the live rows rounded up to 8 (never read); rows in a partly live n8 block are zero-filled.
+// Rows: a warp whose n8 block starts at or past the tile's live rows issues neither its B loads nor its MMAs. The stage copy
+// (code_copy_rows / scale_copy_rows) writes activation code rows up to the live rows rounded up to 16 (the x4 B load reads
+// n8 blocks in pairs) and scale rows up to the live rows rounded up to 8; rows past the live rows are zero-filled, rows past
+// those extents are neither copied nor read.
 #include <cstddef>
 #include <cstdint>
 
@@ -37,6 +39,12 @@ inline constexpr unsigned kSmem = kStages * kStageBytes;  // 81,920 B dynamic (s
 static_assert(kSmem <= 99U * 1024U && kRowBytes % 16U == 0U && kScaleOffset % 16U == 0U);
 // Two activation terms (one K sweep): a stage holds the weight block once and one activation block per term; three stages.
 STRIX_GW4_HD constexpr unsigned stage_bytes(unsigned terms) { return kWBytes + terms * kXBytes; }
+// Activation stage-copy extents of a slice with `rows` live rows (<= kRows), shared by the kernel and the host simulation: code
+// rows r < code_copy_rows(rows) = rows rounded up to 16 are copied (one x4 B load covers two n8 blocks, so the partner block of
+// the last live n8 block is read), scale rows r < scale_copy_rows(rows) = rows rounded up to 8 (scale words are read per live
+// n8 block only).
+STRIX_GW4_HD constexpr unsigned code_copy_rows(unsigned rows) { return (rows + 15U) & ~15U; }
+STRIX_GW4_HD constexpr unsigned scale_copy_rows(unsigned rows) { return (rows + 7U) & ~7U; }
 STRIX_GW4_HD constexpr unsigned stage_count(unsigned terms) { return terms == 1U ? kStages : 3U; }
 STRIX_GW4_HD constexpr unsigned smem_bytes(unsigned terms) { return stage_count(terms) * stage_bytes(terms); }
 static_assert(smem_bytes(1U) == kSmem && smem_bytes(2U) <= 99U * 1024U, "92,160 B for two terms");

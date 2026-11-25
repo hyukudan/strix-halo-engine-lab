@@ -83,7 +83,7 @@ __global__ void __launch_bounds__(kThreads, 1) projection(const contract::Args a
     tile.input += std::size_t{first_row} * tile.input_row;
     tile.output += std::size_t{first_row} * tile.output_row;
     tile.rows -= first_row;
-    const unsigned rows = tile.rows < kRows ? tile.rows : kRows, rows8 = (rows + 7U) & ~7U, rows16 = (rows + 15U) & ~15U;
+    const unsigned rows = tile.rows < kRows ? tile.rows : kRows, rows8 = scale_copy_rows(rows), rows16 = code_copy_rows(rows);
     extern __shared__ __align__(16) std::uint8_t smem[];
     const std::uint32_t base = static_cast<std::uint32_t>(__cvta_generic_to_shared(smem));
     const unsigned thread = threadIdx.x, lane = thread & 31U, warp = thread >> 5U;
