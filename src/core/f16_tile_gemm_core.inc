@@ -10,8 +10,9 @@ __device__ __forceinline__ void core(const Args& p, typename Sched::Storage& lds
                                      const Weights& weights, const Pair& pair = {}, const Rows& source = {}) {
     static_assert(kA16 && L == Layout::NK);
 #elif defined(STRIX_F16_TILE_PLAIN_BF16)
-// Test hook: apply(sum, row, column) sees each completed sum before the projection epilogue; the identity default
-// leaves production launches unchanged. A fixture substitutes sums to put chosen payloads through the real epilogue.
+// Test hook: apply(sum, row, output column of the projection) sees each completed sum before the projection epilogue;
+// the identity default leaves production launches unchanged. A fixture substitutes sums to put chosen payloads through
+// the real epilogue.
 struct AccumulatorTap {
     __device__ static __forceinline__ float apply(float sum, unsigned, unsigned) { return sum; }
 };
@@ -391,7 +392,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #else
                     // Projections with round_bf16 store the BF16-rounded FP32 sum (same rounding as fma_rows; Round selects the function).
                     if (col < left) {
-                        const float sum = Tap::apply(acc[m][t][j], r, col);
+                        const float sum = Tap::apply(acc[m][t][j], r, col0 + col);
                         store.put(b, r, col, projection.round_bf16 ? round_stored<Round>(sum) : sum);
                     }
 #endif

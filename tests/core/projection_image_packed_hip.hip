@@ -199,7 +199,7 @@ int main(int argc, char** argv) {
                                      {"routed_o_pitched", 3072U, {2304U}, true, true, 3200U, true},
                                      {"routed_o_pitch3328", 3072U, {2304U}, true, true, 3328U, false},  // pitch not measured
                                      {"routed_kv_narrow", 2304U, {1024U, 32U}, false, true, 0U, false},
-                                     {"routed_wide_n128_pair", 2304U, {5120U, 128U, 128U}, false, true, 0U, false}};  // unlisted group: its cut would add launches, the call keeps the incumbent
+                                     {"routed_wide_unlisted", 2304U, {5120U, 1024U, 1024U}, false, true, 0U, false}};  // unlisted group: its cut adds launches, the call keeps the incumbent
     const std::vector<unsigned> heights = {1000U, 1024U, 4096U, 4100U, 8192U, 8209U, 8236U, 9216U, 9232U};  // 9,232: above the measured band
     std::mt19937 rng(20261124U);
     std::normal_distribution<float> nd(0.0F, 1.0F);
@@ -247,7 +247,7 @@ int main(int argc, char** argv) {
             {"q_call_4095", 2304U, 4095U, {3072U, 384U, 24U, 3072U, 1024U, 1024U}, false, 0U, 99U, {}},
             {"k_off_stage", 2336U, 8192U, {3072U, 1024U}, false, 0U, 99U, {}},
             {"mixed_align", 2304U, 4096U, {2048U, 32U}, false, 0U, 1U, {}},
-            {"mixed_groups", 2304U, 4096U, {2048U, 1024U, 24U, 2048U, 32U}, false, 0U, 4U, {P, P, I, F, F}},
+            {"mixed_groups", 2304U, 4096U, {3072U, 3072U, 24U, 2048U, 32U}, false, 0U, 4U, {P, P, I, F, F}},
         };
         std::vector<float> host_b(host_a.size());
         for (auto& v : host_b) v = nd(rng);
@@ -527,7 +527,7 @@ int main(int argc, char** argv) {
             const fma_rows::ImageDeviceClass owner_other{"gfx1150", 32U, 40U, 1};
             hipStream_t stream = nullptr;
             require(hipStreamCreate(&stream), "stream");
-            const Case c{"stream_owner", 2304U, {3072U, 2304U}, false, true};
+            const Case c{"stream_owner", 2304U, {3072U, 3072U}, false, true};
             std::vector<std::uint16_t*> weights;
             for (const unsigned width : c.widths) {
                 std::vector<std::uint16_t> w(std::size_t{width} * c.K);
@@ -608,7 +608,7 @@ int main(int argc, char** argv) {
             require(hipStreamDestroy(stream), "stream destroy");
         }
         {  // the public routed entry: the real device takes the image routes, every injected class keeps the FP32 rows
-            const Case c{"routed_injected", 2304U, {3072U, 2304U}, false, true};
+            const Case c{"routed_injected", 2304U, {3072U, 3072U}, false, true};
             std::vector<std::uint16_t*> weights;
             for (const unsigned width : c.widths) {
                 std::vector<std::uint16_t> w(std::size_t{width} * c.K);
