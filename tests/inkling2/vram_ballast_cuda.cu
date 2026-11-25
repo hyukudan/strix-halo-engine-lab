@@ -6,10 +6,18 @@
 // takes memory away; production code has no switch for it.
 #include <cuda_runtime.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
+
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <spawn.h>
+#include <sys/wait.h>
+extern char** environ;
+#endif
 
 int main(int argc, char** argv) {
     if (argc < 5 || std::strcmp(argv[1], "--leave-mib") != 0 || std::strcmp(argv[3], "--") != 0) {
@@ -28,12 +36,23 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::fprintf(stderr, "vram-ballast free %zu MiB -> left %zu MiB\n", free_bytes >> 20U, leave >> 20U);
-    std::string command;
-    for (int i = 4; i < argc; ++i) command += (i > 4 ? " \"" : "\"") + std::string(argv[i]) + "\"";
+    std::fflush(stderr);
+    // The child starts without a shell: a command interpreter caps the command line (8191 characters on Windows), which
+    // a long token prompt exceeds. Arguments must not contain spaces (the Windows runtime joins them with spaces).
+    int status = 2;
 #if defined(_WIN32)
-    command = "\"" + command + "\"";  // cmd.exe strips one outer quote pair
+    const intptr_t code = _spawnv(_P_WAIT, argv[4], argv + 4);
+    if (code == -1) std::fprintf(stderr, "vram-ballast: cannot start %s\n", argv[4]);
+    else status = static_cast<int>(code);
+#else
+    pid_t pid = 0;
+    if (posix_spawn(&pid, argv[4], nullptr, nullptr, argv + 4, environ) != 0) {
+        std::fprintf(stderr, "vram-ballast: cannot start %s\n", argv[4]);
+    } else {
+        int wait_status = 0;
+        if (waitpid(pid, &wait_status, 0) == pid) status = WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : 128;
+    }
 #endif
-    const int status = std::system(command.c_str());
     if (ballast) cudaFree(ballast);
     return status;
 }
