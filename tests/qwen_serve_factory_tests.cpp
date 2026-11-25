@@ -6,6 +6,7 @@
 #include "strix/serve/bpe_tokenizer.hpp"
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 
@@ -171,6 +172,46 @@ void check_factory(const std::string& root) {
     legacy.push_back("--http-serve");
     CHECK(launched_options == qwen::inspect_http_options(legacy_options(legacy)).dump());
 }
+// The front as the user runs it (`strix-serve --model qwen3.8-flash-next --profile fast --asset MODEL.gguf ...`): the
+// expanded native argv resolves the registry drafter beside the model and keeps MTP on with --http-batch 8.
+void check_discovered_drafter(const std::string& root) {
+    const auto dir = std::filesystem::temp_directory_path() / "strix-serve-discovered-drafter";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir / "MTP");
+    const auto model = dir / "model.gguf";
+    { std::ofstream file(model, std::ios::binary); file << "target bytes"; }
+    const auto sidecar = dir / "MTP" / "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
+    { std::ofstream file(sidecar, std::ios::binary); file << "x"; }
+    std::filesystem::resize_file(sidecar, 2786568256ULL);
+    const auto ids = dir / "cal.ids";
+    { std::ofstream file(ids); for (unsigned id = 1; id <= 64; ++id) file << id << " "; }
+    sv::ServiceFactories factories;
+    std::vector<std::string> expanded;
+    bool stopped = false;
+    const auto launch = [&](const std::vector<std::string>& args, const sv::ServiceFactory::ServeScoped& serve) {
+        expanded = args;
+        NativeFixture service(stopped);
+        serve(service);
+        return 0;
+    };
+    qwen::install_session_service(factories, launch);
+    const std::vector<std::string> start{"strix-serve", "--registry-root", root, "--model", "qwen3.8-flash-next",
+        "--profile", "fast", "--asset", model.string(), "--port", "0", "--", "--prompt-ids", ids.string(),
+        "--generate", "64", "--http-batch", "8"};
+    sv::ServeShell shell;
+    shell.serve = [&](const sv::HttpServerConfig&, sv::HttpHandler, sv::SessionRuntime&) {};
+    const auto started = invoke(start, factories, shell);
+    std::cerr << "expanded argv:";
+    for (const auto& a : expanded) std::cerr << " " << a;
+    std::cerr << "\nrc=" << started.code << " " << started.error << "\n";
+    CHECK(!expanded.empty());
+    const auto options = legacy_options(expanded);
+    CHECK(options.http_serve && options.mtp.enabled && options.mtp_native_bundle &&
+          options.supplied_options.contains("--http-batch"));
+    CHECK(options.mtp.sidecar == sidecar.string());
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -178,6 +219,7 @@ int main(int argc, char** argv) {
         CHECK(argc == 2);
         check_factory(argv[1]);
         check_http_capabilities();
+        check_discovered_drafter(argv[1]);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

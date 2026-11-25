@@ -546,6 +546,15 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         return resolve_effective_config(r,model,{},manifest,validated_model_content_identity,{true,true,true},m);
     };
     {
+        // A drafter bundle (a file or a registry-discovered drafter) on the HTTP server is not declined as an
+        // explicit route: the server owns its prompt route and runs the bundle on it.
+        auto bundled=parse(args);bundled.mtp_native_bundle=true;bundled.mtp_bundle_path="registry-drafter.bundle";
+        bool declined_for_http=false;
+        try { (void)resolve(RequestedOptions{bundled,{{"STRIX_BATCH_PROMPT_SMALL","0"}}},memory); }
+        catch(const std::invalid_argument& e) { declined_for_http=std::string_view(e.what()).find("declined with the drafter bundle")!=std::string_view::npos; }
+        expect(!declined_for_http,"Qwen HTTP: a drafter bundle is not declined as an explicit route");
+    }
+    {
         // qcq: an explicit host budget + strict L0 on the HTTP batch route resolves the solo suffix class (the
         // scheduler the L0 gate below pins by env). No mode, capture, STRIX_BATCH_CACHE_SOLO=0, AUTO and the fixed
         // route keep the incumbent scheduler. One resolver: the same options reach the bridge and the identity.
