@@ -58,6 +58,7 @@ struct MiniServeOptions {
     // from their context through one-lane verify windows while one lane is live; a CUDA server declines).
     bool speculation_requested = false;
     bool speculation = false;
+    MiniSpeculationPolicy speculation_policy{};  // the resolved rule (mini_speculation_line)
 };
 
 // The served speculation field of the startup and model lines: off, auto, or declined (requested, not admitted).

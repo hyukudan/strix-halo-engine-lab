@@ -94,13 +94,6 @@ inline constexpr bool mini_server_calibrated_row_allowed(bool requested, bool em
     return requested && emits_first;
 }
 
-// Lookup and drafter speculation must verify against the same incumbent target for every verify width. Until the
-// calibrated target supports both serial and multi-row verification, keep the whole speculative run on incumbent weights.
-inline constexpr bool mini_calibrated_row_allowed_for_cli(bool requested, bool speculation_requested,
-                                                          bool drafter_requested) noexcept {
-    return requested && !speculation_requested && !drafter_requested;
-}
-
 template <class Value>
 bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argument, const Value& value,
                               bool native) {
@@ -245,6 +238,57 @@ inline bool mini_speculation(const profile::Resolution& tier) {
 // a run that does not speculate keeps the row's own level.
 inline unsigned mini_speculation_verify_rows(unsigned verify_rows, bool speculating) noexcept {
     return speculating ? std::max(verify_rows, 1U) : verify_rows;
+}
+
+// The effective speculation of one run, the one rule of the command line and the server. `requested`: the run asks
+// for speculation (an explicit --speculation / --dspark, else the row kMiniSpeculation); `explicit_request`: it came
+// from the run's own flags. A calibrated low-bit target (the q4 row) and speculation never share a run: a verify window
+// runs the incumbent verify body, so its picks would not be the low-bit decode's picks. The explicit request wins: an
+// explicit speculation declines the low-bit row (incumbent weights, as before); a row default yields to the requested
+// low-bit row (plain decode on that target). A backend without verify windows declines with its own reason.
+struct MiniSpeculationPolicy {
+    bool requested = false;
+    bool explicit_request = false;
+    bool admitted = false;      // this run speculates
+    bool lowbit = false;        // the low-bit row stays requested
+    std::string_view reason{};  // why a requested speculation or low-bit row was declined (empty: nothing declined)
+};
+
+inline constexpr std::string_view kMiniSpeculationLowbitDecline = "calibrated low-bit target requested";
+inline constexpr std::string_view kMiniLowbitSpeculationDecline = "speculative verification needs incumbent weights";
+
+inline constexpr MiniSpeculationPolicy mini_speculation_policy(bool requested, bool explicit_request,
+                                                               bool lowbit_requested,
+                                                               std::string_view backend_decline = {}) noexcept {
+    MiniSpeculationPolicy policy{requested, explicit_request, requested, lowbit_requested, {}};
+    if (!requested) return policy;
+    if (!backend_decline.empty()) {
+        policy.admitted = false;
+        policy.reason = backend_decline;
+    } else if (lowbit_requested && explicit_request) {
+        policy.lowbit = false;
+        policy.reason = kMiniLowbitSpeculationDecline;
+    } else if (lowbit_requested) {
+        policy.admitted = false;
+        policy.reason = kMiniSpeculationLowbitDecline;
+    }
+    return policy;
+}
+
+// "strix-speculation/v1 requested auto|off source row|flag effective auto|off verify_rows N[ declined <reason>]": the
+// effective speculation of a run, printed alike by the command line and the server.
+inline std::string mini_speculation_line(const MiniSpeculationPolicy& policy, unsigned verify_rows) {
+    std::string line = "strix-speculation/v1 requested ";
+    line += policy.requested ? "auto" : "off";
+    line += policy.explicit_request ? " source flag" : " source row";
+    line += " effective ";
+    line += policy.admitted ? "auto" : "off";
+    line += " verify_rows " + std::to_string(verify_rows);
+    if (!policy.reason.empty()) {
+        line += " declined ";
+        line += policy.reason;
+    }
+    return line;
 }
 
 // Draft rows per lane by live lanes of the served cohort (models/inkling2-mini.toml [speculation]).

@@ -71,10 +71,6 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.served_route_requested = mini_served_cli_route(resolution);
     out.attn_projected_bias = mini_attn_projected_bias(resolution);
     out.screened_head = mini_screened_head(resolution);
-    // One speculation row for the command line and the server (an explicit --speculation wins); its verify windows
-    // take the verify rows body.
-    out.speculation_requested = explicit_speculation.value_or(mini_speculation(resolution));
-    out.verify_rows = mini_speculation_verify_rows(mini_verify_rows(resolution), out.speculation_requested);
     out.controller_one_plane = mini_controller_one_plane(resolution);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
@@ -83,8 +79,18 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
-    // Served verify windows are admitted on HIP (the verify rows body and per-slot tapes); a CUDA server declines.
-    out.speculation = out.speculation_requested && resolved.backend == "hip";
+    // One speculation rule for the command line and the server (mini_speculation_policy: an explicit --speculation
+    // wins over the row; speculation and a requested low-bit row never share a run). Served verify windows are
+    // admitted on HIP (the verify rows body and per-slot tapes); a CUDA server declines. The admitted windows take the
+    // verify rows body; a run that does not speculate keeps the row's level.
+    out.speculation_policy = mini_speculation_policy(explicit_speculation.value_or(mini_speculation(resolution)),
+                                                     explicit_speculation.has_value(), out.weight_options.lowbit_turbo,
+                                                     resolved.backend == "hip" ? std::string_view{}
+                                                                               : std::string_view{"backend cuda"});
+    out.weight_options.lowbit_turbo = out.speculation_policy.lowbit;
+    out.speculation_requested = out.speculation_policy.requested;
+    out.speculation = out.speculation_policy.admitted;
+    out.verify_rows = mini_speculation_verify_rows(mini_verify_rows(resolution), out.speculation);
     // The W4A4 class is admitted for the resolved backend (HIP refuses a selected class instead of running BF16).
     out.moe_w4a4 = admit_mini_moe_w4a4(resolution, resolved.backend);
     // Backend admission of the served route lever (kMiniServedCliRoute): HIP runs the command line's route, a CUDA
@@ -105,14 +111,17 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
 
 serve::CohortConfig scheduling(const MiniServeOptions& opt, const serve::CohortBackend& backend) {
     serve::CohortConfig config;
-    // Admitted speculation: each greedy lane drafts from its own context (the shared cohort drafter) and verifies the
-    // window on its slot; draft rows by live lanes are the model's data (drafts only while one lane is live).
-    config.context_draft = opt.speculation;
-    config.max_draft = opt.speculation ? kMiniMaxVerifyRows - 1U : 0U;
-    if (opt.speculation) config.max_draft_by_live = mini_served_draft_by_live();
-    // The measured one-node prior until the cohort's own fit takes over (gfx1151 BF16: a served B=1 step 42.4 ms, an
-    // extra verify row 10.2 ms): fixed 32.2 + 10.2 per row.
-    if (opt.speculation) config.prior = {32.2, 10.2, 0.0, 0.0};
+    // Admitted speculation (the decoder staged windows: backend.max_window > 1): each greedy lane drafts from its own
+    // context (the shared cohort drafter) and verifies the window on its slot; draft rows by live lanes are the
+    // model's data (drafts only while one lane is live, the previous one-row route at two or more).
+    const bool windows = opt.speculation && backend.max_window(0U) > 1U;
+    config.context_draft = windows;
+    config.max_draft = windows ? kMiniMaxVerifyRows - 1U : 0U;
+    if (windows) config.max_draft_by_live = mini_served_draft_by_live();
+    // The cycle prior until the cohort's own fit takes over (it prices draft rows only; never ids): ticket ink_draft t1c
+    // on gfx1151, BF16 weights, a served B=1 step 42.4 ms and 10.2 ms per extra verify row -> fixed 32.2 + 10.2 per row.
+    // Without windows the cohort keeps its default prior, as before speculation existed.
+    if (windows) config.prior = {32.2, 10.2, 0.0, 0.0};
     // A prompt runs as the command line's calls (whole chunks, the final one with its tail); beside a decoding lane
     // the cohort cuts pieces of kMiniServeDecodingRows inside those chunks where the decoder's piece rule allows (HIP),
     // so the bits never depend on other lanes (the backend's prompt_piece_rule; CUDA: none, whole chunks).

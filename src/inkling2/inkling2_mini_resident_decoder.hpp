@@ -278,11 +278,28 @@ public:
     // the command line's verify arithmetic (append, MiniAppendKind::verify: every row on its one-row decode body), and
     // under the verify rows lever every slot binds its own convolution tape (a partial commit is copies, no replay).
     // One window is staged at a time (the decoder's one checkpoint workspace). Off: one row per lane, as before.
-    void set_slot_windows(bool enabled) {
+    // Declined (returns false) where the window rows would not run the one-row decode's target arithmetic: a dual
+    // BF16 / low-bit image decodes one row on the low-bit image but verifies on BF16 (backend lowbit_applies).
+    bool set_slot_windows(bool enabled) {
         if (slots_.size() > 1U) throw std::logic_error("set slot windows before allocating slots");
-        slot_windows_ = enabled && max_verify_rows() > 1U;
+        const bool same_target = backend_.lowbit_applies(MiniAppendKind::decode, 1U) ==
+                                 backend_.lowbit_applies(MiniAppendKind::verify, max_verify_rows());
+        slot_windows_ = enabled && max_verify_rows() > 1U && same_target;
+        if (slot_windows_) {
+            // The window's score and pick scratch exists before the slots are budgeted (the KV slot count reads the
+            // free memory after it), not at the first window.
+            if (!verify_logits_) verify_logits_.emplace(std::size_t{max_verify_rows()} * kLogitPitch);
+            if (!verify_greedy_) verify_greedy_.emplace(max_verify_rows(), kOutputVocabulary);
+        } else {
+            verify_greedy_.reset();  // a server without windows never stages one (the single-session route is not served)
+            verify_logits_.reset();
+        }
+        return slot_windows_;
     }
     [[nodiscard]] std::uint32_t max_slot_window() const { return slot_windows_ ? max_verify_rows() : 1U; }
+    // The staged window shares the slot appends' history checkpoint (session/kv_row_append.hpp): an eager one-row
+    // append on another slot would overwrite it, so a window runs alone (serve::FixedKvCohort refuses a mixed verify).
+    [[nodiscard]] bool slot_window_alone() const noexcept { return true; }
 
     void stage_slot_window(std::uint32_t slot, std::span<const std::uint32_t> ids, std::span<std::uint32_t> top) {
         if (!slot_windows_ || ids.size() < 2U || ids.size() > max_verify_rows() || top.size() != ids.size())

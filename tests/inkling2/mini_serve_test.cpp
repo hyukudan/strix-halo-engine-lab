@@ -709,12 +709,23 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         require(rc == 0 && !created &&
                     out.str().find(hip ? " speculation auto" : " speculation declined") != std::string::npos,
                 "served speculation: auto admitted on HIP, declined on CUDA, before any device work");
-        std::ostringstream off_out, off_error;
+        // The row default (auto in every tier) resolves as the explicit flag does; an explicit off wins over it.
+        std::ostringstream row_out, row_error;
+        const auto flag = std::ranges::find(strings, std::string("--speculation"));
+        const auto at = flag - strings.begin();
+        strings.erase(flag, flag + 2);  // the shared argument list pins --speculation off
         strings.emplace_back("--family-inspect");
-        const auto off_rc = run({}, off_out, off_error);
+        const auto row_rc = run({}, row_out, row_error);
         strings.pop_back();
+        strings.insert(strings.begin() + at, {"--speculation", "off"});
+        require(row_rc == 0 && row_out.str().find(hip ? " speculation auto" : " speculation declined") != std::string::npos,
+                "served speculation: the row default resolves auto like the command line");
+        std::ostringstream off_out, off_error;
+        strings.insert(strings.end(), {"--speculation", "off", "--family-inspect"});
+        const auto off_rc = run({}, off_out, off_error);
+        strings.resize(strings.size() - 3U);
         require(off_rc == 0 && off_out.str().find(" speculation off") != std::string::npos,
-                "served speculation: off stays off");
+                "served speculation: an explicit off wins over the row");
     }
     // The server takes no decode form flag: a served form is selected only through the served route lever's row.
     for (const auto* flag : {"--packed-decode", "--grouped-decode"}) {

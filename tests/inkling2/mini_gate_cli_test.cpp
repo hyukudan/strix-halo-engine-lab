@@ -348,11 +348,14 @@ void test_options() {
                 strix::serve::CliSpeculation::automatic,
             "expected DSpark in automatic speculation");
     expect_invalid([] { (void)parse({"1", "--speculation", "off", "--dspark", "mtp.safetensors"}); });
-    // The speculation row (kMiniSpeculation): builtin off; an explicit mode is recorded; --dspark off switches the
-    // drafter off (no sidecar lookup), and a speculating run takes the verify rows body.
-    require(parse({"1"}).generation.speculation == strix::serve::CliSpeculation::off &&
+    // The speculation row (kMiniSpeculation): auto by default in every tier; an explicit mode is recorded and wins;
+    // --dspark off switches the drafter off (no sidecar lookup), and a speculating run takes the verify rows body.
+    require(parse({"1"}).generation.speculation == strix::serve::CliSpeculation::automatic &&
                 !parse({"1"}).generation.speculation_requested,
-            "speculation row builtin: off");
+            "speculation row default: auto");
+    require(parse({"1", "--speculation", "off"}).generation.speculation == strix::serve::CliSpeculation::off &&
+                parse({"1", "--speculation", "off"}).generation.speculation_requested,
+            "an explicit --speculation off wins over the row");
     require(parse({"1", "--speculation", "auto"}).generation.speculation_requested, "explicit speculation recorded");
     {
         const auto off = parse({"1", "--speculation", "auto", "--dspark", "off"});
@@ -377,7 +380,9 @@ void test_options() {
             "expected evaluation-order null arm");
     std::ostringstream profile_line;
     cli::write_profile(gate.tier, profile_line, true);
-    require(profile_line.str() == "profile exact levers none reference BASE\n", "device profile receipt differs");
+    // The speculation row is auto in every tier: the exact receipt names it (a gate run itself never drafts).
+    require(profile_line.str() == "profile exact levers inkling2-mini-speculation@1=auto reference BASE\n",
+            "device profile receipt differs");
 }
 
 #endif

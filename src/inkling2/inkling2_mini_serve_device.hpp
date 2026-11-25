@@ -5,6 +5,7 @@
 #include "inkling2_mini_weight_device.hpp"
 #include "strix/device/gate.hpp"
 #include "strix/serve/fixed_kv_cohort.hpp"
+#include "strix/spec/drafter_source.hpp"
 
 #include <functional>
 #include <iostream>
@@ -38,6 +39,8 @@ inline MiniServeCohort make_mini_device_cohort(
     std::uint64_t slot_bytes = 0;
     unsigned lanes = 0;
     MiniDecoderLevers levers;
+    bool windows = false;
+    std::string_view windows_declined = "decoder declined verify windows";
     std::function<std::uint64_t()> projected_bias_dispatches;
 #if !defined(__HIPCC__)
     exec::CohortProgramPolicy programs;
@@ -52,12 +55,21 @@ inline MiniServeCohort make_mini_device_cohort(
             opt.experts_nvfp4, opt.controller_one_plane, opt.served_cli_route, std::move(lowbit));
         levers = configure_mini_decoder(*decoder, opt.moe_w4a4, opt.combine_image, opt.prepared_round_fold,
                                         opt.attn_projected_bias, opt.screened_head, opt.verify_rows);
-        // Admitted speculation: one-lane verify windows on any slot (per-slot tapes count in the slot's bytes).
-        decoder->set_slot_windows(opt.speculation);
+        // Admitted speculation: one-lane verify windows on any slot (per-slot tapes count in the slot's bytes). The
+        // decoder declines windows on a calibrated low-bit target (mini_speculation_policy never requests both).
+        windows = decoder->set_slot_windows(opt.speculation);
         slot_bytes = decoder->slot_bytes();
         // Keep the CUDA screened plane only when it costs no slot, then enforce the calibrated load's slot promise.
-        const auto memory = mini_gpu::memory_info();
+        auto memory = mini_gpu::memory_info();
         lanes = mini_serve_kv_slots(*decoder, memory.free, memory.total, budget.device_bytes, opt.kv_bytes, rows);
+        if (windows && opt.slots != 0U && lanes < rows) {
+            // The windows' tapes and scratch would cost a configured slot: the slots win, the lanes decode one row.
+            windows = decoder->set_slot_windows(false);
+            windows_declined = "slot capacity";
+            slot_bytes = decoder->slot_bytes();
+            memory = mini_gpu::memory_info();
+            lanes = mini_serve_kv_slots(*decoder, memory.free, memory.total, budget.device_bytes, opt.kv_bytes, rows);
+        }
         require_mini_weight_slot_capacity(lanes, rows, calibrated);
         levers.head = decoder->head();
 #if !defined(__HIPCC__)
@@ -72,7 +84,11 @@ inline MiniServeCohort make_mini_device_cohort(
                                                                             std::uint64_t tokens, bool first) {
                 resident.set_moe_w4a4(mini_prompt_moe(options, device, tokens, first));
             };
-        auto candidate = std::make_unique<Cohort>(std::move(decoder), opt.context, rows, lanes, std::move(policy));
+        // A forward's row budget holds a lone lane's whole window even under --slots 1 (the verify width is not the
+        // slot count): the window is its own forward, the one-row lanes stay within the decoder's rows.
+        const auto forward_rows = std::max<unsigned>(rows, windows ? decoder->max_slot_window() : 1U);
+        auto candidate =
+            std::make_unique<Cohort>(std::move(decoder), opt.context, forward_rows, lanes, std::move(policy));
         if (opt.attn_projected_bias)
             projected_bias_dispatches = [observed] { return observed->projected_attention_dispatches(); };
         return candidate;
@@ -89,7 +105,7 @@ inline MiniServeCohort make_mini_device_cohort(
               << " down_image " << mini_down_image_name(levers.down_image, opt.combine_image)
               << " head " << mini_head_field(levers.head)
               << " experts " << (opt.experts_nvfp4 ? "nvfp4" : "checkpoint")
-              << " speculation " << mini_served_speculation_name(opt)
+              << " speculation " << (windows ? "auto" : opt.speculation_requested ? "declined" : "off")
               << " prefill_route " << (cohort->prefill_emits_first() ? "emits-first" : "plain")
               << " weight_storage " << weights.storage.name << '@' << weights.storage.revision
               << (weights.head_storage != weights.storage ? " weight_head_storage " : "")
@@ -101,6 +117,13 @@ inline MiniServeCohort make_mini_device_cohort(
               << " weight_status " << profile::status_name(weights.status) << " (" << weights.reason << ")"
               << (weights.turbo_quality.empty() ? "" : " turbo_quality ") << weights.turbo_quality << '\n'
               << weight::weight_load_regime_receipt(weights) << '\n';
+    // The command line's speculation line (mini_speculation_line), with the decoder's admission; a served lane drafts
+    // from its own context (no sidecar drafter on this route).
+    auto speculation = opt.speculation_policy;
+    if (speculation.admitted && !windows) speculation.reason = windows_declined;
+    speculation.admitted = windows;
+    std::cerr << mini_speculation_line(speculation, opt.verify_rows) << '\n';
+    if (windows) std::cerr << spec::drafter_receipt("served", {{}, spec::DrafterSource::context, {}}) << '\n';
     return {std::move(cohort), weights, std::move(projected_bias_dispatches)};
 }
 

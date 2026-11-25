@@ -336,13 +336,18 @@ int main(int argc, char** argv) {
             strix::weight::WeightLoadPlan plan;
         };
         auto weight_options = options.weights;
-        const bool calibrated_cli_allowed = mini_calibrated_row_allowed_for_cli(
-            weight_options.lowbit_turbo, options.generation.speculation != serve::CliSpeculation::off,
-            options.dspark != nullptr);
-        if (weight_options.lowbit_turbo && !calibrated_cli_allowed) {
+        // The server's rule (mini_speculation_policy): an explicit speculation declines the low-bit row, the row default
+        // yields to a requested low-bit row.
+        const auto speculation_policy = mini_speculation_policy(
+            options.generation.speculation != serve::CliSpeculation::off,
+            options.generation.speculation_requested || options.dspark != nullptr, weight_options.lowbit_turbo);
+        if (weight_options.lowbit_turbo && !speculation_policy.lowbit) {
             weight_options.lowbit_turbo = false;
-            std::cerr << "strix-lowbit-pack/v2 declined (speculative verification needs incumbent weights); using incumbent weights\n";
+            std::cerr << "strix-lowbit-pack/v2 declined (" << kMiniLowbitSpeculationDecline
+                      << "); using incumbent weights\n";
         }
+        if (speculation_policy.requested && !speculation_policy.admitted)
+            options.generation.speculation = serve::CliSpeculation::off;
         const auto resolve_weights = [&options, &weight_options, model = std::string(argv[1])](strix::weight::WeightLoadExtent extent) {
             auto scope = mini_weight_scope(model, options.tier.profile, weight_options, extent);
             const auto plan = resolve_mini_resident_weight_load(options.tier.profile, weight_options, scope.view(), extent);
@@ -363,6 +368,28 @@ int main(int argc, char** argv) {
         const auto route = cli::resolve_cuda_step_route(options, program_options, weights.storage, resident_k1);
         const bool step_program = route.program;
         options.generation.speculation = route.speculation;
+#endif
+        // The resident route's drafter (strix/spec/drafter_source.hpp), resolved after the CUDA step route (which may
+        // turn speculation off) and alive for the whole run: --dspark FILE|off, else the model's MTP block beside the
+        // checkpoint when this run speculates (auto, greedy). A sidecar found beside the model is validated against the
+        // MTP block schema before anything is reserved for it: a file the loader would refuse is declined with its
+        // reason and the run keeps its context drafts (source absent / rejected = context drafts only); an explicit
+        // --dspark file is never declined (its loader error stands).
+        const auto drafter = [&] {
+            auto found = strix::spec::resolve_drafter_file(
+                {.file = options.dspark ? std::string_view(options.dspark) : std::string_view{},
+                 .off = options.dspark_off,
+                 .speculating = options.generation.speculation == serve::CliSpeculation::automatic &&
+                                !options.gate_manifest && !options.generation.tokenize_file &&
+                                !token_sampling_enabled(options.generation.sampling)},
+                argv[1], strix::model_data::inkling2_mini::speculation::drafter);
+            if (found.source == strix::spec::DrafterSource::beside_model)
+                if (auto problem = strix::inkling2::MiniDSparkDeviceWeights::sidecar_problem(found.path); !problem.empty())
+                    return strix::spec::decline_drafter(found, std::move(problem));
+            return found;
+        }();
+        const bool speculating = options.generation.speculation != serve::CliSpeculation::off;
+#if defined(STRIX_INKLING2_STEP_PROGRAM)
         if (step_program)
             family.load = [program_load = cli::select_mini_cuda_program(program_options.epilogue_fusion,
                                                                         program_options.latency_forms),
@@ -375,16 +402,6 @@ int main(int argc, char** argv) {
             };
         else
 #endif
-        // The resident route's drafter (strix/spec/drafter_source.hpp): --dspark FILE|off, else the model's MTP block
-        // beside the checkpoint when this run speculates (auto, greedy).
-        const auto drafter = strix::spec::resolve_drafter_file(
-            {.file = options.dspark ? std::string_view(options.dspark) : std::string_view{},
-             .off = options.dspark_off,
-             .speculating = options.generation.speculation == serve::CliSpeculation::automatic &&
-                            !options.gate_manifest && !options.generation.tokenize_file &&
-                            !token_sampling_enabled(options.generation.sampling)},
-            argv[1], strix::model_data::inkling2_mini::speculation::drafter);
-        const bool speculating = options.generation.speculation != serve::CliSpeculation::off;
         family.load = [&loaded, &resolve_weights, &options, &weight_options, step_graphs, &drafter,
                        combine_image = mini_combine_image(options.tier),
                        round_fold = mini_prepared_round_fold(options.tier),
@@ -431,6 +448,13 @@ int main(int argc, char** argv) {
             std::cerr << "strix-decode-route/v1 moe_decode " << mini_decode_form_name(options.generation.packed_decode)
                       << '\n';
             std::cerr << mini_served_route_cli_line(options.tier) << '\n';
+            {
+                auto shown = speculation_policy;  // the server prints the same line (mini_speculation_line)
+                shown.admitted = speculating;     // after the CUDA step route, which may decline (its own line below)
+                std::cerr << mini_speculation_line(shown, mini_speculation_verify_rows(mini_verify_rows(options.tier),
+                                                                                         speculating))
+                          << '\n';
+            }
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
             if (!step_program)
 #endif

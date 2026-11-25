@@ -61,6 +61,22 @@ public:
     MiniDSparkDeviceWeights(const std::string& path, mini_gpu::Stream stream)
         : MiniDSparkDeviceWeights(open(path), stream) {}
 
+    // The sidecar's header against the model's MTP block schema, read before any device resource is reserved for it:
+    // empty when this loader accepts the file, else the loader's reason (an auto-discovered sidecar is then declined).
+    // The schema fixes every tensor's name and shape; no target-checkpoint identity is stored in the sidecar, so a
+    // same-schema drafter trained elsewhere loads (verification keeps the ids exact; only its acceptance can differ).
+    [[nodiscard]] static std::string sidecar_problem(const std::string& path) {
+        try {
+            weight::TensorLookup input;
+            const auto status = input.open_safetensors(path, D::schema());
+            if (!status) return status.detail.empty() ? std::string("unreadable sidecar") : status.detail;
+            for (const auto& tensor : D::schema().tensors) static_cast<void>(input.find(tensor.name));
+            return {};
+        } catch (const std::exception& error) {
+            return error.what();
+        }
+    }
+
     [[nodiscard]] const std::uint16_t* get(std::string_view name) const { return tensors_.bf16(name).data(); }
     [[nodiscard]] const float* fusion(unsigned row) const { return fusion_.data() + row * MiniDSparkTapPlan::count; }
 

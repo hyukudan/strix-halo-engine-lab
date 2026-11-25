@@ -445,14 +445,28 @@ void test_capacity_and_pack_fallback() {
 }
 
 void test_calibrated_row_speculation_admission() {
-    require(mini::mini_calibrated_row_allowed_for_cli(true, false, false),
-            "serial calibrated decode remains available without speculation");
-    require(!mini::mini_calibrated_row_allowed_for_cli(true, true, false),
-            "lookup or verify speculation keeps the incumbent target for every verify width");
-    require(!mini::mini_calibrated_row_allowed_for_cli(true, false, true),
-            "drafter speculation keeps the incumbent target for every verify width");
-    require(!mini::mini_calibrated_row_allowed_for_cli(false, false, false),
-            "an unset calibrated lever remains off");
+    // One rule for the command line and the server (mini_speculation_policy): speculation and a requested low-bit row
+    // never share a run; the explicit request wins.
+    constexpr auto none = mini::mini_speculation_policy(false, false, true);
+    require(!none.admitted && none.lowbit && none.reason.empty(), "no speculation: the low-bit row stays requested");
+    constexpr auto row = mini::mini_speculation_policy(true, false, true);
+    require(!row.admitted && row.lowbit && row.reason == mini::kMiniSpeculationLowbitDecline,
+            "row default speculation yields to a requested low-bit row (plain decode on its target)");
+    constexpr auto flag = mini::mini_speculation_policy(true, true, true);
+    require(flag.admitted && !flag.lowbit && flag.reason == mini::kMiniLowbitSpeculationDecline,
+            "explicit speculation declines the low-bit row (incumbent weights)");
+    constexpr auto plain = mini::mini_speculation_policy(true, false, false);
+    require(plain.admitted && !plain.lowbit && plain.reason.empty(), "speculation without a low-bit row is admitted");
+    constexpr auto cuda = mini::mini_speculation_policy(true, true, true, "backend cuda");
+    require(!cuda.admitted && cuda.lowbit && cuda.reason == "backend cuda",
+            "a backend without windows declines and keeps the low-bit row");
+    require(mini::mini_speculation_line(row, 0U) ==
+                "strix-speculation/v1 requested auto source row effective off verify_rows 0 declined "
+                "calibrated low-bit target requested",
+            "the effective speculation line");
+    require(mini::mini_speculation_line(plain, 1U) ==
+                "strix-speculation/v1 requested auto source row effective auto verify_rows 1",
+            "the effective speculation line, admitted");
 }
 
 void test_calibrated_pack_requires_complete_inventory() {
