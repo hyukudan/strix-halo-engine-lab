@@ -134,6 +134,17 @@ if(MSVC)
     target_compile_options(cuda_core_head_argmax_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
 
+# Synthetic per-class CUDA decode cost table (timing only).
+add_executable(strix-cuda-step-tr-bench ${_cc_root}/tests/cuda_core/step_tr_bench.cu)
+target_link_libraries(strix-cuda-step-tr-bench PRIVATE strix_cuda_core_kernels)
+target_include_directories(strix-cuda-step-tr-bench PRIVATE ${_cc_root}/include ${_cc_root}/src)
+target_compile_features(strix-cuda-step-tr-bench PRIVATE cxx_std_20)
+target_compile_options(strix-cuda-step-tr-bench PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(strix-cuda-step-tr-bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+
 # EXACT screened greedy LM head (src/cuda/core/head_screened.cuh): device test (monotone G, mapped-row identity vs the incumbent
 # R=1 kernel, screened Pick == full head) and, with --bench, full vs screened timing (refused unless the tests PASS).
 add_executable(cuda_core_screened_head_test ${_cc_root}/tests/cuda_core/screened_head_cuda.cu)
