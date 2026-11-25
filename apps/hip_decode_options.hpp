@@ -554,7 +554,7 @@ struct Options {
     double http_sse_progress_interval = 1.0;
     // The requested override and the policy resolved from the startup arguments.
     std::optional<std::string> http_sampling;
-    std::string_view http_sampling_policy = "reject"; // pinned before slot admission
+    std::string_view http_sampling_policy = "reject"; // explicit: pinned before admission; omitted: set by admit_http_batch_slots
     // 0: one request at a time (each from the single request state). 1..8: batched decoding with that many
     // request slots: requests are admitted between decode cycles and decoded together (cohort windows).
     std::uint32_t http_batch = 0; // resolved route: zero selects the single adapter
@@ -1292,26 +1292,24 @@ inline void resolve_http_route(Options& o) {
         o.http_batch = o.http_batch_cap ? o.http_batch_cap : 1U;
         o.http_slot_reason = "capacity pending measured startup";
     }
-    // The policy is a function of the arguments only. An omitted --http-sampling samples only where the operator fixed
-    // the cohort route (--http-batch N or --deploy); the automatic route keeps its measured single/cohort choice and
-    // refuses sampled requests at every slot count, so one-slot memory pressure starts the single runner as before.
-    const bool fixed_route = o.http_batch_explicit || o.deployment_spec;
+    // An explicit --http-sampling is pinned here. An omitted one stays "reject" until admit_http_batch_slots resolves it
+    // from the admitted route: the cohort runner samples (as before this policy existed), the single runner refuses
+    // sampled requests instead of downgrading them to greedy.
     if (o.http_sampling == "greedy") o.http_sampling_policy = "greedy";
-    else if (o.http_sampling != "reject" && (o.http_sampling || fixed_route) && o.http_batch && !o.session_live_control &&
-             o.mtp.sample_speculation)
+    else if (o.http_sampling == "sample" && o.http_batch && !o.session_live_control && o.mtp.sample_speculation)
         o.http_sampling_policy = "sample";
     else o.http_sampling_policy = "reject";
 }
 
-// Keep the incumbent single/cohort route choice and refuse startup if it cannot
-// honor the policy selected before measuring capacity.
-[[nodiscard]] inline std::uint32_t admit_http_batch_slots(const Options& o, std::uint32_t capacity,
-    bool deployment_planned) {
-    const bool cohort = o.http_batch && !o.session_live_control &&
+// Keep the incumbent single/cohort route choice. Only an explicit --http-sampling sample is a startup requirement
+// (refused when measured capacity selects the single route); an omitted policy follows the admitted route.
+[[nodiscard]] inline std::uint32_t admit_http_batch_slots(Options& o, std::uint32_t capacity, bool deployment_planned) {
+    const bool cohort = capacity && o.http_batch && !o.session_live_control &&
         (capacity > 1U || ((o.http_batch_explicit || deployment_planned) && o.http_batch_cap == 1U));
-    if ((!cohort || !capacity) && o.http_sampling_policy == "sample")
+    if (!cohort && o.http_sampling_policy == "sample")
         throw std::runtime_error("HTTP sampling capability requires the cohort runner: measured capacity selects the single route; "
             "use --http-batch 1 for a one-slot cohort or --http-sampling reject for a single runner");
+    if (!o.http_sampling) o.http_sampling_policy = cohort && o.mtp.sample_speculation ? "sample" : "reject";
     return cohort ? capacity : 0U;
 }
 
@@ -1348,8 +1346,9 @@ inline void validate_http_serve(const Options& o, bool defer_prefill = false) {
         (o.http_sampling && *o.http_sampling != "greedy" && *o.http_sampling != "reject" && *o.http_sampling != "sample"))
         throw std::invalid_argument("--http-* values: port <= 65535, non-empty bind/model id, positive limits, batch cap or 0, "
             "sampling greedy|reject|sample, keepalive/progress seconds >= 0");
-    if (o.http_sampling == "sample" && (!o.http_batch_explicit || !o.http_batch || o.session_live_control))
-        throw std::invalid_argument("--http-sampling sample runs on the batched route (--http-batch N)");
+    if (o.http_sampling == "sample" && (!o.http_batch || o.session_live_control))
+        throw std::invalid_argument("--http-sampling sample runs on the batched route (automatic or --http-batch N; "
+            "it needs prefix windows over rows 2,4,8 and the draft chain)");
     if (o.http_sampling == "sample" && o.http_sampling_policy != "sample")
         throw std::invalid_argument("--http-sampling sample requires --mtp-sample-speculation on for HTTP cohorts");
     if (o.http_batch && (!o.mtp.window_prefix || !o.mtp.draft_chain || o.mtp.window_rows_set != std::vector<std::uint32_t>{2U, 4U, 8U}))

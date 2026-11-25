@@ -391,25 +391,49 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         const auto one=resolve_http_bridge_capacity(10,cost,10,30,0,0);
         const auto two=resolve_http_bridge_capacity(10,cost,30,30,0,0);
         expect(one.slots==1 && two.slots==2 && !startup.http_batch_explicit,"Qwen HTTP: exercise measured auto capacity");
-        // The automatic route pins one policy for every measured slot count and still starts at one slot.
-        expect(startup.http_sampling_policy=="reject" && admit_http_batch_slots(startup,two.slots,false)==2,
-            "Qwen HTTP: automatic startup pins the same policy at two slots");
-        expect(admit_http_batch_slots(startup,one.slots,false)==0,
+        // An omitted policy follows the admitted route, as before the policy existed: the automatic cohort samples at
+        // two slots and one-slot pressure starts the single runner, which refuses sampled requests.
+        auto auto_two=startup;
+        expect(admit_http_batch_slots(auto_two,two.slots,false)==2 && auto_two.http_sampling_policy=="sample",
+            "Qwen HTTP: automatic startup with two admitted slots samples");
+        auto auto_one=startup;
+        expect(admit_http_batch_slots(auto_one,one.slots,false)==0 && auto_one.http_sampling_policy=="reject",
             "Qwen HTTP: automatic startup under one-slot pressure starts the single runner");
-        bool refused=false;
-        const auto pinned=parse(args); // --http-batch 2
-        try { (void)admit_http_batch_slots(pinned,one.slots,false); }
-        catch(const std::runtime_error& e) { refused=std::string_view(e.what()).find("HTTP sampling capability")!=std::string_view::npos; }
-        expect(pinned.http_sampling_policy=="sample" && refused,
-            "Qwen HTTP: a fixed sampling cohort refuses startup instead of changing its policy");
+        auto pinned=parse(args); // --http-batch 2, --http-sampling omitted
+        expect(admit_http_batch_slots(pinned,two.slots,false)==2 && pinned.http_sampling_policy=="sample",
+            "Qwen HTTP: a fixed cohort with an omitted policy samples");
+        pinned=parse(args);
+        expect(admit_http_batch_slots(pinned,one.slots,false)==0 && pinned.http_sampling_policy=="reject",
+            "Qwen HTTP: a fixed cap under one-slot pressure falls back to the single runner");
         auto one_cohort=args;
         *(std::find(one_cohort.begin(),one_cohort.end(),"--http-batch")+1)="1";
-        const auto fixed=parse(one_cohort);
-        expect(fixed.http_sampling_policy=="sample" && admit_http_batch_slots(fixed,one.slots,false)==1,
-            "Qwen HTTP: a one-slot cohort admits the startup sampling policy");
+        auto fixed=parse(one_cohort);
+        expect(admit_http_batch_slots(fixed,one.slots,false)==1 && fixed.http_sampling_policy=="sample",
+            "Qwen HTTP: a one-slot cohort samples");
+        // Only an explicit --http-sampling sample is a startup requirement; it runs on AUTO too.
+        auto explicit_sample=automatic;
+        explicit_sample.insert(explicit_sample.end(),{"--http-sampling","sample"});
+        auto sampling=parse(explicit_sample);
+        expect(sampling.http_sampling_policy=="sample" && admit_http_batch_slots(sampling,two.slots,false)==2,
+            "Qwen HTTP: --http-sampling sample alone admits the automatic cohort");
+        bool refused=false;
+        sampling=parse(explicit_sample);
+        try { (void)admit_http_batch_slots(sampling,one.slots,false); }
+        catch(const std::runtime_error& e) { refused=std::string_view(e.what()).find("HTTP sampling capability")!=std::string_view::npos; }
+        expect(refused,"Qwen HTTP: explicit sampling refuses startup when capacity selects the single route");
+        auto capped=args;
+        capped.insert(capped.end(),{"--http-sampling","sample"});
+        auto capped_sampling=parse(capped);
+        refused=false;
+        try { (void)admit_http_batch_slots(capped_sampling,one.slots,false); }
+        catch(const std::runtime_error& e) { refused=std::string_view(e.what()).find("HTTP sampling capability")!=std::string_view::npos; }
+        expect(refused,"Qwen HTTP: explicit sampling with a cap refuses instead of changing its policy");
         automatic.insert(automatic.end(),{"--http-sampling","reject"});
-        const auto rejecting=parse(automatic);
-        expect(rejecting.http_sampling_policy=="reject" && admit_http_batch_slots(rejecting,one.slots,false)==0,
+        auto rejecting=parse(automatic);
+        expect(admit_http_batch_slots(rejecting,two.slots,false)==2 && rejecting.http_sampling_policy=="reject",
+            "Qwen HTTP: an explicit reject policy is kept on the automatic cohort");
+        rejecting=parse(automatic);
+        expect(admit_http_batch_slots(rejecting,one.slots,false)==0 && rejecting.http_sampling_policy=="reject",
             "Qwen HTTP: an explicit reject policy keeps the auto single runner");
 
         const auto* previous=std::getenv("STRIX_MTP_SAMPLED_ACCEPT");
