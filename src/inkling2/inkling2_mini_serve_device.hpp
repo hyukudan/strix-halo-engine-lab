@@ -25,7 +25,7 @@ inline MiniServeCohort make_mini_device_cohort(
     const auto rows = std::min(opt.slots ? opt.slots : kMiniServeLaneRows, row_limit);
     const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, opt.weight_options);
     const auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view());
-    // The command line's prefill chunk and tail capacity (inkling2_mini_serve.cpp resolve).
+    // The served prefill chunk and tail capacity (inkling2_mini_serve.cpp resolve: the command line's on HIP).
     auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
         opt.packed_decode, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows, opt.prefill_tail);
     const bool down_image = configure_mini_decoder(*decoder, opt.moe_w4a4, opt.combine_image);
@@ -45,7 +45,7 @@ inline MiniServeCohort make_mini_device_cohort(
               << " moe_prefill " << moe_core::grouped_w4a4::identity(opt.moe_w4a4)
               << " moe_decode " << mini_decode_form_name(opt.packed_decode)
               << " prefill_chunk " << opt.prefill_rows << " prefill_tail " << decoder_tail
-              << " first_id prefill"
+              << " first_id " << (cohort->prefill_emits_first() ? "prefill" : "decode")
               << " down_image " << mini_down_image_name(down_image, opt.combine_image)
               << " weight_storage " << weights.storage.name << '@' << weights.storage.revision
 #if !defined(__HIPCC__)

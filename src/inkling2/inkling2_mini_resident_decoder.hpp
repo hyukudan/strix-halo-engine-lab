@@ -176,11 +176,34 @@ public:
 #endif
     }
 
-    // Served prefill (serve::FixedKvCohort emits-first, the only served prompt route): a lane's prompt rows by the same
-    // chunks and per-call tail rule as prefill() (the command line), the first id from the final row of the call's last
-    // chunk; its score row is read_slot_logits(0) (materialized on the first read when the pick was screened). The
-    // cohort issues a whole prompt as calls of whole chunks, or, beside a decoding lane, as pieces cut inside those
-    // chunks by prefill_piece_rule() only, so a lane's prompt bits never depend on other lanes.
+    // Served prompt route of this backend (serve::FixedKvCohort reads it once): HIP emits-first
+    // (prefill_slot_first), CUDA the held-back route (prefill_slot) until its identity ticket covers emits-first
+    // serving (mini_served_prefill_emits_first).
+    [[nodiscard]] bool prefill_emits_first() const noexcept {
+#if defined(__HIPCC__)
+        return mini_served_prefill_emits_first(true);
+#else
+        return mini_served_prefill_emits_first(false);
+#endif
+    }
+
+    // Held-back served prefill (the CUDA served route): a lane's prompt rows by greedy chunks with no score row; the
+    // cohort holds back the last prompt token and decodes it as the lane's first decode row.
+    void prefill_slot(unsigned slot, std::span<const unsigned> ids, bool first) {
+        if (first) reset_slot(slot);
+        auto& state = slots_.at(slot)->state();
+        validate_inputs(state, ids, {});
+        last_logit_rows_ = 0U;
+        (void)state.append_sequence(ids, [&](std::span<const unsigned> chunk, bool) {
+            return append(state, chunk, false, {});
+        }, prefill_rows_);
+    }
+
+    // Emits-first served prefill (the HIP served route): a lane's prompt rows by the same chunks and per-call tail rule
+    // as prefill() (the command line), the first id from the final row of the call's last chunk; its score row is
+    // read_slot_logits(0) (materialized on the first read when the pick was screened). The cohort issues a whole prompt
+    // as calls of whole chunks, or, beside a decoding lane, as pieces cut inside those chunks by prefill_piece_rule()
+    // only, so a lane's prompt bits never depend on other lanes.
     [[nodiscard]] unsigned prefill_slot_first(unsigned slot, std::span<const unsigned> ids, bool first) {
         if (first) reset_slot(slot);
         auto& state = slots_.at(slot)->state();

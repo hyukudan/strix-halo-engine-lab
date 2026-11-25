@@ -124,6 +124,18 @@ inline MiniPrefillSchedule mini_prefill_schedule_from_env(bool hip) {
     return schedule;
 }
 
+// Served prompt route per backend. HIP serves the command line's schedule above with the first id taken from the final
+// prefill row (emits-first; device evidence: served prefill == CLI prefill bitwise, chunk and tail edges included). A
+// CUDA server keeps the route it served before until its own identity ticket covers the command line's schedule:
+// 128-row chunks, no tail, the last prompt token held back and decoded as the first decode row.
+inline constexpr unsigned kMiniServedHeldBackChunk = 128U;
+constexpr bool mini_served_prefill_emits_first(bool hip) noexcept { return hip; }
+
+inline MiniPrefillSchedule mini_served_prefill_schedule_from_env(bool hip) {
+    return mini_served_prefill_emits_first(hip) ? mini_prefill_schedule_from_env(hip)
+                                                : MiniPrefillSchedule{kMiniServedHeldBackChunk, 0U};
+}
+
 // Tail rows a chunk may absorb (before the decoder's own admission, mini_admitted_tail_capacity). None when the
 // context leaves no room past the chunk.
 constexpr unsigned mini_prefill_tail_capacity(unsigned chunk, unsigned divisor, unsigned context = ~0U) {

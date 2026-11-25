@@ -58,6 +58,7 @@ levers = "exact"
 [presets.fast]
 levers = "fast"
 
-# Use the admitted FAST levers until this model has a qualified TURBO set.
+# TURBO reaches the native resolver as TURBO (the same tier as the native command line); its lever table inherits the
+# admitted FAST levers where it declares no TURBO value.
 [presets.turbo]
-levers = "fast"
+levers = "turbo"

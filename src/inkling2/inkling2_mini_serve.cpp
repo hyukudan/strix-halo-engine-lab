@@ -82,8 +82,9 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     // The decode form through the one resolver the command line calls, with the backend's served default.
     out.packed_decode =
         serve::resolve_decode_form(packed_flag, grouped_flag, mini_served_packed_default(resolved.backend == "hip"));
-    // The command line's prefill schedule for this backend (one resolver): the same chunk and tail rule.
-    const auto schedule = mini_prefill_schedule_from_env(resolved.backend == "hip");
+    // The served prompt route for this backend (mini_served_prefill_schedule_from_env): HIP the command line's chunk
+    // and tail rule; CUDA its incumbent held-back route until qualified.
+    const auto schedule = mini_served_prefill_schedule_from_env(resolved.backend == "hip");
     if (out.prefill_rows == 0U) out.prefill_rows = schedule.chunk;
     out.prefill_rows = std::min(out.prefill_rows, out.context);
     out.prefill_tail = mini_prefill_tail_capacity(out.prefill_rows, schedule.tail_divisor, out.context);
@@ -208,7 +209,8 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             const auto resolved = resolve(selection, backends);
             const auto& opt = resolved.options;
             out << "backend " << resolved.backend << " context " << opt.context << " prefill_rows " << opt.prefill_rows
-                << " prefill_tail " << opt.prefill_tail << " first_id prefill"
+                << " prefill_tail " << opt.prefill_tail << " first_id "
+                << (mini_served_prefill_emits_first(resolved.backend == "hip") ? "prefill" : "decode")
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
                 << " profile " << mini_profile_name(opt.tier) << " speculation off";
             if (kMiniWeightLoadDecisions.empty() || opt.tier == profile::Name::standard || opt.weight_options.disable_q8) {

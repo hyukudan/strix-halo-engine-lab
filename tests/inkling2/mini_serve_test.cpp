@@ -325,19 +325,31 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                     !mini::mini_served_packed_default(false),
                 "served decode form differs from the command line's form for the same flags (HIP default packed; "
                 "CUDA keeps grouped without a flag until its identity ticket)");
-        // One prefill schedule per request on every entry point: the command line's chunk and tail rule for the backend,
-        // the whole prompt by prefill (emits-first), pieces only where the decoder's rule cuts without changing bits.
+        // HIP serves the command line's prefill schedule (chunk and tail rule, the whole prompt by prefill, emits-first,
+        // pieces only where the decoder's rule cuts without changing bits). A CUDA server keeps its incumbent route
+        // (128-row chunks, no tail, the last prompt token decoded) until its identity ticket.
         const bool hip_backend = std::string_view(backend) == "hip";
-        const auto schedule = mini::mini_prefill_schedule_from_env(hip_backend);
-        require(options.prefill_rows == std::min(schedule.chunk, options.context) &&
+        const auto cli = mini::mini_prefill_schedule_from_env(hip_backend);
+        const auto schedule = mini::mini_served_prefill_schedule_from_env(hip_backend);
+        require(mini::mini_served_prefill_emits_first(hip_backend) == hip_backend &&
+                    (hip_backend ? schedule.chunk == cli.chunk && schedule.tail_divisor == cli.tail_divisor
+                                 : schedule.chunk == 128U && schedule.tail_divisor == 0U) &&
+                    options.prefill_rows == std::min(schedule.chunk, options.context) &&
                     options.prefill_tail ==
                         mini::mini_prefill_tail_capacity(options.prefill_rows, schedule.tail_divisor, options.context) &&
                     mini::mini_prefill_piece_rule(hip_backend).cuttable() == hip_backend,
-                "served prefill schedule differs from the command line's for the same flags");
-        // The server's turbo preset carries the FAST levers (models/inkling2-mini.toml: no qualified TURBO set).
-        require(options.tier == (tier_name == "exact" ? strix::profile::Name::standard : strix::profile::Name::fast) &&
+                "served prefill route: HIP = the command line's schedule, CUDA = the incumbent held-back route");
+        // The served tier is the native command line's resolution of the same --profile (TURBO included: the native
+        // resolver inherits the admitted FAST levers), with the same lever classes.
+        mini::MiniWeightOptions cli_weights;
+        cli_weights.tier.profile = strix::profile::parse(tier_name);
+        cli_weights.qualify_q8 = qualify_q8;
+        const auto cli_tier = mini::resolve_mini_profile(cli_weights, true);
+        require(options.tier == strix::profile::parse(tier_name) && options.tier == cli_tier.profile &&
+                    options.moe_w4a4 == mini::mini_moe_w4a4_class(cli_tier) &&
+                    options.combine_image == mini::mini_combine_image(cli_tier) &&
                     options.weight_options.qualify_q8 == qualify_q8,
-                "profile request did not reach native adapter");
+                "served profile differs from the native command line's resolution of the same --profile");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
         const strix::weight::WeightLoadScope scope{kind, {}, {}, {}, {}, {}};
         const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope);
@@ -421,7 +433,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             const auto effective = sv::parse_json(capabilities.body);
             const auto* profile = effective.find("profile");
             const auto* weights = effective.find("weight_load");
-            require(capabilities.status == 200 && profile && profile->as_string() == (tier_name == "exact" ? "exact" : "fast") && weights &&
+            require(capabilities.status == 200 && profile && profile->as_string() == tier_name && weights &&
                     (tier_name != "fast" ||  // the FAST plan; the other tiers carry their own weight plan
                      (weights->find("storage")->as_string() == (qualify_q8 ? "gguf.q8_0" : "plain.bf16") &&
                       weights->find("status")->as_string() == (qualify_q8 ? "unqualified" : "pending"))),
