@@ -862,6 +862,16 @@ private:
                     copy(std::span<const float>(work.raw_keys, kv_rows), key_tape);
                 if (const auto value_tape = single->state.tape[1]; !value_tape.empty())
                     copy(std::span<const float>(work.raw_values, kv_rows), value_tape);
+#if defined(__HIPCC__)
+                // The history stores the BF16-rounded K/V inputs. Without the round fold the stage rounds raw_keys /
+                // raw_values in place before the convolution (the tape copied rounded rows); with the fold the
+                // convolution rounds its inputs on the fly and the raw rows stay FP32, so the tape takes the same
+                // round here and a partial commit restores the history the replayed rows would leave.
+                if (prepared_round_fold_) {
+                    for (const auto tape : {single->state.tape[0], single->state.tape[1]})
+                        if (!tape.empty()) check(adapter.round(tape.data(), kv_rows));
+                }
+#endif
             }
             check(attn_core::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(
                 adapter, rows, weights.projection(MiniAttentionProjection::output), attended, prep.gate_logits,
