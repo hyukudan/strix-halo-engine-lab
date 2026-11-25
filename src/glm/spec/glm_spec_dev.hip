@@ -195,12 +195,9 @@ __global__ __launch_bounds__(128) void dsa_rows_pool_kernel(DsaSlot sl, unsigned
     const unsigned r = blockIdx.x, i = threadIdx.x, t = t0 + r;
     if ((t + 1) % kKpool != 0) return;
     const unsigned tp = t + 1 - kKpool;
-    float l4[kKpool], kv[kKpool];
-    for (unsigned j = 0; j < kKpool; ++j) {
-        l4[j] = bf16_to_float(sl.igate[static_cast<std::size_t>(tp + j) * kIdxDim + i]) + w.ape[j * kIdxDim + i];
-        kv[j] = bf16_to_float(sl.ikey[static_cast<std::size_t>(tp + j) * kIdxDim + i]);
-    }
-    const float K = strix::attn::group_indexer::gated_pool_channel<kKpool>(l4, kv, strix::attn::group_pool::Fn<declared_exp>{});
+    const auto offset = static_cast<std::size_t>(tp) * kIdxDim;
+    const float K = strix::attn::group_pool::gated_bf16_channel<kKpool>(
+        sl.ikey + offset, sl.igate + offset, w.ape, i, kIdxDim, strix::attn::group_pool::Fn<declared_exp>{});
     if (GLMSPEC_MUTANT != 3 && !is_finite(K)) atomicOr(row_flag + r, 1U);
     sl.pooled[static_cast<std::size_t>(t / kKpool) * kIdxDim + i] = K;
 }
