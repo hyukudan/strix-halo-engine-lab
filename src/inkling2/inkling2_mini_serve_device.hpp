@@ -27,7 +27,13 @@ inline MiniServeCohort make_mini_device_cohort(
     // budget: lane-banded gains do not select).
     const weight::WeightLoadExtent extent{opt.context, opt.slots ? rows : 0U};
     const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, opt.weight_options, extent);
-    auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view(), extent);
+    auto weight_options = opt.weight_options;
+    const bool calibrated_row = mini_server_calibrated_row_allowed(weight_options.lowbit_turbo, opt.served_cli_route);
+    if (weight_options.lowbit_turbo && !calibrated_row) {
+        weight_options.lowbit_turbo = false;
+        std::cerr << "strix-lowbit-pack/v2 declined (held-back served prompt route); using incumbent weights\n";
+    }
+    auto weights = resolve_mini_resident_weight_load(opt.tier, weight_options, scope.view(), extent);
     if (!(scope.checkpoint == weight::Digest256{})) std::cerr << weight::weight_load_scope_receipt(scope.view()) << '\n';
     std::uint64_t slot_bytes = 0;
     unsigned lanes = 0;
@@ -36,7 +42,7 @@ inline MiniServeCohort make_mini_device_cohort(
 #if !defined(__HIPCC__)
     exec::CohortProgramPolicy programs;
 #endif
-    auto cohort = load_mini_weights(opt.checkpoint, weights, opt.tier, opt.weight_options, scope.view(), extent, [&](MiniLowBitRows lowbit) {
+    auto cohort = load_mini_weights(opt.checkpoint, weights, opt.tier, weight_options, scope.view(), extent, [&](MiniLowBitRows lowbit) {
         const bool calibrated = lowbit.admitted != nullptr;
         // The served route is admitted before constructing the decoder. The same load transaction
         // checks capacity and allocates the slots before publishing the cohort.

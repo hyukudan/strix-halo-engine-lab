@@ -76,6 +76,11 @@ private:
 using FixtureCohort = sv::FixedKvCohort<FixtureDecoder>;
 
 void admission() {
+    require(!mini::mini_server_calibrated_row_allowed(true, false),
+            "a held-back HTTP prompt anchor cannot enter the calibrated decode row");
+    require(mini::mini_server_calibrated_row_allowed(true, true),
+            "the calibrated row remains available when served prefill emits its first token");
+    require(!mini::mini_server_calibrated_row_allowed(false, true), "unset calibration stays off on the served route");
     require(sv::fixed_kv_slots(99, 100, 3) == 0, "KV budget too small");
     require(sv::fixed_kv_slots(400, 100, 3) == 3, "row budget cap");
     require(sv::fixed_kv_slots(400, 100, 3, 1) == 1, "explicit slot cap");

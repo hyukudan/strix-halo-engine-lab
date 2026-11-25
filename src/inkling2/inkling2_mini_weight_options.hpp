@@ -85,6 +85,19 @@ inline bool mini_may_load_lowbit_row(profile::Name tier, const MiniWeightOptions
            });
 }
 
+// The HTTP held-back route sends each prompt's last token through decode_slots. It is still prefill work and must use
+// the BF16 route used to qualify the calibrated row. Only an emits-first served route can admit that row safely.
+inline constexpr bool mini_server_calibrated_row_allowed(bool requested, bool emits_first) noexcept {
+    return requested && emits_first;
+}
+
+// Lookup and drafter speculation must verify against the same incumbent target for every verify width. Until the
+// calibrated target supports both serial and multi-row verification, keep the whole speculative run on incumbent weights.
+inline constexpr bool mini_calibrated_row_allowed_for_cli(bool requested, bool speculation_requested,
+                                                          bool drafter_requested) noexcept {
+    return requested && !speculation_requested && !drafter_requested;
+}
+
 template <class Value>
 bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argument, const Value& value,
                               bool native) {
