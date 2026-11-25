@@ -9,6 +9,7 @@
 #include "strix/cuda_core/norms.hpp"
 #include "strix/weight/registry.hpp"
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <new>
@@ -132,13 +133,18 @@ inline cudaError_t enqueue_bf16_dense_row_groups(std::span<const Bf16DenseRowGro
 // BF16-exact (same bits; the rounded epilogue then runs on the one-plane chain).
 // Unsupported MMA shapes can use the same FP32 fallback across a grid of row
 // windows. A caller with a device profile may bind short MMA3 groups to the
-// shared rows planner. `planes_report`, when given, receives the activation planes the dispatch selected.
+// shared rows planner. `planes_report`, when given, is reset to 0 on entry and, after a successful dispatch, receives the
+// activation planes of the tall split that actually ran: the term count when at least one projection took the tall MMA
+// path (a dispatch mixing it with the FP32 grid or short rows reports the split it ran), 0 when none did (every
+// projection took the FP32 grid, the short-row path or the device-profile rows planner, which split no activation here)
+// and after a failure. A caller never reads a stale or requested count.
 inline cudaError_t enqueue_bf16_dense_rows(const float* input, unsigned input_width, unsigned rows,
                                            std::span<const core::Bf16RowProjection> projections,
                                            cudaStream_t stream, DenseArith arithmetic, BigCtx* context,
                                            const device::Profile* profile = nullptr,
                                            core::Bf16Operand operand = core::Bf16Operand::fp32,
                                            int* planes_report = nullptr) {
+    if (planes_report) *planes_report = 0;
     const Bf16DenseRowGroup group{input, input_width, projections};
     if (profile && arithmetic == DenseArith::mma3 && rows <= kMaxRows)
         return enqueue_bf16_dense_row_groups(std::span(&group, 1), rows, *profile, stream);
@@ -150,7 +156,7 @@ inline cudaError_t enqueue_bf16_dense_rows(const float* input, unsigned input_wi
     unsigned short_count = 0;
     BigAct activation{};
     const int terms = detail::bf16_tall_terms(arithmetic, operand);
-    if (planes_report) *planes_report = terms;  // the planes this dispatch splits (diagnostic: operand-class qualification)
+    int split_planes = 0;
     for (const auto& projection : projections) {
         const DenseWeight weight{projection.weights, WeightFormat::bf16, projection.outputs, input_width};
         const auto path = plan_bf16_row_projection(input_width, weight.out, rows, kMaxRows,
@@ -161,6 +167,7 @@ inline cudaError_t enqueue_bf16_dense_rows(const float* input, unsigned input_wi
                                                     &activation, stream, context);
                 if (status != cudaSuccess) return status;
             }
+            split_planes = std::max(split_planes, bf16_split_planes(path, terms));
             const auto epilogue = round_bf16 ? BigEpi::round_bf16 : BigEpi::none;
             const auto status = path == Bf16RowPath::big_compact
                 ? dense_big_bf16_compact(weight, activation, projection.output, epilogue, stream, context)
@@ -174,8 +181,8 @@ inline cudaError_t enqueue_bf16_dense_rows(const float* input, unsigned input_wi
             short_outputs[short_count++] = projection.output;
         }
     }
-    if (short_count == 0) return cudaSuccess;
-    return core::for_each_dense_chunk<kMaxRows>(rows, cudaSuccess, [&](unsigned first, unsigned count) {
+    cudaError_t status = cudaSuccess;
+    if (short_count != 0) status = core::for_each_dense_chunk<kMaxRows>(rows, cudaSuccess, [&](unsigned first, unsigned count) {
         std::array<float*, kMaxBf16RowProjections> outputs;
         for (unsigned i = 0; i < short_count; ++i)
             outputs[i] = short_outputs[i] + std::size_t{first} * short_weights[i].out;
@@ -185,6 +192,8 @@ inline cudaError_t enqueue_bf16_dense_rows(const float* input, unsigned input_wi
         return dense_rows_multi(short_weights.data(), outputs.data(), static_cast<int>(short_count),
                                 input + std::size_t{first} * input_width, count, nullptr, stream, arithmetic);
     });
+    if (status == cudaSuccess && planes_report) *planes_report = split_planes;
+    return status;
 }
 
 // Device token IDs must already be validated. The gather widens BF16 and

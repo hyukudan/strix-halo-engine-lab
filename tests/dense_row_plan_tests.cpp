@@ -111,6 +111,33 @@ bool check_cuda_bf16_fast_terms() {
            plan_bf16_row_projection(input, 3072U, short_limit, short_limit, true, 1) == Bf16RowPath::short_rows;
 }
 
+// The planes a dispatch reports are those of the path each projection actually takes: a tall tile reports the term
+// count (3 exact, 1 BF16-exact declaration, 2 / 1 FAST), the FP32 row grid and short rows report none, and a mixed
+// dispatch the split that ran. Includes the tall 2048-row case, an output width of 17 (FP32 grid) and short rows.
+bool check_reported_planes() {
+    using strix::cuda_core::Bf16RowPath;
+    using strix::cuda_core::bf16_split_planes;
+    using strix::cuda_core::plan_bf16_row_projection;
+    constexpr unsigned short_limit = 16U;
+    const auto reported = [&](unsigned in, unsigned rows, std::initializer_list<unsigned> outs, int terms, bool tall = true) {
+        int planes = 0;
+        for (const unsigned out : outs)
+            planes = std::max(planes, bf16_split_planes(plan_bf16_row_projection(in, out, rows, short_limit, tall, terms), terms));
+        return planes;
+    };
+    for (const int terms : {1, 2, 3}) {
+        if (reported(2304U, 2048U, {3072U}, terms) != terms) return false;   // tall, plain big
+        if (reported(2304U, 2048U, {32U}, terms) != terms) return false;     // tall, compact tile for 3 terms
+        if (reported(64U, 2048U, {17U}, terms) != 0) return false;           // FP32 grid: the request splits nothing
+        if (reported(64U, 8U, {32U}, terms) != 0) return false;              // short rows
+        if (reported(64U, 2048U, {32U, 17U}, terms) != terms) return false;  // mixed reports the split that ran
+        if (reported(64U, 2048U, {17U, 32U}, terms) != terms) return false;
+        if (reported(2304U, 2048U, {3072U}, terms, false) != 0) return false;  // not an MMA request
+    }
+    return bf16_split_planes(Bf16RowPath::fp32_grid, 3) == 0 && bf16_split_planes(Bf16RowPath::short_rows, 3) == 0 &&
+           bf16_split_planes(Bf16RowPath::big, 1) == 1 && bf16_split_planes(Bf16RowPath::big_compact, 3) == 3;
+}
+
 // Host model of the split kernel (RN-even to BF16, FP32 subtraction) and of the
 // tall chain order (per K step lo, mid, hi into one accumulator from +0).
 float bf16_rn(float value) {
@@ -578,7 +605,7 @@ static bool check_image_route_order() {
 
 int main() {
     if (!check_row_chunks() || !check_projection_groups() || !check_cuda_bf16_paths() ||
-        !check_cuda_bf16_fast_terms() || !check_exact_operand_planes() || !check_image_routes() ||
+        !check_cuda_bf16_fast_terms() || !check_reported_planes() || !check_exact_operand_planes() || !check_image_routes() ||
         !check_image_route_order() || !check_dense_declared() || !check_low_rank_bound() ||
         !check_staged_scan()) {
         std::cerr << "Dense row or projection chunk policy failed\n";
