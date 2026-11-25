@@ -3,6 +3,7 @@
 #include "strix/onfly_i4.hpp"
 #include "strix/prefill_identity.hpp"
 #include "strix/session/kv_precision.hpp"
+#include <deque>
 #include <array>
 #include <cstdlib>
 #include <functional>
@@ -199,13 +200,19 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
             inherited |= owned && std::string_view(owned) == marker(profile, status, env);
         return inherited;
     };
-    const auto arms = ::strix::profile::ladder_arms(rows, std::span<const ::strix::profile::LadderRow>(ladder),
+    const auto build_arms = [&] {
+    return ::strix::profile::ladder_arms(rows, std::span<const ::strix::profile::LadderRow>(ladder),
         inputs.regime, admit_of, [&](const Lever& lever) -> std::optional<std::string_view> {
             if (const auto* cli = ::strix::profile::last_setting(inputs.cli, lever.name)) return std::string_view(*cli);
             const char* env = lever.env.empty() ? nullptr : environment(inputs.env, std::string(lever.env));
             if (env && !inherited_env(lever, env)) return env;
             return std::nullopt;
         }, allow_pending);
+    };
+    auto arms = build_arms();
+    // Band receipts name no literal execution: they bind to this run's own reference (shared bind_band_receipts).
+    std::deque<std::string> band_references;
+    if (::strix::profile::bind_band_receipts(ladder, arms, band_references)) arms = build_arms();
     for (const auto& lever : rows) {
         const auto column = ::strix::profile::value_column(lever, profile);  // empty turbo cell: the fast cell
         const std::string* cli = nullptr;
