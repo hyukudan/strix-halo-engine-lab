@@ -39,8 +39,9 @@ inline constexpr unsigned kPadBytes = 16U;   // per staged row: 16-byte row pitc
 inline constexpr unsigned kChunkBytes = 16U; // activation copy chunk
 inline constexpr unsigned kShiftCodes = 128U;  // NVFP4 block-scale codes with a possible exponent-shift table (0x00 .. 0x7f)
 
-// Instantiated forms. Selection (select()) uses r128_k32_s4 and r64_k32_s4; the others exist for the no-model bench.
-enum class FormId : std::uint8_t { r128_k32_s4, r128_k32_s3, r128_w16_k32_s4, r64_k32_s4, r128_n4_k32_s4 };
+// Instantiated forms. Selection (resolve()) uses r128_k32_s4, its direct-scale twin r128_k32_s4_direct and r64_k32_s4;
+// the others exist for the no-model bench.
+enum class FormId : std::uint8_t { r128_k32_s4, r128_k32_s3, r128_w16_k32_s4, r64_k32_s4, r128_n4_k32_s4, r128_k32_s4_direct };
 
 struct Form {
     unsigned rows;     // routed rows per CTA (M)
@@ -69,6 +70,7 @@ STRIX_TALL_HD constexpr Form form(FormId id) {
     case FormId::r128_w16_k32_s4: return {128U, 32U, 4U, 4U, 4U, true};  // 16 warps, warp tile 32 x 32
     case FormId::r64_k32_s4: return {64U, 32U, 4U, 2U, 4U, false};        // 8 warps, warp tile 32 x 32
     case FormId::r128_n4_k32_s4: return {128U, 32U, 4U, 2U, 4U, true};   // 8 warps, warp tile 64 x 32
+    case FormId::r128_k32_s4_direct: return {128U, 32U, 4U, 4U, 2U, false};  // r128_k32_s4 with direct scale loads
     }
     return {128U, 32U, 4U, 4U, 2U, true};
 }
@@ -80,6 +82,7 @@ STRIX_TALL_HD constexpr const char* name(FormId id) {
     case FormId::r128_w16_k32_s4: return "r128.w16.k32.s4";
     case FormId::r64_k32_s4: return "r64.k32.s4";
     case FormId::r128_n4_k32_s4: return "r128.n4.k32.s4";
+    case FormId::r128_k32_s4_direct: return "r128.k32.s4.direct";
     }
     return "?";
 }
@@ -256,6 +259,23 @@ inline bool fits(const grouped_microscaled::Args& args, FormId id, bool nvfp4, s
     const Form f = form(id);
     return valid(f, nvfp4) && fits_shape(f, args.inputs, args.outputs) && args.max_tile_rows <= kMaxRows &&
            shared_bytes(f, layout(f, nvfp4), args.inputs, nvfp4) <= shared_budget;
+}
+
+// The same form with direct scale loads (the scale source is a trait: bits and every other part of the schedule are
+// unchanged); a form that already loads directly is its own twin.
+STRIX_TALL_HD constexpr FormId direct_twin(FormId id) {
+    return id == FormId::r128_k32_s4 ? FormId::r128_k32_s4_direct : id;
+}
+
+// Form a launch takes under a shared budget: the selected form; when its staged block scales do not fit, the same form
+// with direct scale loads (staging never removes a shape the direct form admits); false when neither fits (automatic
+// then keeps the staged tile schedule, an explicit tall request refuses).
+inline bool resolve(const grouped_microscaled::Args& args, bool nvfp4, std::size_t shared_budget, FormId& out) {
+    const FormId id = select(args.max_tile_rows);
+    if (fits(args, id, nvfp4, shared_budget)) { out = id; return true; }
+    const FormId twin = direct_twin(id);
+    if (twin != id && fits(args, twin, nvfp4, shared_budget)) { out = twin; return true; }
+    return false;
 }
 
 }  // namespace strix::moe_core::grouped_tall

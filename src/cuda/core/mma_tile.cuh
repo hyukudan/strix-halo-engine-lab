@@ -726,6 +726,8 @@ inline cudaError_t launch_tall(tall::FormId id, const view::Args& args, cudaStre
     switch (id) {
     case tall::FormId::r128_k32_s4: return launch_tall_form<Format, tall::FormId::r128_k32_s4>(args, stream);
     case tall::FormId::r64_k32_s4: return launch_tall_form<Format, tall::FormId::r64_k32_s4>(args, stream);
+    case tall::FormId::r128_k32_s4_direct:
+        return launch_tall_form<Format, tall::FormId::r128_k32_s4_direct>(args, stream);
     default: return cudaErrorInvalidValue;
     }
 }
@@ -740,8 +742,8 @@ inline cudaError_t launch(const view::Args& args, cudaStream_t stream) {
     if (!fits(args)) return cudaErrorInvalidValue;
     const bool tile = output_tile(args.outputs, args.max_tile_rows) == kTileOutputs;
     if (args.schedule == view::Schedule::tall || (args.schedule == view::Schedule::automatic && tile)) {
-        const auto id = tall::select(args.max_tile_rows);
-        if (tall::fits(args, id, Format == packed::MatrixFormat::nvfp4, detail::shared_budget()))
+        tall::FormId id{};
+        if (tall::resolve(args, Format == packed::MatrixFormat::nvfp4, detail::shared_budget(), id))
             return detail::launch_tall<Format>(id, args, stream);
         if (args.schedule == view::Schedule::tall) return cudaErrorInvalidValue;
     }

@@ -64,9 +64,9 @@ std::vector<T> to_host(const T* src, std::size_t n) {
 std::uint16_t bf16_bits(float v) { return strix::weight::scalar_float::bf16_encode(v); }
 
 // Schedules under test: the incumbent, the default resolution, explicit tall, and every instantiated form.
-enum class Arm { staged, automatic, tall, r128_s4, r128_s3, r128_w16, r64, r128_n4 };
+enum class Arm { staged, automatic, tall, r128_s4, r128_s3, r128_w16, r64, r128_n4, r128_direct };
 constexpr Arm kArms[] = {Arm::staged, Arm::automatic, Arm::tall, Arm::r128_s4, Arm::r128_s3, Arm::r128_w16, Arm::r64,
-                         Arm::r128_n4};
+                         Arm::r128_n4, Arm::r128_direct};
 const char* arm_name(Arm a) {
     switch (a) {
     case Arm::staged: return "staged";
@@ -77,6 +77,7 @@ const char* arm_name(Arm a) {
     case Arm::r128_w16: return tall::name(tall::FormId::r128_w16_k32_s4);
     case Arm::r64: return tall::name(tall::FormId::r64_k32_s4);
     case Arm::r128_n4: return tall::name(tall::FormId::r128_n4_k32_s4);
+    case Arm::r128_direct: return tall::name(tall::FormId::r128_k32_s4_direct);
     }
     return "?";
 }
@@ -92,6 +93,7 @@ cudaError_t run(Arm arm, view::Args args, cudaStream_t stream) {
     case Arm::r128_w16: return tile::detail::launch_tall_form<F, tall::FormId::r128_w16_k32_s4>(args, stream);
     case Arm::r64: return tile::detail::launch_tall_form<F, tall::FormId::r64_k32_s4>(args, stream);
     case Arm::r128_n4: return tile::detail::launch_tall_form<F, tall::FormId::r128_n4_k32_s4>(args, stream);
+    case Arm::r128_direct: return tile::detail::launch_tall_form<F, tall::FormId::r128_k32_s4_direct>(args, stream);
     }
     return cudaErrorInvalidValue;
 }

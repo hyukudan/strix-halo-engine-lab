@@ -10,7 +10,7 @@
 //  6. ring schedule: wait counts, slots and slabs give every read the stage it expects, after it landed, with no copy or decode
 //     into a slot or slab another thread may still read in the same barrier interval, K16 steps ascending over the whole K,
 //     for both decode / multiply orders inside an iteration (warps of one scheduler alternate them);
-//  7. selection and admission;
+//  7. selection and admission (staged block scales never remove a shape the direct-scale twin admits);
 //  8. block scales staged once per CTA: the copy covers every (output, block) byte once (4-byte chunks on whole-word rows,
 //     else bytes), after the tables, inside the launch's shared bytes; every decode job of every stage reads the byte of its
 //     own (output, block), the one a direct global load reads; the byte reads of one warp hit distinct banks.
@@ -37,7 +37,8 @@ void check(bool ok, const char* what, tall::FormId id, bool nvfp4) {
 }
 
 constexpr tall::FormId kForms[] = {tall::FormId::r128_k32_s4, tall::FormId::r128_k32_s3, tall::FormId::r128_w16_k32_s4,
-                                   tall::FormId::r64_k32_s4, tall::FormId::r128_n4_k32_s4};
+                                   tall::FormId::r64_k32_s4, tall::FormId::r128_n4_k32_s4,
+                                   tall::FormId::r128_k32_s4_direct};
 constexpr std::size_t kSm120OptinShared = 99U * 1024U;
 
 static_assert(tall::valid(tall::form(tall::FormId::r128_k32_s4), true));
@@ -327,6 +328,36 @@ void selection() {
     args.max_tile_rows = 128U;
     ok = ok && !tall::fits(args, tall::FormId::r128_k32_s4, true, 48U * 1024U);  // budget below the form's shared bytes
     check(ok, "ragged inputs / outputs, oversize tiles and a small shared budget refused", none, true);
+    // Budget thresholds (K = 4096, N = 2048, NVFP4 and MXFP8): staged r128 at or above its bytes, the direct twin (the
+    // incumbent r128 kernel) from its own bytes up to one byte below the staged ones, nothing below (automatic keeps the
+    // staged tile schedule, an explicit tall request refuses); r64 has no twin.
+    for (const bool nvfp4 : {true, false}) {
+        view::Args big{};
+        big.inputs = 4096U;
+        big.outputs = 2048U;
+        big.max_tile_rows = 128U;
+        const tall::Form fs = tall::form(tall::FormId::r128_k32_s4), fd = tall::form(tall::FormId::r128_k32_s4_direct);
+        const std::size_t staged = tall::shared_bytes(fs, tall::layout(fs, nvfp4), big.inputs, nvfp4);
+        const std::size_t direct = tall::shared_bytes(fd, tall::layout(fd, nvfp4), big.inputs, nvfp4);
+        tall::FormId got = tall::FormId::r128_k32_s3;
+        ok = direct < staged && tall::layout(fs, nvfp4).smem == tall::layout(fd, nvfp4).smem &&
+             tall::direct_twin(tall::FormId::r128_k32_s4) == tall::FormId::r128_k32_s4_direct &&
+             tall::direct_twin(tall::FormId::r64_k32_s4) == tall::FormId::r64_k32_s4;
+        ok = ok && tall::resolve(big, nvfp4, staged, got) && got == tall::FormId::r128_k32_s4;
+        ok = ok && tall::resolve(big, nvfp4, staged - 1U, got) && got == tall::FormId::r128_k32_s4_direct;
+        ok = ok && tall::resolve(big, nvfp4, direct, got) && got == tall::FormId::r128_k32_s4_direct;
+        got = tall::FormId::r128_k32_s3;
+        ok = ok && !tall::resolve(big, nvfp4, direct - 1U, got) && got == tall::FormId::r128_k32_s3;
+        if (nvfp4)  // NVFP4 at a 96 KiB budget: the incumbent admits r128, staging alone would not -> the direct twin
+            ok = ok && direct == 71808U && staged == 105088U && tall::resolve(big, nvfp4, 96U * 1024U, got) &&
+                 got == tall::FormId::r128_k32_s4_direct;
+        big.max_tile_rows = 64U;
+        const tall::Form f64 = tall::form(tall::FormId::r64_k32_s4);
+        const std::size_t b64 = tall::shared_bytes(f64, tall::layout(f64, nvfp4), big.inputs, nvfp4);
+        ok = ok && tall::resolve(big, nvfp4, b64, got) && got == tall::FormId::r64_k32_s4 &&
+             !tall::resolve(big, nvfp4, b64 - 1U, got);
+        check(ok, "budget thresholds: staged r128 >= its bytes, direct twin below, none under the direct bytes", none, nvfp4);
+    }
     ok = mma::microscaled::kRowsPerTile == tall::kMaxRows;
     check(ok, "plan rows per tile = the tall CTA extent", none, true);
 }
@@ -424,6 +455,6 @@ int main() {
         std::printf("grouped_tall_plan_test: FAIL (%d)\n", failures);
         return 1;
     }
-    std::printf("grouped_tall_plan_test: PASS (5 forms x 2 formats: layout, copies, decode, operands, stores, ring schedule)\n");
+    std::printf("grouped_tall_plan_test: PASS (6 forms x 2 formats: layout, copies, decode, operands, stores, ring schedule)\n");
     return 0;
 }
