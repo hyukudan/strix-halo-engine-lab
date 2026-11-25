@@ -187,7 +187,7 @@ struct FakeDecoder {
     strix::moe_core::grouped_w4a4::Activations w4a4 = strix::moe_core::grouped_w4a4::Activations::bf16;
     int image_calls = 0, screen_builds = 0;
     bool image = false, runs = true, fold = false, folds = true, projected = false, builds = true;
-    bool verify = false, verifies = true;
+    unsigned verify = 0U, verifies = 2U;  // selected verify rows level; highest level this backend admits (0: declines)
     void set_attention_projected_bias(bool enabled) { projected = enabled; }
     bool set_prepared_round_fold(bool selected) { fold = selected; return selected && folds; }
     void set_moe_w4a4(strix::moe_core::grouped_w4a4::Activations a) { w4a4 = a; }
@@ -195,7 +195,7 @@ struct FakeDecoder {
     mini::MiniHead set_screened_head(bool selected) {
         return mini::mini_select_head(selected, [this] { ++screen_builds; return builds; });
     }
-    bool set_verify_rows(bool selected) { verify = selected; return selected && verifies; }
+    unsigned set_verify_rows(unsigned selected) { verify = selected; return selected < verifies ? selected : verifies; }
 };
 
 void test_configure() {
@@ -224,7 +224,7 @@ void test_configure() {
         require(!levers.down_image && !levers.prepared_round_fold && !by_default.fold && !by_default.image,
                 "no other lever is applied by default");
         require(!by_default.projected, "the projected-bias route is opt-in: off by default");
-        require(!by_default.verify && !levers.verify_rows, "the verify rows lever is opt-in: off by default");
+        require(by_default.verify == 0U && levers.verify_rows == 0U, "the verify rows lever is opt-in: off by default");
     }
     options.tier = inputs(profile::Name::standard, nullptr, nullptr, "1");
     FakeDecoder fold_on;
@@ -343,7 +343,8 @@ void test_verify_rows() {
     };
     mini::MiniWeightOptions options;
     for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
-        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
+        for (const auto& [value, expected] :
+             {std::pair<const char*, unsigned>{nullptr, 0U}, {"0", 0U}, {"1", 1U}, {"2", mini::kMiniVerifyLanesPick}}) {
             options.tier = in(tier, value);
             for (const bool native : {false, true}) {
                 const auto resolved = mini::resolve_mini_profile(options, native);
@@ -362,15 +363,39 @@ void test_verify_rows() {
     require(profile::resolve(mini::kMiniProfile, in(profile::Name::standard, "1")).fingerprint() !=
                 profile::resolve(mini::kMiniProfile, in(profile::Name::standard, nullptr)).fingerprint(),
             "an explicit verify rows selection is a distinct identity");
+    require(profile::resolve(mini::kMiniProfile, in(profile::Name::standard, "2")).fingerprint() !=
+                profile::resolve(mini::kMiniProfile, in(profile::Name::standard, "1")).fingerprint(),
+            "the lanes pick level is a distinct identity from level 1");
     // A backend that does not run it (CUDA): the request reaches the decoder, the reported state is declined.
     options.tier = in(profile::Name::standard, "1");
     FakeDecoder cuda;
-    cuda.verifies = false;
+    cuda.verifies = 0U;
     const auto levers = mini::configure_mini_decoder(cuda, mini::resolve_mini_profile(options, true));
-    require(cuda.verify && !levers.verify_rows &&
-                std::string(mini::mini_verify_rows_name(levers.verify_rows, true)) == "declined",
+    require(cuda.verify == 1U && levers.verify_rows == 0U &&
+                std::string(mini::mini_verify_rows_name(levers.verify_rows, 1U)) == "declined",
             "a declined verify rows lever is reported declined, not on");
+    // A decoder without the BF16 screened head runs level 1 of a level-2 selection and says so.
     options.tier = in(profile::Name::standard, "2");
+    FakeDecoder rows_only;
+    rows_only.verifies = 1U;
+    const auto partial = mini::configure_mini_decoder(rows_only, mini::resolve_mini_profile(options, true));
+    require(rows_only.verify == 2U && partial.verify_rows == 1U &&
+                std::string(mini::mini_verify_rows_name(partial.verify_rows, 2U)) == "on+lanes-pick-declined" &&
+                std::string(mini::mini_verify_rows_name(2U, 2U)) == "on+lanes-pick" &&
+                std::string(mini::mini_verify_rows_name(1U, 1U)) == "on" &&
+                std::string(mini::mini_verify_rows_name(0U, 0U)) == "off",
+            "the admitted verify rows level is reported against the selected one");
+    // A server reports the lanes pick only where a cohort can run it: two or more admitted slots on the incumbent
+    // served route; the served CLI route and a one-slot server run level 1, lower levels pass through.
+    require(mini::mini_served_verify_rows(2U, false, 4U) == 2U && mini::mini_served_verify_rows(2U, false, 2U) == 2U &&
+                mini::mini_served_verify_rows(2U, false, 1U) == 1U && mini::mini_served_verify_rows(2U, true, 4U) == 1U &&
+                mini::mini_served_verify_rows(1U, false, 1U) == 1U && mini::mini_served_verify_rows(0U, true, 1U) == 0U &&
+                std::string(mini::mini_verify_rows_name(mini::mini_served_verify_rows(2U, true, 4U), 2U)) ==
+                    "on+lanes-pick-declined" &&
+                std::string(mini::mini_verify_rows_name(mini::mini_served_verify_rows(2U, false, 1U), 2U)) ==
+                    "on+lanes-pick-declined",
+            "a server with one admitted slot or on the served CLI route does not report the lanes pick");
+    options.tier = in(profile::Name::standard, "3");
     bool refused = false;
     try {
         static_cast<void>(mini::resolve_mini_profile(options, true));

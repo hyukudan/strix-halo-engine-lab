@@ -75,7 +75,9 @@ inline MiniServeCohort make_mini_device_cohort(
               << " moe_prefill " << moe_core::grouped_w4a4::identity(opt.moe_w4a4)
               << " served_route " << mini_served_route_startup_field(opt, cohort->prompt_tail_rows())
               << " prepared_round_fold " << mini_round_fold_startup_field(opt, levers)
-              << " verify_rows " << mini_verify_rows_name(levers.verify_rows, opt.verify_rows)
+              << " verify_rows "
+              << mini_verify_rows_name(mini_served_verify_rows(levers.verify_rows, opt.served_cli_route, lanes),
+                                       opt.verify_rows)
               << " down_image " << mini_down_image_name(levers.down_image, opt.combine_image)
               << " head " << mini_head_field(levers.head)
               << " experts " << (opt.experts_nvfp4 ? "nvfp4" : "checkpoint")

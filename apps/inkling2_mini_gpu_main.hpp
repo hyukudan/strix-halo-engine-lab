@@ -44,7 +44,7 @@ public:
                      moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16,
                      bool combine_image = false, bool prepared_round_fold = false, bool narrow_experts = false,
                      bool controller_one_plane = false, bool attn_projected_bias = false, bool screened_head = false,
-                     bool verify_rows = false, MiniLowBitRows lowbit = {})
+                     unsigned verify_rows = 0U, MiniLowBitRows lowbit = {})
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
                    load.verify_rows, dspark != nullptr, 1U, load.prefill_tail, narrow_experts, controller_one_plane, false, lowbit),
           projected_bias_(attn_projected_bias) {

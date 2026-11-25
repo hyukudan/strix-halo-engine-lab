@@ -216,13 +216,17 @@ inline bool mini_screened_head(const profile::Resolution& tier) {
     throw std::invalid_argument("STRIX_INK_SCREENED_HEAD must be 0 or 1");
 }
 
-// Resolved state of the verify rows lever (true: a HIP verify window takes the pitched rows head, one lanes attention
-// launch set and the convolution tape, kMiniVerifyRows). 0 or absent = off: the per-row incumbent.
-inline bool mini_verify_rows(const profile::Resolution& tier) {
+// Resolved level of the verify rows lever (kMiniVerifyRows). 0 or absent = off: the per-row incumbent. 1: a HIP verify
+// window takes the pitched rows head, one lanes attention launch set and the convolution tape. 2: level 1, and greedy
+// picks whose scores nobody reads (verify windows without a sampled or observing reader, served cohorts whose groups
+// declare no score read) go through the lanes form of the EXACT screened head (kMiniVerifyLanesPick).
+inline constexpr unsigned kMiniVerifyLanesPick = 2U;
+inline unsigned mini_verify_rows(const profile::Resolution& tier) {
     const auto* entry = tier.find(kMiniVerifyRows);
-    if (entry == nullptr || entry->value == "0") return false;
-    if (entry->value == "1") return true;
-    throw std::invalid_argument("STRIX_INK_VERIFY_ROWS must be 0 or 1");
+    if (entry == nullptr || entry->value == "0") return 0U;
+    if (entry->value == "1") return 1U;
+    if (entry->value == "2") return kMiniVerifyLanesPick;
+    throw std::invalid_argument("STRIX_INK_VERIFY_ROWS must be 0, 1 or 2");
 }
 
 // Resolved state of the served route lever (true: a HIP server runs the command line's route, kMiniServedCliRoute).
@@ -259,14 +263,27 @@ inline bool mini_controller_one_plane(const profile::Resolution& tier) {
 // (down_image, prepared_round_fold), the same text in the CLI, the gate and the server.
 inline const char* mini_down_image_name(bool active, bool selected) { return active ? "on" : selected ? "declined" : "off"; }
 inline const char* mini_round_fold_name(bool active, bool selected) { return mini_down_image_name(active, selected); }
-inline const char* mini_verify_rows_name(bool active, bool selected) { return mini_down_image_name(active, selected); }
+// Effective verify rows level against the selected one: off, on (level 1), on+lanes-pick (level 2), declined (nothing
+// admitted), on+lanes-pick-declined (level 2 selected, the decoder has no screened head: compact head or no screen).
+inline const char* mini_verify_rows_name(unsigned active, unsigned selected) {
+    if (active == 0U) return selected == 0U ? "off" : "declined";
+    if (active >= kMiniVerifyLanesPick) return "on+lanes-pick";
+    return selected >= kMiniVerifyLanesPick ? "on+lanes-pick-declined" : "on";
+}
+// The level a server runs of the decoder's admitted one (its startup receipt): the server stages no verify window, so
+// its lanes pick screens only cohorts of two or more distinct admitted slots on the incumbent served route. The served
+// CLI route (packed passes, decode_slots_served) and a one-slot server run level 1 (on+lanes-pick-declined); a one-slot
+// command line keeps the decoder's level (its verify windows screen through the lanes pick).
+inline unsigned mini_served_verify_rows(unsigned active, bool served_cli_route, std::size_t admitted_slots) {
+    return active >= kMiniVerifyLanesPick && (served_cli_route || admitted_slots < 2U) ? 1U : active;
+}
 
 // What the decoder's backend admitted of the resolved levers: the effective state every entry point reports.
 struct MiniDecoderLevers {
     bool down_image = false;           // the BF16 down image route is active
     bool prepared_round_fold = false;  // the prepared-attention round fold runs
     MiniHead head{};                   // the greedy head the decoder runs (screened-head lever) and why
-    bool verify_rows = false;          // verify windows take the rows head, lanes attention and convolution tape
+    unsigned verify_rows = 0U;         // verify rows level admitted (mini_verify_rows: 0 off, 1 rows, 2 rows + lanes pick)
 };
 
 // The one place a resident decoder takes its resolved profile levers; the serial CLI, the gate and the server all call
@@ -275,14 +292,14 @@ struct MiniDecoderLevers {
 template <class Decoder>
 MiniDecoderLevers configure_mini_decoder(Decoder& decoder, moe_core::grouped_w4a4::Activations moe_w4a4,
                                          bool combine_image, bool prepared_round_fold, bool attn_projected_bias,
-                                         bool screened_head, bool verify_rows) {
+                                         bool screened_head, unsigned verify_rows) {
     decoder.set_moe_w4a4(moe_w4a4);
     decoder.set_attention_projected_bias(attn_projected_bias);
     MiniDecoderLevers levers;
     levers.prepared_round_fold = decoder.set_prepared_round_fold(prepared_round_fold);
     levers.down_image = decoder.set_combine_image(combine_image);
-    levers.head = decoder.set_screened_head(screened_head);
     levers.verify_rows = decoder.set_verify_rows(verify_rows);
+    levers.head = decoder.set_screened_head(screened_head);
     return levers;
 }
 

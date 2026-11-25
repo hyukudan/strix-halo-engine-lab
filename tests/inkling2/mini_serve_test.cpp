@@ -446,6 +446,29 @@ void profile_parity() {
     }
     set_expert_env(nullptr);
     set_w4a4_env(nullptr);
+    const auto previous_arguments = selection.arguments;
+    selection.arguments.back() = "exact";
+    for (const auto* backend : {"hip", "cuda"}) {
+        selection.arguments[3] = backend;
+        for (const auto* head : {static_cast<const char*>(nullptr), "1"}) {
+            set_env("STRIX_INK_SCREENED_HEAD", head);
+            for (const auto& [rows, level] : {std::pair<const char*, unsigned>{nullptr, 0U},
+                                             {"0", 0U}, {"1", 1U}, {"2", 2U}}) {
+                set_env("STRIX_INK_VERIFY_ROWS", rows);
+                loaded.reset();
+                const auto cli = parse_cli("exact", backend);
+                const auto service = factory->create(selection);
+                require(service && loaded && loaded->screened_head == (head != nullptr) &&
+                            loaded->screened_head == mini::mini_screened_head(cli.tier) &&
+                            loaded->verify_rows == level && loaded->verify_rows == mini::mini_verify_rows(cli.tier),
+                        "CLI and server must resolve both opt-in rows independently");
+            }
+        }
+    }
+    set_env("STRIX_INK_SCREENED_HEAD", nullptr);
+    set_env("STRIX_INK_VERIFY_ROWS", nullptr);
+    selection.arguments = previous_arguments;
+
     selection.arguments[3] = "hip";
     for (const auto* tier : {"exact", "fast", "turbo"}) {
         selection.arguments.back() = tier;

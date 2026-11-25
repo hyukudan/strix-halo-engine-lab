@@ -182,6 +182,19 @@ startup line `verify_rows` (served lanes decode one row per step, so the
 server's output does not change). It stays opt-in until device identity
 against the per-row route.
 
+`STRIX_INK_VERIFY_ROWS=2` adds the lanes pick: greedy picks whose scores
+nobody reads (verify windows without a sampled or observing reader, served
+cohorts of 2+ lanes whose groups declare no score read) go through the lanes
+form of the EXACT screened head (BF16 head only; one read of the head plane
+for all lanes, each lane with its one-row token). A later score read of a
+served cohort lane recomputes the skipped rows through the per-row head, also
+after another slot's verify window or prompt chunk (the rows are materialized
+before their head inputs are overwritten); a verify window picked this way has
+no later score reader. The tokens are those of the full head; it is a distinct
+identity, and the startup lines print `on+lanes-pick`
+(`on+lanes-pick-declined` without the BF16 screened head, and on a server with
+one admitted slot or on the served CLI route, whose cohorts keep level 1).
+
 On HIP, the command line prefills in chunks of 8192 rows (`--prefill-chunk`),
 and a remainder of up to chunk / 8 rows (and more than 16) rides in the final
 chunk (`STRIX_INKLING_PREFILL_TAIL=0` turns that off). A HIP server on the

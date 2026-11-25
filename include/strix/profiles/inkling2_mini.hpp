@@ -154,7 +154,8 @@ inline constexpr std::string_view kMiniScreenedHead = "inkling2-mini-screened-he
 // Off in every tier (builtin 0: per-row head launches, per-row attention launches, replayed partial commits); CUDA
 // declines it. Select it with STRIX_INK_VERIFY_ROWS=1 (any profile), through the one resolver the CLI, the gate and the
 // server share; a distinct identity until device identity (scores, picks and continuation after a partial commit
-// bitwise the incumbent) makes it a default.
+// bitwise the incumbent) makes it a default. Value 2 adds the lanes pick: greedy picks whose scores nobody reads (verify
+// windows, served cohorts whose groups declare no score read) take the lanes form of the EXACT screened head (BF16).
 inline constexpr std::string_view kMiniVerifyRows = "inkling2-mini-verify-rows@1";
 inline constexpr std::array<profile::Lever, 11> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
