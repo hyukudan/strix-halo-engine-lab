@@ -16,6 +16,7 @@
 #include "strix/serve/inkling2_chat.hpp"
 #include "strix/session/cli_output.hpp"
 #include "strix/session/embed_splice.hpp"
+#include "strix/spec/drafter_source.hpp"
 #include "strix/spec/engine_target.hpp"
 
 #include <algorithm>
@@ -374,14 +375,28 @@ int main(int argc, char** argv) {
             };
         else
 #endif
-        family.load = [&loaded, &resolve_weights, &options, &weight_options, step_graphs, dspark = options.dspark,
+        // The resident route's drafter (strix/spec/drafter_source.hpp): --dspark FILE|off, else the model's MTP block
+        // beside the checkpoint when this run speculates (auto, greedy).
+        const auto drafter = strix::spec::resolve_drafter_file(
+            {.file = options.dspark ? std::string_view(options.dspark) : std::string_view{},
+             .off = options.dspark_off,
+             .speculating = options.generation.speculation == serve::CliSpeculation::automatic &&
+                            !options.gate_manifest && !options.generation.tokenize_file &&
+                            !token_sampling_enabled(options.generation.sampling)},
+            argv[1], strix::model_data::inkling2_mini::speculation::drafter);
+        const bool speculating = options.generation.speculation != serve::CliSpeculation::off;
+        family.load = [&loaded, &resolve_weights, &options, &weight_options, step_graphs, &drafter,
                        combine_image = mini_combine_image(options.tier),
                        round_fold = mini_prepared_round_fold(options.tier),
                        narrow = mini_experts_nvfp4(options.tier),
                        controller_one_plane = mini_controller_one_plane(options.tier),
                        projected_bias = mini_attn_projected_bias(options.tier),
                        screened_head = mini_screened_head(options.tier),
-                       verify_rows = mini_verify_rows(options.tier)](const serve::SerialGenerationLoad& load) {
+                       verify_rows = mini_speculation_verify_rows(mini_verify_rows(options.tier), speculating)](
+                          const serve::SerialGenerationLoad& load) {
+            // The drafter loads only when this request may draft (the shared CLI's resolved mode).
+            const char* dspark = drafter.enabled() && load.speculation == serve::CliSpeculation::automatic
+                                     ? drafter.path.c_str() : nullptr;
             const strix::weight::WeightLoadExtent extent{load.positions, 1U};
             loaded = resolve_weights(extent);
             const auto moe_w4a4 = mini_prompt_moe(weight_options, loaded->scope.device_class,
@@ -416,6 +431,11 @@ int main(int argc, char** argv) {
             std::cerr << "strix-decode-route/v1 moe_decode " << mini_decode_form_name(options.generation.packed_decode)
                       << '\n';
             std::cerr << mini_served_route_cli_line(options.tier) << '\n';
+#if defined(STRIX_INKLING2_STEP_PROGRAM)
+            if (!step_program)
+#endif
+            if (options.generation.speculation != serve::CliSpeculation::off)
+                std::cerr << strix::spec::drafter_receipt("resident", drafter) << '\n';
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
             if (!route.speculation_reason.empty())
                 std::cerr << "strix-speculation-route/v1 requested auto effective off ("

@@ -52,6 +52,8 @@ inline MiniServeCohort make_mini_device_cohort(
             opt.experts_nvfp4, opt.controller_one_plane, opt.served_cli_route, std::move(lowbit));
         levers = configure_mini_decoder(*decoder, opt.moe_w4a4, opt.combine_image, opt.prepared_round_fold,
                                         opt.attn_projected_bias, opt.screened_head, opt.verify_rows);
+        // Admitted speculation: one-lane verify windows on any slot (per-slot tapes count in the slot's bytes).
+        decoder->set_slot_windows(opt.speculation);
         slot_bytes = decoder->slot_bytes();
         // Keep the CUDA screened plane only when it costs no slot, then enforce the calibrated load's slot promise.
         const auto memory = mini_gpu::memory_info();
@@ -87,6 +89,7 @@ inline MiniServeCohort make_mini_device_cohort(
               << " down_image " << mini_down_image_name(levers.down_image, opt.combine_image)
               << " head " << mini_head_field(levers.head)
               << " experts " << (opt.experts_nvfp4 ? "nvfp4" : "checkpoint")
+              << " speculation " << mini_served_speculation_name(opt)
               << " prefill_route " << (cohort->prefill_emits_first() ? "emits-first" : "plain")
               << " weight_storage " << weights.storage.name << '@' << weights.storage.revision
               << (weights.head_storage != weights.storage ? " weight_head_storage " : "")

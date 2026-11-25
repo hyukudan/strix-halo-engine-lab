@@ -14,6 +14,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstdlib>
+#include <vector>
 
 namespace {
 
@@ -347,6 +348,24 @@ void test_options() {
                 strix::serve::CliSpeculation::automatic,
             "expected DSpark in automatic speculation");
     expect_invalid([] { (void)parse({"1", "--speculation", "off", "--dspark", "mtp.safetensors"}); });
+    // The speculation row (kMiniSpeculation): builtin off; an explicit mode is recorded; --dspark off switches the
+    // drafter off (no sidecar lookup), and a speculating run takes the verify rows body.
+    require(parse({"1"}).generation.speculation == strix::serve::CliSpeculation::off &&
+                !parse({"1"}).generation.speculation_requested,
+            "speculation row builtin: off");
+    require(parse({"1", "--speculation", "auto"}).generation.speculation_requested, "explicit speculation recorded");
+    {
+        const auto off = parse({"1", "--speculation", "auto", "--dspark", "off"});
+        require(off.dspark_off && off.dspark == nullptr &&
+                    off.generation.speculation == strix::serve::CliSpeculation::automatic,
+                "--dspark off: no drafter file, speculation unchanged");
+    }
+    require(strix::inkling2::mini_speculation_verify_rows(0U, true) == 1U &&
+                strix::inkling2::mini_speculation_verify_rows(2U, true) == 2U &&
+                strix::inkling2::mini_speculation_verify_rows(0U, false) == 0U,
+            "a speculating run takes verify rows level >= 1");
+    require(strix::inkling2::mini_served_draft_by_live() == std::vector<std::uint32_t>({7U, 0U}),
+            "served drafts by live lanes: the model's data");
     expect_invalid([] {
         (void)parse({"1", "--speculation", "auto", "--dspark", "mtp.safetensors", "--temperature", "1"});
     });

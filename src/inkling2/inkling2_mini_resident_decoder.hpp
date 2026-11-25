@@ -259,15 +259,51 @@ public:
 
     // Independent serving lanes. Slot 0 is also the single-session slot used by
     // prefill/decode/verify above and the only one that records DSpark taps.
-    [[nodiscard]] std::uint64_t slot_bytes() const { return layout_.kv_bytes() + layout_.convolution_bytes(); }
+    [[nodiscard]] std::uint64_t slot_bytes() const {
+        return layout_.kv_bytes() + layout_.convolution_bytes() + slot_tape_elements() * sizeof(float);
+    }
 
     void allocate_slots(unsigned slots) {
         if (slots == 0U || slots > decode_rows_) throw std::invalid_argument("invalid Mini slot count");
         slots_.reserve(slots);
         while (slots_.size() < slots) slots_.push_back(std::make_unique<Slot>(layout_));
+        bind_slot_tapes();
 #if !defined(__HIPCC__)
         publish_slot_directory();
 #endif
+    }
+
+    // Served verify windows (serve::FixedKvCohort): set once after construction and configure_mini_decoder, before
+    // the slots are allocated. On, a served lane's group may carry drafts: the window is staged on the lane's slot with
+    // the command line's verify arithmetic (append, MiniAppendKind::verify: every row on its one-row decode body), and
+    // under the verify rows lever every slot binds its own convolution tape (a partial commit is copies, no replay).
+    // One window is staged at a time (the decoder's one checkpoint workspace). Off: one row per lane, as before.
+    void set_slot_windows(bool enabled) {
+        if (slots_.size() > 1U) throw std::logic_error("set slot windows before allocating slots");
+        slot_windows_ = enabled && max_verify_rows() > 1U;
+    }
+    [[nodiscard]] std::uint32_t max_slot_window() const { return slot_windows_ ? max_verify_rows() : 1U; }
+
+    void stage_slot_window(std::uint32_t slot, std::span<const std::uint32_t> ids, std::span<std::uint32_t> top) {
+        if (!slot_windows_ || ids.size() < 2U || ids.size() > max_verify_rows() || top.size() != ids.size())
+            throw std::invalid_argument("invalid Mini served verify window");
+        for (const auto& held : slots_)
+            if (held->state().staged()) throw std::logic_error("Mini served verify: one staged window at a time");
+        auto& state = slots_.at(slot)->state();
+        validate_inputs(state, ids, {});
+        last_logit_rows_ = 0U;  // the window's score rows are not a decode_slots window
+        const auto picks = std::span(verify_top_).first(ids.size());
+        (void)append(state, ids, true, {}, MiniAppendKind::verify, picks);
+        std::ranges::copy(picks, top.begin());
+    }
+
+    // Keeps the window's leading `keep` rows (0 discards it); `ids` are the staged window's tokens.
+    void commit_slot_window(std::uint32_t slot, std::span<const std::uint32_t> ids, std::uint32_t keep) {
+        auto& state = slots_.at(slot)->state();
+        if (!state.staged() || keep > ids.size()) throw std::logic_error("invalid Mini served verify commit");
+        state.commit_staged(backend_, keep, [&](unsigned kept) {
+            (void)append(state, ids.first(kept), kept == 1U, {}, MiniAppendKind::verify);
+        });
     }
 
     // Served prompt route (serve::FixedKvCohort reads it once, at its construction): emits-first (prefill_slot_first)
@@ -1285,6 +1321,24 @@ private:
     // Verify rows lever (set_verify_rows): effective state and slot 0's convolution tape.
     bool verify_rows_{false};
     std::optional<mini_gpu::Buffer<float>> conv_tape_;
+    // Served verify windows (set_slot_windows) and the convolution tapes of slots 1.. (slot 0 binds conv_tape_).
+    bool slot_windows_{false};
+    std::optional<mini_gpu::Buffer<float>> slot_tapes_;
+
+    [[nodiscard]] std::uint64_t slot_tape_elements() const {
+        return slot_windows_ && verify_rows_ ? std::uint64_t{max_verify_rows()} * layout_.convolution_row_elements() : 0U;
+    }
+
+    // Under served windows and the verify rows lever, every slot past slot 0 binds its own tape (slot 0: set_verify_rows).
+    void bind_slot_tapes() {
+        const auto per_slot = static_cast<std::size_t>(slot_tape_elements());
+        if (per_slot == 0U || slots_.size() < 2U) return;
+        const auto needed = per_slot * (slots_.size() - 1U);
+        if (!slot_tapes_ || slot_tapes_->span().size() < needed) slot_tapes_.emplace(needed);
+        for (std::size_t slot = 1; slot < slots_.size(); ++slot)
+            slots_[slot]->bind_convolution_tape(slot_tapes_->span().subspan((slot - 1U) * per_slot, per_slot),
+                                                max_verify_rows());
+    }
     // Head inputs and pitched score rows of the last pick that skipped its scores (materialize_scores).
     struct PendingScores {
         const float* input = nullptr;

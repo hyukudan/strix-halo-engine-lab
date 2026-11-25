@@ -54,7 +54,16 @@ struct MiniServeOptions {
     bool controller_one_plane = false;
     // Resolved screened-head lever (mini_screened_head), the value the CLI and the gate read.
     bool screened_head = false;
+    // Speculation (kMiniSpeculation, or an explicit --speculation off|auto): requested, and admitted (HIP: lanes draft
+    // from their context through one-lane verify windows while one lane is live; a CUDA server declines).
+    bool speculation_requested = false;
+    bool speculation = false;
 };
+
+// The served speculation field of the startup and model lines: off, auto, or declined (requested, not admitted).
+inline const char* mini_served_speculation_name(const MiniServeOptions& opt) noexcept {
+    return opt.speculation ? "auto" : opt.speculation_requested ? "declined" : "off";
+}
 
 // Served KV slots of a resident decoder whose screened-head lever may have built a plane (screen_device_bytes; 0 on HIP,
 // whose own binding keeps its incumbent budget, and without the lever): the plane stays only when it costs no KV slot

@@ -691,12 +691,30 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         if (std::string_view(field) == "--no-weight-q8" && !qualify_q8) continue;
         std::ostringstream out, error;
         strings.emplace_back(field);
-        if (std::string_view(field) == "--speculation") strings.emplace_back("auto");
+        if (std::string_view(field) == "--speculation") strings.emplace_back("lookup");
         const auto expected = std::string_view(field) == "--no-weight-q8" ? "--qualify-q8" : field;
         require(run({}, out, error) == 2 && !created && error.str().find(expected) != std::string::npos,
                 "unsupported or conflicting option did not fail before native load");
         if (std::string_view(field) == "--speculation") strings.pop_back();
         strings.pop_back();
+    }
+    // Served speculation (kMiniSpeculation, explicit --speculation auto here): admitted on HIP (one-lane verify windows),
+    // declined on CUDA, named in the startup line before any device work.
+    {
+        std::ostringstream out, error;
+        strings.insert(strings.end(), {"--speculation", "auto", "--family-inspect"});
+        const auto rc = run({}, out, error);
+        strings.resize(strings.size() - 3U);
+        const bool hip = std::string_view(backend) == "hip";
+        require(rc == 0 && !created &&
+                    out.str().find(hip ? " speculation auto" : " speculation declined") != std::string::npos,
+                "served speculation: auto admitted on HIP, declined on CUDA, before any device work");
+        std::ostringstream off_out, off_error;
+        strings.emplace_back("--family-inspect");
+        const auto off_rc = run({}, off_out, off_error);
+        strings.pop_back();
+        require(off_rc == 0 && off_out.str().find(" speculation off") != std::string::npos,
+                "served speculation: off stays off");
     }
     // The server takes no decode form flag: a served form is selected only through the served route lever's row.
     for (const auto* flag : {"--packed-decode", "--grouped-decode"}) {
