@@ -467,6 +467,9 @@ void test_profile() {
         const auto* i4 = turbo.profile->find("moe_iu4");
         check(i4 && i4->status == pr::Status::pending && i4->value == "0",
               "IU4 stays off under TURBO (even --allow-pending) without a measured prefill row over FAST");
+        const auto* replay = turbo.profile->find("decoder_replay");
+        check(replay && replay->requested == "256" && replay->value == "0" && replay->status == pr::Status::pending,
+              "R256 stays pending without a matched TURBO receipt");
         auto i4_world = w;
         i4_world.env["STRIX_DS41_FAST_I4"] = "1";
         for (const auto* profile : {"fast", "turbo"}) {

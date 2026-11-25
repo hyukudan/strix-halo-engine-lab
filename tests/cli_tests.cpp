@@ -243,7 +243,8 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
             const bool native_turbo = entry.family == "minimax" ||
                 (entry.family == "glm5" && std::string_view(backend) == "hip") ||
                 entry.family == "gemma4" ||
-                entry.family == "hy4_flash";
+                entry.family == "hy4_flash" ||
+                entry.family == "deepseek41";
             const auto expected_turbo = native_turbo ? Name::turbo : fast.levers;
             require(turbo.requested == Name::turbo && turbo.levers == expected_turbo,
                     "TURBO forwards the expected native column for this model and backend");
