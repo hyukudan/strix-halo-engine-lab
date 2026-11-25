@@ -345,10 +345,20 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const bool hip = std::string_view(backend) == "hip";
         const bool effective = mini::mini_prepared_round_fold_admitted(hip, "gfx1151");
         require(effective == hip, "the effective round fold follows the backend");
-        require(std::string_view(mini::mini_round_fold_name(options.prepared_round_fold && effective,
-                                                           options.prepared_round_fold)) ==
+        // The startup field comes from the function the native cohort prints it with, given the backend's admission result.
+        require(std::string_view(mini::mini_round_fold_startup_field(
+                                         options, {false, options.prepared_round_fold && effective})) ==
                     (!round_fold ? "off" : hip ? "on" : "declined"),
                 "the served round fold is reported by its effective state");
+        // Injected admission results: a declined fold never reads as the requested bit.
+        auto requested = options;
+        requested.prepared_round_fold = true;
+        require(std::string_view(mini::mini_round_fold_startup_field(requested, {false, false})) == "declined" &&
+                    std::string_view(mini::mini_round_fold_startup_field(requested, {false, true})) == "on",
+                "a requested fold the backend declines is reported declined");
+        requested.prepared_round_fold = false;
+        require(std::string_view(mini::mini_round_fold_startup_field(requested, {false, false})) == "off",
+                "an unrequested fold is reported off");
         // The served prefill resolves the down-image lever like the CLI and the gate do: off unless selected explicitly.
         require(options.combine_image == image, "down-image selection did not reach native adapter");
         require(options.tier == strix::profile::Name::fast && options.weight_options.qualify_q8 == qualify_q8,
@@ -405,6 +415,23 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                 "unsupported or conflicting option did not fail before native load");
         if (std::string_view(field) == "--speculation") strings.pop_back();
         strings.pop_back();
+    }
+    // The block-candidate switch through the production start-up parser (profile fast here): an explicit OFF starts,
+    // every other value is refused before native load with the same reason as the CLI.
+    for (const auto& [value, reason] : std::initializer_list<std::pair<const char*, const char*>>{
+             {"off", ""},
+             {"dflash2:8:greedy", "native forward and verify identity are not bound"},
+             {"dflash2:8:sampled", "sampled rejection hook unqualified and unbound"},
+             {"dflash2:7:greedy", "requires block 8"}}) {
+        std::ostringstream out, error;
+        strings.emplace_back("--block-drafter");
+        strings.emplace_back(value);
+        strings.emplace_back("--family-inspect");
+        const auto rc = run({}, out, error);
+        strings.resize(strings.size() - 3U);
+        if (*reason == '\0') require(rc == 0 && !created, "explicit --block-drafter off did not start");
+        else require(rc == 2 && !created && error.str().find(reason) != std::string::npos,
+                     "--block-drafter value was not refused with its reason before native load");
     }
     sv::ServeShell shell;
     shell.serve = [qualify_q8, sample_capable](const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {

@@ -27,7 +27,9 @@ build does not contain.
 | `quality` | EXL3 pack (`--exl3-arm DIR`), identity chosen once per pack and session (`g4-exl3-v1`/`v3`) | `prefill-exact` | Exact within its EXL3 identity; higher fidelity than Q4_K_M at similar size |
 
 The identity of the EXL3 route is fixed at startup from the pack and `--streams`, never per step, so a session's
-output does not depend on load. `STRIX_G4_EXL3_IDENTITY=v1|v2|v3` forces it.
+output does not depend on load. With automatic selection M4 and M6 use `g4-exl3-v3`, and M5 uses `g4-exl3-v3` at
+eight or more streams and `g4-exl3-v1` below. `STRIX_G4_EXL3_IDENTITY=v1|v2|v3` forces it; an explicit value
+selects the same core on the command line and the server at every stream or slot count.
 
 ## Assets
 
@@ -144,7 +146,7 @@ chat in four languages, a long document, seeded sampling, thinking-budget contin
 disconnects mid-stream). One request at a time is unchanged (C1 with the drafter, same ids and speed).
 `STRIX_G4_SERVE_BATCH=0` restores one chat job at a time. When `--streams` is not given, the session-fixed EXL3 core
 identity is chosen for the slot count (eight), so an M5 pack selects `g4-exl3-v3` instead of `v1`; M4 and M6 always
-use `v3`.
+use `v3`. For one M5 core at every slot count, set `STRIX_G4_EXL3_IDENTITY` explicitly.
 
 | `default`, streaming, 128 tokens per request | 1 client | 4 clients | 8 clients |
 |---|---:|---:|---:|

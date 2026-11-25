@@ -32,7 +32,8 @@ profile::Inputs inputs(profile::Name tier, const char* value = nullptr, const ch
 // The engine resolves the W4A4 row: an unbound table would ignore STRIX_INK_MOE_W4A4 at every prompt length.
 void test_row() {
     require(mini::kMiniProfile.table.size() == mini::kMiniLevers.size(), "Inkling lever table bound to the engine");
-    require(mini::kMiniProfile.table.size() == 3U, "the W4A4 row, the down image row and the prepared round fold row");
+    require(mini::kMiniProfile.table.size() == 4U,
+            "the W4A4 row, the down image row, the prepared round fold row and the block-candidate row");
     const auto& lever = mini::kMiniProfile.table.front();
     require(lever.name == mini::kMiniMoeW4a4 && lever.name == "inkling2-mini-moe-w4a4@1", "w4a4 identity");
     require(lever.env == "STRIX_INK_MOE_W4A4" && lever.off == "0" && lever.builtin == "0", "w4a4 off switch");

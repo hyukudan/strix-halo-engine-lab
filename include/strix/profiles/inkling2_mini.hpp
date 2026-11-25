@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/engine_profile.hpp"
+#include "strix/spec/block_draft_policy.hpp"
 #include "strix/weight/levers.hpp"
 #include "strix/weight/registry.hpp"
 
@@ -47,7 +48,7 @@ inline constexpr std::string_view kMiniCombineImage = "inkling2-mini-combine-dow
 // (core::RoundStore::separate). Opt-in: off in every profile column (all cells empty, builtin 0); select it with
 // STRIX_INK_PREPARED_ROUND_FOLD=1 (any profile), through the one resolver the CLI, the gate and the server share.
 inline constexpr std::string_view kMiniPreparedRoundFold = "inkling2-mini-prepared-round-fold@1";
-inline constexpr std::array<profile::Lever, 3> kMiniLevers{{
+inline constexpr std::array<profile::Lever, 4> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
@@ -64,6 +65,7 @@ inline constexpr std::array<profile::Lever, 3> kMiniLevers{{
      .source = "tests/core/round_fold_hip.hip (every store: the separate round's bits) and the isolated fold off/on "
                "identity ticket of the HIP prepared attention",
      .omit_builtin_fingerprint = true},
+    spec::kBlockDraftLever,
 }};
 
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.

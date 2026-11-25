@@ -144,6 +144,49 @@ void seed(const Run& run, unsigned rows) {
         require(hipMemset(run.outputs[p], 0xFF, std::size_t{rows} * run.projections[p].outputs * 4U), "seed");
 }
 
+// One kernel launch of a captured stream: the kernel and its grid / block, which tells a K64 packed launch from a K32
+// image tile or an FP32 rows launch, and one launch from three.
+struct KernelLaunch {
+    const void* kernel;
+    unsigned grid[3];
+    unsigned block[3];
+    friend bool operator==(const KernelLaunch&, const KernelLaunch&) = default;
+};
+
+// The launches `enqueue` makes on `stream`, in order, read from a capture of the stream (nothing runs); false when the
+// enqueue fails or the capture holds anything but a chain of kernel nodes.
+template <class Enqueue>
+bool capture_launches(hipStream_t stream, std::vector<KernelLaunch>& launches, const Enqueue& enqueue) {
+    launches.clear();
+    require(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), "capture begin");
+    const hipError_t status = enqueue();
+    hipGraph_t graph = nullptr;
+    require(hipStreamEndCapture(stream, &graph), "capture end");
+    bool ok = status == hipSuccess;
+    std::size_t count = 0;
+    require(hipGraphGetRootNodes(graph, nullptr, &count), "roots");
+    ok = ok && count <= 1U;
+    hipGraphNode_t node = nullptr;
+    if (ok && count == 1U) require(hipGraphGetRootNodes(graph, &node, &count), "roots");
+    while (ok && node) {
+        hipGraphNodeType type{};
+        require(hipGraphNodeGetType(node, &type), "node type");
+        hipKernelNodeParams params{};
+        ok = type == hipGraphNodeTypeKernel && hipGraphKernelNodeGetParams(node, &params) == hipSuccess;
+        if (!ok) break;
+        launches.push_back({params.func, {params.gridDim.x, params.gridDim.y, params.gridDim.z},
+                            {params.blockDim.x, params.blockDim.y, params.blockDim.z}});
+        std::size_t next = 0;
+        require(hipGraphNodeGetDependentNodes(node, nullptr, &next), "dependents");
+        ok = next <= 1U;
+        hipGraphNode_t following = nullptr;
+        if (ok && next == 1U) require(hipGraphNodeGetDependentNodes(node, &following, &next), "dependents");
+        node = following;
+    }
+    require(hipGraphDestroy(graph), "graph destroy");
+    return ok;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -156,7 +199,7 @@ int main(int argc, char** argv) {
                                      {"routed_o_pitched", 3072U, {2304U}, true, true, 3200U, true},
                                      {"routed_o_pitch3328", 3072U, {2304U}, true, true, 3328U, false},  // pitch not measured
                                      {"routed_kv_narrow", 2304U, {1024U, 32U}, false, true, 0U, false},
-                                     {"routed_wide_n128_pair", 2304U, {5120U, 128U, 128U}, false, true, 0U, true}};  // unmeasured group: the packed runs are cut into measured launches
+                                     {"routed_wide_unlisted", 2304U, {5120U, 1024U, 1024U}, false, true, 0U, false}};  // unlisted group: its cut adds launches, the call keeps the incumbent
     const std::vector<unsigned> heights = {1000U, 1024U, 4096U, 4100U, 8192U, 8209U, 8236U, 9216U, 9232U};  // 9,232: above the measured band
     std::mt19937 rng(20261124U);
     std::normal_distribution<float> nd(0.0F, 1.0F);
@@ -204,7 +247,7 @@ int main(int argc, char** argv) {
             {"q_call_4095", 2304U, 4095U, {3072U, 384U, 24U, 3072U, 1024U, 1024U}, false, 0U, 99U, {}},
             {"k_off_stage", 2336U, 8192U, {3072U, 1024U}, false, 0U, 99U, {}},
             {"mixed_align", 2304U, 4096U, {2048U, 32U}, false, 0U, 1U, {}},
-            {"mixed_groups", 2304U, 4096U, {2048U, 1024U, 24U, 2048U, 32U}, false, 0U, 4U, {P, P, I, F, F}},
+            {"mixed_groups", 2304U, 4096U, {3072U, 3072U, 24U, 2048U, 32U}, false, 0U, 4U, {P, P, I, F, F}},
         };
         std::vector<float> host_b(host_a.size());
         for (auto& v : host_b) v = nd(rng);
@@ -484,7 +527,7 @@ int main(int argc, char** argv) {
             const fma_rows::ImageDeviceClass owner_other{"gfx1150", 32U, 40U, 1};
             hipStream_t stream = nullptr;
             require(hipStreamCreate(&stream), "stream");
-            const Case c{"stream_owner", 2304U, {3072U, 2304U}, false, true};
+            const Case c{"stream_owner", 2304U, {3072U, 3072U}, false, true};
             std::vector<std::uint16_t*> weights;
             for (const unsigned width : c.widths) {
                 std::vector<std::uint16_t> w(std::size_t{width} * c.K);
@@ -565,7 +608,7 @@ int main(int argc, char** argv) {
             require(hipStreamDestroy(stream), "stream destroy");
         }
         {  // the public routed entry: the real device takes the image routes, every injected class keeps the FP32 rows
-            const Case c{"routed_injected", 2304U, {3072U, 2304U}, false, true};
+            const Case c{"routed_injected", 2304U, {3072U, 3072U}, false, true};
             std::vector<std::uint16_t*> weights;
             for (const unsigned width : c.widths) {
                 std::vector<std::uint16_t> w(std::size_t{width} * c.K);
@@ -603,6 +646,84 @@ int main(int argc, char** argv) {
                 for (auto* p : ref.outputs) require(hipFree(p), "free");
                 for (auto* p : got.outputs) require(hipFree(p), "free");
             }
+            for (auto* w : weights) require(hipFree(w), "free");
+        }
+        {  // the public routed entry's launch sequence, read from a stream capture (not from the entry's own report): a
+           // call the plan keeps on the incumbent makes the incumbent's launches; a priced call makes the image pass and
+           // the packed launches of its run plan
+            struct Sequence {
+                const char* name;
+                std::vector<unsigned> widths;
+                unsigned rows;
+                std::size_t launches;  // literal count of every launch of the call
+                bool image;            // the call stores the operand image
+            };
+            const Sequence sequences[] = {{"wide_5120_128_128_8192", {5120U, 128U, 128U}, 8192U, 1U, false},
+                                          {"wide_5120_128_128_4096", {5120U, 128U, 128U}, 4096U, 1U, false},
+                                          {"production_all_call_8192", {3072U, 3072U, 1024U, 1024U}, 8192U, 3U, true},
+                                          {"production_all_call_4096", {3072U, 3072U, 1024U, 1024U}, 4096U, 3U, true},
+                                          {"production_q_pair_8192", {3072U, 3072U}, 8192U, 2U, true}};
+            std::vector<std::uint16_t*> weights;
+            for (const unsigned width : {5120U, 3072U, 3072U, 1024U, 1024U, 128U, 128U}) {
+                std::vector<std::uint16_t> w(std::size_t{width} * 2304U);
+                for (auto& v : w) v = bf16(0.05F * nd(rng));
+                weights.push_back(device<std::uint16_t>(w.size()));
+                require(hipMemcpy(weights.back(), w.data(), w.size() * 2U, hipMemcpyHostToDevice), "w");
+            }
+            hipStream_t stream = nullptr;
+            require(hipStreamCreate(&stream), "stream");
+            for (const auto& sequence : sequences) {
+                std::vector<std::uint16_t*> own;
+                if (sequence.widths.front() == 5120U) own = {weights[0], weights[5], weights[6]};
+                else
+                    for (std::size_t p = 0; p < sequence.widths.size(); ++p) own.push_back(weights[1U + p]);
+                const Case c{sequence.name, 2304U, sequence.widths, false, true};
+                const auto got = make_run(c, own, sequence.rows);
+                const std::span<std::uint16_t> scratch(image, host_a.size());
+                std::vector<KernelLaunch> routed, expected;
+                bool used = false;
+                const bool captured = capture_launches(stream, routed, [&] {
+                    return fma_rows::enqueue_bf16_rows_routed(a, c.K, sequence.rows, got.projections, kMaxOutputs, scratch,
+                                                              stream, &used);
+                });
+                bool built = false;
+                if (sequence.image) {  // the image pass, then the packed launches of the listed run plan (literal)
+                    built = capture_launches(stream, expected, [&] {
+                        if (const auto status = fma_rows::enqueue_bf16_operand_image(a, c.K, sequence.rows, image, stream);
+                            status != hipSuccess)
+                            return status;
+                        const auto launch = [&](std::span<const Bf16RowProjection> run) {
+                            strix::core::f16_tile_gemm::Bf16ProjectionGroup<fma_rows::kGroupMax> group{};
+                            for (const auto& projection : run)
+                                group.append({projection.weights, projection.outputs, projection.output, false});
+                            return strix::core::f16_tile_gemm::gemm_bf16_projections_image_packed(
+                                image, sequence.rows, c.K, group, stream, c.K);
+                        };
+                        const std::span<const Bf16RowProjection> all(got.projections);
+                        if (all.size() == 4U) {
+                            if (const auto status = launch(all.first(3U)); status != hipSuccess) return status;
+                            return launch(all.subspan(3U));
+                        }
+                        return launch(all);
+                    });
+                } else {  // the incumbent's launches
+                    built = capture_launches(stream, expected, [&] {
+                        return strix::core::for_each_bf16_projection_group<fma_rows::kGroupMax>(
+                            got.projections, hipSuccess, [&](std::span<const Bf16RowProjection> group) {
+                                return fma_rows::enqueue_bf16_rows(a, c.K, sequence.rows, group, kMaxOutputs, stream);
+                            });
+                    });
+                }
+                const bool pass = captured && built && routed == expected && routed.size() == sequence.launches &&
+                                  used == sequence.image;
+                ok = ok && pass;
+                std::cout << "select routed_launches " << sequence.name << " launches " << routed.size() << " expect "
+                          << sequence.launches << " image_used " << used
+                          << (routed == expected ? " same-sequence" : " DIFFERENT") << (pass ? " PASS" : " FAIL")
+                          << '\n';
+                for (auto* p : got.outputs) require(hipFree(p), "free");
+            }
+            require(hipStreamDestroy(stream), "stream destroy");
             for (auto* w : weights) require(hipFree(w), "free");
         }
     }
