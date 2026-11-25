@@ -340,10 +340,10 @@ static __global__ void normalize_pair(NormalizeArgs first, NormalizeArgs second)
     normalize_rows(blockIdx.y == 0U ? first : second, scratch);
 }
 
-#if defined(__HIPCC__)
 // The BF16 operand image of a normalized row: element i is stored as bf16_encode(y) (RNE, a NaN stays NaN), the
 // operand bits a BF16 WMMA consumer's FP32 staging (attn_core tile::pack2<bf16>) makes of the FP32 value normalize
-// stores; that FP32 row is not written.
+// stores (and, for the BF16-exact finite values a rounding plan produces, the one plane a CUDA BF16 MMA split stores);
+// that FP32 row is not written.
 struct Bf16OperandImage {
     static constexpr bool kReplacesRow = true;
     std::uint16_t* image;
@@ -371,7 +371,6 @@ inline void launch_normalize_pair_image(dim3 grid, const NormalizeArgs& first, c
                                         std::uint16_t* first_image, std::uint16_t* second_image, Stream stream) {
     normalize_pair_image<<<grid, kThreads, 0, stream>>>(first, second, first_image, second_image);
 }
-#endif
 
 #if defined(__HIPCC__)
 template <bool Normalized>
@@ -908,19 +907,32 @@ void enqueue_low_rank_controller_tail(LowRankController plan, ControllerWeights 
     // Where the backend's down projection reads a BF16 operand image (rows [rows][stride] u16 at the operands' base:
     // the operand bits its FP32 staging makes of the same values), the pair stores only that image: half the operand
     // bytes written and read, the same latent bits. The backend admits the shape and the down weights before any
-    // launch; a projection its image launch cannot read (pitched, unaligned) keeps the FP32 operands.
+    // launch; a projection its image launch cannot read (pitched, unaligned) keeps the FP32 operands. The image lies
+    // at the base of the FP32 operand rows, so 2 x rows x stride u16 there are the backend's to write (padding).
     bool image = false;
-#if defined(__HIPCC__)
-    const std::span<const Bf16RowProjection> down_rows(down);
+    [[maybe_unused]] const std::span<const Bf16RowProjection> down_rows(down);
     // A backend with the image launch admits with the down weights in view; an older two-argument admission would
     // silently keep the FP32 operands, so it does not compile.
     static_assert(!requires { operations.admits_dense_bf16_image(stride, rows); },
                   "admits_dense_bf16_image takes (stride, rows, down projections)");
+    // A backend whose image is only the bits of its FP32 route for BF16-exact operands (a one-plane MMA split) takes
+    // the declared operand class as a fourth argument and refuses fp32; one whose staging makes the image of any FP32
+    // value (the HIP tile) takes three.
+    [[maybe_unused]] const Bf16Operand declared =
+        plan.round_operands_bf16 ? Bf16Operand::bf16_exact : Bf16Operand::fp32;
+    [[maybe_unused]] std::uint16_t* const no_image = nullptr;
     if constexpr (requires {
-                      { operations.admits_dense_bf16_image(stride, rows, down_rows) } -> std::same_as<bool>;
-                      operations.dense_bf16_image(static_cast<const std::uint16_t*>(nullptr), stride, rows, down_rows);
+                      { operations.admits_dense_bf16_image(stride, rows, down_rows, declared) } -> std::same_as<bool>;
+                      operations.dense_bf16_image(no_image, stride, rows, down_rows);
                   }) {
+        image = operations.admits_dense_bf16_image(stride, rows, down_rows, declared);
+    } else if constexpr (requires {
+                             { operations.admits_dense_bf16_image(stride, rows, down_rows) } -> std::same_as<bool>;
+                             operations.dense_bf16_image(no_image, stride, rows, down_rows);
+                         }) {
         image = operations.admits_dense_bf16_image(stride, rows, down_rows);
+    }
+    if constexpr (requires { operations.dense_bf16_image(no_image, stride, rows, down_rows); }) {
         if (image) {
             auto* const operand_image = reinterpret_cast<std::uint16_t*>(operands.data());
             detail::launch_normalize_pair_image(grid, normalize.operands[0], normalize.operands[1], operand_image,
@@ -929,7 +941,6 @@ void enqueue_low_rank_controller_tail(LowRankController plan, ControllerWeights 
             operations.dense_bf16_image(operand_image, stride, rows, down);
         }
     }
-#endif
     if (!image) {
         detail::normalize_pair<<<grid, detail::kThreads, 0, stream>>>(
             normalize.operands[0], normalize.operands[1]);
