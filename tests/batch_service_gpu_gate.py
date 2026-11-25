@@ -24,17 +24,21 @@ def tokens(path):
     return json.loads(text) if text.startswith("[") else [int(x) for x in text.split()]
 
 
-def completion(port, prompt, count, first=None):
+def completion(port, prompt, count, first=None, *, require_done=False):
     body = json.dumps(dict(prompt=prompt, max_tokens=count, temperature=0,
                            stream=True, return_token_ids=True))
     request = urllib.request.Request(f"http://127.0.0.1:{port}/v1/completions",
                                      data=body.encode(), headers={"Content-Type": "application/json"})
     result = None
     arrivals = []
+    done = False
     with urllib.request.urlopen(request, timeout=1800) as response:
         headers = dict(response.headers)
         for line in response:
-            if not line.startswith(b"data: ") or line.strip() == b"data: [DONE]":
+            if not line.startswith(b"data: "):
+                continue
+            if line.strip() == b"data: [DONE]":
+                done = True
                 continue
             chunk = json.loads(line[6:])
             if "error" in chunk:
@@ -47,6 +51,7 @@ def completion(port, prompt, count, first=None):
                 if first:
                     first.set()
     require(result is not None, "missing final streaming receipt")
+    require(done or not require_done, "missing streaming [DONE]")
     result["completed_at"] = time.monotonic()
     # A one-token answer can arrive with the final receipt chunk only.
     result["first_at"] = arrivals[0] if arrivals else final_at

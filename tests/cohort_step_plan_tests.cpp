@@ -39,7 +39,7 @@ void check_row_splits() {
     catch (const std::invalid_argument&) { rejected = true; }
     require(rejected);
 }
-void check_combine_admission() {
+void check_combine_joins() {
     struct Owner {
         int id;
         std::array<bool, 2> pending{};
@@ -122,7 +122,7 @@ void check(std::span<const std::uint32_t> rows, std::size_t old_steps, std::size
 }
 int main(int argc, char* argv[]) {
     check_row_splits();
-    check_combine_admission();
+    check_combine_joins();
     if (argc > 1) require(strix::cohort_step_rows() == (std::string_view(argv[1]) == "16" ? 16U : 8U));
     check(std::array<std::uint32_t, 8>{2,2,2,2,2,2,2,2}, 2, 1);
     check(std::array<std::uint32_t, 6>{4,4,2,2,2,2}, 2, 1);

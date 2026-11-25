@@ -296,7 +296,7 @@ def cohort_regression(args, prompts):
     require(len(prompts) == 4 and len({tuple(prompt) for prompt in prompts}) == 4,
             "cohort regression requires four distinct prompt fixtures")
     with server(args, "single-reference", "0"):
-        reference = [completion(args.port, prompt, args.generate)["strix"]["token_ids"]
+        reference = [completion(args.port, prompt, args.generate, require_done=True)["strix"]["token_ids"]
                      for prompt in prompts]
     require(all(reference), "NO-REFERENCE: missing solo completion token IDs")
     (args.out / "cohort-reference.json").write_text(json.dumps(reference, indent=2) + "\n")
@@ -310,7 +310,7 @@ def cohort_regression(args, prompts):
 
             def request(index):
                 barrier.wait()
-                return completion(args.port, prompts[index], args.generate)
+                return completion(args.port, prompts[index], args.generate, require_done=True)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=clients) as pool:
                 results = list(pool.map(request, indices))
