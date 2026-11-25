@@ -4,18 +4,21 @@
 // argument-vector adapter; the apps call take() once, first thing in main().
 //
 // One lever, two spellings of the same prompt-window size: `--wide N` (decode app) and `--prefill-rows N`
-// (spec app). Window sizes above 16 rows are the FAST wide class (dense-q8a8-f16-v1). The FAST cell is PENDING: no
-// composite quality gate receipt exists, so `--profile fast` alone changes nothing today (receipt status pending,
-// one notice) unless `--allow-pending` (or STRIX_QWEN35_HIP_PROFILE_ALLOW_PENDING=1) applies it for benchmarking.
-// `exact` and `default` are the default column: no option is added, today's behaviour byte for byte. An explicit
-// `--wide` / `--prefill-rows` always wins over the word; `--wide-exact` / `--prefill-exact` keep their own meaning
-// (EXACT wide windows) and suppress the profile's window size. Promoting the cell = flipping ready[fast], never code.
+// (spec app). Window sizes above 16 rows are the FAST wide class (IU4 pack: dense-iu4a16-f16-v1). The FAST cell is
+// 512 rows, QUALIFIED by the composite FAST gate v2 (kFastGates): 512-row wide windows with the A4W4 layer table below
+// against the real EXACT reference (`--wide-exact 512`), held-out window set, KL 0.0069, top-1 0.971, dNLL -0.0104
+// (the wide IU4 class alone: KL 0.00003). It is the window of the published FAST figures. `exact` (spelled `default`
+// in receipts) is the default column: no option is added, the engine's 64-row EXACT windows run byte for byte. An
+// explicit `--wide` / `--prefill-rows` always wins over the word; `--wide-exact` / `--prefill-exact` keep their own
+// meaning (EXACT wide windows) and suppress the profile's window size. Off switch of the FAST cell: `--wide 16`.
 // Second lever, both apps: the A4W4 layer table (STRIX_DENSE_A4W4_LAYERS, an environment lever exported by take()). Its
 // fast cell is QUALIFIED (kFastGates): the wide IU4 GEMMs of layers 48-63 run the shared A4W4 class
-// (dense-iu4a4-rot-v1), the other layers keep their path. It only acts on wide windows (rows > 16, not the EXACT
-// wide windows), so with today's pending wide cell it needs an explicit --wide / --prefill-rows above 16.
+// (dense-iu4a4-rot-v1), the other layers keep their path. It acts on wide windows (rows > 16, not the EXACT wide
+// windows): the FAST window cell above is such a window.
+// TURBO: no HIP TURBO row is qualified (the kv_fp8 / decode_attn8 cells are CUDA sm_120 bindings), so every TURBO cell
+// is empty and takes its FAST cell: `--profile turbo` runs exactly the FAST levers (TURBO nests FAST).
 // Pair app: NOT bound. Its --wide default (512) is already the FAST wide class, so `exact` could not mean today's
-// behaviour there and the 64-row fast cell would shrink the window; it needs its own table once gated.
+// behaviour there; it needs its own table.
 // Host-only: no HIP types.
 #include "strix/engine_profile.hpp"
 
@@ -33,36 +36,48 @@ enum class App { decode, spec };
 
 // Columns: default, fast, quality, turbo. builtin = today's behaviour with the option absent.
 inline constexpr sp::Lever table[] = {
-    {.name = "wide_rows", .env = "", .option = "--wide", .value = {"", "64", "", ""}, .builtin = "engine default (64-row EXACT windows, IU4)",
-     .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
-     .target = "64-row FAST wide windows (dense-q8a8-f16-v1)", .off = "16",
-     .source = "composite FAST gate (wide prefill rows > 16) pending", .identity = {{{"engine default (64-row EXACT windows, IU4)", "v1"}, {"64", "v1"}, {"16", "v1"}}}},
+    {.name = "wide_rows", .env = "", .option = "--wide", .value = {"", "512", "", ""}, .builtin = "engine default (64-row EXACT windows, IU4)",
+     .kind = sp::Kind::bit_changing, .ready = {true, true, true, false}, .runnable = {true, true, true, false},
+     .target = "", .off = "16",
+     .source = "FAST gate v2 PASS, 512-row wide windows + A4W4 layers 48-63 vs EXACT --wide-exact 512, held-out set (docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast)", .identity = {{{"engine default (64-row EXACT windows, IU4)", "v1"}, {"512", "v1"}, {"16", "v1"}}}},
     {.name = "a4w4_layers", .env = "STRIX_DENSE_A4W4_LAYERS", .option = "", .value = {"", "48-63", "", ""},
      .builtin = "no A4W4 layer (STRIX_DENSE_A4W4=1: every layer, unqualified)", .kind = sp::Kind::bit_changing,
      .ready = {true, true, true, false}, .runnable = {true, true, true, false}, .target = "", .off = "none",
      .source = "FAST gate v2 PASS, layers 48-63 (docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast)", .identity = {{{"no A4W4 layer (STRIX_DENSE_A4W4=1: every layer, unqualified)", "v1"}, {"48-63", "v1"}, {"none", "v1"}}}},
-    {.name = "prefill_rows", .env = "", .option = "--prefill-rows", .value = {"", "64", "", ""},
+    {.name = "prefill_rows", .env = "", .option = "--prefill-rows", .value = {"", "512", "", ""},
      .builtin = "engine default (64-row EXACT windows, IU4)",
-     .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
-     .target = "64-row FAST wide windows (dense-q8a8-f16-v1)", .off = "16",
-     .source = "composite FAST gate (wide prefill rows > 16) pending", .identity = {{{"engine default (64-row EXACT windows, IU4)", "v1"}, {"64", "v1"}, {"16", "v1"}}}},
+     .kind = sp::Kind::bit_changing, .ready = {true, true, true, false}, .runnable = {true, true, true, false},
+     .target = "", .off = "16",
+     .source = "FAST gate v2 PASS, 512-row wide windows + A4W4 layers 48-63 vs EXACT --wide-exact 512, held-out set (docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast)", .identity = {{{"engine default (64-row EXACT windows, IU4)", "v1"}, {"512", "v1"}, {"16", "v1"}}}},
 };
 inline constexpr std::string_view kAllowEnv = "STRIX_QWEN35_HIP_PROFILE_ALLOW_PENDING";
 // FAST gate ledger (strix::profile::FastGate): the qualified fast cells and their receipts.
 inline constexpr sp::FastGate kFastGates[] = {
+    {"wide_rows", "512", "docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast"},
     {"a4w4_layers", "48-63", "docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast"},
+    {"prefill_rows", "512", "docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast"},
 };
-// Ladder rows: incumbent grant of the qualified fast cell the resolver ran before the ladder rule.
+// Ladder rows: grants of the qualified fast cells, kept with their quality and timing receipts. The window cell is
+// faster than the EXACT 64-row windows at every measured length (gfx1151, same binary, same ids: 2K 614 vs 193 tok/s,
+// 8K 660 vs 116, 32K finishes in ~65 s where the 64-row EXACT windows exceed the 470 s turn); the receipts are in
+// docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast.
+inline constexpr std::string_view kWideGrant =
+    "FAST gate v2 PASS, 512-row wide windows + A4W4 48-63 vs EXACT --wide-exact 512, faster than EXACT at 2K/8K/32K "
+    "(docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast)";
 inline constexpr sp::LadderRow kLadderRows[] = {
+    sp::incumbent_cell("wide_rows", "512", sp::Name::fast, kWideGrant, "v1"),
     sp::incumbent_cell("a4w4_layers", "48-63", sp::Name::fast,
                        "FAST gate v2 PASS, layers 48-63 (docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast)", "v1"),
+    sp::incumbent_cell("prefill_rows", "512", sp::Name::fast, kWideGrant, "v1"),
 };
+// Versioned TURBO name: every TURBO cell is empty (the FAST cell runs).
+inline constexpr std::string_view kTurboVersion = "qwen35-hip-turbo-v1";
 
 // One engine per app: each app owns only its own spelling of the window lever; both take the A4W4 layer table.
 inline sp::Engine engine(App app) {
     const std::span<const sp::Lever> rows(table);
     return {app == App::spec ? "qwen35-hip-spec" : "qwen35-hip-decode", kAllowEnv,
-            app == App::spec ? rows.subspan(1U, 2U) : rows.subspan(0U, 2U), false, {}, {}, {}, kLadderRows};
+            app == App::spec ? rows.subspan(1U, 2U) : rows.subspan(0U, 2U), false, kTurboVersion, {}, {}, kLadderRows};
 }
 
 struct Result {
@@ -77,9 +92,6 @@ inline Result resolve_args(const sp::Engine& eng, std::vector<std::string> args,
     in.env = env;
     in.regime = regime;
     sp::take_options(eng, args, in);
-    if (in.profile == sp::Name::turbo)
-        throw std::invalid_argument(std::string(eng.tag) +
-            ": --profile turbo unavailable: kv_fp8 and decode_attn8 (FP8 QK/PV) require the CUDA sm_120 binding");
     Result out{sp::resolve(eng, in), {}};
     bool exact_window = false;
     for (const auto& a : args) exact_window = exact_window || a == "--wide-exact" || a == "--prefill-exact";
