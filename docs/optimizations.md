@@ -5910,11 +5910,15 @@ Shapes it does not take run the staged tile. Same bits either way.
 
 ## Inkling 2 Mini CUDA step program: exact R1 latency forms
 
-**Engine:** `inkling2-mini` (CUDA step program). **Control:** `--latency-forms[=mix|=moe]`, `--no-latency-forms`.
+**Engine:** `inkling2-mini` (CUDA step program). **Control:** `--latency-forms[=mix|moe|batch|b3]`, `--no-latency-forms`.
 **Default:** `mix` (tiled bank readout and controller output split); the packed MoE pipe (`moe`) stays opt-in.
 
 The step program binds the shared exact R1 decode recipe leaves (`exec` CUDA decode catalogue) in place of the
 incumbent leaves; the receipt names the bound forms.
+
+The explicit `--latency-forms=batch` option adds the shared controller message-bank batch to `mix`.
+`--latency-forms=b3` also combines eligible residual adds, bank readouts, and input norms in the shared row-owner launch.
+Both options are pending native token and logit identity checks.
 
 - **Exactness evidence:** EXACT schedule change; host test checks the program node list and edges; device identity
   (ids and logits vs the incumbent leaves) is part of the integration identity ticket.
