@@ -44,7 +44,7 @@ sha256sum "$b/strix-inkling2-mini-hip" "$b/strix-serve" "$model" "$tokenizer" \
 
 ## Text, image and DSpark
 
-`REF/text-$n.generated` and `REF/image.generated` hold the independently generated lines in the form `generated ID ID ...`. `REF/*.f32` contains matching little-endian FP32 rows. The native arms export full greedy sequences and terminal prompt logits. With a bitwise independent reference, compare its corresponding files with `cmp`. For a different evaluation order, declare the comparator and limits before the run and record error across all 200058 logit entries. Report numerical agreement separately from the token-ID check.
+`REF/text-$n.generated` and `REF/image.generated` hold the independently generated lines in the form `generated ID ID ...`. `REF/*.f32` contains matching little-endian FP32 rows. The native arms export full greedy sequences and terminal prompt logits. With a bitwise independent reference, compare its corresponding files with `cmp`. For a different evaluation order, publish the absolute and relative L2 limits before the run as `LOGIT_MAX_ABS` and `LOGIT_MAX_REL_L2`. Report numerical agreement separately from the token-ID check.
 
 ```bash
 for n in 1 1023 1024 1025; do
@@ -84,6 +84,39 @@ diff -u <(grep '^generated ' "$OUT/serial.out") <(grep '^generated ' "$OUT/dspar
 grep '^speculation mode ' "$OUT/dspark.out"
 ```
 
+```bash
+: "${LOGIT_MAX_ABS:?}" "${LOGIT_MAX_REL_L2:?}"
+python3 - "$REF" "$OUT" "$LOGIT_MAX_ABS" "$LOGIT_MAX_REL_L2" <<'PY' | tee "$OUT/logit-comparison.txt"
+import math
+from pathlib import Path
+import struct
+import sys
+
+ref, out = map(Path, sys.argv[1:3])
+max_abs, max_rel = map(float, sys.argv[3:])
+if not all(math.isfinite(limit) and limit >= 0 for limit in (max_abs, max_rel)):
+    sys.exit("comparison limits must be finite and nonnegative")
+row = struct.Struct("<200058f")
+failed = False
+for case in ("text-1", "text-1023", "text-1024", "text-1025", "image"):
+    expected = row.unpack((ref / f"{case}.f32").read_bytes())
+    norm = math.sqrt(math.fsum(value * value for value in expected))
+    if not math.isfinite(norm) or norm == 0:
+        sys.exit(f"{case}: unusable reference logits")
+    for backend in ("cpu", "hip"):
+        actual = row.unpack((out / f"{case}.{backend}.f32").read_bytes())
+        delta = [a - b for a, b in zip(actual, expected)]
+        if not all(map(math.isfinite, delta)):
+            sys.exit(f"{case} {backend}: non-finite logit difference")
+        absolute = max(map(abs, delta))
+        relative = math.sqrt(math.fsum(value * value for value in delta)) / norm
+        passed = absolute <= max_abs and relative <= max_rel
+        failed |= not passed
+        print(f"{case} {backend} max_abs={absolute:.9g} rel_l2={relative:.9g} {'PASS' if passed else 'FAIL'}")
+sys.exit(failed)
+PY
+```
+
 The tower gate uses its axial reference recipe. The end-to-end CLI arm must record the built-in `inkling2-vision-v1` identity and use expected logits for that recipe. For DSpark require proposed rows and both acceptance and restore witnesses, including across a wrap. The present CLI emits prompt-end scores, generated IDs and drafter counters. Independent text export, a native per-visit trace and real-checkpoint rollback digests are prerequisites for the remaining stage/state comparisons.
 
 ## FAST gate and measurements
@@ -112,12 +145,14 @@ Run on an otherwise idle device. Measure the default HTTP path first. `ttft_ms` 
 source scripts/bench/common/runlib.sh
 run_case() (
   set -euo pipefail
-  n=$1 tier=$2 round=$3
-  dir="$OUT/http-$n-$tier-$round"
+  n=$1 tier=$2 round=$3 route=${4:-default}
+  mode_args=()
+  if [ "$route" = q8 ]; then mode_args=(--qualify-q8); fi
+  dir="$OUT/http-$n-$tier-$route-$round"
   mkdir "$dir"
   "$b/strix-serve" --model inkling2-mini --profile "$tier" \
     --bind 127.0.0.1 --port 18197 --context "$((n + 64))" --slots 1 -- \
-    --checkpoint "$model" --tokenizer "$tokenizer" --backend hip \
+    --checkpoint "$model" --tokenizer "$tokenizer" --backend hip "${mode_args[@]}" \
     > "$dir/server.log" 2>&1 &
   server_pid=$!
   trap 'kit_sampler_stop; kill -INT "$server_pid" 2>/dev/null || true; wait "$server_pid" || true' EXIT
@@ -146,6 +181,17 @@ for n in 1024 8192 32768 131072; do
   done
 done
 run_case 1048512 exact 1
+```
+
+For a separate gain check of explicit Q8_0, run the same function on each admitted band with interleaved controls and verify the selected storage in the server log.
+
+```bash
+for n in 1024 8192 32768 131072; do
+  for trial in 1 2 3; do
+    run_case "$n" exact "q8-control-$trial"
+    run_case "$n" fast "$trial" q8
+  done
+done
 ```
 
 | Input tokens | Tier | Effective route/identity | TTFT ms | Prefill tok/s | Decode tok/s | Peak RSS KiB | Peak GTT bytes | Min available KiB | Receipt |
