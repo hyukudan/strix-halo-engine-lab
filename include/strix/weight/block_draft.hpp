@@ -28,6 +28,8 @@ struct BlockDraftCheckpoint {
 };
 // Header only. No payload is read, interpreted, imported or executed here.
 // Uses the common bounded, duplicate-key rejecting safetensors reader.
+// The source must carry a caller-chosen checkpoint name (Source::shard_name), unique per checkpoint: tensor ids
+// are scoped by that name; an unnamed source is refused. Identity of the bytes is digest_block_draft_payload.
 Status index_block_draft(std::shared_ptr<const Source>, std::string_view config_json,
                          BlockDraftCheckpoint&);
 // The same admission with a config source checked for size before any config read.

@@ -52,12 +52,11 @@ BlockDraftConfig parse_block_draft_config(std::string_view json) {
     if (mode != "after_correction" && mode != "before_correction")
         throw std::invalid_argument("block draft: unknown selector softcap mode");
     c.post_softcap = mode == "after_correction";
-    for (const auto* name : {"input_embedding_scale", "output_multiplier"}) {
-        const auto* scale = d.find(name);
-        if (!scale) scale = root.find(name);
-        if (scale && scale->as_double() != 1.0)
-            throw std::invalid_argument("block draft: non-unit embedding/head scale is unsupported");
-    }
+    // Either location may carry a scale and neither has precedence: every value present must be unit.
+    for (const auto* name : {"input_embedding_scale", "output_multiplier"})
+        for (const auto* object : {&d, &root})
+            if (const auto* scale = object->find(name); scale && scale->as_double() != 1.0)
+                throw std::invalid_argument("block draft: non-unit embedding/head scale is unsupported");
     if (const auto* dropout = root.find("attention_dropout"); dropout && dropout->as_double() != 0.0)
         throw std::invalid_argument("block draft: inference dropout must be zero");
     if (field(root, "attention_bias").as_bool() || field(root, "is_causal").as_bool() ||
@@ -123,9 +122,11 @@ Status index_block_draft(std::shared_ptr<const Source> source, std::string_view 
         result.config = parse_block_draft_config(json);
         validate_block_candidate_geometry(result.config);
         if (!source) return {Error::stale_source, "block draft: source absent"};
-        // tensor_id otherwise asks an unnamed Source for its full-file digest.
-        // Header admission must never read payload, even for an unnamed source.
-        if (source->shard_name().empty()) source = namespace_source(std::move(source), "block-draft.header-only@1");
+        // Tensor ids hash the source's checkpoint name with the header and the tensor name. An unnamed source would
+        // need its full-file digest (a payload read) and one shared constant would give two different payloads with
+        // one header the same ids, so the caller names the checkpoint; content identity is the explicit payload digest.
+        if (source->shard_name().empty())
+            return {Error::malformed, "block draft: the caller must name the checkpoint (source shard name)"};
         auto expected = block_draft_shapes(result.config);
         const SafetensorsIndexLimits limits{kMaxHeaderBytes,
             2 + expected.size() * kValuesPerTensor + kMaxMetadataEntries, // root and metadata objects

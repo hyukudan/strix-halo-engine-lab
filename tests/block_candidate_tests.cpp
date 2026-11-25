@@ -57,6 +57,8 @@ struct HeaderSource : sw::Source {
         reads += out.size(); return {sw::Error::ok, {}};
     }
     std::uint64_t size() const noexcept override { return total; }
+    std::string name{"test.checkpoint"};
+    std::string shard_name() const override { return name; }
     sw::Digest256 identity() const override { throw std::runtime_error("test: attempted full-file digest"); }
 };
 std::pair<sj::Json, std::uint64_t> header_json(const sw::BlockDraftConfig& c, const std::string& bad = {}) {
@@ -221,7 +223,7 @@ void loader_tests() {
     // Synthetic payload loading/digesting only, never the downloaded weights.
     source = header(c);
     source->bytes.resize(static_cast<std::size_t>(source->total), sw::Byte{0});
-    auto memory = sw::memory_source(source->bytes);
+    auto memory = sw::memory_source(source->bytes, "synthetic.zero");
     check(bool(sw::index_block_draft(memory, json, checkpoint)), "synthetic checkpoint");
     std::vector<float> decoded;
     check(bool(sw::read_block_draft_tensor(checkpoint, "fc.weight", decoded)) && decoded.size() == 32, "BF16 payload read");
@@ -232,10 +234,33 @@ void loader_tests() {
     const auto it=std::find_if(checkpoint.index.tensors.begin(),checkpoint.index.tensors.end(),[](const auto& t){return t.name=="fc.weight";});
     const auto offset=static_cast<std::size_t>(it->payload.range.offset);
     source->bytes[offset]=sw::Byte{0x80};source->bytes[offset+1]=sw::Byte{0x3f};
-    memory=sw::memory_source(source->bytes);
+    memory=sw::memory_source(source->bytes,"synthetic.mutated");
     check(bool(sw::index_block_draft(memory,json,checkpoint)),"mutated synthetic payload");
     check(bool(sw::read_block_draft_tensor(checkpoint,"fc.weight",decoded)) && decoded.front()==1.0f,"BF16 little endian one");
     check(bool(sw::digest_block_draft_payload(checkpoint,hashes)) && hashes.at("fc.weight").bytes!=old_hash,"payload digest detects changed byte");
+    // Scales: both locations are checked and neither masks the other (r51).
+    for (const char* name : {"input_embedding_scale", "output_multiplier"})
+        for (int nested_unit = 0; nested_unit < 2; ++nested_unit) {
+            auto conflict = sj::parse_json_unique(json);
+            auto nested = *conflict.find("dflash_config");
+            nested.set(name, nested_unit ? 1 : 2); conflict.set("dflash_config", nested);
+            conflict.set(name, nested_unit ? 2 : 1);
+            rejects([&] { static_cast<void>(sw::parse_block_draft_config(conflict.dump())); });
+        }
+    // Checkpoint names scope tensor ids: an unnamed source is refused before any payload read or full-file digest
+    // (HeaderSource throws on identity()); two different payloads under one header get distinct ids by name.
+    auto unnamed = header(c); unnamed->name.clear(); sw::BlockDraftCheckpoint kept = checkpoint;
+    const auto unnamed_status = sw::index_block_draft(unnamed, json, kept);
+    check(!unnamed_status && unnamed_status.detail.find("name the checkpoint") != std::string::npos &&
+          unnamed->reads == 0 && kept.index.tensors.size() == checkpoint.index.tensors.size(), "unnamed source refused");
+    auto first = header(c), second = header(c); first->name = "checkpoint.a"; second->name = "checkpoint.b";
+    sw::BlockDraftCheckpoint a, b;
+    check(bool(sw::index_block_draft(first, json, a)) && bool(sw::index_block_draft(second, json, b)) &&
+          first->reads == first->bytes.size() && second->reads == second->bytes.size(), "named header-only admission");
+    check(a.index.header_identity.bytes == b.index.header_identity.bytes, "one header");
+    for (std::size_t i = 0; i < a.index.tensors.size(); ++i)
+        check(a.index.tensors[i].name == b.index.tensors[i].name && a.index.tensors[i].id != b.index.tensors[i].id,
+              "checkpoint name scopes tensor ids");
     std::cout << "PASS loader: bounded header-only, shapes, dtype, duplicate JSON, atomic failure, synthetic BF16/digests\n";
 }
 void math_tests() {
@@ -495,7 +520,7 @@ int main(int argc,char** argv) {
             std::shared_ptr<const sw::Source> source, config;
             auto status=sw::open_source(argv[2],config);
             check(bool(status),status.detail.c_str());
-            status=sw::open_source(argv[3],source,"block-draft.header-only@1");
+            status=sw::open_source(argv[3],source,argv[3]);
             check(bool(status),status.detail.c_str()); sw::BlockDraftCheckpoint c;
             status=sw::index_block_draft(source,*config,c);check(bool(status),status.detail.c_str());
             std::cout<<"PASS checkpoint HEADER ONLY: "<<c.index.tensors.size()<<" tensors, "<<c.payload_bytes<<" payload bytes; payload NOT read\n";

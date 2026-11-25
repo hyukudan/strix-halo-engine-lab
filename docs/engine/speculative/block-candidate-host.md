@@ -31,8 +31,9 @@ the expected tensor schema and up to 16 metadata entries. The tensor count
 cannot exceed the expected schema size. Version one admits an eight-row block
 with up to eight draft layers and eight target taps with 16-bit IDs. Duplicate
 JSON keys and invalid geometry fail without replacing the caller's previous
-result. An explicit shard namespace prevents implicit full-file hashing during
-header admission. Header and config
+result. The caller names each checkpoint (the source's shard name, unique per
+checkpoint); tensor ids are scoped by that name, and an unnamed source is
+refused rather than hashed in full during header admission. Header and config
 SHA-256 digests identify metadata only: they do **not** attest payload contents.
 `digest_block_draft_payload` is an explicit, separate payload operation.
 
@@ -56,8 +57,8 @@ The embedding callback returns one row for each position in the full block,
 even if the controller asks for fewer proposals. Each row is the target's own input
 embedding of that id, exactly as the target's first layer receives it (for a
 target that normalizes its table rows, the normalized row, for the anchor and
-for every mask row). A bare table row is a different input: measured greedy
-acceptance with bare rows was one token per verification. The head callback returns one
+for every mask row). A bare table row is a different input and is not
+accepted by this contract. The head callback returns one
 raw-logit row per requested proposal over the **real** target vocabulary.
 Padded storage ids must be excluded. The target binding declares that live
 output width in `CandidateTargetHooks::live_vocab` (0 < width <= the checkpoint
