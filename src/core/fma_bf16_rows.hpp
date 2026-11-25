@@ -487,24 +487,31 @@ inline bool bf16_image_disjoint(const float* input, unsigned input_width, unsign
 // The launches of a planned call: fp32_rows runs read the FP32 rows, image and packed runs read image (the operand
 // image of input for the routed entry; any BF16 rows for a fixture that checks which launch served a projection).
 // input is null when a producer stored only the image (every route then reads it; an fp32_rows run is refused).
+// launched / pitch_used (optional) receive the image launch and the weight pitch (elements) of the last image or packed
+// run (an fp32_rows run leaves both untouched).
 inline hipError_t run_bf16_image_routes(const float* input, const std::uint16_t* image, unsigned input_width,
                                         unsigned rows, std::span<const Bf16RowProjection> projections,
                                         unsigned max_outputs, std::span<const ImageRoute> routes, hipStream_t stream,
-                                        RoundStore* store_used = nullptr) {
+                                        RoundStore* store_used = nullptr, ImageLaunch* launched = nullptr,
+                                        std::size_t* pitch_used = nullptr) {
     const auto natural = std::size_t{input_width} * sizeof(std::uint16_t);
     return for_each_image_route_run<kGroupMax>(projections, routes, input_width, hipSuccess,
         [&](ImageRoute route, std::span<const Bf16RowProjection> run) {
             if (route == ImageRoute::fp32_rows)
                 return input ? enqueue_bf16_rows(input, input_width, rows, run, max_outputs, stream, store_used)
                              : hipErrorNotSupported;
-            if (route == ImageRoute::image)
-                return enqueue_bf16_image_rows(image, input_width, rows, run, max_outputs, stream, nullptr, store_used);
+            if (route == ImageRoute::image) {
+                if (pitch_used) *pitch_used = input_width;
+                return enqueue_bf16_image_rows(image, input_width, rows, run, max_outputs, stream, launched, store_used);
+            }
             f16_tile_gemm::Bf16ProjectionGroup<kGroupMax> group{};
             for (const auto& projection : run)
                 group.append({projection.weights, projection.outputs, projection.output, projection.round_bf16});
             const auto pitch = run.front().row_bytes != 0U ? run.front().row_bytes : natural;
             return with_round_store(run.front(), [&](auto policy) {
                 if (store_used) *store_used = decltype(policy)::value;
+                if (launched) *launched = ImageLaunch::k64_packed;
+                if (pitch_used) *pitch_used = pitch / sizeof(std::uint16_t);
                 return f16_tile_gemm::gemm_bf16_projections_image_packed<decltype(policy)::value>(
                     image, rows, input_width, group, stream, pitch / sizeof(std::uint16_t));
             });
@@ -520,14 +527,18 @@ inline hipError_t run_bf16_image_routes(const float* input, const std::uint16_t*
 // rest and the FP32 rows for what neither reads, inside the groups enqueue_bf16_rows runs on the WMMA tile. Every output
 // keeps the bits enqueue_bf16_rows stores; a call the plan keeps on its rows makes the launches enqueue_bf16_rows makes.
 // image_used (optional) reports whether the call took the image routes; store_used (optional) the round store of the
-// last launch the call made.
+// last launch the call made; launched and pitch_used (optional) the image launch (K64 packed or K32 image tile) and the
+// weight pitch in elements of the last image launch the routed dispatch made (k32_image and 0 when it made none).
 inline hipError_t enqueue_bf16_rows_routed(const float* input, unsigned input_width, unsigned rows,
                                            std::span<const Bf16RowProjection> projections, unsigned max_outputs,
                                            std::span<std::uint16_t> image, hipStream_t stream, bool* image_used = nullptr,
-                                           RoundStore* store_used = nullptr) {
+                                           RoundStore* store_used = nullptr, ImageLaunch* launched = nullptr,
+                                           std::size_t* pitch_used = nullptr) {
     ImageRoute routes[kImageRouteMaxProjections]{};
     if (image_used) *image_used = false;
     if (store_used) *store_used = RoundStore::incumbent;
+    if (launched) *launched = ImageLaunch::k32_image;
+    if (pitch_used) *pitch_used = 0U;
     if (!input || reinterpret_cast<std::uintptr_t>(input) % 16U != 0U || !image_routes_device_qualified(stream) ||
         !image_routes_order_free(input, input_width, rows, projections) ||
         !detail::plan_bf16_image_call(input_width, rows, projections, max_outputs, image, routes))
@@ -540,7 +551,8 @@ inline hipError_t enqueue_bf16_rows_routed(const float* input, unsigned input_wi
         status != hipSuccess)
         return status;
     return detail::run_bf16_image_routes(input, image.data(), input_width, rows, projections, max_outputs,
-                                         std::span<const ImageRoute>(routes, projections.size()), stream, store_used);
+                                         std::span<const ImageRoute>(routes, projections.size()), stream, store_used, launched,
+                                         pitch_used);
 }
 
 class Bf16ImageCallPlan;
