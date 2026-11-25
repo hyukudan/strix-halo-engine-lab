@@ -308,6 +308,24 @@ void gemma() {
         {"streams", "the server decodes up to STRIX_G4_SERVE_SLOTS requests together"},
     };
     gate("gemma", cli, config(served.options), allowed);
+
+    // Explicitly match concurrency so the test compares only model/tier settings.
+    for (const std::string tier : {"exact", "fast", "turbo"}) {
+        std::vector<std::string> tier_words = words;
+        tier_words.insert(tier_words.end(), {"--profile", tier, "--streams", "1", "--draft", "off"});
+        std::vector<char*> tier_argv;
+        for (auto& word : tier_words) tier_argv.push_back(word.data());
+        const auto native = e::parse_options(static_cast<int>(tier_argv.size()), tier_argv.data());
+        const auto server = e::prepare_serve(static_cast<int>(tier_argv.size()), tier_argv.data());
+        check(!server.exit_code, "gemma: serve accepts " + tier);
+        check(native.profile.name == strix::profile::parse(tier), "gemma: native tier survives parsing");
+        const auto* identity = native.profile.find("decode_identity");
+        check(identity && identity->value == (tier == "exact" ? "g4-v1" : "g4-a8-v1"),
+              "gemma: " + tier + " resolves its decode identity");
+        const auto* attention = native.profile.find("decode_attention");
+        check(attention && attention->value == "exact", "gemma: " + tier + " keeps qualified exact decode attention");
+        gate("gemma/" + tier, config(native), config(server.options), {});
+    }
 }
 #endif
 
