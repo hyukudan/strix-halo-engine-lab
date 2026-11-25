@@ -43,12 +43,13 @@ public:
                      const char* dspark,
                      moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16,
                      bool combine_image = false, bool prepared_round_fold = false, bool narrow_experts = false,
-                     bool controller_one_plane = false, bool attn_projected_bias = false, unsigned verify_rows = 0U)
+                     bool controller_one_plane = false, bool attn_projected_bias = false, bool screened_head = false,
+                     unsigned verify_rows = 0U)
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
                    load.verify_rows, dspark != nullptr, 1U, load.prefill_tail, narrow_experts, controller_one_plane),
           projected_bias_(attn_projected_bias) {
-        const auto levers = configure_mini_decoder(decoder_, moe_w4a4, combine_image, prepared_round_fold, attn_projected_bias,
-                                                   verify_rows);
+        const auto levers = configure_mini_decoder(decoder_, moe_w4a4, combine_image, prepared_round_fold,
+                                                   attn_projected_bias, screened_head, verify_rows);
         std::cerr << "Inkling down_image " << mini_down_image_name(levers.down_image, combine_image) << '\n';
         std::cerr << "Inkling prepared_round_fold " << mini_round_fold_name(levers.prepared_round_fold, prepared_round_fold)
                   << '\n';
@@ -61,7 +62,7 @@ public:
         // With the lever selected, the observed route: projected-bias appends submitted so far (0: every chunk declined
         // or was not admissible, so the image route ran).
         if (projected_bias_)
-            std::cerr << "Inkling attn_projected_bias dispatches " << decoder_.projected_attention_dispatches() << '\n';
+            std::cerr << mini_projected_bias_dispatches_line(decoder_.projected_attention_dispatches()) << '\n';
         return next;
     }
 
@@ -202,7 +203,8 @@ static_assert(kLatencyFormsMix == kMiniFormsMix && kLatencyFormsMoe == kMiniForm
               kLatencyFormsAll == kMiniFormsAll && kMiniDefaultForms == kMiniFormsMix);
 
 using MiniCudaProgramLoad = std::unique_ptr<serve::SerialGenerationDecoder> (*)(const serve::SerialGenerationLoad&,
-                                                                                moe_core::grouped_w4a4::Activations, bool, bool);
+                                                                                moe_core::grouped_w4a4::Activations, bool, bool,
+                                                                                bool);
 
 // The exact R1 latency forms are a template parameter of the loader; map the CLI mask to its instance.
 inline MiniCudaProgramLoad select_mini_cuda_program(bool fuse, unsigned forms) {
@@ -290,6 +292,9 @@ int main(int argc, char** argv) {
             family.default_prefill_chunk = mini_prefill_schedule(cli::kMiniHipSchedule, options.tier.profile).chunk;
             options.generation.prefill_chunk = family.default_prefill_chunk;
         }
+        // The implicit chunk's pressure fallback of this backend and profile (shared load; never an explicit chunk).
+        family.prefill_chunk_fallback = mini_cli_prefill_fallback_rows(
+            cli::kMiniHipSchedule ? MiniPrefillBackend::hip : MiniPrefillBackend::cuda, options.tier.profile);
         // The serial CLI resolves its one lane at load using prompt + generated positions. A gate knows its
         // resident context from the manifest. CUDA step routing precedes serial loading and has no banded CUDA row.
         struct ResolvedWeights {
@@ -322,9 +327,9 @@ int main(int argc, char** argv) {
                                                                         program_options.latency_forms),
                            moe_w4a4,
                            controller_one_plane = mini_controller_one_plane(options.tier),
-                           projected_bias = mini_attn_projected_bias(options.tier)](
-                              const serve::SerialGenerationLoad& load) {
-                return program_load(load, moe_w4a4, controller_one_plane, projected_bias);
+                           projected_bias = mini_attn_projected_bias(options.tier),
+                           screened_head = mini_screened_head(options.tier)](const serve::SerialGenerationLoad& load) {
+                return program_load(load, moe_w4a4, controller_one_plane, projected_bias, screened_head);
             };
         else
 #endif
@@ -335,11 +340,20 @@ int main(int argc, char** argv) {
                        narrow = mini_experts_nvfp4(options.tier),
                        controller_one_plane = mini_controller_one_plane(options.tier),
                        projected_bias = mini_attn_projected_bias(options.tier),
+                       screened_head = mini_screened_head(options.tier),
                        verify_rows = mini_verify_rows(options.tier)](const serve::SerialGenerationLoad& load) {
             loaded = resolve_weights({load.positions, 1U});
             return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, loaded->plan.storage, dspark, moe_w4a4,
                                                            combine_image, round_fold, narrow, controller_one_plane,
-                                                           projected_bias, verify_rows);
+                                                           projected_bias, screened_head, verify_rows);
+        };
+        // The rows the decoder was loaded with once the shared load fell back (strix-prefill-chunk line): a second load
+        // happens only then, and the prefill route receipt names the chunk that ran.
+        unsigned loads = 0U;
+        std::uint32_t fallback_chunk = 0U;
+        family.load = [load = std::move(family.load), &loads, &fallback_chunk](const serve::SerialGenerationLoad& request) {
+            if (loads++ != 0U) fallback_chunk = request.prefill_chunk;
+            return load(request);
         };
         const auto write_profile = [&] {
             const auto& resolved = loaded ? *loaded : early;
@@ -351,7 +365,8 @@ int main(int argc, char** argv) {
             // The admitted W4A4 class, the same identity the gate prints and the server reports as moe_prefill.
             if (mini_moe_w4a4(options.tier))
                 std::cerr << "strix-moe-w4a4 class " << strix::moe_core::grouped_w4a4::identity(moe_w4a4) << '\n';
-            std::cerr << "strix-prefill-route/v1 chunk " << options.generation.prefill_chunk << " tail_divisor "
+            std::cerr << "strix-prefill-route/v1 chunk " << (fallback_chunk ? fallback_chunk : options.generation.prefill_chunk)
+                      << " tail_divisor "
                       << family.prefill_tail_divisor << " first_id prefill\n";
             std::cerr << "strix-decode-route/v1 moe_decode " << mini_decode_form_name(options.generation.packed_decode)
                       << '\n';

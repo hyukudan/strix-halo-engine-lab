@@ -67,6 +67,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.combine_image = mini_combine_image(resolution);
     out.served_route_requested = mini_served_cli_route(resolution);
     out.attn_projected_bias = mini_attn_projected_bias(resolution);
+    out.screened_head = mini_screened_head(resolution);
     out.verify_rows = mini_verify_rows(resolution);
     out.controller_one_plane = mini_controller_one_plane(resolution);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
@@ -132,6 +133,11 @@ public:
     }
     void handle(const serve::HttpRequest& request, serve::HttpResponseWriter& writer) override {
         api_.handle(request, writer);
+    }
+    // The command line's projected-bias observation, once the owner has stopped: what the served requests submitted.
+    void stopped() override {
+        if (device_.projected_bias_dispatches)
+            std::cerr << mini_projected_bias_dispatches_line(device_.projected_bias_dispatches()) << std::endl;
     }
 
 private:

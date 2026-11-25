@@ -188,7 +188,11 @@ public:
         if (max_rows_ > cuda_core::kMaxRows) {
             big_context_.reset(cuda_core::dense_big_ctx_create());
             if (!big_context_) throw std::runtime_error("Inkling 2 Mini: could not allocate CUDA dense context");
-            check(cuda_core::dense_big_reserve(max_rows_, 2U * kHiddenWidth, 0U, 3, big_context_.get()));
+            // Row-scaled device workspaces (cudaMalloc): an out-of-memory refusal is the typed device allocation
+            // failure, as for the Buffer members above (the implicit chunk's pressure fallback keys on it).
+            mini_gpu::check_device_allocation(
+                cuda_core::dense_big_reserve(max_rows_, 2U * kHiddenWidth, 0U, 3, big_context_.get()),
+                "Inkling 2 Mini: reserve CUDA dense rows");
         }
 #endif
         try {
