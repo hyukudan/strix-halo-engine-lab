@@ -204,6 +204,13 @@ if(TARGET strix_inkling2_mini_checkpoint)
 endif()
 
 if(BUILD_TESTING)
+    # Device test driver: runs a command with the free device memory reduced to a stated amount (the pressure retry of
+    # the implicit prefill chunk, against the real device allocation, with the unchanged production executable).
+    add_executable(strix-cuda-vram-ballast ${_cc_root}/tests/inkling2/vram_ballast_cuda.cu)
+    target_compile_options(strix-cuda-vram-ballast PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${_cc_mini_warnings}>")
+    if(MSVC)
+        target_compile_options(strix-cuda-vram-ballast PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+    endif()
     # Grouped BF16 expert projection, tall slab schedule: device fixture (every form bitwise the staged schedule) + no-model
     # bench (--bench [tokens]).
     add_executable(strix-cuda-grouped-tall-test ${_cc_root}/tests/moe_core/grouped_tall_cuda.cu)
