@@ -27,13 +27,16 @@ inline constexpr std::string_view kEvidence = "docs/models/qwen3.8-27b/README.md
 inline constexpr sp::Lever table[] = {
     {.name = "wide_rows", .env = "", .option = "--wide", .value = {"", "512", "", ""}, .builtin = kExactWindow,
      .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, false, true, false},
-     .target = kPending, .off = "16", .source = kEvidence},
+     .target = kPending, .off = "16", .source = kEvidence,
+     .identity = {{{kExactWindow, "v1"}, {"512", "v1"}, {"16", "v1"}}}},
     {.name = "a4w4_layers", .env = kLayersEnv, .option = "", .value = {"", "48-63", "", ""}, .builtin = "none",
      .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, false, true, false},
-     .target = kPending, .off = "none", .source = kEvidence},
+     .target = kPending, .off = "none", .source = kEvidence,
+     .identity = {{{"none", "v1"}, {"48-63", "v1"}}}},
     {.name = "prefill_rows", .env = "", .option = "--prefill-rows", .value = {"", "512", "", ""}, .builtin = kExactWindow,
      .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, false, true, false},
-     .target = kPending, .off = "16", .source = kEvidence},
+     .target = kPending, .off = "16", .source = kEvidence,
+     .identity = {{{kExactWindow, "v1"}, {"512", "v1"}, {"16", "v1"}}}},
 };
 
 inline constexpr sp::Engine kDecode{"qwen35-hip-decode", kAllowEnv, std::span(table).first<2>(), false, "qwen35-hip-turbo-v1"};
