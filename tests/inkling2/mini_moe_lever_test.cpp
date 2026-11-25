@@ -473,7 +473,10 @@ void test_vision_recipe_row() {
     for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
         options.tier = inputs(tier);
         const auto with = mini::resolve_mini_profile(options, true);
-        const auto old = profile::resolve(without_row, inputs(tier));
+        auto old = profile::resolve(without_row, inputs(tier));
+        // Compare after the same weight admission step: unavailable StrixPack rows
+        // are filtered from the effective receipt, independently of the vision row.
+        static_cast<void>(mini::admit_mini_strixpack_receipt(old));
         require(with.summary() == old.summary() && with.tier_notice() == old.tier_notice() &&
                     with.qualification() == old.qualification() && with.fingerprint() == old.fingerprint(),
                 "unset image recipe: the text-only resolution is the table's without the row");
