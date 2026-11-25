@@ -134,10 +134,63 @@ int run_case(unsigned rows, unsigned in, unsigned n, unsigned seed, bool map2 = 
                 bad_w, bad_s, bad_a, bad_u, bad_b, bad_y, nan_y);
     return ok ? 0 : 1;
 }
+
+// Weight rule trait (contract v2): the device image built with WeightRule::mse_clip is the host rule bit for bit
+// (codes and steps), and differs from the v1 image (the trait is live, not ignored).
+int run_rule_case(unsigned in, unsigned n, unsigned seed) {
+    std::mt19937 g(seed);
+    const unsigned blocks = in / rot::kBlock;
+    std::vector<std::uint8_t> pack(std::size_t(n) * in / 2U);
+    for (auto& e : pack) e = static_cast<std::uint8_t>(g());
+    std::vector<std::uint16_t> sc(std::size_t(n) * (in / 64U));
+    for (auto& e : sc) e = static_cast<std::uint16_t>(((5U + g() % 7U) << 10U) | (g() & 1023U));
+    std::uint8_t *dpack = nullptr, *dw = nullptr, *dw1 = nullptr;
+    std::uint16_t* dsc = nullptr;
+    float *dstep = nullptr, *dstep1 = nullptr;
+    CHECK(hipMalloc(&dpack, pack.size()));
+    CHECK(hipMalloc(&dsc, sc.size() * 2U));
+    CHECK(hipMalloc(&dw, ad::weight_code_bytes(in, n)));
+    CHECK(hipMalloc(&dw1, ad::weight_code_bytes(in, n)));
+    CHECK(hipMalloc(&dstep, ad::weight_step_bytes(in, n)));
+    CHECK(hipMalloc(&dstep1, ad::weight_step_bytes(in, n)));
+    CHECK(hipMemcpy(dpack, pack.data(), pack.size(), hipMemcpyHostToDevice));
+    CHECK(hipMemcpy(dsc, sc.data(), sc.size() * 2U, hipMemcpyHostToDevice));
+    CHECK(hipMemset(dw, 0, ad::weight_code_bytes(in, n)));
+    CHECK(hipMemset(dw1, 0, ad::weight_code_bytes(in, n)));
+    ad::enqueue_requantise(dpack, dsc, in, n, dw, dstep, nullptr, rot::WeightRule::mse_clip);
+    ad::enqueue_requantise(dpack, dsc, in, n, dw1, dstep1, nullptr);
+    CHECK(hipGetLastError());
+    CHECK(hipDeviceSynchronize());
+    std::vector<std::uint8_t> gw(ad::weight_code_bytes(in, n)), gw1(gw.size());
+    std::vector<float> gstep(ad::weight_step_bytes(in, n) / 4U), gstep1(gstep.size());
+    CHECK(hipMemcpy(gw.data(), dw, gw.size(), hipMemcpyDeviceToHost));
+    CHECK(hipMemcpy(gw1.data(), dw1, gw1.size(), hipMemcpyDeviceToHost));
+    CHECK(hipMemcpy(gstep.data(), dstep, gstep.size() * 4U, hipMemcpyDeviceToHost));
+    CHECK(hipMemcpy(gstep1.data(), dstep1, gstep1.size() * 4U, hipMemcpyDeviceToHost));
+    for (void* p : {static_cast<void*>(dpack), static_cast<void*>(dsc), static_cast<void*>(dw), static_cast<void*>(dw1),
+                    static_cast<void*>(dstep), static_cast<void*>(dstep1)})
+        CHECK(hipFree(p));
+    std::vector<std::uint8_t> hw(gw.size(), 0);
+    std::vector<float> hstep(std::size_t(n) * blocks);
+    unsigned bad_s = 0, bad_w = 0, clipped = 0;
+    for (unsigned b = 0; b < blocks; ++b)
+        for (unsigned c = 0; c < n; ++c) {
+            rot::requantise_block(pack.data(), sc.data(), in, n, c, b, hw.data(), hstep.data(), rot::WeightRule::mse_clip);
+            bad_s += bits(gstep[ad::step_index(b, c, n)]) != bits(hstep[std::size_t(c) * blocks + b]);
+            clipped += gstep[ad::step_index(b, c, n)] < gstep1[ad::step_index(b, c, n)];
+        }
+    for (std::size_t i = 0; i < hw.size(); ++i) bad_w += hw[i] != gw[i];
+    const bool ok = bad_s == 0 && bad_w == 0 && clipped > 0 && gw != gw1;
+    std::printf("%s weight rule %s in %u n %u: wcodes %u steps %u differ from the host rule; %u of %u blocks clipped\n",
+                ok ? "PASS" : "FAIL", rot::identity(rot::WeightRule::mse_clip), in, n, bad_w, bad_s, clipped, n * blocks);
+    return ok ? 0 : 1;
+}
 }  // namespace
 
 int main() {
     int fails = 0;
+    fails += run_rule_case(1280, 272, 11U);  // weight rule v2: device image == host rule
+    fails += run_rule_case(384, 16, 12U);
     fails += run_case(37, 512, 96, 1U);     // partial m tile, 6 W tiles (partial CTA in n)
     fails += run_case(130, 1280, 272, 2U);  // 2 m CTAs (second partial), 17 W tiles
     fails += run_case(16, 384, 16, 3U);     // odd block count, one tile each way

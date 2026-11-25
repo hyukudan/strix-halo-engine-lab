@@ -36,11 +36,12 @@ struct Bf16Segments {
     const std::uint16_t* weights[kMaxSegments]{};  // segment s: row r of its matrix at weights[s] + r * pitch[s]
     std::size_t pitch[kMaxSegments]{};            // u16 elements between rows (>= layout.in)
     Layout layout{};
+    rot::WeightRule rule = rot::WeightRule::amax;  // weight image rule (contract v1 / v2)
     __device__ __forceinline__ float requantise(unsigned col, unsigned b, unsigned n, std::uint8_t* dst) const {
         const unsigned s = layout.segment(col);
         const std::uint16_t* row = weights[s] + std::size_t(col - layout.first_col[s]) * pitch[s] + std::size_t(b) * rot::kBlock;
         const auto value = [row](unsigned i) { return __builtin_bit_cast(float, std::uint32_t{row[i]} << 16U); };
-        return rot::requantise_values(value, b, col, n, dst);
+        return rot::requantise_values(value, b, col, n, dst, rule);
     }
 };
 

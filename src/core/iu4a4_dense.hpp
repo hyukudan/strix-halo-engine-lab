@@ -328,8 +328,9 @@ struct G64Source {
     const std::uint8_t* pack;
     const std::uint16_t* scales;
     unsigned in;
+    rot::WeightRule rule = rot::WeightRule::amax;
     __device__ __forceinline__ float requantise(unsigned col, unsigned b, unsigned n, std::uint8_t* dst) const {
-        return rot::requantise_codes(pack, scales, in, n, col, b, dst);
+        return rot::requantise_codes(pack, scales, in, n, col, b, dst, rule);
     }
 };
 
@@ -799,8 +800,8 @@ inline void enqueue_grouped_gemm(const Src& src, unsigned tiles, unsigned max_ti
     STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::grouped_gemm_kernel<Src, Epi>), grid, dim3(32U * kWavesN * kWavesM), 0, s, src, a, n, slices, epi);
 }
 inline void enqueue_requantise(const std::uint8_t* pack, const std::uint16_t* scales, unsigned in, unsigned n, std::uint8_t* dst, float* step,
-                               hipStream_t s) {
-    enqueue_requantise_source(detail::G64Source{pack, scales, in}, in, n, dst, step, s);
+                               hipStream_t s, rot::WeightRule rule = rot::WeightRule::amax) {
+    enqueue_requantise_source(detail::G64Source{pack, scales, in, rule}, in, n, dst, step, s);
 }
 template <class Cols, class Store = f16_dense_tall::RawStore>
 inline void enqueue_gemm(const Weights& w, const Act& a, Cols cols, hipStream_t s, Store store = {}) {
