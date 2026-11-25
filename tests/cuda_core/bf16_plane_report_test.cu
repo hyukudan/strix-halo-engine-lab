@@ -104,6 +104,8 @@ bool run() {
     // Tall tile (width divisible by 32, outputs divisible by 16).
     expect("tall mma3 fp32 operand", {64, 64, {32}}, fp32, 3);
     expect("tall mma3 bf16-exact operand", {64, 64, {32}}, exact, 1);
+    expect("tall 2048 rows fp32 operand", {2304, 2048, {3072}}, fp32, 3);
+    expect("tall 2048 rows bf16-exact operand", {2304, 2048, {3072}}, exact, 1);
     // The FP32 row grid: output width 17 is not a multiple of 16, so the projection splits nothing.
     expect("fp32 grid bf16-exact operand", {64, 64, {17}}, exact, 0);
     expect("fp32 grid fp32 operand", {64, 64, {17}}, fp32, 0);
