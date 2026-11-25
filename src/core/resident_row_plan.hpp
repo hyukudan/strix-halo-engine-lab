@@ -51,9 +51,12 @@ inline bool valid_resident_q8_rows(const weight::ResidentMatrixView& matrix, uns
 }
 
 // The FP32 sweep is the incumbent. The explicit FP16 form uses one arithmetic across both tile schedules.
-// f16_folded_scale: the FP16 form with the scale folded into the operand (fp16(code x d), one WMMA chain per output;
-// core/lowbit_f16_staging.hpp ScalePolicy::folded), also one arithmetic across both schedules. A FAST / TURBO
-// candidate lever value: it changes rounding, is never EXACT and no profile selects it until its gate and receipts exist.
+// f16_folded_scale: the FP16 form whose tile route (launches above the device plan's small_rows) folds the scale into
+// the operand (fp16(code x d), one WMMA chain per output; core/lowbit_f16_staging.hpp ScalePolicy::folded) while the
+// small-M route keeps the group scale: per-regime selection from the no-model fixture (tests/hip_dense_lowbit_bench.hip
+// mode fold; gfx1151: the folded tile faster on every measured shape, the folded small-M schedule no faster at 1-16
+// rows and slower at 32-64). A row's bits then depend on its launch's route. A FAST / TURBO candidate lever value: it
+// changes rounding, is never EXACT and no profile selects it until its gate and receipts exist.
 enum class LowBitArithmetic { fp32_sweep, f16_group_scale, f16_folded_scale };
 
 constexpr bool lowbit_f16_form(LowBitArithmetic arithmetic) { return arithmetic != LowBitArithmetic::fp32_sweep; }
@@ -138,7 +141,7 @@ inline constexpr std::array<weight::ArithmeticId, 2> kResidentLowBitArithmeticHi
 inline constexpr std::array<weight::ArithmeticId, 2> kResidentLowBitTileArithmeticHip{{
     {"hip.q4_g64.f16-group-scale-chain", 1}, {"hip.q6_g64.f16-group-scale-chain", 1}}};
 inline constexpr std::array<weight::ArithmeticId, 2> kResidentLowBitFoldedArithmeticHip{{
-    {"hip.q4_g64.f16-folded-scale-chain", 1}, {"hip.q6_g64.f16-folded-scale-chain", 1}}};
+    {"hip.q4_g64.f16-folded-scale-tile", 1}, {"hip.q6_g64.f16-folded-scale-tile", 1}}};
 
 // The weight bytes one projection of a list reads: a BF16 projection outputs tight rows of width elements, a compact
 // one its whole view. Empty (nullptr, 0) when the descriptor has no weights or the extent does not fit.

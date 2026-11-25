@@ -314,6 +314,11 @@ hipError_t launch_arm(Arm arm, const Packed& p, const std::uint8_t* w, unsigned 
 int fold_ticket(const std::vector<unsigned>& shapes) {
     const std::vector<unsigned> prefill_rows{2048U, 8192U}, small_rows{1U, 2U, 4U, 8U, 16U, 32U, 64U}, sweep_rows{1U, 2U, 4U};
     constexpr unsigned check_rows = 129U, ref_outputs = 128U, max_rows = 8192U;
+    {
+        int dev = 0;
+        ok(hipGetDevice(&dev), "device");
+        report(strix::device::bind_lowbit_rows(dev, {64U, 64U}), "fold: bind the declared plan small_rows=64 wide_panels=64");
+    }
     for (std::size_t s = 0; s + 1 < shapes.size(); s += 2) {
         const unsigned n = shapes[s], k = shapes[s + 1];
         const std::string tag = "N=" + std::to_string(n) + " K=" + std::to_string(k);
@@ -379,6 +384,25 @@ int fold_ticket(const std::vector<unsigned>& shapes) {
         {
             ok(launch_arm(Arm::tile_group, q4, w4, n, k, dx, dy, check_rows), "group tile 129");
             const auto group = fetch_rows(dy, check_rows);
+            // The arithmetic value f16_folded_scale through the resident entry and a two-projection list: the small-M
+            // route (rows <= the bound plan's 64) keeps the group scale's bits, the tile route has the folded tile's.
+            for (const unsigned rows : {1U, 16U, 64U, 65U, 129U}) {
+                const auto& want = rows <= 64U ? group : base;
+                poison(dy2, 2U * std::size_t(rows) * n);
+                ok(core::enqueue_resident_lowbit_rows(view(q4, w4, n, k), n, dx, rows, dy2, nullptr,
+                                                      core::LowBitArithmetic::f16_folded_scale), "folded entry");
+                const auto diff = bit_diff(fetch_rows(dy2, rows), want, rows, n);
+                float* dz = dy2 + std::size_t(rows) * n;
+                const std::array<core::ResidentRowProjection, 2> list{{{view(q4, w4, n, k), n, dy2}, {view(q4, w4, n, k), n, dz}}};
+                ok(core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr, core::LowBitArithmetic::f16_folded_scale),
+                   "folded list");
+                const auto both = fetch(dy2, 2U * std::size_t(rows) * n);
+                const std::vector<float> second(both.begin() + std::ptrdiff_t(std::size_t(rows) * n), both.end());
+                const auto diff_list = bit_diff(both, want, rows, n) + bit_diff(second, want, rows, n);
+                report(diff == 0U && diff_list == 0U, tag + " f16_folded_scale entry rows=" + std::to_string(rows) + " route=" +
+                                                          (rows <= 64U ? "small(group)" : "tile(folded)") + " bits_diff=" +
+                                                          std::to_string(diff) + " list_bits_diff=" + std::to_string(diff_list));
+            }
             std::cout << "info " << tag << " folded_vs_group differing=" << bit_diff(group, base, check_rows, n) << " of "
                       << std::size_t(check_rows) * n << '\n';
             for (const unsigned rows : sweep_rows) {

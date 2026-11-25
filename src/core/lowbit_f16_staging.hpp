@@ -11,7 +11,8 @@
 // rounding; never EXACT): the operand is fp16(code x d), one correctly rounded packed FP16 product per pair (the code is
 // an exact small integer, so the product is the FP16 rounding of the exact real code x d; overflows to inf for
 // |d| > 65504 / 2^(bits-1)), and every K16 unit joins ONE WMMA chain per output, the class of the Q8_0 staging. Both
-// consumers fold the same way, so under `folded` too a row's bits do not depend on the route.
+// consumers fold the same way (folded small-M == folded tile, bit for bit); which route folds is the arithmetic's
+// per-regime choice (core/resident_row_plan.hpp LowBitArithmetic::f16_folded_scale).
 
 #include "strix/weight/host_lowbit.hpp"
 
