@@ -251,7 +251,7 @@ void test_strixpack_selection() {
 
         options.tier.cli.emplace_back(lever.name, lever.target);
         auto plan = mini::resolve_mini_resident_weight_load(tier, options, scope);
-        const auto resolution = mini::resolve_mini_profile(options, true);
+        const auto resolution = mini::resolve_mini_profile(options, false);
         const auto* entry = resolution.find(lever.name);
         bool loaded = false, refused = false;
         std::ostringstream receipt;

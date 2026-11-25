@@ -7,6 +7,7 @@
 
 #include <array>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 namespace strix::weight {
@@ -269,6 +270,10 @@ struct StrixPackLoad {
     [[nodiscard]] constexpr std::string_view reason() const {
         return refused ? "refused: loader not present" : "loader not present";
     }
+
+    void require_loadable() const {
+        if (refused) throw std::invalid_argument(std::string(reason()));
+    }
 };
 
 [[nodiscard]] std::optional<StrixPackLoad> bind_strixpack_load(profile::Resolution& resolution);
@@ -286,7 +291,7 @@ struct WeightLoadPlan {
     std::optional<StrixPackLoad> strixpack{};
 
     void require_loadable() const {
-        if (strixpack && strixpack->refused) throw std::invalid_argument(std::string(strixpack->reason()));
+        if (strixpack) strixpack->require_loadable();
     }
 
     [[nodiscard]] FormatId storage_for(std::optional<Role> role) const {

@@ -345,18 +345,21 @@ inline profile::Resolution resolve_mini_weight_profile(const MiniWeightOptions& 
     return profile::resolve(kMiniProfile, inputs);
 }
 
-inline void admit_mini_strixpack_receipt(profile::Resolution& tier) {
-    static_cast<void>(weight::bind_strixpack_load(tier));
+inline std::optional<weight::StrixPackLoad> admit_mini_strixpack_receipt(profile::Resolution& tier) {
+    const auto load = weight::bind_strixpack_load(tier);
     if (!tier.allow_pending)
         std::erase_if(tier.entries, [](const profile::Entry& entry) {
             const auto* policy = entry.lever ? weight::find_weight_load_policy(entry.lever->name) : nullptr;
             return policy && weight::is_strixpack_storage(policy->target) && entry.reason.empty();
         });
+    return load;
 }
 
 inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options, bool native_execution) {
     auto tier = resolve_mini_weight_profile(options, options.tier);
-    admit_mini_strixpack_receipt(tier);
+    // Native CLI (including the CUDA step program), gate and server admit the weight request before routing.
+    if (const auto load = admit_mini_strixpack_receipt(tier); native_execution && load)
+        load->require_loadable();
     tier.weights.require_honoured();
     if (options.qualify_q8 && (tier.profile != profile::Name::fast || options.disable_q8 || !native_execution))
         throw std::invalid_argument("--qualify-q8 requires --profile fast and native model execution");

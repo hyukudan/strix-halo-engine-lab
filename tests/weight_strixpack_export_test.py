@@ -32,9 +32,9 @@ def run(executable, work):
     (work / "cal.moments").write_bytes(moments_header + ids + inputs + covariance)
     (work / "gate.ids").write_text("17\n", encoding="ascii")
     (work / "gate.txt").write_text("gate 1 gate.ids\n", encoding="ascii")
-    command = [str(executable), "--model", "source.safetensors", "--moments", "cal.moments",
-               "--heldout", "gate.txt", "--technique", "rtn", "--threads", "1"]
-    subprocess.run(command + ["--storage", "projection=sp4", "--dequant-out", "decoded.safetensors"],
+    command = [str(executable), "--moments", "cal.moments", "--heldout", "gate.txt", "--technique", "rtn", "--threads", "1"]
+    subprocess.run(command + ["--model", "source.safetensors", "--storage", "projection=sp4",
+                              "--dequant-out", "decoded.safetensors"],
                    cwd=work, check=True)
 
     decoded = (work / "decoded.safetensors").read_bytes()
@@ -46,11 +46,13 @@ def run(executable, work):
     assert reopened == tensors, reopened
     assert decoded[data_offset:] == payload
 
-    subprocess.run(command + ["--storage", "projection=q4", "--report", "report.tsv", "--out", "pack.bin"],
+    subprocess.run(command + ["--model", "decoded.safetensors", "--storage", "projection=q4",
+                              "--report", "report.tsv", "--out", "pack.bin"],
                    cwd=work, check=True)
     report = (work / "report.tsv").read_text(encoding="utf-8").splitlines()
     assert report[0] == "tensor\tinput\tcal_rows\teval_rows\tformat\ttechnique\trel_error\tselected"
     assert len(report) == 3 and all(len(line.split("\t")) == 8 for line in report)
+    assert {line.split("\t")[0] for line in report[1:]} == weights.keys()
 
 
 if __name__ == "__main__":
