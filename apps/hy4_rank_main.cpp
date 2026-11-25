@@ -582,7 +582,7 @@ int run(int argc, char** argv) {
     GateRef gref;           // --gate-ref (long BASE reference in pieces)
     bool head_explicit = false;
     bool print_config = false;
-    // Exact speculative decode (strix/profiles/hy4.hpp speculation): --mtp forces it, --no-mtp / STRIX_MTP=0 opt out; the
+    // Exact speculative decode (src/hy4/hy4_speculation.hpp): --mtp forces it, --no-mtp / STRIX_MTP=0 opt out; the
     // EXACT prompt runs as verify rows of --prompt-vrows R (1..8, 0 = one step per position; each row bitwise the step).
     bool top_explicit = false, no_mtp = false, want_mtp = false;
     std::uint32_t prompt_vrows = strix::hy4::hipbind::rows::kMaxVerifyRows;
@@ -691,7 +691,7 @@ int run(int argc, char** argv) {
                                     "[--context C] [--top K] [--timing] [--prompt-rows R] [--dump-logits F] [--profile exact|fast|turbo] "
                                     "[--rank 0|1 --cut K | --stage-map C0,C1,..,L|off --repeat K --port P --pipe-guess copy|off --window-costs ROWS:MS,...]");
     // Decode route, every tier: exact speculative decode where the pack ships its next-token block and this rank holds the
-    // whole model (one node, or a tensor-parallel rank); the shared resolver words the decision (hy4.hpp speculation).
+    // whole model (one node, or a tensor-parallel rank); the shared resolver words the decision (hy4_speculation.hpp).
     namespace hr = strix::hy4::hipbind::rows;
     const bool layer_pair = std::getenv("HY4_RANK") != nullptr;
     strix::hy4::SpeculationRun spec_run;
@@ -715,8 +715,7 @@ int run(int argc, char** argv) {
     std::cout << "decode " << (spec_on ? "speculative (next-token block drafts, verify rows emit the greedy ids)" : "plain steps")
               << " [" << spec_decision.source
               << (spec_decision.enabled && !spec_on ? (gen <= 1U ? ", one id" : ", context holds no verify pass") : "") << "]"
-              << (rows_prompt ? "; prompt as verify rows of " + std::to_string(prompt_vrows) : std::string()) << "
-" << std::flush;
+              << (rows_prompt ? "; prompt as verify rows of " + std::to_string(prompt_vrows) : std::string()) << "\n" << std::flush;
     // Pair default: the shared interleaved stage map with v from the shared planner at this width (strix/pair/stage_map.hpp
     // plan_stages over the measured pair cost; bitwise equal to the two-stage cut, measured faster); --stage-map off, --cut,
     // --pipe-guess or --window-costs keep the two-stage route.
@@ -822,8 +821,7 @@ int run(int argc, char** argv) {
         prompt_ms = std::chrono::duration<double, std::milli>(clock::now() - s0).count();
         std::cout << "prefill tokens=" << prompt.size() << " verify_rows=" << prompt_vrows << " ms=" << std::setprecision(1) << prompt_ms
                   << " tok_s=" << std::setprecision(1) << 1000.0 * static_cast<double>(prompt.size()) / prompt_ms
-                  << " logits_fnv64 " << std::hex << fnv(prompt_logits) << std::dec << " [position-by-position bits]
-";
+                  << " logits_fnv64 " << std::hex << fnv(prompt_logits) << std::dec << " [position-by-position bits]\n";
         p0 = prompt.size() - 1U;
     }
     if (o.prompt_rows != 0U) {  // batched prompt: one call; the last prompt position is printed like a step
@@ -883,8 +881,7 @@ int run(int argc, char** argv) {
         if (tpg) {  // tensor-parallel pair: every verify pass (and draft round with the block on both ranks) on both ranks
             const auto rank = static_cast<std::uint32_t>(tp_rank);
             fwd.enable_tp(rank, {&tpg->link(), &strix::xport::tp_gather::HipPairGather::Link::fn});
-            std::cout << fwd.tp_receipt() << "
-";
+            std::cout << fwd.tp_receipt() << "\n";
             // the round message rides the same gather: [2][kSlot] bytes on the device, stream-ordered after the last pass
             constexpr std::size_t kSlot = 128;
             static_assert(strix::spec::pair_round::kMessageBytes <= kSlot);
@@ -917,12 +914,9 @@ int run(int argc, char** argv) {
             gen_ms = std::chrono::duration<double, std::milli>(clock::now() - s0).count();
             tpg->finish();
             std::cout << "spec follow rounds " << fr.rounds << " passes " << fr.passes << " rows " << fr.rows << " committed " << fr.committed
-                      << " drafts " << fr.drafts << (mtp ? " (block on both ranks, draft ids cross-checked)" : "") << "
-ids (rank 0 emits)
-"
+                      << " drafts " << fr.drafts << (mtp ? " (block on both ranks, draft ids cross-checked)" : "") << "\nids (rank 0 emits)\n"
                       << std::setprecision(1) << "time prompt_ms=" << prompt_ms << " gen_ms=" << gen_ms
-                      << " total_ms=" << std::chrono::duration<double, std::milli>(clock::now() - t0).count() << "
-";
+                      << " total_ms=" << std::chrono::duration<double, std::milli>(clock::now() - t0).count() << "\n";
             return 0;
         }
         hr::SpecOptions so;
@@ -941,16 +935,12 @@ ids (rank 0 emits)
         std::cout << std::setprecision(2) << "; plain step " << step_ms << " ms; block calls " << res.chain_calls << " drafts "
                   << res.chain_drafts << "; wall verify " << std::setprecision(1) << res.verify_ms << " draft " << res.chain_ms << " other "
                   << res.wall_ms - res.verify_ms - res.chain_ms << " ms" << (tpg ? (draft_tp ? " (tp, block tp)" : " (tp, block rank 0)") : "")
-                  << "
-ids";
+                  << "\nids";
         for (const auto id : generated) std::cout << ' ' << id;
-        std::cout << "
-" << std::setprecision(1) << "time prompt_ms=" << prompt_ms << " gen_ms=" << gen_ms
+        std::cout << "\n" << std::setprecision(1) << "time prompt_ms=" << prompt_ms << " gen_ms=" << gen_ms
                   << " total_ms=" << std::chrono::duration<double, std::milli>(clock::now() - t0).count() << " decode_tok_s="
-                  << std::setprecision(2) << (gen_ms > 0 ? 1000.0 * (gen - 1U) / gen_ms : 0.0) << "
-";
-        if (tpg) std::cout << fwd.tp_receipt() << "
-";
+                  << std::setprecision(2) << (gen_ms > 0 ? 1000.0 * (gen - 1U) / gen_ms : 0.0) << "\n";
+        if (tpg) std::cout << fwd.tp_receipt() << "\n";
         return 0;
     }
     for (std::size_t p = p0; p < steps; ++p) {

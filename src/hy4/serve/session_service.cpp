@@ -212,8 +212,7 @@ const char* usage() {
            "  --model-id NAME           model id reported by the API (default hy4-flash)\n"
            "  --profile exact|fast|turbo  tier to resolve for host inspection\n"
            "  --prompt-rows N --head-q8 0|1  explicit profile overrides for inspection\n"
-           "  --no-mtp                  plain decode instead of the exact speculative default (also STRIX_MTP=0)
-"
+           "  --no-mtp                  plain decode instead of the exact speculative default (also STRIX_MTP=0)\n"
            "  --print-effective-config  print the effective values and the serve-only levers, then exit\n";
 }
 
