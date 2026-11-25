@@ -349,6 +349,7 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
     static_cast<void>(mini_attn_projected_bias(tier));
     static_cast<void>(mini_screened_head(tier));
     static_cast<void>(mini_verify_rows(tier));
+    mini_defer_vision_recipe(tier);  // image input only: re-admitted and checked by the image opener
     require_mini_expert_consumer(tier, native_execution);
     static_cast<void>(mini_controller_one_plane(tier));
     static_cast<void>(mini_lowbit_turbo(tier));

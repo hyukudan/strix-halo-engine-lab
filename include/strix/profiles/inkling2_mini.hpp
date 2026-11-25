@@ -7,6 +7,8 @@
 
 #include <array>
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 
 namespace strix::inkling2 {
@@ -157,7 +159,17 @@ inline constexpr std::string_view kMiniScreenedHead = "inkling2-mini-screened-he
 // bitwise the incumbent) makes it a default. Value 2 adds the lanes pick: greedy picks whose scores nobody reads (verify
 // windows, served cohorts whose groups declare no score read) take the lanes form of the EXACT screened head (BF16).
 inline constexpr std::string_view kMiniVerifyRows = "inkling2-mini-verify-rows@1";
-inline constexpr std::array<profile::Lever, 11> kMiniLevers{{
+// Image pre-processing recipe of the one vision adapter (src/inkling2/inkling2_vision.*), resolved here with the other
+// rows by the resolver the CLI and the server share. "legacy" (builtin, image identity inkling2-vision-v1) or "axial@1"
+// (the reference-checked axial recipe, image identity inkling2-vision-axial@1: checkerboard alpha, symmetric
+// normalisation, cell-major patches, leading class row, axial RoPE; it can change the prompt length). Bit-changing and
+// not qualified yet: no column selects it, an explicit STRIX_INKLING2_VISION_RECIPE=axial@1 runs under --profile fast
+// or turbo stamped "unqualified", and every other profile refuses it until a ready column carries the value (the row's
+// own identity evidence, Resolution::explicit_value_qualified). Only the image opener reads it (mini_vision_axial on
+// mini_vision_media_tier); a text-only run never applies it (mini_defer_vision_recipe), and at its builtin the row
+// stays out of the fingerprint and the receipt, so a text-only run resolves as before the row.
+inline constexpr std::string_view kMiniVisionRecipe = "inkling2-vision-recipe";
+inline constexpr std::array<profile::Lever, 12> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
@@ -210,6 +222,11 @@ inline constexpr std::array<profile::Lever, 11> kMiniLevers{{
      .source = "awaits device identity on the landing head (verify score rows, picks and the continuation after a "
                "partial commit bitwise the per-row incumbent, BF16 and Q8_0 heads); HIP only",
      .omit_builtin_fingerprint = true},
+    {kMiniVisionRecipe, "STRIX_INKLING2_VISION_RECIPE", "", {}, "legacy", profile::Kind::bit_changing,
+     {}, {false, true, false, true}, "axial@1", "legacy",
+     "awaits the real-checkpoint reference gate (patches, hidden and projected rows) and CLI image identity on HIP "
+     "and CUDA",
+     false, {}, true},
     spec::kBlockDraftLever,
 }};
 
@@ -217,5 +234,50 @@ inline constexpr std::array<profile::Lever, 11> kMiniLevers{{
 inline constexpr profile::Engine kMiniProfile{
     "inkling2-mini", "", kMiniLevers, false, "inkling2-mini-turbo-v1",
 };
+
+// The image recipe applies only to a request with image input. The text resolution (resolve_mini_profile, shared by
+// the CLI and the server) holds an explicit setting of the row as `requested`, effective builtin, status off, so a
+// text-only run starts, summarises, qualifies and fingerprints as with the row unset (nothing is validated there).
+// The image opener re-admits it with mini_vision_media_tier when a request carries images.
+inline constexpr std::string_view kMiniVisionRecipeDeferred = "image input only: applied when a request carries images";
+inline void mini_defer_vision_recipe(profile::Resolution& tier) {
+    for (auto& entry : tier.entries) {
+        if (entry.lever == nullptr || entry.lever->name != kMiniVisionRecipe) continue;
+        const bool explicit_setting =
+            entry.status == profile::Status::explicit_env || entry.status == profile::Status::explicit_cli;
+        if (!explicit_setting && entry.value == entry.lever->builtin) continue;
+        entry.requested = entry.value;
+        entry.value = std::string(entry.lever->builtin);
+        entry.status = profile::Status::off;
+        entry.reason = std::string(kMiniVisionRecipeDeferred);
+    }
+}
+// The resolution an image request runs: `tier` with a deferred image recipe re-admitted as the explicit setting it was
+// (the row's one switch is its environment variable); mini_vision_axial then admits or refuses it.
+inline profile::Resolution mini_vision_media_tier(profile::Resolution tier) {
+    for (auto& entry : tier.entries) {
+        if (entry.lever == nullptr || entry.lever->name != kMiniVisionRecipe) continue;
+        if (entry.status != profile::Status::off || entry.reason != kMiniVisionRecipeDeferred) continue;
+        entry.value = entry.requested;
+        entry.status = profile::Status::explicit_env;
+        entry.reason.clear();
+    }
+    return tier;
+}
+
+// The image recipe of a resolved run: true selects axial@1. A value the row does not qualify is admitted only under
+// --profile fast or turbo; anything but legacy / axial@1 is refused. The one reader of the row (the image opener, on
+// mini_vision_media_tier).
+inline bool mini_vision_axial(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniVisionRecipe);
+    if (entry == nullptr || entry->value == "legacy") return false;
+    if (entry->value != "axial@1")
+        throw std::invalid_argument("STRIX_INKLING2_VISION_RECIPE must be legacy or axial@1");
+    if (!profile::Resolution::explicit_value_qualified(*entry) && tier.profile != profile::Name::fast &&
+        tier.profile != profile::Name::turbo)
+        throw std::invalid_argument("image recipe axial@1 is an unqualified bit-changing image identity: not admitted "
+                                    "under --profile " + std::string(tier.word()) + " (admitted: fast, turbo)");
+    return true;
+}
 
 }  // namespace strix::inkling2

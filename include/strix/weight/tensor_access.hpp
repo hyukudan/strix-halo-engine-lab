@@ -36,6 +36,7 @@ Status validate_tensor_schema(const TensorIndex&, const TensorSchema&, TensorSch
 class TensorLookup {
 public:
     Status open_safetensors(const std::string& path, const TensorSchema&);
+    Status open_safetensors(std::shared_ptr<const Source>, const TensorSchema&);
     Status bind(TensorIndex index, const TensorSchema&);
     [[nodiscard]] const RawTensor* find(std::string_view name) const;
 

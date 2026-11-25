@@ -1,9 +1,13 @@
 #include "inkling2/inkling2_mini_resident_route.hpp"
 #include "inkling2/inkling2_mini_weight_options.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <span>
 #include <stdexcept>
+#include <string_view>
+#include <vector>
 #include <utility>
 #include <string>
 
@@ -59,9 +63,10 @@ void test_controller_planes() {
 // The engine resolves the W4A4 row: an unbound table would ignore STRIX_INK_MOE_W4A4 at every prompt length.
 void test_row() {
     require(mini::kMiniProfile.table.size() == mini::kMiniLevers.size(), "Inkling lever table bound to the engine");
-    require(mini::kMiniProfile.table.size() == 11U,
+    require(mini::kMiniProfile.table.size() == 12U,
             "W4A4, down image, prepared round fold, narrow experts, controller planes, projected-bias, served route, "
-            "screened head, calibrated low-bit, verify rows and the block-candidate row");
+            "screened head, calibrated low-bit, verify rows, image recipe and the block-candidate row");
+    require(mini::kMiniLevers[10].name == mini::kMiniVisionRecipe, "image recipe sits before the block-candidate row");
     const auto& lever = mini::kMiniProfile.table.front();
     require(lever.name == mini::kMiniMoeW4a4 && lever.name == "inkling2-mini-moe-w4a4@1", "w4a4 identity");
     require(lever.env == "STRIX_INK_MOE_W4A4" && lever.off == "0" && lever.builtin == "0", "w4a4 off switch");
@@ -325,7 +330,8 @@ void test_projected_bias() {
 // switchable by STRIX_INK_VERIFY_ROWS, refused on a malformed value, and reaching the decoder through the one helper.
 // It is appended after main's rows; the block-candidate row stays last.
 void test_verify_rows() {
-    const auto& row = mini::kMiniLevers[mini::kMiniLevers.size() - 2U];
+    const auto& row = *std::find_if(mini::kMiniLevers.begin(), mini::kMiniLevers.end(),
+                                    [](const auto& lever) { return lever.name == mini::kMiniVerifyRows; });
     require(row.name == mini::kMiniVerifyRows && row.name == "inkling2-mini-verify-rows@1", "verify rows row identity");
     require(mini::kMiniLevers.back().name == strix::spec::kBlockDraftLever.name, "the block-candidate row stays last");
     require(row.env == "STRIX_INK_VERIFY_ROWS" && row.off == "0" && row.builtin == "0" &&
@@ -446,6 +452,56 @@ void test_narrow_experts() {
         refused = true;
     }
     require(refused, "malformed narrow switch must be refused");
+}
+// r65 #1162.1 and the text-only property: with the image recipe unset, every profile resolves to exactly what the
+// table without the row resolves (receipt, notice, qualification, fingerprint), so a text run's identity is unchanged,
+// and so does any explicit setting of the row (r72 #1162 P2-1); an image request re-admits it: axial@1 is refused
+// there under exact and runs, named and stamped unqualified, under fast and turbo.
+void test_vision_recipe_row() {
+    std::vector<profile::Lever> before;
+    for (const auto& lever : mini::kMiniLevers)
+        if (lever.name != mini::kMiniVisionRecipe) before.push_back(lever);
+    require(before.size() + 1U == mini::kMiniLevers.size(), "one image recipe row");
+    profile::Engine without_row = mini::kMiniProfile;
+    without_row.table = before;
+    mini::MiniWeightOptions options;
+    for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
+        options.tier = inputs(tier);
+        const auto with = mini::resolve_mini_profile(options, true);
+        const auto old = profile::resolve(without_row, inputs(tier));
+        require(with.summary() == old.summary() && with.tier_notice() == old.tier_notice() &&
+                    with.qualification() == old.qualification() && with.fingerprint() == old.fingerprint(),
+                "unset image recipe: the text-only resolution is the table's without the row");
+        for (const char* recipe : {"axial@1", "legacy", "axial"}) {
+            options.tier = inputs(tier);
+            options.tier.env = [recipe](const char* key) -> const char* {
+                return std::strcmp(key, "STRIX_INKLING2_VISION_RECIPE") == 0 ? recipe : nullptr;
+            };
+            // The image-only row never reaches a text-only run: startup is not refused and the summary, notice,
+            // qualification and fingerprint are those of the unset row, under every profile and for any value.
+            const auto resolved = mini::resolve_mini_profile(options, true);
+            require(resolved.summary() == with.summary() && resolved.tier_notice() == with.tier_notice() &&
+                        resolved.qualification() == with.qualification() &&
+                        resolved.fingerprint() == with.fingerprint() && !mini::mini_vision_axial(resolved),
+                    "an image recipe setting leaves the text-only resolution unchanged");
+            // An image request re-admits the setting: axial@1 runs (stamped unqualified) only under fast / turbo.
+            bool refused = false;
+            try {
+                const auto media = mini::mini_vision_media_tier(resolved);
+                require(mini::mini_vision_axial(media) == (std::string_view(recipe) == "axial@1"), "recipe value");
+                if (std::string_view(recipe) == "legacy")
+                    require(media.fingerprint() == with.fingerprint(), "explicit legacy keeps the identity");
+                else
+                    require(media.qualification().find("unqualified: inkling2-vision-recipe") != std::string::npos,
+                            "axial is stamped unqualified");
+            } catch (const std::invalid_argument&) {
+                refused = true;
+            }
+            require(refused == (std::string_view(recipe) == "axial" ||
+                                (tier == profile::Name::standard && std::string_view(recipe) == "axial@1")),
+                    "an image request under EXACT refuses only the unqualified axial recipe; a malformed value is refused");
+        }
+    }
 }
 // The screened-head row: an exact lever, opt-in (off by default in every tier, builtin the full head), bound to the
 // engine after main's rows (the block-candidate row stays last), switchable by STRIX_INK_SCREENED_HEAD, refused on a
@@ -634,6 +690,7 @@ void test_served_route() {
 int main() {
     try {
         test_row();
+        test_vision_recipe_row();
         test_served_route();
         test_resolution();
         test_combine_image();

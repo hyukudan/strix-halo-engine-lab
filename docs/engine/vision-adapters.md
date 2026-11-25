@@ -190,6 +190,69 @@ Measured tower time on one node (warm, no per-layer synchronisation): 111 ms for
 image), 388 ms for 3,888, 1,907 ms for 9,216 (the token cap); about 2.1 x, 1.8 x and 1.4 x that with split
 activations. The aligner adds 22 to 83 ms.
 
+## Inkling 2
+
+`src/inkling2/inkling2_vision.{hpp,cpp}`, validator `inkling2::parse_vision_spec` (the checkpoint's `config.json`
+`vision_config`), tensor schema `inkling2::vision_tensor_specs` (the `model.visual.*` tensors of the one safetensors
+file, the language-model tensors as the ignored namespace), host test `inkling2-vision`, gate tool
+`strix-inkling2-vision-gate` (`-hip` with the HIP tower) with the reference dumps of `tools/vision/inkling2_vision_ref.py`.
+Weights come through `LookupWeights`.
+
+Read from the file: 23 blocks, width 1024, 16 heads (head dimension 64), LayerNorm with bias (epsilon 1e-5), q, k, v
+and out linears with bias, GELU (exact) MLP 4096 with bias, LayerScale after attention and after the MLP, a LayerNorm
+of the embedded rows before block 0 (`embed_norm`), no final norm, patch 20 without patch bias, a learned 32 x 32
+position table, a class token with its own position embedding, a 2 x 2 merge into `proj_in` (4096 to 4096) and
+`proj_out` (4096 to 2304), both without bias. Image rows replace the embedding-table lookup for the placeholder
+token 200054 and pass through the language model's `embed_norm` in CPU and device prefill.
+
+The default image identity is `inkling2-vision-v1` under every profile. It uses per-channel normalization, zero RGB
+padding, raster patches, a trailing class row and learned positions. The recipe is the row `inkling2-vision-recipe`
+of the Inkling 2 Mini profile table (`include/strix/profiles/inkling2_mini.hpp`), resolved with the other rows by the
+resolver the CLI and the server share. The row applies only to a request with image input: a text-only run (and the
+HTTP server, which currently accepts text) starts, resolves and fingerprints exactly as with the row unset, whatever
+the setting. For an image request, `STRIX_INKLING2_VISION_RECIPE=axial@1` selects the candidate under
+`--profile fast` or `turbo` only, and every other profile, including `exact`, refuses that request before the tower
+runs until a qualified column carries the value. The candidate has identity `inkling2-vision-axial@1` and can change
+the prompt length above the token cap.
+An image run prints `image identity <id>` on stderr; with the candidate it also prints
+`image profile inkling2-vision-recipe=axial@1 qualification <...>`, which stamps it unqualified.
+
+The reference is the model's own definition (`Inkling2VisionModel`, `Inkling2ImageProcessor` in the transformers
+package, Apache-2.0); `tools/vision/inkling2_vision_ref.py` runs it in FP32 on the checkpoint's vision tensors and
+writes the pixels, the tower output and the image rows per image. The candidate recipe uses the following rules:
+
+| Parameter | Value |
+|---|---|
+| Canvas | no resize; each side padded at the right / bottom to a multiple of 40 (patch x merge) with -1 on the 0-255 scale; one token per 40 x 40 cell. An image over the token limit (default 4096) is scaled down, aspect kept (the reference has no limit) |
+| Normalisation | (v - 127.5) / 127.5 in FP32, padding included |
+| Alpha | blended over a grey 8-pixel checkerboard (204 / 153), `AlphaPolicy::checkerboard` |
+| Patch features | (y, x, channel) order of the 20 x 20 patch |
+| Patch order | cell row, cell column, then dy, dx inside the cell (the four patches of a token are consecutive) |
+| Class token | in front of the patches, attended with them, dropped before the merge |
+| Learned positions | the 32 x 32 table resampled bilinearly with align_corners=False (border taps clamped) |
+| Rotary positions | axial, base 10000, 16 frequencies per axis, width angles then height angles on adjacent channel pairs; patch (y, x) at (y + 1, x + 1), the class token at (0, 0) |
+| Merge | slot-major: feature `slot * 1024 + c`, slot = dy * 2 + dx |
+| Projector activation | GELU (exact, erf) |
+
+Mapping onto the shared tower, without a tower change: the class token is patch row 0 with zero pixels (the patch
+linear has no bias, so its embedding is exactly zero) and the class embedding plus its position embedding as that
+row's position addend (`positions()`); LayerScale is folded into the out and second MLP linears and their biases in
+FP32 (`EncoderWeights::owned`) before a backend builds its panels; q, k and v are concatenated into `qkv`.
+The shared projector receives the leading row offset and the packed-cell order.
+
+### Gate
+
+```
+python3 tools/vision/inkling2_vision_ref.py --checkpoint CHECKPOINT_DIR --out REF IMAGE.png... [synth:WxH[:seed]]
+strix-inkling2-vision-gate --checkpoint CHECKPOINT_DIR --ref REF --backend host NAME...
+strix-inkling2-vision-gate-hip --checkpoint CHECKPOINT_DIR --ref REF --backend hip NAME...
+```
+
+The manual generator requires Linux with procfs and a fresh output directory or unused case names. It refuses
+images whose padded grids exceed 4096 tokens. The standalone tower gate requires exact patches and relative L2
+at most 0.02 by default for both hidden and projected rows. It reports the worst row cosine for each. The CLI
+workload also covers media admission, prompt IDs and language-model logits on CPU, HIP and CUDA.
+
 ## Image rows in the language model prefill
 
 An encoded image reaches the language model as rows of its hidden width that replace the embedding-table rows of
@@ -238,9 +301,9 @@ build-cuda/strix-inkling2-mini-cuda MODEL.safetensors --messages chat.json --gen
 |---|---|
 | Tower | HIP `vision::Encoder` (`vision-f16-v1`), CUDA `vision::CudaEncoder` (`vision-cuda-f32-v1`), CPU `ReferenceEncoder` (`vision-ref-f32`) |
 | Rows in the prompt | projected rows pass `embed_norm` like token rows (`MiniResidentDecoder::prefill_spliced`); text-only prompts are unchanged |
-| Profiles | `--profile exact` and `fast` both take images; the profile changes the language model weights only, not the tower or the splice |
+| Profiles | `--profile exact` and `fast` both take images; with the builtin recipe the profile changes the language model weights only, not the tower or the splice (exception: an explicit candidate recipe, see [Inkling 2](#inkling-2)) |
 | Decode | a prompt with image rows decodes serially (no speculative drafting for that request) |
-| Image size | scaled down, aspect kept, to at most 4096 cells of 40 px (pre-processing constants not yet confirmed against the reference pre-processor) |
+| Image size | scaled down, aspect kept, to at most 4096 cells of 40 px (pre-processing as in the Inkling 2 adapter section above) |
 | Several images | each image part gets its own rows within the context; only single-image prompts have been run on a device |
 | Not supported | video, `http(s)` image URLs, the HTTP server, the two-node pair, image-row caching across runs |
 | Quality | no gate run yet: no image answer of the device is compared with the CPU reference |
