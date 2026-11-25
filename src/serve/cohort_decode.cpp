@@ -726,11 +726,19 @@ void CohortDecoder::step() {
         if (receipt) receipt->publish();  // the model prefix is committed: the selection state follows it
     const double decode_ms = now_ms() - t0;
     decode_ms_ += decode_ms;
-    last_decode_ms_ = decode_ms;
     std::uint32_t total_rows = 0;
     for (const auto& g : groups) total_rows += g.rows;
     rows_ += total_rows;
     observe_cost(total_rows, static_cast<std::uint32_t>(n), decode_ms);
+    // last_decode_ms_ prices the decode round a prompt pass waits beside (the gap bound). A round that carried draft
+    // rows is priced without them (the fitted row cost per draft row): a prompt arriving raises the live lanes and the
+    // next round runs under the by-live draft cap, so a lone lane's long window must not shrink the next prompt's
+    // grant. A round without drafts is recorded as measured, as in a cohort that never drafts.
+    const std::uint32_t draft_rows = total_rows - static_cast<std::uint32_t>(n);
+    last_decode_ms_ = draft_rows == 0U
+        ? decode_ms
+        : std::max(0.0, decode_ms - static_cast<double>(draft_rows) *
+                                        fitted_cost(sums_, config_, static_cast<std::uint32_t>(n)).row_ms);
     planner_.account(prompt_ms, decode_ms, 0.0, prompt_rows);
 
     std::vector<std::pair<Lane*, std::string>> done;
