@@ -48,6 +48,12 @@ struct MiniPreparedCudaBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGq
     }
 };
 
+// The prompt route whose flash projects the relative bias (cuda_core::PreparedBf16Projection): the shared
+// preparation skips the [row][head][distance] image and its producer; the flash computes the same logits.
+struct MiniPreparedCudaProjectedBackend : MiniPreparedCudaBackend {
+    bool relative_bias_in_attention(unsigned) const { return true; }
+};
+
 // The resident decoder's attention backend: the one-plane operand class is declared only where the staged attention
 // weights are certified (finite, ranges kept finite); otherwise the FP32 class (three planes) runs.
 inline MiniPreparedCudaBackend mini_attention_backend(cudaStream_t stream, cuda_core::BigCtx* big_context,

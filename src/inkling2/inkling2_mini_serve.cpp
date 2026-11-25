@@ -67,6 +67,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.experts_nvfp4 = mini_experts_nvfp4(resolution);
     out.combine_image = mini_combine_image(resolution);
     out.served_route_requested = mini_served_cli_route(resolution);
+    out.attn_projected_bias = mini_attn_projected_bias(resolution);
     out.controller_one_plane = mini_controller_one_plane(resolution);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())

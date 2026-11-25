@@ -71,6 +71,14 @@ inline constexpr std::string_view kMiniCombineImage = "inkling2-mini-combine-dow
 // (core::RoundStore::separate). Opt-in: off in every profile column (all cells empty, builtin 0); select it with
 // STRIX_INK_PREPARED_ROUND_FOLD=1 (any profile), through the one resolver the CLI, the gate and the server share.
 inline constexpr std::string_view kMiniPreparedRoundFold = "inkling2-mini-prepared-round-fold@1";
+// Exact lever (opt-in): the CUDA prompt flash projects the relative bias itself (cuda_core::PreparedBf16Projection)
+// instead of reading the [row][head][distance] image the prepare stage produces. Same FP32 FMA chain in feature order,
+// same BF16 round per distance, same failure contract as the image route for every launch it admits (single prompt
+// chunk of two or more rows, host positions, no null-order count). A launch it cannot admit keeps the image route; real
+// errors stay visible. CUDA only (HIP selects its projected route in its own binding). Off in every tier (builtin "0":
+// the image route); an explicit 1 selects it and is a distinct identity until device identity on the landing head
+// makes it a default. Switch: STRIX_INK_ATTN_PROJECTED_BIAS=0/1.
+inline constexpr std::string_view kMiniAttnProjectedBias = "inkling2-mini-attn-projected-bias@1";
 // Served route lever, opt-in: a HIP server runs the command line's route (packed decode unless a flag selects grouped,
 // the whole prompt by the command line's chunks and tail rule, the first id from the final prefill row), so a served
 // lane carries the bits of the same request on the command line at any cohort width. Off in every profile column (all
@@ -80,7 +88,7 @@ inline constexpr std::string_view kMiniPreparedRoundFold = "inkling2-mini-prepar
 inline constexpr std::string_view kMiniServedCliRoute = "inkling2-mini-served-cli-route@1";
 // Draft CUDA controller schedule. One plane requires explicit selection and a resident weight certificate.
 inline constexpr std::string_view kMiniControllerPlanes = "inkling2-mini-controller-planes@1";
-inline constexpr std::array<profile::Lever, 7> kMiniLevers{{
+inline constexpr std::array<profile::Lever, 8> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
@@ -104,13 +112,17 @@ inline constexpr std::array<profile::Lever, 7> kMiniLevers{{
     {kMiniControllerPlanes, "STRIX_INK_CONTROLLER_PLANES", "--controller-planes", {}, "3", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "3", "awaits CUDA device identity and model qualification",
      true, {}, true},
+    {kMiniAttnProjectedBias, "STRIX_INK_ATTN_PROJECTED_BIAS", "", {}, "0", profile::Kind::exact,
+     {}, {true, true, true, true}, "1", "0",
+     "awaits device identity on the landing head (logits, ids and state bitwise the image route) before any default",
+     false, {}, true},
     // Appended after main's rows (main's row positions unchanged); the block-candidate row stays last.
     {.name = kMiniServedCliRoute, .env = "STRIX_INK_SERVED_CLI_ROUTE", .option = "",
      .value = {"", "", "", ""}, .builtin = "0",
      .kind = profile::Kind::bit_changing, .ready = {false, false, false, false},
      .runnable = {true, true, true, true}, .target = "", .off = "0",
      .source = "waits for the served migration identity (served lanes against the incumbent served route); device "
-               "evidence so far: served lanes == the command line's lone decode at cohort widths 2..17",
+               "evidence so far: served cohort lanes == the same served decoder's lone lane at cohort widths 2..17",
      .omit_builtin_fingerprint = true},
     spec::kBlockDraftLever,
 }};

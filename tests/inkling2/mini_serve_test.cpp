@@ -291,15 +291,15 @@ void socket_startup(const sv::ServiceFactory& factory, const char* backend, bool
 
 using W4a4 = strix::moe_core::grouped_w4a4::Activations;
 
-// The served W4A4 lever value (process environment, as strix-serve reads it); nullptr clears it.
-void set_w4a4_env(const char* value) {
+// One lever switch of the served process environment, as strix-serve reads it; nullptr clears it.
+void set_env(const char* name, const char* value) {
 #ifdef _WIN32
-    require(_putenv_s("STRIX_INK_MOE_W4A4", value ? value : "") == 0, "cannot set STRIX_INK_MOE_W4A4");
+    require(_putenv_s(name, value ? value : "") == 0, "cannot set a lever switch");
 #else
-    require((value ? setenv("STRIX_INK_MOE_W4A4", value, 1) : unsetenv("STRIX_INK_MOE_W4A4")) == 0,
-            "cannot set STRIX_INK_MOE_W4A4");
+    require((value ? setenv(name, value, 1) : unsetenv(name)) == 0, "cannot set a lever switch");
 #endif
 }
+void set_w4a4_env(const char* value) { set_env("STRIX_INK_MOE_W4A4", value); }
 
 // The prepared-attention round fold switch of the served process (off unless 1 selects it, in any profile).
 void set_round_fold_env(const char* value) {
@@ -442,7 +442,8 @@ strix::profile::Name served_native_tier(std::string_view tier_name) {
 
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
             W4a4 w4a4 = W4a4::bf16, std::string_view tier_name = "fast", bool image = false, bool round_fold = false,
-            bool cli_route = false, ServedShape shape = {}, bool controller_one_plane = false) {
+            bool cli_route = false, ServedShape shape = {}, bool controller_one_plane = false,
+            bool projected_bias = false) {
     sv::ServiceFactories factories;
     bool created = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
@@ -524,6 +525,8 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                     options.prepared_round_fold == mini::mini_prepared_round_fold(cli_tier) &&
                     options.weight_options.qualify_q8 == qualify_q8,
                 "served profile differs from the native command line's resolution of the same --profile");
+        // The projected-bias attention lever resolves in the one shared resolver the CLI also reads.
+        require(options.attn_projected_bias == projected_bias, "projected-bias lever did not reach native adapter");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
         const strix::weight::WeightLoadScope scope{kind, {}, {}, {}, {}, {}};
         const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope,
@@ -772,6 +775,15 @@ int main(int argc, char** argv) try {
     set_cli_route_env("0");
     wiring(argv[1], "hip", false);
     set_cli_route_env(nullptr);
+    // The projected-bias lever per tier (opt-in): unset and 0 keep the image route, 1 selects the projected flash;
+    // tests/inkling2/mini_gate_cli_test.cpp pins the same table through the CLI.
+    for (const auto* tier : {"exact", "fast", "turbo"}) {
+        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
+            set_env("STRIX_INK_ATTN_PROJECTED_BIAS", value);
+            wiring(argv[1], "cuda", false, false, W4a4::bf16, tier, false, false, false, {}, false, expected);
+        }
+    }
+    set_env("STRIX_INK_ATTN_PROJECTED_BIAS", nullptr);
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
