@@ -170,7 +170,7 @@ private:
             transform(std::size_t{kOutputVocabulary} * (rank + 1U),
                 Fold{head, weight, bias, folded_.data(), bias_.data(), kHiddenWidth, rank});
         };
-        if (target_.weights_.compact_head_bound()) {
+        if (target_.weights_.compact_head_bound() && !target_.weights_.bf16_bound()) {
             const auto& head = target_.weights_.compact_head();
             const auto stride = static_cast<std::size_t>(head.row_bytes);
             if (head.storage == weight::kQ4G64WeightStorage)

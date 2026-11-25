@@ -40,13 +40,12 @@ inline constexpr std::span<const weight::WeightLoadDecision> kMiniWeightLoadDeci
 // head row passed every class and the pooled bars but failed dNLL on two prose windows, so FAST keeps the BF16 image
 // and the q4 head is part of the TURBO mix only.
 inline constexpr weight::WeightLoadPolicy kMiniFastWeightPolicy = weight::kHeadQ4Policy;
-// TURBO weight mix (data): the shared low-bit policy --profile turbo resolves when no explicit arm is named. It loads
-// only through a TURBO row of kMiniWeightLoadDecisions (measured gain, quality against BF16 stated in the row);
-// without one TURBO keeps the BF16 image.
+// The explicit TURBO lever can admit this mix through a matching low-bit decision row.
+inline constexpr std::string_view kMiniLowBitTurbo = "inkling2-mini-lowbit-turbo@1";
+inline constexpr std::string_view kMiniLowBitPackFile = "inkling2-mini-q4.lowbit-pack";
 inline constexpr weight::WeightLoadPolicy kMiniTurboWeightPolicy = weight::kAttentionHeadQ4Policy;
-// The regime of these rows: decode steps (one row per lane, and the rows of a verify step), CLI and server alike. A
-// load that takes a row keeps the BF16 image resident and adds the low-bit copies of the row's roles; prompt-prefill
-// chunks, and steps wider than the row's band (evidence max_rows), read the BF16 image.
+// The row covers decode steps only. The low-bit copies are resident beside the BF16 image used for
+// prefill, verify and decode widths outside the receipt.
 inline constexpr std::string_view kMiniWeightRegime = weight::kDecodeRegime;
 
 // The calibrated pack the TURBO row was measured with (strix-lowbit-calib-pack, technique both, damp 0.1, q4 for the
@@ -68,15 +67,10 @@ inline constexpr weight::Digest256 kMiniCheckpoint =
 inline constexpr std::uint32_t kMiniLowBitStepBand = 16U;
 inline constexpr weight::WeightLoadExtent kMiniLowBitMeasuredExtent{16384U, 16U};
 
-// The served receipt measured these decode widths at this configured capacity. A receipt for one
-// width does not establish a gain for the other widths, or for a verify or prefill call.
+// The receipt measured these active decode widths. Configured context and lanes must also be known
+// and within the row's evidence caps.
 inline constexpr bool mini_lowbit_receipt_width(std::uint32_t rows) noexcept {
     return rows == 1U || rows == 8U || rows == kMiniLowBitStepBand;
-}
-
-inline constexpr bool mini_lowbit_decode_receipt(weight::WeightLoadExtent extent, std::uint32_t rows) noexcept {
-    return extent.context == kMiniLowBitMeasuredExtent.context && extent.lanes == kMiniLowBitMeasuredExtent.lanes &&
-           mini_lowbit_receipt_width(rows);
 }
 
 inline constexpr std::array<weight::WeightLoadDecision, 1> kMiniWeightLoadDecisionRows{{
@@ -84,7 +78,8 @@ inline constexpr std::array<weight::WeightLoadDecision, 1> kMiniWeightLoadDecisi
      {weight::Backend::hip, "gfx1151", "hip-clang-24.0", kMiniWeightRegime, kMiniLowBitBuild, kMiniCheckpoint},
      {},
      weight::digest_from_hex("54182047338baf7005882cf2062d334aea4b8bb662d6cb484f1ccfce6926508b"),
-     {"docs/engine/lowbit-calibration.md", "2026-11-24", 2457, 16384U, 16U, kMiniLowBitStepBand},
+     {"docs/engine/lowbit-calibration.md", "2026-11-24", 2457, kMiniLowBitMeasuredExtent.context,
+      kMiniLowBitMeasuredExtent.lanes, kMiniLowBitStepBand},
      "vs BF16 decode (bf16 prefill, q4 decode) kl=0.0033 top1=0.980 dnll=+0.0027 flips=0.00x windows_failed=0/39 "
      "pack=b0bd0103dcdd9ffd"},
 }};
@@ -143,7 +138,7 @@ inline constexpr std::string_view kMiniAttnProjectedBias = "inkling2-mini-attn-p
 inline constexpr std::string_view kMiniServedCliRoute = "inkling2-mini-served-cli-route@1";
 // Draft CUDA controller schedule. One plane requires explicit selection and a resident weight certificate.
 inline constexpr std::string_view kMiniControllerPlanes = "inkling2-mini-controller-planes@1";
-inline constexpr std::array<profile::Lever, 8> kMiniLevers{{
+inline constexpr std::array<profile::Lever, 9> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
@@ -171,7 +166,6 @@ inline constexpr std::array<profile::Lever, 8> kMiniLevers{{
      {}, {true, true, true, true}, "1", "0",
      "awaits device identity on the landing head (logits, ids and state bitwise the image route) before any default",
      false, {}, true},
-    // Appended after main's rows (main's row positions unchanged); the block-candidate row stays last.
     {.name = kMiniServedCliRoute, .env = "STRIX_INK_SERVED_CLI_ROUTE", .option = "",
      .value = {"", "", "", ""}, .builtin = "0",
      .kind = profile::Kind::bit_changing, .ready = {false, false, false, false},
@@ -180,6 +174,11 @@ inline constexpr std::array<profile::Lever, 8> kMiniLevers{{
                "evidence so far: served cohort lanes == the same served decoder's lone lane at cohort widths 2..17",
      .omit_builtin_fingerprint = true},
     spec::kBlockDraftLever,
+    {.name = kMiniLowBitTurbo, .env = "STRIX_INK_LOWBIT_TURBO", .option = "",
+     .value = {"", "", "", ""}, .builtin = "0", .kind = profile::Kind::bit_changing,
+     .ready = {}, .runnable = {false, false, false, true}, .target = "1", .off = "0",
+     .source = "docs/engine/lowbit-calibration.md (calibrated HIP decode at widths 1, 8 and 16)",
+     .omit_builtin_fingerprint = true},
 }};
 
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.

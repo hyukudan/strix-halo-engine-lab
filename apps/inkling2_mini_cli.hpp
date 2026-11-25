@@ -86,6 +86,7 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
                  generation.sampling_requested))
         throw std::invalid_argument("gate mode takes no prompt, --tokenize, --generate, --logits or sampling options");
     options.tier = resolve_mini_profile(options.weights, native && !generation.tokenize_file);
+    options.weights.lowbit_turbo = mini_lowbit_turbo(options.tier);
     mini_cli_decline_served_route(options.tier);
     if (options.gate_order_null && (!gate || options.tier.profile != profile::Name::standard))
         throw std::invalid_argument("--gate-order-null requires an exact gate arm");

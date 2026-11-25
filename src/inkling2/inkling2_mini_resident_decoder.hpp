@@ -32,7 +32,6 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
-#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -212,8 +211,9 @@ public:
     }
 
     // Served prompt route (serve::FixedKvCohort reads it once, at its construction): emits-first (prefill_slot_first)
-    // where the decoder was built with the served route lever and the backend admits it (HIP), else the incumbent
-    // held-back route (prefill_slot). CUDA declines: not qualified there.
+    // where the decoder was built with the served route lever and the backend admits it (HIP), or while a W4A4 expert
+    // class is bound (the final prompt token is then a prefill row on both entry points, so a served lane quantises
+    // exactly the prompt rows of the command line); else the incumbent held-back route (prefill_slot).
     [[nodiscard]] bool prefill_emits_first() const noexcept { return served_cli_route_ || backend_.moe_w4a4_bound(); }
     // The decode expert form this decoder was built with (packed or grouped), for receipts and fixtures.
     [[nodiscard]] bool packed_decode() const noexcept { return backend_.packed_decode(); }
@@ -241,7 +241,7 @@ public:
         last_logit_rows_ = 0U;
         const auto token = state.append_sequence(ids, [&](std::span<const unsigned> chunk, bool last) {
             return append(state, chunk, last, {});
-        }, prefill_rows_, call_tail_rows(ids.size()));
+        }, prefill_rows_, served_cli_route_ ? call_tail_rows(ids.size()) : tail_rows_);
         last_logit_rows_ = 1U;
         return token;
     }
@@ -320,7 +320,7 @@ public:
         const auto kind = rows <= kMaxVerifyRows ? MiniAppendKind::verify : MiniAppendKind::decode;
         MiniResidentForward forward(backend_, workspace());
         forward.append_batch(groups_, rows, embeddings, hidden, [&] {
-            embed(ids, embeddings, rows, kind);
+            embed(ids, embeddings, rows, kind, rows);
         }, [&](MiniConstRows output) {
             for (unsigned row = 0; row < rows; ++row)
                 project_head(output.data() + std::size_t{row} * kHiddenWidth,
@@ -377,7 +377,7 @@ public:
             MiniResidentForward forward(backend_, workspace());
             forward.append_batch(std::span<const MiniResidentAppendGroup>(groups_).subspan(first, rows), rows,
                                  embeddings, hidden, [&] {
-                embed(pass_ids, embeddings, rows, kind);
+                embed(pass_ids, embeddings, rows, kind, lanes);
             }, [&](MiniConstRows output) {
                 project_head_rows(output.data(), rows, scores.first(std::size_t{rows} * kLogitPitch));
                 greedy_.enqueue_rows(logits, rows, kLogitPitch, stream_.get());
@@ -658,12 +658,13 @@ private:
         return selected;
     }
 
-    void embed(std::span<const unsigned> ids, MiniMutableRows output, unsigned rows, MiniAppendKind kind) {
+    void embed(std::span<const unsigned> ids, MiniMutableRows output, unsigned rows, MiniAppendKind kind,
+               unsigned decode_cohort_width = 0U) {
         const auto table = weights_.bf16("embed.weight");
         const auto gain = weights_.bf16("embed_norm.weight");
         // During a step-graph capture the token comes from the device descriptor.
         const auto* step = backend_.capture_descriptor();
-        backend_.start_chunk(rows, kind);
+        backend_.start_chunk(rows, kind, decode_cohort_width);
 #if defined(__HIPCC__)
         if (step) {
             core::enqueue_hip_bf16_embedding_device_row(table, kVocabulary, kHiddenWidth, &step->token,
@@ -806,7 +807,7 @@ private:
         if (weights_.compact_head_bound() && backend_.lowbit_chunk() && rows > 1U) {
             backend_.check(core::enqueue_resident_q8_softcap_head_rows(
                 weights_.compact_head(), kOutputVocabulary, static_cast<unsigned>(kLogitPitch), input, rows,
-                scores.first(std::size_t{rows} * kLogitPitch), kLogitSoftcap, stream_.get()));
+                scores.first(std::size_t{rows} * kLogitPitch), kLogitSoftcap, stream_.get(), kMiniLowBitArithmetic));
             return;
         }
         if (rows > 1U) {
@@ -833,10 +834,14 @@ private:
             const auto& head = weights_.compact_head();
             if (softcap)
                 backend_.check(core::enqueue_resident_q8_softcap_head(head, kOutputVocabulary, input, 1U,
-                                                                     row_scores, kLogitSoftcap, stream));
+                                                                     row_scores, kLogitSoftcap, stream, kMiniLowBitArithmetic));
             else
                 backend_.check(core::enqueue_resident_q8_rows(head, kOutputVocabulary, input, rows,
-                                                             row_scores.data(), stream));
+                                                             row_scores.data(), stream
+#if !defined(__HIPCC__)
+                                                             , nullptr
+#endif
+                                                             , kMiniLowBitArithmetic));
             return;
         }
         const auto matrix = weights_.bf16("unembed.weight");

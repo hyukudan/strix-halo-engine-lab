@@ -47,6 +47,7 @@ public:
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
                    load.verify_rows, dspark != nullptr, 1U, load.prefill_tail, narrow_experts, controller_one_plane, false, lowbit),
           projected_bias_(attn_projected_bias) {
+        require_mini_calibrated_cli_slot(lowbit, decoder_.slot_bytes());
         const auto levers = configure_mini_decoder(decoder_, moe_w4a4, combine_image, prepared_round_fold, attn_projected_bias);
         std::cerr << "Inkling down_image " << mini_down_image_name(levers.down_image, combine_image) << '\n';
         std::cerr << "Inkling prepared_round_fold " << mini_round_fold_name(levers.prepared_round_fold, prepared_round_fold)
@@ -142,12 +143,14 @@ inline void run_gate(const char* checkpoint, const Options& options, std::span<c
     const auto prefix_positions = mode == session::HeadGateMode::decode ? positions - options.gate_rows : positions;
     const auto max_rows = std::min(options.generation.prefill_chunk, prefix_positions);
     const auto load_start = session::CliClock::now();
-    auto resident = load_mini_weights(weights, options.tier.profile, options.weights, scope, extent,
+    auto resident = load_mini_weights(checkpoint, weights, options.tier.profile, options.weights, scope, extent,
                                      [&](MiniLowBitRows lowbit) {
-        return std::make_unique<MiniResidentDecoder>(checkpoint, positions, max_rows, options.generation.packed_decode,
+        auto decoder = std::make_unique<MiniResidentDecoder>(checkpoint, positions, max_rows, options.generation.packed_decode,
             options.step_graphs.value_or(MiniResidentBackend::default_step_graphs), weights.roles(),
             0U, false, 1U, 0U, mini_experts_nvfp4(options.tier),
-            mini_controller_one_plane(options.tier), false, std::move(lowbit));
+            mini_controller_one_plane(options.tier), false, lowbit);
+        require_mini_calibrated_cli_slot(lowbit, decoder->slot_bytes());
+        return decoder;
     });
     auto& decoder = *resident;
     cli::write_weight_load_plan(std::cerr, weights);
@@ -358,7 +361,7 @@ int main(int argc, char** argv) {
                        projected_bias = mini_attn_projected_bias(options.tier)](const serve::SerialGenerationLoad& load) {
             const strix::weight::WeightLoadExtent extent{load.positions, 1U};
             loaded = resolve_weights(extent);
-            return load_mini_weights(loaded->plan, options.tier.profile, options.weights, loaded->scope.view(),
+            return load_mini_weights(load.checkpoint, loaded->plan, options.tier.profile, options.weights, loaded->scope.view(),
                                      extent, [&](MiniLowBitRows lowbit) {
                 return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, loaded->plan.roles(), dspark,
                     moe_w4a4, combine_image, round_fold, narrow, controller_one_plane, projected_bias, std::move(lowbit));

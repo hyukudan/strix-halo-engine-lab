@@ -416,6 +416,29 @@ void profile_parity() {
         }
     }
     set_expert_env(nullptr);
+    set_w4a4_env(nullptr);
+    selection.arguments[3] = "hip";
+    for (const auto* tier : {"exact", "fast", "turbo"}) {
+        selection.arguments.back() = tier;
+        for (const auto* value : {static_cast<const char*>(nullptr), "0", "1"}) {
+            set_env("STRIX_INK_LOWBIT_TURBO", value);
+            loaded.reset();
+            const auto cli = parse_cli(tier, "hip");
+            const auto service = factory->create(selection);
+            const bool expected = std::string_view(tier) == "turbo" && value && std::string_view(value) == "1";
+            require(service && loaded && cli.weights.lowbit_turbo == expected &&
+                        loaded->weight_options.lowbit_turbo == expected,
+                    "CLI and server require the same explicit TURBO weight lever");
+        }
+    }
+    set_env("STRIX_INK_LOWBIT_TURBO", nullptr);
+    selection.arguments.back() = "fast";
+    selection.arguments.emplace_back("--qualify-q8");
+    std::ostringstream receipt;
+    factory->inspect(selection, receipt);
+    require(receipt.str().find("weight_storage gguf.q8_0@1 weight_status unqualified") != std::string::npos,
+            "inspect keeps the incumbent device-independent Q8 qualification receipt");
+    selection.arguments.pop_back();
     set_w4a4_env("mse");
     selection.arguments[3] = "hip";
     selection.arguments.back() = "fast";

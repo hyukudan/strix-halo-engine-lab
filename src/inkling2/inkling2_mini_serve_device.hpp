@@ -24,7 +24,7 @@ inline MiniServeCohort make_mini_device_cohort(
     const auto rows = std::min(mini_serve_lane_rows(opt), row_limit);
     // The instance's extent for the weight rows: its configured context and its slot cap (0 = left to the memory
     // budget: lane-banded gains do not select).
-    const weight::WeightLoadExtent extent{opt.context, opt.slots};
+    const weight::WeightLoadExtent extent{opt.context, opt.slots ? rows : 0U};
     const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, opt.weight_options, extent);
     auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view(), extent);
     if (!(scope.checkpoint == weight::Digest256{})) std::cerr << weight::weight_load_scope_receipt(scope.view()) << '\n';
@@ -34,7 +34,7 @@ inline MiniServeCohort make_mini_device_cohort(
 #if !defined(__HIPCC__)
     exec::CohortProgramPolicy programs;
 #endif
-    auto cohort = load_mini_weights(weights, opt.tier, opt.weight_options, scope.view(), extent, [&](MiniLowBitRows lowbit) {
+    auto cohort = load_mini_weights(opt.checkpoint, weights, opt.tier, opt.weight_options, scope.view(), extent, [&](MiniLowBitRows lowbit) {
         const bool calibrated = lowbit.admitted != nullptr;
         // The served route is admitted before constructing the decoder. The same load transaction
         // checks capacity and allocates the slots before publishing the cohort.
@@ -44,12 +44,8 @@ inline MiniServeCohort make_mini_device_cohort(
             opt.experts_nvfp4, opt.controller_one_plane, opt.served_cli_route, std::move(lowbit));
         levers = configure_mini_decoder(*decoder, opt.moe_w4a4, opt.combine_image, opt.prepared_round_fold,
                                         opt.attn_projected_bias);
-        const auto memory = mini_gpu::memory_info();
         slot_bytes = decoder->slot_bytes();
-        lanes = serve::resident_kv_slots(memory.free, memory.total, budget.device_bytes, opt.kv_bytes, slot_bytes, rows);
-        if (!lanes) throw std::runtime_error("Inkling KV budget holds no session slots");
-        if (calibrated && lanes < rows)
-            throw std::runtime_error("calibrated image cannot retain the requested slot capacity");
+        lanes = mini_device_weight_slots(budget.device_bytes, opt.kv_bytes, slot_bytes, rows, calibrated);
 #if !defined(__HIPCC__)
         programs = decoder->cohort_programs();
 #endif

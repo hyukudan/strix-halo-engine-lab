@@ -12,11 +12,10 @@ vocabulary=200058
 # A low-bit candidate pins its calibrated pack: STRIX_LOWBIT_PACK = the pack file (required; every case of CAND and CANDF
 # must load that one file, its engine receipt must name a calibrated identity). "qual" writes OUT/qual-MODE.receipt:
 # the reducer source digest and command, the pack digest and the reducer output; a decision row cites that file.
-# STRIX_INKLING_GATE_ROUTE = row (default for a low-bit candidate) scores the production route of the tier's decision
-# row: no qualification arm, the BF16 image consumes the teacher prefix (prompt prefill) and the low-bit copies run the
-# decode steps, so only decode mode applies; every candidate process must report that two-image route and the full
-# identity of the pack it opened. = arm scores the explicit qualification arm (--qualify-weights: one low-bit image in
-# every chunk, prefix included).
+# STRIX_INKLING_GATE_ROUTE=row scores the admitted TURBO row with STRIX_INK_LOWBIT_TURBO=1 on a decode manifest
+# within its receipt caps. decode-arm (the low-bit default) uses --qualify-decode-weights to collect evidence on
+# BF16 prefill plus compact decode without a decision row. arm uses --qualify-weights (one image for all chunks).
+# Each candidate process must report its route and the full identity of the opened pack.
 weight_policy=${STRIX_INKLING_GATE_WEIGHTS:-weights.attention_head.q8_0@1}
 default_policy=weights.attention_head.q8_0@1  # the policy the BF16 arms resolve under (no qualification arm)
 legacy_policy=inkling2-mini-attention-head-bf16-q8_0@1
@@ -25,11 +24,11 @@ cand_storage=${STRIX_INKLING_GATE_STORAGE:-gguf.q8_0@1}
 case "$cand_tier" in fast|turbo) ;; *) echo "STRIX_INKLING_GATE_TIER must be fast or turbo" >&2; exit 2 ;; esac
 lowbit_candidate=0
 [[ $weight_policy == *q4_g64* || $weight_policy == *q6_g64* ]] && lowbit_candidate=1
-cand_route=${STRIX_INKLING_GATE_ROUTE:-$([[ $lowbit_candidate == 1 ]] && echo row || echo arm)}
+cand_route=${STRIX_INKLING_GATE_ROUTE:-$([[ $lowbit_candidate == 1 ]] && echo decode-arm || echo arm)}
 case "$cand_route" in
     arm) ;;
-    row) [[ $lowbit_candidate == 1 ]] || { echo "STRIX_INKLING_GATE_ROUTE=row needs a low-bit candidate policy" >&2; exit 2; } ;;
-    *) echo "STRIX_INKLING_GATE_ROUTE must be row or arm" >&2; exit 2 ;;
+    row|decode-arm) [[ $lowbit_candidate == 1 ]] || { echo "$cand_route needs a low-bit candidate policy" >&2; exit 2; } ;;
+    *) echo "STRIX_INKLING_GATE_ROUTE must be row, decode-arm or arm" >&2; exit 2 ;;
 esac
 
 usage() {
@@ -179,7 +178,7 @@ case "$action" in
         weight_args=(--no-weight-q8)
         for option in "$@"; do
             case "$option" in
-                --case|--profile|--qualify-q8|--qualify-weights|--no-weight-q8|--gate-*) fail "the gate kit controls $option" ;;
+                --case|--profile|--qualify-q8|--qualify-weights|--qualify-decode-weights|--no-weight-q8|--gate-*) fail "the gate kit controls $option" ;;
             esac
         done
         case "$arm" in
@@ -190,12 +189,18 @@ case "$action" in
         case "$arm" in
             CAND|CANDF)
                 tier=$cand_tier
-                if [[ $cand_route == row ]]; then
-                    [[ $mode == decode ]] || fail "the $cand_tier decision row runs decode steps only: score it in decode mode"
-                    weight_args=()  # the production route of the tier's decision row
-                else
-                    weight_args=(--qualify-weights "$weight_policy")
-                fi
+                case "$cand_route" in
+                    row)
+                        [[ $mode == decode && $tier == turbo && ${STRIX_INK_LOWBIT_TURBO:-0} == 1 ]] ||
+                            fail "row requires decode mode, the turbo tier and STRIX_INK_LOWBIT_TURBO=1"
+                        weight_args=()
+                        ;;
+                    decode-arm)
+                        [[ $mode == decode ]] || fail "decode-arm requires decode mode"
+                        weight_args=(--qualify-decode-weights "$weight_policy")
+                        ;;
+                    arm) weight_args=(--qualify-weights "$weight_policy") ;;
+                esac
                 ;;
         esac
         pack_line=
@@ -235,7 +240,7 @@ case "$action" in
             # The pack this process opened (full identity) and the route it admitted: the decision row keeps the BF16
             # image for the prompt prefill and runs the low-bit copies in decode steps; the arm runs one image.
             route_re='$'
-            [[ $cand_route == row ]] && route_re=' image bf16\+lowbit decode band [0-9]+ rows \(prefill bf16\)$'
+            [[ $cand_route != arm ]] && route_re=' image bf16\+lowbit decode widths 1,8,16 \(prefill bf16\)$'
             opened=$(grep -E "^strix-lowbit-pack/v2 calibrated identity [0-9a-f]{64} matrices [0-9]+/[0-9]+$route_re" \
                 "$process_log" | sort -u)
             [[ -n $opened && $(printf '%s\n' "$opened" | wc -l) == 1 ]] ||

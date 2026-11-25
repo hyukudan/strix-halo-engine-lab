@@ -62,6 +62,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     }
     const auto resolution = resolve_mini_profile(out.weight_options, true);
     out.tier = resolution.profile;
+    out.weight_options.lowbit_turbo = mini_lowbit_turbo(resolution);
     out.prepared_round_fold = mini_prepared_round_fold(resolution);
     out.experts_nvfp4 = mini_experts_nvfp4(resolution);
     out.combine_image = mini_combine_image(resolution);
@@ -231,7 +232,8 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             const auto of_backend = [backend](const weight::WeightLoadDecision& row) { return row.scope.backend == backend; };
             const weight::WeightLoadExtent extent{opt.context, opt.slots};
             const bool device_dependent = opt.tier != profile::Name::standard && !opt.weight_options.disable_q8 &&
-                (opt.weight_options.qualify != nullptr ||
+                ((opt.weight_options.qualify != nullptr && !opt.weight_options.qualify_q8) ||
+                 mini_may_load_lowbit_row(opt.tier, opt.weight_options, backend, extent) ||
                  std::ranges::any_of(kMiniWeightLoadDecisions, [&](const weight::WeightLoadDecision& row) {
                      return of_backend(row) && weight::weight_load_gain_selects(row, extent);
                  }));

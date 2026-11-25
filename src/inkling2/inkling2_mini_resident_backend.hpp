@@ -86,13 +86,14 @@ struct MiniResidentGqaBackend : Base {
 #if !defined(__HIPCC__)
                     , this->big_context
 #endif
-                );
+                    , kMiniLowBitArithmetic);
             },
             [&](std::span<const MiniAttentionLinear> group) {
                 return Base::linear_admitted(input, width, rows, group);
             },
             [&](std::span<const core::ResidentRowProjection> group) {
-                return core::resident_q8_projections_admitted<MiniProjectionWeights::role_count>(input, width, rows, group);
+                return core::resident_q8_projections_admitted<MiniProjectionWeights::role_count>(
+                    input, width, rows, group, kMiniLowBitArithmetic);
             });
     }
 
@@ -257,7 +258,9 @@ public:
         calibration_window_.reset();
     }
     void set_calibration_window(std::optional<std::size_t> window) { calibration_window_ = window; }
-    [[nodiscard]] weight::calib::MomentSet* calibration_moments() const noexcept { return calibration_; }
+    [[nodiscard]] weight::calib::MomentSet* calibration_moments() const noexcept {
+        return calibration_window_ ? calibration_ : nullptr;
+    }
     void capture_calibration(const float* rows_device, std::size_t rows, std::span<weight::calib::InputMoments* const> targets) {
         if (!calibration_ || !calibration_window_ || targets.empty() || rows == 0U) return;
         const std::size_t width = targets.front()->width;
@@ -384,10 +387,10 @@ public:
     // The current chunk reads the compact roles (attention projections here, the head in the decoder).
     [[nodiscard]] bool lowbit_chunk() const noexcept { return lowbit_chunk_; }
 
-    void start_chunk(unsigned rows, MiniAppendKind kind) {
+    void start_chunk(unsigned rows, MiniAppendKind kind, unsigned decode_cohort_width = 0U) {
         // Route capture/replay reads or writes host data synchronously. The step graph itself is
         // decided by try_step_graph; the route only picks the row geometry here.
-        select_route(rows, kind);
+        select_route(rows, kind, decode_cohort_width);
         clear_flags();
     }
 
@@ -857,9 +860,9 @@ private:
             check(attn_core::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(
                 adapter, rows, weights.projection(MiniAttentionProjection::output), attended, prep.gate_logits,
                 gated, output.data(), weights.output_row_bytes));
-            if (calibration_ && single) {
+            if (auto* moments = calibration_moments(); moments && single) {
                 weight::calib::InputMoments* const target =
-                    &mini_calibration_input(*calibration_, MiniCalibrationInput::output, visit.physical_layer);
+                    &mini_calibration_input(*moments, MiniCalibrationInput::output, visit.physical_layer);
                 capture_calibration(gated, rows, std::span(&target, 1U));
             }
         };
@@ -981,8 +984,13 @@ private:
     // The row geometry of a chunk and the prompt-row rule of the bound W4A4 class (mini_resident_chunk_route). The class
     // quantises each token row on its own and sums each (row, output) in a fixed K order, so a prompt row's bits do not
     // depend on how the prompt is chunked.
-    void select_route(unsigned rows, MiniAppendKind kind) {
-        lowbit_chunk_ = lowbit_applies(kind, rows);
+    void select_route(unsigned rows, MiniAppendKind kind, unsigned decode_cohort_width = 0U) {
+        // Cohorts may schedule independent decode lanes with the verify kernel form. The receipt still names
+        // the full decode cohort and the active width of this pass.
+        const auto weight_kind = decode_cohort_width ? MiniAppendKind::decode : kind;
+        lowbit_chunk_ = lowbit_applies(weight_kind, rows) &&
+                        (!weights_.bf16_bound() || decode_cohort_width == 0U ||
+                         mini_lowbit_receipt_width(decode_cohort_width));
         route_ = mini_resident_chunk_route(kind, rows, packed_decode_, moe_w4a4_bound(), cohort_rows_);
 #if !defined(__HIPCC__)
         chunk_w4a4_ = mini_w4a4_rows(moe_w4a4_, kind);
@@ -1118,6 +1126,7 @@ private:
     std::uint64_t null_applications_{};
     std::optional<unsigned> step_token_;
     strix::moe::RouteTap* gate_route_tap_{};
+    bool lowbit_chunk_{};
     weight::calib::MomentSet* calibration_{};
     std::optional<std::size_t> calibration_window_;
     std::vector<float> calibration_rows_;

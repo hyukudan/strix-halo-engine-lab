@@ -2,9 +2,11 @@
 
 #include "core/resident_row_plan.hpp"
 #include "inkling2_mini_weight_options.hpp"
+#include "strix/device/runtime.hpp"
 #include "strix/model_content_hash.hpp"
 
 #include <algorithm>
+#include <filesystem>
 #include <iostream>
 
 #if defined(__HIPCC__)
@@ -44,8 +46,9 @@ inline constexpr auto kMiniWeightBackend = weight::Backend::cuda;
 inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name tier,
                                          const MiniWeightOptions& options, weight::WeightLoadExtent extent) {
     const bool qualify = options.qualify_q8 || options.qualify != nullptr;
+    const bool row_requested = mini_may_load_lowbit_row(tier, options, kMiniWeightBackend, extent);
     const bool compact_tier = tier == profile::Name::fast || tier == profile::Name::turbo;
-    const bool needed = compact_tier && !options.disable_q8 && (qualify ||
+    const bool needed = compact_tier && !options.disable_q8 && (qualify || row_requested ||
         std::ranges::any_of(kMiniWeightLoadDecisions, [](const auto& row) { return row.scope.backend == kMiniWeightBackend; }));
     MiniWeightScope out;
     out.backend = kMiniWeightBackend;
@@ -54,11 +57,13 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
 #if defined(__HIPCC__)
     if (hipGetDevice(&ordinal) != hipSuccess) return out;
     const auto visible = device::HipEnumerator{}.enumerate();
-    out.compiler_id = weight::hip_clang_compiler_id(__clang_version__);  // one id for CLI and server
-    const bool lowbit = options.qualify && (mini_lowbit_storage(options.qualify->target) ||
-                                             mini_lowbit_storage(options.qualify->head_target()));
+    const bool lowbit = row_requested || (options.qualify && (mini_lowbit_storage(options.qualify->target) ||
+                                                               mini_lowbit_storage(options.qualify->head_target())));
+    // The historical low-bit receipt used the device compiler's major and minor version.
+    out.compiler_id = lowbit ? "hip-clang-" + std::to_string(__clang_major__) + "." + std::to_string(__clang_minor__)
+                             : weight::hip_clang_compiler_id(__clang_version__);
     const auto identity = weight::implementation_identity(lowbit
-        ? std::span<const weight::ArithmeticId>(core::kResidentLowBitArithmeticHip)
+        ? std::span<const weight::ArithmeticId>(kMiniLowBitConsumers)
         : std::span<const weight::ArithmeticId>(core::kResidentQ8ArithmeticHip));
     if (lowbit) out.regime = kMiniWeightRegime;
 #else
@@ -75,7 +80,8 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
                row.scope.compiler_id == out.compiler_id && row.scope.build == out.build &&
                weight::weight_load_gain_selects(row, extent);
     };
-    if (!qualify && std::ranges::none_of(kMiniWeightLoadDecisions, row_matches)) return out;
+    if (!qualify && (row_requested ? std::ranges::none_of(kMiniLowBitDecisions, row_matches)
+                                  : std::ranges::none_of(kMiniWeightLoadDecisions, row_matches))) return out;
     out.checkpoint = weight::Digest256{sha256_file_content(model).bytes};
     return out;
 }
@@ -93,29 +99,40 @@ inline void bind_mini_lowbit_device(const weight::WeightLoadPlan& plan) {
 #endif
 }
 
-// Only an explicitly supplied sidecar may trigger a second load. The failed decoder has
-// unwound before the incumbent is built, so a partially uploaded image is never published.
-template <class Load>
-auto load_mini_weights(weight::WeightLoadPlan& plan, profile::Name tier, const MiniWeightOptions& options,
-                       const weight::WeightLoadScope& scope, weight::WeightLoadExtent extent, Load load) {
-    const bool lowbit = mini_lowbit_storage(plan.storage) || mini_lowbit_storage(plan.head_storage);
-    if (lowbit) bind_mini_lowbit_device(plan);
-    const char* path = lowbit ? envcfg::text("STRIX_LOWBIT_PACK") : nullptr;
-    if ((!path || !*path) && !options.qualify_decode_only) return load(MiniLowBitRows{});
-    try {
-        if (!path || !*path) throw std::runtime_error("--qualify-decode-weights requires STRIX_LOWBIT_PACK");
-        return load(open_mini_weight_pack(path, scope.checkpoint, options.qualify_decode_only));
-    } catch (const std::runtime_error& error) {
-        std::cerr << "strix-lowbit-pack/v2 declined (" << error.what() << "); retrying incumbent weights\n";
-        auto incumbent_scope = scope;
-        incumbent_scope.regime = {};
+inline std::uint32_t mini_device_weight_slots(std::uint64_t device_limit, std::uint64_t kv_limit,
+                                              std::uint64_t slot_bytes, unsigned requested, bool calibrated) {
+    const auto memory = device::native::memory_info();
+    return mini_weight_slot_capacity(memory.free, memory.total, device_limit, kv_limit, slot_bytes, requested, calibrated);
+}
+
+inline void require_mini_calibrated_cli_slot(const MiniLowBitRows& lowbit, std::uint64_t slot_bytes) {
+    if (!lowbit.admitted) return;
+    std::uint64_t device_limit = 0;
 #if defined(__HIPCC__)
-        incumbent_scope.build = weight::implementation_identity(core::kResidentQ8ArithmeticHip);
+    if (const auto* bound = device::hip_bound()) device_limit = bound->budget.device_bytes;
 #endif
-        plan = mini_plain_weight_fallback(tier, options, incumbent_scope, extent,
-                                          "calibrated pack declined; incumbent weights");
-        return load(MiniLowBitRows{});
-    }
+    static_cast<void>(mini_device_weight_slots(device_limit, 0, slot_bytes, 1U, true));
+}
+
+template <class Load>
+auto load_mini_weights(const std::string& model, weight::WeightLoadPlan& plan, profile::Name tier,
+                       const MiniWeightOptions& options, const weight::WeightLoadScope& scope,
+                       weight::WeightLoadExtent extent, Load load) {
+    const bool lowbit = mini_lowbit_storage(plan.storage) || mini_lowbit_storage(plan.head_storage);
+    if (!lowbit) return load(MiniLowBitRows{});
+    bind_mini_lowbit_device(plan);
+    const bool measured = !options.qualify && !options.qualify_q8;
+    std::string path;
+    if (const char* supplied = envcfg::text("STRIX_LOWBIT_PACK"); supplied && *supplied) path = supplied;
+    else if (measured) path = (std::filesystem::path(model).parent_path() / kMiniLowBitPackFile).string();
+    auto incumbent_scope = scope;
+    incumbent_scope.regime = {};
+#if defined(__HIPCC__)
+    incumbent_scope.compiler_id = weight::hip_clang_compiler_id(__clang_version__);
+    incumbent_scope.build = weight::implementation_identity(core::kResidentQ8ArithmeticHip);
+#endif
+    return load_mini_weight_pack(plan, tier, options, incumbent_scope, extent, path,
+                                  measured ? &kMiniLowBitPackIdentity : nullptr, std::cerr, load);
 }
 
 } // namespace strix::inkling2
