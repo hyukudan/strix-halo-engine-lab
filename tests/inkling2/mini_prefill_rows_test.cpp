@@ -76,6 +76,9 @@ Attempt attempt(Backend backend, Name tier, std::uint32_t prompt, std::optional<
                                                      [&](std::uint32_t rows) {
             result.seen.push_back(rows);
             const strix::device::native::Buffer<float> workspace(mini::mini_moe_workspace_elements(rows));
+            // The loaded decoder's first launch check reads the runtime's last-error slot: a refusal of an earlier
+            // attempt must not be found there.
+            strix::device::native::check(cudaGetLastError(), "first launch after the load");
             return rows;
         });
     } catch (const strix::DeviceAllocationError&) {
@@ -110,6 +113,7 @@ int main() try {
     require(fell_back.seen == Loads({8192U, 2048U}) && fell_back.loaded == 2048U && stub::malloc_calls == 2U &&
                 fell_back.log == "strix-prefill-chunk 8192 -> 2048 (device memory)\n",
             "CUDA EXACT under pressure loads at 2048 rows and says so");
+    require(stub::last_error == cudaSuccess, "the refused 8192-row allocation leaves no error in the last-error slot");
     // A prompt between the two chunks names its own size.
     fell_back = attempt(Backend::cuda, Name::standard, 5000U);
     require(fell_back.seen == Loads({5000U, 2048U}) && fell_back.loaded == 2048U &&
@@ -118,7 +122,8 @@ int main() try {
     // An explicit chunk is never changed: the typed failure propagates after the one attempt.
     const auto explicit_chunk = attempt(Backend::cuda, Name::standard, 8195U, 8192U);
     require(explicit_chunk.seen == Loads{8192U} && !explicit_chunk.loaded && explicit_chunk.typed_failure &&
-                explicit_chunk.log.empty(), "explicit --prefill-chunk 8192 is never retried");
+                explicit_chunk.log.empty() && stub::last_error == cudaSuccess,
+            "explicit --prefill-chunk 8192 is never retried; the typed failure carries the status, not the slot");
     require(attempt(Backend::cuda, Name::standard, 8195U, 2048U).loaded == 2048U, "explicit --prefill-chunk 2048 loads");
     // A non-memory runtime failure at the same allocation never falls back.
     stub::malloc_status = cudaErrorInvalidValue;
