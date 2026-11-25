@@ -1,0 +1,130 @@
+[
+  {
+    "case": "system and user",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be brief."
+      },
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ],
+    "expected": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:system_setting>\nBe brief.\n</ernie:system_setting>\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nSay hello.<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>"
+  },
+  {
+    "case": "multi-turn thinking on",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Count."
+      },
+      {
+        "role": "assistant",
+        "reasoning_content": " First ",
+        "content": "One."
+      },
+      {
+        "role": "system",
+        "content": "Keep going."
+      },
+      {
+        "role": "user",
+        "content": "Next?"
+      }
+    ],
+    "reasoning_effort": "medium",
+    "expected": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=medium\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nCount.<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think> First </ernie:think>One.<|ernie:im_end|>\n<|ernie:im_start|>system\nKeep going.<|ernie:im_end|>\n<|ernie:im_start|>user\nNext?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>"
+  },
+  {
+    "case": "thinking off",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "2 + 2?"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": "<ernie:think>Compute.</ernie:think>4"
+      },
+      {
+        "role": "user",
+        "content": "Thanks."
+      }
+    ],
+    "enable_thinking": false,
+    "expected": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\n2 + 2?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think>4<|ernie:im_end|>\n<|ernie:im_start|>user\nThanks.<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think>"
+  },
+  {
+    "case": "one tool call and its output",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "days": {
+                "type": "integer"
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          },
+          "name": "weather"
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Weather?"
+      },
+      {
+        "role": "assistant",
+        "thoughts": "Look it up.",
+        "tool_calls": [
+          {
+            "id": "ignored",
+            "function": {
+              "name": "weather",
+              "arguments": "{\"days\": 2, \"city\": \"Oslo\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "ignored",
+        "content": "Clear."
+      }
+    ],
+    "reasoning_effort": "low",
+    "expected": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=low\nparallel_tool_calls=True\n</ernie:global_setting>\n<ernie:tool_list>\n[{\"function\": {\"name\": \"weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"type\": \"object\"}}, \"type\": \"function\"}]\n</ernie:tool_list><|ernie:im_end|>\n<|ernie:im_start|>user\nWeather?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>Look it up.</ernie:think><ernie:tool_call>\n<invoke name=\"weather\"><parameter name=\"city\">Oslo</parameter><parameter name=\"days\">2</parameter></invoke>\n</ernie:tool_call><|ernie:im_end|>\n<|ernie:im_start|>tool\n<ernie:tool_output>Clear.</ernie:tool_output><|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>"
+  },
+  {
+    "case": "grouped tool results without generation prefix",
+    "add_generation_prompt": false,
+    "messages": [
+      {
+        "role": "tool",
+        "content": "0"
+      },
+      {
+        "role": "tool",
+        "content": "1"
+      }
+    ],
+    "options": {
+      "thinking_mode": "close"
+    },
+    "expected": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>tool\n<ernie:tool_output>0</ernie:tool_output>\n<ernie:tool_output>1</ernie:tool_output><|ernie:im_end|>"
+  }
+]
