@@ -235,20 +235,22 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
             require(declared_name != nullptr, "implicit preset must be a string");
             require(implicit.requested == profile::parse_tier(*declared_name),
                     "implicit preset must agree with its declared tier");
+            if (entry.family == "glm5") {
+                const auto column = std::string_view(backend) == "hip" ? Name::turbo : Name::fast;
+                require(turbo.levers == column, "GLM chooses the native column for the selected backend");
+                std::vector<std::string> args;
+                turbo.append_options(args);
+                require(args == std::vector<std::string>{"--profile", std::string(profile::tier_word(column))},
+                        "GLM passes the backend's product profile to the native engine");
+            }
             if (entry.family == "inkling2")
                 require(implicit.requested == Name::standard && implicit.levers == Name::standard,
                         "Inkling Mini implicit profile must remain EXACT");
             require(exact.levers == Name::standard && fast.levers == Name::fast && fast.requested == Name::fast,
                     "explicit exact and FAST select their native columns");
-            const bool glm_pair = entry.family == "glm5" && std::string_view(backend) == "hip";
-            require(turbo.requested == Name::turbo && turbo.levers == (glm_pair ? Name::turbo : fast.levers),
-                    "HIP GLM launches its native TURBO column; other presets keep their FAST projection");
-            if (glm_pair) {
-                std::vector<std::string> args;
-                turbo.append_options(args);
-                require(args == std::vector<std::string>{"--profile", "turbo"},
-                        "HIP GLM passes --profile turbo to the pair engine");
-            }
+            require(turbo.requested == Name::turbo, "explicit TURBO keeps its requested tier");
+            if (entry.family != "glm5" && entry.family != "minimax")
+                require(turbo.levers == fast.levers, "other presets project TURBO to FAST");
             require(exact.kv != "fp8" && fast.kv != "fp8", "FP8 KV shadow is TURBO only");
             require((turbo.kv == "fp8") == (entry.family == "qwen35" && std::string_view(backend) == "cuda"),
                     "only the CUDA dense route has an FP8 KV shadow");

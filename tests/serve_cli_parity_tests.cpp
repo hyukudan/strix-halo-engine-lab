@@ -119,6 +119,13 @@ void glm() {
         check(cli.mtp_spec.value == expected && server.mtp_spec.value == expected &&
               cli.mtp.value == expected && server.mtp.value == expected && server.prefill == "gemv",
               "GLM complete/missing assets and opt-out select intended MTP/prefill route");
+        const std::string_view expected_wmma = std::string_view(profile) == "turbo" ? "1" : "0";
+        for (const auto* lever : {"pf_wmma", "mla_wmma", "kda_wmma", "attn_wmma"}) {
+            const auto* cli_cell = cli.product->find(lever);
+            const auto* serve_cell = server.product->find(lever);
+            check(cli_cell && serve_cell && cli_cell->value == expected_wmma && serve_cell->value == expected_wmma,
+                  "GLM rank and serve apply the same WMMA route for " + std::string(profile) + ": " + lever);
+        }
         gate("glm", values(sp::from_lines(rd::print(cli))), values(sp::from_lines(rd::print(server))), allowed);
     }
     // Sampled MTP (row serve_sampled_mtp): both entry points resolve and admit it in rd::resolve, so the same request
