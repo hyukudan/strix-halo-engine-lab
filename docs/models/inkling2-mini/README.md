@@ -328,7 +328,10 @@ ctest --test-dir build-cuda -L inkling2 -R '^strix-cuda'
 - [ ] Compare native operators with pinned reference intermediate tensors on device.
 - [ ] Validate text prefill, multi-token decode and logits on a single Strix Halo with the official weights.
 - [ ] Validate cache rollover, state restore and rollback for all visits.
-- [ ] Validate image and text prefill, followed by DSpark.
-- [ ] Measure TTFT, prefill, decode and peak memory at 1K, 8K and 32K before enabling any faster profiles or USB4 partition plan.
+- [ ] Qualify the integrated HIP text, CLI image and CLI DSpark paths on the original weights.
+- [ ] Measure TTFT, prefill, decode and peak memory at 1K, 8K, 32K and 128K. Check long-context admission and continuation.
+
+The [HIP qualification runbook](hip-qualification.md) records the per-gate status, device commands,
+profile checks and measurement table.
 
 Tracking #909 for Mini and #908 for Small.
