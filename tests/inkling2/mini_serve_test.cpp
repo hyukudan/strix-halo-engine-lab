@@ -462,7 +462,7 @@ void profile_parity() {
     selection.arguments.back() = "exact";
     for (const auto* backend : {"hip", "cuda"}) {
         selection.arguments[3] = backend;
-        for (const auto* head : {static_cast<const char*>(nullptr), "1"}) {
+        for (const auto* head : {static_cast<const char*>(nullptr), "0", "1"}) {
             set_env("STRIX_INK_SCREENED_HEAD", head);
             for (const auto& [rows, level] : {std::pair<const char*, unsigned>{nullptr, 0U},
                                              {"0", 0U}, {"1", 1U}, {"2", 2U}}) {
@@ -470,13 +470,13 @@ void profile_parity() {
                 loaded.reset();
                 const auto cli = parse_cli("exact", backend);
                 const auto service = factory->create(selection);
-                require(service && loaded && loaded->screened_head == (head != nullptr) &&
+                require(service && loaded && loaded->screened_head == (head == nullptr || head[0] == '1') &&
                             loaded->screened_head == mini::mini_screened_head(cli.tier) &&
                             // a speculating server takes the verify rows body (level >= 1), as the command line does
                             loaded->verify_rows == mini::mini_speculation_verify_rows(level, loaded->speculation) &&
                             loaded->verify_rows ==
                                 mini::mini_speculation_verify_rows(mini::mini_verify_rows(cli.tier), loaded->speculation),
-                        "CLI and server must resolve both opt-in rows independently");
+                        "CLI and server must resolve both rows independently (screened head default on, verify rows opt-in)");
             }
         }
     }
@@ -561,7 +561,7 @@ strix::profile::Name served_native_tier(std::string_view tier_name, std::string_
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
             W4a4 w4a4 = W4a4::bf16, std::string_view tier_name = "fast", bool image = false, bool round_fold = false,
             bool cli_route = false, ServedShape shape = {}, bool controller_one_plane = false,
-            bool projected_bias = false, bool screened_head = false) {
+            bool projected_bias = true, bool screened_head = true) {
     sv::ServiceFactories factories;
     bool created = false;
     // The fixture's projected-bias submissions: set only once the served requests have run, so a report taken before
@@ -1055,23 +1055,25 @@ int main(int argc, char** argv) try {
     set_cli_route_env("0");
     wiring(argv[1], "hip", false);
     set_cli_route_env(nullptr);
-    // The projected-bias lever per tier (opt-in): unset and 0 keep the image route, 1 selects the projected flash;
+    // The projected-bias lever per tier (default on after its RTX identity receipts): unset and 1 select the projected
+    // flash, an explicit 0 keeps the image route;
     // tests/inkling2/mini_gate_cli_test.cpp pins the same table through the CLI.
     for (const auto* tier : {"exact", "fast", "turbo"}) {
-        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
+        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, true}, {"0", false}, {"1", true}}) {
             set_env("STRIX_INK_ATTN_PROJECTED_BIAS", value);
             wiring(argv[1], "cuda", false, false, W4a4::bf16, tier, false, false, false, {}, false, expected);
         }
     }
     set_env("STRIX_INK_ATTN_PROJECTED_BIAS", nullptr);
-    // The screened-head lever per backend and tier (opt-in): unset and 0 keep the full head, 1 selects the screened head;
+    // The screened-head lever per backend and tier (default on after its RTX identity receipts; HIP ignores the value
+    // in its binding but the resolver carries it): unset and 1 select the screened head, an explicit 0 keeps the full head;
     // tests/inkling2/mini_gate_cli_test.cpp pins the same table through the CLI.
     for (const auto* backend : {"cuda", "hip"}) {
         for (const auto* tier : {"exact", "fast", "turbo"}) {
             for (const auto& [value, expected] :
-                 {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
+                 {std::pair<const char*, bool>{nullptr, true}, {"0", false}, {"1", true}}) {
                 set_env("STRIX_INK_SCREENED_HEAD", value);
-                wiring(argv[1], backend, false, false, W4a4::bf16, tier, false, false, false, {}, false, false,
+                wiring(argv[1], backend, false, false, W4a4::bf16, tier, false, false, false, {}, false, true,
                        expected);
             }
         }
