@@ -44,13 +44,16 @@ inline constexpr std::array<strix::profile::Lever, 13> profile_table{{
     // its last R rows, window keys floored at the cut, its dense products in the exact form (bounded run == full run
     // with the floor, bit for bit; not bit-equal to the full decode). 'fast' selects R=256 (key floor
     // round_down(T - R, 256)) over the resolved fast set; TURBO nests it (empty cell). OFF in default / quality.
-    // Set, it enters the profile fingerprint (rank agreement, prefix-cache identity).
+    // Qualified by FAST gate v2 D1R (8K and 32K classes). A run that needs every decoder row (a deferred serve piece,
+    // in-run prefix snapshots, a group pass) takes the exact plan instead. Set, it enters the profile fingerprint (rank
+    // agreement, prefix-cache identity).
     {"decoder_replay", "STRIX_DS41_DECODER_REPLAY", "", {"", "256", "", ""}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true, false}, {true, true, true, true}, "", "0",
+     {true, true, true, false}, {true, true, true, true}, "", "0",
      "FAST bounded decoder replay R=256 (ds41-replay-r256-v1, key floor round_down(T - R, 256)) on the resolved fast set; "
-     "FAST gate v2 D1R on fast set + R256: qualified for prompts <= 8,192 (8K class 14 windows, 882 rows, final PASS: "
-     "KL 0.0121, top-1 0.962, dNLL -0.0058 se 0.0059); provisional above (32K class pending)",
-     false, {false, true, false, false}, true, {},
+     "FAST gate v2 D1R on fast set + R256: qualified (8K and 32K classes, 28 windows, 1,764 rows, final PASS: KL 0.0101, "
+     "top-1 0.972, dNLL +0.0001 se 0.0037, route flips 0.37 x null; 8K class KL 0.0121 top-1 0.962, 32K class KL 0.0080 "
+     "top-1 0.982 dNLL +0.0060 se 0.0044)",
+     false, {false, false, false, false}, true, {},
      {{{"0", "v1"}, {"256", "ds41-replay-r256-v1"}}}},
     // Prefill only: the Engram KV projection on the shared FP16 WMMA core (ds41-engram-f16wmma-v1); views whose x would overflow FP16
     // keep the exact kernel. Not a bundle member (the env bundle ds41-fast-pf-v1 keeps its identity); 'fast' selects it.
@@ -90,8 +93,8 @@ inline constexpr std::array<strix::profile::Lever, 13> profile_table{{
 inline constexpr std::string_view kFastGateD1 =
     "FAST gate v2 D1, resolved fast set, pair, prompts <= 8,192: 14 windows, 882 rows, final PASS (32K: provisional)";
 inline constexpr std::string_view kFastGateD1R =
-    "FAST gate v2 D1R, resolved fast set + decoder replay R=256, pair, prompts <= 8,192: 14 windows, 882 rows, final "
-    "PASS (32K: provisional)";
+    "FAST gate v2 D1R, resolved fast set + decoder replay R=256, pair, prompts <= 8,192 and 32,768: 28 windows, 1,764 "
+    "rows, final PASS";
 inline constexpr strix::profile::FastGate fast_gates[] = {
     {"fast_prefill", "1", kFastGateD1}, {"engram_f16wmma", "1", kFastGateD1},
     {"shared_f16", "1", kFastGateD1},   {"moe_f16wmma", "1", kFastGateD1},

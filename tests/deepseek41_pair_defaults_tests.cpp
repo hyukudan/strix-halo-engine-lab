@@ -468,11 +468,11 @@ void test_profile() {
         check(i4 && i4->status == pr::Status::builtin && i4->value == "0",
               "IU4 is not a TURBO row (measured slower than FAST), even with --allow-pending");
         const auto* replay = turbo.profile->find("decoder_replay");
-        check(replay && replay->value == "256" && replay->status == pr::Status::provisional,
-              "TURBO nests the FAST decoder replay R256");
+        check(replay && replay->value == "256" && replay->status == pr::Status::set,
+              "TURBO nests the FAST decoder replay R256 (qualified)");
         const auto* fast_replay = f.profile->find("decoder_replay");
-        check(fast_replay && fast_replay->value == "256" && fast_replay->status == pr::Status::provisional,
-              "FAST selects decoder replay R256 (gate v2 D1R)");
+        check(fast_replay && fast_replay->value == "256" && fast_replay->status == pr::Status::set,
+              "FAST selects decoder replay R256 (gate v2 D1R, qualified)");
         auto i4_world = w;
         i4_world.env["STRIX_DS41_FAST_I4"] = "1";
         for (const auto* profile : {"fast", "turbo"}) {
