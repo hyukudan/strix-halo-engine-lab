@@ -288,6 +288,9 @@ int main(int argc, char** argv) {
             family.default_prefill_chunk = mini_prefill_schedule(cli::kMiniHipSchedule, options.tier.profile).chunk;
             options.generation.prefill_chunk = family.default_prefill_chunk;
         }
+        // The implicit chunk's pressure fallback of this backend and profile (shared load; never an explicit chunk).
+        family.prefill_chunk_fallback = mini_cli_prefill_fallback_rows(
+            cli::kMiniHipSchedule ? MiniPrefillBackend::hip : MiniPrefillBackend::cuda, options.tier.profile);
         // The serial CLI resolves its one lane at load using prompt + generated positions. A gate knows its
         // resident context from the manifest. CUDA step routing precedes serial loading and has no banded CUDA row.
         struct ResolvedWeights {
@@ -337,6 +340,14 @@ int main(int argc, char** argv) {
                                                            combine_image, round_fold, narrow, controller_one_plane,
                                                            projected_bias);
         };
+        // The rows the decoder was loaded with once the shared load fell back (strix-prefill-chunk line): a second load
+        // happens only then, and the prefill route receipt names the chunk that ran.
+        unsigned loads = 0U;
+        std::uint32_t fallback_chunk = 0U;
+        family.load = [load = std::move(family.load), &loads, &fallback_chunk](const serve::SerialGenerationLoad& request) {
+            if (loads++ != 0U) fallback_chunk = request.prefill_chunk;
+            return load(request);
+        };
         const auto write_profile = [&] {
             const auto& resolved = loaded ? *loaded : early;
             const auto& plan = resolved.plan;
@@ -344,7 +355,8 @@ int main(int argc, char** argv) {
             cli::write_profile(options.tier, std::cerr, true);
             cli::write_weight_load_plan(std::cerr, plan);
             std::cerr << strix::weight::weight_load_regime_receipt(plan) << '\n';
-            std::cerr << "strix-prefill-route/v1 chunk " << options.generation.prefill_chunk << " tail_divisor "
+            std::cerr << "strix-prefill-route/v1 chunk " << (fallback_chunk ? fallback_chunk : options.generation.prefill_chunk)
+                      << " tail_divisor "
                       << family.prefill_tail_divisor << " first_id prefill\n";
             std::cerr << "strix-decode-route/v1 moe_decode " << mini_decode_form_name(options.generation.packed_decode)
                       << '\n';
