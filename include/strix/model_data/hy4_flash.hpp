@@ -27,7 +27,7 @@ inline constexpr std::string_view levers = "fast";
 inline constexpr std::string_view native_kv = "bf16 latent";
 inline constexpr std::string_view reference = "base";
 namespace turbo {
-inline constexpr std::string_view levers = "fast";
+inline constexpr std::string_view levers = "turbo";
 } // namespace turbo
 } // namespace presets
 inline constexpr std::string_view schema = "strix-model/v1";

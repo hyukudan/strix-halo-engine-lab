@@ -4,6 +4,7 @@
 // path through the shared ApiService (reasoning_effort no_think turns thinking off for the output parse, prompt bytes equal
 // the CLI render); a tool-call round trip through the bound renderer and parser; GGUF family admission.
 #include "hy4/serve/session_service.hpp"
+#include "strix/profiles/hy4.hpp"
 #include "strix/model_family_registry.hpp"
 #include "strix/serve/engine.hpp"
 #include <cstdio>
@@ -115,6 +116,25 @@ void shell_tests(const std::filesystem::path& root) {
         argv.emplace_back("--print-effective-config");
         const auto served = invoke(argv, factories);
         check(served.code == 0 && served.out == cli, "CLI = serve effective config: " + served.out + " vs " + cli);
+    }
+    {
+        namespace hp = strix::hy4::profile;
+        const std::vector<std::string> switches{"--profile", "turbo", "--prompt-rows", "2048", "--head-q8", "0"};
+        std::vector<std::string> rank_args = switches;
+        strix::profile::Inputs rank;
+        strix::profile::take_options(hp::engine(), rank_args, rank);
+        const auto native = hp::resolve({hp::Device::unknown, hp::Topology::one_node, 8192}, rank);
+        std::vector<std::string> argv{"serve", "--registry-root", r, "--model", "hy4_flash", "--", "--ctx", "8192",
+                                      "--print-effective-config"};
+        argv.insert(argv.end(), switches.begin(), switches.end());
+        const auto served = invoke(argv, factories);
+        check(served.code == 0, "serve profile inspection: " + served.out + served.error);
+        if (served.code == 0) {
+            const auto config = sv::parse_json(served.out);
+            const auto* resolved = config.find("profile");
+            check(resolved && resolved->dump() == sv::parse_json(native->resolution.json()).dump(),
+                  "native rank and serve resolve the same tier and overrides without a device");
+        }
     }
     const auto a = h::effective_config(h::parse_options(std::vector<std::string>{"--ctx", "8192", "--max-tokens", "512"}), {}).dump();
     const auto b = h::effective_config(h::parse_options(std::vector<std::string>{"--max-tokens", "512", "--ctx", "8192"}), {}).dump();
