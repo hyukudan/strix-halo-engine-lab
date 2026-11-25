@@ -22,6 +22,7 @@
 // SP has no device consumer yet, so --out refuses SP rules; --dequant-out writes the decoded selected matrices as a
 // BF16 safetensors file (SP weights are exact in BF16; the tool refuses a value that is not) for an emulation through
 // the existing BF16 routes. The report gives the relative output error and the weight-space SQNR of every arm.
+#include "strix/serve/json.hpp"
 #include "strix/weight/admission.hpp"
 #include "strix/weight/calib_moments.hpp"
 #include "strix/weight/calib_provenance.hpp"
@@ -255,16 +256,20 @@ using DequantTensors = std::map<std::string, std::pair<std::array<std::size_t, 2
 
 // Selected matrices' decoded weights as one BF16 safetensors file (sorted names, header padded to 8 bytes).
 void write_dequant(const std::string& path, const DequantTensors& tensors) {
-    std::string header = "{";
-    std::size_t offset = 0;
+    using strix::serve::Json;
+    auto descriptors = Json::object();
+    std::uint64_t offset = 0;
     for (const auto& [name, v] : tensors) {
-        const std::size_t bytes = v.second.size() * 2U;
-        header += "\"" + name + "\":{\"dtype\":\"BF16\",\"shape\":[" + std::to_string(v.first[0]) + "," +
-                  std::to_string(v.first[1]) + "],\"data_offsets\":[" + std::to_string(offset) + "," +
-                  std::to_string(offset + bytes) + "]},";
+        const std::uint64_t bytes = v.second.size() * sizeof(std::uint16_t);
+        descriptors.set(name, Json::Object{
+            {"dtype", "BF16"},
+            {"shape", Json::Array{std::uint64_t{v.first[0]}, std::uint64_t{v.first[1]}}},
+            {"data_offsets", Json::Array{offset, offset + bytes}},
+        });
         offset += bytes;
     }
-    header += "\"__metadata__\":{\"format\":\"pt\",\"producer\":\"strix-lowbit-calib-pack dequant\"}}";
+    descriptors.set("__metadata__", Json::Object{{"format", "pt"}, {"producer", "strix-lowbit-calib-pack dequant"}});
+    auto header = descriptors.dump();
     while (header.size() % 8U != 0U) header += ' ';
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f) throw std::runtime_error("cannot open " + path);
@@ -315,11 +320,14 @@ int main(int argc, char** argv) {
                   << heldout.windows().size() << " held-out windows, no overlap) + checkpoint digest in "
                   << seconds_since(t0) << " s\n";
 
+        const bool report_sp = std::ranges::any_of(args.rules, [](const Rule& rule) { return is_sp(rule.format); });
         std::ofstream report;
         if (!args.report.empty()) {
             report.open(args.report, std::ios::trunc);
             if (!report) throw std::runtime_error("cannot open report " + args.report);
-            report << "tensor\tinput\tcal_rows\teval_rows\tformat\ttechnique\trel_error\tselected\ttable\tweight_sqnr_db\n";
+            report << "tensor\tinput\tcal_rows\teval_rows\tformat\ttechnique\trel_error\tselected";
+            if (report_sp) report << "\ttable\tweight_sqnr_db";
+            report << '\n';
         }
         wei::LowbitPackWriter writer(checkpoint);
         DequantTensors dequant_out;
@@ -419,10 +427,13 @@ int main(int argc, char** argv) {
                     const bool chosen = a.format == format && a.fit == fit && tech == args.technique;
                     if (a.format == format && a.fit == fit && tech == Technique::rtn) total_rtn += err.error;
                     if (chosen) total_sel += err.error;
-                    if (!args.report.empty())
+                    if (!args.report.empty()) {
                         report << t->name << '\t' << input_name << '\t' << input->rows << '\t' << held->rows << '\t'
                                << format_name(a.format) << '\t' << technique_name(tech) << '\t' << err.relative() << '\t'
-                               << (chosen ? 1 : 0) << '\t' << coded.table << '\t' << weight_sqnr_db(w, coded.dequant) << '\n';
+                               << (chosen ? 1 : 0);
+                        if (report_sp) report << '\t' << coded.table << '\t' << weight_sqnr_db(w, coded.dequant);
+                        report << '\n';
+                    }
                     if (chosen && !args.dequant_out.empty()) {
                         std::vector<std::uint16_t> bf(coded.dequant.size());
                         for (std::size_t i = 0; i < bf.size(); ++i) bf[i] = exact_bf16(coded.dequant[i]);
