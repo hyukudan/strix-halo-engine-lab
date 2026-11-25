@@ -3,6 +3,7 @@
 #include "exec/cuda_decode_wr2.hpp"
 #include "inkling2_mini_schedule.hpp"
 
+#include <string>
 #include <utility>
 
 namespace strix::inkling2 {
@@ -20,7 +21,8 @@ void MiniCudaBlockCandidateStep::append_tap(exec::CudaProgramRecipe& recipe, con
     auto leaf = exec::cuda_decode::bind_step(cuda::core::StepRowStoreBf16{
         device_step, hidden.data(), features.data() + std::size_t{tap} * kHiddenWidth, kHiddenWidth, pitch, positions_,
     }, rows);
-    const auto stage = recipe.stage_label();
+    // A copy: stage_label() views the recipe's own label, which the next stage() call overwrites.
+    const std::string stage{recipe.stage_label()};
     recipe.stage("draft_tap");
     std::move(leaf).append_to(recipe);
     recipe.stage(stage);
