@@ -88,9 +88,10 @@ inline row_transforms::Status enqueue_resident_q8_rows(
 #if !defined(__HIPCC__)
     , cuda_core::BigCtx* context = nullptr
 #endif
+    , LowBitArithmetic arithmetic = LowBitArithmetic::fp32_sweep
 ) {
     if (matrix.storage == weight::kQ4G64WeightStorage || matrix.storage == weight::kQ6G64WeightStorage)
-        return enqueue_resident_lowbit_rows(matrix, live_outputs, input, rows, output, stream);
+        return enqueue_resident_lowbit_rows(matrix, live_outputs, input, rows, output, stream, arithmetic);
     if (!valid_resident_q8_rows(matrix, live_outputs, input, rows, output)) return row_transforms::invalid;
 
     const auto width = static_cast<unsigned>(matrix.columns);
@@ -212,10 +213,15 @@ inline row_transforms::Status enqueue_resident_q8_projections(
 
 inline row_transforms::Status enqueue_resident_q8_softcap_head(
     const weight::ResidentMatrixView& matrix, unsigned live_outputs, const float* input,
-    unsigned rows, std::span<float> logits, float cap, row_transforms::Stream stream) {
+    unsigned rows, std::span<float> logits, float cap, row_transforms::Stream stream,
+    LowBitArithmetic arithmetic = LowBitArithmetic::fp32_sweep) {
     if (live_outputs == 0 || rows > logits.size() / live_outputs || !(cap > 0.0F))
         return row_transforms::invalid;
-    const auto status = enqueue_resident_q8_rows(matrix, live_outputs, input, rows, logits.data(), stream);
+    const auto status = enqueue_resident_q8_rows(matrix, live_outputs, input, rows, logits.data(), stream
+#if !defined(__HIPCC__)
+                                               , nullptr
+#endif
+                                               , arithmetic);
 #if defined(__HIPCC__)
     if (status != hipSuccess) return status;
 #else
@@ -241,7 +247,8 @@ inline constexpr unsigned kResidentQ8RowBitsRows = 1U;
 // the bits of the one-row head.
 inline row_transforms::Status enqueue_resident_q8_softcap_head_rows(
     const weight::ResidentMatrixView& matrix, unsigned live_outputs, unsigned pitch, const float* input,
-    unsigned rows, std::span<float> logits, float cap, row_transforms::Stream stream) {
+    unsigned rows, std::span<float> logits, float cap, row_transforms::Stream stream,
+    LowBitArithmetic arithmetic = LowBitArithmetic::fp32_sweep) {
     if (matrix.columns == 0U || !(cap > 0.0F) ||
         !head::pitched_rows_fit(rows, live_outputs, pitch, matrix.rows, logits.size()))
         return row_transforms::invalid;
@@ -254,7 +261,7 @@ inline row_transforms::Status enqueue_resident_q8_softcap_head_rows(
         const auto launch = static_cast<unsigned>(head::logit_rows_launch(rows, first, kResidentQ8RowBitsRows).rows);
         const auto status = enqueue_resident_q8_softcap_head(
             matrix, pitch, input + std::size_t{first} * matrix.columns, launch,
-            logits.subspan(head::logit_row_offset(first, pitch), std::size_t{launch} * pitch), cap, stream);
+            logits.subspan(head::logit_row_offset(first, pitch), std::size_t{launch} * pitch), cap, stream, arithmetic);
         if (status != success) return status;
         first += launch;
     }
