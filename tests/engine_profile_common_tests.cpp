@@ -310,27 +310,27 @@ int main() try {
             in.allow_pending = false;
         }
 
-        const hy::Regime measured{hy::Device::gfx1151, hy::Topology::one_node, 8192, hy::single_greedy_8k};
+        const hy::Regime measured_regime{hy::Device::gfx1151, hy::Topology::one_node, 8192, hy::single_greedy_8k};
         for (const auto tier : {Name::fast, Name::turbo}) {
             in.profile = tier;
-            const auto chosen = hy::resolve(measured, in);
+            const auto chosen = hy::resolve(measured_regime, in);
             require(chosen->find("prompt_rows")->value == "2048" && chosen->find("head_q8")->value == "1" &&
                     chosen->find("pf_mha")->value == "1", "Hy4 measured 8K greedy rank uses the qualified 2048 schedule");
-            auto other = measured;
+            auto other = measured_regime;
             other.execution = {};
             require(hy::resolve(other, in)->find("prompt_rows")->value == "4096", "unpriced Hy4 execution keeps its schedule");
-            other = measured;
+            other = measured_regime;
             other.prompt_tokens = 8191;
             require(hy::resolve(other, in)->find("prompt_rows")->value == "4096", "adjacent Hy4 band keeps its schedule");
             in.cli = {{"prompt_rows", "4096"}};
-            require(hy::resolve(measured, in)->find("prompt_rows")->value == "4096", "Hy4 explicit window width wins");
+            require(hy::resolve(measured_regime, in)->find("prompt_rows")->value == "4096", "Hy4 explicit window width wins");
             in.cli = {{"head_q8", "0"}};
-            require(hy::resolve(measured, in)->find("prompt_rows")->value == "4096",
+            require(hy::resolve(measured_regime, in)->find("prompt_rows")->value == "4096",
                     "unpriced Hy4 head override keeps the incumbent schedule");
             in.cli.clear();
         }
         in.profile = Name::standard;
-        require(hy::resolve(measured, in)->find("prompt_rows")->value == "0", "Hy4 BASE keeps the serial reference");
+        require(hy::resolve(measured_regime, in)->find("prompt_rows")->value == "0", "Hy4 BASE keeps the serial reference");
         in.profile = Name::turbo;
 
         constexpr std::pair<const char*, const char*> switches[] = {
