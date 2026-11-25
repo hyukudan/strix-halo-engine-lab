@@ -4,8 +4,7 @@
 #include "core/resident_row_plan.hpp"
 
 #if defined(__HIPCC__)
-#include <mutex>
-#include <string_view>
+#include "strix/hip/current_device_arch.hpp"
 
 #include "core/dense_linear.hpp"
 #include "core/f16_tile_gemm_small.hpp"
@@ -33,28 +32,12 @@ inline LowBitRowPlan current_lowbit_row_plan() {
     int dev = 0;
     return hipGetDevice(&dev) == hipSuccess ? bound_lowbit_row_plan(dev) : LowBitRowPlan{};
 }
-// The architecture of the current device (gcnArchName up to ':'), read once per ordinal; empty when unknown.
-inline std::string_view current_device_arch() {
-    constexpr int kSlots = 16;
-    static std::array<std::once_flag, kSlots> once;
-    static std::array<std::array<char, 32>, kSlots> names{};
-    int dev = 0;
-    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kSlots) return {};
-    const auto slot = static_cast<std::size_t>(dev);
-    std::call_once(once[slot], [&] {
-        hipDeviceProp_t prop{};
-        if (hipGetDeviceProperties(&prop, dev) != hipSuccess) return;
-        const char* arch = prop.gcnArchName;
-        for (std::size_t i = 0; i + 1U < names[slot].size() && arch[i] != '\0' && arch[i] != ':'; ++i) names[slot][i] = arch[i];
-    });
-    return names[slot].data();
-}
 // Lever "lowbit.rows-select": this launch runs the FP32 sweep (core/resident_row_plan.hpp kLowBitSweepCells).
 inline bool lowbit_rows_sweep(LowBitArithmetic arithmetic, weight::FormatId storage, unsigned outputs, unsigned width,
                               unsigned rows) {
     if (arithmetic != LowBitArithmetic::f16_rows_select) return false;
     const unsigned bits = storage == weight::kQ4G64WeightStorage ? 4U : storage == weight::kQ6G64WeightStorage ? 6U : 0U;
-    return lowbit_sweep_cell(current_device_arch(), bits, outputs, width, rows);
+    return lowbit_sweep_cell(strix::hip::arch::current_device_arch_name(), bits, outputs, width, rows);
 }
 // Low-bit projections sharing one input: one launch of the planned route (both routes compute the same bits).
 template <class Storage, unsigned Capacity>
