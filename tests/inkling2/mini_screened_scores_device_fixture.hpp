@@ -6,6 +6,10 @@
 // shared sample_token_row with a fixed policy and fixed uniforms, so both runs sample the same ids exactly when
 // their scores agree. Covers a lane sampled alone from the first step, and a lane sampled alone after a packed
 // cohort step and after another lane's greedy step (whose scores are never read and never projected).
+// Verify rows level 2 (STRIX_INK_VERIFY_ROWS=2, set_verify_rows(2)): cohorts of 2 and 4 lanes whose groups declare no
+// score read pick through the lanes screened head (picks = the full head's, scores deferred and then read bit for bit),
+// an announced read keeps the full head (nothing deferred), and greedy verify windows of 2 and 4 rows pick the full head's
+// tokens through the lanes form, each window committed whole.
 
 #include "inkling2/inkling2_mini_resident_decoder.hpp"
 #include "strix/token_sampling.hpp"
@@ -80,7 +84,7 @@ inline unsigned step_lane(MiniResidentDecoder& decoder, unsigned slot, unsigned 
     return top[0];
 }
 
-inline void screened_scores(const char* checkpoint, weight::FormatId storage) {
+inline ScreenReference screened_scores(const char* checkpoint, weight::FormatId storage) {
     // The serving construction (inkling2_mini_serve_device.hpp): grouped decode, default step graphs, no verify
     // rows, no DSpark taps, one decode row per slot.
     constexpr unsigned lanes = 2U;
@@ -146,6 +150,72 @@ inline void screened_scores(const char* checkpoint, weight::FormatId storage) {
         if (scores_deferred(decoder).value_or(false)) throw std::logic_error("scores still deferred after a score read");
     }
     std::cout << "PASS Inkling Mini screened scores: sampled lane after packed and greedy lanes\n";
+    return reference;
+}
+
+// Verify rows level 2 on a decoder built like the command line's verifying route plus four cohort rows.
+inline void lanes_pick_scores(const char* checkpoint, weight::FormatId storage, const ScreenReference& reference) {
+    constexpr unsigned lanes = 4U;
+    MiniResidentDecoder decoder(checkpoint, 128U, 64U, false, MiniResidentBackend::default_step_graphs, storage,
+                                MiniResidentDecoder::kMaxVerifyRows, false, lanes);
+    decoder.allocate_slots(lanes);
+    const auto admitted = decoder.set_verify_rows(2U);
+#if defined(__HIPCC__)
+    // Level 1 always (verify windows exist); the lanes pick only over the BF16 screened head.
+    const unsigned expected =
+        storage == weight::kBf16WeightStorage && core::hip_screened_head::enabled() ? 2U : 1U;
+#else
+    const unsigned expected = 0U;
+#endif
+    std::cout << "INFO verify rows level " << admitted << " (2 selected)\n";
+    if (admitted != expected)
+        throw std::logic_error("verify rows level 2 must be admitted exactly when the BF16 screened head exists");
+    if (admitted != 2U) {
+        std::cout << "PASS Inkling Mini lanes pick: declined without the BF16 screened head (level " << admitted << ")\n";
+        return;
+    }
+    std::vector<unsigned> prompt(kScreenPromptRows);
+    for (std::size_t i = 0; i < prompt.size(); ++i)
+        prompt[i] = 1000U + static_cast<unsigned>((i * 173U + i / 13U) % 20000U);
+    std::vector<float> scores(kOutputVocabulary);
+    constexpr unsigned kCohortSteps = 4U;
+    for (const unsigned width : {2U, 4U}) {
+        for (unsigned lane = 0; lane < width; ++lane) (void)decoder.prefill_slot_first(lane, prompt, true);
+        std::array<unsigned, lanes> slots{0U, 1U, 2U, 3U}, ids{}, top{};
+        for (unsigned step = 0; step < kCohortSteps; ++step) {
+            const bool announced = step % 2U == 1U;
+            std::fill(ids.begin(), ids.end(), reference.ids[step]);
+            decoder.decode_slots(std::span(slots).first(width), std::span(ids).first(width), std::span(top).first(width),
+                                 announced);
+            const auto deferred = scores_deferred(decoder).value_or(!announced);
+            if (deferred == announced)
+                throw std::logic_error("cohort C" + std::to_string(width) + " step " + std::to_string(step) + ": " +
+                                       (announced ? "an announced read deferred its rows" : "unread rows were projected"));
+            for (unsigned lane = 0; lane < width; ++lane) {
+                decoder.read_slot_logits(lane, scores);
+                check_step(announced ? "level 2 cohort (announced read)" : "level 2 cohort (lanes pick, deferred read)",
+                           step, scores, top[lane], reference);
+            }
+        }
+    }
+    std::cout << "PASS Inkling Mini lanes pick: cohorts C2 and C4, " << kCohortSteps << " steps each\n";
+
+    (void)decoder.prefill_slot_first(0U, prompt, true);
+    unsigned cursor = 0U;
+    for (const unsigned width : {2U, 4U}) {
+        const auto result =
+            decoder.forward_rows(reference.ids.data() + cursor, width, MiniResidentDecoder::LogitRows::all);
+        std::array<unsigned, MiniResidentDecoder::kMaxVerifyRows> top{};
+        decoder.read_top(result, width, top.data());
+        for (unsigned row = 0; row < width; ++row)
+            if (top[row] != reference.top[cursor + row])
+                throw std::runtime_error("level 2 verify window of " + std::to_string(width) + " rows: row " +
+                                         std::to_string(row) + " pick differs from the full head");
+        decoder.commit(width);
+        cursor += width;
+    }
+    if (cursor > kScreenSteps) throw std::logic_error("verify windows outran the reference");
+    std::cout << "PASS Inkling Mini lanes pick: verify windows of 2 and 4 rows\n";
 }
 
 }  // namespace strix::inkling2::test
@@ -160,7 +230,8 @@ int main(int argc, char** argv) {
             if (option == "--qualify-q8") storage = weight::kQ8WeightStorage;
             else throw std::invalid_argument("unknown option: " + std::string(option));
         }
-        inkling2::test::screened_scores(argv[1], storage);
+        const auto reference = inkling2::test::screened_scores(argv[1], storage);
+        inkling2::test::lanes_pick_scores(argv[1], storage, reference);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL Inkling Mini screened scores: " << error.what() << '\n';

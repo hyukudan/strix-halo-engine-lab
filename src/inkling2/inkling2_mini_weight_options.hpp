@@ -104,13 +104,17 @@ inline bool mini_attn_projected_bias(const profile::Resolution& tier) {
     throw std::invalid_argument("STRIX_INK_ATTN_PROJECTED_BIAS must be 0 or 1");
 }
 
-// Resolved state of the verify rows lever (true: a HIP verify window takes the pitched rows head, one lanes attention
-// launch set and the convolution tape, kMiniVerifyRows). 0 or absent = off: the per-row incumbent.
-inline bool mini_verify_rows(const profile::Resolution& tier) {
+// Resolved level of the verify rows lever (kMiniVerifyRows). 0 or absent = off: the per-row incumbent. 1: a HIP verify
+// window takes the pitched rows head, one lanes attention launch set and the convolution tape. 2: level 1, and greedy
+// picks whose scores nobody reads (verify windows without a sampled or observing reader, served cohorts whose groups
+// declare no score read) go through the lanes form of the EXACT screened head (kMiniVerifyLanesPick).
+inline constexpr unsigned kMiniVerifyLanesPick = 2U;
+inline unsigned mini_verify_rows(const profile::Resolution& tier) {
     const auto* entry = tier.find(kMiniVerifyRows);
-    if (entry == nullptr || entry->value == "0") return false;
-    if (entry->value == "1") return true;
-    throw std::invalid_argument("STRIX_INK_VERIFY_ROWS must be 0 or 1");
+    if (entry == nullptr || entry->value == "0") return 0U;
+    if (entry->value == "1") return 1U;
+    if (entry->value == "2") return kMiniVerifyLanesPick;
+    throw std::invalid_argument("STRIX_INK_VERIFY_ROWS must be 0, 1 or 2");
 }
 
 // Resolved state of the served route lever (true: a HIP server runs the command line's route, kMiniServedCliRoute).
@@ -147,13 +151,19 @@ inline bool mini_controller_one_plane(const profile::Resolution& tier) {
 // (down_image, prepared_round_fold), the same text in the CLI, the gate and the server.
 inline const char* mini_down_image_name(bool active, bool selected) { return active ? "on" : selected ? "declined" : "off"; }
 inline const char* mini_round_fold_name(bool active, bool selected) { return mini_down_image_name(active, selected); }
-inline const char* mini_verify_rows_name(bool active, bool selected) { return mini_down_image_name(active, selected); }
+// Effective verify rows level against the selected one: off, on (level 1), on+lanes-pick (level 2), declined (nothing
+// admitted), on+lanes-pick-declined (level 2 selected, the decoder has no screened head: compact head or no screen).
+inline const char* mini_verify_rows_name(unsigned active, unsigned selected) {
+    if (active == 0U) return selected == 0U ? "off" : "declined";
+    if (active >= kMiniVerifyLanesPick) return "on+lanes-pick";
+    return selected >= kMiniVerifyLanesPick ? "on+lanes-pick-declined" : "on";
+}
 
 // What the decoder's backend admitted of the resolved levers: the effective state every entry point reports.
 struct MiniDecoderLevers {
     bool down_image = false;           // the BF16 down image route is active
     bool prepared_round_fold = false;  // the prepared-attention round fold runs
-    bool verify_rows = false;          // verify windows take the rows head, lanes attention and convolution tape
+    unsigned verify_rows = 0U;         // verify rows level admitted (mini_verify_rows: 0 off, 1 rows, 2 rows + lanes pick)
 };
 
 // The one place a resident decoder takes its resolved profile levers; the serial CLI, the gate and the server all call
@@ -162,7 +172,7 @@ struct MiniDecoderLevers {
 template <class Decoder>
 MiniDecoderLevers configure_mini_decoder(Decoder& decoder, moe_core::grouped_w4a4::Activations moe_w4a4,
                                          bool combine_image, bool prepared_round_fold, bool attn_projected_bias,
-                                         bool verify_rows = false) {
+                                         unsigned verify_rows = 0U) {
     decoder.set_moe_w4a4(moe_w4a4);
     decoder.set_attention_projected_bias(attn_projected_bias);
     MiniDecoderLevers levers;
