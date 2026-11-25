@@ -66,8 +66,7 @@ public:
         // With the lever selected, the observed route: projected-bias appends submitted so far (0: every chunk declined
         // or was not admissible, so the image route ran).
         if (projected_bias_)
-            std::cerr << "Inkling attn_projected_bias dispatches " << decoder_.projected_attention_dispatches() << '
-';
+            std::cerr << "Inkling attn_projected_bias dispatches " << decoder_.projected_attention_dispatches() << '\n';
         return next;
     }
 
