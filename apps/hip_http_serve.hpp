@@ -30,6 +30,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <exception>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -499,7 +500,20 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         const auto translate = [&](const serve::GenerationJob& job, qwen::HttpSessionOwner::Callbacks callbacks,
                                    const MtpBatchRunner::AdmissionSink& submit) {
             MtpBatchRequest request;
-            request.constraint = constraints.make(job.constraint);
+            try {
+                request.constraint = constraints.make(job.constraint);
+            } catch (...) {
+                serve::GenerationStats stats;
+                stats.prompt_tokens = job.prompt.size();
+                stats.finish = "execution_failure";
+                stats.error_status = 500;
+                std::string error = "engine failure";
+                try { throw; }
+                catch (const std::exception& e) { if (*e.what()) error = e.what(); }
+                catch (...) {}
+                callbacks.finish(std::move(stats), std::move(error));
+                return;
+            }
             request.cache_retention = job.cache_retention;
             request.prompt = job.prompt;
             request.stable_prefix = job.stable_prefix;
@@ -565,6 +579,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                 if(!result.prompt_state_digest.empty()) stats.engine_extra.push_back({"prompt_state_digest","\""+result.prompt_state_digest+"\""});
                 stats.finish = result.finish;
                 stats.sampling = sampling;
+                if (result.finish == "execution_failure") stats.error_status = 500;
                 finish(std::move(stats), result.error);
             };
             callbacks.before_submit();
@@ -572,7 +587,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         };
         native.add_slot = [&](bool queued) { runner.add_slot(queued); };
         native.active = [&] { return runner.active(); };
-        native.has_free_slot = [&] { return runner.has_free_slot(); };
+        native.has_free_slot = [&] { return runner.http_can_admit(); };
         native.submit = [&](const serve::GenerationJob& job, qwen::HttpSessionOwner::Callbacks callbacks) {
             translate(job, std::move(callbacks), [&](MtpBatchRequest request) { runner.admit(std::move(request)); });
         };
@@ -587,17 +602,26 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         };
         native.step = [&] {
             const auto generation = probing ? probe.pending_generation() : 0;
-            if (generation) {
-                const bool completed = runner.step<true>();
-                if (completed) probe.complete(generation, serve::BackendProof::work_completion);
-            } else runner.step();
+            bool completed = false;
+            try {
+                if (generation) completed = runner.step<true>();
+                else runner.step();
+            } catch (...) {
+                runner.recover_http_step(std::current_exception());
+            }
+            if (completed) probe.complete(generation, serve::BackendProof::work_completion);
         };
         bool named_engine_failed = false;
         native.named = [&](serve::GenerationJob& job) {
-            if (!runner.session_run) throw std::logic_error("named session requires an idle session runner");
+            named_engine_failed = false;
+            if (!runner.http_named_available()) {
+                serve::GenerationStats stats;
+                stats.finish = "execution_failure";
+                stats.error_status = 500;
+                throw serve::GenerationRequestError(std::move(stats), "no healthy MTP session slot is available");
+            }
             MtpBridgeEngine engine(runner.session_run, options.context_tokens, constraints, false, false, false,
                 probing ? &probe : nullptr, options.product_profile);
-            named_engine_failed = false;
             try { return engine.generate(job); }
             catch (...) { named_engine_failed = engine.failed(); throw; }
         };
