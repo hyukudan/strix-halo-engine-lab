@@ -348,6 +348,16 @@ struct LowRankController {
     }
 };
 
+// Admission of the HIP transition body (residual_mix::launch_transition): the contract, a paired-bank block of at
+// least 256 threads (bank_count >= 2, the readout launch_mix runs for one row of more than one bank), the register
+// width of that readout, and no a8g32 image (the HIP decode leaves store none). Anything else runs the separate leaves.
+[[nodiscard]] inline bool hip_transition_admits(const TransitionArgs& args) {
+    if (!fits(args) || args.mix.bank_count < 2U || args.mix.width > kTransitionMaxWidth) return false;
+    for (const auto& norm : args.norm)
+        if (norm.codes || norm.deltas || norm.sums) return false;
+    return true;
+}
+
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #if defined(__HIPCC__)
 using Error = hipError_t;
@@ -632,14 +642,13 @@ __device__ __forceinline__ void emit_registers(const Args& args, std::size_t off
 // The parallel schedule launches one blockDim.y slice per bank. Each x thread
 // owns virtual lanes x and x+128, so their first add is stage 128 of the original
 // tree. All slices enter the remaining stages and their block barriers together.
-// SerialRegisters selects the register form of the serial schedule (false = its loop form, for the identity fixture).
-template <bool Normalized, bool ParallelBanks = false, class Args = MixArgs, bool SerialRegisters = kMixSerialRegisterForm>
-static __global__ void mix(Args args) {
+// The mix body over rows first, first + step, ... (every thread of the block runs it; each row ends with a block
+// barrier). The mix kernel runs it from blockIdx.x by gridDim.x; the transition body runs its one row (0, 1).
+template <bool Normalized, bool ParallelBanks, bool SerialRegisters = kMixSerialRegisterForm, class Args>
+__device__ __forceinline__ void mix_rows(Args args, unsigned first, unsigned step, float* scratch,
+                                         float* inverse, float (*probability)[kMaxBanks]) {
     using Jobs = MixJobs<Args>;
     constexpr unsigned bank_threads = ParallelBanks ? kPairedBankThreads : kThreads;
-    __shared__ float scratch[ParallelBanks ? bank_threads * kMaxBanks : kThreads];
-    __shared__ float inverse[kMaxBanks];
-    __shared__ float probability[kMaxQueries][kMaxBanks];
     const unsigned lane = threadIdx.x;
     const unsigned first_bank = ParallelBanks ? threadIdx.y : 0U;
     const unsigned banks_per_slice = ParallelBanks ? 1U : args.bank_count;
@@ -648,7 +657,7 @@ static __global__ void mix(Args args) {
     auto* bank_scratch = scratch + first_bank * bank_threads;
     const float score_scale = 1.0F / pool::sqrt_rn(static_cast<float>(args.width));
     const bool registers = kMixRegisterForm && (ParallelBanks || SerialRegisters) && args.width <= kMixRegisterWidth;
-    for (std::size_t row = blockIdx.x; row < Jobs::rows(args); row += gridDim.x) {
+    for (std::size_t row = first; row < Jobs::rows(args); row += step) {
         const auto offset = row * args.width;
         if constexpr (ParallelBanks && kMixRegisterForm) {
             if (registers)
@@ -721,6 +730,17 @@ static __global__ void mix(Args args) {
         __syncthreads();
     }
 }
+
+// SerialRegisters selects the register form of the serial schedule (false selects the loop fixture).
+template <bool Normalized, bool ParallelBanks = false, class Args = MixArgs, bool SerialRegisters = kMixSerialRegisterForm>
+static __global__ void mix(Args args) {
+    constexpr unsigned bank_threads = ParallelBanks ? kPairedBankThreads : kThreads;
+    __shared__ float scratch[ParallelBanks ? bank_threads * kMaxBanks : kThreads];
+    __shared__ float inverse[kMaxBanks];
+    __shared__ float probability[kMaxQueries][kMaxBanks];
+    mix_rows<Normalized, ParallelBanks, SerialRegisters>(args, blockIdx.x, gridDim.x, scratch, inverse, probability);
+}
+
 #endif
 
 struct AddRound {

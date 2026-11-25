@@ -1,6 +1,7 @@
 #include "inkling2/inkling2_mini_resident_route.hpp"
 #include "inkling2/inkling2_mini_serve.hpp"
 #include "inkling2/inkling2_mini_weight_options.hpp"
+#include "inkling2_mini_cli.hpp"
 #include "strix/serve/fixed_kv_cohort.hpp"
 #include "strix/serve/http_client.hpp"
 #include "strix/serve/replica_router.hpp"
@@ -8,8 +9,10 @@
 #include <algorithm>
 #include <cstdlib>
 #include <future>
+#include <initializer_list>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -207,18 +210,12 @@ void require_sample_reply(int status, std::string_view body, bool sample_capable
             "sampled HTTP reply did not use the fixture's final logits and specified seed");
 }
 
-// The HTTP regime keeps its 128-row scheduling slice on both backends (not the CLI's tall chunk); --prefill-rows
-// overrides it, and the context caps it. `extra` are further server arguments; `rows` the resolved slice.
-struct PrefillCase { std::vector<std::string> extra; unsigned rows; };
-
 // Run the production HTTP listener and owner on loopback. The device decoder
 // and tokenizer are fixtures.
-void socket_startup(const sv::ServiceFactory& factory, const char* backend, bool sample_capable,
-                    const PrefillCase& prefill) {
+void socket_startup(const sv::ServiceFactory& factory, const char* backend, bool sample_capable) {
     sv::ServiceSelection selection;
     selection.model.name = "inkling2-mini";
     selection.arguments = {"--checkpoint", "MODEL.safetensors", "--backend", backend, "--profile", "fast"};
-    selection.arguments.insert(selection.arguments.end(), prefill.extra.begin(), prefill.extra.end());
     factory.validate(selection);
     struct Listener final : sv::SessionService {
         explicit Listener(std::unique_ptr<sv::SessionService> delegate) : service(std::move(delegate)) {}
@@ -322,23 +319,109 @@ void set_image_env(const char* value) {
 #endif
 }
 
+void set_expert_env(const char* value) {
+#ifdef _WIN32
+    require(_putenv_s("STRIX_MOE_EXPERTS_NVFP4", value ? value : "") == 0, "cannot set STRIX_MOE_EXPERTS_NVFP4");
+#else
+    require((value ? setenv("STRIX_MOE_EXPERTS_NVFP4", value, 1) : unsetenv("STRIX_MOE_EXPERTS_NVFP4")) == 0,
+            "cannot set STRIX_MOE_EXPERTS_NVFP4");
+#endif
+}
+
+// Run the native CLI parser and the real service factory up to its decoder
+// construction boundary. The factory needs neither a device nor a listener.
+void profile_parity() {
+    const sv::SerialGenerationFamily family{"mini", "Mini", "MODEL", 8U, 8U, 16U, 0U, nullptr, 8U,
+        true, false, [](const std::string&) -> std::shared_ptr<const sv::BpeTokenizer> { return {}; },
+        true, {}, true};
+    const auto parse_cli = [&](const char* tier, std::initializer_list<const char*> input = {"1", "--generate", "2"}) {
+        std::vector<std::string> args{"mini", "MODEL.safetensors"};
+        args.insert(args.end(), input.begin(), input.end());
+        args.insert(args.end(), {"--profile", tier});
+        std::vector<char*> argv;
+        for (auto& arg : args) argv.push_back(arg.data());
+        return mini::cli::parse(static_cast<int>(argv.size()), argv.data(), family, true);
+    };
+    const auto refuses = [](const auto& action, std::string_view diagnostic) {
+        try { action(); }
+        catch (const std::invalid_argument& error) {
+            return std::string_view(error.what()).find(diagnostic) != std::string_view::npos;
+        }
+        return false;
+    };
+    constexpr std::string_view exact_error = "forbidden under --profile exact";
+    constexpr std::string_view consumer_error = "requires native resident model execution";
+    std::optional<mini::MiniServeOptions> loaded;
+    const auto create = [&](const mini::MiniServeOptions& options) {
+        loaded = options;
+        return mini::MiniServeCohort{
+            std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(), 32U, 3U, 2U), {}};
+    };
+    sv::ServiceFactories factories;
+    mini::install_mini_service(factories, {create, create},
+        [](const std::string&) {
+            return sv::BpeTokenizer::from_parts({"a"}, {1}, {}, "o200k");
+        }, {});
+    const auto* factory = factories.find("inkling2");
+    require(factory != nullptr, "Inkling service factory was not registered");
+    sv::ServiceSelection selection;
+    selection.model.name = "inkling2-mini";
+    selection.arguments = {"--checkpoint", "MODEL.safetensors", "--backend", "hip", "--profile", "fast"};
+    set_image_env("1");
+    for (const auto* backend : {"hip", "cuda"}) {
+        selection.arguments[3] = backend;
+        for (const auto* tier : {"fast", "turbo", "exact"}) {
+            const bool exact = std::string_view(tier) == "exact";
+            set_w4a4_env(exact ? nullptr : "mse");
+            selection.arguments.back() = tier;
+            for (const auto* value : {static_cast<const char*>(nullptr), "0", "1"}) {
+                set_expert_env(value);
+                loaded.reset();
+                if (exact && value && std::string_view(value) == "1") {
+                    const bool cli_refused = refuses([&] { (void)parse_cli(tier); }, exact_error);
+                    const bool server_refused = refuses([&] { (void)factory->create(selection); }, exact_error);
+                    require(cli_refused && server_refused && !loaded, "CLI and server must refuse narrow EXACT");
+                    continue;
+                }
+                const auto cli = parse_cli(tier);
+                const auto service = factory->create(selection);
+                const bool narrow = value && std::string_view(value) == "1";
+                require(service && loaded && loaded->checkpoint == "MODEL.safetensors" &&
+                        loaded->tier == cli.tier.profile &&
+                        loaded->experts_nvfp4 == narrow && loaded->experts_nvfp4 == mini::mini_experts_nvfp4(cli.tier) &&
+                        loaded->moe_w4a4 == mini::mini_moe_w4a4_class(cli.tier) &&
+                        loaded->combine_image == mini::mini_combine_image(cli.tier),
+                        "CLI and server selected different decoder inputs");
+            }
+        }
+    }
+    set_expert_env("1");
+    require(refuses([&] { (void)parse_cli("fast", {"--tokenize", "input.txt"}); }, consumer_error),
+            "tokenize-only CLI must refuse the narrow image");
+    require(refuses([&] {
+        (void)parse_cli("exact", {"--gate-manifest", "windows.tsv", "--gate-out", "out", "--gate-arm", "NULL",
+                                "--gate-rows", "2", "--gate-mode", "decode", "--gate-order-null", "--no-step-graph"});
+    }, exact_error), "the evaluation-order null must use the checkpoint image");
+    const auto cuda_route = [](const mini::cli::Options& options) {
+        return mini::cli::resolve_cuda_step_route(options, {}, strix::weight::kBf16WeightStorage, false);
+    };
+    require(refuses([&] { (void)cuda_route(parse_cli("fast")); }, consumer_error),
+            "CUDA step program must refuse an image it cannot load");
+    const auto resident = parse_cli("fast", {"1", "--generate", "2", "--no-step-graph"});
+    require(!cuda_route(resident).program && mini::mini_experts_nvfp4(resident.tier),
+            "CUDA resident replay must keep the explicit narrow image");
+    std::cout << "inkling2-mini-profile-parity: ok\n";
+}
+
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
             W4a4 w4a4 = W4a4::bf16, bool image = false, bool round_fold = false,
-            const PrefillCase& prefill = {{}, 128U}) {
+            bool controller_one_plane = false) {
     sv::ServiceFactories factories;
     bool created = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
         require(options.checkpoint == "MODEL.safetensors", "checkpoint did not reach native adapter");
         // The served prefill runs the operand class the profile resolved, never a class-less on/off.
         require(options.moe_w4a4 == w4a4, "W4A4 operand class did not reach native adapter");
-        require(options.prefill_rows == prefill.rows, "HTTP prefill slice differs from its regime");
-        // The same declared selection the CLI reads (inkling2::mini_prefill_rows), for the backend and profile served.
-        if (prefill.extra.empty())
-            require(options.prefill_rows ==
-                        mini::mini_prefill_rows(std::string_view(backend) == "hip" ? mini::MiniPrefillBackend::hip
-                                                                                   : mini::MiniPrefillBackend::cuda,
-                                                options.tier).http,
-                    "HTTP prefill slice is not the declared selection");
         require(options.prepared_round_fold == round_fold, "prepared round fold did not reach native adapter");
         // What the served backend then runs: the CUDA preparation has no fold, so a requested fold is declined there and the
         // startup line must say so; the qualified HIP target admits it. Same admission and same name as the CLI and the gate.
@@ -361,11 +444,13 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                 "an unrequested fold is reported off");
         // The served prefill resolves the down-image lever like the CLI and the gate do: off unless selected explicitly.
         require(options.combine_image == image, "down-image selection did not reach native adapter");
+        require(options.controller_one_plane == controller_one_plane, "controller plane value did not reach native adapter");
         require(options.tier == strix::profile::Name::fast && options.weight_options.qualify_q8 == qualify_q8,
                 "FAST request did not reach native adapter");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
         const strix::weight::WeightLoadScope scope{kind, {}, {}, {}, {}, {}};
-        const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope);
+        const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope,
+                                                                       {options.context, options.slots});
         created = true;
         return mini::MiniServeCohort{
             std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable), 32U, 3U, 2U), weights};
@@ -387,7 +472,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                        "--profile", "fast", "--speculation", "off"};
     std::vector<std::string> strings(std::begin(args), std::end(args));
     if (qualify_q8) strings.emplace_back("--qualify-q8");
-    strings.insert(strings.end(), prefill.extra.begin(), prefill.extra.end());
+    if (controller_one_plane) strings.insert(strings.end(), {"--controller-planes", "1"});
     const auto run = [&](sv::ServeShell shell, std::ostream& out, std::ostream& error) {
         std::vector<char*> argv;
         for (auto& arg : strings) argv.push_back(arg.data());
@@ -398,10 +483,25 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         strings.emplace_back("--family-inspect");
         const auto rc = run({}, out, error);
         strings.pop_back();
-        require(rc == 0 && !created, "Inkling profile inspection should run without device work");
+        if (rc != 0) throw std::runtime_error(error.str());
+        require(!created, "Inkling profile inspection should run without device work");
         const auto expected = qualify_q8 ? "weight_storage gguf.q8_0@1 weight_status unqualified" :
                                            "weight_storage plain.bf16@1 weight_status pending";
         require(out.str().find(expected) != std::string::npos, "inspection weight plan differs from CLI plan");
+        // The route line names the committed rows per regime (why the image stays BF16 on this backend).
+        const bool hip = std::string_view(backend) == "hip";
+        require(hip ? out.str().find(" weight_rows prefill=gate-only@gfx1151,decode=none") !=
+                          std::string::npos
+                    : out.str().find("weight_rows") == std::string::npos,
+                "inspection does not name the committed per-regime rows");
+        if (!hip || qualify_q8) return;
+        // Even an explicit one-slot server can confirm the BF16 default without a device.
+        std::ostringstream one, one_error;
+        strings.insert(strings.end(), {"--slots", "1", "--family-inspect"});
+        const auto one_rc = run({}, one, one_error);
+        strings.resize(strings.size() - 3U);
+        require(one_rc == 0 && !created && one.str().find(expected) != std::string::npos,
+                "a one-slot server must report the same BF16 default as an automatic-slot server");
     };
     inspect();
 
@@ -497,12 +597,21 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
     if (!qualify_q8 && (std::string_view(backend) == "hip" || sample_capable)) {
         const auto* factory = factories.find("inkling2");
         require(factory != nullptr, "Inkling service factory was not registered");
-        socket_startup(*factory, backend, sample_capable, prefill);
+        socket_startup(*factory, backend, sample_capable);
     }
 }
 } // namespace
 
 int main(int argc, char** argv) try {
+    if (argc == 3 && std::string_view(argv[2]) == "--profile-parity") {
+        profile_parity();
+        return 0;
+    }
+    if (argc == 3 && std::string_view(argv[2]) == "--controller-planes-only") {
+        wiring(argv[1], "cuda", false);
+        wiring(argv[1], "cuda", false, false, W4a4::bf16, false, false, true);
+        return 0;
+    }
     require(argc == 2, "expected repository root");
     set_image_env(nullptr);
     set_round_fold_env(nullptr);
@@ -513,11 +622,7 @@ int main(int argc, char** argv) try {
         wiring(argv[1], backend, true);
     }
     wiring(argv[1], "cuda", false, true);
-    for (const auto* backend : {"hip", "cuda"}) {
-        wiring(argv[1], backend, false, false, W4a4::bf16, false, false, PrefillCase{{std::string("--prefill-rows"), std::string("1024")}, 1024U});
-        wiring(argv[1], backend, false, false, W4a4::bf16, false, false, PrefillCase{{std::string("--context"), std::string("64")}, 64U});
-        wiring(argv[1], backend, false, false, W4a4::bf16, false, false, PrefillCase{{"--context", "64", "--prefill-rows", "4096"}, 64U});
-    }
+    wiring(argv[1], "cuda", false, false, W4a4::bf16, false, false, true);
     // Every lever value reaches the served decoder as its own class (mse used to run nearest@1 there).
     for (const auto& [value, expected] : {std::pair{"1", W4a4::nvfp4}, std::pair{"mse", W4a4::nvfp4_mse},
                                           std::pair{"mse-gate-up", W4a4::nvfp4_mse_gate_up}}) {

@@ -32,6 +32,7 @@ namespace {
 namespace sp = strix::parity;
 int g_failures = 0;
 bool g_print = false;
+bool g_require_output_parity = false;
 
 void check(bool ok, const std::string& what) {
     if (ok) return;
@@ -40,7 +41,7 @@ void check(bool ok, const std::string& what) {
 }
 
 void gate(const std::string& family, const sp::Config& cli, const sp::Config& server, std::span<const sp::Allowed> allowed) {
-    const auto report = sp::compare(cli, server, allowed);
+    const auto report = sp::compare(cli, server, allowed, g_require_output_parity);
     if (g_print) {
         std::cout << "== " << family << ": " << cli.size() << " cli keys, " << server.size() << " server keys, "
                   << report.explained.size() << " serving-only, " << report.unexplained.size() << " unexplained\n";
@@ -70,6 +71,13 @@ void helper_tests() {
     const sp::Allowed no_reason[] = {{"y", ""}};
     r = sp::compare(a, b, no_reason);
     check(!r.ok(), "an allowance without a reason does not count");
+    r = sp::compare(a, b, all, true);
+    check(!r.ok() && r.unexplained.size() == 3U && r.stale.empty(), "strict parity refuses historical allowances");
+    const sp::Config meta_cli{{"entry", "cli"}}, meta_server{{"entry", "http"}};
+    const sp::Allowed metadata[] = {{"entry", "receipt label", "not read by execution"}};
+    check(sp::compare(meta_cli, meta_server, metadata, true).ok(), "strict parity permits proven metadata");
+    const sp::Allowed wildcard[] = {{"*", "scheduler", "some routes tested"}};
+    check(!sp::compare(a, b, wildcard, true).ok(), "strict parity refuses wildcard evidence");
     const auto l = sp::from_lines("a=1\nb=2 (auto)\r\nnote\n\n");
     check(l.size() == 3U && l.at("a") == "1" && l.at("b") == "2 (auto)" && l.at("line.0") == "note", "from_lines");
     const std::vector<std::string> args{"--rank", "0", "--tp", "--rows", "8", "16"};
@@ -94,7 +102,7 @@ void glm() {
             if (const auto at = v.rfind(" ("); at != std::string::npos && !v.empty() && v.back() == ')') v.erase(at);
         return c;
     };
-    for (const char* profile : {"default", "fast", "quality"})
+    for (const char* profile : {"exact", "fast", "turbo", "quality"})
     for (const bool complete : {false, true}) for (const bool opt_out : {false, true}) {
         auto profile_request = request;
         profile_request.insert(profile_request.end(), {"--profile", profile});
@@ -123,8 +131,8 @@ void minimax() {
     const auto cli = sp::from_lines(md::effective_config(md::parse_cli("rank", {}), none));
     const auto server = sp::from_lines(md::effective_config(md::parse_cli("serve", {}), none));
     static constexpr sp::Allowed allowed[] = {
-        {"app", "the entry point's own name"},
-        {"session_reason", "text that quotes the app and transport names"},
+        {"app", "the entry point's own name", "effective_config receipt label, not an execution value"},
+        {"session_reason", "text that quotes the app and transport names", "effective_config explanation only"},
         // EXCEPTION for the user (not measured server vs CLI on the same transport): the server defaults to the device
         // exchange, the CLI to the host exchange.
         {"transport", "serve default usb4gpu (device exchange), rank default usb4-auto (host exchange)"},
@@ -215,7 +223,7 @@ void ds41() {
         {"arg:--prefill-path", "the server prefills prompts on the device batch path; the CLI's prompt goes through its decode windows"},
         {"arg:--prefill-rows", "row budget of the server's device prefill path (auto)"},
     };
-    for (const char* profile : {"default", "fast", "quality"})
+    for (const char* profile : {"exact", "fast", "turbo", "quality"})
         gate(std::string("ds41+") + profile, config(pd::App::rank, profile), config(pd::App::serve, profile), allowed);
 }
 #endif
@@ -268,11 +276,14 @@ void gemma() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    for (int i = 1; i < argc; ++i) g_print |= std::strcmp(argv[i], "--print") == 0;
+    for (int i = 1; i < argc; ++i) {
+        g_print |= std::strcmp(argv[i], "--print") == 0;
+        g_require_output_parity |= std::strcmp(argv[i], "--require-output-parity") == 0;
+    }
     try {
         helper_tests();
 #if defined(STRIX_PARITY_GLM)
-        std::cout << "included: glm (default/fast/quality; complete/missing MTP assets, default/opt-out)\n";
+        std::cout << "included: glm (exact/fast/turbo/quality; complete/missing MTP assets, default/opt-out)\n";
         glm();
 #else
         std::cout << "skipped: glm (resolver not linked)\n";

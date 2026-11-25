@@ -28,22 +28,40 @@ struct WeightLoadPolicy {
     Id id;
     FormatId target;
     Id legacy{};
+    // The output head's storage when it differs from the other tagged roles' (empty name: `target`). The per-role
+    // format map of a mix is data of the shared policy row, never a model code path.
+    FormatId head{};
+    [[nodiscard]] constexpr FormatId head_target() const noexcept { return head.name.empty() ? target : head; }
 };
 
 // Attention projections and the output head stored as Q8_0, converted from BF16 at load.
 inline constexpr WeightLoadPolicy kAttentionHeadQ8Policy{{"weights.attention_head.q8_0", 1}, kQ8WeightStorage};
-// The output head alone stored as Q8_0, converted from BF16 at load.
-inline constexpr WeightLoadPolicy kHeadQ8Policy{{"weights.head.q8_0", 1}, kQ8WeightStorage};
+// The output head alone stored as Q8_0, converted from BF16 at load; every other tagged role kept BF16 (per-role).
+inline constexpr WeightLoadPolicy kHeadQ8Policy{{"weights.head.q8_0", 1}, kBf16WeightStorage, {}, kQ8WeightStorage};
+// Low-bit mixes (strix/weight/host_lowbit.hpp, converted from BF16 at load; HIP consumers): attention projections and
+// head q6_g64; attention q4_g64 with a q6_g64 head; both q4_g64.
+inline constexpr WeightLoadPolicy kAttentionHeadQ6Policy{{"weights.attention_head.q6_g64", 1}, kQ6G64WeightStorage};
+inline constexpr WeightLoadPolicy kAttentionQ4HeadQ6Policy{
+    {"weights.attention_q4_g64.head_q6_g64", 1}, kQ4G64WeightStorage, {}, kQ6G64WeightStorage};
+inline constexpr WeightLoadPolicy kAttentionHeadQ4Policy{{"weights.attention_head.q4_g64", 1}, kQ4G64WeightStorage};
+// The output head alone in a low-bit storage, every other tagged role kept BF16. The head feeds no later layer, so
+// these rows leave the routes of a mixture-of-experts model untouched.
+inline constexpr WeightLoadPolicy kHeadQ6Policy{
+    {"weights.head.q6_g64", 1}, kBf16WeightStorage, {}, kQ6G64WeightStorage};
+inline constexpr WeightLoadPolicy kHeadQ4Policy{
+    {"weights.head.q4_g64", 1}, kBf16WeightStorage, {}, kQ4G64WeightStorage};
 // Every attention projection matrix (query, key, value, output and any auxiliary projection of the attention input,
 // such as an output gate, relative or sink projection) stored as Q8_0, converted from BF16 at load; the output head
-// stays BF16, so an exact head (full or screened) keeps its bits. Router and normalisation weights are not covered.
-inline constexpr WeightLoadPolicy kAttentionQ8Policy{{"weights.attention.q8_0", 1}, kQ8WeightStorage};
-inline constexpr std::array<const WeightLoadPolicy*, 3> kWeightLoadPolicies{
-    &kAttentionHeadQ8Policy, &kHeadQ8Policy, &kAttentionQ8Policy};
+// stays BF16 (per-role: `head`), so an exact head (full or screened) keeps its bits. Router and normalisation weights
+// are not covered.
+inline constexpr WeightLoadPolicy kAttentionQ8Policy{{"weights.attention.q8_0", 1}, kQ8WeightStorage, {}, kBf16WeightStorage};
+inline constexpr std::array<const WeightLoadPolicy*, 8> kWeightLoadPolicies{
+    &kAttentionHeadQ8Policy, &kHeadQ8Policy, &kAttentionQ8Policy, &kAttentionHeadQ6Policy, &kAttentionQ4HeadQ6Policy,
+    &kAttentionHeadQ4Policy, &kHeadQ6Policy, &kHeadQ4Policy};
 
 // The binding of a shared policy by a model whose earlier records stored it under `legacy`.
 [[nodiscard]] constexpr WeightLoadPolicy with_legacy(const WeightLoadPolicy& shared, Id legacy) noexcept {
-    return {shared.id, shared.target, legacy};
+    return {shared.id, shared.target, legacy, shared.head};
 }
 
 // True when `key` is the 'name@revision' text of `id` (decimal revision, no sign, no leading zero).
@@ -172,6 +190,16 @@ struct WeightLoadRequest {
     WeightLoadExtent extent{};  // resident context and decode lanes of the instance (bands of the rows)
 };
 
+// Resolved storage of the two tagged role classes (the output head, every other tagged role). One FormatId converts to
+// the same storage for both.
+struct RoleStorage {
+    FormatId attention = kBf16WeightStorage, head = kBf16WeightStorage;
+    constexpr RoleStorage() noexcept = default;
+    constexpr RoleStorage(FormatId all) noexcept : attention(all), head(all) {}  // NOLINT(google-explicit-constructor)
+    constexpr RoleStorage(FormatId attention_storage, FormatId head_storage) noexcept
+        : attention(attention_storage), head(head_storage) {}
+};
+
 // What one regime contributed to a plan: a full row (gate v2 PASS + measured gain), a gate-only row, or nothing.
 enum class RegimeQualification : std::uint8_t { none, gate_only, full };
 
@@ -191,16 +219,18 @@ inline constexpr std::size_t kMaxWeightLoadRegimes = 4;
 
 struct WeightLoadPlan {
     Id policy;
-    FormatId storage;
+    FormatId storage;  // every tagged role but the head
     profile::Status status;
     std::string_view reason;
     Digest256 gate_v2_pass{}, measured_gain{};
+    FormatId head_storage = kBf16WeightStorage;
     std::array<RegimeWeightLoad, kMaxWeightLoadRegimes> regimes{};  // per regime, in request order
     std::size_t regime_count = 0;
 
     [[nodiscard]] FormatId storage_for(std::optional<Role> role) const {
-        return role ? storage : kBf16WeightStorage;
+        return !role ? kBf16WeightStorage : *role == Role::head ? head_storage : storage;
     }
+    [[nodiscard]] RoleStorage roles() const { return {storage, head_storage}; }
     [[nodiscard]] std::span<const RegimeWeightLoad> regime_rows() const { return std::span(regimes).first(regime_count); }
 };
 
@@ -291,8 +321,9 @@ WeightLoadPlan resolve_weight_load(const Registry&, const WeightLoadPolicy&,
     return out;
 }
 
-// Receipt line of a resolved plan: 'strix-weight-load/v1 <policy id> <storage id> <status>'. The policy is
-// always printed under its generic id; a reader resolves older lines through find_weight_load_policy.
+// Receipt line of a resolved plan: 'strix-weight-load/v1 <policy id> <storage id> [head <head storage id>] <status>'
+// (the head part when the head storage differs). The policy is always printed under its generic id; a reader
+// resolves older lines through find_weight_load_policy.
 [[nodiscard]] inline std::string weight_load_receipt(const WeightLoadPlan& plan) {
     const auto put = [](std::string& out, Id id) {
         out += id.name;
@@ -303,6 +334,10 @@ WeightLoadPlan resolve_weight_load(const Registry&, const WeightLoadPolicy&,
     put(out, plan.policy);
     out += ' ';
     put(out, plan.storage);
+    if (!(plan.head_storage == plan.storage)) {
+        out += " head ";
+        put(out, plan.head_storage);
+    }
     out += ' ';
     out += profile::status_name(plan.status);
     return out;

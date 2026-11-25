@@ -99,14 +99,14 @@ __global__ __launch_bounds__(S * 256U) void gdn_gates_rows_kernel(const std::uin
 #pragma unroll
             for (unsigned j = 0; j < 8U; ++j) v[j] = tree[c * kChains + lane + 32U * j];
 #pragma unroll
-            for (unsigned j = 0; j < 4U; ++j) v[j] = gdn_window_add(v[j], v[j + 4U]);
-            v[0] = gdn_window_add(v[0], v[2]); v[1] = gdn_window_add(v[1], v[3]);
-            float total = gdn_window_add(v[0], v[1]);
-            total = gdn_window_add(total, lane_down<16U>(total));
-            total = gdn_window_add(total, lane_down<8U>(total));
-            total = gdn_window_add(total, lane_down<4U>(total));
-            total = gdn_window_add(total, lane_down<2U>(total));
-            total = gdn_window_add(total, lane_down<1U>(total));
+            for (unsigned j = 0; j < 4U; ++j) v[j] = gwin::add(v[j], v[j + 4U]);
+            v[0] = gwin::add(v[0], v[2]); v[1] = gwin::add(v[1], v[3]);
+            float total = gwin::add(v[0], v[1]);
+            total = gwin::add(total, lane_down<16U>(total));
+            total = gwin::add(total, lane_down<8U>(total));
+            total = gwin::add(total, lane_down<4U>(total));
+            total = gwin::add(total, lane_down<2U>(total));
+            total = gwin::add(total, lane_down<1U>(total));
             const unsigned p = c0 + c, g = g0 + p / RB, row = r0 + p % RB;
             if (lane == 0U) {
                 const bool alpha = g >= heads;
@@ -195,7 +195,7 @@ void gdn_prefill_lanes_norm_kernel(GdnPrefillRows rows, std::uint32_t count, flo
             value[part] = s.value[r][part * 32U + lane];
             square[part] = value[part] * value[part];
         }
-        const float inv = rsqrtf(gdn_window_key_sum(square) / static_cast<float>(128U) + epsilon);
+        const float inv = rsqrtf(gwin::key_sum(square) / static_cast<float>(128U) + epsilon);
 #pragma unroll
         for (std::uint32_t part = 0; part < 4U; ++part) {
             const auto channel = part * 32U + lane;
@@ -213,7 +213,7 @@ void gdn_prefill_lanes_norm_kernel(GdnPrefillRows rows, std::uint32_t count, flo
     float retained[K];
 #pragma unroll
     for (unsigned j = 0; j < K; ++j)
-        retained[j] = state[gdn_window_state_index<Storage>(value_head, sub + j * G, column, 128U)];
+        retained[j] = state[gwin::state_index<Storage>(value_head, sub + j * G, column, 128U)];
     fetch(0U);
     commit(stage[0]);
     __syncthreads();
@@ -261,6 +261,6 @@ void gdn_prefill_lanes_norm_kernel(GdnPrefillRows rows, std::uint32_t count, flo
     }
 #pragma unroll
     for (unsigned j = 0; j < K; ++j)
-        state[gdn_window_state_index<Storage>(value_head, sub + j * G, column, 128U)] = retained[j];
+        state[gwin::state_index<Storage>(value_head, sub + j * G, column, 128U)] = retained[j];
 }
 } // namespace gdn_gates

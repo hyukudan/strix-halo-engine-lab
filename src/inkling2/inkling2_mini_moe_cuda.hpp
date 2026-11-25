@@ -32,6 +32,8 @@ inline moe_core::grouped_microscaled::Schedule mini_cuda_moe_schedule() {
 
 inline constexpr auto enqueue_mini_cuda_router_logits = mini_grouped::cuda_router_logits<MiniMoeConfig>;
 
+// Config = MiniMoeNarrowConfig dispatches a narrow expert image (every layer NVFP4).
+template <class Config = MiniMoeConfig>
 inline cudaError_t enqueue_mini_cuda_resident_moe_decoded(
     moe_core::grouped_microscaled::Decode decode,
     unsigned physical_layer, unsigned rows, std::span<const float> input, std::span<const float> logits,
@@ -51,7 +53,7 @@ inline cudaError_t enqueue_mini_cuda_resident_moe_decoded(
                                   buffers.weights.data(), route_stream, tap);
         return status;
     };
-    return mini_grouped::enqueue_resident<MiniMoeConfig, MiniCudaMoeBackend>(
+    return mini_grouped::enqueue_resident<Config, MiniCudaMoeBackend>(
         physical_layer, rows, input, logits, selection_bias, output, route, matrices, csr, planned, workspace, stream,
         mini_grouped::LogitExtent::at_least, select, decode, activations, schedule);
 }

@@ -25,8 +25,10 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -51,6 +53,32 @@ struct MiniPinnedLogitsDeleter {
 };
 }  // namespace detail
 
+// The resident upload of the Mini text weights into `storage` (plan.bytes() long) and the views bound over it: the one
+// the decoder runs, shared with the operand-class fixture so that nothing in it is a second copy. On CUDA the staged
+// attention tensors are then certified (the declaration the attention linears read) through the shared bounded scan:
+// in chunks, no host copy of a whole tensor; no scan scratch leaves the certificate empty (three planes) and the load
+// complete. The HIP load path is unchanged.
+[[nodiscard]] inline MiniResidentWeights upload_mini_resident_weights(const MiniResidentWeightPlan& plan,
+                                                                      std::span<std::uint8_t> storage,
+                                                                      [[maybe_unused]] mini_gpu::Stream stream) {
+#if defined(__HIPCC__)
+    core::HipWeightUploader uploader;
+#else
+    strix::cuda::core::WeightUploader uploader;
+#endif
+    core::WeightSliceLoader loader(uploader, {});
+    auto weights = MiniResidentWeights::bind(plan, storage);
+    loader.load_resident(plan.slices(), storage);
+#if !defined(__HIPCC__)
+    core::Bf16StagedScan scan;
+    weights.certify_attention(scan, [&](std::span<const std::uint16_t> staged, std::span<std::uint16_t> host) {
+        mini_gpu::copy(host.data(), staged.data(), staged.size_bytes(), mini_gpu::device_to_host, stream);
+        mini_gpu::synchronize(stream);
+    });
+#endif
+    return weights;
+}
+
 // One unpadded token stream, bound to the selected device and stream for its
 // lifetime. All checkpoint tensors and live cache slots stay on the device.
 // The owner is serial. Calls return after the stream and state commit finish.
@@ -73,15 +101,16 @@ public:
     MiniResidentDecoder(const std::string& checkpoint, unsigned max_positions, unsigned max_chunk_rows,
                         bool packed_decode = false, bool step_graphs = MiniResidentBackend::default_step_graphs,
                         weight::FormatId storage = weight::kBf16WeightStorage, unsigned verify_rows = 0U,
-                        bool capture_draft_taps = false, unsigned decode_rows = 1U, unsigned tail_rows = 0U)
+                        bool capture_draft_taps = false, unsigned decode_rows = 1U, unsigned tail_rows = 0U,
+                        bool narrow_experts = false, bool controller_one_plane = false)
         : prefill_rows_(MiniResidentBackend::checked_chunk_rows(max_chunk_rows)),
           tail_rows_(admitted_tail_rows(prefill_rows_, tail_rows <= std::numeric_limits<unsigned>::max() - prefill_rows_
                      ? tail_rows : throw std::invalid_argument("Inkling 2 Mini: invalid prefill tail"))),
           decode_rows_(MiniResidentBackend::checked_chunk_rows(decode_rows)),
           max_rows_(std::max({MiniResidentBackend::checked_chunk_rows(prefill_rows_ + tail_rows_),
                               std::min(kMaxVerifyRows, verify_rows), decode_rows_})),
-          layout_(max_positions, max_rows_), weight_plan_(read_plan(checkpoint, storage)),
-          weight_storage_(weight_plan_.bytes()),
+          layout_(max_positions, max_rows_), weight_plan_(read_plan(checkpoint, storage, narrow_experts)),
+          weight_storage_(weight_plan_.bytes()), narrow_storage_(weight_plan_.narrow_bytes()),
           activations_(mini_resident_activation_elements(max_rows_)),
           history_backup_(session::cache_buffer_elements<float>(layout_.convolution_elements())),
           kv_backup_(mini_resident_max_kv_checkpoint_elements()), embeddings_(std::size_t{max_rows_} * kHiddenWidth),
@@ -90,7 +119,7 @@ public:
 #if !defined(__HIPCC__)
           token_ids_(max_rows_),
 #endif
-          weights_(upload_weights()), backend_(weights_, max_rows_, stream_.get(), packed_decode, step_graphs),
+          weights_(upload_weights(controller_one_plane)), backend_(weights_, max_rows_, stream_.get(), packed_decode, step_graphs),
           greedy_(decode_rows_, kOutputVocabulary) {
 #if defined(__HIPCC__)
         // EXACT screened greedy head (core/hip_screened_head.hpp) over the BF16 head: same token and status as the
@@ -537,31 +566,62 @@ private:
         }
     }
 
-    [[nodiscard]] static MiniResidentWeightPlan read_plan(const std::string& path, weight::FormatId storage) {
+    [[nodiscard]] static MiniResidentWeightPlan read_plan(const std::string& path, weight::FormatId storage,
+                                                          bool narrow_experts) {
         MiniTextWeights source;
         const auto status = source.open(path);
         if (!status) throw std::runtime_error(status.detail);
-        return MiniResidentWeightPlan::make(source, storage, MiniResidentBackend::resident_row_pitch_rule());
+        return MiniResidentWeightPlan::make(source, storage, MiniResidentBackend::resident_row_pitch_rule(),
+                                            narrow_experts);
     }
 
-    [[nodiscard]] MiniResidentWeights upload_weights() {
+    [[nodiscard]] MiniResidentWeights upload_weights(bool controller_one_plane) {
+        auto weights = upload_mini_resident_weights(weight_plan_, weight_storage_.span(), stream_.get());
 #if defined(__HIPCC__)
-        core::HipWeightUploader uploader;
+        static_cast<void>(controller_one_plane);
 #else
-        strix::cuda::core::WeightUploader uploader;
+        // CUDA certifies the staged controller weights rather than re-reading the checkpoint.
+        if (controller_one_plane)
+            weights.certify_controller([&](std::span<const std::uint16_t> staged, std::span<std::uint16_t> host) {
+                mini_gpu::copy(host.data(), staged.data(), staged.size_bytes(), mini_gpu::device_to_host, stream_.get());
+                mini_gpu::synchronize(stream_.get());
+            });
 #endif
-        core::WeightSliceLoader loader(uploader, {});
-        auto weights = MiniResidentWeights::bind(weight_plan_, weight_storage_.span());
-        loader.load_resident(weight_plan_.slices(), weight_storage_.span());
-#if !defined(__HIPCC__)
-        // Only the CUDA attention declaration consumes the certificate: it reads the staged attention tensors back
-        // instead of re-reading the checkpoint, so the HIP load path is unchanged.
-        weights.certify_attention([&](std::span<const std::uint16_t> staged, std::span<std::uint16_t> host) {
-            mini_gpu::copy(host.data(), staged.data(), staged.size_bytes(), mini_gpu::device_to_host, stream_.get());
-            mini_gpu::synchronize(stream_.get());
-        });
-#endif
+        if (weight_plan_.narrow_experts()) upload_narrow_experts(weights);
         return weights;
+    }
+
+    // Narrow expert image: each MXFP8 slab of the checkpoint is transcoded to NVFP4 on the host (shared
+    // weight/formats/microscaled_encode.hpp), copied into narrow_storage_ and bound; the receipt line states the
+    // transcode error against the checkpoint values and its cost.
+    void upload_narrow_experts(MiniResidentWeights& weights) {
+        namespace ms = weight::microscaled;
+        const auto start = std::chrono::steady_clock::now();
+        ms::PackError total;
+        unsigned slabs = 0;
+        for (unsigned layer = 0; layer < kPhysicalLayers; ++layer) {
+            if (!MiniResidentWeightPlan::narrowed(layer)) continue;
+            for (const auto projection : {MiniExpertProjection::gate_up, MiniExpertProjection::down}) {
+                ms::Nvfp4Slab slab;
+                if (const auto status = ms::transcode_slab_to_nvfp4(weight_plan_.expert_slab(layer, projection), slab);
+                    !status)
+                    throw std::runtime_error("Inkling 2 Mini: narrow expert transcode: " + status.detail);
+                const auto range = weight_plan_.narrow_range(layer, projection);
+                auto* codes = narrow_storage_.data() + range.codes;
+                auto* scales = narrow_storage_.data() + range.scales;
+                mini_gpu::copy(codes, slab.codes.data(), slab.codes.size(), mini_gpu::host_to_device, stream_.get());
+                mini_gpu::copy(scales, slab.scales.data(), slab.scales.size(), mini_gpu::host_to_device, stream_.get());
+                mini_gpu::synchronize(stream_.get());  // the host bytes end with this scope
+                weights.attach_narrow(layer, projection, slab, {codes, slab.codes.size()}, {scales, slab.scales.size()});
+                total.sse += slab.error.sse;
+                total.energy += slab.error.energy;
+                total.max_abs = std::max(total.max_abs, slab.error.max_abs);
+                ++slabs;
+            }
+        }
+        const auto ms_elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        std::cerr << "strix-experts-nvfp4 slabs " << slabs << " relative_rms " << total.relative() << " max_abs "
+                  << total.max_abs << " bytes " << weight_plan_.narrow_bytes() << " transcode_ms " << ms_elapsed << '\n';
     }
 
     void validate_inputs(const MiniResidentSessionState& state, std::span<const unsigned> tokens,
@@ -739,6 +799,7 @@ private:
     MiniResidentWeightPlan weight_plan_;
     mini_gpu::StreamOwner stream_;
     mini_gpu::Buffer<std::uint8_t> weight_storage_;
+    mini_gpu::Buffer<std::uint8_t> narrow_storage_;  // narrow expert image (empty without the lever)
     mini_gpu::Buffer<float> activations_, history_backup_;
     mini_gpu::Buffer<std::uint16_t> kv_backup_;
     mini_gpu::Buffer<float> embeddings_, hidden_, logits_;

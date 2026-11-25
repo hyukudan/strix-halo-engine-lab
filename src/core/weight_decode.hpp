@@ -5,6 +5,7 @@
 //   q8_0  34-byte blocks {f16 d, int8 q[32]}; weight = d * float(q)   (one FP32 product, as the g4 chunk decoder)
 //   q4_g64 / q6_g64  128-element superblocks (strix/weight/host_lowbit.hpp): weight = d * float(q), d the FP16 scale of
 //         the element's 64-group; a 16-weight chunk never crosses a group, its code words load 8 + 4 bytes aligned.
+//         This is the FP32 sweep decoder. The opt-in FP16 tile decodes integer operands via lowbit_f16_staging.hpp.
 #include "strix/weight/host_lowbit.hpp"
 
 #include <cstddef>

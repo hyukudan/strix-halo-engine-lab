@@ -19,4 +19,20 @@ __device__ __forceinline__ float lds_halving_sum(float* s, float part) {
     return r;
 }
 
+// The same tree at an explicit virtual lane l, for a fused body whose block is not L lanes along x. Lanes l >= L only
+// join the barriers (every thread of the block must call it); lanes l < L add exactly the pairs of
+// lds_halving_sum<L>, so the result has the same bits.
+template <unsigned L>
+__device__ __forceinline__ float lds_halving_sum_lanes(float* s, float part, unsigned l) {
+    if (l < L) s[l] = part;
+    __syncthreads();
+    for (unsigned h = L / 2; h > 0; h >>= 1U) {
+        if (l < h) s[l] = s[l] + s[l + h];
+        __syncthreads();
+    }
+    const float r = s[0];
+    __syncthreads();
+    return r;
+}
+
 }  // namespace strix::ops::norm

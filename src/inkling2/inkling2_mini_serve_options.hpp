@@ -1,6 +1,5 @@
 #pragma once
 
-#include "inkling2_mini_prefill_rows.hpp"
 #include "inkling2_mini_weight_options.hpp"
 #include "strix/serve/cohort_decode.hpp"
 
@@ -17,7 +16,7 @@ struct MiniServeOptions {
     std::string device_id;
     std::string device_profile;
     unsigned context = 8192;
-    unsigned prefill_rows = kMiniHttpPrefillRows;
+    unsigned prefill_rows = 128;
     unsigned slots = 0;
     std::uint64_t kv_bytes = 0;
     MiniWeightOptions weight_options;
@@ -27,9 +26,12 @@ struct MiniServeOptions {
     moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16;
     // Resolved prepared-attention round fold (mini_prepared_round_fold), the CLI's setting from the same resolution.
     bool prepared_round_fold = false;
+    // Resolved narrow expert image lever (mini_experts_nvfp4): the MXFP8 expert layers load as NVFP4.
+    bool experts_nvfp4 = false;
     // Resolved exact down-image lever (mini_combine_image): the HIP resident prefill stores the BF16 down image where the
     // target is qualified.
     bool combine_image = false;
+    bool controller_one_plane = false;
 };
 
 // The prepared_round_fold field of the served startup line: the requested bit from the options and what the decoder's backend

@@ -7,6 +7,9 @@
 #include "inkling2_mini_controller_device.hpp"
 #include "inkling2_mini_resident_route.hpp"
 #include "inkling2_mini_residual_device.hpp"
+#if !defined(__HIPCC__)
+#include "inkling2_mini_controller_operands_cuda.hpp"
+#endif
 #include "moe_core/microscaled_r1.hpp"
 
 #include <algorithm>
@@ -70,7 +73,7 @@ struct MiniResidentGqaBackend : Base {
 
     Status linear(const float* input, unsigned width, unsigned rows,
                   std::span<const core::ResidentRowProjection> views) const {
-        return core::dispatch_resident_rows<MiniProjectionWeights::role_count>(views, success, invalid,
+        return core::dispatch_resident_rows<MiniProjectionWeights::role_count>(input, width, rows, views, success, invalid,
             [&](std::span<const MiniAttentionLinear> group) {
                 return Base::linear(input, width, rows, group);
             },
@@ -81,6 +84,12 @@ struct MiniResidentGqaBackend : Base {
                     , this->big_context
 #endif
                 );
+            },
+            [&](std::span<const MiniAttentionLinear> group) {
+                return Base::linear_admitted(input, width, rows, group);
+            },
+            [&](std::span<const core::ResidentRowProjection> group) {
+                return core::resident_q8_projections_admitted<MiniProjectionWeights::role_count>(input, width, rows, group);
             });
     }
 
@@ -196,6 +205,13 @@ public:
     }
 
     [[nodiscard]] mini_gpu::Stream stream() const { return stream_; }
+#if !defined(__HIPCC__)
+    // The attention linears' backend (what attention() prepares with): the operand class the staged attention weights'
+    // certificate declares, on this backend's stream and dense context. `planes_report` observes each dispatch.
+    [[nodiscard]] detail::MiniPreparedCudaBackend attention_operand_backend(int* planes_report = nullptr) const {
+        return detail::mini_attention_backend(stream_, big_context_.get(), weights_.attention_certificate(), planes_report);
+    }
+#endif
 #if !defined(__HIPCC__)
     struct StepProgramBuffers {
         unsigned max_rows;
@@ -399,6 +415,15 @@ public:
                                           cuda_core::DenseArith::mma3, big_context_.get()));
 #endif
     }
+
+#if !defined(__HIPCC__)
+    // The opt-in CUDA schedule uses one plane for declared BF16 operands with certified resident weights.
+    void dense(const float* input, unsigned width, unsigned rows, std::span<const Projection> projections,
+               core::Bf16Operand operand) {
+        check(enqueue_controller_dense(weights_.controller_certificate(), input, width, rows, projections, stream_,
+                                       big_context_.get(), operand).status);
+    }
+#endif
 
 #if defined(__HIPCC__)
     // Projections on a BF16 operand image (the shared tile's image rows: same bits as dense on the FP32 rows).
@@ -605,9 +630,7 @@ private:
         // Producer-backed operands: the attention inputs are rmsnorm_bf16 rows and the output projection reads the
         // BF16 gated product, so the linears declare bf16_exact (one plane, same bits) where the staged attention
         // weights are certified (finite, ranges kept finite); otherwise they keep FP32 operands (three planes).
-        const detail::MiniPreparedCudaBackend native{
-            {stream_}, cuda_core::DenseArith::mma3, big_context_.get(),
-            weights_.attention_certificate().route(core::Bf16Operand::bf16_exact)};
+        const detail::MiniPreparedCudaBackend native = attention_operand_backend();
         const detail::MiniResidentGqaBackend<> adapter{native, gate_order_null_ ? &null_applications_ : nullptr};
         // One-row decode over native BF16 weights with a rows profile issues the
         // projection groups as one grouped rows call at the first round (the
@@ -823,14 +846,23 @@ public:
             return;
         }
 #if defined(__HIPCC__)
-        check(enqueue_mini_hip_resident_moe(layer, rows, input, logits, bias, output, buffers,
-                                            matrices, csr, planned, workspace, stream_, gate_route_tap_));
+        if (weights_.narrow_experts())
+            check(enqueue_mini_hip_resident_moe_for<MiniMoeNarrowConfig>(layer, rows, input, logits, bias, output, buffers,
+                                                                         matrices, csr, planned, workspace, stream_,
+                                                                         gate_route_tap_));
+        else
+            check(enqueue_mini_hip_resident_moe(layer, rows, input, logits, bias, output, buffers,
+                                                matrices, csr, planned, workspace, stream_, gate_route_tap_));
 #else
-        check(enqueue_mini_cuda_resident_moe_decoded(moe_decode_, layer, rows, input, logits, bias, output, buffers,
-                                                     matrices, csr, planned, workspace, stream_, gate_route_tap_,
-                                                     w4a4 ? moe_w4a4_class_
-                                                          : moe_core::grouped_w4a4::Activations::bf16,
-                                                     moe_schedule_));
+        const auto w4a4_class = w4a4 ? moe_w4a4_class_ : moe_core::grouped_w4a4::Activations::bf16;
+        if (weights_.narrow_experts())
+            check(enqueue_mini_cuda_resident_moe_decoded<MiniMoeNarrowConfig>(
+                moe_decode_, layer, rows, input, logits, bias, output, buffers, matrices, csr, planned, workspace, stream_,
+                gate_route_tap_, w4a4_class, moe_schedule_));
+        else
+            check(enqueue_mini_cuda_resident_moe_decoded(moe_decode_, layer, rows, input, logits, bias, output, buffers,
+                                                         matrices, csr, planned, workspace, stream_, gate_route_tap_,
+                                                         w4a4_class, moe_schedule_));
 #endif
     }
 
@@ -859,7 +891,7 @@ private:
                               route.weights.data(), stream_, gate_route_tap_);
 #endif
         using weight::microscaled::MatrixFormat;
-        const auto format = mini_expert_format(layer);
+        const auto format = weights_.expert_format(layer);
 #if defined(__HIPCC__)
         // HIP: one microscaled_r1 rows launch serves the routed rows (row r's bits are those of a one-row launch,
         // ink_hip_dec); the route status words stay one per row, contiguous from failure.

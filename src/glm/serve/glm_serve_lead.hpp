@@ -165,6 +165,7 @@ struct LeadConfig {
     // to rank 1 over the pair link before the restore.
     bool import_dsa_once = false;
     bool sampling = false;
+    TokenSamplerOptions sampler_options{};
 };
 
 
@@ -476,7 +477,7 @@ private:
             return reject(400, "context_length_exceeded",
                           "prompt of " + std::to_string(n) + " tokens does not fit the context of " + std::to_string(cfg_.capacity) + " positions");
         std::optional<strix::TokenSampler> sampler;
-        try { sampler = strix::serve::make_pair_sampler(job); }
+        try { sampler = strix::serve::make_pair_sampler(job, cfg_.sampler_options); }
         catch (const std::invalid_argument& error) { return reject(400, "invalid_request", error.what()); }
         auto lease = runtime().activate(0, true); // retain original queue take timestamp
         const auto slot = table_.alloc();

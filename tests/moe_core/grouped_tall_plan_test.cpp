@@ -10,7 +10,10 @@
 //  6. ring schedule: wait counts, slots and slabs give every read the stage it expects, after it landed, with no copy or decode
 //     into a slot or slab another thread may still read in the same barrier interval, K16 steps ascending over the whole K,
 //     for both decode / multiply orders inside an iteration (warps of one scheduler alternate them);
-//  7. selection and admission.
+//  7. selection and admission (staged block scales never remove a shape the direct-scale twin admits);
+//  8. block scales staged once per CTA: the copy covers every (output, block) byte once (4-byte chunks on whole-word rows,
+//     else bytes), after the tables, inside the launch's shared bytes; every decode job of every stage reads the byte of its
+//     own (output, block), the one a direct global load reads; the byte reads of one warp hit distinct banks.
 #include "core/f16_tile_gemm.hpp"
 #include "cuda/core/mma_tile.cuh"
 #include "moe_core/grouped_tall_plan.hpp"
@@ -34,7 +37,8 @@ void check(bool ok, const char* what, tall::FormId id, bool nvfp4) {
 }
 
 constexpr tall::FormId kForms[] = {tall::FormId::r128_k32_s4, tall::FormId::r128_k32_s3, tall::FormId::r128_w16_k32_s4,
-                                   tall::FormId::r64_k32_s4, tall::FormId::r128_n4_k32_s4};
+                                   tall::FormId::r64_k32_s4, tall::FormId::r128_n4_k32_s4,
+                                   tall::FormId::r128_k32_s4_direct};
 constexpr std::size_t kSm120OptinShared = 99U * 1024U;
 
 static_assert(tall::valid(tall::form(tall::FormId::r128_k32_s4), true));
@@ -324,8 +328,109 @@ void selection() {
     args.max_tile_rows = 128U;
     ok = ok && !tall::fits(args, tall::FormId::r128_k32_s4, true, 48U * 1024U);  // budget below the form's shared bytes
     check(ok, "ragged inputs / outputs, oversize tiles and a small shared budget refused", none, true);
+    // Budget thresholds (K = 4096, N = 2048, NVFP4 and MXFP8): staged r128 at or above its bytes, the direct twin (the
+    // incumbent r128 kernel) from its own bytes up to one byte below the staged ones, nothing below (automatic keeps the
+    // staged tile schedule, an explicit tall request refuses); r64 has no twin.
+    for (const bool nvfp4 : {true, false}) {
+        view::Args big{};
+        big.inputs = 4096U;
+        big.outputs = 2048U;
+        big.max_tile_rows = 128U;
+        const tall::Form fs = tall::form(tall::FormId::r128_k32_s4), fd = tall::form(tall::FormId::r128_k32_s4_direct);
+        const std::size_t staged = tall::shared_bytes(fs, tall::layout(fs, nvfp4), big.inputs, nvfp4);
+        const std::size_t direct = tall::shared_bytes(fd, tall::layout(fd, nvfp4), big.inputs, nvfp4);
+        tall::FormId got = tall::FormId::r128_k32_s3;
+        ok = direct < staged && tall::layout(fs, nvfp4).smem == tall::layout(fd, nvfp4).smem &&
+             tall::direct_twin(tall::FormId::r128_k32_s4) == tall::FormId::r128_k32_s4_direct &&
+             tall::direct_twin(tall::FormId::r64_k32_s4) == tall::FormId::r64_k32_s4;
+        ok = ok && tall::resolve(big, nvfp4, staged, got) && got == tall::FormId::r128_k32_s4;
+        ok = ok && tall::resolve(big, nvfp4, staged - 1U, got) && got == tall::FormId::r128_k32_s4_direct;
+        ok = ok && tall::resolve(big, nvfp4, direct, got) && got == tall::FormId::r128_k32_s4_direct;
+        got = tall::FormId::r128_k32_s3;
+        ok = ok && !tall::resolve(big, nvfp4, direct - 1U, got) && got == tall::FormId::r128_k32_s3;
+        if (nvfp4)  // NVFP4 at a 96 KiB budget: the incumbent admits r128, staging alone would not -> the direct twin
+            ok = ok && direct == 71808U && staged == 105088U && tall::resolve(big, nvfp4, 96U * 1024U, got) &&
+                 got == tall::FormId::r128_k32_s4_direct;
+        big.max_tile_rows = 64U;
+        const tall::Form f64 = tall::form(tall::FormId::r64_k32_s4);
+        const std::size_t b64 = tall::shared_bytes(f64, tall::layout(f64, nvfp4), big.inputs, nvfp4);
+        ok = ok && tall::resolve(big, nvfp4, b64, got) && got == tall::FormId::r64_k32_s4 &&
+             !tall::resolve(big, nvfp4, b64 - 1U, got);
+        check(ok, "budget thresholds: staged r128 >= its bytes, direct twin below, none under the direct bytes", none, nvfp4);
+    }
     ok = mma::microscaled::kRowsPerTile == tall::kMaxRows;
     check(ok, "plan rows per tile = the tall CTA extent", none, true);
+}
+
+// 8. Block scales staged once per CTA (the CUDA body's prologue copy and its decode reads).
+void scales(tall::FormId id, bool nvfp4, unsigned inputs, std::uintptr_t scale_address) {
+    const tall::Form f = tall::form(id);
+    const tall::Layout l = tall::layout(f, nvfp4);
+    const unsigned blocks = tall::scale_blocks(inputs, nvfp4), pitch = tall::scale_pitch(inputs, nvfp4);
+    const unsigned block_columns = nvfp4 ? 16U : 32U, stride = f.k_slab / block_columns;
+    if (!f.staged_scales) {  // direct loads: no region, the incumbent shared bytes
+        check(tall::shared_bytes(f, l, inputs, nvfp4) == l.smem, "direct-scale form adds no shared bytes", id, nvfp4);
+        return;
+    }
+    bool ok = blocks * block_columns == inputs && pitch % 4U == 0U && (pitch / 4U) % 2U == 1U && pitch >= blocks &&
+              tall::scale_bytes(inputs, nvfp4) == tall::kOutputs * pitch &&
+              tall::shared_bytes(f, l, inputs, nvfp4) == l.smem + tall::scale_bytes(inputs, nvfp4) &&
+              l.smem >= l.table + l.table_bytes;
+    check(ok, "scale region after the tables, odd word pitch", id, nvfp4);
+
+    // Copy map: global byte (output o, block b) lands at scale_offset(o, b), each exactly once.
+    std::vector<unsigned> hits(tall::kOutputs * blocks, 0U);
+    const auto land = [&](unsigned o, unsigned b, unsigned dst) {
+        if (o >= tall::kOutputs || b >= blocks || dst != tall::scale_offset(l, pitch, o, b) ||
+            dst >= tall::shared_bytes(f, l, inputs, nvfp4))
+            return false;
+        ++hits[o * blocks + b];
+        return true;
+    };
+    ok = true;
+    if (tall::scale_words(inputs, nvfp4, scale_address)) {
+        const unsigned words = blocks / 4U;
+        for (unsigned t = 0; t < f.threads(); ++t)
+            for (unsigned c = t; c < tall::kOutputs * words; c += f.threads()) {
+                const unsigned o = c / words, w = c % words, dst = tall::scale_offset(l, pitch, o, 4U * w);
+                ok = ok && dst % 4U == 0U && (scale_address + std::uintptr_t{o} * blocks + 4U * w) % 4U == 0U;
+                for (unsigned i = 0; i < 4U; ++i) ok = ok && land(o, 4U * w + i, dst + i);
+            }
+    } else {
+        for (unsigned t = 0; t < f.threads(); ++t)
+            for (unsigned c = t; c < tall::kOutputs * blocks; c += f.threads())
+                ok = ok && land(c / blocks, c % blocks, tall::scale_offset(l, pitch, c / blocks, c % blocks));
+    }
+    for (const unsigned h : hits) ok = ok && h == 1U;
+    check(ok, "scale copy covers every (output, block) once", id, nvfp4);
+
+    // Decode reads: job (output, column) of stage s reads the byte of block (s k_slab + column) / block columns, the same
+    // block every input of the job belongs to (a direct load reads tile16_address(output, s k_slab + column).scale_code).
+    ok = true;
+    for (unsigned s = 0; s < inputs / f.k_slab; ++s)
+        for (unsigned t = 0; t < f.threads(); ++t) {
+            const tall::DecodeJob job = tall::decode_job(f, t);
+            const unsigned first = tall::scale_offset(l, pitch, job.output, job.column / block_columns);
+            const unsigned block = (s * f.k_slab + job.column) / block_columns;
+            ok = ok && first + s * stride == tall::scale_offset(l, pitch, job.output, block) &&
+                 (s * f.k_slab + job.column + job.columns - 1U) / block_columns == block;
+        }
+    check(ok, "decode jobs read their own (output, block) scale byte", id, nvfp4);
+
+    // Banks: within a warp, two jobs reading different words never share a bank.
+    ok = true;
+    for (unsigned w0 = 0; w0 < f.threads(); w0 += 32U) {
+        unsigned word_of_bank[32];
+        for (unsigned& b : word_of_bank) b = ~0U;
+        for (unsigned t = w0; t < w0 + 32U; ++t) {
+            const tall::DecodeJob job = tall::decode_job(f, t);
+            const unsigned word = tall::scale_offset(l, pitch, job.output, job.column / block_columns) / 4U;
+            unsigned& seen = word_of_bank[word % 32U];
+            ok = ok && (seen == ~0U || seen == word);
+            seen = word;
+        }
+    }
+    check(ok, "scale byte reads of a warp conflict-free", id, nvfp4);
 }
 
 }  // namespace
@@ -334,6 +439,9 @@ int main() {
     for (const auto id : kForms) {
         for (const bool nvfp4 : {true, false}) {
             plans(id, nvfp4);
+            for (const unsigned inputs : {32U, 64U, 96U, 160U, 1152U, 2304U})
+                for (const std::uintptr_t address : {std::uintptr_t{0x1000}, std::uintptr_t{0x1002}})
+                    scales(id, nvfp4, inputs, address);
             for (const unsigned live : {1U, 15U, 16U, 17U, 33U, 63U, 64U, 65U, 100U, 127U, 128U})
                 if (live <= tall::form(id).rows) operands(id, nvfp4, live);
         }
@@ -347,6 +455,6 @@ int main() {
         std::printf("grouped_tall_plan_test: FAIL (%d)\n", failures);
         return 1;
     }
-    std::printf("grouped_tall_plan_test: PASS (5 forms x 2 formats: layout, copies, decode, operands, stores, ring schedule)\n");
+    std::printf("grouped_tall_plan_test: PASS (6 forms x 2 formats: layout, copies, decode, operands, stores, ring schedule)\n");
     return 0;
 }

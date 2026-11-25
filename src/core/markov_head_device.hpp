@@ -4,6 +4,7 @@
 #include "core/pointwise.hpp"
 #include "strix/attn/cache_rows.hpp"
 #include "strix/weight/formats/ieee_half.hpp"
+#include "strix/weight/host_lowbit.hpp"
 #include "strix/weight/host_q8.hpp"
 
 namespace strix::core::markov_device {
@@ -23,6 +24,19 @@ struct Q8Matrix {
         using Q8 = weight::Q8Storage;
         const auto* block = Q8::block(data + row * stride, column / Q8::elements);
         return __fmul_rn(weight::ieee_half::decode(Q8::scale_bits(block)), static_cast<float>(Q8::code(block, column % Q8::elements)));
+    }
+};
+
+// Low-bit resident rows (q4_g64 / q6_g64): weight = float(fp16 scale) * code, the exact product of the storage.
+template <class Storage>
+struct LowBitMatrix {
+    const std::uint8_t* data;
+    std::size_t stride;
+    __device__ float load(std::size_t row, unsigned column) const {
+        const auto* block = data + row * stride + std::size_t{column / Storage::elements} * Storage::bytes;
+        const unsigned j = column % Storage::elements;
+        return __fmul_rn(weight::ieee_half::decode(Storage::scale_bits(block, j / Storage::group)),
+                         static_cast<float>(Storage::code(block, j)));
     }
 };
 

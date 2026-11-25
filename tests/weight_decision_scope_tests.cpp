@@ -134,6 +134,28 @@ int main() {
                                                                         renamed)) ==
                     "strix-weight-load/v1 weights.attention_head.q8_0@1 plain.bf16@1 builtin",
                 "EXACT receipt keeps BF16 storage");
+    weight::WeightLoadPlan head_only{{"weights.head.q6_g64", 1}, weight::kBf16WeightStorage, strix::profile::Status::set, ""};
+    head_only.head_storage = weight::kQ6G64WeightStorage;
+    ok &= check(weight::weight_load_receipt(head_only) ==
+                    "strix-weight-load/v1 weights.head.q6_g64@1 plain.bf16@1 head strix.q6_g64@1 profile",
+                "receipt names a head storage that differs");
+    // The role rows in the per-role form: the head-only Q8_0 row keeps the other roles BF16, the attention row keeps
+    // the head BF16, and the plan of an arm names both role classes.
+    static_assert(weight::same_id(weight::kHeadQ8Policy.target, weight::kBf16WeightStorage) &&
+                  weight::same_id(weight::kHeadQ8Policy.head_target(), weight::kQ8WeightStorage));
+    static_assert(weight::same_id(weight::kAttentionQ8Policy.target, weight::kQ8WeightStorage) &&
+                  weight::same_id(weight::kAttentionQ8Policy.head_target(), weight::kBf16WeightStorage));
+    {
+        const weight::WeightLoadRequest arm{strix::profile::Name::fast, scope, formats, true, true};
+        const auto head_arm = weight::resolve_weight_load(weight::builtin_registry(), weight::kHeadQ8Policy, arm, {});
+        const auto attention_arm =
+            weight::resolve_weight_load(weight::builtin_registry(), weight::kAttentionQ8Policy, arm, {});
+        ok &= check(head_arm.roles().attention == weight::kBf16WeightStorage &&
+                        head_arm.roles().head == weight::kQ8WeightStorage &&
+                        attention_arm.roles().attention == weight::kQ8WeightStorage &&
+                        attention_arm.roles().head == weight::kBf16WeightStorage,
+                    "head-only and attention-only Q8_0 arms name their role storages");
+    }
 
     // Per-regime rows: one resident image serves prefill and decode. A gate-only row (gate v2 PASS, no measured
     // gain) never selects the image; a full row selects it only when every regime of the image has a gate row.
