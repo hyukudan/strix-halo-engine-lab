@@ -3,6 +3,7 @@
 #include "strix/env_arms.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/moe/route_file.hpp"
 #include "glm/prefill/glm_pf_aux.hpp"
 #include "glm_deploy_owners.hpp"
 #include "glm/load/glm_rank_plan.hpp"
@@ -1096,6 +1097,7 @@ int main(int argc, char** argv) {
         }
         for (const auto& toks : decode_prompts) {
             eng.reset(0);
+            strix::moe::route_tap_sequence(pi);  // FAST gate v2: a "{seq}" route path gives each prompt its own segment
             // The image rows of this prompt's prefill; set before the free-memory reading (the staging is allocated here).
             if (!embed_splice.empty()) eng.set_embed_rows(embed_splice);
             if (!bitcalc_cases.empty() && (setenv("STRIX_BITCALC_FORCE_TOKENS", bitcalc_cases[pi].first.c_str(), 1) != 0 ||
