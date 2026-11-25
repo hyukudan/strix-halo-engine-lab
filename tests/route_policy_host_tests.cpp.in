@@ -460,6 +460,115 @@ void glm_schedule() {
     const auto tail = strix::glm::record_prefill_chunk("http", false, 0, 2, 500, "gemv");
     require(tail.tokens == 512 && tail.rows == 6 && tail.declined && tail.mixed, "growth must include engine remainder");
 }
+// Request-fixed dense core (glm_pf_dense_policy.hpp pin_*): the core of every prompt row is the CLI's for that prompt
+// whatever chunks the traffic proposes. Oracle: the engine's own call partition (engine_calls) and the launcher's
+// route choice per call, rows of the whole prompt in one call sequence (the CLI) against rows of the chunks.
+std::vector<unsigned> row_cores(const std::vector<std::size_t>& chunks, unsigned cap, unsigned pipeline = 1) {
+    namespace dp = strix::glm::pf::dense_policy;
+    std::vector<unsigned> cores;
+    for (const auto tokens : chunks)
+        for (const unsigned rows : engine_calls(static_cast<unsigned>(tokens), cap, 1, false, pipeline)) {
+            const auto route = dp::choose(rows, strix::envcfg::text).route;
+            cores.insert(cores.end(), rows, route);
+        }
+    return cores;
+}
+void glm_pin() {
+    namespace dp = strix::glm::pf::dense_policy;
+    env("STRIX_GLM_PF_EXACT_X", "auto");
+    env("STRIX_GLM_PF_EXACT_X_MIN_ROWS", nullptr);
+    env("STRIX_GLM_PF_PIPELINE", "1");
+    env("STRIX_GLM_PF_WMMA", "1");
+    std::size_t unpinned_mismatch = 0, pinned_chunks = 0;
+    for (const unsigned cap : {64U, 100U, 512U, 2048U}) {
+        const auto shape = dp::pin_shape(0, cap, 1, strix::envcfg::text);
+        require(shape.active && shape.min_rows == dp::kWmmaMinRows, "pin active under FAST WMMA with the auto core");
+        std::vector<std::size_t> prompts;
+        for (std::size_t p = 1; p <= 140; ++p) prompts.push_back(p);
+        for (const std::size_t k : {1U, 2U, 3U})
+            for (int d = -40; d <= 40; ++d) prompts.push_back(k * cap + d > 0 ? k * cap + d : 1);
+        for (const auto prompt : prompts) {
+            const auto cli = row_cores({prompt}, cap);
+            require(cli.size() == prompt, "oracle covers every row");
+            // Several traffic patterns: the proposed chunk size per step (a cohort of any width, a lone prompt that
+            // takes the whole rest, the 512-token base chunk, grouped chunks) and every start phase.
+            for (const std::size_t base : {std::size_t{1}, std::size_t{7}, std::size_t{31}, std::size_t{32}, std::size_t{33},
+                                           std::size_t{63}, std::size_t{64}, std::size_t{512}, std::size_t{513},
+                                           std::size_t{1024}, std::size_t{100000}}) {
+                for (const bool pin : {false, true}) {
+                    auto s = shape;
+                    s.prompt = prompt;
+                    std::vector<std::size_t> chunks;
+                    std::size_t done = 0, step = 0;
+                    while (done < prompt) {
+                        std::size_t m = std::min(prompt - done, base + (step % 3) * (base / 2));  // traffic varies per step
+                        if (pin) m = dp::pin_chunk(s, done, m);
+                        require(m >= 1 && done + m <= prompt, "chunk inside the prompt");
+                        if (pin) require(dp::pin_admits(s, done, done + m), "pinned chunk is an admitted end");
+                        chunks.push_back(m);
+                        done += m;
+                        ++step;
+                    }
+                    const bool same = row_cores(chunks, cap) == cli;
+                    if (pin) {
+                        require(same, "pinned chunks keep the CLI core of every row");
+                        pinned_chunks += chunks.size();
+                    } else if (!same) ++unpinned_mismatch;
+                }
+            }
+        }
+    }
+    require(unpinned_mismatch > 0, "without the pin the chunks move rows to another core (the test is sensitive)");
+    require(pinned_chunks > 0, "pinned runs executed");
+    // Single shot: the whole prompt in one chunk whenever that is the CLI partition; 512-row base on a 2048-row call.
+    {
+        auto s = dp::pin_shape(2054, 2048, 1, strix::envcfg::text);
+        require(dp::pin_chunk(s, 0, 2054) == 2054, "whole prompt with the CLI tail (call 2048 + 6) is admitted as is");
+        require(dp::pin_chunk(s, 0, 1030) == 1030, "a chunk of the WMMA class that leaves the CLI call whole is unchanged");
+        require(dp::pin_chunk(s, 0, 2050) == 2054, "a chunk ending inside the 6-row CLI tail extends to the prompt end");
+        require(dp::pin_chunk(s, 2048, 512) == 6, "the 6-row CLI tail runs as its own TM call");
+        require(dp::pin_chunk(s, 0, 512) == 512 && dp::pin_chunk(s, 512, 512) == 512, "a base chunk of whole WMMA calls is unchanged");
+        require(dp::pin_chunk(s, 1536, 512) == 512, "a chunk ending on the CLI call boundary is unchanged");
+        require(dp::pin_chunk(s, 1520, 512) == 528, "a chunk that would leave a gap under the floor is extended to the call end");
+    }
+    // Root snapshot cuts: reusable only when the rows before it hold the head class under any prompt length.
+    {
+        auto s = dp::pin_shape(2054, 2048, 1, strix::envcfg::text);
+        require(dp::pin_root_admits(s, 0, 512), "root inside the head calls");
+        require(!dp::pin_root_admits(s, 0, 2054), "root at a TM tail end is not reusable by a longer prompt");
+        s = dp::pin_shape(2100, 2048, 1, strix::envcfg::text);
+        require(dp::pin_root_admits(s, 0, 2100), "a WMMA tail has the head class: reusable");
+    }
+    // Pipeline 2 (each call split into two column halves): the same oracle, every row's core equals the CLI's.
+    env("STRIX_GLM_PF_PIPELINE", "2");
+    for (const unsigned cap : {64U, 256U, 512U}) {
+        for (std::size_t prompt = 1; prompt <= 1100; prompt += (prompt < 140 ? 1 : 7)) {
+            auto s = dp::pin_shape(prompt, cap, 2, strix::envcfg::text);
+            const auto cli = row_cores({prompt}, cap, 2);
+            for (const std::size_t base : {std::size_t{33}, std::size_t{63}, std::size_t{100}, std::size_t{512}}) {
+                std::vector<std::size_t> chunks;
+                std::size_t done = 0, step = 0;
+                while (done < prompt) {
+                    const auto m = dp::pin_chunk(s, done, std::min(prompt - done, base + (step++ % 2) * 29));
+                    require(m >= 1 && done + m <= prompt, "pipeline 2: chunk inside the prompt");
+                    require(dp::pin_admits(s, done, done + m) || done + m == prompt, "pipeline 2: admitted end");
+                    chunks.push_back(m);
+                    done += m;
+                }
+                require(row_cores(chunks, cap, 2) == cli, "pipeline 2: pinned chunks keep the CLI core of every row");
+            }
+        }
+    }
+    // EXACT (no WMMA identity) and forced routes: no pin (X3 == TM bits, a forced route is one core).
+    env("STRIX_GLM_PF_PIPELINE", "1");
+    env("STRIX_GLM_PF_WMMA", nullptr);
+    require(!dp::pin_shape(2054, 2048, 1, strix::envcfg::text).active, "EXACT: no pin");
+    env("STRIX_GLM_PF_WMMA", "1");
+    env("STRIX_GLM_PF_EXACT_X", "4");
+    require(!dp::pin_shape(2054, 2048, 1, strix::envcfg::text).active, "forced route: no pin");
+    require(dp::pin_chunk(dp::pin_shape(2054, 2048, 1, strix::envcfg::text), 0, 1030) == 1030, "inactive pin keeps the proposal");
+    env("STRIX_GLM_PF_EXACT_X", "auto");
+}
 void glm_reference() {
     namespace dp = strix::glm::pf::dense_policy;
     env("STRIX_GLM_PF_PIPELINE", "2");
@@ -546,6 +655,7 @@ int main(int argc, char** argv) {
         else if (name == "glm_bypass") glm_bypass();
         else if (name == "glm_serve_chunk") glm_serve_chunk();
         else if (name == "glm_schedule") glm_schedule();
+        else if (name == "glm_pin") glm_pin();
         else if (name == "glm_reference") glm_reference();
         else if (name == "glm_dense_baseline") glm_dense_baseline();
         else throw std::runtime_error("unknown test case");
