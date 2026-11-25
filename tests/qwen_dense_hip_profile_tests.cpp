@@ -76,7 +76,12 @@ int main() {
         const std::string reference = granted_entry ? granted_entry->ladder_reference : std::string();
         require(reference.starts_with("ladder-arm/v4;"), "Qwen dense HIP reports the reference of the layer table");
         timing.over = reference;
-        engine.ladder = std::span(&timing, 1);
+        // The timing row replaces the layer table's grant only; the window cell keeps its own grant.
+        std::vector<sp::LadderRow> rows;
+        for (const auto& row : hp::engine(app).ladder)
+            if (row.lever != "a4w4_layers") rows.push_back(row);
+        rows.push_back(timing);
+        engine.ladder = rows;
         const auto measured = hp::resolve_args(engine, with_fast, no_env, {sp::Phase::prefill, 8192, 1, "fixture", "fixture-exec"});
         sp::apply(measured.resolution, [&](const char* k, const char* v) { put.emplace_back(k, v); return true; });
         require(put == std::vector<std::pair<std::string, std::string>>{{"STRIX_DENSE_A4W4_LAYERS", "48-63"}},

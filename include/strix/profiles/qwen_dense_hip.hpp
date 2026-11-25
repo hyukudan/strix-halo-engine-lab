@@ -76,8 +76,10 @@ inline constexpr std::string_view kTurboVersion = "qwen35-hip-turbo-v1";
 // One engine per app: each app owns only its own spelling of the window lever; both take the A4W4 layer table.
 inline sp::Engine engine(App app) {
     const std::span<const sp::Lever> rows(table);
+    const std::span<const sp::LadderRow> ladder(kLadderRows);  // same order as the table: each app's two rows
     return {app == App::spec ? "qwen35-hip-spec" : "qwen35-hip-decode", kAllowEnv,
-            app == App::spec ? rows.subspan(1U, 2U) : rows.subspan(0U, 2U), false, kTurboVersion, {}, {}, kLadderRows};
+            app == App::spec ? rows.subspan(1U, 2U) : rows.subspan(0U, 2U), false, kTurboVersion, {}, {},
+            app == App::spec ? ladder.subspan(1U, 2U) : ladder.subspan(0U, 2U)};
 }
 
 struct Result {
