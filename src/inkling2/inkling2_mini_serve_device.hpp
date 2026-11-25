@@ -53,6 +53,13 @@ inline MiniServeCohort make_mini_device_cohort(
             opt.served_cli_route && kMiniPackedDecodeDefault, MiniResidentBackend::default_step_graphs,
             weights.roles(), 0U, false, rows, opt.served_cli_route ? opt.prefill_tail : 0U,
             opt.experts_nvfp4, opt.controller_one_plane, opt.served_cli_route, std::move(lowbit));
+#if defined(__HIPCC__)
+        // A TURBO load whose prompts may select the rotated integer class builds its images now, not in the first prompt.
+        if (mini_prompt_moe_may_select(weight_options, scope.device_class, moe_core::grouped_w4a4::Activations::iu4_rot,
+                                       MiniPromptExecution{scope.cost_device, opt.context,
+                                                           static_cast<std::uint32_t>(opt.prefill_rows)}))
+            decoder->set_moe_w4a4(moe_core::grouped_w4a4::Activations::iu4_rot);
+#endif
         levers = configure_mini_decoder(*decoder, opt.moe_w4a4, opt.combine_image, opt.prepared_round_fold,
                                         opt.attn_projected_bias, opt.screened_head, opt.verify_rows);
         // Admitted speculation: one-lane verify windows on any slot (per-slot tapes count in the slot's bytes). The
@@ -80,9 +87,11 @@ inline MiniServeCohort make_mini_device_cohort(
         using Cohort = serve::FixedKvCohort<MiniResidentDecoder>;
         Cohort::PrefillPolicy policy;
         if (!kMiniProfile.ladder.empty())
-            policy = [options = weight_options, device = scope.device_class](MiniResidentDecoder& resident,
-                                                                            std::uint64_t tokens, bool first) {
-                resident.set_moe_w4a4(mini_prompt_moe(options, device, tokens, first));
+            policy = [options = weight_options, device = scope.device_class, product = scope.cost_device,
+                      context = std::uint64_t{opt.context}, chunk = static_cast<std::uint32_t>(opt.prefill_rows)](
+                         MiniResidentDecoder& resident, std::uint64_t tokens, bool first) {
+                resident.set_moe_w4a4(mini_prompt_moe(options, device, tokens, first, nullptr,
+                                                      MiniPromptExecution{product, context, chunk}));
             };
         // A forward's row budget holds a lone lane's whole window even under --slots 1 (the verify width is not the
         // slot count): the window is its own forward, the one-row lanes stay within the decoder's rows.

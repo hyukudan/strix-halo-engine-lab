@@ -107,6 +107,11 @@ inline weight::WeightLoadPlan resolve_mini_weight_load(
 // input by the family NVFP4 rule, sm_120 block-scaled FP4 MMA, weights used as stored). MXFP8 layers, decode, verify and
 // one-row calls keep the BF16 tile. CUDA sm_120 only (HIP refuses a selected class). Runnable, not ready: opt in with
 // STRIX_INK_MOE_W4A4=1 until the FAST gate (prefill regime) and a prefill receipt exist. Off switch: STRIX_INK_MOE_W4A4=0.
+// TURBO cell iu4: the rotated integer class on HIP (moe_core/grouped_iu4a4.hpp, grouped-iu4a4-rot-v1; multi-row prefill
+// chunks of every expert layer, rotated images built once at load). Ready under --profile turbo with its declared quality
+// (gate v2, prefill regime; TURBO needs a measured quality and a speed receipt, not the FAST gate), so the CLI and a model
+// preset (strix-serve) admit the same cell. It runs only in the prefill regimes of kMiniLadder below; every other regime
+// (decode, other devices, unmeasured prompt sizes) resolves to the FAST cell, so CUDA keeps its BF16 tile.
 inline constexpr std::string_view kMiniMoeW4a4 = "inkling2-mini-moe-w4a4@1";
 // Narrow expert image: the checkpoint's MXFP8 expert layers are transcoded to NVFP4 at load (shared
 // weight/formats/microscaled_encode.hpp, mse@2 block scales, one outer scale per expert) and every expert consumer
@@ -184,10 +189,12 @@ inline constexpr std::string_view kMiniSpeculation = "inkling2-mini-speculation@
 // stays out of the fingerprint and the receipt, so a text-only run resolves as before the row.
 inline constexpr std::string_view kMiniVisionRecipe = "inkling2-vision-recipe";
 inline constexpr std::array<profile::Lever, 13> kMiniLevers{{
-    {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
-     {}, {false, true, false, true}, "1", "0",
-     "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
-     false, {}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
+    {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", "iu4"}, "0", profile::Kind::bit_changing,
+     {false, false, false, true}, {false, true, false, true}, "1", "0",
+     "FAST 1 waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt; TURBO iu4 declared, "
+     "gate v2 prefill (16 held-out prose windows, 1,008 rows, routes replayed): KL 0.0179, top-1 0.9296, dNLL +0.0035, "
+     "free route-flip ratio 5.55",
+     false, {}, true, {}, {{{"0", "v1"}, {"1", "v1"}, {"iu4", "v1"}}}},
     {kMiniCombineImage, "STRIX_INK_COMBINE_IMAGE", "", {"", "", "", ""}, "0", profile::Kind::exact,
      {true, true, true, true}, {true, true, true, true}, "", "0",
      "BF16 down image + combine: output bits of the FP32 down rows (device A/B through the grouped down producer, NaN "
@@ -253,9 +260,28 @@ inline constexpr std::array<profile::Lever, 13> kMiniLevers{{
     spec::kBlockDraftLever,
 }};
 
+// TURBO prefill timing of the iu4 cell on gfx1151 (one node, one binary for the CLI and strix-serve, prompt prefill time
+// over the BF16 tile, medians). Band receipts (LadderRow::band_bound): they name no literal reference execution, they bind
+// per run to that run's own FAST reference (profile::bind_band_receipts, in profile::resolve), so a row decides only on a
+// run whose execution is known (Regime::execution, spelled by mini_ladder_execution for the command line, the gate and
+// the server alike) inside the band; no FAST prefill lever runs on that device, so the reference is the builtin arm.
+// Measured ends, CLI (prompts of 4,309 / 8,236 / 32,760 tokens) / served (the same texts, 4,307 / 8,234 / 32,758
+// tokens): 4K x1.1211 / x1.1171, 8K x1.0915 / x1.0944, 32K x1.0689 / x1.0861. A band takes the lower speedup of its
+// two ends, rounded down; prompts below 4,307 or above 32,760 tokens are unmeasured and keep the tier below.
+inline constexpr std::string_view kMiniIu4PrefillReceipt =
+    "grouped-iu4a4-rot-v1 prefill timing, gfx1151, CLI + served, EXACT/TURBO interleaved, prompts of 4,307..32,760 tokens";
+inline constexpr std::array<profile::LadderRow, 2> kMiniLadder{{
+    {.lever = kMiniMoeW4a4, .value = "iu4", .tier = profile::Name::turbo, .phase = profile::Phase::prefill,
+     .device = "gfx1151", .min_context = 4307, .max_context = 8236, .min_lanes = 1, .max_lanes = 1,
+     .speedup = 1.091, .noise = 0.01, .receipt = kMiniIu4PrefillReceipt, .band_bound = true},
+    {.lever = kMiniMoeW4a4, .value = "iu4", .tier = profile::Name::turbo, .phase = profile::Phase::prefill,
+     .device = "gfx1151", .min_context = 8237, .max_context = 32760, .min_lanes = 1, .max_lanes = 1,
+     .speedup = 1.068, .noise = 0.01, .receipt = kMiniIu4PrefillReceipt, .band_bound = true},
+}};
+
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.
 inline constexpr profile::Engine kMiniProfile{
-    "inkling2-mini", "", kMiniLevers, false, "inkling2-mini-turbo-v1",
+    "inkling2-mini", "", kMiniLevers, false, "inkling2-mini-turbo-v1", {}, {}, kMiniLadder,
 };
 
 // The image recipe applies only to a request with image input. The text resolution (resolve_mini_profile, shared by

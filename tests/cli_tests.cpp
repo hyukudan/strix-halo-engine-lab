@@ -243,6 +243,12 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
             const bool native_turbo = description.find("presets.turbo.hip") != nullptr && std::string_view(backend) == "hip";
             require(turbo.requested == Name::turbo && turbo.levers == (native_turbo ? Name::turbo : fast.levers),
                     "TURBO inherits FAST levers unless the model declares its native TURBO column for the backend");
+            if (entry.family == "inkling2" && native_turbo) {
+                std::vector<std::string> forwarded;
+                turbo.append_options(forwarded);
+                require(forwarded == std::vector<std::string>{"--profile", "turbo"},
+                        "served Inkling TURBO reaches the engine with the CLI's --profile turbo");
+            }
             require(exact.kv != "fp8" && fast.kv != "fp8", "FP8 KV shadow is TURBO only");
             require((turbo.kv == "fp8") == (entry.family == "qwen35" && std::string_view(backend) == "cuda"),
                     "only the CUDA dense route has an FP8 KV shadow");

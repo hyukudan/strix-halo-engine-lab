@@ -5868,11 +5868,44 @@ input by the family NVFP4 rule and the tile uses the block-scaled FP4 MMA on the
 decode, verify and one-row calls keep the BF16 tile. The CLI, the step-program loader (default route for
 `--generate >= 2`) and the serve route resolve the lever through the same profile table; the receipt names it.
 
-- **Preconditions:** CUDA sm_120, NVFP4 expert layers, multi-row prefill chunks. HIP ignores the lever.
+- **Preconditions:** CUDA sm_120, NVFP4 expert layers, multi-row prefill chunks. On HIP only the TURBO cell runs
+  ([iu4](#inkling2-moe-iu4-turbo)).
 - **Exactness evidence:** bit-changing by design (FAST). Gate not run: the lever stays opt-in until the FAST gate
   (prefill regime, routes replayed) passes.
 - **Off switch:** `STRIX_INK_MOE_W4A4=0`, or any profile other than `fast` / `turbo`.
 - **Measured gain:** not measured on this tree.
+
+<a id="inkling2-moe-iu4-turbo"></a>
+
+## Inkling 2 Mini prompt prefill: rotated integer A4W4 experts (TURBO, HIP)
+
+**Engine:** `inkling2-mini` (HIP gfx1151). **Control:** TURBO cell `iu4` of lever `inkling2-mini-moe-w4a4@1`,
+`STRIX_INK_MOE_W4A4`. **Default:** on under `--profile turbo` for prompts of 4,307..32,760 tokens on gfx1151, in the
+CLI and in `strix-serve` (same resolver, same rows); off in every other profile and regime.
+
+Multi-row prompt-prefill chunks of every expert layer run the shared rotated integer class
+(`moe_core/grouped_iu4a4.hpp`, identity `grouped-iu4a4-rot-v1`): rotated 4-bit images of both expert projections are
+built once at load (13.00 GB at Inkling 2 Mini shapes), tokens and the SwiGLU output are quantised per row, and the
+grouped GEMM runs the integer WMMA. Decode, one-row calls, other devices and prompt sizes outside the rows keep the
+BF16 tile; CUDA declines the class.
+
+- **Preconditions:** HIP gfx1151, `--profile turbo`, a prompt inside a ladder row (4,307..8,236 tokens x1.091;
+  8,237..32,760 tokens x1.068). The route line `strix-ladder/v1 inkling2-mini-moe-w4a4@1 ...` names the row.
+  The rows are band receipts bound to the run's own execution (backend, device product, prompt, context capacity,
+  prefill chunk; one spelling for the CLI, the gate and the server): a run whose execution is not known, and the
+  narrow-experts image (`STRIX_MOE_EXPERTS_NVFP4=1`), keep the BF16 tile.
+- **Quality (TURBO, declared):** gate v2, prefill regime, 16 held-out prose windows (1,008 rows, routes replayed),
+  against the BF16 tile of the same engine: KL 0.0179, top-1 0.9296, dNLL +0.0035, free route-flip ratio 5.55. It
+  does not pass the FAST gate (top-1, windows, flip ratio), so it is a TURBO cell only.
+- **Off switch:** `STRIX_INK_MOE_W4A4=0`, or any profile other than `turbo`.
+- **Measured gain (TURBO over EXACT, prompt prefill, one gfx1151 node, kernel 7.4.0-rc1, default power, load below 3,
+  one binary, medians):**
+
+| Prompt | CLI EXACT | CLI TURBO | Served EXACT | Served TURBO |
+| --- | --- | --- | --- | --- |
+| 4K (4,309 / 4,307 tokens) | 2,129 tok/s | 2,387 tok/s (x1.121) | 2,071 tok/s | 2,313 tok/s (x1.117) |
+| 8K (8,236 / 8,234 tokens) | 2,181 tok/s | 2,380 tok/s (x1.092) | 2,037 tok/s | 2,229 tok/s (x1.094) |
+| 32K (32,760 / 32,758 tokens) | 1,939 tok/s | 2,072 tok/s (x1.069) | 1,890 tok/s | 2,053 tok/s (x1.086) |
 
 <a id="inkling2-moe-shift-decode"></a>
 
