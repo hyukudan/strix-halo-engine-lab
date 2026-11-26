@@ -1,5 +1,6 @@
 // Shared multi-request decoder (strix/serve/cohort_decode.hpp).
 #include "strix/serve/cohort_decode.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/serve/job_sampling.hpp"
 
 #include "strix/serve/short_first.hpp"
@@ -7,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -122,6 +124,13 @@ void validate_prompt_pieces(const CohortConfig& config, PromptPieceRule rule, st
 }
 
 CohortDecoder::~CohortDecoder() = default;
+
+void bind_mixed_service(CohortConfig& config, MixedServicePieces pieces, PromptPieceRule rule, std::uint64_t chunk) {
+    config.prompt_slice_decoding = mixed_service_piece_rows(pieces, rule, chunk);
+    if (config.prompt_slice_decoding != 0U) config.prompt_share = pieces.prompt_share;
+    config.prompt_share = env_number<double>("STRIX_SERVE_PROMPT_SHARE", config.prompt_share, 0.0, 1.0e6);
+    config.trace_steps = config.trace_steps || env_flag_default_off("STRIX_SERVE_STEP_TRACE");
+}
 
 std::uint64_t CohortDecoder::piece_rows(Lane& l, std::uint64_t want, std::uint32_t full_slice, bool bounded,
                                         bool priced, bool& over) {
@@ -353,6 +362,7 @@ void CohortDecoder::step() {
     }
     if (live() == 0) return;
     ++steps_;
+    const double step_start_ms = config_.trace_steps ? now_ms() : 0.0;
 
     // Appends a lane's emitted ids through max_tokens / stop and publishes them; true = the request ends here.
     const auto deliver = [&](Lane& l, std::span<const std::uint32_t> emitted) {
@@ -573,8 +583,24 @@ void CohortDecoder::step() {
     const double t0 = now_ms();
     std::vector<Lane*> run;
     for (const auto id : plan.decode_lanes) run.push_back(lanes_[id].get());
+    // trace_steps: one line per step, after its accounting (debt_ms is the decode still owed after this step).
+    const auto trace = [&](std::size_t decode_lanes, double decode_ms) {
+        if (!config_.trace_steps) return;
+        const double end = now_ms();
+        std::size_t waiting = 0;
+        for (const auto& s : step_lanes) waiting += s.prompt ? 1U : 0U;
+        std::fprintf(stderr,
+                     "cohort-trace step %llu start_ms %.3f idle_ms %.3f prompt_rows %llu prompt_ms %.3f decode_lanes %zu "
+                     "decode_ms %.3f step_ms %.3f prompts_waiting %zu debt_ms %.3f\n",
+                     static_cast<unsigned long long>(steps_), step_start_ms,
+                     last_step_end_ms_ > 0.0 ? step_start_ms - last_step_end_ms_ : 0.0,
+                     static_cast<unsigned long long>(prompt_rows), prompt_ms, decode_lanes, decode_ms,
+                     end - step_start_ms, waiting, planner_.debt_ms());
+        last_step_end_ms_ = end;
+    };
     if (run.empty()) {
         planner_.account(prompt_ms, 0.0, 0.0, prompt_rows);
+        trace(0U, 0.0);
         return;
     }
     const std::size_t n = run.size();
@@ -740,6 +766,7 @@ void CohortDecoder::step() {
         : std::max(0.0, decode_ms - static_cast<double>(draft_rows) *
                                         fitted_cost(sums_, config_, static_cast<std::uint32_t>(n)).row_ms);
     planner_.account(prompt_ms, decode_ms, 0.0, prompt_rows);
+    trace(n, decode_ms);
 
     std::vector<std::pair<Lane*, std::string>> done;
     for (std::size_t k = 0; k < n; ++k) {

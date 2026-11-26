@@ -1,14 +1,17 @@
 // Host-only tests for the shared multi-request decoder (strix/serve/cohort_decode.hpp) over a fake engine.
 // Invariant: every request's ids equal its solo greedy run, whatever joins, leaves, drafts or row plans happen.
 #include "strix/serve/cohort_decode.hpp"
+#include "strix/serve/prefill_chunk_fallback.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <iostream>
 #include <map>
 #include <set>
+#include <sstream>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -534,6 +537,25 @@ void test_prompt_piece_rows() {
     check(prompt_piece_rows(1030, 1030, 8192, rule) == 1030 && prompt_piece_rows(1100, 1030, 8192, rule) == 1024,
           "piece: the step is a multiple of the alignment");
     check(prompt_piece_rows(500, 100, 8192, PromptPieceRule{}) == 500, "piece: an uncuttable chunk runs whole");
+    // The shared mixed-service sizes: the policy's rows where the rule cuts a larger chunk, else whole chunks.
+    static_assert(kMixedServiceShortPieces.piece_rows == 128U && kMixedServiceLongPieces.piece_rows == 1024U);
+    check(mixed_service_piece_rows(kMixedServiceLongPieces, {32, 32}, 8192) == 1024U &&
+              mixed_service_piece_rows(kMixedServiceShortPieces, {32, 32}, 8192) == 128U,
+          "mixed service: the policy's rows inside a larger chunk");
+    check(mixed_service_piece_rows(kMixedServiceLongPieces, {32, 32}, 1024) == 0U &&
+              mixed_service_piece_rows(kMixedServiceLongPieces, PromptPieceRule{}, 8192) == 0U &&
+              mixed_service_piece_rows(MixedServicePieces{}, {32, 32}, 8192) == 0U,
+          "mixed service: whole chunks when the chunk fits, the rule cannot cut or the policy has no pieces");
+    // bind_mixed_service: the pieces, and the policy's share only where its pieces bind (STRIX_SERVE_PROMPT_SHARE unset).
+    CohortConfig bound;
+    bind_mixed_service(bound, kMixedServiceLongPieces, {32, 32}, 8192);
+    CohortConfig whole;
+    bind_mixed_service(whole, kMixedServiceLongPieces, {32, 32}, 1024);
+    CohortConfig short_pieces;
+    bind_mixed_service(short_pieces, kMixedServiceShortPieces, {32, 32}, 8192);
+    check(bound.prompt_slice_decoding == 1024U && bound.prompt_share == 0.0 && whole.prompt_slice_decoding == 0U &&
+              whole.prompt_share == 1.0 && short_pieces.prompt_slice_decoding == 128U && short_pieces.prompt_share == 1.0,
+          "mixed service: a policy's share binds with its pieces");
 }
 
 // A priced grant never dispatches more rows than the grant when ANY bit-safe cut <= grant exists; only when none
@@ -1154,6 +1176,45 @@ void test_bounded_slices_keep_forms() {
     std::cout << "bounded slices: " << cases << " cases, served row forms == one-call prefill\n";
 }
 
+// The step trace (CohortConfig::trace_steps) is diagnostic only: the same steps, calls and ids with it on, for both
+// prompt shares of the mixed-service policies.
+void test_step_trace_changes_nothing() {
+    using B = PieceBackend;
+    for (const double share : {1.0, 0.0}) {
+        std::uint64_t steps[2] = {}, calls[2] = {};
+        std::vector<std::vector<std::uint32_t>> ids[2];
+        for (int traced = 0; traced < 2; ++traced) {
+            B be;
+            be.prompt_rows = 200;
+            CohortConfig cfg;
+            cfg.context_draft = false;
+            cfg.prompt_slice = B::kChunk;
+            cfg.prompt_slice_decoding = 16;
+            cfg.prompt_share = share;
+            cfg.trace_steps = traced == 1;
+            CohortDecoder dec(be, cfg);
+            dec.set_fake_clock(1.0);
+            CohortRequest a, b;
+            a.id = 1;
+            a.prompt = {B::kMarker, 4};
+            a.max_tokens = 400;
+            b.id = 2;
+            b.prompt.resize(200);
+            for (std::uint32_t k = 0; k < 200; ++k) b.prompt[k] = (k * 7U + 1U) % B::kVocab;
+            b.max_tokens = 2;
+            dec.submit(a);
+            dec.step();
+            dec.submit(b);
+            dec.run();
+            steps[traced] = dec.steps();
+            calls[traced] = be.calls;
+            for (const auto& r : dec.take_finished()) ids[traced].push_back(r.ids);
+        }
+        check(steps[0] == steps[1] && calls[0] == calls[1] && ids[0] == ids[1] && !ids[0].empty(),
+              "step trace: the same schedule and ids with the trace on");
+    }
+}
+
 // The constructor's checks are one shared function a launcher can call before device work (validate_prompt_pieces).
 void test_piece_validation() {
     const PromptPieceRule rule{16, 16};
@@ -1188,6 +1249,65 @@ void test_piece_validation() {
     check(refused(c, rule, 8192), "validation: an infinite gap");
 }
 
+// The served chunk ladder (load_with_chunk_ladder): the largest candidate whose whole load keeps the incumbent's slot
+// capacity; the returned service is the last one loaded; one line names a change. Slots per chunk are a table here.
+void test_chunk_ladder() {
+    struct Service {
+        std::uint32_t chunk = 0;
+    };
+    using Admission = ChunkAdmission<Service>;
+    const std::vector<std::uint32_t> chunks{8192U, 2048U, 128U};
+    struct Case {
+        const char* name;
+        std::map<std::uint32_t, std::uint32_t> slots;  // admitted slots per chunk (0 = declined / refused)
+        std::map<std::uint32_t, std::uint32_t> bound;  // host bound per chunk (default: the slots)
+        bool oom_first;
+        std::uint32_t kept;
+        std::vector<std::uint32_t> loads;
+        bool line;
+    };
+    const std::vector<Case> cases{
+        {"roomy: the tall chunk at the cap",
+         {{8192U, 32U}, {2048U, 32U}, {128U, 32U}}, {}, false, 8192U, {8192U}, false},
+        {"tight: the tall chunk loses slots, 2048 keeps them",
+         {{8192U, 20U}, {2048U, 30U}, {128U, 30U}}, {}, false, 2048U, {8192U, 128U, 2048U}, true},
+        {"tighter: only the incumbent keeps its slots (bound skips 2048)",
+         {{8192U, 10U}, {2048U, 20U}, {128U, 30U}}, {}, false, 128U, {8192U, 128U}, true},
+        {"loose bound: 2048 loaded, short, the incumbent again",
+         {{8192U, 10U}, {2048U, 20U}, {128U, 30U}}, {{2048U, 31U}}, false, 128U, {8192U, 128U, 2048U, 128U}, true},
+        {"tall chunk refused by device memory, 2048 keeps the slots",
+         {{8192U, 0U}, {2048U, 12U}, {128U, 12U}}, {}, true, 2048U, {8192U, 128U, 2048U}, true},
+        {"capacity not memory bound: equal slots keep the tall chunk",
+         {{8192U, 8U}, {2048U, 8U}, {128U, 8U}}, {}, false, 8192U, {8192U, 128U, 8192U}, false},
+    };
+    for (const auto& c : cases) {
+        std::vector<std::uint32_t> loads;
+        std::ostringstream log;
+        const auto kept = load_with_chunk_ladder(std::span<const std::uint32_t>(chunks), 32U, log,
+            [&](std::uint32_t chunk, bool last) {
+                loads.push_back(chunk);
+                if (c.oom_first && chunk == chunks.front()) throw strix::DeviceAllocationError("out of memory", 2);
+                check(last == (chunk == chunks.back()),
+                      std::string("ladder: only the incumbent is the last load: ") + c.name);
+                return Admission{Service{chunk}, c.slots.at(chunk)};
+            },
+            [&](std::uint32_t chunk) { return c.bound.contains(chunk) ? c.bound.at(chunk) : c.slots.at(chunk); });
+        check(kept.chunk == c.kept && kept.service.chunk == c.kept && kept.slots == c.slots.at(c.kept),
+              std::string("ladder: kept chunk: ") + c.name);
+        check(loads == c.loads, std::string("ladder: load order: ") + c.name);
+        check(loads.back() == c.kept, std::string("ladder: the kept service is the last load: ") + c.name);
+        check(log.str().empty() == !c.line, std::string("ladder: one line per change: ") + c.name);
+    }
+    // One candidate (an explicit chunk): one load, the caller's refusals apply (last = true).
+    std::ostringstream log;
+    const std::array<std::uint32_t, 1> one{512U};
+    bool final_load = false;
+    const auto kept = load_with_chunk_ladder(std::span<const std::uint32_t>(one), 32U, log,
+        [&](std::uint32_t chunk, bool last) { final_load = last; return Admission{Service{chunk}, 1U}; },
+        [](std::uint32_t) { return 0U; });
+    check(kept.chunk == 512U && final_load && log.str().empty(), "ladder: one candidate is the final load");
+}
+
 int main() {
     test_owner_callbacks_and_boundary();
     test_mixed_drain();
@@ -1209,9 +1329,11 @@ int main() {
     test_group_gap_cold();
     test_gap_forward_price();
     test_bounded_slices_keep_forms();
+    test_step_trace_changes_nothing();
     test_gap_debt();
     test_gap_row_cost_floor();
     test_piece_validation();
+    test_chunk_ladder();
     if (failures) {
         std::cerr << failures << " failure(s)\n";
         return 1;

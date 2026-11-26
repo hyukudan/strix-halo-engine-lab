@@ -79,13 +79,25 @@ build-cuda/strix-inkling2-mini-cuda MODEL.safetensors \
 
 Decode runs the experts on the one-row packed form by default on the command
 line (both backends; `--grouped-decode` selects the grouped tile kernel there,
-printed as `moe_decode` in `strix-decode-route/v1`). `strix-serve` keeps its
-existing route in every profile and takes no decode form flag: the last
-prompt token is held back and decoded, prompts run in 128-row chunks
-(`--prefill-rows`, clamped to the context, which without `--slots` also caps
-the lanes), and a cohort decodes with the grouped form in one batched forward
-(CUDA: its width programs), whose lane bits depend on the cohort width as
-before. The served route switch `STRIX_INK_SERVED_CLI_ROUTE=1`
+printed as `moe_decode` in `strix-decode-route/v1`). `strix-serve` holds
+the last prompt token back and decodes it. On HIP it keeps its existing
+route in every profile and takes no decode form flag: prompts run in 128-row
+chunks (`--prefill-rows`, clamped to the context, which without `--slots`
+also caps the lanes), and a cohort decodes with the grouped form in one
+batched forward, whose lane bits depend on the cohort width as before. On
+CUDA it runs the command line's decode form (every decode row takes the
+packed one-row body at any cohort width, so every lane's bits equal its lone
+run, and every prefill row the grouped tile; `--packed-decode` /
+`--grouped-decode` as on the command line) and, without `--prefill-rows`, the command line's prompt chunk:
+it keeps the largest of 8192, 2048 and 128 rows whose load leaves the slot
+count of the 128-row chunk (startup line `prefill_chunk`), and a prompt
+admitted beside a decoding lane runs in the shared long pieces of 1024 rows
+(`serve::kMixedServiceLongPieces`, cut at 32-row steps), so a decoding lane
+waits about one piece and one decode round (190 ms on an RTX PRO 6000); the
+pieces run back to back with one decode round between them (prompt share 0,
+`STRIX_SERVE_PROMPT_SHARE` replaces it); every prompt row,
+a one-row chunk included, runs the prefill form, so the bits do not change
+with the chunk or the pieces. The served route switch `STRIX_INK_SERVED_CLI_ROUTE=1`
 (`inkling2-mini-served-cli-route@1`, off in every profile column) makes a HIP
 server run the command line's route; a CUDA server declines it. The startup
 line reports it as `served_route off`, `declined`, or `on qualification
@@ -224,10 +236,10 @@ An explicit `--prefill-chunk` is never changed, and `--prefill-chunk 2048`
 selects the smaller chunk up front. The CUDA server is not affected: it keeps
 its own 128-row prompt chunks (`--prefill-rows`).
 
-The greedy head stays the full head on CUDA in every profile. The exact switch
-`STRIX_INK_SCREENED_HEAD=1` (`inkling2-mini-screened-head@1`, off in every
-profile column, a distinct run identity when set) makes CUDA greedy picks that
-return no score row run the shared EXACT screened head
+The greedy head on CUDA is the screened head in every profile (RTX identity
+receipts: greedy ids equal the full head, CLI and served); an explicit
+`STRIX_INK_SCREENED_HEAD=0` (`inkling2-mini-screened-head@1`) keeps the full
+head. CUDA greedy picks that return no score row run the shared EXACT screened head
 (`cuda/core/head_screened.cuh`, an 8-bit plane of the BF16 head built at
 load): the same token and status as the full head. Steps that return or read
 scores (`--logits`, sampled lanes, verify rows, cohort programs) keep the
@@ -238,7 +250,7 @@ screened head (`STRIX_SCREENED_HEAD=0` turns it off) and ignores the switch.
 The command line, the gate and the server print `inkling2 head` with
 `screened lever`, `full lever-off`, `full build-refused`, `full kv-slot` or,
 on HIP, `screened hip-binding` / `full hip-binding`; the server's startup
-line carries the same `head` field. With the switch, the first screened pick
+line carries the same `head` field. When screened, the first screened pick
 prints `inkling2 head screened first pick`, the decoder prints `inkling2 head
 screened picks N` when it closes, and the CUDA step program's install line
 ends with `head=screened`.

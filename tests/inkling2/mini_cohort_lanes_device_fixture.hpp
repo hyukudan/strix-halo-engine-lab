@@ -106,15 +106,25 @@ inline void print_digest(std::string_view route, unsigned width, unsigned step, 
 
 // The serving construction (make_mini_device_cohort, inkling2_mini_serve_device.hpp) for an ADMITTED served route: with
 // it the command line's decode form and packed cohort passes; without it (lever off, or a backend that declines it: the
-// caller passes the production admission, mini_served_prefill_emits_first) the incumbent served decoder (grouped decode).
+// caller passes the production admission, mini_served_prefill_emits_first) the incumbent served decoder (HIP grouped
+// decode; CUDA packed lanes at every cohort width, mini_served_packed_decode).
+#if defined(__HIPCC__)
+inline constexpr bool kFixtureHip = true;
+#else
+inline constexpr bool kFixtureHip = false;
+#endif
+
 inline std::unique_ptr<MiniResidentDecoder> served_decoder(const char* checkpoint, unsigned context, unsigned chunk,
                                                            weight::FormatId storage, unsigned lanes, unsigned tail,
                                                            bool admitted) {
-    return admitted
-        ? std::make_unique<MiniResidentDecoder>(checkpoint, context, chunk, kMiniPackedDecodeDefault,
-              MiniResidentBackend::default_step_graphs, storage, 0U, false, lanes, tail, false, false, true)
-        : std::make_unique<MiniResidentDecoder>(checkpoint, context, chunk, false,
-              MiniResidentBackend::default_step_graphs, storage, 0U, false, lanes);
+    if (admitted)
+        return std::make_unique<MiniResidentDecoder>(checkpoint, context, chunk, kMiniPackedDecodeDefault,
+            MiniResidentBackend::default_step_graphs, storage, 0U, false, lanes, tail, false, false, true);
+    // The held-back route as make_mini_device_cohort builds it (keep_prefill_grouped included).
+    auto decoder = std::make_unique<MiniResidentDecoder>(checkpoint, context, chunk,
+        mini_served_packed_decode(kFixtureHip, false), MiniResidentBackend::default_step_graphs, storage, 0U, false, lanes);
+    decoder->keep_prefill_grouped();
+    return decoder;
 }
 
 using MiniFixedCohort = serve::FixedKvCohort<MiniResidentDecoder>;
@@ -147,8 +157,9 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool r
     std::cout << "ROUTE served_route " << (admitted ? "on" : requested ? "declined" : "off") << " prompt "
               << (emits_first ? "emits-first" : "held-back") << " moe_decode " << mini_decode_form_name(packed_decode)
               << " slots " << kCohortSlots << '\n';
-    // The forms the server runs: admitted = the command line's route (emits-first, packed); otherwise the incumbent.
-    if (emits_first != admitted || packed_decode != admitted)
+    // The forms the server runs: admitted = the command line's route (emits-first, packed); otherwise the held-back
+    // route with the served decode form (CUDA: packed rows at every width, mini_packed_cohort_rows).
+    if (emits_first != admitted || packed_decode != mini_served_packed_decode(kFixtureHip, admitted))
         throw std::logic_error("served decoder runs a form its admission did not select");
     const std::size_t vocab = kOutputVocabulary;
     std::vector<std::uint16_t> row;
@@ -344,7 +355,11 @@ struct PrefillArm {
 
 inline std::uint64_t digest_planes(MiniResidentDecoder& decoder, unsigned slot, std::vector<std::uint16_t>& plane,
                                    std::vector<float>& history, std::uint64_t& history_hash) {
-    // The K and V rows of every committed position at every visit (rows past the frontier are not state).
+    // The K and V rows of every live committed position at every visit: all of them on a full-attention visit, the
+    // last kSlidingWindow on a sliding-window visit (older rows are never read again; a ring keeps them only until it
+    // wraps, and whether the visit is a ring at all depends on the chunk the decoder was built for: RTX q38 / q40, an
+    // 8192-row decoder at this context holds a full cache where a 128-row one holds a 2048-row ring). Rows past the
+    // frontier are not state either.
     const auto view = decoder.slot_view(slot);
     Fnv64 kv;
     for (const auto device : {view.kv.keys, view.kv.values}) {
@@ -353,7 +368,9 @@ inline std::uint64_t digest_planes(MiniResidentDecoder& decoder, unsigned slot, 
         mini_gpu::synchronize(nullptr);
         for (const auto visit : MiniSessionStatePlan::visits()) {
             const auto& layout = view.plan.visit(visit);
-            for (unsigned position = 0; position < view.committed; ++position) {
+            const unsigned live =
+                uses_sliding_attention(visit) ? std::min(view.committed, kSlidingWindow) : view.committed;
+            for (unsigned position = view.committed - live; position < view.committed; ++position) {
                 const auto offset =
                     static_cast<std::size_t>(layout.kv_offset + attn::cache_rows::row_offset(layout.kv, position));
                 kv.add(plane.data() + offset, std::size_t{layout.kv.width} * sizeof(std::uint16_t));
@@ -509,6 +526,203 @@ inline int served_prefill(const char* checkpoint, weight::FormatId storage, std:
     return 0;
 }
 
+// --served-held-back CHUNK [--held-back-levers] [--held-back-incumbent]: the held-back served route of a
+// chunk-invariant backend (CUDA, mini_prefill_chunk_invariant) on the serving decoder built at CHUNK rows (2 lanes, no
+// tail). Arms per prompt length (prompt tokens; the server holds the last one back and decodes it as the lane's first
+// decode row):
+//   incumbent  128-row calls (kMiniServedHeldBackChunk: every served prompt before the CUDA chunk change);
+//   whole      calls of up to CHUNK rows (a prompt alone on the server);
+//   fallback   2048-row calls (the chunk ladder's middle candidate);
+//   pieces     calls of up to CHUNK rows cut by the decoder's piece rule into kMiniServeDecodingRows pieces, with a
+//              neighbour lane decoding one step between pieces (mixed service, serve::prompt_piece_rows);
+//   staggered  two pieces beside the neighbour, then the rest of the call and whole calls (the neighbour finished).
+// Each arm must equal the incumbent bitwise: the first id and its scores, the KV planes of every committed position and
+// the histories, then kServedSteps decode steps (top, logits, appended KV, histories). The neighbour's tokens and
+// logits must equal its solo run. --held-back-incumbent runs the incumbent arm only (a decoder at 128 rows: the
+// incumbent's own KV ring layout); the ticket compares the DIGEST fields across decoders (8192 / 128 rows) and lever
+// settings.
+inline int served_held_back(const char* checkpoint, weight::FormatId storage, std::span<const unsigned> prompt_lengths,
+                            unsigned chunk, bool levers, bool incumbent_only) {
+#if defined(__HIPCC__)
+    (void)checkpoint;
+    (void)storage;
+    (void)prompt_lengths;
+    (void)chunk;
+    (void)levers;
+    (void)incumbent_only;
+    std::cout << "SKIP served_held_back: HIP keeps its 128-row held-back route\n";
+    return 0;
+#else
+    const auto owned = served_decoder(checkpoint, kServedContext, chunk, storage, 2U, 0U, false);
+    auto& decoder = *owned;
+    if (decoder.prefill_emits_first()) throw std::logic_error("held-back route admission");
+    decoder.set_attention_projected_bias(levers);
+    (void)decoder.set_screened_head(levers);
+    decoder.allocate_slots(2U);
+    const auto rule = decoder.prefill_piece_rule();
+    std::cout << "ROUTE served_held_back chunk " << decoder.prefill_chunk_rows() << " rule " << rule.align << '/'
+              << rule.short_rows << " pieces " << kMiniServeDecodingRows << " levers " << (levers ? "on" : "off")
+              << " arms " << (incumbent_only ? "incumbent" : "all") << '\n';
+    if (!rule.cuttable()) throw std::logic_error("the CUDA held-back route states no piece rule");
+    const std::size_t vocab = kOutputVocabulary;
+    std::vector<std::uint16_t> plane, row;
+    std::vector<float> history;
+    Fnv64 all;
+    unsigned failures = 0;
+
+    // The neighbour lane (slot 1): its held-back prefill, then one width-1 decode step per call.
+    struct Neighbour {
+        unsigned token = 0;
+        std::vector<unsigned> tops;
+        std::vector<std::uint64_t> logits;
+    };
+    std::vector<unsigned> other(40U);
+    for (unsigned i = 0; i < other.size(); ++i) other[i] = cohort_token(3U, i);
+    const auto neighbour_start = [&](Neighbour& n) {
+        decoder.prefill_slot(1U, std::span<const unsigned>(other).first(other.size() - 1U), true);
+        n = Neighbour{other.back(), {}, {}};
+    };
+    std::vector<float> scratch(vocab);
+    const auto neighbour_step = [&](Neighbour& n) {
+        const std::array<unsigned, 1> slots{1U};
+        const std::array<unsigned, 1> ids{n.token};
+        std::array<unsigned, 1> top{};
+        decoder.decode_slots(slots, ids, top);
+        decoder.read_slot_logits(0U, scratch);
+        Fnv64 h;
+        h.add(scratch.data(), scratch.size() * sizeof(float));
+        n.tops.push_back(top[0]);
+        n.logits.push_back(h.value);
+        n.token = top[0];
+    };
+    Neighbour solo;
+    neighbour_start(solo);
+    for (unsigned step = 0; step < 72U; ++step) neighbour_step(solo);
+
+    enum Kind : unsigned { incumbent, whole, fallback, pieces, staggered, kinds };
+    static constexpr std::array<const char*, kinds> kNames{"incumbent", "whole", "fallback", "pieces", "staggered"};
+    const unsigned arm_count = incumbent_only ? 1U : unsigned{kinds};
+    for (const auto length : prompt_lengths) {
+        if (length < 2U) throw std::invalid_argument("--served-held-back needs prompts of at least 2 tokens");
+        std::vector<unsigned> prompt(length);
+        for (unsigned i = 0; i < length; ++i) prompt[i] = cohort_token(5U, i);
+        const std::span<const unsigned> ids(prompt);
+        const std::size_t rows = length - 1U;  // the held-back prefill rows
+        std::array<PrefillArm, kinds> arms;
+        for (unsigned kind = 0; kind < arm_count; ++kind) {
+            auto& arm = arms[kind];
+            Neighbour n;
+            const bool mixed = kind == pieces || kind == staggered;
+            if (mixed) neighbour_start(n);
+            unsigned pieces_left = kind == pieces ? ~0U : 2U;
+            bool first_call = true;
+            const auto call = [&](std::size_t at, std::size_t count) {
+                decoder.prefill_slot(0U, ids.subspan(at, count), first_call);
+                first_call = false;
+            };
+            for (std::size_t at = 0; at < rows;) {
+                const std::size_t left = rows - at;
+                if (!mixed) {
+                    const std::size_t count = std::min<std::size_t>(
+                        left, kind == incumbent ? kMiniServedHeldBackChunk : kind == whole ? chunk : 2048U);
+                    call(at, count);
+                    at += count;
+                    continue;
+                }
+                // One region (the call a lone prompt runs: prompt_slice_rows, no tail), cut while the neighbour
+                // decodes.
+                const std::size_t end = at + std::min<std::size_t>(left, chunk);
+                while (at < end) {
+                    std::size_t piece = end - at;
+                    const bool beside = pieces_left != 0U;
+                    if (beside) {
+                        piece = static_cast<std::size_t>(
+                            serve::prompt_piece_rows(end - at, kMiniServeDecodingRows, chunk, rule));
+                        if (pieces_left != ~0U) --pieces_left;
+                    }
+                    call(at, piece);
+                    at += piece;
+                    if (beside && at < rows) neighbour_step(n);
+                }
+            }
+            const std::array<unsigned, 1> slots{0U};
+            const std::array<unsigned, 1> held{ids[rows]};
+            std::array<unsigned, 1> top{};
+            decoder.decode_slots(slots, held, top);
+            arm.first = top[0];
+            arm.scores.resize(vocab);
+            decoder.read_slot_logits(0U, arm.scores);
+            arm.kv = digest_planes(decoder, 0U, plane, history, arm.history);
+            unsigned token = arm.first;
+            for (unsigned step = 0; step < kServedSteps; ++step) {
+                const std::array<unsigned, 1> next{token};
+                decoder.decode_slots(slots, next, top);
+                decoder.read_slot_logits(0U, scratch);
+                auto& s = arm.steps[step];
+                s.top = top[0];
+                Fnv64 h;
+                h.add(scratch.data(), scratch.size() * sizeof(float));
+                s.logits = h.value;
+                digest_state(decoder, 0U, s, row, history);
+                token = top[0];
+            }
+            if (mixed) {
+                const bool same = n.tops.size() <= solo.tops.size() &&
+                                  std::equal(n.tops.begin(), n.tops.end(), solo.tops.begin()) &&
+                                  std::equal(n.logits.begin(), n.logits.end(), solo.logits.begin());
+                if (!same && ++failures <= 20U)
+                    std::cout << "FAIL neighbour != solo rows=" << rows << " arm=" << kNames[kind] << " steps "
+                              << n.tops.size() << '\n';
+            }
+        }
+        for (unsigned kind = 0; kind < arm_count; ++kind) {
+            const auto& arm = arms[kind];
+            Fnv64 scores, steps;
+            scores.add(arm.scores.data(), arm.scores.size() * sizeof(float));
+            for (const auto& s : arm.steps) {
+                steps.add((std::uint64_t{s.position} << 32U) | s.top);
+                steps.add(s.logits);
+                steps.add(s.kv);
+                steps.add(s.history);
+            }
+            char line[256];
+            std::snprintf(line, sizeof(line),
+                          "DIGEST held_back rows=%zu first=%u scores=%016llx kv=%016llx hist=%016llx steps=%016llx",
+                          rows, arm.first, static_cast<unsigned long long>(scores.value),
+                          static_cast<unsigned long long>(arm.kv), static_cast<unsigned long long>(arm.history),
+                          static_cast<unsigned long long>(steps.value));
+            if (kind == incumbent) all.add(line, std::strlen(line));
+            std::cout << line << " arm=" << kNames[kind] << '\n';
+            if (kind == incumbent) continue;
+            const auto fail = [&](const char* what) {
+                if (++failures <= 20U)
+                    std::cout << "FAIL " << kNames[kind] << " != incumbent rows=" << rows << ' ' << what << '\n';
+            };
+            const auto& base = arms[incumbent];
+            if (arm.first != base.first) fail("first id");
+            if (std::memcmp(arm.scores.data(), base.scores.data(), vocab * sizeof(float)) != 0) fail("scores");
+            if (arm.kv != base.kv) fail("kv planes");
+            if (arm.history != base.history) fail("histories");
+            for (unsigned step = 0; step < kServedSteps; ++step)
+                if (!(arm.steps[step] == base.steps[step])) fail("decode step");
+        }
+    }
+    char line[64];
+    std::snprintf(line, sizeof(line), "%016llx", static_cast<unsigned long long>(all.value));
+    std::cout << "DIGEST HELD_BACK " << line << '\n';
+    if (failures != 0U) {
+        std::cout << "FAIL Inkling Mini served held-back route: " << failures << " mismatches\n";
+        return 1;
+    }
+    std::cout << "PASS Inkling Mini served held-back route chunk " << chunk << " levers " << (levers ? "on" : "off")
+              << ": "
+              << (incumbent_only ? "incumbent arm digests" : "whole == fallback == pieces == staggered == incumbent")
+              << " (" << prompt_lengths.size() << " prompt lengths; first id, scores, KV planes, histories, "
+              << kServedSteps << " decode steps bitwise; neighbour == solo)\n";
+    return 0;
+#endif
+}
+
 #if !defined(__HIPCC__)
 // Fill the resident image and compare the CLI's resident session with the production serving cohort.
 inline int w4a4_prompt_parity(const char* checkpoint, weight::FormatId storage,
@@ -583,22 +797,32 @@ int main(int argc, char** argv) {
     using namespace strix;
     try {
         if (argc < 2)
-            throw std::invalid_argument("expected MODEL.safetensors [--qualify-q8] [--served-route] [--served-prefill [--served-prompts LIST]]");
+            throw std::invalid_argument("expected MODEL.safetensors [--qualify-q8] [--served-route] [--served-prefill | --served-held-back CHUNK "
+                "[--held-back-levers] [--held-back-incumbent]] [--served-prompts LIST]");
         auto storage = weight::kBf16WeightStorage;
         bool served_route = false;  // the served route lever (off: the incumbent served decoder)
         bool served_prefill = false;
+        unsigned held_back = 0;  // --served-held-back CHUNK
+        bool held_back_levers = false, held_back_incumbent = false;
         std::vector<unsigned> prompt_lengths(inkling2::test::kServedPrompt.begin(), inkling2::test::kServedPrompt.end());
         for (int i = 2; i < argc; ++i) {
             const std::string_view option{argv[i]};
             if (option == "--qualify-q8") storage = weight::kQ8WeightStorage;
             else if (option == "--served-route") served_route = true;
             else if (option == "--served-prefill") served_prefill = true;
+            else if (option == "--served-held-back" && i + 1 < argc)
+                held_back = static_cast<unsigned>(std::stoul(argv[++i]));
+            else if (option == "--held-back-levers") held_back_levers = true;
+            else if (option == "--held-back-incumbent") held_back_incumbent = true;
             else if (option == "--served-prompts" && i + 1 < argc)
                 prompt_lengths = inkling2::test::parse_served_prompts(argv[++i]);
             else throw std::invalid_argument("unknown option: " + std::string(option));
         }
         if (served_prefill)
             return inkling2::test::served_prefill(argv[1], storage, prompt_lengths);
+        if (held_back != 0U)
+            return inkling2::test::served_held_back(argv[1], storage, prompt_lengths, held_back, held_back_levers,
+                                                    held_back_incumbent);
 #if !defined(__HIPCC__)
         inkling2::MiniWeightOptions options;
         options.tier.profile = profile::Name::fast;

@@ -40,14 +40,15 @@ static_assert(mini::mini_cli_prefill_rows(Backend::hip, Name::standard) == 8192U
 static_assert(mini::mini_cli_prefill_rows(Backend::hip, Name::fast) == 8192U);
 static_assert(mini::mini_cli_prefill_rows(Backend::hip, Name::turbo) == 8192U);
 static_assert(mini::mini_cli_prefill_rows(Backend::cuda, Name::standard) == 8192U);
-static_assert(mini::mini_cli_prefill_rows(Backend::cuda, Name::fast) == 2048U);
-static_assert(mini::mini_cli_prefill_rows(Backend::cuda, Name::quality) == 2048U);
-static_assert(mini::mini_cli_prefill_rows(Backend::cuda, Name::turbo) == 2048U);
-// Only the CUDA EXACT tall default falls back (to the incumbent 2048 rows); no other row has a pressure retry.
+// FAST / TURBO resolve the EXACT prefill arithmetic on CUDA: same tall chunk, so no tier is slower than the one below.
+static_assert(mini::mini_cli_prefill_rows(Backend::cuda, Name::fast) == 8192U);
+static_assert(mini::mini_cli_prefill_rows(Backend::cuda, Name::quality) == 8192U);
+static_assert(mini::mini_cli_prefill_rows(Backend::cuda, Name::turbo) == 8192U);
+// The CUDA tall default falls back to the incumbent 2048 rows in every profile; HIP has no pressure retry.
 static_assert(mini::mini_cli_prefill_fallback_rows(Backend::cuda, Name::standard) == 2048U);
-static_assert(mini::mini_cli_prefill_fallback_rows(Backend::cuda, Name::fast) == 0U);
-static_assert(mini::mini_cli_prefill_fallback_rows(Backend::cuda, Name::quality) == 0U);
-static_assert(mini::mini_cli_prefill_fallback_rows(Backend::cuda, Name::turbo) == 0U);
+static_assert(mini::mini_cli_prefill_fallback_rows(Backend::cuda, Name::fast) == 2048U);
+static_assert(mini::mini_cli_prefill_fallback_rows(Backend::cuda, Name::quality) == 2048U);
+static_assert(mini::mini_cli_prefill_fallback_rows(Backend::cuda, Name::turbo) == 2048U);
 static_assert(mini::mini_cli_prefill_fallback_rows(Backend::hip, Name::standard) == 0U);
 static_assert(mini::mini_cli_prefill_fallback_rows(Backend::hip, Name::fast) == 0U);
 static_assert(mini::mini_cli_prefill_fallback_rows(Backend::hip, Name::turbo) == 0U);
@@ -131,11 +132,12 @@ int main() try {
     require(other.seen == Loads{8192U} && !other.loaded && other.other_failure && !other.typed_failure && other.log.empty(),
             "a non-memory failure is not retried");
     stub::malloc_status = cudaSuccess;
-    // The other CUDA profiles already run 2048 rows: they load under the same pressure, with no retry route.
+    // The other CUDA profiles take the same tall chunk and the same pressure retry.
     for (const auto tier : {Name::fast, Name::quality, Name::turbo}) {
-        const auto incumbent = attempt(Backend::cuda, tier, 8195U);
-        require(incumbent.seen == Loads{2048U} && incumbent.loaded == 2048U && incumbent.log.empty(),
-                "CUDA non-EXACT profiles keep the 2048-row chunk");
+        const auto same = attempt(Backend::cuda, tier, 8195U);
+        require(same.seen == Loads({8192U, 2048U}) && same.loaded == 2048U &&
+                    same.log == "strix-prefill-chunk 8192 -> 2048 (device memory)\n",
+                "CUDA FAST / TURBO take the EXACT tall chunk and its pressure retry");
     }
     // HIP keeps its single attempt: the typed failure reports after it.
     for (const auto tier : {Name::standard, Name::fast, Name::turbo}) {

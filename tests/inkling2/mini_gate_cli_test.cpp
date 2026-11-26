@@ -338,7 +338,7 @@ void set_round_fold_env(const char* value) {
 }
 
 // The projected-bias attention lever per tier through the CLI parse: the same table the server test pins
-// (tests/inkling2/mini_serve_test.cpp): opt-in, so unset and 0 off, 1 on, anything else refused.
+// (tests/inkling2/mini_serve_test.cpp): default on, so unset and 1 on, an explicit 0 off, anything else refused.
 void test_projected_bias_lever() {
     const auto set = [](const char* value) {
 #ifdef _WIN32
@@ -349,7 +349,7 @@ void test_projected_bias_lever() {
 #endif
     };
     for (const auto* tier : {"exact", "fast", "turbo"}) {
-        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
+        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, true}, {"0", false}, {"1", true}}) {
             set(value);
             require(strix::inkling2::mini_attn_projected_bias(parse({"1", "--profile", tier}).tier) == expected,
                     "CLI projected-bias lever differs from the server table");
@@ -361,7 +361,7 @@ void test_projected_bias_lever() {
 }
 
 // The screened-head lever per tier through the CLI parse: the same table the server test pins
-// (tests/inkling2/mini_serve_test.cpp): opt-in, so unset and 0 the full head, 1 the screened head, anything else refused.
+// (tests/inkling2/mini_serve_test.cpp): default on, so unset and 1 the screened head, an explicit 0 the full head, anything else refused.
 void test_screened_head_lever() {
     const auto set = [](const char* value) {
 #ifdef _WIN32
@@ -372,7 +372,7 @@ void test_screened_head_lever() {
 #endif
     };
     for (const auto* tier : {"exact", "fast", "turbo"}) {
-        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
+        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, true}, {"0", false}, {"1", true}}) {
             set(value);
             require(strix::inkling2::mini_screened_head(parse({"1", "--profile", tier}).tier) == expected,
                     "CLI screened-head lever differs from the server table");
@@ -470,8 +470,11 @@ void test_options() {
             "expected evaluation-order null arm");
     std::ostringstream profile_line;
     cli::write_profile(gate.tier, profile_line, true);
-    // The speculation row's builtin (auto) keeps the legacy receipt: no lever applied, none reported.
-    require(profile_line.str() == "profile exact levers none reference BASE\n", "device profile receipt differs");
+    // The speculation row's builtin (auto) reports no lever; the two CUDA EXACT defaults are the only levers off their
+    // builtin, named in table order.
+    require(profile_line.str() == "profile exact levers inkling2-mini-attn-projected-bias@1=1 "
+                                  "inkling2-mini-screened-head@1=1 reference BASE\n",
+            "device profile receipt differs");
 }
 
 #endif

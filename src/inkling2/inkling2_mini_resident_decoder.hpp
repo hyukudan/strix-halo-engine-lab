@@ -265,6 +265,15 @@ public:
     [[nodiscard]] std::uint64_t slot_bytes() const {
         return layout_.kv_bytes() + layout_.convolution_bytes() + slot_tape_elements() * sizeof(float);
     }
+    // slot_bytes() of a decoder built for the held-back served route (no tail, no verify rows, so no slot tapes) at
+    // `chunk` prefill rows and `decode_rows` lanes, before it is built (the served chunk ladder's host bound).
+    [[nodiscard]] static std::uint64_t held_back_slot_bytes(unsigned max_positions, unsigned chunk,
+                                                           unsigned decode_rows) {
+        const auto rows = std::max(MiniResidentBackend::checked_chunk_rows(chunk),
+                                   MiniResidentBackend::checked_chunk_rows(decode_rows));
+        const MiniSessionStatePlan layout(max_positions, rows);
+        return layout.kv_bytes() + layout.convolution_bytes();
+    }
 
     void allocate_slots(unsigned slots) {
         if (slots == 0U || slots > decode_rows_) throw std::invalid_argument("invalid Mini slot count");
@@ -369,10 +378,20 @@ public:
     // Admitted tail capacity (serve::CohortBackend::prompt_tail_rows), the cut rule of served pieces and the first
     // chunk of one prefill call (prompt_piece_rule / prompt_call_chunk).
     [[nodiscard]] unsigned prefill_tail_rows() const noexcept { return tail_rows_; }
-    // Pieces cut only on the command line's route (the held-back route runs its incumbent whole slices).
+    // Pieces cut on the command line's route (HIP) and on the held-back route of a chunk-invariant backend (CUDA,
+    // mini_prefill_piece_rule); never while a bit-changing prefill row is bound (a W4A4 expert class, a calibrated or
+    // narrow expert image): those prompts run whole calls.
     [[nodiscard]] serve::PromptPieceRule prefill_piece_rule() const noexcept {
-        return mini_prefill_piece_rule(served_cli_route_);
+#if defined(__HIPCC__)
+        constexpr bool hip = true;
+#else
+        constexpr bool hip = false;
+#endif
+        if (!served_cli_route_ && (prefill_emits_first() || weight_plan_.narrow_bytes() != 0U)) return {};
+        return mini_prefill_piece_rule(hip, served_cli_route_);
     }
+    // The prompt chunk this decoder was built with (its row-scaled workspaces and KV rings hold it).
+    [[nodiscard]] unsigned prefill_chunk_rows() const noexcept { return prefill_rows_; }
     [[nodiscard]] std::uint64_t prefill_call_chunk_rows(std::uint64_t rows) const noexcept {
         if (!served_cli_route_) return rows;  // the incumbent route: one call is one slice
         return mini_call_first_chunk(rows, prefill_rows_, call_tail_rows(static_cast<std::size_t>(rows)));
@@ -668,6 +687,9 @@ public:
     void set_calibration_moments(weight::calib::MomentSet* moments) { backend_.set_calibration_moments(moments); }
     void set_calibration_window(std::optional<std::size_t> window) { backend_.set_calibration_window(window); }
     void set_gate_order_null(bool enabled) { backend_.set_gate_order_null(enabled); }
+    // Served held-back route (CUDA): every prefill row on the grouped tile (MiniResidentBackend::keep_prefill_grouped);
+    // set once after construction, before any append. The command line never sets it.
+    void keep_prefill_grouped() noexcept { backend_.keep_prefill_grouped(); }
     // Resolved prepared-attention round fold (mini_prepared_round_fold); set once after construction. True when the fold
     // runs (admitted on the qualified HIP target; declined elsewhere, CUDA included).
     bool set_prepared_round_fold(bool selected) { return backend_.set_prepared_round_fold(selected); }

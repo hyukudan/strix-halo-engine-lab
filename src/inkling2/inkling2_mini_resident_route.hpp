@@ -11,8 +11,8 @@ inline constexpr unsigned kMiniMaxVerifyRows = 8U;
 
 // Decode expert form default of the command line (and of a server running its route through the served route lever,
 // kMiniServedCliRoute): the packed one-row form (moe_core::microscaled_r1), whose row bits equal a one-row launch at any
-// cohort width. --grouped-decode selects the grouped tile kernel on the command line. Without the lever a server keeps
-// its incumbent grouped decode and takes no form flag.
+// cohort width. --grouped-decode selects the grouped tile kernel on the command line and on a CUDA server
+// (mini_served_packed_decode); a HIP server without the lever keeps its incumbent grouped decode and takes no form flag.
 inline constexpr bool kMiniPackedDecodeDefault = true;
 
 // The same value from the two flags, through the resolver the command line also calls (serve::resolve_decode_form).
@@ -21,6 +21,17 @@ constexpr bool mini_packed_decode(bool packed_flag, bool grouped_flag) {
 }
 
 constexpr const char* mini_decode_form_name(bool packed_decode) noexcept { return packed_decode ? "packed" : "grouped"; }
+
+// Served decode expert form, fixed at decoder construction. HIP: the packed form only with the admitted served route
+// lever (`cli_route`, which also packs cohort rows); without it the incumbent grouped form. CUDA: the packed form, as the
+// command line (RTX q36, origin/main: CLI grouped 66.3 vs packed 89.1 tok/s, served C1 66.5 = the grouped form): every
+// decode row runs the packed one-row body at any cohort width (mini_packed_cohort_rows), so every lane's bits equal its
+// lone packed run (cohort-lanes fixture, widths 2..17), and prefill rows keep the grouped tile (mini_resident_chunk_route
+// with grouped_prefill). The CUDA server takes the command line's flags through the same resolver (--grouped-decode = the grouped form for a lone
+// lane too; naming both is refused); a HIP server refuses them (its form follows the lever row, resolve).
+constexpr bool mini_served_packed_decode(bool hip, bool cli_route, bool packed_flag = false, bool grouped_flag = false) {
+    return hip ? cli_route && kMiniPackedDecodeDefault : mini_packed_decode(packed_flag, grouped_flag);
+}
 
 enum class MiniAppendKind { prefill, decode, verify };
 
@@ -31,8 +42,9 @@ struct MiniResidentRoute {
 };
 
 // With packed decode a lone decode row and every verify row run the packed expert form. A multi-row decode (a cohort
-// of more than kMiniMaxVerifyRows lanes) runs it only with packed cohort rows (the served route lever); prefill chunks
-// of more than one row keep the grouped tile kernel.
+// of more than kMiniMaxVerifyRows lanes) runs it only with packed cohort rows (the served route lever; every packed CUDA
+// decoder, mini_packed_cohort_rows); prefill chunks of more than one row keep the grouped tile kernel (CUDA: every
+// prefill chunk, mini_resident_chunk_route).
 constexpr MiniResidentRoute mini_resident_route(MiniAppendKind kind, unsigned rows,
                                                 bool packed_decode, bool allow_graph, bool cohort_rows = false) {
     const bool verify = kind == MiniAppendKind::verify;
@@ -114,9 +126,23 @@ constexpr bool mini_w4a4_rows(bool w4a4_bound, MiniAppendKind kind) {
     return w4a4_bound && kind == MiniAppendKind::prefill;
 }
 
+// `grouped_prefill` (the CUDA served held-back route, MiniResidentBackend::keep_prefill_grouped): every prefill row
+// keeps the grouped tile, a one-row prefill chunk included, so a served prompt row's bits do not depend on where the
+// admitted chunk or the pieces cut it (RTX q34: a one-row chunk on the packed body after 128 or 2048 rows changed the
+// scores, KV and the next steps; remainders of 16 or more rows on the grouped tile were equal). The command line keeps
+// its one-row route (its EXACT bits at a one-token prompt and at 1 mod chunk remainders are unchanged).
 constexpr MiniResidentRoute mini_resident_chunk_route(MiniAppendKind kind, unsigned rows, bool packed_decode,
-                                                      bool w4a4_bound, bool cohort_rows = false) {
-    return mini_resident_route(kind, rows, packed_decode && !mini_w4a4_rows(w4a4_bound, kind), false, cohort_rows);
+                                                      bool w4a4_bound, bool cohort_rows = false,
+                                                      bool grouped_prefill = false) {
+    const bool grouped_row = mini_w4a4_rows(w4a4_bound, kind) || (grouped_prefill && kind == MiniAppendKind::prefill);
+    return mini_resident_route(kind, rows, packed_decode && !grouped_row, false, cohort_rows);
+}
+
+// Packed cohort rows of a resident backend: the served route lever (HIP), and every packed CUDA decoder, so a CUDA cohort
+// of more than kMiniMaxVerifyRows lanes runs each lane on the one-row packed body (per-row launches) like a lone lane and
+// the verify-kind cohorts of up to kMiniMaxVerifyRows lanes; a lane's bits do not depend on the cohort width.
+constexpr bool mini_packed_cohort_rows(bool hip, bool packed_decode, bool served_route_rows) noexcept {
+    return packed_decode && (served_route_rows || !hip);
 }
 
 }  // namespace strix::inkling2

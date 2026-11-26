@@ -43,6 +43,10 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
             return args[i];
         };
         if (parse_mini_weight_option(out.weight_options, name, next, true)) continue;
+        if (name == "--packed-decode" || name == "--grouped-decode") {
+            (name == "--packed-decode" ? out.packed_decode_flag : out.grouped_decode_flag) = true;
+            continue;
+        }
         const auto& value = next();
         if (name == "--checkpoint") out.checkpoint = value;
         else if (name == "--tokenizer") out.tokenizer = value;
@@ -98,12 +102,24 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.moe_w4a4 = admit_mini_moe_w4a4(resolution, resolved.backend);
     // Backend admission of the served route lever (kMiniServedCliRoute): HIP runs the command line's route, a CUDA
     // server declines it (requested stays in the receipt, mini_served_route_startup_field).
-    out.served_cli_route = mini_served_prefill_emits_first(resolved.backend == "hip", out.served_route_requested);
-    // The prompt chunk: --prefill-rows, else the route's (the incumbent 128-row held-back chunks without the lever,
-    // the command line's chunk and tail rule with it), clamped to the context. Lanes: mini_serve_lane_rows.
-    const auto schedule = mini_served_prefill_schedule_from_env(true, out.served_cli_route, out.tier);
+    const bool hip = resolved.backend == "hip";
+    out.served_cli_route = mini_served_prefill_emits_first(hip, out.served_route_requested);
+    if (hip && (out.packed_decode_flag || out.grouped_decode_flag))
+        throw std::invalid_argument("a HIP Inkling server takes no decode form flag (the served route lever row sets it)");
+    (void)mini_served_packed_decode(hip, out.served_cli_route, out.packed_decode_flag, out.grouped_decode_flag);
+    // The prompt chunk: --prefill-rows, else the route's from the command line's schedule resolver (the held-back
+    // route: the command line's chunk where the backend's prefill is chunk-invariant (CUDA), else 128 rows; the lever:
+    // the command line's chunk and tail rule), clamped to the context. Lanes: mini_serve_lane_rows.
+    const auto schedule = mini_served_prefill_schedule_from_env(hip, out.served_cli_route, out.tier);
     out.prefill_rows = std::min(explicit_rows.value_or(schedule.chunk), out.context);
-    if (out.served_cli_route) {
+    if (!out.served_cli_route) {
+        // Held-back route: the lane cap stays the incumbent one (an explicit --prefill-rows, else 128 rows, clamped),
+        // whatever chunk the schedule took; an implicit chunk retries at the command line's fallback rows when its
+        // device workspaces are refused (serve::load_with_chunk_fallback).
+        out.lane_rows = std::min(explicit_rows.value_or(kMiniServeLaneRows), out.context);
+        out.prefill_fallback_rows =
+            explicit_rows ? 0U : mini_served_prefill_fallback_rows(hip, out.served_cli_route, out.tier);
+    } else {
         if (out.prefill_rows == 0U) throw std::invalid_argument("--prefill-rows must be positive");
         // An explicit chunk without --slots also caps the lanes (the clamped chunk), as on the incumbent route.
         if (explicit_rows) out.lane_rows = out.prefill_rows;
@@ -112,8 +128,11 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     return resolved;
 }
 
-serve::CohortConfig scheduling(const MiniServeOptions& opt, const serve::CohortBackend& backend) {
-    serve::CohortConfig config;
+serve::CohortConfig scheduling(const MiniServeOptions& opt, const MiniServeCohort& device) {
+    const serve::CohortBackend& backend = *device.backend;
+    // The chunk the load admitted (the chunk ladder may keep a smaller one), never the requested one.
+    auto config = mini_serve_scheduling(device.prefill_rows != 0U ? device.prefill_rows : opt.prefill_rows,
+                                        backend.prompt_piece_rule(), device.mixed_service);
     // Admitted speculation (the decoder staged windows: backend.max_window > 1): each greedy lane drafts from its own
     // context (the shared cohort drafter) and verifies the window on its slot; draft rows by live lanes are the
     // model's data (drafts only while one lane is live, the previous one-row route at two or more).
@@ -125,12 +144,6 @@ serve::CohortConfig scheduling(const MiniServeOptions& opt, const serve::CohortB
     // on gfx1151, BF16 weights, a served B=1 step 42.4 ms and 10.2 ms per extra verify row -> fixed 32.2 + 10.2 per row.
     // Without windows the cohort keeps its default prior, as before speculation existed.
     if (windows) config.prior = {32.2, 10.2, 0.0, 0.0};
-    // A prompt runs as the command line's calls (whole chunks, the final one with its tail); beside a decoding lane
-    // the cohort cuts pieces of kMiniServeDecodingRows inside those chunks where the decoder's piece rule allows (HIP),
-    // so the bits never depend on other lanes (the backend's prompt_piece_rule; CUDA: none, whole chunks).
-    config.prompt_slice = opt.prefill_rows;
-    config.prompt_slice_decoding = opt.served_cli_route && backend.prompt_piece_rule().cuttable() &&
-                                   opt.prefill_rows > kMiniServeDecodingRows ? kMiniServeDecodingRows : 0U;
     return config;
 }
 
@@ -140,7 +153,7 @@ public:
                 const MiniServeTokenizer& tokenizer, MiniChat chat)
         : tokenizer_(tokenizer(opt.tokenizer)), device_(backend(opt)),
           queue_(std::max(64U, device_.backend->lanes())),
-          cohort_(queue_, *device_.backend, scheduling(opt, *device_.backend), [](const serve::GenerationJob& job) {
+          cohort_(queue_, *device_.backend, scheduling(opt, device_), [](const serve::GenerationJob& job) {
               if (job.copy_rows) throw std::invalid_argument("Inkling serving does not support copy_rows");
               if (job.window_rows) throw std::invalid_argument("Inkling serving does not support window_rows");
               if (job.prompt.size() < 2 ||

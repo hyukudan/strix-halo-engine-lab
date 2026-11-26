@@ -6074,3 +6074,107 @@ two applied at the store), dispatched by `enqueue_resident_q8_rows` (`src/core/r
 |---|---|
 | inkling2-mini | bound (HIP head, decode steps) |
 | qwen3.8-flash-next, qwen3.8-27b, deepseek-v4.1-flash, glm-5.3-flash, minimax-m3.1-flash, hy4-flash, nemotron-3.5-bolt-e4b | not bound: the decode head has no calibrated pack path and no resident low-bit rows |
+
+<a id="inkling2-served-chunk-ladder"></a>
+
+## Inkling 2 Mini CUDA served prompt: chunk ladder and mixed-service pieces
+
+**Engine:** `inkling2-mini` (CUDA server). **Control:** --prefill-rows N (one chunk, no ladder). **Default:** ON (CUDA server, every tier): implicit chunk = largest of 8192 / 2048 / 128 rows keeping the slot count of the 128-row chunk; a prompt beside a decoding lane runs 1024-row pieces (32-row cuts) with prompt share 0 (one decode round per piece); every served prompt row on the grouped prefill tile.
+
+Without `--prefill-rows`, the CUDA server loads the command line's chunk (8192 rows) and keeps it only when its whole load (decoder, levers, slot plan, slots allocated) leaves the slot count of the incumbent 128-row chunk; otherwise it tries 2048 rows, then keeps 128 (one load transaction per candidate; a host bound from the incumbent's measured budget skips candidates that cannot reach it). The startup line names `prefill_chunk` and the free bytes the slot plan read. A prompt admitted while another lane decodes runs in pieces cut at 32-row steps (pieces of 1024 rows, a remainder of at most 32 rows rides with the last one), so no piece takes the short-row dense body or the one-row projected-bias call, and a decoding lane waits about one piece; alone, a prompt keeps its one tall call. Fixed, not priced: the shared gap pricing (CohortConfig::prompt_gap_ms) granted whole 8K calls on this route. Each piece carries prompt share 0: the planner owes no decode-only phase after a piece, since the CUDA prefill call is synchronous and the decoding lanes already ride every piece (q42 step trace: 9 pieces x 151.5 ms + 200.7 ms of decode riding them, 0 decode-only steps; share 1 added 102 decode-only steps, 1,143 ms).
+
+- **Shared home:** include/strix/serve/prefill_chunk_fallback.hpp (serve::load_with_chunk_ladder); include/strix/serve/prompt_piece.hpp + src/serve/cohort_decode.cpp (PromptPieceRule, prompt_slice_decoding; serve::MixedServicePieces, the shared piece sizes kMixedServiceShortPieces / kMixedServiceLongPieces + mixed_service_piece_rows); engine binding src/inkling2/inkling2_mini_schedule.hpp (kMiniCudaServePieces).
+- **Tier and regime:** EXACT (FAST / TURBO resolve the same CUDA prefill arithmetic); RTX PRO server, prompts 1..8209 rows, context 34816, 8 slots.
+- **Exactness evidence:** EXACT: the served ids do not depend on the chunk, the pieces, the prompt share or the cohort. RTX receipts (cuda_pf2-kit): q37 (12 prompt lengths 1..8208 rows x 5 arms: incumbent 128-row calls, whole 8192, 2048-row calls, 128-row pieces beside a decoding lane, staggered; logits and KV digests equal; lanes == lone at widths 2, 3, 4, 8, 9, 16, 17), q40 (a decoder built at 8192 rows == one built at 128 rows at 12 lengths, KV included), q41 (served C8 ids == C1 ids, 3 reps, EXACT and FAST), q42 (share 0 server ids == q41, C8 == C1 x3), q43 (== q42). Host: cohort_decode tests (the step trace and the share change no id).
+- **Off switch:** --prefill-rows 128 (the incumbent chunk); STRIX_SERVE_PROMPT_SHARE=X replaces the pieces' prompt share (1 = the incumbent decode-owed schedule).
+- **Measured gain:** RTX PRO 6000 server (cuda_pf2-kit, context 34816, 8 slots, EXACT): decode gap while an 8K prompt is admitted beside a decoding lane 857-863 ms (whole calls, aa53a1a07, q35 arm) -> 197.4 / 196.2 ms (q42) and 190.4 / 189.9 ms (q43); the 8K prompt beside the lane 1,537 / 1,592 ms (q42) and 1,526 / 1,575 ms (q43), against 2,546 / 2,747 ms with prompt share 1 (q42 attribution arm, q41: 2.50 / 2.71 s) and 9.7 s with 128-row pieces (q35); 8K prefill alone 9,711 / 9,250 tok/s (q42) against 9,642 tok/s at the incumbent 128-row chunk build (q27); C8 aggregate 207.0 / 212.2 / 212.6 tok/s over 3 reps (q42). Command: cd wave4/turbo/cuda_pf2-kit && bash ticket.sh q42 (attribution: STRIX_SERVE_STEP_TRACE=1 + trace_sum.py; share 1 arm: STRIX_SERVE_PROMPT_SHARE=1).
+- **Preconditions:** CUDA held-back served route; no bit-changing prefill row bound (W4A4, calibrated, narrow experts: the decoder states no piece rule); HIP keeps one candidate.
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: its server does not run the shared cohort scheduler (serve::FixedKvCohort / serve/cohort_decode); binding needs its backend to state a PromptPieceRule (piece rows whose bits do not depend on the cut) and a chunk-invariant prefill for the ladder |
+| Qwen3.8 27B dense | not bound: the CUDA cohort bench (apps/cuda_qwen35_cohort_main.cu) runs the shared cohort scheduler without a piece rule (one prompt call); needs its prefill rows stated row-count invariant to bind |
+| DeepSeek V4.1 Flash | not bound: its server does not run the shared cohort scheduler (serve::FixedKvCohort / serve/cohort_decode); binding needs its backend to state a PromptPieceRule (piece rows whose bits do not depend on the cut) and a chunk-invariant prefill for the ladder (two-rank server with its own prefill row resolution) |
+| GLM 5.3 Flash | not bound: its server does not run the shared cohort scheduler (serve::FixedKvCohort / serve/cohort_decode); binding needs its backend to state a PromptPieceRule (piece rows whose bits do not depend on the cut) and a chunk-invariant prefill for the ladder |
+| MiniMax M3.1 Flash | not bound: its server does not run the shared cohort scheduler (serve::FixedKvCohort / serve/cohort_decode); binding needs its backend to state a PromptPieceRule (piece rows whose bits do not depend on the cut) and a chunk-invariant prefill for the ladder |
+| Inkling 2 Mini | bound: CUDA held-back served route (ladder 8192 -> 2048 -> 128, shared long pieces of 1024 rows beside a decoding lane); HIP: one candidate (its prefill is not chunk-invariant), pieces only on the served route lever (wave rows) |
+| Hy4 Flash | not bound: its server does not run the shared cohort scheduler (serve::FixedKvCohort / serve/cohort_decode); binding needs its backend to state a PromptPieceRule (piece rows whose bits do not depend on the cut) and a chunk-invariant prefill for the ladder (rank server) |
+| Gemma 4 / Nemotron E4B | not bound: its server does not run the shared cohort scheduler (serve::FixedKvCohort / serve/cohort_decode); binding needs its backend to state a PromptPieceRule (piece rows whose bits do not depend on the cut) and a chunk-invariant prefill for the ladder |
+
+<a id="inkling2-served-packed-decode"></a>
+
+## Inkling 2 Mini CUDA served decode: packed lone-lane MoE form
+
+**Engine:** `inkling2-mini` (CUDA server). **Control:** --packed-decode / --grouped-decode (CLI and CUDA server). **Default:** ON (CUDA, every tier): every decode row on the packed one-row body; a cohort pass runs its rows in microscaled_r1::launch_rows (<= 16 rows per launch, each row the bits of a one-row launch).
+
+The CUDA server builds its decoder with the command line's decode form: every decode row runs the packed one-row MoE body, a cohort pass in one rows launch per 16 rows, so every lane's bits equal its lone run at any cohort width. The grouped tile stays as the explicit --grouped-decode switch, in no tier's defaults. The served ids change against main's grouped server. CLI == server ids stay open: the server serves the held-back route (the last prompt token decoded as the first decode row), the CLI emits the first id from its prefill chunk.
+
+- **Shared home:** include/strix/serve/decode_form.hpp (serve::resolve_decode_form); src/moe_core/microscaled_r1.hpp (packed one-row body, launch_rows).
+- **Tier and regime:** EXACT reference (the CLI's EXACT decode form; the served ids change from main's grouped bits); RTX PRO server, 8 slots, C1 and C8.
+- **Exactness evidence:** EXACT reference = the CLI's packed decode form. The served EXACT ids CHANGE against main's grouped server (q20 / q35: DIFFER); every lane equals its lone run at any width (q39 / q41 / q42: C8 lanes == C1 8/8, FAST == EXACT; CUDA fixture run_r1_rows: every launch_rows row == a one-row launch). CLI == server ids are NOT yet a receipt: q43 (same rendering, reasoning_effort none) 1/8 equal; the CUDA server serves held-back (the last prompt token is the first decode row) where the CLI emits the first id from its prefill chunk; the CLI's route on the server is the served route lever (kMiniServedCliRoute), HIP only today. Main's grouped server was not CLI == server either (q20).
+- **Off switch:** --grouped-decode.
+- **Measured gain:** RTX PRO 6000 server (cuda_pf2-kit, context 34816, 8 slots, EXACT): C1 decode 66.5 tok/s (main's grouped served form, q36) -> 100.2 tok/s (q42) / 100.7 tok/s (q43); C8 aggregate 166.8 tok/s (aa53a1a07, q27) -> 207.0 / 212.2 / 212.6 tok/s (q42, 3 reps). Command: cd wave4/turbo/cuda_pf2-kit && bash ticket.sh q42.
+- **Preconditions:** CUDA server; HIP server: only through the served route lever row (refuses the flags).
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: its MoE decode runs its own form and switch (own catalog rows), not serve::resolve_decode_form |
+| Qwen3.8 27B dense | not applicable: no routed experts |
+| DeepSeek V4.1 Flash | not bound: its MoE decode runs its own form and switch (own catalog rows), not serve::resolve_decode_form |
+| GLM 5.3 Flash | not bound: its MoE decode runs its own form and switch (own catalog rows), not serve::resolve_decode_form |
+| MiniMax M3.1 Flash | not bound: its MoE decode runs its own form and switch (own catalog rows), not serve::resolve_decode_form (Packed MoE decode, STRIX_PF_P1 bit 0) |
+| Inkling 2 Mini | bound: CLI (both backends) and CUDA server (every width); HIP server: through the served route lever row |
+| Hy4 Flash | not bound: its MoE decode runs its own form and switch (own catalog rows), not serve::resolve_decode_form |
+| Gemma 4 / Nemotron E4B | not applicable: no routed experts |
+
+<a id="inkling2-screened-head"></a>
+
+## Inkling 2 Mini CUDA EXACT screened greedy head
+
+**Engine:** `inkling2-mini` (CUDA). **Control:** STRIX_INK_SCREENED_HEAD=0/1 (row inkling2-mini-screened-head@1). **Default:** ON in every tier (CUDA); HIP: its own binding.
+
+A greedy pick whose scores nobody reads runs the shared EXACT screened head: same token and status as the full head, without materialising the full score row.
+
+- **Shared home:** src/core/screened_head.hpp + src/core/screened_head_plan.hpp (EXACT screened greedy head).
+- **Tier and regime:** EXACT, FAST, QUALITY, TURBO (inherits FAST); CUDA CLI and server decode, greedy picks without a score read.
+- **Exactness evidence:** EXACT: bitwise the incumbent route. RTX receipts (cuda_pf2-kit): q16 on the #1280 head (9/9 logits, 13/13 ids, CLI and served), q26 CLI and q27 served (ids equal row off vs on), q38 served held-back fixture with the rows on (every arm equal at 34 / 130 / 8209 prompt rows, digests equal to the rows off).
+- **Off switch:** STRIX_INK_SCREENED_HEAD=0 (the full head).
+- **Measured gain:** Both rows together, RTX PRO server (cuda_pf2-kit ticket q27, strix-serve of aa53a1a07, context 34816, 8 slots, EXACT without vs with the rows): 8K prefill 9,642 -> 10,998 tok/s (+14 %), C1 decode 72.6 -> 73.7 tok/s, C8 aggregate 166.8 -> 167.8 tok/s; not measured apart.
+- **Preconditions:** CUDA greedy picks that return no score row; a step that returns or reads scores keeps the full head.
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: candidate (decode); the shared head exists, the engine's greedy pick does not call it (lev_x T18) |
+| Qwen3.8 27B dense | not bound: candidate (decode); the shared head exists, the engine's greedy pick does not call it (lev_x T18) |
+| DeepSeek V4.1 Flash | not bound: candidate (decode); the shared head exists, the engine's greedy pick does not call it (lev_x T18) |
+| GLM 5.3 Flash | not bound: candidate (decode); the shared head exists, the engine's greedy pick does not call it (lev_x T18) |
+| MiniMax M3.1 Flash | not bound: candidate (decode); the shared head exists, the engine's greedy pick does not call it (lev_x T18) |
+| Inkling 2 Mini | bound: CUDA (this row: default in every tier, CLI and server) and HIP (its own binding, STRIX_SCREENED_HEAD) |
+| Hy4 Flash | not bound: candidate (decode); the shared head exists, the engine's greedy pick does not call it (lev_x T18) |
+| Gemma 4 / Nemotron E4B | not bound: candidate (decode); the shared head exists, the engine's greedy pick does not call it (lev_x T18) |
+
+<a id="inkling2-attn-projected-bias"></a>
+
+## Inkling 2 Mini CUDA EXACT projected relative bias in the prompt flash
+
+**Engine:** `inkling2-mini` (CUDA). **Control:** STRIX_INK_ATTN_PROJECTED_BIAS=0/1 (row inkling2-mini-attn-projected-bias@1). **Default:** ON in every tier (CUDA); HIP: its own projected route.
+
+The CUDA prompt flash projects the relative attention bias itself (cuda_core::PreparedBf16Projection) instead of reading the bias image; same bits.
+
+- **Shared home:** src/attn_core/dense_flash_prefill.hpp (projected bias) + cuda_core::PreparedBf16Projection.
+- **Tier and regime:** EXACT, FAST, QUALITY, TURBO (inherits FAST); CUDA prefill (CLI and served prompts).
+- **Exactness evidence:** EXACT: bitwise the incumbent route. RTX receipts (cuda_pf2-kit): q16 on the #1280 head (9/9 logits, 13/13 ids, CLI and served), q26 CLI and q27 served (ids equal row off vs on), q38 served held-back fixture with the rows on (every arm equal at 34 / 130 / 8209 prompt rows, digests equal to the rows off).
+- **Off switch:** STRIX_INK_ATTN_PROJECTED_BIAS=0 (the image route).
+- **Measured gain:** Both rows together, RTX PRO server (cuda_pf2-kit ticket q27, strix-serve of aa53a1a07, context 34816, 8 slots, EXACT without vs with the rows): 8K prefill 9,642 -> 10,998 tok/s (+14 %), C1 decode 72.6 -> 73.7 tok/s, C8 aggregate 166.8 -> 167.8 tok/s; not measured apart.
+- **Preconditions:** CUDA prompt flash of more than one row (a one-row call keeps the image route).
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not applicable: its attention has no relative-bias term to project |
+| Qwen3.8 27B dense | not applicable: its attention has no relative-bias term to project |
+| DeepSeek V4.1 Flash | not applicable: its attention has no relative-bias term to project |
+| GLM 5.3 Flash | not applicable: its attention has no relative-bias term to project |
+| MiniMax M3.1 Flash | not applicable: its attention has no relative-bias term to project |
+| Inkling 2 Mini | bound: CUDA prompt flash (this row: default in every tier); HIP selects its projected route in its own binding |
+| Hy4 Flash | not applicable: its attention has no relative-bias term to project |
+| Gemma 4 / Nemotron E4B | not applicable: its attention has no relative-bias term to project |
