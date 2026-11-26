@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/exec/graph_submission.hpp"
 #include "strix/exec/width_replay.hpp"
 
 #include <array>
@@ -67,24 +68,18 @@ public:
             runtime.discard(index);
             return false;
         }
-        try {
-            if (action == WidthReplayAction::capture) {
-                bindings_[index] = binding;
-                if (!runtime.capture(stream, index, work)) {
-                    runtime.discard(index);
-                    policy_.fail(width);
-                    return false;
-                }
-                policy_.captured(width);
-            }
+        return submit_graph(action == WidthReplayAction::capture, [&] {
+            bindings_[index] = binding;
+            if (!runtime.capture(stream, index, work)) return false;
+            policy_.captured(width);
+            return true;
+        }, [&] {
             runtime.upload(stream, block);
-            runtime.launch(stream, index);
-        } catch (...) {
+            return true;
+        }, [&] { runtime.launch(stream, index); }, [&] {
             runtime.discard(index);
             policy_.fail(width);
-            throw;
-        }
-        return true;
+        });
     }
 
     template <class Runtime>

@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include "strix/device/graph_inspection.hpp"
+#include "strix/exec/graph_submission.hpp"
 
 #include "strix/device_allocation_error.hpp"
 #endif
@@ -196,17 +197,13 @@ public:
             invalidate();
             return false;
         }
-        if (action == session::StepReplayAction::capture && !try_capture(stream, work)) return fail();
-
-        *staging_ = input;
-        if (STRIX_DEVICE_RT(MemcpyAsync)(device_, staging_, sizeof(input), host_to_device, stream) !=
-            STRIX_DEVICE_RT(Success)) return fail();
-        const auto status = STRIX_DEVICE_RT(GraphLaunch)(exec_, stream);
-        if (status != STRIX_DEVICE_RT(Success)) {
-            fail();
-            check(status, "launch step graph");
-        }
-        return true;
+        return exec::submit_graph(action == session::StepReplayAction::capture,
+            [&] { return try_capture(stream, work); }, [&] {
+                *staging_ = input;
+                return STRIX_DEVICE_RT(MemcpyAsync)(device_, staging_, sizeof(input), host_to_device, stream) ==
+                       STRIX_DEVICE_RT(Success);
+            }, [&] { check(STRIX_DEVICE_RT(GraphLaunch)(exec_, stream), "launch step graph"); },
+            [&] { fail(); });
     }
 
     [[nodiscard]] unsigned instantiations() const noexcept { return instantiations_; }
