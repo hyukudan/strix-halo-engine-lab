@@ -242,8 +242,10 @@ inline constexpr std::array<profile::Lever, 16> kMiniLevers{{
     {.name = kMiniLowBitHead, .env = "STRIX_INK_LOWBIT_HEAD", .option = "",
      .value = {"", "", "", ""}, .builtin = "0", .kind = profile::Kind::bit_changing,
      .ready = {}, .runnable = {false, true, false, true}, .target = "sp4t", .off = "0",
-     .source = "pending: SP4 fixed-table head (emulated gate v2 0/39 FAST); awaits the device gate v2 receipt and a "
-               "decision row; HIP command line only",
+     .source = "explicit option: SP4 fixed-table head, device gate v2 decode 2026-11-26 FAST fails 1/39 windows "
+               "(+1 unresolved), TURBO limits 39/39 pass, CLI B=1 -3.1 % per step vs the BF16 head "
+               "(docs/engine/lowbit-calibration.md); a TURBO row awaits the served arm and a combined receipt; HIP "
+               "command line only",
      .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"sp4t", "sp4t-head-v1"}}}},
 }};
 
