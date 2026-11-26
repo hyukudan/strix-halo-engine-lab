@@ -206,9 +206,10 @@ void arbiter_tests() {
     for (int i = 0; i < 40; ++i) a.observe({sp::Source::model, 0, 7, 0, 8, 41.0, 3.5}, {});
     d = a.decide(in);
     SP_CHECK(d.source == sp::Source::serial || d.probe, "retreat after misses");
-    // Probe: after probe_every passes without the model it is tried once.
+    // Probe: after probe_every passes without the model it is tried once; ArbiterConfig::probe_loss paces it (priced
+    // excess ~23.5 ms <= 0.015 x passes x the 20 ms pick: ~49 passes after the last model pass).
     bool probed = false;
-    for (int i = 0; i < 40 && !probed; ++i) {
+    for (int i = 0; i < 80 && !probed; ++i) {
         d = a.decide(in);
         probed = d.probe && d.source == sp::Source::model;
         a.observe({d.source, 0, d.k, 0, d.rows, 20.0, 0.0}, {});
@@ -1100,6 +1101,7 @@ ProbeRun probe_run(bool charge, std::uint64_t ctx, double p, int passes) {
     config.learn_costs = false;
     config.row_kv_ms_per_kpos = 0.0699;
     config.charge_probe = charge;
+    config.probe_loss = 0.0;  // the probe's depth rule alone; the charged interval is honest_plain_price_tests
     sp::Arbiter a(config);
     for (std::uint32_t r = 1; r <= 16; ++r) a.seed_cost(r, 13.30 + 0.113 * double(r - 1));
     const std::vector<double> survival(15, p);
@@ -1311,8 +1313,117 @@ void cold_wall_tests() {
              "stats line: warm mean for widths with two or more passes: %s", json.c_str());
 }
 
+// Closed-loop trace of the learned arbiter (the shared CLI's auto: learned walls, cold_walls 1) on the walls of the
+// CUDA Inkling 2 Mini resident route (q46 strix-spec-stats, warm means per verify width) and its per-depth MTP
+// acceptance. The controller is never slower than plain decode beyond its charged probes, PROVIDED the plain row it
+// can buy is the plain step: with the eager one-row pass of a drafting run (22.4 ms, the tap store kept the step graph
+// off) prose drafts below a 11.0 ms plain step; with the plain step priced at 11.0 ms it stays within the bound.
+struct TraceResult { double tokens = 0.0, ms = 0.0; std::uint32_t model_passes = 0, passes = 0; };
+TraceResult arbiter_trace(double plain_ms, std::span<const double> conditional, std::uint32_t passes,
+                          double probe_loss = 0.015, double max_tokens = 1e18, std::uint64_t seed = 0,
+                          const sp::ArbiterConfig* base = nullptr, bool always_draft = false) {
+    // Verify + commit wall per window rows (q46: 1 row 11.0 graph / 22.4 eager, 3 31.9, 4 35.7, 5 33.0-35.1, 7 37.6,
+    // 8 39.4; widths without a sample interpolated, monotone).
+    const std::array<double, 9> wall{0.0, plain_ms, 29.0, 31.9, 33.5, 34.5, 36.0, 37.6, 39.4};
+    std::vector<double> draft(7);
+    for (std::size_t k = 0; k < draft.size(); ++k) draft[k] = 1.75 + 0.05 * double(k);  // q46: 1.8-2.1 ms per pass
+    sp::ArbiterConfig config = base ? *base : sp::ArbiterConfig{};
+    config.cold_walls = 1;
+    config.probe_loss = probe_loss;
+    sp::Arbiter a(config);
+    std::uint64_t state = 0x9E3779B97F4A7C15ULL + seed * 0x632BE59BD9B4E019ULL;
+    const auto uniform = [&state] {  // splitmix64: the same stream on every compiler
+        std::uint64_t z = (state += 0x9E3779B97F4A7C15ULL);
+        z = (z ^ (z >> 30U)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27U)) * 0x94D049BB133111EBULL;
+        return double((z ^ (z >> 31U)) >> 11U) * 0x1.0p-53;
+    };
+    TraceResult r;
+    std::vector<std::uint32_t> emitted;
+    for (std::uint32_t pass = 0; pass < passes && r.tokens < max_tokens; ++pass) {
+        sp::StepInput in;
+        in.model_max_k = 7;
+        in.model_draft_ms = draft;
+        in.max_rows = 8;
+        in.context = 658U + static_cast<std::uint64_t>(r.tokens);
+        auto d = a.decide(in);
+        if (always_draft) d = sp::Decision{sp::Source::model, 7, 8, false, 0.0, 0.0, false};
+        std::uint32_t accepted = 0;
+        if (d.source == sp::Source::model)
+            while (accepted < d.k && uniform() < conditional[std::min<std::size_t>(accepted, conditional.size() - 1U)])
+                ++accepted;
+        const double verify = wall.at(d.rows), drafted = d.source == sp::Source::model ? draft[d.k - 1U] : 0.0;
+        emitted.assign(accepted + 1U, 7U);
+        a.observe({d.source, 0, d.k, accepted, d.rows, verify, drafted, in.context}, emitted);
+        r.tokens += double(accepted + 1U);
+        r.ms += verify + drafted;
+        r.model_passes += d.source == sp::Source::model ? 1U : 0U;
+        ++r.passes;
+    }
+    return r;
+}
+
+void honest_plain_price_tests() {
+    // q46 per-depth conditional acceptance: prose depth_accepted / depth_offered [78/131, 42/78, 1/5, 0/1], code
+    // [40/52, 33/40, 31/32, 28/31, 24/27, 24/24, 20/24].
+    const std::array<double, 4> prose{0.595, 0.538, 0.2, 0.2};
+    const std::array<double, 7> code{0.77, 0.825, 0.97, 0.90, 0.89, 0.97, 0.83};
+    const double plain = 11.0, plain_rate = 1.0 / plain;
+    const auto ratio = [plain_rate](const TraceResult& r) { return r.tokens / r.ms / plain_rate; };
+    const auto report = [&](const char* label, const TraceResult& r) {
+        std::printf("arbiter trace %s: %.4f x a 11.0 ms plain step, %u of %u passes drafted\n", label, ratio(r),
+                    r.model_passes, r.passes);
+    };
+    const auto prose_charged = arbiter_trace(plain, prose, 2000);
+    const auto prose_fixed = arbiter_trace(plain, prose, 2000, 0.0);
+    report("prose, plain 11.0 ms, probe_loss 0.015", prose_charged);
+    report("prose, plain 11.0 ms, probe_loss 0 (fixed 32-pass probes)", prose_fixed);
+    SP_CHECK(ratio(prose_charged) >= 0.97, "prose: within 3 %% of plain decode (%.4f)", ratio(prose_charged));
+    SP_CHECK(ratio(prose_fixed) < ratio(prose_charged), "the fixed interval pays more probes (%.4f)", ratio(prose_fixed));
+    const auto prose_eager = arbiter_trace(22.4, prose, 2000);
+    report("prose, plain 22.4 ms (eager tap step)", prose_eager);
+    SP_CHECK(prose_eager.model_passes > prose_eager.passes / 2U && ratio(prose_eager) < 0.8,
+             "the defect: a 22.4 ms plain row makes a losing drafter win (%.4f)", ratio(prose_eager));
+    const auto code_charged = arbiter_trace(plain, code, 2000);
+    const auto code_fixed = arbiter_trace(plain, code, 2000, 0.0);
+    // q47 (one 255-token request, plain 11.0 ms): the probe was capped to the window the frontier budget afforded (k=1,
+    // 2 rows 28.5 ms ~ 1.8 tokens, a loss) and the acceptance estimate of a few probes stays below the 8-row break-even
+    // (3.77 tokens) on code that accepts ~4.9: 6 of 250 passes drafted, 88 tok/s vs 116. Probes now run the deepest
+    // window and an episode keeps drafting while its realized net is >= 0.
+    // One 255-token request is a few probes: the ratio is the aggregate of 64 requests (independent streams).
+    const auto requests = [&](std::span<const double> rates, double loss = 0.015, const sp::ArbiterConfig* base = nullptr,
+                              bool always = false) {
+        TraceResult sum;
+        for (std::uint64_t seed = 1; seed <= 64; ++seed) {
+            const auto r = arbiter_trace(plain, rates, 2000, loss, 255.0, seed, base, always);
+            sum.tokens += r.tokens;
+            sum.ms += r.ms;
+            sum.model_passes += r.model_passes;
+            sum.passes += r.passes;
+        }
+        return sum;
+    };
+    const auto code_short = requests(code);
+    const auto prose_short = requests(prose);
+    const auto code_always = requests(code, 0.015, nullptr, true);  // every pass drafts k = 7 (the drafting bound)
+    report("code, plain 11.0 ms, probe_loss 0.015", code_charged);
+    report("code, plain 11.0 ms, probe_loss 0", code_fixed);
+    report("code, 64 requests of 255 tokens", code_short);
+    report("prose, 64 requests of 255 tokens", prose_short);
+    report("code, 64 requests of 255 tokens, always drafting k=7", code_always);
+    // A 2000-pass run pays ~2 % for the rarer re-probes after an unlucky stretch (1.280 vs 1.302); one request gains.
+    SP_CHECK(ratio(code_charged) >= 1.2 && ratio(code_charged) >= ratio(code_fixed) - 0.03,
+             "code keeps drafting, the charged interval costs it little (%.4f vs %.4f)", ratio(code_charged), ratio(code_fixed));
+    // One request of i.i.d. acceptance: the opening measurements cost prose ~2.3 %, so code reaches ~0.92x always
+    // drafting at prose >= 0.97 (the frontier is in ArbiterConfig::probe_loss).
+    SP_CHECK(ratio(code_short) >= 1.2 && ratio(code_short) >= 0.9 * ratio(code_always),
+             "code: 64 requests find the deep windows (%.4f, always drafting %.4f)", ratio(code_short), ratio(code_always));
+    SP_CHECK(ratio(prose_short) >= 0.97, "prose: 64 requests stay within 3 %% of plain decode (%.4f)", ratio(prose_short));
+}
+
 int main() {
     cold_wall_tests();
+    honest_plain_price_tests();
     measured_ladder_tests();
     wide_window_tests();
     index_tests();

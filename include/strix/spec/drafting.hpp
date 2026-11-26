@@ -117,6 +117,25 @@ struct ArbiterConfig {
     // context where serial wins (K/V-priced verify rows) never pays an unpriced deep pass (128K, k 15: ~8 serial passes).
     // false = the previous form (always the deepest legal window). Drafts never change emitted tokens.
     bool charge_probe = true;
+    // Charged re-probe interval (charge_probe, learned drafter that is not the pick): a re-probe whose priced excess over
+    // the pick is E waits until E <= probe_loss x the pick's ms over the passes since the last model pass (at least
+    // probe_every), so the re-probes of a drafter that loses cost at most probe_loss of decode time (plus one excess per
+    // run), while a drafter near break-even (E ~ 0) is re-probed every probe_every passes as before. The bound rests on
+    // learned prices: an excess the estimate understates is learned by the probe itself. 0 = the fixed probe_every
+    // interval. Measured cause: on prose the fixed 32-pass probes alone cost 4.6 % (closed-loop trace of the CUDA
+    // Inkling 2 Mini walls, spec_drafting_tests honest_plain_price_tests).
+    // With probe_loss > 0 a probe runs the deepest legal window and opens an episode: the drafter keeps that window while
+    // the episode's realized net (emitted tokens x the pick's ms per token - pass walls) stays >= 0, and the next probe
+    // waits on the realized loss of the closed episode (at most one pass's excess). Bound: exploration loses at most
+    // probe_loss of the pick's decode time plus one episode and the min_model_passes first measurements. Measured cause:
+    // q47, an 11 ms plain step: the acceptance estimate of 5-8 probes in one 255-token request stays below break-even
+    // (3.77 tokens per 8-row pass) on code that accepts ~4.9, so the estimate alone drafted 6 of 250 passes (88 vs 116 tok/s).
+    // The episode's ledger counts every model pass while it is open, allows half a priced excess (one short accept must
+    // not end a winning run) and caps its credit at three probe walls (a change of text stops it within a few passes).
+    // 64 traced 255-token requests at the q46 walls (spec_drafting_tests honest_plain_price_tests), x plain decode:
+    //   allowance 0 / 0.5 / 1 / 2 excess: code 1.19 / 1.21 / 1.23 / 1.25, prose 0.971 / 0.970 / 0.965 / 0.947
+    //   (always drafting k=7: code 1.325, prose 0.536); probe_loss 0.010 / 0.015: code 1.208 / 1.213, prose 0.974 / 0.970.
+    double probe_loss = 0.015;
     // Priced exploration (learned per-depth drafter; replaces the deepest-window choice of charge_probe when true):
     // - a probe never moves the arm hysteresis (switch_in): leaving serial needs the estimate, not a probe's side effect.
     //   Measured: each deep probe left the arbiter on a k = 3 window that tied serial (1.002x priced) for 43 of 187 passes;
@@ -336,6 +355,11 @@ private:
     // ArbiterConfig::cycle_half_life_tokens: decayed net (ms), priced ms and passes of the model arm's realized cycles,
     // and the plain row's price at the last decision.
     double cycle_net_ms_ = 0.0, cycle_priced_ms_ = 0.0, cycle_passes_ = 0.0, decided_plain_ms_ = 0.0;
+    // ArbiterConfig::probe_loss episodes: realized net (ms) of the open episode at the pick's ms per token, that rate,
+    // and the realized loss of the last closed episode (< 0 = none: the priced excess paces the next probe).
+    // Allowance (one priced excess) and credit cap (three probe walls) of the open episode.
+    double episode_net_ms_ = 0.0, episode_rate_ = 0.0, episode_loss_ms_ = -1.0, episode_allow_ms_ = 0.0, episode_cap_ms_ = 0.0;
+    bool episode_open_ = false, episode_pass_ = false;
     std::array<Decision, source_count> arms_{};  // best option per source of the last decide() (trace)
     std::array<double, source_count> arm_scores_{};
 

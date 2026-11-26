@@ -6432,3 +6432,81 @@ model pending a matched timing comparison.
 | MiniMax M3.1 Flash | Unbound | Unbound |
 | Nemotron 3.5 Bolt E4B | Unbound | Unbound |
 | Hy4 Flash | FAST/TURBO with a matching receipt | Explicit MTP rank option |
+
+<a id="spec-arbiter-probe-episodes"></a>
+
+## Shared speculation arbiter: measured probe episodes
+
+**Engine:** `shared`. **Control:** ArbiterConfig::probe_loss. **Default:** on (0.015).
+
+A probe of a learned per-depth drafter runs the deepest legal window and opens an episode whose realized ledger (every model pass at the plain row's ms per token; allowance half a priced excess, credit capped at three probe walls) keeps the drafter while it is not losing; the closed episode's realized loss paces the next probe. Bound: exploration loses at most probe_loss of decode time plus one episode and the first measurements.
+
+- **Shared home:** include/strix/spec/drafting.hpp + src/spec/drafting.cpp (spec::Arbiter).
+- **Tier and regime:** EXACT, FAST, QUALITY, TURBO; speculative decode at one request.
+- **Exactness evidence:** Drafts never change emitted tokens (greedy verify). RTX q47: ids equal on code and prose (new auto == off == q46 resident).
+- **Off switch:** ArbiterConfig::probe_loss = 0.
+- **Measured gain:** RTX PRO, cuda_pf2-kit q48, Inkling 2 Mini CUDA CLI EXACT 256 tokens: code 130.2 / 131.4 tok/s vs off 90.8 and the previous default 116.0 (51 of 54 passes drafted); prose 91.3 / 91.2 vs off 94.8 (0.963x: the bound at one 255-token request is 0.96x = probe_loss 1.5 % + the opening measurements ~2 % of a 2.7 s decode). q47 (the previous charged probe): code 88.4 (6 of 250 passes drafted). Host closed-loop trace, 64 requests: code 1.21x plain (always drafting 1.32x), prose 0.970x.
+- **Preconditions:** Learned walls (not frozen prices), a per-depth drafter (model_draft_ms), charge_probe on.
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | bound where the Qwen spec CLIs (apps/*qwen35_spec_main) run a learned MTP chain through spec::BlockDrafter; frozen-price runs keep priced exploration (unchanged); not re-measured |
+| Qwen3.8 27B dense | bound where the Qwen spec CLIs (apps/*qwen35_spec_main) run a learned MTP chain through spec::BlockDrafter; frozen-price runs keep priced exploration (unchanged); not re-measured |
+| DeepSeek V4.1 Flash | not affected: the DSpark batch drafter is a black-box measured pass (model_pass_ms), a different arbiter branch |
+| GLM 5.3 Flash | not affected: the MTP pair arbiter prices a black-box pass / frozen prices, a different arbiter branch |
+| MiniMax M3.1 Flash | not applicable: no drafter |
+| Inkling 2 Mini | bound: CUDA and HIP serial CLI (MTP chain through spec::BlockDrafter, learned walls); the server's cohort context drafter is lookup (unchanged) |
+| Hy4 Flash | bound where the Hy4 rows run a learned chain through spec::BlockDrafter; not re-measured |
+| Nemotron 3.5 Bolt E4B | not applicable: no drafter |
+
+<a id="inkling2-drafting-step-graph"></a>
+
+## Inkling 2 Mini CUDA drafting runs keep the one-row step graph
+
+**Engine:** `inkling2-mini`. **Control:** the step graph route. **Default:** on.
+
+A drafting run's plain passes replay the captured one-row step: the drafter tap is written at the step descriptor's device row, so an eager verify append no longer invalidates the graph.
+
+- **Shared home:** src/core/row_transforms.hpp (StoreBf16SliceAtRow); src/inkling2 binding.
+- **Tier and regime:** EXACT, FAST, QUALITY, TURBO; CUDA CLI speculative decode.
+- **Exactness evidence:** EXACT: the graph replays the same eager kernels; the drafter tap is stored at the step descriptor's row (StoreBf16SliceAtRow). RTX q47: ids equal to the resident non-speculative run (code) and to off (prose).
+- **Off switch:** --no-step-graph (eager).
+- **Measured gain:** RTX PRO, cuda_pf2-kit q47 vs q46 (CLI EXACT 256 tokens): the plain row in a drafting run 22.4 -> 11.0 ms; prose auto 57.2 -> 91.7 tok/s (off 94.6).
+- **Preconditions:** CUDA resident decoder with DSpark/MTP taps; plain (serial) passes of a drafting run.
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: the shared row store exists; the engine has no captured step with drafter taps |
+| Qwen3.8 27B dense | not bound: the shared row store exists; the engine has no captured step with drafter taps |
+| DeepSeek V4.1 Flash | not bound: the shared row store exists; the engine has no captured step with drafter taps |
+| GLM 5.3 Flash | not bound: the shared row store exists; the engine has no captured step with drafter taps |
+| MiniMax M3.1 Flash | not bound: the shared row store exists; the engine has no captured step with drafter taps |
+| Inkling 2 Mini | bound: CUDA CLI (this row) |
+| Hy4 Flash | not bound: the shared row store exists; the engine has no captured step with drafter taps |
+| Nemotron 3.5 Bolt E4B | not bound: the shared row store exists; the engine has no captured step with drafter taps |
+
+<a id="inkling2-verify-lanes-screened-head"></a>
+
+## Inkling 2 Mini CUDA verify windows pick through the lanes screened head
+
+**Engine:** `inkling2-mini`. **Control:** STRIX_INK_SCREENED_HEAD=0/1. **Default:** ON in every tier (CUDA).
+
+A greedy verify window of up to 8 rows picks every row through the lanes form of the shared EXACT screened head instead of the full BF16 head per row.
+
+- **Shared home:** src/cuda/core/head_screened.cuh (lanes); src/core/resident_greedy.hpp (enqueue_produced_rows).
+- **Tier and regime:** EXACT, FAST, QUALITY, TURBO; CUDA CLI speculative verify.
+- **Exactness evidence:** EXACT: lane l is bitwise the R=1 screened head (device test cuda_core_screened_head_test, lanes 1-32: 0 lanes differ); RTX q47 ids equal.
+- **Off switch:** STRIX_INK_SCREENED_HEAD=0.
+- **Measured gain:** Device bench at the Inkling head shape (q47): 8 lanes 696.8 -> 430.6 us per verify head (full head per row vs lanes screened); decode tok/s not measured apart.
+- **Preconditions:** CUDA greedy verify windows of <= 8 rows without a score read.
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: candidate (speculative verify); the lanes head exists, the engine's verify pick does not call it |
+| Qwen3.8 27B dense | not bound: candidate (speculative verify); the lanes head exists, the engine's verify pick does not call it |
+| DeepSeek V4.1 Flash | not bound: candidate (speculative verify); the lanes head exists, the engine's verify pick does not call it |
+| GLM 5.3 Flash | not bound: candidate (speculative verify); the lanes head exists, the engine's verify pick does not call it |
+| MiniMax M3.1 Flash | not bound: candidate (speculative verify); the lanes head exists, the engine's verify pick does not call it |
+| Inkling 2 Mini | bound: CUDA verify windows (this row) |
+| Hy4 Flash | not bound: candidate (speculative verify); the lanes head exists, the engine's verify pick does not call it |
+| Nemotron 3.5 Bolt E4B | not bound: candidate (speculative verify); the lanes head exists, the engine's verify pick does not call it |

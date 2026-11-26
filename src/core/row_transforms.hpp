@@ -53,6 +53,21 @@ struct StoreBf16Slice {
     }
 };
 
+// StoreBf16Slice whose first destination row is read on the device (`*first_row`, e.g. a step descriptor's
+// position), so a captured step graph stores each replay at its own row: output row (*first_row + i / width), the
+// same bytes StoreBf16Slice writes at output + *first_row * stride.
+struct StoreBf16SliceAtRow {
+    const float* input;
+    std::uint16_t* output;
+    unsigned width;
+    unsigned stride;
+    const std::uint32_t* first_row;
+
+    __device__ void operator()(std::size_t i) const {
+        output[(std::size_t{*first_row} + i / width) * stride + i % width] = attn::cache_rows::encode(input[i]);
+    }
+};
+
 template <unsigned Taps>
 struct MixBf16Rows {
     const std::uint16_t* input;

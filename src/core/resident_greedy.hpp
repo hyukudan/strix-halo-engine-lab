@@ -179,6 +179,19 @@ public:
         submitted_rows_ = 1;
     }
 
+    // Rows 0..rows-1 picked by another device producer that writes the index-or-none word of row r at device_tokens[r]
+    // (e.g. the lanes form of the EXACT screened head); one pinned reply copy follows on the same stream and token(r)
+    // reads row r after the stream fence.
+    template <class Producer>
+    void enqueue_produced_rows(unsigned rows, Producer&& produce, device::native::Stream stream) {
+        submitted_rows_ = 0;
+        if (!rows || rows > capacity_) throw std::invalid_argument("invalid resident CUDA greedy produced rows");
+        produce_checked(std::forward<Producer>(produce), device_tokens_.data(), "enqueue produced CUDA greedy rows");
+        device::native::copy(replies_.get(), device_tokens_.data(), rows * sizeof(std::uint32_t),
+                             device::native::device_to_host, stream);
+        submitted_rows_ = rows;
+    }
+
     // A producer may return its launch status (cudaError_t / hipError_t): a rejected launch must not publish the
     // reply of an earlier submission, so the status is checked (throws) before the row is marked submitted.
     template <class Producer, class Target>

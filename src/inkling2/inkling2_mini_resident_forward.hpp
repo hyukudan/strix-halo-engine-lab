@@ -118,7 +118,8 @@ public:
             workspace_.activations.size() < activation_elements) {
             throw std::invalid_argument("incomplete Mini resident forward workspace or output");
         }
-        auto taps = workspace_.draft_taps;
+        const auto plane = workspace_.draft_taps;
+        auto taps = plane;
         if (!taps.empty()) {
             const auto offset = MiniDSparkTapPlan::elements(chunk.first_position);
             const auto length = MiniDSparkTapPlan::elements(chunk.rows);
@@ -128,7 +129,11 @@ public:
         }
         session_->append(backend_, chunk, workspace_.convolution_checkpoint, workspace_.kv_checkpoint, [&] {
             if constexpr (!std::is_same_v<Prepare, std::nullptr_t>) prepare();
-            ChunkForward<false> forward(*this, chunk, image_elements, taps);
+            // A one-row step capture stores the DSpark taps at the step descriptor's position
+            // (MiniResidentBackend::store_draft_tap): it takes the tap plane from position 0, not the capture's row.
+            bool capturing = false;
+            if constexpr (requires { backend_.capture_descriptor(); }) capturing = backend_.capture_descriptor() != nullptr;
+            ChunkForward<false> forward(*this, chunk, image_elements, capturing ? plane : taps);
             forward.run(embeddings, output);
             if constexpr (!std::is_same_v<Finalize, std::nullptr_t>) finalize(chunk, MiniConstRows(output));
         }, [&] {
