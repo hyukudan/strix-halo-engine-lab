@@ -40,7 +40,9 @@ A GPU entry may also state the switch points of the low-bit (q4_g64 / q6_g64) re
 that device: `lowbit_rows = { small_rows = 64, wide_panels = 64 }` (the values measured on a Strix Halo, gfx1151 with
 40 CUs, by the no-model fixture `strix-hip-dense-lowbit-bench`). Launches of at most `small_rows` rows then run the
 small-M schedule, and small-M launches of at least `wide_panels` 64-column panels run 17 to 32 rows as one 32-row
-block. Every route computes the same bits, so the key changes speed only. Without it, every launch takes one route.
+block. The two group-scale tiles compute the same bits. Selecting `strix-halo-128` on a matching gfx1151 device
+supplies these points for group-scaled q4_g64 / q6_g64 launches. An explicit `lowbit_rows` in the device entry takes
+precedence. With neither source, the group-scale form uses the 128-row tile for every launch.
 
 A **cluster of identical cards** is one entry without an identity:
 

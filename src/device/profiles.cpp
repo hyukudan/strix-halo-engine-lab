@@ -29,7 +29,8 @@ const std::vector<Profile> kCatalogue = {
     {"strix-halo-128", "AMD Ryzen AI Max+ 395 / Radeon 8060S (128 GB)", "amd", "gfx1151", 125829120000ULL, 256,
      {29.7, 59.4, 59.4, 0, 0, 59.4}, 40, "CU", 0, 0, "integrated", true, "memory_bytes",
      "our nodes; memory_bytes = GPU-visible memory as configured there (depends on the GTT setting); "
-     "HIP reports 20 compute units (WGPs); measured stream read about 243 GB/s; WMMA FP16 = BF16 = IU8 rate"},
+     "HIP reports 20 compute units (WGPs); measured stream read about 243 GB/s; WMMA FP16 = BF16 = IU8 rate",
+     {64, 64}},
     {"dgx-spark-gb10-128", "NVIDIA DGX Spark GB10 (128 GB)", "nvidia", "sm_121", 128 * GiB, 273,
      {0, 125, 125, 250, 500, 250}, 48, "SM", 0, 0, "nvlink-c2c", true, "",
      "unified LPDDR5X shared with the CPU; usable GPU memory is lower than 128 GiB"},
@@ -119,6 +120,9 @@ std::string catalogue_toml() {
            << "host_link = " << quoted(p.host_link) << "\n"
            << "unified = " << (p.unified ? "true" : "false") << "\n"
            << "measured = " << quoted(p.measured) << "\n";
+        if (p.lowbit_rows.small_rows != 0U)
+            os << "lowbit_rows = { small_rows = " << p.lowbit_rows.small_rows
+               << ", wide_panels = " << p.lowbit_rows.wide_panels << " }\n";
         if (!p.note.empty()) os << "note = " << quoted(p.note) << "\n";
     }
     os << "\n# Interconnect classes for `count = N` shapes: nominal one-direction GB/s and round trip (us).\n";

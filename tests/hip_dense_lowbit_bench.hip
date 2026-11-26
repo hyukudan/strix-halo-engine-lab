@@ -159,7 +159,8 @@ hipError_t launch(const Packed& p, const std::uint8_t* w, unsigned n, unsigned k
     group.append({w, n, y});
     const bool q4 = p.format == wd::Format::q4_g64;
     if (route == Route::small) {  // the small schedule with this device's block plan
-        const bool wide = core::lowbit_wide_block(rows, group.first_panel[group.count], core::detail::current_lowbit_row_plan());
+        const bool wide =
+            core::lowbit_wide_block(rows, group.first_panel[group.count], core::detail::current_lowbit_row_plan(true));
         return q4 ? tg::small_m::gemm_lowbit<wei::Q4G64Storage>(x, rows, k, group, nullptr, wide)
                   : tg::small_m::gemm_lowbit<wei::Q6G64Storage>(x, rows, k, group, nullptr, wide);
     }
@@ -603,10 +604,10 @@ int main(int argc, char** argv) {
         hipDeviceProp_t prop{};
         ok(hipGetDevice(&dev), "device");
         ok(hipGetDeviceProperties(&prop, dev), "device properties");
-        const auto unbound = core::detail::current_lowbit_row_plan();
+        const auto unbound = core::detail::current_lowbit_row_plan(true);
         report(unbound.small_rows == 0U && unbound.wide_panels == 0U, "an unbound device runs one route");
         report(strix::device::bind_lowbit_rows(dev, {64U, 64U}), "bind the declared plan");
-        const auto plan = core::detail::current_lowbit_row_plan();
+        const auto plan = core::detail::current_lowbit_row_plan(true);
         const std::string arch(prop.gcnArchName);
         std::cout << "plan arch=" << arch << " multiprocessors=" << prop.multiProcessorCount
                   << " bound small_rows=" << plan.small_rows << " wide_panels=" << plan.wide_panels << '\n';

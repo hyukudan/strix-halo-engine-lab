@@ -16,11 +16,13 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cfenv>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <span>
 #include <string>
@@ -179,9 +181,8 @@ void check_lowbit_plan() {
     namespace co = strix::core;
     {
         // The route plan is data of the device's declaration (strix/device/declaration.hpp `lowbit_rows`), never a
-        // constant of the core header and never a compiled catalogue row: two declarations of the same device (one
-        // arch, one profile, one identity) carry their own switch points, a declaration without the key runs one
-        // route at every row count, and the plan a launch reads is the one bound to its device ordinal.
+        // constant of the core header. Explicit declarations of the same device keep their own switch points.
+        // These cases parse entry data before the gate resolves any selected catalogue profile.
         const auto plan_of = [](const std::string& extra) {
             const auto d = strix::device::parse_declaration(
                 "schema = \"strix-devices-v1\"\n[devices.igpu]\nvendor = \"amd\"\narch = \"gfx1151\"\n"
@@ -218,11 +219,15 @@ void check_lowbit_plan() {
         const dv::LowBitRows declared{measured.small_rows, measured.wide_panels};
         check(co::bound_lowbit_row_plan(3).small_rows == 0U && dv::bind_lowbit_rows(3, declared) &&
                   co::bound_lowbit_row_plan(3).small_rows == 64U && co::bound_lowbit_row_plan(3).wide_panels == 64U &&
+                  co::bound_lowbit_row_plan(3, false).small_rows == 64U &&
                   co::bound_lowbit_row_plan(4).small_rows == 0U && dv::bind_lowbit_rows(3, {}) &&
                   co::bound_lowbit_row_plan(3).small_rows == 0U && !dv::bind_lowbit_rows(-1, declared) &&
                   !dv::bind_lowbit_rows(dv::kLowBitRowSlots, declared) &&
                   co::bound_lowbit_row_plan(dv::kLowBitRowSlots).small_rows == 0U,
               "plan: bound per device ordinal, unbound and out-of-range = one route");
+        check(dv::bind_lowbit_rows(3, {64U, 64U, true}) && co::bound_lowbit_row_plan(3).small_rows == 64U &&
+                  co::bound_lowbit_row_plan(3, false).small_rows == 0U && dv::bind_lowbit_rows(3, {}),
+              "plan: catalogue points can be excluded while explicit points still apply");
     }
     const auto& ids = co::kResidentLowBitTileArithmeticHip;
     check(ids.size() == 2U && ids[0].name != ids[1].name && ids[0].revision && ids[1].revision,
@@ -487,6 +492,93 @@ void check_group_accumulator() {
           "group scale uses a fused add on every lane");
 }
 
+// Host model of the two WMMA schedules. Use exact K16 products and sums so this
+// checks tiling and group-scale order without assuming the device's internal dot reduction order.
+template <class Storage>
+void check_lowbit_schedule_identity() {
+    namespace co = strix::core;
+    using Unit = std::array<float, 16>;
+    using Fragment = std::array<float, 8>;
+    struct DotUnit {
+        Fragment operator()(const Unit& a, const Unit& b, Fragment sum) const {
+            for (std::size_t i = 0; i < a.size(); ++i) sum[0] += a[i] * b[i];
+            return sum;
+        }
+    };
+    constexpr unsigned width = 2U * Storage::elements;
+    constexpr unsigned outputs = 65U;
+    constexpr unsigned max_rows = 128U;
+    const co::LowBitRowPlan plan{64U, 64U};
+    std::array<std::array<std::uint8_t, 2U * Storage::bytes>, outputs> weights{};
+    for (unsigned n = 0; n < outputs; ++n) {
+        for (unsigned block = 0; block < 2U; ++block) {
+            std::array<int, Storage::elements> codes{};
+            for (unsigned k = 0; k < codes.size(); ++k)
+                codes[k] = Storage::qmin + static_cast<int>((11U * k + 5U * n + block) %
+                    static_cast<unsigned>(Storage::qmax - Storage::qmin + 1));
+            const std::uint16_t scales[]{0x2aabU, static_cast<std::uint16_t>(0x3800U + n + block)};
+            wei::lowbit::pack_block<Storage>(codes.data(), scales, weights[n].data() + block * Storage::bytes);
+        }
+    }
+    const auto input = [](unsigned row, unsigned k) {
+        return static_cast<float>(static_cast<int>((17U * row + 3U * k) % 127U) - 63) / 32.0F;
+    };
+    std::vector<float> reference(max_rows * outputs);
+    for (unsigned row = 0; row < max_rows; ++row) {
+        for (unsigned n = 0; n < outputs; ++n) {
+            float acc = 0.0F;
+            for (unsigned g = 0; g < width / Storage::group; ++g) {
+                const auto* block = weights[n].data() + g / Storage::groups * Storage::bytes;
+                float dot = 0.0F;
+                for (unsigned k = 0; k < Storage::group; ++k)
+                    dot += input(row, g * Storage::group + k) * static_cast<float>(
+                        Storage::code(block, g % Storage::groups * Storage::group + k));
+                acc = std::fma(dot, wei::lowbit::f16_bits_to_f32(Storage::scale_bits(block, g % Storage::groups)), acc);
+            }
+            reference[row * outputs + n] = acc;
+        }
+    }
+    const auto launch = [&](unsigned rows, unsigned block_rows, unsigned block_outputs) {
+        std::vector<float> result(rows * outputs, std::numeric_limits<float>::quiet_NaN());
+        for (unsigned r0 = 0; r0 < rows; r0 += block_rows)
+            for (unsigned n0 = 0; n0 < outputs; n0 += block_outputs)
+                for (unsigned row = r0; row < std::min(r0 + block_rows, rows); ++row)
+                    for (unsigned n = n0; n < std::min(n0 + block_outputs, outputs); ++n) {
+                        Fragment acc{};
+                        for (unsigned block = 0; block < 2U; ++block) {
+                            const auto* packed = weights[n].data() + block * Storage::bytes;
+                            for (unsigned g = 0; g < Storage::groups; ++g) {
+                                co::lowbit_f16::GroupAccumulator<Fragment, DotUnit> group{};
+                                for (unsigned unit = 0; unit < Storage::group; unit += 16U) {
+                                    Unit a{}, b{};
+                                    for (unsigned k = 0; k < a.size(); ++k) {
+                                        const unsigned col = g * Storage::group + unit + k;
+                                        const auto x = input(row, block * Storage::elements + col);
+                                        a[k] = wei::lowbit::f16_bits_to_f32(wei::lowbit::f32_to_f16_bits(x));
+                                        b[k] = static_cast<float>(Storage::code(packed, col));
+                                    }
+                                    group.add(a, b);
+                                }
+                                group.apply(wei::lowbit::f16_bits_to_f32(Storage::scale_bits(packed, g)), acc);
+                            }
+                        }
+                        result[row * outputs + n] = acc[0];
+                    }
+        return result;
+    };
+    for (const unsigned rows : {1U, 8U, 64U, 65U, 128U}) {
+        const auto large = launch(rows, co::f16_tile_gemm::kBM, co::f16_tile_gemm::kBN);
+        const auto small = launch(rows, 16U, co::kLowBitPanelColumns);
+        const auto& selected = co::plan_lowbit_rows(rows, plan) == co::LowBitRoute::small_tile ? small : large;
+        const auto same_bits = [](float expected, float actual) {
+            return std::bit_cast<std::uint32_t>(expected) == std::bit_cast<std::uint32_t>(actual);
+        };
+        check(std::ranges::equal(large, small, same_bits) &&
+                  std::ranges::equal(selected, std::span(reference).first(selected.size()), same_bits),
+              "q4/q6 FP16 schedules and the selected route equal the host group-scale reference bitwise");
+    }
+}
+
 // The resolver admits a per-role mix when the consumer supports each compact format.
 void check_lowbit_policies() {
     const wei::WeightLoadScope scope{};
@@ -662,6 +754,8 @@ int main() {
     check_resident_ranges();
     check_bf16_preflight();
     check_group_accumulator();
+    check_lowbit_schedule_identity<wei::Q4G64Storage>();
+    check_lowbit_schedule_identity<wei::Q6G64Storage>();
     check_lowbit_policies();
     check_layout_bytes<wei::Q4G64Storage, wd::Format::q4_g64>(
         "q4_g64", {{{0, 1, 1.0F}, {63, -8, -8.0F}, {64, 7, 14.0F}, {127, -1, -2.0F}}});

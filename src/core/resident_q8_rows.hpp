@@ -27,11 +27,11 @@ void launch_q8_tight_rows(dense_linear::View weights, const float* input, float*
         <<<(weights.outputs + block_outputs - 1U) / block_outputs, 128, 0, stream>>>(
             weights, weights, input, output, rows);
 }
-// The low-bit route plan bound to the current device (strix/device/lowbit_rows.hpp: the device gate binds the points
-// its declaration states). When no plan is bound, the FP16 form uses the large tile at every row count.
-inline LowBitRowPlan current_lowbit_row_plan() {
+// The device gate binds the low-bit route plan (strix/device/lowbit_rows.hpp). When no plan is bound, the FP16 form
+// uses the large tile at every row count.
+inline LowBitRowPlan current_lowbit_row_plan(bool allow_profile) {
     int dev = 0;
-    return hipGetDevice(&dev) == hipSuccess ? bound_lowbit_row_plan(dev) : LowBitRowPlan{};
+    return hipGetDevice(&dev) == hipSuccess ? bound_lowbit_row_plan(dev, allow_profile) : LowBitRowPlan{};
 }
 // Lever "lowbit.rows-select": this launch runs the FP32 sweep (core/resident_row_plan.hpp kLowBitSweepCells).
 inline bool lowbit_rows_sweep(LowBitArithmetic arithmetic, weight::FormatId storage, unsigned outputs, unsigned width,
@@ -47,7 +47,8 @@ template <class Storage, unsigned Capacity>
 row_transforms::Status launch_lowbit_group(const float* input, unsigned rows, unsigned width,
                                            const f16_tile_gemm::Q8ProjectionGroup<Capacity>& group,
                                            row_transforms::Stream stream, LowBitArithmetic arithmetic) {
-    const auto plan = current_lowbit_row_plan();
+    // The folded candidate uses different arithmetic on the large and small tiles of an explicit plan.
+    const auto plan = current_lowbit_row_plan(arithmetic != LowBitArithmetic::f16_folded_scale);
     if (plan_lowbit_rows(rows, plan) == LowBitRoute::small_tile)
         return f16_tile_gemm::small_m::gemm_lowbit<Storage>(
             input, rows, width, group, stream, lowbit_wide_block(rows, group.first_panel[group.count], plan));
@@ -92,7 +93,7 @@ inline row_transforms::Status enqueue_resident_lowbit_rows(
                                                 f16_tile_gemm::small_m::OuterScales<1>{
                                                     {std::ldexp(1.0F, matrix.outer_exponent)}},
                                                 stream, lowbit_wide_block(rows, group.first_panel[group.count],
-                                                                          detail::current_lowbit_row_plan()));
+                                                                          detail::current_lowbit_row_plan(false)));
     arithmetic = admitted_lowbit_arithmetic(arithmetic, matrix);
     return matrix.storage == weight::kQ4G64WeightStorage
                ? detail::launch_lowbit_group<weight::Q4G64Storage>(input, rows, width, group, stream, arithmetic)

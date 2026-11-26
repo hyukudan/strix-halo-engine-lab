@@ -1,5 +1,7 @@
 #pragma once
 
+#include "strix/device/lowbit_rows.hpp"
+
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -34,6 +36,7 @@ struct Profile {
     bool unified = false;           // device memory is the host memory (integrated APU / superchip)
     std::string_view measured;      // comma list of fields measured on our own device; "" = all public spec
     std::string_view note;
+    LowBitRows lowbit_rows{};       // measured q4_g64 / q6_g64 FP16 group-scale schedule
 };
 
 // The whole catalogue, in a fixed order. "custom" is the empty profile: every value comes from the entry.
