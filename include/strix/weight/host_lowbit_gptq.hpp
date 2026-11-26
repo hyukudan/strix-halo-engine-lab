@@ -329,6 +329,7 @@ inline EncodeStatus encode_rows(const float* w, std::size_t n, std::size_t k, st
 template <class S>
 inline EncodeStatus encode_rows_sp(const sp::Header& h, const float* w, std::size_t n, std::size_t k, std::uint8_t* out,
                                    const Options& opt = {}) {
+    if (h.bits != S::bits || *h.invalid() != '\0') throw std::invalid_argument("Strix pack coder requires a matching header");
     StrixPackCodec<S> codec;
     codec.header = &h;
     return encode_rows_with(codec, w, n, k, out, opt);

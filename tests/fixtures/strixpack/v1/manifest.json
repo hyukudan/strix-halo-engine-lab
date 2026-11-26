@@ -1,0 +1,142 @@
+{
+  "schema": "strixpack-fixtures/v1",
+  "checkpoint_sha256": "d5f7deaca3b4eba76a52901311eae38c16119aa0f220714fbb851d126c9d8d54",
+  "pack_identity": "78902f019590ca82d72125e1c81d53af238f3fcaec2125561dfb15351dc50201",
+  "activation_rows": 2,
+  "entries": [
+    {
+      "name": "sp2",
+      "rows": 1,
+      "columns": 128,
+      "header_hex": "01020505e80000000103000000000000",
+      "offset": 4096,
+      "bytes": 36,
+      "payload_sha256": "b8f03a2ade8913bcc467e78cec7481a7b3226a390fbcf087cf43fa67b06edca4",
+      "decoded": "sp2.decoded.f32le",
+      "activations": "sp2.activations.f32le",
+      "project": "sp2.project.f32le"
+    },
+    {
+      "name": "sp3",
+      "rows": 9,
+      "columns": 256,
+      "header_hex": "010305045a000000030a121e00000000",
+      "offset": 8192,
+      "bytes": 936,
+      "payload_sha256": "fe23dae815d7c541d75224e8b81e5e0dc5c1e14294344e268ca52d44a2d579b9",
+      "decoded": "sp3.decoded.f32le",
+      "activations": "sp3.activations.f32le",
+      "project": "sp3.project.f32le"
+    },
+    {
+      "name": "sp4",
+      "rows": 17,
+      "columns": 256,
+      "header_hex": "0104050488000000010305080a0e1218",
+      "offset": 12288,
+      "bytes": 2312,
+      "payload_sha256": "0a22343adb9b2d6f879197624cdb7c349eaab7ffe9b3d9e99ad80264d4fb6794",
+      "decoded": "sp4.decoded.f32le",
+      "activations": "sp4.activations.f32le",
+      "project": "sp4.project.f32le"
+    },
+    {
+      "name": "sp4t",
+      "rows": 17,
+      "columns": 256,
+      "header_hex": "01040500fd000000010305080a0e1218",
+      "offset": 16384,
+      "bytes": 2312,
+      "payload_sha256": "0c3c3260b8463013f116ba0b13ef9eeac6100b09f3c78b51f7a3dc7dc9d1f65c",
+      "decoded": "sp4t.decoded.f32le",
+      "activations": "sp4t.activations.f32le",
+      "project": "sp4t.project.f32le",
+      "head": "sp4t.head.f32le"
+    }
+  ],
+  "encoder": {
+    "geometry": [
+      1,
+      128
+    ],
+    "zero_input": "zero.f32le",
+    "zero_base": 0,
+    "zero_payloads": {
+      "2": "zero.sp2",
+      "3": "zero.sp3",
+      "4": "zero.sp4"
+    },
+    "nonfinite_input": "nonfinite.f32le",
+    "nonfinite_cases": 3,
+    "nonfinite_status": "reject with no output writes"
+  },
+  "geometry": {
+    "invalid": [
+      [
+        0,
+        128
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        1,
+        127
+      ],
+      [
+        1,
+        129
+      ]
+    ],
+    "large_host_test": [
+      2049,
+      2048
+    ],
+    "uint64_bound": "(2^64 - 1) / block_bytes for K=128"
+  },
+  "sources": {
+    "bf16": [
+      256,
+      256
+    ],
+    "mxfp4": [
+      253,
+      32
+    ],
+    "fp8": [
+      129,
+      129
+    ],
+    "fp8_nan": "canonicalize all output NaNs to 0x7fc00000 before hashing"
+  },
+  "sha256": {
+    "bf16.codes.bin": "68e419472d25e0b85e9917ccf692fd58245c5e95e9a46f07d1df81d2e9da246b",
+    "bf16.decoded.f32le": "9207d7eb28680a098c73dbe536d1ff7b94311dc417b9a385e0af6660683e93ca",
+    "fp8.codes.bin": "6eec4e5950f7f132e82f42a4674055cf37bbbad491a42a947d074ab8b1104e76",
+    "fp8.decoded.f32le": "e3552230faba06a16c4f44240b808abea16517f9a4d6e668954113fc64e3ed9f",
+    "fp8.scales.bin": "9f78832addd4606e7ce37be56cf1b9b955f4f5c56558f41036d298702f036b5d",
+    "mxfp4.codes.bin": "b488a2104d9960cf3fc2ef487c54cfd29e45e3acba0417ba3a57c8ad5e36231d",
+    "mxfp4.decoded.f32le": "77cb8a52ddc10016925dc353937b446d12acb935534ff4e5595b7e1dfd562d2b",
+    "mxfp4.scales.bin": "1211b6885890be48f89934ec5246f1ce3cfff46c626cfcd686d5fdce9b1fb830",
+    "nonfinite.f32le": "6fc307b01d310b39eb27fee80f7a86d59a77297ca0642654131884b40257e989",
+    "sp2.activations.f32le": "ad6312a56c833140762733a9cb32a825b45926fe3a86caa2e15e28c968fd333c",
+    "sp2.decoded.f32le": "b41fea702d27df81bbe6800889c9b9a6fb2f3a719db15c306618b688fd7b7d24",
+    "sp2.project.f32le": "0221a2e2e1c87eed71e3ed1c1fc4fcb2f2af7fb27d6e0ef7a2f14f38e90e7592",
+    "sp3.activations.f32le": "5ee4f27a8999391d310d2847311d818711be2f251ed9d88a06c5978b8cee4494",
+    "sp3.decoded.f32le": "acbed06ae79793cf1d06a122e5e73613f0cc78229814f5f44459ab35ccbf35e6",
+    "sp3.project.f32le": "d412fb6401e8979822ea8144609a285a331090a96ffe45d116710d5b4fac8eb5",
+    "sp4.activations.f32le": "5ee4f27a8999391d310d2847311d818711be2f251ed9d88a06c5978b8cee4494",
+    "sp4.decoded.f32le": "c739c966dc2b4fc17230629d3e02f239a5b365a9cf95a0e9a5dbb4ed02b25534",
+    "sp4.project.f32le": "f021900e9074a5a0a96b6c0b2fad258f4557cad653e4be23721abbe710be70d9",
+    "sp4t.activations.f32le": "e80ef2d27d82bcb2ab9c17da1b08b3d2fbe77ac4ab6d86cc9c865bb89ad65c6d",
+    "sp4t.decoded.f32le": "5a05f4306c4784cb1bc6f2bfe9acf82f833d145783b3eeb168003a9463daf49d",
+    "sp4t.head.f32le": "ec8f5d507d14212c068f300b58b70ae525ca90916d31cd2af34ae0eb80596c76",
+    "sp4t.project.f32le": "0ebb3ac7cfe985095d942d873a42b39c27b04468965800c67cc151cc28dee0ba",
+    "vectors.lp": "2c8b11b01e4cbb79593d3016b1029137d2efdfe5bb9369226ab507bc336906b5",
+    "zero.f32le": "33d16b3f8b5ec5d9bfc425a722c657792f48c286b1e3767cbf1aeb4d5d803e46",
+    "zero.sp2": "6db65fd59fd356f6729140571b5bcd6bb3b83492a16e1bf0a3884442fc3c8a0e",
+    "zero.sp3": "7955cb2de90dd9efc6df9fdbf5f5d10c114f4135a9a6b52db1003be749e32f7a",
+    "zero.sp4": "1751ac12e70e15b4f76c16775cd329ae55973b612521dab2de828a5cdb6c8ab3"
+  }
+}

@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <set>
 
@@ -156,15 +157,15 @@ std::string entry_line(const LowbitPackEntry& e, std::uint64_t offset) {
 }
 
 Status validate_entry(const LowbitPackEntry& e, std::set<std::string>& names) {
-    if (e.tensor.empty() || std::ranges::any_of(e.tensor, [](char c) { return c <= ' ' || c == 127; }))
+    if (e.tensor.empty() || std::ranges::any_of(e.tensor, [](unsigned char c) { return c <= ' ' || c == 127; }))
         return fail(Error::malformed, "invalid tensor name in low-bit pack: " + e.tensor);
-    if (!names.insert(e.tensor).second) return fail(Error::malformed, "duplicate tensor " + e.tensor);
     if (!supported(e.storage)) return fail(Error::unknown_format, "unsupported pack format for " + e.tensor);
     if (const auto why = lowbit_header_defect(e.storage, e.sp_header); !why.empty())
         return fail(Error::malformed, e.tensor + ": " + why);
     std::uint64_t want = 0;
     if (const auto status = expected_bytes(e.storage, e.rows, e.columns, want); !status) return status;
     if (want != e.bytes) return fail(Error::malformed, "payload size mismatch for " + e.tensor);
+    if (!names.insert(e.tensor).second) return fail(Error::malformed, "duplicate tensor " + e.tensor);
     return kOk;
 }
 
@@ -280,18 +281,20 @@ Status LowbitPackWriter::write(const std::string& path) const {
             header += entry_line(items_[i].entry, offsets[i]);
         header += "end\n";
     };
-    for (int pass = 0; pass < 8; ++pass) {
+    for (;;) {
         build();
+        if (header.size() > kMaxHeader) return fail(Error::malformed, "low-bit pack header exceeds 64 MiB");
         auto at = align_up(header.size());
         std::vector<std::uint64_t> next(items_.size());
         for (std::size_t i = 0; i < items_.size(); ++i) {
             next[i] = at;
+            if (items_[i].entry.bytes > std::numeric_limits<std::uint64_t>::max() - at - (kAlign - 1U))
+                return fail(Error::memory_budget, "low-bit pack offset overflow");
             at = align_up(at + items_[i].entry.bytes);
         }
         if (next == offsets) break;
         offsets = std::move(next);
     }
-    build();
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) return fail(Error::malformed, "cannot create " + path);
     out.write(header.data(), static_cast<std::streamsize>(header.size()));
@@ -392,7 +395,7 @@ Status LowbitPack::open_impl(const std::string& path, const Digest256& checkpoin
                                              ", the model is " + hex(checkpoint).substr(0, 16));
 
     std::vector<LowbitPackEntry> entries;
-    std::set<std::string, std::less<>> names;
+    std::set<std::string> names;
     for (std::uint64_t i = 0; i < count; ++i) {
         const auto f = split(lines[static_cast<std::size_t>(i) + 2U]);
         std::uint32_t version = 0;
@@ -413,17 +416,18 @@ Status LowbitPack::open_impl(const std::string& path, const Digest256& checkpoin
                 return fail(Error::malformed, e.tensor + ": Strix pack header: " + why);
             e.sp_header = tensor_header;
         }
-        if (const auto why = lowbit_header_defect(e.storage, e.sp_header); !why.empty())
-            return fail(Error::malformed, e.tensor + ": " + why);
-        if (!names.insert(e.tensor).second) return fail(Error::malformed, "duplicate tensor " + e.tensor);
-        std::uint64_t want = 0;
-        if (const auto status = expected_bytes(e.storage, e.rows, e.columns, want); !status)
-            return fail(status.code, e.tensor + ": " + status.detail);
-        if (want != e.bytes) return fail(Error::malformed, "payload size mismatch for " + e.tensor);
+        if (const auto status = validate_entry(e, names); !status) return status;
         if (e.offset % kAlign != 0U || e.offset < padded || e.offset > file_size || e.bytes > file_size - e.offset)
             return fail(Error::malformed, "payload outside file for " + e.tensor);
         entries.push_back(std::move(e));
     }
+    std::vector<ByteRange> ranges;
+    ranges.reserve(entries.size());
+    for (const auto& e : entries) ranges.push_back({e.offset, e.bytes});
+    std::ranges::sort(ranges, {}, &ByteRange::offset);
+    for (std::size_t i = 1; i < ranges.size(); ++i)
+        if (ranges[i - 1U].offset + ranges[i - 1U].bytes > ranges[i].offset)
+            return fail(Error::malformed, "overlapping low-bit pack payloads");
 
     Digest256 identity;
     if (const auto status = pack_identity(*file, header.size(), entries, identity); !status) return status;

@@ -157,26 +157,41 @@ Status PackMatrixSource::digest(Digest256& out) const {
 }
 
 Status PackMatrixSource::decode(std::vector<float>& out, Digest256* digest_out) const {
+    constexpr auto limit = std::numeric_limits<std::size_t>::max() / sizeof(float);
+    if (!rows || !columns || columns > limit || rows > limit / columns)
+        return {Error::unsupported_shape, "invalid pack source matrix geometry"};
+    const auto count = rows * columns;
+    using Block = BlockScaledE4M3<128, 128, float>;
+    if ((encoding == Encoding::bf16 && (codes.range.bytes != 2U * count || scales.range.bytes)) ||
+        (encoding == Encoding::mxfp4 && (columns % 32U || codes.range.bytes != count / 2U ||
+                                         scales.range.bytes != count / 32U)) ||
+        (encoding == Encoding::fp8_block && (codes.range.bytes != count ||
+                 scales.range.bytes != 4U * Block::scale_rows(rows) * Block::scale_columns(columns))))
+        return {Error::malformed, "pack source payload disagrees with matrix geometry"};
     std::vector<std::uint8_t> raw(static_cast<std::size_t>(codes.range.bytes));
     std::vector<std::uint8_t> scale(static_cast<std::size_t>(scales.range.bytes));
     if (const auto s = read_slice(codes, std::as_writable_bytes(std::span(raw))); !s) return s;
     if (!scale.empty())
         if (const auto s = read_slice(scales, std::as_writable_bytes(std::span(scale))); !s) return s;
-    std::vector<float> matrix(rows * columns);
+    std::vector<float> matrix(count);
     if (encoding == Encoding::bf16) {
         for (std::size_t i = 0; i < matrix.size(); ++i)
             matrix[i] = scalar_float::u2f((std::uint32_t{raw[2U * i]} << 16U) |
                                          (std::uint32_t{raw[2U * i + 1U]} << 24U));
     } else if (encoding == Encoding::mxfp4) {
-        for (std::size_t row = 0; row < rows; ++row)
-            microscaled::decode_mxfp4_row(std::span(raw).subspan(row * (columns / 2U), columns / 2U),
-                                         std::span(scale).subspan(row * (columns / 32U), columns / 32U),
-                                         std::span(matrix).subspan(row * columns, columns));
+        try {
+            for (std::size_t row = 0; row < rows; ++row)
+                microscaled::decode_mxfp4_row(std::span(raw).subspan(row * (columns / 2U), columns / 2U),
+                                             std::span(scale).subspan(row * (columns / 32U), columns / 32U),
+                                             std::span(matrix).subspan(row * columns, columns));
+        } catch (const std::invalid_argument& e) {
+            return {Error::malformed, e.what()};
+        }
     } else {
         std::vector<float> scales_f32(scale.size() / 4U);
         for (std::size_t i = 0; i < scales_f32.size(); ++i)
             scales_f32[i] = decode_f32_le(reinterpret_cast<const Byte*>(scale.data()) + i * 4U);
-        const BlockScaledE4M3<128, 128, float> fp8(raw, scales_f32, rows, columns);
+        const Block fp8(raw, scales_f32, rows, columns);
         for (std::size_t row = 0; row < rows; ++row)
             fp8.decode_row(row, std::span(matrix).subspan(row * columns, columns));
     }
