@@ -281,6 +281,22 @@ class Statistics(unittest.TestCase):
         self.assertEqual(result["reference_suspect_classes"], ["prose"])
         self.assertIn("reference suspect class prose", v2.pooled_line(result))
 
+    def test_null_arm_order_does_not_change_acceptance(self):
+        ref = np.ones(800)
+        varied = ref + np.tile([-0.2, 0.2], 400)
+        cand = ref + np.tile([-0.4, 0.46], 400)
+        outcomes = []
+        for arms in ([ref, varied], [varied, ref]):
+            w = v2.window_stats("multi", np.full(800, 0.005), np.ones(800, bool), ref, cand, [0.001, 0.001],
+                                null_nlls=arms)
+            outcomes.append((w["state"], w["dnll_se"]))
+        self.assertEqual(outcomes[0], outcomes[1])
+
+    def test_exact_null_floor_boundary_is_engaged(self):
+        ref = np.ones(800)
+        w = v2.window_stats("boundary", np.full(800, 0.018), np.ones(800, bool), ref, ref, [0.02])
+        self.assertTrue(v2.verdict([w])["null_floor"]["kl"]["engaged"])
+
     def test_se_capped_by_the_null(self):
         # row se 0.0198 but the null's se on the same window is 0.005: the dNLL limit uses 1.5 x 0.005
         w = window("cap", 63, 0.005, 0.97, 0.030, 0.004, self.rng, scale=0.157, null_dnll=0.0, null_scale=0.0397)

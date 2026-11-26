@@ -82,6 +82,15 @@ def mean_se(x):
     return float(x.mean()), se
 
 
+def null_row_mean(name, metric, values, shape):
+    rows = np.asarray(values, np.float64)
+    if rows.shape == shape:
+        rows = rows[np.newaxis, :]
+    if rows.ndim != 2 or not rows.shape[0] or rows.shape[1:] != shape or not np.isfinite(rows).all():
+        raise GateError(f"{name}: invalid or unpaired null {metric} rows")
+    return np.sort(rows, axis=0).mean(axis=0)
+
+
 def _judge(kl, agree, d, null_kl, null_dis, null_d, limits):
     """R2 + R4 on one window or one pooled content class: KL two-state, top-1 and dNLL three-state, reference check.
 
@@ -120,13 +129,13 @@ def _judge(kl, agree, d, null_kl, null_dis, null_d, limits):
 
 
 def window_stats(name, kl, agree, nll_ref, nll_cand, null_kls, hit_ref=None, hit_cand=None, limits=LIMITS, null_top1s=None,
-                 null_nlls=None, cls=None, null_kl_rows=None):
+                 null_nlls=None, cls=None, null_kl_rows=None, null_top1_rows=None):
     """One window: R2 KL limit relative to this window's null; top-1 and dNLL PASS / UNRESOLVED / FAIL on its rows; R4.
 
     null_top1s: the null arms' top-1 agreement on this window (None: the null-relative top-1 term is absent).
-    null_nlls: the null arms' per-row NLL on the same labels (the first is used: se cap and the paired reference check).
+    null_nlls: the null arms' per-row NLL on the same labels (mean per row for the se cap and paired reference check).
     cls: the window's content class, declared before scoring (None: one class for the whole gate set).
-    null_kl_rows: the first null arm's per-row KL on this window (None: the pooled null-floor KL has no se term)."""
+    null_kl_rows and null_top1_rows: per-row KL and agreement of the null arms, for the pooled null-floor se."""
     kl, agree = np.asarray(kl, np.float64), np.asarray(agree, bool)
     nll_ref = np.asarray(nll_ref, np.float64)
     nll_cand = np.asarray(nll_cand, np.float64)
@@ -137,20 +146,18 @@ def window_stats(name, kl, agree, nll_ref, nll_cand, null_kls, hit_ref=None, hit
     d = nll_cand - nll_ref
     if not null_kls:
         raise GateError(f"{name}: no null arm (v2 needs the one-ulp / order-only null of every window)")
-    null_kl = float(np.mean(null_kls))
+    null_kl = float(np.mean(sorted(null_kls)))
     if null_top1s and not all(0.0 <= x <= 1.0 for x in null_top1s):
         raise GateError(f"{name}: null top-1 agreement is outside [0, 1]")
-    null_dis = 1.0 - float(np.mean(null_top1s)) if null_top1s else 0.0
+    null_dis = 1.0 - float(np.mean(sorted(null_top1s))) if null_top1s else 0.0
     null_d = None
     if null_nlls:
-        null_nll = np.asarray(null_nlls[0], np.float64)
-        if null_nll.shape != nll_ref.shape or not np.isfinite(null_nll).all():
-            raise GateError(f"{name}: invalid or unpaired null NLL rows")
+        null_nll = null_row_mean(name, "NLL", null_nlls, nll_ref.shape)
         null_d = null_nll - nll_ref
     if null_kl_rows is not None:
-        null_kl_rows = np.asarray(null_kl_rows, np.float64)
-        if null_kl_rows.shape != kl.shape or not np.isfinite(null_kl_rows).all():
-            raise GateError(f"{name}: invalid or unpaired null KL rows")
+        null_kl_rows = null_row_mean(name, "KL", null_kl_rows, kl.shape)
+    if null_top1_rows is not None:
+        null_top1_rows = null_row_mean(name, "top-1", null_top1_rows, agree.shape)
     w = {"name": name, "class": cls or "all", "rows": int(kl.size), "dnll_rows": int(d.size),
          "ref_nll": float(nll_ref.mean())}
     w.update(_judge(kl, agree, d, null_kl, null_dis, null_d, limits))
@@ -166,8 +173,8 @@ def window_stats(name, kl, agree, nll_ref, nll_cand, null_kls, hit_ref=None, hit
         w["_rows"]["null_dnll"] = null_d
     if null_kl_rows is not None:
         w["_rows"]["null_kl"] = null_kl_rows
-    if null_nlls:   # every null's mean dNLL (the pooled null floor uses their mean, like the null KL)
-        w["null_dnll_mean"] = float(np.mean([np.mean(np.asarray(x, np.float64) - nll_ref) for x in null_nlls]))
+    if null_top1_rows is not None:
+        w["_rows"]["null_top1"] = null_top1_rows
     return w
 
 
@@ -313,8 +320,8 @@ def null_floor(windows, pooled, limits=LIMITS):
     A bar is engaged when the pooled null fails it or lies within floor_z of its own row se of failing it (the null is
     not measurably inside the bar). An engaged bar only relaxes: KL <= max(0.02, null + 0.02), top-1 >= min(0.93,
     null - 0.01), dNLL <= max(0.01, null + 0.01). Without the null's evidence for a bar (no per-window null top-1 / null
-    NLL rows) that bar stays absolute. The pooled null is the mean of the null arms; its se comes from the first null's
-    rows (KL without per-row null KL: se 0)."""
+    NLL rows) that bar stays absolute. The pooled null and its se use the paired per-row averages of all null arms
+    (KL without per-row evidence: se 0, agreement without per-row evidence: binomial se)."""
     rows = np.array([w["rows"] for w in windows], np.float64)
     z = limits["floor_z"]
     out = {"z": z}
@@ -324,18 +331,18 @@ def null_floor(windows, pooled, limits=LIMITS):
     nt = nt_se = None
     if all("null_top1" in w for w in windows):
         nt = float(np.dot(rows, [w["null_top1"] for w in windows]) / rows.sum())
-        nt_se = math.sqrt(nt * (1.0 - nt) / rows.sum())
+        tr = [w["_rows"].get("null_top1") for w in windows]
+        nt_se = (mean_se(np.concatenate(tr))[1] if all(x is not None for x in tr)
+                 else math.sqrt(nt * (1.0 - nt) / rows.sum()))
     nd = nd_se = None
     if all("null_dnll" in w["_rows"] for w in windows):
-        nd_se = mean_se(np.concatenate([w["_rows"]["null_dnll"] for w in windows]))[1]
-        drows = np.array([w["dnll_rows"] for w in windows], np.float64)
-        nd = float(np.dot(drows, [w["null_dnll_mean"] for w in windows]) / drows.sum())
+        nd, nd_se = mean_se(np.concatenate([w["_rows"]["null_dnll"] for w in windows]))
     for b, value, absl, null, se, margin, sign in (
             ("kl", pooled["kl"], limits["max_kl"], nk, nk_se, limits["floor_kl_margin"], 1.0),
             ("top1", pooled["top1"], limits["min_top1"], nt, nt_se, limits["floor_top1_margin"], -1.0),
             ("dnll", pooled["dnll"], limits["max_dnll"], nd, nd_se, limits["floor_dnll_margin"], 1.0)):
         # sign +1: lower is better (value <= limit); -1: higher is better (value >= limit)
-        engaged = null is not None and sign * (null + sign * z * (se or 0.0) - absl) > 0.0
+        engaged = null is not None and sign * (null - absl) + z * (se or 0.0) >= 0.0
         limit = absl
         if engaged:
             limit = max(absl, null + margin) if sign > 0 else min(absl, null - margin)
@@ -374,12 +381,12 @@ def class_verdicts(windows, limits=LIMITS):
     out = []
     for name, ws in groups.items():
         cat = lambda k: np.concatenate([w["_rows"][k] for w in ws])  # noqa: E731
-        rows = np.array([w["dnll_rows"] for w in ws], np.float64)
+        rows = np.array([w["rows"] for w in ws], np.float64)
         null_kl = float(np.dot(rows, [w["null_kl"] for w in ws]) / rows.sum())
         null_dis = (float(np.dot(rows, [1.0 - w["null_top1"] for w in ws]) / rows.sum())
                     if all("null_top1" in w for w in ws) else 0.0)
         null_d = cat("null_dnll") if all("null_dnll" in w["_rows"] for w in ws) else None
-        c = {"name": name, "windows": [w["name"] for w in ws], "rows": int(rows.sum())}
+        c = {"name": name, "windows": [w["name"] for w in ws], "rows": sum(w["dnll_rows"] for w in ws)}
         c.update(_judge(cat("kl"), cat("agree"), cat("dnll"), null_kl, null_dis, null_d, limits))
         c["final"] = c["rows"] >= limits["min_rows"]
         out.append(c)
@@ -584,7 +591,8 @@ def qual(a):
         w = window_stats(case, ra["kl_rc"], ra["agree"].astype(bool), ra["nll_r"], ra["nll_c"],
                          [float(x["kl_rc"].mean()) for x in nulls], ra["top1_r_is_label"], ra["top1_c_is_label"],
                          null_top1s=[float(x["agree"].mean()) for x in nulls], null_nlls=[x["nll_c"] for x in nulls],
-                         cls=window_class(case, classes, manifest), null_kl_rows=nulls[0]["kl_rc"], limits=limits)
+                         cls=window_class(case, classes, manifest), null_kl_rows=[x["kl_rc"] for x in nulls],
+                         null_top1_rows=[x["agree"] for x in nulls], limits=limits)
         ref_route = route(a.ref)
         moe = ref_route.exists()
         f = None
