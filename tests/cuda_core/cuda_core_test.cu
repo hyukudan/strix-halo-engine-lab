@@ -1291,7 +1291,9 @@ int main(int argc, char** argv) {
         return (g_fail || r) ? 1 : 0;
     }
     int rc = test_dense() | test_norms_rope() | test_norm_batched_loads() | test_attention() | test_attention_schedule() | test_attention_schedule(16, 2) | test_attention_schedule(8, 2) |
-             test_attention_row_share() | test_attention_decode8() | test_gdn() | test_conv_row_batch() | test_nvfp4_fused();
+             test_attention_row_share() | test_attention_decode8() | test_gdn() | test_conv_row_batch();
+    if (cc::nvfp4_supported()) rc |= test_nvfp4_fused();
+    else std::puts("NVFP4 fused projection skipped: no matching native CUDA image");
     // repeat determinism is covered by the identical-bits checks (each compares two separate launches)
     std::printf(g_fail || rc ? "cuda_core_test: FAILED (%d checks)\n" : "cuda_core_test: PASS\n", g_fail);
     return (g_fail || rc) ? 1 : 0;

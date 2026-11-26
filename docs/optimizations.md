@@ -6706,3 +6706,16 @@ In a drafting run the speculator's one-row steps run on the CUDA step program ov
 | Inkling 2 Mini | bound: CUDA CLI (this row) |
 | Hy4 Flash | not bound: no CUDA step program with drafter taps next to a verifying route |
 | Nemotron 3.5 Bolt E4B | not bound: no CUDA step program with drafter taps next to a verifying route |
+
+<a id="cuda-native-nvfp4-images"></a>
+### CUDA native NVFP4 images
+
+Shared CUDA core and Qwen builds select CUDA images through
+`CMAKE_CUDA_ARCHITECTURES` and `STRIX_CUDA_NVFP4_ARCHITECTURES`. The latter
+defaults to `120a`. Set it empty to build without native FP4 instructions.
+For example, configure with `-DCMAKE_CUDA_ARCHITECTURES=89-real` and
+`-DSTRIX_CUDA_NVFP4_ARCHITECTURES=` for a portable Ada build. The
+`121a` native image is an explicit build choice. The launch contract checks
+for an image matching the current compute capability before an NVFP4 kernel
+can run. Compilation of an image supplies no device quality or timing receipt.
+The shared build rules live in `cmake/StrixCudaArchs.cmake`.

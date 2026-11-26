@@ -1,6 +1,7 @@
 #include "grouped_w4a4.hpp"
 
 #include "arch/sm120/grouped_w4a4.cuh"
+#include "../arch/native_nvfp4.hpp"
 
 namespace strix::cuda::core::grouped_w4a4 {
 namespace {
@@ -12,6 +13,7 @@ cudaError_t quantize_rows(const contract::QuantizeArgs<T>& args, cudaStream_t st
         reinterpret_cast<std::uintptr_t>(args.source) % 16U != 0U || (args.source_row * sizeof(T)) % 16U != 0U ||
         !contract::fits_quantize(args.output, args.width, args.terms))
         return cudaErrorInvalidValue;
+    if (const auto e = arch::native_nvfp4_status(); e != cudaSuccess) return e;
     if (args.terms == 2U) {
         if (rule == contract::ScaleRule::mse)
             sm120::quantize_rows<T, true, 2U><<<(args.rows + 7U) / 8U, 256, 0, stream>>>(args);
@@ -46,6 +48,7 @@ cudaError_t quantize(const contract::QuantizeArgs<std::uint16_t>& args, cudaStre
 
 cudaError_t launch(const contract::Args& args, cudaStream_t stream) {
     if (!contract::fits(args)) return cudaErrorInvalidValue;
+    if (const auto e = arch::native_nvfp4_status(); e != cudaSuccess) return e;
     const unsigned bound = args.tiles.max_tile_rows == 0U ? contract::kMaxTileRows : args.tiles.max_tile_rows;
     const dim3 grid(args.tiles.outputs / contract::kTileOutputs, (bound + contract::kTileRows - 1U) / contract::kTileRows,
                     args.tiles.count);

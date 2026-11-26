@@ -1,3 +1,5 @@
+include("${CMAKE_CURRENT_LIST_DIR}/StrixCudaArchs.cmake")
+strix_cuda_arch_defaults()
 enable_language(CUDA)
 find_package(Threads REQUIRED)
 set(CMAKE_CXX_STANDARD 20)
@@ -16,8 +18,8 @@ include(${CMAKE_CURRENT_LIST_DIR}/StrixCudaBackend.cmake)
 add_library(strix_nvfp4 STATIC src/cuda/core/nvfp4.cu)
 target_include_directories(strix_nvfp4 PUBLIC include)
 target_link_libraries(strix_nvfp4 PUBLIC strix-weight)
-set_target_properties(strix_nvfp4 PROPERTIES
-    CUDA_ARCHITECTURES 120a CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+set_target_properties(strix_nvfp4 PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+strix_cuda_nvfp4_images(strix_nvfp4 FALSE)
 target_compile_options(strix_nvfp4 PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 if(MSVC)

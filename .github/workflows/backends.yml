@@ -63,18 +63,34 @@ jobs:
       matrix:
         include:
           - mode: CORE
-            arch: '120'
+            arch: '120a-real'
+            native_fp4: '120a'
             targets: strix_cuda_core_kernels strix-cuda-qwen35-decode strix-cuda-qwen35-cohort
+          - mode: CORE
+            arch: '89-real;121-real'
+            native_fp4: ''
+            targets: cuda_core_test cuda_core_portable_nvfp4_refusal
+          - mode: CORE
+            arch: '121-real'
+            native_fp4: '121a'
+            targets: strix_cuda_core_fp4
           - mode: QWEN
             arch: '120'
+            native_fp4: '120a'
             targets: strix-cuda-qwen-serve strix-cuda-qwen-prefill-service strix-cuda-qwen-logits
+          - mode: QWEN
+            arch: '89-real'
+            native_fp4: ''
+            targets: strix-cuda-qwen-prefill-service
           - mode: DS41
             arch: '89'
+            native_fp4: ''
             targets: strix-cuda-ds41-decode strix-cuda-ds41-prefill-service
           # CORE_ONLY returns before the checkpoint, executor and serving targets exist.
           # Compile the resident include order and the K8 regression fixture in the full tree.
           - mode: INKLING
             arch: '120'
+            native_fp4: '120a'
             targets: strix-inkling2-mini-cuda strix-serve strix-k8c-mix-cuda-fixture strix-k10c-resident-embedding-fixture strix-mixlat-cuda-fixture strix-moer-cuda-fixture strix-transition-cuda-fixture strix-cuda-decode-transition-tests
     steps:
       - name: Install build tools
@@ -82,11 +98,12 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake g++ git ninja-build python3
       - uses: actions/checkout@v4
-      - name: Compile CUDA targets for sm_${{ matrix.arch }}
+      - name: Compile CUDA targets for ${{ matrix.arch }}
         env:
           CUDA_MODE: ${{ matrix.mode }}
           CUDA_ARCH: ${{ matrix.arch }}
           CUDA_TARGETS: ${{ matrix.targets }}
+          CUDA_NATIVE_FP4: ${{ matrix.native_fp4 }}
         run: |
           options=("-DSTRIX_CUDA_${CUDA_MODE}_ONLY=ON")
           if [ "$CUDA_MODE" = INKLING ]; then
@@ -95,8 +112,15 @@ jobs:
               -DBUILD_TESTING=ON -DSTRIX_K8C_CUDA_FIXTURE=ON -DSTRIX_K10C_RESIDENT_FIXTURE=ON
                 -DSTRIX_MIXLAT_CUDA_FIXTURE=ON -DSTRIX_MOER_CUDA_FIXTURE=ON -DSTRIX_TRANSITION_CUDA_FIXTURE=ON)
           fi
+          if [ "$CUDA_MODE" != DS41 ]; then
+            options+=("-DSTRIX_CUDA_NVFP4_ARCHITECTURES=$CUDA_NATIVE_FP4")
+          fi
           cmake -S . -B build/backend-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" "${options[@]}"
           read -r -a targets <<< "$CUDA_TARGETS"
           cmake --build build/backend-cuda --parallel 2 --target "${targets[@]}"
+          if [ "$CUDA_MODE" = CORE ] && [ -z "$CUDA_NATIVE_FP4" ]; then
+            ctest --test-dir build/backend-cuda --no-tests=error --output-on-failure \
+              -R '^cuda_core_portable_nvfp4_refusal$'
+          fi
 
