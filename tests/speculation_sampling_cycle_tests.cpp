@@ -58,6 +58,19 @@ int main() {
             layout_request);
 
     {
+        const std::vector<std::uint32_t> candidates;
+        auto request = base_request(candidates);
+        request.base_position = 1;
+        request.committed_tokens = 1;
+        const auto preparation = strix::prepare_sampled_speculation_cycle(model, layout, request);
+        const std::vector<std::vector<double>> target{{0x1.e36df62d0e73fp-2, 0x1.0e4904e978c60p-1, 0x1p-53, 0x1p-53}};
+        const strix::SampledSpeculationFinalizeRequest finalize{target, {}, {1234, 0x1111ULL, 0x2222ULL}, 1, {},
+            strix::SpeculationProbabilityIdentity::binary64_v1};
+        const auto plan = strix::finalize_sampled_speculation_cycle(model, layout, preparation, finalize);
+        expect(plan.emitted_tokens == std::vector<std::uint32_t>{1}, "cycle uses binary64 for the target bonus");
+    }
+
+    {
         const std::vector<std::uint32_t> candidates{0, 1};
         auto request =
             base_request(candidates);

@@ -1,6 +1,9 @@
 #include "strix/speculation_sampling.hpp"
 
 #include <algorithm>
+#include <array>
+#include <bit>
+#include <cfenv>
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -20,6 +23,47 @@ void expect(bool condition, const char* message) {
 
 strix::SpeculationRngIdentity rng() {
     return {1234, 0x1111ULL, 0x2222ULL};
+}
+
+void check_binary64_golden() {
+    constexpr auto identity = strix::SpeculationProbabilityIdentity::binary64_v1;
+    const auto bits = [](double value) { return std::bit_cast<std::uint64_t>(value); };
+    // At position 1 the draw is 0x1.e36df62d0e73ep-2. Dropping the two
+    // half-ulp addends at mass 1 would leave token 0 above that boundary.
+    constexpr std::array<double, 4> cdf_row{0x1.e36df62d0e73fp-2, 0x1.0e4904e978c60p-1, 0x1p-53, 0x1p-53};
+    expect(strix::sample_speculation_target_token(cdf_row, rng(), 1, 0, identity) == 1,
+           "binary64 bonus crosses the compensated mass boundary");
+
+    constexpr std::array<double, 2> halfway{1.0, 0x1p-53};
+    constexpr std::array<double, 2> point{1.0, 0.0};
+    const auto accepted = strix::verify_speculative_sample({halfway, point, 0, rng(), 0, 0, 0, identity});
+    // An extended-precision denominator would produce the next double below 1.
+    expect(accepted.token == 0 && accepted.accepted && !accepted.used_residual &&
+               bits(accepted.acceptance_probability) == 0x3ff0000000000000ULL &&
+               bits(accepted.acceptance_uniform) == 0x3fc19df882fbb40cULL,
+           "binary64 acceptance uses the rounded halfway denominator and the declared draw");
+
+    constexpr std::array<double, 5> row{0.25, 0.5, 0.25, 0x1p-53, 0x1p-53};
+    constexpr std::array<double, 5> draft{1.0, 0.0, 0.0, 0.0, 0.0};
+    const auto rejected = strix::verify_speculative_sample({row, draft, 0, rng(), 7, 0, 0, identity});
+    expect(rejected.token == 1 && !rejected.accepted && rejected.used_residual &&
+               bits(rejected.acceptance_probability) == 0x3fcffffffffffffeULL &&
+               bits(rejected.acceptance_uniform) == 0x3fd30c990185bf5aULL &&
+               bits(rejected.residual_mass) == 0x3fe8000000000000ULL &&
+               bits(rejected.residual_uniform) == 0x3fc92a1f9d7d7440ULL,
+           "binary64 rejection keeps the residual decision and all floating fields bitwise");
+
+    const int original = std::fegetround();
+    if (std::fesetround(FE_DOWNWARD) == 0) {
+        bool refused = false;
+        try {
+            static_cast<void>(strix::sample_speculation_target_token(cdf_row, rng(), 1, 0, identity));
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        static_cast<void>(std::fesetround(original));
+        expect(refused, "binary64 speculation refuses a non-nearest rounding environment");
+    }
 }
 
 strix::SpeculativeSamplingStepResult legacy_verify(const strix::SpeculativeSamplingStepRequest& request) {
@@ -112,6 +156,7 @@ void check_legacy_parity() {
 }  // namespace
 
 int main() {
+    check_binary64_golden();
     check_legacy_parity();
     {
         const std::vector<double> target{

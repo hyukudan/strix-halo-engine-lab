@@ -7,22 +7,32 @@
 namespace strix {
 namespace {
 
-double charge_coverage(double target, double draft, long double remaining, long double& covered) {
-    covered = std::min(static_cast<long double>(target), covered + remaining * draft);
+template <typename Float>
+double charge_coverage(double target, double draft, Float remaining, Float& covered) {
+    covered = std::min(static_cast<Float>(target), covered + remaining * draft);
     return static_cast<double>(target - covered);
+}
+
+template <typename Float>
+double sum_rejected_target_mass(const TokenDistribution& target, const TokenDistribution& draft) {
+    const auto ids = target.tokens();
+    const auto probabilities = target.probabilities();
+    Float mass = 0;
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        Float covered = 0;
+        mass += charge_coverage(probabilities[i], draft.probability(ids[i]), Float{1}, covered);
+    }
+    return static_cast<double>(mass);
 }
 
 }  // namespace
 
 double detail::rejected_target_mass(const TokenDistribution& target, const TokenDistribution& draft) {
-    const auto ids = target.tokens();
-    const auto probabilities = target.probabilities();
-    long double mass = 0.0L;
-    for (std::size_t i = 0; i < ids.size(); ++i) {
-        long double covered = 0.0L;
-        mass += charge_coverage(probabilities[i], draft.probability(ids[i]), 1.0L, covered);
-    }
-    return static_cast<double>(mass);
+    return sum_rejected_target_mass<long double>(target, draft);
+}
+
+double detail::binary64_rejected_target_mass(const TokenDistribution& target, const TokenDistribution& draft) {
+    return sum_rejected_target_mass<double>(target, draft);
 }
 
 MultiDraftDecision verify_multi_draft_row(

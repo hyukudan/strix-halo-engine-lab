@@ -6687,3 +6687,35 @@ In a drafting run the speculator's one-row steps run on the CUDA step program ov
 | Inkling 2 Mini | bound: CUDA CLI (this row) |
 | Hy4 Flash | not bound: no CUDA step program with drafter taps next to a verifying route |
 | Nemotron 3.5 Bolt E4B | not bound: no CUDA step program with drafter taps next to a verifying route |
+
+<a id="speculation-probability-binary64-v1"></a>
+
+### Sampled speculation probability identity binary64-v1
+
+The shared sampled-cycle API accepts `SpeculationProbabilityIdentity::binary64_v1`
+for supplied probability rows. It uses a binary64 compensated total in token ID
+order, nearest-even division, the existing binary64 token decision and residual
+sums in token order. Admission requires IEEE binary64 evaluation, nearest-even
+rounding and gradual subnormals. The counter-key inputs and draws are the caller's.
+The identity is opt-in. Calls with `SpeculationProbabilityIdentity::legacy` keep the
+platform's long-double normalization and receipt arithmetic. The binary64 golden
+covers a target bonus on a cumulative boundary, a halfway normalization and a
+rejected proposal that consumes a residual draw. No latency measurement is available.
+
+<a id="device-sampling-boundaries"></a>
+
+### Device sampling-v1 boundaries
+
+The device bit key ranks positive zero above negative zero. For an exact signed-zero
+tie, the host transform picks the smaller token ID. With more than 2,048 kept
+entries, the device's unfiltered inverse CDF compares a scaled draw against raw
+weights in a fixed parallel order. The device's large top-p uses fixed-point
+mass quantiles. The host sums normalized entries sequentially. These forms can
+select adjacent tokens even when the exponential weights are exact. The shared
+device test executable accepts `--boundary-audit-only` for signed zeros and
+draws around 0.5 in both large-row forms.
+
+Select `STRIX_SAMPLE_PATH=host` on the shared sampling-v1 route to use the host
+transform for target and draft. The device draft vocabulary API accepts append-only
+entry IDs. A different vocabulary with the same number of entries requires a new
+sampler.

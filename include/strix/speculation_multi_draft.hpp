@@ -13,6 +13,7 @@ namespace strix {
 namespace detail {
 
 [[nodiscard]] double rejected_target_mass(const TokenDistribution& target, const TokenDistribution& draft);
+[[nodiscard]] double binary64_rejected_target_mass(const TokenDistribution& target, const TokenDistribution& draft);
 
 }  // namespace detail
 

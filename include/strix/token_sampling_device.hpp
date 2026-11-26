@@ -11,12 +11,11 @@ namespace strix {
 // Device form of sampling-v1 (src/token_sampling.cpp): the transform, the inverse-CDF sample and the speculative
 // decision of every row run on the GPU over the row's FP32 logits; only the decisions come back. The uniforms
 // are the host sampler's (same counter-based draws), so the random numbers are identical.
-// Rows whose cutoff and top-k keep at most `device_top_p_candidates` entries (and every row with a top-k of at most
-// device_top_p_candidates / 32, selected in one pass) are decided by one workgroup in the host's order and
-// arithmetic (sequential sums in token id or top-p order). Larger rows sum in a fixed parallel order; their top-p
-// prefix and inverse CDF are mass quantiles in (weight desc, id asc) order with exact fixed-point sums. In all
-// cases the device `exp` may differ from the host's by an ulp, so a decision can differ from the host path only
-// when its uniform falls within a few double ulps of a cumulative boundary.
+// In the device rank key +0 sorts above -0. The host treats both zeros as a numeric tie ordered by ID.
+// Rows with at most `device_top_p_candidates` entries after cutoff and top-k use one workgroup and sequential sums.
+// Large rows without top-p use fixed parallel sums and compare a scaled draw to unnormalized weights. Large
+// top-p uses mass quantiles in rank-key order with fixed-point sums. Differences at CDF boundaries are possible
+// even for exact weights. Use the explicit host path when the host transform and CDF are required.
 inline constexpr std::uint32_t device_top_p_candidates = 2048;
 
 // Which path decides sampled rows. STRIX_SAMPLE_PATH=device|host|auto (default auto); STRIX_SAMPLE_HOST=1 is

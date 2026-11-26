@@ -7,6 +7,13 @@
 
 namespace strix {
 
+// The legacy identity uses the platform's long-double format. The explicitly
+// selected binary64 identity defines the arithmetic for supplied probability rows.
+enum class SpeculationProbabilityIdentity : std::uint8_t {
+    legacy,
+    binary64_v1,
+};
+
 struct SpeculativeSamplingStepRequest {
     std::span<const double> target_probabilities;
     std::span<const double> draft_probabilities;
@@ -15,6 +22,7 @@ struct SpeculativeSamplingStepRequest {
     std::uint64_t absolute_position = 0;
     std::uint32_t acceptance_draw_index = 0;
     std::uint32_t residual_draw_index = 0;
+    SpeculationProbabilityIdentity probability_identity = SpeculationProbabilityIdentity::legacy;
 };
 
 struct SpeculativeSamplingStepResult {
@@ -31,7 +39,8 @@ struct SpeculativeSamplingStepResult {
     std::span<const double> target_probabilities,
     const SpeculationRngIdentity& rng,
     std::uint64_t absolute_position,
-    std::uint32_t draw_index = 0);
+    std::uint32_t draw_index = 0,
+    SpeculationProbabilityIdentity probability_identity = SpeculationProbabilityIdentity::legacy);
 
 [[nodiscard]] SpeculativeSamplingStepResult
 verify_speculative_sample(

@@ -4,6 +4,7 @@
 #include "strix/token_sampling_device.hpp"
 
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
@@ -37,6 +38,23 @@ void test_same_transform() {
     auto m = policy(0.7F, 1.0F, 1); m.min_p = 0.05F;
     expect(!strix::same_token_transform(policy(0.7F, 1.0F, 1), k) && !strix::same_token_transform(policy(0.7F, 1.0F, 1), m),
         "top_k and min_p are");
+}
+
+void test_host_boundary_oracle() {
+    constexpr std::array<float, 2> signed_zeros{-0.0F, 0.0F};
+    constexpr strix::TokenSamplingPolicy top_one{1.0F, 1U, 1.0F, 0.0F, 0U};
+    const auto tie = strix::make_token_distribution(signed_zeros, {}, top_one);
+    expect(tie.sample(0.5) == 0U, "the host transform breaks the signed-zero tie by token ID");
+
+    for (const float top_p : {1.0F, 0.75F}) {
+        const strix::TokenSamplingPolicy row_policy{1.0F, 0U, top_p, 0.0F, 0U};
+        const std::vector<float> logits(top_p < 1.0F ? 8192U : 6144U, 0.0F);
+        const auto host = strix::make_token_distribution(logits, {}, row_policy);
+        expect(host.tokens().size() == 6144U, "both host boundary policies keep 6144 tokens");
+        for (const double u : {std::nextafter(0.5, 0.0), 0.5, std::nextafter(0.5, 1.0)}) {
+            expect(host.sample(u) == 3071U, "host CDF sums individually normalized weights at the boundary");
+        }
+    }
 }
 
 void test_plan() {
@@ -91,6 +109,7 @@ void test_plan() {
 
 int main() {
     test_same_transform();
+    test_host_boundary_oracle();
     test_plan();
     if (failures != 0) { std::cerr << failures << " failure(s)\n"; return EXIT_FAILURE; }
     std::cout << "device sampling plan tests passed\n";
