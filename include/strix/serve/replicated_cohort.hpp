@@ -97,12 +97,16 @@ public:
 
     // Delivers the queued commits / releases with no forward (an idle heartbeat for transports with a timeout).
     void keepalive();
-    // Delivers the queued operations and ends follow_cohort() on rank 1. Further calls throw.
+    // Delivers the queued operations and ends follow_cohort() on rank 1. Further calls throw std::logic_error.
+    // After a failure aborted the link (a transport error, or a rank 0 verify failure) the peer is gone: release() frees
+    // only rank 0's lane, close() does nothing, and every other call throws std::runtime_error without touching the
+    // link, so a CohortDecoder fails each request as a backend failure and keeps running.
     void close();
     [[nodiscard]] std::uint64_t rounds() const noexcept { return round_; }  // control messages sent
 
 private:
     void abort_replica(const char* reason) noexcept;
+    void check_open() const;  // runtime_error after an abort, logic_error after close()
     void send(std::uint32_t op, std::uint32_t arg, std::uint32_t flag, std::span<const std::uint32_t> body);
     void defer(std::uint32_t kind, std::span<const std::uint32_t> head, std::span<const std::uint32_t> body);
 
@@ -115,6 +119,7 @@ private:
     std::vector<CohortGroup> read_groups_;  // verify groups as both ranks run them (every group read)
     std::uint64_t round_ = 0;
     bool closed_ = false;
+    bool aborted_ = false;  // closed by a failure (abort_replica), not by close()
 };
 
 // Rank 1 side: applies rank 0's calls to `local` until close(). Returns the control messages handled.

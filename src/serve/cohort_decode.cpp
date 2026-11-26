@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <exception>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -311,6 +312,18 @@ void CohortDecoder::admit() {
     }
 }
 
+void CohortDecoder::fail_lanes(std::span<Lane* const> lanes, const std::string& error) {
+    std::exception_ptr release_error;
+    for (Lane* lane : lanes) {
+        try {
+            finish(*lane, error);  // frees the lane and returns its budget before the backend release
+        } catch (...) {
+            if (!release_error) release_error = std::current_exception();
+        }
+    }
+    if (release_error) std::rethrow_exception(release_error);
+}
+
 void CohortDecoder::finish(Lane& lane, std::string error) {
     lane.result.error = std::move(error);
     {
@@ -546,6 +559,13 @@ void CohortDecoder::step() {
                 group.push_back(static_cast<std::uint32_t>(id));
         }
     }
+    // A backend failure of a prompt pass fails the lanes of that pass, as a failed verify does, and ends this step (no
+    // first id is pending yet); a contract violation (std::logic_error) stays fatal after the cleanup.
+    const auto fail_prompt = [&](std::span<const std::uint32_t> indices, const std::exception& ex) {
+        std::vector<Lane*> failed;
+        for (const auto i : indices) failed.push_back(lanes_[i].get());
+        fail_lanes(failed, std::string("prefill: ") + ex.what());
+    };
     if (group.size() > 1) {
         std::vector<CohortPrompt> members;
         for (const auto i : group) {
@@ -556,7 +576,13 @@ void CohortDecoder::step() {
         account_gap(prompt_rows, false);
         prompt_rows = 0;
         const double t0 = now_ms();
-        backend_.prefill_group(members);
+        try {
+            backend_.prefill_group(members);
+        } catch (const std::exception& ex) {
+            fail_prompt(group, ex);
+            if (dynamic_cast<const std::logic_error*>(&ex) != nullptr) throw;
+            return;
+        }
         prompt_ms = now_ms() - t0;
         prompt_ms_ += prompt_ms;
         ++prompt_groups_;
@@ -582,9 +608,16 @@ void CohortDecoder::step() {
         // 8192 + 16) carries two fixed costs and is not a sample
         const bool one_pass = config_.prompt_slice_decoding == 0U || l.prompt_read + prompt_rows <= l.chunk_end;
         const double t0 = now_ms();
-        backend_.prefill_scoped(plan.prompt.front().lane,
-                                std::span<const std::uint32_t>(l.request.prompt.data() + l.prompt_read, prompt_rows),
-                                l.prompt_read == 0, l.request.prompt.size());
+        try {
+            backend_.prefill_scoped(plan.prompt.front().lane,
+                                    std::span<const std::uint32_t>(l.request.prompt.data() + l.prompt_read, prompt_rows),
+                                    l.prompt_read == 0, l.request.prompt.size());
+        } catch (const std::exception& ex) {
+            const std::uint32_t one[1] = {plan.prompt.front().lane};
+            fail_prompt(one, ex);
+            if (dynamic_cast<const std::logic_error*>(&ex) != nullptr) throw;
+            return;
+        }
         prompt_ms = now_ms() - t0;
         prompt_ms_ += prompt_ms;
         // The gap's row cost is learned from passes of at least the decoding floor only: a shorter pass (a lone short
@@ -731,12 +764,13 @@ void CohortDecoder::step() {
     }
     top.assign(tokens.size(), 0U);
     // A backend failure of the verify or commit fails every lane of this forward (selections discarded, lanes
-    // released, budget returned) and leaves the decoder usable; the next step starts clean.
+    // released, budget returned) and leaves the decoder usable; the next step starts clean. Every lane is retired even
+    // when a backend release throws (each finish() frees its lane first); the first such error is rethrown once.
     const auto fail_forward = [&](const char* what, const std::exception& ex) {
         for (std::size_t k = 0; k < n; ++k)
             if (auto& selection = run[k]->request.selection) selection->discard();
-        for (std::size_t k = 0; k < n; ++k) finish(*run[k], std::string(what) + ": " + ex.what());
         verification_ = std::move(scratch);
+        fail_lanes(std::span<Lane* const>(run.data(), n), std::string(what) + ": " + ex.what());
     };
     try {
         backend_.verify(groups, tokens, top);

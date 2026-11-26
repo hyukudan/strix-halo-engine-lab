@@ -600,15 +600,63 @@ void run_verify_backend_failure() {
         bool closed = false;
         try {
             rep.keepalive();
+        } catch (const std::runtime_error& e) {
+            // A backend failure that names the earlier abort; the regressed path tries to use the aborted link instead.
+            closed = std::string_view(e.what()) == "cohort replica: link aborted by an earlier failure";
         } catch (const std::logic_error&) {
-            closed = true;
-        } catch (const std::runtime_error&) {
-            // The regressed path tries to use the aborted link.
+            // A contract violation would stop a CohortDecoder's loop.
         }
-        check(closed, "verify backend: rank 0 refuses further work on the replica");
+        check(closed, "verify backend: rank 0 refuses further work on the replica as a backend failure");
         follower.thread.join();
         check(follower.error == "link aborted: rank 0 verify failed", "verify backend: rank 1 exits its collective");
     }
+}
+
+// A rank 0 verify failure inside the decoder on a pair: every lane of the forward fails cleanly (its result is taken,
+// rank 0's lane is freed), the decoder keeps stepping, a later request fails as a backend failure without touching the
+// dead link, and close() after the abort does not throw.
+void run_decoder_pair_failure() {
+    const std::uint32_t vocab = 23;
+    Pair link;
+    FakeBackend be0(2, 4, vocab), be1(2, 4, vocab);
+    be0.on_verify = [] { throw std::runtime_error("rank 0 verify failed"); };
+    be1.on_verify = [&] {
+        std::byte unused{};
+        link.t1.receive({&unused, 1});  // rank 1 waits inside the collective until the abort wakes it
+    };
+    Follower follower;
+    follower.start(be1, link.t1, {});
+    const auto reqs = requests(3, vocab);
+    std::vector<CohortResult> first, later;
+    std::string thrown;
+    {
+        ReplicatedCohort rep(be0, link.t0);
+        CohortDecoder dec(rep, CohortConfig{});
+        dec.submit(reqs[0]);
+        dec.submit(reqs[1]);
+        try {
+            dec.run();
+            first = dec.take_finished();
+            check(dec.live() == 0 && dec.idle(), "pair failure: no lane stays bound after the failed forward");
+            dec.submit(reqs[2]);
+            dec.run();
+            later = dec.take_finished();
+            rep.close();
+        } catch (const std::exception& e) {
+            thrown = e.what();
+        }
+    }
+    follower.thread.join();
+    check(thrown.empty(), "pair failure: the decoder loop and close() do not throw (" + thrown + ")");
+    check(first.size() == 2, "pair failure: both lanes of the failed forward return a result");
+    for (const auto& r : first)
+        check(r.finish == "error" && r.error.find("rank 0 verify failed") != std::string::npos,
+              "pair failure: lane " + std::to_string(r.id) + " fails with the verify error (" + r.error + ")");
+    check(be0.releases >= 2, "pair failure: rank 0 frees its lanes after the abort");
+    check(later.size() == 1 && later[0].finish == "error" &&
+              later[0].error.find("link aborted by an earlier failure") != std::string::npos,
+          "pair failure: a later request fails as a backend failure");
+    check(follower.error == "link aborted: rank 0 verify failed", "pair failure: rank 1 exits its collective");
 }
 
 void run_exchange_abort_allocation_failure() {
@@ -913,6 +961,7 @@ int main() {
     run_score_reads(wire.t0, wire.t1);
     run_verify_allocation_failure();
     run_verify_backend_failure();
+    run_decoder_pair_failure();
     run_exchange_abort_allocation_failure();
     run_callbackless_exchange_rejection();
     run_exchange_verify_failure();
