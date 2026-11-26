@@ -153,6 +153,16 @@ and [qualification](engine/serving/ds41-prefix-cache-qualification.md).
 
 ## Baselines, inspection and exactness
 
+### Published tier throughput check
+
+**Engine:** shared. **Control:** `tools/ci/check_tier_monotonicity.py`. **Default:** checked in CI.
+
+The throughput check reads the published results by model, revision, hardware, route, prompt and phase.
+It compares adjacent tiers using the median of reported repeats or separated bounds when only ranges are
+available. A new decrease fails CI. See `tools/ci/tier_monotonicity_known.tsv` for the historical decreases
+and remove an entry when its replacement receipt meets the tier guarantee. A decrease in this table warrants
+a controlled device comparison with the same route and prompts before attributing it to a particular lever.
+
 | Engine | Master baseline | Inspect before device work | Scope / precedence |
 |---|---|---|---|
 | Qwen | `--baseline` / `STRIX_BASELINE=1` | `--print-effective-config` | Historical organization/arithmetic; controlled defaults suppressed, implicit context 8192; explicit tiled routes still require priced native-pool headroom |

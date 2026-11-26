@@ -44,6 +44,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       - name: Benchmark completion-marker regression (CPU-only)
         shell: bash
@@ -73,6 +75,12 @@ jobs:
       - name: Environment switch census
         shell: bash
         run: python3 -B tools/env_switch_census.py --check --root .
+
+      - name: Check published tier throughput
+        shell: bash
+        run: |
+          python3 -B tools/ci/check_tier_monotonicity.py --base HEAD^1
+          python3 -B tools/ci/test_check_tier_monotonicity.py
 
       - name: Install Python test dependency
         shell: bash
