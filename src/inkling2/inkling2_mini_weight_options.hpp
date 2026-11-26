@@ -131,7 +131,8 @@ inline bool mini_may_load_lowbit_row(profile::Name tier, const MiniWeightOptions
     return tier == profile::Name::turbo && options.lowbit_turbo && !options.disable_q8 &&
            !options.qualify && !options.qualify_q8 &&
            std::ranges::any_of(kMiniLowBitDecisions, [backend, extent](const auto& row) {
-               return backend == row.scope.backend && weight::weight_load_gain_selects(row, extent);
+               return backend == row.scope.backend && weight::weight_load_gain_selects(row, extent) &&
+                      profile::ladder_gain(row.evidence.speedup, row.evidence.noise);
            });
 }
 
@@ -144,6 +145,10 @@ inline std::string mini_lowbit_row_decline(profile::Name tier, const MiniWeightO
     if (options.disable_q8) return "--no-weight-q8 keeps every role BF16";
     if (options.qualify != nullptr || options.qualify_q8) return "an explicit qualification arm names its own weights";
     if (backend != weight::Backend::hip) return "measured on HIP gfx1151 only";
+    if (std::ranges::none_of(kMiniLowBitDecisions, [](const auto& row) {
+            return profile::ladder_gain(row.evidence.speedup, row.evidence.noise);
+        }))
+        return "the row's current receipt is not faster than FAST (screened BF16 head); no admission until a new receipt";
     const auto& measured = kMiniLowBitMeasuredExtent;
     if (extent.context == 0U || extent.context > measured.context)
         return "context " + std::to_string(extent.context) + " outside the measured 1.." +

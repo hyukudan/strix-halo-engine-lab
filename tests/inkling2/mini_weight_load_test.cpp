@@ -10,6 +10,7 @@
 #include "strix/weight/resident_slices.hpp"
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -384,28 +385,38 @@ void test_lowbit_receipts() {
 
     options.tier.env = [](std::string_view key) { return key == "STRIX_INK_LOWBIT_TURBO" ? "1" : nullptr; };
     options.lowbit_turbo = mini::mini_lowbit_turbo(mini::resolve_mini_profile(options, true));
-    require(options.lowbit_turbo && is_q4(pick(turbo.scope, extent)),
-            "explicit TURBO opt-in admits a matching row at the measured caps");
-    require(mini::mini_lowbit_row_decline(profile::Name::turbo, options, weight::Backend::hip, extent).empty(),
-            "no decline inside the measured regime");
-    require(!mini::mini_lowbit_row_decline(profile::Name::turbo, options, weight::Backend::hip, {16384U, 0U}).empty() &&
-                !mini::mini_lowbit_row_decline(profile::Name::turbo, options, weight::Backend::hip, {16385U, 1U}).empty() &&
-                !mini::mini_lowbit_row_decline(profile::Name::turbo, options, weight::Backend::cuda, extent).empty(),
-            "outside the measured regime the receipt states the decline");
+    // The row states its current receipt (slower than FAST at B=1 with the screened head): not a gain, so even the
+    // explicit opt-in loads the incumbent inside the measured regime and the receipt says why.
+    require(!profile::ladder_gain(turbo.evidence.speedup, turbo.evidence.noise), "the current receipt is not a gain");
+    require(options.lowbit_turbo && !is_q4(pick(turbo.scope, extent)) && !is_q4(pick(turbo.scope, {8192U, 1U})),
+            "explicit TURBO opt-in declines a row whose current receipt is not faster");
+    require(mini::mini_lowbit_row_decline(profile::Name::turbo, options, weight::Backend::hip, extent)
+                    .find("current receipt") != std::string::npos,
+            "inside the measured regime the decline names the receipt");
+    require(!mini::mini_lowbit_row_decline(profile::Name::turbo, options, weight::Backend::cuda, extent).empty(),
+            "other backends decline");
     for (const auto below : {profile::Name::standard, profile::Name::fast}) {
         auto lower = options;
         lower.tier.profile = below;
         require(!mini::mini_lowbit_turbo(mini::resolve_mini_profile(lower, true)), "EXACT and FAST keep BF16 weights");
     }
-    require(is_q4(pick(turbo.scope, {8192U, 1U})), "the caps include serial decode");
+    // Band and scope mechanics of the shared decision table, on a copy of the row that states a gain.
+    auto win = turbo;
+    win.evidence.speedup = 1.2;
+    const std::array<weight::WeightLoadDecision, 1> won{win};
+    const auto pick_won = [&](weight::WeightLoadScope scope, weight::WeightLoadExtent shape) {
+        return mini::mini_lowbit_receipt_plan(profile::Name::turbo, scope, shape, won);
+    };
+    require(is_q4(pick_won(turbo.scope, extent)) && is_q4(pick_won(turbo.scope, {8192U, 1U})),
+            "a winning row admits the measured caps, serial decode included");
     for (const auto outside : {weight::WeightLoadExtent{16385U, 16U}, {16384U, 17U}, {0U, 16U}, {16384U, 0U}})
-        require(!is_q4(pick(turbo.scope, outside)), "out-of-band or unknown extent keeps the incumbent");
+        require(!is_q4(pick_won(turbo.scope, outside)), "out-of-band or unknown extent keeps the incumbent");
     auto unmatched = turbo.scope;
     unmatched.build = {};
-    require(!is_q4(pick(unmatched, extent)), "unknown consumer identity keeps the incumbent");
+    require(!is_q4(pick_won(unmatched, extent)), "unknown consumer identity keeps the incumbent");
     unmatched = turbo.scope;
     unmatched.checkpoint = {};
-    require(!is_q4(pick(unmatched, extent)), "unknown checkpoint keeps the incumbent");
+    require(!is_q4(pick_won(unmatched, extent)), "unknown checkpoint keeps the incumbent");
     options.disable_q8 = true;
     require(!is_q4(pick(turbo.scope, extent)), "the compact weight off switch still applies");
 
