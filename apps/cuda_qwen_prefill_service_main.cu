@@ -291,7 +291,11 @@ void handle(Service& svc, http::Sock s, std::uint32_t max_positions, const std::
     http::Message m;
     std::string carry;
     const auto err = http::read_message(s, m, std::size_t{64} << 20, false, carry);
-    if (!err.empty()) { http::respond(s, 400, R"({"error":")" + err + "\"}"); http::close_sock(s); return; }
+    if (!err.empty()) {
+        http::respond(s, strix::serve::http_wire_error_status(err), R"({"error":")" + err + "\"}");
+        http::close_sock(s);
+        return;
+    }
     const auto sp1 = m.start.find(' '), sp2 = m.start.find(' ', sp1 + 1);
     const std::string method = m.start.substr(0, sp1), path = m.start.substr(sp1 + 1, sp2 - sp1 - 1);
     if (path == "/health") { http::respond(s, 200, svc.health()); http::close_sock(s); return; }

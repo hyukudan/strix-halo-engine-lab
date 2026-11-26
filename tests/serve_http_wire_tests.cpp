@@ -320,8 +320,20 @@ void test_qwen_prefill_request() {
     CHECK(r.has_schedule && r.tail_large && r.has_final_rows && r.final_rows == 65520U && r.node_completions == "n");
 }
 
+// A slow request is answered 408, an oversized body 413 and an oversized header 431; every other error 400.
+void test_error_status() {
+    using strix::serve::http_wire_error_status;
+    CHECK(http_wire_error_status("request timed out") == 408);
+    CHECK(http_wire_error_status("body too large") == 413);
+    CHECK(http_wire_error_status("headers too large") == 431);
+    for (const char* e : {"bad Content-Length", "conflicting Content-Length", "malformed start line", "truncated body",
+                          "malformed header field", "chunked bodies are not supported"})
+        CHECK(http_wire_error_status(e) == 400);
+}
+
 int main() {
     test_qwen_prefill_request();
+    test_error_status();
     test_head_table();
     test_reader();
     test_deadline();

@@ -95,6 +95,16 @@ struct HttpWireMessage {
     }
 };
 
+// The status a server answers for an error of read_http_message: 408 when the request missed its deadline, 413 for
+// a body over its limit, 431 for a header over its limit, 400 for every malformed request. A client can then tell a
+// slow link from a malformed request.
+[[nodiscard]] inline int http_wire_error_status(std::string_view error) {
+    if (error == "request timed out") return 408;
+    if (error == "body too large") return 413;
+    if (error == "headers too large") return 431;
+    return 400;
+}
+
 namespace wire_detail {
 
 inline bool is_tchar(char c) {

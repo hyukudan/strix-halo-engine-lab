@@ -211,7 +211,9 @@ const char* reason(int status) {
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
     case 409: return "Conflict";
+    case 408: return "Request Timeout";
     case 413: return "Payload Too Large";
+    case 431: return "Request Header Fields Too Large";
     case 500: return "Internal Server Error";
     case 502: return "Bad Gateway";
     case 503: return "Service Unavailable";
@@ -1339,7 +1341,7 @@ void handle(Sock s, Service& svc, const Config& c, std::uint32_t max_positions, 
     const auto max_body = bounded_passes ? std::size_t{max_positions} * 16U + 65536U : std::size_t{256} << 20;
     const std::string err = read_message(s, req, max_body, false);
     if (!err.empty()) {
-        if (err != "connection closed") respond(s, 400, error_json(err).dump());
+        if (err != "connection closed") respond(s, strix::serve::http_wire_error_status(err), error_json(err).dump());
         return;
     }
     const auto sp1 = req.start.find(' ');
