@@ -135,9 +135,9 @@ struct ArbiterConfig {
     // 64 traced 255-token requests at the q46 walls (spec_drafting_tests honest_plain_price_tests), x plain decode:
     //   allowance 0 / 0.5 / 1 / 2 excess: code 1.19 / 1.21 / 1.23 / 1.25, prose 0.971 / 0.970 / 0.965 / 0.947
     //   (always drafting k=7: code 1.325, prose 0.536); probe_loss 0.010 / 0.015: code 1.208 / 1.213, prose 0.974 / 0.970.
-    // Default 0 (the fixed interval). The value an engine runs is data: spec::resolve_probe_loss
-    // (strix/spec/probe_policy.hpp) gives kMeasuredProbeLoss only to an engine and backend with a device receipt, and
-    // STRIX_SPEC_PROBE_LOSS overrides it for every engine.
+    // Default 0 (the fixed interval). The value an engine runs is data: its model TOML's [speculation.probe_loss] row
+    // for the backend, present only with a device receipt, through spec::resolve_probe_loss
+    // (strix/spec/probe_policy.hpp); STRIX_SPEC_PROBE_LOSS overrides it for every engine.
     double probe_loss = 0.0;
     // Priced exploration (learned per-depth drafter; replaces the deepest-window choice of charge_probe when true):
     // - a probe never moves the arm hysteresis (switch_in): leaving serial needs the estimate, not a probe's side effect.

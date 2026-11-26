@@ -6490,11 +6490,11 @@ model pending a matched timing comparison.
 
 ## Shared speculation arbiter: measured probe episodes
 
-**Engine:** `shared`. **Control:** `STRIX_SPEC_PROBE_LOSS` (0..1; 0 = the previous fixed re-probe interval, bit-identical), one resolver for command line and server (`spec::resolve_probe_loss`). **Default:** per engine and backend as data (`include/strix/spec/probe_policy.hpp`): 0.015 only for Inkling 2 Mini CUDA (receipt below); every other engine keeps the fixed interval until its off-vs-on device arms exist.
+**Engine:** `shared`. **Control:** `STRIX_SPEC_PROBE_LOSS` (a value in [0, 1); 0 = the previous fixed re-probe interval, bit-identical), one resolver for command line and server (`spec::resolve_probe_loss`). **Default:** per model and backend as data in the model TOML (`[speculation.probe_loss]`): 0.015 only for Inkling 2 Mini CUDA (`models/inkling2-mini.toml`, receipt below); every other engine keeps the fixed interval until its off-vs-on device arms exist.
 
 A probe of a learned per-depth drafter runs the deepest legal window and opens an episode whose realized ledger (every model pass at the plain row's ms per token; allowance half a priced excess, credit capped at three probe walls) keeps the drafter while it is not losing; the closed episode's realized loss paces the next probe. Bound: exploration loses at most probe_loss of decode time plus one episode and the first measurements.
 
-- **Shared home:** include/strix/spec/drafting.hpp + src/spec/drafting.cpp (spec::Arbiter); include/strix/spec/probe_policy.hpp (per-engine default, switch).
+- **Shared home:** include/strix/spec/drafting.hpp + src/spec/drafting.cpp (spec::Arbiter); include/strix/spec/probe_policy.hpp (resolver, switch); the per-model value is `[speculation.probe_loss]` in the model TOML.
 - **Tier and regime:** EXACT, FAST, QUALITY, TURBO; speculative decode at one request.
 - **Exactness evidence:** Drafts never change emitted tokens (greedy verify). RTX q47: ids equal on code and prose (new auto == off == q46 resident).
 - **Off switch:** `STRIX_SPEC_PROBE_LOSS=0`.

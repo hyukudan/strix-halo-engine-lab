@@ -506,6 +506,13 @@ inline constexpr std::string_view kMiniBuildBackend = "hip";
 #else
 inline constexpr std::string_view kMiniBuildBackend = "cuda";
 #endif
+// The charged re-probe episodes this backend's build runs: the model TOML's [speculation.probe_loss] row for it
+// (spec::resolve_probe_loss), the fixed interval where the TOML has none.
+#if defined(__HIPCC__)
+inline constexpr double kMiniProbeLoss = 0.0;
+#else
+inline constexpr double kMiniProbeLoss = model_data::inkling2_mini::speculation::probe_loss::cuda;
+#endif
 
 // STRIX_MOE_TAIL, the R1 MoE tail of the packed one-row route: one read for both backends, its default per backend as
 // data. HIP: on (EXACT receipt, docs/optimizations.md#inkling2-hip-bank-tail; "0" turns it off). CUDA: off, an opt-in of
