@@ -87,7 +87,7 @@ PackReader::PackReader(std::string dir) : dir_(std::move(dir)) {
     // Shard names come from the file: only plain basenames inside dir_ are opened (shared rule with the weight readers).
     std::map<std::string, std::uint32_t> file_ids;
     for (const auto& [k, v] : weight_map->as_object()) {
-        if (!v.is_string() || !weight::safetensors_shard_name_ok(v.as_string()))
+        if (!v.is_string() || !weight::shard_basename_ok(v.as_string()))
             throw std::runtime_error("invalid safetensors shard name for " + k + " in " + index_path);
         file_ids.emplace(v.as_string(), 0U);
     }

@@ -6,11 +6,16 @@
 
 namespace strix::weight {
 
-// A plain basename ending in .safetensors with a non-empty stem: no directory separator, drive colon or NUL.
+// A plain file name: non-empty, not "." or "..", no directory separator, drive colon or NUL.
+[[nodiscard]] inline bool shard_basename_ok(std::string_view name) noexcept {
+    return !name.empty() && name != "." && name != ".." &&
+           name.find_first_of(std::string_view("/\\:\0", 4)) == std::string_view::npos;
+}
+
+// A plain file name ending in .safetensors with a non-empty stem.
 [[nodiscard]] inline bool safetensors_shard_name_ok(std::string_view name) noexcept {
     constexpr std::string_view ext = ".safetensors";
-    return name.size() > ext.size() && name.substr(name.size() - ext.size()) == ext &&
-           name.find_first_of(std::string_view("/\\:\0", 4)) == std::string_view::npos;
+    return shard_basename_ok(name) && name.size() > ext.size() && name.substr(name.size() - ext.size()) == ext;
 }
 
 // The largest model.safetensors.index.json a reader accepts.

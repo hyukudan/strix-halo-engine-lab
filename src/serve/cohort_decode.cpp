@@ -302,6 +302,9 @@ void CohortDecoder::admit() {
             if (l.whole && l.prompt_left() == 0) l.first_due = true;
             else if (l.prompt_left() == 0) l.pending = p.back();
         }
+        } catch (const std::logic_error& ex) {  // a contract violation stays fatal, after the lane is retired
+            finish(l, std::string("admit: ") + ex.what());
+            throw;
         } catch (const std::exception& ex) {
             finish(l, std::string("admit: ") + ex.what());
         }
@@ -737,6 +740,9 @@ void CohortDecoder::step() {
     };
     try {
         backend_.verify(groups, tokens, top);
+    } catch (const std::logic_error& ex) {  // contract violations stay fatal after the cleanup
+        fail_forward("verify", ex);
+        throw;
     } catch (const std::exception& ex) {
         fail_forward("verify", ex);
         return;
@@ -782,6 +788,9 @@ void CohortDecoder::step() {
     }
     try {
         backend_.commit(keep);
+    } catch (const std::logic_error& ex) {  // contract violations stay fatal after the cleanup
+        fail_forward("commit", ex);
+        throw;
     } catch (const std::exception& ex) {
         fail_forward("commit", ex);
         return;

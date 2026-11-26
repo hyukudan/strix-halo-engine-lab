@@ -97,7 +97,7 @@ Pack::Pack(std::string dir, unsigned prefix_layers) : dir_(std::move(dir)) {
             if (!keep) continue;
         }
         // Shard names come from the file: only plain basenames inside dir_ are opened.
-        if (!f.is_string() || !weight::safetensors_shard_name_ok(f.as_string()))
+        if (!f.is_string() || !weight::shard_basename_ok(f.as_string()))
             throw std::runtime_error("invalid safetensors shard name for " + name + " in " + index_path);
         if (file_id.count(f.as_string()) == 0) {
             file_id[f.as_string()] = static_cast<std::uint32_t>(names.size());

@@ -2,7 +2,6 @@
 #include "strix/serve/json.hpp"
 #include "strix/minimax/asset_input.hpp"
 #include "strix/minimax/model_description.hpp"
-#include "strix/weight/shard_name.hpp"
 #include <set>
 #include <stdexcept>
 
@@ -28,8 +27,6 @@ std::map<std::string, std::filesystem::path> pack_weight_map(const std::filesyst
     std::map<std::string, std::filesystem::path> out;
     for (const auto& [name, value] : weights->as_object()) {
         if (!value.is_string()) throw std::runtime_error("weight_map." + name + ": expected string, actual " + value.dump());
-        if (!weight::safetensors_shard_name_ok(value.as_string()))
-            throw std::runtime_error("weight_map." + name + ": invalid safetensors shard name");
         out.emplace(name, dir / value.as_string());
     }
     return out;
