@@ -116,3 +116,17 @@ final prompt row and the selected ID. Compare IDs, per-layer digests and
 the first-token top-20 against the host oracle. A first native result is
 BASE until bytewise equality establishes EXACT. The first HCA history
 qualification must also exercise positions 127–129.
+
+Use `prompt.u32`, `generated.u32`, and `hidden.tsv` in each rank receipt
+directory. Put the first full FP32 vocabulary row in
+`rank-1/raw-logits.f32`. Write the rank-local `seam.tsv` with columns
+`position` and `sha256` for the outgoing or incoming FP32 streams. Once the
+native callbacks emit these receipts, run the comparison against a completed
+CPU prompt directory.
+
+```sh
+python -I tools/ernie_trace_compare.py "$ORACLE/prompt-0" "$RECEIPTS/rank-0" "$RECEIPTS/rank-1" +  --cut 22 > "$RECEIPTS/first-token-compare.json"
+```
+
+The receipt reports the reference identity. Agreement with a candidate raw-head
+trace checks the same raw computation and stream layout.
