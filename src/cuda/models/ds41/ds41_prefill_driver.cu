@@ -1,4 +1,3 @@
-#include "strix/device/graph_inspection.hpp"
 #include "strix/weight/admission.hpp"
 // deepseek41 CUDA prefill driver (cuda_ds41_prefill.hpp): the DevicePrefill plan on the CUDA layer kernels, with the
 // cone, the tiered routed-expert provider and the Engram rows from the model file.
@@ -58,6 +57,7 @@
 #endif
 #include <windows.h>
 #endif
+#include "strix/device/graph_inspection.hpp"
 
 namespace strix::ds41::cuda {
 namespace {

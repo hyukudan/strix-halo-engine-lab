@@ -6675,7 +6675,8 @@ grid, block and dynamic shared memory with the native node before installation.
 The physical program also checks command kind, dependencies and node count.
 A device-specific shared-memory budget is part of the transition plan.
 
-The shared width runner uploads a fresh step descriptor for each launch. A
+Scalar and width runners share the submission order. They record on a cache
+miss, upload a fresh descriptor on each use and launch exactly once. A
 linear inclusive verify window requires consecutive positions from one slot,
 the declared parent/ancestor chain and matching valid bits. Each window binding
 names its convolution history, tape, tap plane, tape stride and head form.
@@ -6684,8 +6685,8 @@ the owner because some work may already have been submitted.
 
 The route resolver matches verification, taps, single-row sampling and sampled
 verification independently. The Inkling CUDA CLI uses those requirements when
-selecting its decoder. Gate and explicit replay choices continue to use the
-existing route policy.
+selecting its decoder. The shared CLI also checks the verification interface
+on the loaded decoder before starting forced speculation.
 
 Host tests exercise two physical bindings over stable fake allocations, replay
 different tokens and positions, move tape storage and compare a partial commit
