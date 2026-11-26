@@ -354,6 +354,11 @@ bool isolated_regex(const Json& split, std::string_view expression) {
 bool decimal_triplet_layout(const Json::Array& stages) {
     constexpr auto cjk = u8"[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+";
     const std::string_view cjk_pattern(reinterpret_cast<const char*>(cjk));
+    constexpr std::string_view classes =
+        "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+"
+        "|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+"
+        "| ?[\\p{P}\\p{S}]+[\r\n]*"
+        "|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
     // Recognize the serialized schema as a unit. These are data signatures for
     // the shared scanner, which does not evaluate regexes from an asset.
     return stages.size() == 7U && field_is_string(stages[0], "type", "Digits") &&
@@ -362,7 +367,7 @@ bool decimal_triplet_layout(const Json::Array& stages) {
            isolated_regex(stages[2], R"(\A\p{Nd}{1,2}(?=\p{Nd}{3}+\z))") &&
            isolated_regex(stages[3], R"(\A\p{Nd}{3}|\G\p{Nd}{3})") &&
            isolated_regex(stages[4], cjk_pattern) &&
-           isolated_regex(stages[5], R"rx([!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)rx") &&
+           isolated_regex(stages[5], classes) &&
            field_is_string(stages[6], "type", "ByteLevel") &&
            field_is_bool(stages[6], "add_prefix_space", false) && field_is_bool(stages[6], "use_regex", false);
 }
