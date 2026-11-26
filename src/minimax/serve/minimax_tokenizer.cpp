@@ -152,17 +152,6 @@ std::vector<std::uint32_t> nfc_code_points(const std::vector<std::uint32_t>& in)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Byte-level alphabet (GPT-2): printable bytes map to themselves, the others to U+0100.. in order.
-std::array<std::uint32_t, 256> byte_to_code_point() {
-    std::array<std::uint32_t, 256> out{};
-    std::uint32_t extra = 0;
-    for (std::uint32_t b = 0; b < 256U; ++b) {
-        const bool direct = (b >= '!' && b <= '~') || (b >= 0xA1U && b <= 0xACU) || (b >= 0xAEU);
-        out[b] = direct ? b : 256U + extra++;
-    }
-    return out;
-}
-
 // Minimal JSON DOM for tokenizer.json. (strix::serve::parse_json checks duplicate object keys linearly,
 // which is quadratic on the 200k-entry vocabulary: ~20 s. This reader keeps every member, in order.)
 struct TjValue {
@@ -472,7 +461,7 @@ std::shared_ptr<const MinimaxTokenizer> MinimaxTokenizer::load(const std::string
     impl.vocab_bytes.resize(vocab_size);
     impl.vocab_ids.reserve(vocab->size() * 2U);
     std::unordered_map<std::uint32_t, unsigned char> cp_byte;
-    const auto byte_cp = byte_to_code_point();
+    const auto& byte_cp = strix::serve::tokenizer_utf8::kByteBpeCodePoints;
     for (std::uint32_t b = 0; b < 256U; ++b) cp_byte.emplace(byte_cp[b], static_cast<unsigned char>(b));
     for (const auto& [text, value] : vocab->as_object()) {
         const auto id = checked_token_id(value);

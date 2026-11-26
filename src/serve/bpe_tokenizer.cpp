@@ -405,23 +405,6 @@ bool raw_prefix_template(const Json& root, const Json& vocab) {
            matches(b[2], "SpecialToken", prefix, 1) && matches(b[3], "Sequence", "B", 1);
 }
 
-std::array<std::string, 256> byte_to_unicode() {
-    std::array<std::string, 256> out{};
-    std::array<bool, 256> direct{};
-    for (int b = '!'; b <= '~'; ++b) direct[static_cast<std::size_t>(b)] = true;
-    for (int b = 0xA1; b <= 0xAC; ++b) direct[static_cast<std::size_t>(b)] = true;
-    for (int b = 0xAE; b <= 0xFF; ++b) direct[static_cast<std::size_t>(b)] = true;
-    std::uint32_t extra = 0;
-    for (std::size_t b = 0; b < 256U; ++b) {
-        const std::uint32_t cp = direct[b] ? static_cast<std::uint32_t>(b) : 256U + extra++;
-        std::string s;
-        if (cp < 0x80U) s.push_back(static_cast<char>(cp));
-        else { s.push_back(static_cast<char>(0xC0U | (cp >> 6U))); s.push_back(static_cast<char>(0x80U | (cp & 0x3FU))); }
-        out[b] = s;
-    }
-    return out;
-}
-
 // GGUF header metadata (only the tokenizer keys are kept).
 struct GgufTokenizer {
     std::vector<std::string> tokens, merges;
@@ -527,7 +510,7 @@ struct BpeTokenizer::Impl {
     // first bytes at which a special token may start: '<' and '[' (qwen35), every special's first byte (DeepSeek,
     // whose added tokens such as the DSML markers also start inside text)
     std::array<bool, 256> special_start{};
-    std::array<std::string, 256> byte_unicode = byte_to_unicode();
+    std::array<std::string, 256> byte_unicode = tokenizer_utf8::byte_bpe_alphabet();
     std::unordered_map<std::uint32_t, unsigned char> unicode_byte;
     std::string pre;
     const PreSplitRule* rule = &kPreSplitRules[0];
