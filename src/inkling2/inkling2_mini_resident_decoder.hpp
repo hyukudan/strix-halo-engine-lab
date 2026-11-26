@@ -788,6 +788,31 @@ private:
     }
 
 #if !defined(__HIPCC__)
+    // The window program of a staged verify window on `state`: block row r = (id r, position committed + r, the
+    // state's slot), every row valid (each stores its own KV row on the sequence's caches). Empty when the window is
+    // outside the lanes form (one row, more rows than a lanes launch) or its slot has no directory entry.
+    [[nodiscard]] std::optional<MiniResidentBackend::WindowProgram> window_program(const MiniResidentSessionState& state,
+                                                                                std::span<const unsigned> ids) {
+        const auto rows = static_cast<std::uint32_t>(ids.size());
+        if (rows < 2U || rows > attn::lanes::kMaxPreparedBf16Lanes || rows > exec::kStepMaxRows) return std::nullopt;
+        std::uint32_t slot = 0;
+        while (slot < slots_.size() && &slots_[slot]->state() != &state) ++slot;
+        if (slot >= slots_.size() || slot >= decode_rows_) return std::nullopt;
+        MiniResidentBackend::WindowProgram program{};
+        program.block.h.rows = rows;
+        const auto first = state.committed();
+        for (std::uint32_t row = 0; row < rows; ++row)
+            program.block.row[row] = {ids[row], first + row, slot, exec::kStepNoParent, 0U,
+                                      static_cast<std::uint32_t>(exec::step_valid), 0U, 0U};
+        const auto& owner = *slots_[slot];
+        const auto planes = owner.planes();
+        program.lanes = {exec::step_lane_view(backend_.window_block(), slot_directory_.data(), decode_rows_, rows),
+                         {reinterpret_cast<std::uintptr_t>(planes.keys.data()),
+                          reinterpret_cast<std::uintptr_t>(planes.values.data()),
+                          reinterpret_cast<std::uintptr_t>(owner.history().data())}};
+        return program;
+    }
+
     // Embedding of a cohort program: the ids come from the device step block (padded rows read id 0).
     void embed_lanes(MiniMutableRows output, unsigned rows, MiniAppendKind kind) {
         const auto table = weights_.bf16("embed.weight");
@@ -919,6 +944,14 @@ private:
         }
         backend_.rms(output.data(), gain.data(), output.data(), rows);
 #else
+        if (backend_.window_capturing()) {
+            // A captured verify window reads its ids from the window block (row r = the window's id r).
+            backend_.check(cuda::core::step_inputs::enqueue(backend_.window_block(),
+                cuda::core::step_inputs::Linear{{lane_anchor_.data(), lane_ids_.data()}}, stream_.get()));
+            backend_.check(enqueue_mini_cuda_embeddings(table.data(), gain.data(), lane_ids_.data(), output.data(), rows,
+                                                        stream_.get()));
+            return;
+        }
         if (!step) {
             // The caller's token span can be pageable.
             mini_gpu::copy(token_ids_.data(), ids.data(), ids.size_bytes(), mini_gpu::host_to_device, stream_.get());
@@ -1180,6 +1213,20 @@ private:
             backend_.abandon_capture();
             screened_graph_ = screened;
         }
+#if !defined(__HIPCC__)
+        // A staged verify window whose picks nobody reads as scores replays its window program (one graph per window
+        // rows; MiniResidentBackend::try_window_graph). The program captures the head it ran: a change of head form drops
+        // it with the step graph (abandon_capture / reset_step_graph).
+        std::optional<MiniResidentBackend::WindowProgram> window;
+        if (kind == MiniAppendKind::verify && multi_pick && host_logits.empty() && !scores_read && !lowbit &&
+            backend_.step_graphs())
+            window = window_program(state, ids);
+        struct ClearWindow {
+            MiniResidentBackend& backend;
+            ~ClearWindow() { backend.set_window_program(nullptr); }
+        } clear_window{backend_};
+        backend_.set_window_program(window ? &*window : nullptr);
+#endif
         try {
             backend_.set_step_token(decode_step ? std::optional<unsigned>{ids.front()} : std::nullopt);
             MiniResidentForward forward(backend_, state, workspace(&state));
@@ -1249,6 +1296,10 @@ private:
                 },
                 [&] {
                     if (!pick_next) return;
+#if !defined(__HIPCC__)
+                    // A replayed window program re-ran the captured picks and their pinned reply copy.
+                    if (backend_.window_replayed()) greedy.replayed(static_cast<unsigned>(verify_top.size()));
+#endif
                     if (verify_top.empty()) token = checked_token(greedy, 0U);
                     else for (std::size_t row = 0; row < verify_top.size(); ++row)
                         verify_top[row] = checked_token(greedy, row);

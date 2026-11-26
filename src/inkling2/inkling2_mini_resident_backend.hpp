@@ -440,6 +440,7 @@ public:
         graph_.reset();
 #if !defined(__HIPCC__)
         cohort_graphs_.reset();
+        window_graphs_.reset();
 #endif
     }
 
@@ -496,6 +497,60 @@ public:
         return graph_.capture_descriptor();
     }
 
+    // Device position of the first row of the chunk being captured (the one-row step's descriptor, or the first row of a
+    // captured verify window); null when the chunk runs eagerly. Row r of the chunk is at *position + r.
+    [[nodiscard]] const std::uint32_t* capture_position() const noexcept {
+        if (const auto* step = graph_.capture_descriptor()) return &step->position;
+#if !defined(__HIPCC__)
+        if (window_lanes_) return window_position_;
+#endif
+        return nullptr;
+    }
+
+#if !defined(__HIPCC__)
+    // Verify window program: the K rows of one staged verify window of one sequence (StepBlock row r = the window's row r:
+    // its id, position first + r and the sequence's slot), captured once per K and replayed for any position. Inside the
+    // capture the attention store + flash run the device-resolved lanes form (every lane at its own position on the
+    // sequence's caches: the bind_lane / flash_body of the eager lanes launch, so the same bits), the position-scaled
+    // clips and the DSpark tap store read *capture_position() + row, the embedding reads the ids from the block; every
+    // other stage is position-free (fixed addresses). The decoder sets the program around its staged verify append.
+    struct WindowProgram {
+        exec::StepBlock block;
+        MiniCohortLanes lanes;
+    };
+    void set_window_program(const WindowProgram* program) noexcept {
+        window_program_ = program;
+        window_replayed_ = false;
+    }
+    [[nodiscard]] exec::StepBlock* window_block() { return window_graphs_.block(); }
+    [[nodiscard]] bool window_capturing() const noexcept { return window_lanes_ != nullptr; }
+    [[nodiscard]] bool window_replayed() const noexcept { return window_replayed_; }
+    [[nodiscard]] const exec::WidthStepGraphs& window_graphs() const noexcept { return window_graphs_; }
+
+    // session::RowAppendState::append offers a taped staged window here (after its eager checkpoints). False: nothing
+    // ran (no program set, graphs off, a host tap, or this width declined); the work then runs eagerly.
+    template <class Work>
+    bool try_window_graph(MiniResidentChunk chunk, Work& work, bool taped) {
+        window_replayed_ = false;
+        if (!window_program_ || !taped || !step_graphs_ || window_program_->block.h.rows != chunk.rows) return false;
+        const auto& program = *window_program_;
+        window_position_ = &window_graphs_.block()->row[0].position;
+        // The host route of the replayed window (finish reads its flags); the capture's start_chunk sets the same one.
+        prepare_route(chunk.rows, MiniAppendKind::verify);
+        const bool ran = window_graphs_.try_launch(stream_, true, host_taps_off(), program.block, [&] {
+            struct Leave {
+                const MiniCohortLanes*& active;
+                ~Leave() { active = nullptr; }
+            } leave{window_lanes_};
+            window_lanes_ = &program.lanes;
+            clear_flags();
+            work();
+        });
+        window_replayed_ = ran;
+        return ran;
+    }
+#endif
+
     template <class Work>
     bool try_step_graph(MiniResidentChunk chunk, Work& work) {
         // Layout and workspace addresses are fixed for this backend's lifetime. A route tap and the
@@ -520,6 +575,9 @@ public:
 
     bool abandon_capture() noexcept {
         graph_.invalidate();
+#if !defined(__HIPCC__)
+        window_graphs_.invalidate();
+#endif
         // try_launch closes even a failed capture before it returns or throws.
         return false;
     }
@@ -661,9 +719,9 @@ public:
     // every step at its own position (same bytes, same place as the eager store).
     void store_draft_tap(MiniConstRows input, std::span<std::uint16_t> output) {
         namespace rows = core::row_transforms;
-        if (const auto* step = capture_descriptor()) {
+        if (const auto* position = capture_position()) {
             check(rows::elements(input.size(), rows::StoreBf16SliceAtRow{
-                input.data(), output.data(), kHiddenWidth, MiniDSparkTapPlan::width, &step->position}, stream_));
+                input.data(), output.data(), kHiddenWidth, MiniDSparkTapPlan::width, position}, stream_));
             return;
         }
         check(rows::elements(input.size(), rows::StoreBf16Slice{
@@ -728,8 +786,9 @@ private:
 #endif
         const auto* lag = mini_convolution_layer(lag_weights_.data(), visit);
         auto* failure = flags_.data() + visit.logical_layer;
-        const auto* step = capture_descriptor();
-        const auto* device_position = step ? &step->position : nullptr;
+        [[maybe_unused]] const auto* step = capture_descriptor();  // HIP split workspaces
+        // The one-row step's position, or a captured verify window's first row (its clips take + row).
+        const auto* device_position = capture_position();
         const std::span<const MiniResidentAttentionGroup> visits =
             single ? std::span<const MiniResidentAttentionGroup>(single, 1U) : groups;
         const auto image_of = [&](const MiniResidentAttentionGroup& group, std::size_t base) {
@@ -858,6 +917,19 @@ private:
         // independent of the other lanes). Multi-row windows and device-position steps keep the
         // per-window launch.
         const auto launch_visits = [&](std::span<const MiniResidentAttentionGroup> lanes) {
+            if (window_lanes_) {
+                // Captured verify window: its rows are lanes of one sequence (all stored, then each attends up to its
+                // own position), resolved on the device: the bind_lane / flash_body of the eager host-lane launch
+                // below, so every row keeps its bits while the graph replays at any position.
+                auto packed = image_of(lanes.front(), 0U);
+                packed.count = rows;
+                const auto& kv = lanes.front().state.kv;
+                const cuda_core::PreparedBf16StepLanes step_lanes{window_lanes_->lanes,
+                    window_lanes_->plane(kMiniLaneKeys, kv.keys), window_lanes_->plane(kMiniLaneValues, kv.values),
+                    kv.slots, kv.wrapped ? 1U : 0U};
+                check(enqueue_mini_cuda_attention_step_lanes(visit, packed, step_lanes, stream_, failure));
+                return;
+            }
             if (cohort) {
                 // Lane mode: lane 0's visit caches give the plane offsets; the device resolves every lane.
                 auto packed = image_of(lanes.front(), 0U);
@@ -1384,6 +1456,13 @@ private:
 #endif
     exec::WidthStepGraphs cohort_graphs_;  // shared step descriptor, CUDA graph per width
     std::optional<MiniCohortLanes> cohort_lanes_;  // set while a cohort is captured or submitted eagerly
+#if !defined(__HIPCC__)
+    exec::WidthStepGraphs window_graphs_;          // verify window programs, one per window rows
+    const WindowProgram* window_program_{};        // set by the decoder around a staged verify append
+    const MiniCohortLanes* window_lanes_{};        // set while a verify window program is captured
+    const std::uint32_t* window_position_{};       // device position of the window's first row
+    bool window_replayed_{};
+#endif
     const MiniResidentWeights& weights_;
     mini_gpu::Stream stream_;
     unsigned max_rows_;
