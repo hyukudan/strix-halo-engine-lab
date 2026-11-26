@@ -1,3 +1,4 @@
+#include "strix/device/decode_geometry.hpp"
 #include "catalog_cuda_step_rows.hpp"
 
 #include "cuda_program_recipe.hpp"
@@ -13,6 +14,7 @@
 namespace strix::exec::cuda_step_rows {
 namespace {
 
+namespace geo = ::strix::device::decode_geometry;
 using graph::Op;
 using enum OperandClass;
 
@@ -23,10 +25,6 @@ weight::FormatId weight_id(Format format) {
     case Format::f32: return {"plain.f32", 1};
     default: throw std::invalid_argument("unsupported CUDA row weight format");
     }
-}
-
-Grid grid(std::uint32_t blocks, std::uint32_t threads) {
-    return {{blocks, 1, 1}, {threads, 1, 1}, 0};
 }
 
 template <class Args>
@@ -65,7 +63,7 @@ KernelBinding Bindings::bind(const Embedding& a) const {
     if (!a.weight.data || !a.ids || !a.output || a.weight.in == 0 || a.weight.out == 0)
         throw std::invalid_argument("invalid CUDA row embedding");
     const auto form = a.weight.format == Format::bf16 ? "embedding.bf16_to_f32" : "embedding.q8_to_f32";
-    return bind_leaf(thunks_, Leaf::embedding, Op::gather, form, weight_id(a.weight.format), f32_fma, grid(1, 256), a);
+    return bind_leaf(thunks_, Leaf::embedding, Op::gather, form, weight_id(a.weight.format), f32_fma, geo::embedding(1), a);
 }
 
 KernelBinding Bindings::bind(const Rms& a) const {
@@ -74,7 +72,7 @@ KernelBinding Bindings::bind(const Rms& a) const {
         a.input_view.width != a.output_view.width)
         throw std::invalid_argument("invalid CUDA row RMS");
     return bind_leaf(thunks_, Leaf::rms, Op::norm, "norm.rms", {"plain.f32", 1}, f32_fma,
-                     grid(a.input_view.groups, 256), a);
+                     geo::row_groups(a.input_view.groups), a);
 }
 
 KernelBinding Bindings::bind(const Dense& a) const {
@@ -92,13 +90,12 @@ KernelBinding Bindings::bind(const Dense& a) const {
             throw std::invalid_argument("unsupported CUDA row GEMV dimensions");
         outputs += w.out;
     }
-    constexpr std::uint32_t warps_per_fma_block = 8;
-    if (outputs > std::numeric_limits<std::uint32_t>::max() - warps_per_fma_block)
+    if (outputs > std::numeric_limits<std::uint32_t>::max() - geo::dense_warps)
         throw std::invalid_argument("CUDA row GEMV grid overflow");
-    const auto blocks = static_cast<std::uint32_t>(a.mma ? outputs / core::rows::kTileOut :
-        (outputs + warps_per_fma_block - 1) / warps_per_fma_block);
+    const auto total = static_cast<unsigned>(outputs);
+    const auto geometry = a.mma ? geo::dense_mma(total / core::rows::kTileOut) : geo::dense_fma(total);
     return bind_leaf(thunks_, Leaf::dense, Op::linear, a.up ? "rows.gate_up_silu" : "rows.multi",
-                     weight_id(weights.front().format), a.mma ? bf16_mma : f32_fma, grid(blocks, 256), a);
+                     weight_id(weights.front().format), a.mma ? bf16_mma : f32_fma, geometry, a);
 }
 
 KernelBinding Bindings::bind(const Rope& a) const {
@@ -106,14 +103,14 @@ KernelBinding Bindings::bind(const Rope& a) const {
         a.rotary_width == 0 || a.rotary_width % 2 != 0 || a.rotary_width > a.view.width)
         throw std::invalid_argument("invalid CUDA row RoPE");
     return bind_leaf(thunks_, Leaf::rope, Op::elementwise, "rope.device_position", {}, f32_fma,
-                     grid(a.view.groups, 32), a);
+                     geo::rotary(a.view.groups, 1), a);
 }
 
 KernelBinding Bindings::bind(const KvStore& a) const {
     if (!a.key || !a.value || !a.key_cache || !a.value_cache || !a.position || a.shape.kv_heads == 0)
         throw std::invalid_argument("invalid CUDA row KV append");
     return bind_leaf(thunks_, Leaf::kv_store, Op::store, "kv.bf16.linear", {}, f32_fma,
-                     grid(a.shape.kv_heads, 256), a);
+                     geo::row_groups(a.shape.kv_heads), a);
 }
 
 KernelBinding Bindings::bind(const Pick& a, Leaf leaf) const {
@@ -122,7 +119,7 @@ KernelBinding Bindings::bind(const Pick& a, Leaf leaf) const {
         throw std::invalid_argument("invalid CUDA row greedy pick");
     const bool partial = leaf == Leaf::pick_partial;
     return bind_leaf(thunks_, leaf, Op::argmax, partial ? "greedy.partial.pdl" : "greedy.final.pdl_index",
-                     {}, f32_fma, grid(partial ? head_argmax::default_chunks(a.vocabulary) : 1U, 256), a);
+                     {}, f32_fma, geo::row_groups(partial ? head_argmax::default_chunks(a.vocabulary) : 1U), a);
 }
 
 KernelBinding Bindings::bind(const Gdn& a, GdnPhase phase) const {
@@ -137,26 +134,26 @@ KernelBinding Bindings::bind(const Gdn& a, GdnPhase phase) const {
         if (blocks > std::numeric_limits<std::uint32_t>::max() / 128)
             throw std::invalid_argument("CUDA row GDN convolution grid overflow");
         return bind_leaf(thunks_, Leaf::gdn_convolution, Op::elementwise, "gdn.convolution.parity", {}, f32_fma,
-                         grid(static_cast<std::uint32_t>(blocks), 128), a);
+                         geo::gdn(static_cast<std::uint32_t>(blocks)), a);
     }
     case GdnPhase::recurrence:
         if (!a.ssm_a || !a.time_bias || !a.gain || !a.recurrent_state || !a.alpha || !a.beta || !a.z ||
             !a.output || !a.parity)
             throw std::invalid_argument("invalid CUDA row GDN recurrence");
         return bind_leaf(thunks_, Leaf::gdn_recurrence, Op::elementwise, "gdn.recurrence.parity", {}, f32_fma,
-                         grid(a.value_heads, 128), a);
+                         geo::gdn(a.value_heads), a);
     }
     throw std::invalid_argument("unknown CUDA row GDN phase");
 }
 
 KernelBinding Bindings::bind(const Attention& a, AttentionPhase phase) const {
     const auto& s = a.shape;
-    constexpr std::uint32_t chunk = 256;
+    constexpr auto chunk = geo::split_keys;
     if (s.heads == 0 || s.kv_heads == 0 || s.heads % s.kv_heads != 0 || s.heads / s.kv_heads > 8 ||
         s.width != 256 || s.capacity == 0 || s.capacity > std::numeric_limits<std::uint32_t>::max() - (chunk - 1) ||
         !a.position || !a.scratch)
         throw std::invalid_argument("unsupported CUDA row split attention dimensions");
-    const Grid chunks{{(s.capacity + chunk - 1) / chunk, s.kv_heads, 1}, {256, 1, 1}, 0};
+    const auto chunks = geo::attention_splits((s.capacity + chunk - 1) / chunk, s.kv_heads, 1);
     switch (phase) {
     case AttentionPhase::scores:
         if (!a.query || !a.key_cache || a.query_view.groups != s.heads || a.query_view.width != s.width)
@@ -172,7 +169,7 @@ KernelBinding Bindings::bind(const Attention& a, AttentionPhase phase) const {
         if (!a.output || (a.gate && (a.gate_view.groups != s.heads || a.gate_view.width != s.width)))
             throw std::invalid_argument("invalid CUDA row attention combine");
         return bind_leaf(thunks_, Leaf::attention_combine, Op::combine, "attention.decode.bf16.combine", {}, f32_fma,
-                         grid(s.heads, 256), a);
+                         geo::row_groups(s.heads), a);
     }
     throw std::invalid_argument("unknown CUDA row split attention phase");
 }

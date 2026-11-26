@@ -1,6 +1,7 @@
 #pragma once
 
 #if defined(__HIPCC__)
+#include "strix/device/decode_geometry.hpp"
 #include <hip/hip_runtime.h>
 #elif defined(__CUDACC__)
 #include <cuda_runtime.h>
@@ -44,11 +45,8 @@ __global__ void elements_kernel(std::size_t size, Transform transform) {
 template <class Transform>
 Status elements(std::size_t size, Transform transform, Stream stream) {
     if (size == 0 || size > std::numeric_limits<std::size_t>::max() / sizeof(float)) return invalid;
-    constexpr unsigned threads = 256;
-    constexpr unsigned max_blocks = 65535;
-    const auto blocks = (size - 1) / threads + 1;
-    elements_kernel<<<blocks < max_blocks ? static_cast<unsigned>(blocks) : max_blocks,
-        threads, 0, stream>>>(size, transform);
+    const device::LaunchGeometry geometry = device::decode_geometry::pointwise(size);
+    elements_kernel<<<geometry.grid<dim3>(), geometry.block<dim3>(), 0, stream>>>(size, transform);
     return last_error();
 }
 

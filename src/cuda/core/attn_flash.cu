@@ -5,6 +5,7 @@
 // registers as bf16 A fragments (the head-dimension k permutation: k step ks, quad lane q holds d = 16 ks + 4 q .. +3, the same
 // permutation on the K side, so a thread reads its 4 K values with one LDS.64). S = Q K^T; online softmax in FP32 (exp2); P (bf16) feeds
 // O += P V with V B-fragments from ldmatrix.trans. K rows are padded to 544 B (conflict-free LDS.64), V rows to 528 B (conflict-free ldmatrix).
+#include "strix/device/decode_geometry.hpp"
 #include "attn_decode.cuh"
 #include "attn_lanes.cuh"
 
@@ -38,9 +39,12 @@ constexpr auto step_position_limit = std::numeric_limits<unsigned>::max() - QB -
 // Shared-memory layouts of one K/V tile stage (byte offsets inside a stage). Both give conflict-free K LDS.64 and V ldmatrix;
 // the arithmetic per row is identical (same tiles, same order), so every layout produces the same bits.
 template <int Dim>
-struct PadLayoutShape {  // FlashPipe::pad2: two stages, prefetch distance 1, two barriers per tile.
-    static constexpr int D = Dim, KB = 2 * D + 32, VB = 2 * D + 16;
-    static constexpr int STAGES = 2, K_TILE = KT * KB, STAGE = K_TILE + KT * VB;
+struct PadLayoutShape : device::decode_geometry::PaddedFlashStorage<Dim> {
+    using Storage = device::decode_geometry::PaddedFlashStorage<Dim>;
+    using Storage::KB;
+    using Storage::VB;
+    using Storage::K_TILE;
+    static_assert(KT == Storage::keys);
     __device__ static std::uint32_t k_chunk(std::uint32_t r, std::uint32_t ch) { return r * KB + ch * 16; }
     __device__ static std::uint32_t k_read(std::uint32_t r, int ks, int q4) { return r * KB + 32 * ks + 8 * q4; }
     __device__ static std::uint32_t v_chunk(std::uint32_t key, std::uint32_t ch) { return K_TILE + key * VB + ch * 16; }
@@ -546,13 +550,15 @@ cudaError_t launch_flash_prepared(const AttentionDims& d, const PreparedBf16Flas
                                                                                    : flash_prepared_step_kernel<LY>;
         if (auto e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<LY>()); e != cudaSuccess)
             return e;
-        kernel<<<d.heads, 256, smem_bytes<LY>(), stream>>>(d, prepared, q, k_cache, v_cache, device_position, out);
+        const device::LaunchGeometry geometry = device::decode_geometry::prepared_flash(d.heads, 1, smem_bytes<LY>());
+        kernel<<<geometry.grid<dim3>(), geometry.block<dim3>(), geometry.shared_bytes, stream>>>(d, prepared, q, k_cache, v_cache, device_position, out);
         return cudaGetLastError();
     }
     const auto tiles = (rows + QB - 1U) / QB;
     if (auto e = cudaFuncSetAttribute(flash_prepared_kernel<LY, Bidirectional>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                       smem_bytes<LY>()); e != cudaSuccess) return e;
-    flash_prepared_kernel<LY, Bidirectional><<<tiles * d.heads, 256, smem_bytes<LY>(), stream>>>(
+    const device::LaunchGeometry geometry = device::decode_geometry::prepared_flash(tiles * d.heads, 1, smem_bytes<LY>());
+    flash_prepared_kernel<LY, Bidirectional><<<geometry.grid<dim3>(), geometry.block<dim3>(), geometry.shared_bytes, stream>>>(
         d, prepared, q, k_cache, v_cache, pos0, rows, out, tiles);
     return cudaGetLastError();
 }
@@ -848,7 +854,8 @@ cudaError_t prepared_step_flash(const attn_core::PreparedStepFlash& a, cudaStrea
         (a.relative_extent && !a.relative_logits)) return cudaErrorInvalidValue;
     if (auto e = cudaFuncSetAttribute(flash_prepared_step_rows<Rows, Layout>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<Layout>()); e != cudaSuccess) return e;
-    flash_prepared_step_rows<Rows, Layout><<<dim3(a.heads, Rows), 256, smem_bytes<Layout>(), stream>>>(a);
+    const device::LaunchGeometry geometry = device::decode_geometry::prepared_flash(a.heads, Rows, smem_bytes<Layout>());
+    flash_prepared_step_rows<Rows, Layout><<<geometry.grid<dim3>(), geometry.block<dim3>(), geometry.shared_bytes, stream>>>(a);
     return cudaGetLastError();
 }
 

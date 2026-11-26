@@ -6,6 +6,7 @@
 // and commutative; within a thread indices only grow, so the strict compare keeps the first maximum).
 // Launch form is a trait of the caller (Launch): plain <<<>>> launches, or programmatic dependent launch (contract in
 // src/cuda/core/common.cuh) where both kernels wait on their predecessor before their first dependent read.
+#include "strix/device/decode_geometry.hpp"
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -27,7 +28,7 @@ namespace strix::cuda::core::head_argmax {
 enum class Launch { plain, pdl };
 
 namespace detail {
-inline constexpr unsigned kThreads = 256;
+inline constexpr unsigned kThreads = device::decode_geometry::row_threads;
 
 __device__ __forceinline__ ha::Pick2 shfl_xor(const ha::Pick2& p, unsigned d) {
     ha::Pick2 o;
@@ -114,7 +115,8 @@ template <Launch L = Launch::plain, class P = ha::Pick>
 cudaError_t pick_partial(View v, cudaStream_t stream) {
     if (v.rows == 0U) return cudaSuccess;
     if (!detail::prepare_split_view(v)) return cudaErrorInvalidValue;
-    const dim3 grid(v.chunks, v.rows), block(detail::kThreads);
+    const auto geometry = device::decode_geometry::row_groups(v.chunks, v.rows);
+    const auto grid = geometry.grid<dim3>(), block = geometry.block<dim3>();
     if constexpr (L == Launch::pdl) {
         return ::strix::cuda_core::launch_pdl(detail::partial_kernel<L, P>, grid, block, stream, v);
     } else {
@@ -127,7 +129,8 @@ template <Launch L = Launch::plain, class P = ha::Pick, class Emit>
 cudaError_t pick_final(View v, Emit emit, cudaStream_t stream) {
     if (v.rows == 0U) return cudaSuccess;
     if (!detail::prepare_split_view(v)) return cudaErrorInvalidValue;
-    const dim3 grid(v.rows), block(detail::kThreads);
+    const auto geometry = device::decode_geometry::row_groups(v.rows);
+    const auto grid = geometry.grid<dim3>(), block = geometry.block<dim3>();
     if constexpr (L == Launch::pdl) {
         return ::strix::cuda_core::launch_pdl(detail::final_kernel<L, Emit, P>, grid, block, stream, v, emit);
     } else {

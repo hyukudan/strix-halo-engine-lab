@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/device/decode_geometry.hpp"
 #include "attn_core/prepared_step.hpp"
 #include "core/short_convolution.hpp"
 #include "cuda/core/step_row_store.cuh"
@@ -14,6 +15,9 @@
 #endif
 
 namespace strix::exec::cuda_decode {
+
+namespace wr2_geometry = ::strix::device::decode_geometry;
+
 
 struct StepCheckedWaveRoute {
     const StepBlock* step;
@@ -98,15 +102,14 @@ cudaError_t route(const StepCheckedWaveRoute& a, cudaStream_t stream) {
 inline BoundStepLeaf bind_step(const attn_core::PreparedStepKv& a, unsigned rows) {
     return wr2_detail::by_width(rows, [&]<unsigned R>() {
         return wr2_detail::bind<R, cuda_core::prepared_step_kv<R>>(a, "cuda-sm120-kv-append-bf16",
-            {{a.kv_heads, R, 1}, {a.width, 1, 1}, 0});
+            wr2_geometry::prepared_kv(a.kv_heads, R, a.width));
     });
 }
 
 inline BoundStepLeaf bind_step(const attn_core::PreparedStepFlash& a, unsigned rows) {
-    constexpr unsigned shared = 2U * 32U * (4U * 128U + 32U + 16U);
     return wr2_detail::by_width(rows, [&]<unsigned R>() {
         return wr2_detail::bind<R, cuda_core::prepared_step_flash<R>>(a, "cuda-sm120-prepared-attention-bf16-pad2",
-            {{a.heads, R, 1}, {256, 1, 1}, shared});
+            wr2_geometry::prepared_flash128(a.heads, R));
     });
 }
 
@@ -116,10 +119,10 @@ inline BoundStepLeaf bind_step(const attn_core::PreparedStepFinite& a, unsigned 
     const auto heads = std::size_t{rows} * a.heads;
     constexpr auto limit = std::numeric_limits<std::size_t>::max() / sizeof(float);
     if (stride == 0U || heads == 0U || heads > limit / stride) throw std::invalid_argument("invalid WR2 finite shape");
-    const auto blocks = static_cast<unsigned>(std::min<std::size_t>((heads * stride - 1U) / 256U + 1U, 65535U));
+    const auto geometry = wr2_geometry::pointwise(heads * stride);
     return wr2_detail::by_width(rows, [&]<unsigned R>() {
         return wr2_detail::bind<R, attn_core::enqueue_prepared_step_finite<R>>(a, "cuda-sm120-prepared-finite",
-            {{blocks, 1, 1}, {256, 1, 1}, 0});
+            geometry);
     });
 }
 

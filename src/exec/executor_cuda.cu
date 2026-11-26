@@ -294,7 +294,7 @@ struct CudaExecutor::Impl {
         }
 
         const auto plan = cuda_detail::capture_plan(program, binding, pdl);
-#if !defined(NDEBUG) || defined(STRIX_EXEC_VALIDATE_CAPTURE)
+#if !defined(NDEBUG) || defined(STRIX_STRICT_GRAPH_CAPTURE)
         constexpr bool check_all = true;
 #else
         constexpr bool check_all = false;

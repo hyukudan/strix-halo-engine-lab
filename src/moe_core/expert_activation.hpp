@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/device/decode_geometry.hpp"
 #include "strix/moe/activation_policy.hpp"
 #include "strix/weight/formats/scalar_float.hpp"
 
@@ -29,6 +30,13 @@ struct Args {
     std::size_t output_row{};
     const unsigned* failure{};
 };
+
+inline device::LaunchGeometry launch_geometry(std::size_t width, std::size_t rows) {
+    constexpr unsigned threads = 128;
+    constexpr std::size_t limit = 65535;
+    const auto columns = static_cast<unsigned>(std::min((width - 1) / threads + 1, limit));
+    return device::decode_geometry::row_groups(columns, static_cast<unsigned>(std::min(rows, limit)), threads);
+}
 
 inline bool fits(const Args& args, float gate_cap, float up_cap) {
     if (args.rows == 0) return true;
@@ -99,11 +107,8 @@ inline cudaError_t launch(const Args& args, float gate_cap, float up_cap, cudaSt
     if (!fits(args, gate_cap, up_cap)) return cudaErrorInvalidValue;
 #endif
 
-    constexpr unsigned threads = 128;
-    constexpr std::size_t grid_limit = 65535;
-    const auto columns = static_cast<unsigned>(std::min((args.width - 1U) / threads + 1U, grid_limit));
-    const auto rows = static_cast<unsigned>(std::min(args.rows, grid_limit));
-    detail::activate<<<dim3(columns, rows), threads, 0, stream>>>(args, {gate_cap, up_cap});
+    const auto geometry = launch_geometry(args.width, args.rows);
+    detail::activate<<<geometry.grid<dim3>(), geometry.block<dim3>(), 0, stream>>>(args, {gate_cap, up_cap});
 #if defined(__HIPCC__)
     return hipGetLastError();
 #else

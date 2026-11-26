@@ -17,7 +17,7 @@ if(STRIX_EXEC_CUDA)
 
     add_library(strix_exec_cuda STATIC src/exec/executor_cuda.cu)
     if(BUILD_TESTING)
-        target_compile_definitions(strix_exec_cuda PRIVATE STRIX_EXEC_VALIDATE_CAPTURE=1)
+        target_compile_definitions(strix_exec_cuda PRIVATE STRIX_STRICT_GRAPH_CAPTURE=1)
     endif()
     target_include_directories(strix_exec_cuda PUBLIC include src/exec)
     target_compile_features(strix_exec_cuda PUBLIC cxx_std_20)

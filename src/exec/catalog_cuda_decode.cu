@@ -1,3 +1,4 @@
+#include "strix/device/decode_geometry.hpp"
 #include "catalog_cuda_decode.hpp"
 
 #include "core/row_transforms.hpp"
@@ -29,6 +30,7 @@
 namespace strix::exec::cuda_decode {
 namespace {
 
+namespace geo = ::strix::device::decode_geometry;
 namespace residual = core::residual_mix;
 namespace transforms = core::row_transforms;
 namespace cuda = cuda_core;
@@ -128,6 +130,15 @@ cudaError_t enqueue(const residual::ControllerArgs& a, cudaStream_t stream) {
 
 cudaError_t enqueue(const residual::BankBatchArgs& a, cudaStream_t stream) {
     return ::strix::cuda::mix::enqueue_batch(a, stream);
+}
+
+struct BoundTransition {
+    residual::TransitionArgs args;
+    ::strix::cuda::mix::TransitionGrid grid;
+};
+
+cudaError_t enqueue(const BoundTransition& bound, cudaStream_t stream) {
+    return ::strix::cuda::mix::enqueue_transition(bound.args, bound.grid, stream);
 }
 
 cudaError_t enqueue(const residual::TransitionArgs& a, cudaStream_t stream) {
@@ -663,8 +674,7 @@ KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite
 Grid pointwise_grid(std::size_t elements) {
     if (elements == 0 || elements > std::numeric_limits<std::size_t>::max() / sizeof(float))
         throw std::invalid_argument("invalid CUDA decode pointwise size");
-    const auto blocks = static_cast<unsigned>(std::min<std::size_t>((elements - 1U) / 256U + 1U, 65535U));
-    return {{blocks, 1, 1}, {256, 1, 1}, 0};
+    return geo::pointwise(elements);
 }
 
 // Packed codes and scale planes are counted once per logical matrix operand.
@@ -685,26 +695,25 @@ LaunchSite packed_projection_cost(MatrixFormat format, std::uint64_t inputs, std
 std::span<const KernelEntry> entries() noexcept { return catalogue; }
 
 KernelBinding bind(const Embedding& a) {
-    return bind_leaf(embed, {{1, 1, 1}, {256, 1, 1}, 0}, a,
+    return bind_leaf(embed, geo::embedding(1), a,
         {.weight_bytes = std::uint64_t{a.width} * sizeof(std::uint16_t), .state_bytes = sizeof(*a.token), .scratch = {},
          .bytes_written = std::uint64_t{a.width} * sizeof(float)});
 }
 
 KernelBinding bind(const RmsBf16& a) {
-    return bind_leaf(rms_bf16, {{a.groups, 1, 1}, {256, 1, 1}, 0}, a);
+    return bind_leaf(rms_bf16, geo::row_groups(a.groups), a);
 }
 
 KernelBinding bind(const AppendKvBf16& a) {
     if (!a.position) throw std::invalid_argument("missing device position for CUDA KV step");
-    return bind_leaf(kv_store, {{a.kv_heads, 1, 1}, {std::min(a.width, 256U), 1, 1}, 0}, a);
+    return bind_leaf(kv_store, geo::prepared_kv(a.kv_heads, 1, a.width), a);
 }
 
 KernelBinding bind(const PreparedFlashBf16& a) {
     if (!a.position) throw std::invalid_argument("missing device position for CUDA prepared flash step");
     // One position-driven CTA per head. PadLayoutShape<128> in attn_flash.cu
     // reserves two 32-key stages, with 32 and 16 padding bytes for K and V.
-    constexpr auto shared = 2U * 32U * (4U * prepared_head_width + 32U + 16U);
-    return bind_leaf(flash, {{a.heads, 1, 1}, {256, 1, 1}, shared}, a);
+    return bind_leaf(flash, geo::prepared_flash128(a.heads, 1), a);
 }
 
 KernelBinding bind(const PreparedFlashSplitBf16& s) {
@@ -749,39 +758,51 @@ KernelBinding bind(const CausalConvolution& a) {
 
 KernelBinding bind(const HeadClipBf16& a) {
     if (a.heads == 0 || a.width == 0 || a.width > 256) throw std::invalid_argument("invalid CUDA R1 head clip");
-    const auto threads = a.width <= 32 ? 32U : a.width <= 128 ? 128U : 256U;
-    return bind_leaf(head_clip, {{a.heads, 1, 1}, {threads, 1, 1}, 0}, a);
+    return bind_leaf(head_clip, geo::head_clip(a.heads, 1, a.width), a);
 }
 
 KernelBinding bind(const residual::NormalizeArgs& a) {
     if (a.rows != 1 || !residual::fits(a)) throw std::invalid_argument("invalid CUDA R1 residual norm");
-    return bind_leaf(bank_norm, {{1, 1, 1}, {residual::detail::kThreads, 1, 1}, 0}, a);
+    return bind_leaf(bank_norm, residual::normalize_geometry(a.rows, 1), a);
 }
 
 KernelBinding bind(const residual::MixArgs& a) {
     if (a.rows != 1 || !residual::fits(a)) throw std::invalid_argument("invalid CUDA R1 residual mix");
     namespace readout = ::strix::cuda::mix::detail;
-    const auto threads = a.bank_count > 1 ? readout::kPairedLanes : readout::kLanes;
-    return bind_leaf(bank_mix, {{1, 1, 1}, {threads, a.bank_count, 1}, 0}, a);
+    return bind_leaf(bank_mix, readout::bank_geometry(a), a);
 }
 
 KernelBinding bind(const residual::BankBatchArgs& a) {
     const auto grid = ::strix::cuda::mix::latency_batch_grid(a);
     if (grid.tiles == 0U) throw std::invalid_argument("invalid CUDA R1 residual bank batch");
-    return bind_leaf(bank_batch, {{grid.tiles, grid.queries, 1}, {::strix::cuda::mix::kLatencyBankThreads, grid.banks, 1}, 0}, a);
+    return bind_leaf(bank_batch, ::strix::cuda::mix::latency_geometry(grid), a);
 }
 
-KernelBinding bind(const residual::TransitionArgs& a) {
-    const auto grid = ::strix::cuda::mix::transition_grid(a);
+namespace {
+
+KernelBinding bind_transition(const residual::TransitionArgs& a, const ::strix::cuda::mix::TransitionGrid& grid) {
     if (grid.slices == 0U) throw std::invalid_argument("invalid CUDA R1 residual transition");
     const auto width = std::uint64_t{a.mix.width};
     const auto rows_written = std::uint64_t{a.mix.query_count} + residual::norm_count(a) + (residual::has_prologue(a) ? 1U : 0U);
-    const auto smem = static_cast<std::uint32_t>(grid.smem);
-    return bind_leaf(transition, {{grid.tiles, 1, 1}, {grid.threads, grid.slices, 1}, smem}, a,
+    return bind_leaf(transition, ::strix::cuda::mix::transition_geometry(grid), BoundTransition{a, grid},
         {.weight_bytes = (std::uint64_t{a.mix.query_count} + residual::norm_count(a)) * width * sizeof(float),
          .state_bytes = (std::uint64_t{a.mix.bank_count} + (residual::has_prologue(a) ? 2U : 0U)) * width * sizeof(float),
          .scratch = {},
          .bytes_written = rows_written * width * sizeof(float)});
+}
+
+}  // namespace
+
+KernelBinding bind(const residual::TransitionArgs& a) {
+    ::strix::cuda::mix::TransitionGrid grid{};
+    const auto status = ::strix::cuda::mix::resolve_transition_grid(a, grid);
+    if (status == cudaErrorInvalidValue) throw std::invalid_argument("invalid CUDA R1 residual transition");
+    device::native::check(status, "resolve CUDA transition geometry");
+    return bind_transition(a, grid);
+}
+
+KernelBinding bind(const residual::TransitionArgs& a, std::size_t dynamic_budget) {
+    return bind_transition(a, ::strix::cuda::mix::transition_grid(a, dynamic_budget));
 }
 
 KernelBinding bind(const residual::AddArgs& a) {
@@ -836,12 +857,12 @@ KernelBinding bind(const Bf16DenseGroup& a) {
                           .macs = macs, .scratch = {}, .bytes_written = std::uint64_t{outputs} * sizeof(float)};
     if (mma) {
         const auto leaf = round_output ? linear_mma3_round : linear_mma3;
-        return bind_leaf(leaf, {{outputs / core::rows::kTileOut, 1, 1}, {256, 1, 1}, 0}, a, cost);
+        return bind_leaf(leaf, geo::dense_mma(outputs / core::rows::kTileOut), a, cost);
     }
     // dense.cu by_rows<bf16, false> uses one output per warp at R1.
     if (outputs > std::numeric_limits<std::uint32_t>::max() - 7U)
         throw std::invalid_argument("CUDA R1 dense group exceeds the FP32 launch range");
-    return bind_leaf(linear_fp32, {{(outputs + 7U) / 8U, 1, 1}, {256, 1, 1}, 0}, a, cost);
+    return bind_leaf(linear_fp32, geo::dense_fma(outputs), a, cost);
 }
 
 std::vector<KernelBinding> bind_projection_batch(const core::Bf16ProjectionBatch& batch, const device::Profile& profile) {
@@ -871,7 +892,7 @@ std::vector<KernelBinding> bind_projection_batch(const core::Bf16ProjectionBatch
         const auto plan = rows::plan({std::span(jobs).first(count), 1, 0, rows::Packing::fewest_launches}, profile);
         for (const auto& launch : plan.launches()) {
             const auto args = cuda::mma_group_args(launch, cuda::kRowsAddResidual, cuda::kRowsRoundBf16);
-            auto leaf = bind_leaf(linear_independent, {{launch.tiles.total(), 1, 1}, {256, 1, 1}, 0}, args);
+            auto leaf = bind_leaf(linear_independent, geo::dense_mma(launch.tiles.total()), args);
             // Encode which outputs are rounded in the chain identity used by the recipe/compiler.
             for (unsigned j = 0; j < args.tiles.count; ++j) leaf.chain_identity += args.jobs[j].round_bf16 ? 'r' : 'f';
             leaves.push_back(std::move(leaf));
@@ -884,7 +905,7 @@ KernelBinding bind(const Bf16Fp32Epilogue& a) {
     if (!valid(a)) throw std::invalid_argument("invalid CUDA R1 FP32 dense epilogue");
     const auto outputs = a.dense.projections[0].outputs;
     const auto leaf = a.form == graph::Form::softcap ? linear_fp32_softcap : linear_fp32_round;
-    return bind_leaf(leaf, {{(outputs - 1U) / 8U + 1U, 1, 1}, {256, 1, 1}, 0}, a);
+    return bind_leaf(leaf, geo::dense_fma(outputs), a);
 }
 
 KernelBinding bind(const RoundedCausalConvolution& a) {
@@ -898,7 +919,7 @@ KernelBinding bind(const RoundedCausalConvolution& a) {
 KernelBinding bind(const residual::NormalizePairArgs& a) {
     if (a.first.rows != 1U || a.second.rows != 1U || !residual::fits(a.first) || !residual::fits(a.second))
         throw std::invalid_argument("invalid CUDA R1 controller pair norm");
-    return bind_leaf(controller_pair, {{1, 2, 1}, {residual::detail::kThreads, 1, 1}, 0}, a);
+    return bind_leaf(controller_pair, residual::normalize_geometry(a.first.rows, 2), a);
 }
 
 namespace {
@@ -943,7 +964,7 @@ KernelBinding bind(const PackedDownCombine& a) {
 KernelBinding bind(const BankReadoutTiled& a) {
     if (!fits(a)) throw std::invalid_argument("invalid CUDA R1 tiled bank readout");
     const auto grid = ::strix::cuda::mix::latency_grid(a.args);
-    return bind_leaf(bank_mix_tiled, {{grid.tiles, grid.queries, 1}, {::strix::cuda::mix::kLatencyBankThreads, grid.banks, 1}, 0},
+    return bind_leaf(bank_mix_tiled, ::strix::cuda::mix::latency_geometry(grid),
         a, {.scratch = {}, .bytes_written = std::uint64_t{a.args.query_count} * a.args.width * sizeof(float)});
 }
 
@@ -996,13 +1017,13 @@ KernelBinding bind(const PackedDownCombineTail& a) {
 }
 
 KernelBinding bind(const GreedyPartial& a) {
-    return bind_leaf(greedy_part, {{greedy_chunks(a), 1, 1}, {argmax::detail::kThreads, 1, 1}, 0}, a);
+    return bind_leaf(greedy_part, geo::row_groups(greedy_chunks(a)), a);
 }
 
 KernelBinding bind(const GreedyFinal& a) {
     (void)greedy_chunks(a.reduction);
     if (!a.output) throw std::invalid_argument("missing CUDA R1 greedy output");
-    return bind_leaf(greedy_final, {{1, 1, 1}, {argmax::detail::kThreads, 1, 1}, 0}, a);
+    return bind_leaf(greedy_final, geo::row_groups(1), a);
 }
 
 namespace {
@@ -1018,7 +1039,7 @@ const screen_plan::Launch& checked(const screen_plan::Launch& a) {
 
 KernelBinding bind(const ScreenedHeadPrep& a) {
     const auto& l = checked(a.launch);
-    return bind_leaf(screened_prep, {{l.lanes, 1, 1}, {256, 1, 1}, 0}, a,
+    return bind_leaf(screened_prep, screen_plan::lane_grid(l), a,
         {.state_bytes = std::uint64_t{l.lanes} * l.head.width * sizeof(float),
          .scratch = {}, .bytes_written = std::uint64_t{l.lanes} * sizeof(screen_plan::State)});
 }
@@ -1038,38 +1059,37 @@ KernelBinding bind(const ScreenedHeadPass1& a) {
 
 KernelBinding bind(const ScreenedHeadCompact& a) {
     const auto& l = checked(a.launch);
-    return bind_leaf(screened_compact, {{l.grids.compact, l.lanes, 1}, {screen_plan::kCompactThreads, 1, 1}, 0}, a,
+    return bind_leaf(screened_compact, screen_plan::compact_grid(l), a,
         {.state_bytes = std::uint64_t{l.lanes} * l.head.rows * sizeof(float), .scratch = {}});
 }
 
 KernelBinding bind(const ScreenedHeadPass2& a) {
     const auto& l = checked(a.launch);
-    return bind_leaf(screened_pass2, {{l.grids.pass2, l.lanes, 1}, {256, 1, 1}, 0}, a);
+    return bind_leaf(screened_pass2, screen_plan::pass2_grid(l), a);
 }
 
 KernelBinding bind(const ScreenedHeadPick& a) {
     const auto& l = checked(a.launch);
     if (!a.output) throw std::invalid_argument("missing CUDA screened head output");
-    return bind_leaf(screened_pick, {{l.lanes, 1, 1}, {256, 1, 1}, 0}, a,
+    return bind_leaf(screened_pick, screen_plan::lane_grid(l), a,
         {.scratch = {}, .bytes_written = std::uint64_t{l.lanes} * sizeof(std::uint32_t)});
 }
 
 KernelBinding bind(const ScreenedHeadPickRows& a) {
     const auto& l = checked(a.launch);
     if (!a.output || !l.runner_up) throw std::invalid_argument("CUDA screened head rows pick needs a runner-up launch");
-    return bind_leaf(screened_pick_rows, {{l.lanes, 1, 1}, {256, 1, 1}, 0}, a,
+    return bind_leaf(screened_pick_rows, screen_plan::lane_grid(l), a,
         {.scratch = {}, .bytes_written = std::uint64_t{l.lanes} * sizeof(RowOut)});
 }
 
 KernelBinding bind(const AppendKvHostBf16& a) {
     if (a.args.position) throw std::invalid_argument("host-position KV append has a device position");
-    return bind_leaf(kv_store_host, {{a.args.kv_heads, 1, 1}, {std::min(a.args.width, 256U), 1, 1}, 0}, a);
+    return bind_leaf(kv_store_host, geo::prepared_kv(a.args.kv_heads, 1, a.args.width), a);
 }
 
 KernelBinding bind(const PreparedFlashHostBf16& a) {
     if (a.args.position) throw std::invalid_argument("host-position prepared flash has a device position");
-    constexpr auto shared = 2U * 32U * (4U * prepared_head_width + 32U + 16U);
-    return bind_leaf(flash_host, {{a.args.heads, 1, 1}, {256, 1, 1}, shared}, a);
+    return bind_leaf(flash_host, geo::prepared_flash128(a.args.heads, 1), a);
 }
 
 KernelBinding bind(const grouped_rows::GatherArgs& a) {
@@ -1095,8 +1115,7 @@ KernelBinding bind(const GroupedProjection& a) {
 KernelBinding bind(const GroupedActivation& a) {
     if (a.args.rows == 0 || !moe_core::expert_activation::fits(a.args, a.gate_cap, a.up_cap))
         throw std::invalid_argument("invalid CUDA grouped activation");
-    return bind_leaf(group_activation, {{static_cast<unsigned>((a.args.width - 1U) / 128U + 1U),
-        static_cast<unsigned>(a.args.rows), 1}, {128, 1, 1}, 0}, a);
+    return bind_leaf(group_activation, moe_core::expert_activation::launch_geometry(a.args.width, a.args.rows), a);
 }
 
 KernelBinding bind(const grouped_rows::CombineArgs& a) {

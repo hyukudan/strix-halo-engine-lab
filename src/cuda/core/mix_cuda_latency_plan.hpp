@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/device/decode_geometry.hpp"
 #include "core/mix_latency_plan.hpp"
 #include "core/residual_mix.hpp"
 
@@ -12,6 +13,10 @@ inline constexpr unsigned kLatencyBankThreads = 128U;
 inline constexpr unsigned kLatencyMaxWidth = 4096U;
 
 using LatencyGrid = ::strix::core::residual_mix::LatencyGrid;
+
+inline device::LaunchGeometry latency_geometry(LatencyGrid grid) {
+    return {{grid.tiles, grid.queries, 1}, {kLatencyBankThreads, grid.banks, 1}, 0};
+}
 
 [[nodiscard]] inline LatencyGrid latency_grid(const ::strix::core::residual_mix::MixArgs& args) {
     return ::strix::core::residual_mix::latency_grid(args, kLatencyTile, kLatencyMaxWidth);

@@ -1,3 +1,4 @@
+#include "strix/device/decode_geometry.hpp"
 #include "lookup_cuda.cuh"
 
 #include "cuda/weight/arch/sm120_sources.cuh"
@@ -100,9 +101,10 @@ __global__ void gather(View v, Ids ids) {
 
 template <Form F, class Ids>
 cudaError_t launch(View v, Ids ids, cudaStream_t stream) {
-    constexpr unsigned threads = 256;
-    if (v.programmatic) return cc::launch_pdl(gather<F, Ids>, dim3(v.rows), dim3(threads), stream, v, ids);
-    gather<F, Ids><<<v.rows, threads, 0, stream>>>(v, ids);
+    const device::LaunchGeometry geometry = device::decode_geometry::embedding(v.rows);
+    const auto grid = geometry.grid<dim3>(), block = geometry.block<dim3>();
+    if (v.programmatic) return cc::launch_pdl(gather<F, Ids>, grid, block, stream, v, ids);
+    gather<F, Ids><<<grid, block, 0, stream>>>(v, ids);
     return cudaGetLastError();
 }
 

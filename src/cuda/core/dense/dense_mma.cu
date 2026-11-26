@@ -5,6 +5,7 @@
 // ascending warp order. q8_0: int8 values are exact in bf16; each 32-block partial starts from zero and is folded into the
 // running sum as tot = tot + fl(d * part), blocks ascending per warp. Thread-level k permutation: thread q of a quad owns 8
 // consecutive k of the 32-block (same permutation for A and B, so the sum is unchanged).
+#include "strix/device/decode_geometry.hpp"
 #include "dense_mma.hpp"
 #include "rows_bf16_narrow.cuh"
 #include "core/dense_bf16_narrow_plan.hpp"
@@ -283,7 +284,8 @@ __global__ void __launch_bounds__(256) mma_kernel(const __grid_constant__ MmaGro
 
 template <WeightFormat F>
 cudaError_t grouped_by_nt(const MmaGroupArgs& args, std::uint32_t row_count, cudaStream_t stream) {
-    const dim3 grid(args.tiles.total()), block(256);
+    const device::LaunchGeometry geometry = device::decode_geometry::dense_mma(args.tiles.total());
+    const auto grid = geometry.grid<dim3>(), block = geometry.block<dim3>();
     if (row_count <= 8) return launch_pdl(mma_kernel<F, 1>, grid, block, stream, args, row_count);
     if (row_count <= 16) return launch_pdl(mma_kernel<F, 2>, grid, block, stream, args, row_count);
     if (row_count <= 24) return launch_pdl(mma_kernel<F, 3>, grid, block, stream, args, row_count);
@@ -292,7 +294,8 @@ cudaError_t grouped_by_nt(const MmaGroupArgs& args, std::uint32_t row_count, cud
 
 template <WeightFormat F, int NT, int TERMS, bool FUSED, bool RoundBf16 = false>
 cudaError_t go(const MmaCall& c, const MmaArgs& ma, std::uint32_t tiles, cudaStream_t s) {
-    return launch_pdl(mma_kernel<F, NT, TERMS, FUSED, RoundBf16>, dim3(tiles), dim3(256), s, ma, c.w1, c.x, c.residual, c.in, c.rows);
+    const device::LaunchGeometry geometry = device::decode_geometry::dense_mma(tiles);
+    return launch_pdl(mma_kernel<F, NT, TERMS, FUSED, RoundBf16>, geometry.grid<dim3>(), geometry.block<dim3>(), s, ma, c.w1, c.x, c.residual, c.in, c.rows);
 }
 template <WeightFormat F, int TERMS, bool FUSED, bool RoundBf16 = false>
 cudaError_t by_nt(const MmaCall& c, const MmaArgs& ma, std::uint32_t tiles, cudaStream_t s) {

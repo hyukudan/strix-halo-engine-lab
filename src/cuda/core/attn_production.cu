@@ -1,5 +1,6 @@
 // GQA decode attention over a BF16 KV cache, rows 1..32 with causal masking inside the window. See attention.hpp.
 // Three kernels (scores, values, combine) parallel over position chunks; the reduction order is defined per 256-position chunk.
+#include "strix/device/decode_geometry.hpp"
 #include "attn_decode.cuh"
 #include "attn_core/prepared_step.hpp"
 #include "attn_lanes.cuh"
@@ -653,7 +654,9 @@ cudaError_t decode_attention(const AttentionDims& d, const float* q, const Group
     // the device's measured table (none: one row per block); shared walks run as a persistent item loop on a grid of two
     // resident waves (no block without work).
     RowWalk rs, rv;
-    dim3 gs(mc, d.kv_heads, rows), gvd(mc, d.kv_heads, rows);
+    const auto splits = device::decode_geometry::attention_splits(mc, d.kv_heads, rows);
+    auto gs = splits.grid<dim3>(), gvd = gs;
+    const auto block = splits.block<dim3>();
     const DecodeRowShare mode = rows > 1 ? decode_row_share() : DecodeRowShare::off;
     const attn_row_share::DeviceTable* table = mode == DecodeRowShare::automatic ? row_share_table(d) : nullptr;
     const std::uint32_t cs = walk_cap(mode, table, rows, kScoreWalkRows), cv = walk_cap(mode, table, rows, value_walk_rows(GT));
@@ -670,15 +673,18 @@ cudaError_t decode_attention(const AttentionDims& d, const float* q, const Group
         }
     }
     if (!OnePhase || phase == AttentionDecodePhase::scores) {
-        const auto e = launch_pdl(attn_scores_kernel<GT, SELF, Position>, gs, dim3(256), stream, d, q, qv, k_cache, pos0, rows, sc, rm, rs, qvec);
+        const auto e = launch_pdl(attn_scores_kernel<GT, SELF, Position>, gs, block, stream, d, q, qv, k_cache, pos0, rows, sc, rm, rs, qvec);
         if (OnePhase || e != cudaSuccess) return e;
     }
     if (!OnePhase || phase == AttentionDecodePhase::values) {
-        const auto e = launch_pdl(attn_values_kernel<GT, SELF, Position>, gvd, dim3(256), stream, d, v_cache, pos0, rows, sc, rm, rv);
+        const auto e = launch_pdl(attn_values_kernel<GT, SELF, Position>, gvd, block, stream, d, v_cache, pos0, rows, sc, rm, rv);
         if (OnePhase || e != cudaSuccess) return e;
     }
-    if (!OnePhase || phase == AttentionDecodePhase::combine)
-        return launch_pdl(attn_combine_kernel<Position>, dim3(d.heads, rows), dim3(256), stream, d, gate, gv, pos0, out, sc, rm);
+    if (!OnePhase || phase == AttentionDecodePhase::combine) {
+        const device::LaunchGeometry geometry = device::decode_geometry::row_groups(d.heads, rows);
+        return launch_pdl(attn_combine_kernel<Position>, geometry.grid<dim3>(), geometry.block<dim3>(), stream,
+                          d, gate, gv, pos0, out, sc, rm);
+    }
     return cudaErrorInvalidValue;
 }
 
@@ -726,7 +732,8 @@ DecodeRowShare decode_row_share() {
 cudaError_t kv_store(const AttentionDims& d, const float* k, const float* v, __nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
                      const std::uint32_t* pos0, std::uint32_t rows, cudaStream_t stream, const RowMap& rm) {
     if (rows == 0) return cudaErrorInvalidValue;
-    return launch_pdl(rm.self ? kv_store_kernel<true> : kv_store_kernel<false>, dim3(d.kv_heads, rows), dim3(256), stream, d, k, v, k_cache, v_cache, pos0, rm);
+    const device::LaunchGeometry geometry = device::decode_geometry::row_groups(d.kv_heads, rows);
+    return launch_pdl(rm.self ? kv_store_kernel<true> : kv_store_kernel<false>, geometry.grid<dim3>(), geometry.block<dim3>(), stream, d, k, v, k_cache, v_cache, pos0, rm);
 }
 
 namespace {
@@ -772,13 +779,13 @@ cudaError_t kv_store_prepared_bf16(const AttentionDims& d, const float* k, const
     if (!prepared_store_admits(d, k, v, k_cache, v_cache, pos0, rows, wrapped) || (device_position && rows != 1U)) {
         return cudaErrorInvalidValue;
     }
-    const auto grid_rows = rows < kMaxStoreGridRows ? rows : kMaxStoreGridRows;
-    const auto threads = d.head_dim < 256U ? d.head_dim : 256U;
+    const device::LaunchGeometry geometry = device::decode_geometry::prepared_kv(d.kv_heads, rows, d.head_dim);
+    const auto grid = geometry.grid<dim3>(), block = geometry.block<dim3>();
     if (device_position) {
-        kv_store_prepared_step_kernel<<<d.kv_heads, threads, 0, stream>>>(d, k, v, k_cache, v_cache,
+        kv_store_prepared_step_kernel<<<grid, block, 0, stream>>>(d, k, v, k_cache, v_cache,
                                                                          device_position, wrapped);
     } else {
-        kv_store_prepared_kernel<<<dim3(d.kv_heads, grid_rows), threads, 0, stream>>>(
+        kv_store_prepared_kernel<<<grid, block, 0, stream>>>(
             d, k, v, k_cache, v_cache, pos0, rows, wrapped);
     }
     return cudaGetLastError();
@@ -788,7 +795,8 @@ template <unsigned Rows>
 cudaError_t prepared_step_kv(const attn_core::PreparedStepKv& a, cudaStream_t stream) {
     if (!a.step || !a.keys || !a.values || a.kv_heads == 0U || a.width == 0U ||
         a.width > 256U || !attn_core::valid_prepared_cache(a.cache, a.kv_heads, a.width)) return cudaErrorInvalidValue;
-    kv_store_prepared_step_rows<Rows><<<dim3(a.kv_heads, Rows), a.width, 0, stream>>>(a);
+    const device::LaunchGeometry geometry = device::decode_geometry::prepared_kv(a.kv_heads, Rows, a.width);
+    kv_store_prepared_step_rows<Rows><<<geometry.grid<dim3>(), geometry.block<dim3>(), 0, stream>>>(a);
     return cudaGetLastError();
 }
 

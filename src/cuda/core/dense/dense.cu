@@ -1,4 +1,5 @@
 // Dense rows 1..16: BF16 / Q8_0 / F32 weights, FP32 accumulation in the fixed order documented in dense.hpp.
+#include "strix/device/decode_geometry.hpp"
 #include "../head_argmax.cuh"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/cuda_core/nvfp4.hpp"
@@ -130,7 +131,7 @@ __device__ __forceinline__ void dot_any(const void* w, std::uint32_t o, const fl
 // Up to four weights sharing x (and format/in) are served by ONE launch: warp g of the grid owns global output row g, mapped to
 // (weight j, row o). The per-row arithmetic does not depend on the mapping.
 constexpr int kMaxMulti = 4;
-constexpr int kWarpsPerBlock = 8;  // 128-thread blocks: finer grid -> less wave-quantisation tail on 188 SMs
+constexpr int kWarpsPerBlock = device::decode_geometry::dense_warps;
 struct MultiArgs {
     const void* w[kMaxMulti];
     float* y[kMaxMulti];
@@ -247,13 +248,13 @@ template <WeightFormat F, int R, bool FUSED, int ORO, bool RowGrid = false>
 cudaError_t launch(const MultiArgs& ma, const void* w1, const float* x, const float* resid, std::uint32_t in, std::uint32_t rows,
                    cudaStream_t s) {
     const std::uint32_t total = ma.row_end[kMaxMulti - 1];
+    const device::LaunchGeometry geometry = device::decode_geometry::dense_fma(total, RowGrid ? (rows - 1) / R + 1 : 1U);
+    const auto grid = geometry.grid<dim3>(), block = geometry.block<dim3>();
     if constexpr (RowGrid) {
-        const dim3 grid((total - 1) / kWarpsPerBlock + 1, (rows - 1) / R + 1);
-        return launch_pdl(dense_kernel<F, R, FUSED, ORO, true>, grid, dim3(kWarpsPerBlock * 32), s,
+        return launch_pdl(dense_kernel<F, R, FUSED, ORO, true>, grid, block, s,
                           ma, w1, x, resid, in, rows);
     } else {
-        return launch_pdl(dense_kernel<F, R, FUSED, ORO>, dim3((total + kWarpsPerBlock - 1) / kWarpsPerBlock),
-                          dim3(kWarpsPerBlock * 32), s, ma, w1, x, resid, in, rows);
+        return launch_pdl(dense_kernel<F, R, FUSED, ORO>, grid, block, s, ma, w1, x, resid, in, rows);
     }
 }
 
@@ -359,7 +360,8 @@ cudaError_t dense_bf16_fp32_r1_epilogue(const std::uint16_t* weights, const floa
     args.y[0] = output;
     args.out[0] = out;
     for (auto& end : args.row_end) end = out;
-    const dim3 grid((out - 1U) / kWarpsPerBlock + 1U), block(kWarpsPerBlock * 32);
+    const device::LaunchGeometry geometry = device::decode_geometry::dense_fma(out);
+    const auto grid = geometry.grid<dim3>(), block = geometry.block<dim3>();
     switch (store) {
     case Bf16Fp32Store::round:
         return launch_pdl(dense_bf16_fp32_r1_store<Bf16Fp32Store::round>, grid, block, stream, args, input, in, 0.0F);
@@ -380,7 +382,8 @@ cudaError_t dense_bf16_fp32_r1_mapped_epilogue(const std::uint16_t* weights, con
         (lane_count > 1U && (lanes.x < in || lanes.x % 4U != 0U || lanes.y == 0 || lanes.ids < capacity ||
                              lanes.count == 0)))
         return cudaErrorInvalidValue;
-    const dim3 grid(blocks, lane_count), block(kWarpsPerBlock * 32);
+    const device::LaunchGeometry geometry = device::decode_geometry::row_groups(blocks, lane_count, kWarpsPerBlock * 32);
+    const auto grid = geometry.grid<dim3>(), block = geometry.block<dim3>();
     switch (store) {
     case Bf16Fp32Store::round:
         dense_bf16_fp32_r1_mapped<Bf16Fp32Store::round><<<grid, block, 0, stream>>>(weights, input, output, ids, count,
@@ -496,7 +499,8 @@ cudaError_t dense_gate_up_silu_rows(const DenseWeight& gate, const DenseWeight& 
 cudaError_t embedding_rows(const DenseWeight& table, const std::uint32_t* ids, float* out, std::uint32_t rows,
                            cudaStream_t stream) {
     if (table.data == nullptr || rows == 0) return cudaErrorInvalidValue;
-    return launch_pdl(embedding_kernel, dim3(rows), dim3(256), stream, static_cast<const unsigned char*>(table.data), table.format, table.in, ids, out);
+    const device::LaunchGeometry geometry = device::decode_geometry::embedding(rows);
+    return launch_pdl(embedding_kernel, geometry.grid<dim3>(), geometry.block<dim3>(), stream, static_cast<const unsigned char*>(table.data), table.format, table.in, ids, out);
 }
 
 cudaError_t argmax_rows(const float* logits, std::uint32_t vocab, std::uint32_t rows, std::uint32_t* out, void* workspace,

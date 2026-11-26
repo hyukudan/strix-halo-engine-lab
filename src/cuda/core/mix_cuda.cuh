@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/device/decode_geometry.hpp"
 #include "core/residual_mix.hpp"
 #include "step_rows.cuh"
 
@@ -51,10 +52,16 @@ __global__ void bank_softmax_step(MixArgs args, core::StepRows<Width> binding) {
 #include "mix_body.inc"
 }
 
+inline device::LaunchGeometry bank_geometry(const MixArgs& args) {
+    const bool parallel = args.rows <= 2U && args.bank_count > 1U;
+    return {{std::min(args.rows, kGridLimit), 1, 1},
+            {parallel ? kPairedLanes : kLanes, parallel ? args.bank_count : 1U, 1}, 0};
+}
+
 template <bool ParallelBanks>
 cudaError_t enqueue_schedule(const MixArgs& args, cudaStream_t stream) {
-    const auto blocks = std::min(args.rows, kGridLimit);
-    const dim3 threads = ParallelBanks ? dim3(kPairedLanes, args.bank_count) : dim3(kLanes);
+    const auto geometry = bank_geometry(args);
+    const auto blocks = geometry.grid<dim3>(), threads = geometry.block<dim3>();
     if (args.normalized) bank_softmax<true, ParallelBanks><<<blocks, threads, 0, stream>>>(args);
     else bank_softmax<false, ParallelBanks><<<blocks, threads, 0, stream>>>(args);
     return cudaGetLastError();
@@ -71,7 +78,7 @@ cudaError_t enqueue_schedule(const MixArgs& args, cudaStream_t stream) {
     constexpr auto max_width = std::numeric_limits<unsigned>::max() - detail::kMaxOutputStride + 1U;
     if (!::strix::core::residual_mix::fits(args) || args.width > max_width)
         return cudaErrorInvalidValue;
-    if (args.rows <= 2U && args.bank_count > 1U) return detail::enqueue_schedule<true>(args, stream);
+    if (detail::bank_geometry(args).threads[1] > 1U) return detail::enqueue_schedule<true>(args, stream);
     return detail::enqueue_schedule<false>(args, stream);
 }
 

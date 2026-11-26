@@ -1,4 +1,5 @@
 // RMSNorm (stored gain), gated RMSNorm, per-group l2norm, residual add. Reduction order documented in norms.hpp.
+#include "strix/device/decode_geometry.hpp"
 #include "strix/cuda_core/norms.hpp"
 #include "../../../core/pointwise.hpp"
 
@@ -45,15 +46,16 @@ cudaError_t run(const float* x, const GroupedView& xv, const Gain<M>* gain, cons
                 const GroupedView& yv, float eps, float scale, cudaStream_t s) {
     if (!same_shape(xv, yv) || xv.n == 0 || xv.rows == 0 || xv.groups == 0) return cudaErrorInvalidValue;
     if (xv.groups > 65535u * 1u && false) return cudaErrorInvalidValue;
-    const dim3 grid(xv.groups, xv.rows);
+    const device::LaunchGeometry geometry = device::decode_geometry::row_groups(xv.groups, xv.rows);
+    const auto grid = geometry.grid<dim3>(), block = geometry.block<dim3>();
     const std::uint32_t nreg = (xv.n + 255) / 256;
-    if (nreg <= 1) launch_pdl(norm_kernel<M, 1>, grid, dim3(256), s, x, xv, gain, z, zv, y, yv, eps, scale);
-    else if (nreg <= 2) launch_pdl(norm_kernel<M, 2>, grid, dim3(256), s, x, xv, gain, z, zv, y, yv, eps, scale);
-    else if (nreg <= 4) launch_pdl(norm_kernel<M, 4>, grid, dim3(256), s, x, xv, gain, z, zv, y, yv, eps, scale);
-    else if (nreg <= 8) launch_pdl(norm_kernel<M, 8>, grid, dim3(256), s, x, xv, gain, z, zv, y, yv, eps, scale);
-    else if (nreg <= 16) launch_pdl(norm_kernel<M, 16>, grid, dim3(256), s, x, xv, gain, z, zv, y, yv, eps, scale);
-    else if (nreg <= 24) launch_pdl(norm_kernel<M, 24>, grid, dim3(256), s, x, xv, gain, z, zv, y, yv, eps, scale);
-    else if (nreg <= 32) launch_pdl(norm_kernel<M, 32>, grid, dim3(256), s, x, xv, gain, z, zv, y, yv, eps, scale);
+    if (nreg <= 1) launch_pdl(norm_kernel<M, 1>, grid, block, s, x, xv, gain, z, zv, y, yv, eps, scale);
+    else if (nreg <= 2) launch_pdl(norm_kernel<M, 2>, grid, block, s, x, xv, gain, z, zv, y, yv, eps, scale);
+    else if (nreg <= 4) launch_pdl(norm_kernel<M, 4>, grid, block, s, x, xv, gain, z, zv, y, yv, eps, scale);
+    else if (nreg <= 8) launch_pdl(norm_kernel<M, 8>, grid, block, s, x, xv, gain, z, zv, y, yv, eps, scale);
+    else if (nreg <= 16) launch_pdl(norm_kernel<M, 16>, grid, block, s, x, xv, gain, z, zv, y, yv, eps, scale);
+    else if (nreg <= 24) launch_pdl(norm_kernel<M, 24>, grid, block, s, x, xv, gain, z, zv, y, yv, eps, scale);
+    else if (nreg <= 32) launch_pdl(norm_kernel<M, 32>, grid, block, s, x, xv, gain, z, zv, y, yv, eps, scale);
     else return cudaErrorInvalidValue;  // n <= 8192
     return cudaGetLastError();
 }

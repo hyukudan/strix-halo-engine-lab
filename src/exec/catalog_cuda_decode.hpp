@@ -292,6 +292,8 @@ struct ScreenedHeadPickRows {
 [[nodiscard]] KernelBinding bind(const core::residual_mix::BankBatchArgs&);
 // One launch for a residual add, the bank readout that reads its output and the input norms of the readout's rows.
 [[nodiscard]] KernelBinding bind(const core::residual_mix::TransitionArgs&);
+// Inject the available dynamic shared memory for host planning and dry capture.
+[[nodiscard]] KernelBinding bind(const core::residual_mix::TransitionArgs&, std::size_t dynamic_budget);
 [[nodiscard]] KernelBinding bind(const core::residual_mix::AddArgs&);
 [[nodiscard]] KernelBinding bind(const core::residual_mix::ControllerArgs&);
 [[nodiscard]] KernelBinding bind(const Bf16Round&);

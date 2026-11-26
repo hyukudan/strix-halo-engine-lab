@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -49,7 +50,11 @@ struct Recorder {
     std::vector<Node> nodes;
     auto emit() {
         return [this](const auto& leaf, bool pdl) {
-            auto bound = decode::bind(leaf);
+            auto bound = [&] {
+                if constexpr (std::is_same_v<std::decay_t<decltype(leaf)>, residual::TransitionArgs>)
+                    return decode::bind(leaf, std::size_t{96} * 1024U);
+                else return decode::bind(leaf);
+            }();
             nodes.push_back({bound.identity, bound.grid, bound.args, pdl});
         };
     }
