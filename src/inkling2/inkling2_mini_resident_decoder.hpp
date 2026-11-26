@@ -811,7 +811,9 @@ private:
     // state's slot), every row valid (each stores its own KV row on the sequence's caches). Empty when the window is
     // outside the lanes form (one row, more rows than a lanes launch) or its slot has no directory entry.
     [[nodiscard]] std::optional<MiniResidentBackend::WindowProgram> window_program(const MiniResidentSessionState& state,
-                                                                                std::span<const unsigned> ids) {
+                                                                                std::span<const unsigned> ids,
+                                                                                unsigned pick_rows, bool lanes_screened,
+                                                                                bool screened) {
         const auto rows = static_cast<std::uint32_t>(ids.size());
         if (rows < 2U || rows > attn::lanes::kMaxPreparedBf16Lanes || rows > exec::kStepMaxRows) return std::nullopt;
         std::uint32_t slot = 0;
@@ -823,6 +825,8 @@ private:
         program.block = session::linear_verify_step(
             {rows, state.committed(), slot, 0U, session::LinearVerifyRows::inclusive_valid}, ids);
         auto& owner = *slots_[slot];
+        program.binding = {owner.history().data(), state.convolution_tape_data(), workspace(&state).draft_taps.data(),
+                           state.convolution_tape_rows(), pick_rows, lanes_screened, screened};
         const auto planes = owner.planes();
         program.lanes = {exec::step_lane_view(backend_.window_block(), slot_directory_.data(), decode_rows_, rows),
                          {reinterpret_cast<std::uintptr_t>(planes.keys.data()),
@@ -1238,7 +1242,7 @@ private:
         std::optional<MiniResidentBackend::WindowProgram> window;
         if (window_programs_ && kind == MiniAppendKind::verify && multi_pick && host_logits.empty() && !scores_read &&
             !lowbit && backend_.step_graphs())
-            window = window_program(state, ids);
+            window = window_program(state, ids, static_cast<unsigned>(verify_top.size()), lanes_screened, screened);
         struct ClearWindow {
             MiniResidentBackend& backend;
             ~ClearWindow() { backend.set_window_program(nullptr); }

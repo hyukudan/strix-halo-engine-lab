@@ -8,6 +8,7 @@
 #include "inkling2/inkling2_mini_schedule.hpp"
 #include "moe_core/microscaled_r1.hpp"
 #include "strix/exec/compiler.hpp"
+#include "strix/exec/dry_capture.hpp"
 
 #include <array>
 #include <bit>
@@ -764,13 +765,14 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
     std::vector<unsigned> words(decode::GroupedDecodeScratch::word_count(kExperts, kExpertsPerToken));
     std::vector<float> values_scratch(decode::GroupedDecodeScratch::value_count(kHiddenWidth, kExpertWidth, kExpertsPerToken));
     std::vector<strix::moe_core::device_grouped::TileRows> descriptors(2U * kExpertsPerToken);
+    auto bind_position = position;
     const auto build_recipe = [&](bool fusion, bool reject_fp32 = false, bool grouped_projections = false,
                                    decode::R1Forms forms = {}, bool moe_tail = false, bool moe_route_inline = false,
                                    std::span<std::uint16_t> draft_taps = {}) {
         auto state = make_state();
         // Advance the frontier without touching buffers.
         PositionOnly skip;
-        for (unsigned row = 0; row < position; ++row)
+        for (unsigned row = 0; row < bind_position; ++row)
             state.append(skip, {row, rows}, history_backup, kv_backup, [] {}, [] {});
         unsigned checkpoints = 0;
         MiniCudaStepMode mode{key, {words, values_scratch, descriptors}, nullptr, &checkpoints,
@@ -804,7 +806,7 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
         const auto finish = [] {};
         MiniCudaStepLowering lower(weights, scratch, &descriptor, bind, dispatch, finish, mode);
         MiniResidentForward forward(lower, state, {activations, history_backup, kv_backup, draft_taps});
-        forward.append({position, rows}, buffers.embeddings, buffers.hidden,
+        forward.append({bind_position, rows}, buffers.embeddings, buffers.hidden,
             [&](MiniResidentChunk chunk, MiniConstRows h) { lower.head(h, buffers); lower.submit_eager(chunk); }, [] {},
             [&] { lower.begin_eager(); lower.embed(buffers.embeddings); });
         check(result.program.capturable == !key.program.tap && (checkpoints != 0U) == key.program.tap,
@@ -820,6 +822,18 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
         // every replay); without a tap plane the program is the incumbent one (no extra launch).
         std::vector<std::uint16_t> taps(MiniDSparkTapPlan::elements(position + 1U));
         const auto tapped = build_recipe(key.program.tap, false, false, {}, false, false, taps);
+        if (position == 7U && screened && !key.grouped) {
+            // Keep the arena, program width, layout and descriptor address fixed. Rebind the
+            // actual 48-visit walk at a different committed row, with different replay data.
+            bind_position = 3U;
+            descriptor.row[0] = {913U, bind_position, 2U, exec::kStepNoParent, 1U, exec::step_valid, 42U, 7U};
+            descriptor.h = {1U, 1U, 19U, 1U, 0U, 0U, 0U, 0U};
+            const auto other = build_recipe(key.program.tap, false, false, {}, false, false, taps);
+            exec::verify_dry_capture(tapped.program, other.program);
+            check(tapped.binding == other.binding, "replay input changed transfer kinds or program edges");
+            bind_position = position;
+            descriptor = {};
+        }
         std::size_t found = 0;
         for (const auto& launch : tapped.program.launches) {
             if (std::string_view(launch.identity).find("slice-at-row") == std::string_view::npos) continue;

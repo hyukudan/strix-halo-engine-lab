@@ -14,6 +14,8 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <memory>
+#include <new>
 
 #include "strix/device_allocation_error.hpp"
 #endif
@@ -122,6 +124,32 @@ private:
 };
 
 inline void synchronize(Stream stream) { check(STRIX_DEVICE_RT(StreamSynchronize)(stream), "synchronize stream"); }
+
+// Opaque single-stream decode captures have no independently bound list of leaves. Validate
+// their physical node vocabulary before installation. Declared programs additionally compare
+// each kernel against its bound geometry and check the edges in their program executor.
+inline bool inspect_raw_step_graph(STRIX_DEVICE_RT(Graph_t) graph, std::size_t& count) noexcept {
+    if (STRIX_DEVICE_RT(GraphGetNodes)(graph, nullptr, &count) != STRIX_DEVICE_RT(Success) || count == 0U)
+        return false;
+#if !defined(NDEBUG) || defined(STRIX_STRICT_GRAPH_CAPTURE)
+    const auto allocated = count;
+    using Node = STRIX_DEVICE_RT(GraphNode_t);
+    std::unique_ptr<Node[]> nodes{new (std::nothrow) Node[count]};
+    if (!nodes || STRIX_DEVICE_RT(GraphGetNodes)(graph, nodes.get(), &count) != STRIX_DEVICE_RT(Success) ||
+        count != allocated) return false;
+    for (const auto node : std::span(nodes.get(), count)) {
+        STRIX_DEVICE_RT(GraphNodeType) kind{};
+        if (STRIX_DEVICE_RT(GraphNodeGetType)(node, &kind) != STRIX_DEVICE_RT(Success)) return false;
+        if (kind == STRIX_DEVICE_RT(GraphNodeTypeMemcpy) || kind == STRIX_DEVICE_RT(GraphNodeTypeMemset)) continue;
+        if (kind != STRIX_DEVICE_RT(GraphNodeTypeKernel)) return false;
+        STRIX_DEVICE_RT(KernelNodeParams) args{};
+        if (STRIX_DEVICE_RT(GraphKernelNodeGetParams)(node, &args) != STRIX_DEVICE_RT(Success) || !args.func ||
+            !args.gridDim.x || !args.gridDim.y || !args.gridDim.z ||
+            !args.blockDim.x || !args.blockDim.y || !args.blockDim.z) return false;
+    }
+#endif
+    return true;
+}
 
 class StepGraph {
 public:
@@ -266,7 +294,8 @@ private:
         if (!allocate_descriptor()) return false;
         const auto graph = capture(stream, work);
         if (!graph) return false;
-        const bool instantiated = instantiate(graph);
+        std::size_t count{};
+        const bool instantiated = inspect_raw_step_graph(graph, count) && instantiate(graph);
         (void)STRIX_DEVICE_RT(GraphDestroy)(graph);
         return instantiated;
     }
