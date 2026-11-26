@@ -1365,11 +1365,11 @@ TraceResult arbiter_trace(double plain_ms, std::span<const double> conditional, 
     return r;
 }
 
-// A cold wall does not pace the next probe. CUDA window programs capture each width on its first pass (+18..+28 ms
-// over the warm wall); a measured code run opened with model acceptances 1, 0, 1 and those captures in the closed
-// episode's loss: the next probe was paced beyond the request and auto ran 4 model passes of 229 (93.1 tok/s) where
-// the same code drafts ~51 of 54. Same opening, same captures: the model is probed again and keeps drafting (with the
-// captures in the pacing: 12-15 model passes of ~224, ~99 tok/s at these walls).
+// A cold wall is not the probe_loss episode's loss. CUDA window programs capture each width on its first pass
+// (+18..+28 ms over the warm wall); measured code runs opened with model acceptances 1, 0, 1 and those captures in the
+// episode's net: the episode closed, the drafting path was left and auto ran 4 and 6 model passes of ~200 (q53 93.1,
+// q60 107.5 tok/s) where the same code drafts 51 of 54 (q58). Same opening, same captures: the episode stays open
+// (captures charged: 12-15 model passes of ~224, ~99 tok/s at these walls; left out of the pacing only: ~50 of ~85).
 void cold_episode_tests() {
     const std::array<double, 9> warm{0.0, 10.14, 17.0, 19.5, 22.0, 24.0, 23.3, 26.3, 29.3};
     const std::array<double, 9> captured{0.0, 42.1, 35.6, 37.0, 34.9, 51.9, 43.0, 47.0, 49.9};
@@ -1414,7 +1414,7 @@ void cold_episode_tests() {
             ms += verify + drafted;
             ++passes;
         }
-        SP_CHECK(model >= 40U && 1000.0 * tokens / ms >= 120.0,
+        SP_CHECK(model >= 40U && 10U * model >= 9U * passes && 1000.0 * tokens / ms >= 120.0,
                  "seed %llu: cold captures after an unlucky opening keep the model drafting (model %u of %u passes, %.1f tok/s)",
                  static_cast<unsigned long long>(seed), model, passes, 1000.0 * tokens / ms);
     }
@@ -1476,8 +1476,8 @@ void honest_plain_price_tests() {
     SP_CHECK(ratio(code_short) >= 1.2 && ratio(code_short) >= 0.9 * ratio(code_always),
              "code: 64 requests find the deep windows (%.4f, always drafting %.4f)", ratio(code_short), ratio(code_always));
     // The first pass of every width is cold-flagged (cold_walls 1) although this trace's walls are warm from the start;
-    // leaving cold passes out of the re-probe pacing (cold_episode_tests) re-probes prose a little sooner here:
-    // 0.9703 -> 0.9664, code 1.2125 -> 1.2196.
+    // leaving cold passes out of the episode (cold_episode_tests) keeps a prose episode one pass longer here:
+    // 0.9703 -> 0.9664, code 1.2125 -> 1.2057.
     SP_CHECK(ratio(prose_short) >= 0.965, "prose: 64 requests stay within 3.5 %% of plain decode (%.4f)", ratio(prose_short));
 }
 
