@@ -1,4 +1,5 @@
 #include "strix/spec/block_drafter.hpp"
+#include "strix/spec/draft_depth.hpp"
 #include "strix/spec/greedy_prefix.hpp"
 
 #include <algorithm>
@@ -149,6 +150,7 @@ Block BlockDrafter::next(const StepParams& params, const PrelaunchFn* launch) {
     in.max_rows = max_rows;
     in.context = params.context;
     in.force_lookup = config_.force_lookup;
+    in.live_lanes = params.live_lanes;
     b.decision = arbiter_.decide(in);
     const auto& d = b.decision;
     b.source = d.source;
@@ -162,7 +164,8 @@ Block BlockDrafter::next(const StepParams& params, const PrelaunchFn* launch) {
         b.bucket = std::min(proposal_.bucket(), lookup_buckets - 1);
         // Hybrid: the copy proposal ended below the window; extend it with the chain when that pays.
         const std::uint32_t n = d.k;
-        const std::uint32_t limit = params.remaining - 1;
+        const auto limit = draft_depth_for_lanes(config_.arbiter.max_draft_by_live, params.live_lanes,
+                                                 params.remaining - 1U);
         const std::uint32_t by_block = config_.max_block - 1 > n ? config_.max_block - 1 - n : 0U;
         const std::uint32_t room = std::min({config_.chain_max_k, by_block, limit > n ? limit - n : 0U,
                                              max_rows - 1 > n ? max_rows - 1 - n : 0U});

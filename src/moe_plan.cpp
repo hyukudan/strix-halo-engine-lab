@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -521,7 +522,8 @@ std::uint32_t largest_supported_chunk(std::uint64_t remaining) {
 
 MoeExpertExecutionPlan build_moe_expert_execution_plan_from_route(
     const MoeRouteRequest& request,
-    const MoeRoutePlan& route) {
+    const MoeRoutePlan& route,
+    std::span<const std::uint32_t> padded_tile_rows = {}) {
     MoeExpertExecutionPlan plan;
     plan.assignments = route.assignments;
     plan.direct_weight_traversals = route.assignments;
@@ -535,11 +537,16 @@ MoeExpertExecutionPlan build_moe_expert_execution_plan_from_route(
             offset;
 
         while (remaining != 0) {
-            const auto rows = largest_supported_chunk(remaining);
-            if (rows == 0) {
-                throw std::logic_error("MoE expert batch decomposition failed");
+            auto tile_rows = largest_supported_chunk(remaining);
+            if (!padded_tile_rows.empty()) {
+                const auto target =
+                    std::min<std::uint64_t>(remaining, padded_tile_rows.back());
+                tile_rows = *std::lower_bound(padded_tile_rows.begin(),
+                                             padded_tile_rows.end(), target);
             }
-            plan.batches.push_back(MoeExpertBatch{expert, offset, rows});
+            const auto rows = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(remaining, tile_rows));
+            plan.batches.push_back(MoeExpertBatch{expert, offset, rows, tile_rows});
             offset += rows;
             remaining -= rows;
         }
@@ -781,6 +788,19 @@ MoeExpertExecutionPlan build_moe_expert_execution_plan(
     const MoeRouteRequest& request) {
     const auto route = build_moe_route_plan(request);
     return build_moe_expert_execution_plan_from_route(request, route);
+}
+
+MoeExpertExecutionPlan build_moe_expert_execution_plan(
+    const MoeRouteRequest& request,
+    std::span<const std::uint32_t> padded_tile_rows) {
+    if (padded_tile_rows.empty() || padded_tile_rows.front() == 0 ||
+        std::adjacent_find(padded_tile_rows.begin(), padded_tile_rows.end(),
+                           std::greater_equal<>{}) != padded_tile_rows.end()) {
+        throw std::invalid_argument(
+            "MoE padded tile heights must be positive and strictly increasing");
+    }
+    const auto route = build_moe_route_plan(request);
+    return build_moe_expert_execution_plan_from_route(request, route, padded_tile_rows);
 }
 
 MoeExpertExecutionDecision select_moe_expert_execution_strategy(

@@ -78,11 +78,20 @@ struct Solver {
         std::uint32_t min_total = 0;
         double min_tokens = 0;
         growth.clear();
+        const auto common_min = lanes.front().min_rows;
+        const bool uniform = limits.uniform_windows && std::all_of(lanes.begin(), lanes.end(), [&](const Lane& lane) {
+            return lane.min_rows == common_min;
+        });
+        std::uint32_t common_max = ~0U;
+        if (uniform) {
+            for (const auto& lane : lanes)
+                common_max = std::min(common_max, std::min(lane.max_rows, std::max(common_min, lane.useful_cap)));
+        }
         for (std::size_t i = 0; i < lanes.size(); ++i) {
             const Lane& lane = lanes[i];
             const LaneDemand& demand = demands[lane.index];
             min_total += lane.min_rows;
-            const std::uint32_t top = std::min(lane.max_rows, std::max(lane.min_rows, lane.useful_cap));
+            const std::uint32_t top = std::min(common_max, std::min(lane.max_rows, std::max(lane.min_rows, lane.useful_cap)));
             double value = 1.0;
             for (std::uint32_t row = 0; row < top; ++row) {
                 value *= accept_at(demand, row, prior);
@@ -93,8 +102,10 @@ struct Solver {
                 }
             }
         }
-        // Values never rise along a lane, so this order keeps each lane's rows in sequence.
-        std::sort(growth.begin(), growth.end(), [](const Growth& a, const Growth& b) {
+        // Uniform windows buy a complete depth at once. Otherwise values
+        // never rise along a lane, so ranking by value preserves row order.
+        std::sort(growth.begin(), growth.end(), [uniform](const Growth& a, const Growth& b) {
+            if (uniform && a.row != b.row) return a.row < b.row;
             if (a.value != b.value) return a.value > b.value;
             if (a.row != b.row) return a.row < b.row;
             if (a.id != b.id) return a.id < b.id;
@@ -107,6 +118,7 @@ struct Solver {
         double best_tokens = 0, best_ms = 0, tokens = min_tokens;
         for (std::size_t extra = 0; extra <= growth.size(); ++extra) {
             if (extra != 0) tokens += growth[extra - 1].value;
+            if (uniform && extra % lanes.size() != 0) continue;
             const std::uint32_t total = min_total + static_cast<std::uint32_t>(extra);
             if (limits.rows_per_forward != 0 && total > limits.rows_per_forward) break;
             const double ms = std::max(cycle_ms(lanes.size(), total), floor_ms);

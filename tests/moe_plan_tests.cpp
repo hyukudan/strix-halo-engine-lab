@@ -18,9 +18,84 @@ void expect(bool condition, const char* message) {
     }
 }
 
+void test_padded_expert_tiles() {
+    constexpr std::uint32_t rows = 34;
+    constexpr std::uint32_t top_k = 2;
+    constexpr std::uint64_t weight_bytes = 1000;
+    std::vector<std::uint32_t> routes;
+    for (std::uint32_t row = 0; row < rows; ++row) {
+        const auto expert = row + 1U == rows ? 3U : 1U;
+        routes.push_back(row % 2U == 0 ? expert : 2U);
+        routes.push_back(row % 2U == 0 ? 2U : expert);
+    }
+    const strix::MoeRouteRequest request{rows, top_k, 4, weight_bytes, routes};
+    const std::uint32_t tile_rows[]{16, 32};
+    const auto grouping = strix::build_moe_grouping_plan(request);
+    const auto plan = strix::build_moe_expert_execution_plan(request, tile_rows);
+    const auto incumbent = strix::build_moe_expert_execution_plan(request);
+    expect(incumbent.grouped_weight_bytes == 11U * weight_bytes &&
+               incumbent.batches.front().tile_rows == incumbent.batches.front().logical_rows,
+           "incumbent exact row classes retain their byte accounting");
+    expect(plan.assignments == rows * top_k && plan.expert_batches == 5 &&
+               plan.grouped_weight_traversals == plan.expert_batches &&
+               plan.direct_weight_bytes == rows * top_k * weight_bytes &&
+               plan.grouped_weight_bytes == 5U * weight_bytes &&
+               plan.grouped_weight_bytes_saved == 63U * weight_bytes,
+           "each padded tile accounts for exactly one shared weight traversal");
+
+    const strix::MoeExpertBatch expected[]{
+        {1, 0, 32, 32}, {1, 32, 1, 16}, {2, 33, 32, 32},
+        {2, 65, 2, 16}, {3, 67, 1, 16},
+    };
+    expect(plan.batches.size() == 5, "only live expert tiles are scheduled");
+    if (plan.batches.size() != 5) return;
+
+    std::vector<unsigned> visits(routes.size());
+    for (std::size_t index = 0; index < plan.batches.size(); ++index) {
+        const auto& batch = plan.batches[index];
+        const auto& want = expected[index];
+        const bool matches = batch.expert == want.expert &&
+                             batch.assignment_offset == want.assignment_offset &&
+                             batch.logical_rows == want.logical_rows && batch.tile_rows == want.tile_rows;
+        expect(matches, "expert tiles pack full rows then the smallest supported tail");
+        if (!matches) continue;
+
+        for (std::uint32_t row = 0; row < batch.logical_rows; ++row) {
+            const auto at = static_cast<std::size_t>(batch.assignment_offset + row);
+            const auto slot = grouping.assignment_rows.at(at) * top_k + grouping.assignment_slots.at(at);
+            expect(routes.at(slot) == batch.expert, "tile preserves each original top-k slot and expert");
+            ++visits.at(slot);
+        }
+    }
+    for (const auto count : visits) {
+        expect(count == 1U, "live slots are executed once with no padded CSR entries");
+    }
+
+    const std::uint32_t wider_tiles[]{16, 32, 48};
+    const auto wider = strix::build_moe_expert_execution_plan(request, wider_tiles);
+    expect(wider.grouped_weight_bytes == 3U * weight_bytes &&
+               wider.batches.front().tile_rows == 48 && wider.batches.front().logical_rows == 33,
+           "a supported wider tile can replace two reads of the same weights");
+
+    const std::uint32_t zero[]{0, 16};
+    const std::uint32_t decreasing[]{32, 16};
+    const std::uint32_t repeated[]{16, 16};
+    const std::span<const std::uint32_t> invalid_heights[]{{}, zero, decreasing, repeated};
+    for (const auto invalid : invalid_heights) {
+        bool rejected = false;
+        try {
+            static_cast<void>(strix::build_moe_expert_execution_plan(request, invalid));
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        expect(rejected, "padded tile geometry must be positive and strictly increasing");
+    }
+}
+
 }  // namespace
 
 int main() {
+    test_padded_expert_tiles();
 
     strix::MoeExpertStorageRequest storage;
     storage.hidden_size = 2560;

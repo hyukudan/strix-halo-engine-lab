@@ -1,4 +1,5 @@
 #include "strix/spec/drafting.hpp"
+#include "strix/spec/draft_depth.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -557,10 +558,13 @@ Decision Arbiter::decide_chance_window(const StepInput& input) {
     return best;
 }
 
-Decision Arbiter::decide(const StepInput& input) {
+Decision Arbiter::decide(const StepInput& step) {
     decided_ms_ = decided_excess_ms_ = 0.0;
     episode_pass_ = false;
+    auto input = step;
     if (input.remaining == 0 || input.max_rows == 0) return Decision{Source::serial, 0, 0, false, 0.0, 0.0, false};
+    input.remaining = 1U + draft_depth_for_lanes(config_.max_draft_by_live, input.live_lanes,
+                                                input.remaining - 1U);
     if (input.force_lookup) {
         const auto end = std::upper_bound(config_.windows.begin(), config_.windows.end(), input.max_rows);
         if (input.lookup && !input.lookup->tokens.empty()) {

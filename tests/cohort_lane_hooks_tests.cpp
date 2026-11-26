@@ -53,6 +53,7 @@ public:
         : lanes_(lanes), rows_(rows), ctx_(lanes), decoded_(lanes, false), logits_(kVocab) {}
     std::uint32_t lanes() const override { return lanes_; }
     std::uint32_t rows_per_forward() const override { return rows_; }
+    std::uint32_t max_batch_verify_rows() const override { return batch_rows; }
     std::uint32_t max_positions() const override { return 4096; }
     void prefill(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) override {
         check(window_.empty(), "prefill with an open window");
@@ -64,8 +65,10 @@ public:
     void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                 std::span<std::uint32_t> top) override {
         check(window_.empty(), "verify with an open window");
+        verify_shapes.emplace_back();
         std::size_t base = 0;
         for (const auto& g : groups) {
+            verify_shapes.back().push_back(g.rows);
             std::vector<std::uint32_t> c = ctx_.at(g.lane);
             for (std::uint32_t i = 0; i < g.rows; ++i) {
                 c.push_back(tokens[base + i]);
@@ -89,6 +92,7 @@ public:
         check(accept.size() == window_.size(), "one keep count per group");
         for (std::size_t g = 0; g < window_.size(); ++g) {
             check(accept[g] >= 1 && accept[g] <= window_[g].second.size(), "keep out of range");
+            partial_commits += accept[g] < window_[g].second.size() ? 1U : 0U;
             auto& c = ctx_.at(window_[g].first);
             c.insert(c.end(), window_[g].second.begin(), window_[g].second.begin() + accept[g]);
             decoded_.at(window_[g].first) = true;
@@ -157,10 +161,13 @@ public:
     }
 
     bool drafts_on = false;
+    std::uint32_t batch_rows = 0;
     std::uint32_t wrong = 2;
     std::uint64_t group_members = 1;
     std::vector<std::vector<std::uint32_t>> retained;
     std::vector<std::size_t> group_sizes;
+    std::vector<std::vector<std::uint32_t>> verify_shapes;
+    std::size_t partial_commits = 0;
     std::uint64_t forwards = 0, prompt_rows = 0, proposals = 0, logit_reads = 0;
 
 private:
@@ -248,6 +255,35 @@ void test_retained_prefix() {
     auto c = run_all(dec);
     check(c[3].restored == 0 && c[3].ids == solo(third), "prefix: reuse off starts cold, ids == solo");
     check(be.retained.size() == kept, "prefix: retain off is not captured");
+}
+
+void test_uniform_verify_windows(std::uint32_t capacity, std::uint32_t width) {
+    HookBackend be(8, 64);
+    be.drafts_on = true;
+    be.batch_rows = capacity;
+    be.group_members = 8;
+    CohortConfig cfg;
+    cfg.context_draft = false;
+    cfg.uniform_verify_windows = true;
+    cfg.max_draft_by_live = {7, 4};
+    cfg.prior = {100.0, 0.01, 0.0, 0.0};
+    cfg.learn_cost = false;
+    CohortDecoder dec(be, cfg);
+    std::vector<CohortRequest> reqs;
+    for (std::uint32_t i = 0; i < 8; ++i) reqs.push_back(request(80 + i, 5, 20, i));
+    for (const auto& r : reqs) dec.submit(r);
+    while (!dec.idle()) {
+        const auto before = be.forwards;
+        dec.step();
+        check(be.forwards - before <= 1, "uniform verify: one target pass per round");
+    }
+    const std::vector<std::uint32_t> expected(8, width);
+    check(std::find(be.verify_shapes.begin(), be.verify_shapes.end(), expected) != be.verify_shapes.end(),
+          "uniform verify: eight complete windows in one target pass");
+    check(be.partial_commits > 0, "uniform verify: rejected suffixes were discarded");
+    auto results = run_all(dec);
+    for (const auto& r : reqs)
+        check(results[r.id].error.empty() && results[r.id].ids == solo(r), "uniform verify: ids equal solo after rollback");
 }
 
 void test_grouped_prompts() {
@@ -382,6 +418,8 @@ void test_selection_refusal() {
 int main() {
     test_device_drafts(false);
     test_device_drafts(true);
+    test_uniform_verify_windows(64, 5);
+    test_uniform_verify_windows(39, 4);
     test_retained_prefix();
     test_grouped_prompts();
     test_selection(false);
