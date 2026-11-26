@@ -77,10 +77,12 @@ routes. Performance is unmeasured. Use fresh state and separate cache directorie
 
 ## Qwen product profiles
 
-`--profile default|fast|quality` selects the Qwen product policy for decode,
-prefill, MTP and HTTP serving. `default` preserves current production behavior
-without exporting profile switches. `fast` applies ready and explicitly provisional
+`--profile exact|fast|turbo` selects the Qwen product policy for decode,
+prefill, MTP and HTTP serving. `default` remains a compatibility spelling for
+the profile column selected by `exact`. `fast` applies ready and explicitly provisional
 runnable levers in the [single profile table](../include/strix/qwen_profile_table.hpp).
+`turbo` inherits FAST and resolves higher rows according to their declared
+execution scope. The legacy `quality` column still reports its absent pack.
 Where the route admits it, fast currently applies BF16 MoE route storage by exporting
 `STRIX_QPF2K_MOE_ROUTE_BF16=1`, without `--allow-pending`. This bit-changing row
 changes logits and is selected ahead of its qualification receipt; qualification
@@ -97,7 +99,6 @@ and the stamp lists every applied provisional row (`qualification in progress: q
 Single-node screen of the three rows together, plain CLI, 8K prompts: pooled KL 0.0040, top-1 agreement 97.5 %,
 NLL change -0.039 on 7 held-out prompts (1,792 teacher-forced rows); prefill 8K / 32K / 128K +7.2 / +7.9 / +7.9 %.
 The output head row remains pending: its builtin path continues, with one notice and its declared target in `profile.pending`.
-`quality` runs default settings with one notice because no quality pack exists.
 
 Explicit environment variables and lever options override the profile, including
 explicit off. `--allow-pending` / `STRIX_QWEN_PROFILE_ALLOW_PENDING=1` applies only
