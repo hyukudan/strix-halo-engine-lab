@@ -39,12 +39,11 @@ See [production defaults](production-defaults.md),
 [long contexts](long-context.md) and
 [hot-expert placement](hot-placement.md).
 
-Every pair app (`rank`, `batch`, `prefill`, `serve`) accepts `--profile default|fast|quality`; run the
-same profile on both ranks. `default` is the exact production configuration above and sets nothing. `fast`
-adds the relaxed MoE epilogue (`STRIX_DS41_FAST_MOE=1`, bit-changing; its qualification is in progress) and lists
-the still-pending FP16 sparse attention in the receipt and in one stderr line. `quality` has no pack for this model and runs `default` with a notice. An explicit environment
-variable or option always wins; `--allow-pending` runs pending options whose code is in the build, for
-benchmarks only, stamped `unqualified`. `--print-effective-config` lists the profile and every option.
+Every pair app (`rank`, `batch`, `prefill`, `serve`) accepts `--profile exact|fast|turbo`.
+Use the same tier on both ranks. FAST and TURBO keep the previous prefill arithmetic
+outside the D1 receipt. Explicit environment switches remain available for experiments.
+`--print-effective-config` shows the startup resolution.
+See [the pair profile and receipt scope](production-defaults.md#product-profiles).
 
 **RTX + pair:** use the [pipeline stage launch contract](pipeline-stages.md).
 The RTX runs layers 0–21; the pair runs layers 22–39 and the head. Preserve the declared composed

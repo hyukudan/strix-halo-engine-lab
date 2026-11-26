@@ -19,6 +19,11 @@ namespace strix::deepseek41::quality {
 // the relaxed MoE of the arm; the receipt profile is "diagnostic".
 // Prefix eng_ (any arm, e.g. eng_fast3, eng_exact; labels are [a-z0-9_]): adds the FAST lever ds41-engram-f16wmma-v1 (Engram projection on WMMA).
 inline PrefillOptions arm_precision(const std::string& label) {
+    if (label == "m16_sh_eng_fast3") {
+        PrefillOptions o;
+        apply_d1_prefill(o);
+        return o;
+    }
     if (label.rfind("i4_", 0) == 0 && label.size() > 3) {  // routed experts on gguf-iu4-direct-v1 instead of the relaxed MoE
         PrefillOptions o = arm_precision(label.substr(3));
         o.fast_i4 = 1;

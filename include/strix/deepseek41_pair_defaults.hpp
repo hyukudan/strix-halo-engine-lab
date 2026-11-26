@@ -42,11 +42,10 @@
 // One-shot rank commands remain explicit.
 // --print-effective-config prints the resolved environment and arguments and exits before any device work.
 //
-// Product profile (every app): '--profile default|fast|quality' (strix/engine_profile.hpp, rows in
-// strix/deepseek41_pair_profile_table.hpp) resolves first; default sets nothing, so the resolution above is
-// unchanged. A fast/quality row that is not qualified is pending: listed in the receipt ("profile {...}") and in
-// one stderr line, never applied, never a refusal. '--allow-pending' (STRIX_DS41_PROFILE_ALLOW_PENDING=1) runs a
-// pending row whose code is in this build, stamped "unqualified". Both ranks must run the same profile.
+// Product profile (every app): '--profile exact|fast|turbo' (strix/engine_profile.hpp). Both ranks must agree
+// on the tier and its explicit switches. Prefill admission waits for an eligible request and rank agreement.
+namespace strix::deepseek41 { struct PrefillOptions; }
+
 namespace strix::deepseek41::pair_defaults {
 // KV precision (--kv, strix/session/kv_precision.hpp): the model defines its KV numerics (FP8 sliding-window ring, FP4
 // compressed cache; strix/ds41_attention.hpp). fp8 is native in every tier; no other precision has a path.
@@ -116,6 +115,11 @@ const std::string& profile_json();
 // This process's resolved profile (Effective ran first): two-rank apps check it against the peer
 // (strix::profile::check_peer) on their control channel right after the communicator exists.
 const strix::profile::Resolution& profile_resolution();
+// Fresh whole-prompt device prefill only. The adapter supplies its measured reference route and runtime device facts.
+std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::profile::Resolution& startup,
+    const PrefillOptions& options, std::uint64_t prompt_tokens, std::string_view device_product, bool measured_reference);
+// The wire decision is made before enabling D1. Zero is a decline, including a rank unable to allocate mirrors.
+inline bool paired_d1(std::uint64_t local, std::uint64_t peer) noexcept { return local != 0 && local == peer; }
 // The code defaults adopted on 2026-10-25/26 that STRIX_DS41_BASELINE=1 switches off (variable, value).
 const std::vector<std::pair<std::string, std::string>>& baseline_off_items();
 // Empty ON means leave the app/kernel builtin untouched; OFF is baseline export.

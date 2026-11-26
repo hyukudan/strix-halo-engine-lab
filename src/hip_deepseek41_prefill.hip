@@ -7,6 +7,8 @@
 #include "strix/ds41_prefill_tuning.hpp"
 #include "strix/hip_ds41_dense_fp16.hpp"
 #include "strix/deepseek41_prefill.hpp"
+#include "strix/deepseek41_pair_defaults.hpp"
+#include "device/hip_cost_identity.hpp"
 #include "strix/ds41_prefill_precision.hpp"
 
 #include "strix/deepseek41_attention_host.hpp"
@@ -183,6 +185,7 @@ public:
     Mapped(const Mapped&) = delete;
     Mapped& operator=(const Mapped&) = delete;
     [[nodiscard]] const std::uint8_t* at(std::uint64_t offset) const { return base_ + offset; }
+    [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
 
 private:
     int fd_ = -1;
@@ -1700,6 +1703,59 @@ PrefillResult DevicePrefill::run(std::span<const std::uint32_t> tokens) {
     if (impl_->task != nullptr) throw std::logic_error("deepseek41 prefill: a task is in progress");
     impl_->embed_run = std::exchange(impl_->embed_next, {});
     return run_from(tokens, 0U);
+}
+
+PrefillResult DevicePrefill::run_full_prompt(std::span<const std::uint32_t> tokens) {
+    auto& m = *impl_;
+    const auto& startup = pair_defaults::profile_resolution();
+    if (!m.distributed() || (startup.profile != strix::profile::Name::fast && !startup.is_turbo()))
+        return run(tokens);
+
+    const auto& o = m.options;
+    const char* baseline = std::getenv("STRIX_DS41_BASELINE");
+    const bool baseline_on = baseline && *baseline && std::string_view(baseline) != "0";
+    const bool scope = o.quality_head_rows == 64U && o.communicator->transport_name().starts_with("usb4-host:") && m.moe_window_auto &&
+        m.overlay == nullptr && m.file->size() == pinned_file(PinnedFileKind::target_q2).bytes &&
+        m.dense_select && m.split_min_rows == PrefillOptions{}.split_min_rows && !m.moe_joint &&
+        m.joint_max_rows == PrefillOptions{}.joint_max_rows && m.async_gather && m.pack &&
+        m.overlap && m.moe_persist && m.staged_gather_allowed && m.early_q_b && m.group.empty() &&
+        m.task == nullptr && m.snap_next.empty() && m.embed_next.empty() &&
+        !baseline_on;
+    const auto resolution = pair_defaults::resolve_prefill_profile(
+        startup, o, tokens.size(), scope ? strix::device::hip_cost_device_identity() : std::string{}, scope);
+    // CLI and serve use a one-row head. It rules out D1 on both ranks before a request exchange.
+    if (o.quality_head_rows != 64U) return run(tokens);
+    const auto* d1 = resolution ? resolution->find("d1_prefill") : nullptr;
+    bool local = d1 && d1->value == "1";
+
+    // Either rank may decline before any arithmetic changes. The startup profile handshake
+    // already agrees the tier and explicit switches. This exchange agrees the request's route.
+    if (local) {
+        try {
+            m.prepare_flash_mirrors();
+        } catch (const std::runtime_error&) {
+            local = false;
+        }
+    }
+    const std::array<std::uint64_t, 2> mine{tokens.size(), local ? resolution->fingerprint() : 0U};
+    std::array<std::uint64_t, 2> peer{};
+    o.communicator->exchange_host(std::as_bytes(std::span(mine)), std::as_writable_bytes(std::span(peer)),
+        strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 0x44315046U, 0U});
+    if (peer[0] != mine[0]) throw std::runtime_error("deepseek41 D1: ranks disagree on prompt length");
+    if (!pair_defaults::paired_d1(mine[1], peer[1])) {
+        std::fprintf(stderr, "deepseek41 D1: %zu prompt tokens, no paired D1 admission; previous prefill route\n", tokens.size());
+        return run(tokens);
+    }
+    std::fprintf(stderr, "%s\n", d1->ladder.c_str());
+
+    // The change is sequence-local. Explicit arms, group passes, continuations and later requests keep their own options.
+    struct RestoreOptions {
+        PrefillOptions& active;
+        PrefillOptions previous;
+        ~RestoreOptions() { active = std::move(previous); }
+    } restore{m.options, m.options};
+    apply_d1_prefill(m.options);
+    return run(tokens);
 }
 
 PrefillResult DevicePrefill::extend(std::span<const std::uint32_t> tokens) {

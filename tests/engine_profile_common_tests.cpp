@@ -72,6 +72,41 @@ int main() try {
     inputs.profile = Name::standard;
     require(resolve(engine, inputs).entries[0].value == "0", "DEFAULT unchanged");
 
+    // The ordinary shared consumer keeps the original preset behavior even with historical grants.
+    {
+        Lever qualified = pending;
+        qualified.ready[1] = true;
+        Lever provisional = pending;
+        provisional.name = "experiment";
+        provisional.env = "EXPERIMENT";
+        provisional.option = "--experiment";
+        provisional.provisional[1] = true;
+        const std::array rows{qualified, provisional};
+        const std::array grants{incumbent_cell("item", "1", Name::fast, "gate pass", "v1"),
+            incumbent_cell("experiment", "1", Name::fast, kProvisionalBeforeLadder, "v1")};
+        const Engine consumer{"consumer", "ALLOW", rows, false, "v1", {}, {}, grants};
+        Inputs in;
+        in.env = env;
+        const char* marker = environment({}, kPresetEnv);
+        const auto previous = marker ? std::optional<std::string>(marker) : std::nullopt;
+        for (const auto tier : {Name::standard, Name::fast, Name::quality, Name::turbo}) {
+            in.profile = tier;
+            require(export_environment(kPresetEnv, ""), "clear preset marker");
+            const auto native = resolve(consumer, in);
+            require(export_environment(kPresetEnv, "1"), "set preset marker");
+            const auto preset = resolve(consumer, in);
+            const bool lossy_tier = tier == Name::fast || tier == Name::turbo;
+            require(preset.find("item")->value == native.find("item")->value, "preset preserves the qualified cell");
+            require(preset.find("experiment")->value == "0", "preset filters historical provisional grant");
+            if (!lossy_tier)
+                require(preset.fingerprint() == native.fingerprint(), "preset preserves exact/quality identity");
+            in.allow_pending = true;
+            require(resolve(consumer, in).fingerprint() == native.fingerprint(), "explicit opt-in preserves native identity");
+            in.allow_pending = false;
+        }
+        require(export_environment(kPresetEnv, previous ? previous->c_str() : ""), "restore preset marker");
+    }
+
     // Explicit settings of a bit-changing lever: qualified only at the builtin, the off value or a ready, not provisional
     // column value (table data); a provisional or pending column value set by hand stamps the run unqualified.
     {
@@ -141,7 +176,7 @@ int main() try {
     inputs.profile = Name::fast;
     inputs.allow_pending = false;
     const auto shipped_fast = resolve(shipped, inputs);
-    require(shipped_fast.find("moe_relaxed")->status == Status::pending &&
+    require(shipped_fast.find("moe_relaxed")->status == Status::builtin &&
             shipped_fast.find("moe_relaxed")->value == "0", "unscoped shipped candidate declines");
     check_peer(legacy, [](auto out, auto in) { std::memcpy(in.data(), out.data(), out.size()); });
     bool mismatch = false;
