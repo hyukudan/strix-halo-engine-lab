@@ -9,6 +9,7 @@
 #include "moe_core/microscaled_r1.hpp"
 #include "strix/exec/compiler.hpp"
 #include "strix/exec/dry_capture.hpp"
+#include "../graph/capture_packet.hpp"
 
 #include <array>
 #include <bit>
@@ -129,6 +130,26 @@ void check_compiler_admission(const graph::StageGraph& stages, const graph::Laun
     }
     check(nvfp4 != 0 && mxfp8 != 0 && nvfp4 + mxfp8 == 2U * schedule.size(),
           "expected both microscaled expert formats on the complete loop");
+}
+
+void check_packet_padding() {
+    struct Word { std::uint8_t tag; std::uint32_t value; };
+    struct Packet { std::uint8_t kind; std::array<Word, 2> words; };
+    const auto capture = [](int fill, std::uint32_t last) {
+        Packet p;
+        std::memset(&p, fill, sizeof(p));
+        p.kind = 3U;
+        for (auto& w : p.words) {
+            w.tag = 2U;
+            w.value = 7U;
+        }
+        p.words.back().value = last;
+        auto bytes = std::bit_cast<std::array<std::byte, sizeof(Packet)>>(p);
+        exec::test::canonicalize_packet<Packet>(bytes);
+        return bytes;
+    };
+    check(capture(0, 9) == capture(255, 9) && capture(255, 9) != capture(255, 10),
+          "dry capture must discard padding and preserve nested array values");
 }
 
 void check_transfer_nodes() {
@@ -795,6 +816,8 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
 #endif
         const auto bind = [reject_fp32](const auto& args) {
             auto leaf = bind_physical_fixture(args);
+            using Packet = std::remove_cvref_t<decltype(args)>;
+            exec::test::canonicalize_packet<Packet>(leaf.args);
             if constexpr (std::is_same_v<std::remove_cvref_t<decltype(args)>, decode::Bf16Fp32Epilogue>) {
                 if (reject_fp32) leaf.identity = "rejected-fp32-epilogue";
             }
@@ -803,6 +826,16 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
         exec::CudaRecipeProgram result;
         const auto dispatch = [&](MiniResidentChunk, const auto& build) {
             result = build().compile(key.program);
+            for (std::size_t i = 0; i < result.binding.nodes.size(); ++i) {
+                const auto& leaf = result.program.launches[i];
+                auto bytes = std::span(result.program.args).subspan(leaf.args_offset, leaf.args_bytes);
+                switch (result.binding.nodes[i].kind) {
+                case exec::CudaNodeKind::memset: exec::test::canonicalize_packet<exec::CudaMemsetArgs>(bytes); break;
+                case exec::CudaNodeKind::copy_d2d:
+                case exec::CudaNodeKind::copy_d2h_pinned: exec::test::canonicalize_packet<exec::CudaCopyArgs>(bytes); break;
+                default: break;
+                }
+            }
             return true;
         };
         const auto finish = [] {};
@@ -972,7 +1005,7 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
         const auto clip = [&](unsigned heads, unsigned threads, bool from_x3) {
             const auto args = trace.kernel<decode::HeadClipBf16>("head-clip-bf16-r1", grid(heads, threads));
             check(args.position == (from_x3 && !key.program.tap ? &descriptor.row[0].position : nullptr) &&
-                  args.first_position == (from_x3 ? position : 0U), "visit clip position binding");
+                  args.first_position == (from_x3 && key.program.tap ? position : 0U), "visit clip position binding");
         };
         clip(24U, 128U, full);
         clip(8U, 128U, false);
@@ -989,14 +1022,14 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
             ? trace.kernel<decode::AppendKvHostBf16>("prepared-bf16-kv-host-r1", grid(8U, 128U)).args
             : trace.kernel<decode::AppendKvBf16>("prepared-bf16-kv-step", grid(8U, 128U));
         check(append.key_cache == cached.kv.keys && append.value_cache == cached.kv.values &&
-              append.position == (key.program.tap ? nullptr : &descriptor.row[0].position) && append.first_position == position &&
+              append.position == (key.program.tap ? nullptr : &descriptor.row[0].position) && append.first_position == (key.program.tap ? position : 0U) &&
               append.capacity == cached.kv.slots && append.wrapped == cached.kv.wrapped, "visit KV append binding");
         const auto flash_grid = grid(24U, 256U, 1U, 1U, 35840U);
         const auto flash = key.program.tap
             ? trace.kernel<decode::PreparedFlashHostBf16>("prepared-flash-pad2-d128-host-r1", flash_grid).args
             : trace.kernel<decode::PreparedFlashBf16>("prepared-flash-pad2-d128", flash_grid);
         check(flash.key_cache == append.key_cache && flash.value_cache == append.value_cache &&
-              flash.position == append.position && flash.first_position == position && flash.window == (full ? 0U : kSlidingWindow) &&
+              flash.position == append.position && flash.first_position == append.first_position && flash.window == (full ? 0U : kSlidingWindow) &&
               flash.relative_bias == relative.output && flash.sinks == sinks.values, "visit flash binding");
         const auto finite = trace.kernel<decode::PreparedFinite>("prepared-finite-check", grid(96U));
         check(finite.failure == flags.data() + visit.logical_layer && finite.rows.output == flash.output,
@@ -1276,6 +1309,7 @@ int main(int argc, const char** argv) try {
           "the declared step plan changed with position");
     check_compiler_admission(decode.stages(), short_plan);
     check_compiler_admission(decode.stages(), long_plan);
+    check_packet_padding();
     check_transfer_nodes();
     FixtureWeights weights;
     for (const auto position : {7U, 4096U}) {
