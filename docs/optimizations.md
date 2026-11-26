@@ -1,5 +1,74 @@
 # Optimizations
 
+<a id="pair-startup-contract"></a>
+### Shared two-rank startup contract
+
+GLM and MiniMax rank and serve, DeepSeek pair serve, and Hy4 rank send a versioned
+304-byte startup record in each direction. Bindings compare executable and model
+content, GPU architecture, route and profile, and the fields that govern the
+entry point's frame layout. Each peer refuses a mismatch before model traffic.
+Resource offers can differ and are resolved by their admission policy.
+[Shared record](../include/strix/pair/handshake.hpp) · [Host cases](../tests/pair_lockstep_tests.cpp).
+
+<a id="pair-half-sum-wire-contract"></a>
+### Shared GLM and MiniMax half-sum wire contract
+
+The shared schedule describes two FP32 half-sums per layer and a final argmax.
+Each engine supplies its tag vocabulary and trailer identity. Host traces cover
+both ranks, decode at 1 and 8 rows, prefill at 32 rows, and inline and deferred
+CRC. The extraction preserves frame bytes and message counts.
+[Implementation](../src/xport/half_sum_wire.hpp).
+
+<a id="pair-state-staging"></a>
+### Shared pair handoff staging
+
+The Qwen pair handoff binds the shared two-slot pinned staging implementation
+with its existing piece capacity. The wire programs retain their ordering and
+copy fences. Host fixtures cover both copy directions, trailing short pieces,
+failed receipts and state ownership.
+[Implementation](../src/xport/hip_state_staging.hpp).
+
+<a id="pair-split-phase-plan"></a>
+### Explicit split-phase pair planning
+
+Callers supply prefill and decode estimates and a named transition with link,
+time and per-rank peak memory requirements. The planner checks matching device
+and calibration evidence and budgets the transition before comparing the whole
+request against one device. The returned receipt is a prediction. Production
+selection requires a bound runner and a same-regime device receipt.
+[Planner](../include/strix/pair/planner.hpp) · [Host cases](../tests/pair_planner_tests.cpp).
+
+<a id="glm-served-fast-band-parity"></a>
+### GLM FAST band admission for one active serving lane
+
+The pair server and rank entry point resolve `pf_wmma` through the same selector.
+An eligible, fresh, whole text prompt takes the existing FAST band of 2,049 to
+8,192 rows with one actual lane, an admitted 8,192-row workspace, and the measured
+route. Slot reservation is independent of that lane count. `STRIX_GLM_PF_WMMA=0`
+turns the bundle off. Server timing and same-identity native checks are pending.
+[Band receipt](#glm-pf-wmma-x) · [Resolver](../apps/glm_rank_defaults.hpp).
+
+<a id="minimax-pair-transport-capabilities"></a>
+### MiniMax pair transport capability parity
+
+`STRIX_MM_USB4_CAPS` accepts `streams,joint,ready,deferred-crc,chunks,crc-overlap,gpu-lean`
+as comma-separated explicit capabilities on negotiated USB4 transports. Rank and
+serve report the same effective mask and supply it to both the opener and the
+communicator. Unset or empty leaves the mask at zero. Joint calibration also
+requires `STRIX_DIST_USB4_CALIBRATE=joint` and eligible links. Native timing and
+qualification are pending for the new serving cells.
+[Resolver](../src/minimax/engine/mm_defaults.cpp) · [Parity cases](../tests/serve_cli_parity_tests.cpp).
+
+<a id="glm-pair-idle-quiesce"></a>
+### GLM pair idle receive retirement
+
+With a live GPU-direct link, both GLM serving ranks retire queued device
+receives at the first idle heartbeat. They execute the same operation after
+acknowledging the heartbeat command. The heartbeat remains a 512-byte control
+block. The host fixture checks startup, work and return to idle. Native
+idle-and-resume qualification is pending.
+[Lead](../src/glm/serve/glm_serve_lead.hpp) · [Fixture](../tests/glm_serve_cpu_tests.cpp).
+
 <a id="ds41-single-attention-read-ahead"></a>
 ### Single DeepSeek attention read-ahead
 
