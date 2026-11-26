@@ -310,6 +310,12 @@ if(BUILD_TESTING)
         target_link_libraries(strix-cuda-inkling2-mini-cohort-lanes-test PRIVATE
             strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core strix_serve)
         list(APPEND _cc_mini_verify_target strix-cuda-inkling2-mini-cohort-lanes-test)
+        # The verify window program vs the eager verify pass, stage by stage (histories, K/V rows, hidden rows, taps,
+        # picks; capture, replay at the same and other positions, after commits 0..K); needs the model checkpoint.
+        add_executable(strix-cuda-inkling2-mini-window-program-test ${_cc_root}/tests/inkling2/mini_window_program_cuda.cu)
+        target_link_libraries(strix-cuda-inkling2-mini-window-program-test PRIVATE
+            strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core)
+        list(APPEND _cc_mini_verify_target strix-cuda-inkling2-mini-window-program-test)
         # The screened-head lever: greedy picks == the full head, and a sampled serving lane reads the scores of its own
         # (screened) step; needs the model checkpoint.
         add_executable(strix-cuda-inkling2-mini-screened-scores-test

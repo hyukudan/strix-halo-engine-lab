@@ -407,6 +407,17 @@ public:
     }
     [[nodiscard]] std::span<float> step_program_embeddings() noexcept { return embeddings_.span().first(kHiddenWidth); }
     [[nodiscard]] std::span<float> step_program_hidden() noexcept { return hidden_.span().first(kHiddenWidth); }
+    // Verify window programs (MiniResidentBackend::try_window_graph): an explicit opt-in until the device identity
+    // fixture (tests/inkling2/mini_window_program_device_fixture.hpp) proves every stage of the captured window equal to
+    // the eager verify pass; off, every staged verify window runs eagerly (the incumbent route).
+    void set_window_programs(bool enabled) noexcept { window_programs_ = enabled; }
+    [[nodiscard]] bool window_programs() const noexcept { return window_programs_; }
+    // The final hidden rows of the last append (device rows, the head inputs) and the DSpark tap plane (device, every
+    // position): read-only views for the window program identity fixture.
+    [[nodiscard]] std::span<const float> last_hidden_rows(unsigned rows) const {
+        return hidden_.span().first(std::size_t{rows} * kHiddenWidth);
+    }
+    [[nodiscard]] std::span<const std::uint16_t> draft_tap_plane() const noexcept { return draft_taps_.span(); }
     [[nodiscard]] std::span<float> step_program_logits() noexcept { return logits_.span().first(kOutputVocabulary); }
     [[nodiscard]] core::ResidentGreedy& step_program_greedy() noexcept { return greedy_; }
     // The lever's screened head (nullptr: the full head) and the count of a step the program picked through it.
@@ -1218,8 +1229,8 @@ private:
         // rows; MiniResidentBackend::try_window_graph). The program captures the head it ran: a change of head form drops
         // it with the step graph (abandon_capture / reset_step_graph).
         std::optional<MiniResidentBackend::WindowProgram> window;
-        if (kind == MiniAppendKind::verify && multi_pick && host_logits.empty() && !scores_read && !lowbit &&
-            backend_.step_graphs())
+        if (window_programs_ && kind == MiniAppendKind::verify && multi_pick && host_logits.empty() && !scores_read &&
+            !lowbit && backend_.step_graphs())
             window = window_program(state, ids);
         struct ClearWindow {
             MiniResidentBackend& backend;
@@ -1514,6 +1525,9 @@ private:
         float* scores = nullptr;
     } pending_scores_;
     std::optional<Screen> screen_;
+#if !defined(__HIPCC__)
+    bool window_programs_{false};  // set_window_programs: opt-in until the device identity fixture passes
+#endif
 #if defined(__HIPCC__)
     bool verify_lanes_pick_{false};  // verify rows level 2 admitted (set_verify_rows): lanes screened picks
 #endif
