@@ -10,6 +10,7 @@
 #include <span>
 #include <vector>
 
+#include "strix/attn/hybrid_rope.hpp"
 #include "strix/ds41_scalar_codecs.hpp"
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
@@ -106,10 +107,7 @@ DS41A_HD std::uint32_t order_key(float x) {  // monotone float -> uint32 (for se
 struct RopeRow { float c[kRopePairs]; float s[kRopePairs]; };
 enum class RopeKind : std::uint8_t { window, compressed };  // theta 10000 / theta 160000 + YaRN (factor 16 over 65536)
 RopeRow rope_row(RopeKind kind, std::uint64_t position);
-DS41A_HD void rope_pair(float& x0, float& x1, float c, float s, bool inverse) {
-    const float a = x0, b = x1;
-    if (!inverse) { x0 = a * c - b * s; x1 = a * s + b * c; } else { x0 = a * c + b * s; x1 = b * c - a * s; }
-}
+using strix::attn::rope_pair;
 
 // ---- layer plan: KV / index sources and reuse (released config) ----
 struct LayerAttention {

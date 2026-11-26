@@ -11,11 +11,14 @@
 
 namespace strix::hc {
 
+enum class FnLayout { mix_major, feature_major };
+
 struct SiteWeights {
     std::span<const std::uint16_t> fn_f16;  // FnType::f16: [mix_rows][flat]
     std::span<const float> fn_f32;          // FnType::f32: [mix_rows][flat]
     std::span<const float> base;            // [mix_rows]
     std::span<const float> scale;           // [scale_count]
+    FnLayout layout = FnLayout::mix_major;  // feature_major F32: [flat][mix_rows]
 };
 
 struct Mix {

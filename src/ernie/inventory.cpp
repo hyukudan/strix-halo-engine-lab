@@ -13,6 +13,12 @@ namespace {
 using enum Module;
 using weight::Error;
 using weight::Status;
+namespace dim = data::dims;
+namespace att = data::attention;
+namespace moe = data::moe;
+namespace extra = data::extras;
+constexpr auto kFlat = extra::hc_mult * dim::hidden;
+constexpr auto kMix = (2 + extra::hc_mult) * extra::hc_mult;
 
 struct Matrix {
     std::string_view name;
@@ -38,123 +44,125 @@ void tensor(Schema& schema, std::string name, Module module, std::string_view dt
 void fp8(Schema& schema, const std::string& prefix, const Matrix& matrix) {
     const auto name = prefix + std::string(matrix.name);
     tensor(schema, name, matrix.module, "F8_E4M3", matrix.rows, matrix.columns);
-    const auto stem = name.ends_with(".weight") ? name.substr(0, name.size() - 7U) : name;
-    tensor(schema, stem + ".weight_scale_inv", matrix.module, "F32",
-           (matrix.rows + 127U) / 128U, (matrix.columns + 127U) / 128U);
+    constexpr auto block_rows = model::narrow<std::uint64_t>(data::weights::checkpoint::weight_block_size[0]);
+    constexpr auto block_columns = model::narrow<std::uint64_t>(data::weights::checkpoint::weight_block_size[1]);
+    tensor(schema, inverse_scale_name(name), matrix.module, "F32",
+           (matrix.rows + block_rows - 1U) / block_rows, (matrix.columns + block_columns - 1U) / block_columns);
 }
 
-// The grouped output projection is the one FP8 matrix whose scale suffix uses
-// an underscore after the tensor name itself.
-void grouped_projection(Schema& schema, const std::string& prefix) {
-    const auto name = prefix + "linear_o_group_proj";
-    tensor(schema, name, hca, "F8_E4M3", 8192, 4096);
-    tensor(schema, name + "_scale_inv", hca, "F32", 64, 32);
-}
-
-void add_attention(Schema& schema, const std::string& prefix, bool sparse, bool compressed) {
-    tensor(schema, prefix + "vha_postmix_U", value_head_mix, "BF16", 64, 16);
-    tensor(schema, prefix + "vha_postmix_V", value_head_mix, "BF16", 64, 16);
-    fp8(schema, prefix, {"gate_proj.weight", attention_gate, sparse ? 16384U : 8192U, 1024});
-    fp8(schema, prefix, {"o_proj.weight", sparse ? mla : hca, 4096, sparse ? 16384U : 8192U});
+void add_attention(Schema& schema, const std::string& prefix, bool sparse, std::uint64_t compression) {
+    constexpr auto mla_value = dim::n_heads * att::mla::v_head_dim;
+    constexpr auto grouped_value = att::o_groups * att::o_lora_rank;
+    const auto value_width = sparse ? std::uint64_t{mla_value} : std::uint64_t{grouped_value};
+    tensor(schema, prefix + "vha_postmix_U", value_head_mix, "BF16", dim::n_heads, att::vha_rank);
+    tensor(schema, prefix + "vha_postmix_V", value_head_mix, "BF16", dim::n_heads, att::vha_rank);
+    fp8(schema, prefix, {"gate_proj.weight", attention_gate, value_width, att::q_lora_rank});
+    fp8(schema, prefix, {"o_proj.weight", sparse ? mla : hca, dim::hidden, value_width});
     const auto core = prefix + "core_attention.";
     if (sparse) {
         constexpr Matrix projections[]{
-            {"q_a_proj.weight", mla, 1024, 4096}, {"q_b_proj.weight", mla, 16384, 1024},
-            {"kv_a_proj_with_mqa.weight", mla, 576, 4096}, {"kv_b_proj.weight", mla, 28672, 512},
-            {"core_attention.indexer.wq_b.weight", sparse_indexer, 8192, 1024},
+            {"q_a_proj.weight", mla, att::mla::q_lora_rank, dim::hidden},
+            {"q_b_proj.weight", mla, dim::n_heads * (att::mla::qk_nope_head_dim + att::mla::qk_rope_head_dim), att::mla::q_lora_rank},
+            {"kv_a_proj_with_mqa.weight", mla, att::mla::kv_lora_rank + att::mla::qk_rope_head_dim, dim::hidden},
+            {"kv_b_proj.weight", mla, att::mla::n_kv_heads * (att::mla::qk_nope_head_dim + att::mla::v_head_dim), att::mla::kv_lora_rank},
+            {"core_attention.indexer.wq_b.weight", sparse_indexer, att::indexer::index_n_heads * att::indexer::index_head_dim, att::mla::q_lora_rank},
         };
         for (const auto& projection : projections) fp8(schema, prefix, projection);
-        tensor(schema, prefix + "q_a_layernorm.weight", mla, "BF16", 1024);
-        tensor(schema, prefix + "kv_a_layernorm.weight", mla, "BF16", 512);
-        tensor(schema, core + "softmax_offset", mla, "BF16", 64);
+        tensor(schema, prefix + "q_a_layernorm.weight", mla, "BF16", att::mla::q_lora_rank);
+        tensor(schema, prefix + "kv_a_layernorm.weight", mla, "BF16", att::mla::kv_lora_rank);
+        tensor(schema, core + "softmax_offset", mla, "BF16", dim::n_heads);
         const auto indexer = core + "indexer.";
-        tensor(schema, indexer + "wk.weight", sparse_indexer, "BF16", 128, 4096);
-        tensor(schema, indexer + "weights_proj.weight", sparse_indexer, "BF16", 64, 4096);
-        tensor(schema, indexer + "k_norm.weight", sparse_indexer, "BF16", 128);
-        tensor(schema, indexer + "k_norm.bias", sparse_indexer, "BF16", 128);
-        tensor(schema, indexer + "flashindexer_bias", flash_indexer, "BF16", 64);
-        tensor(schema, indexer + "linear_gate.weight", flash_indexer, "BF16", 64, 4096);
+        tensor(schema, indexer + "wk.weight", sparse_indexer, "BF16", att::indexer::index_head_dim, dim::hidden);
+        tensor(schema, indexer + "weights_proj.weight", sparse_indexer, "BF16", att::indexer::index_n_heads, dim::hidden);
+        tensor(schema, indexer + "k_norm.weight", sparse_indexer, "BF16", att::indexer::index_head_dim);
+        tensor(schema, indexer + "k_norm.bias", sparse_indexer, "BF16", att::indexer::index_head_dim);
+        tensor(schema, indexer + "flashindexer_bias", flash_indexer, "BF16", att::indexer::index_n_heads);
+        tensor(schema, indexer + "linear_gate.weight", flash_indexer, "BF16", att::indexer::index_n_heads, dim::hidden);
     } else {
         constexpr Matrix projections[]{
-            {"linear_q_down_proj.weight", hca, 1024, 4096},
-            {"linear_q_up_proj.weight", hca, 32768, 1024},
-            {"linear_kv_proj.weight", hca, 512, 4096},
+            {"linear_q_down_proj.weight", hca, att::q_lora_rank, dim::hidden},
+            {"linear_q_up_proj.weight", hca, dim::n_heads * dim::head_dim, att::q_lora_rank},
+            {"linear_kv_proj.weight", hca, att::kv_lora_rank, dim::hidden},
+            {"linear_o_group_proj", hca, grouped_value, (dim::n_heads / att::o_groups) * att::v_head_dim},
         };
         for (const auto& projection : projections) fp8(schema, prefix, projection);
-        grouped_projection(schema, prefix);
-        tensor(schema, prefix + "q_layernorm.weight", hca, "BF16", 1024);
-        tensor(schema, prefix + "kv_layernorm.weight", hca, "BF16", 512);
-        tensor(schema, core + "attn_sink", hca, "F32", 64);
-        if (!compressed) return;
+        tensor(schema, prefix + "q_layernorm.weight", hca, "BF16", att::q_lora_rank);
+        tensor(schema, prefix + "kv_layernorm.weight", hca, "BF16", att::kv_lora_rank);
+        tensor(schema, core + "attn_sink", hca, "F32", dim::n_heads);
+        if (compression == 0) return;
         const auto comp = core + "compressor.";
-        tensor(schema, comp + "ape", compressor, "F32", 128, 512);
-        tensor(schema, comp + "linear_wgate.weight", compressor, "BF16", 512, 4096);
-        tensor(schema, comp + "linear_wkv.weight", compressor, "BF16", 512, 4096);
-        tensor(schema, comp + "norm.weight", compressor, "BF16", 512);
+        tensor(schema, comp + "ape", compressor, "F32", compression, att::kv_lora_rank);
+        tensor(schema, comp + "linear_wgate.weight", compressor, "BF16", att::kv_lora_rank, dim::hidden);
+        tensor(schema, comp + "linear_wkv.weight", compressor, "BF16", att::kv_lora_rank, dim::hidden);
+        tensor(schema, comp + "norm.weight", compressor, "BF16", att::kv_lora_rank);
     }
 }
 
 void add_moe(Schema& schema, const std::string& prefix) {
-    tensor(schema, prefix + "e_score_correction_bias", router, "F32", 512);
-    tensor(schema, prefix + "gate.routed_scaling_factor_param", router, "F32", 512);
-    tensor(schema, prefix + "gate.weight", router, "BF16", 512, 4096);
-    tensor(schema, prefix + "gate.weight_1", router, "BF16", 512, 4096);
-    tensor(schema, prefix + "latent_norm.weight", latent_projection, "BF16", 2048);
+    tensor(schema, prefix + "e_score_correction_bias", router, "F32", kExpertCount);
+    tensor(schema, prefix + "gate.routed_scaling_factor_param", router, "F32", kExpertCount);
+    tensor(schema, prefix + "gate.weight", router, "BF16", kExpertCount, dim::hidden);
+    tensor(schema, prefix + "gate.weight_1", router, "BF16", kExpertCount, dim::hidden);
+    constexpr auto latent = moe::moe_latent_size, intermediate = moe::moe_intermediate_size;
+    tensor(schema, prefix + "latent_norm.weight", latent_projection, "BF16", latent);
     constexpr Matrix projections[]{
-        {"fc1_latent_proj.weight", latent_projection, 2048, 4096},
-        {"fc2_latent_proj.weight", latent_projection, 4096, 2048},
-        {"shared_experts.w1.weight", shared_expert, 2048, 4096},
-        {"shared_experts.w2.weight", shared_expert, 4096, 2048},
-        {"shared_experts.w3.weight", shared_expert, 2048, 4096},
+        {"fc1_latent_proj.weight", latent_projection, latent, dim::hidden},
+        {"fc2_latent_proj.weight", latent_projection, dim::hidden, latent},
+        {"shared_experts.w1.weight", shared_expert, intermediate * moe::n_shared_experts, dim::hidden},
+        {"shared_experts.w2.weight", shared_expert, dim::hidden, intermediate * moe::n_shared_experts},
+        {"shared_experts.w3.weight", shared_expert, intermediate * moe::n_shared_experts, dim::hidden},
     };
     for (const auto& projection : projections) fp8(schema, prefix, projection);
     for (unsigned expert = 0; expert < kExpertCount; ++expert) {
         const auto base = prefix + "experts." + std::to_string(expert) + ".";
         for (const auto* proj : {"w1", "w2", "w3"}) {
-            const auto name = base + proj;
-            tensor(schema, name + ".weight", routed_expert, "I8", 2048, 1024);
-            tensor(schema, name + ".weight_scale_inv", routed_expert, "F8_E8M0", 2048, 64);
+            const auto name = base + proj + ".weight";
+            const auto rows = std::string_view(proj) == "w2" ? latent : intermediate;
+            const auto columns = std::string_view(proj) == "w2" ? intermediate : latent;
+            tensor(schema, name, routed_expert, "I8", static_cast<std::uint64_t>(rows), static_cast<std::uint64_t>(columns / 2));
+            tensor(schema, inverse_scale_name(name), routed_expert, "F8_E8M0", static_cast<std::uint64_t>(rows),
+                   static_cast<std::uint64_t>(columns / data::weights::checkpoint::expert_block_columns));
         }
     }
 }
 
-void add_block(Schema& schema, const std::string& prefix, bool sparse, bool compressed) {
-    tensor(schema, prefix + "input_layernorm.weight", layer_norm, "BF16", 4096);
-    tensor(schema, prefix + "post_attention_layernorm.weight", layer_norm, "BF16", 4096);
+void add_block(Schema& schema, const std::string& prefix, bool sparse, std::uint64_t compression) {
+    tensor(schema, prefix + "input_layernorm.weight", layer_norm, "BF16", dim::hidden);
+    tensor(schema, prefix + "post_attention_layernorm.weight", layer_norm, "BF16", dim::hidden);
     for (const auto* hc : {"self_attention_hyper_connection.", "mlp_hyper_connection."}) {
         const auto base = prefix + hc;
         for (const auto* scalar : {"alpha_pre", "alpha_post", "alpha_res"})
             tensor(schema, base + scalar, hyper_connection, "F32", 1);
-        tensor(schema, base + "bias", hyper_connection, "F32", 24);
-        tensor(schema, base + "mapping_proj.weight", hyper_connection, "F32", 16384, 24);
+        tensor(schema, base + "bias", hyper_connection, "F32", kMix);
+        tensor(schema, base + "mapping_proj.weight", hyper_connection, "F32", kFlat, kMix);
     }
-    add_attention(schema, prefix + "self_attn.", sparse, compressed);
+    add_attention(schema, prefix + "self_attn.", sparse, compression);
 }
 
 void add_contract(Schema& schema, const std::string& prefix) {
-    tensor(schema, prefix + "hc_head_base", hc_contract, "F32", 4);
-    tensor(schema, prefix + "hc_head_fn", hc_contract, "F32", 16384, 4);
+    tensor(schema, prefix + "hc_head_base", hc_contract, "F32", extra::hc_mult);
+    tensor(schema, prefix + "hc_head_fn", hc_contract, "F32", kFlat, extra::hc_mult);
     tensor(schema, prefix + "hc_head_scale", hc_contract, "F32", 1);
 }
 
 const Schema& known_schema() {
     static const Schema schema = [] {
         Schema rows;
-        tensor(rows, "model.embed_tokens.weight", embedding, "BF16", 201216, 4096);
-        tensor(rows, "lm_head.weight", lm_head, "BF16", 201216, 4096);
-        tensor(rows, "model.lm_head.multimax_ranges", lm_head, "BF16", 4);
-        tensor(rows, "model.lm_head.multimax_ts", lm_head, "BF16", 4);
-        tensor(rows, "model.norm.weight", final_norm, "BF16", 4096);
+        tensor(rows, "model.embed_tokens.weight", embedding, "BF16", dim::vocab, dim::hidden);
+        tensor(rows, "lm_head.weight", lm_head, "BF16", dim::vocab, dim::hidden);
+        tensor(rows, "model.lm_head.multimax_ranges", lm_head, "BF16", extra::multimax_parameters);
+        tensor(rows, "model.lm_head.multimax_ts", lm_head, "BF16", extra::multimax_parameters);
+        tensor(rows, "model.norm.weight", final_norm, "BF16", dim::hidden);
         add_contract(rows, "model.mhc_contract.");
         for (unsigned layer = 0; layer < kLayerCount; ++layer) {
-            const auto prefix = "model.layers." + std::to_string(layer) + ".";
-            const bool sparse = std::ranges::find(kMlaLayers, std::int64_t{layer}) != std::ranges::end(kMlaLayers);
-            add_block(rows, prefix, sparse, !sparse);
-            if (layer == 0) {
+            const auto prefix = target_layer_prefix(layer);
+            const bool sparse = layer_is_mla(layer);
+            add_block(rows, prefix, sparse, sparse ? 0U : static_cast<std::uint64_t>(att::compress_ratios[layer]));
+            if (!layer_has_moe(layer)) {
                 constexpr Matrix dense[]{
-                    {"mlp.gate_proj.weight", dense_mlp, 14336, 4096},
-                    {"mlp.up_proj.weight", dense_mlp, 14336, 4096},
-                    {"mlp.down_proj.weight", dense_mlp, 4096, 14336},
+                    {"mlp.gate_proj.weight", dense_mlp, dim::intermediate, dim::hidden},
+                    {"mlp.up_proj.weight", dense_mlp, dim::intermediate, dim::hidden},
+                    {"mlp.down_proj.weight", dense_mlp, dim::hidden, dim::intermediate},
                 };
                 for (const auto& projection : dense) fp8(rows, prefix, projection);
             } else {
@@ -163,15 +171,15 @@ const Schema& known_schema() {
         }
         const std::string draft = "model.mtp.";
         add_contract(rows, draft + "mhc_contract.");
-        tensor(rows, draft + "norm.weight", final_norm, "BF16", 4096);
-        tensor(rows, draft + "feature_norm.weight", draft_input, "BF16", 4096);
-        fp8(rows, draft, {"feature_projection.weight", draft_input, 4096, 12288});
-        tensor(rows, draft + "markov_head.markov_w1.weight", draft_markov, "BF16", 256, 201216);
-        tensor(rows, draft + "markov_head.markov_w2.weight", draft_markov, "BF16", 201216, 256);
-        tensor(rows, draft + "confidence_head.projection.weight", draft_confidence, "BF16", 1, 4352);
+        tensor(rows, draft + "norm.weight", final_norm, "BF16", dim::hidden);
+        tensor(rows, draft + "feature_norm.weight", draft_input, "BF16", dim::hidden);
+        fp8(rows, draft, {"feature_projection.weight", draft_input, extra::dspark_feature_projection[0], extra::dspark_feature_projection[1]});
+        tensor(rows, draft + "markov_head.markov_w1.weight", draft_markov, "BF16", data::drafter::rank, dim::vocab);
+        tensor(rows, draft + "markov_head.markov_w2.weight", draft_markov, "BF16", dim::vocab, data::drafter::rank);
+        tensor(rows, draft + "confidence_head.projection.weight", draft_confidence, "BF16", 1, extra::dspark_confidence_input);
         for (unsigned layer = 0; layer < kDraftLayerCount; ++layer) {
             const auto prefix = draft + std::to_string(layer) + ".";
-            add_block(rows, prefix, false, false);
+            add_block(rows, prefix, false, 0U);
             add_moe(rows, prefix + "block_sparse_moe.");
         }
         return rows;
@@ -250,7 +258,19 @@ std::string main_shard_name(unsigned index) {
     if (index == 0 || index > kMainShardCount) throw std::out_of_range("ERNIE shard index");
     auto number = std::to_string(index);
     number.insert(0, 5U - number.size(), '0');
-    return "model-" + number + "-of-00128.safetensors";
+    auto count = std::to_string(kMainShardCount);
+    count.insert(0, 5U - count.size(), '0');
+    return "model-" + number + "-of-" + count + ".safetensors";
+}
+
+std::string target_layer_prefix(unsigned layer) {
+    return "model.layers." + std::to_string(layer) + ".";
+}
+
+std::string inverse_scale_name(std::string_view name) {
+    if (name.ends_with("linear_o_group_proj")) return std::string(name) + "_scale_inv";
+    if (!name.ends_with(".weight")) throw std::invalid_argument("ERNIE: weight has no inverse-scale naming rule");
+    return std::string(name.substr(0, name.size() - std::string_view(".weight").size())) + ".weight_scale_inv";
 }
 
 Status add_shard(const weight::TensorIndex& shard, Inventory& inventory) {
@@ -271,7 +291,7 @@ Status add_shard(const weight::TensorIndex& shard, Inventory& inventory) {
                 return {Error::malformed, "wire dtype or shape disagrees for " + raw.name};
             module = expected.module;
         }
-        if ((module == flash_indexer) != (shard_name == kFlashIndexerShard))
+        if (module != unclassified && (module == flash_indexer) != (shard_name == kFlashIndexerShard))
             return {Error::malformed, "unexpected FlashIndexer shard mapping for " + raw.name};
         const bool drafter = raw.name.starts_with("model.mtp.");
         pending.emplace(raw.name, Tensor{module, drafter, tensor_layer(raw.name, drafter),

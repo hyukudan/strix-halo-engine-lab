@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
-#include <numbers>
 #include <stdexcept>
 #include <string>
 
@@ -36,7 +35,7 @@ void rms_norm_512(const float* x, const float* w, float* y) {
     for (unsigned d = 0; d < kHeadDim; ++d) y[d] = (x[d] * r) * w[d];
 }
 void rope_tail(float* v, unsigned dim, const RopeRow& rope, bool inverse) {
-    for (unsigned i = 0; i < kRopePairs; ++i) rope_pair(v[dim - kRopeDim + 2 * i], v[dim - kRopeDim + 2 * i + 1], rope.c[i], rope.s[i], inverse);
+    strix::attn::hybrid_rope_tail({v, dim}, dim, rope.c, rope.s, inverse);
 }
 void quant_fp4_e4m3_16(const float* x, std::uint8_t* entry) {  // 512 values -> 288 B
     for (unsigned g = 0; g < 32; ++g) {
@@ -72,29 +71,10 @@ void check_rows(std::size_t rows) {
 }  // namespace
 
 RopeRow rope_row(RopeKind kind, std::uint64_t position) {
-    // rope_head_dim 64: frequencies 1 / base^(2i/64); compressed layers: base 160000 with YaRN (factor 16, original
-    // 65536, beta_fast 32, beta_slow 1); window-only layers: base 10000 without YaRN. Double, rounded once.
-    const double dim = kRopeDim, base = kind == RopeKind::window ? 10000.0 : 160000.0;
+    constexpr strix::attn::HybridYarn yarn{65536.0, 16.0, 32.0, 1.0};
     RopeRow r{};
-    double low = 0, high = 0;
-    if (kind == RopeKind::compressed) {
-        const auto corrected = [&](double rotations) {
-            return dim * std::log(65536.0 / (rotations * 2.0 * std::numbers::pi)) / (2.0 * std::log(base));
-        };
-        low = std::max(std::floor(corrected(32.0)), 0.0);
-        high = std::min(std::ceil(corrected(1.0)), dim - 1.0);
-    }
-    for (unsigned i = 0; i < kRopePairs; ++i) {
-        double f = 1.0 / std::pow(base, (2.0 * i) / dim);
-        if (kind == RopeKind::compressed) {
-            const double ramp = std::clamp((i - low) / std::max(high - low, 1e-3), 0.0, 1.0);
-            const double smooth = 1.0 - ramp;
-            f = f / 16.0 * (1.0 - smooth) + f * smooth;
-        }
-        const double angle = static_cast<double>(position) * f;
-        r.c[i] = static_cast<float>(std::cos(angle));
-        r.s[i] = static_cast<float>(std::sin(angle));
-    }
+    strix::attn::hybrid_rope_row(position, kind == RopeKind::window ? 10000.0 : 160000.0,
+        kind == RopeKind::compressed ? &yarn : nullptr, r.c, r.s);
     return r;
 }
 

@@ -29,4 +29,17 @@ inline void linear_reference(std::span<const float> matrix, std::span<const floa
     }
 }
 
+// The row-major matrix stores one block per group, with no off-diagonal
+// weights. Inputs and outputs are contiguous group-major rows.
+inline void grouped_linear_reference(std::span<const float> matrix, std::span<const float> input,
+                                     std::span<float> output, unsigned groups) {
+    if (groups == 0 || input.empty() || output.empty() ||
+        input.size() % groups != 0 || output.size() % groups != 0 || matrix.size() % groups != 0)
+        throw std::invalid_argument("grouped linear reference: invalid groups");
+    const auto in = input.size() / groups, out = output.size() / groups, weights = matrix.size() / groups;
+    for (unsigned group = 0; group < groups; ++group)
+        linear_reference(matrix.subspan(group * weights, weights),
+                         input.subspan(group * in, in), output.subspan(group * out, out));
+}
+
 }  // namespace strix::core
