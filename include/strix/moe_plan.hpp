@@ -75,8 +75,10 @@ struct MoeRoutePlan {
 
 struct MoeExpertBatch {
     std::uint32_t expert = 0;
+    // Index into the expert-major assignment_rows and assignment_slots arrays.
     std::uint64_t assignment_offset = 0;
     std::uint32_t logical_rows = 0;
+    std::uint32_t tile_rows = logical_rows;
 };
 
 struct MoeExpertExecutionPlan {
@@ -228,6 +230,14 @@ struct MoeGroupingPlan {
 
 [[nodiscard]] MoeExpertExecutionPlan build_moe_expert_execution_plan(
     const MoeRouteRequest& request);
+
+// Opt-in schedule for kernels that share one weight traversal across a padded
+// tile. Supply strictly increasing, positive tile heights supported by the
+// backend. Each expert uses the widest full tiles and the smallest tail tile
+// that holds its remaining assignments. Padding does not add CSR entries.
+[[nodiscard]] MoeExpertExecutionPlan build_moe_expert_execution_plan(
+    const MoeRouteRequest& request,
+    std::span<const std::uint32_t> padded_tile_rows);
 
 [[nodiscard]] MoeExpertExecutionDecision select_moe_expert_execution_strategy(
     const MoeRouteRequest& request,
