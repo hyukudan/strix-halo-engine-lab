@@ -387,7 +387,17 @@ static void check_short_bitmap(const std::string& dir) {
     }
 }
 
+// The oracle rounds every product before the next add, as the library does (both are built with -ffp-contract=off).
+// (1 + 2^-12)^2 - (1 + 2^-11) is 0 with a rounded product and 2^-24 when the compiler fuses it into an FMA.
+static bool oracle_rounds_products() {
+    volatile float a = 1.0F + 0x1p-12F, c = 1.0F + 0x1p-11F;
+    const float x = a, y = c;
+    const float r = x * x - y;
+    return r == 0.0F;
+}
+
 int main() {
+    expect(oracle_rounds_products(), "oracle TU fuses a * b - c into an FMA: build this test with -ffp-contract=off");
     Rng rng(0x5eedULL);
     std::string dir;
     bool synthetic = false;
