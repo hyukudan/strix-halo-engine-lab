@@ -142,6 +142,10 @@ dump and otherwise writes `manifest-r<rank>.json`: run id, arm, rank, binary sha
 launch environment, each prompt's token-file sha256 and each dump's size, sha256 and width.
 `--attest sel_mode=N` must equal the mode the engine itself wrote into its selection dump, so an
 arm whose switch was not applied cannot be sealed under the wrong name.
+For a FAST candidate failure capture, `seal --capture-nonfinite` (and `witness --capture-nonfinite`
+if a witness is used) retains the original hashes and complete dumps. `compare` returns FAIL and
+includes `pooled.nonfinite_candidate` with `--json`. Nonfinite reference or null logits still give
+no verdict. Use the v2 quality gate for promotion; v1 is retained to reproduce historical audits.
 
 `compare` re-hashes every dump against its manifest, requires different run ids for the two
 arms and the same prompts, rows and vocabulary slices, then prints per prompt and pooled

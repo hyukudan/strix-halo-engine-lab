@@ -1,5 +1,10 @@
 # Optimizations
 
+<a id="platform-fast-capture-nonfinite"></a>
+### FAST candidate failure capture
+
+`fast_logit_gate.py seal --capture-nonfinite` retains sealed candidate logits so that a valid paired FAST comparison records a nonfinite candidate as FAIL. Add the same switch to `witness` if needed. Omit the switch to refuse nonfinite dumps at sealing. This host-only qualification option changes no engine arithmetic or defaults.
+
 <a id="ds41-single-attention-read-ahead"></a>
 ### Single DeepSeek attention read-ahead
 
