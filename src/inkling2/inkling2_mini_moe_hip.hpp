@@ -41,9 +41,10 @@ inline hipError_t enqueue_mini_hip_resident_moe(
     std::span<const float> router_logits, std::span<const float> bias, std::span<float> output,
     MiniMoeResidentRouteBuffers buffers, std::span<const MiniMoeExpert> matrices,
     moe_core::device_grouped::CsrTables csr, moe_core::device_grouped::Output out,
-    MiniMoeWorkspace workspace, hipStream_t stream, moe::RouteTap* tap = nullptr) {
+    MiniMoeWorkspace workspace, hipStream_t stream, moe::RouteTap* tap = nullptr,
+    moe_core::grouped_iu4a4::Selection iu4 = {}) {
     return enqueue_mini_hip_resident_moe_for<MiniMoeConfig>(physical, rows, input, router_logits, bias, output, buffers,
-                                                            matrices, csr, out, workspace, stream, tap);
+                                                            matrices, csr, out, workspace, stream, tap, iu4);
 }
 #endif
 
