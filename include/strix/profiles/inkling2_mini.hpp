@@ -175,6 +175,17 @@ inline constexpr std::string_view kMiniScreenedHead = "inkling2-mini-screened-he
 // bitwise the incumbent) makes it a default. Value 2 adds the lanes pick: greedy picks whose scores nobody reads (verify
 // windows, served cohorts whose groups declare no score read) take the lanes form of the EXACT screened head (BF16).
 inline constexpr std::string_view kMiniVerifyRows = "inkling2-mini-verify-rows@1";
+// Exact lever, builtin auto: the default of every tier, and the legacy identity (omit_builtin_fingerprint: only an explicit
+// off is fingerprinted; receipts in its source). Greedy speculation, exact by construction (a drafted row is committed
+// only when it equals the target's own pick, so the ids are the ids of one-row decode). "auto" resolves the speculation
+// mode of the command line and the server alike (an explicit --speculation wins): the command line's resident route
+// loads the model's MTP block drafter beside the checkpoint (strix/spec/drafter_source.hpp; --dspark FILE|off wins) and
+// buys windows through the shared block drafter; a HIP server drafts from each lane's context (the shared cohort
+// drafter) through one-lane verify windows, while one lane is live (the model's max_draft_by_live). Either way the
+// verify body is the verify rows lever at level >= 1. Speculation and a requested low-bit row never share a run
+// (mini_speculation_policy). CUDA: the step program declines (no verifier), the server
+// declines. Values: auto (builtin), off.
+inline constexpr std::string_view kMiniSpeculation = "inkling2-mini-speculation@1";
 // Image pre-processing recipe of the one vision adapter (src/inkling2/inkling2_vision.*), resolved here with the other
 // rows by the resolver the CLI and the server share. "legacy" (builtin, image identity inkling2-vision-v1) or "axial@1"
 // (the reference-checked axial recipe, image identity inkling2-vision-axial@1: checkerboard alpha, symmetric
@@ -185,7 +196,7 @@ inline constexpr std::string_view kMiniVerifyRows = "inkling2-mini-verify-rows@1
 // mini_vision_media_tier); a text-only run never applies it (mini_defer_vision_recipe), and at its builtin the row
 // stays out of the fingerprint and the receipt, so a text-only run resolves as before the row.
 inline constexpr std::string_view kMiniVisionRecipe = "inkling2-vision-recipe";
-inline constexpr std::array<profile::Lever, 18> kMiniLevers{{
+inline constexpr std::array<profile::Lever, 19> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
@@ -239,6 +250,15 @@ inline constexpr std::array<profile::Lever, 18> kMiniLevers{{
      .source = "awaits device identity on the landing head (verify score rows, picks and the continuation after a "
                "partial commit bitwise the per-row incumbent, BF16 and Q8_0 heads); HIP only",
      .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
+    {.name = kMiniSpeculation, .env = "STRIX_INK_SPECULATION", .option = "",
+     .value = {"", "", "", ""}, .builtin = "auto",
+     .kind = profile::Kind::exact, .ready = {}, .runnable = {true, true, true, true},
+     .target = "", .off = "off",
+     .source = "ink_draft t1c/t2 (cluster1 gfx1151, BF16, greedy): ids with drafting == without, CLI 3/3 and served "
+               "46/46; CLI 160 tokens code / prose / JSON 28.40 / 28.31 / 29.06 -> 29.46 / 32.77 / 42.64 tok/s, served "
+               "B=1 23.43 / 23.28 / 23.69 -> 28.58 / 31.88 / 28.67; windows only while one lane is live "
+               "(max_draft_by_live), the previous one-row route at two or more; CUDA declines (no verifier)",
+     .omit_builtin_fingerprint = true, .identity = {{{"off", "v1"}, {"auto", "v2"}}}},
     {kMiniVisionRecipe, "STRIX_INKLING2_VISION_RECIPE", "", {}, "legacy", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "axial@1", "legacy",
      "awaits the real-checkpoint reference gate (patches, hidden and projected rows) and CLI image identity on HIP "

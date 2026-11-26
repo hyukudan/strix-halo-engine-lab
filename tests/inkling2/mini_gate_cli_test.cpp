@@ -14,6 +14,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstdlib>
+#include <vector>
 
 namespace {
 
@@ -137,7 +138,16 @@ void test_cuda_route_options() {
     using Mode = strix::serve::CliSpeculation;
     constexpr auto bf16 = strix::weight::kBf16WeightStorage;
     constexpr auto q8 = strix::weight::kQ8WeightStorage;
-    auto options = parse({"1", "--generate", "4"});
+    // The row default (auto) on the CUDA step program: the program runs, speculation is declined with its reason.
+    {
+        auto by_row = parse({"1", "--generate", "4"});
+        cli::StepProgramOptions defaults;
+        const auto route = cli::resolve_cuda_step_route(by_row, defaults, bf16, false);
+        require(by_row.generation.speculation == Mode::automatic && route.program && route.speculation == Mode::off &&
+                    !route.speculation_reason.empty(),
+                "the speculation row default on the CUDA step program: declined with its reason");
+    }
+    auto options = parse({"1", "--generate", "4", "--speculation", "off"});
     cli::StepProgramOptions program;
     const auto resolve = [&](strix::weight::FormatId storage = strix::weight::kBf16WeightStorage,
                              bool resident_k1 = false) {
@@ -426,6 +436,27 @@ void test_options() {
                 strix::serve::CliSpeculation::automatic,
             "expected DSpark in automatic speculation");
     expect_invalid([] { (void)parse({"1", "--speculation", "off", "--dspark", "mtp.safetensors"}); });
+    // The speculation row (kMiniSpeculation): auto by default in every tier; an explicit mode is recorded and wins;
+    // --dspark off switches the drafter off (no sidecar lookup), and a speculating run takes the verify rows body.
+    require(parse({"1"}).generation.speculation == strix::serve::CliSpeculation::automatic &&
+                !parse({"1"}).generation.speculation_requested,
+            "speculation row default: auto");
+    require(parse({"1", "--speculation", "off"}).generation.speculation == strix::serve::CliSpeculation::off &&
+                parse({"1", "--speculation", "off"}).generation.speculation_requested,
+            "an explicit --speculation off wins over the row");
+    require(parse({"1", "--speculation", "auto"}).generation.speculation_requested, "explicit speculation recorded");
+    {
+        const auto off = parse({"1", "--speculation", "auto", "--dspark", "off"});
+        require(off.dspark_off && off.dspark == nullptr &&
+                    off.generation.speculation == strix::serve::CliSpeculation::automatic,
+                "--dspark off: no drafter file, speculation unchanged");
+    }
+    require(strix::inkling2::mini_speculation_verify_rows(0U, true) == 1U &&
+                strix::inkling2::mini_speculation_verify_rows(2U, true) == 2U &&
+                strix::inkling2::mini_speculation_verify_rows(0U, false) == 0U,
+            "a speculating run takes verify rows level >= 1");
+    require(strix::inkling2::mini_served_draft_by_live() == std::vector<std::uint32_t>({7U, 0U}),
+            "served drafts by live lanes: the model's data");
     expect_invalid([] {
         (void)parse({"1", "--speculation", "auto", "--dspark", "mtp.safetensors", "--temperature", "1"});
     });
@@ -437,6 +468,7 @@ void test_options() {
             "expected evaluation-order null arm");
     std::ostringstream profile_line;
     cli::write_profile(gate.tier, profile_line, true);
+    // The speculation row's builtin (auto) keeps the legacy receipt: no lever applied, none reported.
     require(profile_line.str() == "profile exact levers none reference BASE\n", "device profile receipt differs");
 }
 

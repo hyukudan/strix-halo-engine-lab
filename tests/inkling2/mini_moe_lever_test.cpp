@@ -63,18 +63,39 @@ void test_controller_planes() {
 // The engine resolves the W4A4 row: an unbound table would ignore STRIX_INK_MOE_W4A4 at every prompt length.
 void test_row() {
     require(mini::kMiniProfile.table.size() == mini::kMiniLevers.size(), "Inkling lever table bound to the engine");
-    require(mini::kMiniProfile.table.size() == 18U,
+    require(mini::kMiniProfile.table.size() == 19U,
             "W4A4, down image, prepared round fold, narrow experts, controller planes, projected-bias, served route, "
-            "screened head, calibrated low-bit, verify rows, image recipe, block-candidate, three StrixPack rows, folded scale rows-select and the SP4 fixed-table head");
-    require(mini::kMiniLevers[10].name == mini::kMiniVisionRecipe, "image recipe sits before the block-candidate row");
-    require(mini::kMiniLevers[11].name == strix::spec::kBlockDraftLever.name &&
-                mini::kMiniLevers[12].name == strix::weight::kAttentionHeadSP4Lever.name &&
-                mini::kMiniLevers[13].name == strix::weight::kAttentionHeadSP3Lever.name &&
-                mini::kMiniLevers[14].name == strix::weight::kAttentionHeadSP2Lever.name &&
-                mini::kMiniLevers[15].name == strix::weight::kLowBitFoldedScaleLever.name &&
-                mini::kMiniLevers[16].name == strix::weight::kLowBitRowsSelectLever.name,
+            "screened head, calibrated low-bit, verify rows, speculation, image recipe, block-candidate, three StrixPack rows, folded scale, rows-select and the SP4 fixed-table head");
+    require(mini::kMiniLevers[11].name == mini::kMiniVisionRecipe, "image recipe sits before the block-candidate row");
+    require(mini::kMiniLevers[12].name == strix::spec::kBlockDraftLever.name &&
+                mini::kMiniLevers[13].name == strix::weight::kAttentionHeadSP4Lever.name &&
+                mini::kMiniLevers[14].name == strix::weight::kAttentionHeadSP3Lever.name &&
+                mini::kMiniLevers[15].name == strix::weight::kAttentionHeadSP2Lever.name &&
+                mini::kMiniLevers[16].name == strix::weight::kLowBitFoldedScaleLever.name &&
+                mini::kMiniLevers[17].name == strix::weight::kLowBitRowsSelectLever.name,
             "existing block row retains its slot and StrixPack and both low-bit candidates are bound");
-    require(mini::kMiniLevers[17].name == mini::kMiniLowBitHead, "the SP4 fixed-table head row closes the table");
+    require(mini::kMiniLevers[18].name == mini::kMiniLowBitHead, "the SP4 fixed-table head row closes the table");
+    // The speculation row: exact, builtin auto (the default of every tier, legacy identity), off explicit.
+    const auto* speculation = std::ranges::find_if(mini::kMiniLevers, [](const profile::Lever& lever) {
+        return lever.name == mini::kMiniSpeculation;
+    });
+    require(speculation != mini::kMiniLevers.end() && speculation->kind == profile::Kind::exact &&
+                speculation->builtin == "auto" && speculation->off == "off" &&
+                std::ranges::all_of(speculation->value, [](std::string_view v) { return v.empty(); }),
+            "speculation row: exact, auto by default (builtin), off explicit");
+    for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
+        mini::MiniWeightOptions options;
+        options.tier = inputs(tier);
+        const auto incumbent = mini::resolve_mini_profile(options, true);
+        require(mini::mini_speculation(incumbent), "speculation resolves auto (the builtin)");
+        options.tier = inputs(tier);
+        options.tier.env = [](const char* key) -> const char* {
+            return std::strcmp(key, "STRIX_INK_SPECULATION") == 0 ? "off" : nullptr;
+        };
+        const auto selected = mini::resolve_mini_profile(options, true);
+        require(!mini::mini_speculation(selected) && selected.fingerprint() != incumbent.fingerprint(),
+                "STRIX_INK_SPECULATION=off switches speculation off under its own identity, in every tier");
+    }
     const auto& lever = mini::kMiniProfile.table.front();
     require(lever.name == mini::kMiniMoeW4a4 && lever.name == "inkling2-mini-moe-w4a4@1", "w4a4 identity");
     require(lever.env == "STRIX_INK_MOE_W4A4" && lever.off == "0" && lever.builtin == "0", "w4a4 off switch");

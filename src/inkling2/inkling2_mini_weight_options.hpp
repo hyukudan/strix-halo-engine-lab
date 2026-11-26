@@ -4,6 +4,7 @@
 #include "inkling2_mini_resident_route.hpp"
 #include "moe_core/grouped_w4a4.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/model_data/inkling2_mini.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
 #include "strix/serve/row_budget.hpp"
 #include "strix/weight/lowbit_pack.hpp"
@@ -20,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace strix::inkling2 {
 
@@ -171,13 +173,6 @@ inline constexpr bool mini_decode_only_pack_route_ok(bool admitted, bool decode_
     return !(admitted && decode_only) || emits_first;
 }
 
-// Lookup and drafter speculation must verify against the same incumbent target for every verify width. Until the
-// calibrated target supports both serial and multi-row verification, keep the whole speculative run on incumbent weights.
-inline constexpr bool mini_calibrated_row_allowed_for_cli(bool requested, bool speculation_requested,
-                                                          bool drafter_requested) noexcept {
-    return requested && !speculation_requested && !drafter_requested;
-}
-
 template <class Value>
 bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argument, const Value& value,
                               bool native) {
@@ -308,6 +303,80 @@ inline unsigned mini_verify_rows(const profile::Resolution& tier) {
     if (entry->value == "1") return 1U;
     if (entry->value == "2") return kMiniVerifyLanesPick;
     throw std::invalid_argument("STRIX_INK_VERIFY_ROWS must be 0, 1 or 2");
+}
+
+// Resolved speculation row (kMiniSpeculation): true = auto. The one default of the command line and the server; an
+// explicit --speculation of either entry point wins over it.
+inline bool mini_speculation(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniSpeculation);
+    if (entry == nullptr || entry->value == "off") return false;
+    if (entry->value == "auto") return true;
+    throw std::invalid_argument("STRIX_INK_SPECULATION must be off or auto");
+}
+
+// The verify rows level a speculating run selects: its verify windows take the rows body (level >= 1, an exact lever);
+// a run that does not speculate keeps the row's own level.
+inline unsigned mini_speculation_verify_rows(unsigned verify_rows, bool speculating) noexcept {
+    return speculating ? std::max(verify_rows, 1U) : verify_rows;
+}
+
+// The effective speculation of one run, the one rule of the command line and the server. `requested`: the run asks
+// for speculation (an explicit --speculation / --dspark, else the row kMiniSpeculation); `explicit_request`: it came
+// from the run's own flags. A calibrated low-bit target (the q4 row) and speculation never share a run: a verify window
+// runs the incumbent verify body, so its picks would not be the low-bit decode's picks. The explicit request wins: an
+// explicit speculation declines the low-bit row (incumbent weights, as before); a row default yields to the requested
+// low-bit row (plain decode on that target). A backend without verify windows declines with its own reason.
+struct MiniSpeculationPolicy {
+    bool requested = false;
+    bool explicit_request = false;
+    bool admitted = false;      // this run speculates
+    bool lowbit = false;        // the low-bit row stays requested
+    std::string_view reason{};  // why a requested speculation or low-bit row was declined (empty: nothing declined)
+};
+
+inline constexpr std::string_view kMiniSpeculationLowbitDecline = "calibrated low-bit target requested";
+inline constexpr std::string_view kMiniLowbitSpeculationDecline = "speculative verification needs incumbent weights";
+
+inline constexpr MiniSpeculationPolicy mini_speculation_policy(bool requested, bool explicit_request,
+                                                               bool lowbit_requested,
+                                                               std::string_view backend_decline = {}) noexcept {
+    MiniSpeculationPolicy policy{requested, explicit_request, requested, lowbit_requested, {}};
+    if (!requested) return policy;
+    if (!backend_decline.empty()) {
+        policy.admitted = false;
+        policy.reason = backend_decline;
+    } else if (lowbit_requested && explicit_request) {
+        policy.lowbit = false;
+        policy.reason = kMiniLowbitSpeculationDecline;
+    } else if (lowbit_requested) {
+        policy.admitted = false;
+        policy.reason = kMiniSpeculationLowbitDecline;
+    }
+    return policy;
+}
+
+// "strix-speculation/v1 requested auto|off source row|flag effective auto|off verify_rows N[ declined <reason>]": the
+// effective speculation of a run, printed alike by the command line and the server.
+inline std::string mini_speculation_line(const MiniSpeculationPolicy& policy, unsigned verify_rows) {
+    std::string line = "strix-speculation/v1 requested ";
+    line += policy.requested ? "auto" : "off";
+    line += policy.explicit_request ? " source flag" : " source row";
+    line += " effective ";
+    line += policy.admitted ? "auto" : "off";
+    line += " verify_rows " + std::to_string(verify_rows);
+    if (!policy.reason.empty()) {
+        line += " declined ";
+        line += policy.reason;
+    }
+    return line;
+}
+
+// Draft rows per lane by live lanes of the served cohort (models/inkling2-mini.toml [speculation]).
+inline std::vector<std::uint32_t> mini_served_draft_by_live() {
+    std::vector<std::uint32_t> rows;
+    for (const auto value : model_data::inkling2_mini::speculation::max_draft_by_live)
+        rows.push_back(static_cast<std::uint32_t>(value));
+    return rows;
 }
 
 // Resolved state of the served route lever (true: a HIP server runs the command line's route, kMiniServedCliRoute).

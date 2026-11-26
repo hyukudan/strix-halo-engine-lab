@@ -73,6 +73,10 @@ inline constexpr std::int64_t core_passes = 3;
 inline constexpr std::int64_t residual_block_layers = 6;
 } // namespace schedule
 inline constexpr std::string_view schema = "strix-model/v1";
+namespace speculation {
+inline constexpr std::string_view drafter = "mtp.safetensors";
+inline constexpr std::int64_t max_draft_by_live[] = {7, 0};
+} // namespace speculation
 namespace weights {
 namespace format {
 inline constexpr std::string_view attention = "bf16";

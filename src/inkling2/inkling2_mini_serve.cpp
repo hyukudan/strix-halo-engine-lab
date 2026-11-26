@@ -34,6 +34,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     auto& out = resolved.options;
     const auto& args = selection.arguments;
     std::optional<unsigned> explicit_rows;  // --prefill-rows
+    std::optional<bool> explicit_speculation;  // --speculation off|auto
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string_view name = args[i];
         if (name == "--dspark") throw std::invalid_argument("Inkling serving does not support --dspark");
@@ -57,7 +58,8 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
         else if (name == "--slots") out.slots = static_cast<unsigned>(number(name, value, 65535U));
         else if (name == "--kv-bytes") out.kv_bytes = number(name, value, UINT64_MAX);
         else if (name == "--speculation") {
-            if (value != "off") throw std::invalid_argument("Inkling serving requires --speculation off");
+            if (value != "off" && value != "auto") throw std::invalid_argument("Inkling --speculation must be off or auto");
+            explicit_speculation = value == "auto";
         } else throw std::invalid_argument("unknown Inkling argument " + std::string(name));
     }
     const auto resolution = resolve_mini_profile(out.weight_options, true);
@@ -72,7 +74,6 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.served_route_requested = mini_served_cli_route(resolution);
     out.attn_projected_bias = mini_attn_projected_bias(resolution);
     out.screened_head = mini_screened_head(resolution);
-    out.verify_rows = mini_verify_rows(resolution);
     out.controller_one_plane = mini_controller_one_plane(resolution);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
@@ -81,6 +82,18 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
+    // One speculation rule for the command line and the server (mini_speculation_policy: an explicit --speculation
+    // wins over the row; speculation and a requested low-bit row never share a run). Served verify windows are
+    // admitted on HIP (the verify rows body and per-slot tapes); a CUDA server declines. The admitted windows take the
+    // verify rows body; a run that does not speculate keeps the row's level.
+    out.speculation_policy = mini_speculation_policy(explicit_speculation.value_or(mini_speculation(resolution)),
+                                                     explicit_speculation.has_value(), out.weight_options.lowbit_turbo,
+                                                     resolved.backend == "hip" ? std::string_view{}
+                                                                               : std::string_view{"backend cuda"});
+    out.weight_options.lowbit_turbo = out.speculation_policy.lowbit;
+    out.speculation_requested = out.speculation_policy.requested;
+    out.speculation = out.speculation_policy.admitted;
+    out.verify_rows = mini_speculation_verify_rows(mini_verify_rows(resolution), out.speculation);
     // The W4A4 class is admitted for the resolved backend (HIP refuses a selected class instead of running BF16).
     out.moe_w4a4 = admit_mini_moe_w4a4(resolution, resolved.backend);
     // Backend admission of the served route lever (kMiniServedCliRoute): HIP runs the command line's route, a CUDA
@@ -101,8 +114,17 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
 
 serve::CohortConfig scheduling(const MiniServeOptions& opt, const serve::CohortBackend& backend) {
     serve::CohortConfig config;
-    config.context_draft = false;
-    config.max_draft = 0;
+    // Admitted speculation (the decoder staged windows: backend.max_window > 1): each greedy lane drafts from its own
+    // context (the shared cohort drafter) and verifies the window on its slot; draft rows by live lanes are the
+    // model's data (drafts only while one lane is live, the previous one-row route at two or more).
+    const bool windows = opt.speculation && backend.max_window(0U) > 1U;
+    config.context_draft = windows;
+    config.max_draft = windows ? kMiniMaxVerifyRows - 1U : 0U;
+    if (windows) config.max_draft_by_live = mini_served_draft_by_live();
+    // The cycle prior until the cohort's own fit takes over (it prices draft rows only; never ids): ticket ink_draft t1c
+    // on gfx1151, BF16 weights, a served B=1 step 42.4 ms and 10.2 ms per extra verify row -> fixed 32.2 + 10.2 per row.
+    // Without windows the cohort keeps its default prior, as before speculation existed.
+    if (windows) config.prior = {32.2, 10.2, 0.0, 0.0};
     // A prompt runs as the command line's calls (whole chunks, the final one with its tail); beside a decoding lane
     // the cohort cuts pieces of kMiniServeDecodingRows inside those chunks where the decoder's piece rule allows (HIP),
     // so the bits never depend on other lanes (the backend's prompt_piece_rule; CUDA: none, whole chunks).
@@ -150,7 +172,8 @@ private:
         cohort_.configure_api(config);
         config.capabilities_extra = [cohort = std::move(config.capabilities_extra), tier = opt.tier,
                                      requested = opt.served_route_requested, admitted = opt.served_cli_route,
-                                     weights = device_.weights](serve::Json& value) {
+                                     weights = device_.weights,
+                                     speculation = std::string(mini_served_speculation_name(opt))](serve::Json& value) {
             cohort(value);
             value.set("profile", serve::Json(mini_profile_name(tier)));
             // The served route lever, only when requested (absent: the incumbent route, as before the lever): what was
@@ -168,7 +191,7 @@ private:
                 {"status", serve::Json(profile::status_name(weights.status))},
                 {"reason", serve::Json(weights.reason)},
             }));
-            value.set("speculation", serve::Json("off"));
+            value.set("speculation", serve::Json(speculation));
         };
         config.model_id = model;
         config.default_thinking = false;
@@ -235,7 +258,7 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             out << "backend " << resolved.backend << " context " << opt.context << " prefill_rows " << opt.prefill_rows
                 << " served_route " << mini_served_route_startup_field(opt)
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
-                << " profile " << mini_profile_name(opt.tier) << " speculation off";
+                << " profile " << mini_profile_name(opt.tier) << " speculation " << mini_served_speculation_name(opt);
             const auto backend = resolved.backend == "hip" ? weight::Backend::hip : weight::Backend::cuda;
             // Without a device the plan is exact unless a full row (gate + gain) of this backend could select for this
             // instance's extent there (the same extent make_mini_device_cohort resolves with).
