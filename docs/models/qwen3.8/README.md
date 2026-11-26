@@ -37,6 +37,29 @@ T8192 (falling back through smaller tiles under memory pressure), with its exist
 See [HTTP prefill](../../engine/serving/serving.md#default-prompt-prefill). See the
 [auto route and off switches](../../getting-started/engine-reference.md#command-line).
 
+### Serving quick start
+
+The HTTP server serves exact MTP decode only, so its command line carries what the MTP route needs; the short
+`strix-serve --model qwen3.8-flash-next --profile fast --asset MODEL.gguf` alone is refused at startup
+(`--http-serve requires the tiled MTP route`, then the calibration rows). This is inherent, not a missing default:
+the predictor is qualified on the first 16 rows of a calibration prompt, the calibration golden is bound to the
+exact token ids, and the command-line tools have no tokenizer to make ids for you. Supply three things after `--`:
+
+```bash
+strix-serve --model qwen3.8-flash-next --profile fast --asset MODEL.gguf --host 127.0.0.1 --port 8080 --   --prompt-ids calibration.ids --generate 64 --mtp-bundle MODEL.gguf.mtp-bundle.json
+```
+
+- `calibration.ids`: at least 17 token ids (16 calibration rows and one more) of any representative text, for
+  example the first ids of a `prompt.ids`. `--generate` is ignored while serving but must be positive.
+- `MODEL.gguf.mtp-bundle.json`: the [distill-g recipe](../../../recipes/qwen-distill-g-yarn.mtp-bundle.json) copied
+  next to the sidecar (its relative sidecar and `draft-vocab/` paths resolve from the bundle's directory). The bundle
+  carries the pins and budgets of the explicit `--mtp ...` flags; the calibration golden is generated on the first
+  start and cached under `~/.cache/strix-engine/goldens`, so no `--mtp-golden` and no `--mtp-golden-sha256` are
+  needed.
+- No `--known-prefix-*` flags: with a bundle the server resolves its tiled prefill (T8192, smaller tiles under memory
+  pressure) and sizes the context itself, including `--context 36864`. Spell the `--known-prefix-*` budgets only for
+  the explicit-sidecar recipe in [serving](../../engine/serving/serving.md#one-node-explicit-sidecar-mtp-recipe).
+
 `prompt.ids` holds the prompt as token IDs from the model's tokenizer; the engine prints a JSON receipt with
 `generated_tokens` and timings. The plain command decodes with exact MTP speculation when the
 [drafter bundle](../../engine/speculative/mtp-native-cli.md#default-mtp-drafter-bundle) (bundle JSON, distilled

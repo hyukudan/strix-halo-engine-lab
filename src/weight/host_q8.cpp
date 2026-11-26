@@ -51,7 +51,7 @@ Status matrix_load_geometry(FormatId storage, const Shape& shape, MatrixLoadGeom
  if (is_strixpack_storage(storage))
   return {Error::unsupported_arithmetic, "Strix pack storage " + serialize_id(storage) + " requires the Strix pack loader"};
  if (!(storage == kBf16WeightStorage) && !(storage == kQ8WeightStorage) && !(storage == kQ4G64WeightStorage) &&
-     !(storage == kQ6G64WeightStorage))
+     !(storage == kQ6G64WeightStorage) && !(storage == kSP4TWeightStorage))
   return {Error::unknown_format, "no compact BF16 matrix loader for requested storage"};
  if (shape.rank != 2 || !shape.dims[0] || !shape.dims[1])
   return {Error::unsupported_shape, "weight matrix requires nonempty [N,K]"};
@@ -106,6 +106,8 @@ Status load_bf16_matrix(const Slice& source, const Shape& shape, FormatId destin
  if (source.range.bytes != input.bytes || out.size() != output.bytes)
   return {Error::malformed, "weight matrix payload size differs from planned geometry"};
  if (destination == kBf16WeightStorage) return read_slice(source, out);
+ if (destination == kSP4TWeightStorage)
+  return {Error::unknown_format, "strix.sp4t has no load-time encoder (calibrated pack only)"};
  if (destination == kQ4G64WeightStorage) return load_bf16_lowbit<Q4G64Storage>(source, input.bytes, out);
  if (destination == kQ6G64WeightStorage) return load_bf16_lowbit<Q6G64Storage>(source, input.bytes, out);
 
@@ -213,6 +215,8 @@ Status prepare_bf16_matrix_slice(const Slice& source, const Shape& shape, Format
     if (auto status = matrix_load_geometry(destination, shape, output); !status) return status;
     if (source.range.bytes != input.bytes)
         return {Error::malformed, "BF16 source size differs from matrix geometry"};
+    if (destination == kSP4TWeightStorage)
+        return {Error::unknown_format, "strix.sp4t has no load-time encoder (calibrated pack only)"};
     Slice checked{};
     if (auto status = subslice(source, {0, input.bytes}, checked); !status) return status;
     if (destination == kBf16WeightStorage) {

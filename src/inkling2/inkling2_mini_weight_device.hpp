@@ -68,7 +68,7 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
     out.compiler_id = lowbit ? "hip-clang-" + std::to_string(__clang_major__) + "." + std::to_string(__clang_minor__)
                              : weight::hip_clang_compiler_id(__clang_version__);
     const auto identity = weight::implementation_identity(lowbit
-        ? std::span<const weight::ArithmeticId>(kMiniLowBitConsumers)
+        ? mini_lowbit_consumers(options.qualify ? options.qualify->head_target() : weight::kQ4G64WeightStorage)
         : std::span<const weight::ArithmeticId>(core::kResidentQ8ArithmeticHip));
     if (lowbit) out.regime = kMiniWeightRegime;
 #else
@@ -133,13 +133,19 @@ auto load_mini_weights(const std::string& model, weight::WeightLoadPlan& plan, p
                        weight::WeightLoadExtent extent, Load load) {
     const bool lowbit = mini_lowbit_storage(plan.storage) || mini_lowbit_storage(plan.head_storage);
     const auto arithmetic = core::resident_lowbit_arithmetic(profile::resolve(kMiniProfile, options.tier));
-    if (arithmetic != kMiniLowBitArithmetic && (!lowbit || scope.backend != weight::Backend::hip))
+    const auto group_scale_storage = [](weight::FormatId storage) {
+        return storage == weight::kQ4G64WeightStorage || storage == weight::kQ6G64WeightStorage;
+    };
+    const auto admits_arithmetic = [&] {
+        return group_scale_storage(plan.storage) || group_scale_storage(plan.head_storage);
+    };
+    if (arithmetic != kMiniLowBitArithmetic && (!admits_arithmetic() || scope.backend != weight::Backend::hip))
         throw std::invalid_argument("the low-bit arithmetic candidate requires resident HIP q4_g64 or q6_g64 weights");
     if (!lowbit)
         return load_mini_weight_pack(plan, tier, options, scope, extent, {}, nullptr, std::cerr, load);
     const auto load_with_arithmetic = [&](MiniLowBitRows rows) {
         if (arithmetic != kMiniLowBitArithmetic &&
-            !mini_lowbit_storage(plan.storage) && !mini_lowbit_storage(plan.head_storage))
+            !admits_arithmetic())
             throw std::invalid_argument("the selected low-bit arithmetic lost its resident weight image");
         rows.arithmetic = arithmetic;
 #if defined(__HIPCC__)

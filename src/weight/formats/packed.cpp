@@ -21,7 +21,8 @@ std::span<const FormatDescriptor> packed_formats() {
   descriptor(kQ6G64WeightStorage,"derived-q6g64",quantized_linear,false,fixed<128,100,64>),
   strixpack_descriptor<4>(kSP4WeightStorage,"derived-sp4"),
   strixpack_descriptor<3>(kSP3WeightStorage,"derived-sp3"),
-  strixpack_descriptor<2>(kSP2WeightStorage,"derived-sp2")
+  strixpack_descriptor<2>(kSP2WeightStorage,"derived-sp2"),
+  descriptor(kSP4TWeightStorage,"derived-sp4t",quantized_linear,false,fixed<128,68,32>)
  };
  return formats;
 }

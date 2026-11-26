@@ -8,7 +8,7 @@ rows=64
 vocabulary=200058
 # Candidate weight arm: STRIX_INKLING_GATE_WEIGHTS = shared policy key (default the Q8_0 policy; low-bit mixes
 # weights.attention_head.q6_g64@1, weights.attention_q4_g64.head_q6_g64@1, weights.attention_head.q4_g64@1,
-# weights.head.q6_g64@1, weights.head.q4_g64@1),
+# weights.head.q6_g64@1, weights.head.q4_g64@1, weights.head.sp4t@1 (Strix pack SP4, calibrated pack only)),
 # STRIX_INKLING_GATE_TIER = fast (default) or turbo, STRIX_INKLING_GATE_STORAGE = the expected receipt storage text.
 # A low-bit candidate pins its calibrated pack: STRIX_LOWBIT_PACK = the pack file (required; every case of CAND and CANDF
 # must load that one file, its engine receipt must name a calibrated identity). "qual" writes OUT/qual-MODE.receipt:
@@ -24,7 +24,7 @@ cand_tier=${STRIX_INKLING_GATE_TIER:-fast}
 cand_storage=${STRIX_INKLING_GATE_STORAGE:-gguf.q8_0@1}
 case "$cand_tier" in fast|turbo) ;; *) echo "STRIX_INKLING_GATE_TIER must be fast or turbo" >&2; exit 2 ;; esac
 lowbit_candidate=0
-[[ $weight_policy == *q4_g64* || $weight_policy == *q6_g64* ]] && lowbit_candidate=1
+[[ $weight_policy == *q4_g64* || $weight_policy == *q6_g64* || $weight_policy == *sp4t* ]] && lowbit_candidate=1
 cand_route=${STRIX_INKLING_GATE_ROUTE:-$([[ $lowbit_candidate == 1 ]] && echo decode-arm || echo arm)}
 case "$cand_route" in
     arm) ;;

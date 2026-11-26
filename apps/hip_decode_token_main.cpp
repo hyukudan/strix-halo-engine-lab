@@ -1380,7 +1380,8 @@ static int run_decode_entry(
         const auto metadata = strix::decode_cli::read_rtx_state_import_metadata(options.rtx_state_import_file, options.tokens);
         options.rtx_state_import_position = strix::decode_cli::parse_rtx_state_begin(metadata).position;
     }
-    bundle_retry.selected=options.mtp.enabled && !options.mtp_bundle_path.empty();
+    // The server has no serial fallback (it requires the MTP route): its setup error is reported as it is.
+    bundle_retry.selected=options.mtp.enabled && !options.mtp_bundle_path.empty() && !options.http_serve;
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     options.mtp_cli_phase_retirement=false;
 #endif
@@ -1605,9 +1606,9 @@ static int run_decode_entry(
         const auto& m=candidate.mtp;
         // A bundle golden not yet in the cache is self-generated after load (ensure_mtp_bundle_golden) and pinned
         // then; until that point the check charges the exact v3 golden extent and verifies the sidecar only.
+        // The native route is the same: the server charges the exact golden extent and generates the golden
+        // before it listens (ensure_mtp_bundle_golden), so a first start with a discovered drafter works.
         const bool golden_pending=!candidate.mtp_bundle_path.empty() && m.golden.empty();
-        if (golden_pending && candidate.rotary.mode()!=RotaryMode::yarn)
-            throw std::invalid_argument("one-slot:native MTP bundle golden pending self-generation (no serving charge)");
         if (!golden_pending && (serving_golden_path!=m.golden || !serving_golden)) {
             serving_golden.reset(); serving_golden_path.clear();
             serving_golden.emplace(MappedModelFile::open_read_only(m.golden,"calibration",generations));

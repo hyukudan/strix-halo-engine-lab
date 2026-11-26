@@ -90,7 +90,11 @@ summed in ascending warp order. q8_0: int8 values are exact in bf16; each 32-blo
 `--wide-exact` / `--prefill-exact`) the IU4 GEMMs of layers 48-63 run the shared A4W4 class `dense-iu4a4-rot-v1`
 (`src/core/iu4a4_dense.hpp`: Hadamard-128 rotated A4 g32 activations x rotated W4 per-128 weights on iu4 WMMA); the other
 layers keep the wide IU4 path (`dense-iu4a16-f16-v1`). The fast wide-window cell is still pending, so the table acts
-only with an explicit `--wide N` / `--prefill-rows N` above 16. `STRIX_DENSE_A4W4_LAYERS=none` turns it off;
+with an explicit `--wide N` / `--prefill-rows N` above 16 or when `--allow-pending` selects the 512-row candidate.
+HIP `--profile turbo` inherits the FAST cells.
+On one gfx1151 node with the same binary and prompt IDs (MTP off), 512 rows plus A4W4 on layers 48–63 ran at
+614 versus 193 tok/s at 2K and 660 versus 116 tok/s at 8K against the 64-row EXACT windows.
+`STRIX_DENSE_A4W4_LAYERS=none` turns the layer table off;
 `STRIX_DENSE_A4W4=1` alone (every layer) fails the gate and is in no profile.
 
 FAST gate v2 (`tools/strix-gate`): 8,192-token prompts, 256 teacher-forced rows per window, 4 windows (1,024 rows), null

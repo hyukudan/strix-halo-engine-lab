@@ -35,9 +35,9 @@ struct MiniWeightOptions {
 
 // The bindings a qualification key may name: the model's Q8_0 binding (legacy id included), the shared low-bit mixes and
 // the shared head-only low-bit rows (attention BF16), plus attention-only Q8_0.
-inline constexpr std::array<weight::WeightLoadPolicy, 7> kMiniQualifiablePolicies{
+inline constexpr std::array<weight::WeightLoadPolicy, 8> kMiniQualifiablePolicies{
     kMiniWeightLoadPolicy, weight::kAttentionQ8Policy, weight::kAttentionHeadQ6Policy, weight::kAttentionQ4HeadQ6Policy,
-    weight::kAttentionHeadQ4Policy, weight::kHeadQ6Policy, weight::kHeadQ4Policy};
+    weight::kAttentionHeadQ4Policy, weight::kHeadQ6Policy, weight::kHeadQ4Policy, kMiniSp4HeadPolicy};
 
 inline const weight::WeightLoadPolicy& mini_weight_load_policy(const MiniWeightOptions& options) {
     if (options.qualify == nullptr || weight::same_id(options.qualify->id, kMiniWeightLoadPolicy.id))
@@ -50,7 +50,13 @@ inline constexpr auto kMiniLowBitArithmetic = core::LowBitArithmetic::f16_group_
 inline constexpr auto& kMiniLowBitConsumers = core::kResidentLowBitTileArithmeticHip;
 
 inline bool mini_lowbit_storage(weight::FormatId f) {
-    return f == weight::kQ4G64WeightStorage || f == weight::kQ6G64WeightStorage;
+    return f == weight::kQ4G64WeightStorage || f == weight::kQ6G64WeightStorage || f == weight::kSP4TWeightStorage;
+}
+
+// Consumer identity of a low-bit load: the SP4 head runs its own arithmetic (core::kResidentSp4ArithmeticHip).
+inline std::span<const weight::ArithmeticId> mini_lowbit_consumers(weight::FormatId head) {
+    if (head == weight::kSP4TWeightStorage) return core::kResidentSp4ArithmeticHip;
+    return kMiniLowBitConsumers;
 }
 
 // The native load binds this only when the profile has timing rows. Each append then supplies the workload
@@ -98,6 +104,24 @@ inline bool mini_lowbit_turbo(const profile::Resolution& tier) {
     if (entry == nullptr || entry->value == "0") return false;
     if (entry->value != "1") throw std::invalid_argument("STRIX_INK_LOWBIT_TURBO must be 0 or 1");
     return tier.profile == profile::Name::turbo;
+}
+
+// STRIX_INK_LOWBIT_HEAD: "sp4t" selects the SP4 head arm in FAST or TURBO; "0" (builtin) leaves the head as is.
+inline bool mini_lowbit_head(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniLowBitHead);
+    if (entry == nullptr || entry->value == "0") return false;
+    if (entry->value != "sp4t") throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD must be 0 or sp4t");
+    return tier.profile == profile::Name::fast || tier.profile == profile::Name::turbo;
+}
+
+// The lever's arm is the decode-only head qualification arm of kMiniSp4HeadPolicy: it needs STRIX_LOWBIT_PACK and
+// combines with no other weight arm.
+inline void apply_mini_lowbit_head(MiniWeightOptions& options, const profile::Resolution& tier) {
+    if (!mini_lowbit_head(tier)) return;
+    if (options.qualify != nullptr || options.qualify_q8 || options.lowbit_turbo || options.disable_q8)
+        throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD=sp4t combines with no other weight arm");
+    options.qualify = &kMiniSp4HeadPolicy;
+    options.qualify_decode_only = true;
 }
 
 inline bool mini_may_load_lowbit_row(profile::Name tier, const MiniWeightOptions& options,
@@ -403,6 +427,7 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
     static_cast<void>(mini_lowbit_turbo(tier));
     if (core::resident_lowbit_arithmetic(tier) != kMiniLowBitArithmetic && !native_execution)
         throw std::invalid_argument("the low-bit arithmetic candidate requires native HIP execution");
+    static_cast<void>(mini_lowbit_head(tier));
     spec::require_block_draft_execution(spec::block_draft_selection(tier));
     return tier;
 }
@@ -474,8 +499,9 @@ inline weight::WeightLoadPlan resolve_mini_resident_weight_load(profile::Name ti
         return refused;
     }
     constexpr std::array consumers{weight::kBf16WeightStorage, weight::kQ8WeightStorage,
-                                   weight::kQ4G64WeightStorage, weight::kQ6G64WeightStorage};
-    const std::span<const weight::FormatId> formats(consumers.data(), scope.backend == weight::Backend::hip ? 4U : 2U);
+                                   weight::kQ4G64WeightStorage, weight::kQ6G64WeightStorage,
+                                   weight::kSP4TWeightStorage};
+    const std::span<const weight::FormatId> formats(consumers.data(), scope.backend == weight::Backend::hip ? 5U : 2U);
     const auto& policy = mini_weight_load_policy(options);
     const bool qualify = options.qualify_q8 || options.qualify != nullptr;
     if (mini_may_load_lowbit_row(tier, options, scope.backend, extent)) {

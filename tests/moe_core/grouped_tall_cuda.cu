@@ -64,7 +64,7 @@ std::vector<T> to_host(const T* src, std::size_t n) {
 std::uint16_t bf16_bits(float v) { return strix::weight::scalar_float::bf16_encode(v); }
 
 // Schedules under test: the incumbent, the default resolution, explicit tall, and every instantiated form.
-enum class Arm { staged, automatic, tall, r128_s4, r128_s3, r128_w16, r64, r128_n4, r128_direct };
+enum class Arm { staged, automatic, tall, r128_s4, r128_s3, r128_w16, r64, r128_n4, r128_direct, r256 };
 constexpr Arm kArms[] = {Arm::staged, Arm::automatic, Arm::tall, Arm::r128_s4, Arm::r128_s3, Arm::r128_w16, Arm::r64,
                          Arm::r128_n4, Arm::r128_direct};
 const char* arm_name(Arm a) {
@@ -78,6 +78,7 @@ const char* arm_name(Arm a) {
     case Arm::r64: return tall::name(tall::FormId::r64_k32_s4);
     case Arm::r128_n4: return tall::name(tall::FormId::r128_n4_k32_s4);
     case Arm::r128_direct: return tall::name(tall::FormId::r128_k32_s4_direct);
+    case Arm::r256: return tall::name(tall::FormId::r256_k32_s3);
     }
     return "?";
 }
@@ -94,6 +95,7 @@ cudaError_t run(Arm arm, view::Args args, cudaStream_t stream) {
     case Arm::r64: return tile::detail::launch_tall_form<F, tall::FormId::r64_k32_s4>(args, stream);
     case Arm::r128_n4: return tile::detail::launch_tall_form<F, tall::FormId::r128_n4_k32_s4>(args, stream);
     case Arm::r128_direct: return tile::detail::launch_tall_form<F, tall::FormId::r128_k32_s4_direct>(args, stream);
+    case Arm::r256: return tile::detail::launch_tall_form<F, tall::FormId::r256_k32_s3>(args, stream);
     }
     return cudaErrorInvalidValue;
 }
@@ -102,6 +104,7 @@ cudaError_t run(Arm arm, view::Args args, cudaStream_t stream) {
 struct Case {
     unsigned inputs, outputs;
     packed::RowOrder order;
+    unsigned scale_skew = 0;  // bytes the scale array starts past a 4-byte boundary (the byte-copy path of chunked scales)
 };
 
 template <Format F>
@@ -137,20 +140,26 @@ void fixture_case(const Case& c, view::Decode decode, std::mt19937& rng) {
         in = bf16_bits(v);
     }
     auto* codes = device_buffer<std::uint8_t>(h_codes.size());
-    auto* scales = device_buffer<std::uint8_t>(h_scales.size());
+    auto* scales_base = device_buffer<std::uint8_t>(h_scales.size() + 4U);
+    auto* scales = scales_base + c.scale_skew;
     auto* input = device_buffer<std::uint16_t>(h_input.size());
     to_device(codes, h_codes);
     to_device(scales, h_scales);
     to_device(input, h_input);
     // Expert-major runs cut into tiles of at most 128 rows (the plan's CSR cut). Descriptors hold device pointers.
-    std::vector<view::TileRows> host_tiles;
-    unsigned first = 0, max_rows = 0;
+    std::vector<view::TileRows> host_tiles, host_tiles256;  // the 128-row cut and the wide cut of the same runs
+    unsigned first = 0, max_rows = 0, max_rows256 = 0;
     for (unsigned e = 0; e < experts; ++e) {
         const packed::PackedMatrix w{codes + w_codes * e, scales + w_scales * e, c.outputs, c.inputs, 0.375F, c.order};
         for (unsigned r = 0; r < runs[e]; r += tile::kRowsPerTile) {
             const unsigned live = std::min(tile::kRowsPerTile, runs[e] - r);
             max_rows = std::max(max_rows, live);
             host_tiles.push_back({w, input + std::size_t{first + r} * c.inputs, nullptr, c.inputs, c.outputs, live});
+        }
+        for (unsigned r = 0; r < runs[e]; r += tall::kWideRows) {
+            const unsigned live = std::min(tall::kWideRows, runs[e] - r);
+            max_rows256 = std::max(max_rows256, live);
+            host_tiles256.push_back({w, input + std::size_t{first + r} * c.inputs, nullptr, c.inputs, c.outputs, live});
         }
         first += runs[e];
     }
@@ -238,6 +247,41 @@ void fixture_case(const Case& c, view::Decode decode, std::mt19937& rng) {
             }
         }
     }
+    {  // The wide cut (runs cut at 256 rows): the 256-row form (where the shape fits it), the 128-row form over two row
+       // slices, the automatic choice (the 256-row form, else the 128-row fallback) and explicit tall store the staged bits;
+       // a staged request is refused and stores nothing (a 256-row tile is never truncated to 128 rows).
+        const unsigned count256 = static_cast<unsigned>(host_tiles256.size());
+        auto* tiles256 = device_buffer<view::TileRows>(count256);
+        view::Args wide{tiles256, count256, c.inputs, c.outputs, nullptr, nullptr, max_rows256};
+        wide.decode = decode;
+        const auto run_wide = [&](Arm arm) {
+            fill(actual);
+            bind_tiles(tiles256, host_tiles256, actual);
+            CK(run<F>(arm, wide, nullptr));
+            CK(cudaDeviceSynchronize());
+            std::snprintf(label, sizeof label, "%s wide cut arm %s", what, arm_name(arm));
+            if (!same(label)) ++failures;
+        };
+        if (tall::fits_shape(tall::form(tall::FormId::r256_k32_s3), c.inputs, c.outputs, Operand::kNvfp4)) run_wide(Arm::r256);
+        run_wide(Arm::r128_s4);
+        run_wide(Arm::automatic);
+        run_wide(Arm::tall);
+        fill(actual);
+        bind_tiles(tiles256, host_tiles256, actual);
+        wide.schedule = view::Schedule::staged;
+        if (tile::launch<F>(wide, nullptr) != cudaErrorInvalidValue) {
+            std::printf("FAIL %s: staged accepted a wide-cut tile\n", what);
+            ++failures;
+        }
+        (void)cudaGetLastError();
+        CK(cudaDeviceSynchronize());
+        const auto kept = to_host(actual, out_elems);
+        if (std::memcmp(kept.data(), sentinel.data(), out_elems * sizeof(float)) != 0) {
+            std::printf("FAIL %s: refused staged launch stored\n", what);
+            ++failures;
+        }
+        CK(cudaFree(tiles256));
+    }
     // A device tile count below the launch count: tiles past it are not touched (same in both schedules).
     to_device(tile_count, std::vector<unsigned>{count / 2U});
     view::Args bounded = args;
@@ -266,7 +310,7 @@ void fixture_case(const Case& c, view::Decode decode, std::mt19937& rng) {
         ++failures;
     }
     CK(cudaFree(codes));
-    CK(cudaFree(scales));
+    CK(cudaFree(scales_base));
     CK(cudaFree(input));
     CK(cudaFree(tiles));
     CK(cudaFree(reference));
@@ -280,7 +324,12 @@ void fixture() {
     const Case cases[] = {{2304U, 2304U, packed::RowOrder::interleaved_halves},
                           {1152U, 2304U, packed::RowOrder::contiguous},
                           {96U, 256U, packed::RowOrder::interleaved_halves},
-                          {32U, 128U, packed::RowOrder::contiguous}};
+                          {32U, 128U, packed::RowOrder::contiguous},
+                          // chunked scales: a partial last chunk (K = 192: 3 of 4 words; K = 320: second chunk 1 word) and a
+                          // scale array off a 4-byte boundary (byte copies); K = 96 / 32 take the 128-row fallback
+                          {192U, 256U, packed::RowOrder::contiguous},
+                          {320U, 384U, packed::RowOrder::interleaved_halves},
+                          {1152U, 256U, packed::RowOrder::contiguous, 2U}};
     for (const auto& c : cases) {
         fixture_case<Format::nvfp4>(c, view::Decode::reference, rng);
         fixture_case<Format::nvfp4>(c, view::Decode::shift, rng);
@@ -353,7 +402,7 @@ void bench_format(unsigned tokens, view::Decode decode, const std::vector<unsign
         else fill_bytes<<<1024, 256>>>(scales, w_scales * kExperts, 9U, 120U, 14U);
         fill_bf16<<<1024, 256>>>(input, std::size_t{assignments} * p.inputs, 3U);
         // Two descriptor sets over the same rows (one per output buffer), expert-major, cut at 128 rows.
-        std::vector<view::TileRows> ref_tiles, arm_tiles;
+        std::vector<view::TileRows> ref_tiles, arm_tiles, tiles256_h;
         unsigned first = 0;
         for (unsigned e = 0; e < kExperts; ++e) {
             const packed::PackedMatrix w{codes + w_codes * e, scales + w_scales * e, p.outputs, p.inputs, 0.01F, p.order};
@@ -363,10 +412,18 @@ void bench_format(unsigned tokens, view::Decode decode, const std::vector<unsign
                 ref_tiles.push_back({w, input + row * p.inputs, out_ref + row * p.outputs, p.inputs, p.outputs, live});
                 arm_tiles.push_back({w, input + row * p.inputs, out + row * p.outputs, p.inputs, p.outputs, live});
             }
+            for (unsigned r = 0; r < counts[e]; r += tall::kWideRows) {  // the same runs cut at 256 rows (the wide cut)
+                const unsigned live = std::min(tall::kWideRows, counts[e] - r);
+                const std::size_t row = first + r;
+                tiles256_h.push_back({w, input + row * p.inputs, out + row * p.outputs, p.inputs, p.outputs, live});
+            }
             first += counts[e];
         }
         const auto count = static_cast<unsigned>(ref_tiles.size());
-        view::TileRows *d_ref = nullptr, *d_arm = nullptr;
+        const auto count256 = static_cast<unsigned>(tiles256_h.size());
+        view::TileRows *d_ref = nullptr, *d_arm = nullptr, *d_wide = nullptr;
+        CK(cudaMalloc(&d_wide, count256 * sizeof(view::TileRows)));
+        CK(cudaMemcpy(d_wide, tiles256_h.data(), count256 * sizeof(view::TileRows), cudaMemcpyHostToDevice));
         CK(cudaMalloc(&d_ref, count * sizeof(view::TileRows)));
         CK(cudaMalloc(&d_arm, count * sizeof(view::TileRows)));
         CK(cudaMemcpy(d_ref, ref_tiles.data(), count * sizeof(view::TileRows), cudaMemcpyHostToDevice));
@@ -374,23 +431,35 @@ void bench_format(unsigned tokens, view::Decode decode, const std::vector<unsign
         view::Args ref_args{d_ref, count, p.inputs, p.outputs, nullptr, nullptr, tile::kRowsPerTile};
         view::Args arm_args{d_arm, count, p.inputs, p.outputs, nullptr, nullptr, tile::kRowsPerTile};
         ref_args.decode = arm_args.decode = decode;
+        // The shipped selection: the tile cut follows the mean rows per expert (tall::tile_cut), the launch then resolves the
+        // form from the cut (r256 for the wide cut, else r128). Arm "automatic" runs it; r256 always runs the wide plan.
+        const unsigned mean_rows = (assignments + kExperts - 1U) / kExperts;
+        const bool wide_cut = tall::tile_cut(mean_rows) == tall::kWideRows;
+        view::Args wide_args{d_wide, count256, p.inputs, p.outputs, nullptr, nullptr, tall::kWideRows};
+        wide_args.decode = decode;
+        const auto args_of = [&](Arm a) {
+            return a == Arm::r256 || (a == Arm::automatic && wide_cut) ? wide_args : arm_args;
+        };
         CK(run<F>(Arm::staged, ref_args, nullptr));
         CK(cudaDeviceSynchronize());
 
-        constexpr Arm timed[] = {Arm::staged, Arm::r128_s4, Arm::r128_s3, Arm::r128_w16, Arm::r64, Arm::r128_n4};
-        constexpr unsigned kArmsTimed = sizeof(timed) / sizeof(timed[0]);
-        std::vector<float> ms[kArmsTimed];
-        unsigned long long mismatch[kArmsTimed]{};
+        std::vector<Arm> timed = {Arm::staged, Arm::r128_s4, Arm::r128_s3, Arm::r128_w16, Arm::r64, Arm::r128_n4};
+        if (tall::fits_shape(tall::form(tall::FormId::r256_k32_s3), p.inputs, p.outputs, Operand::kNvfp4))
+            timed.push_back(Arm::r256);
+        timed.push_back(Arm::automatic);
+        const auto kArmsTimed = static_cast<unsigned>(timed.size());
+        std::vector<std::vector<float>> ms(kArmsTimed);
+        std::vector<unsigned long long> mismatch(kArmsTimed, 0ULL);
         cudaEvent_t a, b;
         CK(cudaEventCreate(&a));
         CK(cudaEventCreate(&b));
-        for (unsigned i = 0; i < kArmsTimed; ++i) CK(run<F>(timed[i], arm_args, nullptr));  // warm-up
+        for (unsigned i = 0; i < kArmsTimed; ++i) CK(run<F>(timed[i], args_of(timed[i]), nullptr));  // warm-up
         CK(cudaDeviceSynchronize());
         for (unsigned rep = 0; rep < 15U; ++rep) {
             for (unsigned i = 0; i < kArmsTimed; ++i) {
                 const unsigned arm = (i + rep) % kArmsTimed;  // rotate the order between repetitions
                 CK(cudaEventRecord(a));
-                CK(run<F>(timed[arm], arm_args, nullptr));
+                CK(run<F>(timed[arm], args_of(timed[arm]), nullptr));
                 CK(cudaEventRecord(b));
                 CK(cudaEventSynchronize(b));
                 float t = 0.F;
@@ -400,7 +469,7 @@ void bench_format(unsigned tokens, view::Decode decode, const std::vector<unsign
         }
         for (unsigned i = 0; i < kArmsTimed; ++i) {
             CK(cudaMemset(out, 0xff, std::size_t{assignments} * p.outputs * 4U));
-            CK(run<F>(timed[i], arm_args, nullptr));
+            CK(run<F>(timed[i], args_of(timed[i]), nullptr));
             CK(cudaMemset(diff, 0, sizeof(unsigned long long)));
             count_diff<<<1024, 256>>>(out_ref, out, std::size_t{assignments} * p.outputs, diff);
             CK(cudaMemcpy(&mismatch[i], diff, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
@@ -411,9 +480,15 @@ void bench_format(unsigned tokens, view::Decode decode, const std::vector<unsign
             std::sort(ms[i].begin(), ms[i].end());
             const float med = ms[i][ms[i].size() / 2U];
             if (i == 0) base = med;
-            std::printf("BENCH T=%u %s %s.%s rows %u tiles %u %-16s %.3f ms %6.1f TFLOPS x%.2f %s\n", tokens, p.name,
+            char name[32];
+            if (timed[i] == Arm::automatic)
+                std::snprintf(name, sizeof name, "auto.%s", wide_cut ? "r256" : "r128");
+            else
+                std::snprintf(name, sizeof name, "%s", arm_name(timed[i]));
+            std::printf("BENCH T=%u %s %s.%s rows %u mean %u tiles %u %-16s %.3f ms %6.1f TFLOPS x%.2f %s\n", tokens, p.name,
                         Operand::kNvfp4 ? "nvfp4" : "mxfp8", decode == view::Decode::shift ? "shift" : "ref", assignments,
-                        count, arm_name(timed[i]), med, flops / med / 1e9, base / med,
+                        mean_rows, timed[i] == Arm::r256 || (timed[i] == Arm::automatic && wide_cut) ? count256 : count, name,
+                        med, flops / med / 1e9, base / med,
                         mismatch[i] == 0 ? "bitwise EQUAL" : "BITS DIFFER");
             if (mismatch[i] != 0) ++failures;
         }
@@ -427,6 +502,7 @@ void bench_format(unsigned tokens, view::Decode decode, const std::vector<unsign
         CK(cudaFree(diff));
         CK(cudaFree(d_ref));
         CK(cudaFree(d_arm));
+        CK(cudaFree(d_wide));
     }
 }
 
@@ -451,17 +527,19 @@ int main(int argc, char** argv) {
     int device = 0, optin = 0;
     CK(cudaGetDevice(&device));
     CK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-    fixture();
+    const bool bench_only = argc > 1 && std::strcmp(argv[1], "--bench-only") == 0;
+    if (bench_only) argv[1] = const_cast<char*>("--bench");  // the bench alone (no model, no fixture)
+    if (!bench_only) fixture();
     if (failures != 0) {
         std::printf("grouped_tall_cuda: FAIL (%d)\n", failures);
         return 1;
     }
-    std::printf("grouped_tall_cuda: PASS (6 tall forms + automatic = staged bitwise; nvfp4 ref/shift, mxfp8; K 32..2304; "
-                "runs 1..300; tile count, failure word; opt-in shared %d B)\n", optin);
+    std::printf("grouped_tall_cuda: PASS (7 tall forms + automatic, 128-row and wide cut = staged bitwise; nvfp4 ref/shift, "
+                "mxfp8; K 32..2304; runs 1..300; tile count, failure word; opt-in shared %d B)\n", optin);
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
         std::vector<unsigned> tokens;
         for (int i = 2; i < argc; ++i) tokens.push_back(static_cast<unsigned>(std::strtoul(argv[i], nullptr, 10)));
-        if (tokens.empty()) tokens = {2048U, 8192U};
+        if (tokens.empty()) tokens = {2048U, 4096U, 6144U, 8192U, 12288U};  // mean rows per expert 128 .. 768
         for (const unsigned t : tokens) bench(t);
         if (failures != 0) {
             std::printf("grouped_tall_cuda: BENCH BITS DIFFER (%d)\n", failures);

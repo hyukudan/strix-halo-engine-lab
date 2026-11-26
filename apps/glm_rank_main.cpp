@@ -149,7 +149,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "usage: %s MODEL_DIR --world 1|2 [--rank R --transport T] [modes] [--identity r1|r1b|r1b-all] [--idcheck N --prompt T.u32]\n"
                                  "--print-device-profile / STRIX_PRINT_DEVICE_PROFILE=1: HIP probe JSON, then exit (no model/peer)\n"
                                  "--deploy FILE|auto --deploy-check: host-only deployment JSON (no allocation/peer)\n"
-                                 "--profile default|fast|quality: product policy; bare --profile: kernel timing\n"
+                                 "--profile exact|fast|quality|turbo: product policy; bare --profile: kernel timing\n"
                                  "identity: r1 throughout; r1b (default) R1 prompts/R1b generation; "
                                  "r1b-all throughout (reference prefill)\n", argv[0]);
             return 2;

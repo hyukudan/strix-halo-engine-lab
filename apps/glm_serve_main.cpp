@@ -996,7 +996,7 @@ int main(int argc, char** argv) {
     try {
         if (argc < 2) {
             std::fprintf(stderr, "usage: %s MODEL_DIR --world 1|2 [--rank R --transport T] [--slots S] [--capacity C] [--serial] "
-                                 "[--host H] [--port P] [--profile default|fast|quality] [--deploy FILE|auto] [--deploy-check] [--prefix-cache-gib G] [--selftest N [--selftest-tokens M] [--selftest-prefix [--selftest-prefix-long L]]] "
+                                 "[--host H] [--port P] [--profile exact|fast|quality|turbo] [--deploy FILE|auto] [--deploy-check] [--prefix-cache-gib G] [--selftest N [--selftest-tokens M] [--selftest-prefix [--selftest-prefix-long L]]] "
                                  "[--import-listen IP:PORT --import-key FILE --import-model-sha HEX (operator attestation of the producer's "
                                  "model, compared with its hand-off header, not computed from the loaded tensors)]\n", argv[0]);
             return 2;

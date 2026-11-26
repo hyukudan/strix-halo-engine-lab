@@ -510,9 +510,12 @@ inline void validate_effective_options(const Options& o, const ModelContract& mo
 }
 // Cache identity includes the resolved geometry, profiles and calibration chain.
 inline std::string mtp_bundle_golden_identity(const Options& options, const ModelContract& model) {
-    std::ifstream bundle_input(options.mtp_bundle_path,std::ios::binary);
-    if (!bundle_input) throw std::runtime_error("cannot reread MTP bundle");
-    std::string identity_text((std::istreambuf_iterator<char>(bundle_input)),{});
+    std::string identity_text=options.mtp_bundle_synthesized;
+    if (identity_text.empty()) {
+        std::ifstream bundle_input(options.mtp_bundle_path,std::ios::binary);
+        if (!bundle_input) throw std::runtime_error("cannot reread MTP bundle");
+        identity_text.assign((std::istreambuf_iterator<char>(bundle_input)),{});
+    }
     identity_text += model.rotary_identity().json()+std::to_string(options.context_tokens)+":"+
         std::to_string(numerical_profile_identity(options.numerical_profile))+":"+
         std::to_string(numerical_profile_identity(numerical_profile_pair(options).prefill));
@@ -765,7 +768,8 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
     const bool single_session_mtp = single_session_mtp_route(o, request.environment, manifest, verified_content, capabilities);
     const auto decline = [&](std::string reason) {
         // The default drafter bundle exists only on the automatic prompt route; the caller falls back to plain decode.
-        if (o.mtp_native_bundle && o.mtp.enabled && !o.known_prefix_window)
+        // The HTTP server owns its prompt route (serve-prefill) and runs the bundle on it: it is not declined.
+        if (o.mtp_native_bundle && o.mtp.enabled && !o.known_prefix_window && !o.http_serve)
             throw std::invalid_argument("automatic prompt route declined with the drafter bundle (" + reason + ")");
         result.reason = std::move(reason);
         if (!baseline) inject(qpf2k::Organization{qpf2k::historical_items |

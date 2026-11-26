@@ -52,6 +52,10 @@ inline constexpr WeightLoadPolicy kHeadQ6Policy{
     {"weights.head.q6_g64", 1}, kBf16WeightStorage, {}, kQ6G64WeightStorage};
 inline constexpr WeightLoadPolicy kHeadQ4Policy{
     {"weights.head.q4_g64", 1}, kBf16WeightStorage, {}, kQ4G64WeightStorage};
+// The output head alone in Strix pack SP4 with the fixed table (calibrated pack only, strix/weight/lowbit_pack.hpp),
+// every other tagged role kept BF16.
+inline constexpr WeightLoadPolicy kHeadSP4TPolicy{
+    {"weights.head.sp4t", 1}, kBf16WeightStorage, {}, kSP4TWeightStorage};
 // Every attention projection matrix (query, key, value, output and any auxiliary projection of the attention input,
 // such as an output gate, relative or sink projection) stored as Q8_0, converted from BF16 at load; the output head
 // stays BF16 (per-role: `head`), so an exact head (full or screened) keeps its bits. Router and normalisation weights
@@ -60,9 +64,9 @@ inline constexpr WeightLoadPolicy kAttentionQ8Policy{{"weights.attention.q8_0", 
 inline constexpr WeightLoadPolicy kAttentionHeadSP4Policy{{"weights.attention_head.sp4", 1}, kSP4WeightStorage};
 inline constexpr WeightLoadPolicy kAttentionHeadSP3Policy{{"weights.attention_head.sp3", 1}, kSP3WeightStorage};
 inline constexpr WeightLoadPolicy kAttentionHeadSP2Policy{{"weights.attention_head.sp2", 1}, kSP2WeightStorage};
-inline constexpr std::array<const WeightLoadPolicy*, 11> kWeightLoadPolicies{
+inline constexpr std::array<const WeightLoadPolicy*, 12> kWeightLoadPolicies{
     &kAttentionHeadQ8Policy, &kHeadQ8Policy, &kAttentionQ8Policy, &kAttentionHeadQ6Policy, &kAttentionQ4HeadQ6Policy,
-    &kAttentionHeadQ4Policy, &kHeadQ6Policy, &kHeadQ4Policy,
+    &kAttentionHeadQ4Policy, &kHeadQ6Policy, &kHeadQ4Policy, &kHeadSP4TPolicy,
     &kAttentionHeadSP4Policy, &kAttentionHeadSP3Policy, &kAttentionHeadSP2Policy};
 
 // Both columns nominate the same implementation. A receipt decides the tier and measured regime.

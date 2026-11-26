@@ -173,6 +173,8 @@ private:
         if (target_.weights_.compact_head_bound() && !target_.weights_.bf16_bound()) {
             const auto& head = target_.weights_.compact_head();
             const auto stride = static_cast<std::size_t>(head.row_bytes);
+            if (head.storage == weight::kSP4TWeightStorage)
+                throw std::invalid_argument("Inkling 2 Mini drafter: the head fold has no strix.sp4t reader");
             if (head.storage == weight::kQ4G64WeightStorage)
                 run(LowBitMatrix<weight::Q4G64Storage>{head.bytes.data(), stride});
             else if (head.storage == weight::kQ6G64WeightStorage)

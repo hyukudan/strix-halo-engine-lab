@@ -183,8 +183,17 @@ inline bool valid_resident_lowbit_rows(const weight::ResidentMatrixView& matrix,
     constexpr auto max_floats = std::numeric_limits<std::size_t>::max() / sizeof(float);
     constexpr auto max_extent = std::numeric_limits<unsigned>::max() - 127U;
     const bool q4 = matrix.storage == weight::kQ4G64WeightStorage;
-    if (!q4 && !(matrix.storage == weight::kQ6G64WeightStorage)) return false;
-    const auto row_bytes = q4 ? weight::Q4G64Storage::row_bytes(matrix.columns) : weight::Q6G64Storage::row_bytes(matrix.columns);
+    const bool sp4 = matrix.storage == weight::kSP4TWeightStorage;
+    if (!q4 && !sp4 && !(matrix.storage == weight::kQ6G64WeightStorage)) return false;
+    // SP4 has the FP16 form only, on the small-M schedule (16-row blocks, grid rows <= 65535); the tensor base is an
+    // outer power of two within the FP32 exponent range.
+    if (sp4 && (arithmetic != LowBitArithmetic::f16_group_scale || rows > 65535U * 16U ||
+                matrix.outer_exponent < weight::sp::kMinBase || matrix.outer_exponent > weight::sp::kMaxBase))
+        return false;
+    if (!sp4 && matrix.outer_exponent != 0) return false;
+    const auto row_bytes = q4    ? weight::Q4G64Storage::row_bytes(matrix.columns)
+                           : sp4 ? weight::sp::SP4Storage::row_bytes(matrix.columns)
+                                 : weight::Q6G64Storage::row_bytes(matrix.columns);
     return input && output && reinterpret_cast<std::uintptr_t>(input) % 16U == 0U &&
            matrix.bytes.data() && reinterpret_cast<std::uintptr_t>(matrix.bytes.data()) % 16U == 0U &&
            rows != 0U && rows <= lowbit_max_rows(arithmetic) && outputs != 0U && outputs <= matrix.rows &&
@@ -254,6 +263,9 @@ inline constexpr std::array<weight::ArithmeticId, 2> kResidentLowBitArithmeticHi
     {"hip.q4_g64.dense-linear-tight-rows", 1}, {"hip.q6_g64.dense-linear-tight-rows", 1}}};
 inline constexpr std::array<weight::ArithmeticId, 2> kResidentLowBitTileArithmeticHip{{
     {"hip.q4_g64.f16-group-scale-chain", 1}, {"hip.q6_g64.f16-group-scale-chain", 1}}};
+// Strix pack SP4 (fixed table) on the small-M schedule: table values as exact FP16 operands, one WMMA chain per K32
+// group from +0, acc = fma(group sum, (1 + m / 8) 2^e, acc) in ascending groups, then x 2^base at the store.
+inline constexpr std::array<weight::ArithmeticId, 1> kResidentSp4ArithmeticHip{{{"hip.sp4t.f16-group32-scale-chain", 1}}};
 inline constexpr std::array<weight::ArithmeticId, 2> kResidentLowBitFoldedArithmeticHip{{
     {"hip.q4_g64.f16-folded-scale-tile", 1}, {"hip.q6_g64.f16-folded-scale-tile", 1}}};
 

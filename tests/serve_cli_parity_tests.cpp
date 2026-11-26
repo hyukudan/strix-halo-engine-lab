@@ -119,6 +119,13 @@ void glm() {
         check(cli.mtp_spec.value == expected && server.mtp_spec.value == expected &&
               cli.mtp.value == expected && server.mtp.value == expected && server.prefill == "gemv",
               "GLM complete/missing assets and opt-out select intended MTP/prefill route");
+        const std::string_view expected_wmma = std::string_view(profile) == "turbo" ? "1" : "0";
+        for (const auto* lever : {"pf_wmma", "mla_wmma", "kda_wmma", "attn_wmma"}) {
+            const auto* cli_cell = cli.product->find(lever);
+            const auto* serve_cell = server.product->find(lever);
+            check(cli_cell && serve_cell && cli_cell->value == expected_wmma && serve_cell->value == expected_wmma,
+                  "GLM rank and serve apply the same WMMA route for " + std::string(profile) + ": " + lever);
+        }
         gate("glm", values(sp::from_lines(rd::print(cli))), values(sp::from_lines(rd::print(server))), allowed);
     }
     // Sampled MTP (row serve_sampled_mtp): both entry points resolve and admit it in rd::resolve, so the same request
@@ -312,6 +319,24 @@ void gemma() {
         {"streams", "the server decodes up to STRIX_G4_SERVE_SLOTS requests together"},
     };
     gate("gemma", cli, config(served.options), allowed);
+
+    // Explicitly match concurrency so the test compares only model/tier settings.
+    for (const std::string tier : {"exact", "fast", "turbo"}) {
+        std::vector<std::string> tier_words = words;
+        tier_words.insert(tier_words.end(), {"--profile", tier, "--streams", "1", "--draft", "off"});
+        std::vector<char*> tier_argv;
+        for (auto& word : tier_words) tier_argv.push_back(word.data());
+        const auto native = e::parse_options(static_cast<int>(tier_argv.size()), tier_argv.data());
+        const auto server = e::prepare_serve(static_cast<int>(tier_argv.size()), tier_argv.data());
+        check(!server.exit_code, "gemma: serve accepts " + tier);
+        check(native.profile.name == strix::profile::parse(tier), "gemma: native tier survives parsing");
+        const auto* identity = native.profile.find("decode_identity");
+        check(identity && identity->value == (tier == "exact" ? "g4-v1" : "g4-a8-v1"),
+              "gemma: " + tier + " resolves its decode identity");
+        const auto* attention = native.profile.find("decode_attention");
+        check(attention && attention->value == "exact", "gemma: " + tier + " keeps qualified exact decode attention");
+        gate("gemma/" + tier, config(native), config(server.options), {});
+    }
 }
 #endif
 
