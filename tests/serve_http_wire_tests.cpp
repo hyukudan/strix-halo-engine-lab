@@ -1,11 +1,14 @@
 // Host tests of the shared raw-socket HTTP reader (include/strix/serve/http_wire.hpp) and of the Qwen prefill
 // service's reader built on it (src/cuda/models/qwen/qwen_http.hpp): malformed or ambiguous heads give a clean
-// error, a slow peer is cut off by one total deadline, and the body buffer follows the bytes received.
+// error, a slow peer is cut off by one total deadline, and the body buffer follows the bytes received. The Qwen
+// service's request body reader (qwen_prefill_request.hpp) refuses malformed bodies with an exception.
 #include "strix/serve/http_wire.hpp"
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -17,6 +20,7 @@
 #include <unistd.h>
 #include "qwen_http.hpp"
 #endif
+#include "qwen_prefill_request.hpp"
 
 namespace {
 
@@ -283,7 +287,41 @@ void test_qwen_reader() {
 
 }  // namespace
 
+// The Qwen prefill service's body reader refuses every malformed body with an exception (answered 400) and never
+// dereferences an absent key; a valid body reads every field as before.
+void test_qwen_prefill_request() {
+    const auto refused = [](const char* body) {
+        try {
+            strix::qwen_http::PrefillRequest r;
+            strix::qwen_http::parse_prefill_request(strix::serve::parse_json(body), 65520U, r);
+        } catch (const std::exception&) {
+            return true;
+        }
+        return false;
+    };
+    CHECK(refused("{}"));
+    CHECK(refused("[]"));
+    CHECK(refused("7"));
+    CHECK(refused(R"({"handoff":"h:1"})"));
+    CHECK(refused(R"({"tokens":[1,2]})"));
+    CHECK(refused(R"({"tokens":"12","handoff":"h:1"})"));
+    CHECK(refused(R"({"tokens":[1,2],"handoff":3})"));
+    CHECK(refused(R"({"tokens":[1,2],"handoff":"h:1","block_schedule":"x"})"));
+    CHECK(refused(R"({"tokens":[1,2],"handoff":"h:1","final_block_rows":65521})"));
+    CHECK(refused(R"({"tokens":[1,2],"handoff":"h:1","final_block_rows":-1})"));
+    strix::qwen_http::PrefillRequest r;
+    strix::qwen_http::parse_prefill_request(
+        strix::serve::parse_json(R"({"tokens":[5,6,7],"handoff":"h:1","session":{"a":1},"handoff_api_key":"k",)"
+                                 R"("handoff_codec":"c","local_rows":9,"trace":true,"block_schedule":"tail-large",)"
+                                 R"("final_block_rows":65520,"node_completions":"n"})"),
+        65520U, r);
+    CHECK((r.tokens == std::vector<std::uint32_t>{5, 6, 7}) && r.handoff == "h:1" && r.session.is_object());
+    CHECK(r.api_key == "k" && r.has_codec && r.codec == "c" && r.local_rows == 9 && r.trace);
+    CHECK(r.has_schedule && r.tail_large && r.has_final_rows && r.final_rows == 65520U && r.node_completions == "n");
+}
+
 int main() {
+    test_qwen_prefill_request();
     test_head_table();
     test_reader();
     test_deadline();

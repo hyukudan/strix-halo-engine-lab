@@ -79,6 +79,7 @@
 #include "strix/model_content_hash.hpp"
 #include "strix/serve/http_wire.hpp"
 #include "strix/serve/json.hpp"
+#include "strix/serve/secure_equal.hpp"
 
 #include <cuda_runtime.h>
 
@@ -1352,8 +1353,12 @@ void handle(Sock s, Service& svc, const Config& c, std::uint32_t max_positions, 
         const Json* st = h.find("status");
         return respond(s, st != nullptr && st->as_string() == "ok" ? 200 : 503, h.dump());
     }
-    if (!c.api_key.empty() && req.header("authorization") != "Bearer " + c.api_key && req.header("x-api-key") != c.api_key)
-        return respond(s, 401, error_json("invalid or missing API key").dump());
+    if (!c.api_key.empty()) {
+        // Both comparisons always run, each in time independent of the key content.
+        const bool by_bearer = strix::serve::secure_equal(req.header("authorization"), "Bearer " + c.api_key);
+        const bool by_header = strix::serve::secure_equal(req.header("x-api-key"), c.api_key);
+        if (!by_bearer && !by_header) return respond(s, 401, error_json("invalid or missing API key").dump());
+    }
     if (path == "/v1/describe") {
         if (method != "GET") return respond(s, 405, error_json("GET").dump());
         return respond(s, 200, svc.describe().dump());
