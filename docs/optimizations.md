@@ -2,6 +2,37 @@
 
 Qwen guarded wave reductions can use exact DPP/permlanex16 exchanges (build-time lever, off by default: configure with `-DSTRIX_DPP_REDUCE=ON`; the all-on build uses it); addition trees are unchanged, native byte-equality qualification is pending, and no speed gain is claimed.
 
+<a id="gemma4-exl3-shared-hadamard"></a>
+## Gemma 4 shared EXL3 Hadamard
+
+Configure a HIP device build with `-DSTRIX_GEMMA4_EXL3_SHARED_HADAMARD=ON` to test the
+observer trait in `src/core/hadamard.hpp`. The Gemma 4 adapter flags each non-finite result and
+keeps the existing rounding boundary at the FP16 conversion. The build option defaults to
+`OFF` for all profiles. Device qualification requires the EXL3 checks and byte-identical tokens
+and logits on the same EXL3 pack. Performance is unmeasured. Use separate state and cache
+directories for the qualification builds.
+
+<a id="qwen-qsa-shared-eager"></a>
+## Qwen Flash Next shared eager QSA score and output
+
+Configure a HIP device build with `-DSTRIX_QWEN_QSA_SHARED_EAGER=ON` to test the score and
+value forms in `src/attn_core/eager_selected.hpp` through the same launcher in the CLI and server.
+The adapter supplies BF16 or int8 KV reads, captured selection counts and status checks.
+The build option defaults to `OFF` for all profiles. Device qualification requires the launcher
+fixture and byte-identical model output on automatic, eager BF16, eager KV-int8, and long-prompt
+routes. Performance is unmeasured. Use fresh state and separate cache directories for each build.
+
+| Model | Shared EXL3 Hadamard adapter | Shared eager QSA score and output |
+|---|---|---|
+| inkling2-mini | No Gemma 4 EXL3 adapter | No Qwen QSA adapter |
+| qwen3.8-flash-next | No Gemma 4 EXL3 adapter | HIP qualification build |
+| qwen3.8-27b | No Gemma 4 EXL3 adapter | Dense attention |
+| deepseek-v4.1-flash | No Gemma 4 EXL3 adapter | DeepSeek sparse attention |
+| glm-5.3-flash | No Gemma 4 EXL3 adapter | GLM sparse attention |
+| minimax-m3.1-flash | No Gemma 4 EXL3 adapter | MiniMax sparse attention |
+| hy4-flash | No Gemma 4 EXL3 adapter | Hy4 attention |
+| nemotron-3.5-bolt-e4b | No Gemma 4 EXL3 adapter | Dense attention |
+
 ## Qwen product profiles
 
 `--profile default|fast|quality` selects the Qwen product policy for decode,

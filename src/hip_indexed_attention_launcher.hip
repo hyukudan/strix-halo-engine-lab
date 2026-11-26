@@ -5,6 +5,9 @@
 #include "strix/env_flags.hpp"
 #include "attn_core/index_score_wmma.hpp"
 #include "attn_core/index_score_band.hpp"
+#if defined(STRIX_QWEN_QSA_SHARED_EAGER)
+#include "attn_core/eager_selected.hpp"
+#endif
 #include "attn_core/eager_softmax.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_check.hpp"
@@ -1956,6 +1959,66 @@ __global__ __launch_bounds__(kSelectThreads) void select_blocks_kernel(float* bl
     select_blocks_parallel_body(block_scores, num_blocks, select_blocks, compress_ratio, visible_tokens, selected, dynamic);
 }
 
+// Shared eager attention graph control: captured count, status bit 8 and BF16 rounding.
+struct QsaSoftmaxControl {
+    GraphSelectionArguments dynamic;
+    __device__ __forceinline__ bool count(std::uint32_t& selected_count) const { return graph_selected_count(dynamic, selected_count); }
+#if defined(STRIX_QWEN_QSA_SHARED_EAGER)
+    __device__ __forceinline__ bool padded() const { return dynamic.position.position != nullptr; }
+#endif
+    __device__ __forceinline__ bool checks() const { return dynamic.position.status != nullptr; }
+    __device__ __forceinline__ void fail() const { atomicOr(dynamic.position.status, 8U); }
+    __device__ __forceinline__ float round(float value) const { return round_bf16(value); }
+};
+
+#if defined(STRIX_QWEN_QSA_SHARED_EAGER)
+using EagerGeometry = strix::attn_core::eager_selected::Geometry;
+
+// Operand layout of the shared eager selected forms: q_gate [head][query head_dim | gate head_dim] FP32; the KV row of a
+// token is [K kv_width | V kv_width], BF16 or kv-int8-tok-v1 (codes, then FP32 scales).
+template <bool Int8>
+struct QsaEagerOperands {
+    const float* q_gate;
+    const std::uint16_t* kv_state;
+    __device__ __forceinline__ float query(const EagerGeometry& g, std::uint32_t head, std::uint32_t feature) const {
+        return q_gate[static_cast<std::uint64_t>(head) * g.head_dim * 2ULL + feature];
+    }
+    __device__ __forceinline__ float gate(const EagerGeometry& g, std::uint32_t head, std::uint32_t feature) const {
+        return q_gate[static_cast<std::uint64_t>(head) * g.head_dim * 2ULL + g.head_dim + feature];
+    }
+    __device__ __forceinline__ auto key_reader(const EagerGeometry& g, std::uint32_t kv_width, std::uint32_t token,
+                                               std::uint32_t kv_head) const {
+        const auto kv_heads = g.kv_heads, head_dim = g.head_dim;
+        const auto row_base = static_cast<std::uint64_t>(token) * kv_width * 2ULL;
+        const auto* kv = kv_state;
+        return [=](std::uint32_t feature) {
+            if constexpr (Int8) return kv_int8_load(kv, token, kv_width, kv_heads, 0U, kv_head, head_dim, feature);
+            else return bf16_to_float(kv[row_base + static_cast<std::uint64_t>(kv_head) * head_dim + feature]);
+        };
+    }
+    __device__ __forceinline__ auto value_reader(const EagerGeometry& g, std::uint32_t kv_width, std::uint32_t kv_head,
+                                                 std::uint32_t feature) const {
+        const auto kv_heads = g.kv_heads, head_dim = g.head_dim;
+        const auto offset = static_cast<std::uint64_t>(kv_width) + static_cast<std::uint64_t>(kv_head) * head_dim + feature;
+        const auto* kv = kv_state;
+        return [=](std::uint32_t token) {
+            if constexpr (Int8) return kv_int8_load(kv, token, kv_width, kv_heads, 1U, kv_head, head_dim, feature);
+            else return bf16_to_float(kv[static_cast<std::uint64_t>(token) * kv_width * 2ULL + offset]);
+        };
+    }
+};
+
+template <bool Int8 = false>
+__device__ __forceinline__ void attention_score_body(const float* q_gate, const std::uint16_t* kv_state,
+    const std::uint32_t* selected, std::uint32_t selected_count, std::uint32_t maximum_selected,
+    std::uint32_t attention_heads, std::uint32_t kv_heads, std::uint32_t head_dim, float* scores,
+    GraphSelectionArguments dynamic) {
+    __shared__ float scratch[kThreads];
+    strix::attn_core::eager_selected::score_slot<kThreads>(scratch, selected, selected_count, maximum_selected,
+        EagerGeometry{attention_heads, kv_heads, head_dim}, scores, QsaEagerOperands<Int8>{q_gate, kv_state},
+        QsaSoftmaxControl{dynamic});
+}
+#else
 template <bool Int8 = false>
 __device__ __forceinline__ void attention_score_body(
     const float* q_gate,
@@ -2054,6 +2117,7 @@ __device__ __forceinline__ void attention_score_body(
                     head_dim));
     }
 }
+#endif
 
 __global__ void attention_score_kernel(const float* q_gate, const std::uint16_t* kv_state,
     const std::uint32_t* selected, std::uint32_t selected_count, std::uint32_t maximum_selected,
@@ -2070,16 +2134,6 @@ __global__ void attention_score_int8_kernel(const float* q_gate, const std::uint
     attention_score_body<true>(q_gate, kv_state, selected, selected_count, maximum_selected,
         attention_heads, kv_heads, head_dim, scores, dynamic);
 }
-
-// Graph control of the shared eager softmax (attn_core/eager_softmax.hpp): the captured count, status bit 8 for a
-// non-finite row, BF16 probabilities (eager attention casts softmax back to query dtype).
-struct QsaSoftmaxControl {
-    GraphSelectionArguments dynamic;
-    __device__ __forceinline__ bool count(std::uint32_t& selected_count) const { return graph_selected_count(dynamic, selected_count); }
-    __device__ __forceinline__ bool checks() const { return dynamic.position.status != nullptr; }
-    __device__ __forceinline__ void fail() const { atomicOr(dynamic.position.status, 8U); }
-    __device__ __forceinline__ float round(float value) const { return round_bf16(value); }
-};
 
 // Publish (Q7 p32 only): each rounded probability is also stored, unchanged, to
 // published[index] when published is not null; the default form is the incumbent body.
@@ -2098,6 +2152,20 @@ __global__ void attention_softmax_kernel(float* scores, std::uint32_t selected_c
     attention_softmax_body(scores, selected_count, maximum_selected, dynamic);
 }
 
+#if defined(STRIX_QWEN_QSA_SHARED_EAGER)
+template <bool Int8 = false>
+__device__ __forceinline__ void attention_output_body(const float* q_gate, const std::uint16_t* kv_state,
+    const std::uint32_t* selected, const float* scores, std::uint32_t selected_count, std::uint32_t maximum_selected,
+    std::uint32_t attention_heads, std::uint32_t kv_heads, std::uint32_t head_dim, RoundedStageImage output,
+    GraphSelectionArguments dynamic) {
+    // The model's BF16 attention output and BF16 sigmoid gate before the final output projection.
+    const QsaEagerOperands<Int8> operands{q_gate, kv_state};
+    strix::attn_core::eager_selected::value_chain(selected, scores, selected_count, maximum_selected,
+        EagerGeometry{attention_heads, kv_heads, head_dim}, operands,
+        strix::attn_core::eager_selected::GatedRoundedOutput<RoundedStageImage, QsaEagerOperands<Int8>>{operands, output},
+        QsaSoftmaxControl{dynamic});
+}
+#else
 template <bool Int8 = false>
 __device__ __forceinline__ void attention_output_body(
     const float* q_gate,
@@ -2182,6 +2250,7 @@ __device__ __forceinline__ void attention_output_body(
             attn * gate);
     if (dynamic.position.status != nullptr && !isfinite(round_bf16(attn * gate))) atomicOr(dynamic.position.status, 8U);
 }
+#endif
 
 __global__ void attention_output_kernel(const float* q_gate, const std::uint16_t* kv_state,
     const std::uint32_t* selected, const float* scores, std::uint32_t selected_count,
