@@ -5992,3 +5992,35 @@ Both options are pending native token and logit identity checks.
   (ids and logits vs the incumbent leaves) is part of the integration identity ticket.
 - **Off switch:** `--no-latency-forms`.
 - **Measured gain:** not measured on this tree.
+
+<a id="inkling2-sp4t-head"></a>
+## Inkling 2 Mini decode head: Strix pack SP4, fixed table (`strix.sp4t`)
+
+**Engine:** `inkling2-mini` (HIP). **Control:** lever `inkling2-mini-lowbit-head@1` (`STRIX_INK_LOWBIT_HEAD=sp4t`) or
+`--qualify-decode-weights weights.head.sp4t@1`, with `STRIX_LOWBIT_PACK` naming a calibrated `strix.sp4t` pack.
+**Default:** off in every tier; an explicit option runnable under `--profile fast` and `--profile turbo`.
+
+**Shared home:** `Sp4Operand` of the shared small-M schedule (`src/core/f16_tile_gemm_small.hpp`, codes staged as exact
+FP16 table values by `src/core/lowbit_f16_staging.hpp`, one FP32 multiplier per 32-weight group, the per-tensor power of
+two applied at the store), dispatched by `enqueue_resident_q8_rows` (`src/core/resident_q8_rows.hpp`); storage identity
+`strix.sp4t@1` and calibrated pack entries in `src/weight` (docs/engine/lowbit-calibration.md); policy
+`weights.head.sp4t@1` in `include/strix/weight/levers.hpp`. Inkling binds the head arm only.
+
+- **Exactness evidence:** bit-changing (lossy weights). With the lever unset, Inkling CLI and served token ids and logits
+  equal origin/main (100 of 100 identity rows) and the incumbent gfx1151 ISA is identical (43 objects). The device SP4
+  rows equal the host dequantised reference within the FP32 accumulation bound (worst 0.0032 of it) and are bitwise per
+  row for 1 to 33 rows.
+- **Quality (gate v2, decode, 39 held-out windows, 2,457 rows):** pooled KL 0.00067, top-1 0.994, dNLL -0.0002, route
+  flips 0. FAST: one window fails dNLL by 0.00005 (prose-13) and one is unresolved (structured-14, top-1 0.905): not a
+  FAST row. TURBO limits: 39 of 39 windows pass.
+- **Measured gain:** CLI B=1, 512 steps, three interleaved rounds: 33.20 ms per step against 34.26 ms with the BF16 head
+  (-3.1 %) and 35.28 ms with the q4_g64 head. The q4_g64 gap is the route (small-M against the large tile on a device
+  without declared `lowbit_rows`), not the format. Served decode not measured: the arm is command line only.
+- **Why no TURBO row yet:** the TURBO row carries q4 attention and a q4 head under a served receipt; replacing its head
+  needs the combined arm gated, the SP4 arm served and a served receipt at widths 1, 8 and 16.
+- **Off switch:** leave `STRIX_INK_LOWBIT_HEAD` unset.
+
+| model | SP4 head |
+|---|---|
+| inkling2-mini | bound (HIP head, decode steps) |
+| qwen3.8-flash-next, qwen3.8-27b, deepseek-v4.1-flash, glm-5.3-flash, minimax-m3.1-flash, hy4-flash, nemotron-3.5-bolt-e4b | not bound: the decode head has no calibrated pack path and no resident low-bit rows |

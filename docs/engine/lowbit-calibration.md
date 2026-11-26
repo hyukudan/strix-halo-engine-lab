@@ -87,6 +87,7 @@ incumbent weights. The final calibrated q4 head lacks a passing FAST receipt.
 |---|---|---|---|
 | EXACT, FAST | BF16 | bitwise | 23.36 / 53.76 / 66.74 tok/s, 14.15 s |
 | (FAST candidate) | head q4_g64, every other role BF16 | every class and the pooled bars pass (KL 0.0010, top-1 0.993, dNLL +0.0011, route flips 0), but two prose windows fail dNLL: not a FAST row | 23.96 / 64.55 / 81.52 tok/s, 14.15 s |
+| (explicit option) | head Strix pack SP4, fixed table (`strix.sp4t`), every other role BF16 | decode-arm route: pooled KL 0.00067, top-1 0.994, dNLL -0.0002, route flips 0; every class passes; FAST: 37 windows pass, prose-13 fails dNLL (+0.01709, limit +0.01704), structured-14 unresolved (top-1 0.905, dNLL -0.020): not a FAST row; TURBO limits: 39 / 39 windows pass | not served (command line only); CLI B=1, 127-token prompt, 512 steps, three interleaved rounds: 33.20 ms per step against 34.26 (BF16 head) and 35.28 (q4_g64 head) |
 | TURBO opt-in | attention and head q4_g64 | scored on the production route (BF16 prefill of the teacher prefix, q4 decode steps): KL 0.0033, top-1 0.980, dNLL +0.0027, route flips 0.00x the null, every window inside the TURBO window bar; a TURBO row (its q4 head fails the FAST bar on two prose windows) | 27.03 / 68.48 / 86.60 tok/s, 14.38 s |
 
 The decode figures above predate the screened BF16 head of the HIP greedy pick. Against a build that screens it (served,
@@ -95,6 +96,8 @@ The decode figures above predate the screened BF16 head of the HIP greedy pick. 
 8K prefill equal (563 / 595 against 581 / 594 tok/s). The q4 row projects the full q4 head and gives up the screen.
 
 TURBO prints its quality in the `weight_status` receipt line (`turbo_quality ...`).
+
+SP4 head pack: the same calibration moments and held-out manifests as the q4 pack, technique `both`, damp 0.1, fixed table, head only, identity `9566197bac8cd738`, base -36, offline relative output error 0.359 of round-to-nearest. It is not a TURBO row yet: the TURBO row carries q4 attention and a q4 head under a served receipt; swapping its head needs the combined arm gated, the SP4 arm served and a served receipt at widths 1, 8 and 16. The step difference to the q4 head is the route, not the format (same bytes): the SP4 consumer always runs the small-M schedule, while q4_g64 / q6_g64 take the large tile at every row count on a device whose declaration states no `lowbit_rows` (the gfx1151 entry of `data/devices/profiles.toml` states none; see docs/devices.md).
 
 Quality is measured with the gate (`tools/strix-gate/gate_v2.py` through the engine's gate kit) on the loaded pack,
 never inferred from the offline table. `STRIX_INKLING_GATE_ROUTE=decode-arm` scores the two-image route via
