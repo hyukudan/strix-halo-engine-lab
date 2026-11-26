@@ -1,7 +1,9 @@
 // Host coverage of the dense HIP profile binding and prefill routes.
 #include "strix/profiles/qwen_dense_hip.hpp"
 
+#include <algorithm>
 #include <cstdio>
+#include <string_view>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -185,10 +187,120 @@ void documentation_receipt(const char* path) {
                 timing.find("| 32500 | timeout at 470 s | 436.8 |") != std::string::npos,
             "timing receipt uses the matching 8K arms and records 32.5K EXACT as a timeout");
 }
+
+// FAST and TURBO resolve the gated route (the 512-row window; + A4W4 48-63 only where its own row passed) only inside a
+// regime ledger row on gfx1151, one rank, one lane, the IU4 pack and a known execution (band timing rows bind to it);
+// the previous route elsewhere.
+void scoped_fast_route() {
+    const std::string execution = "exec/v1 backend=hip device=gfx1151|fixture prompt=8192 context=8272 lanes=1";
+    const hp::Scope solo{true, true};
+    struct Case {
+        std::uint64_t prompt = 0;
+        std::string_view device = "gfx1151";
+        std::uint32_t lanes = 1;
+        bool known = true;
+        hp::Scope scope{true, true};
+    };
+    const auto resolve = [&](const Case& c, sp::Name tier, const sp::Lookup& env, const q::PrefillFlags& flags,
+                             hp::App app = hp::App::decode) {
+        sp::Inputs inputs;
+        inputs.profile = tier;
+        inputs.env = env;
+        inputs.regime = {sp::Phase::prefill, c.prompt, c.lanes, c.device, c.known ? std::string_view(execution) : std::string_view()};
+        return hp::resolve_prefill(app, inputs, flags, max_rows, c.scope);
+    };
+    // The FAST route of a gated band: the 512-row window (bound to its band receipt), plus the A4W4 layers only where
+    // the ledger also holds a passing A4W4 row for that prompt length (none today: the composite failed the gate).
+    const auto composite = [&](const sp::Resolution& r, std::uint64_t prompt) {
+        const sp::Regime regime{sp::Phase::prefill, prompt, 1, "gfx1151", execution};
+        const bool a4w4 = hp::qualification("a4w4_layers", "48-63", regime) != nullptr;
+        const bool window_ok = window(r, hp::App::decode).status == sp::Status::set &&
+                               window(r, hp::App::decode).value == "512" &&
+                               !window(r, hp::App::decode).ladder_reference.empty();
+        const bool layers_ok = a4w4 ? layers(r).status == sp::Status::set && layers(r).value == "48-63"
+                                    : !sp::applied(layers(r).status);
+        return window_ok && layers_ok;
+    };
+    const auto previous = [&](const sp::Resolution& r) {
+        return !sp::applied(window(r, hp::App::decode).status) && !sp::applied(layers(r).status) &&
+               window(r, hp::App::decode).value == hp::kExactWindow && layers(r).value == "none";
+    };
+    bool window_rows = false;
+    std::uint64_t top = 0;
+    for (const auto& row : hp::kQualified) {
+        require(row.gate.lever == "wide_rows" || row.gate.lever == "a4w4_layers", "the ledger holds only the two cells");
+        window_rows = window_rows || row.gate.lever == "wide_rows";
+        if (row.gate.lever == "wide_rows") top = std::max(top, row.gate.max_prompt_tokens);
+    }
+    require(window_rows, "the ledger holds the window rows");
+    for (const auto& row : hp::kQualified) {
+        if (row.gate.lever != "wide_rows") continue;
+        for (const auto prompt : {row.gate.min_prompt_tokens, (row.gate.min_prompt_tokens + row.gate.max_prompt_tokens) / 2,
+                                  row.gate.max_prompt_tokens}) {
+            for (const auto tier : {sp::Name::fast, sp::Name::turbo}) {
+                const auto r = resolve({prompt}, tier, no_env, {});
+                require(composite(r, prompt), "FAST and TURBO resolve the gated route inside its band");
+                q::PrefillFlags flags;
+                hp::apply_window(hp::App::decode, r, flags);
+                require(flags.width == 512 && !flags.exact, "the applied window reaches the engine flags");
+            }
+            require(previous(resolve({prompt}, sp::Name::standard, no_env, {})), "EXACT keeps its windows inside the band");
+            const auto spec = resolve({prompt}, sp::Name::fast, no_env, {}, hp::App::spec);
+            require(!sp::applied(window(spec, hp::App::spec).status) && !sp::applied(layers(spec).status),
+                    "the spec app keeps its route (no gate on that execution)");
+        }
+    }
+    const std::uint64_t inside = top;
+    for (const auto& c : {Case{0}, Case{top + 1}, Case{inside, "gfx1100"}, Case{inside, "gfx1151", 2},
+                          Case{inside, "gfx1151", 1, false}, Case{inside, "gfx1151", 1, true, {false, true}},
+                          Case{inside, "gfx1151", 1, true, {true, false}}})
+        for (const auto tier : {sp::Name::fast, sp::Name::turbo})
+            require(previous(resolve(c, tier, no_env, {})),
+                    "unknown prompt, beyond the bands, other device, lanes, unknown execution, TP or pack: previous route");
+
+    q::PrefillFlags exact64;
+    exact64.width = 64;
+    exact64.exact = true;
+    const auto e = resolve({inside}, sp::Name::fast, no_env, exact64);
+    require(window(e, hp::App::decode).value == "64" && !sp::applied(layers(e).status), "explicit EXACT window: no A4W4");
+    q::PrefillFlags w256;
+    w256.width = 256;
+    require(!sp::applied(layers(resolve({inside}, sp::Name::fast, no_env, w256)).status), "another width: no A4W4");
+    q::PrefillFlags w512;
+    w512.width = 512;
+    const bool a4w4_inside =
+        hp::qualification("a4w4_layers", "48-63", {sp::Phase::prefill, inside, 1, "gfx1151", execution}) != nullptr;
+    require(sp::applied(layers(resolve({inside}, sp::Name::fast, no_env, w512)).status) == a4w4_inside,
+            "the gated width spelled explicitly: A4W4 exactly where its row passed");
+    q::PrefillFlags rows;
+    rows.rows = 4;
+    require(!sp::applied(layers(resolve({inside}, sp::Name::fast, no_env, rows)).status), "row diagnostics: no A4W4");
+    q::PrefillFlags dump_window;  // the gate's FAST arm: --dump-logits --dump-window measures the resolved default
+    dump_window.dump = dump_window.dump_window = true;
+    const auto dw = resolve({inside}, sp::Name::fast, no_env, dump_window);
+    require(composite(dw, inside), "--dump-logits --dump-window: the profile's route runs");
+    hp::apply_window(hp::App::decode, dw, dump_window);
+    require(dump_window.width == 512 && !dump_window.row_path(), "--dump-window takes the applied 512-row window");
+    q::PrefillFlags dump_only;
+    dump_only.dump = true;
+    require(!sp::applied(layers(resolve({inside}, sp::Name::fast, no_env, dump_only)).status),
+            "--dump-logits alone: row path, no A4W4");
+    const sp::Lookup master_off = [](const char* key) -> const char* {
+        return std::string_view(key) == "STRIX_DENSE_A4W4" ? "0" : nullptr;
+    };
+    const auto off = resolve({inside}, sp::Name::fast, master_off, {});
+    require(sp::applied(window(off, hp::App::decode).status) && !sp::applied(layers(off).status),
+            "STRIX_DENSE_A4W4=0 turns the layer table off and keeps the window");
+    const auto none = resolve({inside}, sp::Name::fast, layers_off, {});
+    require(sp::applied(window(none, hp::App::decode).status) && layers(none).value == "none",
+            "STRIX_DENSE_A4W4_LAYERS=none keeps the window alone");
+    (void)solo;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
     pending_composite_and_exact_identity();
+    scoped_fast_route();
     diagnostic_windows();
     exact_window_receipt();
     if (argc == 2) documentation_receipt(argv[1]);

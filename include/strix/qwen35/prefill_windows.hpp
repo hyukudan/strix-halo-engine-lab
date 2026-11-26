@@ -32,7 +32,9 @@ struct PrefillFlags {
     bool dump_window = false;  // wide path + dump: every row of the last wide window (else its last row)
     std::uint32_t tf_rows = 0; // wide path: the last N prompt tokens on the decode row path
 
-    [[nodiscard]] bool row_path() const noexcept { return !width && (rows || dump); }
+    // --dump-window asks for the last wide window, so without --wide it takes the wide path at the window the profile
+    // applies (else the engine default); --dump-logits alone keeps the one-row windows of its references.
+    [[nodiscard]] bool row_path() const noexcept { return !width && (rows || (dump && !dump_window)); }
 };
 
 // Engine options from the flags: untouched (engine defaults) unless an explicit width is given; the row path needs no

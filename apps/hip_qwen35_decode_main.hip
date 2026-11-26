@@ -40,6 +40,8 @@
 #include "../src/core/dense_linear_iu4.hpp"
 #include "../src/xport/tp_gather_hip.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/gguf_reader.hpp"
+#include "device/hip_cost_identity.hpp"
 
 namespace {
 std::string sysfs_clock() {
@@ -133,8 +135,34 @@ int main(int argc, char** argv) try {
         else if (a == "--tp-force") tp_force = true;
         else throw std::invalid_argument("unknown flag " + a);
     }
-    const auto profile = hip_profile::resolve_prefill(hip_profile::App::decode, command.inputs, pf, HipEngine::max_rows());
+    // The profile resolves for this run (before load): prompt length, device class and product, the IU4 pack, one rank.
+    if (!ids_arg.empty() && ids_arg[0] == '@') {  // long prompts exceed the per-argument limit of the OS
+        std::ifstream f(ids_arg.substr(1));
+        if (!f) throw std::invalid_argument("cannot read " + ids_arg.substr(1));
+        ids_arg.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        while (!ids_arg.empty() && std::isspace(static_cast<unsigned char>(ids_arg.back()))) ids_arg.pop_back();
+    }
+    const auto prompt = parse_ids(ids_arg);
+    const std::string device_product = strix::device::hip_cost_device_identity();
+    const std::string device_class = device_product.substr(0, std::min(device_product.find('|'), device_product.find(':')));
+    bool iu4_pack = false;
+    try {
+        if (!model.empty())
+            for (const auto& t : strix::gguf::read_file(model).tensors) iu4_pack = iu4_pack || t.ggml_type == strix::gguf::type_strix_iu4_g64;
+    } catch (const std::exception&) {
+        iu4_pack = false;  // unreadable header: the load below reports it; no FAST cell qualifies
+    }
+    const std::uint64_t capacity = maxpos ? std::uint64_t{maxpos} : prompt.size() + gen + HipEngine::max_rows();
+    const std::string settings = "mtp=" + spec_args.mtp + "|tp=" + (tp_rank < 0 ? "off" : "on");
+    const std::string execution = strix::profile::ladder_execution({"hip", device_product,
+        {prompt.size(), capacity, 1U, static_cast<std::uint32_t>(std::min<std::size_t>(prompt.size(), 0xFFFFFFFFU)), 0U, 0U, 0U, gen},
+        settings});
+    auto profile_inputs = command.inputs;
+    profile_inputs.regime = {strix::profile::Phase::prefill, prompt.size(), 1U, device_class, execution};
+    const auto profile = hip_profile::resolve_prefill(hip_profile::App::decode, profile_inputs, pf, HipEngine::max_rows(),
+                                                      {tp_rank < 0, iu4_pack});
     if (hip_profile::finish(hip_profile::App::decode, profile, inspect)) return 0;
+    hip_profile::apply_window(hip_profile::App::decode, profile, pf);  // the window the profile applied runs
     if (tp_rank > 1) throw std::invalid_argument("--tp-rank 0|1");
     // Tensor-parallel decode: every rank must pick the same verify windows, so the speculation costs are the compiled
     // table (identical bits on every rank; calibrated or learned walls are per rank and could differ). An explicit
@@ -155,13 +183,6 @@ int main(int argc, char** argv) try {
     }
     if (model.empty() || pf.rows > HipEngine::max_rows())
         throw std::invalid_argument("usage: --model GGUF [--prompt-ids 1,2,3] [--gen N] [--rows 1..16 (row-path diagnostic)] [--dump-logits FILE] [--iu4-reference] [--mtp auto|off|F] [--draft-rows on|off] [--draft-pack F1,F2] [--spec-costs calibrated|table|learned] [--wide N | --wide-exact N] [--tf-rows N] [--dump-window] [--max-pos N] [--repeat N]; --prompt-ids @FILE reads the list from FILE");
-    if (!ids_arg.empty() && ids_arg[0] == '@') {  // long prompts exceed the per-argument limit of the OS
-        std::ifstream f(ids_arg.substr(1));
-        if (!f) throw std::invalid_argument("cannot read " + ids_arg.substr(1));
-        ids_arg.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
-        while (!ids_arg.empty() && std::isspace(static_cast<unsigned char>(ids_arg.back()))) ids_arg.pop_back();
-    }
-    const auto prompt = parse_ids(ids_arg);
     if (prompt.empty()) throw std::invalid_argument("empty prompt");
     strix::core::require_capacity(prompt.size(), gen, 0xFFFFFFFFULL);
     const auto required = prompt.size() + gen;
@@ -232,8 +253,11 @@ int main(int argc, char** argv) try {
     for (const auto& w : pplan.windows) {
         const auto o = E->forward_commit(uprompt.data() + w.at, w.rows, w.want);
         if (const unsigned m = w.tops()) {
-            E->read_top(o, m, ptop.data());
-            first_top = ptop[m - 1U];
+            // A window of more rows than the decode window returns every row's logits but only the last row's argmax
+            // (engine: the all-rows head of a wide window); read what it returns.
+            const unsigned tops = m > HipEngine::max_rows() ? 1U : m;
+            E->read_top(o, tops, ptop.data());
+            first_top = ptop[tops - 1U];
             if (!dump.empty()) {
                 const auto at = dumped.size();
                 dumped.resize(at + std::size_t(m) * V);

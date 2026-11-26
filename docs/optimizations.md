@@ -1174,6 +1174,41 @@ the decode app keeps 16-row windows unless `--wide-exact N`, the pair app keeps 
 - **Implementation / evidence:** [engine](../src/qwen35/hip/engine.hip), [IU4 dense core](../src/core/dense_linear_iu4.hpp),
   [row-block grid](../src/core/dense_iu4_rows.hpp), [options](../include/strix/qwen35/hip_engine.hpp)
 
+<a id="qwen27-hip-fast-window"></a>
+
+### Qwen 27B HIP: FAST and TURBO prefill with the 512-row window inside the gated bands
+
+**Engine:** `qwen` (27B dense, HIP decode app `strix-hip-qwen35-decode`). **Control:** `--profile fast|turbo`
+(default product profile FAST). **Default:** ON in FAST and TURBO inside the gated prompt bands; EXACT unchanged.
+
+The 512-row IU4 window (`--wide 512`, A4W4 off) is the FAST/TURBO prefill route when the shared regime ledger
+(`sp::RegimeGate` rows, quality per prompt band) and the shared band receipts (`LadderRow::band_bound`, timing per band,
+bound by `bind_band_receipts` to the run's own reference and re-bound until the ladder chain settles) both cover the
+run: gfx1151, one rank, one lane, the IU4 g64 pack, a known execution and a prompt in 1..2,048, 2,049..8,192 or
+8,193..24,576 tokens. Elsewhere the previous route (64-row EXACT windows) stays. The A4W4 48-63 layer table failed the same
+per-class gate and stays pending. `--dump-logits --dump-window` without `--wide` now dumps the last window of the route
+the profile resolves (the gate's default arm); `--dump-logits` alone keeps its one-row reference path. Windows wider
+than the decode window read back the one argmax the engine returns for them (the all-rows head; fixes a
+`hipMemcpyAsync ... invalid argument` on `--wide N --dump-window`).
+
+| Engine | Device | Status |
+|---|---|---|
+| qwen 27B dense, HIP decode app | gfx1151, one rank, one lane, IU4 g64 | ON in FAST/TURBO inside the gated bands |
+| qwen 27B dense, HIP spec / pair apps, TP | gfx1151 | previous route (not gated on that execution) |
+| qwen 27B dense, CUDA | any | not applicable (own windows) |
+| other engines | any | not applicable |
+
+- **Preconditions:** Qwen 27B dense IU4 g64 pack on one gfx1151 device, one rank, one lane, prompt inside a gated band.
+- **Exactness evidence:** Bit-changing (FAST class). Per-class gate v2 PASS in every class of every band (KL <= 0.00008,
+  top-1 >= 0.996, |dNLL| <= 0.0008 against EXACT `--wide-exact 512`, one-ulp null); the default's dumps are bitwise the
+  gated window arm (6 cases, 2,048 and 8,192 tokens); EXACT reference bits equal across the two nodes.
+- **Off switch:** `--profile exact`, an explicit `--wide N` / `--wide-exact N`, or `--rows N`.
+- **Measured gain:** One Strix Halo node, `--no-mtp --gen 1`, prompt seconds EXACT 64 rows -> 512-row window: 2,048
+  tokens 10.27 -> 2.99 s (3.43x), 8,192 tokens 67.60 -> 12.93 s (5.23x), 24,576 tokens 534.39 -> 45.43 s (11.8x).
+- **Implementation / evidence:** [profile rows](../include/strix/profiles/qwen_dense_hip.hpp),
+  [shared band receipts](../include/strix/engine_profile.hpp), [prefill windows](../include/strix/qwen35/prefill_windows.hpp),
+  [model page](models/qwen3.8-27b/README.md#fast-prefill-window-hip-decode-app)
+
 <a id="qwen27-hip-decode-attn-row-share"></a>
 
 ### Qwen 27B HIP: decode attention walks the K/V cache once per kv head for several rows

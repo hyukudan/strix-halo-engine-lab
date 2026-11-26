@@ -85,14 +85,55 @@ summed in ascending warp order. q8_0: int8 values are exact in bf16; each 32-blo
 - FAST policies: `mma2` (hi + mid), `mma1` (hi only; max |dlogit| 8x larger, see RESULT). Not the default.
 - Shapes not covered (in % 32, out % 16, f32 weights) fall back to fp32 kernels.
 
+## FAST prefill window (HIP decode app)
+
+FAST and TURBO prefill with the 512-row IU4 window (`--wide 512`, A4W4 off) by default when the
+prompt is inside a gated band: one gfx1151 device, one rank (no `--tp-rank`), one lane, the IU4 g64
+pack and a known execution. The band rows live in the shared regime ledger and band receipts
+(`include/strix/profiles/qwen_dense_hip.hpp`: `kQualified`, `kBandRows`); outside them, and for EXACT,
+the spec app, TP, other devices or packs, the previous route stays (64-row EXACT windows). Off
+switches: `--profile exact`, an explicit `--wide N` / `--wide-exact N`, or `--rows N`.
+`--dump-logits FILE --dump-window` dumps every row of the last window of the route the profile
+resolves; `--dump-logits` alone keeps the one-row reference path.
+
+FAST gate v2 per content class (`tools/strix-gate/gate_v2.py qual`, limits KL <= 0.02, top-1 >= 0.93,
+dNLL <= +0.01, >= 800 rows per class): held-out texts (prose: Perl pod and licence texts; code: the
+Python standard library; structured: ISO code JSON and the freedesktop MIME XML), 4 windows per class at
+2,048 and 8,192 tokens and one text per class cut at 24,576 and 24,064 tokens, 511 scored rows per window,
+reference EXACT `--wide-exact 512` (`--tf-rows`), null arm `STRIX_DENSE_NULL=0:100:1234`.
+
+| Band (tokens) | Arm | prose KL / top-1 / dNLL | code KL / top-1 / dNLL | structured KL / top-1 / dNLL | Verdict |
+|---|---|---|---|---|---|
+| 2,048 | 512-row window | 0.00008 / 0.9961 / -0.0008 | 0.00002 / 0.9971 / -0.0001 | 0.00001 / 1.0000 / +0.0001 | PASS |
+| 2,048 | window + A4W4 48-63 | 0.2095 / 0.8454 / +0.1157 | 0.0669 / 0.9310 / +0.0518 | 0.0707 / 0.9677 / +0.0464 | FAIL |
+| 8,192 | 512-row window | 0.00007 / 0.9961 / +0.0002 | 0.00003 / 0.9976 / -0.0003 | 0.00001 / 1.0000 / +0.00001 | PASS |
+| 8,192 | window + A4W4 48-63 | 0.1792 / 0.8704 / +0.1099 | 0.0649 / 0.9178 / +0.0632 | 0.0097 / 0.9902 / +0.0004 | FAIL |
+| 24,576 (cuts 24,576 + 24,064) | 512-row window | 0.00006 / 0.9951 / -0.0004 | 0.00001 / 1.0000 / -0.0000 | 0.00001 / 1.0000 / -0.0003 | PASS |
+
+The bands are 1..2,048, 2,049..8,192 and 8,193..24,576 tokens, each gated at its top. Longer prompts keep the
+64-row EXACT windows: their EXACT reference does not finish inside one night queue turn.
+
+Timing (one gfx1151 node, the IU4 pack, `--no-mtp --gen 1`, meas_nodes prompt ids, mirrored order,
+EXACT one cold prefill per round, the window warm of `--repeat 2`, kfd evictions 0, prompt seconds):
+
+| Prompt tokens | EXACT 64 rows | 512-row window | window + A4W4 48-63 | `--profile fast` (default) |
+|---|---:|---:|---:|---:|
+| 2,048 | 10.24 / 10.30 | 2.98 / 3.00 | 2.81 / 2.80 | 2.82 / 2.81 |
+| 8,192 | 67.57 / 67.63 | 12.91 / 12.94 | 12.09 / 12.11 | 12.11 / 12.10 |
+| 24,576 | 534.39 | 45.45 / 45.42 | not run | 45.32 / 45.76 |
+
+2,048 and 8,192 ran on one node in one turn; 24,576 ran on the other node, the window and default arms in one
+turn and the EXACT run (one cold prefill, 534 s) in its own turn, same binary and ids.
+
+The `--profile fast` column above ran the provisional data (window + A4W4); with the gated data the
+default dumps are bitwise the 512-row window arm (2,048 and 8,192 tokens, 3 cases each).
+
 ## A4W4 layer table (HIP, FAST)
 
-FAST and TURBO use the engine's 64-row EXACT windows when no window is requested. The
-512-row window and A4W4 layers 48-63 form one candidate. The 8,192-token held-out result below
-covers a single text. Automatic admission requires final predeclared content-class verdicts
-and a timing gain for the same composition. The other timed lengths were 2,048 and 32,500
-tokens. Each needs its own quality verdict. Other devices, multi-rank or multi-lane
-execution, other packs, other window widths and different execution modes keep their
+The 512-row window and A4W4 layers 48-63 formed one candidate. It failed the per-class gate above
+at 2,048 and 8,192 tokens (prose and code), so its FAST cell stays pending. The single-text
+8,192-token result below did not predict the per-class result. Other devices, multi-rank or
+multi-lane execution, other packs, other window widths and different execution modes keep their
 previous routes. There is no separately qualified HIP TURBO lever.
 
 For an explicit experiment, set `STRIX_DENSE_A4W4_LAYERS=48-63` with `--wide 512`

@@ -287,6 +287,7 @@ int main(int argc, char** argv) try {
     }
     const auto profile = q::hip_profile::resolve_prefill(q::hip_profile::App::spec, command.inputs, pfl, q::HipEngine::max_rows());
     if (q::hip_profile::finish(q::hip_profile::App::spec, profile, inspect)) return 0;
+    q::hip_profile::apply_window(q::hip_profile::App::spec, profile, pfl);  // the window the profile applied runs
     const auto plan = q::resolve_hip_dense_spec(model, spec_args);  // ONE resolver (hip_spec_defaults.hpp)
     mtp_file = plan.mtp_source;
     std::printf("spec plan: mtp %s %s, draft rows %s, costs %s; overrides:%s%s%s%s\n", plan.mtp_reason.c_str(), mtp_file.c_str(),
