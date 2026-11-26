@@ -59,6 +59,20 @@ class Layering(unittest.TestCase):
                 self.assertEqual(cl.model_of(path), family)
                 self.assertIn(("model-kernel", path), self.counts({path: "__global__ void k() {}"}))
 
+    def test_qwen_launcher_kernel_fragments_are_ratchet_checked(self):
+        paths = (
+            "src/hip_gdn_fp16_chunk.inc",
+            "src/hip_qpf2k_hc_output3_body.inc",  # nested under a launcher-owned fragment
+            "src/hip_qsa_index_band.inc",
+            "src/hip_moe_prefill_commit.inc",
+            "src/hip_ple_rows_site.inc",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertEqual(cl.model_of(path), "qwen")
+                self.assertEqual(self.counts({path: "__global__ void k() {}"}), {("model-kernel", path): 1})
+        self.assertIsNone(cl.model_of("src/hip_gdn_shared_primitive.inc"))
+
     def test_rules(self):
         c = self.counts()
         self.assertEqual(c.get(("model-include", "include/strix/serve/api.hpp")), 1)
