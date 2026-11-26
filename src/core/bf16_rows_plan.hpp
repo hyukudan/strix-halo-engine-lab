@@ -13,6 +13,15 @@ namespace strix::core::fma_rows {
 // grid past its launch limit). One source for enqueue_bf16_rows and for the routed entry, whose image routes stand in
 // only for the WMMA tile.
 enum class Bf16RowsPath : unsigned char { refused, tight_rows, wmma, fma };
+enum class Bf16RowsSchedule : unsigned char { legacy, compact_narrow };
+
+// Select only inside the incumbent WMMA path. Pitched weights stay on its pitched kernel.
+constexpr bool admits_bf16_compact_projection(unsigned width, unsigned rows, const Bf16RowProjection& projection) {
+    using Shape = f16_tile_gemm::Bf16TileShape<true>;
+    constexpr Bf16RowLimits limits{gemv_rows::max_rows, 0U, Shape::panel, 16U, 1U};
+    return rows <= 65535U * Shape::rows && projection.contiguous(width) &&
+           plan_bf16_row_projection(width, projection.outputs, rows, true, limits) == Bf16RowPath::big_compact;
+}
 
 inline Bf16RowsPath bf16_rows_path(unsigned input_width, unsigned rows, std::span<const Bf16RowProjection> projections,
                                    unsigned max_outputs) noexcept {
