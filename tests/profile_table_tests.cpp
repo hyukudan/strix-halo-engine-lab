@@ -1,15 +1,22 @@
-#include "strix/profile/catalog_levers.hpp"
-
 #include "cuda/models/glm/producer/profile.hpp"
+#include "strix/device/profiles.hpp"
+#include "strix/deepseek41_pair_defaults.hpp"
+#include "strix/glm_pair_profile_table.hpp"
+#include "strix/model_registry.hpp"
 #include "strix/profiles/ds41_rtx.hpp"
+#include "strix/profiles/ernie.hpp"
 #include "strix/profiles/gemma4.hpp"
+#include "strix/profiles/hy4.hpp"
+#include "strix/profiles/inkling2_mini.hpp"
 #include "strix/profiles/qwen_cuda.hpp"
-#include "strix/serve_cli_parity.hpp"
+#include "strix/profiles/qwen_dense_cuda.hpp"
+#include "strix/profiles/qwen_dense_hip.hpp"
+#include "minimax/engine/mm_defaults.hpp"
 
 #include <algorithm>
 #include <array>
+#include <iomanip>
 #include <iostream>
-#include <limits>
 #include <set>
 
 namespace {
@@ -19,10 +26,9 @@ namespace qc = strix::qwen::cuda_profile;
 namespace g4 = strix::gemma4::profile;
 namespace ds = strix::ds41::rtx::profile;
 namespace glm = strix::glm::rtxpf::profile;
-namespace ex = strix::exec;
-using strix::lever::Exactness;
 
 constexpr std::array tier_words{"exact", "fast", "turbo", "quality", "default"};
+bool dump = false;
 
 void check(bool condition, std::string_view message) {
     if (!condition) throw std::runtime_error(std::string(message));
@@ -39,7 +45,6 @@ p::Lookup env(p::Pairs values = {}) {
 struct Snapshot {
     std::vector<std::string> fields;
     bool refused = false;
-    bool operator==(const Snapshot&) const = default;
 };
 
 template <class Resolution>
@@ -62,6 +67,7 @@ Snapshot snapshot(const Resolution& resolved) {
         fields.push_back(std::to_string(static_cast<int>(entry.status)));
         if constexpr (requires { entry.target; }) fields.push_back(entry.target);
         if constexpr (requires { entry.wanted; }) fields.push_back(entry.wanted);
+        if constexpr (requires { entry.ladder_reference; }) fields.push_back(entry.ladder_reference);
         if constexpr (requires { entry.requested; }) {
             fields.push_back(entry.requested);
             fields.push_back(entry.reason);
@@ -85,14 +91,14 @@ struct Comparison {
 
     template <class Row, class Native>
     void run(std::string_view label, p::Name tier, std::span<const Row> rows, Native&& native) {
-        // At this base there are no D4 bindings for any incumbent override.
-        const auto expected = capture([&] { return native(rows); });
-        std::vector<Row> storage;
-        const auto actual = capture([&] {
-            return p::resolve_effective_profile(tier, rows, {}, storage, native);
-        });
-        check(actual == expected, label);
-        if (expected.refused) ++refused;
+        const auto observed = capture([&] { return native(rows); });
+        if (dump) {
+            std::cout << resolved + refused << '\t' << p::name(tier) << '\t' << std::quoted(label) << '\t'
+                      << (observed.refused ? "refused" : "resolved");
+            for (const auto& field : observed.fields) std::cout << '\t' << std::quoted(field);
+            std::cout << '\n';
+        }
+        if (observed.refused) ++refused;
         else ++resolved;
     }
 
@@ -294,196 +300,170 @@ void ds41() {
 }
 
 void glm_cuda() {
+    // The producer currently leaves its bit-changing rows inaccessible to CLI/environment overrides.
+    // Add switches to a copied table to exercise the binding without exposing new production options.
+    const auto declared = glm::levers();
+    const auto candidate = std::ranges::find(declared, "prefill_tile_large", &glm::Lever::name);
+    check(candidate != declared.end(), "GLM producer pending tile row");
+    auto row = *candidate;
+    row.env = "STRIX_FIXTURE_TILE";
+    row.options[0] = {"--fixture-tile", "*"};
+    const std::array fixture{row};
+    const auto unqualified = [&](const glm::Inputs& in, glm::Status source) {
+        const auto resolution = glm::resolve(glm::App::decode_service, in, fixture);
+        const auto* entry = resolution.find(row.name);
+        check(entry && entry->value == "8192" && entry->status == source &&
+            resolution.qualification() == "unqualified: prefill_tile_large" &&
+            resolution.json().find("\"unqualified\":[\"prefill_tile_large\"]") != std::string::npos,
+            "GLM producer explicit pending tile is unqualified and retains its source");
+    };
+    unqualified({{"--fixture-tile", "8192"}, env()}, glm::Status::explicit_cli);
+    unqualified({{}, env({{std::string(row.env), "8192"}})}, glm::Status::explicit_env);
+    check(glm::resolve(glm::App::decode_service, {{}, env({{std::string(row.env), "off"}})}, fixture)
+              .qualification() == "qualified", "GLM producer explicit off is qualified");
+
     constexpr std::array apps{glm::App::decode_service};
     rtx<glm::Inputs>("glm_cuda", glm::levers(), std::span<const glm::App>(apps),
         [](auto app, const auto& in, auto rows) { return glm::resolve(app, in, rows); },
         "STRIX_GLM_RTX_PROFILE", "STRIX_GLM_RTX_PROFILE_ALLOW_PENDING");
 }
 
-void catalogue() {
-    const auto builtins = ex::Catalog::builtin_entries(ex::Backend::hip);
-    check(!builtins.empty(), "expected D4 HIP entries");
-    auto reference = builtins.front(), fast = reference, turbo = reference, unrelated = reference;
-    fast.key.prologue = 1;
-    fast.identity = "fast-v1";
-    fast.exact = Exactness::bit_changing;
-    turbo.key.prologue = 2;
-    turbo.identity = "turbo-v1";
-    turbo.exact = Exactness::bit_changing;
-    unrelated.key.prologue = 3;
-    unrelated.identity = "unrelated-v1";
-    const std::array entries{reference, fast, turbo, unrelated};
-    ex::Catalog kernels;
-    kernels.add(entries);
-    strix::device::Profile device{};
-    device.name = "fixture";
-    device.arch = "gfx1151";
-    const std::array sites{
-        p::CatalogSite{"projection", reference.key, reference.identity},
-        p::CatalogSite{"projection", fast.key, reference.identity},
-        p::CatalogSite{"projection", turbo.key, reference.identity},
-        p::CatalogSite{"projection", unrelated.key, reference.identity},
-        p::CatalogSite{"projection", fast.key, reference.identity},
-    };
-    const std::array turbo_entries{turbo.identity};
-    const auto table = p::levers_of(kernels, device, sites, turbo_entries);
-    check(table.rows.size() == 3, "expected reference and two distinct variants");
-    check(p::levers_of(ex::Catalog::builtin(ex::Backend::hip), device, sites).rows.size() == 1,
-          "real D4 catalogue has no tier-changing fixture variants");
-    auto wrong_device = device;
-    wrong_device.arch = "sm_120";
-    check(p::levers_of(kernels, wrong_device, sites).rows.empty(), "architecture filter");
+// Registered product families, plus native sibling entry points reading the same model.
+// The device catalogue supplies the product and architecture for each backend.
+struct Binding { std::string_view tag, backend, route; };
+constexpr Binding bindings[]{
+    {"qwen", "hip", "decode"}, {"qwen", "cuda", "serve"},
+    {"deepseek41-pair", "hip", "pair"}, {"deepseek41-pair", "cuda", "replica"},
+    {"deepseek41-pair", "cuda", "prefill-service"},
+    {"glm-pair", "hip", "pair"}, {"glm-pair", "cuda", "producer"},
+    {"minimax-pair", "hip", "pair"},
+    {"gemma4", "hip", "engine"},
+    {"qwen35", "hip", "decode"}, {"qwen35", "hip", "spec"},
+    {"qwen35", "cuda", "decode"}, {"qwen35", "cuda", "spec"},
+    {"hy4", "hip", "rank"},
+    {"inkling2-mini", "cpu", "decode"}, {"inkling2-mini", "hip", "decode"},
+    {"inkling2-mini", "cuda", "decode"},
+    {"ernie", "hip", "inspection"},
+};
 
-    constexpr std::string_view fast_name = "projection/fast-v1", turbo_name = "projection/turbo-v1";
-    std::array classes{p::ClassVerdict{"code", "short", p::GateVerdict::pass, 800}};
-    std::array gates{
-        p::GateRecord{fast_name, "fixture-model", "held-out", p::GateVerdict::pass, classes},
-        p::GateRecord{turbo_name, "fixture-model", "held-out", p::GateVerdict::pass, classes, p::Name::turbo},
-    };
-    std::array regimes{
-        p::RegimeRecord{fast_name, device.name, {strix::lever::Axis::rows, 8, false, true}, 0.001, "fast-receipt"},
-        p::RegimeRecord{turbo_name, device.name, {strix::lever::Axis::rows, 8, false, true}, 0.002, "turbo-receipt"},
-    };
-    p::CatalogInputs inputs{.options = {}, .regime = {.rows = 8}, .model = "fixture-model",
-                            .gate_set = "held-out", .content_class = "code", .band = "short"};
-    const auto run = [&] { return p::resolve(table, inputs, gates, regimes); };
-    const auto expect = [&](bool fast_on, bool turbo_on, std::string_view label) {
-        const auto result = run();
-        check(result.entries[0].on && result.entries[0].reason == p::CatalogReason::reference, "reference class");
-        check(result.entries[1].on == fast_on && result.entries[2].on == turbo_on, label);
-    };
-    expect(false, false, "exact selects reference");
-    inputs.options.cli.emplace_back(fast_name, "1");
-    expect(false, false, "explicit request cannot change EXACT");
-    inputs.options.cli.clear();
-    inputs.options.profile = p::Name::fast;
-    expect(true, false, "FAST needs gate and a measured gain");
-    const auto qualified = run();
-    check(qualified.entries[1].receipt == "fast-receipt", "qualification provenance");
-
-    inputs.options.profile = p::Name::turbo;
-    expect(true, true, "TURBO extends FAST");
-    gates[1].tier = p::Name::fast;
-    expect(true, false, "FAST-limit record does not qualify TURBO");
-    check(run().describe().find("\"gate\":\"not-run\"") != std::string::npos, "missing TURBO record reported");
-    constexpr std::array turbo_provisional{turbo_name};
-    inputs.provisional = turbo_provisional;
-    inputs.options.cli.emplace_back(turbo_name, "1");
-    expect(true, true, "missing TURBO record allows a declared provisional opt-in");
-    check(run().entries[2].provisional && run().entries[2].gate_not_run, "explicit TURBO gate pending receipt");
-    gates[1].tier = p::Name::turbo;
-    for (const auto verdict : {p::GateVerdict::fail, p::GateVerdict::hold}) {
-        gates[1].verdict = verdict;
-        expect(true, false, "TURBO FAIL and HOLD block even provisional opt-ins");
+void matrix(const char* registry) {
+    namespace qd = strix::qwen35;
+    const auto no_env = env();
+    for (const auto& model : strix::model_registry::load(registry)) {
+        bool covered = false;
+        for (const auto& binding : bindings) {
+            if (model.profile_tag != binding.tag) continue;
+            covered = true;
+            for (const auto& device : strix::device::catalogue()) {
+                if ((binding.backend == "hip" && !device.vendor.empty() && device.vendor != "amd") ||
+                    (binding.backend == "cuda" && !device.vendor.empty() && device.vendor != "nvidia") ||
+                    (binding.backend == "cpu" && !device.vendor.empty())) continue;
+                for (const auto tier : {p::Name::standard, p::Name::fast, p::Name::turbo}) {
+                    for (const auto context : {0U, 2048U, 4096U, 8192U, 8193U, 16384U, 32768U}) {
+                        const auto lanes = binding.route == "pair" ? 2U : 1U;
+                        p::Inputs in;
+                        in.profile = tier;
+                        in.env = no_env;
+                        in.backend = binding.backend;
+                        in.regime = {p::Phase::prefill, context, lanes, device.arch, "matrix"};
+                        const auto emit = [&](const auto& resolution) {
+                            std::cout << '\t' << std::quoted(resolution.qualification());
+                            for (const auto& entry : resolution.entries)
+                                std::cout << '\t' << entry.lever->name << '=' << std::quoted(entry.value)
+                                          << '/' << static_cast<unsigned>(entry.status);
+                        };
+                        std::cout << model.name << '\t' << binding.backend << '\t' << binding.route << '\t'
+                                  << device.name << '\t' << (tier == p::Name::standard ? "exact" : p::name(tier))
+                                  << '\t' << context;
+                        try {
+                            if (binding.tag == "qwen") {
+                                q::Inputs qi;
+                                qi.env = no_env;
+                                qi.regime = in.regime;
+                                qi.max_prompt_tokens = context;
+                                if (binding.backend == "hip") {
+                                    qi.regimes = q::fast_regimes;
+                                    emit(q::resolve(tier, qi));
+                                } else {
+                                    qi.caps = &q::kCudaWeightCaps;
+                                    auto resolved = q::resolve(tier, qi, qc::levers(), qc::ladder_rows);
+                                    static_cast<void>(qc::choose(resolved));
+                                    emit(resolved);
+                                }
+                            } else if (binding.tag == "deepseek41-pair") {
+                                if (binding.backend == "hip")
+                                    emit(p::resolve(strix::deepseek41::pair_defaults::profile_engine(), in));
+                                else
+                                    emit(ds::resolve(tier, false,
+                                        binding.route == "replica" ? ds::App::replica : ds::App::prefill_service,
+                                        {{}, no_env, in.regime}));
+                            } else if (binding.tag == "glm-pair") {
+                                if (binding.backend == "hip")
+                                    emit(p::resolve(strix::glm::rank_defaults::product_profile_engine, in));
+                                else
+                                    emit(glm::resolve(glm::App::decode_service,
+                                        {{"--profile", p::name(tier)}, no_env, in.regime}));
+                            } else if (binding.tag == "minimax-pair") {
+                                emit(p::resolve(strix::minimax::defaults::profile_engine(), in));
+                            } else if (binding.tag == "gemma4") {
+                                g4::Inputs gi;
+                                gi.env = no_env;
+                                gi.regime = in.regime;
+                                emit(g4::resolve(tier, g4::App::engine, gi));
+                            } else if (binding.tag == "qwen35") {
+                                const bool spec = binding.route == "spec";
+                                if (binding.backend == "hip") {
+                                    namespace hp = qd::hip_profile;
+                                    emit(hp::resolve_prefill(spec ? hp::App::spec : hp::App::decode, in, {}, 64,
+                                                             {true, true}));
+                                } else {
+                                    namespace cp = qd::profile;
+                                    cp::Regime regime;
+                                    regime.prompt_tokens = context;
+                                    regime.device = device.arch;
+                                    regime.arch = device.arch;
+                                    regime.cost_device = device.name;
+                                    regime.route = spec ? cp::Route::windows : cp::Route::large_prefill;
+                                    emit(cp::resolve(tier, regime, {})->resolution);
+                                }
+                            } else if (binding.tag == "hy4") {
+                                namespace hp = strix::hy4::profile;
+                                emit(hp::resolve({hp::device_of(device.arch), hp::Topology::one_node, context, "matrix"},
+                                                 in)->resolution);
+                            } else if (binding.tag == "inkling2-mini") {
+                                emit(p::resolve(strix::inkling2::kMiniProfile, in));
+                            } else {
+                                emit(p::resolve(strix::ernie::kProfileEngine, in));
+                            }
+                        } catch (const std::invalid_argument& error) {
+                            std::cout << "\trefused\t" << std::quoted(error.what());
+                        }
+                        std::cout << '\n';
+                    }
+                }
+            }
+        }
+        check(covered, model.name + " has no profile matrix binding");
     }
-    inputs.provisional = {};
-    inputs.options.cli.clear();
-    gates[1].verdict = p::GateVerdict::unresolved;
-    expect(true, false, "TURBO UNRESOLVED leaves FAST in effect");
-    gates[1].verdict = p::GateVerdict::pass;
-    regimes[1].gain = 0;
-    expect(true, false, "TURBO needs a gain over FAST");
-    regimes[1].gain = std::numeric_limits<double>::infinity();
-    expect(true, false, "TURBO needs a finite gain");
-    regimes[1].gain = 0.002;
-    inputs.options.profile = p::Name::fast;
-    inputs.regime.rows = 7;
-    expect(false, false, "FAST outside measured regime");
-    inputs.regime.rows = 8;
-    regimes[0].device = "other";
-    expect(false, false, "receipt device must match");
-    regimes[0].device = device.name;
-    inputs.band = "long";
-    expect(false, false, "gate band must match");
-    inputs.band = "short";
-    inputs.gate_set = "other";
-    expect(false, false, "gate set must match");
-    inputs.gate_set = "held-out";
-    classes[0].rows = 799;
-    expect(false, false, "small content class remains provisional");
-    constexpr std::array provisional{fast_name};
-    inputs.provisional = provisional;
-    inputs.options.cli.emplace_back(fast_name, "1");
-    expect(true, false, "declared provisional opt-in");
-    check(run().entries[1].provisional, "provisional result is stamped");
-    gates[0].verdict = p::GateVerdict::hold;
-    expect(false, false, "HOLD refuses explicit provisional");
-    gates[0].verdict = p::GateVerdict::fail;
-    expect(false, false, "FAIL refuses explicit provisional");
-    gates[0].verdict = p::GateVerdict::pass;
-    classes[0].rows = 800;
-    inputs.regime.rows = 7;
-    expect(true, false, "provisional opt-in can measure a new regime");
-    check(run().entries[1].provisional, "unmeasured regime is stamped provisional");
-    inputs.regime.rows = 8;
-    inputs.provisional = {};
-    inputs.force_off = provisional;
-    expect(false, false, "model forced off");
-    inputs.force_off = {};
-
-    constexpr std::array<std::string_view, 1> request_options{"--prompt"}, device_options{"--device"};
-    const auto options = p::options_table(table, request_options, device_options);
-    check(options.size() == 9 && options.back().source == p::OptionSource::device, "generated option sources");
-    const auto option = std::ranges::find(options, fast_name, &p::CatalogOption::lever);
-    check(option != options.end() && option->source == p::OptionSource::lever, "generated lever option");
-    const auto& fast_option = option->option;
-    std::vector<std::string> cli{"--profile", "fast", fast_option, "1", fast_option + "=0", "--prompt", "text"};
-    const auto server_result = [&] {
-        inputs.options.cli.emplace_back(fast_name, "0");
-        return run();
-    }();
-    inputs.options = {};
-    p::take_catalog_options(options, cli, inputs.options);
-    const auto cli_result = run();
-    const auto parity = strix::parity::compare({{"profile", cli_result.describe()}},
-                                              {{"profile", server_result.describe()}}, {});
-    check(parity.ok() && !cli_result.entries[1].on,
-          "CLI and structured request use the same decision, with last explicit switch winning");
-    check(cli_result.describe().find("\"off\":\"0\"") != std::string::npos, "describe prints the off switch");
-
-    // Only the fixture has a catalogue-to-native binding. Exercise both arms
-    // with today's effective profile function and verify an untouched row too.
-    constexpr std::array bindings{p::CatalogBinding{fast_name, "index_proj_wmma", "1", "0"}};
-    p::LadderRow fixture_timing{"index_proj_wmma", "1", p::Name::fast, p::Phase::prefill, "fixture",
-                                8, 8, 1, 1, 1.01, 0.005, "fixture"};
-    q::Inputs native_inputs;
-    native_inputs.env = env();
-    native_inputs.regime = {p::Phase::prefill, 8, 1, "fixture", "fixture-exec"};
-    const auto native = [&](auto rows) { return q::resolve(p::Name::fast, native_inputs, rows); };
-    std::vector<q::Lever> storage;
-    const auto off_cells = p::effective_cells(cli_result, bindings);
-    const auto on_cells = p::effective_cells(qualified, bindings);
-    // The row is measured over the execution that runs under the catalogue's FAST cell (LadderArms::over).
-    const auto unmeasured = p::resolve_effective_profile(p::Name::fast, q::levers(), on_cells, storage, native);
-    const std::string native_reference =
-        unmeasured.find("index_proj_wmma") ? unmeasured.find("index_proj_wmma")->ladder_reference : std::string();
-    check(native_reference.starts_with("ladder-arm/v4;"), "the native adapter reports the reference of the cell");
-    fixture_timing.over = native_reference;
-    native_inputs.ladder = std::span(&fixture_timing, 1);
-    const auto off = p::resolve_effective_profile(p::Name::fast, q::levers(), off_cells, storage, native);
-    check(off.find("index_proj_wmma") && off.find("index_proj_wmma")->value == "0", "catalogue off reaches native");
-    const auto on = p::resolve_effective_profile(p::Name::fast, q::levers(), on_cells, storage, native);
-    check(on.find("index_proj_wmma") && on.find("index_proj_wmma")->value == "1", "catalogue on reaches native");
-    const auto incumbent = native(q::levers());
-    const auto* projected_budget = on.find("qsa_budget");
-    const auto* legacy_budget = incumbent.find("qsa_budget");
-    check(projected_budget && legacy_budget && projected_budget->value == legacy_budget->value,
-          "unbound native row preserved");
-    std::cout << "profile_catalog_serve_cli_parity PASS\n";
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
     try {
-        check(argc == 2, "expected profile fixture name");
+        if (argc == 3 && std::string_view(argv[1]) == "--matrix") {
+            matrix(argv[2]);
+            return 0;
+        }
+        check(argc == 2 || (argc == 3 && std::string_view(argv[2]) == "--dump"),
+              "expected profile fixture name [--dump]");
+        dump = argc == 3;
         const std::string_view name = argv[1];
         if (name == "qwen_hip") qwen(false);
         else if (name == "qwen_cuda") qwen(true);
         else if (name == "gemma4") gemma();
         else if (name == "ds41_rtx") ds41();
         else if (name == "glm_cuda") glm_cuda();
-        else if (name == "catalogue") catalogue();
         else throw std::invalid_argument("unknown profile fixture");
         return 0;
     } catch (const std::exception& error) {

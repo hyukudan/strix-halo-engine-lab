@@ -170,8 +170,6 @@ inline std::string marker(Name profile, Status status, std::string_view value) {
 inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<const Lever> rows = levers(),
                           std::span<const ::strix::profile::LadderRow> registered = ladder_rows) {
     Resolution out{profile, {}, {}, {}};
-    std::vector<::strix::profile::LadderRow> ladder(inputs.ladder.begin(), inputs.ladder.end());
-    ladder.insert(ladder.end(), registered.begin(), registered.end());
     const char* allow = environment(inputs.env, "STRIX_QWEN_PROFILE_ALLOW_PENDING");
     const bool allow_pending = inputs.allow_pending || (allow && std::string_view(allow) == "1");
     const bool preset = ::strix::profile::model_preset();
@@ -192,53 +190,17 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
             inherited |= owned && std::string_view(owned) == marker(profile, status, env);
         return inherited;
     };
-    const auto build_arms = [&] {
-    return ::strix::profile::ladder_arms(rows, std::span<const ::strix::profile::LadderRow>(ladder),
-        inputs.regime, admit_of, [&](const Lever& lever) -> std::optional<std::string_view> {
-            if (const auto* cli = ::strix::profile::last_setting(inputs.cli, lever.name)) return std::string_view(*cli);
+    const auto regime = ::strix::profile::measured_receipt_regime(inputs.regime, inputs.env);
+    namespace shared = ::strix::profile;
+    out.entries = shared::resolve_switches(rows, profile, regime, allow_pending, inputs.ladder, registered,
+        admit_of, [&](const Lever& lever) -> std::optional<shared::SwitchSetting> {
+            if (const auto* cli = shared::last_setting(inputs.cli, lever.name))
+                return shared::SwitchSetting{*cli, *cli, true};
             const char* env = lever.env.empty() ? nullptr : environment(inputs.env, std::string(lever.env));
-            if (env && !inherited_env(lever, env)) return env;
+            if (env && !inherited_env(lever, env)) return shared::SwitchSetting{env, env};
             return std::nullopt;
-        }, allow_pending);
-    };
-    auto arms = build_arms();
-    // Band receipts name no literal execution: they bind to this run's own reference (shared bind_band_receipts).
-    std::deque<std::string> band_references;
-    ::strix::profile::settle_band_receipts(ladder, arms, band_references, build_arms);
-    for (const auto& lever : rows) {
-        const auto column = ::strix::profile::value_column(lever, profile);  // empty turbo cell: the fast cell
-        const std::string* cli = nullptr;
-        for (const auto& [key, value] : inputs.cli) if (key == lever.name) cli = &value;
-        const char* env = lever.env.empty() ? nullptr : environment(inputs.env, std::string(lever.env));
-        const auto wanted = lever.value[column];
-        const auto admit = [&](unsigned c) { return admit_of(lever, c); };
-        const auto admission = admit(column);
-        const bool inherited = env && !cli && inherited_env(lever, env);
-        Entry entry{&lever, std::string(lever.builtin), Status::builtin, {}, false, {}, std::string(wanted)};
-        if (cli || (env && !inherited)) {
-            entry.cli_override = cli != nullptr;
-            entry.value = cli ? *cli : env;
-            entry.requested = entry.value;
-            entry.status = cli ? Status::explicit_cli : Status::explicit_env;
-            if ((!lever.off.empty() && entry.value == lever.off) || entry.value == "off") entry.status = Status::off;
-            bool runnable = false;
-            for (bool available : lever.runnable) runnable |= available;
-            if (!runnable && entry.status != Status::off && entry.value != lever.builtin)
-                throw std::invalid_argument(std::string(lever.env.empty() ? lever.option : lever.env) + "=" + entry.value +
-                    " is not in this build (" + std::string(lever.source) + ")");
-        } else if (wanted.empty()) continue;
-        else if (admission == Status::pending) {
-            entry.status = Status::pending;
-            entry.target = std::string(lever.target.empty() ? wanted : lever.target);
-        } else {
-            entry.value = std::string(wanted);
-            entry.status = admission;
-            if (entry.status == Status::set && wanted == lever.builtin) entry.status = Status::builtin;
-        }
-        if (!cli && (!env || inherited))
-            ::strix::profile::apply_ladder(entry, ladder, profile, inputs.regime, admit, allow_pending, arms);
-        out.entries.push_back(std::move(entry));
-    }
+        }, {.omit_unselected = true, .keep_cli_provenance = true, .refuse_unrunnable_explicit = true,
+            .admit_builtin_column = true});
     return out;
 }
 using ::strix::profile::Export;

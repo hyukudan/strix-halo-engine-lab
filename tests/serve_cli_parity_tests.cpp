@@ -132,6 +132,7 @@ void glm() {
                   "GLM rank and serve apply the same WMMA route for " + std::string(profile) + ": " + lever);
         }
         gate("glm", values(sp::from_lines(rd::print(cli))), values(sp::from_lines(rd::print(server))), allowed);
+        gate("glm+profile-receipt", {{"profile", cli.product->json()}}, {{"profile", server.product->json()}}, {});
     }
     // The measured pair executions and each unmatched axis use the same product resolver: the TURBO literal rows
     // (8,108 / 31,258 tokens, capacity 36,864, 64 generated) and the FAST band row (2,049..8,192 tokens, any capacity,
@@ -154,6 +155,7 @@ void glm() {
         check(fast_row == (on && work.prompt >= 2049 && work.prompt <= 8192),  // TURBO nests the FAST cell in the band
               std::string("GLM FAST band row named in the route line (") + profile + " prompt " + std::to_string(work.prompt) + ")");
         gate("glm", values(sp::from_lines(printed)), values(sp::from_lines(rd::print(serve))), allowed);
+        gate("glm+measured-receipt", {{"profile", cli.product->json()}}, {{"profile", serve.product->json()}}, {});
     };
     const auto verify = [&](const rd::PrefillWork& work, const rd::EnvGet& env, bool on) {
         verify_profile("turbo", work, env, on);
@@ -290,6 +292,32 @@ void minimax() {
             check(c.count(k) == 1 && s.count(k) == 1, std::string("minimax: ") + k + " printed by both entry points");
         gate("minimax+fast", c, s, allowed);
     }
+    for (const auto* tier : {"exact", "fast", "turbo"}) {
+        const md::Lookup env = [tier](const char* key) -> const char* {
+            const std::string_view name(key);
+            if (name == md::kProductProfileEnv) return tier;
+            if (name == "STRIX_MM_PF_TABLE_RING") return "0";
+            return nullptr;
+        };
+        for (const auto* transport : {"usb4-auto", "usb4gpu"}) {
+            const auto profile_config = [&](const md::Cli& args) {
+                const auto all = sp::from_lines(md::effective_config(args, env));
+                sp::Config levers{{"transport", all.at("transport")},
+                                  {"host.STRIX_MM_PF_TABLE_RING", all.at("host.STRIX_MM_PF_TABLE_RING")},
+                                  {"profile_fingerprint", all.at("profile_fingerprint")}};
+                for (const auto& row : md::profile_table)
+                    levers.emplace(row.env, all.at(std::string(row.env)));
+                for (const auto& [key, value] : all)
+                    if (key.starts_with("prefill.") || key.starts_with("profile.")) levers.emplace(key, value);
+                return levers;
+            };
+            const auto rank = profile_config(md::parse_cli("rank", {"model", "0", transport, "output"}));
+            const auto serve = profile_config(md::parse_cli("serve", {"model", "--transport", transport}));
+            check(serve.at("transport") == transport && serve.at("host.STRIX_MM_PF_TABLE_RING") == "0",
+                  "MiniMax explicit transport and ring settings reach serving");
+            gate(std::string("minimax+explicit+") + tier + '+' + transport, rank, serve, {});
+        }
+    }
 }
 #endif
 
@@ -316,6 +344,7 @@ void ds41() {
         if (r.profile) {
             c["profile"] = std::string(strix::profile::name(r.profile->profile));
             c["profile.fingerprint"] = strix::profile::hex_identity(r.profile->fingerprint());
+            c["profile.receipt"] = r.profile->json();
             for (const auto& entry : r.profile->entries)
                 if (entry.lever) c["profile." + std::string(entry.lever->name)] = entry.value;
         }
@@ -419,7 +448,8 @@ void ds41() {
         const auto result = pd::resolve_prefill_profile(*startup.profile, o, prompt, 1U,
                                                        "gfx1151|AMD Radeon 8060S Graphics|fixture", true);
         if (!result) return {{"d1_prefill", "declined"}, {"decoder_replay", "declined"}};
-        return {{"d1_prefill", result->find("d1_prefill")->value}, {"decoder_replay", result->find("decoder_replay")->value}};
+        return {{"d1_prefill", result->find("d1_prefill")->value}, {"decoder_replay", result->find("decoder_replay")->value},
+                {"profile.receipt", result->json()}};
     };
     for (const char* profile : {"exact", "fast", "turbo"})
         for (const auto prompt : {2048U, 8192U, 32768U}) {
@@ -501,6 +531,25 @@ void ds41() {
 // additions (src/gemma4/engine/runtime.cpp). Same request words through both; every option and profile entry compared.
 void gemma() {
     namespace e = strix::gemma4::engine;
+    const auto isolated = [](auto&& resolve) {
+        // Both native executables export the selected profile to the process. Start each arm with the
+        // same environment so an exported CLI lever does not turn into an explicit HTTP override.
+        struct ProfileEnvironment {
+            std::vector<std::pair<std::string, std::string>> saved;
+            ProfileEnvironment() {
+                for (const auto& lever : strix::gemma4::profile::levers()) {
+                    if (lever.env.empty()) continue;
+                    const std::string key(lever.env);
+                    const char* raw = strix::profile::environment({}, key);
+                    saved.emplace_back(key, raw ? raw : "");
+                }
+            }
+            ~ProfileEnvironment() {
+                for (const auto& [key, value] : saved) (void)strix::profile::export_environment(key.c_str(), value.c_str());
+            }
+        } environment;
+        return resolve();
+    };
     const auto config = [](const e::Options& o) {
         sp::Config c;
         c["model"] = o.model.generic_string();
@@ -522,6 +571,7 @@ void gemma() {
         c["draft_mtp"] = o.draft_mtp.generic_string();
         c["profile"] = std::to_string(static_cast<int>(o.profile.name));
         c["profile.app"] = std::to_string(static_cast<unsigned>(o.profile.app));
+        c["profile.receipt"] = o.profile.json();
         for (const auto& entry : o.profile.entries)
             if (entry.lever) c["profile." + std::string(entry.lever->name)] = entry.value;
         return c;
@@ -529,8 +579,8 @@ void gemma() {
     std::vector<std::string> words{"x", "--model", "/m/model.gguf", "--rope-tables", "/m/rope"};
     std::vector<char*> argv;
     for (auto& w : words) argv.push_back(w.data());
-    const auto cli = config(e::parse_options(static_cast<int>(argv.size()), argv.data()));
-    const auto served = e::prepare_serve(static_cast<int>(argv.size()), argv.data());
+    const auto cli = isolated([&] { return config(e::parse_options(static_cast<int>(argv.size()), argv.data())); });
+    const auto served = isolated([&] { return e::prepare_serve(static_cast<int>(argv.size()), argv.data()); });
     check(!served.exit_code, "gemma: prepare_serve accepts the CLI's request words");
     static constexpr sp::Allowed allowed[] = {
         // EXCEPTION for the user: the server sizes session-fixed choices (the EXL3 core identity) for the requests that
@@ -540,21 +590,25 @@ void gemma() {
     gate("gemma", cli, config(served.options), allowed);
 
     // Explicitly match concurrency so the test compares only model/tier settings.
+    for (const std::string model_name : {"gemma-4-e4b-it", "nemotron-3.5-bolt-e4b"})
     for (const std::string tier : {"exact", "fast", "turbo"}) {
         std::vector<std::string> tier_words = words;
+        tier_words[2] = "/m/" + model_name + ".gguf";
         tier_words.insert(tier_words.end(), {"--profile", tier, "--streams", "1", "--draft", "off"});
         std::vector<char*> tier_argv;
         for (auto& word : tier_words) tier_argv.push_back(word.data());
-        const auto native = e::parse_options(static_cast<int>(tier_argv.size()), tier_argv.data());
-        const auto server = e::prepare_serve(static_cast<int>(tier_argv.size()), tier_argv.data());
+        const auto native = isolated([&] { return e::parse_options(static_cast<int>(tier_argv.size()), tier_argv.data()); });
+        const auto server = isolated([&] { return e::prepare_serve(static_cast<int>(tier_argv.size()), tier_argv.data()); });
         check(!server.exit_code, "gemma: serve accepts " + tier);
+        check(server.deployment_slots == native.streams,
+              model_name + " " + tier + ": the HTTP scheduler receives the explicitly matched stream count");
         check(native.profile.name == strix::profile::parse(tier), "gemma: native tier survives parsing");
         const auto* identity = native.profile.find("decode_identity");
         check(identity && identity->value == (tier == "exact" ? "g4-v1" : "g4-a8-v1"),
               "gemma: " + tier + " resolves its decode identity");
         const auto* attention = native.profile.find("decode_attention");
         check(attention && attention->value == "exact", "gemma: " + tier + " keeps qualified exact decode attention");
-        gate("gemma/" + tier, config(native), config(server.options), {});
+        gate(model_name + "/" + tier, config(native), config(server.options), {});
     }
 
     namespace fs = std::filesystem;
@@ -566,8 +620,8 @@ void gemma() {
         std::vector<std::string> args{"x", "--model", model_path.string(), "--rope-tables", "rope", "--profile", tier};
         std::vector<char*> pointers;
         for (auto& arg : args) pointers.push_back(arg.data());
-        const auto options = e::parse_options(static_cast<int>(pointers.size()), pointers.data());
-        const auto server = e::prepare_serve(static_cast<int>(pointers.size()), pointers.data());
+        const auto options = isolated([&] { return e::parse_options(static_cast<int>(pointers.size()), pointers.data()); });
+        const auto server = isolated([&] { return e::prepare_serve(static_cast<int>(pointers.size()), pointers.data()); });
         check(!server.exit_code && options.draft_mtp == expected && server.options.draft_mtp == expected,
               "gemma " + tier + ": discover only a drafter with its weights file");
     };

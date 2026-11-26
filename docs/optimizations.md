@@ -153,6 +153,29 @@ and [qualification](engine/serving/ds41-prefix-cache-qualification.md).
 
 ## Baselines, inspection and exactness
 
+### Native profile resolution through the product launchers
+
+**Engine:** shared. **Control:** `--native-profile`. **Default:** off.
+
+Use `strix run`, `strix serve` or `strix-serve` with `--native-profile` to use the engine's own admission and tier
+selection. An explicit `--profile` reaches the engine directly. When omitted, the engine selects its usual default.
+This mode also leaves KV selection to the engine. Use an asset with `--print-effective-config` to print the
+engine receipt. Applicable backend, asset and placement checks still run. The engine's supported tiers and
+explicit switches apply, including any provisional rows admitted by that native entry point.
+
+- **Evidence:** Host tests cover the forwarded arguments, the native inspection path and the scoped selection of
+  preset admission. This switch makes no throughput claim.
+
+### Published tier throughput check
+
+**Engine:** shared. **Control:** `tools/ci/check_tier_monotonicity.py`. **Default:** checked in CI.
+
+The throughput check reads the published results by model, revision, hardware, route, prompt and phase.
+It compares adjacent tiers using the median of reported repeats or separated bounds when only ranges are
+available. A new decrease fails CI. See `tools/ci/tier_monotonicity_known.tsv` for the historical decreases
+and remove an entry when its replacement receipt meets the tier guarantee. A decrease in this table warrants
+a controlled device comparison with the same route and prompts before attributing it to a particular lever.
+
 | Engine | Master baseline | Inspect before device work | Scope / precedence |
 |---|---|---|---|
 | Qwen | `--baseline` / `STRIX_BASELINE=1` | `--print-effective-config` | Historical organization/arithmetic; controlled defaults suppressed, implicit context 8192; explicit tiled routes still require priced native-pool headroom |
@@ -5672,6 +5695,15 @@ OFF: `STRIX_QPF2K_HC_RECOMPUTE_NORM=0`; restart. `=1` also admits the route with
 were not measured and therefore keep the image by default. Unsupported sites retain the image.
 See [admission, lifetime, resources and the native ticket](engine/prefill/hc-normalized-recompute.md).
 
+## Measured profile receipts
+
+Set `STRIX_PROFILE_STRICT_RECEIPTS=1` to require a winning recorded timing in the requested regime and an admitted
+column for automatic FAST/TURBO promotion. A band reference must match the complete execution, including pack and
+route settings outside the lever table, every effective lever identity, and the candidate identity. Historical grants
+alone and provisional columns without explicit benchmark permission fall back to the lower tier. With the setting
+unset, historical grants and band rows without a recorded reference retain compatibility admission. Explicit lever
+settings keep their precedence. The control changes automatic FAST/TURBO admission.
+
 ## HC low-band layout
 
 **Default ON (mode 3)** through decoder qpf2k defaults.
@@ -5975,6 +6007,9 @@ another with the single-row instruction sequence.
 <a id="hy4-pf-store-epilogue"></a>
 
 ## Hy4-flash prompt windows: bf16 epilogue in the producers' store
+
+The rank and HTTP entry points share the explicit profile option parser. `--prompt-rows=N` and `--head-q8=0|1`
+also accept a separate argument for the value. Both entry points reject malformed values before model load.
 
 **Engine:** `hy4`. **Control:** `STRIX_HY4_PF_STORE_EPILOGUE`. **Default:** on.
 

@@ -641,6 +641,30 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         expect(report.ok(),"qwen: projected CLI/server route fields and environment match within the listed allowances");
     }
     {
+        // Compare the profile consumed by the entry point, including the entire stable lever receipt.
+        // Match an explicit off switch on both arms because the server cannot apply band-scoped env per request.
+        const auto resolved_profile = [](std::vector<std::string> words) {
+            std::vector<char*> pointers;
+            for (auto& word : words) pointers.push_back(word.data());
+            return parse_options(static_cast<int>(pointers.size()), pointers.data(), false, {}, DecodeAssets::defer,
+                                 "gfx1151").product_profile;
+        };
+        for (const auto* tier : {"exact", "fast", "turbo"}) {
+            std::vector<std::string> request_words{"decoder", "target.gguf", "--profile", tier, "--context", "8192",
+                                                   "--no-mtp", "--prefill-moe-route-prune", "off"};
+            auto cli_words = request_words;
+            cli_words.insert(cli_words.end(), {"--generate", "8", "1", "2", "3"});
+            request_words.emplace_back("--http-serve");
+            const auto cli = resolved_profile(std::move(cli_words));
+            const auto serve = resolved_profile(std::move(request_words));
+            const auto* route = cli.find("moe_route_prune");
+            expect(route && route->value == "off", "Qwen HIP: explicit route off reaches the resolver");
+            if (cli.json() != serve.json())
+                std::cerr << "Qwen HIP " << tier << " CLI profile: " << cli.json() << "\nserver profile: " << serve.json() << '\n';
+            expect(cli.json() == serve.json(), "Qwen HIP: rank and serve apply the same explicit route and receipt");
+        }
+    }
+    {
         // Native joining gate shape: pinned MTP server args (C24576, T8192 serving prefill),
         // explicit 4 GiB host budget, --http-batch 3 --prefix-batch-cert l0, gate env.
         // The HTTP 1024-row checkpoint default applies; joining must still be armed.

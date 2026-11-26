@@ -1,6 +1,7 @@
 #include "strix/glm_pair_profile_table.hpp"
 #include "strix/engine_profile.hpp"
 #include "strix/deepseek41_pair_profile_table.hpp"
+#include "strix/fast_profile.hpp"
 #include "strix/profiles/hy4.hpp"
 
 #include <iostream>
@@ -39,6 +40,30 @@ int main() try {
     exempt.in_baseline = false;
     vars.clear();
     require(resolve_default(exempt, true, env).value == "1", "baseline exemption");
+    {
+        const std::array members{strix::fast_profile::Member{"MEMBER", "2", "member-v1", "1 2"}};
+        const strix::fast_profile::Bundle bundle{"BUNDLE", "bundle-v1", members};
+        vars = {{"BUNDLE", "1"}, {"MEMBER", "0"}};
+        unsigned admissions = 0;
+        const auto admit = [&](const auto&) { ++admissions; return true; };
+        require(strix::fast_profile::expand(bundle, env, admit).at("MEMBER") == "0" && admissions == 0,
+                "explicit OFF wins without consulting bundle admission");
+        vars["MEMBER"] = "malformed";
+        require(strix::fast_profile::expand(bundle, env, admit).at("MEMBER") == "0" && admissions == 0,
+                "canonicalizing a malformed override does not fall back to the bundle");
+        vars["MEMBER"].clear();
+        require(strix::fast_profile::expand(bundle, env, admit).at("MEMBER") == "2" && admissions == 1,
+                "empty FAST member selects the admitted bundle value");
+        require(!strix::fast_profile::expand(bundle, env, [](const auto&) { return false; }).contains("MEMBER"),
+                "bundle cannot select a member whose admission failed");
+        const auto selected = resolve_member_override("", EmptyOverride::present, [&] {
+            ++admissions;
+            return "2";
+        });
+        require(selected.explicit_value && std::string_view(selected.value).empty() && admissions == 1,
+                "bundle bindings can preserve an empty explicit setting");
+        vars.clear();
+    }
     for (unsigned bits = 0; bits < 16; ++bits) {
         const bool ready = (bits & 1U) != 0, runnable = (bits & 2U) != 0;
         const bool allow = (bits & 4U) != 0, provisional = (bits & 8U) != 0;
@@ -71,6 +96,74 @@ int main() try {
     inputs.cli.clear();
     inputs.profile = Name::standard;
     require(resolve(engine, inputs).entries[0].value == "0", "DEFAULT unchanged");
+
+    // An alternate pack or route cannot borrow a recorded band denominator.
+    {
+        Inputs receipt_inputs = inputs;
+        Lever ready = pending;
+        ready.ready[1] = true;
+        const std::array rows{ready};
+        auto band = timing;
+        band.identity = "v1";
+        band.band_bound = true;
+        band.band_evidence.timed = {8};
+        const Engine scoped{"scoped-band", "", rows, false, {}, {}, {}, std::span(&band, 1)};
+        receipt_inputs.profile = Name::fast;
+        receipt_inputs.allow_pending = false;
+        require(resolve(scoped, receipt_inputs).find("item")->value == "1", "the band keeps its measured denominator");
+        const auto original = receipt_inputs.regime;
+        receipt_inputs.regime.execution = "alternate-pack-and-route";
+        require(resolve(scoped, receipt_inputs).find("item")->value == "0", "the band cannot overwrite its recorded key");
+        vars[kStrictReceiptsEnv] = "1";
+        require(resolve(scoped, receipt_inputs).find("item")->value == "0", "strict resolution refuses a different denominator");
+        receipt_inputs.regime = original;
+        require(resolve(scoped, receipt_inputs).find("item")->value == "1", "strict resolution accepts a matching measured key");
+        band.over = {};
+        require(resolve(scoped, receipt_inputs).find("item")->value == "0", "a live key cannot establish a measured denominator");
+        vars[kStrictReceiptsEnv] = "10";
+        require(resolve(scoped, receipt_inputs).find("item")->value == "1", "only the exact opt-in enables strict receipts");
+        vars.erase(kStrictReceiptsEnv);
+    }
+
+    // Historical grants preserve compatibility. Strict mode requires a winning timing and an admitted column.
+    {
+        Inputs receipt_inputs = inputs;
+        std::array rows{pending};
+        rows[0].ready[1] = true;
+        const auto grant = incumbent_cell("item", "1", Name::fast, kProvisionalBeforeLadder, "v1");
+        std::array evidence{grant, timing};
+        const Engine incumbent{"incumbent", "", rows, false, {}, {}, {}, evidence};
+        const auto value = [&] { return resolve(incumbent, receipt_inputs).find("item")->value; };
+        receipt_inputs.profile = Name::fast;
+        receipt_inputs.allow_pending = false;
+        receipt_inputs.regime = {};
+        require(value() == "1", "legacy grant survives without timing");
+        vars[kStrictReceiptsEnv] = "1";
+        require(value() == "0", "strict receipts cannot borrow a historical grant");
+        receipt_inputs.regime = measured;
+        require(value() == "1", "strict receipts admit the winning scoped timing");
+        for (const auto& outside : {Regime{Phase::decode, 8, 1, "fixture", "fixture-exec"},
+                                    Regime{Phase::prefill, 9, 1, "fixture", "fixture-exec"},
+                                    Regime{Phase::prefill, 8, 2, "fixture", "fixture-exec"},
+                                    Regime{Phase::prefill, 8, 1, "other-device", "fixture-exec"},
+                                    Regime{Phase::prefill, 8, 1, "fixture", "other-exec"}}) {
+            receipt_inputs.regime = outside;
+            require(value() == "0", "strict receipts enforce phase, band, lanes, device and complete reference");
+        }
+        receipt_inputs.regime = measured;
+        for (const auto ratio : {0.95, 1.00}) {
+            evidence[1].speedup = ratio;
+            require(value() == "0", "a grant cannot overturn a slow or noisy timing");
+        }
+        evidence[1] = timing;
+        rows[0].ready[1] = false;
+        rows[0].provisional[1] = true;
+        require(value() == "0", "strict receipts do not automatically promote provisional cells with timing alone");
+        receipt_inputs.allow_pending = true;
+        require(value() == "1", "explicit provisional benchmark remains possible");
+        receipt_inputs.allow_pending = false;
+        vars.erase(kStrictReceiptsEnv);
+    }
 
     // The ordinary shared consumer keeps the original preset behavior even with historical grants.
     {

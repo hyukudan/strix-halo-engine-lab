@@ -9,6 +9,8 @@
 // the profile. The profile exports plain environment variables before main, exactly as a user would, so every lever keeps
 // its own admission, decline notice and off switch. Build-time levers (STRIX_DPP_REDUCE) and levers that replace one
 // another (TILE64 instead of the tier split, TIERS=2 instead of 1) are not part of the profile; they are separate arms.
+#include "strix/profile/member_override.hpp"
+
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -129,8 +131,9 @@ unsigned apply(Get get, Put put) {
     unsigned set = 0U;
     for (const auto& lever : levers) {
         if (!selected(lever, value)) continue;
-        if (get(lever.env)) continue;
-        if (put(lever.env, lever.on)) {
+        const auto choice = profile::resolve_member_override(get(lever.env), profile::EmptyOverride::present,
+                                                             [&] { return lever.on; });
+        if (!choice.explicit_value && put(lever.env, choice.value)) {
             injected[static_cast<std::size_t>(&lever - levers.data())] = true;
             ++set;
         }

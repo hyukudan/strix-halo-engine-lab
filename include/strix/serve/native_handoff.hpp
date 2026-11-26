@@ -20,6 +20,7 @@ namespace strix::serve {
     native.asset = request.asset;
     native.args = selection.arguments;
     native.profile = request.tier;
+    native.native_profile = request.native_profile;
     native.backend = request.backend;
     native.host = request.bind;
     native.port = request.port;

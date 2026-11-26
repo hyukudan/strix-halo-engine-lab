@@ -142,6 +142,10 @@ std::string switches(const Lever& l) {
     if (!l.env.empty()) s += (s.empty() ? "" : " ") + std::string(l.env);
     return s;
 }
+
+strix::profile::Status qualification_status(const Entry& entry) {
+    return strix::profile::qualification_status(entry, "off");
+}
 }  // namespace
 
 std::span<const Lever> levers() { return kTable; }
@@ -183,10 +187,7 @@ const Entry* Resolution::find(std::string_view lever) const {
     return nullptr;
 }
 std::string Resolution::qualification() const {
-    std::string rows;
-    for (const auto& e : entries)
-        if (e.status == Status::unqualified) rows += (rows.empty() ? "" : ",") + std::string(e.lever->name);
-    return rows.empty() ? "qualified" : "unqualified: " + rows;
+    return strix::profile::qualification_summary(entries, qualification_status);
 }
 std::vector<std::string> Resolution::pending() const {
     std::vector<std::string> out;
@@ -247,7 +248,7 @@ std::string Resolution::json(const std::function<std::string(std::string_view)>&
         }
         out += '}';
         std::string& list = e.status == Status::pending ? pend : unq;
-        if (e.status == Status::pending || e.status == Status::unqualified) {
+        if (e.status == Status::pending || qualification_status(e) == strix::profile::Status::unqualified) {
             if (!list.empty()) list += ',';
             escape(list, e.lever->name);
         }
@@ -285,7 +286,6 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
     out.name = profile;
     out.app = app;
     out.allow_pending = allow_pending;
-    const auto column = unsigned(profile);
     namespace shared = strix::profile;
     // The last of the lever's own options decides (the service parses them in order).
     const auto cli_value = [&](const Lever& lever) -> std::optional<std::string_view> {
@@ -311,49 +311,46 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
         const std::string_view v(own);
         return v == "0" || v == "off" ? std::string_view("off") : v;
     };
-    // The lower arms the ladder rows are bound to; a lever outside this app never runs (its builtin).
-    const auto arms = shared::ladder_arms(table, inputs.ladder, inputs.regime,
+    // A lever outside this app never runs (its builtin).
+    const auto regime = shared::measured_receipt_regime(inputs.regime, inputs.env);
+    shared::resolve_rows(table, static_cast<shared::Name>(profile), regime, allow_pending, inputs.ladder, {},
         [&](const Lever& lever, unsigned c) { return shared::column_admission(lever, c, allow_pending, false); },
         [&](const Lever& lever) -> std::optional<std::string_view> {
-            if (!(lever.apps & unsigned(app))) return std::string_view(lever.builtin);
+            if (!(lever.apps & unsigned(app))) return lever.builtin;
             if (const auto set = cli_value(lever)) return set;
             return env_value(lever);
-        }, allow_pending);
-    for (const auto& lever : table) {
-        if (!(lever.apps & unsigned(app))) continue;
-        Entry entry{&lever, {}, Status::profile, {}};
-        const auto cli = cli_value(lever);
-        const auto own = env_value(lever);
-        const auto& wanted = lever.value[column];
-        if (cli) {
-            entry.value = std::string(*cli);
-            entry.status = Status::explicit_cli;
-        } else if (own) {
-            entry.value = std::string(*own);
-            entry.status = Status::explicit_env;
-        } else if (wanted.empty()) {
-            continue;  // the profile leaves it alone
-        } else {
-            const auto admit = [&](unsigned c) { return shared::column_admission(lever, c, allow_pending, false); };
-            auto cell = shared::select_profile_cell(lever, inputs.ladder, static_cast<shared::Name>(profile),
-                                                    inputs.regime, admit, allow_pending, arms);
-            entry.ladder = std::move(cell.route);
-            entry.ladder_reference = std::move(cell.reference);
-            const auto admission = cell.benchmark ? shared::Status::unqualified : admit(column);
-            if (admission == shared::Status::pending || (!entry.ladder.empty() && cell.value == lever.builtin)) {
-                entry.wanted = wanted;
-                entry.value = lever.builtin;
-                entry.status = Status::pending;
+        }, [app](const Lever& lever) { return (lever.apps & unsigned(app)) != 0; },
+        [&](const Lever& lever, unsigned column, const auto& admit, shared::LadderCell cell) {
+            Entry entry{&lever, {}, Status::profile, {}};
+            const auto cli = cli_value(lever);
+            const auto own = env_value(lever);
+            const auto& wanted = lever.value[column];
+            if (cli) {
+                entry.value = std::string(*cli);
+                entry.status = Status::explicit_cli;
+            } else if (own) {
+                entry.value = std::string(*own);
+                entry.status = Status::explicit_env;
+            } else if (wanted.empty()) {
+                return;  // the profile leaves it alone
             } else {
-                entry.value = cell.value;
-                if (admission == shared::Status::unqualified) {
+                entry.ladder = std::move(cell.route);
+                entry.ladder_reference = std::move(cell.reference);
+                const auto admission = cell.benchmark ? shared::Status::unqualified : admit(column);
+                if (admission == shared::Status::pending || (!entry.ladder.empty() && cell.value == lever.builtin)) {
                     entry.wanted = wanted;
-                    entry.status = Status::unqualified;
+                    entry.value = lever.builtin;
+                    entry.status = Status::pending;
+                } else {
+                    entry.value = cell.value;
+                    if (admission == shared::Status::unqualified) {
+                        entry.wanted = wanted;
+                        entry.status = Status::unqualified;
+                    }
                 }
             }
-        }
-        out.entries.push_back(std::move(entry));
-    }
+            out.entries.push_back(std::move(entry));
+    }, false);
     return out;
 }
 

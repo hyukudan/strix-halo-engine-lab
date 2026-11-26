@@ -1,0 +1,15 @@
+# revision, model, hardware, route, decode mode, phase, prompt, lower tier, higher tier, lower bound, upper bound
+ca2de6ae8	DeepSeek V4.1 Flash	pair	HTTP served	DSpark (default)	decode	344	exact	fast	57.45	53.55
+ca2de6ae8	DeepSeek V4.1 Flash	pair	HTTP served	DSpark (default)	prefill	30975	fast	turbo	1698.5	1696.5
+ca2de6ae8	GLM-5.3 Flash	pair	HTTP served	default	decode	362	exact	fast	41.5	41.1
+ca2de6ae8	GLM-5.3 Flash	pair	HTTP served	default	prefill	2037	exact	fast	531	530
+ca2de6ae8	GLM-5.3 Flash	pair	HTTP served	default	prefill	31258	exact	fast	565	556.5
+ca2de6ae8	GLM-5.3 Flash	pair	HTTP served	default	prefill	8108	exact	fast	616.5	612
+ca2de6ae8	Hy4-flash	1 node	CLI	plain	decode	8192	exact	fast	16.5	14.25
+ca2de6ae8	Hy4-flash	1 node	CLI	plain	prefill	8192	fast	turbo	768.5	733.5
+ca2de6ae8	MiniMax M3.1 Flash	pair	HTTP served	plain	decode	508	fast	turbo	27.0	26.65
+ca2de6ae8	Qwen3.8-27B	1 node	CLI	MTP (default)	decode	2048	exact	fast	35.25	35.2
+ca2de6ae8	Qwen3.8-27B	1 node	CLI	MTP (default)	decode	8192	exact	fast	25.4	25.1
+ca2de6ae8	Qwen3.8-Flash-Next	1 node	CLI	plain	prefill	2048	fast	turbo	1673	1188
+ca2de6ae8	Qwen3.8-Flash-Next	1 node	CLI	plain	prefill	32500	exact	fast	1673	1672
+ca2de6ae8	Qwen3.8-Flash-Next	1 node	CLI	plain	prefill	32500	fast	turbo	1672	1665

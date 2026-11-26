@@ -50,7 +50,7 @@ struct ServePreparation {
     Options options;
     strix::serve::DeploymentCallbacks deployment;
     std::optional<int> exit_code;
-    // Slot count chosen by a deployment plan (0: no plan, STRIX_G4_SERVE_SLOTS applies).
+    // HTTP slot override from --streams or a deployment plan (0: STRIX_G4_SERVE_SLOTS applies).
     std::uint32_t deployment_slots = 0;
     std::string output;
     bool bind_given = false, port_given = false;

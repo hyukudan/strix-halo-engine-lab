@@ -127,6 +127,7 @@ struct Regime {
     // ladder_execution(): backend, device product identity, priced workload and the effective timing settings. Part of
     // every ordinary timing reference (LadderArms::over); empty: not known, and no ordinary timing row decides.
     std::string_view execution{};
+    bool require_measured_receipts = false;
 };
 
 // At startup a server often knows its capacity but cannot resolve per request before a real prompt arrives.
@@ -256,8 +257,8 @@ struct LadderRow {
     std::string_view receipt;
     // Incumbent grant: a cell a resolver already applied before the ladder rule, kept with the receipt that qualified
     // it (or made it provisional). It covers every regime, so the cell keeps running exactly where its own readiness
-    // (unchanged by the ladder) admits it; where a timing row covers the regime, the timing row decides. Phase, device,
-    // bands, speedup and noise are unused.
+    // (unchanged by the ladder) admits it in compatibility mode. Where a timing row covers the regime, the timing row
+    // decides. Measured-receipt policy does not admit grants. Phase, device, bands, speedup and noise are unused.
     bool incumbent = false;
     // Paired decision: names the partner lever. The row was measured on the combined operation of this cell and the
     // partner's cell (one complete workload against the effective arm of the tier below) and decides only that pair
@@ -279,13 +280,12 @@ struct LadderRow {
     // The implementation identity the incumbent grant or band receipt covers (Lever::identity of the candidate value).
     // A changed implementation under the same value needs its own receipt. Required for grants and band receipts.
     std::string_view identity{};
-    // Band receipt: the row was timed at representative workloads of its band (min_context..max_context) on its device
-    // class and carries no literal `over`. An adapter that spells Regime::execution binds it per resolution with
-    // bind_band_receipts(): `over` becomes that run's own reference (LadderArms::over) for the row's lever, value and
-    // tier. The adapter owns the measured execution scope (product, pack and route). The binder requires a known
-    // execution and the measured candidate identity above before matching the phase, device class and band.
+    // Band receipt: the row was timed at representative workloads of its band on its device class. A literal `over`
+    // freezes the measured scope, including all external settings and the lower arm. Historical band rows with no
+    // recorded key still have a per-run compatibility reference, which measured-receipt policy ignores.
     bool band_bound = false;
     BandEvidence band_evidence{};
+    std::string_view compatibility_over{};  // populated only on resolver-owned copies of historical rows
 };
 
 // Bound the rounding allowance to three tokens (the same fixture can differ by a few tokens by entry point).
@@ -374,8 +374,12 @@ struct ReceiptKey {
     if (row.phase != regime.phase || row.device.empty() || row.device != regime.device ||
         !ladder_band(regime.context, ladder_min_context(row), row.max_context, regime.lanes, row.min_lanes, row.max_lanes))
         return false;
-    if (key.joint.empty())
-        return !key.reference.empty() && !regime.execution.empty() && row.over == key.reference;
+    if (key.joint.empty()) {
+        if (row.band_bound && row.identity != key.identity) return false;
+        const auto over = row.band_bound && row.over.empty() && !regime.require_measured_receipts
+            ? row.compatibility_over : row.over;
+        return !key.reference.empty() && !regime.execution.empty() && over == key.reference;
+    }
     return key.joint_scope != nullptr && key.joint_scope->complete() && row.joint_scope == *key.joint_scope;
 }
 
@@ -396,15 +400,16 @@ struct LadderVerdict {
 };
 
 // The verdict over the receipts matching `key` (ladder_receipt_matches()): applies only when every matching receipt
-// shows a gain; with no matching receipt, an incumbent grant with a receipt keeps the cell (Rung::incumbent), and
-// otherwise the cell resolves to the tier below (unmeasured). A grant is matched on lever, value, tier, receipt AND the
-// declared implementation identity of the value (ReceiptKey::identity). Receipts that do not match are ignored entirely.
+// shows a gain. With no matching receipt, compatibility mode can keep a historical grant (Rung::incumbent) and
+// measured-receipt policy resolves to the tier below. A grant matches the lever, value, tier, receipt and the declared
+// implementation identity of the value (ReceiptKey::identity).
 [[nodiscard]] constexpr LadderVerdict ladder_verdict(std::span<const LadderRow> rows, const ReceiptKey& key) noexcept {
     const LadderRow* worst = nullptr;
     const LadderRow* grant = nullptr;
+    const bool allow_grants = key.regime == nullptr || !key.regime->require_measured_receipts;
     for (const auto& row : rows) {
         if (row.incumbent) {
-            if (!grant && key.joint.empty() && !row.receipt.empty() && !row.identity.empty() &&
+            if (allow_grants && !grant && key.joint.empty() && !row.receipt.empty() && !row.identity.empty() &&
                 row.identity == key.identity && ladder_names(row, key.lever, key.value, key.tier))
                 grant = &row;
             continue;
@@ -596,7 +601,7 @@ struct Entry {
 template <class Row>
 [[nodiscard]] bool explicit_value_qualified(const Row& lever, std::string_view value, std::string_view off,
                                              std::span<const bool> provisional = {}, std::string_view same_bits = {}) {
-    if (lever.kind != Kind::bit_changing) return true;
+    if (lever.kind != decltype(lever.kind)::bit_changing) return true;
     if (value == lever.builtin || (!off.empty() && value == off)) return true;
     const bool in_class = bit_class_member(same_bits, value);
     for (std::size_t c = 0; c < lever.value.size(); ++c)
@@ -1041,6 +1046,13 @@ inline const char* environment(const Lookup& env, std::string_view key) {
 }
 
 inline constexpr char kPresetEnv[] = "STRIX_INTERNAL_MODEL_PRESET";
+inline constexpr char kStrictReceiptsEnv[] = "STRIX_PROFILE_STRICT_RECEIPTS";
+
+[[nodiscard]] inline Regime measured_receipt_regime(Regime regime, const Lookup& env) {
+    const auto* value = environment(env, kStrictReceiptsEnv);
+    regime.require_measured_receipts |= value && std::string_view(value) == "1";
+    return regime;
+}
 
 // Model presets automatically admit qualified cells. Provisional experiments require an explicit opt-in.
 inline Status admit_profile_column(bool ready, bool runnable, bool allow_pending, bool provisional,
@@ -1173,9 +1185,13 @@ template <class Row, class Admission>
                                             const LadderArms& arms, LadderCell lower) {
     const auto column = value_column(lever, tier);
     const auto wanted = lever.value[column];
+    const bool judged = ladder_judged(lever) && (tier == Name::fast || tier == Name::turbo);
+    const auto admission = wanted.empty() || wanted == lever.builtin ? Status::builtin : admit(column);
     // A cell spelling the builtin runs without a qualification of its own (resolve() treats it as builtin).
-    const bool eligible = !wanted.empty() && (wanted == lever.builtin || applied(admit(column)));
-    if (!ladder_judged(lever) || (tier != Name::fast && tier != Name::turbo))
+    // A speed receipt alone cannot promote a provisional column under measured-receipt policy.
+    const bool qualified = !judged || !regime.require_measured_receipts || allow_pending || admission == Status::set;
+    const bool eligible = !wanted.empty() && (wanted == lever.builtin || (qualified && applied(admission)));
+    if (!judged)
         return {eligible ? wanted : lever.builtin, tier, {}};
 
     lower.measured = false;  // the lower step's own verdict is not this tier's
@@ -1184,11 +1200,12 @@ template <class Row, class Admission>
         // the cell FAST resolved, whatever value the proposal spells (a companion setting of the proposal stays
         // pending in its own row); it never drops an admitted FAST member. FAST falls back to the builtin.
         if (tier == Name::turbo) {
-            if (lower.value != lever.builtin)
+            if (lower.value != lever.builtin || !qualified)
                 lower.route = " turbo=" + std::string(wanted) + " refused by column admission" + lower.route;
             return lower;
         }
-        return {lever.builtin, Name::standard, {}};
+        return {lever.builtin, Name::standard,
+                qualified ? std::string{} : " fast=" + std::string(wanted) + " refused by column admission"};
     }
     if (!eligible || (tier == Name::turbo && column == static_cast<unsigned>(Name::fast)) ||
         wanted == lower.value) return lower;
@@ -1288,24 +1305,22 @@ template <class Row, class AdmitOf, class ExplicitOf = NoExplicitSetting>
 
 // A synthetic execution for probing the band and candidate identity checks without an adapter.
 inline constexpr std::string_view kBandProbeExecution = "exec/v1 band-probe";
-// Binds the band receipts of `rows` to the run's own reference (LadderRow::band_bound). `storage` owns the spellings
-// (a deque: views stay valid) and must outlive the rows. Rows with an unknown execution, unidentified reference or
-// changed candidate identity stay unbound and decide nothing. A row already bound is re-bound when its reference
-// changed: the reference of a later lever extends the cells the earlier rows admitted (the ladder chain), so a caller
-// repeats bind + arms until nothing changes (resolve() does). Returns true when a row's reference changed.
+// Computes compatibility references for historical band rows that lack a recorded key. The measured `over` is
+// immutable. `storage` owns the spellings (views remain valid) and must outlive the rows. A later lever's compatibility
+// reference extends the cells the earlier rows admitted, so callers repeat bind + arms until the chain settles.
 inline bool bind_band_receipts(std::vector<LadderRow>& rows, const LadderArms& arms, std::deque<std::string>& storage) {
     bool changed = false;
     for (auto& row : rows) {
-        if (!row.band_bound || row.incumbent || !row.joint.empty()) continue;
+        if (!row.band_bound || row.incumbent || !row.joint.empty() || !row.over.empty()) continue;
         const auto at = arms.index(row.lever);
         const bool measured_candidate = identity_token(row.identity) && at < arms.identities.size() &&
             declared_identity(arms.identities[at], row.value) == row.identity;
         auto over = measured_candidate ? arms.over(row.tier, row.lever, row.value) : std::string{};
-        if (over == row.over) continue;
-        if (over.empty()) row.over = {};
+        if (over == row.compatibility_over) continue;
+        if (over.empty()) row.compatibility_over = {};
         else {
             storage.push_back(std::move(over));
-            row.over = storage.back();
+            row.compatibility_over = storage.back();
         }
         changed = true;
     }
@@ -1354,11 +1369,33 @@ inline LadderCell select_profile_cell(const Row& lever, std::span<const LadderRo
     return cell;
 }
 
-inline void apply_ladder(Entry& entry, std::span<const LadderRow> rows, Name tier, const Regime& regime,
-                         const auto& admit, bool allow_pending, const LadderArms& arms) {
+// Prepare the ladder and select its profile cell once, in table order. Adapters bind launch precedence
+// (including the arm value of their explicit switches) and write their established receipt schema.
+template <class Row, class Admission, class ArmValue, class Active, class Emit>
+void resolve_rows(std::span<const Row> table, Name tier, const Regime& regime, bool allow_pending,
+                  std::span<const LadderRow> registered, std::span<const LadderRow> additional,
+                  const Admission& admit, const ArmValue& explicit_arm, const Active& active, const Emit& emit,
+                  bool bind_bands = true) {
+    std::vector<LadderRow> rows(registered.begin(), registered.end());
+    rows.insert(rows.end(), additional.begin(), additional.end());
+    const auto build_arms = [&] {
+        return ladder_arms(table, std::span<const LadderRow>(rows), regime, admit, explicit_arm, allow_pending);
+    };
+    auto arms = build_arms();
+    std::deque<std::string> band_references;
+    if (bind_bands) settle_band_receipts(rows, arms, band_references, build_arms);
+    for (const auto& lever : table) {
+        if (!active(lever)) continue;
+        const auto column = value_column(lever, tier);
+        const auto admit_column = [&](unsigned c) { return admit(lever, c); };
+        emit(lever, column, admit_column, select_profile_cell(lever, rows, tier, regime, admit_column,
+                                                             allow_pending, arms));
+    }
+}
+
+inline void apply_ladder(Entry& entry, Name tier, const auto& admit, LadderCell cell) {
     const auto& lever = *entry.lever;
     if (!ladder_judged(lever) || (tier != Name::fast && tier != Name::turbo)) return;
-    auto cell = select_profile_cell(lever, rows, tier, regime, admit, allow_pending, arms);
     entry.ladder = std::move(cell.route);
     entry.ladder_reference = std::move(cell.reference);
     entry.ladder_lowered = !entry.ladder.empty() && cell.tier != tier;
@@ -1380,6 +1417,62 @@ inline void apply_ladder(Entry& entry, std::span<const LadderRow> rows, Name tie
     } else if (applied(entry.status)) {
         entry.status = Status::builtin;
     }
+}
+
+// A front end may interpret an environment value (or disregard its own inherited export).
+// Keep the requested spelling separate from the effective value for receipts.
+struct SwitchSetting {
+    std::string_view value, requested;
+    bool from_cli = false;
+};
+
+// The main table schema allows adapters to preserve their existing receipt and export contracts.
+struct SwitchPolicy {
+    bool omit_unselected = false;
+    bool keep_cli_provenance = false;
+    bool refuse_unrunnable_explicit = false;
+    bool admit_builtin_column = false;
+};
+
+inline std::vector<Entry> resolve_switches(std::span<const Lever> table, Name tier, const Regime& regime,
+                                           bool allow_pending, std::span<const LadderRow> registered,
+                                           std::span<const LadderRow> additional, const auto& admit,
+                                           const auto& setting, SwitchPolicy policy = {}) {
+    std::vector<Entry> entries;
+    resolve_rows(table, tier, regime, allow_pending, registered, additional, admit,
+        [&](const Lever& lever) -> std::optional<std::string_view> {
+            if (const auto chosen = setting(lever)) return chosen->value;
+            return std::nullopt;
+        }, [](const Lever&) { return true; },
+        [&](const Lever& lever, unsigned column, const auto& admit_column, LadderCell cell) {
+            const auto wanted = lever.value[column];
+            Entry entry{&lever, std::string(lever.builtin), Status::builtin, {}, false, {}, std::string(wanted)};
+            if (const auto chosen = setting(lever)) {
+                entry.cli_override = policy.keep_cli_provenance && chosen->from_cli;
+                entry.value = chosen->value;
+                entry.requested = chosen->requested;
+                entry.status = chosen->from_cli ? Status::explicit_cli : Status::explicit_env;
+                if ((!lever.off.empty() && entry.value == lever.off) || entry.value == "off") entry.status = Status::off;
+                if (policy.refuse_unrunnable_explicit && entry.status != Status::off && entry.value != lever.builtin &&
+                    std::none_of(lever.runnable.begin(), lever.runnable.end(), [](bool available) { return available; }))
+                    throw std::invalid_argument(std::string(lever.env.empty() ? lever.option : lever.env) + "=" +
+                        entry.value + " is not in this build (" + std::string(lever.source) + ")");
+            } else {
+                if (wanted.empty() && policy.omit_unselected) return;
+                if (!wanted.empty() && (policy.admit_builtin_column || wanted != lever.builtin)) {
+                    entry.status = admit_column(column);
+                    if (entry.status == Status::pending) {
+                        entry.target = lever.target.empty() ? wanted : lever.target;
+                    } else {
+                        entry.value = wanted;
+                        if (entry.status == Status::set && wanted == lever.builtin) entry.status = Status::builtin;
+                    }
+                }
+                apply_ladder(entry, tier, admit_column, std::move(cell));
+            }
+            entries.push_back(std::move(entry));
+        });
+    return entries;
 }
 
 // Identity-variant admission, the one rule for every engine and entry point: each request names a declared variant
@@ -1447,43 +1540,14 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
     const auto admit = [&](const Lever& lever, unsigned column) {
         return column_admission(lever, column, out.allow_pending, preset);
     };
-    std::vector<LadderRow> ladder(engine.ladder.begin(), engine.ladder.end());
-    const auto build_arms = [&] { return ladder_arms(engine.table, std::span<const LadderRow>(ladder), inputs.regime,
-        admit,
-        [&](const Lever& lever) -> std::optional<std::string_view> {
-            if (const auto* cli = last_setting(inputs.cli, lever.name)) return std::string_view(*cli);
+    const auto regime = measured_receipt_regime(inputs.regime, inputs.env);
+    out.entries = resolve_switches(engine.table, profile_column, regime, out.allow_pending,
+        engine.ladder, {}, admit, [&](const Lever& lever) -> std::optional<SwitchSetting> {
+            if (const auto* cli = last_setting(inputs.cli, lever.name)) return SwitchSetting{*cli, *cli, true};
             if (const char* env = lever.env.empty() ? nullptr : environment(inputs.env, lever.env))
-                return effective_env_value(lever, env);
+                return SwitchSetting{effective_env_value(lever, env), env};
             return std::nullopt;
-        }, out.allow_pending); };
-    auto arms = build_arms();
-    std::deque<std::string> band_references;  // band receipts bind to this run's own reference
-    settle_band_receipts(ladder, arms, band_references, build_arms);
-    for (const auto& lever : engine.table) {
-        const auto column = value_column(lever, profile_column);
-        const std::string* cli = last_setting(inputs.cli, lever.name);  // the value the arms spelled (dispatch precedence)
-        const char* env = lever.env.empty() ? nullptr : environment(inputs.env, lever.env);
-        const auto wanted = lever.value[column];
-        Entry entry{&lever, std::string(lever.builtin), Status::builtin, {}, false, {}, std::string(wanted)};
-        if (cli != nullptr || env != nullptr) {  // a set variable is explicit even when empty (the app judges it)
-            entry.requested = cli != nullptr ? *cli : std::string(env);
-            if (cli != nullptr) entry.value = *cli;
-            else entry.value = effective_env_value(lever, env);
-            entry.status = cli != nullptr ? Status::explicit_cli : Status::explicit_env;
-            if ((!lever.off.empty() && entry.value == lever.off) || entry.value == "off") entry.status = Status::off;
-        } else if (wanted.empty() || wanted == lever.builtin) {
-            // builtin (the default column always is: default exports nothing)
-        } else {
-            entry.status = admit(lever, column);
-            if (entry.status == Status::pending) entry.target = std::string(lever.target.empty() ? wanted : lever.target);
-            else entry.value = std::string(wanted);
-        }
-        if (cli == nullptr && env == nullptr)
-            apply_ladder(entry, ladder, profile_column, inputs.regime, [&](unsigned c) {
-                return admit(lever, c);
-            }, out.allow_pending, arms);
-        out.entries.push_back(std::move(entry));
-    }
+        });
     out.admitted_ = Resolution::resolve_variants(engine, inputs, out);
     out.admitted_engine_ = &engine;
     out.admitted_profile_ = out.profile;
@@ -1530,9 +1594,10 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         if (row.joint.empty() && row.value.empty()) return where + ": timing row names no measured value";
         if (row.band_bound && (!row.joint.empty() || !identity_token(row.identity)))
             return where + ": band receipt requires a single measured candidate and its implementation identity";
-        if (row.joint.empty() && !row.band_bound && ladder_reference_execution(row.over).empty())
+        const bool fixed_reference = row.joint.empty() && (!row.band_bound || !row.over.empty());
+        if (fixed_reference && ladder_reference_execution(row.over).empty())
             return where + ": timing row without a versioned reference execution (LadderArms::over spelling)";
-        if (row.joint.empty() && !row.band_bound && !row.over.ends_with(std::string(";tier=") + name(row.tier)))
+        if (fixed_reference && !row.over.ends_with(std::string(";tier=") + name(row.tier)))
             return where + ": timing row key names another tier";
         if (row.device.empty() || row.receipt.empty()) return where + ": ladder row without device or receipt";
         if (!valid_ladder_measurement(row.speedup, row.noise)) return where + ": invalid speedup or noise";
@@ -1568,7 +1633,8 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
                                        row.max_lanes == kNoLaneBound ? row.max_lanes : row.max_lanes + 1};
         for (const auto context : contexts)
             for (const auto lane : lanes)
-                if (lane >= 1) out.push_back({row.phase, context, lane, row.device, (row.band_bound ? kBandProbeExecution : ladder_reference_execution(row.over))});
+                if (lane >= 1) out.push_back({row.phase, context, lane, row.device,
+                    row.band_bound && row.over.empty() ? kBandProbeExecution : ladder_reference_execution(row.over)});
     }
     return out;
 }
@@ -1768,45 +1834,6 @@ inline void take_options(const Engine& engine, std::vector<std::string>& args, I
         inputs.cli.emplace_back(std::string(lever->name), value);
     }
     args = std::move(kept);
-}
-
-// Compatibility adapter for a catalogue projection. Native resolution still
-// owns app masks, assets, explicit override precedence and receipt formats.
-struct EffectiveCell {
-    std::string_view row, value;
-    bool provisional = false;
-};
-
-template <class Row, class Resolve>
-[[nodiscard]] auto resolve_effective_profile(Name tier, std::span<const Row> legacy,
-                                             std::span<const EffectiveCell> cells,
-                                             std::vector<Row>& storage, Resolve&& native) {
-    // Publish the rows only after resolution succeeds. The result borrows
-    // their addresses until storage is changed or destroyed.
-    std::vector<Row> projected(legacy.begin(), legacy.end());
-    const auto column = static_cast<std::size_t>(tier);
-    for (const auto& cell : cells) {
-        Row* match = nullptr;
-        for (auto& row : projected) {
-            if (row.name == cell.row) {
-                match = &row;
-                break;
-            }
-        }
-        if (match == nullptr || column >= match->value.size())
-            throw std::invalid_argument("unbound profile cell: " + std::string(cell.row));
-        if constexpr (requires { match->provisional[column]; }) {
-            match->provisional[column] = cell.provisional;
-        } else if (cell.provisional) {
-            throw std::invalid_argument("native profile cannot represent provisional cell: " + std::string(cell.row));
-        }
-        match->value[column] = cell.value;
-        match->ready[column] = !cell.provisional;
-        match->runnable[column] = true;
-    }
-    auto result = std::forward<Resolve>(native)(std::span<const Row>(projected));
-    storage.swap(projected);
-    return result;
 }
 
 inline std::string hex_identity(std::uint64_t value) {

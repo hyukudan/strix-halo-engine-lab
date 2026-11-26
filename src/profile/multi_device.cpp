@@ -257,12 +257,12 @@ std::string measured_reference(const Regime& regime, const Query& q) {
     row.band_bound = true;
     // A deployment receipt is the timing of its own band: both declared edges are its measured points.
     row.band_evidence.timed = {r->min_context, r->max_context};
-    std::vector rows{row};
-    std::deque<std::string> keys;
-    (void)bind_band_receipts(rows, arms, keys);
+    const auto reference = arms.over(Name::fast, row.lever, row.value);
+    row.over = reference;
+    const std::array rows{row};
     const profile::Regime priced{profile::Phase::decode, e.context, 1, e.device, arms.execution};
-    return ladder_judge(rows, regime.lever, row.value, Name::fast, priced, rows.front().over,
-                        "tensor-decode@1").rung == Rung::applies ? std::string(rows.front().over) : std::string{};
+    return ladder_judge(rows, regime.lever, row.value, Name::fast, priced, reference,
+                        "tensor-decode@1").rung == Rung::applies ? reference : std::string{};
 }
 
 bool rows_match(const std::optional<std::uint64_t>& value, const std::optional<std::uint64_t>& lo,

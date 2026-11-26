@@ -5,6 +5,7 @@
 // the CLI render); a tool-call round trip through the bound renderer and parser; GGUF family admission.
 #include "hy4/hy4_speculation.hpp"
 #include "hy4/serve/session_service.hpp"
+#include "strix/hy4/profile_options.hpp"
 #include "strix/profiles/hy4.hpp"
 #include "strix/model_family_registry.hpp"
 #include "strix/serve/engine.hpp"
@@ -119,12 +120,14 @@ void shell_tests(const std::filesystem::path& root) {
         const auto served = invoke(argv, factories);
         check(served.code == 0 && served.out == cli, "CLI = serve effective config: " + served.out + " vs " + cli);
     }
-    {
+    for (const auto* tier : {"exact", "fast", "turbo"}) {
         namespace hp = strix::hy4::profile;
-        const std::vector<std::string> switches{"--profile", "turbo", "--prompt-rows", "2048", "--head-q8", "0"};
-        std::vector<std::string> rank_args = switches;
+        const std::vector<std::string> switches{"--profile", tier, "--prompt-rows", "2048", "--prompt-rows=0", "--head-q8=0"};
+        auto rank_args = switches;
         strix::profile::Inputs rank;
-        strix::profile::take_options(hp::engine(), rank_args, rank);
+        const auto native_overrides = strix::hy4::take_profile_options(rank_args, rank);
+        check(rank_args.empty() && native_overrides.prompt_rows == 0U && native_overrides.head_q8 == false,
+              "native parser preserves explicit off and the last prompt width");
         const auto native = hp::resolve({hp::Device::unknown, hp::Topology::one_node, 8192}, rank);
         std::vector<std::string> argv{"serve", "--registry-root", r, "--model", "hy4_flash", "--", "--ctx", "8192",
                                       "--print-effective-config"};
@@ -135,8 +138,22 @@ void shell_tests(const std::filesystem::path& root) {
             const auto config = sv::parse_json(served.out);
             const auto* resolved = config.find("profile");
             check(resolved && resolved->dump() == sv::parse_json(native->resolution.json()).dump(),
-                  "native rank and serve resolve the same tier and overrides without a device");
+                  "native rank and serve resolve the same tier and equals-spelled overrides without a device");
         }
+    }
+    for (const auto& switches : std::vector<std::vector<std::string>>{
+             {"--head-q8", "10"}, {"--prompt-rows", "2048x"}, {"--prompt-rows", "4294967296"}}) {
+        std::vector<std::string> argv{"serve", "--registry-root", r, "--model", "hy4_flash", "--", "--ctx", "8192",
+                                      "--print-effective-config"};
+        argv.insert(argv.end(), switches.begin(), switches.end());
+        const auto served = invoke(argv, factories);
+        auto rank_args = switches;
+        strix::profile::Inputs rank;
+        std::string rank_error;
+        try { (void)strix::hy4::take_profile_options(rank_args, rank); }
+        catch (const std::invalid_argument& error) { rank_error = error.what(); }
+        check(served.code == 2 && !rank_error.empty() && served.error.find(rank_error) != std::string::npos,
+              "native rank and serve refuse malformed explicit profile overrides with the same diagnostic");
     }
     // Exact speculative decode: one declaration, the shared default resolver decides for every tier.
     {

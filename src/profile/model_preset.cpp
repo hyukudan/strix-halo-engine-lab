@@ -183,9 +183,18 @@ void ModelPreset::append_options(std::vector<std::string>& args) const {
     }
 }
 
-PresetScope::PresetScope() {
+void append_native_profile(std::vector<std::string>& args, std::optional<Name> requested) {
+    if (!requested) return;
+    if (std::ranges::any_of(args, [](std::string_view arg) { return arg == "--profile" || arg.starts_with("--profile="); }))
+        throw std::invalid_argument("specify --profile once");
+    args.emplace_back("--profile");
+    args.emplace_back(tier_word(*requested));
+}
+
+PresetScope::PresetScope(bool enabled) {
     if (const char* value = environment({}, kPresetEnv)) previous_ = value;
-    if (!export_environment(kPresetEnv, "1")) throw std::runtime_error("cannot apply the model preset");
+    if (!export_environment(kPresetEnv, enabled ? "1" : "0"))
+        throw std::runtime_error("cannot set model preset admission");
 }
 
 PresetScope::~PresetScope() { restore(previous_ ? previous_->c_str() : nullptr); }

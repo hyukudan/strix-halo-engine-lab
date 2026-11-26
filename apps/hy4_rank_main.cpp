@@ -16,6 +16,7 @@
 #include "hy4/hy4_speculation.hpp"
 #include "strix/hy4/tp_layout.hpp"
 #include "strix/hy4/placement_policy.hpp"
+#include "strix/hy4/profile_options.hpp"
 #include "strix/weight_pack.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/pair/layer_pipeline.hpp"
@@ -602,11 +603,14 @@ int run(int argc, char** argv) {
     std::uint32_t prompt_vrows = strix::hy4::hipbind::rows::kMaxVerifyRows;
     std::string dump_path;  // --dump-logits F: every host logits row (FP32, vocab floats per step) appended to F
     std::vector<strix::hy4::hipbind::PairWindowCost> window_costs;  // --window-costs ROWS:MS,... (pair calibration)
-    // The tier word (--profile exact|fast|turbo, --allow-pending) through the shared resolver; the lever options
-    // stay in args and are parsed below (an explicit option wins over the profile).
+    // The shared profile and Hy4 option bindings preserve explicit overrides for both the receipt and execution.
     std::vector<std::string> args(argv + 1, argv + argc);
     strix::profile::Inputs inputs;
-    strix::profile::take_options(strix::hy4::profile::engine(), args, inputs);
+    const auto profile_overrides = strix::hy4::take_profile_options(args, inputs);
+    rows_explicit = profile_overrides.prompt_rows.has_value();
+    head_explicit = profile_overrides.head_q8.has_value();
+    o.prompt_rows = profile_overrides.prompt_rows.value_or(o.prompt_rows);
+    o.head_q8 = profile_overrides.head_q8.value_or(o.head_q8);
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
         const bool more = i + 1 < args.size();
@@ -623,10 +627,8 @@ int run(int argc, char** argv) {
             prompt_vrows = static_cast<std::uint32_t>(std::stoul(args[++i]));
             if (prompt_vrows > strix::hy4::hipbind::rows::kMaxVerifyRows) throw std::invalid_argument("--prompt-vrows 0..8");
         }
-        else if (a == "--prompt-rows" && more) o.prompt_rows = static_cast<std::uint32_t>(std::stoul(args[++i])), rows_explicit = true;
         else if (a == "--timing") timing = true;
         else if (a == "--gate-ref") gref.on = true;
-        else if (a == "--head-q8" && more) o.head_q8 = args[++i] == "1", head_explicit = true;
         else if (a == "--verify-rows" && more) o.verify_rows = static_cast<std::uint32_t>(std::stoul(args[++i]));
         else if (a == "--state-in" && more) gref.state_in = args[++i];
         else if (a == "--state-out" && more) gref.state_out = args[++i];

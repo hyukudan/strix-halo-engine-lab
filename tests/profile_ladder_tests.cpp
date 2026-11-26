@@ -259,12 +259,13 @@ void defects() {
 // whose column admission is off has an entry with no judgment).
 std::string shipped_row_defect(const p::Engine& engine, const p::LadderRow& row) {
     const auto actual = resolve(engine, row.tier, {row.phase, p::ladder_min_context(row), row.min_lanes, row.device,
-                                                   row.band_bound ? p::kBandProbeExecution : p::ladder_reference_execution(row.over)});
+                                                   row.band_bound && row.over.empty() ? p::kBandProbeExecution
+                                                                                     : p::ladder_reference_execution(row.over)});
     const auto* entry = actual.find(row.lever);
     if (entry == nullptr) return "no entry for the lever";
     const std::string step = " " + std::string(p::name(row.tier)) + "=" + std::string(row.value) + " ";
     if (entry->ladder.find(step) == std::string::npos) return "the cell was not judged in its regime: " + entry->ladder;
-    if (!row.band_bound && entry->ladder_reference != row.over) return "judged over " + entry->ladder_reference + ", not the row's reference";
+    if (!row.over.empty() && entry->ladder_reference != row.over) return "judged over " + entry->ladder_reference + ", not the row's reference";
     if (entry->ladder.find(std::string(row.receipt)) == std::string::npos) return "the row did not decide: " + entry->ladder;
     return {};
 }
@@ -488,9 +489,55 @@ void cuda_cli_server() {
     const auto startup = qo::resolve(request, qo::Entry::serve);
     require(!profile_selects_storage(startup) && startup.choice.qsa_mma,
             "startup declines the non-incumbent timing row and retains the incumbent form");
+
+    // Use the request words both entries consume, with the same prefill schedule and no handoff.
+    for (const auto* tier : {"exact", "fast", "turbo"}) {
+        std::vector<std::string> words{"model", "--model", "model.gguf", "--tables", "tables", "--rope-table", "rope",
+                                       "--profile", tier, "--blocks", "4096,8192"};
+        std::vector<char*> argv;
+        for (auto& word : words) argv.push_back(word.data());
+        qo::Request matched;
+        matched.inputs.env = [](const char*) -> const char* { return nullptr; };
+        matched.inputs.regime = p::startup_prefill_regime();
+        matched.engine.decode = true;
+        matched.engine.export_state = false;
+        matched.engine.release_by_layer = false;
+        for (int i = 1; i < static_cast<int>(argv.size()); ++i)
+            require(qo::take(static_cast<int>(argv.size()), argv.data(), i, matched), "Qwen CUDA consumes the shared request words");
+        const auto native = qo::resolve(matched, qo::Entry::cli);
+        const auto served = qo::resolve(matched, qo::Entry::serve);
+        const auto cli_receipt = strix::serve::parse_json(qo::effective_config_json(native));
+        const auto server_receipt = strix::serve::parse_json(qo::effective_config_json(served));
+        for (const auto* field : {"profile", "resolution", "forms", "form_identities", "engine", "kv", "arithmetic_contract"}) {
+            const auto* a = cli_receipt.find(field);
+            const auto* b = server_receipt.find(field);
+            require(a && b && a->dump() == b->dump(), std::string("Qwen CUDA ") + tier + " receipt field " + field);
+        }
+        require(native.config.block_schedule == std::vector<std::uint32_t>{4096, 8192},
+                "Qwen CUDA preserves the explicitly matched block schedule");
+    }
 }
 
 void custom_adapters() {
+    // The shipped Qwen composition is provisional above its 8K gate.
+    {
+        namespace qwen = strix::qwen::profile;
+        qwen::Inputs in;
+        bool strict_receipts = false;
+        in.env = [&](const char* key) -> const char* {
+            return strict_receipts && std::string_view(key) == p::kStrictReceiptsEnv ? "1" : nullptr;
+        };
+        in.regimes = qwen::fast_regimes;
+        in.max_prompt_tokens = 32768;
+        in.regime = {p::Phase::prefill, 32768, 1, "gfx1151", kExec};
+        const auto compatibility = qwen::resolve(p::Name::fast, in);
+        strict_receipts = true;
+        const auto strict = qwen::resolve(p::Name::fast, in);
+        for (const auto lever : {"qsa_budget", "moe_route_bf16", "gdn_fp16_chunk"}) {
+            require(compatibility.find(lever)->status == p::Status::provisional, "Qwen keeps the legacy 32K composition");
+            require(strict.find(lever)->status == p::Status::pending, "strict Qwen FAST refuses the provisional 32K cell");
+        }
+    }
     constexpr p::Regime regime{p::Phase::prefill, 4096, 1, "dev", "fixture-exec"};
     const p::LadderRow sample = measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 4096, 4096, 1, 1,
                                                    1.008, 0.002, "r/fast"}, kExactArm);

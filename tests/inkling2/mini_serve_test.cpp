@@ -454,7 +454,10 @@ void profile_parity() {
                         loaded->tier == cli.tier.profile &&
                         loaded->experts_nvfp4 == narrow && loaded->experts_nvfp4 == mini::mini_experts_nvfp4(cli.tier) &&
                         loaded->moe_w4a4 == cli.moe_w4a4 &&
-                        loaded->combine_image == mini::mini_combine_image(cli.tier),
+                        loaded->combine_image == mini::mini_combine_image(cli.tier) &&
+                        loaded->prepared_round_fold == mini::mini_prepared_round_fold(cli.tier) &&
+                        loaded->attn_projected_bias == mini::mini_attn_projected_bias(cli.tier) &&
+                        loaded->controller_one_plane == mini::mini_controller_one_plane(cli.tier),
                         "CLI and server selected different decoder inputs");
             }
         }
@@ -462,6 +465,31 @@ void profile_parity() {
     set_expert_env(nullptr);
     set_w4a4_env(nullptr);
     const auto previous_arguments = selection.arguments;
+    set_cli_route_env("1");
+    for (const auto* backend : {"hip", "cuda"}) {
+        const bool hip = std::string_view(backend) == "hip";
+        for (const auto* tier : {"exact", "fast", "turbo"}) {
+            selection.arguments = {"--checkpoint", "MODEL.safetensors", "--backend", backend, "--profile", tier,
+                                   "--speculation", "off"};
+            loaded.reset();
+            const auto cli = parse_cli(tier, backend, {"1", "--generate", "2", "--speculation", "off"});
+            const auto service = factory->create(selection);
+            const auto schedule = mini::mini_prefill_schedule(hip, cli.tier.profile);
+            require(service && loaded && loaded->served_cli_route && !loaded->speculation &&
+                    loaded->prefill_rows == std::min(schedule.chunk, loaded->context) &&
+                    loaded->prefill_tail == mini::mini_prefill_tail_capacity(loaded->prefill_rows, schedule.tail_divisor,
+                                                                          loaded->context),
+                    "Inkling's explicit served CLI route must use the matched chunk, tail and speculation levers");
+            std::ostringstream cli_receipt, server_receipt;
+            mini::cli::write_profile(cli.tier, cli_receipt, true);
+            factory->inspect(selection, server_receipt);
+            const auto word = std::string("profile ") + mini::mini_profile_name(cli.tier.profile) + ' ';
+            require(cli_receipt.str().starts_with(word) && server_receipt.str().find(word + "speculation off") != std::string::npos,
+                    "the CLI and server receipts report the same explicit tier and served speculation off");
+        }
+    }
+    set_cli_route_env(nullptr);
+    selection.arguments = previous_arguments;
     selection.arguments.back() = "exact";
     for (const auto* backend : {"hip", "cuda"}) {
         selection.arguments[3] = backend;
