@@ -100,6 +100,9 @@ inline constexpr std::string_view levers = "fast";
 } // namespace fast
 inline constexpr std::string_view native_kv = "fp8 ring + fp4 compressed (model-defined)";
 namespace turbo {
+namespace cuda {
+inline constexpr std::string_view levers = "fast";
+} // namespace cuda
 inline constexpr std::string_view levers = "turbo";
 } // namespace turbo
 } // namespace presets
