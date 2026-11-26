@@ -39,6 +39,14 @@ struct SafetensorsIndexLimits {
   std::size_t max_metadata_entries = std::numeric_limits<std::size_t>::max();
 };
 Status index_safetensors(std::shared_ptr<const Source>, TensorIndex&, const SafetensorsIndexLimits&);
+struct SafetensorsManifestEntry {
+  std::string_view name, shard;
+  std::uint64_t bytes;
+};
+// Reconcile all indexed payloads with a weight_map. For a partial download,
+// only entries belonging to explicitly absent shards can be missing.
+Status validate_safetensors_manifest(std::span<const SafetensorsManifestEntry>, std::string_view json,
+                                     std::span<const std::string> missing_shards = {});
 // Verify the supported single-shard manifest contract without reading any payload.
 Status validate_safetensors_shard_manifest(const TensorIndex&, std::string_view json, std::string_view shard);
 Status index_pack(std::shared_ptr<const Source>, TensorIndex&);

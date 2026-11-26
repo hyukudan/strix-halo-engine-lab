@@ -121,6 +121,7 @@ NATIVE_HEADERS = {
     "src/moe_core/route_tap_hip.hpp",
     "src/moe_core/route_project_kernel.hpp",  # HIP-only route projection body; the neutral route_project.hpp remains SDK-free.
     "src/moe_core/route_wave_kernel.hpp",
+    "src/moe_core/split_trellis_kernels.hpp",  # HIP split-K expert bodies shared from the DeepSeek K2 adapter.
     "src/xport/bf16_wire_hip.hpp",
     "src/xport/channel_device.hpp",
     "src/xport/channel_hip.hpp",

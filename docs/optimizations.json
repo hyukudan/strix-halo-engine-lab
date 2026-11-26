@@ -941,6 +941,17 @@
   },
   {
     "engine": "qwen",
+    "name": "Qwen 27B HIP FAST/TURBO prefill: 512-row window inside the gated bands",
+    "flag_or_env": "--profile fast|turbo (decode app); off: --profile exact, --wide N / --wide-exact N, --rows N",
+    "default": "ON in FAST and TURBO on gfx1151, one rank, one lane, IU4 g64 pack, known execution, prompt in a gated band (1..2,048, 2,049..8,192, 8,193..24,576); previous route (64-row EXACT windows) elsewhere and in EXACT",
+    "exact": "Bit-changing (FAST class): per-class gate v2 PASS in every class of every band (KL <= 0.00008, top-1 >= 0.996, |dNLL| <= 0.0008 vs EXACT --wide-exact 512, one-ulp null); default dumps bitwise the gated window arm. A4W4 48-63 failed the same gate (pending).",
+    "gain": "One Strix Halo node, --no-mtp, prompt seconds EXACT 64 rows -> 512-row window: 2,048 tokens 10.27 -> 2.99 s, 8,192 tokens 67.60 -> 12.93 s, 24,576 tokens 534.39 -> 45.43 s (11.8x).",
+    "preconditions": "Qwen 27B dense IU4 g64 pack, one gfx1151 device, one rank, one lane, prompt inside a gated band.",
+    "off_switch": "--profile exact; --wide N / --wide-exact N; --rows N",
+    "doc_anchor": "docs/optimizations.md#qwen27-hip-fast-window"
+  },
+  {
+    "engine": "qwen",
     "name": "R1 GDN preparation fusion",
     "flag_or_env": "STRIX_QWEN_DECODE_FUSE",
     "default": "OFF (opt-in: STRIX_QWEN_DECODE_FUSE=1)",
@@ -2833,13 +2844,13 @@
   },
   {
     "engine": "glm",
-    "name": "FAST WMMA prefill linear cores (glm-pf-wmma-x)",
+    "name": "FAST WMMA prefill bundle (glm-pf-wmma-x)",
     "flag_or_env": "STRIX_GLM_PF_WMMA",
-    "default": "off (glm rank --profile fast enables; opt-in FAST identity)",
-    "exact": "FAST identity (new FP32 summation order); pre-registered quality-parity check passed at 1K / 8K / 32K; OFF equals the exact 8K logits anchors on both ranks.",
-    "gain": "Pair 8K TTFT 15.45 -> 12.94 s (-16.3 %), 32K 62.3 -> 51.2 s (-17.8 %, mean of both run orders); whole-call MoE -28..-29 %, dense 8192 rows -28..-32 %",
-    "preconditions": "Dense calls of 2048+ rows (X3 route); MoE calls on V11/V14.",
-    "off_switch": "STRIX_GLM_PF_WMMA=0 (overrides --profile fast); unset stays off without fast",
+    "default": "on under --profile fast / turbo for pair prompts of 2,049..8,192 tokens in the measured execution (band receipt); TURBO also at 31,258 tokens; off otherwise",
+    "exact": "FAST identity (new FP32 summation order); FAST gate v2 with MoE route replay at 8K: 5 windows, 1,275 rows, pooled KL 0.00018, top-1 0.9969, dNLL -0.0013; OFF equals the exact 8K logits anchors on both ranks.",
+    "gain": "Pair 8,192-token prompt: exact cores 12.32 s -> bundle 8.23 s cold (x1.50; warm 655 -> 1,000 tok/s); TURBO 8K TTFT -16.3 %, 32K -17.8 %; FAST default (--profile fast alone, cold): CLI 8,192 tokens 12.78 -> 8.54 s (x1.50, 959 tok/s, forced-arm head logits bitwise = gate arm, EXACT bitwise unchanged); served 8,108 tokens 889 tok/s vs 628 before",
+    "preconditions": "Ordinary two-rank pair workload (Radeon 8060S x2, USB4 2x2x40, MTP decode on, 8,192-row chunks, one lane, fresh prompt); one shared resolver for CLI and server.",
+    "off_switch": "STRIX_GLM_PF_WMMA=0, --profile exact, or --baseline",
     "doc_anchor": "docs/optimizations.md#glm-pf-wmma-x"
   },
   {
@@ -2929,6 +2940,30 @@
     "preconditions": "STRIX_DS41_FAST_ATTN=2 flash layers, q_b on the FAST dense core (rows >= STRIX_DS41_FAST_DENSE_MIN_ROWS); other q_b forms keep FP32 q.",
     "off_switch": "STRIX_DS41_FAST_ATTN_Q16=0 (FP32 q, same bits)",
     "doc_anchor": "docs/optimizations.md#ds41-pf-flash-q16"
+  },
+  {
+    "engine": "deepseek41",
+    "name": "DS41 FAST prefill: D1 composition and bounded decoder replay R=256 by band receipt",
+    "flag_or_env": "profile rows d1_prefill (ds41-prefill-d1-v1) and decoder_replay=256 (ds41-replay-r256-v1); explicit STRIX_DS41_FAST_* / STRIX_DS41_DECODER_REPLAY settings keep their own route",
+    "default": "FAST and TURBO (the implicit model preset is FAST): per request, on both ranks, for prompts of 4,096-8,192 and 8,193-32,768 tokens on gfx1151; EXACT and other prompts keep the previous prefill route",
+    "tier": "FAST (TURBO nests FAST)",
+    "status": "qualified: FAST gate v2 D1 and D1R final PASS (pair, 8K and 32K classes, 28 windows, 1,764 rows)",
+    "home": "include/strix/engine_profile.hpp (bind_band_receipts), include/strix/deepseek41_pair_profile_table.hpp (rows), src/deepseek41_pair_defaults.cpp (execution key), src/hip_deepseek41_prefill.hip (paired admission)",
+    "exact": "Bit-changing. D1 KL 0.0093, top-1 0.972, dNLL -0.0037 (se 0.0035); D1 + R256 KL 0.0101, top-1 0.972, dNLL +0.0001 (se 0.0037). The bounded replay equals the full run with the key floor bit for bit; deferred serve pieces, snapshot points and group passes take the exact plan.",
+    "gain": "Pair CLI: 8,192 tokens EXACT 1,128.5 -> D1 1,614 / 1,647 -> D1 + R256 1,855 tok/s; 32,768 tokens EXACT 1,257.2 -> D1 1,808.6 -> D1 + R256 1,981 tok/s (pre-integration binaries; device check of the integrated build pending).",
+    "preconditions": "World 2 pair over usb4-host, TP attention, 40 layers, chunk 1,024, window 8, four attention lanes, automatic MoE chunk; no explicit FAST switch; both ranks agree on the request fingerprint.",
+    "off_switch": "--profile exact, or any explicit STRIX_DS41_FAST_PREFILL / STRIX_DS41_DECODER_REPLAY value",
+    "doc_anchor": "docs/optimizations.md#ds41-fast-d1-band",
+    "engine_matrix": {
+      "inkling2-mini": "not bound: no DeepSeek prefill composition",
+      "qwen3.8-flash-next": "shared mechanism only (band receipts bind its own TURBO rows)",
+      "qwen3.8-27b": "shared mechanism only (band receipts bind its 512-row window rows)",
+      "deepseek-v4.1-flash": "bound (pair prefill, CLI and serve)",
+      "glm-5.3-flash": "not bound: no DeepSeek prefill composition",
+      "minimax-m3.1-flash": "not bound: no DeepSeek prefill composition",
+      "hy4-flash": "shared mechanism only (band ladder of its prefill window)",
+      "nemotron-3.5-bolt-e4b": "not bound: no DeepSeek prefill composition"
+    }
   },
   {
     "engine": "minimax",
@@ -3498,8 +3533,10 @@
   },
   {"engine": "hy4", "name": "Prompt windows: bf16 epilogue in the producers' store", "flag_or_env": "STRIX_HY4_PF_STORE_EPILOGUE", "default": "ON", "exact": "Bitwise: same function on the same FP32 value; bf16 epilogue idempotent over all 2^32 patterns; 4096-token logits digest a0db1a8a45606112 equal on, off and parent.", "gain": "One node, 4096-token bench prompt, 2048-row windows, A-B/B-A: warm -4.3 %, cold -4.2 %.", "preconditions": "Hy4-flash --prompt-rows; q8a8 dense batch <= 1 outside the operand-image form; K-quant known-rows down. Other forms refuse it.", "off_switch": "STRIX_HY4_PF_STORE_EPILOGUE=0", "doc_anchor": "docs/optimizations.md#hy4-pf-store-epilogue"},
   {"engine":"hy4","name":"Hy4-flash exact tensor-parallel decode over two nodes","flag_or_env":"--tp-rank 0|1; --tp-rates A,B; --tp-transport; --tp-trip-us; --tp-force","default":"off (one node) unless --tp-rank is given; the shared split planner keeps one node when the group does not win","exact":"Generated ids equal the one-node run on both ranks (300 of 300 and 128 of 128, 1024-token prompt).","gain":"Two nodes over USB4, EXACT, 1024-token prompt, 128 greedy ids: one node 16.52 / 16.51 tok/s, tensor parallel 19.92 tok/s (+21 %, host-staged gather route).","preconditions":"Both ranks hold the whole pack; per-rank read rates from --tp-rates; the trip cost is measured at start-up and agreed by both ranks; --prompt-rows (each rank prefills alone).","off_switch":"omit --tp-rank","doc_anchor":"docs/optimizations.md#hy4-flash-exact-tensor-parallel-decode-over-two-nodes"},
-  {"engine": "inkling2-mini", "name": "Prompt prefill: W4A4 experts (FAST)", "flag_or_env": "lever inkling2-mini-moe-w4a4@1; STRIX_INK_MOE_W4A4", "default": "OFF; opt in with STRIX_INK_MOE_W4A4=1 under --profile fast", "exact": "Bit-changing (FAST); gate not run.", "gain": "Not measured on this tree.", "preconditions": "CUDA sm_120, NVFP4 expert layers, multi-row prefill chunks; MXFP8 layers, decode, verify and one-row calls keep the BF16 tile; HIP ignores it.", "off_switch": "STRIX_INK_MOE_W4A4=0 or a profile other than fast/turbo", "doc_anchor": "docs/optimizations.md#inkling2-moe-w4a4"},
+  {"engine": "inkling2-mini", "name": "Prompt prefill: W4A4 experts (FAST)", "flag_or_env": "lever inkling2-mini-moe-w4a4@1; STRIX_INK_MOE_W4A4", "default": "OFF; opt in with STRIX_INK_MOE_W4A4=1 under --profile fast", "exact": "Bit-changing (FAST); gate not run.", "gain": "Not measured on this tree.", "preconditions": "CUDA sm_120, NVFP4 expert layers, multi-row prefill chunks; MXFP8 layers, decode, verify and one-row calls keep the BF16 tile; HIP runs only the TURBO cell iu4.", "off_switch": "STRIX_INK_MOE_W4A4=0 or a profile other than fast/turbo", "doc_anchor": "docs/optimizations.md#inkling2-moe-w4a4"},
+  {"engine": "inkling2-mini", "name": "Prompt prefill: rotated integer A4W4 experts (TURBO, HIP)", "flag_or_env": "lever inkling2-mini-moe-w4a4@1, TURBO cell iu4; STRIX_INK_MOE_W4A4", "default": "ON under --profile turbo on gfx1151 for prompts of 4,307..32,760 tokens (CLI and strix-serve); off elsewhere", "exact": "Bit-changing (TURBO); gate v2 prefill KL 0.0179, top-1 0.9296, dNLL +0.0035, flip ratio 5.55 (does not pass the FAST gate).", "gain": "Prompt prefill over EXACT, gfx1151: CLI 4K x1.121, 8K x1.092, 32K x1.069; served x1.117 / x1.094 / x1.086.", "preconditions": "HIP gfx1151, multi-row prefill chunks inside a ladder row; decode, one-row calls, other devices and other prompt sizes keep the BF16 tile; CUDA declines it.", "off_switch": "STRIX_INK_MOE_W4A4=0 or a profile other than turbo", "doc_anchor": "docs/optimizations.md#inkling2-moe-iu4-turbo"},
   {"engine": "inkling2-mini", "name": "CUDA expert tile: exact NVFP4 shift decode", "flag_or_env": "STRIX_INK_MOE_SHIFT_DECODE", "default": "ON", "exact": "Bitwise: shared trait host test; device 4K prefill logits and 16 greedy ids byte-equal reference vs shift.", "gain": "Not measured on this tree.", "preconditions": "CUDA grouped expert tile on NVFP4 layers.", "off_switch": "STRIX_INK_MOE_SHIFT_DECODE=0", "doc_anchor": "docs/optimizations.md#inkling2-moe-shift-decode"},
   {"engine": "inkling2-mini", "name": "CUDA expert tile: exact tall slab schedule", "flag_or_env": "STRIX_INK_MOE_TALL", "default": "ON", "exact": "EXACT schedule change: per output the same BF16 m16n8k16 MMA chain from +0, K16 ascending, same fragment positions; host simulation of the shared plan; device fixture every form bitwise the staged tile. Model identity: RTX ticket pending.", "gain": "Not measured on this tree (RTX ticket pending).", "preconditions": "CUDA grouped expert tile, multi-row chunks (more than 16 rows per tile bound), 128-output shapes, inputs a multiple of 32; otherwise the staged tile runs.", "off_switch": "STRIX_INK_MOE_TALL=0", "doc_anchor": "docs/optimizations.md#inkling2-moe-tall"},
-  {"engine": "inkling2-mini", "name": "CUDA step program: exact R1 latency forms", "flag_or_env": "--latency-forms[=mix|=moe]; --no-latency-forms", "default": "mix (tiled bank readout + controller output split); moe pipe opt-in", "exact": "EXACT schedule change; host test checks program nodes and edges; device identity in the integration ticket.", "gain": "Not measured on this tree.", "preconditions": "CUDA step-program decode route.", "off_switch": "--no-latency-forms", "doc_anchor": "docs/optimizations.md#inkling2-latency-forms"}
+  {"engine": "inkling2-mini", "name": "CUDA step program: exact R1 latency forms", "flag_or_env": "--latency-forms[=mix|=moe]; --no-latency-forms", "default": "mix (tiled bank readout + controller output split); moe pipe opt-in", "exact": "EXACT schedule change; host test checks program nodes and edges; device identity in the integration ticket.", "gain": "Not measured on this tree.", "preconditions": "CUDA step-program decode route.", "off_switch": "--no-latency-forms", "doc_anchor": "docs/optimizations.md#inkling2-latency-forms"},
+  {"engine": "inkling2-mini", "name": "Decode head: Strix pack SP4, fixed table (strix.sp4t)", "flag_or_env": "lever inkling2-mini-lowbit-head@1; STRIX_INK_LOWBIT_HEAD=sp4t or --qualify-decode-weights weights.head.sp4t@1, with STRIX_LOWBIT_PACK naming a strix.sp4t pack", "default": "OFF in every tier (explicit option; runnable under --profile fast and turbo)", "status": "explicit option; FAST gate fails, TURBO gate passes; no decision row", "home": "src/core/f16_tile_gemm_small.hpp (Sp4Operand of the shared small-M schedule), src/core/lowbit_f16_staging.hpp, src/core/resident_q8_rows.hpp (dispatch), src/weight/lowbit_pack.cpp + include/strix/weight/registry.hpp (strix.sp4t@1 pack entries), include/strix/weight/levers.hpp (weights.head.sp4t@1)", "tier": "none by default; FAST: gate v2 FAIL (1/39 windows + 1 unresolved); TURBO limits: PASS 39/39 (head only, decode steps)", "exact": "Bit-changing (lossy weights). With the lever unset: Inkling CLI + served ids and logits equal origin/main 2bd8fc71d (100/100 rows) and the incumbent gfx1151 ISA is identical (43 objects, 0 differing). Device SP4 rows equal the host dequantised reference within the FP32 accumulation bound (worst 0.0032 of it), rows 1..33 bitwise per row.", "gain": "CLI B=1, 127-token prompt, 512 steps, three interleaved rounds (cluster2 gfx1151): 33.20 ms per step against 34.26 ms with the BF16 head (-3.1 %, 30.12 vs 29.18 tok/s) and 35.28 ms with the q4_g64 head; the gap to q4_g64 is the small-M route, not the format. Served not measured (the arm is command line only).", "preconditions": "HIP, a calibrated strix.sp4t head pack bound to the checkpoint (strix-lowbit-calib-pack --storage head=sp4 --table fixed --out); decode widths 1, 8, 16; prefill and verify keep BF16; not combinable with another weight arm; served refuses it.", "off_switch": "leave STRIX_INK_LOWBIT_HEAD unset (or 0)", "engine_matrix": {"inkling2-mini": "bound (HIP head, decode steps)", "qwen3.8-flash-next": "not bound: its decode head has no calibrated pack path and no resident low-bit rows (the shared consumer is reachable through enqueue_resident_q8_rows)", "qwen3.8-27b": "not bound: its decode head has no calibrated pack path and no resident low-bit rows (the shared consumer is reachable through enqueue_resident_q8_rows)", "deepseek-v4.1-flash": "not bound: its decode head has no calibrated pack path and no resident low-bit rows (the shared consumer is reachable through enqueue_resident_q8_rows)", "glm-5.3-flash": "not bound: its decode head has no calibrated pack path and no resident low-bit rows (the shared consumer is reachable through enqueue_resident_q8_rows)", "minimax-m3.1-flash": "not bound: its decode head has no calibrated pack path and no resident low-bit rows (the shared consumer is reachable through enqueue_resident_q8_rows)", "hy4-flash": "not bound: its decode head has no calibrated pack path and no resident low-bit rows (the shared consumer is reachable through enqueue_resident_q8_rows)", "nemotron-3.5-bolt-e4b": "not bound: its decode head has no calibrated pack path and no resident low-bit rows (the shared consumer is reachable through enqueue_resident_q8_rows)"}, "doc_anchor": "docs/optimizations.md#inkling2-sp4t-head"}
 ]

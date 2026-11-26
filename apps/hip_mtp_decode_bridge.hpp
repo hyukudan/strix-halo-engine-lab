@@ -35,6 +35,7 @@
 #include "strix/hip_known_prefix_window.hpp"
 #include "strix/hip_known_prompt_backend.hpp"
 #include "strix/hip_launch_context.hpp"
+#include "strix/hip_setup_quiescence.hpp"
 #include "strix/hip_mtp_asset_loader.hpp"
 #include "strix/hip_launcher_catalog.hpp"
 #include "strix/hip_mtp_forward_replay.hpp"
@@ -57,8 +58,10 @@
 #include "strix/session_executor_handoff.hpp"
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <future>
 #include <iostream>
 #include <memory>
@@ -939,6 +942,12 @@ private:
 public:
     std::function<void(HipKnownPrefixWindow&,const std::function<void()>&)> execute_native;
     void drain_for_handoff(){drain_priming();}
+    void wait_for_failed_request() {
+        // The async submitter can enqueue after a device drain unless we wait for it first.
+        // Its own error path already retains any quarantined prefix capture.
+        if (submitter_.valid()) submitter_.wait();
+        submitter_ = {};
+    }
     void set_request_order(std::uint64_t value) {request_order_=value;}
     // A no-op unless the pending capture carries this tag (batch certification, or a fenced cross-owner capture).
     void before_writer(hipStream_t stream) const {PrefixAsyncCapture::before_writer(this,stream);}
@@ -1238,6 +1247,7 @@ public:
         OutputLogitsChain output_chain;
         bool active = false;     // the slot holds a request (prefilling or decoding)
         bool prefilling = false; // its prompt is still running (interleaved admission)
+        bool retired = false;    // a failed native owner must never be leased again
         std::unique_ptr<TiledMtpPrompt> prefill;
         Slot* waits_for=nullptr;
         serve::PrefixJoinWait join_wait;
@@ -1325,10 +1335,12 @@ public:
     // Called only by the engine loop, between steps and outside service callbacks.
     bool add_slot(bool queued) {
         EngineCall call(engine_call_);
+        const auto unavailable = static_cast<std::size_t>(std::count_if(slots_.begin(), slots_.end(),
+            [](const auto& s) { return s->active || s->retired; }));
         if (stats_.lazy_slot_memory_declined || !grow_factory ||
-            !http_slot_should_grow(queued, active(), slots(), slots_capacity, true, spare_slot_)) return false;
+            !http_slot_should_grow(queued, unavailable, slots(), slots_capacity, true, spare_slot_)) return false;
         if (paused_ || paused_owner_) throw std::logic_error("batch growth during service park");
-        for (auto& slot : slots_) if (slot->prefilling) slot->prefill->drain_for_handoff();
+        (void)drain_prompt_submitters();
         if (!growth_memory_ok || !growth_memory_ok()) {
             stats_.lazy_slot_memory_declined = true;
             std::fprintf(stderr,"http slot growth stopped: insufficient MemAvailable/GTT with headroom\n");
@@ -1376,13 +1388,16 @@ public:
     [[nodiscard]] std::size_t active() const noexcept {
         return static_cast<std::size_t>(std::count_if(slots_.begin(), slots_.end(), [](const auto& s) { return s->active; }));
     }
-    [[nodiscard]] bool has_free_slot() const noexcept { return active() < slots_.size(); }
+    [[nodiscard]] bool has_free_slot() const noexcept { return free_slot() != slots_.end(); }
+    // At idle, take requests even when all slots are retired so admission can complete them with an error.
+    [[nodiscard]] bool http_can_admit() const noexcept { return has_free_slot() || active() == 0U; }
+    [[nodiscard]] bool http_named_available() const noexcept { return session_run && !slots_.front()->retired; }
     [[nodiscard]] bool interleaved() const noexcept { return interleave_; }
     [[nodiscard]] static bool prompt_batching() noexcept { return prompt_batch_enabled(); }
     [[nodiscard]] static std::uint32_t prompt_group_rows() { return prompt_batch_rows(); }
     [[nodiscard]] static bool prompt_window_cohort() { return prompt_window_cohort_enabled(); }
     // The executed scheduler: the environment toggles, minus groups/cohorts under the resolved solo suffix class.
-    [[nodiscard]] bool prompt_groups_on() const { return prompt_batch_enabled() && !options_.batch_cache_solo; }
+    [[nodiscard]] bool prompt_groups_on() const { return !prompt_group_failed_ && prompt_batch_enabled() && !options_.batch_cache_solo; }
     [[nodiscard]] bool prompt_cohort_on() const { return prompt_window_cohort_enabled() && !options_.batch_cache_solo; }
     [[nodiscard]] std::size_t prefilling() const noexcept {
         return static_cast<std::size_t>(std::count_if(slots_.begin(), slots_.end(), [](const auto& s) { return s->prefilling; }));
@@ -1400,6 +1415,7 @@ public:
     std::size_t admit(MtpBatchRequest request) {
         EngineCall call(engine_call_);
         const auto index=prepare_admission(std::move(request));
+        if (index == slots_.size()) return index;
         auto& s=*slots_[index];
         if (!interleave_) {
             try {
@@ -1407,10 +1423,14 @@ public:
                 if(cancel_requested(s)) cancel_prefill(s,false);else complete_prompt(s);
             } catch(const KnownPrefillCancelled&) {cancel_prefill(s,true);}
             catch(const serve::ConstraintError& e) {constraint_failed(s,e);}
+            catch (...) { fail_http_slot(s, std::current_exception()); }
         }
         return index;
     }
 private:
+    [[nodiscard]] auto free_slot() const noexcept -> std::vector<std::unique_ptr<Slot>>::const_iterator {
+        return std::find_if(slots_.begin(), slots_.end(), [](const auto& s) { return !s->active && !s->retired; });
+    }
     BatchCertContext batch_cert_context(const Slot& s) const {
         BatchCertContext result;
         result.enabled=prefix_batch_cert_execution_mode(options_) && !options_.baseline;
@@ -1433,24 +1453,42 @@ private:
     }
     std::size_t prepare_admission(MtpBatchRequest request) {
         if(!engine_call_ || (paused_owner_ && !service_mode_)) throw std::logic_error("invalid admission mode");
-        const auto free = std::find_if(slots_.begin(), slots_.end(), [](const auto& s) { return !s->active; });
-        if (free == slots_.end()) throw std::logic_error("batched MTP admission without a free slot");
-        const auto vocabulary = model_.vocab_size;
-        if (request.prompt.empty() || request.prompt.size() >= options_.context_tokens || !request.max_tokens || !request.on_tokens)
-            throw std::invalid_argument("batched request needs a prompt shorter than the context, a token budget and a sink");
-        for (const auto t : request.prompt) if (t >= vocabulary) throw std::invalid_argument("batched prompt token outside the vocabulary");
-        for (const auto t : request.stop_tokens) if (t >= vocabulary) throw std::invalid_argument("batched stop token outside the vocabulary");
+        const auto free = free_slot();
+        try {
+            if (free == slots_.end()) throw std::runtime_error("no healthy MTP batch slot is available");
+            if (request.prompt.empty() || request.prompt.size() >= options_.context_tokens || !request.max_tokens || !request.on_tokens)
+                throw std::invalid_argument("batched request needs a prompt shorter than the context, a token budget and a sink");
+            for (const auto t : request.prompt) if (t >= model_.vocab_size) throw std::invalid_argument("batched prompt token outside the vocabulary");
+            for (const auto t : request.stop_tokens) if (t >= model_.vocab_size) throw std::invalid_argument("batched stop token outside the vocabulary");
+        } catch (...) {
+            if (!options_.http_serve || !request.on_finish) throw;
+            MtpServeResult result;
+            result.finish = "execution_failure";
+            result.error = exception_message(std::current_exception());
+            request.on_finish(result);
+            return slots_.size();
+        }
         auto& s = **free;
+        s.request = std::move(request);
+        MtpServeResult fresh_result;
+        fresh_result.service.nest_rows_limit = nest_rows_;
+        s.result = std::move(fresh_result);
+        try {
+            prepare_slot(s, free - slots_.cbegin());
+        } catch (...) {
+            fail_http_slot(s, std::current_exception());
+            return slots_.size();
+        }
+        return static_cast<std::size_t>(free - slots_.cbegin());
+    }
+    void prepare_slot(Slot& s, std::ptrdiff_t index) {
         const auto& m = options_.mtp;
         const auto start = std::chrono::steady_clock::now();
-        s.request = std::move(request);
         if(s.request.constraint) {const auto route=resolve_mtp_selection_route(options_.http_selection_mtp,!!s.window,s.window && s.window->policy_selection_admitted());
             s.request.constraint->set_execution(route.mtp?"mtp-host":"serial-host",route.fallback?route.fallback:"");}
         if (s.request.ngram_peers) any_peers_ = true;
-        MtpServeResult fresh_result;
-        s.result=std::move(fresh_result);s.result.service.nest_rows_limit=nest_rows_;
         s.chosen_rows = {};
-        joint_.reset(static_cast<std::uint32_t>(free-slots_.begin()));policy_joint_.reset(static_cast<std::uint32_t>(free-slots_.begin()));
+        joint_.reset(static_cast<std::uint32_t>(index));policy_joint_.reset(static_cast<std::uint32_t>(index));
         // STRIX_MTP_JOINT_RULE_FILE (measurement, in-process A/B): the joint plan rule is re-read from this file at
         // every admission (its text as STRIX_MTP_JOINT_PLAN; missing/empty file = the startup rule). The file's
         // "wave=N" token names the wave; on the first admission of a new wave, "snapshot" saves the controller's
@@ -1480,7 +1518,7 @@ private:
         if (admit_log)
             std::fprintf(stderr, "joint admit rule=%d%d%u state=%.*s slot=%td request=%llu prompt_tokens=%zu wall_ms=%lld cal_min_members=%zu\n", joint_.rule().pooled ? 1 : 0,
                 joint_.rule().calibrated ? 1 : 0, joint_.rule().cap, static_cast<int>(restored.size()), restored.data(),
-                free - slots_.begin(),
+                index,
                 static_cast<unsigned long long>(++admitted_), s.request.prompt.size(),
                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count()), joint_.rule().calibrated_min_members);
@@ -1525,7 +1563,6 @@ private:
                 if(current_hip_launch_context()) throw std::logic_error("nested prefill retained launch scope");
             } else execute_prefill(owner,job,&s);
         };
-        return static_cast<std::size_t>(free-slots_.begin());
     }
 public:
 
@@ -1547,17 +1584,19 @@ public:
         for(auto& owner:slots_) {
             auto& s=*owner;
             if(!s.prefilling || !s.waits_for) continue;
-            if(cancel_requested(s)) {cancel_prefill(s,false);continue;}
-            const auto& producer=*s.waits_for;
-            // Asynchronous capture: the boundary state exists once the producer's position has passed it.
-            if(s.join_wait.pending(producer.order,producer.active,producer.prefilling,
-                (producer.prefill?producer.prefill->position():0)>s.join_wait.boundary)) continue;
-            s.waits_for=nullptr;s.join_wait={};
-            PrefixAsyncCapture::reap();
-            s.prefill->retry_join_lookup();
-            if(s.join_entry) {prefix_inflight_.release(s.join_entry);s.join_entry=0;}
-            announce_prefix(s);
-            stats_.inflight_restored_tokens+=s.prefill->restored();
+            try {
+                if(cancel_requested(s)) {cancel_prefill(s,false);continue;}
+                const auto& producer=*s.waits_for;
+                // Asynchronous capture: the boundary state exists once the producer's position has passed it.
+                if(s.join_wait.pending(producer.order,producer.active,producer.prefilling,
+                    (producer.prefill?producer.prefill->position():0)>s.join_wait.boundary)) continue;
+                s.waits_for=nullptr;s.join_wait={};
+                PrefixAsyncCapture::reap();
+                s.prefill->retry_join_lookup();
+                if(s.join_entry) {prefix_inflight_.release(s.join_entry);s.join_entry=0;}
+                announce_prefix(s);
+                stats_.inflight_restored_tokens+=s.prefill->restored();
+            } catch (...) { fail_http_slot(s, std::current_exception()); }
         }
         // STRIX_BATCH_SHORT_FIRST_ROWS (default 2048; 0 = oldest prompt first): a prompt with at most that many rows left runs
         // its units before longer prompts (oldest such prompt first), so a short request waits for the current unit of a
@@ -1583,12 +1622,11 @@ public:
             try {
                 if(cancel_requested(*prompt)) cancel_prefill(*prompt,false);
                 else if (!run_prompt_group(*prompt) && !run_prompt_windows(*prompt)) {
-                    prompt->prefill->step(serial_rows_per_step_);
-                    if(cancel_requested(*prompt)) cancel_prefill(*prompt,false);
-                    else if (prompt->prefill->done()) complete_prompt(*prompt);
+                    step_single_prompt(*prompt);
                 }
             } catch(const KnownPrefillCancelled&) {cancel_prefill(*prompt,true);}
             catch(const serve::ConstraintError& e) {constraint_failed(*prompt,e);}
+            catch (...) { fail_http_slot(*prompt, std::current_exception()); }
 
             prompt_debt_ms_ += prompt_share_ * std::max(0.0,std::chrono::duration<double, std::milli>(clock::now() - t0).count()-(stats_.service_ms_suspended-suspended_before));
         }
@@ -1608,6 +1646,7 @@ public:
                 const std::array<std::uint32_t,1> token{s.pending.predicted_token()};
                 emitted(s,token);
             } catch(const serve::ConstraintError& e) {constraint_failed(s,e);}
+            catch (...) { fail_http_slot(s, std::current_exception()); }
             // Serial work pays prompt debt too, including when no ordinary slot
             // remains to run the cohort timing scope below.
             prompt_debt_ms_-=std::chrono::duration<double,std::milli>(clock::now()-serial_start).count();
@@ -1617,6 +1656,15 @@ public:
         else (void)run_decode_round();
     }
 private:
+    void step_single_prompt(Slot& s) {
+        try {
+            s.prefill->step(serial_rows_per_step_);
+            if (cancel_requested(s)) cancel_prefill(s, false);
+            else if (s.prefill->done()) complete_prompt(s);
+        } catch (const KnownPrefillCancelled&) { throw; }
+        catch (const serve::ConstraintError&) { throw; }
+        catch (...) { fail_http_slot(s, std::current_exception()); }
+    }
     // The wide copy cycle runs only for the one live request of the whole runner: no other slot holds a request
     // (decoding, prefilling or paused), so the shared tail-owner scratch it uses cannot alias another slot's prompt.
     [[nodiscard]] bool wide_allowed(const Slot& s) const {
@@ -1643,6 +1691,17 @@ private:
             live.push_back(s.get());
         }
         if (live.empty()) return false;
+        try {
+            return decode_live(live);
+        } catch (...) {
+            if (!options_.http_serve) throw;
+            const auto message = exception_message(std::current_exception());
+            for (auto* s : live) if (s->active || s->request.on_finish) retire_failed_slot(*s, message);
+            return false;
+        }
+    }
+    bool decode_live(const std::vector<Slot*>& live) {
+        using clock = std::chrono::steady_clock;
         if (context_peers || any_peers_) {
             std::vector<const HipMtpGreedyRuntime*> peers;
             for (auto* s : live) if(!s->request.constraint) peers.push_back(s->greedy.get());
@@ -1758,12 +1817,22 @@ private:
         auto results = hip_mtp_greedy_cohort_cycle(members, &stats_.cohort,joint?&joint_:nullptr,joint?&policy_joint_:nullptr);
         runtime_done(results);
         for (std::size_t k = 0; k < live.size(); ++k) live[k]->result.shared_execution.add(results[k].shared);
-        for (std::size_t k = 0; k < live.size(); ++k) apply(*live[k], std::move(results[k]));
+        for (std::size_t k = 0; k < live.size(); ++k) {
+            try { apply(*live[k], std::move(results[k])); }
+            catch (...) { fail_http_slot(*live[k], std::current_exception()); }
+        }
         receipt_done();
         return true;
     }
 
 public:
+    // A failed scheduling turn may have touched both a parked prompt and a shared forward.
+    // Keep the listener running and leave the affected owners out of later admissions.
+    void recover_http_step(std::exception_ptr failure) {
+        const auto message = exception_message(failure);
+        for (auto& s : slots_) if (s->active || s->request.on_finish) retire_failed_slot(*s, message);
+    }
+
     // Snapshot committed frontiers on the engine thread before dropping any slot state.
     void fail_requests(const std::string& error) {
         for (auto& s : slots_) {
@@ -1794,6 +1863,54 @@ public:
     }
 
 private:
+    static std::string exception_message(const std::exception_ptr& error) {
+        try { std::rethrow_exception(error); }
+        catch (const std::exception& e) { return *e.what() ? e.what() : "engine failure"; }
+        catch (...) { return "engine failure"; }
+    }
+    void fail_http_slot(Slot& s, const std::exception_ptr& error) {
+        if (!options_.http_serve) std::rethrow_exception(error);
+        retire_failed_slot(s, exception_message(error));
+    }
+    // A submitter belongs to its request, even when the next launch needs its scratch quiescent.
+    bool drain_prompt_submitters(Slot* solo = nullptr, std::span<Slot* const> group = {}) {
+        for (auto& s : slots_) if (s->prefilling) {
+            try { s->prefill->drain_for_handoff(); }
+            catch (...) {
+                if (s.get() == solo) throw;
+                fail_http_slot(*s, std::current_exception());
+                if (!group.empty() && (!prompt_groups_on() || std::find(group.begin(), group.end(), s.get()) != group.end()))
+                    return false;
+            }
+        }
+        return true;
+    }
+    void retire_failed_slot(Slot& s, const std::string& error) {
+        s.retired = true;
+        if (&s == slots_.front().get()) prompt_group_failed_ = true;
+        if (s.prefill) s.prefill->wait_for_failed_request();
+        s.target->guard()->recover_or_fail_stop();
+        auto& tiled = s.parents->tiled;
+        if (tiled.block_owner) tiled.block_owner->abandon_pending_completion();
+        for (const auto& tail : tiled.tails) tail.owner->abandon_pending_completion();
+        if (s.window) for (const auto rows : {2U, 4U, 8U, 16U, 32U})
+            if (const auto owner = s.window->owner_with_rows(rows)) owner->abandon_pending_completion();
+        end_prefix_entries(s);
+        s.waits_for = nullptr;
+        s.join_wait = {};
+        s.prefill.reset();
+        s.prefilling = false;
+        s.active = false;
+        s.greedy.reset();
+        s.pending = {};
+        if (s.runtime) s.runtime->cancel();
+        s.result.finish = "execution_failure";
+        s.result.error = error;
+        if (s.request.constraint) s.result.constraint = s.request.constraint->verdict(s.result.finish);
+        auto finish_request = std::move(s.request.on_finish);
+        s.request = {};
+        if (finish_request) finish_request(s.result);
+    }
     bool prefix_join_on() const noexcept {return options_.prefix_cache_inflight && interleave_ && !service_mode_;}
     // A prefilling unconstrained prompt may serve joins from now on (shared directory; lane = slot index).
     void announce_prefix(Slot& s) {
@@ -1894,6 +2011,7 @@ private:
         // Retire earlier idle users before borrowing shared tail D1/union storage.
         // The parked owner (and every physical alias of its lease) remains untouched.
         for(auto& s:slots_) {
+            if (s->retired) continue;
             for(const auto& tail:s->parents->tiled.tails) if(!paused_owner_->aliases_prefill_storage(*tail.owner))
                 tail.backend->finish_deferred();
             if(s->window) for(const auto rows:{2U,4U,8U,16U,32U})
@@ -1902,14 +2020,14 @@ private:
         }
         // The pump supplies requests only; preparation never executes prompt work.
         const auto can_prepare=[&] {
-            const auto free=std::find_if(slots_.begin(),slots_.end(),[](const auto& s){return !s->active;});
+            const auto free=free_slot();
             if(free==slots_.end()) return false;
             if(!slot_disjoint(**free)) {skip(nullptr,"alias");return false;}
             return true;
         };
         if(admission_pump_) admission_pump_([&](MtpBatchRequest request) {
             if(!service_mode_ || !has_free_slot()) throw std::logic_error("invalid service admission");
-            const auto free=std::find_if(slots_.begin(),slots_.end(),[](const auto& s){return !s->active;});
+            const auto free=free_slot();
             if(!slot_disjoint(**free)) throw std::logic_error("service admission aliases parked slot");
             prepare_admission(std::move(request));
         },can_prepare);
@@ -1951,7 +2069,7 @@ private:
             metrics.nested_ms+=ms;s.result.service.nested_ms+=ms;
             if(cancel_requested(s)) cancel_prefill(s,false);else complete_prompt(s);
         } catch(const serve::ConstraintError& e) {constraint_failed(s,e);}
-        catch(...) {leaf_=nullptr;throw;}
+        catch (...) { leaf_=nullptr; fail_http_slot(s, std::current_exception()); }
         leaf_=nullptr;
     }
     void execute_prefill(HipKnownPrefixWindow& owner,const std::function<void()>& job,Slot* slot,std::span<Slot* const> group={}) {
@@ -1960,7 +2078,7 @@ private:
         BatchServiceLookahead lookahead(lookahead_);
         auto* telemetry=current_execution_telemetry();const auto correlation=current_execution_correlation();
         // STRIX_PREFILL_PIPE: retire every earlier submitter before another host owns native scratch.
-        for(auto& s:slots_) if(s->prefilling) s->prefill->drain_for_handoff();
+        if (slot) (void)drain_prompt_submitters(slot);
         struct Events {
             std::vector<hipEvent_t> ring;
             explicit Events(unsigned count):ring(count,nullptr) {
@@ -2087,7 +2205,8 @@ private:
         if (!prompt_groups_on() || prefilling() < 2U) return none("single");
         const auto& lead = slots_.front()->parents->tiled;
         auto& group = lead.group ? *lead.group : *lead.blocks;
-        const auto budget = std::min(lead.group ? lead.group_owner->logical_rows() : lead.rows, prompt_batch_rows());
+        auto& group_owner = lead.group ? *lead.group_owner : *lead.block_owner;
+        const auto budget = std::min(group_owner.logical_rows(), prompt_batch_rows());
         const bool backlog = !has_free_slot() && has_queued_work_ && has_queued_work_() >= prompt_batch_auto_queue();
         const std::size_t max_members = prompt_batch_auto() && !backlog ? prompt_batch_idle_members : SIZE_MAX;
         struct Member { Slot* slot; TiledMtpPrompt::Block block; };
@@ -2095,7 +2214,15 @@ private:
         std::uint32_t rows = 0;
         const auto join = [&](Slot& s) {
             if(s.waits_for || members.size() >= max_members) return;
-            const auto block = s.prefill->next_block();
+            std::optional<TiledMtpPrompt::Block> block;
+            try {
+                block = s.prefill->next_block();
+                if (block && !group.supports_prompt_group(*block->backend, block->rows, block->final)) {
+                    if (why) std::cerr << "prompt group skip: incompatible block, slot order " << s.order << std::endl;
+                    return;
+                }
+            }
+            catch (...) { fail_http_slot(s, std::current_exception()); return; }
             // A balanced partial block (STRIX_QPF2K_SCHED bit 4: the first rows of the prompt's T owner) is a segment like
             // any other block: the segmented forward runs each segment's rows as its block alone. STRIX_PROMPT_BATCH_PARTIAL=0
             // runs partial blocks alone as before (then the first unit of every prompt below T rows is never grouped).
@@ -2108,31 +2235,51 @@ private:
             rows += block->rows;
         };
         join(oldest);
+        if (!oldest.prefilling) return true; // The oldest request failed during planning.
         if (members.empty()) return none("oldest", budget);
         std::vector<Slot*> others;
         for (auto& s : slots_) if (s.get() != &oldest && s->prefilling && !s->waits_for) others.push_back(s.get());
         std::sort(others.begin(), others.end(), [](const Slot* a, const Slot* b) { return a->order < b->order; });
         for (auto* s : others) join(*s);
+        if (!prompt_groups_on()) return none("owner-retired");
         if (members.size() < 2U) return none("alone", budget, others.size());
         const auto t0 = std::chrono::steady_clock::now();
+        std::vector<Slot*> group_slots;
+        for (const auto& member : members) group_slots.push_back(member.slot);
         std::vector<HipKnownPromptBackend::GroupMember> group_members;
         group_members.reserve(members.size());
-        for (const auto& m : members)
-            group_members.push_back({m.block.backend, m.slot->prefill->block_tokens(m.block), m.slot->prefill->position(), m.block.final,
-                m.slot->prefill->block_observer(m.block.rows), m.block.rows != m.block.backend->logical_rows()});
+        for (const auto& m : members) {
+            try {
+                group_members.push_back({m.block.backend, m.slot->prefill->block_tokens(m.block), m.slot->prefill->position(), m.block.final,
+                    m.slot->prefill->block_observer(m.block.rows), m.block.rows != m.block.backend->logical_rows()});
+                m.slot->prefill->before_writer(group_owner.producer_stream());
+            } catch (...) { fail_http_slot(*m.slot, std::current_exception()); return true; }
+        }
+        if (worker_ && !drain_prompt_submitters(nullptr, group_slots)) return true;
         std::vector<std::vector<float>> logits;
-        for(const auto& member:members)
-            member.slot->prefill->before_writer((lead.group?lead.group_owner:lead.block_owner)->producer_stream());
         const auto launch=[&]{logits=HipKnownPromptBackend::execute_group(group,group_members,options_.http_serve);};
-        std::vector<Slot*> group_slots;for(const auto& member:members) group_slots.push_back(member.slot);
-        if(worker_) execute_prefill(*(lead.group?lead.group_owner:lead.block_owner),launch,nullptr,group_slots);else launch();
+        try {
+            if(worker_) execute_prefill(group_owner,launch,nullptr,group_slots);else launch();
+        } catch (const HipKnownPromptBackend::GroupMemberError& e) {
+            fail_http_slot(*members[e.index].slot, std::current_exception());
+            return true;
+        } catch (...) {
+            if (!options_.http_serve) throw;
+            prompt_group_failed_ = true;
+            group_owner.abandon_pending_completion();
+            if (!lead.group) slots_.front()->retired = true;
+            const auto message = exception_message(std::current_exception());
+            for (auto* s : group_slots) retire_failed_slot(*s, message);
+            return true;
+        }
         for (std::size_t k = 0; k < members.size(); ++k) {
             auto& s = *members[k].slot;
             try {
-                s.prefill->finish_block(members[k].block, logits[k], true,(lead.group?lead.group_owner:lead.block_owner).get());
+                s.prefill->finish_block(members[k].block, logits[k], true,&group_owner);
                 if(cancel_requested(s)) cancel_prefill(s,false);
                 else if (s.prefill->done()) complete_prompt(s);
             } catch(const serve::ConstraintError& e) {constraint_failed(s,e);}
+            catch (...) { fail_http_slot(s, std::current_exception()); }
         }
         ++stats_.prompt_groups;
         stats_.grouped_blocks += members.size();
@@ -2167,18 +2314,33 @@ private:
         for (auto& s : slots_) if (s.get() != &oldest && s->prefilling && !s->waits_for) others.push_back(s.get());
         std::sort(others.begin(), others.end(), [](const Slot* a, const Slot* b) { return a->order < b->order; });
         for (auto* s : others) {
-            const auto rows = s->prefill->window_unit();
+            std::uint32_t rows = 0;
+            try { rows = s->prefill->window_unit(); }
+            catch (...) { fail_http_slot(*s, std::current_exception()); continue; }
             if (!rows) continue;
             members.push_back(s);
             requests.push_back({s->prefill->window_verifier(), &s->prefill->session(), s->prefill->window_tokens(rows)});
         }
-        for(auto* member:members) member->prefill->before_writer(nullptr);
-        auto tickets=HipMtpWindowVerifier::prompt_rows_cohort(requests);
+        for (auto* member : members) {
+            try { member->prefill->before_writer(nullptr); }
+            catch (...) { fail_http_slot(*member, std::current_exception()); return true; }
+        }
+        std::vector<std::vector<HipMtpTargetHiddenTicket>> tickets;
+        try { tickets = HipMtpWindowVerifier::prompt_rows_cohort(requests); }
+        catch (...) {
+            if (!options_.http_serve) throw;
+            const auto message = exception_message(std::current_exception());
+            for (auto* s : members) retire_failed_slot(*s, message);
+            return true;
+        }
         for (std::size_t k = 0; k < members.size(); ++k) {
             auto& s = *members[k];
-            s.prefill->finish_window(std::move(tickets[k]),members.size()>1U);
-            if(cancel_requested(s)) cancel_prefill(s,false);
-            else if (s.prefill->done()) complete_prompt(s);
+            try {
+                s.prefill->finish_window(std::move(tickets[k]),members.size()>1U);
+                if(cancel_requested(s)) cancel_prefill(s,false);
+                else if (s.prefill->done()) complete_prompt(s);
+            } catch (const serve::ConstraintError& e) { constraint_failed(s, e); }
+            catch (...) { fail_http_slot(s, std::current_exception()); }
         }
         ++stats_.prompt_window_cohorts;
         stats_.prompt_window_members += members.size();
@@ -2358,6 +2520,7 @@ private:
     const ActivatedMtpDraftPlan& activated_;
     EnableDraft enable_draft_;
     std::vector<std::unique_ptr<Slot>> slots_;
+    bool prompt_group_failed_ = false;
     // In-flight prompts that may serve a join (lane = index in slots_). 64-token blocks, min 64: a plan-certified
     // boundary is a multiple of T >= 64, so no join below 64 shared tokens exists.
     serve::PrefixDirectory prefix_inflight_{64, 64};

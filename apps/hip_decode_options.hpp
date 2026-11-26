@@ -34,6 +34,7 @@
 #include "strix/mtp_draft_profiles.hpp"
 #include "strix/onfly_i4.hpp"
 #include "qwen_mtp_bundle.hpp"
+#include "strix/session/drafter_discovery.hpp"
 #include "strix/session/speculation_default.hpp"
 #include "strix/spec/wide_window.hpp"
 #include "strix/mtp_depth_window_controller.hpp"
@@ -287,7 +288,12 @@ struct Options {
     std::optional<strix::qwen::profile::Name> product_profile_requested;
     strix::qwen::profile::Inputs product_profile_inputs;
     strix::qwen::profile::Resolution product_profile;
+    // Device class (architecture) and the device product identity (device/hip_cost_identity.hpp) the profile ladder reads.
+    std::string profile_device_class, profile_device_product;
     std::string mtp_bundle_path;
+    // A bundle synthesized from a registry drafter has no file: its options (one argument per line) stand in for
+    // the file's text wherever the bundle is identified again (calibration golden identity).
+    std::string mtp_bundle_synthesized;
     // The bundle was selected on the native (non-YaRN) route; the automatic prompt route may keep it.
     bool mtp_native_bundle = false;
     std::string yarn_decode_source = "explicit";
@@ -2136,17 +2142,39 @@ inline std::span<const strix::serve::config_file::Option> hip_serve_config_optio
 
 enum class DecodeAssets { verify, defer };
 
+// The spelling of the admitted execution of one Qwen HIP prefill (strix::profile::ladder_execution): backend, device
+// product identity, priced workload (prompt, context capacity, one lane, prefill chunk and rows, generated tokens) and
+// the effective timing settings outside the lever table. Empty while the device product or the prompt is unknown
+// (no ordinary timing row decides such a run).
+inline std::string qwen_ladder_execution(const Options& o, std::uint64_t prompt_tokens) {
+    const std::uint64_t capacity = std::max<std::uint64_t>(o.context_tokens, prompt_tokens);
+    const auto chunk = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+        o.known_prefix_prefill_rows ? o.known_prefix_prefill_rows : prompt_tokens, 0xFFFFFFFFULL));
+    const std::string settings = "rotary-factor=" + std::to_string(o.rotary.factor()) + "|mtp=" + (o.mtp.enabled ? "1" : "0");
+    return strix::profile::ladder_execution({"hip", o.profile_device_product,
+        {prompt_tokens, capacity, 1U, chunk, chunk, 0U, 0U, static_cast<std::uint32_t>(o.generate_tokens)}, settings});
+}
+// The profile of one prefill of `prompt_tokens`: the CLI prompt, or one HTTP request's prompt (same code, same
+// regime: phase, prompt length as context, one lane, device class, execution key).
+inline strix::qwen::profile::Resolution resolve_request_product_profile(Options& o, std::uint64_t prompt_tokens) {
+    const std::string execution = qwen_ladder_execution(o, prompt_tokens);
+    auto inputs = o.product_profile_inputs;
+    inputs.regime = strix::profile::Regime{strix::profile::Phase::prefill, prompt_tokens, 1, o.profile_device_class, execution};
+    return strix::qwen::profile::resolve(
+        o.product_profile_requested.value_or(strix::qwen::profile::Name::standard), inputs);
+}
+
 inline Options parse_options(
     int argc,
     char** argv, bool defer_qpf2k_defaults = false, std::string bundle_path = {},
-    DecodeAssets assets = DecodeAssets::verify, std::string_view device_class = {}) {
+    DecodeAssets assets = DecodeAssets::verify, std::string_view device_class = {}, std::string_view device_product = {}) {
     if (bundle_path.empty()) {  // --serve-config FILE: validated and expanded before anything is read or loaded
         auto file = strix::serve::config_file::expand(argc, argv, hip_serve_config_options());
         if (file.print) { std::cout << file.effective << std::flush; std::exit(0); }
         if (file.used) {
             std::vector<char*> pointers;
             for (auto& arg : file.argv) pointers.push_back(arg.data());
-            return parse_options(static_cast<int>(pointers.size()), pointers.data(), defer_qpf2k_defaults, bundle_path, assets, device_class);
+            return parse_options(static_cast<int>(pointers.size()), pointers.data(), defer_qpf2k_defaults, bundle_path, assets, device_class, device_product);
         }
     }
     if (argc>=2 && bundle_path.empty()) {
@@ -2157,8 +2185,8 @@ inline Options parse_options(
         bool baseline=inherited_baseline && std::string_view(inherited_baseline)=="1";
         std::vector<std::string> expanded;
         // The plain production command: MODEL, prompt tokens, a generation budget and nothing that owns a route.
-        bool no_mtp=false, plain=true, value_next=false;
-        std::size_t prompt_tokens=0;
+        bool no_mtp=false, plain=true, value_next=false, http_serve=false, prompt_ids_file=false, leading=true;
+        std::size_t prompt_tokens=0, leading_tokens=0;
         std::uint64_t generate=0;
         for (int i=0;i<argc;++i) {
             const std::string arg=argv[i];
@@ -2169,9 +2197,16 @@ inline Options parse_options(
                     if (argv[i-1]==std::string_view("--generate")) generate=std::strtoull(arg.c_str(),nullptr,10);
                 } else if (arg=="--generate" || arg=="--context") value_next=true;
                 else if (arg.starts_with("--generate=")) generate=std::strtoull(arg.c_str()+11,nullptr,10);
-                else if (arg.starts_with("--")) plain &= arg.starts_with("--context=") || arg=="--unqualified-context" ||
-                    arg=="--print-effective-config" || arg=="--mtp-bundle" || arg.starts_with("--mtp-bundle=");
-                else ++prompt_tokens;
+                else if (arg.starts_with("--")) {
+                    leading=false;
+                    http_serve |= arg=="--http-serve";
+                    prompt_ids_file |= arg=="--prompt-ids";
+                    plain &= arg.starts_with("--context=") || arg=="--unqualified-context" ||
+                        arg=="--print-effective-config" || arg=="--mtp-bundle" || arg.starts_with("--mtp-bundle=");
+                } else {
+                    ++prompt_tokens;
+                    if (leading) ++leading_tokens;
+                }
             }
             if (arg=="--mtp-bundle" || arg.starts_with("--mtp-bundle=")) {
                 if (!bundle.empty()) throw std::invalid_argument("duplicate --mtp-bundle");
@@ -2198,22 +2233,73 @@ inline Options parse_options(
         speculation.environment=std::getenv(strix::session::speculation_environment);
         speculation.baseline=baseline;
         speculation.explicit_speculation=explicit_mtp || !bundle.empty();
-        // 16 calibration rows and the first generated row need 17 prompt tokens.
-        speculation.explicit_route=!yarn && (!plain || prompt_tokens<17U || generate<2U);
+        // 16 calibration rows and the first generated row need 17 prompt tokens. The HTTP server's command line
+        // carries the calibration prompt as its leading ids (or --prompt-ids FILE); its other options do not own
+        // the route, because the server always runs the tiled MTP route and takes the same drafter as the CLI.
+        speculation.explicit_route=!yarn && (http_serve ? ((leading_tokens<17U && !prompt_ids_file) || generate<1U)
+            : (!plain || prompt_tokens<17U || generate<2U));
+        const bool bundle_explicit=!bundle.empty();
         const std::string discovered=std::string(argv[1])+".mtp-bundle.json";
-        speculation.assets_found=!bundle.empty() || std::filesystem::exists(discovered);
-        const auto decision=strix::session::resolve_speculation_default(capability,speculation);
+        const bool bundle_json_present=std::filesystem::exists(discovered);
+        // Third source: a registry drafter whose sidecar sits under the model directory (shared discovery).
+        std::vector<std::string> rejected_drafters;
+        std::optional<strix::session::DrafterDiscovery> profile_drafter;
+        // The YaRN route keeps its own contract: only an explicit or adjacent bundle selects MTP there.
+        if (bundle.empty() && !bundle_json_present && !explicit_mtp && !no_mtp && !yarn)
+            profile_drafter=strix::session::discover_drafter_sidecar(argv[1],mtp_drafter_candidates(),
+                mtp_recommended_draft_profile,&rejected_drafters);
+        speculation.assets_found=!bundle.empty() || bundle_json_present || profile_drafter.has_value();
+        auto decision=strix::session::resolve_speculation_default(capability,speculation);
         const bool off=yarn_bundle_serial_retry || (yarn && env && std::string_view(env)=="0") ||
             decision.source=="cli-opt-out" || decision.source=="env-opt-out";
-        if (!explicit_mtp && bundle.empty() && !off && decision.source=="default") bundle=discovered;
-        if (!yarn && !yarn_bundle_serial_retry && decision.report_fallback)
-            std::cerr << strix::session::speculation_fallback_line(capability,"no drafter bundle at "+discovered) << '\n';
+        std::optional<MtpBundleArguments> profile_bundle;
+        bool profile_bundle_made=false;
+        std::string synthesized_text;
+        std::string fallback_detail="no drafter bundle at "+discovered;
+        if (!explicit_mtp && bundle.empty() && !off && decision.source=="default") {
+            if (bundle_json_present) bundle=discovered;
+            else if (profile_drafter) {
+                // The target's pins are its own content hashes (persistent cache: one full read per file); a
+                // discovered drafter therefore pins the draft exactly and trusts the target file it sits beside.
+                try {
+                    const auto target=hash_single_model_content_file({"model",argv[1]},FileHashPolicy::cached);
+                    const auto directory=std::filesystem::path(argv[1]).parent_path();
+                    MtpProfileBundleInputs inputs;
+                    inputs.sidecar=profile_drafter->path;
+                    inputs.target_sha256=model_content_identity_hex(target.file_sha256);
+                    inputs.target_content=model_content_identity_hex(target.content_identity);
+                    if (std::filesystem::is_directory(directory/"draft-vocab")) inputs.vocabulary_dir=directory/"draft-vocab";
+                    profile_bundle=profile_mtp_bundle_arguments(*find_mtp_draft_profile(profile_drafter->name),inputs);
+                    bundle=(directory/("mtp-profile-"+profile_drafter->name+".bundle")).string();
+                    profile_bundle_made=true;
+                } catch (const std::exception& error) {
+                    fallback_detail="drafter "+profile_drafter->path.string()+" found but the target cannot be pinned: "+error.what();
+                    decision={false,"assets-missing",true};
+                }
+            }
+        }
+        if (!yarn && !yarn_bundle_serial_retry && decision.report_fallback) {
+            if (!profile_drafter && !bundle_json_present) {
+                fallback_detail+=" and no registry drafter beside the model (MTP/"+std::string(mtp_draft_profiles[0].logical_name)+")";
+                for (const auto& note:rejected_drafters) fallback_detail+="; "+note;
+            }
+            std::cerr << strix::session::speculation_fallback_line(capability,fallback_detail) << '\n';
+        }
         if (yarn && !explicit_mtp && !off && bundle.empty() && env && std::string_view(env)=="1")
             throw std::invalid_argument("STRIX_QWEN_YARN_MTP=1 requires an MTP bundle");
         if ((!bundle.empty() || yarn_bundle_serial_retry) && !explicit_mtp) {
             try {
                 if (!off) {
-                    auto loaded=read_mtp_bundle(bundle);
+                    auto loaded=profile_bundle ? std::move(*profile_bundle) : read_mtp_bundle(bundle);
+                    if (profile_bundle_made) for (const auto& argument:loaded.argv) synthesized_text+=argument+"\n";
+                    // One line names the drafter that was taken and how it was found (once per process).
+                    std::string sidecar_file=bundle;
+                    for (std::size_t k=0;k+1<loaded.argv.size();++k) if (loaded.argv[k]=="--mtp-sidecar") sidecar_file=loaded.argv[k+1];
+                    const std::string how=bundle_explicit ? "bundle given by --mtp-bundle "+bundle
+                        : profile_drafter && bundle!=discovered ? profile_drafter->how
+                        : "bundle "+discovered+" beside the model";
+                    const auto line=strix::session::drafter_discovery_line(sidecar_file,how);
+                    if (!yarn_bundle_serial_retry && strix::session::announce_drafter_once(line)) std::cerr << line << '\n';
                     expanded.insert(expanded.end(),loaded.argv.begin(),loaded.argv.end());
                     // The native tiled prompt qualifies the predictor on its first rows.
                     if (!yarn && std::find(loaded.argv.begin(),loaded.argv.end(),"--mtp-calibration-rows")==loaded.argv.end())
@@ -2222,8 +2308,9 @@ inline Options parse_options(
                 std::vector<char*> pointers;
                 for (auto& arg:expanded) pointers.push_back(arg.data());
                 auto result=parse_options(static_cast<int>(pointers.size()),pointers.data(),defer_qpf2k_defaults,
-                    off?"serial-retry":bundle, assets, device_class);
+                    off?"serial-retry":bundle, assets, device_class, device_product);
                 result.mtp.runtime_automatic = !off && decision.source=="default";
+                if (!off) result.mtp_bundle_synthesized=synthesized_text;
                 if (off) {result.mtp_bundle_path.clear();result.yarn_decode_source="env";}
                 else if (assets == DecodeAssets::verify)
                     verify_mtp_bundle_sidecar(result.mtp.sidecar,result.mtp.sidecar_sha256,result.mtp.sidecar_bytes);
@@ -3846,11 +3933,17 @@ inline Options parse_options(
     options.product_profile_inputs.max_prompt_tokens =
         options.tokens.empty() ? options.context_tokens : static_cast<std::uint64_t>(options.tokens.size());
     options.product_profile_inputs.regimes = strix::qwen::profile::fast_regimes;
-    // A serving capacity is not a request's actual prompt length.
-    options.product_profile_inputs.regime = options.http_serve ? strix::profile::startup_prefill_regime(device_class)
-        : strix::profile::Regime{strix::profile::Phase::prefill, options.tokens.size(), 1, device_class};
-    options.product_profile = strix::qwen::profile::resolve(
-        options.product_profile_requested.value_or(strix::qwen::profile::Name::standard), options.product_profile_inputs);
+    options.profile_device_class = std::string(device_class);
+    options.profile_device_product = std::string(device_product);
+    // A serving capacity is not a request's actual prompt length: HTTP keeps the startup regime (no execution key);
+    // a request resolves with resolve_request_product_profile() over its own prompt.
+    if (options.http_serve) {
+        options.product_profile_inputs.regime = strix::profile::startup_prefill_regime(device_class);
+        options.product_profile = strix::qwen::profile::resolve(
+            options.product_profile_requested.value_or(strix::qwen::profile::Name::standard), options.product_profile_inputs);
+    } else {
+        options.product_profile = resolve_request_product_profile(options, options.tokens.size());
+    }
     // KV precision: native BF16 in every tier (no FP8 here, so turbo keeps BF16 with a note); only --kv changes it.
     options.kv = strix::session::kv_precision::resolve(options.product_profile.profile, options.kv_request,
         strix::qwen::profile::kKvCaps);

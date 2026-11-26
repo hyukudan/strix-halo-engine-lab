@@ -184,6 +184,15 @@ void deepseek_cases() {
         }, "DeepSeek drafter embedding");
 }
 
+// Wave07 MiniMax embedding, retained as an oracle for the shared BF16 gather.
+__global__ void minimax_embed_incumbent(const std::uint16_t* table, const std::uint32_t* tokens, float* out) {
+    constexpr auto width = strix::minimax::rtxpf::cuda::kHidden;
+    const auto* src = table + static_cast<std::size_t>(tokens[blockIdx.x]) * width;
+    auto* dst = out + static_cast<std::size_t>(blockIdx.x) * width;
+    for (unsigned i = threadIdx.x; i < width; i += 256)
+        dst[i] = __uint_as_float(static_cast<std::uint32_t>(src[i]) << 16U);
+}
+
 void bf16_cases() {
     constexpr unsigned glm_width = 4096U;
     const auto weights = plain16(glm_width, false);
@@ -196,7 +205,7 @@ void bf16_cases() {
     constexpr unsigned mm_width = strix::minimax::rtxpf::cuda::kHidden;
     check_incumbent<float>(Form::bf16_to_f32, mm_width, 1U, plain16(mm_width, false),
         [](const std::uint16_t* table, const std::uint32_t* ids, float* out, float*, std::uint32_t*) {
-            incumbent::minimax::embed_kernel<<<kRows, 256>>>(table, ids, out);
+            minimax_embed_incumbent<<<kRows, 256>>>(table, ids, out);
         }, "MiniMax embedding");
 }
 

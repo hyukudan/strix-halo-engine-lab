@@ -230,6 +230,50 @@ void test_selection() {
 
 // Every committed decision row names the current consumer arithmetic: bumping a resident Q8_0 route's revision
 // Low-bit qualification arms: one shared policy per mix, HIP consumers only, FAST or TURBO only, EXACT untouched.
+void test_strixpack_selection() {
+    const auto& lever = weight::kAttentionHeadSP4Lever;
+    const weight::WeightLoadScope scope{weight::Backend::hip, "gfx1151", {}, {}, {}, {}};
+    for (const auto tier : {profile::Name::fast, profile::Name::turbo}) {
+        mini::MiniWeightOptions options;
+        options.tier.profile = tier;
+        options.tier.env = [](const char*) -> const char* { return nullptr; };
+        auto pending = mini::resolve_mini_resident_weight_load(tier, options, scope);
+        require(pending.storage != weight::kSP4WeightStorage && pending.strixpack && !pending.strixpack->refused &&
+                    pending.strixpack->reason() == "loader not present",
+                "pending SP storage keeps the incumbent and records why");
+        const auto default_receipt = mini::resolve_mini_profile(options, true);
+        require(default_receipt.find(lever.name) == nullptr, "unrequested SP rows stay out of the effective config");
+        options.tier.allow_pending = true;
+        const auto inspection = mini::resolve_mini_profile(options, true);
+        require(inspection.find(lever.name) && inspection.find(lever.name)->status == profile::Status::pending,
+                "candidate inspection shows pending SP storage");
+        options.tier.allow_pending = false;
+
+        options.tier.cli.emplace_back(lever.name, lever.target);
+        auto plan = mini::resolve_mini_resident_weight_load(tier, options, scope);
+        const auto resolution = mini::resolve_mini_profile(options, false);
+        const auto* entry = resolution.find(lever.name);
+        bool loaded = false, refused = false;
+        std::ostringstream receipt;
+        try {
+            static_cast<void>(mini::load_mini_weight_pack(plan, tier, options, scope, {}, {}, nullptr, receipt,
+                [&](const mini::MiniLowBitRows&) { loaded = true; return 0; }));
+        } catch (const std::invalid_argument& error) {
+            refused = std::string_view(error.what()).find("refused: loader not present") != std::string_view::npos;
+        }
+        require(plan.strixpack && weight::same_id(plan.strixpack->policy, weight::kAttentionHeadSP4Policy.id) &&
+                    plan.reason == "refused: loader not present" && refused && !loaded,
+                "the resolved SP profile request reaches the load plan and blocks the incumbent loader");
+        require(entry && entry->value == "off" && entry->reason == plan.reason,
+                "effective profile receipt cannot claim SP when the loader is absent");
+        options.tier.cli.clear();
+        options.qualify = &weight::kAttentionHeadSP4Policy;
+        const auto qualified = mini::resolve_mini_resident_weight_load(tier, options, scope);
+        require(qualified.strixpack && qualified.strixpack->refused && qualified.reason == plan.reason,
+                "explicit qualification uses the same profile-to-plan path");
+    }
+}
+
 void test_lowbit_arms() {
     weight::WeightLoadScope hip{weight::Backend::hip, "gfx1151", "hip-7.1", mini::kMiniWeightRegime, digest(1), digest(2)};
     auto cuda = hip;
@@ -273,6 +317,16 @@ void test_lowbit_arms() {
             "legacy Q8_0 key selects the Q8_0 arm");
     require(mini::resolve_mini_resident_weight_load(profile::Name::fast, q8, cuda).storage == weight::kQ8WeightStorage,
             "Q8_0 arm on CUDA");
+    mini::MiniWeightOptions attention_q8;
+    const auto attention_q8_key = []() { return std::string_view("weights.attention.q8_0@1"); };
+    require(mini::parse_mini_weight_option(attention_q8, "--qualify-weights", attention_q8_key, true),
+            "explicit attention-only Q8_0 arm");
+    const auto attention_q8_plan = mini::resolve_mini_resident_weight_load(profile::Name::fast, attention_q8, hip);
+    require(attention_q8_plan.policy == weight::kAttentionQ8Policy.id &&
+                attention_q8_plan.storage == weight::kQ8WeightStorage &&
+                attention_q8_plan.head_storage == weight::kBf16WeightStorage &&
+                attention_q8_plan.status == profile::Status::unqualified,
+            "attention-only arm keeps the BF16 head and requires qualification");
     for (const char* key : {"weights.attention_head.q6_g64@1", "weights.attention_head.q4_g64@1"}) {
         mini::MiniWeightOptions arm;
         const auto value = [&]() { return std::string_view(key); };
@@ -459,14 +513,28 @@ void test_capacity_and_pack_fallback() {
 }
 
 void test_calibrated_row_speculation_admission() {
-    require(mini::mini_calibrated_row_allowed_for_cli(true, false, false),
-            "serial calibrated decode remains available without speculation");
-    require(!mini::mini_calibrated_row_allowed_for_cli(true, true, false),
-            "lookup or verify speculation keeps the incumbent target for every verify width");
-    require(!mini::mini_calibrated_row_allowed_for_cli(true, false, true),
-            "drafter speculation keeps the incumbent target for every verify width");
-    require(!mini::mini_calibrated_row_allowed_for_cli(false, false, false),
-            "an unset calibrated lever remains off");
+    // One rule for the command line and the server (mini_speculation_policy): speculation and a requested low-bit row
+    // never share a run; the explicit request wins.
+    constexpr auto none = mini::mini_speculation_policy(false, false, true);
+    require(!none.admitted && none.lowbit && none.reason.empty(), "no speculation: the low-bit row stays requested");
+    constexpr auto row = mini::mini_speculation_policy(true, false, true);
+    require(!row.admitted && row.lowbit && row.reason == mini::kMiniSpeculationLowbitDecline,
+            "row default speculation yields to a requested low-bit row (plain decode on its target)");
+    constexpr auto flag = mini::mini_speculation_policy(true, true, true);
+    require(flag.admitted && !flag.lowbit && flag.reason == mini::kMiniLowbitSpeculationDecline,
+            "explicit speculation declines the low-bit row (incumbent weights)");
+    constexpr auto plain = mini::mini_speculation_policy(true, false, false);
+    require(plain.admitted && !plain.lowbit && plain.reason.empty(), "speculation without a low-bit row is admitted");
+    constexpr auto cuda = mini::mini_speculation_policy(true, true, true, "backend cuda");
+    require(!cuda.admitted && cuda.lowbit && cuda.reason == "backend cuda",
+            "a backend without windows declines and keeps the low-bit row");
+    require(mini::mini_speculation_line(row, 0U) ==
+                "strix-speculation/v1 requested auto source row effective off verify_rows 0 declined "
+                "calibrated low-bit target requested",
+            "the effective speculation line");
+    require(mini::mini_speculation_line(plain, 1U) ==
+                "strix-speculation/v1 requested auto source row effective auto verify_rows 1",
+            "the effective speculation line, admitted");
 }
 
 void test_calibrated_pack_requires_complete_inventory() {
@@ -628,6 +696,7 @@ int main() {
         test_selection();
         test_committed_rows();
         test_lowbit_arms();
+        test_strixpack_selection();
         test_lowbit_receipts();
         test_pack_admission();
         test_capacity_and_pack_fallback();

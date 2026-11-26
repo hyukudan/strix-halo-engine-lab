@@ -21,13 +21,17 @@ inline constexpr unsigned kRefLanes = 256, kWarpLanes = 32, kPerLane = kRefLanes
 template <class Add, class Elem>
 QSA_ORDER_FN float lane_partial(unsigned lam, unsigned count, Add add, Elem e) {
     float x[kPerLane];
+#if defined(__CUDACC__)
 #pragma unroll
+#endif
     for (unsigned j = 0; j < kPerLane; ++j) {
         float s = 0.0F;
         for (unsigned i = lam + kWarpLanes * j; i < count; i += kRefLanes) s = add(s, e(i));
         x[j] = s;
     }
+#if defined(__CUDACC__)
 #pragma unroll
+#endif
     for (unsigned j = 0; j < 4U; ++j) x[j] = add(x[j], x[j + 4U]);
     x[0] = add(x[0], x[2]);
     x[1] = add(x[1], x[3]);

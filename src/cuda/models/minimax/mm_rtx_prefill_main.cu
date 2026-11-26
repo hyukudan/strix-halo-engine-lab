@@ -25,10 +25,13 @@
 //                    listeners, --repeat K times per prompt alternating identity / bp-v1 frames (ABA...): transport,
 //                    codec, import and token reply on the real link, plus its rate
 //   MM_RTX_PROFILE=1 synchronised per-phase times
+#include "strix/minimax/pair_state.hpp"
 #include "strix/pair/state_decls.hpp"
+#include "cuda/core/chain/args.hpp"
 #include "mm_rtx_kernels.cuh"
 #include "mm_rtx_pack.hpp"
 #include "mm_rtx_weights.hpp"
+#include "mm_rtx_index.hpp"
 #include "minimax/rtxpf/fp32_identity.hpp"
 #include "strix/bp_codec.hpp"
 #include "strix/minimax_layercut.hpp"
@@ -45,6 +48,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <condition_variable>
@@ -55,17 +59,21 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace cu = strix::minimax::rtxpf::cuda;
+namespace chain = strix::cuda::core::chain;
 namespace hx = strix::minimax::rtxpf::host;
 namespace fp = strix::minimax::rtxpf;
 using Clock = std::chrono::steady_clock;
 
 namespace {
 
-constexpr unsigned kHidden = 6144, kQ = 8192, kQLocal = 4096, kKV = 512, kKVLocal = 256, kIdxLocal = 256;
+constexpr unsigned kHidden = 6144, kQ = 8192, kQLocal = 4096, kKV = 512, kKVLocal = 256;
 constexpr unsigned kDenseLocal = 6144, kExpertLocal = 1536, kLayers = 60, kExperts = 128, kTopE = 4;
+static_assert(kQ == cu::kQHeads * cu::kHeadDim && kKV == cu::kKvHeads * cu::kHeadDim);
+static_assert(fp::kIndexQuery.stride == cu::kIdxHeads * cu::kHeadDim && fp::kIndexKey.stride == cu::kHeadDim);
 const std::string kP = "language_model.model.";
 
 void ck(cudaError_t e, const char* what) {
@@ -104,12 +112,25 @@ std::vector<std::uint32_t> read_u32(const std::string& path) {
 
 fp::F32Job job(const hx::DevMat& d, std::uint32_t rows) { return {d.trellis, d.suh, d.svh, d.input, d.output, d.bits, rows, 0, 0}; }
 
+std::array<chain::Norm, 2> exchange_norms(const hx::LayerBlob& blob, const std::uint8_t* base) {
+    const auto norm = [base](std::size_t offset) {
+        return chain::Norm{1e-6F, reinterpret_cast<const float*>(base + offset), nullptr, nullptr,
+                           chain::RmsOrder::bank_halving};
+    };
+    return {norm(blob.w_post), norm(blob.w_next)};
+}
+
 struct Runner {
     std::size_t R = 0;  // total rows
     float *h, *hn, *q, *k, *v, *iq, *ik, *attn, *part[2], *g, *u, *ye, *ys, *xt, *raw, *scratch, *scores;
     std::uint32_t *sel, *sel_count, *ids_d, *maps_d, *row_seq;
-    uint2* tiles_d = nullptr;  // 32-row tiles of one sequence each (tiled index scores)
-    unsigned n_tiles = 0;
+    chain::ScalarStore* residual_d = nullptr;
+    cu::MsaPrep msa_prep;
+    cu::select::PickRow* picks_d = nullptr;
+    cu::select::StridedScoreCache index_cache{};
+    cu::select::ScoreSequence* score_sequences_d = nullptr;
+    cu::select::ScoreTile* score_tiles_d = nullptr;
+    unsigned score_tile_count = 0;
     bool attn_legacy = std::getenv("MM_RTX_ATTN_LEGACY") != nullptr;
     bool no_tail = std::getenv("MM_RTX_NO_TAIL") != nullptr;  // A/B: 128-row tiles only (no 64-row tail core)
     // job tables: a pinned ring copied asynchronously (a blocking cudaMemcpy per call stalled the GPU ~20x per layer);
@@ -125,21 +146,28 @@ struct Runner {
     unsigned max_blocks = 1;
 
     void release() {
+        msa_prep.reset();
         for (void* p : {static_cast<void*>(h), static_cast<void*>(hn), static_cast<void*>(q), static_cast<void*>(k), static_cast<void*>(kv_map),
                         static_cast<void*>(iq), static_cast<void*>(ik), static_cast<void*>(attn), static_cast<void*>(part[0]),
                         static_cast<void*>(part[1]), static_cast<void*>(g), static_cast<void*>(u), static_cast<void*>(ye), static_cast<void*>(ys),
                         static_cast<void*>(xt), static_cast<void*>(raw), static_cast<void*>(scratch), static_cast<void*>(scores),
                         static_cast<void*>(sel), static_cast<void*>(sel_count), static_cast<void*>(ids_d), static_cast<void*>(maps_d),
-                        static_cast<void*>(row_seq), static_cast<void*>(tiles_d), static_cast<void*>(jobs_d)})
+                        static_cast<void*>(row_seq), static_cast<void*>(picks_d), static_cast<void*>(score_sequences_d),
+                        static_cast<void*>(score_tiles_d), static_cast<void*>(jobs_d), static_cast<void*>(residual_d)})
             cudaFree(p);
+        score_sequences_d = nullptr;
+        score_tiles_d = nullptr;
+        score_tile_count = 0;
         cudaFreeHost(jobs_h);
         jobs_h = nullptr;
     }
     void alloc(std::size_t rows, unsigned mb) {
+        (void)cu::plan_msa_attention(rows, attn_legacy);
         R = rows;
         max_blocks = mb;
         const std::size_t pairs = R * kTopE;
         h = dalloc<float>(R * kHidden);
+        residual_d = dupload(std::vector<chain::ScalarStore>{{h}});
         hn = dalloc<float>(R * kHidden);
         q = dalloc<float>(R * kQ);
         k = dalloc<float>(2 * R * kKV);  // k then v, contiguous: one grouped call writes both (kv_map)
@@ -153,8 +181,8 @@ struct Runner {
                 }
             kv_map = dupload(m);
         }
-        iq = dalloc<float>(R * 512);
-        ik = dalloc<float>(R * 128);
+        iq = dalloc<float>(R * fp::kIndexQuery.stride);
+        ik = dalloc<float>(R * fp::kIndexKey.stride);
         attn = dalloc<float>(R * kQ);
         part[0] = dalloc<float>(R * kHidden);
         part[1] = dalloc<float>(R * kHidden);
@@ -166,8 +194,9 @@ struct Runner {
         raw = dalloc<float>(pairs * kHidden);
         scratch = dalloc<float>(R * kExperts * 2);
         scores = dalloc<float>(R * 4 * mb);
-        sel = dalloc<std::uint32_t>(R * 4 * 16);
-        sel_count = dalloc<std::uint32_t>(R * 4);
+        sel = dalloc<std::uint32_t>(R * cu::kIdxHeads * cu::kTopK);
+        sel_count = dalloc<std::uint32_t>(R * cu::kIdxHeads);
+        picks_d = dalloc<cu::select::PickRow>(R * cu::kIdxHeads);
         ids_d = dalloc<std::uint32_t>(R * kTopE * 2);  // ids then weights
         maps_d = dalloc<std::uint32_t>(3 * pairs);
         jobs_d = dalloc<fp::F32Job>(kJobRing);
@@ -176,6 +205,32 @@ struct Runner {
         ids_h.resize(R * kTopE);
         wts_h.resize(R * kTopE);
         maps_h.resize(3 * pairs);
+    }
+    // Tile geometry depends on row partitioning. Reuse it for equal-sized cut blocks.
+    void prepare_msa_geometry(std::span<const cu::SeqView> seqs, cu::select::StridedScoreCache cache) {
+        index_cache = cache;
+        if (R != 0 && !attn_legacy) cu::prepare_msa_attention();
+        if (max_blocks <= cu::kTopK) return;
+        score_sequences_d = dalloc<cu::select::ScoreSequence>(seqs.size());
+        if (!attn_legacy) {
+            const auto tiles = cu::msa_score_tiles(seqs);
+            score_tiles_d = dupload(tiles);
+            score_tile_count = static_cast<unsigned>(tiles.size());
+            cu::prepare_msa_score_tiles();
+        }
+    }
+    // Origins and pick ranges depend on absolute positions. Upload once per group or cut block.
+    void prepare_msa_rows(std::span<const cu::SeqView> seqs, unsigned layers,
+                          const float* rotary, std::size_t rotary_positions) {
+        msa_prep.prepare(seqs, row_seq, R, layers, index_cache.layer_stride, rotary, rotary_positions);
+        if (score_sequences_d) {
+            const auto origins = cu::msa_score_sequences(seqs);
+            ck(cudaMemcpy(score_sequences_d, origins.data(), origins.size() * sizeof(origins.front()),
+                          cudaMemcpyHostToDevice), "MSA score sequence origins");
+        }
+        const auto desc = cu::msa_pick_rows(seqs, R, max_blocks, scores, sel, sel_count);
+        if (!desc.empty())
+            ck(cudaMemcpy(picks_d, desc.data(), desc.size() * sizeof(desc.front()), cudaMemcpyHostToDevice), "MSA pick rows");
     }
     void grouped(std::vector<fp::F32Job>& jobs, const float* x, std::uint32_t xs, const std::uint32_t* xmap, float* y, std::uint32_t ys_,
                  const std::uint32_t* ymap = nullptr) {
@@ -271,7 +326,8 @@ struct Runner {
         g_ph.lap(7);
     }
     // One layer over all rows (weights bound in device memory).
-    void layer(const hx::DevLayer& w, unsigned L, const cu::SeqView* seqs_d, const cu::RopeRow* rope_d) {
+    void layer(const hx::DevLayer& w, const chain::Norm* norms, unsigned L,
+               const strix::attn::SelectedBlockSequence* seqs_d) {
         g_ph.mark();
         for (unsigned r = 0; r < 2; ++r) linear(w.r[r].q, hn, kHidden, q + r * kQLocal, kQ);
         {  // k and v of both ranks in one call (4 x 16 CTAs at 1K instead of 4 launches of 16)
@@ -280,17 +336,17 @@ struct Runner {
             grouped(j, hn, kHidden, kv_map, k, kKVLocal, kv_map + 4 * R);
         }
         g_ph.lap(0);
-        for (unsigned r = 0; r < 2; ++r) cu::dense_t(hn, w.r[r].wiq, iq + r * kIdxLocal, R, kIdxLocal, 512, nullptr);
-        cu::dense_t(hn, w.wik, ik, R, 128, 128, nullptr);
+        cu::index_project(hn, w.r[0].wiq, w.r[1].wiq, w.wik, iq, ik, R, nullptr);
         g_ph.lap(1);
-        const cu::MsaLayer ml{L, w.q_w, w.k_w, w.iq_w, w.ik_w};
-        cu::msa_prep(seqs_d, row_seq, R, ml, q, k, v, iq, ik, rope_d, nullptr, nullptr);
+        msa_prep.launch(L, {w.q_w, w.k_w, w.iq_w, w.ik_w}, q, k, v, iq, ik, nullptr);
         g_ph.lap(2);
-        cu::msa_attend(seqs_d, row_seq, R, max_blocks, L, q, iq, scores, sel, sel_count, attn, nullptr, tiles_d, n_tiles, attn_legacy);
+        const cu::select::StridedScoreArgs score_args{index_cache, row_seq, score_sequences_d, iq, scores,
+            L, static_cast<unsigned>(R), max_blocks, score_tiles_d, score_tile_count};
+        cu::msa_attend(seqs_d, score_args, q, picks_d, sel, sel_count, attn, nullptr, attn_legacy);
         g_ph.lap(3);
         for (unsigned r = 0; r < 2; ++r) linear(w.r[r].o, attn + r * kQLocal, kQ, part[r], kHidden);
         g_ph.lap(4);
-        cu::post_exchange(h, part[0], part[1], w.w_post, hn, R, nullptr);
+        cu::post_exchange(h, part[0], part[1], residual_d, norms, hn, R, nullptr);
         if (w.moe) {
             cu::route(hn, w.router, w.bias, R, scratch, ids_d, reinterpret_cast<float*>(ids_d + R * kTopE), nullptr);
             ck(cudaMemcpy(ids_h.data(), ids_d, R * kTopE * 4, cudaMemcpyDeviceToHost), "ids");
@@ -302,7 +358,7 @@ struct Runner {
             for (unsigned r = 0; r < 2; ++r) mlp(w.r[r].dense, kDenseLocal, part[r]);
             g_ph.lap(8);
         }
-        cu::post_exchange(h, part[0], part[1], w.w_next, hn, R, nullptr);
+        cu::post_exchange(h, part[0], part[1], residual_d, norms + 1, hn, R, nullptr);
         g_ph.lap(5);
     }
 };
@@ -373,6 +429,7 @@ struct Store {
     std::vector<std::uint8_t*> pinned;          // streamed layers: pinned host copy
     std::vector<std::size_t> size;
     std::uint8_t* slot[2] = {nullptr, nullptr};
+    chain::Norm* exchange_norms_d = nullptr;
     cudaStream_t copy = nullptr;
     cudaEvent_t ready[2]{}, free_[2]{};
     // disk tier
@@ -570,16 +627,19 @@ int main(int argc, char** argv) {
         const auto t0 = Clock::now();
         g_ph.on = std::getenv("MM_RTX_PROFILE") != nullptr;
         hx::Pack pack(model, layer_cut ? cut_cfg.cut : 0);
-        std::vector<cu::RopeRow> rope;
+        std::size_t rotary_positions = 0;
+        for (const auto& p : prompts) rotary_positions = std::max(rotary_positions, p.tokens.size());
+        if (!std::in_range<unsigned>(rotary_positions))
+            throw std::invalid_argument("MMPREP refused MiniMax RTX rotary table extent");
+        std::vector<float> rope(rotary_positions * 2U * cu::kMsaRotaryHalf);
         {
-            std::size_t max_rows = 0;
-            for (const auto& p : prompts) max_rows = std::max(max_rows, p.tokens.size());
-            rope.resize(max_rows);
             std::ifstream f(rope_path, std::ios::binary);
-            if (!f.read(reinterpret_cast<char*>(rope.data()), static_cast<std::streamsize>(rope.size() * sizeof(cu::RopeRow))))
-                throw std::runtime_error("rope table too short");
+            if (!f.read(reinterpret_cast<char*>(rope.data()), static_cast<std::streamsize>(rope.size() * sizeof(float))))
+                throw std::runtime_error("MMPREP refused MiniMax RTX rotary table: read failed or table too short");
         }
-        cu::RopeRow* rope_d = dupload(rope);
+        if (!std::ranges::all_of(rope, [](float entry) { return std::isfinite(entry); }))
+            throw std::runtime_error("MMPREP refused MiniMax RTX nonfinite rotary table");
+        const float* rope_d = dupload(rope);
         // embedding rows gathered on the host (BF16 -> FP32 is exact; keeps 2.5 GB of device memory for weights)
         std::vector<std::uint16_t> table;
         {
@@ -587,7 +647,10 @@ int main(int argc, char** argv) {
             table.resize(e.bytes / 2);
             pack.read(e, 0, e.bytes, table.data());
         }
-        float* w_in0 = dupload(pack.floats(kP + "layers.0.input_layernorm.weight"));
+        auto input_gain = pack.floats(kP + "layers.0.input_layernorm.weight");
+        for (float& gain : input_gain) gain = 1.0F + gain;
+        float* input_gain_d = dupload(input_gain);
+        auto* input_norm_d = dupload(std::vector<chain::Norm>{{1e-6F, input_gain_d, nullptr, nullptr, chain::RmsOrder::bank_halving}});
         std::vector<cudaEvent_t> layer_done(kLayers);
         for (auto& e : layer_done) ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming | cudaEventBlockingSync), "event");
 
@@ -684,6 +747,16 @@ int main(int argc, char** argv) {
                 st.slot[0] = dalloc<std::uint8_t>(slot_bytes);
                 st.slot[1] = dalloc<std::uint8_t>(slot_bytes);
             }
+            // Streamed layers always use the same slot parity, including disk-backed layers.
+            std::vector<chain::Norm> norms(2U * n_layers);
+            std::size_t stream_index = 0;
+            for (unsigned L = 0; L < n_layers; ++L) {
+                const auto* base = st.dev[L] ? st.dev[L] : st.slot[stream_index++ % 2U];
+                const auto pair = exchange_norms(st.meta[L], base);
+                norms[2U * L] = pair[0];
+                norms[2U * L + 1U] = pair[1];
+            }
+            st.exchange_norms_d = dupload(norms);
             if (stage_bytes)
                 for (unsigned i = 0; i < Store::kStage; ++i) {
                     ck(cudaHostAlloc(reinterpret_cast<void**>(&st.stage[i]), stage_bytes, cudaHostAllocDefault), "staging ring");
@@ -699,7 +772,10 @@ int main(int argc, char** argv) {
         }
 
         if (layer_cut) {
-            run_layercut(cut_cfg, st, table, w_in0, rope_d, prompts[0].tokens, send_to, cut_pair_identity, repeat, codec_bp, abab_xport);
+            run_layercut(cut_cfg, st, table, input_norm_d, rope_d, prompts[0].tokens, send_to, cut_pair_identity, repeat, codec_bp, abab_xport);
+            cudaFree(st.exchange_norms_d);
+            cudaFree(input_norm_d);
+            cudaFree(input_gain_d);
             return 0;
         }
         // groups: gate mode = all prompts batched in one pass; timing mode = one prompt at a time
@@ -717,6 +793,8 @@ int main(int argc, char** argv) {
             std::size_t max_rows = 0;
             for (std::size_t s = 0; s < grp.size(); ++s) {
                 const auto& pt = prompts[grp[s]].tokens;
+                if (pt.empty() || !std::in_range<unsigned>(tokens.size() + (pt.size() - 1)))
+                    throw std::invalid_argument("MMPREP refused MiniMax RTX prompt row extent");
                 const std::size_t rows = pt.size() - 1;
                 cu::SeqView v{};
                 v.row0 = static_cast<std::uint32_t>(tokens.size());
@@ -724,24 +802,27 @@ int main(int argc, char** argv) {
                 v.cap = static_cast<std::uint32_t>(rows);
                 v.k = dalloc<std::uint16_t>(std::size_t{kLayers} * rows * 4 * 128);
                 v.v = dalloc<std::uint16_t>(std::size_t{kLayers} * rows * 4 * 128);
-                v.ik = dalloc<std::uint16_t>(std::size_t{kLayers} * rows * 128);
                 seqs.push_back(v);
                 tokens.insert(tokens.end(), pt.begin(), pt.end() - 1);
                 for (std::size_t r = 0; r < rows; ++r) row_seq.push_back(static_cast<std::uint32_t>(s));
                 max_rows = std::max(max_rows, rows);
             }
+            auto index_cache = cu::msa_index_cache(nullptr, max_rows, kLayers);
+            auto* index_keys = dalloc<std::uint16_t>(index_cache.sequence_stride * seqs.size());
+            index_cache.base = index_keys;
+            for (unsigned s = 0; s < seqs.size(); ++s)
+                seqs[s].ik = index_keys + index_cache.offset(s, 0, 0);
+
             const std::size_t R = tokens.size();
             Runner run;
             run.alloc(R, static_cast<unsigned>((max_rows + 127) / 128));
-            cu::SeqView* seqs_d = dupload(seqs);
+            std::vector<strix::attn::SelectedBlockSequence> attention_seqs;
+            attention_seqs.reserve(seqs.size());
+            for (const auto& seq : seqs) attention_seqs.push_back(cu::msa_attention_sequence(seq));
+            auto* seqs_d = dupload(attention_seqs);
             run.row_seq = dupload(row_seq);
-            {
-                std::vector<uint2> tiles;
-                for (const auto& s : seqs)
-                    for (std::uint32_t r = 0; r < s.rows; r += 32) tiles.push_back(make_uint2(s.row0 + r, std::min<std::uint32_t>(32, s.rows - r)));
-                run.tiles_d = dupload(tiles);
-                run.n_tiles = static_cast<unsigned>(tiles.size());
-            }
+            run.prepare_msa_geometry(seqs, index_cache);
+            run.prepare_msa_rows(seqs, kLayers, rope_d, rotary_positions);
             // state blobs (pinned: the per-layer copies are asynchronous; a sender thread reads them after the layer's event)
             std::vector<std::uint8_t*> blobs[2];
             for (unsigned r = 0; r < 2; ++r)
@@ -760,7 +841,8 @@ int main(int argc, char** argv) {
             auto export_all = [&](unsigned L) {
                 for (std::size_t s = 0; s < seqs.size(); ++s)
                     for (unsigned r = 0; r < 2; ++r)
-                        cu::export_layer(seqs[s], L, r, seqs[s].rows, blobs[r][s] + static_cast<std::size_t>(L) * seqs[s].rows * 1280, nullptr);
+                        cu::export_layer(seqs[s], index_cache.layer_stride, L, r, 0, seqs[s].rows,
+                            blobs[r][s] + static_cast<std::size_t>(L) * seqs[s].rows * 1280, nullptr);
                 ck(cudaEventRecord(layer_done[L], nullptr), "layer event");
                 std::lock_guard<std::mutex> lk(rec_m);
                 recorded = L + 1;
@@ -772,21 +854,24 @@ int main(int argc, char** argv) {
                     for (unsigned i = 0; i < kHidden; ++i) emb_h[r * kHidden + i] = static_cast<std::uint32_t>(src[i]) << 16U;
                 }
                 ck(cudaMemcpy(run.h, emb_h, R * kHidden * 4, cudaMemcpyHostToDevice), "embed rows");
-                cu::rmsnorm(run.h, w_in0, run.hn, R, nullptr);
+                cu::rmsnorm(run.h, input_norm_d, run.hn, R, nullptr);
             };
             std::printf("mm-rtx-prefill: group of %zu prompt(s), %zu rows, %.1f s since start\n", grp.size(), R, secs(t0, Clock::now()));
             std::fflush(stdout);
             if (resident < 0) {  // gate mode: each layer read when needed
                 double t_load = 0, t_comp = 0;
+                auto* norms_d = dalloc<chain::Norm>(2);
                 start();
                 for (unsigned L = 0; L < n_layers; ++L) {
                     const auto a = Clock::now();
                     const hx::LayerBlob blob = hx::build_layer(pack, L);
                     std::uint8_t* d = dalloc<std::uint8_t>(blob.bytes.size());
                     ck(cudaMemcpy(d, blob.bytes.data(), blob.bytes.size(), cudaMemcpyHostToDevice), "layer upload");
+                    const auto norms = exchange_norms(blob, d);
+                    ck(cudaMemcpy(norms_d, norms.data(), sizeof(norms), cudaMemcpyHostToDevice), "exchange norm upload");
                     const auto b = Clock::now();
                     t_load += secs(a, b);
-                    run.layer(hx::bind(blob, d), L, seqs_d, rope_d);
+                    run.layer(hx::bind(blob, d), norms_d, L, seqs_d);
                     export_all(L);
                     ck(cudaDeviceSynchronize(), "layer");
                     g_ph.lap(9);
@@ -796,6 +881,7 @@ int main(int argc, char** argv) {
                         std::printf("mm-rtx-prefill: layer %u done, load %.1f s, compute %.1f s, read %.1f GiB\n", L, t_load, t_comp, pack.gib_read());
                     std::fflush(stdout);
                 }
+                cudaFree(norms_d);
                 std::printf("mm-rtx-prefill: weights load %.1f s, compute %.1f s\n", t_load, t_comp);
             } else {  // timing mode
                 for (unsigned it = 0; it < repeat; ++it) {
@@ -921,7 +1007,7 @@ int main(int argc, char** argv) {
                             ck(cudaStreamWaitEvent(nullptr, st.ready[sl], 0), "wait ready");
                             base = st.slot[sl];
                         }
-                        run.layer(hx::bind(st.meta[L], base), L, seqs_d, rope_d);
+                        run.layer(hx::bind(st.meta[L], base), st.exchange_norms_d + 2U * L, L, seqs_d);
                         export_all(L);
                         if (sl >= 0) {
                             ck(cudaEventRecord(st.free_[sl], nullptr), "free");
@@ -969,13 +1055,16 @@ int main(int argc, char** argv) {
             for (auto& s : seqs) {
                 cudaFree(s.k);
                 cudaFree(s.v);
-                cudaFree(s.ik);
             }
+            cudaFree(index_keys);
             cudaFree(seqs_d);
             for (unsigned r = 0; r < 2; ++r)
                 for (auto* b : blobs[r]) cudaFreeHost(b);
             cudaFreeHost(emb_h);
         }
+        cudaFree(st.exchange_norms_d);
+        cudaFree(input_norm_d);
+        cudaFree(input_gain_d);
         if (g_ph.on) {
             std::printf("mm-rtx-prefill: phases (s):");
             for (int i = 0; i < 10; ++i) std::printf(" %s %.3f", kPhase[i], g_ph.s[i]);

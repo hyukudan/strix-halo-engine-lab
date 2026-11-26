@@ -87,6 +87,7 @@ block = 5
 
 # Launchers project these columns into the engine's native, gated registry.
 [presets]
+# FAST is the product default; the presets resolve the native granted cells, as the native CLI does for --profile fast.
 default = "fast"
 native_kv = "fp8 ring + fp4 compressed (model-defined)"
 
@@ -96,9 +97,8 @@ levers = "exact"
 [presets.fast]
 levers = "fast"
 
-# Use the admitted FAST levers until this model has a qualified TURBO set.
 [presets.turbo]
-levers = "fast"
+levers = "turbo"
 
 # Engine-read switches of this model that a [multi_device] key is planned to replace (listed in the effective
 # config when set; they still act inside the engine).

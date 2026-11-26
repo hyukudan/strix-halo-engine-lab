@@ -22,6 +22,8 @@
 #include "strix/cuda/qwen_dense.hpp"
 #include "strix/cuda/dense_kernel_ids.hpp"
 #include "strix/cuda/qwen_gdn.hpp"
+#include "qwen_gdn_replay.hpp"
+#include "cuda/core/recur_cuda.cuh"
 #include "../../core/head_argmax.cuh"
 #include "strix/cuda/qwen_hc.hpp"
 #include "strix/cuda/qwen_hc_fp16_range.hpp"
@@ -32,6 +34,8 @@
 #include "strix/cuda/qwen_mtp_draft.hpp"
 #include "strix/cuda/qwen_plemtp.hpp"
 #include "strix/cuda/qwen_qsa.hpp"
+#include "qwen_qsa_rowgroup.hpp"
+#include "qwen_qsa_segments.hpp"
 #include "strix/mtp_draft_split.hpp"
 #include "strix/spec/commit_tail.hpp"
 #include "strix/cuda/qwen_transcode.hpp"
@@ -94,6 +98,8 @@ constexpr std::uint32_t kMaxStepRows = 8;    // draft chain rows (1 + up to 7 dr
 constexpr std::uint32_t kMaxWindowRows = 16; // rows of a whole cohort window (9..16: the row-independent families run on the
                                              // exact prefill-shaped kernels over 16 padded rows, as a prefill block)
 constexpr std::uint32_t kLayers = 48, kHidden = 2560, kWide = 10240, kTopK = 10, kExperts = 512;
+constexpr auto kGdnReplayShape = gdn::replay_shape_for(
+    {kHidden, gdn::kKeyHeads, gdn::kValueHeads, gdn::kHeadDim, gdn::kConvKernel, gdn::kA8Pitch});
 constexpr bool is_qsa(std::uint32_t layer) { return layer % 4U == 3U; }
 constexpr std::uint32_t gdn_ordinal(std::uint32_t layer) { return layer - (layer + 1U) / 4U; }
 constexpr std::uint32_t qsa_ordinal(std::uint32_t layer) { return layer / 4U; }
@@ -410,6 +416,8 @@ struct Prefill::Impl : BlockFields {
         if (trace_host) cudaFreeHost(trace_host);
         if (mtp_stash) cudaFree(mtp_stash);
         if (mtp_stash_next) cudaFree(mtp_stash_next);
+        if (gdn_replay) cudaFree(gdn_replay);
+        if (gdn_replay_pinned) cudaFreeHost(gdn_replay_pinned);
     }
     std::size_t graph_cap = 512;                   // layouts up to 16 rows (C8 with 1-draft windows: 256)
     std::uint64_t graph_clock = 0, graph_captures = 0, graph_replays = 0, graph_evictions = 0, eager_windows = 0;
@@ -422,6 +430,11 @@ struct Prefill::Impl : BlockFields {
     std::uint32_t* moe_sticky_pinned = nullptr;    // [1 + 8]
     SegTable* seg_table = nullptr;                 // decode: device [8] (graph descriptor table)
     SegTable* seg_table_pinned = nullptr;          // [8] host source of the table copy captured in the window prologue
+    gdn::ReplayWindow* gdn_replay = nullptr;
+    gdn::ReplayWindow* gdn_replay_pinned = nullptr;
+    bool uses_gdn_replay(const Segment* seg, std::uint32_t count) const noexcept {
+        return gdn_replay && count == 1 && seg[0].rows <= gdn::kMaxReplayRows;
+    }
     bool graph_table = true;                       // STRIX_QRTX_GRAPH_TABLE=0: graphs bake session pointers (keyed by session)
     bool table_mode = false;                       // run_block / window_prologue emit table-relative launches (capture)
     void qsa_core(std::uint32_t l, const Segment& seg);
@@ -429,8 +442,8 @@ struct Prefill::Impl : BlockFields {
     // device table that the replay writes first (one graph per window, no cuts); same kernels and order as qsa_layer.
     // Maps [0, 12) = the window's QSA layers, [12, 12 + 7) = the draft chain's steps.
     static constexpr std::uint32_t kQsaMaps = 12U + kMaxStepRows;
-    qsa::SegmentMap* qsa_maps = nullptr;           // device [kQsaMaps]
-    qsa::SegmentMap* qsa_maps_pinned = nullptr;    // host source of the captured copy
+    qsa::ReplaySegmentMap* qsa_maps = nullptr;           // device [kQsaMaps]
+    qsa::ReplaySegmentMap* qsa_maps_pinned = nullptr;    // host source of the captured copy
     bool qsa_graph = true;
     const qsa::MultiShape* qsa_dev_shape = nullptr;  // capture: run_block emits qsa_layer_dev with this shape
     qsa::LayerWeights qsa_weights(std::uint32_t l) const;
@@ -1125,9 +1138,13 @@ void Prefill::Impl::allocate() {
         seg_table = dev_zero<SegTable>(kMaxStepRows, "graph descriptor table");
         ck(cudaMallocHost(&seg_table_pinned, kMaxStepRows * sizeof(SegTable)), "pinned descriptor table");
         std::memset(seg_table_pinned, 0, kMaxStepRows * sizeof(SegTable));
-        qsa_maps = dev_zero<qsa::SegmentMap>(kQsaMaps, "qsa segment maps");
-        ck(cudaMallocHost(&qsa_maps_pinned, kQsaMaps * sizeof(qsa::SegmentMap)), "pinned qsa segment maps");
-        for (std::uint32_t i = 0; i < kQsaMaps; ++i) qsa_maps_pinned[i] = qsa::SegmentMap{};
+        if (strix::envcfg::flag("STRIX_QRTX_GDN_REPLAY", false) && strix::envcfg::flag("STRIX_QRTX_GDN_DECODE", true)) {
+            gdn_replay = dev_alloc<gdn::ReplayWindow>(1, "GDN replay window");
+            ck(cudaMallocHost(&gdn_replay_pinned, sizeof(gdn::ReplayWindow)), "pinned GDN replay window");
+        }
+        qsa_maps = dev_zero<qsa::ReplaySegmentMap>(kQsaMaps, "qsa segment maps");
+        ck(cudaMallocHost(&qsa_maps_pinned, kQsaMaps * sizeof(qsa::ReplaySegmentMap)), "pinned qsa segment maps");
+        for (std::uint32_t i = 0; i < kQsaMaps; ++i) qsa_maps_pinned[i] = qsa::ReplaySegmentMap{};
         ck(cudaMallocHost(&moe_sticky_pinned, (1 + kMaxWindowRows) * 4), "pinned moe sticky");
         win_rows = dev_zero<float>(std::uint64_t{36} * kMaxWindowRows * gdn_stride, "window gdn rows");
         win_raw = dev_zero<float>(std::uint64_t{36} * kMaxWindowRows * gdn::kConvWidth, "window conv inputs");
@@ -1389,6 +1406,7 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
                                      " (select a card with --device-id or STRIX_DEVICE)");
         ck(cudaSetDevice(bound.visible.ordinal), "set device");
     }
+    if (m.cfg.forms.qsa_mma) qsa::prepare_attention_mma();
     // Residency is decided before our first allocation. Fully resident (automatic when the model fits, or full): nothing
     // below this block changes, no allocation, launch or sync is added. Tiered: the experts stay in the memory-mapped GGUF,
     // the card keeps a slot pool of the hot ones, blocks are capped to the exchange's rows, the position limit may shrink.
@@ -1727,7 +1745,20 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
                 SessionState& ss = *seg[i].s;
                 float* sb = base + off * gdn_stride;
                 const gdn::Rows grs{sb, sb + 10240, sb + 16384, sb + 16432, sb + 16480, gdn_stride};
-                if (window && table_mode)
+                if (window && uses_gdn_replay(seg, count)) {
+                    // The prologue stages the slot directory and saves the taps.
+                    // Both graph and eager launches resolve the same four images.
+                    const auto raw = win_raw + std::uint64_t{o} * kMaxWindowRows * gdn::kConvWidth;
+                    const strix::cuda::recur::DecodeRow row{hidden, grs.qkv, grs.z, grs.qkv, grs.beta, grs.gate, grs.core, raw};
+                    const strix::ops::recur::DecodeRowStrides strides{kHidden, gdn_stride, gdn_stride, gdn_stride,
+                        gdn_stride, gdn_stride, gdn::kConvWidth, gdn::kValueWidth};
+                    const strix::cuda::recur::DecodeWeights weights{gw.beta, gw.alpha, gw.dt, gw.a, gw.conv, gw.norm,
+                        gw.qk_l2_epsilon, gw.rms_epsilon};
+                    const auto step = gdn::bind_replay_layer(kGdnReplayShape, *gdn_replay, row, strides, o, state_type);
+                    ck(strix::cuda::recur::enqueue_decode_replay_step(kGdnReplayShape, std::bit_ceil(seg[i].rows),
+                        weights, step, tables, stream),
+                        "GDN replay step");
+                } else if (window && table_mode)
                     gdn::launch_core_split_ref(hidden + off * kHidden, kHidden, grs, seg[i].rows,
                         gdn::DevRef<std::uint16_t>{nullptr, &seg_table[i].gdn_conv, std::uint64_t{o} * gdn::kConvStateHalfs},
                         gdn::DevRef<float>{nullptr, &seg_table[i].gdn_state, std::uint64_t{o} * state_layer_floats},
@@ -1903,7 +1934,7 @@ void Prefill::Impl::qsa_core(std::uint32_t l, const Segment& seg) {
     const auto o = qsa_ordinal(l);
     SessionState& ss = *seg.s;
     const qsa::LayerState st{ss.kv[o], ss.raw_index[o], ss.pooled[o], &ss.pooled_valid[o]};
-    qsa::layer_core(rb, seg.rows, seg.p0, qw, st, rope, tables, qws, stream, cfg.forms.qsa_mma && !window);
+    qsa::layer_core_prepared(rb, seg.rows, seg.p0, qw, st, rope, tables, qws, stream, cfg.forms.qsa_mma && !window);
     executed_forms.qsa_mma |= cfg.forms.qsa_mma && !window && seg.rows != 0;
 }
 
@@ -2234,6 +2265,7 @@ void Prefill::Impl::commit_one(SessionState& s, std::uint32_t keep) {
     if (keep < s.window_rows) {
         // GDN: replay the kept rows from S0 (same ascending-row arithmetic) into the other buffer; conv/PLE histories and
         // the n-gram word from their pre-window values plus the kept rows. QSA rows beyond keep are overwritten later.
+        // K9G leaves the same prepared rows and raw captures for this state-only continuation.
         for (std::uint32_t o = 0; o < 36; ++o) {
             float* base = win_rows + (std::uint64_t{o} * kMaxWindowRows + off) * gdn_stride;
             const gdn::Rows gr{base, base + 10240, base + 16384, base + 16432, base + 16480, gdn_stride};
@@ -2336,6 +2368,9 @@ void Prefill::abort_cohort() noexcept {
 
 void Prefill::Impl::window_prologue(const Segment* seg, std::uint32_t count) {
     ck(cudaMemsetAsync(moe_sticky, 0, (1 + kMaxWindowRows) * 4, stream), "moe sticky clear");
+    if (uses_gdn_replay(seg, count))
+        ck(cudaMemcpyAsync(gdn_replay, gdn_replay_pinned, sizeof(gdn::ReplayWindow), cudaMemcpyHostToDevice, stream),
+            "GDN replay window upload");
     if (table_mode) {
         // the replay's descriptor table (filled on the host before the launch), then the snapshots through it
         ck(cudaMemcpyAsync(seg_table, seg_table_pinned, count * sizeof(SegTable), cudaMemcpyHostToDevice, stream), "descriptor table");
@@ -2494,6 +2529,12 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
     std::vector<float> logits;
     m.window = true;
     try {
+        if (m.uses_gdn_replay(segs.data(), n)) {
+            const auto& s = *segs[0].s;
+            *m.gdn_replay_pinned = gdn::stage_replay_window(s.window_tokens,
+                static_cast<std::uint32_t>(s.window_position), static_cast<std::uint32_t>(s.capacity),
+                s.conv_before, s.gdn_state, s.gdn_conv, s.gdn_other);
+        }
         auto it = m.use_graphs ? m.graphs.find(key) : m.graphs.end();
         std::uint32_t* seen = nullptr;
         if (m.use_graphs && it == m.graphs.end()) {
@@ -2533,7 +2574,7 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
                 };
                 ck(cudaStreamBeginCapture(m.stream, cudaStreamCaptureModeRelaxed), "begin capture");
                 if (dev_qsa) {  // one graph: the QSA cores read the maps the replay copies first
-                    ck(cudaMemcpyAsync(m.qsa_maps, m.qsa_maps_pinned, 12U * sizeof(qsa::SegmentMap), cudaMemcpyHostToDevice, m.stream),
+                    ck(cudaMemcpyAsync(m.qsa_maps, m.qsa_maps_pinned, 12U * sizeof(qsa::ReplaySegmentMap), cudaMemcpyHostToDevice, m.stream),
                        "qsa maps");
                     m.qsa_dev_shape = &dev_shape;
                 } else {
@@ -3287,7 +3328,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
             ck(cudaMemcpyAsync(m.draft_token, m.draft_pos_pinned + kMaxStepRows, 4, cudaMemcpyHostToDevice, m.stream), "draft pending");
         ck(cudaMemcpyAsync(m.draft_pos, m.draft_pos_pinned, kMaxStepRows * sizeof(std::uint64_t), cudaMemcpyHostToDevice, m.stream),
            "draft positions");
-        ck(cudaMemcpyAsync(m.qsa_maps + 12 + k0, m.qsa_maps_pinned + 12 + k0, (k1 - k0) * sizeof(qsa::SegmentMap), cudaMemcpyHostToDevice,
+        ck(cudaMemcpyAsync(m.qsa_maps + 12 + k0, m.qsa_maps_pinned + 12 + k0, (k1 - k0) * sizeof(*m.qsa_maps), cudaMemcpyHostToDevice,
                            m.stream),
            "draft qsa maps");
     }

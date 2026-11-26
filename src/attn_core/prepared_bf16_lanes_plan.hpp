@@ -21,15 +21,9 @@
 
 namespace strix::attn_core::dense {
 
-struct PreparedBf16Lane {
-    std::uint16_t* keys;    // [slot][KV head][dim] BF16, this lane's cache
-    std::uint16_t* values;  // [slot][KV head][dim] BF16, this lane's cache
-    unsigned first_position;
-    unsigned cache_slots;
-    unsigned wrapped;       // nonzero: slot = absolute position % cache_slots
-};
-
-inline constexpr unsigned kMaxPreparedBf16Lanes = 16U;
+using ::strix::attn::lanes::PreparedBf16Lane;
+using ::strix::attn::lanes::kMaxPreparedBf16Lanes;
+using ::strix::attn::lanes::distinct_lane_caches;
 
 // Workspace floats one lane owns: one row's partials and statistics at the largest split count.
 constexpr std::size_t lane_workspace_floats(unsigned heads, unsigned dim) {
@@ -60,20 +54,6 @@ inline unsigned max_lane_key_splits(std::span<const PreparedBf16Lane> lanes, uns
         splits = s > splits ? s : splits;
     }
     return splits;
-}
-
-// Every lane writes its own caches: two lanes on one cache would see each other's store before their flash, which the
-// one-lane sequence orders differently.
-inline bool distinct_lane_caches(std::span<const PreparedBf16Lane> lanes) {
-    for (std::size_t i = 0; i < lanes.size(); ++i) {
-        if (!lanes[i].keys || !lanes[i].values || lanes[i].keys == lanes[i].values) return false;
-        for (std::size_t j = 0; j < i; ++j) {
-            const auto* k = lanes[j].keys;
-            const auto* v = lanes[j].values;
-            if (lanes[i].keys == k || lanes[i].keys == v || lanes[i].values == k || lanes[i].values == v) return false;
-        }
-    }
-    return true;
 }
 
 // Lanes of one sequence on one cache (verify windows): the one backend-neutral rule of the lane contract

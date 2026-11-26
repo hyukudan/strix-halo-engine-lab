@@ -129,10 +129,12 @@ Options parse_options(int argc, char** argv) {
     for (const auto* path : {&o.draft, &o.draft_eagle, &o.draft_mtp}) if (!path->empty()) inputs.cli.emplace_back("draft",path->generic_string());
     if (draft_off) inputs.cli.emplace_back("draft","off");
     if (dflash_given) inputs.cli.emplace_back("draft_mode",o.request.dflash == DraftMode::on ? "on" : o.request.dflash == DraftMode::off ? "off" : "auto");
-    // Drafter discovery: <model dir>/drafter-mtp.
+    // Probe the same package entry the loader needs. An empty sidecar directory is not an asset.
     std::error_code error;
-    const auto drafter = (std::filesystem::is_directory(o.model,error) ? o.model : o.model.parent_path()) / "drafter-mtp";
-    if (std::filesystem::is_directory(drafter,error)) inputs.assets.emplace_back("draft",drafter.generic_string());
+    const auto drafter = (std::filesystem::is_directory(o.model,error) ? o.model : o.model.parent_path()) /
+                         eagle::mtp::drafter_subdirectory;
+    if (std::filesystem::is_regular_file(drafter / "model.safetensors", error))
+        inputs.assets.emplace_back("draft",drafter.generic_string());
     o.profile = profile::resolve(selected,profile::App::engine,inputs);
     profile::apply(o.profile);
     if (const auto* draft = o.profile.find("draft")) {
@@ -217,6 +219,7 @@ Runtime::Runtime(const Options& o) {
     }
     const auto* kind = std::getenv("STRIX_G4_DRAFT_KIND");
     const bool mtp_kind = !o.draft_mtp.empty() || (!o.draft.empty() && kind && std::string(kind) == "mtp");
+    std::filesystem::path mtp_file;
     if (mtp_kind) {
         // MTP assistant: target sliding/global RoPE tables, committed layer 22/23 KV (A6), final hidden row (A1),
         // target token_embd. STRIX_G4_MTP_Q8=1 repacks the assistant matrices to Q8_0 (default: checkpoint BF16).
@@ -232,6 +235,7 @@ Runtime::Runtime(const Options& o) {
             !o.inspect && dflash::enabled_from_environment());
 #endif
         metadata.set("draft_kind","mtp-assistant");
+        mtp_file = eagle::mtp::resolve_drafter(path) / "model.safetensors";
         metadata.set("draft_backend",o.backend == "device" ? "resident-device" : "host-reference");
         metadata.set("draft_identity",eagle::mtp::arithmetic_id); metadata.set("draft_hash",mtp_draft->source);
         metadata.set("draft_matrices",q8_on ? "q8_0" : "bf16");
@@ -292,6 +296,14 @@ Runtime::Runtime(const Options& o) {
         metadata.set("prompt_lookup",lookup.json());
         if (!metadata.find("draft_kind")) metadata.set("draft_kind","prompt-lookup");
     }
+    if (!o.inspect) {
+        if (!mtp_file.empty())
+            std::cerr << "gemma4 decode: MTP " << mtp_file.generic_string() << '\n';
+        else if (const auto* draft_kind = metadata.find("draft_kind"))
+            std::cerr << "gemma4 decode: " << draft_kind->as_string() << '\n';
+        else
+            std::cerr << "gemma4 decode: plain\n";
+    }
     metadata.set("profile",strix::serve::parse_json_unique(o.profile.json()));
     metadata.set("qualification",intel_selected ? "PENDING-HARDWARE" : o.profile.qualification());
     metadata.set("feature_identity",features::freeze(manifest,
@@ -317,7 +329,7 @@ ServePreparation prepare_serve(int argc,char** argv) {
                 "  --draft DRAFT.gguf --draft-rope TABLE.g4dr (DFlash), --draft-eagle EAGLE.gguf (e4b-eagle fallback)\n"
                 "env: STRIX_G4_DRAFT_KIND=dflash|mtp|eagle (how --draft is read), STRIX_G4_MTP_TOPK=1..64 (clusters, default 64),\n"
                 "  STRIX_G4_MTP_Q8=1 (Q8_0 assistant matrices), STRIX_G4_MTP_GRAPHS=0 (no HIP graph replay), STRIX_G4_DFLASH=0 (no drafting)\n"
-                "profiles: --profile default|fast|quality (default: default; explicit options and env win); the MTP drafter is found at\n"
+                "profiles: --profile exact|fast|turbo|quality (default: exact; explicit options and env win); the MTP drafter is found at\n"
                 "  <model dir>/drafter-mtp unless --draft-mtp DIR is given; --draft off or STRIX_G4_DRAFT=0 disables it\n"
                 "deployment: --deploy FILE|auto [--deploy-check] [--deploy-node INDEX for replica inventory]\n";
             prepared.exit_code=0;prepared.output=report.str();return prepared;

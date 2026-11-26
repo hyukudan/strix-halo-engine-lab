@@ -20,6 +20,10 @@ struct ResidentMatrixView {
     std::span<const std::uint8_t> bytes;
     FormatId storage;
     std::uint64_t rows, columns, row_bytes;
+    bool folded_scale_admitted = false;
+    // Every output of the matrix carries a factor 2^outer_exponent outside its group scales (a Strix pack entry's
+    // per-tensor base, strix/weight/host_lowbit.hpp sp::); 0 for every other storage.
+    std::int32_t outer_exponent = 0;
 };
 
 struct ResidentBf16Rows {
@@ -37,6 +41,8 @@ public:
         std::uint64_t row_pitch{};  // Zero uses the natural layout.
         // Pre-encoded bytes of matrix_storage (geometry.bytes long); replaces the BF16 conversion.
         std::optional<Slice> prepacked{};
+        // Outer power of two of the prepacked matrix (LowbitPack::find); only a prepacked matrix may carry one.
+        std::int32_t outer_exponent{};
     };
 
     // Offsets are sorted within a shard so queued reads follow file order.
@@ -53,7 +59,9 @@ public:
         plan.ranges_.reserve(tensors.size());
         constexpr auto limit = std::numeric_limits<std::size_t>::max();
         const auto mask = alignment - 1U;
-        for (const auto& [name, raw, matrix_storage, row_pitch, prepacked] : tensors) {
+        for (const auto& [name, raw, matrix_storage, row_pitch, prepacked, outer_exponent] : tensors) {
+            if (outer_exponent != 0 && !prepacked)
+                throw std::invalid_argument("outer exponent without a prepacked matrix " + std::string(name));
             Slice payload{};
             if (const auto status = subslice(raw->payload, {0, raw->payload.range.bytes}, payload); !status)
                 throw std::invalid_argument("invalid resident tensor " + std::string(name) + ": " + status.detail);
@@ -100,7 +108,7 @@ public:
                 throw std::overflow_error("resident weights exceed address space");
             const auto bytes = static_cast<std::size_t>(size);
             if (!plan.tensors_.emplace(std::string(name), Tensor{offset, bytes, dtype, matrix_storage,
-                    rows, columns, geometry.row_bytes, pitched}).second)
+                    rows, columns, geometry.row_bytes, pitched, outer_exponent}).second)
                 throw std::invalid_argument("duplicate resident tensor " + std::string(name));
             if (pitched) {
                 // Kernels read only natural row bytes. The padding retains the storage's prior contents.
@@ -137,6 +145,7 @@ private:
         std::optional<FormatId> matrix_storage;
         std::uint64_t rows, columns, row_bytes;
         bool pitched;
+        std::int32_t outer_exponent;
     };
 
     std::size_t bytes_{};
@@ -182,7 +191,7 @@ public:
             throw std::invalid_argument("incompatible resident matrix " + std::string(name));
         const auto& entry = it->second;
         return {storage_.subspan(entry.offset, entry.bytes), *entry.matrix_storage,
-                entry.rows, entry.columns, entry.row_bytes};
+                entry.rows, entry.columns, entry.row_bytes, false, entry.outer_exponent};
     }
 
     Status bind_expert_slab(const microscaled::ExpertSlabView& slab, std::string_view codes_name,

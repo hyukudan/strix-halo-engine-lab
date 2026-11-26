@@ -3,7 +3,9 @@
 // (the CLI's parse of an argv and the serve shell's family arguments give byte-identical effective configs); the request
 // path through the shared ApiService (reasoning_effort no_think turns thinking off for the output parse, prompt bytes equal
 // the CLI render); a tool-call round trip through the bound renderer and parser; GGUF family admission.
+#include "hy4/hy4_speculation.hpp"
 #include "hy4/serve/session_service.hpp"
+#include "strix/profiles/hy4.hpp"
 #include "strix/model_family_registry.hpp"
 #include "strix/serve/engine.hpp"
 #include <cstdio>
@@ -11,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -115,6 +118,70 @@ void shell_tests(const std::filesystem::path& root) {
         argv.emplace_back("--print-effective-config");
         const auto served = invoke(argv, factories);
         check(served.code == 0 && served.out == cli, "CLI = serve effective config: " + served.out + " vs " + cli);
+    }
+    {
+        namespace hp = strix::hy4::profile;
+        const std::vector<std::string> switches{"--profile", "turbo", "--prompt-rows", "2048", "--head-q8", "0"};
+        std::vector<std::string> rank_args = switches;
+        strix::profile::Inputs rank;
+        strix::profile::take_options(hp::engine(), rank_args, rank);
+        const auto native = hp::resolve({hp::Device::unknown, hp::Topology::one_node, 8192}, rank);
+        std::vector<std::string> argv{"serve", "--registry-root", r, "--model", "hy4_flash", "--", "--ctx", "8192",
+                                      "--print-effective-config"};
+        argv.insert(argv.end(), switches.begin(), switches.end());
+        const auto served = invoke(argv, factories);
+        check(served.code == 0, "serve profile inspection: " + served.out + served.error);
+        if (served.code == 0) {
+            const auto config = sv::parse_json(served.out);
+            const auto* resolved = config.find("profile");
+            check(resolved && resolved->dump() == sv::parse_json(native->resolution.json()).dump(),
+                  "native rank and serve resolve the same tier and overrides without a device");
+        }
+    }
+    // Exact speculative decode: one declaration, the shared default resolver decides for every tier.
+    {
+        strix::hy4::SpeculationRun run;
+        run.block_in_pack = true;
+        check(strix::hy4::speculation(run).enabled && strix::hy4::speculation(run).source == "default", "Hy4 MTP is the default with the block");
+        run.whole_model = false;
+        check(!strix::hy4::speculation(run).enabled && strix::hy4::speculation(run).source == "unavailable", "Hy4 layer split has no block");
+        run.whole_model = true;
+        run.block_in_pack = false;
+        check(!strix::hy4::speculation(run).enabled, "Hy4 pack without the block decodes plain");
+        run.block_in_pack = true;
+        run.no_mtp = true;
+        check(strix::hy4::speculation(run).source == "cli-opt-out", "Hy4 --no-mtp");
+        run.no_mtp = false;
+        run.environment = "0";
+        check(strix::hy4::speculation(run).source == "env-opt-out", "Hy4 STRIX_MTP=0");
+        run.environment = nullptr;
+        run.per_step_route = true;
+        check(!strix::hy4::speculation(run).enabled && strix::hy4::speculation(run).source == "explicit-route",
+                "Hy4 per-step logits keep the plain steps");
+        run.explicit_mtp = true;
+        check(strix::hy4::speculation(run).enabled && strix::hy4::speculation(run).source == "explicit", "Hy4 --mtp wins over the per-step route");
+    }
+    {  // the decode route: the native rank's shared speculation decision (pack facts: the block ships in the pack)
+        h::PackFacts with_block;
+        with_block.next_token_block = true;
+        for (const bool no_mtp : {false, true}) {
+            const auto o = h::parse_options(no_mtp ? std::vector<std::string>{"--no-mtp"} : std::vector<std::string>{});
+            const auto config = h::effective_config(o, with_block);
+            const auto* spec = config.find("speculation");
+            strix::hy4::SpeculationRun run;
+            run.block_in_pack = true;
+            run.no_mtp = no_mtp;
+            run.environment = std::getenv(strix::session::speculation_environment);
+            const auto native = strix::hy4::speculation(run);
+            check(spec && spec->find("enabled") && spec->find("source") &&
+                      spec->find("enabled")->dump() == sv::Json(native.enabled).dump() &&
+                      spec->find("source")->dump() == sv::Json(std::string(native.source)).dump(),
+                  "serve reports the native speculation decision");
+        }
+        const auto plain = h::effective_config(h::parse_options(std::vector<std::string>{}), {});
+        const auto* none = plain.find("speculation");
+        check(none && none->find("source") && none->find("source")->dump() == sv::Json("unavailable").dump(),
+              "no pack, no block: plain decode");
     }
     const auto a = h::effective_config(h::parse_options(std::vector<std::string>{"--ctx", "8192", "--max-tokens", "512"}), {}).dump();
     const auto b = h::effective_config(h::parse_options(std::vector<std::string>{"--max-tokens", "512", "--ctx", "8192"}), {}).dump();

@@ -18,13 +18,14 @@
 #include "strix/env_flags.hpp"
 
 namespace strix::glm::pf::attn_wmma {
-inline bool enabled() {
+inline bool configured() {
     const char* p = std::getenv("STRIX_GLM_PF_ATTN_WMMA");
-    if (p == nullptr || *p == '\0') return wmma_x::enabled();
+    if (p == nullptr || *p == '\0') return wmma_x::configured();
     if (std::strcmp(p, "0") == 0) return false;
     if (std::strcmp(p, "1") == 0) return true;
     throw std::invalid_argument("STRIX_GLM_PF_ATTN_WMMA must be 0 or 1");
 }
+inline bool enabled() { return wmma_x::profile_enabled || configured(); }
 inline unsigned block_keys() {
     const char* p = std::getenv("STRIX_GLM_PF_ATTN_WMMA_T");
     if (p == nullptr || *p == '\0' || std::strcmp(p, "16") == 0) return 16U;

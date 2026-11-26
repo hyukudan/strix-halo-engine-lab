@@ -17,6 +17,7 @@
 #include "../core/hadamard.hpp"
 #include "../core/trellis_codec.hpp"
 #include "../hip/weight/trellis_sources.hpp"
+#include "exl3_lane_window.hpp"
 
 namespace strix::moe_core {
 
@@ -26,6 +27,13 @@ using core::trellis::Half2;
 __host__ __device__ constexpr unsigned vector_splits(unsigned input, unsigned output) {
     return output <= 1024 ? 32U : (output <= 4096 && input >= 4096 ? 16U : 4U);
 }
+constexpr bool host_split_policy_agrees() {
+    for (unsigned input = 128; input <= 16384U; input += 128U)
+        for (unsigned output = 128; output <= 16384U; output += 128U)
+            if (vector_splits(input, output) != split_policy::vector_splits(input, output)) return false;
+    return true;
+}
+static_assert(host_split_policy_agrees(), "split_policy::vector_splits (exl3_lane_window.hpp) must equal vector_splits");
 
 // RN32 boundary before a later RN16 conversion: the one core/hadamard.hpp materialize_fp32.
 __device__ __forceinline__ float materialize(float v) { return strix::core::materialize_fp32(v); }
@@ -255,7 +263,10 @@ template <int Bits, int Depth> struct LdsRingU {
     // optimization: K3 never reads the third word. Lane shift = ((lane * 8 + 1) * 3 + 768 - 16) & 31 is 19 / 11 / 3 / 27 (<= 27),
     // and the 8 states span offsets 0..21, so a state reads at most low >> 27 = the top 5 bits of low, which come from
     // b << shift alone; tail is never read. With c = 0 compute_slot builds the same high/low (same bits); one load less.
-    static constexpr bool kNeedC = Bits != 3;
+    // The same holds for every Bits whose lanes all end inside two words (exl3_lane_window.hpp: Bits 1..4, e.g. the K2
+    // routed experts); K5..K8 keep the third word. K3 and K5 (the existing instantiations) keep their values.
+    static constexpr bool kNeedC = lane_window::needs_third_word(Bits);
+    static_assert(!lane_window::needs_third_word(3) && lane_window::needs_third_word(5));
     static __device__ __forceinline__ unsigned u(unsigned v) { return uni(v); }
     __device__ __forceinline__ LdsRingU(const std::uint32_t* trellis, unsigned output, unsigned col, unsigned kt_,
                                        unsigned splits_, unsigned s0_, unsigned s1_, unsigned lane)
@@ -345,6 +356,48 @@ __device__ __forceinline__ void stream_column_lds_u(const std::uint32_t* trellis
                                                     float (&acc)[R][2]) {
     LdsRingU<Bits, Depth> ring(trellis, output, col, kt, splits, s0, s1, lane);
     ring.template run<R>(xs, xs_stride, kofs, nrows, lane, acc);
+}
+
+// Expert rows core of the trellis MoE family: one wave, tile column `col`, ONE split `split` of `splits`; the reduced
+// split partial of each row r < nrows is stored at part0[r * part_stride + col * 16 + lane / 4 (+ 8)] for the finish to
+// add in ascending split order. xs: LDS rows (stride split_ch halves) of the split's transformed inputs, which start at
+// channel split * split_ch. Only the split's k tiles are read, so a matrix that holds a k range only (the columns slice
+// of a TP rank) passes its base moved back by its first k tile.
+// Same chains as MiniMax split4_core (mmx_moe.hip, gu4 scalar reader) for every Bits.
+template <int Bits, int R, int Depth>
+__device__ __forceinline__ void expert_split_partials(const std::uint32_t* trellis, unsigned output, unsigned kt, unsigned splits,
+                                                      unsigned col, unsigned split, unsigned split_ch, const _Float16* xs,
+                                                      unsigned nrows, unsigned lane, float* part0, std::size_t part_stride) {
+    float acc[R][2];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r][0] = acc[r][1] = 0.0F;
+    stream_column_lds_u<Bits, R, Depth>(trellis, output, col, kt, splits, split, split + 1, xs, split_ch, split * split_ch / 16, nrows,
+                                        lane, acc);
+    if ((lane & 3U) == 0)
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+            if (static_cast<unsigned>(r) < nrows) {
+                float* pr = part0 + static_cast<std::size_t>(r) * part_stride + col * 16 + lane / 4;
+                pr[0] = acc[r][0];
+                pr[8] = acc[r][1];
+            }
+}
+
+// Row bucket dispatch of expert_split_partials (1, 2, 4, MaxR rows; DepthBig for the largest bucket) for one Bits.
+template <int Bits, int MaxR, int Depth, int DepthBig = Depth>
+__device__ __forceinline__ void expert_split_rows(const std::uint32_t* trellis, unsigned output, unsigned kt, unsigned splits,
+                                                  unsigned col, unsigned split, unsigned split_ch, const _Float16* xs,
+                                                  unsigned nrows, unsigned lane, float* part0, std::size_t part_stride) {
+    if constexpr (MaxR == 1) {
+        expert_split_partials<Bits, 1, Depth>(trellis, output, kt, splits, col, split, split_ch, xs, nrows, lane, part0, part_stride);
+    } else {
+        if (nrows == 1) expert_split_partials<Bits, 1, Depth>(trellis, output, kt, splits, col, split, split_ch, xs, nrows, lane, part0, part_stride);
+        else if (nrows == 2 || MaxR == 2) expert_split_partials<Bits, 2, Depth>(trellis, output, kt, splits, col, split, split_ch, xs, nrows, lane, part0, part_stride);
+        else if constexpr (MaxR >= 4) {
+            if (nrows <= 4 || MaxR == 4) expert_split_partials<Bits, 4, Depth>(trellis, output, kt, splits, col, split, split_ch, xs, nrows, lane, part0, part_stride);
+            else expert_split_partials<Bits, MaxR, DepthBig>(trellis, output, kt, splits, col, split, split_ch, xs, nrows, lane, part0, part_stride);
+        }
+    }
 }
 
 // One wave streams tile column `col` over splits [s0, s1) of a matrix with kt = input / 16 k-tiles, accumulating the

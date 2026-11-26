@@ -5,6 +5,7 @@
 #include "../../weight/arch/sm120_sources.cuh"
 #include "strix/cuda/qwen_plemtp.hpp"
 #include "strix/cuda/qwen_mtp_v2_shape.hpp"
+#include "../../core/lookup_cuda.cuh"
 #include "../../core/mma_tile.cuh"
 #include "strix/env_flags.hpp"
 
@@ -504,6 +505,8 @@ MtpLayout mtp_layout(std::uint32_t rows) {
 }
 
 // 1. embedding_kernel<bf16, q8_0>: BF16 RNE of scale * code (exact).
+// The K10c fixture extracts this incumbent as its independent byte oracle.
+template <class = void>
 __global__ void mtp_embedding_kernel(const std::uint8_t* table, std::uint32_t vocab, const std::uint32_t* tokens,
     std::uint16_t* out, std::uint32_t* status) {
     const std::uint32_t row = blockIdx.y, f = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1139,6 +1142,15 @@ void launch_mtp_fused_projection(const float* normalized, const void* eh_q4, std
     check(cudaGetLastError(), "MTP fused projection launch");
 }
 
+namespace {
+void launch_mtp_embedding(const MtpWeights& w, const std::uint32_t* tokens, std::uint32_t rows,
+    std::uint16_t* out, std::uint32_t* status, cudaStream_t stream) {
+    const core::lookup::View view{{w.token_embd, w.vocab, kHidden}, core::lookup::Form::q8_0_to_bf16_row_zero,
+                                  out, rows, 1U, nullptr, status};
+    check(core::lookup::enqueue(view, core::lookup::TokenIds{tokens}, stream), "MTP embedding launch");
+}
+}  // namespace
+
 void launch_mtp_cache_rows(const MtpWeights& w, const MtpRounding& rd, const std::uint16_t* hidden,
     const std::uint32_t* next_tokens, std::uint32_t rows, std::uint64_t position0, std::uint16_t* kv, std::uint16_t* raw_index,
     void* workspace, std::uint32_t* status, const amdmath::Tables& tables, cudaStream_t stream, const std::uint64_t* position_dev) {
@@ -1147,8 +1159,7 @@ void launch_mtp_cache_rows(const MtpWeights& w, const MtpRounding& rd, const std
     const auto v = mtp_workspace_views(workspace, rows);
     auto* first_bad = reinterpret_cast<std::uint32_t*>(static_cast<unsigned char*>(workspace) + l.first_bad);
     check(cudaMemsetAsync(first_bad, 0xff, 4, stream), "MTP first-bad reset");
-    mtp_embedding_kernel<<<dim3(kHidden / 256U, rows), 256, 0, stream>>>(static_cast<const std::uint8_t*>(w.token_embd), w.vocab,
-        next_tokens, v.embedding, status);
+    launch_mtp_embedding(w, next_tokens, rows, v.embedding, status, stream);
     // STRIX_QRTX_MTP_STEP=0: the v1 kernels (reference) at every row count. Decode rows (<= 8) use every v2 form; prefill rows
     // use the v2 fused projection and hyper output (more outputs per warp / rows per CTA, same chains); the other many-row forms are v1.
     static const bool step_v2 = strix::envcfg::flag("STRIX_QRTX_MTP_STEP", true);

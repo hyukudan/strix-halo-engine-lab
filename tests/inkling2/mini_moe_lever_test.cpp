@@ -2,6 +2,8 @@
 #include "inkling2/inkling2_mini_weight_options.hpp"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <span>
@@ -19,6 +21,22 @@ namespace profile = strix::profile;
 void require(bool passed, const char* detail) {
     if (!passed) throw std::runtime_error(detail);
 }
+
+// The process-wide model preset switch strix-serve exports around its engine (restored on scope exit).
+struct PresetEnv {
+    PresetEnv() { set("1"); }
+    ~PresetEnv() { set(nullptr); }
+    PresetEnv(const PresetEnv&) = delete;
+    PresetEnv& operator=(const PresetEnv&) = delete;
+    static void set(const char* value) {
+#ifdef _MSC_VER
+        (void)_putenv_s(profile::kPresetEnv, value ? value : "");
+#else
+        if (value) (void)::setenv(profile::kPresetEnv, value, 1);
+        else (void)::unsetenv(profile::kPresetEnv);
+#endif
+    }
+};
 
 // Hermetic environment: only the Inkling switches under test, when given.
 profile::Inputs inputs(profile::Name tier, const char* value = nullptr, const char* image = nullptr,
@@ -63,38 +81,48 @@ void test_controller_planes() {
 // The engine resolves the W4A4 row: an unbound table would ignore STRIX_INK_MOE_W4A4 at every prompt length.
 void test_row() {
     require(mini::kMiniProfile.table.size() == mini::kMiniLevers.size(), "Inkling lever table bound to the engine");
-    require(mini::kMiniProfile.table.size() == 13U,
+    require(mini::kMiniProfile.table.size() == 19U,
             "W4A4, down image, prepared round fold, narrow experts, controller planes, projected-bias, served route, "
-            "screened head, calibrated low-bit, verify rows, speculation, image recipe and the block-candidate row");
-    // The speculation row: exact, builtin off in every tier until its device receipts, both values identified.
-    const auto* speculation = std::ranges::find_if(mini::kMiniLevers, [](const profile::Lever& lever) {
+            "screened head, calibrated low-bit, verify rows, speculation, image recipe, block-candidate, three StrixPack rows, folded scale, rows-select and the SP4 fixed-table head");
+    require(mini::kMiniLevers[11].name == mini::kMiniVisionRecipe, "image recipe sits before the block-candidate row");
+    require(mini::kMiniLevers[12].name == strix::spec::kBlockDraftLever.name &&
+                mini::kMiniLevers[13].name == strix::weight::kAttentionHeadSP4Lever.name &&
+                mini::kMiniLevers[14].name == strix::weight::kAttentionHeadSP3Lever.name &&
+                mini::kMiniLevers[15].name == strix::weight::kAttentionHeadSP2Lever.name &&
+                mini::kMiniLevers[16].name == strix::weight::kLowBitFoldedScaleLever.name &&
+                mini::kMiniLevers[17].name == strix::weight::kLowBitRowsSelectLever.name,
+            "existing block row retains its slot and StrixPack and both low-bit candidates are bound");
+    require(mini::kMiniLevers[18].name == mini::kMiniLowBitHead, "the SP4 fixed-table head row closes the table");
+    // The speculation row: exact, builtin auto (the default of every tier, legacy identity), off explicit.
+    const auto speculation = std::ranges::find_if(mini::kMiniLevers, [](const profile::Lever& lever) {
         return lever.name == mini::kMiniSpeculation;
     });
     require(speculation != mini::kMiniLevers.end() && speculation->kind == profile::Kind::exact &&
-                speculation->builtin == "off" && speculation->target == "auto" &&
+                speculation->builtin == "auto" && speculation->off == "off" &&
                 std::ranges::all_of(speculation->value, [](std::string_view v) { return v.empty(); }),
-            "speculation row: exact, off by default, target auto");
+            "speculation row: exact, auto by default (builtin), off explicit");
     for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
         mini::MiniWeightOptions options;
         options.tier = inputs(tier);
         const auto incumbent = mini::resolve_mini_profile(options, true);
-        require(!mini::mini_speculation(incumbent), "speculation resolves off");
+        require(mini::mini_speculation(incumbent), "speculation resolves auto (the builtin)");
         options.tier = inputs(tier);
         options.tier.env = [](const char* key) -> const char* {
-            return std::strcmp(key, "STRIX_INK_SPECULATION") == 0 ? "auto" : nullptr;
+            return std::strcmp(key, "STRIX_INK_SPECULATION") == 0 ? "off" : nullptr;
         };
         const auto selected = mini::resolve_mini_profile(options, true);
-        require(mini::mini_speculation(selected) && selected.fingerprint() != incumbent.fingerprint(),
-                "STRIX_INK_SPECULATION=auto selects speculation under its own identity, in every tier");
+        require(!mini::mini_speculation(selected) && selected.fingerprint() != incumbent.fingerprint(),
+                "STRIX_INK_SPECULATION=off switches speculation off under its own identity, in every tier");
     }
-    require(mini::kMiniLevers[11].name == mini::kMiniVisionRecipe, "image recipe sits before the block-candidate row");
     const auto& lever = mini::kMiniProfile.table.front();
     require(lever.name == mini::kMiniMoeW4a4 && lever.name == "inkling2-mini-moe-w4a4@1", "w4a4 identity");
     require(lever.env == "STRIX_INK_MOE_W4A4" && lever.off == "0" && lever.builtin == "0", "w4a4 off switch");
     require(lever.kind == profile::Kind::bit_changing, "bit-changing lever");
-    require(lever.value[0].empty() && lever.value[1] == "1" && lever.value[3].empty(), "exact off, fast/turbo on");
+    require(lever.value[0].empty() && lever.value[1] == "1" && lever.value[3] == "iu4", "exact off, fast 1, turbo iu4");
     for (std::size_t column = 0; column < profile::kProfileColumns; ++column)
-        require(!lever.ready[column] && !lever.provisional[column], "row stays opt-in until its FAST gate");
+        require(lever.ready[column] == (column == 3U) && !lever.provisional[column],
+                "fast stays opt-in until its FAST gate; turbo iu4 is ready with its declared quality");
+    require(profile::ladder_defect(mini::kMiniProfile).empty(), "Inkling ladder rows are well formed");
     require(lever.runnable[1] && lever.runnable[3] && !lever.runnable[0], "fast/turbo columns runnable");
 }
 
@@ -106,18 +134,8 @@ void test_resolution() {
     require(exact.find(mini::kMiniMoeW4a4) != nullptr, "exact resolution carries the row");
     require(exact.qualification() == "qualified", "exact receipt");
     const profile::Engine legacy{"inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1"};
-    // The CUDA EXACT defaults (projected bias, screened head) are non-builtin effective values, so the default
-    // fingerprint mixes them; with both explicitly 0 (their builtins, which the fingerprint omits) it is the legacy one.
-    auto incumbent_inputs = inputs(profile::Name::standard);
-    incumbent_inputs.env = [](const char* key) -> const char* {
-        return std::strcmp(key, "STRIX_INK_ATTN_PROJECTED_BIAS") == 0 || std::strcmp(key, "STRIX_INK_SCREENED_HEAD") == 0
-                   ? "0" : nullptr;
-    };
-    require(profile::resolve(mini::kMiniProfile, incumbent_inputs).fingerprint() ==
-                profile::resolve(legacy, inputs(profile::Name::standard)).fingerprint(),
-            "exact identity unchanged by the additive rows with the EXACT defaults switched off");
-    require(exact.fingerprint() != profile::resolve(legacy, inputs(profile::Name::standard)).fingerprint(),
-            "the EXACT defaults are a distinct run identity from the legacy one");
+    require(exact.fingerprint() == profile::resolve(legacy, inputs(profile::Name::standard)).fingerprint(),
+            "exact identity unchanged by the additive rows by default");
     const auto exact_image = profile::resolve(mini::kMiniProfile, inputs(profile::Name::standard, nullptr, "1"));
     const auto exact_fold = profile::resolve(mini::kMiniProfile, inputs(profile::Name::standard, nullptr, nullptr, "1"));
     require(exact.fingerprint() != exact_image.fingerprint(), "the selected down image is part of the run identity");
@@ -143,23 +161,28 @@ void test_resolution() {
                                               {"mse-gate-up", A::nvfp4_mse_gate_up},
                                               {"mse-r2-gate-up", A::nvfp4_mse_r2_gate_up},
                                               {"mse-r2", A::nvfp4_mse_r2},
-                                              {"r2", A::nvfp4_r2}}) {
+                                              {"r2", A::nvfp4_r2},
+                                              {"iu4", A::iu4_rot}}) {
             options.tier = inputs(tier, value);
             require(mini::mini_moe_w4a4_class(mini::resolve_mini_profile(options, true)) == expected,
                     "lever value selects the shared activation class");
-            require(mini::mini_moe_w4a4(mini::resolve_mini_profile(options, true)), "candidate values run W4A4");
+            require(mini::mini_moe_w4a4(mini::resolve_mini_profile(options, true)), "candidate values select a class");
             // Backend admission (CLI, gate, step program, server): CUDA runs the class; HIP refuses it instead of
             // running the BF16 tile under the class's name.
             const auto resolved = mini::resolve_mini_profile(options, true);
-            require(mini::admit_mini_moe_w4a4(resolved, "cuda") == expected, "CUDA admits the selected class");
-            bool hip_refused = false;
+            // The rotated integer class is the HIP class, the NVFP4 classes are CUDA classes.
+            const bool rotated = expected == A::iu4_rot;
+            const char* runs = rotated ? "hip" : "cuda";
+            const char* refuses = rotated ? "cuda" : "hip";
+            require(mini::admit_mini_moe_w4a4(resolved, runs) == expected, "the class's backend admits it");
+            bool refused_here = false;
             try {
-                static_cast<void>(mini::admit_mini_moe_w4a4(resolved, "hip"));
+                static_cast<void>(mini::admit_mini_moe_w4a4(resolved, refuses));
             } catch (const std::invalid_argument& error) {
-                hip_refused = std::string(error.what()).find(strix::moe_core::grouped_w4a4::identity(expected)) !=
-                              std::string::npos;
+                refused_here = std::string(error.what()).find(strix::moe_core::grouped_w4a4::identity(expected)) !=
+                               std::string::npos;
             }
-            require(hip_refused, "HIP refuses a selected W4A4 class and names it");
+            require(refused_here, "the other backend refuses a selected class and names it");
         }
         options.tier = inputs(tier, "0");
         require(mini::admit_mini_moe_w4a4(mini::resolve_mini_profile(options, true), "hip") == A::bf16,
@@ -176,6 +199,77 @@ void test_resolution() {
         refused = true;
     }
     require(refused, "malformed W4A4 switch must be refused");
+}
+
+// TURBO iu4 runs only in the measured prefill regimes of its ladder rows (gfx1151, prompts of 4,307..32,760 tokens);
+// every other regime, device and tier keeps the BF16 tile; explicit switches run as set.
+void test_ladder() {
+    using A = strix::moe_core::grouped_w4a4::Activations;
+    mini::MiniWeightOptions options;
+    // The execution every entry point spells for the timing rows (mini_ladder_execution): device product, resident
+    // context capacity, prefill chunk. The band receipts bind to it per run (LadderRow::band_bound).
+    // The host test names the HIP backend: the class is admitted per backend (the build's own backend is CUDA here).
+    const mini::MiniPromptExecution known{"gfx1151|product|cu40|mem", 65536U, 128U, "hip"};
+    const auto prompt = [&](profile::Name tier, const char* device, std::uint64_t tokens, const char* value = nullptr,
+                            const mini::MiniPromptExecution& run = {"gfx1151|product|cu40|mem", 65536U, 128U, "hip"}) {
+        options.tier = inputs(tier, value);
+        return mini::mini_prompt_moe(options, device, tokens, false, nullptr, run);
+    };
+    for (const std::uint64_t tokens : {4307ULL, 4309ULL, 8192ULL, 8236ULL, 8237ULL, 32758ULL, 32760ULL})
+        require(prompt(profile::Name::turbo, "gfx1151", tokens) == A::iu4_rot, "TURBO prefill inside the rows runs iu4");
+    for (const std::uint64_t tokens : {0ULL, 1ULL, 4306ULL, 32761ULL, 131072ULL})
+        require(prompt(profile::Name::turbo, "gfx1151", tokens) == A::bf16, "unmeasured prompt sizes keep the BF16 tile");
+    require(prompt(profile::Name::turbo, "sm_120", 8236U) == A::bf16, "other devices keep the BF16 tile");
+    require(prompt(profile::Name::turbo, "", 8236U) == A::bf16, "an unknown device keeps the BF16 tile");
+    require(prompt(profile::Name::fast, "gfx1151", 8236U) == A::bf16, "FAST keeps the BF16 tile");
+    require(prompt(profile::Name::standard, "gfx1151", 8236U) == A::bf16, "EXACT keeps the BF16 tile");
+    require(prompt(profile::Name::turbo, "gfx1151", 8236U, "0") == A::bf16, "off switch wins in TURBO");
+    require(prompt(profile::Name::fast, "gfx1151", 2048U, "iu4") == A::iu4_rot, "explicit iu4 runs as set");
+    // The rows are band receipts bound to the run's own execution: an execution that is not known decides nothing.
+    for (const auto& unknown : {mini::MiniPromptExecution{"", 0U, 0U, "hip"},
+                                mini::MiniPromptExecution{"gfx1151|product", 65536U, 0U, "hip"},
+                                mini::MiniPromptExecution{"", 65536U, 128U, "hip"}})
+        require(prompt(profile::Name::turbo, "gfx1151", 8236U, nullptr, unknown) == A::bf16,
+                "an unknown execution keeps the BF16 tile");
+    require(!mini::mini_ladder_execution(known, 8236U).empty() && mini::mini_ladder_execution({"", 0U, 0U, "hip"}, 8236U).empty(),
+            "the execution spelling needs the device product and the chunk");
+    require(mini::mini_ladder_execution(known, 8236U) != mini::mini_ladder_execution(known, 8237U),
+            "the execution spells the prompt");
+    for (const auto& row : mini::kMiniProfile.ladder)
+        require(row.band_bound && row.over.empty() && !row.incumbent && row.joint.empty(),
+                "Inkling timing rows are band receipts");
+
+    profile::Resolution receipt;
+    options.tier = inputs(profile::Name::turbo);
+    static_cast<void>(mini::mini_prompt_moe(options, "gfx1151", 8236U, false, &receipt, known));
+    const auto* entry = receipt.find(mini::kMiniMoeW4a4);
+    require(entry != nullptr && entry->status == profile::Status::set, "TURBO iu4 applies as a ready cell");
+    require(entry->ladder.find("turbo=iu4 applies x1.091") != std::string::npos, "route line names the measured row");
+    auto decode = inputs(profile::Name::turbo);
+    decode.regime = {profile::Phase::decode, 8236U, 1, "gfx1151"};
+    require(mini::mini_moe_w4a4_class(profile::resolve(mini::kMiniProfile, decode)) == A::bf16, "decode keeps the BF16 tile");
+
+    options.tier = inputs(profile::Name::turbo);
+    require(mini::mini_prompt_moe_may_select(options, "gfx1151", A::iu4_rot, known), "a TURBO gfx1151 load builds iu4 images");
+    require(!mini::mini_prompt_moe_may_select(options, "gfx1151", A::iu4_rot), "an unknown execution builds none");
+    require(!mini::mini_prompt_moe_may_select(options, "sm_120", A::iu4_rot, known), "a TURBO load elsewhere builds none");
+    options.tier = inputs(profile::Name::fast);
+    require(!mini::mini_prompt_moe_may_select(options, "gfx1151", A::iu4_rot, known), "a FAST load builds none");
+    options.tier = inputs(profile::Name::fast, "iu4");
+    require(mini::mini_prompt_moe_may_select(options, "sm_120", A::iu4_rot, known), "an explicit iu4 load builds them");
+
+    // strix-serve resolves under a model preset, which admits only ready cells: the server selects what the CLI
+    // selects for the same prompt (served prompts of the receipt: 4,307 / 8,234 / 32,758 tokens).
+    {
+        const PresetEnv preset;
+        for (const std::uint64_t tokens : {4307ULL, 8234ULL, 32758ULL})
+            require(prompt(profile::Name::turbo, "gfx1151", tokens) == A::iu4_rot, "served TURBO selects the CLI cell");
+        require(prompt(profile::Name::turbo, "gfx1151", 2048U) == A::bf16, "served TURBO keeps BF16 outside the rows");
+        require(prompt(profile::Name::fast, "gfx1151", 8234U) == A::bf16, "served FAST keeps the BF16 tile");
+        options.tier = inputs(profile::Name::turbo);
+        require(mini::mini_prompt_moe_may_select(options, "gfx1151", A::iu4_rot, known), "a served TURBO load builds images");
+    }
+    require(!profile::model_preset(), "preset scope restored");
 }
 
 // The down-image lever: off in every profile unless selected explicitly (STRIX_INK_COMBINE_IMAGE=1), one value for every
@@ -242,18 +336,16 @@ void test_configure() {
     require(mini::configure_mini_decoder(decoder, resolved).down_image && decoder.image_calls == 1 && decoder.image,
             "the resolved image lever reaches the decoder");
     require(!decoder.fold, "the round fold stays off while only the image is selected");
-    // The projected-bias lever reaches every decoder through the same helper the CLI, the gate and the server call; an
-    // explicit 0 keeps the incumbent image route.
-    for (const char* value : {"1", "0"}) {
-        profile::Inputs sel = inputs(profile::Name::standard);
-        sel.env = [value](const char* key) -> const char* {
-            return std::strcmp(key, "STRIX_INK_ATTN_PROJECTED_BIAS") == 0 ? value : nullptr;
+    // The projected-bias lever reaches every decoder through the same helper the CLI, the gate and the server call.
+    {
+        profile::Inputs on = inputs(profile::Name::standard);
+        on.env = [](const char* key) -> const char* {
+            return std::strcmp(key, "STRIX_INK_ATTN_PROJECTED_BIAS") == 0 ? "1" : nullptr;
         };
-        options.tier = sel;
+        options.tier = on;
         FakeDecoder projected;
         mini::configure_mini_decoder(projected, mini::resolve_mini_profile(options, true));
-        require(projected.projected == (value[0] == '1'),
-                "the resolved projected-bias lever reaches the decoder through configure_mini_decoder");
+        require(projected.projected, "the resolved projected-bias lever reaches the decoder through configure_mini_decoder");
     }
     options.tier = inputs(profile::Name::standard);
     FakeDecoder by_default;
@@ -261,7 +353,7 @@ void test_configure() {
         const auto levers = mini::configure_mini_decoder(by_default, mini::resolve_mini_profile(options, true));
         require(!levers.down_image && !levers.prepared_round_fold && !by_default.fold && !by_default.image,
                 "no other lever is applied by default");
-        require(by_default.projected, "the projected-bias route is the default (RTX identity receipts)");
+        require(!by_default.projected, "the projected-bias route is opt-in: off by default");
         require(by_default.verify == 0U && levers.verify_rows == 0U, "the verify rows lever is opt-in: off by default");
     }
     options.tier = inputs(profile::Name::standard, nullptr, nullptr, "1");
@@ -319,13 +411,10 @@ void test_projected_bias() {
     const auto& row = mini::kMiniLevers[5];
     require(row.name == mini::kMiniAttnProjectedBias && row.name == "inkling2-mini-attn-projected-bias@1", "row identity");
     require(row.env == "STRIX_INK_ATTN_PROJECTED_BIAS" && row.off == "0" && row.builtin == "0" &&
-                row.kind == profile::Kind::exact, "row is an exact lever, builtin the image route, off switch 0");
-    for (std::size_t column = 0; column < profile::kProfileColumns; ++column) {
-        // Default, fast and quality select the projected route (RTX identity receipts); the empty turbo cell inherits fast.
-        require(row.value[column] == (column == 3U ? "" : "1") && row.ready[column] && !row.provisional[column] &&
-                    row.runnable[column],
-                "every profile column selects the projected route after its RTX identity receipts");
-    }
+                row.kind == profile::Kind::exact, "row is an exact lever, off by default");
+    for (std::size_t column = 0; column < profile::kProfileColumns; ++column)
+        require(row.value[column].empty() && !row.ready[column] && !row.provisional[column] && row.runnable[column],
+                "no profile column selects the projected route before its landing-head identity");
     const auto in = [](profile::Name tier, const char* value) {
         profile::Inputs inputs;
         inputs.profile = tier;
@@ -336,33 +425,20 @@ void test_projected_bias() {
     };
     mini::MiniWeightOptions options;
     for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
-        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, true}, {"0", false}, {"1", true}}) {
+        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
             options.tier = in(tier, value);
             for (const bool native : {false, true})
                 require(mini::mini_attn_projected_bias(mini::resolve_mini_profile(options, native)) == expected,
                         "projected-bias lever resolves one value per tier for every entry point");
         }
     }
-    // The default is the lever ON (a non-builtin effective value, so the fingerprint mixes it); the row declares no
-    // engine identity variant, so the resolution stays the incumbent identity. An explicit 0 is the builtin, which the
-    // fingerprint omits: the legacy run identity.
     const profile::Engine legacy{"inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1"};
-    const auto legacy_print = profile::resolve(legacy, in(profile::Name::standard, nullptr)).fingerprint();
-    // The other CUDA EXACT default (the screened head) is switched off too: its default is a non-builtin value as well.
-    profile::Inputs both_off = in(profile::Name::standard, nullptr);
-    both_off.env = [](const char* key) -> const char* {
-        return std::strcmp(key, "STRIX_INK_ATTN_PROJECTED_BIAS") == 0 || std::strcmp(key, "STRIX_INK_SCREENED_HEAD") == 0
-                   ? "0" : nullptr;
-    };
-    require(profile::resolve(mini::kMiniProfile, both_off).fingerprint() == legacy_print,
-            "an explicit 0 keeps the legacy identity: the builtin, which the fingerprint omits");
-    require(profile::resolve(mini::kMiniProfile, in(profile::Name::standard, nullptr)).fingerprint() != legacy_print,
-            "the default is the lever on, a distinct run identity from the image route");
     require(profile::resolve(mini::kMiniProfile, in(profile::Name::standard, nullptr)).fingerprint() ==
-                profile::resolve(mini::kMiniProfile, in(profile::Name::standard, "1")).fingerprint(),
-            "an explicit 1 is the default's own run (the fingerprint holds effective values)");
-    require(profile::resolve(mini::kMiniProfile, in(profile::Name::standard, nullptr)).incumbent_identity(),
-            "the lever is a row, not an identity variant");
+                profile::resolve(legacy, in(profile::Name::standard, nullptr)).fingerprint(),
+            "default identity unchanged: the default is the row's builtin, which the fingerprint omits");
+    require(profile::resolve(mini::kMiniProfile, in(profile::Name::standard, "1")).fingerprint() !=
+                profile::resolve(legacy, in(profile::Name::standard, nullptr)).fingerprint(),
+            "an explicit opt-in is a distinct run identity");
     options.tier = in(profile::Name::fast, "yes");
     bool refused = false;
     try {
@@ -377,12 +453,12 @@ void test_projected_bias() {
 // receipt; an explicit STRIX_MOE_EXPERTS_NVFP4=1 opts in (unqualified), 0 is the off switch, other values are refused.
 // The verify rows row: an exact lever, opt-in (off in every tier, builtin the per-row incumbent), bound to the engine,
 // switchable by STRIX_INK_VERIFY_ROWS, refused on a malformed value, and reaching the decoder through the one helper.
-// It is appended after main's rows; the block-candidate row stays last.
+// The block-candidate row follows the image recipe.
 void test_verify_rows() {
     const auto& row = *std::find_if(mini::kMiniLevers.begin(), mini::kMiniLevers.end(),
                                     [](const auto& lever) { return lever.name == mini::kMiniVerifyRows; });
     require(row.name == mini::kMiniVerifyRows && row.name == "inkling2-mini-verify-rows@1", "verify rows row identity");
-    require(mini::kMiniLevers.back().name == strix::spec::kBlockDraftLever.name, "the block-candidate row stays last");
+    require(mini::kMiniLevers[12].name == strix::spec::kBlockDraftLever.name, "the block-candidate row follows the image recipe");
     require(row.env == "STRIX_INK_VERIFY_ROWS" && row.off == "0" && row.builtin == "0" &&
                 row.kind == profile::Kind::exact, "verify rows row is an exact lever, off by default");
     for (std::size_t column = 0; column < profile::kProfileColumns; ++column)
@@ -412,14 +488,9 @@ void test_verify_rows() {
         }
     }
     const profile::Engine legacy{"inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1"};
-    profile::Inputs exact_off = in(profile::Name::standard, nullptr);  // the two CUDA EXACT defaults off (their builtins)
-    exact_off.env = [](const char* key) -> const char* {
-        return std::strcmp(key, "STRIX_INK_ATTN_PROJECTED_BIAS") == 0 || std::strcmp(key, "STRIX_INK_SCREENED_HEAD") == 0
-                   ? "0" : nullptr;
-    };
-    require(profile::resolve(mini::kMiniProfile, exact_off).fingerprint() ==
+    require(profile::resolve(mini::kMiniProfile, in(profile::Name::standard, nullptr)).fingerprint() ==
                 profile::resolve(legacy, in(profile::Name::standard, nullptr)).fingerprint(),
-            "identity unchanged by the verify rows row (builtin omitted from the fingerprint)");
+            "default identity unchanged by the verify rows row (builtin omitted from the fingerprint)");
     require(profile::resolve(mini::kMiniProfile, in(profile::Name::standard, "1")).fingerprint() !=
                 profile::resolve(mini::kMiniProfile, in(profile::Name::standard, nullptr)).fingerprint(),
             "an explicit verify rows selection is a distinct identity");
@@ -522,7 +593,10 @@ void test_vision_recipe_row() {
     for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
         options.tier = inputs(tier);
         const auto with = mini::resolve_mini_profile(options, true);
-        const auto old = profile::resolve(without_row, inputs(tier));
+        auto old = profile::resolve(without_row, inputs(tier));
+        // Compare after the same weight admission step: unavailable StrixPack rows
+        // are filtered from the effective receipt, independently of the vision row.
+        static_cast<void>(mini::admit_mini_strixpack_receipt(old));
         require(with.summary() == old.summary() && with.tier_notice() == old.tier_notice() &&
                     with.qualification() == old.qualification() && with.fingerprint() == old.fingerprint(),
                 "unset image recipe: the text-only resolution is the table's without the row");
@@ -557,10 +631,9 @@ void test_vision_recipe_row() {
         }
     }
 }
-// The screened-head row: an exact lever, the default in every tier after its RTX identity receipts (builtin the full
-// head, which an explicit 0 keeps), bound to the engine after main's rows (the block-candidate row stays last),
-// switchable by STRIX_INK_SCREENED_HEAD, refused on a malformed value; the default and the explicit 1 are one run
-// identity, the explicit 0 keeps the legacy one.
+// The screened-head row: an exact lever, opt-in (off by default in every tier, builtin the full head), bound to the
+// engine after main's rows (the block-candidate row retains its original slot), switchable by STRIX_INK_SCREENED_HEAD, refused on a
+// malformed value; the explicit 1 is a distinct run identity, the default keeps the legacy one.
 void test_screened_head_row() {
     const profile::Lever* lever = nullptr;
     std::size_t index = 0;
@@ -571,15 +644,15 @@ void test_screened_head_row() {
         }
     require(lever != nullptr && lever->name == "inkling2-mini-screened-head@1" && index == 7U &&
                 mini::kMiniProfile.table[6].name == mini::kMiniServedCliRoute &&
-                mini::kMiniProfile.table.back().name == strix::spec::kBlockDraftLever.name,
-            "screened head row identity and position (appended; the block-candidate row stays last)");
+                mini::kMiniProfile.table[12].name == strix::spec::kBlockDraftLever.name,
+            "screened head row identity and position (the block-candidate row follows the image recipe)");
     require(lever->env == "STRIX_INK_SCREENED_HEAD" && lever->off == "0" && lever->builtin == "0" &&
                 lever->kind == profile::Kind::exact && lever->omit_builtin_fingerprint && lever->option.empty(),
-            "screened head row is an exact lever, builtin the full head, off switch 0");
+            "screened head row is an exact lever, off by default");
     for (std::size_t column = 0; column < profile::kProfileColumns; ++column)
-        require(lever->value[column] == (column == 3U ? "" : "1") && lever->ready[column] &&
-                    !lever->provisional[column] && lever->runnable[column],
-                "every profile column selects the screened head after its RTX identity receipts (turbo inherits fast)");
+        require(lever->value[column].empty() && !lever->ready[column] && !lever->provisional[column] &&
+                    lever->runnable[column],
+                "no profile column selects the screened head before its RTX identity receipt");
     const auto in = [](profile::Name tier, const char* value) {
         profile::Inputs inputs;
         inputs.profile = tier;
@@ -590,7 +663,7 @@ void test_screened_head_row() {
     };
     mini::MiniWeightOptions options;
     for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
-        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, true}, {"0", false}, {"1", true}}) {
+        for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
             options.tier = in(tier, value);
             for (const bool native : {false, true}) {
                 const auto resolution = mini::resolve_mini_profile(options, native);
@@ -599,23 +672,17 @@ void test_screened_head_row() {
                 require(resolution.incumbent_identity(), "the lever is a row, not an identity variant");
             }
         }
-        // The default is on: it shares the explicit 1's identity and differs from the explicit 0 (the builtin, which the
-        // fingerprint omits).
+        // Distinct identity for 1 in every tier; unset and 0 keep the tier's default identity.
         const auto unset = profile::resolve(mini::kMiniProfile, in(tier, nullptr)).fingerprint();
-        require(profile::resolve(mini::kMiniProfile, in(tier, "1")).fingerprint() == unset,
-                "an explicit 1 is the default's own run identity");
-        require(profile::resolve(mini::kMiniProfile, in(tier, "0")).fingerprint() != unset,
-                "an explicit 0 keeps the incumbent full head, a distinct run identity from the default");
+        require(profile::resolve(mini::kMiniProfile, in(tier, "0")).fingerprint() == unset,
+                "an explicit 0 is the default identity");
+        require(profile::resolve(mini::kMiniProfile, in(tier, "1")).fingerprint() != unset,
+                "an explicit 1 is a distinct run identity");
     }
     const profile::Engine legacy{"inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1"};
-    profile::Inputs both_off = in(profile::Name::standard, nullptr);  // the other CUDA EXACT default off too
-    both_off.env = [](const char* key) -> const char* {
-        return std::strcmp(key, "STRIX_INK_ATTN_PROJECTED_BIAS") == 0 || std::strcmp(key, "STRIX_INK_SCREENED_HEAD") == 0
-                   ? "0" : nullptr;
-    };
-    require(profile::resolve(mini::kMiniProfile, both_off).fingerprint() ==
+    require(profile::resolve(mini::kMiniProfile, in(profile::Name::standard, nullptr)).fingerprint() ==
                 profile::resolve(legacy, in(profile::Name::standard, nullptr)).fingerprint(),
-            "an explicit 0 keeps the legacy identity: the builtin, which the fingerprint omits");
+            "default identity unchanged: the default is the row's builtin, which the fingerprint omits");
     for (const char* bad : {"yes", "2"}) {
         options.tier = in(profile::Name::fast, bad);
         bool refused = false;
@@ -628,7 +695,7 @@ void test_screened_head_row() {
     }
 }
 
-// The head decision (MiniResidentDecoder::set_screened_head through configure_mini_decoder): lever off (explicit 0) -> the full head
+// The head decision (MiniResidentDecoder::set_screened_head through configure_mini_decoder): lever off -> the full head
 // without building the plane, even where it could be built; on -> screened; a plane that cannot be built -> the full
 // head with the reason; the startup field names each state.
 void test_screened_head_decision() {
@@ -676,26 +743,21 @@ void test_screened_head_decision() {
         };
         return mini::resolve_mini_profile(options, true);
     };
-    {
+    for (const char* value : {static_cast<const char*>(nullptr), "0"}) {
         FakeDecoder decoder;
-        const auto levers = mini::configure_mini_decoder(decoder, with("0"));
+        const auto levers = mini::configure_mini_decoder(decoder, with(value));
         require(levers.head == mini::MiniHead{} && decoder.screen_builds == 0,
-                "0: every entry point keeps the full head and builds no plane");
+                "unset or 0: every entry point keeps the full head and builds no plane");
     }
-    for (const char* value : {static_cast<const char*>(nullptr), "1"}) {
-        FakeDecoder on;
-        require(mini::configure_mini_decoder(on, with(value)).head ==
-                        mini::MiniHead{true, mini::MiniHeadReason::lever} &&
-                    on.screen_builds == 1,
-                "unset or 1: the resolved lever reaches the decoder through configure_mini_decoder");
-    }
-    for (const char* value : {static_cast<const char*>(nullptr), "1"}) {
-        FakeDecoder refused;
-        refused.builds = false;
-        require(mini::configure_mini_decoder(refused, with(value)).head ==
-                    mini::MiniHead{false, mini::MiniHeadReason::build_refused},
-                "unset or 1 with a plane that cannot be built: the full head, reported build-refused");
-    }
+    FakeDecoder on;
+    require(mini::configure_mini_decoder(on, with("1")).head == mini::MiniHead{true, mini::MiniHeadReason::lever} &&
+                on.screen_builds == 1,
+            "1: the resolved lever reaches the decoder through configure_mini_decoder");
+    FakeDecoder refused;
+    refused.builds = false;
+    require(mini::configure_mini_decoder(refused, with("1")).head ==
+                mini::MiniHead{false, mini::MiniHeadReason::build_refused},
+            "1 with a plane that cannot be built: the full head, reported build-refused");
 }
 }  // namespace
 
@@ -759,6 +821,7 @@ int main() {
         test_vision_recipe_row();
         test_served_route();
         test_resolution();
+        test_ladder();
         test_combine_image();
         test_controller_planes();
         test_configure();

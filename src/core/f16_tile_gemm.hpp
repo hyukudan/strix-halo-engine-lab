@@ -343,23 +343,24 @@ inline hipError_t gemm_q8_projections(const float* a, unsigned rows, unsigned K,
 // Low-bit resident projections (q4_g64 / q6_g64) on the same tile: the Q8_0 projection core with the low-bit staging
 // trait: integer codes as the FP16 operand, one WMMA chain per K64 group from +0, acc = fma(group sum, float(d), acc)
 // (the small-M schedule's arithmetic, f16_tile_gemm_small.hpp; FAST). K % 128 == 0 (whole superblocks).
-template <unsigned Capacity, class LowBit>
+// Policy folded (a FAST / TURBO candidate value, core/lowbit_f16_staging.hpp): fp16(code x d) operands, one WMMA chain.
+template <unsigned Capacity, class LowBit, lowbit_f16::ScalePolicy Policy = lowbit_f16::ScalePolicy::group>
 __global__ __launch_bounds__(kThreads)
 void lowbit_projection_kernel(const float* a, unsigned rows, unsigned K, std::size_t w_row_bytes,
                               Q8ProjectionGroup<Capacity> group) {
     const Args p{a, nullptr, K, 0U, nullptr, w_row_bytes, 0U, nullptr, 0U, 0U, rows, K, 0U, 1U};
     __shared__ Storage lds;
-    q8_core<Capacity, lowbit_f16::LowBitF16Staging<LowBit>>(p, lds, group);
+    q8_core<Capacity, lowbit_f16::LowBitF16Staging<LowBit, Policy>>(p, lds, group);
 }
 
-template <class LowBit, unsigned Capacity>
+template <class LowBit, unsigned Capacity, lowbit_f16::ScalePolicy Policy = lowbit_f16::ScalePolicy::group>
 inline hipError_t gemm_lowbit_projections(const float* a, unsigned rows, unsigned K,
                                           const Q8ProjectionGroup<Capacity>& group, hipStream_t stream) {
     static_assert(Capacity <= 32U);  // The total panel count fits unsigned.
     const dim3 grid((group.first_panel[group.count] + 1U) / 2U, (rows + kBM - 1U) / kBM);
     const auto w_row_bytes = static_cast<std::size_t>(LowBit::row_bytes(K));
-    STRIX_HIP_LAUNCH(Rdna3Layout,
-                     lowbit_projection_kernel<Capacity, LowBit><<<grid, kThreads, 0, stream>>>(a, rows, K, w_row_bytes, group));
+    STRIX_HIP_LAUNCH(Rdna3Layout, lowbit_projection_kernel<Capacity, LowBit, Policy>
+                                  <<<grid, kThreads, 0, stream>>>(a, rows, K, w_row_bytes, group));
     return hipGetLastError();
 }
 

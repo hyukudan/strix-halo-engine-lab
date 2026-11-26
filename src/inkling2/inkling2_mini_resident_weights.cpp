@@ -18,6 +18,30 @@ void check(weight::Status status) {
     if (!status) throw std::runtime_error("Inkling 2 Mini resident weights: " + status.detail);
 }
 
+bool attention_only_q8(weight::RoleStorage storage) {
+    return storage.attention == weight::kQ8WeightStorage && storage.head == weight::kBf16WeightStorage;
+}
+
+bool compact_attention_projection(MiniAttentionProjection role, bool all_q8_projections) {
+    using Role = MiniAttentionProjection;
+    return role == Role::query || role == Role::key || role == Role::value || role == Role::output ||
+           (all_q8_projections && role != Role::relative_bias);
+}
+
+bool is_compact_q8_attention_tensor(std::string_view name) {
+    constexpr std::string_view layers = "layers.";
+    if (!name.starts_with(layers)) return false;
+    const auto dot = name.find('.', layers.size());
+    if (dot == std::string_view::npos) return false;
+    const auto suffix = name.substr(dot + 1U);
+    for (unsigned i = 0; i < attn_core::ResidentPreparedGqaWeights::role_count; ++i) {
+        const auto role = static_cast<MiniAttentionProjection>(i);
+        if (compact_attention_projection(role, true) && suffix == mini_attention_projection_spec(role).tensor_suffix)
+            return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weights, weight::RoleStorage storage,
@@ -25,7 +49,8 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
                                                     const weight::LowbitPack* pack, bool keep_bf16) {
     const auto stored = [](weight::FormatId format) {
         return format == weight::kBf16WeightStorage || format == weight::kQ8WeightStorage ||
-               format == weight::kQ4G64WeightStorage || format == weight::kQ6G64WeightStorage;
+               format == weight::kQ4G64WeightStorage || format == weight::kQ6G64WeightStorage ||
+               format == weight::kSP4TWeightStorage;
     };
     if (!stored(storage.attention) || !stored(storage.head))
         throw std::invalid_argument("invalid Inkling 2 Mini resident weight storage");
@@ -51,30 +76,33 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
     unsigned expected_prepacked = 0U;
     for (const auto& spec : schema) {
         if (!spec.resident || narrowed_tensors.contains(spec.name)) continue;
+        const auto name = std::string_view(spec.name).substr(kMiniTextTensorPrefix.size());
         const auto role_storage = spec.load_matrix_role == weight::Role::head ? storage.head : storage.attention;
-        const auto compact = role_storage != weight::kBf16WeightStorage && spec.load_matrix_role;
+        const bool compact = role_storage != weight::kBf16WeightStorage &&
+            (spec.load_matrix_role || (attention_only_q8(storage) && is_compact_q8_attention_tensor(name)));
         const auto pitch = !compact && spec.load_matrix_role == weight::Role::attention_o ? output_pitch : 0U;
         const auto* raw = weights.find(spec.name);
         std::optional<weight::Slice> prepacked;
-        if (pack && compact && raw &&
-            (role_storage == weight::kQ4G64WeightStorage || role_storage == weight::kQ6G64WeightStorage))
+        std::int32_t outer_exponent = 0;
+        const bool packed_role = role_storage == weight::kQ4G64WeightStorage ||
+                                 role_storage == weight::kQ6G64WeightStorage || role_storage == weight::kSP4TWeightStorage;
+        if (pack && compact && raw && packed_role)
             ++expected_prepacked;
-        if (pack && compact && raw &&
-            (role_storage == weight::kQ4G64WeightStorage || role_storage == weight::kQ6G64WeightStorage)) {
-            check(pack->find(spec.name, role_storage, *raw, prepacked));
+        if (pack && compact && raw && packed_role) {
+            check(pack->find(spec.name, role_storage, *raw, prepacked, &outer_exponent));
             if (!prepacked && plan.keep_bf16_)
                 throw std::runtime_error("measured pack lacks tensor " + spec.name);
             if (prepacked) ++plan.prepacked_;
         }
-        const auto name = std::string_view(spec.name).substr(kMiniTextTensorPrefix.size());
         if (compact && plan.keep_bf16_) {
             const auto bf16_pitch = spec.load_matrix_role == weight::Role::attention_o ? output_pitch : 0U;
             tensors.push_back({name, raw, std::nullopt, bf16_pitch, std::nullopt});
             tensors.push_back({copy_names.emplace_back(std::string(kMiniLowBitImage) + std::string(name)), raw,
-                               role_storage, 0U, std::move(prepacked)});
+                               role_storage, 0U, std::move(prepacked), outer_exponent});
             continue;
         }
-        tensors.push_back({name, raw, compact ? std::optional(role_storage) : std::nullopt, pitch, std::move(prepacked)});
+        tensors.push_back({name, raw, compact ? std::optional(role_storage) : std::nullopt, pitch, std::move(prepacked),
+                           outer_exponent});
     }
     if (pack) mini_require_calibrated_pack_matrix_count(plan.prepacked_, expected_prepacked);
     plan.slices_ = weight::ResidentSlicePlan::make(std::move(tensors), kAlignment);
@@ -122,13 +150,10 @@ MiniResidentWeights MiniResidentWeights::bind(const MiniResidentWeightPlan& plan
                 const auto role = static_cast<Role>(i);
                 if (!is_full_attention(layer) && (role == Role::key_taps || role == Role::value_taps)) continue;
                 const auto name = prefix + std::string(mini_attention_projection_spec(role).tensor_suffix);
-                switch (role) {
-                    case Role::query: case Role::key: case Role::value: case Role::output:
-                        attention.matrix[i] = bound.slices_.matrix(compact_name(name));
-                        break;
-                    default:
-                        attention.matrix[i] = bound.bf16(name).data();
-                }
+                if (compact_attention_projection(role, attention_only_q8(plan.storage_)))
+                    attention.matrix[i] = bound.slices_.matrix(compact_name(name));
+                else
+                    attention.matrix[i] = bound.bf16(name).data();
             }
             attention.query_gain = bound.bf16(prefix + "attn.q_l2_clip.scale").data();
             attention.relative_gain = bound.bf16(prefix + "attn.rel_l2_clip.scale").data();

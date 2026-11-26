@@ -56,18 +56,12 @@ void test_resolution() {
     // Real default resolution of every profile: off.
     for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo, profile::Name::quality})
         require(!fold(tier), "off by default in every profile");
-    // The EXACT identity is the legacy one when no lever is applied (the two CUDA EXACT defaults switched off).
+    // The EXACT identity is the legacy one by default (no lever applied, none reported).
     mini::MiniWeightOptions plain;
     plain.tier = inputs(profile::Name::standard);
-    // The CUDA EXACT defaults (projected bias, screened head) are non-builtin values the fingerprint mixes: switch
-    // both off (their builtins) to compare with the legacy identity.
-    plain.tier.env = [](const char* key) -> const char* {
-        return std::strcmp(key, "STRIX_INK_ATTN_PROJECTED_BIAS") == 0 || std::strcmp(key, "STRIX_INK_SCREENED_HEAD") == 0
-                   ? "0" : nullptr;
-    };
     require(mini::resolve_mini_profile(plain, true).fingerprint() ==
                 profile::resolve(bare, inputs(profile::Name::standard)).fingerprint(),
-            "EXACT fingerprint equals the legacy one with the EXACT defaults switched off");
+            "EXACT fingerprint equals the legacy one by default");
     // The off switch, and an explicit on, in every column.
     for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo, profile::Name::quality}) {
         require(!fold(tier, "0"), "off switch");

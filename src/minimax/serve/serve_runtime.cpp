@@ -276,6 +276,9 @@ public:
             }
         }
         // taps only while DSpark is on (both ranks read the same STRIX_MM_SERVE_DSPARK; runtime switches via Command::taps)
+        if (!drafter || dspark_mode == ds::Mode::off)
+            std::fprintf(stderr, "rank %u: MiniMax decode: plain (DSpark %s)\n",
+                         opt.rank, dspark_mode == ds::Mode::off ? "off" : "assets missing");
         const bool dspark_on = drafter != nullptr && dspark_mode == ds::Mode::on;
         if (drafter != nullptr) eng.set_taps(dspark_on);
         if (opt.rank != 0) {

@@ -22,6 +22,10 @@ peer_bin_dir=${BENCH_PEER_BIN_DIR:-}
 peer_model_dir=${BENCH_PEER_MODEL_DIR:-}
 limit=${BENCH_TIMEOUT:-3600}
 repeats='' contexts='' gen_tokens='' concurrency=1,4,8 warmup='' profile='' prompts=kit only=decode,prefill,exactness json=0 md=0 verify_models=cached
+if [[ $action == campaign ]]; then
+    py campaign "$@"
+    exit
+fi
 if [[ $action == report ]]; then
     [[ $# == 1 ]] || die 'usage: bench.sh report DIR'
     py report "$1/results.json"

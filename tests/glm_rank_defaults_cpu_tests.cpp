@@ -374,7 +374,9 @@ void test_mtp_default() {
     const auto split = names.size() / 2;
     write_shard("indexed.safetensors", 0, split);
     write_shard("mtp.safetensors", split, names.size());
-    CHECK(rd::probe_model_mtp(dir).mtp_complete);
+    const auto split_facts = rd::probe_model_mtp(dir);
+    CHECK(split_facts.mtp_complete);
+    CHECK((split_facts.mtp_files == std::vector<std::filesystem::path>{dir / "indexed.safetensors", dir / "mtp.safetensors"}));
     write_shard("mtp.safetensors", split - 1, names.size());
     facts = rd::probe_model_mtp(dir);
     CHECK(!facts.mtp_complete && facts.reason.find("tensor defined twice") != std::string::npos);
@@ -387,6 +389,11 @@ void test_mtp_default() {
     write(true);
     facts = rd::probe_model_mtp(dir);
     CHECK(facts.mtp_present && facts.mtp_complete);
+    // Discovery records every role tensor's payload span (role order, absolute offsets), still without reading payloads.
+    CHECK(facts.mtp_spans.size() == roles.size() && facts.mtp_spans.front().name == names.front());
+    CHECK(facts.mtp_spans.front().file == dir / "mtp.safetensors" && facts.mtp_spans.front().offset > 8);
+    CHECK(facts.mtp_spans[1].offset == facts.mtp_spans[0].offset + facts.mtp_spans[0].bytes);
+    CHECK(facts.mtp_digest.empty());
     auto resolve_head = [&](const Args& extra, const Env& env = Env{}) {
         return rd::resolve(rd::scan(cat(cat(kDeploy, kDecodeWork), extra)), getter(env), facts);
     };
@@ -870,10 +877,71 @@ void test_sampled_mtp_admission() {
 
 }  // namespace
 
+// r94: the drafter's content identity. Same payload under other file names / offsets -> same digest; one changed payload
+// byte -> another digest; bytes outside the spans do not count; an incomplete inventory has none. The digest is named
+// by the receipt and by the path-free print() the pair identity vote hashes.
+void test_mtp_payload_digest() {
+    const auto dir = std::filesystem::temp_directory_path() /
+        ("glm-mtp-digest-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directory(dir);
+    struct Cleanup {
+        std::filesystem::path dir;
+        ~Cleanup() {
+            for (const auto& e : std::filesystem::directory_iterator(dir)) std::filesystem::remove(e.path());
+            std::filesystem::remove(dir);
+        }
+    } cleanup{dir};
+    const auto put = [&](const char* name, const std::string& bytes) {
+        std::ofstream f(dir / name, std::ios::binary);
+        f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    };
+    std::string a(3000, '\0'), b(4000, 'x');
+    for (std::size_t i = 0; i < a.size(); ++i) a[i] = static_cast<char>(i * 37 + 11);
+    for (std::size_t i = 0; i < 3000 - 100; ++i) b[1000 + i] = a[100 + i];  // same span bytes, other file / offset
+    put("a.safetensors", a);
+    put("b.safetensors", b);
+    rd::ModelFacts facts;
+    facts.mtp_present = facts.mtp_complete = true;
+    facts.mtp_spans = {{"t0", dir / "a.safetensors", 100, 1203}, {"t1", dir / "a.safetensors", 1303, 1697}};
+    const auto digest = rd::mtp_payload_digest(facts);
+    CHECK(digest.size() == 16);
+    auto moved = facts;
+    moved.mtp_spans = {{"t0", dir / "b.safetensors", 1000, 1203}, {"t1", dir / "b.safetensors", 2203, 1697}};
+    CHECK(rd::mtp_payload_digest(moved) == digest);
+    auto renamed = facts;
+    renamed.mtp_spans[1].name = "t2";
+    CHECK(rd::mtp_payload_digest(renamed) != digest);
+    b[1000 + 1500] = static_cast<char>(b[1000 + 1500] ^ 1);  // one payload bit inside t1
+    put("b.safetensors", b);
+    CHECK(rd::mtp_payload_digest(moved) != digest);
+    b[1000 + 1500] = static_cast<char>(b[1000 + 1500] ^ 1);
+    b[10] = 'y';  // outside every span
+    put("b.safetensors", b);
+    CHECK(rd::mtp_payload_digest(moved) == digest);
+    auto partial = facts;
+    partial.mtp_complete = false;
+    CHECK(rd::mtp_payload_digest(partial).empty());
+
+    facts.mtp_files = {dir / "a.safetensors"};
+    auto e = rd::resolve(rd::scan(cat(kDeploy, kDecodeWork)), getter(Env{}), facts);
+    CHECK(e.mtp_spec.value == "1");
+    e.head.mtp_digest = digest;
+    CHECK(rd::mtp_decode_line(e).find(" payload=" + digest + "\n") != std::string::npos);
+    auto other = e;
+    other.head.mtp_digest = rd::mtp_payload_digest(renamed);
+    const auto line = std::string("effective mtp-payload=") + digest + "\n";
+    CHECK(rd::print(e, false).find(line) != std::string::npos);
+    CHECK(rd::print(e, false) != rd::print(other, false));  // the identity vote tells the two drafters apart
+    auto plain = rd::resolve(rd::scan(cat(cat(kDeploy, kDecodeWork), {"--mtp", "0"})), getter(Env{}), facts);
+    plain.head.mtp_digest = digest;
+    CHECK(plain.mtp_spec.value == "0" && rd::print(plain, false).find("effective mtp-payload=") == std::string::npos);
+}
+
 int main() {
     test_sampled_mtp_admission();
     test_pf_variants();
     test_mtp_default();
+    test_mtp_payload_digest();
     test_plain_equals_receipt();
     test_apply_env_default();
     test_item_off_switches();

@@ -33,7 +33,7 @@ void leaves(const md::Value::Table& table, md::Value::Table& out, const std::str
     for (const auto& [key, value] : table) {
         if (prefix.empty() && md::is_launch_metadata(key)) continue;
         const auto field = prefix.empty() ? key : prefix + "." + key;
-        if (field == "moe.route") continue;  // bound by typed code from the generated constants, not by this contract
+        if (field == "pair" || field == "moe.route") continue;  // bound by typed code from the generated constants
         if (const auto* child = std::get_if<md::Value::Table>(&value.data)) leaves(*child, out, field);
         else out.emplace(field, value);
     }

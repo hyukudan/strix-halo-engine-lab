@@ -1,5 +1,8 @@
 #pragma once
 #include "qwen_yarn_memory.hpp"
+#include "strix/mtp_bundle_defaults.hpp"
+#include "strix/mtp_draft_profiles.hpp"
+#include "strix/session/drafter_discovery.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/prefill_identity.hpp"
 #include "strix/qpf2k_defaults.hpp"
@@ -9,6 +12,7 @@
 #include <optional>
 #include "strix/serve/json.hpp"
 #include <atomic>
+#include <cstdio>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -209,6 +213,51 @@ inline MtpBundleArguments read_mtp_bundle(const std::filesystem::path& path) {
             v=(automatic?"auto:":"")+(path.parent_path()/relative).lexically_normal().string();
         }
         result.argv.push_back(std::move(v));
+    }
+    return result;
+}
+// The bundle of a registry drafter found beside the model (no MODEL.gguf.mtp-bundle.json): the draft's identity,
+// provenance and min-p come from the profile registry, the budgets from the production defaults, the target's pins
+// from the caller. Option order and values equal the shipped recipe's for the same draft; a host test compares them.
+// `vocabulary_dir` empty: no draft vocabulary subset (the 4096-row context vocabulary still serves the Q4 head).
+// The profile registry as discovery candidates (the discovery itself is engine-neutral).
+inline std::vector<strix::session::DrafterCandidate> mtp_drafter_candidates() {
+    std::vector<strix::session::DrafterCandidate> result;
+    for (const auto& p:mtp_draft_profiles) result.push_back({p.name,p.source_path,p.logical_name,p.sidecar_bytes,mtp_drafter_dir});
+    return result;
+}
+struct MtpProfileBundleInputs {
+    std::filesystem::path sidecar;
+    std::string target_sha256, target_content;
+    std::filesystem::path vocabulary_dir;
+};
+inline MtpBundleArguments profile_mtp_bundle_arguments(const MtpDraftProfile& profile, const MtpProfileBundleInputs& in) {
+    MtpBundleArguments result{in.sidecar.string(), {"--mtp"}};
+    const auto put=[&](std::string_view key,std::string value){
+        result.argv.emplace_back(key);
+        if (value!="true") result.argv.push_back(std::move(value));
+    };
+    char min_p[32];
+    std::snprintf(min_p,sizeof min_p,"%.6g",static_cast<double>(mtp_draft_backend_min_probability(&profile,MtpDraftBackend::hip)));
+    put("--mtp-sidecar",in.sidecar.string());
+    put("--mtp-sidecar-logical-name",std::string(profile.logical_name));
+    put("--mtp-sidecar-sha256",std::string(profile.sidecar_sha256));
+    put("--mtp-target-sha256",in.target_sha256);
+    put("--mtp-target-content",in.target_content);
+    put("--mtp-source-repository",std::string(profile.repository));
+    put("--mtp-source-revision",std::string(profile.revision));
+    put("--mtp-source-path",std::string(profile.source_path));
+    put("--mtp-converter-sha256",std::string(profile.converter_sha256));
+    put("--mtp-norm-converter-sha256",std::string(profile.norm_converter_sha256));
+    put("--mtp-converter-revision",std::string(profile.converter_revision));
+    put("--mtp-sidecar-bytes",std::to_string(profile.sidecar_bytes));
+    put("--mtp-spec-min-p",min_p);
+    for (const auto& [key,value]:mtp_production_bundle_options) {
+        if (key=="--mtp-draft-vocab") {
+            if (!in.vocabulary_dir.empty()) put(key,"auto:"+in.vocabulary_dir.string());
+            continue;
+        }
+        put(key,std::string(value));
     }
     return result;
 }

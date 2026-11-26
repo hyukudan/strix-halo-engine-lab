@@ -1,5 +1,7 @@
 // pair::state: one copy per owner, prefix first. Pins every family's hand-off bytes to the MINSTATE tables
 // (wave4 next1113, Tarea 1) and checks the planner's owner, relay, prefix and recompute rules and the shared resolver.
+#include "strix/glm/pair_state.hpp"
+#include "strix/minimax/pair_state.hpp"
 #include "strix/pair/state_decls.hpp"
 #include "strix/pair/state_relay.hpp"
 

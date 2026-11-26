@@ -18,6 +18,7 @@
 #include <thread>
 #include <vector>
 
+#include "strix/cuda/vram_guard.hpp"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/device/cuda_enumerator.hpp"
 #include "strix/qwen35/cuda_engine.hpp"
@@ -168,7 +169,7 @@ int main(int argc, char** argv) {
         std::optional<strix::profile::Name> profile;  // --profile exact|default|fast|quality|turbo (strix/profiles/qwen_dense_cuda.hpp)
         strix::profile::Pairs lever_cli;             // per-lever options: override the profile, recorded as explicit
         strix::session::kv_precision::Request kv_request;  // --kv native|bf16|fp8 (fp8 = the attn8 levers' e4m3 KV shadow)
-        std::string pf_arith, pf_dump;            // --prefill-arith exact|flash|fast|fast2: large-M prefill (absent: windows of --rows)
+        std::string pf_arith, pf_dump;            // the large-M route that runs after admission (qp::execute_route); "" = CLI windows
         std::string pf_norm_fold;                 // --prefill-norm-fold on|off (EngineOptions::prefill_norm_fold; FAST4 only, bitwise)
         std::string pf_tile_feed;                 // --prefill-tile-feed bulk|lsu (EngineOptions::prefill_tile_feed; FAST4 only, bitwise)
         std::uint32_t pf_chunk = 2048, pf_repeat = 1, pf_slots = 2, pf_wave_min = 0;
@@ -320,9 +321,16 @@ int main(int argc, char** argv) {
         const auto resolved = qp::resolve(profile, regime, lever_cli);
         qp::apply(opt, *resolved);
         qp::observe_kv(kv, *resolved);
-        if (const auto* e = resolved->find("prefill_arith"); e && e->status != strix::profile::Status::builtin && e->status != strix::profile::Status::pending)
-            pf_arith = e->value;  // the large-M prefill route of this CLI follows the resolved arithmetic
-        const std::string profile_text = qp::describe(*resolved) + "  kv: " + kv.receipt() + "\n";
+        // the prompt route: ONE host-side plan (qp::plan_prompt), executed after the engine's admission (qp::execute_route)
+        qp::PromptRequest preq;
+        preq.prompt_tokens = prompt.empty() ? static_cast<std::uint64_t>(prompt_len) + ctx_fill : prompt.size();
+        preq.rows = rows_cap;
+        preq.per_row_output = !dump.empty() || !dump_mtp.empty();
+        preq.slot_bench = slots != 0;
+        if (opt.qual_null_order) preq.unshown.emplace_back("--qual-null-order");
+        if (step_program) preq.unshown.emplace_back("--step-program");
+        const auto route = qp::plan_prompt(*resolved, preq);
+        const std::string profile_text = qp::describe(*resolved) + "  kv: " + kv.receipt() + "\n" + qp::describe_route(route);
         if (!pf_norm_fold.empty()) opt.prefill_norm_fold = q::parse_prefill_norm_fold(pf_norm_fold);
         if (!pf_tile_feed.empty()) opt.prefill_tile_feed = q::parse_prefill_tile_feed(pf_tile_feed);
         opt.prefill_chunk = pf_chunk;
@@ -360,6 +368,16 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "qwen35: layers %u hidden %u inter %u vocab %u heads %u/%u hd %u gdn %u/%u x %u mtp %d\n", cfg.layers,
                      cfg.hidden, cfg.intermediate, cfg.vocab, cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.gdn_key_heads,
                      cfg.gdn_value_heads, cfg.gdn_value_dim, E->has_mtp() ? 1 : 0);
+        {  // admission BEFORE any prompt state: the large route runs only with its workspace allocated within the budget
+            q::CudaEngine::PrefillAdmission adm;
+            if (route.path != qp::PromptPath::windows)
+                adm = E->admit_prefill(static_cast<std::uint32_t>(std::max<std::uint64_t>(1, preq.prompt_tokens)),
+                                       strix::cuda::vram_guard_enabled() ? strix::cuda::vram_headroom_bytes() : 0);
+            const auto ran = qp::execute_route(route, route.path == qp::PromptPath::windows ? nullptr : &adm);
+            std::fputs(ran.line.c_str(), stderr);
+            if (ran.path == qp::PromptPath::large) pf_arith = route.arith;
+            else if (ran.path == qp::PromptPath::engine_windows) pf_arith = "engine-windows";  // CudaEngine::prefill's own fallback
+        }
         std::uint64_t lcg = 12345;
         auto rnd_tok = [&]() {
             lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
@@ -518,7 +536,8 @@ int main(int argc, char** argv) {
             for (auto t : top1) std::printf(" %u", t);
             std::printf("\n");
         }
-        std::fprintf(stderr, "prefill %zu tokens in %.2f s (rows %u)\n", prompt.size(), prefill_s, rows_cap);
+        if (pf_arith.empty() || df)  // the windows loop ran (the large route prints its prefill[i/n] lines above)
+            std::fprintf(stderr, "prefill %zu tokens in %.2f s (rows %u)\n", prompt.size(), prefill_s, rows_cap);
 
         // greedy decode; decode_rows > 1 times an R-row window (tokens = the greedy token repeated, all committed)
         std::vector<std::uint32_t> gen;

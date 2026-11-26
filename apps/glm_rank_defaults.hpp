@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <optional>
 #include <string>
@@ -328,58 +329,141 @@ inline void resolve_sampled_mtp(Effective& e, const EnvGet& env) {
     e.sampled_mtp = p;
 }
 
-inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& facts = {}) {
-    Effective e;
-    e.baseline = baseline_requested(r, env);
+// Device/link/layout eligibility is voted on both ranks before resolving a live request.
+struct PrefillWork {
+    bool pair_ready = false;
+    std::uint64_t prompt = 0, capacity = 0;
+    unsigned rows = 0, lanes = 0, generated = 0;
+    // Scratch storage of the admitted layout (routed or the original full arena): no arithmetic change, but part of the
+    // execution key, so a receipt measured on one storage (the TURBO literal rows: routed) decides only that storage.
+    bool routed_scratch = true;
+};
+
+inline std::optional<strix::profile::Resolution> resolve_product(const Request& r, const EnvGet& env, bool baseline,
+                                                                const PrefillWork& work = {}) {
     const auto profile_env = [&](const char* key) -> const char* {
         const char* value = env(key);
         // GLM uses exact WMMA rescoring for an empty switch. Explicit 0 is the exact VALU route.
         if (value != nullptr && *value == '\0' && std::string_view(key) == "STRIX_IDX_WMMA") return "exact";
         return value;
     };
-    if (r.product.profile || r.product.allow_pending ||
-        strix::profile::turbo::has_weight_request(r.product.weights, env)) {
-        auto inputs = r.product;
-        inputs.env = profile_env;
-        e.product = strix::profile::resolve(product_profile_engine, inputs);
-        // Baseline vetoes profile additions; explicit environment values still win.
-        if (e.baseline) for (auto& entry : e.product->entries) {
-            if (strix::profile::applied(entry.status)) {
-                entry.value = std::string(entry.lever->off);
-                entry.status = strix::profile::Status::off;
-                entry.reason = "baseline";
+    namespace p = strix::profile;
+    if (!r.product.profile && !r.product.allow_pending && !p::turbo::has_weight_request(r.product.weights, env))
+        return std::nullopt;
+    auto inputs = r.product;
+    inputs.env = profile_env;
+    const auto execution = work.pair_ready ? p::ladder_execution({"hip", kTurboPrefillDevice,
+            {work.prompt, work.capacity, work.lanes, work.rows, work.rows, 1, 0, work.generated},
+            work.routed_scratch ? kTurboPrefillSettings : kFullScratchPrefillSettings}) : std::string{};
+    inputs.regime = {p::Phase::prefill, work.prompt, work.lanes,
+                     execution.empty() ? std::string_view{} : kTurboPrefillDevice, execution};
+    auto product = p::resolve(product_profile_engine, inputs);
+    // Baseline vetoes profile additions; explicit environment values still win.
+    if (baseline) for (auto& entry : product.entries) {
+        if (strix::profile::applied(entry.status) ||
+            (entry.lever->name == "pf_wmma" && entry.ladder_lowered)) {
+            entry.value = std::string(entry.lever->off);
+            entry.status = strix::profile::Status::off;
+            entry.reason = "baseline";
+            entry.ladder.clear();
+            entry.ladder_lowered = false;
+        }
+    }
+    // pf_wmma is profile-owned per prompt (select_prefill_wmma opens the bundle in a ProfileScope; the switch is never
+    // exported), and that selection admits no --allow-pending run. The shared benchmark opt-in of an unmeasured regime
+    // would only rename the cell in the receipt: report the exact cores that run. STRIX_GLM_PF_WMMA=1 forces the bundle.
+    for (auto& entry : product.entries) {
+        if (entry.lever->name != "pf_wmma" || entry.status != strix::profile::Status::unqualified) continue;
+        entry.value = std::string(entry.lever->builtin);
+        entry.status = strix::profile::Status::builtin;
+        entry.reason = "per-prompt cell: the benchmark opt-in does not open it";
+        entry.ladder.clear();
+        entry.ladder_lowered = false;
+    }
+    // These GLM routes inherit the umbrella after the baseline veto. Only report the inherited
+    // value: the runtime owns the fallback and must still see the original environment.
+    const bool wmma = product.find("pf_wmma")->value == "1";
+    for (auto& entry : product.entries) {
+        using strix::profile::Status;
+        const auto name = entry.lever->name;
+        if (name != "mla_wmma" && name != "kda_wmma" && name != "attn_wmma") continue;
+        if (entry.status == Status::builtin || (entry.status == Status::pending && wmma) ||
+            (entry.status == Status::explicit_env && entry.value.empty())) {
+            entry.value = wmma ? "1" : "0";
+            entry.status = Status::builtin;
+            entry.target.clear();
+            if (wmma) {
+                entry.reason = "inherits pf_wmma";
                 entry.ladder.clear();
                 entry.ladder_lowered = false;
             }
-        }
-        // These GLM routes inherit the umbrella after the baseline veto. Only report the inherited
-        // value: the runtime owns the fallback and must still see the original environment.
-        const bool wmma = e.product->find("pf_wmma")->value == "1";
-        for (auto& entry : e.product->entries) {
-            using strix::profile::Status;
-            const auto name = entry.lever->name;
-            if (name != "mla_wmma" && name != "kda_wmma" && name != "attn_wmma") continue;
-            if (entry.status == Status::builtin || (entry.status == Status::pending && wmma) ||
-                (entry.status == Status::explicit_env && entry.value.empty())) {
-                entry.value = wmma ? "1" : "0";
-                entry.status = Status::builtin;
-                entry.target.clear();
-                if (wmma) {
-                    entry.reason = "inherits pf_wmma";
-                    entry.ladder.clear();
-                    entry.ladder_lowered = false;
-                }
-            } else if (name == "mla_wmma" &&
-                       (entry.status == Status::explicit_env ||
-                        (entry.status == Status::off && entry.requested == "off"))) {
-                // MLA uses the legacy first-character parser with the umbrella as its default.
-                const bool matches = strix::detail::env_flag_matches(
-                    entry.value.c_str(), wmma ? "0" : "1", EnvFlagMatch::first_character);
-                entry.value = (wmma != matches) ? "1" : "0";
-                entry.status = entry.value == "1" ? Status::explicit_env : Status::off;
-            }
+        } else if (name == "mla_wmma" &&
+                   (entry.status == Status::explicit_env ||
+                    (entry.status == Status::off && entry.requested == "off"))) {
+            // MLA uses the legacy first-character parser with the umbrella as its default.
+            const bool matches = strix::detail::env_flag_matches(
+                entry.value.c_str(), wmma ? "0" : "1", EnvFlagMatch::first_character);
+            entry.value = (wmma != matches) ? "1" : "0";
+            entry.status = entry.value == "1" ? Status::explicit_env : Status::off;
         }
     }
+    return product;
+}
+
+// The ordinary pair workload of a lossy profile (FAST or TURBO): the only requests whose prefill the ladder rows of
+// pf_wmma can decide per prompt. Anything else keeps the startup resolution (the exact cores unless switched explicitly).
+inline bool ordinary_lossy_prefill(const Request& r, const Effective& e) {
+    return (r.product.profile == strix::profile::Name::fast || r.product.profile == strix::profile::Name::turbo) &&
+        !r.product.allow_pending &&
+        !e.baseline && r.world == 2 && r.xch == "comm" && r.decode && !r.reference_gate &&
+        !r.mem_plan && r.idcheck == 0 && e.prefill == "gemv" && e.identity.value == "r1b" &&
+        e.mtp_spec.value == "1" && e.decode_xch.value == "xfer" && e.kmax == 3 && e.adaptive &&
+        !e.kv_shard && !e.kv_shard_auto;
+}
+
+inline bool measured_prefill_switches(const Effective& e, const EnvGet& env) {
+    for (const auto& row : env_items()) {
+        const std::string_view name = row.name;
+        // These three controls are priced by the admitted layout/row count, not the request.
+        if (name == "pf-scratch" || name == "pf-attn-qwin" || name == "max-rows-auto") continue;
+        if (e.env.at(row.env).value != row.on) return false;
+    }
+    for (const auto& [key, value] : std::initializer_list<std::pair<const char*, const char*>>{
+            {"STRIX_GLM_PF_EXACT_X_MIN_ROWS", "32"}, {"STRIX_GLM_PF_EXACT_LIN", "1"},
+            {"STRIX_GLM_PF_KDA_PACK", "0"}, {"STRIX_GLM_PF_ATTN_WMMA_T", "16"},
+            {"STRIX_GLM_PF_MLA_QT16", "1"}, {"STRIX_GLM_PF_MLA_GEMM_HEADS", "1"},
+            {"STRIX_GLM_PF_X16", "1"}, {"STRIX_GLM_PF_STREAMS", "2"},
+            {"STRIX_GLM_PF_IU4", "0"}, {"STRIX_GLM_PF_WMMA", "1"},
+            {"STRIX_GLM_PF_MLA_WMMA", ""}, {"STRIX_GLM_PF_KDA_WMMA", ""}, {"STRIX_GLM_PF_ATTN_WMMA", ""},
+            {"STRIX_GLM_PF_EXACT_MOE", ""}, {"STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS", ""},
+            {"STRIX_GLM_PF_WMMA_CP", ""}, {"STRIX_GLM_PF_WMMA_LIVE_FRAG", ""},
+            {"STRIX_GLM_PF_WMMA_ROWS", ""}, {"STRIX_GLM_PF_WMMA_SHARED128", ""},
+            {"STRIX_GLM_PF_WMMA_SPLIT", ""}, {"STRIX_GLM_PF_WMMA_TAIL128", ""},
+            {"STRIX_GLM_PF_SCORE_OUT", ""}, {"STRIX_GLM_PF_TOPK_OVERLAP", ""}}) {
+        const char* configured = env(key);
+        if (configured && *configured && std::string_view(configured) != value) return false;
+    }
+    return true;
+}
+
+// Called for a whole prompt, after pair agreement and the final chunk/layout admission. The composition, the chunk and
+// the lane count are the measured ones of every pf_wmma row; the shared ladder then decides the prompt: the TURBO rows
+// are literal keys (prompt, capacity, generated), the FAST row a band receipt bound to this execution.
+inline bool select_prefill_wmma(const Request& r, const Effective& e, const EnvGet& env, const PrefillWork& work) {
+    if (!work.pair_ready || !ordinary_lossy_prefill(r, e) || !measured_prefill_switches(e, env) ||
+        work.rows != kTurboPrefillRows || work.lanes != 1)
+        return false;
+    const auto product = resolve_product(r, env, e.baseline, work);
+    const auto* wmma = product->find("pf_wmma");
+    return wmma->status == strix::profile::Status::set && wmma->value == "1" &&
+        product->find("mla_wmma")->value == "1" && product->find("kda_wmma")->value == "1" &&
+        product->find("attn_wmma")->value == "1";
+}
+
+inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& facts = {}, const PrefillWork& work = {}) {
+    Effective e;
+    e.baseline = baseline_requested(r, env);
+    e.product = resolve_product(r, env, e.baseline);
     const char* src_b = e.baseline ? "baseline" : "default";
     // identity: STRIX_GLM_IDENTITY overrides --identity (engine rule)
     if (const char* v = env("STRIX_GLM_IDENTITY")) e.identity = {v, "explicit"};
@@ -485,6 +569,7 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
     e.spec_arbiter = arbiter == "1";
     e.world = r.world;
     resolve_sampled_mtp(e, env);
+    if (select_prefill_wmma(r, e, env, work)) e.product = resolve_product(r, env, e.baseline, work);
     return e;
 }
 
@@ -507,8 +592,8 @@ inline std::vector<std::string> serve_request_args(std::vector<std::string> rank
     return rank_args;
 }
 inline Effective resolve_serve(const std::vector<std::string>& rank_args, bool serve_mtp,
-                               const EnvGet& env, const ModelFacts& facts = {}) {
-    return resolve(scan(serve_request_args(rank_args, serve_mtp)), env, facts);
+                               const EnvGet& env, const ModelFacts& facts = {}, const PrefillWork& work = {}) {
+    return resolve(scan(serve_request_args(rank_args, serve_mtp)), env, facts, work);
 }
 
 // The predicate dry-runs the load and prefill admissions, including their current margins.
@@ -531,12 +616,23 @@ inline void apply_env(const Effective& e, const std::function<void(const char*, 
         if (v.source == "baseline" || it.app_sets) setenv_if_unset(it.env, v.value.c_str());
     }
     if (e.product) strix::profile::apply(*e.product, [&](const char* key, const char* value) {
-        setenv_if_unset(key, value);
+        // Profile-owned WMMA lives on the request's submission thread only.
+        if (std::string_view(key) != "STRIX_GLM_PF_WMMA") setenv_if_unset(key, value);
         return true;
     });
 }
 
-inline std::string print(const Effective& e) {
+inline std::string mtp_decode_line(const Effective& e) {
+    if (e.mtp_spec.value != "1")
+        return "effective mtp-decode=plain" +
+               (e.mtp_spec_candidate && !e.head.mtp_complete ? " (" + e.head.reason + ")" : std::string{}) + "\n";
+    std::string line = "effective mtp-decode=verified";
+    for (const auto& path : e.head.mtp_files) line += " " + path.generic_string();
+    if (!e.head.mtp_digest.empty()) line += " payload=" + e.head.mtp_digest;
+    return line + "\n";
+}
+
+inline std::string print(const Effective& e, bool include_asset_receipt = true) {
     std::string s;
     auto line = [&](const std::string& k, const Value& v) { s += "effective " + k + "=" + v.value + " (" + v.source + ")\n"; };
     s += std::string("effective baseline=") + (e.baseline ? "1" : "0") + "\n";
@@ -553,6 +649,9 @@ inline std::string print(const Effective& e) {
     line("mtp-spec", e.mtp_spec);
     line("spec", e.spec);
     s += "effective mtp-head=" + e.head.reason + "\n";
+    if (include_asset_receipt) s += mtp_decode_line(e);
+    // Path-free drafter content identity (mtp_payload_digest): part of the pair identity vote (print without assets).
+    if (e.mtp_spec.value == "1" && !e.head.mtp_digest.empty()) s += "effective mtp-payload=" + e.head.mtp_digest + "\n";
     s += "effective mtp-kmax=" + std::to_string(e.kmax) + " adaptive=" + (e.adaptive ? "1" : "0") + "\n";
     s += "effective mtp-bootstrap=" + std::string(e.mtp_spec.value == "1" ? (e.prefill == "gemv" ? "chunked" : "ref") : "plain") + "\n";
     s += "effective prefill=" + e.prefill + " (requested " + e.prefill_requested.value + ", " + e.prefill_requested.source + ")\n";

@@ -7,11 +7,13 @@
 #include "minimax/engine/mm_defaults.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/dist/transport_spec.hpp"
+#include "strix/minimax/model_assets.hpp"
 #include "strix/minimax/session_startup.hpp"
 
 #include <algorithm>
 #include <cstdlib>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <filesystem>
@@ -39,6 +41,26 @@ void check(bool ok, const std::string& what) {
         ++g_failures;
         std::cerr << "FAIL: " << what << "\n";
     }
+}
+
+void test_draft_discovery() {
+    namespace assets = strix::minimax::assets;
+    namespace fs = std::filesystem;
+    const auto model = fs::temp_directory_path() /
+        ("strix-minimax-drafts-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto draft = model / "dspark";
+    const auto impostor = draft / "unpacked.safetensors";
+    check(assets::discover_draft_dir(model).empty(), "plain when the draft directory is absent");
+    fs::create_directories(impostor);
+    check(assets::discover_draft_dir(model).empty(), "a directory is not a draft shard");
+    const auto shard = draft / "model.safetensors";
+    std::ofstream(shard).put('x');
+    check(assets::discover_draft_dir(model) == draft, "find the packaged DSpark directory");
+    check(assets::draft_files(draft) == std::vector<fs::path>{shard}, "discovery and loader agree on real shards");
+    fs::remove(shard);
+    fs::remove(impostor);
+    fs::remove(draft);
+    fs::remove(model);
 }
 
 using EnvMap = std::map<std::string, std::string>;
@@ -1200,6 +1222,7 @@ int main(int argc, char** argv) {
     }
     try {
         test_table();
+        test_draft_discovery();
         test_receipts(argv[1]);
         test_off_switches();
         test_pair_pipeline_declaration();

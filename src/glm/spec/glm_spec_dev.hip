@@ -4,6 +4,7 @@
 #include "glm/spec/glm_spec_dev.hpp"
 #include "glm/kernels/glm_tree.hpp"
 #include "strix/attn/group_pool.hpp"
+#include "strix/env_flags.hpp"
 
 #include <cstdlib>
 #include <stdexcept>
@@ -191,16 +192,24 @@ __global__ __launch_bounds__(128) void dsa_rows_store_kernel(DsaSlot sl, unsigne
     }
 }
 // ... then the pools closed inside the block (separate launch: a pool may span rows stored by other blocks).
+template <bool SharedPool>
 __global__ __launch_bounds__(128) void dsa_rows_pool_kernel(DsaSlot sl, unsigned t0, IndexerDev w, unsigned* row_flag) {
     const unsigned r = blockIdx.x, i = threadIdx.x, t = t0 + r;
     if ((t + 1) % kKpool != 0) return;
     const unsigned tp = t + 1 - kKpool;
-    float l4[kKpool], kv[kKpool];
-    for (unsigned j = 0; j < kKpool; ++j) {
-        l4[j] = bf16_to_float(sl.igate[static_cast<std::size_t>(tp + j) * kIdxDim + i]) + w.ape[j * kIdxDim + i];
-        kv[j] = bf16_to_float(sl.ikey[static_cast<std::size_t>(tp + j) * kIdxDim + i]);
+    float K;
+    if constexpr (SharedPool) {
+        const auto offset = static_cast<std::size_t>(tp) * kIdxDim;
+        K = strix::attn::group_pool::gated_bf16_channel<kKpool>(
+            sl.ikey + offset, sl.igate + offset, w.ape, i, kIdxDim, strix::attn::group_pool::Fn<declared_exp>{});
+    } else {
+        float l4[kKpool], kv[kKpool];
+        for (unsigned j = 0; j < kKpool; ++j) {
+            l4[j] = bf16_to_float(sl.igate[static_cast<std::size_t>(tp + j) * kIdxDim + i]) + w.ape[j * kIdxDim + i];
+            kv[j] = bf16_to_float(sl.ikey[static_cast<std::size_t>(tp + j) * kIdxDim + i]);
+        }
+        K = strix::attn::group_indexer::gated_pool_channel<kKpool>(l4, kv, strix::attn::group_pool::Fn<declared_exp>{});
     }
-    const float K = strix::attn::group_indexer::gated_pool_channel<kKpool>(l4, kv, strix::attn::group_pool::Fn<declared_exp>{});
     if (GLMSPEC_MUTANT != 3 && !is_finite(K)) atomicOr(row_flag + r, 1U);
     sl.pooled[static_cast<std::size_t>(t / kKpool) * kIdxDim + i] = K;
 }
@@ -238,7 +247,9 @@ void dsa_append_rows(const DsaSlot& slot, unsigned t0, unsigned R, const float* 
     dense(x, w.gate, WType::F16, kHidden, 0, kIdxDim, gate_scratch, R, s);
     dsa_rows_store_kernel<<<R, 128, 0, s>>>(slot, t0, latent, w, key_scratch, gate_scratch, row_flag);
     ok(hipGetLastError(), "glm dsa_rows_store");
-    dsa_rows_pool_kernel<<<R, 128, 0, s>>>(slot, t0, w, row_flag);
+    static const bool shared_pool = strix::envcfg::flag("STRIX_GLM_DSA_SHARED_POOL", false);
+    if (shared_pool) dsa_rows_pool_kernel<true><<<R, 128, 0, s>>>(slot, t0, w, row_flag);
+    else dsa_rows_pool_kernel<false><<<R, 128, 0, s>>>(slot, t0, w, row_flag);
     ok(hipGetLastError(), "glm dsa_rows_pool");
 }
 

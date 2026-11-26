@@ -288,6 +288,7 @@ bool check_ring_append() {
     const auto old_key = cache.keys[slot];
     const auto old_value = cache.values[slot];
     bool overwrote = false;
+    bool rejected = false;
     const auto finish_calls = single.backend.finish_calls;
     single.backend.trace_banks = false;
     try {
@@ -296,9 +297,21 @@ bool check_ring_append() {
             throw std::runtime_error("fixture failure after wrapped append");
         });
     } catch (const std::runtime_error&) {
-        return overwrote && single.backend.finish_calls == finish_calls + 2U && equal_committed_state(multi, single);
+        rejected = true;
     }
-    return false;
+    if (!rejected || !overwrote || single.backend.finish_calls != finish_calls + 2U ||
+        !equal_committed_state(multi, single)) return false;
+
+    // Retry the rejected token and compare against a lane that never saw the
+    // failed write. Check all visit state and both repeat banks on continuation.
+    multi.backend.banks = {};
+    single.backend.banks = {};
+    single.backend.trace_banks = true;
+    const auto control_out = std::span(multi_out).first(kHiddenWidth);
+    multi.append(1, control_out);
+    single.append(1, first_out);
+    return equal_rows(control_out, first_out) && equal_committed_state(multi, single) &&
+           std::ranges::equal(multi.backend.banks, single.backend.banks, equal_rows);
 }
 
 bool check_cohort_append() {
@@ -489,6 +502,101 @@ bool check_discarded_capture() {
     }
 }
 
+// History contract of the convolution tape (session::RowAppendState): every history holds the last input rows of
+// its stream. Key / value inputs are recorded by the attention (as attn_core does for the prepared GQA
+// convolutions); attention / MoE inputs by the forward. A partial commit by copies must equal the replay.
+struct TapeBackend : RingBackend {
+    static void push(MiniMutableRows history, MiniConstRows row) {
+        const auto width = row.size();
+        std::ranges::copy(history.subspan(width), history.begin());
+        std::ranges::copy(row, history.end() - static_cast<std::ptrdiff_t>(width));
+    }
+
+    void attention(LayerVisit visit, MiniResidentChunk chunk, MiniConstRows query, MiniConstRows keys,
+                   MiniConstRows values, MiniResidentVisitState state, MiniMutableRows output) {
+        active = chunk;
+        std::array<float, kKvWidth> k{}, v{};
+        for (unsigned row = 0; row < chunk.rows; ++row) {
+            const auto hidden_offset = std::size_t{row} * kHiddenWidth;
+            const float past = state.history[0].front() + state.history[1].front();
+            for (unsigned i = 0; i < kKvWidth; ++i) {
+                k[i] = keys[hidden_offset + i] + static_cast<float>(visit.logical_layer);
+                v[i] = 0.5F * values[hidden_offset + i];
+            }
+            for (unsigned stream = 0; stream < 2U; ++stream) {
+                const auto& in = stream == 0U ? k : v;
+                if (!state.tape[stream].empty())
+                    std::ranges::copy(in, state.tape[stream].begin() + std::ptrdiff_t{row} * kKvWidth);
+                push(state.history[stream], in);
+            }
+            const auto out = output.subspan(hidden_offset, kHiddenWidth);
+            copy(query.subspan(hidden_offset, kHiddenWidth), out);
+            out.front() += past / 64.0F;
+        }
+    }
+
+    void convolve(LayerVisit, MiniConvolutionStream, MiniConstRows input, MiniMutableRows history,
+                  MiniMutableRows output) {
+        copy(input, output);
+        for (unsigned row = 0; row < active.rows; ++row) {
+            const auto offset = std::size_t{row} * kHiddenWidth;
+            output[offset] += history.front() / 64.0F;
+            push(history, input.subspan(offset, kHiddenWidth));
+        }
+    }
+};
+
+struct TapeLane {
+    static constexpr unsigned kRows = 4U;
+    explicit TapeLane(bool taped)
+        : plan(64U, kRows), keys(plan.kv_elements_per_plane()), values(keys.size()),
+          histories(plan.convolution_elements()), history_backup(histories.size()),
+          scratch(mini_resident_activation_elements(kRows)), kv_backup(mini_resident_max_kv_checkpoint_elements()),
+          tape(std::size_t{kRows} * plan.convolution_row_elements()), inputs(std::size_t{kRows} * kHiddenWidth),
+          outputs(inputs.size()), state(plan, {keys, values}, histories),
+          forward(backend, state, {scratch, history_backup, kv_backup}) {
+        if (taped) state.bind_convolution_tape(tape, kRows);
+    }
+    void append(unsigned rows, bool stage) {
+        backend.reset_trace();
+        const auto first = state.committed();
+        for (std::size_t i = 0; i < std::size_t{rows} * kHiddenWidth; ++i)
+            inputs[i] = static_cast<float>((first + i / kHiddenWidth) % 7U) + static_cast<float>(i % 97U) / 128.0F;
+        const auto count = std::size_t{rows} * kHiddenWidth;
+        forward.append({first, rows}, std::span(inputs).first(count), std::span(outputs).first(count),
+                       nullptr, nullptr, nullptr, nullptr, stage);
+    }
+
+    MiniSessionStatePlan plan;
+    std::vector<std::uint16_t> keys, values;
+    std::vector<float> histories, history_backup, scratch;
+    std::vector<std::uint16_t> kv_backup;
+    std::vector<float> tape, inputs, outputs;
+    TapeBackend backend;
+    MiniResidentSessionState state;
+    MiniResidentForward<TapeBackend> forward;
+};
+
+bool check_convolution_tape_commit() {
+    TapeLane taped(true), replayed(false);
+    taped.append(3, false);
+    replayed.append(3, false);
+    unsigned replays = 0;
+    for (const unsigned keep : {1U, 0U, 3U, 2U, 4U, 1U}) {
+        taped.append(TapeLane::kRows, true);
+        replayed.append(TapeLane::kRows, true);
+        taped.state.commit_staged(taped.backend, keep, [&](unsigned rows) { ++replays; taped.append(rows, false); });
+        replayed.state.commit_staged(replayed.backend, keep, [&](unsigned rows) { replayed.append(rows, false); });
+        if (taped.state.committed() != replayed.state.committed() || taped.state.poisoned() ||
+            !equal_rows(taped.histories, replayed.histories)) return false;
+    }
+    // One more row continues identically from the rebuilt histories.
+    taped.append(1, false);
+    replayed.append(1, false);
+    return replays == 0U && equal_rows(taped.histories, replayed.histories) &&
+           equal_rows(std::span(taped.outputs).first(kHiddenWidth), std::span(replayed.outputs).first(kHiddenWidth));
+}
+
 bool check_draft_tap_frontier() {
     constexpr MiniSessionStatePlan plan(5, 2);
     constexpr auto width = MiniDSparkTapPlan::width;
@@ -651,6 +759,7 @@ int main() {
     if (!check_draft_tap_frontier()) return 20;
     if (!check_cohort_append()) return 23;
     if (!check_prepared_groups()) return 24;
+    if (!check_convolution_tape_commit()) return 25;
 
     // A failed later prefill chunk must retire the partially committed lane.
     FixtureBackend sequence_backend;

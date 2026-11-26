@@ -87,33 +87,29 @@ void families() {
     const std::map<std::string, std::string> none;
     p::Resolution r;
     generic(ds, p::Name::turbo, none, r);
-    // TURBO nests FAST: the prefill bundle (attention bf16flash, relaxed MoE, f16 dense, set once by the bundle) and the
-    // Engram / shared expert / MoE f16 members run in TURBO as in FAST.
-    require(profile_table.size() == 13, "ds41 keeps thirteen rows, including the IU4 candidate and explicit diagnostics");
-    for (const char* lever : {"fast_prefill", "engram_f16wmma", "shared_f16", "moe_f16wmma"})
-        require(find(r, lever) != nullptr && find(r, lever)->value == "1" && p::applied(find(r, lever)->status),
-                (std::string("ds41 turbo runs the fast member ") + lever).c_str());
-    {
-        p::Resolution fast;
-        generic(ds, p::Name::fast, none, fast);
-        for (const auto& e : fast.entries) {
-            const std::string lever(e.lever->name);
-            require(find(r, lever.c_str()) != nullptr && find(r, lever.c_str())->value == e.value,
-                    ("ds41 turbo resolves every cell to its fast value: " + lever).c_str());
-        }
+    require(find(r, "d1_prefill")->value == "0" && find(r, "d1_prefill")->status == p::Status::pending,
+            "DeepSeek TURBO defers D1 until a measured request");
+    for (const auto tier : {p::Name::fast, p::Name::turbo}) {
+        p::Inputs in;
+        in.profile = tier;
+        in.env = env_of(none);
+        in.regime = {p::Phase::prefill, 8128, 1, "gfx1151", p::kBandProbeExecution};
+        const auto measured = p::resolve(ds, in);
+        require(find(measured, "d1_prefill")->value == "1", "DeepSeek TURBO inherits the measured FAST D1 row");
+        require(find(measured, "decoder_replay")->value == "256", "DeepSeek TURBO inherits the measured FAST R256 row");
     }
-    require(find(r, "moe_iu4")->value == "0" && find(r, "moe_iu4")->status == p::Status::pending,
-            "DeepSeek IU4 remains pending in TURBO");
+    require(find(r, "moe_iu4")->value == "0" && find(r, "moe_iu4")->status == p::Status::builtin,
+            "DeepSeek IU4 is not a TURBO row (measured slower than FAST)");
     std::size_t engram_rows = 0;
     for (const auto& row : profile_table)
         if (std::string_view(row.env) == "STRIX_DS41_FAST_ENGRAM") ++engram_rows;
     require(engram_rows == 1 && find(r, "engram_wmma") == nullptr, "one real Engram row per env");
     const auto* engram = find(r, "engram_f16wmma");
-    require(engram != nullptr && engram->value == "1" && engram->lever->value[3].empty(),
-            "DeepSeek TURBO inherits the FAST Engram member");
+    require(engram != nullptr && engram->value == "0" && engram->lever->value[3].empty(),
+            "DeepSeek startup keeps explicit Engram off");
     require(find(r, "decoder_replay") != nullptr && find(r, "decoder_replay")->status == p::Status::pending, "ds41 replay pending");
     generic(ds, p::Name::fast, none, r);
-    require(find(r, "attention_f16wmma")->requested == "1", "ds41 fast unchanged (f16wmma)");
+    require(find(r, "attention_f16wmma")->value == "0", "ds41 startup cannot select standalone attention");
     generic(ds, p::Name::standard, none, r);
     require(find(r, "engram_f16wmma") != nullptr && find(r, "engram_f16wmma")->status == p::Status::builtin, "ds41 default unchanged");
 
@@ -205,7 +201,7 @@ void families() {
             "allow-pending cannot bypass the missing MiniMax 0-59 adapter");
 
     generic(strix::glm::rank_defaults::product_profile_engine, p::Name::turbo, none, r);
-    require(find(r, "pf_wmma")->value == "1", "glm turbo inherits pf_wmma");
+    require(find(r, "pf_wmma")->value == "0", "GLM with no known workload keeps the FAST prefill route");
     require(find(r, "kda_state16")->status == p::Status::pending && find(r, "router_wmma")->status == p::Status::pending &&
                 find(r, "idxproj_wmma")->status == p::Status::pending, "GLM router/indexer and KDA16 pending");
 }

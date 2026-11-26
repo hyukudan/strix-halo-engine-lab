@@ -227,24 +227,54 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
         for (const auto* backend : {"hip", "cuda"}) {
             const auto exact = profile::resolve_model_preset(description, Name::standard, backend);
             const auto implicit = profile::resolve_model_preset(description, {}, backend);
-            const auto fast = profile::resolve_model_preset(description, Name::fast, backend);
-            const auto turbo = profile::resolve_model_preset(description, Name::turbo, backend);
             const auto* declared_default = description.find("presets.default");
             require(declared_default != nullptr, "every model declares an implicit preset");
             const auto* declared_name = std::get_if<std::string>(&declared_default->data);
             require(declared_name != nullptr, "implicit preset must be a string");
             require(implicit.requested == profile::parse_tier(*declared_name),
                     "implicit preset must agree with its declared tier");
+            if (entry.family == "ernie") {
+                require(exact.levers == Name::standard && implicit.levers == Name::standard,
+                        "ERNIE inventory resolves EXACT");
+                refuses([&] { (void)profile::resolve_model_preset(description, Name::fast, backend); }, "missing presets.fast");
+                refuses([&] { (void)profile::resolve_model_preset(description, Name::turbo, backend); }, "missing presets.turbo");
+                continue;
+            }
+            const auto fast = profile::resolve_model_preset(description, Name::fast, backend);
+            const auto turbo = profile::resolve_model_preset(description, Name::turbo, backend);
+            if (entry.family == "glm5") {
+                const auto column = std::string_view(backend) == "hip" ? Name::turbo : Name::fast;
+                require(turbo.levers == column, "GLM chooses the native column for the selected backend");
+                std::vector<std::string> args;
+                turbo.append_options(args);
+                require(args == std::vector<std::string>{"--profile", std::string(profile::tier_word(column))},
+                        "GLM passes the backend's product profile to the native engine");
+            }
+            if (entry.family == "hy4_flash")
+                require(turbo.levers == Name::turbo, "Hy4 TURBO reaches the native TURBO resolver");
             if (entry.family == "inkling2")
                 require(implicit.requested == Name::standard && implicit.levers == Name::standard,
                         "Inkling Mini implicit profile must remain EXACT");
             require(exact.levers == Name::standard && fast.levers == Name::fast && fast.requested == Name::fast,
                     "explicit exact and FAST select their native columns");
-            require(turbo.requested == Name::turbo, "explicit TURBO keeps its requested tier");
-            if (entry.family == "inkling2")
-                require(turbo.levers == Name::turbo, "Inkling served TURBO selects its native column");
-            else if (entry.family != "glm5" && entry.family != "minimax")
-                require(turbo.levers == fast.levers, "other presets project TURBO to FAST");
+            if (entry.family == "inkling2" && std::string_view(backend) == "hip") {
+                std::vector<std::string> forwarded;
+                turbo.append_options(forwarded);
+                require(forwarded == std::vector<std::string>{"--profile", "turbo"},
+                        "served Inkling TURBO reaches the engine with the CLI's --profile turbo");
+            }
+            const auto* turbo_levers = description.find(std::string("presets.turbo.") + backend + ".levers");
+            if (turbo_levers == nullptr) turbo_levers = description.find("presets.turbo.levers");
+            const auto* declared_levers = turbo_levers ? std::get_if<std::string>(&turbo_levers->data) : nullptr;
+            const auto expected_levers = declared_levers ? profile::parse_tier(*declared_levers) : fast.levers;
+            require(turbo.requested == Name::turbo && turbo.levers == expected_levers,
+                    "TURBO selects its backend override or the model's declared levers");
+            if (entry.family == "deepseek41") {
+                require(turbo.requested == Name::turbo && turbo.levers == Name::turbo,
+                        "DeepSeek preset forwards TURBO to the native resolver");
+                require(implicit.requested == Name::fast && implicit.levers == Name::fast,
+                        "DeepSeek implicit preset is the FAST product default");
+            }
             require(exact.kv != "fp8" && fast.kv != "fp8", "FP8 KV shadow is TURBO only");
             require((turbo.kv == "fp8") == (entry.family == "qwen35" && std::string_view(backend) == "cuda"),
                     "only the CUDA dense route has an FP8 KV shadow");
@@ -258,6 +288,22 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
     profile::resolve_model_preset(minimax, Name::turbo, "hip").append_options(minimax_args);
     require(minimax_args == std::vector<std::string>{"--profile", "turbo"},
             "MiniMax passes --profile turbo to the pair engine");
+
+    {
+        // The Qwen3.8 Flash-Next HIP preset serves the native TURBO column (the route-prune receipt applies through the
+        // preset front alone); other backends keep FAST.
+        const auto flash = strix::model_description::load((data / "models/qwen3.8-flash-next.toml").string());
+        const auto hip = profile::resolve_model_preset(flash, Name::turbo, "hip");
+        const auto cuda = profile::resolve_model_preset(flash, Name::turbo, "cuda");
+        std::vector<std::string> args;
+        hip.append_options(args);
+        require(hip.levers == Name::turbo && args.size() >= 2U && args[0] == "--profile" && args[1] == "turbo",
+                "the Flash-Next HIP turbo preset emits --profile turbo");
+        require(cuda.levers == Name::fast, "the Flash-Next turbo preset keeps FAST on other backends");
+    }
+    const auto e4b = strix::model_description::load((data / "models/nemotron-3.5-bolt-e4b.toml").string());
+    const auto e4b_turbo = profile::resolve_model_preset(e4b, Name::turbo, "hip");
+    require(e4b_turbo.levers == Name::turbo, "E4B TURBO reaches the native TURBO resolver");
 
     const auto dense = strix::model_description::load((data / "models/qwen3.8-27b.toml").string());
     probes.host = Platform::windows_host;

@@ -11,6 +11,8 @@
 #include "strix/model/bind.hpp"
 #include "strix/model_data/nemotron_3_5_bolt_e4b.hpp"
 
+#include "strix/numeric/rsqrt_exact.hpp"
+
 #if defined(__HIPCC__)
 #define STRIX_G4_HD __host__ __device__
 #else
@@ -102,48 +104,14 @@ STRIX_G4_HD inline float q6_k_value(const std::uint8_t* b, std::uint32_t i) {
 
 namespace detail {
 STRIX_G4_HD inline float pow2(int k) { return bit_cast<float>(std::uint32_t(k + 127) << 23U); }
-// Compare mx * my^2 * 2^exponent with 1, exactly (at most 74 significant bits).
-STRIX_G4_HD inline int square_compare(std::uint32_t mx, std::uint32_t my, int exponent) {
-    const std::uint64_t sq = std::uint64_t(my) * my;
-    const std::uint64_t a = (sq & 0xffffffffULL) * mx, b = (sq >> 32U) * mx;
-    const std::uint64_t lo = a + (b << 32U), hi = (b >> 32U) + (lo < a ? 1U : 0U);
-    const int k = -exponent;
-    if (k < 0) return 1;
-    if (k >= 96) return -1;
-    const std::uint64_t th = k >= 64 ? std::uint64_t(1) << (k - 64) : 0;
-    const std::uint64_t tl = k < 64 ? std::uint64_t(1) << k : 0;
-    if (hi != th) return hi < th ? -1 : 1;
-    return lo == tl ? 0 : (lo < tl ? -1 : 1);
-}
-STRIX_G4_HD inline void dyadic(std::uint32_t bits, std::uint32_t& m, int& e) {
-    const auto field = bits >> 23U;
-    m = (bits & 0x7fffffU) | (field != 0 ? 0x800000U : 0U);
-    e = field != 0 ? int(field) - 150 : -149;
-}
+// The exact dyadic helpers of the correctly rounded rsqrt are the shared ones (strix/numeric/rsqrt_exact.hpp).
+using ::strix::numeric::rsqrt_detail::square_compare;
+using ::strix::numeric::rsqrt_detail::dyadic;
 }
 
-// Correctly rounded x^(-1/2), checked using integer dyadics, including midpoint ties.
-// No approximate rsqrt, sqrt/divide equivalence, native reciprocal or host libm assumption.
-STRIX_G4_HD inline float pow32_rsqrt(float x) {
-    const auto bits = bit_cast<std::uint32_t>(x);
-    if ((bits & 0x7fffffffU) == 0) return bit_cast<float>((bits & 0x80000000U) | 0x7f800000U);
-    if ((bits >> 31U) != 0 || bits > 0x7f800000U) return bit_cast<float>(0x7fc00000U);
-    if (bits == 0x7f800000U) return 0.0F;
-    std::uint32_t mx; int ex;
-    detail::dyadic(bits, mx, ex);
-    std::uint32_t lo = 0x00800000U, hi = 0x7f7fffffU;
-    while (lo < hi) {
-        const auto mid = lo + (hi - lo + 1U) / 2U;
-        std::uint32_t my; int ey;
-        detail::dyadic(mid, my, ey);
-        if (detail::square_compare(mx, my, ex + 2 * ey) <= 0) lo = mid;
-        else hi = mid - 1U;
-    }
-    std::uint32_t my; int ey;
-    detail::dyadic(lo, my, ey);
-    const int c = detail::square_compare(mx, 2U * my + 1U, ex + 2 * (ey - 1));
-    return bit_cast<float>(lo + (c < 0 || (c == 0 && (lo & 1U)) ? 1U : 0U));
-}
+// Correctly rounded x^(-1/2): the shared integer-dyadic form (strix::numeric::rsqrt_correctly_rounded), the same
+// comparisons and midpoint rule. No approximate rsqrt, sqrt/divide equivalence, native reciprocal or host libm assumption.
+STRIX_G4_HD inline float pow32_rsqrt(float x) { return ::strix::numeric::rsqrt_correctly_rounded(x); }
 
 // MiniMax declared_exp copied verbatim in constants/order/saturation; portable RNE intrinsic spelling.
 STRIX_G4_HD inline float declared_exp(float x) {

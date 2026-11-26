@@ -63,7 +63,10 @@ namespace fast {
 inline constexpr std::string_view levers = "fast";
 } // namespace fast
 namespace turbo {
+namespace hip {
 inline constexpr std::string_view levers = "turbo";
+} // namespace hip
+inline constexpr std::string_view levers = "fast";
 } // namespace turbo
 } // namespace presets
 namespace schedule {

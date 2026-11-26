@@ -40,10 +40,4 @@ std::vector<std::filesystem::path> pack_files(const std::filesystem::path& dir, 
     }
     return out;
 }
-std::vector<std::filesystem::path> draft_files(const std::filesystem::path& dir) {
-    std::vector<std::filesystem::path> out;
-    for (const auto& entry : std::filesystem::directory_iterator(dir))
-        if (entry.path().extension() == ".safetensors") out.push_back(entry.path());
-    return out;
-}
 } // namespace strix::minimax::assets

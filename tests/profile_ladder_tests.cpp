@@ -8,12 +8,14 @@
 #include "strix/deepseek41_pair_profile_table.hpp"
 #include "strix/model_registry.hpp"
 #include "strix/profiles/ds41_rtx.hpp"
+#include "strix/profiles/ernie.hpp"
 #include "strix/profiles/gemma4.hpp"
 #include "strix/profiles/qwen_cuda.hpp"
 #include "strix/profiles/qwen_dense_cuda.hpp"
 #include "strix/profiles/qwen_dense_hip.hpp"
 #include "strix/profiles/hy4.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
+#include "core/resident_row_plan.hpp"
 #include "minimax/engine/mm_defaults.hpp"
 #include "cuda/models/glm/producer/profile.hpp"
 
@@ -257,12 +259,12 @@ void defects() {
 // whose column admission is off has an entry with no judgment).
 std::string shipped_row_defect(const p::Engine& engine, const p::LadderRow& row) {
     const auto actual = resolve(engine, row.tier, {row.phase, row.min_context, row.min_lanes, row.device,
-                                                   p::ladder_reference_execution(row.over)});
+                                                   row.band_bound ? p::kBandProbeExecution : p::ladder_reference_execution(row.over)});
     const auto* entry = actual.find(row.lever);
     if (entry == nullptr) return "no entry for the lever";
     const std::string step = " " + std::string(p::name(row.tier)) + "=" + std::string(row.value) + " ";
     if (entry->ladder.find(step) == std::string::npos) return "the cell was not judged in its regime: " + entry->ladder;
-    if (entry->ladder_reference != row.over) return "judged over " + entry->ladder_reference + ", not the row's reference";
+    if (!row.band_bound && entry->ladder_reference != row.over) return "judged over " + entry->ladder_reference + ", not the row's reference";
     if (entry->ladder.find(std::string(row.receipt)) == std::string::npos) return "the row did not decide: " + entry->ladder;
     return {};
 }
@@ -679,6 +681,100 @@ std::vector<std::string> selections() {
     return out;
 }
 
+
+void strixpack_candidates() {
+    using namespace strix::weight;
+    const auto& engine = strix::inkling2::kMiniProfile;
+    for (const auto* candidate : {&kAttentionHeadSP4Lever, &kAttentionHeadSP3Lever, &kAttentionHeadSP2Lever}) {
+        const auto lever = std::ranges::find(engine.table, candidate->name, &p::Lever::name);
+        require(lever != engine.table.end() && p::identity_defect(*lever).empty(), std::string(candidate->name) + ": declared row and identities");
+        if (lever == engine.table.end()) continue;
+        for (const auto tier : {p::Name::standard, p::Name::fast, p::Name::turbo}) {
+            p::Inputs in;
+            in.profile = tier;
+            in.allow_pending = true;
+            in.env = [](const char*) -> const char* { return nullptr; };
+            const auto resolution = p::resolve(engine, in);
+            const auto* entry = resolution.find(candidate->name);
+            require(entry && entry->value == "off" &&
+                        entry->status == (tier == p::Name::standard ? p::Status::builtin : p::Status::pending),
+                    std::string(candidate->name) + ": SP stays off without a loader and receipt");
+        }
+    }
+    const auto& candidate = kAttentionHeadSP4Lever;
+    const p::Regime regime{p::Phase::decode, 64U, 1U, "gfx1151", kExec};
+    const auto arms = p::ladder_arms(engine.table, engine.ladder,
+        regime, [](const p::Lever& row, unsigned column) { return p::column_admission(row, column, false, false); });
+    for (const auto tier : {p::Name::fast, p::Name::turbo}) {
+        const auto reference = arms.over(tier, candidate.name, candidate.target);
+        require(!reference.empty(), "SP4 has a complete reference key");
+        const p::LadderRow receipt{candidate.name, candidate.target, tier, regime.phase, regime.device,
+                                   regime.context, regime.context, 1, 1, 1.2, 0.01, "fixture/sp4", false, {}, {}, reference};
+        auto measured = engine;
+        measured.ladder = std::span(&receipt, 1);
+        require(p::ladder_defect(measured).empty(), "SP4 synthetic receipt is valid");
+        for (const auto applied : {tier, p::Name::turbo}) {
+            auto granted = resolve(measured, applied, regime);
+            const auto* entry = granted.find(candidate.name);
+            require(entry && entry->value == candidate.target, "same SP4 identity resolves in either tier");
+            const auto plan = bind_strixpack_load(granted);
+            require(plan && same_id(plan->policy, kAttentionHeadSP4Policy.id) && !plan->refused &&
+                        entry && entry->value == "off" && entry->status == p::Status::pending && entry->ladder.empty(),
+                    "the admission binding demotes a receipt grant until the loader exists");
+        }
+    }
+}
+
+void lowbit_candidate(const p::Lever& candidate, strix::core::LowBitArithmetic candidate_arithmetic,
+                      const p::Regime& regime) {
+    using strix::core::LowBitArithmetic;
+    using strix::core::resident_lowbit_arithmetic;
+    const auto& engine = strix::inkling2::kMiniProfile;
+    const auto lever = std::ranges::find(engine.table, candidate.name, &p::Lever::name);
+    require(lever != engine.table.end() && p::identity_defect(*lever).empty(),
+            "low-bit candidate is registered with identities");
+    if (lever == engine.table.end()) return;
+
+    const auto exact = resolve(engine, p::Name::standard, regime);
+    require(resident_lowbit_arithmetic(exact) == LowBitArithmetic::f16_group_scale, "EXACT keeps group scale");
+    const auto arms = p::ladder_arms(engine.table, engine.ladder,
+        regime, [](const p::Lever& row, unsigned column) { return p::column_admission(row, column, false, false); });
+    for (const auto tier : {p::Name::fast, p::Name::turbo}) {
+        const auto pending = resolve(engine, tier, regime);
+        const auto* entry = pending.find(candidate.name);
+        require(entry && entry->status == p::Status::pending &&
+                    resident_lowbit_arithmetic(pending) == LowBitArithmetic::f16_group_scale,
+                "low-bit arithmetic stays pending without a receipt");
+        const auto reference = arms.over(tier, candidate.name, candidate.target);
+        require(!reference.empty(), "low-bit candidate has a complete reference key");
+        const p::LadderRow receipt{candidate.name, candidate.target, tier, regime.phase, regime.device,
+                                   regime.context, regime.context, 1, 1, 1.2, 0.01, "fixture/lowbit", false, {}, {}, reference};
+        auto measured = engine;
+        measured.ladder = std::span(&receipt, 1);
+        require(p::ladder_defect(measured).empty() &&
+                    resident_lowbit_arithmetic(resolve(measured, tier, regime)) == candidate_arithmetic,
+                "one matching receipt selects the arithmetic without changing the lever");
+        require(resident_lowbit_arithmetic(resolve(measured, p::Name::turbo, regime)) == candidate_arithmetic,
+                "TURBO keeps the selected value, including when only FAST qualifies");
+        require(resident_lowbit_arithmetic(resolve(measured, p::Name::standard, regime)) == LowBitArithmetic::f16_group_scale,
+                "receipt never changes EXACT");
+        auto wrong = regime;
+        ++wrong.context;
+        require(resident_lowbit_arithmetic(resolve(measured, tier, wrong)) == LowBitArithmetic::f16_group_scale,
+                "another regime keeps group scale");
+    }
+    p::Inputs explicit_exact;
+    explicit_exact.env = [](const char*) -> const char* { return nullptr; };
+    explicit_exact.cli.emplace_back(candidate.name, candidate.target);
+    bool refused = false;
+    try {
+        static_cast<void>(resident_lowbit_arithmetic(p::resolve(engine, explicit_exact)));
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    require(refused, "an explicit low-bit arithmetic candidate is refused in EXACT");
+}
+
 void incumbents(const char* golden, bool write) {
     const auto now = selections();
     if (write) {
@@ -804,6 +900,92 @@ void hy4_new_quality_rows() {
     rows.push_back({h::Device::gfx1151, h::Topology::pair, {"prompt_rows", "4096", 0, 65536, "fixture wider pair gate"}});
     require(h::resolve(other, in, rows, h::incumbent_grants, timings)->find("prompt_rows")->value == "0",
             "pair topology declines the one-node measured row");
+}
+
+void hy4_measured_window_schedule() {
+    namespace h = strix::hy4::profile;
+    p::Inputs in;
+    in.env = [](const char*) -> const char* { return nullptr; };
+    in.profile = p::Name::fast;
+    const h::Regime legacy{h::Device::gfx1151, h::Topology::one_node, 8192, h::single_greedy_8k};
+    const auto baseline = h::resolve(legacy, in);
+    for (const auto& cell : baseline->ladder)
+        require(!cell.incumbent || cell.lever != "prompt_rows" || cell.value == "4096",
+                "Hy4 cannot use an incumbent grant to admit a different window width");
+
+    // Synthetic timing evidence, with the key fixed independently of the effective-arm builder.
+    const h::RankExecution rank{"gfx1151|Fixture A|cu40|mem137438953472|clk2900000|hip70000000|drv70000000",
+                                "fixture-q4_k_m", 8192, 8384, 64, 2};
+    const auto execution = h::rank_execution(rank, in);
+    const std::string reference = "ladder-arm/v4;" + execution +
+        ";prompt_rows=4096{v1},head_q8=1{v1},pf_mha=1{v1},decode_iu4=off{v1},pf_a8_producer=1{v1},"
+        "q8_store_epilogue=1{v1},pf_store_epilogue=1{v1},prompt_window_schedule=4096{v1};"
+        "candidate=prompt_window_schedule=2048{v1};tier=fast";
+    h::Measured receipt{h::Topology::one_node,
+        {"prompt_window_schedule", "2048", p::Name::fast, p::Phase::prefill, "gfx1151", 8192, 8192,
+         1, 1, 1.05, 0.02, "fixture warm timing over FAST 4096"}};
+    receipt.timing.over = reference;
+    auto regime = legacy;
+    regime.execution = execution;
+    const auto resolve = [&](const h::Regime& run) {
+        return h::resolve(run, in, h::qualified, h::incumbent_grants, std::span(&receipt, 1));
+    };
+    require(h::resolve(regime, in)->find("prompt_rows")->value == "4096", "Hy4 keeps 4096 without a registered receipt");
+    for (const auto tier : {p::Name::fast, p::Name::turbo}) {
+        in.profile = tier;
+        const auto selected = resolve(regime);
+        const auto& width = *selected->find("prompt_rows");
+        require(p::ladder_defect(selected->engine).empty(), "Hy4 window receipt is in the shared ladder");
+        require(width.value == "2048" && width.status == p::Status::set && width.ladder_reference == reference &&
+                    width.ladder.find("applies x1.050 noise 0.020") != std::string::npos,
+                "Hy4 admits only the measured schedule over the gated FAST width");
+        auto other = regime;
+        --other.prompt_tokens;
+        require(resolve(other)->find("prompt_rows")->value == "4096", "Hy4 neighboring prompt keeps 4096");
+        other = regime;
+        other.topology = h::Topology::pair;
+        require(resolve(other)->find("prompt_rows")->value == "4096", "Hy4 pair uses its previous width");
+        auto different = rank;
+        different.repeat = 1;
+        const auto cold = h::rank_execution(different, in);
+        other = regime;
+        other.execution = cold;
+        require(resolve(other)->find("prompt_rows")->value == "4096", "Hy4 cold run keeps 4096");
+        different = rank;
+        different.device = "gfx1151|Fixture B|cu40|mem137438953472|clk2900000|hip70000000|drv70000000";
+        const auto device = h::rank_execution(different, in);
+        other.execution = device;
+        require(resolve(other)->find("prompt_rows")->value == "4096", "Hy4 other gfx1151 product keeps 4096");
+
+        in.env = [](const char* name) -> const char* {
+            return std::string_view(name) == "STRIX_DECODE_FUSE" ? "0legacy" : nullptr;
+        };
+        const auto unfused = h::rank_execution(rank, in);
+        other.execution = unfused;
+        require(resolve(other)->find("prompt_rows")->value == "4096", "Hy4 unfused decode keeps 4096");
+        in.env = [](const char* name) -> const char* {
+            return std::string_view(name) == "STRIX_DECODE_FUSE" ? "1legacy" : nullptr;
+        };
+        require(h::rank_execution(rank, in) == execution, "Hy4 keys the effective value of the decode fuse");
+        in.cli = {{"head_q8", "0"}};
+        require(resolve(regime)->find("prompt_rows")->value == "4096", "Hy4 other arithmetic composition keeps 4096");
+        in.cli = {{"prompt_rows", "4096"}};
+        require(resolve(regime)->find("prompt_rows")->value == "4096", "Hy4 respects an explicit width");
+        in.cli.clear();
+        in.allow_pending = true;
+        receipt.timing.speedup = 1.012;
+        require(resolve(regime)->find("prompt_rows")->value == "4096", "Hy4 keeps 4096 within the noise margin");
+        receipt.timing.speedup = 0.94;
+        require(resolve(regime)->find("prompt_rows")->value == "4096", "Hy4 keeps 4096 when the measured schedule loses");
+        receipt.timing.speedup = 1.05;
+        require(resolve(legacy)->find("prompt_rows")->value == "4096", "Hy4 cannot benchmark an unmeasured width by default");
+        in.allow_pending = false;
+    }
+    in.profile = p::Name::standard;
+    require(resolve(regime)->find("prompt_rows")->value == "0", "Hy4 BASE keeps the serial reference with evidence");
+    in.profile = p::Name::fast;
+    const auto no_gate = h::resolve(regime, in, {}, h::incumbent_grants, std::span(&receipt, 1));
+    require(no_gate->find("prompt_rows")->value == "0", "Hy4 timing cannot admit ungated arithmetic");
 }
 
 // Ordinary timing rows decide only the comparison they measured (LadderRow::over), --allow-pending never runs a measured
@@ -1494,6 +1676,38 @@ void minimax_i4_binding() {
 
 }  // namespace
 
+// Band receipts along a chain: the second lever's band row binds over the cell the first lever's band row admits
+// (bind + arms repeated until the references settle), so both cells of a measured chain run inside their bands.
+void band_chain() {
+    static constexpr std::array<p::Lever, 2> table{{
+        {"chain-window@1", "", "", {"", "w", "", ""}, "off", p::Kind::bit_changing, {true, true, false, false},
+         {true, true, false, false}, "", "off", "fixture receipts", false, {}, false, {}, {{{"off", "v1"}, {"w", "v1"}}}},
+        {"chain-layers@1", "", "", {"", "l", "", ""}, "off", p::Kind::bit_changing, {true, true, false, false},
+         {true, true, false, false}, "", "off", "fixture receipts", false, {}, false, {}, {{{"off", "v1"}, {"l", "v1"}}}},
+    }};
+    const auto band = [](std::string_view lever, std::string_view value, double speedup) {
+        p::LadderRow row{lever, value, p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, speedup, 0.02, "r/band"};
+        row.band_bound = true;
+        return row;
+    };
+    const std::array rows{band("chain-window@1", "w", 1.5), band("chain-layers@1", "l", 1.1)};
+    const p::Engine engine{"band-chain", "", table, false, "band-chain-v1", {}, {}, rows};
+    require(p::ladder_defect(engine).empty(), "band chain fixture is well formed: " + p::ladder_defect(engine));
+    const auto in_band = resolve(engine, p::Name::fast, {p::Phase::prefill, 4096, 1, "dev", kExec});
+    const auto* window = in_band.find("chain-window@1");
+    const auto* layers = in_band.find("chain-layers@1");
+    require(window && window->value == "w" && p::applied(window->status), "first band lever runs in its band");
+    require(layers && layers->value == "l" && p::applied(layers->status) &&
+                layers->ladder_reference.find("chain-window@1=w{v1}") != std::string::npos,
+            "second band lever binds over the first lever's admitted cell and runs");
+    const auto unknown = resolve(engine, p::Name::fast, {p::Phase::prefill, 4096, 1, "dev", {}});
+    require(!p::applied(unknown.find("chain-window@1")->status) && !p::applied(unknown.find("chain-layers@1")->status),
+            "unknown execution: no band row decides");
+    const auto outside = resolve(engine, p::Name::fast, {p::Phase::prefill, 8193, 1, "dev", kExec});
+    require(!p::applied(outside.find("chain-window@1")->status) && !p::applied(outside.find("chain-layers@1")->status),
+            "outside the band: the tier below");
+}
+
 int main(int argc, char** argv) try {
     if (argc < 3) return 2;
     if (argc > 3 && std::string_view(argv[3]) == "--write") {
@@ -1501,7 +1715,13 @@ int main(int argc, char** argv) try {
         return 0;
     }
     incumbents(argv[2], false);
+    strixpack_candidates();
+    lowbit_candidate(strix::weight::kLowBitFoldedScaleLever, strix::core::LowBitArithmetic::f16_folded_scale,
+                     {p::Phase::prefill, 8192U, 1, "gfx1151", kExec});
+    lowbit_candidate(strix::weight::kLowBitRowsSelectLever, strix::core::LowBitArithmetic::f16_rows_select,
+                     {p::Phase::decode, 16384U, 1, "gfx1151", kExec});
     verdicts();
+    band_chain();
     bound_evidence();
     defects();
     shipped_rows();
@@ -1525,6 +1745,7 @@ int main(int argc, char** argv) try {
         qd::hip_profile::engine(qd::hip_profile::App::spec),
         strix::hy4::profile::engine(),
         strix::inkling2::kMiniProfile,
+        strix::ernie::kProfileEngine,  // inspection only: no lever table yet
     };
     for (const auto& registered : strix::model_registry::load(argv[1])) {
         const auto tag = registered.profile_tag;
@@ -1535,6 +1756,7 @@ int main(int argc, char** argv) try {
     turbo_nests_fast(engines);
     paired_rows();
     hy4_new_quality_rows();
+    hy4_measured_window_schedule();
     for (const auto& engine : engines) walk(engine);
     // Review r63 D: every engine table the ladder reads, the custom adapters' tables through their shared row view.
     EnumerationCount count;

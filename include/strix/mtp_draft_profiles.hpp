@@ -59,6 +59,10 @@ inline constexpr std::array<MtpDraftProfile, 3> mtp_draft_profiles{{
 
 // The recommended draft (final campaign: +10 % decode over the base draft at min-p 0.85).
 inline constexpr std::string_view mtp_recommended_draft_profile = "distill-g";
+// Directory beside the model where the published draft ships (the base draft's source path); every profiled draft
+// is also found there by its logical name (drafter discovery).
+inline constexpr std::string_view mtp_drafter_dir = "MTP";
+static_assert(mtp_draft_profiles[0].source_path.starts_with("MTP/"), "the base draft ships in the drafter directory");
 
 inline constexpr const MtpDraftProfile* find_mtp_draft_profile(std::string_view name) noexcept {
     for (const auto& p : mtp_draft_profiles) if (p.name == name) return &p;

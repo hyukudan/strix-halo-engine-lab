@@ -129,6 +129,21 @@ public:
                        std::span<const std::uint8_t> codes, std::span<const std::uint8_t> scales);
     void certify_controller(const MiniReadControllerBits& read);
     [[nodiscard]] const MiniControllerCertificate& controller_certificate() const { return controller_certificate_; }
+    // Bind admission to the compact views that dispatch will use. BF16 and Q8_0 have no folded operand.
+    template <class Read, class Decline>
+    void certify_folded_scale(const Read& read, const Decline& decline) {
+        const auto certify = [&](weight::ResidentMatrixView& matrix, unsigned layer, unsigned projection) {
+            if (matrix.storage != weight::kQ4G64WeightStorage && matrix.storage != weight::kQ6G64WeightStorage) return;
+            if (const auto reason = core::certify_folded_scale(matrix, read); !reason.empty())
+                decline(layer, projection, reason);
+        };
+        if (head_) certify(*head_, kPhysicalLayers, 0U);
+        if (compact_attention_)
+            for (unsigned layer = 0U; layer < kPhysicalLayers; ++layer)
+                for (unsigned role = 0U; role < attention_[layer].role_count; ++role)
+                    if (auto* matrix = std::get_if<weight::ResidentMatrixView>(&attention_[layer].matrix[role]))
+                        certify(*matrix, layer, role);
+    }
     [[nodiscard]] const weight::ResidentMatrixView& compact_head() const { return head_.value(); }
     [[nodiscard]] const attn_core::ResidentPreparedGqaWeights& compact_attention(unsigned physical) const {
         return attention_.at(physical);

@@ -244,20 +244,23 @@ int run_mtp_ref(q::HipEngine& E, const std::string& model, const std::string& mt
 }  // namespace
 
 int main(int argc, char** argv) try {
-    if (strix::qwen35::hip_profile::take(strix::qwen35::hip_profile::App::spec, argc, argv)) return 0;
+    const q::hip_profile::Command command(q::hip_profile::App::spec, argc, argv);
+    const auto& args = command.args;
+    bool inspect = false;
     std::string model, ids_file, label = "run", sources, mtp_file, chain_hidden = "post", dump_ref, dump_out;
-    std::uint32_t n_gen = 256, max_block = 0, max_pos = 0, pf_bench = 0, trace_n = 0, prefill_rows = 0, chain_k = 0, ref_n = 0;
-    bool prefill_exact = false;  // prefill_rows 0 = the engine default (64-row EXACT windows)
+    std::uint32_t n_gen = 256, max_block = 0, max_pos = 0, pf_bench = 0, trace_n = 0, chain_k = 0, ref_n = 0;
+    q::PrefillFlags pfl;
     q::HipDenseSpecArgs spec_args;  // the family's shared speculation flags: the same parser and resolver as strix-hip-qwen35-decode
     bool check = true, cost_table = false, pf_sample = false, pf_twice = false, mtp_ref = false;
     std::uint32_t copy_arm = 0;
-    for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const auto& a = args[i];
         auto next = [&]() -> std::string {
-            if (i + 1 >= argc) throw std::invalid_argument("missing value for " + a);
-            return argv[++i];
+            if (i + 1 >= args.size()) throw std::invalid_argument("missing value for " + a);
+            return args[++i];
         };
-        if (a == "--model") model = next();
+        if (a == "--print-effective-config") inspect = true;
+        else if (a == "--model") model = next();
         else if (a == "--prompt-file") ids_file = next();
         else if (a == "--n-gen") n_gen = strix::core::parse_u32(next());
         else if (a == "--sources") sources = next();
@@ -268,8 +271,7 @@ int main(int argc, char** argv) try {
         else if (a == "--prefill-bench") pf_bench = strix::core::parse_u32(next());
         else if (a == "--pf-sample") pf_sample = true;
         else if (a == "--pf-twice") pf_twice = true;  // two full prefills: cold first, warm last
-        else if (a == "--prefill-rows") prefill_rows = strix::core::parse_u32(next());  // 16 = 16-row exact; >16 = FAST wide windows (dense-q8a8-f16-v1)
-        else if (a == "--prefill-exact") prefill_exact = true;  // with --prefill-rows > 16: EXACT wide windows (bitwise to 16)
+        else if (q::hip_profile::take_window_flag(q::hip_profile::App::spec, a, [&] { return strix::core::parse_u32(next()); }, pfl)) {}
         else if (a == "--seed-costs") spec_args.costs = next() != "0" ? q::HipDenseCostMode::calibrated : q::HipDenseCostMode::learned;  // previous name
         else if (a == "--trace") trace_n = strix::core::parse_u32(next());
         else if (a == "--label") label = next();
@@ -283,6 +285,9 @@ int main(int argc, char** argv) try {
         else if (a == "--dump-out") dump_out = next();              // speculative emitted ids -> file
         else throw std::invalid_argument("unknown argument " + a);
     }
+    const auto profile = q::hip_profile::resolve_prefill(q::hip_profile::App::spec, command.inputs, pfl, q::HipEngine::max_rows());
+    if (q::hip_profile::finish(q::hip_profile::App::spec, profile, inspect)) return 0;
+    q::hip_profile::apply_window(q::hip_profile::App::spec, profile, pfl);  // the window the profile applied runs
     const auto plan = q::resolve_hip_dense_spec(model, spec_args);  // ONE resolver (hip_spec_defaults.hpp)
     mtp_file = plan.mtp_source;
     std::printf("spec plan: mtp %s %s, draft rows %s, costs %s; overrides:%s%s%s%s\n", plan.mtp_reason.c_str(), mtp_file.c_str(),
@@ -304,9 +309,6 @@ int main(int argc, char** argv) try {
     opt.max_positions = std::max<std::uint32_t>(max_pos, std::uint32_t(prompt.size()) + n_gen + 128U + (cost_table ? 512U : 0U));
     if (pf_bench) opt.max_positions = std::max(opt.max_positions, pf_bench + 64U);
     opt.quiet = true;
-    q::PrefillFlags pfl;  // explicit window: 16-row exact, or FAST wide unless --prefill-exact (prefill_windows.hpp)
-    pfl.width = prefill_rows;
-    pfl.exact = prefill_exact;
     q::apply_prefill_flags(pfl, q::HipEngine::max_rows(), opt);
     auto E = q::HipEngine::from_gguf(model, opt);
     std::printf("prefill windows: %u rows, %s\n", E->prefill_rows(),

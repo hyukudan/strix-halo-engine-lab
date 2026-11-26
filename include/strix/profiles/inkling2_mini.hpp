@@ -3,6 +3,8 @@
 #include "strix/engine_profile.hpp"
 #include "strix/spec/block_draft_policy.hpp"
 #include "strix/weight/levers.hpp"
+#include "strix/weight/lowbit_folded_scale_profile.hpp"
+#include "strix/weight/lowbit_rows_select_profile.hpp"
 #include "strix/weight/registry.hpp"
 
 #include <array>
@@ -51,6 +53,11 @@ inline constexpr weight::WeightLoadPolicy kMiniFastWeightPolicy = weight::kHeadQ
 // ladder rule leaves TURBO on the tier below. The row's stated gain (kMiniLowBitDecisionRows) predates the screened head.
 inline constexpr std::string_view kMiniLowBitTurbo = "inkling2-mini-lowbit-turbo@1";
 inline constexpr std::string_view kMiniLowBitPackFile = "inkling2-mini-q4.lowbit-pack";
+// Head in Strix pack SP4 (fixed table) from an explicit calibrated pack (STRIX_LOWBIT_PACK, strix-lowbit-calib-pack
+// --storage unembed.weight=sp4 --table fixed): the decode-only head arm (BF16 image kept for prefill, verify and the
+// widths outside the band). Pending in FAST and TURBO: no decision row until its device gate v2 receipt.
+inline constexpr std::string_view kMiniLowBitHead = "inkling2-mini-lowbit-head@1";
+inline constexpr weight::WeightLoadPolicy kMiniSp4HeadPolicy = weight::kHeadSP4TPolicy;
 inline constexpr weight::WeightLoadPolicy kMiniTurboWeightPolicy = weight::kAttentionHeadQ4Policy;
 // The row covers decode steps only. The low-bit copies are resident beside the BF16 image used for
 // prefill, verify and decode widths outside the receipt.
@@ -113,6 +120,11 @@ inline weight::WeightLoadPlan resolve_mini_weight_load(
 // input by the family NVFP4 rule, sm_120 block-scaled FP4 MMA, weights used as stored). MXFP8 layers, decode, verify and
 // one-row calls keep the BF16 tile. CUDA sm_120 only (HIP refuses a selected class). Runnable, not ready: opt in with
 // STRIX_INK_MOE_W4A4=1 until the FAST gate (prefill regime) and a prefill receipt exist. Off switch: STRIX_INK_MOE_W4A4=0.
+// TURBO cell iu4: the rotated integer class on HIP (moe_core/grouped_iu4a4.hpp, grouped-iu4a4-rot-v1; multi-row prefill
+// chunks of every expert layer, rotated images built once at load). Ready under --profile turbo with its declared quality
+// (gate v2, prefill regime; TURBO needs a measured quality and a speed receipt, not the FAST gate), so the CLI and a model
+// preset (strix-serve) admit the same cell. It runs only in the prefill regimes of kMiniLadder below; every other regime
+// (decode, other devices, unmeasured prompt sizes) resolves to the FAST cell, so CUDA keeps its BF16 tile.
 inline constexpr std::string_view kMiniMoeW4a4 = "inkling2-mini-moe-w4a4@1";
 // Narrow expert image: the checkpoint's MXFP8 expert layers are transcoded to NVFP4 at load (shared
 // weight/formats/microscaled_encode.hpp, mse@2 block scales, one outer scale per expert) and every expert consumer
@@ -132,12 +144,13 @@ inline constexpr std::string_view kMiniCombineImage = "inkling2-mini-combine-dow
 // (core::RoundStore::separate). Opt-in: off in every profile column (all cells empty, builtin 0); select it with
 // STRIX_INK_PREPARED_ROUND_FOLD=1 (any profile), through the one resolver the CLI, the gate and the server share.
 inline constexpr std::string_view kMiniPreparedRoundFold = "inkling2-mini-prepared-round-fold@1";
-// Exact lever: the CUDA prompt flash projects the relative bias itself (cuda_core::PreparedBf16Projection)
+// Exact lever (opt-in): the CUDA prompt flash projects the relative bias itself (cuda_core::PreparedBf16Projection)
 // instead of reading the [row][head][distance] image the prepare stage produces. Same FP32 FMA chain in feature order,
 // same BF16 round per distance, same failure contract as the image route for every launch it admits (single prompt
 // chunk of two or more rows, host positions, no null-order count). A launch it cannot admit keeps the image route; real
-// errors stay visible. CUDA only (HIP ignores the value: set_attention_projected_bias is a no-op under __HIPCC__ and
-// HIP selects its projected route in its own binding). The default in every tier after the RTX identity checks; an explicit 0 keeps the incumbent image route. Switch: STRIX_INK_ATTN_PROJECTED_BIAS=0/1.
+// errors stay visible. CUDA only (HIP selects its projected route in its own binding). Off in every tier (builtin "0":
+// the image route); an explicit 1 selects it and is a distinct identity until device identity on the landing head
+// makes it a default. Switch: STRIX_INK_ATTN_PROJECTED_BIAS=0/1.
 inline constexpr std::string_view kMiniAttnProjectedBias = "inkling2-mini-attn-projected-bias@1";
 // Served route lever, opt-in: a HIP server runs the command line's route (packed decode unless a flag selects grouped,
 // the whole prompt by the command line's chunks and tail rule, the first id from the final prefill row), so a served
@@ -148,14 +161,14 @@ inline constexpr std::string_view kMiniAttnProjectedBias = "inkling2-mini-attn-p
 inline constexpr std::string_view kMiniServedCliRoute = "inkling2-mini-served-cli-route@1";
 // Draft CUDA controller schedule. One plane requires explicit selection and a resident weight certificate.
 inline constexpr std::string_view kMiniControllerPlanes = "inkling2-mini-controller-planes@1";
-// Exact lever: CUDA greedy picks that return no score row run the shared EXACT screened head
+// Exact lever (opt-in): CUDA greedy picks that return no score row run the shared EXACT screened head
 // (cuda/core/head_screened.cuh over the BF16 unembed.weight, 8-bit plane built at load): the token and status of the full
 // head by construction (rigorous bound, every possible argmax is rescored by the incumbent row body and picked by the
 // incumbent rule). Steps that return or read scores (host logits, sampled lanes, verify rows, cohort programs) keep the
 // full head; a plane that cannot be built, or (served) would cost a KV slot, keeps the full head. CUDA only: HIP keeps its
-// own binding (screened by default, STRIX_SCREENED_HEAD=0 = full head; set_screened_head is a no-op under __HIPCC__,
-// so HIP ignores the value). The default in every tier after the RTX identity checks; an explicit 0
-// keeps the incumbent full head. Switch: STRIX_INK_SCREENED_HEAD=0/1.
+// own binding (screened by default, STRIX_SCREENED_HEAD=0 = full head). Off in every tier (builtin "0": the full head);
+// an explicit 1 selects it and is a distinct identity until an RTX identity receipt makes it a default.
+// Switch: STRIX_INK_SCREENED_HEAD=0/1.
 inline constexpr std::string_view kMiniScreenedHead = "inkling2-mini-screened-head@1";
 // Exact lever (opt-in): a HIP verify window of 2..kMiniMaxVerifyRows rows projects its score rows through the decoder's
 // one pitched rows head (project_head_rows: the head read once, every row on its one-row body), attends its rows in one
@@ -167,14 +180,16 @@ inline constexpr std::string_view kMiniScreenedHead = "inkling2-mini-screened-he
 // bitwise the incumbent) makes it a default. Value 2 adds the lanes pick: greedy picks whose scores nobody reads (verify
 // windows, served cohorts whose groups declare no score read) take the lanes form of the EXACT screened head (BF16).
 inline constexpr std::string_view kMiniVerifyRows = "inkling2-mini-verify-rows@1";
-// Exact lever (opt-in until its device receipts): greedy speculation, exact by construction (a drafted row is committed
+// Exact lever, builtin auto: the default of every tier, and the legacy identity (omit_builtin_fingerprint: only an explicit
+// off is fingerprinted; receipts in its source). Greedy speculation, exact by construction (a drafted row is committed
 // only when it equals the target's own pick, so the ids are the ids of one-row decode). "auto" resolves the speculation
 // mode of the command line and the server alike (an explicit --speculation wins): the command line's resident route
 // loads the model's MTP block drafter beside the checkpoint (strix/spec/drafter_source.hpp; --dspark FILE|off wins) and
 // buys windows through the shared block drafter; a HIP server drafts from each lane's context (the shared cohort
 // drafter) through one-lane verify windows, while one lane is live (the model's max_draft_by_live). Either way the
-// verify body is the verify rows lever at level >= 1. CUDA: the step program declines (no verifier), the server
-// declines. Values: off (builtin), auto.
+// verify body is the verify rows lever at level >= 1. Speculation and a requested low-bit row never share a run
+// (mini_speculation_policy). CUDA: the step program declines (no verifier), the server
+// declines. Values: auto (builtin), off.
 inline constexpr std::string_view kMiniSpeculation = "inkling2-mini-speculation@1";
 // Image pre-processing recipe of the one vision adapter (src/inkling2/inkling2_vision.*), resolved here with the other
 // rows by the resolver the CLI and the server share. "legacy" (builtin, image identity inkling2-vision-v1) or "axial@1"
@@ -186,11 +201,13 @@ inline constexpr std::string_view kMiniSpeculation = "inkling2-mini-speculation@
 // mini_vision_media_tier); a text-only run never applies it (mini_defer_vision_recipe), and at its builtin the row
 // stays out of the fingerprint and the receipt, so a text-only run resolves as before the row.
 inline constexpr std::string_view kMiniVisionRecipe = "inkling2-vision-recipe";
-inline constexpr std::array<profile::Lever, 13> kMiniLevers{{
-    {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
-     {}, {false, true, false, true}, "1", "0",
-     "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
-     false, {}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
+inline constexpr std::array<profile::Lever, 19> kMiniLevers{{
+    {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", "iu4"}, "0", profile::Kind::bit_changing,
+     {false, false, false, true}, {false, true, false, true}, "1", "0",
+     "FAST 1 waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt; TURBO iu4 declared, "
+     "gate v2 prefill (16 held-out prose windows, 1,008 rows, routes replayed): KL 0.0179, top-1 0.9296, dNLL +0.0035, "
+     "free route-flip ratio 5.55",
+     false, {}, true, {}, {{{"0", "v1"}, {"1", "v1"}, {"iu4", "v1"}}}},
     {kMiniCombineImage, "STRIX_INK_COMBINE_IMAGE", "", {"", "", "", ""}, "0", profile::Kind::exact,
      {true, true, true, true}, {true, true, true, true}, "", "0",
      "BF16 down image + combine: output bits of the FP32 down rows (device A/B through the grouped down producer, NaN "
@@ -210,10 +227,9 @@ inline constexpr std::array<profile::Lever, 13> kMiniLevers{{
     {kMiniControllerPlanes, "STRIX_INK_CONTROLLER_PLANES", "--controller-planes", {}, "3", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "3", "awaits CUDA device identity and model qualification",
      true, {}, true, {}, {{{"3", "v1"}, {"1", "v1"}}}},
-    {kMiniAttnProjectedBias, "STRIX_INK_ATTN_PROJECTED_BIAS", "", {"1", "1", "1", ""}, "0", profile::Kind::exact,
-     {true, true, true, true}, {true, true, true, true}, "1", "0",
-     "RTX identity: 9/9 logits and 13/13 token sequences on the projected-bias implementation; "
-     "off/on greedy token sequences matched in CLI and serving",
+    {kMiniAttnProjectedBias, "STRIX_INK_ATTN_PROJECTED_BIAS", "", {}, "0", profile::Kind::exact,
+     {}, {true, true, true, true}, "1", "0",
+     "awaits device identity on the landing head (logits, ids and state bitwise the image route) before any default",
      false, {}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniServedCliRoute, .env = "STRIX_INK_SERVED_CLI_ROUTE", .option = "",
      .value = {"", "", "", ""}, .builtin = "0",
@@ -223,10 +239,11 @@ inline constexpr std::array<profile::Lever, 13> kMiniLevers{{
                "evidence so far: served cohort lanes == the same served decoder's lone lane at cohort widths 2..17",
      .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniScreenedHead, .env = "STRIX_INK_SCREENED_HEAD", .option = "",
-     .value = {"1", "1", "1", ""}, .builtin = "0",
-     .kind = profile::Kind::exact, .ready = {true, true, true, true},
+     .value = {"", "", "", ""}, .builtin = "0",
+     .kind = profile::Kind::exact, .ready = {false, false, false, false},
      .runnable = {true, true, true, true}, .target = "1", .off = "0",
-     .source = "RTX identity: full and screened heads produced the same greedy token sequences in CLI and serving",
+     .source = "awaits the RTX identity receipt on the landing head (greedy ids against the full head, CLI and served) "
+               "before any default",
      .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniLowBitTurbo, .env = "STRIX_INK_LOWBIT_TURBO", .option = "",
      .value = {"", "", "", ""}, .builtin = "0", .kind = profile::Kind::bit_changing,
@@ -241,22 +258,57 @@ inline constexpr std::array<profile::Lever, 13> kMiniLevers{{
                "partial commit bitwise the per-row incumbent, BF16 and Q8_0 heads); HIP only",
      .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniSpeculation, .env = "STRIX_INK_SPECULATION", .option = "",
-     .value = {"", "", "", ""}, .builtin = "off",
-     .kind = profile::Kind::exact, .ready = {}, .runnable = {true, true, true, true}, .target = "auto", .off = "off",
-     .source = "awaits device receipts on one gfx1151 node: ids with drafting == without (command line and served, "
-               "prose / code / JSON) and tok/s per regime (B=1, C2, C4, C8); a slower cell stays off; HIP only",
-     .omit_builtin_fingerprint = true, .identity = {{{"off", "v1"}, {"auto", "v1"}}}},
+     .value = {"", "", "", ""}, .builtin = "auto",
+     .kind = profile::Kind::exact, .ready = {}, .runnable = {true, true, true, true},
+     .target = "", .off = "off",
+     .source = "ink_draft t1c/t2 (cluster1 gfx1151, BF16, greedy): ids with drafting == without, CLI 3/3 and served "
+               "46/46; CLI 160 tokens code / prose / JSON 28.40 / 28.31 / 29.06 -> 29.46 / 32.77 / 42.64 tok/s, served "
+               "B=1 23.43 / 23.28 / 23.69 -> 28.58 / 31.88 / 28.67; windows only while one lane is live "
+               "(max_draft_by_live), the previous one-row route at two or more; CUDA declines (no verifier)",
+     .omit_builtin_fingerprint = true, .identity = {{{"off", "v1"}, {"auto", "v2"}}}},
     {kMiniVisionRecipe, "STRIX_INKLING2_VISION_RECIPE", "", {}, "legacy", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "axial@1", "legacy",
      "awaits the real-checkpoint reference gate (patches, hidden and projected rows) and CLI image identity on HIP "
      "and CUDA",
      false, {}, true, {}, {{{"legacy", "v1"}, {"axial@1", "v1"}}}},
     spec::kBlockDraftLever,
+    weight::kAttentionHeadSP4Lever,
+    weight::kAttentionHeadSP3Lever,
+    weight::kAttentionHeadSP2Lever,
+    weight::kLowBitFoldedScaleLever,
+    weight::kLowBitRowsSelectLever,
+    {.name = kMiniLowBitHead, .env = "STRIX_INK_LOWBIT_HEAD", .option = "",
+     .value = {"", "", "", ""}, .builtin = "0", .kind = profile::Kind::bit_changing,
+     .ready = {}, .runnable = {false, true, false, true}, .target = "sp4t", .off = "0",
+     .source = "explicit option: SP4 fixed-table head, device gate v2 decode 2026-11-26 FAST fails 1/39 windows "
+               "(+1 unresolved), TURBO limits 39/39 pass, CLI B=1 -3.1 % per step vs the BF16 head "
+               "(docs/engine/lowbit-calibration.md); a TURBO row awaits the served arm and a combined receipt; HIP "
+               "command line only",
+     .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"sp4t", "sp4t-head-v1"}}}},
+}};
+
+// TURBO prefill timing of the iu4 cell on gfx1151 (one node, one binary for the CLI and strix-serve, prompt prefill time
+// over the BF16 tile, medians). Band receipts (LadderRow::band_bound): they name no literal reference execution, they bind
+// per run to that run's own FAST reference (profile::bind_band_receipts, in profile::resolve), so a row decides only on a
+// run whose execution is known (Regime::execution, spelled by mini_ladder_execution for the command line, the gate and
+// the server alike) inside the band; no FAST prefill lever runs on that device, so the reference is the builtin arm.
+// Measured ends, CLI (prompts of 4,309 / 8,236 / 32,760 tokens) / served (the same texts, 4,307 / 8,234 / 32,758
+// tokens): 4K x1.1211 / x1.1171, 8K x1.0915 / x1.0944, 32K x1.0689 / x1.0861. A band takes the lower speedup of its
+// two ends, rounded down; prompts below 4,307 or above 32,760 tokens are unmeasured and keep the tier below.
+inline constexpr std::string_view kMiniIu4PrefillReceipt =
+    "grouped-iu4a4-rot-v1 prefill timing, gfx1151, CLI + served, EXACT/TURBO interleaved, prompts of 4,307..32,760 tokens";
+inline constexpr std::array<profile::LadderRow, 2> kMiniLadder{{
+    {.lever = kMiniMoeW4a4, .value = "iu4", .tier = profile::Name::turbo, .phase = profile::Phase::prefill,
+     .device = "gfx1151", .min_context = 4307, .max_context = 8236, .min_lanes = 1, .max_lanes = 1,
+     .speedup = 1.091, .noise = 0.01, .receipt = kMiniIu4PrefillReceipt, .band_bound = true},
+    {.lever = kMiniMoeW4a4, .value = "iu4", .tier = profile::Name::turbo, .phase = profile::Phase::prefill,
+     .device = "gfx1151", .min_context = 8237, .max_context = 32760, .min_lanes = 1, .max_lanes = 1,
+     .speedup = 1.068, .noise = 0.01, .receipt = kMiniIu4PrefillReceipt, .band_bound = true},
 }};
 
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.
 inline constexpr profile::Engine kMiniProfile{
-    "inkling2-mini", "", kMiniLevers, false, "inkling2-mini-turbo-v1",
+    "inkling2-mini", "", kMiniLevers, false, "inkling2-mini-turbo-v1", {}, {}, kMiniLadder,
 };
 
 // The image recipe applies only to a request with image input. The text resolution (resolve_mini_profile, shared by

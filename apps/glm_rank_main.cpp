@@ -3,6 +3,7 @@
 #include "strix/env_arms.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/moe/route_file.hpp"
 #include "glm/prefill/glm_pf_aux.hpp"
 #include "glm_deploy_owners.hpp"
 #include "glm/load/glm_rank_plan.hpp"
@@ -59,6 +60,7 @@
 // rank with exit code 86 near the OOM line.
 // --print-model-graph / STRIX_PRINT_MODEL_GRAPH=1: validated description dump; exits before device work.
 #include "glm_rank_defaults.hpp"
+#include "glm_prefill_turbo.hpp"
 #include "../src/glm/load/glm_model_description.hpp"
 #include "glm/prefill/glm_pf_load_admission.hpp"
 #include "strix/device_profile.hpp"
@@ -149,7 +151,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "usage: %s MODEL_DIR --world 1|2 [--rank R --transport T] [modes] [--identity r1|r1b|r1b-all] [--idcheck N --prompt T.u32]\n"
                                  "--print-device-profile / STRIX_PRINT_DEVICE_PROFILE=1: HIP probe JSON, then exit (no model/peer)\n"
                                  "--deploy FILE|auto --deploy-check: host-only deployment JSON (no allocation/peer)\n"
-                                 "--profile default|fast|quality: product policy; bare --profile: kernel timing\n"
+                                 "--profile exact|fast|quality|turbo: product policy; bare --profile: kernel timing\n"
                                  "identity: r1 throughout; r1b (default) R1 prompts/R1b generation; "
                                  "r1b-all throughout (reference prefill)\n", argv[0]);
             return 2;
@@ -311,6 +313,9 @@ int main(int argc, char** argv) {
             return 0;
         }
         rd::apply_env(eff, [](const char* k, const char* v) { (void)::setenv(k, v, 0); });
+        // Drafter content identity (r94): read once here, named by the receipt and by the pair identity (print()).
+        if (eff.mtp_spec.value == "1") eff.head.mtp_digest = rd::mtp_payload_digest(eff.head);
+        std::fputs(rd::mtp_decode_line(eff).c_str(), stderr);
         if (eff.product) {
             std::fprintf(stderr, "profile %s\n", eff.product->json().c_str());
             for (const auto& line : eff.product->receipt_lines()) std::fprintf(stderr, "%s\n", line.c_str());
@@ -424,6 +429,7 @@ int main(int argc, char** argv) {
         }
         std::unique_ptr<strix::dist::Communicator> comm;
         std::shared_ptr<strix::glm::xfer::XferExchange> xfer_exchange;
+        bool turbo_prefill_pair = false;
         const char* lt = std::getenv("STRIX_GLM_LOAD_TEST");
         if (opt.world == 2 && !(lt != nullptr && std::string(lt) == "1")) {
             if (transport_spec.empty()) throw std::invalid_argument("--world 2 needs --transport");
@@ -431,6 +437,9 @@ int main(int argc, char** argv) {
             // the DS/MiniMax 'hp' host path (STRIX_DIST_CRC_PARALLEL / HOST_CRC_OVERLAP / HOST_CHUNK_BYTES) is set by rank_defaults
             (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "600000", 0);
             auto opened = strix::dist::open_pair(transport_spec, opt.rank);
+            turbo_prefill_pair = rd::select_prefill_wmma(request, eff, rd::process_env(),
+                {rd::ordinary_lossy_prefill(request, eff) && rd::measured_prefill_pair(opened.usb4_topology.streams, opened.direct != nullptr) && !deployment.plan,
+                 rd::kPrefillProbePrompt, opt.capacity, opt.max_rows, opt.slots, decode_n});
             auto transport = std::move(opened.host);
             const auto& receipt = opened.receipt;
             if (deployment.provider) deployment.resolve_live(opt, *transport);
@@ -448,7 +457,7 @@ int main(int argc, char** argv) {
             }
         }
         if (pf_swap_moe && (opt.world != 2 || pf_gate.empty())) throw std::invalid_argument("--pf-swap-moe needs --world 2 and --pf-gate");
-        const bool startup_handshake = rd::has_config_agreement(opt.world, xch_kind, decode_n > 0, reference_gate,
+        const bool startup_handshake = comm && rd::has_config_agreement(opt.world, xch_kind, decode_n > 0, reference_gate,
                                                                 !tf_tokens.empty() || !pf_ttft.empty());
         // FAST glm-pf-wmma-x is a per-rank env switch, checked by the startup agreement (kPfWmmaConfig). Modes without
         // that handshake (or the --tf / --pf-ttft config-only agreement) cannot verify that both ranks run the same identity, so FAST is refused there (no new exchange).
@@ -526,7 +535,8 @@ int main(int argc, char** argv) {
             const auto result = rd::startup_agreement(
                 {eligible ? 1U : 0U, packed, opt.max_rows, decode_n,
                  static_cast<std::uint32_t>(opt.capacity), static_cast<std::uint32_t>(opt.capacity >> 32), opt.slots, prompt_hash},
-                rd::max_rows_auto(eff), startup_handshake, [&](auto* rows, unsigned n, auto& ctl) { eng.exchange()->merge(rows, n, ctl, nullptr); });
+                rd::max_rows_auto(eff), startup_handshake,
+                [&](auto* rows, unsigned n, auto& ctl) { eng.exchange()->merge(rows, n, ctl, nullptr); }, &turbo_prefill_pair, opt.rank);
             rd::agree_max_rows(eff, result.rows);
             opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
             mtp_spec_on = result.eligible;
@@ -1096,6 +1106,7 @@ int main(int argc, char** argv) {
         }
         for (const auto& toks : decode_prompts) {
             eng.reset(0);
+            strix::moe::route_tap_sequence(pi);  // FAST gate v2: a "{seq}" route path gives each prompt its own segment
             // The image rows of this prompt's prefill; set before the free-memory reading (the staging is allocated here).
             if (!embed_splice.empty()) eng.set_embed_rows(embed_splice);
             if (!bitcalc_cases.empty() && (setenv("STRIX_BITCALC_FORCE_TOKENS", bitcalc_cases[pi].first.c_str(), 1) != 0 ||
@@ -1112,15 +1123,24 @@ int main(int argc, char** argv) {
                 if (peer != mine) throw std::runtime_error("prefill timer barrier: peer at prompt " + std::to_string(peer));
                 std::printf("rank %u prefill timer barrier: waited %.3f s for the peer\n", opt.rank, secs(tb, Clock::now()));
             }
+            const rd::PrefillWork work{startup_handshake && turbo_prefill_pair && mtp_spec_on &&
+                    rd::measured_prefill_layout(eng.prefill_pipeline()) && embed_splice.empty() && bitcalc_cases.empty(),
+                toks.size(), opt.capacity, opt.max_rows, opt.slots, decode_n, rd::routed_prefill_scratch()};
+            const bool turbo = rd::select_prefill_wmma(request, eff, rd::process_env(), work);
+            if (rd::ordinary_lossy_prefill(request, eff) && !strix::glm::pf::wmma_x::enabled())
+                rd::report_prefill_wmma(opt.rank, request, eff, rd::process_env(), work, turbo);
             const auto t0 = Clock::now();
             auto& control = decode_control;
             sp::Seed seed;
             std::uint32_t next = 0;
-            if (mtp_spec_on) {
-                seed = sp::bootstrap(eng, 0, toks, prefill_mode == "gemv" ? sp::BootstrapPolicy::Chunked :
-                                                                         sp::BootstrapPolicy::Reference, control);
-                next = seed.y0;
-            } else next = eng.prefill(0, toks, 0);
+            {
+                const strix::glm::pf::wmma_x::ProfileScope scope(turbo);
+                if (mtp_spec_on) {
+                    seed = sp::bootstrap(eng, 0, toks, prefill_mode == "gemv" ? sp::BootstrapPolicy::Chunked :
+                                                                             sp::BootstrapPolicy::Reference, control);
+                    next = seed.y0;
+                } else next = eng.prefill(0, toks, 0);
+            }
             const auto t1 = Clock::now();
             if (hipMemGetInfo(&free1, &total) != hipSuccess) throw std::runtime_error("mem info");
             std::printf("rank %u pf dev free delta %+.1f MiB (%zu rows)\n", opt.rank,
@@ -1141,7 +1161,8 @@ int main(int argc, char** argv) {
                 const auto wd = W::dense_calls.exchange(0), wmo = W::moe_calls.exchange(0), wq = W::iu4_moe_calls.exchange(0);
                 std::printf("rank %u prefill identity %s (STRIX_GLM_PF_WMMA=%s, prefill %s, wmma calls dense %llu moe %llu)",
                             opt.rank, eng.model_fast_i4() ? "glm-fast-i4 FAST (routed W4A4 g64)" :
-                            wd + wmo ? (wq ? "glm-pf-wmma-x+iu4 FAST" : "glm-pf-wmma-x FAST") : prefill_mode == "wmma" ? "prefill-wmma route" : "exact",
+                            wd + wmo ? (turbo ? "glm-pf-wmma-x TURBO" : wq ? "glm-pf-wmma-x+iu4 FAST" : "glm-pf-wmma-x FAST") :
+                                prefill_mode == "wmma" ? "prefill-wmma route" : "exact",
                             wm ? wm : "unset", prefill_mode.c_str(), static_cast<unsigned long long>(wd), static_cast<unsigned long long>(wmo));
                 if (wq) std::printf(" iu4 moe %llu", static_cast<unsigned long long>(wq));  // STRIX_GLM_PF_IU4=1 only
                 std::printf("\n");

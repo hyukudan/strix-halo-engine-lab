@@ -134,6 +134,17 @@ if(MSVC)
     target_compile_options(cuda_core_head_argmax_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
 
+# Synthetic per-class CUDA decode cost table (timing only).
+add_executable(strix-cuda-step-tr-bench ${_cc_root}/tests/cuda_core/step_tr_bench.cu)
+target_link_libraries(strix-cuda-step-tr-bench PRIVATE strix_cuda_core_kernels)
+target_include_directories(strix-cuda-step-tr-bench PRIVATE ${_cc_root}/include ${_cc_root}/src)
+target_compile_features(strix-cuda-step-tr-bench PRIVATE cxx_std_20)
+target_compile_options(strix-cuda-step-tr-bench PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(strix-cuda-step-tr-bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+
 # EXACT screened greedy LM head (src/cuda/core/head_screened.cuh): device test (monotone G, mapped-row identity vs the incumbent
 # R=1 kernel, screened Pick == full head) and, with --bench, full vs screened timing (refused unless the tests PASS).
 add_executable(cuda_core_screened_head_test ${_cc_root}/tests/cuda_core/screened_head_cuda.cu)
@@ -142,6 +153,17 @@ target_include_directories(cuda_core_screened_head_test PRIVATE ${_cc_root}/incl
 target_compile_options(cuda_core_screened_head_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 if(MSVC)
     target_compile_options(cuda_core_screened_head_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+
+# Low-rank controller BF16 operand image on CUDA: normalize_pair_image + enqueue_bf16_dense_rows_plane vs the FP32
+# operand route (one plane, three planes) bitwise, pad rows, refusals. Device test, run by the operator.
+add_executable(cuda_core_controller_operand_image_test ${_cc_root}/tests/cuda_core/controller_operand_image_cuda.cu)
+target_link_libraries(cuda_core_controller_operand_image_test PRIVATE strix_cuda_core_kernels)
+target_include_directories(cuda_core_controller_operand_image_test PRIVATE ${_cc_root}/include ${_cc_root}/src)
+target_compile_features(cuda_core_controller_operand_image_test PRIVATE cxx_std_20)
+target_compile_options(cuda_core_controller_operand_image_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(cuda_core_controller_operand_image_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
 
 # Long-context prefill attention bench + pipe identity check (scripts: --check-only is the ctest form).

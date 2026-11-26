@@ -1,3 +1,4 @@
+#include "strix/deepseek41_prefill.hpp"
 #include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/ds41_decode_xport.hpp"
 #include "strix/deepseek41_pair_profile_table.hpp"
@@ -427,6 +428,86 @@ void test_session_off_settings() {
 // Product profile: default changes nothing (same resolution as no --profile, lines only added after "app"),
 // fast/quality never refuse, a pending row is listed and never applied, explicit settings win,
 // --allow-pending runs a runnable pending row stamped unqualified. Generic resolver on a fake table too.
+void test_d1_request_profile() {
+    namespace ds = strix::deepseek41;
+    namespace pr = strix::profile;
+    const World w;
+    static constexpr std::string_view device = "gfx1151|AMD Radeon 8060S Graphics|fixture";
+    ds::PrefillOptions measured;
+    measured.world = 2;
+    measured.max_positions = 8192;
+    measured.moe_chunk_rows = 4096;
+    measured.row_split = false;
+    measured.cone = false;
+    measured.quality_head_rows = 64;
+    auto composition = measured;
+    ds::apply_d1_prefill(composition);
+    check(composition.fast_attention && composition.fast_attention_flash && composition.fast_dense &&
+          composition.fast_moe && composition.fast_moe_f16 && composition.fast_engram && composition.fast_shared &&
+          composition.fast_i4 == 0 && composition.decoder_replay_rows == 0U && composition.decoder_replay_override,
+          "D1 applies the complete gate arm atomically");
+    for (const auto app : {pd::App::prefill, pd::App::serve}) {
+        for (const char* tier : {"exact", "fast", "turbo"}) {
+            const std::vector<std::string> args{MODEL, "--rank", "0", "--transport",
+                app == pd::App::prefill ? "usb4-auto" : "usb4auto", "--profile", tier};
+            const auto startup = w.run(app, args);
+            const auto resolve = [&](std::uint64_t prompt, const ds::PrefillOptions& o, std::string_view product = {}, bool route = true) {
+                return pd::resolve_prefill_profile(*startup.profile, o, prompt, product.empty() ? device : product, route)
+                    .value_or(*startup.profile);
+            };
+            const auto hit = resolve(8128, measured);
+            const bool expect_d1 = std::string_view(tier) != "exact";
+            check(hit.find("d1_prefill")->value == (expect_d1 ? "1" : "0"), "D1 matches the measured execution under FAST and TURBO");
+            check(hit.find("decoder_replay")->value == (expect_d1 ? "256" : "0"), "R256 rides on the measured D1 band");
+            // The pair CLI / serve request (row split, exact cone, head1, automatic MoE chunk) binds the same band rows.
+            ds::PrefillOptions native;
+            native.world = 2;
+            native.max_positions = 32768;
+            for (std::uint64_t prompt : {4096U, 8192U, 8193U, 32768U}) {
+                const auto cli = resolve(prompt, native);
+                check(cli.find("d1_prefill")->value == (expect_d1 ? "1" : "0") &&
+                          cli.find("decoder_replay")->value == (expect_d1 ? "256" : "0"),
+                      "CLI and serve requests in the 8K and 32K bands take D1 + R256 under FAST and TURBO");
+            }
+            for (std::uint64_t prompt : {4095U, 32769U})
+                check(resolve(prompt, native).find("d1_prefill")->value == "0" &&
+                          resolve(prompt, native).find("decoder_replay")->value == "0",
+                      "outside the measured bands the request keeps the previous route");
+            if (expect_d1) {
+                const auto identity = hit.fingerprint();
+                check(pd::paired_d1(identity, identity) && !pd::paired_d1(identity, 0) &&
+                      !pd::paired_d1(0, identity) && !pd::paired_d1(identity, identity ^ 1U),
+                      "both ranks must agree to the same complete D1 route");
+            }
+            if (expect_d1)
+                check(hit.find("d1_prefill")->ladder.find("D1 final 8K PASS") != std::string::npos,
+                      "D1 receipt comes from the shared ladder");
+            for (std::uint64_t prompt : {0U, 4095U, 8193U})
+                check(resolve(prompt, measured).find("d1_prefill")->value == "0",
+                      "D1 declines an unpriced prompt (8,193 exceeds the quality arms' 8,192 positions)");
+            for (const auto change : {+[](ds::PrefillOptions& o) { o.fast_moe = true; },
+                                     +[](ds::PrefillOptions& o) { o.decoder_replay_rows = 256; },
+                                     +[](ds::PrefillOptions& o) { o.chunk_rows = 2048; },
+                                     +[](ds::PrefillOptions& o) { o.attention_lanes = 2; },
+                                     +[](ds::PrefillOptions& o) { o.world = 1; },
+                                     +[](ds::PrefillOptions& o) { o.moe_chunk_rows = 2048; }}) {
+                auto other = measured;
+                change(other);
+                check(resolve(8128, other).find("d1_prefill")->value == "0", "D1 requires measured shape and full composition");
+            }
+            check(resolve(8128, measured, "gfx1151|other product|fixture").find("d1_prefill")->value == "0" &&
+                  resolve(8128, measured, device, false).find("d1_prefill")->value == "0",
+                  "D1 declines an unmatched device or transport");
+            auto off = w;
+            off.env["STRIX_DS41_FAST_PREFILL"] = "0";
+            const auto explicit_off = off.run(app, args);
+            const auto off_d1 = pd::resolve_prefill_profile(*explicit_off.profile, measured, 8128, device, true).value_or(*explicit_off.profile);
+            check(off_d1.find("d1_prefill")->value == "0" && off_d1.find("moe_relaxed")->value == "0",
+                  "bundle OFF cannot leak standalone relaxed MoE");
+        }
+    }
+}
+
 void test_profile() {
     namespace pr = strix::profile;
     for (const auto app : {pd::App::rank, pd::App::batch, pd::App::prefill, pd::App::serve}) {
@@ -465,8 +546,14 @@ void test_profile() {
         turbo_args.insert(turbo_args.end(), {"--profile", "turbo", "--allow-pending"});
         const auto turbo = w.run(app, turbo_args);
         const auto* i4 = turbo.profile->find("moe_iu4");
-        check(i4 && i4->status == pr::Status::pending && i4->value == "0",
-              "IU4 stays off under TURBO (even --allow-pending) without a measured prefill row over FAST");
+        check(i4 && i4->status == pr::Status::builtin && i4->value == "0",
+              "IU4 is not a TURBO row (measured slower than FAST), even with --allow-pending");
+        const auto* replay = turbo.profile->find("decoder_replay");
+        check(replay && replay->value == "0" && replay->status == pr::Status::pending,
+              "TURBO startup leaves R256 to the request's band receipt (test_d1_request_profile)");
+        const auto* fast_replay = f.profile->find("decoder_replay");
+        check(fast_replay && fast_replay->value == "0" && fast_replay->status == pr::Status::pending,
+              "FAST startup leaves R256 to the request's band receipt (test_d1_request_profile)");
         auto i4_world = w;
         i4_world.env["STRIX_DS41_FAST_I4"] = "1";
         for (const auto* profile : {"fast", "turbo"}) {
@@ -476,56 +563,50 @@ void test_profile() {
             check(explicit_i4.profile->find("moe_iu4")->value == "1", "explicit IU4 runs as set");
             check(explicit_i4.profile->find("moe_relaxed")->value == "0", "explicit IU4 replaces the profile's relaxed MoE");
         }
-        auto fast_env = base.set_env;
-        const std::vector<std::pair<std::string, std::string>> fast_set{
-            {"STRIX_DS41_FAST_PREFILL", "1"}, {"STRIX_DS41_FAST_ATTN", "2"}, {"STRIX_DS41_FAST_MOE", "1"},
-            {"STRIX_DS41_FAST_DENSE", "1"}, {"STRIX_DS41_FAST_DENSE_MIN_ROWS", "128"}, {"STRIX_DS41_FAST_ENGRAM", "1"},
-            {"STRIX_DS41_FAST_SHARED", "1"}, {"STRIX_DS41_FAST_MOE_F16", "1"}};
-        fast_env.insert(fast_env.end(), fast_set.begin(), fast_set.end());
-        check(f.args == base.args && std::is_permutation(f.set_env.begin(), f.set_env.end(), fast_env.begin(), fast_env.end()),
-              "fast: bundle ds41-fast-pf-v1 expanded as the switch, plus Engram, shared and MoE FP16 levers");
+        check(f.args == base.args && f.set_env == base.set_env,
+              "unmeasured FAST startup exports the previous prefill route");
         const auto value_of = [](const std::vector<std::pair<std::string, std::string>>& set, const char* key) {
             for (const auto& [k, v] : set) if (k == key) return v;
             return std::string();
         };
+        const char* marker = pr::environment({}, pr::kPresetEnv);
+        const auto previous = marker ? std::optional<std::string>(marker) : std::nullopt;
+        for (const char* name : {"exact", "fast", "turbo"}) {
+            auto args = plain_args;
+            args.insert(args.end(), {"--profile", name});
+            const auto native = w.run(app, args);
+            check(pr::export_environment(pr::kPresetEnv, "1"), "enable model preset marker");
+            const auto preset = w.run(app, args);
+            check(pr::export_environment(pr::kPresetEnv, previous ? previous->c_str() : ""), "restore model preset marker");
+            check(preset.set_env == native.set_env && preset.profile->fingerprint() == native.profile->fingerprint(),
+                  std::string(name) + " preset has native exports and identity");
+            for (const char* row : {"fast_prefill", "engram_f16wmma", "shared_f16", "moe_f16wmma", "moe_relaxed",
+                                    "decoder_replay", "moe_iu4"})
+                check(preset.profile->find(row)->value == "0",
+                      std::string(name) + " preset: startup cannot select " + row);
+            const auto* d1 = preset.profile->find("d1_prefill");
+            check(d1 && d1->value == "0" && (std::string_view(name) == "exact" || d1->status == pr::Status::pending),
+                  std::string(name) + " preset: D1 waits for the actual request");
+        }
         World sw = w;
         sw.env["STRIX_DS41_FAST_PREFILL"] = "1";
         const auto switch_run = sw.run(app, plain_args);
-        for (const char* key : {"STRIX_DS41_FAST_ATTN", "STRIX_DS41_FAST_MOE", "STRIX_DS41_FAST_DENSE", "STRIX_DS41_FAST_DENSE_MIN_ROWS"})
-            check(!value_of(f.set_env, key).empty() && value_of(f.set_env, key) == value_of(switch_run.set_env, key),
-                  "fast: bundle members equal the switch's");
-        check(f.profile->find("moe_relaxed")->value == "1" && f.profile->find("attention_f16wmma")->value == "2",
-              "fast: bundle members in the receipt");
-        std::size_t pending = 0;
-        for (const auto& e : f.profile->entries) pending += e.status == pr::Status::pending;
-        check(pending == 0U, "fast: no pending row once the bundle selects attention bf16flash");
-        // The gated stack is final for prompts <= 8,192 and provisional above: selected ahead of its full receipt.
-        const std::string stamp = f.profile->qualification();
-        check(stamp.rfind("qualification in progress", 0) == 0, "fast: the gated stack is stamped in progress (32K provisional)");
-        for (const char* row : {"fast_prefill", "engram_f16wmma", "shared_f16", "moe_f16wmma"}) {
-            check(f.profile->find(row)->status == pr::Status::provisional && f.profile->find(row)->value == "1",
-                  "fast: gated row selected (provisional)");
-            check(stamp.find(row) != std::string::npos, "fast: provisional row named in the stamp");
-        }
-        check(std::count_if(f.notices.begin(), f.notices.end(), [](const std::string& n) {
-                  return n.find("qualification in progress") != std::string::npos; }) > 0,
-              "fast: provisional notice");
-        check(f.profile->json().find("\"provisional\":[\"") != std::string::npos &&
-                  f.profile->json().find("fast_prefill") != std::string::npos &&
-                  base.profile->json().find("\"provisional\":[]") != std::string::npos,
-              "receipt: provisional list names the gated rows; exact has none");
-        check(pd::describe(app, f).find("profile qualification " + stamp + "\n") != std::string::npos &&
-                  pd::describe(app, f).find("profile lever fast_prefill 1 (") != std::string::npos,
-              "effective config: provisional lines");
+        check(value_of(switch_run.set_env, "STRIX_DS41_FAST_ATTN") == "2" &&
+              value_of(switch_run.set_env, "STRIX_DS41_FAST_MOE") == "1" &&
+              value_of(switch_run.set_env, "STRIX_DS41_FAST_DENSE") == "1" &&
+              value_of(switch_run.set_env, "STRIX_DS41_FAST_DENSE_MIN_ROWS") == "128" &&
+              value_of(switch_run.set_env, "STRIX_DS41_FAST_SHARED").empty(),
+              "explicit legacy bundle keeps its historical three members");
         World sw0 = w;
         sw0.env["STRIX_DS41_FAST_PREFILL"] = "0";
         const auto f0 = sw0.run(app, fast_args);
         check(value_of(f0.set_env, "STRIX_DS41_FAST_ATTN").empty() && value_of(f0.set_env, "STRIX_DS41_FAST_DENSE").empty() &&
-                  value_of(f0.set_env, "STRIX_DS41_FAST_PREFILL") == "0",
+                  value_of(f0.set_env, "STRIX_DS41_FAST_PREFILL") == "0" &&
+                  f0.profile->find("moe_relaxed")->value == "0" && f0.profile->find("d1_prefill")->value == "0",
               "fast: an explicit switch 0 wins over the profile");
         World ap = w;
         ap.env["STRIX_DS41_PROFILE_ALLOW_PENDING"] = "1";
-        check(ap.run(app, fast_args).profile->qualification() == stamp, "--allow-pending: the same set under fast");
+        check(ap.run(app, fast_args).profile->find("d1_prefill")->value == "0", "--allow-pending does not force an unscoped D1 set");
 
         auto q_args = plain_args;
         q_args.insert(q_args.end(), {"--profile", "quality"});
@@ -808,6 +889,7 @@ int main(int argc, char** argv) {
     test_session_defaults();
     test_session_off_settings();
     test_profile();
+    test_d1_request_profile();
     test_common_adapter();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);

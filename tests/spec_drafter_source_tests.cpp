@@ -60,6 +60,22 @@ int main() {
         refused = true;
     }
     check(refused, "file and off together refused");
+    // A sidecar beside the model that its loader rejects: context drafts only, the reason in the receipt.
+    const auto rejected = decline_drafter(found, "schema mismatch");
+    check(!rejected.enabled() && rejected.source == DrafterSource::rejected, "a rejected sidecar: no drafter");
+    check(drafter_receipt("resident", rejected) ==
+              "strix-speculation-drafter/v1 route=resident source=rejected file=- reason=schema mismatch",
+          "receipt: rejected with its reason");
+    bool explicit_kept = false;
+    try {
+        (void)decline_drafter(given, "x");
+    } catch (const std::logic_error&) {
+        explicit_kept = true;
+    }
+    check(explicit_kept, "an explicit file is never declined");
+    check(drafter_receipt("served", {{}, DrafterSource::context, {}}) ==
+              "strix-speculation-drafter/v1 route=served source=context file=-",
+          "receipt: a context-only route");
     fs::remove(beside, error);
     fs::remove(dir, error);
     if (failures != 0) {

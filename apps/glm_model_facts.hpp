@@ -1,7 +1,11 @@
 #pragma once
-// Metadata-only layer-45 inventory. Never opens tensor payloads or constructs a HIP object.
+// Metadata-only layer-45 inventory: discovery never opens tensor payloads or constructs a HIP object. The drafter's
+// content identity (mtp_payload_digest) reads the recorded payload spans on request only.
 #include "../src/glm/engine/glm_json.hpp"
 #include <algorithm>
+#include <bit>
+#include <cstdio>
+#include <cstring>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -9,9 +13,18 @@
 #include <limits>
 #include <set>
 #include <utility>
+#include <vector>
 
 namespace strix::glm::rank_defaults {
-struct ModelFacts { bool mtp_present = false, mtp_complete = false; std::string reason = "missing mtp.safetensors"; };
+struct ModelFacts {
+    bool mtp_present = false, mtp_complete = false;
+    std::string reason = "missing mtp.safetensors";
+    std::vector<std::filesystem::path> mtp_files{};
+    // Complete inventory only: every layer-45 role tensor's payload span (absolute file offset), in role order.
+    struct Span { std::string name; std::filesystem::path file; std::uint64_t offset = 0, bytes = 0; };
+    std::vector<Span> mtp_spans{};
+    std::string mtp_digest{};  // mtp_payload_digest() of the spans, set by the app that verifies MTP decode
+};
 struct MtpTensorRole {
     std::string name, dtype;
     std::vector<std::uint64_t> shape;
@@ -85,8 +98,9 @@ inline ModelFacts probe_model_mtp(const std::filesystem::path& dir) {
         }
         std::sort(unlisted.begin(), unlisted.end());
         files.insert(files.end(), unlisted.begin(), unlisted.end());
-        struct Metadata { engine::detail::Json json; std::uint64_t payload; };
+        struct Metadata { engine::detail::Json json; std::uint64_t payload; std::filesystem::path file; std::uint64_t data; };
         std::map<std::string, Metadata> tensors;
+        std::vector<std::filesystem::path> mtp_files;
         for (const auto& file : files) {
             const auto path = dir / file;
             std::ifstream f(path, std::ios::binary);
@@ -100,13 +114,19 @@ inline ModelFacts probe_model_mtp(const std::filesystem::path& dir) {
             std::string header(static_cast<std::size_t>(length), '\0');
             if (!f.read(header.data(), static_cast<std::streamsize>(length))) throw std::runtime_error("short JSON header: " + file);
             const auto json = engine::detail::parse_json(header.data(), header.data() + header.size());
+            bool has_next_layer = false;
             for (const auto& [name, metadata] : json.obj()) {
                 if (name == "__metadata__") continue;
-                if (name.starts_with("model.language_model.layers.45.")) facts.mtp_present = true;
-                if (!tensors.emplace(name, Metadata{metadata, size - 8 - length}).second)
+                has_next_layer |= name.starts_with("model.language_model.layers.45.");
+                if (!tensors.emplace(name, Metadata{metadata, size - 8 - length, path, 8 + length}).second)
                     throw std::runtime_error("tensor defined twice: " + name);
             }
+            if (has_next_layer) {
+                facts.mtp_present = true;
+                mtp_files.push_back(path);
+            }
         }
+        if (!facts.mtp_present) return facts;
         const std::map<std::string, std::uint64_t> sizes = {
             {"BOOL", 1}, {"U8", 1}, {"I8", 1}, {"F8_E4M3", 1}, {"F8_E5M2", 1},
             {"U16", 2}, {"I16", 2}, {"F16", 2}, {"BF16", 2},
@@ -117,6 +137,7 @@ inline ModelFacts probe_model_mtp(const std::filesystem::path& dir) {
                 throw std::runtime_error("invalid nonnegative integer");
             return static_cast<std::uint64_t>(n);
         };
+        std::vector<ModelFacts::Span> spans;
         for (const auto& role : mtp_tensor_roles()) {
             const auto& name = role.name;
             if (!tensors.count(name)) { facts.reason = "incomplete head: missing " + name; return facts; }
@@ -146,13 +167,52 @@ inline ModelFacts probe_model_mtp(const std::filesystem::path& dir) {
                 const auto begin = integer(offsets[0]), end = integer(offsets[1]);
                 if (end < begin || end - begin != expected) throw std::runtime_error("tensor byte count mismatch");
                 if (end > tensor.payload) throw std::runtime_error("tensor offsets exceed file payload");
+                spans.push_back({name, tensor.file, tensor.data + begin, end - begin});
             } catch (const std::exception& e) {
                 throw std::runtime_error(name + ": " + e.what());
             }
         }
         facts.mtp_complete = true;
         facts.reason = "complete layer-45 inventory";
+        facts.mtp_files = std::move(mtp_files);
+        facts.mtp_spans = std::move(spans);
     } catch (const std::exception& e) { facts.reason = std::string("invalid MTP header: ") + e.what(); }
     return facts;
+}
+
+// Content identity of the drafter: 64-bit FNV-1a over every layer-45 role tensor in role order (name, byte count, then
+// its payload as little-endian 64-bit words, the tail bytes zero-padded). Both ranks of a pair and the receipt name it,
+// so same-named, same-sized shards with different payloads (or another pack's drafter) are told apart. Reads the
+// payload spans (layer 45 only), once per process. Empty when the inventory is not complete.
+inline std::string mtp_payload_digest(const ModelFacts& facts) {
+    if (!facts.mtp_complete || facts.mtp_spans.empty()) return {};
+    constexpr std::uint64_t prime = 1099511628211ULL;
+    std::uint64_t h = 14695981039346656037ULL;
+    const auto mix = [&](std::uint64_t word) { h = (h ^ word) * prime; };
+    std::vector<char> buffer(std::size_t{8} << 20);
+    for (const auto& span : facts.mtp_spans) {
+        for (const char c : span.name) mix(static_cast<unsigned char>(c));
+        mix(span.bytes);
+        std::ifstream f(span.file, std::ios::binary);
+        if (!f.seekg(static_cast<std::streamoff>(span.offset))) throw std::runtime_error("mtp digest: seek " + span.name);
+        for (std::uint64_t left = span.bytes; left > 0;) {
+            const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(left, buffer.size()));
+            if (!f.read(buffer.data(), static_cast<std::streamsize>(n))) throw std::runtime_error("mtp digest: short read " + span.name);
+            for (std::size_t i = 0; i < n; i += 8) {
+                std::uint64_t word = 0;
+                if (std::endian::native == std::endian::little && i + 8 <= n) {
+                    std::memcpy(&word, buffer.data() + i, 8);
+                } else {
+                    for (std::size_t b = 0; b < 8 && i + b < n; ++b)
+                        word |= std::uint64_t{static_cast<unsigned char>(buffer[i + b])} << (8 * b);
+                }
+                mix(word);
+            }
+            left -= n;
+        }
+    }
+    char out[17];
+    std::snprintf(out, sizeof out, "%016llx", static_cast<unsigned long long>(h));
+    return out;
 }
 }  // namespace strix::glm::rank_defaults

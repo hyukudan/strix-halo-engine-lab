@@ -40,13 +40,12 @@ la [caché de prefijos](../../engine/serving/prefix-state-cache.md#deepseek-pair
 los [contextos largos](long-context.md) y
 la [colocación de expertos calientes](hot-placement.md).
 
-Todas las aplicaciones del par (`rank`, `batch`, `prefill`, `serve`) aceptan `--profile default|fast|quality`;
-use el mismo perfil en los dos ranks. `default` es la configuración de producción exacta descrita arriba y no
-cambia nada. `fast` añade el epílogo MoE relajado (`STRIX_DS41_FAST_MOE=1`, cambia bits; su cualificación está en curso) e
-indica la atención dispersa FP16, aún pendiente, en el recibo y en una línea de stderr. `quality` no tiene paquete para este modelo y ejecuta `default` con
-un aviso. Una variable de entorno u opción explícita siempre tiene prioridad; `--allow-pending` ejecuta las opciones
-pendientes cuyo código está en el build, solo para benchmarks, marcadas como `unqualified`.
-`--print-effective-config` muestra el perfil y todas las opciones.
+Todas las aplicaciones del par (`rank`, `batch`, `prefill`, `serve`) aceptan
+`--profile exact|fast|turbo`. Use el mismo perfil en los dos ranks. FAST y TURBO
+conservan la aritmética anterior de prefill fuera del recibo D1. Las variables de
+entorno explícitas permiten realizar pruebas. `--print-effective-config` muestra la
+resolución al arrancar.
+Consulte [los perfiles del par y el alcance del recibo](production-defaults.md#product-profiles).
 
 **RTX + par:** use el [contrato de lanzamiento de etapas del pipeline](pipeline-stages.md).
 La RTX ejecuta las capas 0–21; el par ejecuta las capas 22–39 y la cabeza. Conserve la identidad compuesta declarada

@@ -2,7 +2,9 @@
 
 #include "exec/cuda_decode_epilogue.hpp"
 #include "exec/cuda_decode_lowering.hpp"
+#include "exec/cuda_decode_transition.hpp"
 #include "inkling2_mini_attention_prepare_device.hpp"
+#include "inkling2_mini_controller_device.hpp"
 #include "inkling2_mini_expert_layout.hpp"
 #include "inkling2_mini_moe_dispatch.hpp"
 #include "inkling2_mini_resident_forward.hpp"
@@ -18,6 +20,7 @@
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 #include "inkling2_mini_resident_decoder.hpp"
 #include "inkling2_mini_weight_options.hpp"
+#include "strix/env_flags.hpp"
 #include <iostream>
 #else
 #include "exec/scheduled_stage_graph.hpp"
@@ -53,6 +56,7 @@ struct MiniCudaStepStorage {
     float* route_weights;
     std::uint16_t* expert_activation;
     std::span<unsigned> flags;
+    std::span<float> messages{};
 };
 
 struct MiniCudaStepRows {
@@ -74,6 +78,8 @@ struct MiniCudaStepMode {
     bool epilogue_fusion = true;
     const device::Profile* projection_profile = nullptr;
     decltype(&exec::cuda_decode::bind_projection_batch) bind_projections = nullptr;
+    bool moe_tail = false;
+    bool moe_route_inline = false;
 };
 
 // Bind the resident traversal's exact native leaves. The same traversal
@@ -82,19 +88,21 @@ template <class Weights, class Bind, class Dispatch, class Finish>
 class MiniCudaStepLowering {
     using Shape = MiniPreparedGqaShape;
     using Mode = exec::cuda_decode::Bf16DenseMode;
+    using MoeTail = moe_core::r1_tail::ConvResidualTail<exec::cuda_decode::kPackedConvTailTaps>;
     static constexpr float epsilon = 1.0e-6F;
 
 public:
     MiniCudaStepLowering(const Weights& weights, MiniCudaStepStorage storage, const exec::StepBlock* descriptor,
                         const Bind& bind, const Dispatch& dispatch, const Finish& finish, MiniCudaStepMode mode = {})
         : weights_(weights), storage_(storage), descriptor_(descriptor), bind_(bind), dispatch_(dispatch),
-          finish_(finish), mode_(mode), recipe_(mode.key.program.tap) {}
+          finish_(finish), mode_(mode), recipe_(mode.key.program.tap), transition_(transition_forms(mode)) {}
 
     bool try_step_graph(MiniResidentChunk chunk, auto& work) {
         if (mode_.key.program.tap) return false;
         return dispatch_(chunk, [&] {
             begin();
             work();
+            flush();
             return std::move(recipe_);
         });
     }
@@ -110,6 +118,7 @@ public:
 
     void submit_eager(MiniResidentChunk chunk) {
         if (!mode_.key.program.tap) return;
+        flush();
         recording_ = false;
         (void)dispatch_(chunk, [&] { return std::move(recipe_); });
     }
@@ -124,6 +133,7 @@ public:
 
     void head(MiniConstRows hidden, MiniCudaStepRows rows) {
         using namespace exec::cuda_decode;
+        flush();
         recipe_.visit(-1);
         recipe_.stage("head");
         if (rows.screen) {
@@ -157,6 +167,7 @@ public:
     template <class T>
     void copy(std::span<const T> input, std::span<T> output) {
         if (input.data() == output.data()) return;
+        flush();
         if (!recording_ && mode_.key.program.tap) {
             mode_.copy_eager(output.data(), input.data(), input.size_bytes(), mode_.stream);
             return;
@@ -175,14 +186,26 @@ public:
         const auto layer = visit.physical_layer;
         const auto* scale = weights_.bf16(parameter(layer, mini_input_norm_suffix(visit, path))).data();
         if (visit.pass == 0U) {
+            // The input norm of a raw readout row joins the held residual transition (same bits, one launch).
             rms(raw.data(), scale, output.data());
             return;
         }
+        flush();
         const bool key_value = path == MessagePath::key || path == MessagePath::value;
         const auto queries = weights_.f32(key_value ? "middle_cycle_cross_pass_kv_queries"
                                                     : "middle_cycle_cross_pass_queries");
         const auto query = 2U * (layer - kCoreFirst) + (path == MessagePath::value || path == MessagePath::moe ? 1U : 0U);
         const auto stem = parameter(layer, std::string("controllers.") + std::string(mini_controller_path(path)) + ".");
+        if (message_batch_) {
+            // The pass's bank batch already holds this controller's message row (same bits as its own readout).
+            const auto* message = storage_.messages.data() + (key_value ? kMiniMessageQueryRows : 0U) * std::size_t{kHiddenWidth} +
+                                  std::size_t{query} * kHiddenWidth;
+            exec::cuda_decode::lower_low_rank_controller_tail(kHiddenWidth, kControllerRank, epsilon, raw, message,
+                output, storage_.controller, weights_.bf16(stem + "down_weight").data(),
+                weights_.bf16(stem + "forget_weight").data(), weights_.bf16(stem + "gain_weight").data(), scale, add(),
+                mode_.key.forms);
+            return;
+        }
         exec::cuda_decode::lower_low_rank_controller(kHiddenWidth, kControllerRank, epsilon,
             queries.subspan(std::size_t{query} * kHiddenWidth, kHiddenWidth), raw, previous, output, storage_.controller,
             weights_.bf16(stem + "down_weight").data(), weights_.bf16(stem + "forget_weight").data(),
@@ -202,25 +225,31 @@ public:
         for (std::size_t i = 0; i < blocks.size(); ++i) args.banks[i] = blocks[i].data();
         args.banks[args.bank_count++] = current.data();
         for (std::size_t i = 0; i < output.size(); ++i) args.output[i] = output[i].data();
-        exec::cuda_decode::lower_bank_readout(args, mode_.key.forms, add());
+        // Held: a pending residual add of its current row and the input norms of its rows join it (R1Forms.transition).
+        transition_.readout(args, held());
     }
 
     void capture_message_bank(const std::array<MiniConstRows, 2>& source,
                               const std::array<MiniMutableRows, 2>& normalized) {
+        flush();
         recipe_.stage("message_bank");
         for (std::size_t i = 0; i < source.size(); ++i)
             add_leaf(core::residual_mix::NormalizeArgs{source[i].data(), normalized[i].data(),
                                                       1U, kHiddenWidth, epsilon});
+        message_batch_ = !mode_.key.program.tap && mode_.key.forms.bank_batch && bind_message_batch(normalized);
     }
 
     void add(MiniConstRows lhs, MiniConstRows rhs, MiniMutableRows output, bool round_bf16) {
         recipe_.stage("residual_add");
-        add_leaf(core::residual_mix::AddArgs{lhs.data(), rhs.data(), output.data(), output.size(), round_bf16});
+        // Held: the next bank readout of this row takes it as its prologue (R1Forms.transition).
+        transition_.add(core::residual_mix::AddArgs{lhs.data(), rhs.data(), output.data(), output.size(), round_bf16},
+                        held());
     }
 
     void attention(LayerVisit visit, MiniResidentChunk chunk, MiniConstRows query, MiniConstRows key,
                    MiniConstRows value, const MiniResidentVisitState& state, MiniMutableRows output) {
         using namespace exec::cuda_decode;
+        flush();
         recipe_.stage("attention");
         auto arena = storage_.attention;
         const auto take = [&](unsigned width) {
@@ -286,6 +315,7 @@ public:
 
     void convolve(LayerVisit visit, MiniConvolutionStream path, MiniConstRows input, MiniMutableRows history,
                   MiniMutableRows output) {
+        flush();
         recipe_.stage("post_convolution");
         const auto* weights = mini_post_convolution_weights(storage_.lag_weights, visit, path == MiniConvolutionStream::moe);
         require(attn_core::enqueue_prepared_gqa_post_convolution<Shape>(
@@ -293,7 +323,28 @@ public:
     }
 
     void moe(LayerVisit visit, MiniConstRows input, MiniMutableRows output) {
+        lower_moe(visit, input, output, nullptr);
+    }
+
+    [[nodiscard]] bool moe_tail_enabled() const noexcept {
+        return mode_.moe_tail && !mode_.key.grouped && !mode_.key.forms.moe_pipe && !mode_.key.program.tap;
+    }
+
+    void moe_tail(LayerVisit visit, MiniConstRows input, MiniMutableRows output, MiniMutableRows history,
+                  MiniConstRows residual, MiniMutableRows convolution, MiniMutableRows sum) {
+        static_assert(Shape::kConvTaps == exec::cuda_decode::kPackedConvTailTaps);
+        const MoeTail tail{
+            attn_core::prepared_gqa_post_convolution_plan<Shape>(),
+            mini_post_convolution_weights(storage_.lag_weights, visit, true), history.data(), convolution.data(),
+            residual.data(), sum.data(), attn_core::kPreparedGqaPostConvolutionRound, true,
+        };
+        lower_moe(visit, input, output, &tail);
+    }
+
+private:
+    void lower_moe(LayerVisit visit, MiniConstRows input, MiniMutableRows output, const MoeTail* tail) {
         using namespace exec::cuda_decode;
+        flush();
         recipe_.stage("moe");
         const auto layer = visit.physical_layer;
         const std::array router{core::Bf16RowProjection{weights_.bf16(parameter(layer, "mlp.gate.weight")).data(),
@@ -301,9 +352,9 @@ public:
         lower_dense(input.data(), kHiddenWidth, router, true, add());
         auto* failure = storage_.flags.data() + kLogicalVisits + visit.logical_layer;
         const auto* matrices = storage_.matrices.data() + std::size_t{layer} * kExperts;
+        const auto* bias = weights_.f32(parameter(layer, "mlp.gate.bias")).data();
         const auto select = [&](unsigned* status) {
-            add_leaf(CheckedWaveRoute{storage_.route_logits, weights_.f32(parameter(layer, "mlp.gate.bias")).data(),
-                                      storage_.route_ids, storage_.route_weights, status});
+            add_leaf(CheckedWaveRoute{storage_.route_logits, bias, storage_.route_ids, storage_.route_weights, status});
             if (mode_.key.program.tap)
                 recipe_.host_action(bind_(RouteTapExchange{mode_.tap, layer, 1U, kExpertsPerToken, kExperts,
                                                            storage_.route_ids, storage_.route_weights}));
@@ -322,7 +373,6 @@ public:
                                  add(), [this](auto clear) { recipe_.clear(clear); });
             return;
         }
-        select(failure);
         static_assert(kExpertsPerToken == kPackedExpertsPerToken);
         const moe_core::microscaled_r1::Args args{
             matrices, storage_.route_ids, storage_.route_weights,
@@ -330,17 +380,29 @@ public:
             kMlpGateSoftcap, kMlpUpSoftcap,
         };
         if (mode_.key.forms.moe_pipe) {
+            select(failure);
             add_leaf(PackedGateUpPipe{args, format});
             add_leaf(PackedDownCombinePipe{args, format});
             return;
         }
-        add_leaf(PackedGateUp{args, format});
-        add_leaf(PackedDownCombine{args, format});
+        if (mode_.moe_route_inline && !mode_.key.program.tap) {
+            add_leaf(RoutedPackedGateUp{args, format, storage_.route_logits, bias,
+                                        storage_.route_ids, storage_.route_weights, failure}, true);
+        } else {
+            select(failure);
+            add_leaf(PackedGateUp{args, format});
+        }
+        if (tail) {
+            require(moe_core::microscaled_r1::admits_tail(args, *tail, 1U, kPackedExpertsPerToken));
+            add_leaf(PackedDownCombineTail{args, format, *tail}, true);
+        } else {
+            add_leaf(PackedDownCombine{args, format});
+        }
     }
 
-private:
     void begin() {
         recording_ = true;
+        message_batch_ = false;
         recipe_.stage("flags");
         recipe_.clear({storage_.flags.data(), storage_.flags.size_bytes(), 0});
     }
@@ -354,10 +416,61 @@ private:
     }
 
     void rms(const float* input, const std::uint16_t* scale, float* output) {
-        add_leaf(exec::cuda_decode::RmsBf16{input, scale, output, 1U, kHiddenWidth, epsilon}, true);
+        transition_.norm(exec::cuda_decode::RmsBf16{input, scale, output, 1U, kHiddenWidth, epsilon}, held());
     }
 
-    void add_leaf(const auto& args, bool pdl = false) { recipe_.kernel(bind_(args), pdl); }
+    void add_leaf(const auto& args, bool pdl = false) {
+        flush();
+        recipe_.kernel(bind_(args), pdl);
+    }
+
+    // Emission of the leaves the transition chain held: a held add / readout / transition carries its own stage
+    // label; the labels of the caller that triggered the emission are restored after it.
+    auto held() {
+        return [this](const auto& args, bool pdl) {
+            using Args = std::remove_cvref_t<decltype(args)>;
+            const std::string stage(recipe_.stage_label());
+            if constexpr (std::is_same_v<Args, core::residual_mix::AddArgs>) recipe_.stage("residual_add");
+            else if constexpr (std::is_same_v<Args, core::residual_mix::TransitionArgs>) recipe_.stage("residual_transition");
+            else if constexpr (!std::is_same_v<Args, exec::cuda_decode::RmsBf16>) recipe_.stage("residual_read");
+            recipe_.kernel(bind_(args), pdl);
+            recipe_.stage(stage);
+        };
+    }
+
+    // Emits what the transition chain holds, in program order; called before any other leaf.
+    void flush() { transition_.flush(held()); }
+
+    static exec::cuda_decode::R1Forms transition_forms(const MiniCudaStepMode& mode) {
+        auto forms = mode.key.forms;
+        // The route-tapped (gate) recipe keeps every incumbent leaf, like the epilogue fusion.
+        if (mode.key.program.tap) forms.transition = false;
+        return forms;
+    }
+
+    // Every controller of the next pass reads the bank just captured: one residual bank batch issues all of their
+    // message readouts (each job = that controller's single-query readout, same bits). False keeps the
+    // per-controller readout when the scratch or the query tensors do not have the declared shape.
+    bool bind_message_batch(const std::array<MiniMutableRows, 2>& bank) {
+        const auto queries = weights_.f32("middle_cycle_cross_pass_queries");
+        const auto kv_queries = weights_.f32("middle_cycle_cross_pass_kv_queries");
+        const auto rows = std::size_t{kMiniMessageQueryRows} * kHiddenWidth;
+        if (storage_.messages.size() < kMiniMessageBatchElements || queries.size() != rows || kv_queries.size() != rows)
+            return false;
+        core::residual_mix::BankBatchArgs batch{};
+        batch.banks[0] = bank[0].data();
+        batch.banks[1] = bank[1].data();
+        batch.bank_count = 2U;
+        batch.width = kHiddenWidth;
+        batch.epsilon = epsilon;
+        batch.normalized = true;
+        batch.sets[0] = {queries.data(), storage_.messages.data(), kMiniMessageQueryRows};
+        batch.sets[1] = {kv_queries.data(), storage_.messages.data() + rows, kMiniMessageQueryRows};
+        batch.set_count = 2U;
+        if (!core::residual_mix::fits(batch)) return false;
+        add_leaf(batch, true);
+        return true;
+    }
     auto add() { return [this](const auto& args, bool pdl) { add_leaf(args, pdl); }; }
 
     [[nodiscard]] bool epilogue_fusion() const noexcept {
@@ -514,7 +627,9 @@ private:
     const Finish& finish_;
     MiniCudaStepMode mode_;
     exec::CudaProgramRecipe recipe_;
+    exec::cuda_decode::TransitionChain transition_;
     bool recording_ = false;
+    bool message_batch_ = false;
 };
 
 class MiniResidentDecoder;
@@ -539,14 +654,18 @@ private:
 };
 
 // Exact R1 latency forms (bitwise against the incumbents), opt-in until the RTX A/B selects them:
-// mask bit 1 = tiled bank readouts, 2 = controller output split, 4 = packed MoE pipe.
+// mask bit 1 = tiled bank readouts, 2 = controller output split, 4 = packed MoE pipe, 8 = per-pass controller
+// message readouts in one residual bank batch, 16 = residual transition (add + bank readout + input norms in one
+// row-owner launch). The controller batch and residual transition are explicit CUDA step-program options.
 inline constexpr unsigned kMiniFormsMix = 3U, kMiniFormsMoe = 4U, kMiniFormsAll = 7U;
+inline constexpr unsigned kMiniFormsBatch = kMiniFormsMix | 8U, kMiniFormsB3 = kMiniFormsBatch | 16U;
 [[nodiscard]] constexpr exec::cuda_decode::R1Forms mini_latency_forms(unsigned mask) noexcept {
-    return {(mask & 1U) != 0U, (mask & 2U) != 0U, (mask & 4U) != 0U};
+    return {.bank_tiled = (mask & 1U) != 0U, .output_split = (mask & 2U) != 0U, .moe_pipe = (mask & 4U) != 0U,
+            .transition = (mask & 16U) != 0U, .bank_batch = (mask & 8U) != 0U};
 }
 inline constexpr exec::cuda_decode::R1Forms kMiniLatencyForms = mini_latency_forms(kMiniFormsAll);
 // RTX r1 (11-22, ink_rtx_dec kit out/r1, bitwise ids / logits / 31 decode rows): greedy 256 tok/s base 102.8,
-// mix 109.9, mix + MoE pipe 108.4 -> the default binds mix; the pipe stays opt-in (--latency-forms).
+// tiled + split 109.9, + MoE pipe 108.4 -> the default binds mix; the pipe stays opt-in (--latency-forms).
 inline constexpr unsigned kMiniDefaultForms = kMiniFormsMix;
 
 // moe_w4a4: resolved operand class of the W4A4 expert lever (mini_moe_w4a4_class; bf16 = off), applied to the resident
@@ -566,7 +685,8 @@ struct MiniCudaProgramDecoder::Impl {
            epilogue_fusion(fuse), forms(selected),
           grouped_words(grouped ? GroupedScratch::word_count(kExperts, kExpertsPerToken) : 0U),
           grouped_values(grouped ? GroupedScratch::value_count(kHiddenWidth, kExpertWidth, kExpertsPerToken) : 0U),
-          grouped_descriptors(grouped ? 2U * kExpertsPerToken : 0U) {}
+          grouped_descriptors(grouped ? 2U * kExpertsPerToken : 0U),
+          messages(forms.bank_batch ? kMiniMessageBatchElements : 0U) {}
 
     unsigned decode(unsigned token, std::span<float> host_logits) {
         if (token >= kVocabulary || (!host_logits.empty() && host_logits.size() != kOutputVocabulary))
@@ -593,14 +713,16 @@ struct MiniCudaProgramDecoder::Impl {
             greedy.step_program_reply(), launch ? &*launch : nullptr};
         const auto raw = backend.step_program_buffers();
         const MiniCudaStepStorage storage{raw.max_rows, raw.controller, raw.attention, raw.lag_weights,
-            raw.matrices, raw.route_ids, raw.route_logits, raw.route_weights, raw.expert_activation, raw.flags};
+            raw.matrices, raw.route_ids, raw.route_logits, raw.route_weights, raw.expert_activation, raw.flags, messages.span()};
         const bool tapped = gate_tap ? gate_tap->active() : cuda::core::route_tap_active();
+        const bool packed_r1 = !grouped && !forms.moe_pipe && !tapped;
         const MiniCudaStepMode mode{{grouped, {.tap = tapped, .graph_id = static_cast<std::uint8_t>(screened ? 1U : 0U)},
                                      forms},
             {grouped_words.span(), grouped_values.span(), grouped_descriptors.span()}, gate_tap, backend.stream(),
             +[](void* to, const void* from, std::size_t bytes, void* stream) {
                 mini_gpu::copy(to, from, bytes, mini_gpu::device_to_device, static_cast<cudaStream_t>(stream));
-            }, epilogue_fusion, backend.step_projection_profile(), exec::cuda_decode::bind_projection_batch};
+            }, epilogue_fusion, backend.step_projection_profile(), exec::cuda_decode::bind_projection_batch,
+            packed_r1 && moe_tail, packed_r1 && moe_route_inline};
         const auto key = mode.key.program;
         const auto bind = [](const auto& args) {
             using namespace exec::cuda_decode;
@@ -608,6 +730,9 @@ struct MiniCudaProgramDecoder::Impl {
             if constexpr (std::is_same_v<Args, CheckedWaveRoute>)
                 return bind_checked_wave<MiniRoutePolicy, detail::MiniMoeMath, moe::RouteWaveTraits<true>>(
                     args, "cuda-sm120-checked-wave-mini-route-r1-v1");
+            else if constexpr (std::is_same_v<Args, RoutedPackedGateUp>)
+                return bind_routed_gate_up<MiniRoutePolicy, detail::MiniMoeMath, moe::RouteWaveTraits<true>>(
+                    args, "mini-route");
             else if constexpr (std::is_same_v<Args, GroupedPlanLeaf>)
                 return bind_grouped_plan<kExperts, kExpertsPerToken>(args);
             else if constexpr (std::is_same_v<Args, RouteTapExchange>)
@@ -640,7 +765,11 @@ struct MiniCudaProgramDecoder::Impl {
                           << " epilogue_fusion=" << (epilogue_fusion ? "on" : "off")
                           << " latency_forms=" << (forms == exec::cuda_decode::R1Forms{} ? "off" : "")
                           << (forms.bank_tiled ? "B" : "") << (forms.output_split ? "S" : "")
-                          << (forms.moe_pipe ? "P" : "") << (screened ? " head=screened" : "") << '\n';
+                          << (forms.moe_pipe ? "P" : "") << (forms.bank_batch ? "B3-batch" : "")
+                          << (forms.transition ? "B3-transition" : "") << (screened ? " head=screened" : "")
+                          << (moe_tail ? (mode.moe_tail ? " moe_tail=on" : " moe_tail=declined") : "")
+                          << (moe_route_inline ? (mode.moe_route_inline ? " moe_route=inline" : " moe_route=declined") : "")
+                          << '\n';
             }
             if (tapped && !reported_tap) {
                 std::cerr << "inkling2 step graph route=program captures=0 nodes=" << plan.program.launches.size()
@@ -692,9 +821,12 @@ struct MiniCudaProgramDecoder::Impl {
     const bool grouped;
     const bool epilogue_fusion;
     const exec::cuda_decode::R1Forms forms;
+    const bool moe_tail = strix::envcfg::flag("STRIX_MOE_TAIL", false);
+    const bool moe_route_inline = strix::envcfg::flag("STRIX_MOE_ROUTE_INLINE", false);
     mini_gpu::Buffer<unsigned> grouped_words;
     mini_gpu::Buffer<float> grouped_values;
     mini_gpu::Buffer<moe_core::device_grouped::TileRows> grouped_descriptors;
+    mini_gpu::Buffer<float> messages;
     moe::RouteTap* gate_tap{};
     bool reported_tap = false;
     std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits;

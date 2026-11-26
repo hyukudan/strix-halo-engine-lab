@@ -60,9 +60,10 @@ void must_fail(const std::string& what, const Check& check) {
     require(caught, "negative fixture not caught: " + what);
 }
 
-p::Resolution run(const p::Engine& engine, p::Name profile) {
+p::Resolution run(const p::Engine& engine, p::Name profile, p::Regime regime = {}) {
     p::Inputs in;
     in.profile = profile;
+    in.regime = regime;
     in.env = [](const char*) -> const char* { return nullptr; };
     return p::resolve(engine, in);
 }
@@ -83,10 +84,10 @@ bool fast_cell_live(const p::Lever& l) {
 // extra_fast: the engine's fast profile also selects a FAST bundle outside these rows (checked by the caller).
 // `ladder`: the engine's ladder rows (incumbent grants keep the cells that ran before the ladder rule).
 void check_table(std::string_view tag, std::span<const p::Lever> rows, bool extra_fast = false,
-                 std::span<const p::LadderRow> ladder = {}) {
+                 std::span<const p::LadderRow> ladder = {}, p::Regime regime = {}) {
     const p::Engine engine{tag, "", rows, false, {}, {}, {}, ladder};
     const auto exact = run(engine, p::Name::standard);
-    const auto fast = run(engine, p::Name::fast);
+    const auto fast = run(engine, p::Name::fast, regime);
     bool any = extra_fast;
     for (const auto& l : rows) {
         const std::string where = std::string(tag) + "/" + std::string(l.name);
@@ -350,11 +351,13 @@ int main() {
     tier_words();
     negative_fixtures();
     check_table("deepseek41-pair", strix::deepseek41::pair_defaults::profile_table, false,
-                strix::deepseek41::pair_defaults::ladder_rows);
+                strix::deepseek41::pair_defaults::ladder_rows,
+                {p::Phase::prefill, 8128, 1, "gfx1151", p::kBandProbeExecution});
     check_bundle("deepseek41-pair", strix::deepseek41::pair_defaults::profile_table, strix::ds41::fast_profile::kBundle,
                  strix::deepseek41::pair_defaults::ladder_rows);
     check_table("glm-pair", strix::glm::rank_defaults::product_profile_table, false,
-                strix::glm::rank_defaults::product_ladder_rows);
+                strix::glm::rank_defaults::product_ladder_rows,
+                {p::Phase::prefill, 8192, 1, strix::glm::rank_defaults::kTurboPrefillDevice, p::kBandProbeExecution});
     check_table("deepseek41-rtx", strix::ds41::rtx::profile::shared_rows());
     minimax_bundle();
     check_table("minimax-pair", strix::minimax::defaults::profile_table, false, strix::minimax::defaults::ladder_rows);
@@ -362,7 +365,7 @@ int main() {
                  strix::minimax::defaults::ladder_rows);
     check_table("qwen-hip", strix::qwen::profile::table, false, strix::qwen::profile::ladder_rows);
     check_table("qwen-cuda", strix::qwen::cuda_profile::table, false, strix::qwen::cuda_profile::ladder_rows);
-    check_table("qwen35-hip-dense", strix::qwen35::hip_profile::table, false, strix::qwen35::hip_profile::kLadderRows);
+    check_table("qwen35-hip-dense", strix::qwen35::hip_profile::table);
     qwen_dense_regimes();
     regime_gate_rows();
     qwen_hip_regimes();
@@ -372,12 +375,12 @@ int main() {
         const auto ds41_rows = bundle_rows(dp::profile_table, strix::ds41::fast_profile::kBundle);
         const auto mm_rows = bundle_rows(md::profile_table, md::kFastBundle);
         check_gates("deepseek41-pair", dp::profile_table, dp::fast_gates, ds41_rows);
-        check_gates("glm-pair", strix::glm::rank_defaults::product_profile_table, {});
+        check_gates("glm-pair", strix::glm::rank_defaults::product_profile_table, strix::glm::rank_defaults::fast_gates);
         check_gates("deepseek41-rtx", strix::ds41::rtx::profile::shared_rows(), {});
         check_gates("minimax-pair", md::profile_table, {}, mm_rows);
         check_gates("qwen-hip", strix::qwen::profile::table, {});
         check_gates("qwen-cuda", strix::qwen::cuda_profile::table, {});
-        check_gates("qwen35-hip-dense", strix::qwen35::hip_profile::table, strix::qwen35::hip_profile::kFastGates);
+        check_gates("qwen35-hip-dense", strix::qwen35::hip_profile::table, {});
     }
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);

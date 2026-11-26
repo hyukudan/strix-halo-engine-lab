@@ -20,6 +20,7 @@ struct OpenedTransport {
     std::unique_ptr<Transport> host;
     std::unique_ptr<DeviceExchange> direct;
     std::string receipt;
+    Usb4Topology usb4_topology;  // negotiated host streams, empty for TCP or an explicit device list
 };
 inline OpenedTransport open_transport(const std::string& spec, const OpenTransportOptions& options) {
     const auto parsed = parse_transport(spec, options.spellings);
@@ -31,15 +32,14 @@ inline OpenedTransport open_transport(const std::string& spec, const OpenTranspo
     case TransportKind::usb4_auto:
     case TransportKind::usb4_gpu: break;
     }
-    Usb4Topology topology;
-    result.host = usb4_host_auto(options.usb, &topology);
-    result.receipt = topology.receipt();
+    result.host = usb4_host_auto(options.usb, &result.usb4_topology);
+    result.receipt = result.usb4_topology.receipt();
     if (parsed.kind == TransportKind::usb4_gpu) {
         std::string why, direct_receipt;
         if (usb4_gpu_direct_streams(options.usb, *result.host, &why) == 0U)
             result.receipt += "; gpu-direct unavailable (" + why + "): host path only";
         else {
-            result.direct = usb4_gpu_direct(options.usb, topology, *result.host, {}, &direct_receipt);
+            result.direct = usb4_gpu_direct(options.usb, result.usb4_topology, *result.host, {}, &direct_receipt);
             result.receipt += "; usb4 " + direct_receipt;
         }
     }

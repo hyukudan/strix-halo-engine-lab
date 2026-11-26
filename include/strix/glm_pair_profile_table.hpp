@@ -9,15 +9,14 @@ namespace strix::glm::rank_defaults {
 inline constexpr char kSampledMtpCoupledIdentity[] = "glm-sampled-mtp-coupled-v1";
 inline constexpr char kSampledMtpRejectionIdentity[] = "glm-sampled-mtp-rejection-v1";
 
-// Default/quality export nothing. FAST selects no lever: the FAST prefill set (pf_wmma) fails the 8K quality gate, so it
-// is UNQUALIFIED for fast and runs only with an explicit STRIX_GLM_PF_WMMA=1. TURBO keeps pf_wmma (incumbent grant
-// below). The other bit-changing prefill switches are rows so that an explicit setting is named in the receipt; their
-// TURBO cells are candidates that stay at the builtin until a timing row shows them faster in the regime.
+// The complete WMMA bundle (X3, MLA, KDA, sparse attention) passed FAST gate v2 at 8K with MoE route replay. FAST and
+// TURBO run it only where a ladder row below covers the regime; elsewhere the exact prefill cores run.
+// Individual arithmetic switches remain explicit; their standalone proposals need their own receipts.
 inline constexpr std::array<strix::profile::Lever, 11> product_profile_table{{
-    {"pf_wmma", "STRIX_GLM_PF_WMMA", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true, true}, {true, true, true, true}, "glm-pf-wmma-x", "0",
-     "docs/optimizations.md#glm-pf-wmma-x: UNQUALIFIED for fast: the FAST prefill set fails the 8K quality gate (KL 0.0587 and "
-     "0.492 on two windows, no single member carries it); explicit STRIX_GLM_PF_WMMA=1 only until fixed; OFF equals exact anchors", false, {}, false, {}, {{{"0", "v1"}, {"1", "v1"}}}},
+    {"pf_wmma", "STRIX_GLM_PF_WMMA", "", {"", "1", "", "1"}, "0", strix::profile::Kind::bit_changing,
+     {true, true, true, true}, {true, true, true, true}, "glm-pf-wmma-x", "0",
+     "docs/optimizations.md#glm-pf-wmma-x: FAST gate v2 PASS at 8K with route replay (5 windows, 1,275 rows, KL 0.00018); "
+     "FAST and TURBO only in the measured pair regimes (ladder rows); OFF equals exact anchors", false, {}, false, {}, {{{"0", "v1"}, {"1", "v1"}}}},
     {"stored_i4", "STRIX_GLM_MODEL_FORMAT", "", {"", "", "", "fast_i4"}, "exl3", strix::profile::Kind::pack,
      {true, false, true, false}, {true, false, true, true}, "", "exl3",
      "glm-fast-i4: stored routed gate/up on MoE ordinals 25-41, W4A4 prefill and W4A16 decode; load-scoped, ladder evidence pending",
@@ -50,10 +49,53 @@ inline constexpr std::array<strix::profile::Lever, 11> product_profile_table{{
      false, {}, true, {}, {{{"0", "glm-plain-sampling-v1"},
                            {"coupled", kSampledMtpCoupledIdentity}, {"rejection", kSampledMtpRejectionIdentity}}}},
 }};
-// Ladder rows (strix::profile::LadderRow): incumbent grant for the turbo cell the resolver ran before the ladder rule.
+inline constexpr std::string_view kTurboPrefillDevice = "gfx1151/Radeon-8060S";
+inline constexpr std::string_view kTurboPrefillSettings =
+    "tp2-usb4-host-2x2x40-r1b-gemv-exl3-pipeline2-routed-qwin0-mtp-wmma-x3-mla-kda-attn16";
+// The same execution on the original full scratch arena (storage only; STRIX_GLM_PF_SCRATCH auto picks it when it fits).
+inline constexpr std::string_view kFullScratchPrefillSettings =
+    "tp2-usb4-host-2x2x40-r1b-gemv-exl3-pipeline2-full-qwin0-mtp-wmma-x3-mla-kda-attn16";
+inline constexpr std::uint64_t kTurboPrefillCapacity = 36864;
+inline constexpr unsigned kTurboPrefillRows = 8192, kTurboPrefillGenerated = 64;
+
+#define STRIX_GLM_TURBO_ARM(prompt) \
+    "ladder-arm/v4;exec/v1 backend=hip device=gfx1151/Radeon-8060S prompt=" prompt \
+    " context=36864 lanes=1 chunk=8192 prefill_rows=8192 decode_rows=1 verify_rows=0 generated=64" \
+    " settings=tp2-usb4-host-2x2x40-r1b-gemv-exl3-pipeline2-routed-qwin0-mtp-wmma-x3-mla-kda-attn16;" \
+    "pf_wmma=0{v1},stored_i4=exl3{exl3-v1},mla_wmma=0{v1},mla_ob16=0{v1},kda_wmma=0{v1},attn_wmma=0{v1}," \
+    "idxproj_wmma=0{v1},router_wmma=0{v1},idx_scores=exact{glm-idx-wmma-exact-v1}," \
+    "kda_state16=0{v1},serve_sampled_mtp=0{glm-plain-sampling-v1};candidate=pf_wmma=1{v1};tier=turbo"
+
+// FAST gate ledger (strix::profile::FastGate): the qualified fast cell and its receipt.
+inline constexpr std::string_view kFastGatePfWmma =
+    "FAST gate v2 PASS, pair, 8K with MoE route replay (glm_fast gate-fast2.json): 5 windows of 8,192 tokens, 1,275 rows, "
+    "pooled KL 0.00018 (null 0.00007), top-1 0.9969, dNLL -0.0013 (se 0.0009), free route-flip ratio 1.05; product-route "
+    "head dump bitwise equal to the gated arm";
+inline constexpr strix::profile::FastGate fast_gates[] = {{"pf_wmma", "1", kFastGatePfWmma}};
+
+// A prompt inside the FAST band: the startup pair vote asks whether this execution can run the bundle at all; each
+// prompt is then decided by the rows below (select_prefill_wmma).
+inline constexpr std::uint64_t kPrefillProbePrompt = 8192;
+
+// TURBO: one fresh request at a time on the USB4 pair, ratio = the lower of the two observed TURBO/FAST throughput
+// ratios with a conservative 10% margin. Inside the FAST band the FAST cell runs the bundle and TURBO nests it (its
+// former 8,108-token receipt, measured against the exact cores, is superseded there by the band row).
 inline constexpr strix::profile::LadderRow product_ladder_rows[] = {
-    strix::profile::incumbent_cell("pf_wmma", "1", strix::profile::Name::turbo,
-                                   "glm-pf-wmma-x turbo cell ready before the ladder rule (docs/optimizations.md#glm-pf-wmma-x)", "v1")};
+    {"pf_wmma", "1", strix::profile::Name::turbo, strix::profile::Phase::prefill, kTurboPrefillDevice,
+     31258, 31258, 1, 1, 1.54, 0.10, "GLM pair 32K TURBO vs FAST, docs/models/glm-5.3/README.md",
+     false, {}, {}, STRIX_GLM_TURBO_ARM("31258")},
+    // FAST band receipt (LadderRow::band_bound: bound per run to its own reference by profile::bind_band_receipts, so it
+    // decides only a known pair execution). Band: the gate windows are 8,192 tokens; the 8K band below them follows the
+    // shared band convention (2,049..8,192). Prompts of 2,048 or fewer tokens and above 8,192 keep the exact prefill
+    // cores until a replay gate covers them (32K stays TURBO). Ratio: the lower observed 8K EXACT -> bundle ratio
+    // (11-19 G1 cold 12.319 -> 8.227 s x1.497; warm 655 -> 1,000 tok/s x1.53; glm_fast SE2/SF2 cold 604.1 -> 991.8
+    // tok/s x1.64), 10 % margin.
+    {.lever = "pf_wmma", .value = "1", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
+     .device = kTurboPrefillDevice, .min_context = 2049, .max_context = 8192, .min_lanes = 1, .max_lanes = 1,
+     .speedup = 1.50, .noise = 0.10,
+     .receipt = "GLM pair 8K FAST bundle vs EXACT cores (gate v2 8K route replay PASS), docs/optimizations.md#glm-pf-wmma-x",
+     .band_bound = true}};
+#undef STRIX_GLM_TURBO_ARM
 inline const strix::profile::Engine product_profile_engine{"glm-pair", "", product_profile_table, false, "glm-turbo-v1",
                                                            {}, {}, product_ladder_rows};
 

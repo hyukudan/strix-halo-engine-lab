@@ -4,10 +4,10 @@
 //     tree read at lane 0.
 //  2. The full row (factor 1 / CR sqrt, plain output) equals the private chunked kernel's expression.
 //  3. SquareForm changes bits (fma vs mul_add), so the trait is load-bearing.
-//  4. strix::numeric::rsqrt_correctly_rounded equals the private correctly rounded search and a double oracle; the
+//  4. strix::numeric::rsqrt_correctly_rounded uses the same result through the Gemma4 adapter and agrees with the double oracle away from midpoint ambiguity; the
 //     non-finite guard of inv_sqrt_correctly_rounded_finite.
 #include "../src/ops/norm/reference.hpp"
-#include "../src/gemma4/contracts/g4_identity.hpp"  // pow32_rsqrt: the private correctly rounded form (identity oracle)
+#include "../src/gemma4/contracts/g4_identity.hpp"  // pow32_rsqrt: Gemma4 adapter
 #include "strix/ds41_moe.hpp"                       // declared_sqrt (host: correctly rounded sqrtf)
 
 #include <cmath>
@@ -146,7 +146,7 @@ void rsqrt() {
     unsigned oracle_ties = 0;
     auto check = [&](float x) {
         const float r = rsqrt_correctly_rounded(x);
-        require(same(r, strix::gemma4::pow32_rsqrt(x)), "rsqrt_correctly_rounded == private pow32_rsqrt");
+        require(same(r, strix::gemma4::pow32_rsqrt(x)), "Gemma4 adapter returns the shared rsqrt");
         if (std::isfinite(x) && x > 0.0F) {
             const double exact = 1.0 / std::sqrt(static_cast<double>(x));
             const auto oracle = static_cast<float>(exact);

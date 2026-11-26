@@ -1,9 +1,10 @@
 // Model-free device test of the QSA FAST attention form (Config::forms.qsa_mma): qsa::attention_mma against the exact
 // qsa::attention on the same random inputs (selection built like select_kernel's output: all tokens while <= 512 complete
-// blocks, else 512 random 4-token blocks in random order + the tail). Reports max abs / relative L2 of attn_out and the
+// blocks, else 512 random 4-token blocks in ascending order + the tail). Reports max abs / relative L2 of attn_out and the
 // per-row relative L2 spread (errors must be uniform), then times both at 8K rows (history 0) and at a 32K position.
 //   qwen_qsa_mma_test <tables dir> [nofail]
 #include "strix/cuda/qwen_qsa.hpp"
+#include "qwen_qsa_rowgroup.hpp"
 
 #include "strix/cuda/amd_math_tables.hpp"
 
@@ -63,6 +64,7 @@ Inputs make_inputs(std::uint32_t rows, std::uint64_t first, float qscale) {
         blocks.resize(nb);
         for (std::uint32_t i = 0; i < nb; ++i) blocks[i] = i;
         for (std::uint32_t i = 0; i < qsa::kTopK; ++i) std::swap(blocks[i], blocks[i + rng() % (nb - i)]);
+        std::sort(blocks.begin(), blocks.begin() + qsa::kTopK);
         for (std::uint32_t i = 0; i < qsa::kTopK; ++i)
             for (std::uint32_t o = 0; o < qsa::kRatio; ++o) s[i * qsa::kRatio + o] = blocks[i] * qsa::kRatio + o;
         for (std::uint32_t t = nb * qsa::kRatio; t < visible; ++t) s[qsa::kTopK * qsa::kRatio + t - nb * qsa::kRatio] = t;
@@ -81,7 +83,7 @@ void compare(std::uint32_t rows, std::uint64_t first, float qscale, const am::Ta
     ck(cudaMalloc(&ob, std::uint64_t{rows} * qsa::kAttnWidth * 4), "ob");
     ck(cudaMemset(ob, 0xff, std::uint64_t{rows} * qsa::kAttnWidth * 4), "poison");
     qsa::attention(in.q, rows, first, in.sel, in.kv, scores, oa, tables, nullptr);
-    qsa::attention_mma(in.q, rows, first, in.sel, in.kv, ob, nullptr);
+    qsa::attention_mma(in.q, rows, first, in.sel, in.kv, scores, ob, nullptr);
     ck(cudaDeviceSynchronize(), "run");
     const auto a = download(oa, std::uint64_t{rows} * qsa::kAttnWidth), b = download(ob, std::uint64_t{rows} * qsa::kAttnWidth);
     double maxabs = 0, d2 = 0, n2 = 0, worst_row = 0, min_row = 1e30, sum_row = 0;
@@ -121,7 +123,7 @@ void timing(std::uint32_t rows, std::uint64_t first, const am::Tables& tables) {
                 const auto* s = in.sel + std::uint64_t{c} * qsa::kMaxSelected;
                 auto* o = oa + std::uint64_t{c} * qsa::kAttnWidth;
                 if (mode == 0) qsa::attention(q, n, first + c, s, in.kv, scores, o, tables, nullptr);
-                else qsa::attention_mma(q, n, first + c, s, in.kv, o, nullptr);
+                else qsa::enqueue_attention_mma(q, n, first + c, s, in.kv, scores, o, nullptr);
             }
         };
         run(); run(); ck(cudaDeviceSynchronize(), "warm");
@@ -143,6 +145,7 @@ int main(int argc, char** argv) {
     }
     const bool nofail = argc == 3;
     const auto tables = am::load_tables(argv[1]);
+    qsa::prepare_attention_mma();
     for (const std::uint64_t first : {0ULL, 9000ULL})
         for (const std::uint32_t rows : {1U, 15U, 16U, 17U, 1000U, 4096U}) compare(rows, first, 2.0F, tables, nofail);
     compare(1000, 9000, 6.0F, tables, nofail);   // peaked softmax

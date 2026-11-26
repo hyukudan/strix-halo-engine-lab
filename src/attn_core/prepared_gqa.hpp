@@ -221,6 +221,10 @@ struct PreparedGqaWorkspace {
     float* relative_features;             // [row][QueryHeads][RelativeWidth]
     float* key_history;                   // [ConvTaps - 1][KvWidth], per visit
     float* value_history;                 // [ConvTaps - 1][KvWidth], per visit
+    // Optional convolution tapes of a staged append, [row][KvWidth]: each receives the rows its history commit
+    // stores (session::VisitCacheRows::tape), so a partial commit rebuilds the history by copies. Null: no tape.
+    float* key_tape = nullptr;
+    float* value_tape = nullptr;
 };
 
 // Row intervals follow packed input order. Each interval has its own stream
@@ -229,6 +233,8 @@ struct PreparedGqaGroup {
     unsigned first_position, rows;
     float* key_history;
     float* value_history;
+    float* key_tape = nullptr;  // optional, as in PreparedGqaWorkspace
+    float* value_tape = nullptr;
 };
 
 // Lanes of a replayed multi-request decode step (strix/state/lane_view.hpp): packed row l is ONE decode row
@@ -330,16 +336,32 @@ bool folds_rounds(const Backend& backend) {
     return false;
 }
 
+// The rows the history commit of a convolution stores, copied into its tape: the rounded reads of a folding
+// convolution (scalar_float::bf16_round, the function of the separate round) or the already rounded rows.
+template <class Backend>
+typename Backend::Status prepared_gqa_record_tape(const Backend& backend, const float* activation,
+                                                  std::size_t elements, float* tape, bool round) {
+    if (!tape) return Backend::success;
+    if constexpr (requires { backend.store_rows(activation, elements, tape, round); }) {
+        return backend.store_rows(activation, elements, tape, round);
+    } else {
+        return Backend::invalid;
+    }
+}
+
 // round_output (folding backends only): the convolution stores its output rounded, replacing a later plain round.
+// tape (optional): receives the input rows the history commit stores (prepared_gqa_record_tape).
 template <class Shape, class Backend>
 typename Backend::Status prepared_gqa_kv_convolution(
     const Backend& backend, bool full, unsigned rows, const float* convolution, float* activation,
-    float* dynamic, float* history, float* output, bool round_output = false) {
+    float* dynamic, float* history, float* output, bool round_output = false, float* tape = nullptr) {
     if constexpr (PreparedGqaFoldsRounds<Backend>) {
         if (folds_rounds(backend)) {
             const core::ShortConvolution plan{Shape::kKvWidth, Shape::kConvTaps, full ? Shape::kKvHeads : 0U, 1.0F,
                                               full ? Shape::kFullConvDivisor : Shape::kLocalConvDivisor};
             const float* taps = full ? dynamic : nullptr;
+            if (auto status = prepared_gqa_record_tape(backend, activation, std::size_t{rows} * Shape::kKvWidth,
+                                                       tape, true); status != Backend::success) return status;
             return round_output
                 ? backend.template convolve<true, true>(plan, rows, activation, convolution, taps, history, output)
                 : backend.template convolve<false, true>(plan, rows, activation, convolution, taps, history, output);
@@ -352,6 +374,8 @@ typename Backend::Status prepared_gqa_kv_convolution(
         if (auto status = backend.round(dynamic, std::size_t{rows} * Shape::kKvHeads * Shape::kConvTaps); status != Backend::success)
             return status;
     }
+    if (auto status = prepared_gqa_record_tape(backend, activation, std::size_t{rows} * Shape::kKvWidth, tape, false);
+        status != Backend::success) return status;
     const core::ShortConvolution plan{Shape::kKvWidth, Shape::kConvTaps, full ? Shape::kKvHeads : 0U, 1.0F,
                                       full ? Shape::kFullConvDivisor : Shape::kLocalConvDivisor};
     return backend.convolve(plan, rows, activation, convolution, full ? dynamic : nullptr, history, output);
@@ -402,7 +426,8 @@ typename Backend::Status enqueue_prepared_gqa(
     const std::uint32_t* device_position = nullptr, std::span<const PreparedGqaGroup> groups = {},
     const PreparedGqaStepLanes* step_lanes = nullptr) {
     using Role = PreparedGqaProjection;
-    const PreparedGqaGroup single{first_position, rows, work.key_history, work.value_history};
+    const PreparedGqaGroup single{first_position, rows, work.key_history, work.value_history, work.key_tape,
+                                  work.value_tape};
     if (groups.empty()) groups = {&single, 1U};
     if (rows == 0 || rows > 65535U || !weights.query_gain || !weights.relative_gain ||
         !weights.key_convolution || !weights.value_convolution) return Backend::invalid;
@@ -517,11 +542,12 @@ typename Backend::Status enqueue_prepared_gqa(
         const auto kv = base * Shape::kKvWidth;
         const auto taps = base * Shape::kKvHeads * Shape::kConvTaps;
         if (auto status = detail::prepared_gqa_kv_convolution<Shape>(backend, full, group.rows, weights.key_convolution,
-                work.raw_keys + kv, full ? work.dynamic_keys + taps : nullptr, group.key_history, output.key + kv);
+                work.raw_keys + kv, full ? work.dynamic_keys + taps : nullptr, group.key_history, output.key + kv,
+                false, group.key_tape);
             status != Backend::success) return status;
         if (auto status = detail::prepared_gqa_kv_convolution<Shape>(backend, full, group.rows, weights.value_convolution,
                 work.raw_values + kv, full ? work.dynamic_values + taps : nullptr, group.value_history, output.value + kv,
-                detail::folds_rounds(backend));
+                detail::folds_rounds(backend), group.value_tape);
             status != Backend::success) return status;
 
         if (auto status = clip_query(output.query + base * Shape::kQueryWidth, weights.query_gain,
@@ -688,6 +714,12 @@ struct PreparedGqaRowsDevice {
             plan, core::causal_conv::LaneArgs<History>{lanes, input, lag_weights, dynamic, history, output}, stream);
     }
 
+    // Copy of `elements` floats; `round` stores scalar_float::bf16_round of each (the function of the separate round).
+    auto store_rows(const float* input, std::size_t elements, float* output, bool round) const {
+        namespace prep = core::row_transforms;
+        if (round) return prep::elements(elements, prep::CopyBf16Round{input, output}, stream);
+        return prep::elements(elements, prep::Copy{input, output}, stream);
+    }
     auto round(float* row, std::size_t elements, unsigned* failure = nullptr) const {
         namespace prep = core::row_transforms;
         if (failure) return prep::elements(elements, prep::CheckedBf16Round{row, failure}, stream);

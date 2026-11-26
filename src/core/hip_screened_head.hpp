@@ -107,7 +107,11 @@ __global__ void __launch_bounds__(kPass1Waves * 32U) pass1_kernel(PlaneView plan
     const unsigned units = plane.width / screened_head::kUnit;
     float lmax = -__builtin_inff();
     bool bad = false;
-    for (unsigned row = blockIdx.x * kPass1Waves + wave; row < plane.rows; row += gridDim.x * kPass1Waves) {
+    // The shared pass-1 schedule (screened_head_plan): one lane is one group of one-row tiles.
+    const auto map = screened_head_plan::pass1_map(blockIdx.x, gridDim.x, 1U);
+    static_assert(screened_head_plan::pass1_tile_rows(1U) == 1U, "one lane: a warp carries one row");
+    for (unsigned row = screened_head_plan::pass1_first_tile(map, wave); row < plane.rows;
+         row += screened_head_plan::pass1_tile_step(map)) {
         const std::uint8_t* base = plane.data + std::size_t{row} * plane.row_bytes;
         const std::uint16_t* scales = reinterpret_cast<const std::uint16_t*>(base + plane.scales_offset);
         float acc = 0.0F;

@@ -7,6 +7,7 @@
 
 struct Args {
     std::uint32_t repeat = 2, ttft_warmup = 1;
+    std::uint32_t ttft_decode = 0, extend_check = 0;
     bool timing = true;
 };
 namespace strix::dist {
@@ -37,6 +38,8 @@ struct DevicePrefill {
         }
         return r;
     }
+    // The production full-prompt entry (the request's D1 admission) times the same run in this fake.
+    PrefillResult run_full_prompt(std::span<const std::uint32_t> rows) { return run(rows); }
 };
 }
 struct TtftClock {

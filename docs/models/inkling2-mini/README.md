@@ -81,13 +81,9 @@ Decode runs the experts on the one-row packed form by default on the command
 line (both backends; `--grouped-decode` selects the grouped tile kernel there,
 printed as `moe_decode` in `strix-decode-route/v1`). `strix-serve` keeps its
 existing route in every profile and takes no decode form flag: the last
-prompt token is held back and decoded, prompts run in the command line's
-chunk without its tail (8192 rows on HIP; `--prefill-rows` sets it, clamped
-to the context, and an explicit value without `--slots` also caps the lanes,
-128 otherwise; the chunk changes no output). When the device refuses the
-chunk's workspaces, or the `--slots` lanes do not fit beside its per-slot
-rings and tapes, the server loads at 128 rows (HIP; CUDA: the command line's
-fallback) and prints a `strix-prefill-chunk` line. A cohort decodes with the grouped form in one batched forward
+prompt token is held back and decoded, prompts run in 128-row chunks
+(`--prefill-rows`, clamped to the context, which without `--slots` also caps
+the lanes), and a cohort decodes with the grouped form in one batched forward
 (CUDA: its width programs), whose lane bits depend on the cohort width as
 before. The served route switch `STRIX_INK_SERVED_CLI_ROUTE=1`
 (`inkling2-mini-served-cli-route@1`, off in every profile column) makes a HIP
@@ -225,13 +221,13 @@ names its own size in place of 8192) and the
 depend on the chunk, so the generated ids are the same. Only a refused device
 allocation selects the smaller chunk; any other load error is reported as is.
 An explicit `--prefill-chunk` is never changed, and `--prefill-chunk 2048`
-selects the smaller chunk up front. The CUDA server applies the same chunk
-and fallback to its held-back prompt route (`--prefill-rows` overrides it).
+selects the smaller chunk up front. The CUDA server is not affected: it keeps
+its own 128-row prompt chunks (`--prefill-rows`).
 
-The greedy head on CUDA is the screened head in every profile (RTX identity
-receipts: greedy ids equal the full head, CLI and served); an explicit
-`STRIX_INK_SCREENED_HEAD=0` (`inkling2-mini-screened-head@1`) keeps the full
-head. CUDA greedy picks that return no score row run the shared EXACT screened head
+The greedy head stays the full head on CUDA in every profile. The exact switch
+`STRIX_INK_SCREENED_HEAD=1` (`inkling2-mini-screened-head@1`, off in every
+profile column, a distinct run identity when set) makes CUDA greedy picks that
+return no score row run the shared EXACT screened head
 (`cuda/core/head_screened.cuh`, an 8-bit plane of the BF16 head built at
 load): the same token and status as the full head. Steps that return or read
 scores (`--logits`, sampled lanes, verify rows, cohort programs) keep the
@@ -242,7 +238,7 @@ screened head (`STRIX_SCREENED_HEAD=0` turns it off) and ignores the switch.
 The command line, the gate and the server print `inkling2 head` with
 `screened lever`, `full lever-off`, `full build-refused`, `full kv-slot` or,
 on HIP, `screened hip-binding` / `full hip-binding`; the server's startup
-line carries the same `head` field. When screened, the first screened pick
+line carries the same `head` field. With the switch, the first screened pick
 prints `inkling2 head screened first pick`, the decoder prints `inkling2 head
 screened picks N` when it closes, and the CUDA step program's install line
 ends with `head=screened`.
@@ -332,7 +328,10 @@ ctest --test-dir build-cuda -L inkling2 -R '^strix-cuda'
 - [ ] Compare native operators with pinned reference intermediate tensors on device.
 - [ ] Validate text prefill, multi-token decode and logits on a single Strix Halo with the official weights.
 - [ ] Validate cache rollover, state restore and rollback for all visits.
-- [ ] Validate image and text prefill, followed by DSpark.
-- [ ] Measure TTFT, prefill, decode and peak memory at 1K, 8K and 32K before enabling any faster profiles or USB4 partition plan.
+- [ ] Qualify the integrated HIP text, CLI image and CLI DSpark paths on the original weights.
+- [ ] Measure TTFT, prefill, decode and peak memory at 1K, 8K, 32K and 128K. Check long-context admission and continuation.
+
+The [HIP qualification runbook](hip-qualification.md) records the per-gate status, device commands,
+profile checks and measurement table.
 
 Tracking #909 for Mini and #908 for Small.

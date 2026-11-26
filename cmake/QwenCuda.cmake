@@ -28,7 +28,9 @@ add_library(strix_qwen_cuda STATIC
     src/cuda/models/qwen/qwen_prefill_driver.cu src/cuda/models/qwen/qwen_hc.cu src/cuda/models/qwen/qwen_dense.cu
     src/cuda/models/qwen/qwen_gdn.cu src/cuda/models/qwen/qwen_qsa.cu src/cuda/models/qwen/qwen_moe.cu
     src/cuda/models/qwen/qwen_plemtp.cu src/cuda/models/qwen/qwen_mtp_draft.cu src/cuda/models/qwen/qwen_transcode.cu src/cuda/tiered_experts.cu src/cuda/weight/registry.cu ${STRIX_CUDA_CORE_AMD_MATH_SOURCES} src/gguf_reader.cpp
-    src/cuda/core/nvfp4_a8.cu src/cuda/core/nvfp4_a8_reference.cpp src/cuda/core/nvfp4_reference.cpp)
+    src/cuda/core/nvfp4_a8.cu src/cuda/core/nvfp4_a8_reference.cpp src/cuda/core/nvfp4_reference.cpp
+    src/cuda/core/recur_decode.cu
+    src/cuda/core/lookup_cuda.cu)
 # Public headers reach shared src/ headers (strix/onfly_i4.hpp -> core/iu4_rows_plan.hpp), as strix_core exports.
 target_include_directories(strix_qwen_cuda PUBLIC include src src/cuda/models/qwen)
 target_link_libraries(strix_qwen_cuda PUBLIC strix-weight strix_nvfp4)
@@ -210,6 +212,13 @@ target_compile_options(qwen_qsa_rowgroup_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>
 add_executable(qwen_qsa_score_tree_test tests/cuda/qwen_qsa_score_tree_test.cu)
 target_link_libraries(qwen_qsa_score_tree_test PRIVATE strix_qwen_cuda)
 target_compile_options(qwen_qsa_score_tree_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+# The legacy fixture readers use the Windows CRT. The selection-only mode needs no assets.
+if(WIN32)
+    add_executable(qwen_qsa_tests tests/cuda/qwen_qsa_tests.cu)
+    target_link_libraries(qwen_qsa_tests PRIVATE strix_qwen_cuda)
+    target_compile_options(qwen_qsa_tests PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
 
 # Prefix storage and compatibility planning are host-only; no CUDA initialization in their tests.
 add_library(strix_qwen_prefix STATIC src/prefix_state_cache.cpp src/cuda/models/qwen/qwen_prefix_identity.cpp)
@@ -272,6 +281,16 @@ foreach(_qx draft_step gdn_decode hc_rows qsa_decode rows_glue)
     target_link_libraries(qwen_${_qx}_exact_test PRIVATE strix_qwen_cuda)
     target_compile_options(qwen_${_qx}_exact_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 endforeach()
+add_executable(qwen_gdn_replay_host_test tests/cuda/qwen_gdn_replay_host_test.cpp)
+target_include_directories(qwen_gdn_replay_host_test PRIVATE include src src/cuda/models/qwen)
+strix_apply_target_warnings(qwen_gdn_replay_host_test)
+add_test(NAME qwen_gdn_replay_host COMMAND qwen_gdn_replay_host_test)
+
+# Run separately on the CUDA operator's card with TABLES_DIR.
+add_executable(qwen_gdn_replay_test tests/cuda/qwen_gdn_replay_test.cu)
+target_link_libraries(qwen_gdn_replay_test PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_gdn_replay_test PRIVATE $<TARGET_PROPERTY:strix_qwen_cuda,COMPILE_OPTIONS>)
+
 # 16-bit recurrent state (STRIX_RECURRENT_STATE=f16|bf16) in the CUDA GDN recurrence: codec bit-equality with the host,
 # per-row rounding equalities, f32 incumbent bits. Needs the GPU (index 0 only: set CUDA_VISIBLE_DEVICES=0).
 add_executable(qwen_gdn_state16_test tests/cuda/qwen_gdn_state16_test.cu)

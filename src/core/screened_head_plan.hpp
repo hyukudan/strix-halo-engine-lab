@@ -169,6 +169,47 @@ constexpr unsigned pass1_groups(unsigned lanes, unsigned per_group) noexcept {
     return per_group == 0U ? 0U : (lanes + per_group - 1U) / per_group;
 }
 
+// ---- Pass-1 schedule (backend-neutral; the CUDA and HIP bodies call these from device code). ----
+// The schedule only decides which warp computes which (row, lane) bound; every bound is computed by the same per-row
+// arithmetic (thread t of the warp folds units t, t + 32, ... in order, then the warp sum), so y_hat, U, Lstar and the
+// runner-up key are bitwise independent of it.
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define STRIX_SHP_HD __host__ __device__
+#else
+#define STRIX_SHP_HD
+#endif
+
+// Row tile: plane rows one warp carries at once. The activations a thread reads from shared memory for one unit serve
+// all of them, so shared-memory traffic per weight is per_group / tile_rows activations instead of per_group (the
+// limit of a group of 8 lanes with one row per warp: 32 B of LDS per lane per 8 weights).
+STRIX_SHP_HD constexpr unsigned pass1_tile_rows(unsigned per_group) noexcept {
+    return per_group >= 2U ? per_group / 2U : 1U;
+}
+
+// Pass-1 blocks: one wave of the instantiation (resident = blocks the device holds at once, 0 when unknown) capped by
+// the owner's grid, rounded down to whole lane groups (at least one block per group). Lane groups are folded into the
+// block index (block % groups), so the sibling groups of one row block run at the same time over the same plane rows:
+// the plane is read from memory once and the other groups find it in the last-level cache.
+constexpr unsigned pass1_blocks(unsigned cap, unsigned resident, unsigned groups) noexcept {
+    if (groups == 0U) return 0U;
+    unsigned blocks = resident != 0U && resident < cap ? resident : cap;
+    blocks = blocks / groups * groups;
+    return blocks < groups ? groups : blocks;
+}
+
+struct Pass1Map {
+    unsigned group, row_block, row_blocks;  // lane group, this block's row block, row blocks per group
+};
+STRIX_SHP_HD constexpr Pass1Map pass1_map(unsigned block, unsigned blocks, unsigned groups) noexcept {
+    return {block % groups, block / groups, blocks / groups};
+}
+// Warp `warp` of a block visits row tiles first_tile, first_tile + tile_step, ... (tile t = rows [t * tile_rows,
+// (t + 1) * tile_rows) of the plane, the tail clipped at rows).
+STRIX_SHP_HD constexpr unsigned pass1_first_tile(const Pass1Map& m, unsigned warp) noexcept {
+    return m.row_block * kPass1Waves + warp;
+}
+STRIX_SHP_HD constexpr unsigned pass1_tile_step(const Pass1Map& m) noexcept { return m.row_blocks * kPass1Waves; }
+
 // One enqueue of the screened head over `lanes` activation rows (all pointers are device pointers). pass1_lanes is the
 // owner's plan (pass1_lanes() against its device's shared-memory limit, set up once at load), so binding a launch never
 // queries a device.
@@ -185,6 +226,9 @@ struct Launch {
     // lower bound L(2): two distinct rows reach it, so the true runner-up does, and a row with G(U) < G(L(2)) is
     // strictly below it). The pick may then fold the shared top-2 (head_argmax::Pick2) bit for bit.
     bool runner_up = false;
+    // Pass-1 blocks the device holds at once for this launch's instantiation (SMs x blocks per SM, measured by the
+    // owner at load); 0: unknown, grids.pass1 alone sizes the grid. See pass1_blocks().
+    unsigned pass1_resident = 0U;
 };
 
 constexpr bool pass1_lanes_valid(unsigned per_group, unsigned lanes) noexcept {

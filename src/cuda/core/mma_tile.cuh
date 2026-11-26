@@ -278,6 +278,9 @@ namespace tall = ::strix::moe_core::grouped_tall;
 inline constexpr unsigned kKStep = 16U;
 // Plan rows per tile: the tall CTA extent. The staged tile form (64-row CTAs) takes a larger tile as row slices of 64.
 inline constexpr unsigned kRowsPerTile = tall::kMaxRows;
+// Tile cut of a launch from the host-known mean live rows per expert: kRowsPerTile, or tall::kWideRows (256) in the regime
+// where the 256-row tall form wins. Tiles of the wide cut run only on the tall body (launch below).
+inline constexpr unsigned tile_cut(unsigned mean_rows) { return tall::tile_cut(mean_rows); }
 inline constexpr unsigned kDecodeRows = 16U * native_mma::kDecodeMBlocks;
 inline constexpr unsigned kTileOutputs = 128U;
 inline constexpr unsigned kDecodeOutputs = 32U;
@@ -489,6 +492,7 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
     constexpr tall::Layout L = tall::layout(F, Operand::kNvfp4);
     static_assert(tall::valid(F, Operand::kNvfp4));
     constexpr unsigned kWM = F.warp_m_blocks(), kWN = F.warp_n_blocks();
+    constexpr bool kChunked = F.chunked_scales;  // (a constexpr member read inside a lambda is not a constant expression)
     constexpr unsigned kActLoads = tall::act_chunks_per_thread(F), kCodeLoads = tall::code_chunks_per_thread(F);
     constexpr unsigned kColumns = tall::decode_columns(F), kPairs = kColumns / 2U;
     constexpr unsigned kCodeBytes = kColumns * L.code_tile / 16U, kWords = kCodeBytes / 4U;
@@ -533,7 +537,7 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
     // Form::staged_scales: the block scales of the CTA's outputs over the whole K, staged once (plan: "block scales"); the
     // 4-byte copies join stage 0's commit group, the byte copies are plain stores; both are visible after the prologue barrier.
     const unsigned scale_pitch = tall::scale_pitch(args.inputs, Operand::kNvfp4);
-    if constexpr (F.staged_scales) {
+    if constexpr (F.staged_scales && !F.chunked_scales) {
         const unsigned scale_row = tall::scale_blocks(args.inputs, Operand::kNvfp4);
         if (tall::scale_words(args.inputs, Operand::kNvfp4, reinterpret_cast<std::uintptr_t>(rows.weights.block_scales))) {
             const unsigned words = scale_row / 4U;
@@ -549,6 +553,41 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
             }
         }
     }
+
+    // Form::chunked_scales: chunk c (stages 8 c .. 8 c + 7) of every output's scale row, copied by 4-byte cp.async tasks (or plain
+    // byte stores on a row array that is not word aligned) into buffer c % 2; the prologue copies chunks 0 and 1, iteration s
+    // (chunk_copy_at) chunk s / 8 + 1, both inside a commit group of the ring (plan: "chunked scales").
+    constexpr unsigned kChunkTasks = kChunked ? tall::chunk_tasks_per_thread(F, Operand::kNvfp4) : 1U;
+    constexpr unsigned kChunkWords = kChunked ? tall::chunk_words(F, Operand::kNvfp4) : 1U;
+    const std::uint8_t* chunk_src[kChunkTasks];
+    unsigned chunk_task[kChunkTasks];
+    if constexpr (kChunked) {
+#pragma unroll
+        for (unsigned j = 0; j < kChunkTasks; ++j) {
+            chunk_task[j] = j * F.threads() + thread;
+            const bool live_task = chunk_task[j] < tall::chunk_tasks(F, Operand::kNvfp4);
+            chunk_src[j] = source.tile16_address(first_output + (live_task ? chunk_task[j] / kChunkWords : 0U), 0U).scale_code +
+                           4U * (chunk_task[j] % kChunkWords);
+        }
+    }
+    const auto scale_chunk = [&](unsigned c) {
+        if constexpr (kChunked) {
+            const unsigned row_bytes = tall::scale_blocks(args.inputs, Operand::kNvfp4);
+#pragma unroll
+            for (unsigned j = 0; j < kChunkTasks; ++j) {
+                if (chunk_task[j] >= tall::chunk_tasks(F, Operand::kNvfp4)) continue;
+                const unsigned word = chunk_task[j] % kChunkWords, output = chunk_task[j] / kChunkWords;
+                if (4U * (c * kChunkWords + word) >= row_bytes) continue;  // past the last chunk's words
+                const std::uint8_t* src = chunk_src[j] + std::size_t{4U} * c * kChunkWords;
+                const unsigned dst = tall::chunk_offset(F, L, Operand::kNvfp4, c % 2U, output, 4U * word);
+                if ((reinterpret_cast<std::uintptr_t>(src) & 3U) == 0U) {
+                    ptx::cp_async4(base + dst, src);
+                } else {
+                    for (unsigned i = 0; i < 4U; ++i) smem[dst + i] = src[i];
+                }
+            }
+        }
+    };
 
     const auto issue = [&](unsigned stage) {
         const std::uint32_t slot = tall::slot(F, stage) * L.stage_bytes;
@@ -582,7 +621,16 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
     const tall::DecodeJob job = tall::decode_job(F, thread);
     const unsigned scale_first =
         tall::scale_offset(L, scale_pitch, job.output, job.column / static_cast<unsigned>(Operand::kBlockColumns));
-    const auto staged_scale = [&](unsigned stage) { return smem[scale_first + stage * kScaleStride]; };
+    const unsigned chunk_first = F.chunked_scales
+        ? tall::chunk_offset(F, L, Operand::kNvfp4, 0U, job.output, job.column / static_cast<unsigned>(Operand::kBlockColumns))
+        : 0U;
+    const auto staged_scale = [&](unsigned stage) {
+        if constexpr (kChunked)
+            return smem[chunk_first + ((stage / tall::kScaleChunkStages) % 2U) * tall::chunk_buffer_bytes(F, Operand::kNvfp4) +
+                        (stage % tall::kScaleChunkStages) * tall::scale_stage_bytes(F, Operand::kNvfp4)];
+        else
+            return smem[scale_first + stage * kScaleStride];
+    };
     const std::uint8_t* scale_src = source.tile16_address(first_output + job.output, job.column).scale_code;
     std::uint8_t ahead = 0U;
     const auto decode = [&](unsigned stage, std::uint8_t scale_code) {
@@ -646,6 +694,10 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
 
     const unsigned steps = args.inputs / F.k_slab;
     if constexpr (!F.staged_scales) ahead = *scale_src;
+    if constexpr (F.chunked_scales) {
+        scale_chunk(0U);
+        if (tall::chunk_count(F, args.inputs) > 1U) scale_chunk(1U);
+    }
 #pragma unroll
     for (unsigned s = 0; s + 1U < F.stages; ++s) {
         if (s < steps) issue(s);
@@ -663,6 +715,9 @@ __global__ __launch_bounds__(tall::form(Id).threads(), 1) void projection_tall(v
         ptx::cp_async_wait<static_cast<int>(tall::loop_pending(F))>();
         __syncthreads();  // stage s + 1 landed for all; every warp is past stage s - 1 (its slot and slab are free)
         if (tall::copy_stage(F, s) < steps) issue(tall::copy_stage(F, s));
+        if constexpr (F.chunked_scales)
+            if (tall::chunk_copy_at(s) && tall::chunk_copied_at(s) < tall::chunk_count(F, args.inputs))
+                scale_chunk(tall::chunk_copied_at(s));
         ptx::cp_async_commit();
 #pragma unroll 1
         for (unsigned phase = 0; phase < 2U; ++phase) {  // decode stage s + 1 and multiply stage s, in the warp row's order
@@ -748,6 +803,7 @@ inline cudaError_t launch_tall(tall::FormId id, const view::Args& args, cudaStre
     case tall::FormId::r64_k32_s4: return launch_tall_form<Format, tall::FormId::r64_k32_s4>(args, stream);
     case tall::FormId::r128_k32_s4_direct:
         return launch_tall_form<Format, tall::FormId::r128_k32_s4_direct>(args, stream);
+    case tall::FormId::r256_k32_s3: return launch_tall_form<Format, tall::FormId::r256_k32_s3>(args, stream);
     default: return cudaErrorInvalidValue;
     }
 }
@@ -761,11 +817,14 @@ template<packed::MatrixFormat Format>
 inline cudaError_t launch(const view::Args& args, cudaStream_t stream) {
     if (!fits(args)) return cudaErrorInvalidValue;
     const bool tile = output_tile(args.outputs, args.max_tile_rows) == kTileOutputs;
-    if (args.schedule == view::Schedule::tall || (args.schedule == view::Schedule::automatic && tile)) {
+    const bool wide = args.max_tile_rows > kRowsPerTile;
+    if (wide && args.schedule != view::Schedule::automatic && args.schedule != view::Schedule::tall)
+        return cudaErrorInvalidValue;
+    if (args.schedule == view::Schedule::tall || (args.schedule == view::Schedule::automatic && tile) || wide) {
         tall::FormId id{};
         if (tall::resolve(args, Format == packed::MatrixFormat::nvfp4, detail::shared_budget(), id))
             return detail::launch_tall<Format>(id, args, stream);
-        if (args.schedule == view::Schedule::tall) return cudaErrorInvalidValue;
+        if (args.schedule == view::Schedule::tall || wide) return cudaErrorInvalidValue;
     }
     if (tile) return detail::launch_form<Format, native_mma::kTileMBlocks, kTileOutputs>(args, stream);
     return detail::launch_form<Format, native_mma::kDecodeMBlocks, kDecodeOutputs>(args, stream);

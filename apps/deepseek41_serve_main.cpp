@@ -12,7 +12,7 @@
 // of running it alone.
 //
 //   strix-deepseek41-serve MODEL.gguf --rank R --transport usb4auto|usb4gpu|tcp-listen:P|tcp-connect:H:P|emulate
-//       [--group-manifest FILE] [--layers 40] [--context 4096] [--slots 4] [--prompt-rows 8] [--tp-attention]
+//       [--group-manifest FILE] [--layers 40] [--context 4096] [--slots 8] [--prompt-rows 8] [--tp-attention]
 //       [--pool-positions N] (a shared KV pool of N positions over all slots: a request holds prompt + max_tokens of it)
 //       [--engram-direct] [--http-bind 127.0.0.1] [--http-port 0] [--http-api-key-file F] [--http-max-queue 64]
 //       [--http-max-connections 64] [--http-responses on|off] [--http-capabilities on|off]
@@ -1033,7 +1033,10 @@ public:
             if (budget == 0U && !ptask_) {
                 const std::span<const std::uint32_t> piece(prompt_.data() + at_, end - at_);
                 const auto run_piece = embeds_ ? resolve_piece(piece) : piece;
-                r_ = at_ == 0U ? sp_.prefill_->run(run_piece) : sp_.prefill_->extend(run_piece);
+                const bool whole = at_ == 0U && end == N && !embeds_ && !sp_.cache_ &&
+                                   sp_.a_.session_ram_bytes == 0U && sp_.a_.slots == 1U;
+                if (whole) r_ = sp_.prefill_->run_full_prompt(run_piece);
+                else r_ = at_ == 0U ? sp_.prefill_->run(run_piece) : sp_.prefill_->extend(run_piece);
             } else {
                 if (!ptask_) {
                     const std::span<const std::uint32_t> text_piece(prompt_.data() + at_, end - at_);

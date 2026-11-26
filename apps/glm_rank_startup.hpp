@@ -43,9 +43,13 @@ struct StartupResult { unsigned rows; bool eligible; };
 // negates only the row-count value: R18 then chooses the minimum proposed rows. The existing OR vote
 // rejects a mode/config mismatch on both ranks before either can enter another collective.
 template<class Merge>
-StartupResult startup_agreement(std::array<std::uint32_t, 8> fields, bool automatic, bool enabled, Merge&& merge) {
+StartupResult startup_agreement(std::array<std::uint32_t, 8> fields, bool automatic, bool enabled, Merge&& merge,
+                                bool* turbo_prefill = nullptr, unsigned rank = 0) {
     const bool eligible = fields[0] != 0;
-    if (!enabled) return {fields[2], eligible};
+    if (!enabled) {
+        if (turbo_prefill) *turbo_prefill = false;
+        return {fields[2], eligible};
+    }
     if (automatic) fields[1] |= kAutoRowsConfig;
     spec::MergeRow rows[8];
     for (unsigned i = 0; i < 8; ++i) {
@@ -56,6 +60,9 @@ StartupResult startup_agreement(std::array<std::uint32_t, 8> fields, bool automa
     if (automatic) rows[2].value = -rows[2].value;
     spec::MergeCtl ctl;
     ctl.kind = spec::kEligibilityMerge;
+    // The eligibility merge already ORs this control word. Each rank votes with its
+    // own bit; the existing MTP flags and configurations keep their wire values.
+    if (turbo_prefill && *turbo_prefill) ctl.replay_flag = 1U << rank;
     merge(rows, 8, ctl);
     bool mismatch = false;
     const char* names[] = {"eligible", "config", "max_rows", "decode_n", "capacity-lo", "capacity-hi", "slots", "prompt-fnv1a"};
@@ -72,6 +79,7 @@ StartupResult startup_agreement(std::array<std::uint32_t, 8> fields, bool automa
     merge(&vote, 1, vote_ctl);
     if (vote.flag != 0)
         throw std::runtime_error("TP2 ranks resolved different decode configurations or max-rows modes: " + local);
+    if (turbo_prefill) *turbo_prefill = ctl.replay_flag == 3U;
     return {rows[2].id, rows[0].flag == 0};
 }
 // Used only after both peers have passed the mode vote. A fresh admission can therefore request a

@@ -43,6 +43,12 @@ template <bool Fold> struct Probe {
     mutable std::vector<bool> checked;
     mutable std::vector<Conv> convs;
     mutable std::vector<Bf16RowProjection> projections;
+    struct Store {
+        const float* input;
+        float* output;
+        bool round, input_rounded;  // input_rounded: a plain round of `input` was launched before the store
+    };
+    mutable std::vector<Store> stores;
 
     bool fold_rounds() const { return fold_on; }
     bool store_round(unsigned rows) const { return admit_store_round && rows <= 16U; }
@@ -53,6 +59,10 @@ template <bool Fold> struct Probe {
     bool round(float* p, std::size_t, unsigned* failure = nullptr) const {
         rounds.push_back(p);
         checked.push_back(failure != nullptr);
+        return true;
+    }
+    bool store_rows(const float* input, std::size_t, float* output, bool round) const {
+        stores.push_back({input, output, round, rounded(input)});
         return true;
     }
     template <bool RoundOutput = false, bool RoundInput = false>
@@ -86,8 +96,12 @@ struct Buffers {
     }
 };
 
-template <bool Fold> void run(bool full, bool admit, unsigned rows, bool on = true) {
+template <bool Fold> void run(bool full, bool admit, unsigned rows, bool on = true, bool tape = false) {
     Buffers b;
+    if (tape) {
+        b.work.key_tape = b.a[19];
+        b.work.value_tape = b.a[20];
+    }
     Probe<Fold> probe;
     probe.admit_store_round = admit;
     probe.fold_on = on;
@@ -128,6 +142,21 @@ template <bool Fold> void run(bool full, bool admit, unsigned rows, bool on = tr
     for (std::size_t i = 0; i < probe.rounds.size(); ++i) plain += probe.checked[i] ? 0U : 1U;
     const std::size_t incumbent = 4U + (full ? 2U : 0U);  // raw K, raw V, value, output (+ dynamic K, V)
     check(plain == (folded ? (store ? 0U : 1U) : incumbent), "plain round count");
+    // Tape: the rows each history commit stores. A folding convolution rounds its reads (store rounds them); the
+    // incumbent sequence rounds the activation first (store copies it). Without a tape nothing is stored.
+    if (!tape) {
+        check(probe.stores.empty(), "no tape, no store");
+        return;
+    }
+    check(probe.stores.size() == 2U, "one tape store per key/value convolution");
+    const float* inputs[2]{w.raw_keys, w.raw_values};
+    const float* tapes[2]{w.key_tape, w.value_tape};
+    for (std::size_t i = 0; i < 2U; ++i) {
+        const auto& st = probe.stores[i];
+        check(st.input == inputs[i] && st.output == tapes[i], "tape of the convolution input");
+        check(st.round == folded, "tape rounds iff the convolution rounds its reads");
+        check(st.input_rounded == !folded, "unfolded tape copies the already rounded rows");
+    }
 }
 }  // namespace
 
@@ -139,6 +168,9 @@ int main() {
                 run<true>(full, true, rows);
                 run<true>(full, false, rows);
                 run<true>(full, true, rows, false);  // off switch: the incumbent sequence
+                run<false>(full, true, rows, true, true);
+                run<true>(full, true, rows, true, true);
+                run<true>(full, true, rows, false, true);
             }
         }
     } catch (const std::exception& e) {

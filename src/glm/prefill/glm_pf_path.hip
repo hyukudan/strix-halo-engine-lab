@@ -282,7 +282,7 @@ public:
         {  // the three projections of x share one launch under dense v3 (v1 / v2 run them one by one); same bits
             const DenseProj px[3] = {{w.f_a, 0, kKdaDim, ta_}, {w.g_a, 0, kKdaDim, tb128_}, {w.b, 0, H, b_}};
             const DenseProj pf{w.f_b, 0, C, f_}, pg{w.g_b, 0, C, g_};
-            if (kda_wmma_ && kda_wmma::supported(D::WType::F16, kHidden, px, 3, R) &&
+            if ((kda_wmma_ || wmma_x::profile_enabled) && kda_wmma::supported(D::WType::F16, kHidden, px, 3, R) &&
                 kda_wmma::supported(D::WType::F16, kKdaDim, &pf, 1, R) && kda_wmma::supported(D::WType::F16, kKdaDim, &pg, 1, R)) {
                 // FAST (default with the FAST route): the same five projections on the shared dense FP16 WMMA core.
                 kda_wmma::dense_group(x, kHidden, px, 3, R, c.stream, x16_ ? xt_ : nullptr);  // x16 from kX16Rows rows (same bits)

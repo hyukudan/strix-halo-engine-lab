@@ -1174,6 +1174,41 @@ the decode app keeps 16-row windows unless `--wide-exact N`, the pair app keeps 
 - **Implementation / evidence:** [engine](../src/qwen35/hip/engine.hip), [IU4 dense core](../src/core/dense_linear_iu4.hpp),
   [row-block grid](../src/core/dense_iu4_rows.hpp), [options](../include/strix/qwen35/hip_engine.hpp)
 
+<a id="qwen27-hip-fast-window"></a>
+
+### Qwen 27B HIP: FAST and TURBO prefill with the 512-row window inside the gated bands
+
+**Engine:** `qwen` (27B dense, HIP decode app `strix-hip-qwen35-decode`). **Control:** `--profile fast|turbo`
+(default product profile FAST). **Default:** ON in FAST and TURBO inside the gated prompt bands; EXACT unchanged.
+
+The 512-row IU4 window (`--wide 512`, A4W4 off) is the FAST/TURBO prefill route when the shared regime ledger
+(`sp::RegimeGate` rows, quality per prompt band) and the shared band receipts (`LadderRow::band_bound`, timing per band,
+bound by `bind_band_receipts` to the run's own reference and re-bound until the ladder chain settles) both cover the
+run: gfx1151, one rank, one lane, the IU4 g64 pack, a known execution and a prompt in 1..2,048, 2,049..8,192 or
+8,193..24,576 tokens. Elsewhere the previous route (64-row EXACT windows) stays. The A4W4 48-63 layer table failed the same
+per-class gate and stays pending. `--dump-logits --dump-window` without `--wide` now dumps the last window of the route
+the profile resolves (the gate's default arm); `--dump-logits` alone keeps its one-row reference path. Windows wider
+than the decode window read back the one argmax the engine returns for them (the all-rows head; fixes a
+`hipMemcpyAsync ... invalid argument` on `--wide N --dump-window`).
+
+| Engine | Device | Status |
+|---|---|---|
+| qwen 27B dense, HIP decode app | gfx1151, one rank, one lane, IU4 g64 | ON in FAST/TURBO inside the gated bands |
+| qwen 27B dense, HIP spec / pair apps, TP | gfx1151 | previous route (not gated on that execution) |
+| qwen 27B dense, CUDA | any | not applicable (own windows) |
+| other engines | any | not applicable |
+
+- **Preconditions:** Qwen 27B dense IU4 g64 pack on one gfx1151 device, one rank, one lane, prompt inside a gated band.
+- **Exactness evidence:** Bit-changing (FAST class). Per-class gate v2 PASS in every class of every band (KL <= 0.00008,
+  top-1 >= 0.996, |dNLL| <= 0.0008 against EXACT `--wide-exact 512`, one-ulp null); the default's dumps are bitwise the
+  gated window arm (6 cases, 2,048 and 8,192 tokens); EXACT reference bits equal across the two nodes.
+- **Off switch:** `--profile exact`, an explicit `--wide N` / `--wide-exact N`, or `--rows N`.
+- **Measured gain:** One Strix Halo node, `--no-mtp --gen 1`, prompt seconds EXACT 64 rows -> 512-row window: 2,048
+  tokens 10.27 -> 2.99 s (3.43x), 8,192 tokens 67.60 -> 12.93 s (5.23x), 24,576 tokens 534.39 -> 45.43 s (11.8x).
+- **Implementation / evidence:** [profile rows](../include/strix/profiles/qwen_dense_hip.hpp),
+  [shared band receipts](../include/strix/engine_profile.hpp), [prefill windows](../include/strix/qwen35/prefill_windows.hpp),
+  [model page](models/qwen3.8-27b/README.md#fast-prefill-window-hip-decode-app)
+
 <a id="qwen27-hip-decode-attn-row-share"></a>
 
 ### Qwen 27B HIP: decode attention walks the K/V cache once per kv head for several rows
@@ -4626,22 +4661,54 @@ their checks.
 
 <a id="glm-pf-wmma-x"></a>
 
-### FAST WMMA prefill linear cores (glm-pf-wmma-x)
+### FAST WMMA prefill bundle (glm-pf-wmma-x)
 
-**Engine:** `glm`. **Control:** `STRIX_GLM_PF_WMMA`. **Default:** off (explicit `STRIX_GLM_PF_WMMA=1` only; unqualified for `--profile fast`, see the quality line; opt-in FAST identity).
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_WMMA`. **Default:** on under `--profile fast` (and `turbo`) for a two-rank
+pair prompt of 2,049..8,192 tokens in the measured execution (below); off everywhere else. `STRIX_GLM_PF_WMMA=1` forces
+it, `=0` keeps the exact cores.
 
 The exact prefill's X3 linear calls run on `v_wmma_f32_16x16x16_f16` over the exact cores' FP16 operands: dense calls of
 2048+ rows (X3 route) and the MoE gate/up/down of the V11/V14 route. Per (row, output) each stage of four 16-wide
 k-units is one WMMA chain from +0, folded into an FP32 total with round-to-nearest adds; 128-row tiles with two output
 tiles per wave (remainders on 64-row storage); the H128/svh epilogue, plan, transforms, activation and combine are the
-exact path's. `STRIX_GLM_PF_WMMA_ROWS=64` and `STRIX_GLM_PF_WMMA_CP=1` select other tilings with the same bits.
+exact path's. `STRIX_GLM_PF_WMMA_ROWS=64` and `STRIX_GLM_PF_WMMA_CP=1` select other tilings with the same bits. The
+bundle also switches the MLA, KDA and sparse-attention cores to their WMMA forms (`mla_wmma`, `kda_wmma`, `attn_wmma`
+inherit it).
 
-- **Preconditions:** dense calls of 2048+ rows (`STRIX_GLM_PF_EXACT_X` auto / 4); MoE calls on V11 or V14 (auto from 128 rows). Other calls stay exact.
-- **Automatic selection:** none today: `--profile fast` does not select it (the FAST prefill set fails the 8K quality gate, KL 0.0587 and 0.492 on two windows, no single member carrying it; it returns to the fast column when fixed). An explicit environment value runs it. `default` exports nothing, `quality` uses default with a notice, and baseline vetoes the profile addition. The bare `--profile` keeps its timing meaning.
-- **Fallback notice:** None; each rank prints `prefill identity glm-pf-wmma-x FAST (... wmma calls dense D moe M)` only when WMMA calls ran, else `prefill identity exact` (`prefill identity prefill-wmma route` under `--prefill wmma`). Two ranks: the switch is part of the startup agreement (a mismatch stops both ranks); modes without that handshake refuse `STRIX_GLM_PF_WMMA=1`.
-- **Exactness evidence:** FAST identity (new FP32 summation order). Quality: pre-registered quality-parity check passed at 1K / 8K / 32K; the later per-window FAST gate of the whole FAST prefill set fails at 8K (above), so the lever is unqualified for the profile. Synthetic: WMMA vs FP64 2.5-2.8e-7 rel-L2 (exact X3 1.9-8.2e-7); every WMMA tiling bitwise equal (hip_glm_pf_wmma_tests). Pair: FAST deterministic; OFF equals the exact 8K logits anchors on both ranks.
-- **Off switch:** STRIX_GLM_PF_WMMA=0 (also overrides `--profile fast`); without a named fast profile, unset keeps it off
-- **Measured gain:** Pair 8K TTFT 15.45 -> 12.94 s (-16.3 %), 32K 62.3 -> 51.2 s (-17.8 %, mean of both run orders); whole-call MoE -28..-29 %, dense 8192 rows -28..-32 %
+| Engine | Device | Status |
+|---|---|---|
+| glm-5.3-flash, pair (`strix-glm5-rank`, `strix-glm5-serve`) | two Radeon 8060S (gfx1151), USB4 2x2x40 host transport | FAST/TURBO: ON for prompts of 2,049..8,192 tokens; TURBO also at the measured 31,258-token prompt |
+| glm-5.3-flash, one GPU or other topologies | any | exact cores (no receipt for that execution) |
+| glm-5.3-flash, CUDA producer | sm_120 | not applicable (own profile table) |
+| deepseek-v4.1-flash, minimax-m3.1-flash, qwen3.8-flash-next, qwen3.8-27b, hy4-flash, inkling2-mini, nemotron-3.5-bolt-e4b, ernie-5.5-flash-preview | any | not applicable (GLM prefill cores; their FAST rows are their own) |
+
+- **Preconditions:** the ordinary pair workload: `--world 2`, comm exchange, MTP decode on (complete layer-45 head),
+  R1b identity, chunked prefill with the 2-stage pipeline (routed or full scratch arena), 8,192-row chunks (`max-rows` auto admits
+  them at about 112 GiB available memory; with 4,096-row chunks the exact cores run), one lane, a fresh whole prompt
+  (served: greedy text request without a cached prefix), both ranks voting the same device class and link.
+- **Automatic selection:** one shared resolver for the command line and the server. The FAST cell is qualified by its
+  gate (below) and timed by a band receipt bound to the run's own execution (`profile::bind_band_receipts`): device
+  gfx1151/Radeon-8060S, prefill, one lane, 2,049..8,192 tokens, x1.50 noise 0.10. TURBO runs the FAST cell inside that
+  band and its own literal receipt at 31,258 tokens. Each prompt prints
+  `glm-pf-wmma-x profile=<p> prompt=<n> chunk=<rows> scratch=<routed|full> effective=wmma|exact-cores (reason)` and the `strix-ladder/v1 pf_wmma`
+  route that decided it.
+- **Fallback notice:** prompts of 2,048 tokens or fewer, above 8,192 tokens (32K is TURBO only), other devices, links,
+  chunks or compositions, and two-rank native modes without configuration agreement keep the exact cores. Two-rank
+  execution still requires configuration agreement for an explicit arithmetic switch.
+- **Exactness evidence:** FAST identity (new FP32 summation order). FAST gate v2 with MoE route replay, pair, 5 windows
+  of 8,192 tokens (prose, JSON, two 32K-document slices), 1,275 held-out rows: pooled KL 0.00018 (one-ulp null
+  0.00007), top-1 0.9969, dNLL -0.0013 (se 0.0009), free route-flip ratio 1.05; every window passes. Free-running
+  (no replay) KL is not discriminating on GLM: the exact arm's own one-ulp null flips routes as much. The product
+  route's head dump is bitwise equal to the gated arm. Synthetic: WMMA vs FP64 2.5-2.8e-7 rel-L2 (exact X3
+  1.9-8.2e-7); every WMMA tiling bitwise equal (hip_glm_pf_wmma_tests). OFF equals the exact 8K logits anchors on both
+  ranks.
+- **Off switch:** `STRIX_GLM_PF_WMMA=0`, `--profile exact`, or `--baseline`.
+- **Measured gain:** pair, 8,192-token prompt, both ranks: exact cores 12.32 s -> bundle 8.23 s cold (x1.50; warm
+  655 -> 1,000 tok/s); whole-call MoE -28..-29 %, dense 8192 rows -28..-32 %. TURBO receipts: 8K TTFT 15.45 -> 12.94 s
+  (-16.3 %), 32K 62.3 -> 51.2 s (-17.8 %, mean of both run orders). FAST default (product command line
+  `--profile fast` alone, same binary, one load per arm, cold): CLI 8,192 tokens EXACT 12.78 s -> FAST 8.54 s (x1.50,
+  959 tok/s; head logits of the forced arm bitwise equal to the gate arm, EXACT bitwise unchanged); served 8,108-token
+  prompt 889 tok/s (64 ids equal to the TURBO bundle record) vs 628 before.
 - **Implementation / evidence:** [shared core](../src/moe_core/grouped_f16.hpp), [GLM adapter](../src/glm/prefill/glm_pf_wmma_x.hpp), [MoE](../src/glm/prefill/glm_pf_wmma_moe.inc), [test](../tests/hip_glm_pf_wmma_tests.hip)
 
 <a id="glm-pf-wmma-live-fragments"></a>
@@ -4851,6 +4918,20 @@ The q_b epilogue applies the flash prologue's own RoPE (`rope_pair`, dims 448..5
 - **Off switch:** `STRIX_DS41_FAST_ATTN_Q16=0` (FP32 q, same bits)
 - **Measured gain:** q_b 2048 x 1024 x 8192: 1.505 -> 1.352 ms. Pair 11,594 warm, strict ABAB 3 pairs: d +15 / +30 / -29 ms (no wall gain beyond noise).
 - **Implementation / evidence:** [image store](../src/core/f16_dense_q8a8.hpp), [q_b](../src/hip_ds41_layer.hip), [policy](../src/hip_ds41_attention_flash.inl), [test](../tests/hip_ds41_fast_dense_tests.hip)
+
+<a id="ds41-fast-d1-band"></a>
+
+### DS41 FAST prefill: D1 composition and bounded decoder replay R=256 by band receipt
+
+**Engine:** `deepseek41` (shared `bind_band_receipts` in `include/strix/engine_profile.hpp`). **Control:** profile rows `d1_prefill` and `decoder_replay` (`--profile fast|turbo`; the implicit model preset is FAST). **Default:** FAST and TURBO, per request, for prompts of 4,096-8,192 and 8,193-32,768 tokens on gfx1151.
+
+Startup exports the previous prefill route. Each request resolves the profile again with its own execution key (backend, device product, priced workload, row split, cone, head rows, window, lanes, MoE chunk). The two band rows of each lever bind to that run's own reference, so the D1 composition (BF16 flash attention, FP16 dense, relaxed MoE with FP16 down, FP16 Engram and shared expert) and, on top of it, the bounded decoder replay R=256 run only inside their measured bands. Both ranks exchange the request fingerprint; either rank declining keeps the previous route on both.
+
+- **Exactness evidence:** Bit-changing. FAST gate v2 D1: KL 0.0093, top-1 0.972, dNLL -0.0037 (se 0.0035), route flips 1.05 x null. D1R (with R=256): KL 0.0101, top-1 0.972, dNLL +0.0001 (se 0.0037), route flips 0.37 x null. Pair, 8K and 32K classes, 28 windows, 1,764 rows, final PASS. The bounded replay equals the full run with the key floor bit for bit; deferred serve pieces, snapshot points and group passes take the exact plan.
+- **Off switch:** `--profile exact`, or any explicit `STRIX_DS41_FAST_PREFILL` / `STRIX_DS41_DECODER_REPLAY` value.
+- **Measured gain:** Pair CLI, 8,192 tokens: EXACT 1,128.5, D1 1,614 / 1,647, D1 + R256 1,855 tok/s. 32,768 tokens: EXACT 1,257.2, D1 1,808.6, D1 + R256 1,981 tok/s. Measured before integration; the integrated build needs its device check.
+- **Engines:** DeepSeek V4.1 Flash bound. Qwen3.8 Flash Next, Qwen3.8-27B and Hy4 Flash use the same band mechanism for their own rows. Inkling 2 Mini, GLM-5.3 Flash, MiniMax M3.1 Flash and Nemotron 3.5 Bolt E4B have no DeepSeek prefill composition.
+- **Implementation / evidence:** [rows](../include/strix/deepseek41_pair_profile_table.hpp), [execution key](../src/deepseek41_pair_defaults.cpp), [paired admission](../src/hip_deepseek41_prefill.hip), [tests](../tests/deepseek41_pair_defaults_tests.cpp)
 
 <a id="mm-pf-msa-q16"></a>
 
@@ -5869,11 +5950,44 @@ input by the family NVFP4 rule and the tile uses the block-scaled FP4 MMA on the
 decode, verify and one-row calls keep the BF16 tile. The CLI, the step-program loader (default route for
 `--generate >= 2`) and the serve route resolve the lever through the same profile table; the receipt names it.
 
-- **Preconditions:** CUDA sm_120, NVFP4 expert layers, multi-row prefill chunks. HIP ignores the lever.
+- **Preconditions:** CUDA sm_120, NVFP4 expert layers, multi-row prefill chunks. On HIP only the TURBO cell runs
+  ([iu4](#inkling2-moe-iu4-turbo)).
 - **Exactness evidence:** bit-changing by design (FAST). Gate not run: the lever stays opt-in until the FAST gate
   (prefill regime, routes replayed) passes.
 - **Off switch:** `STRIX_INK_MOE_W4A4=0`, or any profile other than `fast` / `turbo`.
 - **Measured gain:** not measured on this tree.
+
+<a id="inkling2-moe-iu4-turbo"></a>
+
+## Inkling 2 Mini prompt prefill: rotated integer A4W4 experts (TURBO, HIP)
+
+**Engine:** `inkling2-mini` (HIP gfx1151). **Control:** TURBO cell `iu4` of lever `inkling2-mini-moe-w4a4@1`,
+`STRIX_INK_MOE_W4A4`. **Default:** on under `--profile turbo` for prompts of 4,307..32,760 tokens on gfx1151, in the
+CLI and in `strix-serve` (same resolver, same rows); off in every other profile and regime.
+
+Multi-row prompt-prefill chunks of every expert layer run the shared rotated integer class
+(`moe_core/grouped_iu4a4.hpp`, identity `grouped-iu4a4-rot-v1`): rotated 4-bit images of both expert projections are
+built once at load (13.00 GB at Inkling 2 Mini shapes), tokens and the SwiGLU output are quantised per row, and the
+grouped GEMM runs the integer WMMA. Decode, one-row calls, other devices and prompt sizes outside the rows keep the
+BF16 tile; CUDA declines the class.
+
+- **Preconditions:** HIP gfx1151, `--profile turbo`, a prompt inside a ladder row (4,307..8,236 tokens x1.091;
+  8,237..32,760 tokens x1.068). The route line `strix-ladder/v1 inkling2-mini-moe-w4a4@1 ...` names the row.
+  The rows are band receipts bound to the run's own execution (backend, device product, prompt, context capacity,
+  prefill chunk; one spelling for the CLI, the gate and the server): a run whose execution is not known, and the
+  narrow-experts image (`STRIX_MOE_EXPERTS_NVFP4=1`), keep the BF16 tile.
+- **Quality (TURBO, declared):** gate v2, prefill regime, 16 held-out prose windows (1,008 rows, routes replayed),
+  against the BF16 tile of the same engine: KL 0.0179, top-1 0.9296, dNLL +0.0035, free route-flip ratio 5.55. It
+  does not pass the FAST gate (top-1, windows, flip ratio), so it is a TURBO cell only.
+- **Off switch:** `STRIX_INK_MOE_W4A4=0`, or any profile other than `turbo`.
+- **Measured gain (TURBO over EXACT, prompt prefill, one gfx1151 node, kernel 7.4.0-rc1, default power, load below 3,
+  one binary, medians):**
+
+| Prompt | CLI EXACT | CLI TURBO | Served EXACT | Served TURBO |
+| --- | --- | --- | --- | --- |
+| 4K (4,309 / 4,307 tokens) | 2,129 tok/s | 2,387 tok/s (x1.121) | 2,071 tok/s | 2,313 tok/s (x1.117) |
+| 8K (8,236 / 8,234 tokens) | 2,181 tok/s | 2,380 tok/s (x1.092) | 2,037 tok/s | 2,229 tok/s (x1.094) |
+| 32K (32,760 / 32,758 tokens) | 1,939 tok/s | 2,072 tok/s (x1.069) | 1,890 tok/s | 2,053 tok/s (x1.086) |
 
 <a id="inkling2-moe-shift-decode"></a>
 
@@ -5910,13 +6024,49 @@ Shapes it does not take run the staged tile. Same bits either way.
 
 ## Inkling 2 Mini CUDA step program: exact R1 latency forms
 
-**Engine:** `inkling2-mini` (CUDA step program). **Control:** `--latency-forms[=mix|=moe]`, `--no-latency-forms`.
+**Engine:** `inkling2-mini` (CUDA step program). **Control:** `--latency-forms[=mix|moe|batch|b3]`, `--no-latency-forms`.
 **Default:** `mix` (tiled bank readout and controller output split); the packed MoE pipe (`moe`) stays opt-in.
 
 The step program binds the shared exact R1 decode recipe leaves (`exec` CUDA decode catalogue) in place of the
 incumbent leaves; the receipt names the bound forms.
 
+The explicit `--latency-forms=batch` option adds the shared controller message-bank batch to `mix`.
+`--latency-forms=b3` also combines eligible residual adds, bank readouts, and input norms in the shared row-owner launch.
+Both options are pending native token and logit identity checks.
+
 - **Exactness evidence:** EXACT schedule change; host test checks the program node list and edges; device identity
   (ids and logits vs the incumbent leaves) is part of the integration identity ticket.
 - **Off switch:** `--no-latency-forms`.
 - **Measured gain:** not measured on this tree.
+
+<a id="inkling2-sp4t-head"></a>
+## Inkling 2 Mini decode head: Strix pack SP4, fixed table (`strix.sp4t`)
+
+**Engine:** `inkling2-mini` (HIP). **Control:** lever `inkling2-mini-lowbit-head@1` (`STRIX_INK_LOWBIT_HEAD=sp4t`) or
+`--qualify-decode-weights weights.head.sp4t@1`, with `STRIX_LOWBIT_PACK` naming a calibrated `strix.sp4t` pack.
+**Default:** off in every tier; an explicit option runnable under `--profile fast` and `--profile turbo`.
+
+**Shared home:** `Sp4Operand` of the shared small-M schedule (`src/core/f16_tile_gemm_small.hpp`, codes staged as exact
+FP16 table values by `src/core/lowbit_f16_staging.hpp`, one FP32 multiplier per 32-weight group, the per-tensor power of
+two applied at the store), dispatched by `enqueue_resident_q8_rows` (`src/core/resident_q8_rows.hpp`); storage identity
+`strix.sp4t@1` and calibrated pack entries in `src/weight` (docs/engine/lowbit-calibration.md); policy
+`weights.head.sp4t@1` in `include/strix/weight/levers.hpp`. Inkling binds the head arm only.
+
+- **Exactness evidence:** bit-changing (lossy weights). With the lever unset, Inkling CLI and served token ids and logits
+  equal origin/main (100 of 100 identity rows) and the incumbent gfx1151 ISA is identical (43 objects). The device SP4
+  rows equal the host dequantised reference within the FP32 accumulation bound (worst 0.0032 of it) and are bitwise per
+  row for 1 to 33 rows.
+- **Quality (gate v2, decode, 39 held-out windows, 2,457 rows):** pooled KL 0.00067, top-1 0.994, dNLL -0.0002, route
+  flips 0. FAST: one window fails dNLL by 0.00005 (prose-13) and one is unresolved (structured-14, top-1 0.905): not a
+  FAST row. TURBO limits: 39 of 39 windows pass.
+- **Measured gain:** CLI B=1, 512 steps, three interleaved rounds: 33.20 ms per step against 34.26 ms with the BF16 head
+  (-3.1 %) and 35.28 ms with the q4_g64 head. The q4_g64 gap is the route (small-M against the large tile on a device
+  without declared `lowbit_rows`), not the format. Served decode not measured: the arm is command line only.
+- **Why no TURBO row yet:** the TURBO row carries q4 attention and a q4 head under a served receipt; replacing its head
+  needs the combined arm gated, the SP4 arm served and a served receipt at widths 1, 8 and 16.
+- **Off switch:** leave `STRIX_INK_LOWBIT_HEAD` unset.
+
+| model | SP4 head |
+|---|---|
+| inkling2-mini | bound (HIP head, decode steps) |
+| qwen3.8-flash-next, qwen3.8-27b, deepseek-v4.1-flash, glm-5.3-flash, minimax-m3.1-flash, hy4-flash, nemotron-3.5-bolt-e4b | not bound: the decode head has no calibrated pack path and no resident low-bit rows |

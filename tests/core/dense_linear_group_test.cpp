@@ -1,19 +1,31 @@
-// Grouped tight-row decode launch (src/core/dense_linear.hpp): every block of the one launch runs exactly one block
-// of exactly one projection's own launch, and every block of every own launch is run once. With the shared body this
-// makes each stored value bitwise the single-launch value.
+// Grouped tight-row decode launch (src/core/dense_linear.hpp) on the shared projection-group index
+// (strix/decode_projection_group.hpp): every block of the one launch runs exactly one block of exactly one projection's
+// own launch, and every block of every own launch is run once. With the shared body this makes each stored value
+// bitwise the single-launch value.
 #include "core/dense_linear.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <vector>
 
 namespace {
 
 using strix::core::dense_linear::kTightGroupMax;
-using strix::core::dense_linear::locate;
 using strix::core::dense_linear::plan_tight_blocks;
 using strix::core::dense_linear::TightBlocks;
 
 int failures = 0;
+
+struct Slot {
+    unsigned projection;
+    std::uint32_t block;
+};
+// The device kernel's lookup: the shared decode::locate over the plan's prefix table.
+Slot locate(const TightBlocks& plan, unsigned block) {
+    Slot slot{};
+    strix::decode::locate(plan.first, plan.count, block, slot.projection, slot.block);
+    return slot;
+}
 
 void expect(bool ok, const char* what, unsigned a, unsigned b) {
     if (ok) return;
@@ -53,6 +65,8 @@ int main() {
         {3072U, 1024U, 1024U},   // attention prepare
         {24U, 384U, 128U},       // small projections in one group
         {1U},                    {7U, 9U},     {8U, 8U, 8U, 8U}, {17U, 1U, 33U, 4097U},
+        {4096U, 256U, 16U, 64U, 512U, 512U},  // six same-input projections (one launch)
+        {1U, 1U, 1U, 1U, 1U, 1U},
     };
     for (const auto width : widths)
         for (const auto& group : groups) check_group(group, width);
@@ -60,18 +74,29 @@ int main() {
     TightBlocks plan{};
     const unsigned zero[] = {8U, 0U};
     expect(!plan_tight_blocks(zero, 2U, 8U, plan), "zero outputs rejected", 0U, 0U);
-    const unsigned five[] = {1U, 1U, 1U, 1U, 1U};
-    expect(!plan_tight_blocks(five, kTightGroupMax + 1U, 8U, plan), "count above max rejected", kTightGroupMax + 1U, 0U);
-    expect(!plan_tight_blocks(five, 0U, 8U, plan), "empty group rejected", 0U, 0U);
+    const unsigned over[kTightGroupMax + 1U] = {1U, 1U, 1U, 1U, 1U, 1U, 1U};
+    expect(!plan_tight_blocks(over, kTightGroupMax + 1U, 8U, plan), "count above max rejected", kTightGroupMax + 1U, 0U);
+    expect(!plan_tight_blocks(over, 0U, 8U, plan), "empty group rejected", 0U, 0U);
     const unsigned huge[] = {0xffffffffU, 0xffffffffU};
     expect(!plan_tight_blocks(huge, 2U, 1U, plan), "32-bit block overflow rejected", 0U, 0U);
 
     static_assert([] {
         TightBlocks p{};
         const unsigned outputs[] = {2304U, 2304U};
-        return plan_tight_blocks(outputs, 2U, 8U, p) && p.first[1] == 288U && p.first[2] == 576U &&
-               locate(p, 287U).projection == 0U && locate(p, 288U).projection == 1U && locate(p, 288U).block == 0U;
+        return plan_tight_blocks(outputs, 2U, 8U, p) && p.count == 2U && p.first[0] == 0U && p.first[1] == 288U &&
+               p.first[2] == 576U;
     }());
+    {
+        TightBlocks p{};
+        const unsigned outputs[] = {2304U, 2304U};
+        expect(plan_tight_blocks(outputs, 2U, 8U, p), "pair plan", 0U, 0U);
+        expect(locate(p, 287U).projection == 0U && locate(p, 288U).projection == 1U && locate(p, 288U).block == 0U,
+               "pair boundary", 287U, 288U);
+        // A rejected plan leaves the caller's table untouched.
+        const auto before = p;
+        expect(!plan_tight_blocks(zero, 2U, 8U, p) && p.count == before.count && p.first[2] == before.first[2],
+               "rejected plan untouched", 0U, 0U);
+    }
 
     if (failures != 0) return 1;
     std::printf("dense_linear grouped tight rows: every launch block maps to one own block, each own block once "

@@ -429,6 +429,11 @@ At exit the process prints one `strix-route-file/v1 {json}` line on stderr. It h
 the local flips per layer (the arm's own picks against the replayed ones) and the null's nudge count. With no switch
 set, the tap does nothing. Replay needs eager execution; a captured graph is refused.
 
+**Several prompts in one process.** When a path contains `{seq}` (for example `routes/w{seq}.exact.rte`), an engine
+that runs a prompt list calls `route_tap_sequence(i)` before prompt `i`. Each prompt then gets its own file, its own
+counters and its own receipt line, exactly as if it ran in its own process. One model load then serves every window of
+an arm. The gate files each receipt line under its window by the path it names. Without `{seq}` nothing changes.
+
 ```sh
 # option_qual runner output (arms: REF {"routes":{"out":true}}, NULL {"routes":{"in":"REF"},
 #   "env":{"STRIX_MOE_ROUTE_NULL":"0:1"}}, FAST {"routes":{"in":"REF"}}, FASTF / NULLF {"routes":{"out":true}})
