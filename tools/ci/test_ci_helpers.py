@@ -1,5 +1,6 @@
 """Tests of the CI helpers: change classification (ci_changes.py) and unittest sharding (unittest_shard.py)."""
 import pathlib
+import subprocess
 import sys
 import unittest
 
@@ -38,7 +39,8 @@ class Classify(unittest.TestCase):
     def test_hip_inputs(self):
         for path in ('src/core/x.cpp', 'include/strix/a.hpp', 'CMakeLists.txt', 'cmake/StrixDevice.cmake',
                      'src/hip_shared_expert_launcher.hip', 'tests/hip_launcher_tests.cpp',
-                     'lab/uma_residency/hip_residency.hip', '.github/workflows/ci.yml', 'apps/x.cpp'):
+                     'lab/uma_residency/hip_residency.hip', '.github/workflows/ci.yml', 'apps/x.cpp',
+                     'data/devices/profiles.toml'):
             self.check([path], True, True)
 
     def test_non_hip_paths(self):
@@ -46,6 +48,11 @@ class Classify(unittest.TestCase):
                      'tools/strix-gate/x.py', 'scripts/bench/a.sh', 'tests/serve_cycles_tests.py',
                      'lab/transport/tcp.cpp', '.github/workflows/other.yml'):
             self.check([path], True, False)
+
+    def test_codegen_and_scratch_contract_changes_run_hip_ci(self):
+        for path in ('tools/gen_q8_rows_vopd.py', 'tools/gen_ds41_qk_asm.py', 'tools/ci/check_generated_asm.py',
+                     'tools/check_kernel_scratch.py', 'tools/kernel_scratch_allowance.txt'):
+            self.check([path], True, True)
 
 
 class Shard(unittest.TestCase):
@@ -71,6 +78,19 @@ class Shard(unittest.TestCase):
     def test_bad_arguments(self):
         self.assertEqual(unittest_shard.main(['x', 'm', '2', '2']), 2)
         self.assertEqual(unittest_shard.main(['x', 'm']), 2)
+
+
+class Scratch(unittest.TestCase):
+    def test_allowance_requires_decoded_kernel_metadata(self):
+        root = pathlib.Path(__file__).resolve().parents[2]
+        script = root / 'tools/check_kernel_scratch.py'
+        allowance = root / 'tools/kernel_scratch_allowance.txt'
+        for name, expected in (('README.md', 2), ('lab/cross_compile/out/probe.gfx1151.hsaco', 0)):
+            with self.subTest(artifact=name):
+                result = subprocess.run([sys.executable, '-I', '-B', str(script), '--quiet',
+                                         '--allowance', str(allowance), str(root / name)],
+                                        capture_output=True, text=True, timeout=15, check=False)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
 
 if __name__ == '__main__':

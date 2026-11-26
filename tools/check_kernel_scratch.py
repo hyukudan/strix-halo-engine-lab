@@ -379,10 +379,15 @@ def main():
     rows = []
     for f in args.files:
         rows.extend(kernel_rows(f))
-    # The same TU is often linked into several binaries: report each kernel once per (name, private, spills).
+    if args.allowance and not rows:
+        print("SCRATCH CHECK FAIL: no AMDGPU kernel metadata found", file=sys.stderr)
+        return 2
+    # A TU may be linked several times. Keep each distinct allowance or launch-budget observation.
     unique = {}
     for r in rows:
-        unique.setdefault((r["name"], r["private"], r["vgpr_spill"], r["sgpr_spill"], r["vgpr"]), r)
+        key = tuple(r[field] for field in ("name", "private", "dynamic_stack", "vgpr_spill", "sgpr_spill",
+                                          "vgpr", "sgpr", "lds"))
+        unique.setdefault(key, r)
     rows = sorted(unique.values(), key=lambda r: (-r["private"], -r["vgpr_spill"], r["name"]))
 
     nt = nontemporal_loads(args.objdump, rows) if args.nt else {}

@@ -9,8 +9,8 @@
 
 // strix-device-profiles-v1: the catalogue of known device models. A device entry in the declaration names one with
 // `profile = "rtx-5090-32"` and every route sizes itself from it (strix/device/budget.hpp); a cluster of identical
-// devices is `count = N` plus an `interconnect` class. The table in src/device/profiles.cpp is the source of truth;
-// data/devices/profiles.toml is its printed form (catalogue_toml(), checked byte-equal by the host tests).
+// devices is `count = N` plus an `interconnect` class. The built-in profiles come from data/devices/profiles.toml;
+// catalogue_toml() exports those profiles and the shared interconnect rates.
 //
 // Values are vendor public specifications unless `measured` lists the field: peaks are dense (no 2:4 sparsity),
 // in TFLOPS / TOPS, 0 = the format has no tensor path on the device or the vendor does not state it. A profile is a
@@ -34,7 +34,7 @@ struct Profile {
     std::uint32_t pcie_gen = 0, pcie_width = 0; // 0 = integrated (no PCIe link to the host)
     std::string_view host_link;     // "pcie5x16" | "pcie4x16" | "integrated" | "nvlink-c2c"
     bool unified = false;           // device memory is the host memory (integrated APU / superchip)
-    std::string_view measured;      // comma list of fields measured on our own device; "" = all public spec
+    std::string_view measured;      // comma list of measured fields; "" = all public spec
     std::string_view note;
     LowBitRows lowbit_rows{};       // measured q4_g64 / q6_g64 FP16 group-scale schedule
 };
@@ -45,7 +45,7 @@ struct Profile {
 [[nodiscard]] const Profile* find_profile(std::string_view name) noexcept;
 // Comma-separated catalogue names, for refusals ("unknown profile x; known: a, b, ...").
 [[nodiscard]] std::string profile_names();
-// The data file (data/devices/profiles.toml): one [profiles.<name>] table per entry.
+// CLI export of the catalogue: one [profiles.<name>] table per entry.
 [[nodiscard]] std::string catalogue_toml();
 
 // Interconnect classes for N identical devices (`interconnect = "pcie5x16"`): nominal one-direction GB/s and round

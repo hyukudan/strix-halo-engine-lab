@@ -21,6 +21,7 @@ on:
       - 'src/spec/**'
       - 'src/vision/**'
       - 'include/strix/**'
+      - 'data/devices/**'
       - 'cmake/**'
       - 'CMakeLists.txt'
       - 'tests/backend_workflow_paths_tests.py'

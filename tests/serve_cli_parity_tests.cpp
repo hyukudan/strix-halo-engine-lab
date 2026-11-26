@@ -340,6 +340,28 @@ void ds41() {
         gate(std::string("ds41+preset+") + profile, native, preset, allowed);
         check(preset.at("arg:--slots") == "8", "ds41: serve uses the resolved eight slots");
     }
+    {
+        pd::Probe with_draft = probe;
+        with_draft.list = [](const std::string& dir) {
+            if (dir != "/md") return std::vector<std::string>{};
+            return std::vector<std::string>{"z-DSpark-MXFP4.gguf", "a-DSpark-MXFP4.gguf", "unrelated.gguf"};
+        };
+        const auto draft_args = [&](pd::App app, bool opt_out) {
+            std::vector<std::string> args{model, "--rank", "0", "--transport", "usb4auto", "--profile", "fast"};
+            if (opt_out) args.emplace_back("--no-dspark");
+            const auto resolved = pd::resolve(app, args, [](const char*) -> const char* { return nullptr; },
+                                              with_draft, pd::Build{true});
+            return sp::from_args(std::span<const std::string>(resolved.args).subspan(1));
+        };
+        const auto served = draft_args(pd::App::serve, false);
+        const auto draft = served.find("arg:--dspark");
+        check(draft != served.end() && draft->second == "/md/a-DSpark-MXFP4.gguf",
+              "ds41: serve discovers the first eligible draft beside the target");
+        check(!draft_args(pd::App::serve, true).contains("arg:--dspark"),
+              "ds41: the server opt-out suppresses discovery");
+        check(!draft_args(pd::App::rank, false).contains("arg:--dspark"),
+              "ds41: automatic DSpark discovery applies only to serve");
+    }
     namespace ds = strix::deepseek41;
     ds::PrefillOptions measured;
     measured.world = 2;

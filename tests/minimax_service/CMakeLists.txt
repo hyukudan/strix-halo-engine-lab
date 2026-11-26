@@ -4,6 +4,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     include(CTest)
     get_filename_component(REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
     add_subdirectory("${REPO_ROOT}/tests/session_runtime" shared)
+    include("${REPO_ROOT}/cmake/StrixDevice.cmake")
     add_library(strix_lookup STATIC "${REPO_ROOT}/src/lookup/index.cpp")
     target_include_directories(strix_lookup PUBLIC "${REPO_ROOT}/include")
     target_compile_features(strix_lookup PUBLIC cxx_std_20)
@@ -19,15 +20,13 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         "${REPO_ROOT}/src/deploy/plan.cpp"
         "${REPO_ROOT}/src/deploy/link.cpp"
         "${REPO_ROOT}/src/deploy/route.cpp"
-        "${REPO_ROOT}/src/device/declaration.cpp"
-        "${REPO_ROOT}/src/device/profiles.cpp"
         "${REPO_ROOT}/src/minimax/serve/minimax_api.cpp"
         "${REPO_ROOT}/src/minimax/serve/minimax_observe.cpp"
         "${REPO_ROOT}/src/minimax/serve/minimax_chat.cpp"
         "${REPO_ROOT}/src/minimax/serve/minimax_tokenizer.cpp")
     target_include_directories(minimax_service_host PUBLIC "${REPO_ROOT}/include" "${REPO_ROOT}/src")
     target_compile_features(minimax_service_host PUBLIC cxx_std_20)
-    target_link_libraries(minimax_service_host PUBLIC strix_session_runtime strix_lookup)
+    target_link_libraries(minimax_service_host PUBLIC strix_session_runtime strix_lookup strix_device)
     add_library(strix_minimax_session_service STATIC
         "${REPO_ROOT}/src/minimax/serve/session_service.cpp"
         "${REPO_ROOT}/src/minimax/serve/serve_runtime.cpp")

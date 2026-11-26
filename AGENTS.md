@@ -220,7 +220,7 @@ Use each engine's built-in exactness gates and compare complete token IDs and lo
 Qwen: profile-pair qualification and operator byte checks; DeepSeek pair: both-rank prefill/greedy/verify/batch
 and transport gates; RTX: replica canonical/pressure/plain-speculative chat gates; MiniMax: golden logits,
 decode/verify/exchange checks; GLM: G3/G4, identity, prefill and speculative-oracle gates.
-Once the bench kit lands, inspect availability and run:
+Use the checked-in bench kit to discover engine availability and run:
 
 ```sh
 bash scripts/bench/bench.sh list
@@ -228,8 +228,8 @@ bash scripts/bench/bench.sh check --engine E --only exactness --suite quick --js
 bash scripts/bench/bench.sh run --engine E --only exactness --suite quick --json
 ```
 
-Use the engine key reported by `list`. Verdicts are `EXACT`, `MISMATCH` and `NO-REFERENCE`;
-missing reference data is not an exactness pass. Do not assume the planned kit is installed today.
+Use an engine key reported as available by `list`. Verdicts are `EXACT`, `MISMATCH` and `NO-REFERENCE`;
+missing reference data is not an exactness pass. A `pending-publication` engine reports a skipped run.
 
 For A/B, change one off switch at a time, preserve model/profile/state/capacity, restart startup-cached
 readers and both ranks as needed, verify tokens/digests first, then compare medians from interleaved runs.

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Common-core layering guard with a ratchet allow-list (AGENTS.md "Shared code first", "Adding a model").
 
-Rules (counted per file over tracked sources under src/ and include/; apps/, tests/ and tools/ are composition roots
-and test code, not checked):
+Rules (counted per file over tracked sources under src/ and include/; apps/ is a composition root checked for
+raw-getenv and spin-wait):
   model-include  shared code includes a header that belongs to one model
   cross-model    a file of one model includes a header of another model
   tu-include     a source includes another translation unit (.cpp / .cc / .cu / .hip)
@@ -32,6 +32,7 @@ import subprocess
 import sys
 
 ROOT_DIRS = ("src/", "include/")
+APP_DIR = "apps/"
 SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".h", ".hpp", ".cu", ".cuh", ".hip", ".inc", ".inl"}
 TU_SUFFIXES = {".c", ".cc", ".cpp", ".cu", ".hip"}
 ALIASES = {"ds41": "deepseek41", "deepseek41": "deepseek41", "glm": "glm", "minimax": "minimax", "mmx": "minimax",
@@ -137,10 +138,16 @@ def scan(files, read):
             counts[(rule, path)] = counts.get((rule, path), 0) + k
 
     for path in sorted(files):
-        if not path.startswith(ROOT_DIRS) or pathlib.PurePosixPath(path).suffix not in SOURCE_SUFFIXES:
+        if not path.startswith((*ROOT_DIRS, APP_DIR)) or pathlib.PurePosixPath(path).suffix not in SOURCE_SUFFIXES:
             continue
         raw = read(path)
         if raw is None:
+            continue
+        code = strip_comments(raw)
+        if path not in ENV_HOMES:
+            add("raw-getenv", path, len(GETENV_RE.findall(code)))
+        add("spin-wait", path, len(SPIN_RE.findall(code)))
+        if path.startswith(APP_DIR):
             continue
         mine = model_of(path)
         for target in INCLUDE_RE.findall(strip_comments(raw, keep_strings=True)):
@@ -154,12 +161,8 @@ def scan(files, read):
                 add("model-include", path)
             elif theirs is not None and mine is not None and theirs != mine:
                 add("cross-model", path)
-        code = strip_comments(raw)
         if mine is not None:
             add("model-kernel", path, len(KERNEL_RE.findall(code)))
-        if path not in ENV_HOMES:
-            add("raw-getenv", path, len(GETENV_RE.findall(code)))
-        add("spin-wait", path, len(SPIN_RE.findall(code)))
     return counts
 
 
@@ -201,7 +204,8 @@ def format_allowlist(counts):
 
 
 def git_files():
-    out = subprocess.run(["git", "ls-files", "-z", "--", "src", "include"], check=True, capture_output=True).stdout
+    out = subprocess.run(["git", "ls-files", "-z", "--", "src", "include", "apps"],
+                         check=True, capture_output=True).stdout
     return [x.decode() for x in out.split(b"\0") if x]
 
 

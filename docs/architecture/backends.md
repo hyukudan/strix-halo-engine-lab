@@ -4,8 +4,7 @@ The engine is modular by device, in three layers:
 
 1. **Shared, model-agnostic logic**: graph, session, serve, xport, spec, policies, identities, and
    the arithmetic contracts of every operator (host references in `src/ops`, `include/strix/*_formats.hpp`).
-2. **One backend per vendor or device kind** (HIP, CUDA, CPU; NPU later) implementing the same core
-   interfaces below.
+2. **One backend per vendor or device kind** implementing the shared core interfaces below.
 3. **Architecture specialisations** inside a backend (gfx1151 WMMA, sm_120 tensor cores,
    AVX-512/AMX, NEON/SVE), selected by capability, never by model.
 
@@ -31,7 +30,7 @@ with no vendor include; the vendor body lives in the backend tree.
 
 ## The backend interface
 
-Every backend implements the operations below. Each one is defined by its **arithmetic contract**
+The operations below describe the backend contract. Each one is defined by its **arithmetic contract**
 (operation order, rounding points), so any two backends that claim the same contract give the same
 bits, and the host reference is the oracle.
 
@@ -81,12 +80,29 @@ it does not register as an exact replacement for an existing dense identity.
 Caller-owned workspace and capability selection follow the memory/stream contract
 above. Model adapters and complete-workload qualification remain pending.
 
+## Experimental Intel, Vulkan and Metal backends
+
+- **Intel SYCL / Level Zero** provides operator references and host-managed model
+  references when built with oneAPI. The dedicated Gemma 4 E4B Q8_0 decode and
+  serve executables offer `--backend intel` without a drafter. That path uses
+  synchronous transfers for operator inputs and results and a resident cache for
+  Q8_0 weights. The Hy4 reference CLI exposes a hybrid Intel projection path.
+  Both model references are pending hardware qualification.
+- **Vulkan and Metal** provide RMSNorm operator references. Each call stages the
+  input and waits for completion. These backends have no model execution plan.
+  The Vulkan adapter uses the Linux Vulkan loader.
+
+The shared `strix-serve --backend` interface offers HIP and CUDA.
+
 ## CPU backend
 
 Tree: `src/cpu/core` (interface binding, scalar exact reference, capability detection and
 selection), `src/cpu/arch/avx512` (AVX-512 BW/VNNI, AMX int8), `src/cpu/arch/neon` (NEON
-dotprod/i8mm, SVE). AVX2 joins as `src/cpu/arch/avx2` when needed. Build option
-`STRIX_BACKEND_CPU` (default OFF); nothing else depends on it.
+dotprod/i8mm, SVE). The `STRIX_BACKEND_CPU` option (default OFF) builds the shared CPU
+operator library and its fixtures. The Qwen CUDA build also links this library for its
+tiered routed-expert executor. That executor uses a worker pool, a separate AVX2 path
+and exp lookup tables to reproduce the target device arithmetic. The scalar operator
+table and the dedicated model host references have their own dispatch paths.
 
 - **Memory**: host memory is the device memory. Weights are used in place from the mapped model
   file (Q8_0 blocks are 34 bytes, so rows are read unaligned; a repack to 64-byte rows follows

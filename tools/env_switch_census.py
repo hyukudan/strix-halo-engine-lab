@@ -11,7 +11,7 @@ Every switch read from the environment is one of:
   * a switch has more raw read sites than in the baseline (tools/env_switch_baseline.txt). Use
     env_flags.hpp or a declared switch to introduce another read;
   * one boolean switch is read through the governed helpers with two different defaults.
-Decreased site counts are reported and lowered with --update.
+Decreased site counts also fail until the baseline is lowered with --update.
 --grandfather NAME... explicitly admits pre-introduction raw reads; never use it in the CMake test.
 
 --self-test runs the scanner on its fixtures (positive and negative).
@@ -300,7 +300,7 @@ def main() -> int:
     if stale:
         print(f"env switch census: {len(stale)} switches have fewer raw reads; "
               f"run tools/env_switch_census.py --update", file=sys.stderr)
-    if failed:
+    if failed or stale:
         return 1
     print(f"env switch census: ok ({len(raw)} raw switches, no site count increased; {len(set(governed) - set(raw))} governed)")
     return 0

@@ -68,6 +68,8 @@ include("${STRIX_ROOT}/cmake/StrixStateCache.cmake")
 target_link_libraries(strix-cluster-serve-cli-parity-tests PRIVATE strix_state_cache)
 target_compile_definitions(strix-cluster-serve-cli-parity-tests PRIVATE
     STRIX_PARITY_GLM=1 STRIX_PARITY_MINIMAX=1 STRIX_PARITY_DS41=1)
+set_tests_properties(strix-cluster-serve-cli-parity-tests PROPERTIES
+    FAIL_REGULAR_EXPRESSION "skipped: (glm|minimax|ds41)")
 
 profile_host_test(strix-job-sampling-tests "${STRIX_ROOT}/tests/job_sampling_tests.cpp"
     "${STRIX_ROOT}/src/token_sampling.cpp" "${STRIX_ROOT}/src/speculation_rng.cpp")

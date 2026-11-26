@@ -81,8 +81,9 @@ line and `/api/status` show `profile=` and the budget only when one is declared.
 
 Vendor public specifications unless the `measured` column lists the field. Peaks are dense TFLOPS / TOPS (FP16 and
 FP8 at the FP16-accumulate rate; GeForce cards run BF16 at half that rate); 0 = no tensor path or not stated. Memory
-for NVIDIA cards is the total the runtime reports. The data file is [data/devices/profiles.toml](../data/devices/profiles.toml)
-(`strix-device-plan --toml`).
+for NVIDIA cards is the total the runtime reports. The build embeds the profiles from
+[data/devices/profiles.toml](../data/devices/profiles.toml). Run `strix-device-plan --toml` to export
+the built-in profiles with the interconnect classes.
 
 | profile | arch | memory GiB | GB/s | units | FP32 | FP16 | BF16 | FP8 | FP4 | INT8 | host link | measured |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
