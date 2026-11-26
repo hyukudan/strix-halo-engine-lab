@@ -77,6 +77,7 @@ class Shard(unittest.TestCase):
 
     def test_bad_arguments(self):
         self.assertEqual(unittest_shard.main(['x', 'm', '2', '2']), 2)
+        self.assertEqual(unittest_shard.main(['x', 'm']), 2)
 
 
 class Scratch(unittest.TestCase):
@@ -90,7 +91,6 @@ class Scratch(unittest.TestCase):
                                          '--allowance', str(allowance), str(root / name)],
                                         capture_output=True, text=True, timeout=15, check=False)
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
-        self.assertEqual(unittest_shard.main(['x', 'm']), 2)
 
 
 if __name__ == '__main__':
