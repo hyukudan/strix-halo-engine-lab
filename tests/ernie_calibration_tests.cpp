@@ -1,5 +1,6 @@
 #include "strix/ernie/calibration.hpp"
 
+#include "core/multimax_reference.hpp"
 #include "moe_core/reference.hpp"
 #include "strix/ernie/inventory.hpp"
 #include "strix/serve/json.hpp"
@@ -167,6 +168,22 @@ void logits_test() {
     rejects([&] { static_cast<void>(ernie::compare_logits(a, nonfinite)); }, "nonfinite logits accepted");
 }
 
+void multimax_test() {
+    const std::array ranges{-1.5078125F, 3.75F, -2.125F, 6.125F};
+    const std::array strengths{0.31640625F, -0.2265625F, 0.07177734375F, -0.048095703125F};
+    const std::array expected{-1.53125F, -1.9296875F, -1.921875F, -1.5078125F, 1.0F,
+                              3.75F, 5.59375F, 6.5F};
+    std::array logits{-12.25F, -2.125F, -2.109375F, -1.5078125F, 1.00390625F, 3.75F, 6.125F, 7.4375F};
+    strix::core::multimax_bf16_reference(logits, ranges, strengths);
+    check(logits == expected, "MultiMax thresholds, input tie, or intermediate BF16 stores");
+
+    const auto inf = std::numeric_limits<float>::infinity();
+    std::array nonfinite{std::numeric_limits<float>::quiet_NaN(), inf, -inf};
+    strix::core::multimax_bf16_reference(nonfinite, ranges, strengths);
+    check(std::ranges::all_of(nonfinite, [](float value) { return std::isnan(value); }),
+          "MultiMax must propagate NaN and preserve infinity arithmetic");
+}
+
 }  // namespace
 
 int main() {
@@ -181,6 +198,7 @@ int main() {
             check_override<wei::sp::SP2Storage>(checkpoint, dir / "sp2.pack", wei::kSP2WeightStorage);
             check_override<wei::sp::SP3Storage>(checkpoint, dir / "sp3.pack", wei::kSP3WeightStorage);
             logits_test();
+            multimax_test();
         } catch (...) {
             std::filesystem::remove_all(dir);
             throw;
