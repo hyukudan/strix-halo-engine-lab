@@ -76,6 +76,8 @@ struct BatchSpeculator::Slots {
     float* staging = nullptr;                          // [count][stage_rows][main_width]
     std::vector<std::uint32_t> staged;                 // rows staged per slot
     std::vector<std::vector<std::uint32_t>> context;   // committed tokens not yet in the slot's draft vocabulary
+    // The cooperative callback completes both transfers before the next exchange.
+    std::vector<std::byte> coop_out, coop_in;
     ~Slots() {
         if (staging) (void)hipFree(staging);
     }
@@ -392,7 +394,10 @@ ds::Draft BatchSpeculator::coop_draft(std::uint32_t slot, std::uint32_t token) {
     // (STRIX_DS41_DSPARK_MARKOV=cand, once per draft) in exchanges of at most 64 KiB (the control channel's limit)
     drafter_.set_rank(options_.rank, 2U, [this](void* stream, const void* local, void* remote, std::size_t bytes) {
         constexpr std::size_t chunk = std::size_t{64} << 10U;
-        std::vector<std::byte> o(std::max(bytes, round_bytes)), i(o.size());
+        auto& o = slots_->coop_out;
+        auto& i = slots_->coop_in;
+        o.assign(std::max(bytes, round_bytes), std::byte{});
+        i.assign(o.size(), std::byte{});
         check(hipMemcpyAsync(o.data(), local, bytes, hipMemcpyDeviceToHost, static_cast<hipStream_t>(stream)), "coop candidate");
         check(hipStreamSynchronize(static_cast<hipStream_t>(stream)), "coop candidate");
         for (std::size_t off = 0; off < o.size(); off += chunk) {
