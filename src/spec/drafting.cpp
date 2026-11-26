@@ -160,6 +160,8 @@ Arbiter::Arbiter(ArbiterConfig config) : config_(std::move(config)) {
         throw std::invalid_argument("arbiter: switch_in >= 1, half_life_tokens > 0, cost_weight_cap >= 1, aging in (0, 1], "
                                     "frontier_loss >= 0, retreat_horizon >= 0, cost_fit_half_life > 0, cost_fit_ridge > 0, "
                                     "row_kv_ms_per_kpos in [0, 10], cost_fit_condition 0 or >= 1");
+    if (!(config_.probe_loss >= 0.0 && config_.probe_loss < 1.0))
+        throw std::invalid_argument("arbiter: probe_loss in [0, 1)");
     if (config_.mode == ArbiterMode::ChanceWindow) config_.chance_window.validate(w.back());
     for (auto& c : cost_) { c.ms.assign(w.back() + 1, 0.0); c.weight.assign(w.back() + 1, 0.0); c.seed.assign(w.back() + 1, 0.0); }
 }
@@ -768,7 +770,12 @@ Decision Arbiter::decide(const StepInput& input) {
             const double tw = expected(Source::model, 0, kw), mw = verify_ms(rw, ctx) + draft_ms(kw);
             if (k == 0 || !charge || mw - tw * pick_ms_per_token <= budget) { k = kw; rows = rw; tokens = tw; ms = mw; }
         }
-        if (k > 0) {
+        // ArbiterConfig::probe_loss: a re-probe waits until its priced excess is within probe_loss of the pick's ms over
+        // the passes since the last model pass (the first measurements, min_model_passes, never wait).
+        const double excess = charge ? ms - tokens * pick_ms_per_token : 0.0;
+        const bool due = !charge || !(config_.probe_loss > 0.0) || model_passes_ < config_.min_model_passes ||
+                         excess <= config_.probe_loss * double(passes_ - last_model_) * d.expected_ms;
+        if (k > 0 && due) {
             d = Decision{Source::model, k, rows, rows > k + 1, tokens, ms, true};
             model_barred_until_ = 0;
         }

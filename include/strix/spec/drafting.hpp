@@ -117,6 +117,14 @@ struct ArbiterConfig {
     // context where serial wins (K/V-priced verify rows) never pays an unpriced deep pass (128K, k 15: ~8 serial passes).
     // false = the previous form (always the deepest legal window). Drafts never change emitted tokens.
     bool charge_probe = true;
+    // Charged re-probe interval (charge_probe, learned drafter that is not the pick): a re-probe whose priced excess over
+    // the pick is E waits until E <= probe_loss x the pick's ms over the passes since the last model pass (at least
+    // probe_every), so the re-probes of a drafter that loses cost at most probe_loss of decode time (plus one excess per
+    // run), while a drafter near break-even (E ~ 0) is re-probed every probe_every passes as before. The bound rests on
+    // learned prices: an excess the estimate understates is learned by the probe itself. 0 = the fixed probe_every
+    // interval. Measured cause: on prose the fixed 32-pass probes alone cost 4.6 % (closed-loop trace of the CUDA
+    // Inkling 2 Mini walls, spec_drafting_tests honest_plain_price_tests).
+    double probe_loss = 0.02;
     // Priced exploration (learned per-depth drafter; replaces the deepest-window choice of charge_probe when true):
     // - a probe never moves the arm hysteresis (switch_in): leaving serial needs the estimate, not a probe's side effect.
     //   Measured: each deep probe left the arbiter on a k = 3 window that tied serial (1.002x priced) for 43 of 187 passes;
