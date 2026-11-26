@@ -4,10 +4,12 @@
 //      max / 127, fminf/fmaxf clamp), for every reduction order the HIP writer can use.
 //   2. Non-finite rows (NaN, +-Inf, NaN payloads, finite values whose BF16 rounding overflows): scale NaN, codes 0,
 //      status raised, every feature decodes to NaN; the v1 statements are shown to encode a finite wrong value.
+//   4. The split-K row plan as data and the KV bytes one decode step reads per form (the slot / bandwidth arithmetic).
 //   3. Extreme finite scales and long accumulations: per-feature error bounds of both forms and the FP32 error of a
 //      64K-position value sum read through each form.
 #include "strix/attn/cache_shadow.hpp"
 #include "strix/attn/kv_int8_token.hpp"
+#include "strix/attn/split_decode_plan.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -268,6 +270,34 @@ void long_accumulation(std::mt19937& rng) {
                 worst_tok, bound_tok, worst_g16, bound_g16, worst_fp32);
 }
 
+// Split-K plan data (the Gemma global-layer plan: dim 512, 128-key tiles, 256 lanes, 8 heads / 2 KV heads, 64K) and the
+// bytes-per-token arithmetic of the forms.
+void plan_and_bytes() {
+    using strix::attn::SplitDecodePlan;
+    using F = cs::Form;
+    constexpr SplitDecodePlan plan{.dim = 512, .tile = 128, .threads = 256, .group = 4, .heads = 8, .kv_heads = 2,
+                                   .max_positions = 65536};
+    static_assert(plan.valid() && plan.partial_floats() == 2056U && plan.max_tiles() == 512U);
+    for (std::uint32_t rows : {1U, 3U, 8U})
+        for (std::uint32_t stride : {64U, 128U, 8192U, 65536U}) {
+            const std::size_t tiles = (std::size_t(stride) + 127U) / 128U;
+            const std::size_t old_formula = std::size_t(rows) * (8U * 512U + 2U * tiles * 2056U) * sizeof(float);
+            expect(plan.scratch_bytes(rows, stride) == old_formula, "plan scratch == the kernel's formula", stride);
+        }
+    SplitDecodePlan bad = plan;
+    bad.tile = 96;
+    expect(!bad.valid(), "plan rejects a tile that is not a multiple of 64");
+    // 7 global layers read 2 KV heads x 512 per position: FP32 57,344 B, kv8 16,128 B, f16 28,672 B.
+    expect(strix::attn::kv_read_bytes(F::none, 1U, 2U, 512U, 7U) == 57344U, "FP32 bytes per position");
+    expect(strix::attn::kv_read_bytes(F::kv8, 1U, 2U, 512U, 7U) == 16128U, "kv8 bytes per position");
+    expect(strix::attn::kv_read_bytes(F::f16, 1U, 2U, 512U, 7U) == 28672U, "f16 bytes per position");
+    expect(strix::attn::kv_read_bytes(F::none, 65280U, 2U, 512U, 7U) == 3743416320ULL, "FP32 bytes at 65,280");
+    expect(strix::attn::kv_read_bytes(F::kv8, 65280U, 2U, 512U, 7U) == 1052835840ULL, "kv8 bytes at 65,280");
+    // Resident shadow of a 64K slot: 4 global producer layers.
+    expect(4U * cs::shadow_bytes(F::kv8, 65536U, 1024U) == 603979776ULL, "kv8 shadow of a 64K slot");
+    expect(cs::shadow_bytes(F::none, 65536U, 1024U) == 0U, "no shadow for the master form");
+}
+
 }  // namespace
 
 int main() {
@@ -277,6 +307,7 @@ int main() {
     int8g16_domain();
     error_bounds(rng);
     long_accumulation(rng);
+    plan_and_bytes();
     if (failures != 0) {
         std::printf("attn-kv8-numeric: %d failures\n", failures);
         return 1;

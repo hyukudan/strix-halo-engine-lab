@@ -36,6 +36,27 @@ namespace strix::attn::cache_shadow {
 inline constexpr unsigned flag_nonfinite = 1U, flag_tag = 2U, flag_overflow = 4U;
 inline constexpr unsigned group = 16U;  // Int8G16 features per scale
 
+// KV-format trait of a shadow reader (src/attn_core/shadow_kv_read.hpp): none = read the FP32 master, f16 = F16 form,
+// kv8 = Int8G16 form.
+enum class Form : std::uint32_t { none = 0, f16 = 1, kv8 = 2 };
+// Read descriptor of one shadow layer: K and V planes [admitted][width] (halves or codes), Int8G16 scales
+// [admitted][width / group] per plane, rows [0, mirrored) valid (newer rows are converted from the master by the
+// reader with the same encode).
+struct ShadowRead {
+    const void* k = nullptr;
+    const void* v = nullptr;
+    const std::uint16_t* k_scale = nullptr;
+    const std::uint16_t* v_scale = nullptr;
+    std::uint64_t mirrored = 0;
+    std::uint32_t width = 0;
+    std::uint32_t format = 0;  // Form
+};
+// Shadow bytes of `rows` positions of one layer (K and V planes, scales included).
+constexpr std::uint64_t shadow_bytes(Form f, std::uint64_t rows, std::uint32_t width) {
+    const std::uint64_t elements = 2ULL * rows * width;
+    return f == Form::f16 ? 2ULL * elements : f == Form::kv8 ? elements + 2ULL * (elements / group) : 0ULL;
+}
+
 // A half whose exponent field is all ones (infinity or NaN).
 STRIX_CS_HD inline bool half_special(std::uint16_t bits) { return (bits & 0x7c00U) == 0x7c00U; }
 STRIX_CS_HD inline bool finite(float x) { return (__builtin_bit_cast(std::uint32_t, x) & 0x7f800000U) != 0x7f800000U; }
