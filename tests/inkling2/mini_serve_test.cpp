@@ -415,8 +415,10 @@ void profile_parity() {
     std::optional<mini::MiniServeOptions> loaded;
     const auto create = [&](const mini::MiniServeOptions& options) {
         loaded = options;
+        // The load admits the requested served route (no chunk ladder fallback in this fixture).
         return mini::MiniServeCohort{
-            std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(), 32U, 3U, 2U), {}, {}, 0U};
+            std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(), 32U, 3U, 2U), {}, {}, 0U,
+            sv::kMixedServiceShortPieces, options.served_cli_route};
     };
     sv::ServiceFactories factories;
     mini::install_mini_service(factories, {create, create},

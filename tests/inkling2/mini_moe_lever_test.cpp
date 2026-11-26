@@ -837,8 +837,10 @@ void test_served_route() {
             // The command line's resolution: the request stays visible on its own line, never as an effective lever.
             auto cli = resolution;
             mini::mini_cli_decline_served_route(cli);
-            require(!mini::mini_served_cli_route(cli) && cli.qualification() == "qualified" &&
-                        cli.summary().find("served-cli-route") == std::string::npos,
+            const auto* declined = cli.find(mini::kMiniServedCliRoute);
+            require(declined != nullptr && declined->value == lever->builtin &&
+                        (declined->status == profile::Status::builtin || declined->status == profile::Status::off) &&
+                        cli.qualification() == "qualified" && cli.summary().find("served-cli-route") == std::string::npos,
                     "served route: the command line's summary and qualification carry no server-only setting");
             require(mini::mini_served_route_cli_line(cli) ==
                         std::string("strix-served-route/v1 requested ") + (on ? "1" : "0") +
