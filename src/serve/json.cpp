@@ -150,9 +150,10 @@ std::string Json::dump_spaced() const { std::string out; write(out, true); retur
 namespace {
 class Parser {
 public:
-    Parser(std::string_view text, bool unique, std::size_t max_values) : unique_(unique), max_values_(max_values), text_(text) {}
+    Parser(std::string_view text, bool unique, std::size_t max_values, const JsonAssetPolicy* asset = nullptr)
+        : unique_(unique), max_values_(max_values), text_(text), asset_(asset) {}
     Json document() {
-        if (unique_) validate_utf8();
+        if (unique_ && !asset_) validate_utf8();
         auto value = parse(0);
         skip();
         if (at_ != text_.size()) fail("trailing characters after the JSON value");
@@ -160,25 +161,29 @@ public:
     }
 private:
     [[noreturn]] void fail(const char* what) const {
+        if (asset_) throw std::runtime_error(std::string(asset_->structural_error));
         throw JsonError(std::string("JSON parse error at byte ") + std::to_string(at_) + ": " + what);
     }
-    void validate_utf8() const {
-        for (std::size_t i = 0; i < text_.size();) {
-            const auto c = static_cast<unsigned char>(text_[i++]);
-            if (c < 0x80U) continue;
-            unsigned count = 0, cp = 0, minimum = 0;
-            if (c >= 0xC2U && c <= 0xDFU) { count = 1; cp = c & 0x1FU; minimum = 0x80U; }
-            else if (c >= 0xE0U && c <= 0xEFU) { count = 2; cp = c & 0x0FU; minimum = 0x800U; }
-            else if (c >= 0xF0U && c <= 0xF4U) { count = 3; cp = c & 0x07U; minimum = 0x10000U; }
-            else fail("invalid UTF-8");
-            if (count > text_.size() - i) fail("truncated UTF-8");
-            while (count--) {
-                const auto next = static_cast<unsigned char>(text_[i++]);
-                if ((next & 0xC0U) != 0x80U) fail("invalid UTF-8 continuation");
-                cp = (cp << 6U) | (next & 0x3FU);
-            }
-            if (cp < minimum || cp > 0x10FFFFU || (cp >= 0xD800U && cp <= 0xDFFFU)) fail("invalid UTF-8 scalar");
+    std::size_t utf8_width(std::size_t at) const {
+        const auto start = at;
+        const auto c = static_cast<unsigned char>(text_[at++]);
+        if (c < 0x80U) return 1;
+        unsigned count = 0, cp = 0, minimum = 0;
+        if (c >= 0xC2U && c <= 0xDFU) { count = 1; cp = c & 0x1FU; minimum = 0x80U; }
+        else if (c >= 0xE0U && c <= 0xEFU) { count = 2; cp = c & 0x0FU; minimum = 0x800U; }
+        else if (c >= 0xF0U && c <= 0xF4U) { count = 3; cp = c & 0x07U; minimum = 0x10000U; }
+        else fail("invalid UTF-8");
+        if (count > text_.size() - at) fail("truncated UTF-8");
+        while (count--) {
+            const auto next = static_cast<unsigned char>(text_[at++]);
+            if ((next & 0xC0U) != 0x80U) fail("invalid UTF-8 continuation");
+            cp = (cp << 6U) | (next & 0x3FU);
         }
+        if (cp < minimum || cp > 0x10FFFFU || (cp >= 0xD800U && cp <= 0xDFFFU)) fail("invalid UTF-8 scalar");
+        return at - start;
+    }
+    void validate_utf8() const {
+        for (std::size_t i = 0; i < text_.size();) i += utf8_width(i);
     }
     void skip() {
         while (at_ < text_.size() && (text_[at_] == ' ' || text_[at_] == '\t' || text_[at_] == '\n' || text_[at_] == '\r')) ++at_;
@@ -189,7 +194,7 @@ private:
         return true;
     }
     Json parse(unsigned depth) {
-        if (depth > 128U) fail("nesting is too deep");
+        if (depth > 128U || (asset_ && depth > asset_->max_depth)) fail("nesting is too deep");
         if (++values_ > max_values_) fail("too many values");
         skip();
         if (at_ >= text_.size()) fail("unexpected end of input");
@@ -203,11 +208,7 @@ private:
             for (;;) {
                 skip();
                 if (at_ >= text_.size() || text_[at_] != '"') fail("expected an object key");
-                auto key = string();
-                skip();
-                if (at_ >= text_.size() || text_[at_] != ':') fail("expected ':'");
-                ++at_;
-                auto value = parse(depth + 1U);
+                auto key = read_string();
                 // A repeated key replaces the value in place (or fails the unique parser). Large objects index their
                 // keys: a linear scan per member made them quadratic.
                 std::size_t found = members.size();
@@ -216,6 +217,11 @@ private:
                 } else {
                     for (std::size_t i = 0; i < members.size(); ++i) if (members[i].first == key) { found = i; break; }
                 }
+                if (asset_ && found != members.size()) fail("duplicate object key");
+                skip();
+                if (at_ >= text_.size() || text_[at_] != ':') fail("expected ':'");
+                ++at_;
+                auto value = parse(depth + 1U);
                 if (found != members.size()) {
                     if (unique_) fail("duplicate object key");
                     members[found].second = std::move(value);
@@ -244,7 +250,13 @@ private:
                 fail("expected ',' or ']'");
             }
         }
-        if (c == '"') return Json(string());
+        if (c == '"') return Json(read_string());
+        if (asset_) {
+            const auto start = at_;
+            while (at_ < text_.size() && std::string_view(",]} \r\n\t").find(text_[at_]) == std::string_view::npos)
+                ++at_;
+            return strict_lexeme(start);
+        }
         if (literal("true")) return Json(true);
         if (literal("false")) return Json(false);
         if (literal("null")) return Json();
@@ -288,6 +300,28 @@ private:
             out.push_back(static_cast<char>(0x80U | ((cp >> 6U) & 0x3FU))); out.push_back(static_cast<char>(0x80U | (cp & 0x3FU)));
         }
     }
+    Json strict_lexeme(std::size_t start) const {
+        return Parser(text_.substr(start, at_ - start), true, std::numeric_limits<std::size_t>::max()).document();
+    }
+    std::string read_string() {
+        if (!asset_) return string();
+        // Copy unescaped vocabulary strings in one pass. Escaped strings go
+        // through the strict decoder with diagnostics relative to the lexeme.
+        const auto start = at_++;
+        bool escaped = false;
+        while (at_ < text_.size()) {
+            const auto c = static_cast<unsigned char>(text_[at_]);
+            if (c < 0x20U) fail("control character in string");
+            if (c == '"') {
+                const auto end = at_++;
+                if (escaped) return strict_lexeme(start).as_string();
+                return std::string(text_.substr(start + 1U, end - start - 1U));
+            }
+            if (c == '\\') { escaped = true; at_ += 2U; }
+            else at_ += utf8_width(at_);
+        }
+        fail("unterminated string");
+    }
     std::string string() {
         ++at_; // opening quote
         std::string out;
@@ -330,6 +364,7 @@ private:
     std::size_t max_values_;
     std::size_t values_ = 0;
     std::string_view text_;
+    const JsonAssetPolicy* asset_;
     std::size_t at_ = 0;
 };
 }  // namespace
@@ -339,6 +374,10 @@ Json parse_json_unique(std::string_view text) { return Parser(text, true, std::n
 Json parse_json_unique(std::string_view text, std::size_t max_bytes, std::size_t max_values) {
     if (text.size() > max_bytes) throw JsonError("JSON byte limit exceeded");
     return Parser(text, true, max_values).document();
+}
+
+Json parse_json_asset(std::string_view text, const JsonAssetPolicy& policy) {
+    return Parser(text, true, std::numeric_limits<std::size_t>::max(), &policy).document();
 }
 
 Json parse_json(std::string_view text) { return Parser(text, false, std::numeric_limits<std::size_t>::max()).document(); }

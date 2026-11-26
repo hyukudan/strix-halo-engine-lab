@@ -12,19 +12,19 @@
 #include <queue>
 #include <stdexcept>
 #include <unordered_map>
-#include <unordered_set>
 
 namespace strix::gemma4::serve {
 namespace {
 using strix::serve::Json;
 constexpr std::string_view space_marker = "\xE2\x96\x81";
+constexpr strix::serve::JsonAssetPolicy asset_json{63, "gemma4 tokenizer: unsupported or invalid asset contract"};
 const Json& field(const Json& j, std::string_view key) {
     const auto* p = j.find(key);
     if (!p) throw std::runtime_error("gemma4 tokenizer: missing " + std::string(key));
     return *p;
 }
 void require(bool ok) {
-    if (!ok) throw std::runtime_error("gemma4 tokenizer: unsupported or invalid asset contract");
+    if (!ok) throw std::runtime_error(std::string(asset_json.structural_error));
 }
 std::uint64_t pair_key(std::uint32_t a, std::uint32_t b) { return (std::uint64_t{a} << 32U) | b; }
 std::string replace_spaces(std::string_view s) {
@@ -61,59 +61,6 @@ std::size_t scalar_length(std::string_view s, std::size_t at) {
         !(cp >= 0xD800U && cp <= 0xDFFFU));
     return n;
 }
-// The shared API parser intentionally replaces duplicate keys by a linear scan.
-// Assets need strict duplicate rejection and linear loading of a 262K-key vocabulary.
-// Keep the same Json representation/string escape parser, with an asset-local reader.
-class AssetReader {
-public:
-    explicit AssetReader(std::string_view s) : s_(s) {}
-    Json document() { auto j = value(0); skip(); require(at_ == s_.size()); return j; }
-private:
-    void skip() { while (at_ < s_.size() && (s_[at_] == ' ' || s_[at_] == '\r' || s_[at_] == '\n' || s_[at_] == '\t')) ++at_; }
-    bool take(char c) { skip(); if (at_ < s_.size() && s_[at_] == c) { ++at_; return true; } return false; }
-    std::string string() {
-        skip(); require(at_ < s_.size() && s_[at_] == '"');
-        const auto start = at_++;
-        bool escaped = false;
-        while (at_ < s_.size()) {
-            const auto c = static_cast<unsigned char>(s_[at_]);
-            require(c >= 0x20U);
-            if (c == '"') {
-                const auto end = at_++;
-                if (escaped) return strix::serve::parse_json_unique(s_.substr(start, at_ - start)).as_string();
-                return std::string(s_.substr(start + 1, end - start - 1));
-            }
-            if (c == '\\') { escaped = true; at_ += 2; }
-            else at_ += scalar_length(s_, at_);
-        }
-        require(false); return {};
-    }
-    Json value(unsigned depth) {
-        require(depth < 64); skip(); require(at_ < s_.size());
-        if (s_[at_] == '"') return Json(string());
-        if (take('{')) {
-            Json::Object members;
-            std::unordered_set<std::string> keys;
-            if (take('}')) return Json(std::move(members));
-            do {
-                auto key = string(); require(keys.emplace(key).second); require(take(':'));
-                members.emplace_back(std::move(key), value(depth + 1));
-            } while (take(','));
-            require(take('}')); return Json(std::move(members));
-        }
-        if (take('[')) {
-            Json::Array items;
-            if (take(']')) return Json(std::move(items));
-            do { items.push_back(value(depth + 1)); } while (take(','));
-            require(take(']')); return Json(std::move(items));
-        }
-        const auto start = at_;
-        while (at_ < s_.size() && std::string_view(",]} \r\n\t").find(s_[at_]) == std::string_view::npos) ++at_;
-        return strix::serve::parse_json_unique(s_.substr(start, at_ - start));
-    }
-    std::string_view s_;
-    std::size_t at_ = 0;
-};
 } // namespace
 
 struct Tokenizer::Impl {
@@ -200,7 +147,7 @@ std::shared_ptr<const Tokenizer> Tokenizer::load(const std::filesystem::path& pa
     std::string data(static_cast<std::size_t>(size), '\0');
     file.seekg(0);
     require(static_cast<bool>(file.read(data.data(), static_cast<std::streamsize>(data.size()))));
-    const auto root = AssetReader(data).document();
+    const auto root = strix::serve::parse_json_asset(data, asset_json);
     require(field(root, "version").as_string() == "1.0");
     const auto expected = strix::serve::parse_json(R"({"type":"Replace","pattern":{"String":" "},"content":"\u2581"})");
     require(field(root, "normalizer").dump() == expected.dump());

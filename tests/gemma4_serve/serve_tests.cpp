@@ -74,6 +74,14 @@ void streaming(const std::string& s, const std::string& reasoning, const std::st
     }
 }
 void parser_tests() {
+    constexpr strix::serve::JsonAssetPolicy asset{63, "invalid tokenizer asset"};
+    const std::string asset_text = R"({"e":"\ud83d\ude42","v":[true,-0,1.0e+1],"raw":"東京"})";
+    check(strix::serve::parse_json_asset(asset_text, asset).dump() == R"({"e":"🙂","v":[true,-0,1.0e+1],"raw":"東京"})",
+          "asset JSON preserves order, escapes and number bytes");
+    const auto nested = [](std::size_t depth) { return std::string(depth, '[') + std::string(depth, ']'); };
+    check(strix::serve::parse_json_asset(nested(64), asset).is_array(), "asset JSON accepts depth 63");
+    rejects([&] { (void)strix::serve::parse_json_asset(nested(65), asset); }, "asset JSON rejects depth 64");
+
     const auto args = strix::serve::parse_json_unique(R"({"a":[null,true,false,-12,1.25],"nest":{"x":"a\\b\"c\n🙂<turn|><tool_call|>"}})");
     const auto argument_text = g4::format_argument(args, false);
     check(g4::parse_arguments(argument_text).dump() == args.dump(), "argument syntax inverse");
