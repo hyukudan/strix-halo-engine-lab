@@ -31,6 +31,7 @@
 #include "core/iu4.hpp"
 #include "core/null_perturb.hpp"
 #include "moe_core/int4_layer_policy.hpp"
+#include "moe_core/route_tap_hip.hpp"
 #include "glm/prefill/glm_pf_exact_moe.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
 #include "glm/prefill/glm_pf_router_wmma.hpp"
@@ -1998,6 +1999,7 @@ struct Engine::Impl {
                 float* wt = wts + q * kTopE;
                 pf_router(x, w.moew, log, h.count, q, stream);
                 D::route(log, w.moew.bias, id, wt, h.count, stream);
+                strix::moe_core::route_tap(w.index, h.count, kTopE, kExperts, id, wt, stream);  // FAST gate v2 tap (inactive: no copy)
                 if (pf->moe_by_row()) {
                     const unsigned B = std::clamp(pf->moe_row_block(), 1U, 8U);
                     for (unsigned r = 0; r < h.count; r += B) {
@@ -2172,6 +2174,7 @@ struct Engine::Impl {
                     // Router and matrix-specific MoE input transforms stay replicated.
                     pf_router(x, w.moew, log, count, first, half_stream);
                     D::route(log, w.moew.bias, id, wt, count, half_stream);
+                    strix::moe_core::route_tap(w.index, count, kTopE, kExperts, id, wt, half_stream);
                     if (pf->moe_by_row()) {
                         const unsigned B = std::clamp(pf->moe_row_block(), 1U, 8U);
                         for (unsigned r = 0; r < count; r += B) {
@@ -2440,6 +2443,7 @@ struct Engine::Impl {
                 if (pfc) {  // chunk rows: the row-tiled router chain (== decode bits) + R14 route
                     pf_router(xn, w.moew, rlog, R, 0, stream);
                     D::route(rlog, w.moew.bias, ids, wts, R, stream);
+                    strix::moe_core::route_tap(w.index, R, kTopE, kExperts, ids, wts, stream);
                     if (pf->moe_by_row()) {  // the engine's MoE seam, blocks of <= 8 rows: the decode identity (batch invariant)
                         const unsigned B = std::clamp(pf->moe_row_block(), 1U, 8U);
                         for (unsigned q = 0; q < R; q += B) {
