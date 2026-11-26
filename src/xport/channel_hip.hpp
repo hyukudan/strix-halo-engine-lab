@@ -146,6 +146,7 @@ public:
     void drain();
     // Throws with the cause if an exchange failed (the stream was released with garbage).
     void check() const;
+    // Counters of the progress thread: read only after drain() (its acquire of the completion count orders them).
     [[nodiscard]] Stats stats() const;
     [[nodiscard]] std::uint64_t sent() const noexcept { return next_; }
     [[nodiscard]] const Options& options() const noexcept { return options_; }
@@ -166,6 +167,7 @@ private:
     class CrcWorker;
     static constexpr std::size_t kQueue = 256;
     void init();
+    void release_buffers() noexcept;  // idempotent: the destructor and a failed init()
     void run();
     void process(const Job& job);
     void post(const Job& job);
