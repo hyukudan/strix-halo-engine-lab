@@ -832,17 +832,16 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         if (std::string_view(field) == "--speculation") strings.pop_back();
         strings.pop_back();
     }
-    // Served speculation (kMiniSpeculation, explicit --speculation auto here): admitted on HIP (one-lane verify windows),
-    // declined on CUDA, named in the startup line before any device work.
+    // Served speculation (kMiniSpeculation, explicit --speculation auto here): admitted on HIP (one-lane verify windows)
+    // and on CUDA (the shared lone-lane speculator), named in the startup line before any device work.
     {
         std::ostringstream out, error;
         strings.insert(strings.end(), {"--speculation", "auto", "--family-inspect"});
         const auto rc = run({}, out, error);
         strings.resize(strings.size() - 3U);
-        const bool hip = std::string_view(backend) == "hip";
         require(rc == 0 && !created &&
-                    out.str().find(hip ? " speculation auto" : " speculation declined") != std::string::npos,
-                "served speculation: auto admitted on HIP, declined on CUDA, before any device work");
+                    out.str().find(" speculation auto") != std::string::npos,
+                "served speculation: auto admitted on HIP and CUDA, before any device work");
         // The row default (auto in every tier) resolves as the explicit flag does; an explicit off wins over it.
         std::ostringstream row_out, row_error;
         const auto flag = std::ranges::find(strings, std::string("--speculation"));
@@ -852,7 +851,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const auto row_rc = run({}, row_out, row_error);
         strings.pop_back();
         strings.insert(strings.begin() + at, {"--speculation", "off"});
-        require(row_rc == 0 && row_out.str().find(hip ? " speculation auto" : " speculation declined") != std::string::npos,
+        require(row_rc == 0 && row_out.str().find(" speculation auto") != std::string::npos,
                 "served speculation: the row default resolves auto like the command line");
         std::ostringstream off_out, off_error;
         strings.insert(strings.end(), {"--speculation", "off", "--family-inspect"});

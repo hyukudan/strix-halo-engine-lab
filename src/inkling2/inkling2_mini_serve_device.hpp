@@ -1,6 +1,7 @@
 #pragma once
 
 #include "inkling2_mini_resident_decoder.hpp"
+#include "inkling2_mini_serve_lanes.hpp"
 #include "inkling2_mini_serve_options.hpp"
 #include "inkling2_mini_weight_device.hpp"
 #include "strix/device/gate.hpp"
@@ -58,6 +59,21 @@ inline MiniServeCohort make_mini_device_cohort(
 #if !defined(__HIPCC__)
     exec::CohortProgramPolicy programs;
 #endif
+    // Lone-lane speculation (CUDA): the model's DSpark sidecar beside the checkpoint, validated like the command line's
+    // (absent or declined: the lone lane drafts lookup-only). Found, the decoder captures slot 0's DSpark taps and the
+    // cohort binds the drafter (MiniServeLaneBinding) before the slots are budgeted.
+    spec::ResolvedDrafter drafter{{}, spec::DrafterSource::context, {}};
+    if (opt.lane_speculation) {
+        drafter = spec::resolve_drafter_file({{}, false, true}, opt.checkpoint,
+                                             model_data::inkling2_mini::speculation::drafter);
+        if (drafter.source == spec::DrafterSource::beside_model)
+            if (auto problem = MiniDSparkDeviceWeights::sidecar_problem(drafter.path); !problem.empty())
+                drafter = spec::decline_drafter(drafter, std::move(problem));
+    }
+    const bool draft_taps = opt.lane_speculation && !drafter.path.empty();
+    bool lanes_bound = false;
+    [[maybe_unused]] bool window_programs = false, window_programs_declined = false;
+    [[maybe_unused]] unsigned window_prewarmed = 0U;
     // The admitted prompt chunk (serve::load_with_chunk_ladder) and the free device bytes the slot plan read.
     unsigned chunk_rows = opt.prefill_rows;
     std::uint64_t admission_free = 0;
@@ -76,9 +92,18 @@ inline MiniServeCohort make_mini_device_cohort(
         const auto ladder = mini_served_chunk_ladder(opt.prefill_rows, opt.prefill_fallback_rows);
         const auto load = [&](std::uint32_t chunk, bool last) {
             const bool route = opt.served_cli_route && chunk == ladder.rows[0];
+            // CUDA: slot 0 binds the command line's verify window tape (the constructor's verify rows, as the command
+            // line's load.verify_rows) when windows may be served: a staged window is then taped, so it replays its
+            // window program and a partial commit rebuilds by copies. Without it (q63) every served window ran eagerly
+            // and every partial commit replayed its kept rows: served code 100.9 tok/s vs 180.6 on the command line.
+#if defined(__HIPCC__)
+            const unsigned tape_rows = 0U;  // HIP served windows: unchanged
+#else
+            const unsigned tape_rows = opt.speculation ? kMiniMaxVerifyRows : 0U;
+#endif
             auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, chunk,
                 packed_decode, MiniResidentBackend::default_step_graphs,
-                weights.roles(), 0U, false, rows, route ? opt.prefill_tail : 0U,
+                weights.roles(), tape_rows, draft_taps, rows, route ? opt.prefill_tail : 0U,
                 opt.experts_nvfp4, opt.controller_one_plane, route, lowbit);
             if (!mini_decode_only_pack_route_ok(calibrated, decode_only_pack, decoder->prefill_emits_first()))
                 throw std::logic_error("calibrated decode image on the held-back served prompt route");
@@ -98,6 +123,22 @@ inline MiniServeCohort make_mini_device_cohort(
             // decoder declines windows on a calibrated low-bit target (mini_speculation_policy never requests both).
             windows = decoder->set_slot_windows(opt.speculation);
             windows_declined = "decoder declined verify windows";
+#if !defined(__HIPCC__)
+            // Verify window programs for the staged windows: the command line's switch (STRIX_INKLING_WINDOW_PROGRAMS=1)
+            // and its proven levers (identity fixture q52r: EXACT levers only), so a served window runs the command
+            // line's window arithmetic and wall.
+            window_programs = windows && mini_window_programs_requested();
+            if (window_programs && !mini_window_programs_proven(opt.combine_image, opt.prepared_round_fold,
+                                                                opt.experts_nvfp4, opt.controller_one_plane,
+                                                                opt.moe_w4a4, opt.attn_projected_bias, weights.roles())) {
+                window_programs = false;
+                window_programs_declined = true;
+            }
+            decoder->set_window_programs(window_programs);
+#endif
+            // The drafter's device weights and context exist before the slots read the free memory.
+            std::unique_ptr<MiniServeLaneBinding> binding;
+            if (windows && draft_taps) binding = std::make_unique<MiniServeLaneBinding>(*decoder, opt.context, drafter.path);
             slot_bytes = decoder->slot_bytes();
             const auto plane = decoder->screen_device_bytes();
             // Keep the CUDA screened plane only when it costs no slot, then enforce the calibrated load's slot promise.
@@ -105,8 +146,13 @@ inline MiniServeCohort make_mini_device_cohort(
             lanes = mini_serve_kv_slots(*decoder, memory.free, memory.total, budget.device_bytes, opt.kv_bytes, rows);
             if (windows && opt.slots != 0U && lanes < rows) {
                 // The windows' tapes and scratch would cost a configured slot: the slots win, the lanes decode one row.
+                binding.reset();
                 windows = decoder->set_slot_windows(false);
                 windows_declined = "slot capacity";
+#if !defined(__HIPCC__)
+                window_programs = false;
+                decoder->set_window_programs(false);
+#endif
                 slot_bytes = decoder->slot_bytes();
                 memory = mini_gpu::memory_info();
                 lanes = mini_serve_kv_slots(*decoder, memory.free, memory.total, budget.device_bytes, opt.kv_bytes, rows);
@@ -144,6 +190,13 @@ inline MiniServeCohort make_mini_device_cohort(
             const auto forward_rows = std::max<unsigned>(rows, windows ? decoder->max_slot_window() : 1U);
             auto candidate =
                 std::make_unique<Cohort>(std::move(decoder), opt.context, forward_rows, lanes, std::move(policy));
+            lanes_bound = binding != nullptr;
+            if (binding) candidate->bind_lanes(std::move(binding));
+#if !defined(__HIPCC__)
+            // Every window width captured now, slots allocated and slot 0 empty (MiniResidentDecoder::
+            // prewarm_window_programs): no capture wall enters a served decode; prompts keep the programs.
+            window_prewarmed = window_programs ? observed->prewarm_window_programs() : 0U;
+#endif
             projected_bias_dispatches = nullptr;
             if (opt.attn_projected_bias)
                 projected_bias_dispatches = [observed] { return observed->projected_attention_dispatches(); };
@@ -205,7 +258,21 @@ inline MiniServeCohort make_mini_device_cohort(
     if (speculation.admitted && !windows) speculation.reason = windows_declined;
     speculation.admitted = windows;
     std::cerr << mini_speculation_line(speculation, opt.verify_rows) << '\n';
-    if (windows) std::cerr << spec::drafter_receipt("served", {{}, spec::DrafterSource::context, {}}) << '\n';
+    if (windows) {
+        // CUDA lone-lane speculation: the DSpark drafter bound on slot 0 (else lookup-only drafts); HIP: context drafts.
+        if (opt.lane_speculation && !lanes_bound && !drafter.path.empty())
+            drafter = spec::decline_drafter(drafter, "verify windows declined");
+        std::cerr << spec::drafter_receipt("served", drafter) << '\n';
+        if (opt.lane_speculation)
+            std::cerr << "Inkling lane_speculation on max_live 1 drafter " << (lanes_bound ? "dspark" : "lookup") << '\n';
+#if !defined(__HIPCC__)
+        std::cerr << "Inkling verify window programs "
+                  << (window_programs ? "on prewarmed " + std::to_string(window_prewarmed)
+                                      : window_programs_declined ? std::string("declined (unproven for this profile)")
+                                                                 : std::string("off"))
+                  << '\n';
+#endif
+    }
     // CUDA, either prompt route: the shared long pieces beside decoding lanes, cut by the CUDA rule
     // (mini_prefill_piece_rule); HIP keeps the short ones.
     const auto pieces = !kServeHip ? kMiniCudaServePieces : serve::kMixedServiceShortPieces;

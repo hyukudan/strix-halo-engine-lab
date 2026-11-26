@@ -3,6 +3,7 @@
 #include "strix/spec/draft_depth.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/serve/job_sampling.hpp"
+#include "strix/serve/lane_speculation.hpp"
 
 #include "strix/serve/short_first.hpp"
 
@@ -15,6 +16,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace strix::serve {
@@ -77,6 +79,29 @@ std::uint32_t sample_lane(CohortBackend& backend, std::uint32_t lane, TokenSampl
     if (backend.samples_on_device()) return backend.sample_final(lane, sampler, position);
     return sampler.decide(backend.read_final_logits(lane), position, nullptr).token;
 }
+// The lane's counters of one request (CohortResult::lane_speculation): integers and booleans only.
+struct LaneSpecCounts {
+    std::uint64_t steps = 0, suspends = 0, resumes = 0;
+};
+std::string lane_speculation_receipt(const LaneSpeculator& sp, std::uint32_t lane, const LaneSpecCounts& counts) {
+    const auto& drafter = sp.drafter();
+    const auto& stats = drafter.stats();
+    const auto& arbiter = drafter.arbiter();
+    const auto u = [](std::uint64_t v) { return std::to_string(v); };
+    const auto b = [](bool v) { return std::string(v ? "true" : "false"); };
+    const auto source = [&](spec::Source s) {
+        const auto k = static_cast<std::size_t>(s);
+        return "{\"passes\":" + u(stats.source_passes[k]) + ",\"proposed\":" + u(stats.source_proposed[k]) +
+               ",\"accepted\":" + u(stats.source_accepted[k]) + "}";
+    };
+    return "{\"lane\":" + u(lane) + ",\"steps\":" + u(counts.steps) + ",\"suspends\":" + u(counts.suspends) +
+           ",\"resumes\":" + u(counts.resumes) + ",\"chained\":" + b(sp.chained()) + ",\"lookup_only\":" +
+           b(sp.lookup_only()) + ",\"chain_starts\":" + u(sp.chain_starts()) + ",\"ready_false\":" +
+           u(sp.ready_refusals()) + ",\"chain_null\":" + u(sp.chain_refusals()) + ",\"passes\":" + u(stats.passes) +
+           ",\"emitted\":" + u(stats.emitted) + ",\"model\":" + source(spec::Source::model) + ",\"lookup\":" +
+           source(spec::Source::lookup) + ",\"serial\":" + source(spec::Source::serial) + ",\"episode_open\":" +
+           b(arbiter.episode_open()) + ",\"episode_closed_loss\":" + b(arbiter.episode_loss_ms() >= 0.0) + "}";
+}
 }  // namespace
 
 void CohortBackend::prefill_group(std::span<const CohortPrompt> members) {
@@ -95,6 +120,14 @@ struct CohortDecoder::Lane {
     std::uint64_t bytes = 0;
     std::unique_ptr<MtpContextDraft> drafter;
     std::optional<TokenSampler> sampler;
+    // Lone-lane speculation (CohortConfig::lane_speculation): the lane's speculator, made at its first speculator step
+    // and kept for the request (suspended while the lane takes the round), and the ids it emitted that the context
+    // drafter has not seen yet (fed to it when the lane takes the round again), after the pending token spec_anchor.
+    std::unique_ptr<LaneSpeculator> speculator;
+    std::vector<std::uint32_t> spec_unseen;
+    std::uint32_t spec_anchor = 0;
+    bool spec_lookup_only = false;  // counted in lane_speculation_lookup_only
+    std::uint64_t spec_steps = 0, spec_suspends = 0, spec_resumes = 0;  // this request's (CohortResult::lane_speculation)
     std::vector<double> tried, kept;  // kept histogram per draft row index: rows the target verified / kept
     std::uint64_t prompt_start = 0;   // prompt rows restored at admission (a group member starts from 0 only)
     bool whole = false;               // the backend's prefill reads the whole prompt and emits the first id
@@ -143,6 +176,7 @@ CohortDecoder::CohortDecoder(CohortBackend& backend, CohortConfig config) : back
     if (n == 0) throw std::invalid_argument("cohort decoder: backend has no lanes");
     validate_prompt_pieces(config_, backend_.prompt_piece_rule(),
                            config_.prompt_slice_decoding != 0U ? backend_.prompt_call_chunk(config_.prompt_slice) : 0U);
+    if (config_.lane_speculation.enabled) lane_spec_rows_ = validate_lane_speculation(backend_, config_.lane_speculation);
     lanes_.resize(n);
     step_scratch_ = std::make_unique<StepScratch>(n);
 }
@@ -379,6 +413,24 @@ void CohortDecoder::finish(Lane& lane, std::string error) {
     if (lane.sampler) lane.result.sampling_receipt = job_sampling_receipt(*lane.sampler);
     for (std::size_t i = 0; i < lanes_.size(); ++i) {
         if (lanes_[i].get() != &lane) continue;
+        if (lane.speculator && lane.speculator->started()) {
+            lane.result.lane_speculation = lane_speculation_receipt(*lane.speculator, static_cast<std::uint32_t>(i),
+                                                                    {lane.spec_steps, lane.spec_suspends, lane.spec_resumes});
+            if (config_.lane_speculation.log) {
+                std::string line = lane.result.lane_speculation;
+                line.pop_back();  // the closing brace: the drafter's stats and the decoder's totals follow
+                std::fprintf(stderr,
+                             "strix-lane-spec %s,\"totals\":{\"steps\":%llu,\"suspends\":%llu,\"resumes\":%llu,"
+                             "\"lookup_only_lanes\":%llu,\"ready_false\":%llu},\"stats\":%s}\n",
+                             line.c_str(), static_cast<unsigned long long>(lane_spec_steps_),
+                             static_cast<unsigned long long>(lane_spec_suspends_),
+                             static_cast<unsigned long long>(lane_spec_resumes_),
+                             static_cast<unsigned long long>(lane_spec_lookup_only_),
+                             static_cast<unsigned long long>(lane_spec_ready_false_),
+                             lane.speculator->drafter().stats().json().c_str());
+                std::fflush(stderr);
+            }
+        }
         used_bytes_ -= lane.bytes;
         // prefix capture is optional: its failure must never keep the lane from retiring
         try {
@@ -686,11 +738,94 @@ void CohortDecoder::step() {
     }
     for (auto& [l, error] : first_done) finish(*l, std::move(error));
 
-    // 2. Decode round: every decoding lane holds its certain row; draft rows are bought by plan_rows.
+    // 2. Lone-lane speculation (CohortConfig::lane_speculation): while at most max_live requests are live, a greedy
+    // decoding lane runs one speculator step (one verify + commit of its own) instead of the round; the ids go through
+    // the round's delivery. A lane that takes the round again suspends its speculator (kept: learned walls and
+    // acceptance) and its context drafter first reads the ids the speculator emitted. Ends are applied after the round.
+    auto& done = round.done;  // speculator ends first, then the round's (applied after the round)
+    done.clear();
+    std::vector<std::uint32_t> decode_ids;  // the lanes of the round
+    double spec_ms = 0;
+    std::size_t spec_lanes = 0;
+    const bool speculate = config_.lane_speculation.enabled && live() <= config_.lane_speculation.max_live;
+    for (const auto id : plan.decode_lanes) {
+        Lane& l = *lanes_[id];
+        if (speculate && !l.sampler && !l.request.selection) {
+            const double s0 = now_ms();
+            auto& sp = l.speculator;
+            if (!sp) sp = std::make_unique<LaneSpeculator>(backend_, id, config_.lane_speculation, lane_spec_rows_);
+            if (!sp->active()) {
+                // the stream is the prompt then the emitted ids; its last token is the pending one (not committed)
+                std::vector<std::uint32_t> stream = l.request.prompt;
+                stream.insert(stream.end(), l.result.ids.begin(), l.result.ids.end());
+                if (stream.size() != l.position + 1U || stream.back() != l.pending)
+                    throw std::logic_error("cohort decoder: lane speculation out of step with the lane");
+                const bool resume = sp->started();
+                const std::uint64_t refused = sp->ready_refusals();
+                sp->start(l.pending, stream);
+                lane_spec_ready_false_ += sp->ready_refusals() - refused;
+                if (resume) {
+                    ++lane_spec_resumes_;
+                    ++l.spec_resumes;
+                }
+                if (sp->lookup_only() && !l.spec_lookup_only) {
+                    l.spec_lookup_only = true;
+                    ++lane_spec_lookup_only_;
+                }
+            }
+            const std::uint64_t left = token_limit(l.request) - l.result.ids.size();
+            const std::uint64_t room_pos = backend_.max_positions() - l.position;  // rows position .. position + R - 1
+            const std::uint64_t window = std::max<std::uint32_t>(backend_.max_window(id), 1U);
+            const auto room = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>({left, room_pos, std::uint64_t{lane_spec_rows_}, window}));
+            spec::StepParams params;
+            params.remaining = params.max_rows = room;
+            params.context = l.position;
+            if (l.request.stop.size() == 1U) params.eos = l.request.stop.front();
+            std::vector<std::uint32_t> out;
+            const spec::StepRecord record = sp->step(out, params);
+            if (record.emitted == 0U || out.empty() || out.size() > room)
+                throw std::logic_error("cohort decoder: lane speculation produced an invalid window");
+            ++lane_spec_steps_;
+            ++l.spec_steps;
+            rows_ += record.rows;
+            l.result.steps += 1;
+            l.result.drafted += record.rows - 1U;
+            l.result.accepted += record.accepted;
+            l.position += out.size();
+            if (l.drafter) {
+                if (l.spec_unseen.empty()) l.spec_anchor = l.pending;
+                l.spec_unseen.insert(l.spec_unseen.end(), out.begin(), out.end());
+            }
+            if (deliver(l, out)) done.emplace_back(&l, std::string());
+            spec_ms += now_ms() - s0;
+            ++spec_lanes;
+            continue;
+        }
+        if (l.speculator && l.speculator->active()) {
+            l.speculator->suspend();
+            ++lane_spec_suspends_;
+            ++l.spec_suspends;
+        }
+        if (!l.spec_unseen.empty()) {
+            if (l.drafter) {
+                // one observe-only cycle: the context drafter's context follows the lane (pending, then the ids)
+                std::vector<double> unused;
+                (void)l.drafter->begin_cycle(l.spec_anchor, std::span<const std::uint32_t>(), 0U, 0U, unused,
+                                             config_.min_p);
+                l.drafter->finish_cycle(l.spec_unseen);
+            }
+            l.spec_unseen.clear();
+        }
+        decode_ids.push_back(id);
+    }
+    if (spec_lanes != 0U) decode_ms_ += spec_ms;
+
+    // 3. Decode round: every decoding lane holds its certain row; draft rows are bought by plan_rows.
     const double t0 = now_ms();
     auto& run = round.run;
     run.clear();
-    for (const auto id : plan.decode_lanes) run.push_back(lanes_[id].get());
+    for (const auto id : decode_ids) run.push_back(lanes_[id].get());
     // trace_steps: one line per step, after its accounting (debt_ms is the decode still owed after this step).
     const auto trace = [&](std::size_t decode_lanes, double decode_ms) {
         if (!config_.trace_steps) return;
@@ -707,8 +842,9 @@ void CohortDecoder::step() {
         last_step_end_ms_ = end;
     };
     if (run.empty()) {
-        planner_.account(prompt_ms, 0.0, 0.0, prompt_rows);
-        trace(0U, 0.0);
+        planner_.account(prompt_ms, spec_ms, 0.0, prompt_rows);
+        trace(spec_lanes, spec_ms);
+        for (auto& [l, error] : done) finish(*l, std::move(error));
         return;
     }
     const std::size_t n = run.size();
@@ -738,14 +874,14 @@ void CohortDecoder::step() {
         // a selection that reads logits decides one row per step from the lane's final logits
         const bool one_row = l.request.selection && l.request.selection_reads_logits;
         // the backend's own cap on the lane's window (pending row + drafts)
-        const std::uint64_t window_cap = std::max<std::uint32_t>(backend_.max_window(plan.decode_lanes[k]), 1U) - 1U;
+        const std::uint64_t window_cap = std::max<std::uint32_t>(backend_.max_window(decode_ids[k]), 1U) - 1U;
         const std::size_t room = one_row ? 0U : static_cast<std::size_t>(std::min<std::uint64_t>(
                                                      {draft_cap, left - 1U, room_pos, window_cap}));
         acc.clear();
         device.clear();
         device_p.clear();
         if (!l.sampler && room != 0 && backend_.device_drafts()) {
-            backend_.propose(plan.decode_lanes[k], static_cast<std::uint32_t>(room), device, device_p);
+            backend_.propose(decode_ids[k], static_cast<std::uint32_t>(room), device, device_p);
             if (device.size() > room) device.resize(room);
         }
         device_acc.resize(device.size());
@@ -792,7 +928,7 @@ void CohortDecoder::step() {
         double chain = 1.0, expected = 1.0;  // the pending row is certain
         for (std::size_t d = 1; d < accept.size(); ++d) expected += chain *= static_cast<double>(accept[d]);
         demands[k].rate = (static_cast<double>(l.result.ids.size()) + expected) / static_cast<double>(l.result.steps + 1U);
-        demands[k].lane = plan.decode_lanes[k];
+        demands[k].lane = decode_ids[k];
         demands[k].remaining_tokens = static_cast<std::uint32_t>(left);
         demands[k].min_rows = 1;
         demands[k].max_rows = 1U + static_cast<std::uint32_t>(drafts.size());
@@ -918,11 +1054,9 @@ void CohortDecoder::step() {
         ? decode_ms
         : std::max(0.0, decode_ms - static_cast<double>(draft_rows) *
                                         fitted_cost(sums_, config_, static_cast<std::uint32_t>(n)).row_ms);
-    planner_.account(prompt_ms, decode_ms, 0.0, prompt_rows);
-    trace(n, decode_ms);
+    planner_.account(prompt_ms, decode_ms + spec_ms, 0.0, prompt_rows);
+    trace(n + spec_lanes, decode_ms + spec_ms);
 
-    auto& done = round.done;
-    done.clear();
     for (std::size_t k = 0; k < n; ++k) {
         Lane& l = *run[k];
         auto& picked = round.decode[k];

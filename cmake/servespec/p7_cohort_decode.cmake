@@ -1,6 +1,6 @@
 # Shared multi-request decoder (join / leave at step boundaries, plan_rows + StepPlanner, context drafts) and its
 # host test over a fake engine (each request's ids == its solo run).
-strix_servespec_serve_sources(src/serve/cohort_decode.cpp)
+strix_servespec_serve_sources(src/serve/cohort_decode.cpp src/serve/lane_speculation.cpp)
 if(TARGET strix_session_runtime)
     add_library(strix_cohort_session STATIC src/serve/cohort_session.cpp)
     target_link_libraries(strix_cohort_session PUBLIC strix_session_runtime)
@@ -25,4 +25,9 @@ strix_servespec_host_test(NAME strix-fixed-kv-cohort-tests
 # engine: every request's ids == its solo run under its selection policy.
 strix_servespec_host_test(NAME strix-cohort-lane-hooks-tests
     SOURCES tests/cohort_lane_hooks_tests.cpp
+    LIBS strix_serve)
+# Lone-lane speculation (CohortConfig::lane_speculation) over a fake engine, a fake model drafter and a virtual clock:
+# the lane's decisions and ids == the command line's block continuation; hand-over at step boundaries, ids == solo.
+strix_servespec_host_test(NAME strix-cohort-lane-speculation-tests
+    SOURCES tests/cohort_lane_speculation_tests.cpp
     LIBS strix_serve)

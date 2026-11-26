@@ -6,6 +6,7 @@
 // per-slot verify windows serves one drafted lane per verify (the kept prefix committed, a released lane's window
 // discarded), and a cohort that drafts through it under the live-lane rule emits the ids of one-row decode.
 #include "strix/serve/fixed_kv_cohort.hpp"
+#include "strix/spec/block_drafter.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -15,6 +16,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using strix::serve::CohortGroup;
@@ -434,6 +436,186 @@ WindowRun run_windows(std::uint32_t max_draft, std::vector<std::uint32_t> by_liv
     return out;
 }
 
+// FixedKvCohort::bind_lanes: an engine's lone-lane pieces answer the cohort's lane hooks (no binding: the defaults).
+// The drafter proposes the target's own next ids for the lane it was started on (a perfect drafter where its context
+// is complete), then a wrong id on every third proposal, so windows keep part of a draft.
+struct OracleDrafter final : strix::spec::ChainDrafter {
+    std::vector<std::uint32_t> h;
+    std::uint32_t drafts = 0;
+    void draft(std::span<const std::uint32_t> prefix, std::uint32_t k, std::vector<std::uint32_t>& out) override {
+        auto t = h;
+        t.insert(t.end(), prefix.begin(), prefix.end());
+        out.clear();
+        for (std::uint32_t i = 0; i < k; ++i) {
+            const auto next = (drafts + i) % 3U == 2U ? 7U : WindowDecoder::model(t);
+            out.push_back(next);
+            t.push_back(next);
+        }
+        ++drafts;
+    }
+    void accept(std::span<const std::uint32_t> emitted) override { h.insert(h.end(), emitted.begin(), emitted.end()); }
+};
+
+struct LaneBinding final : strix::serve::FixedKvLaneBinding {
+    WindowDecoder& decoder;
+    OracleDrafter drafter;
+    std::vector<std::uint32_t> asked;  // lanes whose drafter was asked
+    std::uint32_t ready_lane = 0;      // the lane whose drafter inputs are complete (the engine's slot-0 taps)
+    bool tuned = false;
+    explicit LaneBinding(WindowDecoder& d) : decoder(d) {}
+    strix::spec::ChainDrafter* chain_drafter(std::uint32_t lane, std::uint32_t anchor, std::uint64_t position) override {
+        asked.push_back(lane);
+        drafter.h = decoder.history.at(lane);  // the committed rows (position of them) and the pending anchor
+        check(drafter.h.size() == position, "lane binding: the drafter starts at the lane's committed position");
+        drafter.h.push_back(anchor);
+        return &drafter;
+    }
+    void tune(strix::spec::BlockConfig&) const override { const_cast<LaneBinding*>(this)->tuned = true; }
+    bool ready(std::uint32_t lane) const override { return lane == ready_lane; }
+};
+
+void test_lane_binding() {
+    using strix::serve::CohortConfig;
+    using strix::serve::CohortDecoder;
+    using strix::serve::CohortRequest;
+    const auto request = [](std::uint64_t id, std::uint32_t max_tokens) {
+        CohortRequest r;
+        r.id = id;
+        r.prompt = {31U + static_cast<std::uint32_t>(id), 32U, 33U, 34U, 35U, 36U};
+        r.max_tokens = max_tokens;
+        return r;
+    };
+    const auto make = [](WindowDecoder*& raw, LaneBinding*& bound, bool bind) {
+        auto decoder = std::make_unique<WindowDecoder>();
+        raw = decoder.get();
+        auto cohort = std::make_unique<FixedKvCohort<WindowDecoder>>(std::move(decoder), 512U, 4U, 4U);
+        bound = nullptr;
+        if (bind) {
+            auto binding = std::make_unique<LaneBinding>(*raw);
+            bound = binding.get();
+            cohort->bind_lanes(std::move(binding));
+        }
+        return cohort;
+    };
+    CohortConfig config;
+    config.prompt_slice = 16U;
+    config.lane_speculation.enabled = true;
+    config.lane_speculation.max_rows = 4U;
+    {
+        // No binding: the hooks' defaults (ready, no model drafter): a lone lane speculates from the copy source alone.
+        WindowDecoder* raw = nullptr;
+        LaneBinding* bound = nullptr;
+        auto cohort = make(raw, bound, false);
+        check(cohort->lane_chain_drafter(0U, 1U, 1U) == nullptr && cohort->lane_speculation_ready(3U),
+              "lane binding: unbound hooks keep their defaults");
+        CohortDecoder scheduler(*cohort, config);
+        const auto r = request(1U, 40U);
+        scheduler.submit(r);
+        for (int step = 0; step < 200 && !scheduler.idle(); ++step) scheduler.step();
+        const auto done = scheduler.take_finished();
+        check(done.size() == 1U && done[0].ids == solo_ids(r), "lane binding: unbound lone lane ids == solo");
+    }
+    {
+        // Bound: lane 0 drafts with the engine's drafter (windows accept part of its drafts); ids equal the solo run.
+        WindowDecoder* raw = nullptr;
+        LaneBinding* bound = nullptr;
+        auto cohort = make(raw, bound, true);
+        CohortDecoder scheduler(*cohort, config);
+        const auto r = request(1U, 60U);
+        scheduler.submit(r);
+        for (int step = 0; step < 200 && !scheduler.idle(); ++step) scheduler.step();
+        const auto done = scheduler.take_finished();
+        check(done.size() == 1U && done[0].ids == solo_ids(r), "lane binding: lane 0 ids == solo");
+        check(!bound->asked.empty() && bound->asked.front() == 0U && bound->drafter.drafts > 0U && bound->tuned,
+              "lane binding: lane 0's drafter is asked, tuned and drafts");
+        check(raw->windows > 0U && done[0].accepted > 0U, "lane binding: windows keep drafted rows");
+    }
+    {
+        // A request on another lane finishes while lane 0 speculates alone afterwards; a lane that is not ready (its
+        // inputs incomplete: not the engine's tap lane) never gets the drafter. Ids of both equal their solo runs.
+        WindowDecoder* raw = nullptr;
+        LaneBinding* bound = nullptr;
+        auto cohort = make(raw, bound, true);
+        CohortDecoder scheduler(*cohort, config);
+        const auto a = request(1U, 50U), b = request(2U, 8U);
+        scheduler.submit(a);
+        scheduler.submit(b);
+        for (int step = 0; step < 300 && !scheduler.idle(); ++step) scheduler.step();
+        auto done = scheduler.take_finished();
+        std::ranges::sort(done, {}, &strix::serve::CohortResult::id);
+        check(done.size() == 2U && done[0].ids == solo_ids(a) && done[1].ids == solo_ids(b),
+              "lane binding: survivor and finished request ids == solo");
+        check(std::ranges::all_of(bound->asked, [](std::uint32_t lane) { return lane == 0U; }),
+              "lane binding: only the ready lane's drafter is asked");
+    }
+    {
+        // Cancellation mid-run while lane 0 speculates: the request ends cancelled at a step boundary, no window left
+        // staged on the decoder.
+        WindowDecoder* raw = nullptr;
+        LaneBinding* bound = nullptr;
+        auto cohort = make(raw, bound, true);
+        CohortDecoder scheduler(*cohort, config);
+        auto r = request(1U, 200U);
+        bool cancel = false;
+        r.cancelled = [&] { return cancel; };
+        scheduler.submit(r);
+        for (int step = 0; step < 300 && !scheduler.idle(); ++step) {
+            scheduler.step();
+            if (raw->windows >= 3U) cancel = true;
+        }
+        const auto done = scheduler.take_finished();
+        check(done.size() == 1U && done[0].cancelled && done[0].ids.size() < 200U,
+              "lane binding: cancelled mid-run while speculating");
+        const auto& ids = done[0].ids;
+        const auto solo = solo_ids(r);
+        check(std::equal(ids.begin(), ids.end(), solo.begin()), "lane binding: cancelled ids are a prefix of solo");
+        check(std::ranges::all_of(raw->staged, [](std::uint32_t s) { return s == 0U; }),
+              "lane binding: no window left staged after the cancellation");
+    }
+    {
+        // The served measurement sequence (a short warm-up, then the same prompt twice, one request at a time, all on
+        // lane 0) and a lone lane on a lane that is not ready: every request's receipt (CohortResult::lane_speculation,
+        // also the server's strix-lane-spec line) says whether the model drafter ran, and why not.
+        WindowDecoder* raw = nullptr;
+        LaneBinding* bound = nullptr;
+        auto cohort = make(raw, bound, true);
+        auto logged = config;
+        logged.lane_speculation.log = true;
+        CohortDecoder scheduler(*cohort, logged);
+        const auto has = [](const std::string& s, const char* part) { return s.find(part) != std::string::npos; };
+        for (const auto& [id, tokens] : {std::pair{1U, 8U}, std::pair{2U, 60U}, std::pair{3U, 60U}}) {
+            auto r = request(1U, tokens);
+            r.id = id;
+            scheduler.submit(r);
+            for (int step = 0; step < 300 && !scheduler.idle(); ++step) scheduler.step();
+            const auto done = scheduler.take_finished();
+            check(done.size() == 1U && done[0].ids == solo_ids(r), "lane receipt: sequential request ids == solo");
+            const auto& receipt = done[0].lane_speculation;
+            check(has(receipt, "\"lane\":0,") && has(receipt, "\"chained\":true") &&
+                      has(receipt, "\"lookup_only\":false") && has(receipt, "\"ready_false\":0,") &&
+                      has(receipt, "\"chain_starts\":1,") && has(receipt, "\"suspends\":0,"),
+                  "lane receipt: lane 0 drafts with the engine's drafter on every request");
+            // (how many passes the model drafts is the arbiter's choice on the wall clock: not asserted here)
+        }
+        // Two at once: the short one (lane 0) ends, the long one speculates alone on lane 1 (not ready): lookup-only.
+        auto a = request(4U, 6U), b = request(5U, 40U);
+        scheduler.submit(a);
+        scheduler.submit(b);
+        for (int step = 0; step < 300 && !scheduler.idle(); ++step) scheduler.step();
+        auto done = scheduler.take_finished();
+        std::ranges::sort(done, {}, &strix::serve::CohortResult::id);
+        check(done.size() == 2U && done[0].ids == solo_ids(a) && done[1].ids == solo_ids(b),
+              "lane receipt: pair ids == solo");
+        const auto& lone = done[1].lane_speculation;
+        check(has(lone, "\"lane\":1,") && has(lone, "\"chained\":false") && has(lone, "\"lookup_only\":true") &&
+                  has(lone, "\"ready_false\":1,") && has(lone, "\"chain_starts\":0,") &&
+                  has(lone, "\"model\":{\"passes\":0,"),
+              "lane receipt: a lone lane that is not ready drafts lookup-only and says why");
+        check(scheduler.lane_speculation_ready_false() == 1U && scheduler.lane_speculation_lookup_only() == 1U,
+              "lane receipt: the decoder's totals count the refusal");
+    }
+}
+
 void test_verify_windows() {
     using strix::serve::CohortConfig;
     using strix::serve::max_draft_for_live;
@@ -645,6 +827,7 @@ int main() {
     test_prefill_emits_first();
     test_prefill_route_selected();
     test_verify_windows();
+    test_lane_binding();
     if (failures != 0) {
         std::fprintf(stderr, "fixed-kv-cohort: %d failures\n", failures);
         return EXIT_FAILURE;

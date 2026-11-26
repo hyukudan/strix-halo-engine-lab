@@ -446,6 +446,21 @@ inline unsigned mini_served_verify_rows(unsigned active, bool served_cli_route, 
     return active >= kMiniVerifyLanesPick && (served_cli_route || admitted_slots < 2U) ? 1U : active;
 }
 
+// Verify window programs (CUDA, MiniResidentDecoder::set_window_programs): default on for the levers the device identity
+// fixture proves (q52r: the EXACT levers, projected bias, screened or full head; timing q62), off switch
+// STRIX_INKLING_WINDOW_PROGRAMS=0. The one rule of the command line (apps/inkling2_mini_gpu_main.hpp) and the server.
+inline bool mini_window_programs_requested() {
+    const char* value = strix::envcfg::text("STRIX_INKLING_WINDOW_PROGRAMS");
+    return !(value && std::string_view(value) == "0");
+}
+inline bool mini_window_programs_proven(bool combine_image, bool prepared_round_fold, bool narrow_experts,
+                                        bool controller_one_plane, moe_core::grouped_w4a4::Activations moe_w4a4,
+                                        bool attn_projected_bias, weight::RoleStorage storage) {
+    return !combine_image && !prepared_round_fold && !narrow_experts && !controller_one_plane &&
+           moe_w4a4 == moe_core::grouped_w4a4::Activations::bf16 && attn_projected_bias &&
+           storage.attention == weight::kBf16WeightStorage && storage.head == weight::kBf16WeightStorage;
+}
+
 // What the decoder's backend admitted of the resolved levers: the effective state every entry point reports.
 struct MiniDecoderLevers {
     bool down_image = false;           // the BF16 down image route is active

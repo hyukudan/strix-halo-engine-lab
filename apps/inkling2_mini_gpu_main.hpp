@@ -85,12 +85,9 @@ public:
         // lever, or Q8_0 attention / head storage, declines with the reason.
         // Off switch STRIX_INKLING_WINDOW_PROGRAMS=0. With a drafter every width is captured here, at load, so no capture
         // wall enters a timed decode (prewarm_window_programs; the line counts them, and the end line counts any later).
-        const char* window = strix::envcfg::text("STRIX_INKLING_WINDOW_PROGRAMS");
-        const bool asked = !(window && std::string_view(window) == "0");
-        const bool proven = !combine_image && !prepared_round_fold && !narrow_experts && !controller_one_plane &&
-                            moe_w4a4 == moe_core::grouped_w4a4::Activations::bf16 && attn_projected_bias &&
-                            storage.attention == weight::kBf16WeightStorage &&
-                            storage.head == weight::kBf16WeightStorage;
+        const bool asked = mini_window_programs_requested();  // the server's rule too (inkling2_mini_weight_options.hpp)
+        const bool proven = mini_window_programs_proven(combine_image, prepared_round_fold, narrow_experts,
+                                                        controller_one_plane, moe_w4a4, attn_projected_bias, storage);
         if (asked && proven) decoder_.set_window_programs(true);
         else if (asked) std::cerr << "inkling2 verify window programs declined (unproven for this profile: the identity "
                                      "fixture covers the EXACT levers only)\n";

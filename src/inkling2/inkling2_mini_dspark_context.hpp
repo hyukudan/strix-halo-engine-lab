@@ -192,6 +192,9 @@ public:
         projected_ = end;
     }
 
+    // A new target sequence (a served slot reused): the next refresh projects its rows from position 0 again.
+    void reset() noexcept { projected_ = 0U; }
+
     [[nodiscard]] const mini_dspark_device::KvCache& cache(unsigned layer) const { return cache_.at(layer); }
     [[nodiscard]] const float* markov() const { return markov_.data(); }
 

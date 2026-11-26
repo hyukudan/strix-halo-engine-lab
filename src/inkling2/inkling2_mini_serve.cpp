@@ -88,15 +88,15 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
     // One speculation rule for the command line and the server (mini_speculation_policy: an explicit --speculation
     // wins over the row; speculation and a requested low-bit row never share a run). Served verify windows are
-    // admitted on HIP (the verify rows body and per-slot tapes); a CUDA server declines. The admitted windows take the
-    // verify rows body; a run that does not speculate keeps the row's level.
+    // admitted on HIP (the verify rows body and per-slot tapes: each greedy lane drafts from its context while one lane
+    // is live) and on CUDA as the shared lone-lane speculator (lane_speculation). The admitted windows take the verify
+    // rows body; a run that does not speculate keeps the row's level.
     out.speculation_policy = mini_speculation_policy(explicit_speculation.value_or(mini_speculation(resolution)),
-                                                     explicit_speculation.has_value(), out.weight_options.lowbit_turbo,
-                                                     resolved.backend == "hip" ? std::string_view{}
-                                                                               : std::string_view{"backend cuda"});
+                                                     explicit_speculation.has_value(), out.weight_options.lowbit_turbo);
     out.weight_options.lowbit_turbo = out.speculation_policy.lowbit;
     out.speculation_requested = out.speculation_policy.requested;
     out.speculation = out.speculation_policy.admitted;
+    out.lane_speculation = out.speculation && resolved.backend != "hip";
     out.verify_rows = mini_speculation_verify_rows(mini_verify_rows(resolution), out.speculation);
     // The W4A4 class is admitted for the resolved backend (HIP refuses a selected class instead of running BF16).
     out.moe_w4a4 = admit_mini_moe_w4a4(resolution, resolved.backend);
@@ -150,6 +150,13 @@ serve::CohortConfig scheduling(const MiniServeOptions& opt, const MiniServeCohor
     // context (the shared cohort drafter) and verifies the window on its slot; draft rows by live lanes are the
     // model's data (drafts only while one lane is live, the previous one-row route at two or more).
     const bool windows = opt.speculation && backend.max_window(0U) > 1U;
+    if (windows && opt.lane_speculation) {
+        // CUDA: the lone lane runs the command line's speculator step (LaneSpeculator: the same drafter setup, arbiter
+        // and verify windows as the CLI's auto, the DSpark drafter on slot 0); two or more live lanes take the round.
+        // One strix-lane-spec line per finished request (the lane's receipt and drafter stats).
+        config.lane_speculation = {true, 1U, kMiniMaxVerifyRows, kMiniProbeLoss, true};
+        return config;
+    }
     config.context_draft = windows;
     config.max_draft = windows ? kMiniMaxVerifyRows - 1U : 0U;
     if (windows) config.max_draft_by_live = mini_served_draft_by_live();
@@ -241,11 +248,12 @@ private:
                 if ((role && role->is_string() && role->as_string() == "tool") || (calls && calls->size()))
                     throw serve::ChatTemplateError("Inkling serving supports text messages");
             }
-            const auto* effort = body.find("reasoning_effort");
-            if (effort && !effort->is_null() && (!effort->is_string() || effort->as_string() != "none"))
+            // The command line's resolver (request field, else the model's chat default); served: "none" only.
+            const auto effort = serve::inkling2_reasoning_effort(body.find("reasoning_effort"));
+            if (!effort.is_string() || effort.as_string() != "none")
                 throw serve::ChatTemplateError("Inkling serving supports reasoning_effort none");
             serve::ApiChatPrompt prompt;
-            prompt.tokens = tokenizer->encode(render(*messages, {}, serve::Json("none")), true);
+            prompt.tokens = tokenizer->encode(render(*messages, {}, effort), true);
             return prompt;
         };
         config.output_parser = [](const std::string& text, bool, const serve::Json&) {

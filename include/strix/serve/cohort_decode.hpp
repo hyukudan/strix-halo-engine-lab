@@ -37,7 +37,18 @@
 // against the target's greedy choice; a per-lane selection transaction (JSON, thinking budget) may cut the window. Sampled requests use a single
 // row per lane per step. Every request's ids equal its solo run under the backend's batch invariance contract.
 //
+// Lone-lane speculation (CohortConfig::lane_speculation, off by default): while at most max_live requests are live,
+// each greedy decoding lane runs the command line's speculator step instead of the round (spec::BlockSpeculator over a
+// spec::BlockDrafter with the shared Arbiter, strix/serve/lane_speculation.hpp); when more requests are live the lane
+// takes the round again. A hand-over happens only between two speculator steps (each is one verify + commit).
+//
 // Pure host code: no device types. Engines bind CohortBackend; the arithmetic lives here.
+namespace strix::spec {
+class BlockDrafter;
+class ChainDrafter;
+struct BlockConfig;
+}  // namespace strix::spec
+
 namespace strix::serve {
 
 // One request's rows in a forward: `rows` consecutive rows of one lane (its pending token, then its drafts).
@@ -156,6 +167,25 @@ public:
     // passes through CohortDecoder::control. Under ReplicatedCohort every rank receives the same message at the same
     // point between backend calls. Default: no-op.
     virtual void control(std::span<const std::uint32_t> words);
+    // Lone-lane speculation (CohortConfig::lane_speculation). The lane's speculator verifies through verify / commit
+    // (one group of the lane, reads_scores false) and needs no other backend call; these hooks only add the engine's
+    // data, as SerialGenerationDecoder::chain_drafter / tune_speculation / seed_speculation do for the command line.
+    // lane_chain_drafter: the engine's model drafter attached to the lane, continuing from `anchor` (the lane's pending
+    // token, not committed) at `position` (the lane's committed positions); asked when the lane starts speculating and
+    // again when it resumes after taking the round (the drafter restarts from that point). Owned by the backend, valid
+    // until the lane is released or asked again. nullptr (default) = the copy (lookup) source only.
+    [[nodiscard]] virtual spec::ChainDrafter* lane_chain_drafter(std::uint32_t /*lane*/, std::uint32_t /*anchor*/,
+                                                                 std::uint64_t /*position*/) {
+        return nullptr;
+    }
+    // The engine's speculator data (arbiter windows, hybrid, chain seeds, clock) and cost seeds (verify walls, chain
+    // survival). Never change emitted ids. Default: none.
+    virtual void tune_lane_speculation(spec::BlockConfig& /*config*/) const {}
+    virtual void seed_lane_speculation(spec::BlockDrafter& /*drafter*/) const {}
+    // Whether the model drafter's inputs for the lane are complete (e.g. the target rows it reads were kept while the
+    // lane took the round). Asked before every lane_chain_drafter call; false = the lane speculates lookup-only for the
+    // rest of its request. Default true.
+    [[nodiscard]] virtual bool lane_speculation_ready(std::uint32_t /*lane*/) const { return true; }
 };
 
 struct CohortRequest {
@@ -207,6 +237,9 @@ struct CohortResult {
     // (Appended last, so positional initialisers of the leading fields stay valid.)
     // Why the request ended: "stop", "length", "context" (CohortRequest::context_tokens), "cancelled" or "error".
     std::string_view finish = "error";
+    // Lone-lane speculation receipt (CohortConfig::lane_speculation; empty when the lane never ran a speculator step):
+    // one JSON object of integers and booleans (CohortDecoder::finish).
+    std::string lane_speculation{};  // a default member initialiser: positional initialisers may stop before it
 };
 
 struct CohortConfig;
@@ -265,6 +298,20 @@ struct CohortConfig {
     bool trace_steps = false;
     // Use the backend's shared verify pass and price equal-width windows.
     bool uniform_verify_windows = false;
+    // Lone-lane speculation (off by default: every engine keeps the round). While live() <= max_live, a greedy decoding
+    // lane (no sampler, no selection policy) runs one spec::BlockSpeculator step per scheduler step instead of the round:
+    // at most max_rows rows (anchor + drafts; also capped by rows_per_forward, the backend's max_window and the lane's
+    // budget and positions). probe_loss is the model TOML's [speculation.probe_loss] value (spec::apply_probe_loss), as
+    // the command line's family speculation_probe_loss. Ids equal the round's (both are the target's greedy choice).
+    struct LaneSpeculation {
+        bool enabled = false;
+        std::uint32_t max_live = 1;
+        std::uint32_t max_rows = 8;
+        double probe_loss = 0.0;  // spec::kFixedReprobeInterval
+        // One stderr line per finished request that ran a speculator step: `strix-lane-spec {the receipt's fields,
+        // "stats": the strix-spec-stats JSON of the lane's drafter}` (diagnostic only: no schedule or bits change).
+        bool log = false;
+    } lane_speculation;
 };
 
 // Binds a mixed-service policy (prompt_piece.hpp) to a cohort: pieces of the policy's rows beside decoding lanes where
@@ -322,6 +369,15 @@ public:
     // was the only choice), and the largest predicted excess (ms).
     [[nodiscard]] std::uint64_t gap_overshoots() const noexcept { return gap_overshoots_; }
     [[nodiscard]] double gap_overshoot_ms() const noexcept { return gap_overshoot_ms_; }
+    // Lone-lane speculation (CohortConfig::lane_speculation): speculator steps run, hand-overs to the round
+    // (suspends), restarts after one (resumes), and requests that continued lookup-only because the model drafter's
+    // inputs were not complete at a start (CohortBackend::lane_speculation_ready false, or no drafter on a resume).
+    [[nodiscard]] std::uint64_t lane_speculation_steps() const noexcept { return lane_spec_steps_; }
+    [[nodiscard]] std::uint64_t lane_speculation_suspends() const noexcept { return lane_spec_suspends_; }
+    [[nodiscard]] std::uint64_t lane_speculation_resumes() const noexcept { return lane_spec_resumes_; }
+    [[nodiscard]] std::uint64_t lane_speculation_lookup_only() const noexcept { return lane_spec_lookup_only_; }
+    // Speculator starts where CohortBackend::lane_speculation_ready answered false (every lane, every request).
+    [[nodiscard]] std::uint64_t lane_speculation_ready_false() const noexcept { return lane_spec_ready_false_; }
     // Decode time (ms) still owed to decoding lanes for prompt time (CohortConfig::prompt_share).
     [[nodiscard]] double prompt_debt_ms() const noexcept { return planner_.debt_ms(); }
     // Test hook: a fixed clock step (ms) per call instead of the wall clock; 0 = wall clock.
@@ -366,6 +422,9 @@ private:
     std::unique_ptr<StepScratch> step_scratch_;
     std::uint64_t order_ = 0, steps_ = 0, rows_ = 0, used_bytes_ = 0;
     std::uint64_t prompt_groups_ = 0, grouped_prompts_ = 0, gap_overshoots_ = 0;
+    std::uint64_t lane_spec_steps_ = 0, lane_spec_suspends_ = 0, lane_spec_resumes_ = 0, lane_spec_lookup_only_ = 0;
+    std::uint64_t lane_spec_ready_false_ = 0;
+    std::uint32_t lane_spec_rows_ = 0;  // the lane speculator's widest window (max_rows within rows_per_forward)
     double gap_overshoot_ms_ = 0;
     std::uint32_t peak_live_ = 0;
     double decode_ms_ = 0, prompt_ms_ = 0, fake_clock_ms_ = 0, fake_now_ = 0;
