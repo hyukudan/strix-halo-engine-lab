@@ -463,7 +463,6 @@ raw-getenv src/ple_lookup.cpp 1
 raw-getenv src/ple_reclaim.cpp 7
 raw-getenv src/preflight.cpp 1
 raw-getenv src/serve/api.cpp 1
-raw-getenv src/serve/media.cpp 2
 raw-getenv src/speculative_verify_runtime.cpp 2
 raw-getenv src/token_sampling.cpp 4
 raw-getenv src/vision/embed_cache.cpp 1

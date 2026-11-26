@@ -1,5 +1,7 @@
 #include "strix/serve/media.hpp"
 
+#include "strix/env_flags.hpp"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -421,8 +423,8 @@ FetchPolicy parse_fetch_policy(std::string_view mode, std::string_view hosts) {
 }
 
 FetchPolicy fetch_policy_from_env() {
-    const char* mode = std::getenv("STRIX_SERVE_IMAGE_FETCH");
-    const char* hosts = std::getenv("STRIX_SERVE_IMAGE_HOSTS");
+    const char* mode = envcfg::lookup_unrecorded("STRIX_SERVE_IMAGE_FETCH");
+    const char* hosts = envcfg::lookup_unrecorded("STRIX_SERVE_IMAGE_HOSTS");
     return parse_fetch_policy(mode ? mode : "", hosts ? hosts : "");
 }
 
