@@ -69,6 +69,9 @@ struct RowLimits {
     // then shortens the run only on a lane that would otherwise end last; on a lane that ends earlier at its
     // minimum rows a yielded token only removes that lane's own later row (step 4 below).
     bool drain = false;
+    // Price equal-width windows over the admitted lanes together. If their
+    // mandatory rows differ, use the ordinary ragged planner.
+    bool uniform_windows = false;
 };
 
 struct RowPlan {

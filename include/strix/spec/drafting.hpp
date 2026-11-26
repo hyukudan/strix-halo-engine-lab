@@ -231,6 +231,7 @@ struct ArbiterConfig {
     double model_sd = 0.0;
     ArbiterMode mode = ArbiterMode::Adaptive;
     ChanceWindowTables chance_window{};
+    std::vector<std::uint32_t> max_draft_by_live{};
 };
 
 struct StepInput {
@@ -250,6 +251,7 @@ struct StepInput {
     // ChanceWindow only: one probability per already-drafted ID, in proposal order. Empty omits the model arm.
     // This replaces the pre-draft model inputs. Proposal work is sunk, so decisions price verification only.
     std::span<const float> model_confidence{};
+    std::uint32_t live_lanes = 1;
 };
 
 struct Decision {

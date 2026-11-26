@@ -1468,7 +1468,30 @@ void probe_policy_tests() {
     set_probe_switch(nullptr);
 }
 
+void live_depth_tests() {
+    namespace sp = strix::spec;
+    sp::ArbiterConfig config;
+    config.windows = {1, 2, 3, 4, 5, 6, 7, 8};
+    config.max_draft_by_live = {7, 4, 0};
+    sp::Arbiter arbiter(config);
+    sp::Proposal lookup;
+    lookup.tokens = {1, 2, 3, 4, 5, 6, 7};
+    sp::StepInput input;
+    input.lookup = &lookup;
+    input.force_lookup = true;
+    SP_CHECK(arbiter.decide(input).k == 7, "one live lane keeps the full proposal");
+    input.live_lanes = 2;
+    SP_CHECK(arbiter.decide(input).k == 4, "two live lanes cap speculative depth");
+    input.remaining = 3;
+    SP_CHECK(arbiter.decide(input).k == 2, "remaining output still caps the proposal");
+    input.live_lanes = 8;
+    SP_CHECK(arbiter.decide(input).k == 0, "wider cohorts reuse the last entry, including zero");
+    input.remaining = 0;
+    SP_CHECK(arbiter.decide(input).rows == 0, "no work when the output budget is exhausted");
+}
+
 int main() {
+    live_depth_tests();
     probe_policy_tests();
     cold_wall_tests();
     honest_plain_price_tests();

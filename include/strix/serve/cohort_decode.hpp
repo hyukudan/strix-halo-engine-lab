@@ -66,6 +66,9 @@ public:
     virtual ~CohortBackend() = default;
     [[nodiscard]] virtual std::uint32_t lanes() const = 0;             // sessions the backend holds
     [[nodiscard]] virtual std::uint32_t rows_per_forward() const = 0;  // physical rows of one forward, all groups
+    // Positive only when verify() can run a rectangle of consecutive rows
+    // per lane in one physical pass and commit its window prefixes independently.
+    [[nodiscard]] virtual std::uint32_t max_batch_verify_rows() const { return 0U; }
     [[nodiscard]] virtual std::uint32_t max_positions() const = 0;     // positions one lane can hold
     // Starts or continues the lane's prompt: appends `tokens` to the lane's committed state (no logits needed).
     // first = true resets the lane before the rows.
@@ -260,6 +263,8 @@ struct CohortConfig {
     // lanes and wall of its decode round, the scheduler's idle time before it, the prompts waiting and the decode
     // time owed (prompt_share). Diagnostic only: no schedule or bits change.
     bool trace_steps = false;
+    // Use the backend's shared verify pass and price equal-width windows.
+    bool uniform_verify_windows = false;
 };
 
 // Binds a mixed-service policy (prompt_piece.hpp) to a cohort: pieces of the policy's rows beside decoding lanes where

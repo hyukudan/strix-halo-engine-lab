@@ -1,5 +1,6 @@
 // Shared multi-request decoder (strix/serve/cohort_decode.hpp).
 #include "strix/serve/cohort_decode.hpp"
+#include "strix/spec/draft_depth.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/serve/job_sampling.hpp"
 
@@ -224,10 +225,7 @@ void CohortDecoder::submit(CohortRequest request) {
 void CohortDecoder::control(std::span<const std::uint32_t> words) { backend_.control(words); }
 
 std::uint32_t max_draft_for_live(const CohortConfig& config, std::uint32_t live) noexcept {
-    const auto& table = config.max_draft_by_live;
-    if (table.empty()) return config.max_draft;
-    const std::size_t index = live == 0U ? 0U : std::min<std::size_t>(live - 1U, table.size() - 1U);
-    return std::min(config.max_draft, table[index]);
+    return spec::draft_depth_for_lanes(config.max_draft_by_live, live, config.max_draft);
 }
 
 bool CohortDecoder::idle() const noexcept { return waiting_.empty() && live() == 0; }
@@ -608,7 +606,12 @@ void CohortDecoder::step() {
     std::vector<std::vector<float>> accept(n);
     std::vector<LaneDemand> demands(n);
     std::vector<std::size_t> device_rows(n, 0);  // leading device-draft rows of a window (context rows follow them)
-    const std::uint32_t draft_cap = max_draft_for_live(config_, live());
+    const auto backend_rows = backend_.rows_per_forward();
+    const auto batch_rows = config_.uniform_verify_windows
+        ? std::min(backend_rows, backend_.max_batch_verify_rows()) : 0U;
+    const bool uniform = batch_rows >= n;
+    auto draft_cap = max_draft_for_live(config_, live());
+    if (uniform) draft_cap = std::min(draft_cap, batch_rows / static_cast<std::uint32_t>(n) - 1U);
     std::vector<std::uint32_t> device;
     std::vector<double> device_p, acc, device_acc;
     for (std::size_t k = 0; k < n; ++k) {
@@ -680,7 +683,8 @@ void CohortDecoder::step() {
         demands[k].waited_ms = l.waited_ms;
     }
     RowLimits row_limits;
-    row_limits.rows_per_forward = backend_.rows_per_forward();
+    row_limits.rows_per_forward = uniform ? batch_rows : backend_rows;
+    row_limits.uniform_windows = uniform;
     row_limits.drain = waiting_.empty();  // nobody waits for a lane: a lane that ends early frees nothing
     const RowPlan rp =
         plan_rows(demands, fitted_cost(sums_, config_, static_cast<std::uint32_t>(n)), row_limits, config_.accept_prior);
