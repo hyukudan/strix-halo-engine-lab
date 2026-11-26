@@ -79,20 +79,24 @@ public:
         (void)plain_program;
 #endif
 #if !defined(__HIPCC__)
-        // Verify window programs (one captured graph per window rows; device identity fixture q52r PASS): an explicit
-        // option until a timing receipt decides the default of the drafting passes. The fixture covers the EXACT
-        // levers (projected bias, screened or full head) over BF16 role storage: a profile with a FAST weight-image or
-        // expert lever, or Q8_0 attention / head storage, declines.
-        if (const char* window = strix::envcfg::text("STRIX_INKLING_WINDOW_PROGRAMS"); window && std::string_view(window) == "1") {
-            const bool proven = !combine_image && !prepared_round_fold && !narrow_experts && !controller_one_plane &&
-                                moe_w4a4 == moe_core::grouped_w4a4::Activations::bf16 && attn_projected_bias &&
-                                storage.attention == weight::kBf16WeightStorage &&
-                                storage.head == weight::kBf16WeightStorage;
-            if (proven) decoder_.set_window_programs(true);
-            else std::cerr << "inkling2 verify window programs declined (unproven for this profile: the identity "
-                              "fixture covers the EXACT levers only)\n";
-        }
-        std::cerr << "inkling2 verify window programs " << (decoder_.window_programs() ? "on" : "off") << '\n';
+        // Verify window programs (one captured graph per window rows; device identity fixture q52r PASS; timing q62: code
+        // 170.8 / 169.3 tok/s vs 132.0 / 132.8 eager, ids equal): default on for the profile the fixture covers (EXACT
+        // levers: projected bias, screened or full head, BF16 attention and head storage); a FAST weight-image or expert
+        // lever, or Q8_0 attention / head storage, declines with the reason.
+        // Off switch STRIX_INKLING_WINDOW_PROGRAMS=0. With a drafter every width is captured here, at load, so no capture
+        // wall enters a timed decode (prewarm_window_programs; the line counts them, and the end line counts any later).
+        const char* window = strix::envcfg::text("STRIX_INKLING_WINDOW_PROGRAMS");
+        const bool asked = !(window && std::string_view(window) == "0");
+        const bool proven = !combine_image && !prepared_round_fold && !narrow_experts && !controller_one_plane &&
+                            moe_w4a4 == moe_core::grouped_w4a4::Activations::bf16 && attn_projected_bias &&
+                            storage.attention == weight::kBf16WeightStorage &&
+                            storage.head == weight::kBf16WeightStorage;
+        if (asked && proven) decoder_.set_window_programs(true);
+        else if (asked) std::cerr << "inkling2 verify window programs declined (unproven for this profile: the identity "
+                                     "fixture covers the EXACT levers only)\n";
+        std::cerr << "inkling2 verify window programs " << (decoder_.window_programs() ? "on" : "off");
+        if (dspark && decoder_.window_programs()) std::cerr << " prewarmed " << decoder_.prewarm_window_programs();
+        std::cerr << '\n';
 #endif
         // Calibration statistics (off unless STRIX_CALIB_MOMENTS=FILE): the prompt's attention / output-projection /
         // head input rows accumulate into strix/weight/calib_moments.hpp second moments, written after each prefill.
@@ -102,6 +106,17 @@ public:
             decoder_.set_calibration_moments(&*calibration_);
         }
     }
+
+    // Receipt of the verify window programs over the run: equal to the load line's prewarmed count when no width was
+    // captured inside the decode.
+    ~DeviceCliDecoder() override {
+#if !defined(__HIPCC__)
+        if (decoder_.window_programs())
+            std::cerr << "inkling2 verify window programs captured " << decoder_.window_program_captures() << '\n';
+#endif
+    }
+    DeviceCliDecoder(const DeviceCliDecoder&) = delete;
+    DeviceCliDecoder& operator=(const DeviceCliDecoder&) = delete;
 
     unsigned prefill(std::span<const unsigned> ids, std::span<float> logits) override {
         // Provenance: the prompt is registered as a window before its rows are captured, every captured row counts
@@ -125,6 +140,13 @@ public:
         // The plain-row route when bound (the step program over this decoder's state), else the resident step.
         return decoder_.decode_committed_row(token, logits);
     }
+#if defined(STRIX_INKLING2_STEP_PROGRAM)
+    // Sampled rows on the plain-row route: the step program's full-head row sampled on the device (decode_sampled).
+    [[nodiscard]] bool samples_on_device() const override { return plain_.has_value() && decoder_.plain_row_applies(); }
+    std::uint32_t decode_sampled(std::uint32_t token, TokenSampler& sampler, std::uint64_t position) override {
+        return plain_->decode_sampled(token, sampler, position);
+    }
+#endif
     unsigned prefill_embedded(std::span<const unsigned> ids, const std::shared_ptr<const session::EmbedTable>& table,
                               std::span<float> logits) override {
         if (!table) return decoder_.prefill(ids, logits);

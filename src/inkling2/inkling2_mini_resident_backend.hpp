@@ -599,6 +599,14 @@ public:
         // try_launch closes even a failed capture before it returns or throws.
         return false;
     }
+    // A prompt drops the one-row step program only. The verify window programs are position-free like the cohort
+    // programs (row positions and the slot come from the step block, every other address is fixed for this backend's
+    // lifetime), so they stay captured across requests; a change of levers, head form or low-bit arithmetic still drops
+    // them through abandon_capture / reset_step_graph.
+    bool abandon_step_capture() noexcept {
+        graph_.invalidate();
+        return false;
+    }
 
     // Decode expert form this backend was built with (packed one-row form or the grouped tile kernel).
     [[nodiscard]] bool packed_decode() const noexcept { return packed_decode_; }

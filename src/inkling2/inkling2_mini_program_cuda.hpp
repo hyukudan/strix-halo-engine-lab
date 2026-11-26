@@ -20,6 +20,7 @@
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 #include "inkling2_mini_resident_decoder.hpp"
 #include "inkling2_mini_weight_options.hpp"
+#include "strix/cuda/token_sampling_device.hpp"
 #include "strix/env_flags.hpp"
 #include <iostream>
 #else
@@ -661,6 +662,10 @@ public:
 
     unsigned prefill(std::span<const unsigned> ids, std::span<float> logits);
     unsigned decode(unsigned token, std::span<float> logits);
+    // A sampled step: the full-head program (graph_id 0, as a step that returns the logits row) without the row's host
+    // copy; the shared CUDA token sampler decides the device row with `sampler`'s uniforms for `position` (the
+    // decision sampler.decide makes over the host row) and counts it in `sampler`.
+    std::uint32_t decode_sampled(unsigned token, TokenSampler& sampler, std::uint64_t position);
     void reset_gate_session();
     void prefill_gate_rows(std::span<const unsigned> ids, std::span<float> logits);
     void set_gate_route_tap(moe::RouteTap*);
@@ -705,7 +710,17 @@ struct MiniCudaProgramDecoder::Impl {
           grouped_descriptors(grouped ? 2U * kExpertsPerToken : 0U),
           messages(forms.bank_batch ? kMiniMessageBatchElements : 0U) {}
 
-    unsigned decode(unsigned token, std::span<float> host_logits) {
+    std::uint32_t decode_sampled(unsigned token, TokenSampler& sampler, std::uint64_t position) {
+        (void)decode(token, {}, true);
+        if (!sampler_device) sampler_device.emplace(kOutputVocabulary, 1U);
+        const auto scores = decoder.step_program_logits();
+        const DeviceSampleRow row{{{}, reinterpret_cast<std::uintptr_t>(scores.data()), scores.size_bytes(), 0U}, position};
+        const auto decision = sampler_device->decide(sampler, std::span(&row, 1U), decoder.step_program_backend().stream()).at(0);
+        sampler.count(decision);
+        return decision.token;
+    }
+
+    unsigned decode(unsigned token, std::span<float> host_logits, bool device_scores = false) {
         if (token >= kVocabulary || (!host_logits.empty() && host_logits.size() != kOutputVocabulary))
             throw std::invalid_argument("invalid Inkling step program input or logits row");
         auto& backend = decoder.step_program_backend();
@@ -722,7 +737,7 @@ struct MiniCudaProgramDecoder::Impl {
         // returns the logits row, and every step without the lever, keeps the full-head program (graph_id 0, the
         // incumbent key).
         const auto* screen = decoder.step_program_screen();
-        const bool screened = screen != nullptr && host_logits.empty();
+        const bool screened = screen != nullptr && host_logits.empty() && !device_scores;
         std::optional<core::screened_head_plan::Launch> launch;
         if (screened) launch = screen->launch(nullptr);
         const MiniCudaStepRows rows{decoder.step_program_embeddings(), decoder.step_program_hidden(),
@@ -835,6 +850,7 @@ struct MiniCudaProgramDecoder::Impl {
     }
 
     MiniResidentDecoder& decoder;
+    std::optional<CudaTokenSamplerDevice> sampler_device;  // decode_sampled (built at the first sampled step)
     const bool grouped;
     const bool epilogue_fusion;
     const exec::cuda_decode::R1Forms forms;
@@ -862,6 +878,9 @@ inline unsigned MiniCudaProgramDecoder::prefill(std::span<const unsigned> ids, s
 }
 inline unsigned MiniCudaProgramDecoder::decode(unsigned token, std::span<float> logits) {
     return impl_->decode(token, logits);
+}
+inline std::uint32_t MiniCudaProgramDecoder::decode_sampled(unsigned token, TokenSampler& sampler, std::uint64_t position) {
+    return impl_->decode_sampled(token, sampler, position);
 }
 inline void MiniCudaProgramDecoder::reset_gate_session() { impl_->decoder.reset_gate_session(); }
 inline void MiniCudaProgramDecoder::set_gate_route_tap(moe::RouteTap* tap) {
@@ -903,6 +922,10 @@ inline std::unique_ptr<serve::SerialGenerationDecoder> load_mini_cuda_program(co
             return next;
         }
         unsigned decode(unsigned token, std::span<float> logits) override { return program.decode(token, logits); }
+        [[nodiscard]] bool samples_on_device() const override { return true; }
+        std::uint32_t decode_sampled(std::uint32_t token, TokenSampler& sampler, std::uint64_t position) override {
+            return program.decode_sampled(token, sampler, position);
+        }
         MiniResidentDecoder resident;
         MiniCudaProgramDecoder program;
         bool projected_bias_;

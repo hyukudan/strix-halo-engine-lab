@@ -225,7 +225,7 @@ public:
     // the output projection. If a later chunk fails after an earlier one
     // committed, retire the session so a retry cannot append the prefix twice.
     [[nodiscard]] unsigned prefill(std::span<const unsigned> prompt, std::span<float> logits = {}) {
-        backend_.abandon_capture();
+        backend_.abandon_step_capture();  // the verify window programs stay (prewarm_window_programs)
         auto& state = slots_.front()->state();
         validate_inputs(state, prompt, logits);
         return state.append_sequence(prompt, [&](std::span<const unsigned> chunk, bool last) {
@@ -239,7 +239,7 @@ public:
     [[nodiscard]] unsigned prefill_spliced(std::span<const unsigned> prompt, const session::EmbedSplice& splice,
                                    std::span<float> logits = {}) {
         if (splice.empty()) return prefill(prompt, logits);
-        backend_.abandon_capture();
+        backend_.abandon_step_capture();
         auto& state = slots_.front()->state();
         validate_inputs(state, prompt, logits);
         splice.validate(prompt.size(), kHiddenWidth);
@@ -409,11 +409,50 @@ public:
     }
     [[nodiscard]] std::span<float> step_program_embeddings() noexcept { return embeddings_.span().first(kHiddenWidth); }
     [[nodiscard]] std::span<float> step_program_hidden() noexcept { return hidden_.span().first(kHiddenWidth); }
-    // Verify window programs (MiniResidentBackend::try_window_graph): an explicit opt-in until the device identity
-    // fixture (tests/inkling2/mini_window_program_device_fixture.hpp) proves every stage of the captured window equal to
-    // the eager verify pass; off, every staged verify window runs eagerly (the incumbent route).
+    // Verify window programs (MiniResidentBackend::try_window_graph): the device identity fixture
+    // (tests/inkling2/mini_window_program_device_fixture.hpp, q52r) proves every stage of the captured window equal to
+    // the eager verify pass for the EXACT levers; the owner (the CUDA CLI) turns them on for that profile. Off, every
+    // staged verify window runs eagerly.
     void set_window_programs(bool enabled) noexcept { window_programs_ = enabled; }
     [[nodiscard]] bool window_programs() const noexcept { return window_programs_; }
+    // Capture the verify window program of every width 2..max_verify_rows() before the first request (load time, slot 0
+    // empty): the first window of a width otherwise captures inside the timed decode (+18..+28 ms per width on the RTX
+    // PRO, q53), and those one-time walls steered the arbiter's probe episodes (the q53 / q60 collapses, the q62 prose
+    // deficit). Each width runs one staged window of token 0 at position 0 through the program route, then the slot is
+    // reset (fresh frontier, histories cleared; the prompt overwrites the rows and taps it wrote). The head form is
+    // settled first as the greedy one-row decode step would settle it, so that step does not drop the programs again.
+    // Returns the number of widths captured (0: programs off, graphs off, or not at load).
+    unsigned prewarm_window_programs() {
+#if !defined(__HIPCC__)
+        auto& state = slots_.front()->state();
+        if (!window_programs_ || !backend_.step_graphs() || state.committed() != 0U || state.staged()) return 0U;
+        const bool screened = !backend_.lowbit_applies(MiniAppendKind::decode, 1U) &&
+            mini_screened_pick(head_.reason, screen_.has_value(), MiniAppendKind::decode, true, false, false);
+        if (screened != screened_graph_) {
+            backend_.abandon_capture();
+            screened_graph_ = screened;
+        }
+        const auto before = backend_.window_graphs().instantiations();
+        const std::array<unsigned, kMaxVerifyRows> ids{};
+        for (unsigned rows = 2U; rows <= max_verify_rows(); ++rows) {
+            (void)forward_rows(ids.data(), rows, LogitRows::all);
+            reset_slot(0U);
+        }
+        mini_gpu::synchronize(stream_.get());
+        return backend_.window_graphs().instantiations() - before;
+#else
+        return 0U;
+#endif
+    }
+    // Verify window programs captured over this decoder's lifetime (prewarm included): a count that does not grow during
+    // a timed decode shows that no capture wall entered it.
+    [[nodiscard]] unsigned window_program_captures() const noexcept {
+#if !defined(__HIPCC__)
+        return backend_.window_graphs().instantiations();
+#else
+        return 0U;
+#endif
+    }
     // The final hidden rows of the last append (device rows, the head inputs) and the DSpark tap plane (device, every
     // position): read-only views for the window program identity fixture.
     [[nodiscard]] std::span<const float> last_hidden_rows(unsigned rows) const {
@@ -686,6 +725,10 @@ public:
     using PlainRowRoute = std::function<unsigned(unsigned, std::span<float>)>;
     void set_plain_row_route(PlainRowRoute route) { plain_row_ = std::move(route); }
     [[nodiscard]] bool plain_row_route() const noexcept { return static_cast<bool>(plain_row_); }
+    // decode_committed_row takes the plain-row route (not a calibrated low-bit decode row).
+    [[nodiscard]] bool plain_row_applies() const noexcept {
+        return plain_row_ && !backend_.lowbit_applies(MiniAppendKind::decode, 1U);
+    }
 
     void commit(unsigned rows) {
         auto& state = slots_.front()->state();
@@ -1538,7 +1581,7 @@ private:
     std::optional<Screen> screen_;
     PlainRowRoute plain_row_;  // set_plain_row_route: the speculator's one-row steps (empty: this decoder's decode)
 #if !defined(__HIPCC__)
-    bool window_programs_{false};  // set_window_programs: opt-in until the device identity fixture passes
+    bool window_programs_{false};  // set_window_programs: the owner decides (the CUDA CLI: on for the EXACT levers)
 #endif
 #if defined(__HIPCC__)
     bool verify_lanes_pick_{false};  // verify rows level 2 admitted (set_verify_rows): lanes screened picks
