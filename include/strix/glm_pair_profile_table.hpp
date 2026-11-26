@@ -95,7 +95,7 @@ inline constexpr strix::profile::LadderRow product_ladder_rows[] = {
      .device = kTurboPrefillDevice, .min_context = 2049, .max_context = 8192, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1.50, .noise = 0.10,
      .receipt = "GLM pair 8K FAST bundle vs EXACT cores (gate v2 8K route replay PASS), docs/optimizations.md#glm-pf-wmma-x",
-     .band_bound = true, .band_evidence = {{8192}, {8192}, kFastGatePfWmma, true}}};
+     .identity = "v1", .band_bound = true, .band_evidence = {{8192}, {8192}, kFastGatePfWmma, true}}};
 #undef STRIX_GLM_TURBO_ARM
 inline const strix::profile::Engine product_profile_engine{"glm-pair", "", product_profile_table, false, "glm-turbo-v1",
                                                            {}, {}, product_ladder_rows};

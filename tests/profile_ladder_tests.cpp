@@ -1722,6 +1722,7 @@ void band_chain() {
     }};
     const auto band = [](std::string_view lever, std::string_view value, double speedup) {
         p::LadderRow row{lever, value, p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, speedup, 0.02, "r/band"};
+        row.identity = "v1";
         row.band_bound = true;
         row.band_evidence = {{1}, {}, {}};
         return row;
@@ -1736,6 +1737,13 @@ void band_chain() {
     require(layers && layers->value == "l" && p::applied(layers->status) &&
                 layers->ladder_reference.find("chain-window@1=w{v1}") != std::string::npos,
             "second band lever binds over the first lever's admitted cell and runs");
+    auto changed_table = table;
+    changed_table[1].identity[1].identity = "v2";
+    auto changed_engine = engine;
+    changed_engine.table = changed_table;
+    const auto revision = resolve(changed_engine, p::Name::fast, {p::Phase::prefill, 4096, 1, "dev", kExec});
+    require(p::applied(revision.find("chain-window@1")->status) && !p::applied(revision.find("chain-layers@1")->status),
+            "a band receipt cannot bind to a newer candidate implementation");
     const auto unknown = resolve(engine, p::Name::fast, {p::Phase::prefill, 4096, 1, "dev", {}});
     require(!p::applied(unknown.find("chain-window@1")->status) && !p::applied(unknown.find("chain-layers@1")->status),
             "unknown execution: no band row decides");

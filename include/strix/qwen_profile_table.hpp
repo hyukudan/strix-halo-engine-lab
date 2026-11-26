@@ -153,10 +153,10 @@ inline constexpr ::strix::profile::LadderRow ladder_rows[] = {
     // numbers here (ms FAST over cap9 gives speedup = fast / cap9); the receipt text names the evidence.
     {.lever = "moe_route_prune", .value = "cap9", .tier = Name::turbo, .phase = ::strix::profile::Phase::prefill,
      .device = "gfx1151", .min_context = 4096, .max_context = 8192, .min_lanes = 1, .max_lanes = 1,
-     .speedup = kCap9Speedup8k, .noise = kCap9Noise, .receipt = kCap9Receipt8k, .band_bound = true,
+     .speedup = kCap9Speedup8k, .noise = kCap9Noise, .receipt = kCap9Receipt8k, .identity = "route-prune-v1", .band_bound = true,
      .band_evidence = {{8192}, {8192}, "Composite vs EXACT at 8K, KL 0.00528, top-1 0.9707, dNLL +0.0050.", true}},
     {.lever = "moe_route_prune", .value = "cap9", .tier = Name::turbo, .phase = ::strix::profile::Phase::prefill,
      .device = "gfx1151", .min_context = 8193, .max_context = 32768, .min_lanes = 1, .max_lanes = 1,
-     .speedup = kCap9Speedup32k, .noise = kCap9Noise, .receipt = kCap9Receipt32k, .band_bound = true,
+     .speedup = kCap9Speedup32k, .noise = kCap9Noise, .receipt = kCap9Receipt32k, .identity = "route-prune-v1", .band_bound = true,
      .band_evidence = {{32768}, {8192}, "Composite gate at 8K; no 32K gate length cited.", true}},
 };

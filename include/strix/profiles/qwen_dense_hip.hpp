@@ -102,7 +102,7 @@ inline constexpr std::string_view kTime24k = "qwen_night-tim-c2-24k(-exact) 24,5
                                                      sp::BandEvidence evidence) {
     return {.lever = lever, .value = value, .tier = sp::Name::fast, .phase = sp::Phase::prefill, .device = "gfx1151",
             .min_context = lo, .max_context = hi, .min_lanes = 1, .max_lanes = 1, .speedup = speedup, .noise = kNoise,
-            .receipt = receipt, .band_bound = true, .band_evidence = evidence};
+            .receipt = receipt, .identity = "v1", .band_bound = true, .band_evidence = evidence};
 }
 inline constexpr sp::LadderRow kBandRows[] = {
     band_row("wide_rows", "512", 1, 2048, kWide2k, kTime2k, {{2048}, {2048}, kGate2k, true}),

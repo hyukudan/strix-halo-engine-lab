@@ -276,17 +276,14 @@ struct LadderRow {
     // tier, phase, device class and band: ladder_receipt_matches()); any other run is outside the row, which then has
     // no effect at all there. Paired rows bind through `joint_scope` instead.
     std::string_view over{};
-    // Incumbent grants only: the implementation identity the grant was given to (Lever::identity of the granted value).
-    // The grant keeps the cell only while the table declares exactly that identity for the value the cell runs; a
-    // changed implementation under the same value is not granted (it needs its own timing receipt). Never empty on a
-    // grant (ladder_defect()).
+    // The implementation identity the incumbent grant or band receipt covers (Lever::identity of the candidate value).
+    // A changed implementation under the same value needs its own receipt. Required for grants and band receipts.
     std::string_view identity{};
     // Band receipt: the row was timed at representative workloads of its band (min_context..max_context) on its device
     // class and carries no literal `over`. An adapter that spells Regime::execution binds it per resolution with
     // bind_band_receipts(): `over` becomes that run's own reference (LadderArms::over) for the row's lever, value and
-    // tier, so the row still decides only the complete lever chain with its declared identities, the tier, the phase,
-    // the device class and the band, and only where the execution is known (priced workload, device product). Unbound
-    // (no execution) it matches nothing.
+    // tier. The adapter owns the measured execution scope (product, pack and route). The binder requires a known
+    // execution and the measured candidate identity above before matching the phase, device class and band.
     bool band_bound = false;
     BandEvidence band_evidence{};
 };
@@ -1289,18 +1286,21 @@ template <class Row, class AdmitOf, class ExplicitOf = NoExplicitSetting>
     return arms;
 }
 
-// The execution a probe of a band receipt runs on (the receipt names none; any known execution binds it).
+// A synthetic execution for probing the band and candidate identity checks without an adapter.
 inline constexpr std::string_view kBandProbeExecution = "exec/v1 band-probe";
 // Binds the band receipts of `rows` to the run's own reference (LadderRow::band_bound). `storage` owns the spellings
-// (a deque: views stay valid) and must outlive the rows. Rows whose reference is empty (execution not known, a value
-// without a declared identity) stay unbound and decide nothing. A row already bound is re-bound when its reference
+// (a deque: views stay valid) and must outlive the rows. Rows with an unknown execution, unidentified reference or
+// changed candidate identity stay unbound and decide nothing. A row already bound is re-bound when its reference
 // changed: the reference of a later lever extends the cells the earlier rows admitted (the ladder chain), so a caller
 // repeats bind + arms until nothing changes (resolve() does). Returns true when a row's reference changed.
 inline bool bind_band_receipts(std::vector<LadderRow>& rows, const LadderArms& arms, std::deque<std::string>& storage) {
     bool changed = false;
     for (auto& row : rows) {
         if (!row.band_bound || row.incumbent || !row.joint.empty()) continue;
-        auto over = arms.over(row.tier, row.lever, row.value);
+        const auto at = arms.index(row.lever);
+        const bool measured_candidate = identity_token(row.identity) && at < arms.identities.size() &&
+            declared_identity(arms.identities[at], row.value) == row.identity;
+        auto over = measured_candidate ? arms.over(row.tier, row.lever, row.value) : std::string{};
         if (over == row.over) continue;
         if (over.empty()) row.over = {};
         else {
@@ -1528,6 +1528,8 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
                 return where + ": paired row names no other lossy lever of the table";
         }
         if (row.joint.empty() && row.value.empty()) return where + ": timing row names no measured value";
+        if (row.band_bound && (!row.joint.empty() || !identity_token(row.identity)))
+            return where + ": band receipt requires a single measured candidate and its implementation identity";
         if (row.joint.empty() && !row.band_bound && ladder_reference_execution(row.over).empty())
             return where + ": timing row without a versioned reference execution (LadderArms::over spelling)";
         if (row.joint.empty() && !row.band_bound && !row.over.ends_with(std::string(";tier=") + name(row.tier)))
