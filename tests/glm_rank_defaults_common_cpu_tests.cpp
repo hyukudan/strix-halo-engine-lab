@@ -239,6 +239,10 @@ void test_glm_turbo_pair_and_scope() {
     link[3].link_gbps = 20.0;
     CHECK(!rd::measured_prefill_pair(device, link, false));
     link[3].link_gbps = 40.0;
+    device.name = "Radeon 8060S Graphics";  // the nodes' default runtime omits the vendor prefix (turn glm_bind-cli)
+    CHECK(rd::measured_prefill_pair(device, link, false));
+    device.name = "AMD Radeon 8060S Graphicsx";
+    CHECK(!rd::measured_prefill_pair(device, link, false));
     device.name = "unmeasured gfx1151";
     CHECK(!rd::measured_prefill_pair(device, link, false));
 

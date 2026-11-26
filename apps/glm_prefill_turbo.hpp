@@ -5,14 +5,21 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <string_view>
 
 namespace strix::glm::rank_defaults {
 
 // This receipt used one integrated 8060S per rank, the host transport, and two
 // streams per 40 Gb/s cable. Unknown/mixed bindings decline in the pair vote.
+// The runtime spells the product with or without the vendor prefix ("AMD Radeon 8060S Graphics" on one ROCm,
+// "Radeon 8060S Graphics" on the nodes' default one): both name the same integrated gfx1151 device.
+inline bool measured_prefill_device_name(std::string_view name) {
+    if (name.starts_with("AMD ")) name.remove_prefix(4);
+    return name == "Radeon 8060S Graphics";
+}
 inline bool measured_prefill_pair(const strix::device::Visible& device, const auto& streams, bool direct) {
     if (device.vendor != strix::device::Vendor::amd || !device.integrated || device.arch != "gfx1151" ||
-        device.name != "AMD Radeon 8060S Graphics" || direct) return false;
+        !measured_prefill_device_name(device.name) || direct) return false;
     if (streams.size() != 4U || std::any_of(streams.begin(), streams.end(), [](const auto& stream) {
             return stream.xdomain.empty() || stream.link_gbps != 40.0;
         })) return false;
