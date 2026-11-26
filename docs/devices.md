@@ -85,6 +85,12 @@ for NVIDIA cards is the total the runtime reports. The build embeds the profiles
 [data/devices/profiles.toml](../data/devices/profiles.toml). Run `strix-device-plan --toml` to export
 the built-in profiles with the interconnect classes.
 
+Entries marked `unmeasured = true` describe hardware classes without supplying memory capacity, bandwidth,
+tensor throughput or a tuned schedule. The current generic rows cover 32-CU Strix Halo, Gorgon
+(`gfx1152`, `gfx1153`), AMD CDNA (`gfx942`, `gfx950`), Intel Arc Xe2, Apple Silicon and a HIP catch-all.
+Supply sizing facts in the declaration when planning with these entries. A catalogue entry alone confers
+no model or kernel support.
+
 | profile | arch | memory GiB | GB/s | units | FP32 | FP16 | BF16 | FP8 | FP4 | INT8 | host link | measured |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
 | rtx-pro-6000-blackwell-96 | sm_120 | 95.59 | 1792 | 188 SM | 125.0 | 500.0 | 500.0 | 1000.0 | 2000.0 | 1000.0 | pcie5x16 | memory_bytes, units |

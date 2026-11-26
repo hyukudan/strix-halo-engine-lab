@@ -122,6 +122,12 @@ resolution before adding overrides. `ON` means enabled; `auto` means enabled whe
 The [JSON catalog](optimizations.json) provides the same controls for tools; the [README](../README.md)
 is the compact overview, and [toggles](toggles.md) lists every switch by area. Run commands and agent instructions are in [AGENTS.md](../AGENTS.md).
 
+### Unmeasured device catalogue entries
+
+The shared device catalogue provides planning identities for additional AMD, Intel and Apple GPU families.
+Entries marked `unmeasured` carry no capacity or throughput estimates and confer no route qualification.
+The interconnect catalogue references the shared topology classes. [Device catalogue](devices.md#catalogue)
+
 Exactness requires fixed model content, prompt, state, profile pair and capacity. Qwen fast FP16 prefill,
 dense A8, GSQ, DeepSeek trellis and GLM R1b are distinct numerical identities. Speculation verifies committed
 tokens against its target from the prefill handoff state; draft changes can affect acceptance without changing

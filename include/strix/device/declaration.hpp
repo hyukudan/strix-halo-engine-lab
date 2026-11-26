@@ -84,7 +84,7 @@
 // `front` and `experts` are GPU roles; an NPU takes only `aux`; a CPU takes only `host` and `aux`.
 namespace strix::device {
 
-enum class Vendor { amd, nvidia, intel };
+enum class Vendor { amd, nvidia, intel, apple };
 [[nodiscard]] std::string_view vendor_name(Vendor vendor) noexcept;
 [[nodiscard]] Vendor parse_vendor(std::string_view text); // throws std::invalid_argument
 

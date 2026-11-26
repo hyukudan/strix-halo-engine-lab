@@ -130,3 +130,179 @@ host_link = ""
 unified = false
 measured = ""
 note = "set memory_gib (and optionally bandwidth_gbytes_ps, units) in the entry"
+
+# Generic identities supply no capacity, throughput or schedule calibration.
+
+[[profiles]]
+name = "strix-halo-32cu"
+display = "AMD Strix Halo (32 CU)"
+vendor = "amd"
+arch = "gfx1151"
+memory_bytes = 0
+memory_gbytes_ps = 0
+peaks = { fp32 = 0, fp16 = 0, bf16 = 0, fp8 = 0, fp4 = 0, int8 = 0 }
+units = 32
+unit_kind = "CU"
+pcie = { gen = 0, width = 0 }
+host_link = "integrated"
+unified = true
+measured = ""
+unmeasured = true
+note = "unmeasured; device capability or planning identity only"
+
+[[profiles]]
+name = "gorgon-gfx1152"
+display = "AMD Gorgon Point (gfx1152)"
+vendor = "amd"
+arch = "gfx1152"
+memory_bytes = 0
+memory_gbytes_ps = 0
+peaks = { fp32 = 0, fp16 = 0, bf16 = 0, fp8 = 0, fp4 = 0, int8 = 0 }
+units = 0
+unit_kind = "CU"
+pcie = { gen = 0, width = 0 }
+host_link = "integrated"
+unified = true
+measured = ""
+unmeasured = true
+note = "unmeasured; device capability or planning identity only"
+
+[[profiles]]
+name = "gorgon-gfx1153"
+display = "AMD Gorgon Point (gfx1153)"
+vendor = "amd"
+arch = "gfx1153"
+memory_bytes = 0
+memory_gbytes_ps = 0
+peaks = { fp32 = 0, fp16 = 0, bf16 = 0, fp8 = 0, fp4 = 0, int8 = 0 }
+units = 0
+unit_kind = "CU"
+pcie = { gen = 0, width = 0 }
+host_link = "integrated"
+unified = true
+measured = ""
+unmeasured = true
+note = "unmeasured; device capability or planning identity only"
+
+[[profiles]]
+name = "amd-gfx942"
+display = "AMD CDNA3 (gfx942)"
+vendor = "amd"
+arch = "gfx942"
+memory_bytes = 0
+memory_gbytes_ps = 0
+peaks = { fp32 = 0, fp16 = 0, bf16 = 0, fp8 = 0, fp4 = 0, int8 = 0 }
+units = 0
+unit_kind = "CU"
+pcie = { gen = 0, width = 0 }
+host_link = ""
+unified = false
+measured = ""
+unmeasured = true
+note = "unmeasured; device capability or planning identity only"
+
+[[profiles]]
+name = "amd-gfx950"
+display = "AMD CDNA4 (gfx950)"
+vendor = "amd"
+arch = "gfx950"
+memory_bytes = 0
+memory_gbytes_ps = 0
+peaks = { fp32 = 0, fp16 = 0, bf16 = 0, fp8 = 0, fp4 = 0, int8 = 0 }
+units = 0
+unit_kind = "CU"
+pcie = { gen = 0, width = 0 }
+host_link = ""
+unified = false
+measured = ""
+unmeasured = true
+note = "unmeasured; device capability or planning identity only"
+
+[[profiles]]
+name = "intel-arc-xe2"
+display = "Intel Arc Xe2"
+vendor = "intel"
+arch = "xe2"
+memory_bytes = 0
+memory_gbytes_ps = 0
+peaks = { fp32 = 0, fp16 = 0, bf16 = 0, fp8 = 0, fp4 = 0, int8 = 0 }
+units = 0
+unit_kind = ""
+pcie = { gen = 0, width = 0 }
+host_link = ""
+unified = false
+measured = ""
+unmeasured = true
+note = "unmeasured; device capability or planning identity only"
+
+[[profiles]]
+name = "apple-silicon"
+display = "Apple Silicon GPU"
+vendor = "apple"
+arch = ""
+memory_bytes = 0
+memory_gbytes_ps = 0
+peaks = { fp32 = 0, fp16 = 0, bf16 = 0, fp8 = 0, fp4 = 0, int8 = 0 }
+units = 0
+unit_kind = ""
+pcie = { gen = 0, width = 0 }
+host_link = "integrated"
+unified = true
+measured = ""
+unmeasured = true
+note = "unmeasured; device capability or planning identity only"
+
+[[profiles]]
+name = "generic-hip"
+display = "Generic AMD HIP device"
+vendor = "amd"
+arch = ""
+memory_bytes = 0
+memory_gbytes_ps = 0
+peaks = { fp32 = 0, fp16 = 0, bf16 = 0, fp8 = 0, fp4 = 0, int8 = 0 }
+units = 0
+unit_kind = ""
+pcie = { gen = 0, width = 0 }
+host_link = ""
+unified = false
+measured = ""
+unmeasured = true
+note = "unmeasured; device capability or planning identity only"
+
+# The entries reference the same link classes used by topology.
+
+[[interconnects]]
+name = "pcie5x16"
+note = "peer copies through the host bridge, no NVLink"
+
+[[interconnects]]
+name = "pcie4x16"
+note = "peer copies through the host bridge"
+
+[[interconnects]]
+name = "pcie4x4"
+
+[[interconnects]]
+name = "oculink4x4"
+
+[[interconnects]]
+name = "pcie3x4"
+
+[[interconnects]]
+name = "usb4"
+note = "measured between our two nodes"
+
+[[interconnects]]
+name = "100gbe"
+
+[[interconnects]]
+name = "25gbe"
+
+[[interconnects]]
+name = "10gbe"
+
+[[interconnects]]
+name = "2.5gbe"
+
+[[interconnects]]
+name = "1gbe"

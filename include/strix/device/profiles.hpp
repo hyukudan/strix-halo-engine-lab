@@ -24,8 +24,8 @@ struct Peaks {
 struct Profile {
     std::string_view name;          // catalogue key: <model>-<memory GB>
     std::string_view display;       // marketing name
-    std::string_view vendor;        // amd | nvidia
-    std::string_view arch;          // sm_120 | sm_89 | sm_121 | gfx1151 | gfx1201
+    std::string_view vendor;        // device declaration vendor
+    std::string_view arch;          // runtime architecture when known
     std::uint64_t memory_bytes = 0; // device-visible memory the runtime reports (what a budget caps to)
     double memory_gbytes_ps = 0;    // memory bandwidth, GB/s
     Peaks peaks;
@@ -37,6 +37,7 @@ struct Profile {
     std::string_view measured;      // comma list of measured fields; "" = all public spec
     std::string_view note;
     LowBitRows lowbit_rows{};       // measured q4_g64 / q6_g64 FP16 group-scale schedule
+    bool unmeasured = false;        // generic row: no measured schedule, capacity or rates
 };
 
 // The whole catalogue, in a fixed order. "custom" is the empty profile: every value comes from the entry.
