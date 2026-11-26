@@ -342,6 +342,17 @@ class Statistics(unittest.TestCase):
         with self.assertRaisesRegex(v2.GateError, "greedy: every label"):
             v2.verdict([clean, generated])
 
+    def test_document_uncertainty_groups_correlated_windows(self):
+        windows = [{"name": name, "_rows": {"dnll": np.full(200, score)}}
+                   for name, score in (("a1", 0.2), ("a2", 0.2), ("b", -0.2))]
+        plan = {"a1": {"document": "a"}, "a2": {"document": "a"}, "b": {"document": "b"}}
+        report = v2.document_uncertainty(windows, plan)
+        self.assertEqual(report["documents"], 2)
+        self.assertAlmostEqual(report["dnll_cluster_se"], 8 / 45)
+        self.assertGreater(report["dnll_cluster_se"], 20 * report["dnll_row_se"])
+        plan["b"]["document"] = "a"
+        self.assertIsNone(v2.document_uncertainty(windows, plan)["dnll_cluster_se"])
+
     def test_route_files_flips_and_ratio(self):
         with tempfile.TemporaryDirectory() as t:
             t = pathlib.Path(t)
@@ -662,7 +673,7 @@ class HeadFormat(unittest.TestCase):
             windows = {}
             for c in cases:
                 ids = np.array((d / f"{c}.ids").read_text(encoding="utf-8").split(), dtype="<u4")
-                windows[c] = {"class": "prose", "ids_sha256": hashlib.sha256(ids.tobytes()).hexdigest()}
+                windows[c] = {"class": "prose", "ids_sha256": hashlib.sha256(ids.tobytes()).hexdigest(), "document": c}
             payload = json.dumps({"schema": "strix-gate-frozen-qualification/v1", "windows": windows,
                                   "reference_nll": {"prose": [1.0, 1.0, 1.0]}}).encode("utf-8")
             frozen.write_bytes(payload)
@@ -670,6 +681,10 @@ class HeadFormat(unittest.TestCase):
             rc, out = self.gate(d, *args)
             self.assertEqual(rc, 4, out)
             self.assertIn("HOLD off-distribution", out)
+            rc, out = self.gate(d, *args, "--document-uncertainty")
+            self.assertEqual(rc, 4, out)
+            diagnostic = json.loads((d / "g.json").read_text(encoding="utf-8"))["pooled"]["document_uncertainty"]
+            self.assertEqual(diagnostic["documents"], 13)
             rc, out = self.gate(d, *args, "--cases", *cases[:-1])
             self.assertEqual(rc, 2, out)
             self.assertIn("frozen qualification window set", out)

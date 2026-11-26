@@ -638,6 +638,23 @@ def frozen_qualification(plan, cases, classes, limits, opener):
     return windows, bars
 
 
+def document_uncertainty(windows, frozen):
+    """Cluster score standard error for the row-weighted dNLL mean, assuming independent documents."""
+    groups = {}
+    for w in windows:
+        rows = w["_rows"]["dnll"]
+        groups.setdefault(frozen[w["name"]]["document"], []).append(rows)
+    d = np.concatenate([w["_rows"]["dnll"] for w in windows])
+    mean, row_se = mean_se(d)
+    clusters = len(groups)
+    cluster_se = None
+    if clusters > 1:
+        scores = [math.fsum(float(np.sum(rows - mean)) for rows in group) for group in groups.values()]
+        cluster_se = math.sqrt(clusters / (clusters - 1) * math.fsum(s * s for s in scores)) / d.size
+    return {"documents": clusters, "dnll_row_se": row_se if math.isfinite(row_se) else None,
+            "dnll_cluster_se": cluster_se}
+
+
 def verify_null_witness(witness, case, arms, capture_hashes, head_ids):
     """Bind a launcher's control evidence to the consumed files and exact baseline identity."""
     records = witness.get(case)
@@ -718,6 +735,10 @@ def qual(a):
         raise GateError(f"{out} holds no {a.ref} logits")
     plan = getattr(a, "frozen_qualification", None)
     frozen_windows, frozen_bars = frozen_qualification(plan, cases, classes, limits, opener) if plan else ({}, None)
+    doc_uncertainty = getattr(a, "document_uncertainty", False)
+    if doc_uncertainty and (not plan or any(not isinstance(w.get("document"), str) or not w["document"].strip()
+                                            for w in frozen_windows.values())):
+        raise GateError("--document-uncertainty needs a frozen qualification plan with a document ID for every window")
     witness_path = getattr(a, "null_control_witness", None)
     witness = None
     if witness_path:
@@ -861,6 +882,10 @@ def qual(a):
                     p["state"], p["pass"] = state, state == "PASS"
                     break
             print(f"REPLAY + FREE-RUNNING -> {p['state']}")
+        if doc_uncertainty:
+            diagnostic = document_uncertainty(windows, frozen_windows)
+            p["document_uncertainty"] = diagnostic
+            print(f"DNLL DIAGNOSTIC (document clusters) {json.dumps(diagnostic, sort_keys=True)}")
     exit_code = EXIT[p["state"]]
     if a.json:
         doc = {"schema": "strix-fast-gate-v2/v1", "limits": limits, "ref": a.ref, "cand": a.cand, "null": a.null,
@@ -1166,6 +1191,7 @@ def main(argv=None):
                    "with --manifest, else one class)")
     q.add_argument("--frozen-qualification", nargs=2, metavar=("PLAN", "SHA256"),
                    help="require the preregistered window IDs, content labels and reference NLL bars")
+    q.add_argument("--document-uncertainty", action="store_true", help="also report dNLL SE for the frozen plan's document clusters")
     q.add_argument("--r4-assess", metavar="ORIGINAL_NLLS", help="diagnostic only on stderr: JSON {content class: "
                    "[original reference NLLs]} (requires --classes and --manifest)")
     q.add_argument("--json")

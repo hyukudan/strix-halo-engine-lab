@@ -15,6 +15,11 @@
 
 `gate_v2.py qual --frozen-qualification PLAN.json SHA256` binds the scored case set, content classes and token IDs to a published digest. It evaluates each reference against the plan's historical NLL distribution for that class, including when the new batch has fewer than three windows. This host gate option preserves engine defaults.
 
+<a id="platform-fast-document-uncertainty"></a>
+### Document-cluster dNLL uncertainty
+
+`gate_v2.py qual --document-uncertainty` reports an additional pooled dNLL standard error from independent documents declared in the frozen plan. This option is diagnostic and preserves the gate's row-based verdict.
+
 <a id="ds41-single-attention-read-ahead"></a>
 ### Single DeepSeek attention read-ahead
 

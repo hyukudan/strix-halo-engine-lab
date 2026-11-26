@@ -495,6 +495,10 @@ window NLLs. Hash little-endian uint32 IDs in order: the full prompt for head ca
 spool captures. The gate validates those IDs against the consumed evidence and reports the pinned digest and bars.
 A window above its frozen class bar holds the verdict even with only one window in the new run. The ordinary
 reference checks still apply.
+`--document-uncertainty` additionally reports the cluster standard error for pooled dNLL. Supply a `document`
+identifier for every planned window and reuse it for windows from the same source document. The report assumes
+independent documents, weights by scored rows, and shows an unavailable cluster SE when there is only one document.
+The diagnostic leaves the verdict's row-based rule in effect.
 
 `qual --r4-assess ORIGINAL_NLLS.json`, with `--classes` and `--manifest`, adds an **R4 DIAGNOSTIC ONLY** report on
 stderr after the ordinary verdict. Supply one original reference mean NLL per window, grouped by content class (for
