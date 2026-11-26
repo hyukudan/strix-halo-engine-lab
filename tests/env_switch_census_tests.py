@@ -18,7 +18,7 @@ class CensusCliTests(unittest.TestCase):
         (self.root / "src").mkdir()
         self.source = self.root / "src" / "fixture.cpp"
         self.baseline = self.root / "baseline.txt"
-        self.baseline.write_bytes(b"# preserved baseline\r\nSTRIX_BASELINE\r\n")
+        self.baseline.write_bytes(b"# preserved baseline\r\nSTRIX_BASELINE 1\r\n")
 
     def run_cli(self, *args):
         return subprocess.run(
@@ -34,7 +34,8 @@ class CensusCliTests(unittest.TestCase):
                 self.source.write_text(f'std::getenv({expression});\n', encoding="utf-8")
                 result = self.run_cli("--check")
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertIn("STRIX_BASELINE_NEW is read with a raw getenv", result.stderr)
+                self.assertIn("STRIX_BASELINE_NEW has 1 raw getenv sites", result.stderr)
+                self.assertIn("baseline 0", result.stderr)
 
     def test_escaped_raw_literal_fails_closed(self):
         self.source.write_text(r'getenv("STRIX_BASELINE" "\x5fNEW");', encoding="utf-8")
@@ -66,13 +67,30 @@ class CensusCliTests(unittest.TestCase):
                                'getenv("STRIX_OTHER_RAW");\n', encoding="utf-8")
         result = self.run_cli("--grandfather", "STRIX_NEW_RAW")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        names = self.baseline.read_text(encoding="utf-8").splitlines()
-        self.assertIn("STRIX_BASELINE", names)
-        self.assertIn("STRIX_NEW_RAW", names)
-        self.assertNotIn("STRIX_OTHER_RAW", names)
+        rows = self.baseline.read_text(encoding="utf-8").splitlines()
+        self.assertIn("STRIX_BASELINE 1", rows)
+        self.assertIn("STRIX_NEW_RAW 1", rows)
+        self.assertNotIn("STRIX_OTHER_RAW 1", rows)
         self.assertEqual(self.run_cli("--check").returncode, 1)
         self.assertEqual(self.run_cli("--grandfather", "STRIX_OTHER_RAW").returncode, 0)
         self.assertEqual(self.run_cli("--check").returncode, 0)
+
+    def test_repeated_reads_of_a_baseline_name_fail_check(self):
+        self.source.write_text('getenv("STRIX_BASELINE");\n', encoding="utf-8")
+        self.assertEqual(self.run_cli("--check").returncode, 0)
+
+        self.source.write_text('getenv("STRIX_BASELINE"); std::getenv("STRIX_BASELINE");\n',
+                               encoding="utf-8")
+        result = self.run_cli("--check")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("STRIX_BASELINE has 2 raw getenv sites", result.stderr)
+        self.assertIn("baseline 1", result.stderr)
+
+        for args in (("--update",), ("--grandfather", "STRIX_BASELINE")):
+            with self.subTest(args=args):
+                self.assertEqual(self.run_cli(*args).returncode, 0)
+                self.assertIn("STRIX_BASELINE 1", self.baseline.read_text(encoding="utf-8").splitlines())
+                self.assertEqual(self.run_cli("--check").returncode, 1)
 
     def test_grandfather_rejects_non_raw_names_without_writing(self):
         self.source.write_text('getenv("STRIX_NEW_RAW"); '
