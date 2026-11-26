@@ -17,6 +17,7 @@
 #include <charconv>
 #include <cstdint>
 #include <cstdlib>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -73,6 +74,7 @@ struct PrefillIdentityOverride {
     bool set = false;
     bool exact = false;
     unsigned disabled = 0U;
+    std::optional<std::uint32_t> qsa_budget;
 };
 inline PrefillIdentityOverride& prefill_identity_override() {
     static PrefillIdentityOverride o;
@@ -90,11 +92,13 @@ inline unsigned normalize_prefill_options(unsigned mask) {
 }
 
 // Command line: --prefill-exact-fp16 and --prefill-disable a,b. Call before the first prefill (the mask is read per call).
-inline void set_prefill_identity_override(bool exact, unsigned disabled) {
+inline void set_prefill_identity_override(bool exact, unsigned disabled,
+                                          std::optional<std::uint32_t> qsa_budget = std::nullopt) {
     auto& o = detail::prefill_identity_override();
     o.set = true;
     o.exact = o.exact || exact;
     o.disabled |= disabled;
+    if (qsa_budget) o.qsa_budget = qsa_budget;
 }
 inline unsigned parse_prefill_option_list(std::string_view list) {
     if (list.empty() || list.back() == ',')
@@ -116,7 +120,7 @@ inline unsigned parse_prefill_option_list(std::string_view list) {
 template<class Get>
 inline unsigned resolve_prefill_options(Get get, bool exact = false, unsigned disabled = 0U) {
     const char* master = get("STRIX_PREFILL_EXACT_FP16");
-    if (exact || (master && master[0] == '1')) return 0U;
+    if (exact || envcfg::parse_flag(master, false, EnvFlagMatch::exact)) return 0U;
     unsigned mask = kPrefillOptionsReady & ~disabled;
     for (unsigned i = 0; i < kPrefillOptions.size(); ++i) {
         const char* value = get(kPrefillOptions[i].env.data());
@@ -126,7 +130,7 @@ inline unsigned resolve_prefill_options(Get get, bool exact = false, unsigned di
             mask |= bit;
             if (rev3) mask |= kPrefillGdnChunkRev3;
         }
-        if (value && value[0] == '0') mask &= ~bit;
+        if (!envcfg::parse_flag(value, true, EnvFlagMatch::exact)) mask &= ~bit;
     }
     return normalize_prefill_options(mask);
 }
@@ -154,13 +158,15 @@ inline std::uint32_t qsa_union_cap_active() {
         const char* value = std::getenv("STRIX_QPF2K_QSA_UNION_CAP");
         return parse_qsa_union_cap(value ? value : "");
     }();
-    static const bool exact = strix::envcfg::flag("STRIX_PREFILL_EXACT_FP16", false);
+    static const bool exact = envcfg::flag("STRIX_PREFILL_EXACT_FP16", false, EnvFlagMatch::exact);
     return exact || detail::prefill_identity_override().exact ? 0U : cap;
 }
 
 inline std::uint32_t qsa_prefill_budget_active() {
-    const char* master = std::getenv("STRIX_PREFILL_EXACT_FP16");
-    if (detail::prefill_identity_override().exact || (master && master[0] == '1')) return 0U;
+    const auto& override = detail::prefill_identity_override();
+    if (override.exact) return 0U;
+    if (override.qsa_budget) return *override.qsa_budget;
+    if (envcfg::flag("STRIX_PREFILL_EXACT_FP16", false, EnvFlagMatch::exact)) return 0U;
     static const auto budget = [] {
         const char* value = std::getenv("STRIX_QPF2K_QSA_BUDGET");
         return parse_qsa_prefill_budget(value ? value : "");
@@ -170,7 +176,7 @@ inline std::uint32_t qsa_prefill_budget_active() {
 
 // One effective draft policy for both arithmetic binding and native submission.
 inline moe_core::RoutePrune prefill_route_prune_active() {
-    static const bool exact = envcfg::flag("STRIX_PREFILL_EXACT_FP16", false);
+    static const bool exact = envcfg::flag("STRIX_PREFILL_EXACT_FP16", false, EnvFlagMatch::exact);
     return exact || detail::prefill_identity_override().exact ? moe_core::RoutePrune{} : moe_core::route_prune_active();
 }
 
@@ -214,7 +220,8 @@ inline std::uint64_t bind_prefill_option_identity(std::uint64_t arithmetic, unsi
 // supplied from the model contract, never inferred from unrelated process state.
 inline std::uint64_t prefill_arithmetic_identity(const NumericalProfilePair& pair, unsigned mask, bool gsq,
     std::uint32_t qsa_budget = qsa_prefill_budget_active(), std::uint32_t union_cap = qsa_union_cap_active()) {
-    if (!numerical_profile_fast_prefill(pair.prefill) && !qsa_budget && !union_cap) return numerical_profile_pair_identity(pair);
+    if (!numerical_profile_fast_prefill(pair.prefill) && !qsa_budget && !union_cap && !prefill_route_prune_active().active())
+        return numerical_profile_pair_identity(pair);
     auto identity = bind_prefill_option_identity(numerical_profile_pair_identity(pair), mask, qsa_budget, union_cap);
     if (gsq && (pair.fast_components & kFastPrefillMoe))
         for (const std::uint64_t word : {UINT64_C(0x4753514d4f455046), moe_q4k_a8::gsq_fast_prefill_moe_identity()})

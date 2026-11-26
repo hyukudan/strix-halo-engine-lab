@@ -1721,6 +1721,8 @@ static int run_decode_entry(
     if (!options.print_effective_config) {
         strix::qwen::profile::withdraw_declined(options.product_profile);
         strix::qwen::profile::apply(options.product_profile);
+        strix::set_prefill_identity_override(options.prefill_exact_fp16, options.prefill_disabled,
+                                             options.resolved_qsa_prefill_budget);
         if (options.product_profile.find("moe_route_prune"))
             (void)strix::moe_core::route_prune_active_tag(true);
     }
@@ -1776,7 +1778,6 @@ static int run_decode_entry(
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     strix::tests::set_mtp_product_profile(options.product_profile);
 #endif
-    strix::set_prefill_identity_override(options.prefill_exact_fp16, options.prefill_disabled);
     session_cache_enabled = !options.session_save.empty() || !options.session_load.empty() || options.session_live_control || options.session_management_requested;
     strix::decode_cli::require_bitcalc_session_route(options, bitcalc.enabled());
     if (bitcalc.enabled() && (options.mtp.enabled || options.mtp.supplied || options.prompt_lookup ||
