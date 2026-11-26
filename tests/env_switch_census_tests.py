@@ -92,6 +92,14 @@ class CensusCliTests(unittest.TestCase):
                 self.assertIn("STRIX_BASELINE 1", self.baseline.read_text(encoding="utf-8").splitlines())
                 self.assertEqual(self.run_cli("--check").returncode, 1)
 
+    def test_stale_baseline_fails_until_lowered(self):
+        self.source.write_text('envcfg::flag("STRIX_BASELINE", false);\n', encoding="utf-8")
+        result = self.run_cli("--check")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("fewer raw reads", result.stderr)
+        self.assertEqual(self.run_cli("--update").returncode, 0)
+        self.assertEqual(self.run_cli("--check").returncode, 0)
+
     def test_grandfather_rejects_non_raw_names_without_writing(self):
         self.source.write_text('getenv("STRIX_NEW_RAW"); '
                                'envcfg::flag("STRIX_GOVERNED", false);\n', encoding="utf-8")
@@ -114,7 +122,7 @@ class CensusCliTests(unittest.TestCase):
             f'strix::env_number<{kind}>("{name}", {default});'
             for kind, name, default in cases), encoding="utf-8")
         tsv = self.root / "inventory.tsv"
-        result = self.run_cli("--check", "--report", "--tsv", str(tsv))
+        result = self.run_cli("--report", "--tsv", str(tsv))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("switches read: 4\n", result.stdout)
         self.assertIn("governed only: 4\n", result.stdout)
