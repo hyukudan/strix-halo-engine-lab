@@ -666,7 +666,10 @@ def build_parser():
     p.add_argument("--url", help="server base URL, e.g. http://127.0.0.1:8080")
     p.add_argument("--path", default=None, help="completion route (default /v1/completions, or /v1/chat/completions with --chat)")
     p.add_argument("--chat", action="store_true", help="send chat messages instead of a prompt string")
-    p.add_argument("--prompt-file", action="append", default=[], help="UTF-8 prompt file; repeat to cycle prompts over the burst")
+    prompt = p.add_mutually_exclusive_group()
+    prompt.add_argument("--prompt-file", action="append", default=[], help="UTF-8 prompt file; repeat to cycle prompts over the burst")
+    prompt.add_argument("--prompt-ids-file", action="append", default=[],
+                        help="JSON array of token IDs for completions; repeat to cycle prompts over the burst")
     p.add_argument("--concurrency", type=int_list, default=[1, 4, 8, 16])
     p.add_argument("--max-tokens", type=int_list, default=[128])
     p.add_argument("--receipt", action="store_true", help="require cycle receipts (fail when the steady window is empty)")
@@ -699,12 +702,24 @@ def main(argv=None):
         bursts.append(burst_report(args.concurrency[0] if len(args.concurrency) == 1 else len(events),
                                    args.max_tokens[0], events, cycles, args.slots))
     else:
-        if not args.url or not args.prompt_file:
-            raise SystemExit("--url and --prompt-file are required (or --replay-events)")
+        if not args.url or not (args.prompt_file or args.prompt_ids_file):
+            raise SystemExit("--url and a prompt file are required (or --replay-events)")
+        if args.prompt_ids_file and (args.chat or "prompt" in extra):
+            raise SystemExit("--prompt-ids-file requires completions and cannot be combined with a --body-extra prompt")
         prompts = []
         for path in args.prompt_file:
             with open(path, encoding="utf-8") as stream:
                 prompts.append(stream.read())
+        for path in args.prompt_ids_file:
+            try:
+                with open(path, encoding="utf-8") as stream:
+                    ids = json.load(stream)
+                if (not isinstance(ids, list) or not ids or
+                        any(type(token) is not int or not 0 <= token <= 0xffffffff for token in ids)):
+                    raise ValueError("expected a nonempty JSON array of unsigned 32-bit integers")
+            except (OSError, ValueError) as error:
+                raise SystemExit(f"--prompt-ids-file {path}: {error}") from error
+            prompts.append(ids)
         base = args.url.rstrip("/")
         url = base + (args.path or ("/v1/chat/completions" if args.chat else "/v1/completions"))
         for max_tokens in args.max_tokens:

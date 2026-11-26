@@ -5015,6 +5015,15 @@ Startup exports the previous prefill route. Each request resolves the profile ag
 - **Engines:** DeepSeek V4.1 Flash bound. Qwen3.8 Flash Next, Qwen3.8-27B and Hy4 Flash use the same band mechanism for their own rows. Inkling 2 Mini, GLM-5.3 Flash, MiniMax M3.1 Flash and Nemotron 3.5 Bolt E4B have no DeepSeek prefill composition. Same class of serve-vs-CLI gap (a serve-only option or piece plan that leaves the CLI's measured route), to check per engine: Qwen HIP serve (1024-row cache checkpoints and T8192 pieces against the CLI's whole-prompt FAST rows), Hy4 Flash (served `prompt_rows` against the FAST row qualified at <= 4K), GLM-5.3 Flash pair (band rows that need MemAvailable for auto max-rows 8192; a server holding more memory can fall out of them), MiniMax M3.1 Flash pair (serve default transport usb4gpu vs CLI usb4-auto, a parity exception never measured on the same transport), Gemma 4 (server sizes the EXL3 core for 8 streams, CLI for 1). Inkling 2 Mini served chunks were aligned with the CLI earlier (shared served chunk ladder).
 - **Implementation / evidence:** [rows](../include/strix/deepseek41_pair_profile_table.hpp), [execution key](../src/deepseek41_pair_defaults.cpp), [paired admission](../src/hip_deepseek41_prefill.hip), [tests](../tests/deepseek41_pair_defaults_tests.cpp)
 
+<a id="serve-bench-prompt-ids"></a>
+
+### Fixed token IDs for HTTP band measurements
+
+**Engine:** shared benchmark client. **Control:** `tools/serve_bench.py --prompt-ids-file FILE`. Pass a JSON array of token IDs to a completions endpoint. Repeat the option to cycle through fixtures. The host test checks that 2,048- and 8,192-token fixtures reach the request boundary with every ID intact.
+
+- **Use:** Measure the same prompt IDs at a band edge on the CLI and over HTTP. This option changes the benchmark input. Engine admission and serving defaults are unchanged.
+- **Engines:** DeepSeek V4.1 Flash is the initial measurement target. Any binding with a token-array completions endpoint can use the same client.
+
 <a id="mm-pf-msa-q16"></a>
 
 ### MiniMax MSA FAST flash reads q as a bf16 image after norm + RoPE
