@@ -59,16 +59,14 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #if defined(STRIX_F16_TILE_PROJECTIONS)
     constexpr unsigned b = 0U;
     const unsigned r0 = blockIdx.y * Shape::rows;
-    [[maybe_unused]] unsigned panel = 0U;
-    unsigned index = 0U, col0 = 0U;
-    if constexpr (Compact) {
-        index = blockIdx.x;
-    } else {
-        panel = group.count == 1U ? 2U * blockIdx.x + wn : blockIdx.x + wn * gridDim.x;
+    // The incumbent (non-compact) statement order: the projection reference before col0 keeps its machine code.
+    [[maybe_unused]] const unsigned panel =
+        Compact ? 0U : group.count == 1U ? 2U * blockIdx.x + wn : blockIdx.x + wn * gridDim.x;
+    unsigned index = Compact ? blockIdx.x : 0U;
+    if constexpr (!Compact)
         while (index + 1U < group.count && panel >= group.first_panel[index + 1U]) ++index;
-        col0 = (panel - group.first_panel[index]) * kProjectionPanel;
-    }
     const auto& projection = group.projections[index];
+    const unsigned col0 = Compact ? 0U : (panel - group.first_panel[index]) * kProjectionPanel;
 #if defined(STRIX_F16_TILE_Q8)
     const unsigned left = panel < group.first_panel[index + 1U] ? projection.outputs - col0 : 0U;
 #else
