@@ -1,0 +1,16 @@
+{
+  "schema": "strix-pack-model/v1",
+  "retained_bytes": 22190000000,
+  "expert_groups": [
+    {
+      "first_layer": 1,
+      "layers": 42,
+      "experts": 512,
+      "projections": [
+        {"name": "model.layers.{layer}.block_sparse_moe.experts.{expert}.w1.weight", "rows": 2048, "columns": 2048},
+        {"name": "model.layers.{layer}.block_sparse_moe.experts.{expert}.w2.weight", "rows": 2048, "columns": 2048},
+        {"name": "model.layers.{layer}.block_sparse_moe.experts.{expert}.w3.weight", "rows": 2048, "columns": 2048}
+      ]
+    }
+  ]
+}

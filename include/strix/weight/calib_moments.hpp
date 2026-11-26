@@ -29,6 +29,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <span>
 #include <sstream>
@@ -42,23 +43,45 @@ namespace strix::weight::calib {
 
 inline constexpr std::string_view kMomentFileTag = "strix-calib-moments/v4";
 
+inline constexpr std::string_view kDiagonalMomentFileTag = "strix-calib-moments/diagonal-v1";
+enum class MomentLayout { full, diagonal };
+
 struct InputMoments {
     std::string name;
     std::vector<std::string> consumers;
     std::uint32_t width = 0;
     std::uint64_t rows = 0;
     std::vector<std::uint64_t> window_rows;  // rows per registered window (index = window); sums to rows
-    std::vector<double> h;  // width x width, lower triangle filled
+    std::vector<double> h;  // full: width x width with lower triangle filled; diagonal: width entries
+    MomentLayout layout = MomentLayout::full;
+    [[nodiscard]] double diagonal(std::size_t column) const {
+        return h[layout == MomentLayout::diagonal ? column : column * width + column];
+    }
 };
 
 class MomentSet {
 public:
-    explicit MomentSet(unsigned threads = 0U)
-        : threads_(threads ? threads : std::max(1U, std::thread::hardware_concurrency())) {}
+    explicit MomentSet(unsigned threads = 0U, MomentLayout layout = MomentLayout::full,
+                       std::size_t max_moment_bytes = std::numeric_limits<std::size_t>::max())
+        : threads_(threads ? threads : std::max(1U, std::thread::hardware_concurrency())),
+          layout_(layout), max_values_(max_moment_bytes / sizeof(double)) {}
+
+    [[nodiscard]] MomentLayout layout() const noexcept { return layout_; }
+    [[nodiscard]] std::size_t moment_bytes() const noexcept { return values_ * sizeof(double); }
+
+    // Publish one layer's moments and release its arrays only after a successful
+    // write. Registered windows are reusable when replaying the next layer.
+    // Every input handle from the flushed layer expires here.
+    void flush_layer(const std::string& path) {
+        write(path);
+        inputs_.clear();
+        index_.clear();
+        values_ = 0;
+    }
 
     // Declares (once) or re-finds an input; a second declaration must agree on width and consumers.
     InputMoments& declare(std::string_view name, std::uint32_t width, std::span<const std::string> consumers) {
-        if (width == 0U) throw std::invalid_argument("calibration input width is zero");
+        if (width == 0U || width > 65536U) throw std::invalid_argument("calibration input width out of range");
         const auto found = index_.find(std::string(name));
         if (found != index_.end()) {
             auto& entry = inputs_[found->second];
@@ -67,13 +90,24 @@ public:
                 throw std::invalid_argument("calibration input redeclared differently: " + std::string(name));
             return entry;
         }
-        index_.emplace(std::string(name), inputs_.size());
-        auto& entry = inputs_.emplace_back();
+        const std::size_t stride = layout_ == MomentLayout::diagonal ? 1U : width;
+        if (stride > (max_values_ - values_) / width)
+            throw std::runtime_error("calibration moment memory limit exceeded declaring " + std::string(name));
+        InputMoments entry;
         entry.name = std::string(name);
         entry.consumers.assign(consumers.begin(), consumers.end());
         entry.width = width;
-        entry.h.assign(std::size_t{width} * width, 0.0);
-        return entry;
+        entry.layout = layout_;
+        entry.h.assign(std::size_t{width} * stride, 0.0);
+        inputs_.push_back(std::move(entry));
+        try {
+            index_.emplace(inputs_.back().name, inputs_.size() - 1U);
+        } catch (...) {
+            inputs_.pop_back();
+            throw;
+        }
+        values_ += inputs_.back().h.size();
+        return inputs_.back();
     }
 
     // Adds `rows` rows of width floats (row-major), all produced while the engine ran registered window `window`, to
@@ -88,28 +122,33 @@ public:
             throw std::invalid_argument("calibration rows added for a window that is not registered");
         if (targets.empty() || rows == 0U) return;
         const auto width = targets.front()->width;
+        const auto values = targets.front()->h.size();
         for (const auto* t : targets)
-            if (t->width != width) throw std::invalid_argument("calibration inputs of different widths");
-        // Prepare. Growing a count vector with zeros changes no total and no serialized byte (write() pads the same way).
+            if (t->width != width || t->layout != layout_)
+                throw std::invalid_argument("calibration inputs of different widths or layouts");
+        if (values > max_values_ - values_)
+            throw std::runtime_error("calibration moment memory limit exceeded accumulating " + targets.front()->name);
+        // Growing counts with zeros changes no serialized byte (write pads the same way).
         for (auto* t : targets)
             if (t->window_rows.size() <= window) t->window_rows.resize(window + 1U, 0U);
         if (prepare_hook_) prepare_hook_(0);
-        std::vector<double> next;  // single target: the target's sum continued (the same fixed-order sum as alone)
-        if (targets.size() == 1U) {
-            next = targets.front()->h;
-            lowbit::gptq::accumulate_second_moments(x, rows, width, next, threads_);
+        std::vector<double> next(values, 0.0);
+        if (targets.size() == 1U) std::ranges::copy(targets.front()->h, next.begin());
+        if (layout_ == MomentLayout::diagonal) {
+            for (std::size_t row = 0; row < rows; ++row)
+                for (std::size_t col = 0; col < width; ++col) {
+                    const double value = x[row * width + col];
+                    next[col] += value * value;
+                }
         } else {
-            scratch_.assign(std::size_t{width} * width, 0.0);
-            lowbit::gptq::accumulate_second_moments(x, rows, width, scratch_, threads_);
+            lowbit::gptq::accumulate_second_moments(x, rows, width, next, threads_);
         }
         if (prepare_hook_) prepare_hook_(1);
-        // Publish (nothing below allocates or throws).
         if (targets.size() == 1U) {
             targets.front()->h.swap(next);
         } else {
             for (auto* t : targets)
-                for (std::size_t i = 0; i < std::size_t{width}; ++i)
-                    for (std::size_t j = 0; j <= i; ++j) t->h[i * width + j] += scratch_[i * width + j];
+                for (std::size_t i = 0; i < values; ++i) t->h[i] += next[i];
         }
         for (auto* t : targets) {
             t->window_rows[window] += rows;
@@ -166,12 +205,12 @@ public:
     }
 
     void write(const std::string& path) const {
+        check_attribution(path);
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         if (!out) throw std::runtime_error("cannot write calibration moments " + path);
-        check_attribution(path);
         static constexpr char digits[] = "0123456789abcdef";
         const auto windows = provenance_.windows().size();
-        out << kMomentFileTag << ' ' << inputs_.size() << ' ' << windows << ' '
+        out << (layout_ == MomentLayout::diagonal ? kDiagonalMomentFileTag : kMomentFileTag) << ' ' << inputs_.size() << ' ' << windows << ' '
             << provenance_.shingles().size() << '\n';
         for (const auto& w : provenance_.windows()) {
             out << "window ";
@@ -193,16 +232,24 @@ public:
             out << ' ';
             for (std::size_t c = 0; c < e.consumers.size(); ++c) out << (c ? "," : "") << e.consumers[c];
             out << '\n';
+            if (layout_ == MomentLayout::diagonal) {
+                row.resize(e.width);
+                std::ranges::transform(e.h, row.begin(), [](double value) { return static_cast<float>(value); });
+                out.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(row.size() * sizeof(float)));
+                continue;
+            }
             for (std::size_t i = 0; i < e.width; ++i) {
                 row.resize(i + 1U);
                 for (std::size_t j = 0; j <= i; ++j) row[j] = static_cast<float>(e.h[i * e.width + j]);
                 out.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(row.size() * sizeof(float)));
             }
         }
+        out.close();
         if (!out) throw std::runtime_error("short write of calibration moments " + path);
     }
 
-    static MomentSet read(const std::string& path) {
+    static MomentSet read(const std::string& path,
+                          std::size_t max_moment_bytes = std::numeric_limits<std::size_t>::max()) {
         static_assert(sizeof(float) == 4U);
         std::ifstream in(path, std::ios::binary);
         if (!in) throw std::runtime_error("cannot read calibration moments " + path);
@@ -217,9 +264,9 @@ public:
             throw std::runtime_error("calibration moments with window identities but not their token ids (v3): recapture " + path);
         if (tag == "strix-calib-moments/v2")
             throw std::runtime_error("calibration moments with rows not attributed to windows (v2): recapture " + path);
-        if (!(head >> count >> windows >> shingles) || tag != kMomentFileTag)
+        if (!(head >> count >> windows >> shingles) || (tag != kMomentFileTag && tag != kDiagonalMomentFileTag))
             throw std::runtime_error("not a calibration moment file: " + path);
-        MomentSet set(1U);
+        MomentSet set(1U, tag == kMomentFileTag ? MomentLayout::full : MomentLayout::diagonal, max_moment_bytes);
         std::vector<WindowId> ids(windows);
         for (auto& w : ids) {
             std::getline(in, line);
@@ -281,6 +328,7 @@ public:
                 if (comma > at) list.push_back(consumers.substr(at, comma - at));
                 at = comma + 1U;
             }
+            if (set.find(name)) throw std::runtime_error("duplicate calibration input " + name + " in " + path);
             auto& e = set.declare(name, width, list);
             e.rows = rows;
             if (counts != "-") {
@@ -295,6 +343,13 @@ public:
             }
             if (e.window_rows.size() != (counts == "-" ? std::size_t{0} : windows))
                 throw std::runtime_error("calibration input " + name + " counts rows for the wrong number of windows in " + path);
+            if (set.layout_ == MomentLayout::diagonal) {
+                row.resize(width);
+                in.read(reinterpret_cast<char*>(row.data()), static_cast<std::streamsize>(row.size() * sizeof(float)));
+                if (!in) throw std::runtime_error("truncated diagonal calibration moments in " + path);
+                std::ranges::copy(row, e.h.begin());
+                continue;
+            }
             for (std::size_t i = 0; i < width; ++i) {
                 row.resize(i + 1U);
                 in.read(reinterpret_cast<char*>(row.data()), static_cast<std::streamsize>(row.size() * sizeof(float)));
@@ -308,12 +363,13 @@ public:
 
 private:
     unsigned threads_;
+    MomentLayout layout_;
+    std::size_t max_values_, values_ = 0;
     Provenance provenance_;
     std::vector<std::vector<std::uint32_t>> window_ids_;  // token ids of each registered window (index = window)
     void (*prepare_hook_)(int) = nullptr;
     std::deque<InputMoments> inputs_;  // stable addresses: callers keep declare() results
     std::map<std::string, std::size_t> index_;
-    std::vector<double> scratch_;
 };
 
 // Pack-time guard: a fit or proxy input that no attributed row fed carries a zero covariance, which would make the

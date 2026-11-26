@@ -6070,3 +6070,44 @@ two applied at the store), dispatched by `enqueue_resident_q8_rows` (`src/core/r
 |---|---|
 | inkling2-mini | bound (HIP head, decode steps) |
 | qwen3.8-flash-next, qwen3.8-27b, deepseek-v4.1-flash, glm-5.3-flash, minimax-m3.1-flash, hy4-flash, nemotron-3.5-bolt-e4b | not bound: the decode head has no calibrated pack path and no resident low-bit rows |
+
+<a id="strixpack-grouped-experts"></a>
+## Strix pack for grouped experts
+
+**Control** `strix-lowbit-calib-pack --storage SUBSTRING=sp2|sp3|sp4` or `--plan FILE`.
+**Default** Explicit host option. **Shared home** `src/weight/lowbit_pack.cpp`, `src/weight/pack_plan.cpp`
+and `src/moe_core/grouped_strixpack.hpp`. The host reference projects mixed-width expert rows
+against the shared expert-major plan. SP2, SP3 and SP4 use 36, 52 and 68 bytes per 128 weights.
+A plan can promote higher-use experts to SP3 under a declared memory budget.
+Synthetic fixtures compare packed bytes and FP32 reference arithmetic. Model quality and device timing are pending.
+
+<a id="strixpack-layer-moments"></a>
+## Layer-streamed calibration moments
+
+**Control** `MomentSet::flush_layer`, optional `MomentLayout::diagonal`, repeated `--moments` and
+`--moments-bytes`. **Default** Explicit host option. **Shared home** `include/strix/weight/calib_moments.hpp`.
+Diagonal capture uses K FP64 values per input and the largest active input's K values as update scratch.
+The layer writer retains window provenance and releases completed arrays. Diagonal clipping is an approximation
+to the full covariance proxy. The host tests check the memory limit and file round trips.
+
+<a id="strixpack-sharded-sources"></a>
+## Sharded Strix pack sources
+
+**Control** `strix-lowbit-calib-pack --model INDEX_OR_DIRECTORY`. **Default** Explicit host option.
+**Shared home** `src/weight/pack_source.cpp`. One matrix and its original scale bytes feed the FP32 coder
+through the shared BF16, MXFP4 or FP8 block decoder. The streaming writer retains entry metadata while
+writing payloads. Host tests check arithmetic and reject inconsistent shard mappings.
+
+| Model | Sharded pack input | Layer moments | Grouped Strix pack |
+|---|---|---|---|
+| qwen3.8-flash-next | Offline safetensors interface | Capture binding pending | Device binding pending |
+| qwen3.8-27b | Offline safetensors interface | Capture binding pending | Dense model |
+| deepseek-v4.1-flash | Offline safetensors interface | Capture binding pending | Device binding pending |
+| glm-5.3-flash | Offline safetensors interface | Capture binding pending | Device binding pending |
+| minimax-m3.1-flash | Offline safetensors interface | Capture binding pending | Device binding pending |
+| hy4-flash | Offline safetensors interface | Capture binding pending | Device binding pending |
+| nemotron-3.5-bolt-e4b | Offline safetensors interface | Capture binding pending | Device binding pending |
+| inkling2-mini | Offline safetensors interface | Existing full capture, layer binding pending | Device binding pending |
+
+The offline source contract applies to matrices in the supported encodings and ranks. ERNIE has a
+sizing example and needs a model binding. See [calibrated low-bit packs](engine/lowbit-calibration.md#host-strix-packs-for-grouped-experts).

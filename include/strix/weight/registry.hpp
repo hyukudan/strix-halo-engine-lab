@@ -6,13 +6,17 @@ inline constexpr FormatId kQ8WeightStorage{"gguf.q8_0", 1};
 // Low-bit resident row storages produced at load from a BF16 matrix (strix/weight/host_lowbit.hpp layout).
 inline constexpr FormatId kQ4G64WeightStorage{"strix.q4_g64", 1};
 inline constexpr FormatId kQ6G64WeightStorage{"strix.q6_g64", 1};
-// Geometry-only entries until the Strix pack loader and device consumers land.
+// Strix pack storages for the host grouped reference. Native consumers are admitted separately.
 inline constexpr FormatId kSP4WeightStorage{"strix.sp4", 1};
 inline constexpr FormatId kSP3WeightStorage{"strix.sp3", 1};
 inline constexpr FormatId kSP2WeightStorage{"strix.sp2", 1};
-[[nodiscard]] inline bool is_strixpack_storage(FormatId id) noexcept {
-    return id == kSP4WeightStorage || id == kSP3WeightStorage || id == kSP2WeightStorage;
+[[nodiscard]] inline unsigned strixpack_bits(FormatId id) noexcept {
+    if (id == kSP2WeightStorage) return 2U;
+    if (id == kSP3WeightStorage) return 3U;
+    if (id == kSP4WeightStorage) return 4U;
+    return 0U;
 }
+[[nodiscard]] inline bool is_strixpack_storage(FormatId id) noexcept { return strixpack_bits(id) != 0U; }
 // Strix pack SP4 with the fixed 4-bit table {1,3,5,8,10,14,18,24} (strix/weight/host_lowbit.hpp sp::, 68 B per 128
 // weights, one scale byte per 32): produced only by strix-lowbit-calib-pack (calibrated pack, never at load). The
 // per-tensor base travels in the pack entry and reaches the consumers as ResidentMatrixView::outer_exponent.

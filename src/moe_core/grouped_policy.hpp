@@ -66,7 +66,7 @@ struct GroupedLdsRing {
 // A declared case does not admit a new format or provide a missing decoder.
 enum class GroupedWeightFormat {
     q4_k, q5_k, q2_k, q5_1, q8_0, q2_0,
-    iq2_xxs, iq2_s, iq3_xxs, iq3_s, iq4_xs, iq4_nl
+    iq2_xxs, iq2_s, iq3_xxs, iq3_s, iq4_xs, iq4_nl, sp2, sp3, sp4
 };
 
 template <GroupedWeightFormat Format, class Operations>

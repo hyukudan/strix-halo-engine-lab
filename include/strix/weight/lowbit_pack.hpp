@@ -1,25 +1,27 @@
 #pragma once
-// Low-bit pack sidecar: pre-encoded q4_g64 / q6_g64 resident rows for named checkpoint tensors, loaded instead of
-// the load-time BF16 conversion. Layout: text header ("strix-lowbit-pack/v2 COUNT", "checkpoint HEX", COUNT
-// "tensor ..." lines, "end"), padded with '\n' to a multiple of 4096 bytes, then payloads at 4096-aligned absolute
-// offsets. A pack is bound to the exact checkpoint bytes it was coded from (raw SHA-256 of the checkpoint file: the
-// calibration statistics depend on every tensor, packed or not) and each entry to the exact BF16 payload of its tensor
-// (SHA-256 of every byte); its identity is the SHA-256 of the header and every payload byte, read through the same
-// open file the resident slices then read.
-// A Strix pack entry (strix.sp4t) adds a tenth field, the 16-byte tensor header (strix/weight/host_lowbit.hpp
-// sp::Header) in hex: it is part of the identity, it must carry the storage's fixed table, and its base reaches the
-// consumers as the matrix's outer exponent (find()).
+// Pre-encoded resident rows for named checkpoint tensors. The v2 text header
+// ("strix-lowbit-pack/v2 COUNT", "checkpoint HEX", COUNT "tensor ..." lines,
+// "end") precedes payloads at 4096-aligned absolute offsets. The pack binds to
+// the original checkpoint and source-byte fingerprints from pack_source.hpp.
+// Its identity hashes the header text and complete payloads in entry order,
+// read through the same open file as the resident slices.
+// A Strix entry appends a tenth field in hex: its 16-byte sp::Header, including
+// the table and base. The native fixed-table SP4 load exposes the base as the
+// matrix outer exponent. Host grouped loads use the complete header.
 #include "strix/weight/admission.hpp"
 #include "strix/weight/host_lowbit.hpp"
 #include "strix/weight/registry.hpp"
 #include "strix/weight/source.hpp"
 
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace strix::weight {
+
+struct PackMatrixSource;
 
 inline constexpr std::string_view kLowbitPackTag = "strix-lowbit-pack/v2";
 
@@ -28,11 +30,11 @@ struct LowbitPackEntry {
     FormatId storage;
     std::uint64_t rows{}, columns{};
     std::uint64_t offset{}, bytes{};
-    Digest256 source{};  // SHA-256 of the tensor's complete BF16 payload (digest_slice)
+    Digest256 source{};  // PackMatrixSource fingerprint (raw SHA-256 for BF16)
     std::optional<sp::Header> sp_header{};  // Strix pack storages only
 };
 
-// A Strix pack storage carries a tensor header (strix.sp4t: 4 bits, the fixed 4-bit table); q4_g64 / q6_g64 carry none.
+// Strix storages carry a header, and strix.sp4t restricts it to the fixed SP4 table.
 // lowbit_header_defect: empty when `header` is admissible for `storage`, otherwise the first violated rule.
 [[nodiscard]] bool lowbit_storage_has_header(FormatId storage) noexcept;
 [[nodiscard]] std::string lowbit_header_defect(FormatId storage, const std::optional<sp::Header>& header);
@@ -40,11 +42,16 @@ struct LowbitPackEntry {
 class LowbitPackWriter {
 public:
     // `checkpoint`: raw SHA-256 of the checkpoint file the rows and the statistics come from (required).
-    explicit LowbitPackWriter(const Digest256& checkpoint) : checkpoint_(checkpoint) {}
+    explicit LowbitPackWriter(const Digest256& checkpoint);
+    // Streaming variant: write payloads into an adjacent staging file and keep
+    // only the entry metadata. finish() publishes a new destination.
+    LowbitPackWriter(const Digest256& checkpoint, const std::string& path, std::span<const std::string_view> names);
+    ~LowbitPackWriter();
     void add(std::string tensor, FormatId storage, std::uint64_t rows, std::uint64_t columns,
              const Digest256& source, std::vector<std::uint8_t> bytes,
              std::optional<sp::Header> sp_header = std::nullopt);
     Status write(const std::string& path) const;
+    Status finish();
 
 private:
     struct Item {
@@ -53,6 +60,8 @@ private:
     };
     Digest256 checkpoint_{};
     std::vector<Item> items_;
+    struct Staging;
+    std::unique_ptr<Staging> staging_;
 };
 
 class LowbitPack {
@@ -60,6 +69,8 @@ public:
     // `checkpoint` is the raw SHA-256 of the checkpoint the engine loads; a pack coded from other bytes (or without a
     // checkpoint identity) is refused with stale_source. Framing, bounds and the identity are read from one open file.
     static Status open(const std::string& path, const Digest256& checkpoint, LowbitPack& out);
+    // Host reference admission includes SP2/SP3/SP4 entries, with fixed or fitted tables.
+    static Status open_host(const std::string& path, const Digest256& checkpoint, LowbitPack& out);
     [[nodiscard]] const std::vector<LowbitPackEntry>& entries() const { return entries_; }
     // SHA-256 of the header text and payloads in entry order (without padding).
     [[nodiscard]] const Digest256& identity() const { return identity_; }
@@ -72,10 +83,16 @@ public:
     Status find(std::string_view tensor, FormatId storage, const RawTensor& source, std::optional<Slice>& out,
                 std::int32_t* outer_exponent = nullptr) const;
 
+    Status find(std::string_view tensor, FormatId storage, const PackMatrixSource& source,
+                std::optional<Slice>& out) const;
+
 private:
+    static Status open_impl(const std::string&, const Digest256&, bool host, LowbitPack&);
+    Status find_impl(std::string_view, FormatId, const PackMatrixSource&, std::optional<Slice>&, std::int32_t*) const;
     std::string path_;
     std::shared_ptr<const Source> file_;
     std::vector<LowbitPackEntry> entries_;
+    std::map<std::string, std::size_t, std::less<>> entry_index_;
     std::size_t header_bytes_{};
     Digest256 identity_{}, checkpoint_{};
 };

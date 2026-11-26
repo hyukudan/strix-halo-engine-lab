@@ -4,6 +4,8 @@ add_library(strix-weight STATIC
     ${STRIX_WEIGHT_ROOT}/src/weight/block_draft.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/host_q8.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/lowbit_pack.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/pack_source.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/pack_plan.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/calib_provenance.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/source.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/admission.cpp
