@@ -4,6 +4,7 @@
 #include "strix/minimax/model_assets.hpp"
 
 #include <cstring>
+#include <cstdio>
 #include <fstream>
 #include "strix/minimax/asset_input.hpp"
 #include <map>
@@ -177,7 +178,8 @@ std::unique_ptr<DraftFile> DraftFile::open(const std::filesystem::path& dir, boo
     const auto want = manifest();
     std::map<std::string, const Blob*> found;
     std::size_t skipped = 0;
-    for (const auto& path : assets::draft_files(dir)) {
+    const auto files = assets::draft_files(dir);
+    for (const auto& path : files) {
         const auto header = read_header(path, &f->snapshot_);
         assets::Input in(path, &f->snapshot_);
         for (const auto& [name, t] : header) {
@@ -236,6 +238,9 @@ std::unique_ptr<DraftFile> DraftFile::open(const std::filesystem::path& dir, boo
         y.up = mx(p + "mlp.up_proj", inter, hidden);
         y.down = mx(p + "mlp.down_proj", hidden, inter);
     }
+    std::fputs("MiniMax decode: DSpark", stderr);
+    for (const auto& path : files) std::fprintf(stderr, " %s", path.string().c_str());
+    std::fputc('\n', stderr);
     return f;
 }
 

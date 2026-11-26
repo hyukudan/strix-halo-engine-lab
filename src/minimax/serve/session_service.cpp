@@ -1,4 +1,5 @@
 #include "session_service.hpp"
+#include "strix/minimax/model_assets.hpp"
 #include "serve_runtime.hpp"
 #include "minimax/model_graph.hpp"
 #include "strix/minimax/model_description.hpp"
@@ -262,12 +263,8 @@ ServePreparation prepare_serve(const std::vector<std::string>& arguments) {
         if(!session_options.save.empty() && !session_options.load.empty()) throw std::invalid_argument("choose session save or load");
         if (opt.slots == 0 || opt.slots > 8) throw std::invalid_argument("--slots 1..8");
         if (!dspark_exl3.empty() && dspark_dir.empty()) dspark_dir = opt.model_dir + "/dspark";
-        if (dspark_dir.empty() && dspark_mode != ds::Mode::off && std::filesystem::is_directory(opt.model_dir + "/dspark"))
-            for (const auto& entry : std::filesystem::directory_iterator(opt.model_dir + "/dspark"))
-                if (entry.is_regular_file() && entry.path().extension() == ".safetensors") {
-                    dspark_dir = opt.model_dir + "/dspark";
-                    break;
-                }
+        if (dspark_dir.empty() && dspark_mode != ds::Mode::off)
+            dspark_dir = strix::minimax::assets::discover_draft_dir(opt.model_dir).string();
         const strix::minimax::graph::Attachments graph_attachments{!dspark_dir.empty(), !dspark_exl3.empty(), 0};
         if (strix::minimax::graph::inspect_or_check(opt.model_dir, opt.rank, graph_attachments, print_graph, print_plan)) { p.exit_code = 0; return p; }
         auto& deploy_spec = p.deploy_spec;

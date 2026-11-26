@@ -129,6 +129,18 @@ Env exports(const rd::Effective& e) {
 void test_glm_product_profiles() {
     const Env absent;
     const auto empty = lookup(absent);
+    rd::ModelFacts head{true, true, "complete layer-45 inventory", {"model/mtp.safetensors"}};
+    for (const auto* tier : {"exact", "fast", "turbo"}) {
+        const std::vector<std::string> args{"--profile", tier};
+        const auto cli = rd::resolve(rd::scan({"--profile", tier, "--decode", "64"}), empty, head);
+        const auto server = rd::resolve_serve(args, true, empty, head);
+        CHECK(rd::print(cli).find("effective mtp-decode=verified model/mtp.safetensors\n") != std::string::npos);
+        CHECK(rd::print(cli, false).find("model/mtp.safetensors") == std::string::npos);
+        CHECK(rd::mtp_decode_line(cli) == rd::mtp_decode_line(server));
+        CHECK(rd::print(rd::resolve_serve(args, true, empty, {})).find(
+                  "effective mtp-decode=plain (missing mtp.safetensors)\n") != std::string::npos);
+        CHECK(rd::mtp_decode_line(rd::resolve_serve(args, false, empty, head)) == "effective mtp-decode=plain\n");
+    }
     const auto plain = rd::resolve(rd::scan({"--decode", "64"}), empty);
     CHECK(!plain.product);
     const auto normal_exports = exports(plain);

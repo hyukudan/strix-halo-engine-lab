@@ -606,7 +606,16 @@ inline void apply_env(const Effective& e, const std::function<void(const char*, 
     });
 }
 
-inline std::string print(const Effective& e) {
+inline std::string mtp_decode_line(const Effective& e) {
+    if (e.mtp_spec.value != "1")
+        return "effective mtp-decode=plain" +
+               (e.mtp_spec_candidate && !e.head.mtp_complete ? " (" + e.head.reason + ")" : std::string{}) + "\n";
+    std::string line = "effective mtp-decode=verified";
+    for (const auto& path : e.head.mtp_files) line += " " + path.generic_string();
+    return line + "\n";
+}
+
+inline std::string print(const Effective& e, bool include_asset_receipt = true) {
     std::string s;
     auto line = [&](const std::string& k, const Value& v) { s += "effective " + k + "=" + v.value + " (" + v.source + ")\n"; };
     s += std::string("effective baseline=") + (e.baseline ? "1" : "0") + "\n";
@@ -623,6 +632,7 @@ inline std::string print(const Effective& e) {
     line("mtp-spec", e.mtp_spec);
     line("spec", e.spec);
     s += "effective mtp-head=" + e.head.reason + "\n";
+    if (include_asset_receipt) s += mtp_decode_line(e);
     s += "effective mtp-kmax=" + std::to_string(e.kmax) + " adaptive=" + (e.adaptive ? "1" : "0") + "\n";
     s += "effective mtp-bootstrap=" + std::string(e.mtp_spec.value == "1" ? (e.prefill == "gemv" ? "chunked" : "ref") : "plain") + "\n";
     s += "effective prefill=" + e.prefill + " (requested " + e.prefill_requested.value + ", " + e.prefill_requested.source + ")\n";

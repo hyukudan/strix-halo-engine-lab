@@ -1212,6 +1212,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         rd::apply_env(eff, [](const char* k, const char* v) { (void)::setenv(k, v, 0); });
+        std::fputs(rd::mtp_decode_line(eff).c_str(), stderr);
         opt.mtp = mtp_on;
         opt.spec = mtp_on;
         opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
@@ -1310,7 +1311,8 @@ int main(int argc, char** argv) {
         hello.prefix_cache_bytes = prefix_cache_bytes;
         hello.model_hash = model_hash(opt.model_dir);
         {
-            std::string ident = rd::print(eff);
+            // Device peers may mount the same model pack under different paths.
+            std::string ident = rd::print(eff, /*include_asset_receipt=*/false);
             ident += std::string("engine identity ") + ge::identity_mode_name(eng.identity_mode()) + " decode-xfer " +
                      (eng.decode_xfer_enabled() ? "1" : "0") + " prefill " + prefill_mode + " pipeline " +
                      std::to_string(eng.prefill_pipeline()) + " mtp " + std::to_string(mtp_on ? 1 : 0) + " g2 " + std::to_string(serve_g2 ? 1 : 0) +

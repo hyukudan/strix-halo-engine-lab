@@ -313,6 +313,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         rd::apply_env(eff, [](const char* k, const char* v) { (void)::setenv(k, v, 0); });
+        std::fputs(rd::mtp_decode_line(eff).c_str(), stderr);
         if (eff.product) {
             std::fprintf(stderr, "profile %s\n", eff.product->json().c_str());
             for (const auto& line : eff.product->receipt_lines()) std::fprintf(stderr, "%s\n", line.c_str());
