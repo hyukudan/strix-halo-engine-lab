@@ -5,6 +5,7 @@
 #include "strix/weight/admission.hpp"
 
 #include <filesystem>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <string_view>
@@ -19,6 +20,7 @@ inline constexpr auto kDraftLayerCount = model::narrow<unsigned>(data::drafter::
 inline constexpr auto kExpertCount = model::narrow<unsigned>(data::moe::n_routed_experts);
 inline constexpr auto& kMlaLayers = data::attention::mla::layers;
 inline constexpr auto kFlashIndexerShard = data::attention::indexer::sidecar;
+static_assert(std::size(data::attention::compress_ratios) == kLayerCount);
 
 enum class Module {
     unclassified, embedding, layer_norm, hyper_connection, hca, compressor,
@@ -29,6 +31,16 @@ enum class Module {
 
 [[nodiscard]] std::string_view module_name(Module module) noexcept;
 [[nodiscard]] std::string main_shard_name(unsigned one_based_index);
+[[nodiscard]] std::string target_layer_prefix(unsigned layer);
+[[nodiscard]] std::string inverse_scale_name(std::string_view weight_name);
+
+[[nodiscard]] constexpr bool layer_is_mla(unsigned layer) {
+    return layer < kLayerCount && data::attention::compress_ratios[layer] < 0;
+}
+[[nodiscard]] constexpr bool layer_has_moe(unsigned layer) {
+    return layer < kLayerCount && layer >= data::moe::first_k_dense_replace &&
+           layer % data::moe::moe_layer_freq == 0;
+}
 
 struct Tensor {
     Module module;
