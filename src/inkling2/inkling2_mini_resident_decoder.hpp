@@ -686,6 +686,10 @@ public:
     using PlainRowRoute = std::function<unsigned(unsigned, std::span<float>)>;
     void set_plain_row_route(PlainRowRoute route) { plain_row_ = std::move(route); }
     [[nodiscard]] bool plain_row_route() const noexcept { return static_cast<bool>(plain_row_); }
+    // decode_committed_row takes the plain-row route (not a calibrated low-bit decode row).
+    [[nodiscard]] bool plain_row_applies() const noexcept {
+        return plain_row_ && !backend_.lowbit_applies(MiniAppendKind::decode, 1U);
+    }
 
     void commit(unsigned rows) {
         auto& state = slots_.front()->state();

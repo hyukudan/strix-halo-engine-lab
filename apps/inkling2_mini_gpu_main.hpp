@@ -121,6 +121,13 @@ public:
         // The plain-row route when bound (the step program over this decoder's state), else the resident step.
         return decoder_.decode_committed_row(token, logits);
     }
+#if defined(STRIX_INKLING2_STEP_PROGRAM)
+    // Sampled rows on the plain-row route: the step program's full-head row sampled on the device (decode_sampled).
+    [[nodiscard]] bool samples_on_device() const override { return plain_.has_value() && decoder_.plain_row_applies(); }
+    std::uint32_t decode_sampled(std::uint32_t token, TokenSampler& sampler, std::uint64_t position) override {
+        return plain_->decode_sampled(token, sampler, position);
+    }
+#endif
     unsigned prefill_embedded(std::span<const unsigned> ids, const std::shared_ptr<const session::EmbedTable>& table,
                               std::span<float> logits) override {
         if (!table) return decoder_.prefill(ids, logits);
