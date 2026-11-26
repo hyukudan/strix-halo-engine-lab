@@ -506,6 +506,20 @@ bool check_discarded_capture() {
 // its stream. Key / value inputs are recorded by the attention (as attn_core does for the prepared GQA
 // convolutions); attention / MoE inputs by the forward. A partial commit by copies must equal the replay.
 struct TapeBackend : RingBackend {
+    // Copies into the bound tape: each (visit, stream) region is recorded once per staged append (a duplicate
+    // recording wrote the same bytes twice: one more launch per stream and visit in every verify window).
+    std::span<const float> tape_range;
+    std::vector<const float*> tape_writes;
+    template <class T>
+    void copy(std::span<const T> source, std::span<T> output) {
+        if constexpr (std::is_same_v<T, float>) {
+            const auto* at = output.data();
+            if (!output.empty() && !tape_range.empty() && at >= tape_range.data() &&
+                at < tape_range.data() + tape_range.size())
+                tape_writes.push_back(at);
+        }
+        RingBackend::copy(source, output);
+    }
     static void push(MiniMutableRows history, MiniConstRows row) {
         const auto width = row.size();
         std::ranges::copy(history.subspan(width), history.begin());
@@ -581,9 +595,14 @@ bool check_convolution_tape_commit() {
     TapeLane taped(true), replayed(false);
     taped.append(3, false);
     replayed.append(3, false);
+    taped.backend.tape_range = taped.tape;
     unsigned replays = 0;
     for (const unsigned keep : {1U, 0U, 3U, 2U, 4U, 1U}) {
+        taped.backend.tape_writes.clear();
         taped.append(TapeLane::kRows, true);
+        auto writes = taped.backend.tape_writes;
+        std::ranges::sort(writes);
+        if (writes.empty() || std::ranges::adjacent_find(writes) != writes.end()) return false;
         replayed.append(TapeLane::kRows, true);
         taped.state.commit_staged(taped.backend, keep, [&](unsigned rows) { ++replays; taped.append(rows, false); });
         replayed.state.commit_staged(replayed.backend, keep, [&](unsigned rows) { replayed.append(rows, false); });

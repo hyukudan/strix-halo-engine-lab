@@ -346,10 +346,10 @@ private:
                     base += elements;
                 }
             } else {
+                // A taped (staged verify) chunk keeps every input row of the stream for its partial commit: one copy
+                // per stream (the input is const, so recording before the convolution is the same bytes).
                 record_tape(input, visit_state_.tape[path]);
                 backend_.convolve(visit, stream, input, visit_state_.history[path], output);
-                // A taped (staged verify) chunk keeps every input row of the stream for its partial commit.
-                if (const auto tape = visit_state_.tape[path]; !tape.empty()) backend_.copy(input, tape);
             }
         }
 
