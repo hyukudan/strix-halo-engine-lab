@@ -107,26 +107,26 @@ int main(int argc,char** argv) try {
     SAME(window_history_intervals);
 #undef SAME
     // Exercise the guide's pins and calibration geometry without the HIP-only organization flags.
-    std::vector<std::string> serving_args{"decode", (dir/"target.gguf").string()};
-    for (int token = 1; token <= 32; ++token) serving_args.push_back(std::to_string(token));
+    std::vector<std::string> guide_args{"decode", (dir/"target.gguf").string()};
+    for (int token = 1; token <= 32; ++token) guide_args.push_back(std::to_string(token));
     const auto pins_begin = std::find(explicit_bundle_args.begin(), explicit_bundle_args.end(), "--mtp");
     const auto pins_end = std::find(pins_begin, explicit_bundle_args.end(), "--mtp-golden");
-    serving_args.insert(serving_args.end(), pins_begin, pins_end);
-    serving_args.insert(serving_args.end(), {"--generate", "64", "--context", "33280", "--mtp-calibration-rows", "8"});
-    auto dump_args = serving_args;
-    dump_args.insert(dump_args.end(), {"--known-prefix-window", "--known-prefix-full-rows",
+    guide_args.insert(guide_args.end(), pins_begin, pins_end);
+    guide_args.insert(guide_args.end(), {"--generate", "64", "--context", "33280", "--mtp-calibration-rows", "8"});
+    auto guide_dump_args = guide_args;
+    guide_dump_args.insert(guide_dump_args.end(), {"--known-prefix-window", "--known-prefix-full-rows",
         "--known-prefix-prefill-rows", "8192", "--known-prefix-workspace-budget-bytes", "8589934592",
         "--known-prefix-host-metadata-budget-bytes", "2147483648", "--known-prefix-uma-budget-bytes", "128849018880",
         "--known-prefix-host-headroom-bytes", "4294967296", "--mtp-golden-dump", "qwen-t8192.golden"});
-    const auto dump = parse(dump_args);
-    require(mtp_tiled_prompt(dump) && dump.known_prefix_prefill_rows == 8192 &&
-        dump.mtp.golden_dump == "qwen-t8192.golden" && !dump.http_serve, "guide uses tiled golden dump");
-    serving_args.insert(serving_args.end(), {"--http-serve", "--http-batch", "0", "--http-bind", "127.0.0.1",
+    const auto guide_dump = parse(guide_dump_args);
+    require(mtp_tiled_prompt(guide_dump) && guide_dump.known_prefix_prefill_rows == 8192 &&
+        guide_dump.mtp.golden_dump == "qwen-t8192.golden" && !guide_dump.http_serve, "guide uses tiled golden dump");
+    guide_args.insert(guide_args.end(), {"--http-serve", "--http-batch", "0", "--http-bind", "127.0.0.1",
         "--http-port", "8082", "--mtp-golden", "qwen-t8192.golden", "--mtp-golden-sha256", sha});
-    const auto served = parse(serving_args);
-    require(http_prefill_pending(served) && served.http_batch_explicit && !served.http_batch &&
-        served.mtp.golden == dump.mtp.golden_dump && mtp_calibration_rows(served) == mtp_calibration_rows(dump) &&
-        mtp_calibration_rows(served) == 8 && served.mtp.sidecar_logical_name == dump.mtp.sidecar_logical_name,
+    const auto guide_served = parse(guide_args);
+    require(http_prefill_pending(guide_served) && guide_served.http_batch_explicit && !guide_served.http_batch &&
+        guide_served.mtp.golden == guide_dump.mtp.golden_dump && mtp_calibration_rows(guide_served) == mtp_calibration_rows(guide_dump) &&
+        mtp_calibration_rows(guide_served) == 8 && guide_served.mtp.sidecar_logical_name == guide_dump.mtp.sidecar_logical_name,
         "guide uses automatic single HTTP owner with matching MTP pins and calibration geometry");
 
     const auto stats=file_hash_cache_stats();verify_mtp_bundle_sidecar(sidecar.string(),sha,3);

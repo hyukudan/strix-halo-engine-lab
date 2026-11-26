@@ -7,6 +7,7 @@
 
 struct Args {
     std::uint32_t repeat = 2, ttft_warmup = 1;
+    std::uint32_t ttft_decode = 0, extend_check = 0;
     bool timing = true;
 };
 namespace strix::dist {

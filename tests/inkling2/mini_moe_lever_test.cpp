@@ -94,7 +94,7 @@ void test_row() {
             "existing block row retains its slot and StrixPack and both low-bit candidates are bound");
     require(mini::kMiniLevers[18].name == mini::kMiniLowBitHead, "the SP4 fixed-table head row closes the table");
     // The speculation row: exact, builtin auto (the default of every tier, legacy identity), off explicit.
-    const auto* speculation = std::ranges::find_if(mini::kMiniLevers, [](const profile::Lever& lever) {
+    const auto speculation = std::ranges::find_if(mini::kMiniLevers, [](const profile::Lever& lever) {
         return lever.name == mini::kMiniSpeculation;
     });
     require(speculation != mini::kMiniLevers.end() && speculation->kind == profile::Kind::exact &&
