@@ -830,10 +830,9 @@ void test_served_route() {
             const bool on = explicit_on || value == nullptr;
             require(mini::mini_served_cli_route(resolution) == on, "served route: the column, an explicit 1 or 0");
             require(resolution.qualification() == "qualified", "served route: every setting is qualified");
-            // The backend's request: CUDA runs the resolved value, HIP an explicit 1 only.
-            require(mini::mini_served_route_request(resolution, false) == on &&
-                        mini::mini_served_route_request(resolution, true) == explicit_on,
-                    "served route: CUDA takes the column, HIP an explicit setting only");
+            // The backend's request: every backend runs the resolved value (an explicit 0 keeps the held-back route).
+            require(mini::mini_served_route_request(resolution) == on,
+                    "served route: every backend takes the resolved value");
             // The command line's resolution: the request stays visible on its own line, never as an effective lever.
             auto cli = resolution;
             mini::mini_cli_decline_served_route(cli);

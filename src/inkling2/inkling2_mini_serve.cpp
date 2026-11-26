@@ -103,7 +103,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     // Admission of the served route lever (kMiniServedCliRoute): a server of either backend runs the command line's
     // route (mini_served_prefill_emits_first; the receipt carries requested / admitted, mini_served_route_startup_field).
     const bool hip = resolved.backend == "hip";
-    out.served_route_requested = mini_served_route_request(resolution, hip);
+    out.served_route_requested = mini_served_route_request(resolution);
     out.served_cli_route = mini_served_prefill_emits_first(hip, out.served_route_requested);
     if (hip && (out.packed_decode_flag || out.grouped_decode_flag))
         throw std::invalid_argument("a HIP Inkling server takes no decode form flag (the served route lever row sets it)");
@@ -132,9 +132,9 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
         if (explicit_rows) out.lane_rows = out.prefill_rows;
         out.prefill_tail = mini_prefill_tail_capacity(out.prefill_rows, schedule.tail_divisor, out.context);
     }
-    // An implicit chunk on a chunk-invariant backend (CUDA) retries at the command line's fallback rows when its slots
-    // fall short (serve::load_with_chunk_ladder); with the lever those smaller candidates run the held-back route. The
-    // explicit HIP tall-chunk option falls back to the incumbent 128 rows.
+    // An implicit chunk retries at the fallback rows when its slots fall short (serve::load_with_chunk_ladder): the
+    // command line's fallback rows on a chunk-invariant backend (CUDA), the held-back 128 rows on HIP; with the lever
+    // those smaller candidates run the held-back route. The explicit HIP tall-chunk option falls back to the same 128 rows.
     out.prefill_fallback_rows = explicit_rows    ? 0U
                                 : hip_tall_chunk ? kMiniServedHeldBackChunk
                                                  : mini_served_prefill_fallback_rows(hip, out.tier);

@@ -194,16 +194,22 @@ int served_prefill_gate() {
     static_assert(cuda_rule.align == 32U && cuda_rule.short_rows == 32U);
     static_assert(cuda_lever_rule.align == 32U && cuda_lever_rule.short_rows == 32U);
     // The served route lever is admitted on both backends. CUDA keeps its chunk ladder on either route (the lever runs
-    // at the first candidate only, a smaller candidate runs held-back); HIP has one candidate.
+    // at the first candidate only, a smaller candidate runs held-back); HIP falls back to its held-back 128 rows, so the
+    // command line's chunk never costs a slot there (the held-back route at 128 rows stays one candidate).
     static_assert(mini_served_prefill_emits_first(true, true) && mini_served_prefill_emits_first(false, true) &&
                   !mini_served_prefill_emits_first(true, false) && !mini_served_prefill_emits_first(false, false));
-    static_assert(mini_served_prefill_fallback_rows(true, Name::standard) == 0U &&
+    static_assert(mini_served_prefill_fallback_rows(true, Name::standard) == kMiniServedHeldBackChunk &&
                   mini_served_prefill_fallback_rows(false, Name::standard) ==
                       mini_cli_prefill_fallback_rows(MiniPrefillBackend::cuda, Name::standard));
     constexpr auto tall = mini_served_chunk_ladder(8192U, 2048U), short_context = mini_served_chunk_ladder(1024U, 2048U);
     static_assert(tall.count == 3U && tall.rows[1] == 2048U && tall.rows[2] == 128U);
     static_assert(short_context.count == 2U && short_context.rows[1] == 128U);
     static_assert(mini_served_chunk_ladder(8192U, 0U).count == 1U && mini_served_chunk_ladder(128U, 2048U).count == 1U);
+    constexpr auto hip_route = mini_served_chunk_ladder(8192U, mini_served_prefill_fallback_rows(true, Name::turbo));
+    constexpr auto hip_held_back = mini_served_chunk_ladder(kMiniServedHeldBackChunk,
+                                                            mini_served_prefill_fallback_rows(true, Name::standard));
+    static_assert(hip_route.count == 2U && hip_route.rows[0] == 8192U && hip_route.rows[1] == kMiniServedHeldBackChunk);
+    static_assert(hip_held_back.count == 1U && hip_held_back.rows[0] == kMiniServedHeldBackChunk);
     static_assert(mini_prefill_tail_capacity(8192U, 8U, 8192U) == 0U && mini_prefill_tail_capacity(8192U, 8U, 9000U) == 808U);
     static_assert(mini_call_first_chunk(8193U, 8192U, 0U) == 8192U && mini_call_first_chunk(8209U, 8192U, 17U) == 8209U);
     return failed;

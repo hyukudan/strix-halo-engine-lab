@@ -161,10 +161,13 @@ inline constexpr std::string_view kMiniAttnProjectedBias = "inkling2-mini-attn-p
 // of the same request on the command line at any cohort width (CLI == server). The build's behaviour (builtin 1, no
 // profile column sets it) after the RTX receipts (cuda_pf2-kit q44: served prefill == CLI prefill bitwise; q45: server
 // ids == CLI ids 8/8 at the held-back route's speed, slot bytes equal): the held-back served EXACT ids were a defect
-// (q43: 1/8 equal to the command line). A CUDA server runs it; a HIP server only when set explicitly
-// (mini_served_route_request: its per-slot working memory, the command line's chunk instead of the 128-row held-back
-// chunk, awaits its own decision). An explicit 0 keeps the held-back route (the last prompt token decoded as the first
-// decode row). The command line always runs this route and does not read the switch.
+// (q43: 1/8 equal to the command line). Every server runs it (mini_served_route_request). On HIP its per-slot working
+// memory (the command line's chunk instead of the 128-row held-back chunk) never costs a session slot: the served chunk
+// ladder keeps the held-back route at 128 rows wherever the command line's chunk would (mini_served_prefill_fallback_rows).
+// HIP receipts: ink_fix2 t1 server ids == CLI 128/128; gfx1151 served EXACT prefill with the command line's chunk 8K
+// 601 -> 2,030 tok/s, 32K 578 -> 1,870 (ink_pf_ab, ids 7/7 equal to the held-back route). An explicit 0 keeps the
+// held-back route (the last prompt token decoded as the first decode row). The command line always runs this route and
+// does not read the switch.
 inline constexpr std::string_view kMiniServedCliRoute = "inkling2-mini-served-cli-route@1";
 // Draft CUDA controller schedule. One plane requires explicit selection and a resident weight certificate.
 inline constexpr std::string_view kMiniControllerPlanes = "inkling2-mini-controller-planes@1";
@@ -246,7 +249,9 @@ inline constexpr std::array<profile::Lever, 19> kMiniLevers{{
      .runnable = {true, true, true, true}, .target = "", .off = "0",
      .source = "RTX receipts (cuda_pf2-kit): q44 served prefill == CLI prefill bitwise (first id, scores, KV, histories, "
                "4 decode steps; pieces) and lanes == lone; q45 server ids == CLI ids 8/8, C1 / C8 / gap / slot bytes equal "
-               "to the held-back route; HIP: ink_fix2 t1 server ids == CLI 128/128",
+               "to the held-back route; HIP: ink_fix2 t1 server ids == CLI 128/128; gfx1151 served EXACT prefill, 1 slot, "
+               "held-back -> this route (ink_meas s1/s2): 1K 582 -> 1,590, 8K 580 -> 2,203, 32K 543 -> 1,942, 58K 515 -> "
+               "1,661 tok/s, ids equal at the five lengths",
      .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniScreenedHead, .env = "STRIX_INK_SCREENED_HEAD", .option = "",
      .value = {"1", "1", "1", ""}, .builtin = "0",
