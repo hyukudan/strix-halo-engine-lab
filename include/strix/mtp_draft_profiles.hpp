@@ -20,6 +20,14 @@ namespace strix {
 //     every draft until an RTX receipt qualifies another value (no HIP number is promoted to CUDA).
 // The probability only changes how many drafts a cycle proposes and which verify window runs; the target
 // verifies every token, so tokens are those of the same command with the explicit value.
+// The target model a draft was trained for (GGUF general.architecture, <arch>.block_count, <arch>.embedding_length).
+// Drafter discovery binds a draft beside a model only when the model declares this identity.
+struct MtpDraftTarget {
+    std::string_view architecture;
+    std::uint64_t layers, hidden;
+};
+inline constexpr MtpDraftTarget mtp_flash_next_target{"qwen4exp", 48U, 2560U};  // models/qwen3.8-flash-next.toml
+
 struct MtpDraftProfile {
     std::string_view name;
     std::string_view sidecar_sha256;
@@ -29,6 +37,7 @@ struct MtpDraftProfile {
     std::string_view converter_revision, converter_sha256, norm_converter_sha256;
     float hip_min_probability;   // qualified on HIP (Strix)
     float cuda_min_probability;  // qualified on CUDA (RTX serve); legacy 0.7 until an RTX receipt
+    MtpDraftTarget target;
 };
 
 inline constexpr std::array<MtpDraftProfile, 3> mtp_draft_profiles{{
@@ -39,7 +48,8 @@ inline constexpr std::array<MtpDraftProfile, 3> mtp_draft_profiles{{
      "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
      "6fcaa16f4b360649933a54d1f91ad40ed35c0e11",
      "6dab74eb519ea3b12787a28cc3fd5039ff65135ff14ba44321c9855edf1f8289",
-     "c53604b9df72214ebfe492d05899042dd375a1e9d9aa03a5de87ab01f97d7730", 0.85F, 0.7F},
+     "c53604b9df72214ebfe492d05899042dd375a1e9d9aa03a5de87ab01f97d7730", 0.85F, 0.7F,
+     mtp_flash_next_target},
     // Distilled drafts (branch mtp/distill, round 1 = D, round 2 = G): min-p 0.7.
     {"distill-d", "47cb2cbd35184726065eec9a21ea89d121988852eea037cb3464be4818966017",
      "mtp-Qwen3.8-Flash-Next-shared-distillD-Q8_0.gguf", 2786568256ULL,
@@ -47,14 +57,16 @@ inline constexpr std::array<MtpDraftProfile, 3> mtp_draft_profiles{{
      "export/mtp-Qwen3.8-Flash-Next-shared-distillD-Q8_0.gguf",
      "f9eccbc789e860ca1b8402980830e410594eda52",
      "5dfead6ba7840f708945c1da3a288a3292e22e4dceb70630ccefab00cbba1366",
-     "4ea7af3e68357e554eb75f47e40275d882f48406fcaced18af1eba71acbfac0c", 0.7F, 0.7F},
+     "4ea7af3e68357e554eb75f47e40275d882f48406fcaced18af1eba71acbfac0c", 0.7F, 0.7F,
+     mtp_flash_next_target},
     {"distill-g", "5516d3ce407783a424315b6a2a0d8b06341665bb3541b98e5db0fe944add4c3c",
      "mtp-Qwen3.8-Flash-Next-shared-distillG-Q8_0.gguf", 2786568256ULL,
      "local/mtp-distill", "1a0eed49be3995d8ea15eeb6dd370dd16d9c04db",
      "export/mtp-Qwen3.8-Flash-Next-shared-distillG-Q8_0.gguf",
      "1a0eed49be3995d8ea15eeb6dd370dd16d9c04db",
      "5dfead6ba7840f708945c1da3a288a3292e22e4dceb70630ccefab00cbba1366",
-     "4ea7af3e68357e554eb75f47e40275d882f48406fcaced18af1eba71acbfac0c", 0.7F, 0.7F},
+     "4ea7af3e68357e554eb75f47e40275d882f48406fcaced18af1eba71acbfac0c", 0.7F, 0.7F,
+     mtp_flash_next_target},
 }};
 
 // The recommended draft (final campaign: +10 % decode over the base draft at min-p 0.85).
@@ -63,6 +75,12 @@ inline constexpr std::string_view mtp_recommended_draft_profile = "distill-g";
 // is also found there by its logical name (drafter discovery).
 inline constexpr std::string_view mtp_drafter_dir = "MTP";
 static_assert(mtp_draft_profiles[0].source_path.starts_with("MTP/"), "the base draft ships in the drafter directory");
+
+[[nodiscard]] constexpr bool mtp_draft_target_matches(const MtpDraftProfile& profile, std::string_view architecture,
+                                                      std::uint64_t layers, std::uint64_t hidden) noexcept {
+    return profile.target.architecture == architecture && profile.target.layers == layers &&
+           profile.target.hidden == hidden;
+}
 
 inline constexpr const MtpDraftProfile* find_mtp_draft_profile(std::string_view name) noexcept {
     for (const auto& p : mtp_draft_profiles) if (p.name == name) return &p;

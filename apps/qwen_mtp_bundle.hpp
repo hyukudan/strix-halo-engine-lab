@@ -1,6 +1,7 @@
 #pragma once
 #include "qwen_yarn_memory.hpp"
 #include "strix/mtp_bundle_defaults.hpp"
+#include "strix/gguf_reader.hpp"
 #include "strix/mtp_draft_profiles.hpp"
 #include "strix/session/drafter_discovery.hpp"
 #include "strix/model_content_hash.hpp"
@@ -221,9 +222,47 @@ inline MtpBundleArguments read_mtp_bundle(const std::filesystem::path& path) {
 // from the caller. Option order and values equal the shipped recipe's for the same draft; a host test compares them.
 // `vocabulary_dir` empty: no draft vocabulary subset (the 4096-row context vocabulary still serves the Q4 head).
 // The profile registry as discovery candidates (the discovery itself is engine-neutral).
-inline std::vector<strix::session::DrafterCandidate> mtp_drafter_candidates() {
+// The identity a model file declares for drafter discovery (empty architecture: unreadable or not a GGUF).
+struct MtpTargetShape {
+    std::string architecture;
+    std::uint64_t layers=0, hidden=0;
+};
+inline MtpTargetShape mtp_target_shape(const gguf::FileInfo& info) {
+    MtpTargetShape shape;
+    const auto* arch=info.find_metadata("general.architecture");
+    if (!arch || !arch->string_value) return shape;
+    shape.architecture=*arch->string_value;
+    const auto number=[&](const std::string& key) -> std::uint64_t {
+        const auto* e=info.find_metadata(shape.architecture+"."+key);
+        if (!e) return 0;
+        if (e->unsigned_value) return *e->unsigned_value;
+        return e->signed_value && *e->signed_value>0 ? static_cast<std::uint64_t>(*e->signed_value) : 0;
+    };
+    shape.layers=number("block_count");
+    shape.hidden=number("embedding_length");
+    return shape;
+}
+inline MtpTargetShape mtp_target_shape(const std::filesystem::path& model) {
+    try { return mtp_target_shape(gguf::read_file(model)); }
+    catch (const std::exception&) { return {}; }
+}
+// Registry drafts trained for this target only: a draft file in MTP/ beside another model is never bound (its size and
+// name match, its weights do not). `rejected` names the drafts present beside the model but left out, and why.
+inline std::vector<strix::session::DrafterCandidate> mtp_drafter_candidates(const std::filesystem::path& model,
+    const MtpTargetShape& target, std::vector<std::string>* rejected=nullptr) {
     std::vector<strix::session::DrafterCandidate> result;
-    for (const auto& p:mtp_draft_profiles) result.push_back({p.name,p.source_path,p.logical_name,p.sidecar_bytes,mtp_drafter_dir});
+    const auto directory=(model.has_parent_path() ? model.parent_path() : std::filesystem::path("."))/mtp_drafter_dir;
+    for (const auto& p:mtp_draft_profiles) {
+        if (!mtp_draft_target_matches(p,target.architecture,target.layers,target.hidden)) {
+            std::error_code ec;
+            if (rejected && std::filesystem::exists(directory/p.logical_name,ec)) rejected->push_back("draft "+std::string(p.name)+" targets "+std::string(p.target.architecture)+" "+
+                std::to_string(p.target.layers)+" x "+std::to_string(p.target.hidden)+", the model declares "+
+                (target.architecture.empty() ? std::string("no readable identity") : target.architecture+" "+
+                 std::to_string(target.layers)+" x "+std::to_string(target.hidden)));
+            continue;
+        }
+        result.push_back({p.name,p.source_path,p.logical_name,p.sidecar_bytes,mtp_drafter_dir});
+    }
     return result;
 }
 struct MtpProfileBundleInputs {
