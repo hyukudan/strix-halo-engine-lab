@@ -98,7 +98,8 @@ void simulate(const Case& c, std::mt19937& rng) {
     for (auto& b : x_scales) b = static_cast<std::uint8_t>(scale(rng));
     const unsigned w_code_row = k_total / 2U, w_scale_row = k_total / 16U;
     std::vector<int> seen(std::size_t{c.rows} * out_total, 0);
-    const unsigned rows = c.rows < lay::kRows ? c.rows : lay::kRows, rows8 = (rows + 7U) & ~7U, rows16 = (rows + 15U) & ~15U;
+    const unsigned rows = c.rows < lay::kRows ? c.rows : lay::kRows, rows8 = lay::scale_copy_rows(rows),
+                   rows16 = lay::code_copy_rows(rows);
     constexpr unsigned kAcc = 4U * 4U * 4U;  // acc[mt][nt][z] per lane
     for (unsigned block = 0; block < out_total / lay::kOutputs; ++block) {
         const unsigned first_output = block * lay::kOutputs;
@@ -299,9 +300,28 @@ void copy_plan_terms() {
     }
 }
 
+// The stage-copy extents the kernel and the simulation share: at 1, 8, 17 and 33 live rows the x4 B load reads the partner n8
+// block past the last live one, so code rows run to the next multiple of 16 (rows 8..15 at one live row) while scale rows stop at
+// the next multiple of 8. A code extent that stops at a multiple of 8 fails here.
+void copy_extents() {
+    const struct {
+        unsigned rows, code, scale;
+    } pinned[] = {{1U, 16U, 8U}, {8U, 16U, 8U}, {17U, 32U, 24U}, {33U, 48U, 40U}, {128U, 128U, 128U}};
+    for (const auto& p : pinned) {
+        check(lay::code_copy_rows(p.rows) == p.code, "code rows copied up to a multiple of 16");
+        check(lay::scale_copy_rows(p.rows) == p.scale, "scale rows copied up to a multiple of 8");
+    }
+    for (unsigned rows = 1; rows <= lay::kRows; ++rows) {
+        const unsigned code = lay::code_copy_rows(rows), scale = lay::scale_copy_rows(rows);
+        check(code % 16U == 0U && code >= rows && code < rows + 16U && code <= lay::kRows, "code extent");
+        check(scale % 8U == 0U && scale >= rows && scale < rows + 8U && code >= scale, "scale extent");
+    }
+}
+
 int main() {
     admission();
     copy_plan_terms();
+    copy_extents();
     std::mt19937 rng(20261122U);
     const Case cases[] = {{128, 256, 64, 0, packed::RowOrder::contiguous},
                           {256, 384, 37, 5, packed::RowOrder::interleaved_halves},
