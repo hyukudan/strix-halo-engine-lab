@@ -326,70 +326,58 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
     std::vector<Selected> selections(table.size());
     for (std::size_t i = 0; i < table.size(); ++i)
         if (table[i].apps & unsigned(app)) selections[i] = select_of(table[i]);
-    // The lower arm the ladder rows are bound to; a lever outside this app never runs (its builtin).
-    std::vector<strix::profile::LadderRow> ladder(inputs.ladder.begin(), inputs.ladder.end());
-    const auto regime = strix::profile::measured_receipt_regime(inputs.regime, inputs.env);
-    const auto build_arms = [&] {
-        return strix::profile::ladder_arms(table, std::span<const strix::profile::LadderRow>(ladder), regime,
-            [&](const Lever& lever, unsigned c) {
-                return strix::profile::column_admission(lever, c, allow_pending, strix::profile::model_preset());
-            },
-            [&](const Lever& lever) -> std::optional<std::string_view> {
-                if (!(lever.apps & unsigned(app))) return std::string_view(lever.builtin);
-                const auto& chosen = selections[static_cast<std::size_t>(&lever - table.data())].value;
-                if (chosen.source == strix::profile::DefaultSource::on) return std::nullopt;
-                return std::string_view(chosen.value);
-            }, allow_pending);
-    };
-    auto arms = build_arms();
-    std::deque<std::string> band_references;
-    strix::profile::settle_band_receipts(ladder, arms, band_references, build_arms);
-    for (const auto& lever : table) {
-        if (!(lever.apps & unsigned(app))) continue;
-        Entry entry{&lever, {}, Status::profile, {}};
-        const auto& wanted = lever.value[column];
-        const auto& [selected, cli_baseline] = selections[static_cast<std::size_t>(&lever - table.data())];
-        entry.value = selected.value;
-        if (selected.source == strix::profile::DefaultSource::cli) {
-            entry.status = cli_baseline ? Status::baseline_cli : Status::explicit_cli;
-        } else if (selected.source == strix::profile::DefaultSource::baseline) {
-            entry.status = Status::baseline_env;
-        } else if (selected.source == strix::profile::DefaultSource::env) {
-            entry.status = Status::explicit_env;
-        } else if (wanted.empty()) {
-            continue;  // the profile leaves it alone
-        } else {
-            const auto admit = [&](unsigned c) {
-                return strix::profile::column_admission(lever, c, allow_pending, strix::profile::model_preset());
-            };
-            const auto admission = admit(column);
-            auto cell = strix::profile::select_profile_cell(lever, ladder, profile, regime, admit,
-                                                            allow_pending, arms);
-            entry.ladder = std::move(cell.route);
-            entry.ladder_reference = std::move(cell.reference);
-            if (cell.benchmark) {
-                // --allow-pending where no timing row decides the regime: the cell runs as an unqualified benchmark
-                // arm (the shared resolver's rule); a measured slower or within-noise row never reaches here.
-                entry.value = cell.value;
-                entry.wanted = std::string(wanted);
-                entry.status = Status::unqualified;
-                out.entries.push_back(std::move(entry));
-                continue;
+    // A lever outside this app never runs (its builtin).
+    namespace shared = strix::profile;
+    const auto regime = shared::measured_receipt_regime(inputs.regime, inputs.env);
+    shared::resolve_rows(table, profile, regime, allow_pending, inputs.ladder, {},
+        [&](const Lever& lever, unsigned c) {
+            return shared::column_admission(lever, c, allow_pending, shared::model_preset());
+        }, [&](const Lever& lever) -> std::optional<std::string_view> {
+            if (!(lever.apps & unsigned(app))) return lever.builtin;
+            const auto& chosen = selections[static_cast<std::size_t>(&lever - table.data())].value;
+            if (chosen.source == shared::DefaultSource::on) return std::nullopt;
+            return chosen.value;
+        }, [app](const Lever& lever) { return (lever.apps & unsigned(app)) != 0; },
+        [&](const Lever& lever, unsigned selected_column, const auto& admit, shared::LadderCell cell) {
+            Entry entry{&lever, {}, Status::profile, {}};
+            const auto& wanted = lever.value[selected_column];
+            const auto& [selected, cli_baseline] = selections[static_cast<std::size_t>(&lever - table.data())];
+            entry.value = selected.value;
+            if (selected.source == strix::profile::DefaultSource::cli) {
+                entry.status = cli_baseline ? Status::baseline_cli : Status::explicit_cli;
+            } else if (selected.source == strix::profile::DefaultSource::baseline) {
+                entry.status = Status::baseline_env;
+            } else if (selected.source == strix::profile::DefaultSource::env) {
+                entry.status = Status::explicit_env;
+            } else if (wanted.empty()) {
+                return;  // the profile leaves it alone
+            } else {
+                const auto admission = admit(selected_column);
+                entry.ladder = std::move(cell.route);
+                entry.ladder_reference = std::move(cell.reference);
+                if (cell.benchmark) {
+                    // --allow-pending where no timing row decides the regime: the cell runs as an unqualified benchmark
+                    // arm (the shared resolver's rule); a measured slower or within-noise row never reaches here.
+                    entry.value = cell.value;
+                    entry.wanted = std::string(wanted);
+                    entry.status = Status::unqualified;
+                    out.entries.push_back(std::move(entry));
+                    return;
+                }
+                // The ladder ran a lower cell: the status is that cell's admission (the builtin: pending, with the
+                // wanted cell named). Otherwise the column's own admission stands, as before the ladder rule.
+                const bool lowered = !entry.ladder.empty() && cell.value != wanted;
+                const auto status_of = lowered && cell.value == lever.builtin ? strix::profile::Status::pending
+                                     : lowered ? admit(strix::profile::value_column(lever, cell.tier)) : admission;
+                if (lowered) entry.value = cell.value;
+                if (status_of != strix::profile::Status::set) {
+                    entry.wanted = std::string(wanted);
+                    entry.status = status_of == strix::profile::Status::pending ? Status::pending : Status::unqualified;
+                    if (entry.status == Status::pending) entry.value = std::string(lever.builtin);
+                }
             }
-            // The ladder ran a lower cell: the status is that cell's admission (the builtin: pending, with the
-            // wanted cell named). Otherwise the column's own admission stands, as before the ladder rule.
-            const bool lowered = !entry.ladder.empty() && cell.value != wanted;
-            const auto status_of = lowered && cell.value == lever.builtin ? strix::profile::Status::pending
-                                 : lowered ? admit(strix::profile::value_column(lever, cell.tier)) : admission;
-            if (lowered) entry.value = cell.value;
-            if (status_of != strix::profile::Status::set) {
-                entry.wanted = std::string(wanted);
-                entry.status = status_of == strix::profile::Status::pending ? Status::pending : Status::unqualified;
-                if (entry.status == Status::pending) entry.value = std::string(lever.builtin);
-            }
-        }
-        out.entries.push_back(std::move(entry));
-    }
+            out.entries.push_back(std::move(entry));
+    });
     return out;
 }
 
