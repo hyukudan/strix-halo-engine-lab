@@ -223,7 +223,7 @@ inline MtpBundleArguments read_mtp_bundle(const std::filesystem::path& path) {
 // The profile registry as discovery candidates (the discovery itself is engine-neutral).
 inline std::vector<strix::session::DrafterCandidate> mtp_drafter_candidates() {
     std::vector<strix::session::DrafterCandidate> result;
-    for (const auto& p:mtp_draft_profiles) result.push_back({p.name,p.source_path,p.logical_name,p.sidecar_bytes});
+    for (const auto& p:mtp_draft_profiles) result.push_back({p.name,p.source_path,p.logical_name,p.sidecar_bytes,mtp_drafter_dir});
     return result;
 }
 struct MtpProfileBundleInputs {
