@@ -124,7 +124,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (!out.served_cli_route) {
         // Held-back route: the lane cap stays the incumbent one (an explicit --prefill-rows, else 128 rows, clamped),
         // whatever chunk the schedule took; an implicit chunk retries at the command line's fallback rows when its
-        // device workspaces are refused (serve::load_with_chunk_fallback).
+        // device workspaces are refused (serve::load_with_chunk_ladder).
         out.lane_rows = std::min(explicit_rows.value_or(kMiniServeLaneRows), out.context);
     } else {
         if (out.prefill_rows == 0U) throw std::invalid_argument("--prefill-rows must be positive");

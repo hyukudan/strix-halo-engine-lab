@@ -127,7 +127,7 @@ inline MiniPrefillSchedule mini_prefill_schedule_from_env(bool hip, profile::Nam
     return schedule;
 }
 
-// Served prompt route. A server with the served route lever (kMiniServedCliRoute, opt-in in every profile column)
+// Served prompt route. A server with the served route lever (kMiniServedCliRoute: default on CUDA, opt-in on HIP)
 // serves the command line's schedule above with the first id taken from the final prefill row (emits-first), so its
 // prompt rows run the command line's calls. Both backends admit it (device evidence, the cohort-lanes fixture's
 // served_prefill arm: served prefill == CLI prefill bitwise, first id, scores, KV, histories and the next decode steps;

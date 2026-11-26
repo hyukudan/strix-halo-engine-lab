@@ -34,7 +34,7 @@ struct MiniServeOptions {
     // (resolve): the incumbent cap, an explicit --prefill-rows else kMiniServeLaneRows, clamped (0: the chunk).
     unsigned lane_rows = 0;
     // Held-back route: rows the decoder load retries at when the implicit chunk's device workspaces are refused
-    // (mini_served_prefill_fallback_rows, serve::load_with_chunk_fallback); 0 = no retry.
+    // (mini_served_prefill_fallback_rows, serve::load_with_chunk_ladder); 0 = no retry.
     unsigned prefill_fallback_rows = 0;
     // Decode form flags of a CUDA server (--packed-decode / --grouped-decode, mini_served_packed_decode); a HIP server
     // refuses them.

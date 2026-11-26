@@ -6,8 +6,10 @@
 #include "strix/weight/host_q8.hpp"
 #include "strix/weight/pack_source.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
+#include <vector>
 
 namespace strix::moe_core::grouped_strixpack {
 

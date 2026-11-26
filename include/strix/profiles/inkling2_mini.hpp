@@ -237,7 +237,8 @@ inline constexpr std::array<profile::Lever, 19> kMiniLevers{{
     {kMiniAttnProjectedBias, "STRIX_INK_ATTN_PROJECTED_BIAS", "", {"1", "1", "1", ""}, "0", profile::Kind::exact,
      {true, true, true, true}, {true, true, true, true}, "1", "0",
      "RTX identity receipts (cuda_pf2-kit): q16 on the #1280 head (9/9 logits, 13/13 ids, CLI and served), q26 CLI and "
-     "q27 served on origin/main (ids equal lever off vs on)",
+     "q27 served on origin/main (ids equal lever off vs on)"
+     "; with the served CLI route default: q45 on exact-defaults 136c64e88b (served ids == CLI ids 8/8) plus q26 (CLI ids equal lever off vs on)",
      false, {}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniServedCliRoute, .env = "STRIX_INK_SERVED_CLI_ROUTE", .option = "",
      .value = {"", "", "", ""}, .builtin = "1",
@@ -252,7 +253,8 @@ inline constexpr std::array<profile::Lever, 19> kMiniLevers{{
      .kind = profile::Kind::exact, .ready = {true, true, true, true},
      .runnable = {true, true, true, true}, .target = "1", .off = "0",
      .source = "RTX identity receipts (cuda_pf2-kit): q26 CLI and q27 served on origin/main (greedy ids equal full head "
-               "vs screened head)",
+               "vs screened head)"
+               "; with the served CLI route default: q45 on exact-defaults 136c64e88b (served ids == CLI ids 8/8) plus q26 (CLI ids equal lever off vs on)",
      .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniLowBitTurbo, .env = "STRIX_INK_LOWBIT_TURBO", .option = "",
      .value = {"", "", "", ""}, .builtin = "0", .kind = profile::Kind::bit_changing,

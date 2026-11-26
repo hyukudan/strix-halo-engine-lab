@@ -61,6 +61,8 @@ struct InputMoments {
 
 class MomentSet {
 public:
+    // max_moment_bytes bounds the resident moments (values_). accumulate() also holds one input's transient `next`
+    // buffer outside that bound while it folds a batch in, so the peak is the bound plus one input's moments.
     explicit MomentSet(unsigned threads = 0U, MomentLayout layout = MomentLayout::full,
                        std::size_t max_moment_bytes = std::numeric_limits<std::size_t>::max())
         : threads_(threads ? threads : std::max(1U, std::thread::hardware_concurrency())),

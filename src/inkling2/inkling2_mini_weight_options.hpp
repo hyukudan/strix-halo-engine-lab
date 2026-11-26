@@ -621,10 +621,14 @@ inline moe_core::grouped_w4a4::Activations mini_prompt_moe(const MiniWeightOptio
 inline bool mini_prompt_moe_may_select(const MiniWeightOptions& options, std::string_view device,
                                        moe_core::grouped_w4a4::Activations wanted, const MiniPromptExecution& run = {}) {
     if (mini_moe_w4a4_class(profile::resolve(kMiniProfile, options.tier)) == wanted) return true;
-    for (const auto& row : kMiniProfile.ladder)
-        if (row.lever == kMiniMoeW4a4 && !row.incumbent && row.device == device && row.phase == profile::Phase::prefill &&
-            mini_prompt_moe(options, device, row.min_context, false, nullptr, run) == wanted)
-            return true;
+    // Probe at the row's effective lower edge (a narrowed band starts above min_context); a row with no usable edge
+    // (ladder_min_context 0) selects nothing.
+    for (const auto& row : kMiniProfile.ladder) {
+        if (row.lever != kMiniMoeW4a4 || row.incumbent || row.device != device || row.phase != profile::Phase::prefill)
+            continue;
+        const auto edge = profile::ladder_min_context(row);
+        if (edge != 0U && mini_prompt_moe(options, device, edge, false, nullptr, run) == wanted) return true;
+    }
     return false;
 }
 
