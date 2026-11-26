@@ -18,6 +18,16 @@ int main() try {
     const auto hard = ernie::candidate_activation(ernie::CandidateActivation::hard_clip);
     check(soft(0, 3, 4, 25) == 0, "zero gate");
     check(soft(std::log(3.0F), -1, 4, 25) < 0, "signed up");
+    struct ActivationCase { float gate, up, expected; };
+    constexpr ActivationCase cases[] = {
+        {3.75F, 24.50F, 54.0102246F},
+        {4.25F, 25.50F, 59.7074687F},
+        {-4.25F, 25.50F, -0.8516813F},
+        {4.25F, -25.50F, -59.7074687F},
+        {8.00F, 50.00F, 92.9037518F},
+    };
+    for (const auto& c : cases)
+        check(std::abs(soft(c.gate, c.up, 4, 25) - c.expected) < 2e-5F, "smooth SiTU at both caps");
     const float saturation = 4.0F / (1.0F + std::exp(-4.0F));
     check(std::abs(hard(7, -30, 4, 25) - (-25.0F * saturation)) < 1e-5F, "clip both branches");
 
