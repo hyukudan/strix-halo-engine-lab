@@ -8,6 +8,7 @@
 #include "strix/deepseek41_pair_profile_table.hpp"
 #include "strix/model_registry.hpp"
 #include "strix/profiles/ds41_rtx.hpp"
+#include "strix/profiles/ernie.hpp"
 #include "strix/profiles/gemma4.hpp"
 #include "strix/profiles/qwen_cuda.hpp"
 #include "strix/profiles/qwen_dense_cuda.hpp"
@@ -1744,6 +1745,7 @@ int main(int argc, char** argv) try {
         qd::hip_profile::engine(qd::hip_profile::App::spec),
         strix::hy4::profile::engine(),
         strix::inkling2::kMiniProfile,
+        strix::ernie::kProfileEngine,  // inspection only: no lever table yet
     };
     for (const auto& registered : strix::model_registry::load(argv[1])) {
         const auto tag = registered.profile_tag;
