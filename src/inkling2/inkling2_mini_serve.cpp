@@ -153,7 +153,8 @@ serve::CohortConfig scheduling(const MiniServeOptions& opt, const MiniServeCohor
     if (windows && opt.lane_speculation) {
         // CUDA: the lone lane runs the command line's speculator step (LaneSpeculator: the same drafter setup, arbiter
         // and verify windows as the CLI's auto, the DSpark drafter on slot 0); two or more live lanes take the round.
-        config.lane_speculation = {true, 1U, kMiniMaxVerifyRows, "inkling2-mini", "cuda"};
+        // One strix-lane-spec line per finished request (the lane's receipt and drafter stats).
+        config.lane_speculation = {true, 1U, kMiniMaxVerifyRows, "inkling2-mini", "cuda", true};
         return config;
     }
     config.context_draft = windows;
