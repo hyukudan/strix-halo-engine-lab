@@ -109,8 +109,8 @@ int main(int argc,char** argv) try {
     // Exercise the guide's pins and calibration geometry without the HIP-only organization flags.
     std::vector<std::string> serving_args{"decode", (dir/"target.gguf").string()};
     for (int token = 1; token <= 32; ++token) serving_args.push_back(std::to_string(token));
-    const auto pins_begin = std::find(explicit_args.begin(), explicit_args.end(), "--mtp");
-    const auto pins_end = std::find(pins_begin, explicit_args.end(), "--mtp-golden");
+    const auto pins_begin = std::find(explicit_bundle_args.begin(), explicit_bundle_args.end(), "--mtp");
+    const auto pins_end = std::find(pins_begin, explicit_bundle_args.end(), "--mtp-golden");
     serving_args.insert(serving_args.end(), pins_begin, pins_end);
     serving_args.insert(serving_args.end(), {"--generate", "64", "--context", "33280", "--mtp-calibration-rows", "8"});
     auto dump_args = serving_args;
