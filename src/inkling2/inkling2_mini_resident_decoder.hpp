@@ -22,6 +22,7 @@
 #include "strix/logit_rows.hpp"
 #include "strix/serve/cohort_passes.hpp"
 #include "strix/session/embed_splice_device.hpp"
+#include "strix/session/linear_verify_step.hpp"
 
 #if !defined(__HIPCC__)
 #include "cuda/core/step_inputs.cuh"
@@ -809,12 +810,11 @@ private:
         std::uint32_t slot = 0;
         while (slot < slots_.size() && &slots_[slot]->state() != &state) ++slot;
         if (slot >= slots_.size() || slot >= decode_rows_) return std::nullopt;
+        // The shared linear verify descriptor: it also sets the header valid mask that exec::step_row_valid reads (a block
+        // with rows but no mask made every row invalid: ids read 0, no K/V store, picks 0; q52).
         MiniResidentBackend::WindowProgram program{};
-        program.block.h.rows = rows;
-        const auto first = state.committed();
-        for (std::uint32_t row = 0; row < rows; ++row)
-            program.block.row[row] = {ids[row], first + row, slot, exec::kStepNoParent, 0U,
-                                      static_cast<std::uint32_t>(exec::step_valid), 0U, 0U};
+        program.block = session::linear_verify_step(
+            {rows, state.committed(), slot, 0U, session::LinearVerifyRows::inclusive_valid}, ids);
         auto& owner = *slots_[slot];
         const auto planes = owner.planes();
         program.lanes = {exec::step_lane_view(backend_.window_block(), slot_directory_.data(), decode_rows_, rows),

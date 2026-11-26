@@ -191,14 +191,17 @@ inline int window_program_identity(const char* checkpoint, bool screened) {
         };
         const auto staged = run(eager, top_eager);
         const auto before = graphs.instantiations();
+        // window_replayed() is cleared when the append ends: count runs through the monotonic counter.
+        const auto runs_before = program.step_program_backend().window_runs();
         const auto first_run = run(program, top_program);
-        const bool replayed = program.step_program_backend().window_replayed();
+        const bool replayed = program.step_program_backend().window_runs() != runs_before;
         compare_window(staged, first_run, tag + (graphs.instantiations() != before ? " captured" : " staged"), result);
         // The same window again at the same position after a discard: the second replay of this width's program.
         program.commit(0U);
+        const auto runs_second = program.step_program_backend().window_runs();
         const auto second_run = run(program, top_program);
         compare_window(staged, second_run, tag + " replay at the same position", result);
-        replays[width] += (replayed ? 1U : 0U) + (program.step_program_backend().window_replayed() ? 1U : 0U);
+        replays[width] += (replayed ? 1U : 0U) + (program.step_program_backend().window_runs() != runs_second ? 1U : 0U);
         eager.commit(keep);
         program.commit(keep);
         compare_window(window_state(eager, position, keep, {}, false), window_state(program, position, keep, {}, false),

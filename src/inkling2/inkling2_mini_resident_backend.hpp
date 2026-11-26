@@ -525,6 +525,9 @@ public:
     [[nodiscard]] exec::StepBlock* window_block() { return window_graphs_.block(); }
     [[nodiscard]] bool window_capturing() const noexcept { return window_lanes_ != nullptr; }
     [[nodiscard]] bool window_replayed() const noexcept { return window_replayed_; }
+    // Window programs that ran so far (monotonic): window_replayed() is cleared with the program when the append ends,
+    // so a reader after the append (the identity fixture) counts runs here.
+    [[nodiscard]] std::uint64_t window_runs() const noexcept { return window_runs_; }
     [[nodiscard]] const exec::WidthStepGraphs& window_graphs() const noexcept { return window_graphs_; }
 
     // session::RowAppendState::append offers a taped staged window here (after its eager checkpoints). False: nothing
@@ -547,6 +550,7 @@ public:
             work();
         });
         window_replayed_ = ran;
+        window_runs_ += ran ? 1U : 0U;
         return ran;
     }
 #endif
@@ -1462,6 +1466,7 @@ private:
     const MiniCohortLanes* window_lanes_{};        // set while a verify window program is captured
     const std::uint32_t* window_position_{};       // device position of the window's first row
     bool window_replayed_{};
+    std::uint64_t window_runs_{};
 #endif
     const MiniResidentWeights& weights_;
     mini_gpu::Stream stream_;
