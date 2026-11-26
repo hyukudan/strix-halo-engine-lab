@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -75,6 +76,33 @@ struct RowPlan {
     std::vector<std::uint32_t> rows;  // one entry per demand, in input order; 0 = parked this cycle
     double expected_tokens = 0;
     double expected_ms = 0;           // 0 when no lane runs
+};
+
+// A repeated caller may retain the solver's buffers and result between forward rounds.
+// The returned plan is valid until this planner is called again.
+class RowPlanner {
+public:
+    const RowPlan& plan(std::span<const LaneDemand> demands, const CycleCost& cost, const RowLimits& limits,
+                        double accept_prior = 0.8);
+
+private:
+    struct Lane {
+        std::size_t index = 0;
+        std::uint32_t id = 0, min_rows = 1, max_rows = 1, useful_cap = 0;
+        double waited_ms = 0.0;
+    };
+    struct Growth {
+        double value = 0.0;
+        std::uint32_t row = 0;
+        std::size_t lane = 0;
+        std::uint32_t id = 0;
+    };
+
+    std::vector<Lane> waiting_, admitted_;
+    std::vector<Growth> growth_;
+    RowPlan result_;
+
+    friend RowPlan plan_rows(std::span<const LaneDemand>, const CycleCost&, const RowLimits&, double);
 };
 
 // Deterministic.

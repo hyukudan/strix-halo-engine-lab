@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -95,6 +96,8 @@ class StepPlanner {
 public:
     // Plans one step. Clears the debt when no prompt lane is present.
     StepPlan plan(std::span<const StepLane> lanes, const StepLimits& limits);
+    // Overwrites the plan and reuses its vector capacity.
+    void plan(std::span<const StepLane> lanes, const StepLimits& limits, StepPlan& out);
 
     // After the step: prompt time (less the time it was suspended for other service) is charged with the
     // share of the last plan, decode time pays it back. prompt_rows = rows the prompt unit really ran
@@ -112,6 +115,7 @@ private:
     std::uint64_t planned_rows_ = 0;
     double observed_ms_ = 0.0;
     std::uint64_t observed_rows_ = 0;
+    std::vector<std::size_t> prompt_arrival_;
 };
 
 }  // namespace strix::serve

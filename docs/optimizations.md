@@ -38,9 +38,9 @@ Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-
 <a id="cohort-verification-scratch-reuse"></a>
 ### Cohort verification scratch reuse
 
-Backends using the shared cohort decoder. Host cohort tests compare cohort and solo IDs, including device-draft and per-lane selection hooks. Reuses verification and commit staging across host rounds. Wall time unmeasured. The host code lives in `src/serve/cohort_decode.cpp`.
+Backends using the shared cohort decoder. Host cohort tests compare cohort and solo IDs, including device-draft and per-lane selection hooks. Reuses prompt planning, lane drafts, row planning, verification and commit buffers across host rounds. The steady-state counting fixture checks the full greedy IDs and committed state digest. Device wall time is unmeasured. The host code lives in `src/serve/cohort_decode.cpp`.
 
-Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=CUDA cohort, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+Engine matrix: inkling2-mini=HIP and CUDA HTTP cohorts, qwen3.8-flash-next=unaffected, qwen3.8-27b=CUDA cohort, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
 
 Qwen guarded wave reductions can use exact DPP/permlanex16 exchanges (build-time lever, off by default: configure with `-DSTRIX_DPP_REDUCE=ON`; the all-on build uses it); addition trees are unchanged, native byte-equality qualification is pending, and no speed gain is claimed.
 

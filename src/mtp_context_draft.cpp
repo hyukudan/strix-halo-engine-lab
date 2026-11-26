@@ -124,6 +124,14 @@ std::vector<std::uint32_t> MtpContextDraft::begin_copy_cycle(std::uint32_t pendi
 std::vector<std::uint32_t> MtpContextDraft::begin_cycle(std::uint32_t pending, std::span<const std::uint32_t> drafts,
     std::size_t confident, std::size_t room, std::vector<double>& acceptance_out, double min_probability,
     double kept_expected) {
+    const auto proposal = begin_cycle_view(pending, drafts, confident, room, acceptance_out, min_probability,
+                                          kept_expected);
+    return {proposal.begin(), proposal.end()};
+}
+
+std::span<const std::uint32_t> MtpContextDraft::begin_cycle_view(std::uint32_t pending,
+    std::span<const std::uint32_t> drafts, std::size_t confident, std::size_t room,
+    std::vector<double>& acceptance_out, double min_probability, double kept_expected) {
     if (!std::isfinite(min_probability) || min_probability < 0.0 || min_probability > 1.0)
         throw std::invalid_argument("MTP n-gram minimum probability is out of range");
     acceptance_out.clear(); shadow_ = {}; pending_probe_ = {}; selected_rows_ = 0; wide_ = false;
@@ -176,7 +184,7 @@ std::vector<std::uint32_t> MtpContextDraft::begin_cycle(std::uint32_t pending, s
     }
     if (acceptance_out.empty()) return {};
     selected_rows_ = acceptance_out.size(); ++stats_.selected_cycles; stats_.selected_rows += selected_rows_;
-    return {shadow_.tokens.begin(), shadow_.tokens.begin() + static_cast<std::ptrdiff_t>(acceptance_out.size())};
+    return std::span<const std::uint32_t>(shadow_.tokens).first(selected_rows_);
 }
 std::vector<std::uint32_t> MtpContextDraft::propose_wide(std::uint32_t pending, std::size_t rows, double min_acceptance) {
     if (!std::isfinite(min_acceptance) || min_acceptance < 0.0 || min_acceptance > 1.0)

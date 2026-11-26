@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <utility>
 
 namespace strix::serve {
 
@@ -39,22 +40,6 @@ PlaneKvSlots resident_kv_slots_with_plane(std::uint64_t free, std::uint64_t tota
 
 namespace {
 
-struct Lane {
-    std::size_t index = 0;  // position in the demand span
-    std::uint32_t id = 0;
-    std::uint32_t min_rows = 1;
-    std::uint32_t max_rows = 1;   // >= min_rows
-    std::uint32_t useful_cap = 0; // rows that can still yield a token
-    double waited_ms = 0;
-};
-
-struct Growth {
-    double value = 0;  // P(this row yields a token)
-    std::uint32_t row = 0;
-    std::size_t lane = 0;  // position in the admitted list
-    std::uint32_t id = 0;
-};
-
 double clean(double value) { return std::isfinite(value) && value > 0 ? value : 0.0; }
 
 double clamp01(double value, double fallback) {
@@ -88,10 +73,11 @@ struct Solver {
 
     // Plans the admitted lanes. `relaxed` ignores the latency guard and accepts an unqualified
     // minimum; it is used only for a single lane that cannot meet the limits.
-    bool solve(const std::vector<Lane>& lanes, bool relaxed, RowPlan& plan) const {
+    template<class Lane, class Growth>
+    bool solve(const std::vector<Lane>& lanes, bool relaxed, RowPlan& plan, std::vector<Growth>& growth) const {
         std::uint32_t min_total = 0;
         double min_tokens = 0;
-        std::vector<Growth> growth;
+        growth.clear();
         for (std::size_t i = 0; i < lanes.size(); ++i) {
             const Lane& lane = lanes[i];
             const LaneDemand& demand = demands[lane.index];
@@ -148,6 +134,7 @@ struct Solver {
 };
 
 // Expected tokens of one cycle in which the lane holds `rows` rows (only rows below useful_cap can yield).
+template<class Lane>
 double expected_tokens(const LaneDemand& demand, const Lane& lane, std::uint32_t rows, double prior) {
     double value = 1.0, tokens = 0.0;
     for (std::uint32_t row = 0; row < std::min(rows, lane.useful_cap); ++row) {
@@ -159,6 +146,7 @@ double expected_tokens(const LaneDemand& demand, const Lane& lane, std::uint32_t
 
 // Step 4 of plan_rows (row_budget.hpp): the drain bound is the largest expected number of cycles to the end with
 // every offered row; a lane that ends within it at its minimum rows keeps only its minimum.
+template<class Lane>
 void pace_drain(std::span<const LaneDemand> demands, std::vector<Lane>& lanes, double prior) {
     double bound = 0.0;
     for (const Lane& lane : lanes) {
@@ -179,11 +167,17 @@ void pace_drain(std::span<const LaneDemand> demands, std::vector<Lane>& lanes, d
 
 RowPlan plan_rows(std::span<const LaneDemand> demands, const CycleCost& cost, const RowLimits& limits,
                   double accept_prior) {
-    RowPlan plan;
-    plan.rows.assign(demands.size(), 0u);
+    RowPlanner planner;
+    planner.plan(demands, cost, limits, accept_prior);
+    return std::move(planner.result_);
+}
 
-    std::vector<Lane> waiting;
-    waiting.reserve(demands.size());
+const RowPlan& RowPlanner::plan(std::span<const LaneDemand> demands, const CycleCost& cost, const RowLimits& limits,
+                               double accept_prior) {
+    result_.rows.assign(demands.size(), 0u);
+    result_.expected_tokens = result_.expected_ms = 0.0;
+    waiting_.clear();
+    waiting_.reserve(demands.size());
     for (std::size_t i = 0; i < demands.size(); ++i) {
         const LaneDemand& demand = demands[i];
         if (demand.remaining_tokens == 0) continue;
@@ -196,37 +190,37 @@ RowPlan plan_rows(std::span<const LaneDemand> demands, const CycleCost& cost, co
         lane.waited_ms = clean(demand.waited_ms);
         // A lane whose minimum can never fit one forward is left parked.
         if (limits.rows_per_forward != 0 && lane.min_rows > limits.rows_per_forward) continue;
-        waiting.push_back(lane);
+        waiting_.push_back(lane);
     }
     const double prior = clamp01(accept_prior, 0.8);
-    if (limits.drain) pace_drain(demands, waiting, prior);
-    std::sort(waiting.begin(), waiting.end(), [](const Lane& a, const Lane& b) {
+    if (limits.drain) pace_drain(demands, waiting_, prior);
+    std::sort(waiting_.begin(), waiting_.end(), [](const Lane& a, const Lane& b) {
         if (a.waited_ms != b.waited_ms) return a.waited_ms > b.waited_ms;
         if (a.id != b.id) return a.id < b.id;
         return a.index < b.index;
     });
 
-    std::vector<Lane> admitted;
+    admitted_.clear();
     std::uint32_t min_total = 0;
-    for (const Lane& lane : waiting) {
-        if (limits.max_lanes != 0 && admitted.size() >= limits.max_lanes) break;
+    for (const Lane& lane : waiting_) {
+        if (limits.max_lanes != 0 && admitted_.size() >= limits.max_lanes) break;
         if (limits.rows_per_forward != 0 && lane.min_rows > limits.rows_per_forward - min_total) continue;
         min_total += lane.min_rows;
-        admitted.push_back(lane);
+        admitted_.push_back(lane);
     }
-    if (admitted.empty()) return plan;
+    if (admitted_.empty()) return result_;
 
     const Solver solver{demands,
                         {clean(cost.fixed_ms), clean(cost.row_ms), clean(cost.lane_ms), clean(cost.draft_row_ms)},
                         limits, prior};
-    while (!solver.solve(admitted, false, plan)) {
-        if (admitted.size() == 1) {
-            solver.solve(admitted, true, plan);
+    while (!solver.solve(admitted_, false, result_, growth_)) {
+        if (admitted_.size() == 1) {
+            solver.solve(admitted_, true, result_, growth_);
             break;
         }
-        admitted.pop_back();  // shortest-waiting lane; it ages and returns first
+        admitted_.pop_back();  // shortest-waiting lane; it ages and returns first
     }
-    return plan;
+    return result_;
 }
 
 }  // namespace strix::serve

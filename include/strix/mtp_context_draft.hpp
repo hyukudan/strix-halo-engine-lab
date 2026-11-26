@@ -83,6 +83,10 @@ public:
     std::vector<std::uint32_t> begin_cycle(std::uint32_t pending, std::span<const std::uint32_t> drafts,
         std::size_t confident, std::size_t room, std::vector<double>& acceptance,
         double min_probability = 0.0, double kept_expected = -1.0);
+    // Borrow the selected rows until the next drafter mutation so callers can reuse their own staging.
+    std::span<const std::uint32_t> begin_cycle_view(std::uint32_t pending, std::span<const std::uint32_t> drafts,
+        std::size_t confident, std::size_t room, std::vector<double>& acceptance,
+        double min_probability = 0.0, double kept_expected = -1.0);
     [[nodiscard]] std::size_t kept_drafts() const noexcept { return shadow_.prefix.size(); }
     // copy/edit only: exactly `rows` context tokens after `pending` for one wide verify forward, or empty. Only a long
     // unanimous anchor (suffix >= copy_anchor, every earlier occurrence continuing alike) whose context continuation
