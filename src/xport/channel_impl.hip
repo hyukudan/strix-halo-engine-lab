@@ -3,6 +3,7 @@
 #include "channel_device.hpp"
 #include "wire.hpp"
 #include "small_progress.hpp"
+#include "failure_log.hpp"
 #include "strix/hip_argmax_core.hpp"
 
 #include <immintrin.h>
@@ -499,7 +500,7 @@ template<class Traits>
 void Channel<Traits>::fail(const std::string& why) {
     {
         std::lock_guard<std::mutex> g(failure_mutex_);
-        if (failure_.empty()) failure_ = why;
+        report_first_failure(failure_, why, options_.rank);
     }
     failed_.store(true, std::memory_order_release);
     __atomic_store_n(&flags_host_[kRxFlag], ~std::uint64_t{0}, __ATOMIC_RELEASE);
@@ -639,7 +640,7 @@ void Channel<Traits>::run() {
     } catch (const std::exception& e) {
         if (!failed_.load()) {
             std::lock_guard<std::mutex> g(failure_mutex_);
-            if (failure_.empty()) failure_ = e.what();
+            report_first_failure(failure_, e.what(), options_.rank);
             failed_.store(true);
         }
         __atomic_store_n(&flags_host_[kRxFlag], ~std::uint64_t{0}, __ATOMIC_RELEASE);
