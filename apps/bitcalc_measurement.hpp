@@ -12,14 +12,47 @@
 #include <fstream>
 #include <limits>
 #include <string>
+#include <vector>
 
 namespace strix::decode_cli {
 
+// One case of a quality-kit capture list (STRIX_BITCALC_CASES=FILE): line i = "FORCE OUT [PROMPT_IDS]" for prompt i,
+// so one process (one model load) captures every case of a list. FORCE and OUT mean what STRIX_BITCALC_FORCE_TOKENS
+// and STRIX_BITCALC_LOGITS_OUT mean for that prompt; PROMPT_IDS (optional) names the prompt's token file for an engine
+// whose prompts come from the list itself. Every line holds the same number of fields; blank lines are skipped.
+struct BitcalcCase {
+    std::string force, out, prompt;
+};
+
+inline std::vector<BitcalcCase> read_bitcalc_cases(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) throw std::invalid_argument("STRIX_BITCALC_CASES: cannot open " + path);
+    std::vector<BitcalcCase> cases;
+    std::size_t fields_per_line = 0;
+    for (std::string line; std::getline(in, line);) {
+        std::vector<std::string> fields;
+        std::size_t at = 0;
+        while (at < line.size()) {
+            while (at < line.size() && std::isspace(static_cast<unsigned char>(line[at]))) ++at;
+            const auto begin = at;
+            while (at < line.size() && !std::isspace(static_cast<unsigned char>(line[at]))) ++at;
+            if (at > begin) fields.emplace_back(line, begin, at - begin);
+        }
+        if (fields.empty()) continue;
+        if ((fields.size() != 2U && fields.size() != 3U) || (fields_per_line != 0U && fields.size() != fields_per_line))
+            throw std::invalid_argument("STRIX_BITCALC_CASES: every line must hold FORCE OUT [PROMPT_IDS], the same count on each");
+        fields_per_line = fields.size();
+        cases.push_back({fields[0], fields[1], fields.size() == 3U ? fields[2] : std::string{}});
+    }
+    if (cases.empty()) throw std::invalid_argument("STRIX_BITCALC_CASES: no case in " + path);
+    return cases;
+}
+
 class BitcalcMeasurement {
 public:
-    BitcalcMeasurement() {
-        const char* out = std::getenv("STRIX_BITCALC_LOGITS_OUT");
-        const char* force = std::getenv("STRIX_BITCALC_FORCE_TOKENS");
+    BitcalcMeasurement() : BitcalcMeasurement(std::getenv("STRIX_BITCALC_LOGITS_OUT"), std::getenv("STRIX_BITCALC_FORCE_TOKENS")) {}
+    // Explicit paths (one case of a STRIX_BITCALC_CASES list); nullptr = that half is off.
+    BitcalcMeasurement(const char* out, const char* force) {
         enabled_ = out || force;
         if ((out && !*out) || (force && !*force))
             throw std::invalid_argument("STRIX_BITCALC paths must be nonempty");
