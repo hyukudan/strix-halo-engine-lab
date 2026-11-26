@@ -575,6 +575,9 @@ class HeadFormat(unittest.TestCase):
             self.assertEqual(self.gate(d, *args)[0], 1)
             doc = json.loads((d / "g.json").read_text(encoding="utf-8"))
             self.assertEqual(doc["pooled"]["free_run"]["nonfinite_candidate"], ["w00"])
+            final_row = len(finite) - self.V * 4
+            target.write_bytes(finite[:final_row] + np.array([np.inf], "<f4").tobytes() + finite[final_row + 4:])
+            self.assertEqual(self.gate(d, *args)[0], 1)
             target.write_bytes(finite)
             write_routes(d / "routes" / "w00.fast_free.rte", [(0, [[1, 2]], [[np.inf, 0.9]])])
             self.assertEqual(self.gate(d, *args)[0], 1)

@@ -827,14 +827,17 @@ def qual(a):
             for key, arm in (("cand", a.cand_free), ("null", a.null_free)):
                 what = f"{case}.{arm}"
                 check_free_record(route_receipt(err(arm), what), route(arm), f[key], what, null=key == "null")
-            fc, _ = reduce(logit(a.ref), logit(a.cand_free), **kw)
-            fn, _ = reduce(logit(a.ref), logit(a.null_free), **kw)
-            if fc["nonfinite_r"].any() or fn["nonfinite_r"].any():
+            fc, fc_info = reduce(logit(a.ref), logit(a.cand_free), **kw)
+            fn, fn_info = reduce(logit(a.ref), logit(a.null_free), **kw)
+            if (fc["nonfinite_r"].any() or fc_info.get("ref_unscored_nonfinite")
+                    or fn["nonfinite_r"].any() or fn_info.get("ref_unscored_nonfinite")):
                 raise GateError(f"{case}: non-finite reference logits")
-            if fn["nonfinite_c"].any() or not f["null"]["finite_weights"]:
+            if fn["nonfinite_c"].any() or fn_info.get("cand_unscored_nonfinite") or not f["null"]["finite_weights"]:
                 raise GateError(f"{case}: non-finite free-running null logits or router weights")
             null_moved(f"{case} free-running", [float(fn["kl_rc"].mean())])
-            if fc["nonfinite_c"].any() or not f["cand"]["finite_weights"]:
+            if null_envelope is not None:
+                check_null_envelope(case, [a.null_free], [fn], null_envelope)
+            if fc["nonfinite_c"].any() or fc_info.get("cand_unscored_nonfinite") or not f["cand"]["finite_weights"]:
                 nonfinite_free.append(case)
             else:
                 free = score_window(case, fc, [fn], w["class"], limits)
@@ -895,7 +898,7 @@ def qual(a):
                 print(f"FREE-RUNNING -> FAIL non-finite candidate logits or router weights: {', '.join(nonfinite_free)}")
             else:
                 free_pooled = verdict(free_windows, limits=limits,
-                                      allow_null_floor=getattr(a, "allow_null_floor", False))
+                                      allow_null_floor=getattr(a, "allow_null_floor", False), frozen_bars=frozen_bars)
                 print("FREE-RUNNING " + pooled_line(free_pooled, limits))
             p["free_run"] = free_pooled
             p["replay_state"] = p["state"]
