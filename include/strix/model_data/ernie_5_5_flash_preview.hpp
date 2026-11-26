@@ -74,18 +74,18 @@ inline constexpr std::int64_t n_kv_heads = 1;
 inline constexpr std::int64_t vocab = 201216;
 } // namespace dims
 namespace drafter {
-inline constexpr std::string_view attention_kind = "uncompressed";
 inline constexpr std::int64_t block = 7;
-inline constexpr std::int64_t confidence_input = 4352;
-inline constexpr std::int64_t feature_projection[] = {4096, 12288};
 inline constexpr std::string_view kind = "block";
 inline constexpr std::int64_t layers = 3;
 inline constexpr std::int64_t rank = 256;
-inline constexpr bool shared_lm_head = true;
 inline constexpr std::int64_t taps[] = {40, 41, 42};
 } // namespace drafter
 namespace extras {
+inline constexpr std::string_view dspark_attention_kind = "uncompressed";
+inline constexpr std::int64_t dspark_confidence_input = 4352;
+inline constexpr std::int64_t dspark_feature_projection[] = {4096, 12288};
 inline constexpr std::int64_t dspark_noise_token_id = 1024;
+inline constexpr bool dspark_shared_lm_head = true;
 inline constexpr double hc_eps = 0x1.0c6f7a0b5ed8dp-20 /* 1e-06 */;
 inline constexpr std::int64_t hc_mult = 4;
 inline constexpr std::int64_t hc_sinkhorn_iters = 20;

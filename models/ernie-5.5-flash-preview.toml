@@ -98,7 +98,11 @@ hc_mult = 4
 hc_sinkhorn_iters = 20
 hc_eps = 0.000001
 tie_word_embeddings = false
+dspark_attention_kind = "uncompressed"
+dspark_confidence_input = 4352
+dspark_feature_projection = [4096, 12288]
 dspark_noise_token_id = 1024
+dspark_shared_lm_head = true
 num_nextn_predict_layers = 0
 
 [tokens]
@@ -123,10 +127,6 @@ layers = 3
 block = 7
 rank = 256
 taps = [40, 41, 42]
-attention_kind = "uncompressed"
-shared_lm_head = true
-feature_projection = [4096, 12288]
-confidence_input = 4352
 
 [presets]
 default = "exact"
