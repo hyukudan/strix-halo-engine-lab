@@ -46,6 +46,11 @@ public:
                                            const std::shared_ptr<const session::EmbedTable>& table,
                                            std::span<float> logits);
     virtual std::uint32_t decode(std::uint32_t, std::span<float>) = 0;
+    // Optional sampled decode on the device (strix/token_sampling_device.hpp): the step keeps its logits row on the
+    // device and the shared device sampler decides it with `sampler`'s uniforms for `position` (the decision
+    // sampler.decide makes over the host row), counted in `sampler`; the row is never copied to the host.
+    [[nodiscard]] virtual bool samples_on_device() const { return false; }
+    virtual std::uint32_t decode_sampled(std::uint32_t token, TokenSampler& sampler, std::uint64_t position);
     virtual spec::VerifyTarget* verify_target() { return nullptr; }
     // Includes the anchor. Zero declines the requested mode.
     virtual std::uint32_t max_verify_rows(CliSpeculation) const { return 0; }

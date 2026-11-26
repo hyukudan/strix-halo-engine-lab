@@ -2,6 +2,7 @@
 
 #include "core/dense_linear.hpp"
 #include "strix/exec/route_capabilities.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/serial_request.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
@@ -15,6 +16,7 @@
 #include "strix/spec/probe_policy.hpp"
 #include "strix/spec/verify_cost_table.hpp"
 #include "strix/token_sampling.hpp"
+#include "strix/token_sampling_device.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -316,6 +318,31 @@ TextInput read_text_input(const char* path) {
 
 std::string read_text(const char* path) { return read_text_input(path).text; }
 
+// Per-round diagnostic (STRIX_SPEC_ROUND_LOG=N; off by default): the first N verify rounds of a speculating run, one
+// stderr line each, written after the round's commit (spec::RoundSink): no effect on any decision or bit. Two runs that
+// should decide alike (e.g. an executor switched on and off) are compared line by line; the first differing line names
+// the round, and its fields what differs (source / window, drafts, the target's pick at every verified row, accepted).
+class RoundLog final : public spec::RoundSink {
+public:
+    RoundLog(std::ostream& out, std::uint32_t rounds) : out_(out), left_(rounds) {}
+    void round(const spec::RoundRecord& record) override {
+        if (left_ == 0U) return;
+        --left_;
+        out_ << "spec-round " << index_++ << " context " << record.context << " source "
+             << spec::source_name(record.source) << " rows " << record.rows << " accepted " << record.accepted
+             << " copy " << record.copy << " ext " << record.ext << " drafts";
+        for (const auto id : record.drafts) out_ << ' ' << id;
+        out_ << " picks";
+        for (const auto id : record.greedy) out_ << ' ' << id;
+        out_ << '\n';
+    }
+
+private:
+    std::ostream& out_;
+    std::uint32_t left_;
+    std::uint32_t index_ = 0;
+};
+
 }  // namespace
 
 // --messages with image parts: the shared media layer normalizes them (data URLs / base64 only: the CLI has no
@@ -570,6 +597,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     std::uint32_t cost_seeded = 0, cost_recorded = 0, chain_k = 0;
     bool cost_stored = false, prices_frozen = false;
     SerialGreedyRequestResult generated;
+    bool device_sampled = false;  // the serial path's sampled rows decided on the device (decode_sampled)
     const auto decode_start = Clock::now();
     if (verify) {
         spec::BlockConfig config;
@@ -610,10 +638,17 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
             cost_seeded = spec::seed_verify_costs(seeds, *drafter, max_rows);
             if (chain_k > 0U) (void)spec::seed_draft_costs(seeds, *drafter, chain_k);
         }
-        generated =spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit,
-                                                           row_rule);
+        std::optional<RoundLog> round_log;
+        if (const int rounds = envcfg::integer("STRIX_SPEC_ROUND_LOG", 0); rounds > 0)
+            round_log.emplace(std::cerr, static_cast<std::uint32_t>(rounds));
+        generated = spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit,
+                                                           row_rule, round_log ? &*round_log : nullptr);
     } else {
+        // A decoder that samples on the device decides every sampled row there: the same ids for the request's seed,
+        // without the logits row's host copy and host transform (STRIX_SAMPLE_PATH=host keeps the host path).
+        device_sampled = sampler && device_token_sampling_enabled(options.sampling) && decoder->samples_on_device();
         generated = execute_serial_token_continuation(request, [&](std::uint32_t input, std::uint64_t position) {
+            if (device_sampled) return decoder->decode_sampled(input, *sampler, position + 1U);
             const auto selected = decoder->decode(input, logits);
             return sampler ? sampler->decide(logits, position + 1U, nullptr).token : selected;
         }, emit);
@@ -630,6 +665,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     out << "timing prompt_tokens " << prompt_size << " prefill_ms " << prefill_ms
         << " decode_tokens " << generated.steps_executed << " decode_ms "
         << (generated.steps_executed ? decode_ms : 0.0) << " decode_tok_s " << decode_tok_s << '\n';
+    if (sampler) out << "sampling path " << (device_sampled ? "device" : "host") << '\n';
     if (options.speculation != CliSpeculation::off) {
         const spec::SpecStats empty;
         const auto& stats = drafter ? drafter->stats() : empty;
@@ -659,6 +695,10 @@ std::uint32_t SerialGenerationDecoder::prefill_embedded(std::span<const std::uin
                                                        std::span<float> logits) {
     if (table) throw std::invalid_argument("this family takes no provided embedding rows");
     return prefill(ids, logits);
+}
+
+std::uint32_t SerialGenerationDecoder::decode_sampled(std::uint32_t, TokenSampler&, std::uint64_t) {
+    throw std::logic_error("this decoder does not sample on the device");
 }
 
 int run_serial_generation_cli(int argc, char** argv, const SerialGenerationFamily& family,

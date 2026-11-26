@@ -222,7 +222,8 @@ struct ArbiterConfig {
     // first one-row pass 33-37 ms against a ~9.5 ms plain step; learned as the plain row's price, it made every
     // drafted window look cheaper than serial, and serial was never measured again (auto drafted on prose at 0.65x
     // of off). An ignored width is priced as if unmeasured (seeds or neighbours); an unmeasured, unseeded plain row
-    // still forces a serial pass, so the plain row is learned from a warm pass. 0 = every wall counts.
+    // still forces a serial pass, so the plain row is learned from a warm pass. A cold model pass is left out of the
+    // probe_loss episode's net (it neither closes the episode nor paces the next probe). 0 = every wall counts.
     std::uint32_t cold_walls = 0;
     double lookup_overhead_ms = 0.0;    // extra cost of a lookup pass (the proposal itself is computed every step: sunk)
     std::array<double, 2> lookup_prior{1.0, 2.0};  // Beta prior (accept, reject) per depth for lookup

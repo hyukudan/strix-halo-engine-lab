@@ -859,7 +859,16 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
         cycle_passes_ *= f;
     }
     decided_ms_ = decided_excess_ms_ = decided_plain_ms_ = 0.0;
-    if (episode_pass_ && o.source == Source::model)  // ArbiterConfig::probe_loss: the episode's realized net
+    bool cold = false;  // ArbiterConfig::cold_walls: a first wall of its width is not a price
+    if (adaptive && config_.learn_costs && config_.cold_walls > 0 && o.rows > 0 && o.verify_ms > 0.0) {
+        if (width_walls_.size() <= o.rows) width_walls_.resize(o.rows + 1, 0);
+        cold = width_walls_[o.rows]++ < config_.cold_walls;
+    }
+    // ArbiterConfig::probe_loss: the episode's realized net, cold passes left out (their one-time work is no more the
+    // drafter's loss than it is a price, and their warm wall is not known yet). Charged, the captures of an unlucky
+    // opening closed the episode and the next probes left the drafting path: measured CUDA code runs, 4 and 6 model
+    // passes of ~200 (q53, q60), where the same text drafts 51 of 54 (q58).
+    if (episode_pass_ && o.source == Source::model && !cold)
         episode_net_ms_ = std::min(episode_cap_ms_, episode_net_ms_ + double(std::max<std::size_t>(emitted.size(), 1)) *
                                                                      episode_rate_ - (o.verify_ms + o.draft_ms));
     episode_pass_ = false;
@@ -899,11 +908,6 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
     if (adaptive) {
         auto& c = cost_[context_bin(o.context)];
         if (config_.learn_costs) for (auto& w : c.weight) w *= config_.cost_aging;
-        bool cold = false;  // ArbiterConfig::cold_walls: a first wall of its width is not a price
-        if (config_.learn_costs && config_.cold_walls > 0 && o.rows > 0 && o.verify_ms > 0.0) {
-            if (width_walls_.size() <= o.rows) width_walls_.resize(o.rows + 1, 0);
-            cold = width_walls_[o.rows]++ < config_.cold_walls;
-        }
         if (config_.learn_costs && !cold && o.rows > 0 && o.rows < c.ms.size() && o.verify_ms > 0.0) {
             auto& w = c.weight[o.rows];
             c.ms[o.rows] = (c.ms[o.rows] * w + o.verify_ms) / (w + 1.0);

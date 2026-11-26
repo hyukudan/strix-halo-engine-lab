@@ -6997,3 +6997,23 @@ conversion changes the source weights and requires explicit opt-in. See [the use
 | MiniMax M3.1 Flash | Shared host API | Device binding pending |
 | Hy4 Flash | Shared host API | Device binding pending |
 | Nemotron 3.5 Bolt E4B | Shared host API | Dense model |
+<a id="arbiter-cold-episode"></a>
+## Speculation arbiter: cold passes are left out of the probe episode
+**Engine:** `shared`. **Control:** none (ArbiterConfig::cold_walls > 0 with probe_loss > 0). **Default:** on wherever both are set (today: the serial generation CLI with learned walls).
+A probe episode's realized net leaves out the first wall of every window width (a capture or first-touch wall is neither a price nor the drafter's loss): before, the capture walls of an unlucky opening closed the episode and paced the next probe beyond the request.
+- **Shared home:** src/spec/drafting.cpp, include/strix/spec/drafting.hpp
+- **Tier and regime:** EXACT, FAST, QUALITY, TURBO; speculative decode
+- **Exactness evidence:** EXACT: the arbiter only chooses windows; emitted ids are the target's picks. q62 ids equal in all 7 arms. Host: strix-spec-drafting-tests cold_episode_tests (4 seeds, measured q53 opening and cold walls: >= 90 % model passes after the cold opening).
+- **Off switch:** cold_walls = 0 (every wall counts) or STRIX_SPEC_PROBE_LOSS=0 (fixed re-probe interval)
+- **Measured gain:** q62 (RTX PRO, Inkling 2 Mini CUDA CLI EXACT 256 tokens, code, window programs on): 170.81 / 169.28 tok/s with 51 model passes (201/342); the q53 / q60 runs before the fix collapsed to 4 / 6 model passes (93.13 / 107.52 tok/s) when the first-capture walls of an unlucky opening closed the episode.
+- **Preconditions:** learned walls (learn_costs) with cold_walls > 0 and a charged probe_loss
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | unchanged: no probe_loss row (fixed re-probe interval) |
+| Qwen3.8 27B dense | unchanged: no probe_loss row (fixed re-probe interval) |
+| DeepSeek V4.1 Flash | unchanged: no probe_loss row (fixed re-probe interval) |
+| GLM 5.3 Flash | unchanged: no probe_loss row (fixed re-probe interval) |
+| MiniMax M3.1 Flash | unchanged: no probe_loss row (fixed re-probe interval) |
+| Inkling 2 Mini | bound: CUDA CLI --speculation auto (probe_loss 0.015, cold_walls 1) |
+| Hy4 Flash | unchanged: no probe_loss row (fixed re-probe interval) |
+| Nemotron 3.5 Bolt E4B | unchanged: no probe_loss row (fixed re-probe interval) |
