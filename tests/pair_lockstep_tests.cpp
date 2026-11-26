@@ -1,7 +1,9 @@
 #include "strix/pair/lockstep.hpp"
+#include "strix/pair/handshake.hpp"
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 namespace {
@@ -61,6 +63,55 @@ void test_same_rank_and_range() {
            "rank > 1 rejected");
 }
 
+void test_startup_hello() {
+    using strix::pair::PairHello;
+    PairHello a, b;
+    a.protocol = b.protocol = 23;
+    b.rank = 1;
+    a.executable_sha256[31] = b.executable_sha256[31] = 1;
+    a.model_sha256[31] = b.model_sha256[31] = 2;
+    strix::pair::set_gpu_arch(a, "gfx1151");
+    strix::pair::set_gpu_arch(b, "gfx1151");
+    a.route = b.route = 0x8000000080000000ULL;
+    a.offers[0] = 8;
+    b.offers[0] = 4;
+    std::size_t exchanges = 0;
+    const auto exchange = [&](auto out, auto in) {
+        ++exchanges;
+        expect(out.size() == 304U && in.size() == 304U, "one fixed-size startup frame per rank");
+        expect(std::memcmp(out.data(), &a, sizeof a) == 0, "all startup fields are sent");
+        std::memcpy(in.data(), &b, sizeof b);
+    };
+    const auto peer = strix::pair::exchange_hello(a, exchange);
+    expect(exchanges == 1U && peer.offers[0] == 4U, "one exchange carries independent memory offers");
+    const auto valid = b;
+    const auto reject = [&](std::string_view field) {
+        const auto error = thrown([&] { (void)strix::pair::exchange_hello(a, exchange); });
+        expect(error.find(field) != std::string::npos, "pair hello reports the mismatched field");
+        b = valid;
+    };
+    b.version = 0;
+    reject("wire version");
+    b.rank = a.rank;
+    reject("complementary ranks");
+    b.executable_sha256[31] = 0;
+    reject("executable SHA-256");
+    b.model_sha256[31] = 0;
+    reject("model identity");
+    strix::pair::set_gpu_arch(b, "gfx1100");
+    reject("GPU architecture");
+    b.route = 0;
+    reject("route fingerprint");  // the old GLM xor-fold would have matched
+    b.placement_reference = 1;
+    reject("placement and receipt");
+    b.transport_capabilities = 1;
+    reject("transport capabilities");
+    b.contract[0] = 2;
+    constexpr std::array<std::string_view, 1> fields{"wire and split policy"};
+    expect(thrown([&] { (void)strix::pair::exchange_hello(a, exchange, fields); }).find(fields[0]) != std::string::npos,
+           "bindings can name a wire or split mismatch");
+}
+
 }  // namespace
 
 int main() {
@@ -68,6 +119,7 @@ int main() {
     test_duplicate_or_stale_round();
     test_ack_mismatch();
     test_same_rank_and_range();
+    test_startup_hello();
     if (failures) return EXIT_FAILURE;
     std::printf("PASS pair lockstep\n");
     return EXIT_SUCCESS;

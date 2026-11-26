@@ -156,6 +156,8 @@ public:
     [[nodiscard]] std::vector<float> last_logits(std::size_t rows) const;
     // Control channel: `bytes` (1..65536) of host memory sent, the peer's `bytes` received (both ranks, same size).
     void exchange_bytes(const void* out, void* in, std::size_t bytes);
+    // Startup contract after local admission, before the first forward call.
+    void agree_pair(bool serving, std::uint32_t draft_protocol = 0);
     void abort(const std::string& reason);
     // Data channel for device buffers of any size (both ranks, same size): `local` (ordered after its producer on
     // `stream`) to the peer, the peer's bytes into `remote` (enqueued on `stream`). One control-tagged comm.exchange.

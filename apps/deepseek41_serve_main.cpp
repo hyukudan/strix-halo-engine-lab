@@ -49,7 +49,7 @@
 // up), {"event":"POISONED","reason":...} before a non-zero exit (peer lost, engine failure, group mismatch),
 // {"event":"STOPPED"} after a clean stop (SIGINT/SIGTERM: stop admitting, finish the running requests, stop rank 1).
 // The group manifest (TensorMeld, strix/group-manifest-v1) gives group_id, epoch, rank, transport, http, context and
-// slots; both ranks check group_id, epoch, the engine executable's SHA-256 and the model file size in a hello.
+// slots; both ranks check the group, executable, model and resolved pair contract in the startup hello.
 //
 // --prefill-path device: an admitted request's prompt (of at least --prefill-min tokens) is run by the two-rank device
 // prefill (DevicePrefill, both ranks; rank 0 sends a prefill command and the prompt over the control channel) instead
@@ -107,7 +107,7 @@
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/deepseek41_state_frames.hpp"
 #include "strix/handoff.hpp"
-#include "strix/pair/lockstep.hpp"
+#include "strix/pair/handshake_hip.hpp"
 #include "strix/deepseek41_batch_dspark.hpp"
 
 #include "ds41_hetero_stage.hpp"
@@ -284,8 +284,7 @@ std::uint64_t fnv(std::string_view s) {
 }
 
 std::string executable_sha256() {
-    static const std::string sha = strix::model_content_identity_hex(strix::sha256_file_content("/proc/self/exe"));
-    return sha;
+    return strix::model_content_identity_hex(strix::pair::executable_identity());
 }
 
 // strix/group-manifest-v1 (TensorMeld): the fields this engine uses override the command line.
@@ -336,37 +335,38 @@ strix::deepseek41::BatchForwardOptions forward_options(const Args& a, strix::dis
 }
 
 // ---- the control channel: one fixed-size block per round, rank 0 -> rank 1 (rank 1 answers with its own) ----
-enum class Command : std::uint32_t { hello = 1, step = 2, heartbeat = 3, shutdown = 4, prefill = 5, import_state = 6, prefill_unit = 7, quiesce = 8,
+enum class Command : std::uint32_t { step = 2, heartbeat = 3, shutdown = 4, prefill = 5, import_state = 6, prefill_unit = 7, quiesce = 8,
     session = 9,
     prefill_group = 10  // several short prompts as ONE group pass (STRIX_SERVE_PREFILL_GROUP): see device_prefill_group
 };
 struct Control {
-    std::uint32_t magic = 0x43425344U;  // "DSBC"
+    std::uint32_t magic = 0x32425344U;  // "DSB2"
     std::uint32_t command = 0;
     std::uint64_t round = 0;
     std::uint32_t rows = 0, resets = 0;  // resets: bit s = reset slot s before the step
     BatchRow row[BatchForward::max_rows]{};
-    // hello
-    std::uint64_t group_hash = 0, epoch = 0, model_bytes = 0, exe_hash = 0;
-    std::uint32_t layers = 0, slots = 0, context = 0, tp = 0;
+    // The previous protocol used this space for the startup hello; preserve the operation offsets.
+    std::uint64_t ack_round = strix::pair::kNoRound;
+    std::uint32_t rank = 0;
+    std::uint32_t reserved_hello[9]{};
     // KV pool: rank 0's reserve/release operations since the last step, in order (op = kind << 30 | slot << 24 |
     // positions; kind 1 release, 2 reserve), replayed by rank 1 before the step
-    std::uint32_t pool = 0, ops = 0;
+    std::uint32_t reserved_pool = 0, ops = 0;
     std::uint32_t op[63]{};  // 63: the block keeps 512 bytes with the scheduler fields
     // prefill: slot, prompt tokens (they follow in exchanges of kTokensPerMessage), the cache's resume boundary, shared
-    // boundary and key as rank 0 found them, flags (bit 0: insert the boundaries); hello: the prefill configuration
+    // boundary and key as rank 0 found them, flags (bit 0: insert the boundaries)
     std::uint32_t pslot = 0, plen = 0, presume = 0, pshared = 0, pflags = 0;  // step: pflags is the sampled row mask
     std::uint32_t commits = 0;  // DSpark windows: the count of commit[] below
     std::uint32_t pbudget = 0;  // STRIX_DS41_SERVE_SCHED=interleave: the prefill_unit budget
     std::uint64_t pkey = 0;
-    std::uint32_t prefill_mode = 0, prefill_rows = 0, prefix_block = 0;
+    std::uint32_t reserved_prefill[3]{};
     std::uint32_t pend = 0;  // STRIX_DS41_SERVE_SCHED=interleave: the prefill_unit end row; step: prompt-lookup window slots
     std::uint64_t prefix_bytes = 0;  // prefill_group: sampled members by index
-    // disk tier and session snapshots (hello: configuration; step/prefill/heartbeat: snaps = slots whose state at a
+    // Session snapshots (step/prefill/heartbeat: snaps = slots whose state at a
     // block boundary rank 0 inserted after the last step, inserted by rank 1 before anything else)
-    std::uint64_t prefix_disk = 0;
-    std::uint32_t prefix_flags = 0, snaps = 0;
-    std::uint64_t prefix_ns = 0;  // hello: FNV of the serve identity (sched::serve_identity_text: weights content, decode, DSpark)
+    std::uint64_t reserved_disk = 0;
+    std::uint32_t reserved_prefix_flags = 0, snaps = 0;
+    std::uint64_t reserved_prefix_ns = 0;
     // import_state: the slot in pslot, the state's byte count in prefix_bytes, its digest in pkey (the bytes follow in
     // messages of kImportChunk bytes; the pool operations come first). Rank 1's reply of the next round carries the
     // digest it imported in pkey.
@@ -397,22 +397,30 @@ static_assert(offsetof(Control, extra_rows) <= 512U);
 
 // Lockstep round of this rank's Control channel. Each rank runs its whole Control conversation on one thread (lead() /
 // follow(); the --emulate peer is a second thread in the same process), so the counter is per thread.
-thread_local std::uint64_t control_round = 0;
+thread_local strix::pair::Lockstep control_lock(0);
 
-Control exchange(BatchForward& fwd, const Control& out) {
+void stamp_control(Control& c) {
+    const auto head = control_lock.header();
+    c.round = head.round;
+    c.ack_round = head.ack_round;
+    c.rank = head.rank;
+}
+
+Control exchange(BatchForward& fwd, Control out) {
+    stamp_control(out);
     std::array<std::byte, 512> o{}, i{};
     std::memcpy(o.data(), &out, offsetof(Control, extra_rows));
-    std::memcpy(o.data() + offsetof(Control, round), &control_round, sizeof control_round);
     fwd.exchange_host(o, i);
     Control in;
     std::copy_n(i.begin(), offsetof(Control, extra_rows), std::as_writable_bytes(std::span(&in, 1)).begin());
     if (in.magic != out.magic) throw std::runtime_error("control channel: bad magic from the peer");
-    strix::pair::check_round(control_round, in.round);
-    ++control_round;
+    const strix::pair::LockstepHeader peer{in.round, in.ack_round, in.rank};
+    control_lock.check(peer);
     if (std::max(out.rows, in.rows) > BatchForward::max_rows) {
         if (std::max(out.rows, in.rows) > fwd.row_limit()) throw std::runtime_error("control channel: step row limit differs");
         fwd.exchange_host(std::as_bytes(std::span(out.extra_rows)), std::as_writable_bytes(std::span(in.extra_rows)));
     }
+    control_lock.accept(peer);
     return in;
 }
 
@@ -472,74 +480,48 @@ std::string dspark_markov_identity(const Args& a) {
     return m.cand ? "|markov cand " + std::to_string(m.C) + " " + std::to_string(m.H) : std::string{};
 }
 
-Control hello(const Args& a) {
-    Control c;
-    c.command = static_cast<std::uint32_t>(Command::hello);
-    c.group_hash = fnv(a.deployment_plan ? a.group_id + "/" + a.deployment_plan->hash() : a.group_id);
-    c.epoch = a.epoch;
-    c.model_bytes = std::filesystem::file_size(a.model);
-    c.exe_hash = fnv(executable_sha256());
-    c.layers = a.layers;
-    c.slots = a.slots;
-    c.context = a.context;
-    c.tp = (a.tp ? 1U : 0U) | (BatchForward::configured_row_limit() > BatchForward::max_rows ? 2U : 0U) | (dspark_coop_on() ? 4U : 0U);
-    c.pool = a.pool;
-    c.prefill_mode = a.device_prefill ? 1U : 0U;
-    c.prefill_rows = a.prefill_rows_auto ? 0U : a.prefill_rows;  // auto: resolved by both ranks after the load
-    c.prefix_block = a.prefix_block;
-    c.prefix_bytes = a.prefix_cache_mb << 20U;
-    c.prefix_disk = a.prefix_dir.empty() ? 0U : (a.prefix_disk_mb << 20U) + 1U;
-    c.prefix_flags = (a.prefix_before_tail ? 1U : 0U) | (a.prefix_session ? 2U : 0U) | (a.prefix_inrun ? 4U : 0U) |
-                     (a.prefix_inrun ? std::min<std::uint32_t>(a.prefix_inrun_reach, 0xFFFFFFU) << 8U : 0U);  // the cone: both ranks alike
-    // serve keeps expert TP off unless STRIX_DS41_EXPERT_TP=1 (then the rows path): the decode identity of fwd.expert_tp().
-    // Always compared (not only with a disk tier): ranks with different weights content, decode identity or DSpark setup
-    // exchange the same bytes and tags, which no CRC or framing check can tell apart.
+strix::pair::PairHello hello(const Args& a, std::uint32_t rank, std::uint16_t capabilities, bool direct) {
+    auto c = strix::pair::native_hello(0x32535344U, rank);  // "DSS2"
+    c.model_sha256 = strix::sha256_file_content(a.model).bytes;
+    if (!a.dspark.empty()) c.placement_reference = fnv(strix::model_content_identity_hex(strix::sha256_file_content(a.dspark)));
+    c.profile = strix::deepseek41::pair_defaults::profile_resolution().fingerprint();
     const auto ns = strix::deepseek41::prefix_namespace_from_env(strix::ds41::expert_tp::enabled_from_env()).text;
-    c.prefix_ns = fnv(strix::deepseek41::sched::serve_identity_text(
+    c.route = fnv(strix::deepseek41::sched::serve_identity_text(
         ns, a.dspark.empty() ? 0U : std::filesystem::file_size(a.dspark), a.dspark_ranks, a.dspark_window, a.dspark_vocab + dspark_markov_identity(a)));
-    // Resource limits occupy previously zero hello fields. OFF keeps the original
-    // 512 bytes; defaults sampled on different hosts negotiate a common minimum.
-    c.pkey = a.session_ram_bytes;
-    if (c.pkey) {
-        c.plen = static_cast<std::uint32_t>(a.session_max_parked);
-        c.pflags = a.session_dir.empty() ? 0U : 1U;
-        c.pshared = static_cast<std::uint32_t>(a.session_disk_bytes);
-        c.presume = static_cast<std::uint32_t>(a.session_disk_bytes >> 32U);
+    c.transport_capabilities = capabilities;
+    c.context = a.context;
+    c.slots = a.slots;
+    c.max_rows = a.prefill_rows_auto ? 0U : a.prefill_rows;
+    const std::uint64_t flags = (a.tp ? 1U : 0U) | (dspark_coop_on() ? 2U : 0U) | (a.device_prefill ? 4U : 0U) |
+        (a.engram_direct ? 8U : 0U) | (direct ? 16U : 0U) | (a.prefix_before_tail ? 32U : 0U) |
+        (a.prefix_session ? 64U : 0U) | (a.prefix_inrun ? 128U : 0U) | (a.prefix_dir.empty() ? 0U : 256U) |
+        (!a.hetero_listen.empty() ? 512U : 0U);
+    c.contract = {fnv(a.deployment_plan ? a.group_id + "/" + a.deployment_plan->hash() : a.group_id), a.epoch,
+                  (std::uint64_t{a.layers} << 32U) | a.pool, flags, a.prefix_cache_mb, a.prefix_disk_mb,
+                  (std::uint64_t{a.prefix_block} << 32U) | (a.prefix_inrun ? a.prefix_inrun_reach : 0U),
+                  (std::uint64_t{BatchForward::configured_row_limit()} << 32U) | a.prefill_piece_rows,
+                  (std::uint64_t{a.dspark_seed_rows} << 32U) | a.dspark_max_inflight,
+                  (std::uint64_t{a.hetero_cut} << 32U) | a.hetero_groups};
+    // Automatically sampled resource limits negotiate a common minimum.
+    if (a.session_ram_bytes != 0U) {
+        c.offers = {a.session_ram_bytes, a.session_max_parked, a.session_dir.empty() ? 0U : 1U, a.session_disk_bytes};
     }
     return c;
 }
 
-void agree_session_limits(Args& a, const Control& peer) {
+void agree_session_limits(Args& a, const strix::pair::PairHello& peer) {
     const auto before = a.session_ram_bytes;
     const bool had_disk = !a.session_dir.empty();
-    a.session_ram_bytes = std::min(a.session_ram_bytes, peer.pkey);
-    a.session_max_parked = std::min(a.session_max_parked, static_cast<std::uint64_t>(peer.plen));
+    a.session_ram_bytes = std::min(a.session_ram_bytes, peer.offers[0]);
+    a.session_max_parked = std::min(a.session_max_parked, peer.offers[1]);
     if (!a.session_max_parked) a.session_ram_bytes = 0;
-    if (!a.session_ram_bytes || !peer.pflags) a.session_dir.clear();
-    const auto peer_disk = static_cast<std::uint64_t>(peer.pshared) | (static_cast<std::uint64_t>(peer.presume) << 32U);
-    a.session_disk_bytes = std::min(a.session_disk_bytes, peer_disk);
+    if (!a.session_ram_bytes || !peer.offers[2]) a.session_dir.clear();
+    a.session_disk_bytes = std::min(a.session_disk_bytes, peer.offers[3]);
     if (!a.session_disk_bytes) a.session_dir.clear();
     if (before && !a.session_ram_bytes)
         std::fprintf(stderr, "session cache: off (peer precondition or off switch)\n");
     else if (had_disk && a.session_dir.empty())
         std::fprintf(stderr, "session disk: off (peer precondition or off switch)\n");
-}
-
-std::string hello_mismatch(const Control& mine, const Control& peer) {
-    if (peer.command != static_cast<std::uint32_t>(Command::hello)) return "the peer did not answer the hello";
-    if (peer.group_hash != mine.group_hash) return "group_id differs between the ranks";
-    if (peer.epoch != mine.epoch) return "epoch differs between the ranks";
-    if (peer.exe_hash != mine.exe_hash) return "the engine executables differ (SHA-256)";
-    if (peer.model_bytes != mine.model_bytes) return "the model files differ (size)";
-    if ((peer.tp ^ mine.tp) & 4U) return "STRIX_DS41_DSPARK_COOP differs between the ranks";
-    if (peer.layers != mine.layers || peer.slots != mine.slots || peer.context != mine.context || peer.tp != mine.tp || peer.pool != mine.pool)
-        return "layers, slots, context, KV pool or tensor-parallel attention differ between the ranks";
-    if (peer.prefill_mode != mine.prefill_mode || peer.prefill_rows != mine.prefill_rows || peer.prefix_block != mine.prefix_block ||
-        peer.prefix_bytes != mine.prefix_bytes || peer.prefix_disk != mine.prefix_disk || peer.prefix_flags != mine.prefix_flags)
-        return "the prefill path or the prefix cache differ between the ranks";
-    if (peer.prefix_ns != mine.prefix_ns)
-        return "the serve identities differ between the ranks (weights overlay / trellis / EP map content, EP vs expert TP, or DSpark drafter / ranks / window / vocabulary / STRIX_DS41_DSPARK_MARKOV)";
-    return {};
 }
 
 // Watchdog: the process ends (POISONED) if a round with the peer has not completed for `limit` seconds.
@@ -1611,13 +1593,8 @@ using PrefillFactory = std::function<std::unique_ptr<SlotPrefill>(std::uint32_t&
 // ---- rank 1: no API; runs what rank 0 sends ----
 void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const PrefillFactory& make_prefill, strix::ds41::hetero::Stage* stage,
             StepTokenDigest& step_tokens, StepProfile& step_profile) {
-    control_round = 0;
+    control_lock = strix::pair::Lockstep(1U);
     Args a = initial;
-    const auto mine = hello(a);
-    const auto first = exchange(fwd, mine);
-    dog.progress();
-    if (const auto why = hello_mismatch(mine, first); !why.empty()) poisoned(1U, why);
-    agree_session_limits(a, first);
     dog.pause(true);
     auto sessions = make_sessions(a, 1U);
     agree_session_startup(a, fwd, sessions);
@@ -1671,7 +1648,7 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
         }
     };
     for (;;) {
-        reply.round = control_round;
+        stamp_control(reply);
         std::array<std::byte, 512> out{}, in{};
         std::memcpy(out.data(), &reply, offsetof(Control, extra_rows));
         fwd.exchange_host(out, in);
@@ -1687,12 +1664,13 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
         Control c;
         std::copy_n(in.begin(), offsetof(Control, extra_rows), std::as_writable_bytes(std::span(&c, 1)).begin());
         if (c.magic != reply.magic) throw std::runtime_error("control channel: bad magic from the peer");
-        strix::pair::check_round(control_round, c.round);  // draft packets above neither check nor advance the round
-        ++control_round;
+        const strix::pair::LockstepHeader peer{c.round, c.ack_round, c.rank};
+        control_lock.check(peer);  // draft packets above neither check nor advance the round
         if (std::max(reply.rows, c.rows) > BatchForward::max_rows) {  // as exchange(): the rows past 8 follow
             if (std::max(reply.rows, c.rows) > fwd.row_limit()) throw std::runtime_error("control channel: step row limit differs");
             fwd.exchange_host(std::as_bytes(std::span(reply.extra_rows)), std::as_writable_bytes(std::span(c.extra_rows)));
         }
+        control_lock.accept(peer);
         if (c.commits > std::size(c.commit)) throw std::runtime_error("control channel: too many commits");
         std::array<std::uint32_t, 64> kept{};
         kept.fill(0xFFFFFFFFU);
@@ -2221,13 +2199,8 @@ void frames_import_session(const Args& a, ServeState& state, ImportBox& box, str
 
 void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& comm, Watchdog& dog, const PrefillFactory& make_prefill, strix::ds41::hetero::Stage* stage,
           StepTokenDigest& step_tokens, StepProfile& step_profile) {
-    control_round = 0;
+    control_lock = strix::pair::Lockstep(0U);
     Args a = initial;
-    const auto mine = hello(a);
-    const auto peer = exchange(fwd, mine);
-    dog.progress();
-    if (const auto why = hello_mismatch(mine, peer); !why.empty()) poisoned(0U, why);
-    agree_session_limits(a, peer);
     dog.pause(true);
     auto sessions = make_sessions(a, 0U);
     agree_session_startup(a, fwd, sessions);
@@ -4141,13 +4114,22 @@ std::uint32_t auto_prefill_rows(const Args& a, BatchForward& fwd, strix::dist::C
 void run_rank(Args a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport,
               std::unique_ptr<strix::dist::DeviceExchange> direct = nullptr) {
     if (a.deploy_spec) resolve_live_deployment(a, rank, *transport);
+    const auto caps = a.transport == "emulate" ? std::uint16_t{0} : strix::dist::all_transport_capabilities;
+    try {
+        constexpr std::array<std::string_view, 10> fields{
+            "group or deployment", "epoch", "layers or KV pool", "execution or prefix flags", "prefix RAM budget",
+            "prefix disk budget", "prefix block or reach", "step or prefill rows", "DSpark seed or inflight limit", "heterogeneous cut or groups"};
+        const auto peer = strix::pair::exchange_hello(hello(a, rank, caps, direct != nullptr),
+            [&](auto out, auto in) { transport->exchange(out, in); }, fields);
+        agree_session_limits(a, peer);
+    } catch (const std::exception& e) {
+        transport->abort(e.what());
+        throw;
+    }
     // the device prefill exchanges a chunk's MoE half sums (<= 21 MB) in one message
     strix::dist::Communicator comm(strix::dist::Group{rank, 2U, a.epoch, fnv(a.group_id)}, std::move(transport), std::move(direct),
                                    a.device_prefill ? std::size_t{22} << 20U : std::size_t{4} << 20U);
     std::fprintf(stderr, "rank %u: dist %s\n", rank, comm.transport_name().c_str());
-    strix::profile::check_peer(strix::deepseek41::pair_defaults::profile_resolution(), [&](std::span<const std::byte> profile_out, std::span<std::byte> profile_in) {
-        comm.exchange_host(profile_out, profile_in, strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 0x70726f66U, 0U});
-    });  // both ranks must run the same product profile
     Watchdog dog(rank, a.peer_timeout);
     dog.pause(true);  // loading the weights is not a round
     BatchForward fwd(a.model, forward_options(a, &comm, rank));

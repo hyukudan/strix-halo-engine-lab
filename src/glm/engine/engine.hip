@@ -1877,7 +1877,10 @@ struct Engine::Impl {
         unsigned f = 0;
         hip_ok(hipMemcpyAsync(&f, flag, 4, hipMemcpyDeviceToHost, stream), "flag");
         hip_ok(hipStreamSynchronize(stream), "flag sync");
-        if (f) throw std::runtime_error(std::string("non-finite value (checkpoints C1-C5) at ") + where);
+        if (!f) return;
+        const std::string error = std::string("non-finite value (checkpoints C1-C5) at ") + where;
+        if (comm != nullptr) comm->cancel_pending(error);
+        throw std::runtime_error(error);
     }
 
     // One forward of R <= 8 rows through layers [0, n_layers); X holds the 4-stream residual afterwards.

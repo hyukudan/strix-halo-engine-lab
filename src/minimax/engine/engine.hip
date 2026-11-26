@@ -16,9 +16,11 @@
 // Linears: strix_gemm for prefill / gate calls, strix_gemv for decode steps (<= 8 rows).
 #include "strix/prefill_headless.hpp"
 #include "strix/minimax/engine.hpp"
+#include "strix/minimax/model_assets.hpp"
 #include "strix/dist/communicator_hip.hpp"
 #include "strix/head_argmax.hpp"
 #include "strix/pair/prefill_group.hpp"
+#include "strix/pair/handshake_hip.hpp"
 
 #include "mm_kernels.hpp"
 #include "strix/hip_minimax_moe.hpp"
@@ -2135,7 +2137,7 @@ struct Engine::Impl {
     // A table default (pf_order) that cannot hold declines to adaptive with a printed reason, before receipts (the
     // decline re-exports STRIX_MMX_PF_ORDER, so route receipt and cache identity name the effective order); an
     // explicit STRIX_MMX_PF_ORDER=invariant, or STRIX_MM_PF_DENSE_TAIL_FIXED=1 (which needs the invariant order), keeps
-    // the hard error. Both ranks load the same config and weights, so the decision is the same on each rank.
+    // the hard error. The startup hello compares the effective order after both ranks have admitted it.
     void require_invariant_dense() const {
         if (!mmoe::prefill_order_invariant()) return;
         const char* unmet = nullptr;
@@ -3820,7 +3822,14 @@ struct Engine::Impl {
 
 Engine::Engine(Options options, dist::Communicator& comm) : impl_(std::make_unique<Impl>(std::move(options), comm)) {}
 Engine::~Engine() = default;
-LoadReport Engine::load() { return impl_->load(); }
+LoadReport Engine::load() {
+    try {
+        return impl_->load();
+    } catch (...) {
+        impl_->comm.cancel_pending("MiniMax load failed");
+        throw;
+    }
+}
 std::uint32_t Engine::prefill(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
     return impl_->prefill(slot, tokens, pos0);
 }
@@ -3991,6 +4000,33 @@ std::vector<float> Engine::last_logits(std::size_t rows) const {
 }
 void Engine::abort(const std::string& reason) { impl_->comm.transport().abort(reason); }
 void Engine::exchange_bytes(const void* out, void* in, std::size_t bytes) { impl_->exchange_bytes(out, in, bytes); }
+void Engine::agree_pair(bool serving, std::uint32_t draft_protocol) {
+    auto& m = *impl_;
+    try {
+        auto hello = strix::pair::native_hello(serving ? 0x32534d4dU : 0x32524d4dU, m.opt.rank);  // "MMS2" / "MMR2"
+        std::vector<strix::ModelContentFile> files;
+        for (const auto& path : assets::pack_files(m.opt.model_dir)) files.push_back({path.filename().string(), path});
+        hello.model_sha256 = strix::build_model_content_identity(files).bytes;
+        hello.profile = defaults::profile_resolution(strix::envcfg::text).fingerprint();
+        hello.route = strix::route::fingerprint();
+        hello.context = m.opt.capacity;
+        hello.slots = m.opt.slots;
+        hello.max_rows = m.opt.max_rows;
+        hello.transport_capabilities = m.comm.group().transport_capabilities;
+        hello.contract = {m.comm.group().plan, draft_protocol,
+            (std::uint64_t{static_cast<unsigned>(m.split_policy.mode)} << 32U) | m.split_policy.crossover,
+            (m.xfer_on ? 1U : 0U) | (m.pf_on ? 2U : 0U) | (m.pf_interleave ? 4U : 0U) |
+                (m.pf_force_comm ? 8U : 0U) | (m.comm.device_exchange() != nullptr ? 16U : 0U),
+            static_cast<std::uint64_t>(m.pf_fmt), m.opt.unit_chunks};
+        constexpr std::array<std::string_view, 6> fields{"group or deployment", "DSpark protocol", "split frame policy",
+            "decode or prefill exchange route", "prefill wire format", "prefill unit size"};
+        (void)strix::pair::exchange_hello(hello, [&](auto out, auto in) { m.exchange_bytes(out.data(), in.data(), out.size()); }, fields);
+        std::printf("rank %u: route fingerprint %016llx agreed with the peer\n", m.opt.rank, static_cast<unsigned long long>(hello.route));
+    } catch (...) {
+        m.comm.cancel_pending("MiniMax pair hello failed");
+        throw;
+    }
+}
 void Engine::exchange_device(const void* local, void* remote, std::size_t bytes, void* stream) {
     impl_->exchange_device(local, remote, bytes, static_cast<hipStream_t>(stream));
 }
