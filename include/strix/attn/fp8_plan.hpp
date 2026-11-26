@@ -14,6 +14,18 @@ inline constexpr std::uint32_t capacity_alignment = 64;
 inline constexpr std::uint32_t split_keys = 2048;
 inline constexpr std::uint32_t max_group = 8;
 
+// The aligned shadow allocation may include stale positions. Limit the tile
+// before reading its bytes or scales, and use the causal end for per-query work.
+[[nodiscard]]
+#if defined(__HIPCC__) || defined(__CUDACC__)
+__host__ __device__
+#endif
+constexpr std::uint32_t live_tile_keys(std::uint32_t first, std::uint32_t end) noexcept {
+    if (first >= end) return 0;
+    const auto remaining = end - first;
+    return remaining < capacity_alignment ? remaining : capacity_alignment;
+}
+
 struct Plan {
     std::uint32_t capacity, padded_capacity, heads, kv_heads, group, splits;
 

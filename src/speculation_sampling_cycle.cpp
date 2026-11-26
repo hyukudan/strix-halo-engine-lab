@@ -201,6 +201,7 @@ finalize_sampled_speculation_cycle(
             preparation.candidate_tokens[index];
         step.rng =
             request.rng;
+        step.probability_identity = request.probability_identity;
         step.absolute_position =
             checked_add(
                 preparation.base_position,
@@ -248,7 +249,8 @@ finalize_sampled_speculation_cycle(
                     preparation.base_position,
                     static_cast<std::uint64_t>(
                         depth),
-                    "sampled speculation bonus position overflow"));
+                    "sampled speculation bonus position overflow"),
+                0U, request.probability_identity);
         plan.emitted_tokens.push_back(
             bonus);
     }

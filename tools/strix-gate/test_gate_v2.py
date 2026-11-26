@@ -16,6 +16,7 @@ import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import gate_v2 as v2  # noqa: E402
+import fast_logit_gate as sealed  # noqa: E402
 import test_fast_logit_gate as tfg  # noqa: E402
 
 
@@ -335,6 +336,23 @@ class Statistics(unittest.TestCase):
         ws = [window(f"w{i}", 256, 0.001, 1.0, 0.0, 0.001, self.rng, hit=0.6) for i in range(4)]
         self.assertAlmostEqual(v2.verdict(ws)["held_out"]["label_is_ref_top1"], 0.6, places=2)
 
+    def test_greedy_window_cannot_be_diluted_by_held_out_windows(self):
+        clean = window("document", 800, 0.001, 1.0, 0.0, 0.001, self.rng)
+        generated = window("greedy", 64, 0.001, 1.0, 0.0, 0.001, self.rng, hit=1.0)
+        with self.assertRaisesRegex(v2.GateError, "greedy: every label"):
+            v2.verdict([clean, generated])
+
+    def test_document_uncertainty_groups_correlated_windows(self):
+        windows = [{"name": name, "_rows": {"dnll": np.full(200, score)}}
+                   for name, score in (("a1", 0.2), ("a2", 0.2), ("b", -0.2))]
+        plan = {"a1": {"document": "a"}, "a2": {"document": "a"}, "b": {"document": "b"}}
+        report = v2.document_uncertainty(windows, plan)
+        self.assertEqual(report["documents"], 2)
+        self.assertAlmostEqual(report["dnll_cluster_se"], 8 / 45)
+        self.assertGreater(report["dnll_cluster_se"], 20 * report["dnll_row_se"])
+        plan["b"]["document"] = "a"
+        self.assertIsNone(v2.document_uncertainty(windows, plan)["dnll_cluster_se"])
+
     def test_route_files_flips_and_ratio(self):
         with tempfile.TemporaryDirectory() as t:
             t = pathlib.Path(t)
@@ -504,6 +522,73 @@ class HeadFormat(unittest.TestCase):
             self.assertEqual(doc["windows"][0]["flips"]["cand"]["slots"], self.N * 4)
             self.assertTrue(0.0 < doc["pooled"]["held_out"]["label_is_ref_top1"] < 1.0)
 
+    def test_replay_does_not_hide_free_running_regressions(self):
+        with tempfile.TemporaryDirectory() as d:
+            cases = [f"w{i:02d}" for i in range(13)]
+            d = self.kit(d, cases)
+            (d / "log").mkdir()
+            (d / "routes").mkdir()
+            for case in cases:
+                ref = f"{case}.exact.rte"
+                control = {"null": {"order": "reduce", "applications": 1}}
+                for arm in ("exact", "fast_free", "null_free"):
+                    path = d / "routes" / f"{case}.{arm}.rte"
+                    weights = [0.1, 0.9] if arm == "fast_free" else [0.75, 0.25]
+                    write_routes(path, [(0, [[1, 2]], [weights])])
+                    receipt = {"out": {"path": path.name, "records": 1, "rows": 1}}
+                    if arm == "null_free":
+                        receipt.update(control)
+                    (d / "log" / f"{case}.{arm}.stderr").write_text(
+                        "strix-route-file/v1 " + json.dumps(receipt) + "\n", encoding="utf-8")
+                for arm in ("fast", "n0"):
+                    receipt = {"in": {"path": ref, "complete": True, "consumed": 1, "records": 1, "rows": 1}}
+                    if arm == "n0":
+                        receipt.update(control)
+                    (d / "log" / f"{case}.{arm}.stderr").write_text(
+                        "strix-route-file/v1 " + json.dumps(receipt) + "\n", encoding="utf-8")
+                (d / f"{case}-null_free.f32").write_bytes((d / f"{case}-n0.f32").read_bytes())
+                (d / f"{case}-fast_free.f32").write_bytes((d / f"{case}-fast.f32").read_bytes())
+
+            args = ("--cand-free", "fast_free", "--null-free", "null_free")
+            self.assertEqual(self.gate(d, *args)[0], 0)
+            rc, out = self.gate(d, "--cand-free", "exact", "--null-free", "null_free")
+            self.assertEqual(rc, 2, out)
+            self.assertIn("must be distinct", out)
+            target = d / "w00-fast_free.f32"
+            finite = target.read_bytes()
+            target.write_bytes((-np.frombuffer(finite, "<f4")).tobytes())
+            rc, out = self.gate(d, *args)
+            self.assertEqual(rc, 1, out)
+            doc = json.loads((d / "g.json").read_text(encoding="utf-8"))
+            self.assertEqual(doc["pooled"]["free_run"]["state"], "FAIL")
+            self.assertEqual(doc["pooled"]["flips"]["cand"]["ids"], 0)
+            self.assertGreater(doc["windows"][0]["flips"]["cand"]["rms_weight_delta"], 0.6)
+
+            route = d / "routes" / "w00.fast_free.rte"
+            write_routes(route, [(0, [[1, 1]], [[0.1, 0.9]])])
+            rc, out = self.gate(d, *args)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("repeated expert ID", out)
+            write_routes(route, [(0, [[1, 2]], [[0.1, 0.9]])])
+
+            target.write_bytes(np.array([np.nan], "<f4").tobytes() + finite[4:])
+            self.assertEqual(self.gate(d, *args)[0], 1)
+            doc = json.loads((d / "g.json").read_text(encoding="utf-8"))
+            self.assertEqual(doc["pooled"]["free_run"]["nonfinite_candidate"], ["w00"])
+            final_row = len(finite) - self.V * 4
+            target.write_bytes(finite[:final_row] + np.array([np.inf], "<f4").tobytes() + finite[final_row + 4:])
+            self.assertEqual(self.gate(d, *args)[0], 1)
+            target.write_bytes(finite)
+            write_routes(d / "routes" / "w00.fast_free.rte", [(0, [[1, 2]], [[np.inf, 0.9]])])
+            self.assertEqual(self.gate(d, *args)[0], 1)
+            target.unlink()
+            self.assertEqual(self.gate(d, *args)[0], 2)
+
+    def test_sealed_route_only_evidence_cannot_qualify_moe(self):
+        args = mock.Mock(mode="fast", route_flips=["w=ref.rte,cand.rte,null.rte"])
+        with self.assertRaisesRegex(sealed.GateError, "requires free-running logits"):
+            sealed.compare(args)
+
     def test_nonfinite_candidate_is_a_failure_not_an_evidence_error(self):
         with tempfile.TemporaryDirectory() as d:
             d = self.kit(d, [f"w{i:02d}" for i in range(13)])
@@ -525,6 +610,125 @@ class HeadFormat(unittest.TestCase):
             rc, out = self.gate(self.kit(d, [f"w{i:02d}" for i in range(13)], null_ids=20, cand_ids=32))
             self.assertEqual(rc, 1, out)
             self.assertIn("FAIL flip_ratio", out)
+
+    def test_trace_null_does_not_depend_on_argument_order(self):
+        with tempfile.TemporaryDirectory() as d:
+            cases = [f"w{i:02d}" for i in range(13)]
+            d = self.kit(d, cases, null_ids=20, cand_ids=28)
+            for c in cases:
+                (d / f"{c}-n1.f32").write_bytes((d / f"{c}-n0.f32").read_bytes())
+            log = d / "r0.log"
+            before = log.read_text(encoding="utf-8")
+            log.write_text(before + "".join(line.replace('"arm":"n0"', '"arm":"n1"')
+                                             for line in before.splitlines(keepends=True) if '"arm":"n0"' in line),
+                           encoding="utf-8")
+            rc, out = self.gate(d, "--null", "n1")
+            self.assertEqual(rc, 2, out)
+            self.assertIn("--null-free", out)
+            rc, out = self.gate(d, "--null", "n1", "--null-free", "n1")
+            self.assertEqual(rc, 0, out)
+
+    def test_repeating_a_null_does_not_reweight_the_evidence(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = self.kit(d, [f"w{i:02d}" for i in range(13)], null_ids=20, cand_ids=28)
+            rc, out = self.gate(d, "--null", "n0", "--null-free", "n0")
+            self.assertEqual(rc, 2, out)
+            self.assertIn("distinct reference, candidate and null arms", out)
+
+    def test_null_witness_binds_the_baseline_configuration_and_capture(self):
+        with tempfile.TemporaryDirectory() as d:
+            cases = [f"w{i:02d}" for i in range(13)]
+            d = self.kit(d, cases, cand_ids=20)
+            witness = d / "control.json"
+            records = {}
+            for case in cases:
+                records[case] = {}
+                ids = np.array((d / f"{case}.ids").read_text(encoding="utf-8").split(), dtype="<u4")
+                for arm in ("exact", "n0"):
+                    records[case][arm] = {"binary_sha256": "a" * 64, "model_sha256": "b" * 64,
+                                          "numerical_config_sha256": "c" * 64,
+                                          "logits_sha256": hashlib.sha256((d / f"{case}-{arm}.f32").read_bytes()).hexdigest(),
+                                          "head_ids_sha256": hashlib.sha256(ids.tobytes()).hexdigest(),
+                                          "control": None if arm == "exact" else
+                                              {"order": "test-order@1", "applications": self.R}}
+
+            def check(old_exit):
+                witness.write_text(json.dumps({"schema": "strix-gate-null-witness/v1", "cases": records}), encoding="utf-8")
+                rc, out = self.gate(d, "--null-control-witness", str(witness))
+                self.assertEqual(rc, old_exit, out)
+
+            check(0)
+            record = records[cases[0]]["n0"]
+            for field, invalid in (("logits_sha256", "d" * 64), ("numerical_config_sha256", "d" * 64),
+                                   ("control", {"order": "test-order@1", "applications": 0})):
+                with self.subTest(field=field):
+                    original = record[field]
+                    record[field] = invalid
+                    check(2)
+                    record[field] = original
+
+            # An attested order control can still drift beyond the declared envelope.
+            null_path = d / f"{cases[0]}-n0.f32"
+            altered = -np.fromfile(null_path, dtype="<f4")
+            null_path.write_bytes(altered.tobytes())
+            record["logits_sha256"] = hashlib.sha256(altered.tobytes()).hexdigest()
+            check(0)
+            frozen = d / "envelope.json"
+            payload = json.dumps({"schema": "strix-gate-frozen-qualification/v1",
+                                  "windows": {c: {"class": "prose", "ids_sha256": records[c]["exact"]["head_ids_sha256"]}
+                                              for c in cases}, "reference_nll": {"prose": [10.0, 10.0, 10.0]},
+                                  "null_envelope": {"max_kl": 0.02, "min_top1": 0.93,
+                                                    "max_abs_dnll": 0.2}}).encode("utf-8")
+            frozen.write_bytes(payload)
+            rc, out = self.gate(d, "--null-control-witness", str(witness), "--allow-null-floor",
+                                "--frozen-qualification", str(frozen), hashlib.sha256(payload).hexdigest())
+            self.assertEqual(rc, 2, out)
+            self.assertIn(f"{cases[0]}.n0: exceeds the frozen null envelope", out)
+
+    def test_frozen_qualification_binds_held_out_ids_and_reference_bars(self):
+        with tempfile.TemporaryDirectory() as d:
+            cases = [f"w{i:02d}" for i in range(13)]
+            d = self.kit(d, cases, cand_ids=20)
+            self.assertEqual(self.gate(d)[0], 0)
+            frozen = d / "frozen.json"
+            windows = {}
+            for c in cases:
+                ids = np.array((d / f"{c}.ids").read_text(encoding="utf-8").split(), dtype="<u4")
+                windows[c] = {"class": "prose", "ids_sha256": hashlib.sha256(ids.tobytes()).hexdigest(), "document": c}
+            payload = json.dumps({"schema": "strix-gate-frozen-qualification/v1", "windows": windows,
+                                  "reference_nll": {"prose": [1.0, 1.0, 1.0]}}).encode("utf-8")
+            frozen.write_bytes(payload)
+            args = ["--frozen-qualification", str(frozen), hashlib.sha256(payload).hexdigest()]
+            rc, out = self.gate(d, *args)
+            self.assertEqual(rc, 4, out)
+            self.assertIn("HOLD off-distribution", out)
+            rc, out = self.gate(d, *args, "--document-uncertainty")
+            self.assertEqual(rc, 4, out)
+            diagnostic = json.loads((d / "g.json").read_text(encoding="utf-8"))["pooled"]["document_uncertainty"]
+            self.assertEqual(diagnostic["documents"], 13)
+            rc, out = self.gate(d, *args, "--cases", *cases[:-1])
+            self.assertEqual(rc, 2, out)
+            self.assertIn("frozen qualification window set", out)
+            replaced_ids = d / f"{cases[0]}.ids"
+            replaced_ids.write_text("0 " * self.N, encoding="utf-8")
+            rc, out = self.gate(d, *args)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("frozen qualification IDs differ", out)
+
+    def test_nonfinite_last_head_row_is_checked_without_scoring_an_extra_label(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = self.kit(d, [f"w{i:02d}" for i in range(13)])
+            for arm, expected in (("fast", 1), ("exact", 2), ("n0", 2)):
+                with self.subTest(arm=arm):
+                    target = d / f"w00-{arm}.f32"
+                    original = target.read_bytes()
+                    target.write_bytes(original[:-4] + np.array([np.inf], dtype="<f4").tobytes())
+                    rc, out = self.gate(d)
+                    self.assertEqual(rc, expected, out)
+                    if expected == 1:
+                        doc = json.loads((d / "g.json").read_text(encoding="utf-8"))
+                        self.assertEqual(doc["pooled"]["nonfinite_candidate"], ["w00"])
+                    target.write_bytes(original)
 
     def test_turbo_tier_relaxes_only_its_bars(self):
         # flip ratio 32 / 20 = 1.6: above the FAST 1.5, inside the TURBO 2.0; every other rule is unchanged

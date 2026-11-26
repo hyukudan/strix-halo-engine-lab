@@ -235,7 +235,7 @@ execute_sampled_speculation_cycle(
 
         const SampledSpeculationFinalizeRequest finalize{
             target_probabilities, request.draft_probabilities,
-            request.rng, request.token_budget, request.eos_tokens,
+            request.rng, request.token_budget, request.eos_tokens, request.probability_identity,
         };
         result.plan = finalize_sampled_speculation_cycle(
             model, *resources.session_state_layout, preparation, finalize);

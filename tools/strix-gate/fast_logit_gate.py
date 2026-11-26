@@ -4,7 +4,7 @@
 Two subcommands (Python 3.9+, numpy):
 
   seal     Run on the node that wrote one rank's dumps, right after the engine exits. Checks that every expected
-           dump exists, is fresh, has the declared row count and only finite values, then writes
+           dump exists, is fresh, has the declared row count and only finite values unless captured as failure evidence, then writes
            manifest-r<rank>.json (schema strix-fast-dump/v1): run id, arm, rank, binary sha256, the environment the
            arm was launched with, per prompt the token-file sha256 and per dump its bytes / sha256 / width.
            A missing, short, stale or already sealed dump is an error: nothing is written.
@@ -53,6 +53,10 @@ SEL_MAGIC = 0x444C4553
 
 class GateError(Exception):
     """Identity or input defect: the comparison has no verdict."""
+
+
+class NonfiniteCandidate(Exception):
+    """A candidate on the sealed, paired FAST history emitted a non-finite logit."""
 
 
 # dNLL rules per engine / profile. "abs" (every engine, the default): pooled dNLL <= --max-dnll. "floor": pooled dNLL <=
@@ -414,8 +418,7 @@ def seal(a):
 
 
 def dump_entries(a, attest):
-    """The sealed prompts map of one rank (seal and witness): every expected dump present, fresh, of the declared rows and
-    finite; per prompt the token count / sha256 and per dump its bytes / sha256 / width (selection: records / mode)."""
+    """Validate the dumps and seal their shape and contents; nonfinite values need explicit failure capture."""
     d = pathlib.Path(a.dir)
     prompts = {}
     for name, tok_path in parse_pairs(a.prompt, "--prompt").items():
@@ -439,7 +442,7 @@ def dump_entries(a, attest):
                     raise GateError(f"seal: {f} has {st.st_size} bytes, not {a.rows} rows of FP32")
                 entry["width"] = st.st_size // (a.rows * 4)
                 z = np.memmap(f, "<f4", "r")
-                if not np.isfinite(z).all():
+                if not np.isfinite(z).all() and not a.capture_nonfinite:
                     raise GateError(f"seal: nonfinite logits in {f}")
             else:
                 recs = read_selection(f)
@@ -701,7 +704,7 @@ def arm_logits(d, docs, name):
     return shards, rows
 
 
-def compare_logits(da, a, db, b, name, tokens, chunk=16):
+def compare_logits(da, a, db, b, name, tokens, chunk=16, *, candidate_evidence=False):
     sa, rows = arm_logits(da, a, name)
     sb, rows_b = arm_logits(db, b, name)
     if rows != rows_b or [s.shape for s in sa] != [s.shape for s in sb]:
@@ -709,13 +712,20 @@ def compare_logits(da, a, db, b, name, tokens, chunk=16):
     total = len(tokens)
     if rows > total:
         raise GateError(f"{name}: {rows} rows scored but the prompt has {total} tokens")
+    if (tokens[total - rows + 1:] >= sum(s.shape[1] for s in sa)).any():
+        raise GateError(f"{name}: label outside the sealed vocabulary")
     kl, agree, margin, nla, nlb, hia, hib = np.empty(rows), np.empty(rows, bool), np.empty(rows), [], [], [], []
-    identical = True
+    identical, nonfinite_candidate = True, False
     for i in range(0, rows, chunk):
         za = np.concatenate([s[i:i + chunk] for s in sa], axis=1).astype(np.float64)
         zb = np.concatenate([s[i:i + chunk] for s in sb], axis=1).astype(np.float64)
-        if not (np.isfinite(za).all() and np.isfinite(zb).all()):
-            raise GateError(f"{name}: nonfinite logits")
+        if not np.isfinite(za).all():
+            raise GateError(f"{name}: nonfinite reference logits")
+        if not np.isfinite(zb).all():
+            if not candidate_evidence:
+                raise GateError(f"{name}: nonfinite comparison logits")
+            nonfinite_candidate = True
+            continue
         identical = identical and bool((za == zb).all())
         la, lb = log_softmax(za), log_softmax(zb)
         kl[i:i + chunk] = (np.exp(la) * (la - lb)).sum(axis=1)
@@ -729,6 +739,8 @@ def compare_logits(da, a, db, b, name, tokens, chunk=16):
                 nlb.append(-lb[j, tokens[pos + 1]])
                 hia.append(ta[j] == tokens[pos + 1])
                 hib.append(tb[j] == tokens[pos + 1])
+    if nonfinite_candidate:
+        raise NonfiniteCandidate(name)
     return {"rows": rows, "kl": kl, "agree": agree, "margin_ref": margin, "nll_ref": np.array(nla), "nll_cand": np.array(nlb),
             "hit_ref": np.array(hia, dtype=bool), "hit_cand": np.array(hib, dtype=bool), "identical": identical}
 
@@ -777,18 +789,6 @@ def compare_selection(da, a, db, b, name):
 def compare_v2(a, names, results, null_prompt_kl, report, null_prompt=None):
     """FAST gate v2 verdict over the per-prompt rows (statistics in gate_v2.py, shared with the option_qual adapter)."""
     import gate_v2
-    flips_of = {}
-    for item in a.route_flips or []:
-        name, _, files = item.partition("=")
-        parts = files.split(",")
-        if name not in names or len(parts) != 3:
-            raise GateError(f"--route-flips {item!r}: want PROMPT=REF,CAND_FREE,NULL_FREE for a compared prompt")
-        try:
-            flips_of[name] = {"cand": gate_v2.route_flips(parts[0], parts[1]), "null": gate_v2.route_flips(parts[0], parts[2])}
-        except gate_v2.GateError as e:
-            raise GateError(str(e)) from e
-    if flips_of and sorted(flips_of) != names:
-        raise GateError("--route-flips must name every compared prompt (or none: dense engines)")
     windows = []
     try:
         for name, r in zip(names, results):
@@ -799,8 +799,8 @@ def compare_v2(a, names, results, null_prompt_kl, report, null_prompt=None):
                                      null_nlls=nu.get("nll") or None,
                                      null_kl_rows=nu.get("kl") or None, null_top1_rows=nu.get("agree") or None)
             windows.append(w)
-            print(gate_v2.window_line(w, flips_of.get(name)))
-        p = gate_v2.verdict(windows, [flips_of[n] for n in names] if flips_of else None)
+            print(gate_v2.window_line(w))
+        p = gate_v2.verdict(windows)
     except gate_v2.GateError as e:
         raise GateError(str(e)) from e
     print(gate_v2.pooled_line(p))
@@ -813,6 +813,9 @@ def compare_v2(a, names, results, null_prompt_kl, report, null_prompt=None):
 
 
 def compare(a):
+    if getattr(a, "route_flips", None):
+        raise GateError("MoE qualification requires free-running logits and replay receipts; use gate_v2.py qual "
+                        "with --cand-free and --null-free")
     if a.mode == "turbo":
         return compare_turbo(a)
     ranks = sorted(set(a.ranks))
@@ -822,8 +825,6 @@ def compare(a):
     v2 = getattr(a, "rule", "v1") == "v2"
     if v2 and (a.expect_identical or a.dnll_rule != "abs" or not null_dirs):
         raise GateError("--rule v2 needs at least one --null-arm and the plain dNLL rule (no --dnll-rule floor / --expect-identical)")
-    if not v2 and getattr(a, "route_flips", None):
-        raise GateError("--route-flips is a --rule v2 input")
     check_dnll_policy(a.dnll_rule, a.engine, a.profile, 0 if v2 else len(null_dirs))
     da, ma = load_arm(a.ref, ranks)
     db, mb = load_arm(a.cand, ranks)
@@ -855,7 +856,7 @@ def compare(a):
     print(f"cand run {mb[0]['run_id']} arm {mb[0]['arm']} env {mb[0]['env']} binary {report['cand_binary'][0][:12]}")
     pooled = {"kl": [], "agree": [], "nll_ref": [], "nll_cand": []}
     identical, sel_slots, sel_slot_diff, sel_id_diff, sel_seen = True, 0, 0, 0, False
-    results, copy_masks, tok_of = [], [], {}
+    results, copy_masks, tok_of, nonfinite = [], [], {}, []
     for name in names:
         tok_sha = sha256_file(tokens[name])
         for m in ma + mb + [m for _, mn in nulls for m in mn]:
@@ -864,7 +865,12 @@ def compare(a):
         tok = np.fromfile(tokens[name], "<u4").astype(np.int64)
         if nulls:
             tok_of[name] = tok
-        r = compare_logits(da, ma, db, mb, name, tok)
+        layers = compare_selection(da, ma, db, mb, name)
+        try:
+            r = compare_logits(da, ma, db, mb, name, tok, candidate_evidence=True)
+        except NonfiniteCandidate:
+            nonfinite.append(name)
+            continue
         results.append(r)
         copy_masks.append(copy_rows(tok, r["rows"]))
         identical = identical and r["identical"]
@@ -876,7 +882,6 @@ def compare(a):
                "identical": r["identical"]}
         print(f"{name}: rows {row['rows']} KL mean {row['kl_mean']:.5f} median {row['kl_median']:.5f} max {row['kl_max']:.4f}; "
               f"top-1 {row['top1']:.4f}; NLL ref {row['nll_ref']:.4f} dNLL {row['dnll']:+.5f}; logits identical {row['identical']}")
-        layers = compare_selection(da, ma, db, mb, name)
         if layers is not None:
             sel_seen = True
             slots, sd, idd = (sum(x[k] for x in layers) for k in ("slots", "slot_diff", "id_diff"))
@@ -891,6 +896,22 @@ def compare(a):
             if first is not None:
                 print(f"{name}: differing slots per layer: {' '.join(str(x['slot_diff']) for x in layers)}")
         report["prompts"][name] = row
+    if nonfinite:
+        # The failure applies only to valid paired evidence, including any control captures.
+        from gate_v2 import GateError as GateV2Error, null_moved
+        for name in names:
+            rs = [compare_logits(da, ma, dn, mn, name, tok_of[name]) for dn, mn in nulls]
+            if v2:
+                try:
+                    null_moved(name, [float(r["kl"].mean()) for r in rs])
+                except GateV2Error as e:
+                    raise GateError(str(e)) from e
+        report["pooled"] = {"state": "FAIL", "pass": False, "checks": {"candidate_finite": False},
+                            "nonfinite_candidate": nonfinite, "rule": "v2" if v2 else "v1"}
+        print(f"POOLED -> FAIL nonfinite candidate logits: {', '.join(nonfinite)}")
+        if a.json:
+            pathlib.Path(a.json).write_text(json.dumps(report, indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
+        return 1
     kl = float(np.concatenate(pooled["kl"]).mean())
     top1 = float(np.concatenate(pooled["agree"]).mean())
     dnll = float(np.concatenate(pooled["nll_cand"]).mean() - np.concatenate(pooled["nll_ref"]).mean())
@@ -1242,6 +1263,7 @@ def main(argv=None):
     s.add_argument("--attest", action="append", metavar="KEY=VALUE", help="sel_mode=N must equal the selection dump's mode")
     s.add_argument("--execution-witness", metavar="JSON", help="launcher/engine execution evidence; required on every floor arm")
     s.add_argument("--select", action="store_true", help="selection dumps are required")
+    s.add_argument("--capture-nonfinite", action="store_true", help="seal nonfinite logits as FAST candidate failure evidence")
     s.add_argument("--not-before", type=float, help="unix time the run started: older dumps are stale")
     s.add_argument("--model-sha", metavar="SHA", help="weights/pack sha recorded in the seal (checked by compare --mode turbo)")
     w = sub.add_parser("witness")
@@ -1254,6 +1276,7 @@ def main(argv=None):
     w.add_argument("--prompt", action="append", metavar="NAME=TOKENS.u32")
     w.add_argument("--attest", action="append", metavar="KEY=VALUE", help="sel_mode=N must equal the selection dump's mode")
     w.add_argument("--select", action="store_true", help="selection dumps are required")
+    w.add_argument("--capture-nonfinite", action="store_true", help="witness nonfinite logits as FAST candidate failure evidence")
     w.add_argument("--not-before", type=float, help="unix time the run started: older dumps are stale")
     w.add_argument("--engine", required=True, choices=sorted(WITNESS_ADAPTERS))
     w.add_argument("--engine-log", required=True, help="the rank's complete engine stdout + stderr")
@@ -1279,7 +1302,7 @@ def main(argv=None):
                    help="v2: FAST gate v2 (gate_v2.py): per prompt KL <= max(0.02, 1.5 x --null-arm KL), top-1 and dNLL "
                         "per prompt and pooled, >= 800 rows, dNLL se; needs >= 1 --null-arm")
     c.add_argument("--route-flips", action="append", metavar="PROMPT=REF,CAND_FREE,NULL_FREE",
-                   help="v2, MoE engines: strix-route-file/v1 records of one prompt (R1 flip ratio <= 1.5); one per prompt")
+                   help="retired route-only input; use gate_v2.py qual for MoE qualification")
     c.add_argument("--json")
     c.add_argument("--mode", choices=("fast", "turbo"), default="fast",
                    help="fast (default): absolute bar; turbo: T's loss vs E must not exceed the reference pack R's")

@@ -142,6 +142,10 @@ dump and otherwise writes `manifest-r<rank>.json`: run id, arm, rank, binary sha
 launch environment, each prompt's token-file sha256 and each dump's size, sha256 and width.
 `--attest sel_mode=N` must equal the mode the engine itself wrote into its selection dump, so an
 arm whose switch was not applied cannot be sealed under the wrong name.
+For a FAST candidate failure capture, `seal --capture-nonfinite` (and `witness --capture-nonfinite`
+if a witness is used) retains the original hashes and complete dumps. `compare` returns FAIL and
+includes `pooled.nonfinite_candidate` with `--json`. Nonfinite reference or null logits still give
+no verdict. Use the v2 quality gate for promotion; v1 is retained to reproduce historical audits.
 
 `compare` re-hashes every dump against its manifest, requires different run ids for the two
 arms and the same prompts, rows and vocabulary slices, then prints per prompt and pooled
@@ -366,7 +370,7 @@ It changes what they are measured on:
 |---|---|
 | R1 route replay (MoE engines) | The lever arm replays the reference's expert ids and weights at every router call, so KL, top-1 and dNLL measure arithmetic, not route flips. Separately, the route flip rate of the lever running free (its own routes) is divided by the flip rate of the null arm running free. That ratio must be <= 1.5. |
 | R2 null-relative window KL | For each window, the KL limit is max(0.02, 1.5 x the null arm's KL on that same window). The null is a one-ulp perturbation, measured under the same replay as the lever. The pooled limits follow the null floor below. Top-1 and dNLL limits stay absolute per window. |
-| R3 held-out dNLL | dNLL is scored on token ids that neither arm generated: the recorded continuation of the text. The gate refuses labels that all equal an arm's own top-1. At least 800 scored rows are needed pooled, and the standard error is printed. |
+| R3 held-out dNLL | dNLL is scored on token ids that neither arm generated: the recorded continuation of the text. The gate refuses a window of at least 32 rows, or a pooled set of at least 32 scored rows, if all of its labels equal an arm's own top-1. At least 800 scored rows are needed pooled, and the standard error is printed. |
 
 | R2b three states per window | Top-1 and dNLL pass at the limit (disagreement <= L = max(0.07, 1.5 x the null's disagreement); dNLL <= 0.01), fail above the limit plus 2 standard errors of the window's rows (dNLL se at most 1.5 x the null's se on that window) and are UNRESOLVED in between. An unresolved window is cleared only by its content class (`--classes C.json`, declared before scoring; default the prompt-length band with a manifest, else one class): the class rows are pooled and judged by the same rule, final on >= 800 rows. |
 | R4 reference check | A window where the lever beats the exact reference by more than 3 se, while the paired lever-minus-null difference is also below -3 se, is "reference suspect" (the window test uses the raw row se, not the capped se of the pooled bars: a window whose gap lies between 3 x the capped se and 3 x the raw se passes the window check, and the final-class HOLD covers it). A window whose reference NLL is above max(3 x median, median + 2 nats) of the set (>= 3 windows) is "off-distribution": control or chat-template ids, or a timing prompt used as a gate window. Either holds the verdict. |
@@ -416,7 +420,8 @@ Then it prints the pooled line.
 
 **Engine side (shared route tap).** A MoE backend binds `include/strix/moe/route_file.hpp` in one place, right after
 its router writes the selected ids and weights. Three environment switches drive it:
-- `STRIX_MOE_ROUTES_OUT=FILE` records each router call.
+- `STRIX_MOE_ROUTES_OUT=FILE` records each free-running call as consumed by the experts, including any null nudge.
+  A replay arm with recording enabled captures its local routes before replay.
 - `STRIX_MOE_ROUTES_IN=FILE` replays the calls. The layer, row count and top-k of every call must match the record,
   otherwise the run stops with an error.
 - `STRIX_MOE_ROUTE_NULL=LAYER:SEED` is the one-ulp null. Every selected weight of that layer moves by one FP32 ulp, up
@@ -434,13 +439,18 @@ that runs a prompt list calls `route_tap_sequence(i)` before prompt `i`. Each pr
 counters and its own receipt line, exactly as if it ran in its own process. One model load then serves every window of
 an arm. The gate files each receipt line under its window by the path it names. Without `{seq}` nothing changes.
 
+For a route-tapped engine, `qual` scores the replayed and free-running logits separately on the same held-out
+history. For each, it applies the tier's pooled, window and class checks against the corresponding null control.
+Both must pass, and the free-running expert ID flip ratio must pass. Maximum and RMS weight deltas are reported
+for matching experts. Use the free-running verdict to decide the effect of weight drift on model outputs.
+Capture logits for both free arms. A non-finite free-running candidate logit or route weight fails qualification.
+
 ```sh
 # option_qual runner output (arms: REF {"routes":{"out":true}}, NULL {"routes":{"in":"REF"},
 #   "env":{"STRIX_MOE_ROUTE_NULL":"0:1"}}, FAST {"routes":{"in":"REF"}}, FASTF / NULLF {"routes":{"out":true}})
 python tools/strix-gate/gate_v2.py qual OUT --ref REF --cand FAST --null NULL --cand-free FASTF --null-free NULLF
-# sealed strix-fast-dump arms
-python tools/strix-gate/fast_logit_gate.py compare REF CAND --ranks 0 --tokens p=p.u32 --rule v2 --null-arm NULL \
-    [--route-flips p=ref.rte,cand_free.rte,null_free.rte]
+# sealed strix-fast-dump arms for a dense run
+python tools/strix-gate/fast_logit_gate.py compare REF CAND --ranks 0 --tokens p=p.u32 --rule v2 --null-arm NULL
 ```
 
 Qwen HIP kit: `scripts/bench/qwen/fast-gate-v2.sh` (one model load per GPU ticket, resumable; arms in
@@ -449,7 +459,7 @@ Qwen HIP kit: `scripts/bench/qwen/fast-gate-v2.sh` (one model load per GPU ticke
 **Prefill head dumps and engines without a route tap.** A prefill quality tool that writes the logits of a prompt's
 last rows (`<case>-<arm>.f32`, rows x vocabulary FP32, no header) is read with `--format head`. The manifest
 (`NAME TOKENS IDS_PATH` per row) gives the prompt IDs. Row `j` of a dump is scored against the prompt ID that follows it,
-so the labels are held-out text; the last row has no label and is not scored, which leaves 63 scored rows per window of
+so the labels are held-out text; the last row is checked for finiteness and has no label, which leaves 63 scored rows per window of
 64. An engine that has not bound the route tap runs every arm free. KL, top-1 and dNLL then include the route flips,
 which is a harder test than replay. The R1 flip ratio comes from the engine's per-layer trace lines
 (`{"diag":1,"case":...,"arm":...,"layers":[{"router_ids":N,...}]}`, `--trace-diag LOG`). `router_ids` counts the
@@ -466,6 +476,33 @@ A missing or malformed arm file is a defect of the evidence (exit 2, no verdict)
 
 A lever that passes v2 and has a measured speed gain is qualified per prompt-length regime (the profile table's
 `fast_regimes` rows) and runs under `--profile fast`.
+
+`qual --null-control-witness WITNESS.json` checks an explicit launcher record against the bytes consumed by the gate.
+The document is `{"schema":"strix-gate-null-witness/v1","cases":{CASE:{ARM:RECORD}}}` and covers the reference
+and every null arm for every scored case. Each record carries `binary_sha256`, `model_sha256`,
+`numerical_config_sha256`, `logits_sha256`, and `control`. The binary, model and configuration excluding the control
+must match the exact reference. Its control is JSON null. A null control has the engine's versioned `order` and positive
+integer `applications`. For head captures also bind `head_ids_sha256` to the SHA-256 of the full prompt's little-endian
+uint32 IDs. Step and spool captures include their labels in the hashed logit file. The launcher must collect these facts
+from the executed arms. The checker validates the binding of that record to the inputs. Disabling the check permits
+historical fixtures with no launcher record.
+
+For preregistered qualification, `qual --frozen-qualification PLAN.json SHA256` pins the complete case set, content
+classes, IDs and class-specific R4 reference distribution. Publish the SHA-256 before collecting the candidate.
+The plan has `schema` equal to `strix-gate-frozen-qualification/v1`, a `windows` map from case to
+`{"class": CLASS, "ids_sha256": DIGEST}`, and a `reference_nll` map from class to at least three previous reference-only
+window NLLs. Hash little-endian uint32 IDs in order: the full prompt for head captures, the scored labels for step and
+spool captures. The gate validates those IDs against the consumed evidence and reports the pinned digest and bars.
+A window above its frozen class bar holds the verdict even with only one window in the new run. The ordinary
+reference checks still apply.
+The plan may also declare a `null_envelope` of `max_kl`, `min_top1` and `max_abs_dnll`. It requires
+`--null-control-witness` and applies to every null in every window before the gate averages the controls, even
+when `--allow-null-floor` is enabled. A control outside the approved envelope invalidates the evidence. The plan
+sets these bounds before candidate scoring for its own regime.
+`--document-uncertainty` additionally reports the cluster standard error for pooled dNLL. Supply a `document`
+identifier for every planned window and reuse it for windows from the same source document. The report assumes
+independent documents, weights by scored rows, and shows an unavailable cluster SE when there is only one document.
+The diagnostic leaves the verdict's row-based rule in effect.
 
 `qual --r4-assess ORIGINAL_NLLS.json`, with `--classes` and `--manifest`, adds an **R4 DIAGNOSTIC ONLY** report on
 stderr after the ordinary verdict. Supply one original reference mean NLL per window, grouped by content class (for

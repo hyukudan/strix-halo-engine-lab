@@ -3,7 +3,7 @@
 #include "strix/model_contract.hpp"
 #include "strix/session_snapshot.hpp"
 #include "strix/session_state_layout.hpp"
-#include "strix/speculation_rng.hpp"
+#include "strix/speculation_sampling.hpp"
 
 #include <cstdint>
 #include <span>
@@ -39,6 +39,7 @@ struct SampledSpeculationFinalizeRequest {
     SpeculationRngIdentity rng;
     std::uint32_t token_budget = 1;
     std::span<const std::uint32_t> eos_tokens;
+    SpeculationProbabilityIdentity probability_identity = SpeculationProbabilityIdentity::legacy;
 };
 
 struct SampledSpeculationCyclePlan {

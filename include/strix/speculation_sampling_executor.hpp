@@ -40,6 +40,7 @@ struct SampledSpeculationExecutionRequest {
     std::uint32_t token_budget = 1;
     std::span<const std::uint32_t> eos_tokens;
     std::uint64_t snapshot_alignment = 64;
+    SpeculationProbabilityIdentity probability_identity = SpeculationProbabilityIdentity::legacy;
 };
 
 struct SampledSpeculationExecutionResult {

@@ -4,16 +4,39 @@
 #include "strix/token_sampling.hpp"
 
 #include <algorithm>
+#include <cfenv>
+#include <cfloat>
 #include <cmath>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace strix {
 namespace {
 
+bool use_binary64(SpeculationProbabilityIdentity identity) {
+    switch (identity) {
+    case SpeculationProbabilityIdentity::legacy:
+        return false;
+    case SpeculationProbabilityIdentity::binary64_v1: {
+        if (!std::numeric_limits<double>::is_iec559 || FLT_EVAL_METHOD != 0 || std::fegetround() != FE_TONEAREST) {
+            throw std::invalid_argument("binary64-v1 speculation requires binary64 round-to-nearest-even");
+        }
+        const volatile double tiny = std::numeric_limits<double>::denorm_min();
+        const volatile double two = 2.0;
+        if (tiny * two == 0.0) {
+            throw std::invalid_argument("binary64-v1 speculation requires gradual subnormals");
+        }
+        return true;
+    }
+    }
+    throw std::invalid_argument("unknown speculation probability identity");
+}
+
+template <typename Float>
 std::vector<double> normalize(
     std::span<const double> probabilities,
     const char* name) {
@@ -23,7 +46,8 @@ std::vector<double> normalize(
             " distribution must be non-empty");
     }
 
-    long double mass = 0.0L;
+    Float mass = 0;
+    [[maybe_unused]] double lost = 0.0;
     for (const auto value : probabilities) {
         if (!std::isfinite(value) ||
             value < 0.0) {
@@ -31,9 +55,15 @@ std::vector<double> normalize(
                 std::string(name) +
                 " distribution must contain finite non-negative probabilities");
         }
-        mass +=
-            static_cast<long double>(
-                value);
+        if constexpr (std::is_same_v<Float, double>) {
+            // Kahan summation in token order, using binary64 for every operation.
+            const double adjusted = value - lost;
+            const double updated = mass + adjusted;
+            lost = (updated - mass) - adjusted;
+            mass = updated;
+        } else {
+            mass += static_cast<Float>(value);
+        }
     }
 
     if (!(mass > 0.0L) ||
@@ -50,11 +80,13 @@ std::vector<double> normalize(
     for (const auto value : probabilities) {
         result.push_back(
             static_cast<double>(
-                static_cast<long double>(
-                    value) /
-                mass));
+                static_cast<Float>(value) / mass));
     }
     return result;
+}
+
+std::vector<double> normalize(std::span<const double> probabilities, const char* name, bool binary64) {
+    return binary64 ? normalize<double>(probabilities, name) : normalize<long double>(probabilities, name);
 }
 
 std::vector<std::uint32_t> dense_token_ids(std::size_t size) {
@@ -72,9 +104,11 @@ std::uint32_t sample_speculation_target_token(
     std::span<const double> target_probabilities,
     const SpeculationRngIdentity& rng,
     std::uint64_t absolute_position,
-    std::uint32_t draw_index) {
+    std::uint32_t draw_index,
+    SpeculationProbabilityIdentity probability_identity) {
     const auto ids = dense_token_ids(target_probabilities.size());
-    const auto target = make_token_distribution_from_probabilities(ids, normalize(target_probabilities, "target"));
+    const auto probabilities = normalize(target_probabilities, "target", use_binary64(probability_identity));
+    const auto target = make_token_distribution_from_probabilities(ids, probabilities);
     const auto uniform = speculation_uniform01(rng, absolute_position,
         SpeculationRandomDrawClass::serial_target, draw_index);
     return decide_token(target, nullptr, uniform, 0.0, 0.0).token;
@@ -96,8 +130,9 @@ verify_speculative_sample(
     }
 
     const auto ids = dense_token_ids(request.target_probabilities.size());
-    const auto target = normalize(request.target_probabilities, "target");
-    const auto draft = normalize(request.draft_probabilities, "draft");
+    const bool binary64 = use_binary64(request.probability_identity);
+    const auto target = normalize(request.target_probabilities, "target", binary64);
+    const auto draft = normalize(request.draft_probabilities, "draft", binary64);
     const auto target_distribution = make_token_distribution_from_probabilities(ids, target);
     const TokenDraft proposal{request.absolute_position, request.draft_token,
         make_token_distribution_from_probabilities(ids, draft), {}};
@@ -118,7 +153,8 @@ verify_speculative_sample(
     result.used_residual = decision.residual;
     result.token = decision.token;
     if (decision.residual) {
-        result.residual_mass = detail::rejected_target_mass(target_distribution, proposal.distribution);
+        result.residual_mass = binary64 ? detail::binary64_rejected_target_mass(target_distribution, proposal.distribution)
+                                        : detail::rejected_target_mass(target_distribution, proposal.distribution);
         result.residual_uniform = residual_uniform;
     }
     return result;

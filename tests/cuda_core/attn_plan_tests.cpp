@@ -1,5 +1,7 @@
 #include "attn_core/decode_plan.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -13,9 +15,39 @@ void check(bool ok, const char* message) {
     std::fprintf(stderr, "k4c plan FAIL: %s\n", message);
     std::exit(EXIT_FAILURE);
 }
+
+void check_fp8_tail() {
+    namespace fp8 = strix::attn::fp8;
+    // One constant component of V with all QK scores zero. The only live
+    // lane in the last tile is key 64. Invalid lanes may even be absent.
+    std::array<float, 64> scales{}, values{};
+    scales[0] = 0.5F;
+    values[0] = 2.0F;
+    const auto score = [&](unsigned keys, unsigned causal_end) {
+        const auto live = fp8::live_tile_keys(64U, keys);
+        const auto visible = fp8::live_tile_keys(64U, std::min(keys, causal_end));
+        float sum = 0.0F, vmax = 0.0F;
+        for (unsigned k = 0; k < live; ++k) vmax = std::max(vmax, scales.at(k));
+        for (unsigned k = 0; k < visible; ++k) sum += values.at(k) * scales.at(k);
+        return std::array{sum, vmax};
+    };
+    const auto zero_tail = score(65U, 65U);
+    std::fill(scales.begin() + 1, scales.end(), 1.0e30F);
+    std::fill(values.begin() + 1, values.end(), 448.0F);
+    check(score(65U, 65U) == zero_tail, "stale finite FP8 padding cannot influence V scale or PV");
+    std::fill(scales.begin() + 1, scales.end(), std::numeric_limits<float>::infinity());
+    std::fill(values.begin() + 1, values.end(), std::numeric_limits<float>::quiet_NaN());
+    check(zero_tail == std::array{1.0F, 0.5F} && score(65U, 65U) == zero_tail,
+          "poisoned FP8 padding must be excluded before multiplication");
+    check(score(65U, 64U)[0] == 0.0F, "query before the tile contributes no PV");
+    check(fp8::live_tile_keys(0U, 65U) == 64U && fp8::live_tile_keys(128U, 65U) == 0U &&
+              fp8::live_tile_keys(0xfffffffeU, 0xffffffffU) == 1U,
+          "live lane count handles whole, empty and maximum-index tiles");
+}
 }  // namespace
 
 int main() {
+    check_fp8_tail();
     attn::DecodeSpec prepared{128, 24, 8, 1, 8191, 1024, 1024, 1024, 0.08838834764831844F,
         attn::DecodeOrder::online_bf16, attn::KvLayout::ring, attn::OutputGate::sigmoid_bf16, true};
     auto plan = attn::make_decode_plan(prepared, kNativeSplitHeadDim);

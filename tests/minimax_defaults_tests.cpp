@@ -683,6 +683,10 @@ void test_apply() {
 // resolves once; its cache identity is minimax-turbo-v1 even with every row off; the timing session moved to
 // --timing-profile with the old spelling kept; an unhonoured weight request is visible and refused.
 void test_turbo_product_profile() {
+    const EnvMap inherited_fast{{md::kProductProfileEnv, "fast"}};
+    const auto kv = md::rank_kv_resolution({}, lookup(inherited_fast));
+    check(kv.tier == strix::profile::Name::fast && kv.precision == md::kKvCaps.native && !kv.changes_output(),
+          "rank KV receipt uses the inherited product tier while keeping native storage");
     const EnvMap plain, turbo{{md::kProductProfileEnv, "turbo"}};
     const auto pr = md::profile_resolution(lookup(turbo));
     check(pr.is_turbo() && pr.versioned() == "minimax-turbo-v1", "turbo: versioned name");

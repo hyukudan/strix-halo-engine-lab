@@ -89,11 +89,16 @@ std::uint64_t token_sampling_policy_identity(const TokenSamplingPolicy& policy) 
     validate_token_sampling_policy(policy);
     std::uint64_t hash=14695981039346656037ULL;
     auto mix=[&](std::uint64_t value){for(unsigned s=0;s<64;s+=8){hash^=(value>>s)&0xffU;hash*=1099511628211ULL;}};
-    mix(1U); // transform revision: sampling-v1
-    mix(std::bit_cast<std::uint32_t>(policy.temperature));
+    const bool canonical_zero = policy.identity == SamplingPolicyIdentity::canonical_zero_v2;
+    const auto float_bits = [canonical_zero](float value) {
+        const auto bits = std::bit_cast<std::uint32_t>(value);
+        return canonical_zero && bits == 0x80000000U ? 0U : bits;
+    };
+    mix(canonical_zero ? 2U : 1U);
+    mix(float_bits(policy.temperature));
     mix(policy.top_k);
     mix(std::bit_cast<std::uint32_t>(policy.top_p));
-    mix(std::bit_cast<std::uint32_t>(policy.min_p));
+    mix(float_bits(policy.min_p));
     return hash?hash:1U;
 }
 

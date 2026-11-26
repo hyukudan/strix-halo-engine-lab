@@ -1,5 +1,35 @@
 # Optimizations
 
+<a id="platform-fast-capture-nonfinite"></a>
+### FAST candidate failure capture
+
+`fast_logit_gate.py seal --capture-nonfinite` retains sealed candidate logits so that a valid paired FAST comparison records a nonfinite candidate as FAIL. Add the same switch to `witness` if needed. Omit the switch to refuse nonfinite dumps at sealing. This host-only qualification option changes no engine arithmetic or defaults.
+
+<a id="platform-fast-null-control-witness"></a>
+### FAST null control evidence
+
+`gate_v2.py qual --null-control-witness WITNESS.json` checks that the launcher recorded the same binary, model and numerical configuration for the reference and each order-only null. It binds the control to the consumed logits and, for head dumps, to the full prompt IDs. This explicit gate option requires launcher evidence and preserves engine defaults.
+
+<a id="platform-fast-frozen-qualification"></a>
+### Preregistered FAST gate evidence
+
+`gate_v2.py qual --frozen-qualification PLAN.json SHA256` binds the scored case set, content classes and token IDs to a published digest. It evaluates each reference against the plan's historical NLL distribution for that class, including when the new batch has fewer than three windows. The plan can also require a numerical envelope for each witnessed null before it can relax acceptance limits. This host gate option preserves engine defaults.
+
+<a id="platform-fast-document-uncertainty"></a>
+### Document-cluster dNLL uncertainty
+
+`gate_v2.py qual --document-uncertainty` reports an additional pooled dNLL standard error from independent documents declared in the frozen plan. This option is diagnostic and preserves the gate's row-based verdict.
+
+<a id="platform-fp8-tail-guard"></a>
+### FP8 attention tail guard
+
+The shared `live_tile_keys` guard bounds valid positions before reading an aligned E4M3 shadow tile. Its host oracle covers stale finite scales and nonfinite tail bytes. Device conformance and binding to the launched attention paths are pending.
+
+<a id="platform-numerical-identity-options"></a>
+### KV and numeric identity options
+
+The shared resolver offers explicit `ExactOverride::require_native`. The active MiniMax rank receipt reports the resolved product tier and uses native KV. `SamplingPolicyIdentity::canonical_zero_v2` normalizes both signs of zero when hashing a policy. `NanMode::quiet` exposes quiet signaling-NaN decoding for formats that choose that policy. These API options require a binding and a versioned identity before use in a product.
+
 <a id="ds41-single-attention-read-ahead"></a>
 ### Single DeepSeek attention read-ahead
 
@@ -6702,3 +6732,35 @@ In a drafting run the speculator's one-row steps run on the CUDA step program ov
 | Inkling 2 Mini | bound: CUDA CLI (this row) |
 | Hy4 Flash | not bound: no CUDA step program with drafter taps next to a verifying route |
 | Nemotron 3.5 Bolt E4B | not bound: no CUDA step program with drafter taps next to a verifying route |
+
+<a id="speculation-probability-binary64-v1"></a>
+
+### Sampled speculation probability identity binary64-v1
+
+The shared sampled-cycle API accepts `SpeculationProbabilityIdentity::binary64_v1`
+for supplied probability rows. It uses a binary64 compensated total in token ID
+order, nearest-even division, the existing binary64 token decision and residual
+sums in token order. Admission requires IEEE binary64 evaluation, nearest-even
+rounding and gradual subnormals. The counter-key inputs and draws are the caller's.
+The identity is opt-in. Calls with `SpeculationProbabilityIdentity::legacy` keep the
+platform's long-double normalization and receipt arithmetic. The binary64 golden
+covers a target bonus on a cumulative boundary, a halfway normalization and a
+rejected proposal that consumes a residual draw. No latency measurement is available.
+
+<a id="device-sampling-boundaries"></a>
+
+### Device sampling-v1 boundaries
+
+The device bit key ranks positive zero above negative zero. For an exact signed-zero
+tie, the host transform picks the smaller token ID. With more than 2,048 kept
+entries, the device's unfiltered inverse CDF compares a scaled draw against raw
+weights in a fixed parallel order. The device's large top-p uses fixed-point
+mass quantiles. The host sums normalized entries sequentially. These forms can
+select adjacent tokens even when the exponential weights are exact. The shared
+device test executable accepts `--boundary-audit-only` for signed zeros and
+draws around 0.5 in both large-row forms.
+
+Select `STRIX_SAMPLE_PATH=host` on the shared sampling-v1 route to use the host
+transform for target and draft. The device draft vocabulary API accepts append-only
+entry IDs. A different vocabulary with the same number of entries requires a new
+sampler.

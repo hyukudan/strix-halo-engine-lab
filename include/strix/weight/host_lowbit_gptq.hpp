@@ -282,16 +282,7 @@ inline EncodeStatus encode_rows_with(const Codec& codec, const float* w, std::si
             for (std::size_t r = 0; r < rn; ++r) {
                 float* row = rows.data() + r * k;
                 auto& st = states[r * Codec::groups + group];
-                if (!std::isfinite(row[i])) {
-                    statuses[b] = EncodeStatus::nonfinite;
-                    return;
-                }
                 if (in_block % Codec::group == 0U) {
-                    if (opt.factor && std::any_of(row + i, row + i + Codec::group,
-                                                  [](float value) { return !std::isfinite(value); })) {
-                        statuses[b] = EncodeStatus::nonfinite;
-                        return;
-                    }
                     statuses[b] = codec.begin(row + i, opt.importance ? opt.importance + i : nullptr, st);
                     if (statuses[b] != EncodeStatus::ok) return;
                 }
@@ -313,7 +304,13 @@ inline EncodeStatus encode_rows_with(const Codec& codec, const float* w, std::si
             for (std::size_t r = 0; r < rn; ++r) {
                 const float e = err[r];
                 float* row = rows.data() + r * k;
-                for (std::size_t j = i + 1U; j < k; ++j) row[j] -= e * ui[j];
+                for (std::size_t j = i + 1U; j < k; ++j) {
+                    row[j] -= e * ui[j];
+                    if (!std::isfinite(row[j])) {
+                        statuses[b] = EncodeStatus::nonfinite;
+                        return;
+                    }
+                }
             }
         }
     });

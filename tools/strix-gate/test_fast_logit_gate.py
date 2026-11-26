@@ -45,7 +45,8 @@ class Case(unittest.TestCase):
             words += [g.SEL_MAGIC, 1, mode, 16, 0, ROWS, 2, 4] + [3] * (ROWS * 2) + ids.ravel().tolist()
         np.array(words, "<u4").tofile(path)
 
-    def arm(self, name, run_id, logits=None, mode=4, swap=False, seal=True, select=True, witness=None, model_sha=None):
+    def arm(self, name, run_id, logits=None, mode=4, swap=False, seal=True, select=True, witness=None, model_sha=None,
+            capture_nonfinite=False):
         d = self.root / name
         d.mkdir()
         z = self.logits if logits is None else logits
@@ -74,6 +75,7 @@ class Case(unittest.TestCase):
                 rc.append(run(["seal", "--dir", str(d), "--rank", str(rank), "--arm", name, "--run-id", run_id, "--binary",
                                str(self.binary), "--rows", str(ROWS), "--prompt", f"p={self.tok}", "--env", "MODE=x",
                                "--attest", f"sel_mode={mode}"] + (["--select"] if select else []) + evidence
+                               + (["--capture-nonfinite"] if capture_nonfinite else [])
                                + (["--model-sha", model_sha] if model_sha else [])))
         return d, rc
 
@@ -137,6 +139,22 @@ class Case(unittest.TestCase):
         self.assertEqual(rc, [2, 0])
 
     # ---- floor-relative dNLL rule (DS41 FAST prefill only)
+    def test_capture_keeps_nonfinite_candidate_as_failure_evidence(self):
+        a, _ = self.arm("A", "r1")
+        bad = self.logits.copy()
+        bad[-1, -1] = np.inf
+        cand, rc = self.arm("C", "r2", bad, capture_nonfinite=True)
+        self.assertEqual(rc, [0, 0])
+        receipt = self.root / "failed.json"
+        self.assertEqual(self.cmp(a, cand, "--json", str(receipt)), 1)
+        p = json.loads(receipt.read_text(encoding="utf-8"))["pooled"]
+        self.assertEqual((p["state"], p["pass"], p["nonfinite_candidate"]), ("FAIL", False, ["p"]))
+        self.assertEqual(self.cmp(cand, a), 2)
+        null, _ = self.arm("N", "r3", bad, capture_nonfinite=True)
+        self.assertEqual(self.cmp(a, cand, "--rule", "v2", "--null-arm", str(null)), 2)
+        moved, _ = self.arm("N1", "r4", self.noisy(0.01, 11))
+        self.assertEqual(self.cmp(a, cand, "--rule", "v2", "--null-arm", str(moved)), 1)
+
     def noisy(self, scale, seed):
         rng = np.random.default_rng(seed)
         return self.logits + rng.normal(scale=scale, size=self.logits.shape).astype("<f4")

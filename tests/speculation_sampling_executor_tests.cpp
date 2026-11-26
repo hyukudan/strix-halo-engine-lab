@@ -324,6 +324,20 @@ int main() try {
 
     {
         Fixture fixture;
+        fixture.session.next_position = 1;
+        fixture.session.committed_tokens = 1;
+        FakeBackend backend;
+        backend.target = {{0x1.e36df62d0e73fp-2, 0x1.0e4904e978c60p-1, 0x1p-53, 0x1p-53}};
+        strix::SampledSpeculationExecutionRequest request;
+        request.rng = {1234, 0x1111ULL, 0x2222ULL};
+        request.probability_identity = strix::SpeculationProbabilityIdentity::binary64_v1;
+        const auto result = strix::execute_sampled_speculation_cycle(fixture.model, fixture.compiled,
+            fixture.resources, fixture.session, request, allocator, generations, transfer, backend);
+        expect(result.plan.emitted_tokens == std::vector<std::uint32_t>{1}, "executor forwards the binary64 identity");
+    }
+
+    {
+        Fixture fixture;
         FakeBackend backend;
         backend.target = {
             {1.0, 0.0},

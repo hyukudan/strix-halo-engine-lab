@@ -113,6 +113,29 @@ int main() {
         again.on_call(1, 1, 2, b2.data(), u2.data());
         check(u2 == u, "null is deterministic per seed");
     }
+    {
+        const auto null_path = temp_file("free-null.rte");
+        std::vector<std::uint32_t> ids = ids1;
+        std::vector<float> weights = w1;
+        {
+            RouteTapConfig c;
+            c.out_path = null_path;
+            strix::moe::parse_route_null("1:7", c);
+            RouteTap tap(c);
+            check(tap.on_call(1, 1, 2, ids.data(), weights.data()), "free null changes the recorded call");
+        }
+        {
+            RouteTapConfig c;
+            c.in_path = null_path;
+            RouteTap tap(c);
+            auto replayed_ids = ids1;
+            auto replayed_weights = w1;
+            tap.on_call(1, 1, 2, replayed_ids.data(), replayed_weights.data());
+            check(replayed_ids == ids && replayed_weights == weights,
+                  "a free null records the weights actually consumed by experts");
+        }
+        std::filesystem::remove(null_path);
+    }
     check(throws([] { RouteTapConfig c; strix::moe::parse_route_null("x:1", c); }), "bad null text refuses");
     check(strix::moe::route_set_diff(ids0.data(), ids0.data(), 2) == 0, "set diff of equal sets");
     {

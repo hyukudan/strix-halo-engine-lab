@@ -4,6 +4,7 @@
 // none is expected over these draws). Drafts are read from pinned host memory or from device memory. Device
 // draft steps over draft-head-like entry lists must give the host's token and distribution.
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -29,9 +30,44 @@ std::vector<float> make_logits(std::mt19937_64& rng, std::uint32_t vocab, float 
     for (unsigned k = 0; k < 64U; ++k) out[pick(rng)] = out[pick(rng)]; // ties
     return out;
 }
+
+void check_boundary_identity() {
+    // A sign-bit key orders +0 above -0 even though the host's numeric tie
+    // goes to the smaller token ID. Keep this fixture as a migration witness.
+    constexpr std::array<float, 2> signed_zeros{-0.0F, 0.0F};
+    constexpr TokenSamplingPolicy top_one{1.0F, 1U, 1.0F, 0.0F, 0U};
+    constexpr double middle = 0.5;
+    bool fallback = false;
+    const auto host_tie = make_token_distribution(signed_zeros, {}, top_one).sample(middle);
+    const auto device_tie = STRIX_TEST_DECIDE(signed_zeros, top_one, nullptr, middle, 0.0, 0.0, &fallback);
+    require(!fallback && host_tie == 0U && device_tie.token == 1U, "signed-zero ordering witness changed");
+
+    // Exact equal weights remove exp implementations from the comparison.
+    // Sequential normalized sums put all three draws in host token 3071.
+    // The device compares unnormalized mass, with a boundary at exactly 3072.
+    const std::array<double, 3> uniforms{std::nextafter(middle, 0.0), middle, std::nextafter(middle, 1.0)};
+    constexpr std::array<std::uint32_t, 3> device_tokens{3071U, 3072U, 3072U};
+    for (const float top_p : {1.0F, 0.75F}) {
+        const TokenSamplingPolicy policy{1.0F, 0U, top_p, 0.0F, 0U};
+        const std::vector<float> logits(top_p < 1.0F ? 8192U : 6144U, 0.0F);
+        const auto host = make_token_distribution(logits, {}, policy);
+        require(host.tokens().size() == 6144U && host.tokens().size() > device_top_p_candidates,
+                "CDF fixture needs 6144 retained tokens through the large-row route");
+        for (std::size_t i = 0; i < uniforms.size(); ++i) {
+            const auto device = STRIX_TEST_DECIDE(logits, policy, nullptr, uniforms[i], 0.0, 0.0, &fallback);
+            require(!fallback && host.sample(uniforms[i]) == 3071U && device.token == device_tokens[i],
+                    "large-row CDF boundary witness changed at draw " + std::to_string(i));
+        }
+    }
+    std::cout << "signed-zero and large-row CDF identity witnesses: PASS\n";
+}
 } // namespace
 
 int main(int argc, char** argv) try {
+    if (argc > 1 && std::string(argv[1]) == "--boundary-audit-only") {
+        check_boundary_identity();
+        return 0;
+    }
     // The second top-p finish can reset a zero-mass residual to an ordinary
     // draw. That draw needs the final quantile/finish pair, even for p == q.
     // The test API accepts an explicit endpoint to force the rejection branch.

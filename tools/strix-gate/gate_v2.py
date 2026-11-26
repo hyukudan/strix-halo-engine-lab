@@ -41,6 +41,7 @@ Exit 0 = PASS, 1 = FAIL, 2 = no verdict (bookkeeping defect, too few rows, label
 """
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import math
@@ -180,16 +181,20 @@ def window_stats(name, kl, agree, nll_ref, nll_cand, null_kls, hit_ref=None, hit
 
 
 def check_held_out(windows):
-    """R3: labels must not be an arm's own greedy ids (both arms agreeing with every label means no held-out text)."""
-    rows = sum(w["dnll_rows"] for w in windows if "label_is_ref_top1" in w)
+    """R3: detect greedy labels in each sufficiently large window and in the pooled set."""
+    measured = [w for w in windows if "label_is_ref_top1" in w]
+    rows = sum(w["dnll_rows"] for w in measured)
     if rows < MIN_LABEL_ROWS:
         return None
-    for key in ("label_is_ref_top1", "label_is_cand_top1"):
-        frac = sum(w[key] * w["dnll_rows"] for w in windows) / rows
-        if frac >= 1.0:
-            raise GateError(f"every label equals the {'reference' if 'ref' in key else 'candidate'}'s top-1: the labels are "
-                            "that arm's greedy ids, not held-out text (R3)")
-    return {k: sum(w[k] * w["dnll_rows"] for w in windows) / rows for k in ("label_is_ref_top1", "label_is_cand_top1")}
+    pooled = {}
+    for arm, key in (("reference", "label_is_ref_top1"), ("candidate", "label_is_cand_top1")):
+        pooled[key] = sum(w[key] * w["dnll_rows"] for w in measured) / rows
+        greedy = next((w for w in measured if w["dnll_rows"] >= MIN_LABEL_ROWS and w[key] == 1.0), None)
+        if greedy is not None or pooled[key] == 1.0:
+            scope = f"{greedy['name']}: " if greedy is not None else ""
+            raise GateError(f"{scope}every label equals the {arm}'s top-1: the labels are that arm's greedy ids, "
+                            "not held-out text (R3)")
+    return pooled
 
 
 def read_routes(path, opener=None):
@@ -202,9 +207,9 @@ def read_routes(path, opener=None):
     while at < len(data):
         if at + 16 > len(data):
             raise GateError(f"{path}: truncated record header")
-        layer, rows, k, _ = np.frombuffer(data, "<u4", 4, at).tolist()
+        layer, rows, k, flags = np.frombuffer(data, "<u4", 4, at).tolist()
         n = rows * k
-        if k == 0 or k > 64 or at + 16 + 8 * n > len(data):
+        if rows == 0 or k == 0 or k > 64 or flags != 0 or at + 16 + 8 * n > len(data):
             raise GateError(f"{path}: corrupt or truncated record {len(out)}")
         ids = np.frombuffer(data, "<u4", n, at + 16).reshape(rows, k)
         w = np.frombuffer(data, "<f4", n, at + 16 + 4 * n).reshape(rows, k)
@@ -216,29 +221,50 @@ def read_routes(path, opener=None):
 def route_flips(ref_path, arm_path, opener=None):
     """Order-independent ID differences and weight differences on matching experts, for the same call sequence."""
     a, b = read_routes(ref_path, opener), read_routes(arm_path, opener)
+    if not a:
+        raise GateError(f"{ref_path}: no router calls")
     if len(a) != len(b):
         raise GateError(f"{arm_path}: {len(b)} router calls, the reference has {len(a)}")
     per = {}
-    max_weight_delta, rows = 0.0, 0
+    max_weight_delta, sq_weight_delta, matched, rows = 0.0, 0.0, 0, 0
+    finite_weights = True
     for i, ((la, ia, wa), (lb, ib, wb)) in enumerate(zip(a, b)):
         if la != lb or ia.shape != ib.shape:
             raise GateError(f"{arm_path}: call {i} is layer {lb} shape {ib.shape}, the reference has layer {la} shape {ia.shape}")
-        k = ia.shape[1]
-        if not np.isfinite(wa).all() or not np.isfinite(wb).all():
-            raise GateError(f"{arm_path}: non-finite router weight at call {i}")
+        if not np.isfinite(wa).all():
+            raise GateError(f"{ref_path}: non-finite reference router weight at call {i}")
+        finite_weights &= bool(np.isfinite(wb).all())
         missing = 0
-        for x, y, wx, wy in zip(ia, ib, wa, wb):
-            common, ix, iy = np.intersect1d(x, y, return_indices=True)
-            missing += k - common.size
-            if common.size:
-                max_weight_delta = max(max_weight_delta, float(np.abs(wx[ix].astype(np.float64) - wy[iy]).max()))
+        # Bound the temporary rows x top-k x top-k matrix; long prompt
+        # recordings may contain many millions of rows across their layers.
+        for start in range(0, ia.shape[0], 4096):
+            span = slice(start, start + 4096)
+            x, y = ia[span], ib[span]
+            for ids in (x, y):
+                ordered = np.sort(ids, axis=1)
+                if np.any(ordered[:, 1:] == ordered[:, :-1]):
+                    raise GateError(f"{arm_path}: repeated expert ID within a row at call {i}")
+            if np.array_equal(x, y):
+                delta = wa[span].astype(np.float64) - wb[span] if finite_weights else None
+            else:
+                matches = x[:, :, None] == y[:, None, :]
+                present = matches.any(axis=2)
+                missing += present.size - int(present.sum())
+                delta = ((wa[span].astype(np.float64) - np.take_along_axis(wb[span], matches.argmax(axis=2), axis=1))[present]
+                         if finite_weights else None)
+            if delta is not None and delta.size:
+                max_weight_delta = max(max_weight_delta, float(np.abs(delta).max()))
+                sq_weight_delta += float(np.sum(delta * delta))
+                matched += delta.size
         s = per.setdefault(int(la), [0, 0])
         s[0] += ia.size
         s[1] += missing
         rows += ia.shape[0]
     slots, ids = sum(v[0] for v in per.values()), sum(v[1] for v in per.values())
     return {"slots": slots, "ids": ids, "rate": ids / slots if slots else 0.0, "per_layer": per,
-            "records": len(a), "rows": rows, "max_abs_weight_delta": max_weight_delta}
+            "records": len(a), "rows": rows, "finite_weights": finite_weights,
+            "max_abs_weight_delta": max_weight_delta if finite_weights else None,
+            "rms_weight_delta": (math.sqrt(sq_weight_delta / matched) if matched else 0.0) if finite_weights else None}
 
 
 def flip_ratio(cand, null):
@@ -288,7 +314,7 @@ def check_free_record(receipt, path, counts, what, null=False):
         raise GateError(f"{what}: no applied null control in the free-running route receipt")
 
 
-def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False):
+def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False, frozen_bars=None):
     """Pooled + per-window verdict. windows: window_stats dicts with their per-row arrays under '_rows'."""
     if len({w["name"] for w in windows}) != len(windows):
         raise GateError("duplicate window in pooled evidence")
@@ -312,6 +338,10 @@ def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False):
         if w["state"] == "unresolved":
             w["cleared_by_class"] = w["class"] in final_pass
     pooled["off_distribution"] = off_distribution(windows, limits)
+    if frozen_bars is not None:
+        outliers = {w["name"] for w in windows if w["ref_nll"] > frozen_bars[w["class"]]}
+        outliers.update(pooled["off_distribution"])
+        pooled["off_distribution"] = [w["name"] for w in windows if w["name"] in outliers]
     pooled["reference_suspect"] = [w["name"] for w in windows if w["reference_suspect"]]
     suspect_classes = [c["name"] for c in pooled["classes"] if c["final"] and c["reference_suspect"]]
     if suspect_classes:
@@ -438,9 +468,10 @@ def window_line(w, flips=None, limits=LIMITS):
     if flips:
         fl = (f"; flips free cand {flips['cand']['rate']:.3e} null {flips['null']['rate']:.3e} ratio "
               f"{flip_ratio(flips['cand'], flips['null']):.2f}")
-        if "max_abs_weight_delta" in flips["cand"]:
+        if flips["cand"].get("max_abs_weight_delta") is not None:
             fl += (f"; max matched route weight delta cand {flips['cand']['max_abs_weight_delta']:.3e} "
-                   f"null {flips['null']['max_abs_weight_delta']:.3e}")
+                   f"null {flips['null']['max_abs_weight_delta']:.3e}; RMS cand {flips['cand']['rms_weight_delta']:.3e} "
+                   f"null {flips['null']['rms_weight_delta']:.3e}")
     nt = f", null {w['null_top1']:.4f}" if "null_top1" in w else ""
     nd = (f"; null dNLL {w['null_dnll']:+.5f} se {w['null_dnll_se']:.5f}" if "null_dnll" in w else "; null dNLL n/a")
     cap = f" (rows se {w['dnll_se_rows']:.5f}, capped 1.5 x null)" if "dnll_se_rows" in w else ""
@@ -560,6 +591,114 @@ def null_moved(name, null_kls):
                             "not a null (re-run it with a step that survives the consumer's input rounding)")
 
 
+def score_window(case, rows, controls, cls, limits):
+    return window_stats(case, rows["kl_rc"], rows["agree"].astype(bool), rows["nll_r"], rows["nll_c"],
+                        [float(x["kl_rc"].mean()) for x in controls], rows["top1_r_is_label"], rows["top1_c_is_label"],
+                        null_top1s=[float(x["agree"].mean()) for x in controls], null_nlls=[x["nll_c"] for x in controls],
+                        cls=cls, null_kl_rows=[x["kl_rc"] for x in controls],
+                        null_top1_rows=[x["agree"] for x in controls], limits=limits)
+
+
+def digest(value):
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def ids_digest(ids):
+    return hashlib.sha256(ids.astype("<u4").tobytes()).hexdigest()
+
+
+def frozen_qualification(plan, cases, classes, limits, opener):
+    path, expected = plan
+    with open(path, "rb", opener=opener) as f:
+        data = f.read(R4_MAX_INPUT_BYTES + 1)
+    if len(data) > R4_MAX_INPUT_BYTES or not digest(expected) or hashlib.sha256(data).hexdigest() != expected:
+        raise GateError("frozen qualification plan exceeds size limit or differs from its expected SHA-256")
+    doc = json.loads(data)
+    if not isinstance(doc, dict) or doc.get("schema") != "strix-gate-frozen-qualification/v1":
+        raise GateError("invalid frozen qualification plan")
+    windows, original = doc.get("windows"), doc.get("reference_nll")
+    if not isinstance(windows, dict) or set(windows) != set(cases):
+        raise GateError("frozen qualification window set differs from the scored cases")
+    if classes is not None and not isinstance(classes, dict):
+        raise GateError("--classes needs a JSON mapping of cases to content classes")
+    for case, win in windows.items():
+        if (not isinstance(win, dict) or not isinstance(win.get("class"), str) or not win["class"].strip()
+                or not digest(win.get("ids_sha256"))):
+            raise GateError(f"{case}: frozen qualification needs an IDs digest and content class")
+        if classes is not None and classes.get(case) != win["class"]:
+            raise GateError(f"{case}: --classes differs from the frozen qualification plan")
+    if not isinstance(original, dict) or set(original) != {win["class"] for win in windows.values()}:
+        raise GateError("frozen qualification reference NLL must cover every content class")
+    bars = {}
+    for cls, values in original.items():
+        if not isinstance(values, list) or len(values) < R4_CLASS_MIN or any(
+                type(nll) not in (int, float) or not 0 <= nll <= sys.float_info.max for nll in values):
+            raise GateError(f"{cls}: frozen qualification needs {R4_CLASS_MIN} or more finite original NLLs")
+        bars[cls] = _r4_class_stats(values, limits)["bar"]
+    envelope = doc.get("null_envelope")
+    if "null_envelope" in doc and (
+            not isinstance(envelope, dict) or set(envelope) != {"max_kl", "min_top1", "max_abs_dnll"}
+            or any(type(v) not in (int, float) or not 0 <= v <= sys.float_info.max for v in envelope.values())
+            or envelope["min_top1"] > 1):
+        raise GateError("frozen null envelope needs finite max_kl, min_top1 in [0, 1], and max_abs_dnll")
+    return windows, bars, envelope
+
+
+def check_null_envelope(case, arms, rows, envelope):
+    """Check each control before the null-relative statistics combine arms or windows."""
+    for arm, control in zip(arms, rows):
+        kl = float(control["kl_rc"].mean())
+        top1 = float(control["agree"].mean())
+        dnll = float((control["nll_c"] - control["nll_r"]).mean())
+        if not (kl <= envelope["max_kl"] and top1 >= envelope["min_top1"] and abs(dnll) <= envelope["max_abs_dnll"]):
+            raise GateError(f"{case}.{arm}: exceeds the frozen null envelope (KL {kl:.6g}, top-1 {top1:.6g}, dNLL {dnll:+.6g})")
+
+
+def document_uncertainty(windows, frozen):
+    """Cluster score standard error for the row-weighted dNLL mean, assuming independent documents."""
+    groups = {}
+    for w in windows:
+        rows = w["_rows"]["dnll"]
+        groups.setdefault(frozen[w["name"]]["document"], []).append(rows)
+    d = np.concatenate([w["_rows"]["dnll"] for w in windows])
+    mean, row_se = mean_se(d)
+    clusters = len(groups)
+    cluster_se = None
+    if clusters > 1:
+        scores = [math.fsum(float(np.sum(rows - mean)) for rows in group) for group in groups.values()]
+        cluster_se = math.sqrt(clusters / (clusters - 1) * math.fsum(s * s for s in scores)) / d.size
+    return {"documents": clusters, "dnll_row_se": row_se if math.isfinite(row_se) else None,
+            "dnll_cluster_se": cluster_se}
+
+
+def verify_null_witness(witness, case, arms, capture_hashes, head_ids):
+    """Bind a launcher's control evidence to the consumed files and exact baseline identity."""
+    records = witness.get(case)
+    if not isinstance(records, dict) or set(records) != set(arms):
+        raise GateError(f"{case}: null witness must cover the reference and every null arm")
+    identity_fields = ("binary_sha256", "model_sha256", "numerical_config_sha256")
+    head_hash = ids_digest(head_ids) if head_ids is not None else None
+    baseline = None
+    for role, (arm, capture_hash) in enumerate(zip(arms, capture_hashes)):
+        rec = records[arm]
+        if not isinstance(rec, dict) or not all(digest(rec.get(k)) for k in (*identity_fields, "logits_sha256")):
+            raise GateError(f"{case}.{arm}: null witness needs SHA-256 identities and a logit digest")
+        if rec["logits_sha256"] != capture_hash or rec.get("head_ids_sha256") != head_hash:
+            raise GateError(f"{case}.{arm}: null witness differs from the consumed capture or head IDs")
+        identity = tuple(rec[k] for k in identity_fields)
+        control = rec.get("control")
+        if role == 0:
+            baseline = identity
+            if "control" not in rec or control is not None:
+                raise GateError(f"{case}.{arm}: null witness reference must run without a control")
+        else:
+            if identity != baseline:
+                raise GateError(f"{case}.{arm}: null witness differs from the reference binary, model or configuration")
+            if (not isinstance(control, dict) or not isinstance(control.get("order"), str) or not control["order"].strip()
+                    or type(control.get("applications")) is not int or control["applications"] <= 0):
+                raise GateError(f"{case}.{arm}: null witness needs an applied order-only control")
+
+
 def qual(a):
     """option_qual adapter: reduce every case's REF vs CAND / NULL logits, check replay receipts, count free flips."""
     out = pathlib.Path(a.out)
@@ -582,6 +721,8 @@ def qual(a):
         return _r4_reduce_pair(reduce_pair, ref, cand, a.format, opener, **kw)
 
     tier = getattr(a, "tier", "fast") or "fast"
+    if len(set([a.ref, a.cand, *a.null])) != 2 + len(a.null):
+        raise GateError("v2 needs distinct reference, candidate and null arms")
     if tier not in TIERS:
         raise GateError(f"unknown tier {tier}; tiers {sorted(TIERS)}")
     limits = TIERS[tier]
@@ -608,36 +749,64 @@ def qual(a):
         cases = sorted(p.name[:-len(f".{a.ref}.bin")] for p in (out / "logits").glob(f"*.{a.ref}.bin"))
     if not cases:
         raise GateError(f"{out} holds no {a.ref} logits")
+    plan = getattr(a, "frozen_qualification", None)
+    frozen_windows, frozen_bars, null_envelope = (
+        frozen_qualification(plan, cases, classes, limits, opener) if plan else ({}, None, None))
+    doc_uncertainty = getattr(a, "document_uncertainty", False)
+    if doc_uncertainty and (not plan or any(not isinstance(w.get("document"), str) or not w["document"].strip()
+                                            for w in frozen_windows.values())):
+        raise GateError("--document-uncertainty needs a frozen qualification plan with a document ID for every window")
+    witness_path = getattr(a, "null_control_witness", None)
+    if null_envelope is not None and not witness_path:
+        raise GateError("a frozen null envelope requires --null-control-witness")
+    witness = None
+    if witness_path:
+        with open(witness_path, encoding="utf-8", opener=opener) as f:
+            doc = json.load(f)
+        if (not isinstance(doc, dict) or doc.get("schema") != "strix-gate-null-witness/v1"
+                or not isinstance(doc.get("cases"), dict) or set(doc["cases"]) != set(cases)):
+            raise GateError("null witness must be a strix-gate-null-witness/v1 record of every scored case")
+        witness = doc["cases"]
     diag = read_trace_diag(a.trace_diag, opener)
     if diag and manifest is None:
         raise GateError("--trace-diag needs --manifest (flip slots = prompt rows x traced layers)")
     windows, flips, replay, traced = [], [], {}, 0
     nonfinite_candidate = []
+    free_windows, nonfinite_free = [], []
     for case in cases:
         if manifest is not None and case not in manifest:
             raise GateError(f"{case}: not in the manifest")
-        kw = {"ids": manifest[case], "rows": a.head_rows} if head else {}
+        kw = {"ids": manifest[case], "rows": a.head_rows, "include_unscored": True} if head else {}
         logit = lambda arm: path_of(case, arm)  # noqa: E731
         route = lambda arm: out / "routes" / f"{case}.{arm}.rte"  # noqa: E731
         def err(arm):
             with open(out / "log" / f"{case}.{arm}.stderr", "rb", opener=opener) as f:
                 return f.read()
 
-        ra, _ = reduce(logit(a.ref), logit(a.cand), **kw)
-        nulls = [reduce(logit(a.ref), logit(n), **kw)[0] for n in a.null]
-        if ra["nonfinite_r"].any():
+        ra, ra_info = reduce(logit(a.ref), logit(a.cand), **kw)
+        frozen = frozen_windows.get(case)
+        if frozen and ids_digest(manifest[case] if head else ra["label"]) != frozen["ids_sha256"]:
+            raise GateError(f"{case}: frozen qualification IDs differ from the scored window")
+        null_pairs = [reduce(logit(a.ref), logit(n), **kw) for n in a.null]
+        nulls = [rows for rows, _ in null_pairs]
+        if witness is not None:
+            ref_sha = ra_info.get("ref_sha256")
+            if any(info.get("ref_sha256") != ref_sha for _, info in null_pairs):
+                raise GateError(f"{case}: reference capture changed while reading controls")
+            capture_hashes = [ref_sha, *(info.get("cand_sha256") for _, info in null_pairs)]
+            verify_null_witness(witness, case, [a.ref, *a.null], capture_hashes, manifest[case] if head else None)
+        if ra["nonfinite_r"].any() or ra_info.get("ref_unscored_nonfinite"):
             raise GateError(f"{case}: non-finite reference logits")
-        if any(x["nonfinite_c"].any() for x in nulls):
+        if any(rows["nonfinite_c"].any() or info.get("cand_unscored_nonfinite") for rows, info in null_pairs):
             raise GateError(f"{case}: non-finite null logits")
         null_moved(case, [float(x["kl_rc"].mean()) for x in nulls])
-        if ra["nonfinite_c"].any():
+        if null_envelope is not None:
+            check_null_envelope(case, a.null, nulls, null_envelope)
+        if ra["nonfinite_c"].any() or ra_info.get("cand_unscored_nonfinite"):
             nonfinite_candidate.append(case)
             continue
-        w = window_stats(case, ra["kl_rc"], ra["agree"].astype(bool), ra["nll_r"], ra["nll_c"],
-                         [float(x["kl_rc"].mean()) for x in nulls], ra["top1_r_is_label"], ra["top1_c_is_label"],
-                         null_top1s=[float(x["agree"].mean()) for x in nulls], null_nlls=[x["nll_c"] for x in nulls],
-                         cls=window_class(case, classes, manifest), null_kl_rows=[x["kl_rc"] for x in nulls],
-                         null_top1_rows=[x["agree"] for x in nulls], limits=limits)
+        cls = frozen["class"] if frozen else window_class(case, classes, manifest)
+        w = score_window(case, ra, nulls, cls, limits)
         ref_route = route(a.ref)
         moe = ref_route.exists()
         f = None
@@ -648,17 +817,40 @@ def qual(a):
                                      for n in a.null]}
             w["replay"] = replay[case]
             if not (a.cand_free and a.null_free):
-                raise GateError(f"{case}: MoE routes present: --cand-free and --null-free arms are required (R1 flip ratio)")
+                raise GateError(f"{case}: MoE routes present: --cand-free and --null-free arms are required")
+            arms = [a.ref, a.cand, *a.null, a.cand_free, a.null_free]
+            if len(set(arms)) != len(arms):
+                raise GateError(f"{case}: replayed and free-running qualification arms must be distinct")
             f = {"cand": route_flips(ref_route, route(a.cand_free), opener),
                  "null": route_flips(ref_route, route(a.null_free), opener)}
             check_free_record(ref_r, ref_route, f["cand"], f"{case}.{a.ref}")
             for key, arm in (("cand", a.cand_free), ("null", a.null_free)):
                 what = f"{case}.{arm}"
                 check_free_record(route_receipt(err(arm), what), route(arm), f[key], what, null=key == "null")
+            fc, fc_info = reduce(logit(a.ref), logit(a.cand_free), **kw)
+            fn, fn_info = reduce(logit(a.ref), logit(a.null_free), **kw)
+            if (fc["nonfinite_r"].any() or fc_info.get("ref_unscored_nonfinite")
+                    or fn["nonfinite_r"].any() or fn_info.get("ref_unscored_nonfinite")):
+                raise GateError(f"{case}: non-finite reference logits")
+            if fn["nonfinite_c"].any() or fn_info.get("cand_unscored_nonfinite") or not f["null"]["finite_weights"]:
+                raise GateError(f"{case}: non-finite free-running null logits or router weights")
+            null_moved(f"{case} free-running", [float(fn["kl_rc"].mean())])
+            if null_envelope is not None:
+                check_null_envelope(case, [a.null_free], [fn], null_envelope)
+            if fc["nonfinite_c"].any() or fc_info.get("cand_unscored_nonfinite") or not f["cand"]["finite_weights"]:
+                nonfinite_free.append(case)
+            else:
+                free = score_window(case, fc, [fn], w["class"], limits)
+                free_windows.append(free)
+                w["free_run"] = {k: v for k, v in free.items() if k != "_rows"}
+                print("  free-running " + window_line(free, limits=limits))
             flips.append(f)
-            w["flips"] = {k: {x: v[x] for x in ("slots", "ids", "rate", "max_abs_weight_delta")} for k, v in f.items()}
+            w["flips"] = {k: {x: v[x] for x in ("slots", "ids", "rate", "max_abs_weight_delta", "rms_weight_delta")}
+                          for k, v in f.items()}
         elif diag:
             # no route tap: every arm ran free, so the flips come from the engine trace of the candidate and the null
+            if len(a.null) > 1 and not a.null_free:
+                raise GateError(f"{case}: --trace-diag with multiple null arms requires an explicit --null-free")
             fc, fn = diag.get((case, a.cand_free or a.cand)), diag.get((case, a.null_free or a.null[0]))
             if (fc is None) != (fn is None):
                 raise GateError(f"{case}: trace of only one of the free-running candidate / null arms (R1 needs both)")
@@ -691,9 +883,35 @@ def qual(a):
              "nonfinite_candidate": nonfinite_candidate}
         print(f"POOLED v2 -> FAIL non-finite candidate logits: {', '.join(nonfinite_candidate)}")
     else:
+        if replay and len(replay) != len(windows):
+            raise GateError("route replay evidence is required for every window of a replayed qualification")
         p = verdict(windows, flips if flips else None, limits=limits,
-                    allow_null_floor=getattr(a, 'allow_null_floor', False))
+                    allow_null_floor=getattr(a, 'allow_null_floor', False), frozen_bars=frozen_bars)
+        if plan:
+            p["frozen_qualification"] = {"sha256": plan[1], "reference_nll_bars": frozen_bars}
+            if null_envelope is not None:
+                p["frozen_qualification"]["null_envelope"] = null_envelope
         print(pooled_line(p, limits))
+        if replay:
+            if nonfinite_free:
+                free_pooled = {"state": "FAIL", "pass": False, "nonfinite_candidate": nonfinite_free}
+                print(f"FREE-RUNNING -> FAIL non-finite candidate logits or router weights: {', '.join(nonfinite_free)}")
+            else:
+                free_pooled = verdict(free_windows, limits=limits,
+                                      allow_null_floor=getattr(a, "allow_null_floor", False), frozen_bars=frozen_bars)
+                print("FREE-RUNNING " + pooled_line(free_pooled, limits))
+            p["free_run"] = free_pooled
+            p["replay_state"] = p["state"]
+            p["checks"]["free_run"] = free_pooled["pass"]
+            for state in ("FAIL", "HOLD", "UNRESOLVED", "PASS"):
+                if state in (p["replay_state"], free_pooled["state"]):
+                    p["state"], p["pass"] = state, state == "PASS"
+                    break
+            print(f"REPLAY + FREE-RUNNING -> {p['state']}")
+        if doc_uncertainty:
+            diagnostic = document_uncertainty(windows, frozen_windows)
+            p["document_uncertainty"] = diagnostic
+            print(f"DNLL DIAGNOSTIC (document clusters) {json.dumps(diagnostic, sort_keys=True)}")
     exit_code = EXIT[p["state"]]
     if a.json:
         doc = {"schema": "strix-fast-gate-v2/v1", "limits": limits, "ref": a.ref, "cand": a.cand, "null": a.null,
@@ -701,6 +919,8 @@ def qual(a):
                "windows": [{k: v for k, v in w.items() if k != "_rows"} for w in windows], "pooled": p}
         if tier != "fast":
             doc["tier"] = tier
+        if replay:
+            doc.update(cand_free=a.cand_free, null_free=a.null_free)
         with open(a.json, "w", encoding="utf-8", opener=opener) as f:
             f.write(json.dumps(doc, indent=1, sort_keys=True, default=str) + "\n")
     stdout = sys.stdout
@@ -984,6 +1204,7 @@ def main(argv=None):
     q.add_argument("--ref", required=True)
     q.add_argument("--cand", required=True)
     q.add_argument("--null", action="append", required=True)
+    q.add_argument("--null-control-witness", metavar="JSON", help="bind captured nulls to the exact baseline and an applied order control")
     q.add_argument("--cand-free")
     q.add_argument("--null-free")
     q.add_argument("--cases", nargs="*")
@@ -994,6 +1215,9 @@ def main(argv=None):
     q.add_argument("--trace-diag", action="append", help="engine log with per-layer trace diag lines (no route tap)")
     q.add_argument("--classes", help="JSON {case: content class} declared before scoring (default: prompt-length band "
                    "with --manifest, else one class)")
+    q.add_argument("--frozen-qualification", nargs=2, metavar=("PLAN", "SHA256"),
+                   help="require the preregistered window IDs, content labels and reference NLL bars")
+    q.add_argument("--document-uncertainty", action="store_true", help="also report dNLL SE for the frozen plan's document clusters")
     q.add_argument("--r4-assess", metavar="ORIGINAL_NLLS", help="diagnostic only on stderr: JSON {content class: "
                    "[original reference NLLs]} (requires --classes and --manifest)")
     q.add_argument("--json")

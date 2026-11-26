@@ -93,11 +93,11 @@ def read_spool(path, hasher=None):
             raise ValueError("trailing bytes after spool footer")
 
 
-def read_head(path, hasher=None, *, ids, rows):
+def read_head(path, hasher=None, *, ids, rows, include_unscored=False):
     """Head dump: ``rows`` x vocab FP32 rows and nothing else, the logits of the last ``rows`` positions of a prompt
     ``ids`` (a prefill quality tool's teacher head). Row ``j`` is position ``n - rows + j`` and is scored against the
     prompt ID ``ids[n - rows + j + 1]`` (held-out text: neither arm generated it); the last row has no label in the
-    prompt, so it is read (and hashed) but not yielded."""
+    prompt, so it is read (and hashed) but yielded with label -1 only when requested for validation."""
     ids = np.asarray(ids, dtype=np.int64).reshape(-1)
     n = int(ids.size)
     if rows < 2 or rows > n:
@@ -114,7 +114,9 @@ def read_head(path, hasher=None, *, ids, rows):
         for j in range(rows - 1):
             logits = np.frombuffer(_exact(f, 4 * vocab, "head logits"), dtype="<f4")
             yield Row(j, first + j, -1, int(ids[first + j + 1]), logits)
-        _exact(f, 4 * vocab, "head last row")
+        tail = _exact(f, 4 * vocab, "head last row")
+        if include_unscored:
+            yield Row(rows - 1, n - 1, -1, -1, np.frombuffer(tail, dtype="<f4"))
         if f.read(1):
             raise ValueError("trailing bytes after the head rows")
 
