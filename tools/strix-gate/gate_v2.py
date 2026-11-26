@@ -41,6 +41,7 @@ Exit 0 = PASS, 1 = FAIL, 2 = no verdict (bookkeeping defect, too few rows, label
 """
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import math
@@ -594,6 +595,38 @@ def score_window(case, rows, controls, cls, limits):
                         null_top1_rows=[x["agree"] for x in controls], limits=limits)
 
 
+def digest(value):
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def verify_null_witness(witness, case, arms, capture_hashes, head_ids):
+    """Bind a launcher's control evidence to the consumed files and exact baseline identity."""
+    records = witness.get(case)
+    if not isinstance(records, dict) or set(records) != set(arms):
+        raise GateError(f"{case}: null witness must cover the reference and every null arm")
+    identity_fields = ("binary_sha256", "model_sha256", "numerical_config_sha256")
+    head_hash = hashlib.sha256(head_ids.astype("<u4").tobytes()).hexdigest() if head_ids is not None else None
+    baseline = None
+    for role, (arm, capture_hash) in enumerate(zip(arms, capture_hashes)):
+        rec = records[arm]
+        if not isinstance(rec, dict) or not all(digest(rec.get(k)) for k in (*identity_fields, "logits_sha256")):
+            raise GateError(f"{case}.{arm}: null witness needs SHA-256 identities and a logit digest")
+        if rec["logits_sha256"] != capture_hash or rec.get("head_ids_sha256") != head_hash:
+            raise GateError(f"{case}.{arm}: null witness differs from the consumed capture or head IDs")
+        identity = tuple(rec[k] for k in identity_fields)
+        control = rec.get("control")
+        if role == 0:
+            baseline = identity
+            if "control" not in rec or control is not None:
+                raise GateError(f"{case}.{arm}: null witness reference must run without a control")
+        else:
+            if identity != baseline:
+                raise GateError(f"{case}.{arm}: null witness differs from the reference binary, model or configuration")
+            if (not isinstance(control, dict) or not isinstance(control.get("order"), str) or not control["order"].strip()
+                    or type(control.get("applications")) is not int or control["applications"] <= 0):
+                raise GateError(f"{case}.{arm}: null witness needs an applied order-only control")
+
+
 def qual(a):
     """option_qual adapter: reduce every case's REF vs CAND / NULL logits, check replay receipts, count free flips."""
     out = pathlib.Path(a.out)
@@ -644,6 +677,15 @@ def qual(a):
         cases = sorted(p.name[:-len(f".{a.ref}.bin")] for p in (out / "logits").glob(f"*.{a.ref}.bin"))
     if not cases:
         raise GateError(f"{out} holds no {a.ref} logits")
+    witness_path = getattr(a, "null_control_witness", None)
+    witness = None
+    if witness_path:
+        with open(witness_path, encoding="utf-8", opener=opener) as f:
+            doc = json.load(f)
+        if (not isinstance(doc, dict) or doc.get("schema") != "strix-gate-null-witness/v1"
+                or not isinstance(doc.get("cases"), dict) or set(doc["cases"]) != set(cases)):
+            raise GateError("null witness must be a strix-gate-null-witness/v1 record of every scored case")
+        witness = doc["cases"]
     diag = read_trace_diag(a.trace_diag, opener)
     if diag and manifest is None:
         raise GateError("--trace-diag needs --manifest (flip slots = prompt rows x traced layers)")
@@ -663,6 +705,12 @@ def qual(a):
         ra, ra_info = reduce(logit(a.ref), logit(a.cand), **kw)
         null_pairs = [reduce(logit(a.ref), logit(n), **kw) for n in a.null]
         nulls = [rows for rows, _ in null_pairs]
+        if witness is not None:
+            ref_sha = ra_info.get("ref_sha256")
+            if any(info.get("ref_sha256") != ref_sha for _, info in null_pairs):
+                raise GateError(f"{case}: reference capture changed while reading controls")
+            capture_hashes = [ref_sha, *(info.get("cand_sha256") for _, info in null_pairs)]
+            verify_null_witness(witness, case, [a.ref, *a.null], capture_hashes, manifest[case] if head else None)
         if ra["nonfinite_r"].any() or ra_info.get("ref_unscored_nonfinite"):
             raise GateError(f"{case}: non-finite reference logits")
         if any(rows["nonfinite_c"].any() or info.get("cand_unscored_nonfinite") for rows, info in null_pairs):
@@ -1058,6 +1106,7 @@ def main(argv=None):
     q.add_argument("--ref", required=True)
     q.add_argument("--cand", required=True)
     q.add_argument("--null", action="append", required=True)
+    q.add_argument("--null-control-witness", metavar="JSON", help="bind captured nulls to the exact baseline and an applied order control")
     q.add_argument("--cand-free")
     q.add_argument("--null-free")
     q.add_argument("--cases", nargs="*")

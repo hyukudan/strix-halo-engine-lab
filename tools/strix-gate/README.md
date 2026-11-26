@@ -477,6 +477,16 @@ A missing or malformed arm file is a defect of the evidence (exit 2, no verdict)
 A lever that passes v2 and has a measured speed gain is qualified per prompt-length regime (the profile table's
 `fast_regimes` rows) and runs under `--profile fast`.
 
+`qual --null-control-witness WITNESS.json` checks an explicit launcher record against the bytes consumed by the gate.
+The document is `{"schema":"strix-gate-null-witness/v1","cases":{CASE:{ARM:RECORD}}}` and covers the reference
+and every null arm for every scored case. Each record carries `binary_sha256`, `model_sha256`,
+`numerical_config_sha256`, `logits_sha256`, and `control`. The binary, model and configuration excluding the control
+must match the exact reference. Its control is JSON null. A null control has the engine's versioned `order` and positive
+integer `applications`. For head captures also bind `head_ids_sha256` to the SHA-256 of the full prompt's little-endian
+uint32 IDs. Step and spool captures include their labels in the hashed logit file. The launcher must collect these facts
+from the executed arms. The checker validates the binding of that record to the inputs. Disabling the check permits
+historical fixtures with no launcher record.
+
 `qual --r4-assess ORIGINAL_NLLS.json`, with `--classes` and `--manifest`, adds an **R4 DIAGNOSTIC ONLY** report on
 stderr after the ordinary verdict. Supply one original reference mean NLL per window, grouped by content class (for
 example, `{"prose": [1.1, 1.3, 1.5]}`). The report fixes each class's median and R4 bar from those original values,

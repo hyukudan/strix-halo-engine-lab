@@ -621,6 +621,38 @@ class HeadFormat(unittest.TestCase):
             self.assertEqual(rc, 2, out)
             self.assertIn("distinct reference, candidate and null arms", out)
 
+    def test_null_witness_binds_the_baseline_configuration_and_capture(self):
+        with tempfile.TemporaryDirectory() as d:
+            cases = [f"w{i:02d}" for i in range(13)]
+            d = self.kit(d, cases, cand_ids=20)
+            witness = d / "control.json"
+            records = {}
+            for case in cases:
+                records[case] = {}
+                ids = np.array((d / f"{case}.ids").read_text(encoding="utf-8").split(), dtype="<u4")
+                for arm in ("exact", "n0"):
+                    records[case][arm] = {"binary_sha256": "a" * 64, "model_sha256": "b" * 64,
+                                          "numerical_config_sha256": "c" * 64,
+                                          "logits_sha256": hashlib.sha256((d / f"{case}-{arm}.f32").read_bytes()).hexdigest(),
+                                          "head_ids_sha256": hashlib.sha256(ids.tobytes()).hexdigest(),
+                                          "control": None if arm == "exact" else
+                                              {"order": "test-order@1", "applications": self.R}}
+
+            def check(old_exit):
+                witness.write_text(json.dumps({"schema": "strix-gate-null-witness/v1", "cases": records}), encoding="utf-8")
+                rc, out = self.gate(d, "--null-control-witness", str(witness))
+                self.assertEqual(rc, old_exit, out)
+
+            check(0)
+            record = records[cases[0]]["n0"]
+            for field, invalid in (("logits_sha256", "d" * 64), ("numerical_config_sha256", "d" * 64),
+                                   ("control", {"order": "test-order@1", "applications": 0})):
+                with self.subTest(field=field):
+                    original = record[field]
+                    record[field] = invalid
+                    check(2)
+                    record[field] = original
+
     def test_nonfinite_last_head_row_is_checked_without_scoring_an_extra_label(self):
         with tempfile.TemporaryDirectory() as d:
             d = self.kit(d, [f"w{i:02d}" for i in range(13)])

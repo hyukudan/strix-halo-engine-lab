@@ -5,6 +5,11 @@
 
 `fast_logit_gate.py seal --capture-nonfinite` retains sealed candidate logits so that a valid paired FAST comparison records a nonfinite candidate as FAIL. Add the same switch to `witness` if needed. Omit the switch to refuse nonfinite dumps at sealing. This host-only qualification option changes no engine arithmetic or defaults.
 
+<a id="platform-fast-null-control-witness"></a>
+### FAST null control evidence
+
+`gate_v2.py qual --null-control-witness WITNESS.json` checks that the launcher recorded the same binary, model and numerical configuration for the reference and each order-only null. It binds the control to the consumed logits and, for head dumps, to the full prompt IDs. This explicit gate option requires launcher evidence and preserves engine defaults.
+
 <a id="ds41-single-attention-read-ahead"></a>
 ### Single DeepSeek attention read-ahead
 
