@@ -99,6 +99,7 @@ PrefillPolicy prefill_policy(const Lookup& env);
 strix::pair::PipelineChoice pair_pipeline_choice(std::uint64_t rows);
 const profile::Engine& profile_engine();                 // tag "minimax-pair", table profile_table
 profile::Resolution profile_resolution(const Lookup& env);
+session::kv_precision::Resolution rank_kv_resolution(const session::kv_precision::Request& request, const Lookup& env);
 // Product profile (default|fast|quality|turbo) and TURBO weight toggle of strix-minimax-rank and strix-minimax-serve:
 // print_or_apply() takes '--profile NAME' (a product name) and --turbo-weights / --turbo-weight-bits /
 // --turbo-weights-pack from argv and exports them (STRIX_MM_PRODUCT_PROFILE, STRIX_TURBO_WEIGHTS*) before anything

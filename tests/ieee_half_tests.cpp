@@ -25,6 +25,14 @@ int main() {
             std::cerr << "IEEE half mismatch at bit pattern " << h << '\n';
             return 1;
         }
+        using strix::weight::ieee_half::NanMode;
+        const auto quiet = strix::weight::ieee_half::decode(static_cast<std::uint16_t>(h), NanMode::quiet);
+        const auto quiet_bits = std::bit_cast<std::uint32_t>(reference) |
+            (exponent == 31U && mantissa != 0U ? 0x00400000U : 0U);
+        if (std::bit_cast<std::uint32_t>(quiet) != quiet_bits) {
+            std::cerr << "IEEE half quiet policy mismatch at bit pattern " << h << '\n';
+            return 1;
+        }
     }
     std::cout << "IEEE half decoder: all 65536 patterns match the independent oracle\n";
 }

@@ -30,6 +30,10 @@ int main() {
         rng_id != 0,
         "speculation RNG has a stable non-zero identity");
 
+    // The raw FNV-1a hash of these three little-endian words is exactly zero.
+    const strix::SpeculationRngIdentity zero_hash{0x9b606708819d3f62ULL, 0x8a6fb9a9fcf2c489ULL, 0x6c4e9b79c177b2f8ULL};
+    expect(strix::speculation_rng_identity(zero_hash) == 1U, "a zero hash maps to the first nonzero identity");
+
     const auto serial_10 =
         strix::speculation_random_u64(
             identity,

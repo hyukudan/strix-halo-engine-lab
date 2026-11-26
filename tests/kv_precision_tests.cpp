@@ -103,6 +103,16 @@ void options() {
     check(kvp::scan_tier(3, t1) == Name::turbo && kvp::scan_tier(3, t2) == Name::standard && kvp::scan_tier(2, t3) == Name::fast &&
               kvp::scan_tier(4, t4) == Name::standard,
           "scan_tier reads only a tier word (a bare --profile is timing in some engines)");
+    const kvp::Caps dual_cache{"dual-cache", Precision::bf16, kvp::bit(Precision::fp8)};
+    kvp::Request request;
+    kvp::set(request, "fp8");
+    const auto strict = kvp::ExactOverride::require_native;
+    const auto tier_default = kvp::TierDefault::resolved_by_levers;
+    check(refusal([&] { (void)kvp::resolve(Name::standard, request, dual_cache, tier_default, strict); }).find("requires native KV")
+              != std::string::npos,
+          "explicit strict policy refuses bit-changing KV under exact");
+    check(kvp::resolve(Name::fast, request, dual_cache, tier_default, strict).precision == Precision::fp8,
+          "strict exact policy admits explicit FP8 under fast");
 }
 
 void tiers() {

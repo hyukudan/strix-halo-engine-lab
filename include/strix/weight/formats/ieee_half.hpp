@@ -11,6 +11,8 @@
 
 namespace strix::weight::ieee_half {
 
+enum class NanMode : std::uint8_t { preserve, quiet };
+
 // Exact IEEE binary16 decoding, including signed zeros and NaN payloads.
 // Preserve the established host, HIP and CUDA conversion forms.
 STRIX_HALF_HD inline float decode(std::uint16_t h) {
@@ -40,6 +42,14 @@ STRIX_HALF_HD inline float decode(std::uint16_t h) {
     const std::uint32_t normal = sign | ((exponent + 112U) << 23U) | (mantissa << 13U);
     return __builtin_bit_cast(float, exponent == 0x1fU ? special : exponent == 0U ? small : normal);
 #endif
+}
+
+// Opt in per format. Quiet on the input bits so no host or device FP
+// operation consumes a signaling value merely to change its NaN payload.
+STRIX_HALF_HD inline float decode(std::uint16_t h, NanMode mode) {
+    if (mode == NanMode::quiet && (h & 0x7c00U) == 0x7c00U && (h & 0x03ffU) != 0U)
+        h = static_cast<std::uint16_t>(h | 0x0200U);
+    return decode(h);
 }
 
 } // namespace strix::weight::ieee_half

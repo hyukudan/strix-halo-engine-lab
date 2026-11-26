@@ -9,6 +9,8 @@
 
 namespace strix {
 
+enum class SamplingPolicyIdentity : std::uint8_t { legacy_v1, canonical_zero_v2 };
+
 // Sampling identity `sampling-v1` (temperature > 0; temperature 0 is greedy and
 // never reaches this code). Over the FP32 logits of one row, in this order:
 //   1. z = logit / temperature (double); m = max z. Every logit must be finite.
@@ -29,6 +31,7 @@ struct TokenSamplingPolicy {
     float top_p = 1.0F;
     float min_p = 0.0F;
     std::uint64_t seed = 0;
+    SamplingPolicyIdentity identity = SamplingPolicyIdentity::legacy_v1;
 };
 
 [[nodiscard]] bool token_sampling_enabled(const TokenSamplingPolicy&) noexcept;

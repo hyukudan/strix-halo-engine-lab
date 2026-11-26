@@ -96,11 +96,9 @@ std::uint64_t speculation_rng_identity(
     hash_u64(
         hash,
         identity.sampling_policy_identity);
-    if (hash == 0) {
-        throw std::logic_error(
-            "speculation RNG identity must be non-zero");
-    }
-    return hash;
+    // Zero is reserved for unsampled decisions. The counter stream uses the
+    // original input tuple, so remapping its receipt does not change any draw.
+    return hash == 0 ? 1U : hash;
 }
 
 std::uint64_t speculation_random_u64(

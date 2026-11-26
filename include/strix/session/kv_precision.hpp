@@ -190,10 +190,12 @@ struct Resolution {
 };
 
 enum class TierDefault { fp8_if_supported, resolved_by_levers };
+enum class ExactOverride { report_identity_change, require_native };
 
 // Throws std::invalid_argument naming the engine, the request and what the engine implements.
 inline Resolution resolve(profile::Name tier, const Request& request, const Caps& caps,
-                          TierDefault policy = TierDefault::fp8_if_supported) {
+                          TierDefault policy = TierDefault::fp8_if_supported,
+                          ExactOverride override = ExactOverride::report_identity_change) {
     Resolution r;
     r.engine = std::string(caps.engine);
     r.tier = tier;
@@ -209,6 +211,9 @@ inline Resolution resolve(profile::Name tier, const Request& request, const Caps
             if (!caps.unavailable.empty()) message += "; " + std::string(caps.unavailable);
             throw std::invalid_argument(message);
         }
+        if (tier == profile::Name::standard && override == ExactOverride::require_native && want != caps.native)
+            throw std::invalid_argument(std::string(caps.engine) + ": " + request.spelling + " " +
+                                        std::string(kv_precision::word(want)) + " refused: exact requires native KV");
         r.precision = want;
         r.source = Source::explicit_option;
         if (r.changes_output() && tier == profile::Name::standard)

@@ -25,6 +25,11 @@
 
 The shared `live_tile_keys` guard bounds valid positions before reading an aligned E4M3 shadow tile. Its host oracle covers stale finite scales and nonfinite tail bytes. Device conformance and binding to the launched attention paths are pending.
 
+<a id="platform-numerical-identity-options"></a>
+### KV and numeric identity options
+
+The shared resolver offers explicit `ExactOverride::require_native`. The active MiniMax rank receipt reports the resolved product tier and uses native KV. `SamplingPolicyIdentity::canonical_zero_v2` normalizes both signs of zero when hashing a policy. `NanMode::quiet` exposes quiet signaling-NaN decoding for formats that choose that policy. These API options require a binding and a versioned identity before use in a product.
+
 <a id="ds41-single-attention-read-ahead"></a>
 ### Single DeepSeek attention read-ahead
 

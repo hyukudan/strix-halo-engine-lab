@@ -427,6 +427,10 @@ profile::Resolution profile_resolution(const Lookup& env) {
     return resolve_startup_profile(env, settings, true);
 }
 
+session::kv_precision::Resolution rank_kv_resolution(const session::kv_precision::Request& request, const Lookup& env) {
+    return session::kv_precision::resolve(profile_resolution(env).profile, request, kKvCaps);
+}
+
 bool profile_column_selects_bundle(const Lookup& env) {
     const char* name = env(kProductProfileEnv);
     if (name == nullptr || *name == 0 || !profile::is_name(name)) return false;

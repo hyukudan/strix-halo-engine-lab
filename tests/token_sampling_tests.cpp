@@ -127,6 +127,19 @@ void test_policy_and_distribution() {
     expect(strix::token_sampling_policy_identity(a) != strix::token_sampling_policy_identity(b), "policy identity covers top-k");
     b = a; b.seed = 99;
     expect(strix::token_sampling_policy_identity(a) == strix::token_sampling_policy_identity(b), "policy identity excludes the seed");
+    b = a; b.min_p = -0.0F;
+    expect(strix::token_sampling_policy_identity(a) != strix::token_sampling_policy_identity(b),
+        "legacy sampled policies retain the signed-zero stream");
+    auto positive = a;
+    positive.identity = b.identity = strix::SamplingPolicyIdentity::canonical_zero_v2;
+    expect(strix::token_sampling_rng(positive).sampling_policy_identity == strix::token_sampling_rng(b).sampling_policy_identity,
+        "explicit sampling-v2 selects the same RNG stream for both signs of zero");
+    expect(strix::token_sampling_policy_identity(a) != strix::token_sampling_policy_identity(positive),
+        "canonical-zero identity is versioned");
+    positive.temperature = 0.0F;
+    b.temperature = -0.0F;
+    expect(strix::token_sampling_policy_identity(positive) == strix::token_sampling_policy_identity(b),
+        "explicit sampling-v2 canonicalizes a zero temperature too");
     bool threw = false;
     try { strix::validate_token_sampling_policy({1.0F, 0, 0.0F, 0.0F, 0}); } catch (const std::invalid_argument&) { threw = true; }
     expect(threw, "top-p zero is rejected");
