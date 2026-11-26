@@ -90,12 +90,14 @@ inline constexpr strix::profile::LadderRow product_ladder_rows[] = {
     // shared band convention (2,049..8,192). Prompts of 2,048 or fewer tokens and above 8,192 keep the exact prefill
     // cores until a replay gate covers them (32K stays TURBO). Ratio: the lower observed 8K EXACT -> bundle ratio
     // (11-19 G1 cold 12.319 -> 8.227 s x1.497; warm 655 -> 1,000 tok/s x1.53; glm_fast SE2/SF2 cold 604.1 -> 991.8
-    // tok/s x1.64), 10 % margin.
+    // tok/s x1.64), 10 % margin. Lower edge timed on the pair CLI (ABBA, cold prefill): 2,049 x1.37, 4,096 x1.47
+    // (both above 1 + noise) -> the edge stays at 2,049.
     {.lever = "pf_wmma", .value = "1", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
      .device = kTurboPrefillDevice, .min_context = 2049, .max_context = 8192, .min_lanes = 1, .max_lanes = 1,
-     .speedup = 1.50, .noise = 0.10,
-     .receipt = "GLM pair 8K FAST bundle vs EXACT cores (gate v2 8K route replay PASS), docs/optimizations.md#glm-pf-wmma-x",
-     .identity = "v1", .band_bound = true, .band_evidence = {{8192}, {8192}, kFastGatePfWmma, true}}};
+     .speedup = 1.37, .noise = 0.10,  // the lower measured ratio of the band (2,049; 8,192 gave x1.50)
+     .receipt = "GLM pair 8K FAST bundle vs EXACT cores (gate v2 8K route replay PASS), docs/optimizations.md#glm-pf-wmma-x; "
+                "lower edge 2,049: EXACT 3.83 s, FAST 2.79 s (x1.37); 4,096: x1.47",
+     .identity = "v1", .band_bound = true, .band_evidence = {{2049, 4096, 8192}, {8192}, kFastGatePfWmma, false}}};
 #undef STRIX_GLM_TURBO_ARM
 inline const strix::profile::Engine product_profile_engine{"glm-pair", "", product_profile_table, false, "glm-turbo-v1",
                                                            {}, {}, product_ladder_rows};

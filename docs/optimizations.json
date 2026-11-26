@@ -2903,7 +2903,7 @@
     "flag_or_env": "STRIX_GLM_PF_WMMA",
     "default": "on under --profile fast / turbo for pair prompts of 2,049..8,192 tokens in the measured execution (band receipt); TURBO also at 31,258 tokens; off otherwise",
     "exact": "FAST identity (new FP32 summation order); FAST gate v2 with MoE route replay at 8K: 5 windows, 1,275 rows, pooled KL 0.00018, top-1 0.9969, dNLL -0.0013; OFF equals the exact 8K logits anchors on both ranks.",
-    "gain": "Pair 8,192-token prompt: exact cores 12.32 s -> bundle 8.23 s cold (x1.50; warm 655 -> 1,000 tok/s); TURBO 8K TTFT -16.3 %, 32K -17.8 %; FAST default (--profile fast alone, cold): CLI 8,192 tokens 12.78 -> 8.54 s (x1.50, 959 tok/s, forced-arm head logits bitwise = gate arm, EXACT bitwise unchanged); served 8,108 tokens 889 tok/s vs 628 before",
+    "gain": "Pair 8,192-token prompt: exact cores 12.32 s -> bundle 8.23 s cold (x1.50; warm 655 -> 1,000 tok/s); lower band edge (cold ABBA): 2,049 tokens 3.83 -> 2.79 s (x1.37), 4,096 6.69 -> 4.56 s (x1.47); TURBO 8K TTFT -16.3 %, 32K -17.8 %; FAST default (--profile fast alone, cold): CLI 8,192 tokens 12.78 -> 8.54 s (x1.50, 959 tok/s, forced-arm head logits bitwise = gate arm, EXACT bitwise unchanged); served 8,108 tokens 889 tok/s vs 628 before",
     "preconditions": "Ordinary two-rank pair workload (Radeon 8060S x2, USB4 2x2x40, MTP decode on, 8,192-row chunks, one lane, fresh prompt); one shared resolver for CLI and server.",
     "off_switch": "STRIX_GLM_PF_WMMA=0, --profile exact, or --baseline",
     "doc_anchor": "docs/optimizations.md#glm-pf-wmma-x"
@@ -3005,7 +3005,7 @@
     "status": "qualified: FAST gate v2 D1 and D1R final PASS (pair, 8K and 32K classes, 28 windows, 1,764 rows)",
     "home": "include/strix/engine_profile.hpp (bind_band_receipts), include/strix/deepseek41_pair_profile_table.hpp (rows), src/deepseek41_pair_defaults.cpp (execution key), src/hip_deepseek41_prefill.hip (paired admission)",
     "exact": "Bit-changing. D1 KL 0.0093, top-1 0.972, dNLL -0.0037 (se 0.0035); D1 + R256 KL 0.0101, top-1 0.972, dNLL +0.0001 (se 0.0037). The bounded replay equals the full run with the key floor bit for bit; deferred serve pieces, snapshot points and group passes take the exact plan.",
-    "gain": "Pair CLI: 8,192 tokens EXACT 1,128.5 -> D1 1,614 / 1,647 -> D1 + R256 1,855 tok/s; 32,768 tokens EXACT 1,257.2 -> D1 1,808.6 -> D1 + R256 1,981 tok/s (pre-integration binaries; device check of the integrated build pending).",
+    "gain": "Pair CLI: 8,192 tokens EXACT 1,128.5 -> D1 1,614 / 1,647 -> D1 + R256 1,855 tok/s; lower band edges (integrated build, warm ABBA, FAST vs EXACT): 4,096 x1.60, 6,000 x1.57, 8,193 x1.58, 16,384 x1.55; 8,192 FAST 1,794 tok/s, 32,768 FAST 1,909 tok/s; 32,768 tokens EXACT 1,257.2 -> D1 1,808.6 -> D1 + R256 1,981 tok/s (pre-integration binaries; device check of the integrated build pending).",
     "preconditions": "World 2 pair over usb4-host, TP attention, 40 layers, chunk 1,024, window 8, four attention lanes, automatic MoE chunk; no explicit FAST switch; both ranks agree on the request fingerprint.",
     "off_switch": "--profile exact, or any explicit STRIX_DS41_FAST_PREFILL / STRIX_DS41_DECODER_REPLAY value",
     "doc_anchor": "docs/optimizations.md#ds41-fast-d1-band",

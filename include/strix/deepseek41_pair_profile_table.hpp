@@ -89,27 +89,34 @@ inline constexpr strix::profile::LadderRow ladder_rows[] = {
     // Band receipts (bind_band_receipts per request): the complete D1 composition and, on top of it, the bounded
     // decoder replay R=256. Timed on the pair CLI (gfx1151, one request) at 8,192 and 32,768 prompt tokens; the quality
     // arms at 8,128 gave the same direction (16.148 / 16.179 s EXACT, 12.564 / 12.695 s D1). Outside the bands, or
-    // when either rank declines, the request keeps the previous prefill route. The 8,128 timing is D1 only.
+    // when either rank declines, the request keeps the previous prefill route. The 8,128 timing is D1 only. Lower edges
+    // timed on the pair CLI (ABBA, warm run, the FAST product D1 + R=256 vs EXACT; D1 alone is not a product execution:
+    // any explicit lever leaves the measured composition): 4,096 x1.60, 6,000 x1.57, 8,193 x1.58, 16,384 x1.55 -> the
+    // nominal edges stay.
     {.lever = "d1_prefill", .value = "1", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
      .device = "gfx1151", .min_context = 4096, .max_context = 8192, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1614.0 / 1128.5, .noise = 0.05,
-     .receipt = "D1 final 8K PASS. Pair CLI 8,192 tokens: EXACT 1,128.5 tok/s, D1 1,614 / 1,647 tok/s (no replay). Quality runner 8,128 tokens: EXACT 16.148 / 16.179 s, D1 12.564 / 12.695 s.",
-     .identity = "ds41-prefill-d1-v1", .band_bound = true, .band_evidence = {{8128, 8192}, {8128, 32768}, kFastGateD1, true}},
+     .receipt = "D1 final 8K PASS. Pair CLI 8,192 tokens: EXACT 1,128.5 tok/s, D1 1,614 / 1,647 tok/s (no replay). Quality runner 8,128 tokens: EXACT 16.148 / 16.179 s, D1 12.564 / 12.695 s. "
+                "Lower edge 4,096: EXACT 4,089 ms, FAST (D1 + R256) 2,557 ms (x1.60); 6,000: x1.57.",
+     .identity = "ds41-prefill-d1-v1", .band_bound = true, .band_evidence = {{4096, 6000, 8128, 8192}, {8128, 32768}, kFastGateD1, false}},
     {.lever = "d1_prefill", .value = "1", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
      .device = "gfx1151", .min_context = 8193, .max_context = 32768, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1808.6 / 1257.2, .noise = 0.05,
-     .receipt = "D1 final 32K PASS. Pair CLI 32,768 tokens: EXACT 1,257.2 tok/s, D1 1,808.6 tok/s (no replay).",
-     .identity = "ds41-prefill-d1-v1", .band_bound = true, .band_evidence = {{32768}, {8128, 32768}, kFastGateD1, true}},
+     .receipt = "D1 final 32K PASS. Pair CLI 32,768 tokens: EXACT 1,257.2 tok/s, D1 1,808.6 tok/s (no replay). "
+                "Lower edge 8,193: EXACT 7,172 ms, FAST (D1 + R256) 4,537 ms (x1.58); 16,384: x1.55.",
+     .identity = "ds41-prefill-d1-v1", .band_bound = true, .band_evidence = {{8193, 16384, 32768}, {8128, 32768}, kFastGateD1, false}},
     {.lever = "decoder_replay", .value = "256", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
      .device = "gfx1151", .min_context = 4096, .max_context = 8192, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1855.0 / 1647.0, .noise = 0.05,
-     .receipt = "D1R final PASS. Pair CLI 8,192 tokens over D1: 1,614 / 1,647 tok/s without replay, 1,855 tok/s with R=256.",
-     .identity = "ds41-replay-r256-v1", .band_bound = true, .band_evidence = {{8192}, {8128, 32768}, kFastGateD1R, true}},
+     .receipt = "D1R final PASS. Pair CLI 8,192 tokens over D1: 1,614 / 1,647 tok/s without replay, 1,855 tok/s with R=256. "
+                "Lower edge 4,096: FAST 2,557 ms vs EXACT 4,089 ms (x1.60); 6,000: x1.57.",
+     .identity = "ds41-replay-r256-v1", .band_bound = true, .band_evidence = {{4096, 6000, 8192}, {8128, 32768}, kFastGateD1R, false}},
     {.lever = "decoder_replay", .value = "256", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
      .device = "gfx1151", .min_context = 8193, .max_context = 32768, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1981.0 / 1808.6, .noise = 0.05,
-     .receipt = "D1R final PASS. Pair CLI 32,768 tokens over D1: 1,808.6 tok/s without replay, 1,981 tok/s with R=256.",
-     .identity = "ds41-replay-r256-v1", .band_bound = true, .band_evidence = {{32768}, {8128, 32768}, kFastGateD1R, true}},
+     .receipt = "D1R final PASS. Pair CLI 32,768 tokens over D1: 1,808.6 tok/s without replay, 1,981 tok/s with R=256. "
+                "Lower edge 8,193: FAST 4,537 ms vs EXACT 7,172 ms (x1.58); 16,384: x1.55.",
+     .identity = "ds41-replay-r256-v1", .band_bound = true, .band_evidence = {{8193, 16384, 32768}, {8128, 32768}, kFastGateD1R, false}},
 };
 
 }  // namespace strix::deepseek41::pair_defaults
