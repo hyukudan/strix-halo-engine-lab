@@ -361,6 +361,7 @@ void product_table() {
         timing.over = {};
         timing.band_bound = true;
         timing.identity = "v1";
+        timing.band_evidence.timed = {4096};  // the band's own timing (a band row with no in-band timing matches nothing)
         r = pr::resolve(pr::Name::fast, app, pending_ok);
         check(status(r, "decode_attention") == pr::Status::unqualified &&
               r.find("decode_attention")->ladder.find("applies x1.100") != std::string::npos,
