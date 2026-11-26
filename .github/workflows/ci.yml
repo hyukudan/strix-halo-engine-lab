@@ -308,6 +308,7 @@ jobs:
                   -DCMAKE_BUILD_TYPE=Release -DSTRIX_ENABLE_HIP_RUNTIME=ON -DBUILD_TESTING=ON \
                   -DSTRIX_FAMILY_QWEN35_HIP=ON -DSTRIX_FAMILY_GLM5=ON -DSTRIX_FAMILY_MINIMAX=ON \
                   -DSTRIX_FAMILY_GEMMA4=ON -DSTRIX_GEMMA4_DEVICE_BACKEND=ON \
+                  -DSTRIX_CHECK_KERNEL_SCRATCH=ON \
                   -DSTRIX_FAMILY_HY4=ON -DSTRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE=ON
                 cmake --build build/root-hip-runtime-offline                   --target strix_hip_runtime strix-hip-decode-token strix-hip-model-residency strix-hip-runtime-launchers-tests strix-hip-moe-route-launcher-tests strix-hip-embedding-launcher-tests strix-hip-hyper-mix-launcher-tests strix-hip-launcher-catalog-tests strix-hip-lm-head-launcher-tests strix-hip-shared-expert-launcher-tests strix-hip-moe-experts-launcher-tests strix-hip-gdn-launcher-tests strix-hip-ple-launcher-tests strix-hip-indexed-attention-launcher-tests strix-hip-model-residency-tests strix-hip-runtime-memory-init-tests
                 cmake --build build/root-hip-runtime-offline --target strix-hip-dense-iu4-cols-probe
