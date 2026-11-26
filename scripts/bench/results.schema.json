@@ -252,6 +252,89 @@
         }
       }
     },
+    "public_campaign": {
+      "type": "object",
+      "required": [
+        "issue",
+        "requested_tier",
+        "native_tier",
+        "groups",
+        "group_measurements",
+        "commands",
+        "raw_samples",
+        "native_manifests"
+      ],
+      "properties": {
+        "issue": {
+          "const": 116
+        },
+        "requested_tier": {
+          "enum": [
+            "exact",
+            "fast",
+            "turbo"
+          ]
+        },
+        "native_tier": {
+          "enum": [
+            "exact",
+            "fast"
+          ]
+        },
+        "groups": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "group_measurements": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "job",
+              "rank",
+              "argv"
+            ],
+            "properties": {
+              "job": {
+                "type": "string"
+              },
+              "rank": {
+                "enum": [
+                  0,
+                  1
+                ]
+              },
+              "argv": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "raw_samples": {
+          "const": "samples.jsonl"
+        },
+        "native_manifests": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
     "nemotron": {
       "type": "object"
     }

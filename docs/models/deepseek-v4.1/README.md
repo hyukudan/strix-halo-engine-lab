@@ -109,6 +109,8 @@ limits and the data path: [image input](../../engine/vision.md).
 
 Sources: [published performance](../../performance.md) and [current pair defaults](production-defaults.md).
 
+For the public fixed-prompt campaign and its results template, see [issue 116 reproduction](campaign-issue-116.md).
+
 Pair-only rows: DeepSeek V4.1 Flash (1017 checkpoint), routed experts in the published 2-bit (Q2) GGUF, dense weights in
 a 6.5-bit overlay with trellis-coded attention, shared-expert and head weights. 2 nodes, expert tensor parallel
 (TP2) over USB4.
