@@ -2002,9 +2002,8 @@ int main(int argc, char** argv) {
         // Host-path defaults (transport timeouts, prefill table ring): the one table both entry points apply
         // (mm_defaults host_defaults(); --print-effective-config prints the rows). An explicit value wins.
         strix::minimax::defaults::apply_host_defaults("rank");
-        const auto capabilities = strix::dist::parse_transport_capabilities(strix::xport::staging_env("STRIX_MM_USB4_CAPS"));
-        if (capabilities && std::string(argv[3]).rfind("usb4", 0) != 0)
-            throw std::invalid_argument("STRIX_MM_USB4_CAPS requires USB4 startup capability agreement");
+        const auto capabilities = strix::minimax::defaults::transport_capabilities(
+            argv[3], [](const char* key) { return std::getenv(key); });
         auto opened = strix::dist::open_pair(argv[3], opt.rank, {std::chrono::seconds(180), capabilities});
         auto transport = std::move(opened.host);
         if (!opened.receipt.empty()) std::printf("transport: %s\n", opened.receipt.c_str());

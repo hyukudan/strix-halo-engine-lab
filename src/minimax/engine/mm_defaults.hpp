@@ -184,6 +184,9 @@ SessionConfig session_config(const Cli&, const Lookup&, std::uint64_t available 
                              bool explicit_cli = false, const std::string& explicit_directory = "");
 Cli parse_cli(const std::string& app, const std::vector<std::string>& args);  // args without argv[0]
 
+// Explicit organization options carried by the USB4 startup negotiation.
+std::uint16_t transport_capabilities(const std::string& transport, const Lookup& env);
+
 // Canonical text, one key=value per line: CLI shape, route/build switches, every item and resolved serve policy.
 // Serve configuration validates scheduler and DSpark policy, independently of process environment export.
 std::string effective_config(const Cli& cli, const Lookup& env);

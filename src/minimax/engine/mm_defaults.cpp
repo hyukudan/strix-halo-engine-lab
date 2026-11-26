@@ -4,6 +4,8 @@
 // MiniMax M3.1 defaults-on resolver: the table of default-ON items, the baseline master switch and the canonical
 // effective configuration (see mm_defaults.hpp).
 #include "minimax/engine/mm_defaults.hpp"
+#include "strix/dist/transport_caps.hpp"
+#include "strix/dist/transport_spec.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/host_memory.hpp"
 #include "minimax/engine/mm_fast_i4.hpp"
@@ -614,6 +616,17 @@ Cli parse_cli(const std::string& app, const std::vector<std::string>& args) {
     return c;
 }
 
+std::uint16_t transport_capabilities(const std::string& transport, const Lookup& env) {
+    const char* setting = env("STRIX_MM_USB4_CAPS");
+    const auto bits = dist::parse_transport_capabilities(setting ? setting : "");
+    if (bits != 0) {
+        const auto kind = dist::parse_transport(transport, dist::pair_transport).kind;
+        if (kind != dist::TransportKind::usb4_auto && kind != dist::TransportKind::usb4_gpu)
+            throw std::invalid_argument("STRIX_MM_USB4_CAPS requires negotiated usb4-auto or usb4gpu transport");
+    }
+    return bits;
+}
+
 namespace {
 struct ServePolicy {
     serve::Sched sched;
@@ -764,6 +777,7 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
     std::ostringstream o;
     o << "app=" << cli.app << "\n"
       << "transport=" << cli.transport << "\n"
+      << "transport_capabilities=" << transport_capabilities(cli.transport, env) << "\n"
       << "slots=" << cli.slots << "\n"
       << "capacity=" << cli.capacity << "\n"
       << "max_rows=" << cli.max_rows << "\n";

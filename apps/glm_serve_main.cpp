@@ -1368,12 +1368,12 @@ int main(int argc, char** argv) {
         const bool turbo_candidate = turbo_prefill_device && rd::measured_prefill_layout(eng.prefill_pipeline()) &&
             !deployment.plan && !serial && rtx_prefill.empty() && import_listen.empty();
         ops.turbo_prefill_pair = rd::select_prefill_wmma(request, eff, rd::process_env(),
-            {turbo_candidate, rd::kPrefillProbePrompt, opt.capacity, opt.max_rows, opt.slots,
-             rd::kTurboPrefillGenerated});
+            rd::serve_prefill_work(turbo_candidate, true, rd::kPrefillProbePrompt, opt.capacity, opt.max_rows,
+                                   rd::kTurboPrefillGenerated, rd::routed_prefill_scratch()));
         if (rd::ordinary_lossy_prefill(request, eff) && !strix::glm::pf::wmma_x::enabled()) {
             ops.turbo_prefill_policy = [&](std::uint64_t prompt, unsigned generated, bool fresh) {
-                const rd::PrefillWork work{ops.turbo_prefill_pair && fresh, prompt, opt.capacity, opt.max_rows, opt.slots, generated,
-                                           rd::routed_prefill_scratch()};
+                const auto work = rd::serve_prefill_work(ops.turbo_prefill_pair, fresh, prompt, opt.capacity, opt.max_rows,
+                                                         generated, rd::routed_prefill_scratch());
                 const bool selected = rd::select_prefill_wmma(request, eff, rd::process_env(), work);
                 rd::report_prefill_wmma(opt.rank, request, eff, rd::process_env(), work, selected);
                 return selected;

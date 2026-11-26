@@ -30,15 +30,6 @@ double secs(Clock::time_point a, Clock::time_point b) { return std::chrono::dura
 // Signal storage outlives every Lead and transport; no monitor thread.
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop.store(true); }
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, std::string& receipt,
-    std::unique_ptr<strix::dist::DeviceExchange>& gpu_direct) {
-    // transport_capabilities 0 preserves the serving capability contract.
-    auto opened = strix::dist::open_pair(spec, rank, {std::chrono::seconds(300), 0});
-    gpu_direct = std::move(opened.direct);
-    receipt = std::move(opened.receipt);
-    return std::move(opened.host);
-}
-
 // The transport shared in turn by the communicator and the exchange module (as strix-minimax-rank).
 using Borrowed = strix::xport::BorrowedTransport<
     strix::xport::BorrowedAbort::forward, strix::xport::BorrowedState::base_default>;
@@ -88,8 +79,11 @@ public:
         strix::minimax::defaults::apply_host_defaults("serve");  // the one host-path table, serving column
         g_stop.store(false);
         std::signal(SIGINT,on_signal); std::signal(SIGTERM,on_signal);
-        std::string receipt;
-        transport = open_transport(transport_spec, opt.rank, receipt, gpu_direct);
+        const auto capabilities = strix::minimax::defaults::transport_capabilities(transport_spec, lookup);
+        auto opened = strix::dist::open_pair(transport_spec, opt.rank, {std::chrono::seconds(300), capabilities});
+        transport = std::move(opened.host);
+        gpu_direct = std::move(opened.direct);
+        auto receipt = std::move(opened.receipt);
         if (deploy_spec) {
             const auto exchange = [&](auto out, auto in) { transport->exchange(out,in); };
             auto plan = strix::deploy::resolve_native_route(*deploy_spec,
@@ -104,7 +98,7 @@ public:
             deployment_plan = std::make_shared<const strix::deploy::Plan>(std::move(plan));
         }
         strix::dist::Group group;
-        group.transport_capabilities = 0;
+        group.transport_capabilities = capabilities;
         group.rank = opt.rank;
         group.world = 2;
         group.plan = 0x4d4d5331ULL;  // "MMS1"
