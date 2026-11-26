@@ -247,6 +247,8 @@ exec::KernelBinding bind_physical_fixture(const A& a) {
             const auto bytes = std::as_bytes(std::span(&a, 1U));
             routed.args.assign(bytes.begin(), bytes.end());
             return routed;
+        } else if constexpr (std::is_same_v<A, residual::TransitionArgs>) {
+            return decode::bind(a, std::size_t{96} * 1024U);
         } else {
             return decode::bind(a);
         }

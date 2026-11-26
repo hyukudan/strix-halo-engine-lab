@@ -132,13 +132,12 @@ cudaError_t enqueue(const residual::BankBatchArgs& a, cudaStream_t stream) {
     return ::strix::cuda::mix::enqueue_batch(a, stream);
 }
 
-struct BoundTransition {
-    residual::TransitionArgs args;
-    ::strix::cuda::mix::TransitionGrid grid;
-};
-
-cudaError_t enqueue(const BoundTransition& bound, cudaStream_t stream) {
-    return ::strix::cuda::mix::enqueue_transition(bound.args, bound.grid, stream);
+cudaError_t enqueue(const residual::TransitionArgs& a, const Grid& bound, cudaStream_t stream) {
+    // The baked dynamic-byte budget determines the staging ring uniquely. Keep the
+    // native operand packet stable and avoid reselecting an occupancy limit here.
+    const auto grid = ::strix::cuda::mix::transition_grid(a, bound.shared_bytes);
+    if (grid.slices == 0 || ::strix::cuda::mix::transition_geometry(grid) != bound) return cudaErrorInvalidValue;
+    return ::strix::cuda::mix::enqueue_transition(a, grid, stream);
 }
 
 cudaError_t enqueue(const residual::TransitionArgs& a, cudaStream_t stream) {
@@ -323,12 +322,16 @@ bool valid(const RoundedCausalConvolution& a) {
 }
 
 template <class Args>
-void thunk(std::span<const std::byte> bytes, const Grid&, void* stream) {
+void thunk(std::span<const std::byte> bytes, const Grid& grid, void* stream) {
     static_assert(std::is_trivially_copyable_v<Args>);
     if (bytes.size() != sizeof(Args)) throw std::invalid_argument("invalid CUDA decode leaf arguments");
     Args args{};
     std::memcpy(&args, bytes.data(), sizeof(args));
-    device::native::check(enqueue(args, static_cast<cudaStream_t>(stream)), "enqueue CUDA decode leaf");
+    const auto queue = static_cast<cudaStream_t>(stream);
+    if constexpr (std::is_same_v<Args, residual::TransitionArgs>)
+        device::native::check(enqueue(args, grid, queue), "enqueue bound CUDA residual transition");
+    else
+        device::native::check(enqueue(args, queue), "enqueue CUDA decode leaf");
 }
 
 template <class Args>
@@ -784,7 +787,7 @@ KernelBinding bind_transition(const residual::TransitionArgs& a, const ::strix::
     if (grid.slices == 0U) throw std::invalid_argument("invalid CUDA R1 residual transition");
     const auto width = std::uint64_t{a.mix.width};
     const auto rows_written = std::uint64_t{a.mix.query_count} + residual::norm_count(a) + (residual::has_prologue(a) ? 1U : 0U);
-    return bind_leaf(transition, ::strix::cuda::mix::transition_geometry(grid), BoundTransition{a, grid},
+    return bind_leaf(transition, ::strix::cuda::mix::transition_geometry(grid), a,
         {.weight_bytes = (std::uint64_t{a.mix.query_count} + residual::norm_count(a)) * width * sizeof(float),
          .state_bytes = (std::uint64_t{a.mix.bank_count} + (residual::has_prologue(a) ? 2U : 0U)) * width * sizeof(float),
          .scratch = {},
