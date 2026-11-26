@@ -37,6 +37,8 @@ struct DevicePrefill {
         }
         return r;
     }
+    // The production full-prompt entry (the request's D1 admission) times the same run in this fake.
+    PrefillResult run_full_prompt(std::span<const std::uint32_t> rows) { return run(rows); }
 };
 }
 struct TtftClock {
