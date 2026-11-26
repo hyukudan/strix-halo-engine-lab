@@ -7,7 +7,8 @@
 #include <cmath>
 #include <array>
 #include "strix/ggml_dequant.hpp"
-#include "strix/ds41_native_fp8.hpp"
+#include "strix/weight/formats/fp8_block_admission.hpp"
+#include "strix/weight/formats/scalar_float.hpp"
 namespace strix::weight::detail {
 namespace {
 Status range_valid(const Slice& slice) {
@@ -53,8 +54,8 @@ Status validate_special(const WeightView& view,bool scan_values) {
     view.parameters.transform!="planar" && view.parameters.transform!="interleaved") return {Error::malformed,"unknown packed layout"};
  if(name=="block.e4m3-e8m0.32x32") {
   status=required(view,"block_scales",Scalar::e8m0,{{rows/32,width/32,0,0},2},part); if(!status) return status;
-  status=inspect(part->data,1,[](const Byte* p) { auto e=std::to_integer<unsigned>(*p); return e>=ds41::fp8_min_exponent && e<=ds41::fp8_max_exponent; }); if(!status) return status;
-  return inspect(view.payload,1,[](const Byte* p) { return (std::to_integer<unsigned>(*p)&127)!=127; });
+  status=inspect(part->data,1,[](const Byte* p) { return fp8_block_admission::supports_exponent(std::to_integer<std::uint8_t>(*p)); }); if(!status) return status;
+  return inspect(view.payload,1,[](const Byte* p) { return !scalar_float::e4m3_is_nan(std::to_integer<std::uint8_t>(*p)); });
  }
  if(name=="nvidia.nvfp4") {
   if(view.shape.rank!=2 || width%64) return {Error::unsupported_shape,"NVFP4 requires matrix K multiple of 64"};
