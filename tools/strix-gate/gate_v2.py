@@ -213,21 +213,31 @@ def read_routes(path, opener=None):
 
 
 def route_flips(ref_path, arm_path, opener=None):
-    """Ids of the reference's selected sets missing from the arm's, per layer (order-free). Same call sequence required."""
+    """Order-independent ID differences and weight differences on matching experts, for the same call sequence."""
     a, b = read_routes(ref_path, opener), read_routes(arm_path, opener)
     if len(a) != len(b):
         raise GateError(f"{arm_path}: {len(b)} router calls, the reference has {len(a)}")
     per = {}
-    for i, ((la, ia, _), (lb, ib, _)) in enumerate(zip(a, b)):
+    max_weight_delta, rows = 0.0, 0
+    for i, ((la, ia, wa), (lb, ib, wb)) in enumerate(zip(a, b)):
         if la != lb or ia.shape != ib.shape:
             raise GateError(f"{arm_path}: call {i} is layer {lb} shape {ib.shape}, the reference has layer {la} shape {ia.shape}")
         k = ia.shape[1]
-        missing = k - np.array([np.intersect1d(x, y).size for x, y in zip(ia, ib)], dtype=np.int64)
+        if not np.isfinite(wa).all() or not np.isfinite(wb).all():
+            raise GateError(f"{arm_path}: non-finite router weight at call {i}")
+        missing = 0
+        for x, y, wx, wy in zip(ia, ib, wa, wb):
+            common, ix, iy = np.intersect1d(x, y, return_indices=True)
+            missing += k - common.size
+            if common.size:
+                max_weight_delta = max(max_weight_delta, float(np.abs(wx[ix].astype(np.float64) - wy[iy]).max()))
         s = per.setdefault(int(la), [0, 0])
         s[0] += ia.size
-        s[1] += int(missing.sum())
+        s[1] += missing
+        rows += ia.shape[0]
     slots, ids = sum(v[0] for v in per.values()), sum(v[1] for v in per.values())
-    return {"slots": slots, "ids": ids, "rate": ids / slots if slots else 0.0, "per_layer": per}
+    return {"slots": slots, "ids": ids, "rate": ids / slots if slots else 0.0, "per_layer": per,
+            "records": len(a), "rows": rows, "max_abs_weight_delta": max_weight_delta}
 
 
 def flip_ratio(cand, null):
@@ -243,6 +253,11 @@ def route_receipt(stderr_bytes, what):
     return json.loads(found[0])
 
 
+def null_control_applied(receipt):
+    control = receipt.get("null", {})
+    return control.get("nudged", 0) > 0 or (control.get("order") and control.get("applications", 0) > 0)
+
+
 def check_replay(ref_receipt, arm_receipt, ref_file, what, null=False):
     """R1 bookkeeping: each arm replayed every route and the null exercised its declared control."""
     out = ref_receipt.get("out")
@@ -255,11 +270,21 @@ def check_replay(ref_receipt, arm_receipt, ref_file, what, null=False):
         raise GateError(f"{what}: replayed {rin['path']}, not the reference file {ref_file}")
     if not rin["complete"] or rin["consumed"] != out["records"] or rin["records"] != out["records"]:
         raise GateError(f"{what}: replay consumed {rin['consumed']} of {rin['records']} records, the reference wrote {out['records']}")
-    evidence = arm_receipt.get("null", {})
-    if null and not (evidence.get("nudged") or (evidence.get("order") and evidence.get("applications", 0) > 0)):
+    if null and not null_control_applied(arm_receipt):
         raise GateError(f"{what}: no applied null control in the route receipt")
     return {"records": rin["consumed"], "rows": rin["rows"], "local_flips": arm_receipt.get("local_flips"),
             "null": arm_receipt.get("null")}
+
+
+def check_free_record(receipt, path, counts, what, null=False):
+    out = receipt.get("out", {})
+    if "in" in receipt or not out or ("null" in receipt and not null):
+        raise GateError(f"{what}: expected a free-running route recording")
+    if (pathlib.PurePath(out.get("path", "")).name != pathlib.PurePath(path).name
+            or any(out.get(k) != counts[k] for k in ("records", "rows"))):
+        raise GateError(f"{what}: route recording does not match its receipt")
+    if null and not null_control_applied(receipt):
+        raise GateError(f"{what}: no applied null control in the free-running route receipt")
 
 
 def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False):
@@ -410,6 +435,9 @@ def window_line(w, flips=None, limits=LIMITS):
     if flips:
         fl = (f"; flips free cand {flips['cand']['rate']:.3e} null {flips['null']['rate']:.3e} ratio "
               f"{flip_ratio(flips['cand'], flips['null']):.2f}")
+        if "max_abs_weight_delta" in flips["cand"]:
+            fl += (f"; max matched route weight delta cand {flips['cand']['max_abs_weight_delta']:.3e} "
+                   f"null {flips['null']['max_abs_weight_delta']:.3e}")
     nt = f", null {w['null_top1']:.4f}" if "null_top1" in w else ""
     nd = (f"; null dNLL {w['null_dnll']:+.5f} se {w['null_dnll_se']:.5f}" if "null_dnll" in w else "; null dNLL n/a")
     cap = f" (rows se {w['dnll_se_rows']:.5f}, capped 1.5 x null)" if "dnll_se_rows" in w else ""
@@ -606,8 +634,12 @@ def qual(a):
                 raise GateError(f"{case}: MoE routes present: --cand-free and --null-free arms are required (R1 flip ratio)")
             f = {"cand": route_flips(ref_route, route(a.cand_free), opener),
                  "null": route_flips(ref_route, route(a.null_free), opener)}
+            check_free_record(ref_r, ref_route, f["cand"], f"{case}.{a.ref}")
+            for key, arm in (("cand", a.cand_free), ("null", a.null_free)):
+                what = f"{case}.{arm}"
+                check_free_record(route_receipt(err(arm), what), route(arm), f[key], what, null=key == "null")
             flips.append(f)
-            w["flips"] = {k: {x: v[x] for x in ("slots", "ids", "rate")} for k, v in f.items()}
+            w["flips"] = {k: {x: v[x] for x in ("slots", "ids", "rate", "max_abs_weight_delta")} for k, v in f.items()}
         elif diag:
             # no route tap: every arm ran free, so the flips come from the engine trace of the candidate and the null
             fc, fn = diag.get((case, a.cand_free or a.cand)), diag.get((case, a.null_free or a.null[0]))

@@ -362,6 +362,28 @@ class Statistics(unittest.TestCase):
             with self.assertRaises(v2.GateError):
                 v2.read_routes(t / "cut.rte")
 
+    def test_route_weight_diagnostic_aligns_by_expert(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = pathlib.Path(d)
+            write_routes(path / "ref", [(0, [[1, 2]], [[0.75, 0.25]])])
+            write_routes(path / "cand", [(0, [[2, 1]], [[0.5, 0.5]])])
+            flips = v2.route_flips(path / "ref", path / "cand")
+            self.assertEqual(flips["ids"], 0)
+            self.assertEqual(flips["max_abs_weight_delta"], 0.25)
+
+    def test_free_route_receipt_rejects_replay_missing_control_and_wrong_counts(self):
+        counts = {"records": 3, "rows": 9}
+        recorded = {"out": {"path": "case.CAND_FREE.rte", **counts}}
+        path = "case.CAND_FREE.rte"
+        v2.check_free_record(recorded, path, counts, "candidate")
+        with self.assertRaisesRegex(v2.GateError, "free-running"):
+            v2.check_free_record(dict(recorded, **{"in": {}}), path, counts, "candidate")
+        with self.assertRaisesRegex(v2.GateError, "does not match"):
+            v2.check_free_record(recorded, path, dict(counts, rows=6), "candidate")
+        with self.assertRaisesRegex(v2.GateError, "no applied null control"):
+            v2.check_free_record(recorded, path, counts, "null", null=True)
+        v2.check_free_record(dict(recorded, null={"order": "reduce", "applications": 3}), path, counts, "null", null=True)
+
     def test_replay_bookkeeping(self):
         ref = {"version": 1, "out": {"path": "/o/routes/c.REF.rte", "records": 96, "rows": 9000}}
         arm = {"version": 1, "in": {"path": "/o/routes/c.REF.rte", "records": 96, "consumed": 96, "rows": 9000, "complete": True},
