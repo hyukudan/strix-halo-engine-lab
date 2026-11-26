@@ -269,3 +269,20 @@ and 39 held-out windows of three content classes (prose, code, structured) at 8K
   --qualify-q8` selects the explicit Q8_0 qualification arm for both phases.
 
 Detailed receipts (per-window reductions, tickets, timing summaries) remain outside Git.
+
+## Inkling 2 Mini Strix pack SP4 attention and head (decode) on gfx1151
+
+**observed** (2026-11-26). Policy `weights.attention_head.sp4t@1` (attention query / key / value / output projections
+and the output head in `strix.sp4t@1` from a calibrated pack, identity `ede1ecc1…e5ef`, every other role BF16), HIP
+on gfx1151, decode-only route (BF16 image prefills the teacher prefix, the SP4 copies run the decode steps), checkpoint
+SHA-256 `65e60f51…39d1`. Gate v2 decode with the exact BF16 reference (`--profile exact`), a null arm and route replay on the 39 held-out
+windows of three content classes (prose, code, structured) at 8K, 32K and 64K context.
+
+- Decode regime, FAST limits: PASS, 2,457 pooled rows (KL 0.00207, top-1 0.9813, dNLL -0.00014 ± 0.00149, route flip
+  ratio 0.00); every class final and PASS (819 rows each); 32 windows PASS, 7 UNRESOLVED and cleared by their class,
+  none FAIL; every context band (8K, 32K, 64K; 819 rows each) PASS.
+- Timing (command line, B=1, `--profile fast` with MTP speculation, 1,024-token held-out prefixes, 512 tokens):
+  code 18.55 -> 16.94 ms per token, prose 17.42 -> 16.16 ms. No served receipt yet, so no decision row: a FAST row
+  needs a served lever for the pack and a served speed receipt at the decode step widths.
+
+Detailed receipts (per-window reductions, tickets, timing summaries) remain outside Git.

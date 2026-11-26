@@ -6257,6 +6257,45 @@ two applied at the store), dispatched by `enqueue_resident_q8_rows` (`src/core/r
 | inkling2-mini | bound (HIP head, decode steps) |
 | qwen3.8-flash-next, qwen3.8-27b, deepseek-v4.1-flash, glm-5.3-flash, minimax-m3.1-flash, hy4-flash, nemotron-3.5-bolt-e4b | not bound: the decode head has no calibrated pack path and no resident low-bit rows |
 
+<a id="inkling2-sp4t-attention-head"></a>
+## Inkling 2 Mini decode attention projections and head: Strix pack SP4, fixed table (`strix.sp4t`), with speculation
+
+**Engine:** `inkling2-mini` (HIP). **Control:** `--qualify-decode-weights weights.attention_head.sp4t@1` with
+`STRIX_LOWBIT_PACK` naming a calibrated `strix.sp4t` pack of the attention query / key / value / output projections and
+the head (`strix-lowbit-calib-pack`, one `--storage ROLE.weight=sp4` per role `attn.wq_du`, `attn.wk_dv`, `attn.wv_dv`,
+`attn.wo_ud`, `llm.unembed`, `--table fixed --technique both --damp 0.1`).
+**Default:** off in every tier; an explicit decode-only qualification arm under `--profile fast`. MTP speculation stays on
+with the arm: its verify windows run the same low-bit copies.
+
+**Shared home:** the grouped SP4 projections ([below](#shared-sp4t-grouped-projections)) and the SP4 head consumer
+([above](#inkling2-sp4t-head)); policy `weights.attention_head.sp4t@1` in `include/strix/weight/levers.hpp`. Inkling binds
+it in `src/inkling2/inkling2_mini_weight_options.hpp` (qualifiable policy), `src/inkling2/inkling2_mini_resident_backend.hpp`
+(a dual image verifies on its low-bit copies, `kMiniMaxVerifyRows <= kMiniLowBitStepBand`) and
+`apps/inkling2_mini_gpu_main.hpp` (a decode-only arm no longer declines speculation; the TURBO row still does).
+
+- **Exactness evidence:** bit-changing (lossy weights). With the arm unset the incumbent gfx1151 ISA is identical (43
+  objects) and the host suite passes (1065 of 1065). With the arm, speculative output equals plain decode on the same
+  low-bit target (512 tokens, code and prose prompts; low-bit rows are bitwise per row across row counts).
+- **Quality (gate v2, decode, 39 held-out windows, 2,457 rows, route replay, null-relative):** pooled KL 0.00207, top-1
+  0.9813, dNLL -0.00014 (se 0.00149), route flip ratio 0.00; the prose, code and structured classes pass (final, 819
+  rows each); 32 windows pass, 7 are unresolved (six on dNLL +0.0103 to +0.0149, under their fail bounds; one on top-1 0.921)
+  and are cleared by their class, none fails: **FAST PASS**. By context band (13 windows, 819 rows each): 8K KL 0.00226 / dNLL +0.00013, 32K 0.00187 /
+  +0.00027, 64K 0.00209 / -0.00081, all PASS.
+- **Measured gain:** CLI B=1 under `--profile fast` (MTP), 1,024-token held-out prefixes, 512 tokens, two rounds, gfx1151
+  with its bound `lowbit_rows` plan: code 18.55 -> 16.94 ms per token (+9.5 % tokens/s), prose 17.42 -> 16.16 ms
+  (+7.8 %). Token ids equal the BF16 run on both prompts; MTP acceptance is unchanged (prose 429 / 437 both arms). The
+  same arm without speculation decodes at 28.5 ms (the former decline). Served decode not measured: the arm is command
+  line only.
+- **Why no FAST row yet:** a FAST decision row (`kMiniWeightLoadDecisionRows`, decode regime) needs a served lever that
+  loads the pack and a served receipt at the step widths 1, 8 and 16 (16 slots, context 16384, ABBA against FAST); the
+  gate PASS above is its quality half.
+- **Off switch:** do not pass the qualification arm.
+
+| model | SP4 attention + head decode arm |
+|---|---|
+| inkling2-mini | bound (HIP, explicit decode-only arm, command line) |
+| qwen3.8-flash-next, qwen3.8-27b, deepseek-v4.1-flash, glm-5.3-flash, minimax-m3.1-flash, hy4-flash, nemotron-3.5-bolt-e4b | not bound: no resident low-bit attention route on the shared projection dispatch and no calibrated `strix.sp4t` pack |
+
 <a id="shared-sp4t-grouped-projections"></a>
 ## Grouped Strix pack SP4 resident projections (`strix.sp4t`)
 
