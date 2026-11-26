@@ -396,8 +396,11 @@ inline std::optional<strix::profile::Resolution> resolve_product(const Request& 
     return product;
 }
 
-inline bool ordinary_turbo(const Request& r, const Effective& e) {
-    return r.product.profile == strix::profile::Name::turbo && !r.product.allow_pending &&
+// The ordinary pair workload of a lossy profile (FAST or TURBO): the only requests whose prefill the ladder rows of
+// pf_wmma can decide per prompt. Anything else keeps the startup resolution (the exact cores unless switched explicitly).
+inline bool ordinary_lossy_prefill(const Request& r, const Effective& e) {
+    return (r.product.profile == strix::profile::Name::fast || r.product.profile == strix::profile::Name::turbo) &&
+        !r.product.allow_pending &&
         !e.baseline && r.world == 2 && r.xch == "comm" && r.decode && !r.reference_gate &&
         !r.mem_plan && r.idcheck == 0 && e.prefill == "gemv" && e.identity.value == "r1b" &&
         e.mtp_spec.value == "1" && e.decode_xch.value == "xfer" && e.kmax == 3 && e.adaptive &&
@@ -429,13 +432,12 @@ inline bool measured_prefill_switches(const Effective& e, const EnvGet& env) {
     return true;
 }
 
-// Called for a whole prompt, after pair agreement and the final chunk/layout admission.
-inline bool select_prefill_turbo(const Request& r, const Effective& e, const EnvGet& env, const PrefillWork& work) {
-    if (!work.pair_ready || !ordinary_turbo(r, e) ||
-        !measured_prefill_switches(e, env) || work.rows != kTurboPrefillRows ||
-        work.capacity != kTurboPrefillCapacity || work.lanes != 1 || work.generated != kTurboPrefillGenerated)
-        return false;
-    if (work.prompt != product_ladder_rows[0].min_context && work.prompt != product_ladder_rows[1].min_context)
+// Called for a whole prompt, after pair agreement and the final chunk/layout admission. The composition, the chunk and
+// the lane count are the measured ones of every pf_wmma row; the shared ladder then decides the prompt: the TURBO rows
+// are literal keys (prompt, capacity, generated), the FAST row a band receipt bound to this execution.
+inline bool select_prefill_wmma(const Request& r, const Effective& e, const EnvGet& env, const PrefillWork& work) {
+    if (!work.pair_ready || !ordinary_lossy_prefill(r, e) || !measured_prefill_switches(e, env) ||
+        work.rows != kTurboPrefillRows || work.lanes != 1)
         return false;
     const auto product = resolve_product(r, env, e.baseline, work);
     const auto* wmma = product->find("pf_wmma");
@@ -553,7 +555,7 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
     e.spec_arbiter = arbiter == "1";
     e.world = r.world;
     resolve_sampled_mtp(e, env);
-    if (select_prefill_turbo(r, e, env, work)) e.product = resolve_product(r, env, e.baseline, work);
+    if (select_prefill_wmma(r, e, env, work)) e.product = resolve_product(r, env, e.baseline, work);
     return e;
 }
 

@@ -37,10 +37,13 @@ inline bool measured_prefill_layout(unsigned pipeline) {
     return pipeline == 2 && layout.routed && !layout.sharded && layout.query_window == 0;
 }
 
-inline void report_prefill_turbo(unsigned rank, const PrefillWork& work, bool selected) {
-    std::fprintf(stderr, "rank %u glm-pf-wmma-x profile=turbo prompt=%llu chunk=%u effective=%s (%s)\n",
-                 rank, static_cast<unsigned long long>(work.prompt), work.rows, selected ? "wmma" : "fast",
-                 selected ? "matched 8060S USB4 TP2 receipt" : "outside measured execution");
+// Per-prompt receipt of the pf_wmma ladder decision (FAST band row / TURBO rows); the profile receipt's
+// strix-ladder/v1 route line names the deciding row.
+inline void report_prefill_wmma(unsigned rank, const Request& r, const PrefillWork& work, bool selected) {
+    const char* profile = r.product.profile ? strix::profile::name(*r.product.profile) : "default";
+    std::fprintf(stderr, "rank %u glm-pf-wmma-x profile=%s prompt=%llu chunk=%u effective=%s (%s)\n",
+                 rank, profile, static_cast<unsigned long long>(work.prompt), work.rows, selected ? "wmma" : "exact-cores",
+                 selected ? "matched 8060S USB4 TP2 ladder row" : "outside measured execution");
 }
 
 }  // namespace strix::glm::rank_defaults

@@ -435,8 +435,8 @@ int main(int argc, char** argv) {
             // the DS/MiniMax 'hp' host path (STRIX_DIST_CRC_PARALLEL / HOST_CRC_OVERLAP / HOST_CHUNK_BYTES) is set by rank_defaults
             (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "600000", 0);
             auto opened = strix::dist::open_pair(transport_spec, opt.rank);
-            turbo_prefill_pair = rd::select_prefill_turbo(request, eff, rd::process_env(),
-                {rd::ordinary_turbo(request, eff) && rd::measured_prefill_pair(opened.usb4_topology.streams, opened.direct != nullptr) && !deployment.plan,
+            turbo_prefill_pair = rd::select_prefill_wmma(request, eff, rd::process_env(),
+                {rd::ordinary_lossy_prefill(request, eff) && rd::measured_prefill_pair(opened.usb4_topology.streams, opened.direct != nullptr) && !deployment.plan,
                  rd::product_ladder_rows[0].min_context, opt.capacity, opt.max_rows, opt.slots, decode_n});
             auto transport = std::move(opened.host);
             const auto& receipt = opened.receipt;
@@ -1124,9 +1124,9 @@ int main(int argc, char** argv) {
             const rd::PrefillWork work{startup_handshake && turbo_prefill_pair && mtp_spec_on &&
                     rd::measured_prefill_layout(eng.prefill_pipeline()) && embed_splice.empty() && bitcalc_cases.empty(),
                 toks.size(), opt.capacity, opt.max_rows, opt.slots, decode_n};
-            const bool turbo = rd::select_prefill_turbo(request, eff, rd::process_env(), work);
-            if (rd::ordinary_turbo(request, eff) && !strix::glm::pf::wmma_x::enabled())
-                rd::report_prefill_turbo(opt.rank, work, turbo);
+            const bool turbo = rd::select_prefill_wmma(request, eff, rd::process_env(), work);
+            if (rd::ordinary_lossy_prefill(request, eff) && !strix::glm::pf::wmma_x::enabled())
+                rd::report_prefill_wmma(opt.rank, request, work, turbo);
             const auto t0 = Clock::now();
             auto& control = decode_control;
             sp::Seed seed;

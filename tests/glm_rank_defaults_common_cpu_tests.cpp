@@ -152,11 +152,13 @@ void test_glm_product_profiles() {
         CHECK(rd::print(e) == rd::print(plain) + e.product->describe());
         CHECK(e.product->quality_fallback() == (std::string(name) == "quality"));
     }
-    // pf_wmma is UNQUALIFIED for fast (8K quality gate failed): the word selects nothing; explicit STRIX_GLM_PF_WMMA=1 only.
+    // pf_wmma is qualified for fast (gate v2 8K route replay) but runs only where its band row covers a known pair
+    // execution: with no device or prompt known (startup) the cell is lowered to the exact cores and exports nothing.
     auto fast = rd::resolve(rd::scan({"--profile", "fast", "--decode", "64"}), empty);
-    CHECK(fast.product && fast.product->find("pf_wmma")->status == profile::Status::builtin);
+    CHECK(fast.product && fast.product->find("pf_wmma")->status == profile::Status::pending);
+    CHECK(fast.product->find("pf_wmma")->ladder_lowered);
     CHECK(fast.product->find("pf_wmma")->value == "0");
-    CHECK(exports(fast) == normal_exports); // FAST exports nothing until the gate passes.
+    CHECK(exports(fast) == normal_exports); // the per-prompt scope opens the bundle; nothing is exported at startup.
     CHECK(fast.product->qualification() == "qualified");
     CHECK(rd::print(fast).find("profile lever pf_wmma 1") == std::string::npos);
     CHECK(rd::print(fast) == rd::print(plain) + fast.product->describe());
