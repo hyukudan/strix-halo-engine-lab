@@ -1756,8 +1756,7 @@ PrefillResult DevicePrefill::run_full_prompt(std::span<const std::uint32_t> toke
     } restore{m.options, m.options};
     apply_d1_prefill(m.options);
     if (replay && replay->value == "256") {
-        std::fprintf(stderr, "%s
-", replay->ladder.c_str());
+        std::fprintf(stderr, "%s\n", replay->ladder.c_str());
         m.options.decoder_replay_rows = 256U;
     }
     return run(tokens);
