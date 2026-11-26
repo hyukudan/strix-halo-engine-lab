@@ -239,6 +239,8 @@ Status LowbitPack::open(const std::string& path, const Digest256& checkpoint, Lo
             !parse_num(f[7], e.bytes) || !parse_hex(f[8], e.source))
             return fail(Error::malformed, "bad low-bit pack entry line " + std::to_string(i + 3U));
         e.tensor = std::string(f[1]);
+        if (is_strixpack_storage({f[2], version}))
+            return fail(Error::unsupported_arithmetic, "Strix pack storage requires the Strix pack loader for " + e.tensor);
         const auto storage = parse_format(f[2], version);
         if (!storage) return fail(Error::unknown_format, "unsupported low-bit pack format for " + e.tensor);
         e.storage = *storage;

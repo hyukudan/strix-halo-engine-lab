@@ -63,10 +63,15 @@ void test_controller_planes() {
 // The engine resolves the W4A4 row: an unbound table would ignore STRIX_INK_MOE_W4A4 at every prompt length.
 void test_row() {
     require(mini::kMiniProfile.table.size() == mini::kMiniLevers.size(), "Inkling lever table bound to the engine");
-    require(mini::kMiniProfile.table.size() == 12U,
+    require(mini::kMiniProfile.table.size() == 15U,
             "W4A4, down image, prepared round fold, narrow experts, controller planes, projected-bias, served route, "
-            "screened head, calibrated low-bit, verify rows, image recipe and the block-candidate row");
+            "screened head, calibrated low-bit, verify rows, image recipe, block-candidate and three StrixPack rows");
     require(mini::kMiniLevers[10].name == mini::kMiniVisionRecipe, "image recipe sits before the block-candidate row");
+    require(mini::kMiniLevers[11].name == strix::spec::kBlockDraftLever.name &&
+                mini::kMiniLevers[12].name == strix::weight::kAttentionHeadSP4Lever.name &&
+                mini::kMiniLevers[13].name == strix::weight::kAttentionHeadSP3Lever.name &&
+                mini::kMiniLevers[14].name == strix::weight::kAttentionHeadSP2Lever.name,
+            "existing block row retains its slot and the three StrixPack rows are bound");
     const auto& lever = mini::kMiniProfile.table.front();
     require(lever.name == mini::kMiniMoeW4a4 && lever.name == "inkling2-mini-moe-w4a4@1", "w4a4 identity");
     require(lever.env == "STRIX_INK_MOE_W4A4" && lever.off == "0" && lever.builtin == "0", "w4a4 off switch");
@@ -328,12 +333,12 @@ void test_projected_bias() {
 // receipt; an explicit STRIX_MOE_EXPERTS_NVFP4=1 opts in (unqualified), 0 is the off switch, other values are refused.
 // The verify rows row: an exact lever, opt-in (off in every tier, builtin the per-row incumbent), bound to the engine,
 // switchable by STRIX_INK_VERIFY_ROWS, refused on a malformed value, and reaching the decoder through the one helper.
-// It is appended after main's rows; the block-candidate row stays last.
+// It is appended after main's rows; the block-candidate row retains its original slot.
 void test_verify_rows() {
     const auto& row = *std::find_if(mini::kMiniLevers.begin(), mini::kMiniLevers.end(),
                                     [](const auto& lever) { return lever.name == mini::kMiniVerifyRows; });
     require(row.name == mini::kMiniVerifyRows && row.name == "inkling2-mini-verify-rows@1", "verify rows row identity");
-    require(mini::kMiniLevers.back().name == strix::spec::kBlockDraftLever.name, "the block-candidate row stays last");
+    require(mini::kMiniLevers[11].name == strix::spec::kBlockDraftLever.name, "the block-candidate row retains its original slot");
     require(row.env == "STRIX_INK_VERIFY_ROWS" && row.off == "0" && row.builtin == "0" &&
                 row.kind == profile::Kind::exact, "verify rows row is an exact lever, off by default");
     for (std::size_t column = 0; column < profile::kProfileColumns; ++column)
@@ -468,7 +473,10 @@ void test_vision_recipe_row() {
     for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
         options.tier = inputs(tier);
         const auto with = mini::resolve_mini_profile(options, true);
-        const auto old = profile::resolve(without_row, inputs(tier));
+        auto old = profile::resolve(without_row, inputs(tier));
+        // Compare after the same weight admission step: unavailable StrixPack rows
+        // are filtered from the effective receipt, independently of the vision row.
+        static_cast<void>(mini::admit_mini_strixpack_receipt(old));
         require(with.summary() == old.summary() && with.tier_notice() == old.tier_notice() &&
                     with.qualification() == old.qualification() && with.fingerprint() == old.fingerprint(),
                 "unset image recipe: the text-only resolution is the table's without the row");
@@ -504,7 +512,7 @@ void test_vision_recipe_row() {
     }
 }
 // The screened-head row: an exact lever, opt-in (off by default in every tier, builtin the full head), bound to the
-// engine after main's rows (the block-candidate row stays last), switchable by STRIX_INK_SCREENED_HEAD, refused on a
+// engine after main's rows (the block-candidate row retains its original slot), switchable by STRIX_INK_SCREENED_HEAD, refused on a
 // malformed value; the explicit 1 is a distinct run identity, the default keeps the legacy one.
 void test_screened_head_row() {
     const profile::Lever* lever = nullptr;
@@ -516,8 +524,8 @@ void test_screened_head_row() {
         }
     require(lever != nullptr && lever->name == "inkling2-mini-screened-head@1" && index == 7U &&
                 mini::kMiniProfile.table[6].name == mini::kMiniServedCliRoute &&
-                mini::kMiniProfile.table.back().name == strix::spec::kBlockDraftLever.name,
-            "screened head row identity and position (appended; the block-candidate row stays last)");
+                mini::kMiniProfile.table[11].name == strix::spec::kBlockDraftLever.name,
+            "screened head row identity and position (appended; the block-candidate row retains its original slot)");
     require(lever->env == "STRIX_INK_SCREENED_HEAD" && lever->off == "0" && lever->builtin == "0" &&
                 lever->kind == profile::Kind::exact && lever->omit_builtin_fingerprint && lever->option.empty(),
             "screened head row is an exact lever, off by default");

@@ -5,8 +5,9 @@
 // file when one is given.
 //
 //   strix-lowbit-calib-pack --model MODEL.safetensors --moments CAL.moments --heldout GATE_MANIFEST [...]
-//       [--eval EVAL.moments] --storage SUBSTRING=q4|q6 [...] [--technique rtn|importance|feedback|both] [--damp D]
-//       [--threads N] [--compare] [--proxy-stride S] [--out PACK] [--report FILE.tsv]
+//       [--eval EVAL.moments] --storage SUBSTRING=q4|q6|sp4|sp3|sp2 [...] [--technique rtn|importance|feedback|both]
+//       [--damp D] [--table fixed|auto] [--threads N] [--compare] [--proxy-stride S] [--out PACK] [--report FILE.tsv]
+//       [--dequant-out FILE.safetensors]
 // Held-out separation is enforced, not documented: the statistics must carry their window provenance
 // (strix/weight/calib_provenance.hpp), and the tool refuses them when a calibration window or any run of 32 ids is
 // shared with a gate manifest named by --heldout (every manifest the qualification uses); the --eval statistics must carry
@@ -15,6 +16,13 @@
 // --storage rules select the matrices (first rule whose substring occurs in the tensor name); every selected matrix
 // must be a consumer of one statistics input. --compare also measures the other technique / format arms per tensor.
 // --proxy-stride S measures the output error on every S-th output row only (the coded bytes are always complete).
+// Strix pack rules (sp4 / sp3 / sp2, strix/weight/host_lowbit.hpp sp::) code the matrix on the SP grid with the default
+// table (--table fixed) or a per-tensor fitted table (--table auto: sp::fit_table on a row sample, importance-weighted
+// when the technique uses importance); every coded superblock is decoded again and must equal the coder's own decode.
+// SP has no device consumer yet, so --out refuses SP rules; --dequant-out writes the decoded selected matrices as a
+// BF16 safetensors file (SP weights are exact in BF16; the tool refuses a value that is not) for an emulation through
+// the existing BF16 routes. The report gives the relative output error and the weight-space SQNR of every arm.
+#include "strix/serve/json.hpp"
 #include "strix/weight/admission.hpp"
 #include "strix/weight/calib_moments.hpp"
 #include "strix/weight/calib_provenance.hpp"
@@ -26,7 +34,10 @@
 #include "core/iu4_onfly.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -65,19 +76,34 @@ Technique parse_technique(std::string_view s) {
     throw std::invalid_argument("technique must be rtn|importance|feedback|both");
 }
 
+enum class Format { q4, q6, sp4, sp3, sp2 };
+
+const char* format_name(Format f) {
+    switch (f) {
+        case Format::q4: return "q4";
+        case Format::q6: return "q6";
+        case Format::sp4: return "sp4";
+        case Format::sp3: return "sp3";
+        case Format::sp2: return "sp2";
+    }
+    return "?";
+}
+
+bool is_sp(Format f) { return f == Format::sp4 || f == Format::sp3 || f == Format::sp2; }
+
 struct Rule {
     std::string substring;
-    unsigned bits;
+    Format format;
 };
 
 struct Args {
-    std::string model, moments, eval, out, report;
+    std::string model, moments, eval, out, report, dequant_out;
     std::vector<std::string> heldout;
     std::vector<Rule> rules;
     Technique technique = Technique::both;
     double damp = 0.01;
     unsigned threads = 0, proxy_stride = 1;
-    bool compare = false;
+    bool compare = false, table_auto = false;
 };
 
 Args parse(int argc, char** argv) {
@@ -99,17 +125,32 @@ Args parse(int argc, char** argv) {
         else if (arg == "--threads") a.threads = static_cast<unsigned>(std::stoul(value()));
         else if (arg == "--compare") a.compare = true;
         else if (arg == "--proxy-stride") a.proxy_stride = std::max(1U, static_cast<unsigned>(std::stoul(value())));
-        else if (arg == "--storage") {
+        else if (arg == "--dequant-out") a.dequant_out = value();
+        else if (arg == "--table") {
+            const std::string_view t = value();
+            if (t != "fixed" && t != "auto") throw std::invalid_argument("--table must be fixed or auto");
+            a.table_auto = t == "auto";
+        } else if (arg == "--storage") {
             const auto v = value();
             const auto eq = v.rfind('=');
-            if (eq == std::string::npos || eq == 0U) throw std::invalid_argument("--storage SUBSTRING=q4|q6");
+            if (eq == std::string::npos || eq == 0U) throw std::invalid_argument("--storage SUBSTRING=q4|q6|sp4|sp3|sp2");
             const auto fmt = v.substr(eq + 1U);
-            if (fmt != "q4" && fmt != "q6") throw std::invalid_argument("--storage format must be q4 or q6");
-            a.rules.push_back({v.substr(0, eq), fmt == "q4" ? 4U : 6U});
+            Format f{};
+            if (fmt == "q4") f = Format::q4;
+            else if (fmt == "q6") f = Format::q6;
+            else if (fmt == "sp4") f = Format::sp4;
+            else if (fmt == "sp3") f = Format::sp3;
+            else if (fmt == "sp2") f = Format::sp2;
+            else throw std::invalid_argument("--storage format must be q4, q6, sp4, sp3 or sp2");
+            a.rules.push_back({v.substr(0, eq), f});
         } else throw std::invalid_argument("unknown argument " + std::string(arg));
     }
     if (a.model.empty() || a.moments.empty() || a.rules.empty() || a.heldout.empty())
         throw std::invalid_argument("need --model, --moments, at least one --heldout gate manifest and one --storage rule");
+    if (!a.out.empty())
+        for (const auto& r : a.rules)
+            if (is_sp(r.format))
+                throw std::invalid_argument("--out: a Strix pack rule has no device consumer yet (use --dequant-out)");
     if (a.threads == 0U) a.threads = std::max(1U, std::thread::hardware_concurrency());
     return a;
 }
@@ -128,7 +169,18 @@ std::vector<float> read_bf16(const wei::RawTensor& t) {
 struct Coded {
     std::vector<std::uint8_t> bytes;
     std::vector<float> dequant;
+    std::string table = "-";  // SP: "fixed|auto:t0,t1,...;base=B;flags=F"
 };
+
+double weight_sqnr_db(const std::vector<float>& w, const std::vector<float>& q) {
+    double sig = 0.0, err = 0.0;
+    for (std::size_t i = 0; i < w.size(); ++i) {
+        const double a = static_cast<double>(w[i]), d = a - static_cast<double>(q[i]);
+        sig += a * a;
+        err += d * d;
+    }
+    return err > 0.0 ? 10.0 * std::log10(sig / err) : 999.0;
+}
 
 template <class Storage>
 Coded code(const std::vector<float>& w, std::size_t n, std::size_t k, Technique t, const std::vector<float>& importance,
@@ -148,6 +200,94 @@ Coded code(const std::vector<float>& w, std::size_t n, std::size_t k, Technique 
     if (!status) throw std::runtime_error(status.code == wei::lowbit::EncodeStatus::nonfinite ? "nonfinite weight"
                                                                                               : "group scale beyond FP16");
     return c;
+}
+
+template <class S>
+Coded code_sp(const std::vector<float>& w, std::size_t n, std::size_t k, Technique t, bool fit,
+              const std::vector<float>& importance, const std::vector<float>& factor, const std::vector<std::uint8_t>& dead,
+              unsigned threads) {
+    const bool weighted = t == Technique::importance || t == Technique::both;
+    auto table = wei::sp::default_table<S::bits>();
+    if (fit) {  // a sample of about 2^21 weights (every stride-th row)
+        const std::size_t stride = std::max<std::size_t>(1U, n * k / (std::size_t{1} << 21U));
+        table = wei::sp::fit_table<S>(w.data(), n, k, stride, weighted ? importance.data() : nullptr);
+    }
+    auto h = wei::sp::make_header<S>(w.data(), n, k, table);
+    Coded c;
+    c.bytes.resize(n * S::row_bytes(k));
+    c.dequant.resize(n * k);
+    gq::Options o;
+    o.threads = threads;
+    o.dequant = c.dequant.data();
+    if (weighted) o.importance = importance.data();
+    if (t == Technique::feedback || t == Technique::both) {
+        o.factor = factor.data();
+        o.dead = dead.data();
+    }
+    if (const auto status = gq::encode_rows_sp<S>(h, w.data(), n, k, c.bytes.data(), o); !status)
+        throw std::runtime_error("nonfinite weight");
+    wei::sp::mark_foldable<S>(h, c.bytes.data(), n, k);
+    if (const char* why = h.invalid(); *why != '\0') throw std::runtime_error(std::string("Strix pack header: ") + why);
+    // Round trip: the stored bytes decode to the coder's values, element for element.
+    const std::size_t blocks = k / S::elements;
+    for (std::size_t r = 0; r < n; ++r)
+        for (std::size_t b = 0; b < blocks; ++b)
+            for (unsigned j = 0; j < S::elements; ++j) {
+                const float v = wei::sp::decode<S>(c.bytes.data() + (r * blocks + b) * S::bytes, j, h);
+                if (std::memcmp(&v, &c.dequant[r * k + b * S::elements + j], sizeof v) != 0)
+                    throw std::runtime_error("Strix pack bytes do not decode to the coded values");
+            }
+    std::string text = fit ? "auto:" : "fixed:";
+    for (unsigned i = 0; i < S::levels; ++i) text += (i ? "," : "") + std::to_string(h.table[i]);
+    text += ";base=" + std::to_string(int{h.base}) + ";flags=" + std::to_string(unsigned{h.flags});
+    c.table = std::move(text);
+    return c;
+}
+
+// BF16 bits of a value that BF16 holds exactly; throws otherwise.
+std::uint16_t exact_bf16(float v) {
+    std::uint32_t u = 0;
+    std::memcpy(&u, &v, sizeof u);
+    if ((u & 0xffffU) != 0U) throw std::runtime_error("--dequant-out: a decoded weight is not exact in BF16");
+    return static_cast<std::uint16_t>(u >> 16U);
+}
+
+using DequantTensors = std::map<std::string, std::pair<std::array<std::size_t, 2>, std::vector<std::uint16_t>>>;
+
+// Selected matrices' decoded weights as one BF16 safetensors file (sorted names, header padded to 8 bytes).
+void write_dequant(const std::string& path, const DequantTensors& tensors) {
+    using strix::serve::Json;
+    auto descriptors = Json::object();
+    std::uint64_t offset = 0;
+    for (const auto& [name, v] : tensors) {
+        const std::uint64_t bytes = v.second.size() * sizeof(std::uint16_t);
+        descriptors.set(name, Json::Object{
+            {"dtype", "BF16"},
+            {"shape", Json::Array{std::uint64_t{v.first[0]}, std::uint64_t{v.first[1]}}},
+            {"data_offsets", Json::Array{offset, offset + bytes}},
+        });
+        offset += bytes;
+    }
+    descriptors.set("__metadata__", Json::Object{{"format", "pt"}, {"producer", "strix-lowbit-calib-pack dequant"}});
+    auto header = descriptors.dump();
+    while (header.size() % 8U != 0U) header += ' ';
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) throw std::runtime_error("cannot open " + path);
+    const std::uint64_t len = header.size();
+    char prefix[8];
+    for (unsigned i = 0; i < 8U; ++i) prefix[i] = static_cast<char>((len >> (8U * i)) & 0xffU);
+    f.write(prefix, 8);
+    f.write(header.data(), static_cast<std::streamsize>(header.size()));
+    for (const auto& [name, v] : tensors) {
+        std::vector<char> raw(v.second.size() * 2U);
+        for (std::size_t i = 0; i < v.second.size(); ++i) {
+            raw[2U * i] = static_cast<char>(v.second[i] & 0xffU);
+            raw[2U * i + 1U] = static_cast<char>(v.second[i] >> 8U);
+        }
+        f.write(raw.data(), static_cast<std::streamsize>(raw.size()));
+    }
+    f.close();
+    if (!f) throw std::runtime_error("cannot finish " + path);
 }
 
 double seconds_since(std::chrono::steady_clock::time_point t0) {
@@ -180,13 +320,17 @@ int main(int argc, char** argv) {
                   << heldout.windows().size() << " held-out windows, no overlap) + checkpoint digest in "
                   << seconds_since(t0) << " s\n";
 
+        const bool report_sp = std::ranges::any_of(args.rules, [](const Rule& rule) { return is_sp(rule.format); });
         std::ofstream report;
         if (!args.report.empty()) {
             report.open(args.report, std::ios::trunc);
             if (!report) throw std::runtime_error("cannot open report " + args.report);
-            report << "tensor\tinput\tcal_rows\teval_rows\tformat\ttechnique\trel_error\tselected\n";
+            report << "tensor\tinput\tcal_rows\teval_rows\tformat\ttechnique\trel_error\tselected";
+            if (report_sp) report << "\ttable\tweight_sqnr_db";
+            report << '\n';
         }
         wei::LowbitPackWriter writer(checkpoint);
+        DequantTensors dequant_out;
         std::map<std::string, std::vector<const wei::RawTensor*>> by_input;
         std::size_t selected = 0;
         for (const auto& t : index.tensors) {
@@ -220,27 +364,48 @@ int main(int argc, char** argv) {
                 const std::size_t n = t->shape.dims[0];
                 if (t->shape.dims[1] != k) throw std::runtime_error(t->name + ": width differs from its input");
                 const auto w = read_bf16(*t);
-                unsigned bits = 0;
+                Format format = Format::q4;
                 for (const auto& r : args.rules)
                     if (t->name.find(r.substring) != std::string::npos) {
-                        bits = r.bits;
+                        format = r.format;
                         break;
                     }
-                const auto arm = [&](unsigned b, Technique tech) {
-                    return b == 4U ? code<wei::Q4G64Storage>(w, n, k, tech, importance, factor, dead, args.threads)
-                                   : code<wei::Q6G64Storage>(w, n, k, tech, importance, factor, dead, args.threads);
+                struct Arm {
+                    Format format;
+                    bool fit;
+                    Technique tech;
                 };
-                std::vector<std::pair<unsigned, Technique>> arms{{bits, Technique::rtn}};
-                if (args.technique != Technique::rtn) arms.push_back({bits, args.technique});
-                if (args.compare) {
+                const auto arm = [&](const Arm& a) {
+                    switch (a.format) {
+                        case Format::q4: return code<wei::Q4G64Storage>(w, n, k, a.tech, importance, factor, dead, args.threads);
+                        case Format::q6: return code<wei::Q6G64Storage>(w, n, k, a.tech, importance, factor, dead, args.threads);
+                        case Format::sp4:
+                            return code_sp<wei::sp::SP4Storage>(w, n, k, a.tech, a.fit, importance, factor, dead, args.threads);
+                        case Format::sp3:
+                            return code_sp<wei::sp::SP3Storage>(w, n, k, a.tech, a.fit, importance, factor, dead, args.threads);
+                        case Format::sp2:
+                            return code_sp<wei::sp::SP2Storage>(w, n, k, a.tech, a.fit, importance, factor, dead, args.threads);
+                    }
+                    throw std::logic_error("format");
+                };
+                const bool fit = is_sp(format) && args.table_auto;
+                std::vector<Arm> arms{{format, fit, Technique::rtn}};
+                if (args.technique != Technique::rtn) arms.push_back({format, fit, args.technique});
+                if (args.compare && !is_sp(format)) {
                     for (const auto tech : {Technique::importance, Technique::feedback, Technique::both})
-                        if (tech != args.technique) arms.push_back({bits, tech});
-                    const unsigned other = bits == 4U ? 6U : 4U;
-                    arms.push_back({other, Technique::rtn});
-                    if (args.technique != Technique::rtn) arms.push_back({other, args.technique});
+                        if (tech != args.technique) arms.push_back({format, false, tech});
+                    const Format other = format == Format::q4 ? Format::q6 : Format::q4;
+                    arms.push_back({other, false, Technique::rtn});
+                    if (args.technique != Technique::rtn) arms.push_back({other, false, args.technique});
+                } else if (args.compare) {  // SP: the other table mode and the incumbent q4_g64, rtn and the technique
+                    arms.push_back({format, !fit, Technique::rtn});
+                    if (args.technique != Technique::rtn) arms.push_back({format, !fit, args.technique});
+                    arms.push_back({Format::q4, false, Technique::rtn});
+                    if (args.technique != Technique::rtn) arms.push_back({Format::q4, false, args.technique});
                 }
-                for (const auto& [b, tech] : arms) {
-                    auto coded = arm(b, tech);
+                for (const auto& a : arms) {
+                    const auto tech = a.tech;
+                    auto coded = arm(a);
                     gq::OutputError err;
                     if (args.proxy_stride == 1U) {
                         err = gq::output_error(w.data(), coded.dequant.data(), n, k, held->h, args.threads);
@@ -259,17 +424,26 @@ int main(int argc, char** argv) {
                     if (!err.available())
                         throw std::runtime_error(t->name + ": proxy signal on input " + input_name +
                                                  " is zero or not finite, relative error unavailable");
-                    const bool chosen = b == bits && tech == args.technique;
-                    if (b == bits && tech == Technique::rtn) total_rtn += err.error;
+                    const bool chosen = a.format == format && a.fit == fit && tech == args.technique;
+                    if (a.format == format && a.fit == fit && tech == Technique::rtn) total_rtn += err.error;
                     if (chosen) total_sel += err.error;
-                    if (!args.report.empty())
-                        report << t->name << '\t' << input_name << '\t' << input->rows << '\t' << held->rows << "\tq" << b
-                               << '\t' << technique_name(tech) << '\t' << err.relative() << '\t' << (chosen ? 1 : 0) << '\n';
+                    if (!args.report.empty()) {
+                        report << t->name << '\t' << input_name << '\t' << input->rows << '\t' << held->rows << '\t'
+                               << format_name(a.format) << '\t' << technique_name(tech) << '\t' << err.relative() << '\t'
+                               << (chosen ? 1 : 0);
+                        if (report_sp) report << '\t' << coded.table << '\t' << weight_sqnr_db(w, coded.dequant);
+                        report << '\n';
+                    }
+                    if (chosen && !args.dequant_out.empty()) {
+                        std::vector<std::uint16_t> bf(coded.dequant.size());
+                        for (std::size_t i = 0; i < bf.size(); ++i) bf[i] = exact_bf16(coded.dequant[i]);
+                        dequant_out[t->name] = {{n, k}, std::move(bf)};
+                    }
                     if (chosen && !args.out.empty()) {
                         wei::Digest256 digest{};
                         if (const auto status = wei::digest_slice(t->payload, digest); !status)
                             throw std::runtime_error(t->name + ": " + status.detail);
-                        writer.add(t->name, b == 4U ? wei::kQ4G64WeightStorage : wei::kQ6G64WeightStorage, n, k, digest,
+                        writer.add(t->name, a.format == Format::q4 ? wei::kQ4G64WeightStorage : wei::kQ6G64WeightStorage, n, k, digest,
                                    std::move(coded.bytes));
                     }
                 }
@@ -282,6 +456,7 @@ int main(int argc, char** argv) {
         }
         if (!args.out.empty())
             if (const auto status = writer.write(args.out); !status) throw std::runtime_error("write pack: " + status.detail);
+        if (!args.dequant_out.empty()) write_dequant(args.dequant_out, dequant_out);
         std::cout << "strix-lowbit-calib-pack/v1 matrices " << selected << " technique " << technique_name(args.technique)
                   << " damp " << args.damp << " output-error rtn " << total_rtn << " selected " << total_sel << " ratio "
                   << (total_rtn > 0.0 ? total_sel / total_rtn : 0.0) << " seconds " << seconds_since(t0) << '\n';

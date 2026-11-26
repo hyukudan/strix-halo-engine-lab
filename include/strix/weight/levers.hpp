@@ -7,6 +7,7 @@
 
 #include <array>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 namespace strix::weight {
@@ -56,9 +57,26 @@ inline constexpr WeightLoadPolicy kHeadQ4Policy{
 // stays BF16 (per-role: `head`), so an exact head (full or screened) keeps its bits. Router and normalisation weights
 // are not covered.
 inline constexpr WeightLoadPolicy kAttentionQ8Policy{{"weights.attention.q8_0", 1}, kQ8WeightStorage, {}, kBf16WeightStorage};
-inline constexpr std::array<const WeightLoadPolicy*, 8> kWeightLoadPolicies{
+inline constexpr WeightLoadPolicy kAttentionHeadSP4Policy{{"weights.attention_head.sp4", 1}, kSP4WeightStorage};
+inline constexpr WeightLoadPolicy kAttentionHeadSP3Policy{{"weights.attention_head.sp3", 1}, kSP3WeightStorage};
+inline constexpr WeightLoadPolicy kAttentionHeadSP2Policy{{"weights.attention_head.sp2", 1}, kSP2WeightStorage};
+inline constexpr std::array<const WeightLoadPolicy*, 11> kWeightLoadPolicies{
     &kAttentionHeadQ8Policy, &kHeadQ8Policy, &kAttentionQ8Policy, &kAttentionHeadQ6Policy, &kAttentionQ4HeadQ6Policy,
-    &kAttentionHeadQ4Policy, &kHeadQ6Policy, &kHeadQ4Policy};
+    &kAttentionHeadQ4Policy, &kHeadQ6Policy, &kHeadQ4Policy,
+    &kAttentionHeadSP4Policy, &kAttentionHeadSP3Policy, &kAttentionHeadSP2Policy};
+
+// Both columns nominate the same implementation. A receipt decides the tier and measured regime.
+// Pending opt-in remains unavailable until there is a loader.
+[[nodiscard]] constexpr profile::Lever strixpack_load_lever(std::string_view name, std::string_view storage,
+                                                            std::string_view identity) {
+    return {.name = name, .env = "", .option = "", .value = {"", storage, "", storage},
+            .builtin = "off", .kind = profile::Kind::bit_changing, .ready = {false, true, false, true},
+            .target = storage, .off = "off", .source = "awaits Strix pack loader, device consumers and gate v2 evidence",
+            .omit_builtin_fingerprint = true, .identity = {{{"off", "bf16@1"}, {storage, identity}}}};
+}
+inline constexpr auto kAttentionHeadSP4Lever = strixpack_load_lever("weights.attention_head.sp4@1", "sp4", "strix.sp4@1");
+inline constexpr auto kAttentionHeadSP3Lever = strixpack_load_lever("weights.attention_head.sp3@1", "sp3", "strix.sp3@1");
+inline constexpr auto kAttentionHeadSP2Lever = strixpack_load_lever("weights.attention_head.sp2@1", "sp2", "strix.sp2@1");
 
 // The binding of a shared policy by a model whose earlier records stored it under `legacy`.
 [[nodiscard]] constexpr WeightLoadPolicy with_legacy(const WeightLoadPolicy& shared, Id legacy) noexcept {
@@ -244,6 +262,22 @@ struct RegimeWeightLoad {
 
 inline constexpr std::size_t kMaxWeightLoadRegimes = 4;
 
+// Candidate admission is separate from the effective (incumbent) storage of a pending load.
+struct StrixPackLoad {
+    Id policy;
+    bool refused = false;
+
+    [[nodiscard]] constexpr std::string_view reason() const {
+        return refused ? "refused: loader not present" : "loader not present";
+    }
+
+    void require_loadable() const {
+        if (refused) throw std::invalid_argument(std::string(reason()));
+    }
+};
+
+[[nodiscard]] std::optional<StrixPackLoad> bind_strixpack_load(profile::Resolution& resolution);
+
 struct WeightLoadPlan {
     Id policy;
     FormatId storage;  // every tagged role but the head
@@ -254,6 +288,11 @@ struct WeightLoadPlan {
     std::string_view turbo_quality{};  // non-empty: admitted by a TURBO-only row (quality below the FAST gate, stated)
     std::array<RegimeWeightLoad, kMaxWeightLoadRegimes> regimes{};  // per regime, in request order
     std::size_t regime_count = 0;
+    std::optional<StrixPackLoad> strixpack{};
+
+    void require_loadable() const {
+        if (strixpack) strixpack->require_loadable();
+    }
 
     [[nodiscard]] FormatId storage_for(std::optional<Role> role) const {
         return !role ? kBf16WeightStorage : *role == Role::head ? head_storage : storage;

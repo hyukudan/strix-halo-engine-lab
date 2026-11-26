@@ -48,6 +48,8 @@ public:
 }
 
 Status matrix_load_geometry(FormatId storage, const Shape& shape, MatrixLoadGeometry& out) {
+ if (is_strixpack_storage(storage))
+  return {Error::unsupported_arithmetic, "Strix pack storage " + serialize_id(storage) + " requires the Strix pack loader"};
  if (!(storage == kBf16WeightStorage) && !(storage == kQ8WeightStorage) && !(storage == kQ4G64WeightStorage) &&
      !(storage == kQ6G64WeightStorage))
   return {Error::unknown_format, "no compact BF16 matrix loader for requested storage"};

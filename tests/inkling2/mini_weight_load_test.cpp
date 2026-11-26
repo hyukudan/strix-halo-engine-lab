@@ -230,6 +230,50 @@ void test_selection() {
 
 // Every committed decision row names the current consumer arithmetic: bumping a resident Q8_0 route's revision
 // Low-bit qualification arms: one shared policy per mix, HIP consumers only, FAST or TURBO only, EXACT untouched.
+void test_strixpack_selection() {
+    const auto& lever = weight::kAttentionHeadSP4Lever;
+    const weight::WeightLoadScope scope{weight::Backend::hip, "gfx1151", {}, {}, {}, {}};
+    for (const auto tier : {profile::Name::fast, profile::Name::turbo}) {
+        mini::MiniWeightOptions options;
+        options.tier.profile = tier;
+        options.tier.env = [](const char*) -> const char* { return nullptr; };
+        auto pending = mini::resolve_mini_resident_weight_load(tier, options, scope);
+        require(pending.storage != weight::kSP4WeightStorage && pending.strixpack && !pending.strixpack->refused &&
+                    pending.strixpack->reason() == "loader not present",
+                "pending SP storage keeps the incumbent and records why");
+        const auto default_receipt = mini::resolve_mini_profile(options, true);
+        require(default_receipt.find(lever.name) == nullptr, "unrequested SP rows stay out of the effective config");
+        options.tier.allow_pending = true;
+        const auto inspection = mini::resolve_mini_profile(options, true);
+        require(inspection.find(lever.name) && inspection.find(lever.name)->status == profile::Status::pending,
+                "candidate inspection shows pending SP storage");
+        options.tier.allow_pending = false;
+
+        options.tier.cli.emplace_back(lever.name, lever.target);
+        auto plan = mini::resolve_mini_resident_weight_load(tier, options, scope);
+        const auto resolution = mini::resolve_mini_profile(options, false);
+        const auto* entry = resolution.find(lever.name);
+        bool loaded = false, refused = false;
+        std::ostringstream receipt;
+        try {
+            static_cast<void>(mini::load_mini_weight_pack(plan, tier, options, scope, {}, {}, nullptr, receipt,
+                [&](const mini::MiniLowBitRows&) { loaded = true; return 0; }));
+        } catch (const std::invalid_argument& error) {
+            refused = std::string_view(error.what()).find("refused: loader not present") != std::string_view::npos;
+        }
+        require(plan.strixpack && weight::same_id(plan.strixpack->policy, weight::kAttentionHeadSP4Policy.id) &&
+                    plan.reason == "refused: loader not present" && refused && !loaded,
+                "the resolved SP profile request reaches the load plan and blocks the incumbent loader");
+        require(entry && entry->value == "off" && entry->reason == plan.reason,
+                "effective profile receipt cannot claim SP when the loader is absent");
+        options.tier.cli.clear();
+        options.qualify = &weight::kAttentionHeadSP4Policy;
+        const auto qualified = mini::resolve_mini_resident_weight_load(tier, options, scope);
+        require(qualified.strixpack && qualified.strixpack->refused && qualified.reason == plan.reason,
+                "explicit qualification uses the same profile-to-plan path");
+    }
+}
+
 void test_lowbit_arms() {
     weight::WeightLoadScope hip{weight::Backend::hip, "gfx1151", "hip-7.1", mini::kMiniWeightRegime, digest(1), digest(2)};
     auto cuda = hip;
@@ -614,6 +658,7 @@ int main() {
         test_selection();
         test_committed_rows();
         test_lowbit_arms();
+        test_strixpack_selection();
         test_lowbit_receipts();
         test_pack_admission();
         test_capacity_and_pack_fallback();

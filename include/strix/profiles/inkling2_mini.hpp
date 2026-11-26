@@ -172,7 +172,7 @@ inline constexpr std::string_view kMiniVerifyRows = "inkling2-mini-verify-rows@1
 // mini_vision_media_tier); a text-only run never applies it (mini_defer_vision_recipe), and at its builtin the row
 // stays out of the fingerprint and the receipt, so a text-only run resolves as before the row.
 inline constexpr std::string_view kMiniVisionRecipe = "inkling2-vision-recipe";
-inline constexpr std::array<profile::Lever, 12> kMiniLevers{{
+inline constexpr std::array<profile::Lever, 15> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
@@ -231,6 +231,9 @@ inline constexpr std::array<profile::Lever, 12> kMiniLevers{{
      "and CUDA",
      false, {}, true, {}, {{{"legacy", "v1"}, {"axial@1", "v1"}}}},
     spec::kBlockDraftLever,
+    weight::kAttentionHeadSP4Lever,
+    weight::kAttentionHeadSP3Lever,
+    weight::kAttentionHeadSP2Lever,
 }};
 
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.

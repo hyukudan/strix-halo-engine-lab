@@ -132,7 +132,8 @@ auto load_mini_weights(const std::string& model, weight::WeightLoadPlan& plan, p
                        const MiniWeightOptions& options, const weight::WeightLoadScope& scope,
                        weight::WeightLoadExtent extent, Load load) {
     const bool lowbit = mini_lowbit_storage(plan.storage) || mini_lowbit_storage(plan.head_storage);
-    if (!lowbit) return load(MiniLowBitRows{});
+    if (!lowbit)
+        return load_mini_weight_pack(plan, tier, options, scope, extent, {}, nullptr, std::cerr, load);
     bind_mini_lowbit_device(plan);
     const bool measured = !options.qualify && !options.qualify_q8;
     std::string path;

@@ -485,6 +485,21 @@ void profile_parity() {
     }
     set_env("STRIX_INK_LOWBIT_TURBO", nullptr);
     selection.arguments.back() = "fast";
+    for (const char* backend : {"hip", "cuda"}) {
+        selection.arguments[3] = backend;
+        loaded.reset();
+        require(factory->create(selection) && loaded && loaded->weight_options.qualify == nullptr,
+                "unset SP must preserve incumbent server admission");
+        for (const char* policy : {"weights.attention_head.sp2@1", "weights.attention_head.sp3@1",
+                                   "weights.attention_head.sp4@1"}) {
+            selection.arguments.insert(selection.arguments.end(), {"--qualify-weights", policy});
+            loaded.reset();
+            require(refuses([&] { (void)factory->create(selection); }, "refused: loader not present") && !loaded,
+                    "explicit SP must refuse before starting the server backend");
+            selection.arguments.resize(selection.arguments.size() - 2U);
+        }
+    }
+    selection.arguments[3] = "hip";
     selection.arguments.emplace_back("--qualify-q8");
     std::ostringstream receipt;
     factory->inspect(selection, receipt);

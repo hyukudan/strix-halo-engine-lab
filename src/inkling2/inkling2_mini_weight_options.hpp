@@ -119,12 +119,13 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
         options.qualify_decode_only = argument == "--qualify-decode-weights";
         const std::string_view key(value());
         options.qualify = weight::find_weight_load_policy(key, kMiniQualifiablePolicies);
-        bool bound = false;
+        const bool strixpack = options.qualify && weight::is_strixpack_storage(options.qualify->target);
+        bool bound = strixpack;
         for (const auto& binding : kMiniQualifiablePolicies)
             bound = bound || (options.qualify != nullptr && weight::same_id(binding.id, options.qualify->id));
         if (!bound) throw std::invalid_argument("--qualify-weights: unknown or unbound weight policy " + std::string(key));
         options.qualify_q8 = weight::same_id(options.qualify->id, kMiniWeightLoadPolicy.id);
-        if (options.qualify_decode_only && !mini_lowbit_storage(options.qualify->head_target()))
+        if (options.qualify_decode_only && !strixpack && !mini_lowbit_storage(options.qualify->head_target()))
             throw std::invalid_argument("--qualify-decode-weights requires a low-bit head");
     } else if (native && argument == "--no-weight-q8") {
         options.disable_q8 = true;
@@ -334,8 +335,31 @@ inline constexpr std::string_view kMiniBuildBackend = "hip";
 inline constexpr std::string_view kMiniBuildBackend = "cuda";
 #endif
 
+inline profile::Resolution resolve_mini_weight_profile(const MiniWeightOptions& options, profile::Inputs inputs) {
+    if (options.qualify && weight::is_strixpack_storage(options.qualify->target)) {
+        const auto entry = std::ranges::find_if(kMiniProfile.table, [&](const profile::Lever& lever) {
+            return weight::id_has_key(options.qualify->id, lever.name);
+        });
+        if (entry != kMiniProfile.table.end()) inputs.cli.emplace_back(entry->name, entry->target);
+    }
+    return profile::resolve(kMiniProfile, inputs);
+}
+
+inline std::optional<weight::StrixPackLoad> admit_mini_strixpack_receipt(profile::Resolution& tier) {
+    const auto load = weight::bind_strixpack_load(tier);
+    if (!tier.allow_pending)
+        std::erase_if(tier.entries, [](const profile::Entry& entry) {
+            const auto* policy = entry.lever ? weight::find_weight_load_policy(entry.lever->name) : nullptr;
+            return policy && weight::is_strixpack_storage(policy->target) && entry.reason.empty();
+        });
+    return load;
+}
+
 inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options, bool native_execution) {
-    auto tier = profile::resolve(kMiniProfile, options.tier);
+    auto tier = resolve_mini_weight_profile(options, options.tier);
+    // Native CLI (including the CUDA step program), gate and server admit the weight request before routing.
+    if (const auto load = admit_mini_strixpack_receipt(tier); native_execution && load)
+        load->require_loadable();
     tier.weights.require_honoured();
     if (options.qualify_q8 && (tier.profile != profile::Name::fast || options.disable_q8 || !native_execution))
         throw std::invalid_argument("--qualify-q8 requires --profile fast and native model execution");
@@ -380,7 +404,8 @@ inline moe_core::grouped_w4a4::Activations mini_prompt_moe(const MiniWeightOptio
                                                          bool print = true, profile::Resolution* receipt = nullptr) {
     auto inputs = options.tier;
     inputs.regime = {profile::Phase::prefill, tokens, 1, device};
-    auto selected = profile::resolve(kMiniProfile, inputs);
+    auto selected = resolve_mini_weight_profile(options, inputs);
+    admit_mini_strixpack_receipt(selected);
     if (print)
         for (const auto& entry : selected.entries)
             if (!entry.ladder.empty()) std::cerr << entry.ladder << '\n';
@@ -413,6 +438,16 @@ inline std::string admit_mini_lowbit_pack(const std::string& file, const weight:
 inline weight::WeightLoadPlan resolve_mini_resident_weight_load(profile::Name tier, const MiniWeightOptions& options,
                                                               const weight::WeightLoadScope& scope,
                                                               weight::WeightLoadExtent extent = {}) {
+    auto inputs = options.tier;
+    inputs.profile = tier;
+    auto resolved = resolve_mini_weight_profile(options, std::move(inputs));
+    const auto strixpack = weight::bind_strixpack_load(resolved);
+    if (strixpack && strixpack->refused) {
+        weight::WeightLoadPlan refused{strixpack->policy, weight::kBf16WeightStorage, profile::Status::pending,
+                                       strixpack->reason()};
+        refused.strixpack = strixpack;
+        return refused;
+    }
     constexpr std::array consumers{weight::kBf16WeightStorage, weight::kQ8WeightStorage,
                                    weight::kQ4G64WeightStorage, weight::kQ6G64WeightStorage};
     const std::span<const weight::FormatId> formats(consumers.data(), scope.backend == weight::Backend::hip ? 4U : 2U);
@@ -420,13 +455,17 @@ inline weight::WeightLoadPlan resolve_mini_resident_weight_load(profile::Name ti
     const bool qualify = options.qualify_q8 || options.qualify != nullptr;
     if (mini_may_load_lowbit_row(tier, options, scope.backend, extent)) {
         auto candidate = mini_lowbit_receipt_plan(tier, scope, extent);
-        if (mini_lowbit_storage(candidate.head_storage)) return candidate;
+        if (mini_lowbit_storage(candidate.head_storage)) {
+            candidate.strixpack = strixpack;
+            return candidate;
+        }
     }
     // The resident image serves every request from one position and one lane up to extent.
     auto plan = weight::resolve_weight_load(weight::builtin_registry(), policy,
         {tier, scope, formats, !options.disable_q8, qualify, kMiniWeightLoadRegimes, extent, {1, 1}}, kMiniWeightLoadDecisions);
     if (qualify && (plan.storage != policy.target || plan.head_storage != policy.head_target()))
         throw std::invalid_argument("the qualified compact weights were not admitted on this backend");
+    plan.strixpack = strixpack;
     return plan;
 }
 
@@ -473,6 +512,7 @@ template <class Load>
 auto load_mini_weight_pack(weight::WeightLoadPlan& plan, profile::Name tier, const MiniWeightOptions& options,
                            const weight::WeightLoadScope& incumbent_scope, weight::WeightLoadExtent extent,
                            const std::string& path, const weight::Digest256* measured, std::ostream& receipt, Load load) {
+    plan.require_loadable();
     const bool decode_only = measured || options.qualify_decode_only;
     if (path.empty() && !decode_only) return load(MiniLowBitRows{});
     try {

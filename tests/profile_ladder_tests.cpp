@@ -679,6 +679,50 @@ std::vector<std::string> selections() {
     return out;
 }
 
+
+void strixpack_candidates() {
+    using namespace strix::weight;
+    const auto& engine = strix::inkling2::kMiniProfile;
+    for (const auto* candidate : {&kAttentionHeadSP4Lever, &kAttentionHeadSP3Lever, &kAttentionHeadSP2Lever}) {
+        const auto lever = std::ranges::find(engine.table, candidate->name, &p::Lever::name);
+        require(lever != engine.table.end() && p::identity_defect(*lever).empty(), std::string(candidate->name) + ": declared row and identities");
+        if (lever == engine.table.end()) continue;
+        for (const auto tier : {p::Name::standard, p::Name::fast, p::Name::turbo}) {
+            p::Inputs in;
+            in.profile = tier;
+            in.allow_pending = true;
+            in.env = [](const char*) -> const char* { return nullptr; };
+            const auto resolution = p::resolve(engine, in);
+            const auto* entry = resolution.find(candidate->name);
+            require(entry && entry->value == "off" &&
+                        entry->status == (tier == p::Name::standard ? p::Status::builtin : p::Status::pending),
+                    std::string(candidate->name) + ": SP stays off without a loader and receipt");
+        }
+    }
+    const auto& candidate = kAttentionHeadSP4Lever;
+    const p::Regime regime{p::Phase::decode, 64U, 1U, "gfx1151", kExec};
+    const auto arms = p::ladder_arms(engine.table, engine.ladder,
+        regime, [](const p::Lever& row, unsigned column) { return p::column_admission(row, column, false, false); });
+    for (const auto tier : {p::Name::fast, p::Name::turbo}) {
+        const auto reference = arms.over(tier, candidate.name, candidate.target);
+        require(!reference.empty(), "SP4 has a complete reference key");
+        const p::LadderRow receipt{candidate.name, candidate.target, tier, regime.phase, regime.device,
+                                   regime.context, regime.context, 1, 1, 1.2, 0.01, "fixture/sp4", false, {}, {}, reference};
+        auto measured = engine;
+        measured.ladder = std::span(&receipt, 1);
+        require(p::ladder_defect(measured).empty(), "SP4 synthetic receipt is valid");
+        for (const auto applied : {tier, p::Name::turbo}) {
+            auto granted = resolve(measured, applied, regime);
+            const auto* entry = granted.find(candidate.name);
+            require(entry && entry->value == candidate.target, "same SP4 identity resolves in either tier");
+            const auto plan = bind_strixpack_load(granted);
+            require(plan && same_id(plan->policy, kAttentionHeadSP4Policy.id) && !plan->refused &&
+                        entry && entry->value == "off" && entry->status == p::Status::pending && entry->ladder.empty(),
+                    "the admission binding demotes a receipt grant until the loader exists");
+        }
+    }
+}
+
 void incumbents(const char* golden, bool write) {
     const auto now = selections();
     if (write) {
@@ -1501,6 +1545,7 @@ int main(int argc, char** argv) try {
         return 0;
     }
     incumbents(argv[2], false);
+    strixpack_candidates();
     verdicts();
     bound_evidence();
     defects();
