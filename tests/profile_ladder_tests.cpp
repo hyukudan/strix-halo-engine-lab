@@ -724,17 +724,16 @@ void strixpack_candidates() {
     }
 }
 
-void lowbit_candidate() {
+void lowbit_candidate(const p::Lever& candidate, strix::core::LowBitArithmetic candidate_arithmetic,
+                      const p::Regime& regime) {
     using strix::core::LowBitArithmetic;
     using strix::core::resident_lowbit_arithmetic;
     const auto& engine = strix::inkling2::kMiniProfile;
-    const auto& candidate = strix::weight::kLowBitFoldedScaleLever;
     const auto lever = std::ranges::find(engine.table, candidate.name, &p::Lever::name);
     require(lever != engine.table.end() && p::identity_defect(*lever).empty(),
             "low-bit candidate is registered with identities");
     if (lever == engine.table.end()) return;
 
-    const p::Regime regime{p::Phase::prefill, 8192U, 1, "gfx1151", kExec};
     const auto exact = resolve(engine, p::Name::standard, regime);
     require(resident_lowbit_arithmetic(exact) == LowBitArithmetic::f16_group_scale, "EXACT keeps group scale");
     const auto arms = p::ladder_arms(engine.table, engine.ladder,
@@ -752,9 +751,9 @@ void lowbit_candidate() {
         auto measured = engine;
         measured.ladder = std::span(&receipt, 1);
         require(p::ladder_defect(measured).empty() &&
-                    resident_lowbit_arithmetic(resolve(measured, tier, regime)) == LowBitArithmetic::f16_folded_scale,
+                    resident_lowbit_arithmetic(resolve(measured, tier, regime)) == candidate_arithmetic,
                 "one matching receipt selects the arithmetic without changing the lever");
-        require(resident_lowbit_arithmetic(resolve(measured, p::Name::turbo, regime)) == LowBitArithmetic::f16_folded_scale,
+        require(resident_lowbit_arithmetic(resolve(measured, p::Name::turbo, regime)) == candidate_arithmetic,
                 "TURBO keeps the selected value, including when only FAST qualifies");
         require(resident_lowbit_arithmetic(resolve(measured, p::Name::standard, regime)) == LowBitArithmetic::f16_group_scale,
                 "receipt never changes EXACT");
@@ -1598,7 +1597,10 @@ int main(int argc, char** argv) try {
     }
     incumbents(argv[2], false);
     strixpack_candidates();
-    lowbit_candidate();
+    lowbit_candidate(strix::weight::kLowBitFoldedScaleLever, strix::core::LowBitArithmetic::f16_folded_scale,
+                     {p::Phase::prefill, 8192U, 1, "gfx1151", kExec});
+    lowbit_candidate(strix::weight::kLowBitRowsSelectLever, strix::core::LowBitArithmetic::f16_rows_select,
+                     {p::Phase::decode, 16384U, 1, "gfx1151", kExec});
     verdicts();
     bound_evidence();
     defects();

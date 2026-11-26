@@ -4,6 +4,8 @@
 #include "core/resident_row_plan.hpp"
 
 #if defined(__HIPCC__)
+#include "device/hip_current_device_arch.hpp"
+
 #include "core/dense_linear.hpp"
 #include "core/f16_tile_gemm_small.hpp"
 #else
@@ -29,6 +31,13 @@ void launch_q8_tight_rows(dense_linear::View weights, const float* input, float*
 inline LowBitRowPlan current_lowbit_row_plan() {
     int dev = 0;
     return hipGetDevice(&dev) == hipSuccess ? bound_lowbit_row_plan(dev) : LowBitRowPlan{};
+}
+// Lever "lowbit.rows-select": this launch runs the FP32 sweep (core/resident_row_plan.hpp kLowBitSweepCells).
+inline bool lowbit_rows_sweep(LowBitArithmetic arithmetic, weight::FormatId storage, unsigned outputs, unsigned width,
+                              unsigned rows) {
+    if (arithmetic != LowBitArithmetic::f16_rows_select) return false;
+    const unsigned bits = storage == weight::kQ4G64WeightStorage ? 4U : storage == weight::kQ6G64WeightStorage ? 6U : 0U;
+    return lowbit_sweep_cell(strix::hip::arch::current_device_arch_name(), bits, outputs, width, rows);
 }
 // Low-bit projections sharing one input: one launch of the planned route. Under f16_group_scale both routes compute
 // the same bits; under f16_folded_scale the tile route folds the scale and the small-M route keeps the group scale
@@ -59,8 +68,7 @@ row_transforms::Status launch_lowbit_rows(dense_linear::View weights, const floa
 }  // namespace detail
 #endif
 
-// HIP low-bit resident rows. Selecting f16_group_scale (or the candidate f16_folded_scale) explicitly enables the two
-// WMMA schedules.
+// HIP low-bit resident rows use the selected WMMA arithmetic or the FP32 sweep in measured cells.
 inline row_transforms::Status enqueue_resident_lowbit_rows(
     const weight::ResidentMatrixView& matrix, unsigned live_outputs, const float* input,
     unsigned rows, float* output, row_transforms::Stream stream,
@@ -68,7 +76,8 @@ inline row_transforms::Status enqueue_resident_lowbit_rows(
     if (!valid_resident_lowbit_rows(matrix, live_outputs, input, rows, output, arithmetic)) return row_transforms::invalid;
 #if defined(__HIPCC__)
     const auto width = static_cast<unsigned>(matrix.columns);
-    if (arithmetic == LowBitArithmetic::fp32_sweep) {
+    if (arithmetic == LowBitArithmetic::fp32_sweep ||
+        detail::lowbit_rows_sweep(arithmetic, matrix.storage, live_outputs, width, rows)) {
         const dense_linear::View weights{matrix.bytes.data(), width, live_outputs, static_cast<std::size_t>(matrix.row_bytes)};
         return matrix.storage == weight::kQ4G64WeightStorage
                    ? detail::launch_lowbit_rows<weight_decode::Format::q4_g64>(weights, input, output, rows, stream)
@@ -143,6 +152,7 @@ inline bool resident_q8_projections_admitted(const float* input, unsigned width,
                                              std::span<const ResidentRowProjection> projections,
                                              [[maybe_unused]] LowBitArithmetic arithmetic = LowBitArithmetic::fp32_sweep) {
     if (projections.empty() || projections.size() > Capacity) return false;
+    arithmetic = grouped_lowbit_arithmetic(arithmetic);
     for (const auto& projection : projections) {
         const auto* matrix = std::get_if<weight::ResidentMatrixView>(&projection.weights);
         if (!matrix || matrix->columns != width || matrix->rows != projection.outputs) return false;
@@ -188,7 +198,7 @@ inline row_transforms::Status enqueue_resident_q8_projections(
         const bool tile = q4 || storage == weight::kQ6G64WeightStorage || use_resident_q8_tile(rows);
         if (tile) {
             f16_tile_gemm::Q8ProjectionGroup<Capacity> group{};
-            auto run_arithmetic = arithmetic;
+            auto run_arithmetic = grouped_lowbit_arithmetic(arithmetic);
             for (const auto& projection : run) {
                 const auto& matrix = std::get<weight::ResidentMatrixView>(projection.weights);
                 group.append({matrix.bytes.data(), projection.outputs, projection.output});

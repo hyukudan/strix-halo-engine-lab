@@ -280,6 +280,25 @@ void check_grouped_fixture_poison() {
     check(ran && first != 1.0F && second == 2.0F, "grouped fixture catches a skipped standalone destination");
 }
 
+void check_rows_select_cells() {
+    namespace co = strix::core;
+    // gfx1151 standalone timing receipt: the four large cells also won at M=4.
+    for (const unsigned bits : {4U, 6U}) {
+        for (const unsigned n : {1024U, 2304U, 17408U}) {
+            for (unsigned m = 0; m <= 17U; ++m) {
+                const bool won = n != 2304U ? m == 1U || m == 2U || m == 4U
+                                            : bits == 4U && (m == 1U || m == 2U);
+                check(co::lowbit_sweep_cell("gfx1151", bits, n, 5120U, m) == won,
+                      "only exact measured standalone rows select the sweep");
+            }
+        }
+    }
+    check(co::grouped_lowbit_arithmetic(co::LowBitArithmetic::f16_rows_select) ==
+              co::LowBitArithmetic::f16_group_scale, "grouped projections always keep the incumbent");
+    check(!co::lowbit_sweep_cell("", 4U, 1024U, 5120U, 2U) &&
+          !co::lowbit_sweep_cell("gfx1151", 4U, 1024U, 5121U, 2U), "unknown device and unmeasured K keep incumbent");
+}
+
 void check_resident_ranges() {
     namespace co = strix::core;
     namespace w = strix::weight;
@@ -639,6 +658,7 @@ int main() {
     check_folded_scale<wei::Q4G64Storage>(wei::kQ4G64WeightStorage);
     check_folded_scale<wei::Q6G64Storage>(wei::kQ6G64WeightStorage);
     check_grouped_fixture_poison();
+    check_rows_select_cells();
     check_resident_ranges();
     check_bf16_preflight();
     check_group_accumulator();

@@ -6,6 +6,7 @@
 #include "core/gemv_rows.hpp"
 #include "strix/device/lowbit_rows.hpp"
 #include "strix/weight/lowbit_folded_scale_profile.hpp"
+#include "strix/weight/lowbit_rows_select_profile.hpp"
 #include "strix/weight/host_lowbit.hpp"
 #include "strix/weight/resident_slices.hpp"
 
@@ -13,6 +14,8 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <span>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -54,25 +57,26 @@ inline bool valid_resident_q8_rows(const weight::ResidentMatrixView& matrix, uns
                                 matrix.bytes.size());
 }
 
-// The FP32 sweep is the incumbent. The explicit FP16 form uses one arithmetic across both tile schedules.
-// f16_folded_scale: the FP16 form whose tile route (launches above the device plan's small_rows) folds the scale into
-// the operand (fp16(code x d), one WMMA chain per output; core/lowbit_f16_staging.hpp ScalePolicy::folded) while the
-// small-M route keeps the group scale: per-regime selection from the no-model fixture (tests/hip_dense_lowbit_bench.hip
-// mode fold; gfx1151: the folded tile faster on every measured shape, the folded small-M schedule no faster at 1-16
-// rows and slower at 32-64). A row's bits then depend on its launch's route. A FAST / TURBO candidate lever value: it
-// changes rounding, is never EXACT and no profile selects it until its gate and receipts exist.
-enum class LowBitArithmetic { fp32_sweep, f16_group_scale, f16_folded_scale };
+// Pending FAST/TURBO candidates use either folded tile operands or a measured standalone sweep.
+enum class LowBitArithmetic { fp32_sweep, f16_group_scale, f16_folded_scale, f16_rows_select };
 
 // Both product entry points and qualification arms bind the same resolved value to the launch policy.
 inline LowBitArithmetic resident_lowbit_arithmetic(const profile::Resolution& tier) {
-    const auto& lever = weight::kLowBitFoldedScaleLever;
-    const auto* entry = tier.find(lever.name);
-    if (!entry || entry->value == lever.builtin || entry->value == "off") return LowBitArithmetic::f16_group_scale;
-    if (entry->value != lever.target)
-        throw std::invalid_argument(std::string(lever.env) + " requires " + std::string(lever.target) + " or off");
-    if (tier.profile != profile::Name::fast && tier.profile != profile::Name::turbo)
-        throw std::invalid_argument(std::string(lever.env) + " requires FAST or TURBO");
-    return LowBitArithmetic::f16_folded_scale;
+    const auto enabled = [&](const profile::Lever& lever) {
+        const auto* entry = tier.find(lever.name);
+        if (!entry || entry->value == lever.builtin || entry->value == "off") return false;
+        if (entry->value != lever.target)
+            throw std::invalid_argument(std::string(lever.env) + " requires " + std::string(lever.target) + " or off");
+        if (tier.profile != profile::Name::fast && tier.profile != profile::Name::turbo)
+            throw std::invalid_argument(std::string(lever.env) + " requires FAST or TURBO");
+        return true;
+    };
+    const bool folded = enabled(weight::kLowBitFoldedScaleLever);
+    const bool rows_select = enabled(weight::kLowBitRowsSelectLever);
+    if (folded && rows_select)
+        throw std::invalid_argument("folded scale and rows-select are separate low-bit candidate identities");
+    if (folded) return LowBitArithmetic::f16_folded_scale;
+    return rows_select ? LowBitArithmetic::f16_rows_select : LowBitArithmetic::f16_group_scale;
 }
 
 namespace detail {
@@ -126,11 +130,53 @@ constexpr LowBitArithmetic admitted_lowbit_arithmetic(LowBitArithmetic arithmeti
     return arithmetic == LowBitArithmetic::f16_folded_scale && !matrix.folded_scale_admitted
         ? LowBitArithmetic::f16_group_scale : arithmetic;
 }
+}
 
 constexpr bool lowbit_f16_form(LowBitArithmetic arithmetic) { return arithmetic != LowBitArithmetic::fp32_sweep; }
 constexpr unsigned lowbit_max_rows(LowBitArithmetic arithmetic) {
     return lowbit_f16_form(arithmetic) ? 65535U * f16_tile_gemm::kBM : gemv_rows::max_rows;
 }
+
+// One measured standalone cell of "lowbit.rows-select". Each entry lists only the exact row counts where
+// the FP32 sweep beat the incumbent. Adding or removing a measured count requires an identity revision.
+struct LowBitSweepCell {
+    std::string_view arch;
+    unsigned bits, outputs, width;
+    std::span<const unsigned> rows;
+};
+inline constexpr weight::ArithmeticId kLowBitRowsSelectIdentity{"lowbit.rows-select.fp32-sweep-cells", 2};
+inline constexpr unsigned kRowsOneTwo[]{1U, 2U};
+inline constexpr unsigned kRowsOneTwoFour[]{1U, 2U, 4U};
+inline constexpr std::array<LowBitSweepCell, 5> kLowBitSweepCells{{
+    {"gfx1151", 4U, 1024U, 5120U, kRowsOneTwoFour},
+    {"gfx1151", 4U, 2304U, 5120U, kRowsOneTwo},
+    {"gfx1151", 4U, 17408U, 5120U, kRowsOneTwoFour},
+    {"gfx1151", 6U, 1024U, 5120U, kRowsOneTwoFour},
+    {"gfx1151", 6U, 17408U, 5120U, kRowsOneTwoFour},
+}};
+constexpr bool lowbit_sweep_cell(std::string_view arch, unsigned bits, unsigned outputs, unsigned width, unsigned rows,
+                                 std::span<const LowBitSweepCell> cells = kLowBitSweepCells) {
+    if (arch.empty()) return false;
+    for (const auto& cell : cells)
+        if (cell.arch == arch && cell.bits == bits && cell.outputs == outputs && cell.width == width)
+            return std::ranges::find(cell.rows, rows) != cell.rows.end();
+    return false;
+}
+static_assert([] {
+    for (const auto& cell : kLowBitSweepCells) {
+        if ((cell.bits != 4U && cell.bits != 6U) || cell.rows.empty() || cell.width % 128U != 0U)
+            return false;
+        for (const auto rows : cell.rows)
+            if (rows == 0U || rows > gemv_rows::max_rows) return false;
+    }
+    return true;
+}());
+
+// The receipt table covers standalone projections. Every grouped storage run uses its incumbent arithmetic.
+constexpr LowBitArithmetic grouped_lowbit_arithmetic(LowBitArithmetic arithmetic) {
+    return arithmetic == LowBitArithmetic::f16_rows_select ? LowBitArithmetic::f16_group_scale : arithmetic;
+}
+
 inline bool valid_resident_lowbit_rows(const weight::ResidentMatrixView& matrix, unsigned outputs,
                                        const float* input, unsigned rows, const float* output,
                                        LowBitArithmetic arithmetic = LowBitArithmetic::fp32_sweep) {
