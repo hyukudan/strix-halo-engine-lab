@@ -157,7 +157,8 @@ def scores(manifest, reference, candidate, null=None):
         window = {
             "rows": info["rows"], "kl": float(values["kl_rc"].mean()),
             "top1": float(values["agree"].mean()), "dnll": float(d.mean()),
-            "dnll_se": gate.mean_se(d)[1], "exact_nll": float(values["nll_r"].mean()),
+            "dnll_se": gate.mean_se(d)[1] if d.size > 1 else None,
+            "exact_nll": float(values["nll_r"].mean()),
         }
         ref_routes, cand_routes = [directory / (name + ".rte") for directory in (reference, candidate)]
         if ref_routes.exists() and cand_routes.exists():
