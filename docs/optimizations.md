@@ -20,6 +20,11 @@
 
 `gate_v2.py qual --document-uncertainty` reports an additional pooled dNLL standard error from independent documents declared in the frozen plan. This option is diagnostic and preserves the gate's row-based verdict.
 
+<a id="platform-fp8-tail-guard"></a>
+### FP8 attention tail guard
+
+The shared `live_tile_keys` guard bounds valid positions before reading an aligned E4M3 shadow tile. Its host oracle covers stale finite scales and nonfinite tail bytes. Device conformance and binding to the launched attention paths are pending.
+
 <a id="ds41-single-attention-read-ahead"></a>
 ### Single DeepSeek attention read-ahead
 
