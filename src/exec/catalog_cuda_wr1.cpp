@@ -54,9 +54,10 @@ Greedy greedy(Greedy args, unsigned rows) {
 
 }  // namespace
 
-Bindings::Bindings(const StepBlock* descriptor, unsigned rows, const Thunks& thunks)
+Bindings::Bindings(const StepBlock* descriptor, unsigned rows, const Thunks& thunks, bool early_launch)
     : descriptor_(descriptor),
-      index_(static_cast<std::size_t>(std::ranges::find(widths, rows) - widths.begin())), thunks_(thunks) {
+      index_(static_cast<std::size_t>(std::ranges::find(widths, rows) - widths.begin())), thunks_(thunks),
+      early_launch_(early_launch) {
     require(descriptor && index_ < widths.size());
 }
 
@@ -73,6 +74,7 @@ KernelBinding Bindings::leaf(Leaf which, Grid grid, const Args& args) const {
     result.grid = grid;
     result.predicted.launches = 1;
     result.pdl = pdl_contract(which);
+    if (!early_launch_) result.pdl.opt_out = PdlOptOut::legacy_schedule;
     const LaunchArgs<Args> launch{descriptor_, args};
     const auto bytes = std::as_bytes(std::span(&launch, 1));
     result.args.assign(bytes.begin(), bytes.end());

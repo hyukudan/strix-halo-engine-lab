@@ -45,10 +45,10 @@ using Thunks = std::array<std::array<LaunchFn, static_cast<unsigned>(Leaf::count
 }
 
 // Separate width-indexed recipe table. Every thunk enqueues exactly one
-// matching kernel. Bindings carry pdl_contract; append adds them under it.
+// matching kernel. Callers can opt into programmatic edges under pdl_contract.
 class Bindings {
 public:
-    Bindings(const StepBlock* descriptor, unsigned rows, const Thunks& thunks);
+    Bindings(const StepBlock* descriptor, unsigned rows, const Thunks& thunks, bool early_launch = false);
 
     [[nodiscard]] KernelBinding bind(const Bf16DenseGroup&) const;
     [[nodiscard]] KernelBinding bind(const core::residual_mix::MixArgs&) const;
@@ -82,6 +82,7 @@ private:
     const StepBlock* descriptor_;
     std::size_t index_;
     const Thunks& thunks_;
+    bool early_launch_;
 };
 
 template <class Args>

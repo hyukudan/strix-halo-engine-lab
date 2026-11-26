@@ -40,7 +40,7 @@ void test() {
     std::set<std::string> identities;
 
     for (auto rows : wr1::widths) {
-        wr1::Bindings bindings(&descriptor, rows, thunks);
+        wr1::Bindings bindings(&descriptor, rows, thunks, true);
         CudaProgramRecipe recipe;
         const auto append = [&](const auto& args, bool = false) { bindings.append(recipe, args); };
         const auto fp32 = decode::Bf16DenseGroup{input.data(), 32,
@@ -122,12 +122,16 @@ void test() {
     }
     check(waited == 4, "WR1 waited leaf count");
     {
-        wr1::Bindings bindings(&descriptor, 4, thunks);
-        const auto rms = bindings.bind(decode::RmsBf16{input.data(), weights.data(), output.data(), 1U, 32U, 0.001F});
+        wr1::Bindings bindings(&descriptor, 4, thunks, true);
+        const decode::RmsBf16 args{input.data(), weights.data(), output.data(), 1U, 32U, 0.001F};
+        const auto rms = bindings.bind(args);
         check(rms.pdl.wait == PdlWait::before_step_io && rms.pdl.opt_out == PdlOptOut::none,
               "RMS binding lost its wait contract");
         check(bindings.bind(decode::Bf16Round{output.data(), 32}).pdl.opt_out == PdlOptOut::legacy_schedule,
               "pointwise binding gained an early launch");
+        const wr1::Bindings incumbent(&descriptor, 4, thunks);
+        check(incumbent.bind(args).pdl.opt_out == PdlOptOut::legacy_schedule,
+              "the incumbent WR1 graph must opt out of early launch");
     }
     check(decode::controller_scratch_floats(32, 16, 1) == 144 &&
           decode::controller_scratch_floats(32, 16, 4) == 832, "controller scratch layout");
