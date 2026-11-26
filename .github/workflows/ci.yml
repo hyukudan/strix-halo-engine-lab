@@ -61,6 +61,10 @@ jobs:
           python3 -B tools/ci/test_check_layering.py
           python3 -B tools/ci/check_layering.py
 
+      - name: Check generated assembly
+        shell: bash
+        run: python3 -I -B tools/ci/check_generated_asm.py
+
       - name: CI helper tests
         shell: bash
         run: python3 -B tools/ci/test_ci_helpers.py

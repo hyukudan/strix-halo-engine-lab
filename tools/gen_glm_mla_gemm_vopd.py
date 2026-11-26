@@ -38,7 +38,7 @@ for p in range(ROWS // 2):
     ins = ", ".join([*(f'"{{v{AV + r}}}"(av[{r}])' for r in (i, i + 1)),
                      *(f'"{{v{WV + j}}}"(wv[{j}])' for j in range(COLS))])
     print(f"template <> __device__ __forceinline__ void mla_gemm_vopd_rows<{p}>({sig}) {{")
-    print('    asm("' + "\\n\\t".join(lines) + '"')
+    print('    STRIX_HIP_RDNA3_ASM(asm("' + "\\n\\t".join(lines) + '"')
     print(f"        : {outs}")
-    print(f"        : {ins});")
+    print(f"        : {ins}));")
     print("}")
