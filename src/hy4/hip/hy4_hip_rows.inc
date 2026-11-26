@@ -236,7 +236,7 @@ void cache_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> latent[l] (+ t
     if (idx)
         for (std::uint32_t r = 0; r < R; ++r) {
             const RowBind bind(*this, r);
-            index_keys(l);
+            index_keys(l, false);  // verify rows: no shared same-input projection ran, project here
         }
 }
 

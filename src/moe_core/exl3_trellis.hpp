@@ -16,6 +16,7 @@
 
 #include "../core/hadamard.hpp"
 #include "../core/trellis_codec.hpp"
+#include "strix/hip/legacy_intrinsics.hpp"
 #include "../hip/weight/trellis_sources.hpp"
 #include "exl3_lane_window.hpp"
 
