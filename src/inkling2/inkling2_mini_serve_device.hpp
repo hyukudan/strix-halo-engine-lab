@@ -92,9 +92,18 @@ inline MiniServeCohort make_mini_device_cohort(
         const auto ladder = mini_served_chunk_ladder(opt.prefill_rows, opt.prefill_fallback_rows);
         const auto load = [&](std::uint32_t chunk, bool last) {
             const bool route = opt.served_cli_route && chunk == ladder.rows[0];
+            // CUDA: slot 0 binds the command line's verify window tape (the constructor's verify rows, as the command
+            // line's load.verify_rows) when windows may be served: a staged window is then taped, so it replays its
+            // window program and a partial commit rebuilds by copies. Without it (q63) every served window ran eagerly
+            // and every partial commit replayed its kept rows: served code 100.9 tok/s vs 180.6 on the command line.
+#if defined(__HIPCC__)
+            const unsigned tape_rows = 0U;  // HIP served windows: unchanged
+#else
+            const unsigned tape_rows = opt.speculation ? kMiniMaxVerifyRows : 0U;
+#endif
             auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, chunk,
                 packed_decode, MiniResidentBackend::default_step_graphs,
-                weights.roles(), 0U, draft_taps, rows, route ? opt.prefill_tail : 0U,
+                weights.roles(), tape_rows, draft_taps, rows, route ? opt.prefill_tail : 0U,
                 opt.experts_nvfp4, opt.controller_one_plane, route, lowbit);
             if (!mini_decode_only_pack_route_ok(calibrated, decode_only_pack, decoder->prefill_emits_first()))
                 throw std::logic_error("calibrated decode image on the held-back served prompt route");
