@@ -139,7 +139,8 @@ public:
     std::unique_ptr<e::StreamState> create_stream(std::uint32_t n)override{return std::make_unique<TraceStream>(target().create_stream(n),log);}
     const g::ModelConfig& config()const override{return target().config();}
     Json identity()const override{auto j=target().identity();if(unknown_identity){j.set("model_hash","");}
-        if(memory_wrapper)j.set("backend","host-memory-wrapper-evidence");return j;}
+        if(memory_wrapper){j.set("backend","host-memory-wrapper-evidence");}
+        return j;}
     std::optional<std::uint64_t> native_turn_work_bound()const override {
         return memory_wrapper?reported_work:target().native_turn_work_bound();
     }
