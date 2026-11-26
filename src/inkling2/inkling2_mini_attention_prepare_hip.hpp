@@ -69,6 +69,11 @@ struct MiniPreparedHipImageBackend : MiniPreparedHipBackend {
 
     Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
         if (use_wide_tight_group(rows)) return MiniPreparedHipBackend::linear(input, width, rows, views);
+        static const bool compact = strix::envcfg::flag(
+            "STRIX_INKLING2_HIP_ATTN_PREP_COMPACT", false, strix::EnvFlagMatch::exact);
+        if (compact && rows > core::gemv_rows::max_rows)
+            return core::fma_rows::enqueue_bf16_rows_routed<core::fma_rows::Bf16RowsSchedule::compact_narrow>(
+                input, width, rows, views, kVocabulary, operand_image, stream);
         return core::fma_rows::enqueue_bf16_rows_routed(input, width, rows, views, kVocabulary, operand_image, stream);
     }
 

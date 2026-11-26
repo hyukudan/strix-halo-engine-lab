@@ -6,6 +6,7 @@
 #if defined(__HIPCC__)
 #include "moe_core/route_wave_kernel.hpp"
 #include "moe_core/route_tap_hip.hpp"
+#include "strix/env_flags.hpp"
 #endif
 
 namespace strix::inkling2 {
@@ -22,7 +23,11 @@ inline hipError_t enqueue_mini_hip_resident_moe_for(
     moe_core::grouped_iu4a4::Selection iu4 = {}) {
     const auto select = [physical, tap](std::span<const float> logits, std::span<const float> selection_bias,
                            MiniMoeResidentRouteBuffers route, unsigned count, hipStream_t route_stream) {
-        const auto status = moe_core::enqueue_route_wave<MiniRoutePolicy, detail::MiniMoeMath, moe::RouteWaveTraits<true, true>>(
+        using Traits = moe::RouteWaveTraits<true, true>;
+        static const bool grid = strix::envcfg::flag("STRIX_MOE_ROUTE_WAVE_GRID", false, strix::EnvFlagMatch::exact);
+        const auto enqueue = grid ? moe_core::enqueue_route_wave_grid<MiniRoutePolicy, detail::MiniMoeMath, Traits>
+                                  : moe_core::enqueue_route_wave<MiniRoutePolicy, detail::MiniMoeMath, Traits>;
+        const auto status = enqueue(
             logits.data(), selection_bias.data(), route.ids.data(), route.weights.data(),
             route.status.data(), count, route_stream);
         if (status == hipSuccess)

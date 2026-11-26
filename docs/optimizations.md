@@ -6040,6 +6040,44 @@ The source receipt on gfx1151 compared complete greedy IDs on seven prompts of 2
 It measured served prefill of 602 → 2,030 tok/s at 8K and 578 → 1,870 tok/s at 32K. Device qualification of the
 integrated server is pending.
 
+<a id="hip-bf16-compact-narrow"></a>
+
+## HIP compact WMMA for narrow BF16 projections
+
+**Status** · explicit option, device ticket pending.
+`STRIX_INKLING2_HIP_ATTN_PREP_COMPACT=1` selects `Bf16RowsSchedule::compact_narrow` in the
+shared HIP BF16 rows dispatcher for eligible resident attention preparation projections.
+Two wave32 waves cover 32 rows and up to 32 outputs with 5,120 bytes of LDS.
+The FP32 activation staging, BF16 weights, ascending K16 WMMA chain and selected rounding store
+give the same arithmetic as the incumbent WMMA route. The compact schedule requires more than
+16 rows, contiguous aligned weights, disjoint output ranges and a representable grid.
+Short rows and admitted operand-image launches keep their own schedules.
+A mixed FP32 projection group can cost one extra launch. Native identity and timing are pending.
+Leave the variable unset or set it to `0` in a fresh process to use the default.
+
+<a id="hip-moe-route-wave-grid"></a>
+
+## HIP checked MoE router with four rows per block
+
+**Status** · explicit option, device ticket pending.
+`STRIX_MOE_ROUTE_WAVE_GRID=1` binds the shared four-wave32 launch to the Inkling resident
+checked router for calls of at least four rows. Each wave owns its LDS row and keeps the
+same selection, tie break, FP32 renormalization and failure status. Fewer than four rows use the
+one-wave launch. The launch reduces the number of blocks from one per row to one per four rows
+without changing the downstream expert grouping. Native identity and timing are pending.
+Leave the variable unset or set it to `0` in a fresh process to use the default.
+
+| Model | HIP compact BF16 projections | HIP checked MoE route grid |
+| --- | --- | --- |
+| Inkling 2 Mini | Explicit resident HIP option | Explicit resident HIP option |
+| Qwen3.8 Flash Next | No binding | No binding |
+| Qwen3.8-27B | No binding | No binding |
+| DeepSeek V4.1 Flash | No binding | No binding |
+| GLM-5.3 Flash | No binding | No binding |
+| MiniMax M3.1 Flash | No binding | No binding |
+| Hy4 Flash | No binding | No binding |
+| Nemotron 3.5 Bolt E4B | No binding | No binding |
+
 <a id="iu4-short-wave-quantiser"></a>
 
 ## HIP IU4 activation quantisation with eight row owners
