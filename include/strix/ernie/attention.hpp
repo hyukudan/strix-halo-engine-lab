@@ -8,6 +8,8 @@
 namespace strix::ernie {
 
 using AttentionProject = ReferenceProject;
+using AttentionHeadRange = std::function<void(std::size_t, std::size_t)>;
+using AttentionHeadExecutor = std::function<void(std::size_t, const AttentionHeadRange&)>;
 
 // One layer of one sequence. Copies own their complete causal history.
 class AttentionHistory {
@@ -16,12 +18,12 @@ public:
 
 private:
     friend std::vector<float> attention_reference(unsigned, const ReferenceShape&, const ReferenceRead&,
-        std::span<const float>, AttentionHistory&, const AttentionProject&);
+        std::span<const float>, AttentionHistory&, const AttentionProject&, const AttentionHeadExecutor&);
     friend std::vector<float> attention_reference_first_hca(const std::string&, const ReferenceShape&,
         const ReferenceRead&, std::span<const float>, const AttentionProject&);
 
     struct {
-        std::vector<float> window, compressed, carry_values, carry_logits;
+        std::vector<float> window, window_values, compressed, carry_values, carry_logits;
     } hca_;
     struct {
         std::vector<float> latents, rotary_keys, inverse_key_rms;
@@ -35,7 +37,7 @@ private:
 // precision and index gate are candidate checkpoint semantics pending a trace.
 [[nodiscard]] std::vector<float> attention_reference(unsigned layer, const ReferenceShape& shape,
     const ReferenceRead& read, std::span<const float> input, AttentionHistory& history,
-    const AttentionProject& project = {});
+    const AttentionProject& project = {}, const AttentionHeadExecutor& execute_heads = {});
 
 // Position-zero diagnostic binding, with no compressor reads or cache writes.
 [[nodiscard]] std::vector<float> attention_reference_first_hca(const std::string& prefix,

@@ -95,7 +95,8 @@ PairPayload pair_payload(const Inventory& inventory, unsigned cut) {
     return plan;
 }
 
-CheckpointWeights::CheckpointWeights(Inventory inventory) : inventory_(std::move(inventory)) {}
+CheckpointWeights::CheckpointWeights(Inventory inventory, CheckpointReadPolicy policy)
+    : inventory_(std::move(inventory)), policy_(policy) {}
 
 void CheckpointWeights::read(std::string_view name, std::span<float> out, std::size_t first_element,
                              const RowExecutor& execute) const {
@@ -136,6 +137,12 @@ void CheckpointWeights::read(std::string_view name, std::span<float> out, std::s
     if (fp8) {
         std::vector<float> scales(scale_rows * scale_columns);
         read_plain(scale_name, scale, scales);
+        if (policy_.transpose_fp8_scales && scale_rows > 1 && scale_columns > 1) {
+            const auto stored = scales;
+            for (std::size_t row = 0; row < scale_rows; ++row)
+                for (std::size_t col = 0; col < scale_columns; ++col)
+                    scales[row * scale_columns + col] = stored[col * scale_rows + row];
+        }
         const Fp8 matrix(codes, scales, rows, columns);
         schedule([&](std::size_t first, std::size_t last) {
             for (auto row = first; row < last; ++row) matrix.decode_row(row, out.subspan(row * columns, columns));
@@ -145,10 +152,24 @@ void CheckpointWeights::read(std::string_view name, std::span<float> out, std::s
         if (scales.size() / scale_columns != rows || scales.size() % scale_columns != 0)
             throw std::invalid_argument("ERNIE: scale slice does not match MXFP4 matrix shape");
         schedule([&](std::size_t first, std::size_t last) {
-            for (auto row = first; row < last; ++row)
-                weight::microscaled::decode_mxfp4_row(std::span(codes).subspan(row * packed_width, packed_width),
-                    std::span(scales).subspan(row * scale_columns, scale_columns), out.subspan(row * columns, columns));
+            for (auto row = first; row < last; ++row) {
+                const auto bytes = std::span(codes).subspan(row * packed_width, packed_width);
+                const auto block_scales = std::span(scales).subspan(row * scale_columns, scale_columns);
+                auto values = out.subspan(row * columns, columns);
+                if (policy_.table_mxfp4 || policy_.high_nibble_first)
+                    weight::microscaled::decode_mxfp4_row_table(bytes, block_scales, values, policy_.high_nibble_first);
+                else weight::microscaled::decode_mxfp4_row(bytes, block_scales, values);
+            }
         });
+        if (policy_.transpose_experts) {
+            if (rows != columns) throw std::invalid_argument("ERNIE: transpose probe requires a square expert matrix");
+            constexpr std::size_t tile = 32;
+            for (std::size_t i = 0; i < rows; i += tile)
+                for (std::size_t j = 0; j <= i; j += tile)
+                    for (auto r = i; r < std::min(i + tile, rows); ++r)
+                        for (auto c = j; c < std::min(j + tile, r); ++c)
+                            std::swap(out[r * rows + c], out[c * rows + r]);
+        }
     }
 }
 

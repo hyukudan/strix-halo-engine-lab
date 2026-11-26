@@ -29,12 +29,19 @@ struct PairPayload {
 // Header-derived lazy weight source for the target reference. Quantized
 // matrices are requested whole (two planes decoded through shared codecs).
 // Plain tensors also support ranged reads, e.g. one embedding row.
+struct CheckpointReadPolicy {
+    bool table_mxfp4 = false;
+    bool high_nibble_first = false;
+    bool transpose_experts = false;
+    bool transpose_fp8_scales = false;
+};
+
 class CheckpointWeights {
 public:
     using RowRange = std::function<void(std::size_t first, std::size_t last)>;
     using RowExecutor = std::function<void(std::size_t rows, const RowRange&)>;
 
-    explicit CheckpointWeights(Inventory inventory);
+    explicit CheckpointWeights(Inventory inventory, CheckpointReadPolicy policy = {});
     [[nodiscard]] const Inventory& inventory() const { return inventory_; }
     // An executor may partition independent decoder rows. It joins all ranges
     // before returning or throwing.
@@ -42,6 +49,7 @@ public:
               const RowExecutor& execute = {}) const;
 private:
     Inventory inventory_;
+    CheckpointReadPolicy policy_;
 };
 
 } // namespace strix::ernie

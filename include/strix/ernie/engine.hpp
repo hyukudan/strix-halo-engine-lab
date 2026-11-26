@@ -7,10 +7,29 @@
 
 namespace strix::ernie {
 
+enum class RouterContract { candidate, unit_gain, gain_before_normalize, swapped_planes, single_plane };
+enum class VhaContract { residual, swapped, off, non_residual };
+enum class KeyNormContract { candidate, value_before_head_norm, weighted_only, none };
+enum class ResidualContract { candidate, transpose, half_post, feature_interleave, bf16 };
+
+struct HostContracts {
+    RouterContract router{};
+    VhaContract vha{};
+    KeyNormContract key_norm{};
+    ResidualContract residual{};
+    bool global_kv_split = false;
+    bool gate_before_vha = false;
+    bool no_hca_inverse_rope = false;
+    unsigned position_offset = 0;
+    float rope_base = 0;
+    float rms_epsilon = 0;
+};
+
 struct ReferenceShape {
     unsigned hidden, vocab, dense_width, latent_width, expert_width;
     unsigned heads, head_dim, rope_dim, q_rank, o_groups, o_rank, vha_rank;
     moe::RoutePolicy route;
+    HostContracts contracts{};
 };
 
 [[nodiscard]] ReferenceShape checkpoint_reference_shape();
@@ -45,6 +64,7 @@ public:
     [[nodiscard]] LayerResult block(unsigned layer, std::span<const float> streams,
                                     const AttentionRow& attend) const;
     [[nodiscard]] std::vector<float> embed(std::uint32_t token) const;
+    [[nodiscard]] std::vector<float> head_input(std::span<const float> streams) const;
     [[nodiscard]] std::vector<float> raw_logits(std::span<const float> streams) const;
     [[nodiscard]] std::vector<float> embedding_first_block_logits(std::uint32_t token) const;
 

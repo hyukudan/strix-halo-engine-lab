@@ -28,6 +28,39 @@ two-bit and three-bit pilot plans replace the observed experts from a narrow
 slice. Load an explicit sidecar with `--pack` and use `--replay` for paired
 logit measurements. These options do not enter runtime tiers.
 
+### Teacher-forced host diagnostics
+
+```sh
+strix-ernie-cpu CHECKPOINT_DIR TEXT.txt BASE --oracle --limit 64 --save-layers \
+  --threads 12 --cache-mib 8192 --ordered-simd --table-mxfp4 --profile-host
+strix-ernie-cpu CHECKPOINT_DIR TEXT.txt PROBE --oracle --limit 64 --resume BASE \
+  --start-layer 7 --end-layer 8 --variant mla-global-kv --threads 12 --cache-mib 8192 \
+  --ordered-simd --table-mxfp4
+```
+
+The oracle tokenizes ordinary UTF-8 text. Each row predicts the actual next
+token from the causal prefix. `--bos` explicitly inserts the checkpoint's begin
+token. `scores.tsv` contains IDs, negative log-likelihood in nats and top-1
+hits. `run.json` includes the mean, perplexity and empirical unigram entropy for
+the same target IDs. `rms.tsv` and `layers.tsv` describe the residual before
+each indexed layer and after the last layer.
+
+With `--save-layers`, the runner writes a little-endian F32 image at each
+boundary. Use the same immutable checkpoint and text to resume that image.
+The runner checks the saved token IDs and boundary size and rebuilds causal
+history within every recomputed layer. Boundary 43 is the input to the output
+head. Stopping earlier applies the final head as an intermediate diagnostic;
+the resulting loss is a logit-lens score for that boundary.
+
+The scalar reference and the opt-in ordered FMA path run the same column
+chain for each output. The batch head streams each weight block once for
+every position. The table MXFP4 decoder is also opt-in and widens the same
+low-first E2M1 and E8M0 operands. `--profile-host` reports projection and
+weight-access timings separately. Contract switches are experimental host
+diagnostics and carry their settings into the receipt.
+`--parallel-mla` distributes independent latent-attention heads over the
+same host workers and admits the decoded KV-B matrix to the bounded cache.
+
 The [pair plan](pair-plan.md) describes native weight placement, memory admission,
 the shared transport seam and the first device ticket.
 

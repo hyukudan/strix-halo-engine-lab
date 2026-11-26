@@ -40,9 +40,10 @@ struct ReferenceHybridQueries {
 // Keys share their own domain's rotated query. The compressed value accessor
 // supplies values already expressed in the window value domain, permitting a
 // single inverse rotation after the common reduction.
-template<class WindowAt, class PooledKeyAt, class PooledValueAt>
+template<class WindowAt, class WindowValueAt, class PooledKeyAt, class PooledValueAt>
 void hybrid_mqa_reference(const ReferenceHybridQueries& q, std::size_t window_count, std::size_t pooled_count,
-    WindowAt window_at, PooledKeyAt pooled_key, PooledValueAt pooled_value, std::span<float> output) {
+    WindowAt window_at, WindowValueAt window_value, PooledKeyAt pooled_key, PooledValueAt pooled_value,
+    std::span<float> output) {
     if (q.dim == 0 || window_count == 0 || q.window_heads.size() != q.sink.size() * q.dim ||
         q.compressed_heads.size() != q.window_heads.size() || output.size() != q.window_heads.size())
         throw std::invalid_argument("hybrid attention: invalid head geometry");
@@ -60,11 +61,17 @@ void hybrid_mqa_reference(const ReferenceHybridQueries& q, std::size_t window_co
             return score * scale;
         };
         const auto value_at = [&](std::size_t row) {
-            return row < window_count ? window_at(row) : pooled_value(row - window_count);
+            return row < window_count ? window_value(row) : pooled_value(row - window_count);
         };
         detail::causal_fp32_head(output.subspan(at, q.dim), window_count + pooled_count,
                                  q.sink[h], score_at, value_at);
     }
+}
+
+template<class WindowAt, class PooledKeyAt, class PooledValueAt>
+void hybrid_mqa_reference(const ReferenceHybridQueries& q, std::size_t window_count, std::size_t pooled_count,
+    WindowAt window_at, PooledKeyAt pooled_key, PooledValueAt pooled_value, std::span<float> output) {
+    hybrid_mqa_reference(q, window_count, pooled_count, window_at, window_at, pooled_key, pooled_value, output);
 }
 
 } // namespace strix::attn_core

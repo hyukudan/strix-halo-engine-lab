@@ -157,6 +157,14 @@ void latent_attention() {
         [&](std::size_t) { return SelectedLatentRow{latent, rotary, inverse}; }, output);
     near(output[0], 10.0F / 3.0F, "absorbed plain-key score changes attended weight");
     near(output[1], 14.0F / 3.0F, "separate rotary-key score changes attended weight");
+    const auto execute = [](std::size_t count, const LatentHeadRange& work) {
+        for (auto i = count; i > 0; --i) work(i - 1, i);
+    };
+    std::array<float, 2> split_inverse{}, split_output{};
+    latent_key_inverse_rms_reference(shape, projections, latent, rotary, epsilon, split_inverse, execute);
+    selected_latent_attention_reference(shape, projections, query_with_scores, sinks, only,
+        [&](std::size_t) { return SelectedLatentRow{latent, rotary, split_inverse}; }, split_output, execute);
+    check(inverse == split_inverse && output == split_output, "MLA ranges are independent");
 }
 
 void mla_history() {

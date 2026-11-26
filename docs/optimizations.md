@@ -87,6 +87,42 @@ block. The host fixture checks startup, work and return to idle. Native
 idle-and-resume qualification is pending.
 [Lead](../src/glm/serve/glm_serve_lead.hpp) · [Fixture](../tests/glm_serve_cpu_tests.cpp).
 
+<a id="ernie-ordered-fma"></a>
+### ERNIE ordered host FMA
+
+`--ordered-simd` uses the shared CPU dense kernel. The matrix-vector
+path interleaves independent outputs, and the batch vocabulary head uses
+eight positions per vector. Every result keeps the scalar FMA chain.
+The host selects this path when AVX2 and FMA are available.
+
+| Engines | State |
+| --- | --- |
+| ERNIE 5.5 Flash Preview | Opt-in host candidate |
+| Inkling2 Mini, Qwen3.8 Flash Next, Qwen3.8 27B, DeepSeek V4.1 Flash, GLM 5.3 Flash, MiniMax M3.1 Flash, Hy4 Flash, Nemotron 3.5 Bolt E4B | Unaffected |
+
+<a id="ernie-mxfp4-table"></a>
+### ERNIE table MXFP4 decode
+
+`--table-mxfp4` uses a shared host lookup for the ordinary E8M0 scale
+range and delegates extreme scales to the scalar decoder. The fixture
+compares signed zeros and all finite scales supported by every E2M1 code.
+
+| Engines | State |
+| --- | --- |
+| ERNIE 5.5 Flash Preview | Opt-in host candidate |
+| Inkling2 Mini, Qwen3.8 Flash Next, Qwen3.8 27B, DeepSeek V4.1 Flash, GLM 5.3 Flash, MiniMax M3.1 Flash, Hy4 Flash, Nemotron 3.5 Bolt E4B | Unaffected |
+
+<a id="ernie-head-parallel-mla"></a>
+### ERNIE head-parallel MLA
+
+`--parallel-mla` partitions independent key-normalization and attention
+heads. It admits decoded KV-B to the same matrix cache as other projections.
+
+| Engines | State |
+| --- | --- |
+| ERNIE 5.5 Flash Preview | Opt-in host candidate |
+| Inkling2 Mini, Qwen3.8 Flash Next, Qwen3.8 27B, DeepSeek V4.1 Flash, GLM 5.3 Flash, MiniMax M3.1 Flash, Hy4 Flash, Nemotron 3.5 Bolt E4B | Unaffected |
+
 <a id="ernie-parallel-checkpoint-decode"></a>
 ### ERNIE parallel checkpoint row decoding
 

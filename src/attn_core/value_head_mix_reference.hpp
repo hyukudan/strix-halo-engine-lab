@@ -9,7 +9,7 @@ namespace strix::attn_core {
 // V[h,r] contracts the head axis and U[h,r] projects it back. The input and
 // output use [head][channel]; each channel is mixed independently.
 inline void residual_value_head_mix(std::span<float> values, unsigned heads, unsigned rank,
-                                    std::span<const float> u, std::span<const float> v) {
+                                    std::span<const float> u, std::span<const float> v, bool residual = true) {
     if (heads == 0 || rank == 0 || values.empty() || values.size() % heads != 0 ||
         u.size() != std::size_t{heads} * rank || v.size() != u.size())
         throw std::invalid_argument("value head mix: incompatible dimensions");
@@ -21,8 +21,11 @@ inline void residual_value_head_mix(std::span<float> values, unsigned heads, uns
             for (unsigned h = 0; h < heads; ++h) coefficients[h] = v[std::size_t{h} * rank + r];
             latent[r] = core::dot_f32(coefficients, column);
         }
-        for (unsigned h = 0; h < heads; ++h)
-            values[h * width + d] += core::dot_f32(u.subspan(std::size_t{h} * rank, rank), latent);
+        for (unsigned h = 0; h < heads; ++h) {
+            const auto mixed = core::dot_f32(u.subspan(std::size_t{h} * rank, rank), latent);
+            if (residual) values[h * width + d] += mixed;
+            else values[h * width + d] = mixed;
+        }
     }
 }
 

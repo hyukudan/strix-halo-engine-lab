@@ -46,6 +46,14 @@ hc::Spec hc_spec(unsigned hidden, hc::Site site) {
     return spec;
 }
 
+std::vector<float> feature_order(std::span<const float> streams, unsigned hidden) {
+    std::vector<float> ordered(streams.size());
+    for (unsigned d = 0; d < hidden; ++d)
+        for (unsigned c = 0; c < kStreams; ++c)
+            ordered[std::size_t{d} * kStreams + c] = streams[std::size_t{c} * hidden + d];
+    return ordered;
+}
+
 struct RouteMath {
     static float exp(float x) { return std::exp(x); }
 };
@@ -129,10 +137,17 @@ void FirstRowReference::feed_forward(unsigned layer_id, const std::string& layer
     project(prefix + "gate.weight_1", input, mix);
     moe::route_scores_ref<RouteMath>(s.route.score, select, select);
     moe::route_scores_ref<RouteMath>(s.route.score, mix, mix);
+    if (s.contracts.router == RouterContract::swapped_planes) std::swap(select, mix);
+    if (s.contracts.router == RouterContract::single_plane) mix = select;
+    auto gain = read(prefix + "gate.routed_scaling_factor_param", s.route.experts);
+    if (s.contracts.router == RouterContract::gain_before_normalize)
+        for (std::size_t i = 0; i < mix.size(); ++i) mix[i] *= gain[i];
+    if (s.contracts.router == RouterContract::unit_gain || s.contracts.router == RouterContract::gain_before_normalize)
+        std::ranges::fill(gain, 1.0F);
     result.experts.resize(s.route.top_k);
     result.expert_weights.resize(s.route.top_k);
     moe::route_select_split_ref(s.route, select, mix, read(prefix + "e_score_correction_bias", s.route.experts),
-        read(prefix + "gate.routed_scaling_factor_param", s.route.experts), result.experts, result.expert_weights);
+        gain, result.experts, result.expert_weights);
 
     const auto project_expert = [&](unsigned id, moe::ExpertProjection kind,
                                     std::span<const float> value, std::span<float> out) {
@@ -145,7 +160,8 @@ void FirstRowReference::feed_forward(unsigned layer_id, const std::string& layer
             project(expert + "w2.weight", value, out);
         }
     };
-    moe_core::latent_experts_reference(input, read(prefix + "latent_norm.weight", s.latent_width), kRmsEps,
+    const auto epsilon = s.contracts.rms_epsilon > 0 ? s.contracts.rms_epsilon : kRmsEps;
+    moe_core::latent_experts_reference(input, read(prefix + "latent_norm.weight", s.latent_width), epsilon,
         [&](auto in, auto out) { project(prefix + "fc1_latent_proj.weight", in, out); },
         [&](auto in, auto out) {
             moe::combine_routed_reference(s.expert_width, in, result.experts, result.expert_weights,
@@ -172,7 +188,11 @@ LayerResult FirstRowReference::block(unsigned layer, std::span<const float> stre
                                      const AttentionRow& attend) const {
     if (layer >= kLayerCount || !attend)
         throw std::invalid_argument("ERNIE: invalid target block binding");
-    const auto site = hc_spec(shape_.hidden, hc::Site::sublayer);
+    auto site = hc_spec(shape_.hidden, hc::Site::sublayer);
+    const auto residual_contract = shape_.contracts.residual;
+    if (residual_contract == ResidualContract::half_post) site.post_magnitude = 1.0F;
+    if (residual_contract == ResidualContract::bf16) site.store = hc::Store::bf16;
+    const auto epsilon = shape_.contracts.rms_epsilon > 0 ? shape_.contracts.rms_epsilon : kRmsEps;
     const auto prefix = target_layer_prefix(layer);
     const auto run_site = [&](const char* name, const char* norm, std::span<const float> residual,
                               std::span<float> next, const auto& compute) {
@@ -181,10 +201,17 @@ LayerResult FirstRowReference::block(unsigned layer, std::span<const float> stre
                                read(hp + "alpha_res", 1).front()};
         const auto fn = read(hp + "mapping_proj.weight", site.flat() * site.mix_rows());
         const auto base = read(hp + "bias", site.mix_rows());
-        const auto mix = hc::mixes(site, residual, {{}, fn, base, scale, hc::FnLayout::feature_major});
+        const auto ordered = residual_contract == ResidualContract::feature_interleave
+            ? feature_order(residual, shape_.hidden) : std::vector<float>{};
+        auto mix = hc::mixes(site, ordered.empty() ? residual : std::span<const float>(ordered),
+                            {{}, fn, base, scale, hc::FnLayout::feature_major});
+        if (residual_contract == ResidualContract::transpose)
+            for (unsigned i = 0; i < kStreams; ++i)
+                for (unsigned j = 0; j < i; ++j)
+                    std::swap(mix.comb[i * kStreams + j], mix.comb[j * kStreams + i]);
         std::vector<float> normalized(shape_.hidden);
         hc::collapse(site, residual, mix.pre, normalized);
-        core::rms_norm_bf16_reference(normalized, read(prefix + norm, normalized.size()), kRmsEps);
+        core::rms_norm_bf16_reference(normalized, read(prefix + norm, normalized.size()), epsilon);
         hc::expand(site, compute(normalized), residual, mix, next);
     };
     LayerResult result{std::vector<float>(site.flat()), std::vector<float>(shape_.hidden),
@@ -209,15 +236,26 @@ std::vector<float> FirstRowReference::embed(std::uint32_t token) const {
     return streams;
 }
 
-std::vector<float> FirstRowReference::raw_logits(std::span<const float> streams) const {
-    const auto site = hc_spec(shape_.hidden, hc::Site::head);
+std::vector<float> FirstRowReference::head_input(std::span<const float> streams) const {
+    auto site = hc_spec(shape_.hidden, hc::Site::head);
+    if (shape_.contracts.residual == ResidualContract::bf16) site.store = hc::Store::bf16;
     const auto fn = read("model.mhc_contract.hc_head_fn", site.flat() * site.mix_rows());
     const auto base = read("model.mhc_contract.hc_head_base", site.mix_rows());
     const auto scale = read("model.mhc_contract.hc_head_scale", 1);
-    const auto mix = hc::mixes(site, streams, {{}, fn, base, scale, hc::FnLayout::feature_major});
-    std::vector<float> row(shape_.hidden), logits(shape_.vocab);
+    const auto ordered = shape_.contracts.residual == ResidualContract::feature_interleave
+        ? feature_order(streams, shape_.hidden) : std::vector<float>{};
+    const auto mix = hc::mixes(site, ordered.empty() ? streams : std::span<const float>(ordered),
+                              {{}, fn, base, scale, hc::FnLayout::feature_major});
+    std::vector<float> row(shape_.hidden);
     hc::collapse(site, streams, mix.pre, row);
-    core::rms_norm_bf16_reference(row, read("model.norm.weight", row.size()), kRmsEps);
+    const auto epsilon = shape_.contracts.rms_epsilon > 0 ? shape_.contracts.rms_epsilon : kRmsEps;
+    core::rms_norm_bf16_reference(row, read("model.norm.weight", row.size()), epsilon);
+    return row;
+}
+
+std::vector<float> FirstRowReference::raw_logits(std::span<const float> streams) const {
+    const auto row = head_input(streams);
+    std::vector<float> logits(shape_.vocab);
     project("lm_head.weight", row, logits);
     return logits;
 }

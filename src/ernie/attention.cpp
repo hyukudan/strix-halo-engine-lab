@@ -33,8 +33,10 @@ static_assert(kWindow > 0 && kCompression >= 2 && kIndexDim % 32U == 0 && kTopK 
 
 struct RotaryRow {
     std::vector<float> c, s;
-    RotaryRow(unsigned dim, unsigned position, bool compressed) : c(dim / 2U), s(dim / 2U) {
-        attn::hybrid_rope_row(position, compressed ? a::compress_rope_theta : static_cast<double>(a::rope_theta),
+    RotaryRow(unsigned dim, unsigned position, bool compressed, const HostContracts& contract)
+        : c(dim / 2U), s(dim / 2U) {
+        const double base = contract.rope_base > 0 ? contract.rope_base : static_cast<double>(a::rope_theta);
+        attn::hybrid_rope_row(position + contract.position_offset, compressed ? a::compress_rope_theta : base,
                              compressed ? &kYarn : nullptr, c, s);
     }
     void apply(std::span<float> rows, unsigned width, bool inverse = false) const {
@@ -60,18 +62,18 @@ struct LayerWeights {
 };
 
 void postmix(const LayerWeights& w, const ReferenceShape& s, std::span<float> heads) {
+    if (s.contracts.vha == VhaContract::off) return;
     const auto count = std::size_t{s.heads} * s.vha_rank;
+    auto u = w.tensor("vha_postmix_U", count), v = w.tensor("vha_postmix_V", count);
+    if (s.contracts.vha == VhaContract::swapped) std::swap(u, v);
     attn_core::residual_value_head_mix(heads, s.heads, s.vha_rank,
-        w.tensor("vha_postmix_U", count), w.tensor("vha_postmix_V", count));
+        u, v, s.contracts.vha != VhaContract::non_residual);
 }
 
-std::vector<float> output_projection(const LayerWeights& w, std::span<const float> query_lora,
-                                    std::span<float> values, unsigned hidden) {
-    std::vector<float> gate(values.size()), output(hidden);
+void gate_values(const LayerWeights& w, std::span<const float> query_lora, std::span<float> values) {
+    std::vector<float> gate(values.size());
     w.linear("gate_proj.weight", query_lora, gate);
     core::sigmoid_product_reference(values, gate, values, core::SigmoidGatePrecision::f32);
-    w.linear("o_proj.weight", values, output);
-    return output;
 }
 
 template<class T>
@@ -86,17 +88,21 @@ std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
     const auto width = s.head_dim;
     const auto ring_size = std::size_t{kWindow} * width;
     const auto carry_size = std::size_t{kCompression - 1U} * width;
+    const auto eps = s.contracts.rms_epsilon > 0 ? s.contracts.rms_epsilon : kEpsilon;
+    const bool separate_values = s.contracts.key_norm == KeyNormContract::value_before_head_norm;
     if (position != 0 && (state.window.size() != ring_size || state.carry_values.size() != carry_size))
         throw std::invalid_argument("ERNIE HCA: history geometry changed");
 
     std::vector<float> q_lora(s.q_rank), query(std::size_t{s.heads} * width), kv(width);
     w.linear("linear_q_down_proj.weight", input, q_lora);
-    core::rms_norm_bf16_reference(q_lora, w.tensor("q_layernorm.weight", q_lora.size()), kEpsilon);
+    core::rms_norm_bf16_reference(q_lora, w.tensor("q_layernorm.weight", q_lora.size()), eps);
     w.linear("linear_q_up_proj.weight", q_lora, query);
     w.linear("linear_kv_proj.weight", input, kv);
-    core::rms_norm_bf16_reference(kv, w.tensor("kv_layernorm.weight", kv.size()), kEpsilon);
-    attn::head_rms_reference(query, width, kEpsilon);
-    attn::head_rms_reference(kv, width, kEpsilon);
+    core::rms_norm_bf16_reference(kv, w.tensor("kv_layernorm.weight", kv.size()), eps);
+    auto local_value = separate_values ? kv : std::vector<float>{};
+    if (s.contracts.key_norm != KeyNormContract::none) attn::head_rms_reference(query, width, eps);
+    if (s.contracts.key_norm != KeyNormContract::weighted_only && s.contracts.key_norm != KeyNormContract::none)
+        attn::head_rms_reference(kv, width, eps);
 
     constexpr std::string_view compressor = "core_attention.compressor.";
     std::vector<float> carry_value(width), carry_logit(width), pooled;
@@ -105,25 +111,33 @@ std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
         w.linear(std::string(compressor) + "linear_wgate.weight", input, carry_logit);
     }
     const auto carry_row = position % kCompression;
-    const RotaryRow window_rope(s.rope_dim, position, false), compressed_rope(s.rope_dim, position, true);
+    const RotaryRow window_rope(s.rope_dim, position, false, s.contracts),
+                    compressed_rope(s.rope_dim, position, true, s.contracts);
     if (carry_row == kCompression - 1U) {
         pooled.resize(width);
         attn_core::projected_ape_pool_reference<kCompression>(state.carry_values, state.carry_logits,
             carry_value, carry_logit, w.tensor(std::string(compressor) + "ape", std::size_t{kCompression} * width),
             pooled);
-        core::rms_norm_bf16_reference(pooled, w.tensor(std::string(compressor) + "norm.weight", width), kEpsilon);
-        RotaryRow(s.rope_dim, position + 1U - kCompression, true).apply(pooled, width);
+        core::rms_norm_bf16_reference(pooled, w.tensor(std::string(compressor) + "norm.weight", width), eps);
+        RotaryRow(s.rope_dim, position + 1U - kCompression, true, s.contracts).apply(pooled, width);
     }
 
     auto compressed_query = query;
     window_rope.apply(query, width);
     window_rope.apply(kv, width);
+    if (separate_values) window_rope.apply(local_value, width);
     compressed_rope.apply(compressed_query, width);
     const auto window_start = attn_core::mask::window_lo(position, kWindow);
     const auto window_at = [&](std::size_t row) -> std::span<const float> {
         const auto token = window_start + row;
         if (token == position) return kv;
         return std::span(state.window).subspan((token % kWindow) * width, width);
+    };
+    const auto window_value = [&](std::size_t row) -> std::span<const float> {
+        if (!separate_values) return window_at(row);
+        const auto token = window_start + row;
+        if (token == position) return local_value;
+        return std::span(state.window_values).subspan((token % kWindow) * width, width);
     };
     // The just-completed group and the current window may overlap. Both are
     // visible, with raw-window keys first in the reduction.
@@ -143,16 +157,19 @@ std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
     const auto sinks = w.tensor("core_attention.attn_sink", s.heads);
     if (record_history) {
         attn_core::hybrid_mqa_reference({width, query, compressed_query, sinks},
-            position - window_start + 1U, compressed_count, window_at, pooled_key, pooled_value, heads);
+            position - window_start + 1U, compressed_count, window_at, window_value, pooled_key, pooled_value, heads);
     } else {
         std::vector<float> keys(width), values(width);
-        attn_core::causal_gqa_reference({s.heads, 1, width}, {0, query, kv, kv, 0, {}, sinks}, {keys, values}, heads);
+        attn_core::causal_gqa_reference({s.heads, 1, width}, {0, query, kv, window_value(0), 0, {}, sinks},
+                                       {keys, values}, heads);
     }
-    window_rope.apply(heads, width, true);
+    if (!s.contracts.no_hca_inverse_rope) window_rope.apply(heads, width, true);
     postmix(w, s, heads);
     std::vector<float> grouped(std::size_t{s.o_groups} * s.o_rank);
     w.linear("linear_o_group_proj", heads, grouped, s.o_groups);
-    auto output = output_projection(w, q_lora, grouped, s.hidden);
+    std::vector<float> output(s.hidden);
+    gate_values(w, q_lora, grouped);
+    w.linear("o_proj.weight", grouped, output);
     if (!record_history) return output;
 
     // Prepare allocation before touching any live row. An interrupted read or
@@ -162,11 +179,14 @@ std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
         state.carry_values.reserve(carry_size);
         state.carry_logits.reserve(carry_size);
         state.window.resize(ring_size);
+        if (separate_values) state.window_values.resize(ring_size);
         state.carry_values.resize(carry_size);
         state.carry_logits.resize(carry_size);
     }
     reserve_append(state.compressed, pooled.size());
     std::ranges::copy(kv, std::span(state.window).subspan(std::size_t{position % kWindow} * width, width).begin());
+    if (separate_values)
+        std::ranges::copy(local_value, std::span(state.window_values).subspan(std::size_t{position % kWindow} * width, width).begin());
     if (pooled.empty()) {
         std::ranges::copy(carry_value, std::span(state.carry_values).subspan(std::size_t{carry_row} * width, width).begin());
         std::ranges::copy(carry_logit, std::span(state.carry_logits).subspan(std::size_t{carry_row} * width, width).begin());
@@ -213,7 +233,7 @@ std::vector<std::uint32_t> select_mla_rows(const LayerWeights& w, const RotaryRo
 }
 
 std::vector<float> mla_reference(const LayerWeights& w, const ReferenceShape& s,
-    std::span<const float> input, unsigned position, auto& state) {
+    std::span<const float> input, unsigned position, auto& state, const AttentionHeadExecutor& execute) {
     const attn_core::SelectedLatentShape shape{s.heads, narrow<unsigned>(a::mla::kv_lora_rank),
         narrow<unsigned>(a::mla::qk_nope_head_dim), narrow<unsigned>(a::mla::qk_rope_head_dim),
         narrow<unsigned>(a::mla::v_head_dim)};
@@ -224,18 +244,21 @@ std::vector<float> mla_reference(const LayerWeights& w, const ReferenceShape& s,
         combined(shape.latent + shape.rotary), inverse(shape.heads), output_heads(std::size_t{shape.heads} * shape.value);
     const auto latent = std::span(combined).first(shape.latent);
     const auto rotary_key = std::span(combined).last(shape.rotary);
+    const auto eps = s.contracts.rms_epsilon > 0 ? s.contracts.rms_epsilon : kEpsilon;
     w.linear("q_a_proj.weight", input, q_lora);
-    core::rms_norm_bf16_reference(q_lora, w.tensor("q_a_layernorm.weight", q_lora.size()), kEpsilon);
+    core::rms_norm_bf16_reference(q_lora, w.tensor("q_a_layernorm.weight", q_lora.size()), eps);
     w.linear("q_b_proj.weight", q_lora, query);
-    attn::head_rms_reference(query, shape.qk(), kEpsilon);
+    if (s.contracts.key_norm != KeyNormContract::none) attn::head_rms_reference(query, shape.qk(), eps);
     w.linear("kv_a_proj_with_mqa.weight", input, combined);
-    core::rms_norm_bf16_reference(latent, w.tensor("kv_a_layernorm.weight", latent.size()), kEpsilon);
+    core::rms_norm_bf16_reference(latent, w.tensor("kv_a_layernorm.weight", latent.size()), eps);
 
     const auto kv_b = w.tensor("kv_b_proj.weight",
         std::size_t{shape.heads} * (shape.nope + shape.value) * shape.latent);
-    const auto projections = attn_core::split_latent_projection(shape, kv_b);
-    attn_core::latent_key_inverse_rms_reference(shape, projections, latent, rotary_key, kEpsilon, inverse);
-    const RotaryRow rotary(shape.rotary, position, false);
+    const auto projections = attn_core::split_latent_projection(shape, kv_b, s.contracts.global_kv_split);
+    if (s.contracts.key_norm == KeyNormContract::weighted_only || s.contracts.key_norm == KeyNormContract::none)
+        std::ranges::fill(inverse, 1.0F);
+    else attn_core::latent_key_inverse_rms_reference(shape, projections, latent, rotary_key, eps, inverse, execute);
+    const RotaryRow rotary(shape.rotary, position, false, s.contracts);
     rotary.apply(query, shape.qk());
     rotary.apply(rotary_key, shape.rotary);
 
@@ -254,9 +277,12 @@ std::vector<float> mla_reference(const LayerWeights& w, const ReferenceShape& s,
                 std::span(state.inverse_key_rms).subspan(row * shape.heads, shape.heads)};
     };
     attn_core::selected_latent_attention_reference(shape, projections, query,
-        w.tensor("core_attention.softmax_offset", shape.heads), selected, row_at, output_heads);
+        w.tensor("core_attention.softmax_offset", shape.heads), selected, row_at, output_heads, execute);
+    if (s.contracts.gate_before_vha) gate_values(w, q_lora, output_heads);
     postmix(w, s, output_heads);
-    auto output = output_projection(w, q_lora, output_heads, s.hidden);
+    if (!s.contracts.gate_before_vha) gate_values(w, q_lora, output_heads);
+    std::vector<float> output(s.hidden);
+    w.linear("o_proj.weight", output_heads, output);
 
     reserve_append(state.latents, latent.size());
     reserve_append(state.rotary_keys, rotary_key.size());
@@ -272,7 +298,8 @@ std::vector<float> mla_reference(const LayerWeights& w, const ReferenceShape& s,
 } // namespace
 
 std::vector<float> attention_reference(unsigned layer, const ReferenceShape& shape, const ReferenceRead& read,
-    std::span<const float> input, AttentionHistory& history, const AttentionProject& project) {
+    std::span<const float> input, AttentionHistory& history, const AttentionProject& project,
+    const AttentionHeadExecutor& execute_heads) {
     if (layer >= kLayerCount || history.position_ >= data::dims::max_context ||
         (history.position_ != 0 && history.layer_ != layer) || !read || shape.hidden != input.size() ||
         shape.hidden == 0 || shape.q_rank == 0 || shape.heads == 0 || shape.head_dim == 0 ||
@@ -280,7 +307,7 @@ std::vector<float> attention_reference(unsigned layer, const ReferenceShape& sha
         shape.vha_rank == 0 || shape.rope_dim > shape.head_dim || shape.rope_dim % 2U != 0)
         throw std::invalid_argument("ERNIE attention: incompatible row, layer or history");
     const LayerWeights weights{read, project, target_layer_prefix(layer) + "self_attn."};
-    auto result = layer_is_mla(layer) ? mla_reference(weights, shape, input, history.position_, history.mla_)
+    auto result = layer_is_mla(layer) ? mla_reference(weights, shape, input, history.position_, history.mla_, execute_heads)
                                     : hca_reference(weights, shape, input, history.position_, history.hca_, true);
     history.layer_ = layer;
     ++history.position_;
