@@ -17,7 +17,7 @@ pcie = { gen = 5, width = 16 }
 host_link = "pcie5x16"
 unified = false
 measured = "memory_bytes,units"
-note = "memory_bytes and units read from the runtime, peaks from vendor specifications"
+note = "our card; memory_bytes and units read from the runtime, peaks public spec"
 
 [[profiles]]
 name = "rtx-5090-32"
@@ -81,7 +81,7 @@ host_link = "integrated"
 unified = true
 measured = "memory_bytes"
 lowbit_rows = { small_rows = 64, wide_panels = 64 }
-note = "memory_bytes = configured GPU-visible memory (depends on the GTT setting); HIP reports 20 compute units (WGPs); measured stream read about 243 GB/s; WMMA FP16 = BF16 = IU8 rate"
+note = "our nodes; memory_bytes = GPU-visible memory as configured there (depends on the GTT setting); HIP reports 20 compute units (WGPs); measured stream read about 243 GB/s; WMMA FP16 = BF16 = IU8 rate"
 
 [[profiles]]
 name = "dgx-spark-gb10-128"

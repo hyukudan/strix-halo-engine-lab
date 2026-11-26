@@ -133,9 +133,10 @@ const Interconnect* find_interconnect(std::string_view name) noexcept {
 
 std::string catalogue_toml() {
     std::ostringstream os;
-    os << "# Device profiles from data/devices/profiles.toml with the shared interconnect classes.\n"
-          "# Peaks are dense TFLOPS / TOPS; 0 = no tensor path or not stated. Fields listed in `measured`\n"
-          "# come from runtime observations; the other fields use vendor specifications.\n"
+    // Preserve the CLI export bytes. The input TOML has its own editable-file header.
+    os << "# Generated from src/device/profiles.cpp (strix::device::catalogue_toml); do not edit by hand.\n"
+          "# Peaks are dense TFLOPS / TOPS; 0 = no tensor path or not stated. `measured` lists the fields read on our\n"
+          "# own devices; everything else is the vendor's public specification.\n"
           "schema = \"strix-device-profiles-v1\"\n";
     for (const auto& p : catalogue()) {
         os << "\n[profiles." << p.name << "]\n"
