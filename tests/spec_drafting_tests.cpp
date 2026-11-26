@@ -1441,8 +1441,8 @@ void probe_policy_tests() {
     SP_CHECK(sp::ArbiterConfig{}.probe_loss == 0.0, "the arbiter default is the fixed re-probe interval");
     SP_CHECK(sp::BlockConfig{}.arbiter.probe_loss == 0.0, "the block drafter default is the fixed re-probe interval");
     // The one measured row is model data (models/inkling2-mini.toml, generated into strix/model_data).
-    SP_CHECK(strix::model_data::inkling2_mini::speculation::probe_loss::cuda == 0.015,
-             "Inkling 2 Mini CUDA carries the measured probe_loss row");
+    static_assert(strix::model_data::inkling2_mini::speculation::probe_loss::cuda == 0.015,
+                  "Inkling 2 Mini CUDA carries the measured probe_loss row");
     const double rows[] = {strix::model_data::inkling2_mini::speculation::probe_loss::cuda, sp::kFixedReprobeInterval};
     set_probe_switch(nullptr);
     for (const double row : rows) {
