@@ -366,7 +366,7 @@ It changes what they are measured on:
 |---|---|
 | R1 route replay (MoE engines) | The lever arm replays the reference's expert ids and weights at every router call, so KL, top-1 and dNLL measure arithmetic, not route flips. Separately, the route flip rate of the lever running free (its own routes) is divided by the flip rate of the null arm running free. That ratio must be <= 1.5. |
 | R2 null-relative window KL | For each window, the KL limit is max(0.02, 1.5 x the null arm's KL on that same window). The null is a one-ulp perturbation, measured under the same replay as the lever. The pooled limits follow the null floor below. Top-1 and dNLL limits stay absolute per window. |
-| R3 held-out dNLL | dNLL is scored on token ids that neither arm generated: the recorded continuation of the text. The gate refuses labels that all equal an arm's own top-1. At least 800 scored rows are needed pooled, and the standard error is printed. |
+| R3 held-out dNLL | dNLL is scored on token ids that neither arm generated: the recorded continuation of the text. The gate refuses a window of at least 32 rows, or a pooled set of at least 32 scored rows, if all of its labels equal an arm's own top-1. At least 800 scored rows are needed pooled, and the standard error is printed. |
 
 | R2b three states per window | Top-1 and dNLL pass at the limit (disagreement <= L = max(0.07, 1.5 x the null's disagreement); dNLL <= 0.01), fail above the limit plus 2 standard errors of the window's rows (dNLL se at most 1.5 x the null's se on that window) and are UNRESOLVED in between. An unresolved window is cleared only by its content class (`--classes C.json`, declared before scoring; default the prompt-length band with a manifest, else one class): the class rows are pooled and judged by the same rule, final on >= 800 rows. |
 | R4 reference check | A window where the lever beats the exact reference by more than 3 se, while the paired lever-minus-null difference is also below -3 se, is "reference suspect" (the window test uses the raw row se, not the capped se of the pooled bars: a window whose gap lies between 3 x the capped se and 3 x the raw se passes the window check, and the final-class HOLD covers it). A window whose reference NLL is above max(3 x median, median + 2 nats) of the set (>= 3 windows) is "off-distribution": control or chat-template ids, or a timing prompt used as a gate window. Either holds the verdict. |
@@ -456,7 +456,7 @@ Qwen HIP kit: `scripts/bench/qwen/fast-gate-v2.sh` (one model load per GPU ticke
 **Prefill head dumps and engines without a route tap.** A prefill quality tool that writes the logits of a prompt's
 last rows (`<case>-<arm>.f32`, rows x vocabulary FP32, no header) is read with `--format head`. The manifest
 (`NAME TOKENS IDS_PATH` per row) gives the prompt IDs. Row `j` of a dump is scored against the prompt ID that follows it,
-so the labels are held-out text; the last row has no label and is not scored, which leaves 63 scored rows per window of
+so the labels are held-out text; the last row is checked for finiteness and has no label, which leaves 63 scored rows per window of
 64. An engine that has not bound the route tap runs every arm free. KL, top-1 and dNLL then include the route flips,
 which is a harder test than replay. The R1 flip ratio comes from the engine's per-layer trace lines
 (`{"diag":1,"case":...,"arm":...,"layers":[{"router_ids":N,...}]}`, `--trace-diag LOG`). `router_ids` counts the

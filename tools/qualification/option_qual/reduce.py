@@ -41,6 +41,7 @@ def reduce_pair(ref_path, cand_path, fmt="steps", **reader_kw):
     """reader_kw: the format's extra inputs (``head``: ids=, rows=), the same for both files."""
     read = reader(fmt)
     rows, labels, identical, vocab = [], [], True, None
+    unscored_nonfinite = {}
     h_ref, h_cand = hashlib.sha256(), hashlib.sha256()     # digests of the bytes actually reduced
     ref_iter, cand_iter = read(ref_path, h_ref, **reader_kw), read(cand_path, h_cand, **reader_kw)
     while True:
@@ -55,6 +56,10 @@ def reduce_pair(ref_path, cand_path, fmt="steps", **reader_kw):
                                   f"{(a.step, a.position, a.label, a.logits.size)} vs "
                                   f"{(b.step, b.position, b.label, b.logits.size)}")
         vocab = a.logits.size
+        if fmt == "head" and a.label == -1:
+            unscored_nonfinite = {"ref_unscored_nonfinite": not bool(np.isfinite(a.logits).all()),
+                                  "cand_unscored_nonfinite": not bool(np.isfinite(b.logits).all())}
+            continue
         identical = identical and a.argmax == b.argmax and a.logits.tobytes() == b.logits.tobytes()
         rows.append(compare(a.logits, b.logits, a.label))
         labels.append(a.label)
@@ -63,7 +68,7 @@ def reduce_pair(ref_path, cand_path, fmt="steps", **reader_kw):
     arrays = _arrays(rows, FIELDS)
     arrays["label"] = np.asarray(labels, dtype=np.int64)
     info = {"rows": len(rows), "vocab": vocab, "format": fmt, "ref_sha256": h_ref.hexdigest(),
-            "cand_sha256": h_cand.hexdigest(), "bitwise_identical": bool(identical)}
+            "cand_sha256": h_cand.hexdigest(), "bitwise_identical": bool(identical), **unscored_nonfinite}
     return arrays, info
 
 

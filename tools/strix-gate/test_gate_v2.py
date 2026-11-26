@@ -335,6 +335,12 @@ class Statistics(unittest.TestCase):
         ws = [window(f"w{i}", 256, 0.001, 1.0, 0.0, 0.001, self.rng, hit=0.6) for i in range(4)]
         self.assertAlmostEqual(v2.verdict(ws)["held_out"]["label_is_ref_top1"], 0.6, places=2)
 
+    def test_greedy_window_cannot_be_diluted_by_held_out_windows(self):
+        clean = window("document", 800, 0.001, 1.0, 0.0, 0.001, self.rng)
+        generated = window("greedy", 64, 0.001, 1.0, 0.0, 0.001, self.rng, hit=1.0)
+        with self.assertRaisesRegex(v2.GateError, "greedy: every label"):
+            v2.verdict([clean, generated])
+
     def test_route_files_flips_and_ratio(self):
         with tempfile.TemporaryDirectory() as t:
             t = pathlib.Path(t)
@@ -574,6 +580,45 @@ class HeadFormat(unittest.TestCase):
             rc, out = self.gate(self.kit(d, [f"w{i:02d}" for i in range(13)], null_ids=20, cand_ids=32))
             self.assertEqual(rc, 1, out)
             self.assertIn("FAIL flip_ratio", out)
+
+    def test_trace_null_does_not_depend_on_argument_order(self):
+        with tempfile.TemporaryDirectory() as d:
+            cases = [f"w{i:02d}" for i in range(13)]
+            d = self.kit(d, cases, null_ids=20, cand_ids=28)
+            for c in cases:
+                (d / f"{c}-n1.f32").write_bytes((d / f"{c}-n0.f32").read_bytes())
+            log = d / "r0.log"
+            before = log.read_text(encoding="utf-8")
+            log.write_text(before + "".join(line.replace('"arm":"n0"', '"arm":"n1"')
+                                             for line in before.splitlines(keepends=True) if '"arm":"n0"' in line),
+                           encoding="utf-8")
+            rc, out = self.gate(d, "--null", "n1")
+            self.assertEqual(rc, 2, out)
+            self.assertIn("--null-free", out)
+            rc, out = self.gate(d, "--null", "n1", "--null-free", "n1")
+            self.assertEqual(rc, 0, out)
+
+    def test_repeating_a_null_does_not_reweight_the_evidence(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = self.kit(d, [f"w{i:02d}" for i in range(13)], null_ids=20, cand_ids=28)
+            rc, out = self.gate(d, "--null", "n0", "--null-free", "n0")
+            self.assertEqual(rc, 2, out)
+            self.assertIn("distinct reference, candidate and null arms", out)
+
+    def test_nonfinite_last_head_row_is_checked_without_scoring_an_extra_label(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = self.kit(d, [f"w{i:02d}" for i in range(13)])
+            for arm, expected in (("fast", 1), ("exact", 2), ("n0", 2)):
+                with self.subTest(arm=arm):
+                    target = d / f"w00-{arm}.f32"
+                    original = target.read_bytes()
+                    target.write_bytes(original[:-4] + np.array([np.inf], dtype="<f4").tobytes())
+                    rc, out = self.gate(d)
+                    self.assertEqual(rc, expected, out)
+                    if expected == 1:
+                        doc = json.loads((d / "g.json").read_text(encoding="utf-8"))
+                        self.assertEqual(doc["pooled"]["nonfinite_candidate"], ["w00"])
+                    target.write_bytes(original)
 
     def test_turbo_tier_relaxes_only_its_bars(self):
         # flip ratio 32 / 20 = 1.6: above the FAST 1.5, inside the TURBO 2.0; every other rule is unchanged

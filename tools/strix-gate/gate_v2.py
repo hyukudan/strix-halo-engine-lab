@@ -180,16 +180,20 @@ def window_stats(name, kl, agree, nll_ref, nll_cand, null_kls, hit_ref=None, hit
 
 
 def check_held_out(windows):
-    """R3: labels must not be an arm's own greedy ids (both arms agreeing with every label means no held-out text)."""
-    rows = sum(w["dnll_rows"] for w in windows if "label_is_ref_top1" in w)
+    """R3: detect greedy labels in each sufficiently large window and in the pooled set."""
+    measured = [w for w in windows if "label_is_ref_top1" in w]
+    rows = sum(w["dnll_rows"] for w in measured)
     if rows < MIN_LABEL_ROWS:
         return None
-    for key in ("label_is_ref_top1", "label_is_cand_top1"):
-        frac = sum(w[key] * w["dnll_rows"] for w in windows) / rows
-        if frac >= 1.0:
-            raise GateError(f"every label equals the {'reference' if 'ref' in key else 'candidate'}'s top-1: the labels are "
-                            "that arm's greedy ids, not held-out text (R3)")
-    return {k: sum(w[k] * w["dnll_rows"] for w in windows) / rows for k in ("label_is_ref_top1", "label_is_cand_top1")}
+    pooled = {}
+    for arm, key in (("reference", "label_is_ref_top1"), ("candidate", "label_is_cand_top1")):
+        pooled[key] = sum(w[key] * w["dnll_rows"] for w in measured) / rows
+        greedy = next((w for w in measured if w["dnll_rows"] >= MIN_LABEL_ROWS and w[key] == 1.0), None)
+        if greedy is not None or pooled[key] == 1.0:
+            scope = f"{greedy['name']}: " if greedy is not None else ""
+            raise GateError(f"{scope}every label equals the {arm}'s top-1: the labels are that arm's greedy ids, "
+                            "not held-out text (R3)")
+    return pooled
 
 
 def read_routes(path, opener=None):
@@ -598,6 +602,8 @@ def qual(a):
         return _r4_reduce_pair(reduce_pair, ref, cand, a.format, opener, **kw)
 
     tier = getattr(a, "tier", "fast") or "fast"
+    if len(set([a.ref, a.cand, *a.null])) != 2 + len(a.null):
+        raise GateError("v2 needs distinct reference, candidate and null arms")
     if tier not in TIERS:
         raise GateError(f"unknown tier {tier}; tiers {sorted(TIERS)}")
     limits = TIERS[tier]
@@ -633,21 +639,22 @@ def qual(a):
     for case in cases:
         if manifest is not None and case not in manifest:
             raise GateError(f"{case}: not in the manifest")
-        kw = {"ids": manifest[case], "rows": a.head_rows} if head else {}
+        kw = {"ids": manifest[case], "rows": a.head_rows, "include_unscored": True} if head else {}
         logit = lambda arm: path_of(case, arm)  # noqa: E731
         route = lambda arm: out / "routes" / f"{case}.{arm}.rte"  # noqa: E731
         def err(arm):
             with open(out / "log" / f"{case}.{arm}.stderr", "rb", opener=opener) as f:
                 return f.read()
 
-        ra, _ = reduce(logit(a.ref), logit(a.cand), **kw)
-        nulls = [reduce(logit(a.ref), logit(n), **kw)[0] for n in a.null]
-        if ra["nonfinite_r"].any():
+        ra, ra_info = reduce(logit(a.ref), logit(a.cand), **kw)
+        null_pairs = [reduce(logit(a.ref), logit(n), **kw) for n in a.null]
+        nulls = [rows for rows, _ in null_pairs]
+        if ra["nonfinite_r"].any() or ra_info.get("ref_unscored_nonfinite"):
             raise GateError(f"{case}: non-finite reference logits")
-        if any(x["nonfinite_c"].any() for x in nulls):
+        if any(rows["nonfinite_c"].any() or info.get("cand_unscored_nonfinite") for rows, info in null_pairs):
             raise GateError(f"{case}: non-finite null logits")
         null_moved(case, [float(x["kl_rc"].mean()) for x in nulls])
-        if ra["nonfinite_c"].any():
+        if ra["nonfinite_c"].any() or ra_info.get("cand_unscored_nonfinite"):
             nonfinite_candidate.append(case)
             continue
         w = score_window(case, ra, nulls, window_class(case, classes, manifest), limits)
@@ -687,6 +694,8 @@ def qual(a):
                           for k, v in f.items()}
         elif diag:
             # no route tap: every arm ran free, so the flips come from the engine trace of the candidate and the null
+            if len(a.null) > 1 and not a.null_free:
+                raise GateError(f"{case}: --trace-diag with multiple null arms requires an explicit --null-free")
             fc, fn = diag.get((case, a.cand_free or a.cand)), diag.get((case, a.null_free or a.null[0]))
             if (fc is None) != (fn is None):
                 raise GateError(f"{case}: trace of only one of the free-running candidate / null arms (R1 needs both)")
