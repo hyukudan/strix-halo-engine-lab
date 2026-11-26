@@ -262,18 +262,20 @@ int main() {
               ra.receipts[0].find("\"nudged\":4") != std::string::npos, "segment 0 replay complete, its own null count");
         RouteTapConfig flat;
         flat.out_path = temp_file("flat.rte");
-        RouteTap tap(flat);
-        int sunk = 0;
-        Arm sink_arm;
-        check(!tap.segmented(), "a plain path is not segmented");
-        feed(tap, seqs[0], false, sink_arm);
-        tap.sequence(1, [&](const std::string&) { ++sunk; });
-        feed(tap, seqs[1], false, sink_arm);
-        check(sunk == 0 && tap.receipt().find("\"records\":4") != std::string::npos,
-              "without {seq} sequence() changes nothing: one file, one receipt");
-        RouteTap off{RouteTapConfig{}};
-        off.sequence(3, [&](const std::string&) { ++sunk; });
-        check(sunk == 0 && !off.active(), "an inactive tap ignores sequence()");
+        {
+            RouteTap tap(flat);
+            int sunk = 0;
+            Arm sink_arm;
+            check(!tap.segmented(), "a plain path is not segmented");
+            feed(tap, seqs[0], false, sink_arm);
+            tap.sequence(1, [&](const std::string&) { ++sunk; });
+            feed(tap, seqs[1], false, sink_arm);
+            check(sunk == 0 && tap.receipt().find("\"records\":4") != std::string::npos,
+                  "without {seq} sequence() changes nothing: one file, one receipt");
+            RouteTap off{RouteTapConfig{}};
+            off.sequence(3, [&](const std::string&) { ++sunk; });
+            check(sunk == 0 && !off.active(), "an inactive tap ignores sequence()");
+        }
         for (const auto& p : resolved) std::filesystem::remove(p);
         std::filesystem::remove(flat.out_path);
     }

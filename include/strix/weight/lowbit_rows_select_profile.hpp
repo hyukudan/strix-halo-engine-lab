@@ -8,7 +8,8 @@ inline constexpr profile::Lever kLowBitRowsSelectLever{
     .name = "lowbit.rows-select", .env = "STRIX_LOWBIT_ROWS_SELECT", .option = "",
     .value = {"", "f16_rows_select", "", "f16_rows_select"},
     .builtin = "f16_group_scale", .kind = profile::Kind::bit_changing,
-    .ready = {false, true, false, true}, .runnable = {false, true, false, true},
+    // A benchmark must name one low-bit arithmetic. --allow-pending cannot select both candidates.
+    .ready = {false, true, false, true}, .runnable = {},
     .target = "f16_rows_select", .off = "f16_group_scale",
     .source = "awaits gate v2 and regime timing receipts for HIP low-bit rows",
     .omit_builtin_fingerprint = true,
