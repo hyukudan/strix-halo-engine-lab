@@ -81,9 +81,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-numpy
 
-      - name: Logit gate tail rule tests
+      - name: Logit gate unit tests
         shell: bash
-        run: python3 -B tools/strix-gate/test_tail_rule.py
+        run: |
+          set -euo pipefail
+          python3 -B tools/strix-gate/test_tail_rule.py
+          python3 -B tools/strix-gate/test_gate_v2.py
 
   host-build:
     needs: changes
