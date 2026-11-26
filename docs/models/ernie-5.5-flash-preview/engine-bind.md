@@ -62,6 +62,13 @@ diagnostics and carry their settings into the receipt.
 `--parallel-mla` distributes independent latent-attention heads over the
 same host workers and admits the decoded KV-B matrix to the bounded cache.
 
+`--recovered-contract` selects the host candidate that applies the learned
+expert gain before renormalization, keeps the weighted KV normalization
+without a second key RMS, and reverses the VHA factor order used by the
+initial candidate. It keeps the raw output head. The mode is available to
+both the oracle and the chat runner. Set `STRIX_ERNIE_ORACLE_CHECKPOINT` when
+configuring the build to register the slow next-token loss fixture.
+
 The [pair plan](pair-plan.md) describes native weight placement, memory admission,
 the shared transport seam and the first device ticket.
 

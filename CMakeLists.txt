@@ -1714,6 +1714,16 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME strix-ernie-forward-schedule-tests COMMAND strix-ernie-forward-schedule-tests)
     set_tests_properties(strix-ernie-forward-schedule-tests PROPERTIES LABELS "cpu;model" TIMEOUT 30)
+    set(STRIX_ERNIE_ORACLE_CHECKPOINT "" CACHE PATH "Optional ERNIE checkpoint for the slow host loss test")
+    if(STRIX_ERNIE_ORACLE_CHECKPOINT)
+        add_test(NAME strix-ernie-host-oracle-slow
+            COMMAND ${CMAKE_COMMAND}
+                "-DRUNNER=$<TARGET_FILE:strix-ernie-cpu>"
+                "-DCHECKPOINT=${STRIX_ERNIE_ORACLE_CHECKPOINT}"
+                "-DTEXT=${CMAKE_CURRENT_SOURCE_DIR}/tests/data/ernie/host_oracle.txt"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/ernie_oracle_gate.cmake")
+        set_tests_properties(strix-ernie-host-oracle-slow PROPERTIES LABELS "cpu;model;slow" TIMEOUT 1800 RUN_SERIAL TRUE)
+    endif()
     add_executable(strix-ernie-calibration-tests tests/ernie_calibration_tests.cpp)
     target_include_directories(strix-ernie-calibration-tests PRIVATE src)
     target_link_libraries(strix-ernie-calibration-tests PRIVATE strix_ernie_engine)

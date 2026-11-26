@@ -92,6 +92,12 @@ Options parse_options(int argc, char** argv) {
         if (arg == "--ordered-simd") { opts.simd = true; continue; }
         if (arg == "--table-mxfp4") { opts.decode.table_mxfp4 = true; continue; }
         if (arg == "--parallel-mla") { opts.parallel_mla = true; continue; }
+        if (arg == "--recovered-contract") {
+            set_variant(opts, "router-gain-before-norm");
+            set_variant(opts, "kv-no-head-norm");
+            set_variant(opts, "vha-swap");
+            continue;
+        }
         if (arg == "--bos") { opts.bos = true; continue; }
         if (arg == "--save-layers") { opts.save_layers = true; continue; }
         if (arg == "--dump-logits") { opts.dump_logits = true; continue; }
@@ -128,6 +134,12 @@ Options parse_options(int argc, char** argv) {
         opts.end_layer != ernie::kLayerCount || opts.limit != 128 || opts.multimax != "identity"))
         throw std::invalid_argument("layer and text options require --oracle");
     return opts;
+}
+
+Json::Array variant_names(const Options& opts) {
+    Json::Array names;
+    for (const auto& variant : opts.variants) names.emplace_back(variant);
+    return names;
 }
 
 void transform_logits(std::span<float> logits, std::string_view mode, const ernie::ReferenceRead& read) {
@@ -347,11 +359,9 @@ void run_oracle(std::vector<std::uint32_t> ids, const Options& opts, const fs::p
     const auto end = Clock::now();
     const auto prefill_seconds = std::chrono::duration<double>(prefill - started).count();
     const auto head_seconds = std::chrono::duration<double>(end - prefill).count();
-    Json::Array variant_names;
-    for (const auto& variant : opts.variants) variant_names.emplace_back(variant);
     const auto receipt = Json(Json::Object{
         {"activation", opts.activation}, {"multiply_fixed_gain", opts.fixed_gain}, {"bf16_projections", opts.bf16},
-        {"variants", variant_names}, {"multimax", opts.multimax},
+        {"variants", variant_names(opts)}, {"multimax", opts.multimax},
         {"bos", opts.bos}, {"first_layer", std::uint64_t{opts.start_layer}}, {"end_layer", std::uint64_t{opts.end_layer}},
         {"cache_prefix", opts.resume.generic_string()}, {"threads", std::uint64_t{opts.threads}},
         {"cache_mib", std::uint64_t{opts.cache_mib}}, {"positions", std::uint64_t{targets.size()}},
@@ -498,6 +508,7 @@ void run_prompt(const Json& request, unsigned index, const strix::serve::BpeToke
     auto receipt = Json(Json::Object{
         {"identity", "candidate-raw-head"}, {"activation", opts.activation},
         {"bf16_projections", opts.bf16}, {"multiply_fixed_gain", opts.fixed_gain},
+        {"variants", variant_names(opts)},
         {"pack", !opts.packed.empty()}, {"teacher_forced", replay.has_value()},
         {"ordered_simd", opts.simd}, {"table_mxfp4", opts.decode.table_mxfp4}, {"parallel_mla", opts.parallel_mla},
         {"threads", static_cast<std::uint64_t>(opts.threads)}, {"cache_mib", static_cast<std::uint64_t>(opts.cache_mib)},
@@ -520,12 +531,12 @@ int main(int argc, char** argv) try {
     if (argc < 4) {
         std::cerr << "usage: strix-ernie-cpu CHECKPOINT PROMPTS.json NEW_TRACE_DIR"
                      " [--generate N] [--prompt-index N] [--activation soft-clip|hard-clip|swiglu]"
-                     " [--bf16-projections] [--multiply-fixed-gain] [--threads N] [--cache-mib N]"
+                     " [--bf16-projections] [--multiply-fixed-gain] [--recovered-contract] [--threads N] [--cache-mib N]"
                      " [--capture MODEL_DESCRIPTION] [--pack SIDECAR] [--replay TRACE_DIR]\n"
                      "       strix-ernie-cpu CHECKPOINT TEXT_FILE NEW_TRACE_DIR --oracle"
                      " [--bos] [--limit N] [--save-layers] [--dump-logits] [--resume TRACE_DIR]"
                      " [--start-layer N] [--end-layer N] [--threads N] [--cache-mib N] [--profile-host]"
-                     " [--ordered-simd] [--table-mxfp4] [--parallel-mla]"
+                     " [--ordered-simd] [--table-mxfp4] [--parallel-mla] [--recovered-contract]"
                      " [--variant NAME] [--multimax identity|hinge|signed-hinge|softplus]\n";
         return 2;
     }
