@@ -1764,6 +1764,7 @@ int main(int argc, char** argv) try {
         else if (mode == "sample") sample_api.handle(r, w);
         else if (mode == "reject") reject_api.handle(r, w);
         else if (mode == "throw-utf8") throw std::runtime_error("handler failed: caf\xc3\xa9\x01!");
+        else if (mode == "throw-bad-utf8") throw std::runtime_error("handler failed: \xff\xc3(\xe2\x82 end");
         else api.handle(r, w);
     });
     server.listen();
@@ -1775,6 +1776,16 @@ int main(int argc, char** argv) try {
         const auto reply = http(port, "GET", "/v1/capabilities", "", auth + "X-Test-Config: throw-utf8\r\n");
         check(reply.status == 500 && reply.body.find("handler failed: caf\xc3\xa9 !") != std::string::npos,
               "500 body keeps UTF-8 bytes of the error text");
+    }
+    {   // invalid UTF-8 in the message becomes U+FFFD: a strict client still parses the 500 body
+        const auto reply = http(port, "GET", "/v1/capabilities", "", auth + "X-Test-Config: throw-bad-utf8\r\n");
+        bool parsed = false;
+        try {
+            parsed = parse_json_unique(reply.body).find("error") != nullptr;
+        } catch (const std::exception&) {}
+        check(reply.status == 500 && parsed &&
+                  reply.body.find("handler failed: \xef\xbf\xbd\xef\xbf\xbd(\xef\xbf\xbd end") != std::string::npos,
+              "500 body replaces invalid UTF-8 with U+FFFD");
     }
     {   // a fractional max_tokens is a client error in the clamping (non-exact) mode too
         const auto reply = http(port, "POST", "/v1/completions", R"({"model":"test-model","prompt":"hello","max_tokens":1.5})", auth);
