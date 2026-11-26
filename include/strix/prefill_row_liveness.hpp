@@ -62,7 +62,7 @@ template <class OwnsState>
     return p;
 }
 
-// The same rule over a model graph declaration (any type with `layers[i].states`, src/model_graph/model_graph.hpp): a
+// The same rule over a model graph declaration (any type with `layers[i].states`, include/strix/model_graph.hpp): a
 // layer owns state when it declares any (attention K/V, latent / compressed caches, recurrent state).
 template <class Graph>
 [[nodiscard]] constexpr Plan plan_graph(const Graph& graph, const Readers& r) {

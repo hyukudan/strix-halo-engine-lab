@@ -1,6 +1,6 @@
 #pragma once
 
-#include "model_graph.hpp"
+#include "strix/model_graph.hpp"
 #include "plan.hpp"
 #include "strix/deepseek41_model.hpp"
 #include "strix/deepseek41_plan.hpp"

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "strix/minimax/model_description.hpp"
-#include "../model_graph/model_graph.hpp"
+#include "strix/model_graph.hpp"
 #include "../model_graph/plan.hpp"
 #include "engine/mm_defaults.hpp"
 

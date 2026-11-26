@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../model_graph/model_graph.hpp"
+#include "strix/model_graph.hpp"
 #include "glm_rank_plan.hpp"
 
 #include <string>

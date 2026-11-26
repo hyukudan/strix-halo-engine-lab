@@ -1,4 +1,4 @@
-#include "model_graph.hpp"
+#include "strix/model_graph.hpp"
 
 #include <iomanip>
 #include <initializer_list>

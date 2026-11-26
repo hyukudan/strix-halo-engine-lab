@@ -2,7 +2,7 @@
 
 #include "strix/deepseek41_model.hpp"
 #include "strix/model_description.hpp"
-#include "../../src/model_graph/model_graph.hpp"
+#include "strix/model_graph.hpp"
 
 #include <string>
 
