@@ -21,9 +21,7 @@ Status dispatch(const Plan& plan,const WeightView& weight,const KernelArguments&
  view.weight=binding.data(); view.row_bytes=binding.row_bytes();
  status=validate_view(view); if(!status) return status;
  status=validate_q8_shape(weight,view.count,view.in); if(!status) return status;
- const auto* kernels=::strix::cpu::registered_weight_kernels(::strix::cpu::Isa::scalar);
- if(!kernels || !kernels->gemv_q8_0_a8) return {Error::unavailable_isa,"CPU scalar Q8 registration missing"};
- try { kernels->gemv_q8_0_a8(view,args.stream); return {Error::ok,{}}; }
+ try { ::strix::cpu::reference_kernels().gemv_q8_0_a8(view,args.stream); return {Error::ok,{}}; }
  catch(const std::exception& error) { return {Error::device_failure,error.what()}; }
 }
 }
@@ -62,7 +60,7 @@ Status enqueue_dense(const WeightView& weight,const DenseArguments& args) {
  return enqueue(plan,weight,arguments(launch),args.view.out,nullptr,0,context);
 }
 Status require_isa(::strix::cpu::Isa isa) {
- if(::strix::cpu::registered_weight_kernels(isa)) return {Error::ok,{}};
+ if(isa==::strix::cpu::reference_kernels().isa) return {Error::ok,{}};
  return {Error::unavailable_isa,"CPU architecture weight source is a scaffold; dependency=qualified ISA kernel; fixture=CPU backend exactness; removal=register validated implementation"};
 }
 }

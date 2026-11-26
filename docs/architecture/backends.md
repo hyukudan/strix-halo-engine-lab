@@ -64,11 +64,11 @@ A backend exposes `caps()` and `select(caps) -> Kernels`, a table of entry point
 register a table with only the entries they implement; gaps are filled from the backend's
 reference. Selection is by capability bits, never by model name, and every specialised entry must
 match the reference bit for bit before it registers.
-CPU selection returns a table by value, so later selections cannot modify a retained table.
-Current CPU capability detection is only a scaffold: x86 reports hardware feature bits,
-ARM uses compile-time features, and `sve_bits` is zero. Runtime and OS vector-state
-admission (including XCR0 and AMX permission) must be complete before registering
-instructions that require it. Both specialisation tables are currently empty.
+CPU selection returns a complete table by value, so later selections cannot modify a retained
+table. It selects scalar, AVX2, AVX-512F+BW or NEON according to the usable feature set. x86
+checks CPUID and OS vector state. NEON availability follows the build target. The operator
+table currently binds every entry to the portable reference. AMX and SVE have no operator
+entries and use the selected lower capability level when available.
 
 ## CUDA NVFP4 dense operator
 
@@ -96,10 +96,9 @@ The shared `strix-serve --backend` interface offers HIP and CUDA.
 
 ## CPU backend
 
-Tree: `src/cpu/core` (interface binding, scalar exact reference, capability detection and
-selection), `src/cpu/arch/avx512` (AVX-512 BW/VNNI, AMX int8), `src/cpu/arch/neon` (NEON
-dotprod/i8mm, SVE). The `STRIX_BACKEND_CPU` option (default OFF) builds the shared CPU
-operator library and its fixtures. The Qwen CUDA build also links this library for its
+The `STRIX_BACKEND_CPU` option (default OFF) builds the shared CPU operator library and its
+fixtures. `src/cpu/core` owns the interface, exact portable reference and capability selection.
+The Qwen CUDA build also links this library for its
 tiered routed-expert executor. That executor uses a worker pool, a separate AVX2 path
 and exp lookup tables to reproduce the target device arithmetic. The scalar operator
 table and the dedicated model host references have their own dispatch paths.
@@ -114,7 +113,7 @@ table and the dedicated model host references have their own dispatch paths.
 - **Numerics**: compiled with contraction off (`-ffp-contract=off`, `/fp:precise`). Integer dots are
   exact in int32, so a SIMD kernel only has to keep the declared float order: per-group product,
   group g into lane g % 32, then the butterfly.
-- **Scaffolded now**: `quantize_a8`, `gemv_q8_0_a8` (the `Q8a8View` has a related layout to the HIP
+- **Implemented operators** are `quantize_a8`, `gemv_q8_0_a8` (the `Q8a8View` has a related layout to the HIP
   dense view, but omits `k_bytes` and `tile0` and uses a different arithmetic contract) and
   RMSNorm bound to the shared `Norm<Traits>`; tests in `tests/cpu_backend_host_tests.cpp` compare
   them bitwise with `ds41::quantize_a8`, `ds41::product_q8_0` and `ops::norm::reference`.
@@ -122,8 +121,9 @@ table and the dedicated model host references have their own dispatch paths.
   with `std::invalid_argument` before writing output. Zero width is allowed. Callers supply
   sufficient buffers and strides, with `x_stride` a multiple of 32. Valid calls allocate no memory.
   Tests cover retained-table selection, width rejection, padded strides, tiny groups, half
-  subnormals, cancellation, and norm thresholds/tails/aliasing. Both table runs currently use
-  scalar code; these host checks establish neither ISA specialisation nor native GPU equivalence.
+  subnormals, cancellation, and norm thresholds/tails/aliasing. Synthetic descriptors exercise
+  the full portable table at every selectable capability level. The explicit raw Q8_0 weights
+  registry still advertises its scalar arithmetic implementation.
 - **Next**: AVX-512 VNNI and NEON SDOT `gemv_q8_0_a8` (same bits); Q2_K / IQ2_XXS / MXFP4 decode
   products from the `ds41_formats` contracts; grouped MoE through the existing policy split;
   attention via the `sparse_flash_keysplit` policy contract with host policies; AMX for prefill GEMM.

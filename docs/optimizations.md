@@ -35,6 +35,15 @@ Device target row verification, including mixed streams and optional KV mirrors.
 
 Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=affected.
 
+<a id="cpu-portable-operator-dispatch"></a>
+### CPU portable operator dispatch
+
+The optional CPU operator library selects a runtime capability level and gives each level the
+complete portable A8 quantization, Q8_0 GEMV and RMSNorm table. Synthetic CPU feature descriptors
+exercise the selector and compare the results bitwise with the host oracles. The selected level
+currently records capabilities while all operator entries run the same portable arithmetic.
+The shared code lives in `src/cpu/core/select.cpp`. The opt-in build flag is `STRIX_BACKEND_CPU`.
+
 <a id="cohort-verification-scratch-reuse"></a>
 ### Cohort verification scratch reuse
 

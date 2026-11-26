@@ -12,9 +12,7 @@ add_library(strix_backend_cpu STATIC
     ${_strix_cpu_root}/src/cpu/core/select.cpp
     ${_strix_cpu_root}/src/cpu/core/routed_expert.cpp
     ${_strix_cpu_root}/src/cpu/weight/registry.cpp
-    ${_strix_cpu_root}/src/cpu/arch/avx2/routed_expert_avx2.cpp
-    ${_strix_cpu_root}/src/cpu/arch/avx512/kernels.cpp
-    ${_strix_cpu_root}/src/cpu/arch/neon/kernels.cpp)
+    ${_strix_cpu_root}/src/cpu/arch/avx2/routed_expert_avx2.cpp)
 target_include_directories(strix_backend_cpu PUBLIC ${_strix_cpu_root}/src ${_strix_cpu_root}/include)
 target_link_libraries(strix_backend_cpu PUBLIC strix-weight strix_cpu_linear)
 target_compile_features(strix_backend_cpu PUBLIC cxx_std_20)

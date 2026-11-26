@@ -218,13 +218,13 @@ void test_q8_0(const strix::cpu::Kernels& k, std::mt19937& rng, std::uint32_t wi
     for (std::size_t i = 0; i < y.size(); ++i) expect(same(y2[i], initial[i] + y[i]), "q8_0 accumulate", i);
 }
 
-void test_norm(std::mt19937& rng, unsigned n, unsigned rows) {
+void test_norm(const strix::cpu::Kernels& kernels, std::mt19937& rng, unsigned n, unsigned rows) {
     std::normal_distribution<float> nd(0.0F, 3.0F);
     std::vector<float> x(static_cast<std::size_t>(n) * rows), w(n), y(x.size()), ref(x.size());
     for (auto& v : x) v = nd(rng);
     for (auto& v : w) v = 1.0F + 0.1F * nd(rng);
     const strix::cpu::Stream s{};
-    strix::cpu::Norm::run(x.data(), w.data(), 0, n, 1e-6F, y.data(), rows, &s);
+    kernels.rmsnorm_f32(x.data(), w.data(), n, 1e-6F, y.data(), rows, s);
     strix::ops::norm::reference<HostNormTraits>(x.data(), w.data(), 0, n, 1e-6F, ref.data(), rows);
     for (std::size_t i = 0; i < y.size(); ++i) expect(same(y[i], ref[i]), "rmsnorm", i);
     auto in_place = x;
@@ -237,14 +237,48 @@ void test_norm(std::mt19937& rng, unsigned n, unsigned rows) {
     strix::cpu::Norm::run(in_place.data(), nullptr, 0, n, 1e-6F, in_place.data(), rows, &s);
     for (std::size_t i = 0; i < y.size(); ++i) expect(same(in_place[i], ref[i]), "rmsnorm unscaled in place", i);
 }
+
+void test_isa_dispatch() {
+    using namespace strix::cpu;
+    const struct {
+        Caps caps;
+        Isa selected;
+    } cases[] = {
+        {{}, Isa::scalar},
+        {{.avx2 = true}, Isa::avx2},
+        {{.avx2 = true, .avx512f = true}, Isa::avx2},
+        {{.avx2 = true, .avx512f = true, .avx512bw = true}, Isa::avx512},
+        {{.amx_int8 = true}, Isa::scalar},
+        {{.avx2 = true, .avx512f = true, .avx512bw = true, .amx_int8 = true}, Isa::avx512},
+        {{.neon = true}, Isa::neon},
+        {{.neon = true, .sve = true, .dotprod = true, .sve_bits = 256}, Isa::neon},
+    };
+    const auto& portable = reference_kernels();
+    for (const auto& fixture : cases) {
+        const auto kernels = select(fixture.caps);
+        const auto index = static_cast<std::size_t>(fixture.selected);
+        expect(kernels.isa == fixture.selected, "runtime ISA dispatch", index);
+        // Fake descriptors must never execute real vector instructions on this host.
+        const bool fallback = kernels.quantize_a8 == portable.quantize_a8 &&
+                              kernels.gemv_q8_0_a8 == portable.gemv_q8_0_a8 &&
+                              kernels.rmsnorm_f32 == portable.rmsnorm_f32;
+        expect(fallback, "every operator uses the portable implementation", index);
+        if (!fallback) continue;
+        std::mt19937 rng(351U);
+        test_q8_0(kernels, rng, 64, 5, 2);
+        test_invalid_widths(kernels);
+        test_norm(kernels, rng, 513, 2);
+    }
+}
 }  // namespace
 
 int main() {
     test_retained_selection();
+    test_isa_dispatch();
     std::mt19937 rng(1112U);
     const auto host = strix::cpu::caps();
     const auto& selected = strix::cpu::select(host);
-    std::printf("cpu backend: selected table %s (avx2=%d avx512f=%d vnni=%d amx=%d neon=%d sve=%d)\n",
+    std::printf("cpu backend: capability level %s, portable operators (avx2=%d avx512f=%d vnni=%d amx=%d neon=%d sve=%d)\n",
                 strix::cpu::isa_name(selected.isa), host.avx2, host.avx512f, host.avx512vnni, host.amx_int8,
                 host.neon, host.sve);
     for (const auto* k : {&strix::cpu::reference_kernels(), &selected}) {
@@ -255,10 +289,10 @@ int main() {
         test_q8_0(*k, rng, 2048, 64, 3);
         test_q8_0(*k, rng, 7168 + 32, 17, 2);  // groups not a multiple of the lane count
     }
-    test_norm(rng, 96, 3);
-    for (const unsigned n : {1U, 127U, 128U, 129U, 511U, 512U, 513U}) test_norm(rng, n, 2);
-    test_norm(rng, 4096, 2);
-    test_norm(rng, 7168, 1);
+    test_norm(selected, rng, 96, 3);
+    for (const unsigned n : {1U, 127U, 128U, 129U, 511U, 512U, 513U}) test_norm(selected, rng, n, 2);
+    test_norm(selected, rng, 4096, 2);
+    test_norm(selected, rng, 7168, 1);
     std::printf("%u checks, %u failures\n", checks, failures);
     return failures ? 1 : 0;
 }

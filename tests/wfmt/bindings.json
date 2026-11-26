@@ -1195,7 +1195,6 @@
         "launch",
         "product",
         "reference_kernels",
-        "registered_weight_kernels",
         "scale"
       ],
       "operand_source": "src/cpu/weight/source.hpp",
@@ -1239,44 +1238,10 @@
       "status": "incumbent",
       "capture": "legacy-public-entrypoint",
       "operations": [
-        "kernels",
-        "reference_kernels",
-        "registered_weight_kernels"
+        "reference_kernels"
       ],
       "operand_source": "src/cpu/weight/source.hpp",
       "source_registry": "src/cpu/weight/registry.cpp"
-    },
-    {
-      "id": "cpu:src/cpu/arch/avx512/kernels.cpp",
-      "source": "src/cpu/arch/avx512/kernels.cpp",
-      "backend": "cpu",
-      "formats": [
-        "Q8_0"
-      ],
-      "arithmetic": "integer-product/tree32",
-      "migration": "P05",
-      "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
-      "capture": "legacy-public-entrypoint",
-      "operations": [
-        "kernels"
-      ]
-    },
-    {
-      "id": "cpu:src/cpu/arch/neon/kernels.cpp",
-      "source": "src/cpu/arch/neon/kernels.cpp",
-      "backend": "cpu",
-      "formats": [
-        "Q8_0"
-      ],
-      "arithmetic": "integer-product/tree32",
-      "migration": "P05",
-      "owner": "shared-weight-layer-maintainer",
-      "status": "incumbent",
-      "capture": "legacy-public-entrypoint",
-      "operations": [
-        "kernels"
-      ]
     },
     {
       "id": "intel:src/intel/core/dense_q8a8_ref.hpp",
@@ -5354,8 +5319,6 @@
     "src/core/trellis_codec.hpp",
     "src/core/trellis_format.hpp",
     "src/core/weight_archive.cpp",
-    "src/cpu/arch/avx512/kernels.cpp",
-    "src/cpu/arch/neon/kernels.cpp",
     "src/cpu/core/backend.hpp",
     "src/cpu/core/reference.cpp",
     "src/cpu/core/select.cpp",
