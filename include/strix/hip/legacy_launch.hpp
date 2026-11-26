@@ -32,11 +32,6 @@ inline const DeviceCaps& current_device_caps() {
 
 }  // namespace detail
 
-inline std::string_view current_device_arch() {
-    const std::string_view name(detail::current_device_caps().arch);
-    return name.substr(0, name.find(':'));
-}
-
 inline void require_current_device(LaunchRequirement requirement) {
     const auto& current = detail::current_device_caps();
     const auto reason = requirement == LaunchRequirement::Rdna3Layout ? current.rdna3_refusal : current.wave32_refusal;

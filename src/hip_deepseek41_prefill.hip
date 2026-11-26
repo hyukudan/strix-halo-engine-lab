@@ -1712,7 +1712,7 @@ PrefillResult DevicePrefill::run_full_prompt(std::span<const std::uint32_t> toke
         return run(tokens);
 
     const auto& o = m.options;
-    const char* baseline = std::getenv("STRIX_DS41_BASELINE");
+    const char* baseline = strix::envcfg::text("STRIX_DS41_BASELINE");
     const bool baseline_on = baseline && *baseline && std::string_view(baseline) != "0";
     const bool scope = o.quality_head_rows == 64U && o.communicator->transport_name().starts_with("usb4-host:") && m.moe_window_auto &&
         m.overlay == nullptr && m.file->size() == pinned_file(PinnedFileKind::target_q2).bytes &&

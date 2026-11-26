@@ -1,12 +1,12 @@
 #include "hy4/serve/session_service.hpp"
 #include "hy4/hy4_speculation.hpp"
 #include "strix/profiles/hy4.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/model_family_registry.hpp"
 #include "strix/weight/tensor_map.hpp"
 #include <algorithm>
 #include <charconv>
-#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -178,7 +178,7 @@ sv::Json effective_config(const Options& options, const PackFacts& pack) {
     ::strix::hy4::SpeculationRun run;
     run.block_in_pack = pack.next_token_block;
     run.no_mtp = options.no_mtp;
-    run.environment = std::getenv(::strix::session::speculation_environment);
+    run.environment = ::strix::envcfg::text(::strix::session::speculation_environment);
     const auto decision = ::strix::hy4::speculation(run);
     auto speculation = sv::Json::object();
     speculation.set("enabled", sv::Json(decision.enabled));
