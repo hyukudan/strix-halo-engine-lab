@@ -1,9 +1,11 @@
 #include "h3/te/te_tokenizer.hpp"
 
 #include "strix/serve/json.hpp"
+#include "strix/serve/tokenizer_limits.hpp"
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstdio>
 #include <fstream>
 #include <iterator>
@@ -234,11 +236,16 @@ std::array<std::string, 256> byte_alphabet() {
 }
 
 std::string read_file(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("te tokenizer: cannot open " + path);
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
+    return serve::read_tokenizer_file(path, "te tokenizer");
+}
+
+// A token ID text: decimal digits only, 0 <= id <= kMaxTokenizerVocabId.
+std::int32_t checked_token_id(std::string_view digits) {
+    std::int64_t id = 0;
+    const auto r = std::from_chars(digits.data(), digits.data() + digits.size(), id);
+    if (digits.empty() || r.ec != std::errc() || r.ptr != digits.data() + digits.size() || id < 0 || id > serve::kMaxTokenizerVocabId)
+        throw std::runtime_error("te tokenizer: token ID out of range");
+    return static_cast<std::int32_t>(id);
 }
 
 // vocab.json: one flat object {"token": id, ...}. Parsed here directly; the generic JSON value
@@ -268,8 +275,8 @@ std::unordered_map<std::string, std::int32_t> parse_vocab(const std::string& s) 
         std::string r;
         while (i < s.size() && s[i] != '"') {
             if (s[i] != '\\') { r.push_back(s[i++]); continue; }
-            const char e = s[++i];
-            ++i;
+            if (++i >= s.size()) fail("unterminated string");
+            const char e = s[i++];
             switch (e) {
                 case '"': r.push_back('"'); break;
                 case '\\': r.push_back('\\'); break;
@@ -310,7 +317,7 @@ std::unordered_map<std::string, std::int32_t> parse_vocab(const std::string& s) 
         std::size_t end = i;
         while (end < s.size() && s[end] >= '0' && s[end] <= '9') ++end;
         if (end == i) fail("expected id");
-        out[std::move(key)] = static_cast<std::int32_t>(std::stol(s.substr(i, end - i)));
+        out[std::move(key)] = checked_token_id(std::string_view(s).substr(i, end - i));
         i = end;
         skip();
         if (i < s.size() && s[i] == ',') { ++i; continue; }
@@ -335,31 +342,52 @@ struct Tokenizer::Impl {
     std::array<std::string, 256> alphabet = byte_alphabet();
     std::size_t size = 0;
 
+    // Byte-pair merges by rank. Round R merges every occurrence (left to right) of the pair of lowest rank R; pairs a
+    // merge creates only compete in the next round. A queue of (rank, position) over a linked list of symbols replaces
+    // the rescan of the whole word per round, and gives the ids of that rescan (checked against it in the host tests).
     void bpe(std::string_view piece, std::vector<std::int32_t>& out) const {
+        constexpr std::size_t kNone = SIZE_MAX;
+        struct Candidate {
+            std::uint32_t rank;
+            std::size_t left, right, left_size, right_size;  // sizes identify the symbol texts at push time
+            bool operator>(const Candidate& o) const { return rank != o.rank ? rank > o.rank : left > o.left; }
+        };
+        const std::size_t n = piece.size();
         std::vector<std::string> sym;
-        sym.reserve(piece.size());
+        sym.reserve(n);
         for (const char ch : piece) sym.push_back(alphabet[static_cast<unsigned char>(ch)]);
+        std::vector<std::size_t> next(n), prev(n);
+        std::vector<char> alive(n, 1);
+        for (std::size_t k = 0; k < n; ++k) { next[k] = k + 1U < n ? k + 1U : kNone; prev[k] = k > 0U ? k - 1U : kNone; }
         std::string key;
-        while (sym.size() > 1U) {
-            std::uint32_t best = UINT32_MAX;
-            std::size_t at = 0;
-            for (std::size_t k = 0; k + 1U < sym.size(); ++k) {
-                key.assign(sym[k]); key.push_back(' '); key += sym[k + 1U];
-                if (const auto r = ranks.find(key); r != ranks.end() && r->second < best) { best = r->second; at = k; }
+        const auto offer = [&](std::vector<Candidate>& to, std::size_t l, std::size_t r) {
+            key.assign(sym[l]); key.push_back(' '); key += sym[r];
+            if (const auto it = ranks.find(key); it != ranks.end()) to.push_back({it->second, l, r, sym[l].size(), sym[r].size()});
+        };
+        std::vector<Candidate> queue, created;
+        for (std::size_t k = 0; k + 1U < n; ++k) offer(queue, k, k + 1U);
+        const auto later = std::greater<Candidate>();
+        std::make_heap(queue.begin(), queue.end(), later);
+        while (!queue.empty()) {
+            const auto round = queue.front().rank;
+            created.clear();
+            while (!queue.empty() && queue.front().rank == round) {
+                std::pop_heap(queue.begin(), queue.end(), later);
+                const Candidate c = queue.back();
+                queue.pop_back();
+                if (!alive[c.left] || !alive[c.right] || next[c.left] != c.right || sym[c.left].size() != c.left_size ||
+                    sym[c.right].size() != c.right_size) continue;
+                sym[c.left] += sym[c.right];
+                alive[c.right] = 0;
+                next[c.left] = next[c.right];
+                if (next[c.left] != kNone) prev[next[c.left]] = c.left;
+                if (prev[c.left] != kNone) offer(created, prev[c.left], c.left);
+                if (next[c.left] != kNone) offer(created, c.left, next[c.left]);
             }
-            if (best == UINT32_MAX) break;
-            // merge every occurrence of the best pair, left to right
-            std::vector<std::string> merged;
-            merged.reserve(sym.size());
-            const std::string a = sym[at], b = sym[at + 1U];
-            for (std::size_t k = 0; k < sym.size();) {
-                if (k + 1U < sym.size() && sym[k] == a && sym[k + 1U] == b) { merged.push_back(a + b); k += 2U; }
-                else merged.push_back(std::move(sym[k++]));
-            }
-            sym = std::move(merged);
+            for (const auto& c : created) { queue.push_back(c); std::push_heap(queue.begin(), queue.end(), later); }
         }
-        for (const auto& s : sym) {
-            const auto it = vocab.find(s);
+        for (std::size_t k = n ? 0U : kNone; k != kNone; k = next[k]) {
+            const auto it = vocab.find(sym[k]);
             if (it == vocab.end()) throw std::runtime_error("te tokenizer: BPE symbol not in vocabulary");
             out.push_back(it->second);
         }
@@ -401,8 +429,10 @@ std::shared_ptr<const Tokenizer> Tokenizer::load(const std::string& dir) {
     const auto cfg = serve::parse_json(read_file(dir + "/tokenizer_config.json"));
     if (const auto* dec = cfg.find("added_tokens_decoder"); dec != nullptr) {
         for (const auto& [k, v] : dec->as_object()) {
-            const auto id = static_cast<std::int32_t>(std::stol(k));
-            im.added.emplace_back(v.find("content")->as_string(), id);
+            const auto id = checked_token_id(k);
+            const auto* content = v.find("content");
+            if (!content) throw std::runtime_error("te tokenizer: added token needs content");
+            im.added.emplace_back(content->as_string(), id);
             max_id = std::max(max_id, id);
         }
     }
@@ -620,6 +650,7 @@ std::vector<std::int32_t> token_tags(const Presented& p, const std::vector<std::
             if (slot >= slot_sizes.size()) throw std::invalid_argument("token_tags: missing slot size");
             // the start token before the block is already emitted as text; re-tag it
             if (!tags.empty()) tags.back() = 0;
+            if (slot_sizes[slot] < 0) throw std::invalid_argument("token_tags: negative slot size");
             tags.insert(tags.end(), static_cast<std::size_t>(slot_sizes[slot++]), 0);
             if (i + 1U < p.ids.size()) { tags.push_back(0); ++i; }  // the end token
             continue;
