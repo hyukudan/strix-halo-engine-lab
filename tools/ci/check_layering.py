@@ -13,7 +13,8 @@ and test code, not checked):
                  reports a timeout instead of adding a raw loop
 
 A file belongs to a model when a directory on its path, or its file name (after an optional hip_ / cuda_ prefix),
-names the model: ALIASES below. Everything else under src/ and include/ is shared code.
+names the model, or when its legacy flat source path explicitly names an owner below. Everything else under
+src/ and include/ is shared code.
 
 tools/ci/layering_allowlist.txt lists today's counts as `rule path count`. The check fails when a count rises or a
 (rule, path) pair is new, and also when a count fell without the list being lowered, so the list stays the exact
@@ -34,7 +35,15 @@ ROOT_DIRS = ("src/", "include/")
 SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".h", ".hpp", ".cu", ".cuh", ".hip", ".inc", ".inl"}
 TU_SUFFIXES = {".c", ".cc", ".cpp", ".cu", ".hip"}
 ALIASES = {"ds41": "deepseek41", "deepseek41": "deepseek41", "glm": "glm", "minimax": "minimax", "mmx": "minimax",
-           "qwen": "qwen", "qwen27": "qwen", "qwen35": "qwen", "gemma4": "gemma4", "h3": "h3"}
+           "qwen": "qwen", "qwen27": "qwen", "qwen35": "qwen", "gemma4": "gemma4", "h3": "h3",
+           "hy4": "hy4", "inkling2": "inkling2", "ernie": "ernie"}
+LEGACY_MODEL_OWNERS = {
+    "src/hip_indexed_attention_launcher.hip": "qwen",
+    "src/hip_gdn_launcher.hip": "qwen",
+    "src/hip_hyper_mix_launcher.hip": "qwen",
+    "src/hip_moe_experts_launcher.hip": "qwen",
+    "src/hip_ple_launcher.hip": "qwen",
+}
 ENV_HOMES = {"include/strix/env_flags.hpp", "include/strix/env_arms.hpp", "include/strix/lever.hpp"}
 RULES = ("model-include", "cross-model", "tu-include", "model-kernel", "raw-getenv", "spin-wait")
 ALLOWLIST = "tools/ci/layering_allowlist.txt"
@@ -49,6 +58,8 @@ SPIN_RE = re.compile(r"\bwhile\s*\(\s*(?:__hip_atomic_load|__atomic_load_n|__ato
 
 def model_of(path):
     """The model a repo-relative path belongs to, or None for shared code."""
+    if path in LEGACY_MODEL_OWNERS:
+        return LEGACY_MODEL_OWNERS[path]
     parts = path.split("/")
     for d in parts[:-1]:
         if d in ALIASES:

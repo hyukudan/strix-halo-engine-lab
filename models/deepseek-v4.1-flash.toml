@@ -100,6 +100,10 @@ levers = "fast"
 [presets.turbo]
 levers = "turbo"
 
+[presets.turbo.cuda]
+# The RTX replica supports the FAST column; native TURBO is implemented by the pair engine.
+levers = "fast"
+
 # Engine-read switches of this model that a [multi_device] key is planned to replace (listed in the effective
 # config when set; they still act inside the engine).
 [multi_device.legacy_env]

@@ -797,7 +797,7 @@ def compare_v2(a, names, results, null_prompt_kl, report, null_prompt=None):
             w = gate_v2.window_stats(name, r["kl"], r["agree"], r["nll_ref"], r["nll_cand"], null_prompt_kl[name],
                                      r["hit_ref"], r["hit_cand"], null_top1s=nu.get("top1") or None,
                                      null_nlls=nu.get("nll") or None,
-                                     null_kl_rows=nu["kl"][0] if nu.get("kl") else None)
+                                     null_kl_rows=nu.get("kl") or None, null_top1_rows=nu.get("agree") or None)
             windows.append(w)
             print(gate_v2.window_line(w, flips_of.get(name)))
         p = gate_v2.verdict(windows, [flips_of[n] for n in names] if flips_of else None)
@@ -900,7 +900,7 @@ def compare(a):
           f"{stats['copy_rows']} misses ref {stats['copy_miss_ref']} cand {stats['copy_miss']} (copy dNLL {stats['copy_dnll']:+.5f})")
     null_rows, null_stats, null_prompt_kl = [], [], {name: [] for name in names}
     null_results = []
-    null_prompt = {name: {"nll": [], "top1": [], "kl": []} for name in names}   # per-row NLL / KL, top-1 of each null (v2)
+    null_prompt = {name: {"nll": [], "top1": [], "kl": [], "agree": []} for name in names}
     for dn, mn in nulls:  # pooled exactly like the candidate: same reference, same prompts, same labels
         rs = [compare_logits(da, ma, dn, mn, name, tok_of[name]) for name in names]
         null_results.append(rs)
@@ -909,6 +909,7 @@ def compare(a):
             null_prompt[name]["nll"].append(r["nll_cand"])
             null_prompt[name]["top1"].append(float(r["agree"].mean()))
             null_prompt[name]["kl"].append(r["kl"])
+            null_prompt[name]["agree"].append(r["agree"])
         st = arm_stats(rs, copy_masks)
         null_stats.append(st)
         null_rows.append({"dir": str(dn), "run_id": mn[0]["run_id"], "arm": mn[0]["arm"], "env": mn[0]["env"],

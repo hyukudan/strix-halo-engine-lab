@@ -313,6 +313,8 @@ struct Forward::Impl {
     std::uint8_t* engram_stage = nullptr;  // pinned: Engram n-gram rows, one slot of heads x engram_dim per Engram ordinal
     std::uint32_t* dstatus_all = nullptr;  // device status words [layers][2][4] (A8 views are 16-byte aligned), zeroed once per step
     std::unique_ptr<strix::engram::RowReader> engram_reader;
+    std::vector<std::uint64_t> engram_row_ids;
+    std::vector<strix::engram::RowRequest> engram_row_requests;
 
     // caches (bf16 rows) per layer; rope tables
     std::vector<std::uint16_t*> latent;
@@ -912,9 +914,11 @@ struct Forward::Impl {
     void engram(std::uint32_t l, std::uint32_t ordinal, float* x) {
         const auto q = pos;
         if (tokens[q] == c.pad_token) return;  // masked position: the Engram output is zero
-        std::vector<std::uint64_t> rows(c.engram_heads());
+        auto& rows = engram_row_ids;
+        auto& req = engram_row_requests;
+        rows.resize(c.engram_heads());
         engram_hash->at(tokens, q, ordinal, rows);
-        std::vector<strix::engram::RowRequest> req;
+        req.clear();
         for (const auto r : rows) req.push_back({0U, r});
         // pinned slot of this Engram ordinal: the copy never waits for the stream, so the host read overlaps the GPU's work
         const std::size_t slot = std::size_t{c.engram_heads()} * c.engram_dim, bytes = rows.size() * c.engram_dim;

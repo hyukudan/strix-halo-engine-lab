@@ -1,5 +1,5 @@
 #include "catalog.hpp"
-#include "h3/gemm/operand.hpp"
+#include "strix/weight/channel_quant_operand.hpp"
 #include <cstring>
 namespace strix::weight::detail {
 namespace {
@@ -34,7 +34,7 @@ Status decode_channel(const WeightView& view,const std::vector<Byte>& raw,std::v
   for(std::size_t i=0;i<out.size();++i) out[i]=float(static_cast<std::int8_t>(std::to_integer<std::uint8_t>(raw[i])))*channel[i/width];
   return {Error::ok,{}};
  }
- h3::gemm::PackedW4A8 packed;
+ channel_quant::PackedW4A8 packed;
  packed.group_size=view.parameters.group_size;
  const auto groups=out.size()/packed.group_size;
  const auto* scales=sidecar(view,"group_scales");

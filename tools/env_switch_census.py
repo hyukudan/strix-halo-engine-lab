@@ -8,24 +8,23 @@ Every switch read from the environment is one of:
   raw       read with getenv at its use site: unvalidated, unlisted, default known only to that line.
 
 --check (the ctest) fails when
-  * a switch is read raw that is not in the baseline (tools/env_switch_baseline.txt): a new switch must be read
-    through env_flags.hpp or declared in a table, so the raw set can only shrink;
+  * a switch has more raw read sites than in the baseline (tools/env_switch_baseline.txt). Use
+    env_flags.hpp or a declared switch to introduce another read;
   * one boolean switch is read through the governed helpers with two different defaults.
-Baseline names that are no longer read raw are reported and removed with --update (never added by hand).
+Decreased site counts are reported and lowered with --update.
 --grandfather NAME... explicitly admits pre-introduction raw reads; never use it in the CMake test.
 
 --self-test runs the scanner on its fixtures (positive and negative).
 --report prints the counts; --tsv FILE writes one row per switch (name, class, read sites, documented).
 The scan is lexical: comments are removed, white space and new lines between the tokens of a call are allowed.
-A switch whose name is built at run time or passed through a wrapper is not seen. The baseline governs names,
-not read sites: a baselined switch may gain another raw read.
+A switch whose name is built at run time or passed through a wrapper is not seen.
 """
 from __future__ import annotations
 
 import argparse
 import re
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 SOURCE_DIRS = ("src", "include", "apps")
@@ -79,9 +78,9 @@ def strip_comments(text: str) -> str:
 
 
 def scan_text(text: str):
-    """Switches of one source text: (raw names, governed names, [(name, 'on'|'off')] of governed flag reads)."""
+    """Switches of one source text: (raw site counts, governed names, [(name, 'on'|'off')] of governed flag reads)."""
     code = strip_comments(text)
-    raw = set()
+    raw: Counter[str] = Counter()
     for argument in RAW.findall(code):
         # C++ escape decoding is outside this lexical scanner. Fail closed instead
         # of accepting a baselined prefix of an unsupported constant expression.
@@ -89,7 +88,7 @@ def scan_text(text: str):
             raise ValueError("unsupported escape in raw getenv literal; use an ordinary literal name")
         name = "".join(token[1:-1] for token in re.findall(STRING, argument))
         if NAME.fullmatch(name):
-            raw.add(name)
+            raw[name] += 1
     governed = {name for helper, name in GOVERNED.findall(code) if helper != "env_reject"}
     governed.update(TABLE.findall(code))
     defaults = []
@@ -99,7 +98,7 @@ def scan_text(text: str):
 
 
 def scan(root: Path):
-    raw: dict[str, set[str]] = defaultdict(set)
+    raw: dict[str, Counter[str]] = defaultdict(Counter)
     governed: dict[str, set[str]] = defaultdict(set)
     defaults: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
     inspected = 0
@@ -115,8 +114,8 @@ def scan(root: Path):
             file_raw, file_governed, file_defaults = scan_text(text)
         except ValueError as error:
             raise ValueError(f"{rel}: {error}") from error
-        for name in file_raw:
-            raw[name].add(rel)
+        for name, count in file_raw.items():
+            raw[name][rel] += count
         for name in file_governed:
             governed[name].add(rel)
         for name, default in file_defaults:
@@ -138,6 +137,7 @@ FIXTURES = [
     ('const char* doc = "see // getenv"; auto v = getenv("STRIX_A");', {"STRIX_A"}, set(), []),
     ('const char* doc = "/* open"; auto v = getenv("STRIX_A"); /* getenv("STRIX_B") */', {"STRIX_A"}, set(), []),
     ('char q = \'"\'; auto v = getenv("STRIX_A"); // getenv("STRIX_B")', {"STRIX_A"}, set(), []),
+    ('auto a = getenv("STRIX_A"); auto b = std::getenv("STRIX_A");', ["STRIX_A", "STRIX_A"], set(), []),
     ('auto v = my_getenv("STRIX_A"); auto w = getenv_or("STRIX_B");', set(), set(), []),
     ('auto v = getenv(name); auto w = getenv("OTHER_A"); auto x = getenv("strix_a");', set(), set(), []),
     ('const char* s = "getenv(\\"STRIX_A\\")";', set(), set(), []),
@@ -162,27 +162,37 @@ def self_test() -> int:
     failed = 0
     for index, (text, raw, governed, defaults) in enumerate(FIXTURES):
         got = scan_text(text)
-        if got != (raw, governed, defaults):
+        expected = (Counter(raw), governed, defaults)
+        if got != expected:
             failed += 1
             print(f"env switch census self-test: fixture {index} {text!r}: got {got}, "
-                  f"expected {(raw, governed, defaults)}", file=sys.stderr)
+                  f"expected {expected}", file=sys.stderr)
     print(f"env switch census self-test: {len(FIXTURES) - failed}/{len(FIXTURES)} fixtures ok")
     return 1 if failed else 0
 
 
-def read_baseline(path: Path) -> set[str]:
+def read_baseline(path: Path) -> dict[str, int]:
     if not path.is_file():
-        return set()
-    return {line.strip() for line in path.read_text(encoding="utf-8").splitlines()
-            if line.strip() and not line.startswith("#")}
+        return {}
+    counts = {}
+    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = line.partition("#")[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        if (len(parts) != 2 or not NAME.fullmatch(parts[0]) or parts[0] in counts
+                or not parts[1].isascii() or not parts[1].isdigit() or int(parts[1]) == 0):
+            raise ValueError(f"{path}:{line_no}: expected a unique STRIX_* name and a positive site count")
+        counts[parts[0]] = int(parts[1])
+    return counts
 
 
-def write_baseline(path: Path, names: set[str], *, exclusive: bool = False) -> None:
-    header = ("# Switches read with a raw getenv today (generated: tools/env_switch_census.py --update).\n"
-              "# After introduction this list only shrinks. New switches use include/strix/env_flags.hpp or a\n"
-              "# lever table (include/strix/lever.hpp). Explicit introduction exceptions use --grandfather.\n")
+def write_baseline(path: Path, counts: dict[str, int], *, exclusive: bool = False) -> None:
+    header = ("# Raw getenv sites per switch (generated: tools/env_switch_census.py --update).\n"
+              "# Counts may only decrease. Use include/strix/env_flags.hpp or a declared switch for new reads.\n"
+              "# Explicit introduction exceptions for new names use --grandfather.\n")
     with path.open("x" if exclusive else "w", encoding="utf-8", newline="\n") as output:
-        output.write(header + "".join(name + "\n" for name in sorted(names)))
+        output.write(header + "".join(f"{name} {counts[name]}\n" for name in sorted(counts)))
 
 
 def main() -> int:
@@ -191,7 +201,7 @@ def main() -> int:
     parser.add_argument("--baseline", type=Path)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true")
-    mode.add_argument("--update", action="store_true", help="drop baseline names that are no longer read raw")
+    mode.add_argument("--update", action="store_true", help="lower baseline counts as raw sites are removed")
     mode.add_argument("--grandfather", nargs="+", metavar="NAME",
                       help="explicitly admit named pre-introduction switches currently read raw (not for CI)")
     mode.add_argument("--seed", action="store_true", help="write the baseline from the current tree (first use only)")
@@ -216,14 +226,19 @@ def main() -> int:
     if not args.seed and not baseline_path.is_file():
         print(f"env switch census: baseline {baseline_path} not found", file=sys.stderr)
         return 2
-    baseline = read_baseline(baseline_path)
+    try:
+        baseline = {} if args.seed else read_baseline(baseline_path)
+    except (OSError, ValueError) as error:
+        print(f"env switch census: {error}", file=sys.stderr)
+        return 2
     conflicts = {name: sides for name, sides in defaults.items() if len(sides) > 1}
-    new_raw = sorted(set(raw) - baseline)
-    stale = sorted(baseline - set(raw))
+    raw_count = {name: sum(files.values()) for name, files in raw.items()}
+    increased = sorted(name for name, count in raw_count.items() if count > baseline.get(name, 0))
+    stale = sorted(name for name, count in baseline.items() if count > raw_count.get(name, 0))
 
     if args.seed:
         try:
-            write_baseline(baseline_path, set(raw), exclusive=True)
+            write_baseline(baseline_path, raw_count, exclusive=True)
         except FileExistsError:
             print(f"env switch census: baseline {baseline_path} already exists; use --update to remove names",
                   file=sys.stderr)
@@ -237,20 +252,22 @@ def main() -> int:
             print(f"env switch census: cannot grandfather names not currently read raw: {', '.join(invalid)}",
                   file=sys.stderr)
             return 2
-        write_baseline(baseline_path, baseline | requested)
-        for name in sorted(requested - baseline):
+        added = requested - baseline.keys()
+        write_baseline(baseline_path, baseline | {name: raw_count[name] for name in added})
+        for name in sorted(added):
             print(f"env switch census: grandfathered {name} ({', '.join(sorted(raw[name]))})")
         return 0
     if args.update:
-        write_baseline(baseline_path, baseline & set(raw))
-        print(f"env switch census: baseline {len(baseline)} -> {len(baseline & set(raw))} (removed {len(stale)})")
+        updated = {name: min(limit, raw_count[name]) for name, limit in baseline.items() if name in raw_count}
+        write_baseline(baseline_path, updated)
+        print(f"env switch census: baseline lowered for {len(stale)} switches")
         return 0
 
     if args.report or args.tsv:
         documented = documented_names(root)
         names = sorted(set(raw) | set(governed))
         only_governed = [n for n in names if n not in raw]
-        multi = [n for n in names if len(raw.get(n, set()) | governed.get(n, set())) > 1]
+        multi = [n for n in names if len(raw.get(n, {}).keys() | governed.get(n, set())) > 1]
         if args.report:
             print(f"switches read: {len(names)}")
             print(f"  governed only: {len(only_governed)}")
@@ -261,17 +278,18 @@ def main() -> int:
         if args.tsv:
             rows = ["name\tclass\tfiles\tdocumented\n"]
             for n in names:
-                files = sorted(raw.get(n, set()) | governed.get(n, set()))
+                files = sorted(raw.get(n, {}).keys() | governed.get(n, set()))
                 rows.append(f"{n}\t{'raw' if n in raw else 'governed'}\t{len(files)}\t{'yes' if n in documented else 'no'}\n")
             args.tsv.write_text("".join(rows), encoding="utf-8", newline="\n")
 
     if not args.check:
         return 0
     failed = False
-    for name in new_raw:
+    for name in increased:
         failed = True
         where = ", ".join(sorted(raw[name])[:3])
-        print(f"env switch census: {name} is read with a raw getenv ({where}). Read a new switch through "
+        print(f"env switch census: {name} has {raw_count[name]} raw getenv sites ({where}), "
+              f"baseline {baseline.get(name, 0)}. Read through "
               f"include/strix/env_flags.hpp (envcfg::flag/integer/text/choice) or declare it in a lever table.",
               file=sys.stderr)
     for name, sides in sorted(conflicts.items()):
@@ -280,11 +298,11 @@ def main() -> int:
         off = ", ".join(sorted(sides["off"])[:2])
         print(f"env switch census: {name} is read default-on ({on}) and default-off ({off}).", file=sys.stderr)
     if stale:
-        print(f"env switch census: {len(stale)} baseline switches are no longer read raw; "
+        print(f"env switch census: {len(stale)} switches have fewer raw reads; "
               f"run tools/env_switch_census.py --update", file=sys.stderr)
     if failed:
         return 1
-    print(f"env switch census: ok ({len(raw)} raw switches, none new; {len(set(governed) - set(raw))} governed)")
+    print(f"env switch census: ok ({len(raw)} raw switches, no site count increased; {len(set(governed) - set(raw))} governed)")
     return 0
 
 

@@ -140,6 +140,13 @@ void product() {
 void resolver() {
     Env env;
     pr::Inputs inputs{{}, lookup(env), false};
+    env["STRIX_PREFILL_INDEX_SCORE_WMMA"] = "1";
+    const auto explicit_index = pr::resolve(pr::Name::standard, inputs);
+    check(explicit_index.find("index_score_wmma")->status == pr::Status::explicit_env &&
+          explicit_index.qualification() == "unqualified: index_score_wmma" &&
+          explicit_index.json().find("\"unqualified\":[\"index_score_wmma\"]") != std::string::npos,
+          "explicit unqualified index arithmetic is stamped in its receipt");
+    env.clear();
     auto r = pr::resolve(pr::Name::fast, inputs, synthetic);
     check(r.find("ready")->status == pr::Status::set, "ready row applies");
     check(r.find("pending")->status == pr::Status::pending && r.find("absent")->status == pr::Status::pending, "pending never refuses");
@@ -312,14 +319,21 @@ void native_switch_and_yarn() {
         pr::apply(o.product_profile, [&](const char*, const char*) { ++writes; return true; });
         // Fast also exports the provisional GDN chunk row (switch + provenance).
         check(writes == 4U, "native CLI retains optional field while other profile rows export");
-        check(o.product_profile.qualification() == "qualification in progress: qsa_budget,gdn_fp16_chunk",
-            "explicit native override is not applied by provisional profile");
-        // Same run with a 1-token prompt (inside the qualified regime): the fast cells read as qualified.
+        const std::string expected = std::string("qualification in progress: qsa_budget,gdn_fp16_chunk") +
+            (on ? "; unqualified: moe_route_bf16" : "");
+        check(o.product_profile.qualification() == expected,
+            "the native override retains its source and stamps explicitly enabled unqualified arithmetic");
+        check(o.product_profile.json().find(on ? "\"unqualified\":[\"moe_route_bf16\"]" : "\"unqualified\":[]") != std::string::npos,
+            "receipt lists the explicitly enabled unqualified row");
+        // The 8K ledger qualifies the automatic bundle. The explicit row still uses the table's explicit-value rule.
         std::vector<std::string> in_regime{"decoder","model.gguf","1","--profile","fast","--prefill-moe-route-bf16",value};
         if (allow) in_regime.push_back("--allow-pending");
-        check(parse(std::move(in_regime)).product_profile.qualification() == "qualified",
-            "fast cells inside the 8K regime ledger read as qualified");
+        check(parse(std::move(in_regime)).product_profile.qualification() ==
+                (on ? "unqualified: moe_route_bf16" : "qualified"),
+            "only the explicit opt-in is unqualified inside the automatic bundle's band");
     }
+    check(parse({"decoder","model.gguf","1","--profile","fast"}).product_profile.qualification() == "qualified",
+        "the automatic FAST bundle retains its in-band qualification");
     refuses([] { (void)parse({"decoder","model.gguf","1","--prefill-moe-route-bf16","maybe"}); }, "requires on or off");
     refuses([] { (void)parse({"decoder","model.gguf","1","--prefill-moe-route-bf16","on","--prefill-moe-route-bf16","off"}); }, "once");
     for (const auto profile : {"default", "fast", "quality"}) for (const bool allow : {false, true}) {

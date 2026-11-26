@@ -610,7 +610,7 @@ void CohortDecoder::step() {
     std::vector<std::size_t> device_rows(n, 0);  // leading device-draft rows of a window (context rows follow them)
     const std::uint32_t draft_cap = max_draft_for_live(config_, live());
     std::vector<std::uint32_t> device;
-    std::vector<double> device_p;
+    std::vector<double> device_p, acc, device_acc;
     for (std::size_t k = 0; k < n; ++k) {
         Lane& l = *run[k];
         const std::uint64_t left = token_limit(l.request) - l.result.ids.size();
@@ -621,14 +621,14 @@ void CohortDecoder::step() {
         const std::uint64_t window_cap = std::max<std::uint32_t>(backend_.max_window(plan.decode_lanes[k]), 1U) - 1U;
         const std::size_t room = one_row ? 0U : static_cast<std::size_t>(std::min<std::uint64_t>(
                                                      {draft_cap, left - 1U, room_pos, window_cap}));
-        std::vector<double> acc;
+        acc.clear();
         device.clear();
         device_p.clear();
         if (!l.sampler && room != 0 && backend_.device_drafts()) {
             backend_.propose(plan.decode_lanes[k], static_cast<std::uint32_t>(room), device, device_p);
             if (device.size() > room) device.resize(room);
         }
-        std::vector<double> device_acc(device.size());
+        device_acc.resize(device.size());
         double device_expected = 0.0, chain_p = 1.0;
         for (std::size_t d = 0; d < device.size(); ++d) {
             const double p = d < device_p.size() && std::isfinite(device_p[d]) ? std::clamp(device_p[d], 0.0, 1.0)
@@ -636,6 +636,7 @@ void CohortDecoder::step() {
             device_acc[d] = p;
             device_expected += chain_p *= p;
         }
+        const auto* probabilities = &acc;
         if (l.drafter) {
             // room 0 still observes the pending token once (the drafter's context follows the lane). A device proposal
             // is the confident prefix: the context drafter continues it, or replaces it with a long exact copy span
@@ -649,12 +650,12 @@ void CohortDecoder::step() {
                 drafts[k] = device;
                 drafts[k].insert(drafts[k].end(), context.begin(), context.end());
                 device_acc.insert(device_acc.end(), acc.begin(), acc.end());
-                acc = std::move(device_acc);
+                probabilities = &device_acc;
                 device_rows[k] = device.size();
             }
         } else if (!device.empty()) {
             drafts[k] = device;
-            acc = std::move(device_acc);
+            probabilities = &device_acc;
             device_rows[k] = device.size();
         }
         if (drafts[k].size() > room) drafts[k].resize(room);
@@ -662,7 +663,7 @@ void CohortDecoder::step() {
         accept[k].push_back(1.0F);
         const double w = config_.accept_weight;
         for (std::size_t d = 0; d < drafts[k].size(); ++d) {
-            const double claim = d < acc.size() ? acc[d] : config_.accept_prior;
+            const double claim = d < probabilities->size() ? (*probabilities)[d] : config_.accept_prior;
             const double p = w > 0.0 && d < l.tried.size() ? (l.kept[d] + w * claim) / (l.tried[d] + w) : claim;
             accept[k].push_back(static_cast<float>(p));
         }
@@ -684,8 +685,10 @@ void CohortDecoder::step() {
     const RowPlan rp =
         plan_rows(demands, fitted_cost(sums_, config_, static_cast<std::uint32_t>(n)), row_limits, config_.accept_prior);
 
-    std::vector<CohortGroup> groups(n);
-    std::vector<std::uint32_t> tokens;
+    auto scratch = std::exchange(verification_, {});
+    auto& [groups, tokens, top, keep] = scratch;
+    groups.resize(n);
+    tokens.clear();
     for (std::size_t k = 0; k < n; ++k) {
         const std::uint32_t rows = std::min(rp.rows.at(k), demands[k].max_rows);
         if (rows == 0) throw std::logic_error("cohort decoder: a running lane was parked (lanes > rows of a forward)");
@@ -706,9 +709,9 @@ void CohortDecoder::step() {
         }
         base += groups[k].rows;
     }
-    std::vector<std::uint32_t> top(tokens.size());
+    top.assign(tokens.size(), 0U);
     backend_.verify(groups, tokens, top);
-    std::vector<std::uint32_t> keep(n);
+    keep.resize(n);
     std::vector<std::vector<std::uint32_t>> chosen(n);  // the ids each lane emits this step
     std::vector<std::unique_ptr<MtpSelectionReceipt>> receipts(n);
     std::vector<std::string> refused(n);
@@ -799,6 +802,7 @@ void CohortDecoder::step() {
         l.position += keep[k];
         if (deliver(l, emitted)) done.emplace_back(&l, std::string());
     }
+    verification_ = std::move(scratch);
     for (auto& [l, error] : done) finish(*l, std::move(error));
 }
 

@@ -19,7 +19,7 @@ that the reference's own chaos is not charged to the lever:
      default one class, or the prompt-length band with a manifest) are pooled and judged by the same rule; a class
      verdict is final on >= 800 rows. The pooled top-1 and dNLL limits stay absolute (>= 800 rows pooled).
   R3 dNLL on held-out ids (labels that neither arm generated), at least 800 scored rows pooled, standard error shown.
-  R4 reference check: a window where the candidate beats the exact reference by more than 3 se (and, with a null, the
+  R4 reference check: a window or final class where the candidate beats the exact reference by more than 3 se (and, with a null, the
      candidate-minus-null difference is also below -3 se) is "reference suspect"; a window whose reference NLL is far
      above the others (> max(3 x median, median + 2 nats), >= 3 windows) is "off-distribution" (control or
      chat-template ids, a timing prompt). Either makes the verdict HOLD, never PASS.
@@ -82,6 +82,15 @@ def mean_se(x):
     return float(x.mean()), se
 
 
+def null_row_mean(name, metric, values, shape):
+    rows = np.asarray(values, np.float64)
+    if rows.shape == shape:
+        rows = rows[np.newaxis, :]
+    if rows.ndim != 2 or not rows.shape[0] or rows.shape[1:] != shape or not np.isfinite(rows).all():
+        raise GateError(f"{name}: invalid or unpaired null {metric} rows")
+    return np.sort(rows, axis=0).mean(axis=0)
+
+
 def _judge(kl, agree, d, null_kl, null_dis, null_d, limits):
     """R2 + R4 on one window or one pooled content class: KL two-state, top-1 and dNLL three-state, reference check.
 
@@ -99,7 +108,7 @@ def _judge(kl, agree, d, null_kl, null_dis, null_d, limits):
     if null_d is not None and null_d.size > 1:
         j["null_dnll"], j["null_dnll_se"] = mean_se(null_d)
         cap = limits.get("se_null_cap", LIMITS["se_null_cap"]) * j["null_dnll_se"]
-        if math.isfinite(cap) and 0.0 < cap < se:
+        if math.isfinite(cap) and cap < se:
             se_used, j["dnll_se_rows"] = cap, se
     j["dnll_se"] = se_used
     j["dnll_limit"] = limits["max_dnll"] + (z * se_used if math.isfinite(se_used) else 0.0)
@@ -109,9 +118,9 @@ def _judge(kl, agree, d, null_kl, null_dis, null_d, limits):
     s = j["states"].values()
     j["state"] = "fail" if "fail" in s else ("unresolved" if "unresolved" in s else "pass")
     # R4: the lever beats the exact reference on the true text by more than suspect_z se, and the null does not move
-    # the same way (paired candidate-minus-null not below -suspect_z se as well)
+    # the same way (paired candidate-minus-null is also below -suspect_z se).
     sz = limits.get("suspect_z", LIMITS["suspect_z"])
-    suspect = math.isfinite(se_used) and dnll < -sz * se_used
+    suspect = math.isfinite(se) and dnll < -sz * se
     if suspect and null_d is not None and null_d.size == d.size and d.size > 1:
         j["cand_minus_null"], cn_se = mean_se(d - null_d)
         suspect = j["cand_minus_null"] < -sz * cn_se
@@ -120,13 +129,13 @@ def _judge(kl, agree, d, null_kl, null_dis, null_d, limits):
 
 
 def window_stats(name, kl, agree, nll_ref, nll_cand, null_kls, hit_ref=None, hit_cand=None, limits=LIMITS, null_top1s=None,
-                 null_nlls=None, cls=None, null_kl_rows=None):
+                 null_nlls=None, cls=None, null_kl_rows=None, null_top1_rows=None):
     """One window: R2 KL limit relative to this window's null; top-1 and dNLL PASS / UNRESOLVED / FAIL on its rows; R4.
 
     null_top1s: the null arms' top-1 agreement on this window (None: the null-relative top-1 term is absent).
-    null_nlls: the null arms' per-row NLL on the same labels (the first is used: se cap and the paired reference check).
+    null_nlls: the null arms' per-row NLL on the same labels (mean per row for the se cap and paired reference check).
     cls: the window's content class, declared before scoring (None: one class for the whole gate set).
-    null_kl_rows: the first null arm's per-row KL on this window (None: the pooled null-floor KL has no se term)."""
+    null_kl_rows and null_top1_rows: per-row KL and agreement of the null arms, for the pooled null-floor se."""
     kl, agree = np.asarray(kl, np.float64), np.asarray(agree, bool)
     nll_ref = np.asarray(nll_ref, np.float64)
     nll_cand = np.asarray(nll_cand, np.float64)
@@ -137,20 +146,18 @@ def window_stats(name, kl, agree, nll_ref, nll_cand, null_kls, hit_ref=None, hit
     d = nll_cand - nll_ref
     if not null_kls:
         raise GateError(f"{name}: no null arm (v2 needs the one-ulp / order-only null of every window)")
-    null_kl = float(np.mean(null_kls))
+    null_kl = float(np.mean(sorted(null_kls)))
     if null_top1s and not all(0.0 <= x <= 1.0 for x in null_top1s):
         raise GateError(f"{name}: null top-1 agreement is outside [0, 1]")
-    null_dis = 1.0 - float(np.mean(null_top1s)) if null_top1s else 0.0
+    null_dis = 1.0 - float(np.mean(sorted(null_top1s))) if null_top1s else 0.0
     null_d = None
     if null_nlls:
-        null_nll = np.asarray(null_nlls[0], np.float64)
-        if null_nll.shape != nll_ref.shape or not np.isfinite(null_nll).all():
-            raise GateError(f"{name}: invalid or unpaired null NLL rows")
+        null_nll = null_row_mean(name, "NLL", null_nlls, nll_ref.shape)
         null_d = null_nll - nll_ref
     if null_kl_rows is not None:
-        null_kl_rows = np.asarray(null_kl_rows, np.float64)
-        if null_kl_rows.shape != kl.shape or not np.isfinite(null_kl_rows).all():
-            raise GateError(f"{name}: invalid or unpaired null KL rows")
+        null_kl_rows = null_row_mean(name, "KL", null_kl_rows, kl.shape)
+    if null_top1_rows is not None:
+        null_top1_rows = null_row_mean(name, "top-1", null_top1_rows, agree.shape)
     w = {"name": name, "class": cls or "all", "rows": int(kl.size), "dnll_rows": int(d.size),
          "ref_nll": float(nll_ref.mean())}
     w.update(_judge(kl, agree, d, null_kl, null_dis, null_d, limits))
@@ -164,10 +171,11 @@ def window_stats(name, kl, agree, nll_ref, nll_cand, null_kls, hit_ref=None, hit
     w["_rows"] = {"kl": kl, "agree": agree, "dnll": d}
     if null_d is not None:
         w["_rows"]["null_dnll"] = null_d
+        w["null_dnll_mean"] = w["null_dnll"]  # receipt alias for the pooled control mean
     if null_kl_rows is not None:
         w["_rows"]["null_kl"] = null_kl_rows
-    if null_nlls:   # every null's mean dNLL (the pooled null floor uses their mean, like the null KL)
-        w["null_dnll_mean"] = float(np.mean([np.mean(np.asarray(x, np.float64) - nll_ref) for x in null_nlls]))
+    if null_top1_rows is not None:
+        w["_rows"]["null_top1"] = null_top1_rows
     return w
 
 
@@ -206,21 +214,31 @@ def read_routes(path, opener=None):
 
 
 def route_flips(ref_path, arm_path, opener=None):
-    """Ids of the reference's selected sets missing from the arm's, per layer (order-free). Same call sequence required."""
+    """Order-independent ID differences and weight differences on matching experts, for the same call sequence."""
     a, b = read_routes(ref_path, opener), read_routes(arm_path, opener)
     if len(a) != len(b):
         raise GateError(f"{arm_path}: {len(b)} router calls, the reference has {len(a)}")
     per = {}
-    for i, ((la, ia, _), (lb, ib, _)) in enumerate(zip(a, b)):
+    max_weight_delta, rows = 0.0, 0
+    for i, ((la, ia, wa), (lb, ib, wb)) in enumerate(zip(a, b)):
         if la != lb or ia.shape != ib.shape:
             raise GateError(f"{arm_path}: call {i} is layer {lb} shape {ib.shape}, the reference has layer {la} shape {ia.shape}")
         k = ia.shape[1]
-        missing = k - np.array([np.intersect1d(x, y).size for x, y in zip(ia, ib)], dtype=np.int64)
+        if not np.isfinite(wa).all() or not np.isfinite(wb).all():
+            raise GateError(f"{arm_path}: non-finite router weight at call {i}")
+        missing = 0
+        for x, y, wx, wy in zip(ia, ib, wa, wb):
+            common, ix, iy = np.intersect1d(x, y, return_indices=True)
+            missing += k - common.size
+            if common.size:
+                max_weight_delta = max(max_weight_delta, float(np.abs(wx[ix].astype(np.float64) - wy[iy]).max()))
         s = per.setdefault(int(la), [0, 0])
         s[0] += ia.size
-        s[1] += int(missing.sum())
+        s[1] += missing
+        rows += ia.shape[0]
     slots, ids = sum(v[0] for v in per.values()), sum(v[1] for v in per.values())
-    return {"slots": slots, "ids": ids, "rate": ids / slots if slots else 0.0, "per_layer": per}
+    return {"slots": slots, "ids": ids, "rate": ids / slots if slots else 0.0, "per_layer": per,
+            "records": len(a), "rows": rows, "max_abs_weight_delta": max_weight_delta}
 
 
 def flip_ratio(cand, null):
@@ -236,6 +254,11 @@ def route_receipt(stderr_bytes, what):
     return json.loads(found[0])
 
 
+def null_control_applied(receipt):
+    control = receipt.get("null", {})
+    return control.get("nudged", 0) > 0 or (control.get("order") and control.get("applications", 0) > 0)
+
+
 def check_replay(ref_receipt, arm_receipt, ref_file, what, null=False):
     """R1 bookkeeping: each arm replayed every route and the null exercised its declared control."""
     out = ref_receipt.get("out")
@@ -248,11 +271,21 @@ def check_replay(ref_receipt, arm_receipt, ref_file, what, null=False):
         raise GateError(f"{what}: replayed {rin['path']}, not the reference file {ref_file}")
     if not rin["complete"] or rin["consumed"] != out["records"] or rin["records"] != out["records"]:
         raise GateError(f"{what}: replay consumed {rin['consumed']} of {rin['records']} records, the reference wrote {out['records']}")
-    evidence = arm_receipt.get("null", {})
-    if null and not (evidence.get("nudged") or (evidence.get("order") and evidence.get("applications", 0) > 0)):
+    if null and not null_control_applied(arm_receipt):
         raise GateError(f"{what}: no applied null control in the route receipt")
     return {"records": rin["consumed"], "rows": rin["rows"], "local_flips": arm_receipt.get("local_flips"),
             "null": arm_receipt.get("null")}
+
+
+def check_free_record(receipt, path, counts, what, null=False):
+    out = receipt.get("out", {})
+    if "in" in receipt or not out or ("null" in receipt and not null):
+        raise GateError(f"{what}: expected a free-running route recording")
+    if (pathlib.PurePath(out.get("path", "")).name != pathlib.PurePath(path).name
+            or any(out.get(k) != counts[k] for k in ("records", "rows"))):
+        raise GateError(f"{what}: route recording does not match its receipt")
+    if null and not null_control_applied(receipt):
+        raise GateError(f"{what}: no applied null control in the free-running route receipt")
 
 
 def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False):
@@ -280,6 +313,9 @@ def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False):
             w["cleared_by_class"] = w["class"] in final_pass
     pooled["off_distribution"] = off_distribution(windows, limits)
     pooled["reference_suspect"] = [w["name"] for w in windows if w["reference_suspect"]]
+    suspect_classes = [c["name"] for c in pooled["classes"] if c["final"] and c["reference_suspect"]]
+    if suspect_classes:
+        pooled["reference_suspect_classes"] = suspect_classes
     pooled["unresolved"] = sorted({w["class"] for w in windows if w["state"] == "unresolved" and not w["cleared_by_class"]} |
                                   {c["name"] for c in pooled["classes"] if c["state"] == "unresolved" or not c["final"]})
     if flips is not None:
@@ -293,7 +329,7 @@ def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False):
     pooled["checks"] = checks
     if not all(checks.values()):
         pooled["state"] = "FAIL"
-    elif pooled["reference_suspect"] or pooled["off_distribution"]:
+    elif pooled["reference_suspect"] or suspect_classes or pooled["off_distribution"]:
         pooled["state"] = "HOLD"     # never PASS: the exact path is examined on those windows first
     elif pooled["unresolved"]:
         pooled["state"] = "UNRESOLVED"   # provisional: the lever stays opt-in for these classes
@@ -312,8 +348,8 @@ def null_floor(windows, pooled, limits=LIMITS):
     A bar is engaged when the pooled null fails it or lies within floor_z of its own row se of failing it (the null is
     not measurably inside the bar). An engaged bar only relaxes: KL <= max(0.02, null + 0.02), top-1 >= min(0.93,
     null - 0.01), dNLL <= max(0.01, null + 0.01). Without the null's evidence for a bar (no per-window null top-1 / null
-    NLL rows) that bar stays absolute. The pooled null is the mean of the null arms; its se comes from the first null's
-    rows (KL without per-row null KL: se 0)."""
+    NLL rows) that bar stays absolute. The pooled null and its se use the paired per-row averages of all null arms
+    (KL without per-row evidence: se 0, agreement without per-row evidence: binomial se)."""
     rows = np.array([w["rows"] for w in windows], np.float64)
     z = limits["floor_z"]
     out = {"z": z}
@@ -323,18 +359,18 @@ def null_floor(windows, pooled, limits=LIMITS):
     nt = nt_se = None
     if all("null_top1" in w for w in windows):
         nt = float(np.dot(rows, [w["null_top1"] for w in windows]) / rows.sum())
-        nt_se = math.sqrt(nt * (1.0 - nt) / rows.sum())
+        tr = [w["_rows"].get("null_top1") for w in windows]
+        nt_se = (mean_se(np.concatenate(tr))[1] if all(x is not None for x in tr)
+                 else math.sqrt(nt * (1.0 - nt) / rows.sum()))
     nd = nd_se = None
     if all("null_dnll" in w["_rows"] for w in windows):
-        nd_se = mean_se(np.concatenate([w["_rows"]["null_dnll"] for w in windows]))[1]
-        drows = np.array([w["dnll_rows"] for w in windows], np.float64)
-        nd = float(np.dot(drows, [w["null_dnll_mean"] for w in windows]) / drows.sum())
+        nd, nd_se = mean_se(np.concatenate([w["_rows"]["null_dnll"] for w in windows]))
     for b, value, absl, null, se, margin, sign in (
             ("kl", pooled["kl"], limits["max_kl"], nk, nk_se, limits["floor_kl_margin"], 1.0),
             ("top1", pooled["top1"], limits["min_top1"], nt, nt_se, limits["floor_top1_margin"], -1.0),
             ("dnll", pooled["dnll"], limits["max_dnll"], nd, nd_se, limits["floor_dnll_margin"], 1.0)):
         # sign +1: lower is better (value <= limit); -1: higher is better (value >= limit)
-        engaged = null is not None and sign * (null + sign * z * (se or 0.0) - absl) > 0.0
+        engaged = null is not None and sign * (null - absl) + z * (se or 0.0) >= 0.0
         limit = absl
         if engaged:
             limit = max(absl, null + margin) if sign > 0 else min(absl, null - margin)
@@ -373,12 +409,12 @@ def class_verdicts(windows, limits=LIMITS):
     out = []
     for name, ws in groups.items():
         cat = lambda k: np.concatenate([w["_rows"][k] for w in ws])  # noqa: E731
-        rows = np.array([w["dnll_rows"] for w in ws], np.float64)
+        rows = np.array([w["rows"] for w in ws], np.float64)
         null_kl = float(np.dot(rows, [w["null_kl"] for w in ws]) / rows.sum())
         null_dis = (float(np.dot(rows, [1.0 - w["null_top1"] for w in ws]) / rows.sum())
                     if all("null_top1" in w for w in ws) else 0.0)
         null_d = cat("null_dnll") if all("null_dnll" in w["_rows"] for w in ws) else None
-        c = {"name": name, "windows": [w["name"] for w in ws], "rows": int(rows.sum())}
+        c = {"name": name, "windows": [w["name"] for w in ws], "rows": sum(w["dnll_rows"] for w in ws)}
         c.update(_judge(cat("kl"), cat("agree"), cat("dnll"), null_kl, null_dis, null_d, limits))
         c["final"] = c["rows"] >= limits["min_rows"]
         out.append(c)
@@ -402,6 +438,9 @@ def window_line(w, flips=None, limits=LIMITS):
     if flips:
         fl = (f"; flips free cand {flips['cand']['rate']:.3e} null {flips['null']['rate']:.3e} ratio "
               f"{flip_ratio(flips['cand'], flips['null']):.2f}")
+        if "max_abs_weight_delta" in flips["cand"]:
+            fl += (f"; max matched route weight delta cand {flips['cand']['max_abs_weight_delta']:.3e} "
+                   f"null {flips['null']['max_abs_weight_delta']:.3e}")
     nt = f", null {w['null_top1']:.4f}" if "null_top1" in w else ""
     nd = (f"; null dNLL {w['null_dnll']:+.5f} se {w['null_dnll_se']:.5f}" if "null_dnll" in w else "; null dNLL n/a")
     cap = f" (rows se {w['dnll_se_rows']:.5f}, capped 1.5 x null)" if "dnll_se_rows" in w else ""
@@ -421,9 +460,10 @@ def _state_text(x):
 
 
 def class_line(c):
+    flag = " [reference_suspect]" if c["reference_suspect"] else ""
     return (f"class {c['name']}: windows {len(c['windows'])} rows {c['rows']} ({'final' if c['final'] else 'provisional'}, "
             f">= {LIMITS['min_rows']}) KL {c['kl']:.5f} top-1 {c['top1']:.4f} (fail < {c['top1_limit']:.4f}) dNLL "
-            f"{c['dnll']:+.5f} se {c['dnll_se']:.5f} (fail > {c['dnll_limit']:+.5f}) -> {_state_text(c)}")
+            f"{c['dnll']:+.5f} se {c['dnll_se']:.5f} (fail > {c['dnll_limit']:+.5f}) -> {_state_text(c)}{flag}")
 
 
 def pooled_line(p, limits=LIMITS):
@@ -436,6 +476,7 @@ def pooled_line(p, limits=LIMITS):
     why = {"FAIL": ",".join(bad), "UNRESOLVED": "classes " + ",".join(p.get("unresolved", [])) + " (provisional: opt-in there)",
            "HOLD": "; ".join(x for x in (
                ("reference suspect " + ",".join(p.get("reference_suspect", []))) if p.get("reference_suspect") else "",
+               ("reference suspect class " + ",".join(p["reference_suspect_classes"])) if p.get("reference_suspect_classes") else "",
                ("off-distribution reference " + ",".join(p.get("off_distribution", []))) if p.get("off_distribution") else "")
                if x) + " (examine the exact path on those windows, then re-run)", "PASS": ""}[p["state"]]
     lines = [class_line(c) for c in p.get("classes", [])]
@@ -486,7 +527,7 @@ def read_trace_diag(paths, opener=None):
     """Free-running route flips from an engine's per-layer trace, for engines without a route tap: lines
     {"diag":1,"case":C,"arm":A,...,"layers":[{"l":0,...,"router_ids":I,...},...]} where router_ids counts the
     reference's selected experts missing from the arm's selection on that layer (order-free, over the traced rows).
-    Returns {(case, arm): (ids, layers)}; a diag line without layers (trace off) is skipped."""
+    Returns {(case, arm): (ids, layer_ids)}; a diag line without layers (trace off) is skipped."""
     out = {}
     for p in paths or []:
         with open(p, encoding="utf-8", errors="replace", opener=opener) as f:
@@ -495,12 +536,18 @@ def read_trace_diag(paths, opener=None):
             m = TRACE_DIAG.match(line)
             if not m:
                 continue
-            ids = [int(x) for x in re.findall(r'"router_ids":(\d+)', line)]
-            if not ids:
+            layers = json.loads(line).get("layers", [])
+            if not layers:
                 continue
+            per_layer = {}
+            for layer in layers:
+                number, ids = layer.get("l"), layer.get("router_ids")
+                if type(number) is not int or number < 0 or number in per_layer or type(ids) is not int or ids < 0:
+                    raise GateError(f"{p}: invalid router trace layers for {m.group(1)}.{m.group(2)}")
+                per_layer[number] = ids
             if m.groups() in out:
                 raise GateError(f"{p}: a second trace of {m.group(1)}.{m.group(2)}")
-            out[m.groups()] = (sum(ids), len(ids))
+            out[m.groups()] = (sum(per_layer.values()), tuple(sorted(per_layer)))
     return out
 
 
@@ -565,6 +612,7 @@ def qual(a):
     if diag and manifest is None:
         raise GateError("--trace-diag needs --manifest (flip slots = prompt rows x traced layers)")
     windows, flips, replay, traced = [], [], {}, 0
+    nonfinite_candidate = []
     for case in cases:
         if manifest is not None and case not in manifest:
             raise GateError(f"{case}: not in the manifest")
@@ -577,11 +625,19 @@ def qual(a):
 
         ra, _ = reduce(logit(a.ref), logit(a.cand), **kw)
         nulls = [reduce(logit(a.ref), logit(n), **kw)[0] for n in a.null]
+        if ra["nonfinite_r"].any():
+            raise GateError(f"{case}: non-finite reference logits")
+        if any(x["nonfinite_c"].any() for x in nulls):
+            raise GateError(f"{case}: non-finite null logits")
         null_moved(case, [float(x["kl_rc"].mean()) for x in nulls])
+        if ra["nonfinite_c"].any():
+            nonfinite_candidate.append(case)
+            continue
         w = window_stats(case, ra["kl_rc"], ra["agree"].astype(bool), ra["nll_r"], ra["nll_c"],
                          [float(x["kl_rc"].mean()) for x in nulls], ra["top1_r_is_label"], ra["top1_c_is_label"],
                          null_top1s=[float(x["agree"].mean()) for x in nulls], null_nlls=[x["nll_c"] for x in nulls],
-                         cls=window_class(case, classes, manifest), null_kl_rows=nulls[0]["kl_rc"], limits=limits)
+                         cls=window_class(case, classes, manifest), null_kl_rows=[x["kl_rc"] for x in nulls],
+                         null_top1_rows=[x["agree"] for x in nulls], limits=limits)
         ref_route = route(a.ref)
         moe = ref_route.exists()
         f = None
@@ -595,8 +651,12 @@ def qual(a):
                 raise GateError(f"{case}: MoE routes present: --cand-free and --null-free arms are required (R1 flip ratio)")
             f = {"cand": route_flips(ref_route, route(a.cand_free), opener),
                  "null": route_flips(ref_route, route(a.null_free), opener)}
+            check_free_record(ref_r, ref_route, f["cand"], f"{case}.{a.ref}")
+            for key, arm in (("cand", a.cand_free), ("null", a.null_free)):
+                what = f"{case}.{arm}"
+                check_free_record(route_receipt(err(arm), what), route(arm), f[key], what, null=key == "null")
             flips.append(f)
-            w["flips"] = {k: {x: v[x] for x in ("slots", "ids", "rate")} for k, v in f.items()}
+            w["flips"] = {k: {x: v[x] for x in ("slots", "ids", "rate", "max_abs_weight_delta")} for k, v in f.items()}
         elif diag:
             # no route tap: every arm ran free, so the flips come from the engine trace of the candidate and the null
             fc, fn = diag.get((case, a.cand_free or a.cand)), diag.get((case, a.null_free or a.null[0]))
@@ -604,8 +664,8 @@ def qual(a):
                 raise GateError(f"{case}: trace of only one of the free-running candidate / null arms (R1 needs both)")
             if fc is not None:
                 if fc[1] != fn[1]:
-                    raise GateError(f"{case}: candidate trace has {fc[1]} layers, the null's {fn[1]}")
-                slots = int(manifest[case].size) * fc[1]
+                    raise GateError(f"{case}: candidate trace layers {fc[1]} differ from null layers {fn[1]}")
+                slots = int(manifest[case].size) * len(fc[1])
                 f = {k: {"slots": slots, "ids": v[0], "rate": v[0] / slots} for k, v in (("cand", fc), ("null", fn))}
                 flips.append(f)
                 w["flips"] = f
@@ -626,10 +686,15 @@ def qual(a):
     if traced and not replay:
         print(f"R1: no route tap: every arm ran free, so KL / top-1 / dNLL include route flips; flips from the engine trace "
               f"on {traced} of {len(windows)} windows (slots = prompt rows x traced layers)")
-    p = verdict(windows, flips if flips else None, limits=limits,
-                allow_null_floor=getattr(a, 'allow_null_floor', False))
+    if nonfinite_candidate:
+        p = {"state": "FAIL", "pass": False, "checks": {"candidate_finite": False},
+             "nonfinite_candidate": nonfinite_candidate}
+        print(f"POOLED v2 -> FAIL non-finite candidate logits: {', '.join(nonfinite_candidate)}")
+    else:
+        p = verdict(windows, flips if flips else None, limits=limits,
+                    allow_null_floor=getattr(a, 'allow_null_floor', False))
+        print(pooled_line(p, limits))
     exit_code = EXIT[p["state"]]
-    print(pooled_line(p, limits))
     if a.json:
         doc = {"schema": "strix-fast-gate-v2/v1", "limits": limits, "ref": a.ref, "cand": a.cand, "null": a.null,
                "format": a.format, "r1": r1,
@@ -647,7 +712,7 @@ def qual(a):
             stdout.flush()
         except (OSError, ValueError):
             return exit_code
-    if r4_input is not None:
+    if r4_input is not None and not nonfinite_candidate:
         try:
             _run_r4_diagnostic(r4_input, windows, p, classes, manifest, limits, protected,
                                stdout, sys.stderr, stdout_flushed)
@@ -759,7 +824,8 @@ def r4_assessment(path, windows, pooled, manifest, limits):
 
     failed = any(not ok for k, ok in pooled["checks"].items() if k != "classes") or any(
         c["state"] == "fail" for c in (*content.values(), *bands.values()))
-    state = ("FAIL" if failed else "HOLD" if flagged or pooled["reference_suspect"]
+    suspect_class = any(c["final"] and c["reference_suspect"] for c in (*content.values(), *bands.values()))
+    state = ("FAIL" if failed else "HOLD" if flagged or pooled["reference_suspect"] or suspect_class
              else "UNRESOLVED" if unresolved else "PASS")
     return [*lines, f"frozen-bar assessment would be {state}"]
 

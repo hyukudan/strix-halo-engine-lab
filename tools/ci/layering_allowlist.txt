@@ -2,6 +2,9 @@
 # to-do list of private families, cross-model includes, raw getenv and unbounded spin waits.
 # Regenerate with tools/ci/check_layering.py --write and check that the diff only shrinks.
 cross-model src/glm/kernels/glm_tier_a.hip 1
+cross-model src/hy4/hip/hy4_hip_forward.hip 2
+cross-model src/hy4/ref/hy4_dfly_ref.cpp 1
+cross-model src/hy4/ref/hy4_host_ref.cpp 2
 model-include include/strix/cuda/trellis.hpp 1
 model-include include/strix/hc/hc_contract.hpp 1
 model-include include/strix/hip_ggml_weight_formats.hpp 3
@@ -12,13 +15,9 @@ model-include src/cuda/weight/gsq_sources.cuh 1
 model-include src/cuda/weight/registry.cu 1
 model-include src/cuda/weight/registry.hpp 1
 model-include src/ggml_dequant.cpp 3
-model-include src/hip_gdn_launcher.hip 1
-model-include src/hip_hyper_mix_launcher.hip 1
-model-include src/hip_indexed_attention_launcher.hip 4
 model-include src/hip_known_prefix_window.hip 6
 model-include src/hip_known_prompt_backend.cpp 1
 model-include src/hip_lm_head_launcher.hip 1
-model-include src/hip_moe_experts_launcher.hip 2
 model-include src/hip_moe_q4k_a8_known_rows.hip 3
 model-include src/hip_moe_q4k_a8_probe.hip 1
 model-include src/hip_moe_route_launcher.hip 1
@@ -27,18 +26,13 @@ model-include src/hip_mtp_fast_draft.hip 1
 model-include src/hip_mtp_input_fusion.hip 1
 model-include src/hip_mtp_resources.hip 1
 model-include src/hip_mtp_target_hidden.hip 1
-model-include src/hip_ple_launcher.hip 1
 model-include src/hip_q6p_pack.cpp 1
 model-include src/hip_q8_rows_gemv.hpp 1
 model-include src/hip_serial_graph.hip 1
 model-include src/hip_shared_expert_launcher.hip 1
-model-include src/hy4/hip/hy4_hip_forward.hip 2
-model-include src/hy4/ref/hy4_dfly_ref.cpp 1
-model-include src/hy4/ref/hy4_host_ref.cpp 2
 model-include src/known_prefix_prefill_runtime.cpp 2
 model-include src/moe_q4k_a8_contract.cpp 3
 model-include src/session/backend_hip.cpp 1
-model-include src/weight/formats/channel_quant.cpp 1
 model-include src/weight/formats/exl3.cpp 1
 model-include src/weight/formats/fp8.cpp 1
 model-include src/weight/formats/gsq.cpp 4
@@ -158,8 +152,13 @@ model-kernel src/hip_ds41_shexp_tp.hip 2
 model-kernel src/hip_ds41_staged_ready.hpp 5
 model-kernel src/hip_ds41_trellis.hip 1
 model-kernel src/hip_ds41_trellis_group.hip 2
+model-kernel src/hip_gdn_launcher.hip 28
+model-kernel src/hip_hyper_mix_launcher.hip 36
+model-kernel src/hip_indexed_attention_launcher.hip 70
 model-kernel src/hip_minimax_moe.hip 6
 model-kernel src/hip_minimax_msa.hip 7
+model-kernel src/hip_moe_experts_launcher.hip 27
+model-kernel src/hip_ple_launcher.hip 12
 model-kernel src/minimax/attn/index_proj.hip 8
 model-kernel src/minimax/attn/index_proj_tests.hip 2
 model-kernel src/minimax/attn/msa_fused.hip 12

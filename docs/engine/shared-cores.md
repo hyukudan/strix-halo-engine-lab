@@ -86,7 +86,7 @@ one device operand source every engine reads trellis weights through ([trellis c
 
 **Engine profiles and the FAST bundle** ([`include/strix/engine_profile.hpp`](../../include/strix/engine_profile.hpp),
 [`include/strix/fast_profile.hpp`](../../include/strix/fast_profile.hpp)). One switch `--profile
-default|fast|quality` selects every lever's value; each lever is one row of the engine's `*_profile_table.hpp`.
+exact|fast|turbo` selects a tier; the resolver applies explicit overrides and scoped receipts; each lever is one row of the engine's `*_profile_table.hpp`.
 `fast_profile.hpp` is the shared FAST prefill bundle: one switch (for example `STRIX_DS41_FAST_PREFILL=1`,
 `STRIX_MM_FAST_PREFILL=1`) selects named member levers, and a set member variable wins over the bundle. Its two
 readers, `lever()` on the device side and `expand()` in the host resolver, share the same rules.
@@ -172,8 +172,7 @@ MiniMax binds the grouped core the same way:
 ## Adding a new user of a core
 
 Bind the existing core through its policy, adapter or traits; do not copy a kernel into an engine. A new model on
-an existing family needs only its description and registry row
-([adding a model](adding-a-model.md)); a new architecture is described in its
-["New architecture"](adding-a-model.md#new-architecture) section. A default stays bitwise; anything that changes
+an existing family needs a description and registry row. A changed checkpoint contract also needs a family adapter that
+supports it. See the [model guide](adding-a-model.md) and [engine binding guide](../adding-an-engine.md). A default stays bitwise; anything that changes
 bits ships under a named FAST policy and passes the [quality gate](../../tools/strix-gate/README.md)
 ([toggles: profiles](../toggles.md#profiles-exact-vs-fast)).

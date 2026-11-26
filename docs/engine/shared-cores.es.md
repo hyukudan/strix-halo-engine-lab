@@ -89,7 +89,7 @@ host) y la única fuente de operandos en dispositivo por la que todo motor lee p
 **Perfiles de motor y paquete FAST**
 ([`include/strix/engine_profile.hpp`](../../include/strix/engine_profile.hpp),
 [`include/strix/fast_profile.hpp`](../../include/strix/fast_profile.hpp)). Un interruptor `--profile
-default|fast|quality` elige el valor de cada palanca; cada palanca es una fila del `*_profile_table.hpp` del motor.
+exact|fast|turbo` elige el nivel; el resolvedor aplica los ajustes explícitos y los recibos del régimen; cada palanca es una fila del `*_profile_table.hpp` del motor.
 `fast_profile.hpp` es el paquete FAST de prefill compartido: un interruptor (por ejemplo
 `STRIX_DS41_FAST_PREFILL=1`, `STRIX_MM_FAST_PREFILL=1`) elige palancas miembro con nombre, y una variable miembro
 fijada gana al paquete. Sus dos lectores, `lever()` en el lado del dispositivo y `expand()` en el resolvedor del
@@ -184,8 +184,9 @@ con su propia decodificación de pesos, disposición, transformación de entrada
 ## Añadir un nuevo usuario de un núcleo
 
 Enlace el núcleo existente mediante su política, adaptador o traits; no copie un kernel dentro de un motor. Un modelo
-nuevo de una familia existente solo necesita su descripción y su fila de registro
-([añadir un modelo](adding-a-model.es.md)); una arquitectura nueva se describe en su sección de arquitectura nueva.
+nuevo de una familia existente necesita descripción y fila de registro. Un cambio en el contrato del checkpoint también
+requiere un adaptador que lo soporte. Consulta la [guía de modelos](adding-a-model.es.md) y la
+[guía de integración de motores](../adding-an-engine.md).
 Un valor por defecto sigue siendo bit a bit; todo lo que cambia bits se publica bajo una política FAST con nombre y
 pasa la [compuerta de calidad](../../tools/strix-gate/README.md)
 ([toggles: perfiles](../toggles.es.md#perfiles-exacto-frente-a-fast)).

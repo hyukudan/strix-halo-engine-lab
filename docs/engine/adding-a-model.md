@@ -140,8 +140,12 @@ Host checks do not prove a numerical result. On the device:
 
 ## New architecture
 
-It needs its family module (kernels, layer walk, tensor mapping, adapter, defaults table) plus the same two files. What
-it plugs into is common: profile and defaults rows (`include/strix/engine_profile.hpp`, `strix::profile::DefaultItem`),
-the execution receipt, host hashing (`include/strix/fnv.hpp`) and the generated switch table
-([optimization-table.md](optimization-table.md)). Not part of this branch: a shared exchange op between nodes, a shared
-op library and a shared speculation layer; a new family still carries its own copies of those.
+Follow the [engine binding guide](../adding-an-engine.md) for the family adapter and registration. Keep tensor names,
+layouts and stage bindings in the family. Extend the shared mechanism through a trait when the family needs a new
+operation variant. The shared implementations include operators and kernels (`src/ops`, `src/core`, `src/cuda/core`),
+pair exchange (`src/xport`, `include/strix/pair`) and speculative drafting (`src/spec`, `include/strix/spec`).
+
+When a binding consumes generated constants, use `strix-model-gen` after changing its TOML and run
+`strix-model-constants-tests` to verify that the checked-in header matches the source. Shared graph and executor
+bindings live in `src/graph` and `src/exec`. The environment switch census in `tools/env_switch_census.py` checks
+raw switch reads and conflicting defaults.

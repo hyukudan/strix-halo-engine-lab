@@ -41,7 +41,7 @@ def window(name, n, kl, top1, dnll, null_kl, rng, hit=0.5, scale=0.05, null_top1
     hits = np.arange(n) < round(hit * n)
     null_nlls = None
     if null_dnll is not None:
-        null_nlls = [nll_ref + rows_with_mean(n, null_dnll, null_scale or scale, rng)]
+        null_nlls = [nll_ref + rows_with_mean(n, null_dnll, scale if null_scale is None else null_scale, rng)]
     return v2.window_stats(name, np.full(n, kl), agree, nll_ref, nll_ref + d, [null_kl], hits, hits,
                            null_top1s=None if null_top1 is None else [null_top1], null_nlls=null_nlls, cls=cls,
                            null_kl_rows=null_kl_rows)
@@ -260,7 +260,7 @@ class Statistics(unittest.TestCase):
         self.assertEqual(p["state"], "PASS")
 
     def test_reference_check_holds(self):
-        base = [window(f"b{i}", 256, 0.005, 0.97, 0.0, 0.004, self.rng) for i in range(4)]
+        base = [window(f"b{i}", 256, 0.005, 0.97, 0.0, 0.004, self.rng, null_dnll=0.0) for i in range(4)]
         # the lever beats the exact reference by ~10 se on the true text, no null NLL: HOLD, never PASS
         w = window("sus", 63, 0.005, 0.97, -0.19, 0.004, self.rng, scale=0.157)
         self.assertTrue(w["reference_suspect"])
@@ -272,6 +272,31 @@ class Statistics(unittest.TestCase):
         self.assertIn("null dNLL -0.19000", v2.window_line(w))
         self.assertEqual(v2.verdict(base + [w])["state"], "PASS")
 
+    def test_final_class_reference_check_holds(self):
+        windows = [window(f"p{i}", 63, 0.005, 0.97, -0.02, 0.004, self.rng, scale=0.10,
+                          null_dnll=0.0, null_scale=0.0, cls="prose") for i in range(13)]
+        self.assertFalse(any(w["reference_suspect"] for w in windows))
+        result = v2.verdict(windows)
+        self.assertEqual(result["state"], "HOLD")
+        self.assertEqual(result["reference_suspect_classes"], ["prose"])
+        self.assertIn("reference suspect class prose", v2.pooled_line(result))
+
+    def test_null_arm_order_does_not_change_acceptance(self):
+        ref = np.ones(800)
+        varied = ref + np.tile([-0.2, 0.2], 400)
+        cand = ref + np.tile([-0.4, 0.46], 400)
+        outcomes = []
+        for arms in ([ref, varied], [varied, ref]):
+            w = v2.window_stats("multi", np.full(800, 0.005), np.ones(800, bool), ref, cand, [0.001, 0.001],
+                                null_nlls=arms)
+            outcomes.append((w["state"], w["dnll_se"]))
+        self.assertEqual(outcomes[0], outcomes[1])
+
+    def test_exact_null_floor_boundary_is_engaged(self):
+        ref = np.ones(800)
+        w = v2.window_stats("boundary", np.full(800, 0.018), np.ones(800, bool), ref, ref, [0.02])
+        self.assertTrue(v2.verdict([w])["null_floor"]["kl"]["engaged"])
+
     def test_se_capped_by_the_null(self):
         # row se 0.0198 but the null's se on the same window is 0.005: the dNLL limit uses 1.5 x 0.005
         w = window("cap", 63, 0.005, 0.97, 0.030, 0.004, self.rng, scale=0.157, null_dnll=0.0, null_scale=0.0397)
@@ -279,6 +304,21 @@ class Statistics(unittest.TestCase):
         self.assertGreater(w["dnll_se_rows"], w["dnll_se"])
         self.assertEqual(w["state"], "fail")
         self.assertIn("capped 1.5 x null", v2.window_line(w))
+
+    def test_zero_variance_null_caps_the_window_before_class_pooling(self):
+        clean = [window(f"ok{i}", 63, 0.005, 0.97, 0.0, 0.004, self.rng, scale=0.0,
+                        null_dnll=0.0, null_scale=0.0) for i in range(13)]
+        bad = window("bad", 63, 0.005, 0.97, 0.05, 0.004, self.rng, scale=0.5,
+                     null_dnll=0.0, null_scale=0.0)
+        self.assertEqual(bad["dnll_se"], 0.0)
+        self.assertEqual(bad["states"]["dnll"], "fail")
+        self.assertEqual(v2.verdict(clean + [bad])["state"], "FAIL")
+
+    def test_reference_check_uses_candidate_uncapped_se(self):
+        w = window("noise", 63, 0.005, 0.97, -0.02, 0.004, self.rng, scale=0.10,
+                   null_dnll=0.1, null_scale=0.002)
+        self.assertLess(w["dnll_se"], 0.002)
+        self.assertFalse(w["reference_suspect"])
 
     def test_off_distribution_reference_holds(self):
         # refx_dense: a window opening with chat-template ids had EXACT NLL 7.07 against 0.9-2.0 elsewhere
@@ -321,6 +361,28 @@ class Statistics(unittest.TestCase):
             (t / "cut.rte").write_bytes((t / "ref.rte").read_bytes()[:-3])
             with self.assertRaises(v2.GateError):
                 v2.read_routes(t / "cut.rte")
+
+    def test_route_weight_diagnostic_aligns_by_expert(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = pathlib.Path(d)
+            write_routes(path / "ref", [(0, [[1, 2]], [[0.75, 0.25]])])
+            write_routes(path / "cand", [(0, [[2, 1]], [[0.5, 0.5]])])
+            flips = v2.route_flips(path / "ref", path / "cand")
+            self.assertEqual(flips["ids"], 0)
+            self.assertEqual(flips["max_abs_weight_delta"], 0.25)
+
+    def test_free_route_receipt_rejects_replay_missing_control_and_wrong_counts(self):
+        counts = {"records": 3, "rows": 9}
+        recorded = {"out": {"path": "case.CAND_FREE.rte", **counts}}
+        path = "case.CAND_FREE.rte"
+        v2.check_free_record(recorded, path, counts, "candidate")
+        with self.assertRaisesRegex(v2.GateError, "free-running"):
+            v2.check_free_record(dict(recorded, **{"in": {}}), path, counts, "candidate")
+        with self.assertRaisesRegex(v2.GateError, "does not match"):
+            v2.check_free_record(recorded, path, dict(counts, rows=6), "candidate")
+        with self.assertRaisesRegex(v2.GateError, "no applied null control"):
+            v2.check_free_record(recorded, path, counts, "null", null=True)
+        v2.check_free_record(dict(recorded, null={"order": "reduce", "applications": 3}), path, counts, "null", null=True)
 
     def test_replay_bookkeeping(self):
         ref = {"version": 1, "out": {"path": "/o/routes/c.REF.rte", "records": 96, "rows": 9000}}
@@ -442,6 +504,22 @@ class HeadFormat(unittest.TestCase):
             self.assertEqual(doc["windows"][0]["flips"]["cand"]["slots"], self.N * 4)
             self.assertTrue(0.0 < doc["pooled"]["held_out"]["label_is_ref_top1"] < 1.0)
 
+    def test_nonfinite_candidate_is_a_failure_not_an_evidence_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = self.kit(d, [f"w{i:02d}" for i in range(13)])
+            target = d / "w00-fast.f32"
+            original = target.read_bytes()
+            target.write_bytes(np.array([np.nan], dtype="<f4").tobytes() + original[4:])
+            rc, out = self.gate(d)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("non-finite candidate logits", out)
+            doc = json.loads((d / "g.json").read_text(encoding="utf-8"))
+            self.assertEqual(doc["pooled"]["nonfinite_candidate"], ["w00"])
+            target.write_bytes(original)
+            null = d / "w00-n0.f32"
+            null.write_bytes(np.array([np.inf], dtype="<f4").tobytes() + null.read_bytes()[4:])
+            self.assertEqual(self.gate(d)[0], 2)
+
     def test_head_gate_flip_ratio_fails(self):
         with tempfile.TemporaryDirectory() as d:
             rc, out = self.gate(self.kit(d, [f"w{i:02d}" for i in range(13)], null_ids=20, cand_ids=32))
@@ -521,6 +599,17 @@ class HeadFormat(unittest.TestCase):
             self.assertEqual(rc, 0, out)
             self.assertIn("engine trace on 12 of 13 windows", out)
 
+    def test_traces_must_cover_the_same_layer_ids(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = self.kit(d, [f"w{i:02d}" for i in range(13)])
+            log = d / "r0.log"
+            lines = log.read_text(encoding="utf-8").splitlines()
+            lines[1] = lines[1].replace('"l":2', '"l":7')
+            log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            rc, out = self.gate(d)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("candidate trace layers (0, 1, 3, 7) differ from null layers (0, 1, 2, 3)", out)
+
 
 class FrozenR4Diagnostic(unittest.TestCase):
     kit, gate = HeadFormat.kit, HeadFormat.gate
@@ -538,7 +627,8 @@ class FrozenR4Diagnostic(unittest.TestCase):
             with open(ref, "rb") as source, open(arm, "rb"):
                 nll = np.full(255, 4.0 if source.read(7) == b"outlier" else 1.0)
             return dict(kl_rc=np.full(nll.size, 1 / 1024), agree=np.ones_like(nll), nll_r=nll, nll_c=nll,
-                        top1_r_is_label=np.zeros_like(nll), top1_c_is_label=np.zeros_like(nll)), {}
+                        top1_r_is_label=np.zeros_like(nll), top1_c_is_label=np.zeros_like(nll),
+                        nonfinite_r=np.zeros_like(nll), nonfinite_c=np.zeros_like(nll)), {}
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(v2, "_option_qual_reduce", return_value=reduce_pair):
             d = self.kit(tmp, cases, cand_ids=20)

@@ -2563,7 +2563,6 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                             tag, [&] {
                                 enqueue_late_mix();
                                 prefetch_after(s);
-                                if (m.prefetch_bytes) prefetch_after(s);
                             });
                         const float* h0 = m.options.rank == 0U ? m.half_own.p : m.half_other.p;
                         const float* h1 = m.options.rank == 0U ? m.half_other.p : m.half_own.p;

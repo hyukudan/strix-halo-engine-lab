@@ -1,5 +1,47 @@
 # Optimizations
 
+<a id="ds41-single-attention-read-ahead"></a>
+### Single DeepSeek attention read-ahead
+
+Trellis tensor-parallel attention half-sum with weight read-ahead enabled. Both calls submitted the same read-ahead; one submission remains. Removes a duplicate touch dispatch sequence. Device timing pending. The host code lives in `src/hip_deepseek41_batch_forward.hip`.
+
+Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=affected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+
+<a id="ds41-cooperative-draft-staging-reuse"></a>
+### DeepSeek cooperative draft staging reuse
+
+Cooperative two-rank DSpark candidate exchange. The payload, zero padding and transfer order are preserved. Reuses two host allocations after warm-up. Device timing pending. The host code lives in `src/hip_deepseek41_batch_dspark.hip`.
+
+Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=affected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+
+<a id="hy4-engram-request-staging-reuse"></a>
+### Hy4 Engram request staging reuse
+
+Single-row Engram reads. Hash, row requests, read order and upload bytes are preserved. Reuses host vectors across layers and tokens. Device timing pending. The host code lives in `src/hy4/hip/hy4_hip_forward.hip`.
+
+Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=affected, nemotron-3.5-bolt-e4b=unaffected.
+
+<a id="glm-fixed-host-decode-metadata"></a>
+### GLM fixed host decode metadata
+
+Forward calls of at most eight rows; longer prompt calls retain dynamic staging. Token IDs, slots, positions and copy boundaries are preserved. Removes three short-forward host allocations. Device timing pending. The host code lives in `src/glm/engine/engine.hip`.
+
+Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=unaffected, glm-5.3-flash=affected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+
+<a id="gemma-target-host-descriptor-reuse"></a>
+### Gemma-shaped target host descriptor reuse
+
+Device target row verification, including mixed streams and optional KV mirrors. Populated and zero-filled descriptor slots and copy sizes are preserved. Reuses descriptor allocations after first use. Device timing pending. The host code lives in `src/gemma4/kernels/target.hip`.
+
+Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=affected.
+
+<a id="cohort-verification-scratch-reuse"></a>
+### Cohort verification scratch reuse
+
+Backends using the shared cohort decoder. Host cohort tests compare cohort and solo IDs, including device-draft and per-lane selection hooks. Reuses verification and commit staging across host rounds. Wall time unmeasured. The host code lives in `src/serve/cohort_decode.cpp`.
+
+Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=CUDA cohort, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+
 Qwen guarded wave reductions can use exact DPP/permlanex16 exchanges (build-time lever, off by default: configure with `-DSTRIX_DPP_REDUCE=ON`; the all-on build uses it); addition trees are unchanged, native byte-equality qualification is pending, and no speed gain is claimed.
 
 <a id="gemma4-exl3-shared-hadamard"></a>
@@ -35,10 +77,12 @@ routes. Performance is unmeasured. Use fresh state and separate cache directorie
 
 ## Qwen product profiles
 
-`--profile default|fast|quality` selects the Qwen product policy for decode,
-prefill, MTP and HTTP serving. `default` preserves current production behavior
-without exporting profile switches. `fast` applies ready and explicitly provisional
+`--profile exact|fast|turbo` selects the Qwen product policy for decode,
+prefill, MTP and HTTP serving. `default` remains a compatibility spelling for
+the profile column selected by `exact`. `fast` applies ready and explicitly provisional
 runnable levers in the [single profile table](../include/strix/qwen_profile_table.hpp).
+`turbo` inherits FAST and resolves higher rows according to their declared
+execution scope. The legacy `quality` column still reports its absent pack.
 Where the route admits it, fast currently applies BF16 MoE route storage by exporting
 `STRIX_QPF2K_MOE_ROUTE_BF16=1`, without `--allow-pending`. This bit-changing row
 changes logits and is selected ahead of its qualification receipt; qualification
@@ -55,7 +99,6 @@ and the stamp lists every applied provisional row (`qualification in progress: q
 Single-node screen of the three rows together, plain CLI, 8K prompts: pooled KL 0.0040, top-1 agreement 97.5 %,
 NLL change -0.039 on 7 held-out prompts (1,792 teacher-forced rows); prefill 8K / 32K / 128K +7.2 / +7.9 / +7.9 %.
 The output head row remains pending: its builtin path continues, with one notice and its declared target in `profile.pending`.
-`quality` runs default settings with one notice because no quality pack exists.
 
 Explicit environment variables and lever options override the profile, including
 explicit off. `--allow-pending` / `STRIX_QWEN_PROFILE_ALLOW_PENDING=1` applies only

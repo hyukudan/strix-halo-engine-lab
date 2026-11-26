@@ -6,3 +6,4 @@ __pycache__/
 /S16-REPORT.md
 /.s17/
 /S17-REPORT.md
+*.log

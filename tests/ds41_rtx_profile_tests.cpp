@@ -208,10 +208,20 @@ int main() {
         const auto r = run_with(gain);
         CHECK(status(r, "runnable_pending") == "unqualified" && value(r, "runnable_pending") == "on");
         CHECK(r.qualification() == "unqualified: runnable_pending");
+        auto band = gain;
+        band.over = {};
+        band.band_bound = true;
+        band.identity = "v1";
+        const auto band_result = run_with(band);
+        CHECK(band_result.find("runnable_pending")->ladder.find("applies x1.100") != std::string::npos);
     }
     CHECK(syn({}, true, pf::Name::standard).find("runnable_pending") == nullptr);  // default leaves it alone
     CHECK(status(syn({}, true, pf::Name::fast, {{"TEST_RP", "0"}}), "runnable_pending") == "explicit-env");
     CHECK(syn({}, true, pf::Name::fast, {{"TEST_RP", "0"}}).qualification() == "qualified");
+    const auto explicit_pending = syn({}, false, pf::Name::standard, {{"TEST_RP", "1"}});
+    CHECK(status(explicit_pending, "runnable_pending") == "explicit-env");
+    CHECK(explicit_pending.qualification() == "unqualified: runnable_pending");
+    CHECK(explicit_pending.json().find("\"unqualified\":[\"runnable_pending\"]") != std::string::npos);
 
     // the receipt JSON carries the app's effective value when given
     const auto j = none.json([](std::string_view l) { return l == "wb_stream" ? std::string("on") : std::string(); });

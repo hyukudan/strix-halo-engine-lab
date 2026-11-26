@@ -108,6 +108,8 @@ void pending_composite_and_exact_identity() {
                         "FAST and TURBO fall back together until the composite has a final scoped gate");
                 require(hp::effective_config(app, r).find(hp::kPending) != std::string::npos,
                         "fallback receipt names the missing evidence");
+                require(hp::effective_config(app, r).find("\"device_probe\":\"skipped for inspection\"") != std::string::npos,
+                        "host inspection explains why device-conditioned cells may be pending");
             }
         }
 

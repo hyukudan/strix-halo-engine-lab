@@ -358,8 +358,20 @@ void product_table() {
         check(status(r, "decode_attention") == pr::Status::unqualified &&
               r.find("decode_attention")->ladder.find("applies x1.100") != std::string::npos,
               "measured candidate remains unqualified until its quality gate passes");
+        timing.over = {};
+        timing.band_bound = true;
+        timing.identity = "v1";
+        r = pr::resolve(pr::Name::fast, app, pending_ok);
+        check(status(r, "decode_attention") == pr::Status::unqualified &&
+              r.find("decode_attention")->ladder.find("applies x1.100") != std::string::npos,
+              "Gemma settles its band receipt with the shared binder");
         r = pr::resolve(pr::Name::fast, app, in({}, {}, lookup({{"STRIX_G4_DECODE_ATTN", "exact"}})));
         check(value(r, "decode_attention") == "exact" && !r.active("decode_attention"), "STRIX_G4_DECODE_ATTN=exact is OFF");
+        r = pr::resolve(pr::Name::standard, app, in({}, {}, lookup({{"STRIX_G4_DECODE_ATTN", "g4-dattn-f2"}})));
+        check(status(r, "decode_attention") == pr::Status::explicit_env &&
+              r.qualification() == "unqualified: decode_attention" &&
+              r.json().find("\"unqualified\":[\"decode_attention\"]") != std::string::npos,
+              "explicit unqualified decode attention is stamped in both receipt fields");
         r = pr::resolve(pr::Name::standard, app, in());
         check(status(r, "decode_attention") == pr::Status::builtin && value(r, "decode_attention") == "exact",
               "default keeps the exact decode attention");

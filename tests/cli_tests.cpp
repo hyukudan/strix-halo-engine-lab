@@ -270,8 +270,12 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
             require(turbo.requested == Name::turbo && turbo.levers == expected_levers,
                     "TURBO selects its backend override or the model's declared levers");
             if (entry.family == "deepseek41") {
-                require(turbo.requested == Name::turbo && turbo.levers == Name::turbo,
-                        "DeepSeek preset forwards TURBO to the native resolver");
+                const auto column = std::string_view(backend) == "hip" ? Name::turbo : Name::fast;
+                std::vector<std::string> args;
+                turbo.append_options(args);
+                require(turbo.requested == Name::turbo && turbo.levers == column &&
+                            args == std::vector<std::string>{"--profile", std::string(profile::tier_word(column))},
+                        "DeepSeek TURBO forwards a native profile supported by the selected backend");
                 require(implicit.requested == Name::fast && implicit.levers == Name::fast,
                         "DeepSeek implicit preset is the FAST product default");
             }

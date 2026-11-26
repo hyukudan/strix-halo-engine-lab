@@ -6,6 +6,7 @@
 #include "capture_guard.hpp"
 #include "gemma4/exl3/device.hpp"
 #include "attention_fast_decode.hpp"
+#include <array>
 #include <atomic>
 #include <iostream>
 #include <algorithm>
@@ -180,6 +181,9 @@ struct DeviceTarget::Impl {
     PinnedBuffer host_fast_mirrors;
     PinnedBuffer host_tokens, host_positions, host_reads, host_writes, host_failure, host_logits, host_taps, host_winners,
         host_hidden;
+    std::vector<KvRead> read_descriptors;
+    std::vector<KvWrite> write_descriptors;
+    std::vector<Fp16MirrorRead> mirror_descriptors;
     std::vector<Candidate> selected;
     hipEvent_t start = nullptr, stop = nullptr;
     hipStream_t queue = nullptr;
@@ -679,11 +683,12 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
     if (!n)
         return result;
     unsigned stride = 0;
-    std::vector<unsigned> tokens;
-    std::vector<std::uint64_t> positions;
-    for (const auto* r : rows) {
-        tokens.push_back(r->token);
-        positions.push_back(r->position);
+    std::array<unsigned, 8> tokens;
+    std::array<std::uint64_t, 8> positions;
+    for (unsigned i = 0; i < n; ++i) {
+        const auto* r = rows[i];
+        tokens[i] = r->token;
+        positions[i] = r->position;
         stride = std::max(stride, unsigned(r->position + 1));
     }
     // Stable 64-position buckets alter storage/launch bounds only. Visible-key
@@ -720,12 +725,14 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
                 }
             }
         }
-        b.input(b.tokens, b.host_tokens, tokens.data(), tokens.size() * sizeof(unsigned));
-        b.input(b.positions, b.host_positions, positions.data(), positions.size() * sizeof(std::uint64_t));
+        b.input(b.tokens, b.host_tokens, tokens.data(), n * sizeof(unsigned));
+        b.input(b.positions, b.host_positions, positions.data(), n * sizeof(std::uint64_t));
         hip_checked(hipMemsetAsync(b.failure.data(), 0, b.failure.size(), b.queue));
         hip_checked(hipMemsetAsync(b.taps.data(), 0, b.taps.size(), b.queue));
-        std::vector<KvRead> descriptors(8ULL * c.layers);
-        std::vector<KvWrite> destinations(8ULL * c.layers);
+        auto& descriptors = b.read_descriptors;
+        auto& destinations = b.write_descriptors;
+        descriptors.assign(8ULL * c.layers, KvRead{});
+        destinations.assign(descriptors.size(), KvWrite{});
         for (unsigned l = 0; l < c.layers; ++l)
             for (unsigned r = 0; r < n; ++r) {
                 auto* tx = static_cast<DeviceStream::Impl::Txn*>(rows[r]->transaction);
@@ -742,7 +749,8 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
             // per (global layer, row).
             for (auto& entry : transactions)
                 fp16_mirror_sync(*entry.first->stream, b.fast_format, b.failure.as<unsigned>(), b.queue);
-            std::vector<Fp16MirrorRead> mirrors(8ULL * c.layers);
+            auto& mirrors = b.mirror_descriptors;
+            mirrors.assign(descriptors.size(), Fp16MirrorRead{});
             for (unsigned l = 0; l < c.layers; ++l)
                 if (c.layer[l].attention == AttentionKind::global)
                     for (unsigned r = 0; r < n; ++r) {

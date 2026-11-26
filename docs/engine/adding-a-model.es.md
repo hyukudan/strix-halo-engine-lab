@@ -144,9 +144,13 @@ Las comprobaciones de host no prueban un resultado numérico. En el dispositivo:
 
 ## Arquitectura nueva
 
-Necesita su módulo de familia (kernels, recorrido de capas, mapeo de tensores, adaptador, tabla de valores por defecto)
-y los mismos dos ficheros. Lo que usa es común: las filas de perfil y de valores por defecto
-(`include/strix/engine_profile.hpp`, `strix::profile::DefaultItem`), el recibo de ejecución, el hash de host
-(`include/strix/fnv.hpp`) y la tabla de interruptores generada ([optimization-table.md](optimization-table.md)). Fuera
-de esta rama: una operación de intercambio compartida entre nodos, una biblioteca de operaciones compartida y una capa
-de especulación compartida; una familia nueva sigue llevando sus propias copias de esas partes.
+Sigue la [guía de integración de motores](../adding-an-engine.md) para el adaptador y el registro de la familia.
+Mantén en la familia los nombres y diseños de tensores y los enlaces de cada etapa. Extiende el mecanismo compartido
+mediante un trait si necesitas una variante. Las implementaciones compartidas incluyen operadores y kernels
+(`src/ops`, `src/core`, `src/cuda/core`), intercambio entre nodos (`src/xport`, `include/strix/pair`) y borradores
+especulativos (`src/spec`, `include/strix/spec`).
+
+Cuando un adaptador utilice constantes generadas, ejecuta `strix-model-gen` después de cambiar su TOML y
+`strix-model-constants-tests` para comprobar que la cabecera coincide con el origen. Los enlaces comunes de grafos
+y ejecutores están en `src/graph` y `src/exec`. El censo `tools/env_switch_census.py` comprueba las lecturas
+directas de variables de entorno y los valores predeterminados contradictorios.

@@ -228,17 +228,38 @@ void route_prune_startup_binding() {
     check(pr::erase_environment(key), "clear prune before memory planning");
     (void)strix::moe_core::route_prune_active_tag(true);
     const auto exact_identity = strix::prefill_identity_hash(0U, 0U, 0U);
+    const strix::NumericalProfilePair exact_pair{};
+    const auto exact_arithmetic = strix::numerical_profile_pair_identity(exact_pair);
+    check(strix::prefill_arithmetic_identity(exact_pair, 0U, false, 0U, 0U) == exact_arithmetic,
+          "unpruned exact arithmetic preserves its identity");
     check(strix::moe_core::route_prune_active_tag().empty(), "early planning sees pruning off");
     check(pr::export_environment(key, "cap9"), "export admitted pruning after planning");
     check(strix::moe_core::route_prune_active_tag(true) == "cap9" &&
         strix::moe_core::route_prune_active().active(), "execution sees the admitted cap9");
     check(strix::prefill_identity_hash(0U, 0U, 0U) != exact_identity, "pruning is in the arithmetic identity");
+    check(strix::prefill_arithmetic_identity(exact_pair, 0U, false, 0U, 0U) != exact_arithmetic,
+          "pruning also enters the identity of a non-fast profile");
     check(pr::erase_environment(key), "withdraw incompatible inherited pruning");
     check(strix::moe_core::route_prune_active_tag(true).empty() &&
         !strix::moe_core::route_prune_active().active(), "execution sees the withdrawn cap9");
     check(strix::prefill_identity_hash(0U, 0U, 0U) == exact_identity, "withdrawal restores the unpruned identity");
     if (saved) check(pr::export_environment(key, saved->c_str()), "restore prune environment");
     (void)strix::moe_core::route_prune_active_tag(true);
+}
+
+void prefill_startup_binding() {
+    const auto options = strix::resolve_prefill_options([](const char* key) -> const char* {
+        if (std::string_view(key) == "STRIX_PREFILL_EXACT_FP16") return "10";
+        if (std::string_view(key) == "STRIX_PREFILL_HC_OUTPUT_WMMA") return "01";
+        return nullptr;
+    });
+    check(options == strix::kPrefillOptionsReady, "flag matching requires a whole 0 or 1");
+    const auto original_budget = strix::qsa_prefill_budget_active();
+    strix::set_prefill_identity_override(false, 0U, 1536U);
+    check(strix::qsa_prefill_budget_active() == 1536U &&
+              strix::prefill_identity_name(0U).find("+qsab1536") != std::string::npos,
+          "startup binding replaces an early budget read with the final resolved value");
+    strix::set_prefill_identity_override(false, 0U, original_budget);
 }
 
 void config_matrix() {
@@ -333,6 +354,7 @@ int main(int argc,char** argv) try {
     emit=argc==2 && std::string_view(argv[1])=="--fixtures";
     pending_weights_inspection();
     route_prune_startup_binding();
+    prefill_startup_binding();
     registered_controls_resolve_builtin();
     product_matrix(); admission_matrix(); defaults_matrix(); config_matrix(); identities();
 #ifndef STRIX_STEP1_ORIGINAL

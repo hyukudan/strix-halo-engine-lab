@@ -1234,7 +1234,7 @@ static int run_decode_entry(
         std::cout << "Usage: strix-hip-decode-token MODEL.gguf TOKEN_ID ... [options]\n"
             "  --context N --generate N --eos-token ID --residency register|copy\n"
             "  --deploy FILE|auto --deploy-check (host-only deployment JSON; includes effective config)\n"
-            "  --profile default|fast|quality (default: current qualified settings)\n"
+            "  --profile exact|fast|turbo (also accepts default and quality)\n"
             "  --allow-pending (benchmark runnable pending profile rows; unqualified)\n"
             "  --optimization-profile auto|manual (default auto, qualified checkpoint only)\n"
             "  --baseline / STRIX_BASELINE=1 (historical resolution, controlled defaults off)\n"
@@ -1721,6 +1721,8 @@ static int run_decode_entry(
     if (!options.print_effective_config) {
         strix::qwen::profile::withdraw_declined(options.product_profile);
         strix::qwen::profile::apply(options.product_profile);
+        strix::set_prefill_identity_override(options.prefill_exact_fp16, options.prefill_disabled,
+                                             options.resolved_qsa_prefill_budget);
         if (options.product_profile.find("moe_route_prune"))
             (void)strix::moe_core::route_prune_active_tag(true);
     }
@@ -1776,7 +1778,6 @@ static int run_decode_entry(
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     strix::tests::set_mtp_product_profile(options.product_profile);
 #endif
-    strix::set_prefill_identity_override(options.prefill_exact_fp16, options.prefill_disabled);
     session_cache_enabled = !options.session_save.empty() || !options.session_load.empty() || options.session_live_control || options.session_management_requested;
     strix::decode_cli::require_bitcalc_session_route(options, bitcalc.enabled());
     if (bitcalc.enabled() && (options.mtp.enabled || options.mtp.supplied || options.prompt_lookup ||

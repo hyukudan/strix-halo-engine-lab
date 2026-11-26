@@ -586,7 +586,7 @@ inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request
     const auto budget = result.environment.find("STRIX_QPF2K_QSA_BUDGET");
     const auto master = result.environment.find("STRIX_PREFILL_EXACT_FP16");
     result.options.resolved_qsa_prefill_budget = result.options.prefill_exact_fp16 ||
-        (master != result.environment.end() && master->second.starts_with('1')) ? 0U :
+        (master != result.environment.end() && master->second == "1") ? 0U :
         parse_qsa_prefill_budget(budget == result.environment.end() ? "" : budget->second);
     return result;
 }
@@ -1913,7 +1913,7 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
         std::string_view refusal = moe_da16_route_refusal(o, result.environment, result.gsq_owner, capabilities.fp16_operands);
         if (request.paired_prefill) refusal = "pair prefill is unsupported";
         else if (o.prefill_exact_fp16 || (result.environment.contains("STRIX_PREFILL_EXACT_FP16") &&
-                 result.environment.at("STRIX_PREFILL_EXACT_FP16").starts_with('1')))
+                 result.environment.at("STRIX_PREFILL_EXACT_FP16") == "1"))
             refusal = "prefill-exact-fp16 disables route pruning";
         else if (refusal.empty() && !moe_da16_writer_supported(model, manifest))
             refusal = "unsupported DA16 geometry or writer format";
