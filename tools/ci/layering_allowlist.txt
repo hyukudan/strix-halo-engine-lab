@@ -107,7 +107,7 @@ model-kernel src/glm/engine/glm_kvshard.hip 11
 model-kernel src/glm/engine/glm_r1b.hip 6
 model-kernel src/glm/kernels/glm_dsa.hip 6
 model-kernel src/glm/kernels/glm_tier_a.hip 7
-model-kernel src/glm/moe/glm_moe.hip 7
+model-kernel src/glm/moe/glm_moe.hip 3
 model-kernel src/glm/prefill/glm_pf_exact.hip 5
 model-kernel src/glm/prefill/glm_pf_exact_moe.hip 8
 model-kernel src/glm/prefill/glm_pf_kda_wmma.hpp 2
@@ -303,7 +303,7 @@ raw-getenv src/glm/engine/glm_mem.cpp 3
 raw-getenv src/glm/engine/glm_pack.cpp 2
 raw-getenv src/glm/engine/glm_r1b.hip 7
 raw-getenv src/glm/load/glm_model_description.cpp 2
-raw-getenv src/glm/moe/glm_moe.hip 3
+raw-getenv src/glm/moe/glm_moe.hip 2
 raw-getenv src/glm/prefill/glm_pf_attn_wmma.hpp 2
 raw-getenv src/glm/prefill/glm_pf_aux.hpp 2
 raw-getenv src/glm/prefill/glm_pf_capacity_policy.hpp 2
