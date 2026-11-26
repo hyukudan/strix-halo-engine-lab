@@ -6218,11 +6218,11 @@ Both options are pending native token and logit identity checks.
   `enqueue_low_rank_controller_tail` on its batched message row instead of its own readout.
 - `STRIX_MOE_TAIL`: on the packed one-row MoE route the post-convolution and the BF16-rounded residual add run inside
   the R1 down-combine launch (`moe_core/r1_tail` `ConvResidualTail`, the same hook the CUDA step program offers).
-- **Exactness evidence:** EXACT schedule change (same operands and arithmetic). cluster1, Inkling Mini EXACT B=1,
+- **Exactness evidence:** EXACT schedule change (same operands and arithmetic). One gfx1151 node, Inkling Mini EXACT B=1,
   127-id prompt: head `2019eacec5` vs this branch, 32-token logits (800,232 B) and ids EQUAL; levers off vs on EQUAL;
   128-token ids EQUAL; `strix-hip-inkling2-mini-verify-rows-test` packed and grouped PASS.
 - **Off switch:** `STRIX_RESIDUAL_BANK_BATCH=0`, `STRIX_MOE_TAIL=0` (with both off the decode time returns to the head's).
-- **Measured gain:** cluster1, B=1, 128 tokens, ABBA head/port/port/head: decode 4,336.9 / 4,335.1 ms -> 4,209.8 /
+- **Measured gain:** one gfx1151 node, B=1, 128 tokens, ABBA head/port/port/head: decode 4,336.9 / 4,335.1 ms -> 4,209.8 /
   4,214.4 ms (-2.9 %, 29.29 -> 30.15 tok/s); both levers off 4,339.5 ms.
 
 <a id="inkling2-sp4t-head"></a>
