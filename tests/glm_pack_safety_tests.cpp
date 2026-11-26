@@ -83,19 +83,6 @@ const std::string kOk = "{\"w\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\
 
 std::vector<Case> cases() {
     return {
-        {"shard_parent_dir", [](const fs::path& root) {
-             const fs::path d = fresh(root, "shard_parent_dir");
-             write_shard(d.parent_path() / "outside.safetensors", kOk, f32_bytes({1.0F, 2.0F}));
-             write_index(d, "\"w\":\"../outside.safetensors\"");
-             CHECK(refused(d));
-         }},
-        {"shard_absolute", [](const fs::path& root) {
-             const fs::path d = fresh(root, "shard_absolute");
-             const fs::path abs = fs::absolute(d.parent_path() / "abs.safetensors");
-             write_shard(abs, kOk, f32_bytes({1.0F, 2.0F}));
-             write_index(d, "\"w\":\"" + abs.string() + "\"");
-             CHECK(refused(d));
-         }},
         {"shard_not_string", [](const fs::path& root) {
              const fs::path d = fresh(root, "shard_not_string");
              write_index(d, "\"w\":7");

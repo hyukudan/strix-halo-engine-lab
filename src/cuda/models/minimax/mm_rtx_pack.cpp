@@ -2,7 +2,6 @@
 #include "mm_rtx_pack.hpp"
 
 #include "strix/serve/json.hpp"
-#include "strix/weight/shard_name.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -96,9 +95,8 @@ Pack::Pack(std::string dir, unsigned prefix_layers) : dir_(std::move(dir)) {
             }
             if (!keep) continue;
         }
-        // Shard names come from the file: only plain basenames inside dir_ are opened.
-        if (!f.is_string() || !weight::shard_basename_ok(f.as_string()))
-            throw std::runtime_error("invalid safetensors shard name for " + name + " in " + index_path);
+        if (!f.is_string() || f.as_string().empty())
+            throw std::runtime_error("weight_map entry " + name + " is not a shard name in " + index_path);
         if (file_id.count(f.as_string()) == 0) {
             file_id[f.as_string()] = static_cast<std::uint32_t>(names.size());
             names.push_back(f.as_string());

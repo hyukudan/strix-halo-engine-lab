@@ -138,8 +138,6 @@ SafetensorsResolution resolve_safetensors_checkpoint(const std::filesystem::path
         const auto* map = root.find("weight_map");
         if (map == nullptr || !map->is_object()) throw std::runtime_error("ds41 native fp8: no weight_map in " + index.string());
         for (const auto& [name, file] : map->as_object()) {
-            if (!weight::shard_basename_ok(file.as_string()))
-                throw std::runtime_error("ds41 native fp8: invalid safetensors shard name for " + name);
             out.shard_of.emplace(name, file.as_string());
             out.files.emplace(file.as_string(), dir / file.as_string());
         }

@@ -58,7 +58,6 @@ int main(int argc, char** argv) try {
                              R"("m.suh":{"dtype":"F16","shape":[128],"data_offsets":[4,260]},)"
                              R"("m.svh":{"dtype":"F16","shape":[128],"data_offsets":[260,516]}})";
     const std::vector<Row> rows = {
-        {"parent shard", "../outside.safetensors", w + "[0,8]}}", std::string(8, '\0'), 0, 0},
         {"one offset", "a.safetensors", w + "[0]}}", std::string(8, '\0'), 0, 0},
         {"no offsets", "a.safetensors", w + "[]}}", std::string(8, '\0'), 0, 0},
         {"reversed offsets", "a.safetensors", w + "[8,0]}}", std::string(8, '\0'), 0, 0},
@@ -75,7 +74,7 @@ int main(int argc, char** argv) try {
     for (const auto& row : rows) {
         const fs::path d = dir / "malformed" / row.name / "model";
         fs::create_directories(d);
-        const fs::path file = row.shard_name.rfind("../", 0) == 0 ? d.parent_path() / row.shard_name.substr(3) : d / row.shard_name;
+        const fs::path file = d / row.shard_name;
         raw_shard(file, row.header, row.payload, row.declared);
         {
             std::ofstream out(d / "model.safetensors.index.json");

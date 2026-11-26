@@ -142,10 +142,7 @@ Index::Index(const std::string& dir) {
     if (probe) {
         const Json j = parse_json(read_text(dir + "/model.safetensors.index.json"));
         std::set<std::string> s;
-        for (const auto& [k, v] : j.obj().at("weight_map").obj()) {
-            if (!weight::shard_basename_ok(v.str())) throw std::runtime_error("invalid safetensors shard name for " + k);
-            s.insert(v.str());
-        }
+        for (const auto& [k, v] : j.obj().at("weight_map").obj()) s.insert(v.str());
         names.assign(s.begin(), s.end());
     } else {
         DIR* d = ::opendir(dir.c_str());

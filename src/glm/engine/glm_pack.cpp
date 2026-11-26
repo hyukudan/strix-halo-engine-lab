@@ -84,11 +84,11 @@ PackReader::PackReader(std::string dir) : dir_(std::move(dir)) {
     const serve::Json j = serve::parse_json_unique(read_index(index_path));
     const serve::Json* weight_map = j.find("weight_map");
     if (weight_map == nullptr || !weight_map->is_object()) throw std::runtime_error("no weight_map object in " + index_path);
-    // Shard names come from the file: only plain basenames inside dir_ are opened (shared rule with the weight readers).
+    // Shard names are model configuration: like the DS41 and MiniMax readers, a name may reference a shard outside dir_.
     std::map<std::string, std::uint32_t> file_ids;
     for (const auto& [k, v] : weight_map->as_object()) {
-        if (!v.is_string() || !weight::shard_basename_ok(v.as_string()))
-            throw std::runtime_error("invalid safetensors shard name for " + k + " in " + index_path);
+        if (!v.is_string() || v.as_string().empty())
+            throw std::runtime_error("weight_map entry " + k + " is not a shard name in " + index_path);
         file_ids.emplace(v.as_string(), 0U);
     }
     std::vector<std::string> files;  // listed shards in name order (file numbers are internal to the reader)

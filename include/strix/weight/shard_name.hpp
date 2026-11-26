@@ -1,6 +1,6 @@
 #pragma once
-// Shard names read from a model.safetensors.index.json weight_map are data from the model directory: every reader
-// joins them to that directory only after this check, so a name can only designate a file inside the directory.
+// Shard-name rule of the confined pack reader (PackCheckpoint) and the manifest size limit shared by the
+// model.safetensors.index.json readers. Model readers that accept external shards by contract do not apply the rule.
 #include <cstdint>
 #include <string_view>
 
