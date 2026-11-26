@@ -166,6 +166,9 @@ struct CudaStepRoute {
     bool program;
     serve::CliSpeculation speculation;
     std::string_view speculation_reason;
+    // The verifying route's plain rows (the speculator's one-row steps) run on the CUDA step program over the resident
+    // decoder's own state (it records the DSpark taps); drafting passes stay on the resident verify windows.
+    bool plain_program = false;
 };
 
 inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepProgramOptions& program_options,
@@ -198,7 +201,10 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
             throw std::invalid_argument("--no-epilogue-fusion requires the CUDA step program");
         if (program_options.latency_forms_set)
             throw std::invalid_argument("latency forms select step-program leaves: decode through --step-program");
-        return {false, requested_mode, {}};
+        // q52c (RTX, 11-26): plain prose rows ran 101.5 tok/s on the step program vs 91.7 on the resident auto route; the
+        // step program needs BF16 weights and no route tap, like its own route.
+        return {false, requested_mode, {},
+                verifying && storage == weight::kBf16WeightStorage && !resident_k1 && !options.gate_order_null};
     }
     require_mini_expert_consumer(options.tier, false);
     if (options.gate_order_null)

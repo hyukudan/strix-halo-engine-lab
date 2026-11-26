@@ -264,6 +264,7 @@ exec::KernelBinding bind_physical_fixture(const A& a) {
             if constexpr (std::is_same_v<A, Bf16SigmoidProduct>) return {"pointwise-bf16-sigmoid-product", pointwise(a.elements)};
             if constexpr (std::is_same_v<A, Bf16Softcap>) return {"pointwise-bf16-softcap", pointwise(a.elements)};
             if constexpr (std::is_same_v<A, Bf16RelativeProjection16>) return {"relative-bf16-d16", pointwise(a.heads * a.relative_extent)};
+            if constexpr (std::is_same_v<A, Bf16SliceAtRow>) return {"pointwise-bf16-slice-at-row", pointwise(a.elements)};
             if constexpr (std::is_same_v<A, Bf16DenseGroup>) {
                 unsigned outputs = 0;
                 for (unsigned i = 0; i < a.count; ++i) outputs += a.projections[i].outputs;
@@ -751,7 +752,8 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
     std::vector<float> values_scratch(decode::GroupedDecodeScratch::value_count(kHiddenWidth, kExpertWidth, kExpertsPerToken));
     std::vector<strix::moe_core::device_grouped::TileRows> descriptors(2U * kExpertsPerToken);
     const auto build_recipe = [&](bool fusion, bool reject_fp32 = false, bool grouped_projections = false,
-                                   decode::R1Forms forms = {}, bool moe_tail = false, bool moe_route_inline = false) {
+                                   decode::R1Forms forms = {}, bool moe_tail = false, bool moe_route_inline = false,
+                                   std::span<std::uint16_t> draft_taps = {}) {
         auto state = make_state();
         // Advance the frontier without touching buffers.
         PositionOnly skip;
@@ -788,7 +790,7 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
         };
         const auto finish = [] {};
         MiniCudaStepLowering lower(weights, scratch, &descriptor, bind, dispatch, finish, mode);
-        MiniResidentForward forward(lower, state, {activations, history_backup, kv_backup});
+        MiniResidentForward forward(lower, state, {activations, history_backup, kv_backup, draft_taps});
         forward.append({position, rows}, buffers.embeddings, buffers.hidden,
             [&](MiniResidentChunk chunk, MiniConstRows h) { lower.head(h, buffers); lower.submit_eager(chunk); }, [] {},
             [&] { lower.begin_eager(); lower.embed(buffers.embeddings); });
@@ -799,6 +801,27 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
 
     const auto state = make_state();
     const auto result = build_recipe(key.program.tap);  // Tapped recipes use the default policy.
+    if (!key.program.tap) {
+        // A drafting decoder's step program (the plain rows of an auto run) stores every DSpark tap row: one shared slice
+        // leaf per tapped visit, plane from position 0, the row read from the step descriptor (the resident bytes on
+        // every replay); without a tap plane the program is the incumbent one (no extra launch).
+        std::vector<std::uint16_t> taps(MiniDSparkTapPlan::elements(position + 1U));
+        const auto tapped = build_recipe(key.program.tap, false, false, {}, false, false, taps);
+        std::size_t found = 0;
+        for (const auto& launch : tapped.program.launches) {
+            if (std::string_view(launch.identity).find("slice-at-row") == std::string_view::npos) continue;
+            decode::Bf16SliceAtRow args{};
+            std::memcpy(&args, tapped.program.args.data() + launch.args_offset, sizeof(args));
+            check(args.first_row == &descriptor.row[0].position && args.output == taps.data() + found * kHiddenWidth &&
+                      args.elements == kHiddenWidth && args.width == kHiddenWidth &&
+                      args.stride == MiniDSparkTapPlan::width,
+                  "DSpark tap leaf binding");
+            ++found;
+        }
+        check(found == MiniDSparkTapPlan::count &&
+                  tapped.program.launches.size() == result.program.launches.size() + found,
+              "step program DSpark taps: one leaf per tapped visit, nothing else changes");
+    }
 
     PhysicalTrace trace{result};
     EpilogueTrace epilogues{result, {}, screened};

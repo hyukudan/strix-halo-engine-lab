@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <bitset>
 #include <chrono>
 #include <cstdio>
@@ -675,10 +676,16 @@ public:
         std::ranges::copy(top, output);
     }
 
-    // A one-row verify window (a speculator serial step) is the plain decode step, committed at once.
+    // A one-row verify window (a speculator serial step) is the plain decode step, committed at once. A drafting run may
+    // bind a plain-row route (set_plain_row_route: the CUDA step program over this decoder's own state, recording the
+    // DSpark taps): it takes the step unless the low-bit rows apply to it.
     [[nodiscard]] unsigned decode_committed_row(unsigned token, std::span<float> logits) {
+        if (plain_row_ && !backend_.lowbit_applies(MiniAppendKind::decode, 1U)) return plain_row_(token, logits);
         return decode(token, logits);
     }
+    using PlainRowRoute = std::function<unsigned(unsigned, std::span<float>)>;
+    void set_plain_row_route(PlainRowRoute route) { plain_row_ = std::move(route); }
+    [[nodiscard]] bool plain_row_route() const noexcept { return static_cast<bool>(plain_row_); }
 
     void commit(unsigned rows) {
         auto& state = slots_.front()->state();
@@ -1525,6 +1532,7 @@ private:
         float* scores = nullptr;
     } pending_scores_;
     std::optional<Screen> screen_;
+    PlainRowRoute plain_row_;  // set_plain_row_route: the speculator's one-row steps (empty: this decoder's decode)
 #if !defined(__HIPCC__)
     bool window_programs_{false};  // set_window_programs: opt-in until the device identity fixture passes
 #endif

@@ -175,6 +175,20 @@ public:
         recipe_.copy(exec::CudaNodeKind::copy_d2d, {output.data(), input.data(), input.size_bytes()});
     }
 
+    // The step's device position: the forward walk then hands the DSpark tap plane from position 0 (a decoder that
+    // records taps; none: no tap leaf), and store_draft_tap writes the row the descriptor names on every replay.
+    [[nodiscard]] const std::uint32_t* capture_position() const noexcept { return &descriptor_->row[0].position; }
+
+    // DSpark tap row of a drafting decoder: the bytes MiniResidentBackend::store_draft_tap stores (the same
+    // core::row_transforms::StoreBf16SliceAtRow) at the step descriptor's position, one shared catalog leaf.
+    void store_draft_tap(MiniConstRows input, std::span<std::uint16_t> output) {
+        const std::string stage(recipe_.stage_label());
+        recipe_.stage("draft_tap");
+        add_leaf(exec::cuda_decode::Bf16SliceAtRow{input.data(), output.data(), input.size(), kHiddenWidth,
+                                                   MiniDSparkTapPlan::width, capture_position()});
+        recipe_.stage(stage);
+    }
+
     void norm(MiniConstRows input, std::string_view name, MiniMutableRows output) {
         rms(input.data(), weights_.bf16(name).data(), output.data());
     }
