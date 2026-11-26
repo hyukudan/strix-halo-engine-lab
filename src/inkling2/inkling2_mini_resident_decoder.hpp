@@ -409,9 +409,10 @@ public:
     }
     [[nodiscard]] std::span<float> step_program_embeddings() noexcept { return embeddings_.span().first(kHiddenWidth); }
     [[nodiscard]] std::span<float> step_program_hidden() noexcept { return hidden_.span().first(kHiddenWidth); }
-    // Verify window programs (MiniResidentBackend::try_window_graph): an explicit opt-in until the device identity
-    // fixture (tests/inkling2/mini_window_program_device_fixture.hpp) proves every stage of the captured window equal to
-    // the eager verify pass; off, every staged verify window runs eagerly (the incumbent route).
+    // Verify window programs (MiniResidentBackend::try_window_graph): the device identity fixture
+    // (tests/inkling2/mini_window_program_device_fixture.hpp, q52r) proves every stage of the captured window equal to
+    // the eager verify pass for the EXACT levers; the owner (the CUDA CLI) turns them on for that profile. Off, every
+    // staged verify window runs eagerly.
     void set_window_programs(bool enabled) noexcept { window_programs_ = enabled; }
     [[nodiscard]] bool window_programs() const noexcept { return window_programs_; }
     // Capture the verify window program of every width 2..max_verify_rows() before the first request (load time, slot 0
@@ -1576,7 +1577,7 @@ private:
     std::optional<Screen> screen_;
     PlainRowRoute plain_row_;  // set_plain_row_route: the speculator's one-row steps (empty: this decoder's decode)
 #if !defined(__HIPCC__)
-    bool window_programs_{false};  // set_window_programs: opt-in until the device identity fixture passes
+    bool window_programs_{false};  // set_window_programs: the owner decides (the CUDA CLI: on for the EXACT levers)
 #endif
 #if defined(__HIPCC__)
     bool verify_lanes_pick_{false};  // verify rows level 2 admitted (set_verify_rows): lanes screened picks
