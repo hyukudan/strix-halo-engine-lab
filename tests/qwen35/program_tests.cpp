@@ -125,12 +125,8 @@ private:
     std::size_t index_ = 0;
 };
 
-void check(std::uint32_t context, bool pdl, bool mixed) {
-    const ResidentFixture fixture(context, mixed);
+void check_capture(const ResidentFixture& fixture, const exec::CudaRecipeProgram& result, bool pdl, bool mixed) {
     const auto& s = fixture.storage;
-    const exec::ProgramKey key;
-    const auto result = adapter::lower(s, fixture.visits, leaf::Bindings(offline_thunks), pdl)
-        .compile(key, exec::CudaReadback::resident);
     require(exec::cuda_detail::is_completion_chain(result.binding.nodes) == !pdl,
             "native stream capture requires a serial completion chain");
     Capture capture(result, pdl);
@@ -192,6 +188,28 @@ void check(std::uint32_t context, bool pdl, bool mixed) {
     capture.node(-1, "cuda-sm120-greedy-partial-pdl-r1-v1", pick, 128);
     capture.node(-1, "cuda-sm120-greedy-final-pdl-index-r1-v1", pick, 1);
     capture.finish(mixed ? 616 : 613);
+}
+
+void check(std::uint32_t context, bool pdl, bool mixed) {
+    ResidentFixture fixture(context, mixed);
+    const auto lower = [&] {
+        return adapter::lower(fixture.storage, fixture.visits, leaf::Bindings(offline_thunks), pdl)
+            .compile(exec::ProgramKey{}, exec::CudaReadback::resident);
+    };
+    const auto before = lower();
+    check_capture(fixture, before, pdl, mixed);
+
+    // Change the contents of all replay scalars at their original addresses.
+    // Compare each typed native argument against the independent expected
+    // packet in both passes. This excludes unspecified C++ padding bytes.
+    ++fixture.token;
+    ++fixture.position;
+    fixture.parity ^= 1U;
+    fixture.top = 97;
+    const auto after = lower();
+    require(before.binding == after.binding && before.program.key == after.program.key,
+            "replay scalars changed physical plan or program key");
+    check_capture(fixture, after, pdl, mixed);
 }
 
 }  // namespace
