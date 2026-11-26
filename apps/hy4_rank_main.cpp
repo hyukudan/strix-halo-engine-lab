@@ -807,7 +807,7 @@ int run(int argc, char** argv) {
             throw std::invalid_argument("--stage-map replaces --cut; --pipe-guess and --window-costs are two-stage options");
         return run_pair_stages(o, prompt, gen, stage_map, std::max(repeat, 1U), port, pair_vote);
     }
-    if (std::getenv("HY4_RANK") != nullptr)
+    if (layer_pair)  // the placement decision: a pair resolved to tensor placement runs the TP path below
         return run_pair(o, prompt, gen, cut, std::max(repeat, 1U), port, rows_explicit, pipe_guess, window_costs,
                         pair_vote);
     using clock = std::chrono::steady_clock;
