@@ -118,14 +118,15 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
         // whatever chunk the schedule took; an implicit chunk retries at the command line's fallback rows when its
         // device workspaces are refused (serve::load_with_chunk_fallback).
         out.lane_rows = std::min(explicit_rows.value_or(kMiniServeLaneRows), out.context);
-        out.prefill_fallback_rows =
-            explicit_rows ? 0U : mini_served_prefill_fallback_rows(hip, out.served_cli_route, out.tier);
     } else {
         if (out.prefill_rows == 0U) throw std::invalid_argument("--prefill-rows must be positive");
         // An explicit chunk without --slots also caps the lanes (the clamped chunk), as on the incumbent route.
         if (explicit_rows) out.lane_rows = out.prefill_rows;
         out.prefill_tail = mini_prefill_tail_capacity(out.prefill_rows, schedule.tail_divisor, out.context);
     }
+    // An implicit chunk on a chunk-invariant backend (CUDA) retries at the command line's fallback rows when its slots
+    // fall short (serve::load_with_chunk_ladder); with the lever those smaller candidates run the held-back route.
+    out.prefill_fallback_rows = explicit_rows ? 0U : mini_served_prefill_fallback_rows(hip, out.tier);
     return resolved;
 }
 
@@ -185,7 +186,7 @@ private:
         serve::ApiConfig config;
         cohort_.configure_api(config);
         config.capabilities_extra = [cohort = std::move(config.capabilities_extra), tier = opt.tier,
-                                     requested = opt.served_route_requested, admitted = opt.served_cli_route,
+                                     requested = opt.served_route_requested, admitted = device_.served_route,
                                      weights = device_.weights,
                                      speculation = std::string(mini_served_speculation_name(opt))](serve::Json& value) {
             cohort(value);

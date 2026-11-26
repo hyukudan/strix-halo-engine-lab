@@ -154,19 +154,20 @@ inline MiniPrefillSchedule mini_served_prefill_schedule_from_env(bool hip, bool 
                                                            : mini_served_held_back_schedule(hip, tier);
 }
 
-// Fallback rows of the served chunk: the command line's fallback rows when the held-back route took the command line's
-// chunk; 0 = no smaller candidate (an explicit --prefill-rows is never changed). The served route lever keeps the
-// command line's chunk alone: a smaller one would split a prompt the command line runs as one chunk (2049 rows at a
-// 2048-row chunk: 2048 + a one-row chunk on the packed one-row route).
-constexpr unsigned mini_served_prefill_fallback_rows(bool hip, bool cli_route, profile::Name tier) noexcept {
-    if (mini_served_prefill_emits_first(hip, cli_route) || !mini_prefill_chunk_invariant(hip)) return 0U;
+// Fallback rows of the served chunk on a chunk-invariant backend (CUDA), either route: the command line's fallback rows;
+// 0 = no smaller candidate (HIP; an explicit --prefill-rows is never changed). The served route lever runs only at the
+// command line's chunk: a smaller candidate runs the held-back route (a smaller emits-first chunk would split a prompt
+// the command line runs as one chunk: 2049 rows at a 2048-row chunk = 2048 + a one-row chunk on the packed route).
+constexpr unsigned mini_served_prefill_fallback_rows(bool hip, profile::Name tier) noexcept {
+    if (!mini_prefill_chunk_invariant(hip)) return 0U;
     return mini_cli_prefill_fallback_rows(hip ? MiniPrefillBackend::hip : MiniPrefillBackend::cuda, tier);
 }
 
 // Candidate chunks of the served load (serve::load_with_chunk_ladder), largest first, the incumbent last: the resolved
 // chunk, then (an implicit chunk with fallback rows) the fallback rows and the incumbent held-back 128 rows, each only
 // when smaller than the one before. The server keeps the largest candidate whose whole load keeps the incumbent's slot
-// capacity, so the tall chunk never costs a session slot. One candidate: an explicit --prefill-rows, HIP, the lever.
+// capacity, so the tall chunk never costs a session slot. One candidate: an explicit --prefill-rows, HIP. With the
+// served route lever the first candidate runs the command line's route, the smaller ones the held-back route.
 struct MiniChunkLadder {
     std::array<std::uint32_t, 3> rows{};
     std::size_t count = 0;

@@ -193,13 +193,12 @@ int served_prefill_gate() {
     constexpr auto cuda_rule = mini_prefill_piece_rule(false, false), cuda_lever_rule = mini_prefill_piece_rule(false, true);
     static_assert(cuda_rule.align == 32U && cuda_rule.short_rows == 32U);
     static_assert(cuda_lever_rule.align == 32U && cuda_lever_rule.short_rows == 32U);
-    // The served route lever is admitted on both backends and takes the command line's chunk alone (no smaller
-    // candidate); the CUDA held-back route keeps its ladder.
+    // The served route lever is admitted on both backends. CUDA keeps its chunk ladder on either route (the lever runs
+    // at the first candidate only, a smaller candidate runs held-back); HIP has one candidate.
     static_assert(mini_served_prefill_emits_first(true, true) && mini_served_prefill_emits_first(false, true) &&
                   !mini_served_prefill_emits_first(true, false) && !mini_served_prefill_emits_first(false, false));
-    static_assert(mini_served_prefill_fallback_rows(false, true, Name::standard) == 0U &&
-                  mini_served_prefill_fallback_rows(true, true, Name::standard) == 0U &&
-                  mini_served_prefill_fallback_rows(false, false, Name::standard) ==
+    static_assert(mini_served_prefill_fallback_rows(true, Name::standard) == 0U &&
+                  mini_served_prefill_fallback_rows(false, Name::standard) ==
                       mini_cli_prefill_fallback_rows(MiniPrefillBackend::cuda, Name::standard));
     constexpr auto tall = mini_served_chunk_ladder(8192U, 2048U), short_context = mini_served_chunk_ladder(1024U, 2048U);
     static_assert(tall.count == 3U && tall.rows[1] == 2048U && tall.rows[2] == 128U);

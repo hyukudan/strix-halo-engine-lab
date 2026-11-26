@@ -67,20 +67,23 @@ inline MiniServeCohort make_mini_device_cohort(
         using Cohort = serve::FixedKvCohort<MiniResidentDecoder>;
         using Admission = serve::ChunkAdmission<std::unique_ptr<Cohort>>;
         // The served route is admitted before constructing the decoder. ONE load transaction per candidate chunk builds
-        // the decoder, checks capacity and allocates the slots before publishing the cohort. An implicit held-back
-        // chunk on a chunk-invariant backend (CUDA) has candidates (mini_served_chunk_ladder): the largest whose whole
-        // load keeps the slot capacity of the incumbent 128-row chunk is kept (the chunk changes no output there).
+        // the decoder, checks capacity and allocates the slots before publishing the cohort. An implicit chunk on a
+        // chunk-invariant backend (CUDA) has candidates (mini_served_chunk_ladder): the largest whose whole load keeps
+        // the slot capacity of the incumbent 128-row chunk is kept. The served route lever runs at the first candidate
+        // only (the command line's chunk); a smaller candidate runs the held-back route (whose bits do not depend on
+        // the chunk), so the command line's chunk never costs a session slot.
         std::uint64_t incumbent_free = 0, incumbent_slot_bytes = 0, incumbent_plane = 0;
         const auto ladder = mini_served_chunk_ladder(opt.prefill_rows, opt.prefill_fallback_rows);
         const auto load = [&](std::uint32_t chunk, bool last) {
+            const bool route = opt.served_cli_route && chunk == ladder.rows[0];
             auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, chunk,
                 packed_decode, MiniResidentBackend::default_step_graphs,
-                weights.roles(), 0U, false, rows, opt.served_cli_route ? opt.prefill_tail : 0U,
-                opt.experts_nvfp4, opt.controller_one_plane, opt.served_cli_route, lowbit);
+                weights.roles(), 0U, false, rows, route ? opt.prefill_tail : 0U,
+                opt.experts_nvfp4, opt.controller_one_plane, route, lowbit);
             if (!mini_decode_only_pack_route_ok(calibrated, decode_only_pack, decoder->prefill_emits_first()))
                 throw std::logic_error("calibrated decode image on the held-back served prompt route");
             // Held-back route: every prompt row on the prefill form whatever chunk or piece cuts it (CUDA; HIP no-op).
-            if (!opt.served_cli_route) decoder->keep_prefill_grouped();
+            if (!route) decoder->keep_prefill_grouped();
 #if defined(__HIPCC__)
             // A TURBO load whose prompts may select the rotated integer class builds its images now, not in the first
             // prompt.
@@ -161,6 +164,13 @@ inline MiniServeCohort make_mini_device_cohort(
         chunk_rows = admitted.chunk;
         return std::move(admitted.service);
     });
+    // The served route lever as admitted: at the command line's chunk only (a smaller candidate runs held-back).
+    const bool served_route = opt.served_cli_route && chunk_rows == opt.prefill_rows;
+    auto shown = opt;
+    shown.served_cli_route = served_route;
+    if (opt.served_cli_route && !served_route)
+        std::cerr << "Inkling served_route declined: the command line's chunk " << opt.prefill_rows
+                  << " rows would cost session slots; held-back route at chunk " << chunk_rows << " rows\n";
     std::cerr << "Inkling " << backend << " slots " << lanes << " context " << opt.context
               << " prefill_chunk " << chunk_rows
               << " moe_decode " << mini_decode_form_name(packed_decode)
@@ -168,10 +178,10 @@ inline MiniServeCohort make_mini_device_cohort(
               << " slot budget free bytes " << admission_free
               << " profile " << mini_profile_name(opt.tier)
               << " moe_prefill " << moe_core::grouped_w4a4::identity(opt.moe_w4a4)
-              << " served_route " << mini_served_route_startup_field(opt, cohort->prompt_tail_rows())
+              << " served_route " << mini_served_route_startup_field(shown, cohort->prompt_tail_rows())
               << " prepared_round_fold " << mini_round_fold_startup_field(opt, levers)
               << " verify_rows "
-              << mini_verify_rows_name(mini_served_verify_rows(levers.verify_rows, opt.served_cli_route, lanes),
+              << mini_verify_rows_name(mini_served_verify_rows(levers.verify_rows, served_route, lanes),
                                        opt.verify_rows)
               << " down_image " << mini_down_image_name(levers.down_image, opt.combine_image)
               << " head " << mini_head_field(levers.head)
@@ -198,7 +208,7 @@ inline MiniServeCohort make_mini_device_cohort(
     // CUDA, either prompt route: the shared long pieces beside decoding lanes, cut by the CUDA rule
     // (mini_prefill_piece_rule); HIP keeps the short ones.
     const auto pieces = !kServeHip ? kMiniCudaServePieces : serve::kMixedServiceShortPieces;
-    return {std::move(cohort), weights, std::move(projected_bias_dispatches), chunk_rows, pieces};
+    return {std::move(cohort), weights, std::move(projected_bias_dispatches), chunk_rows, pieces, served_route};
 }
 
 } // namespace strix::inkling2

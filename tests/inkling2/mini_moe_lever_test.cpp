@@ -806,19 +806,19 @@ void test_screened_head_decision() {
 }
 }  // namespace
 
-// The served route row: selected by every profile column after the RTX receipts q44 / q45, qualified; an explicit 0 keeps
-// the held-back route. A HIP server takes it only when set explicitly.
+// The served route row: the build's behaviour (builtin 1, no profile column sets it) after the RTX receipts q44 / q45; an
+// explicit 0 keeps the held-back route. A HIP server takes it only when set explicitly.
 void test_served_route() {
     const profile::Lever* lever = nullptr;
     for (const auto& row : mini::kMiniProfile.table)
         if (row.name == mini::kMiniServedCliRoute) lever = &row;
     require(lever != nullptr && lever->name == "inkling2-mini-served-cli-route@1" &&
-                lever->env == "STRIX_INK_SERVED_CLI_ROUTE" && lever->builtin == "0" && lever->off == "0" &&
+                lever->env == "STRIX_INK_SERVED_CLI_ROUTE" && lever->builtin == "1" && lever->off == "0" &&
                 lever->kind == profile::Kind::bit_changing && lever->omit_builtin_fingerprint,
             "served route row identity");
     for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
-        require(lever->value[static_cast<unsigned>(tier)] == "1" && lever->ready[static_cast<unsigned>(tier)],
-                "served route: every profile column selects it, qualified");
+        require(lever->value[static_cast<unsigned>(tier)].empty() && !lever->ready[static_cast<unsigned>(tier)],
+                "served route: no profile column sets it (the builtin runs it)");
         for (const char* value : {static_cast<const char*>(nullptr), "0", "1"}) {
             mini::MiniWeightOptions options;
             options.tier.profile = tier;

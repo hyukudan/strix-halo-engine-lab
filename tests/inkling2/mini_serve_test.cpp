@@ -671,12 +671,17 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                                    : shape.prefill_rows                ? chunk
                                                                        : mini::kMiniServeLaneRows;
             const auto rule = mini::mini_prefill_piece_rule(hip_backend, true);
+            // The chunk ladder: HIP one candidate; an implicit CUDA chunk keeps the held-back ladder, whose smaller
+            // candidates run the held-back route (the lever runs at the command line's chunk only).
+            const unsigned fallback = hip_backend || shape.prefill_rows ? 0U
+                : mini::mini_cli_prefill_fallback_rows(mini::MiniPrefillBackend::cuda, options.tier);
             require(options.prefill_rows == chunk && mini::mini_serve_lane_rows(options) == lanes &&
                         options.prefill_tail == mini::mini_prefill_tail_capacity(chunk, cli.tail_divisor, context) &&
                         (hip_backend || options.prefill_tail == 0U) && rule.cuttable() &&
-                        options.prefill_fallback_rows == 0U &&
-                        mini::mini_served_chunk_ladder(options.prefill_rows, options.prefill_fallback_rows).count == 1U,
-                    "lever on: the command line's schedule (CUDA: no tail), its chunk alone, the served lane cap");
+                        options.prefill_fallback_rows == fallback &&
+                        mini::mini_served_chunk_ladder(options.prefill_rows, options.prefill_fallback_rows).rows[0] ==
+                            chunk,
+                    "lever on: the command line's schedule (CUDA: no tail) at the first candidate, the served lane cap");
             // CUDA: the lever's prompts take the CUDA cut rule and the long pieces beside a decoding lane, as on the
             // held-back route (the device cohort's pieces follow the backend, not the route).
             if (!hip_backend) {
