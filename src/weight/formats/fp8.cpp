@@ -1,6 +1,6 @@
 #include "catalog.hpp"
 #include "strix/ds41_native_fp8.hpp"
-#include <cstring>
+#include "strix/weight/formats/fp8_block.hpp"
 namespace strix::weight::detail {
 std::span<const FormatDescriptor> fp8_formats() {
  static const FormatDescriptor formats[] = {
@@ -19,10 +19,9 @@ Status decode_fp8(const WeightView& view,const std::vector<Byte>& raw,std::vecto
  const auto exponents=std::span(reinterpret_cast<const std::uint8_t*>(scales.data()),scales.size());
  const auto reason=ds41::fp8_tensor_check(codes,exponents,rows,width);
  if(!reason.empty()) return {Error::malformed,reason};
- std::vector<std::uint8_t> joined(raw.size()+scales.size());
- std::memcpy(joined.data(),raw.data(),raw.size()); std::memcpy(joined.data()+raw.size(),scales.data(),scales.size());
- for(std::size_t row=0;row<rows;++row) for(std::size_t col=0;col<width;++col)
-  out[row*width+col]=ds41::fp8_weight(joined.data(),rows,width,row,col);
+ const BlockScaledE4M3<32, 32, std::uint8_t> matrix(codes,exponents,rows,width);
+ for(std::size_t row=0;row<rows;++row)
+  matrix.decode_row(row,std::span(out).subspan(row*width,width));
  return {Error::ok,{}};
 }
 }

@@ -98,13 +98,18 @@ hc_mult = 4
 hc_sinkhorn_iters = 20
 hc_eps = 0.000001
 tie_word_embeddings = false
+dspark_attention_kind = "uncompressed"
+dspark_confidence_input = 4352
+dspark_feature_projection = [4096, 12288]
 dspark_noise_token_id = 1024
+dspark_shared_lm_head = true
 num_nextn_predict_layers = 0
 
 [tokens]
 pad_token_id = 0
 bos_token_id = 1
 eos_token_id = 2
+generation_eos_ids = [2, 8]
 
 [weights.checkpoint]
 container = "safetensors"
@@ -118,6 +123,7 @@ expert_block_columns = 32
 
 [drafter]
 kind = "block"
+layers = 3
 block = 7
 rank = 256
 taps = [40, 41, 42]

@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
+#include <fstream>
+#include <set>
 #include <stdexcept>
 #include <utility>
 
@@ -48,7 +51,7 @@ void grouped_projection(Schema& schema, const std::string& prefix) {
     tensor(schema, name + "_scale_inv", hca, "F32", 64, 32);
 }
 
-void add_attention(Schema& schema, const std::string& prefix, bool sparse) {
+void add_attention(Schema& schema, const std::string& prefix, bool sparse, bool compressed) {
     tensor(schema, prefix + "vha_postmix_U", value_head_mix, "BF16", 64, 16);
     tensor(schema, prefix + "vha_postmix_V", value_head_mix, "BF16", 64, 16);
     fp8(schema, prefix, {"gate_proj.weight", attention_gate, sparse ? 16384U : 8192U, 1024});
@@ -82,6 +85,7 @@ void add_attention(Schema& schema, const std::string& prefix, bool sparse) {
         tensor(schema, prefix + "q_layernorm.weight", hca, "BF16", 1024);
         tensor(schema, prefix + "kv_layernorm.weight", hca, "BF16", 512);
         tensor(schema, core + "attn_sink", hca, "F32", 64);
+        if (!compressed) return;
         const auto comp = core + "compressor.";
         tensor(schema, comp + "ape", compressor, "F32", 128, 512);
         tensor(schema, comp + "linear_wgate.weight", compressor, "BF16", 512, 4096);
@@ -114,23 +118,38 @@ void add_moe(Schema& schema, const std::string& prefix) {
     }
 }
 
+void add_block(Schema& schema, const std::string& prefix, bool sparse, bool compressed) {
+    tensor(schema, prefix + "input_layernorm.weight", layer_norm, "BF16", 4096);
+    tensor(schema, prefix + "post_attention_layernorm.weight", layer_norm, "BF16", 4096);
+    for (const auto* hc : {"self_attention_hyper_connection.", "mlp_hyper_connection."}) {
+        const auto base = prefix + hc;
+        for (const auto* scalar : {"alpha_pre", "alpha_post", "alpha_res"})
+            tensor(schema, base + scalar, hyper_connection, "F32", 1);
+        tensor(schema, base + "bias", hyper_connection, "F32", 24);
+        tensor(schema, base + "mapping_proj.weight", hyper_connection, "F32", 16384, 24);
+    }
+    add_attention(schema, prefix + "self_attn.", sparse, compressed);
+}
+
+void add_contract(Schema& schema, const std::string& prefix) {
+    tensor(schema, prefix + "hc_head_base", hc_contract, "F32", 4);
+    tensor(schema, prefix + "hc_head_fn", hc_contract, "F32", 16384, 4);
+    tensor(schema, prefix + "hc_head_scale", hc_contract, "F32", 1);
+}
+
 const Schema& known_schema() {
     static const Schema schema = [] {
         Schema rows;
         tensor(rows, "model.embed_tokens.weight", embedding, "BF16", 201216, 4096);
+        tensor(rows, "lm_head.weight", lm_head, "BF16", 201216, 4096);
+        tensor(rows, "model.lm_head.multimax_ranges", lm_head, "BF16", 4);
+        tensor(rows, "model.lm_head.multimax_ts", lm_head, "BF16", 4);
+        tensor(rows, "model.norm.weight", final_norm, "BF16", 4096);
+        add_contract(rows, "model.mhc_contract.");
         for (unsigned layer = 0; layer < kLayerCount; ++layer) {
             const auto prefix = "model.layers." + std::to_string(layer) + ".";
-            tensor(rows, prefix + "input_layernorm.weight", layer_norm, "BF16", 4096);
-            tensor(rows, prefix + "post_attention_layernorm.weight", layer_norm, "BF16", 4096);
-            for (const auto* hc : {"self_attention_hyper_connection.", "mlp_hyper_connection."}) {
-                const auto base = prefix + hc;
-                for (const auto* scalar : {"alpha_pre", "alpha_post", "alpha_res"})
-                    tensor(rows, base + scalar, hyper_connection, "F32", 1);
-                tensor(rows, base + "bias", hyper_connection, "F32", 24);
-                tensor(rows, base + "mapping_proj.weight", hyper_connection, "F32", 16384, 24);
-            }
-            add_attention(rows, prefix + "self_attn.",
-                          std::ranges::find(kMlaLayers, std::int64_t{layer}) != std::ranges::end(kMlaLayers));
+            const bool sparse = std::ranges::find(kMlaLayers, std::int64_t{layer}) != std::ranges::end(kMlaLayers);
+            add_block(rows, prefix, sparse, !sparse);
             if (layer == 0) {
                 constexpr Matrix dense[]{
                     {"mlp.gate_proj.weight", dense_mlp, 14336, 4096},
@@ -142,9 +161,60 @@ const Schema& known_schema() {
                 add_moe(rows, prefix + "block_sparse_moe.");
             }
         }
+        const std::string draft = "model.mtp.";
+        add_contract(rows, draft + "mhc_contract.");
+        tensor(rows, draft + "norm.weight", final_norm, "BF16", 4096);
+        tensor(rows, draft + "feature_norm.weight", draft_input, "BF16", 4096);
+        fp8(rows, draft, {"feature_projection.weight", draft_input, 4096, 12288});
+        tensor(rows, draft + "markov_head.markov_w1.weight", draft_markov, "BF16", 256, 201216);
+        tensor(rows, draft + "markov_head.markov_w2.weight", draft_markov, "BF16", 201216, 256);
+        tensor(rows, draft + "confidence_head.projection.weight", draft_confidence, "BF16", 1, 4352);
+        for (unsigned layer = 0; layer < kDraftLayerCount; ++layer) {
+            const auto prefix = draft + std::to_string(layer) + ".";
+            add_block(rows, prefix, false, false);
+            add_moe(rows, prefix + "block_sparse_moe.");
+        }
         return rows;
     }();
     return schema;
+}
+std::optional<unsigned> tensor_layer(std::string_view name, bool drafter) {
+    const std::string_view prefix = drafter ? "model.mtp." : "model.layers.";
+    if (!name.starts_with(prefix)) return {};
+    name.remove_prefix(prefix.size());
+    const auto dot = name.find('.');
+    if (dot == std::string_view::npos) return {};
+    unsigned layer = 0;
+    const auto stop = name.data() + dot;
+    const auto [end, error] = std::from_chars(name.data(), stop, layer);
+    if (error != std::errc{} || end != stop) return {};
+    return layer;
+}
+
+Status check_manifest(const std::filesystem::path& path, Inventory& inventory) {
+    auto missing = inventory.missing_shards;
+    std::erase(missing, kFlashIndexerShard); // The sidecar is outside the main index.
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error == std::errc::no_such_file_or_directory && !missing.empty()) return {Error::ok, {}};
+    if (error) return {Error::stale_source, "cannot read checkpoint manifest: " + error.message()};
+    if (size > 64U * 1024U * 1024U) return {Error::malformed, "checkpoint manifest exceeds size bound"};
+    std::ifstream file(path, std::ios::binary);
+    std::string json(static_cast<std::size_t>(size), '\0');
+    if (!file.read(json.data(), static_cast<std::streamsize>(json.size())) || file.peek() != EOF)
+        return {Error::stale_source, "could not read the checkpoint manifest at its recorded size"};
+
+    std::set<std::string, std::less<>> shard_names;
+    std::vector<weight::SafetensorsManifestEntry> entries;
+    entries.reserve(inventory.tensors.size());
+    for (const auto& [name, tensor] : inventory.tensors) {
+        const auto shard = tensor.payload.source->shard_name();
+        if (shard != kFlashIndexerShard)
+            entries.push_back({name, *shard_names.insert(shard).first, tensor.payload.range.bytes});
+    }
+    const auto status = weight::validate_safetensors_manifest(entries, json, missing);
+    inventory.has_manifest = static_cast<bool>(status);
+    return status;
 }
 } // namespace
 
@@ -166,6 +236,12 @@ std::string_view module_name(Module module) noexcept {
     case latent_projection: return "latent_projection";
     case shared_expert: return "shared_expert";
     case routed_expert: return "routed_expert";
+    case final_norm: return "final_norm";
+    case hc_contract: return "hc_contract";
+    case lm_head: return "lm_head";
+    case draft_input: return "draft_input";
+    case draft_markov: return "draft_markov";
+    case draft_confidence: return "draft_confidence";
     }
     return "unclassified";
 }
@@ -197,7 +273,9 @@ Status add_shard(const weight::TensorIndex& shard, Inventory& inventory) {
         }
         if ((module == flash_indexer) != (shard_name == kFlashIndexerShard))
             return {Error::malformed, "unexpected FlashIndexer shard mapping for " + raw.name};
-        pending.emplace(raw.name, Tensor{module, raw.wire_dtype, raw.extents, raw.payload});
+        const bool drafter = raw.name.starts_with("model.mtp.");
+        pending.emplace(raw.name, Tensor{module, drafter, tensor_layer(raw.name, drafter),
+                                         raw.wire_dtype, raw.extents, raw.payload});
     }
     inventory.tensors.merge(pending);
     return {Error::ok, {}};
@@ -237,6 +315,8 @@ Status inspect_weights(const std::filesystem::path& root, Inventory& out) {
     for (unsigned index = 1; index <= kMainShardCount; ++index)
         if (auto status = inspect(main_shard_name(index)); !status) return status;
     if (auto status = inspect(std::string(kFlashIndexerShard)); !status) return status;
+    if (auto status = check_manifest(root / "model.safetensors.index.json", inventory); !status)
+        return status;
     inventory.missing_known_tensors = count_missing_known_tensors(inventory);
     out = std::move(inventory);
     return {Error::ok, {}};
