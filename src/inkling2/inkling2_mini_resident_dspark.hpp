@@ -91,7 +91,6 @@ public:
     // rows are re-read from the new sequence's taps at the next forward). A failed session is not restarted.
     void restart_sequence() noexcept {
         context_.reset();
-        logged_tap_rows_ = 0U;
     }
     [[nodiscard]] bool failed() const noexcept { return failed_; }
 
