@@ -28,7 +28,8 @@ NON_HIP_PREFIXES = ('docs/', 'tools/', 'scripts/', 'recipes/', 'release/', 'pack
 NON_HIP_SUFFIXES = DOC_SUFFIXES | {'.py', '.cu', '.cuh'}
 HIP_WORKFLOW = '.github/workflows/ci.yml'
 HIP_TOOL_INPUTS = {'tools/ci/check_generated_asm.py', 'tools/gen_ds41_qk_asm.py',
-                   'tools/check_kernel_scratch.py', 'tools/kernel_scratch_allowance.txt'}
+                   'tools/check_kernel_scratch.py', 'tools/kernel_scratch_allowance.txt',
+                   'tools/kernel_scratch_known.txt'}
 
 
 def is_doc(path):

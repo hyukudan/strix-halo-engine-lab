@@ -151,13 +151,14 @@ if(STRIX_EXPERIMENTAL_MALL_SHARED_DOWN_NT)
 endif()
 option(STRIX_BACKEND_CPU "Build the CPU backend scaffold (src/cpu) and its host tests" OFF)
 option(STRIX_USE_OPENSSL_SHA256 "Use OpenSSL for full-file SHA-256 verification" OFF)
-option(STRIX_CHECK_KERNEL_SCRATCH "Fail the build when a kernel's private scratch/spills exceed tools/kernel_scratch_allowance.txt" OFF)
+option(STRIX_CHECK_KERNEL_SCRATCH "Fail the build when a kernel's private scratch/spills exceed tools/kernel_scratch_allowance.txt (known kernels: their record in tools/kernel_scratch_known.txt)" OFF)
 # Post-build check of every amdgcn code object linked into target (tools/check_kernel_scratch.py).
 function(strix_check_kernel_scratch target)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_custom_command(TARGET ${target} POST_BUILD
         COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tools/check_kernel_scratch.py --quiet
-            --allowance ${CMAKE_SOURCE_DIR}/tools/kernel_scratch_allowance.txt $<TARGET_FILE:${target}>
+            --allowance ${CMAKE_SOURCE_DIR}/tools/kernel_scratch_allowance.txt
+            --known ${CMAKE_SOURCE_DIR}/tools/kernel_scratch_known.txt $<TARGET_FILE:${target}>
         COMMENT "Kernel scratch/spill check: ${target}" VERBATIM)
 endfunction()
 option(STRIX_ENABLE_EXPERIMENTAL_DENSE_TRELLIS "Build the explicit experimental dense trellis pack route" OFF)

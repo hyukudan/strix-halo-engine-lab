@@ -12,6 +12,15 @@ Kernels without a matching line are allowed 0 bytes, 0 spills and no dynamic sta
 The first matching line wins. The optional fields are the kernel's static launch budget (a contract checked
 without a GPU): VGPRs / SGPRs as allocated and static LDS bytes must not exceed them.
 
+With --known FILE (tools/kernel_scratch_known.txt) the kernels that already exceeded the allowance when the baseline
+was recorded are KNOWN: such a kernel passes while every value at fault stays at or below its recorded value. A kernel
+over the allowance that the file does not list (a new kernel or a new fault) or a value above its record fails.
+Known lines: `<kernel-name> private=N vgpr_spill=N sgpr_spill=N [dynamic_stack=1] [vgpr=N] [sgpr=N] [lds=N]`
+(the maximum observed over the toolchains the CI and the nodes use). The list may only shrink: with
+--known-base BASE (the same file at the base commit) a kernel absent from BASE or a value above BASE fails.
+--write-known FILE writes the kernels at fault, merged (maximum per value) with --known when given.
+--summary FILE appends the verdict and the failure lines as Markdown (the CI passes $GITHUB_STEP_SUMMARY).
+
 With --isa-base BASE (repeatable) it compares the machine code of every kernel in the given files against BASE
 (binaries of the base tree built with the same flags): per (target, kernel) the disassembly with addresses, encodings, symbolic
 targets and comments removed must be identical. It prints IDENTICAL / CHANGED / NEW / GONE per kernel matching
@@ -217,6 +226,84 @@ def over_budget(rules, row):
     return [(k, row[k], v) for k, v in sorted(rule[2].items()) if row[k] > v]
 
 
+KNOWN_KEYS = ("private", "vgpr_spill", "sgpr_spill", "dynamic_stack") + BUDGET_KEYS
+
+
+def parse_known(lines):
+    """{kernel name: {key: recorded maximum}} of the kernels over the allowance when the baseline was recorded."""
+    known = {}
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        fields = line.split()
+        if len(fields) < 2 or fields[0] in known:
+            raise SystemExit("known line needs a kernel name and its values, one line per kernel: %r" % line)
+        values = {}
+        for field in fields[1:]:
+            key, sep, value = field.partition("=")
+            if not sep or key not in KNOWN_KEYS or not value.isdigit() or key in values:
+                raise SystemExit("known field %r: expected one of %s=N, once" % (field, "/".join(KNOWN_KEYS)))
+            values[key] = int(value)
+        known[fields[0]] = values
+    return known
+
+
+def load_known(path):
+    with open(path, encoding="utf-8") as f:
+        return parse_known(f)
+
+
+def faults(rules, row):
+    """[(key, value, limit)] of the row above its allowance: scratch, spills without scratch, dynamic stack, budget."""
+    limit = allowed(rules, row["name"])
+    out = []
+    if row["private"] > limit:
+        out.append(("private", row["private"], limit))
+    if limit == 0:
+        out.extend((k, row[k], 0) for k in ("vgpr_spill", "sgpr_spill") if row[k])
+    if row["dynamic_stack"]:
+        out.append(("dynamic_stack", 1, 0))
+    out.extend(over_budget(rules, row))
+    return out
+
+
+def uncovered(known, row, found):
+    """The faults the baseline does not cover: all of them for an unlisted kernel, else those above the record."""
+    record = known.get(row["name"])
+    if record is None:
+        return list(found)
+    return [(k, v, limit) for k, v, limit in found if v > record.get(k, 0)]
+
+
+def known_growth(known, base):
+    """['name: reason'] of the entries a change added to the known list or raised above the base commit's."""
+    out = []
+    for name, values in sorted(known.items()):
+        if name not in base:
+            out.append("%s: not in the base list" % name)
+            continue
+        out.extend("%s: %s %d above the base %d" % (name, k, v, base[name].get(k, 0))
+                   for k, v in sorted(values.items()) if v > base[name].get(k, 0))
+    return out
+
+
+def known_line(name, values):
+    keys = [k for k in KNOWN_KEYS if k in ("private", "vgpr_spill", "sgpr_spill") or values.get(k)]
+    return "%s %s\n" % (name, " ".join("%s=%d" % (k, values.get(k, 0)) for k in keys))
+
+
+def write_summary(path, title, verdict, lines):
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as out:
+        out.write("### %s\n\n%s\n\n" % (title, verdict))
+        if lines:
+            out.write("```\n%s\n```\n\n" % "\n".join(lines[:200]))
+            if len(lines) > 200:
+                out.write("(%d more lines in the step log)\n\n" % (len(lines) - 200))
+
+
 ADDRESS_RE = re.compile(r"^\s*[0-9a-f]+:\s*")
 SYMBOL_RE = re.compile(r"^[0-9a-f]+ <(.+)>:$")
 
@@ -302,6 +389,37 @@ def self_test():
             failures.append("planted control: malformed line %r accepted" % bad[0])
         except SystemExit:
             pass
+    known = parse_known(["# comment", "k_old private=64 vgpr_spill=3 sgpr_spill=0", "k_stack private=0 vgpr_spill=0 "
+                         "sgpr_spill=0 dynamic_stack=1 vgpr=200"])
+    expect(known["k_stack"] == {"private": 0, "vgpr_spill": 0, "sgpr_spill": 0, "dynamic_stack": 1, "vgpr": 200},
+           "known fields")
+    base_row = {"name": "k_old", "private": 64, "vgpr_spill": 3, "sgpr_spill": 0, "dynamic_stack": False,
+                "vgpr": 100, "sgpr": 90, "lds": 0}
+    found = faults(rules, base_row)
+    expect(found == [("private", 64, 0), ("vgpr_spill", 3, 0)], "faults of an unlisted kernel")
+    expect(uncovered(known, base_row, found) == [], "a known kernel at its record passes")
+    grown = dict(base_row, private=80)
+    expect(uncovered(known, grown, faults(rules, grown)) == [("private", 80, 0)], "planted control: growth fails")
+    spilled = dict(base_row, sgpr_spill=2)
+    expect(uncovered(known, spilled, faults(rules, spilled)) == [("sgpr_spill", 2, 0)],
+           "planted control: a new spill kind fails")
+    new = dict(base_row, name="k_new")
+    expect(uncovered(known, new, faults(rules, new)) == faults(rules, new), "planted control: a new kernel fails")
+    stack = dict(base_row, name="k_stack", private=0, vgpr_spill=0, dynamic_stack=True, vgpr=200)
+    expect(uncovered(known, stack, faults(rules, stack)) == [], "a known dynamic stack passes")
+    expect(known_growth(known, known) == [], "an unchanged list passes")
+    expect(known_growth(known, {"k_old": known["k_old"]}) == ["k_stack: not in the base list"],
+           "planted control: an added kernel fails")
+    expect(known_growth({"k_old": dict(known["k_old"], private=65)}, known) == ["k_old: private 65 above the base 64"],
+           "planted control: a raised record fails")
+    expect(known_growth({"k_old": dict(known["k_old"], private=32)}, known) == [], "a lowered record passes")
+    expect(parse_known([known_line("k_stack", known["k_stack"])]) == {"k_stack": known["k_stack"]}, "known line round trip")
+    for bad in (["k"], ["k private=x"], ["k regs=1"], ["k private=1 private=2"], ["k private=1", "k private=2"]):
+        try:
+            parse_known(bad)
+            failures.append("planted control: malformed known list %r accepted" % bad)
+        except SystemExit:
+            pass
     a = ("\n0000000000001900 <kern>:\n    1900: s_load_dwordx4 s[0:3], s[4:5], 0x0 // 000000001900: F4080002\n"
          "    1908: s_cbranch_scc1 3 // 000000001914 <kern+0x14>\n    190c: v_add_f32_e32 v0, v1, v2\n"
          "\n0000000000001a00 <other>:\n    1a00: s_endpgm\n")
@@ -318,7 +436,8 @@ def self_test():
     for f in failures:
         print("SELF-TEST FAIL: %s" % f, file=sys.stderr)
     if not failures:
-        print("kernel contract self-test PASS (allowance and budget parser, budget check, ISA normalisation, planted controls)")
+        print("kernel contract self-test PASS (allowance and budget parser, budget check, known baseline, ISA normalisation, "
+              "planted controls)")
     return 1 if failures else 0
 
 
@@ -358,6 +477,10 @@ def main():
     ap.add_argument("--quiet", action="store_true", help="print only the summary and check failures")
     ap.add_argument("--isa-base", action="append", help="base-tree binary (repeatable): fail when a matching kernel's machine code changed")
     ap.add_argument("--isa-kernels", default="*", help="fnmatch pattern of the functions --isa-base compares")
+    ap.add_argument("--known", help="known over-allowance kernels: pass while at or below their recorded values")
+    ap.add_argument("--known-base", help="the known list at the base commit: fail when --known adds or raises an entry")
+    ap.add_argument("--write-known", help="write the kernels at fault (merged with --known, maximum per value)")
+    ap.add_argument("--summary", help="append the verdict and failure lines as Markdown (e.g. $GITHUB_STEP_SUMMARY)")
     ap.add_argument("--self-test", action="store_true", help="run the built-in checks with planted controls")
     args = ap.parse_args()
     if args.self_test:
@@ -379,9 +502,6 @@ def main():
     rows = []
     for f in args.files:
         rows.extend(kernel_rows(f))
-    if args.allowance and not rows:
-        print("SCRATCH CHECK FAIL: no AMDGPU kernel metadata found", file=sys.stderr)
-        return 2
     # A TU may be linked several times. Keep each distinct allowance or launch-budget observation.
     unique = {}
     for r in rows:
@@ -399,6 +519,12 @@ def main():
             for r in rows:
                 w.writerow([r["name"], r["private"], int(r["dynamic_stack"]), r["vgpr_spill"], r["sgpr_spill"], r["vgpr"],
                             r["sgpr"], r["lds"], r["wave"], r["max_wg"], nt.get(r["symbol"], 0), r["object"]])
+    if args.allowance and not rows:  # after the CSV: the artifact records that the inputs had no metadata
+        message = "SCRATCH CHECK FAIL: no AMDGPU kernel metadata found"
+        print(message, file=sys.stderr)
+        write_summary(args.summary, "Kernel scratch budget",
+                      "**FAIL**: no AMDGPU kernel metadata in %s" % ", ".join(args.files), [message])
+        return 2
 
     flagged = [r for r in rows if r["private"] or r["vgpr_spill"] or r["sgpr_spill"] or r["dynamic_stack"]]
     print("kernels: %d unique, %d with scratch/spills/dynamic stack" % (len(rows), len(flagged)))
@@ -423,25 +549,70 @@ def main():
 
     if args.allowance:
         rules = load_allowance(args.allowance)
-        bad = []
-        over = []
+        known = load_known(args.known) if args.known else None
+        failed = []    # (row, faults the baseline does not cover, its record or None)
+        covered = {}   # known kernel name -> rows at fault within their record
+        at_fault = {}  # kernel name -> maximum per value over its rows at fault (for --write-known)
         for r in rows:
-            limit = allowed(rules, r["name"])
-            if r["private"] > limit or r["dynamic_stack"] or (limit == 0 and (r["vgpr_spill"] or r["sgpr_spill"])):
-                bad.append((r, limit))
-            over.extend((r, k, v, m) for k, v, m in over_budget(rules, r))
-        for r, limit in bad:
-            print("SCRATCH CHECK FAIL: %s private %d B (allowance %d), vgpr_spill %d, sgpr_spill %d%s" % (
-                r["name"], r["private"], limit, r["vgpr_spill"], r["sgpr_spill"],
-                ", dynamic stack" if r["dynamic_stack"] else ""), file=sys.stderr)
-        for r, key, value, limit in over:
-            print("BUDGET CHECK FAIL: %s %s %d (budget %d)" % (r["name"], key, value, limit), file=sys.stderr)
-        if bad or over:
+            found = faults(rules, r)
+            if not found:
+                continue
+            record = at_fault.setdefault(r["name"], {})
+            for k in ("private", "vgpr_spill", "sgpr_spill"):
+                record[k] = max(record.get(k, 0), r[k])
+            for k, v, _ in found:
+                record[k] = max(record.get(k, 0), v)
+            rest = found if known is None else uncovered(known, r, found)
+            if rest:
+                failed.append((r, rest, None if known is None else known.get(r["name"])))
+            else:
+                covered.setdefault(r["name"], []).append(r)
+        lines = []
+        for r, rest, record in failed:
+            scratch = [f for f in rest if f[0] not in BUDGET_KEYS]
+            if known is None:
+                tag = ""
+            elif record is None:
+                tag = " [new kernel over the allowance]"
+            else:
+                tag = " [above its known record: %s]" % ", ".join("%s %d" % (k, record.get(k, 0)) for k, _, _ in rest)
+            if scratch:
+                lines.append("SCRATCH CHECK FAIL: %s private %d B (allowance %d), vgpr_spill %d, sgpr_spill %d%s%s" % (
+                    r["name"], r["private"], allowed(rules, r["name"]), r["vgpr_spill"], r["sgpr_spill"],
+                    ", dynamic stack" if r["dynamic_stack"] else "", tag))
+            for key, value, limit in (f for f in rest if f[0] in BUDGET_KEYS):
+                lines.append("BUDGET CHECK FAIL: %s %s %d (budget %d)%s" % (r["name"], key, value, limit, tag))
+        if known is not None and args.known_base:
+            lines.extend("KNOWN LIST FAIL: %s (the list may only shrink)" % g
+                         for g in known_growth(known, load_known(args.known_base)))
+        for line in lines:
+            print(line, file=sys.stderr)
+        if args.write_known:
+            merged = {name: dict(values) for name, values in (known or {}).items()}
+            for name, values in at_fault.items():
+                entry = merged.setdefault(name, {})
+                for k, v in values.items():
+                    entry[k] = max(entry.get(k, 0), v)
+            with open(args.write_known, "w", encoding="utf-8", newline="\n") as out:
+                out.write("# Kernels over tools/kernel_scratch_allowance.txt when the baseline was recorded (maximum per value\n"
+                          "# over the toolchains measured), read by tools/check_kernel_scratch.py --known. A listed kernel\n"
+                          "# passes while it stays at or below these values; the list may only shrink.\n")
+                for name in sorted(merged):
+                    out.write(known_line(name, merged[name]))
+        if lines:
+            verdict = "**FAIL**: %d line(s); %d known kernel(s) within their record" % (len(lines), len(covered))
+            write_summary(args.summary, "Kernel scratch budget", verdict, lines)
             return 1
-        slack = sum(1 for r in flagged if r["private"] < allowed(rules, r["name"]))
-        unused = sum(1 for pattern, _, _ in rules if not any(pattern == r["name"] or fnmatch.fnmatchcase(r["name"], pattern) for r in rows))
-        print("scratch check PASS (%d kernels; %d below their allowance, %d allowance lines match no kernel)" % (
-            len(rows), slack, unused))
+        verdict = "scratch check PASS (%d kernels; %d below their allowance, %d allowance lines match no kernel" % (
+            len(rows), sum(1 for r in flagged if r["private"] < allowed(rules, r["name"])),
+            sum(1 for pattern, _, _ in rules
+                if not any(pattern == r["name"] or fnmatch.fnmatchcase(r["name"], pattern) for r in rows)))
+        if known is not None:
+            verdict += "; %d known kernels within their record, %d known lines not at fault here" % (
+                len(covered), sum(1 for name in known if name not in covered))
+        verdict += ")"
+        print(verdict)
+        write_summary(args.summary, "Kernel scratch budget", verdict, [])
     return 0
 
 

@@ -349,17 +349,23 @@ jobs:
               '
           } 2>&1 | tee hip-offline-build.log
 
-      # Advisory until tools/kernel_scratch_allowance.txt is refreshed against this toolchain: on one gfx1151
-      # node's ROCm compiler the three executables exceed it in existing kernels (private segment and SGPR spills of
-      # incumbent code; none from a change under review). The report is kept as an artifact; the build above stays
-      # blocking.
-      - name: Kernel scratch budget (advisory)
-        continue-on-error: true
+      # Blocking. Kernels that already exceeded tools/kernel_scratch_allowance.txt when the baseline was recorded are
+      # listed in tools/kernel_scratch_known.txt (maximum over this image's compiler and the gfx1151 nodes' ROCm) and
+      # pass while they stay at or below their record; a new kernel over the allowance, or growth above a record,
+      # fails. On a pull request the known list may only shrink against the base branch. The verdict and every
+      # failure line go to the step summary; the per-kernel CSV is kept as an artifact.
+      - name: Kernel scratch budget
         shell: bash
         run: |
           set -euo pipefail
           tree=build/root-hip-runtime-offline
+          base_known=()
+          if [ -n "${GITHUB_BASE_REF:-}" ] && git fetch --no-tags --depth=1 origin "$GITHUB_BASE_REF" \
+              && git show FETCH_HEAD:tools/kernel_scratch_known.txt > kernel-scratch-known-base.txt 2>/dev/null; then
+            base_known=(--known-base kernel-scratch-known-base.txt)
+          fi
           python3 -B tools/check_kernel_scratch.py --quiet --allowance tools/kernel_scratch_allowance.txt \
+            --known tools/kernel_scratch_known.txt "${base_known[@]}" --summary "$GITHUB_STEP_SUMMARY" \
             --csv kernel-scratch.csv \
             "$tree/strix-hip-decode-token" "$tree/strix-hip-qwen35-decode" "$tree/strix-hip-qwen35-spec"
 
