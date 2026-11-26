@@ -2,6 +2,7 @@
 //
 //   cuda_core_flash_bench [--lens 32768,65536,131072,262144] [--rows 4096] [--heads 24] [--kv-heads 4] [--iters 3] [--pipes pad2,swz3]
 //                         [--check-only] [--no-f8]
+//   cuda_core_flash_bench --flash8-tail-check
 //
 // Per length L: a filled BF16 KV cache of L positions (deterministic pseudo-random values), one prefill chunk of `rows` query rows at
 // positions L - rows .. L - 1 (the last chunk of an L-token prefill, the most expensive one). Every pipe runs on the same inputs; the
@@ -10,6 +11,7 @@
 // FAST8 arm (unless --no-f8): kv_shadow_e4m3 + attention_prefill_flash8 on the same inputs, printed with its error vs the first pipe
 // (relative RMS over all outputs, max abs; non-finite outputs fail the run).
 // --check-only: small lengths (and the partial last tile / short chunk edges) for ctest; exit 1 on any byte difference.
+// --flash8-tail-check: compare a zeroed shadow suffix with stale finite and non-finite suffixes; exit 1 on a difference.
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -17,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -210,9 +213,87 @@ std::size_t run_case(const Case& c, std::uint32_t heads, std::uint32_t kvh, cons
     return bad_total;
 }
 
+int check_flash8_tail() {
+    constexpr std::uint32_t dim = 256, heads = 6, keys = 65, position = keys - 1;
+    constexpr std::size_t query_size = heads * dim;
+    const cc::AttentionDims d{heads, 1, dim, 1.0f / 16.0f, keys};
+    const cc::GroupedView qv{1, heads, dim, heads * dim, dim};
+    const std::size_t capacity = cc::attn8_capacity(d);
+
+    cc::KvShadowE4m3 shadow;
+    __nv_bfloat16 *k = nullptr, *v = nullptr;
+    float *q = nullptr, *out = nullptr, *scratch = nullptr;
+    std::uint32_t* device_position = nullptr;
+    CK(cudaMalloc(&shadow.k8, capacity * dim));
+    CK(cudaMalloc(&shadow.v8t, capacity * dim));
+    CK(cudaMalloc(&shadow.ks, capacity * sizeof(float)));
+    CK(cudaMalloc(&shadow.vs, capacity * sizeof(float)));
+    CK(cudaMalloc(&k, keys * dim * sizeof(*k)));
+    CK(cudaMalloc(&v, keys * dim * sizeof(*v)));
+    CK(cudaMalloc(&q, query_size * sizeof(float)));
+    CK(cudaMalloc(&out, query_size * sizeof(float)));
+    CK(cudaMalloc(&scratch, cc::attention_decode8_scratch_floats(d, 1) * sizeof(float)));
+    CK(cudaMalloc(&device_position, sizeof(position)));
+    CK(cudaMemcpy(device_position, &position, sizeof(position), cudaMemcpyHostToDevice));
+    CK(cudaMemset(q, 0, query_size * sizeof(float)));
+    CK(cudaMemset(k, 0, keys * dim * sizeof(*k)));
+    fill_bf16<<<8, 256>>>(v, keys * dim, 23u, 1.0f);
+    CK(cudaGetLastError());
+
+    auto fill_shadow = [&](int v_byte, float v_scale) {
+        const std::vector<float> scales(capacity, v_scale);
+        CK(cudaMemset(shadow.k8, 0, capacity * dim));
+        CK(cudaMemset(shadow.v8t, v_byte, capacity * dim));
+        CK(cudaMemset(shadow.ks, 0, capacity * sizeof(float)));
+        CK(cudaMemcpy(shadow.vs, scales.data(), capacity * sizeof(float), cudaMemcpyHostToDevice));
+        // Rebuild only valid keys. This overwrites their bytes even in the transposed V layout.
+        CK(cc::kv_shadow_e4m3(d, k, v, shadow, 0, keys, nullptr));
+    };
+    auto read_attention = [&](bool decode) {
+        CK(cudaMemset(out, 0xFF, query_size * sizeof(float)));
+        if (decode) CK(cc::attention_decode8(d, q, qv, nullptr, qv, shadow, device_position, 1, out, scratch, nullptr));
+        else CK(cc::attention_prefill_flash8(d, q, qv, nullptr, qv, shadow, position, 1, out, nullptr));
+        std::vector<float> values(query_size);
+        CK(cudaMemcpy(values.data(), out, query_size * sizeof(float), cudaMemcpyDeviceToHost));
+        return values;
+    };
+
+    fill_shadow(0, 0.0f);
+    const auto prefill = read_attention(false), decode = read_attention(true);
+    const auto count_nonfinite = [](const std::vector<float>& values) {
+        return std::count_if(values.begin(), values.end(), [](float x) { return !std::isfinite(x); });
+    };
+    const auto baseline_bad = count_nonfinite(prefill) + count_nonfinite(decode);
+    std::printf("flash8-tail-check keys=%u baseline_nonfinite=%td\n", keys, baseline_bad);
+    bool failed = baseline_bad != 0;
+    auto compare = [&](const char* tail, bool is_decode, const std::vector<float>& baseline) {
+        const auto values = read_attention(is_decode);
+        std::size_t mismatches = 0;
+        for (std::size_t i = 0; i < values.size(); ++i)
+            if (std::memcmp(&values[i], &baseline[i], sizeof(float)) != 0) ++mismatches;
+        const auto nonfinite = count_nonfinite(values);
+        std::printf("flash8-tail-check %s %s mismatches=%zu nonfinite=%td\n", is_decode ? "decode" : "prefill", tail, mismatches, nonfinite);
+        failed |= mismatches != 0 || nonfinite != 0;
+    };
+    const auto compare_tail = [&](const char* name, int v_byte, float v_scale) {
+        fill_shadow(v_byte, v_scale);
+        compare(name, false, prefill);
+        compare(name, true, decode);
+    };
+    compare_tail("stale-finite", 0x7E, 1e30f);
+    compare_tail("infinite-scale", 0x7E, std::numeric_limits<float>::infinity());
+    compare_tail("nan-e4m3", 0x7F, 0.0f);
+
+    for (void* p : {static_cast<void*>(shadow.k8), static_cast<void*>(shadow.v8t), static_cast<void*>(shadow.ks),
+                    static_cast<void*>(shadow.vs), static_cast<void*>(k), static_cast<void*>(v), static_cast<void*>(q),
+                    static_cast<void*>(out), static_cast<void*>(scratch), static_cast<void*>(device_position)}) CK(cudaFree(p));
+    return failed ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--flash8-tail-check") == 0) return check_flash8_tail();
     std::vector<std::uint32_t> lens{32768, 65536, 131072, 262144};
     std::uint32_t rows = 4096, heads = 24, kvh = 4;
     int iters = 3;
