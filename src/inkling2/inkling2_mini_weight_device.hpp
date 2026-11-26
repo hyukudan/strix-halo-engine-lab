@@ -156,7 +156,9 @@ auto load_mini_weights(const std::string& model, weight::WeightLoadPlan& plan, p
 #if defined(__HIPCC__)
         if (!kMiniProfile.ladder.empty() && !(scope.checkpoint == weight::Digest256{}) &&
             (mini_lowbit_storage(plan.storage) || mini_lowbit_storage(plan.head_storage))) {
-            const auto row_plan = core::bound_lowbit_row_plan(device::native::current_device());
+            // The plan the launch runs (launch_lowbit_group: the folded-scale candidate never takes the profile plan).
+            const auto row_plan = core::bound_lowbit_row_plan(device::native::current_device(),
+                                                              arithmetic != core::LowBitArithmetic::f16_folded_scale);
             std::string settings = "weights=" + weight::serialize_id(plan.storage) +
                 " head=" + weight::serialize_id(plan.head_storage) + " " + weight::weight_load_scope_receipt(scope) +
                 " small_rows=" + std::to_string(row_plan.small_rows) + " wide_panels=" + std::to_string(row_plan.wide_panels);
