@@ -635,7 +635,23 @@ def frozen_qualification(plan, cases, classes, limits, opener):
                 type(nll) not in (int, float) or not 0 <= nll <= sys.float_info.max for nll in values):
             raise GateError(f"{cls}: frozen qualification needs {R4_CLASS_MIN} or more finite original NLLs")
         bars[cls] = _r4_class_stats(values, limits)["bar"]
-    return windows, bars
+    envelope = doc.get("null_envelope")
+    if "null_envelope" in doc and (
+            not isinstance(envelope, dict) or set(envelope) != {"max_kl", "min_top1", "max_abs_dnll"}
+            or any(type(v) not in (int, float) or not 0 <= v <= sys.float_info.max for v in envelope.values())
+            or envelope["min_top1"] > 1):
+        raise GateError("frozen null envelope needs finite max_kl, min_top1 in [0, 1], and max_abs_dnll")
+    return windows, bars, envelope
+
+
+def check_null_envelope(case, arms, rows, envelope):
+    """Check each control before the null-relative statistics combine arms or windows."""
+    for arm, control in zip(arms, rows):
+        kl = float(control["kl_rc"].mean())
+        top1 = float(control["agree"].mean())
+        dnll = float((control["nll_c"] - control["nll_r"]).mean())
+        if not (kl <= envelope["max_kl"] and top1 >= envelope["min_top1"] and abs(dnll) <= envelope["max_abs_dnll"]):
+            raise GateError(f"{case}.{arm}: exceeds the frozen null envelope (KL {kl:.6g}, top-1 {top1:.6g}, dNLL {dnll:+.6g})")
 
 
 def document_uncertainty(windows, frozen):
@@ -734,12 +750,15 @@ def qual(a):
     if not cases:
         raise GateError(f"{out} holds no {a.ref} logits")
     plan = getattr(a, "frozen_qualification", None)
-    frozen_windows, frozen_bars = frozen_qualification(plan, cases, classes, limits, opener) if plan else ({}, None)
+    frozen_windows, frozen_bars, null_envelope = (
+        frozen_qualification(plan, cases, classes, limits, opener) if plan else ({}, None, None))
     doc_uncertainty = getattr(a, "document_uncertainty", False)
     if doc_uncertainty and (not plan or any(not isinstance(w.get("document"), str) or not w["document"].strip()
                                             for w in frozen_windows.values())):
         raise GateError("--document-uncertainty needs a frozen qualification plan with a document ID for every window")
     witness_path = getattr(a, "null_control_witness", None)
+    if null_envelope is not None and not witness_path:
+        raise GateError("a frozen null envelope requires --null-control-witness")
     witness = None
     if witness_path:
         with open(witness_path, encoding="utf-8", opener=opener) as f:
@@ -781,6 +800,8 @@ def qual(a):
         if any(rows["nonfinite_c"].any() or info.get("cand_unscored_nonfinite") for rows, info in null_pairs):
             raise GateError(f"{case}: non-finite null logits")
         null_moved(case, [float(x["kl_rc"].mean()) for x in nulls])
+        if null_envelope is not None:
+            check_null_envelope(case, a.null, nulls, null_envelope)
         if ra["nonfinite_c"].any() or ra_info.get("cand_unscored_nonfinite"):
             nonfinite_candidate.append(case)
             continue
@@ -865,6 +886,8 @@ def qual(a):
                     allow_null_floor=getattr(a, 'allow_null_floor', False), frozen_bars=frozen_bars)
         if plan:
             p["frozen_qualification"] = {"sha256": plan[1], "reference_nll_bars": frozen_bars}
+            if null_envelope is not None:
+                p["frozen_qualification"]["null_envelope"] = null_envelope
         print(pooled_line(p, limits))
         if replay:
             if nonfinite_free:

@@ -664,6 +664,24 @@ class HeadFormat(unittest.TestCase):
                     check(2)
                     record[field] = original
 
+            # An attested order control can still drift beyond the declared envelope.
+            null_path = d / f"{cases[0]}-n0.f32"
+            altered = -np.fromfile(null_path, dtype="<f4")
+            null_path.write_bytes(altered.tobytes())
+            record["logits_sha256"] = hashlib.sha256(altered.tobytes()).hexdigest()
+            check(0)
+            frozen = d / "envelope.json"
+            payload = json.dumps({"schema": "strix-gate-frozen-qualification/v1",
+                                  "windows": {c: {"class": "prose", "ids_sha256": records[c]["exact"]["head_ids_sha256"]}
+                                              for c in cases}, "reference_nll": {"prose": [10.0, 10.0, 10.0]},
+                                  "null_envelope": {"max_kl": 0.02, "min_top1": 0.93,
+                                                    "max_abs_dnll": 0.2}}).encode("utf-8")
+            frozen.write_bytes(payload)
+            rc, out = self.gate(d, "--null-control-witness", str(witness), "--allow-null-floor",
+                                "--frozen-qualification", str(frozen), hashlib.sha256(payload).hexdigest())
+            self.assertEqual(rc, 2, out)
+            self.assertIn(f"{cases[0]}.n0: exceeds the frozen null envelope", out)
+
     def test_frozen_qualification_binds_held_out_ids_and_reference_bars(self):
         with tempfile.TemporaryDirectory() as d:
             cases = [f"w{i:02d}" for i in range(13)]
