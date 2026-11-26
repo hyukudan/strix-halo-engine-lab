@@ -6588,3 +6588,81 @@ existing arithmetic and schedule with catalogue data.
 | minimax-m3.1-flash | no resident q4_g64 / q6_g64 FP16 binding | outside ticket |
 | hy4-flash | no resident q4_g64 / q6_g64 FP16 binding | outside ticket |
 | nemotron-3.5-bolt-e4b | no resident q4_g64 / q6_g64 FP16 binding | outside ticket |
+
+<a id="cuda-one-row-latency-forms"></a>
+
+## CUDA one-row latency forms: tiled residual bank readout and narrow rounded output split
+
+**Engine:** `shared`. **Control:** none (selected by rows == 1 and the form's own admission). **Default:** on (CUDA).
+
+One-row callers of the residual bank readout and of a one-projection rounded narrow dense row take the latency forms the decode program route already bound; one launch replaces one launch, so captured steps keep their node count.
+
+- **Shared home:** src/core/residual_mix.hpp, src/core/dense_bf16_narrow_plan.hpp; src/cuda/core/mix_cuda.cuh, src/cuda/core/mix_cuda_latency.cuh, src/cuda/core/dense/bf16_rows.hpp
+- **Tier and regime:** EXACT, FAST, QUALITY, TURBO; CUDA one-row decode
+- **Exactness evidence:** EXACT: tests/cuda_core/mixlat_cuda_fixture.cu: bank tiled bitwise vs K8c and the resident CUDA readout; output split bitwise vs group_round (4608x64, 32x16, 160x48). RTX q52c / q54 (builds carrying both forms on the resident route): ids equal to the q46 resident run (code) and to q47 off (prose).
+- **Off switch:** none needed: bitwise the incumbent's result; the incumbent stays wherever the form does not admit the shape
+- **Measured gain:** RTX PRO, Inkling 2 Mini CUDA step program r1: 102.8 -> 109.9 tok/s with both forms. Resident route: inside the q52c / q54 builds, not measured apart.
+- **Preconditions:** CUDA; one row; residual readout inside latency_grid (width <= 4096); one rounded projection with <= 64 outputs and 16-byte aligned weights and input. Every other shape keeps the incumbent.
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: no CUDA one-row caller of launch_mix or of a one-projection rounded narrow dense row; binds automatically when one calls them |
+| Qwen3.8 27B dense | not bound: no CUDA one-row caller of launch_mix or of a one-projection rounded narrow dense row; binds automatically when one calls them |
+| DeepSeek V4.1 Flash | not bound: no CUDA one-row caller of launch_mix or of a one-projection rounded narrow dense row; binds automatically when one calls them |
+| GLM 5.3 Flash | not bound: no CUDA one-row caller of launch_mix or of a one-projection rounded narrow dense row; binds automatically when one calls them |
+| MiniMax M3.1 Flash | not bound: no CUDA one-row caller of launch_mix or of a one-projection rounded narrow dense row; binds automatically when one calls them |
+| Inkling 2 Mini | bound: CUDA resident and step-program routes (controller bank readout, controller down projection) |
+| Hy4 Flash | not bound: no CUDA one-row caller of launch_mix or of a one-projection rounded narrow dense row; binds automatically when one calls them |
+| Nemotron 3.5 Bolt E4B | not bound: no CUDA one-row caller of launch_mix or of a one-projection rounded narrow dense row; binds automatically when one calls them |
+
+<a id="verify-window-program"></a>
+
+## Session row append: staged verify window programs
+
+**Engine:** `shared`. **Control:** backend member try_window_graph(chunk, work, taped); Inkling 2 Mini: STRIX_INKLING_WINDOW_PROGRAMS=1. **Default:** off (no backend replays a window by default: q53 measured a loss with it on).
+
+A taped staged verify window is offered to the backend after its eager checkpoints; a backend may replay one captured program per window rows, else the work runs eagerly. Off by default: identity passes, but the drafter's acceptance collapses with the programs on (q53).
+
+- **Shared home:** include/strix/session/kv_row_append.hpp, src/core/resident_greedy.hpp; src/inkling2 binding
+- **Tier and regime:** EXACT, FAST, QUALITY, TURBO; CUDA CLI speculative decode (verify windows)
+- **Exactness evidence:** EXACT verification: q52r device fixture (Inkling 2 Mini CUDA, programs vs eager windows) 42,525 items, 0 differing, programs ran at every width 2..8; q53: ids equal to the q46 resident run with the programs on. Host: tests/session_conv_tape_tests.cpp (offer after the checkpoints, accept == decline), strix-e2i-step-inputs-tests (window block valid mask).
+- **Off switch:** default off; STRIX_INKLING_WINDOW_PROGRAMS=1 turns the Inkling 2 Mini programs on
+- **Measured gain:** none measured: q53 (RTX PRO, code, CLI EXACT 256 tokens, programs on) 93.13 tok/s vs 132.80 with the programs off: the drafter's acceptance collapses (26/92, mean 1.3 vs 201/343, 3.94); cause open.
+- **Preconditions:** a backend that defines try_window_graph; taped staged verify windows of 2..16 rows without score reads.
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: no backend defines try_window_graph; appends unchanged (eager) |
+| Qwen3.8 27B dense | not bound: no backend defines try_window_graph; appends unchanged (eager) |
+| DeepSeek V4.1 Flash | not bound: no backend defines try_window_graph; appends unchanged (eager) |
+| GLM 5.3 Flash | not bound: no backend defines try_window_graph; appends unchanged (eager) |
+| MiniMax M3.1 Flash | not bound: no backend defines try_window_graph; appends unchanged (eager) |
+| Inkling 2 Mini | bound (opt-in): CUDA resident decoder window programs; default off (q53) |
+| Hy4 Flash | not bound: no backend defines try_window_graph; appends unchanged (eager) |
+| Nemotron 3.5 Bolt E4B | not bound: no backend defines try_window_graph; appends unchanged (eager) |
+
+<a id="inkling2-auto-hybrid-route"></a>
+
+## Inkling 2 Mini CUDA auto speculation: hybrid route
+
+**Engine:** `inkling2-mini`. **Control:** --speculation auto (CUDA CLI); STRIX_INKLING_PLAIN_ROW_ROUTE=resident. **Default:** on (CUDA CLI --speculation auto, BF16 weights, no FAST weight-image levers).
+
+In a drafting run the speculator's one-row steps run on the CUDA step program over the resident decoder's own state (it stores the drafter taps); drafting passes stay on the resident verify windows.
+
+- **Shared home:** src/exec/catalog_cuda_decode.{hpp,cu} (Bf16SliceAtRow); src/inkling2 binding
+- **Tier and regime:** EXACT, FAST, QUALITY, TURBO; CUDA CLI speculative decode
+- **Exactness evidence:** EXACT: both routes run the same arithmetic on the same decoder state; the step program stores the drafter taps through the shared Bf16SliceAtRow leaf. RTX q54: ids equal to the q46 resident run (code) and to q47 off (prose); acceptance 201/343 unchanged.
+- **Off switch:** STRIX_INKLING_PLAIN_ROW_ROUTE=resident (every row on the resident decoder); --speculation off
+- **Measured gain:** RTX PRO, cuda_pf2-kit q54 (CLI EXACT 256 tokens): code 132.80 tok/s vs 97.23 on the plain step program (+36.6 %); prose 98.05 vs 101.49 on the plain step program (0.966x; q52c all-resident auto 91.66). Measured bound: prose >= 0.96x the plain program (the arbiter's 8 probe passes), code +36 %.
+- **Preconditions:** CUDA build with the step program; BF16 weight storage; no route tap, no combine image, no prepared round fold, no narrow experts.
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: no CUDA step program with drafter taps next to a verifying route |
+| Qwen3.8 27B dense | not bound: no CUDA step program with drafter taps next to a verifying route |
+| DeepSeek V4.1 Flash | not bound: no CUDA step program with drafter taps next to a verifying route |
+| GLM 5.3 Flash | not bound: no CUDA step program with drafter taps next to a verifying route |
+| MiniMax M3.1 Flash | not bound: no CUDA step program with drafter taps next to a verifying route |
+| Inkling 2 Mini | bound: CUDA CLI (this row) |
+| Hy4 Flash | not bound: no CUDA step program with drafter taps next to a verifying route |
+| Nemotron 3.5 Bolt E4B | not bound: no CUDA step program with drafter taps next to a verifying route |
