@@ -3,6 +3,7 @@
 #include "channel_device.hpp"
 #include "wire.hpp"
 #include "small_progress.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/hip_argmax_core.hpp"
 
 #include <immintrin.h>
@@ -10,6 +11,7 @@
 #include <sched.h>
 
 #include <algorithm>
+#include <limits>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -95,9 +97,10 @@ __device__ __forceinline__ bool better(float v, std::uint32_t i, float bv, std::
     out[r] = i0 == 0xFFFFFFFFU || i1 == 0xFFFFFFFFU ? 0xFFFFFFFFU : v1 > v0 ? i1 : i0;  // tie: rank 0 (lower ids)
 }
 
-[[maybe_unused]] std::uint64_t env_u64(const char* name, std::uint64_t fallback) {
-    const char* v = std::getenv(name);
-    return v != nullptr && *v != '\0' ? std::stoull(v) : fallback;
+[[maybe_unused]] std::uint64_t env_u64(const char* name, std::uint64_t fallback,
+                                       std::uint64_t hi = std::numeric_limits<std::uint64_t>::max()) {
+    // strict: a negative, non-numeric, trailing-junk or out-of-range value throws std::invalid_argument naming the variable
+    return strix::env_number<std::uint64_t>(name, fallback, 0, hi);
 }
 
 }  // namespace
@@ -121,7 +124,9 @@ public:
     }
     std::uint64_t submit(const std::byte* p, std::size_t n) {
         const std::uint64_t t = submitted_.load(std::memory_order_relaxed) + 1;
-        while (t - completed_.load(std::memory_order_acquire) > kRing) _mm_pause();
+        // a slot is reused only once its previous ticket is older than kRing - 1 newer ones: wait() of the most recent
+        // completed ticket still reads a live slot
+        while (t - completed_.load(std::memory_order_acquire) >= kRing) _mm_pause();
         Task& k = ring_[t % kRing];
         k.p = p;
         k.n = n;
@@ -167,12 +172,14 @@ void ChannelOptions<Traits>::from_env() {
     if (const char* v = std::getenv("STRIX_XPORT_SMALL_SPIN"); v != nullptr && *v != '\0') {
         small_spin = SmallProgress::parse(v);
     }
-    depth = static_cast<unsigned>(env_u64((std::string(Traits::kEnvironment) + "DEPTH").c_str(), depth));
+    depth = static_cast<unsigned>(env_u64((std::string(Traits::kEnvironment) + "DEPTH").c_str(), depth, std::numeric_limits<unsigned>::max()));
     {   // Exchange row fold: messages of at most <ENV>FOLD rows may be folded by the progress thread (0 = off). The
         // default is the engine's measured crossover (Traits::kFoldRows), absent = off.
         std::uint64_t rows = 0;
         if constexpr (requires { Traits::kFoldRows; }) rows = Traits::kFoldRows;
-        rows = env_u64((std::string(Traits::kEnvironment) + "FOLD").c_str(), rows);
+        constexpr std::uint64_t row_bytes = static_cast<std::uint64_t>(Traits::kWidth) * sizeof(typename Traits::Payload);
+        rows = env_u64((std::string(Traits::kEnvironment) + "FOLD").c_str(), rows,
+                       std::numeric_limits<std::uint64_t>::max() / row_bytes);  // rows * row_bytes cannot wrap
         fold_capacity = std::min<std::size_t>(static_cast<std::size_t>(rows) * Traits::kWidth * sizeof(typename Traits::Payload), capacity);
     }
     if (const char* v = std::getenv((std::string(Traits::kEnvironment) + "PUBLISH").c_str()); v != nullptr && *v != '\0') {
@@ -201,7 +208,8 @@ void ChannelOptions<Traits>::from_env() {
     if (const char* v = std::getenv((std::string(Traits::kEnvironment) + "PROGRESS_CPU").c_str()); v != nullptr && *v != '\0') progress_cpu = std::atoi(v);
     if (const char* v = std::getenv((std::string(Traits::kEnvironment) + "CRC_CPU").c_str()); v != nullptr && *v != '\0') crc_cpu = std::atoi(v);
     test_corrupt_sequence = env_u64((std::string(Traits::kEnvironment) + "TEST_CORRUPT").c_str(), test_corrupt_sequence);
-    idle_spin_us = static_cast<unsigned>(env_u64((std::string(Traits::kEnvironment) + "IDLE_SPIN_US").c_str(), idle_spin_us));
+    idle_spin_us = static_cast<unsigned>(env_u64((std::string(Traits::kEnvironment) + "IDLE_SPIN_US").c_str(), idle_spin_us,
+                                                 std::numeric_limits<unsigned>::max()));
     timeout = std::chrono::milliseconds(env_u64((std::string(Traits::kEnvironment) + "TIMEOUT_MS").c_str(), static_cast<std::uint64_t>(timeout.count())));
 }
 
@@ -223,6 +231,8 @@ void Channel<Traits>::init() {
     stride_ = (options_.capacity + sizeof(Trailer) + 4095) & ~std::size_t{4095};
     const std::size_t total = stride_ * options_.depth;
     const unsigned flags = hipHostMallocMapped | hipHostMallocCoherent;
+    // A constructor that throws never runs ~Channel: whatever was allocated so far is released here.
+    try {
     auto slots = [&](Memory m, std::byte** host, std::byte** dev, void** alloc, const char* what) {
         if (m != Memory::host_coherent) {
             hip_check(hipExtMallocWithFlags(alloc, total, m == Memory::device_fine ? hipDeviceMallocFinegrained : hipDeviceMallocUncached), what);
@@ -269,6 +279,28 @@ void Channel<Traits>::init() {
         CPU_SET(options_.progress_cpu, &set);
         pthread_setaffinity_np(thread_.native_handle(), sizeof(set), &set);
     }
+    } catch (...) {
+        crc_worker_.reset();
+        release_buffers();
+        throw;
+    }
+}
+
+template<class Traits>
+void Channel<Traits>::release_buffers() noexcept {
+    if (fx_host_ != nullptr) (void)hipHostFree(fx_host_);
+    (void)hipFree(gate_dev_);
+    (void)hipHostFree(flags_host_);
+    if (options_.rx_memory != Memory::host_coherent) (void)hipFree(rx_alloc_);
+    else (void)hipHostFree(rx_alloc_);
+    if (options_.tx_memory != Memory::host_coherent) (void)hipFree(tx_alloc_);
+    else (void)hipHostFree(tx_alloc_);
+    (void)hipFree(counter_dev_);
+    fx_host_ = nullptr;
+    gate_dev_ = nullptr;
+    flags_host_ = nullptr;
+    rx_alloc_ = tx_alloc_ = nullptr;
+    counter_dev_ = nullptr;
 }
 
 template<class Traits>
@@ -285,7 +317,6 @@ Channel<Traits>::~Channel() {
         (void)hipStreamSynchronize(options_.stream);
     }
     crc_worker_.reset();
-    (void)hipFree(counter_dev_);
     if (!rx_trace_path_.empty()) {
         if (std::FILE* f = std::fopen((rx_trace_path_ + "." + std::to_string(options_.rank)).c_str(), "w")) {
             for (const auto& r : rx_trace_)
@@ -298,13 +329,7 @@ Channel<Traits>::~Channel() {
     }
     if (folds_ != 0) std::fprintf(stderr, "xport row_fold rank=%u folded=%llu of %llu exchanges\n", options_.rank,
                                   static_cast<unsigned long long>(folds_), static_cast<unsigned long long>(stats_.exchanges));
-    if (fx_host_ != nullptr) (void)hipHostFree(fx_host_);
-    (void)hipFree(gate_dev_);
-    (void)hipHostFree(flags_host_);
-    if (options_.rx_memory != Memory::host_coherent) (void)hipFree(rx_alloc_);
-    else (void)hipHostFree(rx_alloc_);
-    if (options_.tx_memory != Memory::host_coherent) (void)hipFree(tx_alloc_);
-    else (void)hipHostFree(tx_alloc_);
+    release_buffers();
 }
 
 template<class Traits>
@@ -351,6 +376,18 @@ void Channel<Traits>::send(std::size_t bytes, const Tag& tag, Publish how) {
     if (bytes == 0 || bytes > options_.capacity) throw std::invalid_argument("glmxfer: message size outside 1..capacity");
     const std::uint64_t s = next_ + 1;
     if (s > received_ + options_.depth) throw std::logic_error("glmxfer: send() of a sequence whose slot is still in use");
+    // Validate the pending split / fold before anything is published: a rejected send changes no sequence or flag
+    // (and drops the pending request, so the next send starts clean).
+    if (head_next_ != 0 && head_next_ >= bytes) {
+        head_next_ = 0;
+        fold_next_ = RowFold::none;
+        throw std::invalid_argument("glmxfer: split head not below the message size");
+    }
+    if (fold_next_ != RowFold::none && !can_fold(bytes)) {
+        head_next_ = 0;
+        fold_next_ = RowFold::none;
+        throw std::invalid_argument("glmxfer: fold of a message outside the fold capacity");
+    }
     if (how == Publish::kernel) {
         hipLaunchKernelGGL(publish_kernel, dim3(1), dim3(32), 0, options_.stream, flags_dev_ + kTxFlag, s);
         hip_check(hipGetLastError(), "publish kernel");
@@ -361,12 +398,10 @@ void Channel<Traits>::send(std::size_t bytes, const Tag& tag, Publish how) {
     tail_deferred_ = options_.crc && options_.crc_deferred && bytes > kInlineCrcMax;
     Job job{s, bytes, tag, false};
     if (head_next_ != 0) {
-        if (head_next_ >= bytes) throw std::invalid_argument("glmxfer: split head not below the message size");
         job.head = head_next_;
         head_next_ = 0;
     }
     if (fold_next_ != RowFold::none) {
-        if (!can_fold(bytes)) throw std::invalid_argument("glmxfer: fold of a message outside the fold capacity");
         job.fold = fold_next_;
         fold_next_ = RowFold::none;
     }

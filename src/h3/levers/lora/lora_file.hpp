@@ -125,27 +125,30 @@ private:
     Json value() {
         Json j;
         const char c = peek();
+        if ((c == '{' || c == '[') && ++depth_ > 128) fail("nesting too deep");
         if (c == '{') {
             j.kind = Json::kObj;
             ++i_;
-            if (peek() == '}') { ++i_; return j; }
+            if (peek() == '}') { ++i_; --depth_; return j; }
             while (true) {
                 std::string k = string();
                 expect(':');
                 j.obj.emplace_back(std::move(k), value());
                 if (peek() == ',') { ++i_; continue; }
                 expect('}');
+                --depth_;
                 return j;
             }
         }
         if (c == '[') {
             j.kind = Json::kArr;
             ++i_;
-            if (peek() == ']') { ++i_; return j; }
+            if (peek() == ']') { ++i_; --depth_; return j; }
             while (true) {
                 j.arr.push_back(value());
                 if (peek() == ',') { ++i_; continue; }
                 expect(']');
+                --depth_;
                 return j;
             }
         }
@@ -166,7 +169,14 @@ private:
     }
     const std::string& s_;
     std::size_t i_ = 0;
+    int depth_ = 0;  // nesting bound as serve::parse_json_unique: deep input is an error, not a stack overflow
 };
+// A safetensors extent (shape dimension or data offset): a non-negative integer that fits the 53-bit double mantissa.
+inline std::uint64_t lora_extent(const Json& j, const std::string& what) {
+    if (j.kind != Json::kNum || !(j.num >= 0.0) || j.num > 9007199254740992.0 || j.num != static_cast<double>(static_cast<std::uint64_t>(j.num)))
+        throw std::runtime_error("h3 lora: bad extent in " + what);
+    return static_cast<std::uint64_t>(j.num);
+}
 inline float f16_to_f32(std::uint16_t h) {
     const std::uint32_t s = (h >> 15U) & 1U, e = (h >> 10U) & 0x1fU, m = h & 0x3ffU;
     float v;
@@ -215,9 +225,10 @@ public:
             const detail::Json* of = kv.second.get("data_offsets");
             if (!dt || !sh || !of || of->arr.size() != 2) throw std::runtime_error("h3 lora: bad tensor entry " + kv.first);
             t.dtype = dt->str;
-            for (const auto& d : sh->arr) t.shape.push_back(static_cast<std::uint64_t>(d.num));
-            t.begin = static_cast<std::uint64_t>(of->arr[0].num);
-            t.end = static_cast<std::uint64_t>(of->arr[1].num);
+            for (const auto& d : sh->arr) t.shape.push_back(detail::lora_extent(d, kv.first));
+            t.begin = detail::lora_extent(of->arr[0], kv.first);
+            t.end = detail::lora_extent(of->arr[1], kv.first);
+            if (t.end < t.begin) throw std::runtime_error("h3 lora: reversed data_offsets of " + kv.first);
             (kv.first.rfind(kPrefix, 0) == 0 ? any_prefixed : any_plain) = true;
             tensors_[kv.first] = t;
         }

@@ -10,7 +10,9 @@
 #include <random>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
+#include <new>
 #include <iostream>
 #include <iterator>
 #include <map>
@@ -55,6 +57,54 @@ std::string read_file(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error("cannot open " + path);
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+// Malformed tokenizer.json (the memo fixture with one field changed): a clean error, never an out-of-range write or
+// an allocation sized by an ID.
+bool load_is_clean_error(const std::string& path, const std::string& needle) {
+    try { (void)mm::MinimaxTokenizer::load(path); }
+    catch (const std::bad_alloc&) { return false; } catch (const std::length_error&) { return false; }
+    catch (const std::runtime_error& e) { return std::string(e.what()).find(needle) != std::string::npos; }
+    return false;
+}
+
+void malformed_assets_checks() {
+    const auto base = read_file(STRIX_MINIMAX_MEMO_FIXTURE);
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto write = [&](const std::string& name, const std::string& text) {
+        const auto path = (dir / ("strix_mm_tok_audit_" + name)).string();
+        std::ofstream(path, std::ios::binary) << text;
+        return path;
+    };
+    const auto mutated = [&](const std::string& from, const std::string& to) {
+        auto text = base;
+        const auto at = text.find(from);
+        if (at == std::string::npos) throw std::runtime_error("memo fixture changed: " + from);
+        text.replace(at, from.size(), to);
+        return text;
+    };
+    struct Case { const char* name; std::string text; const char* needle; };
+    const std::vector<Case> cases{
+        {"id-negative-1", mutated("\"\\u0100\": 0,", "\"\\u0100\": -1,"), "token ID out of range"},
+        {"id-negative-2", mutated("\"\\u0100\": 0,", "\"\\u0100\": -2,"), "token ID out of range"},
+        {"id-int-max", mutated("\"\\u0100\": 0,", "\"\\u0100\": 2147483647,"), "token ID out of range"},
+        {"id-over-cap", mutated("\"\\u0100\": 0,", "\"\\u0100\": 4194304,"), "token ID out of range"},
+        {"added-id-negative", mutated("\"id\": 256,", "\"id\": -5,"), "token ID out of range"},
+        {"added-id-huge", mutated("\"id\": 256,", "\"id\": 4294967295,"), "token ID out of range"},
+        {"added-no-content", mutated("\"content\": \"<mm:think>\",", "\"other\": 1,"), "added token needs"},
+        {"added-no-id", mutated("\"id\": 256,", "\"other\": 256,"), "added token needs"},
+    };
+    for (const auto& c : cases) {
+        const auto path = write(c.name, c.text);
+        check("malformed", load_is_clean_error(path, c.needle), std::string("not a clean error: ") + c.name);
+        std::filesystem::remove(path);
+    }
+    // The unchanged fixture still loads; an oversized file is refused before it is parsed.
+    check("malformed", mm::MinimaxTokenizer::load(STRIX_MINIMAX_MEMO_FIXTURE) != nullptr, "fixture loads");
+    const auto big = write("oversized", "{");
+    std::filesystem::resize_file(big, (std::uintmax_t{128} << 20U) + 1U);
+    check("malformed", load_is_clean_error(big, "size limit"), "oversized tokenizer.json is not a clean error");
+    std::filesystem::remove(big);
 }
 
 mm::MinimaxChatOptions options_of(const Json& o) {
@@ -148,6 +198,7 @@ int main(int argc, char** argv) try {
         check("invalid-utf8", bytes == raw, "raw bytes round trip");
     }
 
+    malformed_assets_checks();
     // encode / decode
     if (tok) {
         std::size_t total_tokens = 0;

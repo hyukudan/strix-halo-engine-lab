@@ -16,8 +16,8 @@ endif()
 add_test(NAME strix-pair-layercut-tests COMMAND strix-pair-layercut-tests)
 
 add_executable(strix-pair-layercut-pack-tests "${root}/tests/pair_layercut_pack_tests.cpp"
-    "${root}/src/cuda/models/minimax/mm_rtx_pack.cpp")
-target_include_directories(strix-pair-layercut-pack-tests PRIVATE "${root}/src")
+    "${root}/src/cuda/models/minimax/mm_rtx_pack.cpp" "${root}/src/serve/json.cpp")
+target_include_directories(strix-pair-layercut-pack-tests PRIVATE "${root}/src" "${root}/include")
 target_compile_features(strix-pair-layercut-pack-tests PRIVATE cxx_std_20)
 if(MSVC)
     target_compile_options(strix-pair-layercut-pack-tests PRIVATE /W4 /WX /EHsc /wd4996)
