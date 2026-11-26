@@ -37,7 +37,7 @@ def is_doc(path):
 
 
 def needs_hip(path):
-    if (path == HIP_WORKFLOW or path in HIP_TOOL_INPUTS
+    if (path == HIP_WORKFLOW or path in HIP_TOOL_INPUTS or path.startswith('data/devices/')
             or (path.startswith('tools/gen_') and path.endswith('_vopd.py'))):
         return True
     if path.startswith('lab/'):

@@ -39,7 +39,8 @@ class Classify(unittest.TestCase):
     def test_hip_inputs(self):
         for path in ('src/core/x.cpp', 'include/strix/a.hpp', 'CMakeLists.txt', 'cmake/StrixDevice.cmake',
                      'src/hip_shared_expert_launcher.hip', 'tests/hip_launcher_tests.cpp',
-                     'lab/uma_residency/hip_residency.hip', '.github/workflows/ci.yml', 'apps/x.cpp'):
+                     'lab/uma_residency/hip_residency.hip', '.github/workflows/ci.yml', 'apps/x.cpp',
+                     'data/devices/profiles.toml'):
             self.check([path], True, True)
 
     def test_non_hip_paths(self):
