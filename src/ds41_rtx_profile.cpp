@@ -1,6 +1,7 @@
 #include "strix/profiles/ds41_rtx.hpp"
 
 #include <cstdlib>
+#include <deque>
 #include <stdexcept>
 #include <vector>
 
@@ -326,16 +327,22 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
     for (std::size_t i = 0; i < table.size(); ++i)
         if (table[i].apps & unsigned(app)) selections[i] = select_of(table[i]);
     // The lower arm the ladder rows are bound to; a lever outside this app never runs (its builtin).
-    const auto arms = strix::profile::ladder_arms(table, inputs.ladder, inputs.regime,
-        [&](const Lever& lever, unsigned c) {
-            return strix::profile::column_admission(lever, c, allow_pending, strix::profile::model_preset());
-        },
-        [&](const Lever& lever) -> std::optional<std::string_view> {
-            if (!(lever.apps & unsigned(app))) return std::string_view(lever.builtin);
-            const auto& chosen = selections[static_cast<std::size_t>(&lever - table.data())].value;
-            if (chosen.source == strix::profile::DefaultSource::on) return std::nullopt;
-            return std::string_view(chosen.value);
-        }, allow_pending);
+    std::vector<strix::profile::LadderRow> ladder(inputs.ladder.begin(), inputs.ladder.end());
+    const auto build_arms = [&] {
+        return strix::profile::ladder_arms(table, std::span<const strix::profile::LadderRow>(ladder), inputs.regime,
+            [&](const Lever& lever, unsigned c) {
+                return strix::profile::column_admission(lever, c, allow_pending, strix::profile::model_preset());
+            },
+            [&](const Lever& lever) -> std::optional<std::string_view> {
+                if (!(lever.apps & unsigned(app))) return std::string_view(lever.builtin);
+                const auto& chosen = selections[static_cast<std::size_t>(&lever - table.data())].value;
+                if (chosen.source == strix::profile::DefaultSource::on) return std::nullopt;
+                return std::string_view(chosen.value);
+            }, allow_pending);
+    };
+    auto arms = build_arms();
+    std::deque<std::string> band_references;
+    strix::profile::settle_band_receipts(ladder, arms, band_references, build_arms);
     for (const auto& lever : table) {
         if (!(lever.apps & unsigned(app))) continue;
         Entry entry{&lever, {}, Status::profile, {}};
@@ -355,7 +362,7 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
                 return strix::profile::column_admission(lever, c, allow_pending, strix::profile::model_preset());
             };
             const auto admission = admit(column);
-            auto cell = strix::profile::select_profile_cell(lever, inputs.ladder, profile, inputs.regime, admit,
+            auto cell = strix::profile::select_profile_cell(lever, ladder, profile, inputs.regime, admit,
                                                             allow_pending, arms);
             entry.ladder = std::move(cell.route);
             entry.ladder_reference = std::move(cell.reference);

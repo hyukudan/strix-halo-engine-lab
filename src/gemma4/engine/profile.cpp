@@ -1,6 +1,7 @@
 #include "strix/profiles/gemma4.hpp"
 
 #include <cstdlib>
+#include <deque>
 #include <iostream>
 #include <stdexcept>
 
@@ -296,28 +297,30 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
     out.allow_pending = inputs.allow_pending || (allow && std::string_view(allow) == "1");
     // The lower arm the ladder rows are bound to: the explicit settings below run in every tier; a lever outside this
     // app never runs (its builtin).
-    const auto arms = strix::profile::ladder_arms(levers, std::span<const strix::profile::LadderRow>(ladder),
-        inputs.regime,
-        [&](const Lever& lever, unsigned c) {
-            return strix::profile::column_admission(lever, c, out.allow_pending, strix::profile::model_preset());
-        },
-        [&](const Lever& lever) -> std::optional<std::string_view> {
-            if (!(lever.apps & unsigned(app))) return std::string_view(lever.builtin);
-            const auto off = [&](std::string_view v) { return !lever.off.empty() && (v == lever.off || v == "off"); };
-            const auto* given = lookup(inputs.cli, lever.name);
-            const char* exported = lever.env.empty() ? nullptr : environment(inputs.env, std::string(lever.env).c_str());
-            if ((given && off(*given)) || (!given && exported && off(exported))) return std::string_view("off");
-            if (given) return std::string_view(*given);
-            if (exported && !lever.asset) return std::string_view(exported);
-            // An asset lever runs what discovery resolved, requested or not (dispatch below: the asset found, else the
-            // builtin): its arm spells that, never the column word, so a present and a missing asset are two keys. A
-            // discovered asset has no declared identity, so its arm spells no key and no timing receipt decides there.
-            if (lever.asset) {
-                const auto* asset = lookup(inputs.assets, lever.name);
-                return asset ? std::string_view(*asset) : std::string_view(lever.builtin);
-            }
-            return std::nullopt;
-        }, out.allow_pending);
+    const auto explicit_value = [&](const Lever& lever) -> std::optional<std::string_view> {
+        if (!(lever.apps & unsigned(app))) return std::string_view(lever.builtin);
+        const auto off = [&](std::string_view v) { return !lever.off.empty() && (v == lever.off || v == "off"); };
+        const auto* given = lookup(inputs.cli, lever.name);
+        const char* exported = lever.env.empty() ? nullptr : environment(inputs.env, std::string(lever.env).c_str());
+        if ((given && off(*given)) || (!given && exported && off(exported))) return std::string_view("off");
+        if (given) return std::string_view(*given);
+        if (exported && !lever.asset) return std::string_view(exported);
+        // An asset lever runs what discovery resolved. An undeclared asset identity cannot bind a timing receipt.
+        if (lever.asset) {
+            const auto* asset = lookup(inputs.assets, lever.name);
+            return asset ? std::string_view(*asset) : std::string_view(lever.builtin);
+        }
+        return std::nullopt;
+    };
+    const auto build_arms = [&] {
+        return strix::profile::ladder_arms(levers, std::span<const strix::profile::LadderRow>(ladder), inputs.regime,
+            [&](const Lever& lever, unsigned c) {
+                return strix::profile::column_admission(lever, c, out.allow_pending, strix::profile::model_preset());
+            }, explicit_value, out.allow_pending);
+    };
+    auto arms = build_arms();
+    std::deque<std::string> band_references;
+    strix::profile::settle_band_receipts(ladder, arms, band_references, build_arms);
     for (const auto& lever : levers) {
         if (!(lever.apps & unsigned(app))) continue;
         const auto column = strix::profile::value_column(lever, profile);
