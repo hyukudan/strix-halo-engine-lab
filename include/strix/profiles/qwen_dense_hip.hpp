@@ -106,7 +106,7 @@ inline constexpr std::string_view kTime24k = "qwen_night-tim-c2-24k(-exact) 24,5
 }
 // Lower edges (integration head 2019eacec5, bin 4f23e3450dd68600, one gfx1151 node, ABBA, warm ms, evicted 0): at 4 and
 // 16 tokens the window ties the EXACT windows (74.7 / 74.6 ms, 99.1 / 99.1 ms: no gain), from 64 it wins (282 -> 156 ms,
-// 256: 1,131 -> 385, 1,024: 4,663 -> 1,436), so the first band starts at its first winning point, 64. 2,049: 10,212 ->
+// 256: 1,122 -> 377, 1,024: 4,763 -> 1,463), so the first band starts at its first winning point, 64. 2,049: 10,212 ->
 // 3,024 ms; 4,096: 25,373 -> 6,290 ms; 8,193: 68,262 (one cold EXACT) -> 13,403 / 13,067 cold, so those edges hold.
 inline constexpr sp::LadderRow kBandRows[] = {
     band_row("wide_rows", "512", 1, 2048, kWide2k, kTime2k, {{64, 256, 1024, 2048}, {2048}, kGate2k, true, true}),
