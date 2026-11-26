@@ -130,7 +130,6 @@ constexpr LowBitArithmetic admitted_lowbit_arithmetic(LowBitArithmetic arithmeti
     return arithmetic == LowBitArithmetic::f16_folded_scale && !matrix.folded_scale_admitted
         ? LowBitArithmetic::f16_group_scale : arithmetic;
 }
-}
 
 constexpr bool lowbit_f16_form(LowBitArithmetic arithmetic) { return arithmetic != LowBitArithmetic::fp32_sweep; }
 constexpr unsigned lowbit_max_rows(LowBitArithmetic arithmetic) {
