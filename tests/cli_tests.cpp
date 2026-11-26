@@ -285,6 +285,10 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
                 "the Flash-Next HIP turbo preset emits --profile turbo");
         require(cuda.levers == Name::fast, "the Flash-Next turbo preset keeps FAST on other backends");
     }
+    const auto e4b = strix::model_description::load((data / "models/nemotron-3.5-bolt-e4b.toml").string());
+    const auto e4b_turbo = profile::resolve_model_preset(e4b, Name::turbo, "hip");
+    require(e4b_turbo.levers == Name::turbo, "E4B TURBO reaches the native TURBO resolver");
+
     const auto dense = strix::model_description::load((data / "models/qwen3.8-27b.toml").string());
     probes.host = Platform::windows_host;
     auto req = parse({"run", "--model", "qwen3.8-27b", "--backend", "cuda", "--profile=turbo",
