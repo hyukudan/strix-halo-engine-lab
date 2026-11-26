@@ -63,9 +63,12 @@ struct MiniServeOptions {
     // Resolved screened-head lever (mini_screened_head), the value the CLI and the gate read.
     bool screened_head = false;
     // Speculation (kMiniSpeculation, or an explicit --speculation off|auto): requested, and admitted (HIP: lanes draft
-    // from their context through one-lane verify windows while one lane is live; a CUDA server declines).
+    // from their context through one-lane verify windows while one lane is live; CUDA: lane_speculation).
     bool speculation_requested = false;
     bool speculation = false;
+    // CUDA: an admitted speculation runs the shared lone-lane speculator (CohortConfig::lane_speculation: the command
+    // line's speculator step while one lane is live, the model's DSpark sidecar on slot 0's taps).
+    bool lane_speculation = false;
     MiniSpeculationPolicy speculation_policy{};  // the resolved rule (mini_speculation_line)
 };
 

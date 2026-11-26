@@ -658,7 +658,19 @@ public:
 
     // Final-row scores of the last decode_slots() call, exactly as the greedy pick saw them (after the
     // output softcap). Lane `row` follows the slot order of that call. Valid until the next decode_slots().
-    [[nodiscard]] bool final_logits_supported() const { return draft_taps_.span().empty(); }
+    // With DSpark taps captured, lanes outside a cohort program step one at a time (each overwrites the score row), so
+    // several lanes' rows are readable only where every decode width runs a cohort program (CUDA, programs on: one
+    // forward per width; a lone lane keeps its own row).
+    [[nodiscard]] bool final_logits_supported() const {
+        if (draft_taps_.span().empty()) return true;
+#if !defined(__HIPCC__)
+        for (unsigned lanes = 2; lanes <= decode_rows_; ++lanes)
+            if (cohort_policy_.width(lanes, decode_rows_) == 0U) return false;
+        return true;
+#else
+        return false;
+#endif
+    }
     [[nodiscard]] std::uint32_t logit_width() const { return kOutputVocabulary; }
     // The last pick was screened and its score row waits for the first score read (materialize_scores): a greedy
     // caller that never reads scores never pays the full head projection.
@@ -699,6 +711,8 @@ public:
     // Every committed slot-0 row has its DSpark tap (taps captured and no slot-0 row decoded inside a cohort program
     // since the slot's sequence started): the model drafter's input is complete.
     [[nodiscard]] bool slot0_taps_complete() const noexcept { return !draft_taps_.span().empty() && !slot0_taps_stale_; }
+    // Sequences slot 0 has started (reset_slot(0)): a model drafter reading slot 0's taps restarts its context on a change.
+    [[nodiscard]] std::uint64_t slot0_sequence() const noexcept { return slot0_sequence_; }
 
     // EngineVerifyTarget binding. All replies are validated before exposing the
     // staged rows. A caller may also request the raw scores for every row.
@@ -959,7 +973,10 @@ private:
 #endif
 
     void reset_slot(unsigned slot) {
-        if (slot == 0U) slot0_taps_stale_ = false;  // a fresh sequence: its taps are written from row 0
+        if (slot == 0U) {  // a fresh sequence: its taps are written from row 0
+            slot0_taps_stale_ = false;
+            ++slot0_sequence_;
+        }
         // KV visibility is determined by the fresh frontier. No old row is read.
         slots_.at(slot)->reset([&](std::span<float> history) {
             mini_gpu::clear(history.data(), history.size_bytes(), stream_.get());
@@ -1585,6 +1602,7 @@ private:
     std::optional<Screen> screen_;
     PlainRowRoute plain_row_;  // set_plain_row_route: the speculator's one-row steps (empty: this decoder's decode)
     bool slot0_taps_stale_{false};  // a slot-0 row ran in a cohort program (no tap store) since the slot's reset
+    std::uint64_t slot0_sequence_{0};  // reset_slot(0) calls (slot0_sequence)
 #if !defined(__HIPCC__)
     bool window_programs_{false};  // set_window_programs: the owner decides (the CUDA CLI: on for the EXACT levers)
 #endif

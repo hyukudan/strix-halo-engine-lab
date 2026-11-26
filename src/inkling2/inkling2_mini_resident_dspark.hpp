@@ -87,6 +87,14 @@ public:
         controller_.start(anchor, position);
     }
 
+    // A served drafter outlives its requests: a new sequence on the target's slot 0 restarts the projected context (its
+    // rows are re-read from the new sequence's taps at the next forward). A failed session is not restarted.
+    void restart_sequence() noexcept {
+        context_.reset();
+        logged_tap_rows_ = 0U;
+    }
+    [[nodiscard]] bool failed() const noexcept { return failed_; }
+
     void draft(std::span<const std::uint32_t> prefix, std::uint32_t count, std::vector<std::uint32_t>& out) override {
         if (failed_) throw std::logic_error("invalid resident DSpark session");
         if (controller_.anchor_pos() > kMaxContext - D::block) {
