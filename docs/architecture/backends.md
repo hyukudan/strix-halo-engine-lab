@@ -82,11 +82,12 @@ above. Model adapters and complete-workload qualification remain pending.
 
 ## Experimental Intel, Vulkan and Metal backends
 
-- **Intel SYCL / Level Zero** provides operator references and a Gemma 4 E4B Q8_0
-  reference route in the dedicated `strix-gemma4-serve --backend intel` executable
-  when built with oneAPI. It uses host-managed model state, synchronous transfers
-  for operator inputs and results, and a resident cache for Q8_0 weights.
-  The route runs without a drafter and reports `PENDING-HARDWARE`.
+- **Intel SYCL / Level Zero** provides operator references and host-managed model
+  references when built with oneAPI. The dedicated Gemma 4 E4B Q8_0 decode and
+  serve executables offer `--backend intel` without a drafter. That path uses
+  synchronous transfers for operator inputs and results and a resident cache for
+  Q8_0 weights. The Hy4 reference CLI exposes a hybrid Intel projection path.
+  Both model references are pending hardware qualification.
 - **Vulkan and Metal** provide RMSNorm operator references. Each call stages the
   input and waits for completion. These backends have no model execution plan.
   The Vulkan adapter uses the Linux Vulkan loader.
