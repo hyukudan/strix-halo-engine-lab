@@ -32,7 +32,7 @@
 namespace strix::glm::serve {
 
 inline constexpr std::uint32_t kControlMagic = 0x434D4C47U;  // "GLMC" (little-endian bytes)
-inline constexpr std::uint32_t kControlVersion = 14;  // v14: a sampled MTP window may end at a stop id (kPairWindowStop decision); v13: the sampled MTP window decision carries the accepted-draft count (11 words; a v12 build exchanged 10); v12: embed frame summary before its bytes; v11: sampled MTP (kRunSample / kRunSampleDrafts on mtp_run / mtp_enter); v10: prefill embed frame (kPrefillEmbeds); v9: MTP prompt-end key = the prompt (plen == ppos); v8: prefill units (kPrefillUnits, budget = layer units); v7 paired prefix snapshots
+inline constexpr std::uint32_t kControlVersion = 15;  // v15: the idle heartbeat can retire posted GPU-direct receives
 inline constexpr std::uint32_t kPrefillMtp = 1U;   // prefill pflags: exact chunked MTP bootstrap (prefill_mtp)
 inline constexpr std::uint32_t kPrefillLast = 2U;  // prefill pflags: the prompt's last chunk (MTP: its seed is kept)
 // prefill pflags (with kPrefillMtp): a prefill_mtp session of layer units; `budget` = units to run (0: cancel it).
@@ -51,6 +51,7 @@ inline constexpr std::size_t kEmbedFrameMessage = std::size_t{1} << 19U;  // fir
 inline constexpr std::uint32_t kStepSample = 1U << 31;  // step pflags carries a sampled-row mask
 inline constexpr std::uint32_t kHelloSamplingVote = 1U;
 inline constexpr std::uint32_t kHelloTurboPrefillVote = 2U;
+inline constexpr std::uint32_t kHeartbeatQuiesce = 1U;  // heartbeat pflags: retire paired receives before going idle
 inline constexpr std::uint32_t kPrefillPending = 0xFFFFFFFEU;  // a prefill units call that did not complete the prompt
 inline constexpr std::uint32_t kMaxMtpCycles = 64;
 inline constexpr std::uint32_t kPrefixReply = 8U;     // prefix_prepare pflags: reply-end snapshot (default: prompt-end)
@@ -831,6 +832,11 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
             }
         }
         case Cmd::heartbeat:
+            if ((c.pflags & kHeartbeatQuiesce) != 0U) {
+                if constexpr (requires { eng.quiesce_idle(); }) eng.quiesce_idle();
+                else throw ProtocolError("control channel: idle transport quiesce unavailable");
+            }
+            return out;
         case Cmd::shutdown: return out;
         case Cmd::hello:
         case Cmd::reply: throw ProtocolError(std::string("control channel: unexpected ") + cmd_name(cmd));

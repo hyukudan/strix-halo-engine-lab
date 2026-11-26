@@ -12,6 +12,10 @@ void rejects(const std::string& text, strix::dist::TransportSpellings spellings)
 }
 int main() try {
     using namespace strix::dist;
+    require(resolve_device_route({}) == "table");
+    require(device_route_identity({}) == device_route_identity("table"));
+    require(device_route_identity("auto") != device_route_identity("table"));
+    require(device_route_identity("65536:host,inf:gpu:2") != device_route_identity("65536:host,inf:gpu:1"));
     // One dialect for every pair binary: both spellings of each USB4 kind, TCP endpoints and device lists.
     const auto dialect = pair_transport;
     for (const char* host : {"usb4auto", "usb4-auto"})

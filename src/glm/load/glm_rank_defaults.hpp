@@ -339,6 +339,20 @@ struct PrefillWork {
     bool routed_scratch = true;
 };
 
+// Rank runs its prompt loop serially. Serve calls this for a fresh whole prompt
+// with no decoding cohort. The reserved slot capacity is not a workload lane.
+inline PrefillWork single_lane_prefill(bool ready, std::uint64_t prompt, std::uint64_t capacity,
+                                       unsigned rows, unsigned generated, bool routed_scratch = true) {
+    return {ready, prompt, capacity, rows, 1U, generated, routed_scratch};
+}
+
+// Only the FAST band receipt applies to serve, including when TURBO inherits it.
+inline PrefillWork serve_prefill_work(bool pair_ready, bool fresh, std::uint64_t prompt, std::uint64_t capacity,
+                                      unsigned rows, unsigned generated, bool routed_scratch) {
+    return single_lane_prefill(pair_ready && fresh && prompt <= kPrefillProbePrompt,
+                               prompt, capacity, rows, generated, routed_scratch);
+}
+
 inline std::optional<strix::profile::Resolution> resolve_product(const Request& r, const EnvGet& env, bool baseline,
                                                                 const PrefillWork& work = {}) {
     const auto profile_env = [&](const char* key) -> const char* {

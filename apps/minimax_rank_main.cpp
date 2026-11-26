@@ -2005,9 +2005,9 @@ int main(int argc, char** argv) {
         // Host-path defaults (transport timeouts, prefill table ring): the one table both entry points apply
         // (mm_defaults host_defaults(); --print-effective-config prints the rows). An explicit value wins.
         strix::minimax::defaults::apply_host_defaults("rank");
-        const auto capabilities = strix::dist::parse_transport_capabilities(strix::xport::staging_env("STRIX_MM_USB4_CAPS"));
-        if (capabilities && std::string(argv[3]).rfind("usb4", 0) != 0)
-            throw std::invalid_argument("STRIX_MM_USB4_CAPS requires USB4 startup capability agreement");
+        const auto capabilities = strix::minimax::defaults::transport_capabilities(
+            argv[3], [](const char* key) { return std::getenv(key); });
+        const auto pair_model_identity = mm::Engine::pair_model_identity(opt.model_dir);
         auto opened = strix::dist::open_pair(argv[3], opt.rank, {std::chrono::seconds(180), capabilities});
         auto transport = std::move(opened.host);
         if (!opened.receipt.empty()) std::printf("transport: %s\n", opened.receipt.c_str());
@@ -2067,14 +2067,7 @@ int main(int argc, char** argv) {
         if (exchanger) eng.set_exchanger(exchanger.get(), xfer_env == nullptr || std::string(xfer_env) == "on");
         if (pfx) eng.set_prefill_exchanger(pfx.get(), pfx_on);
         const auto lr = eng.load();
-        // Shared route receipt: both ranks must have resolved the same numerical route before any product runs.
-        try {
-            const auto route_fp = strix::route::compare_ranks([&](const void* o, void* i, std::size_t n) { eng.exchange_bytes(o, i, n); });
-            std::printf("rank %u: route fingerprint %016llx agreed with the peer\n", opt.rank, static_cast<unsigned long long>(route_fp));
-        } catch (...) { eng.abort("route receipt: numerical-route fingerprint mismatch"); throw; }
-        try {  // FAST prefill profile rows (STRIX_MM_FAST_PREFILL and members): both ranks must resolve the same
-            strix::minimax::defaults::check_peer([&](const void* o, void* i, std::size_t n) { eng.exchange_bytes(o, i, n); });
-        } catch (...) { eng.abort("product profile: MiniMax FAST prefill profile differs between the ranks"); throw; }
+        eng.agree_pair(pair_model_identity, false);
         std::printf("rank %u: load %.1f s, %.1f GiB read (%s), device used %.1f GiB\n", opt.rank, lr.seconds, lr.gib_read,
                     lr.direct_io ? "O_DIRECT" : "buffered", lr.device_gib);
         std::fflush(stdout);

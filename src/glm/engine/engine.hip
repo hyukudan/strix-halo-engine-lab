@@ -1882,7 +1882,10 @@ struct Engine::Impl {
     void check_flag(const char* where) {
         unsigned f = 0;
         read_decisions({&f, 1U}, flag, "flag", "flag sync");
-        if (f) throw std::runtime_error(std::string("non-finite value (checkpoints C1-C5) at ") + where);
+        if (!f) return;
+        const std::string error = std::string("non-finite value (checkpoints C1-C5) at ") + where;
+        if (comm != nullptr) comm->cancel_pending(error);
+        throw std::runtime_error(error);
     }
 
     void read_decisions(std::span<std::uint32_t> out, const std::uint32_t* source, const char* operation, const char* fence) {

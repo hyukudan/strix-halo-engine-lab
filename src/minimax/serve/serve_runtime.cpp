@@ -30,15 +30,6 @@ double secs(Clock::time_point a, Clock::time_point b) { return std::chrono::dura
 // Signal storage outlives every Lead and transport; no monitor thread.
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop.store(true); }
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, std::string& receipt,
-    std::unique_ptr<strix::dist::DeviceExchange>& gpu_direct) {
-    // transport_capabilities 0 preserves the serving capability contract.
-    auto opened = strix::dist::open_pair(spec, rank, {std::chrono::seconds(300), 0});
-    gpu_direct = std::move(opened.direct);
-    receipt = std::move(opened.receipt);
-    return std::move(opened.host);
-}
-
 // The transport shared in turn by the communicator and the exchange module (as strix-minimax-rank).
 using Borrowed = strix::xport::BorrowedTransport<
     strix::xport::BorrowedAbort::forward, strix::xport::BorrowedState::base_default>;
@@ -88,8 +79,12 @@ public:
         strix::minimax::defaults::apply_host_defaults("serve");  // the one host-path table, serving column
         g_stop.store(false);
         std::signal(SIGINT,on_signal); std::signal(SIGTERM,on_signal);
-        std::string receipt;
-        transport = open_transport(transport_spec, opt.rank, receipt, gpu_direct);
+        const auto capabilities = strix::minimax::defaults::transport_capabilities(transport_spec, lookup);
+        const auto pair_model_identity = mm::Engine::pair_model_identity(opt.model_dir);
+        auto opened = strix::dist::open_pair(transport_spec, opt.rank, {std::chrono::seconds(300), capabilities});
+        transport = std::move(opened.host);
+        gpu_direct = std::move(opened.direct);
+        auto receipt = std::move(opened.receipt);
         if (deploy_spec) {
             const auto exchange = [&](auto out, auto in) { transport->exchange(out,in); };
             auto plan = strix::deploy::resolve_native_route(*deploy_spec,
@@ -104,7 +99,7 @@ public:
             deployment_plan = std::make_shared<const strix::deploy::Plan>(std::move(plan));
         }
         strix::dist::Group group;
-        group.transport_capabilities = 0;
+        group.transport_capabilities = capabilities;
         group.rank = opt.rank;
         group.world = 2;
         group.plan = 0x4d4d5331ULL;  // "MMS1"
@@ -142,18 +137,7 @@ public:
         phases.mark("weights");
         const std::uint32_t dspark_config = 0x4d4d0400U | (static_cast<std::uint32_t>(dspark_prior) << 7) | (static_cast<std::uint32_t>(dspark_mode) << 5) |
                                             (dspark_dir.empty() ? 0U : 16U) | dspark_inflight;
-        if (eng.peer(dspark_config) != dspark_config) {
-            eng.abort("DSpark startup mode / assets / protocol mismatch");
-            throw std::runtime_error("DSpark startup mode / assets / protocol mismatch");
-        }
-        // Shared route receipt: both ranks must have resolved the same numerical route before any product runs.
-        try {
-            const auto route_fp = strix::route::compare_ranks([&](const void* o, void* i, std::size_t n) { eng.exchange_bytes(o, i, n); });
-            std::printf("rank %u: route fingerprint %016llx agreed with the peer\n", opt.rank, static_cast<unsigned long long>(route_fp));
-        } catch (...) { eng.abort("route receipt: numerical-route fingerprint mismatch"); throw; }
-        try {  // FAST prefill profile rows (STRIX_MM_FAST_PREFILL and members): both ranks must resolve the same
-            strix::minimax::defaults::check_peer([&](const void* o, void* i, std::size_t n) { eng.exchange_bytes(o, i, n); });
-        } catch (...) { eng.abort("product profile: MiniMax FAST prefill profile differs between the ranks"); throw; }
+        eng.agree_pair(pair_model_identity, true, dspark_config);
         std::printf("rank %u: load %.1f s, device used %.1f GiB\n", opt.rank, lr.seconds, lr.device_gib);
         std::fflush(stdout);
         phases.mark("peer-agree");

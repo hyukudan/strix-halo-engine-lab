@@ -282,7 +282,9 @@ void actual_lead(Args a,const Prepare& prepare) {
     witness::queue=&queue;
     witness::peer=[](auto out,auto in){if(out.size()!=512)return;Control c;std::memcpy(&c,out.data(),offsetof(Control,extra_rows));
         if(c.command==static_cast<unsigned>(Command::import_state))witness::import_digest=c.pkey;
-        if(c.command==static_cast<unsigned>(Command::heartbeat)){c.pkey=witness::import_digest?witness::import_digest:1;std::memcpy(in.data(),&c,offsetof(Control,extra_rows));}};
+        if(c.command==static_cast<unsigned>(Command::heartbeat)){c.pkey=witness::import_digest?witness::import_digest:1;std::memcpy(in.data(),&c,offsetof(Control,extra_rows));}
+        // The echoed frame stands for rank 1: the Lockstep control rejects a peer that reports the same rank.
+        Control r;std::memcpy(&r,in.data(),offsetof(Control,extra_rows));r.rank=r.rank==0U?1U:0U;std::memcpy(in.data(),&r,offsetof(Control,extra_rows));};
     serve::ApiConfig config;config.model_id="host-ds41";config.default_max_tokens=3;
     config.sampling_policy="greedy";config.default_thinking=false;
     std::vector<std::string> words{"a","b","c","d","e","f","g","h","i","j","<eos>"};

@@ -192,6 +192,28 @@ void glm() {
     }, false);                                                                 // explicit off wins
     for (const char* profile : {"exact", "quality"})
         verify_profile(profile, {true, 8192, 36864, 8192, 1, 64}, none, false);
+    // Exercise the live entry points' work construction. A fresh served prompt
+    // has one active lane even when the server holds a multi-slot arena.
+    const std::vector<std::string> c1_args{"--world", "2", "--profile", "fast"};
+    const auto c1_rank = rd::scan(rd::serve_request_args(c1_args, true));
+    const auto c1_server = rd::scan(rd::serve_request_args({"--world", "2", "--profile", "fast", "--slots", "8"}, true));
+    const auto c1_cli_config = rd::resolve(c1_rank, none, complete);
+    const auto c1_serve_config = rd::resolve(c1_server, none, complete);
+    const auto cli_prompt = rd::single_lane_prefill(true, 8192, 16384, 8192, 64);
+    const auto serve_prompt = rd::serve_prefill_work(true, true, 8192, 16384, 8192, 64, true);
+    check(rd::select_prefill_wmma(c1_rank, c1_cli_config, none, cli_prompt) &&
+          rd::select_prefill_wmma(c1_server, c1_serve_config, none, serve_prompt),
+          "GLM live FAST selection matches for one CLI request and a fresh served request in an eight-slot arena");
+    for (const auto& declined : {rd::serve_prefill_work(false, true, 8192, 16384, 8192, 64, true),
+                                 rd::serve_prefill_work(true, false, 8192, 16384, 8192, 64, true),
+                                 rd::serve_prefill_work(true, true, 8192, 16384, 4096, 64, true)})
+        check(!rd::select_prefill_wmma(c1_server, c1_serve_config, none, declined),
+              "GLM serve declines the live FAST row without pair agreement, a fresh whole prompt and its measured chunk");
+    const auto c1_turbo = rd::scan(rd::serve_request_args({"--world", "2", "--profile", "turbo"}, true));
+    const auto c1_turbo_config = rd::resolve(c1_turbo, none, complete);
+    check(!rd::select_prefill_wmma(c1_turbo, c1_turbo_config, none,
+              rd::serve_prefill_work(true, true, 31258, 36864, 8192, 64, true)),
+          "GLM serve does not select the CLI-only 32K TURBO receipt");
     // Scratch storage (full arena vs routed) is spelled in the execution key: the band row binds either (the gate and
     // the FAST timing ran on the full arena), the TURBO literal key names routed scratch only.
     verify_profile("fast", {true, 8192, 8448, 8192, 1, 64, false}, none, true);
@@ -254,6 +276,23 @@ void minimax() {
         {"host.STRIX_MM_PF_TABLE_RING.serving_reason", "the reason line exists on the server only"},
     };
     gate("minimax", cli, server, allowed);
+    check(cli.at("transport_capabilities") == "0" && server.at("transport_capabilities") == "0",
+          "MiniMax's unqualified transport capabilities stay off by default for both entry points");
+    const md::Lookup caps = [](const char* key) -> const char* {
+        return std::string_view(key) == "STRIX_MM_USB4_CAPS" ? "streams,joint" : nullptr;
+    };
+    for (const auto* transport : {"usb4-auto", "usb4gpu", "usb4-gpu"}) {
+        const auto c = sp::from_lines(md::effective_config(md::parse_cli("rank", {"model", "0", transport, "out"}), caps));
+        const auto s = sp::from_lines(md::effective_config(md::parse_cli("serve", {"model", "--transport", transport}), caps));
+        check(c.at("transport_capabilities") == "3" && s.at("transport_capabilities") == "3",
+              "MiniMax rank and serve publish the same explicit USB4 capability mask");
+    }
+    for (const auto* transport : {"usb4:/dev/stream", "tcp-listen:3000"}) {
+        bool refused = false;
+        try { (void)md::transport_capabilities(transport, caps); }
+        catch (const std::invalid_argument&) { refused = true; }
+        check(refused, "MiniMax capabilities require a transport with startup capability agreement");
+    }
     // FAST prefill profile rows (mm_profile_table.hpp): every row is printed by both entry points and resolves the
     // same with the bundle on, with an explicit OFF beating it, and on the FAST_I4 format (member not selected); the
     // same through the product word alone (STRIX_MM_PRODUCT_PROFILE=fast, as print_or_apply exports '--profile fast').

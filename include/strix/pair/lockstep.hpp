@@ -23,7 +23,7 @@ struct LockstepHeader {
     std::uint32_t rank = 0;
 };
 
-// The round part alone, for a wire format with no room for ack_round / rank (DeepSeek 4.1's full 512-byte block).
+// Check the round first, so sequence mismatches are named before the acknowledgement and rank checks.
 inline void check_round(std::uint64_t mine, std::uint64_t peer) {
     if (peer != mine)
         throw ProtocolError("control channel: duplicate / stale round " + std::to_string(peer) + ", expected " +

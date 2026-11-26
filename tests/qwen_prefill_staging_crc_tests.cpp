@@ -21,6 +21,20 @@ namespace {
 void require(bool condition) {
     if (!condition) throw std::runtime_error("PP seam publication assertion failed");
 }
+void state_slots() {
+    auto staging = strix::qwen_pp::make_hip_state_staging();
+    const auto first = staging->buffer(0);
+    const auto second = staging->buffer(1);
+    require(first.size() == strix::qwen_pp::seam_piece_bytes && second.size() == first.size());
+    std::array<std::byte, 23> source{}, restored{};
+    for (std::size_t i = 0; i < source.size(); ++i) source[i] = static_cast<std::byte>(i + 1U);
+    auto tail = second.last(source.size());
+    staging->copy_device(true, source.data(), first.first(source.size()));
+    staging->copy_device(true, source.data(), tail);
+    std::fill(first.begin(), first.begin() + static_cast<std::ptrdiff_t>(source.size()), std::byte{0});
+    staging->copy_device(false, restored.data(), tail);
+    require(restored == source);
+}
 void crc_allocation_checks() {
     using namespace strix::qwen_pp;
     const auto before = strix::xport::crc_allocations;
@@ -123,6 +137,7 @@ void strided_rows() {
 }
 int main() {
     try {
+        state_slots();
         crc_allocation_checks();
         const auto before = stress(true);
         const auto after = stress(false);

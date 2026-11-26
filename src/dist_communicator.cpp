@@ -4,6 +4,7 @@
 #include "strix/pinned_host.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/dist/host_copy.hpp"
+#include "strix/dist/transport_spec.hpp"
 #include "dist_crc32c_parallel.hpp"
 #include "dist_crc32c_vector.hpp"
 #include "dist_latency_trace.hpp"
@@ -2087,8 +2088,7 @@ std::vector<Route> parse_routes(const std::string& text) {
 // Measures every candidate (host path, direct on 1..rings rings) at a grid of sizes, both ranks in the same order;
 // rank 0 picks the fastest p50 per size and both apply its table.
 void Communicator::configure_routes() {
-    const char* env = std::getenv("STRIX_DIST_ROUTE");
-    const std::string mode = env && *env ? env : "table";
+    const std::string mode(configured_device_route());
     const bool host_allowed = transport_->name().rfind("tcp", 0) != 0;
     if (mode == "table") {
         // The measured defaults (2026-10-21, poll kernel). With host streams (mixed layout, e.g. data0 host + data1

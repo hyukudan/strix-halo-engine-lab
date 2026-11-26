@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/file_snapshot.hpp"
+#include "strix/model_runtime_binding.hpp"
 // MiniMax M3.1 Flash engine, TP2 over the pair (fork of the DeepSeek V4.1 TP2 engine; see qualification notes).
 // Rank r holds q heads 32r..32r+31, KV / index-q heads {2r, 2r+1}, half of every MLP intermediate (dense, shared, all 128
 // experts), and its vocabulary half of the head; router, index key and embedding are replicated. Per layer two exchanges
@@ -156,6 +157,9 @@ public:
     [[nodiscard]] std::vector<float> last_logits(std::size_t rows) const;
     // Control channel: `bytes` (1..65536) of host memory sent, the peer's `bytes` received (both ranks, same size).
     void exchange_bytes(const void* out, void* in, std::size_t bytes);
+    // Hash weights before loading them into UMA. The startup exchange follows local admission.
+    [[nodiscard]] static ModelContentIdentity pair_model_identity(const std::string& model_dir);
+    void agree_pair(const ModelContentIdentity& model, bool serving, std::uint32_t draft_protocol = 0);
     void abort(const std::string& reason);
     // Data channel for device buffers of any size (both ranks, same size): `local` (ordered after its producer on
     // `stream`) to the peer, the peer's bytes into `remote` (enqueued on `stream`). One control-tagged comm.exchange.
