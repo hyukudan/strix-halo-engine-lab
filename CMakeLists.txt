@@ -1574,6 +1574,7 @@ if(BUILD_TESTING)
     add_executable(strix-ernie-host-tests tests/ernie_host_tests.cpp)
     target_link_libraries(strix-ernie-host-tests PRIVATE strix_ernie_inventory strix_model_description)
     strix_target_warnings(strix-ernie-host-tests)
+    target_include_directories(strix-ernie-host-tests PRIVATE src)
     add_test(NAME strix-ernie-host-tests COMMAND strix-ernie-host-tests
         "${CMAKE_CURRENT_SOURCE_DIR}/models/ernie-5.5-flash-preview.toml")
     set_tests_properties(strix-ernie-host-tests PROPERTIES LABELS "cpu;model" TIMEOUT 30)
@@ -2193,10 +2194,14 @@ if(BUILD_TESTING)
     add_executable(strix-serve-ernie-chat-tests tests/serve_ernie_chat_tests.cpp)
     target_link_libraries(strix-serve-ernie-chat-tests PRIVATE strix_serve)
     strix_target_warnings(strix-serve-ernie-chat-tests)
+    if(MSVC)
+        target_compile_options(strix-serve-ernie-chat-tests PRIVATE /utf-8)
+    endif()
     set(STRIX_ERNIE_TOKENIZER_JSON "" CACHE FILEPATH "Optional official ERNIE tokenizer.json for host asset checks")
     add_test(NAME strix-serve-ernie-chat-tests COMMAND strix-serve-ernie-chat-tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/serve/ernie_chat_cases.json
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/serve/ernie_synthetic_byte_bpe.json
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/serve/ernie_prompt_ids.json
         ${STRIX_ERNIE_TOKENIZER_JSON})
     add_executable(strix-serve-tool-choice-none-tests tests/serve_tool_choice_none_tests.cpp)
     target_link_libraries(strix-serve-tool-choice-none-tests PRIVATE strix_serve)

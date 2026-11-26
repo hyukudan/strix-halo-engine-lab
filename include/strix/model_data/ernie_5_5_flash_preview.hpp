@@ -74,9 +74,14 @@ inline constexpr std::int64_t n_kv_heads = 1;
 inline constexpr std::int64_t vocab = 201216;
 } // namespace dims
 namespace drafter {
+inline constexpr std::string_view attention_kind = "uncompressed";
 inline constexpr std::int64_t block = 7;
+inline constexpr std::int64_t confidence_input = 4352;
+inline constexpr std::int64_t feature_projection[] = {4096, 12288};
 inline constexpr std::string_view kind = "block";
+inline constexpr std::int64_t layers = 3;
 inline constexpr std::int64_t rank = 256;
+inline constexpr bool shared_lm_head = true;
 inline constexpr std::int64_t taps[] = {40, 41, 42};
 } // namespace drafter
 namespace extras {
@@ -122,6 +127,7 @@ inline constexpr std::string_view schema = "strix-model/v1";
 namespace tokens {
 inline constexpr std::int64_t bos_token_id = 1;
 inline constexpr std::int64_t eos_token_id = 2;
+inline constexpr std::int64_t generation_eos_ids[] = {2, 8};
 inline constexpr std::int64_t pad_token_id = 0;
 } // namespace tokens
 namespace weights {
