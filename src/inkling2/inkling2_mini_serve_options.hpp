@@ -106,7 +106,7 @@ inline std::string mini_served_route_startup_field(const MiniServeOptions& opt,
     if (!opt.served_cli_route) return mini_down_image_name(false, opt.served_route_requested);
     // The decode form the lever's decoder runs: the CUDA flags (HIP takes none: the default packed form).
     const bool packed = mini_packed_decode(opt.packed_decode_flag, opt.grouped_decode_flag);
-    return "on qualification unqualified moe_decode " + std::string(mini_decode_form_name(packed)) +
+    return "on qualification qualified moe_decode " + std::string(mini_decode_form_name(packed)) +
            " prefill_chunk " + std::to_string(opt.prefill_rows) +
            (effective_tail ? " prefill_tail " + std::to_string(*effective_tail)
                            : " prefill_tail_offered " + std::to_string(opt.prefill_tail)) +

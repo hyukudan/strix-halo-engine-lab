@@ -594,12 +594,14 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         // The served prefill resolves the down-image lever like the CLI and the gate do: off unless selected explicitly.
         require(options.combine_image == image, "down-image selection did not reach native adapter");
         require(options.controller_one_plane == controller_one_plane, "controller plane value did not reach native adapter");
-        // The served route lever (opt-in in every profile column): a server of either backend runs the command line's
-        // route only when STRIX_INK_SERVED_CLI_ROUTE=1 selects it.
+        // The served route lever (selected by every profile column): a CUDA server runs the command line's route unless
+        // STRIX_INK_SERVED_CLI_ROUTE=0; a HIP server only when STRIX_INK_SERVED_CLI_ROUTE=1 selects it explicitly.
         const bool hip_backend = std::string_view(backend) == "hip";
-        const bool route = cli_route;
-        require(options.served_route_requested == cli_route && options.served_cli_route == route,
-                "served route lever: opt-in, admitted on both backends");
+        const char* route_env = std::getenv("STRIX_INK_SERVED_CLI_ROUTE");
+        const bool explicit_off = route_env != nullptr && std::string_view(route_env) == "0";
+        const bool route = cli_route || (!hip_backend && !explicit_off);
+        require(options.served_route_requested == route && options.served_cli_route == route,
+                "served route lever: CUDA default on (explicit 0 off), HIP explicit 1 only");
         const auto field = mini::mini_served_route_startup_field(options);
         // Without a decoder the tail is the offered capacity; the startup line prints what the decoder admitted.
         require(!route || (field.find(" prefill_tail_offered " + std::to_string(options.prefill_tail) + ' ') != std::string::npos &&
@@ -610,12 +612,11 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             auto grouped = options;
             grouped.grouped_decode_flag = true;
             require(mini::mini_served_route_startup_field(grouped).starts_with(
-                        "on qualification unqualified moe_decode grouped "),
+                        "on qualification qualified moe_decode grouped "),
                     "served route receipt: a CUDA --grouped-decode lever decoder is named grouped");
         }
-        require(route ? field.starts_with("on qualification unqualified moe_decode packed ")
-                      : field == (cli_route ? "declined" : "off"),
-                "served route receipt: off, declined or on with its qualification");
+        require(route ? field.starts_with("on qualification qualified moe_decode packed ") : field == "off",
+                "served route receipt: off or on with its qualification");
         const unsigned context = shape.context.value_or(8192U);
         require(options.context == context && options.slots == shape.slots.value_or(0U), "served shape options");
         if (!route) {
@@ -902,13 +903,15 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                      (weights->find("storage")->as_string() == (qualify_q8 ? "gguf.q8_0" : "plain.bf16") &&
                       weights->find("status")->as_string() == (qualify_q8 ? "unqualified" : "pending"))),
                     "Inkling capability response does not match the loaded plan");
-            // The served route lever: absent without a request (the incumbent capabilities), else requested / admitted
-            // (both backends) / qualification of the admitted route.
+            // The served route lever: absent without a request (the held-back route), else requested / admitted /
+            // qualification of the admitted route. CUDA requests the column (on unless an explicit 0), HIP an explicit 1.
             const auto* route = effective.find("served_route");
-            const bool admitted = cli_route;
-            require((route != nullptr) == cli_route &&
+            const char* route_env = std::getenv("STRIX_INK_SERVED_CLI_ROUTE");
+            const bool explicit_off = route_env != nullptr && std::string_view(route_env) == "0";
+            const bool admitted = cli_route || (std::string_view(backend) != "hip" && !explicit_off);
+            require((route != nullptr) == admitted &&
                         (!route || (route->find("requested")->as_bool() && route->find("admitted")->as_bool() == admitted &&
-                                    route->find("qualification")->as_string() == (admitted ? "unqualified" : "n/a"))),
+                                    route->find("qualification")->as_string() == (admitted ? "qualified" : "n/a"))),
                     "Inkling capability response misreports the served route lever");
             const auto* sampling = effective.find("sampling");
             const auto* temperature = sampling ? sampling->find("positive_temperature") : nullptr;
@@ -1064,8 +1067,8 @@ int main(int argc, char** argv) try {
     set_image_env("0");
     wiring(argv[1], "hip", false);
     set_image_env(nullptr);
-    // The served route lever: off by default in every tier (above); STRIX_INK_SERVED_CLI_ROUTE=1 selects the command
-    // line's route on either backend in any tier; an explicit 0 keeps it off.
+    // The served route lever: on by default on CUDA in every tier (above), HIP only with an explicit 1; an explicit 0
+    // keeps the held-back route on both.
     set_cli_route_env("1");
     for (const auto* backend : {"hip", "cuda"})
         for (const auto* tier : {"exact", "fast", "turbo"})
@@ -1074,6 +1077,11 @@ int main(int argc, char** argv) try {
                 wiring(argv[1], backend, false, false, W4a4::bf16, tier, false, false, true, shape);
     set_cli_route_env("0");
     wiring(argv[1], "hip", false);
+    // An explicit 0: the held-back shape (CUDA: the chunk ladder and its long pieces) on both backends.
+    for (const auto* backend : {"hip", "cuda"})
+        for (const ServedShape shape : {ServedShape{}, ServedShape{{}, 15U, {}}, ServedShape{8192U, 15U, {}},
+                                        ServedShape{32U, {}, {}}, ServedShape{{}, {}, 9U}})
+            wiring(argv[1], backend, false, false, W4a4::bf16, "exact", false, false, false, shape);
     set_cli_route_env(nullptr);
     // The projected-bias lever per tier (default on after its RTX identity receipts): unset and 1 select the projected
     // flash, an explicit 0 keeps the image route;

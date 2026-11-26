@@ -387,14 +387,24 @@ inline std::vector<std::uint32_t> mini_served_draft_by_live() {
     return rows;
 }
 
-// Resolved state of the served route lever (true: a HIP server runs the command line's route, kMiniServedCliRoute).
-// 0 or absent = off: the served incumbent route. Read (and validated) by the server only: the command line always runs
+// Resolved value of the served route lever (true: the server runs the command line's route, kMiniServedCliRoute).
+// 0 or absent = off: the held-back served route. Read (and validated) by the server only: the command line always runs
 // its own route and reports the lever as not applicable (mini_served_route_cli_line).
 inline bool mini_served_cli_route(const profile::Resolution& tier) {
     const auto* entry = tier.find(kMiniServedCliRoute);
     if (entry == nullptr || entry->value == "0") return false;
     if (entry->value == "1") return true;
     throw std::invalid_argument("STRIX_INK_SERVED_CLI_ROUTE must be 0 or 1");
+}
+
+// The served route a server of the backend requests: CUDA the resolved value (the profile columns select it); HIP only an
+// explicit setting (STRIX_INK_SERVED_CLI_ROUTE=1), so a HIP server keeps the held-back route by default until the
+// route's per-slot working memory on HIP (the command line's chunk instead of the 128-row held-back chunk) is decided.
+inline bool mini_served_route_request(const profile::Resolution& tier, bool hip) {
+    if (!mini_served_cli_route(tier)) return false;
+    if (!hip) return true;
+    const auto* entry = tier.find(kMiniServedCliRoute);
+    return entry->status == profile::Status::explicit_env || entry->status == profile::Status::explicit_cli;
 }
 
 // The command line's receipt of the served route lever: the requested value as the resolution holds it (unparsed, so a
