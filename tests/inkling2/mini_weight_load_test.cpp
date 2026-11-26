@@ -427,6 +427,7 @@ void test_lowbit_receipts() {
     fast.policy = mini::kMiniFastWeightPolicy.id;
     fast.gate_v2_pass = digest(3);
     fast.evidence.tier = profile::Name::fast;
+    fast.evidence.speedup = 1.2;  // synthetic gain: the real row states a current receipt that is not one
     fast.turbo_quality = {};
     const auto fixture = std::span(&fast, 1U);
     const auto fast_pick = [&](weight::WeightLoadScope scope, weight::WeightLoadExtent shape) {
