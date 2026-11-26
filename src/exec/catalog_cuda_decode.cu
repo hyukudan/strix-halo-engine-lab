@@ -240,6 +240,11 @@ cudaError_t enqueue(const Bf16RelativeProjection16& a, cudaStream_t stream) {
         transforms::ShortBf16Projection<16>{a.input, a.weights, a.output, a.relative_extent}, stream);
 }
 
+cudaError_t enqueue(const Bf16SliceAtRow& a, cudaStream_t stream) {
+    return transforms::elements(a.elements,
+        transforms::StoreBf16SliceAtRow{a.input, a.output, a.width, a.stride, a.first_row}, stream);
+}
+
 cudaError_t enqueue(const cuda::MmaGroupTable& a, cudaStream_t stream) {
     return cuda::dense_bf16_mma3_r1(a, stream);
 }
@@ -362,6 +367,7 @@ constexpr LauncherRef round_bf16{"strix::core::pointwise::elements", "src/core/p
 constexpr LauncherRef sigmoid{"strix::core::pointwise::elements", "src/core/pointwise.hpp", "bf16_sigmoid_product", 1};
 constexpr LauncherRef softcap{"strix::core::pointwise::elements", "src/core/pointwise.hpp", "bf16_softcap", 1};
 constexpr LauncherRef relative{"strix::core::pointwise::elements", "src/core/row_transforms.hpp", "relative_bf16_d16", 1};
+constexpr LauncherRef slice_at_row{"strix::core::pointwise::elements", "src/core/row_transforms.hpp", "bf16_slice_at_row", 1};
 constexpr LauncherRef independent{"strix::cuda_core::dense_bf16_mma3_r1",
     "src/cuda/core/dense/dense_mma.cu", "mma3_independent", 1};
 constexpr LauncherRef dense_fp32{"strix::cuda_core::dense_rows_multi", "src/cuda/core/dense/dense.cu", "fp32", 1};
@@ -468,7 +474,7 @@ enum Leaf { embed, rms_bf16, kv_store, flash, finite_check, conv, head_clip, ban
             linear_fp32_round, linear_fp32_softcap, conv_round, linear_independent, bank_mix_tiled, linear_mma3_split,
             gate_up_pipe_nvfp4, gate_up_pipe_mxfp8, down_pipe_nvfp4, down_pipe_mxfp8, screened_prep, screened_pass1,
             screened_compact, screened_pass2, screened_pick, screened_pick_rows, down_tail_nvfp4,
-            down_tail_mxfp8, bank_batch, transition, flash_split, flash_split_host };
+            down_tail_mxfp8, bank_batch, transition, flash_split, flash_split_host, slice_store };
 constexpr KernelEntry catalogue[] = {
     [] {
         auto instance = embedding;
@@ -571,8 +577,10 @@ constexpr KernelEntry catalogue[] = {
         instance.exact = lever::Exactness::bit_changing;
         return instance;
     }(),
+    entry<Bf16SliceAtRow>(graph::Op::elementwise, "bf16.store.slice_at_row", {}, "cuda-sm120-pointwise-bf16-slice-at-row-v1",
+        slice_at_row),
 };
-static_assert(std::size(catalogue) == flash_split_host + 1U, "decode catalogue order follows Leaf");
+static_assert(std::size(catalogue) == slice_store + 1U, "decode catalogue order follows Leaf");
 
 template <class Args>
 KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite& site = {}) {
@@ -630,6 +638,7 @@ KernelBinding bind_leaf(Leaf leaf, Grid grid, const Args& args, const LaunchSite
     case screened_compact:
     case screened_pick:
     case screened_pick_rows:
+    case slice_store:
         bound.pdl = {PdlWait::absent, PdlOptOut::kernel_without_wait};
         break;
     case screened_pass2:  // the mapped rows body waits first, but the stage keeps completion edges (plain launch)
@@ -799,6 +808,12 @@ KernelBinding bind(const Bf16RelativeProjection16& a) {
     if (a.relative_extent == 0 || a.heads > std::numeric_limits<std::size_t>::max() / a.relative_extent)
         throw std::invalid_argument("invalid CUDA R1 relative projection");
     return bind_leaf(relative_d16, pointwise_grid(std::size_t{a.heads} * a.relative_extent), a);
+}
+
+KernelBinding bind(const Bf16SliceAtRow& a) {
+    if (!a.input || !a.output || !a.first_row || a.width == 0U || a.stride < a.width || a.elements % a.width != 0U)
+        throw std::invalid_argument("invalid CUDA R1 BF16 slice store");
+    return bind_leaf(slice_store, pointwise_grid(a.elements), a);
 }
 
 KernelBinding bind(const Bf16DenseGroup& a) {

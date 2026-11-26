@@ -130,6 +130,17 @@ struct Bf16RelativeProjection16 {
     unsigned heads, relative_extent;
 };
 
+// BF16 store of `elements` FP32 values into rows of a plane at a device-read first row (core::row_transforms::
+// StoreBf16SliceAtRow): output row *first_row + i / width, column i % width, row stride `stride`. A captured step
+// replays it at the step descriptor's position (e.g. a drafter's tap rows), the bytes of the eager StoreBf16Slice.
+struct Bf16SliceAtRow {
+    const float* input;
+    std::uint16_t* output;
+    std::size_t elements;
+    unsigned width, stride;
+    const std::uint32_t* first_row;
+};
+
 enum class Bf16DenseMode { fp32, mma3, mma3_round };
 
 // A homogeneous group that emits one native launch. The caller preserves the
@@ -287,6 +298,7 @@ struct ScreenedHeadPickRows {
 [[nodiscard]] KernelBinding bind(const Bf16SigmoidProduct&);
 [[nodiscard]] KernelBinding bind(const Bf16Softcap&);
 [[nodiscard]] KernelBinding bind(const Bf16RelativeProjection16&);
+[[nodiscard]] KernelBinding bind(const Bf16SliceAtRow&);
 [[nodiscard]] KernelBinding bind(const Bf16DenseGroup&);
 // Validate all independent operands and build all owned leaves before the caller emits any of them.
 [[nodiscard]] std::vector<KernelBinding> bind_projection_batch(const core::Bf16ProjectionBatch&, const device::Profile&);
