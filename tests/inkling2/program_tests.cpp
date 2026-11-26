@@ -235,7 +235,20 @@ exec::KernelBinding bind_physical_fixture(const A& a) {
         return wave;
     } else {
 #if defined(STRIX_INKLING2_TEST_CUDA_BINDINGS)
-        return decode::bind(a);
+        // The routed gate-up binder (bind_routed_gate_up) is a CUDA-compiled template with no catalogue bind(); the
+        // host test records the identity and geometry it binds for the Inkling route.
+        if constexpr (std::is_same_v<A, RoutedPackedGateUp>) {
+            exec::KernelBinding routed;
+            routed.fn = unexecuted_binding;
+            routed.identity = routed.exact_identity = routed_gate_up_identity(a.format, "mini-route");
+            routed.grid = grid(r1_geometry::gate_blocks(a.args.intermediate, r1_geometry::kCudaGeometry.gate_columns),
+                               256U, 8U);
+            const auto bytes = std::as_bytes(std::span(&a, 1U));
+            routed.args.assign(bytes.begin(), bytes.end());
+            return routed;
+        } else {
+            return decode::bind(a);
+        }
 #else
         auto describe = [&]() -> std::pair<std::string_view, exec::Grid> {
             const auto pointwise = [](std::size_t n) { return grid(static_cast<unsigned>((n + 255U) / 256U)); };
