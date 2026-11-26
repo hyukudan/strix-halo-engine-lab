@@ -1,5 +1,6 @@
 #pragma once
 
+#include "native_launch_contract.hpp"
 #include "executor_cuda.hpp"
 
 #include <algorithm>
@@ -12,6 +13,17 @@ namespace strix::exec::cuda_detail {
 enum class GraphAction { eager, capture, rebind, replay };
 
 inline const CudaProgramBinding empty_binding{};
+
+inline bool strict_capture(const Program& program, const CudaProgramBinding& binding, bool check_all) {
+    return check_all || binding.readback == CudaReadback::resident ||
+        (!program.launches.empty() && program.launches.front().chain_identity.starts_with(detail::cuda_capture_recipe));
+}
+
+inline void validate_capture_grid(const Grid& observed, const BoundLaunch& launch) {
+    if (observed != launch.grid)
+        throw std::runtime_error("captured CUDA geometry differs from bound grid: " + launch.identity);
+}
+
 
 inline void validate_step_width(const ProgramKey& key) {
     if ((key.phase == Phase::decode || key.phase == Phase::verify) && !session::is_step_replay_width(key.rows))

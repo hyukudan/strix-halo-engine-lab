@@ -168,19 +168,12 @@ cudaGraphNode_t captured_node(cudaStream_t stream, cudaGraphNodeType expected_ty
     return node;
 }
 
-bool requires_capture(const Program& program) {
-    return !program.launches.empty() &&
-        program.launches.front().chain_identity.starts_with(detail::cuda_capture_recipe);
-}
-
 void validate_capture_grid(cudaGraphNode_t node, const BoundLaunch& launch) {
     cudaKernelNodeParams parameters{};
     native::check(cudaGraphKernelNodeGetParams(node, &parameters), "query bound CUDA launch geometry");
-    const std::array blocks{parameters.gridDim.x, parameters.gridDim.y, parameters.gridDim.z};
-    const std::array threads{parameters.blockDim.x, parameters.blockDim.y, parameters.blockDim.z};
-    if (blocks != launch.grid.blocks || threads != launch.grid.threads ||
-        parameters.sharedMemBytes != launch.grid.shared_bytes)
-        throw std::runtime_error("captured CUDA geometry differs from bound grid: " + launch.identity);
+    cuda_detail::validate_capture_grid({{parameters.gridDim.x, parameters.gridDim.y, parameters.gridDim.z},
+                                        {parameters.blockDim.x, parameters.blockDim.y, parameters.blockDim.z},
+                                        parameters.sharedMemBytes}, launch);
 }
 
 void capture_bound(const Program& program, std::span<const CudaNodeBinding> plan, cudaStream_t stream,
@@ -301,7 +294,12 @@ struct CudaExecutor::Impl {
         }
 
         const auto plan = cuda_detail::capture_plan(program, binding, pdl);
-        const bool strict = binding.readback == CudaReadback::resident || requires_capture(program);
+#if !defined(NDEBUG) || defined(STRIX_EXEC_VALIDATE_CAPTURE)
+        constexpr bool check_all = true;
+#else
+        constexpr bool check_all = false;
+#endif
+        const bool strict = cuda_detail::strict_capture(program, binding, check_all);
         const bool native_chain = !pdl && binding.readback == CudaReadback::resident &&
                                   cuda_detail::is_completion_chain(plan);
         ++cached.stats.captures;
@@ -320,7 +318,12 @@ struct CudaExecutor::Impl {
                 return cudaGraphGetNodes(graph, nullptr, &count) == cudaSuccess && count == program.launches.size();
             });
         if (!installed) {
-            if (capture_error && strict) std::rethrow_exception(capture_error);
+            if (strict && (capture_error || check_all)) {
+                // A second call must observe the same failure, even for optional graphs.
+                cached.binding = {};
+                if (capture_error) std::rethrow_exception(capture_error);
+                throw std::runtime_error("strict CUDA program capture failed");
+            }
             return nullptr;
         }
 

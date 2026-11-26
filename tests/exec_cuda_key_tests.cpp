@@ -1,4 +1,5 @@
 #include "executor_cuda.hpp"
+#include "strix/device/decode_geometry.hpp"
 #include "executor_cuda_binding.hpp"
 
 #include <array>
@@ -71,6 +72,51 @@ void test_invalidation() {
     require(binding.select(changed, 5) == GraphAction::capture, "layout invalidation permits another attempt");
     changed.key.tap = true;
     require(binding.select(changed, 5) == GraphAction::eager, "a tap must stay eager");
+}
+
+void test_strict_capture() {
+    Program program{};
+    program.launches.resize(1);
+    for (auto policy : {CudaReadback::executor, CudaReadback::bound, CudaReadback::resident}) {
+        CudaProgramBinding binding{};
+        binding.readback = policy;
+        for (auto phase : {Phase::decode, Phase::verify, Phase::prefill, Phase::draft}) {
+            program.key.phase = phase;
+            require(cuda_detail::strict_capture(program, binding, true), "debug capture must check every readback");
+            require(cuda_detail::strict_capture(program, binding, false) == (policy == CudaReadback::resident),
+                    "release capture policy differs");
+        }
+    }
+    program.launches.front().chain_identity = detail::cuda_capture_recipe;
+    require(cuda_detail::strict_capture(program, {}, false), "tagged recipes must check their captured nodes");
+    auto& launch = program.launches.front();
+    launch.identity = "screened pass 1";
+    launch.grid = {{1128, 1, 1}, {32, 1, 1}, 9216};
+    const auto observed = launch.grid;
+    cuda_detail::validate_capture_grid(observed, launch);
+    const auto rejects = [&](const Grid& stale) {
+        launch.grid = stale;
+        try {
+            cuda_detail::validate_capture_grid(observed, launch);
+        } catch (const std::runtime_error&) {
+            return true;
+        }
+        return false;
+    };
+    auto stale = observed;
+    stale.blocks[0] = 1504;
+    require(rejects(stale), "old screened grid accepted");
+    for (unsigned axis = 0; axis < 3; ++axis) {
+        stale = observed;
+        ++stale.blocks[axis];
+        require(rejects(stale), "incorrect grid axis accepted");
+        stale = observed;
+        ++stale.threads[axis];
+        require(rejects(stale), "incorrect block axis accepted");
+    }
+    stale = observed;
+    ++stale.shared_bytes;
+    require(rejects(stale), "incorrect dynamic shared memory accepted");
 }
 
 void test_node_plan() {
@@ -162,6 +208,7 @@ int main() {
         test_keys();
         test_invalidation();
         test_node_plan();
+        test_strict_capture();
         test_descriptor_projection();
         std::puts("exec_cuda_keys PASS");
         return 0;
