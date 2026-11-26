@@ -2302,6 +2302,12 @@ struct Engine::Impl {
     void layers_forward(std::span<const Row> rows, unsigned n_layers, ForwardKind kind, const SpecRows* sp = nullptr,
                         unsigned l0 = 0, unsigned l1 = ~0U) {
         const bool pfc = kind == ForwardKind::Prefill;
+        constexpr unsigned decode_rows = 8;
+        if (rows.empty()) throw std::invalid_argument("layers_forward: rows must be nonempty");
+        if (!pfc && rows.size() > decode_rows)
+            throw std::invalid_argument("layers_forward: decode calls take 1..8 rows");
+        if (rows.size() > std::max(decode_rows, opt.max_rows))
+            throw std::invalid_argument("layers_forward: rows > max_rows");
         const auto R = static_cast<unsigned>(rows.size());
         const bool seqpar = pfc && pf_seqpar && xfer::seqpar_admits(R);
         l1 = std::min(l1, n_layers);
@@ -2317,13 +2323,25 @@ struct Engine::Impl {
             if (sp != nullptr || layer_dump != nullptr || null_layer >= 0)
                 throw std::logic_error("prefill pipeline 2 does not support spec / layer_dump / null_layer hooks");
             if (!pf->supports_pipeline()) throw std::logic_error("prefill pipeline 2 needs an exact half-row PrefillPath");
-            if (rows.empty()) throw std::invalid_argument("prefill pipeline 2 needs nonempty rows");
             for (unsigned r = 1; r < R; ++r)
                 if (rows[r].slot != rows[0].slot || rows[r].pos != rows[0].pos + r)
                     throw std::invalid_argument("prefill pipeline 2 needs consecutive positions of one slot");
         }
-        std::vector<std::uint32_t> tk(R), sl(R);
-        std::vector<std::uint64_t> ps(R);
+        std::array<std::uint32_t, decode_rows> small_tk, small_sl;
+        std::array<std::uint64_t, decode_rows> small_ps;
+        std::vector<std::uint32_t> large_tk, large_sl;
+        std::vector<std::uint64_t> large_ps;
+        auto* tk = small_tk.data();
+        auto* sl = small_sl.data();
+        auto* ps = small_ps.data();
+        if (R > decode_rows) {
+            large_tk.resize(R);
+            large_sl.resize(R);
+            large_ps.resize(R);
+            tk = large_tk.data();
+            sl = large_sl.data();
+            ps = large_ps.data();
+        }
         for (unsigned r = 0; r < R; ++r) {
             tk[r] = rows[r].token;
             sl[r] = rows[r].slot;
@@ -2337,9 +2355,9 @@ struct Engine::Impl {
                     break;
                 }
         }
-        hip_ok(hipMemcpyAsync(tok_d, tk.data(), R * 4, hipMemcpyHostToDevice, stream), "tokens");
-        hip_ok(hipMemcpyAsync(slot_d, sl.data(), R * 4, hipMemcpyHostToDevice, stream), "slots");
-        hip_ok(hipMemcpyAsync(pos_d, ps.data(), R * 8, hipMemcpyHostToDevice, stream), "pos");
+        hip_ok(hipMemcpyAsync(tok_d, tk, R * 4, hipMemcpyHostToDevice, stream), "tokens");
+        hip_ok(hipMemcpyAsync(slot_d, sl, R * 4, hipMemcpyHostToDevice, stream), "slots");
+        hip_ok(hipMemcpyAsync(pos_d, ps, R * 8, hipMemcpyHostToDevice, stream), "pos");
         seg_n = 0;  // only step() collects; a verify / gate forward's marks are dropped here
         mark(segStart);
         if (l0 != 0) {
@@ -2356,8 +2374,6 @@ struct Engine::Impl {
         hip_ok(hipGetLastError(), "embed");
         if (pfc && l0 == 0 && !embed_chunk.empty()) splice_embed_rows(embed_chunk, X, kHc, R, seqpar);
         mark(segEmbed);
-        if (!pfc && R > 8) throw std::invalid_argument("layers_forward: decode calls take 1..8 rows");
-        if (R > std::max<unsigned>(8U, opt.max_rows)) throw std::invalid_argument("layers_forward: rows > max_rows");
         if (pfc && r1b) throw std::logic_error("r1b-all needs the reference prefill; the chunked prefill implements R1 prompts");
         select_exchange(kind, R);
         if (seqpar) {
