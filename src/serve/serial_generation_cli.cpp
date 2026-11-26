@@ -11,6 +11,7 @@
 #include "strix/serve/prefill_chunk_fallback.hpp"
 #include "strix/session/embed_rows.hpp"
 #include "strix/session/cli_output.hpp"
+#include "strix/spec/block_setup.hpp"
 #include "strix/spec/greedy_continuation.hpp"
 #include "strix/spec/probe_policy.hpp"
 #include "strix/spec/verify_cost_table.hpp"
@@ -594,38 +595,41 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     bool device_sampled = false;  // the serial path's sampled rows decided on the device (decode_sampled)
     const auto decode_start = Clock::now();
     if (verify) {
-        spec::BlockConfig config;
-        config.hybrid = false;  // The optional chain owns a complete, independent block (an engine may opt in).
-        if (options.speculation != CliSpeculation::verify) decoder->tune_speculation(config);
-        spec::apply_probe_loss(config.arbiter, family.speculation_engine, family.speculation_backend);
-        if (config.arbiter.windows.empty() || max_rows > config.arbiter.windows.back())
-            throw std::invalid_argument("target exceeds the supported verify row count");
-        config.max_block = max_rows;
-        config.force_lookup = options.speculation == CliSpeculation::lookup;
-        auto* chain = options.speculation == CliSpeculation::automatic ? decoder->chain_drafter(next, prompt_size) : nullptr;
-        if (!chain) config.hybrid = false;
-        chain_k = chain && config.chain ? std::min(config.chain_max_k, max_rows > 1U ? max_rows - 1U : 0U) : 0U;
-        // Frozen prices (strix/spec/verify_cost_table.hpp): a table that prices every window of this run (and a chain
-        // depth) is the whole cost model, so the row choices are a function of the table and the acceptance history,
-        // not of this run's host clock. Otherwise auto learns verify + commit and draft walls in this run. The
-        // diagnostic keeps its original equal prices.
-        prices_frozen = cost_table && spec::table_prices_run(*cost_table, config.arbiter.windows, max_rows, chain_k);
-        config.fixed_costs = options.speculation == CliSpeculation::verify || prices_frozen;
-        config.frozen_prices = prices_frozen;
-        // Learned walls: the first pass of a width can carry its one-time work (graph capture), never a price.
-        if (!config.fixed_costs) config.arbiter.cold_walls = 1;
-        if (config.fixed_costs) spec::set_context_cost(config.arbiter, "off");
-        // Frozen prices also price the exploration (ArbiterConfig::priced_exploration: probes never buy a window that
-        // cannot pay and never move the arm hysteresis) and stop a drafter whose realized cycles lose at those prices
-        // (ArbiterConfig::cycle_half_life_tokens).
-        if (prices_frozen) spec::set_frozen_price_rules(config.arbiter);
-        drafter.emplace(config, chain);
-        // Before seeding: switching the drafter to sampled rows resets its learned observations.
-        drafter->set_row_rule(row_rule);
-        if (options.speculation == CliSpeculation::verify)
-            for (std::uint32_t row = 1; row <= max_rows; ++row) drafter->seed_verify_ms(row, 1.0);
-        else
-            decoder->seed_speculation(*drafter);
+        // The shared block setup (strix/spec/block_setup.hpp); this command line adds its request modes, the frozen
+        // prices of its cost table and the diagnostic's equal prices.
+        spec::BlockSetup setup;
+        setup.max_rows = max_rows;
+        setup.engine = family.speculation_engine;
+        setup.backend = family.speculation_backend;
+        if (options.speculation != CliSpeculation::verify)
+            setup.tune = [&](spec::BlockConfig& config) { decoder->tune_speculation(config); };
+        setup.chain = [&](spec::BlockConfig& config) -> spec::ChainDrafter* {
+            config.force_lookup = options.speculation == CliSpeculation::lookup;
+            return options.speculation == CliSpeculation::automatic ? decoder->chain_drafter(next, prompt_size) : nullptr;
+        };
+        setup.prices = [&](spec::BlockConfig& config, spec::ChainDrafter* chain) {
+            chain_k = chain && config.chain ? std::min(config.chain_max_k, max_rows > 1U ? max_rows - 1U : 0U) : 0U;
+            // Frozen prices (strix/spec/verify_cost_table.hpp): a table that prices every window of this run (and a
+            // chain depth) is the whole cost model, so the row choices are a function of the table and the acceptance
+            // history, not of this run's host clock. Otherwise auto learns verify + commit and draft walls in this run.
+            // The diagnostic keeps its original equal prices.
+            prices_frozen = cost_table && spec::table_prices_run(*cost_table, config.arbiter.windows, max_rows, chain_k);
+            config.fixed_costs = options.speculation == CliSpeculation::verify || prices_frozen;
+            config.frozen_prices = prices_frozen;
+            if (config.fixed_costs) spec::set_context_cost(config.arbiter, "off");
+            // Frozen prices also price the exploration (ArbiterConfig::priced_exploration: probes never buy a window
+            // that cannot pay and never move the arm hysteresis) and stop a drafter whose realized cycles lose at those
+            // prices (ArbiterConfig::cycle_half_life_tokens).
+            if (prices_frozen) spec::set_frozen_price_rules(config.arbiter);
+        };
+        setup.row_rule = row_rule;
+        setup.seed = [&](spec::BlockDrafter& built) {
+            if (options.speculation == CliSpeculation::verify)
+                for (std::uint32_t row = 1; row <= max_rows; ++row) built.seed_verify_ms(row, 1.0);
+            else
+                decoder->seed_speculation(built);
+        };
+        (void)spec::make_block_drafter(drafter, setup);
         // Walls measured by earlier runs win over the engine's declared seeds (applied after them).
         if (cost_table) {
             const auto& seeds = cost_prior ? *cost_prior : *cost_table;
