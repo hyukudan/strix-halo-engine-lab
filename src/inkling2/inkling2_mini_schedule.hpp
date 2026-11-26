@@ -215,12 +215,15 @@ static_assert(kMiniServeDecodingRows % kMiniPrefillWaveRows == 0U &&
 static_assert(kMiniServeDecodingRows % kMiniCudaPieceRows == 0U && kMiniServeDecodingRows > 3U * kMiniCudaPieceRows,
               "a CUDA held-back piece is cuttable (serve::validate_prompt_pieces)");
 
-// CUDA held-back route beside decoding lanes: gap-bounded pieces (serve::CohortConfig::prompt_gap_ms, the shared
-// gap_bounded_rows) of at least kMiniServeDecodingRows rows. The target bounds the step a decoding lane waits for
-// across one piece plus its decode round; the fixed cost of one prefill pass prices a piece with the row cost the
-// previous piece measured. RTX PRO q35 (f8d8f9e38, one decoding lane): a 128-row piece ~135 ms, an 8192-row prompt
-// alone 848 ms -> ~124 ms per pass + ~0.088 ms per row; fixed 128-row pieces made an 8K prompt beside a lane take 9.7 s.
-inline constexpr double kMiniCudaServePromptGapMs = 250.0;
-inline constexpr double kMiniCudaPrefillPassFixedMs = 124.0;
+// CUDA held-back route beside decoding lanes: pieces of kMiniCudaServeDecodingRows rows. RTX PRO q35 (f8d8f9e38, one
+// decoding lane): a 128-row piece ~135 ms, an 8192-row prompt alone 848 ms (~124 ms per pass + ~0.088 ms per row), so
+// 128-row pieces kept a 145-157 ms decode gap but made an 8K prompt beside a lane take 9.7 s; 1024-row pieces bound
+// the gap near 225 ms and admit an 8K prompt in 8 passes. Fixed, not priced: with the shared gap pricing
+// (CohortConfig::prompt_gap_ms 250 ms, 124 ms per pass) the learned row cost came out near zero and the planner granted
+// whole 8K calls beside a decoding lane (RTX q39: 849-853 ms gaps).
+inline constexpr unsigned kMiniCudaServeDecodingRows = 1024U;
+static_assert(kMiniCudaServeDecodingRows % kMiniCudaPieceRows == 0U &&
+                  kMiniCudaServeDecodingRows > 3U * kMiniCudaPieceRows,
+              "a CUDA held-back piece is cuttable (serve::validate_prompt_pieces)");
 
 }  // namespace strix::inkling2

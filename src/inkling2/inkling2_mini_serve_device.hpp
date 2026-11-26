@@ -154,9 +154,9 @@ inline MiniServeCohort make_mini_device_cohort(
               << " weight_status " << profile::status_name(weights.status) << " (" << weights.reason << ")"
               << (weights.turbo_quality.empty() ? "" : " turbo_quality ") << weights.turbo_quality << '\n'
               << weight::weight_load_regime_receipt(weights) << '\n';
-    // CUDA held-back route: gap-bounded pieces beside decoding lanes (HIP keeps fixed slices).
-    const double prompt_gap_ms = !kServeHip && !opt.served_cli_route ? kMiniCudaServePromptGapMs : 0.0;
-    return {std::move(cohort), weights, std::move(projected_bias_dispatches), chunk_rows, prompt_gap_ms};
+    // CUDA held-back route: 1024-row pieces beside decoding lanes (HIP keeps the 128-row bound).
+    const unsigned decoding_rows = !kServeHip && !opt.served_cli_route ? kMiniCudaServeDecodingRows : 0U;
+    return {std::move(cohort), weights, std::move(projected_bias_dispatches), chunk_rows, decoding_rows};
 }
 
 } // namespace strix::inkling2
