@@ -257,7 +257,7 @@
       "implementation": "route-prune-v1",
       "execution_key": "bind_band_receipts/LadderArms::over",
       "execution_scope": "HIP one lane, known priced prompt execution; FAST plus cap9 over FAST",
-      "timing_receipt": "eng_land Q-CAP 11-24 bin 88ce20962408081f 32K FAST 16140.4 ms -> cap9 15846.1 ms (+1.9 %); lower edge (integration head 2019eacec5, bin fb814e2f1dba372a, one gfx1151 node, ABBA x2) p8193 FAST 3995.0 ms (1 valid, 3 evicted all slower) -> cap9 3843.7 ms (median of 3 valid, +3.9 %); quality measured at 8K (KL 0.00528 top-1 0.9707 dNLL +0.0050)",
+      "timing_receipt": "eng_land Q-CAP 11-24 bin 88ce20962408081f 32K FAST 16140.4 ms -> cap9 15846.1 ms (+1.9 %); lower edge (integration head 2019eacec5, bin fb814e2f1dba372a, one gfx1151 node, ABBA x2) p8193 FAST 3995.0 ms (1 valid, 3 evicted all slower) -> cap9 3843.7 ms (median of 3 valid, +3.9 %; single-sample FAST arm, not compared with the row noise: re-timed in the final campaign before it is relied on); quality measured at 8K (KL 0.00528 top-1 0.9707 dNLL +0.0050)",
       "gate_receipt": "Composite gate at 8K; no 32K gate length cited.",
       "band": [8193, 32768],
       "lanes": [1, 1],
