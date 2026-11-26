@@ -25,6 +25,7 @@ the flags below. The serve options can also come from a TOML file (`--serve-conf
 | `--http-model-id NAME` | `qwen3.8-flash-next` | model name reported by `/v1/models` and responses |
 | `--http-api-key-file FILE` | none | require `Authorization: Bearer KEY` or `x-api-key: KEY` on the API routes |
 | `--http-batch N` | AUTO | omitted: as many request slots as memory admits ([below](#batched-decoding)); `N`: at most N; `0`: one request at a time |
+| `--http-slot-build on-demand\|admission` | `on-demand` | `admission` builds extra slots before admitting the next cohort, after live requests finish |
 | `--http-sampling greedy\|reject\|sample` | omitted: resolved from the admitted route: `sample` on the cohort runner (automatic with two or more admitted slots, `--http-batch N` or `--deploy`) with MTP sampling speculation, `greedy` on the single runner, as before; an explicit `sample` is a startup requirement (refused when capacity selects the single runner) | requests with `temperature > 0`: run greedy and say so in the response, answer 400, or sample (sampling-v1, cohort runner only) |
 | `--http-default-temperature`, `-top-k`, `-top-p`, `-min-p` | retired | refused at startup: a server-only sampling default would make the HTTP stream differ from the command line; send the value in the request |
 | `--http-default-max-tokens N` | `4096` | generation budget when a request gives none |
@@ -450,6 +451,10 @@ if its launch would fall back to the single runner, startup refuses it. A cap of
   after re-checking memory (growth stops for the server, with a notice, when a slot no longer fits).
   A build takes 1.4-2.9 s (measured) and delays that step: it is the longest decode gap of a server that grows;
   `STRIX_HTTP_EAGER_SLOTS` trades startup time for fewer builds under load.
+- With `--http-slot-build admission`, requests can fill available slots during decode when the waiting work fits.
+  If waiting demand exceeds available slots and more slots can be built, the current cohort finishes before
+  construction starts. New requests may wait longer for their first token. Each construction still uses the
+  memory check and the same slot initializer. This policy requires the cohort route.
 - Requests beyond the built slots wait in the queue and are never rejected for busy slots: responses carry
   `X-Strix-Http-Slots` (capacity) and `X-Strix-Queue-Position` (waiting jobs ahead at submission), the final
   `strix` receipt `queue_ms`. The queue and connection limits default to 65536 / 4096.

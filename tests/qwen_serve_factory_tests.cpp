@@ -130,13 +130,17 @@ void check_factory(const std::string& root) {
         {},
         {"--http-batch", "0", "--http-sampling", "reject", "--http-logprobs", "off"},
         {"--http-batch", "2", "--http-sampling", "sample",
-         "--http-constraints", "off", "--http-default-max-tokens", "24"}};
+         "--http-constraints", "off", "--http-default-max-tokens", "24"},
+        {"--http-batch", "2", "--http-slot-build", "admission"}};
     for (const auto& extra : cases) {
         auto legacy = family;
         legacy.insert(legacy.begin(), "strix-hip-decode-token");
         legacy.emplace_back("--http-serve");
         legacy.insert(legacy.end(), extra.begin(), extra.end());
-        const auto expected = qwen::inspect_http_options(legacy_options(legacy));
+        const auto resolved = legacy_options(legacy);
+        CHECK(resolved.http_build_slots_at_admission ==
+              (std::find(extra.begin(), extra.end(), "admission") != extra.end()));
+        const auto expected = qwen::inspect_http_options(resolved);
         auto inspect = select;
         inspect.insert(inspect.end(), {"--family-inspect", "--"});
         inspect.insert(inspect.end(), family.begin(), family.end());

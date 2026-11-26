@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <csignal>
 #include <fstream>
 #include <iostream>
@@ -585,7 +586,12 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
             callbacks.before_submit();
             submit(std::move(request));
         };
-        native.add_slot = [&](bool queued) { runner.add_slot(queued); };
+        if (options.http_build_slots_at_admission) {
+            native.prepare_admission_slots = [&](std::uint64_t pending) { return runner.prepare_admission_slots(pending); };
+            std::fputs("http slot growth: admission\n", stderr);
+        } else {
+            native.add_slot = [&](bool queued) { runner.add_slot(queued); };
+        }
         native.active = [&] { return runner.active(); };
         native.has_free_slot = [&] { return runner.http_can_admit(); };
         native.submit = [&](const serve::GenerationJob& job, qwen::HttpSessionOwner::Callbacks callbacks) {

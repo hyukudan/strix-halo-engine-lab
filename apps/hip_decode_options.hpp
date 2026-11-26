@@ -564,6 +564,7 @@ struct Options {
     std::uint32_t http_batch = 0; // resolved route: zero selects the single adapter
     bool http_batch_explicit = false;
     std::uint32_t http_batch_cap = 0;
+    bool http_build_slots_at_admission = false;
     std::string http_slot_reason;
     std::uint32_t http_default_max_tokens = 4096;
     std::uint32_t http_max_queue = 65536;
@@ -1310,6 +1311,8 @@ inline void resolve_http_route(Options& o) {
 [[nodiscard]] inline std::uint32_t admit_http_batch_slots(Options& o, std::uint32_t capacity, bool deployment_planned) {
     const bool cohort = capacity && o.http_batch && !o.session_live_control &&
         (capacity > 1U || ((o.http_batch_explicit || deployment_planned) && o.http_batch_cap == 1U));
+    if (!cohort && o.http_build_slots_at_admission)
+        throw std::runtime_error("--http-slot-build admission requires a cohort; measured capacity selects the single route");
     if (!cohort && o.http_sampling_policy == "sample")
         throw std::runtime_error("HTTP sampling capability requires the cohort runner: measured capacity selects the single route; "
             "use --http-batch 1 for a one-slot cohort or --http-sampling reject for a single runner");
@@ -1326,6 +1329,8 @@ inline void resolve_http_route(Options& o) {
 
 // HTTP serving runs the tiled MTP route after one calibration replay.
 inline void validate_http_serve(const Options& o, bool defer_prefill = false) {
+    if (o.http_build_slots_at_admission && (!o.http_serve || !o.http_batch))
+        throw std::invalid_argument("--http-slot-build admission requires batched HTTP serving");
     if (o.rtx_state_import && o.rtx_state_import_file.empty() && (!o.http_serve || o.http_batch))
         throw std::invalid_argument("--rtx-state-import requires --http-serve (the tiled MTP prompt) without --http-batch");
     if (!o.rtx_state_import_file.empty()) {
@@ -2124,7 +2129,8 @@ inline std::span<const strix::serve::config_file::Option> hip_serve_config_optio
         {"prefill.disable", "--prefill-disable", Kind::list, ',', "--config"},
         {"http.serve", "--http-serve", Kind::flag}, {"http.port", "--http-port", Kind::value}, {"http.bind", "--http-bind", Kind::value},
         {"http.model_id", "--http-model-id", Kind::value}, {"http.api_key_file", "--http-api-key-file", Kind::path},
-        {"http.batch", "--http-batch", Kind::value}, {"http.max_queue", "--http-max-queue", Kind::value},
+        {"http.batch", "--http-batch", Kind::value}, {"http.slot_build", "--http-slot-build", Kind::value},
+        {"http.max_queue", "--http-max-queue", Kind::value},
         {"http.max_connections", "--http-max-connections", Kind::value}, {"http.default_max_tokens", "--http-default-max-tokens", Kind::value},
         {"http.default_temperature", "--http-default-temperature", Kind::value}, {"http.default_top_k", "--http-default-top-k", Kind::value},
         {"http.default_top_p", "--http-default-top-p", Kind::value}, {"http.default_min_p", "--http-default-min-p", Kind::value},
@@ -2938,7 +2944,7 @@ inline Options parse_options(
             argument == "--http-default-temperature" || argument == "--http-default-top-k" ||
             argument == "--http-default-top-p" || argument == "--http-default-min-p" ||
             argument == "--http-max-queue" || argument == "--http-max-connections" || argument == "--http-batch" ||
-            argument == "--rtx-state-import-decode-threads") {
+            argument == "--http-slot-build" || argument == "--rtx-state-import-decode-threads") {
             if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
                 throw std::invalid_argument(std::string(argument) + " requires a value");
             const std::string_view value = argv[++index];
@@ -2986,6 +2992,11 @@ inline Options parse_options(
             else if (argument == "--http-batch") {
                 options.http_batch = options.http_batch_cap = u32("HTTP batch");
                 options.http_batch_explicit = true;
+            }
+            else if (argument == "--http-slot-build") {
+                if (value != "admission" && value != "on-demand")
+                    throw std::invalid_argument("--http-slot-build requires on-demand|admission");
+                options.http_build_slots_at_admission = value == "admission";
             }
             else if (argument == "--rtx-state-import-decode-threads") options.rtx_state_import_decode_threads = u32("rtx import decode threads");
             else options.http_max_connections = u32("HTTP connections");

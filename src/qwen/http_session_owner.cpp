@@ -75,12 +75,12 @@ HttpSessionOwner::HttpSessionOwner(serve::GenerationQueue& q, std::uint64_t cont
     : queue_(q), context_(context), native_(std::move(native)), engine_(context, capacity),
       leases_(capacity, 1, logical_hooks()), runtime_(q, engine_, leases_, no_retention(), owner_hooks()),
       protection_(serve::queued_prefix_protection_policy_from_env(), native_.queue_protection) {
-    if (!native_.add_slot || !native_.has_free_slot || !native_.active || !native_.submit ||
+    if ((!native_.add_slot && !native_.prepare_admission_slots) || !native_.has_free_slot || !native_.active || !native_.submit ||
         !native_.service_admission || !native_.step || !native_.fail_requests || !native_.abandon)
         throw std::invalid_argument("Qwen owner requires the native runner binding");
     if (native_.session_mutex) batch_lock_ = std::unique_lock<std::mutex>(*native_.session_mutex, std::defer_lock);
     native_.service_admission([this] {
-        return runtime_.reservation() || !queue_.has_queued_work() ? std::size_t{0} :
+        return admission_paused_ || runtime_.reservation() || !queue_.has_queued_work() ? std::size_t{0} :
             std::max<std::size_t>(1, static_cast<std::size_t>(queue_.snapshot().queued));
     }, [this](const Submit& prepare, const std::function<bool()>& can_prepare) { pump(prepare, can_prepare); });
 }
@@ -160,6 +160,7 @@ void HttpSessionOwner::pump(const Submit& prepare, const std::function<bool()>& 
     // cannot monopolize a parked native service boundary.
     // Bounded: protect the states the still-waiting prompts will restore before this turn captures more.
     protection_.scan(queue_);
+    if (admission_paused_) return;
     auto remaining = queue_.snapshot().queued;
     const auto slots = engine_.caps().max_slots;
     remaining = remaining > UINT64_MAX - slots ? UINT64_MAX : remaining + slots;
@@ -177,12 +178,23 @@ void HttpSessionOwner::turn() {
     // One candidate per common-owner turn. Preserve the two native growth
     // points across these bounded turns; yielding never adds native calls.
     if (turn_ == Turn::growth) {
-        native_.add_slot(queue_.snapshot().queued != 0);
+        if (!native_.prepare_admission_slots) native_.add_slot(queue_.snapshot().queued != 0);
         turn_ = Turn::admission;
     }
     if (turn_ == Turn::admission) {
-        if (native_.has_free_slot() && !(runtime_.reservation() && native_.active())) {
-            if (!runtime_.reserve_fifo() && !native_.active() && !queue_.stopping()) {
+        if (native_.prepare_admission_slots) {
+            const auto* reserved = runtime_.reservation();
+            auto pending = queue_.snapshot().queued;
+            if (!pending && !reserved && !native_.active() && !queue_.stopping()) {
+                runtime_.wait_for(std::chrono::seconds(1), true);
+                protection_.scan(queue_);
+                pending = queue_.snapshot().queued;
+            }
+            // A named reservation runs on its existing slot once native work drains.
+            admission_paused_ = !native_.prepare_admission_slots(reserved ? 0 : pending);
+        }
+        if (!admission_paused_ && native_.has_free_slot() && !(runtime_.reservation() && native_.active())) {
+            if (!runtime_.reserve_fifo() && !native_.prepare_admission_slots && !native_.active() && !queue_.stopping()) {
                 runtime_.wait_for(std::chrono::seconds(1), true);
                 protection_.scan(queue_);
                 (void)runtime_.reserve_fifo();
@@ -194,7 +206,7 @@ void HttpSessionOwner::turn() {
         }
         turn_ = Turn::work;
     }
-    native_.add_slot(queue_.snapshot().queued != 0);
+    if (!native_.prepare_admission_slots) native_.add_slot(queue_.snapshot().queued != 0);
     turn_ = Turn::growth;
     if (!native_.active()) {
         drained_ = queue_.stopping();

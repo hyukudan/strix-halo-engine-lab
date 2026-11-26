@@ -350,6 +350,18 @@ HTTP serving (`--http-serve`) without an explicit tiled configuration resolves t
 - **Measured gain:** One Strix Halo node, same binary, interleaved arms, identical token IDs, versus explicit T2048: cold TTFT 21.95 vs 22.93 s at 17K tokens (-4.3 %), 11.08/11.11 vs 11.53/11.58 s for two 8.5K prompts (-3.9 %/-4.0 %); eight staggered 8.5K prompts queued: TTFT p50 65.3 vs 66.4-71.7 s, wave wall 103.7 vs 105.2-110.2 s. T8192 uses capacity: 29 vs 55 admitted slots, a queueing tradeoff only above 29 concurrent requests.
 - **Implementation / evidence:** [Resolver](../apps/qwen_effective_config.hpp), [serving](engine/serving/serving.md#default-prompt-prefill)
 
+<a id="qwen-http-slot-admission"></a>
+
+### Qwen HTTP slot growth at cohort admission
+
+**Engine:** Qwen Flash Next HIP HTTP cohort. **Control:** `--http-slot-build admission`. **Default:** `--http-slot-build on-demand`.
+
+When queued work needs more slots, the scheduler keeps stepping the active cohort and prepares additional slots before admitting the next cohort. The allocator enters its device-wide setup phase with zero live lanes. The same capacity ceiling and per-slot memory checks apply. An admission can wait for the current cohort to drain.
+
+- **Exactness evidence:** The host replay checks the full IDs and final state digests for active and queued requests, including declined growth. Native identity and timing are pending.
+- **Measured gain:** Pending. The HTTP slots gate compares the largest active-stream token gap and next-cohort TTFT with staggered arrivals.
+- **Implementation / evidence:** [Slot policy](../include/strix/serve/slot_capacity.hpp), [serving](engine/serving/serving.md), [gate](../tests/http_slots_gpu_gate.py).
+
 <a id="qwen-residency"></a>
 
 ### UMA registered residency

@@ -76,6 +76,8 @@ def server(args, name, mode, overrides=None, extra=()):
     command = args.command + list(extra) + ["--http-serve", "--http-port", str(args.port)]
     if mode != "auto":
         command += ["--http-batch", mode]
+    if mode != "0" and args.slot_build:
+        command += ["--http-slot-build", args.slot_build]
     with (args.out / (name + ".log")).open("w") as log:
         process = subprocess.Popen(command, env=env, stdout=log, stderr=log)
         try:
@@ -349,6 +351,10 @@ def main():
     parser.add_argument("--startup-timeout", type=float, default=1800)
     parser.add_argument("--modes", default="auto,1,2,4,8,16")
     parser.add_argument("--clients", default="1,2,4,8,16")
+    parser.add_argument("--slot-build", choices=("on-demand", "admission"),
+                        help="select the construction policy for the cohort arms")
+    parser.add_argument("--stagger-after-first", action="store_true",
+                        help="start the waiting clients after the first stream emits a token")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="-- executable and pinned model/MTP arguments, without HTTP flags")
     args = parser.parse_args()
     if args.command[:1] == ["--"]:
@@ -378,12 +384,21 @@ def main():
         name = f"slots-{mode}"
         with server(args, name, mode):
             for clients in map(int, args.clients.split(",")):
-                barrier = threading.Barrier(clients)
+                staggered = args.stagger_after_first and clients > 1
+                barrier = threading.Barrier(clients - int(staggered))
                 def request(index):
                     barrier.wait()
                     return completion(args.port, prompts[index % len(prompts)], args.generate)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=clients) as pool:
-                    results = list(pool.map(request, range(clients)))
+                    if staggered:
+                        first_token = threading.Event()
+                        first = pool.submit(completion, args.port, prompts[0], args.generate, first_token)
+                        require(first_token.wait(args.startup_timeout) and not first.done(),
+                                "NO-WITNESS: first stream ended before introducing waiting clients")
+                        futures = [first] + [pool.submit(request, index) for index in range(1, clients)]
+                        results = [future.result() for future in futures]
+                    else:
+                        results = list(pool.map(request, range(clients)))
                 for index, result in enumerate(results):
                     require(signature(result) == reference[index % len(prompts)], f"MISMATCH: {name} clients {clients}")
                     headers = {k.lower(): v for k, v in result["http_headers"].items()}
@@ -397,6 +412,8 @@ def main():
                 (args.out / f"{name}-clients-{clients}.json").write_text(json.dumps(results, indent=2))
                 print(f"EXACT {name} clients {clients}: slots {slots}", flush=True)
         log = (args.out / (name + ".log")).read_text()
+        if args.slot_build == "admission":
+            require("http slot growth: admission" in log, "NO-WITNESS: cohort admission construction policy")
         receipts = []
         for line in log.splitlines():
             try:

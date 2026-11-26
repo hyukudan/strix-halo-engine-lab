@@ -1339,6 +1339,19 @@ public:
             [](const auto& s) { return s->active || s->retired; }));
         if (stats_.lazy_slot_memory_declined || !grow_factory ||
             !http_slot_should_grow(queued, unavailable, slots(), slots_capacity, true, spare_slot_)) return false;
+        return build_slot();
+    }
+    bool prepare_admission_slots(std::uint64_t pending) {
+        EngineCall call(engine_call_);
+        if (!pending || stats_.lazy_slot_memory_declined || !grow_factory || slots() >= slots_capacity) return true;
+        const auto healthy = static_cast<std::size_t>(std::count_if(slots_.begin(), slots_.end(),
+            [](const auto& slot) { return !slot->retired; }));
+        return serve::prepare_admission_slots(pending, active(), healthy, slots(), slots_capacity, spare_slot_,
+            [this] { return build_slot(); });
+    }
+
+private:
+    bool build_slot() {
         if (paused_ || paused_owner_) throw std::logic_error("batch growth during service park");
         (void)drain_prompt_submitters();
         if (!growth_memory_ok || !growth_memory_ok()) {
@@ -1357,6 +1370,7 @@ public:
         stats_.lazy_slot_max_ms = std::max(stats_.lazy_slot_max_ms, ms);
         return true;
     }
+public:
     [[nodiscard]] std::size_t slots() const noexcept { return slots_.size(); }
     // The prompt tile T of the slots' tiled prompts (0: no slot) and the model vocabulary: the serve warm-up's plan.
     [[nodiscard]] std::uint32_t tile_rows() const noexcept {
