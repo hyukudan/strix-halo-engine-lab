@@ -14,8 +14,9 @@ namespace strix::ops::norm {
 
 // How a lane adds one square to its running sum a:
 //   fma:     a = fma(v, v, a)    (one rounding; the existing bindings);
-//   mul_add: a = a + (v * v)     (two roundings, never contracted, whatever the translation unit's -ffp-contract).
-enum class SquareForm { fma, mul_add };
+//   mul_add: a = a + (v * v)     (the existing identity, requires strict compiler flags on the host);
+//   mul_add_uncontracted: a = a + (v * v) with two roundings, even in a contraction-enabled translation unit.
+enum class SquareForm { fma, mul_add, mul_add_uncontracted };
 
 template <class Traits>
 STRIX_OPS_NORM_HD constexpr SquareForm square_form_of() {
@@ -31,11 +32,18 @@ STRIX_OPS_NORM_HD inline float square_step(float a, float v) {
 #if defined(__CUDA_ARCH__)
         return __fadd_rn(a, __fmul_rn(v, v));  // nvcc contracts plain a + v * v under -fmad
 #else
+        if constexpr (F == SquareForm::mul_add_uncontracted) {
+            // A volatile intermediate prevents contraction even if the caller
+            // requests it across expressions. Device admission checks its cost.
+            const volatile float square = v * v;
+            return a + square;
+        } else {
 #if defined(__clang__)
 #pragma clang fp contract(off)
 #endif
-        const float square = v * v;
-        return a + square;
+            const float square = v * v;
+            return a + square;
+        }
 #endif
     }
 }
