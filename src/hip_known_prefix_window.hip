@@ -2010,8 +2010,8 @@ struct HipKnownPrefixWindow::Impl {
             return cohort_wide_enabled("gdn");
         case KnownWindowStepMode::lm_head_rows: return cohort_wide_enabled("head");
         case KnownWindowStepMode::inject_rows: return cohort_wide_enabled("inject");
-        // Every chunk must have a primary: a lone session joins its own detached shared expert inside its step.
-        case KnownWindowStepMode::moe_combine_rows: return all_chunked && cohort_wide_enabled("combine");
+        case KnownWindowStepMode::moe_combine_rows:
+            return all_chunked && cohort_wide_enabled("combine");
         case KnownWindowStepMode::routed_expert_union: return cohort_wide_union(members);
         case KnownWindowStepMode::qsa_rows:
             // 16 / 32 rows: dense A8 only (the launcher also requires a Q8_0 output projection).
@@ -2325,10 +2325,9 @@ struct HipKnownPrefixWindow::Impl {
             for (std::size_t i = 0; i < steps; ++i) {
                 const auto& step = lead.serial.execution.steps[i];
                 if (step.op == SerialOp::moe_combine && step.layer) {
-                    // The shared expert and its combine choose their launch scopes independently.
-                    // A chunk-shared or wide combine can consume outputs detached by individual members.
-                    for (auto& chunk : chunks) if (chunk.primary) chunk.primary->join_shared(*step.layer);
-                    for (auto& m : members) m.impl->join_shared(*step.layer);
+                    join_cohort_combine(primaries, members, *step.layer,
+                        [](CohortMember& member) -> Impl& { return *member.impl; },
+                        [](Impl& owner, std::uint32_t layer) { owner.join_shared(layer); });
                 }
                 if ((chunks.size() > 1U || cohort_step_rows()==16U) && cohort_wide_step(i, members, all_chunked)) {
                     ++wide_count;
