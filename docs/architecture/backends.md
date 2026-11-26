@@ -82,17 +82,36 @@ above. Model adapters and complete-workload qualification remain pending.
 
 ## Experimental Intel, Vulkan and Metal backends
 
-- **Intel SYCL / Level Zero** provides operator references and host-managed model
-  references when built with oneAPI. The dedicated Gemma 4 E4B Q8_0 decode and
-  serve executables offer `--backend intel` without a drafter. That path uses
-  synchronous transfers for operator inputs and results and a resident cache for
-  Q8_0 weights. The Hy4 reference CLI exposes a hybrid Intel projection path.
-  Both model references are pending hardware qualification.
-- **Vulkan and Metal** provide RMSNorm operator references. Each call stages the
-  input and waits for completion. These backends have no model execution plan.
-  The Vulkan adapter uses the Linux Vulkan loader.
+| Backend | Model entry points | Current operator and device scope |
+|---|---|---|
+| Intel SYCL / Level Zero | The Gemma 4 E4B Q8_0 GGUF reference accepts `--backend intel` in `strix-gemma4-decode`, `strix-gemma4-serve` (with `STRIX_LEGACY_MAINS`) and the Gemma family arguments after `--` in `strix-serve`. The route requires RoPE tables, Q8_0 matrices and F32 or BF16 vectors, and runs without a drafter. `strix-hy4-ref` has a hybrid Intel reference for routing and FP32 projections while the host owns the rest of the forward pass. | An opt-in oneAPI SYCL build, a discrete Xe2 Arc card visible at Level Zero ordinal 0 and device USM are required by the reference. The shared operator interface covers Q8_0 gather and linear, FP32 linear, routing, RMSNorm, RoPE and dense attention. Calls synchronously stage operator inputs and outputs. Q8_0 weights can stay resident. The opt-in XMX FP16-input linear policy is a separate operator path. Both model references await native qualification. |
+| Vulkan | RMSNorm operator fixtures only. | Opt-in Linux build with Vulkan headers, a Vulkan 1.1 loader and compute device, and SPIR-V produced from the checked shader. FP32 RMSNorm accepts a per-channel scale or runs unscaled. Dispatch stages buffers and waits for completion. A build without the GLSL compiler refuses dispatch. |
+| Metal | RMSNorm operator fixtures only. | Opt-in macOS build with Metal and Foundation, a compute-capable Metal device and the bundled shader. FP32 RMSNorm accepts a per-channel scale or runs unscaled. Dispatch stages buffers and waits for completion. |
 
-The shared `strix-serve --backend` interface offers HIP and CUDA.
+The shared shell's own `--backend` accepts `hip` or `cuda`. It rejects `intel`,
+`vulkan` and `metal` with the relevant supported scope before loading the registry.
+Vulkan and Metal throw `UnsupportedOperation` for gather, linear, RoPE, attention
+and family execution plans. The Intel reference refuses unavailable builds,
+unsupported devices and unsupported model assets without starting a CPU service.
+
+### Order to first qualified model
+
+1. Freeze a single-device Gemma 4 E4B Q8_0 GGUF, its RoPE tables, tokenizer,
+   prompt IDs and host reference logits as the common bring-up target.
+2. Build and run each native operator fixture on its target platform. On Intel,
+   qualify the existing E4B reference route and bind the selected Level Zero GPU
+   through the shared device gate. On Vulkan and Metal, qualify FP32 RMSNorm and
+   implement the missing Q8_0 gather and dense projections, RoPE and attention
+   through the shared core contracts. Check each against the host oracle.
+3. Add device-owned weight and KV lifetimes, ordered queue batches and a common
+   memory budget. Keep the agreed model arithmetic and qualify transfers, queue
+   errors and resource retirement before composing the forward pass.
+4. Bind the same model description to the shared session adapter. Exercise
+   complete prefill and decode, then compare token IDs, logits and state against
+   the declared reference. Record which arithmetic identity was qualified.
+5. Expose the qualified single-device route as an explicit shared serve backend.
+   Verify CLI and server option parity, request and cancellation behavior, and
+   failure before listening when a required capability is missing.
 
 ## CPU backend
 

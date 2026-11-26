@@ -86,6 +86,12 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
             } else if (arg == "--asset") request.asset = value(i);
             else if (arg == "--backend") {
                 request.backend = value(i);
+                if (request.backend == "intel")
+                    throw std::invalid_argument("--backend intel is a family reference option. Pass it after -- for a family that supports it "
+                                                "or use a dedicated model reference executable. strix-serve supports hip or cuda at the shell level.");
+                if (request.backend == "vulkan" || request.backend == "metal")
+                    throw std::invalid_argument("--backend " + request.backend + " only exposes the RMSNorm operator reference. "
+                                                "strix-serve supports hip or cuda at the shell level.");
                 if (request.backend != "hip" && request.backend != "cuda")
                     throw std::invalid_argument("--backend requires hip or cuda");
             }

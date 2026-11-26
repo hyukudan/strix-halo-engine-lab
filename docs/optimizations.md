@@ -51,6 +51,14 @@ Backends using the shared cohort decoder. Host cohort tests compare cohort and s
 
 Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=CUDA cohort, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
 
+<a id="reference-gpu-serve-admission"></a>
+### Reference GPU serve admission
+
+The shared `strix-serve` shell explains the supported Intel family entry point and
+the RMSNorm operator scope of Vulkan and Metal when those backends are requested
+at the shell level. Host tests cover early refusal and the reference operator
+boundary. See the [experimental backend coverage](architecture/backends.md#experimental-intel-vulkan-and-metal-backends).
+
 Qwen guarded wave reductions can use exact DPP/permlanex16 exchanges (build-time lever, off by default: configure with `-DSTRIX_DPP_REDUCE=ON`; the all-on build uses it); addition trees are unchanged, native byte-equality qualification is pending, and no speed gain is claimed.
 
 <a id="gemma4-exl3-shared-hadamard"></a>
