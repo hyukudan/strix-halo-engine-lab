@@ -115,7 +115,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
 serve::CohortConfig scheduling(const MiniServeOptions& opt, const MiniServeCohort& device) {
     // The chunk the load admitted (the chunk ladder may keep a smaller one), never the requested one.
     return mini_serve_scheduling(device.prefill_rows != 0U ? device.prefill_rows : opt.prefill_rows,
-                                 device.backend->prompt_piece_rule());
+                                 device.backend->prompt_piece_rule(), device.prompt_gap_ms);
 }
 
 class MiniService final : public serve::SessionService {

@@ -117,11 +117,14 @@ inline constexpr bool kFixtureHip = false;
 inline std::unique_ptr<MiniResidentDecoder> served_decoder(const char* checkpoint, unsigned context, unsigned chunk,
                                                            weight::FormatId storage, unsigned lanes, unsigned tail,
                                                            bool admitted) {
-    return admitted
-        ? std::make_unique<MiniResidentDecoder>(checkpoint, context, chunk, kMiniPackedDecodeDefault,
-              MiniResidentBackend::default_step_graphs, storage, 0U, false, lanes, tail, false, false, true)
-        : std::make_unique<MiniResidentDecoder>(checkpoint, context, chunk, mini_served_packed_decode(kFixtureHip, false),
-              MiniResidentBackend::default_step_graphs, storage, 0U, false, lanes);
+    if (admitted)
+        return std::make_unique<MiniResidentDecoder>(checkpoint, context, chunk, kMiniPackedDecodeDefault,
+            MiniResidentBackend::default_step_graphs, storage, 0U, false, lanes, tail, false, false, true);
+    // The held-back route as make_mini_device_cohort builds it (keep_prefill_grouped included).
+    auto decoder = std::make_unique<MiniResidentDecoder>(checkpoint, context, chunk,
+        mini_served_packed_decode(kFixtureHip, false), MiniResidentBackend::default_step_graphs, storage, 0U, false, lanes);
+    decoder->keep_prefill_grouped();
+    return decoder;
 }
 
 using MiniFixedCohort = serve::FixedKvCohort<MiniResidentDecoder>;

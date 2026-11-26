@@ -73,6 +73,8 @@ inline MiniServeCohort make_mini_device_cohort(
                 packed_decode, MiniResidentBackend::default_step_graphs,
                 weights.roles(), 0U, false, rows, opt.served_cli_route ? opt.prefill_tail : 0U,
                 opt.experts_nvfp4, opt.controller_one_plane, opt.served_cli_route, lowbit);
+            // Held-back route: every prompt row on the prefill form whatever chunk or piece cuts it (CUDA; HIP no-op).
+            if (!opt.served_cli_route) decoder->keep_prefill_grouped();
             levers = configure_mini_decoder(*decoder, opt.moe_w4a4, opt.combine_image, opt.prepared_round_fold,
                                             opt.attn_projected_bias, opt.screened_head, opt.verify_rows);
             slot_bytes = decoder->slot_bytes();
@@ -152,7 +154,9 @@ inline MiniServeCohort make_mini_device_cohort(
               << " weight_status " << profile::status_name(weights.status) << " (" << weights.reason << ")"
               << (weights.turbo_quality.empty() ? "" : " turbo_quality ") << weights.turbo_quality << '\n'
               << weight::weight_load_regime_receipt(weights) << '\n';
-    return {std::move(cohort), weights, std::move(projected_bias_dispatches), chunk_rows};
+    // CUDA held-back route: gap-bounded pieces beside decoding lanes (HIP keeps fixed slices).
+    const double prompt_gap_ms = !kServeHip && !opt.served_cli_route ? kMiniCudaServePromptGapMs : 0.0;
+    return {std::move(cohort), weights, std::move(projected_bias_dispatches), chunk_rows, prompt_gap_ms};
 }
 
 } // namespace strix::inkling2

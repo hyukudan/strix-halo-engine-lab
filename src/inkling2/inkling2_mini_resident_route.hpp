@@ -126,10 +126,11 @@ constexpr bool mini_w4a4_rows(bool w4a4_bound, MiniAppendKind kind) {
     return w4a4_bound && kind == MiniAppendKind::prefill;
 }
 
-// `grouped_prefill` (CUDA, whose prefill rows are chunk-invariant): every prefill row keeps the grouped tile, a one-row
-// prefill chunk included, so a prompt row's bits do not depend on where the chunks cut it (RTX q34: a one-row chunk on
-// the packed body after 128 or 2048 rows changed the scores, KV and the next steps; remainders of 16 or more rows on the
-// grouped tile were equal). The command line's one-token prompt and its 1 mod chunk remainders follow the same rule.
+// `grouped_prefill` (the CUDA served held-back route, MiniResidentBackend::keep_prefill_grouped): every prefill row
+// keeps the grouped tile, a one-row prefill chunk included, so a served prompt row's bits do not depend on where the
+// admitted chunk or the pieces cut it (RTX q34: a one-row chunk on the packed body after 128 or 2048 rows changed the
+// scores, KV and the next steps; remainders of 16 or more rows on the grouped tile were equal). The command line keeps
+// its one-row route (its EXACT bits at a one-token prompt and at 1 mod chunk remainders are unchanged).
 constexpr MiniResidentRoute mini_resident_chunk_route(MiniAppendKind kind, unsigned rows, bool packed_decode,
                                                       bool w4a4_bound, bool cohort_rows = false,
                                                       bool grouped_prefill = false) {

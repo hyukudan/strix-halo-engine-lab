@@ -612,6 +612,9 @@ public:
     void set_calibration_moments(weight::calib::MomentSet* moments) { backend_.set_calibration_moments(moments); }
     void set_calibration_window(std::optional<std::size_t> window) { backend_.set_calibration_window(window); }
     void set_gate_order_null(bool enabled) { backend_.set_gate_order_null(enabled); }
+    // Served held-back route (CUDA): every prefill row on the grouped tile (MiniResidentBackend::keep_prefill_grouped);
+    // set once after construction, before any append. The command line never sets it.
+    void keep_prefill_grouped() noexcept { backend_.keep_prefill_grouped(); }
     // Resolved prepared-attention round fold (mini_prepared_round_fold); set once after construction. True when the fold
     // runs (admitted on the qualified HIP target; declined elsewhere, CUDA included).
     bool set_prepared_round_fold(bool selected) { return backend_.set_prepared_round_fold(selected); }

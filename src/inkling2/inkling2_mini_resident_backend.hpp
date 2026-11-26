@@ -485,6 +485,12 @@ public:
     // Decode expert form this backend was built with (packed one-row form or the grouped tile kernel).
     [[nodiscard]] bool packed_decode() const noexcept { return packed_decode_; }
 
+    // Served held-back route on a chunk-invariant backend (CUDA): every prefill row keeps the grouped tile, a one-row
+    // prefill chunk included (mini_resident_chunk_route grouped_prefill), so a served prompt row's bits do not depend
+    // on the admitted chunk or the pieces. Set once before any append; the command line keeps its one-row route.
+    void keep_prefill_grouped() noexcept { grouped_prefill_ = !kBackendHip; }
+    [[nodiscard]] bool prefill_grouped() const noexcept { return grouped_prefill_; }
+
     void finish() {
         std::array<unsigned, (1U + kMiniMaxVerifyRows) * kLogicalVisits> storage{};
         const auto active = active_flags().size();
@@ -1052,7 +1058,7 @@ private:
         lowbit_chunk_ = lowbit_applies(weight_kind, rows) &&
                         (!weights_.bf16_bound() || decode_cohort_width == 0U ||
                          mini_lowbit_receipt_width(decode_cohort_width));
-        route_ = mini_resident_chunk_route(kind, rows, packed_decode_, moe_w4a4_bound(), cohort_rows_, !kBackendHip);
+        route_ = mini_resident_chunk_route(kind, rows, packed_decode_, moe_w4a4_bound(), cohort_rows_, grouped_prefill_);
 #if !defined(__HIPCC__)
         chunk_w4a4_ = mini_w4a4_rows(moe_w4a4_, kind);
 #endif
@@ -1099,9 +1105,11 @@ private:
                 check(decode::launch<MatrixFormat::mxfp8, kExpertsPerToken>(args, stream_, rows));
             return;
         }
-        // Packed cohort rows (served route lever only): launch_rows runs chunks of at most rows_chunk_cap(scratch
-        // rows) rows, so a pass of up to kMaxLaunchRows (16) rows is ONE launch when the activation scratch holds
-        // that many rows; row r keeps the bits of a one-row launch.
+#endif
+        // Packed cohort rows (the HIP served route lever; every packed CUDA decoder, mini_packed_cohort_rows):
+        // launch_rows runs chunks of at most rows_chunk_cap(scratch rows) rows, so a pass of up to kMaxLaunchRows (16)
+        // rows is ONE launch when the activation scratch holds that many rows; row r keeps the bits of a one-row launch
+        // (HIP and CUDA rows fixtures, mini_moe_device_fixture run_r1_rows; CUDA served lanes: cohort-lanes fixture).
         const auto scratch_rows = static_cast<unsigned>(
             std::min<std::size_t>(moe_bf16_.span().size() / (std::size_t{kExpertsPerToken} * kExpertWidth),
                                   decode::kMaxLaunchRows));
@@ -1116,7 +1124,6 @@ private:
                 check(decode::launch_rows<MatrixFormat::mxfp8, kExpertsPerToken>(args, stream_, rows, scratch_rows));
             return;
         }
-#endif
         // One route status per token remains live until finish(). Expert scratch
         // is reused in stream order after each decode form has consumed it.
         for (unsigned row = 0; row < rows; ++row) {
@@ -1169,6 +1176,7 @@ private:
     unsigned max_rows_;
     bool packed_decode_;
     bool cohort_rows_;  // packed cohort decode passes of up to max_rows_ lanes (mini_packed_cohort_rows)
+    bool grouped_prefill_ = false;  // keep_prefill_grouped (served held-back route, CUDA)
 #if !defined(__HIPCC__)
     moe_core::grouped_microscaled::Decode moe_decode_ = mini_cuda_moe_decode();
     moe_core::grouped_microscaled::Schedule moe_schedule_ = mini_cuda_moe_schedule();

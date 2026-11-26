@@ -116,18 +116,26 @@ struct MiniServeCohort {
     // The prompt chunk the load admitted (serve::load_with_chunk_ladder; 0 = MiniServeOptions::prefill_rows): the
     // cohort's prompt slice.
     unsigned prefill_rows = 0;
+    // Gap target of the pieces beside decoding lanes (0 = fixed kMiniServeDecodingRows pieces): the CUDA held-back route.
+    double prompt_gap_ms = 0.0;
 };
 
 // The served cohort's prompt service: alone, a prompt runs the admitted chunk per call (prompt_slice); beside a
 // decoding lane, pieces of kMiniServeDecodingRows (the incumbent 128-row mixed-service bound) cut inside those chunks
 // where the decoder's piece rule keeps the bits (CohortBackend::prompt_piece_rule: the HIP command line's route, the
-// CUDA held-back route); a decoder without a rule runs whole chunks.
-inline serve::CohortConfig mini_serve_scheduling(unsigned chunk, serve::PromptPieceRule rule) {
+// CUDA held-back route, whose pieces are gap-bounded: prompt_gap_ms); a decoder without a rule runs whole chunks.
+inline serve::CohortConfig mini_serve_scheduling(unsigned chunk, serve::PromptPieceRule rule,
+                                                 double prompt_gap_ms = 0.0) {
     serve::CohortConfig config;
     config.context_draft = false;
     config.max_draft = 0;
     config.prompt_slice = chunk;
     config.prompt_slice_decoding = rule.cuttable() && chunk > kMiniServeDecodingRows ? kMiniServeDecodingRows : 0U;
+    // Gap-bounded pieces (CUDA held-back route): at least the 128-row floor, at most the chunk, priced per pass.
+    if (config.prompt_slice_decoding != 0U && prompt_gap_ms > 0.0) {
+        config.prompt_gap_ms = prompt_gap_ms;
+        config.prompt_pass_fixed_ms = kMiniCudaPrefillPassFixedMs;
+    }
     return config;
 }
 
