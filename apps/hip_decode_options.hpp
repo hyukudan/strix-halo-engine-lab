@@ -3935,8 +3935,9 @@ inline Options parse_options(
     options.product_profile_inputs.regimes = strix::qwen::profile::fast_regimes;
     options.profile_device_class = std::string(device_class);
     options.profile_device_product = std::string(device_product);
-    // A serving capacity is not a request's actual prompt length: HTTP keeps the startup regime (no execution key);
-    // a request resolves with resolve_request_product_profile() over its own prompt.
+    // A serving capacity is not a request's actual prompt length: HTTP keeps the startup regime (no execution key), so
+    // the band rows (for example TURBO cap9 on 4,096-32,768 prompt tokens) are CLI-only. The server's levers are process
+    // global; a per-request resolution needs request-scoped levers first.
     if (options.http_serve) {
         options.product_profile_inputs.regime = strix::profile::startup_prefill_regime(device_class);
         options.product_profile = strix::qwen::profile::resolve(

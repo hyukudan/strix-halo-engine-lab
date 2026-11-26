@@ -342,11 +342,15 @@ serial route, `--profile default` vs `--profile fast`, two interleaved pairs) pr
 (−2.9 %, 1,371 → 1,412 tok/s)**, every fast run faster than every default run; decode is unchanged. See the
 [catalog](../../optimizations.md#qwen-moe-route-bf16).
 
-**MoE route pruning — optional toggle, default OFF, in no profile.** `STRIX_QPF2K_MOE_ROUTE_PRUNE=cap9` (or
+**MoE route pruning — optional toggle; TURBO band row on the prefill CLI.** `STRIX_QPF2K_MOE_ROUTE_PRUNE=cap9` (or
 `--prefill-moe-route-prune cap9`) drops the lowest-weight expert of every prefill row before the route plan is built:
 about 2 % less prefill time at 8,192 and 32,768 tokens, inside the composite FAST gate at both lengths. `cap8` gives
 4-5 % and leaves the gate at 32,768 tokens. It changes logits and adds `+rp<spec>` to the prefill identity; unset it and
-restart to roll back. Numbers and grammar: [moe-route-prune](../../engine/kernels/moe-route-prune.md).
+restart to roll back. EXACT and FAST never apply it. `--profile turbo` applies cap9 per run on gfx1151 for
+4,096-8,192 and 8,193-32,768 prompt tokens (band receipts: 8K 4,020.9 → 3,919.3 ms, 32K 16,140.4 → 15,846.1 ms against
+FAST; quality measured at 8K only: KL 0.00528, top-1 0.9707). It is CLI-only: the HTTP server resolves its startup
+regime, not each request's prompt, so served TURBO keeps the FAST rows. Numbers and grammar:
+[moe-route-prune](../../engine/kernels/moe-route-prune.md).
 
 **Chunked GDN prefill on FP16 WMMA — opt-in candidate, pending qualification.** `STRIX_QPF2K_GDN_FP16_CHUNK=1`
 (or `--gdn-fp16-chunk 1`) runs the GDN layers' conv, recurrence and gated norm as 32-row chunks on FP16 WMMA with FP32
