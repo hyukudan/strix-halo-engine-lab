@@ -150,9 +150,11 @@ PromptBand whole_prompt_band(const strix::profile::Resolution& startup);
 [[nodiscard]] constexpr std::uint32_t served_piece_rows(std::uint32_t piece_rows, std::uint32_t capacity_rows,
     std::uint32_t prompt_tokens, PromptBand band, std::uint32_t resume, bool image_rows, bool disk_state,
     bool capture) noexcept {
+    // the plan's piece rows are a multiple of 8 (plan_prefill_pieces); the one piece still ends at the prompt's end
+    const std::uint32_t rows = prompt_tokens > 0xFFFFFFF7U ? 0U : (prompt_tokens + 7U) / 8U * 8U;
     const bool whole = resume == 0U && !image_rows && !disk_state && !capture && band.covers(prompt_tokens) &&
-                       prompt_tokens <= capacity_rows;
-    return whole && prompt_tokens > piece_rows ? prompt_tokens : piece_rows;
+                       rows != 0U && rows <= capacity_rows;
+    return whole && rows > piece_rows ? rows : piece_rows;
 }
 // The wire decision is made before enabling D1. Zero is a decline, including a rank unable to allocate mirrors.
 inline bool paired_d1(std::uint64_t local, std::uint64_t peer) noexcept { return local != 0 && local == peer; }

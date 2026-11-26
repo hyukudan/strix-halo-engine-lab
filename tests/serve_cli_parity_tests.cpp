@@ -25,6 +25,7 @@
 #include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/deepseek41_prefill.hpp"
 #include "strix/ds41_prefill.hpp"
+#include "strix/deepseek41_prefix_cache.hpp"
 #endif
 #if defined(STRIX_PARITY_GEMMA4)
 #include "gemma4/engine/runtime.hpp"
@@ -460,6 +461,14 @@ void ds41() {
         check(pd::served_piece_rows(16384U, 32768U, 40000U, fast, 0U, false, false, false) == 16384U &&
               pd::served_piece_rows(16384U, 32768U, 8192U, fast, 0U, false, false, false) == 16384U,
               "ds41: outside the band, and inside one piece already, nothing changes");
+        // the served 32K prompt (30,975 tokens): the piece rows round up to 8 and the default plan is ONE piece to the end
+        const auto rows = pd::served_piece_rows(16384U, 32768U, 30975U, fast, 0U, false, false, false);
+        const auto plan = ds::select_prefix_prefill_plan(0U, 0U, 30975U, 1024U, rows, 9U, false, false, false, 0U, 0U);
+        check(rows == 30976U && plan.ends == std::vector<std::uint32_t>{30975U} && plan.points.empty(),
+              "ds41: an unaligned whole prompt is one piece (rows rounded to 8, plan_prefill_pieces accepts them)");
+        check(pd::served_piece_rows(16384U, 32768U, 32767U, fast, 0U, false, false, false) == 32768U &&
+              pd::served_piece_rows(16384U, 30968U, 30975U, fast, 0U, false, false, false) == 16384U,
+              "ds41: the rounded piece must still fit the capacity");
     }
 
 }
