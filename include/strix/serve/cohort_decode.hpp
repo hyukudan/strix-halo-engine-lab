@@ -236,7 +236,7 @@ struct CohortResult {
     std::string_view finish = "error";
     // Lone-lane speculation receipt (CohortConfig::lane_speculation; empty when the lane never ran a speculator step):
     // one JSON object of integers and booleans (CohortDecoder::finish).
-    std::string lane_speculation;
+    std::string lane_speculation{};  // a default member initialiser: positional initialisers may stop before it
 };
 
 struct CohortConfig;
