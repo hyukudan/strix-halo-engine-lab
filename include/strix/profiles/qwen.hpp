@@ -192,9 +192,10 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
             inherited |= owned && std::string_view(owned) == marker(profile, status, env);
         return inherited;
     };
+    const auto regime = ::strix::profile::measured_receipt_regime(inputs.regime, inputs.env);
     const auto build_arms = [&] {
     return ::strix::profile::ladder_arms(rows, std::span<const ::strix::profile::LadderRow>(ladder),
-        inputs.regime, admit_of, [&](const Lever& lever) -> std::optional<std::string_view> {
+        regime, admit_of, [&](const Lever& lever) -> std::optional<std::string_view> {
             if (const auto* cli = ::strix::profile::last_setting(inputs.cli, lever.name)) return std::string_view(*cli);
             const char* env = lever.env.empty() ? nullptr : environment(inputs.env, std::string(lever.env));
             if (env && !inherited_env(lever, env)) return env;
@@ -236,7 +237,7 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
             if (entry.status == Status::set && wanted == lever.builtin) entry.status = Status::builtin;
         }
         if (!cli && (!env || inherited))
-            ::strix::profile::apply_ladder(entry, ladder, profile, inputs.regime, admit, allow_pending, arms);
+            ::strix::profile::apply_ladder(entry, ladder, profile, regime, admit, allow_pending, arms);
         out.entries.push_back(std::move(entry));
     }
     return out;

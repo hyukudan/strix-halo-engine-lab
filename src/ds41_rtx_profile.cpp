@@ -328,8 +328,9 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
         if (table[i].apps & unsigned(app)) selections[i] = select_of(table[i]);
     // The lower arm the ladder rows are bound to; a lever outside this app never runs (its builtin).
     std::vector<strix::profile::LadderRow> ladder(inputs.ladder.begin(), inputs.ladder.end());
+    const auto regime = strix::profile::measured_receipt_regime(inputs.regime, inputs.env);
     const auto build_arms = [&] {
-        return strix::profile::ladder_arms(table, std::span<const strix::profile::LadderRow>(ladder), inputs.regime,
+        return strix::profile::ladder_arms(table, std::span<const strix::profile::LadderRow>(ladder), regime,
             [&](const Lever& lever, unsigned c) {
                 return strix::profile::column_admission(lever, c, allow_pending, strix::profile::model_preset());
             },
@@ -362,7 +363,7 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
                 return strix::profile::column_admission(lever, c, allow_pending, strix::profile::model_preset());
             };
             const auto admission = admit(column);
-            auto cell = strix::profile::select_profile_cell(lever, ladder, profile, inputs.regime, admit,
+            auto cell = strix::profile::select_profile_cell(lever, ladder, profile, regime, admit,
                                                             allow_pending, arms);
             entry.ladder = std::move(cell.route);
             entry.ladder_reference = std::move(cell.reference);

@@ -5695,6 +5695,14 @@ OFF: `STRIX_QPF2K_HC_RECOMPUTE_NORM=0`; restart. `=1` also admits the route with
 were not measured and therefore keep the image by default. Unsupported sites retain the image.
 See [admission, lifetime, resources and the native ticket](engine/prefill/hc-normalized-recompute.md).
 
+## Measured profile receipts
+
+Set `STRIX_PROFILE_STRICT_RECEIPTS=1` to require a recorded reference for automatic band promotion. The reference must
+match the complete execution, including pack and route settings outside the lever table, every effective lever identity,
+and the candidate identity. An unrecorded reference falls back to the lower tier. With the setting unset, historical
+band rows without a recorded reference continue to use the compatibility binding. Explicit lever settings keep their
+existing precedence. The control only changes automatic FAST/TURBO admission and has no performance gain of its own.
+
 ## HC low-band layout
 
 **Default ON (mode 3)** through decoder qpf2k defaults.

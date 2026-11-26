@@ -127,6 +127,7 @@ struct Regime {
     // ladder_execution(): backend, device product identity, priced workload and the effective timing settings. Part of
     // every ordinary timing reference (LadderArms::over); empty: not known, and no ordinary timing row decides.
     std::string_view execution{};
+    bool require_measured_receipts = false;
 };
 
 // At startup a server often knows its capacity but cannot resolve per request before a real prompt arrives.
@@ -279,13 +280,12 @@ struct LadderRow {
     // The implementation identity the incumbent grant or band receipt covers (Lever::identity of the candidate value).
     // A changed implementation under the same value needs its own receipt. Required for grants and band receipts.
     std::string_view identity{};
-    // Band receipt: the row was timed at representative workloads of its band (min_context..max_context) on its device
-    // class and carries no literal `over`. An adapter that spells Regime::execution binds it per resolution with
-    // bind_band_receipts(): `over` becomes that run's own reference (LadderArms::over) for the row's lever, value and
-    // tier. The adapter owns the measured execution scope (product, pack and route). The binder requires a known
-    // execution and the measured candidate identity above before matching the phase, device class and band.
+    // Band receipt: the row was timed at representative workloads of its band on its device class. A literal `over`
+    // freezes the measured scope, including all external settings and the lower arm. Historical band rows with no
+    // recorded key still have a per-run compatibility reference, which measured-receipt policy ignores.
     bool band_bound = false;
     BandEvidence band_evidence{};
+    std::string_view compatibility_over{};  // populated only on resolver-owned copies of historical rows
 };
 
 // Bound the rounding allowance to three tokens (the same fixture can differ by a few tokens by entry point).
@@ -374,8 +374,12 @@ struct ReceiptKey {
     if (row.phase != regime.phase || row.device.empty() || row.device != regime.device ||
         !ladder_band(regime.context, ladder_min_context(row), row.max_context, regime.lanes, row.min_lanes, row.max_lanes))
         return false;
-    if (key.joint.empty())
-        return !key.reference.empty() && !regime.execution.empty() && row.over == key.reference;
+    if (key.joint.empty()) {
+        if (row.band_bound && row.identity != key.identity) return false;
+        const auto over = row.band_bound && row.over.empty() && !regime.require_measured_receipts
+            ? row.compatibility_over : row.over;
+        return !key.reference.empty() && !regime.execution.empty() && over == key.reference;
+    }
     return key.joint_scope != nullptr && key.joint_scope->complete() && row.joint_scope == *key.joint_scope;
 }
 
@@ -1041,6 +1045,13 @@ inline const char* environment(const Lookup& env, std::string_view key) {
 }
 
 inline constexpr char kPresetEnv[] = "STRIX_INTERNAL_MODEL_PRESET";
+inline constexpr char kStrictReceiptsEnv[] = "STRIX_PROFILE_STRICT_RECEIPTS";
+
+[[nodiscard]] inline Regime measured_receipt_regime(Regime regime, const Lookup& env) {
+    const auto* value = environment(env, kStrictReceiptsEnv);
+    regime.require_measured_receipts |= value && std::string_view(value) == "1";
+    return regime;
+}
 
 // Model presets automatically admit qualified cells. Provisional experiments require an explicit opt-in.
 inline Status admit_profile_column(bool ready, bool runnable, bool allow_pending, bool provisional,
@@ -1288,24 +1299,22 @@ template <class Row, class AdmitOf, class ExplicitOf = NoExplicitSetting>
 
 // A synthetic execution for probing the band and candidate identity checks without an adapter.
 inline constexpr std::string_view kBandProbeExecution = "exec/v1 band-probe";
-// Binds the band receipts of `rows` to the run's own reference (LadderRow::band_bound). `storage` owns the spellings
-// (a deque: views stay valid) and must outlive the rows. Rows with an unknown execution, unidentified reference or
-// changed candidate identity stay unbound and decide nothing. A row already bound is re-bound when its reference
-// changed: the reference of a later lever extends the cells the earlier rows admitted (the ladder chain), so a caller
-// repeats bind + arms until nothing changes (resolve() does). Returns true when a row's reference changed.
+// Computes compatibility references for historical band rows that lack a recorded key. The measured `over` is
+// immutable. `storage` owns the spellings (views remain valid) and must outlive the rows. A later lever's compatibility
+// reference extends the cells the earlier rows admitted, so callers repeat bind + arms until the chain settles.
 inline bool bind_band_receipts(std::vector<LadderRow>& rows, const LadderArms& arms, std::deque<std::string>& storage) {
     bool changed = false;
     for (auto& row : rows) {
-        if (!row.band_bound || row.incumbent || !row.joint.empty()) continue;
+        if (!row.band_bound || row.incumbent || !row.joint.empty() || !row.over.empty()) continue;
         const auto at = arms.index(row.lever);
         const bool measured_candidate = identity_token(row.identity) && at < arms.identities.size() &&
             declared_identity(arms.identities[at], row.value) == row.identity;
         auto over = measured_candidate ? arms.over(row.tier, row.lever, row.value) : std::string{};
-        if (over == row.over) continue;
-        if (over.empty()) row.over = {};
+        if (over == row.compatibility_over) continue;
+        if (over.empty()) row.compatibility_over = {};
         else {
             storage.push_back(std::move(over));
-            row.over = storage.back();
+            row.compatibility_over = storage.back();
         }
         changed = true;
     }
@@ -1447,8 +1456,9 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
     const auto admit = [&](const Lever& lever, unsigned column) {
         return column_admission(lever, column, out.allow_pending, preset);
     };
+    const auto regime = measured_receipt_regime(inputs.regime, inputs.env);
     std::vector<LadderRow> ladder(engine.ladder.begin(), engine.ladder.end());
-    const auto build_arms = [&] { return ladder_arms(engine.table, std::span<const LadderRow>(ladder), inputs.regime,
+    const auto build_arms = [&] { return ladder_arms(engine.table, std::span<const LadderRow>(ladder), regime,
         admit,
         [&](const Lever& lever) -> std::optional<std::string_view> {
             if (const auto* cli = last_setting(inputs.cli, lever.name)) return std::string_view(*cli);
@@ -1479,7 +1489,7 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
             else entry.value = std::string(wanted);
         }
         if (cli == nullptr && env == nullptr)
-            apply_ladder(entry, ladder, profile_column, inputs.regime, [&](unsigned c) {
+            apply_ladder(entry, ladder, profile_column, regime, [&](unsigned c) {
                 return admit(lever, c);
             }, out.allow_pending, arms);
         out.entries.push_back(std::move(entry));
@@ -1530,9 +1540,10 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         if (row.joint.empty() && row.value.empty()) return where + ": timing row names no measured value";
         if (row.band_bound && (!row.joint.empty() || !identity_token(row.identity)))
             return where + ": band receipt requires a single measured candidate and its implementation identity";
-        if (row.joint.empty() && !row.band_bound && ladder_reference_execution(row.over).empty())
+        const bool fixed_reference = row.joint.empty() && (!row.band_bound || !row.over.empty());
+        if (fixed_reference && ladder_reference_execution(row.over).empty())
             return where + ": timing row without a versioned reference execution (LadderArms::over spelling)";
-        if (row.joint.empty() && !row.band_bound && !row.over.ends_with(std::string(";tier=") + name(row.tier)))
+        if (fixed_reference && !row.over.ends_with(std::string(";tier=") + name(row.tier)))
             return where + ": timing row key names another tier";
         if (row.device.empty() || row.receipt.empty()) return where + ": ladder row without device or receipt";
         if (!valid_ladder_measurement(row.speedup, row.noise)) return where + ": invalid speedup or noise";
@@ -1568,7 +1579,8 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
                                        row.max_lanes == kNoLaneBound ? row.max_lanes : row.max_lanes + 1};
         for (const auto context : contexts)
             for (const auto lane : lanes)
-                if (lane >= 1) out.push_back({row.phase, context, lane, row.device, (row.band_bound ? kBandProbeExecution : ladder_reference_execution(row.over))});
+                if (lane >= 1) out.push_back({row.phase, context, lane, row.device,
+                    row.band_bound && row.over.empty() ? kBandProbeExecution : ladder_reference_execution(row.over)});
     }
     return out;
 }

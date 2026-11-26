@@ -259,12 +259,13 @@ void defects() {
 // whose column admission is off has an entry with no judgment).
 std::string shipped_row_defect(const p::Engine& engine, const p::LadderRow& row) {
     const auto actual = resolve(engine, row.tier, {row.phase, p::ladder_min_context(row), row.min_lanes, row.device,
-                                                   row.band_bound ? p::kBandProbeExecution : p::ladder_reference_execution(row.over)});
+                                                   row.band_bound && row.over.empty() ? p::kBandProbeExecution
+                                                                                     : p::ladder_reference_execution(row.over)});
     const auto* entry = actual.find(row.lever);
     if (entry == nullptr) return "no entry for the lever";
     const std::string step = " " + std::string(p::name(row.tier)) + "=" + std::string(row.value) + " ";
     if (entry->ladder.find(step) == std::string::npos) return "the cell was not judged in its regime: " + entry->ladder;
-    if (!row.band_bound && entry->ladder_reference != row.over) return "judged over " + entry->ladder_reference + ", not the row's reference";
+    if (!row.over.empty() && entry->ladder_reference != row.over) return "judged over " + entry->ladder_reference + ", not the row's reference";
     if (entry->ladder.find(std::string(row.receipt)) == std::string::npos) return "the row did not decide: " + entry->ladder;
     return {};
 }

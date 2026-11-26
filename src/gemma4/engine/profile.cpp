@@ -312,8 +312,9 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
         }
         return std::nullopt;
     };
+    const auto regime = strix::profile::measured_receipt_regime(inputs.regime, inputs.env);
     const auto build_arms = [&] {
-        return strix::profile::ladder_arms(levers, std::span<const strix::profile::LadderRow>(ladder), inputs.regime,
+        return strix::profile::ladder_arms(levers, std::span<const strix::profile::LadderRow>(ladder), regime,
             [&](const Lever& lever, unsigned c) {
                 return strix::profile::column_admission(lever, c, out.allow_pending, strix::profile::model_preset());
             }, explicit_value, out.allow_pending);
@@ -354,7 +355,7 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
         } else if (wanted.empty()) {
             continue;
         } else {
-            auto cell = strix::profile::select_profile_cell(lever, ladder, profile, inputs.regime, admit, out.allow_pending,
+            auto cell = strix::profile::select_profile_cell(lever, ladder, profile, regime, admit, out.allow_pending,
                                                             arms);
             entry.ladder = std::move(cell.route);
             entry.ladder_reference = std::move(cell.reference);

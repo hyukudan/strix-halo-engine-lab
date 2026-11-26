@@ -312,7 +312,8 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
         return v == "0" || v == "off" ? std::string_view("off") : v;
     };
     // The lower arms the ladder rows are bound to; a lever outside this app never runs (its builtin).
-    const auto arms = shared::ladder_arms(table, inputs.ladder, inputs.regime,
+    const auto regime = shared::measured_receipt_regime(inputs.regime, inputs.env);
+    const auto arms = shared::ladder_arms(table, inputs.ladder, regime,
         [&](const Lever& lever, unsigned c) { return shared::column_admission(lever, c, allow_pending, false); },
         [&](const Lever& lever) -> std::optional<std::string_view> {
             if (!(lever.apps & unsigned(app))) return std::string_view(lever.builtin);
@@ -336,7 +337,7 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
         } else {
             const auto admit = [&](unsigned c) { return shared::column_admission(lever, c, allow_pending, false); };
             auto cell = shared::select_profile_cell(lever, inputs.ladder, static_cast<shared::Name>(profile),
-                                                    inputs.regime, admit, allow_pending, arms);
+                                                    regime, admit, allow_pending, arms);
             entry.ladder = std::move(cell.route);
             entry.ladder_reference = std::move(cell.reference);
             const auto admission = cell.benchmark ? shared::Status::unqualified : admit(column);

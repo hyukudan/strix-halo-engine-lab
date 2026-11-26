@@ -72,6 +72,34 @@ int main() try {
     inputs.profile = Name::standard;
     require(resolve(engine, inputs).entries[0].value == "0", "DEFAULT unchanged");
 
+    // An alternate pack or route cannot borrow a recorded band denominator.
+    {
+        Inputs receipt_inputs = inputs;
+        Lever ready = pending;
+        ready.ready[1] = true;
+        const std::array rows{ready};
+        auto band = timing;
+        band.identity = "v1";
+        band.band_bound = true;
+        band.band_evidence.timed = {8};
+        const Engine scoped{"scoped-band", "", rows, false, {}, {}, {}, std::span(&band, 1)};
+        receipt_inputs.profile = Name::fast;
+        receipt_inputs.allow_pending = false;
+        require(resolve(scoped, receipt_inputs).find("item")->value == "1", "the band keeps its measured denominator");
+        const auto original = receipt_inputs.regime;
+        receipt_inputs.regime.execution = "alternate-pack-and-route";
+        require(resolve(scoped, receipt_inputs).find("item")->value == "0", "the band cannot overwrite its recorded key");
+        vars[kStrictReceiptsEnv] = "1";
+        require(resolve(scoped, receipt_inputs).find("item")->value == "0", "strict resolution refuses a different denominator");
+        receipt_inputs.regime = original;
+        require(resolve(scoped, receipt_inputs).find("item")->value == "1", "strict resolution accepts a matching measured key");
+        band.over = {};
+        require(resolve(scoped, receipt_inputs).find("item")->value == "0", "a live key cannot establish a measured denominator");
+        vars[kStrictReceiptsEnv] = "10";
+        require(resolve(scoped, receipt_inputs).find("item")->value == "1", "only the exact opt-in enables strict receipts");
+        vars.erase(kStrictReceiptsEnv);
+    }
+
     // The ordinary shared consumer keeps the original preset behavior even with historical grants.
     {
         Lever qualified = pending;
