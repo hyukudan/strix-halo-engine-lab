@@ -45,9 +45,11 @@ struct ModelLaunch {
 
 // Legacy resolvers run both in the shell and in standalone processes.
 // Keep this scope alive through validation and startup, including exec.
+void append_native_profile(std::vector<std::string>& args, std::optional<Name> requested);
+
 class PresetScope {
 public:
-    PresetScope();
+    explicit PresetScope(bool enabled = true);
     ~PresetScope();
     PresetScope(const PresetScope&) = delete;
     PresetScope& operator=(const PresetScope&) = delete;

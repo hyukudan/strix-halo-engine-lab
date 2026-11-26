@@ -153,6 +153,19 @@ and [qualification](engine/serving/ds41-prefix-cache-qualification.md).
 
 ## Baselines, inspection and exactness
 
+### Native profile resolution through the product launchers
+
+**Engine:** shared. **Control:** `--native-profile`. **Default:** off.
+
+Use `strix run`, `strix serve` or `strix-serve` with `--native-profile` to use the engine's own admission and tier
+selection. An explicit `--profile` reaches the engine directly. When omitted, the engine selects its usual default.
+This mode also leaves KV selection to the engine. Use an asset with `--print-effective-config` to print the
+engine receipt. Applicable backend, asset and placement checks still run. The engine's supported tiers and
+explicit switches apply, including any provisional rows admitted by that native entry point.
+
+- **Evidence:** Host tests cover the forwarded arguments, the native inspection path and the scoped selection of
+  preset admission. This switch makes no throughput claim.
+
 ### Published tier throughput check
 
 **Engine:** shared. **Control:** `tools/ci/check_tier_monotonicity.py`. **Default:** checked in CI.

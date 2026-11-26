@@ -23,6 +23,7 @@ struct Request {
     std::vector<std::string> args;
     support::Filter support_filter;
     std::optional<profile::Name> profile;
+    bool native_profile = false;
     bool print_effective_config = false;
     std::string backend;
     std::string asset;

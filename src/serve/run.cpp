@@ -68,7 +68,7 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
             if (arg == "--") { while (++i < argc) family_args.emplace_back(argv[i]); break; }
             if (arg == "--help" || arg == "-h") {
                 out << "strix-serve --model FAMILY|ID|NAME [--profile exact|fast|turbo] [--asset PATH]\n"
-                    "  --backend hip|cuda --print-effective-config [-- ENGINE_ARGS]\n"
+                    "  --backend hip|cuda --native-profile --print-effective-config [-- ENGINE_ARGS]\n"
                     "  --device-count N --placement single|replica|layers|tensor|speculation\n"
                     "  --registry-root DIR --registry PATH --description PATH\n"
                     "  --list-models --inspect --family-inspect --bind ADDRESS --port N\n"
@@ -83,6 +83,9 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
             else if (arg == "--profile" || arg.starts_with("--profile=")) {
                 if (request.tier) throw std::invalid_argument("duplicate --profile");
                 request.tier = profile::parse_tier(arg == "--profile" ? value(i) : arg.substr(10));
+            } else if (arg == "--native-profile") {
+                if (request.native_profile) throw std::invalid_argument("duplicate --native-profile");
+                request.native_profile = true;
             } else if (arg == "--asset") request.asset = value(i);
             else if (arg == "--backend") {
                 request.backend = value(i);
@@ -167,7 +170,8 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
         }
         // A placement query alone does not apply a model preset: it is validated (below) against the effective tier,
         // so a family-native --profile after `--` keeps its passthrough (same design as strix run/serve).
-        const bool preset_requested = request.tier || request.print || !request.asset.empty() || !request.backend.empty();
+        const bool preset_requested = request.native_profile || request.tier || request.print ||
+            !request.asset.empty() || !request.backend.empty();
         const bool placement_requested = request.placement.placement || request.placement.devices != 1;
         std::optional<std::string> native_word;
         for (std::size_t i = 0; i < selection.arguments.size() && !native_word; ++i) {
@@ -178,15 +182,19 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
         const bool native_profile = !request.tier && !request.print && native_word.has_value();
         // The effective placement, resolved once: the native tier when one is given, else the shell resolver's.
         const auto placement_for = [&](std::string_view backend_name) {
-            if (native_profile) {
+            if (request.native_profile || native_profile) {
                 auto query = request.placement;
-                try { query.tier = profile::parse_tier(*native_word); } catch (const std::invalid_argument&) {}   // the engine rejects it
+                if (request.tier) query.tier = *request.tier;
+                else if (native_word) {
+                    try { query.tier = profile::parse_tier(*native_word); } catch (const std::invalid_argument&) {}   // the engine rejects it
+                }
                 return profile::multi_device::resolve(selection.description, query);
             }
             return profile::resolve_model_preset(selection.description, request.tier, backend_name, request.placement).placement;
         };
         const std::string_view backend = request.backend.empty() ? "hip" : std::string_view(request.backend);
         if (request.print && request.asset.empty() && selection.arguments.empty()) {
+            if (request.native_profile) throw std::invalid_argument("--native-profile inspection requires an engine asset");
             out << profile::resolve_model_preset(selection.description, request.tier, backend, request.placement).config.dump() << '\n';
             return 0;
         }
@@ -211,7 +219,12 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
                 if (!factory->asset_option.empty())
                     selection.arguments.emplace(selection.arguments.begin(), factory->asset_option);
             }
-            if (native_profile) {
+            if (request.native_profile) {
+                if (!request.print) profile::multi_device::admit(placement_for(backend), profile::multi_device::Executor::engine);
+                profile::append_native_profile(selection.arguments, request.tier);
+                if (request.print) selection.arguments.emplace_back("--print-effective-config");
+                scope.emplace(false);
+            } else if (native_profile) {
                 // The native --profile is the tier: no preset injection, the placement is admitted at that tier.
                 profile::multi_device::admit(placement_for(backend), profile::multi_device::Executor::engine);
             } else {

@@ -403,6 +403,20 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
                 "a replica dry-run names the placement, its executor and labels the worker command");
         fs::remove_all(root);
     }
+    const auto native_qwen = [&](std::vector<std::string> args) {
+        return resolve(parse(args), entries, matrix, probes, "bin", exists, &dense);
+    };
+    const auto implicit_native = native_qwen({"run", "qwen3.8-27b", "--backend", "cuda", "--asset", "model.gguf",
+                                              "--native-profile", "--print-effective-config"});
+    require(!implicit_native.preset && implicit_native.args == std::vector<std::string>{"--model", "model.gguf",
+                "--print-effective-config"}, "native policy preserves the engine's omitted tier and KV choices");
+    const auto explicit_native = native_qwen({"run", "qwen3.8-27b", "--backend", "cuda", "--asset", "model.gguf",
+                                              "--native-profile", "--profile", "turbo"});
+    require(!explicit_native.preset && explicit_native.args == std::vector<std::string>{"--model", "model.gguf",
+                "--profile", "turbo"}, "native policy forwards an explicit tier without the TOML override");
+    refuses([&] { (void)native_qwen({"run", "qwen3.8-27b", "--backend", "cuda", "--asset", "model.gguf",
+                "--native-profile", "--profile", "turbo", "--", "--profile=exact"}); }, "specify --profile once");
+
     req.profile = Name::fast;
     req.args = {"--kv=fp8"};
     refuses([&] { (void)resolve(req, entries, matrix, probes, "bin", exists, &dense); }, "requires the turbo preset");
@@ -448,6 +462,13 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
         require(profile::model_preset(), "preset scope enables shared preset environment");
         require(profile::resolve(engine, inputs).find("candidate")->status == profile::Status::pending,
                 "model preset waits for the FAST gate");
+        {
+            profile::PresetScope native(false);
+            require(!profile::model_preset() &&
+                    profile::resolve(engine, inputs).find("candidate")->status == profile::Status::provisional,
+                    "native policy inherits the native resolver even inside a preset environment");
+        }
+        require(profile::model_preset(), "native scope restores its preset parent");
         candidate.ready[1] = true;
         candidate.provisional[1] = false;
         require(profile::resolve(engine, inputs).find("candidate")->status == profile::Status::set,
