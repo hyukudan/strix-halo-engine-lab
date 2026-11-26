@@ -44,6 +44,7 @@ token. `scores.tsv` contains IDs, negative log-likelihood in nats and top-1
 hits. `run.json` includes the mean, perplexity and empirical unigram entropy for
 the same target IDs. `rms.tsv` and `layers.tsv` describe the residual before
 each indexed layer and after the last layer.
+`--dump-logits` writes the FP32 scores before the selected MultiMax probe.
 
 With `--save-layers`, the runner writes a little-endian F32 image at each
 boundary. Use the same immutable checkpoint and text to resume that image.

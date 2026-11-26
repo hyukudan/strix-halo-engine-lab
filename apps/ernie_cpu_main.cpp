@@ -40,7 +40,7 @@ struct Options {
     ernie::CheckpointReadPolicy decode;
     fs::path capture, packed, replay, resume;
     bool bf16 = false, fixed_gain = false, oracle = false, bos = false, save_layers = false, profile = false;
-    bool simd = false, parallel_mla = false;
+    bool simd = false, parallel_mla = false, dump_logits = false;
 };
 
 void set_variant(Options& opts, std::string_view name) {
@@ -94,6 +94,7 @@ Options parse_options(int argc, char** argv) {
         if (arg == "--parallel-mla") { opts.parallel_mla = true; continue; }
         if (arg == "--bos") { opts.bos = true; continue; }
         if (arg == "--save-layers") { opts.save_layers = true; continue; }
+        if (arg == "--dump-logits") { opts.dump_logits = true; continue; }
         if (arg == "--profile-host") { opts.profile = true; continue; }
         if (arg == "--bf16-projections") { opts.bf16 = true; continue; }
         if (arg == "--multiply-fixed-gain") { opts.fixed_gain = true; continue; }
@@ -123,7 +124,7 @@ Options parse_options(int argc, char** argv) {
         opts.start_layer > opts.end_layer || opts.end_layer > ernie::kLayerCount ||
         (opts.start_layer != 0 && opts.resume.empty())))
         throw std::invalid_argument("invalid oracle options or missing layer cache");
-    if (!opts.oracle && (opts.bos || opts.save_layers || !opts.resume.empty() || opts.start_layer != 0 ||
+    if (!opts.oracle && (opts.bos || opts.save_layers || opts.dump_logits || !opts.resume.empty() || opts.start_layer != 0 ||
         opts.end_layer != ernie::kLayerCount || opts.limit != 128 || opts.multimax != "identity"))
         throw std::invalid_argument("layer and text options require --oracle");
     return opts;
@@ -323,6 +324,10 @@ void run_oracle(std::vector<std::uint32_t> ids, const Options& opts, const fs::p
         });
     }
     if (opts.bf16) for (auto& row : logits) core::round_bf16_reference(row);
+    if (opts.dump_logits) {
+        auto dump = output_file(folder / "raw-logits.f32");
+        for (const auto& row : logits) write_row(dump, std::span(row));
+    }
     std::map<std::uint32_t, std::size_t> frequencies;
     for (auto id : targets) ++frequencies[id];
     auto scores = trace_file(folder / "scores.tsv", "position\tinput_id\ttarget_id\ttop_id\tnll\thit");
@@ -518,7 +523,7 @@ int main(int argc, char** argv) try {
                      " [--bf16-projections] [--multiply-fixed-gain] [--threads N] [--cache-mib N]"
                      " [--capture MODEL_DESCRIPTION] [--pack SIDECAR] [--replay TRACE_DIR]\n"
                      "       strix-ernie-cpu CHECKPOINT TEXT_FILE NEW_TRACE_DIR --oracle"
-                     " [--bos] [--limit N] [--save-layers] [--resume TRACE_DIR]"
+                     " [--bos] [--limit N] [--save-layers] [--dump-logits] [--resume TRACE_DIR]"
                      " [--start-layer N] [--end-layer N] [--threads N] [--cache-mib N] [--profile-host]"
                      " [--ordered-simd] [--table-mxfp4] [--parallel-mla]"
                      " [--variant NAME] [--multimax identity|hinge|signed-hinge|softplus]\n";
