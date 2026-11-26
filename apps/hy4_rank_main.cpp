@@ -221,7 +221,8 @@ void print_top(std::size_t p, std::uint32_t token, const std::vector<float>& log
 // Two stages of the shared layer pipeline over one link (pair/link.hpp: HY4_RANK / HY4_PEER / HY4_TRANSPORT).
 int run_pair(strix::hy4::hipbind::ForwardOptions o, const std::vector<std::uint32_t>& prompt, std::uint32_t gen, std::uint32_t cut,
              std::uint32_t repeat, std::uint16_t port, bool rows_explicit, bool pipe_guess,
-             const std::vector<strix::hy4::hipbind::PairWindowCost>& window_costs) {
+             const std::vector<strix::hy4::hipbind::PairWindowCost>& window_costs,
+             const strix::profile::multi_device::PlacementVote& vote) {
     namespace layers = strix::pair::layers;
     using clock = std::chrono::steady_clock;
     const auto ms_since = [](clock::time_point t) { return std::chrono::duration<double, std::milli>(clock::now() - t).count(); };
@@ -248,6 +249,8 @@ int run_pair(strix::hy4::hipbind::ForwardOptions o, const std::vector<std::uint3
               << ms_since(t_load) / 1000.0 << "\n" << std::flush;
     auto link = strix::pair::open_link(rank, "HY4", port);
     strix::dist::Transport* t = link.get();
+    // First exchange on the link: both ranks run the placement they decided (see run(): pair placement).
+    strix::profile::multi_device::agree_placement(vote, [t](auto out, auto in) { t->exchange(out, in); });
     const std::size_t row_bytes = fwd.seam_row_bytes();
     auto stream = static_cast<hipStream_t>(fwd.stream_handle());
     const std::uint32_t W = o.prompt_rows;
@@ -393,7 +396,8 @@ int run_pair(strix::hy4::hipbind::ForwardOptions o, const std::vector<std::uint3
 // same windows in prompt order (the shared stage-map invariant), so the head logits equal the two-stage and the one-node
 // prefill at the same width.
 int run_pair_stages(strix::hy4::hipbind::ForwardOptions o, const std::vector<std::uint32_t>& prompt, std::uint32_t gen,
-                    const std::string& map_text, std::uint32_t repeat, std::uint16_t port) {
+                    const std::string& map_text, std::uint32_t repeat, std::uint16_t port,
+                    const strix::profile::multi_device::PlacementVote& vote) {
     namespace layers = strix::pair::layers;
     using Forward = strix::hy4::hipbind::Forward;
     using clock = std::chrono::steady_clock;
@@ -439,6 +443,8 @@ int run_pair_stages(strix::hy4::hipbind::ForwardOptions o, const std::vector<std
     };
     auto link = strix::pair::open_link(rank, "HY4", port);
     strix::dist::Transport* t = link.get();
+    // First exchange on the link: both ranks run the placement they decided (see run(): pair placement).
+    strix::profile::multi_device::agree_placement(vote, [t](auto out, auto in) { t->exchange(out, in); });
     const std::size_t row_bytes = own.front().fwd->seam_row_bytes();
     const std::uint32_t W = o.prompt_rows;
     const std::uint64_t identity = layers::fnv(
@@ -691,6 +697,8 @@ int run(int argc, char** argv) {
     spec_run.per_step_route = (top_explicit && top > 0U) || !teacher.empty() || !dump_path.empty() || timing || gref.on;
     const bool spec_room = prompt.size() + gen + hr::kMaxVerifyRows <= o.context;
     std::optional<strix::serve::Json> placement_config;
+    // The decision both ranks must share; an explicit --tp-rank is the tensor form without a measured reference.
+    auto pair_vote = md::placement_vote(tp_rank >= 0 ? md::Form::tensor : md::Form::layers, {});
     if (layer_pair) {
         const auto rank = strix::pair::env_rank("HY4");
         const auto* transport = std::getenv("HY4_TRANSPORT");
@@ -716,6 +724,7 @@ int run(int argc, char** argv) {
         const auto policy = md::parse_policy(description);
         const auto decision = strix::hy4::resolve_pair_placement(description, q);
         placement_config = decision.json(policy, q);
+        pair_vote = md::placement_vote(decision.form, decision.ladder_reference);
         if (!print_config) std::cout << "pair placement " << placement_config->dump() << '\n';
         if (decision.form == md::Form::tensor && !print_config) {
             if (!stage_route || o.depth != 0 || rows == 0U)
@@ -796,10 +805,11 @@ int run(int argc, char** argv) {
     if (layer_pair && !stage_map.empty()) {
         if (cut != 0U || pipe_guess || !window_costs.empty())
             throw std::invalid_argument("--stage-map replaces --cut; --pipe-guess and --window-costs are two-stage options");
-        return run_pair_stages(o, prompt, gen, stage_map, std::max(repeat, 1U), port);
+        return run_pair_stages(o, prompt, gen, stage_map, std::max(repeat, 1U), port, pair_vote);
     }
     if (std::getenv("HY4_RANK") != nullptr)
-        return run_pair(o, prompt, gen, cut, std::max(repeat, 1U), port, rows_explicit, pipe_guess, window_costs);
+        return run_pair(o, prompt, gen, cut, std::max(repeat, 1U), port, rows_explicit, pipe_guess, window_costs,
+                        pair_vote);
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
     strix::hy4::hipbind::Forward fwd(o);
@@ -818,6 +828,9 @@ int run(int argc, char** argv) {
             throw std::invalid_argument("--tp-rank 0|1 needs --prompt-rows (each rank prefills alone) and --tp-rates A,B (GB/s)");
         auto opened = strix::dist::open_pair(tp_spec, static_cast<std::uint32_t>(tp_rank));
         if (!opened.receipt.empty()) std::cout << "tp transport: " << opened.receipt << "\n";
+        // Startup handshake on the host link before the gather's first collective: both ranks decided tensor on the
+        // same measured reference (a rank with a stale or missing receipt refuses here instead of desynchronising).
+        md::agree_placement(pair_vote, [&opened](auto out, auto in) { opened.host->exchange(out, in); });
         // largest gather: half the logits row (vocab / 2 FP32); the link probe sizes fit in 1 MiB; speculative decode: a
         // verify pass's MoE join at 8 rows (8 x (8 slot rows x 1536 + shared / 2) FP32) < 2 MiB
         // route: the shared policy (pair::select_route); the device-waited channel unless STRIX_TP_CHANNEL=0 (staged)

@@ -124,6 +124,11 @@ kernel y las uniones son concatenaciones, así que los ids son los de un nodo. A
 enlace y el planificador compartido imprime `tp placement:`; rechaza el par cuando lo predice más lento (`--tp-force`
 lo ejecuta igualmente, `--tp-trip-us` sustituye el viaje medido).
 
+Antes de la primera colectiva los dos rangos intercambian su decisión de colocación (la forma y un hash de la
+referencia del recibo medido) y ambos se niegan a arrancar si difieren, por ejemplo cuando solo un rango recibió el
+recibo de despliegue. La colocación en par (capas o tensor) es una función de `strix-hy4-rank`: el servidor HTTP
+(`strix-serve --model hy4_flash`) sirve en un nodo y nunca resuelve una colocación en par.
+
 ## Medidas
 
 Clase (ver [Clase aritmética](#clase-aritmética)): la línea de la ruta por defecto es BASE; las filas de la tabla usan la

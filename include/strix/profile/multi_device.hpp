@@ -7,7 +7,10 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <span>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // Multi-device placement as model DATA: the [multi_device] section of a model TOML, resolved once by the shared
@@ -144,5 +147,43 @@ void admit(const Decision&, Executor);
 
 // One call for every launcher: parse + select + legacy report.
 [[nodiscard]] Decision resolve(const model_description::ModelDescription&, const Query&, const Lookup& env = {});
+
+// Pair startup agreement. Each rank resolves its placement from its own inputs (receipt, flags), so a stale or missing
+// receipt on one rank would start the two ranks on different forms. Before the first collective of the chosen form the
+// ranks exchange this vote (the decided form plus an FNV-1a 64 of the ladder reference) over the host link and refuse
+// on any difference. Same-host binaries only: the vote is raw bytes in host order.
+inline constexpr std::uint32_t kPlacementVoteMagic = 0x504c5631U;  // "PLV1"
+struct PlacementVote {
+    std::uint32_t magic = kPlacementVoteMagic;
+    std::uint32_t form = 0;
+    std::uint64_t reference = 0;
+};
+static_assert(sizeof(PlacementVote) == 16U);
+[[nodiscard]] constexpr std::uint64_t placement_reference_hash(std::string_view reference) noexcept {
+    std::uint64_t h = 14695981039346656037ULL;
+    for (const char c : reference) h = (h ^ static_cast<unsigned char>(c)) * 1099511628211ULL;
+    return h;
+}
+[[nodiscard]] constexpr PlacementVote placement_vote(Form form, std::string_view ladder_reference) noexcept {
+    return {kPlacementVoteMagic, static_cast<std::uint32_t>(form), placement_reference_hash(ladder_reference)};
+}
+// exchange(out, in) sends this rank's 16 bytes and receives the peer's (dist::Transport::exchange on the host link).
+// Throws std::runtime_error naming both decisions when the peer's vote differs or is not a vote.
+template<class Exchange>
+void agree_placement(const PlacementVote& mine, Exchange&& exchange) {
+    PlacementVote peer{};
+    exchange(std::as_bytes(std::span(&mine, 1)), std::as_writable_bytes(std::span(&peer, 1)));
+    if (peer.magic != kPlacementVoteMagic)
+        throw std::runtime_error("pair placement agreement: the peer sent no placement vote (different build or route)");
+    if (peer.form == mine.form && peer.reference == mine.reference) return;
+    const auto name = [](std::uint32_t f) {
+        return f <= static_cast<std::uint32_t>(Form::speculation) ? std::string(form_name(static_cast<Form>(f)))
+                                                                  : "form#" + std::to_string(f);
+    };
+    throw std::runtime_error("pair placement agreement: this rank decided " + name(mine.form) + " (reference fnv " +
+                             std::to_string(mine.reference) + "), the peer decided " + name(peer.form) +
+                             " (reference fnv " + std::to_string(peer.reference) +
+                             "); give both ranks the same deployment receipt and placement");
+}
 
 } // namespace strix::profile::multi_device

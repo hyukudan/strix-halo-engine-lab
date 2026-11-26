@@ -5,12 +5,17 @@
 #include "strix/profile/model_preset.hpp"
 #include "strix/profile/multi_device.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <iostream>
 #include <map>
 #include <optional>
+#include <span>
+#include <stdexcept>
 #include <string>
 
 namespace {
@@ -395,6 +400,49 @@ void registered_models(const std::filesystem::path& root) {
         }
     }
 }
+// Review P2-1: two ranks run agree_placement over one symmetric exchange; each receives the other's vote. Equal
+// decisions pass on both ranks; a different form, a different ladder reference or a non-vote refuses on both.
+std::array<std::string, 2> two_ranks(const md::PlacementVote& rank0, const md::PlacementVote& rank1) {
+    const std::array<md::PlacementVote, 2> votes{rank0, rank1};
+    std::array<std::string, 2> errors{};
+    for (std::size_t r = 0; r < 2U; ++r) {
+        try {
+            md::agree_placement(votes[r], [&](std::span<const std::byte> out, std::span<std::byte> in) {
+                require(out.size() == sizeof(md::PlacementVote) && in.size() == out.size(), "the vote is 16 bytes");
+                std::memcpy(in.data(), &votes[1U - r], in.size());
+            });
+        } catch (const std::runtime_error& e) {
+            errors[r] = e.what();
+        }
+    }
+    return errors;
+}
+
+void placement_agreement() {
+    static_assert(md::placement_reference_hash("") == 14695981039346656037ULL, "FNV-1a 64 offset basis");
+    const auto tensor = md::placement_vote(md::Form::tensor, "pair-placement/v1;receipt-a");
+    const auto both_pass = [](const std::array<std::string, 2>& e) { return e[0].empty() && e[1].empty(); };
+    const auto both_refuse = [](const std::array<std::string, 2>& e, const std::string& needle) {
+        return e[0].find(needle) != std::string::npos && e[1].find(needle) != std::string::npos;
+    };
+    require(both_pass(two_ranks(tensor, tensor)), "same form and reference: both ranks start");
+    const auto layers = md::placement_vote(md::Form::layers, "");
+    require(both_pass(two_ranks(layers, layers)), "the default layer route agrees without a receipt");
+    const auto split = two_ranks(tensor, layers);
+    require(both_refuse(split, "pair placement agreement") && split[0].find("decided tensor") != std::string::npos &&
+                split[0].find("peer decided layers") != std::string::npos &&
+                split[1].find("decided layers") != std::string::npos,
+            "tensor vs layers refuses on both ranks and names both forms");
+    const auto stale = md::placement_vote(md::Form::tensor, "pair-placement/v1;receipt-b");
+    require(both_refuse(two_ranks(tensor, stale), "reference fnv"), "same form, different receipt: both refuse");
+    require(both_refuse(two_ranks(tensor, md::placement_vote(md::Form::tensor, "")), "reference fnv"),
+            "measured tensor vs explicit tensor without a receipt: both refuse");
+    md::PlacementVote garbage{};
+    garbage.magic = 0U;
+    require(!two_ranks(tensor, garbage)[0].empty() &&
+                two_ranks(tensor, garbage)[0].find("no placement vote") != std::string::npos,
+            "a peer that sends no vote is refused");
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -410,6 +458,7 @@ int main(int argc, char** argv) {
     effective_wire_report();
     launch_applies_single_and_replica();
     registered_models(argv[1]);
+    placement_agreement();
     if (failures) {
         std::cerr << failures << " failure(s)\n";
         return 1;

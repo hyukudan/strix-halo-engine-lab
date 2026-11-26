@@ -119,6 +119,11 @@ concatenations, so the ids equal one node. At start-up both ranks measure the li
 `tp placement:`; it refuses the pair when the pair is predicted slower (`--tp-force` runs it anyway, `--tp-trip-us`
 replaces the measured trip).
 
+Before the first collective the two ranks exchange their placement decision (the form and a hash of the measured
+receipt reference) and both refuse at start-up when they differ, for example when only one rank was given the
+deployment receipt. The pair placement (layers or tensor) is a `strix-hy4-rank` feature: the HTTP server
+(`strix-serve --model hy4_flash`) serves on one node and never resolves a pair placement.
+
 ## Measured
 
 Class (see [Arithmetic class](#arithmetic-class)): the default-path line is BASE; the table rows use the FAST lever
