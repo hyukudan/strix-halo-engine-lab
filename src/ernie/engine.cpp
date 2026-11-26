@@ -116,7 +116,9 @@ void FirstRowReference::feed_forward(unsigned layer_id, const std::string& layer
                                      LayerResult& result) const {
     const auto& s = shape_;
     const auto activate = [this](float gate, float up) {
-        return activation_(gate, up, nearest_float(m::activation_situ_beta), nearest_float(m::activation_situ_linear_beta));
+        const float value = activation_(gate, up, nearest_float(m::activation_situ_beta),
+                                        nearest_float(m::activation_situ_linear_beta));
+        return shape_.contracts.checkpoint_stores ? attn::group_indexer::bf16_round(value) : value;
     };
     const auto glu = [&](const std::string& gate, const std::string& up, const std::string& down,
                          unsigned width, std::span<const float> in, std::span<float> out) {
@@ -175,7 +177,10 @@ void FirstRowReference::feed_forward(unsigned layer_id, const std::string& layer
         [&](auto in, auto out) {
             const auto shared = prefix + "shared_experts.";
             glu(shared + "w1.weight", shared + "w3.weight", shared + "w2.weight", s.expert_width, in, out);
-        }, result.ffn);
+            if (s.contracts.checkpoint_stores) core::round_bf16_reference(out);
+        }, result.ffn, s.contracts.norm_routed_output ? moe_core::LatentNormSite::routed_output
+                                                     : moe_core::LatentNormSite::expert_input);
+    if (s.contracts.checkpoint_stores) core::round_bf16_reference(result.ffn);
 }
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop

@@ -178,6 +178,15 @@ void check_operator_traits() {
         [](auto x, auto y) { y[0] = x[0]; y[1] = x[1]; y[2] = x[0] + x[1]; },
         [](auto x, auto y) { std::ranges::copy(x, y.begin()); }, row);
     require(row == std::array{0.0F, -10.0F, 0.0F}, "latent norm, routed reduction, reprojection, and shared branch");
+    moe_core::latent_experts_reference(hidden, gain, 2.375F,
+        [](auto, auto y) { y[0] = -0.5F; y[1] = 0.5F; },
+        [](auto x, auto y) {
+            require(x[0] == -0.5F && x[1] == 0.5F, "experts receive the unnormalized latent");
+            y[0] = 2.0F * x[0]; y[1] = -3.0F * x[1];
+        },
+        [](auto x, auto y) { y[0] = x[0]; y[1] = x[1]; y[2] = x[0] + x[1]; },
+        [](auto x, auto y) { std::ranges::copy(x, y.begin()); }, row, moe_core::LatentNormSite::routed_output);
+    require(row == std::array{1.0F, -7.0F, 4.0F}, "routed latent norm precedes reprojection");
 }
 }  // namespace
 

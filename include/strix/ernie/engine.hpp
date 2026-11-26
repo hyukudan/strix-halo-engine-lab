@@ -20,6 +20,8 @@ struct HostContracts {
     bool global_kv_split = false;
     bool gate_before_vha = false;
     bool no_hca_inverse_rope = false;
+    bool norm_routed_output = false;
+    bool checkpoint_stores = false;
     unsigned position_offset = 0;
     float rope_base = 0;
     float rms_epsilon = 0;
