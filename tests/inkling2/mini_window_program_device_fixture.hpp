@@ -12,8 +12,17 @@
 // after the partial / full commit both decoders then make (a rollback rebuilds histories from the checkpoint and the
 // window's convolution tape, so a tape the program recorded wrongly shows there). Widths 1..8 each appear several
 // times at different positions (capture, then replays), with kept rows 0..K. Exit 0 PASS, 1 FIRST DIFF, 2 error.
+//
+// With a drafter (--dspark FILE, else the MTP block beside the checkpoint) each decoder also carries the command
+// line's resident DSpark drafter, run between windows as in a drafting decode: after every commit (and after the
+// prefill) both drafters start at the new anchor and propose one block, and the fixture compares what the drafter
+// reads and returns: every committed DSpark tap row [0, committed) (a row written at another position than the
+// window's shows here, not in the per-window rows above) and the proposals.
 
 #include "inkling2/inkling2_mini_resident_decoder.hpp"
+#include "inkling2/inkling2_mini_resident_dspark.hpp"
+#include "strix/model_data/inkling2_mini.hpp"
+#include "strix/spec/drafter_source.hpp"
 
 #include <algorithm>
 #include <array>
@@ -21,9 +30,11 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace strix::inkling2::test {
@@ -156,11 +167,57 @@ inline std::unique_ptr<MiniResidentDecoder> window_decoder(const char* checkpoin
     return decoder;
 }
 
-inline int window_program_identity(const char* checkpoint, bool screened) {
+inline constexpr std::uint32_t kWindowDrafts = 7U;  // the command line's deepest model draft (8-row window)
+
+// What a drafting decode's drafter reads after a commit and what it proposes: every committed tap row, then the block
+// it drafts from `anchor` at the committed frontier (start + one draft, the command line's model pass).
+inline std::vector<WindowItem> drafter_state(MiniResidentDecoder& decoder, MiniResidentDSpark& drafter,
+                                             unsigned anchor, std::vector<std::uint32_t>& proposals) {
+    std::vector<WindowItem> items;
+    const auto taps = decoder.committed_taps();
+    const auto tap_row = static_cast<std::size_t>(MiniDSparkTapPlan::elements(1U));
+    const auto bytes = window_device_bytes(taps.data(), taps.size());
+    const auto row_bytes = tap_row * sizeof(std::uint16_t);
+    for (std::size_t row = 0; row * row_bytes < bytes.size(); ++row) {
+        const auto begin = bytes.begin() + static_cast<std::ptrdiff_t>(row * row_bytes);
+        items.push_back({"committed DSpark tap row at position " + std::to_string(row),
+                         std::vector<unsigned char>(begin, begin + static_cast<std::ptrdiff_t>(row_bytes))});
+    }
+    const auto committed = static_cast<std::uint32_t>(taps.size() / tap_row);
+    drafter.start(anchor, committed);
+    drafter.draft({}, kWindowDrafts, proposals);
+    // Fixed size (a shorter block pads with ~0) so the two sides always compare item by item.
+    std::array<std::uint32_t, kWindowDrafts> padded{};
+    padded.fill(~0U);
+    std::copy_n(proposals.begin(), std::min<std::size_t>(proposals.size(), padded.size()), padded.begin());
+    WindowItem block{"drafter proposals", std::vector<unsigned char>(sizeof(padded))};
+    std::memcpy(block.bytes.data(), padded.data(), block.bytes.size());
+    items.push_back(std::move(block));
+    return items;
+}
+
+inline std::string window_ids(const std::vector<std::uint32_t>& ids) {
+    std::string text;
+    for (const auto id : ids) text += (text.empty() ? "" : ",") + std::to_string(id);
+    return "[" + text + "]";
+}
+
+inline int window_program_identity(const char* checkpoint, bool screened, std::string_view dspark = {}) {
     auto eager_owner = window_decoder(checkpoint, false, screened);
     auto program_owner = window_decoder(checkpoint, true, screened);
     auto& eager = *eager_owner;
     auto& program = *program_owner;
+    // The command line's drafter: an explicit file, else the MTP block beside the checkpoint when present.
+    const auto drafter_file = spec::resolve_drafter_file({.file = dspark, .off = false, .speculating = true},
+                                                         checkpoint, model_data::inkling2_mini::speculation::drafter);
+    std::optional<MiniResidentDSpark> eager_drafter, program_drafter;
+    if (!drafter_file.path.empty()) {
+        eager_drafter.emplace(eager, kWindowContext, drafter_file.path);
+        program_drafter.emplace(program, kWindowContext, drafter_file.path);
+    }
+    std::cout << "WINFIX drafter " << (drafter_file.path.empty() ? std::string("none") : drafter_file.path) << '\n';
+    unsigned drafts_compared = 0U, drafts_differing = 0U;
+    std::vector<std::uint32_t> proposals_eager, proposals_program;
     std::vector<unsigned> prompt(kWindowPromptRows);
     for (unsigned i = 0; i < prompt.size(); ++i) prompt[i] = window_token(0U, i);
     unsigned token = eager.prefill(prompt);
@@ -171,6 +228,18 @@ inline int window_program_identity(const char* checkpoint, bool screened) {
     WindowCompare result;
     compare_window(window_state(eager, 0U, 0U, {}, false), window_state(program, 0U, 0U, {}, false), "after prefill",
                    result);
+    const auto compare_drafters = [&](unsigned anchor, const std::string& where) {
+        if (!eager_drafter || !program_drafter) return;
+        const auto drafted_eager = drafter_state(eager, *eager_drafter, anchor, proposals_eager);
+        const auto drafted_program = drafter_state(program, *program_drafter, anchor, proposals_program);
+        compare_window(drafted_eager, drafted_program, where + " drafter", result);
+        ++drafts_compared;
+        const bool same = proposals_eager == proposals_program;
+        drafts_differing += same ? 0U : 1U;
+        std::cout << "WINFIX DRAFT " << where << " anchor " << anchor << " eager " << window_ids(proposals_eager)
+                  << (same ? " == " : " != ") << "program " << window_ids(proposals_program) << '\n';
+    };
+    compare_drafters(token, "after prefill");
     auto& graphs = program.step_program_backend().window_graphs();
     std::array<unsigned, MiniResidentDecoder::kMaxVerifyRows + 1U> replays{};
     unsigned position = kWindowPromptRows;
@@ -206,6 +275,7 @@ inline int window_program_identity(const char* checkpoint, bool screened) {
         program.commit(keep);
         compare_window(window_state(eager, position, keep, {}, false), window_state(program, position, keep, {}, false),
                        tag + " after commit keep=" + std::to_string(keep), result);
+        compare_drafters(keep != 0U ? top_eager[keep - 1U] : token, tag + " after commit keep=" + std::to_string(keep));
         std::cout << "WINFIX " << tag << " keep=" << keep << " program " << (replayed ? "ran" : "declined")
                   << " picks " << top_eager[0] << (top_eager[0] == top_program[0] ? " == " : " != ") << top_program[0]
                   << '\n';
@@ -232,6 +302,7 @@ inline int window_program_identity(const char* checkpoint, bool screened) {
     }
     std::cout << "WINFIX instantiations " << graphs.instantiations() << " compared items " << result.items
               << " differing " << result.differing << '\n';
+    std::cout << "WINFIX drafts compared " << drafts_compared << " proposals differing " << drafts_differing << '\n';
     if (programs_ran == 0U) {
         std::cout << "WINFIX RESULT INVALID: no window program ran (every width declined)\n";
         return 2;
