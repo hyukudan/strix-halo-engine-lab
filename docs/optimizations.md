@@ -87,6 +87,42 @@ block. The host fixture checks startup, work and return to idle. Native
 idle-and-resume qualification is pending.
 [Lead](../src/glm/serve/glm_serve_lead.hpp) · [Fixture](../tests/glm_serve_cpu_tests.cpp).
 
+<a id="ernie-parallel-checkpoint-decode"></a>
+### ERNIE parallel checkpoint row decoding
+
+Each FP8 or MXFP4 row uses the same decoder on the same codes and scales. The reordered decoder fixture compares FP32 bytes, including a partial FP8 tile. The host code lives in `src/ernie/checkpoint.cpp` and uses `--threads N`. Wall time is pending an official checkpoint A/B.
+
+Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+
+<a id="ernie-cpu-parallel-projections"></a>
+### ERNIE row-parallel CPU projections
+
+Partitions independent output rows and keeps the input order and fused operations of each dot product. Wall time pending an official checkpoint A/B. The host code lives in `src/core/streamed_linear_reference.hpp`. The control is `--threads N`. This row applies to the ERNIE CPU candidate.
+
+Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+
+<a id="ernie-decoded-matrix-cache"></a>
+### ERNIE bounded decoded matrix cache
+
+Retains immutable FP32 matrices after repeated access and evicts the least recent entries within the byte budget. Avoids rereading and decoding retained matrices. Wall time is pending an official checkpoint A/B. The host code lives in `src/core/streamed_linear_reference.hpp`. The control is `--cache-mib N`. This row applies to the ERNIE CPU candidate.
+
+Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+
+<a id="ernie-layer-major-prefill"></a>
+### ERNIE layer-major CPU prefill
+
+Keeps per-layer token order and compares all-logit bits against row-by-row prefill in the synthetic stack. Improves the locality of layer weights. Wall time pending an official checkpoint A/B. The host code lives in `src/ernie/forward.cpp`. This row applies to the ERNIE CPU candidate.
+
+Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+
+<a id="ernie-head-slabs"></a>
+### ERNIE streamed CPU vocabulary head
+
+Uses the same independent contiguous row dots as the whole matrix. A synthetic tail slab compares bitwise. Bounds the decoded head workspace at 64 MiB for the official shape, plus a 32 MiB input slice. The host code lives in `apps/ernie_cpu_main.cpp`. This row applies to the ERNIE CPU candidate.
+
+Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+
+
 <a id="ds41-single-attention-read-ahead"></a>
 ### Single DeepSeek attention read-ahead
 
