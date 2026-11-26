@@ -76,3 +76,7 @@ cudaError_t enqueue_schedule(const MixArgs& args, cudaStream_t stream) {
 }
 
 } // namespace strix::cuda::mix
+
+// launch_mix (core/residual_mix.hpp) binds enqueue_selected; every include order of the mix headers completes this
+// header's body before the latency form's.
+#include "mix_cuda_latency.cuh"

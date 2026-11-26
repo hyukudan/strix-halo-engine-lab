@@ -2,6 +2,7 @@
 
 #include "row_plan.hpp"
 #include "cuda/core/dense/bf16_row_abi.hpp"
+#include "cuda/core/dense/rows_bf16_narrow.cuh"
 #include "core/dense_row_plan.hpp"
 #include "cuda/core/lookup_cuda.cuh"
 #include "strix/core/rows.hpp"
@@ -12,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -144,6 +146,16 @@ inline cudaError_t enqueue_bf16_dense_rows(const float* input, unsigned input_wi
         }
     }
     cudaError_t status = cudaSuccess;
+    // One row of one rounded narrow projection: the output split of the incumbent rounded MMA3 rows kernel (bitwise
+    // against it: tests/cuda_core/mixlat_cuda_fixture.cu). Its 16-byte weight and input loads keep the incumbent on
+    // any other alignment. The operand class does not reach this path: the rows kernel always splits three terms.
+    const auto aligned = [](const void* p) { return reinterpret_cast<std::uintptr_t>(p) % 16U == 0U; };
+    if (short_count != 0 && bf16_narrow_selected(rows, short_count, round_bf16, input_width, short_weights[0].out) &&
+        aligned(short_weights[0].data) && aligned(input)) {
+        status = dense_bf16_mma3_r1_output_split(short_weights[0], short_outputs[0], input, stream);
+        if (status == cudaSuccess && planes_report) *planes_report = split_planes;
+        return status;
+    }
     if (short_count != 0) status = core::for_each_dense_chunk<kMaxRows>(rows, cudaSuccess, [&](unsigned first, unsigned count) {
         std::array<float*, kMaxBf16RowProjections> outputs;
         for (unsigned i = 0; i < short_count; ++i)

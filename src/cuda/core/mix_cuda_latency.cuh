@@ -143,6 +143,15 @@ bank_softmax_tiled(const __grid_constant__ Args args) {
     return cuda_core::launch_pdl(kernel, dim3(grid.tiles, grid.queries), dim3(kLatencyBankThreads, grid.banks), stream, args);
 }
 
+// The residual readout the shared launch_mix binds (core/residual_mix.hpp): a one-row readout whose shape the tiled
+// plan admits (latency_grid: rows 1, width <= kLatencyMaxWidth, fits) takes enqueue_tiled, every other readout the
+// incumbent enqueue. Same bits either way (tests/cuda_core/mixlat_cuda_fixture.cu: tiled vs K8c and resident CUDA).
+[[nodiscard]] inline cudaError_t enqueue_selected(const ::strix::core::residual_mix::MixArgs& args,
+                                                  cudaStream_t stream) {
+    if (latency_grid(args).tiles != 0U) return enqueue_tiled(args, stream);
+    return enqueue(args, stream);
+}
+
 // One launch for every job of the batch; each job's bits are those of enqueue_tiled with that single query.
 [[nodiscard]] inline cudaError_t enqueue_batch(const ::strix::core::residual_mix::BankBatchArgs& args, cudaStream_t stream) {
     using Args = ::strix::core::residual_mix::BankBatchArgs;

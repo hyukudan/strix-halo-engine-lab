@@ -1,5 +1,6 @@
 #include "core/dense_bf16_narrow_plan.hpp"
 #include "core/mix_latency_plan.hpp"
+#include "cuda/core/dense/rows_bf16_narrow_plan.hpp"
 #include "cuda/core/mix_cuda_latency_plan.hpp"
 #include "strix/exec/catalog.hpp"
 
@@ -52,6 +53,21 @@ void geometry() {
     static_assert(bf16_narrow_blocks(32, 16, 0, 16) == 0);
     static_assert(bf16_narrow_blocks(32, 16, 32, 0) == 0);
     static_assert(bf16_narrow_blocks(32, 15, 32, 15) == 0);
+
+    // Unrequested split selection (the shared CUDA rows dispatch): one row, one rounded narrow projection.
+    using core::bf16_narrow_selected;
+    static_assert(core::kBf16NarrowSelectOutputs == 64U);
+    static_assert(bf16_narrow_selected(1, 1, true, 4608, 64, 32, 16));
+    static_assert(bf16_narrow_selected(1, 1, true, 32, 16, 32, 16) && bf16_narrow_selected(1, 1, true, 160, 48, 32, 16));
+    static_assert(!bf16_narrow_selected(2, 1, true, 4608, 64, 32, 16), "two rows keep the incumbent");
+    static_assert(!bf16_narrow_selected(0, 1, true, 4608, 64, 32, 16), "no rows keep the incumbent");
+    static_assert(!bf16_narrow_selected(1, 2, true, 4608, 64, 32, 16), "two projections keep the incumbent");
+    static_assert(!bf16_narrow_selected(1, 1, false, 4608, 64, 32, 16), "an unrounded projection keeps the incumbent");
+    static_assert(!bf16_narrow_selected(1, 1, true, 4608, 80, 32, 16), "wider than the measured class");
+    static_assert(!bf16_narrow_selected(1, 1, true, 4600, 64, 32, 16), "input off the K32 blocks");
+    static_assert(!bf16_narrow_selected(1, 1, true, 4608, 56, 32, 16), "outputs off the m16 tiles");
+    static_assert(cuda_core::bf16_narrow_selected(1, 1, true, 4608, 64) &&
+                  !cuda_core::bf16_narrow_selected(1, 1, true, 4608, 72));
 }
 
 // The batch contract: jobs numbered set by set, each job = one single-query readout, disjoint outputs required.

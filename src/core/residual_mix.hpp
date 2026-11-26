@@ -31,6 +31,7 @@ struct MixArgs;
 }
 namespace strix::cuda::mix {
 [[nodiscard]] inline cudaError_t enqueue(const ::strix::core::residual_mix::MixArgs& args, cudaStream_t stream);
+[[nodiscard]] inline cudaError_t enqueue_selected(const ::strix::core::residual_mix::MixArgs& args, cudaStream_t stream);
 namespace detail {
 template <bool ParallelBanks>
 cudaError_t enqueue_schedule(const ::strix::core::residual_mix::MixArgs& args, cudaStream_t stream);
@@ -756,7 +757,8 @@ inline Error launch_mix(const MixArgs& args, Stream stream) {
     if (args.rows <= 2U && args.bank_count > 1U) return detail::launch_mix_schedule<true>(args, stream);
     return detail::launch_mix_schedule(args, stream);
 #else
-    return ::strix::cuda::mix::enqueue(args, stream);
+    // One row: the tiled latency form where its plan admits the shape (same bits as the incumbent), else the incumbent.
+    return ::strix::cuda::mix::enqueue_selected(args, stream);
 #endif
 }
 
