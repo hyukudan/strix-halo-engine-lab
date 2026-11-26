@@ -500,6 +500,14 @@ public:
     bool try_step_graph(MiniResidentChunk chunk, Work& work) {
         // Layout and workspace addresses are fixed for this backend's lifetime. A route tap and the
         // order-null gate perform host-synchronous reads and writes.
+        // An append that is not the one-row decode step (a prompt chunk, the kept rows a partial verify commit replays)
+        // runs eagerly and leaves the captured step as it is: it binds no other address, and every setting a capture
+        // depends on drops the graph where it changes (levers, low-bit arithmetic, the screened head, slot resets).
+        // Without this, every verify replay of a drafting run made the next plain step capture again.
+        if (!step_token_) {
+            clear_flags();
+            return false;
+        }
         if (graph_.try_launch(stream_, step_graphs_, chunk.rows, step_token_.has_value(),
                               host_taps_off(),
                               {chunk.first_position, step_token_.value_or(0U)}, [&] {
@@ -630,8 +638,16 @@ public:
         check(launch_mini_residual_add(lhs, rhs, output, round_bf16, stream_));
     }
 
+    // `output` starts at the tap's column of the chunk's first position. During a one-row step capture it starts at
+    // the tap's column of position 0 instead and the row comes from the step descriptor, so the replayed graph stores
+    // every step at its own position (same bytes, same place as the eager store).
     void store_draft_tap(MiniConstRows input, std::span<std::uint16_t> output) {
         namespace rows = core::row_transforms;
+        if (const auto* step = capture_descriptor()) {
+            check(rows::elements(input.size(), rows::StoreBf16SliceAtRow{
+                input.data(), output.data(), kHiddenWidth, MiniDSparkTapPlan::width, &step->position}, stream_));
+            return;
+        }
         check(rows::elements(input.size(), rows::StoreBf16Slice{
             input.data(), output.data(), kHiddenWidth, MiniDSparkTapPlan::width}, stream_));
     }

@@ -1152,10 +1152,10 @@ private:
         }
         auto& greedy = multi_pick ? *verify_greedy_ : greedy_;
         auto token = head_argmax::kNone;
-        // The one-row decode step of the single session replays from a device step descriptor. DSpark
-        // taps and the other slots bind position- or slot-dependent addresses, so they stay eager.
-        const bool decode_step = kind == MiniAppendKind::decode && rows == 1U &&
-                                 &state == &slots_.front()->state() && draft_taps_.span().empty();
+        // The one-row decode step of the single session replays from a device step descriptor; its DSpark tap store
+        // takes the row from the descriptor too (store_draft_tap), so a drafting run's plain step is the same graph.
+        // The other slots bind slot-dependent addresses, so they stay eager.
+        const bool decode_step = kind == MiniAppendKind::decode && rows == 1U && &state == &slots_.front()->state();
         // A calibrated decode uses its admitted head for both single and lanes picks.
         const bool lowbit = backend_.lowbit_applies(kind, rows);
         // The single-pick screened head is HIP's own binding or the CUDA lever (CUDA verify rows stay full).
@@ -1167,7 +1167,12 @@ private:
         const bool lanes_screened = !lowbit && verify_lanes_pick_ && pick_next && multi_pick && !need_scores &&
                                     verify_top.size() <= screen_->max_lanes();
 #else
-        static_cast<void>(scores_read);  // only the HIP verify rows level 2 tells reads apart
+        // A CUDA verify window whose scores nobody reads (no host rows, no announced read) picks every row through the
+        // lanes form of the EXACT screened head (cuda/core/head_screened.cuh: lane l is the R=1 head of its row, the
+        // incumbent full-head token and status): the plane is read once for the window instead of the full BF16 head
+        // (0.92 GB) once per row. Under the screened-head lever only, like the one-row pick.
+        const bool lanes_screened = !lowbit && pick_next && multi_pick && !need_scores && !scores_read && screen_ &&
+                                    head_.reason == MiniHeadReason::lever && verify_top.size() <= screen_->max_lanes();
 #endif
         const bool screened = !lowbit &&
             mini_screened_pick(head_.reason, screen_.has_value(), kind, pick_next, multi_pick, need_scores);
@@ -1202,6 +1207,15 @@ private:
                     if (verify_rows_ && multi_pick) {
                         project_head_rows(tail.data(), static_cast<unsigned>(head_rows), scores);
                         rows_head = true;
+                    }
+#else
+                    if (lanes_screened) {
+                        greedy.enqueue_produced_rows(static_cast<unsigned>(head_rows), [&](std::uint32_t* device_tokens) {
+                            return screen_->enqueue(tail.data(),
+                                ::strix::cuda::core::head_argmax::EmitIndexOrNone{device_tokens}, stream_.get(),
+                                static_cast<unsigned>(head_rows), kHiddenWidth);
+                        }, stream_.get());
+                        return;
                     }
 #endif
                     for (std::size_t row = 0; row < head_rows; ++row) {
@@ -1277,8 +1291,9 @@ private:
     bool build_screen() {
         if (weights_.compact()) return false;
         try {
+            // Scratch for a whole verify window (the lanes pick of append); the one-row pick uses lane 0.
             screen_.emplace(weights_.bf16("unembed.weight").data(), kOutputVocabulary, kHiddenWidth, kLogitSoftcap,
-                            stream_.get());
+                            stream_.get(), 8U, std::max(1U, max_verify_rows()));
         } catch (const std::exception& error) {
             screen_.reset();
             static_cast<void>(cudaGetLastError());
