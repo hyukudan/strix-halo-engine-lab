@@ -288,6 +288,7 @@ bool check_ring_append() {
     const auto old_key = cache.keys[slot];
     const auto old_value = cache.values[slot];
     bool overwrote = false;
+    bool rejected = false;
     const auto finish_calls = single.backend.finish_calls;
     single.backend.trace_banks = false;
     try {
@@ -296,9 +297,21 @@ bool check_ring_append() {
             throw std::runtime_error("fixture failure after wrapped append");
         });
     } catch (const std::runtime_error&) {
-        return overwrote && single.backend.finish_calls == finish_calls + 2U && equal_committed_state(multi, single);
+        rejected = true;
     }
-    return false;
+    if (!rejected || !overwrote || single.backend.finish_calls != finish_calls + 2U ||
+        !equal_committed_state(multi, single)) return false;
+
+    // Retry the rejected token and compare against a lane that never saw the
+    // failed write. Check all visit state and both repeat banks on continuation.
+    multi.backend.banks = {};
+    single.backend.banks = {};
+    single.backend.trace_banks = true;
+    const auto control_out = std::span(multi_out).first(kHiddenWidth);
+    multi.append(1, control_out);
+    single.append(1, first_out);
+    return equal_rows(control_out, first_out) && equal_committed_state(multi, single) &&
+           std::ranges::equal(multi.backend.banks, single.backend.banks, equal_rows);
 }
 
 bool check_cohort_append() {
