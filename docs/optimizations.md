@@ -57,17 +57,17 @@ directories for the qualification builds.
 <a id="qwen-qsa-shared-eager"></a>
 ## Qwen Flash Next shared eager QSA score and output
 
-Configure a HIP device build with `-DSTRIX_QWEN_QSA_SHARED_EAGER=ON` to test the score and
-value forms in `src/attn_core/eager_selected.hpp` through the same launcher in the CLI and server.
-The adapter supplies BF16 or int8 KV reads, captured selection counts and status checks.
-The build option defaults to `OFF` for all profiles. Device qualification requires the launcher
-fixture and byte-identical model output on automatic, eager BF16, eager KV-int8, and long-prompt
-routes. Performance is unmeasured. Use fresh state and separate cache directories for each build.
+The HIP QSA launcher runs the score and value forms of `src/attn_core/eager_selected.hpp` in the CLI and
+server, in every profile; the adapter supplies BF16 or int8 KV reads, captured selection counts and status checks.
+The launcher's private score / output bodies were deleted after the device identity (dev_b 11-26, PR head
+2019eacec5, cluster1 gfx1151): launcher fixture PASS and 128 generated ids equal to the private form on the
+automatic (MTP), eager BF16, eager KV-int8 and long-prompt (4,096) routes. No gain is claimed (same bits; one
+sample per route within +-1.5 %, not an ABBA timing).
 
 | Model | Shared EXL3 Hadamard adapter | Shared eager QSA score and output |
 |---|---|---|
 | inkling2-mini | No Gemma 4 EXL3 adapter | No Qwen QSA adapter |
-| qwen3.8-flash-next | No Gemma 4 EXL3 adapter | HIP qualification build |
+| qwen3.8-flash-next | No Gemma 4 EXL3 adapter | HIP, every profile (EXACT bind) |
 | qwen3.8-27b | No Gemma 4 EXL3 adapter | Dense attention |
 | deepseek-v4.1-flash | No Gemma 4 EXL3 adapter | DeepSeek sparse attention |
 | glm-5.3-flash | No Gemma 4 EXL3 adapter | GLM sparse attention |
