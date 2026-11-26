@@ -3967,6 +3967,8 @@ if(BUILD_TESTING)
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     endif()
     if(Python3_Interpreter_FOUND)
+        add_test(NAME strix-profile-receipts-tests
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tools/ci/check_profile_receipts.py)
         add_test(NAME strix-dual-transport-runner-tests
             COMMAND ${Python3_EXECUTABLE} -B -W error::ResourceWarning ${CMAKE_SOURCE_DIR}/lab/transport/test_dual_tbstream.py)
         add_test(NAME strix-private-kernel-preparation-tests
