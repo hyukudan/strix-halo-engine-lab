@@ -1675,6 +1675,38 @@ void minimax_i4_binding() {
 
 }  // namespace
 
+// Band receipts along a chain: the second lever's band row binds over the cell the first lever's band row admits
+// (bind + arms repeated until the references settle), so both cells of a measured chain run inside their bands.
+void band_chain() {
+    static constexpr std::array<p::Lever, 2> table{{
+        {"chain-window@1", "", "", {"", "w", "", ""}, "off", p::Kind::bit_changing, {true, true, false, false},
+         {true, true, false, false}, "", "off", "fixture receipts", false, {}, false, {}, {{{"off", "v1"}, {"w", "v1"}}}},
+        {"chain-layers@1", "", "", {"", "l", "", ""}, "off", p::Kind::bit_changing, {true, true, false, false},
+         {true, true, false, false}, "", "off", "fixture receipts", false, {}, false, {}, {{{"off", "v1"}, {"l", "v1"}}}},
+    }};
+    const auto band = [](std::string_view lever, std::string_view value, double speedup) {
+        p::LadderRow row{lever, value, p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, speedup, 0.02, "r/band"};
+        row.band_bound = true;
+        return row;
+    };
+    const std::array rows{band("chain-window@1", "w", 1.5), band("chain-layers@1", "l", 1.1)};
+    const p::Engine engine{"band-chain", "", table, false, "band-chain-v1", {}, {}, rows};
+    require(p::ladder_defect(engine).empty(), "band chain fixture is well formed: " + p::ladder_defect(engine));
+    const auto in_band = resolve(engine, p::Name::fast, {p::Phase::prefill, 4096, 1, "dev", kExec});
+    const auto* window = in_band.find("chain-window@1");
+    const auto* layers = in_band.find("chain-layers@1");
+    require(window && window->value == "w" && p::applied(window->status), "first band lever runs in its band");
+    require(layers && layers->value == "l" && p::applied(layers->status) &&
+                layers->ladder_reference.find("chain-window@1=w{v1}") != std::string::npos,
+            "second band lever binds over the first lever's admitted cell and runs");
+    const auto unknown = resolve(engine, p::Name::fast, {p::Phase::prefill, 4096, 1, "dev", {}});
+    require(!p::applied(unknown.find("chain-window@1")->status) && !p::applied(unknown.find("chain-layers@1")->status),
+            "unknown execution: no band row decides");
+    const auto outside = resolve(engine, p::Name::fast, {p::Phase::prefill, 8193, 1, "dev", kExec});
+    require(!p::applied(outside.find("chain-window@1")->status) && !p::applied(outside.find("chain-layers@1")->status),
+            "outside the band: the tier below");
+}
+
 int main(int argc, char** argv) try {
     if (argc < 3) return 2;
     if (argc > 3 && std::string_view(argv[3]) == "--write") {
@@ -1688,6 +1720,7 @@ int main(int argc, char** argv) try {
     lowbit_candidate(strix::weight::kLowBitRowsSelectLever, strix::core::LowBitArithmetic::f16_rows_select,
                      {p::Phase::decode, 16384U, 1, "gfx1151", kExec});
     verdicts();
+    band_chain();
     bound_evidence();
     defects();
     shipped_rows();

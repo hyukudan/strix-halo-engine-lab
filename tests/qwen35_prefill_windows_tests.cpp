@@ -93,6 +93,13 @@ void test_dump_window_and_tail() {
     const auto win = q::plan_prefill(f, 130U, 64U, kMax);
     check(win.windows.back().want == q::LogitRows::all && win.windows.back().tops() == 2U && logit_windows(win) == 1U,
           "wide + dump-window: every row of the last window (130 = 64 + 64 + 2)");
+    q::PrefillFlags dw;  // --dump-logits --dump-window without --wide: the wide path at the resolved width, not the row path
+    dw.dump = dw.dump_window = true;
+    const auto res = q::plan_prefill(dw, 130U, 64U, kMax);
+    check(!dw.row_path() && !res.row_path && res.width == 64U && res.windows.back().tops() == 2U && logit_windows(res) == 1U,
+          "dump-window alone: the resolved wide windows, every row of the last one");
+    dw.dump_window = false;
+    check(dw.row_path(), "dump alone keeps the row path");
     for (const bool dump : {false, true}) {
         q::PrefillFlags t;
         t.width = 64U;

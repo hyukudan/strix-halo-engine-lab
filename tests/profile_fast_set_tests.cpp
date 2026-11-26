@@ -364,7 +364,7 @@ int main() {
                  strix::minimax::defaults::ladder_rows);
     check_table("qwen-hip", strix::qwen::profile::table, false, strix::qwen::profile::ladder_rows);
     check_table("qwen-cuda", strix::qwen::cuda_profile::table, false, strix::qwen::cuda_profile::ladder_rows);
-    check_table("qwen35-hip-dense", strix::qwen35::hip_profile::table, false, strix::qwen35::hip_profile::kLadderRows);
+    check_table("qwen35-hip-dense", strix::qwen35::hip_profile::table);
     qwen_dense_regimes();
     regime_gate_rows();
     qwen_hip_regimes();
@@ -379,7 +379,7 @@ int main() {
         check_gates("minimax-pair", md::profile_table, {}, mm_rows);
         check_gates("qwen-hip", strix::qwen::profile::table, {});
         check_gates("qwen-cuda", strix::qwen::cuda_profile::table, {});
-        check_gates("qwen35-hip-dense", strix::qwen35::hip_profile::table, strix::qwen35::hip_profile::kFastGates);
+        check_gates("qwen35-hip-dense", strix::qwen35::hip_profile::table, {});
     }
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);

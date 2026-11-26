@@ -79,6 +79,9 @@ namespace turbo {
 namespace cuda {
 inline constexpr std::string_view kv = "fp8";
 } // namespace cuda
+namespace hip {
+inline constexpr std::string_view levers = "turbo";
+} // namespace hip
 inline constexpr std::string_view levers = "fast";
 } // namespace turbo
 } // namespace presets
