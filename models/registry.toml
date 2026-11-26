@@ -6,6 +6,15 @@
 # exists and that every models/*.toml has a row; it does not prove support.
 schema = "strix-registry/v1"
 
+[models.ernie_5_5_flash_preview]
+name = "ernie-5.5-flash-preview"
+description = "models/ernie-5.5-flash-preview.toml"
+family = "ernie"
+profile_tag = "ernie"
+defaults = ["include/strix/profiles/ernie.hpp"]
+apps = ["apps/ernie_inventory_main.cpp"]
+adapter = ["include/strix/ernie/inventory.hpp", "src/ernie/inventory.cpp"]
+
 [models.qwen3_8_flash_next]
 name = "qwen3.8-flash-next"
 description = "models/qwen3.8-flash-next.toml"
