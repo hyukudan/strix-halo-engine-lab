@@ -322,7 +322,8 @@ ServePreparation prepare_serve(int argc,char** argv) {
             prepared.bind_given |= std::string_view(argv[i]) == "--bind";
             prepared.port_given |= std::string_view(argv[i]) == "--port";
         }
-        if (!streams_given) options.streams = std::uint32_t(serve_slots());
+        if (streams_given) prepared.deployment_slots = options.streams;
+        else options.streams = std::uint32_t(serve_slots());
         if (options.help) {
             report << "strix-gemma4-serve MODEL --rope-tables TABLE_DIR --tokenizer tokenizer.json [--backend host|device|intel] [--bind 127.0.0.1 --port 8080] [--dflash on|off|auto] [--draft-mtp DIR | --draft DRAFT.gguf --draft-rope TABLE.g4dr | --draft-eagle FILE] [--threads 1..16]\n"
                 "drafters: --draft-mtp DIR (Gemma-4-E4B-it MTP assistant: a drafter-mtp/ package or a model dir containing one; recommended),\n"

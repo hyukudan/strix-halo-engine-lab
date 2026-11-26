@@ -20,7 +20,7 @@ int main(int argc, char** argv) {
         e::Runtime runtime(options);
         if (options.inspect) { std::cout << e::effective_config(*runtime.backend,options.request,bool(runtime.drafts),options.streams).dump() << '\n'; return 0; }
         if (!runtime.tokenizer) throw std::invalid_argument("serve requires --tokenizer");
-        // The deployment plan's slot count reaches the API explicitly (0: STRIX_G4_SERVE_SLOTS as without a plan).
+        // Explicit --streams and deployment placement reach the API's slot count.
         e::Api api(*runtime.backend,runtime.tokenizer,runtime.drafts,options.request.dflash,"nemotron-bolt-e4b",options.request,deployment,
                    e::Api::Owner::standalone,{},prepared.deployment_slots);
         strix::serve::HttpServerConfig config; config.bind_address = options.bind; config.port = options.port;

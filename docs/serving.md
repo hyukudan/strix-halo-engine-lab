@@ -73,6 +73,9 @@ prefill MoE table ring (CLI only: qualified with one engine owner); Gemma's stre
 prompt). Scheduling between concurrent requests (slots, per-step prefill limits, peer timeouts) has no CLI
 counterpart.
 
+For a matched Gemma 4 or Nemotron run, pass `--streams 1` to both entry points. HTTP uses the explicit count
+for the scheduler and the engine's session configuration.
+
 GLM uses the shared prefill load callbacks for candidate admission and installation, including the first-forward
 reserve and the engine's two-rank install votes/retries. The synthetic host gate in `tests/pr593_host` checks agreed
 rows and installed layouts under reduced and asymmetric memory, including 4096-row fallback. These host checks

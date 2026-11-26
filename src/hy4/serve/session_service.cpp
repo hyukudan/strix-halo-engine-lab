@@ -1,6 +1,7 @@
 #include "hy4/serve/session_service.hpp"
 #include "hy4/hy4_speculation.hpp"
 #include "strix/profiles/hy4.hpp"
+#include "strix/hy4/profile_options.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/model_family_registry.hpp"
@@ -85,7 +86,9 @@ public:
 Options parse_options(std::span<const std::string> arguments) {
     Options o;
     std::vector<std::string> args(arguments.begin(), arguments.end());
-    ::strix::profile::take_options(profile::engine(), args, o.profile);
+    const auto overrides = take_profile_options(args, o.profile);
+    o.prompt_rows = overrides.prompt_rows;
+    o.head_q8 = overrides.head_q8;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const auto& a = args[i];
         const auto value = [&]() -> const std::string& {
@@ -103,12 +106,6 @@ Options parse_options(std::span<const std::string> arguments) {
             if (o.model_id.empty()) throw std::invalid_argument("--model-id must not be empty");
             o.model_id_given = true;
         } else if (a == "--print-effective-config") o.print_effective_config = true;
-        else if (a == "--prompt-rows") o.prompt_rows = number<std::uint32_t>(a, value());
-        else if (a == "--head-q8") {
-            const auto& mode = value();
-            if (mode != "0" && mode != "1") throw std::invalid_argument("--head-q8 expects 0 or 1");
-            o.head_q8 = mode == "1";
-        }
         else if (::strix::session::speculation_opt_out_argument(a)) o.no_mtp = true;
         else if (a == "--help" || a == "-h") o.help = true;
         else throw std::invalid_argument("unknown hy4_flash option: " + a + " (see --help)");

@@ -489,6 +489,33 @@ void cuda_cli_server() {
     const auto startup = qo::resolve(request, qo::Entry::serve);
     require(!profile_selects_storage(startup) && startup.choice.qsa_mma,
             "startup declines the non-incumbent timing row and retains the incumbent form");
+
+    // Use the request words both entries consume, with the same prefill schedule and no handoff.
+    for (const auto* tier : {"exact", "fast", "turbo"}) {
+        std::vector<std::string> words{"model", "--model", "model.gguf", "--tables", "tables", "--rope-table", "rope",
+                                       "--profile", tier, "--blocks", "4096,8192"};
+        std::vector<char*> argv;
+        for (auto& word : words) argv.push_back(word.data());
+        qo::Request matched;
+        matched.inputs.env = [](const char*) -> const char* { return nullptr; };
+        matched.inputs.regime = p::startup_prefill_regime();
+        matched.engine.decode = true;
+        matched.engine.export_state = false;
+        matched.engine.release_by_layer = false;
+        for (int i = 1; i < static_cast<int>(argv.size()); ++i)
+            require(qo::take(static_cast<int>(argv.size()), argv.data(), i, matched), "Qwen CUDA consumes the shared request words");
+        const auto native = qo::resolve(matched, qo::Entry::cli);
+        const auto served = qo::resolve(matched, qo::Entry::serve);
+        const auto cli_receipt = strix::serve::parse_json(qo::effective_config_json(native));
+        const auto server_receipt = strix::serve::parse_json(qo::effective_config_json(served));
+        for (const auto* field : {"profile", "resolution", "forms", "form_identities", "engine", "kv", "arithmetic_contract"}) {
+            const auto* a = cli_receipt.find(field);
+            const auto* b = server_receipt.find(field);
+            require(a && b && a->dump() == b->dump(), std::string("Qwen CUDA ") + tier + " receipt field " + field);
+        }
+        require(native.config.block_schedule == std::vector<std::uint32_t>{4096, 8192},
+                "Qwen CUDA preserves the explicitly matched block schedule");
+    }
 }
 
 void custom_adapters() {

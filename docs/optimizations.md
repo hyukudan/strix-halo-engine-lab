@@ -6008,6 +6008,9 @@ another with the single-row instruction sequence.
 
 ## Hy4-flash prompt windows: bf16 epilogue in the producers' store
 
+The rank and HTTP entry points share the explicit profile option parser. `--prompt-rows=N` and `--head-q8=0|1`
+also accept a separate argument for the value. Both entry points reject malformed values before model load.
+
 **Engine:** `hy4`. **Control:** `STRIX_HY4_PF_STORE_EPILOGUE`. **Default:** on.
 
 The windowed prompt (`--prompt-rows`) ran a separate `glu::launch_epilogue<Round::bf16>` pass over every Q8_0 Linear
