@@ -1374,7 +1374,7 @@ int main(int argc, char** argv) {
             ops.turbo_prefill_policy = [&](std::uint64_t prompt, unsigned generated, bool fresh) {
                 const rd::PrefillWork work{ops.turbo_prefill_pair && fresh, prompt, opt.capacity, opt.max_rows, opt.slots, generated};
                 const bool selected = rd::select_prefill_wmma(request, eff, rd::process_env(), work);
-                rd::report_prefill_wmma(opt.rank, request, work, selected);
+                rd::report_prefill_wmma(opt.rank, request, eff, rd::process_env(), work, selected);
                 return selected;
             };
         }

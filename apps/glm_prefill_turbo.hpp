@@ -37,13 +37,19 @@ inline bool measured_prefill_layout(unsigned pipeline) {
     return pipeline == 2 && layout.routed && !layout.sharded && layout.query_window == 0;
 }
 
-// Per-prompt receipt of the pf_wmma ladder decision (FAST band row / TURBO rows); the profile receipt's
-// strix-ladder/v1 route line names the deciding row.
-inline void report_prefill_wmma(unsigned rank, const Request& r, const PrefillWork& work, bool selected) {
+// Per-prompt receipt of the pf_wmma ladder decision (FAST band row / TURBO rows). When the prompt reached the ladder
+// (voted pair, ordinary workload), the second line is the shared strix-ladder/v1 route of that prompt's regime: it
+// names the deciding row (or why none applies).
+inline void report_prefill_wmma(unsigned rank, const Request& r, const Effective& e, const EnvGet& env,
+                                const PrefillWork& work, bool selected) {
     const char* profile = r.product.profile ? strix::profile::name(*r.product.profile) : "default";
     std::fprintf(stderr, "rank %u glm-pf-wmma-x profile=%s prompt=%llu chunk=%u effective=%s (%s)\n",
                  rank, profile, static_cast<unsigned long long>(work.prompt), work.rows, selected ? "wmma" : "exact-cores",
                  selected ? "matched 8060S USB4 TP2 ladder row" : "outside measured execution");
+    if (!work.pair_ready || !ordinary_lossy_prefill(r, e)) return;
+    const auto product = resolve_product(r, env, e.baseline, work);
+    const auto* row = product ? product->find("pf_wmma") : nullptr;
+    if (row != nullptr && !row->ladder.empty()) std::fprintf(stderr, "rank %u %s\n", rank, row->ladder.c_str());
 }
 
 }  // namespace strix::glm::rank_defaults

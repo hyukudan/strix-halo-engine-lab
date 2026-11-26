@@ -1128,7 +1128,7 @@ int main(int argc, char** argv) {
                 toks.size(), opt.capacity, opt.max_rows, opt.slots, decode_n};
             const bool turbo = rd::select_prefill_wmma(request, eff, rd::process_env(), work);
             if (rd::ordinary_lossy_prefill(request, eff) && !strix::glm::pf::wmma_x::enabled())
-                rd::report_prefill_wmma(opt.rank, request, work, turbo);
+                rd::report_prefill_wmma(opt.rank, request, eff, rd::process_env(), work, turbo);
             const auto t0 = Clock::now();
             auto& control = decode_control;
             sp::Seed seed;

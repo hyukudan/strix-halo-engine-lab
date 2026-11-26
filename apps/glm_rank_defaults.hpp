@@ -366,6 +366,17 @@ inline std::optional<strix::profile::Resolution> resolve_product(const Request& 
             entry.ladder_lowered = false;
         }
     }
+    // pf_wmma is profile-owned per prompt (select_prefill_wmma opens the bundle in a ProfileScope; the switch is never
+    // exported), and that selection admits no --allow-pending run. The shared benchmark opt-in of an unmeasured regime
+    // would only rename the cell in the receipt: report the exact cores that run. STRIX_GLM_PF_WMMA=1 forces the bundle.
+    for (auto& entry : product.entries) {
+        if (entry.lever->name != "pf_wmma" || entry.status != strix::profile::Status::unqualified) continue;
+        entry.value = std::string(entry.lever->builtin);
+        entry.status = strix::profile::Status::builtin;
+        entry.reason = "per-prompt cell: the benchmark opt-in does not open it";
+        entry.ladder.clear();
+        entry.ladder_lowered = false;
+    }
     // These GLM routes inherit the umbrella after the baseline veto. Only report the inherited
     // value: the runtime owns the fallback and must still see the original environment.
     const bool wmma = product.find("pf_wmma")->value == "1";
