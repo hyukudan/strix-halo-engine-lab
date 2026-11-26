@@ -139,6 +139,11 @@ void test_config() {
         "layer_norm_eps":1e-05}})";
     const auto spec = ink::parse_vision_spec(good);
     CHECK(spec.width == 1024U && spec.layers == 23U && spec.patch == 20U && spec.merge == 2U && spec.text_width == 2304U);
+    const auto fallback = ink::parse_vision_spec(R"({"vision_config":{"model_type":"inkling2_vision"}})");
+    CHECK(fallback.text_width == spec.text_width);
+    CHECK(throws([] {
+        (void)ink::parse_vision_spec(R"({"vision_config":{"model_type":"inkling2_vision","text_hidden_size":2305}})");
+    }, "text_hidden_size"));
     auto changed = good;
     changed.replace(changed.find("\"hidden_size\":1024"), 18, "\"hidden_size\":1152");
     CHECK(throws([&] { (void)ink::parse_vision_spec(changed); }, "hidden_size"));
