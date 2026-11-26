@@ -1,4 +1,6 @@
 # Explicit EXL3 identity, streaming arm import and format-specific kernels.
+option(STRIX_GEMMA4_EXL3_SHARED_HADAMARD
+    "Build the shared HIP EXL3 Hadamard transform for device qualification" OFF)
 target_sources(strix_gemma4_model PRIVATE src/gemma4/exl3/host.cpp src/gemma4/exl3/pack.cpp)
 target_link_libraries(strix_gemma4_dflash PUBLIC strix_gemma4_model)
 target_sources(strix_gemma4_prefill_host PRIVATE src/gemma4/exl3/emulator.cpp)
@@ -72,6 +74,10 @@ endif()
 if(STRIX_ENABLE_HIP_RUNTIME)
     target_sources(strix_gemma4_device_primitives PRIVATE src/gemma4/exl3/device.hip)
     set_source_files_properties(src/gemma4/exl3/device.hip PROPERTIES COMPILE_OPTIONS "-fno-rounding-math")
+    if(STRIX_GEMMA4_EXL3_SHARED_HADAMARD)
+        set_property(SOURCE src/gemma4/exl3/device.hip APPEND PROPERTY
+            COMPILE_DEFINITIONS STRIX_GEMMA4_EXL3_SHARED_HADAMARD=1)
+    endif()
     add_executable(strix-gemma4-exl3-check src/gemma4/exl3/check_main.cpp)
     target_link_libraries(strix-gemma4-exl3-check PRIVATE strix_gemma4_prefill strix_gemma4_device strix_gemma4_dflash_device)
     strix_target_warnings(strix-gemma4-exl3-check)
