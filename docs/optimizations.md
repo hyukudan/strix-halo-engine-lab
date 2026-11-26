@@ -6257,6 +6257,30 @@ two applied at the store), dispatched by `enqueue_resident_q8_rows` (`src/core/r
 | inkling2-mini | bound (HIP head, decode steps) |
 | qwen3.8-flash-next, qwen3.8-27b, deepseek-v4.1-flash, glm-5.3-flash, minimax-m3.1-flash, hy4-flash, nemotron-3.5-bolt-e4b | not bound: the decode head has no calibrated pack path and no resident low-bit rows |
 
+<a id="shared-sp4t-grouped-projections"></a>
+## Grouped Strix pack SP4 resident projections (`strix.sp4t`)
+
+**Engine:** shared (HIP). **Control:** a model's qualification arm `weights.attention_head.sp4t@1` with a calibrated
+`strix.sp4t` pack (`STRIX_LOWBIT_PACK`). **Default:** inactive unless a model loads SP4 attention projections.
+
+**Shared home:** `resident_q8_projections_admitted` / `enqueue_resident_q8_projections` (`src/core/resident_q8_rows.hpp`):
+a run of `strix.sp4t` projections sharing one input (query, key and value of one visit) is one small-M
+`gemm_sp4<Capacity>` launch, each projection scaled by its tensor's 2^base, admitted under the group-scale form only
+(as the standalone SP4 entry). Policy `weights.attention_head.sp4t@1` (tagged attention roles and the head in
+`strix.sp4t`) in `include/strix/weight/levers.hpp`.
+
+- **Exactness evidence:** every row of the grouped launch equals the standalone SP4 entry bitwise (HIP fixture
+  `strix-hip-sp4-rows-tests`, query / key / value widths 3072 / 1024 / 1024 by 2304 with distinct tensor bases, rows 1 to
+  33; the FP32 sweep and folded forms are refused). Incumbent gfx1151 ISA identical (43 objects); the new
+  `sp4_kernel<RowTiles, 10>` uses no scratch and no spill (VGPR 122 / 165, the counts of the one-projection kernel).
+- **Gain:** enables SP4 attention projections at q4_g64 bytes; measured on the binding row (Inkling 2 Mini).
+- **Off switch:** do not select an SP4 attention policy.
+
+| model | SP4 grouped projections |
+|---|---|
+| inkling2-mini | bound (explicit decode-only arm, HIP) |
+| qwen3.8-flash-next, qwen3.8-27b, deepseek-v4.1-flash, glm-5.3-flash, minimax-m3.1-flash, hy4-flash, nemotron-3.5-bolt-e4b | not bound: no calibrated `strix.sp4t` pack of their attention projections; reachable through `enqueue_resident_q8_projections` on HIP (CUDA has no SP4 consumer) |
+
 <a id="inkling2-served-chunk-ladder"></a>
 
 ## Inkling 2 Mini CUDA served prompt: chunk ladder and mixed-service pieces
