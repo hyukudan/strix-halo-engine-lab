@@ -97,8 +97,11 @@ The shared `strix-serve --backend` interface offers HIP and CUDA.
 
 Tree: `src/cpu/core` (interface binding, scalar exact reference, capability detection and
 selection), `src/cpu/arch/avx512` (AVX-512 BW/VNNI, AMX int8), `src/cpu/arch/neon` (NEON
-dotprod/i8mm, SVE). AVX2 joins as `src/cpu/arch/avx2` when needed. Build option
-`STRIX_BACKEND_CPU` (default OFF); nothing else depends on it.
+dotprod/i8mm, SVE). The `STRIX_BACKEND_CPU` option (default OFF) builds the shared CPU
+operator library and its fixtures. The Qwen CUDA build also links this library for its
+tiered routed-expert executor. That executor uses a worker pool, a separate AVX2 path
+and exp lookup tables to reproduce the target device arithmetic. The scalar operator
+table and the dedicated model host references have their own dispatch paths.
 
 - **Memory**: host memory is the device memory. Weights are used in place from the mapped model
   file (Q8_0 blocks are 34 bytes, so rows are read unaligned; a repack to 64-byte rows follows
