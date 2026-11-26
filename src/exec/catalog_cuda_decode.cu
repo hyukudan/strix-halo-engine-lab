@@ -1012,8 +1012,10 @@ KernelBinding bind(const ScreenedHeadPass1& a) {
     const auto& l = checked(a.launch);
     const auto plane = std::uint64_t{l.plane.rows} * l.plane.row_bytes;
     const auto groups = screen_plan::pass1_groups(l.lanes, l.pass1_lanes);
-    return bind_leaf(screened_pass1, {{l.grids.pass1, groups, 1}, {screen_plan::kPass1Waves * 32U, 1, 1},
-                                      static_cast<unsigned>(screened::pass1_shared_bytes(l))},
+    // The launcher's geometry (lane groups folded into a 1-D grid, capped at the resident blocks): a strict capture
+    // compares every node's grid with this binding.
+    const auto grid = screen_plan::pass1_grid(l);
+    return bind_leaf(screened_pass1, {{grid.blocks, 1, 1}, {grid.threads, 1, 1}, static_cast<unsigned>(grid.shared_bytes)},
         a, {.weight_bytes = plane * groups, .state_bytes = std::uint64_t{l.lanes} * l.head.width * sizeof(float),
             .macs = std::uint64_t{l.plane.rows} * l.head.width * l.lanes,
             .scratch = {}, .bytes_written = std::uint64_t{l.lanes} * l.head.rows * sizeof(float)});

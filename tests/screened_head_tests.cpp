@@ -413,6 +413,20 @@ void pass1_schedule_tests() {
             expect(per_group != 0U && plan::pass1_lanes_valid(per_group, lanes), "lane form admitted", lanes, per_group);
             expect(groups * per_group >= lanes && (groups - 1U) * per_group < lanes, "groups cover the lanes", lanes,
                    groups);
+            for (const unsigned resident : residents) {
+                // The geometry the launcher enqueues and the exec catalog binds (one plan function for both).
+                plan::Launch a{};
+                a.head.width = 2304U;
+                a.lanes = lanes;
+                a.pass1_lanes = per_group;
+                a.grids.pass1 = 1504U;
+                a.pass1_resident = resident;
+                const auto grid = plan::pass1_grid(a);
+                expect(grid.blocks == plan::pass1_blocks(1504U, resident, groups) && grid.blocks % groups == 0U &&
+                           grid.threads == plan::kPass1Waves * 32U &&
+                           grid.shared_bytes == std::size_t{per_group} * 2304U * sizeof(float),
+                       "pass-1 grid: one 1-D folded launch", lanes, resident);
+            }
             const unsigned tile_rows = plan::pass1_tile_rows(per_group);
             for (const unsigned resident : residents)
                 for (const unsigned rows : row_counts) {
