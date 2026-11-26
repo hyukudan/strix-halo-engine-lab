@@ -305,7 +305,7 @@ bool field_is_unset(const Json& object, std::string_view name) {
     return !field || field->is_null();
 }
 
-bool o200k_layout(const Json& root, const Json& model, const Json& pre, const Json& split, const Json& bytelevel) {
+bool plain_hf_byte_bpe_layout(const Json& root, const Json& model, const Json& pre, const Json& split, const Json& bytelevel) {
     const auto* decoder = root.find("decoder");
     const auto* processor = root.find("post_processor");
     return field_is_string(pre, "type", "Sequence") && field_is_string(split, "type", "Split") &&
@@ -586,10 +586,20 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::from_parts(std::vector<std::st
 }
 
 std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf_json(const std::string& path) {
+    return load_hf(path, {});
+}
+
+std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf_byte_bpe(const std::string& path, std::string_view eos) {
+    if (eos.empty()) throw std::invalid_argument("tokenizer: an explicit EOS is required");
+    return load_hf(path, eos);
+}
+
+std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf(const std::string& path, std::string_view explicit_eos) {
+    const bool strict = !explicit_eos.empty();
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error("tokenizer: cannot open " + path);
     const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    const Json root = parse_json(text);
+    const Json root = strict ? parse_json_unique(text, 64U << 20U, kMaxRequestJsonValues) : parse_json(text);
     const Json* model = root.find("model");
     const Json* pre = root.find("pre_tokenizer");
     if (!model || !pre)
@@ -603,8 +613,12 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf_json(const std::string
     // HF byte-level BPE layouts with a recognized Split, ignore_merges and no normalizer.
     static const std::string glm_pattern =
         "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+    constexpr std::string_view qwen_pattern =
+        R"((?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
     const Json* seq = pre->find("pretokenizers");
-    if (!seq || !seq->is_array() || seq->size() != 2U || !field_is_bool(*model, "ignore_merges", true) ||
+    const auto* ignore = model->find("ignore_merges");
+    if (!seq || !seq->is_array() || seq->size() != 2U ||
+        (strict ? (ignore && !ignore->is_bool()) : !field_is_bool(*model, "ignore_merges", true)) ||
         !field_is_unset(root, "normalizer")) {
         throw std::invalid_argument("tokenizer: " + path + " has an unsupported byte-level BPE layout");
     }
@@ -612,16 +626,22 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf_json(const std::string
     const auto& bytelevel = seq->as_array()[1];
     const auto* pattern = split.find("pattern");
     const bool is_glm = pattern && field_is_string(*pattern, "Regex", glm_pattern);
-    const bool is_o200k = pattern && field_is_string(*pattern, "Regex", o200k::kPattern) &&
-        o200k_layout(root, *model, *pre, split, bytelevel);
-    if ((!is_glm && !is_o200k) || !field_is_string(bytelevel, "type", "ByteLevel")) {
+    const bool plain_layout = plain_hf_byte_bpe_layout(root, *model, *pre, split, bytelevel);
+    const bool is_o200k = pattern && field_is_string(*pattern, "Regex", o200k::kPattern) && plain_layout;
+    const bool is_qwen = strict && pattern && field_is_string(*pattern, "Regex", qwen_pattern);
+    if ((!is_glm && !is_o200k && !is_qwen) || (strict && !plain_layout) ||
+        !field_is_string(bytelevel, "type", "ByteLevel")) {
         throw std::invalid_argument("tokenizer: " + path + " has an unsupported byte-level pre-tokenizer");
     }
     std::vector<std::string> tokens;
     std::vector<std::int32_t> types;
     const auto put = [&](std::int64_t id, const std::string& t, TokenType type) {
-        if (id < 0 || id > 0x7FFFFFFF) throw std::invalid_argument("tokenizer: token ID out of range");
+        if (id < 0 || id > 0x7FFFFFFF || (strict && static_cast<std::uint64_t>(id) >= kMaxRequestJsonValues))
+            throw std::invalid_argument("tokenizer: token ID out of range");
         const auto i = static_cast<std::size_t>(id);
+        if (strict && (t.empty() || (i < tokens.size() && !tokens[i].empty() &&
+            (tokens[i] != t || types[i] != static_cast<std::int32_t>(TokenType::normal)))))
+            throw std::invalid_argument("tokenizer: conflicting token ID or empty token");
         if (i >= tokens.size()) { tokens.resize(i + 1U); types.resize(i + 1U, static_cast<std::int32_t>(TokenType::unused)); }
         tokens[i] = t;
         types[i] = static_cast<std::int32_t>(type);
@@ -629,10 +649,10 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf_json(const std::string
     for (const auto& [t, id] : vocab->as_object()) put(id.as_int(), t, TokenType::normal);
     if (const Json* added = root.find("added_tokens")) {
         for (const auto& a : added->as_array()) {
-            if (is_o200k) {
+            if (is_o200k || strict) {
                 for (const std::string_view flag : {"single_word", "lstrip", "rstrip", "normalized"}) {
                     if (a.find(flag) && !field_is_bool(a, flag, false))
-                        throw std::invalid_argument("tokenizer: unsupported o200k added token flags");
+                        throw std::invalid_argument("tokenizer: unsupported added token flags");
                 }
             }
             const Json* special = a.find("special");
@@ -647,11 +667,25 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf_json(const std::string
     merges.reserve(merge_list->size());
     for (const auto& m : merge_list->as_array()) {
         if (m.is_string()) merges.push_back(m.as_string());
-        else merges.push_back(m.as_array().at(0).as_string() + " " + m.as_array().at(1).as_string());
+        else {
+            if (strict && (!m.is_array() || m.size() != 2U))
+                throw std::invalid_argument("tokenizer: a merge must have two parts");
+            merges.push_back(m.as_array().at(0).as_string() + " " + m.as_array().at(1).as_string());
+        }
     }
-    auto out = from_parts(std::move(tokens), std::move(types), merges, is_o200k ? "o200k" : "glm4");
+    auto out = from_parts(std::move(tokens), std::move(types), merges, is_o200k ? "o200k" : is_qwen ? "qwen35" : "glm4");
+    auto& impl = *const_cast<BpeTokenizer&>(*out).impl_;
+    if (strict) {
+        impl.ignore_merges = ignore && ignore->as_bool();
+        for (const auto id : impl.specials)
+            impl.special_start[static_cast<unsigned char>(impl.tokens[id][0])] = true;
+        impl.eos = out->find(explicit_eos);
+        if (impl.eos == UINT32_MAX || out->type(impl.eos) != TokenType::control)
+            throw std::invalid_argument("tokenizer: explicit EOS must be a special added token");
+        return out;
+    }
     const auto model_end = is_o200k ? out->find("<|content_model_end_sampling|>") : UINT32_MAX;
-    const_cast<BpeTokenizer&>(*out).impl_->eos = model_end == UINT32_MAX ? out->find("<|endoftext|>") : model_end;
+    impl.eos = model_end == UINT32_MAX ? out->find("<|endoftext|>") : model_end;
     return out;
 }
 
@@ -674,6 +708,12 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_gguf(const std::string& p
 
 std::vector<std::uint32_t> BpeTokenizer::encode(std::string_view text, bool parse_special) const {
     return encode_marks(text, parse_special, nullptr);
+}
+
+std::vector<std::uint32_t> BpeTokenizer::encode_ordinary(std::string_view text) const {
+    std::vector<std::uint32_t> out;
+    if (!text.empty()) impl_->encode_plain(text, out);
+    return out;
 }
 
 std::vector<std::uint32_t> BpeTokenizer::encode_marked(std::string_view text, bool parse_special,

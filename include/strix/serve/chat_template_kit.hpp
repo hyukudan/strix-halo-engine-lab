@@ -35,6 +35,9 @@ namespace strix::serve::chat_kit {
 enum class JsonKeyOrder { preserve, top_level, recursive };
 [[nodiscard]] std::string compact_json(const Json& value, JsonKeyOrder order = JsonKeyOrder::preserve);
 
+// Jinja-style JSON with comma/colon spacing and the same number and key semantics.
+[[nodiscard]] std::string spaced_json(const Json& value, JsonKeyOrder order = JsonKeyOrder::preserve);
+
 // The spellings of one template's key/value tool-call grammar.
 struct KvToolGrammar {
     std::string_view think_end;    // ends the reasoning block

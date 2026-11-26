@@ -141,6 +141,10 @@ std::string compact_json(const Json& value, JsonKeyOrder order) {
     return json_for_template(value, order).dump();
 }
 
+std::string spaced_json(const Json& value, JsonKeyOrder order) {
+    return json_for_template(value, order).dump_spaced();
+}
+
 AssistantOutput parse_kv_tool_output(const std::string& text, bool reasoning_open, const KvToolGrammar& g, const Json& tools) {
     AssistantOutput out;
     out.tool_calls = Json::array();  // also when the reply ends inside the thinking block
