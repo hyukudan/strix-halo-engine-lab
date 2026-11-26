@@ -14,9 +14,8 @@ float half(float x) {
 }
 }
 void validate(LinearView w) {
-    if (!geometry(w)) throw std::invalid_argument("EXL3 tensor geometry");
-    for (std::size_t i = 0; i < std::size_t(w.inputs) + w.outputs; ++i)
-        finite(fp16_value(load16(w.data + 2 * i)));
+    if (w.format != WeightFormat::exl3_mul1) throw std::invalid_argument("EXL3 tensor geometry");
+    weight::exl3_transport::validate(w.data, w.inputs, w.outputs, w.row_bytes);
 }
 void hadamard(float* block) {
     for (unsigned stride = 1; stride < 128; stride *= 2)

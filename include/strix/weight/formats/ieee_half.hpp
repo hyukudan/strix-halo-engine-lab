@@ -42,6 +42,27 @@ STRIX_HALF_HD inline float decode(std::uint16_t h) {
 #endif
 }
 
+// FP32 -> FP16, RNE, gradual underflow, signed zero. False means nonfinite or
+// rounding overflow; callers must fail the request, never silently clip.
+STRIX_HALF_HD inline bool encode_finite(float x, std::uint16_t& out) {
+    const auto u = __builtin_bit_cast(std::uint32_t, x), a = u & 0x7fffffffU;
+    const auto sign = std::uint16_t((u >> 16U) & 0x8000U);
+    if (a >= 0x7f800000U) return false;
+    if (a < 0x33000000U) { out = sign; return true; }
+    if (a < 0x38800000U) {
+        const unsigned shift = 126U - (a >> 23U);
+        const auto m = (a & 0x7fffffU) | 0x800000U;
+        const auto q = m >> shift, remainder = m & ((1U << shift) - 1U);
+        const auto midpoint = 1U << (shift - 1U);
+        out = std::uint16_t(sign | (q + unsigned(remainder > midpoint || (remainder == midpoint && (q & 1U)))));
+        return true;
+    }
+    const auto q = ((a - 0x38000000U) + 0xfffU + ((a >> 13U) & 1U)) >> 13U;
+    if (q >= 0x7c00U) return false;
+    out = std::uint16_t(sign | q);
+    return true;
+}
+
 } // namespace strix::weight::ieee_half
 
 #undef STRIX_HALF_HD

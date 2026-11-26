@@ -1,4 +1,5 @@
 #include "formats/catalog.hpp"
+#include "strix/weight/formats/exl3_transport.hpp"
 #include <algorithm>
 #include <cstring>
 #include <numeric>
@@ -82,7 +83,7 @@ Status validate_special(const WeightView& view,bool scan_values) {
   }
  }
  if(name.starts_with("exl3.")) {
-  if(view.shape.rank!=2 || width%128 || rows%128 || view.parameters.transform!="hadamard128") return {Error::unsupported_shape,"EXL3 requires declared H128 transform geometry"};
+  if(view.shape.rank!=2 || !exl3_transport::aligned_shape(width,rows) || view.parameters.transform!="hadamard128") return {Error::unsupported_shape,"EXL3 requires declared H128 transform geometry"};
   if(name=="exl3.mul1.tiles16") {
    status=required(view,"codebook_marker",Scalar::i32,{{1,0,0,0},1},part); if(!status) return status;
    status=inspect(part->data,4,[](const Byte* p) {
@@ -95,7 +96,7 @@ Status validate_special(const WeightView& view,bool scan_values) {
    return inspect(part->data,2,finite_half);
   }
   auto scales=view.payload; scales.range.bytes=2*(width+rows);
-  return inspect(scales,2,finite_half);
+  return inspect(scales,2,[](const Byte* p) { return exl3_transport::finite_scale(std::to_integer<std::uint8_t>(p[1])); });
  }
  return status;
 }
@@ -157,7 +158,7 @@ Status validate_impl(const WeightView& view,bool scan_values) {
  }
  // Gemma transport has contiguous FP16 input/output sidecars before the rings.
  if(view.storage.name=="exl3.gemma.transport") {
-   if(view.shape.rank!=2 || view.shape.dims[0]%128 || view.shape.dims[1]%128)
+   if(view.shape.rank!=2 || !exl3_transport::aligned_shape(view.shape.dims[1],view.shape.dims[0]))
      return {Error::unsupported_shape,"Gemma transport requires I/O multiples of 128"};
    const auto scales=view.shape.dims[0]+view.shape.dims[1];
    if(scales> (UINT64_MAX-bytes)/2) return {Error::malformed,"transport size overflow"};

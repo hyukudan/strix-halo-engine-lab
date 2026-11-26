@@ -11,7 +11,8 @@
 // All other target operations, KV and selection retain g4-v1 arithmetic.
 // Overflow/nonfinite at any conversion or transform is a hard failure.
 // WMMA uses the same transforms and a separately named prefill identity.
-#include "core/trellis_format.hpp"
+#include "core/trellis_scalar.hpp"
+#include "strix/weight/formats/exl3_transport.hpp"
 #include "gemma4/contracts/g4_types.hpp"
 #include "gemma4/prefill/prefill.hpp"
 #include <atomic>
@@ -100,12 +101,10 @@ inline constexpr float hscale = 0.08838834613561630249F;
 // trellis[I/16,O/16,16*K] I16, in the source tile order, without padding.
 // row_bytes records I*K/8, the nominal packed core bytes per logical output.
 // It is not a row stride for this format. Use weight_storage_bytes to upload.
-STRIX_G4_HD inline unsigned bits(LinearView w) { return unsigned(w.row_bytes * 8 / w.inputs); }
+STRIX_G4_HD inline unsigned bits(LinearView w) { return weight::exl3_transport::bits(w.inputs, w.row_bytes); }
 STRIX_G4_HD inline bool geometry(LinearView w) {
-    return w.data && w.format == WeightFormat::exl3_mul1 && w.inputs && w.outputs &&
-           w.inputs % 128 == 0 && w.outputs % 128 == 0 &&
-           (bits(w) == 4 || bits(w) == 5 || bits(w) == 6 || bits(w) == 8) &&
-           w.row_bytes == std::size_t(w.inputs) * bits(w) / 8;
+    return w.data && w.format == WeightFormat::exl3_mul1 &&
+           weight::exl3_transport::geometry(w.inputs, w.outputs, w.row_bytes);
 }
 STRIX_G4_HD inline std::uint32_t word(const std::uint8_t* p) {
     return std::uint32_t(load16(p)) | (std::uint32_t(load16(p + 2)) << 16U);
@@ -115,15 +114,7 @@ STRIX_G4_HD inline unsigned stream_position(unsigned row, unsigned col) { return
 STRIX_G4_HD inline unsigned state(const std::uint8_t* tile, unsigned k, unsigned position) {
     return core::trellis::Format::state_bytes(tile, int(k), position);
 }
-STRIX_G4_HD inline float codebook(unsigned s) {
-    using Book = core::trellis::Mul1Constants;
-    // Both operations are exact in FP32, so this also models the half FMA
-    // with one final RNE conversion, without relying on host half support.
-    const float value = float(1024U + Book::state_sum(s)) * fp16_value(Book::kScale) + fp16_value(Book::kBias);
-    std::uint16_t half = 0;
-    (void)prefill::half_bits(value, half);
-    return fp16_value(half);
-}
+STRIX_G4_HD inline float codebook(unsigned s) { return core::trellis::mul1_value(s); }
 STRIX_G4_HD inline float rotated_at(LinearView w, unsigned input, unsigned output) {
     const auto k = bits(w);
     const auto* tile = w.data + 2ULL * (w.inputs + w.outputs) +

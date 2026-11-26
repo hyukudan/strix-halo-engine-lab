@@ -33,7 +33,6 @@ model-include src/hip_shared_expert_launcher.hip 1
 model-include src/known_prefix_prefill_runtime.cpp 2
 model-include src/moe_q4k_a8_contract.cpp 3
 model-include src/session/backend_hip.cpp 1
-model-include src/weight/formats/exl3.cpp 1
 model-include src/weight/formats/fp8.cpp 1
 model-include src/weight/formats/gsq.cpp 4
 model-include src/weight/formats/packed.cpp 1
