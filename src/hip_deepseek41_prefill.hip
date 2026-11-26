@@ -1718,12 +1718,13 @@ PrefillResult DevicePrefill::run_full_prompt(std::span<const std::uint32_t> toke
         m.overlay == nullptr && m.file->size() == pinned_file(PinnedFileKind::target_q2).bytes &&
         m.dense_select && m.split_min_rows == PrefillOptions{}.split_min_rows && !m.moe_joint &&
         m.joint_max_rows == PrefillOptions{}.joint_max_rows && m.async_gather && m.pack &&
-        m.overlap && m.moe_persist && m.staged_gather_allowed && m.early_q_b && m.group.empty() &&
+        m.overlap && m.moe_persist && m.staged_gather_allowed && m.early_q_b &&
         m.task == nullptr && m.snap_next.empty() && m.embed_next.empty() &&
         !baseline_on;
+    // One sequence per forward: a multi-slot server keeps idle group-pass storage (group_members, run_group only), which
+    // neither runs here nor changes this pass's arithmetic, so it is not a live lane.
     const auto resolution = pair_defaults::resolve_prefill_profile(
-        startup, o, tokens.size(), static_cast<std::uint32_t>(std::max<std::size_t>(1U, m.group.size())),
-        scope ? strix::device::hip_cost_device_identity() : std::string{}, scope);
+        startup, o, tokens.size(), 1U, scope ? strix::device::hip_cost_device_identity() : std::string{}, scope);
     const auto* d1 = resolution ? resolution->find("d1_prefill") : nullptr;
     // R=256 runs only on top of an admitted D1 request (gate v2 D1R scored exactly that set).
     const auto* replay = resolution ? resolution->find("decoder_replay") : nullptr;
