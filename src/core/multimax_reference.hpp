@@ -7,6 +7,25 @@
 
 namespace strix::core {
 
+inline void multimax_f32_reference(std::span<float> logits,
+                                    std::span<const float, 4> ranges,
+                                    std::span<const float, 4> strengths) {
+    const auto relu = [](float value) { return value <= 0.0F ? 0.0F : value; };
+    for (float& logit : logits) {
+        const float source = logit;
+        const float lower = relu(ranges[0] - source);
+        const float upper = relu(source - ranges[1]);
+        const float lower_square = relu(ranges[2] - source);
+        const float upper_square = relu(source - ranges[3]);
+        // Each multiply rounds separately from the following addition.
+        const volatile float a = strengths[0] * lower;
+        const volatile float b = strengths[1] * upper;
+        const volatile float c = strengths[2] * (lower_square * lower_square);
+        const volatile float d = strengths[3] * (upper_square * upper_square);
+        logit = (((source + a) + b) + c) + d;
+    }
+}
+
 // Vocabulary epilogue with four learned hinges: a lower and upper linear
 // correction followed by a lower and upper squared correction. All hinges
 // evaluate the original logit, and every primitive stores to BF16.

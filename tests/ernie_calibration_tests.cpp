@@ -10,6 +10,7 @@
 #include "strix/weight/pack_source.hpp"
 
 #include <array>
+#include <bit>
 #include <cmath>
 #include <fstream>
 #include <iostream>
@@ -182,6 +183,24 @@ void multimax_test() {
     strix::core::multimax_bf16_reference(nonfinite, ranges, strengths);
     check(std::ranges::all_of(nonfinite, [](float value) { return std::isnan(value); }),
           "MultiMax must propagate NaN and preserve infinity arithmetic");
+
+    const std::array model_ranges{15.625F, 15.9375F, 8.75F, 0.3671875F};
+    const std::array model_strengths{-0.1337890625F, 0.279296875F, -0.09765625F, -0.0301513671875F};
+    constexpr std::array<std::uint32_t, 16> input_bits{
+        0, 0x80000000, 1, 0x80000001, 0x417a0000, 0x417f0000, 0x410c0000, 0x3ebc0000,
+        0x4179ffff, 0x417effff, 0x410bffff, 0x3ebbffff, 0x417a0001, 0x417f0001, 0x410c0001, 0x3ebc0001};
+    constexpr std::array<std::uint32_t, 16> output_bits{
+        0xc1191380, 0xc1191380, 0xc1191380, 0xc1191380, 0x4109b118, 0x410a0b52, 0x40b6c3ee, 0xc10895e6,
+        0x4109b118, 0x410a0b52, 0x40b6c3ec, 0xc10895e6, 0x4109b118, 0x410a0b52, 0x40b6c3ee, 0xc10895e6};
+    std::array<float, input_bits.size()> values;
+    std::ranges::transform(input_bits, values.begin(), [](auto bits) { return std::bit_cast<float>(bits); });
+    strix::core::multimax_f32_reference(values, model_ranges, model_strengths);
+    for (std::size_t i = 0; i < values.size(); ++i)
+        check(std::bit_cast<std::uint32_t>(values[i]) == output_bits[i], "MultiMax FP32 threshold or rounding");
+    nonfinite = {std::numeric_limits<float>::quiet_NaN(), inf, -inf};
+    strix::core::multimax_f32_reference(nonfinite, model_ranges, model_strengths);
+    check(std::ranges::all_of(nonfinite, [](float value) { return std::isnan(value); }),
+          "MultiMax FP32 exceptional values");
 }
 
 }  // namespace
