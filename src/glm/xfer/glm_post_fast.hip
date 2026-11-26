@@ -3,6 +3,8 @@
 #include "glm_post_fast.hpp"
 
 #include "glm/common/glm_hc.hpp"
+#include "moe_core/route_wave_kernel.hpp"
+#include "strix/env_flags.hpp"
 
 #include <stdexcept>
 #include <type_traits>
@@ -589,7 +591,12 @@ void hc_chains_lds_only(const float* F, const float* fn, float* z, hipStream_t s
     ok(hipGetLastError(), "glm hc_chains_lds_only");
 }
 void route_v2(const float* logits, const float* bias, std::uint32_t* ids, float* w, unsigned rows, hipStream_t s) {
-    route_v2_kernel<<<rows, 320, 0, s>>>(logits, bias, ids, w);
+    static const bool shared_route = strix::envcfg::flag("STRIX_GLM_SHARED_ROUTE_V2", false);
+    if (shared_route) {
+        strix::moe_core::enqueue_route_wave<kRoutePolicy, GlmDeclaredExp>(logits, bias, ids, w, rows, s);
+    } else {
+        route_v2_kernel<<<rows, 320, 0, s>>>(logits, bias, ids, w);
+    }
     ok(hipGetLastError(), "glm route_v2");
 }
 

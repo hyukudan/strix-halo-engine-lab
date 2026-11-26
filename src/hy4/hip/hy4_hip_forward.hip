@@ -64,6 +64,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <initializer_list>
 #include <map>
 #include <numeric>
 #include <optional>
@@ -285,6 +286,8 @@ struct Forward::Impl {
     std::map<std::string, Tensor> w;
     std::map<std::uint32_t, float*> engram_w1;  // [copy scale 4 x hidden | pre gamma hidden] per Engram layer
     bool store_epilogue = true;  // STRIX_HY4_Q8_STORE_EPILOGUE
+    // Explicit candidate until the grouped attention projections pass the model identity check.
+    bool attn_group = false;
     bool pf_store_epilogue = true;  // STRIX_HY4_PF_STORE_EPILOGUE: prompt windows' bf16 epilogues in the producer's store (EXACT)
     bool q_image = false;           // pf_store_epilogue: K_b stores the bf16 query operand image in the GEMM (allocate_prompt)
     // STRIX_HY4_PF_MHA (FAST, default off until gate v2): the sliding layers' prompt attention in the expanded-MHA form
@@ -564,6 +567,7 @@ struct Forward::Impl {
         engram_stage = static_cast<std::uint8_t*>(es);
         dstatus_all = alloc<std::uint32_t>(8U * c.layers);
         store_epilogue = strix::envcfg::flag("STRIX_HY4_Q8_STORE_EPILOGUE", true);
+        attn_group = strix::envcfg::flag("STRIX_HY4_Q8_ATTN_GROUP", false);
         pf_store_epilogue = strix::envcfg::flag("STRIX_HY4_PF_STORE_EPILOGUE", true);
         pf_mha = strix::envcfg::flag("STRIX_HY4_PF_MHA", false);
         pf_a8_producer = strix::envcfg::flag("STRIX_HY4_PF_A8_PRODUCER", true);
@@ -830,6 +834,40 @@ struct Forward::Impl {
         const std::uint32_t type = q8_head ? 8U : tw.type;
         linear(base + row_bytes(type, width) * r.first, type, x, width, static_cast<std::uint32_t>(r.count), y + r.first, round);
     }
+    // Same-input Q8_0 projections (each a rounded linear_rows() call) as ONE launch of the shared q8_rows::LinearGroupF32:
+    // Each part writes rows [r.first, r.first + r.count) into y + r.first. Use the incumbent separate calls if the
+    // shared grouped launch cannot represent every part.
+    struct GroupPart {
+        std::string name;
+        std::uint32_t outputs;
+        htp::Range r;
+        float* y;
+    };
+    bool try_linear_group(const float* x, std::uint32_t width, std::initializer_list<GroupPart> parts) {
+        if (!decode_fuse || !store_epilogue || width % 32U != 0U || parts.size() > strix::q8_rows::kMaxSegments)
+            return false;
+        strix::q8_rows::LinearGroupF32 site{};
+        site.input[0] = x;
+        site.width = width;
+        site.outputs = 0U;
+        for (const auto& p : parts) {
+            const auto& weight = t(p.name);
+            if (weight.type != 8U || weight.dims.at(0) != width || weight.bytes != row_bytes(8U, width) * p.outputs ||
+                p.r.first > p.outputs || p.r.count == 0U || p.r.count > p.outputs - p.r.first || p.r.count % 4U != 0U)
+                return false;
+            const auto m = site.segments.count++;
+            const auto rows = static_cast<std::uint32_t>(p.r.count);
+            site.segments.weights[m] = weight.p + row_bytes(8U, width) * p.r.first;
+            site.segments.first[m + 1U] = site.segments.first[m] + rows;
+            site.out[m] = p.y + p.r.first;
+            site.bias[m] = nullptr;
+            site.round[m] = true;
+            site.outputs += rows;
+        }
+        strix::q8_rows::launch(site, false, s);
+        check(hipGetLastError(), "q8 rows group launch");
+        return true;
+    }
     [[nodiscard]] htp::Range share(std::size_t n) const { return tp.world == 1U ? htp::Range{0U, n} : htp::half(n, tp.rank); }
     // The symmetric swap of the two halves of `buffer` (slot = one half), stream-ordered after its producers.
     void tp_gather(void* buffer, std::size_t slot_bytes) {
@@ -918,10 +956,10 @@ struct Forward::Impl {
 
     // Indexed layer, every position (also in the dense range): token key -> ring; at a group's 4th slot pool the group
     // (shared pool core), rotate the trailing 64 at its first slot (shared rope), store it in the group-key cache.
-    void index_keys(std::uint32_t l) {
+    void index_keys(std::uint32_t l, bool projected) {
         namespace dcr = strix::attn_core::cache_rows;
         namespace rp = strix::ops::rope;
-        linear(blk(l, "indexer.attn_k.weight"), xn, c.hidden, kIdxDim, ik);
+        if (!projected) linear(blk(l, "indexer.attn_k.weight"), xn, c.hidden, kIdxDim, ik);
         norm(ik, t(blk(l, "indexer.k_norm.weight")).f(), kIdxDim, c.rms_eps, ik);
         check(dcr::store_rows({ik, kIdxDim, dpos, 0U, 1U, tk_rows[l], tkeys[l], flag}, s), "token key store");
         if ((pos + 1U) % kIdxRatio != 0U) return;
@@ -976,20 +1014,35 @@ struct Forward::Impl {
         const bool par = tp.world == 2U;
         const auto hs = share(H);  // this rank's heads [h0, h0 + Hs)
         const auto h0 = static_cast<std::uint32_t>(hs.first), Hs = static_cast<std::uint32_t>(hs.count);
-        linear_rows(blk(l, "attn_gate.weight"), xn, c.hidden, H * vd, {std::size_t{h0} * vd, std::size_t{Hs} * vd}, gate);
-        linear(blk(l, "attn_q_a.weight"), xn, c.hidden, c.q_lora, qa);
+        const htp::Range gate_rows{std::size_t{h0} * vd, std::size_t{Hs} * vd};
+        bool grouped = false;
+        if (attn_group) {
+            const GroupPart gate_part{blk(l, "attn_gate.weight"), H * vd, gate_rows, gate};
+            const GroupPart qa_part{blk(l, "attn_q_a.weight"), c.q_lora, {0U, c.q_lora}, qa};
+            const GroupPart kv_part{blk(l, "attn_kv_a_mqa.weight"), row, {0U, row}, ckv};
+            if (idx) {
+                const GroupPart index_part{blk(l, "indexer.attn_k.weight"), kIdxDim, {0U, kIdxDim}, ik};
+                grouped = try_linear_group(xn, c.hidden, {gate_part, qa_part, kv_part, index_part});
+            } else {
+                grouped = try_linear_group(xn, c.hidden, {gate_part, qa_part, kv_part});
+            }
+        }
+        if (!grouped) {
+            linear_rows(blk(l, "attn_gate.weight"), xn, c.hidden, H * vd, gate_rows, gate);
+            linear(blk(l, "attn_q_a.weight"), xn, c.hidden, c.q_lora, qa);
+        }
         norm(qa, t(blk(l, "attn_q_a_norm.weight")).f(), c.q_lora, c.rms_eps, qa);
         linear_rows(blk(l, "attn_q_b.weight"), qa, c.q_lora, H * qk, {std::size_t{h0} * qk, std::size_t{Hs} * qk}, qv);
         const float* cs = idx ? cos_idx : cos_swa;
         const float* sn = idx ? sin_idx : sin_swa;
         strix::ops::rope::launch<strix::ops::rope::Round::bf16>(
             {qv + std::size_t{h0} * qk, 1U, Hs, H * qk, qk, c.qk_nope, rope / 2U, cs, sn, dpos, false}, s);
-        linear(blk(l, "attn_kv_a_mqa.weight"), xn, c.hidden, row, ckv);
+        if (!grouped) linear(blk(l, "attn_kv_a_mqa.weight"), xn, c.hidden, row, ckv);
         norm(ckv, t(blk(l, "attn_kv_a_norm.weight")).f(), kl, c.rms_eps, ckv);
         strix::ops::rope::launch<strix::ops::rope::Round::bf16>({ckv, 1U, 1U, row, row, kl, rope / 2U, cs, sn, dpos, false}, s);
         namespace dcr = strix::attn_core::cache_rows;
         check(dcr::store_rows({ckv, row, dpos, 0U, 1U, latent_rows[l], latent[l], flag}, s), "latent row store");
-        if (idx) index_keys(l);
+        if (idx) index_keys(l, grouped);
         // absorbed query: q_lat[h] = K_b[h] q_nope[h] (rows of qk_nope), then the rope tail, as the bf16 operand image
         const auto& kb = t(blk(l, "attn_k_b.weight"));
         const auto kb_head = row_bytes(kb.type, c.qk_nope) * kl;

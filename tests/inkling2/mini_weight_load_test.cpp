@@ -317,6 +317,16 @@ void test_lowbit_arms() {
             "legacy Q8_0 key selects the Q8_0 arm");
     require(mini::resolve_mini_resident_weight_load(profile::Name::fast, q8, cuda).storage == weight::kQ8WeightStorage,
             "Q8_0 arm on CUDA");
+    mini::MiniWeightOptions attention_q8;
+    const auto attention_q8_key = []() { return std::string_view("weights.attention.q8_0@1"); };
+    require(mini::parse_mini_weight_option(attention_q8, "--qualify-weights", attention_q8_key, true),
+            "explicit attention-only Q8_0 arm");
+    const auto attention_q8_plan = mini::resolve_mini_resident_weight_load(profile::Name::fast, attention_q8, hip);
+    require(attention_q8_plan.policy == weight::kAttentionQ8Policy.id &&
+                attention_q8_plan.storage == weight::kQ8WeightStorage &&
+                attention_q8_plan.head_storage == weight::kBf16WeightStorage &&
+                attention_q8_plan.status == profile::Status::unqualified,
+            "attention-only arm keeps the BF16 head and requires qualification");
     for (const char* key : {"weights.attention_head.q6_g64@1", "weights.attention_head.q4_g64@1"}) {
         mini::MiniWeightOptions arm;
         const auto value = [&]() { return std::string_view(key); };
