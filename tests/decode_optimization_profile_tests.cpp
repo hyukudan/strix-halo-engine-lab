@@ -3,6 +3,8 @@
 #include <filesystem>
 #include <fstream>
 #include <array>
+#include <cstdlib>
+#include <utility>
 #include "teacher_rows_test_directory.hpp"
 #include <string>
 #include <vector>
@@ -924,6 +926,68 @@ int main() {
         expect(turbo.attention_kv_storage == AttentionKvStorage::bf16 && turbo.kv.word() == "bf16" &&
                turbo.kv.note.find("turbo default fp8 unavailable") != std::string::npos,
                "turbo keeps BF16 on HIP and says so (never a silent int8)");
+    }
+    {
+        // Route prune cap9: the TURBO cell resolves per regime from the shared ladder (band receipt bound to the run's
+        // own execution key); the CLI spells that key, and an HTTP request resolves through the same function.
+        constexpr const char* product = "gfx1151|AMD Radeon Graphics|cu40|mem137438953472|clk2900000|hip70253211|drv70253211";
+        const auto parse_on = [&](std::string tier, std::string_view device, std::string_view fixture_product) {
+            std::vector<std::string> storage{"decoder", "m", "1", "--profile", std::move(tier)};
+            std::vector<char*> argv;
+            for (auto& arg : storage) argv.push_back(arg.data());
+            return parse_options(static_cast<int>(argv.size()), argv.data(), false, {}, DecodeAssets::verify, device, fixture_product);
+        };
+        const auto prune = [](const Options& options, std::uint64_t prompt, bool http = false) {
+            auto copy = options;
+            copy.http_serve = http;
+            const auto resolved = resolve_request_product_profile(copy, prompt);
+            const auto* row = resolved.find("moe_route_prune");
+            return row ? std::pair<std::string, bool>{row->value, profile::applied(row->status)}
+                       : std::pair<std::string, bool>{"missing", false};
+        };
+        const auto turbo = parse_on("turbo", "gfx1151", product);
+        const auto fast = parse_on("fast", "gfx1151", product);
+        const auto entry = turbo.product_profile.find("moe_route_prune");
+        expect(!qwen_ladder_execution(turbo, 8192U).empty() && entry && !entry->ladder_reference.empty() &&
+               qwen_ladder_execution(turbo, 8192U).find("backend=hip") != std::string::npos &&
+               qwen_ladder_execution(turbo, 8192U).find(product) != std::string::npos,
+               "the CLI regime carries a non-empty execution key");
+        for (const std::uint64_t prompt : {4096U, 6000U, 8192U, 8193U, 20000U, 32768U})
+            expect(prune(turbo, prompt) == std::pair<std::string, bool>{"cap9", true} &&
+                   !prune(fast, prompt).second, "TURBO resolves cap9 inside the bands, FAST does not");
+        for (const std::uint64_t prompt : {1U, 4095U, 32769U, 65536U})
+            expect(!prune(turbo, prompt).second, "outside the bands TURBO keeps FAST");
+        expect(!prune(parse_on("turbo", "sm_120", product), 8192U).second &&
+               !prune(parse_on("turbo", "gfx1151", ""), 8192U).second,
+               "another device class or an unknown device product keeps FAST");
+        expect(prune(turbo, 8192U, true) == prune(turbo, 8192U) && prune(turbo, 32768U, true) == prune(turbo, 32768U) &&
+               prune(turbo, 5000U, true) == prune(turbo, 5000U),
+               "an HTTP request resolves like the CLI for the same prompt length");
+        {
+            // Under a model preset (strix run/serve --profile turbo): the measured cap9 row applies, a provisional TURBO
+            // row stays pending.
+            struct Preset {
+                Preset() { (void)::setenv(profile::kPresetEnv, "1", 1); }
+                ~Preset() { (void)::unsetenv(profile::kPresetEnv); }
+            } preset;
+            const auto under = parse_on("turbo", "gfx1151", product);
+            auto copy = under;
+            const auto resolved = resolve_request_product_profile(copy, 8192U);
+            const auto* cap = resolved.find("moe_route_prune");
+            const auto* wmma = resolved.find("index_proj_wmma");
+            expect(cap && cap->value == "cap9" && profile::applied(cap->status) &&
+                   wmma && !profile::applied(wmma->status),
+                   "the preset TURBO applies cap9 at 8K gfx1151 and keeps provisional rows pending");
+        }
+        auto serve = turbo;
+        serve.http_serve = true;
+        serve.product_profile = qwen::profile::resolve(*serve.product_profile_requested, [&] {
+            auto inputs = serve.product_profile_inputs;
+            inputs.regime = profile::startup_prefill_regime("gfx1151");
+            return inputs;
+        }());
+        expect(!profile::applied(serve.product_profile.find("moe_route_prune")->status),
+               "the startup regime (no prompt, no execution key) keeps FAST");
     }
     auto instrumented = parse({"decoder", "fixture.gguf", "1", "--host-dispatch-telemetry"});
     const auto instrumented_profile = resolve_optimization_profile(instrumented, model, info, manifest,

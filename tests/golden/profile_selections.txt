@@ -267,7 +267,7 @@ B qwen-cuda turbo expert_fast=1 s7
 B qwen-cuda turbo mtp_defer_prompt=1 s0
 B qwen-hip turbo ctx=4096 qsa_budget=1536 s0
 B qwen-hip turbo ctx=4096 moe_route_bf16=1 s0
-B qwen-hip turbo ctx=4096 moe_route_prune=off s4
+B qwen-hip turbo ctx=4096 moe_route_prune=cap9 s0
 B qwen-hip turbo ctx=4096 gdn_fp16_chunk=1 s0
 B qwen-hip turbo ctx=4096 index_proj_wmma=1 s7
 B qwen-hip turbo ctx=4096 index_score_wmma=1 s7
@@ -288,7 +288,7 @@ B qwen-cuda turbo expert_fast=1 s7
 B qwen-cuda turbo mtp_defer_prompt=1 s0
 B qwen-hip turbo ctx=8192 qsa_budget=1536 s0
 B qwen-hip turbo ctx=8192 moe_route_bf16=1 s0
-B qwen-hip turbo ctx=8192 moe_route_prune=off s4
+B qwen-hip turbo ctx=8192 moe_route_prune=cap9 s0
 B qwen-hip turbo ctx=8192 gdn_fp16_chunk=1 s0
 B qwen-hip turbo ctx=8192 index_proj_wmma=1 s7
 B qwen-hip turbo ctx=8192 index_score_wmma=1 s7
@@ -309,7 +309,7 @@ B qwen-cuda turbo expert_fast=1 s7
 B qwen-cuda turbo mtp_defer_prompt=1 s0
 B qwen-hip turbo ctx=8193 qsa_budget=1536 s7
 B qwen-hip turbo ctx=8193 moe_route_bf16=1 s7
-B qwen-hip turbo ctx=8193 moe_route_prune=off s4
+B qwen-hip turbo ctx=8193 moe_route_prune=cap9 s0
 B qwen-hip turbo ctx=8193 gdn_fp16_chunk=1 s7
 B qwen-hip turbo ctx=8193 index_proj_wmma=1 s7
 B qwen-hip turbo ctx=8193 index_score_wmma=1 s7
@@ -330,7 +330,7 @@ B qwen-cuda turbo expert_fast=1 s7
 B qwen-cuda turbo mtp_defer_prompt=1 s0
 B qwen-hip turbo ctx=32768 qsa_budget=1536 s7
 B qwen-hip turbo ctx=32768 moe_route_bf16=1 s7
-B qwen-hip turbo ctx=32768 moe_route_prune=off s4
+B qwen-hip turbo ctx=32768 moe_route_prune=cap9 s0
 B qwen-hip turbo ctx=32768 gdn_fp16_chunk=1 s7
 B qwen-hip turbo ctx=32768 index_proj_wmma=1 s7
 B qwen-hip turbo ctx=32768 index_score_wmma=1 s7

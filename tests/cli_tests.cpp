@@ -240,9 +240,12 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
                         "Inkling Mini implicit profile must remain EXACT");
             require(exact.levers == Name::standard && fast.levers == Name::fast && fast.requested == Name::fast,
                     "explicit exact and FAST select their native columns");
-            require(turbo.requested == Name::turbo, "explicit TURBO keeps its requested tier");
-            if (entry.family != "glm5" && entry.family != "minimax")
-                require(turbo.levers == fast.levers, "other presets project TURBO to FAST");
+            const auto* turbo_levers = description.find(std::string("presets.turbo.") + backend + ".levers");
+            if (turbo_levers == nullptr) turbo_levers = description.find("presets.turbo.levers");
+            const auto* declared_levers = turbo_levers ? std::get_if<std::string>(&turbo_levers->data) : nullptr;
+            const auto expected_levers = declared_levers ? profile::parse_tier(*declared_levers) : fast.levers;
+            require(turbo.requested == Name::turbo && turbo.levers == expected_levers,
+                    "TURBO selects its backend override or the model's declared levers");
             require(exact.kv != "fp8" && fast.kv != "fp8", "FP8 KV shadow is TURBO only");
             require((turbo.kv == "fp8") == (entry.family == "qwen35" && std::string_view(backend) == "cuda"),
                     "only the CUDA dense route has an FP8 KV shadow");
@@ -257,6 +260,18 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
     require(minimax_args == std::vector<std::string>{"--profile", "turbo"},
             "MiniMax passes --profile turbo to the pair engine");
 
+    {
+        // The Qwen3.8 Flash-Next HIP preset serves the native TURBO column (the route-prune receipt applies through the
+        // preset front alone); other backends keep FAST.
+        const auto flash = strix::model_description::load((data / "models/qwen3.8-flash-next.toml").string());
+        const auto hip = profile::resolve_model_preset(flash, Name::turbo, "hip");
+        const auto cuda = profile::resolve_model_preset(flash, Name::turbo, "cuda");
+        std::vector<std::string> args;
+        hip.append_options(args);
+        require(hip.levers == Name::turbo && args.size() >= 2U && args[0] == "--profile" && args[1] == "turbo",
+                "the Flash-Next HIP turbo preset emits --profile turbo");
+        require(cuda.levers == Name::fast, "the Flash-Next turbo preset keeps FAST on other backends");
+    }
     const auto dense = strix::model_description::load((data / "models/qwen3.8-27b.toml").string());
     probes.host = Platform::windows_host;
     auto req = parse({"run", "--model", "qwen3.8-27b", "--backend", "cuda", "--profile=turbo",

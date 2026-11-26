@@ -287,6 +287,8 @@ struct Options {
     std::optional<strix::qwen::profile::Name> product_profile_requested;
     strix::qwen::profile::Inputs product_profile_inputs;
     strix::qwen::profile::Resolution product_profile;
+    // Device class (architecture) and the device product identity (device/hip_cost_identity.hpp) the profile ladder reads.
+    std::string profile_device_class, profile_device_product;
     std::string mtp_bundle_path;
     // The bundle was selected on the native (non-YaRN) route; the automatic prompt route may keep it.
     bool mtp_native_bundle = false;
@@ -2136,17 +2138,39 @@ inline std::span<const strix::serve::config_file::Option> hip_serve_config_optio
 
 enum class DecodeAssets { verify, defer };
 
+// The spelling of the admitted execution of one Qwen HIP prefill (strix::profile::ladder_execution): backend, device
+// product identity, priced workload (prompt, context capacity, one lane, prefill chunk and rows, generated tokens) and
+// the effective timing settings outside the lever table. Empty while the device product or the prompt is unknown
+// (no ordinary timing row decides such a run).
+inline std::string qwen_ladder_execution(const Options& o, std::uint64_t prompt_tokens) {
+    const std::uint64_t capacity = std::max<std::uint64_t>(o.context_tokens, prompt_tokens);
+    const auto chunk = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+        o.known_prefix_prefill_rows ? o.known_prefix_prefill_rows : prompt_tokens, 0xFFFFFFFFULL));
+    const std::string settings = "rotary-factor=" + std::to_string(o.rotary.factor()) + "|mtp=" + (o.mtp.enabled ? "1" : "0");
+    return strix::profile::ladder_execution({"hip", o.profile_device_product,
+        {prompt_tokens, capacity, 1U, chunk, chunk, 0U, 0U, static_cast<std::uint32_t>(o.generate_tokens)}, settings});
+}
+// The profile of one prefill of `prompt_tokens`: the CLI prompt, or one HTTP request's prompt (same code, same
+// regime: phase, prompt length as context, one lane, device class, execution key).
+inline strix::qwen::profile::Resolution resolve_request_product_profile(Options& o, std::uint64_t prompt_tokens) {
+    const std::string execution = qwen_ladder_execution(o, prompt_tokens);
+    auto inputs = o.product_profile_inputs;
+    inputs.regime = strix::profile::Regime{strix::profile::Phase::prefill, prompt_tokens, 1, o.profile_device_class, execution};
+    return strix::qwen::profile::resolve(
+        o.product_profile_requested.value_or(strix::qwen::profile::Name::standard), inputs);
+}
+
 inline Options parse_options(
     int argc,
     char** argv, bool defer_qpf2k_defaults = false, std::string bundle_path = {},
-    DecodeAssets assets = DecodeAssets::verify, std::string_view device_class = {}) {
+    DecodeAssets assets = DecodeAssets::verify, std::string_view device_class = {}, std::string_view device_product = {}) {
     if (bundle_path.empty()) {  // --serve-config FILE: validated and expanded before anything is read or loaded
         auto file = strix::serve::config_file::expand(argc, argv, hip_serve_config_options());
         if (file.print) { std::cout << file.effective << std::flush; std::exit(0); }
         if (file.used) {
             std::vector<char*> pointers;
             for (auto& arg : file.argv) pointers.push_back(arg.data());
-            return parse_options(static_cast<int>(pointers.size()), pointers.data(), defer_qpf2k_defaults, bundle_path, assets, device_class);
+            return parse_options(static_cast<int>(pointers.size()), pointers.data(), defer_qpf2k_defaults, bundle_path, assets, device_class, device_product);
         }
     }
     if (argc>=2 && bundle_path.empty()) {
@@ -2222,7 +2246,7 @@ inline Options parse_options(
                 std::vector<char*> pointers;
                 for (auto& arg:expanded) pointers.push_back(arg.data());
                 auto result=parse_options(static_cast<int>(pointers.size()),pointers.data(),defer_qpf2k_defaults,
-                    off?"serial-retry":bundle, assets, device_class);
+                    off?"serial-retry":bundle, assets, device_class, device_product);
                 result.mtp.runtime_automatic = !off && decision.source=="default";
                 if (off) {result.mtp_bundle_path.clear();result.yarn_decode_source="env";}
                 else if (assets == DecodeAssets::verify)
@@ -3846,11 +3870,17 @@ inline Options parse_options(
     options.product_profile_inputs.max_prompt_tokens =
         options.tokens.empty() ? options.context_tokens : static_cast<std::uint64_t>(options.tokens.size());
     options.product_profile_inputs.regimes = strix::qwen::profile::fast_regimes;
-    // A serving capacity is not a request's actual prompt length.
-    options.product_profile_inputs.regime = options.http_serve ? strix::profile::startup_prefill_regime(device_class)
-        : strix::profile::Regime{strix::profile::Phase::prefill, options.tokens.size(), 1, device_class};
-    options.product_profile = strix::qwen::profile::resolve(
-        options.product_profile_requested.value_or(strix::qwen::profile::Name::standard), options.product_profile_inputs);
+    options.profile_device_class = std::string(device_class);
+    options.profile_device_product = std::string(device_product);
+    // A serving capacity is not a request's actual prompt length: HTTP keeps the startup regime (no execution key);
+    // a request resolves with resolve_request_product_profile() over its own prompt.
+    if (options.http_serve) {
+        options.product_profile_inputs.regime = strix::profile::startup_prefill_regime(device_class);
+        options.product_profile = strix::qwen::profile::resolve(
+            options.product_profile_requested.value_or(strix::qwen::profile::Name::standard), options.product_profile_inputs);
+    } else {
+        options.product_profile = resolve_request_product_profile(options, options.tokens.size());
+    }
     // KV precision: native BF16 in every tier (no FP8 here, so turbo keeps BF16 with a note); only --kv changes it.
     options.kv = strix::session::kv_precision::resolve(options.product_profile.profile, options.kv_request,
         strix::qwen::profile::kKvCaps);
