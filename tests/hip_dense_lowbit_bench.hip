@@ -8,10 +8,13 @@
 // then weight-read bandwidth per row count (each timed pass walks >= 512 MiB of distinct 16-byte aligned copies, dram=1;
 // tiny shapes are capped at 4096 copies, dram=0), forced small / tile timings around the switch point, and with the
 // default shapes q | k | v (3072 + 1024 + 1024 outputs, K 2304) as one grouped launch.
+// Folded-scale candidate (mode `fold N K ...`): its operand against the host model fp16(code x d), its output against
+// the host reference, one arithmetic across routes and row counts, and interleaved timings against the incumbent arms.
 // Usage: strix-hip-dense-lowbit-bench [N K ...], N > 0, K a positive multiple of 128
 //        (default: 3072 2304  1024 2304  2304 3072  384 2304  1000 2304  17 256; the last two have output tails)
 // Output: "check ... PASS|FAIL" lines, "bench fmt=F N=.. K=.. route=entry|small|tile rows=R bytes=.. dram=.. us=.. GBps=.."
 // lines, then "lowbit bench checks PASS|FAIL".
+#include "lowbit_folded_fixture.hpp"
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
 #include "core/resident_q8_rows.hpp"
@@ -225,9 +228,242 @@ void report(bool pass, const std::string& line) {
     std::cout << "check " << line << (pass ? " PASS" : " FAIL") << '\n';
 }
 
+// ---- Folded-scale arm (lowbit_f16::ScalePolicy::folded, a FAST / TURBO candidate) ----
+constexpr auto folded = core::lowbit_f16::ScalePolicy::folded;
+
+// The folded FP16 operand of every 16-element run of every weight row as staged by the tile (Small false:
+// LowBitF16Staging::load + publish) or by the small-M schedule (Small true: LowBitOperand::load + unit), 8 words per run.
+template <class S, bool Small>
+__global__ void fold_operand_kernel(const std::uint8_t* w, std::size_t pitch, unsigned runs_per_row, std::size_t runs,
+                                    std::uint32_t* out) {
+    const std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+    if (i >= runs) return;
+    const auto* row = w + (i / runs_per_row) * pitch;
+    const unsigned k = 16U * static_cast<unsigned>(i % runs_per_row);
+    alignas(16) std::uint32_t words[20] = {};
+    if constexpr (Small) {
+        using Op = tg::small_m::LowBitOperand<S, core::lowbit_f16::ScalePolicy::folded>;
+        const auto block = Op::load(row, k / 128U);
+        std::uint32_t unit[8];
+        Op::unit(block, (k % 128U) / 64U, (k % 64U) / 16U, unit);
+        for (unsigned j = 0; j < 8U; ++j) words[j] = unit[j];
+    } else {
+        using St = core::lowbit_f16::LowBitF16Staging<S, core::lowbit_f16::ScalePolicy::folded>;
+        St::publish(St::load(row, k - k % 32U, (k % 32U) / 16U), 0U, words);
+    }
+    for (unsigned j = 0; j < 8U; ++j) out[8U * i + j] = words[j];
+}
+
+// Host model of the folded operand: the FP16 rounding (RNE) of the exact code x d.
+std::uint16_t host_folded(const std::uint8_t* block, unsigned j, bool q4) {
+    const float exact = q4 ? wei::lowbit::decode<wei::Q4G64Storage>(block, j) : wei::lowbit::decode<wei::Q6G64Storage>(block, j);
+    return __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(exact));
+}
+
+// Mismatching FP16 elements of the device folded operand (one staging) against the host model, every row.
+template <class S>
+std::size_t fold_operand_mismatches(const Packed& p, const std::uint8_t* dw, unsigned n, unsigned k, bool small) {
+    const unsigned runs_per_row = k / 16U;
+    const std::size_t runs = std::size_t{n} * runs_per_row;
+    std::uint32_t* dout = nullptr;
+    ok(hipMalloc(&dout, runs * 32U), "malloc operand");
+    const auto blocks = static_cast<unsigned>((runs + 255U) / 256U);
+    if (small) fold_operand_kernel<S, true><<<blocks, 256, 0, nullptr>>>(dw, p.row_bytes, runs_per_row, runs, dout);
+    else fold_operand_kernel<S, false><<<blocks, 256, 0, nullptr>>>(dw, p.row_bytes, runs_per_row, runs, dout);
+    ok(hipGetLastError(), "operand launch");
+    std::vector<std::uint32_t> got(runs * 8U);
+    ok(hipDeviceSynchronize(), "sync operand");
+    ok(hipMemcpy(got.data(), dout, runs * 32U, hipMemcpyDeviceToHost), "copy operand");
+    ok(hipFree(dout), "free operand");
+    std::size_t bad = 0;
+    for (std::size_t i = 0; i < runs; ++i) {
+        const auto* row = p.bytes.data() + (i / runs_per_row) * p.row_bytes;
+        const unsigned k0 = 16U * static_cast<unsigned>(i % runs_per_row);
+        for (unsigned e = 0; e < 16U; ++e) {
+            const unsigned kk = k0 + e;
+            const auto want = host_folded(row + std::size_t{kk / 128U} * S::bytes, kk % 128U, S::high_bytes == 0U);
+            const auto have = static_cast<std::uint16_t>(got[8U * i + e / 2U] >> (16U * (e % 2U)));
+            bad += have != want ? 1U : 0U;
+        }
+    }
+    return bad;
+}
+
+enum class Arm { tile_group, tile_folded, tile_q8, small_group, small_folded, sweep };
+const char* name(Arm a) {
+    constexpr const char* names[] = {"tile-group", "tile-folded", "tile-q8_0", "small-group", "small-folded", "fp32-sweep"};
+    return names[static_cast<int>(a)];
+}
+hipError_t launch_arm(Arm arm, const Packed& p, const std::uint8_t* w, unsigned n, unsigned k, const float* x, float* y,
+                      unsigned rows) {
+    tg::Q8ProjectionGroup<1> group{};
+    group.append({w, n, y});
+    using S = wei::Q4G64Storage;
+    switch (arm) {
+    case Arm::tile_group: return tg::gemm_lowbit_projections<S, 1U>(x, rows, k, group, nullptr);
+    case Arm::tile_folded: return tg::gemm_lowbit_projections<S, 1U, folded>(x, rows, k, group, nullptr);
+    case Arm::tile_q8: return tg::gemm_q8_projections(x, rows, k, group, nullptr);
+    case Arm::small_group: return tg::small_m::gemm_lowbit<S, 1U>(x, rows, k, group, nullptr, false);
+    case Arm::small_folded: return tg::small_m::gemm_lowbit<S, 1U, folded>(x, rows, k, group, nullptr, false);
+    case Arm::sweep: return core::enqueue_resident_q8_rows(view(p, w, n, k), n, x, rows, y, nullptr);
+    }
+    return hipErrorInvalidValue;
+}
+
+// strix-hip-dense-lowbit-bench fold N K ...: folded-scale checks and interleaved timings per shape (q4_g64; q6_g64
+// operand checks; the q8_0 tile as the prefill yardstick; the FP32 sweep against the small-M schedule at 1..4 rows).
+int fold_ticket(const std::vector<unsigned>& shapes) {
+    const std::vector<unsigned> prefill_rows{2048U, 8192U}, small_rows{1U, 2U, 4U, 8U, 16U, 32U, 64U}, sweep_rows{1U, 2U, 4U};
+    constexpr unsigned check_rows = 129U, ref_outputs = 128U, max_rows = 8192U;
+    {
+        int dev = 0;
+        ok(hipGetDevice(&dev), "device");
+        report(strix::device::bind_lowbit_rows(dev, {64U, 64U}), "fold: bind the declared plan small_rows=64 wide_panels=64");
+    }
+    for (std::size_t s = 0; s + 1 < shapes.size(); s += 2) {
+        const unsigned n = shapes[s], k = shapes[s + 1];
+        const std::string tag = "N=" + std::to_string(n) + " K=" + std::to_string(k);
+        std::mt19937 rng(11U + n + k);
+        std::normal_distribution<float> normal(0.0F, 0.02F);
+        std::vector<std::uint16_t> bits(std::size_t(n) * k);
+        for (auto& b : bits) b = to_bf16(normal(rng));
+        std::vector<float> x(std::size_t(max_rows) * k);
+        for (auto& v : x) v = normal(rng) * 50.0F;
+        float *dx = nullptr, *dy = nullptr, *dy2 = nullptr;
+        ok(hipMalloc(&dx, x.size() * 4U), "malloc x");
+        ok(hipMalloc(&dy, std::size_t(max_rows) * n * 4U), "malloc y");
+        ok(hipMalloc(&dy2, std::size_t(max_rows) * n * 4U), "malloc y2");
+        ok(hipMemcpy(dx, x.data(), x.size() * 4U, hipMemcpyHostToDevice), "copy x");
+        const auto q4 = pack(wd::Format::q4_g64, bits, n, k);
+        const auto q6 = pack(wd::Format::q6_g64, bits, n, k);
+        const auto q8 = pack(wd::Format::q8_0, bits, n, k);
+        const auto d4 = upload(q4.bytes.data(), q4.bytes.size());
+        const auto d8 = upload(q8.bytes.data(), q8.bytes.size());
+        std::uint8_t* d6 = nullptr;
+        ok(hipMalloc(&d6, q6.bytes.size()), "malloc q6");
+        ok(hipMemcpy(d6, q6.bytes.data(), q6.bytes.size(), hipMemcpyHostToDevice), "copy q6");
+        const std::uint8_t* w4 = d4.w;
+        // 1. The folded operand equals the host model fp16(code x d) bit for bit, both stagings, q4 and q6.
+        for (const bool small : {false, true}) {
+            const auto b4 = fold_operand_mismatches<wei::Q4G64Storage>(q4, w4, n, k, small);
+            const auto b6 = fold_operand_mismatches<wei::Q6G64Storage>(q6, d6, n, k, small);
+            report(b4 == 0U && b6 == 0U, tag + (small ? " small" : " tile") + " folded operand == host fp16(code x d) q4_bad=" +
+                                              std::to_string(b4) + " q6_bad=" + std::to_string(b6));
+        }
+        // 2. Folded output: within the FP16 operand bound of the host reference (first outputs), one arithmetic across
+        //    the routes and row counts (small == tile, rows r == row r of 129), and its bits against the group arithmetic.
+        const auto fetch_rows = [&](float* d, unsigned rows) { return fetch(d, std::size_t(rows) * n); };
+        ok(launch_arm(Arm::tile_folded, q4, w4, n, k, dx, dy2, check_rows), "folded tile 129");
+        const auto base = fetch_rows(dy2, check_rows);
+        {
+            const unsigned outs = std::min(n, ref_outputs);
+            std::size_t bad = 0;
+            double worst = 0.0;
+            for (unsigned r = 0; r < check_rows; ++r)
+                for (unsigned o = 0; o < outs; ++o) {
+                    double acc = 0.0, m = 0.0;
+                    for (unsigned kk = 0; kk < k; ++kk) {
+                        const double t = double(q4.dequant[std::size_t(o) * k + kk]) * x[std::size_t(r) * k + kk];
+                        acc += t;
+                        m += std::fabs(t);
+                    }
+                    const double err = std::fabs(double(base[std::size_t(r) * n + o]) - acc);
+                    const double bound = (std::ldexp(1.0, -10) + k * std::ldexp(1.0, -23)) * m + 1e-30;
+                    worst = std::max(worst, err / bound);
+                    bad += !std::isfinite(base[std::size_t(r) * n + o]) || err > bound ? 1U : 0U;
+                }
+            report(bad == 0U, tag + " folded rows=129 vs host reference bad=" + std::to_string(bad) +
+                                  " worst/bound=" + std::to_string(worst));
+        }
+        for (const unsigned rows : {1U, 2U, 16U, 17U, 40U, 64U, 129U})
+            for (const Arm arm : {Arm::small_folded, Arm::tile_folded}) {
+                poison(dy, std::size_t(rows) * n);
+                ok(launch_arm(arm, q4, w4, n, k, dx, dy, rows), "folded launch");
+                const auto diff = bit_diff(fetch_rows(dy, rows), base, rows, n);
+                report(diff == 0U, tag + " " + name(arm) + " rows=" + std::to_string(rows) + " bits_vs_tile129=" + std::to_string(diff));
+            }
+        {
+            ok(launch_arm(Arm::tile_group, q4, w4, n, k, dx, dy, check_rows), "group tile 129");
+            const auto group = fetch_rows(dy, check_rows);
+            auto matrix = view(q4, w4, n, k);
+            const auto decline = core::certify_folded_scale(matrix,
+                [](std::span<const std::uint8_t> staged, std::span<std::uint8_t> host) {
+                    ok(hipMemcpy(host.data(), staged.data(), staged.size_bytes(), hipMemcpyDeviceToHost),
+                       "read staged compact image");
+                });
+            for (const unsigned rows : {1U, 16U, 64U, 65U, 129U}) {
+                const bool folds = rows > 64U && decline.empty();
+                const auto& want = folds ? base : group;
+                const auto floats = std::size_t(rows) * n;
+                poison(dy2, floats);
+                ok(core::enqueue_resident_lowbit_rows(matrix, n, dx, rows, dy2, nullptr,
+                                                      core::LowBitArithmetic::f16_folded_scale), "folded entry");
+                const auto diff = bit_diff(fetch_rows(dy2, rows), want, rows, n);
+                float* dz = dy2 + floats;
+                const std::array<core::ResidentRowProjection, 2> list{{{matrix, n, dy2}, {matrix, n, dz}}};
+                ok(strix::test::launch_poisoned_folded_group(dy2, dz, floats, poison, [&] {
+                    return core::enqueue_resident_q8_projections<2>(dx, k, rows, list, nullptr,
+                                                                     core::LowBitArithmetic::f16_folded_scale);
+                }), "folded list");
+                const auto both = fetch(dy2, 2U * std::size_t(rows) * n);
+                const std::vector<float> second(both.begin() + std::ptrdiff_t(std::size_t(rows) * n), both.end());
+                const auto diff_list = bit_diff(both, want, rows, n) + bit_diff(second, want, rows, n);
+                report(diff == 0U && diff_list == 0U, tag + " f16_folded_scale entry rows=" + std::to_string(rows) + " route=" +
+                                                          (folds ? "tile(folded)" : "group-scale") + " bits_diff=" +
+                                                          std::to_string(diff) + " list_bits_diff=" + std::to_string(diff_list));
+            }
+            std::cout << "info " << tag << " folded_vs_group differing=" << bit_diff(group, base, check_rows, n) << " of "
+                      << std::size_t(check_rows) * n << '\n';
+            for (const unsigned rows : sweep_rows) {
+                ok(launch_arm(Arm::sweep, q4, w4, n, k, dx, dy2, rows), "sweep");
+                std::cout << "info " << tag << " rows=" << rows << " fp32-sweep_vs_small-group differing="
+                          << bit_diff(fetch_rows(dy2, rows), group, rows, n) << " of " << std::size_t(rows) * n << '\n';
+            }
+        }
+        // 3. Interleaved timings: two rounds, every arm once per round in the same order.
+        const auto bench = [&](Arm arm, unsigned rows, int round) {
+            const bool tile = arm == Arm::tile_group || arm == Arm::tile_folded || arm == Arm::tile_q8;
+            const auto& d = arm == Arm::tile_q8 ? d8 : d4;
+            const auto& p = arm == Arm::tile_q8 ? q8 : q4;
+            const std::size_t copies = tile ? 2U : d.copies;
+            const double us = time_us(copies, [&](std::size_t c) { return launch_arm(arm, p, d.w + c * d.stride, n, k, dx, dy, rows); });
+            std::cout << "bench fold " << tag << " arm=" << name(arm) << " rows=" << rows << " round=" << round << " us=" << us
+                      << " TMACps=" << double(rows) * n * k / (us * 1e6) << " Gwps=" << double(n) * k / (us * 1e3) << '\n';
+        };
+        for (int round = 0; round < 2; ++round) {
+            for (const unsigned rows : prefill_rows)
+                for (const Arm arm : {Arm::tile_group, Arm::tile_folded, Arm::tile_q8}) bench(arm, rows, round);
+            for (const unsigned rows : small_rows) {
+                for (const Arm arm : {Arm::small_group, Arm::small_folded}) bench(arm, rows, round);
+                if (rows <= 4U) bench(Arm::sweep, rows, round);
+            }
+        }
+        ok(hipFree(d4.w), "free q4");
+        ok(hipFree(d8.w), "free q8");
+        ok(hipFree(d6), "free q6");
+        ok(hipFree(dx), "free x");
+        ok(hipFree(dy), "free y");
+        ok(hipFree(dy2), "free y2");
+    }
+    std::cout << "lowbit fold checks " << (failures == 0 ? "PASS" : "FAIL") << '\n';
+    return failures == 0 ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::strcmp(argv[1], "fold") == 0) {
+        std::vector<unsigned> fold_shapes;
+        for (int i = 2; i < argc; ++i) fold_shapes.push_back(static_cast<unsigned>(std::strtoul(argv[i], nullptr, 10)));
+        bool valid = !fold_shapes.empty() && fold_shapes.size() % 2U == 0U;
+        for (std::size_t i = 0; valid && i < fold_shapes.size(); i += 2)
+            valid = fold_shapes[i] != 0U && fold_shapes[i + 1] != 0U && fold_shapes[i + 1] % 128U == 0U;
+        if (!valid) {
+            std::cerr << "usage: strix-hip-dense-lowbit-bench fold N K [N K ...], K a positive multiple of 128\n";
+            return 2;
+        }
+        return fold_ticket(fold_shapes);
+    }
     // Default shapes: the decode projections, then two output tails (N not a multiple of 64 outputs).
     std::vector<unsigned> shapes{3072, 2304, 1024, 2304, 2304, 3072, 384, 2304, 1000, 2304, 17, 256};
     const bool default_shapes = argc <= 1;

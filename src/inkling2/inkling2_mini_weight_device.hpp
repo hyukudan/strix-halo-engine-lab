@@ -132,8 +132,36 @@ auto load_mini_weights(const std::string& model, weight::WeightLoadPlan& plan, p
                        const MiniWeightOptions& options, const weight::WeightLoadScope& scope,
                        weight::WeightLoadExtent extent, Load load) {
     const bool lowbit = mini_lowbit_storage(plan.storage) || mini_lowbit_storage(plan.head_storage);
+    const auto arithmetic = core::resident_lowbit_arithmetic(profile::resolve(kMiniProfile, options.tier));
+    if (arithmetic != kMiniLowBitArithmetic && (!lowbit || scope.backend != weight::Backend::hip))
+        throw std::invalid_argument("the low-bit arithmetic candidate requires resident HIP q4_g64 or q6_g64 weights");
     if (!lowbit)
         return load_mini_weight_pack(plan, tier, options, scope, extent, {}, nullptr, std::cerr, load);
+    const auto load_with_arithmetic = [&](MiniLowBitRows rows) {
+        if (arithmetic != kMiniLowBitArithmetic &&
+            !mini_lowbit_storage(plan.storage) && !mini_lowbit_storage(plan.head_storage))
+            throw std::invalid_argument("the selected low-bit arithmetic lost its resident weight image");
+        rows.arithmetic = arithmetic;
+#if defined(__HIPCC__)
+        if (!kMiniProfile.ladder.empty() && !(scope.checkpoint == weight::Digest256{}) &&
+            (mini_lowbit_storage(plan.storage) || mini_lowbit_storage(plan.head_storage))) {
+            const auto row_plan = core::bound_lowbit_row_plan(device::native::current_device());
+            std::string settings = "weights=" + weight::serialize_id(plan.storage) +
+                " head=" + weight::serialize_id(plan.head_storage) + " " + weight::weight_load_scope_receipt(scope) +
+                " small_rows=" + std::to_string(row_plan.small_rows) + " wide_panels=" + std::to_string(row_plan.wide_panels);
+            if (rows.admitted) {
+                settings += " pack=";
+                for (const auto byte : rows.admitted->identity().bytes) {
+                    settings += "0123456789abcdef"[byte >> 4U];
+                    settings += "0123456789abcdef"[byte & 15U];
+                }
+            }
+            rows.timing.emplace(MiniLowBitTiming{options.tier, std::string(scope.device_class),
+                device::hip_cost_device_identity(), std::move(settings), extent.context});
+        }
+#endif
+        return load(std::move(rows));
+    };
     bind_mini_lowbit_device(plan);
     const bool measured = !options.qualify && !options.qualify_q8;
     std::string path;
@@ -148,7 +176,7 @@ auto load_mini_weights(const std::string& model, weight::WeightLoadPlan& plan, p
     incumbent_scope.build = weight::implementation_identity(core::kResidentQ8ArithmeticHip);
 #endif
     return load_mini_weight_pack(plan, tier, options, incumbent_scope, extent, path,
-                                  measured ? &kMiniLowBitPackIdentity : nullptr, std::cerr, load);
+                                  measured ? &kMiniLowBitPackIdentity : nullptr, std::cerr, load_with_arithmetic);
 }
 
 } // namespace strix::inkling2

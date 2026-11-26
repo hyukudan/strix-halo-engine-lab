@@ -63,15 +63,16 @@ void test_controller_planes() {
 // The engine resolves the W4A4 row: an unbound table would ignore STRIX_INK_MOE_W4A4 at every prompt length.
 void test_row() {
     require(mini::kMiniProfile.table.size() == mini::kMiniLevers.size(), "Inkling lever table bound to the engine");
-    require(mini::kMiniProfile.table.size() == 15U,
+    require(mini::kMiniProfile.table.size() == 16U,
             "W4A4, down image, prepared round fold, narrow experts, controller planes, projected-bias, served route, "
-            "screened head, calibrated low-bit, verify rows, image recipe, block-candidate and three StrixPack rows");
+            "screened head, calibrated low-bit, verify rows, image recipe, block-candidate and three StrixPack rows and folded scale");
     require(mini::kMiniLevers[10].name == mini::kMiniVisionRecipe, "image recipe sits before the block-candidate row");
     require(mini::kMiniLevers[11].name == strix::spec::kBlockDraftLever.name &&
                 mini::kMiniLevers[12].name == strix::weight::kAttentionHeadSP4Lever.name &&
                 mini::kMiniLevers[13].name == strix::weight::kAttentionHeadSP3Lever.name &&
-                mini::kMiniLevers[14].name == strix::weight::kAttentionHeadSP2Lever.name,
-            "existing block row retains its slot and the three StrixPack rows are bound");
+                mini::kMiniLevers[14].name == strix::weight::kAttentionHeadSP2Lever.name &&
+                mini::kMiniLevers[15].name == strix::weight::kLowBitFoldedScaleLever.name,
+            "existing block row retains its slot and the three StrixPack rows and folded scale are bound");
     const auto& lever = mini::kMiniProfile.table.front();
     require(lever.name == mini::kMiniMoeW4a4 && lever.name == "inkling2-mini-moe-w4a4@1", "w4a4 identity");
     require(lever.env == "STRIX_INK_MOE_W4A4" && lever.off == "0" && lever.builtin == "0", "w4a4 off switch");

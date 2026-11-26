@@ -30,15 +30,20 @@ inline LowBitRowPlan current_lowbit_row_plan() {
     int dev = 0;
     return hipGetDevice(&dev) == hipSuccess ? bound_lowbit_row_plan(dev) : LowBitRowPlan{};
 }
-// Low-bit projections sharing one input: one launch of the planned route (both routes compute the same bits).
+// Low-bit projections sharing one input: one launch of the planned route. Under f16_group_scale both routes compute
+// the same bits; under f16_folded_scale the tile route folds the scale and the small-M route keeps the group scale
+// (core/resident_row_plan.hpp LowBitArithmetic).
 template <class Storage, unsigned Capacity>
 row_transforms::Status launch_lowbit_group(const float* input, unsigned rows, unsigned width,
                                            const f16_tile_gemm::Q8ProjectionGroup<Capacity>& group,
-                                           row_transforms::Stream stream) {
+                                           row_transforms::Stream stream, LowBitArithmetic arithmetic) {
     const auto plan = current_lowbit_row_plan();
     if (plan_lowbit_rows(rows, plan) == LowBitRoute::small_tile)
         return f16_tile_gemm::small_m::gemm_lowbit<Storage>(
             input, rows, width, group, stream, lowbit_wide_block(rows, group.first_panel[group.count], plan));
+    if (arithmetic == LowBitArithmetic::f16_folded_scale)
+        return f16_tile_gemm::gemm_lowbit_projections<Storage, Capacity, lowbit_f16::ScalePolicy::folded>(input, rows, width,
+                                                                                                         group, stream);
     return f16_tile_gemm::gemm_lowbit_projections<Storage>(input, rows, width, group, stream);
 }
 template <weight_decode::Format Format>
@@ -54,7 +59,8 @@ row_transforms::Status launch_lowbit_rows(dense_linear::View weights, const floa
 }  // namespace detail
 #endif
 
-// HIP low-bit resident rows. Selecting f16_group_scale explicitly enables the two WMMA schedules.
+// HIP low-bit resident rows. Selecting f16_group_scale (or the candidate f16_folded_scale) explicitly enables the two
+// WMMA schedules.
 inline row_transforms::Status enqueue_resident_lowbit_rows(
     const weight::ResidentMatrixView& matrix, unsigned live_outputs, const float* input,
     unsigned rows, float* output, row_transforms::Stream stream,
@@ -70,9 +76,10 @@ inline row_transforms::Status enqueue_resident_lowbit_rows(
     }
     f16_tile_gemm::Q8ProjectionGroup<1> group{};
     group.append({matrix.bytes.data(), live_outputs, output});
+    arithmetic = admitted_lowbit_arithmetic(arithmetic, matrix);
     return matrix.storage == weight::kQ4G64WeightStorage
-               ? detail::launch_lowbit_group<weight::Q4G64Storage>(input, rows, width, group, stream)
-               : detail::launch_lowbit_group<weight::Q6G64Storage>(input, rows, width, group, stream);
+               ? detail::launch_lowbit_group<weight::Q4G64Storage>(input, rows, width, group, stream, arithmetic)
+               : detail::launch_lowbit_group<weight::Q6G64Storage>(input, rows, width, group, stream, arithmetic);
 #else
     (void)stream;
     return row_transforms::invalid;
@@ -141,7 +148,7 @@ inline bool resident_q8_projections_admitted(const float* input, unsigned width,
         if (!matrix || matrix->columns != width || matrix->rows != projection.outputs) return false;
         const bool lowbit = matrix->storage == weight::kQ4G64WeightStorage || matrix->storage == weight::kQ6G64WeightStorage;
 #if defined(__HIPCC__)
-        if (lowbit ? arithmetic != LowBitArithmetic::f16_group_scale ||
+        if (lowbit ? !lowbit_f16_form(arithmetic) ||
                          !valid_resident_lowbit_rows(*matrix, projection.outputs, input, rows, projection.output, arithmetic)
                    : !valid_resident_q8_rows(*matrix, projection.outputs, input, rows, projection.output))
             return false;
@@ -181,13 +188,18 @@ inline row_transforms::Status enqueue_resident_q8_projections(
         const bool tile = q4 || storage == weight::kQ6G64WeightStorage || use_resident_q8_tile(rows);
         if (tile) {
             f16_tile_gemm::Q8ProjectionGroup<Capacity> group{};
-            for (const auto& projection : run)
-                group.append({std::get<weight::ResidentMatrixView>(projection.weights).bytes.data(), projection.outputs,
-                              projection.output});
+            auto run_arithmetic = arithmetic;
+            for (const auto& projection : run) {
+                const auto& matrix = std::get<weight::ResidentMatrixView>(projection.weights);
+                group.append({matrix.bytes.data(), projection.outputs, projection.output});
+                run_arithmetic = admitted_lowbit_arithmetic(run_arithmetic, matrix);
+            }
             row_transforms::Status status;
-            if (q4) status = detail::launch_lowbit_group<weight::Q4G64Storage>(input, rows, width, group, stream);
+            if (q4) status = detail::launch_lowbit_group<weight::Q4G64Storage>(input, rows, width, group, stream,
+                                                                             run_arithmetic);
             else if (storage == weight::kQ6G64WeightStorage)
-                status = detail::launch_lowbit_group<weight::Q6G64Storage>(input, rows, width, group, stream);
+                status = detail::launch_lowbit_group<weight::Q6G64Storage>(input, rows, width, group, stream,
+                                                                          run_arithmetic);
             else status = f16_tile_gemm::gemm_q8_projections(input, rows, width, group, stream);
             if (status != success) return status;
         } else {

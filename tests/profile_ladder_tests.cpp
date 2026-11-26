@@ -14,6 +14,7 @@
 #include "strix/profiles/qwen_dense_hip.hpp"
 #include "strix/profiles/hy4.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
+#include "core/resident_row_plan.hpp"
 #include "minimax/engine/mm_defaults.hpp"
 #include "cuda/models/glm/producer/profile.hpp"
 
@@ -721,6 +722,57 @@ void strixpack_candidates() {
                     "the admission binding demotes a receipt grant until the loader exists");
         }
     }
+}
+
+void lowbit_candidate() {
+    using strix::core::LowBitArithmetic;
+    using strix::core::resident_lowbit_arithmetic;
+    const auto& engine = strix::inkling2::kMiniProfile;
+    const auto& candidate = strix::weight::kLowBitFoldedScaleLever;
+    const auto lever = std::ranges::find(engine.table, candidate.name, &p::Lever::name);
+    require(lever != engine.table.end() && p::identity_defect(*lever).empty(),
+            "low-bit candidate is registered with identities");
+    if (lever == engine.table.end()) return;
+
+    const p::Regime regime{p::Phase::prefill, 8192U, 1, "gfx1151", kExec};
+    const auto exact = resolve(engine, p::Name::standard, regime);
+    require(resident_lowbit_arithmetic(exact) == LowBitArithmetic::f16_group_scale, "EXACT keeps group scale");
+    const auto arms = p::ladder_arms(engine.table, engine.ladder,
+        regime, [](const p::Lever& row, unsigned column) { return p::column_admission(row, column, false, false); });
+    for (const auto tier : {p::Name::fast, p::Name::turbo}) {
+        const auto pending = resolve(engine, tier, regime);
+        const auto* entry = pending.find(candidate.name);
+        require(entry && entry->status == p::Status::pending &&
+                    resident_lowbit_arithmetic(pending) == LowBitArithmetic::f16_group_scale,
+                "low-bit arithmetic stays pending without a receipt");
+        const auto reference = arms.over(tier, candidate.name, candidate.target);
+        require(!reference.empty(), "low-bit candidate has a complete reference key");
+        const p::LadderRow receipt{candidate.name, candidate.target, tier, regime.phase, regime.device,
+                                   regime.context, regime.context, 1, 1, 1.2, 0.01, "fixture/lowbit", false, {}, {}, reference};
+        auto measured = engine;
+        measured.ladder = std::span(&receipt, 1);
+        require(p::ladder_defect(measured).empty() &&
+                    resident_lowbit_arithmetic(resolve(measured, tier, regime)) == LowBitArithmetic::f16_folded_scale,
+                "one matching receipt selects the arithmetic without changing the lever");
+        require(resident_lowbit_arithmetic(resolve(measured, p::Name::turbo, regime)) == LowBitArithmetic::f16_folded_scale,
+                "TURBO keeps the selected value, including when only FAST qualifies");
+        require(resident_lowbit_arithmetic(resolve(measured, p::Name::standard, regime)) == LowBitArithmetic::f16_group_scale,
+                "receipt never changes EXACT");
+        auto wrong = regime;
+        ++wrong.context;
+        require(resident_lowbit_arithmetic(resolve(measured, tier, wrong)) == LowBitArithmetic::f16_group_scale,
+                "another regime keeps group scale");
+    }
+    p::Inputs explicit_exact;
+    explicit_exact.env = [](const char*) -> const char* { return nullptr; };
+    explicit_exact.cli.emplace_back(candidate.name, candidate.target);
+    bool refused = false;
+    try {
+        static_cast<void>(resident_lowbit_arithmetic(p::resolve(engine, explicit_exact)));
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    require(refused, "an explicit low-bit arithmetic candidate is refused in EXACT");
 }
 
 void incumbents(const char* golden, bool write) {
@@ -1546,6 +1598,7 @@ int main(int argc, char** argv) try {
     }
     incumbents(argv[2], false);
     strixpack_candidates();
+    lowbit_candidate();
     verdicts();
     bound_evidence();
     defects();

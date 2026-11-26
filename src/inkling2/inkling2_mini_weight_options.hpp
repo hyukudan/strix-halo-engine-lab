@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <span>
 #include <stdexcept>
@@ -52,11 +53,33 @@ inline bool mini_lowbit_storage(weight::FormatId f) {
     return f == weight::kQ4G64WeightStorage || f == weight::kQ6G64WeightStorage;
 }
 
+// The native load binds this only when the profile has timing rows. Each append then supplies the workload
+// it actually launches. The same decoder supplies the key on the CLI and in a served cohort.
+struct MiniLowBitTiming {
+    profile::Inputs inputs;
+    std::string device, product, weights;
+    std::uint32_t capacity;
+
+    core::LowBitArithmetic select(profile::Phase phase, std::uint64_t context, unsigned lanes, unsigned rows,
+                                  unsigned chunk, std::string_view route) const {
+        auto request = inputs;
+        // A receipt prices one prompt chunk or one decode pass over an already resident context.
+        const auto execution = profile::ladder_execution({"hip", product,
+            {context, capacity, lanes, chunk, phase == profile::Phase::prefill ? rows : 0U,
+             phase == profile::Phase::decode ? rows : 0U, 0U, phase == profile::Phase::decode ? 1U : 0U},
+            weights + std::string(route)});
+        request.regime = {phase, context, lanes, device, execution};
+        return core::resident_lowbit_arithmetic(profile::resolve(kMiniProfile, request));
+    }
+};
+
 // The decode-only qualification arm keeps the incumbent BF16 tensors beside the compact
 // tensors. Ordinary weight qualification replaces the selected tensors.
 struct MiniLowBitRows {
     bool decode_only = false;
     std::shared_ptr<const weight::LowbitPack> admitted{};
+    core::LowBitArithmetic arithmetic = kMiniLowBitArithmetic;
+    std::optional<MiniLowBitTiming> timing{};
 };
 
 inline weight::WeightLoadPlan mini_lowbit_receipt_plan(
@@ -378,6 +401,8 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
     require_mini_expert_consumer(tier, native_execution);
     static_cast<void>(mini_controller_one_plane(tier));
     static_cast<void>(mini_lowbit_turbo(tier));
+    if (core::resident_lowbit_arithmetic(tier) != kMiniLowBitArithmetic && !native_execution)
+        throw std::invalid_argument("the low-bit arithmetic candidate requires native HIP execution");
     spec::require_block_draft_execution(spec::block_draft_selection(tier));
     return tier;
 }

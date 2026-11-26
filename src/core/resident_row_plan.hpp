@@ -5,13 +5,17 @@
 #include "core/f16_tile_gemm.hpp"
 #include "core/gemv_rows.hpp"
 #include "strix/device/lowbit_rows.hpp"
+#include "strix/weight/lowbit_folded_scale_profile.hpp"
 #include "strix/weight/host_lowbit.hpp"
 #include "strix/weight/resident_slices.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <limits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace strix::core {
 
@@ -51,10 +55,81 @@ inline bool valid_resident_q8_rows(const weight::ResidentMatrixView& matrix, uns
 }
 
 // The FP32 sweep is the incumbent. The explicit FP16 form uses one arithmetic across both tile schedules.
-enum class LowBitArithmetic { fp32_sweep, f16_group_scale };
+// f16_folded_scale: the FP16 form whose tile route (launches above the device plan's small_rows) folds the scale into
+// the operand (fp16(code x d), one WMMA chain per output; core/lowbit_f16_staging.hpp ScalePolicy::folded) while the
+// small-M route keeps the group scale: per-regime selection from the no-model fixture (tests/hip_dense_lowbit_bench.hip
+// mode fold; gfx1151: the folded tile faster on every measured shape, the folded small-M schedule no faster at 1-16
+// rows and slower at 32-64). A row's bits then depend on its launch's route. A FAST / TURBO candidate lever value: it
+// changes rounding, is never EXACT and no profile selects it until its gate and receipts exist.
+enum class LowBitArithmetic { fp32_sweep, f16_group_scale, f16_folded_scale };
 
+// Both product entry points and qualification arms bind the same resolved value to the launch policy.
+inline LowBitArithmetic resident_lowbit_arithmetic(const profile::Resolution& tier) {
+    const auto& lever = weight::kLowBitFoldedScaleLever;
+    const auto* entry = tier.find(lever.name);
+    if (!entry || entry->value == lever.builtin || entry->value == "off") return LowBitArithmetic::f16_group_scale;
+    if (entry->value != lever.target)
+        throw std::invalid_argument(std::string(lever.env) + " requires " + std::string(lever.target) + " or off");
+    if (tier.profile != profile::Name::fast && tier.profile != profile::Name::turbo)
+        throw std::invalid_argument(std::string(lever.env) + " requires FAST or TURBO");
+    return LowBitArithmetic::f16_folded_scale;
+}
+
+namespace detail {
+template <class Storage, class Read>
+std::string_view folded_scale_decline(const weight::ResidentMatrixView& matrix, const Read& read) {
+    if (matrix.columns == 0U || matrix.columns % Storage::elements != 0U || matrix.rows == 0U ||
+        matrix.row_bytes != Storage::row_bytes(matrix.columns) || matrix.rows > matrix.bytes.size() / matrix.row_bytes)
+        return "invalid compact matrix geometry";
+    constexpr std::size_t chunk_bytes = (64U * 1024U / Storage::bytes) * Storage::bytes;
+    const auto size = static_cast<std::size_t>(matrix.rows * matrix.row_bytes);
+    std::vector<std::uint8_t> scratch(std::min(size, chunk_bytes));
+    for (std::size_t offset = 0U; offset < size;) {
+        const auto chunk = std::span(scratch).first(std::min(scratch.size(), size - offset));
+        read(matrix.bytes.subspan(offset, chunk.size()), chunk);
+        for (std::size_t pos = 0U; pos < chunk.size(); pos += Storage::bytes) {
+            const auto* block = chunk.data() + pos;
+            for (unsigned g = 0U; g < Storage::groups; ++g) {
+                const auto scale = weight::lowbit::f16_bits_to_f32(Storage::scale_bits(block, g));
+                if (!std::isfinite(scale)) return "nonfinite FP16 group scale";
+                for (unsigned j = g * Storage::group; j < (g + 1U) * Storage::group; ++j) {
+                    const auto product = scale * static_cast<float>(Storage::code(block, j));
+                    if (std::abs(product) > 65504.0F) return "scale x code exceeds finite FP16 range";
+                    if (weight::lowbit::f16_bits_to_f32(weight::lowbit::f32_to_f16_bits(product)) != product)
+                        return "scale x code is not exact in FP16";
+                }
+            }
+        }
+        offset += chunk.size();
+    }
+    return {};
+}
+}  // namespace detail
+
+// Certify the immutable staged compact image using a bounded host reader. Dispatch never dereferences device bytes.
+template <class Read>
+std::string_view certify_folded_scale(weight::ResidentMatrixView& matrix, const Read& read) {
+    matrix.folded_scale_admitted = false;
+    std::string_view decline;
+    if (matrix.storage == weight::kQ4G64WeightStorage)
+        decline = detail::folded_scale_decline<weight::Q4G64Storage>(matrix, read);
+    else if (matrix.storage == weight::kQ6G64WeightStorage)
+        decline = detail::folded_scale_decline<weight::Q6G64Storage>(matrix, read);
+    else
+        return "storage has no folded-scale staging";
+    matrix.folded_scale_admitted = decline.empty();
+    return decline;
+}
+
+constexpr LowBitArithmetic admitted_lowbit_arithmetic(LowBitArithmetic arithmetic,
+                                                       const weight::ResidentMatrixView& matrix) {
+    return arithmetic == LowBitArithmetic::f16_folded_scale && !matrix.folded_scale_admitted
+        ? LowBitArithmetic::f16_group_scale : arithmetic;
+}
+
+constexpr bool lowbit_f16_form(LowBitArithmetic arithmetic) { return arithmetic != LowBitArithmetic::fp32_sweep; }
 constexpr unsigned lowbit_max_rows(LowBitArithmetic arithmetic) {
-    return arithmetic == LowBitArithmetic::f16_group_scale ? 65535U * f16_tile_gemm::kBM : gemv_rows::max_rows;
+    return lowbit_f16_form(arithmetic) ? 65535U * f16_tile_gemm::kBM : gemv_rows::max_rows;
 }
 inline bool valid_resident_lowbit_rows(const weight::ResidentMatrixView& matrix, unsigned outputs,
                                        const float* input, unsigned rows, const float* output,
@@ -133,6 +208,8 @@ inline constexpr std::array<weight::ArithmeticId, 2> kResidentLowBitArithmeticHi
     {"hip.q4_g64.dense-linear-tight-rows", 1}, {"hip.q6_g64.dense-linear-tight-rows", 1}}};
 inline constexpr std::array<weight::ArithmeticId, 2> kResidentLowBitTileArithmeticHip{{
     {"hip.q4_g64.f16-group-scale-chain", 1}, {"hip.q6_g64.f16-group-scale-chain", 1}}};
+inline constexpr std::array<weight::ArithmeticId, 2> kResidentLowBitFoldedArithmeticHip{{
+    {"hip.q4_g64.f16-folded-scale-tile", 1}, {"hip.q6_g64.f16-folded-scale-tile", 1}}};
 
 // The weight bytes one projection of a list reads: a BF16 projection outputs tight rows of width elements, a compact
 // one its whole view. Empty (nullptr, 0) when the descriptor has no weights or the extent does not fit.

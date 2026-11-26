@@ -4,6 +4,7 @@
 // fixed bytes in any rounding mode; a scale beyond FP16 is refused; the chosen scale never reconstructs worse than the
 // unclipped scale; the Q8_0 loader is unchanged by the shared block source.
 #include "core/iu4_onfly.hpp"
+#include "lowbit_folded_fixture.hpp"
 #include "core/lowbit_f16_staging.hpp"
 #include "inkling2/inkling2_mini_dense_hip.hpp"
 #include "core/resident_row_plan.hpp"
@@ -230,6 +231,55 @@ void check_lowbit_plan() {
 
 // Byte ranges of resident launches (core/resident_row_plan.hpp): a projection never writes its input, and a grouped
 // list never writes one byte twice, whatever the storages; a refused list calls no backend (nothing is written).
+template <class Storage>
+void check_folded_scale(wei::FormatId format) {
+    namespace co = strix::core;
+    constexpr auto folded = co::LowBitArithmetic::f16_folded_scale;
+    constexpr auto grouped = co::LowBitArithmetic::f16_group_scale;
+    std::array<int, Storage::elements> codes{};
+    std::array<std::uint8_t, 2U * Storage::bytes> bytes{};
+    codes[0] = Storage::qmin;
+    const auto limit = 65504.0F / static_cast<float>(-Storage::qmin);
+    const std::uint16_t admissible[]{wei::lowbit::f32_to_f16_bits(limit), 0U};
+    const std::uint16_t overflowing[]{wei::lowbit::f32_to_f16_bits(65536.0F / static_cast<float>(-Storage::qmin)), 0U};
+    wei::lowbit::pack_block<Storage>(codes.data(), admissible, bytes.data());
+    wei::lowbit::pack_block<Storage>(codes.data(), overflowing, bytes.data() + Storage::bytes);
+    const auto saved = bytes;
+    const auto read = [](std::span<const std::uint8_t> src, std::span<std::uint8_t> dst) {
+        std::ranges::copy(src, dst.begin());
+    };
+    wei::ResidentMatrixView matrix{bytes, format, 2U, Storage::elements, Storage::bytes};
+    check(!co::certify_folded_scale(matrix, read).empty() && co::admitted_lowbit_arithmetic(folded, matrix) == grouped,
+          "one overflowing group declines folded staging for the matrix");
+    const float incumbent = wei::lowbit::decode<Storage>(saved.data() + Storage::bytes, 0U);
+    const auto from_staging = [&](float value) {
+        return co::admitted_lowbit_arithmetic(folded, matrix) == grouped ? value
+            : wei::lowbit::f16_bits_to_f32(wei::lowbit::f32_to_f16_bits(value));
+    };
+    check(incumbent == -65536.0F && std::bit_cast<std::uint32_t>(from_staging(incumbent)) ==
+          std::bit_cast<std::uint32_t>(incumbent) && bytes == saved, "declined staging keeps incumbent bytes");
+    matrix = {std::span(bytes).first(Storage::bytes), format, 1U, Storage::elements, Storage::bytes};
+    check(co::certify_folded_scale(matrix, read).empty() && co::admitted_lowbit_arithmetic(folded, matrix) == folded &&
+          from_staging(wei::lowbit::decode<Storage>(bytes.data(), 0U)) == -65504.0F,
+          "largest finite FP16 product folds exactly");
+    codes[0] = 7;
+    const std::uint16_t inexact[]{wei::lowbit::f32_to_f16_bits(1.0F + 0x1p-10F), 0U};
+    wei::lowbit::pack_block<Storage>(codes.data(), inexact, bytes.data());
+    check(!co::certify_folded_scale(matrix, read).empty() && co::admitted_lowbit_arithmetic(folded, matrix) == grouped,
+          "finite product that would round declines folded staging");
+}
+
+void check_grouped_fixture_poison() {
+    float first = 1.0F, second = 2.0F;
+    const auto poison = [](float* output, std::size_t count) { std::fill_n(output, count, -1.0F); };
+    const bool ran = strix::test::launch_poisoned_folded_group(&first, &second, 1U, poison, [&] {
+        check(second == -1.0F, "second grouped destination is poisoned before launch");
+        second = 2.0F;  // Model a launch that only wrote the second destination.
+        return true;
+    });
+    check(ran && first != 1.0F && second == 2.0F, "grouped fixture catches a skipped standalone destination");
+}
+
 void check_resident_ranges() {
     namespace co = strix::core;
     namespace w = strix::weight;
@@ -586,6 +636,9 @@ int main() {
     check_format<wei::Q6G64Storage, wd::Format::q6_g64>("q6_g64");
     check_q8_unchanged();
     check_lowbit_plan();
+    check_folded_scale<wei::Q4G64Storage>(wei::kQ4G64WeightStorage);
+    check_folded_scale<wei::Q6G64Storage>(wei::kQ6G64WeightStorage);
+    check_grouped_fixture_poison();
     check_resident_ranges();
     check_bf16_preflight();
     check_group_accumulator();
