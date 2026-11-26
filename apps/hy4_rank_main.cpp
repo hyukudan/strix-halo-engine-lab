@@ -878,10 +878,14 @@ int run(int argc, char** argv) {
         const auto anchor = static_cast<std::uint32_t>(std::max_element(prompt_logits.begin(), prompt_logits.end()) - prompt_logits.begin());
         if (mtp) mtp->finish_prompt(anchor);
         strix::spec::pair_round::Exchange pair_ex;
+        double trip_ms = 0.0;
         if (tpg) {  // tensor-parallel pair: every verify pass (and draft round with the block on both ranks) on both ranks
             const auto rank = static_cast<std::uint32_t>(tp_rank);
+            // trip cost measured over the gather form the passes run, agreed by both ranks (prices the seeds below)
+            const auto lc = tpg->measure_link();
+            trip_ms = strix::pair::tp::trip_cost(lc, tp_trip_us).latency_ms;
             fwd.enable_tp(rank, {&tpg->link(), &strix::xport::tp_gather::HipPairGather::Link::fn});
-            std::cout << fwd.tp_receipt() << "\n";
+            std::cout << fwd.tp_receipt() << "\ntp link cost: " << lc.describe() << "\n";
             // the round message rides the same gather: [2][kSlot] bytes on the device, stream-ordered after the last pass
             constexpr std::size_t kSlot = 128;
             static_assert(strix::spec::pair_round::kMessageBytes <= kSlot);
@@ -920,7 +924,11 @@ int run(int argc, char** argv) {
             return 0;
         }
         hr::SpecOptions so;
-        so.verify_ms = strix::spec::moe_verify_seed_ms(strix::spec::hy4_verify_bytes(), step_ms, hr::kVerifySeedGbps, so.max_rows);
+        // Arbiter seeds: the shared routed-MoE pass model over this topology's plain step (one node = moe_verify_seed_ms;
+        // TP: every rank reads half of every weight, plus the pass's gathers at the measured trip)
+        const auto cost = strix::spec::moe_verify_cost(strix::spec::hy4_verify_bytes(), step_ms, hr::kVerifySeedGbps, tpg ? 2U : 1U,
+                                                       trip_ms, tpg ? fwd.tp_gathers_per_step() : 0U);
+        for (std::uint32_t r = 1; r <= so.max_rows; ++r) so.verify_ms.push_back(strix::spec::seed_ms(cost, r));
         so.chain_survival.assign(hr::kChainSurvival.begin(), hr::kChainSurvival.end());
         so.draft_tp = draft_tp;
         const auto res = hr::spec_decode(fwd, prompt, anchor, gen, so, *mtp, tpg ? &pair_ex : nullptr);
