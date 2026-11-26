@@ -81,7 +81,7 @@ void reserve_append(std::vector<T>& values, std::size_t elements) {
 }
 
 std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
-    std::span<const float> input, unsigned position, auto& state) {
+    std::span<const float> input, unsigned position, auto& state, bool record_history) {
     const auto width = s.head_dim;
     const auto ring_size = std::size_t{kWindow} * width;
     const auto carry_size = std::size_t{kCompression - 1U} * width;
@@ -99,8 +99,10 @@ std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
 
     constexpr std::string_view compressor = "core_attention.compressor.";
     std::vector<float> carry_value(width), carry_logit(width), pooled;
-    w.linear(std::string(compressor) + "linear_wkv.weight", input, carry_value);
-    w.linear(std::string(compressor) + "linear_wgate.weight", input, carry_logit);
+    if (record_history) {
+        w.linear(std::string(compressor) + "linear_wkv.weight", input, carry_value);
+        w.linear(std::string(compressor) + "linear_wgate.weight", input, carry_logit);
+    }
     const auto carry_row = position % kCompression;
     const RotaryRow window_rope(s.rope_dim, position, false), compressed_rope(s.rope_dim, position, true);
     if (carry_row == kCompression - 1U) {
@@ -137,14 +139,21 @@ std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
         return std::span<const float>(compressed_values).subspan(row * width, width);
     };
     std::vector<float> heads(query.size());
-    attn_core::hybrid_mqa_reference({width, query, compressed_query, w.tensor("core_attention.attn_sink", s.heads)},
-        position - window_start + 1U, compressed_count, window_at, pooled_key, pooled_value, heads);
+    const auto sinks = w.tensor("core_attention.attn_sink", s.heads);
+    if (record_history) {
+        attn_core::hybrid_mqa_reference({width, query, compressed_query, sinks},
+            position - window_start + 1U, compressed_count, window_at, pooled_key, pooled_value, heads);
+    } else {
+        std::vector<float> keys(width), values(width);
+        attn_core::causal_gqa_reference({s.heads, 1, width}, {0, query, kv, kv, 0, {}, sinks}, {keys, values}, heads);
+    }
     window_rope.apply(heads, width, true);
     postmix(w, s, heads);
     std::vector<float> grouped(std::size_t{s.o_groups} * s.o_rank);
     const auto group_matrix = w.tensor("linear_o_group_proj", heads.size() / s.o_groups * grouped.size());
     core::grouped_linear_reference(group_matrix, heads, grouped, s.o_groups);
     auto output = output_projection(w, q_lora, grouped, s.hidden);
+    if (!record_history) return output;
 
     // Prepare allocation before touching any live row. An interrupted read or
     // projection leaves the visible prefix intact.
@@ -272,10 +281,16 @@ std::vector<float> attention_reference(unsigned layer, const ReferenceShape& sha
         throw std::invalid_argument("ERNIE attention: incompatible row, layer or history");
     const LayerWeights weights{read, project, target_layer_prefix(layer) + "self_attn."};
     auto result = layer_is_mla(layer) ? mla_reference(weights, shape, input, history.position_, history.mla_)
-                                    : hca_reference(weights, shape, input, history.position_, history.hca_);
+                                    : hca_reference(weights, shape, input, history.position_, history.hca_, true);
     history.layer_ = layer;
     ++history.position_;
     return result;
+}
+
+std::vector<float> attention_reference_first_hca(const std::string& prefix, const ReferenceShape& shape,
+    const ReferenceRead& read, std::span<const float> input, const AttentionProject& project) {
+    AttentionHistory state;
+    return hca_reference({read, project, prefix}, shape, input, 0, state.hca_, false);
 }
 
 } // namespace strix::ernie

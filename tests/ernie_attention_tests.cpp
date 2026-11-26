@@ -69,6 +69,8 @@ void hca_carry() {
     const float raw = 1.0F / std::sqrt(1.0F + 1e-6F);
     auto output = ernie::attention_reference(0, s, read, first, history, project);
     near(output[0], raw / 4.0F, "first HCA row attends itself with a sink and a half output gate");
+    check(output == ernie::attention_reference_first_hca("model.layers.0.self_attn.", s, read, first, project),
+          "position-zero diagnostic matches history before any compressor group is visible");
     for (unsigned p = 1; p < 127; ++p)
         output = ernie::attention_reference(0, s, read, rest, history, project);
     near(output[0], raw / 256.0F, "only the causal window is visible before group completion");

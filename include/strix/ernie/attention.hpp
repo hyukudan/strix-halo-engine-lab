@@ -17,6 +17,8 @@ public:
 private:
     friend std::vector<float> attention_reference(unsigned, const ReferenceShape&, const ReferenceRead&,
         std::span<const float>, AttentionHistory&, const AttentionProject&);
+    friend std::vector<float> attention_reference_first_hca(const std::string&, const ReferenceShape&,
+        const ReferenceRead&, std::span<const float>, const AttentionProject&);
 
     struct {
         std::vector<float> window, compressed, carry_values, carry_logits;
@@ -33,6 +35,11 @@ private:
 // precision and index gate are candidate checkpoint semantics pending a trace.
 [[nodiscard]] std::vector<float> attention_reference(unsigned layer, const ReferenceShape& shape,
     const ReferenceRead& read, std::span<const float> input, AttentionHistory& history,
+    const AttentionProject& project = {});
+
+// Position-zero diagnostic binding, with no compressor reads or cache writes.
+[[nodiscard]] std::vector<float> attention_reference_first_hca(const std::string& prefix,
+    const ReferenceShape& shape, const ReferenceRead& read, std::span<const float> input,
     const AttentionProject& project = {});
 
 } // namespace strix::ernie
