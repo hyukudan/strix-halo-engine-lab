@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "glm/engine/glm_mem.hpp"
+#include "strix/glm/pair_state.hpp"
 #include "strix/serve/conversation_keep.hpp"
 
 namespace strix::glm::serve {
@@ -62,12 +63,22 @@ inline std::optional<std::uint64_t> prefix_memory_bytes() {
 }
 
 inline std::uint64_t prefix_snapshot_bound(std::uint64_t p) {
-    // Full 45-layer layout + MTP, world=1 and unsharded: upper bound for every served layout.
-    // 34 KDA layers; 11 DSA plus one MTP DSA. Include the seven-word shard header.
-    constexpr std::uint64_t fixed = 34ULL * (64ULL * 128 * 128 * 4 + 3ULL * 64 * 128 * 3 * 4) + 7 * 8;
-    constexpr std::uint64_t per_row = 12ULL * (512 * 2 + 128 * 2 * 2 + 128);
-    if (p > (UINT64_MAX - fixed) / per_row) return UINT64_MAX;
-    return fixed + p * per_row;
+    // The full unsharded snapshot includes every rank's KDA slice and one copy of DSA.
+    // Keep the linear upper bound for the pooled rows and include the seven-word shard header.
+    constexpr auto size = [] {
+        struct Geometry { std::uint64_t fixed, per_row; };
+        Geometry bytes{7 * sizeof(std::uint64_t), 0};
+        namespace state = ::strix::pair::state;
+        for (const auto& piece : state::decl::glm.pieces) {
+            const auto copies = piece.owner == state::Owner::per_rank ? state::decl::glm.world : 1U;
+            const auto total = piece.bytes * piece.layers * copies;
+            if (piece.extent == state::Extent::fixed) bytes.fixed += total;
+            else bytes.per_row += total / piece.row_div + (total % piece.row_div != 0);
+        }
+        return bytes;
+    }();
+    if (p > (UINT64_MAX - size.fixed) / size.per_row) return UINT64_MAX;
+    return size.fixed + p * size.per_row;
 }
 
 class PrefixCache {
