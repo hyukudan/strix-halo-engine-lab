@@ -33,6 +33,7 @@ public:
     using Stream = device::native::Stream;
 
     explicit BoundWidthStepGraphs(GraphRows layout = GraphRows::cohort) : runner_(layout) {}
+    explicit BoundWidthStepGraphs(const StreamGraphPrograms& programs) : runner_(programs) {}
     ~BoundWidthStepGraphs() {
         invalidate();
         if (device_) (void)STRIX_WIDTH_RT(Free)(device_);
@@ -82,12 +83,22 @@ public:
         return runner_.run(*this, stream, enabled, stable_layout, input, binding, work);
     }
 
+    // Uses the immutable stream program table passed at construction. A nonrectangular
+    // group layout or an unlisted shape declines before capture, upload or launch.
+    template <class Work>
+    bool try_launch_for_streams(Stream stream, bool enabled, bool stable_layout, const StepBlock& input,
+                                std::uint32_t active_streams, Work&& work, const Binding& binding = {}) {
+        return runner_.run_for_streams(*this, stream, enabled, stable_layout, input, binding, work, active_streams);
+    }
+
     [[nodiscard]] bool capturing() const noexcept { return capturing_; }
     [[nodiscard]] unsigned instantiations() const noexcept { return instantiations_; }
     // Kernel/copy/memset nodes of the installed program of `width`; 0 when none is installed.
     [[nodiscard]] std::size_t nodes(std::uint32_t width) const noexcept {
-        const auto at = Policy::index(width);
-        return at < Policy::kWidths && exec_[at] ? nodes_[at] : 0U;
+        return runner_.uses_stream_programs() ? 0U : nodes_for_key(width);
+    }
+    [[nodiscard]] std::size_t nodes_for_streams(std::uint32_t active_streams) const noexcept {
+        return runner_.rows_per_stream(active_streams) ? nodes_for_key(active_streams) : 0U;
     }
     [[nodiscard]] const Policy& policy() const noexcept { return runner_.policy(); }
 
@@ -96,6 +107,11 @@ public:
 
 private:
     friend class StepGraphRunner<Binding>;
+
+    [[nodiscard]] std::size_t nodes_for_key(std::uint32_t width) const noexcept {
+        const auto at = Policy::index(width);
+        return at < Policy::kWidths && exec_[at] ? nodes_[at] : 0U;
+    }
 
     void launch(Stream stream, std::uint32_t at) {
         device::native::check(STRIX_WIDTH_RT(GraphLaunch)(exec_[at], stream), "launch width step graph");

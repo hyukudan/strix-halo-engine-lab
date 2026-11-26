@@ -1,5 +1,6 @@
 #include "strix/exec/dry_capture.hpp"
 #include "strix/exec/graph_runner.hpp"
+#include "strix/exec/step_lanes.hpp"
 #include "strix/session/linear_verify_step.hpp"
 
 #include <algorithm>
@@ -123,6 +124,54 @@ void replay_windows() {
     check(!rt.tapes[1] && runner.policy().failed(2), "partially recorded graph was retained");
 }
 
+void replay_stream_programs() {
+    ex::StepGraphRunner<Runtime::Tape*> runner{ex::StreamGraphPrograms{{2U, 1U}}};
+    Runtime rt;
+    Runtime::Tape single_reply{}, two_reply{};
+    auto* reply = &single_reply;
+    auto work = [&] { return reply; };
+    auto single = strix::session::linear_verify_step(
+        {2U, 8U, 0U, 0U, strix::session::LinearVerifyRows::inclusive_valid}, std::array{17U, 23U});
+    auto two = ex::make_cohort_step(std::array{ex::CohortLane{1U, 7U, 8U}, ex::CohortLane{2U, 10U, 20U}},
+                                    2U, 3U, 100U);
+    const auto run = [&](const ex::StepBlock& block, std::uint32_t streams) {
+        return runner.run_for_streams(rt, 0, true, true, block, reply, work, streams);
+    };
+    check(!runner.run(rt, 0, true, true, single, reply, work), "width entry point used the stream table");
+    check(!run(single, 0U) && !run(single, 3U) && !run(single, 2U) && !run(two, 1U),
+          "unlisted count or wrong slot grouping reached capture");
+    check(rt.records == 0 && rt.uploads == 0 && rt.launches == 0, "a declined shape reached the device");
+
+    check(run(single, 1U) && single_reply == Runtime::Tape{25U, 32U}, "one stream, two rows was not recorded");
+    reply = &two_reply;
+    check(run(two, 2U) && two_reply == Runtime::Tape{15U, 30U}, "two streams, one row each was not recorded");
+    reply = &single_reply;
+    single.row[0].token = 31U;
+    single.row[1].token = 32U;
+    check(run(single, 1U) && single_reply == Runtime::Tape{39U, 41U} && rt.records == 2 && rt.uploads == 3,
+          "equal physical widths aliased or replay did not read its new descriptor");
+    single.h.valid_mask = 1U;
+    single.row[1].flags = 0U;
+    check(!run(single, 1U) && rt.uploads == 3, "a padded window fit a rectangular program");
+
+    reply = &two_reply;
+    rt.throw_on_launch = true;
+    bool threw = false;
+    try { (void)run(two, 2U); } catch (const std::runtime_error&) { threw = true; }
+    rt.throw_on_launch = false;
+    check(threw && runner.policy().failed(2U) && runner.policy().ready(1U) && !run(two, 2U),
+          "failed launch did not stay isolated to its stream count");
+    runner.reset(rt);
+    check(run(two, 2U) && rt.records == 3, "reset did not restore stream program eligibility");
+
+    bool invalid_table = false;
+    try {
+        const ex::StepGraphRunner invalid{ex::StreamGraphPrograms{{0U, ex::kStepMaxRows}}};
+        (void)invalid;
+    } catch (const std::invalid_argument&) { invalid_table = true; }
+    check(invalid_table, "table accepted a physical width the descriptor cannot hold");
+}
+
 void dry_arguments() {
     ex::StepBlock descriptor{};
     Runtime::Tape tape{};
@@ -161,6 +210,7 @@ void dry_arguments() {
 int main() try {
     native_inventory();
     replay_windows();
+    replay_stream_programs();
     dry_arguments();
     return 0;
 } catch (const std::exception& error) {
