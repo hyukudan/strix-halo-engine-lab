@@ -1,4 +1,8 @@
 # B3 mechanism 7: program segments (prelude / core x repeats / coda), launch budget and per-step receipt counts.
+# The stage graph is not configured in the CUDA DeepSeek-only tree (STRIX_CUDA_DS41_ONLY); nothing here applies there.
+if(NOT TARGET strix_stage_graph)
+    return()
+endif()
 target_sources(strix_stage_graph PRIVATE "${PROJECT_SOURCE_DIR}/src/graph/program_segments.cpp")
 
 if(BUILD_TESTING)
