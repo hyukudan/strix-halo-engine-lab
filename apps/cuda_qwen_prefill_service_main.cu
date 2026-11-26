@@ -445,9 +445,18 @@ int main(int argc, char** argv) {
     Service svc(p, c, handoff_key, handoff);
     std::printf("{\"event\":\"READY\",\"bind\":\"%s\",\"port\":%s}\n", bind.c_str(), port.c_str());
     std::fflush(stdout);
+    // At most kMaxLiveConnections handlers run at once (a handler closes its own socket); a refused connection, or
+    // one whose thread cannot start, is answered 503 and closed here. Requests are read under a total deadline.
+    constexpr int kMaxLiveConnections = 32;
+    std::atomic<int> live{0};
     for (;;) {
         const http::Sock s = ::accept(ls, nullptr, nullptr);
-        if (s == http::kNoSock) continue;
-        std::thread([&svc, s, &c, api_key] { handle(svc, s, c.max_positions, api_key); }).detach();
+        if (s == http::kNoSock) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); continue; }
+        const bool started = strix::serve::spawn_counted_connection(live, kMaxLiveConnections,
+            [&svc, s, &c, api_key] { handle(svc, s, c.max_positions, api_key); });
+        if (!started) {
+            http::respond(s, 503, R"({"error":"too many live connections"})");
+            http::close_sock(s);
+        }
     }
 }
