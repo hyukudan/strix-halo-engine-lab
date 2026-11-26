@@ -256,7 +256,16 @@ struct CohortConfig {
     // Grouped prompts: whole short prompts ready together share one backend pass when the backend's capacity admits
     // it. A group never carries more rows than one prompt slice, so it never widens the decode gap of a slice.
     PrefillGroupPolicy prompt_group{};
+    // One stderr line per step (CohortDecoder::step): the prompt rows and wall of the step's prefill call, the decode
+    // lanes and wall of its decode round, the scheduler's idle time before it, the prompts waiting and the decode
+    // time owed (prompt_share). Diagnostic only: no schedule or bits change.
+    bool trace_steps = false;
 };
+
+// Binds a mixed-service policy (prompt_piece.hpp) to a cohort: pieces of the policy's rows beside decoding lanes where
+// the backend's rule cuts a `chunk`-row call, and, where it binds, the policy's prompt share. STRIX_SERVE_PROMPT_SHARE
+// (a number >= 0) replaces the share (the off switch of a policy's share), STRIX_SERVE_STEP_TRACE=1 sets trace_steps.
+void bind_mixed_service(CohortConfig& config, MixedServicePieces pieces, PromptPieceRule rule, std::uint64_t chunk);
 
 // Rows of the next prompt slice of a lane with `left` prompt rows unread. `want` is the planner's grant, `unit` the
 // configured slice. A full grant on the final slice absorbs a remainder of up to `tail` rows (the backend's
@@ -348,6 +357,7 @@ private:
     double decode_ms_ = 0, prompt_ms_ = 0, fake_clock_ms_ = 0, fake_now_ = 0;
     // Gap-bounded pieces: ms per row of the last prefill pass (its fixed cost removed) and of the last decode round.
     double last_row_ms_ = 0, last_decode_ms_ = 0;
+    double last_step_end_ms_ = 0;  // trace_steps: the end of the previous step (scheduler idle before the next)
     CycleLedger::FitSums sums_{};  // observed decode steps: y = ms, r = physical rows, l = lanes (CycleLedger::fit)
 };
 

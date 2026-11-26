@@ -140,7 +140,7 @@ inline serve::CohortConfig mini_serve_scheduling(unsigned chunk, serve::PromptPi
     config.context_draft = false;
     config.max_draft = 0;
     config.prompt_slice = chunk;
-    config.prompt_slice_decoding = serve::mixed_service_piece_rows(pieces, rule, chunk);
+    serve::bind_mixed_service(config, pieces, rule, chunk);
     return config;
 }
 

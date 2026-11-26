@@ -546,6 +546,16 @@ void test_prompt_piece_rows() {
               mixed_service_piece_rows(kMixedServiceLongPieces, PromptPieceRule{}, 8192) == 0U &&
               mixed_service_piece_rows(MixedServicePieces{}, {32, 32}, 8192) == 0U,
           "mixed service: whole chunks when the chunk fits, the rule cannot cut or the policy has no pieces");
+    // bind_mixed_service: the pieces, and the policy's share only where its pieces bind (STRIX_SERVE_PROMPT_SHARE unset).
+    CohortConfig bound;
+    bind_mixed_service(bound, kMixedServiceLongPieces, {32, 32}, 8192);
+    CohortConfig whole;
+    bind_mixed_service(whole, kMixedServiceLongPieces, {32, 32}, 1024);
+    CohortConfig short_pieces;
+    bind_mixed_service(short_pieces, kMixedServiceShortPieces, {32, 32}, 8192);
+    check(bound.prompt_slice_decoding == 1024U && bound.prompt_share == 0.0 && whole.prompt_slice_decoding == 0U &&
+              whole.prompt_share == 1.0 && short_pieces.prompt_slice_decoding == 128U && short_pieces.prompt_share == 1.0,
+          "mixed service: a policy's share binds with its pieces");
 }
 
 // A priced grant never dispatches more rows than the grant when ANY bit-safe cut <= grant exists; only when none
@@ -1166,6 +1176,45 @@ void test_bounded_slices_keep_forms() {
     std::cout << "bounded slices: " << cases << " cases, served row forms == one-call prefill\n";
 }
 
+// The step trace (CohortConfig::trace_steps) is diagnostic only: the same steps, calls and ids with it on, for both
+// prompt shares of the mixed-service policies.
+void test_step_trace_changes_nothing() {
+    using B = PieceBackend;
+    for (const double share : {1.0, 0.0}) {
+        std::uint64_t steps[2] = {}, calls[2] = {};
+        std::vector<std::vector<std::uint32_t>> ids[2];
+        for (int traced = 0; traced < 2; ++traced) {
+            B be;
+            be.prompt_rows = 200;
+            CohortConfig cfg;
+            cfg.context_draft = false;
+            cfg.prompt_slice = B::kChunk;
+            cfg.prompt_slice_decoding = 16;
+            cfg.prompt_share = share;
+            cfg.trace_steps = traced == 1;
+            CohortDecoder dec(be, cfg);
+            dec.set_fake_clock(1.0);
+            CohortRequest a, b;
+            a.id = 1;
+            a.prompt = {B::kMarker, 4};
+            a.max_tokens = 400;
+            b.id = 2;
+            b.prompt.resize(200);
+            for (std::uint32_t k = 0; k < 200; ++k) b.prompt[k] = (k * 7U + 1U) % B::kVocab;
+            b.max_tokens = 2;
+            dec.submit(a);
+            dec.step();
+            dec.submit(b);
+            dec.run();
+            steps[traced] = dec.steps();
+            calls[traced] = be.calls;
+            for (const auto& r : dec.take_finished()) ids[traced].push_back(r.ids);
+        }
+        check(steps[0] == steps[1] && calls[0] == calls[1] && ids[0] == ids[1] && !ids[0].empty(),
+              "step trace: the same schedule and ids with the trace on");
+    }
+}
+
 // The constructor's checks are one shared function a launcher can call before device work (validate_prompt_pieces).
 void test_piece_validation() {
     const PromptPieceRule rule{16, 16};
@@ -1280,6 +1329,7 @@ int main() {
     test_group_gap_cold();
     test_gap_forward_price();
     test_bounded_slices_keep_forms();
+    test_step_trace_changes_nothing();
     test_gap_debt();
     test_gap_row_cost_floor();
     test_piece_validation();

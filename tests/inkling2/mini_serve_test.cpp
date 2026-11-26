@@ -643,12 +643,15 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                         config.max_draft == 0U && !config.context_draft,
                     "lever off: one admitted chunk alone, 128-row pieces beside a decoding lane (CUDA)");
             sv::validate_prompt_pieces(config, rule, chunk);
-            // The CUDA device cohort's pieces (the shared long pieces) where the chunk is larger; never priced.
+            // The CUDA device cohort's pieces (the shared long pieces) where the chunk is larger; never priced, one
+            // decode round per piece (prompt share 0) where they bind; the short pieces keep the incumbent share.
             const auto wide = mini::mini_serve_scheduling(chunk, rule, mini::kMiniCudaServePieces);
+            const bool long_pieces = !hip_backend && chunk > 1024U;
             require(mini::kMiniCudaServePieces.piece_rows == 1024U &&
-                        wide.prompt_slice_decoding == (!hip_backend && chunk > 1024U ? 1024U : 0U) &&
-                        wide.prompt_gap_ms == 0.0 && config.prompt_gap_ms == 0.0,
-                    "lever off: 1024-row CUDA pieces beside a decoding lane, no gap pricing");
+                        wide.prompt_slice_decoding == (long_pieces ? 1024U : 0U) &&
+                        wide.prompt_share == (long_pieces ? 0.0 : 1.0) && config.prompt_share == 1.0 &&
+                        wide.prompt_gap_ms == 0.0 && config.prompt_gap_ms == 0.0 && !wide.trace_steps,
+                    "lever off: 1024-row CUDA pieces beside a decoding lane, one decode round each, no gap pricing");
             sv::validate_prompt_pieces(wide, rule, chunk);
         } else {
             // With the lever: the command line's chunk and tail rule, emits-first; lanes = --slots, else an explicit
