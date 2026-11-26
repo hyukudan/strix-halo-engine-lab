@@ -6344,7 +6344,7 @@ The CUDA prompt flash projects the relative attention bias itself (cuda_core::Pr
 
 <a id="prompt-band-edge-timing"></a>
 
-### Shared prompt band edge timing (EDGE-TIMING PENDING)
+### Shared prompt band edge timing
 
 **Engine:** shared (`include/strix/engine_profile.hpp`: `BandEvidence`, `ladder_min_context`). **Control:** data in each
 band row: `lower_edge_unproven` marks a lower edge with no timing within 3 tokens; `narrow_to_floor` (true only in the Qwen3.8 27B 1-2,048 row)
@@ -6354,17 +6354,12 @@ starts such a band at its first winning in-band timing. **Default:** every other
 without failing. **Device plan:** `bash scripts/bench/bench.sh campaign band-edges plan` (ABBA timings at the lower,
 middle and upper edge of each band); a row's edge is set from those timings, never before.
 
-Rows whose lower band edge is untimed (EDGE-TIMING PENDING, nominal band applies; timed points in brackets):
-
-| Model | Row | Nominal band (prompt tokens) | Timed |
-|---|---|---|---|
-| DeepSeek V4.1 Flash, pair | FAST/TURBO D1 prefill | 4,096-8,192 | 8,128, 8,192 |
-| DeepSeek V4.1 Flash, pair | FAST/TURBO D1 prefill | 8,193-32,768 | 32,768 |
-| DeepSeek V4.1 Flash, pair | FAST/TURBO decoder replay R=256 | 4,096-8,192 | 8,192 |
-| DeepSeek V4.1 Flash, pair | FAST/TURBO decoder replay R=256 | 8,193-32,768 | 32,768 |
-| GLM-5.3 Flash, pair | FAST WMMA prefill bundle | 2,049-8,192 | 8,192 |
-
-Timed lower edges: Qwen3.8 Flash Next TURBO cap9 4,096-8,192 (timed 4,096, 8,192) and 8,193-32,768 (8,193, 32,768);
+No band row has an untimed lower edge. Timed lower edges (timed points in brackets): DeepSeek V4.1 Flash pair D1
+prefill 4,096-8,192 (4,096, 6,000, 8,128, 8,192) and 8,193-32,768 (8,193, 16,384, 32,768), decoder replay R=256
+4,096-8,192 (4,096, 6,000, 8,192) and 8,193-32,768 (8,193, 16,384, 32,768): FAST D1 + R=256 against EXACT x1.60 / x1.57
+/ x1.58 / x1.55 at 4,096 / 6,000 / 8,193 / 16,384, nominal edges kept; GLM-5.3 Flash pair FAST WMMA prefill bundle
+2,049-8,192 (2,049, 4,096, 8,192): x1.37 / x1.47 at 2,049 / 4,096, edge kept and the row states the lower ratio x1.37;
+Qwen3.8 Flash Next TURBO cap9 4,096-8,192 (timed 4,096, 8,192) and 8,193-32,768 (8,193, 32,768);
 Qwen3.8 27B 512-row window 2,049-8,192 (2,049, 4,096, 8,192) and 8,193-24,576 (8,193, 24,576); the 27B 1-2,048 row is
 narrowed to 64-2,048 (timed 64, 256, 1,024, 2,048). Inkling 2 Mini TURBO IU4 (4,307-8,236 and 8,237-32,760) is timed
 at both edges. The GLM TURBO row at 31,258 tokens is a
@@ -6372,8 +6367,8 @@ fixed key, not a band.
 
 | Model | Band edge state |
 |---|---|
-| DeepSeek V4.1 Flash | 4 rows pending |
-| GLM-5.3 Flash | 1 row pending |
+| DeepSeek V4.1 Flash | 4 pair rows timed at both edges |
+| GLM-5.3 Flash | pair FAST row timed at both edges (x1.37 at 2,049) |
 | Qwen3.8 Flash Next | timed at both edges |
 | Qwen3.8 27B | 2 rows timed at both edges, 1 row narrowed to its floor (64) |
 | Inkling 2 Mini | timed at both edges |
