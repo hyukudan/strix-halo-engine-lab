@@ -398,7 +398,15 @@ public:
                           !spans_overlap(tape_, histories) && !spans_overlap(tape_, kv_checkpoint);
         try {
             taping_ = tape ? chunk.rows : 0U;
-            work();
+            // A taped staged window may replay a captured window program: the checkpoints above stay eager (their
+            // addresses depend on the position), the work is position-independent once the backend reads the window's
+            // positions and ids from its device descriptor. `tape` is passed so a program captured with its tape
+            // copies replays only for a window that records them too. Declined: the work runs eagerly.
+            bool graphed = false;
+            if constexpr (requires { backend.try_window_graph(chunk, work, tape); }) {
+                if (tape) graphed = backend.try_window_graph(chunk, work, tape);
+            }
+            if (!graphed) work();
             taping_ = 0U;
         } catch (...) {
             taping_ = 0U;

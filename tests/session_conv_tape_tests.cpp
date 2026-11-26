@@ -64,6 +64,10 @@ struct Lane {
     std::vector<float> tape;
     session::KvStore::RowAppendState<Plan> state{kPlan, {keys, values}, history};
     unsigned replays = 0;
+    // Window program gate (RowAppendState::append offers a taped staged window to try_window_graph). 1: the backend
+    // runs the window (a program replay, here the same work); otherwise it declines and the work runs eagerly.
+    int window_mode = 0;
+    unsigned window_offers = 0, window_runs = 0;
 
     template <class T>
     void copy(std::span<const T> from, std::span<T> to) {
@@ -71,6 +75,17 @@ struct Lane {
         std::copy(from.begin(), from.end(), to.begin());
     }
     void finish() {}
+
+    template <class Work>
+    bool try_window_graph(session::KvAppendChunk, Work& work, bool taped) {
+        ++window_offers;
+        check(taped, "only a taped staged window is offered");
+        check(std::equal(history.begin(), history.end(), history_backup.begin()), "checkpoint taken before the offer");
+        if (window_mode != 1) return false;
+        work();
+        ++window_runs;
+        return true;
+    }
 
     // Host "forward": every stream's history shifts in the chunk's input rows (oldest first); KV cells take the
     // position; the tape (when the transaction asks) receives the same input rows.
@@ -146,6 +161,37 @@ void tape_equals_replay(unsigned prefix, unsigned rows, unsigned keep, bool expe
     check(taped.history == replayed.history, "next append equal");
 }
 
+// A taped staged window is offered to the backend's window program after its checkpoints; a run window publishes
+// exactly what the eager window publishes (taped partial commits, no replay); other appends are never offered.
+void window_program_gate() {
+    for (const int mode : {0, 1}) {
+        Lane<8> lane, reference;
+        lane.window_mode = mode;
+        for (auto* l : {&lane, &reference}) {
+            l->tape.resize(std::size_t{8} * l->state.convolution_row_elements());
+            l->state.bind_convolution_tape(l->tape, 8);
+            l->append(3, false);
+        }
+        check(lane.window_offers == 0U, "an unstaged append is not offered");
+        for (const unsigned keep : {2U, 5U, 0U, 1U}) {
+            lane.append(5, true);
+            reference.append(5, true);
+            lane.commit(keep);
+            reference.commit(keep);
+            check(lane.history == reference.history && lane.state.committed() == reference.state.committed(),
+                  "window program publishes the eager window's state");
+        }
+        check(lane.window_offers == 4U && lane.window_runs == (mode == 1 ? 4U : 0U), "taped windows offered");
+        check(lane.replays == 0U && reference.replays == 0U, "taped commits never replay");
+    }
+    Lane<8> untaped;
+    untaped.window_mode = 1;
+    untaped.append(2, false);
+    untaped.append(3, true);
+    check(untaped.window_offers == 0U, "an untaped staged window is not offered");
+    untaped.commit(3);
+}
+
 }  // namespace
 
 int main() {
@@ -214,6 +260,7 @@ int main() {
         slot.reset(clear);
         check(slot.state().convolution_tape_rows() == 4U, "tape kept across resets");
     }
+    window_program_gate();
     std::cout << "session conv tape tests passed\n";
     return 0;
 }

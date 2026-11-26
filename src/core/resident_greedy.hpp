@@ -207,6 +207,13 @@ public:
         return replies_.get()[row];
     }
 
+    // A captured program replayed the producer and the pinned reply copy of `rows` rows (the host enqueue ran only at
+    // capture): publish those rows for token(). The caller replays only a program captured with this object's enqueue.
+    void replayed(unsigned rows) {
+        if (!rows || rows > capacity_) throw std::invalid_argument("invalid resident CUDA greedy replayed rows");
+        submitted_rows_ = rows;
+    }
+
     // Raw buffers for the optional CUDA step-program route (row 0).
     [[nodiscard]] auto* step_program_partials() noexcept { return partials_.data(); }
     [[nodiscard]] auto* step_program_device_token() noexcept { return device_tokens_.data(); }

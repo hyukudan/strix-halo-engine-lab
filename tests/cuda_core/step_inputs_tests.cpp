@@ -1,5 +1,7 @@
 #include "step_inputs_cases.hpp"
+#include "strix/session/linear_verify_step.hpp"
 
+#include <array>
 #include <cstdio>
 #include <stdexcept>
 
@@ -42,6 +44,36 @@ void check_masks() {
     require(equal_bytes(project(single.mode, c, masked), ScatterOutput{}), "masked single feed wrote scratch");
 }
 
+// A verify window program block (a captured K-row verify window): every row of a K-row window is valid for every
+// step_row_valid consumer (id scatter, K/V store, flash, picks) only when the header mask is set. The shared builder
+// sets it; a block with rows and per-row flags but no header mask scatters id 0 for every row.
+void check_linear_verify_window() {
+    for (std::uint32_t width = 2; width <= 8U; ++width) {
+        std::array<std::uint32_t, 8> ids{};
+        for (std::uint32_t i = 0; i < width; ++i) ids[i] = 1000U + 37U * i;
+        const auto block = strix::session::linear_verify_step(
+            {width, 658U + width, 3U, 0U, strix::session::LinearVerifyRows::inclusive_valid},
+            std::span<const std::uint32_t>(ids.data(), width));
+        auto unmasked = block;
+        unmasked.h.valid_mask = 0U;
+        std::array<std::uint32_t, kRows> got{}, got_unmasked{};
+        std::uint32_t anchor = 0, anchor_unmasked = 0;
+        for (std::uint32_t i = 0; i < kRows; ++i) {
+            scatter::detail::scatter_row(block, scatter::Linear{{&anchor, got.data()}}, i);
+            scatter::detail::scatter_row(unmasked, scatter::Linear{{&anchor_unmasked, got_unmasked.data()}}, i);
+        }
+        for (std::uint32_t i = 0; i < width; ++i) {
+            require(exec::step_row_valid(block, i), "verify window row is not valid");
+            require(block.row[i].position == 658U + width + i && block.row[i].slot == 3U,
+                    "verify window row position or slot");
+            require(got[i] == ids[i], "verify window row did not scatter its id");
+            require(got_unmasked[i] == 0U, "a block without the header mask must read id 0 (the unmasked block class)");
+        }
+        for (std::uint32_t i = width; i < kRows; ++i)
+            require(!exec::step_row_valid(block, i) && got[i] == 0U, "row past the window");
+    }
+}
+
 void check_draft_oracle() {
     for (const auto c : kDraftCases) {
         const auto in = make_draft_input(c);
@@ -74,6 +106,7 @@ int main() {
                     "step input scratch bytes differ");
         }
         check_masks();
+        check_linear_verify_window();
         check_draft_oracle();
         std::puts("PASS E2i CPU scatter, descriptor masks and draft-remap oracle");
         return 0;
