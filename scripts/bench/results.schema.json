@@ -278,7 +278,8 @@
         "native_tier": {
           "enum": [
             "exact",
-            "fast"
+            "fast",
+            "turbo"
           ]
         },
         "groups": {
