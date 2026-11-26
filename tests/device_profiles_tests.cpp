@@ -65,11 +65,25 @@ void catalogue() {
     for (const char* n : {"rtx-pro-6000-blackwell-96", "rtx-5090-32", "rtx-5080-16", "rtx-4090-24", "strix-halo-128",
                           "dgx-spark-gb10-128", "rx-9070-xt-16", "custom"})
         require(device::find_profile(n) != nullptr, n);
+    require(device::hip_receipt_profile_matches("strix-halo-128", "gfx1151:xnack-|AMD Radeon 8060S Graphics|fixture"),
+            "legacy receipt accepts the recorded architecture and product");
+    require(!device::hip_receipt_profile_matches("strix-halo-128", "gfx1152|AMD Radeon 8060S Graphics|fixture") &&
+                !device::hip_receipt_profile_matches("strix-halo-128", "gfx1151|another product|AMD Radeon 8060S Graphics|fixture") &&
+                !device::hip_receipt_profile_matches("strix-halo-32cu", "gfx1151|AMD Radeon 8060S Graphics|fixture"),
+            "the receipt does not attach to another architecture, field or profile");
     const auto* p5090 = device::find_profile("rtx-5090-32");
     require(p5090->units == 170 && p5090->arch == "sm_120" && p5090->memory_bytes == 32607ULL * 1048576ULL, "5090 entry");
     require(device::find_profile("rtx-pro-6000-blackwell-96")->memory_bytes == kProBytes, "PRO memory is the measured total");
+    for (const char* n : {"strix-halo-32cu", "gorgon-gfx1152", "gorgon-gfx1153", "amd-gfx942", "amd-gfx950",
+                          "intel-arc-xe2", "apple-silicon", "generic-hip"}) {
+        const auto* profile = device::find_profile(n);
+        require(profile && profile->unmeasured, n);
+        require(profile->memory_bytes == 0 && profile->memory_gbytes_ps == 0 && profile->lowbit_rows.small_rows == 0,
+                "unmeasured catalogue row cannot carry a memory cap, bandwidth or schedule");
+    }
     for (const auto& p : device::catalogue())
-        if (p.name != "custom") require(p.memory_bytes > 0 && p.memory_gbytes_ps > 0 && p.units > 0, "every known profile is sized");
+        if (p.name != "custom" && !p.unmeasured)
+            require(p.memory_bytes > 0 && p.memory_gbytes_ps > 0 && p.units > 0, "every sized profile retains its facts");
     require(device::find_interconnect("pcie5x16") && !device::find_interconnect("nvlink"), "interconnect classes");
     // The exported TOML keeps the named v1 tables, with all source values in catalogue order.
     using model_description::Value;
@@ -89,10 +103,20 @@ void catalogue() {
         auto expected = std::get<Value::Table>(ordered[i].data);
         const auto key = std::get<std::string>(expected.at("name").data);
         expected.erase("name");
+        // Internal admission metadata does not extend the v1 CLI export schema.
+        expected.erase("unmeasured");
+        expected.erase("legacy_hip_receipt_product");
         require(device::catalogue().at(i).name == key, "catalogue order follows the data");
         require(std::get<Value::Table>(exported.at(key).data) == expected, "exported profile matches its data");
     }
-    for (const auto& link : device::interconnects()) {
+    const auto& link_data = std::get<Value::Array>(source.fields.at("interconnects").data);
+    require(link_data.size() == device::interconnects().size(), "interconnect catalogue covers the data");
+    for (std::size_t i = 0; i < link_data.size(); ++i) {
+        const auto& link = device::interconnects().at(i);
+        const auto& expected = std::get<Value::Table>(link_data[i].data);
+        require(link.name == std::get<std::string>(expected.at("name").data), "interconnect order follows the data");
+        if (expected.contains("note"))
+            require(link.note == std::get<std::string>(expected.at("note").data), "interconnect note follows the data");
         const auto* shared = device::find_link_class(link.name);
         require(shared && shared->gbytes_ps == link.gbytes_ps && shared->rtt_us == link.rtt_us, "rates follow the shared link classes");
         const auto header = "[interconnects.\"" + std::string(link.name) + "\"]\n";
@@ -101,6 +125,9 @@ void catalogue() {
 }
 
 void declaration() {
+    const auto apple = device::parse_declaration(decl("[devices.gpu]\nprofile = \"apple-silicon\"\n"));
+    require(apple.devices.at(0).vendor == device::Vendor::apple && apple.devices.at(0).planned,
+            "Apple profile supplies a vendor for a planning entry");
     const auto d = device::parse_declaration(decl("[devices.main]\nuuid = \"" + std::string(kPro) +
                                                   "\"\nprofile = \"rtx-5090-32\"\nroles = [\"replica\"]\n"));
     require(d.devices.size() == 1 && d.devices[0].vendor == device::Vendor::nvidia, "vendor comes from the profile");

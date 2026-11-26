@@ -64,11 +64,11 @@ A backend exposes `caps()` and `select(caps) -> Kernels`, a table of entry point
 register a table with only the entries they implement; gaps are filled from the backend's
 reference. Selection is by capability bits, never by model name, and every specialised entry must
 match the reference bit for bit before it registers.
-CPU selection returns a table by value, so later selections cannot modify a retained table.
-Current CPU capability detection is only a scaffold: x86 reports hardware feature bits,
-ARM uses compile-time features, and `sve_bits` is zero. Runtime and OS vector-state
-admission (including XCR0 and AMX permission) must be complete before registering
-instructions that require it. Both specialisation tables are currently empty.
+CPU selection returns a complete table by value, so later selections cannot modify a retained
+table. It selects scalar, AVX2, AVX-512F+BW or NEON according to the usable feature set. x86
+checks CPUID and OS vector state. NEON availability follows the build target. The operator
+table currently binds every entry to the portable reference. AMX and SVE have no operator
+entries and use the selected lower capability level when available.
 
 ## CUDA NVFP4 dense operator
 
@@ -82,24 +82,42 @@ above. Model adapters and complete-workload qualification remain pending.
 
 ## Experimental Intel, Vulkan and Metal backends
 
-- **Intel SYCL / Level Zero** provides operator references and host-managed model
-  references when built with oneAPI. The dedicated Gemma 4 E4B Q8_0 decode and
-  serve executables offer `--backend intel` without a drafter. That path uses
-  synchronous transfers for operator inputs and results and a resident cache for
-  Q8_0 weights. The Hy4 reference CLI exposes a hybrid Intel projection path.
-  Both model references are pending hardware qualification.
-- **Vulkan and Metal** provide RMSNorm operator references. Each call stages the
-  input and waits for completion. These backends have no model execution plan.
-  The Vulkan adapter uses the Linux Vulkan loader.
+| Backend | Model entry points | Current operator and device scope |
+|---|---|---|
+| Intel SYCL / Level Zero | The Gemma 4 E4B Q8_0 GGUF reference accepts `--backend intel` in `strix-gemma4-decode`, `strix-gemma4-serve` (with `STRIX_LEGACY_MAINS`) and the Gemma family arguments after `--` in `strix-serve`. The route requires RoPE tables, Q8_0 matrices and F32 or BF16 vectors, and runs without a drafter. `strix-hy4-ref` has a hybrid Intel reference for routing and FP32 projections while the host owns the rest of the forward pass. | An opt-in oneAPI SYCL build, a discrete Xe2 Arc card visible at Level Zero ordinal 0 and device USM are required by the reference. The shared operator interface covers Q8_0 gather and linear, FP32 linear, routing, RMSNorm, RoPE and dense attention. Calls synchronously stage operator inputs and outputs. Q8_0 weights can stay resident. The opt-in XMX FP16-input linear policy is a separate operator path. Both model references await native qualification. |
+| Vulkan | RMSNorm operator fixtures only. | Opt-in Linux build with Vulkan headers, a Vulkan 1.1 loader and compute device, and SPIR-V produced from the checked shader. FP32 RMSNorm accepts a per-channel scale or runs unscaled. Dispatch stages buffers and waits for completion. A build without the GLSL compiler refuses dispatch. |
+| Metal | RMSNorm operator fixtures only. | Opt-in macOS build with Metal and Foundation, a compute-capable Metal device and the bundled shader. FP32 RMSNorm accepts a per-channel scale or runs unscaled. Dispatch stages buffers and waits for completion. |
 
-The shared `strix-serve --backend` interface offers HIP and CUDA.
+The shared shell's own `--backend` accepts `hip` or `cuda`. It rejects `intel`,
+`vulkan` and `metal` with the relevant supported scope before loading the registry.
+Vulkan and Metal throw `UnsupportedOperation` for gather, linear, RoPE, attention
+and family execution plans. The Intel reference refuses unavailable builds,
+unsupported devices and unsupported model assets without starting a CPU service.
+
+### Order to first qualified model
+
+1. Freeze a single-device Gemma 4 E4B Q8_0 GGUF, its RoPE tables, tokenizer,
+   prompt IDs and host reference logits as the common bring-up target.
+2. Build and run each native operator fixture on its target platform. On Intel,
+   qualify the existing E4B reference route and bind the selected Level Zero GPU
+   through the shared device gate. On Vulkan and Metal, qualify FP32 RMSNorm and
+   implement the missing Q8_0 gather and dense projections, RoPE and attention
+   through the shared core contracts. Check each against the host oracle.
+3. Add device-owned weight and KV lifetimes, ordered queue batches and a common
+   memory budget. Keep the agreed model arithmetic and qualify transfers, queue
+   errors and resource retirement before composing the forward pass.
+4. Bind the same model description to the shared session adapter. Exercise
+   complete prefill and decode, then compare token IDs, logits and state against
+   the declared reference. Record which arithmetic identity was qualified.
+5. Expose the qualified single-device route as an explicit shared serve backend.
+   Verify CLI and server option parity, request and cancellation behavior, and
+   failure before listening when a required capability is missing.
 
 ## CPU backend
 
-Tree: `src/cpu/core` (interface binding, scalar exact reference, capability detection and
-selection), `src/cpu/arch/avx512` (AVX-512 BW/VNNI, AMX int8), `src/cpu/arch/neon` (NEON
-dotprod/i8mm, SVE). The `STRIX_BACKEND_CPU` option (default OFF) builds the shared CPU
-operator library and its fixtures. The Qwen CUDA build also links this library for its
+The `STRIX_BACKEND_CPU` option (default OFF) builds the shared CPU operator library and its
+fixtures. `src/cpu/core` owns the interface, exact portable reference and capability selection.
+The Qwen CUDA build also links this library for its
 tiered routed-expert executor. That executor uses a worker pool, a separate AVX2 path
 and exp lookup tables to reproduce the target device arithmetic. The scalar operator
 table and the dedicated model host references have their own dispatch paths.
@@ -114,7 +132,7 @@ table and the dedicated model host references have their own dispatch paths.
 - **Numerics**: compiled with contraction off (`-ffp-contract=off`, `/fp:precise`). Integer dots are
   exact in int32, so a SIMD kernel only has to keep the declared float order: per-group product,
   group g into lane g % 32, then the butterfly.
-- **Scaffolded now**: `quantize_a8`, `gemv_q8_0_a8` (the `Q8a8View` has a related layout to the HIP
+- **Implemented operators** are `quantize_a8`, `gemv_q8_0_a8` (the `Q8a8View` has a related layout to the HIP
   dense view, but omits `k_bytes` and `tile0` and uses a different arithmetic contract) and
   RMSNorm bound to the shared `Norm<Traits>`; tests in `tests/cpu_backend_host_tests.cpp` compare
   them bitwise with `ds41::quantize_a8`, `ds41::product_q8_0` and `ops::norm::reference`.
@@ -122,8 +140,9 @@ table and the dedicated model host references have their own dispatch paths.
   with `std::invalid_argument` before writing output. Zero width is allowed. Callers supply
   sufficient buffers and strides, with `x_stride` a multiple of 32. Valid calls allocate no memory.
   Tests cover retained-table selection, width rejection, padded strides, tiny groups, half
-  subnormals, cancellation, and norm thresholds/tails/aliasing. Both table runs currently use
-  scalar code; these host checks establish neither ISA specialisation nor native GPU equivalence.
+  subnormals, cancellation, and norm thresholds/tails/aliasing. Synthetic descriptors exercise
+  the full portable table at every selectable capability level. The explicit raw Q8_0 weights
+  registry still advertises its scalar arithmetic implementation.
 - **Next**: AVX-512 VNNI and NEON SDOT `gemv_q8_0_a8` (same bits); Q2_K / IQ2_XXS / MXFP4 decode
   products from the `ds41_formats` contracts; grouped MoE through the existing policy split;
   attention via the `sparse_flash_keysplit` policy contract with host policies; AMX for prefill GEMM.

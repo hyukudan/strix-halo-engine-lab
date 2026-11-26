@@ -1,5 +1,5 @@
 // TURBO weights: NVFP4 (e2m1 + e4m3/16 + FP32 global) converter and decode GEMV rows 1..32. Layout/orders: nvfp4.hpp.
-// Compiled for sm_120a only (cvt.e2m1x2 / cvt.e4m3x2 PTX); see cmake/CudaCore.cmake.
+// Native FP4 conversion and decode require an architecture-specific image.
 #include "strix/cuda_core/nvfp4.hpp"
 #include "rows_fp4.cuh"
 #include "../../../core/rows_plan.hpp"
@@ -23,34 +23,61 @@
 #include <mutex>
 
 #include "../common.cuh"
+#include "../../arch/capability.hpp"
+#include "../../arch/native_nvfp4.hpp"
 #include "strix/split_k_policy.hpp"
 
 namespace strix::cuda_core {
 namespace {
 
 __device__ __forceinline__ void e2m1_word(std::uint32_t w, std::uint32_t (&o)[4]) {
+#if defined(STRIX_CUDA_NATIVE_NVFP4)
     asm("{\n .reg .b8 b0, b1, b2, b3;\n mov.b32 {b0, b1, b2, b3}, %4;\n"
         " cvt.rn.f16x2.e2m1x2 %0, b0;\n cvt.rn.f16x2.e2m1x2 %1, b1;\n cvt.rn.f16x2.e2m1x2 %2, b2;\n"
         " cvt.rn.f16x2.e2m1x2 %3, b3;\n}"
         : "=r"(o[0]), "=r"(o[1]), "=r"(o[2]), "=r"(o[3])
         : "r"(w));
+#else
+    (void)w;
+    o[0] = o[1] = o[2] = o[3] = 0;
+    __trap();
+#endif
 }
 // two e4m3 bytes (low 16 bits of v) -> f16x2 (low = byte 0)
 __device__ __forceinline__ std::uint32_t e4m3x2_to_f16x2(std::uint32_t v) {
+#if defined(STRIX_CUDA_NATIVE_NVFP4)
     std::uint32_t r;
     asm("{\n .reg .b16 lo, hi;\n mov.b32 {lo, hi}, %1;\n cvt.rn.f16x2.e4m3x2 %0, lo;\n}" : "=r"(r) : "r"(v));
     return r;
+#else
+    (void)v;
+    __trap();
+    return 0;
+#endif
 }
 __device__ __forceinline__ std::uint32_t f32_to_e4m3(float v) {
+#if defined(STRIX_CUDA_NATIVE_NVFP4)
     std::uint32_t r;
     asm("{\n .reg .b16 h;\n cvt.rn.satfinite.e4m3x2.f32 h, 0f00000000, %1;\n cvt.u32.u16 %0, h;\n}" : "=r"(r) : "f"(v));
     return r & 0xFFu;
+#else
+    (void)v;
+    __trap();
+    return 0;
+#endif
 }
 // (hi, lo) -> byte, hi in the upper nibble
 __device__ __forceinline__ std::uint32_t f32x2_to_e2m1x2(float hi, float lo) {
+#if defined(STRIX_CUDA_NATIVE_NVFP4)
     std::uint32_t r;
     asm("{\n .reg .b8 h;\n cvt.rn.satfinite.e2m1x2.f32 h, %1, %2;\n cvt.u32.u8 %0, h;\n}" : "=r"(r) : "f"(hi), "f"(lo));
     return r & 0xFFu;
+#else
+    (void)hi;
+    (void)lo;
+    __trap();
+    return 0;
+#endif
 }
 __device__ __forceinline__ std::uint32_t pack_f16x2(float lo, float hi) {
     const __half2 h = __floats2half2_rn(lo, hi);
@@ -352,6 +379,7 @@ struct ReadaheadArgs {
 };
 
 __global__ void fp4_readahead(const ReadaheadArgs a) {
+#if __CUDA_ARCH__ >= 900
     const unsigned long long stride = static_cast<unsigned long long>(gridDim.x) * blockDim.x;
     for (unsigned long long i = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < a.pieces;
          i += stride) {
@@ -363,6 +391,7 @@ __global__ void fp4_readahead(const ReadaheadArgs a) {
         const unsigned bytes = (p.c1 - p.c0) * kNvfp4RecordBytes;
         asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src), "r"(bytes) : "memory");
     }
+#endif
 }
 
 // STRIX_CUDA_WEIGHT_READAHEAD: bitwise (prefetch only); default ON (gain plus neutral). No-model bench, RTX PRO 6000 at
@@ -520,6 +549,7 @@ __host__ __device__ PrefetchPiece rows_prefetch_piece(const RowsReadahead& a, un
 
 template <bool Nvfp4>
 __global__ void rows_readahead(const RowsReadahead a) {
+#if __CUDA_ARCH__ >= 900
     auto i = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     const auto stride = static_cast<unsigned long long>(gridDim.x) * blockDim.x;
     for (; i < a.pieces; i += stride) {
@@ -539,11 +569,15 @@ __global__ void rows_readahead(const RowsReadahead a) {
             }
         }
     }
+#endif
 }
 
 template <bool Nvfp4>
 cudaError_t rows_readahead_before(RowsReadahead a, unsigned gy, std::uint32_t rows, cudaStream_t s) {
     if (!readahead_on() || !decode::readahead_rows_ok(rows, kNvfp4ReadaheadMaxRows)) return cudaSuccess;
+#if !defined(STRIX_CUDA_NATIVE_NVFP4)
+    if (!cuda::arch::current_device_at_least<9>()) return cudaSuccess;
+#endif
     cudaGraph_t graph = nullptr;
     cudaGraphNode_t after = nullptr;
     int l2 = 0;
@@ -707,6 +741,7 @@ __global__ void convert_kernel(const void* src, std::uint32_t out, std::uint32_t
 template <bool BF16>
 cudaError_t quantize(const void* src, std::uint32_t out, std::uint32_t in, void* dst, float* gscale, cudaStream_t s) {
     if (!nvfp4_shape_ok(out, in) || src == nullptr || dst == nullptr || gscale == nullptr) return cudaErrorInvalidValue;
+    if (const auto e = cuda::arch::native_nvfp4_status(); e != cudaSuccess) return e;
     std::uint32_t* d_amax = nullptr;
     float* d_gs = nullptr;
     cudaError_t e = cudaMallocAsync(reinterpret_cast<void**>(&d_amax), 8, s);
@@ -727,6 +762,8 @@ cudaError_t quantize(const void* src, std::uint32_t out, std::uint32_t in, void*
 }
 
 }  // namespace
+
+bool nvfp4_supported() { return cuda::arch::native_nvfp4_status() == cudaSuccess; }
 
 void nvfp4_set_split_target(std::uint32_t warps) { g_target_warps = warps ? warps : split_k::kExactTarget; }
 
@@ -786,6 +823,7 @@ namespace {
 // Shared by the single, fused and multi entry points: builds the job table (split-K partial buffers carved from the
 // workspace) and launches. ks per job is nvfp4_split_k(out, in), independent of rows.
 cudaError_t run_jobs(Jobs& jobs, const float* x, std::uint32_t in, std::uint32_t rows, cudaStream_t s) {
+    if (const auto e = cuda::arch::native_nvfp4_status(); e != cudaSuccess) return e;
     std::size_t need = 0;
     for (int q = 0; q < jobs.n; ++q) {
         Job& J = jobs.j[q];
@@ -953,6 +991,11 @@ cudaError_t cuda_rows_grouped(const core::rows::Plan& plan, float* workspace, st
     // Admit all jobs before submitting any work, including the step-1 forms.
     for (const auto& launch : plan.launches())
         if (!valid_rows_launch(launch)) return cudaErrorInvalidValue;
+    for (const auto& launch : plan.launches()) {
+        if (launch.form != rows::Form::nvfp4_split_k) continue;
+        if (const auto e = cuda::arch::native_nvfp4_status(); e != cudaSuccess) return e;
+        break;
+    }
 
     for (std::size_t i = 0; i < plan.launches().size(); ++i) {
         const auto& launch = plan.launches()[i];
@@ -1087,6 +1130,7 @@ __global__ void __launch_bounds__(256) expand_f16_kernel(const unsigned char* w,
 
 cudaError_t nvfp4_expand_f16(const DenseWeight& w, void* dst_f16, cudaStream_t stream) {
     if (w.format != WeightFormat::nvfp4 || !nvfp4_shape_ok(w.out, w.in)) return cudaErrorInvalidValue;
+    if (const auto e = cuda::arch::native_nvfp4_status(); e != cudaSuccess) return e;
     const std::uint32_t recs = (w.out >> 4) * (w.in >> 7);
     expand_f16_kernel<<<(recs + 7) / 8, 256, 0, stream>>>(static_cast<const unsigned char*>(w.data), w.out, w.in, static_cast<__half*>(dst_f16));
     return cudaGetLastError();
@@ -1124,7 +1168,13 @@ __global__ void __launch_bounds__(256) expand_e4m3_kernel(const unsigned char* w
                 std::uint32_t v = hmul2(o[b], prmt(s2, 0x1010));
                 v = hmul2(v, 0x30003000u);  // * 0.125 (exact in f16)
                 std::uint32_t r;
+#if defined(STRIX_CUDA_NATIVE_NVFP4)
                 asm("{\n .reg .b16 h;\n cvt.rn.satfinite.e4m3x2.f16x2 h, %1;\n cvt.u32.u16 %0, h;\n}" : "=r"(r) : "r"(v));
+#else
+                (void)v;
+                r = 0;
+                __trap();
+#endif
                 const int k = 4 * i + b;  // pair index in the thread's 16 pairs
                 if (k & 1) ob[k >> 1] |= (r & 0xFFFFu) << 16;
                 else ob[k >> 1] = r & 0xFFFFu;
@@ -1139,6 +1189,7 @@ __global__ void __launch_bounds__(256) expand_e4m3_kernel(const unsigned char* w
 
 cudaError_t nvfp4_expand_e4m3(const DenseWeight& w, void* dst, cudaStream_t stream) {
     if (w.format != WeightFormat::nvfp4 || !nvfp4_shape_ok(w.out, w.in)) return cudaErrorInvalidValue;
+    if (const auto e = cuda::arch::native_nvfp4_status(); e != cudaSuccess) return e;
     const std::uint32_t recs = (w.out >> 4) * (w.in >> 7);
     expand_e4m3_kernel<<<(recs + 7) / 8, 256, 0, stream>>>(static_cast<const unsigned char*>(w.data), w.out, w.in, static_cast<unsigned char*>(dst));
     return cudaGetLastError();

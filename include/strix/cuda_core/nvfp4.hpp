@@ -50,6 +50,7 @@ constexpr std::uint32_t kNvfp4MaxRows = 32;
 constexpr std::uint32_t kNvfp4RecordBytes = 1152;
 
 [[nodiscard]] constexpr bool nvfp4_shape_ok(std::uint32_t out, std::uint32_t in) { return out % 16 == 0 && in % 128 == 0; }
+[[nodiscard]] bool nvfp4_supported();
 [[nodiscard]] constexpr std::size_t nvfp4_bytes(std::uint32_t out, std::uint32_t in) {
     return static_cast<std::size_t>(out / 16) * (in / 128) * kNvfp4RecordBytes;
 }

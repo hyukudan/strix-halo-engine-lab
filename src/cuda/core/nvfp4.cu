@@ -1,16 +1,11 @@
+#if defined(STRIX_CUDA_NATIVE_NVFP4)
 #include "arch/sm120/nvfp4.cuh"
+#include "../arch/native_nvfp4.hpp"
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
 #include <cmath>
 #include <limits>
 namespace strix::cuda::core::nvfp4 {
-static cudaError_t capability() {
-    int device=0,major=0,minor=0;
-    auto err=cudaGetDevice(&device); if(err!=cudaSuccess) return err;
-    err=cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,device); if(err!=cudaSuccess) return err;
-    err=cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,device); if(err!=cudaSuccess) return err;
-    return major==12 && minor==0?cudaSuccess:cudaErrorNotSupported;
-}
 __global__ void quantize_kernel(const float* input,std::size_t xs,unsigned rows,unsigned k,
     std::uint8_t* q,std::size_t qs,std::uint8_t* s,std::size_t ss,float ts) {
     const std::size_t group=(std::size_t(blockIdx.x)*blockDim.x+threadIdx.x)/8;
@@ -37,7 +32,7 @@ cudaError_t quantize_enqueue(const float* input,std::size_t xs,unsigned rows,uns
        !std::isfinite(ts) || ts<=0 || xs>max/rows/sizeof(float) || qs>max/rows || ss>max/rows ||
        std::uint64_t(rows)*(k/16)>std::uint64_t(2147483647)*16)
         return cudaErrorInvalidValue;
-    const auto err=capability();if(err!=cudaSuccess) return err;
+    const auto err=arch::native_nvfp4_status();if(err!=cudaSuccess) return err;
     quantize_kernel<<<unsigned((std::uint64_t(rows)*(k/16)+15)/16),128,0,stream>>>(input,xs,rows,k,q,qs,s,ss,ts);
     return cudaGetLastError();
 }
@@ -48,7 +43,7 @@ cudaError_t enqueue(const View& v,const Plan& p,void* workspace,std::size_t byte
        p.route!=expected.route || p.workspace_bytes!=expected.workspace_bytes ||
        bytes<p.workspace_bytes || (p.workspace_bytes && (!workspace || reinterpret_cast<std::uintptr_t>(workspace)%256)))
         return cudaErrorInvalidValue;
-    auto err=capability(); if(err!=cudaSuccess) return err;
+    auto err=arch::native_nvfp4_status(); if(err!=cudaSuccess) return err;
     // Explicit grid limits; reject rather than silently dropping tail tiles.
     if(v.m>65535u*64u) return cudaErrorInvalidValue;
     auto* scratch=static_cast<float*>(workspace);
@@ -63,3 +58,21 @@ cudaError_t enqueue(const View& v,const Plan& p,void* workspace,std::size_t byte
     return cudaSuccess;
 }
 }
+
+#else
+
+#include "strix/cuda/core/nvfp4_cuda.hpp"
+
+namespace strix::cuda::core::nvfp4 {
+
+cudaError_t quantize_enqueue(const float*, std::size_t, unsigned, unsigned,
+                            std::uint8_t*, std::size_t, std::uint8_t*, std::size_t, float, cudaStream_t) {
+    return cudaErrorNotSupported;
+}
+
+cudaError_t enqueue(const View&, const Plan&, void*, std::size_t, cudaStream_t) {
+    return cudaErrorNotSupported;
+}
+
+}  // namespace strix::cuda::core::nvfp4
+#endif

@@ -1,18 +1,13 @@
 // Enqueue side of the NVFP4 tile GEMM (contract: strix/cuda/core/nvfp4_tile.hpp; kernels: arch/sm120/nvfp4_tile.cuh).
-// Built for sm_120a only (block-scaled FP4 mma, cvt e2m1x2); another device gets cudaErrorNotSupported, never a trap.
+// Block-scaled FP4 MMA and E2M1 conversion require a matching native image.
 #include "strix/cuda/core/nvfp4_tile_cuda.hpp"
 
 #include "arch/sm120/nvfp4_tile.cuh"
+#include "../arch/native_nvfp4.hpp"
 
 namespace strix::cuda::core::nvfp4::tile {
 namespace {
-cudaError_t capability() {
-    int device = 0, major = 0, minor = 0;
-    if (auto e = cudaGetDevice(&device); e != cudaSuccess) return e;
-    if (auto e = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device); e != cudaSuccess) return e;
-    if (auto e = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device); e != cudaSuccess) return e;
-    return major == 12 && minor == 0 ? cudaSuccess : cudaErrorNotSupported;
-}
+cudaError_t capability() { return arch::native_nvfp4_status(); }
 }  // namespace
 
 bool supported() { return capability() == cudaSuccess; }

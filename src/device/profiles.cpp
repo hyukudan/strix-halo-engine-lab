@@ -1,6 +1,7 @@
 #include "strix/device/profiles.hpp"
 #include "strix/device/link_class.hpp"
 #include "strix/device/profiles_data.hpp"
+#include "strix/hip/arch.hpp"
 #include "strix/model_description.hpp"
 
 #include <iomanip>
@@ -54,6 +55,14 @@ Profile parse_profile(const Table& row) {
         profile.lowbit_rows = {unsigned_field<std::uint32_t>(lowbit, "small_rows"),
                                unsigned_field<std::uint32_t>(lowbit, "wide_panels")};
     }
+    if (row.contains("legacy_hip_receipt_product"))
+        profile.legacy_hip_receipt_product = field<std::string>(row, "legacy_hip_receipt_product");
+    if (row.contains("unmeasured")) profile.unmeasured = field<bool>(row, "unmeasured");
+    if (profile.unmeasured && (!profile.measured.empty() || profile.lowbit_rows.small_rows ||
+                               profile.memory_bytes || profile.memory_gbytes_ps || profile.peaks.fp32 ||
+                               profile.peaks.fp16 || profile.peaks.bf16 || profile.peaks.fp8 ||
+                               profile.peaks.fp4 || profile.peaks.int8 || !profile.legacy_hip_receipt_product.empty()))
+        throw std::invalid_argument("device profiles: an unmeasured profile supplies hardware identity only");
     return profile;
 }
 
@@ -67,25 +76,23 @@ std::vector<Profile> parse_catalogue(const Table& root) {
     return profiles;
 }
 
-// A view of the one link-class table (link_class.hpp): names, order and notes for `count = N` shapes; the rates are
-// the class rates (no second copy of a number).
-Interconnect from_class(std::string_view name, std::string_view note) {
-    const auto* c = find_link_class(name);
-    return {c->name, c->gbytes_ps, c->rtt_us, note};
+std::vector<Interconnect> parse_interconnects(const Table& root) {
+    std::vector<Interconnect> links;
+    for (const auto& entry : field<Value::Array>(root, "interconnects")) {
+        const auto& row = std::get<Table>(entry.data);
+        const auto& name = field<std::string>(row, "name");
+        const auto* link_class = find_link_class(name);
+        if (!link_class) throw std::invalid_argument("device profiles: unknown interconnect " + name);
+        const auto note = row.contains("note") ? std::string_view(field<std::string>(row, "note")) : std::string_view{};
+        links.push_back({link_class->name, link_class->gbytes_ps, link_class->rtt_us, note});
+    }
+    return links;
 }
-const std::vector<Interconnect> kInterconnects = {
-    from_class("pcie5x16", "peer copies through the host bridge, no NVLink"),
-    from_class("pcie4x16", "peer copies through the host bridge"),
-    from_class("pcie4x4", ""),
-    from_class("oculink4x4", ""),
-    from_class("pcie3x4", ""),
-    from_class("usb4", "measured between our two nodes"),
-    from_class("100gbe", ""),
-    from_class("25gbe", ""),
-    from_class("10gbe", ""),
-    from_class("2.5gbe", ""),
-    from_class("1gbe", ""),
-};
+
+const Table& catalogue_data() {
+    static const auto data = model_description::parse(detail::profiles_toml, model_description::TableSyntax::root_array_tables);
+    return data.fields;
+}
 
 std::string num(double v) {
     std::ostringstream os;
@@ -106,8 +113,7 @@ std::string quoted(std::string_view s) {
 
 const std::vector<Profile>& catalogue() {
     // Profile views refer to strings in this process-lifetime TOML parse.
-    static const auto data = model_description::parse(detail::profiles_toml, model_description::TableSyntax::root_array_tables);
-    static const auto profiles = parse_catalogue(data.fields);
+    static const auto profiles = parse_catalogue(catalogue_data());
     return profiles;
 }
 
@@ -117,16 +123,52 @@ const Profile* find_profile(std::string_view name) noexcept {
     return nullptr;
 }
 
+const Profile& describe_hip_profile(std::string_view arch, unsigned compute_units, bool integrated) {
+    arch = hip::arch::base_name(arch);
+    const Profile* match = nullptr;
+    if (!arch.empty()) {
+        for (const auto& profile : catalogue()) {
+            if (profile.vendor != "amd" || profile.arch != arch || profile.unified != integrated ||
+                (profile.units != 0U && profile.units != compute_units)) continue;
+            if (match != nullptr) {
+                match = nullptr;
+                break;
+            }
+            match = &profile;
+        }
+    }
+    if (match != nullptr) return *match;
+    const auto* generic = find_profile("generic-hip");
+    if (generic == nullptr || !generic->unmeasured)
+        throw std::invalid_argument("device profiles: missing the unmeasured generic-hip fallback");
+    return *generic;
+}
+
+bool hip_receipt_profile_matches(std::string_view name, std::string_view cost_identity) {
+    const auto* profile = find_profile(name);
+    if (profile == nullptr || profile->vendor != "amd" || profile->legacy_hip_receipt_product.empty()) return false;
+    const auto arch_end = cost_identity.find('|');
+    if (arch_end == std::string_view::npos ||
+        hip::arch::base_name(cost_identity.substr(0, arch_end)) != profile->arch) return false;
+    cost_identity.remove_prefix(arch_end + 1);
+    const auto product_end = cost_identity.find('|');
+    return product_end != std::string_view::npos &&
+           cost_identity.substr(0, product_end) == profile->legacy_hip_receipt_product;
+}
+
 std::string profile_names() {
     std::string out;
     for (const auto& p : catalogue()) out += (out.empty() ? "" : ", ") + std::string(p.name);
     return out;
 }
 
-const std::vector<Interconnect>& interconnects() { return kInterconnects; }
+const std::vector<Interconnect>& interconnects() {
+    static const auto links = parse_interconnects(catalogue_data());
+    return links;
+}
 
 const Interconnect* find_interconnect(std::string_view name) noexcept {
-    for (const auto& i : kInterconnects)
+    for (const auto& i : interconnects())
         if (i.name == name) return &i;
     return nullptr;
 }
@@ -159,7 +201,7 @@ std::string catalogue_toml() {
         if (!p.note.empty()) os << "note = " << quoted(p.note) << "\n";
     }
     os << "\n# Interconnect classes for `count = N` shapes: nominal one-direction GB/s and round trip (us).\n";
-    for (const auto& i : kInterconnects)
+    for (const auto& i : interconnects())
         os << "[interconnects." << quoted(i.name) << "]\ngbytes_ps = " << num(i.gbytes_ps) << "\nrtt_us = " << num(i.rtt_us)
            << "\n";
     return os.str();

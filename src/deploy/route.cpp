@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <functional>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <locale>
 #include <set>
@@ -289,6 +290,29 @@ std::optional<std::vector<double>> layer_work(const Ctx& c, const StageCost& ent
     auto w = borrowed->layers; w.push_back(borrowed->tail);
     return w;
 }
+// Apply the same gain comparison used by the single- and split-phase pair planner.
+void require_route_gain(const RouteRequest& request, RouteOption& option) {
+    if (!request.multi_device_gain || !option.selectable) return;
+    std::set<std::string_view> units(option.decode.begin(), option.decode.end());
+    for (const auto& stage : option.stages) units.insert(stage.unit.begin(), stage.unit.end());
+    if (units.size() <= 1U) return;
+    const auto& gains = *request.multi_device_gain;
+    const auto row = std::find_if(gains.begin(), gains.end(), [&](const RouteGain& gain) { return gain.label == option.label; });
+    if (row == gains.end() ||
+        std::find_if(std::next(row), gains.end(), [&](const RouteGain& gain) { return gain.label == option.label; }) != gains.end()) {
+        option.selectable = false;
+        option.reason = "needs a unique prefill and decode single-device comparison for this option";
+        return;
+    }
+    const auto comparison = [](const pair::planner::DeviceGain& gain) {
+        return "single " + ms_text(gain.single_ms) + ", multi " + ms_text(gain.multi_ms) + ", ratio " + num(gain.ratio());
+    };
+    const auto summary = "prefill (" + comparison(row->prefill) + "), decode (" + comparison(row->decode) + ")";
+    option.selectable = row->prefill.clears() && row->decode.clears();
+    if (option.selectable) option.reason += (option.reason.empty() ? "" : "; ") + summary;
+    else option.reason = "single-device gain bar refused " + summary;
+}
+
 RoutePlan native_route(const Ctx& c, const NativePairPrefill& prefill) {
     RoutePlan result;
     result.request = c.request;
@@ -371,6 +395,8 @@ RoutePlan native_route(const Ctx& c, const NativePairPrefill& prefill) {
         else option.reason += " Topology pinned.";
     }
     if (placement.refused && !placement.reasons.empty()) option.reason += ". " + placement.reasons.back();
+    require_route_gain(c.request, option);
+    if (!option.selectable && !placement.refused) refuse(option.reason);
     result.chosen = option.selectable ? 0 : -1;
     result.reason = option.reason;
     result.options.push_back(std::move(option));
@@ -790,6 +816,7 @@ RoutePlan plan_route(const RouteRequest& request, const Inventory& inventory, co
     }
 
     if (exhausted) { plan.options.clear(); return refuse("route planning work limit exceeded"); }
+    for (auto& option : plan.options) require_route_gain(request, option);
     // Selection: the objective over selectable options; enumeration order breaks ties.
     const auto better = [&](const RouteOption& a, const RouteOption& b) {
         return request.objective == Objective::ttft ? a.predicted_ms < b.predicted_ms : a.rows_per_s > b.rows_per_s;

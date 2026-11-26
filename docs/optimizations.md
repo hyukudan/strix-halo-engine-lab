@@ -72,12 +72,29 @@ Device target row verification, including mixed streams and optional KV mirrors.
 
 Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=affected.
 
+<a id="cpu-portable-operator-dispatch"></a>
+### CPU portable operator dispatch
+
+The optional CPU operator library selects a runtime capability level and gives each level the
+complete portable A8 quantization, Q8_0 GEMV and RMSNorm table. Synthetic CPU feature descriptors
+exercise the selector and compare the results bitwise with the host oracles. The selected level
+currently records capabilities while all operator entries run the same portable arithmetic.
+The shared code lives in `src/cpu/core/select.cpp`. The opt-in build flag is `STRIX_BACKEND_CPU`.
+
 <a id="cohort-verification-scratch-reuse"></a>
 ### Cohort verification scratch reuse
 
 Backends using the shared cohort decoder. Host cohort tests compare cohort and solo IDs, including device-draft and per-lane selection hooks. Reuses prompt planning, lane drafts, row planning, verification and commit buffers across host rounds. The steady-state counting fixture checks the full greedy IDs and committed state digest. Device wall time is unmeasured. The host code lives in `src/serve/cohort_decode.cpp`.
 
 Engine matrix: inkling2-mini=HIP and CUDA HTTP cohorts, qwen3.8-flash-next=unaffected, qwen3.8-27b=CUDA cohort, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+
+<a id="reference-gpu-serve-admission"></a>
+### Reference GPU serve admission
+
+The shared `strix-serve` shell explains the supported Intel family entry point and
+the RMSNorm operator scope of Vulkan and Metal when those backends are requested
+at the shell level. Host tests cover early refusal and the reference operator
+boundary. See the [experimental backend coverage](architecture/backends.md#experimental-intel-vulkan-and-metal-backends).
 
 Qwen guarded wave reductions can use exact DPP/permlanex16 exchanges (build-time lever, off by default: configure with `-DSTRIX_DPP_REDUCE=ON`; the all-on build uses it); addition trees are unchanged, native byte-equality qualification is pending, and no speed gain is claimed.
 
@@ -158,6 +175,20 @@ resolution before adding overrides. `ON` means enabled; `auto` means enabled whe
 `opt-in` requires an explicit selection. An unlisted isolated gain means unmeasured, not zero.
 The [JSON catalog](optimizations.json) provides the same controls for tools; the [README](../README.md)
 is the compact overview, and [toggles](toggles.md) lists every switch by area. Run commands and agent instructions are in [AGENTS.md](../AGENTS.md).
+
+### Generic HIP device admission
+
+The shared HIP device gate accepts an explicit `--device-profile generic-hip` on an
+unambiguous AMD wave32 device. The catalogue hardware match never grants a budget or
+schedule by itself. Existing qualification decisions are still scoped to their receipt.
+The host fixture covers RDNA3, RDNA3.5, RDNA4, CDNA and unknown device descriptors.
+[Generic HIP devices](devices.md#generic-hip-admission)
+
+### Unmeasured device catalogue entries
+
+The shared device catalogue provides planning identities for additional AMD, Intel and Apple GPU families.
+Entries marked `unmeasured` carry no capacity or throughput estimates and confer no route qualification.
+The interconnect catalogue references the shared topology classes. [Device catalogue](devices.md#catalogue)
 
 Exactness requires fixed model content, prompt, state, profile pair and capacity. Qwen fast FP16 prefill,
 dense A8, GSQ, DeepSeek trellis and GLM R1b are distinct numerical identities. Speculation verifies committed
@@ -5648,6 +5679,14 @@ measured (`complete`, `covered_ms`); nothing is extended over a failed read or p
 - **Measured:** Measurement, not a speed lever. Qwen 8K real-text prefill, one node, default exact route, sampler on/off interleaved (ABAB): 1,755.9 / 1,744.5 tok/s on vs 1,752.9 / 1,733.5 off (no slowdown), logits and tokens identical. First receipts: prefill 577-588 J, 123.5-125.4 W mean, 150-152 W peak, 13.9-14.2 tok/J, median GPU clock 2,512-2,524 MHz, 84-92 C; serial greedy decode 128 tokens: 544 J, 95.7 W mean, 0.235 tok/J, 2,873 MHz.
 - **Off switch:** `STRIX_POWER_SAMPLER=0`.
 
+<a id="multi-device-gain-bar"></a>
+### Multi-device gain comparison
+
+- **Shared home:** `include/strix/pair/device_gain.hpp`
+- **Preconditions:** Comparable single-device and multi-device costs per phase, under the same numerical class and workload. Prefill includes any handoff.
+- **Admission:** The explicit `RouteRequest::multi_device_gain` requires both phases to clear their comparison. A missing or ambiguous comparison refuses the multi-device option, including pinned routes. Positive infinity for the single-device cost denotes a model that cannot fit on one device.
+- **Evidence:** Fake-device planner and deployment fixtures. Device timings are pending.
+
 <a id="platform-route-receipt"></a>
 
 ### Shared route receipt
@@ -6792,3 +6831,14 @@ Select `STRIX_SAMPLE_PATH=host` on the shared sampling-v1 route to use the host
 transform for target and draft. The device draft vocabulary API accepts append-only
 entry IDs. A different vocabulary with the same number of entries requires a new
 sampler.
+<a id="cuda-native-nvfp4-images"></a>
+### CUDA native NVFP4 images
+Shared CUDA core and Qwen builds select CUDA images through
+`CMAKE_CUDA_ARCHITECTURES` and `STRIX_CUDA_NVFP4_ARCHITECTURES`. The latter
+defaults to `120a`. Set it empty to build without native FP4 instructions.
+For example, configure with `-DCMAKE_CUDA_ARCHITECTURES=89-real` and
+`-DSTRIX_CUDA_NVFP4_ARCHITECTURES=` for a portable Ada build. The
+`121a` native image is an explicit build choice. The launch contract checks
+for an image matching the current compute capability before an NVFP4 kernel
+can run. Compilation of an image supplies no device quality or timing receipt.
+The shared build rules live in `cmake/StrixCudaArchs.cmake`.

@@ -563,6 +563,24 @@ rtt_us_measured = 25
             "pair reports bidirectional payload and calibrated link cost without a workload prediction");
     require(pair.ranks.size() == 2 && pair.ranks.front().footprint.staging == GiB &&
             pair.ranks.front().footprint.workspace == 2 * GiB, "pair budget includes staging and temporary memory");
+    request.pin = selected->label;
+    request.multi_device_gain.emplace();
+    auto gated = plan_route(request, declared, provider, {});
+    require(!gated.selected() && gated.deployment->refused && gated.reason.find("unique prefill and decode") != std::string::npos,
+            "strict multi-device route refuses a pin without evidence");
+    auto& gain = request.multi_device_gain->emplace_back(RouteGain{request.pin, {100, 75, 1}, {30, 34, 0}});
+    gated = plan_route(request, declared, provider, {});
+    require(!gated.selected() && gated.reason.find("prefill (single") != std::string::npos &&
+            gated.reason.find("decode (single") != std::string::npos, "good prefill cannot make up for slower decode");
+    gain.decode = {30, 24, 1};
+    gain.prefill.multi_ms = 101;
+    require(!plan_route(request, declared, provider, {}).selected(), "good decode cannot make up for slower prefill");
+    gain.prefill.multi_ms = 75;
+    require(plan_route(request, declared, provider, {}).selected(), "matching gains admit this multi-device option");
+    request.multi_device_gain->push_back(RouteGain{gain});
+    require(!plan_route(request, declared, provider, {}).selected(), "ambiguous evidence refuses the pinned option");
+    request.multi_device_gain.reset();
+    request.pin.clear();
     declared.load["rank-1"].queued = 1;
     const auto queued = plan_route(request, declared, provider, {});
     require(!queued.selected() && queued.options.front().queued_requests == 1 &&

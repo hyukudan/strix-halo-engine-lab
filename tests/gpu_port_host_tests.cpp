@@ -122,8 +122,13 @@ void reference_resources() {
     expect_failure<std::invalid_argument>([&] {
         backend.rms_norm(values, {}, result, 2, std::numeric_limits<float>::infinity());
     }, "invalid reference RMSNorm");
+    expect_failure([&] { backend.gather({}, 0, result); }, "reference gather unavailable");
     expect_failure([&] { backend.linear({}, values, result); }, "reference linear unavailable");
-    check(backend.launches == 2, "invalid shape reached the native hook");
+    expect_failure([&] { backend.rope(result, values, 2); }, "reference RoPE unavailable");
+    expect_failure([&] { backend.attention({}, result); }, "reference attention unavailable");
+    struct Plan final : session::ExecutionPlan { using ExecutionPlan::ExecutionPlan; } plan(backend);
+    expect_failure([&] { backend.execute(plan); }, "family execution plan unavailable");
+    check(result == values && backend.launches == 2, "refused operation changed output or reached the native hook");
 
     backend.fail_dispatch = true;
     result.fill(0.0F);

@@ -6,6 +6,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#if defined(STRIX_CUDA_CHECK_PDL_IMAGE)
+#include "../arch/capability.hpp"
+#endif
 
 namespace strix::cuda_core {
 
@@ -25,7 +28,11 @@ namespace strix::cuda_core {
 // Enforced by type where bound: a kernel takes its non-constant buffers as After<T>; their pointer is only reachable with the
 // PdlWaited token that pdl_wait() returns, so no access to them can be written before the wait (bound: fp4_gemv,
 // fp4_reduce, norm_kernel). Constant data (weights, gains, committed state) stays a plain pointer.
-__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+__device__ __forceinline__ void pdl_trigger() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
 class PdlWaited;
 __device__ __forceinline__ PdlWaited pdl_wait();
 class PdlWaited {
@@ -33,7 +40,9 @@ class PdlWaited {
     friend __device__ PdlWaited pdl_wait();
 };
 __device__ __forceinline__ PdlWaited pdl_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
     return PdlWaited();
 }
 template <class T>
@@ -56,6 +65,20 @@ inline bool& pdl_enabled() {
     return on;
 }
 
+template <class Kernel>
+bool pdl_enabled_for(Kernel kernel) {
+    if (!pdl_enabled()) return false;
+#if defined(STRIX_CUDA_CHECK_PDL_IMAGE)
+    if (!cuda::arch::has_pdl()) return false;
+    // A newer device can JIT an older virtual image that has no PDL wait.
+    cudaFuncAttributes attr{};
+    return cudaFuncGetAttributes(&attr, kernel) == cudaSuccess && attr.ptxVersion >= 90;
+#else
+    (void)kernel;
+    return true;
+#endif
+}
+
 template <class... KArgs, class... Args>
 cudaError_t launch_pdl_smem(void (*kernel)(KArgs...), dim3 grid, dim3 block, std::size_t smem, cudaStream_t stream,
                             Args... args) {
@@ -68,7 +91,7 @@ cudaError_t launch_pdl_smem(void (*kernel)(KArgs...), dim3 grid, dim3 block, std
     at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     at[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = at;
-    cfg.numAttrs = pdl_enabled() ? 1 : 0;
+    cfg.numAttrs = pdl_enabled_for(kernel) ? 1 : 0;
     return cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
 }
 
@@ -82,6 +105,9 @@ cudaError_t launch_pdl_cluster(void (*kernel)(KArgs...), dim3 grid, dim3 block, 
     cfg.blockDim = block;
     cfg.dynamicSmemBytes = smem;
     cfg.stream = stream;
+#if defined(STRIX_CUDA_CHECK_PDL_IMAGE)
+    if (!cuda::arch::has_clusters()) return cudaErrorNotSupported;
+#endif
     cudaLaunchAttribute at[2];
     at[0].id = cudaLaunchAttributeClusterDimension;
     at[0].val.clusterDim.x = cluster_x;
@@ -90,7 +116,7 @@ cudaError_t launch_pdl_cluster(void (*kernel)(KArgs...), dim3 grid, dim3 block, 
     at[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     at[1].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = at;
-    cfg.numAttrs = pdl_enabled() ? 2 : 1;
+    cfg.numAttrs = pdl_enabled_for(kernel) ? 2 : 1;
     return cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
 }
 

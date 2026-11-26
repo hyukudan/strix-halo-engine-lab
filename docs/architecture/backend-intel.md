@@ -1,9 +1,9 @@
 # Intel GPU backend (SYCL / oneAPI, Level Zero)
 
-Status: scaffold. Recorded host evidence is an MSVC Release run; other platforms are not qualified. The SYCL device side is written against SYCL
-2020 and the Intel extensions but has not been compiled yet (no oneAPI toolchain on the build hosts). The shared
-backend interface is described in `docs/architecture/backends.md` (separate branch, not edited here); this page is the
-Intel section of it.
+The Intel backend has experimental SYCL operator references, a Gemma 4 E4B Q8_0
+model reference and a hybrid Hy4 reference. The host fixtures run without oneAPI.
+Native qualification remains pending. See the [current entry points and ordered
+qualification tasks](backends.md#experimental-intel-vulkan-and-metal-backends).
 
 Layering (MODULAR BY DEVICE):
 
@@ -106,8 +106,9 @@ which models fit without the host-tier path. Lunar Lake has 32 GB at most, so it
 
 ## 4. Risks
 
-- **No toolchain yet**: the SYCL branch of `backend.cpp` and `SyclEnumerator` are uncompiled. First step on a host with
-  oneAPI is to build them; expect extension spelling fixes (`ext_intel_device_id`, `ext_intel_pci_address`).
+- **Toolchain and device validation**: the MSVC fixtures exercise the fallback
+  build and injected boundary errors. The oneAPI build and Level Zero native
+  fixtures qualify the separate runtime path.
 - **joint_matrix maturity**: supported shapes and layouts differ per device and release. Query
   `ext::oneapi::experimental::info::device::matrix_combinations` at open and fall back to the reference path; ESIMD
   `dpas` is the fallback when joint_matrix code generation is poor (it ties the kernel to Intel, which is acceptable

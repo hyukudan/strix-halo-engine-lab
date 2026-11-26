@@ -3993,6 +3993,8 @@ if(BUILD_TESTING)
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     endif()
     if(Python3_Interpreter_FOUND)
+        add_test(NAME strix-profile-receipts-tests
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tools/ci/check_profile_receipts.py)
         add_test(NAME strix-dual-transport-runner-tests
             COMMAND ${Python3_EXECUTABLE} -B -W error::ResourceWarning ${CMAKE_SOURCE_DIR}/lab/transport/test_dual_tbstream.py)
         add_test(NAME strix-private-kernel-preparation-tests
@@ -6242,7 +6244,7 @@ endif()
 # deepseek41 trimmed-model host reference (integration): plan interpreter over the formats/MoE pieces.
 add_library(strix_ds41_runtime STATIC src/deepseek41_host_forward.cpp src/deepseek41_attention_host.cpp src/ds41_weight_overlay.cpp
     src/deepseek41_attention_state.cpp src/deepseek41_prefix_cache.cpp src/deepseek41_pair_defaults.cpp)
-target_link_libraries(strix_ds41_runtime PUBLIC strix_ds41_layer strix_ds41_formats strix_ds41_attention strix_family_deepseek41 strix_state_cache)
+target_link_libraries(strix_ds41_runtime PUBLIC strix_ds41_layer strix_ds41_formats strix_ds41_attention strix_family_deepseek41 strix_state_cache PRIVATE strix_device)
 strix_target_warnings(strix_ds41_runtime)
 if(NOT MSVC)
     target_compile_options(strix_ds41_runtime PRIVATE -ffp-contract=off)
@@ -6312,7 +6314,7 @@ if(BUILD_TESTING)
 endif()
 if(BUILD_TESTING AND NOT STRIX_CUDA_DS41_ONLY)
     add_executable(strix-serve-session-disabled-tests tests/serve_session_disabled_tests.cpp)
-    target_link_libraries(strix-serve-session-disabled-tests PRIVATE strix_serve)
+    target_link_libraries(strix-serve-session-disabled-tests PRIVATE strix_serve strix_device)
     target_sources(strix-serve-session-disabled-tests PRIVATE src/deepseek41_pair_defaults.cpp)
     strix_target_warnings(strix-serve-session-disabled-tests)
     add_test(NAME strix-serve-session-disabled-tests COMMAND strix-serve-session-disabled-tests --session-cache off)

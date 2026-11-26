@@ -6,7 +6,7 @@
 // there: a second target re-measures the table and may replace the rule, it never inherits gfx1151's absolute counts).
 // Home: shared (backend core policy, backend-neutral host code). Bound by: src/core/fma_rows.hpp launch_auto.
 
-#include <string_view>
+#include "strix/hip/arch.hpp"
 
 namespace strix::core::fma_rows {
 
@@ -20,16 +20,7 @@ inline constexpr unsigned kMeasuredComputeUnits = 40U, kFillGroupsPerCu = 2U;
 // Work groups that fill a device of `cu` compute units (80 on the measured part).
 constexpr unsigned fill_groups(unsigned cu) { return kFillGroupsPerCu * cu; }
 
-// CUs of a device from the runtime's report: arch = name without feature suffix (HIP gcnArchName up to ':'),
-// multiprocessors = HIP multiProcessorCount, which counts work-group processors (2 CUs each) on RDNA (gfx10 / gfx11 /
-// gfx12) and CUs on GCN / CDNA (gfx9). 0 = unknown (the caller keeps the measured part's count).
-constexpr unsigned compute_units_from(std::string_view arch, unsigned multiprocessors) {
-    if (multiprocessors == 0U || arch.size() < 5U || arch.substr(0, 3) != "gfx") return 0U;
-    const char major = arch[3];
-    if (major == '1' && (arch[4] == '0' || arch[4] == '1' || arch[4] == '2')) return 2U * multiprocessors;  // RDNA: WGPs
-    if (major == '9') return multiprocessors;                                                                // GCN / CDNA
-    return 0U;
-}
+using hip::arch::compute_units_from;
 
 // The form for a group of `blocks` 64-column blocks (sum over its projections), `in` inputs, `rows` rows on a device of
 // `cu` compute units (cu == kMeasuredComputeUnits reproduces the measured selection exactly).

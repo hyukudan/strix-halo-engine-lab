@@ -7,6 +7,7 @@ include(CTest)
 get_filename_component(STRIX_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 include("${STRIX_ROOT}/cmake/StrixHostFp.cmake")
 cmake_language(DEFER CALL strix_host_reference_fp)
+include("${STRIX_ROOT}/cmake/StrixDevice.cmake")
 
 function(profile_host_test target)
     add_executable(${target} ${ARGN})
@@ -62,12 +63,16 @@ add_test(NAME strix-optimization-table-current COMMAND strix-optimization-table 
 set_tests_properties(strix-optimization-table-current PROPERTIES LABELS "cpu;profile" TIMEOUT 60)
 
 # Exercise the real shared cluster resolvers together without device toolchains.
+set(ARG_TEST_ARGS --expect-family=glm --expect-family=minimax --expect-family=ds41)
 profile_host_test(strix-cluster-serve-cli-parity-tests "${STRIX_ROOT}/tests/serve_cli_parity_tests.cpp"
     "${STRIX_ROOT}/src/minimax/engine/mm_defaults.cpp" "${STRIX_ROOT}/src/deepseek41_pair_defaults.cpp"
     "${STRIX_ROOT}/src/ds41_prefill.cpp" "${STRIX_ROOT}/src/deepseek41_prefix_cache.cpp")
+unset(ARG_TEST_ARGS)
 # The DeepSeek prefix-cache piece plan lives with the host state cache closure (standalone adopter module).
 include("${STRIX_ROOT}/cmake/StrixStateCache.cmake")
-target_link_libraries(strix-cluster-serve-cli-parity-tests PRIVATE strix_state_cache)
+target_link_libraries(strix-cluster-serve-cli-parity-tests PRIVATE strix_state_cache strix_device)
+target_link_libraries(strix-deepseek41-pair-defaults-tests PRIVATE strix_device)
+target_link_libraries(strix-optimization-table PRIVATE strix_device)
 target_compile_definitions(strix-cluster-serve-cli-parity-tests PRIVATE
     STRIX_PARITY_GLM=1 STRIX_PARITY_MINIMAX=1 STRIX_PARITY_DS41=1)
 set_tests_properties(strix-cluster-serve-cli-parity-tests PROPERTIES

@@ -50,22 +50,20 @@ struct Q8a8View {
 };
 
 // --------------------------------------------------------------------------- kernel table
-// One table per ISA specialisation; entries a specialisation does not provide stay null and the
-// selector fills them from the reference. Every entry keeps the reference's bits.
+// A selected table is complete. isa describes the runtime capability level, while each entry
+// uses the portable reference until a specialised body has been qualified at that level.
 // All quantize_a8 / gemv_q8_0_a8 entries throw std::invalid_argument for width / in
 // not divisible by 32, before writing any output. Zero width is allowed.
 struct Kernels {
-    Isa isa = Isa::scalar;
+    Isa isa;
     void (*quantize_a8)(const float* x, std::size_t width, std::int8_t* codes, float* deltas,
-                        std::int32_t* sums) = nullptr;
-    void (*gemv_q8_0_a8)(const Q8a8View& v, const Stream& s) = nullptr;
+                        std::int32_t* sums);
+    void (*gemv_q8_0_a8)(const Q8a8View& v, const Stream& s);
     void (*rmsnorm_f32)(const float* x, const float* w, unsigned n, float eps, float* y,
-                        unsigned rows, const Stream& s) = nullptr;
+                        unsigned rows, const Stream& s);
 };
 const Kernels& reference_kernels() noexcept;
-// Explicit source registration; architecture scaffolds remain unavailable.
-const Kernels* registered_weight_kernels(Isa) noexcept;
-// Best table for the host: specialisations in priority order, gaps filled from the reference.
+// Best capability level for the host, populated from the portable reference.
 // Returned by value: subsequent selections and selecting-thread exit cannot invalidate it.
 Kernels select(const Caps& c) noexcept;
 

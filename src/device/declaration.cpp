@@ -304,6 +304,7 @@ std::string_view vendor_name(Vendor vendor) noexcept {
     case Vendor::amd: return "amd";
     case Vendor::nvidia: return "nvidia";
     case Vendor::intel: return "intel";
+    case Vendor::apple: return "apple";
     }
     return "unknown";
 }
@@ -362,7 +363,8 @@ Vendor parse_vendor(std::string_view text) {
     if (v == "amd") return Vendor::amd;
     if (v == "nvidia") return Vendor::nvidia;
     if (v == "intel") return Vendor::intel;
-    throw std::invalid_argument("vendor: expected amd, nvidia or intel, got " + std::string(text));
+    if (v == "apple") return Vendor::apple;
+    throw std::invalid_argument("vendor: expected amd, nvidia, intel or apple, got " + std::string(text));
 }
 
 std::string normalise_uuid(std::string_view text) {

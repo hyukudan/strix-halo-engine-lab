@@ -2047,6 +2047,8 @@ std::unique_ptr<CudaEngine> CudaEngine::from_gguf(const std::string& path, const
                 throw std::invalid_argument("qwen35: " + path + " is a converted NVFP4 pack; load it with --turbo-weights converted");
         mark_fp4(opt, specs);
     }
+    if (std::any_of(specs.begin(), specs.end(), [](const auto& t) { return t.fp4; }) && !cc::nvfp4_supported())
+        throw std::invalid_argument("qwen35: NVFP4 weights require a matching native CUDA image for the current device");
     layout(P.W, specs, P.c.layers);
     std::uint64_t tmp_bytes = 0;
     for (const auto& t : specs) if (t.fp4) tmp_bytes = std::max(tmp_bytes, t.src_bytes);
@@ -2111,6 +2113,8 @@ std::uint64_t save_converted_pack(const std::string& path, const std::string& ou
         outs.push_back(std::move(o));
     }
     if (n4 == 0) throw std::runtime_error("save_converted_pack: no NVFP4-eligible tensor (the source must be the BF16 gguf)");
+    if (!cc::nvfp4_supported())
+        throw std::invalid_argument("save_converted_pack: NVFP4 conversion requires a matching native CUDA image");
     outs.push_back({kPackGscaleName, {n4}, 0, n4 * 4, 0});
     gguf::PackWriter w(out_path, path, info, outs);
     std::ifstream in(path, std::ios::binary);

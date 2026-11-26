@@ -126,6 +126,30 @@ void shell_config_tests() {
     fs::remove_all(dir);
 }
 
+void reference_backend_refusals() {
+    struct Case {
+        std::string backend;
+        std::string_view reason;
+    };
+    const Case cases[] = {
+        {"intel", "Pass it after -- for a family that supports it or use a dedicated model reference executable"},
+        {"vulkan", "only exposes the RMSNorm operator reference"},
+        {"metal", "only exposes the RMSNorm operator reference"},
+    };
+    for (const auto& fixture : cases) {
+        std::vector<std::string> args{"serve", "--backend", fixture.backend, "--model", "skeleton"};
+        std::vector<char*> pointers;
+        for (auto& arg : args) pointers.push_back(arg.data());
+        std::ostringstream out, error;
+        const sv::ServiceFactories factories;
+        CHECK(sv::run(static_cast<int>(pointers.size()), pointers.data(), factories, out, error) == 2);
+        CHECK(out.str().empty());
+        CHECK(error.str().find("--backend " + fixture.backend) != std::string::npos);
+        CHECK(error.str().find(fixture.reason) != std::string::npos);
+        CHECK(error.str().find("strix-serve supports hip or cuda") != std::string::npos);
+    }
+}
+
 // strix-serve --device-count N --print-effective-config prints the shared resolver's config for the same query, and its
 // multi_device member is what the replica router admits (one resolver for CLI, server and router).
 void multi_device_parity() {
@@ -332,6 +356,7 @@ void native_tier_placement() {
 int main(int argc, char** argv) {
     CHECK(argc == 2);
     shell_config_tests();
+    reference_backend_refusals();
     multi_device_parity();
     native_handoff();
     native_tier_placement();
