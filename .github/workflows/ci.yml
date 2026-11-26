@@ -123,7 +123,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSTRIX_BACKEND_CPU=ON
             cmake --build build --parallel "$(nproc)"
             # Declare all registered names before execution; this inventory is
             # host coverage only, not native/model qualification.
@@ -161,6 +161,15 @@ jobs:
             echo "::warning title=MiniMax source receipt drift::tests/minimax_route_identity_sources.inc does not match this tree. Audit the new selectors, update the registry, then refresh the receipt."
             cat route-source-audit.log
           fi
+
+      - name: Check the standalone weight-format contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S tests/wfmt -B build/wfmt-host -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/wfmt-host --parallel "$(nproc)" --target strix-wfmt-host-tests
+          ctest --test-dir build/wfmt-host --output-on-failure --no-tests=error \
+            -R '^wfmt\.(contracts|reference|admission|resolve|arithmetic)$'
 
       - name: Configure UMA host lab
         run: cmake -S lab/uma_residency -B build/uma-residency -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -237,7 +246,19 @@ jobs:
             build/Testing/Temporary/LastTest.log
             build/Testing/Temporary/LastTestsFailed.log
           if-no-files-found: warn
-
+  windows-host-smoke:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and test host CPU dispatch with MSVC
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cmake -S . -B build/msvc -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRIX_BACKEND_CPU=ON || exit /b 1
+          cmake --build build/msvc --target strix-cpu-backend-host-tests strix-cpu-routed-expert-tests || exit /b 1
+          ctest --test-dir build/msvc --output-on-failure --no-tests=error -R "^strix-cpu-(backend-host|routed-expert)-tests$"
 
   hip-offline-build:
     needs: changes
@@ -283,12 +304,19 @@ jobs:
                 cmake -S lab/uma_residency -B build/uma-residency-hip-offline -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRIX_UMA_ENABLE_HIP=ON
                 cmake --build build/uma-residency-hip-offline --target strix-uma-hip
 
-                cmake -S . -B build/root-hip-runtime-offline -G Ninja                   -DCMAKE_BUILD_TYPE=Release                   -DSTRIX_ENABLE_HIP_RUNTIME=ON                   -DBUILD_TESTING=ON                   -DSTRIX_FAMILY_QWEN35_HIP=ON
+                cmake -S . -B build/root-hip-runtime-offline -G Ninja \
+                  -DCMAKE_BUILD_TYPE=Release -DSTRIX_ENABLE_HIP_RUNTIME=ON -DBUILD_TESTING=ON \
+                  -DSTRIX_FAMILY_QWEN35_HIP=ON -DSTRIX_FAMILY_GLM5=ON -DSTRIX_FAMILY_MINIMAX=ON \
+                  -DSTRIX_FAMILY_GEMMA4=ON -DSTRIX_GEMMA4_DEVICE_BACKEND=ON \
+                  -DSTRIX_FAMILY_HY4=ON -DSTRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE=ON
                 cmake --build build/root-hip-runtime-offline                   --target strix_hip_runtime strix-hip-decode-token strix-hip-model-residency strix-hip-runtime-launchers-tests strix-hip-moe-route-launcher-tests strix-hip-embedding-launcher-tests strix-hip-hyper-mix-launcher-tests strix-hip-launcher-catalog-tests strix-hip-lm-head-launcher-tests strix-hip-shared-expert-launcher-tests strix-hip-moe-experts-launcher-tests strix-hip-gdn-launcher-tests strix-hip-ple-launcher-tests strix-hip-indexed-attention-launcher-tests strix-hip-model-residency-tests strix-hip-runtime-memory-init-tests
                 cmake --build build/root-hip-runtime-offline --target strix-hip-dense-iu4-cols-probe
                 cmake --build build/root-hip-runtime-offline --target \
                   strix-hip-qwen35-decode strix-hip-qwen35-spec \
-                  strix-deepseek41-serve strix-hip-token-sampling-device-tests
+                  strix-deepseek41-rank strix-deepseek41-serve strix-deepseek41-prefill \
+                  strix_glm5_kernels strix_minimax_msa_hip strix_minimax_moe_opt_hip \
+                  strix-gemma4-decode strix-gemma4-serve strix-hy4-rank strix-serve \
+                  strix-hip-token-sampling-device-tests
                 cmake --build build/root-hip-runtime-offline --target strix-inkling2-mini-hip strix-hip-inkling2-mini-attention-prepare-test strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test strix-hip-inkling2-mini-attention-test strix-hip-inkling2-mini-short-conv-test strix-hip-inkling2-mini-grouped-test strix-hip-inkling2-mini-grouped-rows-test strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
                 cmake -S . -B build/q4k-a8-offline -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRIX_ENABLE_HIP_RUNTIME=ON -DSTRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME=ON
                 cmake --build build/q4k-a8-offline --target strix_q4k_a8_hip_probe strix-hip-decode-token

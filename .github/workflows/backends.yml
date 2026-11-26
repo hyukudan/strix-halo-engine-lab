@@ -28,6 +28,11 @@ on:
       - '.github/workflows/backend-intel.yml'
       - 'src/cuda/**'
       - 'src/cuda_core/**'
+      - 'src/deepseek41/**'
+      - 'src/ds41_*'
+      - 'src/deepseek41_*'
+      - 'apps/cuda_ds41_*'
+      - 'tests/cuda/ds41_*'
       - 'src/qwen35/**'
       - 'src/inkling2/**'
       - 'apps/inkling2_mini*'
@@ -57,12 +62,18 @@ jobs:
       matrix:
         include:
           - mode: CORE
+            arch: '120'
             targets: strix_cuda_core_kernels strix-cuda-qwen35-decode strix-cuda-qwen35-cohort
           - mode: QWEN
+            arch: '120'
             targets: strix-cuda-qwen-serve strix-cuda-qwen-prefill-service strix-cuda-qwen-logits
+          - mode: DS41
+            arch: '89'
+            targets: strix-cuda-ds41-decode strix-cuda-ds41-prefill-service
           # CORE_ONLY returns before the checkpoint, executor and serving targets exist.
           # Compile the resident include order and the K8 regression fixture in the full tree.
           - mode: INKLING
+            arch: '120'
             targets: strix-inkling2-mini-cuda strix-serve strix-k8c-mix-cuda-fixture strix-k10c-resident-embedding-fixture strix-mixlat-cuda-fixture strix-moer-cuda-fixture strix-transition-cuda-fixture strix-cuda-decode-transition-tests
     steps:
       - name: Install build tools
@@ -70,9 +81,10 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake g++ git ninja-build python3
       - uses: actions/checkout@v4
-      - name: Compile CUDA targets for sm_120
+      - name: Compile CUDA targets for sm_${{ matrix.arch }}
         env:
           CUDA_MODE: ${{ matrix.mode }}
+          CUDA_ARCH: ${{ matrix.arch }}
           CUDA_TARGETS: ${{ matrix.targets }}
         run: |
           options=("-DSTRIX_CUDA_${CUDA_MODE}_ONLY=ON")
@@ -83,7 +95,7 @@ jobs:
                 -DSTRIX_MIXLAT_CUDA_FIXTURE=ON -DSTRIX_MOER_CUDA_FIXTURE=ON -DSTRIX_TRANSITION_CUDA_FIXTURE=ON)
           fi
           cmake -S . -B build/backend-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CUDA_ARCHITECTURES=120 "${options[@]}"
+            -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" "${options[@]}"
           read -r -a targets <<< "$CUDA_TARGETS"
           cmake --build build/backend-cuda --parallel 2 --target "${targets[@]}"
 
