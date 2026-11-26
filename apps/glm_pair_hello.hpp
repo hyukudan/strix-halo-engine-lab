@@ -31,7 +31,7 @@ inline bool agree_glm_pair(dist::Transport& transport, const engine::Options& op
         hello.route = strix::glm::record_route_levers(serving ? "http" : "cli", opt.rank, eff.prefill_requested.value,
                                                      eff.prefill, eff.identity.value, opt.max_rows);
         std::uint64_t config = 14695981039346656037ULL;
-        for (const unsigned char value : route) config = (config ^ value) * 1099511628211ULL;
+        for (const char value : route) config = (config ^ static_cast<unsigned char>(value)) * 1099511628211ULL;
         hello.slots = opt.slots;
         hello.context = opt.capacity;
         hello.max_rows = opt.auto_rows ? 0U : opt.max_rows;

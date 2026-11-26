@@ -59,6 +59,7 @@
 #include "glm_auto_rows.hpp"
 #include "strix/env_flags.hpp"
 #include "glm_rank_startup.hpp"
+#include "glm_pair_hello.hpp"
 #include "glm_rank_transport.hpp"
 
 #include "strix/dist/communicator_hip.hpp"
@@ -1253,6 +1254,11 @@ int main(int argc, char** argv) {
                 deployment.resolve_live(opt, *transport);
                 prefix_cache_bytes = deployment.prefix_keep;  // the plan grant (elastic: may be smaller, or 0 = off)
             }
+            const std::uint64_t serving_contract = (serial ? 1U : 0U) | (serve_g2 ? 2U : 0U) |
+                (prefill_chunk_mtp ? 4U : 0U) | (!import_listen.empty() ? 8U : 0U) |
+                (import_dsa_once ? 16U : 0U) | (import_index_tail ? 32U : 0U) | (std::uint64_t{mtp_cycles} << 32U);
+            turbo_prefill_device = rd::agree_glm_pair(*transport, opt, eff, true, opened.direct != nullptr,
+                strix::dist::all_transport_capabilities, 0U, serving_contract, turbo_prefill_device);
             if (!receipt.empty()) std::printf("transport: %s\n", receipt.c_str());
             comm = strix::glm::rank_transport::make_communicator(opt.rank, std::move(transport), std::move(opened.direct), opt.exchange_rows);
             std::printf("connected: rank %u transport %s %.1f s\n", opt.rank, comm->transport_name().c_str(),
@@ -1262,17 +1268,7 @@ int main(int argc, char** argv) {
         ge::Engine eng(opt, comm.get());
         const auto pf_tier = prefill_mode == "gemv" ? strix::glm::pf::TierB::gemv : strix::glm::pf::TierB::wmma;
         rd::PrefillLoad prefill_load{{opt.rank, opt.world, opt.capacity, opt.mtp, prefill_mode == "ref", pf_tier}};
-        bool rows_mode_checked = false;
         const auto lr = prefill_load.load(eng, opt, [&](const ge::mem::LoadAdmission& admission) {
-            // Both ranks must be in the same max-rows mode before the automatic admission's votes (a peer in a fixed mode
-            // would never answer them).
-            if (!rows_mode_checked && comm) {
-                rows_mode_checked = true;
-                std::uint32_t mode = opt.auto_rows ? 1U : 0U, peer_mode = mode;
-                comm->exchange_host(std::as_bytes(std::span{&mode, 1}), std::as_writable_bytes(std::span{&peer_mode, 1}),
-                                    {static_cast<std::uint32_t>(strix::dist::TagKind::raw_slots), 0xFFFFFFFAU, 0U});
-                if (peer_mode != mode) throw std::runtime_error("TP2 ranks resolved different max-rows modes (automatic vs fixed)");
-            }
             prefill_load.margin = std::max(strix::glm::pf::admission_margin_bytes(), admission.margins.ram);
             if (!opt.auto_rows) return opt.max_rows;
             // The CLI's margins: the 8 GiB OS/peer/runtime headroom at both checks.
@@ -1335,7 +1331,7 @@ int main(int argc, char** argv) {
             if (opt.rank == 0)
                 std::printf("rank 0 effective serve-%s\n",
                             serve_prefill_interleave(prefill_mode, opt.max_rows, eng.prefill_pipeline()).describe(prefill_chunk).c_str());
-            hello.route_fingerprint = static_cast<std::uint32_t>(fp ^ (fp >> 32));
+            hello.identity_hash = gs::fnv1a64(&fp, sizeof fp, hello.identity_hash);
             std::printf("rank %u: route fingerprint %016llx\n", opt.rank, static_cast<unsigned long long>(fp));
         }
         hello.capacity = opt.capacity;

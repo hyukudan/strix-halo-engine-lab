@@ -65,6 +65,7 @@
 #include "glm/prefill/glm_pf_load_admission.hpp"
 #include "strix/device_profile.hpp"
 #include "glm_rank_startup.hpp"
+#include "glm_pair_hello.hpp"
 #include "glm_auto_rows.hpp"
 #include "glm_rank_transport.hpp"
 
@@ -444,6 +445,9 @@ int main(int argc, char** argv) {
             auto transport = std::move(opened.host);
             const auto& receipt = opened.receipt;
             if (deployment.provider) deployment.resolve_live(opt, *transport);
+            const auto prompt_and_decode = (std::uint64_t{decode_n} << 32U) | prompt_hash;
+            turbo_prefill_pair = rd::agree_glm_pair(*transport, opt, eff, false, opened.direct != nullptr,
+                strix::dist::all_transport_capabilities, prompt_and_decode, 0U, turbo_prefill_pair);
             if (!receipt.empty()) std::printf("transport: %s\n", receipt.c_str());
             if (xch_kind == "xfer") {  // the module owns the transport; no Communicator (Options::external_exchange)
                 if (opt.spec) throw std::invalid_argument("--xch xfer has no speculative merge yet: use --xch comm with --spec 1");
@@ -498,6 +502,11 @@ int main(int argc, char** argv) {
         if (idx_wmma != 0)
             std::printf("rank %u prefill identity glm-idx-wmma FAST (STRIX_IDX_WMMA=%s, DSA indexer scores on WMMA)\n", opt.rank,
                         strix::attn_core::idx::wmma_mode_name(idx_wmma));
+        if (startup_handshake && mtp_spec_on && (!opt.mtp || !opt.spec || opt.layers != 45 ||
+            (prefill_mode != "ref" && prefill_mode != "gemv"))) {
+            mtp_spec_on = false;
+            std::printf("rank %u mtp-spec: unavailable (head or precondition); using plain decode\n", opt.rank);
+        }
         ge::Engine eng(opt, comm.get());
         // Shared route receipt: the same lever keys as the server (apps/glm_route_levers.hpp).
         (void)strix::glm::record_route_levers("cli", opt.rank, prefill_requested, prefill_mode, ge::identity_mode_name(eng.identity_mode()),
@@ -513,39 +522,6 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("STRIX_GLM_MODEL_FORMAT=fast_i4: exact identities are refused (needs the FAST chunked prefill "
                                         "STRIX_GLM_PF_WMMA=1; no --prefill ref, reference gates, --pf-gate or --idcheck; --tf scoring only)");
         if (xfer_exchange) eng.set_exchange(xfer_exchange);
-        bool startup_agreed = false;
-        auto startup_agree = [&]() {
-            startup_agreed = true;
-            // External Xfer must never bind its stream through a host control merge.
-            if (!startup_handshake) return;
-            const bool eligible = mtp_spec_on && opt.mtp && opt.spec && opt.layers == 45 &&
-                                  (prefill_mode == "ref" || prefill_mode == "gemv");
-            const std::uint32_t packed = eff.kmax | (eff.adaptive ? 1U << 4 : 0U) |
-                ((prefill_mode == "ref" ? 1U : prefill_mode == "gemv" ? 2U : 3U) << 5) |
-                (static_cast<std::uint32_t>(eng.identity_mode()) << 7) |
-                (eff.env.at("STRIX_GLM_SPEC_XCH").value == "xfer" ? 1U << 9 : 0U) |
-                (eng.decode_xfer_enabled() ? 1U << 10 : 0U) |
-                (strix::glm::pf::wmma_x::enabled() ? rd::kPfWmmaConfig : 0U) |  // FAST prefill identity must match on both ranks
-                (eng.model_fast_i4() ? rd::kFastI4Config : 0U) |                 // and the model format (also in the load vote)
-                (strix::glm::pf::attn_wmma::enabled() ? rd::kPfAttnWmmaConfig : 0U) |
-                (strix::glm::pf::kda_wmma::enabled() ? rd::kPfKdaWmmaConfig : 0U) |
-                (strix::glm::pf::mla_wmma::enabled() ? rd::kPfMlaWmmaConfig : 0U) |
-                (strix::glm::pf::idxproj_wmma::enabled() ? rd::kPfIdxProjWmmaConfig : 0U) |
-                (strix::glm::pf::router_wmma::enabled() ? rd::kPfRouterWmmaConfig : 0U) |
-                (idx_wmma << rd::kIdxWmmaShift);                                   // FAST indexer identity, ditto
-            const auto result = rd::startup_agreement(
-                {eligible ? 1U : 0U, packed, opt.max_rows, decode_n,
-                 static_cast<std::uint32_t>(opt.capacity), static_cast<std::uint32_t>(opt.capacity >> 32), opt.slots, prompt_hash},
-                rd::max_rows_auto(eff), startup_handshake,
-                [&](auto* rows, unsigned n, auto& ctl) { eng.exchange()->merge(rows, n, ctl, nullptr); }, &turbo_prefill_pair, opt.rank);
-            rd::agree_max_rows(eff, result.rows);
-            opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
-            mtp_spec_on = result.eligible;
-            rd::agree_drafter_digest(eff.head.mtp_digest, startup_handshake && mtp_spec_on,
-                [&](auto* rows, unsigned n, auto& ctl) { eng.exchange()->merge(rows, n, ctl, nullptr); });
-            if (!mtp_spec_on)
-                std::printf("rank %u mtp-spec: unavailable on at least one rank (head or precondition); using plain decode\n", opt.rank);
-        };
         const auto pf_tier = prefill_mode == "gemv" ? strix::glm::pf::TierB::gemv : strix::glm::pf::TierB::wmma;
         rd::PrefillLoad prefill_load{{opt.rank, opt.world, opt.capacity, opt.mtp, prefill_mode == "ref", pf_tier},
                                     0, 0, pf_before_load, mem_plan};
@@ -567,11 +543,6 @@ int main(int argc, char** argv) {
                             {static_cast<std::uint32_t>(strix::dist::TagKind::raw_slots), 0xFFFFFFFBU, admission.recheck ? 1U : 0U});
                     return peer_fits;
                 }, [&](unsigned rows) {
-                    opt.max_rows = rows;
-                    if (!admission.recheck) {
-                        startup_agree();
-                        return opt.max_rows;
-                    }
                     return rd::recheck_rows(rows, comm != nullptr,
                         [&](auto* proposal, unsigned n, auto& ctl) { eng.exchange()->merge(proposal, n, ctl, nullptr); });
                 });
@@ -615,7 +586,6 @@ int main(int argc, char** argv) {
             std::printf("rank %u: mem-plan ADMITTED (nothing loaded)\n", opt.rank);
             return 0;
         }
-        if (!startup_agreed) startup_agree();
         if (mtp_spec_on && profile)
             std::printf("rank %u mtp-spec: --profile covers plain steps only; skipping decode profile\n", opt.rank);
         if (prefill_mode != "ref" && !pf_before_load) {

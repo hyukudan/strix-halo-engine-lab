@@ -136,18 +136,7 @@ public:
         phases.mark("weights");
         const std::uint32_t dspark_config = 0x4d4d0400U | (static_cast<std::uint32_t>(dspark_prior) << 7) | (static_cast<std::uint32_t>(dspark_mode) << 5) |
                                             (dspark_dir.empty() ? 0U : 16U) | dspark_inflight;
-        if (eng.peer(dspark_config) != dspark_config) {
-            eng.abort("DSpark startup mode / assets / protocol mismatch");
-            throw std::runtime_error("DSpark startup mode / assets / protocol mismatch");
-        }
-        // Shared route receipt: both ranks must have resolved the same numerical route before any product runs.
-        try {
-            const auto route_fp = strix::route::compare_ranks([&](const void* o, void* i, std::size_t n) { eng.exchange_bytes(o, i, n); });
-            std::printf("rank %u: route fingerprint %016llx agreed with the peer\n", opt.rank, static_cast<unsigned long long>(route_fp));
-        } catch (...) { eng.abort("route receipt: numerical-route fingerprint mismatch"); throw; }
-        try {  // FAST prefill profile rows (STRIX_MM_FAST_PREFILL and members): both ranks must resolve the same
-            strix::minimax::defaults::check_peer([&](const void* o, void* i, std::size_t n) { eng.exchange_bytes(o, i, n); });
-        } catch (...) { eng.abort("product profile: MiniMax FAST prefill profile differs between the ranks"); throw; }
+        eng.agree_pair(true, dspark_config);
         std::printf("rank %u: load %.1f s, device used %.1f GiB\n", opt.rank, lr.seconds, lr.device_gib);
         std::fflush(stdout);
         phases.mark("peer-agree");
