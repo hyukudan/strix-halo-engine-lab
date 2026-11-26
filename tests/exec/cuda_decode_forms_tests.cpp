@@ -206,6 +206,41 @@ void screened_head() {
               pass1.grid.shared_bytes == kWidth * 4U, "pass-1 grid follows the plan (one lane)");
     check(compact.grid.blocks[0] == 376U && pass2.grid.blocks[0] == 752U && prep.grid.blocks[0] == 1U &&
               pick.grid.blocks[0] == 1U, "stage grids follow the plan (one lane)");
+    // Bound grid == launched grid for every lane count (a K-row verify window, a cohort) and both head forms (top-1 pick,
+    // runner-up rows pick), at the resident caps the owner measures at load: a strict capture refuses any difference
+    // (q49: the pass-1 bind kept the pre-fold {cap, groups} grid while the launcher folds groups and caps at resident).
+    static std::uint32_t picks[plan::kMaxLanes]{};
+    static strix::exec::RowOut rows_out[plan::kMaxLanes]{};
+    for (const bool runner_up : {false, true})
+        for (unsigned lanes = 1U; lanes <= plan::kMaxLanes; ++lanes)
+            for (const unsigned resident : {0U, 7U, 1128U, 1504U, 3000U}) {
+                auto k = l;
+                k.lanes = lanes;
+                k.pass1_lanes = plan::pass1_lanes(kWidth, lanes, 99U * 1024U);
+                k.runner_up = runner_up;
+                k.pass1_resident = resident;
+                const auto geometry = plan::pass1_grid(k);
+                const auto b1 = decode::bind(decode::ScreenedHeadPass1{k});
+                const auto bp = decode::bind(decode::ScreenedHeadPrep{k});
+                const auto bc = decode::bind(decode::ScreenedHeadCompact{k});
+                const auto b2 = decode::bind(decode::ScreenedHeadPass2{k});
+                const auto bpick = runner_up ? decode::bind(decode::ScreenedHeadPickRows{k, rows_out, nullptr})
+                                            : decode::bind(decode::ScreenedHeadPick{k, picks});
+                check(b1.grid.blocks[0] == geometry.blocks && b1.grid.blocks[1] == 1U && b1.grid.blocks[2] == 1U &&
+                          b1.grid.threads[0] == geometry.threads && b1.grid.shared_bytes == geometry.shared_bytes,
+                      "pass-1 bind is the launcher's folded grid");
+                check(b1.grid.blocks[0] == plan::pass1_blocks(1504U, resident, plan::pass1_groups(lanes, k.pass1_lanes)),
+                      "pass-1 blocks: owner cap, resident wave, whole lane groups");
+                check(bp.grid.blocks[0] == lanes && bc.grid.blocks[0] == 376U && bc.grid.blocks[1] == lanes &&
+                          b2.grid.blocks[0] == 752U && b2.grid.blocks[1] == lanes && b2.grid.threads[0] == 256U &&
+                          bpick.grid.blocks[0] == lanes,
+                      "prep / compact / pass-2 / pick grids are the launcher's");
+            }
+    {
+        auto one = l;
+        one.pass1_resident = 1128U;  // RTX PRO 6000: 188 SMs x 6 pass-1 blocks
+        check(decode::bind(decode::ScreenedHeadPass1{one}).grid.blocks[0] == 1128U, "one lane: one resident wave");
+    }
     auto wide = l;
     wide.lanes = 3U;
     wide.x_stride = kWidth;

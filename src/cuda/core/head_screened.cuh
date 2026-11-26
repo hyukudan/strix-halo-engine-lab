@@ -335,9 +335,11 @@ cudaError_t ensure_pass1_shared(std::size_t bytes) {
 template <unsigned Bits, bool Top2>
 cudaError_t pass1_form(const Launch& a, const Parts& p, unsigned per_group, cudaStream_t stream, bool launch,
                        unsigned* resident = nullptr) {
-    const std::size_t smem = std::size_t{per_group} * a.head.width * sizeof(float);
+    // per_group is a.pass1_lanes (every caller below): the geometry is the bound one (plan::pass1_grid).
+    const auto geometry = plan::pass1_grid(a);
+    const std::size_t smem = geometry.shared_bytes;
     const unsigned groups = plan::pass1_groups(a.lanes, per_group);
-    const dim3 grid(plan::pass1_blocks(a.grids.pass1, a.pass1_resident, groups)), block(plan::kPass1Waves * 32U);
+    const dim3 grid(geometry.blocks), block(geometry.threads);
     const auto run = [&](auto kernel, cudaError_t ready) {
         if (ready != cudaSuccess) return ready;
         if (resident) {  // host query at load: SMs x blocks per SM of this instantiation at this shared size
@@ -377,11 +379,6 @@ cudaError_t pass1_bits(const Launch& a, const Parts& p, unsigned per_group, cuda
 // Lanes per pass-1 block row on this device (0: the width does not fit; the caller keeps the full head).
 inline unsigned pass1_lanes(unsigned width, unsigned lanes, int device = 0) {
     return plan::pass1_lanes(width, lanes, detail::shared_limit(device));
-}
-
-// Shared bytes of one pass-1 block of a launch.
-constexpr std::size_t pass1_shared_bytes(const Launch& a) noexcept {
-    return std::size_t{a.pass1_lanes} * a.head.width * sizeof(float);
 }
 
 // ---- The five stages (one kernel launch each). `a` must satisfy plan::launch_valid; enqueue() checks it once. ----

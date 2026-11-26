@@ -231,6 +231,18 @@ struct Launch {
     unsigned pass1_resident = 0U;
 };
 
+// The pass-1 launch of `a`: a 1-D grid (lane groups folded into the block index, pass1_blocks) of kPass1Waves warps,
+// each block staging pass1_lanes rows of x. The one source of that geometry: the CUDA launcher enqueues it and the exec
+// catalog binds it (a strict graph capture compares the two node by node).
+struct Pass1Grid {
+    unsigned blocks, threads;
+    std::size_t shared_bytes;
+};
+inline Pass1Grid pass1_grid(const Launch& a) noexcept {
+    return {pass1_blocks(a.grids.pass1, a.pass1_resident, pass1_groups(a.lanes, a.pass1_lanes)), kPass1Waves * 32U,
+            std::size_t{a.pass1_lanes} * a.head.width * sizeof(float)};
+}
+
 constexpr bool pass1_lanes_valid(unsigned per_group, unsigned lanes) noexcept {
     unsigned cover = 1U;
     while (cover < lanes && cover < kMaxPass1Lanes) cover *= 2U;
