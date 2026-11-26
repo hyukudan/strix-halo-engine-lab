@@ -383,6 +383,10 @@ int main(int argc, char** argv) {
                        screened_head = mini_screened_head(options.tier),
                        verify_rows = mini_verify_rows(options.tier)](const serve::SerialGenerationLoad& load) {
             const strix::weight::WeightLoadExtent extent{load.positions, 1U};
+            if (const auto decline = mini_lowbit_row_decline(options.tier.profile, weight_options, kMiniWeightBackend,
+                                                             extent);
+                !decline.empty())
+                std::cerr << "strix-lowbit-pack/v2 declined (" << decline << "); using incumbent weights\n";
             loaded = resolve_weights(extent);
             const auto moe_w4a4 = mini_prompt_moe(weight_options, loaded->scope.device_class,
                                                  load.prompt_tokens, false, &options.tier);

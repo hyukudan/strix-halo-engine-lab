@@ -27,11 +27,11 @@ inline MiniServeCohort make_mini_device_cohort(
     // budget: lane-banded gains do not select).
     const weight::WeightLoadExtent extent{opt.context, opt.slots ? rows : 0U};
     auto weight_options = opt.weight_options;
-    const bool calibrated_row = mini_server_calibrated_row_allowed(weight_options.lowbit_turbo, opt.served_cli_route);
-    if (weight_options.lowbit_turbo && !calibrated_row) {
-        weight_options.lowbit_turbo = false;
-        std::cerr << "strix-lowbit-pack/v2 declined (held-back served prompt route); using incumbent weights\n";
-    }
+    // Any served route admits the calibrated row: its decoder serves prompts emits-first (mini_served_prompt_emits_first),
+    // so the final prompt token stays a BF16 prefill row. Outside the row's measured regime the incumbent loads.
+    if (const auto decline = mini_lowbit_row_decline(opt.tier, weight_options, kMiniWeightBackend, extent);
+        !decline.empty())
+        std::cerr << "strix-lowbit-pack/v2 declined (" << decline << "); using incumbent weights\n";
     const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, weight_options, extent);
     auto weights = resolve_mini_resident_weight_load(opt.tier, weight_options, scope.view(), extent);
     if (!(scope.checkpoint == weight::Digest256{})) std::cerr << weight::weight_load_scope_receipt(scope.view()) << '\n';
@@ -44,12 +44,15 @@ inline MiniServeCohort make_mini_device_cohort(
 #endif
     auto cohort = load_mini_weights(opt.checkpoint, weights, opt.tier, weight_options, scope.view(), extent, [&](MiniLowBitRows lowbit) {
         const bool calibrated = lowbit.admitted != nullptr;
+        const bool decode_only_pack = lowbit.decode_only;
         // The served route is admitted before constructing the decoder. The same load transaction
         // checks capacity and allocates the slots before publishing the cohort.
         auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
             opt.served_cli_route && kMiniPackedDecodeDefault, MiniResidentBackend::default_step_graphs,
             weights.roles(), 0U, false, rows, opt.served_cli_route ? opt.prefill_tail : 0U,
             opt.experts_nvfp4, opt.controller_one_plane, opt.served_cli_route, std::move(lowbit));
+        if (!mini_decode_only_pack_route_ok(calibrated, decode_only_pack, decoder->prefill_emits_first()))
+            throw std::logic_error("calibrated decode image on the held-back served prompt route");
         levers = configure_mini_decoder(*decoder, opt.moe_w4a4, opt.combine_image, opt.prepared_round_fold,
                                         opt.attn_projected_bias, opt.screened_head, opt.verify_rows);
         slot_bytes = decoder->slot_bytes();
