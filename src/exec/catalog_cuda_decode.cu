@@ -1098,14 +1098,15 @@ KernelBinding bind(const GroupedProjection& a) {
     if (!grouped_mma::fits(a.args) || a.args.max_tile_rows != 1U ||
         (a.format != MatrixFormat::nvfp4 && a.format != MatrixFormat::mxfp8))
         throw std::invalid_argument("invalid CUDA R1 grouped projection");
-    const auto shape = grouped_mma::projection_launch< ::strix::cuda::core::native_mma::kDecodeMBlocks,
-                                                       grouped_mma::kDecodeOutputs>(a.args);
+    const auto choice = grouped_mma::choose_projection(a.args, a.format == MatrixFormat::nvfp4, grouped_mma::detail::shared_budget);
+    if (choice.kind == grouped_mma::ProjectionKind::unsupported)
+        throw std::invalid_argument("unsupported CUDA R1 grouped projection schedule");
     const auto leaf = a.format == MatrixFormat::nvfp4 ? group_nvfp4 : group_mxfp8;
     // The R1 recipe allocates one tile per routed assignment. Count its planned logical work.
     const auto cost = packed_projection_cost(a.format, a.args.inputs, a.args.outputs, a.args.count,
         std::uint64_t{a.args.count} * a.args.inputs * sizeof(std::uint16_t),
         std::uint64_t{a.args.count} * a.args.outputs * sizeof(float));
-    return bind_leaf(leaf, shape, a, cost);
+    return bind_leaf(leaf, choice.geometry, a, cost);
 }
 
 KernelBinding bind(const GroupedActivation& a) {
