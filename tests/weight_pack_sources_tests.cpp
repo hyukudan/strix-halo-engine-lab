@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 
@@ -162,7 +163,55 @@ void mixed_group() {
     require(!grouped::project(plan, views, grouped::InputRows::token, 128, 2, x, y) && y == reference,
             "bad mixed format modified output");
     pack = wei::LowbitPack{};
+    staged = {};
     std::filesystem::remove(file);
+
+    const auto checked = "grouped-checked.lp";
+    {
+        wei::LowbitPackWriter writer(digest, checked, names, wei::PackVersion::checked);
+        for (std::size_t e = 0; e < names.size(); ++e)
+            writer.add(std::string(names[e]), formats[e], 2, 128, digest, images[e].packed, images[e].header,
+                       {e == 0 ? "unused" : "projection", "fixture@1", {}});
+        require(bool(writer.finish()), "publish checked mixed pack");
+    }
+    {
+        // The inactive role is damaged before opening. Loading the hot set and projecting
+        // repeated routed experts from a different role still succeed.
+        require(bool(wei::LowbitPack::open_host(checked, digest, pack)), "checked pack admission");
+        const auto cold = pack.entries()[0].offset;
+        pack = {};
+        {
+            std::fstream out(checked, std::ios::in | std::ios::out | std::ios::binary);
+            out.seekp(static_cast<std::streamoff>(cold));
+            out.put(static_cast<char>(images[0].packed[0] ^ 1U));
+            require(bool(out), "damage inactive role");
+        }
+        require(bool(wei::LowbitPack::open_host(checked, digest, pack)), "lazy pack ignores untouched payload at open");
+        require(pack.role_entries("projection").size() == 2U && pack.role_entries("unused").size() == 1U,
+                "role index misses entries");
+        grouped::ExpertBank bank(pack, "projection", {"cold", "hot", "wide"});
+        const std::array<std::uint64_t, 3> hot_counts{0, 15, 10};
+        require(bool(bank.warm(hot_counts, 1)), "warm hottest expert");
+        grouped::MatrixView one, two;
+        require(bool(bank.load(1, one)) && bool(bank.load(1, two)) &&
+                one.bytes.data() == two.bytes.data() && reinterpret_cast<std::uintptr_t>(one.bytes.data()) % 4096U == 0,
+                "expert views reuse the same page-aligned address");
+        const std::array<std::uint32_t, 6> active{1, 2, 2, 1, 2, 1};
+        const auto routed = strix::moe_core::build_expert_major_plan({3, 2, 3, 0, active}, route_weights, 1);
+        std::array<grouped::MatrixView, 3> direct{};
+        direct[1] = one;
+        require(bool(bank.load(2, direct[2])), "load second routed expert");
+        require(bool(grouped::project(routed, direct, grouped::InputRows::token, 128, 2, x, y)),
+                "direct packed projection");
+        const auto expected = y;
+        require(bool(grouped::project(routed, bank, grouped::InputRows::token, 128, 2, x, y)) && y == expected,
+                "lazy packed projection differs from direct projection");
+        wei::MappedBytes bad;
+        require(!pack.map_tensor("cold", bad) && bad.bytes.empty() && !pack.verify_identity(),
+                "payload integrity did not reject the damaged inactive role on demand");
+    }
+    pack = {};
+    std::filesystem::remove(checked);
 }
 }  // namespace
 

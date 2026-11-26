@@ -22,6 +22,8 @@ namespace strix::inkling2::cli {
 struct Options {
     serve::SerialGenerationOptions generation;
     const char* dspark{};
+    const char* host_pack{};
+    const char* host_pack_hot{};
     bool dspark_off{};  // --dspark off: no drafter, not even the model's sidecar under auto
     const char* gate_manifest{};
     const char* gate_out{};
@@ -48,7 +50,13 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
                 options.dspark = options.dspark_off ? nullptr : file;
                 return true;
             }
-            if (!native) return false;
+            if (!native) {
+                if (argument != "--host-pack" && argument != "--host-pack-hot") return false;
+                auto& path = argument == "--host-pack" ? options.host_pack : options.host_pack_hot;
+                if (path) throw std::invalid_argument("duplicate " + std::string(argument));
+                path = value();
+                return true;
+            }
             if (argument == "--step-graph" || argument == "--no-step-graph")
                 options.step_graphs = argument == "--step-graph";
             else if (argument == "--gate-manifest") options.gate_manifest = value();
@@ -81,6 +89,16 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
                  generation.sampling_requested))
         throw std::invalid_argument("gate mode takes no prompt, --tokenize, --generate, --logits or sampling options");
     options.tier = resolve_mini_profile(options.weights, native && !generation.tokenize_file);
+    if (options.host_pack_hot && !options.host_pack)
+        throw std::invalid_argument("--host-pack-hot requires --host-pack");
+    if (options.host_pack) {
+        if ((options.tier.profile != profile::Name::fast && options.tier.profile != profile::Name::turbo) ||
+            generation.tokenize_file)
+            throw std::invalid_argument("--host-pack requires CPU generation with --profile fast or --profile turbo");
+        if (generation.logits && std::filesystem::exists(generation.logits) && std::filesystem::exists(options.host_pack) &&
+            std::filesystem::equivalent(generation.logits, options.host_pack))
+            throw std::invalid_argument("logits output must differ from the host pack");
+    }
     // The speculation row (kMiniSpeculation) is the default of a generating run; an explicit --speculation wins.
     if (!generation.speculation_requested && !gate && !generation.tokenize_file && family.supports_speculation &&
         mini_speculation(options.tier))

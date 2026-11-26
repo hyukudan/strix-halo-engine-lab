@@ -1,0 +1,29 @@
+{
+  "schema": "strix-pack-convert/v1",
+  "roles": {
+    "expert_gate_up": "sp4",
+    "expert_down": "sp4",
+    "attention": "sp4",
+    "controller_down": "sp4",
+    "head": "sp4",
+    "embedding": "keep",
+    "router": "keep",
+    "vision": "keep"
+  },
+  "rules": [
+    {"role": "expert_gate_up", "prefix": "model.llm.layers.", "suffix": ".mlp.experts.w13_weight", "layout": "expert-interleaved"},
+    {"role": "expert_down", "prefix": "model.llm.layers.", "suffix": ".mlp.experts.w2_weight", "layout": "expert-contiguous"},
+    {"role": "attention", "prefix": "model.llm.layers.", "suffix": ".attn.wq_du.weight"},
+    {"role": "attention", "prefix": "model.llm.layers.", "suffix": ".attn.wk_dv.weight"},
+    {"role": "attention", "prefix": "model.llm.layers.", "suffix": ".attn.wv_dv.weight"},
+    {"role": "attention", "prefix": "model.llm.layers.", "suffix": ".attn.wo_ud.weight"},
+    {"role": "attention", "prefix": "model.llm.layers.", "suffix": ".attn.wr_du.weight"},
+    {"role": "attention", "prefix": "model.llm.layers.", "suffix": ".attn.gate_attn.weight"},
+    {"role": "controller_down", "prefix": "model.llm.layers.", "suffix": ".down_weight"},
+    {"role": "head", "suffix": "model.llm.unembed.weight"},
+    {"role": "embedding", "suffix": "model.llm.embed.weight", "reason": "source row-gather contract"},
+    {"role": "router", "prefix": "model.llm.layers.", "suffix": ".mlp.gate.weight", "reason": "retain routing precision"},
+    {"role": "router", "prefix": "model.llm.layers.", "suffix": ".mlp.gate.bias", "reason": "retain routing precision"},
+    {"role": "vision", "prefix": "model.visual.", "reason": "vision is outside the text pack"}
+  ]
+}

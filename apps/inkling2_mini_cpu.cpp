@@ -17,8 +17,9 @@ namespace {
 
 class CpuCliDecoder final : public strix::serve::SerialGenerationDecoder {
 public:
-    CpuCliDecoder(const std::string& checkpoint, unsigned max_positions, const char* dspark = nullptr)
-        : decoder_(checkpoint, max_positions, dspark) {}
+    CpuCliDecoder(const std::string& checkpoint, unsigned max_positions, const char* dspark = nullptr,
+                  const char* host_pack = nullptr, const char* hot_routes = nullptr)
+        : decoder_(checkpoint, max_positions, dspark, host_pack, hot_routes) {}
 
     unsigned prefill(std::span<const unsigned> prompt, std::span<float> logits) override {
         unsigned next{};
@@ -99,7 +100,7 @@ int main(int argc, char** argv) {
 #endif
     if (argc < 3) {
         std::cerr << "usage: strix-inkling2-mini-cpu MODEL.safetensors TOKEN [TOKEN ...] [--profile exact|fast|turbo] [--generate N] [--logits FILE]"
-                     " [--speculation off|auto|verify|lookup] [--dspark FILE] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed N]\n";
+                     " [--speculation off|auto|verify|lookup] [--dspark FILE] [--host-pack PACK] [--host-pack-hot JSON] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed N]\n";
         return 2;
     }
     try {
@@ -107,10 +108,12 @@ int main(int argc, char** argv) {
 #if defined(STRIX_INKLING2_MEDIA)
         family.media = cli::mini_media_opener(options.tier, std::cerr);  // image recipe: this run's resolution
 #endif
-        if (const auto* dspark = options.dspark) {
-            family.load = [dspark](const serve::SerialGenerationLoad& load) {
-                return std::make_unique<CpuCliDecoder>(load.checkpoint, load.positions, dspark);
+        if (options.dspark || options.host_pack) {
+            family.load = [dspark = options.dspark, pack = options.host_pack, hot = options.host_pack_hot]
+                (const serve::SerialGenerationLoad& load) {
+                return std::make_unique<CpuCliDecoder>(load.checkpoint, load.positions, dspark, pack, hot);
             };
+            if (options.host_pack) std::cerr << "weight_status host-pack/v3 explicit lossy CPU projection\n";
         }
         serve::run_serial_generation(argv[1], std::move(options.generation), family, std::cout,
             [&] { cli::write_profile(options.tier, std::cerr, false); });

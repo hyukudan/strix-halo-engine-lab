@@ -79,22 +79,23 @@ struct LowRankGateWeights {
 
 // A low-rank gate consumes the independently RMS-normalized current and message rows. Its
 // forget and gain projections act on the same latent, and the gate mixes the original rows.
-// Supply BF16 weights widened to FP32. BF16 mode rounds the down input and result to
-// BF16 nearest-even while accumulating the dot in FP32. The forget/gain path stays FP32.
-[[nodiscard]] inline std::vector<float> apply_low_rank_gate(std::span<const float> current,
-                                                            std::span<const float> message,
-                                                            const LowRankGateWeights& weights, float epsilon,
-                                                            DownProjectionPrecision precision) {
+// BF16 mode rounds the down input and result to BF16 nearest-even. The callback writes
+// one FP32 output per rank row, and the forget/gain path stays FP32.
+template <class ProjectDown>
+[[nodiscard]] inline std::vector<float> apply_low_rank_gate_with(std::span<const float> current,
+                                                                 std::span<const float> message,
+                                                                 std::span<const float> forget_weights,
+                                                                 std::span<const float> gain_weights, float epsilon,
+                                                                 DownProjectionPrecision precision,
+                                                                 ProjectDown&& project) {
     if (current.empty() || current.size() != message.size() ||
         current.size() > std::numeric_limits<unsigned>::max() ||
         current.size() > std::numeric_limits<std::size_t>::max() / 2) {
         throw std::invalid_argument("invalid low-rank gate input dimensions");
     }
     const auto width = static_cast<unsigned>(current.size());
-    const std::size_t input_width = 2 * current.size();
-    const std::size_t rank = weights.forget.size() / width;
-    if (rank == 0 || weights.forget.size() % width != 0 || weights.gain.size() != weights.forget.size() ||
-        weights.down.size() % input_width != 0 || weights.down.size() / input_width != rank) {
+    const std::size_t rank = forget_weights.size() / width;
+    if (rank == 0 || forget_weights.size() % width != 0 || gain_weights.size() != forget_weights.size()) {
         throw std::invalid_argument("invalid low-rank gate weight dimensions");
     }
 
@@ -107,17 +108,24 @@ struct LowRankGateWeights {
     std::transform(normalized.begin(), normalized.end(), normalized.begin(), cast_down);
 
     std::vector<float> latent(rank);
-    for (std::size_t i = 0; i < rank; ++i) {
-        latent[i] = cast_down(dot_f32(weights.down.subspan(i * input_width, input_width), normalized));
-    }
+    project(std::span<const float>(normalized), std::span<float>(latent));
+    std::transform(latent.begin(), latent.end(), latent.begin(), cast_down);
 
     std::vector<float> output(width);
     for (std::size_t i = 0; i < width; ++i) {
-        const float forget = std::tanh(dot_f32(weights.forget.subspan(i * rank, rank), latent));
-        const float gain = std::tanh(dot_f32(weights.gain.subspan(i * rank, rank), latent));
+        const float forget = std::tanh(dot_f32(forget_weights.subspan(i * rank, rank), latent));
+        const float gain = std::tanh(dot_f32(gain_weights.subspan(i * rank, rank), latent));
         output[i] = (1.0F - forget) * current[i] + gain * message[i];
     }
     return output;
+}
+
+[[nodiscard]] inline std::vector<float> apply_low_rank_gate(std::span<const float> current,
+                                                            std::span<const float> message,
+                                                            const LowRankGateWeights& weights, float epsilon,
+                                                            DownProjectionPrecision precision) {
+    return apply_low_rank_gate_with(current, message, weights.forget, weights.gain, epsilon, precision,
+        [&](std::span<const float> input, std::span<float> output) { linear_reference(weights.down, input, output); });
 }
 
 } // namespace strix::core::residual_reference

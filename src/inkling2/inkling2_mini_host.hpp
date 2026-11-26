@@ -15,7 +15,8 @@ namespace strix::inkling2 {
 // arithmetic failure during a step, the session is invalid and must be reopened.
 class MiniHostDecoder final : public spec::VerifyTarget {
 public:
-    MiniHostDecoder(const std::string& checkpoint_path, unsigned max_positions, const char* dspark = nullptr);
+    MiniHostDecoder(const std::string& checkpoint_path, unsigned max_positions, const char* dspark = nullptr,
+                    const char* host_pack = nullptr, const char* hot_routes = nullptr);
     ~MiniHostDecoder() override;
 
     MiniHostDecoder(const MiniHostDecoder&) = delete;

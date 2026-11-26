@@ -122,15 +122,21 @@ private:
         if (visit.pass == 0) return mini_rms_norm(raw, scale);
 
         const auto base = std::string("controllers.") + std::string(controller) + ".";
-        const auto down = backend_.parameter(mini_layer_parameter(visit.physical_layer, base + "down_weight"),
-                                             2U * kHiddenWidth * kControllerRank);
+        const auto down_name = mini_layer_parameter(visit.physical_layer, base + "down_weight");
         const auto forget = backend_.parameter(mini_layer_parameter(visit.physical_layer, base + "forget_weight"),
                                                kHiddenWidth * kControllerRank);
         const auto gain = backend_.parameter(mini_layer_parameter(visit.physical_layer, base + "gain_weight"),
                                              kHiddenWidth * kControllerRank);
-        const auto gated = ref::apply_low_rank_gate(raw, messages_.value().message(visit, path),
-                                                    {down, forget, gain}, 1e-6F,
-                                                    ref::DownProjectionPrecision::bf16);
+        const auto down = [&](std::span<const float> x, std::span<float> y) {
+            if constexpr (requires { backend_.linear("controller_down", down_name, x, y); }) {
+                backend_.linear("controller_down", down_name, x, y);
+            } else {
+                core::linear_reference(backend_.parameter(down_name, x.size() * y.size()), x, y);
+            }
+        };
+        const auto gated = ref::apply_low_rank_gate_with(raw, messages_.value().message(visit, path),
+                                                         forget, gain, 1e-6F,
+                                                         ref::DownProjectionPrecision::bf16, down);
         return mini_rms_norm(gated, scale);
     }
 

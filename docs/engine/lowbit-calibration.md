@@ -1,5 +1,7 @@
 # Calibrated low-bit packs
 
+For explicit host conversion and integrity checks, see [Strix packs](strix-pack.md).
+
 The low-bit resident row storages `strix.q4_g64` and `strix.q6_g64` (`include/strix/weight/host_lowbit.hpp`) are
 normally produced at load time from BF16 matrices: one FP16 scale per 64 weights, chosen by a clip search on the
 weights alone, then round-to-nearest codes. A calibrated pack holds the same storages for selected matrices, coded

@@ -38,7 +38,7 @@ endif()
 set(STRIX_PACKAGE_CORE_TARGETS strix-serve strix-skeleton-serve strix-memory-plan strix-model-describe
     strix-qwen-chain-plan strix-deepseek41-expert-server)
 set(STRIX_PACKAGE_TOOLS_TARGETS strix strix-inspect-gguf strix-tokenize strix-model-manifest strix-deepseek41-inspect
-    strix-deepseek41-model-describe strix-ds41-prepare-load strix-gemma4-tokenize)
+    strix-deepseek41-model-describe strix-ds41-prepare-load strix-gemma4-tokenize strix-pack strix-lowbit-pack-plan strix-lowbit-calib-pack)
 set(STRIX_PACKAGE_HIP_TARGETS strix-hip-decode-token strix-deepseek41-rank strix-deepseek41-serve
     strix-deepseek41-prefill strix-deepseek41-prefix strix-deepseek41-batch strix-deepseek41-pipeline-front
     strix-deepseek41-dspark-rank strix-ds41-prefill-pair strix-minimax-rank strix-minimax-serve strix-glm5-rank
@@ -125,6 +125,8 @@ endforeach()
 # ---- data and docs --------------------------------------------------------------------------------------------
 install(DIRECTORY "${_strix_pkg_src}/models/" DESTINATION "${CMAKE_INSTALL_DATADIR}/strix/models" COMPONENT core
     FILES_MATCHING PATTERN "*.toml")
+install(FILES "${_strix_pkg_src}/examples/inkling2-mini-pack.json" "${_strix_pkg_src}/examples/ernie-pack-description.json"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/strix/examples" COMPONENT tools)
 install(DIRECTORY "${_strix_pkg_src}/examples/skeleton_engine/models/"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/strix/examples/skeleton_engine/models" COMPONENT core
     FILES_MATCHING PATTERN "*.toml")

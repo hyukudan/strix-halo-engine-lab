@@ -77,6 +77,23 @@ std::uint64_t strixpack_matrix_bytes(FormatId format, std::uint64_t rows, std::u
     return geometry.bytes;
 }
 
+std::vector<PackRouteCount> pack_route_counts(const Json& routes) {
+    std::set<ExpertKey> seen;
+    std::vector<PackRouteCount> result;
+    for (const auto& row : routes.as_array()) {
+        const auto& fields = row.as_array();
+        if (fields.size() != 3) throw std::invalid_argument("expected routes as [layer, expert, count]");
+        PackRouteCount count{nonnegative(fields[0]), nonnegative(fields[1]), nonnegative(fields[2])};
+        if (!seen.emplace(count.layer, count.expert).second) throw std::invalid_argument("duplicate expert route count");
+        result.push_back(count);
+    }
+    std::ranges::sort(result, [](const PackRouteCount& a, const PackRouteCount& b) {
+        if (a.count != b.count) return a.count > b.count;
+        return ExpertKey{a.layer, a.expert} < ExpertKey{b.layer, b.expert};
+    });
+    return result;
+}
+
 PackPlan plan_strix_pack(const Json& description, FormatId cold, std::uint64_t hot_limit,
                         std::uint64_t budget, std::uint64_t reserve) {
     if (required(description, "schema").as_string() != "strix-pack-model/v1" || budget < reserve ||
@@ -98,13 +115,8 @@ PackPlan plan_strix_pack(const Json& description, FormatId cold, std::uint64_t h
             emit(required(tensor, "name").as_string(), {}, nonnegative(required(tensor, "bytes")));
     std::map<ExpertKey, std::uint64_t> routes;
     if (const auto* counts = description.find("routes"))
-        for (const auto& row : counts->as_array()) {
-            const auto& fields = row.as_array();
-            if (fields.size() != 3) throw std::invalid_argument("expected routes as [layer, expert, count]");
-            const ExpertKey key{nonnegative(fields[0]), nonnegative(fields[1])};
-            if (!routes.emplace(key, nonnegative(fields[2])).second)
-                throw std::invalid_argument("duplicate expert route count");
-        }
+        for (const auto& count : pack_route_counts(*counts))
+            routes.emplace(ExpertKey{count.layer, count.expert}, count.count);
 
     std::vector<Promotion> candidates;
     const auto* groups = description.find("expert_groups");

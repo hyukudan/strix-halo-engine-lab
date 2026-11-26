@@ -10,13 +10,17 @@
 #include "inkling2_mini_dspark_reference.hpp"
 #include "inkling2_mini_moe_reference.hpp"
 #include "inkling2_mini_state.hpp"
+#include "moe_core/grouped_strixpack.hpp"
 #include "strix/serial_request.hpp"
+#include "strix/serve/json.hpp"
+#include "strix/weight/pack_plan.hpp"
 #include "strix/session/growing_visit_checkpoint.hpp"
 
 #include <bit>
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <fstream>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -32,13 +36,18 @@ std::string text_parameter(std::string_view suffix) {
     return "model.llm." + std::string(suffix);
 }
 
+namespace grouped = moe_core::grouped_strixpack;
+
 using VerifyWindow = session::GrowingVisitWindow<MiniCacheTraits, float>;
 
 }  // namespace
 
 struct MiniHostDecoder::Impl {
-    Impl(const std::string& path, unsigned capacity, const char* dspark_path) : cache_plan(capacity, 1U) {
+    Impl(const std::string& path, unsigned capacity, const char* dspark_path, const char* host_pack,
+         const char* hot_routes) : cache_plan(capacity, 1U) {
         require_checkpoint(weights.open(path));
+        if (host_pack) bind_pack(host_pack);
+        if (hot_routes) warm_pack(hot_routes);
         if (dspark_path) {
             if (capacity > kMaxContext - MiniDSparkCheckpoint::block + 1U)
                 throw std::invalid_argument("DSpark needs room for a complete block at the context limit");
@@ -48,6 +57,84 @@ struct MiniHostDecoder::Impl {
             chain.emplace(MiniDSparkReference::policy(), *dspark);
             tap_row.resize(tap_elements);
         }
+    }
+
+    void bind_pack(const char* path) {
+        const auto checkpoint = weights.find("model.llm.embed.weight")->payload.source;
+        weight::Digest256 digest{};
+        require_checkpoint(weight::digest_slice({checkpoint, {0, checkpoint->size()}}, digest));
+        require_checkpoint(weight::LowbitPack::open_host(path, digest, pack));
+        if (pack.version() != weight::PackVersion::checked)
+            throw std::invalid_argument("--host-pack requires Strix pack v3");
+        bool selected = false;
+        for (auto role : {"attention", "head", "controller_down"})
+            selected = selected || !pack.role_entries(role).empty();
+        for (unsigned layer = 0; layer < kPhysicalLayers; ++layer) {
+            for (const auto projection : {MiniExpertProjection::gate_up, MiniExpertProjection::down}) {
+                const auto bank_name = mini_expert_slab_names(layer, projection).codes;
+                const auto* role = projection == MiniExpertProjection::gate_up ? "expert_gate_up" : "expert_down";
+                if (!pack.entry(weight::packed_expert_name(bank_name, 0))) continue;
+                std::vector<std::string> names;
+                names.reserve(kExperts);
+                const auto geometry = mini_expert_geometry(projection);
+                for (unsigned expert = 0; expert < kExperts; ++expert) {
+                    auto name = weight::packed_expert_name(bank_name, expert);
+                    const auto* entry = pack.entry(name);
+                    if (!entry || entry->coding.role != role || entry->columns != geometry.inputs ||
+                        entry->rows != geometry.outputs || !entry->sp_header)
+                        throw std::invalid_argument("--host-pack has an incomplete or incompatible expert bank: " + name);
+                    names.push_back(std::move(name));
+                }
+                const auto index = projection == MiniExpertProjection::gate_up ? 0U : 1U;
+                expert_banks[layer][index] = std::make_unique<grouped::ExpertBank>(pack, role, std::move(names));
+                selected = true;
+            }
+        }
+        if (!selected) throw std::invalid_argument("--host-pack has no bound Inkling 2 Mini roles");
+    }
+
+    void warm_pack(const char* path) {
+        std::ifstream file(path, std::ios::binary);
+        if (!file) throw std::invalid_argument("cannot read --host-pack-hot route counts");
+        constexpr std::size_t limit = 1U << 20U;
+        std::string text(limit + 1U, '\0');
+        file.read(text.data(), static_cast<std::streamsize>(text.size()));
+        if (!file.eof() || file.bad()) throw std::invalid_argument("--host-pack-hot input exceeds 1 MiB or cannot be read");
+        text.resize(static_cast<std::size_t>(file.gcount()));
+        const auto document = serve::parse_json_unique(text);
+        const auto* routes = document.find("routes");
+        if (!routes) throw std::invalid_argument("--host-pack-hot needs a routes array");
+        const auto ordered = weight::pack_route_counts(*routes);
+        for (const auto& route : ordered)
+            if (route.layer >= kPhysicalLayers || route.expert >= kExperts)
+                throw std::invalid_argument("--host-pack-hot route outside Inkling 2 Mini geometry");
+        for (const auto& route : ordered) {
+            if (!route.count) break;
+            for (const auto& bank : expert_banks[route.layer]) {
+                if (!bank) continue;
+                grouped::MatrixView view;
+                require_checkpoint(bank->load(static_cast<std::size_t>(route.expert), view));
+            }
+        }
+    }
+
+    bool packed_linear(std::string_view role, std::string_view name, std::span<const float> input,
+                       std::span<float> output, std::size_t rows) const {
+        const auto tensor = text_parameter(name);
+        const auto* entry = pack.entry(tensor);
+        if (!entry) return false;
+        if (entry->coding.role != role || entry->rows != rows || entry->columns != input.size())
+            throw std::invalid_argument("incompatible packed role or matrix dimensions for " + tensor);
+        grouped::Matrix matrix;
+        require_checkpoint(matrix.load(pack, tensor));
+        require_checkpoint(grouped::project_row(matrix.view(), input, output));
+        return true;
+    }
+
+    void linear(std::string_view role, std::string_view name, std::span<const float> input,
+                std::span<float> output) const {
+        if (!packed_linear(role, name, input, output, output.size()))
+            core::linear_reference(parameter(name, input.size() * output.size()), input, output);
     }
 
     std::vector<float> parameter(std::string_view name, std::size_t elements, std::size_t first = 0) const {
@@ -94,9 +181,7 @@ struct MiniHostDecoder::Impl {
             if (spec.transpose_for_rows) {
                 core::linear_reference(relative_table, input, output);
             } else {
-                const auto matrix = parameter(mini_layer_parameter(layer, spec.tensor_suffix),
-                                              input.size() * output.size());
-                core::linear_reference(matrix, input, output);
+                linear("attention", mini_layer_parameter(layer, spec.tensor_suffix), input, output);
             }
         };
 
@@ -132,6 +217,13 @@ struct MiniHostDecoder::Impl {
                                  std::span<const float> row, std::span<float> output) {
             const auto projection = kind == strix::moe::ExpertProjection::gate_up
                 ? MiniExpertProjection::gate_up : MiniExpertProjection::down;
+            const auto index = projection == MiniExpertProjection::gate_up ? 0U : 1U;
+            if (auto* bank = expert_banks[layer][index].get()) {
+                grouped::MatrixView view;
+                require_checkpoint(bank->load(expert, view));
+                require_checkpoint(grouped::project_row(view, row, output));
+                return;
+            }
             weight::microscaled::MatrixView view;
             require_checkpoint(weights.expert_matrix(layer, expert, projection, view));
             weight::microscaled::StagedMatrix matrix;
@@ -151,10 +243,12 @@ struct MiniHostDecoder::Impl {
     std::vector<float> logits(std::span<const float> hidden) const {
         constexpr std::size_t rows_per_read = 128;
         std::vector<float> output(kOutputVocabulary);
-        for (std::size_t first = 0; first < output.size(); first += rows_per_read) {
-            const auto rows = std::min(rows_per_read, output.size() - first);
-            const auto matrix = parameter("unembed.weight", rows * kHiddenWidth, first * kHiddenWidth);
-            core::linear_reference(matrix, hidden, std::span<float>(output).subspan(first, rows));
+        if (!packed_linear("head", "unembed.weight", hidden, output, kVocabulary)) {
+            for (std::size_t first = 0; first < output.size(); first += rows_per_read) {
+                const auto rows = std::min(rows_per_read, output.size() - first);
+                const auto matrix = parameter("unembed.weight", rows * kHiddenWidth, first * kHiddenWidth);
+                core::linear_reference(matrix, hidden, std::span<float>(output).subspan(first, rows));
+            }
         }
         mini_round_bf16(output);
         for (float& value : output) {
@@ -210,6 +304,8 @@ struct MiniHostDecoder::Impl {
     }
 
     MiniTextWeights weights;
+    weight::LowbitPack pack;
+    std::array<std::array<std::unique_ptr<grouped::ExpertBank>, 2>, kPhysicalLayers> expert_banks;
     MiniSessionStatePlan cache_plan;
     unsigned frontier = 0;
     bool failed = false;
@@ -221,8 +317,9 @@ struct MiniHostDecoder::Impl {
     std::vector<float> staged_taps;
 };
 
-MiniHostDecoder::MiniHostDecoder(const std::string& path, unsigned max_positions, const char* dspark)
-    : impl_(std::make_unique<Impl>(path, max_positions, dspark)) {}
+MiniHostDecoder::MiniHostDecoder(const std::string& path, unsigned max_positions, const char* dspark,
+                                 const char* host_pack, const char* hot_routes)
+    : impl_(std::make_unique<Impl>(path, max_positions, dspark, host_pack, hot_routes)) {}
 MiniHostDecoder::~MiniHostDecoder() = default;
 
 std::vector<float> MiniHostDecoder::step(unsigned token, bool want_logits) {

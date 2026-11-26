@@ -43,25 +43,40 @@ public:
         if (file == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open " + path);
         LARGE_INTEGER bytes{};
         if (!GetFileSizeEx(file, &bytes) || bytes.QuadPart <= 0) { CloseHandle(file); throw std::runtime_error("empty file " + path); }
-        HANDLE mapping = CreateFileMappingA(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        try { open_handle(file, static_cast<std::uint64_t>(bytes.QuadPart)); }
+        catch (...) { CloseHandle(file); throw; }
         CloseHandle(file);
-        if (!mapping) throw std::runtime_error("cannot map " + path);
-        void* view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
-        CloseHandle(mapping);  // the view keeps the section alive
-        if (!view) throw std::runtime_error("cannot map view of " + path);
-        data_ = static_cast<const std::uint8_t*>(view);
-        size_ = static_cast<std::uint64_t>(bytes.QuadPart);
 #else
         const int fd = ::open(path.c_str(), O_RDONLY);
         if (fd < 0) throw std::runtime_error("cannot open " + path);
         struct stat st{};
         if (::fstat(fd, &st) != 0 || st.st_size <= 0) { ::close(fd); throw std::runtime_error("empty file " + path); }
-        void* view = ::mmap(nullptr, static_cast<std::size_t>(st.st_size), PROT_READ, MAP_SHARED, fd, 0);
+        try { open_handle(fd, static_cast<std::uint64_t>(st.st_size)); }
+        catch (...) { ::close(fd); throw; }
         ::close(fd);
-        if (view == MAP_FAILED) throw std::runtime_error("cannot map " + path);
-        data_ = static_cast<const std::uint8_t*>(view);
-        size_ = static_cast<std::uint64_t>(st.st_size);
 #endif
+    }
+
+    // Borrow an already-open file handle, keeping the mapping independent of its lifetime.
+#if defined(_WIN32)
+    void open_handle(HANDLE file, std::uint64_t size) {
+#else
+    void open_handle(int file, std::uint64_t size) {
+#endif
+        close();
+        if (size == 0 || size > SIZE_MAX) throw std::runtime_error("file exceeds mapping bounds");
+#if defined(_WIN32)
+        HANDLE mapping = CreateFileMappingA(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (!mapping) throw std::runtime_error("cannot create file mapping");
+        void* view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, static_cast<std::size_t>(size));
+        CloseHandle(mapping);
+        if (!view) throw std::runtime_error("cannot map file view");
+#else
+        void* view = ::mmap(nullptr, static_cast<std::size_t>(size), PROT_READ, MAP_SHARED, file, 0);
+        if (view == MAP_FAILED) throw std::runtime_error("cannot map file view");
+#endif
+        data_ = static_cast<const std::uint8_t*>(view);
+        size_ = size;
     }
     void close() noexcept {
         if (!data_) return;

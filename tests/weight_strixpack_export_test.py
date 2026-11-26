@@ -54,6 +54,19 @@ def run(executable, work):
     assert len(report) == 3 and all(len(line.split("\t")) == 8 for line in report)
     assert {line.split("\t")[0] for line in report[1:]} == weights.keys()
 
+    checked = command.copy()
+    checked[checked.index("rtn")] = "importance"
+    subprocess.run(checked + ["--model", "source.safetensors", "--storage", "projection=sp4",
+                              "--out", "checked.bin", "--checked-role", "attention"],
+                   cwd=work, check=True)
+    pack = (work / "checked.bin").read_bytes()
+    assert pack.startswith(b"strix-lowbit-pack/v3 2\n")
+    assert hashlib.sha256(pack[:-32]).digest() == pack[-32:]
+    fit = hashlib.sha256((work / "cal.moments").read_bytes()).digest()
+    expected = hashlib.sha256(b"strix-pack-calibration@1" + fit + struct.pack("<d", 0.01)).hexdigest()
+    for line in pack.split(b"\nend\n", 1)[0].decode().splitlines()[2:]:
+        assert line.split()[12:15] == ["attention", "clip-importance-fixed@1", expected]
+
 
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="strixpack-export-", dir=Path.cwd()) as directory:
