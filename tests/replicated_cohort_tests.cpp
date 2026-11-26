@@ -648,10 +648,16 @@ void run_decoder_pair_failure() {
     }
     follower.thread.join();
     check(thrown.empty(), "pair failure: the decoder loop and close() do not throw (" + thrown + ")");
-    check(first.size() == 2, "pair failure: both lanes of the failed forward return a result");
-    for (const auto& r : first)
-        check(r.finish == "error" && r.error.find("rank 0 verify failed") != std::string::npos,
-              "pair failure: lane " + std::to_string(r.id) + " fails with the verify error (" + r.error + ")");
+    // The verify failure fails the lanes of that forward; a lane still in its prompt then fails its prefill cleanly.
+    check(first.size() == 2, "pair failure: both requests return a result");
+    std::size_t by_verify = 0;
+    for (const auto& r : first) {
+        by_verify += r.error.find("verify: rank 0 verify failed") != std::string::npos ? 1U : 0U;
+        check(r.finish == "error" && (r.error.find("rank 0 verify failed") != std::string::npos ||
+                                      r.error.find("link aborted by an earlier failure") != std::string::npos),
+              "pair failure: request " + std::to_string(r.id) + " fails cleanly (" + r.error + ")");
+    }
+    check(by_verify >= 1, "pair failure: the failed forward's lane carries the verify error");
     check(be0.releases >= 2, "pair failure: rank 0 frees its lanes after the abort");
     check(later.size() == 1 && later[0].finish == "error" &&
               later[0].error.find("link aborted by an earlier failure") != std::string::npos,
@@ -758,10 +764,10 @@ void run_verify_publication_failure() {
     bool closed = false;
     try {
         rep.keepalive();
-    } catch (const std::logic_error&) {
-        closed = true;
-    } catch (const std::runtime_error&) {}
-    check(closed, "verify publication: rank 0 refuses reuse of the replica");
+    } catch (const std::runtime_error& e) {
+        closed = std::string_view(e.what()) == "cohort replica: link aborted by an earlier failure";
+    } catch (const std::logic_error&) {}
+    check(closed, "verify publication: rank 0 refuses reuse of the replica as a backend failure");
 }
 
 void run_follower_abort_allocation_failure() {
