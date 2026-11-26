@@ -253,6 +253,8 @@ std::string measured_reference(const Regime& regime, const Query& q) {
     row.noise = r->noise;
     row.receipt = r->id;
     row.band_bound = true;
+    // A deployment receipt is the timing of its own band: both declared edges are its measured points.
+    row.band_evidence.timed = {r->min_context, r->max_context};
     std::vector rows{row};
     std::deque<std::string> keys;
     (void)bind_band_receipts(rows, arms, keys);
