@@ -72,13 +72,33 @@ struct Regime {
     std::uint64_t prompt_tokens = 0;  // the prompt of this run (an entry point that resolves earlier: the longest it admits)
     std::string_view execution{};     // sp::Regime::execution (caller-owned; empty: no ordinary timing row decides)
 };
-// The 11-25 timing receipt priced the full-model native rank, one GPU, device greedy,
-// capacity 8384, 64 outputs. Both timed arms included a warm-up pass. The width is a schedule within
-// FAST; it does not change the qualified window arithmetic.
+// Legacy rank callers can describe the shape, but cannot match a timed row without a complete execution key.
 inline constexpr std::string_view single_greedy_8k = "hip/rank/single/full/greedy/8384/64";
-inline constexpr std::string_view single_greedy_8k_receipt =
-    "11-25 meas_main/hy4: same prompt and last-position digest; rows 2048 prefill 744.5 and decode 16.96 "
-    "tok/s vs rows 4096 prefill 781.8 and decode 14.25 tok/s; warm prefill + generation 14.718 vs 14.898 s";
+
+struct RankExecution {
+    std::string_view device;  // strix::device::hip_cost_device_identity()
+    std::string_view pack;    // identity of the loaded weight pack
+    std::uint32_t prompt_tokens = 0, context_capacity = 0, generated_tokens = 0, repeat = 1;
+};
+
+// For full-model single-rank device greedy. Other routes must describe their own workload rather than using this key.
+[[nodiscard]] inline std::string rank_execution(const RankExecution& rank, const sp::Inputs& inputs) {
+    if (rank.pack.empty() || rank.generated_tokens == 0) return {};
+    // Route recording and replay change the ordinary greedy workload.
+    for (const auto* key : {"STRIX_MOE_ROUTES_OUT", "STRIX_MOE_ROUTES_IN", "STRIX_MOE_ROUTE_NULL"})
+        if (const char* value = sp::environment(inputs.env, key); value && *value) return {};
+    if (::strix::envcfg::parse_flag(sp::environment(inputs.env, "STRIX_MOE_ROUTE_STATS"), false, EnvFlagMatch::exact))
+        return {};
+    // This flag lives outside the profile table. Use the same parser and default as the HIP forward.
+    const bool decode_fuse = ::strix::envcfg::parse_flag(sp::environment(inputs.env, "STRIX_DECODE_FUSE"), true);
+    const auto warmups = rank.repeat > 1 ? rank.repeat - 1 : 0;
+    const std::string settings = "route=rank/single/full/device-greedy,pack=" + std::string(rank.pack) +
+        ",warmups=" + std::to_string(warmups) + ",decode_fuse=" + (decode_fuse ? "1" : "0");
+    // The request supplies the entire prompt; window width is the variable compared by the schedule lever.
+    return sp::ladder_execution({"hip", rank.device,
+        {rank.prompt_tokens, rank.context_capacity, 1, rank.prompt_tokens, 0, 1, 0, rank.generated_tokens}, settings});
+}
+
 [[nodiscard]] inline Device device_of(std::string_view arch) {  // hipDeviceProp_t::gcnArchName; features after ':' ignored
     return arch.substr(0, arch.find(':')) == "gfx1151" ? Device::gfx1151 : Device::unknown;
 }
@@ -170,7 +190,18 @@ struct Measured {
     Topology topology;
     sp::LadderRow timing;
 };
+// The warm A/B did not resolve the observed variation and lacks a complete device key and logits/state proof.
+// Keep the 4096 FAST schedule until a receipt qualifies the alternate width.
 inline constexpr std::span<const Measured> measured{};
+
+// Last in the ladder chain: the comparison names the entire gated arithmetic it runs over, including its 4096 width.
+// The builtin here is the incumbent width *within* that arithmetic. BASE and the pair use their original routes.
+inline constexpr sp::Lever prompt_window_schedule{
+    .name = "prompt_window_schedule", .env = "", .option = "", .value = {"", "2048", "", ""}, .builtin = "4096",
+    .kind = sp::Kind::exact, .target = "2048-row FAST prefill schedule", .off = "",
+    .source = "same-bit windows in a measured FAST workload",
+    .identity = {{{"4096", "v1"}, {"2048", "v1"}}}, .timed = true,
+};
 
 // Owns the per-regime rows the resolution points into (non-movable: entries hold pointers).
 struct Resolved {
@@ -196,34 +227,30 @@ struct Resolved {
         if (row.topology == regime.topology && !row.timing.incumbent)
             out->ladder.push_back(row.timing);
     constexpr auto fast = static_cast<unsigned>(sp::Name::fast);
-    const bool measured_composition =
-        regime.device == Device::gfx1151 && regime.topology == Topology::one_node &&
-        regime.prompt_tokens == 8192 && regime.execution == single_greedy_8k &&
-        std::ranges::none_of(table, [&](const auto& lever) {
-            return lever.name != "prompt_rows" &&
-                ((!lever.env.empty() && sp::environment(inputs.env, lever.env) != nullptr) ||
-                 std::ranges::any_of(inputs.cli, [&](const auto& setting) { return setting.first == lever.name; }));
-        });
     for (const auto& lever : table) {
         sp::Lever row = lever;
         const auto nominal = lever.value[fast];
-        const bool scheduled = measured_composition && lever.name == "prompt_rows";
-        if (scheduled) row.value[fast] = "2048";
-        const auto* q = qualification(lever.name, row.value[fast], regime, rows);
-        row.ready[fast] = q != nullptr;
-        // A frozen incumbent grant (not the quality row) keeps a cell that already ran before the ladder rule.
+        row.ready[fast] = qualification(lever.name, nominal, regime, rows) != nullptr;
         if (lever.kind != sp::Kind::exact)
             for (const auto& grant : grants)
-                if (!grant.identity.empty() && sp::declared_identity(lever.identity, row.value[fast]) == grant.identity &&
-                    qualification(lever.name, nominal, regime, std::span(&grant.qualified, 1)) != nullptr &&
-                    (!scheduled || (sp::bit_class_member(lever.same_bits, nominal) &&
-                                    sp::bit_class_member(lever.same_bits, row.value[fast])))) {
-                    out->ladder.push_back(sp::incumbent_cell(lever.name, row.value[fast], sp::Name::fast,
-                        scheduled ? single_greedy_8k_receipt : grant.qualified.gate.receipt, grant.identity));
+                if (!grant.identity.empty() && sp::declared_identity(lever.identity, nominal) == grant.identity &&
+                    qualification(lever.name, nominal, regime, std::span(&grant.qualified, 1)) != nullptr) {
+                    out->ladder.push_back(sp::incumbent_cell(lever.name, nominal, sp::Name::fast,
+                                                             grant.qualified.gate.receipt, grant.identity));
                     break;
                 }
         out->rows.push_back(row);
     }
+    auto schedule = prompt_window_schedule;
+    const auto candidate = schedule.value[fast];
+    const auto& arithmetic = table[0];
+    schedule.ready[fast] = regime.topology == Topology::one_node &&
+        sp::last_setting(inputs.cli, arithmetic.name) == nullptr &&
+        sp::bit_class_member(arithmetic.same_bits, schedule.builtin) &&
+        sp::bit_class_member(arithmetic.same_bits, candidate) &&
+        qualification(arithmetic.name, candidate, regime, rows) != nullptr;
+    out->rows.push_back(schedule);
+
     out->engine = engine();
     out->engine.table = std::span<const sp::Lever>(out->rows);
     out->engine.ladder = std::span<const sp::LadderRow>(out->ladder);
@@ -231,6 +258,16 @@ struct Resolved {
     scoped.regime = {sp::Phase::prefill, regime.prompt_tokens, 1,
                      regime.device == Device::unknown ? std::string_view{} : device_name(regime.device), regime.execution};
     out->resolution = sp::resolve(out->engine, scoped);
+    // Export one width. The private schedule cell only replaces a profile-selected, qualified arithmetic width.
+    const auto& window = out->resolution.entries.back();
+    auto& width = out->resolution.entries.front();
+    if (width.status == sp::Status::set && width.value == schedule.builtin && window.value == candidate &&
+        window.status == sp::Status::set) {
+        width.value = window.value;
+        width.ladder = window.ladder;
+        width.ladder_reference = window.ladder_reference;
+    }
+    out->resolution.entries.pop_back();
     for (auto& entry : out->resolution.entries) {
         if (entry.status != sp::Status::pending && entry.status != sp::Status::unqualified) continue;
         std::string where;

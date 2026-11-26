@@ -51,7 +51,6 @@ int main(int argc, char** argv) {
             namespace profile = strix::profile;
             std::string expected_native_tier = "turbo";
             sv::ServiceFactories factories;
-            std::string expected_native_profile = "turbo";
             factories.install("gemma4", {
                 [&expected_native_tier](const sv::ServiceSelection& s) {
                     CHECK(profile::model_preset());

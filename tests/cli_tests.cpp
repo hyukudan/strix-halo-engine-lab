@@ -243,6 +243,8 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
                 require(args == std::vector<std::string>{"--profile", std::string(profile::tier_word(column))},
                         "GLM passes the backend's product profile to the native engine");
             }
+            if (entry.family == "hy4_flash")
+                require(turbo.levers == Name::turbo, "Hy4 TURBO reaches the native TURBO resolver");
             if (entry.family == "inkling2")
                 require(implicit.requested == Name::standard && implicit.levers == Name::standard,
                         "Inkling Mini implicit profile must remain EXACT");
