@@ -245,7 +245,7 @@ raw-getenv src/device/hip_gate_none.cpp 1
 raw-getenv src/device/process_topology.cpp 1
 raw-getenv src/device/topology.cpp 1
 raw-getenv src/device_profile.cpp 1
-raw-getenv src/dist_communicator.cpp 27
+raw-getenv src/dist_communicator.cpp 26
 raw-getenv src/dist_gpu_direct.cpp 5
 raw-getenv src/dist_latency_trace.hpp 1
 raw-getenv src/ds41_dspark_driver.cpp 2
@@ -414,7 +414,7 @@ raw-getenv src/speculative_verify_runtime.cpp 2
 raw-getenv src/token_sampling.cpp 4
 raw-getenv src/vision/embed_cache.cpp 1
 raw-getenv src/vision/reference.cpp 1
-raw-getenv src/xport/channel_impl.hip 8
+raw-getenv src/xport/channel_impl.hip 7
 raw-getenv src/xport/kvshard_channel_hip.hpp 1
 spin-wait src/cpu/core/routed_expert.cpp 1
 spin-wait src/cuda/models/ds41/ds41_prefill_driver.cu 1
