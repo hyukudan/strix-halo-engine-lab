@@ -212,6 +212,7 @@ int main() {
         band.over = {};
         band.band_bound = true;
         band.identity = "v1";
+        band.band_evidence.timed = {8};  // the band's own timing (a band row with no in-band timing matches nothing)
         const auto band_result = run_with(band);
         CHECK(band_result.find("runnable_pending")->ladder.find("applies x1.100") != std::string::npos);
     }

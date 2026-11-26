@@ -1679,6 +1679,7 @@ void minimax_i4_binding() {
 void band_lower_edge() {
     p::LadderRow band{kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1024, 8192, 1, 1, 1.25, 0.02,
                       "r/floor"};
+    band.identity = "v1";
     band.band_bound = true;
     band.band_evidence.timed = {8192, 4096};
     std::array rows{band};
