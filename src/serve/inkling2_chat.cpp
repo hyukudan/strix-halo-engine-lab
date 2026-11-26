@@ -189,14 +189,19 @@ namespace {
 std::string render_request(std::string_view json, bool images) {
     const auto request = parse_request_json(json);
     const Json absent;
-    if (request.is_array()) return render_inkling2_chat(request, absent, absent, images);
+    if (request.is_array()) return render_inkling2_chat(request, absent, inkling2_reasoning_effort(nullptr), images);
     const auto* messages = request.find("messages");
     if (!messages) throw std::invalid_argument("expected a messages array or an object with messages");
     const auto* tools = request.find("tools");
-    const auto* effort = request.find("reasoning_effort");
-    return render_inkling2_chat(*messages, tools ? *tools : absent, effort ? *effort : absent, images);
+    return render_inkling2_chat(*messages, tools ? *tools : absent,
+                                inkling2_reasoning_effort(request.find("reasoning_effort")), images);
 }
 }  // namespace
+
+Json inkling2_reasoning_effort(const Json* requested) {
+    if (requested && !requested->is_null()) return *requested;
+    return Json(std::string(model_data::inkling2_mini::chat::reasoning_effort));
+}
 
 std::string render_inkling2_chat_request(std::string_view json) { return render_request(json, false); }
 

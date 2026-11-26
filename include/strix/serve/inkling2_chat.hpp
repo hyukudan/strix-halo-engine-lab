@@ -18,6 +18,13 @@ extern const BpeTokenizer::HfIdentity inkling2_mini_tokenizer_identity;
 
 inline constexpr std::string_view kInkling2ImagePlaceholder = "<|unused_200054|>";
 
+// The reasoning effort a request renders with: its own reasoning_effort when present and not null, else the model's
+// chat default (models/inkling2-mini.toml [chat] reasoning_effort, "none" = the served effort). The one resolver of the
+// command line (render_inkling2_chat_request) and the server (inkling2_mini_serve.cpp prepare_chat).
+[[nodiscard]] Json inkling2_reasoning_effort(const Json* requested);
+
+// A request body (a messages array, or an object with messages and optional tools / reasoning_effort), rendered with
+// inkling2_reasoning_effort: the command line's --messages file.
 [[nodiscard]] std::string render_inkling2_chat_request(std::string_view json);
 // The same request with images on: image parts (as the shared media layer normalizes them) render the frame.
 [[nodiscard]] std::string render_inkling2_chat_media_request(std::string_view json);

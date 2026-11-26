@@ -248,11 +248,12 @@ private:
                 if ((role && role->is_string() && role->as_string() == "tool") || (calls && calls->size()))
                     throw serve::ChatTemplateError("Inkling serving supports text messages");
             }
-            const auto* effort = body.find("reasoning_effort");
-            if (effort && !effort->is_null() && (!effort->is_string() || effort->as_string() != "none"))
+            // The command line's resolver (request field, else the model's chat default); served: "none" only.
+            const auto effort = serve::inkling2_reasoning_effort(body.find("reasoning_effort"));
+            if (!effort.is_string() || effort.as_string() != "none")
                 throw serve::ChatTemplateError("Inkling serving supports reasoning_effort none");
             serve::ApiChatPrompt prompt;
-            prompt.tokens = tokenizer->encode(render(*messages, {}, serve::Json("none")), true);
+            prompt.tokens = tokenizer->encode(render(*messages, {}, effort), true);
             return prompt;
         };
         config.output_parser = [](const std::string& text, bool, const serve::Json&) {

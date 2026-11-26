@@ -54,6 +54,11 @@ residual_block_layers = 6
 drafter = "mtp.safetensors"
 max_draft_by_live = [7, 0]
 
+# Chat: the reasoning effort of a request that names none, one default for the command line (--messages) and the
+# server (serve::inkling2_reasoning_effort); a request's own reasoning_effort overrides it. "none" = the served effort.
+[chat]
+reasoning_effort = "none"
+
 # Launchers project these columns into the engine's native, gated registry.
 [presets]
 # The unqualified native Inkling Mini CLI runs EXACT; FAST is explicitly opt-in.
