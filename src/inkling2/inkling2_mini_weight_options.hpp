@@ -36,10 +36,12 @@ struct MiniWeightOptions {
 };
 
 // The bindings a qualification key may name: the model's Q8_0 binding (legacy id included), the shared low-bit mixes and
-// the shared head-only low-bit rows (attention BF16), plus attention-only Q8_0.
-inline constexpr std::array<weight::WeightLoadPolicy, 8> kMiniQualifiablePolicies{
+// the shared head-only low-bit rows (attention BF16), plus attention-only Q8_0 and the Strix pack SP4 attention + head
+// row (from a calibrated pack, STRIX_LOWBIT_PACK).
+inline constexpr std::array<weight::WeightLoadPolicy, 9> kMiniQualifiablePolicies{
     kMiniWeightLoadPolicy, weight::kAttentionQ8Policy, weight::kAttentionHeadQ6Policy, weight::kAttentionQ4HeadQ6Policy,
-    weight::kAttentionHeadQ4Policy, weight::kHeadQ6Policy, weight::kHeadQ4Policy, kMiniSp4HeadPolicy};
+    weight::kAttentionHeadQ4Policy, weight::kHeadQ6Policy, weight::kHeadQ4Policy, kMiniSp4HeadPolicy,
+    weight::kAttentionHeadSP4TPolicy};
 
 inline const weight::WeightLoadPolicy& mini_weight_load_policy(const MiniWeightOptions& options) {
     if (options.qualify == nullptr || weight::same_id(options.qualify->id, kMiniWeightLoadPolicy.id))
