@@ -1663,13 +1663,13 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
         Control c;
         std::copy_n(in.begin(), offsetof(Control, extra_rows), std::as_writable_bytes(std::span(&c, 1)).begin());
         if (c.magic != reply.magic) throw std::runtime_error("control channel: bad magic from the peer");
-        const strix::pair::LockstepHeader peer{c.round, c.ack_round, c.rank};
-        control_lock.check(peer);  // draft packets above neither check nor advance the round
+        const strix::pair::LockstepHeader peer_head{c.round, c.ack_round, c.rank};
+        control_lock.check(peer_head);  // draft packets above neither check nor advance the round
         if (std::max(reply.rows, c.rows) > BatchForward::max_rows) {  // as exchange(): the rows past 8 follow
             if (std::max(reply.rows, c.rows) > fwd.row_limit()) throw std::runtime_error("control channel: step row limit differs");
             fwd.exchange_host(std::as_bytes(std::span(reply.extra_rows)), std::as_writable_bytes(std::span(c.extra_rows)));
         }
-        control_lock.accept(peer);
+        control_lock.accept(peer_head);
         if (c.commits > std::size(c.commit)) throw std::runtime_error("control channel: too many commits");
         std::array<std::uint32_t, 64> kept{};
         kept.fill(0xFFFFFFFFU);
