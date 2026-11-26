@@ -6626,7 +6626,7 @@ A taped staged verify window is offered to the backend after its eager checkpoin
 - **Shared home:** include/strix/session/kv_row_append.hpp, src/core/resident_greedy.hpp; src/inkling2 binding
 - **Tier and regime:** EXACT, FAST, QUALITY, TURBO; CUDA CLI speculative decode (verify windows)
 - **Exactness evidence:** EXACT verification: q52r device fixture (Inkling 2 Mini CUDA, programs vs eager windows) 42,525 items, 0 differing, programs ran at every width 2..8; q53: ids equal to the q46 resident run with the programs on. Host: tests/session_conv_tape_tests.cpp (offer after the checkpoints, accept == decline), strix-e2i-step-inputs-tests (window block valid mask).
-- **Off switch:** default off; STRIX_INKLING_WINDOW_PROGRAMS=1 turns the Inkling 2 Mini programs on
+- **Off switch:** default off; STRIX_INKLING_WINDOW_PROGRAMS=1 turns the Inkling 2 Mini programs on for the EXACT levers the fixture covers (other profiles decline with the reason)
 - **Measured gain:** none measured: q53 (RTX PRO, code, CLI EXACT 256 tokens, programs on) 93.13 tok/s vs 132.80 with the programs off: the drafter's acceptance collapses (26/92, mean 1.3 vs 201/343, 3.94); cause open.
 - **Preconditions:** a backend that defines try_window_graph; taped staged verify windows of 2..16 rows without score reads.
 
@@ -6653,7 +6653,7 @@ In a drafting run the speculator's one-row steps run on the CUDA step program ov
 - **Tier and regime:** EXACT, FAST, QUALITY, TURBO; CUDA CLI speculative decode
 - **Exactness evidence:** EXACT: both routes run the same arithmetic on the same decoder state; the step program stores the drafter taps through the shared Bf16SliceAtRow leaf. RTX q54: ids equal to the q46 resident run (code) and to q47 off (prose); acceptance 201/343 unchanged.
 - **Off switch:** STRIX_INKLING_PLAIN_ROW_ROUTE=resident (every row on the resident decoder); --speculation off
-- **Measured gain:** RTX PRO, cuda_pf2-kit q54 (CLI EXACT 256 tokens): code 132.80 tok/s vs 97.23 on the plain step program (+36.6 %); prose 98.05 vs 101.49 on the plain step program (0.966x; q52c all-resident auto 91.66). Measured bound: prose >= 0.96x the plain program (the arbiter's 8 probe passes), code +36 %.
+- **Measured gain:** RTX PRO, cuda_pf2-kit q54 (CLI EXACT 256 tokens): code 132.80 tok/s vs 97.23 on the plain step program (+36.6 %); prose 98.05 vs 101.49 on the plain step program (0.966x; q52c all-resident auto 91.66). Measured on one code and one prose prompt (256 tokens each), not a bound for other content: prose 0.966x the plain program (the arbiter's 8 probe passes), code +36.6 %. A run that cannot draft (token sampling, an embeddings prompt) runs every decode row on the step program.
 - **Preconditions:** CUDA build with the step program; BF16 weight storage; no route tap, no combine image, no prepared round fold, no narrow experts.
 
 | Model | Binding |

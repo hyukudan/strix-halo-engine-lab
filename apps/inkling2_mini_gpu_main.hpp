@@ -63,6 +63,8 @@ public:
         // continue from it. Only where both routes run the same arithmetic (no FAST weight-image levers); else resident.
         // Default on (q54: code 132.8 tok/s, prose 0.966 x the plain step program); off switch
         // STRIX_INKLING_PLAIN_ROW_ROUTE=resident keeps every row of the verifying route on the resident decoder.
+        // A verifying-route load that cannot draft (token sampling, an embeddings prompt: the shared CLI loads it with
+        // speculation off) runs every decode row here too (decode() below), as the program route it replaced did.
         const char* row_route = strix::envcfg::text("STRIX_INKLING_PLAIN_ROW_ROUTE");
         if (row_route && std::string_view(row_route) == "resident") plain_program = false;
         if (plain_program && !combine_image && !prepared_round_fold && !narrow_experts) {
@@ -77,9 +79,15 @@ public:
 #endif
 #if !defined(__HIPCC__)
         // Verify window programs (one captured graph per window rows; device identity fixture q52r PASS): an explicit
-        // option until a timing receipt decides the default of the drafting passes.
-        if (const char* window = strix::envcfg::text("STRIX_INKLING_WINDOW_PROGRAMS"); window && std::string_view(window) == "1")
-            decoder_.set_window_programs(true);
+        // option until a timing receipt decides the default of the drafting passes. The fixture covers the EXACT
+        // levers (projected bias, screened or full head): a profile with a FAST weight-image or expert lever declines.
+        if (const char* window = strix::envcfg::text("STRIX_INKLING_WINDOW_PROGRAMS"); window && std::string_view(window) == "1") {
+            const bool proven = !combine_image && !prepared_round_fold && !narrow_experts && !controller_one_plane &&
+                                moe_w4a4 == moe_core::grouped_w4a4::Activations::bf16 && attn_projected_bias;
+            if (proven) decoder_.set_window_programs(true);
+            else std::cerr << "inkling2 verify window programs declined (unproven for this profile: the identity "
+                              "fixture covers the EXACT levers only)\n";
+        }
         std::cerr << "inkling2 verify window programs " << (decoder_.window_programs() ? "on" : "off") << '\n';
 #endif
         // Calibration statistics (off unless STRIX_CALIB_MOMENTS=FILE): the prompt's attention / output-projection /
@@ -110,7 +118,8 @@ public:
     }
 
     unsigned decode(unsigned token, std::span<float> logits) override {
-        return decoder_.decode(token, logits);
+        // The plain-row route when bound (the step program over this decoder's state), else the resident step.
+        return decoder_.decode_committed_row(token, logits);
     }
     unsigned prefill_embedded(std::span<const unsigned> ids, const std::shared_ptr<const session::EmbedTable>& table,
                               std::span<float> logits) override {
@@ -472,8 +481,7 @@ int main(int argc, char** argv) {
                                      extent, [&](MiniLowBitRows lowbit) {
                 return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, loaded->plan.roles(), dspark,
                     moe_w4a4, combine_image, round_fold, narrow, controller_one_plane, projected_bias, screened_head,
-                    verify_rows, std::move(lowbit),
-                    plain_program && load.speculation == serve::CliSpeculation::automatic);
+                    verify_rows, std::move(lowbit), plain_program);
             });
         };
         // The rows the decoder was loaded with once the shared load fell back (strix-prefill-chunk line): a second load

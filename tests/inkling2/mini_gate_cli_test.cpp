@@ -144,8 +144,17 @@ void test_cuda_route_options() {
         cli::StepProgramOptions defaults;
         const auto route = cli::resolve_cuda_step_route(by_row, defaults, bf16, false);
         require(by_row.generation.speculation == Mode::automatic && !route.program &&
-                    route.speculation == Mode::automatic && route.speculation_reason.empty(),
-                "the speculation row default on CUDA resolves the verifying route");
+                    route.speculation == Mode::automatic && route.speculation_reason.empty() && route.plain_program,
+                "the speculation row default on CUDA resolves the verifying route, plain rows on the step program");
+        // A run that cannot draft under the default (token sampling; an embeddings prompt is known only at load) keeps
+        // the verifying loader; the plain-row route then carries every decode row (DeviceCliDecoder::decode), so it
+        // must stay bound for it.
+        auto sampled = parse({"1", "--generate", "4", "--temperature", "0.7"});
+        const auto sampled_route = cli::resolve_cuda_step_route(sampled, defaults, bf16, false);
+        require(!sampled_route.program && sampled_route.plain_program,
+                "a sampled run under the default binds the step program for its plain rows");
+        require(!cli::resolve_cuda_step_route(by_row, defaults, q8, false).plain_program,
+                "Q8 weights keep every row on the resident decoder (the step program needs BF16)");
     }
     auto options = parse({"1", "--generate", "4", "--speculation", "off"});
     cli::StepProgramOptions program;
@@ -269,11 +278,12 @@ void test_strixpack_entry_points() {
         bool step_program;
         bool explicit_program = false;
         bool gate = false;
+        bool default_route = false;  // no route flag: the CLI's own default (auto: the verifying route)
     };
     constexpr Entry entries[]{
         {"HIP CLI", "hip", false},
         {"CUDA CLI", "cuda", false},
-        {"automatic CUDA route (auto speculation: resident replay)", "cuda", false},
+        {"automatic CUDA route (auto speculation: resident replay)", "cuda", false, false, false, true},
         {"explicit CUDA step program", "cuda", true, true},
         {"HIP gate", "hip", false, false, true},
         {"CUDA gate", "cuda", true, false, true},
@@ -291,7 +301,7 @@ void test_strixpack_entry_points() {
                                          "--gate-arm", "FAST", "--gate-rows", "2", "--gate-mode", "decode"});
             else
                 args.insert(args.end(), {"1", "--generate", "3"});
-            if (!hip && !entry.step_program) args.emplace_back("--no-step-graph");
+            if (!hip && !entry.step_program && !entry.default_route) args.emplace_back("--no-step-graph");
             if (entry.explicit_program) args.emplace_back("--step-program");
             if (policy) args.insert(args.end(), {"--qualify-weights", policy});
             cli::StepProgramOptions program;
