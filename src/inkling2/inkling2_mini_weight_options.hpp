@@ -507,6 +507,15 @@ inline constexpr std::string_view kMiniBuildBackend = "hip";
 inline constexpr std::string_view kMiniBuildBackend = "cuda";
 #endif
 
+// STRIX_MOE_TAIL, the R1 MoE tail of the packed one-row route: one read for both backends, its default per backend as
+// data. HIP: on (EXACT receipt, docs/optimizations.md#inkling2-hip-bank-tail; "0" turns it off). CUDA: off, an opt-in of
+// the step program without a receipt (a leading '1' turns it on, as before).
+inline constexpr bool kMiniMoeTailDefault = kMiniBuildBackend == "hip";
+inline bool mini_moe_tail_switch() {
+    return strix::envcfg::flag("STRIX_MOE_TAIL", kMiniMoeTailDefault,
+                               kMiniMoeTailDefault ? strix::EnvFlagMatch::exact : strix::EnvFlagMatch::first_character);
+}
+
 inline profile::Resolution resolve_mini_weight_profile(const MiniWeightOptions& options, profile::Inputs inputs) {
     if (options.qualify && weight::is_strixpack_storage(options.qualify->target)) {
         const auto entry = std::ranges::find_if(kMiniProfile.table, [&](const profile::Lever& lever) {

@@ -1415,7 +1415,7 @@ private:
     // Fused decode transitions (HIP), read once: the residual bank batch of each pass's controller messages
     // (STRIX_RESIDUAL_BANK_BATCH=0 keeps one readout per controller) and the MoE tail (STRIX_MOE_TAIL=0).
     bool bank_batch_ = env_flag_default_on("STRIX_RESIDUAL_BANK_BATCH");
-    bool moe_tail_ = env_flag_default_on("STRIX_MOE_TAIL");
+    bool moe_tail_ = mini_moe_tail_switch();
     // The bank whose message rows the last batch produced (the controller scratch after one controller row).
     std::array<const float*, 2> batched_bank_{};
 #endif

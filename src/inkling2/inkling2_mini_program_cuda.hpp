@@ -821,7 +821,7 @@ struct MiniCudaProgramDecoder::Impl {
     const bool grouped;
     const bool epilogue_fusion;
     const exec::cuda_decode::R1Forms forms;
-    const bool moe_tail = strix::envcfg::flag("STRIX_MOE_TAIL", false);
+    const bool moe_tail = mini_moe_tail_switch();
     const bool moe_route_inline = strix::envcfg::flag("STRIX_MOE_ROUTE_INLINE", false);
     mini_gpu::Buffer<unsigned> grouped_words;
     mini_gpu::Buffer<float> grouped_values;
