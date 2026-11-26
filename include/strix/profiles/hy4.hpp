@@ -14,7 +14,6 @@
 // stamps the width). TURBO inherits FAST while no higher cell has evidence. Host-only.
 #include "strix/engine_profile.hpp"
 
-#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <span>
