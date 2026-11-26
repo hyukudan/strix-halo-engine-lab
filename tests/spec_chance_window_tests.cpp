@@ -224,6 +224,7 @@ LegacyTrace legacy_trace(std::uint32_t pricing, std::uint32_t offer) {
     }
     config.windows = {1, 2, 3, 5, 8};
     config.min_model_passes = 4;
+    config.probe_loss = 0.0;  // the base form (ArbiterConfig::probe_loss = 0: fixed re-probe interval, no episodes)
     sp::Arbiter arbiter(config);
     for (const auto rows : config.windows) arbiter.seed_cost(rows, 1.0 + 0.25 * double(rows - 1));
 

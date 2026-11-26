@@ -559,6 +559,7 @@ Decision Arbiter::decide_chance_window(const StepInput& input) {
 
 Decision Arbiter::decide(const StepInput& input) {
     decided_ms_ = decided_excess_ms_ = 0.0;
+    episode_pass_ = false;
     if (input.remaining == 0 || input.max_rows == 0) return Decision{Source::serial, 0, 0, false, 0.0, 0.0, false};
     if (input.force_lookup) {
         const auto end = std::upper_bound(config_.windows.begin(), config_.windows.end(), input.max_rows);
@@ -753,7 +754,7 @@ Decision Arbiter::decide(const StepInput& input) {
             model_barred_until_ = 0;
             priced_probe = true;
         }
-    } else if (model_n > 0 && d.source != Source::model && explore && !model_barred) {
+    } else if (model_n > 0 && d.source != Source::model && !model_barred && (explore || episode_open_)) {
         // Charged like the frontier probe (ArbiterConfig::charge_probe): the deepest legal window whose priced excess over
         // the pick (probe wall - probe tokens at the pick's rate) stays within frontier_loss of probe_every pick passes;
         // none = the shallowest legal window, so exploration never stops. Short contexts: the deepest window's excess is
@@ -761,6 +762,7 @@ Decision Arbiter::decide(const StepInput& input) {
         const bool charge = config_.charge_probe && d.expected_ms > 0.0 && d.expected_tokens > 0.0 && std::isfinite(d.expected_ms);
         const double pick_ms_per_token = charge ? d.expected_ms / d.expected_tokens : 0.0;
         const double budget = config_.frontier_loss * double(config_.probe_every) * d.expected_ms;
+        const bool paced = charge && config_.probe_loss > 0.0;
         std::uint32_t k = 0, rows = 0;
         double tokens = 0.0, ms = 0.0;
         for (const auto w : config_.windows) {
@@ -768,18 +770,38 @@ Decision Arbiter::decide(const StepInput& input) {
             const auto kw = std::min(w - 1, model_n);
             const auto rw = physical(kw + 1);
             const double tw = expected(Source::model, 0, kw), mw = verify_ms(rw, ctx) + draft_ms(kw);
-            if (k == 0 || !charge || mw - tw * pick_ms_per_token <= budget) { k = kw; rows = rw; tokens = tw; ms = mw; }
+            if (k == 0 || !charge || paced || mw - tw * pick_ms_per_token <= budget) { k = kw; rows = rw; tokens = tw; ms = mw; }
         }
-        // ArbiterConfig::probe_loss: a re-probe waits until its priced excess is within probe_loss of the pick's ms over
-        // the passes since the last model pass (the first measurements, min_model_passes, never wait).
-        const double excess = charge ? ms - tokens * pick_ms_per_token : 0.0;
-        const bool due = !charge || !(config_.probe_loss > 0.0) || model_passes_ < config_.min_model_passes ||
-                         excess <= config_.probe_loss * double(passes_ - last_model_) * d.expected_ms;
-        if (k > 0 && due) {
+        // ArbiterConfig::probe_loss: the probe is the deepest legal window (a capped one measures only shallow acceptance:
+        // q47, an 11 ms plain step afforded k=1 and the deep windows that win on code stayed unmeasured) and a re-probe
+        // waits until its priced excess is within probe_loss of the pick's ms over the passes since the last model pass
+        // (the first measurements, min_model_passes, never wait).
+        // An open episode keeps the window while its realized net (every model pass since it opened, credit capped at
+        // three probe walls so a change of text stops it within a few passes) stays above minus half a priced excess (a
+        // single short accept must not end a winning run); at a loss it closes and that loss paces the next probe (none
+        // closed yet: the priced excess).
+        const bool stay = paced && episode_open_ && episode_net_ms_ >= -episode_allow_ms_;
+        if (episode_open_ && !stay) {
+            episode_open_ = false;
+            episode_loss_ms_ = std::max(0.0, -episode_net_ms_);
+        }
+        const double priced_excess = charge ? std::max(0.0, ms - tokens * pick_ms_per_token) : 0.0;
+        const double excess = !charge ? 0.0 : episode_loss_ms_ >= 0.0 ? episode_loss_ms_ : priced_excess;
+        const bool due = explore && (!charge || !(config_.probe_loss > 0.0) || model_passes_ < config_.min_model_passes ||
+                                     excess <= config_.probe_loss * double(passes_ - last_model_) * d.expected_ms);
+        if (k > 0 && (stay || due)) {
             d = Decision{Source::model, k, rows, rows > k + 1, tokens, ms, true};
             model_barred_until_ = 0;
+            if (paced && !stay) {
+                episode_open_ = true;
+                episode_net_ms_ = 0.0;
+                episode_rate_ = pick_ms_per_token;
+                episode_allow_ms_ = 0.5 * priced_excess;
+                episode_cap_ms_ = 3.0 * ms;
+            }
         }
     }
+    episode_pass_ = episode_open_ && d.source == Source::model;  // the episode's ledger counts every model pass
     // Measured ladder (ArbiterConfig::measured_ladder): a lookup pass wider than the priced windows runs at the widest
     // priced one, which measures the next window. The model arm keeps its charged exploration: its draft wall is learned
     // per depth, and a capped first pass would price deeper drafts by extrapolating a one-depth wall (linear in k).
@@ -833,6 +855,10 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
         cycle_passes_ *= f;
     }
     decided_ms_ = decided_excess_ms_ = decided_plain_ms_ = 0.0;
+    if (episode_pass_ && o.source == Source::model)  // ArbiterConfig::probe_loss: the episode's realized net
+        episode_net_ms_ = std::min(episode_cap_ms_, episode_net_ms_ + double(std::max<std::size_t>(emitted.size(), 1)) *
+                                                                     episode_rate_ - (o.verify_ms + o.draft_ms));
+    episode_pass_ = false;
     if (adaptive && o.source == Source::model) {
         learn(model_, o.proposed, o.accepted, 1.0);
         last_model_ = passes_;
