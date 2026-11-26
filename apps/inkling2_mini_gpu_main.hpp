@@ -61,6 +61,10 @@ public:
         // The speculator's one-row steps on the CUDA step program (the program route's forms and fusion) over this
         // decoder's own state: same KV / histories / DSpark taps, so drafting passes on the resident verify windows
         // continue from it. Only where both routes run the same arithmetic (no FAST weight-image levers); else resident.
+        // Default on (q54: code 132.8 tok/s, prose 0.966 x the plain step program); off switch
+        // STRIX_INKLING_PLAIN_ROW_ROUTE=resident keeps every row of the verifying route on the resident decoder.
+        const char* row_route = strix::envcfg::text("STRIX_INKLING_PLAIN_ROW_ROUTE");
+        if (row_route && std::string_view(row_route) == "resident") plain_program = false;
         if (plain_program && !combine_image && !prepared_round_fold && !narrow_experts) {
             plain_.emplace(decoder_, true, mini_latency_forms(kMiniDefaultForms));
             decoder_.set_plain_row_route([this](unsigned token, std::span<float> logits) {
