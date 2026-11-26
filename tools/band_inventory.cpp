@@ -38,7 +38,7 @@ constexpr Binding bindings[] = {
      "HIP one lane, known priced prompt execution; FAST plus cap9 over FAST"},
     {"qwen3.8-27b", "qwen35-hip-decode", "include/strix/profiles/qwen_dense_hip.hpp",
      strix::qwen35::hip_profile::kBandRows, strix::qwen35::hip_profile::table,
-     "HIP one rank, IU4 g64 pack, one lane, known priced execution; timing with MTP off"},
+     "HIP whole-model prefill (one rank or each tensor-parallel rank; decode and spec apps), IU4 g64 pack, one lane, known priced execution; timing with MTP off"},
 };
 
 std::string lengths(const auto& points, bool json) {

@@ -32,6 +32,7 @@
 #include "strix/spec/engine_target.hpp"
 #include "strix/spec/mtp_chain.hpp"
 #include "../src/core/dense_linear.hpp"
+#include "device/hip_cost_identity.hpp"
 
 namespace sp = strix::spec;
 namespace q = strix::qwen35;
@@ -285,7 +286,24 @@ int main(int argc, char** argv) try {
         else if (a == "--dump-out") dump_out = next();              // speculative emitted ids -> file
         else throw std::invalid_argument("unknown argument " + a);
     }
-    const auto profile = q::hip_profile::resolve_prefill(q::hip_profile::App::spec, command.inputs, pfl, q::HipEngine::max_rows());
+    std::vector<std::uint32_t> prompt;
+    if (!ids_file.empty()) {
+        std::ifstream f(ids_file);
+        std::stringstream ss;
+        ss << f.rdbuf();
+        prompt = parse_ids(ss.str());
+    }
+    // The prefill regime of this run through the decode app's resolver (hip_profile::run_regime): the prompt (or the
+    // --prefill-bench length) on this device, the IU4 pack, the whole model; its own execution spelling (app=spec).
+    const std::uint64_t pf_tokens = !prompt.empty() ? prompt.size() : pf_bench;
+    std::uint64_t capacity = std::max<std::uint64_t>(max_pos, prompt.size() + n_gen + 128U + (cost_table ? 512U : 0U));
+    if (pf_bench) capacity = std::max<std::uint64_t>(capacity, std::uint64_t{pf_bench} + 64U);
+    const std::string device_product = inspect ? std::string{} : strix::device::hip_cost_device_identity();
+    const auto prefill_run = q::hip_profile::run_regime(device_product, pf_tokens, capacity, n_gen, "app=spec|mtp=" + spec_args.mtp);
+    auto profile_inputs = command.inputs;
+    profile_inputs.regime = prefill_run.regime(pf_tokens);
+    const auto profile = q::hip_profile::resolve_prefill(q::hip_profile::App::spec, profile_inputs, pfl, q::HipEngine::max_rows(),
+                                                         {true, !inspect && q::hip_profile::iu4_pack(model)});
     if (q::hip_profile::finish(q::hip_profile::App::spec, profile, inspect)) return 0;
     q::hip_profile::apply_window(q::hip_profile::App::spec, profile, pfl);  // the window the profile applied runs
     const auto plan = q::resolve_hip_dense_spec(model, spec_args);  // ONE resolver (hip_spec_defaults.hpp)
@@ -298,13 +316,6 @@ int main(int argc, char** argv) try {
         throw std::invalid_argument("usage: --model F.gguf (--prompt-file ids | --cost-table | --prefill-bench N [--pf-sample]) [--n-gen N] "
                                     "[--sources copy,chain,hybrid|none] [--mtp F.gguf] [--chain-hidden post|pre] [--chain-feed device|host] [--chain-k N] [--mtp-ref] [--dump-ref F] [--dump-out F] "
                                     "[--max-block 1..16] [--check 0|1] [--max-pos N] [--label S]");
-    std::vector<std::uint32_t> prompt;
-    if (!ids_file.empty()) {
-        std::ifstream f(ids_file);
-        std::stringstream ss;
-        ss << f.rdbuf();
-        prompt = parse_ids(ss.str());
-    }
     q::HipEngineOptions opt;
     opt.max_positions = std::max<std::uint32_t>(max_pos, std::uint32_t(prompt.size()) + n_gen + 128U + (cost_table ? 512U : 0U));
     if (pf_bench) opt.max_positions = std::max(opt.max_positions, pf_bench + 64U);

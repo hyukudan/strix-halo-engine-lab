@@ -85,14 +85,18 @@ summed in ascending warp order. q8_0: int8 values are exact in bf16; each 32-blo
 - FAST policies: `mma2` (hi + mid), `mma1` (hi only; max |dlogit| 8x larger, see RESULT). Not the default.
 - Shapes not covered (in % 32, out % 16, f32 weights) fall back to fp32 kernels.
 
-## FAST prefill window (HIP decode app)
+## FAST prefill window (HIP decode and speculative apps)
 
-FAST and TURBO prefill with the 512-row IU4 window (`--wide 512`, A4W4 off) by default when the
-prompt is inside a gated band: one gfx1151 device, one rank (no `--tp-rank`), one lane, the IU4 g64
-pack and a known execution. The band rows live in the shared regime ledger and band receipts
-(`include/strix/profiles/qwen_dense_hip.hpp`: `kQualified`, `kBandRows`); outside them, and for EXACT,
-the spec app, TP, other devices or packs, the previous route stays (64-row EXACT windows). Off
-switches: `--profile exact`, an explicit `--wide N` / `--wide-exact N`, or `--rows N`.
+FAST and TURBO prefill with the 512-row IU4 window (`--wide 512` on the decode app, `--prefill-rows 512`
+on the speculative app, A4W4 off) by default when the prompt is inside a gated band: one gfx1151
+device, the whole model prefilled in the process (one rank, or each rank of the tensor-parallel
+decode: `--tp-rank` ranks prefill the whole prompt alone and split only the decode), one lane, the
+IU4 g64 pack and a known execution. Both apps resolve the same rows through the same resolver
+(`include/strix/profiles/qwen_dense_hip.hpp`: `kQualified`, `kBandRows` / `kSpecBandRows`, one band
+ladder spelled per window lever); each app's own execution spelling binds the band row as that run's
+reference. Outside the bands, and for EXACT, other devices or packs, the previous route stays (64-row
+EXACT windows). Off switches: `--profile exact`, an explicit `--wide N` / `--wide-exact N` /
+`--prefill-rows N` / `--prefill-exact`, or `--rows N`.
 `--dump-logits FILE --dump-window` dumps every row of the last window of the route the profile
 resolves; `--dump-logits` alone keeps the one-row reference path.
 
