@@ -6,6 +6,7 @@
 #include "strix/deepseek41_pair_profile_table.hpp"
 #include "strix/deepseek41_prefill.hpp"
 #include "strix/deepseek41_serve_cache_policy.hpp"
+#include "strix/ds41_prefill.hpp"
 #include "strix/host_memory.hpp"
 #include "strix/session/speculation_default.hpp"
 
@@ -214,6 +215,32 @@ const strix::profile::Resolution& profile_resolution() {
     return *r;
 }
 
+namespace {
+// A startup entry switched off or set explicitly leaves the band rows (their receipts measured the resolved tier alone).
+bool startup_explicit(const strix::profile::Resolution& startup) {
+    namespace p = strix::profile;
+    return std::any_of(startup.entries.begin(), startup.entries.end(), [](const p::Entry& entry) {
+        return entry.status == p::Status::off || entry.status == p::Status::explicit_env ||
+               entry.status == p::Status::explicit_cli;
+    });
+}
+}  // namespace
+
+PromptBand whole_prompt_band(const strix::profile::Resolution& startup) {
+    namespace p = strix::profile;
+    if ((startup.profile != p::Name::fast && !startup.is_turbo()) || startup_explicit(startup)) return {};
+    PromptBand band;
+    for (const auto& row : ladder_rows) {
+        if (row.lever != std::string_view("d1_prefill") || row.value != std::string_view("1") || row.tier != p::Name::fast ||
+            row.phase != p::Phase::prefill)
+            continue;
+        const auto lo = static_cast<std::uint32_t>(row.min_context), hi = static_cast<std::uint32_t>(row.max_context);
+        band.min = band.max == 0U ? lo : std::min(band.min, lo);
+        band.max = std::max(band.max, hi);
+    }
+    return band;
+}
+
 std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::profile::Resolution& startup,
     const PrefillOptions& o, std::uint64_t prompt_tokens, std::uint32_t lanes, std::string_view device_product,
     bool measured_reference) {
@@ -224,15 +251,12 @@ std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::p
         device_product.find("|AMD Radeon 8060S Graphics|") == std::string_view::npos ||
         o.world != 2U || !o.tp_attention || o.expert_tp || o.stream_experts || o.layers != 40U ||
         prompt_tokens > o.max_positions || o.chunk_rows != 1024U || o.window_rows != 8U || o.attention_lanes != 4U ||
-        (o.moe_chunk_rows != 0U && o.moe_chunk_rows != 4096U) || !o.engram_direct_io || o.draft_rows != 0U ||
+        (o.moe_chunk_rows != 0U && o.moe_chunk_rows != 4096U) || !o.engram_direct_io ||
+        o.draft_rows > ::strix::ds41::bounded_replay_min_rows ||
         o.fp16_dense || o.bf16_attention || o.fast_attention || o.fast_dense || o.fast_moe ||
         o.fast_engram || o.fast_shared || o.fast_moe_f16 || o.fast_i4 > 0 || o.null_ulp_layer >= 0 ||
         o.approx_layer_first != 0U || o.approx_layer_end != PrefillOptions{}.approx_layer_end ||
-        o.decoder_replay_rows != 0U || o.trace ||
-        std::any_of(startup.entries.begin(), startup.entries.end(), [](const p::Entry& entry) {
-            return entry.status == p::Status::off || entry.status == p::Status::explicit_env ||
-                   entry.status == p::Status::explicit_cli;
-        }))
+        o.decoder_replay_rows != 0U || o.trace || startup_explicit(startup))
         return std::nullopt;
 
     const auto execution = p::ladder_execution({"hip", device_product,
@@ -244,7 +268,13 @@ std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::p
     inputs.profile = startup.profile;
     inputs.env = [](const char*) -> const char* { return nullptr; };
     inputs.regime = {p::Phase::prefill, prompt_tokens, lanes, "gfx1151", execution};
-    return p::resolve(profile_engine(), inputs);
+    auto out = p::resolve(profile_engine(), inputs);
+    // A drafter seed rides only on the bounded replay (the same rows for any seed <= R); D1 alone would widen its cone.
+    if (const auto* d1 = out.find("d1_prefill"); o.draft_rows != 0U && d1 != nullptr && d1->value == "1") {
+        const auto* replay = out.find("decoder_replay");
+        if (replay == nullptr || replay->value != "256") return std::nullopt;
+    }
+    return out;
 }
 
 const std::vector<std::pair<std::string, std::string>>& baseline_off_items() {

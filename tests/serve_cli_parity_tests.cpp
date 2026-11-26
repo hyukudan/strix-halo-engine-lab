@@ -24,6 +24,7 @@
 #if defined(STRIX_PARITY_DS41)
 #include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/deepseek41_prefill.hpp"
+#include "strix/ds41_prefill.hpp"
 #endif
 #if defined(STRIX_PARITY_GEMMA4)
 #include "gemma4/engine/runtime.hpp"
@@ -380,6 +381,85 @@ void ds41() {
         const auto server = request(pd::App::serve, "1", prompt);
         gate("ds41+lanes2+" + std::to_string(prompt), cli, server, {});
         check(cli.at("d1_prefill") == "0" && cli.at("decoder_replay") == "0", "ds41: two lanes leave the measured bands");
+    }
+    lanes = 1;
+
+    // ds_par: the options each entry really builds. The pair CLI (apps/deepseek41_prefill_main.cpp options()): positions =
+    // the prompt, no row cap, no drafter seed. The default server (slot_prefill_options): positions = --context, rows =
+    // the auto capacity, and DSpark's 128-row seed. Same request -> same D1 / R256 cells (the seed rides on R256:
+    // plan_bounded_replay computes the same rows for any seed <= R).
+    const auto cells = [&](const ds::PrefillOptions& o, const char* rank, std::uint64_t prompt, pd::App app,
+                           const char* profile) -> sp::Config {
+        const auto startup = pd::resolve(app, {model, "--rank", rank,
+            "--transport", app == pd::App::prefill ? "usb4-auto" : "usb4auto", "--profile", profile},
+            [](const char*) -> const char* { return nullptr; }, probe, pd::Build{true});
+        const auto result = pd::resolve_prefill_profile(*startup.profile, o, prompt, 1U,
+                                                       "gfx1151|AMD Radeon 8060S Graphics|fixture", true);
+        if (!result) return {{"d1_prefill", "declined"}, {"decoder_replay", "declined"}};
+        return {{"d1_prefill", result->find("d1_prefill")->value}, {"decoder_replay", result->find("decoder_replay")->value}};
+    };
+    for (const char* profile : {"exact", "fast", "turbo"})
+        for (const auto prompt : {2048U, 8192U, 32768U}) {
+            ds::PrefillOptions cli_o;  // the CLI defaults (row split, cone, head 1, window 8, chunk 1024, lanes 4)
+            cli_o.world = 2;
+            cli_o.max_positions = prompt;
+            ds::PrefillOptions serve_o;
+            serve_o.world = 2;
+            serve_o.max_positions = 36864;
+            serve_o.max_rows = 32768;
+            serve_o.draft_rows = 128;
+            const auto cli = cells(cli_o, "0", prompt, pd::App::prefill, profile);
+            const auto server = cells(serve_o, "1", prompt, pd::App::serve, profile);
+            gate(std::string("ds41+request+") + profile + "+" + std::to_string(prompt), cli, server, {});
+            const bool fast = std::string_view(profile) != "exact", banded = fast && prompt >= 4096U;
+            check(server.at("d1_prefill") == (banded ? "1" : "0") && server.at("decoder_replay") == (banded ? "256" : "0"),
+                  std::string("ds41: the seeded server request resolves the CLI cells (") + profile + ")");
+        }
+    {
+        ds::PrefillOptions seeded;
+        seeded.world = 2;
+        seeded.max_positions = 36864;
+        seeded.draft_rows = 257;  // a seed wider than R: the bounded plan refuses it, so the band declines
+        check(cells(seeded, "0", 8192U, pd::App::serve, "fast").at("d1_prefill") == "declined",
+              "ds41: a seed wider than the replay bound declines D1");
+        for (const std::uint64_t total : {std::uint64_t{8192}, std::uint64_t{32768}}) {
+            strix::ds41::SuffixReplayGeometry g0, g1;
+            g0.draft_rows = 0;
+            g1.draft_rows = 128;
+            const auto a = strix::ds41::plan_bounded_replay(g0, 0U, total, 256U);
+            const auto b = strix::ds41::plan_bounded_replay(g1, 0U, total, 256U);
+            bool same = a.replay_row_layers == b.replay_row_layers && a.layers.size() == b.layers.size();
+            for (std::size_t i = 0; same && i < a.layers.size(); ++i)
+                same = a.layers[i].out_begin == b.layers[i].out_begin && a.layers[i].kv_begin == b.layers[i].kv_begin;
+            check(same, "ds41: the bounded replay computes the same rows with and without the 128-row seed");
+        }
+    }
+    // The served piece plan: a fresh prompt in the tier's band runs as one piece when the prefill holds it; everything
+    // else keeps the default pieces (cache capture, a disk tier, image rows, a continuation, EXACT).
+    {
+        const auto band = [&](const char* profile) {
+            return pd::whole_prompt_band(*pd::resolve(pd::App::serve, {model, "--rank", "0", "--transport", "usb4auto",
+                "--profile", profile}, [](const char*) -> const char* { return nullptr; }, probe, pd::Build{true}).profile);
+        };
+        const auto fast = band("fast"), turbo = band("turbo"), exact = band("exact");
+        check(fast.min == 4096U && fast.max == 32768U && turbo.min == fast.min && turbo.max == fast.max && exact.max == 0U,
+              "ds41: the whole-prompt band is the D1 rows' [4096, 32768] in FAST and TURBO, none in EXACT");
+        check(pd::whole_prompt_capacity(fast, 36864U) == 32768U && pd::whole_prompt_capacity(fast, 16384U) == 16384U &&
+              pd::whole_prompt_capacity(exact, 36864U) == 0U, "ds41: the band's capacity request is bounded by the context");
+        check(pd::served_piece_rows(16384U, 32768U, 32768U, fast, 0U, false, false, false) == 32768U,
+              "ds41: a fresh 32,768-token FAST prompt is one piece (the CLI execution)");
+        check(pd::served_piece_rows(16384U, 32768U, 32768U, exact, 0U, false, false, false) == 16384U,
+              "ds41: EXACT keeps the measured 16,384-row pieces");
+        check(pd::served_piece_rows(16384U, 16384U, 32768U, fast, 0U, false, false, false) == 16384U,
+              "ds41: a prefill that cannot hold the prompt keeps the pieces");
+        check(pd::served_piece_rows(16384U, 32768U, 32768U, fast, 0U, false, false, true) == 16384U &&
+              pd::served_piece_rows(16384U, 32768U, 32768U, fast, 0U, false, true, false) == 16384U &&
+              pd::served_piece_rows(16384U, 32768U, 32768U, fast, 0U, true, false, false) == 16384U &&
+              pd::served_piece_rows(16384U, 32768U, 32768U, fast, 512U, false, false, false) == 16384U,
+              "ds41: capture, a disk tier, image rows and a continuation keep the pieces");
+        check(pd::served_piece_rows(16384U, 32768U, 40000U, fast, 0U, false, false, false) == 16384U &&
+              pd::served_piece_rows(16384U, 32768U, 8192U, fast, 0U, false, false, false) == 16384U,
+              "ds41: outside the band, and inside one piece already, nothing changes");
     }
 
 }

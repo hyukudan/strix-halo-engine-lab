@@ -117,6 +117,9 @@ const std::string& profile_json();
 const strix::profile::Resolution& profile_resolution();
 // Fresh whole-prompt device prefill only. The adapter supplies its measured reference route, the live lane count of
 // the pass (sequences in one prefill forward) and runtime device facts; the band rows bound the lanes.
+// A drafter seed (options.draft_rows, the serve's DSpark: 128 rows) is admitted up to the replay bound when the band
+// also resolves decoder_replay 256: plan_bounded_replay computes the same rows for any draft_rows <= R, so the seed is
+// a copy of rows the CLI's execution computes anyway. Without the replay (a cone widened by the seed) it declines.
 std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::profile::Resolution& startup,
     const PrefillOptions& options, std::uint64_t prompt_tokens, std::uint32_t lanes, std::string_view device_product,
     bool measured_reference);
@@ -127,6 +130,29 @@ std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::p
 [[nodiscard]] constexpr bool served_full_prompt(std::uint32_t at, std::uint32_t end, std::uint32_t prompt_tokens,
     bool image_rows, bool disk_state) noexcept {
     return at == 0U && end == prompt_tokens && !image_rows && !disk_state;
+}
+// The prompt lengths the startup tier's whole-prompt band rows cover (d1_prefill, ladder_rows): FAST and TURBO (which
+// nests FAST) without an explicit or switched-off profile entry, else {0, 0}. Startup facts only: the device, the
+// live lanes and both ranks still decide each request in DevicePrefill::run_full_prompt.
+struct PromptBand {
+    std::uint32_t min = 0, max = 0;
+    [[nodiscard]] constexpr bool covers(std::uint32_t tokens) const noexcept { return max != 0U && tokens >= min && tokens <= max; }
+};
+PromptBand whole_prompt_band(const strix::profile::Resolution& startup);
+// The largest whole prompt the band asks the served device prefill to hold in one piece (0: none).
+[[nodiscard]] constexpr std::uint32_t whole_prompt_capacity(PromptBand band, std::uint32_t context) noexcept {
+    return band.max != 0U && band.min <= context ? (band.max < context ? band.max : context) : 0U;
+}
+// The served default piece plan's piece size for a request. A fresh text prompt inside the band that the device
+// prefill can hold (capacity_rows) and that no in-run cache capture cuts runs as ONE piece, the CLI's execution, so
+// served_full_prompt admits it; every other request keeps the default pieces (piece_rows). Without this a 32,768-token
+// prompt split into two 16,384-row pieces and took the exact plan (1,290 tok/s served vs 1,981 on the CLI).
+[[nodiscard]] constexpr std::uint32_t served_piece_rows(std::uint32_t piece_rows, std::uint32_t capacity_rows,
+    std::uint32_t prompt_tokens, PromptBand band, std::uint32_t resume, bool image_rows, bool disk_state,
+    bool capture) noexcept {
+    const bool whole = resume == 0U && !image_rows && !disk_state && !capture && band.covers(prompt_tokens) &&
+                       prompt_tokens <= capacity_rows;
+    return whole && prompt_tokens > piece_rows ? prompt_tokens : piece_rows;
 }
 // The wire decision is made before enabling D1. Zero is a decline, including a rank unable to allocate mirrors.
 inline bool paired_d1(std::uint64_t local, std::uint64_t peer) noexcept { return local != 0 && local == peer; }

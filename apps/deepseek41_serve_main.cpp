@@ -221,6 +221,10 @@ struct Args : strix::deepseek41::ServeCachePolicy {
     std::uint32_t prefill_rows = 4096, prefill_min = 0;
     std::string vision;  // --vision FILE: image input on the HTTP front door (rank 0 only; needs the device prefill path). Empty: off
     bool prefill_rows_auto = false;  // --prefill-rows auto: resolved after the weights load (auto_prefill_rows)
+    // the default plan's piece size (0: prefill_rows). auto: the measured pieces (sched::auto_piece_rows) while
+    // prefill_rows is the capacity, wider when the tier's whole-prompt band asks for one piece (served_piece_rows)
+    std::uint32_t prefill_piece_rows = 0;
+    [[nodiscard]] std::uint32_t piece_rows() const noexcept { return prefill_piece_rows != 0U ? prefill_piece_rows : prefill_rows; }
     std::string session_dir;
     std::uint64_t session_ram_bytes = 0; // injected by pair_defaults after route/memory checks
     std::uint64_t session_max_parked = 8, session_disk_bytes = 0;
@@ -957,7 +961,13 @@ public:
               sample_(sample), sampler_(sampler), t0_(Clock::now()) {
             namespace ds = strix::deepseek41;
             const auto N = static_cast<std::uint32_t>(prompt_.size());
-            const std::uint32_t rows = std::min(sp_.a_.prefill_rows, sp_.a_.context);
+            // the default pieces; a fresh whole prompt in the tier's band stays one piece (the CLI's execution, so
+            // run_full_prompt can admit it): pair_defaults::served_piece_rows, one rule with served_full_prompt below
+            const std::uint32_t capacity = std::min(sp_.a_.prefill_rows, sp_.a_.context);
+            const std::uint32_t rows = strix::deepseek41::pair_defaults::served_piece_rows(
+                std::min(sp_.a_.piece_rows(), capacity), capacity, N,
+                strix::deepseek41::pair_defaults::whole_prompt_band(strix::deepseek41::pair_defaults::profile_resolution()), hit.resume,
+                embeds_ != nullptr, !sp_.a_.prefix_dir.empty() || !sp_.a_.session_dir.empty(), sp_.cache_ && insert_);
             out_.resume = hit.resume;
             at_ = hit.resume;
             if (hit.resume == N) {  // the whole prompt is a cached boundary (read by prepare())
@@ -1515,6 +1525,7 @@ std::unique_ptr<Sessions> make_sessions(const Args &a, std::uint32_t rank) {
                                             {"prefill-device", std::to_string(a.device_prefill)},
                                             {"prefill-rows", std::to_string(a.prefill_rows)},
                                             {"prefill-rows-auto", std::to_string(a.prefill_rows_auto)},
+                                            {"prefill-piece-rows", std::to_string(a.piece_rows())},
                                             {"prefill-min", std::to_string(a.prefill_min)},
                                             {"prefix-block", std::to_string(a.prefix_block)},
                                             {"prefix-inrun", std::to_string(a.prefix_inrun)},
@@ -4105,7 +4116,9 @@ std::uint32_t auto_prefill_rows(const Args& a, BatchForward& fwd, strix::dist::C
             const char* v = std::getenv(k);
             return v ? std::string(v) : std::string();
         });
-        rows = sc::auto_prefill_rows(a.context, room);
+        // the tier's whole-prompt band (FAST / TURBO: D1 + R256 up to 32,768 rows) asks for that capacity first
+        rows = sc::auto_prefill_rows(a.context, room, strix::deepseek41::pair_defaults::whole_prompt_capacity(
+            strix::deepseek41::pair_defaults::whole_prompt_band(strix::deepseek41::pair_defaults::profile_resolution()), a.context));
     }
     std::array<std::uint32_t, 1> mine{rows}, peer{};
     fwd.exchange_host(std::as_bytes(std::span(mine)), std::as_writable_bytes(std::span(peer)));
@@ -4150,10 +4163,13 @@ void run_rank(Args a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport
         std::unique_ptr<SlotPrefill> prefill;
         if (!a.device_prefill) return prefill;
         dog.pause(true);
-        if (a.prefill_rows_auto) a.prefill_rows = auto_prefill_rows(a, fwd, comm, rank);
+        if (a.prefill_rows_auto) {
+            a.prefill_rows = auto_prefill_rows(a, fwd, comm, rank);
+            a.prefill_piece_rows = strix::deepseek41::sched::auto_piece_rows(a.prefill_rows);
+        }
         const auto before = fwd.device_memory().first;
         prefill = std::make_unique<SlotPrefill>(a, fwd, comm, rank);
-        std::fprintf(stderr, "rank %u: device prefill of %u-row pieces: device free %.2f GiB lower (scratch estimate %.2f GiB + own weights %.2f GiB)\n", rank, a.prefill_rows,
+        std::fprintf(stderr, "rank %u: device prefill of %u-row pieces (capacity %u rows): device free %.2f GiB lower (scratch estimate %.2f GiB + own weights %.2f GiB)\n", rank, a.piece_rows(), a.prefill_rows,
                      (static_cast<double>(before) - static_cast<double>(fwd.device_memory().first)) / 1073741824.0,
                      static_cast<double>(strix::deepseek41::sched::prefill_piece_bytes(a.prefill_rows, a.context)) / 1073741824.0,
                      static_cast<double>(prefill->weight_bytes()) / 1073741824.0);
