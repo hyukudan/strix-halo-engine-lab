@@ -314,7 +314,7 @@ def check_free_record(receipt, path, counts, what, null=False):
         raise GateError(f"{what}: no applied null control in the free-running route receipt")
 
 
-def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False):
+def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False, frozen_bars=None):
     """Pooled + per-window verdict. windows: window_stats dicts with their per-row arrays under '_rows'."""
     if len({w["name"] for w in windows}) != len(windows):
         raise GateError("duplicate window in pooled evidence")
@@ -338,6 +338,10 @@ def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False):
         if w["state"] == "unresolved":
             w["cleared_by_class"] = w["class"] in final_pass
     pooled["off_distribution"] = off_distribution(windows, limits)
+    if frozen_bars is not None:
+        outliers = {w["name"] for w in windows if w["ref_nll"] > frozen_bars[w["class"]]}
+        outliers.update(pooled["off_distribution"])
+        pooled["off_distribution"] = [w["name"] for w in windows if w["name"] in outliers]
     pooled["reference_suspect"] = [w["name"] for w in windows if w["reference_suspect"]]
     suspect_classes = [c["name"] for c in pooled["classes"] if c["final"] and c["reference_suspect"]]
     if suspect_classes:
@@ -599,13 +603,48 @@ def digest(value):
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
+def ids_digest(ids):
+    return hashlib.sha256(ids.astype("<u4").tobytes()).hexdigest()
+
+
+def frozen_qualification(plan, cases, classes, limits, opener):
+    path, expected = plan
+    with open(path, "rb", opener=opener) as f:
+        data = f.read(R4_MAX_INPUT_BYTES + 1)
+    if len(data) > R4_MAX_INPUT_BYTES or not digest(expected) or hashlib.sha256(data).hexdigest() != expected:
+        raise GateError("frozen qualification plan exceeds size limit or differs from its expected SHA-256")
+    doc = json.loads(data)
+    if not isinstance(doc, dict) or doc.get("schema") != "strix-gate-frozen-qualification/v1":
+        raise GateError("invalid frozen qualification plan")
+    windows, original = doc.get("windows"), doc.get("reference_nll")
+    if not isinstance(windows, dict) or set(windows) != set(cases):
+        raise GateError("frozen qualification window set differs from the scored cases")
+    if classes is not None and not isinstance(classes, dict):
+        raise GateError("--classes needs a JSON mapping of cases to content classes")
+    for case, win in windows.items():
+        if (not isinstance(win, dict) or not isinstance(win.get("class"), str) or not win["class"].strip()
+                or not digest(win.get("ids_sha256"))):
+            raise GateError(f"{case}: frozen qualification needs an IDs digest and content class")
+        if classes is not None and classes.get(case) != win["class"]:
+            raise GateError(f"{case}: --classes differs from the frozen qualification plan")
+    if not isinstance(original, dict) or set(original) != {win["class"] for win in windows.values()}:
+        raise GateError("frozen qualification reference NLL must cover every content class")
+    bars = {}
+    for cls, values in original.items():
+        if not isinstance(values, list) or len(values) < R4_CLASS_MIN or any(
+                type(nll) not in (int, float) or not 0 <= nll <= sys.float_info.max for nll in values):
+            raise GateError(f"{cls}: frozen qualification needs {R4_CLASS_MIN} or more finite original NLLs")
+        bars[cls] = _r4_class_stats(values, limits)["bar"]
+    return windows, bars
+
+
 def verify_null_witness(witness, case, arms, capture_hashes, head_ids):
     """Bind a launcher's control evidence to the consumed files and exact baseline identity."""
     records = witness.get(case)
     if not isinstance(records, dict) or set(records) != set(arms):
         raise GateError(f"{case}: null witness must cover the reference and every null arm")
     identity_fields = ("binary_sha256", "model_sha256", "numerical_config_sha256")
-    head_hash = hashlib.sha256(head_ids.astype("<u4").tobytes()).hexdigest() if head_ids is not None else None
+    head_hash = ids_digest(head_ids) if head_ids is not None else None
     baseline = None
     for role, (arm, capture_hash) in enumerate(zip(arms, capture_hashes)):
         rec = records[arm]
@@ -677,6 +716,8 @@ def qual(a):
         cases = sorted(p.name[:-len(f".{a.ref}.bin")] for p in (out / "logits").glob(f"*.{a.ref}.bin"))
     if not cases:
         raise GateError(f"{out} holds no {a.ref} logits")
+    plan = getattr(a, "frozen_qualification", None)
+    frozen_windows, frozen_bars = frozen_qualification(plan, cases, classes, limits, opener) if plan else ({}, None)
     witness_path = getattr(a, "null_control_witness", None)
     witness = None
     if witness_path:
@@ -703,6 +744,9 @@ def qual(a):
                 return f.read()
 
         ra, ra_info = reduce(logit(a.ref), logit(a.cand), **kw)
+        frozen = frozen_windows.get(case)
+        if frozen and ids_digest(manifest[case] if head else ra["label"]) != frozen["ids_sha256"]:
+            raise GateError(f"{case}: frozen qualification IDs differ from the scored window")
         null_pairs = [reduce(logit(a.ref), logit(n), **kw) for n in a.null]
         nulls = [rows for rows, _ in null_pairs]
         if witness is not None:
@@ -719,7 +763,8 @@ def qual(a):
         if ra["nonfinite_c"].any() or ra_info.get("cand_unscored_nonfinite"):
             nonfinite_candidate.append(case)
             continue
-        w = score_window(case, ra, nulls, window_class(case, classes, manifest), limits)
+        cls = frozen["class"] if frozen else window_class(case, classes, manifest)
+        w = score_window(case, ra, nulls, cls, limits)
         ref_route = route(a.ref)
         moe = ref_route.exists()
         f = None
@@ -796,7 +841,9 @@ def qual(a):
         if replay and len(replay) != len(windows):
             raise GateError("route replay evidence is required for every window of a replayed qualification")
         p = verdict(windows, flips if flips else None, limits=limits,
-                    allow_null_floor=getattr(a, 'allow_null_floor', False))
+                    allow_null_floor=getattr(a, 'allow_null_floor', False), frozen_bars=frozen_bars)
+        if plan:
+            p["frozen_qualification"] = {"sha256": plan[1], "reference_nll_bars": frozen_bars}
         print(pooled_line(p, limits))
         if replay:
             if nonfinite_free:
@@ -1117,6 +1164,8 @@ def main(argv=None):
     q.add_argument("--trace-diag", action="append", help="engine log with per-layer trace diag lines (no route tap)")
     q.add_argument("--classes", help="JSON {case: content class} declared before scoring (default: prompt-length band "
                    "with --manifest, else one class)")
+    q.add_argument("--frozen-qualification", nargs=2, metavar=("PLAN", "SHA256"),
+                   help="require the preregistered window IDs, content labels and reference NLL bars")
     q.add_argument("--r4-assess", metavar="ORIGINAL_NLLS", help="diagnostic only on stderr: JSON {content class: "
                    "[original reference NLLs]} (requires --classes and --manifest)")
     q.add_argument("--json")

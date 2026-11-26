@@ -653,6 +653,32 @@ class HeadFormat(unittest.TestCase):
                     check(2)
                     record[field] = original
 
+    def test_frozen_qualification_binds_held_out_ids_and_reference_bars(self):
+        with tempfile.TemporaryDirectory() as d:
+            cases = [f"w{i:02d}" for i in range(13)]
+            d = self.kit(d, cases, cand_ids=20)
+            self.assertEqual(self.gate(d)[0], 0)
+            frozen = d / "frozen.json"
+            windows = {}
+            for c in cases:
+                ids = np.array((d / f"{c}.ids").read_text(encoding="utf-8").split(), dtype="<u4")
+                windows[c] = {"class": "prose", "ids_sha256": hashlib.sha256(ids.tobytes()).hexdigest()}
+            payload = json.dumps({"schema": "strix-gate-frozen-qualification/v1", "windows": windows,
+                                  "reference_nll": {"prose": [1.0, 1.0, 1.0]}}).encode("utf-8")
+            frozen.write_bytes(payload)
+            args = ["--frozen-qualification", str(frozen), hashlib.sha256(payload).hexdigest()]
+            rc, out = self.gate(d, *args)
+            self.assertEqual(rc, 4, out)
+            self.assertIn("HOLD off-distribution", out)
+            rc, out = self.gate(d, *args, "--cases", *cases[:-1])
+            self.assertEqual(rc, 2, out)
+            self.assertIn("frozen qualification window set", out)
+            replaced_ids = d / f"{cases[0]}.ids"
+            replaced_ids.write_text("0 " * self.N, encoding="utf-8")
+            rc, out = self.gate(d, *args)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("frozen qualification IDs differ", out)
+
     def test_nonfinite_last_head_row_is_checked_without_scoring_an_extra_label(self):
         with tempfile.TemporaryDirectory() as d:
             d = self.kit(d, [f"w{i:02d}" for i in range(13)])

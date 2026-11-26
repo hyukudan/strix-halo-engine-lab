@@ -487,6 +487,15 @@ uint32 IDs. Step and spool captures include their labels in the hashed logit fil
 from the executed arms. The checker validates the binding of that record to the inputs. Disabling the check permits
 historical fixtures with no launcher record.
 
+For preregistered qualification, `qual --frozen-qualification PLAN.json SHA256` pins the complete case set, content
+classes, IDs and class-specific R4 reference distribution. Publish the SHA-256 before collecting the candidate.
+The plan has `schema` equal to `strix-gate-frozen-qualification/v1`, a `windows` map from case to
+`{"class": CLASS, "ids_sha256": DIGEST}`, and a `reference_nll` map from class to at least three previous reference-only
+window NLLs. Hash little-endian uint32 IDs in order: the full prompt for head captures, the scored labels for step and
+spool captures. The gate validates those IDs against the consumed evidence and reports the pinned digest and bars.
+A window above its frozen class bar holds the verdict even with only one window in the new run. The ordinary
+reference checks still apply.
+
 `qual --r4-assess ORIGINAL_NLLS.json`, with `--classes` and `--manifest`, adds an **R4 DIAGNOSTIC ONLY** report on
 stderr after the ordinary verdict. Supply one original reference mean NLL per window, grouped by content class (for
 example, `{"prose": [1.1, 1.3, 1.5]}`). The report fixes each class's median and R4 bar from those original values,

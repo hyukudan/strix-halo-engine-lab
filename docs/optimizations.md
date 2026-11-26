@@ -10,6 +10,11 @@
 
 `gate_v2.py qual --null-control-witness WITNESS.json` checks that the launcher recorded the same binary, model and numerical configuration for the reference and each order-only null. It binds the control to the consumed logits and, for head dumps, to the full prompt IDs. This explicit gate option requires launcher evidence and preserves engine defaults.
 
+<a id="platform-fast-frozen-qualification"></a>
+### Preregistered FAST gate evidence
+
+`gate_v2.py qual --frozen-qualification PLAN.json SHA256` binds the scored case set, content classes and token IDs to a published digest. It evaluates each reference against the plan's historical NLL distribution for that class, including when the new batch has fewer than three windows. This host gate option preserves engine defaults.
+
 <a id="ds41-single-attention-read-ahead"></a>
 ### Single DeepSeek attention read-ahead
 
