@@ -54,6 +54,12 @@ residual_block_layers = 6
 drafter = "mtp.safetensors"
 max_draft_by_live = [7, 0]
 
+# Charged re-probe episodes of the shared arbiter (include/strix/spec/probe_policy.hpp), per backend with a receipt.
+# cuda: RTX CLI EXACT, 256 tokens, ids equal: code 130.2 / 131.4 tok/s vs 116.0 with the fixed interval (90.8 with
+# speculation off); prose 91.3 / 91.2 vs 94.8 with speculation off (0.963). hip / cpu: no row, the fixed interval.
+[speculation.probe_loss]
+cuda = 0.015
+
 # Launchers project these columns into the engine's native, gated registry.
 [presets]
 # The unqualified native Inkling Mini CLI runs EXACT; FAST is explicitly opt-in.

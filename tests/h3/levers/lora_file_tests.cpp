@@ -69,6 +69,34 @@ template <class F> bool throws(F f) {
     return false;
 }
 
+// Malformed headers are refused while parsing: deep nesting, negative / fractional / reversed extents, an extent past
+// the end of the file (2 data bytes here) and a shape whose element count overflows.
+void test_malformed_headers() {
+    const std::string p = (std::filesystem::temp_directory_path() / "h3_lora_file_bad.safetensors").string();
+    const std::string headers[] = {
+        std::string(100000, '['),
+        R"({"m.lora_B.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"m.lora_A.weight":{"dtype":"BF16","shape":[-1],"data_offsets":[0,2]}})",
+        R"({"m.lora_B.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"m.lora_A.weight":{"dtype":"BF16","shape":[1.5],"data_offsets":[0,2]}})",
+        R"({"m.lora_B.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"m.lora_A.weight":{"dtype":"BF16","shape":[1],"data_offsets":[-2,0]}})",
+        R"({"m.lora_B.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"m.lora_A.weight":{"dtype":"BF16","shape":[1],"data_offsets":[2,0]}})",
+        R"({"m.lora_B.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"m.lora_A.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,1e300]}})",
+        R"({"m.lora_B.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"m.lora_A.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,4503599627370496]}})",
+        R"({"m.lora_B.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,4]},"m.lora_A.weight":{"dtype":"BF16","shape":[1],"data_offsets":[2,4]}})",
+        R"({"m.lora_B.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"m.lora_A.weight":{"dtype":"BF16","shape":[4294967296,4294967296],"data_offsets":[0,0]}})",
+    };
+    for (const auto& h : headers) {
+        {
+            std::ofstream f(p, std::ios::binary);
+            const std::uint64_t n = h.size();
+            f.write(reinterpret_cast<const char*>(&n), 8);
+            f.write(h.data(), static_cast<std::streamsize>(h.size()));
+            f.write("\0\0", 2);
+        }
+        CHECK(throws([&] { LoraFile lf(p); }), "malformed header accepted: %.60s", h.c_str());
+    }
+    std::filesystem::remove(p);
+}
+
 void test_synthetic() {
     const auto dir = std::filesystem::temp_directory_path();
     const std::string p = (dir / "h3_lora_file_test.safetensors").string();
@@ -157,6 +185,7 @@ void test_real(const std::string& dir) {
 
 int main(int argc, char** argv) {
     test_synthetic();
+    test_malformed_headers();
     if (argc > 2 && std::string(argv[1]) == "--real") test_real(argv[2]);
     else std::printf("real files: skipped (pass --real <models dir>)\n");
     std::printf("lora file tests %s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);

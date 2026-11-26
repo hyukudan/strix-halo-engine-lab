@@ -314,6 +314,23 @@ static bool same(const Out& a, const Out& b) {
     return a.raw.size() == b.raw.size() && std::memcmp(a.raw.data(), b.raw.data(), a.raw.size() * 4) == 0 && a.status == b.status;
 }
 
+// The first difference of two outputs and how many elements differ (diagnostic text of a failed comparison).
+static std::string difference(const Out& a, const Out& b) {
+    if (a.raw.size() != b.raw.size()) return " (sizes differ)";
+    size_t first = a.raw.size(), count = 0;
+    for (size_t i = 0; i < a.raw.size(); ++i)
+        if (std::memcmp(&a.raw[i], &b.raw[i], 4) != 0) { if (first == a.raw.size()) first = i; ++count; }
+    std::string out = " (" + std::to_string(count) + " of " + std::to_string(a.raw.size()) + " values differ";
+    if (count) {
+        u32 x, y; std::memcpy(&x, &a.raw[first], 4); std::memcpy(&y, &b.raw[first], 4);
+        char text[96];
+        std::snprintf(text, sizeof text, "; first at %zu: %08x vs %08x", first, x, y);
+        out += text;
+    }
+    if (a.status != b.status) out += "; status differs";
+    return out + ")";
+}
+
 static void write_tables(const std::string& dir, Rng& r) {
     std::filesystem::create_directories(dir);
     {
@@ -370,7 +387,17 @@ static void check_short_bitmap(const std::string& dir) {
     }
 }
 
+// The oracle rounds every product before the next add, as the library does (both are built with -ffp-contract=off).
+// (1 + 2^-12)^2 - (1 + 2^-11) is 0 with a rounded product and 2^-24 when the compiler fuses it into an FMA.
+static bool oracle_rounds_products() {
+    volatile float a = 1.0F + 0x1p-12F, c = 1.0F + 0x1p-11F;
+    const float x = a, y = c;
+    const float r = x * x - y;
+    return r == 0.0F;
+}
+
 int main() {
+    expect(oracle_rounds_products(), "oracle TU fuses a * b - c into an FMA: build this test with -ffp-contract=off");
     Rng rng(0x5eedULL);
     std::string dir;
     bool synthetic = false;
@@ -399,7 +426,7 @@ int main() {
                     Out ref = blank(rows, sz.sh.hidden), orc = blank(rows, sz.sh.hidden);
                     { ex::Job j = make_job(L, c, ref); ex::reference_run(j, exp); }
                     oracle_run(hx, L, c, orc);
-                    expect(same(ref, orc), "reference_run vs verbatim oracle: " + tag);
+                    expect(same(ref, orc), "reference_run vs verbatim oracle: " + tag + (same(ref, orc) ? "" : difference(ref, orc)));
                     expect(ref.status == std::vector<u32>(rows, 0), "finite case has no status: " + tag);
                     ++g_cases;
                     for (unsigned t : thread_counts)

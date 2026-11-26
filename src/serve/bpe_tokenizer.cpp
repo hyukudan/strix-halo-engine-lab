@@ -1,5 +1,6 @@
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/json.hpp"
+#include "strix/serve/tokenizer_limits.hpp"
 #include "o200k_pretokenizer.hpp"
 #include "tokenizer_utf8.hpp"
 
@@ -7,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iterator>
@@ -427,9 +429,20 @@ struct GgufTokenizer {
     std::string model, pre;
     std::uint32_t eos = UINT32_MAX;
 };
+constexpr std::uint64_t kMaxGgufTokenizerEntries = 1'000'000;  // as gguf::Limits::max_metadata_entries
+constexpr std::uint64_t kMaxGgufTokenizerMerges = std::uint64_t{1} << 24U;
 GgufTokenizer read_gguf_tokenizer(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file) throw std::runtime_error("tokenizer: cannot open " + path);
+    std::error_code size_error;
+    const auto file_bytes = std::filesystem::file_size(path, size_error);
+    if (size_error) throw std::runtime_error("tokenizer: cannot size " + path);
+    // Bytes after the read position: every array count is checked against it before anything is sized from the count.
+    const auto remaining = [&]() -> std::uint64_t {
+        const auto at = file.tellg();
+        if (at < 0 || static_cast<std::uint64_t>(at) > file_bytes) throw std::runtime_error("tokenizer: GGUF read position is invalid");
+        return file_bytes - static_cast<std::uint64_t>(at);
+    };
     const auto read = [&](void* p, std::size_t n) {
         if (!file.read(static_cast<char*>(p), static_cast<std::streamsize>(n))) throw std::runtime_error("tokenizer: truncated GGUF header");
     };
@@ -449,6 +462,7 @@ GgufTokenizer read_gguf_tokenizer(const std::string& path) {
     if (u32() < 2U) throw std::runtime_error("tokenizer: GGUF version below 2");
     (void)u64();
     const auto entries = u64();
+    if (entries > kMaxGgufTokenizerEntries) throw std::runtime_error("tokenizer: GGUF metadata entry count is out of range");
     GgufTokenizer out;
     for (std::uint64_t e = 0; e < entries; ++e) {
         const auto key = string();
@@ -462,10 +476,19 @@ GgufTokenizer read_gguf_tokenizer(const std::string& path) {
         if (type == 9U) {
             const auto item = u32();
             const auto count = u64();
+            // A string takes at least its 8-byte length; any other element at least one byte.
+            const std::uint64_t element_bytes = item == 8U ? 8U : item < sizes.size() ? sizes[item] : 0U;
+            if (element_bytes != 0U && count > remaining() / element_bytes)
+                throw std::runtime_error("tokenizer: GGUF array count exceeds the file");
             if (item == 8U) {
                 std::vector<std::string>* target = key == "tokenizer.ggml.tokens" ? &out.tokens :
                     key == "tokenizer.ggml.merges" ? &out.merges : nullptr;
-                if (target) target->reserve(static_cast<std::size_t>(count));
+                if (target) {
+                    const auto limit = key == "tokenizer.ggml.tokens" ? static_cast<std::uint64_t>(kMaxTokenizerVocabId) + 1U
+                                                                      : kMaxGgufTokenizerMerges;
+                    if (count > limit) throw std::runtime_error("tokenizer: GGUF array count is out of range");
+                    target->reserve(static_cast<std::size_t>(count));
+                }
                 for (std::uint64_t k = 0; k < count; ++k) {
                     auto value = string();
                     if (target) target->push_back(std::move(value));
@@ -474,11 +497,15 @@ GgufTokenizer read_gguf_tokenizer(const std::string& path) {
             }
             if (item >= sizes.size() || !sizes[item]) throw std::runtime_error("tokenizer: unsupported GGUF array element type");
             if (key == "tokenizer.ggml.token_type" && (item == 5U || item == 4U)) {
+                if (count > static_cast<std::uint64_t>(kMaxTokenizerVocabId) + 1U)
+                    throw std::runtime_error("tokenizer: GGUF array count is out of range");
                 out.types.resize(static_cast<std::size_t>(count));
                 read(out.types.data(), out.types.size() * 4U);
                 continue;
             }
-            file.seekg(static_cast<std::streamoff>(sizes[item] * count), std::ios::cur);
+            // count * element size <= remaining (checked above), so the product fits and is not negative.
+            if (!file.seekg(static_cast<std::streamoff>(sizes[item] * count), std::ios::cur))
+                throw std::runtime_error("tokenizer: GGUF array skip failed");
             continue;
         }
         if (type >= sizes.size() || !sizes[type]) throw std::runtime_error("tokenizer: unsupported GGUF metadata type");
@@ -685,9 +712,7 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf_byte_bpe(const std::st
 
 std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf(const std::string& path, std::string_view explicit_eos) {
     const bool strict = !explicit_eos.empty();
-    std::ifstream in(path, std::ios::binary);
-    if (!in) throw std::runtime_error("tokenizer: cannot open " + path);
-    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const std::string text = read_tokenizer_file(path, "tokenizer");
     const Json root = strict ? parse_json_unique(text, 64U << 20U, kMaxRequestJsonValues) : parse_json(text);
     const Json* model = root.find("model");
     const Json* pre = root.find("pre_tokenizer");
@@ -737,7 +762,7 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf(const std::string& pat
     std::vector<std::string> tokens;
     std::vector<std::int32_t> types;
     const auto put = [&](std::int64_t id, const std::string& t, TokenType type) {
-        if (id < 0 || id > 0x7FFFFFFF || (strict && static_cast<std::uint64_t>(id) >= kMaxRequestJsonValues))
+        if (id < 0 || id > kMaxTokenizerVocabId || (strict && static_cast<std::uint64_t>(id) >= kMaxRequestJsonValues))
             throw std::invalid_argument("tokenizer: token ID out of range");
         const auto i = static_cast<std::size_t>(id);
         if (strict && (t.empty() || (i < tokens.size() && !tokens[i].empty() &&

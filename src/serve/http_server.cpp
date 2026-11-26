@@ -1,4 +1,5 @@
 #include "strix/serve/http_server.hpp"
+#include "tokenizer_utf8.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -455,7 +456,14 @@ struct HttpServer::Impl {
                     connection.keep_alive = false;
                     if (!connection.responded()) {
                         std::string body = R"({"error":{"message":")";
-                        for (const char c : std::string(error.what())) { if (c == '"' || c == '\\') body.push_back('\\'); body.push_back(c >= 0x20 ? c : ' '); }
+                        // Valid UTF-8 is kept, every invalid sequence becomes U+FFFD (the body stays valid JSON
+                        // text), and control bytes become spaces.
+                        std::string message;
+                        tokenizer_utf8::append_lossy(message, error.what());
+                        for (const char c : message) {
+                            if (c == '"' || c == '\\') body.push_back('\\');
+                            body.push_back(static_cast<unsigned char>(c) >= 0x20U ? c : ' ');
+                        }
                         body += R"(","type":"server_error"}})";
                         connection.send(500, "application/json", body);
                     }

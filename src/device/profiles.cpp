@@ -1,44 +1,71 @@
 #include "strix/device/profiles.hpp"
 #include "strix/device/link_class.hpp"
+#include "strix/device/profiles_data.hpp"
+#include "strix/model_description.hpp"
 
 #include <iomanip>
 #include <sstream>
+#include <stdexcept>
+#include <utility>
 
 namespace strix::device {
 namespace {
 
-constexpr std::uint64_t MiB = 1024ULL * 1024ULL;
-constexpr std::uint64_t GiB = 1024ULL * MiB;
+using model_description::Value;
+using Table = Value::Table;
 
-// NVIDIA tensor peaks: dense, derived from the stated FP4 (Blackwell) / FP8 (Ada) 2:4-sparse "AI TOPS" (halved for
-// dense, halved again per wider format, FP16-accumulate rate); GeForce cards run BF16 / FP32-accumulate at half that
-// rate, the RTX PRO and GB10 parts at full rate. memory_bytes for NVIDIA cards = the runtime's reported total
-// (nvidia-smi memory.total), not the marketing GB.
-const std::vector<Profile> kCatalogue = {
-    {"rtx-pro-6000-blackwell-96", "NVIDIA RTX PRO 6000 Blackwell (96 GB)", "nvidia", "sm_120", 102641958912ULL, 1792,
-     {125, 500, 500, 1000, 2000, 1000}, 188, "SM", 5, 16, "pcie5x16", false, "memory_bytes,units",
-     "our card; memory_bytes and units read from the runtime, peaks public spec"},
-    {"rtx-5090-32", "NVIDIA GeForce RTX 5090 (32 GB)", "nvidia", "sm_120", 32607 * MiB, 1792,
-     {104.8, 419, 209.5, 838, 1676, 838}, 170, "SM", 5, 16, "pcie5x16", false, "",
-     "same SM generation as the RTX PRO 6000 with 170 of its 188 SMs: about 10 % less compute at equal memory speed"},
-    {"rtx-5080-16", "NVIDIA GeForce RTX 5080 (16 GB)", "nvidia", "sm_120", 16303 * MiB, 960,
-     {56.3, 225.1, 112.6, 450.2, 900.5, 450.2}, 84, "SM", 5, 16, "pcie5x16", false, "", ""},
-    {"rtx-4090-24", "NVIDIA GeForce RTX 4090 (24 GB)", "nvidia", "sm_89", 24564 * MiB, 1008,
-     {82.6, 330.3, 165.2, 660.6, 0, 660.6}, 128, "SM", 4, 16, "pcie4x16", false, "",
-     "profile only (planning); no FP4 tensor path on sm_89"},
-    {"strix-halo-128", "AMD Ryzen AI Max+ 395 / Radeon 8060S (128 GB)", "amd", "gfx1151", 125829120000ULL, 256,
-     {29.7, 59.4, 59.4, 0, 0, 59.4}, 40, "CU", 0, 0, "integrated", true, "memory_bytes",
-     "our nodes; memory_bytes = GPU-visible memory as configured there (depends on the GTT setting); "
-     "HIP reports 20 compute units (WGPs); measured stream read about 243 GB/s; WMMA FP16 = BF16 = IU8 rate",
-     {64, 64}},
-    {"dgx-spark-gb10-128", "NVIDIA DGX Spark GB10 (128 GB)", "nvidia", "sm_121", 128 * GiB, 273,
-     {0, 125, 125, 250, 500, 250}, 48, "SM", 0, 0, "nvlink-c2c", true, "",
-     "unified LPDDR5X shared with the CPU; usable GPU memory is lower than 128 GiB"},
-    {"rx-9070-xt-16", "AMD Radeon RX 9070 XT (16 GB, RDNA4)", "amd", "gfx1201", 16 * GiB, 640,
-     {48.7, 195, 195, 389, 0, 389}, 64, "CU", 5, 16, "pcie5x16", false, "", "RDNA4 discrete; WMMA FP8 and IU8 at 2x FP16"},
-    {"custom", "custom device (every value from the declaration entry)", "", "", 0, 0, {}, 0, "", 0, 0, "", false, "",
-     "set memory_gib (and optionally bandwidth_gbytes_ps, units) in the entry"},
-};
+template <typename T>
+const T& field(const Table& table, const char* key) {
+    const auto it = table.find(key);
+    if (it != table.end())
+        if (const auto* value = std::get_if<T>(&it->second.data)) return *value;
+    throw std::invalid_argument(std::string("device profiles: invalid or missing ") + key);
+}
+
+template <typename T>
+T unsigned_field(const Table& table, const char* key) {
+    const auto value = field<std::int64_t>(table, key);
+    if (!std::in_range<T>(value)) throw std::invalid_argument(std::string("device profiles: out of range ") + key);
+    return static_cast<T>(value);
+}
+
+double real_field(const Table& table, const char* key) {
+    const auto it = table.find(key);
+    if (it != table.end())
+        if (const auto* value = std::get_if<std::int64_t>(&it->second.data)) return static_cast<double>(*value);
+    return field<double>(table, key);
+}
+
+Profile parse_profile(const Table& row) {
+    const auto& pcie = field<Table>(row, "pcie");
+    const auto& peaks = field<Table>(row, "peaks");
+    Profile profile{
+        field<std::string>(row, "name"), field<std::string>(row, "display"),
+        field<std::string>(row, "vendor"), field<std::string>(row, "arch"),
+        unsigned_field<std::uint64_t>(row, "memory_bytes"), real_field(row, "memory_gbytes_ps"),
+        {real_field(peaks, "fp32"), real_field(peaks, "fp16"), real_field(peaks, "bf16"),
+         real_field(peaks, "fp8"), real_field(peaks, "fp4"), real_field(peaks, "int8")},
+        unsigned_field<std::uint32_t>(row, "units"), field<std::string>(row, "unit_kind"),
+        unsigned_field<std::uint32_t>(pcie, "gen"), unsigned_field<std::uint32_t>(pcie, "width"),
+        field<std::string>(row, "host_link"), field<bool>(row, "unified"), field<std::string>(row, "measured"),
+        row.contains("note") ? std::string_view(field<std::string>(row, "note")) : std::string_view{}};
+    if (row.contains("lowbit_rows")) {
+        const auto& lowbit = field<Table>(row, "lowbit_rows");
+        profile.lowbit_rows = {unsigned_field<std::uint32_t>(lowbit, "small_rows"),
+                               unsigned_field<std::uint32_t>(lowbit, "wide_panels")};
+    }
+    return profile;
+}
+
+std::vector<Profile> parse_catalogue(const Table& root) {
+    if (field<std::string>(root, "schema") != "strix-device-profiles-v1")
+        throw std::invalid_argument("device profiles: expected strix-device-profiles-v1");
+    const auto& rows = field<Value::Array>(root, "profiles");
+    std::vector<Profile> profiles;
+    profiles.reserve(rows.size());
+    for (const auto& row : rows) profiles.push_back(parse_profile(std::get<Table>(row.data)));
+    return profiles;
+}
 
 // A view of the one link-class table (link_class.hpp): names, order and notes for `count = N` shapes; the rates are
 // the class rates (no second copy of a number).
@@ -77,17 +104,22 @@ std::string quoted(std::string_view s) {
 
 } // namespace
 
-const std::vector<Profile>& catalogue() { return kCatalogue; }
+const std::vector<Profile>& catalogue() {
+    // Profile views refer to strings in this process-lifetime TOML parse.
+    static const auto data = model_description::parse(detail::profiles_toml, model_description::TableSyntax::root_array_tables);
+    static const auto profiles = parse_catalogue(data.fields);
+    return profiles;
+}
 
 const Profile* find_profile(std::string_view name) noexcept {
-    for (const auto& p : kCatalogue)
+    for (const auto& p : catalogue())
         if (p.name == name) return &p;
     return nullptr;
 }
 
 std::string profile_names() {
     std::string out;
-    for (const auto& p : kCatalogue) out += (out.empty() ? "" : ", ") + std::string(p.name);
+    for (const auto& p : catalogue()) out += (out.empty() ? "" : ", ") + std::string(p.name);
     return out;
 }
 
@@ -101,11 +133,12 @@ const Interconnect* find_interconnect(std::string_view name) noexcept {
 
 std::string catalogue_toml() {
     std::ostringstream os;
+    // Preserve the CLI export bytes. The input TOML has its own editable-file header.
     os << "# Generated from src/device/profiles.cpp (strix::device::catalogue_toml); do not edit by hand.\n"
           "# Peaks are dense TFLOPS / TOPS; 0 = no tensor path or not stated. `measured` lists the fields read on our\n"
           "# own devices; everything else is the vendor's public specification.\n"
           "schema = \"strix-device-profiles-v1\"\n";
-    for (const auto& p : kCatalogue) {
+    for (const auto& p : catalogue()) {
         os << "\n[profiles." << p.name << "]\n"
            << "display = " << quoted(p.display) << "\n"
            << "vendor = " << quoted(p.vendor) << "\n"

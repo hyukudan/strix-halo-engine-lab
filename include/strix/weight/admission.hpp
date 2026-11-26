@@ -1,6 +1,7 @@
 #pragma once
 #include "source.hpp"
 #include "strix/gguf_reader.hpp"
+#include "shard_name.hpp"
 #include <limits>
 namespace strix::weight {
 enum class Container : std::uint8_t { gguf, safetensors, pack };

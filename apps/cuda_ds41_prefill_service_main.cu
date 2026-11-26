@@ -77,7 +77,9 @@
 #include "strix/cuda/ds41_replay.hpp"
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/model_content_hash.hpp"
+#include "strix/serve/http_wire.hpp"
 #include "strix/serve/json.hpp"
+#include "strix/serve/secure_equal.hpp"
 
 #include <cuda_runtime.h>
 
@@ -169,22 +171,6 @@ bool send_all(Sock s, const char* p, std::size_t n) {
     return true;
 }
 
-int recv_some(Sock s, char* p, std::size_t n) {
-    return static_cast<int>(::recv(s, p, static_cast<int>(std::min<std::size_t>(n, 1U << 20)), 0));
-}
-
-std::string lower(std::string v) {
-    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    return v;
-}
-
-std::string trim(const std::string& v) {
-    std::size_t a = 0, b = v.size();
-    while (a < b && (v[a] == ' ' || v[a] == '\t')) ++a;
-    while (b > a && (v[b - 1] == ' ' || v[b - 1] == '\t' || v[b - 1] == '\r')) --b;
-    return v.substr(a, b - a);
-}
-
 // One HTTP/1.1 message (request or response): start line, lower-case headers, Content-Length body.
 struct Message {
     std::string start;
@@ -197,54 +183,24 @@ struct Message {
 };
 
 // Reads one message; without Content-Length a response body runs to the connection's end (requests: no body).
-// Returns an error text, empty on success.
+// Returns an error text, empty on success. The shared strix::serve reader parses it: a request must arrive within
+// one total deadline, Content-Length is plain digits and repeated fields must agree, and the body buffer grows with
+// the bytes received (never reserved from the announced length). A reply is read without that deadline: the peer
+// may compute first, and the socket timeouts bound each wait.
 std::string read_message(Sock s, Message& m, std::size_t max_body, bool is_response) {
-    std::string buf;
-    char tmp[65536];
-    std::size_t head_end = std::string::npos;
-    while ((head_end = buf.find("\r\n\r\n")) == std::string::npos) {
-        if (buf.size() > 65536) return "headers too large";
-        const int k = recv_some(s, tmp, sizeof(tmp));
-        if (k <= 0) return buf.empty() ? "connection closed" : "truncated headers";
-        buf.append(tmp, static_cast<std::size_t>(k));
-    }
-    const std::string head = buf.substr(0, head_end);
-    std::size_t pos = head.find("\r\n");
-    m.start = head.substr(0, pos);
-    while (pos != std::string::npos) {
-        const std::size_t next = head.find("\r\n", pos + 2);
-        const std::string line = head.substr(pos + 2, next == std::string::npos ? std::string::npos : next - pos - 2);
-        if (const auto colon = line.find(':'); colon != std::string::npos) m.headers[lower(trim(line.substr(0, colon)))] = trim(line.substr(colon + 1));
-        pos = next;
-    }
-    m.body = buf.substr(head_end + 4);
-    if (!m.header("transfer-encoding").empty() && lower(m.header("transfer-encoding")) != "identity") return "chunked bodies are not supported";
-    const std::string cl = m.header("content-length");
-    if (cl.empty()) {
-        if (!is_response) return {};
-        for (;;) {
-            const int k = recv_some(s, tmp, sizeof(tmp));
-            if (k <= 0) break;
-            m.body.append(tmp, static_cast<std::size_t>(k));
-            if (m.body.size() > max_body) return "body too large";
-        }
-        return {};
-    }
-    std::size_t want = 0;
-    try {
-        want = static_cast<std::size_t>(std::stoull(cl));
-    } catch (const std::exception&) {
-        return "bad Content-Length";
-    }
-    if (want > max_body) return "body too large";
-    m.body.reserve(want);
-    while (m.body.size() < want) {
-        const int k = recv_some(s, tmp, std::min(sizeof(tmp), want - m.body.size()));
-        if (k <= 0) return "truncated body";
-        m.body.append(tmp, static_cast<std::size_t>(k));
-    }
-    m.body.resize(want);
-    return {};
+    strix::serve::HttpWireLimits limits;
+    limits.max_body_bytes = max_body;
+    limits.request_timeout_ms = is_response ? 0 : 60'000;
+    limits.body_until_close = is_response;
+    strix::serve::HttpWireMessage w;
+    std::string carry;
+    const std::string err = strix::serve::read_http_message(
+        [s](char* p, std::size_t n, int ms) { return strix::serve::wire_recv(s, p, n, ms); }, w, limits, carry);
+    m.start = std::move(w.start);
+    m.headers.clear();
+    for (const auto& [k, v] : w.headers) m.headers[k] = v;
+    m.body = std::move(w.body);
+    return err;
 }
 
 const char* reason(int status) {
@@ -255,7 +211,9 @@ const char* reason(int status) {
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
     case 409: return "Conflict";
+    case 408: return "Request Timeout";
     case 413: return "Payload Too Large";
+    case 431: return "Request Header Fields Too Large";
     case 500: return "Internal Server Error";
     case 502: return "Bad Gateway";
     case 503: return "Service Unavailable";
@@ -443,7 +401,7 @@ public:
             list.push(std::move(item));
         }
         Json final = Json::object(); final.set("name", Json("final"));
-        final.set("bytes", Json(std::uint64_t{position} * 4U + (4ULL << 20U)));
+        final.set("bytes", Json(std::uint64_t{position} * 4U + (std::uint64_t{4} << 20U)));
         list.push(std::move(final));
         manifest.set("sections", std::move(list));
         begun_ = true;  // even an unacknowledged begin may exist at the receiver and need aborting
@@ -1383,7 +1341,7 @@ void handle(Sock s, Service& svc, const Config& c, std::uint32_t max_positions, 
     const auto max_body = bounded_passes ? std::size_t{max_positions} * 16U + 65536U : std::size_t{256} << 20;
     const std::string err = read_message(s, req, max_body, false);
     if (!err.empty()) {
-        if (err != "connection closed") respond(s, 400, error_json(err).dump());
+        if (err != "connection closed") respond(s, strix::serve::http_wire_error_status(err), error_json(err).dump());
         return;
     }
     const auto sp1 = req.start.find(' ');
@@ -1397,8 +1355,12 @@ void handle(Sock s, Service& svc, const Config& c, std::uint32_t max_positions, 
         const Json* st = h.find("status");
         return respond(s, st != nullptr && st->as_string() == "ok" ? 200 : 503, h.dump());
     }
-    if (!c.api_key.empty() && req.header("authorization") != "Bearer " + c.api_key && req.header("x-api-key") != c.api_key)
-        return respond(s, 401, error_json("invalid or missing API key").dump());
+    if (!c.api_key.empty()) {
+        // Both comparisons always run, each in time independent of the key content.
+        const bool by_bearer = strix::serve::secure_equal(req.header("authorization"), "Bearer " + c.api_key);
+        const bool by_header = strix::serve::secure_equal(req.header("x-api-key"), c.api_key);
+        if (!by_bearer && !by_header) return respond(s, 401, error_json("invalid or missing API key").dump());
+    }
     if (path == "/v1/describe") {
         if (method != "GET") return respond(s, 405, error_json("GET").dump());
         return respond(s, 200, svc.describe().dump());
@@ -1725,33 +1687,26 @@ int main(int argc, char** argv) {
         std::vector<std::thread> conns;
         std::atomic<int> live{0};
         while (!g_stop.load()) {
-            fd_set rd;
-            FD_ZERO(&rd);
-            FD_SET(ls, &rd);
-            timeval tv{};
-            tv.tv_usec = 200000;
-            const int k = ::select(static_cast<int>(ls + 1), &rd, nullptr, nullptr, &tv);
-            if (k <= 0) continue;
+            // poll(), not select(): a listening descriptor number above FD_SETSIZE must not overflow an fd_set.
+            if (!strix::serve::wire_wait_readable(ls, 200)) continue;
             const Sock cs = ::accept(ls, nullptr, nullptr);
             if (cs == kNoSock) continue;
-            if (o.pass_rows && live.load() >= static_cast<int>(c.max_queue + 4U)) {
-                respond(cs, 503, error_json("too many live connections for bounded host memory").dump());
-                close_sock(cs);
-                continue;
-            }
             int on = 1;
             setsockopt(cs, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&on), sizeof(on));
             set_timeouts(cs, 3600);
-            ++live;
-            std::thread([cs, &svc, &c, &live, &o] {
+            // The live-connection cap always applies; a refused or failed thread start answers 503 and closes.
+            const bool started = strix::serve::spawn_counted_connection(live, static_cast<int>(c.max_queue + 4U), [cs, &svc, &c, &o] {
                 try {
                     handle(cs, svc, c, o.max_positions, o.pass_rows != 0U);
                 } catch (const std::exception& e) {
                     std::fprintf(stderr, "strix-cuda-ds41-prefill-service: connection: %s\n", e.what());
                 }
                 close_sock(cs);
-                --live;
-            }).detach();
+            });
+            if (!started) {
+                respond(cs, 503, error_json("too many live connections for bounded host memory").dump());
+                close_sock(cs);
+            }
         }
         close_sock(ls);
         while (live.load() > 0) std::this_thread::sleep_for(std::chrono::milliseconds(50));  // the running request ends

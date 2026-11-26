@@ -1,6 +1,8 @@
 """Tests of the CI helpers: change classification (ci_changes.py) and unittest sharding (unittest_shard.py)."""
 import pathlib
+import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -38,7 +40,8 @@ class Classify(unittest.TestCase):
     def test_hip_inputs(self):
         for path in ('src/core/x.cpp', 'include/strix/a.hpp', 'CMakeLists.txt', 'cmake/StrixDevice.cmake',
                      'src/hip_shared_expert_launcher.hip', 'tests/hip_launcher_tests.cpp',
-                     'lab/uma_residency/hip_residency.hip', '.github/workflows/ci.yml', 'apps/x.cpp'):
+                     'lab/uma_residency/hip_residency.hip', '.github/workflows/ci.yml', 'apps/x.cpp',
+                     'data/devices/profiles.toml'):
             self.check([path], True, True)
 
     def test_non_hip_paths(self):
@@ -46,6 +49,12 @@ class Classify(unittest.TestCase):
                      'tools/strix-gate/x.py', 'scripts/bench/a.sh', 'tests/serve_cycles_tests.py',
                      'lab/transport/tcp.cpp', '.github/workflows/other.yml'):
             self.check([path], True, False)
+
+    def test_codegen_and_scratch_contract_changes_run_hip_ci(self):
+        for path in ('tools/gen_q8_rows_vopd.py', 'tools/gen_ds41_qk_asm.py', 'tools/ci/check_generated_asm.py',
+                     'tools/check_kernel_scratch.py', 'tools/kernel_scratch_allowance.txt',
+                     'tools/kernel_scratch_known.txt'):
+            self.check([path], True, True)
 
 
 class Shard(unittest.TestCase):
@@ -71,6 +80,43 @@ class Shard(unittest.TestCase):
     def test_bad_arguments(self):
         self.assertEqual(unittest_shard.main(['x', 'm', '2', '2']), 2)
         self.assertEqual(unittest_shard.main(['x', 'm']), 2)
+
+
+class Scratch(unittest.TestCase):
+    def test_allowance_requires_decoded_kernel_metadata(self):
+        root = pathlib.Path(__file__).resolve().parents[2]
+        script = root / 'tools/check_kernel_scratch.py'
+        allowance = root / 'tools/kernel_scratch_allowance.txt'
+        for name, expected in (('README.md', 2), ('lab/cross_compile/out/probe.gfx1151.hsaco', 0)):
+            with self.subTest(artifact=name):
+                result = subprocess.run([sys.executable, '-I', '-B', str(script), '--quiet',
+                                         '--allowance', str(allowance), str(root / name)],
+                                        capture_output=True, text=True, timeout=15, check=False)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+    def test_missing_metadata_still_writes_csv_and_summary(self):
+        root = pathlib.Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path, summary = pathlib.Path(tmp) / 'k.csv', pathlib.Path(tmp) / 'summary.md'
+            result = subprocess.run([sys.executable, '-I', '-B', str(root / 'tools/check_kernel_scratch.py'), '--quiet',
+                                     '--allowance', str(root / 'tools/kernel_scratch_allowance.txt'),
+                                     '--known', str(root / 'tools/kernel_scratch_known.txt'),
+                                     '--csv', str(csv_path), '--summary', str(summary), str(root / 'README.md')],
+                                    capture_output=True, text=True, timeout=15, check=False)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertTrue(csv_path.read_text(encoding='utf-8').startswith('name,private,'))
+            self.assertIn('no AMDGPU kernel metadata', summary.read_text(encoding='utf-8'))
+
+    def test_known_list_parses_and_may_only_shrink(self):
+        root = pathlib.Path(__file__).resolve().parents[2]
+        sys.path.insert(0, str(root / 'tools'))
+        try:
+            import check_kernel_scratch as scratch
+        finally:
+            sys.path.pop(0)
+        known = scratch.load_known(root / 'tools/kernel_scratch_known.txt')
+        self.assertGreater(len(known), 0)
+        self.assertEqual(scratch.known_growth(known, known), [])
 
 
 if __name__ == '__main__':

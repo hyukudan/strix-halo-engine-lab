@@ -6,13 +6,14 @@
 #include "strix/device/budget.hpp"
 #include "strix/device/declaration.hpp"
 #include "strix/device/gate.hpp"
+#include "strix/device/link_class.hpp"
 #include "strix/device/profiles.hpp"
+#include "strix/model_description.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <set>
-#include <sstream>
 #include <string>
 #include <utility>
 
@@ -70,12 +71,33 @@ void catalogue() {
     for (const auto& p : device::catalogue())
         if (p.name != "custom") require(p.memory_bytes > 0 && p.memory_gbytes_ps > 0 && p.units > 0, "every known profile is sized");
     require(device::find_interconnect("pcie5x16") && !device::find_interconnect("nvlink"), "interconnect classes");
-    // The data file is the printed table.
-    std::ifstream in(std::string(STRIX_SOURCE_ROOT) + "/data/devices/profiles.toml", std::ios::binary);
-    std::ostringstream file;
-    file << in.rdbuf();
-    require(in.good() || in.eof(), "data/devices/profiles.toml is readable");
-    require(file.str() == device::catalogue_toml(), "data/devices/profiles.toml equals catalogue_toml() (regenerate: strix-device-plan --toml)");
+    // The exported TOML keeps the named v1 tables, with all source values in catalogue order.
+    using model_description::Value;
+    const auto source = model_description::load(std::string(STRIX_SOURCE_ROOT) + "/data/devices/profiles.toml",
+                                                model_description::TableSyntax::root_array_tables);
+    const auto output_text = device::catalogue_toml();
+    // Legacy CLI exports quote interconnect keys. The shared model parser accepts bare keys.
+    const auto link_section = output_text.find("\n# Interconnect classes");
+    require(link_section != std::string::npos, "the export includes its interconnect section");
+    const auto output = model_description::parse(std::string_view(output_text).substr(0, link_section));
+    const auto& ordered = std::get<Value::Array>(source.fields.at("profiles").data);
+    const auto& exported = std::get<Value::Table>(output.fields.at("profiles").data);
+    require(source.fields.at("schema") == output.fields.at("schema"), "the export uses the catalogue schema");
+    require(ordered.size() == device::catalogue().size() && ordered.size() == exported.size(),
+            "the catalogue and the export cover every profile");
+    for (std::size_t i = 0; i < ordered.size(); ++i) {
+        auto expected = std::get<Value::Table>(ordered[i].data);
+        const auto key = std::get<std::string>(expected.at("name").data);
+        expected.erase("name");
+        require(device::catalogue().at(i).name == key, "catalogue order follows the data");
+        require(std::get<Value::Table>(exported.at(key).data) == expected, "exported profile matches its data");
+    }
+    for (const auto& link : device::interconnects()) {
+        const auto* shared = device::find_link_class(link.name);
+        require(shared && shared->gbytes_ps == link.gbytes_ps && shared->rtt_us == link.rtt_us, "rates follow the shared link classes");
+        const auto header = "[interconnects.\"" + std::string(link.name) + "\"]\n";
+        require(output_text.find(header, link_section) != std::string::npos, "the export covers every catalogue interconnect");
+    }
 }
 
 void declaration() {

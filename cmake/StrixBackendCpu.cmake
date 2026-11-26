@@ -4,6 +4,7 @@ if(TARGET strix_backend_cpu)
     return()
 endif()
 get_filename_component(_strix_cpu_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+set(STRIX_CPU_LINEAR_REQUIRED ON)  # strix_backend_cpu links strix_cpu_linear (standalone projects set no family option)
 include(${CMAKE_CURRENT_LIST_DIR}/StrixCpuLinear.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/StrixWeight.cmake)
 add_library(strix_backend_cpu STATIC
@@ -51,6 +52,11 @@ if(BUILD_TESTING)
     # STRIX_EXP_TABLES=<dir> selects the real gfx1151 probe tables; otherwise synthetic tables are generated.
     add_executable(strix-cpu-routed-expert-tests ${_strix_cpu_root}/tests/cpu/routed_expert_host_tests.cpp)
     target_link_libraries(strix-cpu-routed-expert-tests PRIVATE strix_backend_cpu Threads::Threads)
+    # The oracle in this TU is a bitwise specification: it must round every product like the library does. A compiler
+    # whose default target has FMA (x86-64-v3 and later) contracts d * i - dm * j and similar forms otherwise.
+    if(NOT MSVC)
+        target_compile_options(strix-cpu-routed-expert-tests PRIVATE -ffp-contract=off -fno-fast-math)
+    endif()
     strix_target_warnings(strix-cpu-routed-expert-tests)
     add_test(NAME strix-cpu-routed-expert-tests COMMAND strix-cpu-routed-expert-tests)
 endif()

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <span>
@@ -16,6 +17,13 @@ namespace {
 void check(bool ok, const char* message) {
     if (!ok) throw std::runtime_error(message);
 }
+// A broken contract inside the fake backend ends the test: thrown, the session would turn it into a request error.
+void backend_contract(bool ok, const char* message) {
+    if (!ok) {
+        std::cerr << "fake backend contract broken: " << message << '\n';
+        std::abort();
+    }
+}
 
 // The fake owns real per-lane contexts; the session, queue, leases and
 // publication path are the production implementations under test.
@@ -25,7 +33,7 @@ public:
     std::uint32_t rows_per_forward() const override { return 2; }
     std::uint32_t max_positions() const override { return 32; }
     void prefill(std::uint32_t lane, std::span<const std::uint32_t> ids, bool first) override {
-        check(pending.empty(), "prefill overlaps an uncommitted batch");
+        backend_contract(pending.empty(), "prefill overlaps an uncommitted batch");
         auto& context = contexts.at(lane);
         if (first) { context.clear(); ++starts; }
         context.insert(context.end(), ids.begin(), ids.end());
@@ -33,30 +41,30 @@ public:
     }
     void verify(std::span<const sv::CohortGroup> groups, std::span<const std::uint32_t> ids,
                 std::span<std::uint32_t> top) override {
-        check(pending.empty(), "verify overlaps an uncommitted batch");
+        backend_contract(pending.empty(), "verify overlaps an uncommitted batch");
         max_groups = std::max(max_groups, groups.size());
         std::size_t offset = 0;
         for (const auto& group : groups) {
-            check(group.rows == 1, "greedy fixture unexpectedly drafts");
+            backend_contract(group.rows == 1, "greedy fixture unexpectedly drafts");
             auto context = contexts.at(group.lane);
             context.push_back(ids[offset]);
             top[offset] = next(context);
             pending.push_back({group.lane, ids[offset]});
             ++offset;
         }
-        check(offset == ids.size() && ids.size() == top.size(), "batch shape mismatch");
+        backend_contract(offset == ids.size() && ids.size() == top.size(), "batch shape mismatch");
     }
     void commit(std::span<const std::uint32_t> keep) override {
-        check(keep.size() == pending.size(), "commit shape mismatch");
+        backend_contract(keep.size() == pending.size(), "commit shape mismatch");
         for (std::size_t i = 0; i < keep.size(); ++i) {
-            check(keep[i] == 1, "greedy fixture did not commit its anchor");
+            backend_contract(keep[i] == 1, "greedy fixture did not commit its anchor");
             contexts.at(pending[i].first).push_back(pending[i].second);
         }
         pending.clear();
     }
     bool supports_final_logits() const override { return sampled; }
     std::span<const float> read_final_logits(std::uint32_t lane) override {
-        check(sampled && std::ranges::any_of(pending, [lane](const auto& row) { return row.first == lane; }),
+        backend_contract(sampled && std::ranges::any_of(pending, [lane](const auto& row) { return row.first == lane; }),
               "logits read outside a sampled lane");
         ++logit_reads;
         return logits;
@@ -134,6 +142,10 @@ void exercise_session() {
         bool done = false;
         const auto chunk = a->wait(std::chrono::milliseconds(0), done, false);
         a_stream.insert(a_stream.end(), chunk.begin(), chunk.end());
+        if (done) {
+            std::cerr << "step " << step << ": error '" << a->error() << "', finish " << a->stats().finish << ", streamed "
+                      << a_stream.size() << ", max_groups " << backend.max_groups << '\n';
+        }
         check(!done, "stream finished before cancellation could be exercised");
         if (a_stream.empty() || backend.max_groups < 2) runtime.step(false);
     }

@@ -1,7 +1,7 @@
 // strix-device-plan: the device catalogue and the shared memory plan, without a GPU.
 //
 //   strix-device-plan --list                         catalogue as a table
-//   strix-device-plan --toml                         catalogue data file (data/devices/profiles.toml)
+//   strix-device-plan --toml                         export catalogue profiles and interconnects
 //   strix-device-plan --devices FILE [--needs N.toml] [--ram-total-gib G]
 //                                                    budget per declared GPU entry; with route needs, the plan
 //                                                    (planned shapes `count = N`: per-device plan + prediction)

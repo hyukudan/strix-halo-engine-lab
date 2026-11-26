@@ -1,3 +1,7 @@
+# The stage graph is not configured in the CUDA DeepSeek-only tree (STRIX_CUDA_DS41_ONLY); nothing here applies there.
+if(NOT TARGET strix_stage_graph)
+    return()
+endif()
 target_sources(strix_stage_graph PRIVATE "${PROJECT_SOURCE_DIR}/src/graph/chain.cpp")
 
 if(BUILD_TESTING)

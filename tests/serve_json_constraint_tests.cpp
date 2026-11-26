@@ -51,6 +51,17 @@ void operator delete(void* p) noexcept { allocation_failure::deallocate(p); }
 void operator delete[](void* p) noexcept { allocation_failure::deallocate(p); }
 void operator delete(void* p, std::size_t) noexcept { allocation_failure::deallocate(p); }
 void operator delete[](void* p, std::size_t) noexcept { allocation_failure::deallocate(p); }
+// The nothrow forms (std::stable_sort's temporary buffer, for one) must come from the same replacement as the delete
+// above; left to the runtime, a sanitizer serves them from its own heap and reports the free as mismatched. They forward
+// to the replaced new exactly as the library default does, so the allocation sweep sees the same sequence.
+void* operator new(std::size_t bytes, const std::nothrow_t&) noexcept {
+    try { return ::operator new(bytes); } catch (...) { return nullptr; }
+}
+void* operator new[](std::size_t bytes, const std::nothrow_t&) noexcept {
+    try { return ::operator new(bytes); } catch (...) { return nullptr; }
+}
+void operator delete(void* p, const std::nothrow_t&) noexcept { allocation_failure::deallocate(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { allocation_failure::deallocate(p); }
 
 namespace strix::serve {
 struct ConstraintProgramCacheTestAccess {
@@ -1086,6 +1097,19 @@ void raw_oracle() {
     check(!raw_valid(parse_json(R"({"const":1})"), "1.0"), "raw oracle rejects numeric value equality");
     std::cout << "independent raw-byte oracle directed_probes=" << probes << '\n';
 }
+// Peak process RSS is not a bound under AddressSanitizer (shadow memory and quarantine count in it); the compilation
+// steps and the time still bound the expansion there.
+#if defined(__SANITIZE_ADDRESS__)
+constexpr bool kAddressSanitizer = true;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+constexpr bool kAddressSanitizer = true;
+#else
+constexpr bool kAddressSanitizer = false;
+#endif
+#else
+constexpr bool kAddressSanitizer = false;
+#endif
 void adversarial_compilation() {
     const auto measure = [](const char* name, const std::function<Json()>& make, bool refuse, ConstraintLimits limits = {}) {
         const auto start = std::chrono::steady_clock::now();
@@ -1107,7 +1131,7 @@ void adversarial_compilation() {
 #endif
         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         check(ok, std::string("aggregate budget ") + name);
-        check(ms < 2000 && rss < 65536, std::string("bounded time/memory ") + name);
+        check(ms < 2000 && (kAddressSanitizer || rss < 65536), std::string("bounded time/memory ") + name);
         std::cout << "adversarial compile shape=" << name << " expected=" << (refuse ? "SchemaError" : "compiled") << " ms=" << ms << " peak_rss_kib=" << rss << '\n';
     };
     measure("repeated-ref-1024-enum-512-branches-46628-bytes", [] {
@@ -1180,7 +1204,8 @@ void branching_expansion() {
         check(accepts(p, "true") && accepts(p, "{}"), "branching expansion preserves language");
         check(stats.expansion_recursion_high_water == 1, "constant native expansion recursion");
         check(stats.expansion_stack_high_water == 1, "single-alternative work stack bounded");
-        check(stats.compilation_steps < 20000 && ms < 2000 && rss < 65536, "branching expansion bounded work/time/memory");
+        check(stats.compilation_steps < 20000 && ms < 2000 && (kAddressSanitizer || rss < 65536),
+              "branching expansion bounded work/time/memory");
         std::cout << "branching expansion levels=" << levels << " schema_bytes=" << spec.dump().size()
                   << " ms=" << ms << " peak_rss_kib=" << rss
                   << " recursion_high_water=" << stats.expansion_recursion_high_water

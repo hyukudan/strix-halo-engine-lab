@@ -363,7 +363,7 @@ SpecResult spec_run(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t
     bc.chain_seed_step_ms = o.chain_step_ms;
     bc.chain_seed_flush_ms = o.chain_flush_ms;
     bc.fixed_costs = !o.verify_ms.empty();
-    spec::apply_probe_loss(bc.arbiter, "hy4-flash", "hip");  // fixed interval until a device receipt (probe_policy.hpp)
+    spec::apply_probe_loss(bc.arbiter, spec::kFixedReprobeInterval);  // no [speculation.probe_loss] row in hy4-flash.toml
     spec::BlockDrafter drafter(bc, chain);
     for (std::uint32_t r = 1; r <= o.max_rows && r <= o.verify_ms.size(); ++r) drafter.seed_verify_ms(r, o.verify_ms[r - 1U]);
     if (chain && !survival.empty()) drafter.seed_chain_survival(survival, o.survival_weight);

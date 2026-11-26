@@ -142,11 +142,17 @@ std::uint32_t ReplicatedCohort::max_window(std::uint32_t lane) const { return lo
 
 void ReplicatedCohort::abort_replica(const char* reason) noexcept {
     closed_ = true;
+    aborted_ = true;
     abort_link(link_, reason);
 }
 
-void ReplicatedCohort::send(std::uint32_t op, std::uint32_t arg, std::uint32_t flag, std::span<const std::uint32_t> body) {
+void ReplicatedCohort::check_open() const {
+    if (aborted_) throw std::runtime_error("cohort replica: link aborted by an earlier failure");
     if (closed_) throw std::logic_error("cohort replica: call after close()");
+}
+
+void ReplicatedCohort::send(std::uint32_t op, std::uint32_t arg, std::uint32_t flag, std::span<const std::uint32_t> body) {
+    check_open();
     try {
         const std::uint32_t deferred = words_of(deferred_.size(), "deferred records");
         const std::uint32_t payload = words_of(deferred_.size() + body.size(), "payload");
@@ -220,7 +226,7 @@ void ReplicatedCohort::verify(std::span<const CohortGroup> groups, std::span<con
 }
 
 void ReplicatedCohort::commit(std::span<const std::uint32_t> accept) {
-    if (closed_) throw std::logic_error("cohort replica: call after close()");
+    check_open();
     if (options_.local_ops) local_.commit(accept);
     deferred_.push_back(kRecCommit);
     deferred_.push_back(words_of(accept.size(), "commit"));
@@ -241,7 +247,7 @@ void ReplicatedCohort::defer(std::uint32_t kind, std::span<const std::uint32_t> 
 }
 
 std::uint64_t ReplicatedCohort::restore(std::uint32_t lane, std::span<const std::uint32_t> prompt) {
-    if (closed_) throw std::logic_error("cohort replica: call after close()");
+    check_open();
     const std::uint64_t rows = local_.restore(lane, prompt);
     if (rows == 0) return 0;  // nothing restored: rank 1's lane starts with the same prefill(first = true)
     // rank 1 restores from the prompt cut after the restored rows plus the anchor, so it cannot restore more; a
@@ -254,7 +260,7 @@ std::uint64_t ReplicatedCohort::restore(std::uint32_t lane, std::span<const std:
 }
 
 void ReplicatedCohort::capture(std::uint32_t lane, std::span<const std::uint32_t> committed) {
-    if (closed_) throw std::logic_error("cohort replica: call after close()");
+    check_open();
     if (options_.local_ops) local_.capture(lane, committed);
     const std::uint32_t head[1] = {lane};
     defer(kRecCapture, head, committed);
@@ -265,7 +271,7 @@ void ReplicatedCohort::capture(std::uint32_t lane, std::span<const std::uint32_t
 }
 
 void ReplicatedCohort::bind_lane(std::uint32_t lane, std::uint64_t request_id, std::span<const std::uint32_t> traits) {
-    if (closed_) throw std::logic_error("cohort replica: call after close()");
+    check_open();
     if (options_.local_ops) local_.bind_lane(lane, request_id, traits);
     const std::uint32_t head[3] = {lane, lo(request_id), hi(request_id)};
     defer(kRecBind, head, traits);
@@ -276,7 +282,7 @@ void ReplicatedCohort::bind_lane(std::uint32_t lane, std::uint64_t request_id, s
 }
 
 void ReplicatedCohort::control(std::span<const std::uint32_t> words) {
-    if (closed_) throw std::logic_error("cohort replica: call after close()");
+    check_open();
     if (options_.local_ops) local_.control(words);
     defer(kRecControl, {}, words);
     if (!options_.local_ops) {
@@ -311,7 +317,11 @@ void ReplicatedCohort::prefill_group(std::span<const CohortPrompt> members) {
 }
 
 void ReplicatedCohort::release(std::uint32_t lane) {
-    if (closed_) throw std::logic_error("cohort replica: call after close()");
+    if (aborted_) {  // nothing to tell a dead peer; rank 0's lane is still freed
+        local_.release(lane);
+        return;
+    }
+    check_open();
     if (options_.local_ops) local_.release(lane);
     deferred_.push_back(kRecRelease);
     deferred_.push_back(lane);
@@ -325,6 +335,7 @@ void ReplicatedCohort::release(std::uint32_t lane) {
 void ReplicatedCohort::keepalive() { send(kOpFlush, 0U, 0U, {}); }
 
 void ReplicatedCohort::close() {
+    if (aborted_) return;  // the abort already ended rank 1
     send(kOpStop, 0U, 0U, {});
     closed_ = true;
 }

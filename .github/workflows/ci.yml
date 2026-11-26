@@ -81,9 +81,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-numpy
 
-      - name: Logit gate tail rule tests
+      - name: Logit gate unit tests
         shell: bash
-        run: python3 -B tools/strix-gate/test_tail_rule.py
+        run: |
+          set -euo pipefail
+          python3 -B tools/strix-gate/test_tail_rule.py
+          python3 -B tools/strix-gate/test_gate_v2.py
 
   host-build:
     needs: changes
@@ -123,7 +126,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSTRIX_BACKEND_CPU=ON
             cmake --build build --parallel "$(nproc)"
             # Declare all registered names before execution; this inventory is
             # host coverage only, not native/model qualification.
@@ -161,6 +164,15 @@ jobs:
             echo "::warning title=MiniMax source receipt drift::tests/minimax_route_identity_sources.inc does not match this tree. Audit the new selectors, update the registry, then refresh the receipt."
             cat route-source-audit.log
           fi
+
+      - name: Check the standalone weight-format contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S tests/wfmt -B build/wfmt-host -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/wfmt-host --parallel "$(nproc)" --target strix-wfmt-host-tests
+          ctest --test-dir build/wfmt-host --output-on-failure --no-tests=error \
+            -R '^wfmt\.(contracts|reference|admission|resolve|arithmetic)$'
 
       - name: Configure UMA host lab
         run: cmake -S lab/uma_residency -B build/uma-residency -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -237,7 +249,41 @@ jobs:
             build/Testing/Temporary/LastTest.log
             build/Testing/Temporary/LastTestsFailed.log
           if-no-files-found: warn
+  windows-host-smoke:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and test host CPU dispatch with MSVC
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cmake -S . -B build/msvc -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRIX_BACKEND_CPU=ON || exit /b 1
+          cmake --build build/msvc --target strix-cpu-backend-host-tests strix-cpu-routed-expert-tests || exit /b 1
+          ctest --test-dir build/msvc --output-on-failure --no-tests=error -R "^strix-cpu-(backend-host|routed-expert)-tests$"
 
+  host-sanitizers:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    env:
+      ASAN_OPTIONS: halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check serving and cohort fixtures with ASan and UBSan
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build/sanitizers -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined -no-pie"
+          targets=(strix-cohort-decode-tests strix-serve-config-tests strix-serve-json-constraint-tests)
+          cmake --build build/sanitizers --parallel 2 --target "${targets[@]}"
+          for target in "${targets[@]}"; do
+            ctest --test-dir build/sanitizers --output-on-failure --no-tests=error -R "^${target}$"
+          done
 
   hip-offline-build:
     needs: changes
@@ -283,18 +329,45 @@ jobs:
                 cmake -S lab/uma_residency -B build/uma-residency-hip-offline -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRIX_UMA_ENABLE_HIP=ON
                 cmake --build build/uma-residency-hip-offline --target strix-uma-hip
 
-                cmake -S . -B build/root-hip-runtime-offline -G Ninja                   -DCMAKE_BUILD_TYPE=Release                   -DSTRIX_ENABLE_HIP_RUNTIME=ON                   -DBUILD_TESTING=ON                   -DSTRIX_FAMILY_QWEN35_HIP=ON
+                cmake -S . -B build/root-hip-runtime-offline -G Ninja \
+                  -DCMAKE_BUILD_TYPE=Release -DSTRIX_ENABLE_HIP_RUNTIME=ON -DBUILD_TESTING=ON \
+                  -DSTRIX_FAMILY_QWEN35_HIP=ON -DSTRIX_FAMILY_GLM5=ON -DSTRIX_FAMILY_MINIMAX=ON \
+                  -DSTRIX_FAMILY_GEMMA4=ON -DSTRIX_GEMMA4_DEVICE_BACKEND=ON \
+                  -DSTRIX_FAMILY_HY4=ON -DSTRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE=ON
                 cmake --build build/root-hip-runtime-offline                   --target strix_hip_runtime strix-hip-decode-token strix-hip-model-residency strix-hip-runtime-launchers-tests strix-hip-moe-route-launcher-tests strix-hip-embedding-launcher-tests strix-hip-hyper-mix-launcher-tests strix-hip-launcher-catalog-tests strix-hip-lm-head-launcher-tests strix-hip-shared-expert-launcher-tests strix-hip-moe-experts-launcher-tests strix-hip-gdn-launcher-tests strix-hip-ple-launcher-tests strix-hip-indexed-attention-launcher-tests strix-hip-model-residency-tests strix-hip-runtime-memory-init-tests
                 cmake --build build/root-hip-runtime-offline --target strix-hip-dense-iu4-cols-probe
                 cmake --build build/root-hip-runtime-offline --target \
                   strix-hip-qwen35-decode strix-hip-qwen35-spec \
-                  strix-deepseek41-serve strix-hip-token-sampling-device-tests
+                  strix-deepseek41-rank strix-deepseek41-serve strix-deepseek41-prefill \
+                  strix_glm5_kernels strix_minimax_msa_hip strix_minimax_moe_opt_hip \
+                  strix-gemma4-decode strix-gemma4-serve strix-hy4-rank strix-serve \
+                  strix-hip-token-sampling-device-tests
                 cmake --build build/root-hip-runtime-offline --target strix-inkling2-mini-hip strix-hip-inkling2-mini-attention-prepare-test strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test strix-hip-inkling2-mini-attention-test strix-hip-inkling2-mini-short-conv-test strix-hip-inkling2-mini-grouped-test strix-hip-inkling2-mini-grouped-rows-test strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
                 cmake -S . -B build/q4k-a8-offline -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRIX_ENABLE_HIP_RUNTIME=ON -DSTRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME=ON
                 cmake --build build/q4k-a8-offline --target strix_q4k_a8_hip_probe strix-hip-decode-token
                 ccache --show-stats
               '
           } 2>&1 | tee hip-offline-build.log
+
+      # Blocking. Kernels that already exceeded tools/kernel_scratch_allowance.txt when the baseline was recorded are
+      # listed in tools/kernel_scratch_known.txt (maximum over this image's compiler and the gfx1151 nodes' ROCm) and
+      # pass while they stay at or below their record; a new kernel over the allowance, or growth above a record,
+      # fails. On a pull request the known list may only shrink against the base branch. The verdict and every
+      # failure line go to the step summary; the per-kernel CSV is kept as an artifact.
+      - name: Kernel scratch budget
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree=build/root-hip-runtime-offline
+          base_known=()
+          if [ -n "${GITHUB_BASE_REF:-}" ] && git fetch --no-tags --depth=1 origin "$GITHUB_BASE_REF" \
+              && git show FETCH_HEAD:tools/kernel_scratch_known.txt > kernel-scratch-known-base.txt 2>/dev/null; then
+            base_known=(--known-base kernel-scratch-known-base.txt)
+          fi
+          python3 -B tools/check_kernel_scratch.py --quiet --allowance tools/kernel_scratch_allowance.txt \
+            --known tools/kernel_scratch_known.txt "${base_known[@]}" --summary "$GITHUB_STEP_SUMMARY" \
+            --csv kernel-scratch.csv \
+            "$tree/strix-hip-decode-token" "$tree/strix-hip-qwen35-decode" "$tree/strix-hip-qwen35-spec"
 
       - name: Save compiler cache
         if: always()
@@ -308,5 +381,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: hip-offline-build-log
-          path: hip-offline-build.log
+          path: |
+            hip-offline-build.log
+            kernel-scratch.csv
           if-no-files-found: ignore

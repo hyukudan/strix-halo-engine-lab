@@ -7,6 +7,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <iostream>
 #include <map>
@@ -53,7 +54,7 @@ std::vector<std::uint32_t> solo(const CohortRequest& r, std::uint32_t vocab) {
     return out;
 }
 
-class FakeBackend final : public CohortBackend {
+class FakeBackend : public CohortBackend {
 public:
     FakeBackend(std::uint32_t lanes, std::uint32_t rows, std::uint32_t vocab, std::uint32_t max_pos = 4096)
         : lanes_(lanes), rows_(rows), vocab_(vocab), max_pos_(max_pos), ctx_(lanes) {}
@@ -106,7 +107,7 @@ public:
     std::size_t max_groups = 0;
     std::uint64_t forwards = 0, prefills = 0, releases = 0;
 
-private:
+protected:
     std::uint32_t lanes_, rows_, vocab_, max_pos_;
     std::vector<std::vector<std::uint32_t>> ctx_;
     std::vector<std::pair<std::uint32_t, std::vector<std::uint32_t>>> window_;
@@ -1308,7 +1309,141 @@ void test_chunk_ladder() {
     check(kept.chunk == 512U && final_load && log.str().empty(), "ladder: one candidate is the final load");
 }
 
+// Fault injection: a backend that throws once at one chosen call. Every path must leave the decoder usable: the failing
+// request is reported (or, for the optional prefix capture, still delivered), the lane is released, the reserved bytes
+// return (a one-request budget admits the next request) and later requests decode their solo ids.
+class FaultBackend final : public FakeBackend {
+public:
+    using FakeBackend::FakeBackend;
+    bool bind = false, restore_throws = false, capture_throws = false, verify_throws = false, commit_throws = false;
+    bool verify_contract = false, release_throws = false;
+    void release(std::uint32_t lane) override {
+        FakeBackend::release(lane);
+        if (std::exchange(release_throws, false)) throw std::runtime_error("injected release failure");
+    }
+    void bind_lane(std::uint32_t, std::uint64_t, std::span<const std::uint32_t>) override {
+        if (std::exchange(bind, false)) throw std::runtime_error("injected bind_lane failure");
+    }
+    std::uint64_t restore(std::uint32_t, std::span<const std::uint32_t>) override {
+        if (std::exchange(restore_throws, false)) throw std::runtime_error("injected restore failure");
+        return 0;
+    }
+    void capture(std::uint32_t, std::span<const std::uint32_t>) override {
+        if (std::exchange(capture_throws, false)) throw std::runtime_error("injected capture failure");
+    }
+    void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
+                std::span<std::uint32_t> top) override {
+        if (std::exchange(verify_throws, false)) throw std::runtime_error("injected verify failure");
+        if (std::exchange(verify_contract, false)) throw std::logic_error("injected verify contract violation");
+        FakeBackend::verify(groups, tokens, top);
+    }
+    void commit(std::span<const std::uint32_t> accept) override {
+        if (std::exchange(commit_throws, false)) {
+            window_.clear();
+            throw std::runtime_error("injected commit failure");
+        }
+        FakeBackend::commit(accept);
+    }
+};
+
+CohortRequest fault_request(std::uint64_t id, std::uint32_t vocab) {
+    CohortRequest r;
+    r.id = id;
+    for (std::uint32_t k = 0; k < 4; ++k) r.prompt.push_back((static_cast<std::uint32_t>(id) + k) % vocab);
+    r.max_tokens = 6;
+    r.traits = {1U};  // a request with traits reaches bind_lane
+    return r;
+}
+
+// `failed`: how many of the first two requests must report an error; `both`: both requests share the failing forward.
+void fault_scenario(const char* name, const std::function<void(FaultBackend&)>& arm, std::size_t failed, bool both) {
+    const std::uint32_t vocab = 23;
+    FaultBackend be(4, 32, vocab);
+    CohortConfig cfg;
+    cfg.context_draft = false;
+    cfg.max_draft = 0;
+    cfg.position_bytes = 1000;
+    cfg.lane_bytes = 5000;
+    cfg.memory_budget = both ? 32000 : 16000;  // (4 + 6 + 1) * 1000 + 5000 = 16000 per request
+    CohortDecoder dec(be, cfg);
+    arm(be);
+    const auto a = fault_request(1, vocab), b = fault_request(2, vocab);
+    dec.submit(a);
+    dec.submit(b);
+    bool threw = false;
+    for (int s = 0; s < 200 && !dec.idle(); ++s) {
+        try {
+            dec.step();
+        } catch (const std::exception&) {
+            threw = true;
+            break;
+        }
+    }
+    check(!threw, std::string(name) + ": step() does not throw");
+    check(dec.idle(), std::string(name) + ": decoder drained after the fault");
+    check(dec.live() == 0, std::string(name) + ": no lane left mounted");
+    // a later request is admitted into the freed lane and budget, and decodes its solo ids
+    const auto c = fault_request(3, vocab), d = fault_request(4, vocab);
+    dec.submit(c);
+    dec.submit(d);
+    for (int s = 0; s < 200 && !dec.idle(); ++s) {
+        try {
+            dec.step();
+        } catch (const std::exception&) {
+            break;
+        }
+    }
+    const auto res = dec.take_finished();
+    std::map<std::uint64_t, const CohortResult*> by_id;
+    for (const auto& r : res) by_id[r.id] = &r;
+    std::size_t errors = 0;
+    for (const auto& id : {1ULL, 2ULL})
+        if (by_id.count(id) && !by_id[id]->error.empty()) ++errors;
+    check(by_id.count(1) && by_id.count(2), std::string(name) + ": both first requests are reported");
+    check(errors == failed, std::string(name) + ": failed request count " + std::to_string(errors));
+    for (const auto* q : {&c, &d}) {
+        const auto it = by_id.find(q->id);
+        check(it != by_id.end() && it->second->error.empty() && it->second->ids == solo(*q, vocab),
+              std::string(name) + ": later request " + std::to_string(q->id) + " decodes its solo ids");
+    }
+    check(be.releases == 4, std::string(name) + ": every admitted lane released (" + std::to_string(be.releases) + ")");
+    (void)both;
+}
+
+void test_backend_faults() {
+    fault_scenario("fault bind_lane", [](FaultBackend& be) { be.bind = true; }, 1, false);
+    fault_scenario("fault restore", [](FaultBackend& be) { be.restore_throws = true; }, 1, false);
+    fault_scenario("fault capture", [](FaultBackend& be) { be.capture_throws = true; }, 0, false);
+    fault_scenario("fault verify", [](FaultBackend& be) { be.verify_throws = true; }, 1, true);
+    fault_scenario("fault commit", [](FaultBackend& be) { be.commit_throws = true; }, 1, true);
+    // A contract violation stays the error that leaves the decoder even when a release fails during its cleanup.
+    {
+        FaultBackend be(4, 32, 23);
+        CohortConfig cfg;
+        cfg.context_draft = false;
+        cfg.max_draft = 0;
+        CohortDecoder dec(be, cfg);
+        be.verify_contract = true;
+        be.release_throws = true;
+        dec.submit(fault_request(1, 23));
+        std::string caught = "none";
+        for (int s = 0; s < 200 && !dec.idle() && caught == "none"; ++s) {
+            try {
+                dec.step();
+            } catch (const std::logic_error& e) {
+                caught = std::string("logic_error: ") + e.what();
+            } catch (const std::exception& e) {
+                caught = std::string("other: ") + e.what();
+            }
+        }
+        check(caught == "logic_error: injected verify contract violation",
+              "fault verify contract + release failure: the contract error is rethrown (" + caught + ")");
+        check(dec.live() == 0, "fault verify contract + release failure: the lane is retired");
+    }
+}
+
 int main() {
+    test_backend_faults();
     test_owner_callbacks_and_boundary();
     test_mixed_drain();
     test_cost_fit_steady_cohort();

@@ -4,6 +4,7 @@
 #include "strix/spec/drafting.hpp"
 #include "strix/spec/block_drafter.hpp"
 #include "strix/spec/probe_policy.hpp"
+#include "strix/model_data/inkling2_mini.hpp"
 
 #include <algorithm>
 #include <array>
@@ -208,10 +209,10 @@ void arbiter_tests() {
     for (int i = 0; i < 40; ++i) a.observe({sp::Source::model, 0, 7, 0, 8, 41.0, 3.5}, {});
     d = a.decide(in);
     SP_CHECK(d.source == sp::Source::serial || d.probe, "retreat after misses");
-    // Probe: after probe_every passes without the model it is tried once; ArbiterConfig::probe_loss paces it (priced
-    // excess ~23.5 ms <= 0.015 x passes x the 20 ms pick: ~49 passes after the last model pass).
+    // Probe: after probe_every passes without the model it is tried once (the default ArbiterConfig runs the fixed
+    // interval; the paced episodes are covered by honest_plain_price_tests).
     bool probed = false;
-    for (int i = 0; i < 80 && !probed; ++i) {
+    for (int i = 0; i < 40 && !probed; ++i) {
         d = a.decide(in);
         probed = d.probe && d.source == sp::Source::model;
         a.observe({d.source, 0, d.k, 0, d.rows, 20.0, 0.0}, {});
@@ -1423,8 +1424,9 @@ void honest_plain_price_tests() {
     SP_CHECK(ratio(prose_short) >= 0.97, "prose: 64 requests stay within 3 %% of plain decode (%.4f)", ratio(prose_short));
 }
 
-// spec::resolve_probe_loss (strix/spec/probe_policy.hpp): the episodes run only where the table holds a device receipt;
-// every other engine keeps the fixed interval (0), and STRIX_SPEC_PROBE_LOSS overrides every engine alike.
+// spec::resolve_probe_loss (strix/spec/probe_policy.hpp): the episodes run only where the model TOML holds a
+// [speculation.probe_loss] row for the backend (a device receipt); every other model keeps the fixed interval (0), and
+// STRIX_SPEC_PROBE_LOSS overrides every engine alike.
 void set_probe_switch(const char* value) {
 #if defined(_WIN32)
     _putenv_s(strix::spec::kProbeLossSwitch, value ? value : "");
@@ -1438,34 +1440,51 @@ void probe_policy_tests() {
     namespace sp = strix::spec;
     SP_CHECK(sp::ArbiterConfig{}.probe_loss == 0.0, "the arbiter default is the fixed re-probe interval");
     SP_CHECK(sp::BlockConfig{}.arbiter.probe_loss == 0.0, "the block drafter default is the fixed re-probe interval");
-    struct Expect { const char* engine; const char* backend; double value; };
-    const Expect table[] = {{"inkling2-mini", "cuda", sp::kMeasuredProbeLoss}, {"inkling2-mini", "hip", 0.0},
-                            {"inkling2-mini", "cpu", 0.0},  {"qwen3.8-27b", "hip", 0.0},
-                            {"qwen3.8-27b", "cuda", 0.0},   {"qwen3.8-flash-next", "hip", 0.0},
-                            {"hy4-flash", "hip", 0.0},      {"", "", 0.0}};
+    // The one measured row is model data (models/inkling2-mini.toml, generated into strix/model_data).
+    static_assert(strix::model_data::inkling2_mini::speculation::probe_loss::cuda == 0.015,
+                  "Inkling 2 Mini CUDA carries the measured probe_loss row");
+    const double rows[] = {strix::model_data::inkling2_mini::speculation::probe_loss::cuda, sp::kFixedReprobeInterval};
     set_probe_switch(nullptr);
-    for (const auto& e : table) {
+    for (const double row : rows) {
         sp::ArbiterConfig config;
         config.probe_loss = 0.5;  // overwritten by the resolver
-        const auto choice = sp::apply_probe_loss(config, e.engine, e.backend);
-        SP_CHECK(choice.value == e.value && config.probe_loss == e.value && sp::table_probe_loss(e.engine, e.backend) == e.value,
-                 "%s/%s resolves the table's probe_loss %.3f (got %.3f, %s)", e.engine, e.backend, e.value, choice.value,
+        const auto choice = sp::apply_probe_loss(config, row);
+        SP_CHECK(choice.value == row && config.probe_loss == row, "the model row %.3f resolves unchanged (got %.3f, %s)",
+                 row, choice.value, choice.source.c_str());
+        SP_CHECK(choice.source == (row > 0.0 ? "measured default" : "fixed interval"), "row %.3f source %s", row,
                  choice.source.c_str());
-        SP_CHECK(choice.source == (e.value > 0.0 ? "measured default" : "fixed interval"), "%s/%s source %s", e.engine,
-                 e.backend, choice.source.c_str());
     }
     set_probe_switch("0");
-    auto off = sp::resolve_probe_loss("inkling2-mini", "cuda");
+    auto off = sp::resolve_probe_loss(0.015);
     SP_CHECK(off.value == 0.0 && off.source == sp::kProbeLossSwitch, "the switch turns the measured row off (%s)",
              off.source.c_str());
     set_probe_switch("0.015");
-    auto on = sp::resolve_probe_loss("hy4-flash", "hip");
+    auto on = sp::resolve_probe_loss(sp::kFixedReprobeInterval);
     SP_CHECK(on.value == 0.015 && on.source == sp::kProbeLossSwitch, "the switch turns the episodes on for any engine");
-    set_probe_switch("2");
-    bool refused = false;
-    try { (void)sp::resolve_probe_loss("qwen3.8-27b", "hip"); } catch (const std::invalid_argument&) { refused = true; }
-    SP_CHECK(refused, "a probe_loss outside 0..1 names the switch and refuses");
+    // The arbiter takes [0, 1): the switch refuses 1 and anything above, naming itself, before a drafter is built.
+    for (const char* bad : {"1", "2", "-0.1"}) {
+        set_probe_switch(bad);
+        bool refused = false;
+        std::string what;
+        try { (void)sp::resolve_probe_loss(sp::kFixedReprobeInterval); } catch (const std::invalid_argument& e) {
+            refused = true;
+            what = e.what();
+        }
+        SP_CHECK(refused && what.find(sp::kProbeLossSwitch) != std::string::npos,
+                 "STRIX_SPEC_PROBE_LOSS=%s is outside [0, 1): refused naming the switch (%s)", bad, what.c_str());
+    }
+    set_probe_switch("0.999");
+    {
+        sp::ArbiterConfig config;
+        (void)sp::apply_probe_loss(config, sp::kFixedReprobeInterval);
+        bool built = config.probe_loss == 0.999;
+        try { sp::Arbiter arbiter(config); } catch (const std::invalid_argument&) { built = false; }
+        SP_CHECK(built, "every value the switch accepts is one the arbiter accepts");
+    }
     set_probe_switch(nullptr);
+    bool bad_row = false;
+    try { (void)sp::resolve_probe_loss(1.0); } catch (const std::invalid_argument&) { bad_row = true; }
+    SP_CHECK(bad_row, "a model row outside [0, 1) is refused");
 }
 
 int main() {

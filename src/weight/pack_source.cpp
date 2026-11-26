@@ -51,7 +51,7 @@ Status PackCheckpoint::open(const std::string& path, PackCheckpoint& out) {
         if (input.extension() == ".json") {
             const ConfinedDirectory directory(input.has_parent_path() ? input.parent_path() : fs::path("."));
             result.manifest_ = directory.open(input.filename());
-            if (result.manifest_->size() > (64U << 20U))
+            if (result.manifest_->size() > kSafetensorsManifestMaxBytes)
                 return {Error::malformed, "safetensors manifest exceeds 64 MiB"};
             std::string json(static_cast<std::size_t>(result.manifest_->size()), '\0');
             if (const auto s = result.manifest_->read({0, json.size()}, std::as_writable_bytes(std::span(json))); !s)
@@ -63,8 +63,7 @@ Status PackCheckpoint::open(const std::string& path, PackCheckpoint& out) {
                 if (!weights || weights->as_object().empty()) return {Error::malformed, "empty weight_map"};
                 for (const auto& pair : weights->as_object()) {
                     const auto& name = pair.second.as_string();
-                    if (name.empty() || name.find_first_of("/\\:") != std::string::npos ||
-                        fs::path(name).extension() != ".safetensors")
+                    if (!safetensors_shard_name_ok(name))
                         return {Error::malformed, "invalid safetensors shard name: " + name};
                     shards.insert(name);
                 }

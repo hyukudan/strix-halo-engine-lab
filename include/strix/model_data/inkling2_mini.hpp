@@ -79,6 +79,9 @@ inline constexpr std::string_view schema = "strix-model/v1";
 namespace speculation {
 inline constexpr std::string_view drafter = "mtp.safetensors";
 inline constexpr std::int64_t max_draft_by_live[] = {7, 0};
+namespace probe_loss {
+inline constexpr double cuda = 0x1.eb851eb851eb8p-7 /* 0.015 */;
+} // namespace probe_loss
 } // namespace speculation
 namespace weights {
 namespace format {

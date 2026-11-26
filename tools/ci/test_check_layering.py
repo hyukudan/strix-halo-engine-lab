@@ -25,7 +25,8 @@ TREE = {
     "src/serve/options.cpp": 'auto v = std::getenv("X"); auto w = getenv("Y"); x.getenv(1);\n',
     "include/strix/env_flags.hpp": 'inline auto f() { return std::getenv("Z"); }\n',  # env home: not counted
     "src/dist/wait.cpp": "char c = '\"'; while (done.load(std::memory_order_acquire) < n) {}\n",
-    "apps/main.cpp": '#include "strix/glm/engine.hpp"\n',                          # composition root: not checked
+    "apps/main.cpp": '#include "strix/glm/engine.hpp"\n'                        # composition root
+                     'getenv("X"); while (ready.load() == 0) {}\n',
     "tests/t.cpp": "getenv(\"T\");\n",
 }
 
@@ -73,7 +74,10 @@ class Layering(unittest.TestCase):
         self.assertNotIn(("raw-getenv", "include/strix/env_flags.hpp"), c)
         self.assertEqual(c.get(("spin-wait", "src/hip_ds41_rows.hip")), 1)
         self.assertEqual(c.get(("spin-wait", "src/dist/wait.cpp")), 1)  # a '"' char literal does not open a string
-        self.assertFalse(any(p.startswith(("apps/", "tests/")) for _, p in c))
+        self.assertEqual(c.get(("raw-getenv", "apps/main.cpp")), 1)
+        self.assertEqual(c.get(("spin-wait", "apps/main.cpp")), 1)
+        self.assertNotIn(("model-include", "apps/main.cpp"), c)
+        self.assertFalse(any(p.startswith("tests/") for _, p in c))
 
     def test_ratchet(self):
         c = self.counts()

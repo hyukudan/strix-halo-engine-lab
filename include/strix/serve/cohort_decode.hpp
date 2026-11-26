@@ -339,6 +339,8 @@ private:
     double now_ms();
     void admit();
     void finish(Lane& lane, std::string error = {});
+    // Fails every lane of a failed backend pass, even when a release throws; rethrows the first such error once.
+    void fail_lanes(std::span<Lane* const> lanes, const std::string& error);
     // Rows of the lane's next prefill call under bounded slices (prompt_slice_decoding != 0): the unbounded call at a
     // region start when the grant covers it (beside a decoding lane, `bounded`: only its first backend chunk), else
     // one piece of the backend chunk being read (prompt_piece_rows). Under a priced grant (`priced`, gap pieces) the

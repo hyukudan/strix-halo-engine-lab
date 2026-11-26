@@ -137,9 +137,10 @@ private:
 // How long an idle worker spins before it sleeps (STRIX_DIST_SPIN_US, default 300): a job posted within the window
 // starts without a wake-up.
 std::chrono::microseconds worker_spin() {
+    // strict: a malformed or negative value throws std::invalid_argument naming the variable (never an anonymous
+    // stoll failure), and the read happens at the first Worker, not during static initialisation
     static const auto us = [] {
-        const char* v = std::getenv("STRIX_DIST_SPIN_US");
-        return std::chrono::microseconds(v && *v ? std::stoll(v) : 300LL);
+        return std::chrono::microseconds(strix::env_number<long long>("STRIX_DIST_SPIN_US", 300LL, 0LL, 3'600'000'000LL));
     }();
     return us;
 }
@@ -174,6 +175,12 @@ public:
     Worker(const Worker&) = delete;
     Worker& operator=(const Worker&) = delete;
     void post(std::function<void()> job) {
+        // The previous job must have finished before job_ / error_ are rewritten (wait_until() may return false while
+        // it still runs). A job that finished its work is granted a short window to publish completion.
+        for (unsigned i = 0; !idle(); ++i) {
+            if (i >= 2'000'000U) throw std::logic_error("dist: worker post() while the previous job is still running");
+            cpu_relax();
+        }
         if (latency::enabled()) {
             const auto context = latency::context();
             job_ = [context, job = std::move(job)] {

@@ -64,7 +64,8 @@ public:
         // Default on (q54: code 132.8 tok/s, prose 0.966 x the plain step program); off switch
         // STRIX_INKLING_PLAIN_ROW_ROUTE=resident keeps every row of the verifying route on the resident decoder.
         // A verifying-route load that cannot draft (token sampling, an embeddings prompt: the shared CLI loads it with
-        // speculation off) runs every decode row here too (decode() below), as the program route it replaced did.
+        // speculation off) runs every decode row here too (decode() below). For an embeddings prompt this is a path the
+        // program route could not run (it had no embeddings prefill); no device receipt covers it yet.
         const char* row_route = strix::envcfg::text("STRIX_INKLING_PLAIN_ROW_ROUTE");
         if (row_route && std::string_view(row_route) == "resident") plain_program = false;
         if (plain_program && !combine_image && !prepared_round_fold && !narrow_experts) {
@@ -80,10 +81,13 @@ public:
 #if !defined(__HIPCC__)
         // Verify window programs (one captured graph per window rows; device identity fixture q52r PASS): an explicit
         // option until a timing receipt decides the default of the drafting passes. The fixture covers the EXACT
-        // levers (projected bias, screened or full head): a profile with a FAST weight-image or expert lever declines.
+        // levers (projected bias, screened or full head) over BF16 role storage: a profile with a FAST weight-image or
+        // expert lever, or Q8_0 attention / head storage, declines.
         if (const char* window = strix::envcfg::text("STRIX_INKLING_WINDOW_PROGRAMS"); window && std::string_view(window) == "1") {
             const bool proven = !combine_image && !prepared_round_fold && !narrow_experts && !controller_one_plane &&
-                                moe_w4a4 == moe_core::grouped_w4a4::Activations::bf16 && attn_projected_bias;
+                                moe_w4a4 == moe_core::grouped_w4a4::Activations::bf16 && attn_projected_bias &&
+                                storage.attention == weight::kBf16WeightStorage &&
+                                storage.head == weight::kBf16WeightStorage;
             if (proven) decoder_.set_window_programs(true);
             else std::cerr << "inkling2 verify window programs declined (unproven for this profile: the identity "
                               "fixture covers the EXACT levers only)\n";
@@ -348,8 +352,7 @@ int main(int argc, char** argv) {
             },
             packed_decode_default, serve::render_inkling2_chat_request, true};
         // The served schedule's resolver (STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks on both entry points).
-        family.speculation_engine = "inkling2-mini";  // spec::resolve_probe_loss data row (per backend)
-        family.speculation_backend = kMiniBuildBackend;
+        family.speculation_probe_loss = kMiniProbeLoss;  // models/inkling2-mini.toml [speculation.probe_loss]
         family.prefill_tail_divisor =
             mini_prefill_schedule_from_env(strix::inkling2::cli::kMiniHipSchedule, strix::profile::Name::standard).tail_divisor;
 #if defined(STRIX_INKLING2_MEDIA)

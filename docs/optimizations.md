@@ -61,8 +61,9 @@ The HIP QSA launcher runs the score and value forms of `src/attn_core/eager_sele
 server, in every profile; the adapter supplies BF16 or int8 KV reads, captured selection counts and status checks.
 The launcher's private score / output bodies were deleted after the device identity (integration head
 2019eacec5, one gfx1151 node): launcher fixture PASS and 128 generated ids equal to the private form on the
-automatic (MTP), eager BF16, eager KV-int8 and long-prompt (4,096) routes. No gain is claimed (same bits; one
-sample per route within +-1.5 %, not an ABBA timing).
+automatic (MTP), eager BF16, eager KV-int8 and long-prompt (4,096) routes, and the launcher object's ISA identical
+to the qualified build (no logits were compared). No gain is claimed (same ids and ISA; one sample per route within
++-1.5 %, not an ABBA timing).
 
 | Model | Shared EXL3 Hadamard adapter | Shared eager QSA score and output |
 |---|---|---|
@@ -6490,11 +6491,11 @@ model pending a matched timing comparison.
 
 ## Shared speculation arbiter: measured probe episodes
 
-**Engine:** `shared`. **Control:** `STRIX_SPEC_PROBE_LOSS` (0..1; 0 = the previous fixed re-probe interval, bit-identical), one resolver for command line and server (`spec::resolve_probe_loss`). **Default:** per engine and backend as data (`include/strix/spec/probe_policy.hpp`): 0.015 only for Inkling 2 Mini CUDA (receipt below); every other engine keeps the fixed interval until its off-vs-on device arms exist.
+**Engine:** `shared`. **Control:** `STRIX_SPEC_PROBE_LOSS` (a value in [0, 1); 0 = the previous fixed re-probe interval, bit-identical), one resolver for command line and server (`spec::resolve_probe_loss`). **Default:** per model and backend as data in the model TOML (`[speculation.probe_loss]`): 0.015 only for Inkling 2 Mini CUDA (`models/inkling2-mini.toml`, receipt below); every other engine keeps the fixed interval until its off-vs-on device arms exist.
 
 A probe of a learned per-depth drafter runs the deepest legal window and opens an episode whose realized ledger (every model pass at the plain row's ms per token; allowance half a priced excess, credit capped at three probe walls) keeps the drafter while it is not losing; the closed episode's realized loss paces the next probe. Bound: exploration loses at most probe_loss of decode time plus one episode and the first measurements.
 
-- **Shared home:** include/strix/spec/drafting.hpp + src/spec/drafting.cpp (spec::Arbiter); include/strix/spec/probe_policy.hpp (per-engine default, switch).
+- **Shared home:** include/strix/spec/drafting.hpp + src/spec/drafting.cpp (spec::Arbiter); include/strix/spec/probe_policy.hpp (resolver, switch); the per-model value is `[speculation.probe_loss]` in the model TOML.
 - **Tier and regime:** EXACT, FAST, QUALITY, TURBO; speculative decode at one request.
 - **Exactness evidence:** Drafts never change emitted tokens (greedy verify). RTX q47: ids equal on code and prose (new auto == off == q46 resident).
 - **Off switch:** `STRIX_SPEC_PROBE_LOSS=0`.
@@ -6653,7 +6654,7 @@ In a drafting run the speculator's one-row steps run on the CUDA step program ov
 - **Tier and regime:** EXACT, FAST, QUALITY, TURBO; CUDA CLI speculative decode
 - **Exactness evidence:** EXACT: both routes run the same arithmetic on the same decoder state; the step program stores the drafter taps through the shared Bf16SliceAtRow leaf. RTX q54: ids equal to the q46 resident run (code) and to q47 off (prose); acceptance 201/343 unchanged.
 - **Off switch:** STRIX_INKLING_PLAIN_ROW_ROUTE=resident (every row on the resident decoder); --speculation off
-- **Measured gain:** RTX PRO, cuda_pf2-kit q54 (CLI EXACT 256 tokens): code 132.80 tok/s vs 97.23 on the plain step program (+36.6 %); prose 98.05 vs 101.49 on the plain step program (0.966x; q52c all-resident auto 91.66). Measured on one code and one prose prompt (256 tokens each), not a bound for other content: prose 0.966x the plain program (the arbiter's 8 probe passes), code +36.6 %. A run that cannot draft (token sampling, an embeddings prompt) runs every decode row on the step program.
+- **Measured gain:** RTX PRO, cuda_pf2-kit q54 (CLI EXACT 256 tokens): code 132.80 tok/s vs 97.23 on the plain step program (+36.6 %); prose 98.05 vs 101.49 on the plain step program (0.966x; q52c all-resident auto 91.66). Measured on one code and one prose prompt (256 tokens each), not a bound for other content: prose 0.966x the plain program (the arbiter's 8 probe passes), code +36.6 %. A run that cannot draft (token sampling, an embeddings prompt) runs every decode row on the step program; for a greedy embeddings prompt this path is new (the program route had no embeddings prefill) and has no device receipt. Without a model drafter (no drafter file, or --dspark off) auto still takes the verifying route and speculates from context only (lookup windows); not measured.
 - **Preconditions:** CUDA build with the step program; BF16 weight storage; no route tap, no combine image, no prepared round fold, no narrow experts.
 
 | Model | Binding |

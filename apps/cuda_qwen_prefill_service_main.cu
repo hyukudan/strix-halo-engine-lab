@@ -24,10 +24,12 @@
 #include "strix/cuda/qwen_options.hpp"
 #include "strix/cuda/qwen_prefill.hpp"
 #include "strix/serve/json.hpp"
+#include "strix/serve/secure_equal.hpp"
 #include "strix/handoff_policy.hpp"
 
 #include "qwen_handoff.hpp"
 #include "qwen_http.hpp"
+#include "qwen_prefill_request.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -98,16 +100,7 @@ Json trace_json(const strix::qwen_prefill_trace::Trace& trace) {
     return t;
 }
 
-struct Job {
-    std::vector<std::uint32_t> tokens;
-    std::string handoff, api_key, codec;
-    bool has_codec = false;
-    bool trace = false, tail_large = false, has_schedule = false;
-    std::uint32_t final_rows = 0;
-    bool has_final_rows = false;
-    std::uint64_t local_rows = 0;
-    std::string node_completions;
-    Json session;
+struct Job : http::PrefillRequest {
     Clock::time_point queued_at;
     std::promise<std::pair<int, std::string>> reply;
 };
@@ -298,37 +291,25 @@ void handle(Service& svc, http::Sock s, std::uint32_t max_positions, const std::
     http::Message m;
     std::string carry;
     const auto err = http::read_message(s, m, std::size_t{64} << 20, false, carry);
-    if (!err.empty()) { http::respond(s, 400, R"({"error":")" + err + "\"}"); http::close_sock(s); return; }
+    if (!err.empty()) {
+        http::respond(s, strix::serve::http_wire_error_status(err), R"({"error":")" + err + "\"}");
+        http::close_sock(s);
+        return;
+    }
     const auto sp1 = m.start.find(' '), sp2 = m.start.find(' ', sp1 + 1);
     const std::string method = m.start.substr(0, sp1), path = m.start.substr(sp1 + 1, sp2 - sp1 - 1);
     if (path == "/health") { http::respond(s, 200, svc.health()); http::close_sock(s); return; }
     if (!api_key.empty()) {
-        const auto auth = m.header("authorization"), key = m.header("x-api-key");
-        if (auth != "Bearer " + api_key && key != api_key) { http::respond(s, 401, R"({"error":"unauthorized"})"); http::close_sock(s); return; }
+        // Both comparisons always run, each in time independent of the key content.
+        const bool by_bearer = strix::serve::secure_equal(m.header("authorization"), "Bearer " + api_key);
+        const bool by_header = strix::serve::secure_equal(m.header("x-api-key"), api_key);
+        if (!by_bearer && !by_header) { http::respond(s, 401, R"({"error":"unauthorized"})"); http::close_sock(s); return; }
     }
     if (path != "/v1/prefill" || method != "POST") { http::respond(s, 404, R"({"error":"not found"})"); http::close_sock(s); return; }
     auto job = std::make_unique<Job>();
     job->queued_at = Clock::now();
     try {
-        const auto j = strix::serve::parse_json(m.body);
-        for (const auto& t : j.find("tokens")->as_array()) job->tokens.push_back(static_cast<std::uint32_t>(t.as_int()));
-        job->handoff = j.find("handoff")->as_string();
-        if (const auto* x = j.find("session")) job->session = *x;
-        if (const auto* x = j.find("handoff_api_key")) job->api_key = x->as_string();
-        if (const auto* x = j.find("handoff_codec")) { job->codec = x->as_string(); job->has_codec = true; }
-        if (const auto* x = j.find("local_rows")) job->local_rows = static_cast<std::uint64_t>(x->as_int());
-        if (const auto* x = j.find("trace")) job->trace = x->as_bool();
-        if (const auto* x = j.find("block_schedule")) {
-            const auto schedule = x->as_string();
-            if (schedule != "default" && schedule != "tail-large") throw std::invalid_argument("block_schedule");
-            job->has_schedule = true; job->tail_large = schedule == "tail-large";
-        }
-        if (const auto* x = j.find("final_block_rows")) {
-            auto n = x->as_int();
-            if (n < 0 || n > qp::kMaxBlockRows) throw std::invalid_argument("final_block_rows");
-            job->has_final_rows = true; job->final_rows = static_cast<std::uint32_t>(n);
-        }
-        if (const auto* x = j.find("node_completions")) job->node_completions = x->as_string();
+        http::parse_prefill_request(strix::serve::parse_json(m.body), qp::kMaxBlockRows, *job);
     } catch (const std::exception& e) {
         http::respond(s, 400, R"({"error":"bad request body"})");
         http::close_sock(s);
@@ -445,9 +426,18 @@ int main(int argc, char** argv) {
     Service svc(p, c, handoff_key, handoff);
     std::printf("{\"event\":\"READY\",\"bind\":\"%s\",\"port\":%s}\n", bind.c_str(), port.c_str());
     std::fflush(stdout);
+    // At most kMaxLiveConnections handlers run at once (a handler closes its own socket); a refused connection, or
+    // one whose thread cannot start, is answered 503 and closed here. Requests are read under a total deadline.
+    constexpr int kMaxLiveConnections = 32;
+    std::atomic<int> live{0};
     for (;;) {
         const http::Sock s = ::accept(ls, nullptr, nullptr);
-        if (s == http::kNoSock) continue;
-        std::thread([&svc, s, &c, api_key] { handle(svc, s, c.max_positions, api_key); }).detach();
+        if (s == http::kNoSock) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); continue; }
+        const bool started = strix::serve::spawn_counted_connection(live, kMaxLiveConnections,
+            [&svc, s, &c, api_key] { handle(svc, s, c.max_positions, api_key); });
+        if (!started) {
+            http::respond(s, 503, R"({"error":"too many live connections"})");
+            http::close_sock(s);
+        }
     }
 }

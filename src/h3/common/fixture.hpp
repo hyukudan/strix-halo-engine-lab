@@ -62,8 +62,11 @@ public:
     }
 
 private:
+    // Nesting bound as the shared serve::parse_json_unique: deep input is an error, not a stack overflow.
+    static constexpr int kMaxDepth = 128;
     std::string_view s_;
     std::size_t p_ = 0;
+    int depth_ = 0;
     [[noreturn]] void fail(const char* what) const {
         throw std::runtime_error(std::string("fixture json: ") + what + " at " + std::to_string(p_));
     }
@@ -142,6 +145,7 @@ private:
                     std::uint32_t cp = hex4();
                     if (cp >= 0xD800 && cp < 0xDC00 && lit("\\u")) {
                         std::uint32_t lo = hex4();
+                        if (lo < 0xDC00 || lo > 0xDFFF) fail("bad surrogate pair");
                         cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                     }
                     utf8(o, cp);
@@ -155,6 +159,7 @@ private:
     Json value() {
         char c = peek();
         Json j;
+        if ((c == '{' || c == '[') && ++depth_ > kMaxDepth) fail("nesting too deep");
         if (c == '{') {
             ++p_;
             auto o = std::make_shared<JsonObject>();
@@ -171,6 +176,7 @@ private:
                 }
             }
             expect('}');
+            --depth_;
             j.v = o;
         } else if (c == '[') {
             ++p_;
@@ -186,6 +192,7 @@ private:
                 }
             }
             expect(']');
+            --depth_;
             j.v = a;
         } else if (c == '"') {
             j.v = string();

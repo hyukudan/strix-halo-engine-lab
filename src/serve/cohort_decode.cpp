@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <exception>
+#include <iostream>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -54,6 +56,16 @@ void CohortBackend::bind_lane(std::uint32_t, std::uint64_t, std::span<const std:
 void CohortBackend::control(std::span<const std::uint32_t>) {}
 
 namespace {
+// Cleanup while a contract violation (std::logic_error) is in flight: the lanes are retired either way, and a backend
+// release failure inside the cleanup is dropped so that the contract error is the one rethrown.
+template <class Cleanup>
+void cleanup_keeping_contract_error(Cleanup&& cleanup) noexcept {
+    try {
+        cleanup();
+    } catch (...) {
+    }
+}
+
 // The most ids a request runs to: max_tokens, or the engine's context ceiling when that is lower.
 std::uint64_t token_limit(const CohortRequest& r) {
     return r.context_tokens != 0 ? std::min(r.max_tokens, r.context_tokens) : r.max_tokens;
@@ -261,7 +273,6 @@ void CohortDecoder::admit() {
         lane->result.id = lane->request.id;
         lane->result.submit_ms = w.submit_ms;
         lane->bytes = reserved_bytes(lane->request);
-        used_bytes_ += lane->bytes;
         lane->whole = backend_.prefill_emits_first();
         if (token_sampling_enabled(lane->request.sampling)) {
             // A stable request identity makes an explicit seed replayable across lane assignments (the request's
@@ -281,8 +292,12 @@ void CohortDecoder::admit() {
         }
         Lane& l = *lane;
         const auto index = static_cast<std::uint32_t>(free - lanes_.begin());
+        used_bytes_ += lane->bytes;
         *free = std::move(lane);
         peak_live_ = std::max(peak_live_, live());
+        // From here the lane is published: a backend or callback failure retires it as a failed request (finish:
+        // budget returned, lane released) instead of leaving it half-initialised in its slot.
+        try {
         // the engine's per-request words reach the backend (every rank under ReplicatedCohort) before any prompt row;
         // a request without traits makes no bind call, so plain requests make exactly the round-1 backend calls
         if (!l.request.traits.empty()) backend_.bind_lane(index, l.request.id, l.request.traits);
@@ -298,7 +313,25 @@ void CohortDecoder::admit() {
             if (l.whole && l.prompt_left() == 0) l.first_due = true;
             else if (l.prompt_left() == 0) l.pending = p.back();
         }
+        } catch (const std::logic_error& ex) {  // a contract violation stays fatal, after the lane is retired
+            cleanup_keeping_contract_error([&] { finish(l, std::string("admit: ") + ex.what()); });
+            throw;
+        } catch (const std::exception& ex) {
+            finish(l, std::string("admit: ") + ex.what());
+        }
     }
+}
+
+void CohortDecoder::fail_lanes(std::span<Lane* const> lanes, const std::string& error) {
+    std::exception_ptr release_error;
+    for (Lane* lane : lanes) {
+        try {
+            finish(*lane, error);  // frees the lane and returns its budget before the backend release
+        } catch (...) {
+            if (!release_error) release_error = std::current_exception();
+        }
+    }
+    if (release_error) std::rethrow_exception(release_error);
 }
 
 void CohortDecoder::finish(Lane& lane, std::string error) {
@@ -318,6 +351,8 @@ void CohortDecoder::finish(Lane& lane, std::string error) {
     for (std::size_t i = 0; i < lanes_.size(); ++i) {
         if (lanes_[i].get() != &lane) continue;
         used_bytes_ -= lane.bytes;
+        // prefix capture is optional: its failure must never keep the lane from retiring
+        try {
         if (lane.request.retain && lane.result.error.empty() && !lane.result.cancelled && !lane.result.ids.empty()) {
             // committed inputs: the prompt (its last token was the first decode row), then every emitted id that a
             // later row consumed; ids cut at a stop are all consumed, so prompt ++ ids is cut at `position`.
@@ -326,8 +361,16 @@ void CohortDecoder::finish(Lane& lane, std::string error) {
             committed.resize(static_cast<std::size_t>(std::min<std::uint64_t>(committed.size(), lane.position)));
             backend_.capture(static_cast<std::uint32_t>(i), committed);
         }
+        } catch (const std::exception& ex) {
+            std::cerr << "cohort decoder: prefix capture failed (" << ex.what() << "); lane retired without it\n";
+        }
         finished_.push_back(std::move(lane.result));
-        backend_.release(static_cast<std::uint32_t>(i));
+        try {
+            backend_.release(static_cast<std::uint32_t>(i));
+        } catch (...) {
+            lanes_[i].reset();
+            throw;
+        }
         lanes_[i].reset();
         return;
     }
@@ -526,6 +569,13 @@ void CohortDecoder::step() {
                 group.push_back(static_cast<std::uint32_t>(id));
         }
     }
+    // A backend failure of a prompt pass fails the lanes of that pass, as a failed verify does, and ends this step (no
+    // first id is pending yet); a contract violation (std::logic_error) stays fatal after the cleanup.
+    const auto fail_prompt = [&](std::span<const std::uint32_t> indices, const std::exception& ex) {
+        std::vector<Lane*> failed;
+        for (const auto i : indices) failed.push_back(lanes_[i].get());
+        fail_lanes(failed, std::string("prefill: ") + ex.what());
+    };
     if (group.size() > 1) {
         std::vector<CohortPrompt> members;
         for (const auto i : group) {
@@ -536,7 +586,16 @@ void CohortDecoder::step() {
         account_gap(prompt_rows, false);
         prompt_rows = 0;
         const double t0 = now_ms();
-        backend_.prefill_group(members);
+        try {
+            backend_.prefill_group(members);
+        } catch (const std::exception& ex) {
+            if (dynamic_cast<const std::logic_error*>(&ex) != nullptr) {
+                cleanup_keeping_contract_error([&] { fail_prompt(group, ex); });
+                throw;
+            }
+            fail_prompt(group, ex);
+            return;
+        }
         prompt_ms = now_ms() - t0;
         prompt_ms_ += prompt_ms;
         ++prompt_groups_;
@@ -562,9 +621,19 @@ void CohortDecoder::step() {
         // 8192 + 16) carries two fixed costs and is not a sample
         const bool one_pass = config_.prompt_slice_decoding == 0U || l.prompt_read + prompt_rows <= l.chunk_end;
         const double t0 = now_ms();
-        backend_.prefill_scoped(plan.prompt.front().lane,
-                                std::span<const std::uint32_t>(l.request.prompt.data() + l.prompt_read, prompt_rows),
-                                l.prompt_read == 0, l.request.prompt.size());
+        try {
+            backend_.prefill_scoped(plan.prompt.front().lane,
+                                    std::span<const std::uint32_t>(l.request.prompt.data() + l.prompt_read, prompt_rows),
+                                    l.prompt_read == 0, l.request.prompt.size());
+        } catch (const std::exception& ex) {
+            const std::uint32_t one[1] = {plan.prompt.front().lane};
+            if (dynamic_cast<const std::logic_error*>(&ex) != nullptr) {
+                cleanup_keeping_contract_error([&] { fail_prompt(one, ex); });
+                throw;
+            }
+            fail_prompt(one, ex);
+            return;
+        }
         prompt_ms = now_ms() - t0;
         prompt_ms_ += prompt_ms;
         // The gap's row cost is learned from passes of at least the decoding floor only: a shorter pass (a lone short
@@ -710,7 +779,24 @@ void CohortDecoder::step() {
         base += groups[k].rows;
     }
     top.assign(tokens.size(), 0U);
-    backend_.verify(groups, tokens, top);
+    // A backend failure of the verify or commit fails every lane of this forward (selections discarded, lanes
+    // released, budget returned) and leaves the decoder usable; the next step starts clean. Every lane is retired even
+    // when a backend release throws (each finish() frees its lane first); the first such error is rethrown once.
+    const auto fail_forward = [&](const char* what, const std::exception& ex) {
+        for (std::size_t k = 0; k < n; ++k)
+            if (auto& selection = run[k]->request.selection) selection->discard();
+        verification_ = std::move(scratch);
+        fail_lanes(std::span<Lane* const>(run.data(), n), std::string(what) + ": " + ex.what());
+    };
+    try {
+        backend_.verify(groups, tokens, top);
+    } catch (const std::logic_error& ex) {  // contract violations stay fatal after the cleanup
+        cleanup_keeping_contract_error([&] { fail_forward("verify", ex); });
+        throw;
+    } catch (const std::exception& ex) {
+        fail_forward("verify", ex);
+        return;
+    }
     keep.resize(n);
     std::vector<std::vector<std::uint32_t>> chosen(n);  // the ids each lane emits this step
     std::vector<std::unique_ptr<MtpSelectionReceipt>> receipts(n);
@@ -750,7 +836,15 @@ void CohortDecoder::step() {
         }
         base += rows;
     }
-    backend_.commit(keep);
+    try {
+        backend_.commit(keep);
+    } catch (const std::logic_error& ex) {  // contract violations stay fatal after the cleanup
+        cleanup_keeping_contract_error([&] { fail_forward("commit", ex); });
+        throw;
+    } catch (const std::exception& ex) {
+        fail_forward("commit", ex);
+        return;
+    }
     for (auto& receipt : receipts)
         if (receipt) receipt->publish();  // the model prefix is committed: the selection state follows it
     const double decode_ms = now_ms() - t0;
