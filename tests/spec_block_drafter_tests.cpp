@@ -700,7 +700,34 @@ void plain_row_price_tests() {
     BD_CHECK(prose >= 1.2 * serial, "auto stopped drafting where it pays: %.4f vs %.4f", prose, serial);
 }
 
+void live_depth_tests() {
+    auto w = make_world("loop", 12, 16, 77);
+    w.prompt = {1, 2, 1, 2};  // The suffix matches the first two tokens and offers a two-token copy.
+    sp::BlockConfig cfg;
+    cfg.fixed_costs = true;
+    cfg.force_lookup = true;
+    cfg.chain_seed_flush_ms = cfg.chain_seed_step_ms = 0.01;
+    cfg.arbiter.max_draft_by_live = {7, 2, 0};
+    const auto next = [&](std::uint32_t lanes) {
+        FakeChain chain(w, 1.0);
+        sp::BlockDrafter drafter(cfg, &chain);
+        for (std::uint32_t rows = 1; rows <= cfg.max_block; ++rows)
+            drafter.seed_verify_ms(rows, 10.0);
+        drafter.commit(w.prompt);
+        sp::StepParams params;
+        params.live_lanes = lanes;
+        return drafter.next(params);
+    };
+    const auto single = next(1);
+    BD_CHECK(single.copy == 2 && single.ext > 0, "single lane should extend the short copy");
+    const auto pair = next(2);
+    BD_CHECK(pair.copy == 2 && pair.ext == 0 && pair.rows() == 3, "hybrid extension exceeds the live-lane cap");
+    const auto wide = next(8);
+    BD_CHECK(wide.source == sp::Source::serial && wide.rows() == 1, "zero live-lane cap should disable drafting");
+}
+
 int main() {
+    live_depth_tests();
     plain_row_probe_tests();
     plain_row_price_tests();
     const std::uint32_t n = 1500;

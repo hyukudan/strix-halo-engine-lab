@@ -166,6 +166,7 @@ struct StepParams {
     std::uint64_t context = 0;      // committed positions (cost bin); the uncommitted anchor is at context
     std::uint32_t tree_rows = 0;    // widest tree window of the target (0: linear only; BlockSpeculator sets it)
     std::optional<std::uint32_t> eos{};  // emit this selection without consuming its draft row
+    std::uint32_t live_lanes = 1;  // depth-policy index; the target still sets the physical row limit
 };
 
 // Rows of a block as the target sees them: tokens[0] = anchor; parent[r] = parent row (-1 for the anchor, < r);
