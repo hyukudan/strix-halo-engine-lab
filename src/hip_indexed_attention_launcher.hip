@@ -5,9 +5,7 @@
 #include "strix/env_flags.hpp"
 #include "attn_core/index_score_wmma.hpp"
 #include "attn_core/index_score_band.hpp"
-#if defined(STRIX_QWEN_QSA_SHARED_EAGER)
 #include "attn_core/eager_selected.hpp"
-#endif
 #include "attn_core/eager_softmax.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_check.hpp"
@@ -1963,15 +1961,12 @@ __global__ __launch_bounds__(kSelectThreads) void select_blocks_kernel(float* bl
 struct QsaSoftmaxControl {
     GraphSelectionArguments dynamic;
     __device__ __forceinline__ bool count(std::uint32_t& selected_count) const { return graph_selected_count(dynamic, selected_count); }
-#if defined(STRIX_QWEN_QSA_SHARED_EAGER)
     __device__ __forceinline__ bool padded() const { return dynamic.position.position != nullptr; }
-#endif
     __device__ __forceinline__ bool checks() const { return dynamic.position.status != nullptr; }
     __device__ __forceinline__ void fail() const { atomicOr(dynamic.position.status, 8U); }
     __device__ __forceinline__ float round(float value) const { return round_bf16(value); }
 };
 
-#if defined(STRIX_QWEN_QSA_SHARED_EAGER)
 using EagerGeometry = strix::attn_core::eager_selected::Geometry;
 
 // Operand layout of the shared eager selected forms: q_gate [head][query head_dim | gate head_dim] FP32; the KV row of a
@@ -2018,106 +2013,6 @@ __device__ __forceinline__ void attention_score_body(const float* q_gate, const 
         EagerGeometry{attention_heads, kv_heads, head_dim}, scores, QsaEagerOperands<Int8>{q_gate, kv_state},
         QsaSoftmaxControl{dynamic});
 }
-#else
-template <bool Int8 = false>
-__device__ __forceinline__ void attention_score_body(
-    const float* q_gate,
-    const std::uint16_t* kv_state,
-    const std::uint32_t* selected,
-    std::uint32_t selected_count,
-    std::uint32_t maximum_selected,
-    std::uint32_t attention_heads,
-    std::uint32_t kv_heads,
-    std::uint32_t head_dim,
-    float* scores, GraphSelectionArguments dynamic) {
-    if (!graph_selected_count(dynamic, selected_count)) return;
-    const auto flat =
-        static_cast<std::uint32_t>(
-            blockIdx.x);
-    const auto head =
-        flat /
-        (dynamic.position.position == nullptr ? selected_count : maximum_selected);
-    const auto selected_slot =
-        flat %
-        (dynamic.position.position == nullptr ? selected_count : maximum_selected);
-    if (head >= attention_heads || selected_slot >= selected_count) {
-        return;
-    }
-
-    const auto feature =
-        static_cast<std::uint32_t>(
-            threadIdx.x);
-    __shared__ float scratch[kThreads];
-
-    const auto token =
-        selected[selected_slot];
-    const auto kv_group =
-        attention_heads /
-        kv_heads;
-    const auto kv_head =
-        head /
-        kv_group;
-    const auto kv_width =
-        kv_heads *
-        head_dim;
-    const auto row_base =
-        static_cast<std::uint64_t>(
-            token) *
-        kv_width *
-        2ULL;
-
-    float product = 0.0F;
-    if constexpr (Int8) {
-        if (feature < head_dim)
-            product = q_gate[static_cast<std::uint64_t>(head) * head_dim * 2ULL + feature] *
-                kv_int8_load(kv_state, token, kv_width, kv_heads, 0U, kv_head, head_dim, feature);
-    } else if (feature < head_dim) {
-        product =
-            q_gate[
-                static_cast<std::uint64_t>(
-                    head) *
-                    head_dim *
-                    2ULL +
-                feature] *
-            bf16_to_float(
-                kv_state[
-                    row_base +
-                    static_cast<std::uint64_t>(
-                        kv_head) *
-                        head_dim +
-                    feature]);
-    }
-    scratch[feature] =
-        product;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (feature < stride) {
-            scratch[feature] +=
-                scratch[
-                    feature +
-                    stride];
-        }
-        __syncthreads();
-    }
-
-    if (feature == 0) {
-        if (dynamic.position.status != nullptr && !isfinite(scratch[0])) atomicOr(dynamic.position.status, 8U);
-        scores[
-            static_cast<std::uint64_t>(
-                head) *
-                maximum_selected +
-            selected_slot] =
-            scratch[0] /
-            sqrtf(
-                static_cast<float>(
-                    head_dim));
-    }
-}
-#endif
 
 __global__ void attention_score_kernel(const float* q_gate, const std::uint16_t* kv_state,
     const std::uint32_t* selected, std::uint32_t selected_count, std::uint32_t maximum_selected,
@@ -2152,7 +2047,6 @@ __global__ void attention_softmax_kernel(float* scores, std::uint32_t selected_c
     attention_softmax_body(scores, selected_count, maximum_selected, dynamic);
 }
 
-#if defined(STRIX_QWEN_QSA_SHARED_EAGER)
 template <bool Int8 = false>
 __device__ __forceinline__ void attention_output_body(const float* q_gate, const std::uint16_t* kv_state,
     const std::uint32_t* selected, const float* scores, std::uint32_t selected_count, std::uint32_t maximum_selected,
@@ -2165,92 +2059,6 @@ __device__ __forceinline__ void attention_output_body(const float* q_gate, const
         strix::attn_core::eager_selected::GatedRoundedOutput<RoundedStageImage, QsaEagerOperands<Int8>>{operands, output},
         QsaSoftmaxControl{dynamic});
 }
-#else
-template <bool Int8 = false>
-__device__ __forceinline__ void attention_output_body(
-    const float* q_gate,
-    const std::uint16_t* kv_state,
-    const std::uint32_t* selected,
-    const float* scores,
-    std::uint32_t selected_count,
-    std::uint32_t maximum_selected,
-    std::uint32_t attention_heads,
-    std::uint32_t kv_heads,
-    std::uint32_t head_dim,
-    RoundedStageImage output, GraphSelectionArguments dynamic) {
-    if (!graph_selected_count(dynamic, selected_count)) return;
-    const auto head =
-        static_cast<std::uint32_t>(
-            blockIdx.x);
-    const auto feature =
-        static_cast<std::uint32_t>(
-            threadIdx.x);
-    if (head >= attention_heads ||
-        feature >= head_dim) {
-        return;
-    }
-
-    const auto kv_group =
-        attention_heads /
-        kv_heads;
-    const auto kv_head =
-        head /
-        kv_group;
-    const auto kv_width =
-        kv_heads *
-        head_dim;
-
-    // Sequential sum += score * value in slot order; eight slots' token indices and
-    // values are requested before they join the chain (latency, not arithmetic).
-    const auto* head_scores = scores + static_cast<std::uint64_t>(head) * maximum_selected;
-    const auto offset = static_cast<std::uint64_t>(kv_width) + static_cast<std::uint64_t>(kv_head) * head_dim + feature;
-    const auto value_at = [&](std::uint32_t token) {
-        if constexpr (Int8) return kv_int8_load(kv_state, token, kv_width, kv_heads, 1U, kv_head, head_dim, feature);
-        else return bf16_to_float(kv_state[static_cast<std::uint64_t>(token) * kv_width * 2ULL + offset]);
-    };
-    float sum = 0.0F;
-    std::uint32_t slot = 0;
-    for (; slot + 8U <= selected_count; slot += 8U) {
-        std::uint32_t token[8];
-#pragma unroll
-        for (unsigned i = 0; i < 8U; ++i) token[i] = selected[slot + i];
-        float value[8], score[8];
-#pragma unroll
-        for (unsigned i = 0; i < 8U; ++i) { value[i] = value_at(token[i]); score[i] = head_scores[slot + i]; }
-#pragma unroll
-        for (unsigned i = 0; i < 8U; ++i) sum += score[i] * value[i];
-    }
-    for (; slot < selected_count; ++slot) {
-        const float value = value_at(selected[slot]);
-        sum += head_scores[slot] * value;
-    }
-
-    // Preserve the model's BF16 attention output and BF16 sigmoid gate before
-    // the final output projection.
-    const float attn =
-        round_bf16(sum);
-    const float gate =
-        round_bf16(
-            1.0F /
-            (1.0F +
-             expf(
-                 -q_gate[
-                     static_cast<std::uint64_t>(
-                         head) *
-                         head_dim *
-                         2ULL +
-                     head_dim +
-                     feature])));
-    output[
-        static_cast<std::uint64_t>(
-            head) *
-            head_dim +
-        feature] =
-        round_bf16(
-            attn * gate);
-    if (dynamic.position.status != nullptr && !isfinite(round_bf16(attn * gate))) atomicOr(dynamic.position.status, 8U);
-}
-#endif
 
 __global__ void attention_output_kernel(const float* q_gate, const std::uint16_t* kv_state,
     const std::uint32_t* selected, const float* scores, std::uint32_t selected_count,
