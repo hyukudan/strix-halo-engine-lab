@@ -3,6 +3,9 @@
 #include "strix/env_flags.hpp"
 // Adapted mathematical codec and transforms; see notices/ for retained attribution.
 #include "device.hpp"
+#if defined(STRIX_GEMMA4_EXL3_SHARED_HADAMARD)
+#include "core/hadamard.hpp"
+#endif
 #include "core/trellis_codec.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -29,6 +32,18 @@ __device__ _Float16 half(float v, unsigned* failure) {
     if ((bit_cast<unsigned short>(h) & 0x7c00U) == 0x7c00U) atomicOr(failure, 4U);
     return h;
 }
+#if defined(STRIX_GEMMA4_EXL3_SHARED_HADAMARD)
+// Hadamard-128 of the shared core with a non-finite flag after every produced value; no RN32 boundary on the
+// scaled values (the RN16 conversion that follows materializes its input itself).
+struct Flagged {
+    static constexpr bool boundary = false;
+    unsigned* failure;
+    __device__ __forceinline__ void step(float value) const { flag(value, failure); }
+};
+__device__ void transform(float (&values)[4], unsigned* failure) {
+    core::hadamard128(values, threadIdx.x % 32U, Flagged{failure});
+}
+#else
 __device__ void transform(float (&values)[4], unsigned* failure) {
     const auto lane = threadIdx.x % 32U;
 #pragma unroll
@@ -50,6 +65,7 @@ __device__ void transform(float (&values)[4], unsigned* failure) {
 #pragma unroll
     for (unsigned j = 0; j < 4; ++j) { values[j] = values[j] * hscale; flag(values[j], failure); }
 }
+#endif
 bool input_preload();
 // panels = false: rows x inputs; true: the prefill GEMMs' [K16][row][16] input panels.
 template <bool Preload = true>

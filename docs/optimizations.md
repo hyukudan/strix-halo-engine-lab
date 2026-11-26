@@ -2,6 +2,37 @@
 
 Qwen guarded wave reductions can use exact DPP/permlanex16 exchanges (build-time lever, off by default: configure with `-DSTRIX_DPP_REDUCE=ON`; the all-on build uses it); addition trees are unchanged, native byte-equality qualification is pending, and no speed gain is claimed.
 
+<a id="gemma4-exl3-shared-hadamard"></a>
+## Gemma 4 shared EXL3 Hadamard
+
+Configure a HIP device build with `-DSTRIX_GEMMA4_EXL3_SHARED_HADAMARD=ON` to test the
+observer trait in `src/core/hadamard.hpp`. The Gemma 4 adapter flags each non-finite result and
+keeps the existing rounding boundary at the FP16 conversion. The build option defaults to
+`OFF` for all profiles. Device qualification requires the EXL3 checks and byte-identical tokens
+and logits on the same EXL3 pack. Performance is unmeasured. Use separate state and cache
+directories for the qualification builds.
+
+<a id="qwen-qsa-shared-eager"></a>
+## Qwen Flash Next shared eager QSA score and output
+
+Configure a HIP device build with `-DSTRIX_QWEN_QSA_SHARED_EAGER=ON` to test the score and
+value forms in `src/attn_core/eager_selected.hpp` through the same launcher in the CLI and server.
+The adapter supplies BF16 or int8 KV reads, captured selection counts and status checks.
+The build option defaults to `OFF` for all profiles. Device qualification requires the launcher
+fixture and byte-identical model output on automatic, eager BF16, eager KV-int8, and long-prompt
+routes. Performance is unmeasured. Use fresh state and separate cache directories for each build.
+
+| Model | Shared EXL3 Hadamard adapter | Shared eager QSA score and output |
+|---|---|---|
+| inkling2-mini | No Gemma 4 EXL3 adapter | No Qwen QSA adapter |
+| qwen3.8-flash-next | No Gemma 4 EXL3 adapter | HIP qualification build |
+| qwen3.8-27b | No Gemma 4 EXL3 adapter | Dense attention |
+| deepseek-v4.1-flash | No Gemma 4 EXL3 adapter | DeepSeek sparse attention |
+| glm-5.3-flash | No Gemma 4 EXL3 adapter | GLM sparse attention |
+| minimax-m3.1-flash | No Gemma 4 EXL3 adapter | MiniMax sparse attention |
+| hy4-flash | No Gemma 4 EXL3 adapter | Hy4 attention |
+| nemotron-3.5-bolt-e4b | No Gemma 4 EXL3 adapter | Dense attention |
+
 ## Qwen product profiles
 
 `--profile default|fast|quality` selects the Qwen product policy for decode,
@@ -5992,6 +6023,54 @@ BF16 tile; CUDA declines the class.
 | 4K (4,309 / 4,307 tokens) | 2,129 tok/s | 2,387 tok/s (x1.121) | 2,071 tok/s | 2,313 tok/s (x1.117) |
 | 8K (8,236 / 8,234 tokens) | 2,181 tok/s | 2,380 tok/s (x1.092) | 2,037 tok/s | 2,229 tok/s (x1.094) |
 | 32K (32,760 / 32,758 tokens) | 1,939 tok/s | 2,072 tok/s (x1.069) | 1,890 tok/s | 2,053 tok/s (x1.086) |
+
+<a id="inkling2-hip-served-tall-chunk"></a>
+
+## Inkling 2 Mini HIP held-back prefill chunk
+
+`STRIX_INK_HIP_SERVED_TALL_CHUNK=1` tries the CLI's 8,192-row chunk on the HIP HTTP held-back EXACT route.
+The context caps the chunk. The server keeps its lane cap and retries with 128 rows if device allocation fails,
+if no lane fits, or if the trial would cost a requested `--slots` lane. An explicit `--prefill-rows` takes precedence.
+Leave the variable unset or set it to `0` to use the incumbent chunk. The option is off in every tier.
+The server loads it through the shared served chunk ladder (candidates 8,192 then 128 rows; the larger is kept only
+when its whole load keeps the 128-row slot capacity). The HIP held-back route cannot cut a chunk into pieces, so a
+decoding lane beside an admitted prompt waits for one whole chunk.
+
+The source receipt on gfx1151 compared complete greedy IDs on seven prompts of 2,280, 9,116 and 35,170 tokens.
+It measured served prefill of 602 → 2,030 tok/s at 8K and 578 → 1,870 tok/s at 32K. Device qualification of the
+integrated server is pending.
+
+<a id="iu4-short-wave-quantiser"></a>
+
+## HIP IU4 activation quantisation with eight row owners
+
+`QuantiseSchedule::wave_rows` in `src/core/iu4a4_dense.hpp` lets each wave own one row of at most 3,072 inputs.
+The shared CTA form handles wider rows. The row maximum and first nonfinite input use the same ordering as the
+incumbent. The fixture checks activation codes, scales, bases and GEMM outputs against the host oracle. Native
+verification and timing are pending. Engine callers use `QuantiseSchedule::incumbent` by default.
+
+<a id="cuda-wr1-programmatic-edges"></a>
+
+## CUDA WR1 programmatic edges
+
+CUDA WR1 recipe callers can opt into programmatic edges by passing `early_launch=true` to `wr1::Bindings`.
+Only the three dense leaves and RMS can accept those edges. Each waits before reading predecessor output or
+writing global memory. The host fixture checks the edge contract. The source compared unchanged SASS for 107
+functions. The native fixture compares completion and programmatic graphs at widths 1, 2, 4, 8 and 16.
+Existing callers use completion edges. Native graph verification and timing are pending.
+
+| Model | HIP held-back chunk | HIP IU4 wave rows | CUDA WR1 edges |
+| --- | --- | --- | --- |
+| Inkling 2 Mini | Explicit, HIP HTTP EXACT | Shared core option | Shared recipe option |
+| Qwen3.8 Flash Next | No binding | Shared core option | Shared recipe option |
+| Qwen3.8-27B | No binding | Shared core option | Shared recipe option |
+| DeepSeek V4.1 Flash | No binding | Shared core option | Shared recipe option |
+| GLM-5.3 Flash | No binding | Shared core option | Shared recipe option |
+| MiniMax M3.1 Flash | No binding | Shared core option | Shared recipe option |
+| Hy4 Flash | No binding | Shared core option | Shared recipe option |
+| Nemotron 3.5 Bolt E4B | No binding | Shared core option | Shared recipe option |
+
+The shared options have no model binding in this change.
 
 <a id="inkling2-moe-shift-decode"></a>
 

@@ -1,3 +1,10 @@
+option(STRIX_QWEN_QSA_SHARED_EAGER
+    "Build the shared HIP eager QSA score and output for device qualification" OFF)
+if(STRIX_QWEN_QSA_SHARED_EAGER)
+    set_property(SOURCE src/hip_indexed_attention_launcher.hip APPEND PROPERTY
+        COMPILE_DEFINITIONS STRIX_QWEN_QSA_SHARED_EAGER=1)
+endif()
+
 if(STRIX_ENABLE_HIP_RUNTIME OR BUILD_TESTING)
     add_library(strix_qwen_serve_options STATIC src/qwen/session_service.cpp)
     target_include_directories(strix_qwen_serve_options PUBLIC src PRIVATE apps)
