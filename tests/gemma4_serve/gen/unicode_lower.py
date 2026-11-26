@@ -7,6 +7,9 @@ from pathlib import Path
 import sys
 import unicodedata
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tools"))
+from unicode_ranges import UNICODE_LIMIT, nonzero_ranges, require_pinned_ucd
+
 def cased(cp):
     ch = chr(cp)
     return ch.islower() or ch.isupper() or ch.istitle()
@@ -20,21 +23,12 @@ def ignorable(cp):
     result = ("AΣ" + ch + ("" if is_cased else "A")).lower()[1]
     return result == ("ς" if is_cased else "σ")
 
-def ranges(f):
-    out = []
-    for cp in range(0x110000):
-        if f(cp):
-            if out and out[-1][1] + 1 == cp:
-                out[-1][1] = cp
-            else:
-                out.append([cp, cp])
-    return out
-
+require_pinned_ucd()
 lines = [f"// Generated Unicode {unicodedata.unidata_version} lowercase/context metadata; see tests/gemma4_serve/gen/unicode_lower.py.",
          "// Mathematical Unicode mappings, queried from CPython; see README.md for provenance.",
          "struct LowerMapping { std::uint32_t cp; std::string_view text; };",
          "constexpr LowerMapping lower_mappings[] = {"]
-for cp in range(0x110000):
+for cp in range(UNICODE_LIMIT):
     s = chr(cp)
     if s.lower() != s:
         escaped = ''.join(f"\\x{b:02X}" for b in s.lower().encode('utf-8'))
@@ -43,7 +37,7 @@ lines.append("};")
 lines.append("struct CaseRange { std::uint32_t first, last; };")
 for name, prop in [("cased_ranges", cased), ("ignorable_ranges", ignorable)]:
     lines.append(f"constexpr CaseRange {name}[] = {{")
-    for a, b in ranges(prop):
+    for a, b, _ in nonzero_ranges(prop):
         lines.append(f"    {{0x{a:X}U, 0x{b:X}U}},")
     lines.append("};")
-Path(sys.argv[1]).write_text('\n'.join(lines) + '\n', encoding='utf-8')
+Path(sys.argv[1]).write_text('\n'.join(lines) + '\n', encoding='utf-8', newline='\n')
