@@ -201,7 +201,7 @@ raw-getenv include/strix/moe_q4k_a8_contract.hpp 2
 raw-getenv include/strix/pair/link.hpp 2
 raw-getenv include/strix/pair/link_flags.hpp 2
 raw-getenv include/strix/ple_gap_witness.hpp 1
-raw-getenv include/strix/prefill_identity.hpp 4
+raw-getenv include/strix/prefill_identity.hpp 3
 raw-getenv include/strix/prefill_moe_policy.hpp 2
 raw-getenv include/strix/q8_projection_manifest.hpp 1
 raw-getenv include/strix/qpersist.hpp 1
