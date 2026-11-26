@@ -6692,3 +6692,29 @@ A probe episode's realized net leaves out the first wall of every window width (
 | Inkling 2 Mini | bound: CUDA CLI --speculation auto (probe_loss 0.015, cold_walls 1) |
 | Hy4 Flash | unchanged: no probe_loss row (fixed re-probe interval) |
 | Nemotron 3.5 Bolt E4B | unchanged: no probe_loss row (fixed re-probe interval) |
+
+<a id="inkling2-device-sampled-rows"></a>
+
+## CUDA CLI sampled rows on the device
+
+**Engine:** `inkling2-mini`. **Control:** STRIX_SAMPLE_PATH=host (off switch). **Default:** on (CUDA CLI, token sampling, step program route).
+
+A sampled CLI row is drawn on the device by the shared sampler (one 4-byte reply) instead of copying the 201K-float row to the host and transforming it there.
+
+- **Shared home:** src/serve/serial_generation_cli.cpp (SerialGenerationDecoder::decode_sampled), strix/cuda/token_sampling_device.hpp; src/inkling2 binding
+- **Tier and regime:** EXACT, FAST, QUALITY, TURBO; CUDA CLI sampled decode
+- **Exactness evidence:** Same draws: the shared device sampler's decision equals the host TokenSampler's (strix/cuda/token_sampling_device.hpp tests). q59: ids Sd == Sh == Sd2 == Sh2 == q56 So (T 0.7 seed 7); greedy G == q46 R0. Host: strix-serial-generation-cli-tests (device decision path).
+- **Off switch:** STRIX_SAMPLE_PATH=host
+- **Measured gain:** q59 (RTX PRO, CLI EXACT 256 tokens, code, T 0.7 seed 7): 94.06 / 93.90 tok/s on the device vs 91.95 / 91.97 host (+2.2 %); greedy 97.78.
+- **Preconditions:** CUDA build with the step program route; a sampled request (temperature > 0)
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: the CLI samples on the host |
+| Qwen3.8 27B dense | not bound: the CLI samples on the host |
+| DeepSeek V4.1 Flash | not bound: the CLI samples on the host |
+| GLM 5.3 Flash | not bound: the CLI samples on the host |
+| MiniMax M3.1 Flash | not bound: the CLI samples on the host |
+| Inkling 2 Mini | bound: CUDA CLI step program route |
+| Hy4 Flash | not bound: the CLI samples on the host |
+| Nemotron 3.5 Bolt E4B | not bound: the CLI samples on the host |
