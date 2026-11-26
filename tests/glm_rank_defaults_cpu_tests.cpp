@@ -401,6 +401,43 @@ void test_mtp_default() {
     CHECK(on.mtp.value == "1" && on.spec.value == "1" && on.mtp_spec.value == "1");
     CHECK(on.prefill == "gemv" && on.kmax == 3 && on.adaptive);
     CHECK(rd::print(on).find("effective mtp-bootstrap=chunked") != std::string::npos);
+    // pf_wmma per prompt (glm_pair_profile_table.hpp): the FAST band row 2,049..8,192 and the TURBO literal row at
+    // 31,258, both for the measured pair execution only (8,192-row chunk, one lane, routed scratch).
+    {
+        struct Work {
+            bool pair = true;
+            std::uint64_t prompt = 8192, capacity = 36864;
+            unsigned rows = rd::kTurboPrefillRows, lanes = 1;
+        };
+        const auto band = [&](const char* profile, Work w, const Args& extra = {}, const Env& env = Env{}) {
+            const auto request = rd::scan(cat(cat(cat(kDeploy, kDecodeWork), {"--profile", profile}), extra));
+            const auto e = rd::resolve(request, getter(env), facts);
+            const rd::PrefillWork work{w.pair, w.prompt, w.capacity, w.rows, w.lanes, rd::kTurboPrefillGenerated, true};
+            return rd::select_prefill_wmma(request, e, getter(env), work);
+        };
+        const auto prompt = [](std::uint64_t n) { Work w; w.prompt = n; return w; };
+        CHECK(!band("fast", prompt(2048)));
+        CHECK(band("fast", prompt(2049)));
+        CHECK(band("fast", prompt(8192)));
+        CHECK(!band("fast", prompt(8193)));
+        CHECK(!band("fast", prompt(31258)));
+        CHECK(!band("exact", prompt(8192)));
+        CHECK(band("turbo", prompt(8192)));
+        CHECK(band("turbo", prompt(31258)));
+        CHECK(!band("turbo", prompt(32768)));
+        CHECK(!band("turbo", prompt(16384)));
+        Work w = prompt(8192);
+        w.pair = false;  // the pair vote folds device, link and layout: any mismatch declines
+        CHECK(!band("fast", w));
+        w = prompt(8192);
+        w.rows = 4096;
+        CHECK(!band("fast", w));
+        w = prompt(8192);
+        w.lanes = 2;
+        CHECK(!band("fast", w));
+        CHECK(!band("fast", prompt(8192), {"--baseline"}));
+        CHECK(!band("fast", prompt(8192), {}, {{"STRIX_GLM_PF_WMMA", "0"}}));
+    }
     const auto off = resolve_head({"--mtp", "0"});
     std::string why;
     CHECK(same_values(off, resolve(cat(kReceiptD, kDecodeWork), merge(kReceiptEnv, kHp)), &why));
@@ -508,6 +545,43 @@ void test_max_rows_memory() {
     CHECK(printed.find("effective max-rows=8192 (auto-8192)\n") != std::string::npos);
     CHECK(printed.find("startup-admission-and-rank-min") != std::string::npos);
     CHECK(printed.find("MemAvailable") == std::string::npos && printed.find("CmaFree") == std::string::npos);
+}
+
+// r94: the CLI pair votes the MTP drafter payload digest after the eligibility round (one extra paired round).
+void test_drafter_digest_vote() {
+    namespace spec = strix::glm::spec;
+    auto pair = [&](const std::string& a, const std::string& b) {
+        std::barrier barrier(2);
+        spec::MergeRow payload[2];
+        spec::MergeCtl control[2];
+        std::string error[2];
+        unsigned rounds[2] = {0, 0};
+        const std::string digest[] = {a, b};
+        auto rank = [&](unsigned r) {
+            try {
+                rd::agree_drafter_digest(digest[r], true, [&](auto* rows, unsigned n, auto& ctl) {
+                    ++rounds[r];
+                    payload[r] = rows[0];
+                    control[r] = ctl;
+                    barrier.arrive_and_wait();
+                    spec::merge_rank_order({rows, n}, ctl, {&payload[1 - r], n}, control[1 - r], r);
+                    barrier.arrive_and_wait();
+                });
+            } catch (const std::exception& e) { error[r] = e.what(); }
+        };
+        std::thread peer(rank, 1);
+        rank(0);
+        peer.join();
+        CHECK(rounds[0] == 2 && rounds[1] == 2);
+        CHECK(error[0].empty() == error[1].empty());
+        return error[0].empty();
+    };
+    CHECK(pair("sha256:aa11", "sha256:aa11"));
+    CHECK(!pair("sha256:aa11", "sha256:aa12"));
+    CHECK(rd::drafter_digest_hash("sha256:aa11") != rd::drafter_digest_hash("sha256:aa12"));
+    unsigned calls = 0;
+    rd::agree_drafter_digest("x", false, [&](auto*, unsigned, auto&) { ++calls; });
+    CHECK(calls == 0);  // no handshake or no eligible drafter: no round
 }
 
 void test_startup_agreement() {
@@ -949,6 +1023,7 @@ int main() {
     test_scan_and_print();
     test_max_rows_memory();
     test_startup_agreement();
+    test_drafter_digest_vote();
     test_no_handshake_fallback();
     test_effective_config_rows();
     test_reference_prefill_rows();

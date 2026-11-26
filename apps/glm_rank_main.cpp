@@ -540,6 +540,8 @@ int main(int argc, char** argv) {
             rd::agree_max_rows(eff, result.rows);
             opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
             mtp_spec_on = result.eligible;
+            rd::agree_drafter_digest(eff.head.mtp_digest, startup_handshake && mtp_spec_on,
+                [&](auto* rows, unsigned n, auto& ctl) { eng.exchange()->merge(rows, n, ctl, nullptr); });
             if (!mtp_spec_on)
                 std::printf("rank %u mtp-spec: unavailable on at least one rank (head or precondition); using plain decode\n", opt.rank);
         };
@@ -1161,7 +1163,7 @@ int main(int argc, char** argv) {
                 const auto wd = W::dense_calls.exchange(0), wmo = W::moe_calls.exchange(0), wq = W::iu4_moe_calls.exchange(0);
                 std::printf("rank %u prefill identity %s (STRIX_GLM_PF_WMMA=%s, prefill %s, wmma calls dense %llu moe %llu)",
                             opt.rank, eng.model_fast_i4() ? "glm-fast-i4 FAST (routed W4A4 g64)" :
-                            wd + wmo ? (turbo ? "glm-pf-wmma-x TURBO" : wq ? "glm-pf-wmma-x+iu4 FAST" : "glm-pf-wmma-x FAST") :
+                            wd + wmo ? (turbo && request.product.profile == strix::profile::Name::turbo ? "glm-pf-wmma-x TURBO" : wq ? "glm-pf-wmma-x+iu4 FAST" : "glm-pf-wmma-x FAST") :
                                 prefill_mode == "wmma" ? "prefill-wmma route" : "exact",
                             wm ? wm : "unset", prefill_mode.c_str(), static_cast<unsigned long long>(wd), static_cast<unsigned long long>(wmo));
                 if (wq) std::printf(" iu4 moe %llu", static_cast<unsigned long long>(wq));  // STRIX_GLM_PF_IU4=1 only

@@ -4692,7 +4692,7 @@ inherit it).
   band and its own literal receipt at 31,258 tokens. Each prompt prints
   `glm-pf-wmma-x profile=<p> prompt=<n> chunk=<rows> scratch=<routed|full> effective=wmma|exact-cores (reason)` and the `strix-ladder/v1 pf_wmma`
   route that decided it.
-- **Fallback notice:** prompts of 2,048 tokens or fewer, above 8,192 tokens (32K is TURBO only), other devices, links,
+- **Fallback notice:** prompts of 2,048 tokens or fewer, above 8,192 tokens (32K is TURBO only, and only on the rank CLI: the server prefills in chunks of at most 8,192 rows), other devices, links,
   chunks or compositions, and two-rank native modes without configuration agreement keep the exact cores. Two-rank
   execution still requires configuration agreement for an explicit arithmetic switch.
 - **Exactness evidence:** FAST identity (new FP32 summation order). FAST gate v2 with MoE route replay, pair, 5 windows
