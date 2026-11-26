@@ -33,6 +33,12 @@ if(TARGET strix_exec_cuda AND TARGET strix_cuda_core_kernels)
     if(STRIX_WARNINGS_AS_ERRORS)
         target_compile_options(strix_exec_cuda_decode_catalog PRIVATE ${e1x_host_werror} -Werror=all-warnings)
     endif()
+    if(TARGET strix-cuda-inkling2-mini-window-program-test)
+        # The window fixture's --hybrid mode binds the command line's plain-row route (the step program).
+        target_compile_definitions(strix-cuda-inkling2-mini-window-program-test PRIVATE STRIX_INKLING2_STEP_PROGRAM=1)
+        target_link_libraries(strix-cuda-inkling2-mini-window-program-test PRIVATE strix_exec strix_exec_cuda
+                              strix_exec_cuda_decode_catalog)
+    endif()
     if(TARGET strix-inkling2-mini-cuda)
         target_compile_definitions(strix-inkling2-mini-cuda PRIVATE STRIX_INKLING2_STEP_PROGRAM=1)
         target_link_libraries(strix-inkling2-mini-cuda PRIVATE strix_exec strix_exec_cuda strix_exec_cuda_decode_catalog)

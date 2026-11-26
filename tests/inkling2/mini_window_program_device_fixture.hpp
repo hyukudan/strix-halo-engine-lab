@@ -23,6 +23,9 @@
 #include "inkling2/inkling2_mini_resident_dspark.hpp"
 #include "strix/model_data/inkling2_mini.hpp"
 #include "strix/spec/drafter_source.hpp"
+#if defined(STRIX_INKLING2_STEP_PROGRAM)
+#include "inkling2/inkling2_mini_program_cuda.hpp"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -202,11 +205,26 @@ inline std::string window_ids(const std::vector<std::uint32_t>& ids) {
     return "[" + text + "]";
 }
 
-inline int window_program_identity(const char* checkpoint, bool screened, std::string_view dspark = {}) {
+inline int window_program_identity(const char* checkpoint, bool screened, std::string_view dspark = {},
+                                   bool hybrid = false) {
     auto eager_owner = window_decoder(checkpoint, false, screened);
     auto program_owner = window_decoder(checkpoint, true, screened);
     auto& eager = *eager_owner;
     auto& program = *program_owner;
+#if defined(STRIX_INKLING2_STEP_PROGRAM)
+    // --hybrid: both decoders bind the command line's plain-row route (the CUDA step program over the decoder's state,
+    // its default forms, recording the DSpark taps); a plain row then runs between windows (q53 ran this way).
+    std::optional<MiniCudaProgramDecoder> eager_plain, program_plain;
+    if (hybrid) {
+        eager_plain.emplace(eager, true, mini_latency_forms(kMiniDefaultForms));
+        program_plain.emplace(program, true, mini_latency_forms(kMiniDefaultForms));
+        eager.set_plain_row_route([&](unsigned id, std::span<float> logits) { return eager_plain->decode(id, logits); });
+        program.set_plain_row_route([&](unsigned id, std::span<float> logits) { return program_plain->decode(id, logits); });
+    }
+    std::cout << "WINFIX plain rows " << (hybrid ? "step program between windows" : "none") << '\n';
+#else
+    if (hybrid) throw std::invalid_argument("--hybrid needs the step program build (STRIX_INKLING2_STEP_PROGRAM)");
+#endif
     // The command line's drafter: an explicit file, else the MTP block beside the checkpoint when present.
     const auto drafter_file = spec::resolve_drafter_file({.file = dspark, .off = false, .speculating = true},
                                                          checkpoint, model_data::inkling2_mini::speculation::drafter);
@@ -281,6 +299,23 @@ inline int window_program_identity(const char* checkpoint, bool screened, std::s
                   << '\n';
         position += keep;
         if (keep != 0U) token = top_eager[keep - 1U];
+#if defined(STRIX_INKLING2_STEP_PROGRAM)
+        // The hybrid route of the command line: the speculator's plain row between drafting passes runs on the step
+        // program over each decoder's own state (decode_committed_row), then the drafter reads and proposes again.
+        if (eager_plain) {
+            const auto next_eager = eager.decode_committed_row(token, {});
+            const auto next_program = program.decode_committed_row(token, {});
+            std::cout << "WINFIX " << tag << " plain row pos=" << position << " picks " << next_eager
+                      << (next_eager == next_program ? " == " : " != ") << next_program << '\n';
+            if (next_eager != next_program && !result.failed) {
+                result.failed = true;
+                result.first = tag + " plain row pick";
+            }
+            position += 1U;
+            token = next_eager;
+            compare_drafters(token, tag + " after plain row");
+        }
+#endif
     }
     std::vector<float> logits_eager(kOutputVocabulary), logits_program(kOutputVocabulary);
     const auto next_eager = eager.decode(token, logits_eager);
