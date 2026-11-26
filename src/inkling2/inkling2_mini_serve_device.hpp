@@ -147,8 +147,9 @@ inline MiniServeCohort make_mini_device_cohort(
             return Admission{std::move(candidate), lanes};
         };
         // A candidate's slots cannot exceed the incumbent's budget with its slot 0 returned and the candidate's own
-        // slot 0 taken (its row-scaled workspaces are never smaller than the incumbent's): host arithmetic only. Only
-        // an implicit CUDA chunk has more than one candidate, and a CUDA decoder declines verify windows (no tapes).
+        // slot 0 taken (its row-scaled workspaces are never smaller than the incumbent's): host arithmetic only. An
+        // implicit CUDA chunk (and the explicit HIP tall-chunk option) has more than one candidate; the bound leaves
+        // verify tapes out, so it can only over-estimate and the candidate's own load decides.
         const auto bound = [&](std::uint32_t chunk) -> std::uint32_t {
             const auto bytes = MiniResidentDecoder::held_back_slot_bytes(opt.context, chunk, rows);
             const std::uint64_t returned = incumbent_free + incumbent_slot_bytes;

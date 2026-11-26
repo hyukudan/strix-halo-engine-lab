@@ -6001,6 +6001,9 @@ BF16 tile; CUDA declines the class.
 The context caps the chunk. The server keeps its lane cap and retries with 128 rows if device allocation fails,
 if no lane fits, or if the trial would cost a requested `--slots` lane. An explicit `--prefill-rows` takes precedence.
 Leave the variable unset or set it to `0` to use the incumbent chunk. The option is off in every tier.
+The server loads it through the shared served chunk ladder (candidates 8,192 then 128 rows; the larger is kept only
+when its whole load keeps the 128-row slot capacity). The HIP held-back route cannot cut a chunk into pieces, so a
+decoding lane beside an admitted prompt waits for one whole chunk.
 
 The source receipt on gfx1151 compared complete greedy IDs on seven prompts of 2,280, 9,116 and 35,170 tokens.
 It measured served prefill of 602 → 2,030 tok/s at 8K and 578 → 1,870 tok/s at 32K. Device qualification of the

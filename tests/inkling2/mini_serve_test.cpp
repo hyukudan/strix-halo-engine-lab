@@ -377,6 +377,7 @@ struct ServedShape {
     std::optional<unsigned> prefill_rows;
     std::optional<unsigned> context;
     std::optional<unsigned> slots;
+    bool hip_tall = false;  // STRIX_INK_HIP_SERVED_TALL_CHUNK=1 is set for this call
 };
 
 void set_expert_env(const char* value) {
@@ -620,9 +621,16 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             const unsigned incumbent = std::min(shape.prefill_rows.value_or(128U), context);
             const auto cli_rows = mini::mini_cli_prefill_rows(
                 hip_backend ? mini::MiniPrefillBackend::hip : mini::MiniPrefillBackend::cuda, options.tier);
-            const unsigned chunk = hip_backend ? incumbent : std::min(shape.prefill_rows.value_or(cli_rows), context);
+            // The explicit HIP option takes the command line's implicit chunk on the EXACT BF16 route, with the
+            // incumbent 128 rows as its one smaller candidate.
+            const bool tall = hip_backend && shape.hip_tall && !shape.prefill_rows &&
+                              options.tier == strix::profile::Name::standard && context > 128U;
+            const unsigned chunk =
+                hip_backend && !tall ? incumbent : std::min(shape.prefill_rows.value_or(cli_rows), context);
             const unsigned lanes = shape.slots.value_or(0U) != 0U ? *shape.slots : incumbent;
-            const unsigned fallback = hip_backend || shape.prefill_rows ? 0U
+            const unsigned fallback = shape.prefill_rows ? 0U
+                : tall                                  ? 128U
+                : hip_backend                           ? 0U
                 : mini::mini_cli_prefill_fallback_rows(mini::MiniPrefillBackend::cuda, options.tier);
             require(options.prefill_rows == chunk && mini::mini_serve_lane_rows(options) == lanes &&
                         options.prefill_tail == 0U && options.lane_rows == incumbent &&
@@ -1055,6 +1063,15 @@ int main(int argc, char** argv) try {
     set_cli_route_env("0");
     wiring(argv[1], "hip", false);
     set_cli_route_env(nullptr);
+    // The explicit HIP tall-chunk option: the EXACT BF16 held-back route only (an explicit --prefill-rows, a context of
+    // 128 rows or less, another tier and CUDA keep their incumbent shapes).
+    set_env("STRIX_INK_HIP_SERVED_TALL_CHUNK", "1");
+    for (const ServedShape shape : {ServedShape{{}, {}, {}, true}, ServedShape{{}, 2048U, 6U, true},
+                                    ServedShape{{}, 64U, {}, true}, ServedShape{256U, {}, {}, true}})
+        wiring(argv[1], "hip", false, false, W4a4::bf16, "exact", false, false, false, shape);
+    wiring(argv[1], "hip", false, false, W4a4::bf16, "turbo");
+    wiring(argv[1], "cuda", false, false, W4a4::bf16, "exact");
+    set_env("STRIX_INK_HIP_SERVED_TALL_CHUNK", nullptr);
     // The projected-bias lever per tier (default on after its RTX identity receipts): unset and 1 select the projected
     // flash, an explicit 0 keeps the image route;
     // tests/inkling2/mini_gate_cli_test.cpp pins the same table through the CLI.
