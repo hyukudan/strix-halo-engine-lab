@@ -2,9 +2,9 @@
 
 This directory is the normative architecture guide for the inference engine.
 
-It intentionally contains no project comparisons, repository names, benchmark anecdotes, reverse-engineering notes, or source-provenance discussion. It describes only the technical decisions that should shape an inference runtime designed specifically for AMD Strix Halo-class systems.
+The architecture prioritizes low-latency local inference, capacity on unified memory, and optional multi-node execution. AMD Strix Halo (`gfx1151`, ROCm/HIP on Linux) is a primary target. The runtime also includes CUDA and other backend bindings, with coverage listed per family in the [support matrix](../support-matrix.md).
 
-The target is a Linux-native, ROCm/HIP inference engine optimized first for `gfx1151`, unified physical memory, high memory capacity, low-latency local serving, and optional multi-node execution over direct high-speed host links.
+Public contracts live in `include/strix/`. Shared implementations in `src/` implement those contracts and backend mechanisms. Family adapters bind them to model data and stages. Executables in `apps/` compose the adapters and shared runtime. The [shared-core map](../engine/shared-cores.md) locates these components. The layering ratchet in `tools/ci/check_layering.py` tracks existing exceptions and prevents their growth.
 
 ## Decision language
 
