@@ -11,7 +11,7 @@
 #include <limits>
 #include <cmath>
 #include "strix/serve/deepseek_chat.hpp"
-#include "../apps/state_cache_stats.hpp"
+#include "strix/serve/state_cache_stats.hpp"
 #include "../apps/hip_session_store.hpp"
 #include "../apps/qwen_effective_config.hpp"
 #include "strix/serve/http_server.hpp"
