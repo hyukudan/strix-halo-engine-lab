@@ -4626,22 +4626,51 @@ their checks.
 
 <a id="glm-pf-wmma-x"></a>
 
-### TURBO WMMA prefill linear cores (glm-pf-wmma-x)
+### FAST WMMA prefill bundle (glm-pf-wmma-x)
 
-**Engine:** `glm`. **Control:** `STRIX_GLM_PF_WMMA`. **Default:** off. `--profile turbo` selects the bundle in the measured pair workload. `STRIX_GLM_PF_WMMA=1` forces it.
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_WMMA`. **Default:** on under `--profile fast` (and `turbo`) for a two-rank
+pair prompt of 2,049..8,192 tokens in the measured execution (below); off everywhere else. `STRIX_GLM_PF_WMMA=1` forces
+it, `=0` keeps the exact cores.
 
 The exact prefill's X3 linear calls run on `v_wmma_f32_16x16x16_f16` over the exact cores' FP16 operands: dense calls of
 2048+ rows (X3 route) and the MoE gate/up/down of the V11/V14 route. Per (row, output) each stage of four 16-wide
 k-units is one WMMA chain from +0, folded into an FP32 total with round-to-nearest adds; 128-row tiles with two output
 tiles per wave (remainders on 64-row storage); the H128/svh epilogue, plan, transforms, activation and combine are the
-exact path's. `STRIX_GLM_PF_WMMA_ROWS=64` and `STRIX_GLM_PF_WMMA_CP=1` select other tilings with the same bits.
+exact path's. `STRIX_GLM_PF_WMMA_ROWS=64` and `STRIX_GLM_PF_WMMA_CP=1` select other tilings with the same bits. The
+bundle also switches the MLA, KDA and sparse-attention cores to their WMMA forms (`mla_wmma`, `kda_wmma`, `attn_wmma`
+inherit it).
 
-- **Preconditions:** dense calls of 2048+ rows (`STRIX_GLM_PF_EXACT_X` auto / 4); MoE calls on V11 or V14 (auto from 128 rows). Other calls stay exact.
-- **Automatic selection:** `--profile turbo` admits the complete X3, MLA, KDA and sparse-attention bundle when the pair reaches the measured device, topology, prefill and prompt regime. The bundle failed the 8K FAST gate, with KL 0.0587 and 0.492 in its two windows. The bare `--profile` keeps its timing meaning.
-- **Fallback notice:** The profile uses the FAST route outside the [measured pair workload](models/glm-5.3/README.md), including two-rank native modes without configuration agreement. The per-prompt receipt prints the selected route. Two-rank execution still requires configuration agreement for an explicit arithmetic switch.
-- **Exactness evidence:** FAST identity (new FP32 summation order). Quality: pre-registered quality-parity check passed at 1K / 8K / 32K; the later per-window FAST gate of the whole FAST prefill set fails at 8K (above), so the lever is unqualified for FAST. Synthetic: WMMA vs FP64 2.5-2.8e-7 rel-L2 (exact X3 1.9-8.2e-7); every WMMA tiling bitwise equal (hip_glm_pf_wmma_tests). Pair: FAST deterministic; OFF equals the exact 8K logits anchors on both ranks.
-- **Off switch:** `STRIX_GLM_PF_WMMA=0` overrides `--profile turbo`.
-- **Measured gain:** Pair 8K TTFT 15.45 -> 12.94 s (-16.3 %), 32K 62.3 -> 51.2 s (-17.8 %, mean of both run orders); whole-call MoE -28..-29 %, dense 8192 rows -28..-32 %
+| Engine | Device | Status |
+|---|---|---|
+| glm-5.3-flash, pair (`strix-glm5-rank`, `strix-glm5-serve`) | two Radeon 8060S (gfx1151), USB4 2x2x40 host transport | FAST/TURBO: ON for prompts of 2,049..8,192 tokens; TURBO also at the measured 31,258-token prompt |
+| glm-5.3-flash, one GPU or other topologies | any | exact cores (no receipt for that execution) |
+| glm-5.3-flash, CUDA producer | sm_120 | not applicable (own profile table) |
+| deepseek-v4.1-flash, minimax-m3.1-flash, qwen3.8-flash-next, qwen3.8-27b, hy4-flash, inkling2-mini, nemotron-3.5-bolt-e4b, ernie-5.5-flash-preview | any | not applicable (GLM prefill cores; their FAST rows are their own) |
+
+- **Preconditions:** the ordinary pair workload: `--world 2`, comm exchange, MTP decode on (complete layer-45 head),
+  R1b identity, chunked prefill with the 2-stage pipeline and routed scratch, 8,192-row chunks (`max-rows` auto admits
+  them at about 112 GiB available memory; with 4,096-row chunks the exact cores run), one lane, a fresh whole prompt
+  (served: greedy text request without a cached prefix), both ranks voting the same device class and link.
+- **Automatic selection:** one shared resolver for the command line and the server. The FAST cell is qualified by its
+  gate (below) and timed by a band receipt bound to the run's own execution (`profile::bind_band_receipts`): device
+  gfx1151/Radeon-8060S, prefill, one lane, 2,049..8,192 tokens, x1.50 noise 0.10. TURBO runs the FAST cell inside that
+  band and its own literal receipts at 8,108 and 31,258 tokens. Each prompt prints
+  `glm-pf-wmma-x profile=<p> prompt=<n> chunk=<rows> effective=wmma|exact-cores` and the `strix-ladder/v1 pf_wmma`
+  route that decided it.
+- **Fallback notice:** prompts of 2,048 tokens or fewer, above 8,192 tokens (32K is TURBO only), other devices, links,
+  chunks or compositions, and two-rank native modes without configuration agreement keep the exact cores. Two-rank
+  execution still requires configuration agreement for an explicit arithmetic switch.
+- **Exactness evidence:** FAST identity (new FP32 summation order). FAST gate v2 with MoE route replay, pair, 5 windows
+  of 8,192 tokens (prose, JSON, two 32K-document slices), 1,275 held-out rows: pooled KL 0.00018 (one-ulp null
+  0.00007), top-1 0.9969, dNLL -0.0013 (se 0.0009), free route-flip ratio 1.05; every window passes. Free-running
+  (no replay) KL is not discriminating on GLM: the exact arm's own one-ulp null flips routes as much. The product
+  route's head dump is bitwise equal to the gated arm. Synthetic: WMMA vs FP64 2.5-2.8e-7 rel-L2 (exact X3
+  1.9-8.2e-7); every WMMA tiling bitwise equal (hip_glm_pf_wmma_tests). OFF equals the exact 8K logits anchors on both
+  ranks.
+- **Off switch:** `STRIX_GLM_PF_WMMA=0`, `--profile exact`, or `--baseline`.
+- **Measured gain:** pair, 8,192-token prompt, both ranks: exact cores 12.32 s -> bundle 8.23 s cold (x1.50; warm
+  655 -> 1,000 tok/s); whole-call MoE -28..-29 %, dense 8192 rows -28..-32 %. TURBO receipts: 8K TTFT 15.45 -> 12.94 s
+  (-16.3 %), 32K 62.3 -> 51.2 s (-17.8 %, mean of both run orders).
 - **Implementation / evidence:** [shared core](../src/moe_core/grouped_f16.hpp), [GLM adapter](../src/glm/prefill/glm_pf_wmma_x.hpp), [MoE](../src/glm/prefill/glm_pf_wmma_moe.inc), [test](../tests/hip_glm_pf_wmma_tests.hip)
 
 <a id="glm-pf-wmma-live-fragments"></a>
