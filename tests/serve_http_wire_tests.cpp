@@ -309,6 +309,10 @@ void test_qwen_prefill_request() {
     CHECK(refused(R"({"tokens":[1,2],"handoff":"h:1","block_schedule":"x"})"));
     CHECK(refused(R"({"tokens":[1,2],"handoff":"h:1","final_block_rows":65521})"));
     CHECK(refused(R"({"tokens":[1,2],"handoff":"h:1","final_block_rows":-1})"));
+    CHECK(refused(R"({"tokens":[1,-2],"handoff":"h:1"})"));
+    CHECK(refused(R"({"tokens":[1,4294967296],"handoff":"h:1"})"));
+    CHECK(refused(R"({"tokens":[1,2],"handoff":"h:1","local_rows":-1})"));
+    CHECK(!refused(R"({"tokens":[1,4294967295],"handoff":"h:1","local_rows":0})"));
     strix::qwen_http::PrefillRequest r;
     strix::qwen_http::parse_prefill_request(
         strix::serve::parse_json(R"({"tokens":[5,6,7],"handoff":"h:1","session":{"a":1},"handoff_api_key":"k",)"
@@ -329,6 +333,14 @@ void test_error_status() {
     for (const char* e : {"bad Content-Length", "conflicting Content-Length", "malformed start line", "truncated body",
                           "malformed header field", "chunked bodies are not supported"})
         CHECK(http_wire_error_status(e) == 400);
+    // The reader's own errors map to the same statuses (a rewording of the reader cannot fall back to 400).
+    HttpWireLimits limits;
+    limits.max_header_bytes = 1024;
+    limits.max_body_bytes = 100;
+    HttpWireMessage m;
+    CHECK(http_wire_error_status(read_with({{"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhe", "<timeout>"}}, limits, m)) == 408);
+    CHECK(http_wire_error_status(read_with({{"POST / HTTP/1.1\r\nContent-Length: 101\r\n\r\n"}}, limits, m)) == 413);
+    CHECK(http_wire_error_status(read_with({{std::string(5000, 'a')}}, limits, m)) == 431);
 }
 
 int main() {

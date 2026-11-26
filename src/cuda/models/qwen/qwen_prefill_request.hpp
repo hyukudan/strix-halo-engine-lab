@@ -32,12 +32,20 @@ inline void parse_prefill_request(const serve::Json& j, std::uint32_t max_block_
     const serve::Json* handoff = j.find("handoff");
     if (tokens == nullptr) throw std::invalid_argument("tokens");
     if (handoff == nullptr) throw std::invalid_argument("handoff");
-    for (const auto& t : tokens->as_array()) r.tokens.push_back(static_cast<std::uint32_t>(t.as_int()));
+    for (const auto& t : tokens->as_array()) {
+        const std::int64_t id = t.as_int();
+        if (id < 0 || id > static_cast<std::int64_t>(UINT32_MAX)) throw std::invalid_argument("tokens");
+        r.tokens.push_back(static_cast<std::uint32_t>(id));
+    }
     r.handoff = handoff->as_string();
     if (const auto* x = j.find("session")) r.session = *x;
     if (const auto* x = j.find("handoff_api_key")) r.api_key = x->as_string();
     if (const auto* x = j.find("handoff_codec")) { r.codec = x->as_string(); r.has_codec = true; }
-    if (const auto* x = j.find("local_rows")) r.local_rows = static_cast<std::uint64_t>(x->as_int());
+    if (const auto* x = j.find("local_rows")) {
+        const std::int64_t rows = x->as_int();
+        if (rows < 0) throw std::invalid_argument("local_rows");
+        r.local_rows = static_cast<std::uint64_t>(rows);
+    }
     if (const auto* x = j.find("trace")) r.trace = x->as_bool();
     if (const auto* x = j.find("block_schedule")) {
         const auto& schedule = x->as_string();

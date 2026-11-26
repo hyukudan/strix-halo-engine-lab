@@ -98,10 +98,14 @@ struct HttpWireMessage {
 // The status a server answers for an error of read_http_message: 408 when the request missed its deadline, 413 for
 // a body over its limit, 431 for a header over its limit, 400 for every malformed request. A client can then tell a
 // slow link from a malformed request.
+// read_http_message returns exactly these texts for the three cases, so the status cannot drift from the reader.
+inline constexpr std::string_view kHttpWireTimedOut = "request timed out";
+inline constexpr std::string_view kHttpWireBodyTooLarge = "body too large";
+inline constexpr std::string_view kHttpWireHeadersTooLarge = "headers too large";
 [[nodiscard]] inline int http_wire_error_status(std::string_view error) {
-    if (error == "request timed out") return 408;
-    if (error == "body too large") return 413;
-    if (error == "headers too large") return 431;
+    if (error == kHttpWireTimedOut) return 408;
+    if (error == kHttpWireBodyTooLarge) return 413;
+    if (error == kHttpWireHeadersTooLarge) return 431;
     return 400;
 }
 
@@ -196,12 +200,12 @@ template <class Recv>
     std::size_t head_end = std::string::npos;
     while ((head_end = buf.find("\r\n\r\n")) == std::string::npos) {
         // Without a terminator the head is at least size - 3 bytes long.
-        if (buf.size() > limits.max_header_bytes + 3U) return "headers too large";
+        if (buf.size() > limits.max_header_bytes + 3U) return std::string(kHttpWireHeadersTooLarge);
         const auto got = receive(sizeof(tmp));
-        if (got == Got::late) return "request timed out";
+        if (got == Got::late) return std::string(kHttpWireTimedOut);
         if (got == Got::closed) return buf.empty() ? "connection closed" : "truncated headers";
     }
-    if (head_end > limits.max_header_bytes) return "headers too large";
+    if (head_end > limits.max_header_bytes) return std::string(kHttpWireHeadersTooLarge);
     if (const auto err = parse_http_head(std::string_view(buf).substr(0, head_end), m, limits); !err.empty()) return err;
     m.body = buf.substr(head_end + 4U);
     buf.clear();
@@ -210,22 +214,22 @@ template <class Recv>
         if (!limits.body_until_close) { carry = std::move(m.body); m.body.clear(); return {}; }
         for (;;) {
             const auto got = receive(sizeof(tmp));
-            if (got == Got::late) return "request timed out";
+            if (got == Got::late) return std::string(kHttpWireTimedOut);
             if (got == Got::closed) break;
             m.body.append(buf);
             buf.clear();
-            if (m.body.size() > limits.max_body_bytes) return "body too large";
+            if (m.body.size() > limits.max_body_bytes) return std::string(kHttpWireBodyTooLarge);
         }
         return {};
     }
     const std::uint64_t want_u = *m.content_length;
-    if (want_u > limits.max_body_bytes) return "body too large";
+    if (want_u > limits.max_body_bytes) return std::string(kHttpWireBodyTooLarge);
     const auto want = static_cast<std::size_t>(want_u);
     if (m.body.size() > want) { carry = m.body.substr(want); m.body.resize(want); }
     if (deadline) *deadline += std::chrono::seconds(static_cast<long long>((want_u + (1U << 20U) - 1U) >> 20U));
     while (m.body.size() < want) {
         const auto got = receive(want - m.body.size());
-        if (got == Got::late) return "request timed out";
+        if (got == Got::late) return std::string(kHttpWireTimedOut);
         if (got == Got::closed) return "truncated body";
         m.body.append(buf);
         buf.clear();

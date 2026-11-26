@@ -1,6 +1,10 @@
 # Kernels over tools/kernel_scratch_allowance.txt when the baseline was recorded (maximum per value
 # over the toolchains measured), read by tools/check_kernel_scratch.py --known. A listed kernel
 # passes while it stays at or below these values; the list may only shrink.
+# A rename or re-parametrisation of a listed kernel changes its mangled name: the same pull request replaces the old
+# line by the new name with values no larger than the old ones (old -> new pair in the PR text), or moves the kernel
+# under tools/kernel_scratch_allowance.txt. Values are the maximum of the toolchains measured, so CI on one toolchain
+# accepts growth up to the other toolchain's value.
 _ZN5strix10moe_q4k_a810known_rows12_GLOBAL__N_110g3_projectILb1ELj128ELj0ELj2EEEvPKhS5_NS1_11PrefillRowsEjjPK15HIP_vector_typeIjLj4EEj private=56 vgpr_spill=17 sgpr_spill=0
 _ZN5strix10moe_q4k_a810known_rows12_GLOBAL__N_114project_windowILj16ELb0ELb0ELj10EEEvPKhS5_NS2_10DeviceRowsENS2_9DeviceCsrEjjj private=144 vgpr_spill=0 sgpr_spill=0
 _ZN5strix10moe_q4k_a810known_rows12_GLOBAL__N_114project_windowILj16ELb0ELb1ELj10EEEvPKhS5_NS2_10DeviceRowsENS2_9DeviceCsrEjjj private=144 vgpr_spill=0 sgpr_spill=0
