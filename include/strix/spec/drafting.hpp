@@ -362,7 +362,8 @@ private:
     // ArbiterConfig::probe_loss episodes: realized net (ms) of the open episode at the pick's ms per token, that rate,
     // and the realized loss of the last closed episode (< 0 = none: the priced excess paces the next probe).
     // Allowance (one priced excess) and credit cap (three probe walls) of the open episode.
-    double episode_net_ms_ = 0.0, episode_rate_ = 0.0, episode_loss_ms_ = -1.0, episode_allow_ms_ = 0.0, episode_cap_ms_ = 0.0;    bool episode_open_ = false, episode_pass_ = false;
+    double episode_net_ms_ = 0.0, episode_rate_ = 0.0, episode_loss_ms_ = -1.0, episode_allow_ms_ = 0.0, episode_cap_ms_ = 0.0;
+    bool episode_open_ = false, episode_pass_ = false;
     std::array<Decision, source_count> arms_{};  // best option per source of the last decide() (trace)
     std::array<double, source_count> arm_scores_{};
 
