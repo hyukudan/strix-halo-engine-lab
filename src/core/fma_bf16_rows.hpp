@@ -56,6 +56,7 @@ inline decltype(auto) with_round_store(const Bf16RowProjection& first, Body&& bo
 
 // store_used (optional) receives the round store the WMMA tile or the FMA rows were launched with (incumbent when the
 // call does not round or runs the tight rows).
+template <Bf16RowsSchedule Schedule = Bf16RowsSchedule::legacy>
 inline hipError_t enqueue_bf16_rows(const float* input, unsigned input_width, unsigned rows,
                                     std::span<const Bf16RowProjection> projections, unsigned max_outputs,
                                     hipStream_t stream, RoundStore* store_used = nullptr) {
@@ -93,18 +94,33 @@ inline hipError_t enqueue_bf16_rows(const float* input, unsigned input_width, un
     if (path == Bf16RowsPath::wmma) {
         f16_tile_gemm::Bf16ProjectionGroup<kGroupMax> wmma_group{};
         const auto pitch = effective_pitch(projections.front());
-        for (const auto& projection : projections)
-            wmma_group.append({projection.weights, projection.outputs, projection.output, projection.round_bf16});
-        with_round_store(projections.front(), [&](auto policy) {
+        const bool split = Schedule == Bf16RowsSchedule::compact_narrow &&
+            std::ranges::any_of(projections, [&](const auto& projection) {
+                return admits_bf16_compact_projection(input_width, rows, projection);
+            }) && image_routes_order_free(input, input_width, rows, projections, true);
+        f16_tile_gemm::Bf16ProjectionGroup<kGroupMax> compact_group{};
+        for (const auto& projection : projections) {
+            auto& dst = split && admits_bf16_compact_projection(input_width, rows, projection)
+                ? compact_group : wmma_group;
+            dst.append({projection.weights, projection.outputs, projection.output, projection.round_bf16});
+        }
+        return with_round_store(projections.front(), [&](auto policy) {
             constexpr RoundStore round = decltype(policy)::value;
             if (store_used) *store_used = round;
+            if constexpr (Schedule == Bf16RowsSchedule::compact_narrow) {
+                if (compact_group.count != 0U) {
+                    f16_tile_gemm::gemm_bf16_compact_projections<round>(input, rows, input_width, compact_group, stream);
+                    if (const auto status = hipGetLastError(); status != hipSuccess) return status;
+                    if (wmma_group.count == 0U) return hipSuccess;
+                }
+            }
             if (pitch == natural_row_bytes)
                 f16_tile_gemm::gemm_bf16_projections<round>(input, rows, input_width, wmma_group, stream);
             else
                 f16_tile_gemm::gemm_bf16_projections<round>(input, rows, input_width, wmma_group, stream,
                                                             pitch / sizeof(std::uint16_t));
+            return hipGetLastError();
         });
-        return hipGetLastError();
     }
 
     for (unsigned p = 0; p < group.count; ++p) {
@@ -443,6 +459,7 @@ inline bool bf16_image_disjoint(const float* input, unsigned input_width, unsign
 // input is null when a producer stored only the image (every route then reads it; an fp32_rows run is refused).
 // launched / pitch_used (optional) receive the image launch and the weight pitch (elements) of the last image or packed
 // run (an fp32_rows run leaves both untouched).
+template <Bf16RowsSchedule Schedule = Bf16RowsSchedule::legacy>
 inline hipError_t run_bf16_image_routes(const float* input, const std::uint16_t* image, unsigned input_width,
                                         unsigned rows, std::span<const Bf16RowProjection> projections,
                                         unsigned max_outputs, std::span<const ImageRoute> routes, hipStream_t stream,
@@ -452,7 +469,7 @@ inline hipError_t run_bf16_image_routes(const float* input, const std::uint16_t*
     return for_each_image_route_run<kGroupMax>(projections, routes, input_width, hipSuccess,
         [&](ImageRoute route, std::span<const Bf16RowProjection> run) {
             if (route == ImageRoute::fp32_rows)
-                return input ? enqueue_bf16_rows(input, input_width, rows, run, max_outputs, stream, store_used)
+                return input ? enqueue_bf16_rows<Schedule>(input, input_width, rows, run, max_outputs, stream, store_used)
                              : hipErrorNotSupported;
             if (route == ImageRoute::image) {
                 if (pitch_used) *pitch_used = input_width;
@@ -483,6 +500,7 @@ inline hipError_t run_bf16_image_routes(const float* input, const std::uint16_t*
 // image_used (optional) reports whether the call took the image routes; store_used (optional) the round store of the
 // last launch the call made; launched and pitch_used (optional) the image launch (K64 packed or K32 image tile) and the
 // weight pitch in elements of the last image launch the routed dispatch made (k32_image and 0 when it made none).
+template <Bf16RowsSchedule Schedule = Bf16RowsSchedule::legacy>
 inline hipError_t enqueue_bf16_rows_routed(const float* input, unsigned input_width, unsigned rows,
                                            std::span<const Bf16RowProjection> projections, unsigned max_outputs,
                                            std::span<std::uint16_t> image, hipStream_t stream, bool* image_used = nullptr,
@@ -497,16 +515,16 @@ inline hipError_t enqueue_bf16_rows_routed(const float* input, unsigned input_wi
         !image_routes_order_free(input, input_width, rows, projections) ||
         !detail::plan_bf16_image_call(input_width, rows, projections, max_outputs, image, routes))
         return for_each_bf16_projection_group<kGroupMax>(projections, hipSuccess, [&](auto group) {
-            return enqueue_bf16_rows(input, input_width, rows, group, max_outputs, stream, store_used);
+            return enqueue_bf16_rows<Schedule>(input, input_width, rows, group, max_outputs, stream, store_used);
         });
     if (!detail::bf16_image_disjoint(input, input_width, rows, projections, image.data())) return hipErrorInvalidValue;
     if (image_used) *image_used = true;
     if (const auto status = enqueue_bf16_operand_image(input, input_width, rows, image.data(), stream);
         status != hipSuccess)
         return status;
-    return detail::run_bf16_image_routes(input, image.data(), input_width, rows, projections, max_outputs,
-                                         std::span<const ImageRoute>(routes, projections.size()), stream, store_used, launched,
-                                         pitch_used);
+    return detail::run_bf16_image_routes<Schedule>(
+        input, image.data(), input_width, rows, projections, max_outputs,
+        std::span<const ImageRoute>(routes, projections.size()), stream, store_used, launched, pitch_used);
 }
 
 class Bf16ImageCallPlan;

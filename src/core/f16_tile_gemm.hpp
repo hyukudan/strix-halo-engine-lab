@@ -49,10 +49,21 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace strix::core::f16_tile_gemm {
 inline constexpr unsigned kBM = 128, kBN = 128, kBK = 32, kThreads = 256;
 inline constexpr unsigned kPitch = kBK / 2U + 4U;  // dwords per LDS row: 16 data + 4 pad (80 bytes)
+
+// Plain BF16 projection geometry. Both shapes keep the same lane layout within each 16x16 fragment.
+template <bool Compact = false>
+struct Bf16TileShape {
+    static constexpr unsigned row_tiles = Compact ? 1U : 2U;
+    static constexpr unsigned col_tiles = Compact ? 2U : 4U;
+    static constexpr unsigned rows = Compact ? 32U : kBM;
+    static constexpr unsigned panel = 16U * col_tiles;
+    static constexpr unsigned threads = Compact ? 64U : kThreads;
+};
 
 enum class Layout { NK, KN };  // weight element (n, k) at w[n * ldw + k] (NK) or w[k * ldw + n] (KN)
 
@@ -249,6 +260,13 @@ struct ControllerRows {
     unsigned width;
 };
 
+// Two row waves stage one 32x32 output tile with the same K32 stage as the incumbent.
+struct alignas(16) Bf16CompactStorage {
+    std::uint32_t a[Bf16TileShape<true>::rows][kPitch];
+    std::uint32_t b[Bf16TileShape<true>::panel][kPitch];
+};
+static_assert(sizeof(Bf16CompactStorage) == 5120U);
+
 #define STRIX_F16_TILE_PLAIN_BF16
 #include "f16_tile_gemm_core.inc"
 #undef STRIX_F16_TILE_PLAIN_BF16
@@ -268,6 +286,14 @@ void bf16_projection_kernel(const float* a, unsigned rows, unsigned K, Bf16Proje
     const Args p{a, nullptr, K, 0U, nullptr, w_ld, 0U, nullptr, 0U, 0U, rows, K, 0U, 1U};
     __shared__ Storage lds;
     core<kHalfTail, Capacity, false, false, Round>(p, lds, group);
+}
+
+template <bool kHalfTail, RoundStore Round, unsigned Capacity>
+__global__ __launch_bounds__(Bf16TileShape<true>::threads)
+void bf16_compact_projection_kernel(const float* a, unsigned rows, unsigned K, Bf16ProjectionGroup<Capacity> group) {
+    const Args p{a, nullptr, K, 0U, nullptr, K, 0U, nullptr, 0U, 0U, rows, K, 0U, 1U};
+    __shared__ Bf16CompactStorage lds;
+    core<kHalfTail, Capacity, false, false, Round, AccumulatorTap, true>(p, lds, group);
 }
 
 // The projections on a BF16 operand image a16 ([rows][K] u16, K % kBK == 0, 16-byte aligned rows): every output has
@@ -311,6 +337,17 @@ inline void gemm_bf16_projections(const float* a, unsigned rows, unsigned K,
         STRIX_HIP_LAUNCH(Rdna3Layout, bf16_projection_kernel<false, Round><<<grid, kThreads, 0, stream>>>(a, rows, K, group, pitch...));
     else
         STRIX_HIP_LAUNCH(Rdna3Layout, bf16_projection_kernel<true, Round><<<grid, kThreads, 0, stream>>>(a, rows, K, group, pitch...));
+}
+
+template <RoundStore Round, unsigned Capacity>
+inline void gemm_bf16_compact_projections(const float* a, unsigned rows, unsigned K,
+                                         const Bf16ProjectionGroup<Capacity>& group, hipStream_t stream) {
+    using Shape = Bf16TileShape<true>;
+    const dim3 grid(group.count, (rows + Shape::rows - 1U) / Shape::rows);
+    if (K % kBK == 0U)
+        STRIX_HIP_LAUNCH(Rdna3Layout, bf16_compact_projection_kernel<false, Round><<<grid, Shape::threads, 0, stream>>>(a, rows, K, group));
+    else
+        STRIX_HIP_LAUNCH(Rdna3Layout, bf16_compact_projection_kernel<true, Round><<<grid, Shape::threads, 0, stream>>>(a, rows, K, group));
 }
 
 // gemm_bf16_projections on a BF16 operand image (bf16_projection_image_kernel); the caller admits K % kBK == 0.

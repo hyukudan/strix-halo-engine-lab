@@ -15,6 +15,7 @@
 #include "strix/moe/route_policy.hpp"
 
 #if defined(__HIPCC__)
+#include "moe_core/route_wave_grid.hpp"
 #include "strix/hip_wave32_dpp.hpp"
 #include "strix/moe/combine.hpp"
 #include <hip/hip_runtime.h>
@@ -71,6 +72,13 @@ struct BlockRows {
     static constexpr unsigned kWaves = kCheckedRouteRowsPerBlock;
     __device__ static unsigned row(unsigned wave) { return blockIdx.x * kCheckedRouteRowsPerBlock + wave; }
 };
+
+#if defined(__HIPCC__)
+struct GridRows {
+    static constexpr unsigned kWaves = RouteWaveGrid::rows_per_block;
+    __device__ static unsigned row(unsigned wave) { return RouteWaveGrid::row(blockIdx.x, wave); }
+};
+#endif
 
 // logits / bias: [rows][experts] / [experts]; ids / w: [rows][top_k].
 template <const moe::RoutePolicy& P, class Math, class Traits, class Site = BlockRows, bool Masked = false>
@@ -132,7 +140,14 @@ __device__ __forceinline__ void route_wave_body(const float* logits, const float
     }
     route_wave_topk(key, all, experts, top_k, lane, Pol{lane, pick_s});
 #if defined(__HIPCC__)
-    __syncthreads();
+    if constexpr (Site::kWaves == 1U) {
+        __syncthreads();
+    } else {
+        // Invalid and inactive waves can exit independently. Each live wave publishes only its own LDS row.
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+    }
 #else
     __syncwarp();
 #endif
@@ -173,6 +188,13 @@ __global__ __launch_bounds__(kCheckedRouteRowsPerBlock * 32U) void route_wave_st
 }
 
 #if defined(__HIPCC__)
+template <const moe::RoutePolicy& P, class Math, class Traits>
+__global__ __launch_bounds__(RouteWaveGrid::threads_per_block) void route_wave_grid_entry(
+    const float* logits, const float* bias, std::uint32_t* ids, float* w, unsigned* status, unsigned rows) {
+    static_assert(Traits::checked_status);
+    route_wave_body<P, Math, Traits, GridRows>(logits, bias, ids, w, status, rows);
+}
+
 // The four-argument entry (GLM and HY4) keeps its own body; route_wave_body above is the checked trait form of the
 // same algorithm (same score, key, top-k, ordering and renormalisation steps). Its tail runs on the whole wave: lane
 // k < top_k takes pick k to its output slot (its rank among the distinct picks for ascending ids, else k), then every
@@ -300,6 +322,20 @@ template <class Policy, class Math, class Traits>
 hipError_t enqueue_route_wave(const float* logits, const float* bias, std::uint32_t* ids, float* w,
                               unsigned* status, unsigned rows, hipStream_t stream) {
     return enqueue_route_wave<Policy::value, Math, Traits>(logits, bias, ids, w, status, rows, stream);
+}
+
+// Explicit wave32 policy. Short row counts use the checked one-wave launch.
+template <class Policy, class Math, class Traits>
+hipError_t enqueue_route_wave_grid(const float* logits, const float* bias, std::uint32_t* ids, float* w,
+                                   unsigned* status, unsigned rows, hipStream_t stream) {
+    static_assert(moe::validate(Policy::value) == nullptr, "route_wave_kernel: invalid policy");
+    if (!RouteWaveGrid::admits(rows)) {
+        return enqueue_route_wave<Policy, Math, Traits>(logits, bias, ids, w, status, rows, stream);
+    }
+    if (!logits || !bias || !ids || !w || !status) return hipErrorInvalidValue;
+    hipLaunchKernelGGL((route_wave_grid_entry<Policy::value, Math, Traits>), dim3(RouteWaveGrid::blocks(rows)),
+                       dim3(RouteWaveGrid::threads_per_block), 0, stream, logits, bias, ids, w, status, rows);
+    return hipGetLastError();
 }
 
 #else

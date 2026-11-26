@@ -308,9 +308,10 @@ bool plan_image_routes(const ImageRoutePolicy& policy, unsigned input_width, uns
 // another projection's output or with another projection's weights [outputs][pitch]. A call with such an ordered alias
 // (for example an FMA group and a later packed group writing the same output buffer) keeps the incumbent sequence.
 // input is null for a call that reads only a producer-stored operand image. Sizes that do not fit an address count as
-// overlapping.
+// overlapping. A geometry change also checks each projection's output against its own weights.
 inline bool image_routes_order_free(const float* input, unsigned input_width, unsigned rows,
-                                    std::span<const Bf16RowProjection> projections) noexcept {
+                                    std::span<const Bf16RowProjection> projections,
+                                    bool check_own_weights = false) noexcept {
     using Address = std::uintptr_t;
     constexpr Address kMax = std::numeric_limits<Address>::max();
     struct Range {
@@ -332,11 +333,10 @@ inline bool image_routes_order_free(const float* input, unsigned input_width, un
         const auto out = range(projections[i].output, Address{rows} * projections[i].outputs, sizeof(float));
         if (input && !apart(out, in)) return false;
         for (std::size_t j = 0; j < projections.size(); ++j) {
-            if (j == i) continue;
             const auto& other = projections[j];
             const auto pitch = other.row_bytes != 0U ? Address{other.row_bytes} : natural;
-            if (!apart(out, range(other.output, Address{rows} * other.outputs, sizeof(float))) ||
-                !apart(out, range(other.weights, other.outputs, pitch)))
+            if ((j != i && !apart(out, range(other.output, Address{rows} * other.outputs, sizeof(float)))) ||
+                ((j != i || check_own_weights) && !apart(out, range(other.weights, other.outputs, pitch))))
                 return false;
         }
     }

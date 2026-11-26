@@ -5,6 +5,8 @@
 #include "strix/ds41_moe.hpp"
 #include "strix/moe/activation_policy.hpp"
 #include "strix/moe/route_policy.hpp"
+#include "../src/inkling2/inkling2_mini_moe.hpp"
+#include "../src/moe_core/route_wave_grid.hpp"
 
 #if defined(STRIX_RP_GLM5)
 #include "glm/host/glm_host.hpp"
@@ -67,6 +69,50 @@ struct Ds41Math {
     static float log1p(float x) { return strix::ds41::declared_log1p(x); }
     static float sqrt(float x) { return strix::ds41::declared_sqrt(x); }
 };
+
+void hip_row_grid() {
+    using Grid = strix::moe_core::RouteWaveGrid;
+    namespace mini = strix::inkling2;
+    static_assert(Grid::threads_per_block == 128U && !Grid::admits(0U) && !Grid::admits(3U) && Grid::admits(4U));
+    static_assert(Grid::blocks(std::numeric_limits<unsigned>::max()) ==
+                  std::numeric_limits<unsigned>::max() / 4U + 1U);
+    constexpr auto policy = mini::kMiniRoute;
+    using Math = mini::detail::MiniMoeMath;
+    for (const unsigned rows : {0U, 1U, 3U, 4U, 5U, 2048U, 8192U, 8193U}) {
+        std::vector<float> logits(std::size_t{rows} * policy.experts);
+        std::vector<float> bias(policy.experts);
+        for (unsigned e = 0; e < policy.experts; ++e) bias[e] = static_cast<float>(e % 11U) / 32.0F;
+        for (std::size_t i = 0; i < logits.size(); ++i) logits[i] = static_cast<float>(i % 71U) / 8.0F - 4.0F;
+        if (Grid::admits(rows)) {
+            std::ranges::fill(std::span(logits).first(policy.experts), 0.0F);  // ties
+        }
+        std::vector<std::uint32_t> ref_ids(std::size_t{rows} * policy.top_k);
+        std::vector<float> ref_w(ref_ids.size());
+        const auto guard = policy.experts;
+        std::vector<std::uint32_t> ids(ref_ids.size() + policy.top_k, guard);
+        std::vector<float> weights(ids.size(), -1.0F);
+        route_rows_ref<Math>(policy, logits, bias, ref_ids, ref_w);
+        unsigned visited = 0;
+        const unsigned blocks = Grid::admits(rows) ? Grid::blocks(rows) : rows;
+        const unsigned waves = Grid::admits(rows) ? Grid::rows_per_block : 1U;
+        for (unsigned block = 0; block < blocks; ++block) {
+            for (unsigned wave = 0; wave < waves; ++wave) {
+                const unsigned row = Grid::admits(rows) ? Grid::row(block, wave) : block;
+                if (row >= rows) continue;
+                const auto at = std::size_t{row} * policy.top_k;
+                route_rows_ref<Math>(policy, std::span(logits).subspan(std::size_t{row} * policy.experts, policy.experts),
+                    bias, std::span(ids).subspan(at, policy.top_k), std::span(weights).subspan(at, policy.top_k));
+                ++visited;
+            }
+        }
+        check(visited == rows && std::ranges::equal(ref_ids, std::span(ids).first(ref_ids.size())) &&
+              std::ranges::equal(ref_w, std::span(weights).first(ref_w.size()),
+                                 [](float a, float b) { return bits(a) == bits(b); }) &&
+              std::ranges::all_of(std::span(ids).last(policy.top_k), [guard](auto id) { return id == guard; }) &&
+              std::ranges::all_of(std::span(weights).last(policy.top_k), [](float w) { return w == -1.0F; }),
+              "HIP route grid preserves Inkling host IDs and weight bits");
+    }
+}
 
 // Deterministic synthetic logits on a 1/64 grid (exact ties) with a few > 20 (softplus threshold), bias on a 1/256 grid
 // with zeros (ties survive the bias).
@@ -375,6 +421,7 @@ void hy4_oracle_compare() {
 
 int main() {
     modelb_top16();
+    hip_row_grid();
     named_words();
 #if defined(STRIX_RP_HY4)
     hy4_oracle_compare();

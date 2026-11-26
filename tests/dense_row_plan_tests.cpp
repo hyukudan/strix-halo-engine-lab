@@ -1,5 +1,7 @@
 #include "core/dense_row_plan.hpp"
+#include "core/bf16_rows_plan.hpp"
 #include "core/residual_mix.hpp"
+#include "core/round_store.hpp"
 #include "core/weight_certificate.hpp"
 #include "cuda/core/dense/row_plan.hpp"
 
@@ -83,6 +85,76 @@ bool check_cuda_bf16_paths() {
            plan(input, 24U, limits.grid_rows + 1U, true) == Bf16RowPath::short_rows &&
            plan(input, 32U, limits.short_rows, true) == Bf16RowPath::short_rows &&
            plan(input, 3072U, 2048U, false) == Bf16RowPath::short_rows;
+}
+
+bool check_hip_compact_bf16() {
+    using namespace strix::core;
+    using f16_tile_gemm::Bf16TileShape;
+    using strix::weight::scalar_float::bf16_round;
+    using fma_rows::admits_bf16_compact_projection;
+    constexpr unsigned max_rows = 65535U * Bf16TileShape<true>::rows;
+    static_assert(admits_bf16_compact_projection(48U, max_rows, {nullptr, 32U}));
+    static_assert(!admits_bf16_compact_projection(48U, max_rows + 1U, {nullptr, 32U}));
+    static_assert(!admits_bf16_compact_projection(48U, gemv_rows::max_rows, {nullptr, 24U}));
+    static_assert(!admits_bf16_compact_projection(48U, 2048U, {nullptr, 33U}));
+    static_assert(!admits_bf16_compact_projection(40U, 2048U, {nullptr, 24U}));
+    static_assert(!admits_bf16_compact_projection(48U, 2048U, {nullptr, 24U, nullptr, false, 112U}));
+    constexpr float guard = -999.0F;
+    for (const unsigned width : {32U, 48U}) {
+        const auto dot = [width](unsigned row, unsigned col) {
+            float sum = 0.0F;
+            for (unsigned stage = 0; stage < width; stage += 16U)
+                for (unsigned k = stage; k < stage + 16U; ++k) {
+                    const float a = bf16_round(static_cast<float>(static_cast<int>((row + k) % 11U) - 5) / 7.0F);
+                    const float scale = k % 16U == 0U ? 0x1p24F : 1.0F;
+                    const float b = bf16_round(scale * static_cast<float>(static_cast<int>((col + k) % 9U) - 4) / 8.0F);
+                    sum = std::fma(a, b, sum);
+                }
+            return sum;
+        };
+        for (const unsigned rows : {17U, 32U, 33U, 129U}) {
+            for (const unsigned outputs : {1U, 24U, 32U}) {
+                const auto live = std::size_t{rows} * outputs;
+                for (const unsigned store : {0U, 1U, 2U}) {
+                    const auto value = [&](unsigned r, unsigned c) {
+                        const float sum = dot(r, c);
+                        if (store == 0U) return sum;
+                        return store == 1U ? round_stored<RoundStore::incumbent>(sum)
+                                           : round_stored<RoundStore::separate>(sum);
+                    };
+                    const auto check = [&]<bool Compact>() {
+                        using Shape = Bf16TileShape<Compact>;
+                        std::vector<float> actual(live + outputs, guard);
+                        std::vector<unsigned> visits(actual.size());
+                        for (unsigned base = 0; base < rows; base += Shape::rows)
+                            for (unsigned wave = 0; wave < Shape::rows / (16U * Shape::row_tiles); ++wave)
+                                for (unsigned m = 0; m < Shape::row_tiles; ++m)
+                                    for (unsigned t = 0; t < Shape::col_tiles; ++t)
+                                        for (unsigned lane = 0; lane < 32U; ++lane)
+                                            for (unsigned j = 0; j < 8U; ++j) {
+                                                const unsigned r = base + 16U * (wave * Shape::row_tiles + m) +
+                                                    2U * j + lane / 16U;
+                                                const unsigned c = 16U * t + lane % 16U;
+                                                if (r >= rows || c >= outputs) continue;
+                                                const auto i = std::size_t{r} * outputs + c;
+                                                actual[i] = value(r, c);
+                                                ++visits[i];
+                                            }
+                        for (std::size_t i = 0; i < actual.size(); ++i) {
+                            const float ref = i < live ? value(static_cast<unsigned>(i / outputs),
+                                                               static_cast<unsigned>(i % outputs)) : guard;
+                            if (visits[i] != (i < live ? 1U : 0U) ||
+                                std::bit_cast<std::uint32_t>(actual[i]) != std::bit_cast<std::uint32_t>(ref))
+                                return false;
+                        }
+                        return true;
+                    };
+                    if (!check.template operator()<false>() || !check.template operator()<true>()) return false;
+                }
+            }
+        }
+    }
+    return true;
 }
 
 // FAST mma2 / mma1 take the tall path where mma3 does, except that the
@@ -611,6 +683,9 @@ static bool check_image_route_order() {
     auto onto_weights = call;
     onto_weights[1].output = f32(reinterpret_cast<std::uintptr_t>(call[2].weights) + 64U);
     if (strix::core::image_routes_order_free(input, K, rows, onto_weights)) return false;
+    auto onto_own_weights = call;
+    onto_own_weights[1].output = f32(reinterpret_cast<std::uintptr_t>(call[1].weights));
+    if (strix::core::image_routes_order_free(input, K, rows, onto_own_weights, true)) return false;
     auto onto_input = call;
     onto_input[2].output = const_cast<float*>(input) + 16U;
     if (strix::core::image_routes_order_free(input, K, rows, onto_input)) return false;
@@ -626,7 +701,7 @@ int main() {
     if (!check_row_chunks() || !check_projection_groups() || !check_cuda_bf16_paths() ||
         !check_cuda_bf16_fast_terms() || !check_reported_planes() || !check_exact_operand_planes() || !check_image_routes() ||
         !check_image_route_order() || !check_dense_declared() || !check_low_rank_bound() ||
-        !check_staged_scan()) {
+        !check_staged_scan() || !check_hip_compact_bf16()) {
         std::cerr << "Dense row or projection chunk policy failed\n";
         return 1;
     }

@@ -151,6 +151,63 @@ bool wide_projection_pass(unsigned inputs, std::span<const unsigned> outputs, bo
     return pass;
 }
 
+bool compact_projection_pass(unsigned inputs, std::span<const unsigned> outputs, bool round_output, bool separate,
+                             hipStream_t stream) {
+    constexpr unsigned capacity = 2048U;
+    using strix::core::fma_rows::Bf16RowsSchedule;
+    using strix::core::fma_rows::enqueue_bf16_rows;
+    float* input{};
+    const auto input_count = std::size_t{capacity} * inputs;
+    require_hip(hipMallocManaged(&input, input_count * sizeof(float)));
+    for (std::size_t i = 0; i < input_count; ++i) input[i] = sample(i) + 0x1p-10F;
+
+    std::vector<std::uint16_t*> weights(outputs.size());
+    std::vector<mini::MiniHipDenseProjection> legacy(outputs.size()), compact(outputs.size());
+    for (std::size_t p = 0; p < outputs.size(); ++p) {
+        const auto weight_count = std::size_t{outputs[p]} * inputs;
+        const auto output_count = std::size_t{capacity + 1U} * outputs[p];
+        require_hip(hipMallocManaged(&weights[p], weight_count * sizeof(std::uint16_t)));
+        for (std::size_t i = 0; i < weight_count; ++i) weights[p][i] = bf16::bf16_encode(sample(i + 113U * p));
+        float* a{};
+        float* b{};
+        require_hip(hipMallocManaged(&a, output_count * sizeof(float)));
+        require_hip(hipMallocManaged(&b, output_count * sizeof(float)));
+        legacy[p] = {weights[p], outputs[p], a, round_output, 0U, separate};
+        compact[p] = {weights[p], outputs[p], b, round_output, 0U, separate};
+    }
+
+    bool pass = true;
+    for (const unsigned live_rows : {16U, 17U, 32U, 33U, 129U, capacity}) {
+        if (separate && live_rows <= strix::core::gemv_rows::max_rows) continue;
+        for (std::size_t p = 0; p < outputs.size(); ++p) {
+            const auto count = std::size_t{live_rows + 1U} * outputs[p];
+            std::fill_n(legacy[p].output, count, sentinel);
+            std::fill_n(compact[p].output, count, sentinel);
+        }
+        require_hip(enqueue_bf16_rows(input, inputs, live_rows, legacy, mini::kVocabulary, stream));
+        require_hip(enqueue_bf16_rows<Bf16RowsSchedule::compact_narrow>(
+            input, inputs, live_rows, compact, mini::kVocabulary, stream));
+        require_hip(hipStreamSynchronize(stream));
+        for (std::size_t p = 0; p < outputs.size(); ++p) {
+            const auto count = std::size_t{live_rows} * outputs[p];
+            const auto* actual = compact[p].output;
+            if (std::memcmp(legacy[p].output, actual, count * sizeof(float)) != 0 ||
+                !std::all_of(actual + count, actual + count + outputs[p], [](float v) { return v == sentinel; })) {
+                std::cerr << "Compact BF16 row grid differs at " << inputs << " x " << outputs[p]
+                          << ", rows " << live_rows << ", round " << round_output << '\n';
+                pass = false;
+            }
+        }
+    }
+    for (std::size_t p = 0; p < outputs.size(); ++p) {
+        require_hip(hipFree(legacy[p].output));
+        require_hip(hipFree(compact[p].output));
+        require_hip(hipFree(weights[p]));
+    }
+    require_hip(hipFree(input));
+    return pass;
+}
+
 bool projection_pass(std::span<const float> in, std::span<const std::uint16_t> weights, std::span<const float> out,
                      unsigned in_width) {
     const auto outputs = weights.size() / in_width;
@@ -242,10 +299,15 @@ int main() {
     constexpr std::array qkv_outputs{1024U, 3072U};
     constexpr std::array down_outputs{2304U};
     constexpr std::array tail_outputs{65U, 17U};
+    constexpr std::array compact_mixed{65U, 24U, 33U, 32U};
+    constexpr std::array compact_only{24U, 32U};
+    const bool compact_pass = compact_projection_pass(2304U, compact_mixed, false, false, stream) &&
+        compact_projection_pass(48U, compact_only, true, false, stream) &&
+        compact_projection_pass(48U, compact_only, true, true, stream);
     const bool wide_pass = wide_projection_pass(2304U, qkv_outputs, false, stream) &&
         wide_projection_pass(3072U, down_outputs, false, stream) &&
         wide_projection_pass(48U, tail_outputs, true, stream);
-    const bool pass = wide_pass &&
+    const bool pass = wide_pass && compact_pass &&
         projection_pass(fixture->input, fixture->first_weight, fixture->first, width) &&
         projection_pass(fixture->input, fixture->second_weight, fixture->second, width) &&
         projection_pass(fixture->relative_input, fixture->relative_weight, fixture->relative, relative_width) &&
