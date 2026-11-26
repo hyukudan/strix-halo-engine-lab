@@ -463,7 +463,7 @@ int main(int argc, char** argv) {
             if (input && (input->width != k || held->width != k))
                 throw std::runtime_error(name + ": width differs from its input");
             const auto format = selection.format;
-            const auto input_name = input ? inpuname : "-";
+            const auto input_name = input ? input->name : "-";
             const auto block = is_sp(format) ? wei::sp::SP2Storage::elements : wei::Q4G64Storage::elements;
             if (k % block != 0U) throw std::runtime_error(name + ": width is not a multiple of pack block");
             wei::Digest256 digest{};
