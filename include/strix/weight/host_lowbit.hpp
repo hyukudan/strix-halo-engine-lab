@@ -15,12 +15,15 @@
 #include "core/iu4_onfly.hpp"
 
 #include <array>
+#include <bit>
 #include <cfenv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <span>
+#include <stdexcept>
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #define STRIX_LOWBIT_HD __host__ __device__
@@ -217,8 +220,8 @@ inline float decode(const std::uint8_t* block, unsigned j) {
 //   SP2 (36 B): bytes [0, 32) codes as the SP3 low plane, code = sign << 1 | index
 //   then 4 scale bytes, one per 32 elements. Scale byte b = e << 3 | m: scale = (1 + m / 8) * 2^(e + base), with the
 //   tensor's base from the header.
-// Weight = (sign ? -1 : 1) * table[index] * scale. Table magnitudes are integers in [1, 31] with at most 4 significant
-// bits, so every weight is exact in BF16 and in FP16 (a 4-bit by 4-bit significand product), and in int8.
+// Weight = (sign ? -1 : 1) * table[index] * scale. Every weight is exact in BF16 and, within the normal FP16 range,
+// in FP16 (a 4-bit by 4-bit significand product). Only the unscaled signed table level is always int8.
 // Per-tensor header (16 B): version u8 | bits u8 | log2 scale group u8 (5) | flags u8 | base i8 | 3 zero bytes |
 // table u8 x 8 (the first 2^(Bits-1) entries strictly increasing, the rest zero).
 // Flags: linear (table = 1, 3, 5, ...: the odd-integer grid), not_foldable (some table x scale product of the tensor is
@@ -268,8 +271,7 @@ constexpr bool representable_magnitude(unsigned t) noexcept {
     return t < 16U;
 }
 
-// Default tables (fixed, not fitted): 4 bits {1,3,5,8,10,14,18,24}; 3 bits {5,16,28,48} / 4 -> {5,16,28,48} is not
-// representable in [1, 31], so the same ratios at the integer grid: {3,10,18,30}; 2 bits {1,3} (= the linear grid).
+// Default tables (fixed, not fitted): see the v1 format page.
 template <unsigned Bits>
 constexpr std::array<std::uint8_t, 8> default_table() noexcept {
     if constexpr (Bits == 4U) return {1, 3, 5, 8, 10, 14, 18, 24};
@@ -335,8 +337,11 @@ struct Header {
 };
 
 // Value of scale byte b for a tensor base: exact (4 significant bits, normal FP32 for every accepted base).
+STRIX_LOWBIT_HD inline std::uint32_t scale_bits(std::uint8_t b, int base) noexcept {
+    return (static_cast<std::uint32_t>(base + 127) * 8U + b) << 20U;
+}
 inline float scale_value(std::uint8_t b, int base) noexcept {
-    return std::ldexp(static_cast<float>(8U + (b & 7U)), static_cast<int>(b >> 3U) + base - 3);
+    return std::bit_cast<float>(scale_bits(b, base));
 }
 
 // Reference decode of element j of a superblock (host tests, emulation tooling).
@@ -367,8 +372,8 @@ inline void pack_block(const unsigned* codes, const std::uint8_t* scales, std::u
 
 // Tensor base: the largest unclipped group scale amax / table[top] (smax > 0) lands in the top two binades of the
 // 32 the scale byte spans, so a group scale may round up one binade and still be encodable. Clamped to the accepted range.
-inline int choose_base(float smax) noexcept {
-    if (!(smax > 0.0F) || !std::isfinite(smax)) return 0;
+inline int choose_base(double smax) noexcept {
+    if (!(smax > 0.0) || !std::isfinite(smax)) return 0;
     const int base = std::ilogb(smax) - 30;
     return base < kMinBase ? kMinBase : base > kMaxBase ? kMaxBase : base;
 }
@@ -376,6 +381,7 @@ inline int choose_base(float smax) noexcept {
 // Nearest scale byte to s > 0 for the base (ties to the lower byte); 0 below the lowest scale, 255 above the highest.
 inline std::uint8_t nearest_scale_byte(double s, int base) noexcept {
     if (!(s > 0.0)) return 0;
+    if (!std::isfinite(s)) return 255;
     int e = std::ilogb(s) - base;
     if (e < 0) return 0;
     if (e > 31) return 255;
@@ -406,9 +412,9 @@ inline unsigned quantise(float w, double s, const std::uint8_t* table) noexcept 
     return (w < 0.0F ? (1U << (S::bits - 1U)) : 0U) | idx;
 }
 
-// One 32-element group of finite inputs: the scale byte with the smallest (importance-weighted) squared error over
-// the bytes whose scale lies in [amax / top / 2, amax / top * 9 / 8] (ties: the lower byte), and the codes for it.
-// The error is summed in double, so the choice does not depend on the rounding mode or on FP contraction.
+// One group of finite inputs: choose the scale byte with the smallest (optionally weighted) squared error
+// over the inclusive nearest-byte endpoints of [amax / top / 2, amax / top * 9 / 8] (ties: lower byte).
+// The caller sets round-to-nearest and compiles without contraction for the FP64 error sum.
 // An all-zero group gets byte 0 and code 0 for every element (the tensor's smallest magnitude, 2^base * table[0]).
 template <class S>
 inline void encode_group(const float* w, const Header& h, unsigned* codes, std::uint8_t& byte,
@@ -446,7 +452,7 @@ inline Header header_for(float amax, const std::array<std::uint8_t, 8>& table) {
     Header h;
     h.bits = static_cast<std::uint8_t>(S::bits);
     h.table = table;
-    h.base = static_cast<std::int8_t>(choose_base(amax / static_cast<float>(table[S::levels - 1U])));
+    h.base = static_cast<std::int8_t>(choose_base(static_cast<double>(amax) / table[S::levels - 1U]));
     if (table == linear_table<S::bits>()) h.flags = static_cast<std::uint8_t>(h.flags | kFlagLinear);
     return h;
 }
@@ -455,9 +461,26 @@ inline float tensor_amax(const float* w, std::size_t count) noexcept {
     for (std::size_t e = 0; e < count; ++e) amax = std::fabs(w[e]) > amax ? std::fabs(w[e]) : amax;
     return amax;
 }
+inline void require_coding_shape(const float* w, std::size_t n, std::size_t k) {
+    constexpr auto max_elements = static_cast<std::size_t>(std::numeric_limits<std::ptrdiff_t>::max());
+    if (!w || !n || !k || k % 128U != 0 || n > max_elements / k)
+        throw std::invalid_argument("Strix pack coder requires a nonempty [N,K] with K divisible by 128");
+}
+inline bool finite_inputs(const float* w, std::size_t n, std::size_t k, const float* importance = nullptr) {
+    for (std::size_t i = 0; i < n * k; ++i)
+        if (!std::isfinite(w[i])) return false;
+    for (std::size_t i = 0; importance && i < k; ++i)
+        if (!std::isfinite(importance[i]) || importance[i] < 0.0F) return false;
+    return true;
+}
 template <class S>
 inline Header make_header(const float* w, std::size_t n, std::size_t k, const std::array<std::uint8_t, 8>& table) {
-    return header_for<S>(tensor_amax(w, n * k), table);
+    require_coding_shape(w, n, k);
+    if (!finite_inputs(w, n, k)) throw std::invalid_argument("Strix pack header requires finite weights");
+    const lowbit::NearestRounding nearest;
+    const auto h = header_for<S>(tensor_amax(w, n * k), table);
+    if (*h.invalid() != '\0') throw std::invalid_argument("Strix pack header requires a valid table");
+    return h;
 }
 
 // Sets / clears not_foldable from the scale bytes actually used (rows of S::row_bytes(k) bytes).
@@ -481,8 +504,13 @@ inline void mark_foldable(Header& h, const std::uint8_t* bytes, std::size_t n, s
 
 // Round-to-nearest coding of a whole tensor (no calibration): out = n * S::row_bytes(k) bytes; optional n x k decode.
 template <class S>
-inline void encode_rows(const float* w, std::size_t n, std::size_t k, const Header& h, std::uint8_t* out,
+inline lowbit::EncodeStatus encode_rows(const float* w, std::size_t n, std::size_t k, const Header& h, std::uint8_t* out,
                         float* dequant = nullptr, const float* importance = nullptr) {
+    require_coding_shape(w, n, k);
+    if (!out || h.bits != S::bits || *h.invalid() != '\0')
+        throw std::invalid_argument("Strix pack coder requires a matching header and an output buffer");
+    if (!finite_inputs(w, n, k, importance)) return {lowbit::EncodeStatus::nonfinite};
+    const lowbit::NearestRounding nearest;
     const std::size_t blocks = k / S::elements;
     for (std::size_t r = 0; r < n; ++r)
         for (std::size_t b = 0; b < blocks; ++b) {
@@ -497,6 +525,30 @@ inline void encode_rows(const float* w, std::size_t n, std::size_t k, const Head
             if (dequant)
                 for (unsigned j = 0; j < S::elements; ++j) dequant[r * k + b * S::elements + j] = decode<S>(block, j, h);
         }
+    return {lowbit::EncodeStatus::ok};
+}
+
+// Lossless re-pack when the header and original group scale bytes are retained.
+// Several scales can represent the same weights, so recalibrating scale bytes
+// from decoded floats alone cannot recover every valid payload.
+template <class S>
+[[nodiscard]] bool repack_block(const float* decoded, const std::uint8_t* scales, const Header& h, std::uint8_t* out) {
+    if (h.bits != S::bits || *h.invalid() != '\0') return false;
+    unsigned codes[S::elements];
+    std::uint8_t saved[S::groups];
+    for (unsigned g = 0; g < S::groups; ++g) {
+        saved[g] = scales[g];
+        const double s = scale_value(saved[g], h.base);
+        for (unsigned j = g * S::group; j < (g + 1U) * S::group; ++j) {
+            const auto w = decoded[j];
+            if (!std::isfinite(w)) return false;
+            const auto c = quantise<S>(w, s, h.table.data());
+            if (std::fabs(static_cast<double>(w)) != static_cast<double>(h.table[c % S::levels]) * s) return false;
+            codes[j] = c;
+        }
+    }
+    pack_block<S>(codes, saved, out);
+    return true;
 }
 
 // Weighted squared reconstruction error of a tensor under a header (RTN codes), summed in double.
@@ -531,6 +583,9 @@ inline double table_error(const float* w, std::size_t rows, std::size_t k, std::
 template <class S>
 inline std::array<std::uint8_t, 8> fit_table(const float* w, std::size_t n, std::size_t k, std::size_t row_stride,
                                              const float* importance = nullptr, unsigned iterations = 4) {
+    require_coding_shape(w, n, k);
+    if (!finite_inputs(w, n, k, importance)) throw std::invalid_argument("Strix pack table fit requires finite inputs");
+    const lowbit::NearestRounding nearest;
     constexpr unsigned L = S::levels;
     if (row_stride == 0U) row_stride = 1U;
     auto best_table = default_table<S::bits>();

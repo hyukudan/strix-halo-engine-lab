@@ -95,7 +95,7 @@ struct LowBitOperand {
 // sp::SP4Storage: 64 code bytes then 4 scale bytes per 128 elements). Unit u of group gi (K32) = the exact FP16 values
 // +-table[index] of elements 32 gi + 16 u .. + 16; scale = the scale byte b = e << 3 | m as (1 + m / 8) 2^e, exact in
 // FP32. The tensor's 2^base is the binding's (Sp4ProjectionTile::store), as NVFP4's outer scale: a power of two, so
-// the row's bits equal those with 2^base inside every group multiplier whenever the outputs are normal FP32 numbers.
+// moving the factor requires that the intermediate exponent range be preserved as well.
 struct Sp4Operand {
     using Storage = weight::sp::SP4Storage;
     static constexpr unsigned kGroup = Storage::group, kUnits = kGroup / 16U, kSuperK = Storage::elements;
@@ -120,8 +120,7 @@ struct Sp4Operand {
         lowbit_f16::sign_index_pairs<kTable>(w.c[word / 4U][word % 4U + 1U], words + 4);
     }
     __device__ __forceinline__ static float scale(const Words& w, unsigned gi) {
-        // (e + 127) << 23 | m << 20 = (byte + 127 * 8) << 20.
-        return __builtin_bit_cast(float, (((w.scale >> (8U * gi)) & 0xFFU) + 127U * 8U) << 20U);
+        return __builtin_bit_cast(float, weight::sp::scale_bits(static_cast<std::uint8_t>(w.scale >> (8U * gi)), 0));
     }
 };
 

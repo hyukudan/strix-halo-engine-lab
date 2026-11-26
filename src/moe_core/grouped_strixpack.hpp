@@ -5,9 +5,9 @@
 #include "strix/weight/lowbit_pack.hpp"
 #include "strix/weight/host_q8.hpp"
 #include "strix/weight/pack_source.hpp"
+#include "strix/weight/strixpack_cpu.hpp"
 
 #include <algorithm>
-#include <cmath>
 #include <limits>
 #include <vector>
 
@@ -54,13 +54,8 @@ namespace detail {
 
 template <class Storage>
 struct Operations {
-    static float dot(const MatrixView& matrix, std::size_t row, std::span<const float> x) {
-        const auto* block = matrix.bytes.data() + row * Storage::row_bytes(matrix.columns);
-        float sum = 0.0F;
-        for (std::size_t col = 0; col < matrix.columns; col += Storage::elements, block += Storage::bytes)
-            for (unsigned lane = 0; lane < Storage::elements; ++lane)
-                sum = std::fma(x[col + lane], sp::decode<Storage>(block, lane, matrix.header), sum);
-        return sum;
+    static void project(const MatrixView& matrix, std::span<const float> x, float* y) {
+        sp::cpu_project(Storage::bits)(matrix.header, matrix.bytes.data(), matrix.rows, matrix.columns, x.data(), y);
     }
 };
 
@@ -68,10 +63,10 @@ using SP2 = GroupedWeightDecode<GroupedWeightFormat::sp2, Operations<sp::SP2Stor
 using SP3 = GroupedWeightDecode<GroupedWeightFormat::sp3, Operations<sp::SP3Storage>>;
 using SP4 = GroupedWeightDecode<GroupedWeightFormat::sp4, Operations<sp::SP4Storage>>;
 
-inline auto dot_for(wei::FormatId format) {
-    if (format == wei::kSP2WeightStorage) return &SP2::dot;
-    if (format == wei::kSP3WeightStorage) return &SP3::dot;
-    return &SP4::dot;
+inline auto project_for(wei::FormatId format) {
+    if (format == wei::kSP2WeightStorage) return &SP2::project;
+    if (format == wei::kSP3WeightStorage) return &SP3::project;
+    return &SP4::project;
 }
 
 }  // namespace detail
@@ -113,13 +108,12 @@ inline wei::Status project(const ExpertMajorPlan& plan, std::span<const MatrixVi
 
     for (const auto& tile : plan.tiles) {
         const auto& matrix = experts[tile.expert];
-        const auto dot = detail::dot_for(matrix.storage);
+        const auto project_rows = detail::project_for(matrix.storage);
         for (std::size_t row = 0; row < tile.rows; ++row) {
             const std::size_t assignment = std::size_t{tile.first_assignment} + row;
             const auto input_row = layout == InputRows::token ? assignments[assignment] : assignment;
             const auto input = x.subspan(input_row * inputs, inputs);
-            for (std::size_t out = 0; out < outputs; ++out)
-                y[assignment * outputs + out] = dot(matrix, out, input);
+            project_rows(matrix, input, y.data() + assignment * outputs);
         }
     }
     return {wei::Error::ok, {}};

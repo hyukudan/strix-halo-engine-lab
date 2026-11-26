@@ -6403,6 +6403,40 @@ against the shared expert-major plan. SP2, SP3 and SP4 use 36, 52 and 68 bytes p
 A plan can promote higher-use experts to SP3 under a declared memory budget.
 Synthetic fixtures compare packed bytes and FP32 reference arithmetic. Model quality and device timing are pending.
 
+<a id="strixpack-host-simd"></a>
+## Strix Pack host SIMD
+
+**Shared home** `src/core/strixpack_cpu.cpp` and `src/core/strixpack_cpu_x86.hpp`.
+**Control** Automatic AVX2/FMA or AVX-512 dispatch when processor and OS state support it.
+Callers can choose `CpuIsa::scalar` for comparison. The grouped reference uses the shared fused
+projection. Its SIMD lanes hold independent weight rows and apply a fused multiply-add in ascending K.
+The [conformance suite](engine/strix-pack-v1.md#exactness-classes) compares the decode and projection bits
+to the scalar oracle and the common fixtures. This is pack-level exactness on the host reference route.
+
+Single-thread Release measurement on Core i7-13700K, Windows Balanced power plan, 4096×4096 packed
+rows, one activation vector for projection. Each result is the median of three runs, each with
+seven interleaved timed passes per ISA after warm-up. The numerator is packed bytes read, including
+the group scales. Decode writes FP32 weights. Projection writes one FP32 result per row.
+
+| Format | Decode scalar to AVX2 (MB/s) | Decode gain | Fused scalar to AVX2 (MB/s) | Fused gain |
+|---|---:|---:|---:|---:|
+| SP4 | 371 to 671 | 1.81× | 159 to 925 | 5.83× |
+| SP3 | 155 to 513 | 3.31× | 72 to 365 | 5.06× |
+| SP2 | 191 to 392 | 2.05× | 95 to 621 | 6.54× |
+
+MB/s uses decimal units. AVX-512 compiled in the same build and requires an AVX-512 host for execution.
+
+| Model | Production engine binding |
+|---|---|
+| inkling2-mini | Host reference only |
+| qwen3.8-flash-next | Host reference only |
+| qwen3.8-27b | Host reference only |
+| deepseek-v4.1-flash | Host reference only |
+| glm-5.3-flash | Host reference only |
+| minimax-m3.1-flash | Host reference only |
+| hy4-flash | Host reference only |
+| nemotron-3.5-bolt-e4b | Host reference only |
+
 <a id="strixpack-layer-moments"></a>
 ## Layer-streamed calibration moments
 

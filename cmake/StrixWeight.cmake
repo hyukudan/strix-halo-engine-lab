@@ -3,6 +3,7 @@ get_filename_component(STRIX_WEIGHT_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE
 add_library(strix-weight STATIC
     ${STRIX_WEIGHT_ROOT}/src/weight/block_draft.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/host_q8.cpp
+    ${STRIX_WEIGHT_ROOT}/src/core/strixpack_cpu.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/lowbit_pack.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/pack_source.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/pack_plan.cpp
@@ -65,6 +66,20 @@ add_library(strix-weight STATIC
     ${STRIX_WEIGHT_ROOT}/src/serve/json.cpp)
 target_include_directories(strix-weight PUBLIC ${STRIX_WEIGHT_ROOT}/include PRIVATE ${STRIX_WEIGHT_ROOT}/src)
 target_compile_features(strix-weight PUBLIC cxx_std_20)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$" AND
+   CMAKE_CXX_COMPILER_ID MATCHES "^(MSVC|GNU|Clang|AppleClang)$")
+    set(strix_sp_cpu "${STRIX_WEIGHT_ROOT}/src/core/strixpack_cpu")
+    target_sources(strix-weight PRIVATE "${strix_sp_cpu}_avx2.cpp" "${strix_sp_cpu}_avx512.cpp")
+    target_compile_definitions(strix-weight PRIVATE STRIX_SP_X86_SIMD=1)
+    if(MSVC)
+        set_source_files_properties("${strix_sp_cpu}_avx2.cpp" PROPERTIES COMPILE_OPTIONS /arch:AVX2)
+        set_source_files_properties("${strix_sp_cpu}_avx512.cpp" PROPERTIES COMPILE_OPTIONS /arch:AVX512)
+    else()
+        set_source_files_properties("${strix_sp_cpu}_avx2.cpp" PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+        set_source_files_properties("${strix_sp_cpu}_avx512.cpp" PROPERTIES COMPILE_OPTIONS
+            "-mavx2;-mfma;-mavx512f;-mavx512dq;-mavx512cd;-mavx512bw;-mavx512vl")
+    endif()
+endif()
 if(MSVC)
     target_compile_options(strix-weight PRIVATE /fp:strict /D_CRT_SECURE_NO_WARNINGS)
 else()

@@ -101,6 +101,45 @@ constexpr SignIndexTable sign_index_table(const std::array<std::uint8_t, N>& tab
 }
 
 #if defined(__HIPCC__)
+#define STRIX_SP_OPERAND __device__ __forceinline__
+#else
+#define STRIX_SP_OPERAND inline
+#endif
+
+STRIX_SP_OPERAND std::uint32_t sign_index_perm(std::uint32_t hi, std::uint32_t lo, std::uint32_t sel) {
+#if defined(__HIPCC__)
+    return __builtin_amdgcn_perm(hi, lo, sel);
+#else
+    // All selectors emitted by sign_index_pairs are byte 0..7 or the zero selector 12.
+    const std::uint64_t src = (std::uint64_t{hi} << 32U) | lo;
+    std::uint32_t out = 0;
+    for (unsigned j = 0; j < 32; j += 8) {
+        const auto i = (sel >> j) & 255U;
+        if (i < 8U) out |= static_cast<std::uint32_t>((src >> (8U * i)) & 255U) << j;
+    }
+    return out;
+#endif
+}
+
+// FP16 pairs of the eight sign + index codes of one word, in increasing column order.
+template <SignIndexTable T>
+STRIX_SP_OPERAND void sign_index_pairs(std::uint32_t w, std::uint32_t* out) {
+    const std::uint32_t even = w & 0x0F0F0F0FU, odd = (w >> 4U) & 0x0F0F0F0FU;
+#if defined(__HIPCC__)
+#pragma unroll
+#endif
+    for (unsigned j = 0; j < 4U; ++j) {
+        // [0, even nibble j, 0, odd nibble j]
+        const auto x = sign_index_perm(odd, even, ((4U + j) << 24U) | 0x000C0000U | (j << 8U) | 0x0CU);
+        auto magnitude = sign_index_perm(T.hi_hi, T.hi_lo, (x & 0x07000700U) | 0x000C000CU);
+        if constexpr ((T.lo_lo | T.lo_hi) != 0U)
+            magnitude |= sign_index_perm(T.lo_hi, T.lo_lo, ((x >> 8U) & 0x00070007U) | 0x0C000C00U);
+        out[j] = magnitude | ((x & 0x08000800U) << 4U);
+    }
+}
+#undef STRIX_SP_OPERAND
+
+#if defined(__HIPCC__)
 using Half2 = weight::hip::gfx1151::Half2;
 using WordsG = const std::uint32_t __attribute__((address_space(1), aligned(4)));
 typedef std::uint32_t Words4 __attribute__((ext_vector_type(4), aligned(4)));
@@ -147,21 +186,6 @@ __device__ __forceinline__ void integer_pairs(std::uint32_t lo0, std::uint32_t l
     }
 }
 
-// FP16 pairs of the 8 sign + index codes of one word (element 2 j in the low half of word j, 2 j + 1 in the high half;
-// element 2 j in the low nibble of byte j).
-template <SignIndexTable T>
-__device__ __forceinline__ void sign_index_pairs(std::uint32_t w, std::uint32_t* out) {
-    const std::uint32_t even = w & 0x0F0F0F0FU, odd = (w >> 4U) & 0x0F0F0F0FU;
-#pragma unroll
-    for (unsigned j = 0; j < 4U; ++j) {
-        // [0, even nibble j, 0, odd nibble j]
-        const std::uint32_t x = __builtin_amdgcn_perm(odd, even, ((4U + j) << 24U) | 0x000C0000U | (j << 8U) | 0x0CU);
-        std::uint32_t magnitude = __builtin_amdgcn_perm(T.hi_hi, T.hi_lo, (x & 0x07000700U) | 0x000C000CU);
-        if constexpr ((T.lo_lo | T.lo_hi) != 0U)
-            magnitude |= __builtin_amdgcn_perm(T.lo_hi, T.lo_lo, ((x >> 8U) & 0x00070007U) | 0x0C000C00U);
-        out[j] = magnitude | ((x & 0x08000800U) << 4U);
-    }
-}
 // The FP32 value of the FP16 scale in bits 0..15 (upper bits ignored).
 __device__ __forceinline__ float scale_value(std::uint32_t bits) {
     return static_cast<float>(__builtin_bit_cast(_Float16, static_cast<std::uint16_t>(bits & 0xFFFFU)));
