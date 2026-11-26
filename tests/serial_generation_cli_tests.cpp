@@ -54,6 +54,7 @@ std::vector<std::uint32_t> inputs;
 unsigned tunes = 0, seeds = 0;
 CliSpeculation loaded_mode = CliSpeculation::off;
 std::string cost_device;  // non-empty: the fixture persists its verify walls (virtual clock, 1 ms per reading)
+bool offer_verifier = true;
 double virtual_ms = 0.0;
 
 void set_env(const char* name, const char* value) {
@@ -82,7 +83,7 @@ public:
     }
 
     std::uint32_t max_verify_rows(CliSpeculation) const override { return rows_; }
-    strix::spec::VerifyTarget* verify_target() override { return this; }
+    strix::spec::VerifyTarget* verify_target() override { return offer_verifier ? this : nullptr; }
     std::string verify_cost_device() const override { return cost_device; }
     void tune_speculation(strix::spec::BlockConfig& config) const override {
         ++tunes;
@@ -614,6 +615,13 @@ int main() try {
     };
     const auto plain = repeated("off");
     const auto plain_inputs = inputs;
+    offer_verifier = false;
+    check(repeated("verify").error.find("cannot verify a window") != std::string::npos,
+          "a forced verifier must be present on the loaded decoder");
+    const auto no_verifier = repeated("auto");
+    check(no_verifier.code == 0 && inputs == plain_inputs && no_verifier.out.find("strix-spec-stats ") == std::string::npos,
+          "automatic decode can continue serially without a verifier");
+    offer_verifier = true;
     const auto lookup = repeated("lookup");
     const auto generated_end = plain.out.find("timing ");
     check(plain.code == 0 && lookup.code == 0 && generated_end != std::string::npos &&

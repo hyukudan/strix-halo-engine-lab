@@ -230,14 +230,14 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
         throw std::invalid_argument("CUDA step program does not support --dspark; choose resident replay "
                                     "with --step-graph or --no-step-graph");
     const auto selected = std::span{&kProgramDecoder, 1U};
-    if ((requested_mode == Mode::verify || requested_mode == Mode::lookup) &&
-        !exec::resolve_decode_route(selected, {.verifier = true, .sampled_verifier = sampled}))
+    const auto can_verify = exec::resolve_decode_route(selected, {.verifier = true, .sampled_verifier = sampled});
+    if ((requested_mode == Mode::verify || requested_mode == Mode::lookup) && !can_verify)
         throw std::invalid_argument("CUDA step program has no verifier; choose resident replay "
                                     "with --step-graph or --no-step-graph for forced drafting");
     if (storage != weight::kBf16WeightStorage)
         throw std::invalid_argument("CUDA step program requires BF16 weights; choose resident replay "
                                     "with --step-graph or --no-step-graph for Q8_0");
-    if (requested_mode == Mode::automatic && !exec::resolve_decode_route(selected, {.verifier = true}))
+    if (requested_mode == Mode::automatic && !can_verify)
         return {true, Mode::off, "CUDA step program has no verifier"};
     return {true, requested_mode, {}};
 }

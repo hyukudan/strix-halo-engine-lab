@@ -1,6 +1,7 @@
 #include "strix/serve/serial_generation_cli.hpp"
 
 #include "core/dense_linear.hpp"
+#include "strix/exec/route_capabilities.hpp"
 #include "strix/serial_request.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
@@ -549,10 +550,15 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     // A sampled request verifies rows with the serial sampler's draw at each position (same policy and request
     // identity as the serial path below), so the ids equal serial sampled decode.
     const auto row_rule = greedy ? spec::RowRule{} : spec::RowRule(options.sampling, sampler_options.request_identity);
-    if (verify && !greedy && !verify->supports_row_rule(true)) {
-        if (options.speculation != CliSpeculation::automatic)
-            throw std::invalid_argument("this target cannot verify sampled rows");
-        verify = nullptr;
+    if (verify_rows > 1U) {
+        const exec::DecodeCapabilities offered{.verifier = verify != nullptr, .sampling = true,
+            .sampled_verifier = !greedy && verify && verify->supports_row_rule(true)};
+        if (!offered.provides({.verifier = true, .sampled_verifier = !greedy})) {
+            if (options.speculation != CliSpeculation::automatic)
+                throw std::invalid_argument(verify ? "this target cannot verify sampled rows" :
+                                                     "this target cannot verify a window");
+            verify = nullptr;
+        }
     }
     std::optional<spec::BlockDrafter> drafter;
     // Opened (file read) before the decode clock; stored after it.
