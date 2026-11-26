@@ -257,11 +257,11 @@ struct Command {
 
 [[nodiscard]] inline std::string effective_config(App app, const sp::Resolution& resolution) {
     auto json = resolution.json();
+    json.pop_back();
+    json += ",\"device_probe\":\"skipped for inspection\"";
     const auto* window = resolution.find(window_lever(app));
-    if (window && !window->reason.empty()) {
-        json.pop_back();
-        json += ",\"prefill_route\":" + sp::json_string(window->reason) + "}";
-    }
+    if (window && !window->reason.empty()) json += ",\"prefill_route\":" + sp::json_string(window->reason);
+    json += '}';
     return json;
 }
 

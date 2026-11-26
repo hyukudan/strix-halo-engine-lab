@@ -143,18 +143,18 @@ int main(int argc, char** argv) try {
         while (!ids_arg.empty() && std::isspace(static_cast<unsigned char>(ids_arg.back()))) ids_arg.pop_back();
     }
     const auto prompt = parse_ids(ids_arg);
-    const std::string device_product = strix::device::hip_cost_device_identity();
+    const std::string device_product = inspect ? std::string{} : strix::device::hip_cost_device_identity();
     const std::string device_class = device_product.substr(0, std::min(device_product.find('|'), device_product.find(':')));
     bool iu4_pack = false;
     try {
-        if (!model.empty())
+        if (!inspect && !model.empty())
             for (const auto& t : strix::gguf::read_file(model).tensors) iu4_pack = iu4_pack || t.ggml_type == strix::gguf::type_strix_iu4_g64;
     } catch (const std::exception&) {
         iu4_pack = false;  // unreadable header: the load below reports it; no FAST cell qualifies
     }
     const std::uint64_t capacity = maxpos ? std::uint64_t{maxpos} : prompt.size() + gen + HipEngine::max_rows();
     const std::string settings = "mtp=" + spec_args.mtp + "|tp=" + (tp_rank < 0 ? "off" : "on");
-    const std::string execution = strix::profile::ladder_execution({"hip", device_product,
+    const std::string execution = inspect ? std::string{} : strix::profile::ladder_execution({"hip", device_product,
         {prompt.size(), capacity, 1U, static_cast<std::uint32_t>(std::min<std::size_t>(prompt.size(), 0xFFFFFFFFU)), 0U, 0U, 0U, gen},
         settings});
     auto profile_inputs = command.inputs;
