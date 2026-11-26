@@ -18,6 +18,8 @@
 // a3 (row g+8); b0 (slots 2t..2t+1, col g), b1 (slots 8+2t.., col g); c0,c1 (row g, cols 2t, 2t+1), c2,c3 (row g+8).
 #pragma once
 
+#include "strix/device/launch_geometry.hpp"
+
 #include "../../moe_core/grouped_microscaled_rows.hpp"
 #include "../../moe_core/grouped_tall_plan.hpp"
 #include "native_mma.hpp"
@@ -335,6 +337,13 @@ inline constexpr unsigned row_slices(unsigned max_tile_rows, unsigned rows_per_c
     return view::tile_row_slices(max_tile_rows, kRowsPerTile, rows_per_cta);
 }
 
+template<unsigned MBlocks, unsigned OutputTile>
+constexpr device::LaunchGeometry projection_launch(const view::Args& args) {
+    using Shape = TileShape<MBlocks, OutputTile>;
+    return {{args.outputs / OutputTile, row_slices(args.max_tile_rows, Shape::kRows), args.count},
+            {Shape::kThreads, 1, 1}, 0};
+}
+
 inline bool fits(const view::Args& args) {
     return view::fits_args(args, kInputAlignment, output_tile(args.outputs, args.max_tile_rows));
 }
@@ -470,15 +479,14 @@ __global__ __launch_bounds__(TileShape<MBlocks, OutputTile>::kThreads, Shift ? 4
 
 template<packed::MatrixFormat Format, unsigned MBlocks, unsigned OutputTile>
 inline cudaError_t launch_form(const view::Args& args, cudaStream_t stream) {
-    using Shape = TileShape<MBlocks, OutputTile>;
-    const dim3 grid(args.outputs / OutputTile, row_slices(args.max_tile_rows, Shape::kRows), args.count);
+    const auto shape = projection_launch<MBlocks, OutputTile>(args);
     if constexpr (Format == packed::MatrixFormat::nvfp4) {
         if (args.decode == view::Decode::shift) {
-            projection<Format, MBlocks, OutputTile, true><<<grid, Shape::kThreads, 0, stream>>>(args);
+            projection<Format, MBlocks, OutputTile, true><<<shape.template grid<dim3>(), shape.template block<dim3>(), shape.shared_bytes, stream>>>(args);
             return cudaGetLastError();
         }
     }
-    projection<Format, MBlocks, OutputTile><<<grid, Shape::kThreads, 0, stream>>>(args);
+    projection<Format, MBlocks, OutputTile><<<shape.template grid<dim3>(), shape.template block<dim3>(), shape.shared_bytes, stream>>>(args);
     return cudaGetLastError();
 }
 

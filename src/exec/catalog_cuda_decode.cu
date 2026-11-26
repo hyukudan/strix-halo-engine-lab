@@ -944,21 +944,21 @@ std::uint32_t greedy_chunks(const GreedyPartial& a) {
 KernelBinding bind(const PackedGateUp& a) {
     if (!fits_packed(a.args, a.format)) throw std::invalid_argument("invalid CUDA R1 packed gate-up");
     const auto leaf = a.format == MatrixFormat::nvfp4 ? gate_up_nvfp4 : gate_up_mxfp8;
-    const auto blocks = packed::gate_blocks(a.args.intermediate, packed::kCudaGeometry.gate_columns);
+    const auto shape = packed::gate_up_launch(a.args.intermediate, 1U, kPackedExpertsPerToken);
     const auto cost = packed_projection_cost(a.format, a.args.hidden, 2ULL * a.args.intermediate, kPackedExpertsPerToken,
         std::uint64_t{a.args.hidden} * sizeof(float),
         std::uint64_t{kPackedExpertsPerToken} * a.args.intermediate * sizeof(*a.args.activation));
-    return bind_leaf(leaf, {{blocks, kPackedExpertsPerToken, 1}, {packed::detail::kThreads, 1, 1}, 0}, a, cost);
+    return bind_leaf(leaf, shape, a, cost);
 }
 
 KernelBinding bind(const PackedDownCombine& a) {
     if (!fits_packed(a.args, a.format)) throw std::invalid_argument("invalid CUDA R1 packed down-combine");
     const auto leaf = a.format == MatrixFormat::nvfp4 ? down_nvfp4 : down_mxfp8;
-    const auto blocks = packed::down_blocks(a.args.hidden, packed::kCudaGeometry.down_columns);
+    const auto shape = packed::down_combine_launch(a.args.hidden, 1U);
     const auto cost = packed_projection_cost(a.format, a.args.intermediate, a.args.hidden, kPackedExpertsPerToken,
         std::uint64_t{kPackedExpertsPerToken} * a.args.intermediate * sizeof(*a.args.activation),
         std::uint64_t{a.args.hidden} * sizeof(float));
-    return bind_leaf(leaf, {{blocks, 1, 1}, {packed::detail::kThreads, 1, 1}, 0}, a, cost);
+    return bind_leaf(leaf, shape, a, cost);
 }
 
 KernelBinding bind(const BankReadoutTiled& a) {
@@ -984,8 +984,7 @@ KernelBinding bind(const PackedGateUpPipe& a) {
     const auto cost = packed_projection_cost(a.format, a.args.hidden, 2ULL * a.args.intermediate, kPackedExpertsPerToken,
         std::uint64_t{a.args.hidden} * sizeof(float),
         std::uint64_t{kPackedExpertsPerToken} * a.args.intermediate * sizeof(*a.args.activation));
-    return bind_leaf(leaf, {{packed::pipe::gate_blocks(a.args.intermediate), packed::pipe::kTop, 1},
-                            {packed::pipe::kGateWarps * packed::pipe::kWarp, 1, 1}, 0}, a, cost);
+    return bind_leaf(leaf, packed::pipe::gate_up_launch(a.args.intermediate), a, cost);
 }
 
 KernelBinding bind(const PackedDownCombinePipe& a) {
@@ -994,8 +993,7 @@ KernelBinding bind(const PackedDownCombinePipe& a) {
     const auto cost = packed_projection_cost(a.format, a.args.intermediate, a.args.hidden, kPackedExpertsPerToken,
         std::uint64_t{kPackedExpertsPerToken} * a.args.intermediate * sizeof(*a.args.activation),
         std::uint64_t{a.args.hidden} * sizeof(float));
-    return bind_leaf(leaf, {{packed::pipe::down_blocks(a.args.hidden), 1, 1},
-                            {packed::pipe::kTop * packed::pipe::kWarp, 1, 1}, 0}, a, cost);
+    return bind_leaf(leaf, packed::pipe::down_combine_launch(a.args.hidden), a, cost);
 }
 
 // Same grid as PackedDownCombine; the tail adds its per-channel operands (weights, history, residual) and stores
@@ -1004,7 +1002,7 @@ KernelBinding bind(const PackedDownCombineTail& a) {
     if (!fits_packed(a.args, a.format) || !packed::admits_tail(a.args, a.tail, 1U, kPackedExpertsPerToken))
         throw std::invalid_argument("invalid CUDA R1 packed down-combine tail");
     const auto leaf = a.format == MatrixFormat::nvfp4 ? down_tail_nvfp4 : down_tail_mxfp8;
-    const auto blocks = packed::down_blocks(a.args.hidden, packed::kCudaGeometry.down_columns);
+    const auto shape = packed::down_combine_launch(a.args.hidden, 1U);
     const std::uint64_t channel = std::uint64_t{a.args.hidden} * sizeof(float);
     constexpr std::uint64_t taps = kPackedConvTailTaps;
     const std::uint64_t tail_read = (2U * taps - 1U + (a.tail.residual ? 1U : 0U)) * channel;
@@ -1012,7 +1010,7 @@ KernelBinding bind(const PackedDownCombineTail& a) {
     const auto cost = packed_projection_cost(a.format, a.args.intermediate, a.args.hidden, kPackedExpertsPerToken,
         std::uint64_t{kPackedExpertsPerToken} * a.args.intermediate * sizeof(*a.args.activation) + tail_read,
         channel + tail_written);
-    return bind_leaf(leaf, {{blocks, 1, 1}, {packed::detail::kThreads, 1, 1}, 0}, a, cost);
+    return bind_leaf(leaf, shape, a, cost);
 }
 
 KernelBinding bind(const GreedyPartial& a) {
@@ -1093,22 +1091,21 @@ KernelBinding bind(const PreparedFlashHostBf16& a) {
 
 KernelBinding bind(const grouped_rows::GatherArgs& a) {
     if (a.width == 0 || a.assignments == 0) throw std::invalid_argument("empty CUDA grouped gather");
-    const auto grid = grouped_rows::detail::grid(a.width, a.assignments);
-    return bind_leaf(group_gather, {{grid.x, grid.y, 1}, {grouped_rows::detail::kThreads, 1, 1}, 0}, a);
+    return bind_leaf(group_gather, grouped_rows::row_launch(a.width, a.assignments), a);
 }
 
 KernelBinding bind(const GroupedProjection& a) {
     if (!grouped_mma::fits(a.args) || a.args.max_tile_rows != 1U ||
         (a.format != MatrixFormat::nvfp4 && a.format != MatrixFormat::mxfp8))
         throw std::invalid_argument("invalid CUDA R1 grouped projection");
-    using Shape = grouped_mma::TileShape< ::strix::cuda::core::native_mma::kDecodeMBlocks, grouped_mma::kDecodeOutputs>;
+    const auto shape = grouped_mma::projection_launch< ::strix::cuda::core::native_mma::kDecodeMBlocks,
+                                                       grouped_mma::kDecodeOutputs>(a.args);
     const auto leaf = a.format == MatrixFormat::nvfp4 ? group_nvfp4 : group_mxfp8;
     // The R1 recipe allocates one tile per routed assignment. Count its planned logical work.
     const auto cost = packed_projection_cost(a.format, a.args.inputs, a.args.outputs, a.args.count,
         std::uint64_t{a.args.count} * a.args.inputs * sizeof(std::uint16_t),
         std::uint64_t{a.args.count} * a.args.outputs * sizeof(float));
-    return bind_leaf(leaf, {{a.args.outputs / grouped_mma::kDecodeOutputs, 1, a.args.count},
-                            {Shape::kThreads, 1, 1}, 0}, a, cost);
+    return bind_leaf(leaf, shape, a, cost);
 }
 
 KernelBinding bind(const GroupedActivation& a) {
@@ -1119,8 +1116,7 @@ KernelBinding bind(const GroupedActivation& a) {
 
 KernelBinding bind(const grouped_rows::CombineArgs& a) {
     if (a.width == 0 || a.rows != 1U) throw std::invalid_argument("invalid CUDA R1 grouped combine");
-    const auto grid = grouped_rows::detail::grid(a.width, a.rows);
-    return bind_leaf(group_combine, {{grid.x, grid.y, 1}, {grouped_rows::detail::kThreads, 1, 1}, 0}, a);
+    return bind_leaf(group_combine, grouped_rows::row_launch(a.width, a.rows), a);
 }
 
 }  // namespace strix::exec::cuda_decode

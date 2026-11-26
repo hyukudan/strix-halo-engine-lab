@@ -46,6 +46,12 @@ constexpr std::uint64_t matrix_bytes(unsigned rows, unsigned width, unsigned val
 } // namespace
 
 int main() {
+    using Geometry = strix::device::LaunchGeometry;
+    static_assert(r1::gate_up_launch(1152U, 8U, 8U) == Geometry{{72, 64, 1}, {256, 1, 1}, 0});
+    static_assert(r1::down_combine_launch(2304U, 8U) == Geometry{{576, 8, 1}, {256, 1, 1}, 0});
+    static_assert(r1::pipe::gate_up_launch(1152U) == Geometry{{288, 8, 1}, {128, 1, 1}, 0});
+    static_assert(r1::pipe::down_combine_launch(2304U) == Geometry{{1152, 1, 1}, {256, 1, 1}, 0});
+    static_assert(strix::moe_core::grouped_rows::row_launch(257, 65536) == Geometry{{2, 65535, 1}, {256, 1, 1}, 0});
     using Fp4 = r1::CudaRun<1U, 16U>;
     using Fp8 = r1::CudaRun<2U, 32U>;
     static_assert(Fp4::kRunBytes == 128U && Fp8::kRunBytes == 128U);

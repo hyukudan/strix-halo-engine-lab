@@ -150,10 +150,9 @@ inline BoundStepLeaf bind_step(const cuda::core::StepRowStoreBf16& a, unsigned r
 template <class Policy, class Math, class Traits>
 BoundStepLeaf bind_step_route(const StepCheckedWaveRoute& a, unsigned rows, std::string_view policy_identity) {
     if (policy_identity.empty()) throw std::invalid_argument("missing WR2 route policy identity");
-    constexpr unsigned waves = moe_core::kCheckedRouteRowsPerBlock;
     return wr2_detail::by_width(rows, [&]<unsigned R>() {
         return wr2_detail::bind<R, wr2_detail::route<R, Policy, Math, Traits>>(a, policy_identity,
-            {{(R - 1U) / waves + 1U, 1, 1}, {waves * 32U, 1, 1}, 0});
+            moe_core::checked_route_launch(R));
     });
 }
 

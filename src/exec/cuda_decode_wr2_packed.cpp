@@ -37,10 +37,8 @@ BoundStepLeaf bind_packed(PackedCall call) {
     binding.identity += call.gate_up ? "gate-up-k8-x3-r" : "down-combine-k8-x3-r";
     // v2: the rows launch of the decode body (one CTA per assignment / row); per-row arithmetic is unchanged.
     binding.identity += std::to_string(call.rows) + "-v2";
-    const auto grid = call.gate_up
-        ? packed::gate_up_grid(b.intermediate, call.rows, packed::kStepTopK, packed::kGeometry.gate_columns)
-        : packed::down_combine_grid(b.hidden, call.rows, packed::kGeometry.down_columns);
-    binding.grid = {{grid.x, grid.y, 1U}, {packed::kWavesPerBlock * 32U, 1, 1}, 0};
+    binding.grid = call.gate_up ? packed::gate_up_launch(b.intermediate, call.rows, packed::kStepTopK)
+                                : packed::down_combine_launch(b.hidden, call.rows);
     binding.predicted.launches = 1U;
     const auto bytes = std::as_bytes(std::span(&call, 1U));
     binding.args.assign(bytes.begin(), bytes.end());

@@ -143,7 +143,7 @@ template <class Policy, class Math, class Traits>
             static_cast<cudaStream_t>(stream)), "enqueue checked CUDA wave route");
     };
     binding.identity = binding.exact_identity = identity;
-    binding.grid = {{1U, 1U, 1U}, {moe_core::kCheckedRouteRowsPerBlock * 32U, 1U, 1U}, 0U};
+    binding.grid = moe_core::checked_route_launch(1U);
     binding.pdl = {PdlWait::absent, PdlOptOut::kernel_without_wait};
     const auto bytes = std::as_bytes(std::span(&args, 1U));
     binding.args.assign(bytes.begin(), bytes.end());
@@ -175,8 +175,7 @@ template <class Policy, class Math, class Traits>
         device::native::check(status, "enqueue CUDA R1 routed gate-up");
     };
     binding.identity = binding.exact_identity = routed_gate_up_identity(args.format, route);
-    binding.grid = {{r1::gate_blocks(args.args.intermediate, r1::kCudaGeometry.gate_columns), top_k, 1U},
-                    {r1::detail::kThreads, 1U, 1U}, 0U};
+    binding.grid = r1::gate_up_launch(args.args.intermediate, 1U, top_k);
     // EntryPdl: every CTA waits before its first read (logits are predecessor output), then triggers.
     binding.pdl.wait = PdlWait::before_step_io;
     const auto bytes = std::as_bytes(std::span(&args, 1U));

@@ -1,4 +1,6 @@
 #pragma once
+
+#include "strix/device/launch_geometry.hpp"
 // MoE router (one wave per row) and expert-output combine.
 // Contracts and host oracles: include/strix/moe/route_policy.hpp (RoutePolicy, presets, route_select_ref) and
 // include/strix/moe/combine.hpp (CombineForm, combine_ref). A family binds a preset (the policy is a template argument
@@ -37,6 +39,11 @@ inline constexpr unsigned kCheckedRouteRowsPerBlock = 1U;
 #else
 inline constexpr unsigned kCheckedRouteRowsPerBlock = 4U;
 #endif
+
+constexpr device::LaunchGeometry checked_route_launch(unsigned rows) {
+    constexpr auto waves = kCheckedRouteRowsPerBlock;
+    return {{(rows - 1U) / waves + 1U, 1, 1}, {waves * 32U, 1, 1}, 0};
+}
 
 template <const moe::RoutePolicy& P>
 struct RouteWavePolicy {
@@ -352,9 +359,8 @@ cudaError_t enqueue_route_wave(const float* logits, const float* bias, std::uint
     static_assert(moe::validate(Policy::value) == nullptr, "route_wave_kernel: invalid policy");
     if (rows == 0U) return cudaSuccess;
     if (!logits || !bias || !ids || !w || !status || rows > 0x7fffffffU) return cudaErrorInvalidValue;
-    constexpr unsigned waves = kCheckedRouteRowsPerBlock;
-    const unsigned blocks = (rows - 1U) / waves + 1U;
-    route_wave_policy_entry<Policy, Math, Traits><<<blocks, waves * 32U, 0, stream>>>(logits, bias, ids, w, status,
+    const auto shape = checked_route_launch(rows);
+    route_wave_policy_entry<Policy, Math, Traits><<<shape.template grid<dim3>(), shape.template block<dim3>(), shape.shared_bytes, stream>>>(logits, bias, ids, w, status,
                                                                                       rows);
     return cudaGetLastError();
 }
@@ -372,8 +378,8 @@ cudaError_t enqueue_route_wave_step(const float* logits, const float* bias, std:
                                    unsigned* status, const exec::StepBlock* step, cudaStream_t stream) {
     static_assert(moe::validate(Policy::value) == nullptr, "route_wave_kernel: invalid policy");
     if (!step || !logits || !bias || !ids || !w || !status) return cudaErrorInvalidValue;
-    constexpr unsigned waves = kCheckedRouteRowsPerBlock;
-    route_wave_step_entry<Rows, Policy, Math, Traits><<<(Rows - 1U) / waves + 1U, waves * 32U, 0, stream>>>(
+    constexpr auto shape = checked_route_launch(Rows);
+    route_wave_step_entry<Rows, Policy, Math, Traits><<<shape.template grid<dim3>(), shape.template block<dim3>(), shape.shared_bytes, stream>>>(
         logits, bias, ids, w, status, step);
     return cudaGetLastError();
 }
