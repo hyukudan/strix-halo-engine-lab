@@ -1205,6 +1205,8 @@ than the decode window read back the one argmax the engine returns for them (the
 - **Off switch:** `--profile exact`, an explicit `--wide N` / `--wide-exact N`, or `--rows N`.
 - **Measured gain:** One Strix Halo node, `--no-mtp --gen 1`, prompt seconds EXACT 64 rows -> 512-row window: 2,048
   tokens 10.27 -> 2.99 s (3.43x), 8,192 tokens 67.60 -> 12.93 s (5.23x), 24,576 tokens 534.39 -> 45.43 s (11.8x).
+  Timed points are the band tops only, with MTP off: the lower part of each band (1-2,047, 2,049-8,191,
+  8,193-24,575) and runs with MTP on are covered by the gate classes, not by a timing receipt.
 - **Implementation / evidence:** [profile rows](../include/strix/profiles/qwen_dense_hip.hpp),
   [shared band receipts](../include/strix/engine_profile.hpp), [prefill windows](../include/strix/qwen35/prefill_windows.hpp),
   [model page](models/qwen3.8-27b/README.md#fast-prefill-window-hip-decode-app)
@@ -4688,7 +4690,8 @@ inherit it).
   (served: greedy text request without a cached prefix), both ranks voting the same device class and link.
 - **Automatic selection:** one shared resolver for the command line and the server. The FAST cell is qualified by its
   gate (below) and timed by a band receipt bound to the run's own execution (`profile::bind_band_receipts`): device
-  gfx1151/Radeon-8060S, prefill, one lane, 2,049..8,192 tokens, x1.50 noise 0.10. TURBO runs the FAST cell inside that
+  gfx1151/Radeon-8060S, prefill, one lane, 2,049..8,192 tokens, x1.50 noise 0.10 (timed and gated at 8,192 tokens only;
+  the lower band edge is untimed). TURBO runs the FAST cell inside that
   band and its own literal receipt at 31,258 tokens. Each prompt prints
   `glm-pf-wmma-x profile=<p> prompt=<n> chunk=<rows> scratch=<routed|full> effective=wmma|exact-cores (reason)` and the `strix-ladder/v1 pf_wmma`
   route that decided it.
