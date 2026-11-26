@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <concepts>
 #include <functional>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -42,6 +43,19 @@ namespace strix::serve {
 // A decoder that offers BOTH prefill calls also declares which one it serves with at run time
 // (prefill_emits_first() const -> bool, fixed for its lifetime). This is an arithmetic lever whose resolved value
 // must match the CLI; it must never be selected by slot, cohort width or arrival order. Read once at construction.
+// An engine's lone-lane speculation pieces (CohortConfig::lane_speculation) are bound with bind_lanes(): the binding
+// answers CohortBackend's lane hooks as they are asked (the model drafter of a lane, the speculator's data and seeds,
+// whether a lane's drafter inputs are complete). Without a binding the hooks keep their defaults (copy drafts only).
+class FixedKvLaneBinding {
+public:
+    virtual ~FixedKvLaneBinding() = default;
+    [[nodiscard]] virtual spec::ChainDrafter* chain_drafter(std::uint32_t lane, std::uint32_t anchor,
+                                                            std::uint64_t position) = 0;
+    virtual void tune(spec::BlockConfig& /*config*/) const {}
+    virtual void seed(spec::BlockDrafter& /*drafter*/) const {}
+    [[nodiscard]] virtual bool ready(std::uint32_t lane) const = 0;
+};
+
 template <class Decoder>
 
 class FixedKvCohort final : public CohortBackend {
@@ -219,6 +233,22 @@ public:
         withdraw();
     }
 
+    // Lone-lane speculation: the bound engine pieces (owned here, destroyed before the decoder they may reference).
+    void bind_lanes(std::unique_ptr<FixedKvLaneBinding> binding) { lanes_binding_ = std::move(binding); }
+    [[nodiscard]] spec::ChainDrafter* lane_chain_drafter(std::uint32_t lane, std::uint32_t anchor,
+                                                         std::uint64_t position) override {
+        return lanes_binding_ ? lanes_binding_->chain_drafter(lane, anchor, position) : nullptr;
+    }
+    void tune_lane_speculation(spec::BlockConfig& config) const override {
+        if (lanes_binding_) lanes_binding_->tune(config);
+    }
+    void seed_lane_speculation(spec::BlockDrafter& drafter) const override {
+        if (lanes_binding_) lanes_binding_->seed(drafter);
+    }
+    [[nodiscard]] bool lane_speculation_ready(std::uint32_t lane) const override {
+        return lanes_binding_ ? lanes_binding_->ready(lane) : CohortBackend::lane_speculation_ready(lane);
+    }
+
     // The lane is free: its pending results (first id, score row) are withdrawn; a released row of a pending window
     // keeps its place for commit. A subsequent first prefill resets the reused slot's frontier and history.
     void release(std::uint32_t lane) override {
@@ -297,6 +327,7 @@ private:
     }
 
     std::unique_ptr<Decoder> decoder_;
+    std::unique_ptr<FixedKvLaneBinding> lanes_binding_;  // after decoder_: destroyed first
     std::uint32_t context_, rows_, lanes_;
     PrefillPolicy prefill_policy_;
     // The last verify window (lane per decode row; kNoLane = released since), readable until commit.
