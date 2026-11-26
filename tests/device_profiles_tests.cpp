@@ -210,6 +210,47 @@ void gate() {
     require(g.mem_total_bytes == 16 * GiB && g.mem_free_bytes == 15 * GiB, "apply_budget: a budget above the device changes nothing");
 }
 
+void lowbit_profile() {
+    const auto* profile = device::find_profile("strix-halo-128");
+    require(profile && profile->lowbit_rows.small_rows == 64U && profile->lowbit_rows.wide_panels == 64U,
+            "Strix Halo catalogue declares both measured switch points");
+    for (const auto& entry : device::catalogue()) {
+        if (entry.name != "strix-halo-128")
+            require(entry.lowbit_rows.small_rows == 0U && entry.lowbit_rows.wide_panels == 0U,
+                    "other profiles do not inherit Strix Halo switch points");
+    }
+    device::Visible card;
+    card.vendor = device::Vendor::amd;
+    card.arch = "gfx1151";
+    card.pci = "0000:c5:00.0";
+    card.memory_bytes = 128 * GiB;
+    card.integrated = true;
+    device::Request request;
+    request.vendor = device::Vendor::amd;
+    const auto device_entry = "[devices.main]\npci = \"0000:c5:00.0\"\nroles = [\"decode\"]\n";
+    const auto declared = device::parse_declaration(decl(std::string(device_entry) + "profile = \"strix-halo-128\"\n"));
+    const auto overridden = device::parse_declaration(decl(std::string(device_entry) + "profile = \"strix-halo-128\"\n"
+        "lowbit_rows = { small_rows = 32, wide_panels = 8 }\n"));
+    const auto implicit = device::resolve(nullptr, {card}, request).device.lowbit_rows;
+    require(implicit.small_rows == 0U && !implicit.from_profile, "implicit binding without a profile has no plan");
+    const auto inherited = device::resolve(&declared, {card}, request).device.lowbit_rows;
+    require(inherited.small_rows == 64U && inherited.wide_panels == 64U && inherited.from_profile,
+            "bound declaration inherits the selected catalogue plan");
+    const auto explicit_rows = device::resolve(&overridden, {card}, request).device.lowbit_rows;
+    require(explicit_rows.small_rows == 32U && explicit_rows.wide_panels == 8U && !explicit_rows.from_profile,
+            "entry switch points override catalogue data");
+    request.profile = "strix-halo-128";
+    require(device::resolve(nullptr, {card}, request).device.lowbit_rows.from_profile,
+            "profile selection also works on an implicit binding");
+    request.profile = "rx-9070-xt-16";
+    require(device::resolve(&declared, {card}, request).device.lowbit_rows.small_rows == 0U &&
+                device::resolve(&overridden, {card}, request).device.lowbit_rows.small_rows == 32U,
+            "profile replacement replaces the catalogue plan and keeps explicit entry switch points");
+    card.arch = "gfx1201";
+    require(device::resolve(&declared, {card}, {}).device.lowbit_rows.small_rows == 0U,
+            "emulating a profile on another architecture does not import its schedule");
+}
+
 deploy::RouteNeeds moe_route() {
     deploy::RouteNeeds n;
     n.route = "moe";
@@ -289,7 +330,7 @@ void plan() {
 
 int main() {
     for (const auto& [name, run] : {std::pair<const char*, void (*)()>{"catalogue", catalogue}, {"declaration", declaration},
-                                    {"budget", budget}, {"gate", gate}, {"plan", plan}}) {
+                                    {"budget", budget}, {"gate", gate}, {"lowbit_profile", lowbit_profile}, {"plan", plan}}) {
         try {
             run();
         } catch (const std::exception& e) {

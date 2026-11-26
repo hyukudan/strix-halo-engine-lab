@@ -201,6 +201,14 @@ Bound finish(Bound bound, const Request& request) {
         bound.device.profile = request.profile;
         bound.device.budget_bytes = 0;
     }
+    if (bound.device.lowbit_rows.small_rows == 0U && !bound.device.profile.empty()) {
+        const auto* profile = find_profile(bound.device.profile);
+        // Memory emulation may name another architecture. Schedule data belongs to the physical device.
+        if (profile && profile->lowbit_rows.small_rows != 0U && profile->arch == bound.visible.arch) {
+            bound.device.lowbit_rows = profile->lowbit_rows;
+            bound.device.lowbit_rows.from_profile = true;
+        }
+    }
     try {
         bound.budget = resolve_budget(bound.device, cpu_unit(bound.units), bound.visible.memory_bytes);
     } catch (const std::invalid_argument& e) {

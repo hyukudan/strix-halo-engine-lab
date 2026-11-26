@@ -6143,8 +6143,8 @@ two applied at the store), dispatched by `enqueue_resident_q8_rows` (`src/core/r
   flips 0. FAST: one window fails dNLL by 0.00005 (prose-13) and one is unresolved (structured-14, top-1 0.905): not a
   FAST row. TURBO limits: 39 of 39 windows pass.
 - **Measured gain:** CLI B=1, 512 steps, three interleaved rounds: 33.20 ms per step against 34.26 ms with the BF16 head
-  (-3.1 %) and 35.28 ms with the q4_g64 head. The q4_g64 gap is the route (small-M against the large tile on a device
-  without declared `lowbit_rows`), not the format. Served decode not measured: the arm is command line only.
+  (-3.1 %) and 35.28 ms with the q4_g64 head. Those timings compared small-M SP4 to q4_g64 on the large tile with no
+  bound `lowbit_rows`. Served decode not measured: the arm is command line only.
 - **Why no TURBO row yet:** the TURBO row carries q4 attention and a q4 head under a served receipt; replacing its head
   needs the combined arm gated, the SP4 arm served and a served receipt at widths 1, 8 and 16.
 - **Off switch:** leave `STRIX_INK_LOWBIT_HEAD` unset.
@@ -6389,3 +6389,28 @@ model pending a matched timing comparison.
 | MiniMax M3.1 Flash | Unbound | Unbound |
 | Nemotron 3.5 Bolt E4B | Unbound | Unbound |
 | Hy4 Flash | FAST/TURBO with a matching receipt | Explicit MTP rank option |
+<a id="gfx1151-lowbit-rows"></a>
+
+## gfx1151 resident low-bit group-scale tiles
+
+Select the `strix-halo-128` device profile on gfx1151 to use the measured `lowbit_rows = { small_rows = 64, wide_panels = 64 }`.
+The HIP gate binds the schedule and the shared projection core uses it for standalone and grouped q4_g64 / q6_g64
+FP16 group-scale launches. Rows 1–64 use small-M. Within that range, 17–32 rows use a 32-row block when the launch
+has at least 64 panels. Rows above 64 use the 128-row tile. Explicit `lowbit_rows` values in the device entry override
+the profile. Omit both sources to use the 128-row tile throughout. The FP32 sweep and the scale-folded candidate keep their
+existing arithmetic and schedule with catalogue data.
+
+- **Host identity:** The modeled 16-row and 128-row schedules match the CPU group-scale reference bit for bit for
+  both storages at M = 1, 8, 64, 65 and 128. The host tests also cover the wide-block predicate and standalone sweep cells.
+- **Status:** identity + timing PASS on gfx1151 (low-bit bench rows 1..129 equal to the host reference; Inkling 2 Mini TURBO q4 explicit arm: 16 decode logits rows and ids equal; B=1, 127 steps: 41.36 -> 27.92 ms/step, 24.2 -> 35.8 tok/s, ids equal). The device-profile option has no tier decision row.
+
+| Model | gfx1151 impact | Device evidence |
+|---|---|---|
+| inkling2-mini | HIP resident low-bit decode head and attention projections, CLI and serving | identity + timing PASS (B=1 41.36 -> 27.92 ms/step, ids equal) |
+| qwen3.8-flash-next | no resident q4_g64 / q6_g64 FP16 binding | outside ticket |
+| qwen3.8-27b | no resident q4_g64 / q6_g64 FP16 binding | outside ticket |
+| deepseek-v4.1-flash | no resident q4_g64 / q6_g64 FP16 binding | outside ticket |
+| glm-5.3-flash | no resident q4_g64 / q6_g64 FP16 binding | outside ticket |
+| minimax-m3.1-flash | no resident q4_g64 / q6_g64 FP16 binding | outside ticket |
+| hy4-flash | no resident q4_g64 / q6_g64 FP16 binding | outside ticket |
+| nemotron-3.5-bolt-e4b | no resident q4_g64 / q6_g64 FP16 binding | outside ticket |

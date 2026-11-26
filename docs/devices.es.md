@@ -41,9 +41,10 @@ Una entrada GPU puede declarar también los puntos de cambio de las rutas reside
 (q4_g64 / q6_g64) medidos en ese dispositivo: `lowbit_rows = { small_rows = 64, wide_panels = 64 }` (los valores
 medidos en un Strix Halo, gfx1151 con 40 CU, con el fixture sin modelo `strix-hip-dense-lowbit-bench`). Los
 lanzamientos de como mucho `small_rows` filas usan entonces el esquema small-M, y los lanzamientos small-M de al menos
-`wide_panels` paneles de 64 columnas procesan de 17 a 32 filas como un solo bloque de 32 filas. Todas las rutas
-calculan los mismos bits, así que la clave solo cambia la velocidad. Sin ella, todos los lanzamientos usan una sola
-ruta.
+`wide_panels` paneles de 64 columnas procesan de 17 a 32 filas como un solo bloque de 32 filas. Los dos esquemas con
+escala por grupo calculan los mismos bits. El perfil `strix-halo-128` aporta estos puntos a los lanzamientos
+q4_g64 / q6_g64 con escala por grupo en un dispositivo gfx1151. La entrada explícita `lowbit_rows` tiene prioridad.
+En ausencia de ambos, la forma con escala por grupo usa el bloque de 128 filas en todos los lanzamientos.
 
 Un **clúster de tarjetas iguales** es una entrada sin identidad:
 

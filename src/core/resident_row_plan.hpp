@@ -240,9 +240,8 @@ struct LowBitRowPlan {
     unsigned wide_panels = 0U;  // small-M launches of >= this many panels run 17..32 rows as one 32-row block (0: never)
 };
 // The plan of a device is data of that device, never a constant of this header: the optional `lowbit_rows` key of its
-// entry in the device declaration (docs/devices.md; measured on the no-model fixture tests/hip_dense_lowbit_bench.hip),
-// bound with the device by the device gate (strix/device/lowbit_rows.hpp). An unbound device, or a declaration without
-// the key, runs the empty plan.
+// entry or selected catalogue profile (docs/devices.md; measured by tests/hip_dense_lowbit_bench.hip), bound with
+// the device by the device gate (strix/device/lowbit_rows.hpp). With no bound switch points, use the empty plan.
 constexpr LowBitRoute plan_lowbit_rows(unsigned rows, const LowBitRowPlan& plan) {
     return rows <= plan.small_rows ? LowBitRoute::small_tile : LowBitRoute::tile;
 }
@@ -253,8 +252,8 @@ constexpr bool lowbit_wide_block(unsigned rows, unsigned panels, const LowBitRow
 }
 
 // The plan bound to a runtime device ordinal (the backend's own device index), or the empty plan.
-inline LowBitRowPlan bound_lowbit_row_plan(int device) noexcept {
-    const auto rows = device::bound_lowbit_rows(device);
+inline LowBitRowPlan bound_lowbit_row_plan(int device, bool allow_profile = true) noexcept {
+    const auto rows = device::bound_lowbit_rows(device, allow_profile);
     return {rows.small_rows, rows.wide_panels};
 }
 
