@@ -644,8 +644,8 @@ void test_screened_head_row() {
         }
     require(lever != nullptr && lever->name == "inkling2-mini-screened-head@1" && index == 7U &&
                 mini::kMiniProfile.table[6].name == mini::kMiniServedCliRoute &&
-                mini::kMiniProfile.table[11].name == strix::spec::kBlockDraftLever.name,
-            "screened head row identity and position (appended; the block-candidate row retains its original slot)");
+                mini::kMiniProfile.table[12].name == strix::spec::kBlockDraftLever.name,
+            "screened head row identity and position (the block-candidate row follows the image recipe)");
     require(lever->env == "STRIX_INK_SCREENED_HEAD" && lever->off == "0" && lever->builtin == "0" &&
                 lever->kind == profile::Kind::exact && lever->omit_builtin_fingerprint && lever->option.empty(),
             "screened head row is an exact lever, off by default");

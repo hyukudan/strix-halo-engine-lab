@@ -36,7 +36,7 @@ inline constexpr std::array<strix::profile::Lever, 14> profile_table{{
     // in-run prefix snapshots, a group pass) takes the exact plan instead. Set, it enters the profile fingerprint (rank
     // agreement, prefix-cache identity).
     {"decoder_replay", "STRIX_DS41_DECODER_REPLAY", "", {"", "256", "", ""}, "0", strix::profile::Kind::bit_changing,
-     {true, true, true, false}, {true, true, true, true}, "", "0",
+     {true, true, true, false}, {true, false, true, false}, "", "0",
      "FAST bounded decoder replay R=256 (ds41-replay-r256-v1, key floor round_down(T - R, 256)) on the resolved fast set; "
      "FAST gate v2 D1R on fast set + R256: qualified (8K and 32K classes, 28 windows, 1,764 rows, final PASS: KL 0.0101, "
      "top-1 0.972, dNLL +0.0001 se 0.0037, route flips 0.37 x null; 8K class KL 0.0121 top-1 0.962, 32K class KL 0.0080 "
