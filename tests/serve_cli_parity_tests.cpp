@@ -346,11 +346,12 @@ void ds41() {
     measured.row_split = false;
     measured.cone = false;
     measured.quality_head_rows = 64;
+    std::uint32_t lanes = 1;
     const auto request = [&](pd::App app, const char* rank, std::uint64_t prompt) {
         const auto startup = pd::resolve(app, {model, "--rank", rank,
             "--transport", app == pd::App::prefill ? "usb4-auto" : "usb4auto", "--profile", "turbo"},
             [](const char*) -> const char* { return nullptr; }, probe, pd::Build{true});
-        const auto result = pd::resolve_prefill_profile(*startup.profile, measured, prompt,
+        const auto result = pd::resolve_prefill_profile(*startup.profile, measured, prompt, lanes,
                                                        "gfx1151|AMD Radeon 8060S Graphics|fixture", true).value_or(*startup.profile);
         return sp::Config{{"d1_prefill", result.find("d1_prefill")->value},
                           {"decoder_replay", result.find("decoder_replay")->value},
@@ -364,6 +365,21 @@ void ds41() {
         const bool banded = prompt >= 4096U && prompt <= 32768U;
         check(cli.at("d1_prefill") == (banded ? "1" : "0") && cli.at("decoder_replay") == (banded ? "256" : "0"),
               "ds41: both ranks use D1 + R256 only inside the measured bands");
+    }
+    // The default server (eight slots, session RAM, no disk tier) sends a fresh whole text prompt to the same device
+    // admission as the CLI; the slot count is not a scope. Pieces, image rows and disk tiers keep the previous route.
+    check(pd::served_full_prompt(0U, 8128U, 8128U, false, false), "ds41: an eight-slot server enters the CLI admission");
+    check(!pd::served_full_prompt(0U, 4096U, 8128U, false, false), "ds41: a cut piece keeps the previous route");
+    check(!pd::served_full_prompt(256U, 8128U, 8128U, false, false), "ds41: a continuation keeps the previous route");
+    check(!pd::served_full_prompt(0U, 8128U, 8128U, true, false), "ds41: image rows keep the previous route");
+    check(!pd::served_full_prompt(0U, 8128U, 8128U, false, true), "ds41: a disk tier keeps the previous route");
+    // The live lane count reaches the band rows (max_lanes 1): a pass of two sequences declines on both entries.
+    lanes = 2;
+    for (const auto prompt : {8128U, 32768U}) {
+        const auto cli = request(pd::App::prefill, "0", prompt);
+        const auto server = request(pd::App::serve, "1", prompt);
+        gate("ds41+lanes2+" + std::to_string(prompt), cli, server, {});
+        check(cli.at("d1_prefill") == "0" && cli.at("decoder_replay") == "0", "ds41: two lanes leave the measured bands");
     }
 
 }

@@ -115,9 +115,19 @@ const std::string& profile_json();
 // This process's resolved profile (Effective ran first): two-rank apps check it against the peer
 // (strix::profile::check_peer) on their control channel right after the communicator exists.
 const strix::profile::Resolution& profile_resolution();
-// Fresh whole-prompt device prefill only. The adapter supplies its measured reference route and runtime device facts.
+// Fresh whole-prompt device prefill only. The adapter supplies its measured reference route, the live lane count of
+// the pass (sequences in one prefill forward) and runtime device facts; the band rows bound the lanes.
 std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::profile::Resolution& startup,
-    const PrefillOptions& options, std::uint64_t prompt_tokens, std::string_view device_product, bool measured_reference);
+    const PrefillOptions& options, std::uint64_t prompt_tokens, std::uint32_t lanes, std::string_view device_product,
+    bool measured_reference);
+// The served device prefill enters the one admission (DevicePrefill::run_full_prompt, the pair prefill CLI's entry)
+// for a fresh whole text prompt run as one piece, whatever the slot count: the band rows then decide as for the CLI.
+// A server with a disk tier (prefix cache directory, session directory) keeps the previous route: the cache namespace
+// does not record the per-request arithmetic, so another process of another tier could restore that state.
+[[nodiscard]] constexpr bool served_full_prompt(std::uint32_t at, std::uint32_t end, std::uint32_t prompt_tokens,
+    bool image_rows, bool disk_state) noexcept {
+    return at == 0U && end == prompt_tokens && !image_rows && !disk_state;
+}
 // The wire decision is made before enabling D1. Zero is a decline, including a rank unable to allocate mirrors.
 inline bool paired_d1(std::uint64_t local, std::uint64_t peer) noexcept { return local != 0 && local == peer; }
 // The code defaults adopted on 2026-10-25/26 that STRIX_DS41_BASELINE=1 switches off (variable, value).

@@ -452,7 +452,7 @@ void test_d1_request_profile() {
                 app == pd::App::prefill ? "usb4-auto" : "usb4auto", "--profile", tier};
             const auto startup = w.run(app, args);
             const auto resolve = [&](std::uint64_t prompt, const ds::PrefillOptions& o, std::string_view product = {}, bool route = true) {
-                return pd::resolve_prefill_profile(*startup.profile, o, prompt, product.empty() ? device : product, route)
+                return pd::resolve_prefill_profile(*startup.profile, o, prompt, 1U, product.empty() ? device : product, route)
                     .value_or(*startup.profile);
             };
             const auto hit = resolve(8128, measured);
@@ -501,7 +501,7 @@ void test_d1_request_profile() {
             auto off = w;
             off.env["STRIX_DS41_FAST_PREFILL"] = "0";
             const auto explicit_off = off.run(app, args);
-            const auto off_d1 = pd::resolve_prefill_profile(*explicit_off.profile, measured, 8128, device, true).value_or(*explicit_off.profile);
+            const auto off_d1 = pd::resolve_prefill_profile(*explicit_off.profile, measured, 8128, 1U, device, true).value_or(*explicit_off.profile);
             check(off_d1.find("d1_prefill")->value == "0" && off_d1.find("moe_relaxed")->value == "0",
                   "bundle OFF cannot leak standalone relaxed MoE");
         }

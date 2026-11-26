@@ -1033,8 +1033,8 @@ public:
             if (budget == 0U && !ptask_) {
                 const std::span<const std::uint32_t> piece(prompt_.data() + at_, end - at_);
                 const auto run_piece = embeds_ ? resolve_piece(piece) : piece;
-                const bool whole = at_ == 0U && end == N && !embeds_ && !sp_.cache_ &&
-                                   sp_.a_.session_ram_bytes == 0U && sp_.a_.slots == 1U;
+                const bool whole = strix::deepseek41::pair_defaults::served_full_prompt(at_, end, N, embeds_ != nullptr,
+                    !sp_.a_.prefix_dir.empty() || !sp_.a_.session_dir.empty());
                 if (whole) r_ = sp_.prefill_->run_full_prompt(run_piece);
                 else r_ = at_ == 0U ? sp_.prefill_->run(run_piece) : sp_.prefill_->extend(run_piece);
             } else {

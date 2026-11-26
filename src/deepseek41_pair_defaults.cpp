@@ -216,7 +216,8 @@ const strix::profile::Resolution& profile_resolution() {
 }
 
 std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::profile::Resolution& startup,
-    const PrefillOptions& o, std::uint64_t prompt_tokens, std::string_view device_product, bool measured_reference) {
+    const PrefillOptions& o, std::uint64_t prompt_tokens, std::uint32_t lanes, std::string_view device_product,
+    bool measured_reference) {
     namespace p = strix::profile;
     // Both measured executions bind the band receipts: the pair CLI / serve request (row split, exact cone, head1) and
     // the quality arms (no row split, no cone, head64). The execution key spells which one ran.
@@ -236,14 +237,14 @@ std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::p
         return std::nullopt;
 
     const auto execution = p::ladder_execution({"hip", device_product,
-        {prompt_tokens, o.max_positions, 1U, o.chunk_rows, o.max_rows == 0U ? o.max_positions : o.max_rows},
+        {prompt_tokens, o.max_positions, lanes, o.chunk_rows, o.max_rows == 0U ? o.max_positions : o.max_rows},
         "ds41-1017-q2,usb4-host-pair,ep,tp-attention," + std::string(o.row_split ? "row-split," : "no-row-split,") +
             (o.cone ? "cone," : "no-cone,") + "head" + std::to_string(o.quality_head_rows) +
             ",window8,attention-lanes4," + (o.moe_chunk_rows == 0U ? "moe-chunk-auto" : "moe-chunk-auto4096")});
     p::Inputs inputs;
     inputs.profile = startup.profile;
     inputs.env = [](const char*) -> const char* { return nullptr; };
-    inputs.regime = {p::Phase::prefill, prompt_tokens, 1U, "gfx1151", execution};
+    inputs.regime = {p::Phase::prefill, prompt_tokens, lanes, "gfx1151", execution};
     return p::resolve(profile_engine(), inputs);
 }
 
