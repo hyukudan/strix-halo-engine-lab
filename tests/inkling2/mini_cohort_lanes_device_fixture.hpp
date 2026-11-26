@@ -396,13 +396,8 @@ inline int served_prefill(const char* checkpoint, weight::FormatId storage, std:
     const unsigned tail = mini_prefill_tail_capacity(schedule.chunk, schedule.tail_divisor, kServedContext);
     const auto owned = served_decoder(checkpoint, kServedContext, schedule.chunk, storage, 2U, tail, true);
     auto& decoder = *owned;
-    // The served route under test: the command line's (the served route lever; a CUDA decoder declines it, and then
-    // this arm has nothing to run: the incumbent held-back route never calls the emits-first prefill).
-    if (decoder.prefill_emits_first() != kHip) throw std::logic_error("served route admission");
-    if (!decoder.prefill_emits_first()) {
-        std::cout << "SKIP served_prefill: the backend declines the served route lever\n";
-        return 0;
-    }
+    // The served route under test: the command line's (the served route lever, admitted on both backends).
+    if (!decoder.prefill_emits_first()) throw std::logic_error("served route admission");
     decoder.allocate_slots(2U);
     const bool packed_decode = kMiniPackedDecodeDefault;
     const auto capacity = decoder.prefill_tail_rows();

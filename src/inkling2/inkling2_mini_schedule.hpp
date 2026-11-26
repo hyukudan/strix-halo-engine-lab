@@ -127,15 +127,17 @@ inline MiniPrefillSchedule mini_prefill_schedule_from_env(bool hip, profile::Nam
     return schedule;
 }
 
-// Served prompt route. A HIP server with the served route lever (kMiniServedCliRoute, opt-in in every profile column)
-// serves the command line's schedule above with the first id taken from the final prefill row (emits-first; device
-// evidence: served prefill == CLI prefill bitwise, chunk and tail edges included). Without it, and on CUDA (not
-// qualified there), a server keeps the held-back route: greedy chunks, no tail, the last prompt token held back and
-// decoded as the first decode row. Its chunk is the command line's chunk (the one schedule resolver above, no tail)
-// where the backend's prefill bits do not depend on the chunk (mini_prefill_chunk_invariant), else the incumbent 128
-// rows. Only the chunk changes: the held-back token, the decode rows and the lane cap (kMiniServeLaneRows) stay.
+// Served prompt route. A server with the served route lever (kMiniServedCliRoute, opt-in in every profile column)
+// serves the command line's schedule above with the first id taken from the final prefill row (emits-first), so its
+// prompt rows run the command line's calls. Both backends admit it (device evidence, the cohort-lanes fixture's
+// served_prefill arm: served prefill == CLI prefill bitwise, first id, scores, KV, histories and the next decode steps;
+// HIP chunk and tail edges, CUDA chunk edges and pieces beside a decoding lane). Without it a server keeps the held-back
+// route: greedy chunks, no tail, the last prompt token held back and decoded as the first decode row. Its chunk is the
+// command line's chunk (the one schedule resolver above, no tail) where the backend's prefill bits do not depend on the
+// chunk (mini_prefill_chunk_invariant), else the incumbent 128 rows. Only the chunk changes: the held-back token, the
+// decode rows and the lane cap (kMiniServeLaneRows) stay.
 inline constexpr unsigned kMiniServedHeldBackChunk = 128U;
-constexpr bool mini_served_prefill_emits_first(bool hip, bool cli_route) noexcept { return hip && cli_route; }
+constexpr bool mini_served_prefill_emits_first(bool /*hip*/, bool cli_route) noexcept { return cli_route; }
 
 // Backends whose resident prefill rows carry the same bits at any chunk (every chunk form, small remainders included):
 // CUDA (complete EXACT generations equal at 2048 and 8192 rows, 2050 / 5200 / 8192 / 8195-token prompts, RTX receipt
@@ -153,7 +155,9 @@ inline MiniPrefillSchedule mini_served_prefill_schedule_from_env(bool hip, bool 
 }
 
 // Fallback rows of the served chunk: the command line's fallback rows when the held-back route took the command line's
-// chunk; 0 = no smaller candidate (an explicit --prefill-rows is never changed).
+// chunk; 0 = no smaller candidate (an explicit --prefill-rows is never changed). The served route lever keeps the
+// command line's chunk alone: a smaller one would split a prompt the command line runs as one chunk (2049 rows at a
+// 2048-row chunk: 2048 + a one-row chunk on the packed one-row route).
 constexpr unsigned mini_served_prefill_fallback_rows(bool hip, bool cli_route, profile::Name tier) noexcept {
     if (mini_served_prefill_emits_first(hip, cli_route) || !mini_prefill_chunk_invariant(hip)) return 0U;
     return mini_cli_prefill_fallback_rows(hip ? MiniPrefillBackend::hip : MiniPrefillBackend::cuda, tier);
@@ -189,19 +193,20 @@ constexpr unsigned mini_prefill_tail_capacity(unsigned chunk, unsigned divisor, 
 
 // Served prompt pieces while another lane decodes (serve::CohortConfig::prompt_slice_decoding) cut a chunk only where
 // every row keeps its route forms (`cli_route`: the ADMITTED served route lever):
-// - HIP command line's route: at multiples of the 16-position wave tile from the chunk start, every piece longer than
-//   the key-split bound (no piece takes the small-row attention policy or the one-row packed MoE body).
-// - held-back route of a chunk-invariant backend (CUDA): at multiples of kMiniCudaPieceRows from the chunk start, every
+// - a chunk-invariant backend (CUDA), either route: at multiples of kMiniCudaPieceRows from the chunk start, every
 //   piece longer than kMiniCudaPieceRows, so no piece takes the short-row dense body (rows <= cuda_core::kMaxRows = 32,
 //   plan_bf16_row_projection) or the one-row projected-bias image route (mini_cuda_bias_in_attention): every piece
 //   runs the forms of its whole chunk. Device evidence: the served_prefill fixture's held-back arms (incumbent 128-row
-//   calls == whole chunk == 2048-row calls == pieces beside a decoding lane: first id, scores, KV, histories).
+//   calls == whole chunk == 2048-row calls == pieces beside a decoding lane: first id, scores, KV, histories) and its
+//   emits-first arm (pieces == the command line's prefill()).
+// - HIP command line's route: at multiples of the 16-position wave tile from the chunk start, every piece longer than
+//   the key-split bound (no piece takes the small-row attention policy or the one-row packed MoE body).
 // - HIP held-back route: none (its 128-row chunk is already the piece).
 inline constexpr unsigned kMiniCudaPieceRows = 32U;
 constexpr serve::PromptPieceRule mini_prefill_piece_rule(bool hip, bool cli_route) {
+    if (mini_prefill_chunk_invariant(hip)) return {kMiniCudaPieceRows, kMiniCudaPieceRows};
     if (mini_served_prefill_emits_first(hip, cli_route))
         return {kMiniPrefillWaveRows, attn_core::dense::kKeySplitMaxRows};
-    if (mini_prefill_chunk_invariant(hip)) return {kMiniCudaPieceRows, kMiniCudaPieceRows};
     return {};
 }
 

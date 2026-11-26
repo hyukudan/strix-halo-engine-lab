@@ -116,10 +116,11 @@ public:
     // the enlarged chunk passes the device admission); otherwise the tail is dropped and the greedy chunks run. The
     // device chunk capacity is max_chunk_rows + the admitted tail. Only the HIP routes are qualified; CUDA keeps
     // greedy chunks.
-    // served_route (the served route lever, kMiniServedCliRoute; HIP admits it, CUDA declines): the decoder of a
-    // server that runs the command line's route. Only then tail_rows is a capacity (the largest admitted tail up to
+    // served_route (the served route lever, kMiniServedCliRoute; both backends admit it): the decoder of a server that
+    // runs the command line's route. Only then tail_rows is a capacity (the largest admitted tail up to
     // it, admitted_tail_capacity) from which each served or command-line call absorbs its actual remainder
-    // (call_tail_rows), and cohorts run packed passes (decode_slots_served). Without it every path is the incumbent one.
+    // (call_tail_rows; CUDA: none), and HIP cohorts run packed passes (decode_slots_served; a packed CUDA decoder runs
+    // packed cohort rows on either route). Without it every path is the incumbent one.
     MiniResidentDecoder(const std::string& checkpoint, unsigned max_positions, unsigned max_chunk_rows,
                         bool packed_decode = false, bool step_graphs = MiniResidentBackend::default_step_graphs,
                         weight::RoleStorage storage = {}, unsigned verify_rows = 0U,
@@ -337,7 +338,7 @@ public:
     }
 
     // Served prompt route (serve::FixedKvCohort reads it once, at its construction): emits-first (prefill_slot_first)
-    // where the decoder was built with the served route lever and the backend admits it (HIP), or while a W4A4 expert
+    // where the decoder was built with the served route lever, or while a W4A4 expert
     // class is bound (the final prompt token is then a prefill row on both entry points, so a served lane quantises
     // exactly the prompt rows of the command line); else the incumbent held-back route (prefill_slot).
     // A calibrated decode-only image (the TURBO low-bit row) takes the same form: the final prompt token is a BF16
@@ -348,7 +349,7 @@ public:
     // The decode expert form this decoder was built with (packed or grouped), for receipts and fixtures.
     [[nodiscard]] bool packed_decode() const noexcept { return backend_.packed_decode(); }
 
-    // Held-back served prefill (the CUDA served route): a lane's prompt rows by greedy chunks with no score row; the
+    // Held-back served prefill (the incumbent served route): a lane's prompt rows by greedy chunks with no score row; the
     // cohort holds back the last prompt token and decodes it as the lane's first decode row.
     void prefill_slot(unsigned slot, std::span<const unsigned> ids, bool first) {
         if (first) reset_slot(slot);
@@ -359,7 +360,7 @@ public:
         }, prefill_rows_);
     }
 
-    // Emits-first served prefill (the HIP served route): a lane's prompt rows by the same chunks and per-call tail rule
+    // Emits-first served prefill (the served route lever): a lane's prompt rows by the same chunks and per-call tail rule
     // as prefill() (the command line), the first id from the final row of the call's last chunk; its score row is
     // read_slot_logits(0) (materialized on the first read when the pick was screened). The cohort issues a whole prompt
     // as calls of whole chunks, or, beside a decoding lane, as pieces cut inside those chunks by prefill_piece_rule()
@@ -378,7 +379,7 @@ public:
     // Admitted tail capacity (serve::CohortBackend::prompt_tail_rows), the cut rule of served pieces and the first
     // chunk of one prefill call (prompt_piece_rule / prompt_call_chunk).
     [[nodiscard]] unsigned prefill_tail_rows() const noexcept { return tail_rows_; }
-    // Pieces cut on the command line's route (HIP) and on the held-back route of a chunk-invariant backend (CUDA,
+    // Pieces cut on the command line's route and on the held-back route of a chunk-invariant backend (CUDA,
     // mini_prefill_piece_rule); never while a bit-changing prefill row is bound (a W4A4 expert class, a calibrated or
     // narrow expert image): those prompts run whole calls.
     [[nodiscard]] serve::PromptPieceRule prefill_piece_rule() const noexcept {
@@ -1381,7 +1382,7 @@ private:
 #endif
     }
 
-    // The served route lever is admitted on HIP only.
+    // The served route lever is admitted on both backends (mini_served_prefill_emits_first).
     static constexpr bool admits_served_route(bool requested) noexcept {
 #if defined(__HIPCC__)
         return mini_served_prefill_emits_first(true, requested);

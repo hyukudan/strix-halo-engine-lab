@@ -100,8 +100,8 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.verify_rows = mini_speculation_verify_rows(mini_verify_rows(resolution), out.speculation);
     // The W4A4 class is admitted for the resolved backend (HIP refuses a selected class instead of running BF16).
     out.moe_w4a4 = admit_mini_moe_w4a4(resolution, resolved.backend);
-    // Backend admission of the served route lever (kMiniServedCliRoute): HIP runs the command line's route, a CUDA
-    // server declines it (requested stays in the receipt, mini_served_route_startup_field).
+    // Admission of the served route lever (kMiniServedCliRoute): a server of either backend runs the command line's
+    // route (mini_served_prefill_emits_first; the receipt carries requested / admitted, mini_served_route_startup_field).
     const bool hip = resolved.backend == "hip";
     out.served_cli_route = mini_served_prefill_emits_first(hip, out.served_route_requested);
     if (hip && (out.packed_decode_flag || out.grouped_decode_flag))

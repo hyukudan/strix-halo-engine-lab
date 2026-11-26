@@ -98,8 +98,11 @@ pieces run back to back with one decode round between them (prompt share 0,
 `STRIX_SERVE_PROMPT_SHARE` replaces it); every prompt row,
 a one-row chunk included, runs the prefill form, so the bits do not change
 with the chunk or the pieces. The served route switch `STRIX_INK_SERVED_CLI_ROUTE=1`
-(`inkling2-mini-served-cli-route@1`, off in every profile column) makes a HIP
-server run the command line's route; a CUDA server declines it. The startup
+(`inkling2-mini-served-cli-route@1`, off in every profile column) makes a
+server run the command line's route on either backend: the final prompt row is a
+prefill row and the first id comes from it, as on the command line (a CUDA
+server keeps the command line's chunk alone, the 32-row cut rule and the long
+pieces). The startup
 line reports it as `served_route off`, `declined`, or `on qualification
 unqualified` with its form, chunk and tail; the command line prints
 `strix-served-route/v1 ... effective n/a`. On that route decode is packed and

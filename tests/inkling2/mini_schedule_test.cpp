@@ -85,18 +85,23 @@ int prefill_tail_gate() {
 }
 
 // Route forms of every prompt row: 1 = one-row chunk (packed R1 MoE body with packed decode), 2 = short chunk (small-row
-// attention, at most the key-split bound), 3 = long chunk; with the row's offset in its chunk modulo the wave tile.
+// attention, at most the key-split bound), 4 = CUDA short-row dense body (at most kMiniCudaPieceRows rows), 3 = long
+// chunk; with the row's offset in its chunk modulo the wave tile.
 struct RowForm {
     unsigned kind = 0, phase = 0;
     bool operator==(const RowForm&) const = default;
 };
 constexpr bool admits_rows(unsigned rows) { return rows <= 65535U; }
-void record_call(std::vector<RowForm>& rows, std::size_t at, std::size_t call, unsigned chunk, unsigned capacity) {
+void record_call(std::vector<RowForm>& rows, std::size_t at, std::size_t call, unsigned chunk, unsigned capacity,
+                 bool hip) {
     const std::vector<unsigned> tokens(call);
     const auto tail = mini_call_tail_rows(call, chunk, capacity, admits_rows);
     strix::session::prompt_windows::append_chunks(std::span<const unsigned>(tokens), chunk,
         [&](std::span<const unsigned> part, bool) {
-            const unsigned kind = part.size() == 1U ? 1U : part.size() <= strix::attn_core::dense::kKeySplitMaxRows ? 2U : 3U;
+            const unsigned kind = part.size() == 1U                                         ? 1U
+                                  : part.size() <= strix::attn_core::dense::kKeySplitMaxRows ? 2U
+                                  : !hip && part.size() <= kMiniCudaPieceRows               ? 4U
+                                                                                            : 3U;
             for (std::size_t r = 0; r < part.size(); ++r)
                 rows.at(at + r) = {kind, static_cast<unsigned>(r % kMiniPrefillWaveRows)};
             at += part.size();
@@ -104,38 +109,38 @@ void record_call(std::vector<RowForm>& rows, std::size_t at, std::size_t call, u
 }
 // The command line: ONE prefill() call over the prompt with the decoder built for it (serial_generation_cli: chunk
 // clamped to the prompt, offered tail = the actual remainder).
-std::vector<RowForm> cli_forms(std::size_t prompt, MiniPrefillSchedule schedule) {
+std::vector<RowForm> cli_forms(std::size_t prompt, MiniPrefillSchedule schedule, bool hip) {
     std::vector<RowForm> rows(prompt);
     const auto chunk = static_cast<unsigned>(std::min<std::size_t>(schedule.chunk, prompt));
     const auto offered = strix::serve::prefill_tail_rows(static_cast<std::uint32_t>(prompt), chunk, schedule.tail_divisor);
-    record_call(rows, 0U, prompt, chunk, mini_admitted_tail_capacity(chunk, offered, admits_rows));
+    record_call(rows, 0U, prompt, chunk, mini_admitted_tail_capacity(chunk, offered, admits_rows), hip);
     return rows;
 }
-// The server: the cohort's regions (prompt_slice_rows with the decoder's tail capacity), each region one call when no
-// other lane decodes, else pieces of kMiniServeDecodingRows cut inside each of the region's chunks by the decoder's
-// piece rule (prompt_call_chunk = mini_call_first_chunk); every call runs the decoder's per-call chunk rule.
+// The server on the served route lever (emits-first, admitted on both backends): the cohort's regions
+// (prompt_slice_rows with the decoder's tail capacity), each region one call when no other lane decodes, else pieces of
+// `piece_rows` cut inside each of the region's chunks by the decoder's piece rule (prompt_call_chunk =
+// mini_call_first_chunk); every call runs the decoder's per-call chunk rule.
 std::vector<RowForm> served_forms(std::size_t prompt, MiniPrefillSchedule schedule, unsigned context, bool decoding,
-                                  bool hip) {
+                                  bool hip, std::uint64_t piece_rows) {
     std::vector<RowForm> rows(prompt);
     const auto chunk = std::min(schedule.chunk, context);
     const auto capacity = mini_admitted_tail_capacity(chunk, mini_prefill_tail_capacity(chunk, schedule.tail_divisor, context),
                                                       admits_rows);
-    // The served route lever is admitted on HIP only; this models its emits-first calls (CUDA: whole chunks here).
-    const auto rule = hip ? mini_prefill_piece_rule(true, true) : strix::serve::PromptPieceRule{};
+    const auto rule = mini_prefill_piece_rule(hip, mini_served_prefill_emits_first(hip, true));
     const auto call_tail = [&](std::uint64_t call) { return mini_call_tail_rows(call, chunk, capacity, admits_rows); };
     std::size_t at = 0;
     while (at < prompt) {
         const auto region = strix::serve::prompt_slice_rows(chunk, chunk, prompt - at, capacity);
         if (!decoding || !rule.cuttable()) {
-            record_call(rows, at, region, chunk, capacity);
+            record_call(rows, at, region, chunk, capacity, hip);
             at += region;
             continue;
         }
         const auto first = mini_call_first_chunk(region, chunk, call_tail(region));
         for (const auto part : {first, region - first}) {
             for (std::uint64_t left = part; left != 0U;) {
-                const auto piece = strix::serve::prompt_piece_rows(left, kMiniServeDecodingRows, chunk, rule);
-                record_call(rows, at, piece, chunk, capacity);
+                const auto piece = strix::serve::prompt_piece_rows(left, piece_rows, chunk, rule);
+                record_call(rows, at, piece, chunk, capacity, hip);
                 at += piece;
                 left -= piece;
             }
@@ -147,19 +152,25 @@ std::vector<RowForm> served_forms(std::size_t prompt, MiniPrefillSchedule schedu
 int served_prefill_gate() {
     const std::size_t lengths[] = {1U, 2U, 16U, 17U, 18U, 33U, 127U, 128U, 129U, 144U, 145U, 255U, 2047U, 2048U, 2049U,
                                    2064U, 2065U, 2080U, 4113U, 8191U, 8192U, 8193U, 8208U, 8209U, 8300U, 9216U, 9217U,
-                                   16384U, 16401U, 20000U};
+                                   16384U, 16401U, 20000U, 32U, 34U, 64U, 65U, 1025U, 1056U, 1057U, 8224U, 8225U,
+                                   8226U, 9249U, 10240U};
     int failed = 0;
     for (const bool hip : {true, false}) {
         for (const unsigned divisor : {mini_prefill_schedule(hip, Name::standard).tail_divisor, 0U}) {
             const MiniPrefillSchedule schedule{mini_prefill_schedule(hip, Name::standard).chunk, divisor};
             for (const auto prompt : lengths) {
-                const auto cli = cli_forms(prompt, schedule);
-                for (const bool decoding : {false, true})
-                    if (served_forms(prompt, schedule, 65536U, decoding, hip) != cli) {
-                        std::fprintf(stderr, "FAIL served prefill forms != CLI: hip=%d divisor=%u prompt=%zu decoding=%d\n",
-                                     hip ? 1 : 0, divisor, prompt, decoding ? 1 : 0);
-                        failed = 40;
-                    }
+                const auto cli = cli_forms(prompt, schedule, hip);
+                // Pieces beside a decoding lane: the short 128-row ones, and the long ones a CUDA server takes.
+                for (const std::uint64_t piece_rows : {std::uint64_t{kMiniServeDecodingRows},
+                                                       std::uint64_t{kMiniCudaServePieces.piece_rows}})
+                    for (const bool decoding : {false, true})
+                        if (served_forms(prompt, schedule, 65536U, decoding, hip, piece_rows) != cli) {
+                            std::fprintf(stderr,
+                                         "FAIL served prefill forms != CLI: hip=%d divisor=%u prompt=%zu decoding=%d "
+                                         "pieces=%llu\n", hip ? 1 : 0, divisor, prompt, decoding ? 1 : 0,
+                                         static_cast<unsigned long long>(piece_rows));
+                            failed = 40;
+                        }
             }
         }
     }
@@ -177,10 +188,19 @@ int served_prefill_gate() {
         }
     }
     // Pieces: the HIP command line's route cuts at the wave tile; the HIP held-back route never cuts (its 128-row chunk
-    // is the piece); the CUDA held-back route cuts at 32-row steps, every piece longer than the short-row dense body.
+    // is the piece); CUDA cuts at 32-row steps on either route, every piece longer than the short-row dense body.
     static_assert(mini_prefill_piece_rule(true, true).cuttable() && !mini_prefill_piece_rule(true, false).cuttable());
-    constexpr auto cuda_rule = mini_prefill_piece_rule(false, false);
+    constexpr auto cuda_rule = mini_prefill_piece_rule(false, false), cuda_lever_rule = mini_prefill_piece_rule(false, true);
     static_assert(cuda_rule.align == 32U && cuda_rule.short_rows == 32U);
+    static_assert(cuda_lever_rule.align == 32U && cuda_lever_rule.short_rows == 32U);
+    // The served route lever is admitted on both backends and takes the command line's chunk alone (no smaller
+    // candidate); the CUDA held-back route keeps its ladder.
+    static_assert(mini_served_prefill_emits_first(true, true) && mini_served_prefill_emits_first(false, true) &&
+                  !mini_served_prefill_emits_first(true, false) && !mini_served_prefill_emits_first(false, false));
+    static_assert(mini_served_prefill_fallback_rows(false, true, Name::standard) == 0U &&
+                  mini_served_prefill_fallback_rows(true, true, Name::standard) == 0U &&
+                  mini_served_prefill_fallback_rows(false, false, Name::standard) ==
+                      mini_cli_prefill_fallback_rows(MiniPrefillBackend::cuda, Name::standard));
     constexpr auto tall = mini_served_chunk_ladder(8192U, 2048U), short_context = mini_served_chunk_ladder(1024U, 2048U);
     static_assert(tall.count == 3U && tall.rows[1] == 2048U && tall.rows[2] == 128U);
     static_assert(short_context.count == 2U && short_context.rows[1] == 128U);
