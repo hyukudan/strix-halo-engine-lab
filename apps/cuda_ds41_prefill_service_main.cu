@@ -398,7 +398,7 @@ public:
             list.push(std::move(item));
         }
         Json final = Json::object(); final.set("name", Json("final"));
-        final.set("bytes", Json(std::uint64_t{position} * 4U + (4ULL << 20U)));
+        final.set("bytes", Json(std::uint64_t{position} * 4U + (std::uint64_t{4} << 20U)));
         list.push(std::move(final));
         manifest.set("sections", std::move(list));
         begun_ = true;  // even an unacknowledged begin may exist at the receiver and need aborting
