@@ -171,6 +171,7 @@ def window_stats(name, kl, agree, nll_ref, nll_cand, null_kls, hit_ref=None, hit
     w["_rows"] = {"kl": kl, "agree": agree, "dnll": d}
     if null_d is not None:
         w["_rows"]["null_dnll"] = null_d
+        w["null_dnll_mean"] = w["null_dnll"]  # receipt alias for the pooled control mean
     if null_kl_rows is not None:
         w["_rows"]["null_kl"] = null_kl_rows
     if null_top1_rows is not None:
