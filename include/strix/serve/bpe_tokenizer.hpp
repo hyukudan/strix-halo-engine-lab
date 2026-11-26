@@ -32,6 +32,9 @@ public:
     // A Hugging Face tokenizer.json with a GLM-4/5 or o200k split, byte-level BPE, no NFC and ignore_merges.
     // Added tokens become control (special) or user-defined tokens. EOS is the known model-end marker when present.
     static std::shared_ptr<const BpeTokenizer> load_hf_json(const std::string& path);
+    // Byte-level BPE with a recognized, strictly checked layout and no implicit BOS.
+    // The caller supplies the checkpoint's EOS spelling; ignore_merges comes from the asset.
+    static std::shared_ptr<const BpeTokenizer> load_hf_byte_bpe(const std::string& path, std::string_view eos);
     // A model can require a specific vocabulary and a sentinel token in addition to the BPE layout.
     struct HfIdentity {
         std::string_view pre;
@@ -47,6 +50,8 @@ public:
 
     // parse_special: control and user-defined token texts in `text` become their IDs.
     [[nodiscard]] std::vector<std::uint32_t> encode(std::string_view text, bool parse_special = true) const;
+    // Bypass added-token matching entirely, including non-special added tokens.
+    [[nodiscard]] std::vector<std::uint32_t> encode_ordinary(std::string_view text) const;
     // encode() that also appends its restart points (see EncodeMark), in increasing byte order.
     [[nodiscard]] std::vector<std::uint32_t> encode_marked(std::string_view text, bool parse_special,
                                                            std::vector<EncodeMark>& marks) const;
@@ -80,6 +85,7 @@ public:
     [[nodiscard]] static std::vector<std::string> pre_tokenize(std::string_view text, std::string_view pre);
 
 private:
+    static std::shared_ptr<const BpeTokenizer> load_hf(const std::string& path, std::string_view explicit_eos);
     BpeTokenizer();
     struct Impl;
     std::unique_ptr<Impl> impl_;

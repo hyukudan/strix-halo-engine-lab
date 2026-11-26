@@ -149,7 +149,11 @@ public:
     // ticket wakes its HTTP drain. Capture family context weakly: it owns this
     // presentation, while completed tickets may outlive the execution context.
     std::function<bool(std::span<const std::uint32_t>)> consume_tokens = {};
-    // Written before ticket completion and read only after it.
+    // Run by the HTTP drain after ticket completion and before reading the final deltas.
+    std::function<void()> finish_tokens = {};
+    // Tool delimiters are decided by the parser, even when identical bytes occur in content.
+    bool tool_frames_parsed = false;
+    // Written by the producer before ticket completion or by finish_tokens.
     AssistantOutput parsed;
     Json receipt;
 private:

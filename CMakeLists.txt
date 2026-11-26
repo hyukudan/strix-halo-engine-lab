@@ -1654,6 +1654,7 @@ add_library(strix_serve STATIC
     src/serve/chat_template_kit.cpp
     src/serve/hy4_chat.cpp
     src/serve/inkling2_chat.cpp
+    src/serve/ernie_chat.cpp
     src/serve/serial_generation_cli.cpp
     src/serve/file_key.cpp
     src/serve/http_server.cpp
@@ -2189,6 +2190,14 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-serve-deepseek-chat-tests)
     add_test(NAME strix-serve-deepseek-chat-tests COMMAND strix-serve-deepseek-chat-tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/serve/deepseek_v41_chat_cases.json)
+    add_executable(strix-serve-ernie-chat-tests tests/serve_ernie_chat_tests.cpp)
+    target_link_libraries(strix-serve-ernie-chat-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-serve-ernie-chat-tests)
+    set(STRIX_ERNIE_TOKENIZER_JSON "" CACHE FILEPATH "Optional official ERNIE tokenizer.json for host asset checks")
+    add_test(NAME strix-serve-ernie-chat-tests COMMAND strix-serve-ernie-chat-tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/serve/ernie_chat_cases.json
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/serve/ernie_synthetic_byte_bpe.json
+        ${STRIX_ERNIE_TOKENIZER_JSON})
     add_executable(strix-serve-tool-choice-none-tests tests/serve_tool_choice_none_tests.cpp)
     target_link_libraries(strix-serve-tool-choice-none-tests PRIVATE strix_serve)
     strix_target_warnings(strix-serve-tool-choice-none-tests)

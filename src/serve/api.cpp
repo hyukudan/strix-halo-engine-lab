@@ -1487,6 +1487,7 @@ struct ApiService::Impl {
             if (client_alive && !client_alive()) ticket->cancel();
             if (!done && !ticket->cancelled() && idle && !idle()) ticket->cancel();
         }
+        if (out.family && out.family->finish_tokens) out.family->finish_tokens();
         family_deltas();
         if (out.family && !stopped) family_reasoning(reasoning_filter->finish());
         if (spec && (spec->program || spec->thinking)) { if (!emit(utf8.flush())) ticket->cancel(); }
@@ -1792,7 +1793,11 @@ struct ApiService::Impl {
     AssistantOutput parsed_output(const Outcome& o, const ChatPrompt& prompt) const {
         if (o.constraint && (o.constraint->program || o.constraint->thinking)) return parsed_turn(o, prompt);
         auto parsed = parsed_turn(o, prompt);
-        if (prompt.tools_off) withhold_tool_calls(parsed, withheld_marker(prompt));
+        if (prompt.tools_off) {
+            const std::string_view marker = o.family && o.family->tool_frames_parsed
+                ? std::string_view{} : std::string_view(withheld_marker(prompt));
+            withhold_tool_calls(parsed, marker);
+        }
         return parsed;
     }
     // The marker the stream splitter holds the text from: with tool_choice "none" the family's withhold marker.
