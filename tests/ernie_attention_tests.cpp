@@ -3,6 +3,7 @@
 #include "attn_core/hybrid_reference.hpp"
 #include "attn_core/selected_latent_reference.hpp"
 #include "attn_core/sparse_index_reference.hpp"
+#include "attn_core/value_head_mix_reference.hpp"
 #include "core/hadamard_reference.hpp"
 
 #include <array>
@@ -47,9 +48,11 @@ void hca_carry() {
     s.hidden = s.head_dim = s.o_rank = 2;
     s.heads = s.q_rank = s.o_groups = s.vha_rank = 1;
     ernie::AttentionHistory history;
-    const auto read = [](std::string_view name, std::span<float> values, std::size_t) {
+    float kv_gain = 1.0F;
+    const auto read = [&](std::string_view name, std::span<float> values, std::size_t) {
         std::ranges::fill(values, 0.0F);
         if (name.ends_with("norm.weight")) std::ranges::fill(values, 1.0F);
+        if (name.ends_with("kv_layernorm.weight")) std::ranges::fill(values, kv_gain);
         if (name.ends_with("linear_o_group_proj")) values[0] = values[3] = 1.0F;
     };
     bool fail_output = false;
@@ -94,6 +97,12 @@ void hca_carry() {
         output = ernie::attention_reference(0, s, read, rest, history, project);
         near(output[0], 1.0F / 260.0F, "old raw row evicts while its group remains visible");
     }
+
+    s.contracts.checkpoint_attention = true;
+    kv_gain = 2.0F;
+    ernie::AttentionHistory weighted;
+    output = ernie::attention_reference(0, s, read, first, weighted, project);
+    near(output[0], 0.5F, "HCA preserves the learned KV gain through attention and the output gate");
 }
 
 void compressed_index() {
@@ -122,12 +131,28 @@ void compressed_index() {
     queries[33] = 1.0F;
     constexpr float weights[] = {1.0F, 10.0F}, gates[] = {1.0F, -1.0F}, fallback[] = {-2.0F, -1.0F};
     const auto at = [&](std::size_t i) { return rows.at(i); };
+    constexpr float bias[] = {4.0F, -5.0F};
+    const auto selected = index_head_weights_reference(weights, fallback, bias, 1);
+    check(selected == std::vector<float>{-2.0F, 0.0F}, "head selection uses biased score but scales by the raw gate");
+    check(weighted_index_top_k_reference(queries, selected, 32, 3, 1, at) == std::vector<std::uint32_t>{0},
+          "negative indexer weights rank the history by signed weighted ReLU scores");
+
     check(gated_index_top_k_reference(queries, weights, gates, 32, 3, 2, at) == std::vector<std::uint32_t>{0, 2},
           "index gate suppresses second head and lower position wins tie");
     check(gated_index_top_k_reference(queries, weights, fallback, 32, 3, 1, at) == std::vector<std::uint32_t>{1},
           "index retains strongest head when all gate logits are negative");
     check(gated_index_top_k_reference(queries, weights, gates, 32, 2, 1, at) == std::vector<std::uint32_t>{0},
           "future high-scoring key lies outside the causal prefix");
+}
+
+void folded_value_mix() {
+    constexpr std::array input_factor{1.0F, 2.0F};
+    constexpr std::array output_factor{-0.5F, 0.25F};
+    const auto folded = fold_value_head_mix_reference(2, 1, output_factor, input_factor, true);
+    check(folded == std::vector<float>{0.5F, -1.0F, 0.25F, 1.5F}, "folded VHA is I plus V times transposed U");
+    std::array values{2.0F, 4.0F, 6.0F, 8.0F};
+    apply_folded_value_head_mix_reference(values, 2, folded);
+    check(values == std::array{-5.0F, -6.0F, 9.5F, 13.0F}, "folded VHA mixes across heads only");
 }
 
 void latent_attention() {
@@ -177,12 +202,14 @@ void mla_history() {
     const auto read = [](std::string_view name, std::span<float> values, std::size_t) {
         std::ranges::fill(values, 0.0F);
         if (name.ends_with("layernorm.weight")) std::ranges::fill(values, 1.0F);
-        if (name.ends_with("kv_b_proj.weight")) values[nope_dim * lora_rank] = 1.0F;
+        if (name.ends_with("kv_b_proj.weight")) values[0] = values[nope_dim * lora_rank] = 1.0F;
     };
-    const auto project = [](const std::string& name, std::span<const float> input, std::span<float> output, unsigned) {
+    float query_value = 0.0F;
+    const auto project = [&](const std::string& name, std::span<const float> input, std::span<float> output, unsigned) {
         std::ranges::fill(output, 0.0F);
         if (name.ends_with("kv_a_proj_with_mqa.weight") || name.ends_with(".o_proj.weight"))
             output[0] = input.front();
+        if (name.ends_with("q_b_proj.weight")) output[0] = query_value;
     };
     constexpr float first[] = {1.0F, 0.0F}, second[] = {0.0F, 0.0F};
     // Unit impulse normalized across 512 channels rounds to 22.625 in BF16.
@@ -190,6 +217,15 @@ void mla_history() {
     near(output[0], 22.625F / 4.0F, "MLA first row, value projection, sink and output gate");
     output = ernie::attention_reference(7, s, read, second, history, project);
     near(output[0], 22.625F / 6.0F, "MLA retains the previous latent in the causal prefix");
+
+    // At position zero with one key, log(3) versus a zero sink puts three
+    // quarters of the weight on the key. Per-head RMS would change that score.
+    s.contracts.checkpoint_attention = true;
+    query_value = std::log(3.0F) * 16.0F / 22.625F;
+    ernie::AttentionHistory projected;
+    output = ernie::attention_reference(7, s, read, first, projected, project);
+    check(std::fabs(output[0] - 22.625F * 3.0F / 8.0F) <= 0.0625F,
+          "MLA preserves the projected query and key magnitudes in the sink score");
 }
 
 } // namespace
@@ -199,6 +235,7 @@ int main() {
         pool_and_merge();
         hca_carry();
         compressed_index();
+        folded_value_mix();
         latent_attention();
         mla_history();
     } catch (const std::exception& error) {

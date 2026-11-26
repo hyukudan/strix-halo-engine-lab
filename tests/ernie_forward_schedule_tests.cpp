@@ -158,6 +158,19 @@ int main() try {
     check(std::ranges::equal(together, serial, [](float a, float b) {
         return std::bit_cast<std::uint32_t>(a) == std::bit_cast<std::uint32_t>(b);
     }), "layer-major and token-major sequences differ");
+    const auto bounded_read = [&](auto name, auto out, auto offset) {
+        check(name.find(".compressor.") == name.npos && name.find(".indexer.") == name.npos,
+              "bounded attention read an unreachable branch");
+        fixture(name, out, offset);
+    };
+    ernie::CpuReference bounded(shape, bounded_read, soft, {}, {}, {}, std::size(prompt));
+    (void)bounded.append(std::span(prompt).first(1));
+    check(bounded.append(std::span(prompt).last(1)) == serial, "bounded causal append changed logits");
+    rejected = false;
+    try {
+        (void)bounded.append(std::span(prompt).last(1));
+    } catch (const std::invalid_argument&) { rejected = true; }
+    check(rejected, "bounded attention accepted an unreachable position");
     return 0;
 } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';

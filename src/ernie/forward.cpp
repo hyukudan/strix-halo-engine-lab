@@ -38,10 +38,12 @@ ReferenceActivation candidate_activation(CandidateActivation activation) {
 
 CpuReference::CpuReference(ReferenceShape shape, ReferenceRead read, ReferenceActivation activation,
                            ReferenceProject project, ExpertObserver expert_observer,
-                           AttentionHeadExecutor execute_heads)
+                           AttentionHeadExecutor execute_heads, std::size_t max_rows)
     : shape_(shape), read_(std::move(read)), project_(std::move(project)),
       execute_heads_(std::move(execute_heads)),
-      block_(shape_, read_, activation, project_, std::move(expert_observer)) {}
+      block_(shape_, read_, activation, project_, std::move(expert_observer)), max_rows_(max_rows) {
+    history_.fill(AttentionHistory(max_rows));
+}
 
 NextTokenScore score_next_token(std::span<const float> logits, std::uint32_t target) {
     if (target >= logits.size()) throw std::out_of_range("ERNIE: target outside vocabulary");
@@ -64,10 +66,10 @@ ReferenceRows CpuReference::embed_rows(std::span<const std::uint32_t> tokens) co
 }
 
 void CpuReference::run_layer(ReferenceRows& rows, unsigned layer, AttentionHistory& history,
-                             std::size_t position, const LayerObserver& observe) const {
+                             std::size_t position, const LayerObserver& observe, bool index_prefill) const {
     for (std::size_t row = 0; row < rows.size(); ++row) {
         auto result = block_.block(layer, rows[row], [&](auto input) {
-            return attention_reference(layer, shape_, read_, input, history, project_, execute_heads_);
+            return attention_reference(layer, shape_, read_, input, history, project_, execute_heads_, index_prefill);
         });
         if (observe) observe(position + row, layer, result);
         rows[row] = std::move(result.streams);
@@ -84,8 +86,8 @@ ReferenceRows CpuReference::prefill(ReferenceRows rows, unsigned first_layer, un
         throw std::invalid_argument("ERNIE: invalid prefill boundary");
     if (boundary) boundary(first_layer, rows);
     for (auto layer = first_layer; layer < end_layer; ++layer) {
-        AttentionHistory history;
-        run_layer(rows, layer, history, 0, {});
+        AttentionHistory history(rows.size());
+        run_layer(rows, layer, history, 0, {}, true);
         if (boundary) boundary(layer + 1, rows);
     }
     return rows;
@@ -97,14 +99,14 @@ std::vector<float> CpuReference::head_input(std::span<const float> row) const {
 
 std::vector<float> CpuReference::append(std::span<const std::uint32_t> tokens, const LayerObserver& observe) {
     if (failed_) throw std::logic_error("ERNIE: discard the sequence after a failed forward");
-    if (tokens.empty() || tokens.size() > static_cast<std::size_t>(data::dims::max_context) - position_)
+    if (tokens.empty() || tokens.size() > max_rows_ - position_)
         throw std::invalid_argument("ERNIE: invalid token count for the sequence");
     if (std::ranges::any_of(tokens, [&](auto id) { return id >= shape_.vocab; }))
         throw std::out_of_range("ERNIE: token outside reference vocabulary");
     try {
         auto rows = embed_rows(tokens);
         for (unsigned layer = 0; layer < kLayerCount; ++layer)
-            run_layer(rows, layer, history_[layer], position_, observe);
+            run_layer(rows, layer, history_[layer], position_, observe, position_ == 0 || tokens.size() > 1);
         auto logits = block_.raw_logits(rows.back());
         position_ += tokens.size();
         return logits;

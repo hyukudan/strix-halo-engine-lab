@@ -42,6 +42,16 @@ struct RotaryRow {
     void apply(std::span<float> rows, unsigned width, bool inverse = false) const {
         attn::hybrid_rope_tail(rows, width, c, s, inverse);
     }
+    void apply_index(std::span<float> rows, bool leading) const {
+        if (!leading) {
+            apply(rows, kIndexDim);
+            return;
+        }
+        const auto dim = static_cast<unsigned>(2U * c.size());
+        if (dim == 0) return;
+        for (std::size_t offset = 0; offset < rows.size(); offset += kIndexDim)
+            apply(rows.subspan(offset, dim), dim);
+    }
 };
 
 struct LayerWeights {
@@ -61,19 +71,30 @@ struct LayerWeights {
     }
 };
 
-void postmix(const LayerWeights& w, const ReferenceShape& s, std::span<float> heads) {
+void postmix(const LayerWeights& w, const ReferenceShape& s, std::span<float> heads, std::vector<float>& folded) {
     if (s.contracts.vha == VhaContract::off) return;
+    if (!folded.empty()) {
+        attn_core::apply_folded_value_head_mix_reference(heads, s.heads, folded);
+        return;
+    }
     const auto count = std::size_t{s.heads} * s.vha_rank;
     auto u = w.tensor("vha_postmix_U", count), v = w.tensor("vha_postmix_V", count);
     if (s.contracts.vha == VhaContract::swapped) std::swap(u, v);
-    attn_core::residual_value_head_mix(heads, s.heads, s.vha_rank,
-        u, v, s.contracts.vha != VhaContract::non_residual);
+    const auto residual = s.contracts.vha != VhaContract::non_residual;
+    if (s.contracts.checkpoint_attention) {
+        folded = attn_core::fold_value_head_mix_reference(s.heads, s.vha_rank, u, v, residual);
+        attn_core::apply_folded_value_head_mix_reference(heads, s.heads, folded);
+    } else {
+        attn_core::residual_value_head_mix(heads, s.heads, s.vha_rank, u, v, residual);
+    }
 }
 
-void gate_values(const LayerWeights& w, std::span<const float> query_lora, std::span<float> values) {
+void gate_values(const LayerWeights& w, std::span<const float> query_lora, std::span<float> values,
+                 bool checkpoint_attention) {
     std::vector<float> gate(values.size());
     w.linear("gate_proj.weight", query_lora, gate);
-    core::sigmoid_product_reference(values, gate, values, core::SigmoidGatePrecision::f32);
+    core::sigmoid_product_reference(values, gate, values, checkpoint_attention
+        ? core::SigmoidGatePrecision::bf16_sigmoid : core::SigmoidGatePrecision::f32);
 }
 
 template<class T>
@@ -84,13 +105,15 @@ void reserve_append(std::vector<T>& values, std::size_t elements) {
 }
 
 std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
-    std::span<const float> input, unsigned position, auto& state, bool record_history) {
+    std::span<const float> input, unsigned position, auto& state, bool record_history, bool keep_compressor) {
     const auto width = s.head_dim;
     const auto ring_size = std::size_t{kWindow} * width;
     const auto carry_size = std::size_t{kCompression - 1U} * width;
     const auto eps = s.contracts.rms_epsilon > 0 ? s.contracts.rms_epsilon : kEpsilon;
-    const bool separate_values = s.contracts.key_norm == KeyNormContract::value_before_head_norm;
-    if (position != 0 && (state.window.size() != ring_size || state.carry_values.size() != carry_size))
+    const bool checkpoint = s.contracts.checkpoint_attention;
+    const bool separate_values = !checkpoint && s.contracts.key_norm == KeyNormContract::value_before_head_norm;
+    if (position != 0 && (state.window.size() != ring_size ||
+        (keep_compressor && state.carry_values.size() != carry_size)))
         throw std::invalid_argument("ERNIE HCA: history geometry changed");
 
     std::vector<float> q_lora(s.q_rank), query(std::size_t{s.heads} * width), kv(width);
@@ -100,20 +123,23 @@ std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
     w.linear("linear_kv_proj.weight", input, kv);
     core::rms_norm_bf16_reference(kv, w.tensor("kv_layernorm.weight", kv.size()), eps);
     auto local_value = separate_values ? kv : std::vector<float>{};
-    if (s.contracts.key_norm != KeyNormContract::none) attn::head_rms_reference(query, width, eps);
-    if (s.contracts.key_norm != KeyNormContract::weighted_only && s.contracts.key_norm != KeyNormContract::none)
+    if (checkpoint || s.contracts.key_norm != KeyNormContract::none) attn::head_rms_reference(query, width, eps);
+    if (!checkpoint && s.contracts.key_norm != KeyNormContract::weighted_only &&
+        s.contracts.key_norm != KeyNormContract::none)
         attn::head_rms_reference(kv, width, eps);
 
     constexpr std::string_view compressor = "core_attention.compressor.";
-    std::vector<float> carry_value(width), carry_logit(width), pooled;
-    if (record_history) {
+    std::vector<float> carry_value, carry_logit, pooled;
+    if (keep_compressor) {
+        carry_value.resize(width);
+        carry_logit.resize(width);
         w.linear(std::string(compressor) + "linear_wkv.weight", input, carry_value);
         w.linear(std::string(compressor) + "linear_wgate.weight", input, carry_logit);
     }
     const auto carry_row = position % kCompression;
-    const RotaryRow window_rope(s.rope_dim, position, false, s.contracts),
+    const RotaryRow window_rope(s.rope_dim, position, checkpoint, s.contracts),
                     compressed_rope(s.rope_dim, position, true, s.contracts);
-    if (carry_row == kCompression - 1U) {
+    if (keep_compressor && carry_row == kCompression - 1U) {
         pooled.resize(width);
         attn_core::projected_ape_pool_reference<kCompression>(state.carry_values, state.carry_logits,
             carry_value, carry_logit, w.tensor(std::string(compressor) + "ape", std::size_t{kCompression} * width),
@@ -127,6 +153,12 @@ std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
     window_rope.apply(kv, width);
     if (separate_values) window_rope.apply(local_value, width);
     compressed_rope.apply(compressed_query, width);
+    if (checkpoint) {
+        core::round_bf16_reference(query);
+        core::round_bf16_reference(kv);
+        core::round_bf16_reference(compressed_query);
+        core::round_bf16_reference(pooled);
+    }
     const auto window_start = attn_core::mask::window_lo(position, kWindow);
     const auto window_at = [&](std::size_t row) -> std::span<const float> {
         const auto token = window_start + row;
@@ -148,8 +180,10 @@ std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
     };
     std::vector<float> compressed_values = state.compressed;
     compressed_values.insert(compressed_values.end(), pooled.begin(), pooled.end());
-    compressed_rope.apply(compressed_values, width, true);
-    window_rope.apply(compressed_values, width);
+    if (!checkpoint) {
+        compressed_rope.apply(compressed_values, width, true);
+        window_rope.apply(compressed_values, width);
+    }
     const auto pooled_value = [&](std::size_t row) {
         return std::span<const float>(compressed_values).subspan(row * width, width);
     };
@@ -163,12 +197,17 @@ std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
         attn_core::causal_gqa_reference({s.heads, 1, width}, {0, query, kv, window_value(0), 0, {}, sinks},
                                        {keys, values}, heads);
     }
-    if (!s.contracts.no_hca_inverse_rope) window_rope.apply(heads, width, true);
-    postmix(w, s, heads);
+    if (checkpoint) core::round_bf16_reference(heads);
+    else if (!s.contracts.no_hca_inverse_rope) window_rope.apply(heads, width, true);
+    postmix(w, s, heads, state.folded_mix);
+    if (checkpoint) {
+        window_rope.apply(heads, width, true);
+        core::round_bf16_reference(heads);
+    }
     std::vector<float> grouped(std::size_t{s.o_groups} * s.o_rank);
     w.linear("linear_o_group_proj", heads, grouped, s.o_groups);
     std::vector<float> output(s.hidden);
-    gate_values(w, q_lora, grouped);
+    gate_values(w, q_lora, grouped, checkpoint);
     w.linear("o_proj.weight", grouped, output);
     if (!record_history) return output;
 
@@ -176,22 +215,24 @@ std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
     // projection leaves the visible prefix intact.
     if (position == 0) {
         state.window.reserve(ring_size);
-        state.carry_values.reserve(carry_size);
-        state.carry_logits.reserve(carry_size);
         state.window.resize(ring_size);
         if (separate_values) state.window_values.resize(ring_size);
-        state.carry_values.resize(carry_size);
-        state.carry_logits.resize(carry_size);
+        if (keep_compressor) {
+            state.carry_values.resize(carry_size);
+            state.carry_logits.resize(carry_size);
+        }
     }
     reserve_append(state.compressed, pooled.size());
     std::ranges::copy(kv, std::span(state.window).subspan(std::size_t{position % kWindow} * width, width).begin());
     if (separate_values)
         std::ranges::copy(local_value, std::span(state.window_values).subspan(std::size_t{position % kWindow} * width, width).begin());
-    if (pooled.empty()) {
-        std::ranges::copy(carry_value, std::span(state.carry_values).subspan(std::size_t{carry_row} * width, width).begin());
-        std::ranges::copy(carry_logit, std::span(state.carry_logits).subspan(std::size_t{carry_row} * width, width).begin());
-    } else {
-        state.compressed.insert(state.compressed.end(), pooled.begin(), pooled.end());
+    if (keep_compressor) {
+        if (pooled.empty()) {
+            std::ranges::copy(carry_value, std::span(state.carry_values).subspan(std::size_t{carry_row} * width, width).begin());
+            std::ranges::copy(carry_logit, std::span(state.carry_logits).subspan(std::size_t{carry_row} * width, width).begin());
+        } else {
+            state.compressed.insert(state.compressed.end(), pooled.begin(), pooled.end());
+        }
     }
     return output;
 }
@@ -208,32 +249,58 @@ void index_key_norm(std::span<float> key, std::span<const float> weight, std::sp
 
 std::vector<std::uint32_t> select_mla_rows(const LayerWeights& w, const RotaryRow& rope,
     std::span<const float> input, std::span<const float> q_lora, unsigned position,
-    std::span<const std::uint8_t> index_history, std::span<const std::uint8_t> current_key) {
+    std::span<const std::uint8_t> index_history, std::span<const std::uint8_t> current_key,
+    bool checkpoint, bool prefill) {
     const std::size_t visible = std::size_t{position} + 1U;
-    if (visible <= kTopK) {
+    const auto candidates = checkpoint ? visible - std::min<std::size_t>(visible, kWindow) : visible;
+    if (candidates <= kTopK) {
         std::vector<std::uint32_t> dense(visible);
         std::iota(dense.begin(), dense.end(), 0U);
         return dense;
     }
     constexpr std::string_view prefix = "core_attention.indexer.";
-    std::vector<float> query(std::size_t{kIndexHeads} * kIndexDim), weights(kIndexHeads), gate(kIndexHeads);
+    std::vector<float> query(std::size_t{kIndexHeads} * kIndexDim), weights(kIndexHeads);
     w.linear(std::string(prefix) + "wq_b.weight", q_lora, query);
-    rope.apply(query, kIndexDim);
-    for (std::size_t h = 0; h < kIndexHeads; ++h)
-        core::hadamard_reference(std::span(query).subspan(h * kIndexDim, kIndexDim));
+    rope.apply_index(query, checkpoint);
+    for (std::size_t h = 0; h < kIndexHeads; ++h) {
+        auto row = std::span(query).subspan(h * kIndexDim, kIndexDim);
+        if (checkpoint) core::round_bf16_reference(row);
+        core::hadamard_reference(row);
+        if (checkpoint) {
+            core::round_bf16_reference(row);
+            const auto packed = attn_core::pack_index_fp4_reference(row);
+            attn_core::unpack_index_fp4_reference(packed, row);
+        }
+    }
 
     w.linear(std::string(prefix) + "weights_proj.weight", input, weights);
-    w.linear(std::string(prefix) + "linear_gate.weight", input, gate);
-    const auto bias = w.tensor(std::string(prefix) + "flashindexer_bias", kIndexHeads);
-    for (std::size_t h = 0; h < kIndexHeads; ++h) gate[h] += bias[h];
     const auto key_at = [&](std::size_t row) {
         return row == position ? current_key : index_history.subspan(row * kPackedIndex, kPackedIndex);
     };
+    if (checkpoint) {
+        const float scale = 1.0F / std::sqrt(static_cast<float>(kIndexDim * kIndexHeads));
+        for (auto& weight : weights) weight *= scale;
+        if (prefill) {
+            const auto gate = w.tensor(std::string(prefix) + "linear_gate.weight", input.size() * kIndexHeads);
+            std::vector<float> logits(kIndexHeads);
+            core::linear_reference(gate, input, logits);
+            const auto bias = w.tensor(std::string(prefix) + "flashindexer_bias", kIndexHeads);
+            weights = attn_core::index_head_weights_reference(weights, logits, bias, 8);
+        }
+        auto selected = attn_core::weighted_index_top_k_reference(query, weights, kIndexDim, candidates, kTopK, key_at);
+        for (auto row = candidates; row < visible; ++row) selected.push_back(static_cast<std::uint32_t>(row));
+        return selected;
+    }
+    std::vector<float> gate(kIndexHeads);
+    w.linear(std::string(prefix) + "linear_gate.weight", input, gate);
+    const auto bias = w.tensor(std::string(prefix) + "flashindexer_bias", kIndexHeads);
+    for (std::size_t h = 0; h < kIndexHeads; ++h) gate[h] += bias[h];
     return attn_core::gated_index_top_k_reference(query, weights, gate, kIndexDim, visible, kTopK, key_at);
 }
 
 std::vector<float> mla_reference(const LayerWeights& w, const ReferenceShape& s,
-    std::span<const float> input, unsigned position, auto& state, const AttentionHeadExecutor& execute) {
+    std::span<const float> input, unsigned position, auto& state, const AttentionHeadExecutor& execute,
+    bool keep_index, bool index_prefill) {
     const attn_core::SelectedLatentShape shape{s.heads, narrow<unsigned>(a::mla::kv_lora_rank),
         narrow<unsigned>(a::mla::qk_nope_head_dim), narrow<unsigned>(a::mla::qk_rope_head_dim),
         narrow<unsigned>(a::mla::v_head_dim)};
@@ -245,31 +312,43 @@ std::vector<float> mla_reference(const LayerWeights& w, const ReferenceShape& s,
     const auto latent = std::span(combined).first(shape.latent);
     const auto rotary_key = std::span(combined).last(shape.rotary);
     const auto eps = s.contracts.rms_epsilon > 0 ? s.contracts.rms_epsilon : kEpsilon;
+    const bool checkpoint = s.contracts.checkpoint_attention;
     w.linear("q_a_proj.weight", input, q_lora);
     core::rms_norm_bf16_reference(q_lora, w.tensor("q_a_layernorm.weight", q_lora.size()), eps);
     w.linear("q_b_proj.weight", q_lora, query);
-    if (s.contracts.key_norm != KeyNormContract::none) attn::head_rms_reference(query, shape.qk(), eps);
+    if (!checkpoint && s.contracts.key_norm != KeyNormContract::none)
+        attn::head_rms_reference(query, shape.qk(), eps);
     w.linear("kv_a_proj_with_mqa.weight", input, combined);
     core::rms_norm_bf16_reference(latent, w.tensor("kv_a_layernorm.weight", latent.size()), eps);
 
     const auto kv_b = w.tensor("kv_b_proj.weight",
         std::size_t{shape.heads} * (shape.nope + shape.value) * shape.latent);
     const auto projections = attn_core::split_latent_projection(shape, kv_b, s.contracts.global_kv_split);
-    if (s.contracts.key_norm == KeyNormContract::weighted_only || s.contracts.key_norm == KeyNormContract::none)
+    if (checkpoint || s.contracts.key_norm == KeyNormContract::weighted_only || s.contracts.key_norm == KeyNormContract::none)
         std::ranges::fill(inverse, 1.0F);
     else attn_core::latent_key_inverse_rms_reference(shape, projections, latent, rotary_key, eps, inverse, execute);
     const RotaryRow rotary(shape.rotary, position, false, s.contracts);
     rotary.apply(query, shape.qk());
     rotary.apply(rotary_key, shape.rotary);
+    if (checkpoint) {
+        core::round_bf16_reference(query);
+        core::round_bf16_reference(rotary_key);
+    }
 
-    std::vector<float> index_key(kIndexDim);
-    w.linear("core_attention.indexer.wk.weight", input, index_key);
-    index_key_norm(index_key, w.tensor("core_attention.indexer.k_norm.weight", kIndexDim),
-                              w.tensor("core_attention.indexer.k_norm.bias", kIndexDim));
-    rotary.apply(index_key, kIndexDim);
-    core::hadamard_reference(index_key);
-    const auto index_entry = attn_core::pack_index_fp4_reference(index_key);
-    const auto selected = select_mla_rows(w, rotary, input, q_lora, position, state.index_keys, index_entry);
+    std::vector<std::uint8_t> index_entry;
+    if (keep_index) {
+        std::vector<float> index_key(kIndexDim);
+        w.linear("core_attention.indexer.wk.weight", input, index_key);
+        index_key_norm(index_key, w.tensor("core_attention.indexer.k_norm.weight", kIndexDim),
+                                  w.tensor("core_attention.indexer.k_norm.bias", kIndexDim));
+        rotary.apply_index(index_key, checkpoint);
+        if (checkpoint) core::round_bf16_reference(index_key);
+        core::hadamard_reference(index_key);
+        if (checkpoint) core::round_bf16_reference(index_key);
+        index_entry = attn_core::pack_index_fp4_reference(index_key);
+    }
+    const auto selected = select_mla_rows(w, rotary, input, q_lora, position, state.index_keys, index_entry,
+                                          checkpoint, index_prefill);
     const auto row_at = [&](std::size_t row) -> attn_core::SelectedLatentRow {
         if (row == position) return {latent, rotary_key, inverse};
         return {std::span(state.latents).subspan(row * shape.latent, shape.latent),
@@ -278,9 +357,11 @@ std::vector<float> mla_reference(const LayerWeights& w, const ReferenceShape& s,
     };
     attn_core::selected_latent_attention_reference(shape, projections, query,
         w.tensor("core_attention.softmax_offset", shape.heads), selected, row_at, output_heads, execute);
-    if (s.contracts.gate_before_vha) gate_values(w, q_lora, output_heads);
-    postmix(w, s, output_heads);
-    if (!s.contracts.gate_before_vha) gate_values(w, q_lora, output_heads);
+    if (checkpoint) core::round_bf16_reference(output_heads);
+    if (s.contracts.gate_before_vha) gate_values(w, q_lora, output_heads, checkpoint);
+    postmix(w, s, output_heads, state.folded_mix);
+    if (checkpoint) core::round_bf16_reference(output_heads);
+    if (!s.contracts.gate_before_vha) gate_values(w, q_lora, output_heads, checkpoint);
     std::vector<float> output(s.hidden);
     w.linear("o_proj.weight", output_heads, output);
 
@@ -297,18 +378,27 @@ std::vector<float> mla_reference(const LayerWeights& w, const ReferenceShape& s,
 
 } // namespace
 
+AttentionHistory::AttentionHistory(std::size_t max_rows) : max_rows_(max_rows) {
+    if (max_rows_ == 0 || max_rows_ > data::dims::max_context)
+        throw std::invalid_argument("ERNIE attention: invalid sequence bound");
+}
+
 std::vector<float> attention_reference(unsigned layer, const ReferenceShape& shape, const ReferenceRead& read,
     std::span<const float> input, AttentionHistory& history, const AttentionProject& project,
-    const AttentionHeadExecutor& execute_heads) {
-    if (layer >= kLayerCount || history.position_ >= data::dims::max_context ||
+    const AttentionHeadExecutor& execute_heads, bool index_prefill) {
+    if (layer >= kLayerCount || history.position_ >= history.max_rows_ ||
         (history.position_ != 0 && history.layer_ != layer) || !read || shape.hidden != input.size() ||
         shape.hidden == 0 || shape.q_rank == 0 || shape.heads == 0 || shape.head_dim == 0 ||
         shape.o_groups == 0 || shape.o_rank == 0 || shape.heads % shape.o_groups != 0 ||
         shape.vha_rank == 0 || shape.rope_dim > shape.head_dim || shape.rope_dim % 2U != 0)
         throw std::invalid_argument("ERNIE attention: incompatible row, layer or history");
     const LayerWeights weights{read, project, target_layer_prefix(layer) + "self_attn."};
-    auto result = layer_is_mla(layer) ? mla_reference(weights, shape, input, history.position_, history.mla_, execute_heads)
-                                    : hca_reference(weights, shape, input, history.position_, history.hca_, true);
+    // A bounded sequence needs no state for an attention branch it can never reach.
+    const auto indexed_prefix_limit = kTopK + (shape.contracts.checkpoint_attention ? kWindow : 0U);
+    auto result = layer_is_mla(layer)
+        ? mla_reference(weights, shape, input, history.position_, history.mla_, execute_heads,
+                        history.max_rows_ > indexed_prefix_limit, index_prefill)
+        : hca_reference(weights, shape, input, history.position_, history.hca_, true, history.max_rows_ >= kCompression);
     history.layer_ = layer;
     ++history.position_;
     return result;
@@ -317,7 +407,7 @@ std::vector<float> attention_reference(unsigned layer, const ReferenceShape& sha
 std::vector<float> attention_reference_first_hca(const std::string& prefix, const ReferenceShape& shape,
     const ReferenceRead& read, std::span<const float> input, const AttentionProject& project) {
     AttentionHistory state;
-    return hca_reference({read, project, prefix}, shape, input, 0, state.hca_, false);
+    return hca_reference({read, project, prefix}, shape, input, 0, state.hca_, false, false);
 }
 
 } // namespace strix::ernie

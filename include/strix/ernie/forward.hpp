@@ -25,7 +25,7 @@ class CpuReference {
 public:
     CpuReference(ReferenceShape shape, ReferenceRead read, ReferenceActivation activation,
                  ReferenceProject project = {}, ExpertObserver expert_observer = {},
-                 AttentionHeadExecutor execute_heads = {});
+                 AttentionHeadExecutor execute_heads = {}, std::size_t max_rows = data::dims::max_context);
 
     // Append a suffix using one layer at a time. Only the last row uses the
     // vocabulary head. A failed forward invalidates this sequence.
@@ -39,13 +39,14 @@ public:
     [[nodiscard]] std::vector<float> head_input(std::span<const float> row) const;
 private:
     void run_layer(ReferenceRows& rows, unsigned layer, AttentionHistory& history,
-                   std::size_t position, const LayerObserver& observe) const;
+                   std::size_t position, const LayerObserver& observe, bool index_prefill) const;
     ReferenceShape shape_;
     ReferenceRead read_;
     ReferenceProject project_;
     AttentionHeadExecutor execute_heads_;
     FirstRowReference block_;
     std::array<AttentionHistory, kLayerCount> history_;
+    std::size_t max_rows_;
     std::size_t position_ = 0;
     bool failed_ = false;
 };

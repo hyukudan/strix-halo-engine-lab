@@ -16,17 +16,19 @@ inline void round_bf16_reference(std::span<float> row) {
 
 // Pointwise sigmoid gate after an upstream projection. The BF16 policy
 // models the operand and result stores of the gated output epilogue.
-enum class SigmoidGatePrecision { f32, bf16 };
+enum class SigmoidGatePrecision { f32, bf16, bf16_sigmoid };
 
 inline void sigmoid_product_reference(std::span<const float> values, std::span<const float> logits,
                                       std::span<float> out, SigmoidGatePrecision precision) {
     if (values.size() != logits.size() || values.size() != out.size())
         throw std::invalid_argument("sigmoid product: row shapes differ");
     const auto round = [precision](float value) {
-        return precision == SigmoidGatePrecision::bf16 ? attn::group_indexer::bf16_round(value) : value;
+        return precision != SigmoidGatePrecision::f32 ? attn::group_indexer::bf16_round(value) : value;
     };
-    for (std::size_t i = 0; i < out.size(); ++i)
-        out[i] = round(round(values[i]) * (1.0F / (1.0F + std::exp(-round(logits[i])))));
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        const float sigmoid = 1.0F / (1.0F + std::exp(-round(logits[i])));
+        out[i] = round(round(values[i]) * (precision == SigmoidGatePrecision::bf16_sigmoid ? round(sigmoid) : sigmoid));
+    }
 }
 
 inline void softmax_bf16_reference(std::span<float> row) {
@@ -43,9 +45,9 @@ inline void rms_norm_bf16_reference(std::span<float> row, std::span<const float>
                                    bool round_numerator = false) {
     if (row.empty() || gain.size() != row.size()) throw std::invalid_argument("BF16 RMSNorm: invalid row shape");
     const float inv = attn::group_pool::rms_inv(row.data(), static_cast<unsigned>(row.size()), epsilon);
+    if (round_numerator) round_bf16_reference(row);
     for (std::size_t i = 0; i < row.size(); ++i) row[i] = (row[i] * inv) * gain[i];
     round_bf16_reference(row);
-    if (round_numerator) round_bf16_reference(row);
 }
 
 inline std::vector<float> mix_rms_norm_bf16_reference(std::span<const float> taps, std::span<const float> coefficients,

@@ -65,18 +65,24 @@ inline void unpack_index_fp4_reference(std::span<const std::uint8_t> entry, std:
     }
 }
 
-// Head gates select the strictly positive logits. An all-negative row retains
-// the strongest head. The caller supplies only the committed prefix and the
-// current entry. The top-k is dense when the causal prefix fits.
+inline std::vector<float> index_head_weights_reference(std::span<const float> weights,
+    std::span<const float> gate, std::span<const float> bias, unsigned retained) {
+    if (weights.size() != gate.size() || gate.size() != bias.size() || retained == 0 || retained > weights.size())
+        throw std::invalid_argument("sparse index: invalid head gate shape");
+    std::vector<float> rank(weights.size()), scaled(weights.size());
+    for (std::size_t h = 0; h < rank.size(); ++h) rank[h] = gate[h] + bias[h];
+    for (const auto h : ordered_top_k<float>(rank, retained)) scaled[h] = gate[h] * weights[h];
+    return scaled;
+}
+
 template<class KeyAt>
-std::vector<std::uint32_t> gated_index_top_k_reference(std::span<const float> queries, std::span<const float> weights,
-    std::span<const float> gates, unsigned dim, std::size_t visible, unsigned top_k, KeyAt key_at) {
-    if (dim == 0 || weights.empty() || gates.size() != weights.size() || queries.size() != weights.size() * dim)
-        throw std::invalid_argument("sparse index: invalid query or head gate shape");
-    const auto best_head = static_cast<std::size_t>(std::ranges::max_element(gates) - gates.begin());
+std::vector<std::uint32_t> weighted_index_top_k_reference(std::span<const float> queries,
+    std::span<const float> weights, unsigned dim, std::size_t visible, unsigned top_k, KeyAt key_at) {
+    if (dim == 0 || weights.empty() || queries.size() != weights.size() * dim)
+        throw std::invalid_argument("sparse index: invalid query shape");
     std::vector<std::size_t> selected_heads;
-    for (std::size_t h = 0; h < gates.size(); ++h)
-        if (gates[h] > 0.0F || h == best_head) selected_heads.push_back(h);
+    for (std::size_t h = 0; h < weights.size(); ++h)
+        if (weights[h] != 0.0F) selected_heads.push_back(h);
     std::vector<float> scores(visible), key(dim);
     if (visible > top_k) {
         for (std::size_t token = 0; token < visible; ++token) {
@@ -88,6 +94,20 @@ std::vector<std::uint32_t> gated_index_top_k_reference(std::span<const float> qu
         }
     }
     return ordered_top_k<float>(scores, top_k);
+}
+
+// The exploratory selector kept every positive gate. It remains available
+// to reproduce historical host traces.
+template<class KeyAt>
+std::vector<std::uint32_t> gated_index_top_k_reference(std::span<const float> queries, std::span<const float> weights,
+    std::span<const float> gates, unsigned dim, std::size_t visible, unsigned top_k, KeyAt key_at) {
+    if (gates.empty() || gates.size() != weights.size())
+        throw std::invalid_argument("sparse index: invalid head gate shape");
+    const auto strongest = static_cast<std::size_t>(std::ranges::max_element(gates) - gates.begin());
+    std::vector<float> selected(weights.size());
+    for (std::size_t h = 0; h < gates.size(); ++h)
+        if (gates[h] > 0.0F || h == strongest) selected[h] = weights[h];
+    return weighted_index_top_k_reference(queries, selected, dim, visible, top_k, key_at);
 }
 
 } // namespace strix::attn_core
