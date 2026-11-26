@@ -18,7 +18,7 @@ if(STRIX_MINIMAX_CUDA)
     target_link_libraries(strix_minimax_rtx_kernels PRIVATE strix_cuda_core_kernels)
     add_executable(mm-rtx-prefill ${mm_cuda}/mm_rtx_prefill_main.cu ${mm_cuda}/mm_rtx_pack.cpp ${mm_cuda}/mm_rtx_weights.cpp
         src/bp_codec.cpp src/handoff.cpp)
-    target_link_libraries(mm-rtx-prefill PRIVATE strix_minimax_rtx_kernels ws2_32)
+    target_link_libraries(mm-rtx-prefill PRIVATE strix_minimax_rtx_kernels strix_serve_json ws2_32)
 
     add_executable(mm_fp32_identity_tests ${mm_cuda}/mm_fp32_identity_tests.cu)
     add_executable(mm_fp32_core_bench ${mm_cuda}/bench/core_bench.cu)

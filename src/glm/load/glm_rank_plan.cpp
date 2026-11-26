@@ -1,5 +1,6 @@
 // GLM-5.3-Flash TP2 rank-slice plan (see glm_rank_plan.hpp).
 #include "glm/load/glm_rank_plan.hpp"
+#include "strix/weight/shard_name.hpp"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -122,11 +123,15 @@ Json parse_json(const std::string& s) {
     return jp.parse();
 }
 std::string read_text(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) throw std::runtime_error("cannot open " + path);
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
+    const std::streamoff end = f.tellg();
+    if (end < 0 || static_cast<std::uint64_t>(end) > weight::kSafetensorsManifestMaxBytes)
+        throw std::runtime_error("not a readable JSON file of at most 64 MiB: " + path);
+    std::string text(static_cast<std::size_t>(end), '\0');
+    f.seekg(0);
+    if (!f.read(text.data(), static_cast<std::streamsize>(text.size()))) throw std::runtime_error("cannot read " + path);
+    return text;
 }
 
 }  // namespace
@@ -137,7 +142,10 @@ Index::Index(const std::string& dir) {
     if (probe) {
         const Json j = parse_json(read_text(dir + "/model.safetensors.index.json"));
         std::set<std::string> s;
-        for (const auto& [k, v] : j.obj().at("weight_map").obj()) s.insert(v.str());
+        for (const auto& [k, v] : j.obj().at("weight_map").obj()) {
+            if (!weight::safetensors_shard_name_ok(v.str())) throw std::runtime_error("invalid safetensors shard name for " + k);
+            s.insert(v.str());
+        }
         names.assign(s.begin(), s.end());
     } else {
         DIR* d = ::opendir(dir.c_str());

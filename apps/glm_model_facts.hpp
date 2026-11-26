@@ -2,6 +2,7 @@
 // Metadata-only layer-45 inventory: discovery never opens tensor payloads or constructs a HIP object. The drafter's
 // content identity (mtp_payload_digest) reads the recorded payload spans on request only.
 #include "../src/glm/engine/glm_json.hpp"
+#include "strix/weight/shard_name.hpp"
 #include <algorithm>
 #include <bit>
 #include <cstdio>
@@ -86,7 +87,8 @@ inline ModelFacts probe_model_mtp(const std::filesystem::path& dir) {
             const std::string text{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
             const auto json = engine::detail::parse_json(text.data(), text.data() + text.size());
             for (const auto& [name, shard] : json.obj().at("weight_map").obj()) {
-                (void)name;
+                if (!strix::weight::safetensors_shard_name_ok(shard.str()))
+                    throw std::runtime_error("invalid safetensors shard name for " + name);
                 if (listed.insert(shard.str()).second) files.push_back(shard.str());
             }
         }
