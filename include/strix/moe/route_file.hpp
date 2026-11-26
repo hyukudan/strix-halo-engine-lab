@@ -4,7 +4,8 @@
 // expert ids and weights of a call, it copies them to host, calls RouteTap::on_call and copies them back when that
 // returns true. With no switch set the tap is inactive and the backend copies nothing.
 //
-//   STRIX_MOE_ROUTES_OUT=FILE   record every call's ids and weights (as this arm computed them)
+//   STRIX_MOE_ROUTES_OUT=FILE   record free-running ids and weights after any null nudge; with replay, record the
+//                               arm's own ids and weights before replay for diagnostics
 //   STRIX_MOE_ROUTES_IN=FILE    replay: overwrite ids and weights with the recorded ones, call by call; the layer,
 //                               row count and top-k of every call must match the record (else std::runtime_error)
 //   STRIX_MOE_ROUTE_NULL=L:SEED one-ulp null control: every selected weight of layer L moves by one FP32 ulp, up or
@@ -197,14 +198,7 @@ public:
             throw std::invalid_argument("route tap: call with zero rows or an unsupported top-k");
         const std::size_t n = static_cast<std::size_t>(rows) * top_k;
         const RouteRecordHeader h{layer, rows, top_k, 0};
-        if (out_.is_open()) {
-            out_.write(reinterpret_cast<const char*>(&h), sizeof(h));
-            out_.write(reinterpret_cast<const char*>(ids), static_cast<std::streamsize>(n * sizeof(std::uint32_t)));
-            out_.write(reinterpret_cast<const char*>(weights), static_cast<std::streamsize>(n * sizeof(float)));
-            if (!out_) throw std::runtime_error("route tap: write failed on " + config_.out_path);
-            ++out_records_;
-            out_rows_ += rows;
-        }
+        if (out_.is_open() && in_.is_open()) record_call(h, n, ids, weights);
         bool changed = false;
         if (in_.is_open()) {
             RouteRecordHeader r{};
@@ -236,12 +230,16 @@ public:
         }
         if (config_.null_on && layer == config_.null_layer) {
             for (std::size_t i = 0; i < n; ++i) {
-                weights[i] = route_ulp_nudge(weights[i], config_.null_seed, null_index_ + i);
-                ++nudged_;
+                const float nudged = route_ulp_nudge(weights[i], config_.null_seed, null_index_ + i);
+                if (std::bit_cast<std::uint32_t>(nudged) != std::bit_cast<std::uint32_t>(weights[i])) {
+                    weights[i] = nudged;
+                    ++nudged_;
+                    changed = true;
+                }
             }
             null_index_ += n;
-            changed = true;
         }
+        if (out_.is_open() && !in_.is_open()) record_call(h, n, ids, weights);
         if (config_.stats_on) {  // the ids the experts will read (after replay)
             const auto c = route_call_stats(ids, rows, top_k, stats_scratch_);
             const auto add = [&](RouteStatsSums& t) {
@@ -289,6 +287,15 @@ public:
     static RouteTap& instance();
 
 private:
+    void record_call(const RouteRecordHeader& h, std::size_t n, const std::uint32_t* ids, const float* weights) {
+        out_.write(reinterpret_cast<const char*>(&h), sizeof(h));
+        out_.write(reinterpret_cast<const char*>(ids), static_cast<std::streamsize>(n * sizeof(std::uint32_t)));
+        out_.write(reinterpret_cast<const char*>(weights), static_cast<std::streamsize>(n * sizeof(float)));
+        if (!out_) throw std::runtime_error("route tap: write failed on " + config_.out_path);
+        ++out_records_;
+        out_rows_ += h.rows;
+    }
+
     static bool has_seq(const std::string& p) { return p.find("{seq}") != std::string::npos; }
     static std::string segment_path(std::string p, std::uint64_t seq) {
         for (auto at = p.find("{seq}"); at != std::string::npos; at = p.find("{seq}", at)) {

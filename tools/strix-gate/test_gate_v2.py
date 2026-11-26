@@ -504,6 +504,55 @@ class HeadFormat(unittest.TestCase):
             self.assertEqual(doc["windows"][0]["flips"]["cand"]["slots"], self.N * 4)
             self.assertTrue(0.0 < doc["pooled"]["held_out"]["label_is_ref_top1"] < 1.0)
 
+    def test_replay_does_not_hide_free_running_regressions(self):
+        with tempfile.TemporaryDirectory() as d:
+            cases = [f"w{i:02d}" for i in range(13)]
+            d = self.kit(d, cases)
+            (d / "log").mkdir()
+            (d / "routes").mkdir()
+            for case in cases:
+                ref = f"{case}.exact.rte"
+                control = {"null": {"order": "reduce", "applications": 1}}
+                for arm in ("exact", "fast_free", "null_free"):
+                    path = d / "routes" / f"{case}.{arm}.rte"
+                    weights = [0.1, 0.9] if arm == "fast_free" else [0.75, 0.25]
+                    write_routes(path, [(0, [[1, 2]], [weights])])
+                    receipt = {"out": {"path": path.name, "records": 1, "rows": 1}}
+                    if arm == "null_free":
+                        receipt.update(control)
+                    (d / "log" / f"{case}.{arm}.stderr").write_text(
+                        "strix-route-file/v1 " + json.dumps(receipt) + "\n", encoding="utf-8")
+                for arm in ("fast", "n0"):
+                    receipt = {"in": {"path": ref, "complete": True, "consumed": 1, "records": 1, "rows": 1}}
+                    if arm == "n0":
+                        receipt.update(control)
+                    (d / "log" / f"{case}.{arm}.stderr").write_text(
+                        "strix-route-file/v1 " + json.dumps(receipt) + "\n", encoding="utf-8")
+                (d / f"{case}-null_free.f32").write_bytes((d / f"{case}-n0.f32").read_bytes())
+                (d / f"{case}-fast_free.f32").write_bytes((d / f"{case}-fast.f32").read_bytes())
+
+            args = ("--cand-free", "fast_free", "--null-free", "null_free")
+            self.assertEqual(self.gate(d, *args)[0], 0)
+            target = d / "w00-fast_free.f32"
+            finite = target.read_bytes()
+            target.write_bytes((-np.frombuffer(finite, "<f4")).tobytes())
+            rc, out = self.gate(d, *args)
+            self.assertEqual(rc, 1, out)
+            doc = json.loads((d / "g.json").read_text(encoding="utf-8"))
+            self.assertEqual(doc["pooled"]["free_run"]["state"], "FAIL")
+            self.assertEqual(doc["pooled"]["flips"]["cand"]["ids"], 0)
+            self.assertGreater(doc["windows"][0]["flips"]["cand"]["rms_weight_delta"], 0.6)
+
+            target.write_bytes(np.array([np.nan], "<f4").tobytes() + finite[4:])
+            self.assertEqual(self.gate(d, *args)[0], 1)
+            doc = json.loads((d / "g.json").read_text(encoding="utf-8"))
+            self.assertEqual(doc["pooled"]["free_run"]["nonfinite_candidate"], ["w00"])
+            target.write_bytes(finite)
+            write_routes(d / "routes" / "w00.fast_free.rte", [(0, [[1, 2]], [[np.inf, 0.9]])])
+            self.assertEqual(self.gate(d, *args)[0], 1)
+            target.unlink()
+            self.assertEqual(self.gate(d, *args)[0], 2)
+
     def test_nonfinite_candidate_is_a_failure_not_an_evidence_error(self):
         with tempfile.TemporaryDirectory() as d:
             d = self.kit(d, [f"w{i:02d}" for i in range(13)])

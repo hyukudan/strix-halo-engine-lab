@@ -219,26 +219,33 @@ def route_flips(ref_path, arm_path, opener=None):
     if len(a) != len(b):
         raise GateError(f"{arm_path}: {len(b)} router calls, the reference has {len(a)}")
     per = {}
-    max_weight_delta, rows = 0.0, 0
+    max_weight_delta, sq_weight_delta, matched, rows = 0.0, 0.0, 0, 0
+    finite_weights = True
     for i, ((la, ia, wa), (lb, ib, wb)) in enumerate(zip(a, b)):
         if la != lb or ia.shape != ib.shape:
             raise GateError(f"{arm_path}: call {i} is layer {lb} shape {ib.shape}, the reference has layer {la} shape {ia.shape}")
         k = ia.shape[1]
-        if not np.isfinite(wa).all() or not np.isfinite(wb).all():
-            raise GateError(f"{arm_path}: non-finite router weight at call {i}")
+        if not np.isfinite(wa).all():
+            raise GateError(f"{ref_path}: non-finite reference router weight at call {i}")
+        finite_weights &= bool(np.isfinite(wb).all())
         missing = 0
         for x, y, wx, wy in zip(ia, ib, wa, wb):
             common, ix, iy = np.intersect1d(x, y, return_indices=True)
             missing += k - common.size
-            if common.size:
-                max_weight_delta = max(max_weight_delta, float(np.abs(wx[ix].astype(np.float64) - wy[iy]).max()))
+            if common.size and finite_weights:
+                delta = wx[ix].astype(np.float64) - wy[iy]
+                max_weight_delta = max(max_weight_delta, float(np.abs(delta).max()))
+                sq_weight_delta += float(np.dot(delta, delta))
+                matched += common.size
         s = per.setdefault(int(la), [0, 0])
         s[0] += ia.size
         s[1] += missing
         rows += ia.shape[0]
     slots, ids = sum(v[0] for v in per.values()), sum(v[1] for v in per.values())
     return {"slots": slots, "ids": ids, "rate": ids / slots if slots else 0.0, "per_layer": per,
-            "records": len(a), "rows": rows, "max_abs_weight_delta": max_weight_delta}
+            "records": len(a), "rows": rows, "finite_weights": finite_weights,
+            "max_abs_weight_delta": max_weight_delta if finite_weights else None,
+            "rms_weight_delta": (math.sqrt(sq_weight_delta / matched) if matched else 0.0) if finite_weights else None}
 
 
 def flip_ratio(cand, null):
@@ -438,9 +445,10 @@ def window_line(w, flips=None, limits=LIMITS):
     if flips:
         fl = (f"; flips free cand {flips['cand']['rate']:.3e} null {flips['null']['rate']:.3e} ratio "
               f"{flip_ratio(flips['cand'], flips['null']):.2f}")
-        if "max_abs_weight_delta" in flips["cand"]:
+        if flips["cand"].get("max_abs_weight_delta") is not None:
             fl += (f"; max matched route weight delta cand {flips['cand']['max_abs_weight_delta']:.3e} "
-                   f"null {flips['null']['max_abs_weight_delta']:.3e}")
+                   f"null {flips['null']['max_abs_weight_delta']:.3e}; RMS cand {flips['cand']['rms_weight_delta']:.3e} "
+                   f"null {flips['null']['rms_weight_delta']:.3e}")
     nt = f", null {w['null_top1']:.4f}" if "null_top1" in w else ""
     nd = (f"; null dNLL {w['null_dnll']:+.5f} se {w['null_dnll_se']:.5f}" if "null_dnll" in w else "; null dNLL n/a")
     cap = f" (rows se {w['dnll_se_rows']:.5f}, capped 1.5 x null)" if "dnll_se_rows" in w else ""
@@ -560,6 +568,14 @@ def null_moved(name, null_kls):
                             "not a null (re-run it with a step that survives the consumer's input rounding)")
 
 
+def score_window(case, rows, controls, cls, limits):
+    return window_stats(case, rows["kl_rc"], rows["agree"].astype(bool), rows["nll_r"], rows["nll_c"],
+                        [float(x["kl_rc"].mean()) for x in controls], rows["top1_r_is_label"], rows["top1_c_is_label"],
+                        null_top1s=[float(x["agree"].mean()) for x in controls], null_nlls=[x["nll_c"] for x in controls],
+                        cls=cls, null_kl_rows=[x["kl_rc"] for x in controls],
+                        null_top1_rows=[x["agree"] for x in controls], limits=limits)
+
+
 def qual(a):
     """option_qual adapter: reduce every case's REF vs CAND / NULL logits, check replay receipts, count free flips."""
     out = pathlib.Path(a.out)
@@ -613,6 +629,7 @@ def qual(a):
         raise GateError("--trace-diag needs --manifest (flip slots = prompt rows x traced layers)")
     windows, flips, replay, traced = [], [], {}, 0
     nonfinite_candidate = []
+    free_windows, nonfinite_free = [], []
     for case in cases:
         if manifest is not None and case not in manifest:
             raise GateError(f"{case}: not in the manifest")
@@ -633,11 +650,7 @@ def qual(a):
         if ra["nonfinite_c"].any():
             nonfinite_candidate.append(case)
             continue
-        w = window_stats(case, ra["kl_rc"], ra["agree"].astype(bool), ra["nll_r"], ra["nll_c"],
-                         [float(x["kl_rc"].mean()) for x in nulls], ra["top1_r_is_label"], ra["top1_c_is_label"],
-                         null_top1s=[float(x["agree"].mean()) for x in nulls], null_nlls=[x["nll_c"] for x in nulls],
-                         cls=window_class(case, classes, manifest), null_kl_rows=[x["kl_rc"] for x in nulls],
-                         null_top1_rows=[x["agree"] for x in nulls], limits=limits)
+        w = score_window(case, ra, nulls, window_class(case, classes, manifest), limits)
         ref_route = route(a.ref)
         moe = ref_route.exists()
         f = None
@@ -648,15 +661,30 @@ def qual(a):
                                      for n in a.null]}
             w["replay"] = replay[case]
             if not (a.cand_free and a.null_free):
-                raise GateError(f"{case}: MoE routes present: --cand-free and --null-free arms are required (R1 flip ratio)")
+                raise GateError(f"{case}: MoE routes present: --cand-free and --null-free arms are required")
             f = {"cand": route_flips(ref_route, route(a.cand_free), opener),
                  "null": route_flips(ref_route, route(a.null_free), opener)}
             check_free_record(ref_r, ref_route, f["cand"], f"{case}.{a.ref}")
             for key, arm in (("cand", a.cand_free), ("null", a.null_free)):
                 what = f"{case}.{arm}"
                 check_free_record(route_receipt(err(arm), what), route(arm), f[key], what, null=key == "null")
+            fc, _ = reduce(logit(a.ref), logit(a.cand_free), **kw)
+            fn, _ = reduce(logit(a.ref), logit(a.null_free), **kw)
+            if fc["nonfinite_r"].any() or fn["nonfinite_r"].any():
+                raise GateError(f"{case}: non-finite reference logits")
+            if fn["nonfinite_c"].any() or not f["null"]["finite_weights"]:
+                raise GateError(f"{case}: non-finite free-running null logits or router weights")
+            null_moved(f"{case} free-running", [float(fn["kl_rc"].mean())])
+            if fc["nonfinite_c"].any() or not f["cand"]["finite_weights"]:
+                nonfinite_free.append(case)
+            else:
+                free = score_window(case, fc, [fn], w["class"], limits)
+                free_windows.append(free)
+                w["free_run"] = {k: v for k, v in free.items() if k != "_rows"}
+                print("  free-running " + window_line(free, limits=limits))
             flips.append(f)
-            w["flips"] = {k: {x: v[x] for x in ("slots", "ids", "rate", "max_abs_weight_delta")} for k, v in f.items()}
+            w["flips"] = {k: {x: v[x] for x in ("slots", "ids", "rate", "max_abs_weight_delta", "rms_weight_delta")}
+                          for k, v in f.items()}
         elif diag:
             # no route tap: every arm ran free, so the flips come from the engine trace of the candidate and the null
             fc, fn = diag.get((case, a.cand_free or a.cand)), diag.get((case, a.null_free or a.null[0]))
@@ -691,9 +719,27 @@ def qual(a):
              "nonfinite_candidate": nonfinite_candidate}
         print(f"POOLED v2 -> FAIL non-finite candidate logits: {', '.join(nonfinite_candidate)}")
     else:
+        if replay and len(replay) != len(windows):
+            raise GateError("route replay evidence is required for every window of a replayed qualification")
         p = verdict(windows, flips if flips else None, limits=limits,
                     allow_null_floor=getattr(a, 'allow_null_floor', False))
         print(pooled_line(p, limits))
+        if replay:
+            if nonfinite_free:
+                free_pooled = {"state": "FAIL", "pass": False, "nonfinite_candidate": nonfinite_free}
+                print(f"FREE-RUNNING -> FAIL non-finite candidate logits or router weights: {', '.join(nonfinite_free)}")
+            else:
+                free_pooled = verdict(free_windows, limits=limits,
+                                      allow_null_floor=getattr(a, "allow_null_floor", False))
+                print("FREE-RUNNING " + pooled_line(free_pooled, limits))
+            p["free_run"] = free_pooled
+            p["replay_state"] = p["state"]
+            p["checks"]["free_run"] = free_pooled["pass"]
+            for state in ("FAIL", "HOLD", "UNRESOLVED", "PASS"):
+                if state in (p["replay_state"], free_pooled["state"]):
+                    p["state"], p["pass"] = state, state == "PASS"
+                    break
+            print(f"REPLAY + FREE-RUNNING -> {p['state']}")
     exit_code = EXIT[p["state"]]
     if a.json:
         doc = {"schema": "strix-fast-gate-v2/v1", "limits": limits, "ref": a.ref, "cand": a.cand, "null": a.null,

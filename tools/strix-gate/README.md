@@ -416,7 +416,8 @@ Then it prints the pooled line.
 
 **Engine side (shared route tap).** A MoE backend binds `include/strix/moe/route_file.hpp` in one place, right after
 its router writes the selected ids and weights. Three environment switches drive it:
-- `STRIX_MOE_ROUTES_OUT=FILE` records each router call.
+- `STRIX_MOE_ROUTES_OUT=FILE` records each free-running call as consumed by the experts, including any null nudge.
+  A replay arm with recording enabled captures its local routes before replay.
 - `STRIX_MOE_ROUTES_IN=FILE` replays the calls. The layer, row count and top-k of every call must match the record,
   otherwise the run stops with an error.
 - `STRIX_MOE_ROUTE_NULL=LAYER:SEED` is the one-ulp null. Every selected weight of that layer moves by one FP32 ulp, up
@@ -433,6 +434,12 @@ set, the tap does nothing. Replay needs eager execution; a captured graph is ref
 that runs a prompt list calls `route_tap_sequence(i)` before prompt `i`. Each prompt then gets its own file, its own
 counters and its own receipt line, exactly as if it ran in its own process. One model load then serves every window of
 an arm. The gate files each receipt line under its window by the path it names. Without `{seq}` nothing changes.
+
+For a route-tapped engine, `qual` scores the replayed and free-running logits separately on the same held-out
+history. For each, it applies the tier's pooled, window and class checks against the corresponding null control.
+Both must pass, and the free-running expert ID flip ratio must pass. Maximum and RMS weight deltas are reported
+for matching experts. Use the free-running verdict to decide the effect of weight drift on model outputs.
+Capture logits for both free arms. A non-finite free-running candidate logit or route weight fails qualification.
 
 ```sh
 # option_qual runner output (arms: REF {"routes":{"out":true}}, NULL {"routes":{"in":"REF"},
