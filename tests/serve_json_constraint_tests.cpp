@@ -1097,6 +1097,19 @@ void raw_oracle() {
     check(!raw_valid(parse_json(R"({"const":1})"), "1.0"), "raw oracle rejects numeric value equality");
     std::cout << "independent raw-byte oracle directed_probes=" << probes << '\n';
 }
+// Peak process RSS is not a bound under AddressSanitizer (shadow memory and quarantine count in it); the compilation
+// steps and the time still bound the expansion there.
+#if defined(__SANITIZE_ADDRESS__)
+constexpr bool kAddressSanitizer = true;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+constexpr bool kAddressSanitizer = true;
+#else
+constexpr bool kAddressSanitizer = false;
+#endif
+#else
+constexpr bool kAddressSanitizer = false;
+#endif
 void adversarial_compilation() {
     const auto measure = [](const char* name, const std::function<Json()>& make, bool refuse, ConstraintLimits limits = {}) {
         const auto start = std::chrono::steady_clock::now();
@@ -1118,7 +1131,7 @@ void adversarial_compilation() {
 #endif
         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         check(ok, std::string("aggregate budget ") + name);
-        check(ms < 2000 && rss < 65536, std::string("bounded time/memory ") + name);
+        check(ms < 2000 && (kAddressSanitizer || rss < 65536), std::string("bounded time/memory ") + name);
         std::cout << "adversarial compile shape=" << name << " expected=" << (refuse ? "SchemaError" : "compiled") << " ms=" << ms << " peak_rss_kib=" << rss << '\n';
     };
     measure("repeated-ref-1024-enum-512-branches-46628-bytes", [] {
@@ -1167,19 +1180,6 @@ void adversarial_compilation() {
     small = {}; small.alternative_expansions = 2;
     measure("alternative-cap", [] { return parse_json(R"({"anyOf":[{"const":1},{"const":2}]})"); }, true, small);
 }
-// Peak process RSS is not a bound under AddressSanitizer (shadow memory and quarantine count in it); the compilation
-// steps and the time still bound the expansion there.
-#if defined(__SANITIZE_ADDRESS__)
-constexpr bool kAddressSanitizer = true;
-#elif defined(__has_feature)
-#if __has_feature(address_sanitizer)
-constexpr bool kAddressSanitizer = true;
-#else
-constexpr bool kAddressSanitizer = false;
-#endif
-#else
-constexpr bool kAddressSanitizer = false;
-#endif
 void branching_expansion() {
     for (const unsigned levels : {11U, 12U, 20U}) {
         Json defs = Json::object();
