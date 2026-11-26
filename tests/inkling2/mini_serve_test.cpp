@@ -722,7 +722,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         if (options.attn_projected_bias) observed = [&served_dispatches] { return served_dispatches; };
         return mini::MiniServeCohort{
             std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable), 32U, 3U, 2U), weights,
-            std::move(observed), 0U};
+            std::move(observed), 0U, sv::kMixedServiceShortPieces, options.served_cli_route};
     };
     mini::MiniServeBackends backends;
     if (std::string_view(backend) == "hip") backends.hip = create;
@@ -916,10 +916,11 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             const char* route_env = std::getenv("STRIX_INK_SERVED_CLI_ROUTE");
             const bool explicit_off = route_env != nullptr && std::string_view(route_env) == "0";
             const bool admitted = cli_route || (std::string_view(backend) != "hip" && !explicit_off);
-            require((route != nullptr) == admitted &&
-                        (!route || (route->find("requested")->as_bool() && route->find("admitted")->as_bool() == admitted &&
-                                    route->find("qualification")->as_string() == (admitted ? "qualified" : "n/a"))),
-                    "Inkling capability response misreports the served route lever");
+            const bool route_ok =
+                (route != nullptr) == admitted &&
+                (!route || (route->find("requested")->as_bool() && route->find("admitted")->as_bool() == admitted &&
+                            route->find("qualification")->as_string() == (admitted ? "qualified" : "n/a")));
+            require(route_ok, "Inkling capability response misreports the served route lever");
             const auto* sampling = effective.find("sampling");
             const auto* temperature = sampling ? sampling->find("positive_temperature") : nullptr;
             require(temperature && temperature->as_string() == (sample_capable ? "sample" : "reject"),
