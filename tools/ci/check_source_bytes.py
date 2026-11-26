@@ -1,4 +1,4 @@
-"""Fail if any tracked source or text file contains a raw NUL byte.
+"""Reject tracked build logs and raw NUL bytes in tracked sources.
 
 Raw NUL bytes inside string or character literals compile on some toolchains and
 break strict builds on others; they also make diffs unreadable. Use the escape
@@ -19,6 +19,9 @@ def main():
         if not raw:
             continue
         path = pathlib.Path(raw.decode())
+        if path.suffix.lower() == '.log':
+            bad.append(f'{path}: build and test logs must stay outside Git')
+            continue
         if path.suffix.lower() not in SUFFIXES and path.name != 'CMakeLists.txt':
             continue
         try:
