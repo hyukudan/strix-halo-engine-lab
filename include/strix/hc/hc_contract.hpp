@@ -64,6 +64,7 @@ struct Spec {
     Store store = Store::f32;
     float post_magnitude = 2.0F;
     float pre_eps = 0.0F, post_eps = 0.0F, comb_eps = 0.0F, norm_eps = 0.0F;
+    bool norm_eps_outside_sqrt = false;
 
     [[nodiscard]] constexpr std::uint32_t post_rows() const { return site == Site::head ? 0U : streams; }
     [[nodiscard]] constexpr std::uint32_t comb_rows() const {

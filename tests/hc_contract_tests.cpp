@@ -6,6 +6,7 @@
 #include "strix/ds41_layer.hpp"
 #include "strix/hc/hc_ref.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -203,6 +204,17 @@ void identity_is_a_skip() {
           "identity matrix differs (0 * inf)");
 }
 
+void mix_epsilon_position() {
+    strix::hc::Spec spec{.streams = 1, .hidden = 1, .site = strix::hc::Site::head, .norm_eps = 0.25F};
+    constexpr std::array<float, 1> row{0.25F}, weight{1.0F};
+    const strix::hc::SiteWeights weights{{}, weight, {}, {}};
+    const float inside = strix::hc::raw_mixes(spec, row, weights).front();
+    spec.norm_eps_outside_sqrt = true;
+    const float outside = strix::hc::raw_mixes(spec, row, weights).front();
+    check(std::fabs(inside - 0.25F / std::sqrt(0.3125F)) < 1e-6F, "mix epsilon inside RMS square root");
+    check(outside == 0.5F, "mix epsilon outside RMS square root");
+}
+
 void geometry_rejected() {
     auto spec = hc_fixture::identity_bf16_spec(strix::hc::Site::sublayer);
     bool threw = false;
@@ -224,6 +236,7 @@ int main() {
     ds41_bitwise(g);
     modelb_fp64(g);
     identity_is_a_skip();
+    mix_epsilon_position();
     geometry_rejected();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);

@@ -26,7 +26,7 @@ struct Mix {
     std::vector<float> comb;       // [streams][streams] (row = source copy), empty unless Comb::sinkhorn
 };
 
-// mix[m] = dot(fn[m], x) * r, r = 1 / declared_sqrt(dot(x, x) / n + norm_eps). Throws on bad geometry.
+// mix[m] = dot(fn[m], x) * r. The spec places norm_eps inside or outside the RMS square root.
 [[nodiscard]] std::vector<float> raw_mixes(const Spec& spec, std::span<const float> streams, const SiteWeights& w);
 // pre / post / comb from the raw mixes (the split, then the Sinkhorn stage when Comb::sinkhorn).
 [[nodiscard]] Mix split(const Spec& spec, std::span<const float> raw, std::span<const float> base,

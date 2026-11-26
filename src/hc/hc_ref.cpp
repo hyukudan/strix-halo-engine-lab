@@ -55,10 +55,12 @@ std::vector<float> raw_mixes(const Spec& spec, std::span<const float> streams, c
     require(streams.size() == n, "hc: stream geometry");
     require(spec.fn == FnType::f16 ? w.fn_f16.size() == rows * n : w.fn_f32.size() == rows * n, "hc: fn geometry");
     require(w.layout == FnLayout::mix_major || spec.fn == FnType::f32, "hc: feature-major fn requires F32");
-    const float r = ds41::declared_rsqrt(
+    const float mean_square =
         ds41::chunked_dot_of([&](std::size_t i) { return streams[i]; }, [&](std::size_t i) { return streams[i]; }, n) /
-            static_cast<float>(n) +
-        spec.norm_eps);
+        static_cast<float>(n);
+    const float r = spec.norm_eps_outside_sqrt
+        ? 1.0F / (ds41::declared_sqrt(mean_square) + spec.norm_eps)
+        : ds41::declared_rsqrt(mean_square + spec.norm_eps);
     std::vector<float> mix(rows);
     for (std::size_t m = 0; m < rows; ++m) {
         float d;
