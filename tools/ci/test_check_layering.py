@@ -42,6 +42,22 @@ class Layering(unittest.TestCase):
         self.assertIsNone(cl.model_of("src/moe_core/grouped.hip"))
         self.assertIsNone(cl.model_of("src/hip_mtp_draft_head.hip"))
 
+    def test_legacy_and_new_model_paths_are_ratchet_checked(self):
+        model_paths = {
+            "src/hy4/hip/new.hip": "hy4",
+            "src/inkling2/new.cu": "inkling2",
+            "src/ernie/new.hip": "ernie",
+            "src/hip_indexed_attention_launcher.hip": "qwen",
+            "src/hip_gdn_launcher.hip": "qwen",
+            "src/hip_hyper_mix_launcher.hip": "qwen",
+            "src/hip_moe_experts_launcher.hip": "qwen",
+            "src/hip_ple_launcher.hip": "qwen",
+        }
+        for path, family in model_paths.items():
+            with self.subTest(path=path):
+                self.assertEqual(cl.model_of(path), family)
+                self.assertIn(("model-kernel", path), self.counts({path: "__global__ void k() {}"}))
+
     def test_rules(self):
         c = self.counts()
         self.assertEqual(c.get(("model-include", "include/strix/serve/api.hpp")), 1)
