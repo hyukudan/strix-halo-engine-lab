@@ -490,10 +490,7 @@ int main(int argc, char** argv) {
             };
             const bool fit = is_sp(format) && args.table_auto;
             std::vector<Arm> arms{{format, fit, Technique::rtn}};
-            if (selection.technique != Technique::rtn) {
-                if (args.report.empty() && !args.compare) arms.clear();
-                arms.push_back({format, fit, selection.technique});
-            }
+            if (selection.technique != Technique::rtn) arms.push_back({format, fit, selection.technique});
             if (args.compare && !is_sp(format)) {
                 for (const auto tech : {Technique::importance, Technique::feedback, Technique::both})
                     if (tech != selection.technique) arms.push_back({format, false, tech});
@@ -602,7 +599,12 @@ int main(int argc, char** argv) {
         if (writer)
             if (const auto status = writer->finish(); !status) throw std::runtime_error("write pack: " + status.detail);
         if (!args.dequant_out.empty()) write_dequant(args.dequant_out, dequant_out);
-        std::cout << "strix-lowbit-calib-pack/v1 matrices " << selected.size() << " technique " << technique_name(args.technique)
+        const auto first_technique = selected.begin()->second.technique;
+        const bool homogeneous = std::ranges::all_of(selected, [&](const auto& item) {
+            return item.second.technique == first_technique;
+        });
+        std::cout << "strix-lowbit-calib-pack/v1 matrices " << selected.size() << " technique "
+                  << (homogeneous ? technique_name(first_technique) : "mixed")
                   << " damp " << args.damp << " output-error ";
         if (args.moments.empty()) std::cout << "unavailable";
         else std::cout << "rtn " << total_rtn << " selected " << total_sel << " ratio "
