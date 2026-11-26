@@ -543,8 +543,12 @@ void profile_parity() {
     const auto cuda_route = [](const mini::cli::Options& options) {
         return mini::cli::resolve_cuda_step_route(options, {}, strix::weight::kBf16WeightStorage, false);
     };
-    require(refuses([&] { (void)cuda_route(parse_cli("fast", "cuda")); }, consumer_error),
+    require(refuses([&] { (void)cuda_route(parse_cli("fast", "cuda", {"1", "--generate", "2", "--speculation", "off"})); }, consumer_error),
             "CUDA step program must refuse an image it cannot load");
+    // The auto speculation row takes the verifying route (resident replay), which keeps the narrow image.
+    const auto automatic = parse_cli("fast", "cuda");
+    require(!cuda_route(automatic).program && mini::mini_experts_nvfp4(automatic.tier),
+            "CUDA auto speculation must take the resident replay with the narrow image");
     const auto resident = parse_cli("fast", "cuda", {"1", "--generate", "2", "--no-step-graph"});
     require(!cuda_route(resident).program && mini::mini_experts_nvfp4(resident.tier),
             "CUDA resident replay must keep the explicit narrow image");
