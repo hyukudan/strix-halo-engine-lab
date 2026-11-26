@@ -4,6 +4,7 @@
 #include "strix/deploy/link.hpp"
 #include "strix/deploy/plan.hpp"
 #include "strix/device/declaration.hpp"
+#include "strix/pair/device_gain.hpp"
 
 #include <cstdint>
 #include <map>
@@ -123,12 +124,21 @@ enum class Objective { ttft, throughput };
 [[nodiscard]] std::string_view objective_name(Objective objective) noexcept;
 [[nodiscard]] Objective parse_objective(std::string_view text); // throws std::invalid_argument
 
+// An in-memory receipt binding for the exact option label, request and numerical
+// class. Prefill includes transfers and imports; decode uses the same token count
+// on both arms. The planner treats absent or invalid evidence as a refusal.
+struct RouteGain {
+    std::string label;
+    pair::planner::DeviceGain prefill, decode;
+};
+
 struct RouteRequest {
     Spec spec;                        // model, serving context, slots, memory margin, format
     std::uint64_t prompt = 0;         // rows to prefill; 0 = spec.context
     Objective objective = Objective::ttft;
     std::vector<std::string> decode;  // unit that decodes afterwards; empty = where the route ends
     std::string pin;                  // option label to force; refused (with the reason) when it is not selectable
+    std::optional<std::vector<RouteGain>> multi_device_gain = std::nullopt; // explicit strict admission, empty evidence refuses multi
 };
 
 // ---- Result -------------------------------------------------------------------------------------------------------

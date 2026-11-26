@@ -5567,6 +5567,14 @@ measured (`complete`, `covered_ms`); nothing is extended over a failed read or p
 - **Measured:** Measurement, not a speed lever. Qwen 8K real-text prefill, one node, default exact route, sampler on/off interleaved (ABAB): 1,755.9 / 1,744.5 tok/s on vs 1,752.9 / 1,733.5 off (no slowdown), logits and tokens identical. First receipts: prefill 577-588 J, 123.5-125.4 W mean, 150-152 W peak, 13.9-14.2 tok/J, median GPU clock 2,512-2,524 MHz, 84-92 C; serial greedy decode 128 tokens: 544 J, 95.7 W mean, 0.235 tok/J, 2,873 MHz.
 - **Off switch:** `STRIX_POWER_SAMPLER=0`.
 
+<a id="multi-device-gain-bar"></a>
+### Multi-device gain comparison
+
+- **Shared home:** `include/strix/pair/device_gain.hpp`
+- **Preconditions:** Comparable single-device and multi-device costs per phase, under the same numerical class and workload. Prefill includes any handoff.
+- **Admission:** The explicit `RouteRequest::multi_device_gain` requires both phases to clear their comparison. A missing or ambiguous comparison refuses the multi-device option, including pinned routes. Positive infinity for the single-device cost denotes a model that cannot fit on one device.
+- **Evidence:** Fake-device planner and deployment fixtures. Device timings are pending.
+
 <a id="platform-route-receipt"></a>
 
 ### Shared route receipt

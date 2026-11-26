@@ -302,7 +302,12 @@ void test_split_phase() {
           "split phase charges setup, serialized trips and bytes");
     check(std::abs(p.prefill_with_handoff_ms - p.prefill.ms - transfer_ms) < 1e-9 &&
           has(p.line, "prefill_form=layers decode_form=tensor") && has(p.line, "handoff_bytes=33554688 handoff_trips=16") &&
-          has(p.line, "evidence=prediction"), "split phase receipt identifies phases and prediction");
+          has(p.line, "prefill_ratio=") && has(p.line, "decode_ratio=") &&
+          has(p.line, "evidence=prediction"), "split phase receipt identifies both comparisons and prediction");
+    auto stale_decode = decode;
+    stale_decode.all[static_cast<std::size_t>(pl::Form::tensor)].ms = stale_decode.single_ms * 1.2;
+    p = pl::split_phase(c, q, option, prefill, stale_decode);
+    check(!p.admissible && has(p.reason, "decode does not clear"), "decode comparison also gates a composed plan");
     q.free_bytes[1] = 127U;
     p = pl::split_phase(c, q, option, prefill, decode);
     check(!p.admissible && has(p.reason, "headroom of b"), "each rank must fit its peak co-resident layout");

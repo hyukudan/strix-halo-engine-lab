@@ -22,6 +22,7 @@
 // Home: shared (host shared). Bound by: the qwen35 dense HIP tensor-parallel decode placement (measured trip + measured
 // one-node pass); other pair engines describe their pass as split::Stage rows and call the same entry.
 #include "strix/device/set.hpp"
+#include "strix/pair/device_gain.hpp"
 #include "strix/pair/gather_link.hpp"
 #include "strix/pair/split_plan.hpp"
 #include "strix/pair/window_overlap.hpp"
@@ -147,8 +148,7 @@ inline double bytes_of(const split::Estimate& e, const tp::TripCost& c, std::uin
 }
 inline void gain_bar(Candidate& c, double single_ms, double margin) {
     if (!c.admissible) return;
-    if (!std::isfinite(single_ms)) return;   // no single fits: the bar does not apply
-    if (c.ms * (1.0 + c.uncertainty) < single_ms * (1.0 - margin)) return;
+    if (DeviceGain{single_ms, c.ms, c.ms * c.uncertainty}.clears(margin)) return;
     c.admissible = false;
     c.reason = "refused: " + fmt("%.1f", c.ms) + " ms" + (c.uncertainty > 0.0 ? fmt(" (+%.0f %% uncertainty)", 100.0 * c.uncertainty) : "") +
                " vs single " + fmt("%.1f", single_ms) + " ms (gain bar " + fmt("%.0f", 100.0 * margin) + " %; " +
@@ -445,9 +445,11 @@ struct SplitPhaseDecision {
                           trip.us_per_byte * static_cast<double>(out.handoff_bytes) / 1000.0;
     }
     out.prefill_with_handoff_ms = out.prefill.ms + out.handoff_ms;
-    const double conservative_ms = out.prefill.ms * (1.0 + out.prefill.uncertainty) + out.handoff_ms;
-    if (!std::isfinite(conservative_ms) ||
-        (std::isfinite(prefill.single_ms) && conservative_ms >= prefill.single_ms * (1.0 - costs.margin)))
+    const DeviceGain prefill_gain{prefill.single_ms, out.prefill_with_handoff_ms,
+                                  out.prefill.ms * out.prefill.uncertainty};
+    const DeviceGain decode_gain{decode.single_ms, out.decode.ms, out.decode.ms * out.decode.uncertainty};
+    if (!decode_gain.clears(costs.margin)) return refuse("decode does not clear the single-device gain bar");
+    if (!prefill_gain.clears(costs.margin))
         return refuse("prefill plus handoff does not clear the single-device gain bar");
     out.admissible = true;
     out.line = "split_phase: placement=" + std::string(option.name) + " prefill_form=" + form_name(out.prefill.form) +
@@ -462,7 +464,8 @@ struct SplitPhaseDecision {
                detail::fmt(" decode_link_bytes_per_pass=%.0f", out.decode.link_bytes) +
                " handoff_bytes=" + std::to_string(out.handoff_bytes) + " handoff_trips=" + std::to_string(option.handoff_trips) +
                detail::fmt(" handoff_ms=%.3f", out.handoff_ms) + detail::fmt(" prefill_with_handoff_ms=%.3f", out.prefill_with_handoff_ms) +
-               " evidence=prediction";
+               detail::fmt(" prefill_ratio=%.3f", prefill_gain.ratio()) +
+               detail::fmt(" decode_ratio=%.3f", decode_gain.ratio()) + " evidence=prediction";
     return out;
 }
 

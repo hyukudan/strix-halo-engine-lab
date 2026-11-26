@@ -3418,6 +3418,7 @@
     "off_switch": "STRIX_POWER_SAMPLER=0",
     "doc_anchor": "docs/optimizations.md#platform-power-receipt"
   },
+  {"engine": "shared", "name": "Multi-device gain comparison", "flag_or_env": "RouteRequest::multi_device_gain", "default": "explicit deployment request", "exact": "Host admission only", "gain": "Device timing pending", "preconditions": "Matching one-device and multi-device costs for prefill and decode, including handoff", "off_switch": "Omit the explicit route request field", "home": "include/strix/pair/device_gain.hpp", "doc_anchor": "docs/optimizations.md#multi-device-gain-bar"},
   {
     "engine": "platform",
     "name": "Shared route receipt",
