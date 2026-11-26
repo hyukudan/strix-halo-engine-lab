@@ -3,10 +3,12 @@
 #include "strix/weight/formats/scalar_float.hpp"
 
 #include <cmath>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
 #include <stdexcept>
+#include <utility>
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #define STRIX_MICROSCALED_HD __host__ __device__ inline
@@ -273,6 +275,46 @@ inline void decode_mxfp4_row(std::span<const std::uint8_t> codes,
             output[i] = even;
             output[i + 1U] = odd;
         }
+    }
+}
+
+// Most scales produce finite FP32 for every E2M1 code. Validate extreme
+// blocks through the scalar decoder and use a small table for ordinary blocks.
+inline void decode_mxfp4_row_table(std::span<const std::uint8_t> codes,
+                                  std::span<const std::uint8_t> block_scales,
+                                  std::span<float> output, bool high_nibble_first = false) {
+    constexpr auto columns = kMxfp4BlockColumns;
+    if (output.empty() || output.size() % columns || codes.size() != output.size() / 2U ||
+        block_scales.size() != output.size() / columns)
+        throw std::invalid_argument("MXFP4 row has inconsistent dimensions");
+    static const auto table = [] {
+        std::array<std::array<float, 16>, 252> values{};
+        for (std::size_t s = 0; s < values.size(); ++s)
+            for (std::size_t c = 0; c < values[s].size(); ++c)
+                values[s][c] = scalar_float::e2m1(static_cast<std::uint8_t>(c)) *
+                               scalar_float::e8m0(static_cast<std::uint8_t>(s));
+        return values;
+    }();
+    for (std::size_t block = 0; block < block_scales.size(); ++block) {
+        const auto scale = block_scales[block];
+        const auto bytes = codes.subspan(block * columns / 2U, columns / 2U);
+        auto row = output.subspan(block * columns, columns);
+        if (scale < 2 || scale >= table.size()) {
+            decode_mxfp4_row(bytes, block_scales.subspan(block, 1), row);
+            if (high_nibble_first)
+                for (std::size_t i = 0; i < columns; i += 2U) std::swap(row[i], row[i + 1U]);
+            continue;
+        }
+        const auto& lut = table[scale];
+        const auto decode = [&]<bool HighFirst> {
+            for (std::size_t i = 0; i < bytes.size(); ++i) {
+                const auto c = bytes[i];
+                row[i * 2U + HighFirst] = lut[c & 0x0fU];
+                row[i * 2U + !HighFirst] = lut[c >> 4U];
+            }
+        };
+        if (high_nibble_first) decode.template operator()<true>();
+        else decode.template operator()<false>();
     }
 }
 

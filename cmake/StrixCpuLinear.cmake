@@ -1,7 +1,7 @@
 # Baseline CPU feature detection and FP32 linear family, independent of accelerator SDKs.
 # Built for its consumers: the CPU backend (STRIX_BACKEND_CPU, or any project that includes StrixBackendCpu.cmake,
 # which links it and sets STRIX_CPU_LINEAR_REQUIRED), Gemma 4 and the CUDA Qwen CPU expert route.
-if(TARGET strix_cpu_linear OR NOT (STRIX_BACKEND_CPU OR STRIX_FAMILY_GEMMA4 OR STRIX_CUDA_QWEN_ONLY OR STRIX_CPU_LINEAR_REQUIRED))
+if(TARGET strix_cpu_linear OR NOT (STRIX_BACKEND_CPU OR STRIX_FAMILY_GEMMA4 OR STRIX_CUDA_QWEN_ONLY OR STRIX_CPU_LINEAR_REQUIRED OR TARGET strix-ernie-cpu))
     return()
 endif()
 
@@ -27,7 +27,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|X86_64|x64")
         target_compile_options(strix_cpu_linear PRIVATE /arch:SSE2)
     else()
         target_compile_options(strix_cpu_linear PRIVATE -march=x86-64)
-        set_source_files_properties("${_strix_cpu_avx2}" PROPERTIES COMPILE_OPTIONS "-mavx2")
+        set_source_files_properties("${_strix_cpu_avx2}" PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
         set_source_files_properties("${_strix_cpu_avx512}" PROPERTIES COMPILE_OPTIONS "-mavx512f")
     endif()
 endif()

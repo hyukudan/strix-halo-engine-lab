@@ -66,8 +66,13 @@ public:
         }
         scratch_.resize(size);
         read(name, std::span<float>(scratch_), 0);
-        const auto bytes = scratch_.capacity() * sizeof(float);
-        if (bytes <= capacity_ && !observed_.insert(name).second) {
+        if (scratch_.size() <= capacity_ / sizeof(float) && !observed_.insert(name).second) {
+            auto retained = scratch_.capacity() == size ? std::move(scratch_) : std::vector<float>(scratch_);
+            const auto bytes = retained.capacity() * sizeof(float);
+            if (bytes > capacity_) {
+                scratch_ = std::move(retained);
+                return scratch_;
+            }
             while (bytes > capacity_ - bytes_) {
                 const auto old = cached_.find(recent_.front());
                 bytes_ -= old->second.values.capacity() * sizeof(float);
@@ -76,7 +81,7 @@ public:
             }
             recent_.push_back(name);
             try {
-                const auto it = cached_.try_emplace(name, Slot{std::move(scratch_), std::prev(recent_.end())}).first;
+                const auto it = cached_.try_emplace(name, Slot{std::move(retained), std::prev(recent_.end())}).first;
                 bytes_ += bytes;
                 return it->second.values;
             } catch (...) {

@@ -10,7 +10,7 @@ struct Caps {
     bool avx2 = false, avx512f = false, avx512bw = false, avx512vnni = false, amx_int8 = false;
     bool neon = false, sve = false, dotprod = false;
     unsigned sve_bits = 0;
-    bool avx_vnni = false, f16c = false;
+    bool avx_vnni = false, f16c = false, fma = false;
     bool os_avx = false, os_avx512 = false;
     bool sha_ni = false;  // SHA instructions and the SSE prerequisites of the digest kernel.
     bool sse2 = false;
@@ -56,6 +56,7 @@ constexpr Caps x86_caps(const X86Features& features) noexcept {
     usable.sha_ni = (features.leaf1_ecx & sha_sse) == sha_sse && (features.leaf7_ebx & (1U << 29));
     usable.avx2 = ymm && (features.leaf7_ebx & (1U << 5));
     usable.f16c = ymm && (features.leaf1_ecx & (1U << 29));
+    usable.fma = ymm && (features.leaf1_ecx & (1U << 12));
     usable.avx_vnni = usable.avx2 && (features.leaf7_1_eax & (1U << 4));
     usable.avx512f = zmm && (features.leaf7_ebx & (1U << 16));
     usable.avx512bw = usable.avx512f && (features.leaf7_ebx & (1U << 30));

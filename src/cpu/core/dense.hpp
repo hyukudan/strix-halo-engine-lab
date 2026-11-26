@@ -15,6 +15,17 @@ struct Chunk16Dot {
 // The kernel may be capped below the host ISA, including for reference comparisons.
 Chunk16Dot chunk16_kernel(Isa maximum = Isa::avx512) noexcept;
 
+struct OrderedFma {
+    Isa isa;
+    void (*matvec)(const float* weights, const float* input, std::size_t width,
+                   float* out, std::size_t outputs) noexcept;
+    // Eight independent inputs are interleaved as [width][8].
+    void (*dot8)(const float* weights, const float* inputs, std::size_t width, float* out) noexcept;
+};
+
+// Each result has its own ascending-column FMA chain, including on SIMD.
+OrderedFma ordered_fma_kernel(bool allow_simd) noexcept;
+
 // Writes an independent output range for all rows. Decode maps one stored coefficient
 // to FP32. The caller owns validation, output scheduling and format-specific epilogues.
 template<class Decode>
