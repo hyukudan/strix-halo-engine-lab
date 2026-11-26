@@ -36,6 +36,22 @@ static void test_json() {
     CHECK(j.at("a").arr()[1].num() == -25.0);
     CHECK(j.at("a").arr()[4].str() == "x\xc3\xa9\n");
     CHECK(j.at("b").at("c").str() == "d");
+    // a surrogate pair decodes to one 4-byte UTF-8 sequence; nesting up to the bound parses
+    CHECK(fx::JsonParser(R"("😀")").parse().str() == "\xf0\x9f\x98\x80");
+    CHECK(fx::JsonParser(std::string(128, '[') + std::string(128, ']')).parse().arr().size() == 1);
+    // malformed input is a clean error: deep nesting (no stack exhaustion), a high surrogate paired with a
+    // non-low escape, truncated input
+    const std::string bad[] = {std::string(100000, '['), std::string(129, '[') + std::string(129, ']'),
+                               R"("\ud800\u0000")", R"("\ud800\ud800")", R"({"a":)", R"("\u12)", "[1,", ""};
+    for (const auto& s : bad) {
+        bool refused = false;
+        try {
+            (void)fx::JsonParser(s).parse();
+        } catch (const std::exception&) {
+            refused = true;
+        }
+        CHECK(refused);
+    }
 }
 
 static void test_conversions() {
