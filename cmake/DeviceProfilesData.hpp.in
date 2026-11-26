@@ -1,0 +1,6 @@
+#pragma once
+
+namespace strix::device::detail {
+inline constexpr char profiles_toml[] = R"strix_toml(
+@STRIX_DEVICE_PROFILES_TOML@)strix_toml";
+}

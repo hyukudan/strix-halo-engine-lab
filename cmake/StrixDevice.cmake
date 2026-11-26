@@ -9,6 +9,14 @@ if(NOT TARGET strix_model_description)
     target_include_directories(strix_model_description PUBLIC ${CMAKE_CURRENT_LIST_DIR}/../include)
     target_compile_features(strix_model_description PUBLIC cxx_std_20)
 endif()
+# Embed the built-in catalogue so installed tools resolve the same data from any working directory.
+set(_strix_device_profiles "${CMAKE_CURRENT_LIST_DIR}/../data/devices/profiles.toml")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_strix_device_profiles}")
+file(READ "${_strix_device_profiles}" STRIX_DEVICE_PROFILES_TOML)
+configure_file("${CMAKE_CURRENT_LIST_DIR}/DeviceProfilesData.hpp.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/strix/device/profiles_data.hpp" @ONLY NEWLINE_STYLE LF)
+unset(STRIX_DEVICE_PROFILES_TOML)
+unset(_strix_device_profiles)
 add_library(strix_device STATIC
     ${CMAKE_CURRENT_LIST_DIR}/../src/device/declaration.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../src/device/gate.cpp
@@ -19,6 +27,7 @@ add_library(strix_device STATIC
     ${CMAKE_CURRENT_LIST_DIR}/../src/device/process_topology.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../src/deploy/memory_plan.cpp)
 target_link_libraries(strix_device PUBLIC strix_model_description)
+target_include_directories(strix_device PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_compile_features(strix_device PUBLIC cxx_std_20)
 if(MSVC)
     target_compile_definitions(strix_device PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -34,7 +43,7 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME strix-device-gate-tests COMMAND strix-device-gate-tests)
     # Device catalogue, declared budgets and the shared memory plan (strix/device/profiles.hpp, budget.hpp,
-    # strix/deploy/memory_plan.hpp); also checks data/devices/profiles.toml against the table.
+    # strix/deploy/memory_plan.hpp), including the built-in TOML and its CLI export.
     add_executable(strix-device-profiles-tests ${CMAKE_CURRENT_LIST_DIR}/../tests/device_profiles_tests.cpp
         ${CMAKE_CURRENT_LIST_DIR}/../src/deploy/device.cpp)
     target_link_libraries(strix-device-profiles-tests PRIVATE strix_device)

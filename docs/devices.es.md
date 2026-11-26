@@ -84,8 +84,9 @@ dispositivo y `/api/status` muestran `profile=` y el presupuesto solo cuando se 
 
 Especificaciones públicas del fabricante salvo los campos que lista la columna `measured`. Los picos son TFLOPS / TOPS
 densos (FP16 y FP8 a la tasa de acumulación FP16; las GeForce ejecutan BF16 a la mitad); 0 = sin camino tensorial o no
-declarado. La memoria de las tarjetas NVIDIA es el total que informa el runtime. El fichero de datos es
-[data/devices/profiles.toml](../data/devices/profiles.toml) (`strix-device-plan --toml`).
+declarado. La memoria de las tarjetas NVIDIA es el total que informa el runtime. La compilación incorpora
+los perfiles de [data/devices/profiles.toml](../data/devices/profiles.toml). El comando `strix-device-plan --toml`
+exporta esos perfiles con las clases de interconexión.
 
 | perfil | arch | memoria GiB | GB/s | unidades | FP32 | FP16 | BF16 | FP8 | FP4 | INT8 | enlace host | medido |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|

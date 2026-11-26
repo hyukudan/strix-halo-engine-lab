@@ -1,9 +1,10 @@
-# Generated from src/device/profiles.cpp (strix::device::catalogue_toml); do not edit by hand.
-# Peaks are dense TFLOPS / TOPS; 0 = no tensor path or not stated. `measured` lists the fields read on our
-# own devices; everything else is the vendor's public specification.
+# Built-in device profiles, in catalogue display order.
+# Peaks are dense TFLOPS / TOPS; 0 = no tensor path or not stated. Fields listed in `measured`
+# come from runtime observations; the other fields use vendor specifications.
 schema = "strix-device-profiles-v1"
 
-[profiles.rtx-pro-6000-blackwell-96]
+[[profiles]]
+name = "rtx-pro-6000-blackwell-96"
 display = "NVIDIA RTX PRO 6000 Blackwell (96 GB)"
 vendor = "nvidia"
 arch = "sm_120"
@@ -16,9 +17,10 @@ pcie = { gen = 5, width = 16 }
 host_link = "pcie5x16"
 unified = false
 measured = "memory_bytes,units"
-note = "our card; memory_bytes and units read from the runtime, peaks public spec"
+note = "memory_bytes and units read from the runtime, peaks from vendor specifications"
 
-[profiles.rtx-5090-32]
+[[profiles]]
+name = "rtx-5090-32"
 display = "NVIDIA GeForce RTX 5090 (32 GB)"
 vendor = "nvidia"
 arch = "sm_120"
@@ -33,7 +35,8 @@ unified = false
 measured = ""
 note = "same SM generation as the RTX PRO 6000 with 170 of its 188 SMs: about 10 % less compute at equal memory speed"
 
-[profiles.rtx-5080-16]
+[[profiles]]
+name = "rtx-5080-16"
 display = "NVIDIA GeForce RTX 5080 (16 GB)"
 vendor = "nvidia"
 arch = "sm_120"
@@ -47,7 +50,8 @@ host_link = "pcie5x16"
 unified = false
 measured = ""
 
-[profiles.rtx-4090-24]
+[[profiles]]
+name = "rtx-4090-24"
 display = "NVIDIA GeForce RTX 4090 (24 GB)"
 vendor = "nvidia"
 arch = "sm_89"
@@ -62,7 +66,8 @@ unified = false
 measured = ""
 note = "profile only (planning); no FP4 tensor path on sm_89"
 
-[profiles.strix-halo-128]
+[[profiles]]
+name = "strix-halo-128"
 display = "AMD Ryzen AI Max+ 395 / Radeon 8060S (128 GB)"
 vendor = "amd"
 arch = "gfx1151"
@@ -76,9 +81,10 @@ host_link = "integrated"
 unified = true
 measured = "memory_bytes"
 lowbit_rows = { small_rows = 64, wide_panels = 64 }
-note = "our nodes; memory_bytes = GPU-visible memory as configured there (depends on the GTT setting); HIP reports 20 compute units (WGPs); measured stream read about 243 GB/s; WMMA FP16 = BF16 = IU8 rate"
+note = "memory_bytes = configured GPU-visible memory (depends on the GTT setting); HIP reports 20 compute units (WGPs); measured stream read about 243 GB/s; WMMA FP16 = BF16 = IU8 rate"
 
-[profiles.dgx-spark-gb10-128]
+[[profiles]]
+name = "dgx-spark-gb10-128"
 display = "NVIDIA DGX Spark GB10 (128 GB)"
 vendor = "nvidia"
 arch = "sm_121"
@@ -93,7 +99,8 @@ unified = true
 measured = ""
 note = "unified LPDDR5X shared with the CPU; usable GPU memory is lower than 128 GiB"
 
-[profiles.rx-9070-xt-16]
+[[profiles]]
+name = "rx-9070-xt-16"
 display = "AMD Radeon RX 9070 XT (16 GB, RDNA4)"
 vendor = "amd"
 arch = "gfx1201"
@@ -108,7 +115,8 @@ unified = false
 measured = ""
 note = "RDNA4 discrete; WMMA FP8 and IU8 at 2x FP16"
 
-[profiles.custom]
+[[profiles]]
+name = "custom"
 display = "custom device (every value from the declaration entry)"
 vendor = ""
 arch = ""
@@ -122,38 +130,3 @@ host_link = ""
 unified = false
 measured = ""
 note = "set memory_gib (and optionally bandwidth_gbytes_ps, units) in the entry"
-
-# Interconnect classes for `count = N` shapes: nominal one-direction GB/s and round trip (us).
-[interconnects."pcie5x16"]
-gbytes_ps = 50
-rtt_us = 5
-[interconnects."pcie4x16"]
-gbytes_ps = 25
-rtt_us = 5
-[interconnects."pcie4x4"]
-gbytes_ps = 7
-rtt_us = 5
-[interconnects."oculink4x4"]
-gbytes_ps = 7
-rtt_us = 5
-[interconnects."pcie3x4"]
-gbytes_ps = 3.2
-rtt_us = 5
-[interconnects."usb4"]
-gbytes_ps = 4.58
-rtt_us = 30
-[interconnects."100gbe"]
-gbytes_ps = 11.5
-rtt_us = 20
-[interconnects."25gbe"]
-gbytes_ps = 2.8
-rtt_us = 60
-[interconnects."10gbe"]
-gbytes_ps = 1.1
-rtt_us = 100
-[interconnects."2.5gbe"]
-gbytes_ps = 0.29
-rtt_us = 150
-[interconnects."1gbe"]
-gbytes_ps = 0.118
-rtt_us = 200
