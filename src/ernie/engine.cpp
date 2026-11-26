@@ -119,6 +119,12 @@ std::vector<float> FirstRowReference::attention(const std::string& prefix, std::
     return output;
 }
 
+// GCC 15 -O2 reports -Wfree-nonheap-object on the routed reference's scratch vectors once they are inlined through
+// the latent-expert lambdas (a vector freed at its own data pointer); a false positive, scoped to this function.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfree-nonheap-object"
+#endif
 void FirstRowReference::feed_forward(const std::string& layer, bool routed, std::span<const float> input,
                                      LayerResult& result) const {
     const auto& s = shape_;
@@ -171,6 +177,9 @@ void FirstRowReference::feed_forward(const std::string& layer, bool routed, std:
             glu(shared + "w1.weight", shared + "w3.weight", shared + "w2.weight", s.expert_width, in, out);
         }, result.ffn);
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 LayerResult FirstRowReference::block(unsigned layer, std::span<const float> streams) const {
     if (layer >= kLayerCount || layer_is_mla(layer))
