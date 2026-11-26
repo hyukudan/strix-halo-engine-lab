@@ -12,6 +12,7 @@
 //
 // Consumers: drafter feature taps (hidden rows a block drafter reads from committed positions).
 
+#include "strix/device/decode_geometry.hpp"
 #include "strix/attn/cache_rows.hpp"
 #include "strix/exec/descriptor.hpp"
 
@@ -54,10 +55,15 @@ __global__ void __launch_bounds__(256) store_rows(StepRowStoreBf16 a) {
 
 }  // namespace step_row_store_detail
 
+inline device::LaunchGeometry step_row_store_geometry(unsigned width, unsigned rows) {
+    return device::decode_geometry::row_groups(step_row_store_blocks(width), rows);
+}
+
 template <unsigned Rows>
 cudaError_t enqueue_step_row_store_bf16(const StepRowStoreBf16& a, cudaStream_t stream) {
     if (!valid_step_row_store(a)) return cudaErrorInvalidValue;
-    step_row_store_detail::store_rows<Rows><<<dim3(step_row_store_blocks(a.width), Rows), 256, 0, stream>>>(a);
+    const auto geometry = step_row_store_geometry(a.width, Rows);
+    step_row_store_detail::store_rows<Rows><<<geometry.grid<dim3>(), geometry.block<dim3>(), 0, stream>>>(a);
     return cudaGetLastError();
 }
 #endif

@@ -12,7 +12,10 @@ struct LaunchGeometry {
     std::array<std::uint32_t, 3> threads{1, 1, 1};
     std::uint32_t shared_bytes = 0;
 
-    constexpr bool operator==(const LaunchGeometry&) const noexcept = default;
+    bool operator==(const LaunchGeometry& other) const noexcept {
+        return blocks == other.blocks && threads == other.threads && shared_bytes == other.shared_bytes;
+    }
+    bool operator!=(const LaunchGeometry& other) const noexcept { return !(*this == other); }
 
     template <class Dimensions>
     constexpr Dimensions grid() const { return {blocks[0], blocks[1], blocks[2]}; }

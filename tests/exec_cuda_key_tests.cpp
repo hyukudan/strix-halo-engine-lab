@@ -74,6 +74,18 @@ void test_invalidation() {
     require(binding.select(changed, 5) == GraphAction::eager, "a tap must stay eager");
 }
 
+void test_launch_shapes() {
+    namespace geo = strix::device::decode_geometry;
+    require(geo::pointwise(1).blocks[0] == 1 && geo::pointwise(257, 8).blocks == std::array{2U, 8U, 1U} &&
+            geo::pointwise(65535U * 256U + 1U).blocks[0] == 65535, "pointwise launch boundaries");
+    require(geo::head_clip(24, 8, 32).threads[0] == 32 && geo::head_clip(24, 8, 33).threads[0] == 128 &&
+            geo::head_clip(24, 8, 129).threads[0] == 256, "head clip instantiation boundaries");
+    const auto flash = geo::prepared_flash128(24, 8);
+    require(flash.blocks == std::array{24U, 8U, 1U} && flash.shared_bytes == 35840U, "padded flash layout");
+    require(geo::dense_fma(9).blocks[0] == 2 && geo::dense_mma(7, 2).blocks == std::array{7U, 2U, 1U},
+            "dense projection tile grid");
+}
+
 void test_strict_capture() {
     Program program{};
     program.launches.resize(1);
@@ -208,6 +220,7 @@ int main() {
         test_keys();
         test_invalidation();
         test_node_plan();
+        test_launch_shapes();
         test_strict_capture();
         test_descriptor_projection();
         std::puts("exec_cuda_keys PASS");

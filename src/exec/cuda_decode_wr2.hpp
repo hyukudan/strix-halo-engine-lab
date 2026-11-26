@@ -130,7 +130,7 @@ inline BoundStepLeaf bind_step(const core::causal_conv::StepArgs& a, unsigned ro
     using namespace core::causal_conv;
     if (!core::valid_short_convolution_plan(a.plan)) throw std::invalid_argument("invalid WR2 convolution shape");
     const auto grid = launch_plan(a.plan, {rows, a.input, a.static_weights, a.dynamic_weights, a.pending, a.output});
-    const Grid native{{grid.channel_blocks, 1, 1}, {grid.threads, 1, 1}, 0};
+    const Grid native = grid.step_geometry();
     return wr2_detail::by_width(rows, [&]<unsigned R>() {
         if (a.round_bf16) return wr2_detail::bind<R, enqueue_step<R, true>>(a, "cuda-sm120-causal-convolution-bf16", native);
         return wr2_detail::bind<R, enqueue_step<R, false>>(a, "cuda-sm120-causal-convolution-f32", native);
@@ -141,10 +141,9 @@ inline BoundStepLeaf bind_step(const core::causal_conv::StepArgs& a, unsigned ro
 // come from the step descriptor, so the R = 1 decode graph and every verify graph reuse their capture.
 inline BoundStepLeaf bind_step(const cuda::core::StepRowStoreBf16& a, unsigned rows) {
     if (!cuda::core::valid_step_row_store(a)) throw std::invalid_argument("invalid step row store");
-    const unsigned blocks = cuda::core::step_row_store_blocks(a.width);
     return wr2_detail::by_width(rows, [&]<unsigned R>() {
         return wr2_detail::bind<R, cuda::core::enqueue_step_row_store_bf16<R>>(a, "cuda-sm120-step-row-store-bf16",
-            {{blocks, R, 1}, {256, 1, 1}, 0});
+            cuda::core::step_row_store_geometry(a.width, R));
     });
 }
 

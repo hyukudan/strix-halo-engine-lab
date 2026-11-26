@@ -725,7 +725,7 @@ KernelBinding bind(const PreparedFlashSplitBf16& s) {
         s.workspace_bytes < need) throw std::invalid_argument("invalid CUDA decode split shape or workspace");
     // Grid (KV head, chunk capacity) of attn_flash_decode_split.cu; chunks past the row's plan exit at once.
     const auto chunks = attn_split::decode_split_capacity(a.capacity, a.window);
-    return bind_leaf(flash_split, {{a.kv_heads, chunks, 1}, {attn_split::kUnit, 1, 1}, 0}, s);
+    return bind_leaf(flash_split, geo::prepared_split(a.kv_heads, chunks, 1, attn_split::kUnit), s);
 }
 
 KernelBinding bind(const PreparedFlashSplitHostBf16& s) {
@@ -738,7 +738,7 @@ KernelBinding bind(const PreparedFlashSplitHostBf16& s) {
         s.workspace_bytes < need || !attn_split::lane_fits(a.first_position, a.window, chunks))
         throw std::invalid_argument("invalid CUDA host-position decode split shape, position or workspace");
     // Grid (KV head, chunk capacity, one lane) of the lanes entry; chunks past the row's plan exit at once.
-    return bind_leaf(flash_split_host, {{a.kv_heads, chunks, 1}, {attn_split::kUnit, 1, 1}, 0}, s);
+    return bind_leaf(flash_split_host, geo::prepared_split(a.kv_heads, chunks, 1, attn_split::kUnit), s);
 }
 
 KernelBinding bind(const PreparedFinite& a) {
@@ -753,7 +753,7 @@ KernelBinding bind(const CausalConvolution& a) {
     const auto args = convolution_args(a);
     if (!core::causal_conv::valid(a.plan, args)) throw std::invalid_argument("invalid CUDA R1 convolution");
     const auto grid = core::causal_conv::launch_plan(a.plan, args);
-    return bind_leaf(conv, {{grid.channel_blocks, grid.row_blocks, 1}, {grid.threads, 1, 1}, 0}, a);
+    return bind_leaf(conv, grid.geometry(), a);
 }
 
 KernelBinding bind(const HeadClipBf16& a) {
@@ -913,7 +913,7 @@ KernelBinding bind(const RoundedCausalConvolution& a) {
     if (!valid(a))
         throw std::invalid_argument("invalid CUDA R1 rounded convolution");
     const auto grid = core::causal_conv::launch_plan(conv.plan, convolution_args(conv));
-    return bind_leaf(conv_round, {{grid.channel_blocks, grid.row_blocks, 1}, {grid.threads, 1, 1}, 0}, a);
+    return bind_leaf(conv_round, grid.geometry(), a);
 }
 
 KernelBinding bind(const residual::NormalizePairArgs& a) {
@@ -971,8 +971,7 @@ KernelBinding bind(const BankReadoutTiled& a) {
 KernelBinding bind(const Bf16OutputSplitRound& a) {
     if (!fits(a)) throw std::invalid_argument("invalid CUDA R1 BF16 output split");
     const auto macs = std::uint64_t{a.outputs} * a.input_width;
-    return bind_leaf(linear_mma3_split, {{cuda::bf16_narrow_blocks(a.input_width, a.outputs), 1, 1},
-                                         {cuda::kBf16NarrowThreads, 1, 1}, 0}, a,
+    return bind_leaf(linear_mma3_split, cuda::bf16_narrow_geometry(a.input_width, a.outputs), a,
         {.weight_bytes = macs * sizeof(std::uint16_t), .state_bytes = std::uint64_t{a.input_width} * sizeof(float),
          .macs = macs, .scratch = {}, .bytes_written = std::uint64_t{a.outputs} * sizeof(float)});
 }

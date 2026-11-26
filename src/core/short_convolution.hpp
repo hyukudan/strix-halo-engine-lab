@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/device/decode_geometry.hpp"
 #include "decode_state_rows.hpp"
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
@@ -284,6 +285,13 @@ struct LaunchPlan {
 
     static constexpr unsigned threads = 256;
     static constexpr std::size_t grid_limit = 65535;
+
+    [[nodiscard]] constexpr device::LaunchGeometry geometry() const {
+        return device::decode_geometry::row_groups(channel_blocks, row_blocks, threads);
+    }
+    [[nodiscard]] constexpr device::LaunchGeometry step_geometry() const {
+        return device::decode_geometry::row_groups(channel_blocks, 1, threads);
+    }
 };
 
 #if defined(__CUDACC__) && !defined(__HIPCC__)
@@ -365,10 +373,11 @@ inline cudaError_t enqueue_step(const StepArgs& args, cudaStream_t stream) {
     if (!args.step || !args.history.valid() || !valid(args.plan, buffers) ||
         args.plan.taps - 1U > limit / Rows / args.plan.channels) return cudaErrorInvalidValue;
     const auto grid = launch_plan(args.plan, buffers);
+    const device::LaunchGeometry geometry = grid.step_geometry();
     if (args.plan.dynamic_groups != 0U) {
-        detail::convolve_step<Rows, true, Round><<<grid.channel_blocks, grid.threads, 0, stream>>>(args, grid.group_width);
+        detail::convolve_step<Rows, true, Round><<<geometry.grid<dim3>(), geometry.block<dim3>(), 0, stream>>>(args, grid.group_width);
     } else {
-        detail::convolve_step<Rows, false, Round><<<grid.channel_blocks, grid.threads, 0, stream>>>(args, 0U);
+        detail::convolve_step<Rows, false, Round><<<geometry.grid<dim3>(), geometry.block<dim3>(), 0, stream>>>(args, 0U);
     }
     return cudaGetLastError();
 }
@@ -378,12 +387,13 @@ inline cudaError_t enqueue_step(const StepArgs& args, cudaStream_t stream) {
 template <bool RoundOutput, bool Decode, bool RoundInput = false>
 inline void enqueue(const ShortConvolution& plan, const Args& args, LaunchPlan config,
                     pointwise::Stream stream) {
-    const dim3 grid(config.channel_blocks, config.row_blocks);
+    const auto geometry = config.geometry();
+    const auto grid = geometry.grid<dim3>(), block = geometry.block<dim3>();
     if (plan.dynamic_groups != 0) {
-        detail::convolve<true, Decode, RoundOutput, RoundInput><<<grid, LaunchPlan::threads, 0, stream>>>(
+        detail::convolve<true, Decode, RoundOutput, RoundInput><<<grid, block, 0, stream>>>(
             plan, args, config.group_width);
     } else {
-        detail::convolve<false, Decode, RoundOutput, RoundInput><<<grid, LaunchPlan::threads, 0, stream>>>(
+        detail::convolve<false, Decode, RoundOutput, RoundInput><<<grid, block, 0, stream>>>(
             plan, args, config.group_width);
     }
 }

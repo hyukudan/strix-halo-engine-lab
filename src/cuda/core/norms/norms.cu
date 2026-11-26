@@ -87,7 +87,7 @@ cudaError_t rmsnorm_bf16_step(const float* input, const std::uint16_t* gain, flo
     const GroupedView view{grid.y, grid.x, width};
     return cuda::core::dispatch_step_rows(grid.y, [&]<unsigned Width> {
         const auto launch = [&]<int NREG> {
-            rms_bf16_step_kernel<Width, NREG><<<grid, 256, 0, stream>>>(
+            rms_bf16_step_kernel<Width, NREG><<<grid, device::decode_geometry::row_threads, 0, stream>>>(
                 input, view, gain, output, epsilon, cuda::core::StepRows<Width>{descriptor});
         };
         const auto nreg = (width + 255U) / 256U;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/device/decode_geometry.hpp"
 #include "core/dense_bf16_narrow_plan.hpp"
 
 namespace strix::cuda_core {
@@ -10,6 +11,10 @@ inline constexpr unsigned kBf16NarrowThreads = 256U;
 // The shared plan with the m16 tile geometry of this backend.
 [[nodiscard]] constexpr unsigned bf16_narrow_blocks(unsigned in, unsigned out) noexcept {
     return ::strix::core::bf16_narrow_blocks(in, out, 32U, 2U * kBf16NarrowOutputs);
+}
+
+[[nodiscard]] constexpr device::LaunchGeometry bf16_narrow_geometry(unsigned in, unsigned out) noexcept {
+    return device::decode_geometry::row_groups(bf16_narrow_blocks(in, out), 1, kBf16NarrowThreads);
 }
 
 // The shared split selection with the same geometry.

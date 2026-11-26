@@ -165,6 +165,28 @@ void moe_pipe() {
     }
 }
 
+void capped_activation() {
+    decode::GroupedActivation a{};
+    a.args.gate_up = scratch;
+    a.args.output = weights[0];
+    a.gate_cap = 1.0F;
+    a.up_cap = 1.0F;
+    // The host bind records addresses. No data is touched at either size.
+    for (unsigned rows : {1U, 65535U, 65536U}) {
+        a.args.rows = rows;
+        for (unsigned width : {128U, 129U, 65535U * 128U + 1U}) {
+            a.args.width = width;
+            a.args.gate_up_row = 2U * width;
+            a.args.output_row = width;
+            const auto binding = decode::bind(a);
+            check(binding.grid == strix::moe_core::expert_activation::launch_geometry(width, rows),
+                  "grouped activation bind matches the launch");
+            check(binding.grid.blocks[0] <= 65535U && binding.grid.blocks[1] <= 65535U,
+                  "grouped activation grid exceeds the native limit");
+        }
+    }
+}
+
 // The five screened head stages bind as one-launch leaves with completion edges, their grids follow the owner's plan
 // (lanes, pass-1 lane groups and shared bytes), and an invalid launch is refused at bind time.
 void screened_head() {
@@ -285,6 +307,7 @@ int main() {
     controller_forms();
     fallbacks();
     moe_pipe();
+    capped_activation();
     screened_head();
     if (failures != 0) return 1;
     std::puts("cuda decode R1 forms: incumbent default, tiled bank, output split, MoE pipe, screened head bindings PASS");

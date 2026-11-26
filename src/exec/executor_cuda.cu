@@ -177,7 +177,7 @@ void validate_capture_grid(cudaGraphNode_t node, const BoundLaunch& launch) {
 }
 
 void capture_bound(const Program& program, std::span<const CudaNodeBinding> plan, cudaStream_t stream,
-                   CudaGraphStats& captured, bool verify_grid, bool native_chain) {
+                   CudaGraphStats& captured, bool verify_grid, bool native_chain, bool& inspection_failed) {
     std::vector<cudaGraphNode_t> nodes(plan.size());
     std::vector<cudaGraphNode_t> parents;
     std::vector<cudaGraphEdgeData> edges;
@@ -209,8 +209,13 @@ void capture_bound(const Program& program, std::span<const CudaNodeBinding> plan
         case CudaNodeKind::copy_d2h_pinned: type = cudaGraphNodeTypeMemcpy; ++captured.copies; break;
         case CudaNodeKind::memset: type = cudaGraphNodeTypeMemset; ++captured.memsets; break;
         }
-        nodes[i] = captured_node(stream, type, parents, edges);
-        if (verify_grid && node.kind == CudaNodeKind::kernel) validate_capture_grid(nodes[i], program.launches[i]);
+        try {
+            nodes[i] = captured_node(stream, type, parents, edges);
+            if (verify_grid && node.kind == CudaNodeKind::kernel) validate_capture_grid(nodes[i], program.launches[i]);
+        } catch (...) {
+            inspection_failed = true;
+            throw;
+        }
         ++captured.nodes;
         captured.edges += parents.size();
     }
@@ -304,10 +309,11 @@ struct CudaExecutor::Impl {
                                   cuda_detail::is_completion_chain(plan);
         ++cached.stats.captures;
         std::exception_ptr capture_error;
+        bool inspection_failed = false;
         const bool installed = cached.graph.prepare_program(capture_stream.get(), program.key.rows, rebind,
             [&] {
                 try {
-                    capture_bound(program, plan, capture_stream.get(), captured, strict, native_chain);
+                    capture_bound(program, plan, capture_stream.get(), captured, strict, native_chain, inspection_failed);
                 } catch (...) {
                     capture_error = std::current_exception();
                     throw;
@@ -315,11 +321,13 @@ struct CudaExecutor::Impl {
             },
             [&](cudaGraph_t graph) noexcept {
                 std::size_t count = 0;
-                return cudaGraphGetNodes(graph, nullptr, &count) == cudaSuccess && count == program.launches.size();
+                inspection_failed = cudaGraphGetNodes(graph, nullptr, &count) != cudaSuccess || count != program.launches.size();
+                return !inspection_failed;
             });
         if (!installed) {
-            if (strict && (capture_error || check_all)) {
-                // A second call must observe the same failure, even for optional graphs.
+            // Optional capture may decline before it has an observable plan (e.g. unsupported stream operation).
+            // A malformed observed plan must remain visible to debug/test callers even on a second submission.
+            if (strict && (inspection_failed || (cuda_detail::strict_capture(program, binding, false) && capture_error))) {
                 cached.binding = {};
                 if (capture_error) std::rethrow_exception(capture_error);
                 throw std::runtime_error("strict CUDA program capture failed");

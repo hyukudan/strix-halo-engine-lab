@@ -110,6 +110,11 @@ void program_chain() {
     residual::TransitionArgs first{}, second{};
     std::memcpy(&first, fused[0].args.data(), sizeof(first));
     std::memcpy(&second, fused[2].args.data(), sizeof(second));
+    constexpr auto ring_budget = (3U * ::strix::cuda::mix::kLatencyTile + 3U * kWidth) * sizeof(float);
+    const auto small = decode::bind(first, ring_budget);
+    check(small.grid.shared_bytes == ring_budget && small.grid.shared_bytes < fused[0].grid.shared_bytes,
+          "smaller device budget is baked into the bound transition");
+
     residual::MixArgs base_read{};
     std::memcpy(&base_read, base[1].args.data(), sizeof(base_read));
     bool same_read = first.mix.queries == base_read.queries && first.mix.rows == base_read.rows &&

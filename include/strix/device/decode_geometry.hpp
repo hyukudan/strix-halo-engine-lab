@@ -43,6 +43,10 @@ constexpr LaunchGeometry attention_splits(unsigned chunks, unsigned kv_heads, un
     return {{chunks, kv_heads, rows}, {split_keys, 1, 1}, 0};
 }
 
+constexpr LaunchGeometry prepared_split(unsigned kv_heads, unsigned capacity, unsigned rows, unsigned threads) {
+    return {{kv_heads, capacity, rows}, {threads, 1, 1}, 0};
+}
+
 constexpr LaunchGeometry gdn(unsigned heads, unsigned groups = 1) { return row_groups(heads, groups, 128); }
 
 // Strides, tile size and stages used by the native padded BF16 attention layout.

@@ -98,10 +98,12 @@ KernelBinding Bindings::bind(const Bf16DenseGroup& a) const {
         outputs += p.outputs;
     }
     require(outputs <= std::numeric_limits<unsigned>::max() - 7U);
-    const auto blocks = mma ? outputs / core::rows::kTileOut : (outputs - 1U) / 8U + 1U;
     const auto which = !mma ? Leaf::dense_fp32 : round_bf16 ? Leaf::dense_mma3_round : Leaf::dense_mma3;
     const auto tiles = mma ? rows : rows / core::dense_step_row_tile(rows);
-    return leaf(which, {{static_cast<unsigned>(blocks), tiles, 1}, {256, 1, 1}, 0}, a);
+    const auto total = static_cast<unsigned>(outputs);
+    const auto geometry = mma ? device::decode_geometry::dense_mma(total / core::rows::kTileOut, tiles)
+                              : device::decode_geometry::dense_fma(total, tiles);
+    return leaf(which, geometry, a);
 }
 
 KernelBinding Bindings::bind(const mix::MixArgs& a) const {
