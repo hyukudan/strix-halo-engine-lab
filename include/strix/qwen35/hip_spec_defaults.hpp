@@ -27,6 +27,7 @@
 #include "strix/qwen35/hip_dense_spec_costs.hpp"
 #include "strix/qwen35/hip_engine.hpp"
 #include "strix/qwen35/iu4_draft_head.hpp"
+#include "strix/spec/probe_policy.hpp"
 #include "strix/spec/block_drafter.hpp"
 #include "strix/spec/draft_rows.hpp"
 #include "strix/spec/mtp_chain.hpp"
@@ -106,6 +107,7 @@ inline spec::BlockConfig hip_dense_block_config(const HipDenseSpecPlan& plan, do
     auto bc = hip_dense_spec_block_config(HipEngine::max_rows(), !plan.mtp_source.empty(), plan.costs != HipDenseCostMode::learned,
                                           head_fraction, costs);
     if (bc.fixed_costs) spec::set_context_cost(bc.arbiter, hip_dense_cost_kv(plan.cost_kv, costs.source));
+    spec::apply_probe_loss(bc.arbiter, "qwen3.8-27b", "hip");  // fixed interval until a device receipt (probe_policy.hpp)
     return bc;
 }
 // The plan's costs for this engine (F7: nothing lab-specific by default). calibrated: after the prompt (real context),

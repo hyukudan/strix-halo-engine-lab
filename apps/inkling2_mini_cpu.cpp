@@ -92,6 +92,8 @@ int main(int argc, char** argv) {
             return serve::BpeTokenizer::load_hf_json(path, serve::inkling2_mini_tokenizer_identity);
         },
         false, serve::render_inkling2_chat_request, true};
+    family.speculation_engine = "inkling2-mini";  // spec::resolve_probe_loss data row (per backend)
+    family.speculation_backend = "cpu";
 #if defined(STRIX_INKLING2_MEDIA)
     family.render_media_messages = serve::render_inkling2_chat_media_request;
 #endif

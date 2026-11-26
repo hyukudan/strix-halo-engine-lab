@@ -6471,26 +6471,26 @@ model pending a matched timing comparison.
 
 ## Shared speculation arbiter: measured probe episodes
 
-**Engine:** `shared`. **Control:** ArbiterConfig::probe_loss. **Default:** on (0.015).
+**Engine:** `shared`. **Control:** `STRIX_SPEC_PROBE_LOSS` (0..1; 0 = the previous fixed re-probe interval, bit-identical), one resolver for command line and server (`spec::resolve_probe_loss`). **Default:** per engine and backend as data (`include/strix/spec/probe_policy.hpp`): 0.015 only for Inkling 2 Mini CUDA (receipt below); every other engine keeps the fixed interval until its off-vs-on device arms exist.
 
 A probe of a learned per-depth drafter runs the deepest legal window and opens an episode whose realized ledger (every model pass at the plain row's ms per token; allowance half a priced excess, credit capped at three probe walls) keeps the drafter while it is not losing; the closed episode's realized loss paces the next probe. Bound: exploration loses at most probe_loss of decode time plus one episode and the first measurements.
 
-- **Shared home:** include/strix/spec/drafting.hpp + src/spec/drafting.cpp (spec::Arbiter).
+- **Shared home:** include/strix/spec/drafting.hpp + src/spec/drafting.cpp (spec::Arbiter); include/strix/spec/probe_policy.hpp (per-engine default, switch).
 - **Tier and regime:** EXACT, FAST, QUALITY, TURBO; speculative decode at one request.
 - **Exactness evidence:** Drafts never change emitted tokens (greedy verify). RTX q47: ids equal on code and prose (new auto == off == q46 resident).
-- **Off switch:** ArbiterConfig::probe_loss = 0.
+- **Off switch:** `STRIX_SPEC_PROBE_LOSS=0`.
 - **Measured gain:** RTX PRO, cuda_pf2-kit q48, Inkling 2 Mini CUDA CLI EXACT 256 tokens: code 130.2 / 131.4 tok/s vs off 90.8 and the previous default 116.0 (51 of 54 passes drafted); prose 91.3 / 91.2 vs off 94.8 (0.963x: the bound at one 255-token request is 0.96x = probe_loss 1.5 % + the opening measurements ~2 % of a 2.7 s decode). q47 (the previous charged probe): code 88.4 (6 of 250 passes drafted). Host closed-loop trace, 64 requests: code 1.21x plain (always drafting 1.32x), prose 0.970x.
 - **Preconditions:** Learned walls (not frozen prices), a per-depth drafter (model_draft_ms), charge_probe on.
 
 | Model | Binding |
 | --- | --- |
-| Qwen3.8 Flash-Next MoE | bound where the Qwen spec CLIs (apps/*qwen35_spec_main) run a learned MTP chain through spec::BlockDrafter; frozen-price runs keep priced exploration (unchanged); not re-measured |
-| Qwen3.8 27B dense | bound where the Qwen spec CLIs (apps/*qwen35_spec_main) run a learned MTP chain through spec::BlockDrafter; frozen-price runs keep priced exploration (unchanged); not re-measured |
+| Qwen3.8 Flash-Next MoE | fixed re-probe interval by default (no device receipt); STRIX_SPEC_PROBE_LOSS=0.015 runs the episodes in the Qwen spec CLIs (apps/*qwen35_spec_main, learned MTP chain through spec::BlockDrafter) |
+| Qwen3.8 27B dense | fixed re-probe interval by default (no device receipt); STRIX_SPEC_PROBE_LOSS=0.015 runs the episodes in the Qwen spec CLIs (apps/*qwen35_spec_main, learned MTP chain through spec::BlockDrafter) |
 | DeepSeek V4.1 Flash | not affected: the DSpark batch drafter is a black-box measured pass (model_pass_ms), a different arbiter branch |
 | GLM 5.3 Flash | not affected: the MTP pair arbiter prices a black-box pass / frozen prices, a different arbiter branch |
 | MiniMax M3.1 Flash | not applicable: no drafter |
-| Inkling 2 Mini | bound: CUDA and HIP serial CLI (MTP chain through spec::BlockDrafter, learned walls); the server's cohort context drafter is lookup (unchanged) |
-| Hy4 Flash | bound where the Hy4 rows run a learned chain through spec::BlockDrafter; not re-measured |
+| Inkling 2 Mini | default on in the CUDA serial CLI (receipt above); HIP and CPU serial CLI keep the fixed interval until their device arms exist; the server's cohort context drafter is lookup (unchanged) |
+| Hy4 Flash | fixed re-probe interval by default (no device receipt); STRIX_SPEC_PROBE_LOSS=0.015 runs the episodes in the Hy4 rows (learned chain through spec::BlockDrafter) |
 | Nemotron 3.5 Bolt E4B | not applicable: no drafter |
 
 <a id="inkling2-drafting-step-graph"></a>

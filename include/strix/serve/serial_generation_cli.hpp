@@ -139,6 +139,9 @@ struct SerialGenerationFamily {
     // Chunk the implicit default falls back to when the decoder fails to allocate it (never an explicit --prefill-chunk);
     // zero: no fallback. See prefill_chunk_fallback.hpp.
     std::uint32_t prefill_chunk_fallback = 0;
+    // Model registry key and backend (cuda | hip | cpu) of the shared arbiter's per-engine data
+    // (spec::resolve_probe_loss). Empty: the fixed re-probe interval unless STRIX_SPEC_PROBE_LOSS is set.
+    std::string_view speculation_engine{}, speculation_backend{};
 };
 
 // Tail rows for a prompt of prompt_size rows in chunks of `chunk` (already clamped to the prompt): the remainder after

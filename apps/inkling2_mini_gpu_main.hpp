@@ -311,6 +311,8 @@ int main(int argc, char** argv) {
             },
             packed_decode_default, serve::render_inkling2_chat_request, true};
         // The served schedule's resolver (STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks on both entry points).
+        family.speculation_engine = "inkling2-mini";  // spec::resolve_probe_loss data row (per backend)
+        family.speculation_backend = kMiniBuildBackend;
         family.prefill_tail_divisor =
             mini_prefill_schedule_from_env(strix::inkling2::cli::kMiniHipSchedule, strix::profile::Name::standard).tail_divisor;
 #if defined(STRIX_INKLING2_MEDIA)

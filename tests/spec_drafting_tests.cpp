@@ -2,6 +2,8 @@
 // copy cursor on a copy-with-one-edit stream, the arbiter's choices on synthetic acceptance/costs, and the stats line.
 // A simulated greedy target checks that whatever the arbiter picks, the emitted ids equal the serial ids.
 #include "strix/spec/drafting.hpp"
+#include "strix/spec/block_drafter.hpp"
+#include "strix/spec/probe_policy.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1421,7 +1423,53 @@ void honest_plain_price_tests() {
     SP_CHECK(ratio(prose_short) >= 0.97, "prose: 64 requests stay within 3 %% of plain decode (%.4f)", ratio(prose_short));
 }
 
+// spec::resolve_probe_loss (strix/spec/probe_policy.hpp): the episodes run only where the table holds a device receipt;
+// every other engine keeps the fixed interval (0), and STRIX_SPEC_PROBE_LOSS overrides every engine alike.
+void set_probe_switch(const char* value) {
+#if defined(_WIN32)
+    _putenv_s(strix::spec::kProbeLossSwitch, value ? value : "");
+#else
+    if (value) setenv(strix::spec::kProbeLossSwitch, value, 1);
+    else unsetenv(strix::spec::kProbeLossSwitch);
+#endif
+}
+
+void probe_policy_tests() {
+    namespace sp = strix::spec;
+    SP_CHECK(sp::ArbiterConfig{}.probe_loss == 0.0, "the arbiter default is the fixed re-probe interval");
+    SP_CHECK(sp::BlockConfig{}.arbiter.probe_loss == 0.0, "the block drafter default is the fixed re-probe interval");
+    struct Expect { const char* engine; const char* backend; double value; };
+    const Expect table[] = {{"inkling2-mini", "cuda", sp::kMeasuredProbeLoss}, {"inkling2-mini", "hip", 0.0},
+                            {"inkling2-mini", "cpu", 0.0},  {"qwen3.8-27b", "hip", 0.0},
+                            {"qwen3.8-27b", "cuda", 0.0},   {"qwen3.8-flash-next", "hip", 0.0},
+                            {"hy4-flash", "hip", 0.0},      {"", "", 0.0}};
+    set_probe_switch(nullptr);
+    for (const auto& e : table) {
+        sp::ArbiterConfig config;
+        config.probe_loss = 0.5;  // overwritten by the resolver
+        const auto choice = sp::apply_probe_loss(config, e.engine, e.backend);
+        SP_CHECK(choice.value == e.value && config.probe_loss == e.value && sp::table_probe_loss(e.engine, e.backend) == e.value,
+                 "%s/%s resolves the table's probe_loss %.3f (got %.3f, %s)", e.engine, e.backend, e.value, choice.value,
+                 choice.source.c_str());
+        SP_CHECK(choice.source == (e.value > 0.0 ? "measured default" : "fixed interval"), "%s/%s source %s", e.engine,
+                 e.backend, choice.source.c_str());
+    }
+    set_probe_switch("0");
+    auto off = sp::resolve_probe_loss("inkling2-mini", "cuda");
+    SP_CHECK(off.value == 0.0 && off.source == sp::kProbeLossSwitch, "the switch turns the measured row off (%s)",
+             off.source.c_str());
+    set_probe_switch("0.015");
+    auto on = sp::resolve_probe_loss("hy4-flash", "hip");
+    SP_CHECK(on.value == 0.015 && on.source == sp::kProbeLossSwitch, "the switch turns the episodes on for any engine");
+    set_probe_switch("2");
+    bool refused = false;
+    try { (void)sp::resolve_probe_loss("qwen3.8-27b", "hip"); } catch (const std::invalid_argument&) { refused = true; }
+    SP_CHECK(refused, "a probe_loss outside 0..1 names the switch and refuses");
+    set_probe_switch(nullptr);
+}
+
 int main() {
+    probe_policy_tests();
     cold_wall_tests();
     honest_plain_price_tests();
     measured_ladder_tests();

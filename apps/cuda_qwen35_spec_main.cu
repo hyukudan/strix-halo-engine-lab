@@ -22,6 +22,7 @@
 #include "strix/qwen35/prefill_controls.hpp"
 #include "strix/profiles/qwen_dense_cuda.hpp"
 #include "strix/spec/draft_rows.hpp"
+#include "strix/spec/probe_policy.hpp"
 
 #include <memory>
 #include <optional>
@@ -462,6 +463,7 @@ int main(int argc, char** argv) {
                 prefill(anchor);
                 warm();
                 sp::BlockConfig bc;
+                sp::apply_probe_loss(bc.arbiter, "qwen3.8-27b", "cuda");  // fixed interval until a device receipt
                 S.set_tree(arm.tree);
                 bc.arbiter.frontier_every = arm.frontier;
                 bc.arbiter.model_continuation = arm.continuation;

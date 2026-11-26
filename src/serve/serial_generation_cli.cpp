@@ -11,6 +11,7 @@
 #include "strix/session/embed_rows.hpp"
 #include "strix/session/cli_output.hpp"
 #include "strix/spec/greedy_continuation.hpp"
+#include "strix/spec/probe_policy.hpp"
 #include "strix/spec/verify_cost_table.hpp"
 #include "strix/token_sampling.hpp"
 
@@ -568,6 +569,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         spec::BlockConfig config;
         config.hybrid = false;  // The optional chain owns a complete, independent block (an engine may opt in).
         if (options.speculation != CliSpeculation::verify) decoder->tune_speculation(config);
+        spec::apply_probe_loss(config.arbiter, family.speculation_engine, family.speculation_backend);
         if (config.arbiter.windows.empty() || max_rows > config.arbiter.windows.back())
             throw std::invalid_argument("target exceeds the supported verify row count");
         config.max_block = max_rows;
