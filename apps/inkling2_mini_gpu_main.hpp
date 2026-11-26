@@ -71,6 +71,13 @@ public:
 #else
         (void)plain_program;
 #endif
+#if !defined(__HIPCC__)
+        // Verify window programs (one captured graph per window rows; device identity fixture q52r PASS): an explicit
+        // option until a timing receipt decides the default of the drafting passes.
+        if (const char* window = strix::envcfg::text("STRIX_INKLING_WINDOW_PROGRAMS"); window && std::string_view(window) == "1")
+            decoder_.set_window_programs(true);
+        std::cerr << "inkling2 verify window programs " << (decoder_.window_programs() ? "on" : "off") << '\n';
+#endif
         // Calibration statistics (off unless STRIX_CALIB_MOMENTS=FILE): the prompt's attention / output-projection /
         // head input rows accumulate into strix/weight/calib_moments.hpp second moments, written after each prefill.
         if (const char* path = strix::envcfg::text("STRIX_CALIB_MOMENTS"); path && *path) {
