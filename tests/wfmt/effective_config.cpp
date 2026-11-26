@@ -1,7 +1,7 @@
 #include <strix/weight/family.hpp>
 #include <strix/weight/runtime.hpp>
 #include <strix/weight/source.hpp>
-#include "glm_rank_defaults.hpp"
+#include "glm/load/glm_rank_defaults.hpp"
 #include <cstring>
 namespace {
 struct Memory final : strix::weight::Source {

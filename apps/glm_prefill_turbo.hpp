@@ -1,6 +1,6 @@
 #pragma once
 
-#include "glm_rank_defaults.hpp"
+#include "glm/load/glm_rank_defaults.hpp"
 #include "strix/device/hip_gate.hpp"
 
 #include <algorithm>

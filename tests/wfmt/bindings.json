@@ -1130,8 +1130,8 @@
       ]
     },
     {
-      "id": "resolution:apps/glm_rank_defaults.hpp",
-      "source": "apps/glm_rank_defaults.hpp",
+      "id": "resolution:src/glm/load/glm_rank_defaults.hpp",
+      "source": "src/glm/load/glm_rank_defaults.hpp",
       "backend": "host",
       "formats": [
         "all",
@@ -5335,7 +5335,7 @@
     "bytes"
   ],
   "closure_files": [
-    "apps/glm_rank_defaults.hpp",
+    "src/glm/load/glm_rank_defaults.hpp",
     "apps/hip_decode_token_main.cpp",
     "apps/qwen_effective_config.hpp",
     "include/strix/cuda/core/nvfp4.hpp",

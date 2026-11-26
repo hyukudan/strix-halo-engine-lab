@@ -44,7 +44,7 @@ family = "glm5"
 cmake = "STRIX_FAMILY_GLM5"
 profile_tag = "glm-pair"
 allow_pending_env = ""
-defaults = ["apps/glm_rank_defaults.hpp"]
+defaults = ["src/glm/load/glm_rank_defaults.hpp"]
 apps = ["apps/glm_rank_main.cpp", "apps/glm_serve_main.cpp"]
 adapter = ["src/glm/load/glm_model_description.hpp"]
 

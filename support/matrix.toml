@@ -712,7 +712,7 @@ test = "tests/row_layout_tests.cpp"
 [[consumer]]
 component = "Engine profiles"
 operation = "Resolve GLM profile"
-file = "apps/glm_rank_defaults.hpp"
+file = "src/glm/load/glm_rank_defaults.hpp"
 symbol = "strix::profile::resolve"
 test = "tests/engine_profile_common_tests.cpp"
 

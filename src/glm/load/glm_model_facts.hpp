@@ -1,7 +1,7 @@
 #pragma once
 // Metadata-only layer-45 inventory: discovery never opens tensor payloads or constructs a HIP object. The drafter's
 // content identity (mtp_payload_digest) reads the recorded payload spans on request only.
-#include "../src/glm/engine/glm_json.hpp"
+#include "glm/engine/glm_json.hpp"
 #include <algorithm>
 #include <bit>
 #include <cstdio>

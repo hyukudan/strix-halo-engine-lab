@@ -207,7 +207,6 @@ raw-getenv apps/dist_gpu_probe_main.cpp 1
 raw-getenv apps/dist_tcp_probe_main.cpp 3
 raw-getenv apps/execution_inventory_receipt.hpp 1
 raw-getenv apps/glm_deploy.inc 2
-raw-getenv apps/glm_rank_defaults.hpp 2
 raw-getenv apps/glm_rank_main.cpp 23
 raw-getenv apps/glm_rank_receipt.hpp 1
 raw-getenv apps/glm_route_levers.hpp 2

@@ -59,7 +59,7 @@
 // named); STRIX_GLM_MEMTRACE=FILE writes one memory line per second; the watchdog (STRIX_GLM_WATCHDOG=0 off) aborts the
 // rank with exit code 86 near the OOM line.
 // --print-model-graph / STRIX_PRINT_MODEL_GRAPH=1: validated description dump; exits before device work.
-#include "glm_rank_defaults.hpp"
+#include "glm/load/glm_rank_defaults.hpp"
 #include "glm_prefill_turbo.hpp"
 #include "../src/glm/load/glm_model_description.hpp"
 #include "glm/prefill/glm_pf_load_admission.hpp"
