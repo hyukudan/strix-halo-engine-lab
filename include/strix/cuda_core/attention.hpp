@@ -36,7 +36,7 @@ cudaError_t kv_move_row(const AttentionDims& d, const KvLayerCaches& caches, std
                         cudaStream_t stream);
 
 constexpr std::uint32_t kAttnChunk = device::decode_geometry::split_keys;  // positions per reduction chunk
-[[nodiscard]] __host__ __device__ inline std::uint32_t attn_max_chunks(const AttentionDims& d) { return (d.max_positions + kAttnChunk - 1) / kAttnChunk; }
+[[nodiscard]] __host__ __device__ inline std::uint32_t attn_max_chunks(const AttentionDims& d) { return device::decode_geometry::attention_chunks(d.max_positions); }
 
 // Floats of scratch attention_decode needs for `rows`: scores + chunk max + chunk denominators + chunk value partials.
 inline std::size_t attention_scratch_floats(const AttentionDims& d, std::uint32_t rows) {

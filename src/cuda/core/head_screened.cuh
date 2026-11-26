@@ -428,11 +428,12 @@ inline cudaError_t launch_compact(const Launch& a, cudaStream_t stream) {
 
 inline cudaError_t launch_pass2(const Launch& a, cudaStream_t stream) {
     const auto p = detail::parts(a);
+    const auto geometry = plan::pass2_grid(a);
     const ::strix::cuda_core::MappedLaneStrides lanes{p.strides.x, p.strides.y, p.strides.ids,
                                                       sizeof(State) / sizeof(std::uint32_t)};
     return ::strix::cuda_core::dense_bf16_fp32_r1_mapped_epilogue(
         a.head.weights, a.x, p.y, p.ids, &p.state->count, a.capacity, a.head.rows, a.head.width,
-        ::strix::cuda_core::Bf16Fp32Store::softcap, a.head.softcap, a.grids.pass2, stream, a.lanes, lanes);
+        ::strix::cuda_core::Bf16Fp32Store::softcap, a.head.softcap, geometry.blocks[0], stream, geometry.blocks[1], lanes);
 }
 
 // emit(lane, ha::Pick) runs on the device once per lane (head_argmax Emit contract, the engine's adapter); the Pick's

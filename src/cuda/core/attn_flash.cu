@@ -854,7 +854,8 @@ cudaError_t prepared_step_flash(const attn_core::PreparedStepFlash& a, cudaStrea
         (a.relative_extent && !a.relative_logits)) return cudaErrorInvalidValue;
     if (auto e = cudaFuncSetAttribute(flash_prepared_step_rows<Rows, Layout>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<Layout>()); e != cudaSuccess) return e;
-    const device::LaunchGeometry geometry = device::decode_geometry::prepared_flash(a.heads, Rows, smem_bytes<Layout>());
+    const auto geometry = device::decode_geometry::prepared_flash128(a.heads, Rows);
+    static_assert(smem_bytes<Layout>() == device::decode_geometry::prepared_flash128(1, 1).shared_bytes);
     flash_prepared_step_rows<Rows, Layout><<<geometry.grid<dim3>(), geometry.block<dim3>(), geometry.shared_bytes, stream>>>(a);
     return cudaGetLastError();
 }

@@ -745,11 +745,10 @@ KernelBinding bind(const PreparedFlashSplitHostBf16& s) {
 }
 
 KernelBinding bind(const PreparedFinite& a) {
-    const auto stride = std::max(a.width, a.relative_extent);
-    if (a.rows.count != 1 || !a.failure || a.heads == 0 || stride == 0 ||
-        a.heads > std::numeric_limits<std::size_t>::max() / stride)
+    const auto scan = attn_core::prepared_finite_scan(a.rows.count, a.heads, a.width, a.relative_extent);
+    if (a.rows.count != 1 || !a.failure || scan.elements == 0U)
         throw std::invalid_argument("invalid CUDA R1 prepared finite check");
-    return bind_leaf(finite_check, pointwise_grid(std::size_t{a.heads} * stride), a);
+    return bind_leaf(finite_check, pointwise_grid(scan.elements), a);
 }
 
 KernelBinding bind(const CausalConvolution& a) {
@@ -895,7 +894,7 @@ std::vector<KernelBinding> bind_projection_batch(const core::Bf16ProjectionBatch
         const auto plan = rows::plan({std::span(jobs).first(count), 1, 0, rows::Packing::fewest_launches}, profile);
         for (const auto& launch : plan.launches()) {
             const auto args = cuda::mma_group_args(launch, cuda::kRowsAddResidual, cuda::kRowsRoundBf16);
-            auto leaf = bind_leaf(linear_independent, geo::dense_mma(launch.tiles.total()), args);
+            auto leaf = bind_leaf(linear_independent, geo::dense_mma(args.tiles.total()), args);
             // Encode which outputs are rounded in the chain identity used by the recipe/compiler.
             for (unsigned j = 0; j < args.tiles.count; ++j) leaf.chain_identity += args.jobs[j].round_bf16 ? 'r' : 'f';
             leaves.push_back(std::move(leaf));

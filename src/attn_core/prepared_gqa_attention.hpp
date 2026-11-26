@@ -5,12 +5,11 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #include "core/pointwise.hpp"
 #include "strix/attn/cache_rows.hpp"
-
-#include <limits>
 #endif
 
 namespace strix::attn_core {
@@ -32,6 +31,19 @@ struct PreparedStepFinite {
     unsigned heads, kv_heads, width, relative_extent;
     unsigned* failure;  // One sticky failure bit per row, initialized by the caller.
 };
+
+struct FiniteScan {
+    unsigned stride;
+    std::size_t elements;
+};
+
+// Each query head visits its full image, including masked relative logits.
+constexpr FiniteScan prepared_finite_scan(unsigned rows, unsigned heads, unsigned width, unsigned relative_extent) {
+    const unsigned stride = std::max(width, relative_extent);
+    constexpr auto limit = std::numeric_limits<std::size_t>::max() / sizeof(float);
+    if (stride == 0U || heads == 0U || rows > limit / stride / heads) return {};
+    return {stride, std::size_t{rows} * heads * stride};
+}
 
 // Rebind the prepared buffers to consecutive launches with a smaller query
 // window. Zero keeps the original window. Buffer row strides are unchanged.
@@ -110,27 +122,23 @@ template <class Stream>
 inline auto enqueue_validate_prepared_finite(const PreparedGqaAttentionRows& rows, unsigned heads,
                                               unsigned kv_heads, unsigned width, unsigned bias_extent,
                                               unsigned* failure, Stream stream) {
-    const unsigned stride = width >= bias_extent ? width : bias_extent;
-    const auto query_heads = std::size_t{rows.count} * heads;
-    constexpr auto max_elements = std::numeric_limits<std::size_t>::max() / sizeof(float);
-    if (stride == 0U || query_heads > max_elements / stride) return core::pointwise::invalid;
-    return core::pointwise::elements(query_heads * stride,
-        detail::FiniteAttentionOperands{rows, heads, kv_heads, width, bias_extent, stride, failure}, stream);
+    const auto scan = prepared_finite_scan(rows.count, heads, width, bias_extent);
+    if (scan.elements == 0U) return core::pointwise::invalid;
+    return core::pointwise::elements(scan.elements,
+        detail::FiniteAttentionOperands{rows, heads, kv_heads, width, bias_extent, scan.stride, failure}, stream);
 }
 
 #if defined(__CUDACC__) && !defined(__HIPCC__)
 template <unsigned Rows>
 inline core::pointwise::Status enqueue_prepared_step_finite(const PreparedStepFinite& args,
                                                           core::pointwise::Stream stream) {
-    const auto stride = std::max(args.width, args.relative_extent);
-    const auto heads = std::size_t{Rows} * args.heads;
-    constexpr auto max_elements = std::numeric_limits<std::size_t>::max() / sizeof(float);
-    if (!args.step || !args.failure || args.rows.count != Rows || stride == 0U || heads > max_elements / stride ||
+    const auto scan = prepared_finite_scan(Rows, args.heads, args.width, args.relative_extent);
+    if (!args.step || !args.failure || args.rows.count != Rows || scan.elements == 0U ||
         !args.heads || !args.kv_heads || args.kv_heads > args.heads || !args.width ||
         !args.rows.queries || !args.rows.keys || !args.rows.values || !args.rows.output ||
         (args.relative_extent && !args.rows.relative_logits)) return core::pointwise::invalid;
-    return core::pointwise::elements(heads * stride, detail::FiniteStepOperands<Rows>{args.step,
-        {args.rows, args.heads, args.kv_heads, args.width, args.relative_extent, stride, args.failure}}, stream);
+    return core::pointwise::elements(scan.elements, detail::FiniteStepOperands<Rows>{args.step,
+        {args.rows, args.heads, args.kv_heads, args.width, args.relative_extent, scan.stride, args.failure}}, stream);
 }
 #endif
 #endif

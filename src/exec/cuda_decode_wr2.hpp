@@ -115,11 +115,9 @@ inline BoundStepLeaf bind_step(const attn_core::PreparedStepFlash& a, unsigned r
 
 inline BoundStepLeaf bind_step(const attn_core::PreparedStepFinite& a, unsigned rows) {
     if (!supports_wr2_width(rows) || a.rows.count != rows) throw std::invalid_argument("invalid WR2 finite width");
-    const unsigned stride = std::max(a.width, a.relative_extent);
-    const auto heads = std::size_t{rows} * a.heads;
-    constexpr auto limit = std::numeric_limits<std::size_t>::max() / sizeof(float);
-    if (stride == 0U || heads == 0U || heads > limit / stride) throw std::invalid_argument("invalid WR2 finite shape");
-    const auto geometry = wr2_geometry::pointwise(heads * stride);
+    const auto scan = attn_core::prepared_finite_scan(rows, a.heads, a.width, a.relative_extent);
+    if (scan.elements == 0U) throw std::invalid_argument("invalid WR2 finite shape");
+    const auto geometry = wr2_geometry::pointwise(scan.elements);
     return wr2_detail::by_width(rows, [&]<unsigned R>() {
         return wr2_detail::bind<R, attn_core::enqueue_prepared_step_finite<R>>(a, "cuda-sm120-prepared-finite",
             geometry);

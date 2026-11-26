@@ -251,7 +251,7 @@ inline device::LaunchGeometry compact_grid(const Launch& launch) {
     return device::decode_geometry::row_groups(launch.grids.compact, launch.lanes, kCompactThreads);
 }
 inline device::LaunchGeometry pass2_grid(const Launch& launch) {
-    return device::decode_geometry::row_groups(launch.grids.pass2, launch.lanes, device::decode_geometry::dense_warps * 32U);
+    return device::decode_geometry::mapped_dense(launch.grids.pass2, launch.lanes);
 }
 
 constexpr bool pass1_lanes_valid(unsigned per_group, unsigned lanes) noexcept {

@@ -37,7 +37,16 @@ constexpr LaunchGeometry dense_fma(unsigned outputs, unsigned row_tiles = 1) {
     return row_groups((outputs - 1U) / dense_warps + 1U, row_tiles, dense_warps * 32U);
 }
 
+constexpr LaunchGeometry mapped_dense(unsigned blocks, unsigned rows) {
+    return row_groups(blocks, rows, dense_warps * 32U);
+}
+
 constexpr LaunchGeometry dense_mma(unsigned tiles, unsigned row_tiles = 1) { return row_groups(tiles, row_tiles); }
+
+#if defined(__CUDACC__) || defined(__HIPCC__)
+__host__ __device__
+#endif
+constexpr unsigned attention_chunks(unsigned positions) { return (positions + split_keys - 1U) / split_keys; }
 
 constexpr LaunchGeometry attention_splits(unsigned chunks, unsigned kv_heads, unsigned rows) {
     return {{chunks, kv_heads, rows}, {split_keys, 1, 1}, 0};
@@ -45,6 +54,10 @@ constexpr LaunchGeometry attention_splits(unsigned chunks, unsigned kv_heads, un
 
 constexpr LaunchGeometry prepared_split(unsigned kv_heads, unsigned capacity, unsigned rows, unsigned threads) {
     return {{kv_heads, capacity, rows}, {threads, 1, 1}, 0};
+}
+
+constexpr std::uint64_t gdn_convolution_heads(unsigned key_heads, unsigned value_heads) {
+    return 2ULL * key_heads + value_heads;
 }
 
 constexpr LaunchGeometry gdn(unsigned heads, unsigned groups = 1) { return row_groups(heads, groups, 128); }

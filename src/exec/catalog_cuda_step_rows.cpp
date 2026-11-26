@@ -130,7 +130,7 @@ KernelBinding Bindings::bind(const Gdn& a, GdnPhase phase) const {
     case GdnPhase::convolution: {
         if (!a.convolution_weights || !a.convolution_state || !a.raw)
             throw std::invalid_argument("invalid CUDA row GDN convolution");
-        const auto blocks = 2ULL * a.key_heads + a.value_heads;
+        const auto blocks = geo::gdn_convolution_heads(a.key_heads, a.value_heads);
         if (blocks > std::numeric_limits<std::uint32_t>::max() / 128)
             throw std::invalid_argument("CUDA row GDN convolution grid overflow");
         return bind_leaf(thunks_, Leaf::gdn_convolution, Op::elementwise, "gdn.convolution.parity", {}, f32_fma,
@@ -153,7 +153,7 @@ KernelBinding Bindings::bind(const Attention& a, AttentionPhase phase) const {
         s.width != 256 || s.capacity == 0 || s.capacity > std::numeric_limits<std::uint32_t>::max() - (chunk - 1) ||
         !a.position || !a.scratch)
         throw std::invalid_argument("unsupported CUDA row split attention dimensions");
-    const auto chunks = geo::attention_splits((s.capacity + chunk - 1) / chunk, s.kv_heads, 1);
+    const auto chunks = geo::attention_splits(geo::attention_chunks(s.capacity), s.kv_heads, 1);
     switch (phase) {
     case AttentionPhase::scores:
         if (!a.query || !a.key_cache || a.query_view.groups != s.heads || a.query_view.width != s.width)

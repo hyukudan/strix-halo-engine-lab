@@ -382,7 +382,7 @@ cudaError_t dense_bf16_fp32_r1_mapped_epilogue(const std::uint16_t* weights, con
         (lane_count > 1U && (lanes.x < in || lanes.x % 4U != 0U || lanes.y == 0 || lanes.ids < capacity ||
                              lanes.count == 0)))
         return cudaErrorInvalidValue;
-    const device::LaunchGeometry geometry = device::decode_geometry::row_groups(blocks, lane_count, kWarpsPerBlock * 32);
+    const device::LaunchGeometry geometry = device::decode_geometry::mapped_dense(blocks, lane_count);
     const auto grid = geometry.grid<dim3>(), block = geometry.block<dim3>();
     switch (store) {
     case Bf16Fp32Store::round:
