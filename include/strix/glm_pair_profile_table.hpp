@@ -3,6 +3,8 @@
 #include "strix/engine_profile.hpp"
 
 #include <array>
+#include <string>
+#include <string_view>
 
 namespace strix::glm::rank_defaults {
 
@@ -50,6 +52,16 @@ inline constexpr std::array<strix::profile::Lever, 11> product_profile_table{{
                            {"coupled", kSampledMtpCoupledIdentity}, {"rejection", kSampledMtpRejectionIdentity}}}},
 }};
 inline constexpr std::string_view kTurboPrefillDevice = "gfx1151/Radeon-8060S";
+// Pair link layouts (strix::dist::LinkLayout::key()) the FAST band receipt was timed on. The first entry is the layout
+// of every literal row below (USB4 layout 1: data0 + data1 host streams on both 40 Gb/s cables). A layout outside the
+// list declines in the startup pair vote and runs the exact prefill cores.
+inline constexpr std::string_view kMeasuredPrefillLayouts[] = {"usb4-host-2x2x40"};
+// The execution settings of a measured prefill: the link layout is part of the key, so a literal row decides only the
+// layout it was timed on. prefill_settings(kMeasuredPrefillLayouts[0], routed) spells the two constants below.
+inline std::string prefill_settings(std::string_view link, bool routed_scratch) {
+    return "tp2-" + std::string(link) + "-r1b-gemv-exl3-pipeline2-" + (routed_scratch ? "routed" : "full") +
+           "-qwin0-mtp-wmma-x3-mla-kda-attn16";
+}
 inline constexpr std::string_view kTurboPrefillSettings =
     "tp2-usb4-host-2x2x40-r1b-gemv-exl3-pipeline2-routed-qwin0-mtp-wmma-x3-mla-kda-attn16";
 // The same execution on the original full scratch arena (storage only; STRIX_GLM_PF_SCRATCH auto picks it when it fits).

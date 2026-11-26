@@ -2,6 +2,7 @@
 
 #include "glm_rank_defaults.hpp"
 #include "strix/device/hip_gate.hpp"
+#include "strix/dist/link_layout.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -17,21 +18,20 @@ inline bool measured_prefill_device_name(std::string_view name) {
     if (name.starts_with("AMD ")) name.remove_prefix(4);
     return name == "Radeon 8060S Graphics";
 }
+// The link layout is shared data (strix::dist::classify_link): only layouts listed in kMeasuredPrefillLayouts admit
+// the measured execution; prefill_link() spells the run's layout for the execution key.
 inline bool measured_prefill_pair(const strix::device::Visible& device, const auto& streams, bool direct) {
     if (device.vendor != strix::device::Vendor::amd || !device.integrated || device.arch != "gfx1151" ||
-        !measured_prefill_device_name(device.name) || direct) return false;
-    if (streams.size() != 4U || std::any_of(streams.begin(), streams.end(), [](const auto& stream) {
-            return stream.xdomain.empty() || stream.link_gbps != 40.0;
-        })) return false;
-    const auto& first = streams.front().xdomain;
-    const auto second = std::find_if(streams.begin(), streams.end(), [&](const auto& stream) {
-        return stream.xdomain != first;
-    });
-    return second != streams.end() && std::count_if(streams.begin(), streams.end(), [&](const auto& stream) {
-        return stream.xdomain == first;
-    }) == 2 && std::count_if(second, streams.end(), [&](const auto& stream) {
-        return stream.xdomain == second->xdomain;
-    }) == 2;
+        !measured_prefill_device_name(device.name)) return false;
+    return strix::dist::measured_layout(strix::dist::classify_link(streams, direct), kMeasuredPrefillLayouts);
+}
+// The run's layout key when it is a measured layout, else the first (literal-row) layout: a declined pair never
+// spells an execution, so the key only matters for admitted runs.
+inline std::string_view prefill_link(const auto& streams, bool direct) {
+    const auto key = strix::dist::classify_link(streams, direct).key();
+    for (const auto measured : kMeasuredPrefillLayouts)
+        if (measured == key) return measured;
+    return kMeasuredPrefillLayouts[0];
 }
 
 inline bool measured_prefill_pair(const auto& streams, bool direct) {

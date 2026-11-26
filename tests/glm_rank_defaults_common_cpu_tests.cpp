@@ -245,6 +245,15 @@ void test_glm_turbo_pair_and_scope() {
     CHECK(!rd::measured_prefill_pair(device, link, false));
     device.name = "unmeasured gfx1151";
     CHECK(!rd::measured_prefill_pair(device, link, false));
+    device.name = "Radeon 8060S Graphics";
+    // The layout is part of the execution key; the literal-row layout spells the historical settings constants.
+    CHECK(rd::prefill_settings(rd::kMeasuredPrefillLayouts[0], true) == rd::kTurboPrefillSettings);
+    CHECK(rd::prefill_settings(rd::kMeasuredPrefillLayouts[0], false) == rd::kFullScratchPrefillSettings);
+    CHECK(rd::prefill_link(link, false) == "usb4-host-2x2x40");
+    // USB4 layout 2bq: one host stream per cable (data1 is gpu_direct).
+    std::array<Stream, 2> link2bq{{{"0", 40.0}, {"1", 40.0}}};
+    CHECK(!rd::measured_prefill_pair(device, link2bq, false));
+    CHECK(!rd::measured_prefill_pair(device, link2bq, true));
 
     for (const bool peer_admitted : {false, true}) {
         bool admitted = true;

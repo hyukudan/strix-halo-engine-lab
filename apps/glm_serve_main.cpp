@@ -1248,11 +1248,13 @@ int main(int argc, char** argv) {
 
         std::unique_ptr<strix::dist::Communicator> comm;
         bool turbo_prefill_device = false;
+        std::string_view pair_link = rd::kMeasuredPrefillLayouts[0];  // the negotiated layout (execution key)
         if (opt.world == 2) {
             if (transport_spec.empty()) throw std::invalid_argument("--world 2 needs --transport");
             (void)::setenv("STRIX_DIST_USB4_TIMEOUT_MS", "600000", 0);
             (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "600000", 0);
             auto opened = strix::dist::open_pair(transport_spec, opt.rank);
+            pair_link = rd::prefill_link(opened.usb4_topology.streams, opened.direct != nullptr);
             turbo_prefill_device = rd::ordinary_lossy_prefill(request, eff) && rd::measured_prefill_pair(opened.usb4_topology.streams, opened.direct != nullptr);
             auto transport = std::move(opened.host);
             const auto& receipt = opened.receipt;
@@ -1372,11 +1374,11 @@ int main(int argc, char** argv) {
             !deployment.plan && !serial && rtx_prefill.empty() && import_listen.empty();
         ops.turbo_prefill_pair = rd::select_prefill_wmma(request, eff, rd::process_env(),
             rd::serve_prefill_work(turbo_candidate, true, rd::kPrefillProbePrompt, opt.capacity, opt.max_rows,
-                                   rd::kTurboPrefillGenerated, rd::routed_prefill_scratch()));
+                                   rd::kTurboPrefillGenerated, rd::routed_prefill_scratch(), pair_link));
         if (rd::ordinary_lossy_prefill(request, eff) && !strix::glm::pf::wmma_x::enabled()) {
             ops.turbo_prefill_policy = [&](std::uint64_t prompt, unsigned generated, bool fresh) {
                 const auto work = rd::serve_prefill_work(ops.turbo_prefill_pair, fresh, prompt, opt.capacity, opt.max_rows,
-                                                         generated, rd::routed_prefill_scratch());
+                                                         generated, rd::routed_prefill_scratch(), pair_link);
                 const bool selected = rd::select_prefill_wmma(request, eff, rd::process_env(), work);
                 rd::report_prefill_wmma(opt.rank, request, eff, rd::process_env(), work, selected);
                 return selected;
