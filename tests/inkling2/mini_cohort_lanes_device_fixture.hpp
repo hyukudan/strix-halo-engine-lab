@@ -355,7 +355,11 @@ struct PrefillArm {
 
 inline std::uint64_t digest_planes(MiniResidentDecoder& decoder, unsigned slot, std::vector<std::uint16_t>& plane,
                                    std::vector<float>& history, std::uint64_t& history_hash) {
-    // The K and V rows of every committed position at every visit (rows past the frontier are not state).
+    // The K and V rows of every live committed position at every visit: all of them on a full-attention visit, the
+    // last kSlidingWindow on a sliding-window visit (older rows are never read again; a ring keeps them only until it
+    // wraps, and whether the visit is a ring at all depends on the chunk the decoder was built for: RTX q38 / q40, an
+    // 8192-row decoder at this context holds a full cache where a 128-row one holds a 2048-row ring). Rows past the
+    // frontier are not state either.
     const auto view = decoder.slot_view(slot);
     Fnv64 kv;
     for (const auto device : {view.kv.keys, view.kv.values}) {
@@ -364,7 +368,9 @@ inline std::uint64_t digest_planes(MiniResidentDecoder& decoder, unsigned slot, 
         mini_gpu::synchronize(nullptr);
         for (const auto visit : MiniSessionStatePlan::visits()) {
             const auto& layout = view.plan.visit(visit);
-            for (unsigned position = 0; position < view.committed; ++position) {
+            const unsigned live =
+                uses_sliding_attention(visit) ? std::min(view.committed, kSlidingWindow) : view.committed;
+            for (unsigned position = view.committed - live; position < view.committed; ++position) {
                 const auto offset =
                     static_cast<std::size_t>(layout.kv_offset + attn::cache_rows::row_offset(layout.kv, position));
                 kv.add(plane.data() + offset, std::size_t{layout.kv.width} * sizeof(std::uint16_t));
