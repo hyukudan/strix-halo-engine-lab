@@ -57,9 +57,14 @@ struct Operations {
     static float dot(const MatrixView& matrix, std::size_t row, std::span<const float> x) {
         const auto* block = matrix.bytes.data() + row * Storage::row_bytes(matrix.columns);
         float sum = 0.0F;
-        for (std::size_t col = 0; col < matrix.columns; col += Storage::elements, block += Storage::bytes)
-            for (unsigned lane = 0; lane < Storage::elements; ++lane)
-                sum = std::fma(x[col + lane], sp::decode<Storage>(block, lane, matrix.header), sum);
+        for (std::size_t col = 0; col < matrix.columns; col += Storage::elements, block += Storage::bytes) {
+            for (unsigned group = 0; group < Storage::groups; ++group) {
+                const float scale = sp::scale_value(Storage::scale_byte(block, group), matrix.header.base);
+                const unsigned start = group * Storage::group;
+                for (unsigned lane = start; lane < start + Storage::group; ++lane)
+                    sum = std::fma(x[col + lane], sp::decode_scaled<Storage>(block, lane, matrix.header, scale), sum);
+            }
+        }
         return sum;
     }
 };
@@ -75,6 +80,31 @@ inline auto dot_for(wei::FormatId format) {
 }
 
 }  // namespace detail
+
+// Single activation row of an already admitted matrix. The output range may
+// be a prefix (for a vocabulary with unused checkpoint rows).
+inline void matvec(const Matrix& matrix, std::span<const float> input, std::span<float> output, std::size_t first = 0U) {
+    const auto view = matrix.view();
+    if (input.size() != view.columns || first > view.rows || output.size() > view.rows - first)
+        throw std::invalid_argument("invalid Strix pack projection geometry");
+    const auto dot = detail::dot_for(view.storage);
+    for (std::size_t row = 0; row < output.size(); ++row) output[row] = dot(view, first + row, input);
+}
+
+inline void lookup(const Matrix& matrix, std::size_t row, std::span<float> output) {
+    const auto view = matrix.view();
+    if (row >= view.rows || output.size() != view.columns)
+        throw std::invalid_argument("invalid Strix pack lookup geometry");
+    const auto decode = [&]<class Storage>() {
+        const auto* block = view.bytes.data() + row * Storage::row_bytes(view.columns);
+        for (std::size_t col = 0; col < view.columns; col += Storage::elements, block += Storage::bytes)
+            for (unsigned lane = 0; lane < Storage::elements; ++lane)
+                output[col + lane] = sp::decode<Storage>(block, lane, view.header);
+    };
+    if (view.storage == wei::kSP2WeightStorage) decode.template operator()<sp::SP2Storage>();
+    else if (view.storage == wei::kSP3WeightStorage) decode.template operator()<sp::SP3Storage>();
+    else decode.template operator()<sp::SP4Storage>();
+}
 
 // CPU arithmetic oracle for any projection in the expert-major schedule.
 // Inputs can be token rows (gate/up) or already grouped rows (down).

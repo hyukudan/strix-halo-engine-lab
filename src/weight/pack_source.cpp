@@ -31,6 +31,32 @@ Digest256 matrix_digest(PackMatrixSource::Encoding encoding, const Digest256& co
     append(hash, scales);
     return {hash.finish()};
 }
+
+Status digest_microscaled(const PackMatrixSource& source, Digest256& out) {
+    constexpr std::string_view tag = "strix-pack-microscaled-source/v1";
+    core::Sha256 hash;
+    hash.update(tag.data(), tag.size());
+    const auto add_integer = [&](std::uint64_t value) {
+        std::array<std::uint8_t, 8> le{};
+        for (unsigned i = 0; i < le.size(); ++i) le[i] = static_cast<std::uint8_t>(value >> (i * 8U));
+        hash.update(le.data(), le.size());
+    };
+    const auto& view = source.microscaled_view;
+    add_integer(static_cast<unsigned>(view.format));
+    add_integer(static_cast<unsigned>(source.row_order));
+    add_integer(view.rows);
+    add_integer(source.columns);
+    add_integer(source.first_row);
+    add_integer(source.rows);
+    for (const auto* slice : {&view.codes, &view.block_scales, &view.amax, &view.denominator}) {
+        if (!slice->source) continue;
+        Digest256 digest{};
+        if (const auto status = digest_slice(*slice, digest); !status) return status;
+        append(hash, digest);
+    }
+    out = {hash.finish()};
+    return ok;
+}
 }  // namespace
 
 Status PackCheckpoint::open(const std::string& path, PackCheckpoint& out) {
@@ -149,6 +175,7 @@ Status PackMatrixSource::bind(const PackCheckpoint& checkpoint, const RawTensor&
 }
 
 Status PackMatrixSource::digest(Digest256& out) const {
+    if (encoding == Encoding::microscaled) return digest_microscaled(*this, out);
     Digest256 raw{}, scale{};
     if (const auto s = digest_slice(codes, raw); !s) return s;
     if (encoding != Encoding::bf16)
@@ -157,7 +184,46 @@ Status PackMatrixSource::digest(Digest256& out) const {
     return ok;
 }
 
+Status PackMatrixSource::bind(const microscaled::MatrixView& view, microscaled::RowOrder order,
+                              std::size_t first, std::size_t count, PackMatrixSource& out) {
+    if (count == 0 || first > view.rows || count > view.rows - first || view.columns == 0 ||
+        count > std::numeric_limits<std::size_t>::max() / sizeof(float) / view.columns)
+        return {Error::unsupported_shape, "invalid source matrix row slice"};
+    out = {Encoding::microscaled, count, view.columns, {}, {}, view, order, first};
+    return ok;
+}
+
+template <microscaled::MatrixFormat Format>
+void decode_microscaled(const PackMatrixSource& source, microscaled::PackedMatrix weights, std::span<float> matrix) {
+    using Operand = microscaled::PackedOperand<Format>;
+    const Operand operand{weights};
+    for (std::size_t row = 0; row < source.rows; ++row) {
+        auto output = matrix.subspan(row * source.columns, source.columns);
+        for (std::size_t col = 0; col < output.size(); col += Operand::kTileColumns) {
+            std::uint32_t bf16[Operand::kTileColumns / 2U];
+            operand.decode_bf16(operand.load_tile16(source.first_row + row, col), bf16);
+            for (std::size_t pair = 0; pair < Operand::kTileColumns / 2U; ++pair) {
+                output[col + 2U * pair] = scalar_float::u2f(bf16[pair] << 16U);
+                output[col + 2U * pair + 1U] = scalar_float::u2f(bf16[pair] & 0xffff0000U);
+            }
+        }
+    }
+}
+
 Status PackMatrixSource::decode(std::vector<float>& out, Digest256* digest_out) const {
+    if (encoding == Encoding::microscaled) {
+        microscaled::StagedMatrix staged;
+        if (const auto status = staged.load(microscaled_view, row_order); !status) return status;
+        if (digest_out)
+            if (const auto status = digest(*digest_out); !status) return status;
+        std::vector<float> matrix(rows * columns);
+        if (staged.format() == microscaled::MatrixFormat::nvfp4)
+            decode_microscaled<microscaled::MatrixFormat::nvfp4>(*this, staged.packed(), matrix);
+        else
+            decode_microscaled<microscaled::MatrixFormat::mxfp8>(*this, staged.packed(), matrix);
+        out = std::move(matrix);
+        return ok;
+    }
     std::vector<std::uint8_t> raw(static_cast<std::size_t>(codes.range.bytes));
     std::vector<std::uint8_t> scale(static_cast<std::size_t>(scales.range.bytes));
     if (const auto s = read_slice(codes, std::as_writable_bytes(std::span(raw))); !s) return s;

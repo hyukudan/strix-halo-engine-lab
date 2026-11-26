@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/weight/admission.hpp"
+#include "strix/weight/formats/microscaled_matrix.hpp"
 
 namespace strix::weight {
 
@@ -20,12 +21,17 @@ private:
 };
 
 struct PackMatrixSource {
-    enum class Encoding { bf16, mxfp4, fp8_block };
+    enum class Encoding { bf16, mxfp4, fp8_block, microscaled };
     Encoding encoding{};
     std::size_t rows{}, columns{};
     Slice codes, scales;
+    microscaled::MatrixView microscaled_view{};
+    microscaled::RowOrder row_order{};
+    std::size_t first_row{};
 
     static Status bind(const PackCheckpoint&, const RawTensor&, PackMatrixSource&);
+    static Status bind(const microscaled::MatrixView&, microscaled::RowOrder, std::size_t first,
+                       std::size_t count, PackMatrixSource&);
     // When requested, hash the exact bytes already staged for this decode.
     Status decode(std::vector<float>& out, Digest256* digest = nullptr) const;
     Status digest(Digest256& out) const;

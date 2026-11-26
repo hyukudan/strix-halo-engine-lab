@@ -9,6 +9,7 @@
 #include <limits>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 namespace strix::core::residual_reference {
@@ -81,10 +82,12 @@ struct LowRankGateWeights {
 // forget and gain projections act on the same latent, and the gate mixes the original rows.
 // Supply BF16 weights widened to FP32. BF16 mode rounds the down input and result to
 // BF16 nearest-even while accumulating the dot in FP32. The forget/gain path stays FP32.
+template <class ProjectDown = std::nullptr_t>
 [[nodiscard]] inline std::vector<float> apply_low_rank_gate(std::span<const float> current,
                                                             std::span<const float> message,
                                                             const LowRankGateWeights& weights, float epsilon,
-                                                            DownProjectionPrecision precision) {
+                                                            DownProjectionPrecision precision,
+                                                            ProjectDown project_down = nullptr) {
     if (current.empty() || current.size() != message.size() ||
         current.size() > std::numeric_limits<unsigned>::max() ||
         current.size() > std::numeric_limits<std::size_t>::max() / 2) {
@@ -107,9 +110,12 @@ struct LowRankGateWeights {
     std::transform(normalized.begin(), normalized.end(), normalized.begin(), cast_down);
 
     std::vector<float> latent(rank);
-    for (std::size_t i = 0; i < rank; ++i) {
-        latent[i] = cast_down(dot_f32(weights.down.subspan(i * input_width, input_width), normalized));
-    }
+    bool replaced = false;
+    if constexpr (!std::is_same_v<ProjectDown, std::nullptr_t>) replaced = project_down(normalized, latent);
+    if (replaced) std::ranges::transform(latent, latent.begin(), cast_down);
+    else
+        for (std::size_t i = 0; i < rank; ++i)
+            latent[i] = cast_down(dot_f32(weights.down.subspan(i * input_width, input_width), normalized));
 
     std::vector<float> output(width);
     for (std::size_t i = 0; i < width; ++i) {
