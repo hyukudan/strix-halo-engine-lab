@@ -19,6 +19,7 @@
 // Weights: O_DIRECT reads through one pinned staging buffer (MiniMax DirectLoader pattern), rank slices per
 // tools/glm/split_plan.py (H128-aligned EXL3 slices, plain tensors by rows).
 #include "strix/glm/engine.hpp"
+#include "strix/hip_stream_readback.hpp"
 #include "strix/session/prefill_session.hpp"
 #include "strix/session/embed_splice_hip.hpp"
 
@@ -65,6 +66,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -651,6 +653,9 @@ struct Engine::Impl {
     } units;
     unsigned* flag = nullptr;
     hipStream_t stream = nullptr;
+    static constexpr unsigned decode_rows = 8U;
+    using IdReply = std::array<std::uint32_t, decode_rows>;
+    std::optional<device::HipStreamReadback<IdReply>> id_reply;
     Profile prof;
     bool profiling = false;
     // profiling: events at segment boundaries; seg_cat[i] = category of the segment ending at event i
@@ -1374,6 +1379,7 @@ struct Engine::Impl {
         const auto t0 = Clock::now();
         start_monitor();
         hip_ok(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
+        if (device::hip_pinned_replies_enabled()) id_reply.emplace();
         const auto& pf_policy = pf::capacity_policy();
         const auto initial_pf_layout = pf::capacity_candidates(pf_policy, kv_shard != nullptr).front();
         pf::capacity_layout() = initial_pf_layout;
@@ -1875,9 +1881,20 @@ struct Engine::Impl {
 
     void check_flag(const char* where) {
         unsigned f = 0;
-        hip_ok(hipMemcpyAsync(&f, flag, 4, hipMemcpyDeviceToHost, stream), "flag");
-        hip_ok(hipStreamSynchronize(stream), "flag sync");
+        read_decisions({&f, 1U}, flag, "flag", "flag sync");
         if (f) throw std::runtime_error(std::string("non-finite value (checkpoints C1-C5) at ") + where);
+    }
+
+    void read_decisions(std::span<std::uint32_t> out, const std::uint32_t* source, const char* operation, const char* fence) {
+        if (id_reply) {
+            const auto reply = id_reply->receive(stream, [&](auto& staging, auto copy) {
+                copy(std::span(staging).first(out.size()), source, operation);
+            }, fence);
+            std::copy_n(reply.begin(), out.size(), out.begin());
+        } else {
+            hip_ok(hipMemcpyAsync(out.data(), source, out.size_bytes(), hipMemcpyDeviceToHost, stream), operation);
+            hip_ok(hipStreamSynchronize(stream), fence);
+        }
     }
 
     // One forward of R <= 8 rows through layers [0, n_layers); X holds the 4-stream residual afterwards.
@@ -2302,7 +2319,6 @@ struct Engine::Impl {
     void layers_forward(std::span<const Row> rows, unsigned n_layers, ForwardKind kind, const SpecRows* sp = nullptr,
                         unsigned l0 = 0, unsigned l1 = ~0U) {
         const bool pfc = kind == ForwardKind::Prefill;
-        constexpr unsigned decode_rows = 8;
         if (rows.empty()) throw std::invalid_argument("layers_forward: rows must be nonempty");
         if (!pfc && rows.size() > decode_rows)
             throw std::invalid_argument("layers_forward: decode calls take 1..8 rows");
@@ -2551,8 +2567,7 @@ struct Engine::Impl {
         xch->argmax(amv, ami, R, stream);
         mark(segHead);
         std::vector<std::uint32_t> out(R);
-        hip_ok(hipMemcpyAsync(out.data(), ami, R * 4, hipMemcpyDeviceToHost, stream), "tokens out");
-        hip_ok(hipStreamSynchronize(stream), "step sync");
+        read_decisions(out, ami, "tokens out", "step sync");
         collect();
         ++prof.calls;
         return out;
@@ -2621,8 +2636,7 @@ struct Engine::Impl {
         check_flag("head");
         xch->argmax(amv, ami, 1, stream);
         std::uint32_t out = 0;
-        hip_ok(hipMemcpyAsync(&out, ami, 4, hipMemcpyDeviceToHost, stream), "token out");
-        hip_ok(hipStreamSynchronize(stream), "prefill sync");
+        read_decisions({&out, 1U}, ami, "token out", "prefill sync");
         // Quality harness (any identity): STRIX_GLM_PF_SCORE_LAST=N STRIX_GLM_PF_SCORE_OUT=PREFIX writes the head logits of the
         // last N rows of the final chunk (real-text teacher forcing through the prefill path) to PREFIX-r<rank>.f32 [N][slice].
         // Row i is prompt position T-N+i (T = prompt length): it predicts token T-N+i+1 (the last row: the first new token).
