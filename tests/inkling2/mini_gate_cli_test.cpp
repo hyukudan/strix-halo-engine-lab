@@ -146,13 +146,13 @@ void test_cuda_route_options() {
         require(by_row.generation.speculation == Mode::automatic && !route.program &&
                     route.speculation == Mode::automatic && route.speculation_reason.empty() && route.plain_program,
                 "the speculation row default on CUDA resolves the verifying route, plain rows on the step program");
-        // A run that cannot draft under the default (token sampling; an embeddings prompt is known only at load) keeps
-        // the verifying loader; the plain-row route then carries every decode row (DeviceCliDecoder::decode), so it
-        // must stay bound for it.
+        // A run that can never draft under the default (token sampling) keeps the step program route, as before the
+        // verifying default; an embeddings prompt is known only at load: the verifying loader then runs every decode row
+        // on the plain-row route (DeviceCliDecoder::decode).
         auto sampled = parse({"1", "--generate", "4", "--temperature", "0.7"});
         const auto sampled_route = cli::resolve_cuda_step_route(sampled, defaults, bf16, false);
-        require(!sampled_route.program && sampled_route.plain_program,
-                "a sampled run under the default binds the step program for its plain rows");
+        require(sampled_route.program && !sampled_route.plain_program && sampled_route.speculation == Mode::off,
+                "a sampled run under the default keeps the step program route (auto declined)");
         require(!cli::resolve_cuda_step_route(by_row, defaults, q8, false).plain_program,
                 "Q8 weights keep every row on the resident decoder (the step program needs BF16)");
     }
