@@ -107,7 +107,7 @@ inline void print_digest(std::string_view route, unsigned width, unsigned step, 
 // The serving construction (make_mini_device_cohort, inkling2_mini_serve_device.hpp) for an ADMITTED served route: with
 // it the command line's decode form and packed cohort passes; without it (lever off, or a backend that declines it: the
 // caller passes the production admission, mini_served_prefill_emits_first) the incumbent served decoder (HIP grouped
-// decode; CUDA packed lone lanes and grouped cohorts, mini_served_packed_decode).
+// decode; CUDA packed lanes at every cohort width, mini_served_packed_decode).
 #if defined(__HIPCC__)
 inline constexpr bool kFixtureHip = true;
 #else
@@ -155,7 +155,7 @@ inline int cohort_lanes(const char* checkpoint, weight::FormatId storage, bool r
               << (emits_first ? "emits-first" : "held-back") << " moe_decode " << mini_decode_form_name(packed_decode)
               << " slots " << kCohortSlots << '\n';
     // The forms the server runs: admitted = the command line's route (emits-first, packed); otherwise the held-back
-    // route with the served decode form (CUDA: packed lone lanes, grouped cohorts: lanes == lone tests both forms).
+    // route with the served decode form (CUDA: packed rows at every width, mini_packed_cohort_rows).
     if (emits_first != admitted || packed_decode != mini_served_packed_decode(kFixtureHip, admitted))
         throw std::logic_error("served decoder runs a form its admission did not select");
     const std::size_t vocab = kOutputVocabulary;

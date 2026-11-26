@@ -129,7 +129,6 @@ inline MiniServeCohort make_mini_device_cohort(
     std::cerr << "Inkling " << backend << " slots " << lanes << " context " << opt.context
               << " prefill_chunk " << chunk_rows
               << " moe_decode " << mini_decode_form_name(packed_decode)
-              << (!kServeHip && packed_decode ? "-lone" : "")
               << " KV and history bytes per slot " << slot_bytes
               << " slot budget free bytes " << admission_free
               << " profile " << mini_profile_name(opt.tier)

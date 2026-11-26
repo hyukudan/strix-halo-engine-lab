@@ -37,6 +37,26 @@ constexpr bool check_routes() {
 
 static_assert(check_routes());
 
+// CUDA (grouped_prefill): every prefill row keeps the grouped tile, a one-row chunk included, while decode and verify
+// rows keep their routes; a packed CUDA decoder packs cohort rows at every width, HIP only with the served route lever.
+constexpr bool check_cuda_forms() {
+    using strix::inkling2::mini_packed_cohort_rows;
+    using strix::inkling2::mini_resident_chunk_route;
+    for (unsigned rows = 1; rows <= 128U; rows = rows * 2U + 1U) {
+        for (auto kind : {MiniAppendKind::prefill, MiniAppendKind::decode, MiniAppendKind::verify}) {
+            const auto hip = mini_resident_chunk_route(kind, rows, true, false, true, false);
+            const auto cuda = mini_resident_chunk_route(kind, rows, true, false, true, true);
+            if (cuda.attention_rows != hip.attention_rows || cuda.step_graph != hip.step_graph) return false;
+            if (cuda.packed_moe != (kind == MiniAppendKind::prefill ? false : hip.packed_moe)) return false;
+            if (kind != MiniAppendKind::prefill && !cuda.packed_moe) return false;
+        }
+    }
+    return mini_packed_cohort_rows(false, true, false) && !mini_packed_cohort_rows(true, true, false) &&
+           mini_packed_cohort_rows(true, true, true) && !mini_packed_cohort_rows(false, false, true);
+}
+
+static_assert(check_cuda_forms());
+
 // The prompt-row rule of a bound W4A4 class: every prefill row runs the class (a one-row prefill chunk on the grouped
 // route, so a lone prompt row or a singleton tail is quantised like a row of a wide chunk); decode and verify rows never
 // do and keep their routes; with no class bound every route is the incumbent one.

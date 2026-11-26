@@ -85,10 +85,10 @@ route in every profile and takes no decode form flag: prompts run in 128-row
 chunks (`--prefill-rows`, clamped to the context, which without `--slots`
 also caps the lanes), and a cohort decodes with the grouped form in one
 batched forward, whose lane bits depend on the cohort width as before. On
-CUDA it runs the command line's decode form (a lone lane takes the packed
-one-row body, a cohort of two or more lanes the grouped tile, every lane's
-bits equal to its lone run; `--packed-decode` / `--grouped-decode` as on the
-command line) and, without `--prefill-rows`, the command line's prompt chunk:
+CUDA it runs the command line's decode form (every decode row takes the
+packed one-row body at any cohort width, so every lane's bits equal its lone
+run, and every prefill row the grouped tile; `--packed-decode` /
+`--grouped-decode` as on the command line) and, without `--prefill-rows`, the command line's prompt chunk:
 it keeps the largest of 8192, 2048 and 128 rows whose load leaves the slot
 count of the 128-row chunk (startup line `prefill_chunk`), and a prompt
 admitted beside a decoding lane runs in pieces of 128 rows (plus a remainder

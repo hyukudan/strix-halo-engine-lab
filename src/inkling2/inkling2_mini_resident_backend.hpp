@@ -157,10 +157,17 @@ public:
         true;
 #endif
 
+    static constexpr bool kBackendHip =
+#if defined(__HIPCC__)
+        true;
+#else
+        false;
+#endif
+
     MiniResidentBackend(const MiniResidentWeights& weights, unsigned max_rows, mini_gpu::Stream stream,
                         bool packed_decode = false, bool step_graphs = default_step_graphs, bool cohort_rows = false)
         : weights_(weights), stream_(stream), max_rows_(checked_chunk_rows(max_rows)), packed_decode_(packed_decode),
-          cohort_rows_(packed_decode && cohort_rows), step_graphs_(step_graphs),
+          cohort_rows_(mini_packed_cohort_rows(kBackendHip, packed_decode, cohort_rows)), step_graphs_(step_graphs),
           tiles_(moe_core::device_grouped::tile_bound(max_rows_, kExpertsPerToken, kExperts, Moe::rows_per_tile)),
           controller_(mini_controller_elements(max_rows_)), attention_(attention_elements(max_rows_)),
 #if defined(__HIPCC__)
@@ -176,8 +183,9 @@ public:
           moe_activation_(mini_moe_activation_elements(max_rows_)),
 #endif
           // Packed decode keeps one route status per routed row: up to kMiniMaxVerifyRows verify rows, or, with packed
-          // cohort rows (the served route lever only), a cohort decode pass of up to max_rows_ lanes.
-          flags_((1U + (packed_decode ? (cohort_rows ? max_rows_ : std::min(max_rows_, kMiniMaxVerifyRows)) : 1U)) * kLogicalVisits),
+          // cohort rows (the served route lever; every packed CUDA decoder), a cohort decode pass of up to max_rows_ lanes.
+          flags_((1U + (packed_decode ? (mini_packed_cohort_rows(kBackendHip, packed_decode, cohort_rows)
+                                             ? max_rows_ : std::min(max_rows_, kMiniMaxVerifyRows)) : 1U)) * kLogicalVisits),
           zero_padding_(kHeadWidth) {
 #if !defined(__HIPCC__)
         if (const char* enable = strix::envcfg::text("STRIX_INKLING_K1BIND"); enable && std::string_view(enable) == "1") {
@@ -1044,7 +1052,7 @@ private:
         lowbit_chunk_ = lowbit_applies(weight_kind, rows) &&
                         (!weights_.bf16_bound() || decode_cohort_width == 0U ||
                          mini_lowbit_receipt_width(decode_cohort_width));
-        route_ = mini_resident_chunk_route(kind, rows, packed_decode_, moe_w4a4_bound(), cohort_rows_);
+        route_ = mini_resident_chunk_route(kind, rows, packed_decode_, moe_w4a4_bound(), cohort_rows_, !kBackendHip);
 #if !defined(__HIPCC__)
         chunk_w4a4_ = mini_w4a4_rows(moe_w4a4_, kind);
 #endif
@@ -1160,7 +1168,7 @@ private:
     mini_gpu::Stream stream_;
     unsigned max_rows_;
     bool packed_decode_;
-    bool cohort_rows_;  // packed cohort decode passes of up to max_rows_ lanes (served route lever only)
+    bool cohort_rows_;  // packed cohort decode passes of up to max_rows_ lanes (mini_packed_cohort_rows)
 #if !defined(__HIPCC__)
     moe_core::grouped_microscaled::Decode moe_decode_ = mini_cuda_moe_decode();
     moe_core::grouped_microscaled::Schedule moe_schedule_ = mini_cuda_moe_schedule();

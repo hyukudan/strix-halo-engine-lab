@@ -25,7 +25,7 @@ namespace {
 namespace sv = strix::serve;
 namespace mini = strix::inkling2;
 
-// Served decode form: HIP packs only with the admitted lever; CUDA runs the command line's packed form at a lone lane.
+// Served decode form: HIP packs only with the admitted lever; CUDA runs the command line's packed form at every width.
 static_assert(strix::inkling2::mini_served_packed_decode(true, true) &&
               !strix::inkling2::mini_served_packed_decode(true, false) &&
               strix::inkling2::mini_served_packed_decode(false, false) &&
