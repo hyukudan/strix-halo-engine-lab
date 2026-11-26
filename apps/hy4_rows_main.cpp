@@ -427,6 +427,26 @@ int mtp_taps(hb::Forward& f, const std::vector<std::uint32_t>& prompt, const std
         std::ofstream b(std::filesystem::path(dir) / "hidden_post.f32", std::ios::binary);
         b.write(reinterpret_cast<const char*>(host.data()), static_cast<std::streamsize>(host.size() * sizeof(float)));
     }
+    {  // the drafter's taps (apps/hy4_dfly_main.cpp accept): the latent rows [kv_lora | qk_rope] of its shared KV layers
+       // (config.json dfly_target_kv_layers), the cached BF16 rows widened to FP32; the first cache piece = the latent rows.
+        const std::size_t width = std::size_t{f.config().kv_lora} + f.config().qk_rope;
+        std::ofstream lat(std::filesystem::path(dir) / "latents.f32", std::ios::binary);
+        for (const std::uint32_t layer : {25U, 29U, 33U, 37U, 41U}) {
+            std::vector<std::byte> raw(static_cast<std::size_t>(f.cache_bytes(layer, P)));
+            if (raw.size() < std::size_t{P} * width * sizeof(std::uint16_t)) throw std::runtime_error("mtp taps: latent rows of layer " + std::to_string(layer));
+            f.export_cache(layer, P, raw);
+            std::vector<float> rows(std::size_t{P} * width);
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                std::uint16_t bits = 0;
+                std::memcpy(&bits, raw.data() + i * sizeof(bits), sizeof(bits));
+                const std::uint32_t wide = std::uint32_t{bits} << 16U;
+                std::memcpy(&rows[i], &wide, sizeof(wide));
+            }
+            lat.write(reinterpret_cast<const char*>(rows.data()), static_cast<std::streamsize>(rows.size() * sizeof(float)));
+        }
+        std::ofstream m(std::filesystem::path(dir) / "manifest.txt", std::ios::app);
+        m << "latent " << width << std::endl;
+    }
     {  // rows form vs the per-row loop of the next-token block (Forward::nextn_rows) over the first fed positions: the
        // teacher's calls, bitwise (hidden_pre, hidden_post, the last row's greedy id); walls of the second run of each form.
        // The teacher loop below rewrites every block cache row from position 0.

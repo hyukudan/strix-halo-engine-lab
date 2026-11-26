@@ -20,22 +20,22 @@ inline constexpr std::int64_t global_rope_dimension = 512;
 inline constexpr double global_rope_theta = 0x1.e848p+19 /* 1e+06 */;
 inline constexpr std::string_view global_rope_type = "proportional";
 inline constexpr std::int64_t group = 4;
-inline constexpr std::int64_t head_dims[] = {256, 256, 256, 256, 256, 512, 256, 256, 256, 256, 256, 512, 256, 256, 
-    256, 256, 256, 512, 256, 256, 256, 256, 256, 512, 256, 256, 256, 256, 256, 512, 256, 256, 256, 256, 256, 512, 
+inline constexpr std::int64_t head_dims[] = {256, 256, 256, 256, 256, 512, 256, 256, 256, 256, 256, 512, 256, 256,
+    256, 256, 256, 512, 256, 256, 256, 256, 256, 512, 256, 256, 256, 256, 256, 512, 256, 256, 256, 256, 256, 512,
     256, 256, 256, 256, 256, 512};
 inline constexpr bool k_eq_v = false;
 inline constexpr std::string_view kind = "sliding+global";
 inline constexpr std::string_view kv_dtype = "F32";
-inline constexpr std::int64_t kv_producers[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 
+inline constexpr std::int64_t kv_producers[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
     19, 20, 21, 22, 23, 22, 22, 22, 22, 22, 23, 22, 22, 22, 22, 22, 23, 22, 22, 22, 22, 22, 23};
-inline constexpr std::string_view layer_types[] = {"sliding_attention", "sliding_attention", "sliding_attention", 
-    "sliding_attention", "sliding_attention", "full_attention", "sliding_attention", "sliding_attention", 
-    "sliding_attention", "sliding_attention", "sliding_attention", "full_attention", "sliding_attention", 
-    "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention", 
-    "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", 
-    "full_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", 
-    "sliding_attention", "full_attention", "sliding_attention", "sliding_attention", "sliding_attention", 
-    "sliding_attention", "sliding_attention", "full_attention", "sliding_attention", "sliding_attention", 
+inline constexpr std::string_view layer_types[] = {"sliding_attention", "sliding_attention", "sliding_attention",
+    "sliding_attention", "sliding_attention", "full_attention", "sliding_attention", "sliding_attention",
+    "sliding_attention", "sliding_attention", "sliding_attention", "full_attention", "sliding_attention",
+    "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+    "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+    "full_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+    "sliding_attention", "full_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+    "sliding_attention", "sliding_attention", "full_attention", "sliding_attention", "sliding_attention",
     "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"};
 inline constexpr double partial_rotary_factor = 0x1p+0 /* 1 */;
 inline constexpr bool qk_norm = true;

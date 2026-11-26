@@ -21,8 +21,10 @@ namespace strix::model {
 
 // The generated header: every scalar and every homogeneous scalar array of the description becomes an
 // `inline constexpr` in namespace strix::model_data::<identifier(name)>[::<table>...]. Integers are std::int64_t,
-// reals are double written as exact hexadecimal literals, booleans bool, strings std::string_view. Arrays of tables
-// and mixed arrays are skipped with a comment. `source_path` is written into the banner only.
+// reals are double written as exact hexadecimal literals, booleans bool, strings std::string_view. An array of
+// tables whose rows have the same keys and one scalar type per key is emitted structure-of-arrays:
+// `namespace <key> { std::size_t count; <type> <field>[count]...; }`. Other arrays of tables and mixed arrays are
+// skipped with a comment. `source_path` is written into the banner only.
 [[nodiscard]] std::string emit_constants(const model_description::ModelDescription& description,
                                          std::string_view source_path);
 

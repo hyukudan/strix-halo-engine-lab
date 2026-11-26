@@ -474,6 +474,7 @@ struct Engine {
     turbo::WeightCaps weight_caps{};        // weight sources / widths this build can load under turbo
     std::span<const IdentityVariant> variants{};  // declared identity variants (empty: the incumbent identity only)
     std::span<const LadderRow> ladder{};    // measured regimes of the lossy cells (ladder rule above)
+    bool preset_keeps_provisional_incumbents = false;  // opt in to native parity for granted cells
 };
 
 // Tier words: exact | fast | turbo; `exact` is the default column (spelled "default" in receipts, kept as an alias).
@@ -976,8 +977,8 @@ inline const char* environment(const Lookup& env, std::string_view key) {
 
 inline constexpr char kPresetEnv[] = "STRIX_INTERNAL_MODEL_PRESET";
 
-// Native provisional profiles remain available for experiments. Model presets
-// select the same rows, but only admit qualified production defaults.
+// Model presets normally filter provisional cells. An engine can preserve native incumbent grants
+// under the same tier word; those cells still report qualification in progress.
 inline Status admit_profile_column(bool ready, bool runnable, bool allow_pending, bool provisional,
                                    bool preset) {
     if (preset && !allow_pending && provisional) return Status::pending;
@@ -1361,9 +1362,19 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         if (!lever.env_flag_match) return raw;
         return envcfg::parse_flag(raw, lever.builtin == "1", *lever.env_flag_match) ? "1" : "0";
     };
+    const auto admit = [&](const Lever& lever, unsigned column) {
+        bool filter_provisional = preset;
+        if (preset && engine.preset_keeps_provisional_incumbents && lever.provisional[column]) {
+            const auto value = lever.value[column];
+            const auto grant = ladder_judge(engine.ladder, lever.name, value, static_cast<Name>(column),
+                                            {}, {}, declared_identity(lever.identity, value));
+            filter_provisional = grant.rung != Rung::incumbent;
+        }
+        return column_admission(lever, column, out.allow_pending, filter_provisional);
+    };
     std::vector<LadderRow> ladder(engine.ladder.begin(), engine.ladder.end());
     const auto build_arms = [&] { return ladder_arms(engine.table, std::span<const LadderRow>(ladder), inputs.regime,
-        [&](const Lever& lever, unsigned c) { return column_admission(lever, c, out.allow_pending, preset); },
+        admit,
         [&](const Lever& lever) -> std::optional<std::string_view> {
             if (const auto* cli = last_setting(inputs.cli, lever.name)) return std::string_view(*cli);
             if (const char* env = lever.env.empty() ? nullptr : environment(inputs.env, lever.env))
@@ -1388,14 +1399,13 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         } else if (wanted.empty() || wanted == lever.builtin) {
             // builtin (the default column always is: default exports nothing)
         } else {
-            entry.status = admit_profile_column(lever.ready[column], lever.runnable[column], out.allow_pending,
-                                                lever.provisional[column], preset);
+            entry.status = admit(lever, column);
             if (entry.status == Status::pending) entry.target = std::string(lever.target.empty() ? wanted : lever.target);
             else entry.value = std::string(wanted);
         }
         if (cli == nullptr && env == nullptr)
             apply_ladder(entry, ladder, profile_column, inputs.regime, [&](unsigned c) {
-                return column_admission(lever, c, out.allow_pending, preset);
+                return admit(lever, c);
             }, out.allow_pending, arms);
         out.entries.push_back(std::move(entry));
     }

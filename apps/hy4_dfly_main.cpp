@@ -12,6 +12,9 @@
 // anchor of the greedy region a chain of up to D drafts (each step feeds its own argmax and its own hidden: --chain pre
 // = x before shared_head_norm, post = shared_head_norm(x)) is compared with
 // the target's greedy ids, then rolled back. Prints P(run >= k) and E(d) = 1 + sum_{k<=d} P(run >= k), d = 1..D.
+//   strix-hy4-dfly embed PART1.gguf [PART2.gguf] TAPDIR
+// completes a device taps run (strix-hy4-rows --mtp-taps: ids, hidden_post, latents of the device target) with the
+// embedding rows, so accept / mtp score the drafters on device target state (hidden_pre is optional: post is used).
 // Files (little-endian): ids.txt (fed ids, then the last argmax), hidden_pre.f32 / hidden_post.f32 [P][hidden],
 // latents.f32 [kv layer][P][kv_lora + qk_rope], embed.f32 [P + 1][hidden] (row P = mask id), head.bf16
 // [vocab][hidden], manifest.txt.
@@ -164,8 +167,8 @@ public:
         hidden_ = std::stoul(m.at("hidden"));
         latent_ = std::stoul(m.at("latent"));
         ids = read_ids((dir / "ids.txt").string());
-        pre = read_f32(dir / "hidden_pre.f32", std::size_t{P} * hidden_);
         post = read_f32(dir / "hidden_post.f32", std::size_t{P} * hidden_);
+        pre = std::filesystem::exists(dir / "hidden_pre.f32") ? read_f32(dir / "hidden_pre.f32", std::size_t{P} * hidden_) : post;  // device taps: post only
         lat_ = read_f32(dir / "latents.f32", std::size_t{5} * P * latent_);
         emb_ = read_f32(dir / "embed.f32", std::size_t{P + 1U} * hidden_);
         for (std::uint32_t p = 0; p < P; ++p) row_.emplace(ids[p], p);
@@ -301,6 +304,32 @@ int kvb(int argc, char** argv) {
 }  // namespace
 
 // The pack's MTP block over taps runs (see the header comment): acceptance by chain depth.
+// A device taps run (strix-hy4-rows --mtp-taps): the embedding rows the drafter reads (fed ids + the mask id) from the pack.
+int embed(int argc, char** argv) {
+    std::vector<std::filesystem::path> parts;
+    std::filesystem::path dir;
+    for (int i = 2; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a.size() > 5 && a.ends_with(".gguf")) parts.emplace_back(a);
+        else dir = a;
+    }
+    if (parts.empty() || dir.empty()) throw std::invalid_argument("usage: strix-hy4-dfly embed PART1.gguf [PART2.gguf] TAPDIR");
+    const auto m = read_manifest(dir);
+    const auto P = static_cast<std::uint32_t>(std::stoul(m.at("positions")));
+    const auto ids = read_ids((dir / "ids.txt").string());
+    if (ids.size() != P + 1U) throw std::runtime_error("ids.txt must hold the fed ids and the last argmax");
+    const auto config = Config::from_gguf(parts.front());
+    auto weights = strix::hy4::pack_weights(parts);
+    const auto& embd = weights->tensor("token_embd.weight");
+    std::ofstream emb(dir / "embed.f32", std::ios::binary);
+    const auto row = [&](std::uint32_t id) {
+        emb.write(reinterpret_cast<const char*>(embd.data() + std::size_t{id} * config.hidden), static_cast<std::streamsize>(config.hidden * sizeof(float)));
+    };
+    for (std::uint32_t p = 0; p < P; ++p) row(ids[p]);
+    row(kMaskId);
+    return 0;
+}
+
 int mtp(int argc, char** argv) {
     std::vector<std::filesystem::path> parts;
     std::vector<std::string> dirs;
@@ -420,6 +449,7 @@ int main(int argc, char** argv) {
         if (argc >= 2 && std::string(argv[1]) == "accept") return accept(argc, argv);
         if (argc >= 2 && std::string(argv[1]) == "kvb") return kvb(argc, argv);
         if (argc >= 2 && std::string(argv[1]) == "mtp") return mtp(argc, argv);
+        if (argc >= 2 && std::string(argv[1]) == "embed") return embed(argc, argv);
         std::cerr << "usage: strix-hy4-dfly taps|accept|kvb|mtp ...\n";
         return 2;
     } catch (const std::exception& e) {

@@ -106,3 +106,25 @@ levers = "fast"
 [multi_device.legacy_env]
 STRIX_GLM_PF_PIPELINE = "forms.layers"
 STRIX_GLM_PF_STAGED = "forms.layers"
+
+# GLM-5.3 pair: 34 KDA layers split 32 + 32 heads (per rank), 11 DSA + 1 MTP layer shared on both ranks; pool = one FP32
+# 128-vector per closed 4-row block.
+# Prompt-state hand-off declaration (include/strix/pair/state_owners.hpp Family / Piece; words = the Owner and Extent
+# enumerator names). Per layer: `bytes` per stored row (rows) or per layer (fixed), per destination slice for per_rank
+# pieces; stored rows = floor((P - rows_less) / row_div). Consumer file:line in `source`.
+[pair]
+family = "glm-5.3"
+rows_of = "P = N - 1"
+world = 2
+block_rows = 64
+prefix_rows_invariant = false
+shared_once_default = true
+shared_once_source = "glm v1/v2 rank payload equal bits (host relay fixture)"
+state = [
+    { name = "kda_s", kind = 0, owner = "per_rank", extent = "fixed", bytes = 2097152, layers = 34, layer0 = 0, layer_stride = 1, row_div = 1, rows_less = 0, source = "src/glm/kernels/glm_tier_a.hip:153-190" },
+    { name = "kda_conv", kind = 1, owner = "per_rank", extent = "fixed", bytes = 147456, layers = 34, layer0 = 0, layer_stride = 1, row_div = 1, rows_less = 0, source = "src/glm/kernels/glm_tier_a.hip:153-190" },
+    { name = "dsa_latent", kind = 2, owner = "shared", extent = "rows", bytes = 1024, layers = 12, layer0 = 0, layer_stride = 1, row_div = 1, rows_less = 0, source = "src/glm/kernels/glm_dsa.hip:54-87" },
+    { name = "dsa_ikey", kind = 3, owner = "shared", extent = "rows", bytes = 256, layers = 12, layer0 = 0, layer_stride = 1, row_div = 1, rows_less = 0, source = "src/glm/kernels/glm_dsa.hip:120-153" },
+    { name = "dsa_igate", kind = 4, owner = "shared", extent = "rows", bytes = 256, layers = 12, layer0 = 0, layer_stride = 1, row_div = 1, rows_less = 0, source = "src/glm/kernels/glm_dsa.hip:120-153" },
+    { name = "dsa_pool", kind = 5, owner = "shared", extent = "rows", bytes = 512, layers = 12, layer0 = 0, layer_stride = 1, row_div = 4, rows_less = 0, source = "src/glm/kernels/glm_dsa.hip:167-180" },
+]

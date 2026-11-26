@@ -11,6 +11,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -57,7 +58,8 @@ using strix::profile::Name;
 using strix::profile::Pairs;
 
 Options run(std::optional<Name> profile, TurboWeights w, qp::Route route, std::uint64_t tokens, const Pairs& cli = {},
-            std::string* text = nullptr, std::span<const qp::Qualified> rows = qp::qualified) {
+            std::string* text = nullptr, std::span<const qp::Qualified> rows = qp::qualified,
+            qp::PromptRoute* route_out = nullptr, const qp::PromptRequest* request = nullptr) {
     Options o;
     o.turbo_weights = w;
     auto regime = qp::regime_of(o, route, tokens);
@@ -100,7 +102,44 @@ Options run(std::optional<Name> profile, TurboWeights w, qp::Route route, std::u
     const auto r = qp::resolve(profile, regime, cli, rows, evidence);
     qp::apply(o, *r);
     if (text) *text = qp::describe(*r);
+    if (route_out && request) *route_out = qp::plan_prompt(*r, *request);
     return o;
+}
+// The decode CLI's host-side planning entry (qp::plan_prompt) on the same resolve as run(); the request the CLI builds:
+// prompt tokens, --rows 16, per-row dumps, --slots, non-table options.
+qp::PromptRoute route_of(std::optional<Name> profile, TurboWeights w, qp::Route route, std::uint64_t tokens,
+                         const Pairs& cli = {}, bool per_row = false, bool slot_bench = false,
+                         std::vector<std::string> unshown = {}) {
+    qp::PromptRequest q;
+    q.prompt_tokens = tokens;
+    q.rows = 16;
+    q.per_row_output = per_row;
+    q.slot_bench = slot_bench;
+    q.unshown = std::move(unshown);
+    qp::PromptRoute pr;
+    (void)run(profile, w, route, tokens, cli, nullptr, qp::qualified, &pr, &q);
+    return pr;
+}
+// CudaEngine::PrefillAdmission's fields (cuda_engine.hpp), host-only.
+struct Admission {
+    bool admitted = false;
+    std::string reason;
+    std::uint32_t slots = 0, slots_wanted = 0, fallback_rows = 32;
+    std::uint64_t workspace_bytes = 0, free_bytes = 0;
+};
+Admission admitted(std::uint32_t slots, std::uint32_t wanted) {
+    Admission a;
+    a.admitted = true;
+    a.slots = slots;
+    a.slots_wanted = wanted;
+    a.workspace_bytes = 1617ULL << 20U;
+    a.free_bytes = 60000ULL << 20U;
+    return a;
+}
+Admission declined(const char* why) {
+    Admission a;
+    a.reason = why;
+    return a;
 }
 bool throws(const auto& fn, const char* needle) {
     try {
@@ -620,6 +659,107 @@ int main() {
         small.prompt_tokens = 4096;
         check(lever_value(*qp::resolve(Name::fast, small, {}, rows), "prefill_attn8") == "off",
               "a wider quality band is not a wider grant");
+    }
+
+    {  // the decode CLI's prompt route: plan_prompt (before load) + execute_route (after the engine's admission), route and
+       // receipt asserted together
+        const auto pr_w = TurboWeights::converted;
+        const auto pr_lp = qp::Route::large_prefill;
+        const auto has = [](const std::string& s, const char* needle) { return s.find(needle) != std::string::npos; };
+        const auto ran = [](const qp::PromptRoute& p, const Admission* a) { return qp::execute_route(p, a); };
+        const Admission two = admitted(2, 2), one = admitted(1, 2), oom = declined("workspace does not fit: 900 MiB free before, headroom 256 MiB"),
+                        fp32 = declined("fp32 policy"), off = declined("disabled");
+
+        // builtin exact inside the identity range: the large route; admitted -> large with the real slots; declined -> the CLI
+        // windows of --rows it ran before (never an allocation failure, never the engine's 32-row fallback)
+        const auto pr_none = route_of(std::nullopt, pr_w, pr_lp, 32768);
+        check(pr_none.large() && pr_none.by_default && pr_none.arith == "exact" && pr_none.reason.empty() &&
+                  qp::describe_route(pr_none) == "  prompt-route: large-M prefill, prefill_arith exact (builtin); workspace admitted at load\n",
+              "no tier word: builtin exact plans the large route, receipt says admission at load");
+        const auto x2 = ran(pr_none, &two);
+        check(x2.path == qp::PromptPath::large &&
+                  x2.line == "  prompt-route executed: large-M prefill, prefill_arith exact; slots 2 of 2; workspace 1617 MiB admitted, 60000 MiB free after\n",
+              "builtin exact admitted: executes the large route and prints the admitted slots");
+        const auto x1 = ran(pr_none, &one);
+        check(x1.path == qp::PromptPath::large && has(x1.line, "slots 1 of 2"), "one slot admitted of two: the receipt says 1 of 2");
+        const auto xd = ran(pr_none, &oom);
+        check(xd.path == qp::PromptPath::windows && has(xd.line, "windows of 16 rows (builtin exact, large route not admitted: workspace does not fit"),
+              "builtin exact declined by the budget: the CLI windows of --rows, stated");
+        const auto xu = ran(pr_none, static_cast<const Admission*>(nullptr));
+        check(xu.path == qp::PromptPath::windows, "no admission: never the large route");
+        check(run(std::nullopt, pr_w, pr_lp, 32768) == run(std::nullopt, pr_w, pr_lp, 32768, {{"prefill_arith", "exact"}}),
+              "builtin exact and explicit exact leave the same options");
+        const auto pr_ex = route_of(Name::standard, pr_w, pr_lp, 2051);
+        check(pr_ex.large() && pr_ex.by_default && ran(pr_ex, &two).path == qp::PromptPath::large,
+              "--profile exact, 2,051 tokens (chunk + 3-row tail): large route admitted");
+        // an unsupported large route (fp32 policy, chunk shape, weight format): builtin keeps the CLI windows of --rows
+        const auto xf = ran(pr_none, &fp32);
+        check(xf.path == qp::PromptPath::windows && has(xf.line, "windows of 16 rows (builtin exact, large route not admitted: fp32 policy)"),
+              "unsupported large route under the builtin: CLI windows of 16, reason printed");
+
+        // explicit / profile arithmetic: large route as before; declined -> the engine's own fallback, stated
+        const auto pr_exp = route_of(Name::standard, pr_w, pr_lp, 32768, {{"prefill_arith", "exact"}});
+        check(pr_exp.large() && !pr_exp.by_default && pr_exp.arith == "exact", "explicit --prefill-arith exact: large route, not by default");
+        const auto xe = ran(pr_exp, &oom);
+        check(xe.path == qp::PromptPath::engine_windows && has(xe.line, "engine windows of 32 rows (large route not admitted: workspace"),
+              "explicit exact declined: the engine's windows fallback, stated");
+        const auto pr_fast = route_of(Name::fast, pr_w, pr_lp, 8192);
+        check(pr_fast.large() && pr_fast.arith == "fast4" && !pr_fast.by_default, "FAST 8K: large route, fast4");
+        const auto xff = ran(pr_fast, &fp32);
+        check(xff.path == qp::PromptPath::engine_windows && has(xff.line, "fp32 policy; prefill_arith fast4 not applied"),
+              "FAST declined: the receipt says fast4 did not run");
+        const auto pr_win = route_of(std::nullopt, pr_w, pr_lp, 2048, {{"prefill_arith", "windows"}});
+        check(pr_win.path == qp::PromptPath::engine_windows && qp::describe_route(pr_win) == "  prompt-route: engine windows (--prefill-arith windows)\n",
+              "explicit windows: the engine's reference windows, never printed as large-M");
+        const auto xw = ran(pr_win, &off);
+        check(xw.path == qp::PromptPath::engine_windows && has(xw.line, "engine windows of 32 rows (--prefill-arith windows)"),
+              "explicit windows executes the engine windows and says so");
+
+        // P1-a: an override that acts on the windows keeps the windows the builtin ran (bit for bit), and the receipt says so
+        for (const auto& [lever, value] : std::vector<std::pair<std::string, std::string>>{
+                 {"decode_attn8", "on"}, {"split_k", "fast"}, {"dense_activation", "on"}}) {
+            const auto p = route_of(std::nullopt, pr_w, pr_lp, 8192, {{lever, value}});
+            const std::string line = qp::describe_route(p);
+            check(p.path == qp::PromptPath::windows && has(line, "windows of 16 rows (builtin exact keeps the windows: ") &&
+                      has(line, (lever + " " + value).c_str()) && ran(p, static_cast<const Admission*>(nullptr)).path == qp::PromptPath::windows,
+                  ("--" + lever + " " + value + " with the builtin exact: windows of --rows kept, lever named").c_str());
+        }
+        const auto pr_d8x = route_of(std::nullopt, pr_w, pr_lp, 8192, {{"decode_attn8", "on"}, {"prefill_arith", "exact"}});
+        check(pr_d8x.large() && !pr_d8x.by_default, "an explicit --prefill-arith exact still takes the large route with --decode-attn8 on");
+        const auto pr_q = route_of(std::nullopt, pr_w, pr_lp, 8192, {}, false, false, {"--qual-null-order"});
+        check(pr_q.path == qp::PromptPath::windows && has(qp::describe_route(pr_q), "--qual-null-order: no identity"),
+              "a non-table option without identity keeps the windows");
+
+        // P1-c: the builtin is resolved to the large route only inside the shown identity range
+        const auto pr_long = route_of(std::nullopt, pr_w, pr_lp, qp::kExactLargeIdentity.max_prompt_tokens + 1);
+        check(pr_long.path == qp::PromptPath::windows && has(qp::describe_route(pr_long), "outside the large-route identity range"),
+              "builtin exact past the identity range: windows, stated");
+        const auto pr_edge = route_of(std::nullopt, pr_w, pr_lp, qp::kExactLargeIdentity.max_prompt_tokens);
+        check(pr_edge.large() && pr_edge.by_default, "builtin exact at the edge of the identity range (32,771): large");
+        const auto pr_longx = route_of(std::nullopt, pr_w, pr_lp, 131072, {{"prefill_arith", "exact"}});
+        check(pr_longx.large(), "explicit exact at 128K: large route (the user asked for it)");
+        const auto pr_nat = route_of(std::nullopt, TurboWeights::native, pr_lp, 8192);
+        check(pr_nat.path == qp::PromptPath::windows && has(qp::describe_route(pr_nat), "native nvfp4"),
+              "native nvfp4 weights: no identity, windows kept");
+        const auto pr_q8 = route_of(std::nullopt, TurboWeights::off, pr_lp, 8192);
+        check(pr_q8.large() && pr_q8.by_default, "exact pack (synthetic bf16 / q8_0 identity): large route");
+
+        // per-row dumps and the slot bench read forward_rows windows: windows, reason printed, executed as windows
+        const auto pr_dump = route_of(Name::standard, pr_w, pr_lp, 2048, {}, true);
+        check(pr_dump.path == qp::PromptPath::windows && pr_dump.arith == "exact" &&
+                  has(qp::describe_route(pr_dump), "windows of 16 rows (--dump-logits / --dump-mtp read every prompt row)") &&
+                  has(ran(pr_dump, static_cast<const Admission*>(nullptr)).line, "executed: windows of 16 rows (--dump-logits"),
+              "per-row dumps run the windows route and say why");
+        check(throws([&] { (void)route_of(Name::fast, pr_w, pr_lp, 8192, {}, true); }, "cannot run there"),
+              "per-row dumps refuse a lossy prefill arithmetic instead of dropping it silently");
+        const auto pr_sl = route_of(std::nullopt, pr_w, pr_lp, 64, {}, false, true);
+        check(pr_sl.path == qp::PromptPath::windows && has(qp::describe_route(pr_sl), "windows of 16 rows (--slots: slot 0 is prefilled by forward_slots windows)"),
+              "--slots 2 --ctx-fill 64: the slot bench's windows, not large-M");
+        const auto pr_slf = route_of(Name::fast, pr_w, pr_lp, 8192, {}, false, true);
+        check(pr_slf.path == qp::PromptPath::windows && has(qp::describe_route(pr_slf), "prefill_arith fast4 not applied"),
+              "FAST slot bench: the receipt says fast4 did not run");
+        const auto pr_spec = route_of(Name::standard, pr_w, qp::Route::windows, 2048);
+        check(pr_spec.path == qp::PromptPath::windows && pr_spec.arith.empty(), "windows route (spec CLI): prefill_arith not offered, no large route");
     }
 
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "ALL PASS", g_fail);

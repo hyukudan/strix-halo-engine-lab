@@ -1811,14 +1811,18 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     const std::uint32_t first_decoder = ds41::SuffixReplayGeometry{}.first_decoder;
     // the bounded decoder replay's bound (0 off) and oracle form, agreed by both ranks with the deferral below
     // (PrefillOptions::decoder_replay_rows, else the environment). A run from position 0 only: a later run (extend)
-    // continues from the bounded state with the exact plan.
-    const std::uint32_t bounded = P0 != 0U ? 0U : (m.options.decoder_replay_override || m.options.decoder_replay_rows != 0U) ? m.options.decoder_replay_rows : prefill_decoder_replay_rows();
+    // continues from the bounded state with the exact plan. v1 bounds a fresh prompt's whole run: a run whose decoder
+    // cone a later piece takes over (a decoder-deferral request), that writes in-run snapshot states, or a group pass
+    // needs every decoder row, so it takes the exact plan (bound 0, reported in decoder_replay_rows) instead of
+    // refusing; the caller's piece plan decides, the same on both ranks (agreed below).
+    const std::uint32_t next_rows = std::exchange(m.defer_next, 0U);
+    const std::uint32_t requested = P0 != 0U ? 0U : (m.options.decoder_replay_override || m.options.decoder_replay_rows != 0U) ? m.options.decoder_replay_rows : prefill_decoder_replay_rows();
+    const std::uint32_t bounded = next_rows != 0U || !m.snap_points.empty() || grp != nullptr ? 0U : requested;
     const bool bounded_oracle = bounded != 0U && prefill_decoder_replay_oracle();
     result.decoder_replay_rows = bounded;
     result.decoder_replay_oracle = bounded_oracle;
     bool defer = false;
     {
-        const std::uint32_t next_rows = std::exchange(m.defer_next, 0U);
         static strix::lever_cache<bool> defer_on_cache{[] { const char* v = std::getenv("STRIX_DS41_DEFER_DECODER"); return !(v && std::strcmp(v, "0") == 0); }};
         const bool defer_on = defer_on_cache.get();
         if (next_rows != 0U && defer_on && m.options.cone && m.options.layers == c.num_hidden_layers && m.options.layers > first_decoder &&

@@ -26,6 +26,8 @@
 //   STRIX_HANDOFF_PREFIX_FIRST ask the ranks first, ship suffix  (default off: needs the family's invariance receipt)
 #include "strix/device/link_class.hpp"
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -33,6 +35,7 @@
 #include <vector>
 
 #include "strix/lever.hpp"
+#include "strix/model/bind.hpp"
 
 namespace strix::pair::state {
 
@@ -64,6 +67,65 @@ struct Family {
     bool shared_once_default = false;  // the family's default for STRIX_HANDOFF_SHARED_ONCE (a receipt, see decl)
     std::string_view shared_once_source{};
 };
+
+// A family's pieces come from its model TOML (pair.state, emitted structure-of-arrays by strix-model-gen, see
+// strix/model/constants.hpp). The words are the enumerator names; an unknown word reaches a non-constexpr function,
+// which makes the initialiser ill-formed (same rule as strix/moe/route_policy.hpp).
+namespace detail {
+inline void state_word_is_not_an_enumerator() {}  // not constexpr on purpose: reaching it is a compile error
+}  // namespace detail
+
+constexpr Owner owner_named(std::string_view word) {
+    if (word == "per_rank") return Owner::per_rank;
+    if (word == "shared") return Owner::shared;
+    if (word == "stage") return Owner::stage;
+    if (word != "replica") detail::state_word_is_not_an_enumerator();
+    return Owner::replica;
+}
+constexpr Extent extent_named(std::string_view word) {
+    if (word == "rows") return Extent::rows;
+    if (word != "fixed") detail::state_word_is_not_an_enumerator();
+    return Extent::fixed;
+}
+
+// The N rows of the generated `state` arrays, in Piece field order. Integers are narrowed with
+// strix::model::narrow (a value outside the field type is a compile error).
+template <std::size_t N>
+constexpr std::array<Piece, N> pieces_of(const std::string_view (&name)[N], const std::int64_t (&kind)[N],
+                                         const std::string_view (&owner)[N], const std::string_view (&extent)[N],
+                                         const std::int64_t (&bytes)[N], const std::int64_t (&layers)[N],
+                                         const std::int64_t (&layer0)[N], const std::int64_t (&layer_stride)[N],
+                                         const std::int64_t (&row_div)[N], const std::int64_t (&rows_less)[N],
+                                         const std::string_view (&source)[N]) {
+    std::array<Piece, N> out{};
+    for (std::size_t i = 0; i < N; ++i)
+        out[i] = Piece{name[i], ::strix::model::narrow<std::uint32_t>(kind[i]), owner_named(owner[i]),
+                       extent_named(extent[i]), ::strix::model::narrow<std::uint64_t>(bytes[i]),
+                       ::strix::model::narrow<std::uint32_t>(layers[i]), ::strix::model::narrow<std::uint32_t>(layer0[i]),
+                       ::strix::model::narrow<std::uint32_t>(layer_stride[i]),
+                       ::strix::model::narrow<std::uint32_t>(row_div[i]), ::strix::model::narrow<std::uint32_t>(rows_less[i]),
+                       source[i]};
+    return out;
+}
+
+// Field-for-field equality of declarations, for static_asserts that pin a TOML-bound family to the literals it replaced.
+constexpr bool equal(const Piece& a, const Piece& b) {
+    return a.name == b.name && a.kind == b.kind && a.owner == b.owner && a.extent == b.extent && a.bytes == b.bytes &&
+           a.layers == b.layers && a.layer0 == b.layer0 && a.layer_stride == b.layer_stride && a.row_div == b.row_div &&
+           a.rows_less == b.rows_less && a.source == b.source;
+}
+template <std::size_t N>
+constexpr bool equal(const std::array<Piece, N>& a, const std::array<Piece, N>& b) {
+    for (std::size_t i = 0; i < N; ++i)
+        if (!equal(a[i], b[i])) return false;
+    return true;
+}
+// Family scalars only (the pieces are compared by the array overload).
+constexpr bool equal(const Family& a, const Family& b) {
+    return a.name == b.name && a.rows_of == b.rows_of && a.world == b.world &&
+           a.block_rows == b.block_rows && a.prefix_rows_invariant == b.prefix_rows_invariant &&
+           a.shared_once_default == b.shared_once_default && a.shared_once_source == b.shared_once_source;
+}
 
 [[nodiscard]] inline std::uint64_t stored_rows(const Piece& p, std::uint64_t rows) noexcept {
     if (p.extent == Extent::fixed) return 1;

@@ -154,9 +154,7 @@ public:
             emplace_screen(1U);
         head_ = {screen_.has_value(), MiniHeadReason::hip_binding};
 #endif
-#if !defined(__HIPCC__)
         cohort_context_ = max_positions;
-#endif
         allocate_slots(1U);
         reset_gate_session();
     }
@@ -265,9 +263,7 @@ public:
         if (slots == 0U || slots > decode_rows_) throw std::invalid_argument("invalid Mini slot count");
         slots_.reserve(slots);
         while (slots_.size() < slots) slots_.push_back(std::make_unique<Slot>(layout_));
-#if !defined(__HIPCC__)
-        publish_slot_directory();
-#endif
+        if (!slot_directory_.span().empty()) publish_slot_directory();
     }
 
     // Served prompt route (serve::FixedKvCohort reads it once, at its construction): emits-first (prefill_slot_first)
@@ -402,24 +398,39 @@ public:
 #endif
         select_lowbit_cohort(groups_, rows);
         MiniResidentForward forward(backend_, workspace());
-        forward.append_batch(groups_, rows, embeddings, hidden, [&] {
-            embed(ids, embeddings, rows, kind, rows);
-        }, [&](MiniConstRows output) {
+        const auto batch = [&] {
+            forward.append_batch(groups_, rows, embeddings, hidden, [&] {
+                embed(ids, embeddings, rows, kind, rows);
+            }, [&](MiniConstRows output) {
 #if defined(__HIPCC__)
-            if (lanes_screened) {
-                greedy_.enqueue_produced_rows(rows, [&](HipGreedyRowsReply* replies) {
-                    return screen_->enqueue_lanes(output.data(), rows, kHiddenWidth, replies, stream_.get());
-                });
-                return;
-            }
+                if (lanes_screened) {
+                    greedy_.enqueue_produced_rows(rows, [&](HipGreedyRowsReply* replies) {
+                        return screen_->enqueue_lanes(output.data(), rows, kHiddenWidth, replies, stream_.get());
+                    });
+                    return;
+                }
 #endif
+                for (unsigned row = 0; row < rows; ++row)
+                    project_head(output.data() + std::size_t{row} * kHiddenWidth,
+                                 logits.subspan(::strix::head::logit_row_offset(row, kLogitPitch), kOutputVocabulary), true);
+                greedy_.enqueue_rows(logits, rows, kLogitPitch, stream_.get());
+            }, [&] {
+                for (std::size_t row = 0; row < top.size(); ++row) (void)checked_token(greedy_, row);
+            });
+        };
+#if defined(__HIPCC__)
+        if (hip_eager_lanes_ && rows <= exec::kStepMaxRows && backend_.admits_eager_lanes()) {
+            cohort_lanes_.clear();
             for (unsigned row = 0; row < rows; ++row)
-                project_head(output.data() + std::size_t{row} * kHiddenWidth,
-                             logits.subspan(::strix::head::logit_row_offset(row, kLogitPitch), kOutputVocabulary), true);
-            greedy_.enqueue_rows(logits, rows, kLogitPitch, stream_.get());
-        }, [&] {
-            for (std::size_t row = 0; row < top.size(); ++row) (void)checked_token(greedy_, row);
-        });
+                cohort_lanes_.push_back({slots[row], groups_[row].state->committed(), ids[row]});
+            const auto block = exec::make_cohort_step(cohort_lanes_, rows, static_cast<std::uint32_t>(slots_.size()),
+                                                      cohort_context_);
+            backend_.run_eager_lanes(block, cohort_lanes(slots.front(), rows), batch);
+        } else
+#endif
+        {
+            batch();
+        }
         for (std::size_t row = 0; row < top.size(); ++row) top[row] = greedy_.token(row);
 #if defined(__HIPCC__)
         if (lanes_screened) {
@@ -665,7 +676,6 @@ private:
     friend class MiniResidentDSpark;
     using Slot = session::ResidentRowSlot<MiniSessionStatePlan, mini_gpu::Buffer>;
 
-#if !defined(__HIPCC__)
     // Directory entry of every allocated slot (K plane, V plane, histories): the state::StateTable layout the
     // cohort programs read. Slots never move, so programs stay valid when slots are added.
     void publish_slot_directory() {
@@ -693,6 +703,7 @@ private:
                  reinterpret_cast<std::uintptr_t>(owner.history().data())}};
     }
 
+#if !defined(__HIPCC__)
     // Embedding of a cohort program: the ids come from the device step block (padded rows read id 0).
     void embed_lanes(MiniMutableRows output, unsigned rows, MiniAppendKind kind) {
         const auto table = weights_.bf16("embed.weight");
@@ -1343,14 +1354,21 @@ private:
     std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits_;
     std::size_t staged_logits_size_{};
     unsigned last_logit_rows_{};
-#if !defined(__HIPCC__)
-    exec::CohortProgramPolicy cohort_policy_{exec::resolve_cohort_programs()};
     unsigned cohort_context_{};
     std::vector<state::SlotEntry> slot_directory_host_;
+#if defined(__HIPCC__)
+    // Keep the incumbent execution and allocations unless this candidate is explicitly selected.
+    const bool hip_eager_lanes_{strix::envcfg::flag("STRIX_INKLING_HIP_LANES", false)};
+    mini_gpu::Buffer<state::SlotEntry> slot_directory_{hip_eager_lanes_ && !served_cli_route_ ?
+        std::size_t{kMiniLaneStates} * decode_rows_ : 0U};
+#else
     mini_gpu::Buffer<state::SlotEntry> slot_directory_{std::size_t{kMiniLaneStates} * decode_rows_};
+#endif
+    std::vector<exec::CohortLane> cohort_lanes_;
+#if !defined(__HIPCC__)
+    exec::CohortProgramPolicy cohort_policy_{exec::resolve_cohort_programs()};
     mini_gpu::Buffer<std::uint32_t> lane_ids_{exec::kStepMaxRows};
     mini_gpu::Buffer<std::uint32_t> lane_anchor_{1U};
-    std::vector<exec::CohortLane> cohort_lanes_;
     std::vector<MiniResidentAppendGroup> padded_groups_;
     std::bitset<exec::kStepMaxRows> reported_cohort_replays_;
     std::bitset<exec::kStepMaxRows> reported_padded_cohort_replays_;

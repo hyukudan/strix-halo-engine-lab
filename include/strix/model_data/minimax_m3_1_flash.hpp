@@ -4,6 +4,7 @@
 // with strix/model/bind.hpp.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string_view>
 
@@ -67,6 +68,30 @@ inline constexpr std::string_view STRIX_TP2_EXCHANGE_FMT = "forms.tensor.wire";
 } // namespace legacy_env
 } // namespace multi_device
 inline constexpr std::string_view name = "minimax-m3.1-flash";
+namespace pair {
+inline constexpr std::int64_t block_rows = 64;
+inline constexpr std::string_view family = "minimax-m3.1";
+inline constexpr bool prefix_rows_invariant = false;
+inline constexpr std::string_view rows_of = "P = N - 1";
+inline constexpr bool shared_once_default = false;
+inline constexpr std::string_view shared_once_source = "opt-in pending the pair receipt";
+namespace state {
+inline constexpr std::size_t count = 3;
+inline constexpr std::int64_t bytes[] = {512, 512, 256};
+inline constexpr std::string_view extent[] = {"rows", "rows", "rows"};
+inline constexpr std::int64_t kind[] = {0, 1, 2};
+inline constexpr std::int64_t layer0[] = {0, 0, 0};
+inline constexpr std::int64_t layer_stride[] = {1, 1, 1};
+inline constexpr std::int64_t layers[] = {60, 60, 60};
+inline constexpr std::string_view name[] = {"k", "v", "ik"};
+inline constexpr std::string_view owner[] = {"per_rank", "per_rank", "shared"};
+inline constexpr std::int64_t row_div[] = {1, 1, 1};
+inline constexpr std::int64_t rows_less[] = {0, 0, 0};
+inline constexpr std::string_view source[] = {"src/minimax/engine/engine.hip:3193-3207",
+    "src/minimax/engine/engine.hip:3193-3207", "src/minimax/rtxpf/cuda/mm_rtx_kernels.cu:639"};
+} // namespace state
+inline constexpr std::int64_t world = 2;
+} // namespace pair
 namespace presets {
 inline constexpr std::string_view default_ = "fast";
 namespace exact {

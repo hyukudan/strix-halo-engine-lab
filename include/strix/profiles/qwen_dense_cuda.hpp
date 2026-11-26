@@ -487,6 +487,127 @@ void apply(Options& o, const Resolved& r) {
     if (dense) o.dense_activation = *dense;
 }
 
+// ---- The decode CLI's prompt route: ONE host-side planning entry (plan_prompt, before load) + the executed route after the
+// engine's admission (execute_route). The CLI runs exactly what execute_route returns and prints its line.
+//
+// An explicit or profile prefill_arith takes the large-M route (CudaEngine::prefill), as before this entry existed. The
+// BUILTIN 'exact' (no tier word, --profile exact) takes it only where it reproduces, bit for bit, what the same invocation ran
+// before: the CLI windows of --rows (forward_rows + commit). That needs (a) every other lever row at its builtin (a
+// non-builtin decode_attn8 / split_k / kv_fp8 / dense_activation acts on forward_rows, i.e. on the old prompt, and the large
+// route does not run them; TURBO resolves prefill_arith builtin too), no engine override outside the table, no option the
+// identity evidence does not cover; (b) the prompt length and weights inside kExactLargeIdentity; (c) no per-row output and no
+// slot bench (both read forward_rows windows). Otherwise the windows run and the reason is printed.
+//
+// Identity of the builtin EXACT large route with those windows: RTX receipts q31 (2,048 and 8,192 tokens) and q33 (32,771 =
+// 16 chunks of 2,048 + a 3-row tail on 2 slots; 2,051 at 128 Ki context; --decode-attn8 on, --dump-logits and a declined
+// admission run the windows bit for bit), synthetic tests/qwen35/cuda_engine_test.cu (13 .. 387 rows, chunk 128, 1 and 2
+// slots, bf16 / q8_0 / onfly nvfp4 packs). The native-nvfp4 weight toggle is not covered.
+inline constexpr sp::RegimeGate kExactLargeIdentity{"prefill_arith", "exact", 1, 32771, "rtx q31 + q33; cuda_engine_test"};
+
+struct PromptRequest {
+    std::uint64_t prompt_tokens = 0;    // the prompt this invocation prefills (--prompt-ids, or --prompt-len + --ctx-fill)
+    std::uint32_t rows = 16;            // --rows: the CLI windows width
+    bool per_row_output = false;        // --dump-logits / --dump-mtp: every prompt row, only the windows produce them
+    bool slot_bench = false;            // --slots N: slot 0 is filled by forward_slots windows of --rows (no prompt route)
+    std::vector<std::string> unshown;   // options outside the lever table that change forward_rows arithmetic, no identity
+};
+enum class PromptPath : std::uint8_t {
+    large,           // CudaEngine::prefill on the large-M route (admission at load)
+    engine_windows,  // CudaEngine::prefill's own windows (--prefill-arith windows: the engine reference)
+    windows,         // the CLI windows of --rows + commit
+};
+struct PromptRoute {
+    PromptPath path = PromptPath::windows;
+    bool by_default = false;  // large only because the builtin exact resolved: a declined admission keeps the CLI windows
+    std::string arith;        // the resolved prefill_arith value ("" when the route does not offer the lever)
+    std::string reason;       // why the windows run (empty when large)
+    std::uint32_t rows = 16;  // the CLI windows width
+    [[nodiscard]] bool large() const { return path == PromptPath::large; }
+};
+inline PromptRoute plan_prompt(const Resolved& r, const PromptRequest& q) {
+    PromptRoute out;
+    out.rows = q.rows;
+    const auto* pa = r.find("prefill_arith");
+    if (pa) out.arith = pa->value;
+    const bool by_default = pa && (pa->status == sp::Status::builtin || pa->status == sp::Status::pending);
+    std::string keep;  // the first reason the builtin keeps the windows
+    if (by_default) {
+        for (const auto& e : r.resolution.entries)
+            if (keep.empty() && e.lever && e.lever->name != "prefill_arith" && e.value != e.lever->builtin)
+                keep = std::string(e.lever->name) + " " + e.value + " acts on the windows the builtin exact ran";
+        for (const auto& o : r.resolution.engine_overrides)
+            if (keep.empty()) keep = "engine override " + o;
+        for (const auto& o : q.unshown)
+            if (keep.empty()) keep = o + ": no identity of the large route with the windows";
+        if (keep.empty() && r.regime.weights == Weights::nvfp4_native) keep = "native nvfp4 weights: no identity of the large route";
+        if (keep.empty() && !sp::regime_covers(kExactLargeIdentity, "prefill_arith", "exact", q.prompt_tokens))
+            keep = "prompt " + std::to_string(q.prompt_tokens) + " tokens outside the large-route identity range " +
+                   std::to_string(kExactLargeIdentity.min_prompt_tokens) + ".." + std::to_string(kExactLargeIdentity.max_prompt_tokens);
+    }
+    if (out.arith.empty()) {
+        out.reason = "prefill_arith not offered on this route";
+    } else if (q.slot_bench) {
+        out.reason = "--slots: slot 0 is prefilled by forward_slots windows" +
+                     (out.arith == "exact" || out.arith == "windows" ? std::string() : "; prefill_arith " + out.arith + " not applied");
+    } else if (q.per_row_output) {
+        if (out.arith != "exact" && out.arith != "windows")
+            throw std::invalid_argument("qwen35-cuda-dense: --dump-logits / --dump-mtp read every prompt row on the windows route "
+                                        "(exact arithmetic); prefill_arith " + out.arith + " cannot run there: drop the profile "
+                                        "word or set --prefill-arith exact");
+        out.reason = "--dump-logits / --dump-mtp read every prompt row";
+    } else if (!keep.empty()) {
+        out.reason = "builtin exact keeps the windows: " + keep;
+    } else if (out.arith == "windows") {
+        out.path = PromptPath::engine_windows;
+        out.reason = "--prefill-arith windows";
+    } else {
+        out.path = PromptPath::large;
+        out.by_default = by_default;
+    }
+    return out;
+}
+// The intent line (effective config, before load): the route asked for; the large route waits for the admission.
+inline std::string describe_route(const PromptRoute& p) {
+    switch (p.path) {
+    case PromptPath::large:
+        return "  prompt-route: large-M prefill, prefill_arith " + p.arith + (p.by_default ? " (builtin)" : "") +
+               "; workspace admitted at load\n";
+    case PromptPath::engine_windows: return "  prompt-route: engine windows (" + p.reason + ")\n";
+    case PromptPath::windows: break;
+    }
+    return "  prompt-route: windows of " + std::to_string(p.rows) + " rows (" + p.reason + ")\n";
+}
+// What runs after the engine's admission (a: CudaEngine::PrefillAdmission or the same fields; nullptr: no large route asked).
+// A declined builtin route keeps the CLI windows it replaced; a declined explicit / profile route runs the engine's windows
+// fallback (what CudaEngine::prefill ran before the admission existed). `line` is the receipt of the executed route.
+struct ExecutedRoute {
+    PromptPath path = PromptPath::windows;
+    std::string line;
+};
+template <class Admission>
+ExecutedRoute execute_route(const PromptRoute& p, const Admission* a) {
+    ExecutedRoute x;
+    const auto windows = [&](const std::string& why) {
+        x.path = PromptPath::windows;
+        x.line = "  prompt-route executed: windows of " + std::to_string(p.rows) + " rows (" + why + ")\n";
+        return x;
+    };
+    if (p.path == PromptPath::windows || a == nullptr) return windows(p.reason.empty() ? "no admission" : p.reason);
+    if (p.path == PromptPath::large && a->admitted) {
+        x.path = PromptPath::large;
+        x.line = "  prompt-route executed: large-M prefill, prefill_arith " + p.arith + "; slots " + std::to_string(a->slots) + " of " +
+                 std::to_string(a->slots_wanted) + "; workspace " + std::to_string(a->workspace_bytes >> 20U) + " MiB admitted, " +
+                 std::to_string(a->free_bytes >> 20U) + " MiB free after\n";
+        return x;
+    }
+    const std::string why = p.path == PromptPath::engine_windows ? p.reason : "large route not admitted: " + a->reason;
+    if (p.by_default) return windows("builtin exact, " + why);
+    x.path = PromptPath::engine_windows;
+    x.line = "  prompt-route executed: engine windows of " + std::to_string(a->fallback_rows) + " rows (" + why +
+             (p.arith == "exact" || p.arith == "windows" ? "" : "; prefill_arith " + p.arith + " not applied") + ")\n";
+    return x;
+}
+
 // The resolved lever set for the effective config. Empty under the default (exact) profile: its effective config stays
 // byte-identical to the build without a profile word.
 inline std::string describe(const Resolved& r) {

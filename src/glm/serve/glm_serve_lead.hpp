@@ -132,6 +132,12 @@ struct LeadConfig {
     // base/whole-prompt calls can exceed it and the engine must split them internally.
     strix::serve::PrefillInterleave interleave;
     unsigned prefill_chunk_cap = 0;
+    // Request-fixed dense core (strix::glm::pf::dense_policy::pin_*; empty: off): the end of a chunk of a prompt is moved to
+    // one that keeps every row on the core the rank CLI gives it (traffic only decides when the chunk runs), and a root
+    // store whose cut would change a row's core is skipped. Arguments: prompt tokens, rows done, proposed tokens/end.
+    std::function<std::size_t(std::size_t, std::size_t, std::size_t)> pin_chunk;
+    std::function<bool(std::size_t, std::size_t, std::size_t)> pin_admits;  // a chunk [done, end) keeps every row's core
+    std::function<bool(std::size_t, std::size_t, std::size_t)> pin_root;    // the same, and a root cut reusable by any prompt
     // Prefill units (STRIX_GLM_SERVE_PREFILL_UNITS=1; 0 rows = token chunks): an MTP prompt chunked beside decoding
     // requests runs as one engine session paused at layer boundaries of its pieces of `prefill_units_rows` rows (the
     // engine's max_rows), `prefill_units_layers` units per piece (strix/session/prefill_session.hpp LayerUnits).
@@ -631,7 +637,8 @@ private:
         // A prompt that fits one base chunk keeps the token call (one call either way).
         // A root still to store keeps the token calls up to it (a units session runs to the end of the prompt).
         if (p.units || (p.root <= p.done && cfg_.prefill_units_rows != 0 && p.a.mtp_ok && p.chunk != 0 && lanes != 0 && n - p.done > p.chunk &&
-                        cfg_.prefill_units_admit && cfg_.prefill_units_admit(n - p.done))) {
+                        cfg_.prefill_units_admit && cfg_.prefill_units_admit(n - p.done) &&
+                        (!cfg_.pin_admits || cfg_.pin_admits(n, p.done, n)))) {  // the session's max_rows pieces must be admitted calls
             const bool start = !p.units;
             if (start) {
                 const strix::session::LayerUnits lu{n - p.done, cfg_.prefill_units_rows, cfg_.prefill_units_layers};
@@ -653,7 +660,12 @@ private:
             if (start) chunk.assign(prompt.begin() + static_cast<std::ptrdiff_t>(p.done), prompt.end());
         } else {
             auto plan = cfg_.interleave.plan(p.chunk, n - p.done, lanes, cfg_.prefill_chunk_cap, p.ms_per_token);
-            if (p.root > p.done) plan.tokens = std::min<std::size_t>(plan.tokens, static_cast<std::size_t>(p.root - p.done));
+            if (cfg_.pin_chunk) plan.tokens = cfg_.pin_chunk(n, p.done, plan.tokens);
+            if (p.root > p.done) {
+                const auto to_root = static_cast<std::size_t>(p.root - p.done);
+                // The root store needs a cut at the root: taken only when that cut keeps every row's core.
+                if (plan.tokens >= to_root && (!cfg_.pin_root || cfg_.pin_root(n, p.done, p.done + to_root))) plan.tokens = to_root;
+            }
             m = plan.tokens;
             decode_debt_.charge(plan);
             last = p.done + m == n;

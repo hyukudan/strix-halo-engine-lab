@@ -273,6 +273,50 @@ std::pair<std::string_view, std::string> scalar(const Value& v) {
     return {{}, {}};
 }
 
+// `type name[] = {a, b, ...};` wrapped at 116 columns.
+std::string scalar_array(const std::string& indent, std::string_view type, const std::string& name,
+                         const std::vector<std::string>& items) {
+    std::string line = indent + "inline constexpr " + std::string(type) + " " + name + "[] = {";
+    std::string body;
+    std::size_t column = line.size();
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        std::string piece = items[i] + (i + 1 < items.size() ? ", " : "");
+        if (column + piece.size() > 116) {
+            if (!body.empty()) body.pop_back();  // space after the previous item's comma
+            body += "\n" + indent + "    ";
+            column = indent.size() + 4;
+        }
+        body += piece;
+        column += piece.size();
+    }
+    return line + body + "};\n";
+}
+
+// An array of tables whose tables all carry the same keys, each key a scalar of one type in every row, is emitted
+// structure-of-arrays: `namespace <key> { count; <field>[]...; }`. Anything else (mixed rows, nested tables, a field
+// called `count`) is left to the caller, which writes the "no constant" comment.
+bool emit_columns(std::string& out, const Value::Array& array, const std::string& name, const std::string& indent) {
+    const auto* first = std::get_if<Value::Table>(&array.front().data);
+    if (!first || first->empty() || first->find("count") != first->end()) return false;
+    std::vector<std::pair<std::string, std::pair<std::string_view, std::vector<std::string>>>> columns;
+    for (const auto& entry : *first) columns.push_back({entry.first, {scalar(entry.second).first, {}}});
+    for (const auto& item : array) {
+        const auto* row = std::get_if<Value::Table>(&item.data);
+        if (!row || row->size() != columns.size()) return false;
+        std::size_t c = 0;
+        for (const auto& [key, value] : *row) {
+            auto [type, literal] = scalar(value);
+            if (type.empty() || key != columns[c].first || type != columns[c].second.first) return false;
+            columns[c++].second.second.push_back(std::move(literal));
+        }
+    }
+    out += indent + "namespace " + name + " {\n";
+    out += indent + "inline constexpr std::size_t count = " + std::to_string(array.size()) + ";\n";
+    for (const auto& [key, column] : columns) out += scalar_array(indent, column.first, cxx_name(key), column.second);
+    out += indent + "} // namespace " + name + "\n";
+    return true;
+}
+
 void emit_table(std::string& out, const Value::Table& table, const std::string& indent) {
     for (const auto& [key, value] : table) {
         const auto name = cxx_name(key);
@@ -284,6 +328,7 @@ void emit_table(std::string& out, const Value::Table& table, const std::string& 
         }
         if (const auto* array = std::get_if<Value::Array>(&value.data)) {
             if (array->empty()) { out += indent + "// " + key + ": empty array (no constant)\n"; continue; }
+            if (emit_columns(out, *array, name, indent)) continue;
             std::string_view type;
             std::vector<std::string> items;
             bool uniform = true;
@@ -294,16 +339,7 @@ void emit_table(std::string& out, const Value::Table& table, const std::string& 
                 items.push_back(std::move(literal));
             }
             if (!uniform) { out += indent + "// " + key + ": array of tables or mixed array (no constant)\n"; continue; }
-            std::string line = indent + "inline constexpr " + std::string(type) + " " + name + "[] = {";
-            std::string body;
-            std::size_t column = line.size();
-            for (std::size_t i = 0; i < items.size(); ++i) {
-                std::string piece = items[i] + (i + 1 < items.size() ? ", " : "");
-                if (column + piece.size() > 116) { body += "\n" + indent + "    "; column = indent.size() + 4; }
-                body += piece;
-                column += piece.size();
-            }
-            out += line + body + "};\n";
+            out += scalar_array(indent, type, name, items);
             continue;
         }
         const auto [type, literal] = scalar(value);
@@ -338,9 +374,13 @@ std::string emit_constants(const model_description::ModelDescription& descriptio
     out += "// strix-model-gen --write " + source + " include/strix/model_data/" + ident + ".hpp " + source + "\n";
     out += "// strix-model-constants-tests fails when this header and the TOML disagree. Engines bind these values\n";
     out += "// with strix/model/bind.hpp.\n";
-    out += "#pragma once\n\n#include <cstdint>\n#include <string_view>\n\n";
+    std::string body;
+    emit_table(body, projected.fields, "");
+    out += "#pragma once\n\n";
+    if (body.find("std::size_t") != std::string::npos) out += "#include <cstddef>\n";  // structure-of-arrays counts
+    out += "#include <cstdint>\n#include <string_view>\n\n";
     out += "namespace strix::model_data::" + ident + " {\n\n";
-    emit_table(out, projected.fields, "");
+    out += body;
     out += "\n} // namespace strix::model_data::" + ident + "\n";
     return out;
 }

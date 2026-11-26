@@ -3,8 +3,7 @@
 #include "glm_post_fast.hpp"
 
 #include "glm/common/glm_hc.hpp"
-#include "moe_core/route_wave_kernel.hpp"
-#include "strix/env_flags.hpp"
+#include "glm/kernels/glm_tier_a.hpp"
 
 #include <stdexcept>
 #include <type_traits>
@@ -520,47 +519,6 @@ __global__ __launch_bounds__(64) void hc_chains_lds_only_kernel(const float* F, 
     z[l] = acc;
 }
 
-// Parallel exact routing: one block of 288 lanes (+ padding to 320) per row.
-__global__ __launch_bounds__(320) void route_v2_kernel(const float* logits, const float* bias, std::uint32_t* ids, float* w) {
-    __shared__ float sg[kExperts];
-    __shared__ std::uint32_t key[kExperts];
-    __shared__ std::uint32_t pick[kTopE];
-    __shared__ std::uint32_t rk[kExperts];
-    const unsigned r = blockIdx.x, e = threadIdx.x;
-    const float* lg = logits + static_cast<std::size_t>(r) * kExperts;
-    if (e < kExperts) {
-        sg[e] = sigmoid(lg[e]);
-        key[e] = ordered_key(sg[e] + bias[e]);
-    }
-    __syncthreads();
-    if (e < kExperts) {
-        // rank under the total order (key desc, index asc): the Tier A scan picks exactly the 8 smallest ranks
-        unsigned rank = 0;
-        const std::uint32_t ke = key[e];
-        for (unsigned f = 0; f < kExperts; ++f) {
-            const std::uint32_t kf = key[f];
-            rank += (kf > ke || (kf == ke && f < e)) ? 1U : 0U;
-        }
-        rk[e] = rank;
-    }
-    __syncthreads();
-    if (e < kExperts && rk[e] < kTopE) {
-        unsigned before = 0;  // position among the selected, ascending id
-        for (unsigned f = 0; f < e; ++f) before += rk[f] < kTopE ? 1U : 0U;
-        pick[before] = e;
-    }
-    __syncthreads();
-    if (e == 0) {  // R14 on lane 0, ascending id, the Tier A expression order
-        float den = 0.0F;
-        for (unsigned k = 0; k < kTopE; ++k) den = den + sg[pick[k]];
-        den = den + kRouteDenEps;
-        for (unsigned k = 0; k < kTopE; ++k) {
-            ids[static_cast<std::size_t>(r) * kTopE + k] = pick[k];
-            w[static_cast<std::size_t>(r) * kTopE + k] = (sg[pick[k]] / den) * kRouteScale;
-        }
-    }
-}
-
 }  // namespace
 
 void hc_pre_v3(const float* X, const float* fn, const float* base, const float* scale, float* F, float* mix, float* xc,
@@ -591,13 +549,7 @@ void hc_chains_lds_only(const float* F, const float* fn, float* z, hipStream_t s
     ok(hipGetLastError(), "glm hc_chains_lds_only");
 }
 void route_v2(const float* logits, const float* bias, std::uint32_t* ids, float* w, unsigned rows, hipStream_t s) {
-    static const bool shared_route = strix::envcfg::flag("STRIX_GLM_SHARED_ROUTE_V2", false);
-    if (shared_route) {
-        strix::moe_core::enqueue_route_wave<kRoutePolicy, GlmDeclaredExp>(logits, bias, ids, w, rows, s);
-    } else {
-        route_v2_kernel<<<rows, 320, 0, s>>>(logits, bias, ids, w);
-    }
-    ok(hipGetLastError(), "glm route_v2");
+    ::strix::glm::dev::route(logits, bias, ids, w, rows, s);
 }
 
 }  // namespace strix::glm::xfer

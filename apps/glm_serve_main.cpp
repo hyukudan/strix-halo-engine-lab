@@ -50,6 +50,7 @@
 // C1 MTP: with one request in flight (none waiting) it decodes through the engine's exact single-slot self-speculation
 // (verify / commit / adaptive K, the CLI --decode route); rank 1 replays mtp_enter / mtp_run / mtp_leave. Any second
 // request ends the decoder at a cycle boundary (deferred rows flushed) and batched plain steps follow.
+#include "strix/glm/pair_state.hpp"
 #include "strix/pair/state_decls.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "glm_rank_defaults.hpp"
@@ -1126,7 +1127,7 @@ int main(int argc, char** argv) {
         if (opt.world != 1 && opt.world != 2) throw std::invalid_argument("--world 1|2");
         if (opt.rank >= opt.world) throw std::invalid_argument("--rank must be < --world");
         {
-            // One resolver for the hand-off owners (strix/pair/state_owners.hpp, GLM declaration in state_decls.hpp): the
+            // One resolver for the hand-off owners (strix/pair/state_owners.hpp, GLM declaration in glm/pair_state.hpp): the
             // flag, then STRIX_HANDOFF_SHARED_ONCE, then the family default (DSA once, v2: the same bytes, relayed). The
             // automatic default applies where v2 runs (import receiver on, a pair); an explicit request elsewhere refuses below.
             namespace ps = strix::pair::state;
@@ -1476,6 +1477,29 @@ int main(int argc, char** argv) {
         lc.prefill_chunk = prefill_chunk;
         lc.interleave = serve_prefill_interleave(prefill_mode, opt.max_rows, eng.prefill_pipeline());
         lc.prefill_chunk_cap = opt.max_rows;
+        if (prefill_mode == "gemv") {
+            // Request-fixed dense core (glm_pf_dense_policy.hpp pin_*): under FAST WMMA with the auto core, a chunk of a
+            // prompt ends only where every row keeps the core the rank CLI gives it, whatever the traffic.
+            const auto pin = strix::glm::pf::dense_policy::pin_shape(0, opt.max_rows, eng.prefill_pipeline(), strix::envcfg::text);
+            if (pin.active) {
+                lc.pin_chunk = [pin](std::size_t prompt, std::size_t done, std::size_t tokens) {
+                    auto shape = pin; shape.prompt = prompt;
+                    return strix::glm::pf::dense_policy::pin_chunk(shape, done, tokens);
+                };
+                lc.pin_admits = [pin](std::size_t prompt, std::size_t done, std::size_t end) {
+                    auto shape = pin; shape.prompt = prompt;
+                    return strix::glm::pf::dense_policy::pin_admits(shape, done, end);
+                };
+                lc.pin_root = [pin](std::size_t prompt, std::size_t done, std::size_t end) {
+                    auto shape = pin; shape.prompt = prompt;
+                    return strix::glm::pf::dense_policy::pin_root_admits(shape, done, end);
+                };
+            }
+            if (opt.rank == 0)
+                std::printf("rank 0 effective prefill-core-pin=%s (the dense core of a prompt row is the rank CLI's for that prompt: "
+                            "chunk ends move to calls that keep it; max_rows=%u floor=%u rows)\n",
+                            pin.active ? "on" : "off", opt.max_rows, pin.min_rows);
+        }
         lc.prefill_timeline = static_cast<unsigned>(std::max(0, strix::envcfg::integer("STRIX_SERVE_PREFILL_TIMELINE", 0)));
         lc.prefill_chunk_mtp = prefill_chunk_mtp;
         lc.prefill_units_rows = opt.prefill_units && prefill_chunk_mtp ? opt.max_rows : 0U;  // max_rows after admission

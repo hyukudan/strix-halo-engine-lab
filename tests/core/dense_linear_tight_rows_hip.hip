@@ -101,6 +101,8 @@ int main() {
     const struct { unsigned K; std::vector<unsigned> widths; bool round; } cases[] = {
         {3072U, {2304U}, false}, {2304U, {3072U, 384U, 37U}, false}, {48U, {200U, 9U}, true},
         {1040U, {64U, 65U, 1U, 129U}, true}, {2304U, {2304U, 2304U}, true},
+        // six same-input projections in one launch (the attention-prepare group of a sliding layer)
+        {2304U, {3072U, 384U, 16U, 8U, 512U, 512U}, true}, {2304U, {3072U, 384U, 16U, 8U, 512U}, false},
     };
     for (const auto& c : cases) {
         const bool pass = c.round ? run<true>(c.K, c.widths, random, compared) : run<false>(c.K, c.widths, random, compared);

@@ -25,6 +25,7 @@
 //                    listeners, --repeat K times per prompt alternating identity / bp-v1 frames (ABA...): transport,
 //                    codec, import and token reply on the real link, plus its rate
 //   MM_RTX_PROFILE=1 synchronised per-phase times
+#include "strix/minimax/pair_state.hpp"
 #include "strix/pair/state_decls.hpp"
 #include "mm_rtx_kernels.cuh"
 #include "mm_rtx_pack.hpp"
