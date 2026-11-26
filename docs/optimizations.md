@@ -1216,7 +1216,7 @@ The 512-row IU4 window (`--wide 512`, A4W4 off) is the FAST/TURBO prefill route 
 (`sp::RegimeGate` rows, quality per prompt band) and the shared band receipts (`LadderRow::band_bound`, timing per band,
 bound by `bind_band_receipts` to the run's own reference and re-bound until the ladder chain settles) both cover the
 run: gfx1151, one rank, one lane, the IU4 g64 pack, a known execution and a prompt of 64..24,576
-tokens (lower edges timed on the PR head 11-26: ties at 4 and 16 tokens, wins from 64; 2,049, 4,096 and 8,193 win
+tokens (lower edges timed on the previous integration head: ties at 4 and 16 tokens, wins from 64; 2,049, 4,096 and 8,193 win
 x3.4, x4.0 and x5.1). The [ladder inventory](band-edges.md) records the original intervals and measured floors. Other prompts use the 64-row EXACT windows. The A4W4 48-63 layer table failed the same
 per-class gate and stays pending. `--dump-logits --dump-window` without `--wide` now dumps the last window of the route
 the profile resolves (the gate's default arm); `--dump-logits` alone keeps its one-row reference path. Windows wider

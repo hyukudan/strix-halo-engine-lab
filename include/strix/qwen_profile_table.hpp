@@ -120,19 +120,19 @@ inline constexpr ::strix::profile::RegimeGate fast_regimes[] = {
 // 4K 2107.1 -> 2047.1 ms; 8K 4020.9 (3 valid) -> 3919.3 ms (4/4 valid), +2.6 %; 32K 16140.4 -> 15846.1 ms, +1.9 %.
 // Confirmed on main ca2de6ae8 (bin 12ea00ce): FAST+cap9 3937.4 ms (2/2 valid), record FAST 4041.2 ms. Quality of the
 // composite vs EXACT at 8K: KL 0.00528, top-1 0.9707, dNLL +0.0050. The 4096-8192 band takes the 8K ratio (the 4K
-// ratio, 2107.1 / 2047.1 = 1.029, is above it). Lower edges timed on the PR head (dev_b 11-26): 4,096 +4.2 %,
+// ratio, 2107.1 / 2047.1 = 1.029, is above it). Lower edges timed on the integration head: 4,096 +4.2 %,
 // 8,193 +3.9 %, so both rows keep their nominal lower edges.
 inline constexpr double kCap9Speedup8k = 4020.9 / 3919.3;
 inline constexpr double kCap9Speedup32k = 16140.4 / 15846.1;
 inline constexpr double kCap9Noise = 0.01;
 inline constexpr std::string_view kCap9Receipt8k =
     "eng_land Q-CAP 11-24 bin 88ce20962408081f p8192 FAST 4020.9 ms -> cap9 3919.3 ms (+2.6 %, 4/4 valid); "
-    "main ca2de6ae8 re-measure cap9 3937.4 ms; lower edge dev_b 11-26 (PR head 2019eacec5, bin fb814e2f1dba372a, "
-    "cluster1, ABBA x2) p4096 FAST 2396.2 ms -> cap9 2300.3 ms (medians, 3 / 4 valid, +4.2 %); "
+    "main ca2de6ae8 re-measure cap9 3937.4 ms; lower edge (integration head 2019eacec5, bin fb814e2f1dba372a, "
+    "one gfx1151 node, ABBA x2) p4096 FAST 2396.2 ms -> cap9 2300.3 ms (medians, 3 / 4 valid, +4.2 %); "
     "quality vs EXACT 8K KL 0.00528 top-1 0.9707 dNLL +0.0050";
 inline constexpr std::string_view kCap9Receipt32k =
     "eng_land Q-CAP 11-24 bin 88ce20962408081f 32K FAST 16140.4 ms -> cap9 15846.1 ms (+1.9 %); "
-    "lower edge dev_b 11-26 (PR head 2019eacec5, bin fb814e2f1dba372a, cluster1, ABBA x2) p8193 FAST 3995.0 ms "
+    "lower edge (integration head 2019eacec5, bin fb814e2f1dba372a, one gfx1151 node, ABBA x2) p8193 FAST 3995.0 ms "
     "(1 valid, 3 evicted all slower) -> cap9 3843.7 ms (median of 3 valid, +3.9 %); "
     "quality measured at 8K (KL 0.00528 top-1 0.9707 dNLL +0.0050)";
 

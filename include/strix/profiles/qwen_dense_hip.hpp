@@ -104,12 +104,12 @@ inline constexpr std::string_view kTime24k = "qwen_night-tim-c2-24k(-exact) 24,5
             .min_context = lo, .max_context = hi, .min_lanes = 1, .max_lanes = 1, .speedup = speedup, .noise = kNoise,
             .receipt = receipt, .band_bound = true, .band_evidence = evidence};
 }
-// Lower edges (dev_b 11-26, PR head 2019eacec5, bin 4f23e3450dd68600, cluster1, ABBA, warm ms, evicted 0): at 4 and
+// Lower edges (integration head 2019eacec5, bin 4f23e3450dd68600, one gfx1151 node, ABBA, warm ms, evicted 0): at 4 and
 // 16 tokens the window ties the EXACT windows (74.7 / 74.6 ms, 99.1 / 99.1 ms: no gain), from 64 it wins (282 -> 156 ms,
 // 256: 1,131 -> 385, 1,024: 4,663 -> 1,436), so the first band starts at its first winning point, 64. 2,049: 10,212 ->
 // 3,024 ms; 4,096: 25,373 -> 6,290 ms; 8,193: 68,262 (one cold EXACT) -> 13,403 / 13,067 cold, so those edges hold.
 inline constexpr sp::LadderRow kBandRows[] = {
-    band_row("wide_rows", "512", 1, 2048, kWide2k, kTime2k, {{64, 256, 1024, 2048}, {2048}, kGate2k, true}),
+    band_row("wide_rows", "512", 1, 2048, kWide2k, kTime2k, {{64, 256, 1024, 2048}, {2048}, kGate2k, true, true}),
     band_row("wide_rows", "512", 2049, 8192, kWide8k, kTime8k, {{2049, 4096, 8192}, {8192}, kGate8k, false}),
     band_row("wide_rows", "512", 8193, 24576, kWide24k, kTime24k, {{8193, 24576}, {24064, 24576}, kGate24k, false}),
 };
