@@ -110,11 +110,11 @@ tower runs on the CPU ahead of the run and the ranks splice its rows into the pr
 The server takes `image_url` parts of chat requests with `--vision MMPROJ.gguf` on rank 0; it encodes each new
 image on its CPU and sends the rows to rank 1 once.
 
-Draft: the host half is tested on synthetic projector files and a fake engine. On the pair (2026-11-24, gfx1151,
-one USB4 cable) the device half compiles and runs with the real projector file (`mmproj-F16.gguf`, `glm5v`): through
-`strix-glm5-serve --vision`, two synthetic images were answered correctly (red | blue halves; a filled circle beside
-an outlined square), greedy and sampled, 5-8 s per request. Not run yet: `strix-glm5-rank --embed-rows`, images
-large enough to span prefill chunks or units, and text-prompt identity against the previous build. Commands, status and limits:
+Draft: the host half is tested on synthetic projector files and a fake engine. On the integrated #1281 head
+(`4d91c55c`, gfx1151 pair), the maintainer ran one image request with the repository's synthetic test projector.
+This is an HTTP smoke, not image-quality qualification. The reported greedy and fixed-seed sampled text token IDs
+matched previous main. Real-projector qualification, image answer quality and timing remain pending on this build;
+the contributor's earlier real-projector smoke was on a prior build. Commands, status and limits:
 [image input](../../engine/vision.md#glm-53-flash); the adapter and its gate:
 [vision adapters](../../engine/vision-adapters.md#glm-53-flash).
 
@@ -243,6 +243,23 @@ workspace, install/staging, late safety and startup reserve terms in GiB.
 | Exact chunked prefill, mHC expand + norm two rows per block (the kernel of that build; since replaced by the shared row expansion, `STRIX_GLM_PF_HC_EXPAND_BW`, same bits) | 8K benchmark prompt (8,192 tokens), alternating on / off arms, other exact prefill levers of that build enabled | TTFT 8K **13.671 → 13.611 s** (−0.44 %, above the 0.024 s spread within an arm) | logits bitwise equal the anchors on both ranks at 8K; host and device gates bitwise against the one-row kernel |
 | Exact / FAST chunked prefill, token-ordered MoE gate/up input transform (default; `STRIX_GLM_PF_IN_TOKEN=0` restores the tile-ordered transform) | 8K / 32K benchmark prompts, on / off arms in both orders, fresh process per arm | FAST 8K TTFT **10.55 → 10.21 s** (median of 4 pairs); exact 8K 13.195 → 12.868 s; FAST 32K 43.49 → 42.39 s (one pair); exact 32K: 56.32 -> 53.41 s and 57.63 -> 55.52 s in two pairs (off first, on first): -2.9 / -2.1 s, mean -2.5 s (-4.5 %), identical full logits files on both ranks (an earlier single pair showed -5.5 s from a slow off arm; it did not reproduce). | logits and state digests identical in every arm on both ranks; full logits files identical in the exact arms |
 | R1b teacher-forced agreement | 32 prompts, 256 positions each; chat, code, JSON, math, reasoning, translation | **8,126/8,192 = 99.19 %** top-1; mean KL **~1.8e-3 nats** | `4dad4c19`; free runs diverge on **28/32** prompts within 19–227 tokens |
+
+The HIP `--profile turbo` WMMA bundle uses X3 linears, MLA GEMMs, KDA projections
+and sparse attention with 16-key blocks. Automatic admission is limited to the
+measured Radeon 8060S USB4 host pair (two 40 Gb/s cables and four streams),
+one fresh text prompt of 8,108 or 31,258 tokens, an admitted 8,192-row chunk,
+36,864-token capacity, and the EXL3 R1b/MTP route with a 64-token decode budget.
+The matched pair used two prefill streams, routed scratch and no query window.
+The served measurements were 12.903 to 8.542 s at 8,108 tokens and 55.006 to
+35.552 s at 31,258 tokens for FAST and TURBO respectively. The bundle's 8K
+quality result was KL 0.275, top-1 agreement 93.2% and ΔNLL −0.087 across 512
+scored rows. The bundle failed the FAST gate.
+
+Other executions use the FAST route, including host-only inspection, memory
+fallback to a smaller chunk, cached or interleaved prefill, and native modes
+without configuration agreement. The prompt receipt names the selected route.
+Explicit arithmetic switches retain their controls and require pair
+configuration agreement. `STRIX_GLM_PF_WMMA=0` disables the umbrella.
 
 The R≥3 buffer fix is verified on the real pair. The latest integration uses direct exchange for plain
 forwards and exact MoE v3 for prefill; the speculative oracle also passes with drained exchange switching.

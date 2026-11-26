@@ -67,6 +67,7 @@
 //   --cut-relay HOST:PORT (rank 0) / --cut-relay-listen PORT (rank 1): activation-only relay
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/minimax/engine.hpp"
+#include "strix/minimax/model_assets.hpp"
 #include "../src/minimax/model_graph.hpp"
 #include "minimax/engine/mm_defaults.hpp"
 #include "strix/dist/communicator_hip.hpp"
@@ -1917,7 +1918,9 @@ int main(int argc, char** argv) {
         const auto& cut_relay = cut_args.relay;
         const auto cut_relay_port = cut_args.relay_port;
         std::vector<std::string> session_hash_files;
-        std::string dspark_dir = std::string(argv[1]) + "/dspark", dspark_exl3;
+        auto packaged_draft = strix::minimax::assets::discover_draft_dir(argv[1]);
+        if (packaged_draft.empty()) packaged_draft = std::filesystem::path(argv[1]) / "dspark";
+        std::string dspark_dir = packaged_draft.string(), dspark_exl3;
         std::vector<std::string> dspark_heads;
         bool print_graph = strix::minimax::graph::requested("STRIX_PRINT_MODEL_GRAPH");
         bool print_plan = strix::minimax::graph::requested("STRIX_PRINT_EXEC_PLAN");

@@ -4,6 +4,7 @@
 // with strix/model/bind.hpp.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string_view>
 
@@ -94,6 +95,32 @@ inline constexpr std::string_view STRIX_GLM_PF_STAGED = "forms.layers";
 } // namespace legacy_env
 } // namespace multi_device
 inline constexpr std::string_view name = "glm-5.3-flash";
+namespace pair {
+inline constexpr std::int64_t block_rows = 64;
+inline constexpr std::string_view family = "glm-5.3";
+inline constexpr bool prefix_rows_invariant = false;
+inline constexpr std::string_view rows_of = "P = N - 1";
+inline constexpr bool shared_once_default = true;
+inline constexpr std::string_view shared_once_source = "glm v1/v2 rank payload equal bits (host relay fixture)";
+namespace state {
+inline constexpr std::size_t count = 6;
+inline constexpr std::int64_t bytes[] = {2097152, 147456, 1024, 256, 256, 512};
+inline constexpr std::string_view extent[] = {"fixed", "fixed", "rows", "rows", "rows", "rows"};
+inline constexpr std::int64_t kind[] = {0, 1, 2, 3, 4, 5};
+inline constexpr std::int64_t layer0[] = {0, 0, 0, 0, 0, 0};
+inline constexpr std::int64_t layer_stride[] = {1, 1, 1, 1, 1, 1};
+inline constexpr std::int64_t layers[] = {34, 34, 12, 12, 12, 12};
+inline constexpr std::string_view name[] = {"kda_s", "kda_conv", "dsa_latent", "dsa_ikey", "dsa_igate", "dsa_pool"};
+inline constexpr std::string_view owner[] = {"per_rank", "per_rank", "shared", "shared", "shared", "shared"};
+inline constexpr std::int64_t row_div[] = {1, 1, 1, 1, 1, 4};
+inline constexpr std::int64_t rows_less[] = {0, 0, 0, 0, 0, 0};
+inline constexpr std::string_view source[] = {"src/glm/kernels/glm_tier_a.hip:153-190",
+    "src/glm/kernels/glm_tier_a.hip:153-190", "src/glm/kernels/glm_dsa.hip:54-87",
+    "src/glm/kernels/glm_dsa.hip:120-153", "src/glm/kernels/glm_dsa.hip:120-153",
+    "src/glm/kernels/glm_dsa.hip:167-180"};
+} // namespace state
+inline constexpr std::int64_t world = 2;
+} // namespace pair
 namespace presets {
 inline constexpr std::string_view default_ = "fast";
 namespace exact {
@@ -104,7 +131,10 @@ inline constexpr std::string_view levers = "fast";
 } // namespace fast
 inline constexpr std::string_view native_kv = "bf16 MLA latent";
 namespace turbo {
+namespace cuda {
 inline constexpr std::string_view levers = "fast";
+} // namespace cuda
+inline constexpr std::string_view levers = "turbo";
 } // namespace turbo
 } // namespace presets
 inline constexpr std::string_view schema = "strix-model/v1";

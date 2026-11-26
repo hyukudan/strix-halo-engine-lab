@@ -1288,6 +1288,9 @@ struct CudaEngine::Impl {
         // e4m3 KV shadow (opt.prefill_attn8): per attention layer, allocated on first use; positions < sh_end mirror the BF16 cache.
         std::vector<cc::KvShadowE4m3> sh;
         std::uint32_t sh_end = 0, sh_from = 0, start = 0;
+        // admit_prefill: slots the budget admitted (no call: unbounded, the old behaviour); declined: prefill() runs windows
+        std::uint32_t slot_cap = UINT32_MAX;
+        bool declined = false;
     } pf;
     [[nodiscard]] bool attn8_on() const { return opt.prefill_attn8 && opt.prefill_arith != PrefillArith::exact; }
     // decode_attn8 (FAST8 decode / verify attention over the same e4m3 shadow, identity -d8): positions < d8_end mirror the
@@ -1602,6 +1605,64 @@ struct CudaEngine::Impl {
         }
     }
 
+    // cuda_engine.hpp admit_prefill: the shape checks, then the slot workspace allocated now (before any prompt state changes)
+    // under the device-memory budget: two slots, else one, else declined with everything it took released.
+    CudaEngine::PrefillAdmission admit_prefill(std::uint32_t n, std::uint64_t headroom) {
+        if (n == 0) throw std::runtime_error("admit_prefill: n must be >= 1");
+        CudaEngine::PrefillAdmission a;
+        a.fallback_rows = RM;
+        pf.declined = false;
+        pf.slot_cap = UINT32_MAX;
+        if (const char* fb = big_fallback()) {
+            a.reason = fb;
+            return a;
+        }
+        if (!pf.sl.empty() && pf.C != opt.prefill_chunk) {
+            a.reason = "prefill_chunk changed after the first prefill";
+            pf.declined = true;
+            return a;
+        }
+        const auto plan = cc::plan_chunks(n, pf_step_rows(n), opt.prefill_ramp, 128);
+        a.slots_wanted = std::min(std::max<std::uint32_t>(1, opt.prefill_slots), static_cast<std::uint32_t>(plan.size()));
+        auto free_now = [] {
+            std::size_t f = 0, t = 0;
+            CK(cudaMemGetInfo(&f, &t));
+            return static_cast<std::uint64_t>(f);
+        };
+        const std::uint64_t free0 = free_now();
+        pf.C = opt.prefill_chunk;
+        while (pf.sl.size() < a.slots_wanted) {
+            auto slot = std::make_unique<Slot>();
+            try {
+                pf_make_slot(*slot, pf.C);
+            } catch (const std::runtime_error& e) {
+                // an allocation the device cannot serve declines (the partial slot is released by its destructor); any other
+                // failure is a real error
+                if (cudaGetLastError() != cudaErrorMemoryAllocation && std::string(e.what()).find("out of memory") == std::string::npos) throw;
+                break;
+            }
+            pf.sl.push_back(std::move(slot));
+        }
+        std::uint64_t f = free_now();
+        while (!pf.sl.empty() && f < headroom) {  // the budget: headroom must stay free after the workspace
+            pf.sl.pop_back();
+            f = free_now();
+        }
+        a.free_bytes = f;
+        a.workspace_bytes = free0 > f ? free0 - f : 0;
+        if (pf.sl.empty()) {
+            pf.declined = true;
+            a.reason = "workspace does not fit: " + std::to_string(free0 >> 20U) + " MiB free before, headroom " +
+                       std::to_string(headroom >> 20U) + " MiB";
+            a.workspace_bytes = 0;
+            return a;
+        }
+        a.admitted = true;
+        a.slots = static_cast<std::uint32_t>(std::min<std::size_t>(pf.sl.size(), a.slots_wanted));
+        pf.slot_cap = a.slots;
+        return a;
+    }
+
     RowsOut prefill(const std::uint32_t* tokens, std::uint32_t n, LogitRows want, float* rows_out = nullptr, bool rows_pre = false) {
         if (n == 0) throw std::runtime_error("prefill: n must be >= 1");
         core::require_capacity(committed, n, opt.max_positions);
@@ -1611,10 +1672,11 @@ struct CudaEngine::Impl {
         if (opt.prefill_arith == PrefillArith::fast4 && !cc::dense_big_fast4_supported())
             throw std::invalid_argument("prefill: FAST4 implementation unavailable for this build/device");
         const char* fallback = big_fallback();
+        if (fallback == nullptr && pf.declined) fallback = "workspace not admitted";
         if (!opt.quiet) std::fprintf(stderr, "prefill route: %s; reason: %s; chunk: %u; requested slots: %u\n",
                                     fallback ? "windows" : "large", fallback ? fallback : "admitted", opt.prefill_chunk, opt.prefill_slots);
         last_rows = 0;
-        if (!big_supported()) {  // windows + commit
+        if (fallback != nullptr) {  // windows + commit
             RowsOut o;
             for (std::uint32_t p = 0; p < n; p += RM) {
                 const std::uint32_t r = std::min<std::uint32_t>(RM, n - p);
@@ -1631,7 +1693,7 @@ struct CudaEngine::Impl {
         // chunk plan (optional ramp from idle) + bounded submission: cuda_core/submit_window.hpp
         const auto plan = cc::plan_chunks(n, C, opt.prefill_ramp, 128);
         const std::uint32_t nchunks = static_cast<std::uint32_t>(plan.size());
-        pf_init(std::min<std::uint32_t>(std::max<std::uint32_t>(1, opt.prefill_slots), nchunks));
+        pf_init(std::min({std::max<std::uint32_t>(1, opt.prefill_slots), nchunks, pf.slot_cap}));
         pf.terms = pf_terms();
         if (attn8_on()) {
             pf_shadow_init();
@@ -2268,6 +2330,9 @@ RowsOut CudaEngine::prefill(const std::uint32_t* tokens, std::uint32_t n, LogitR
     return p_->prefill(tokens, n, want, rows_out, rows_pre);
 }
 bool CudaEngine::prefill_is_big() const { return p_->big_supported(); }
+CudaEngine::PrefillAdmission CudaEngine::admit_prefill(std::uint32_t n, std::uint64_t headroom_bytes) {
+    return p_->admit_prefill(n, headroom_bytes);
+}
 const char* prefill_arith_name(PrefillArith a) {
     static const char* n[] = {"exact", "flash", "fast", "fast2", "fast8", "fast4"};
     return n[static_cast<int>(a)];

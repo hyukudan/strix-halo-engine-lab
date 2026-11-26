@@ -45,10 +45,12 @@ inline constexpr std::uint32_t kPrefillSample = 128U;  // final prefill chunk (p
 // rows, width, axes; checked before any allocation), then the bytes as 32-bit words. The follower re-interns the rows
 // and remaps the ids to its own handles.
 inline constexpr std::uint32_t kPrefillEmbeds = 256U;
+inline constexpr std::uint32_t kPrefillTurbo = 512U;  // a whole prompt, negotiated in hello
 inline constexpr std::uint32_t kEmbedFrameMaxBytes = 1U << 30U;
 inline constexpr std::size_t kEmbedFrameMessage = std::size_t{1} << 19U;  // first message index of a frame (prompt messages stay below)
 inline constexpr std::uint32_t kStepSample = 1U << 31;  // step pflags carries a sampled-row mask
 inline constexpr std::uint32_t kHelloSamplingVote = 1U;
+inline constexpr std::uint32_t kHelloTurboPrefillVote = 2U;
 inline constexpr std::uint32_t kPrefillPending = 0xFFFFFFFEU;  // a prefill units call that did not complete the prompt
 inline constexpr std::uint32_t kMaxMtpCycles = 64;
 inline constexpr std::uint32_t kPrefixReply = 8U;     // prefix_prepare pflags: reply-end snapshot (default: prompt-end)
@@ -373,15 +375,17 @@ public:
     }
 
     // hello on both ranks (each sends Cmd::hello with its own fields): throws on any mismatch.
-    bool hello(const Hello& mine, bool sampling = false) {
+    bool hello(const Hello& mine, bool sampling = false, bool* turbo_prefill = nullptr) {
         Control c;
         c.cmd = static_cast<std::uint32_t>(Cmd::hello);
         c.hello = mine;
-        c.pflags = sampling ? kHelloSamplingVote : 0U;
+        c.pflags = (sampling ? kHelloSamplingVote : 0U) |
+            (turbo_prefill && *turbo_prefill ? kHelloTurboPrefillVote : 0U);
         const Control peer = exchange(c);
         if (peer.cmd != static_cast<std::uint32_t>(Cmd::hello)) throw ProtocolError("control channel: peer did not open with hello");
         const std::string m = hello_mismatch(mine, peer.hello);
         if (!m.empty()) throw ProtocolError("hello mismatch between the ranks: " + m);
+        if (turbo_prefill) *turbo_prefill = (c.pflags & peer.pflags & kHelloTurboPrefillVote) != 0;
         return (c.pflags & peer.pflags & kHelloSamplingVote) != 0;
     }
 
@@ -691,6 +695,9 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
         case Cmd::prefill: {
             // The MTP bootstrap (whole or in layer units) restores the prompt's last-row logits after seeding its
             // drafter, so the call that completes the prompt can be sampled on either route.
+            const bool turbo = (c.pflags & kPrefillTurbo) != 0U;
+            if (turbo && (c.ppos != 0 || c.pflags != (kPrefillMtp | kPrefillLast | kPrefillTurbo)))
+                throw ProtocolError("control channel: TURBO requires a complete native MTP prefill");
             if (sample_mask && (c.pflags & kPrefillLast) == 0U)
                 throw ProtocolError("control channel: sampling requires the final prefill chunk");
             if ((c.pflags & kPrefillUnits) != 0U && (c.pflags & kPrefillStart) == 0U) {  // resume / cancel: no tokens
@@ -718,8 +725,15 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
                     throw ProtocolError("control channel: this engine has no prefill units");
                 break;
             }
-            out.push_back((c.pflags & kPrefillMtp) != 0 ? eng.prefill_mtp(c.pslot, p, c.ppos, (c.pflags & kPrefillLast) != 0)
-                                                        : eng.prefill(c.pslot, p, c.ppos));
+            if (turbo) {
+                if constexpr (requires { eng.prefill_turbo(c.pslot, p); })
+                    out.push_back(eng.prefill_turbo(c.pslot, p));
+                else
+                    throw ProtocolError("control channel: this engine has no TURBO prefill");
+            } else {
+                out.push_back((c.pflags & kPrefillMtp) != 0 ? eng.prefill_mtp(c.pslot, p, c.ppos, (c.pflags & kPrefillLast) != 0)
+                                                            : eng.prefill(c.pslot, p, c.ppos));
+            }
             break;
         }
         case Cmd::import_state: {

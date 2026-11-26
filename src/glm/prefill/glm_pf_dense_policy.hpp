@@ -8,6 +8,7 @@
 // TM16 is 0.54-0.75 at 32 rows, 0.34-0.49 at 256 and 0.33-0.38 at 2048. So auto takes the large-call core from 64 rows
 // (exact, same bits as TM16) and from 32 rows when the FAST WMMA identity is selected.
 #include <algorithm>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -67,6 +68,82 @@ inline CallRows call_rows(unsigned tokens, unsigned max_rows, unsigned pipeline)
         calls.max = std::max(calls.max, tail.max);
     }
     return calls;
+}
+
+// Request-fixed dense core. Under the FAST WMMA identity the core of a call is picked by its row count (WMMA from
+// the auto floor, TM below), so a chunk boundary of the server that the rank CLI does not have could move rows to the
+// other core. The rank CLI prefills a prompt of P tokens as calls of `max_rows` rows and a final call of P % max_rows
+// rows. A serving chunk [a, e) is admitted only when every dense call the engine makes for it (max_rows-row calls from
+// a, then the remainder) has, for each of its rows, the core the CLI call of that row has, and when the rows left after
+// it can still be cut that way. The decode cohort, the arrival order and the memory a slot holds only decide WHEN a
+// chunk runs, never which core its rows take. Host only; EXACT (X3 == TM bits) needs no pin.
+enum class CoreClass { wmma, tm, mixed };
+inline CoreClass call_class(std::size_t rows, unsigned min_rows, unsigned pipeline) {
+    const auto b = call_rows(static_cast<unsigned>(rows), static_cast<unsigned>(rows), pipeline);
+    return b.min >= min_rows ? CoreClass::wmma : b.max < min_rows ? CoreClass::tm : CoreClass::mixed;
+}
+struct PinShape {
+    std::size_t prompt = 0;   // P: tokens of the prompt
+    unsigned max_rows = 0;    // R: rows per engine call
+    unsigned min_rows = 0;    // the auto floor (rows per dense call)
+    unsigned pipeline = 1;
+    bool active = false;      // FAST WMMA identity with the auto core: the pin applies
+};
+template<class Env> PinShape pin_shape(std::size_t prompt, unsigned max_rows, unsigned pipeline, Env&& env) {
+    PinShape s;
+    const char* x = env("STRIX_GLM_PF_EXACT_X");
+    s.prompt = prompt;
+    s.max_rows = max_rows;
+    s.pipeline = pipeline;
+    s.active = x != nullptr && std::strcmp(x, "auto") == 0 && wmma_selected(env) && max_rows >= 2U * kWmmaMinRows;
+    if (s.active) s.min_rows = auto_min_rows(env);
+    return s;
+}
+// Is chunk [a, e) of the prompt admitted (every row keeps its CLI core, and the rows after e stay cuttable)?
+inline bool pin_admits(const PinShape& s, std::size_t a, std::size_t e) {
+    if (e <= a || e > s.prompt) return false;
+    if (!s.active) return true;
+    const std::size_t tail = s.prompt % s.max_rows == 0 ? s.max_rows : s.prompt % s.max_rows;
+    const std::size_t split = s.prompt - tail;  // CLI calls of max_rows rows before it, the final call from it
+    const auto head_class = call_class(s.max_rows, s.min_rows, s.pipeline);
+    const auto tail_class = call_class(tail, s.min_rows, s.pipeline);
+    const auto cli_class = [&](std::size_t row) { return row < split ? head_class : tail_class; };
+    for (std::size_t x = a; x < e;) {
+        const std::size_t size = std::min<std::size_t>(s.max_rows, e - x);
+        const auto mine = call_class(size, s.min_rows, s.pipeline);
+        const auto first = cli_class(x), last = cli_class(x + size - 1U);
+        const bool same_call = size == s.max_rows ? x % s.max_rows == 0 && x < split : x == split && x + size == s.prompt;
+        // A call that is the CLI's own call is identical whatever its class; any other call must be uniform and equal.
+        if (!same_call && (mine == CoreClass::mixed || first != last || first == CoreClass::mixed || mine != first)) return false;
+        x += size;
+    }
+    // The rows left before the final CLI call must still form calls of the WMMA class (a gap whose call is not on the
+    // WMMA class, below the floor of every half under pipeline 2, would run on TM where the CLI runs them on WMMA).
+    if (head_class == CoreClass::wmma && e < split && split - e <= s.max_rows && call_class(split - e, s.min_rows, s.pipeline) != CoreClass::wmma)
+        return false;
+    // A chunk may not end inside the final call's rows unless it ends the prompt (they are one call there).
+    if (e > split && e < s.prompt) return false;
+    return true;
+}
+// A root snapshot cut at e is reused by prompts of any length: the rows before it must hold the head (max_rows call) class,
+// which they do when e is not past the final CLI call of this prompt, or when both classes are the same.
+inline bool pin_root_admits(const PinShape& s, std::size_t a, std::size_t e) {
+    if (!pin_admits(s, a, e)) return false;
+    if (!s.active) return true;
+    const std::size_t tail = s.prompt % s.max_rows == 0 ? s.max_rows : s.prompt % s.max_rows;
+    return e <= s.prompt - tail || call_class(s.max_rows, s.min_rows, s.pipeline) == call_class(tail, s.min_rows, s.pipeline);
+}
+// The tokens of the next chunk: `proposed` (the scheduler's traffic-dependent choice) moved to the nearest admitted
+// end, first upward, then downward. Never below one token, never past the prompt. The same prompt, max_rows and
+// profile give the same set of admitted ends whatever the traffic.
+inline std::size_t pin_chunk(const PinShape& s, std::size_t done, std::size_t proposed) {
+    if (!s.active || done >= s.prompt) return proposed;
+    const std::size_t want = std::min(done + std::max<std::size_t>(1, proposed), s.prompt);
+    for (std::size_t e = want; e <= s.prompt; ++e)
+        if (pin_admits(s, done, e)) return e - done;
+    for (std::size_t e = want; e-- > done + 1U;)
+        if (pin_admits(s, done, e)) return e - done;
+    return want - done;  // no admitted end (a prefix-cache restore started inside a floor gap): reported by the caller
 }
 
 // The serving prefill interleave chunk: tokens of a new prompt per decode step while another request decodes (the

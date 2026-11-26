@@ -9,15 +9,13 @@ namespace strix::glm::rank_defaults {
 inline constexpr char kSampledMtpCoupledIdentity[] = "glm-sampled-mtp-coupled-v1";
 inline constexpr char kSampledMtpRejectionIdentity[] = "glm-sampled-mtp-rejection-v1";
 
-// Default/quality export nothing. FAST selects no lever: the FAST prefill set (pf_wmma) fails the 8K quality gate, so it
-// is UNQUALIFIED for fast and runs only with an explicit STRIX_GLM_PF_WMMA=1. TURBO keeps pf_wmma (incumbent grant
-// below). The other bit-changing prefill switches are rows so that an explicit setting is named in the receipt; their
-// TURBO cells are candidates that stay at the builtin until a timing row shows them faster in the regime.
+// The WMMA bundle failed the FAST gate. TURBO admits the measured complete bundle through the ladder below.
+// Individual arithmetic switches remain explicit; their standalone proposals need their own receipts.
 inline constexpr std::array<strix::profile::Lever, 11> product_profile_table{{
     {"pf_wmma", "STRIX_GLM_PF_WMMA", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, true}, {true, true, true, true}, "glm-pf-wmma-x", "0",
      "docs/optimizations.md#glm-pf-wmma-x: UNQUALIFIED for fast: the FAST prefill set fails the 8K quality gate (KL 0.0587 and "
-     "0.492 on two windows, no single member carries it); explicit STRIX_GLM_PF_WMMA=1 only until fixed; OFF equals exact anchors", false, {}, false, {}, {{{"0", "v1"}, {"1", "v1"}}}},
+     "0.492 on two windows, no single member carries it); TURBO only in the measured pair regime; OFF equals exact anchors", false, {}, false, {}, {{{"0", "v1"}, {"1", "v1"}}}},
     {"stored_i4", "STRIX_GLM_MODEL_FORMAT", "", {"", "", "", "fast_i4"}, "exl3", strix::profile::Kind::pack,
      {true, false, true, false}, {true, false, true, true}, "", "exl3",
      "glm-fast-i4: stored routed gate/up on MoE ordinals 25-41, W4A4 prefill and W4A16 decode; load-scoped, ladder evidence pending",
@@ -50,10 +48,30 @@ inline constexpr std::array<strix::profile::Lever, 11> product_profile_table{{
      false, {}, true, {}, {{{"0", "glm-plain-sampling-v1"},
                            {"coupled", kSampledMtpCoupledIdentity}, {"rejection", kSampledMtpRejectionIdentity}}}},
 }};
-// Ladder rows (strix::profile::LadderRow): incumbent grant for the turbo cell the resolver ran before the ladder rule.
+inline constexpr std::string_view kTurboPrefillDevice = "gfx1151/Radeon-8060S";
+inline constexpr std::string_view kTurboPrefillSettings =
+    "tp2-usb4-host-2x2x40-r1b-gemv-exl3-pipeline2-routed-qwin0-mtp-wmma-x3-mla-kda-attn16";
+inline constexpr std::uint64_t kTurboPrefillCapacity = 36864;
+inline constexpr unsigned kTurboPrefillRows = 8192, kTurboPrefillGenerated = 64;
+
+#define STRIX_GLM_TURBO_ARM(prompt) \
+    "ladder-arm/v4;exec/v1 backend=hip device=gfx1151/Radeon-8060S prompt=" prompt \
+    " context=36864 lanes=1 chunk=8192 prefill_rows=8192 decode_rows=1 verify_rows=0 generated=64" \
+    " settings=tp2-usb4-host-2x2x40-r1b-gemv-exl3-pipeline2-routed-qwin0-mtp-wmma-x3-mla-kda-attn16;" \
+    "pf_wmma=0{v1},stored_i4=exl3{exl3-v1},mla_wmma=0{v1},mla_ob16=0{v1},kda_wmma=0{v1},attn_wmma=0{v1}," \
+    "idxproj_wmma=0{v1},router_wmma=0{v1},idx_scores=exact{glm-idx-wmma-exact-v1}," \
+    "kda_state16=0{v1},serve_sampled_mtp=0{glm-plain-sampling-v1};candidate=pf_wmma=1{v1};tier=turbo"
+
+// Two measured prompt lengths, one fresh request at a time on the USB4 pair. Ratios are the lower of
+// the two observed TURBO/FAST throughput ratios at each length, with a conservative 10% margin.
 inline constexpr strix::profile::LadderRow product_ladder_rows[] = {
-    strix::profile::incumbent_cell("pf_wmma", "1", strix::profile::Name::turbo,
-                                   "glm-pf-wmma-x turbo cell ready before the ladder rule (docs/optimizations.md#glm-pf-wmma-x)", "v1")};
+    {"pf_wmma", "1", strix::profile::Name::turbo, strix::profile::Phase::prefill, kTurboPrefillDevice,
+     8108, 8108, 1, 1, 1.51, 0.10, "GLM pair 8K TURBO vs FAST, docs/models/glm-5.3/README.md",
+     false, {}, {}, STRIX_GLM_TURBO_ARM("8108")},
+    {"pf_wmma", "1", strix::profile::Name::turbo, strix::profile::Phase::prefill, kTurboPrefillDevice,
+     31258, 31258, 1, 1, 1.54, 0.10, "GLM pair 32K TURBO vs FAST, docs/models/glm-5.3/README.md",
+     false, {}, {}, STRIX_GLM_TURBO_ARM("31258")}};
+#undef STRIX_GLM_TURBO_ARM
 inline const strix::profile::Engine product_profile_engine{"glm-pair", "", product_profile_table, false, "glm-turbo-v1",
                                                            {}, {}, product_ladder_rows};
 

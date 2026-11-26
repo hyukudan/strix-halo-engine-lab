@@ -12,55 +12,63 @@ How we measure and what "exact" covers: [methodology](docs/methodology.md).
 
 ## Results
 
-Measured on 2026-11-21 on `main` with AMD Strix Halo (Ryzen AI Max+ 395, Radeon 8060S, 128 GB per node).
-The measured commits were `d3a89ae16` and `f42edd05e`, shown per row. Pairs use USB4. Power limits and the
-IOMMU setting per run were unreported in the measurement tables.
-C1/C2/C4/C8 are streams per batch in the Nemotron decode benchmark, with aggregate rates.
-Qwen HTTP rates are aggregate with one client and four slots configured. Clients completed their requests, and
-the kit validator rejected the server exit code after intentional shutdown.
-The Nemotron HTTP figure comes from the completed drafter-off arm with one client.
-DSpark is speculative drafting. Hy4 FAST arms use the BASE device reference.
-Full request cells show prompt tokens + output tokens. Prefill rates marked TTFT include time to first token.
-See [methodology](docs/methodology.md) for measurement conditions.
+Measured on 2026-11-25 on `main` at commit `ca2de6ae8`, on AMD Strix Halo (Ryzen AI Max+ 395, Radeon 8060S, 128 GB per
+node), one Release HIP build per node (GCC 15.2, HIP clang 24.0, ROCm 10.1, Linux 7.4 with the in-tree `amdgpu`). A pair
+is two nodes over USB4 and runs the same binary on both. Power limits are the node defaults; the GPU clock and power were
+sampled during every request: long prefills ran at 1,950–2,900 MHz and 120–150 W per node.
+No lever was set by hand: `--profile exact|fast|turbo` decides, and every run printed its effective configuration.
+Prompts are real English text (a set of short documents plus a project document). Token counts differ by tokenizer and
+are shown per row. Each engine and tier was loaded once; "a / b" are two repeats on that resident server (or two CLI
+processes). Each long request started below 70 °C. A lower second value comes from one node holding a lower GPU clock
+after about two minutes of sustained load; the receipts show the clock per request.
+Decode is one request (B1), greedy, in the engine's default decode mode, 128 tokens after a short chat prompt unless noted.
+EXACT runs repeated the same ids; FAST and TURBO rows report what their profile prints (a qualification state or the
+FAST identities it applies). See [methodology](docs/methodology.md) for measurement conditions.
 
-| Model | Hardware | Route | Mode | Profile | Prompt (tokens) | Decode (tok/s) | Prefill (tok/s unless noted) | Full request | Main |
-|---|---|---|---|---|---|---|---|---|---|
-| Qwen3.8-Flash-Next | 1 node | CLI | MTP | Default (auto FP16 prefill) | real text, 32K | 51.0 | 20.45 s | — | `d3a89ae16` |
-| Qwen3.8-Flash-Next | 1 node | CLI | default mode unreported | Default | class unreported, 2K and 8K | — | — | 2K + 33: 2.71 s, 8K + 33: 5.95 s | `d3a89ae16` |
-| Qwen3.8-Flash-Next | 1 node | CLI | plain | Default | real text, 32K | — | — | 32K + 128: 24.7 s | `d3a89ae16` |
-| Qwen3.8-Flash-Next | 1 node | HTTP served | MTP + wide auto | Default | lengths unreported | prose 38.0–40.2, edit 153–155, JSON 85.7–87.6, code 60.8–61.2, reasoning 59.6–61.6 | — | — | `d3a89ae16` |
-| Qwen3.8-27B | 1 node | CLI | plain | EXACT (default) | class unreported, 2K and 8K | 2K 13.90, 8K 13.10 | 2K 644, 8K 606 | — | `d3a89ae16` |
-| Qwen3.8-27B | 1 node | CLI | plain | EXACT (default) | real text, 32K | 10.68 | 517 | — | `d3a89ae16` |
-| Qwen3.8-27B | 1 node | CLI | plain | FAST (opt-in) | class unreported, 2K and 8K | — | 2K 684, 8K 635 | — | `d3a89ae16` |
-| Qwen3.8-27B | 1 node | CLI | MTP | EXACT (default) | edit, 477 | 32.2 | — | — | `d3a89ae16` |
-| Qwen3.8-27B | 1 node | CLI | MTP | EXACT (default) | lengths unreported | code 40.8, prose 25.9, reasoning 40.3, JSON 62.2 | — | — | `d3a89ae16` |
-| Qwen3.8-27B | 1 node | CLI | plain | EXACT (default) | code, length unreported | 14.21–14.22 | — | — | `d3a89ae16` |
-| Qwen3.8-27B | pair | CLI | plain | Default (TP) | code, length unreported | 20.61 | — | — | `d3a89ae16` |
-| DeepSeek V4.1 Flash | pair | CLI | plain | EXACT | class unreported, 2K / 8K / 32K | — | 2K 791.9, 8K 1,123.8, 32K 1,224.1 (warm) | — | `d3a89ae16` |
-| DeepSeek V4.1 Flash | pair | CLI | plain | EXACT (default) | 15–21 | code 26.85, prose 26.81 | — | — | `f42edd05e` |
-| DeepSeek V4.1 Flash | pair | CLI | DSpark | EXACT (default) | 15–21 | code 41.70, prose 60.04, JSON 43.62, chat 39.98 | — | — | `f42edd05e` |
-| MiniMax M3.1 Flash | pair | CLI | plain | EXACT | class unreported, 1K / 8K / 32K | 1K 24.20 | 1K 472.3, 8K 621.6 (warm), 32K 587.2 | — | `d3a89ae16` |
-| MiniMax M3.1 Flash | pair | CLI | plain | EXACT (default) | 2,048 | code 23.28, prose 23.19, JSON 23.11, edit 23.07 | code, prose, JSON and edit 506–521 (TTFT) | — | `f42edd05e` |
-| MiniMax M3.1 Flash | pair | CLI | DSpark auto | EXACT (default) | 2,048 | code 32.39, prose 23.83 | — | — | `f42edd05e` |
-| GLM-5.3 Flash | pair | CLI | plain | EXACT (GEMV) | class unreported, 8K and 32K | — | 8K 617 (warm), 32K 595 | — | `d3a89ae16` |
-| GLM-5.3 Flash | pair | CLI | plain | EXACT (R1b) | code, 2,048 | 25.73 | — | — | `f42edd05e` |
-| GLM-5.3 Flash | pair | CLI | plain | EXACT (R1b) | prose, 1,884 | 25.94 | — | — | `f42edd05e` |
-| GLM-5.3 Flash | pair | CLI | MTP + wide | EXACT (R1b) | code, 2,048 | 40.37 | — | — | `f42edd05e` |
-| GLM-5.3 Flash | pair | CLI | MTP + wide | EXACT (R1b) | prose, 1,884 | 66.48 | — | — | `f42edd05e` |
-| Hy4-flash | 1 node | CLI | plain | FAST (default), BASE reference | real text, 2K / 8K / 32K | 2K 16.75, 8K 16.78, 32K 16.69 | 2K 773.2, 8K 730.6 (warm), 32,568 tokens at 696.5 (cold) | — | `d3a89ae16` |
-| Hy4-flash | 1 node | CLI | plain | `exact` (BASE) | real text, 8K | 16.39 | 679.3 (warm) | — | `d3a89ae16` |
-| Hy4-flash | 1 node | CLI | MTP + wide | FAST (default), BASE reference | short prompts, lengths unreported | code 32.23, prose 22.93, reasoning 29.34 | — | — | `d3a89ae16` |
-| Hy4-flash | pair | CLI | plain | FAST (default), BASE reference | real text, 4K / 8K / 32K | — | 4K 1,163.7, 8K 1,260.3 (warm), 32K 1,269.6 (cold) | — | `d3a89ae16` |
-| Hy4-flash | pair | CLI | plain (TP) | FAST (default), BASE reference | class unreported, 1K | 22.3 | — | — | `d3a89ae16` |
-| Hy4-flash | pair | CLI | MTP (TP) | FAST (default), BASE reference | lengths unreported | code 47.24, prose 28.12, reasoning 38.59 | — | — | `d3a89ae16` |
-| Nemotron 3.5 Bolt E4B | 1 node | CLI | plain | EXACT (default) | benchmark, context 64 | C1 54.9, C2 103.2, C4 177.2, C8 243.1 | — | — | `d3a89ae16` |
-| Nemotron 3.5 Bolt E4B | 1 node | CLI | plain | FAST (opt-in) | benchmark, context 64 | C1 53.2, C2 103.7, C4 196.0, C8 334.3 | — | — | `d3a89ae16` |
-| Nemotron 3.5 Bolt E4B | 1 node | CLI | MTP | EXACT (default) | 18–23 | prose 208.3, code 194.7, JSON 193.9 | — | — | `d3a89ae16` |
-| Nemotron 3.5 Bolt E4B | 1 node | CLI | MTP | FAST (opt-in) | 18–23 | prose 273.1, code 250.1, JSON 254.1 | — | — | `d3a89ae16` |
-| Nemotron 3.5 Bolt E4B | 1 node | CLI | MTP | EXACT (default) | edit, 561 | 169.7 | — | — | `d3a89ae16` |
-| Nemotron 3.5 Bolt E4B | 1 node | CLI | MTP | FAST (opt-in) | edit, 561 | 202.2 | — | — | `d3a89ae16` |
-| Nemotron 3.5 Bolt E4B | 1 node | CLI | plain | FAST (opt-in) | repeated prose, 2K / 8K / 32K / 65,000 | — | 2K 5,050, 8K 4,909, 32K 4,249, 65,000: 3,610 | — | `d3a89ae16` |
-| Nemotron 3.5 Bolt E4B | 1 node | HTTP served | plain | EXACT (default) | code, prose, JSON and edit, lengths unreported | 51.90 | — | — | `d3a89ae16` |
+| Model | Hardware | Route | Decode mode | Profile | Prompt (tokens) | Decode (tok/s) | Prefill (tok/s) | Main |
+|---|---|---|---|---|---|---|---|---|
+| DeepSeek V4.1 Flash | pair | HTTP served | DSpark (default) | EXACT | 1,971 / 7,994 / 30,975; decode after 344 | 57.2 / 57.7 | 2K 782 / 739, 8K 1,101 / 1,111, 32K 1,273 / 1,245 | `ca2de6ae8` |
+| DeepSeek V4.1 Flash | pair | HTTP served | DSpark (default) | FAST | same | 53.4 / 53.7 | 2K 969 / 922, 8K 1,425 / 1,588, 32K 1,689 / 1,708 | `ca2de6ae8` |
+| DeepSeek V4.1 Flash | pair | HTTP served | DSpark (default) | TURBO (= FAST levers) | same | — | 8K 1,444 / 1,591, 32K 1,683 / 1,710 | `ca2de6ae8` |
+| MiniMax M3.1 Flash | pair | HTTP served | plain | EXACT | 1,102 / 7,791 / 30,179; decode after 508 | 27.0 / 26.9 (after 1,102: 32.6 / 28.7) | 1K 417 / 451, 8K 667 / 587, 32K 590 / 565 | `ca2de6ae8` |
+| MiniMax M3.1 Flash | pair | HTTP served | plain | FAST | same | 27.1 / 26.9 | 1K 415 / 457, 8K 709 / 660, 32K 640 / 611 | `ca2de6ae8` |
+| MiniMax M3.1 Flash | pair | HTTP served | plain | TURBO | same | 26.7 / 26.6 | 1K 422 / 459, 8K 709 / 662, 32K 674 / 624 | `ca2de6ae8` |
+| GLM-5.3 Flash | pair | HTTP served | default | EXACT | 2,037 / 8,108 / 31,258; decode after 362 | 40.2 / 42.8 | 2K 531, 8K 629 / 604, 32K 578 / 552 | `ca2de6ae8` |
+| GLM-5.3 Flash | pair | HTTP served | default | FAST (resolves to the EXACT route) | same | 41.1 / 41.1 | 2K 530, 8K 628 / 596, 32K 568 / 545 | `ca2de6ae8` |
+| GLM-5.3 Flash | pair | HTTP served | default | TURBO (FP16 WMMA prefill) | same | 41.3 / 41.3 | 2K 718, 8K 949 / 941, 32K 879 / 854 | `ca2de6ae8` |
+| Qwen3.8-Flash-Next | 1 node | CLI | plain (no MTP drafter bundle on our nodes) | EXACT | 2,048 / 8,192 / 32,500 | 20.6–22.1 | 2K 1,435, 8K 1,667 / 1,840, 32K 1,669 / 1,677 | `ca2de6ae8` |
+| Qwen3.8-Flash-Next | 1 node | CLI | plain | FAST | same | 21.6–21.9 | 2K 1,673, 8K 1,865 / 1,880, 32K 1,681 / 1,663 | `ca2de6ae8` |
+| Qwen3.8-Flash-Next | 1 node | CLI | plain | TURBO (= FAST levers) | same | 21.5–21.8 | 2K 1,188 (one run), 8K 1,915, 32K 1,665 | `ca2de6ae8` |
+| Qwen3.8-27B | 1 node | CLI | MTP (default) | EXACT | 2,048 / 8,192 | 2K 35.2 / 35.3, 8K 25.8 / 25.0 | 2K 187–199, 8K 115–117 | `ca2de6ae8` |
+| Qwen3.8-27B | 1 node | CLI | plain (`--no-mtp`) | EXACT | 2,048 / 8,192 | 2K 14.05, 8K 13.22 | 2K 195, 8K 121 | `ca2de6ae8` |
+| Qwen3.8-27B | 1 node | CLI | MTP (default) | FAST (TURBO = FAST) | 2,048 / 8,192 | 2K 35.2, 8K 25.0–25.1 | 2K 188–196, 8K 115–117 | `ca2de6ae8` |
+| Qwen3.8-27B | pair (TP) | CLI | MTP (default) | EXACT / FAST | 2,048 | 45.4 / 45.5 | — | `ca2de6ae8` |
+| Qwen3.8-27B | pair (TP) | CLI | plain | EXACT | 2,048 | 20.22 | — | `ca2de6ae8` |
+| Hy4-flash | 1 node | CLI | plain | FAST (default, BASE reference; prompt rows 4096 by the tier) | 1,024 / 8,192 | 1K 17.5, 8K 14.25 | 1K 602, 8K 755 / 782 | `ca2de6ae8` |
+| Hy4-flash | 1 node | CLI | plain | FAST, prompt rows 2048 set by hand | 2,048 / 8,192 / 32,500 | 16.9–17.0 | 2K 689–810, 8K 721–766, 32K 699 / 693 | `ca2de6ae8` |
+| Hy4-flash | 1 node | CLI | plain | `exact` (BASE; prompt position by position) | 2,048 | 15.75 | 15.2 | `ca2de6ae8` |
+| Hy4-flash | 1 node | CLI | plain | `exact` (BASE), prompt rows 2048 set by hand | 8,192 / 32,500 | 16.5–16.6 | 8K 687–723, 32K 661 (one run) | `ca2de6ae8` |
+| Hy4-flash | 1 node | CLI | plain | TURBO (prompt rows 4096 by the tier) | 8,192 | 15.65 | 739 / 728 | `ca2de6ae8` |
+| Hy4-flash | pair (layer split) | CLI | plain | FAST (the pair always runs a batched prompt) | 4,096 / 8,192 / 32,500 | 12.3–14.0 | 4K 1,265 / 1,216, 8K 1,327 / 1,387, 32K 1,328 (one run) | `ca2de6ae8` |
+| Hy4-flash | pair (TP) | CLI | plain | FAST / `exact` | 1,024 | 22.64 / 22.42 | — | `ca2de6ae8` |
+| Inkling 2 Mini | 1 node | HTTP served | plain | EXACT (FAST and TURBO resolve to the same route on HIP) | 2,280 / 9,116 / 35,170; decode after 396 | 23.6 / 23.6 (after 35,170: 20.9) | 2K 591 / 591, 8K 601 / 595, 32K 578 / 568 | `ca2de6ae8` |
+
+**Lower than the previous table (2026-11-21, `d3a89ae16` / `f42edd05e`).** The previous rows were mostly CLI runs
+with other prompt sets, so part of each change is the route and the prompt:
+- DeepSeek V4.1 Flash EXACT prefill at 2K (791.9 before) and 8K (1,123.8 before).
+- MiniMax M3.1 Flash EXACT prefill at 1K (472.3 before); the second 8K repeat (587) is below the previous 621.6.
+- GLM-5.3 Flash EXACT prefill at 32K (595 before).
+- Qwen3.8-27B prefill: the shipped default runs 64-row prompt windows, 2K 187–199 and 8K 115–117 against 644 / 606
+  (EXACT) and 684 / 635 (FAST) before. Plain TP pair decode 20.22 (20.61 before).
+- Qwen3.8-Flash-Next decode: 20.6–22.1 plain, against 51.0 with MTP before; the MTP drafter bundle is not installed
+  beside the model on our nodes, so the default resolves to plain decode.
+- Hy4-flash FAST decode with the tier's own 4096-row prompt: 14.25 at 8K (16.78 before).
+
+**Not measured on `ca2de6ae8`:** Nemotron 3.5 Bolt E4B (its tokenizer and RoPE tables are not on our nodes); Qwen3.8-27B
+at 32K (the shipped-default prefill did not finish inside our 470 s run limit); Qwen3.8-Flash-Next over HTTP
+(`strix-serve --model qwen3.8-flash-next` needs an MTP calibration golden and the tiled MTP recipe to start); per-content
+MTP and DSpark decode rows (code, prose, JSON, edit); Hy4-flash `exact` and TURBO pairs at 32K. TURBO rows marked
+"= FAST levers" resolve to the FAST lever set on that engine.
 
 ### RTX PRO 6000 (CUDA)
 
@@ -152,7 +160,7 @@ the native resolver also prints its effective settings using the startup inputs 
 
 | Model | Device | Serve | CLI |
 |---|---|---|---|
-| Qwen3.8 Flash Next | Strix, one node | `strix-serve --model qwen3.8-flash-next --profile fast --asset MODEL.gguf` | `strix run qwen3.8-flash-next --profile fast --asset MODEL.gguf -- --prompt-ids prompt.ids --generate 256` |
+| Qwen3.8 Flash Next | Strix, one node | `strix-serve --model qwen3.8-flash-next --profile fast --asset MODEL.gguf -- --prompt-ids calibration.ids --generate 64 --http-batch 8` ([calibration prompt](docs/models/qwen3.8/README.md#serving-quick-start)) | `strix run qwen3.8-flash-next --profile fast --asset MODEL.gguf -- --prompt-ids prompt.ids --generate 256` |
 | Qwen3.8 Flash Next | Strix pair | Pair CLI | `strix run qwen3.8-flash-next --profile fast --asset MODEL.gguf -- --prompt-ids prompt.ids --generate 256 --deploy deploy.toml --rank R --transport usb4auto` |
 | Qwen3.8 Flash Next | RTX, Windows | `strix-serve --model qwen3.8-flash-next --profile fast --backend cuda --asset MODEL.gguf -- --tables TABLES --rope-table rope_cs.bin` | — |
 | Qwen3.8-27B | Strix, one node | — | `strix run qwen3.8-27b --profile fast --asset MODEL.gguf -- --prompt-ids @prompt.ids --gen 256` |

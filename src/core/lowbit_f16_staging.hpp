@@ -7,9 +7,16 @@
 // Decode of 16 consecutive elements (two 4-bit plane words, one 2-bit plane word for q6): bytes of biased codes
 // (code + 8 / code + 32) are built with v_perm_b32, then v_perm_b32 puts 0x64 above each byte, i.e. the FP16 integer
 // 1024 + biased code; the packed subtraction of 1032 / 1056 is exact.
+// Scale policy (ScalePolicy): `group` above is the incumbent. `folded` is a FAST / TURBO candidate value (changes
+// rounding; never EXACT): the operand is fp16(code x d), one correctly rounded packed FP16 product per pair (the code is
+// an exact small integer, so the product is the FP16 rounding of the exact real code x d; overflows to inf for
+// |d| > 65504 / 2^(bits-1)), and every K16 unit joins ONE WMMA chain per output, the class of the Q8_0 staging. Both
+// consumers fold the same way (folded small-M == folded tile, bit for bit); which route folds is the arithmetic's
+// per-regime choice (core/resident_row_plan.hpp LowBitArithmetic::f16_folded_scale).
 
 #include "strix/weight/host_lowbit.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 
@@ -18,6 +25,9 @@
 #endif
 
 namespace strix::core::lowbit_f16 {
+
+// How the group scale enters the arithmetic (see the header comment). A lever value, never a default.
+enum class ScalePolicy : unsigned char { group, folded };
 
 #if defined(__HIPCC__)
 #define STRIX_LOWBIT_GROUP_INLINE __device__ __forceinline__
@@ -63,6 +73,32 @@ struct GroupAccumulator {
 
 // FP16 integer bias of a biased code: 1024 + 2^(bits - 1).
 template <class Storage> inline constexpr float kBias = Storage::high_bytes == 0U ? 1032.0F : 1056.0F;
+
+// Strix pack sign + magnitude-index codes (strix/weight/host_lowbit.hpp sp::, 4 bits: sign << 3 | index) as exact FP16
+// operands through a compile-time table of 8 integer magnitudes (each exact in FP16: <= 31, <= 4 significant bits).
+// The FP16 bits of a magnitude are read with v_perm_b32 from the table's high bytes and, when some magnitude needs it,
+// its low bytes (18 = 0x4C80); the sign bit of the code moves to bit 15 / 31.
+struct SignIndexTable {
+    std::uint32_t hi_lo, hi_hi, lo_lo, lo_hi;  // FP16 high / low bytes of magnitudes 0..3 and 4..7, byte i = entry i
+};
+constexpr std::uint16_t integer_f16_bits(unsigned t) {
+    unsigned e = 0;
+    while ((t >> (e + 1U)) != 0U) ++e;
+    return static_cast<std::uint16_t>(((15U + e) << 10U) | ((t << (10U - e)) & 0x3FFU));
+}
+template <std::size_t N>
+constexpr SignIndexTable sign_index_table(const std::array<std::uint8_t, N>& table) {
+    static_assert(N == 8U);
+    SignIndexTable out{};
+    for (unsigned i = 0; i < 8U; ++i) {
+        const auto bits = integer_f16_bits(table[i]);
+        auto& hi = i < 4U ? out.hi_lo : out.hi_hi;
+        auto& lo = i < 4U ? out.lo_lo : out.lo_hi;
+        hi |= std::uint32_t{static_cast<std::uint8_t>(bits >> 8U)} << (8U * (i % 4U));
+        lo |= std::uint32_t{static_cast<std::uint8_t>(bits & 0xFFU)} << (8U * (i % 4U));
+    }
+    return out;
+}
 
 #if defined(__HIPCC__)
 using Half2 = weight::hip::gfx1151::Half2;
@@ -111,18 +147,53 @@ __device__ __forceinline__ void integer_pairs(std::uint32_t lo0, std::uint32_t l
     }
 }
 
+// FP16 pairs of the 8 sign + index codes of one word (element 2 j in the low half of word j, 2 j + 1 in the high half;
+// element 2 j in the low nibble of byte j).
+template <SignIndexTable T>
+__device__ __forceinline__ void sign_index_pairs(std::uint32_t w, std::uint32_t* out) {
+    const std::uint32_t even = w & 0x0F0F0F0FU, odd = (w >> 4U) & 0x0F0F0F0FU;
+#pragma unroll
+    for (unsigned j = 0; j < 4U; ++j) {
+        // [0, even nibble j, 0, odd nibble j]
+        const std::uint32_t x = __builtin_amdgcn_perm(odd, even, ((4U + j) << 24U) | 0x000C0000U | (j << 8U) | 0x0CU);
+        std::uint32_t magnitude = __builtin_amdgcn_perm(T.hi_hi, T.hi_lo, (x & 0x07000700U) | 0x000C000CU);
+        if constexpr ((T.lo_lo | T.lo_hi) != 0U)
+            magnitude |= __builtin_amdgcn_perm(T.lo_hi, T.lo_lo, ((x >> 8U) & 0x00070007U) | 0x0C000C00U);
+        out[j] = magnitude | ((x & 0x08000800U) << 4U);
+    }
+}
 // The FP32 value of the FP16 scale in bits 0..15 (upper bits ignored).
 __device__ __forceinline__ float scale_value(std::uint32_t bits) {
     return static_cast<float>(__builtin_bit_cast(_Float16, static_cast<std::uint16_t>(bits & 0xFFFFU)));
 }
 
+// ScalePolicy::folded: the FP16 pairs of integer_pairs multiplied by the group's FP16 scale (bits 0..15 of scale_bits),
+// fp16(code x d) per element.
+template <class Storage>
+__device__ __forceinline__ void folded_pairs(std::uint32_t lo0, std::uint32_t lo1, std::uint32_t hi, std::uint32_t scale_bits,
+                                             std::uint32_t (&words)[8]) {
+    integer_pairs<Storage>(lo0, lo1, hi, words);
+    const auto d = __builtin_bit_cast(_Float16, static_cast<std::uint16_t>(scale_bits & 0xFFFFU));
+    const Half2 d2{d, d};
+#pragma unroll
+    for (unsigned i = 0; i < 8U; ++i) words[i] = __builtin_bit_cast(std::uint32_t, __builtin_bit_cast(Half2, words[i]) * d2);
+}
+
+// The staging's group size, present only under the group policy (f16_tile_gemm detail::group_scaled keys on it).
+template <class Storage, ScalePolicy Policy>
+struct GroupKey {
+    static constexpr unsigned kGroupK = Storage::group;
+};
+template <class Storage>
+struct GroupKey<Storage, ScalePolicy::folded> {};
+
 // Staging trait of the 128-row projection tile (interface of q8_f16_staging::Q8F16Staging, plus the group scale): a
 // thread stages the 16 elements [k0 + 16 half, + 16) of one weight row as integer codes (a K32 stage is half of one
 // 64-group, so one scale per thread) and the group's scale bits into the row's LDS pad word kScaleWord, which the tile
-// core reads at the end of each group (f16_tile_gemm_core.inc: kGroupK).
-template <class Storage>
-struct LowBitF16Staging {
-    static constexpr unsigned kGroupK = Storage::group;
+// core reads at the end of each group (f16_tile_gemm_core.inc: kGroupK). ScalePolicy::folded publishes fp16(code x d)
+// instead and has no kGroupK, so the core runs its plain WMMA chain (the Q8_0 staging's class).
+template <class Storage, ScalePolicy Policy = ScalePolicy::group>
+struct LowBitF16Staging : GroupKey<Storage, Policy> {
     static constexpr unsigned kScaleWord = 16U;  // dwords 0..15 hold the stage's 32 FP16 values, 16..19 are pad
     struct Raw {
         std::uint32_t lo0, lo1, hi, scale, half;
@@ -152,10 +223,12 @@ struct LowBitF16Staging {
     __device__ __forceinline__ static void publish(const Raw& raw, unsigned, std::uint32_t* dst) {
         using U4 = weight::hip::gfx1151::U4;
         std::uint32_t words[8];
-        integer_pairs<Storage>(raw.lo0, raw.lo1, raw.hi, words);
+        if constexpr (Policy == ScalePolicy::folded) folded_pairs<Storage>(raw.lo0, raw.lo1, raw.hi, raw.scale, words);
+        else integer_pairs<Storage>(raw.lo0, raw.lo1, raw.hi, words);
         *reinterpret_cast<U4*>(dst) = U4{words[0], words[1], words[2], words[3]};
         *reinterpret_cast<U4*>(dst + 4U) = U4{words[4], words[5], words[6], words[7]};
-        if (raw.half == 0U) dst[kScaleWord] = raw.scale & 0xFFFFU;
+        if constexpr (Policy == ScalePolicy::group)
+            if (raw.half == 0U) dst[kScaleWord] = raw.scale & 0xFFFFU;
     }
 
     // The scale of the current group of the column whose LDS row starts at `row`.

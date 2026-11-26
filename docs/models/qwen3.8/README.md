@@ -40,13 +40,34 @@ See [HTTP prefill](../../engine/serving/serving.md#default-prompt-prefill). See 
 `prompt.ids` holds the prompt as token IDs from the model's tokenizer; the engine prints a JSON receipt with
 `generated_tokens` and timings. The plain command decodes with exact MTP speculation when the
 [drafter bundle](../../engine/speculative/mtp-native-cli.md#default-mtp-drafter-bundle) (bundle JSON, distilled
-sidecar, draft vocabulary) is beside the model; `--no-mtp` or `STRIX_MTP=0` gives plain decode with the same
-tokens, and a missing bundle gives plain decode with one notice. Same binary, one node, plain (`--no-mtp`) against the default command, identical tokens: 22.1 -> 73.3 tok/s after a 1K prompt (300 tokens; 81.3 tok/s over 1,200 tokens) and 16.9 -> 62.8 tok/s after an 8K prompt (300 tokens). The explicit
+sidecar, draft vocabulary) is beside the model, or when a registered drafter sidecar is found under the model
+directory (for example the mirror's `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`; the recommended distilled head
+is preferred when present). The process prints the file it took (`mtp: drafter ...`) and calibrates on first use,
+caching the golden under `~/.cache/strix-engine/goldens`. `--no-mtp` or `STRIX_MTP=0` gives plain decode with the
+same tokens, and no drafter gives plain decode with one notice. Same binary, one node, plain (`--no-mtp`) against the default command, identical tokens: 22.1 -> 73.3 tok/s after a 1K prompt (300 tokens; 81.3 tok/s over 1,200 tokens) and 16.9 -> 62.8 tok/s after an 8K prompt (300 tokens). The explicit
 speculative command (every option spelled out) is in **[docs/getting-started/engine-reference.md → Command line](../../getting-started/engine-reference.md#command-line)**
 and [docs/engine/speculative/mtp-native-cli.md](../../engine/speculative/mtp-native-cli.md). The HTTP server, batched slots (`--http-batch`) and the
 prefix cache are in [docs/engine/serving/serving.md](../../engine/serving/serving.md); several requests in one process in
 [docs/engine/scheduling/multi-request-cohort.md](../../engine/scheduling/multi-request-cohort.md) (automatic per-cycle policy, on by default: 8 requests 69.3 tok/s aggregate, 62.9 tok/s before); sampling in
 [docs/engine/decode/sampled-decoding.md](../../engine/decode/sampled-decoding.md).
+
+### Serving quick start
+
+```bash
+strix-serve --model qwen3.8-flash-next --profile fast --asset MODEL.gguf --bind 127.0.0.1 --port 8080 -- \
+  --prompt-ids calibration.ids --generate 64 --http-batch 8
+```
+
+- `calibration.ids`: at least 17 token IDs (16 calibration rows and one more) of representative text, for example
+  the first 64 IDs of a `prompt.ids`. The server serves exact MTP decode only, so it needs a calibration prompt; the
+  command-line tools have no tokenizer to make one. Without it the server stops at startup ("at least one token id
+  or --reference is required"). `--generate` is ignored while serving but must be positive.
+- The drafter is found as for the CLI (bundle JSON beside the model, else a registered sidecar under the model
+  directory). On the first start the server generates the calibration golden before it listens (about two minutes
+  on one node) and caches it; later starts reuse it.
+- `--http-batch 8` asks for 8 slots. The server builds as many as memory allows and prints the count (`http slots 4
+  (cap 8: limited by MemAvailable budget)` with this 111 GB pack on a 128 GB node).
+- No `--known-prefix-*` flags: the server resolves its tiled prefill (T8192, smaller tiles under memory pressure).
 
 Qwen's [prefix-state cache](../../engine/serving/prefix-state-cache.md) restores complete attention/GDN
 state at admitted boundaries and reads only the suffix. Configure `--prefix-cache-host-bytes N` and

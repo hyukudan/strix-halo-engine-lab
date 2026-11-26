@@ -38,6 +38,16 @@ per token do not change; only the codes and scales do.
   (`require_separation` in `calib_provenance.hpp`), so no held-out row enters a reported error. It also writes a
   table of the relative output error of every matrix for every technique, measured on the evaluation statistics.
 
+- Strix pack SP4 with the fixed table (`strix.sp4t`, `strix/weight/host_lowbit.hpp` `sp::`): 68 bytes per 128 weights
+  like `q4_g64`, sign + magnitude-index codes on the table {1,3,5,8,10,14,18,24}, one scale byte per 32 weights and a
+  per-tensor base. `--storage SUBSTRING=sp4 --table fixed --out PACK` writes it; its pack line carries a tenth field, the
+  16-byte tensor header in hex (part of the identity; a header with another table is refused). There is no load-time
+  encoder: a `strix.sp4t` matrix comes from a pack. The base reaches the consumer as `ResidentMatrixView::outer_exponent`.
+  HIP consumer: the small-M schedule's `Sp4Operand` (`core/f16_tile_gemm_small.hpp`; table values as exact FP16
+  operands, one FP32 multiplier per 32-weight group, 2^base at the store), FP16 form only
+  (`hip.sp4t.f16-group32-scale-chain@1`). Inkling 2 Mini binds it as the head arm `weights.head.sp4t@1`
+  (`--qualify-decode-weights`, or the pending lever `STRIX_INK_LOWBIT_HEAD=sp4t`, command line only).
+
 ## Procedure
 
 1. Collect statistics with an engine that binds the taps (Inkling 2 Mini: `STRIX_CALIB_MOMENTS=FILE` on an EXACT
@@ -62,16 +72,27 @@ windows: no shared 32-token run). The engine looks for it as `inkling2-mini-q4.l
 `STRIX_LOWBIT_PACK`), identity `b0bd0103dcdd9ffd`. Offline relative output error on the evaluation rows: 0.362 of the
 load-time round-to-nearest pack of the same format (mean over the matrices).
 
-The historical TURBO row requires `STRIX_INK_LOWBIT_TURBO=1` with the engine's native `--profile turbo`.
-Configured context and lane capacity must be known and at most 16,384 tokens and 16 lanes. Compact weights run on
-decode widths 1, 8 and 16 using the measured FP16 tile arithmetic. Other widths, prefill and verify use the resident BF16 image. EXACT, FAST and TURBO
-with the lever unset use the incumbent weights. The final calibrated q4 head lacks a passing FAST receipt.
+The historical TURBO row requires `STRIX_INK_LOWBIT_TURBO=1` with `--profile turbo` (the command line and
+`strix-serve`, whose TURBO preset forwards the engine's TURBO column). It is not a TURBO default: since the HIP greedy
+pick screens the BF16 head, the q4 row decodes slower than the BF16 image at B=1 and within noise at C8 / C16 (table
+below, last row), so the ladder rule keeps TURBO on the tier below. Configured context and lane capacity must be known
+and at most 16,384 tokens and 16 lanes (a server needs `--slots 1..16`); outside them, on another backend, with lookup
+or drafter speculation, or without the pack (absent or other content), the incumbent weights load and a
+`strix-lowbit-pack/v2 declined (...)` line says why. Compact weights run on decode widths 1, 8 and 16 using the
+measured FP16 tile arithmetic. Other widths, prefill and verify use the resident BF16 image; a served lane takes its
+final prompt token as a BF16 prefill row (emits-first prompt route) on every served route. EXACT and FAST use the
+incumbent weights. The final calibrated q4 head lacks a passing FAST receipt.
 
 | profile | mix | gate v2 vs BF16, decode (39 held-out windows, prose / code / structured, 8K-64K context, 2,457 rows) | served B=1 / C8 / C16 decode, 8K prefill (16 slots, context 16384) |
 |---|---|---|---|
 | EXACT, FAST | BF16 | bitwise | 23.36 / 53.76 / 66.74 tok/s, 14.15 s |
 | (FAST candidate) | head q4_g64, every other role BF16 | every class and the pooled bars pass (KL 0.0010, top-1 0.993, dNLL +0.0011, route flips 0), but two prose windows fail dNLL: not a FAST row | 23.96 / 64.55 / 81.52 tok/s, 14.15 s |
 | TURBO opt-in | attention and head q4_g64 | scored on the production route (BF16 prefill of the teacher prefix, q4 decode steps): KL 0.0033, top-1 0.980, dNLL +0.0027, route flips 0.00x the null, every window inside the TURBO window bar; a TURBO row (its q4 head fails the FAST bar on two prose windows) | 27.03 / 68.48 / 86.60 tok/s, 14.38 s |
+
+The decode figures above predate the screened BF16 head of the HIP greedy pick. Against a build that screens it (served,
+16 slots, context 16384, 256 tokens per request, ABBA, aggregate decode tok/s over the decode window): B=1 BF16 23.10 /
+23.70, TURBO opt-in 20.08 / 20.10; C8 47.60 / 49.02 against 48.80 / 48.80; C16 55.74 / 58.19 against 58.79 / 59.02;
+8K prefill equal (563 / 595 against 581 / 594 tok/s). The q4 row projects the full q4 head and gives up the screen.
 
 TURBO prints its quality in the `weight_status` receipt line (`turbo_quality ...`).
 

@@ -106,6 +106,12 @@ static void replay_reference() {
         }
         PrefillOptions inherited_arm;
         require(resolve_replay(inherited_arm, inherited).decoder_replay_rows == inherited, "ordinary options must retain inheritance");
+        // a served prompt split into pieces (decoder deferral to the next piece), in-run prefix snapshots or a group pass
+        // need every decoder row: the run takes the exact plan instead of refusing (the serve was poisoned before)
+        require(resolve_replay(inherited_arm, inherited, 0U, 14592U).decoder_replay_rows == 0U, "a deferred piece runs the exact plan");
+        require(resolve_replay(inherited_arm, inherited, 0U, 0U, true).decoder_replay_rows == 0U, "a snapshot run runs the exact plan");
+        require(resolve_replay(inherited_arm, inherited, 0U, 0U, false, true).decoder_replay_rows == 0U, "a group pass runs the exact plan");
+        require(resolve_replay(loaded, inherited, 0U, 14592U).decoder_replay_rows == 0U, "an explicit bound never applies to a deferred piece");
     }
     PrefillOptions unresolved;
     require(quality::arm_profile(unresolved) == "diagnostic", "unresolved inheritance cannot attest exact");

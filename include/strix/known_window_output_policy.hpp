@@ -1,10 +1,24 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string_view>
 
 namespace strix {
 enum class KnownWindowOutputPolicy : std::uint8_t { all_rows=0, terminal_row=1, state_only=2 };
+// A segmented forward can return one terminal head per member, or just state.
+[[nodiscard]] constexpr bool known_prefill_group_supports_output(KnownWindowOutputPolicy policy,
+    bool logits) noexcept {
+    return policy == KnownWindowOutputPolicy::terminal_row ||
+        (policy == KnownWindowOutputPolicy::state_only && !logits);
+}
+[[nodiscard]] constexpr bool known_prefill_group_supports_segment(KnownWindowOutputPolicy group_policy,
+    std::uint32_t group_rows, KnownWindowOutputPolicy member_policy, std::uint32_t member_rows,
+    std::size_t rows, bool logits) noexcept {
+    return known_prefill_group_supports_output(group_policy, logits) &&
+        known_prefill_group_supports_output(member_policy, logits) && rows >= 16U && rows <= group_rows &&
+        (rows == member_rows || (rows < member_rows && rows % 8U == 0U));
+}
 inline void validate_known_window_output_policy(KnownWindowOutputPolicy policy) {
     if(policy!=KnownWindowOutputPolicy::all_rows&&policy!=KnownWindowOutputPolicy::terminal_row&&
         policy!=KnownWindowOutputPolicy::state_only)

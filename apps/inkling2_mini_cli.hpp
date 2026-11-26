@@ -22,6 +22,7 @@ namespace strix::inkling2::cli {
 struct Options {
     serve::SerialGenerationOptions generation;
     const char* dspark{};
+    bool dspark_off{};  // --dspark off: no drafter, not even the model's sidecar under auto
     const char* gate_manifest{};
     const char* gate_out{};
     const char* gate_arm{};
@@ -42,7 +43,9 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
             if (parse_mini_weight_option(options.weights, argument, value, native))
                 return true;
             if (argument == "--dspark") {
-                options.dspark = value();
+                const char* file = value();
+                options.dspark_off = std::string_view(file) == "off";
+                options.dspark = options.dspark_off ? nullptr : file;
                 return true;
             }
             if (!native) return false;
@@ -73,6 +76,15 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
     if (gate && !session::valid_head_gate_name(options.gate_arm))
         throw std::invalid_argument("invalid --gate-arm name");
     const auto& generation = options.generation;
+    if (gate && (!generation.prompt.empty() || generation.text || generation.messages ||
+                 generation.tokenize_file || generation.generate_requested || generation.logits ||
+                 generation.sampling_requested))
+        throw std::invalid_argument("gate mode takes no prompt, --tokenize, --generate, --logits or sampling options");
+    options.tier = resolve_mini_profile(options.weights, native && !generation.tokenize_file);
+    // The speculation row (kMiniSpeculation) is the default of a generating run; an explicit --speculation wins.
+    if (!generation.speculation_requested && !gate && !generation.tokenize_file && family.supports_speculation &&
+        mini_speculation(options.tier))
+        options.generation.speculation = serve::CliSpeculation::automatic;
     if (options.dspark) {
         if (gate || generation.tokenize_file || generation.speculation != serve::CliSpeculation::automatic ||
             token_sampling_enabled(generation.sampling))
@@ -81,12 +93,8 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
             std::filesystem::equivalent(generation.logits, options.dspark))
             throw std::invalid_argument("logits output must differ from the DSpark sidecar");
     }
-    if (gate && (!generation.prompt.empty() || generation.text || generation.messages ||
-                 generation.tokenize_file || generation.generate_requested || generation.logits ||
-                 generation.sampling_requested))
-        throw std::invalid_argument("gate mode takes no prompt, --tokenize, --generate, --logits or sampling options");
-    options.tier = resolve_mini_profile(options.weights, native && !generation.tokenize_file);
     options.weights.lowbit_turbo = mini_lowbit_turbo(options.tier);
+    if (native) apply_mini_lowbit_head(options.weights, options.tier);
     mini_cli_decline_served_route(options.tier);
     if (options.gate_order_null && (!gate || options.tier.profile != profile::Name::standard))
         throw std::invalid_argument("--gate-order-null requires an exact gate arm");

@@ -32,7 +32,9 @@ inline constexpr sp::Lever table[] = {
                "1024 = 2048 at 4,096 and 8,192 tokens); FAST gate v2 per regime: see `qualified`",
      .provisional = {false, false, false, false},
      // the width is scheduling inside this class (the pair's flow-shop picker chooses it): same bits, same qualification
-     .same_bits = "1024,2048,4096", .identity = {{{"0", "v1"}, {"4096", "v1"}}}},
+     .same_bits = "1024,2048,4096",
+     .identity = {{{"0", "v1"}, {"1024", "v1"}, {"2048", "v1"},
+                   {"4096", "v1"}}}},
     {.name = "head_q8", .env = "", .option = "--head-q8", .value = {"", "1", "", ""}, .builtin = "0",
      .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "1 (Q8_0 copy of the BF16 head for the decode head, weights.head.q8_0@1)", .off = "0",
@@ -69,6 +71,37 @@ struct Regime {
     std::uint64_t prompt_tokens = 0;  // the prompt of this run (an entry point that resolves earlier: the longest it admits)
     std::string_view execution{};     // sp::Regime::execution (caller-owned; empty: no ordinary timing row decides)
 };
+// Legacy rank callers can describe the shape, but cannot match a timed row without a complete execution key.
+inline constexpr std::string_view single_greedy_8k = "hip/rank/single/full/greedy/8384/64";
+
+struct RankExecution {
+    std::string_view device;  // strix::device::hip_cost_device_identity()
+    std::string_view pack;    // identity of the loaded weight pack
+    std::uint32_t prompt_tokens = 0, context_capacity = 0, generated_tokens = 0, repeat = 1;
+};
+
+// For full-model single-rank device greedy. Other routes must describe their own workload rather than using this key.
+[[nodiscard]] inline std::string rank_execution(const RankExecution& rank, const sp::Inputs& inputs) {
+    if (rank.pack.empty() || rank.generated_tokens == 0) return {};
+    // Route recording and replay change the ordinary greedy workload.
+    for (const auto* key : {"STRIX_MOE_ROUTES_OUT", "STRIX_MOE_ROUTES_IN", "STRIX_MOE_ROUTE_NULL"})
+        if (const char* value = sp::environment(inputs.env, key); value && *value) return {};
+    if (::strix::envcfg::parse_flag(sp::environment(inputs.env, "STRIX_MOE_ROUTE_STATS"), false, EnvFlagMatch::exact))
+        return {};
+    // This flag lives outside the profile table. Use the same parser and default as the HIP forward.
+    const bool decode_fuse = ::strix::envcfg::parse_flag(sp::environment(inputs.env, "STRIX_DECODE_FUSE"), true);
+    const auto warmups = rank.repeat > 1 ? rank.repeat - 1 : 0;
+    const std::string settings = "route=rank/single/full/device-greedy,pack=" + std::string(rank.pack) +
+        ",warmups=" + std::to_string(warmups) + ",decode_fuse=" + (decode_fuse ? "1" : "0");
+    // The request supplies the entire prompt; window width is the variable compared by the schedule lever.
+    return sp::ladder_execution({"hip", rank.device,
+        {rank.prompt_tokens, rank.context_capacity, 1, rank.prompt_tokens, 0, 1, 0, rank.generated_tokens}, settings});
+}
+
+// The FAST window width is one value (4096) in every regime: a width inside the same_bits class becomes a schedule only
+// through a timing row of `measured` (the shared ladder: execution key with the device product and the effective runtime
+// settings, matched cold and warm arms, a gain beyond the noise). The 11-25 8K pair of receipts does not decide: 2048 was
+// +1.2 % on wall in one warm A/B and -1.6 % in the matched repeat (14.755 vs 14.520 s, same ids and anchor), so no row.
 [[nodiscard]] inline Device device_of(std::string_view arch) {  // hipDeviceProp_t::gcnArchName; features after ':' ignored
     return arch.substr(0, arch.find(':')) == "gfx1151" ? Device::gfx1151 : Device::unknown;
 }
@@ -160,7 +193,18 @@ struct Measured {
     Topology topology;
     sp::LadderRow timing;
 };
+// The warm A/B did not resolve the observed variation and lacks a complete device key and logits/state proof.
+// Keep the 4096 FAST schedule until a receipt qualifies the alternate width.
 inline constexpr std::span<const Measured> measured{};
+
+// Last in the ladder chain: the comparison names the entire gated arithmetic it runs over, including its 4096 width.
+// The builtin here is the incumbent width *within* that arithmetic. BASE and the pair use their original routes.
+inline constexpr sp::Lever prompt_window_schedule{
+    .name = "prompt_window_schedule", .env = "", .option = "", .value = {"", "2048", "", ""}, .builtin = "4096",
+    .kind = sp::Kind::exact, .target = "2048-row FAST prefill schedule", .off = "",
+    .source = "same-bit windows in a measured FAST workload",
+    .identity = {{{"4096", "v1"}, {"2048", "v1"}}}, .timed = true,
+};
 
 // Owns the per-regime rows the resolution points into (non-movable: entries hold pointers).
 struct Resolved {
@@ -188,19 +232,28 @@ struct Resolved {
     constexpr auto fast = static_cast<unsigned>(sp::Name::fast);
     for (const auto& lever : table) {
         sp::Lever row = lever;
-        const auto* q = qualification(lever.name, lever.value[fast], regime, rows);
-        row.ready[fast] = q != nullptr;
-        // A frozen incumbent grant (not the quality row) keeps a cell that already ran before the ladder rule.
+        const auto nominal = lever.value[fast];
+        row.ready[fast] = qualification(lever.name, nominal, regime, rows) != nullptr;
         if (lever.kind != sp::Kind::exact)
             for (const auto& grant : grants)
-                if (!grant.identity.empty() && sp::declared_identity(lever.identity, lever.value[fast]) == grant.identity &&
-                    qualification(lever.name, lever.value[fast], regime, std::span(&grant.qualified, 1)) != nullptr) {
-                    out->ladder.push_back(sp::incumbent_cell(lever.name, lever.value[fast], sp::Name::fast,
+                if (!grant.identity.empty() && sp::declared_identity(lever.identity, nominal) == grant.identity &&
+                    qualification(lever.name, nominal, regime, std::span(&grant.qualified, 1)) != nullptr) {
+                    out->ladder.push_back(sp::incumbent_cell(lever.name, nominal, sp::Name::fast,
                                                              grant.qualified.gate.receipt, grant.identity));
                     break;
                 }
         out->rows.push_back(row);
     }
+    auto schedule = prompt_window_schedule;
+    const auto candidate = schedule.value[fast];
+    const auto& arithmetic = table[0];
+    schedule.ready[fast] = regime.topology == Topology::one_node &&
+        sp::last_setting(inputs.cli, arithmetic.name) == nullptr &&
+        sp::bit_class_member(arithmetic.same_bits, schedule.builtin) &&
+        sp::bit_class_member(arithmetic.same_bits, candidate) &&
+        qualification(arithmetic.name, candidate, regime, rows) != nullptr;
+    out->rows.push_back(schedule);
+
     out->engine = engine();
     out->engine.table = std::span<const sp::Lever>(out->rows);
     out->engine.ladder = std::span<const sp::LadderRow>(out->ladder);
@@ -208,6 +261,16 @@ struct Resolved {
     scoped.regime = {sp::Phase::prefill, regime.prompt_tokens, 1,
                      regime.device == Device::unknown ? std::string_view{} : device_name(regime.device), regime.execution};
     out->resolution = sp::resolve(out->engine, scoped);
+    // Export one width. The private schedule cell only replaces a profile-selected, qualified arithmetic width.
+    const auto& window = out->resolution.entries.back();
+    auto& width = out->resolution.entries.front();
+    if (width.status == sp::Status::set && width.value == schedule.builtin && window.value == candidate &&
+        window.status == sp::Status::set) {
+        width.value = window.value;
+        width.ladder = window.ladder;
+        width.ladder_reference = window.ladder_reference;
+    }
+    out->resolution.entries.pop_back();
     for (auto& entry : out->resolution.entries) {
         if (entry.status != sp::Status::pending && entry.status != sp::Status::unqualified) continue;
         std::string where;

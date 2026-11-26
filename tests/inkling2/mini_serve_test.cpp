@@ -84,11 +84,15 @@ private:
 using FixtureCohort = sv::FixedKvCohort<FixtureDecoder>;
 
 void admission() {
-    require(!mini::mini_server_calibrated_row_allowed(true, false),
-            "a held-back HTTP prompt anchor cannot enter the calibrated decode row");
-    require(mini::mini_server_calibrated_row_allowed(true, true),
-            "the calibrated row remains available when served prefill emits its first token");
-    require(!mini::mini_server_calibrated_row_allowed(false, true), "unset calibration stays off on the served route");
+    require(mini::mini_served_prompt_emits_first(false, false, true),
+            "a calibrated decode image serves prompts emits-first on the default served route");
+    require(!mini::mini_served_prompt_emits_first(false, false, false),
+            "without a calibrated image, a W4A4 class or the route lever the held-back route stays");
+    // Decode-only pack: needs emits-first; full-image pack and unadmitted load: no promise (must not abort startup).
+    require(!mini::mini_decode_only_pack_route_ok(true, true, false), "decode-only pack on the held-back route");
+    require(mini::mini_decode_only_pack_route_ok(true, true, true), "decode-only pack emits first");
+    require(mini::mini_decode_only_pack_route_ok(true, false, false), "full-image pack on the default served route");
+    require(mini::mini_decode_only_pack_route_ok(false, false, false), "no admitted pack");
     require(sv::fixed_kv_slots(99, 100, 3) == 0, "KV budget too small");
     require(sv::fixed_kv_slots(400, 100, 3) == 3, "row budget cap");
     require(sv::fixed_kv_slots(400, 100, 3, 1) == 1, "explicit slot cap");
@@ -468,7 +472,10 @@ void profile_parity() {
                 const auto service = factory->create(selection);
                 require(service && loaded && loaded->screened_head == (head != nullptr) &&
                             loaded->screened_head == mini::mini_screened_head(cli.tier) &&
-                            loaded->verify_rows == level && loaded->verify_rows == mini::mini_verify_rows(cli.tier),
+                            // a speculating server takes the verify rows body (level >= 1), as the command line does
+                            loaded->verify_rows == mini::mini_speculation_verify_rows(level, loaded->speculation) &&
+                            loaded->verify_rows ==
+                                mini::mini_speculation_verify_rows(mini::mini_verify_rows(cli.tier), loaded->speculation),
                         "CLI and server must resolve both opt-in rows independently");
             }
         }
@@ -493,6 +500,21 @@ void profile_parity() {
     }
     set_env("STRIX_INK_LOWBIT_TURBO", nullptr);
     selection.arguments.back() = "fast";
+    for (const char* backend : {"hip", "cuda"}) {
+        selection.arguments[3] = backend;
+        loaded.reset();
+        require(factory->create(selection) && loaded && loaded->weight_options.qualify == nullptr,
+                "unset SP must preserve incumbent server admission");
+        for (const char* policy : {"weights.attention_head.sp2@1", "weights.attention_head.sp3@1",
+                                   "weights.attention_head.sp4@1"}) {
+            selection.arguments.insert(selection.arguments.end(), {"--qualify-weights", policy});
+            loaded.reset();
+            require(refuses([&] { (void)factory->create(selection); }, "refused: loader not present") && !loaded,
+                    "explicit SP must refuse before starting the server backend");
+            selection.arguments.resize(selection.arguments.size() - 2U);
+        }
+    }
+    selection.arguments[3] = "hip";
     selection.arguments.emplace_back("--qualify-q8");
     std::ostringstream receipt;
     factory->inspect(selection, receipt);
@@ -526,11 +548,13 @@ void profile_parity() {
     std::cout << "inkling2-mini-profile-parity: ok\n";
 }
 
-// The native column the registry preset forwards for a served --profile (models/inkling2-mini.toml [presets.*]).
-strix::profile::Name served_native_tier(std::string_view tier_name) {
+// The native column the registry preset forwards for a served --profile on `backend` (models/inkling2-mini.toml
+// [presets.*]): TURBO forwards the engine's TURBO column on HIP and the FAST levers elsewhere.
+strix::profile::Name served_native_tier(std::string_view tier_name, std::string_view backend) {
     namespace presets = strix::model_data::inkling2_mini::presets;
     return strix::profile::parse(tier_name == "exact" ? presets::exact::levers
                                  : tier_name == "fast" ? presets::fast::levers
+                                 : backend == "hip"    ? presets::turbo::hip::levers
                                                        : presets::turbo::levers);
 }
 
@@ -641,9 +665,9 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                     "lever on: the command line's schedule and the served lane cap");
         }
         // The served tier is the registry preset's native column for the requested --profile (models/inkling2-mini.toml:
-        // TURBO keeps the FAST column until this model has a qualified TURBO set), resolved by the native command line's
+        // TURBO: the engine's TURBO column on HIP, the FAST column elsewhere), resolved by the native command line's
         // resolver with the same lever classes.
-        const auto native = served_native_tier(tier_name);
+        const auto native = served_native_tier(tier_name, backend);
         mini::MiniWeightOptions cli_weights;
         cli_weights.tier.profile = native;
         cli_weights.qualify_q8 = qualify_q8;
@@ -731,12 +755,41 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         if (std::string_view(field) == "--no-weight-q8" && !qualify_q8) continue;
         std::ostringstream out, error;
         strings.emplace_back(field);
-        if (std::string_view(field) == "--speculation") strings.emplace_back("auto");
+        if (std::string_view(field) == "--speculation") strings.emplace_back("lookup");
         const auto expected = std::string_view(field) == "--no-weight-q8" ? "--qualify-q8" : field;
         require(run({}, out, error) == 2 && !created && error.str().find(expected) != std::string::npos,
                 "unsupported or conflicting option did not fail before native load");
         if (std::string_view(field) == "--speculation") strings.pop_back();
         strings.pop_back();
+    }
+    // Served speculation (kMiniSpeculation, explicit --speculation auto here): admitted on HIP (one-lane verify windows),
+    // declined on CUDA, named in the startup line before any device work.
+    {
+        std::ostringstream out, error;
+        strings.insert(strings.end(), {"--speculation", "auto", "--family-inspect"});
+        const auto rc = run({}, out, error);
+        strings.resize(strings.size() - 3U);
+        const bool hip = std::string_view(backend) == "hip";
+        require(rc == 0 && !created &&
+                    out.str().find(hip ? " speculation auto" : " speculation declined") != std::string::npos,
+                "served speculation: auto admitted on HIP, declined on CUDA, before any device work");
+        // The row default (auto in every tier) resolves as the explicit flag does; an explicit off wins over it.
+        std::ostringstream row_out, row_error;
+        const auto flag = std::ranges::find(strings, std::string("--speculation"));
+        const auto at = flag - strings.begin();
+        strings.erase(flag, flag + 2);  // the shared argument list pins --speculation off
+        strings.emplace_back("--family-inspect");
+        const auto row_rc = run({}, row_out, row_error);
+        strings.pop_back();
+        strings.insert(strings.begin() + at, {"--speculation", "off"});
+        require(row_rc == 0 && row_out.str().find(hip ? " speculation auto" : " speculation declined") != std::string::npos,
+                "served speculation: the row default resolves auto like the command line");
+        std::ostringstream off_out, off_error;
+        strings.insert(strings.end(), {"--speculation", "off", "--family-inspect"});
+        const auto off_rc = run({}, off_out, off_error);
+        strings.resize(strings.size() - 3U);
+        require(off_rc == 0 && off_out.str().find(" speculation off") != std::string::npos,
+                "served speculation: an explicit off wins over the row");
     }
     // Decode form flags: a CUDA server takes the command line's (mini_served_packed_decode; naming both is refused before
     // native load); a HIP server refuses them, its form follows the served route lever's row.
@@ -822,7 +875,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             const auto effective = sv::parse_json(capabilities.body);
             const auto* profile = effective.find("profile");
             const auto* weights = effective.find("weight_load");
-            require(capabilities.status == 200 && profile && profile->as_string() == mini::mini_profile_name(served_native_tier(tier_name)) && weights &&
+            require(capabilities.status == 200 && profile && profile->as_string() == mini::mini_profile_name(served_native_tier(tier_name, backend)) && weights &&
                     (tier_name != "fast" ||  // the FAST plan; the other tiers carry their own weight plan
                      (weights->find("storage")->as_string() == (qualify_q8 ? "gguf.q8_0" : "plain.bf16") &&
                       weights->find("status")->as_string() == (qualify_q8 ? "unqualified" : "pending"))),
@@ -949,7 +1002,8 @@ int main(int argc, char** argv) try {
     for (const auto* backend : {"hip", "cuda"}) {
         wiring(argv[1], backend, false);
         wiring(argv[1], backend, true);
-        // The deployed TURBO preset with the served route switch unset: main's preset column, Q8 qualification included.
+        // The deployed TURBO preset with the served route switch unset: the engine's column for this backend; TURBO nests FAST, so
+        // the Q8_0 qualification arm stays admitted.
         wiring(argv[1], backend, true, false, W4a4::bf16, "turbo");
         // Every tier keeps the held-back served shape without the lever (CUDA: the command line's chunk, incumbent lane
         // cap), also for chunks above the context and explicit slots.

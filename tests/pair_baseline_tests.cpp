@@ -10,6 +10,9 @@ ModelContentIdentity sha256_file_content(const std::filesystem::path&, FileHashP
     throw std::logic_error("unexpected asset hash");
 }
 ModelContentIdentity sha256_bytes(std::span<const std::byte>) { throw std::logic_error("unexpected content hash"); }
+SingleModelContentIdentity hash_single_model_content_file(const ModelContentFile&, FileHashPolicy) {
+    throw std::logic_error("unexpected target hash");
+}
 std::string model_content_identity_hex(const ModelContentIdentity&) { throw std::logic_error("unexpected asset identity"); }
 void validate_session_snapshot_policy(SessionSnapshotPolicy policy) {
     if (policy != SessionSnapshotPolicy::full_components) throw std::logic_error("unexpected snapshot policy");

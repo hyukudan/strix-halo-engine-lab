@@ -214,6 +214,13 @@ void CohortDecoder::submit(CohortRequest request) {
 
 void CohortDecoder::control(std::span<const std::uint32_t> words) { backend_.control(words); }
 
+std::uint32_t max_draft_for_live(const CohortConfig& config, std::uint32_t live) noexcept {
+    const auto& table = config.max_draft_by_live;
+    if (table.empty()) return config.max_draft;
+    const std::size_t index = live == 0U ? 0U : std::min<std::size_t>(live - 1U, table.size() - 1U);
+    return std::min(config.max_draft, table[index]);
+}
+
 bool CohortDecoder::idle() const noexcept { return waiting_.empty() && live() == 0; }
 
 std::uint32_t CohortDecoder::live() const noexcept {
@@ -575,6 +582,7 @@ void CohortDecoder::step() {
     std::vector<std::vector<float>> accept(n);
     std::vector<LaneDemand> demands(n);
     std::vector<std::size_t> device_rows(n, 0);  // leading device-draft rows of a window (context rows follow them)
+    const std::uint32_t draft_cap = max_draft_for_live(config_, live());
     std::vector<std::uint32_t> device;
     std::vector<double> device_p;
     for (std::size_t k = 0; k < n; ++k) {
@@ -586,7 +594,7 @@ void CohortDecoder::step() {
         // the backend's own cap on the lane's window (pending row + drafts)
         const std::uint64_t window_cap = std::max<std::uint32_t>(backend_.max_window(plan.decode_lanes[k]), 1U) - 1U;
         const std::size_t room = one_row ? 0U : static_cast<std::size_t>(std::min<std::uint64_t>(
-                                                     {config_.max_draft, left - 1U, room_pos, window_cap}));
+                                                     {draft_cap, left - 1U, room_pos, window_cap}));
         std::vector<double> acc;
         device.clear();
         device_p.clear();
@@ -718,11 +726,19 @@ void CohortDecoder::step() {
         if (receipt) receipt->publish();  // the model prefix is committed: the selection state follows it
     const double decode_ms = now_ms() - t0;
     decode_ms_ += decode_ms;
-    last_decode_ms_ = decode_ms;
     std::uint32_t total_rows = 0;
     for (const auto& g : groups) total_rows += g.rows;
     rows_ += total_rows;
     observe_cost(total_rows, static_cast<std::uint32_t>(n), decode_ms);
+    // last_decode_ms_ prices the decode round a prompt pass waits beside (the gap bound). A round that carried draft
+    // rows is priced without them (the fitted row cost per draft row): a prompt arriving raises the live lanes and the
+    // next round runs under the by-live draft cap, so a lone lane's long window must not shrink the next prompt's
+    // grant. A round without drafts is recorded as measured, as in a cohort that never drafts.
+    const std::uint32_t draft_rows = total_rows - static_cast<std::uint32_t>(n);
+    last_decode_ms_ = draft_rows == 0U
+        ? decode_ms
+        : std::max(0.0, decode_ms - static_cast<double>(draft_rows) *
+                                        fitted_cost(sums_, config_, static_cast<std::uint32_t>(n)).row_ms);
     planner_.account(prompt_ms, decode_ms, 0.0, prompt_rows);
 
     std::vector<std::pair<Lane*, std::string>> done;

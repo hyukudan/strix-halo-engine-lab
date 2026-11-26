@@ -53,6 +53,8 @@ int main() {
         {3072U, 1024U, 1024U},   // attention prepare
         {24U, 384U, 128U},       // small projections in one group
         {1U},                    {7U, 9U},     {8U, 8U, 8U, 8U}, {17U, 1U, 33U, 4097U},
+        {4096U, 256U, 16U, 64U, 512U, 512U},  // six same-input projections (one launch)
+        {1U, 1U, 1U, 1U, 1U, 1U},
     };
     for (const auto width : widths)
         for (const auto& group : groups) check_group(group, width);
@@ -60,9 +62,9 @@ int main() {
     TightBlocks plan{};
     const unsigned zero[] = {8U, 0U};
     expect(!plan_tight_blocks(zero, 2U, 8U, plan), "zero outputs rejected", 0U, 0U);
-    const unsigned five[] = {1U, 1U, 1U, 1U, 1U};
-    expect(!plan_tight_blocks(five, kTightGroupMax + 1U, 8U, plan), "count above max rejected", kTightGroupMax + 1U, 0U);
-    expect(!plan_tight_blocks(five, 0U, 8U, plan), "empty group rejected", 0U, 0U);
+    const unsigned over[kTightGroupMax + 1U] = {1U, 1U, 1U, 1U, 1U, 1U, 1U};
+    expect(!plan_tight_blocks(over, kTightGroupMax + 1U, 8U, plan), "count above max rejected", kTightGroupMax + 1U, 0U);
+    expect(!plan_tight_blocks(over, 0U, 8U, plan), "empty group rejected", 0U, 0U);
     const unsigned huge[] = {0xffffffffU, 0xffffffffU};
     expect(!plan_tight_blocks(huge, 2U, 1U, plan), "32-bit block overflow rejected", 0U, 0U);
 

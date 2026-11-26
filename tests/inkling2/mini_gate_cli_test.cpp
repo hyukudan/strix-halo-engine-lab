@@ -14,6 +14,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstdlib>
+#include <vector>
 
 namespace {
 
@@ -82,11 +83,13 @@ struct Decoder {
 };
 
 #if defined(STRIX_INKLING2_APP_CLI_TEST)
-cli::Options parse(std::initializer_list<std::string> arguments, std::string_view backend = "cuda") {
+cli::Options parse(const std::vector<std::string>& arguments, std::string_view backend = "cuda",
+                   cli::StepProgramOptions* program = nullptr) {
     std::vector<std::string> storage{"mini", "model"};
-    storage.insert(storage.end(), arguments);
+    storage.insert(storage.end(), arguments.begin(), arguments.end());
     std::vector<char*> argv;
     for (auto& value : storage) argv.push_back(value.data());
+    if (program) *program = cli::extract_step_program(argv);
     const strix::serve::SerialGenerationFamily family{"mini", "Mini", "MODEL",
         8U, 8U, 16U, 0U, nullptr, 8U, true, false,
         [](const std::string&) -> std::shared_ptr<const strix::serve::BpeTokenizer> { return {}; },
@@ -135,7 +138,16 @@ void test_cuda_route_options() {
     using Mode = strix::serve::CliSpeculation;
     constexpr auto bf16 = strix::weight::kBf16WeightStorage;
     constexpr auto q8 = strix::weight::kQ8WeightStorage;
-    auto options = parse({"1", "--generate", "4"});
+    // The row default (auto) on the CUDA step program: the program runs, speculation is declined with its reason.
+    {
+        auto by_row = parse({"1", "--generate", "4"});
+        cli::StepProgramOptions defaults;
+        const auto route = cli::resolve_cuda_step_route(by_row, defaults, bf16, false);
+        require(by_row.generation.speculation == Mode::automatic && route.program && route.speculation == Mode::off &&
+                    !route.speculation_reason.empty(),
+                "the speculation row default on the CUDA step program: declined with its reason");
+    }
+    auto options = parse({"1", "--generate", "4", "--speculation", "off"});
     cli::StepProgramOptions program;
     const auto resolve = [&](strix::weight::FormatId storage = strix::weight::kBf16WeightStorage,
                              bool resident_k1 = false) {
@@ -238,6 +250,82 @@ void test_cuda_route_options() {
     expect_invalid([&] { (void)forms({"--latency-forms", "--no-latency-forms"}); });
 }
 
+void test_strixpack_entry_points() {
+    namespace mini = strix::inkling2;
+    namespace weight = strix::weight;
+    struct Entry {
+        const char* name;
+        const char* backend;
+        bool step_program;
+        bool explicit_program = false;
+        bool gate = false;
+    };
+    constexpr Entry entries[]{
+        {"HIP CLI", "hip", false},
+        {"CUDA CLI", "cuda", false},
+        {"automatic CUDA step program", "cuda", true},
+        {"explicit CUDA step program", "cuda", true, true},
+        {"HIP gate", "hip", false, false, true},
+        {"CUDA gate", "cuda", true, false, true},
+    };
+    unsigned failures = 0;
+    for (const auto& entry : entries) {
+        const bool hip = std::string_view(entry.backend) == "hip";
+        const weight::WeightLoadScope scope{hip ? weight::Backend::hip : weight::Backend::cuda, {}, {}, {}, {}, {}};
+        const weight::WeightLoadExtent extent{4U, 1U};
+        unsigned loads = 0;
+        const auto run = [&](const char* policy) {
+            std::vector<std::string> args{"--profile", "fast"};
+            if (entry.gate)
+                args.insert(args.end(), {"--gate-manifest", "windows.tsv", "--gate-out", "out",
+                                         "--gate-arm", "FAST", "--gate-rows", "2", "--gate-mode", "decode"});
+            else
+                args.insert(args.end(), {"1", "--generate", "3"});
+            if (!hip && !entry.step_program) args.emplace_back("--no-step-graph");
+            if (entry.explicit_program) args.emplace_back("--step-program");
+            if (policy) args.insert(args.end(), {"--qualify-weights", policy});
+            cli::StepProgramOptions program;
+            auto options = parse(args, entry.backend, hip ? nullptr : &program);
+            auto plan = mini::resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope, extent);
+            if (!hip) {
+                options.gate_manifest = entry.gate ? "windows.tsv" : nullptr;
+                const auto route = cli::resolve_cuda_step_route(options, program, plan.storage, false);
+                require(route.program == entry.step_program, "SP test selected the wrong CUDA route");
+                if (route.program && !entry.gate) {
+                    ++loads;
+                    return plan;
+                }
+            }
+            std::ostringstream receipt;
+            mini::load_mini_weight_pack(plan, options.tier.profile, options.weights, scope, extent, {}, nullptr, receipt,
+                [&](const mini::MiniLowBitRows&) { ++loads; return 0; });
+            return plan;
+        };
+        constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
+        const auto incumbent = mini::resolve_mini_weight_load(strix::profile::Name::fast, scope, formats, true, false,
+                                                               mini::kMiniWeightLoadDecisions, extent);
+        const auto unset = run(nullptr);
+        require(loads == 1U && weight::same_id(unset.policy, incumbent.policy) && unset.storage == incumbent.storage &&
+                    unset.head_storage == incumbent.head_storage && unset.status == incumbent.status &&
+                    unset.reason == incumbent.reason, "unset SP changed the incumbent FAST load");
+        for (const char* policy : {"weights.attention_head.sp2@1", "weights.attention_head.sp3@1",
+                                   "weights.attention_head.sp4@1"}) {
+            loads = 0;
+            bool refused = false;
+            try {
+                (void)run(policy);
+            } catch (const std::invalid_argument& error) {
+                refused = std::string_view(error.what()) == "refused: loader not present";
+            }
+            if (!refused || loads != 0U) {
+                std::cerr << entry.name << ": " << policy << " reached routing without the SP refusal\n";
+                ++failures;
+            }
+        }
+    }
+    require(failures == 0U, "explicit SP must refuse before the load callback");
+}
+
 void set_round_fold_env(const char* value) {
 #ifdef _WIN32
     require(_putenv_s("STRIX_INK_PREPARED_ROUND_FOLD", value ? value : "") == 0, "cannot set the round fold switch");
@@ -317,7 +405,8 @@ void test_options() {
     require(parse({"1", "--profile", "fast", "--qualify-q8"}).weights.qualify_q8, "expected Q8 qualification arm");
     require(parse({"1", "--profile", "fast", "--no-weight-q8"}).weights.disable_q8, "expected Q8 off switch");
     expect_invalid([] { (void)parse({"1", "--qualify-q8"}); });
-    expect_invalid([] { (void)parse({"1", "--profile", "turbo", "--qualify-q8"}); });
+    require(parse({"1", "--profile", "turbo", "--qualify-q8"}).weights.qualify_q8, "TURBO nests the Q8 qualification arm");
+    expect_invalid([] { (void)parse({"1", "--profile", "exact", "--qualify-q8"}); });
     expect_invalid([] { (void)parse({"1", "--profile", "fast", "--no-weight-q8", "--qualify-q8"}); });
     expect_invalid([] { (void)parse({"--tokenize", "input.txt", "--profile", "fast", "--qualify-q8"}); });
     require(parse({"1", "--profile", "turbo", "--qualify-weights", "weights.attention_head.q4_g64@1"}).weights.qualify ==
@@ -347,6 +436,27 @@ void test_options() {
                 strix::serve::CliSpeculation::automatic,
             "expected DSpark in automatic speculation");
     expect_invalid([] { (void)parse({"1", "--speculation", "off", "--dspark", "mtp.safetensors"}); });
+    // The speculation row (kMiniSpeculation): auto by default in every tier; an explicit mode is recorded and wins;
+    // --dspark off switches the drafter off (no sidecar lookup), and a speculating run takes the verify rows body.
+    require(parse({"1"}).generation.speculation == strix::serve::CliSpeculation::automatic &&
+                !parse({"1"}).generation.speculation_requested,
+            "speculation row default: auto");
+    require(parse({"1", "--speculation", "off"}).generation.speculation == strix::serve::CliSpeculation::off &&
+                parse({"1", "--speculation", "off"}).generation.speculation_requested,
+            "an explicit --speculation off wins over the row");
+    require(parse({"1", "--speculation", "auto"}).generation.speculation_requested, "explicit speculation recorded");
+    {
+        const auto off = parse({"1", "--speculation", "auto", "--dspark", "off"});
+        require(off.dspark_off && off.dspark == nullptr &&
+                    off.generation.speculation == strix::serve::CliSpeculation::automatic,
+                "--dspark off: no drafter file, speculation unchanged");
+    }
+    require(strix::inkling2::mini_speculation_verify_rows(0U, true) == 1U &&
+                strix::inkling2::mini_speculation_verify_rows(2U, true) == 2U &&
+                strix::inkling2::mini_speculation_verify_rows(0U, false) == 0U,
+            "a speculating run takes verify rows level >= 1");
+    require(strix::inkling2::mini_served_draft_by_live() == std::vector<std::uint32_t>({7U, 0U}),
+            "served drafts by live lanes: the model's data");
     expect_invalid([] {
         (void)parse({"1", "--speculation", "auto", "--dspark", "mtp.safetensors", "--temperature", "1"});
     });
@@ -358,6 +468,7 @@ void test_options() {
             "expected evaluation-order null arm");
     std::ostringstream profile_line;
     cli::write_profile(gate.tier, profile_line, true);
+    // The speculation row's builtin (auto) keeps the legacy receipt: no lever applied, none reported.
     require(profile_line.str() == "profile exact levers none reference BASE\n", "device profile receipt differs");
 }
 
@@ -474,6 +585,7 @@ int main() {
         test_screened_head_lever();
         test_native_w4a4_admission();
         test_cuda_route_options();
+        test_strixpack_entry_points();
 #endif
         test_windows(directory.path);
     } catch (const std::exception& error) {

@@ -242,6 +242,27 @@ bool check_weight_reads(HeaderSource& source, const wei::TensorIndex& index) {
         }
     }
     if (converted != 97U) return false;
+    const auto attention_q8 = mini::MiniResidentWeightPlan::make(
+        text, wei::RoleStorage{wei::kQ8WeightStorage, wei::kBf16WeightStorage});
+    if (attention_q8.ranges().size() != resident.ranges().size() || source.payload_reads() != 0) return false;
+    const auto* unembed = text.find("model.llm.unembed.weight");
+    if (!unembed) return false;
+    unsigned attention_converted = 0;
+    for (std::size_t i = 0; i < resident.ranges().size(); ++i) {
+        const auto& before = resident.ranges()[i];
+        const auto& q8 = attention_q8.ranges()[i];
+        if (q8.source.source == before.source.source) {
+            if (q8.source.range.offset != before.source.range.offset || q8.bytes != before.bytes) return false;
+        } else {
+            if (before.source.range.offset == unembed->payload.range.offset ||
+                q8.source.range.offset != 0U || q8.bytes * 64U != before.bytes * 34U) return false;
+            ++attention_converted;
+        }
+    }
+    unsigned full_layers = 0;
+    for (unsigned layer = 0; layer < mini::kPhysicalLayers; ++layer)
+        if (mini::is_full_attention(layer)) ++full_layers;
+    if (attention_converted != 7U * mini::kPhysicalLayers + 2U * full_layers) return false;
     try {
         (void)mini::MiniResidentWeights::bind(resident, {});
         return false;

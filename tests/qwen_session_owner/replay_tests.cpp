@@ -35,7 +35,9 @@ inline std::shared_ptr<TokenSampler> make_http_mtp_sampler(const serve::Sampling
 }
 struct MtpConstraintRow {};
 struct HttpConstraintRequests {
+    bool fail_next = false;
     std::shared_ptr<MtpConstraintRow> make(const std::shared_ptr<const serve::ConstraintSpec>& s) {
+        if (std::exchange(fail_next, false)) throw std::runtime_error("constraint setup failure");
         events.push_back(s ? "constraint:on" : "constraint:off"); return s ? std::make_shared<MtpConstraintRow>() : nullptr;
     }
 };
@@ -82,6 +84,7 @@ struct MtpBatchRunner {
     strix::serve::QueuedPrefixProtection::Binding queue_protection_binding() { return {}; }
     bool session_run=true, memory_refusal=false, check_mutex=false, completed=true, empty_error=false, unknown_error=false;
     bool abandon_error=false;
+    bool recover_step_error=false;
     bool stop_when_empty=true;
     int fault=0;
     serve::GenerationQueue& queue;
@@ -92,6 +95,8 @@ struct MtpBatchRunner {
     std::size_t slots() const {return physical.size();}
     std::size_t active() const {return std::count_if(physical.begin(),physical.end(),[](const auto& s){return s.active;});}
     bool has_free_slot() const {return active()<slots();}
+    bool http_can_admit() const {return has_free_slot() || active()==0;}
+    bool http_named_available() const {return session_run;}
     void add_slot(bool q) {
         events.push_back(std::string("grow:")+(q?"queued":"spare"));
         if(fault==1)throw std::runtime_error("growth failure");
@@ -144,6 +149,13 @@ struct MtpBatchRunner {
     void fail_requests(const std::string& e) {
         events.push_back("fail_requests:"+e);
         for(auto& s:physical)if(s.request.on_finish) {s.result.finish="execution_failure";s.result.error=e;s.request.on_finish(s.result);s.request.on_finish={};}
+    }
+    void recover_http_step(std::exception_ptr error) {
+        if (!recover_step_error) std::rethrow_exception(error);
+        try { std::rethrow_exception(error); }
+        catch (const std::exception& e) { fail_requests(e.what()); }
+        abandon();
+        fault = 0;
     }
     void abandon() {
         events.push_back("abandon");
@@ -501,6 +513,44 @@ static void owner_failure_texts() {
         CHECK(queue.snapshot().running==0 && queue.snapshot().queued==0 && available(runner.mutex));
     }
 }
+static void request_failure_keeps_serving(bool fail_prepare) {
+    events.clear();
+    stop = false;
+    serve::GenerationQueue queue;
+    Options options;
+    HttpConstraintRequests constraints;
+    constraints.fail_next = fail_prepare;
+    Probe probe;
+    bool probing = true, samples = true;
+    std::atomic<bool> failed{false};
+    MtpBatchRunner runner(queue);
+    runner.fault = fail_prepare ? 0 : 4;
+    runner.recover_step_error = true;
+    runner.stop_when_empty = false;
+#include "current_binding.inc"
+    serve::ApiConfig config;
+    config.model_id = "qwen-owner-host";
+    config.timed_completion_envelope = true;
+    serve::ApiService api(config, serve::ApiTokenizerBinding(std::make_shared<ByteTokenizer>()), queue, 64, true);
+    serve::HttpRequest request;
+    request.method = "POST";
+    request.path = "/v1/completions";
+    request.body = R"({"prompt":"A","max_tokens":1})";
+    auto run = std::async(std::launch::async, [&] {
+        try { owner.run(); }
+        catch (...) { queue.shutdown(); throw; }
+    });
+    Writer first, second;
+    try {
+        api.handle(request, first);
+        api.handle(request, second);
+    } catch (...) { queue.shutdown(); throw; }
+    queue.shutdown();
+    run.get();
+    CHECK(first.status == 500 && first.body.find(fail_prepare ? "constraint setup failure" : "step failure") != std::string::npos);
+    CHECK(second.status == 200 && !failed);
+    CHECK(queue.snapshot().running == 0 && queue.snapshot().queued == 0 && available(runner.mutex));
+}
 #endif
 }
 #ifndef QWEN_ENTRY
@@ -585,6 +635,8 @@ int main(int argc,char** argv) try {
         strix::decode_cli::reserved_failure_cleanup(false);
         strix::decode_cli::reserved_failure_cleanup(true);
         strix::decode_cli::owner_failure_texts();
+        strix::decode_cli::request_failure_keeps_serving(false);
+        strix::decode_cli::request_failure_keeps_serving(true);
         for(unsigned i=0;i<3;++i)(void)strix::decode_cli::http_scenario(i);
 #endif
         std::cout<<"Qwen native-control host checks passed\n";

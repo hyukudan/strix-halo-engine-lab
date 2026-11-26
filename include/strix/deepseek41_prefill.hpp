@@ -173,6 +173,20 @@ struct PrefillLayerTrace {
     std::vector<float> tail;                 // the last quality_head_rows stream rows after the layer
 };
 
+// The composition scored by gate v2 D1. Its component switches remain independent for explicit experiments.
+inline void apply_d1_prefill(PrefillOptions& o) {
+    o.fast_attention = true;
+    o.fast_attention_flash = true;
+    o.fast_dense = true;
+    o.fast_moe = true;
+    o.fast_engram = true;
+    o.fast_shared = true;
+    o.fast_moe_f16 = true;
+    o.fast_i4 = 0;
+    o.decoder_replay_rows = 0;
+    o.decoder_replay_override = true;
+}
+
 struct PrefillResult {
     std::vector<float> teacher_logits; // quality_head_rows x vocabulary; empty in normal operation
     std::vector<PrefillLayerTrace> trace; // options.trace
@@ -322,6 +336,8 @@ public:
     void apply_levers();
     // The whole prompt from position 0 (a fresh sequence).
     PrefillResult run(std::span<const std::uint32_t> tokens);
+    // A fresh, complete request on both ranks, with no subsequent extend or cache reuse.
+    PrefillResult run_full_prompt(std::span<const std::uint32_t> tokens);
     // The next piece of the same sequence: tokens at positions [rows so far, + tokens.size()), reading the attention
     // state (rings, compressed KV and index keys, ratio-2 carries) and the Engram history the earlier runs left. The rows
     // so far must be a multiple of window_rows. Every row and the final state equal those of one run of the whole prompt.

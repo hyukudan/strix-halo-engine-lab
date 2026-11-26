@@ -18,10 +18,10 @@ inline constexpr Lever table[] = {
      .native_option = true, .provisional = {false, true, false}, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = "moe_route_prune", .env = "STRIX_QPF2K_MOE_ROUTE_PRUNE", .option = "--prefill-moe-route-prune",
      .value = {"", "", "", "cap9"}, .builtin = "off",
-     .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {false, true, false, true},
+     .kind = Kind::bit_changing, .ready = {true, false, true, true}, .runnable = {false, true, false, true},
      .target = "rel<f>[n] | topp<f>[n] | cap<k>[n]", .off = "off",
      .source = "RoutePrune: cap9 keeps the 9 heaviest routes of each row; changes logits. "
-               "Automatic TURBO selection requires qualification of the admitted TURBO composition and a matching workload speed receipt", .identity = {{{"off", "v1"}, {"rel0.02", "route-prune-v1"}, {"cap9", "route-prune-v1"}}}},
+               "TURBO applies it only where a workload speed receipt over FAST covers the regime (ladder_rows: gfx1151 prefill bands); quality: composite at 8K KL 0.00528, top-1 0.9707, dNLL +0.0050 vs EXACT", .identity = {{{"off", "v1"}, {"rel0.02", "route-prune-v1"}, {"cap9", "route-prune-v1"}}}},
     {.name = "gdn_fp16_chunk", .env = "STRIX_QPF2K_GDN_FP16_CHUNK", .option = "--gdn-fp16-chunk",
      .value = {"", "1", ""}, .builtin = "0",
      .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {false, true, false},
@@ -116,6 +116,21 @@ inline constexpr ::strix::profile::RegimeGate fast_regimes[] = {
     {"gdn_fp16_chunk", "1", 1, 8192, "gated in the same FAST bundle (identity fp16-v1+hcout16+gdnchunk16+qsab1536)"},
 };
 
+// Receipts of the cap9 TURBO rows (eng_land Q-CAP, binary 88ce20962408081f, p8192, same ticket, FAST vs FAST+cap9):
+// 4K 2107.1 -> 2047.1 ms; 8K 4020.9 (3 valid) -> 3919.3 ms (4/4 valid), +2.6 %; 32K 16140.4 -> 15846.1 ms, +1.9 %.
+// Confirmed on main ca2de6ae8 (bin 12ea00ce): FAST+cap9 3937.4 ms (2/2 valid), record FAST 4041.2 ms. Quality of the
+// composite vs EXACT at 8K: KL 0.00528, top-1 0.9707, dNLL +0.0050. The 4096-8192 band takes the 8K ratio (the 4K
+// ratio, 2107.1 / 2047.1 = 1.029, is above it).
+inline constexpr double kCap9Speedup8k = 4020.9 / 3919.3;
+inline constexpr double kCap9Speedup32k = 16140.4 / 15846.1;
+inline constexpr double kCap9Noise = 0.01;
+inline constexpr std::string_view kCap9Receipt8k =
+    "eng_land Q-CAP 11-24 bin 88ce20962408081f p8192 FAST 4020.9 ms -> cap9 3919.3 ms (+2.6 %, 4/4 valid); "
+    "main ca2de6ae8 re-measure cap9 3937.4 ms; quality vs EXACT 8K KL 0.00528 top-1 0.9707 dNLL +0.0050";
+inline constexpr std::string_view kCap9Receipt32k =
+    "eng_land Q-CAP 11-24 bin 88ce20962408081f 32K FAST 16140.4 ms -> cap9 15846.1 ms (+1.9 %); "
+    "quality measured at 8K (KL 0.00528 top-1 0.9707 dNLL +0.0050)";
+
 // Ladder rows of this table (resolve() always reads them): workload speed receipts for automatic profile cells, and the
 // incumbent grants of the cells the resolver ran before the ladder rule (inside fast_regimes they are qualified, outside
 // provisional, as before). Quality gates above also apply.
@@ -133,4 +148,13 @@ inline constexpr ::strix::profile::LadderRow ladder_rows[] = {
     ::strix::profile::incumbent_cell("index_proj_wmma", "1", Name::turbo, ::strix::profile::kProvisionalBeforeLadder, "v1"),
     ::strix::profile::incumbent_cell("index_score_wmma", "1", Name::turbo, ::strix::profile::kProvisionalBeforeLadder, "v1"),
     ::strix::profile::incumbent_cell("ple_rows_f16", "1", Name::turbo, ::strix::profile::kProvisionalBeforeLadder, "v1"),
+    // TURBO cap9 timing receipts (band receipts: bound per run to its own FAST reference by bind_band_receipts, so the
+    // row decides only on a known execution, the declared lever chain, gfx1151 prefill and the band). Update the
+    // numbers here (ms FAST over cap9 gives speedup = fast / cap9); the receipt text names the evidence.
+    {.lever = "moe_route_prune", .value = "cap9", .tier = Name::turbo, .phase = ::strix::profile::Phase::prefill,
+     .device = "gfx1151", .min_context = 4096, .max_context = 8192, .min_lanes = 1, .max_lanes = 1,
+     .speedup = kCap9Speedup8k, .noise = kCap9Noise, .receipt = kCap9Receipt8k, .band_bound = true},
+    {.lever = "moe_route_prune", .value = "cap9", .tier = Name::turbo, .phase = ::strix::profile::Phase::prefill,
+     .device = "gfx1151", .min_context = 8193, .max_context = 32768, .min_lanes = 1, .max_lanes = 1,
+     .speedup = kCap9Speedup32k, .noise = kCap9Noise, .receipt = kCap9Receipt32k, .band_bound = true},
 };

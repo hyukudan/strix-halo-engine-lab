@@ -21,6 +21,7 @@ import urllib.request
 
 # Path-based importlib loaders do not add this module directory to sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import campaign
 import interface
 import nemotron
 from hash_cache import ModelHashes
@@ -243,6 +244,10 @@ def precheck():
     return problems, hw
 
 
+def deepseek_public():
+    return ENGINE == 'deepseek-pair' and os.environ.get('BENCH_SELECTED_PROFILE') in interface.DEEPSEEK_CAMPAIGN_TIERS
+
+
 def inventory():
     problems, hw = precheck()
     if problems:
@@ -260,6 +265,12 @@ def inventory():
             m = re.match(r'(STRIX_[A-Z0-9_]+|CMAKE_HIP_ARCHITECTURES|CMAKE_CUDA_ARCHITECTURES|CMAKE_BUILD_TYPE):[^=]+=(.*)', line)
             if m and re.fullmatch(r'[A-Za-z0-9_+.,;-]*', m.group(2)):
                 options[m.group(1)] = m.group(2)
+    if ENGINE == 'deepseek-pair':
+        build_info = BIN / 'share/strix/build-info.json'
+        if build_info.is_file():
+            hw['build_info'] = read(build_info)
+        driver = capture(['modinfo', '-F', 'version', 'amdgpu'])
+        hw['amdgpu_version'] = driver if re.fullmatch(r'[A-Za-z0-9_.+-]+', driver) else None
     return {'repo_commit': commit, 'tracked_dirty': dirty, 'binary_sha256s': binary_files,
             'model_files': models, 'models_verified': os.environ.get('BENCH_VERIFY_MODELS', 'cached') != 'skip',
             'build_options': options, 'hardware': hw}
@@ -275,8 +286,11 @@ def model_inventory(mode=None):
         pin = PINS.get(p.name)
         if pin and h is not None and (h != pin[1] or (pin[0] is not None and size != pin[0])):
             raise ValueError('published model pin differs: ' + p.name)
-        models.append({'role': role, 'name': p.name, 'bytes': size, 'sha256': h,
-                       'published_sha256': pin[1] if pin else None})
+        entry = {'role': role, 'name': p.name, 'bytes': size, 'sha256': h,
+                 'published_sha256': pin[1] if pin else None}
+        if ENGINE == 'deepseek-pair':
+            entry['asset_path'] = p.relative_to(MODELS).as_posix()
+        models.append(entry)
     cache.save()
     return models
 
@@ -287,11 +301,15 @@ def prompt_texts():
 
 def prompts(out):
     texts = prompt_texts()
+    categories = {row['id']: row['category'] for row in interface.prompt_set('kit', KIT)} if deepseek_public() else {}
     result = []
     def save(name, ids, construction):
         (out / (name + '.ids')).write_text(','.join(map(str, ids)) + '\n', encoding='ascii')
         (out / (name + '.u32')).write_bytes(struct.pack('<' + 'I' * len(ids), *ids))
-        result.append({'id': name, 'tokens': len(ids), 'sha256': id_hash(ids), 'construction': construction})
+        entry = {'id': name, 'tokens': len(ids), 'sha256': id_hash(ids), 'construction': construction}
+        if categories and name in texts:
+            entry.update(category=categories[name], text_sha256=sha(out / (name + '.txt')))
+        result.append(entry)
     contexts = list(map(int, os.environ.get('BENCH_CONTEXTS', '1024').split()))
     for name, text in texts.items():
         path = out / (name + '.txt')
@@ -574,7 +592,8 @@ def ingest_batch(out, manifest, log):
             if row['warmup']: continue
             if ids is not None and row['mode']!='ttft' and len(ids)!=row['generation']: raise ValueError('generation length differs')
             stats([value])
-            f.write(json.dumps(dict(prompt_id=row['prompt_id'],mode=row['mode'],generate_length=row['generation'],
+            extra = {'round': row['round']} if 'round' in row else {}
+            f.write(json.dumps(dict(**extra, prompt_id=row['prompt_id'],mode=row['mode'],generate_length=row['generation'],
                                    actual_tokens=len(ids) if ids is not None else row['generation'],token_ids_sha256=id_hash(ids) if ids is not None else None,engine_digest=digest,values=[value],
                                    unit='s' if row['mode']=='ttft' else 'tok/s',log=log.name, timing_scope='native'))+'\n')
 
@@ -671,7 +690,7 @@ def record_effective(out, label, local, peer, model, peer_model, binary, peer_bi
     path=out/'effective-environment.json'
     env=read(path) if path.exists() else {}
     env[label]=public(a['environment'])
-    if ENGINE=='deepseek-pair' and label.startswith('decode-'):
+    if ENGINE=='deepseek-pair' and label.startswith('decode-') and not deepseek_public():
         # Kit setting added to the resolved rank environment for the DeepSeek decode app (lib/batch.sh).
         env[label]['STRIX_DS41_DSPARK_WINDOW']='controller'
     dump(path,env)
@@ -987,6 +1006,67 @@ def attach_census(out, trace, args):
         report(out / 'results.json')
 
 
+DEEPSEEK_GROUPS = {
+    'chat': ('chat', 'chat-es', 'json', 'math'),
+    'code': ('code', 'sql'),
+    'prose': ('prose', 'summary'),
+}
+
+
+def campaign_command(out, label, rank, roots, argv):
+    def public_arg(arg):
+        for root, marker in sorted(zip(roots, ('BIN_DIR', 'MODEL_DIR', 'RUN_DIR')),
+                                   key=lambda pair: len(pair[0]), reverse=True):
+            normalized = root.rstrip('/')
+            pattern = r'(^|[=:])' + re.escape(normalized) + r'(?=/|$)'
+            arg = re.sub(pattern, lambda match: match[1] + '<' + marker + '>', arg)
+        # Preserve path suffixes under a known root, and redact other deployment values.
+        return arg if re.fullmatch(r'(?:[A-Za-z0-9_]+=|auto:)?<(?:BIN|MODEL|RUN)_DIR>(?:/[A-Za-z0-9_./-]+)?', arg) else sanitize(arg)
+
+    path = out / 'commands.json'
+    commands = read(path) if path.is_file() else []
+    commands.append(dict(job=label, rank=rank, argv=list(map(public_arg, argv))))
+    dump(path, commands)
+
+
+def attach_deepseek_campaign(out, data):
+    commands = out / 'commands.json'
+    grouped = []
+    for name, members in DEEPSEEK_GROUPS.items():
+        for mode in ('greedy', 'spec'):
+            values = [sample for row in data['measurements'] if row['prompt_id'] in members and row['mode'] == mode
+                      for sample in row['samples']]
+            if values:
+                grouped.append(dict(group=name, mode=mode, unit='tok/s', **stats(values)))
+    profile = data['params']['profile']
+    data['public_campaign'] = dict(
+        issue=116, requested_tier=profile, native_tier=data['params']['native_tier'],
+        groups=DEEPSEEK_GROUPS, group_measurements=grouped,
+        decode_policy='fixed 256 IDs including the prefill argmax; time the subsequent 255; no EOS stop',
+        order='rounds 1/3 greedy then spec, round 2 spec then greedy; rotate prompts by round; one warmup per prompt and arm',
+        prefill_policy='1024, 8192, 32768 rows; first TTFT per length is warmup; remaining three enter median',
+        commands=read(commands) if commands.is_file() else [],
+        raw_samples='samples.jsonl', native_manifests=sorted(p.name for p in out.glob('*.manifest.json')),
+    )
+    if data['status'] == 'complete':
+        expected = {(p, mode) for members in DEEPSEEK_GROUPS.values() for p in members for mode in ('greedy', 'spec')}
+        expected.update((f'prefill-{length}', 'ttft') for length in (1024, 8192, 32768))
+        rows = data['measurements']
+        if (len(rows) != len(expected) or {(m['prompt_id'], m['mode']) for m in rows} != expected
+                or any(m['repeat_count'] != 3 for m in rows) or len(data['public_campaign']['commands']) != 18):
+            raise ValueError('incomplete issue 116 campaign')
+
+
+def require_deepseek_provenance(data):
+    if data['tracked_dirty'] or not data['models_verified'] or data['peer_inventory']['tracked_dirty']:
+        raise ValueError('publication candidates require clean sources and verified assets on both ranks')
+    for hardware in (data['hardware'], data['peer_hardware']):
+        build = hardware.get('build_info', {})
+        if (build.get('git_sha') != data['repo_commit'] or build.get('dirty') is not False
+                or not build.get('hip_compiler_version') or not hardware.get('rocm_version')):
+            raise ValueError('publication candidates require matching clean build metadata and ROCm on both ranks')
+
+
 def finalize(out, write_refs=False, status='complete'):
     data = read(out / 'identity.json')
     data['wall_s'] = max(0, time.time() - data.pop('start_epoch', time.time()))
@@ -1037,6 +1117,8 @@ def finalize(out, write_refs=False, status='complete'):
     if 'exactness' not in data.get('params', {'only':['exactness']}).get('only', []):
         data['exactness'] = []
         data.pop('digest_checks', None)
+    if deepseek_public():
+        attach_deepseek_campaign(out, data)
     data['logs'] = [p.name for p in sorted(out.glob('*.log'))]
     # Plain and speculative modes must agree within this run, independently of published refs.
     for e in data['exactness']:
@@ -1057,10 +1139,13 @@ def finalize(out, write_refs=False, status='complete'):
             raise ValueError('cannot write reference candidates without full token IDs')
         if status != 'complete' or data['status'] != status or any(e['verdict'] == 'MISMATCH' for e in data['exactness']):
             raise ValueError('failed/unstable runs cannot write reference candidates')
-        dump(out / 'candidate-refs.json', {'schema_version': 1, 'engine': data['engine'],
-                                          'candidate_only': True, 'identity': data['identity'],
-                                          'reference_key': data['reference_key'],
-                                          'identities': {data['reference_sha256']: candidates}})
+        reference = {'schema_version': 1, 'engine': data['engine'], 'candidate_only': True,
+                     'identity': data['identity'], 'reference_key': data['reference_key'],
+                     'identities': {data['reference_sha256']: candidates}}
+        if deepseek_public():
+            require_deepseek_provenance(data)
+            reference['provenance'] = {key: data[key] for key in ('repo_commit', 'hardware', 'peer_hardware')}
+        dump(out / 'candidate-refs.json', reference)
 
 
 def validate(d):
@@ -1126,9 +1211,10 @@ def report(path):
     lines = ['# Engine benchmark', '', f"Engine: `{d['engine']}` | kit {d['kit_version']} | commit `{d['repo_commit']}`",
              '', f"Identity: `{d['identity_sha256']}` | reference key: `{d.get('reference_sha256', 'unrecorded')}` | status: **{d['status']}**", '',
              'WARNING: model content hashes were skipped; models_verified: false.' if not d.get('models_verified', True) else 'Model hashes verified (full read or metadata cache).', '',
-             'README values are context, not qualification of a different workload or identity.', '',
+             ('Issue 116 fixed-prompt campaign. This run establishes a new baseline.' if 'public_campaign' in d else
+              'README values are context, not qualification of a different workload or identity.'), '',
              f"Prompt set: {d.get('prompt_set', {}).get('name', 'legacy')} ({d.get('prompt_set', {}).get('sha256', 'unrecorded')}).",
-             ('DeepSeek decode uses native timing; same method, different prompts (workload differs). Optional serve uses HTTP end-to-end timing.' if d['engine']=='deepseek-pair' else
+             ('DeepSeek decode uses native timing.' if 'public_campaign' in d else 'DeepSeek decode uses native timing; same method, different prompts (workload differs). Optional serve uses HTTP end-to-end timing.' if d['engine']=='deepseek-pair' else
               'same method, different prompts' if d.get('prompt_set', {}).get('name') == 'kit' else 'Verify workload equality before comparing README rows.'),
              f"Model loads per rank: {d.get('model_loads', 'unrecorded')}; total wall: {d.get('wall_s', 'unrecorded')} s.", '',
              f"CPU: {d['hardware'].get('cpu_model')} | GPU: {', '.join(d['hardware'].get('gpu_names', []))}",
@@ -1136,7 +1222,7 @@ def report(path):
              '| Prompt / mode | README | Measured median (min-max) | Ratio measured/README | Check |',
              '|---|---:|---:|---:|---|']
     for m in d['measurements']:
-        b = None if m.get('timing_scope')=='http-end-to-end' and not m['prompt_id'].startswith('http-c') else baseline(d['engine'], m['prompt_id'], m['mode'], d.get('params', {}).get('profile'))
+        b = None if 'public_campaign' in d or m.get('timing_scope')=='http-end-to-end' and not m['prompt_id'].startswith('http-c') else baseline(d['engine'], m['prompt_id'], m['mode'], d.get('params', {}).get('profile'))
         expected = f"{b['value']:g} {b['unit']}" if b else 'unpublished'
         if b and 'pairs_faster' in b and 'pairs' in b:
             expected += f" (ABBA {b['pairs_faster']}/{b['pairs']})"
@@ -1147,6 +1233,11 @@ def report(path):
             check += ' (workload differs/unspecified)'
         scope = ' [HTTP end-to-end]' if m.get('timing_scope')=='http-end-to-end' else ''
         lines.append(f"| {m['prompt_id']} / {m['mode']}{scope} (n={m['repeat_count']}) | {expected} | {m['median']:.3f} ({m['min']:.3f}-{m['max']:.3f}) {m['unit']} | {f'{ratio:.3f}' if ratio else '--'} | {check} |")
+    if 'public_campaign' in d:
+        lines += ['', '| Group / mode | Pooled median (min-max) | Samples |', '|---|---:|---:|']
+        for group in d['public_campaign']['group_measurements']:
+            lines.append(f"| {group['group']} / {group['mode']} | {group['median']:.3f} "
+                         f"({group['min']:.3f}-{group['max']:.3f}) {group['unit']} | {group['repeat_count']} |")
     lines += ['', '| Prompt / mode / requested length | Exactness |', '|---|---|']
     for e in d['exactness']:
         witness = f" (draft witness: {e['draft_witness']['status']}, accepted {e['draft_witness']['accepted']})" if 'draft_witness' in e else ''
@@ -1280,6 +1371,8 @@ def main(args):
             p[key] = 'default' if value == default else 'configured'
         p['out'] = 'run-directory'
         print(json.dumps(p)); return 0
+    if action == 'campaign':
+        return campaign.main(args[1:], KIT, id_hash, sha)
     if action == 'resolve':
         interface.resolve(args[1:], KIT); return 0
     if action == 'list':
@@ -1314,6 +1407,8 @@ def main(args):
         print('Prerequisites OK' if not problems else '\n'.join('MISSING: ' + x for x in problems))
         print(json.dumps({'engine': ENGINE, 'ok': not problems, 'problems': problems, 'hardware': hw}))
         return int(bool(problems))
+    elif action == 'campaign-command':
+        campaign_command(Path(args[1]), args[2], int(args[3]), args[4:7], args[7:])
     elif action == 'inventory':
         print(json.dumps(inventory()))
     elif action == 'compare':

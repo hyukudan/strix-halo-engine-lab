@@ -23,9 +23,12 @@
 #endif
 #if defined(STRIX_PARITY_DS41)
 #include "strix/deepseek41_pair_defaults.hpp"
+#include "strix/deepseek41_prefill.hpp"
 #endif
 #if defined(STRIX_PARITY_GEMMA4)
 #include "gemma4/engine/runtime.hpp"
+#include <chrono>
+#include <fstream>
 #endif
 
 namespace {
@@ -119,8 +122,44 @@ void glm() {
         check(cli.mtp_spec.value == expected && server.mtp_spec.value == expected &&
               cli.mtp.value == expected && server.mtp.value == expected && server.prefill == "gemv",
               "GLM complete/missing assets and opt-out select intended MTP/prefill route");
+        const std::string_view expected_wmma = "0";  // no device or prompt known
+        for (const auto* lever : {"pf_wmma", "mla_wmma", "kda_wmma", "attn_wmma"}) {
+            const auto* cli_cell = cli.product->find(lever);
+            const auto* serve_cell = server.product->find(lever);
+            check(cli_cell && serve_cell && cli_cell->value == expected_wmma && serve_cell->value == expected_wmma,
+                  "GLM rank and serve apply the same WMMA route for " + std::string(profile) + ": " + lever);
+        }
         gate("glm", values(sp::from_lines(rd::print(cli))), values(sp::from_lines(rd::print(server))), allowed);
     }
+    // The measured 8K/32K pair executions and each unmatched axis use the same product resolver.
+    const std::vector<std::string> turbo{"--world", "2", "--profile", "turbo"};
+    const auto measured_cli_args = rd::serve_request_args(turbo, true);
+    rd::ModelFacts complete;
+    complete.mtp_present = complete.mtp_complete = true;
+    const auto verify = [&](const rd::PrefillWork& work, const rd::EnvGet& env, bool on) {
+        const auto cli = rd::resolve(rd::scan(measured_cli_args), env, complete, work);
+        const auto serve = rd::resolve_serve(turbo, true, env, complete, work);
+        for (const auto* lever : {"pf_wmma", "mla_wmma", "kda_wmma", "attn_wmma"}) {
+            const auto* a = cli.product->find(lever);
+            const auto* b = serve.product->find(lever);
+            check(a && b && a->value == (on ? "1" : "0") && b->value == a->value,
+                  "GLM measured/fallback arithmetic agrees for " + std::string(lever));
+        }
+        gate("glm", values(sp::from_lines(rd::print(cli))), values(sp::from_lines(rd::print(serve))), allowed);
+    };
+    verify({true, 8108, 36864, 8192, 1, 64}, none, true);
+    verify({true, 31258, 36864, 8192, 1, 64}, none, true);
+    verify({false, 8108, 36864, 8192, 1, 64}, none, false);
+    verify({true, 4096, 36864, 8192, 1, 64}, none, false);
+    verify({true, 8109, 36864, 8192, 1, 64}, none, false);
+    verify({true, 8108, 36864, 4096, 1, 64}, none, false);
+    verify({true, 8108, 36864, 8192, 2, 64}, none, false);
+    verify({true, 8108, 36864, 8192, 1, 64}, [](const char* key) -> const char* {
+        return std::string_view(key) == "STRIX_GLM_PF_KDA_WMMA" ? "0" : nullptr;
+    }, false);
+    verify({true, 8108, 36864, 8192, 1, 64}, [](const char* key) -> const char* {
+        return std::string_view(key) == "STRIX_GLM_PF_ATTN_WMMA_T" ? "32" : nullptr;
+    }, false);
     // Sampled MTP (row serve_sampled_mtp): both entry points resolve and admit it in rd::resolve, so the same request
     // gives the same route, the same receipt line and the same refusals (the command line reports it inapplicable).
     for (const char* profile : {"exact", "fast", "turbo", "quality"})
@@ -254,8 +293,44 @@ void ds41() {
         {"arg:--prefill-path", "the server prefills prompts on the device batch path; the CLI's prompt goes through its decode windows"},
         {"arg:--prefill-rows", "row budget of the server's device prefill path (auto)"},
     };
+    namespace pr = strix::profile;
     for (const char* profile : {"exact", "fast", "turbo", "quality"})
         gate(std::string("ds41+") + profile, config(pd::App::rank, profile), config(pd::App::serve, profile), allowed);
+    const char* marker = pr::environment({}, pr::kPresetEnv);
+    const auto previous = marker ? std::optional<std::string>(marker) : std::nullopt;
+    for (const char* profile : {"exact", "fast", "turbo"}) {
+        const auto native = config(pd::App::rank, profile);
+        check(pr::export_environment(pr::kPresetEnv, "1"), "enable DeepSeek model preset marker");
+        const auto preset = config(pd::App::serve, profile);
+        check(pr::export_environment(pr::kPresetEnv, previous ? previous->c_str() : ""), "restore model preset marker");
+        gate(std::string("ds41+preset+") + profile, native, preset, allowed);
+        check(preset.at("arg:--slots") == "8", "ds41: serve uses the resolved eight slots");
+    }
+    namespace ds = strix::deepseek41;
+    ds::PrefillOptions measured;
+    measured.world = 2;
+    measured.max_positions = 8192;
+    measured.moe_chunk_rows = 4096;
+    measured.row_split = false;
+    measured.cone = false;
+    measured.quality_head_rows = 64;
+    const auto request = [&](pd::App app, const char* rank, std::uint64_t prompt) {
+        const auto startup = pd::resolve(app, {model, "--rank", rank,
+            "--transport", app == pd::App::prefill ? "usb4-auto" : "usb4auto", "--profile", "turbo"},
+            [](const char*) -> const char* { return nullptr; }, probe, pd::Build{true});
+        const auto result = pd::resolve_prefill_profile(*startup.profile, measured, prompt,
+                                                       "gfx1151|AMD Radeon 8060S Graphics|fixture", true).value_or(*startup.profile);
+        return sp::Config{{"d1_prefill", result.find("d1_prefill")->value},
+                          {"fingerprint", pr::hex_identity(result.fingerprint())}};
+    };
+    for (const auto prompt : {8128U, 8193U, 32768U}) {
+        const auto cli = request(pd::App::prefill, "0", prompt);
+        const auto server = request(pd::App::serve, "1", prompt);
+        gate("ds41+prompt+" + std::to_string(prompt), cli, server, {});
+        check(cli.at("d1_prefill") == (prompt == 8128U ? "1" : "0"),
+              "ds41: both ranks use D1 only for a measured prompt");
+    }
+
 }
 #endif
 
@@ -301,6 +376,45 @@ void gemma() {
         {"streams", "the server decodes up to STRIX_G4_SERVE_SLOTS requests together"},
     };
     gate("gemma", cli, config(served.options), allowed);
+
+    // Explicitly match concurrency so the test compares only model/tier settings.
+    for (const std::string tier : {"exact", "fast", "turbo"}) {
+        std::vector<std::string> tier_words = words;
+        tier_words.insert(tier_words.end(), {"--profile", tier, "--streams", "1", "--draft", "off"});
+        std::vector<char*> tier_argv;
+        for (auto& word : tier_words) tier_argv.push_back(word.data());
+        const auto native = e::parse_options(static_cast<int>(tier_argv.size()), tier_argv.data());
+        const auto server = e::prepare_serve(static_cast<int>(tier_argv.size()), tier_argv.data());
+        check(!server.exit_code, "gemma: serve accepts " + tier);
+        check(native.profile.name == strix::profile::parse(tier), "gemma: native tier survives parsing");
+        const auto* identity = native.profile.find("decode_identity");
+        check(identity && identity->value == (tier == "exact" ? "g4-v1" : "g4-a8-v1"),
+              "gemma: " + tier + " resolves its decode identity");
+        const auto* attention = native.profile.find("decode_attention");
+        check(attention && attention->value == "exact", "gemma: " + tier + " keeps qualified exact decode attention");
+        gate("gemma/" + tier, config(native), config(server.options), {});
+    }
+
+    namespace fs = std::filesystem;
+    const auto model = fs::temp_directory_path() /
+        ("strix-gemma4-draft-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto drafter = model / "drafter-mtp";
+    fs::create_directories(drafter);
+    const auto expect_drafter = [&](const std::string& tier, const fs::path& model_path, const fs::path& expected) {
+        std::vector<std::string> args{"x", "--model", model_path.string(), "--rope-tables", "rope", "--profile", tier};
+        std::vector<char*> pointers;
+        for (auto& arg : args) pointers.push_back(arg.data());
+        const auto options = e::parse_options(static_cast<int>(pointers.size()), pointers.data());
+        const auto server = e::prepare_serve(static_cast<int>(pointers.size()), pointers.data());
+        check(!server.exit_code && options.draft_mtp == expected && server.options.draft_mtp == expected,
+              "gemma " + tier + ": discover only a drafter with its weights file");
+    };
+    for (const auto* tier : {"exact", "fast", "turbo"}) expect_drafter(tier, model / "target.gguf", {});
+    std::ofstream(drafter / "model.safetensors").put('x');
+    for (const auto* tier : {"exact", "fast", "turbo"}) expect_drafter(tier, model / "target.gguf", drafter);
+    fs::remove(drafter / "model.safetensors");
+    fs::remove(drafter);
+    fs::remove(model);
 }
 #endif
 

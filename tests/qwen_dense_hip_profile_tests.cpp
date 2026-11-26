@@ -1,5 +1,5 @@
 // Host test of the Qwen 27B dense HIP product word (include/strix/profiles/qwen_dense_hip.hpp): identity of the
-// default column, pending FAST cell, explicit options win, --allow-pending applies, exact-window options.
+// default column, qualified FAST window + layer table, TURBO nests FAST, explicit options win, exact-window options.
 #include "strix/profiles/qwen_dense_hip.hpp"
 
 #include <cstdio>
@@ -48,12 +48,14 @@ int main() {
                 "no word == exact == default fingerprint");
         require(exact.resolution.profile == sp::Name::standard && dflt.resolution.profile == sp::Name::standard,
                 "exact and default are the default column");
-        require(fast.args == user, "fast without allow-pending adds no option");
-        require(fast.resolution.entries.size() == 2U && win(fast, app).status == sp::Status::pending &&
-                    win(fast, app).value == win(exact, app).value,
-                "fast: the wide cell is pending, effective value equals exact");
-        require(win(fast, app).target == "64-row FAST wide windows (dense-q8a8-f16-v1)", "pending target reported");
-        require(!sp::applied(win(fast, app).status), "fast applies no window lever without allow-pending");
+        Args fast_args{opt, "512"};
+        fast_args.insert(fast_args.end(), user.begin(), user.end());
+        require(fast.args == fast_args, "fast puts the qualified 512-row window option in front of the user's arguments");
+        require(fast.resolution.entries.size() == 2U && sp::applied(win(fast, app).status) &&
+                    win(fast, app).value == "512" && win(fast, app).ladder.find("incumbent") != std::string::npos,
+                "fast applies the gated 512-row wide window (grant with its gate and timing receipts)");
+        require(!sp::applied(win(exact, app).status) && win(exact, app).value != "512",
+                "exact keeps the engine's 64-row EXACT windows");
         // The qualified layer table ran before the ladder rule: its incumbent grant keeps it in every regime.
         require(sp::applied(a4(fast).status) && a4(fast).value == "48-63" &&
                     a4(fast).ladder.find("incumbent") != std::string::npos,
@@ -74,7 +76,12 @@ int main() {
         const std::string reference = granted_entry ? granted_entry->ladder_reference : std::string();
         require(reference.starts_with("ladder-arm/v4;"), "Qwen dense HIP reports the reference of the layer table");
         timing.over = reference;
-        engine.ladder = std::span(&timing, 1);
+        // The timing row replaces the layer table's grant only; the window cell keeps its own grant.
+        std::vector<sp::LadderRow> rows;
+        for (const auto& row : hp::engine(app).ladder)
+            if (row.lever != "a4w4_layers") rows.push_back(row);
+        rows.push_back(timing);
+        engine.ladder = rows;
         const auto measured = hp::resolve_args(engine, with_fast, no_env, {sp::Phase::prefill, 8192, 1, "fixture", "fixture-exec"});
         sp::apply(measured.resolution, [&](const char* k, const char* v) { put.emplace_back(k, v); return true; });
         require(put == std::vector<std::pair<std::string, std::string>>{{"STRIX_DENSE_A4W4_LAYERS", "48-63"}},
@@ -88,12 +95,12 @@ int main() {
         // of the user's options, stamped unqualified (main's contract; the route line says it is a benchmark arm).
         Args allow{"--profile", "fast", "--allow-pending"};
         const auto applied = run(app, allow);
-        require(applied.args == Args{opt, "64"}, "fast --allow-pending adds the 64-row option in front");
-        require(win(applied, app).status == sp::Status::unqualified, "allow-pending is stamped unqualified");
+        require(applied.args == Args{opt, "512"}, "fast --allow-pending: the same qualified 512-row option");
+        require(win(applied, app).status == win(fast, app).status, "allow-pending does not restamp a qualified cell");
         const sp::Lookup allow_env = [](const char* key) -> const char* {
             return std::string(key) == std::string(hp::kAllowEnv) ? "1" : nullptr;
         };
-        require(run(app, with_fast, allow_env).args.size() == user.size() + 2U, "allow-pending env applies the cell");
+        require(run(app, with_fast, allow_env).args == fast_args, "allow-pending env: the same FAST arguments");
         // explicit option wins over the word and stays in the user's arguments.
         Args explicit_args{"--profile", "fast", "--allow-pending", opt, "16", "--gen", "8"};
         const auto won = run(app, explicit_args);
@@ -104,16 +111,19 @@ int main() {
         const char* exact_opt = app == hp::App::decode ? "--wide-exact" : "--prefill-exact";
         const auto ex = run(app, Args{"--profile", "fast", "--allow-pending", exact_opt, "64"});
         require(ex.args == Args{exact_opt, "64"}, "exact-window option suppresses the profile window");
+        // TURBO nests FAST on HIP: no HIP TURBO row, every TURBO cell is the FAST cell.
+        Args with_turbo{"--profile", "turbo"};
+        with_turbo.insert(with_turbo.end(), user.begin(), user.end());
+        const auto turbo = run(app, with_turbo);
+        require(turbo.resolution.profile == sp::Name::turbo && turbo.args == fast.args &&
+                    win(turbo, app).value == "512" && a4(turbo).value == "48-63" && sp::applied(a4(turbo).status),
+                "turbo is accepted and runs exactly the FAST levers");
         // another spelling of --profile (not a word) stays for the app.
         require(run(app, Args{"--profile=/tmp/x"}).args == Args{"--profile=/tmp/x"}, "non-word --profile untouched");
     }
     // the decode app does not see the spec spelling and vice versa
     require(win(run(hp::App::decode, Args{"--prefill-rows", "8"}), hp::App::decode).status == sp::Status::builtin,
             "decode engine ignores --prefill-rows");
-    bool refused = false;
-    try { run(hp::App::spec, Args{"--profile", "turbo"}); }
-    catch (const std::exception& e) { refused = std::string_view(e.what()).find("decode_attn8 (FP8 QK/PV)") != std::string_view::npos; }
-    require(refused, "HIP names the unavailable FP8 arm");
     if (failures == 0) std::printf("qwen dense hip profile: PASS\n");
     return failures == 0 ? 0 : 1;
 }

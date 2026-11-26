@@ -3352,7 +3352,8 @@ void set_mla_profile(hipEvent_t* ev6) { g_mla_prof = ev6; }
 // instead of the o-bar selector; absorb / out keep the exact GEMM selector (the image needs absorb v3 or the FAST MLA
 // WMMA GEMM, which stores the same bf16 image of its own sums; else 22/23 = 20/21).
 static unsigned obar_env_version(unsigned heads) {
-    static const bool fused = attn_wmma::enabled();
+    static const bool forced_fused = attn_wmma::configured();
+    const bool fused = forced_fused || wmma_x::profile_enabled;
     static const unsigned keys = attn_wmma::block_keys();
     static const unsigned image = attn_wmma::qt16() ? 2U : 0U;
     if (fused && heads == 32) return (keys == 16 ? 21U : 20U) + image;

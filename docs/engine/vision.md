@@ -67,12 +67,12 @@ prefix cache and the RTX prefill route, and refuse `session_id`. `--vision` need
 `--prefill gemv`; the server refuses to start otherwise.
 
 Status: the adapter, the tool, the server's host half and the pair protocol (on a fake engine) are tested on the
-host against synthetic projector files ([gate status](vision-adapters.md#gate-status)). The device half
-(`Engine::set_embed_rows` in the plain and the MTP prefill, `--embed-rows`, the server main) compiles for gfx1151 and,
-on a pair (2026-11-24, one USB4 cable), the server runs with the real projector file (`mmproj-F16.gguf`): two
-synthetic images were answered correctly, greedy and sampled (red | blue halves; a filled circle beside an outlined
-square; 5-8 s per request). Not run yet: `strix-glm5-rank --embed-rows`, images that span several prefill chunks or
-units, and text-prompt identity against the previous build on the device.
+host against synthetic projector files ([gate status](vision-adapters.md#gate-status)). The device half compiles
+for gfx1151. On the integrated #1281 head (`4d91c55c`), the maintainer ran one image request end to end on a pair
+using the repository's synthetic test projector; this proves the HTTP path runs, not image correctness.
+The reported greedy and fixed-seed sampled text token IDs matched previous main. Real-projector qualification,
+image quality and timing remain pending on this build; earlier contributor results on a prior build do not
+qualify this head.
 
 Cost of the CPU tower: the host reference accumulates in FP64 and is slow by design. On a synthetic tower of width
 1024 with 4 blocks (MLP 4096) and a projector of width 4096, on a 4-thread x86 host: 20.9 s for 1,024 patches (a

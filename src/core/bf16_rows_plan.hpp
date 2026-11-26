@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/dense_linear.hpp"
 #include "core/dense_row_plan.hpp"
 #include "core/f16_tile_gemm.hpp"
 #include "core/gemv_rows.hpp"
@@ -16,8 +17,9 @@ enum class Bf16RowsPath : unsigned char { refused, tight_rows, wmma, fma };
 inline Bf16RowsPath bf16_rows_path(unsigned input_width, unsigned rows, std::span<const Bf16RowProjection> projections,
                                    unsigned max_outputs) noexcept {
     constexpr auto max_elements = std::numeric_limits<std::size_t>::max() / sizeof(float);
+    const auto group_limit = rows <= gemv_rows::max_rows ? dense_linear::kTightGroupMax : kGroupMax;
     if (rows > std::numeric_limits<unsigned>::max() - 128U || rows == 0U || input_width == 0U || input_width % 16U != 0U ||
-        input_width > max_elements / rows || projections.empty() || projections.size() > kGroupMax)
+        input_width > max_elements / rows || projections.empty() || projections.size() > group_limit)
         return Bf16RowsPath::refused;
 
     const bool round_bf16 = projections.front().round_bf16;

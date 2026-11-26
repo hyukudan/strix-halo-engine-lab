@@ -269,8 +269,8 @@ storage) and the eight images of `images`, on one x86 host, CPU only.
 | The real projector file | pending on this build (qualification with a real projector on the command line and the server) |
 | Server host half (`glm5-serve-vision`): file to bridge to interned rows, embed frame lead to follower, both ranks' chunk resolution | pass: identical tokens and row bytes on both ranks for chunks that cut a span; an image's rows travel once |
 | Pair protocol on a fake engine (`strix-glm5-serve-cpu-tests --image-only`): whole prompt, chunks beside a decoding request, MTP, prefill units | pass: the same tokens in every arm, equal call logs on both ranks, no prefix cache entry, `session_id` refused |
-| Device splice into the GLM prefill (`Engine::set_embed_rows` in `prefill` and `prefill_mtp`, `--embed-rows`, `apps/glm_serve_main.cpp`) | compiles for gfx1151; the server path runs on the pair (whole short image prompts); `--embed-rows`, prompts that span chunks or units, and text-prompt identity against the previous build **not run** |
-| Language model answers on images | pass on two synthetic images, greedy and sampled (red \| blue halves: "The left side is red and the right side is blue."; filled circle beside an outlined square: "A solid black filled circle sits on the left, while an unfilled square outline appears on the right.") |
+| Device splice into the GLM prefill (`Engine::set_embed_rows` in `prefill` and `prefill_mtp`, `--embed-rows`, `apps/glm_serve_main.cpp`) | compiles for gfx1151; #1281 maintainer reports a two-node HTTP smoke with the synthetic test projector and matching greedy and fixed-seed sampled text token IDs; native logits/state comparison, CLI image and multi-chunk device qualification remain pending |
+| Language model answers on images | pending on the integrated build: the synthetic projector smoke does not establish image correctness; earlier real-projector results are not qualification of this build |
 
 ## Inkling 2
 
@@ -474,6 +474,4 @@ element) and is allocated in `set_embed_rows`, never inside a prefill.
 
 Status: compiles for gfx1151; on a pair the server path passes a synthetic HTTP smoke (a generated image is admitted,
 its rows reach both ranks and a reply is returned). That smoke does not show image correctness: correctness on real
-images with the real projector file is pending. Identity for text prompts is by construction (no splice: nothing is
-launched or uploaded and no kernel of the text path is changed); the native device comparison (tokens, logits and
-state digest of a text prompt against the previous build) is pending.
+images with the real projector file is pending. The maintainer's [#1281 device report](https://github.com/hyukudan/strix-halo-engine-lab/pull/1281#issuecomment-7163469178) confirms matching greedy and fixed-seed sampled text token IDs against previous main; raw logits and state-digest comparison remain pending.

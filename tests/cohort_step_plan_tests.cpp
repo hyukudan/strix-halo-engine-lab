@@ -39,6 +39,62 @@ void check_row_splits() {
     catch (const std::invalid_argument&) { rejected = true; }
     require(rejected);
 }
+void check_combine_joins() {
+    struct Owner {
+        int id;
+        std::array<bool, 2> pending{};
+    };
+    Owner first{1}, last{2}, joiner{3}, replacement{4};
+    Owner chunk_a{5}, chunk_b{6};
+    std::vector<int> waits;
+    const auto owner = [](Owner* member) -> Owner& { return *member; };
+    const auto wait = [&](Owner& source, std::uint32_t layer) {
+        if (!source.pending.at(layer)) return;
+        waits.push_back(source.id);
+        source.pending[layer] = false;
+    };
+    const auto combine = [&](std::span<Owner* const> primaries, std::span<Owner*> members,
+                             std::uint32_t layer, const std::vector<int>& expected) {
+        waits.clear();
+        strix::join_cohort_combine(primaries, members, layer, owner, wait);
+        require(waits == expected);
+    };
+
+    // A two-client window can bind an individual producer and a chunk primary.
+    // Membership is leased until the combine, then it can change at a boundary.
+    Owner* first_primary[]{&chunk_a};
+    Owner* pair[]{&first, &last};
+    first.pending[0] = true;
+    chunk_a.pending[0] = true;
+    last.pending[1] = true;
+    combine(first_primary, pair, 0, {5, 1});
+    combine(first_primary, pair, 1, {2});
+
+    // Two more clients join the next window. A wide combine waits for both
+    // chunk primaries and any member-local producers on the same layer.
+    Owner* both_primaries[]{&chunk_a, &chunk_b};
+    Owner* four[]{&first, &last, &joiner, &replacement};
+    chunk_a.pending[0] = chunk_b.pending[0] = true;
+    last.pending[0] = replacement.pending[0] = true;
+    combine(both_primaries, four, 0, {5, 6, 2, 4});
+
+    // Two clients leave. Two singleton chunks need no primaries and neither
+    // a departed client nor the old primary can contribute a stale wait.
+    Owner* no_primaries[]{nullptr, nullptr};
+    Owner* survivors[]{&first, &replacement};
+    replacement.pending[0] = true;
+    combine(no_primaries, survivors, 0, {4});
+    combine(no_primaries, survivors, 0, {});
+
+    first.pending[0] = true;
+    replacement.pending[0] = true;
+    bool threw = false;
+    try {
+        strix::join_cohort_combine(std::span<Owner* const>(no_primaries), std::span<Owner*>(survivors), 0,
+            owner, [](Owner&, std::uint32_t) { throw std::runtime_error("wait failed"); });
+    } catch (const std::runtime_error&) { threw = true; }
+    require(threw && first.pending[0] && replacement.pending[0]);
+}
 void check(std::span<const std::uint32_t> rows, std::size_t old_steps, std::size_t new_steps) {
     const auto old_plan = strix::cohort_step_plan(rows, 8U);
     const auto new_plan = strix::cohort_step_plan(rows, 16U);
@@ -66,6 +122,7 @@ void check(std::span<const std::uint32_t> rows, std::size_t old_steps, std::size
 }
 int main(int argc, char* argv[]) {
     check_row_splits();
+    check_combine_joins();
     if (argc > 1) require(strix::cohort_step_rows() == (std::string_view(argv[1]) == "16" ? 16U : 8U));
     check(std::array<std::uint32_t, 8>{2,2,2,2,2,2,2,2}, 2, 1);
     check(std::array<std::uint32_t, 6>{4,4,2,2,2,2}, 2, 1);
@@ -75,5 +132,5 @@ int main(int argc, char* argv[]) {
     check(std::array<std::uint32_t, 0>{}, 0, 0);
     check(std::array<std::uint32_t, 1>{8}, 1, 1);
     require(strix::cohort_step_rows() == 8U || strix::cohort_step_rows() == 16U);
-    std::cout << "PASS: row order, session windows, padding and step counts\n";
+    std::cout << "PASS: row order, session windows, padding, step counts and combine admission\n";
 }

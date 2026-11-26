@@ -185,10 +185,15 @@ and every off switch.
 
 ## Product profiles
 
-`--profile default|fast|quality` (every pair app, same value on both ranks) resolves before the defaults on this page.
-`default` changes nothing on this page. `fast` adds qualified bit-changing options only; today its two rows (FP16
-sparse attention, relaxed MoE epilogue) are pending and not applied. `quality` = `default` (no quality pack). Rows,
-precedence and receipts: [DeepSeek pair product profiles](../../optimizations.md#product-profiles-pair).
+Use the same `--profile exact|fast|turbo` on both ranks. `exact` (also `default`)
+keeps the production arithmetic above. FAST can select the complete D1 prefill composition
+when the actual prompt and paired execution match its gate and timing receipt. The gate
+class through 8,192 tokens passed. The matched timing covers the 8,128-token quality
+runner with tensor-parallel attention, no row split or suffix cone, and a 64-row scoring
+head. Native CLI and HTTP prefill retain their previous arithmetic pending a matched
+quality receipt for their execution. TURBO inherits admitted FAST. Decoder replay and
+IU4 remain pending. Explicit arithmetic switches still opt into experiments. Startup
+inspection reports D1 pending because the prompt is unknown.
 
 ## Transport and USB4 layout (P17.4)
 

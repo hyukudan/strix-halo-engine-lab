@@ -435,6 +435,64 @@ int main(int argc, char** argv) {
                 if (pol == 5 && var >= 2) CHECK(top_ok * 4 >= extra * 3 - 1, "variant %d: fast8 top-1 mostly agrees", var);
             }
         }
+        // The decode CLI's builtin EXACT large route (admit_prefill + prefill) against the windows of 16 rows + commit it
+        // replaced, over the shapes the route is resolved on: prompts shorter than a window, both sides of the 16-row window
+        // and of the chunk (128 here, 2048 on the CLI), several chunks with a short tail; 1 and 2 slots; then a declined
+        // admission (headroom past the device) runs prefill()'s windows bit for bit and leaves no slot behind.
+        {
+            q::EngineOptions po = opt;
+            po.multi_gemv = true;
+            po.prefill_chunk = 128;
+            po.prefill_arith = q::PrefillArith::exact;
+            po.dense_arithmetic = strix::cuda_core::DenseArith::mma3;
+            q::Config pcfg = cfg;
+            pcfg.gdn_value_heads = 16;
+            const std::uint32_t extra = 4;
+            for (const std::uint32_t n : {13U, 16U, 17U, 127U, 129U, 259U}) {
+                std::vector<std::uint32_t> t2(n + extra);
+                for (auto& id : t2) id = rng() % 2048;
+                auto Ref = q::CudaEngine::synthetic(pcfg, pack, po, 7);  // the old CLI: windows of 16 rows + commit, then 1-row decode
+                const auto& c2 = Ref->config();
+                std::vector<float> want((extra + 1) * c2.vocab), got((extra + 1) * c2.vocab);
+                for (std::uint32_t p = 0; p < n; p += 16) {
+                    const std::uint32_t r = std::min<std::uint32_t>(16, n - p);
+                    const auto wo = Ref->forward_rows(&t2[p], r, p + r == n ? q::LogitRows::last : q::LogitRows::none);
+                    if (p + r == n) Ref->read_logits(wo, 0, want.data());
+                    Ref->commit(r);
+                }
+                for (std::uint32_t i = 0; i < extra; ++i) {
+                    const auto wo = Ref->forward_rows(&t2[n + i], 1, q::LogitRows::all);
+                    Ref->read_logits(wo, 0, &want[(i + 1) * c2.vocab]);
+                    Ref->commit(1);
+                }
+                for (std::uint32_t arm = 1; arm <= 3; ++arm) {  // 3 = 2 slots then a declined admission
+                    q::EngineOptions so = po;
+                    so.prefill_slots = std::min<std::uint32_t>(arm, 2);
+                    auto P = q::CudaEngine::synthetic(pcfg, pack, so, 7);
+                    const auto adm = P->admit_prefill(n, arm == 3 ? UINT64_MAX : 0);
+                    const std::uint32_t chunks = (n + 127) / 128;
+                    if (arm == 3)
+                        CHECK(!adm.admitted && adm.slots == 0 && adm.workspace_bytes == 0 && !adm.reason.empty(), "n %u: a budget past the device declines", n);
+                    else
+                        CHECK(adm.admitted && adm.slots == std::min(so.prefill_slots, chunks) && adm.slots_wanted == adm.slots,
+                              "n %u slots %u: admitted with min(slots, chunks)", n, arm);
+                    const auto wo = P->prefill(t2.data(), n, q::LogitRows::last);
+                    P->read_logits(wo, 0, got.data());
+                    for (std::uint32_t i = 0; i < extra; ++i) {
+                        const auto co = P->forward_rows(&t2[n + i], 1, q::LogitRows::all);
+                        P->read_logits(co, 0, &got[(i + 1) * c2.vocab]);
+                        P->commit(1);
+                    }
+                    CHECK(P->committed() == n + extra, "n %u: committed length", n);
+                    CHECK(same(got, want), "variant %d n %u slots %u%s: last prompt + %u continuation logits differ from the CLI windows of 16", var,
+                          n, so.prefill_slots, arm == 3 ? " (declined)" : "", extra);
+                    if (arm == 3) {
+                        const auto again = P->admit_prefill(n, 0);
+                        CHECK(again.admitted, "n %u: a later admission within the budget succeeds", n);
+                    }
+                }
+            }
+        }
         // MTP: one call with rows == the same rows one at a time
         if (E->has_mtp()) {
             const auto& c = E->config();

@@ -1,4 +1,5 @@
 #include "../apps/qwen_tiled_prompt_plan.hpp"
+#include "strix/known_window_output_policy.hpp"
 #include <iostream>
 #include <memory>
 #include <set>
@@ -6,6 +7,44 @@ using namespace strix;
 using namespace strix::decode_cli;
 namespace {
 void require(bool ok,const char* message) {if(!ok) throw std::runtime_error(message);}
+void prompt_group_output_admission() {
+    using Policy = strix::KnownWindowOutputPolicy;
+    QwenTiledPlanConfig plan;
+    plan.rows = 8192U;
+    plan.block = {plan.rows, QwenPlanOutput::terminal};
+    plan.schedule = 12U;
+    plan.tails = {{1024U, QwenPlanOutput::terminal}, {256U, QwenPlanOutput::terminal},
+        {64U, QwenPlanOutput::terminal}, {32U, QwenPlanOutput::all_rows}, {16U, QwenPlanOutput::terminal}};
+    const auto group_supports = [](Policy group, Policy member, std::size_t rows, std::uint32_t member_rows, bool head) {
+        return known_prefill_group_supports_segment(group, 8192U, member, member_rows, rows, head);
+    };
+    for (const auto size : {56U, 60U}) {
+        QwenPlanCursor cursor;
+        const auto wide = qwen_tiled_next(plan, cursor, 0U, size);
+        require(wide && wide->end == 32U && wide->owner.policy == QwenPlanOutput::all_rows && !wide->final,
+            "short serving prompts start with the wide-copy tail");
+        require(!group_supports(Policy::terminal_row, Policy::all_rows, wide->end - wide->begin, 32U, wide->final),
+            "headless all-rows tails must run solo");
+        const auto tail = qwen_tiled_next(plan, cursor, wide->end, size);
+        require(tail && tail->end == 48U && tail->owner.policy == QwenPlanOutput::terminal &&
+            group_supports(Policy::terminal_row, Policy::terminal_row, tail->end - tail->begin, 16U, tail->final),
+            "the next eligible blocks can still group");
+    }
+    for (const auto group : {Policy::all_rows, Policy::terminal_row, Policy::state_only}) {
+        for (const auto member : {Policy::all_rows, Policy::terminal_row, Policy::state_only}) {
+            for (const bool head : {false, true}) {
+                const bool expected = group != Policy::all_rows && member != Policy::all_rows &&
+                    (!head || (group == Policy::terminal_row && member == Policy::terminal_row));
+                require(group_supports(group, member, 32U, 32U, head) == expected, "whole block output compatibility");
+                require(group_supports(group, member, 24U, 32U, head) == expected, "partial block output compatibility");
+            }
+        }
+    }
+    for (const auto rows : {8U, 20U, 40U})
+        require(!group_supports(Policy::terminal_row, Policy::terminal_row, rows, 32U, false), "invalid partial block geometry");
+    require(!known_prefill_group_supports_segment(Policy::terminal_row, 16U, Policy::terminal_row, 32U, 32U, false),
+        "block must fit the group owner");
+}
 // Adapter lets the frozen old algorithm retain its backend/owner selection expressions.
 using KnownWindowOutputPolicy=QwenPlanOutput;
 struct Backend { QwenPlanOutput policy; QwenPlanOutput output_policy() const {return policy;} };
@@ -52,6 +91,7 @@ void compare(const QwenTiledPlanConfig& c,std::uint64_t n,bool small=false) {
 }
 int main() {
 try {
+    prompt_group_output_admission();
     for(const std::uint32_t t:{1024U,2048U,4096U,8192U})
     for(unsigned mask=0;mask<16;++mask)
     for(const std::uint32_t sched:{0U,4U,12U,16U,20U})

@@ -89,9 +89,15 @@ summed in ascending warp order. q8_0: int8 values are exact in bf16; each 32-blo
 `--profile fast` (decode and spec apps) exports `STRIX_DENSE_A4W4_LAYERS=48-63`: on wide prefill windows (rows > 16, not
 `--wide-exact` / `--prefill-exact`) the IU4 GEMMs of layers 48-63 run the shared A4W4 class `dense-iu4a4-rot-v1`
 (`src/core/iu4a4_dense.hpp`: Hadamard-128 rotated A4 g32 activations x rotated W4 per-128 weights on iu4 WMMA); the other
-layers keep the wide IU4 path (`dense-iu4a16-f16-v1`). The fast wide-window cell is still pending, so the table acts
-only with an explicit `--wide N` / `--prefill-rows N` above 16. `STRIX_DENSE_A4W4_LAYERS=none` turns it off;
-`STRIX_DENSE_A4W4=1` alone (every layer) fails the gate and is in no profile.
+layers keep the wide IU4 path (`dense-iu4a16-f16-v1`). `--profile fast` also selects the 512-row wide prefill window
+(`--wide 512` / `--prefill-rows 512`): the composite of both cells is the gated arm (row "48-63 vs EXACT" below, held-out
+set). `exact` keeps the engine's 64-row EXACT windows. `--profile turbo` runs the same FAST levers on HIP (no HIP TURBO
+row is qualified). Off switches: `--wide 16` / `--prefill-rows 16` for the window, `STRIX_DENSE_A4W4_LAYERS=none` for
+the layer table. `STRIX_DENSE_A4W4=1` alone (every layer) fails the gate and is in no profile.
+
+Window timing (one gfx1151 node, same binary and prompt ids, `--no-mtp`): 8K prefill EXACT 64-row windows 116 tok/s,
+FAST 512-row windows + A4W4 48-63 660 tok/s; 2K 193 -> 614 tok/s; a 32K prompt runs in about a minute with the FAST
+window while the 64-row EXACT windows need several minutes.
 
 FAST gate v2 (`tools/strix-gate`): 8,192-token prompts, 256 teacher-forced rows per window, 4 windows (1,024 rows), null
 arm `STRIX_DENSE_NULL=0:100:1234` (one FP16 ulp of one residual element before layer 0; per-window null KL 2-3e-5).

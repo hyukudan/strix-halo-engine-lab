@@ -66,9 +66,8 @@ levers = "exact"
 [presets.fast]
 levers = "fast"
 
-# Use the admitted FAST levers until this model has a qualified TURBO set.
 [presets.turbo]
-levers = "fast"
+levers = "turbo"
 
 # Engine-read switches of this model that a [multi_device] key is planned to replace (listed in the effective
 # config when set; they still act inside the engine).
@@ -79,3 +78,21 @@ STRIX_SPLIT_BLOCK = "forms.layers.window_rows"
 STRIX_MM_PF_GROUP = "forms.layers.window_rows"
 STRIX_MM_PF_MOE_GROUP = "forms.layers.window_rows"
 STRIX_TP2_EXCHANGE_FMT = "forms.tensor.wire"
+
+# MiniMax M3.1, TP2 (2 KV heads per rank), 60 layers; the index keys are the same bytes for both ranks (shared).
+# Prompt-state hand-off declaration (include/strix/pair/state_owners.hpp Family / Piece; words = the Owner and Extent
+# enumerator names). Per layer: `bytes` per stored row (rows) or per layer (fixed), per destination slice for per_rank
+# pieces; stored rows = floor((P - rows_less) / row_div). Consumer file:line in `source`.
+[pair]
+family = "minimax-m3.1"
+rows_of = "P = N - 1"
+world = 2
+block_rows = 64
+prefix_rows_invariant = false
+shared_once_default = false
+shared_once_source = "opt-in pending the pair receipt"
+state = [
+    { name = "k", kind = 0, owner = "per_rank", extent = "rows", bytes = 512, layers = 60, layer0 = 0, layer_stride = 1, row_div = 1, rows_less = 0, source = "src/minimax/engine/engine.hip:3193-3207" },
+    { name = "v", kind = 1, owner = "per_rank", extent = "rows", bytes = 512, layers = 60, layer0 = 0, layer_stride = 1, row_div = 1, rows_less = 0, source = "src/minimax/engine/engine.hip:3193-3207" },
+    { name = "ik", kind = 2, owner = "shared", extent = "rows", bytes = 256, layers = 60, layer0 = 0, layer_stride = 1, row_div = 1, rows_less = 0, source = "src/minimax/rtxpf/cuda/mm_rtx_kernels.cu:639" },
+]

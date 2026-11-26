@@ -7,11 +7,13 @@
 #include "minimax/engine/mm_defaults.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/dist/transport_spec.hpp"
+#include "strix/minimax/model_assets.hpp"
 #include "strix/minimax/session_startup.hpp"
 
 #include <algorithm>
 #include <cstdlib>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <filesystem>
@@ -21,6 +23,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 #include <type_traits>
 
@@ -38,6 +41,26 @@ void check(bool ok, const std::string& what) {
         ++g_failures;
         std::cerr << "FAIL: " << what << "\n";
     }
+}
+
+void test_draft_discovery() {
+    namespace assets = strix::minimax::assets;
+    namespace fs = std::filesystem;
+    const auto model = fs::temp_directory_path() /
+        ("strix-minimax-drafts-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto draft = model / "dspark";
+    const auto impostor = draft / "unpacked.safetensors";
+    check(assets::discover_draft_dir(model).empty(), "plain when the draft directory is absent");
+    fs::create_directories(impostor);
+    check(assets::discover_draft_dir(model).empty(), "a directory is not a draft shard");
+    const auto shard = draft / "model.safetensors";
+    std::ofstream(shard).put('x');
+    check(assets::discover_draft_dir(model) == draft, "find the packaged DSpark directory");
+    check(assets::draft_files(draft) == std::vector<fs::path>{shard}, "discovery and loader agree on real shards");
+    fs::remove(shard);
+    fs::remove(impostor);
+    fs::remove(draft);
+    fs::remove(model);
 }
 
 using EnvMap = std::map<std::string, std::string>;
@@ -623,6 +646,18 @@ void test_apply() {
     }
     char* argv2[] = {app, m, r0, tr, out};
     check(!md::print_or_apply("rank", 5, argv2), "print_or_apply without the flag");
+    // Both native entry points export the attached word before resolving the engine profile.
+    char turbo_word[] = "--profile=turbo", rank_flag[] = "--rank";
+    char* rank_turbo[] = {app, m, r0, tr, out, turbo_word};
+    char* serve_turbo[] = {app, m, rank_flag, r0, turbo_word};
+    for (const auto& [entry, count, args] : {std::tuple{"rank", 6, rank_turbo}, std::tuple{"serve", 5, serve_turbo}}) {
+        (void)::setenv(md::kProductProfileEnv, "exact", 1);
+        check(!md::print_or_apply(entry, count, args), "turbo: native startup");
+        const auto selected = md::profile_resolution([](const char* key) { return std::getenv(key); });
+        check(selected.is_turbo() && selected.find("msa_flash")->value == "1" &&
+              selected.find("router_wmma")->value == "1", "turbo: native startup selects the inherited FAST cells");
+    }
+    (void)::unsetenv(md::kProductProfileEnv);
     // Both argv orders resolve OFF with an admissible serving order. --session-cache is the CLI form of ON.
     char baseline[] = "--baseline", cache[] = "--session-cache", on[] = "on";
     char* baseline_first[] = {app, m, baseline, cache, on};
@@ -673,6 +708,10 @@ void test_turbo_product_profile() {
     std::vector<std::string> values{"turbo"};
     auto next = [&]() { auto v = values.back(); values.pop_back(); return v; };
     check(md::product_option("--profile", next, &timing) && timing.empty(), "turbo: --profile NAME is the product profile");
+    check(md::product_option("--profile=turbo", next, &timing) && timing.empty(),
+          "turbo: rank accepts the attached product profile without consuming another argument");
+    check(md::product_option("--profile=turbo", next, nullptr),
+          "turbo: serve accepts the same attached product profile");
     values = {"s:prompt.u32:8"};
     check(md::product_option("--profile", next, &timing) && timing == "s:prompt.u32:8", "turbo: old timing spelling kept");
     values = {"t:prompt.u32:4"};
@@ -1183,6 +1222,7 @@ int main(int argc, char** argv) {
     }
     try {
         test_table();
+        test_draft_discovery();
         test_receipts(argv[1]);
         test_off_switches();
         test_pair_pipeline_declaration();

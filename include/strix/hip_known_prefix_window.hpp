@@ -199,6 +199,8 @@ public:
         bool head = false;
         PrefillStepObserver observer;
     };
+    // Static compatibility with this group's compiled owner. Live session and stream checks run at launch.
+    [[nodiscard]] bool supports_prefill_segment(const HipKnownPrefixWindow& member, std::size_t rows, bool head) const;
     [[nodiscard]] std::vector<KnownWindowResult> execute_prefill_segments(std::span<const PrefillSegmentRequest> members,
         bool stage_ple = false);
 private:

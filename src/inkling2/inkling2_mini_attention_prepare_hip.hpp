@@ -3,6 +3,7 @@
 #include "inkling2_mini_attention_hip.hpp"
 #include "inkling2_mini_attention_prepare_device.hpp"
 #include "inkling2_mini_dense_hip.hpp"
+#include "strix/env_flags.hpp"
 
 namespace strix::inkling2 {
 
@@ -29,16 +30,30 @@ struct MiniPreparedHipBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGqa
     bool fold_rounds() const { return fold; }
     static bool store_round(unsigned rows) { return rows > core::gemv_rows::max_rows; }
 
+    static bool use_wide_tight_group(unsigned rows) {
+        static const bool enabled = strix::envcfg::flag("STRIX_INKLING_HIP_TIGHT_GROUP", false);
+        return enabled && rows <= core::gemv_rows::max_rows;
+    }
+
     bool linear_admitted(const float* input, unsigned width, unsigned rows,
                          std::span<const MiniAttentionLinear> views) const {
+        if (use_wide_tight_group(rows)) {
+            return core::fma_rows::bf16_rows_input_aligned(input) &&
+                core::for_each_bf16_projection_group<core::dense_linear::kTightGroupMax>(views, true, [&](auto group) {
+                    return core::fma_rows::bf16_rows_path(width, rows, group, kVocabulary) !=
+                        core::fma_rows::Bf16RowsPath::refused;
+                });
+        }
         return mini_hip_dense_rows_admitted(input, width, rows, views);
     }
 
     Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
-        return core::for_each_bf16_projection_group<core::fma_rows::kGroupMax>(views, success,
-            [&](std::span<const MiniAttentionLinear> group) {
-                return enqueue_mini_hip_dense_rows(input, width, rows, group, stream);
-            });
+        const auto launch = [&](std::span<const MiniAttentionLinear> group) {
+            return enqueue_mini_hip_dense_rows(input, width, rows, group, stream);
+        };
+        if (use_wide_tight_group(rows))
+            return core::for_each_bf16_projection_group<core::dense_linear::kTightGroupMax>(views, success, launch);
+        return core::for_each_bf16_projection_group<core::fma_rows::kGroupMax>(views, success, launch);
     }
 
     Status rms_values(float* value, unsigned rows) const {
@@ -53,6 +68,7 @@ struct MiniPreparedHipImageBackend : MiniPreparedHipBackend {
     std::span<std::uint16_t> operand_image;
 
     Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
+        if (use_wide_tight_group(rows)) return MiniPreparedHipBackend::linear(input, width, rows, views);
         return core::fma_rows::enqueue_bf16_rows_routed(input, width, rows, views, kVocabulary, operand_image, stream);
     }
 

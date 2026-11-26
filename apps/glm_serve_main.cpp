@@ -50,9 +50,12 @@
 // C1 MTP: with one request in flight (none waiting) it decodes through the engine's exact single-slot self-speculation
 // (verify / commit / adaptive K, the CLI --decode route); rank 1 replays mtp_enter / mtp_run / mtp_leave. Any second
 // request ends the decoder at a cycle boundary (deferred rows flushed) and batched plain steps follow.
+#include "strix/glm/pair_state.hpp"
 #include "strix/pair/state_decls.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "glm_rank_defaults.hpp"
+#include "glm_prefill_turbo.hpp"
+#include "glm/prefill/glm_pf_wmma.hpp"
 #include "glm_auto_rows.hpp"
 #include "strix/env_flags.hpp"
 #include "glm_rank_startup.hpp"
@@ -407,6 +410,18 @@ struct EngineOps {
         }
         return out;
     }
+    bool turbo_prefill_pair = false;
+    std::function<bool(std::uint64_t, unsigned, bool)> turbo_prefill_policy{};
+    bool select_turbo_prefill(std::uint64_t tokens, unsigned generated, bool fresh) const {
+        return turbo_prefill_policy && turbo_prefill_policy(tokens, generated, fresh);
+    }
+    std::uint32_t prefill_turbo(std::uint32_t slot, std::span<const std::uint32_t> tokens) {
+        if (!turbo_prefill_pair)
+            throw gs::ProtocolError("control channel: TURBO prefill without pair agreement");
+        const strix::glm::pf::wmma_x::ProfileScope scope(true);
+        return prefill_mtp(slot, tokens, 0, true);
+    }
+
     // The CLI bootstrap: exact chunked prompt + MTP layer (or reference rows), seed for the slot's first cycle. A
     // chunk of a longer prompt (pos0 > 0 or not last) runs Engine::prefill_mtp on the chunk at pos0 in R1, as the
     // bootstrap does for the whole prompt: same trunk rows; the drafter pair at each chunk's last row takes the chunk's
@@ -995,7 +1010,7 @@ int main(int argc, char** argv) {
     try {
         if (argc < 2) {
             std::fprintf(stderr, "usage: %s MODEL_DIR --world 1|2 [--rank R --transport T] [--slots S] [--capacity C] [--serial] "
-                                 "[--host H] [--port P] [--profile default|fast|quality] [--deploy FILE|auto] [--deploy-check] [--prefix-cache-gib G] [--selftest N [--selftest-tokens M] [--selftest-prefix [--selftest-prefix-long L]]] "
+                                 "[--host H] [--port P] [--profile exact|fast|quality|turbo] [--deploy FILE|auto] [--deploy-check] [--prefix-cache-gib G] [--selftest N [--selftest-tokens M] [--selftest-prefix [--selftest-prefix-long L]]] "
                                  "[--import-listen IP:PORT --import-key FILE --import-model-sha HEX (operator attestation of the producer's "
                                  "model, compared with its hand-off header, not computed from the loaded tensors)]\n", argv[0]);
             return 2;
@@ -1126,7 +1141,7 @@ int main(int argc, char** argv) {
         if (opt.world != 1 && opt.world != 2) throw std::invalid_argument("--world 1|2");
         if (opt.rank >= opt.world) throw std::invalid_argument("--rank must be < --world");
         {
-            // One resolver for the hand-off owners (strix/pair/state_owners.hpp, GLM declaration in state_decls.hpp): the
+            // One resolver for the hand-off owners (strix/pair/state_owners.hpp, GLM declaration in glm/pair_state.hpp): the
             // flag, then STRIX_HANDOFF_SHARED_ONCE, then the family default (DSA once, v2: the same bytes, relayed). The
             // automatic default applies where v2 runs (import receiver on, a pair); an explicit request elsewhere refuses below.
             namespace ps = strix::pair::state;
@@ -1147,7 +1162,8 @@ int main(int argc, char** argv) {
         // Engine configuration: the rank app's resolution of a normal decode (MTP self-speculation and its exact chunked
         // bootstrap when the model has a complete MTP head; STRIX_GLM_SERVE_MTP=0 resolves as --mtp-spec 0). Automatic
         // max-rows runs the CLI's load-time admission (rd::admit_auto_rows) and a row merge between the two ranks.
-        auto eff = rd::resolve_serve(rank_args, serve_mtp, rd::process_env(), rd::probe_model_mtp(argv[1]));
+        const auto request = rd::scan(rd::serve_request_args(rank_args, serve_mtp));
+        auto eff = rd::resolve(request, rd::process_env(), rd::probe_model_mtp(argv[1]));
         // Sampled MTP is resolved and admitted inside that resolution (row serve_sampled_mtp; coupled under any profile,
         // rejection fast / turbo only); execution and the receipt read eff.sampled_mtp only. The sampler options are
         // validated here, before any rank connects or the model loads, with the acceptance rule the row resolved (off:
@@ -1196,6 +1212,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         rd::apply_env(eff, [](const char* k, const char* v) { (void)::setenv(k, v, 0); });
+        std::fputs(rd::mtp_decode_line(eff).c_str(), stderr);
         opt.mtp = mtp_on;
         opt.spec = mtp_on;
         opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
@@ -1221,11 +1238,13 @@ int main(int argc, char** argv) {
                     prefill_mode.c_str(), id.c_str(), serial ? "serial" : "on");
 
         std::unique_ptr<strix::dist::Communicator> comm;
+        bool turbo_prefill_device = false;
         if (opt.world == 2) {
             if (transport_spec.empty()) throw std::invalid_argument("--world 2 needs --transport");
             (void)::setenv("STRIX_DIST_USB4_TIMEOUT_MS", "600000", 0);
             (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "600000", 0);
             auto opened = strix::dist::open_pair(transport_spec, opt.rank);
+            turbo_prefill_device = rd::ordinary_turbo(request, eff) && rd::measured_prefill_pair(opened.usb4_topology.streams, opened.direct != nullptr);
             auto transport = std::move(opened.host);
             const auto& receipt = opened.receipt;
             if (deployment.provider) {
@@ -1292,7 +1311,8 @@ int main(int argc, char** argv) {
         hello.prefix_cache_bytes = prefix_cache_bytes;
         hello.model_hash = model_hash(opt.model_dir);
         {
-            std::string ident = rd::print(eff);
+            // Device peers may mount the same model pack under different paths.
+            std::string ident = rd::print(eff, /*include_asset_receipt=*/false);
             ident += std::string("engine identity ") + ge::identity_mode_name(eng.identity_mode()) + " decode-xfer " +
                      (eng.decode_xfer_enabled() ? "1" : "0") + " prefill " + prefill_mode + " pipeline " +
                      std::to_string(eng.prefill_pipeline()) + " mtp " + std::to_string(mtp_on ? 1 : 0) + " g2 " + std::to_string(serve_g2 ? 1 : 0) +
@@ -1343,6 +1363,19 @@ int main(int argc, char** argv) {
         ops.spec.assign(opt.slots, {});
         ops.hp_row.assign(opt.slots, 0);
         ops.world = opt.world;
+        const bool turbo_candidate = turbo_prefill_device && rd::measured_prefill_layout(eng.prefill_pipeline()) &&
+            !deployment.plan && !serial && rtx_prefill.empty() && import_listen.empty();
+        ops.turbo_prefill_pair = rd::select_prefill_turbo(request, eff, rd::process_env(),
+            {turbo_candidate, rd::product_ladder_rows[0].min_context, opt.capacity, opt.max_rows, opt.slots,
+             rd::kTurboPrefillGenerated});
+        if (rd::ordinary_turbo(request, eff) && !strix::glm::pf::wmma_x::enabled()) {
+            ops.turbo_prefill_policy = [&](std::uint64_t prompt, unsigned generated, bool fresh) {
+                const rd::PrefillWork work{ops.turbo_prefill_pair && fresh, prompt, opt.capacity, opt.max_rows, opt.slots, generated};
+                const bool selected = rd::select_prefill_turbo(request, eff, rd::process_env(), work);
+                rd::report_prefill_turbo(opt.rank, work, selected);
+                return selected;
+            };
+        }
         if (!import_listen.empty()) {
             if (import_key_file.empty() || import_model_sha.empty())
                 throw std::invalid_argument("--import-listen needs --import-key and --import-model-sha (the RTX producer's model)");
@@ -1449,11 +1482,11 @@ int main(int argc, char** argv) {
         if (opt.rank != 0) {
             std::printf("rank %u: following (model %016llx identity %016llx)\n", opt.rank,
                         static_cast<unsigned long long>(hello.model_hash), static_cast<unsigned long long>(hello.identity_hash));
-            gs::follow(ops, ch, hello, opt.slots, opt.capacity, sampling_vote);
+            gs::follow(ops, ch, hello, opt.slots, opt.capacity, sampling_vote, &ops.turbo_prefill_pair);
             std::printf("rank %u: STOPPED after %llu rounds\n", opt.rank, static_cast<unsigned long long>(ch.round()));
             return 0;
         }
-        const bool sampling = ch.hello(hello, sampling_vote);
+        const bool sampling = ch.hello(hello, sampling_vote, &ops.turbo_prefill_pair);
         std::printf("rank 0: hello OK (model %016llx identity %016llx)\n", static_cast<unsigned long long>(hello.model_hash),
                     static_cast<unsigned long long>(hello.identity_hash));
 
@@ -1476,6 +1509,29 @@ int main(int argc, char** argv) {
         lc.prefill_chunk = prefill_chunk;
         lc.interleave = serve_prefill_interleave(prefill_mode, opt.max_rows, eng.prefill_pipeline());
         lc.prefill_chunk_cap = opt.max_rows;
+        if (prefill_mode == "gemv") {
+            // Request-fixed dense core (glm_pf_dense_policy.hpp pin_*): under FAST WMMA with the auto core, a chunk of a
+            // prompt ends only where every row keeps the core the rank CLI gives it, whatever the traffic.
+            const auto pin = strix::glm::pf::dense_policy::pin_shape(0, opt.max_rows, eng.prefill_pipeline(), strix::envcfg::text);
+            if (pin.active) {
+                lc.pin_chunk = [pin](std::size_t prompt, std::size_t done, std::size_t tokens) {
+                    auto shape = pin; shape.prompt = prompt;
+                    return strix::glm::pf::dense_policy::pin_chunk(shape, done, tokens);
+                };
+                lc.pin_admits = [pin](std::size_t prompt, std::size_t done, std::size_t end) {
+                    auto shape = pin; shape.prompt = prompt;
+                    return strix::glm::pf::dense_policy::pin_admits(shape, done, end);
+                };
+                lc.pin_root = [pin](std::size_t prompt, std::size_t done, std::size_t end) {
+                    auto shape = pin; shape.prompt = prompt;
+                    return strix::glm::pf::dense_policy::pin_root_admits(shape, done, end);
+                };
+            }
+            if (opt.rank == 0)
+                std::printf("rank 0 effective prefill-core-pin=%s (the dense core of a prompt row is the rank CLI's for that prompt: "
+                            "chunk ends move to calls that keep it; max_rows=%u floor=%u rows)\n",
+                            pin.active ? "on" : "off", opt.max_rows, pin.min_rows);
+        }
         lc.prefill_timeline = static_cast<unsigned>(std::max(0, strix::envcfg::integer("STRIX_SERVE_PREFILL_TIMELINE", 0)));
         lc.prefill_chunk_mtp = prefill_chunk_mtp;
         lc.prefill_units_rows = opt.prefill_units && prefill_chunk_mtp ? opt.max_rows : 0U;  // max_rows after admission

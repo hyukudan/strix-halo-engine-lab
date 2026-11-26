@@ -12,55 +12,65 @@ Cómo medimos y qué cubre "exacto": [metodología](docs/methodology.es.md).
 
 ## Resultados
 
-Mediciones del 2026-11-21 sobre `main`, en AMD Strix Halo (Ryzen AI Max+ 395, Radeon 8060S, 128 GB por nodo).
-Las revisiones medidas fueron `d3a89ae16` y `f42edd05e`, indicadas por fila. Los pares usan USB4. El límite de
-potencia y el ajuste IOMMU de cada medición quedaron sin registrar en las tablas de medición.
-C1/C2/C4/C8 indican flujos por lote en las pruebas de decode de Nemotron, con tasas agregadas.
-Las tasas HTTP de Qwen son agregadas con un cliente y cuatro plazas configuradas. Los clientes completaron
-sus peticiones y el verificador del kit rechazó el código de salida del servidor tras el cierre intencionado.
-La cifra HTTP de Nemotron corresponde al brazo completo con el borrador desactivado y un cliente.
-DSpark es un borrador especulativo. Los brazos FAST de Hy4 usan su referencia de dispositivo BASE.
-Las celdas de petición completa muestran tokens del prompt + tokens de salida. Las tasas de prefill marcadas
-con TTFT incluyen el tiempo hasta el primer token. Consulte las condiciones en [metodología](docs/methodology.es.md).
+Mediciones del 2026-11-25 sobre `main` en la revisión `ca2de6ae8`, en AMD Strix Halo (Ryzen AI Max+ 395, Radeon 8060S,
+128 GB por nodo), con un build HIP Release por nodo (GCC 15.2, HIP clang 24.0, ROCm 10.1, Linux 7.4 con el `amdgpu` del
+kernel). Un par son dos nodos unidos por USB4 que ejecutan el mismo binario. Los límites de potencia son los de fábrica del
+nodo; el reloj y la potencia de la GPU se muestrearon en cada petición: los prefills largos fueron a 1,950–2,900 MHz y
+120–150 W por nodo.
+No se fijó ninguna palanca a mano: decide `--profile exact|fast|turbo`, y cada ejecución imprimió su configuración efectiva.
+Los prompts son texto real en inglés (un conjunto de documentos cortos más un documento del proyecto). El número de tokens
+depende del tokenizador y se indica por fila. Cada motor y tier se cargó una vez; "a / b" son dos repeticiones sobre ese
+servidor residente (o dos procesos CLI). Cada petición larga empezó por debajo de 70 °C. Un segundo valor más bajo se debe a
+que un nodo mantiene un reloj de GPU menor tras unos dos minutos de carga sostenida; los recibos dan el reloj por petición.
+El decode es una petición (B1), voraz, en el modo de decode por defecto del motor, 128 tokens tras un prompt de chat corto
+salvo que se indique otra cosa. Las ejecuciones EXACT repitieron los mismos ids; las filas FAST y TURBO indican lo que imprime
+su perfil (estado de calificación o las identidades FAST que aplica). Consulte las condiciones en
+[metodología](docs/methodology.es.md).
 
-| Modelo | Hardware | Ruta | Modo | Perfil | Prompt (tokens) | Decode (tok/s) | Prefill (tok/s salvo indicación) | Petición completa | Main |
-|---|---|---|---|---|---|---|---|---|---|
-| Qwen3.8-Flash-Next | 1 nodo | CLI | MTP | Por defecto (prefill FP16 automático) | texto real, 32K | 51.0 | 20.45 s | — | `d3a89ae16` |
-| Qwen3.8-Flash-Next | 1 nodo | CLI | modo por defecto sin registrar | Por defecto | clase sin registrar, 2K y 8K | — | — | 2K + 33: 2.71 s, 8K + 33: 5.95 s | `d3a89ae16` |
-| Qwen3.8-Flash-Next | 1 nodo | CLI | plano | Por defecto | texto real, 32K | — | — | 32K + 128: 24.7 s | `d3a89ae16` |
-| Qwen3.8-Flash-Next | 1 nodo | HTTP servido | MTP + wide automático | Por defecto | longitudes sin registrar | prosa 38.0–40.2, edición 153–155, JSON 85.7–87.6, código 60.8–61.2, razonamiento 59.6–61.6 | — | — | `d3a89ae16` |
-| Qwen3.8-27B | 1 nodo | CLI | plano | EXACT (por defecto) | clase sin registrar, 2K y 8K | 2K 13.90, 8K 13.10 | 2K 644, 8K 606 | — | `d3a89ae16` |
-| Qwen3.8-27B | 1 nodo | CLI | plano | EXACT (por defecto) | texto real, 32K | 10.68 | 517 | — | `d3a89ae16` |
-| Qwen3.8-27B | 1 nodo | CLI | plano | FAST (opcional) | clase sin registrar, 2K y 8K | — | 2K 684, 8K 635 | — | `d3a89ae16` |
-| Qwen3.8-27B | 1 nodo | CLI | MTP | EXACT (por defecto) | edición, 477 | 32.2 | — | — | `d3a89ae16` |
-| Qwen3.8-27B | 1 nodo | CLI | MTP | EXACT (por defecto) | longitudes sin registrar | código 40.8, prosa 25.9, razonamiento 40.3, JSON 62.2 | — | — | `d3a89ae16` |
-| Qwen3.8-27B | 1 nodo | CLI | plano | EXACT (por defecto) | código, longitud sin registrar | 14.21–14.22 | — | — | `d3a89ae16` |
-| Qwen3.8-27B | par | CLI | plano | Por defecto (TP) | código, longitud sin registrar | 20.61 | — | — | `d3a89ae16` |
-| DeepSeek V4.1 Flash | par | CLI | plano | EXACT | clase sin registrar, 2K / 8K / 32K | — | 2K 791.9, 8K 1,123.8, 32K 1,224.1 (en caliente) | — | `d3a89ae16` |
-| DeepSeek V4.1 Flash | par | CLI | plano | EXACT (por defecto) | 15–21 | código 26.85, prosa 26.81 | — | — | `f42edd05e` |
-| DeepSeek V4.1 Flash | par | CLI | DSpark | EXACT (por defecto) | 15–21 | código 41.70, prosa 60.04, JSON 43.62, chat 39.98 | — | — | `f42edd05e` |
-| MiniMax M3.1 Flash | par | CLI | plano | EXACT | clase sin registrar, 1K / 8K / 32K | 1K 24.20 | 1K 472.3, 8K 621.6 (en caliente), 32K 587.2 | — | `d3a89ae16` |
-| MiniMax M3.1 Flash | par | CLI | plano | EXACT (por defecto) | 2,048 | código 23.28, prosa 23.19, JSON 23.11, edición 23.07 | código, prosa, JSON y edición 506–521 (TTFT) | — | `f42edd05e` |
-| MiniMax M3.1 Flash | par | CLI | DSpark auto | EXACT (por defecto) | 2,048 | código 32.39, prosa 23.83 | — | — | `f42edd05e` |
-| GLM-5.3 Flash | par | CLI | plano | EXACT (GEMV) | clase sin registrar, 8K y 32K | — | 8K 617 (en caliente), 32K 595 | — | `d3a89ae16` |
-| GLM-5.3 Flash | par | CLI | plano | EXACT (R1b) | código, 2,048 | 25.73 | — | — | `f42edd05e` |
-| GLM-5.3 Flash | par | CLI | plano | EXACT (R1b) | prosa, 1,884 | 25.94 | — | — | `f42edd05e` |
-| GLM-5.3 Flash | par | CLI | MTP + wide | EXACT (R1b) | código, 2,048 | 40.37 | — | — | `f42edd05e` |
-| GLM-5.3 Flash | par | CLI | MTP + wide | EXACT (R1b) | prosa, 1,884 | 66.48 | — | — | `f42edd05e` |
-| Hy4-flash | 1 nodo | CLI | plano | FAST (por defecto), ref. BASE | texto real, 2K / 8K / 32K | 2K 16.75, 8K 16.78, 32K 16.69 | 2K 773.2, 8K 730.6 (en caliente), 32,568 tokens a 696.5 (en frío) | — | `d3a89ae16` |
-| Hy4-flash | 1 nodo | CLI | plano | `exact` (BASE) | texto real, 8K | 16.39 | 679.3 (en caliente) | — | `d3a89ae16` |
-| Hy4-flash | 1 nodo | CLI | MTP + wide | FAST (por defecto), ref. BASE | prompts cortos, longitudes sin registrar | código 32.23, prosa 22.93, razonamiento 29.34 | — | — | `d3a89ae16` |
-| Hy4-flash | par | CLI | plano | FAST (por defecto), ref. BASE | texto real, 4K / 8K / 32K | — | 4K 1,163.7, 8K 1,260.3 (en caliente), 32K 1,269.6 (en frío) | — | `d3a89ae16` |
-| Hy4-flash | par | CLI | plano (TP) | FAST (por defecto), ref. BASE | clase sin registrar, 1K | 22.3 | — | — | `d3a89ae16` |
-| Hy4-flash | par | CLI | MTP (TP) | FAST (por defecto), ref. BASE | longitudes sin registrar | código 47.24, prosa 28.12, razonamiento 38.59 | — | — | `d3a89ae16` |
-| Nemotron 3.5 Bolt E4B | 1 nodo | CLI | plano | EXACT (por defecto) | prueba, contexto 64 | C1 54.9, C2 103.2, C4 177.2, C8 243.1 | — | — | `d3a89ae16` |
-| Nemotron 3.5 Bolt E4B | 1 nodo | CLI | plano | FAST (opcional) | prueba, contexto 64 | C1 53.2, C2 103.7, C4 196.0, C8 334.3 | — | — | `d3a89ae16` |
-| Nemotron 3.5 Bolt E4B | 1 nodo | CLI | MTP | EXACT (por defecto) | 18–23 | prosa 208.3, código 194.7, JSON 193.9 | — | — | `d3a89ae16` |
-| Nemotron 3.5 Bolt E4B | 1 nodo | CLI | MTP | FAST (opcional) | 18–23 | prosa 273.1, código 250.1, JSON 254.1 | — | — | `d3a89ae16` |
-| Nemotron 3.5 Bolt E4B | 1 nodo | CLI | MTP | EXACT (por defecto) | edición, 561 | 169.7 | — | — | `d3a89ae16` |
-| Nemotron 3.5 Bolt E4B | 1 nodo | CLI | MTP | FAST (opcional) | edición, 561 | 202.2 | — | — | `d3a89ae16` |
-| Nemotron 3.5 Bolt E4B | 1 nodo | CLI | plano | FAST (opcional) | prosa repetida, 2K / 8K / 32K / 65,000 | — | 2K 5,050, 8K 4,909, 32K 4,249, 65,000: 3,610 | — | `d3a89ae16` |
-| Nemotron 3.5 Bolt E4B | 1 nodo | HTTP servido | plano | EXACT (por defecto) | código, prosa, JSON y edición, longitudes sin registrar | 51.90 | — | — | `d3a89ae16` |
+| Modelo | Hardware | Ruta | Modo de decode | Perfil | Prompt (tokens) | Decode (tok/s) | Prefill (tok/s) | Main |
+|---|---|---|---|---|---|---|---|---|
+| DeepSeek V4.1 Flash | par | HTTP servido | DSpark (por defecto) | EXACT | 1,971 / 7,994 / 30,975; decode tras 344 | 57.2 / 57.7 | 2K 782 / 739, 8K 1,101 / 1,111, 32K 1,273 / 1,245 | `ca2de6ae8` |
+| DeepSeek V4.1 Flash | par | HTTP servido | DSpark (por defecto) | FAST | igual | 53.4 / 53.7 | 2K 969 / 922, 8K 1,425 / 1,588, 32K 1,689 / 1,708 | `ca2de6ae8` |
+| DeepSeek V4.1 Flash | par | HTTP servido | DSpark (por defecto) | TURBO (= palancas FAST) | igual | — | 8K 1,444 / 1,591, 32K 1,683 / 1,710 | `ca2de6ae8` |
+| MiniMax M3.1 Flash | par | HTTP servido | plain | EXACT | 1,102 / 7,791 / 30,179; decode tras 508 | 27.0 / 26.9 (tras 1,102: 32.6 / 28.7) | 1K 417 / 451, 8K 667 / 587, 32K 590 / 565 | `ca2de6ae8` |
+| MiniMax M3.1 Flash | par | HTTP servido | plain | FAST | igual | 27.1 / 26.9 | 1K 415 / 457, 8K 709 / 660, 32K 640 / 611 | `ca2de6ae8` |
+| MiniMax M3.1 Flash | par | HTTP servido | plain | TURBO | igual | 26.7 / 26.6 | 1K 422 / 459, 8K 709 / 662, 32K 674 / 624 | `ca2de6ae8` |
+| GLM-5.3 Flash | par | HTTP servido | por defecto | EXACT | 2,037 / 8,108 / 31,258; decode tras 362 | 40.2 / 42.8 | 2K 531, 8K 629 / 604, 32K 578 / 552 | `ca2de6ae8` |
+| GLM-5.3 Flash | par | HTTP servido | por defecto | FAST (resuelve a la ruta EXACT) | igual | 41.1 / 41.1 | 2K 530, 8K 628 / 596, 32K 568 / 545 | `ca2de6ae8` |
+| GLM-5.3 Flash | par | HTTP servido | por defecto | TURBO (prefill WMMA FP16) | igual | 41.3 / 41.3 | 2K 718, 8K 949 / 941, 32K 879 / 854 | `ca2de6ae8` |
+| Qwen3.8-Flash-Next | 1 nodo | CLI | plain (sin bundle del drafter MTP en nuestros nodos) | EXACT | 2,048 / 8,192 / 32,500 | 20.6–22.1 | 2K 1,435, 8K 1,667 / 1,840, 32K 1,669 / 1,677 | `ca2de6ae8` |
+| Qwen3.8-Flash-Next | 1 nodo | CLI | plain | FAST | igual | 21.6–21.9 | 2K 1,673, 8K 1,865 / 1,880, 32K 1,681 / 1,663 | `ca2de6ae8` |
+| Qwen3.8-Flash-Next | 1 nodo | CLI | plain | TURBO (= palancas FAST) | igual | 21.5–21.8 | 2K 1,188 (una ejecución), 8K 1,915, 32K 1,665 | `ca2de6ae8` |
+| Qwen3.8-27B | 1 nodo | CLI | MTP (por defecto) | EXACT | 2,048 / 8,192 | 2K 35.2 / 35.3, 8K 25.8 / 25.0 | 2K 187–199, 8K 115–117 | `ca2de6ae8` |
+| Qwen3.8-27B | 1 nodo | CLI | plain (`--no-mtp`) | EXACT | 2,048 / 8,192 | 2K 14.05, 8K 13.22 | 2K 195, 8K 121 | `ca2de6ae8` |
+| Qwen3.8-27B | 1 nodo | CLI | MTP (por defecto) | FAST (TURBO = FAST) | 2,048 / 8,192 | 2K 35.2, 8K 25.0–25.1 | 2K 188–196, 8K 115–117 | `ca2de6ae8` |
+| Qwen3.8-27B | par (TP) | CLI | MTP (por defecto) | EXACT / FAST | 2,048 | 45.4 / 45.5 | — | `ca2de6ae8` |
+| Qwen3.8-27B | par (TP) | CLI | plain | EXACT | 2,048 | 20.22 | — | `ca2de6ae8` |
+| Hy4-flash | 1 nodo | CLI | plain | FAST (por defecto, referencia BASE; el tier elige filas de prompt 4096) | 1,024 / 8,192 | 1K 17.5, 8K 14.25 | 1K 602, 8K 755 / 782 | `ca2de6ae8` |
+| Hy4-flash | 1 nodo | CLI | plain | FAST, filas de prompt 2048 fijadas a mano | 2,048 / 8,192 / 32,500 | 16.9–17.0 | 2K 689–810, 8K 721–766, 32K 699 / 693 | `ca2de6ae8` |
+| Hy4-flash | 1 nodo | CLI | plain | `exact` (BASE; prompt posición a posición) | 2,048 | 15.75 | 15.2 | `ca2de6ae8` |
+| Hy4-flash | 1 nodo | CLI | plain | `exact` (BASE), filas de prompt 2048 fijadas a mano | 8,192 / 32,500 | 16.5–16.6 | 8K 687–723, 32K 661 (una ejecución) | `ca2de6ae8` |
+| Hy4-flash | 1 nodo | CLI | plain | TURBO (el tier elige filas de prompt 4096) | 8,192 | 15.65 | 739 / 728 | `ca2de6ae8` |
+| Hy4-flash | par (reparto por capas) | CLI | plain | FAST (el par siempre usa prompt por lotes) | 4,096 / 8,192 / 32,500 | 12.3–14.0 | 4K 1,265 / 1,216, 8K 1,327 / 1,387, 32K 1,328 (una ejecución) | `ca2de6ae8` |
+| Hy4-flash | par (TP) | CLI | plain | FAST / `exact` | 1,024 | 22.64 / 22.42 | — | `ca2de6ae8` |
+| Inkling 2 Mini | 1 nodo | HTTP servido | plain | EXACT (FAST y TURBO resuelven a la misma ruta en HIP) | 2,280 / 9,116 / 35,170; decode tras 396 | 23.6 / 23.6 (tras 35,170: 20.9) | 2K 591 / 591, 8K 601 / 595, 32K 578 / 568 | `ca2de6ae8` |
+
+**Más bajo que la tabla anterior (2026-11-21, `d3a89ae16` / `f42edd05e`).** Las filas anteriores eran sobre todo
+ejecuciones CLI con otros prompts, así que parte de cada cambio se debe a la ruta y al prompt:
+- Prefill EXACT de DeepSeek V4.1 Flash a 2K (antes 791.9) y a 8K (antes 1,123.8).
+- Prefill EXACT de MiniMax M3.1 Flash a 1K (antes 472.3); la segunda repetición a 8K (587) queda por debajo de 621.6.
+- Prefill EXACT de GLM-5.3 Flash a 32K (antes 595).
+- Prefill de Qwen3.8-27B: la configuración por defecto usa ventanas de prompt de 64 filas, 2K 187–199 y 8K 115–117
+  frente a 644 / 606 (EXACT) y 684 / 635 (FAST) antes. Decode plain en par TP 20.22 (antes 20.61).
+- Decode de Qwen3.8-Flash-Next: 20.6–22.1 en plain, frente a 51.0 con MTP antes; el bundle del drafter MTP no está
+  instalado junto al modelo en nuestros nodos, así que el valor por defecto resuelve a decode plain.
+- Decode FAST de Hy4-flash con el prompt de 4096 filas que elige el tier: 14.25 a 8K (antes 16.78).
+
+**Sin medir en `ca2de6ae8`:** Nemotron 3.5 Bolt E4B (su tokenizador y sus tablas RoPE no están en nuestros nodos);
+Qwen3.8-27B a 32K (el prefill por defecto no terminó dentro de nuestro límite de 470 s por ejecución); Qwen3.8-Flash-Next
+por HTTP (`strix-serve --model qwen3.8-flash-next` necesita un golden de calibración MTP y la receta MTP en mosaico para
+arrancar); las filas de decode MTP y DSpark por contenido (código, prosa, JSON, edición); los pares `exact` y TURBO de
+Hy4-flash a 32K. Las filas TURBO marcadas "= palancas FAST" resuelven al conjunto de palancas FAST de ese motor.
 
 ### RTX PRO 6000 (CUDA)
 

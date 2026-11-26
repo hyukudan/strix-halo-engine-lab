@@ -62,7 +62,10 @@ void emission() {
     const auto text = strix::model::emit_constants(
         strix::model_description::parse("schema = \"strix-model/v1\"\nname = \"e\"\n[t]\ndefault = 1\nr = -0.5\n"
                                         "big = 9007199254740993\ns = \"q\\\"\\\\\"\nempty = []\nmixed = [1, \"a\"]\n"
-                                        "v = [1.5, 2.0]\n[t.u]\nflag = false\n"),
+                                        "v = [1.5, 2.0]\n"
+                                        "rows = [{ n = \"a\", x = 3, ok = true }, { n = \"b\", x = 4, ok = false }]\n"
+                                        "ragged = [{ x = 1 }, { y = 2 }]\ntyped = [{ x = 1 }, { x = 2.5 }]\n"
+                                        "counted = [{ count = 1 }]\n[t.u]\nflag = false\n"),
         "models/e.toml");
     check(has(text, "namespace strix::model_data::e {"), "model namespace");
     check(has(text, "inline constexpr std::string_view name = \"e\";"), "root string");
@@ -74,6 +77,19 @@ void emission() {
     check(has(text, "// empty: empty array (no constant)"), "empty array skipped");
     check(has(text, "// mixed: array of tables or mixed array (no constant)"), "mixed array skipped");
     check(has(text, "namespace u {\ninline constexpr bool flag = false;\n} // namespace u"), "nested table");
+    check(has(text, "namespace rows {\ninline constexpr std::size_t count = 2;\n"
+                    "inline constexpr std::string_view n[] = {\"a\", \"b\"};\n"
+                    "inline constexpr bool ok[] = {true, false};\n"
+                    "inline constexpr std::int64_t x[] = {3, 4};\n} // namespace rows"),
+          "table array is emitted per field");
+    check(has(text, "#include <cstddef>"), "size_t header when a count is emitted");
+    check(has(text, "// ragged: array of tables or mixed array (no constant)"), "rows with different keys skipped");
+    check(has(text, "// typed: array of tables or mixed array (no constant)"), "rows with different types skipped");
+    check(has(text, "// counted: array of tables or mixed array (no constant)"), "a field called count skipped");
+    check(!has(strix::model::emit_constants(strix::model_description::parse("schema = \"strix-model/v1\"\nname = \"e\"\n"),
+                                            "models/e.toml"),
+               "cstddef"),
+          "no cstddef without a table array");
     bool refused = false;
     try {
         (void)strix::model::emit_constants(strix::model_description::parse("schema = \"strix-model/v1\"\n"), "x.toml");

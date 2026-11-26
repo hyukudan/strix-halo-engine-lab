@@ -13,6 +13,7 @@
 #include <cstdint>
 #include "core/iu4_rows_plan.hpp"
 #include "strix/decode_weight_sweep.hpp"
+#include "strix/hip/legacy_intrinsics.hpp"  // STRIX_HIP_FDOT2
 
 namespace strix::core::w4a16 {
 

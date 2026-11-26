@@ -132,6 +132,12 @@ struct LeadConfig {
     // base/whole-prompt calls can exceed it and the engine must split them internally.
     strix::serve::PrefillInterleave interleave;
     unsigned prefill_chunk_cap = 0;
+    // Request-fixed dense core (strix::glm::pf::dense_policy::pin_*; empty: off): the end of a chunk of a prompt is moved to
+    // one that keeps every row on the core the rank CLI gives it (traffic only decides when the chunk runs), and a root
+    // store whose cut would change a row's core is skipped. Arguments: prompt tokens, rows done, proposed tokens/end.
+    std::function<std::size_t(std::size_t, std::size_t, std::size_t)> pin_chunk;
+    std::function<bool(std::size_t, std::size_t, std::size_t)> pin_admits;  // a chunk [done, end) keeps every row's core
+    std::function<bool(std::size_t, std::size_t, std::size_t)> pin_root;    // the same, and a root cut reusable by any prompt
     // Prefill units (STRIX_GLM_SERVE_PREFILL_UNITS=1; 0 rows = token chunks): an MTP prompt chunked beside decoding
     // requests runs as one engine session paused at layer boundaries of its pieces of `prefill_units_rows` rows (the
     // engine's max_rows), `prefill_units_layers` units per piece (strix/session/prefill_session.hpp LayerUnits).
@@ -219,8 +225,8 @@ struct LeadStats {
 // The follower (rank 1): hello, then pure replay until shutdown.
 template<class Eng>
 void follow(Eng& eng, Channel& ch, const Hello& hello, std::uint32_t slots, std::uint64_t capacity,
-            bool sampling = false) {
-    ch.hello(hello, sampling);
+            bool sampling = false, bool* turbo_prefill = nullptr) {
+    ch.hello(hello, sampling, turbo_prefill);
     std::optional<PrefixCache> cache;
     if (hello.prefix_cache_bytes) cache.emplace(hello.prefix_cache_bytes);
     for (;;) {
@@ -349,6 +355,8 @@ private:
         std::uint32_t slot = 0;
         std::size_t done = 0;
         unsigned chunk = 0;  // fixed at admission
+        bool turbo = false;  // only a whole, fresh prefill with its own numerical identity
+        bool prefill_route_resolved = false;
         std::uint64_t root = 0;  // root row still to store (LeadConfig::prefix_root); 0: none
         Active a;
         // RTX route: the import this prompt waits for (0: none, or fallen back to the chunked prefill)
@@ -631,7 +639,8 @@ private:
         // A prompt that fits one base chunk keeps the token call (one call either way).
         // A root still to store keeps the token calls up to it (a units session runs to the end of the prompt).
         if (p.units || (p.root <= p.done && cfg_.prefill_units_rows != 0 && p.a.mtp_ok && p.chunk != 0 && lanes != 0 && n - p.done > p.chunk &&
-                        cfg_.prefill_units_admit && cfg_.prefill_units_admit(n - p.done))) {
+                        cfg_.prefill_units_admit && cfg_.prefill_units_admit(n - p.done) &&
+                        (!cfg_.pin_admits || cfg_.pin_admits(n, p.done, n)))) {  // the session's max_rows pieces must be admitted calls
             const bool start = !p.units;
             if (start) {
                 const strix::session::LayerUnits lu{n - p.done, cfg_.prefill_units_rows, cfg_.prefill_units_layers};
@@ -653,7 +662,12 @@ private:
             if (start) chunk.assign(prompt.begin() + static_cast<std::ptrdiff_t>(p.done), prompt.end());
         } else {
             auto plan = cfg_.interleave.plan(p.chunk, n - p.done, lanes, cfg_.prefill_chunk_cap, p.ms_per_token);
-            if (p.root > p.done) plan.tokens = std::min<std::size_t>(plan.tokens, static_cast<std::size_t>(p.root - p.done));
+            if (cfg_.pin_chunk) plan.tokens = cfg_.pin_chunk(n, p.done, plan.tokens);
+            if (p.root > p.done) {
+                const auto to_root = static_cast<std::size_t>(p.root - p.done);
+                // The root store needs a cut at the root: taken only when that cut keeps every row's core.
+                if (plan.tokens >= to_root && (!cfg_.pin_root || cfg_.pin_root(n, p.done, p.done + to_root))) plan.tokens = to_root;
+            }
             m = plan.tokens;
             decode_debt_.charge(plan);
             last = p.done + m == n;
@@ -661,6 +675,16 @@ private:
             c.plen = static_cast<std::uint32_t>(m);
             c.pflags = (p.a.mtp_ok ? kPrefillMtp : 0U) | (last ? kPrefillLast : 0U);
             chunk.assign(prompt.begin() + static_cast<std::ptrdiff_t>(p.done), prompt.begin() + static_cast<std::ptrdiff_t>(p.done + m));
+        }
+        // Cached roots/suffixes, interleaving and sampled or image prompts keep the existing route.
+        if constexpr (requires { eng_.select_turbo_prefill(n, request(p.a).max_tokens, false); }) {
+            if (!p.prefill_route_resolved) {
+                p.prefill_route_resolved = true;
+                const bool fresh = !p.units && p.done == 0 && last && lanes == 0 && p.a.mtp_ok &&
+                    !p.a.sampler && !request(p.a).embeds && p.import_id == 0;
+                p.turbo = eng_.select_turbo_prefill(n, request(p.a).max_tokens, fresh);
+                if (p.turbo) c.pflags |= kPrefillTurbo;
+            }
         }
         // Image rows: the engine of this rank resolves the chunk's virtual ids against the request's table; the
         // follower gets the rows of the chunk's spans in the embed frame after the tokens (once per image).
@@ -732,7 +756,8 @@ private:
             runtime().publish_progress(p.a.state, {strix::serve::GenerationPhase::prefill, p.done, 0, n});
             return;
         }
-        if (cfg_.prefix_cache_bytes && !request(p.a).embeds) store_prefix(p);
+        // Native FAST snapshots must never restore WMMA state on an unmatched request.
+        if (cfg_.prefix_cache_bytes && !request(p.a).embeds && !p.turbo) store_prefix(p);
         const auto ready = cfg_.prefix_cache_bytes ? Clock::now() : t1;
         const std::uint32_t slot = p.slot;
         Active a = std::move(p.a);

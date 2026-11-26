@@ -47,6 +47,13 @@ core_last = 18
 core_passes = 3
 residual_block_layers = 6
 
+# Speculation: the MTP block drafter's sidecar beside the checkpoint (strix/spec/drafter_source.hpp), and the draft
+# rows per lane by live lanes of the served cohort (serve::CohortConfig::max_draft_by_live): a served window is its
+# own forward, so lanes draft only while one lane is live.
+[speculation]
+drafter = "mtp.safetensors"
+max_draft_by_live = [7, 0]
+
 # Launchers project these columns into the engine's native, gated registry.
 [presets]
 # The unqualified native Inkling Mini CLI runs EXACT; FAST is explicitly opt-in.
@@ -58,9 +65,14 @@ levers = "exact"
 [presets.fast]
 levers = "fast"
 
-# Use the admitted FAST levers until this model has a qualified TURBO set.
+# Under a preset the TURBO column of the shared engine is not forwarded off HIP (CUDA keeps the FAST levers).
 [presets.turbo]
 levers = "fast"
+
+# The HIP engine resolves its TURBO column (include/strix/profiles/inkling2_mini.hpp): the FAST levers plus the
+# prefill ladder rows with a measured gain (the CLI and the server select the same class per prompt).
+[presets.turbo.hip]
+levers = "turbo"
 
 # Multi-device placement, resolved by the shared profile resolver (strix-serve --model inkling2-mini --device-count N, strix-router
 # --description). Two whole-model nodes serve independent requests as replicas behind strix-router: each request
