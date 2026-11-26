@@ -166,8 +166,10 @@ inline bool resident_q8_projections_admitted(const float* input, unsigned width,
     for (const auto& projection : projections) {
         const auto* matrix = std::get_if<weight::ResidentMatrixView>(&projection.weights);
         if (!matrix || matrix->columns != width || matrix->rows != projection.outputs) return false;
-        const bool lowbit = matrix->storage == weight::kQ4G64WeightStorage || matrix->storage == weight::kQ6G64WeightStorage;
+        const bool lowbit = matrix->storage == weight::kQ4G64WeightStorage || matrix->storage == weight::kQ6G64WeightStorage ||
+                            matrix->storage == weight::kSP4TWeightStorage;
 #if defined(__HIPCC__)
+        // SP4 is admitted under the group-scale form only, as on the standalone entry.
         if (lowbit ? !lowbit_f16_form(arithmetic) ||
                          !valid_resident_lowbit_rows(*matrix, projection.outputs, input, rows, projection.output, arithmetic)
                    : !valid_resident_q8_rows(*matrix, projection.outputs, input, rows, projection.output))
@@ -204,6 +206,22 @@ inline row_transforms::Status enqueue_resident_q8_projections(
             ++end;
         const auto run = projections.subspan(i, end - i);
         i = end;
+        if (storage == weight::kSP4TWeightStorage) {
+            // One small-M launch for the run, each projection scaled by its tensor's 2^base. Every output column runs
+            // the K chain of the standalone SP4 entry (enqueue_resident_lowbit_rows), so each row has its bits.
+            f16_tile_gemm::Q8ProjectionGroup<Capacity> group{};
+            f16_tile_gemm::small_m::OuterScales<Capacity> outer{};
+            for (const auto& projection : run) {
+                const auto& matrix = std::get<weight::ResidentMatrixView>(projection.weights);
+                outer.value[group.count] = std::ldexp(1.0F, matrix.outer_exponent);
+                group.append({matrix.bytes.data(), projection.outputs, projection.output});
+            }
+            const auto status = f16_tile_gemm::small_m::gemm_sp4(
+                input, rows, width, group, outer, stream,
+                lowbit_wide_block(rows, group.first_panel[group.count], detail::current_lowbit_row_plan(false)));
+            if (status != success) return status;
+            continue;
+        }
         const bool q4 = storage == weight::kQ4G64WeightStorage;
         const bool tile = q4 || storage == weight::kQ6G64WeightStorage || use_resident_q8_tile(rows);
         if (tile) {

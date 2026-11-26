@@ -625,6 +625,28 @@ void check_lowbit_policies() {
     check(wei::find_weight_load_policy("weights.head.q4_g64@1") == &wei::kHeadQ4Policy &&
               wei::find_weight_load_policy("weights.head.q6_g64@1") == &wei::kHeadQ6Policy,
           "head-only keys find their shared rows");
+    // SP4 (fixed table) on the attention projections and the head: every tagged role takes strix.sp4t where a
+    // consumer exists, the untagged roles stay BF16; without the consumer, or in EXACT, everything stays BF16. The
+    // head-only SP4 row keeps its own key.
+    constexpr std::array sp4t{wei::kBf16WeightStorage, wei::kQ8WeightStorage, wei::kQ4G64WeightStorage,
+                              wei::kQ6G64WeightStorage, wei::kSP4TWeightStorage};
+    const auto sp4_mix = resolve(wei::kAttentionHeadSP4TPolicy, strix::profile::Name::turbo, sp4t);
+    check(sp4_mix.storage == wei::kSP4TWeightStorage && sp4_mix.head_storage == wei::kSP4TWeightStorage &&
+              sp4_mix.storage_for(wei::Role::attention_q) == wei::kSP4TWeightStorage &&
+              sp4_mix.storage_for(wei::Role::attention_o) == wei::kSP4TWeightStorage &&
+              sp4_mix.storage_for(wei::Role::head) == wei::kSP4TWeightStorage &&
+              sp4_mix.storage_for(std::nullopt) == wei::kBf16WeightStorage,
+          "SP4 attention + head row: strix.sp4t on every tagged role");
+    const auto sp4_none = resolve(wei::kAttentionHeadSP4TPolicy, strix::profile::Name::turbo, all);
+    check(sp4_none.storage == wei::kBf16WeightStorage && sp4_none.head_storage == wei::kBf16WeightStorage,
+          "SP4 attention + head row without an SP4 consumer stays BF16");
+    const auto sp4_exact = resolve(wei::kAttentionHeadSP4TPolicy, strix::profile::Name::standard, sp4t);
+    check(sp4_exact.storage == wei::kBf16WeightStorage && sp4_exact.head_storage == wei::kBf16WeightStorage,
+          "SP4 attention + head row: EXACT stays BF16");
+    check(wei::find_weight_load_policy("weights.attention_head.sp4t@1") == &wei::kAttentionHeadSP4TPolicy &&
+              wei::find_weight_load_policy("weights.head.sp4t@1") == &wei::kHeadSP4TPolicy &&
+              wei::find_weight_load_policy("weights.attention_head.sp4@1") == &wei::kAttentionHeadSP4Policy,
+          "SP4 keys find their shared rows");
 }
 
 

@@ -9,11 +9,13 @@
 #include "strix/weight/host_lowbit_gptq.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -138,6 +140,64 @@ void check_rows(std::mt19937& rng) {
               << ", worst err/bound " << worst << ", rows 1..33 bitwise per row)\n";
 }
 
+// Attention projections of one input as one grouped launch (core::enqueue_resident_q8_projections): q / k / v of
+// Inkling 2 Mini's widths (3072 / 1024 / 1024 outputs, K 2304), each with its own tensor base. Every row of every
+// projection equals the standalone SP4 entry bitwise, at the decode widths and past the 16-row block.
+void check_grouped(std::mt19937& rng) {
+    constexpr std::size_t k = 2304, max_rows = 33;
+    constexpr std::array<std::size_t, 3> outputs{3072, 1024, 1024};
+    constexpr std::array<float, 3> sigma{0.02F, 0.05F, 0.002F};  // distinct tensor bases
+    std::vector<Sp4Matrix> m;
+    std::vector<std::unique_ptr<Buffer<std::uint8_t>>> w;
+    std::vector<weight::ResidentMatrixView> views;
+    for (std::size_t p = 0; p < outputs.size(); ++p) {
+        m.push_back(make_sp4(outputs[p], k, rng, sigma[p]));
+        w.push_back(std::make_unique<Buffer<std::uint8_t>>(m.back().bytes.size()));
+        w.back()->upload(m.back().bytes);
+        views.push_back(view(w.back()->data, m.back().bytes.size(), weight::kSP4TWeightStorage, outputs[p], k,
+                             S::row_bytes(k), m.back().header.base));
+    }
+    if (m[0].header.base == m[2].header.base) throw std::runtime_error("grouped fixture needs distinct tensor bases");
+    std::uniform_real_distribution<float> act(-3.0F, 3.0F);
+    std::vector<float> x(max_rows * k);
+    for (auto& v : x) v = act(rng);
+    Buffer<float> dx(x.size());
+    dx.upload(x);
+    std::vector<std::unique_ptr<Buffer<float>>> grouped, single;
+    for (const auto n : outputs) {
+        grouped.push_back(std::make_unique<Buffer<float>>(max_rows * n));
+        single.push_back(std::make_unique<Buffer<float>>(max_rows * n));
+    }
+    constexpr unsigned capacity = 7U;  // the attention role count of a resident GQA binding
+    for (const unsigned rows : {1U, 2U, 8U, 16U, 17U, 33U}) {
+        std::vector<core::ResidentRowProjection> list;
+        for (std::size_t p = 0; p < outputs.size(); ++p)
+            list.push_back({views[p], static_cast<unsigned>(outputs[p]), grouped[p]->data});
+        hip_check(core::enqueue_resident_q8_projections<capacity>(dx.data, k, rows, list, nullptr,
+                                                                  core::LowBitArithmetic::f16_group_scale),
+                  "sp4 grouped");
+        for (std::size_t p = 0; p < outputs.size(); ++p)
+            hip_check(core::enqueue_resident_q8_rows(views[p], static_cast<unsigned>(outputs[p]), dx.data, rows,
+                                                     single[p]->data, nullptr, core::LowBitArithmetic::f16_group_scale),
+                      "sp4 standalone");
+        hip_check(hipDeviceSynchronize(), "sync");
+        for (std::size_t p = 0; p < outputs.size(); ++p) {
+            std::vector<float> a(rows * outputs[p]), b(rows * outputs[p]);
+            grouped[p]->download(a);
+            single[p]->download(b);
+            if (std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) != 0)
+                throw std::runtime_error("SP4 grouped projection " + std::to_string(p) + " rows " + std::to_string(rows) +
+                                         " differs from the standalone entry");
+        }
+        // The fp32 sweep and the folded form have no SP4 route: the list is refused before anything is enqueued.
+        for (const auto refused : {core::LowBitArithmetic::fp32_sweep, core::LowBitArithmetic::f16_folded_scale})
+            if (core::resident_q8_projections_admitted<capacity>(dx.data, k, rows, list, refused))
+                throw std::runtime_error("SP4 grouped list admitted without the group-scale form");
+    }
+    std::cout << "sp4 grouped check PASS (q/k/v 3072/1024/1024 x " << k << ", bases " << int{m[0].header.base} << '/'
+              << int{m[1].header.base} << '/' << int{m[2].header.base} << ", rows 1..33 == standalone bitwise)\n";
+}
+
 void bench(std::mt19937& rng) {
     // Same bytes per weight (68 per 128); the time does not depend on the values: random codes, sane scales.
     constexpr std::size_t n = 200058, k = 2304;
@@ -196,6 +256,7 @@ int main(int argc, char** argv) {
     try {
         std::mt19937 rng(20261125U);
         check_rows(rng);
+        check_grouped(rng);
         if (argc == 2 && std::string_view(argv[1]) == "--bench") bench(rng);
     } catch (const std::exception& error) {
         std::cerr << "FAIL sp4 rows: " << error.what() << '\n';
