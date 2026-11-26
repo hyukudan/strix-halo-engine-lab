@@ -108,12 +108,12 @@ def violations(readme):
     found = set()
     for (*group, higher), (_, higher_hi) in measurements.items():
         index = TIERS.index(higher)
-        if index == 0:
-            continue
-        lower = TIERS[index - 1]
-        control = measurements.get((*group, lower))
-        if control and higher_hi < control[0]:
-            found.add("\t".join((*group, lower, higher, str(control[0]), str(higher_hi))))
+        for lower in reversed(TIERS[:index]):
+            control = measurements.get((*group, lower))
+            if control:
+                if higher_hi < control[0]:
+                    found.add("\t".join((*group, lower, higher, str(control[0]), str(higher_hi))))
+                break
     return found
 
 

@@ -44,6 +44,12 @@ class TierMonotonicityTests(unittest.TestCase):
                 "| M | pair | CLI | plain | FAST | 2,048 | 5 | 10 | `next` |\n")
         self.assertEqual(violations(TABLE + rows), set())
 
+    def test_gap_between_measured_tiers_still_detects_loss(self):
+        rows = ("| M | pair | CLI | plain | EXACT | 2,048 | 20 | 100 | `base` |\n"
+                "| M | pair | CLI | plain | FAST | same | — | — | `base` |\n"
+                "| M | pair | CLI | plain | TURBO | same | 22 | 80 | `base` |\n")
+        self.assertEqual(violations(TABLE + rows), {"base\tM\tpair\tCLI\tplain\tprefill\t2048\texact\tturbo\t100\t80"})
+
     def test_empty_or_unparseable_table_refused(self):
         with self.assertRaisesRegex(ValueError, "missing"):
             violations("")
