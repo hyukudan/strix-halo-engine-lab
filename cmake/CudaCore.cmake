@@ -76,10 +76,10 @@ endif()
 
 # Shared multi-request decoder (serve/cohort_decode) bound to the qwen35 slots: N requests per forward, ids == solo.
 add_executable(strix-cuda-qwen35-cohort ${_cc_root}/apps/cuda_qwen35_cohort_main.cu ${_cc_root}/src/serve/cohort_decode.cpp
-    ${_cc_root}/src/serve/row_budget.cpp ${_cc_root}/src/serve/step_planner.cpp ${_cc_root}/src/mtp_context_draft.cpp
+    ${_cc_root}/src/serve/lane_speculation.cpp ${_cc_root}/src/serve/row_budget.cpp ${_cc_root}/src/serve/step_planner.cpp ${_cc_root}/src/mtp_context_draft.cpp
     ${_cc_root}/src/token_sampling.cpp ${_cc_root}/src/speculation_rng.cpp
     ${_cc_root}/src/mtp_selection_transaction.cpp)  # shared window selection (sampled/constrained lanes)
-target_link_libraries(strix-cuda-qwen35-cohort PRIVATE strix_qwen35_cuda)
+target_link_libraries(strix-cuda-qwen35-cohort PRIVATE strix_qwen35_cuda strix_spec)  # strix_spec: lane speculation
 if(MSVC)
     target_compile_options(strix-cuda-qwen35-cohort PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
@@ -308,7 +308,7 @@ if(BUILD_TESTING)
         add_executable(strix-cuda-inkling2-mini-cohort-lanes-test ${_cc_root}/tests/inkling2/mini_cohort_lanes_cuda.cu
             ${_cc_root}/src/serve/cohort_decode.cpp ${_cc_root}/src/serve/step_planner.cpp)
         target_link_libraries(strix-cuda-inkling2-mini-cohort-lanes-test PRIVATE
-            strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core strix_serve)
+            strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core strix_serve strix_spec)
         list(APPEND _cc_mini_verify_target strix-cuda-inkling2-mini-cohort-lanes-test)
         # The verify window program vs the eager verify pass, stage by stage (histories, K/V rows, hidden rows, taps,
         # picks; capture, replay at the same and other positions, after commits 0..K); needs the model checkpoint.
