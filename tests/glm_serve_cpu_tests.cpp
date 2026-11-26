@@ -137,6 +137,8 @@ struct FakeEng {
     std::vector<std::uint64_t> h, frontier;
     std::vector<bool> ready;
     std::uint64_t calls = 0, steps = 0, cycles = 0, prefills = 0;
+    std::atomic<unsigned> idle_quiesces{0};
+    void quiesce_idle() { ++idle_quiesces; }
     std::vector<std::size_t> step_rows;
     std::vector<std::string> log;
     struct Seed { std::uint32_t slot, y0; std::uint64_t p; };
@@ -678,6 +680,47 @@ PairRun run_pair(unsigned n, std::uint32_t slots, bool batch, std::uint32_t toke
     return out;
 }
 
+void pair_idle_quiesce() {
+    Loopback link;
+    FakeEng lead_engine(1), follow_engine(1);
+    gs::Channel lead_channel(link.side(0), 0), follow_channel(link.side(1), 1);
+    const auto hello = hello_for(1, 4096, 2);
+    std::thread follower([&] { gs::follow(follow_engine, follow_channel, hello, 1, 4096); });
+    lead_channel.hello(hello);
+    sv::GenerationQueue queue(8);
+    gs::LeadConfig config;
+    config.slots = 1;
+    config.capacity = 4096;
+    config.heartbeat_seconds = 60;
+    config.quiesce_idle_transport = true;
+    std::atomic<bool> stop{false};
+    gs::Lead<FakeEng> lead(lead_engine, lead_channel, queue, config, stop);
+    std::thread runner([&] { lead.loop(); });
+    const auto quiesced = [&](unsigned count) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (lead_engine.idle_quiesces == count && follow_engine.idle_quiesces == count) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    };
+    CHECK(quiesced(1));  // independent of the configured 60-second heartbeat
+    sv::GenerationJob request;
+    request.prompt = {5, 6, 7};
+    request.max_tokens = 1;
+    auto ticket = queue.submit(std::move(request));
+    bool done = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!done && std::chrono::steady_clock::now() < deadline)
+        (void)ticket->wait(std::chrono::milliseconds(20), done);
+    CHECK(done);
+    CHECK(quiesced(2));  // one new paired receive retirement on the next idle transition
+    stop.store(true);
+    runner.join();
+    follower.join();
+    CHECK(lead_engine.idle_quiesces == 2 && follow_engine.idle_quiesces == 2);
+}
+
 void queued_successor_interleave() {
     // Final grouped chunks must pay their debt before a queued successor prefills (also when slots are reused).
     for (const bool grouped : {false, true}) {
@@ -1201,7 +1244,7 @@ void test_sampled_mtp_replay() {
         const bool threw = throws_with([&] { first = gs::replay(units, solo, pf, prompt, true, 2, 64, nullptr, choice); }, "");
         CHECK(!threw && first.size() == 1 && first[0] == gs::kPrefillPending);
     }
-    CHECK(gs::kControlVersion == 14);
+    static_assert(gs::kControlVersion == 15);
     std::printf("sampled MTP replay: flags and the lead's sampler reach the engine; unknown flags and engines refused\n");
 }
 
@@ -1670,6 +1713,7 @@ void prefix_root_sibling() {
 }
 
 int main(int argc, char** argv) {
+    pair_idle_quiesce();
     test_sampled_mtp_replay();
     test_sampled_mtp_serve();
     test_sampled_mtp_stop();

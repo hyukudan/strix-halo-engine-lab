@@ -412,6 +412,12 @@ struct EngineOps {
         return out;
     }
     bool turbo_prefill_pair = false;
+    strix::dist::Communicator* idle_communicator = nullptr;
+    void quiesce_idle() {
+        if (!idle_communicator || !idle_communicator->device_exchange())
+            throw std::logic_error("idle transport quiesce requires live GPU-direct");
+        idle_communicator->quiesce(nullptr);
+    }
     std::function<bool(std::uint64_t, unsigned, bool)> turbo_prefill_policy{};
     bool select_turbo_prefill(std::uint64_t tokens, unsigned generated, bool fresh) const {
         return turbo_prefill_policy && turbo_prefill_policy(tokens, generated, fresh);
@@ -1361,6 +1367,7 @@ int main(int argc, char** argv) {
         ops.spec.assign(opt.slots, {});
         ops.hp_row.assign(opt.slots, 0);
         ops.world = opt.world;
+        ops.idle_communicator = comm.get();
         const bool turbo_candidate = turbo_prefill_device && rd::measured_prefill_layout(eng.prefill_pipeline()) &&
             !deployment.plan && !serial && rtx_prefill.empty() && import_listen.empty();
         ops.turbo_prefill_pair = rd::select_prefill_wmma(request, eff, rd::process_env(),
@@ -1544,6 +1551,7 @@ int main(int argc, char** argv) {
         lc.g2 = g2_on;
         lc.kmax = eff.kmax;
         lc.heartbeat_seconds = heartbeat_ms / 1000.0;
+        lc.quiesce_idle_transport = comm && comm->device_exchange();
         struct RtxState { std::mutex m; std::set<std::uint32_t> ids; std::string last_reply; };
         auto rtx_state = std::make_shared<RtxState>();  // failed RTX requests; the producer's last receipt (gate)
         lc.state_digest = import_gate_on;

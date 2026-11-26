@@ -113,6 +113,7 @@ struct LeadConfig {
     bool batch = true;               // false: serial admission (one request at a time)
     bool short_first = true;         // admit the shortest waiting prompt first (bounded overtakes); false: FIFO
     double heartbeat_seconds = 1.0;  // idle: one heartbeat round per interval keeps rank 1 and the link alive
+    bool quiesce_idle_transport = false;  // live GPU-direct path may have a receive posted after work
     std::vector<std::uint32_t> stops = default_stop_ids();
     // C1 MTP self-speculation: with exactly one request in flight (and none waiting in batched mode) it decodes through
     // the engine's single-slot verify loop, `mtp_cycles` verify cycles per control round; prompts are prefilled with
@@ -281,7 +282,11 @@ public:
     // Runs until `stop` (then cancels what runs) or the queue shuts down with nothing running; sends shutdown last.
     // On an engine / protocol failure every running request finishes with the error, then it rethrows (no shutdown
     // round: the peer's state is unknown).
-    void loop() { last_round_ = Clock::now(); owner_.runtime().run(); }
+    void loop() {
+        last_round_ = Clock::now();
+        quiesce_due_ = cfg_.quiesce_idle_transport;
+        owner_.runtime().run();
+    }
     strix::serve::SessionRuntime& runtime() noexcept { return owner_.runtime(); }
 
     [[nodiscard]] LeadStats stats() const {
@@ -416,15 +421,21 @@ private:
             if (table_.live() != 0) return;
             if (queue_.has_queued_work()) return;
             if (queue_.stopping()) { drained_ = true; return; }
-            if (std::chrono::duration<double>(Clock::now() - last_round_).count() >= cfg_.heartbeat_seconds) {
+            if (quiesce_due_ || std::chrono::duration<double>(Clock::now() - last_round_).count() >= cfg_.heartbeat_seconds) {
                 Control hb;
                 hb.cmd = static_cast<std::uint32_t>(Cmd::heartbeat);
-                note_peer(ch_.exchange(hb));
+                if (quiesce_due_) {
+                    hb.pflags = kHeartbeatQuiesce;
+                    (void)control_round(hb);
+                    quiesce_due_ = false;
+                } else {
+                    note_peer(ch_.exchange(hb));
+                    count_round();
+                }
                 {
                     std::lock_guard<std::mutex> l(m_);
                     ++stats_.heartbeats;
                 }
-                count_round();
                 last_round_ = Clock::now();
             }
             // Idle: wake on a submit at once (was a 2 ms poll). The 20 ms cap bounds how late stop_ and the
@@ -1004,6 +1015,7 @@ private:
                                             std::span<const strix::serve::PairSamplingRow> choices = {}) {
         seed_slot_ = -1;
         last_rows_.clear();
+        quiesce_due_ = cfg_.quiesce_idle_transport;
         return control_round(c, prompt, choices);
     }
     // A control round without an engine command (import_expect, heartbeat): seeds and last rows stay valid.
@@ -1467,6 +1479,7 @@ private:
     static constexpr std::uint64_t kNoBudget = ~0ULL;
     std::atomic<std::uint64_t> prefix_budget_request_{kNoBudget};
     Clock::time_point last_round_ = Clock::now();
+    bool quiesce_due_ = false;
     double control_ms_ = 0;  // control exchanges since the last prefill chunk started (timeline)
     bool drained_ = false;
     std::string failure_;
