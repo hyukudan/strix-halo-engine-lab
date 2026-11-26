@@ -1,6 +1,7 @@
 #include "minimax/serve/minimax_tokenizer.hpp"
 #include "serve/o200k_pretokenizer.hpp"
 #include "serve/tokenizer_utf8.hpp"
+#include "strix/serve/tokenizer_limits.hpp"
 
 #include <algorithm>
 #include <array>
@@ -327,11 +328,14 @@ private:
 };
 
 std::string read_file(const std::string& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) throw std::runtime_error("minimax tokenizer: cannot open " + path);
-    std::ostringstream ss;
-    ss << file.rdbuf();
-    return ss.str();
+    return strix::serve::read_tokenizer_file(path, "minimax tokenizer");
+}
+
+// A token ID from the file: 0 <= id <= kMaxTokenizerVocabId (IDs size the vocabulary tables).
+std::uint32_t checked_token_id(const TjValue& value) {
+    const auto id = value.as_int();
+    if (id < 0 || id > strix::serve::kMaxTokenizerVocabId) throw std::runtime_error("minimax tokenizer: token ID out of range");
+    return static_cast<std::uint32_t>(id);
 }
 
 }  // namespace
@@ -463,7 +467,7 @@ std::shared_ptr<const MinimaxTokenizer> MinimaxTokenizer::load(const std::string
     const auto* vocab = model->find("vocab");
     if (!vocab || !vocab->is_object()) throw std::runtime_error("minimax tokenizer: model.vocab missing");
     std::size_t vocab_size = 0;
-    for (const auto& [text, id] : vocab->as_object()) vocab_size = std::max<std::size_t>(vocab_size, static_cast<std::size_t>(id.as_int()) + 1U);
+    for (const auto& [text, id] : vocab->as_object()) vocab_size = std::max<std::size_t>(vocab_size, static_cast<std::size_t>(checked_token_id(id)) + 1U);
     impl.vocab.resize(vocab_size);
     impl.vocab_bytes.resize(vocab_size);
     impl.vocab_ids.reserve(vocab->size() * 2U);
@@ -471,7 +475,7 @@ std::shared_ptr<const MinimaxTokenizer> MinimaxTokenizer::load(const std::string
     const auto byte_cp = byte_to_code_point();
     for (std::uint32_t b = 0; b < 256U; ++b) cp_byte.emplace(byte_cp[b], static_cast<unsigned char>(b));
     for (const auto& [text, value] : vocab->as_object()) {
-        const auto id = static_cast<std::uint32_t>(value.as_int());
+        const auto id = checked_token_id(value);
         impl.vocab[id] = text;
         impl.vocab_ids.emplace(text, id);
         // ByteLevel decoder: every character maps to a byte, else the token's own UTF-8 is used.
@@ -516,7 +520,10 @@ std::shared_ptr<const MinimaxTokenizer> MinimaxTokenizer::load(const std::string
     impl.size = vocab_size;
     if (const auto* added = root.find("added_tokens"); added && added->is_array()) {
         for (const auto& t : added->as_array()) {
-            Impl::Added a{t.find("content")->as_string(), static_cast<std::uint32_t>(t.find("id")->as_int()),
+            const auto* content = t.find("content");
+            const auto* added_id = t.find("id");
+            if (!content || !added_id) throw std::runtime_error("minimax tokenizer: added token needs id and content");
+            Impl::Added a{content->as_string(), checked_token_id(*added_id),
                 t.find("special") && t.find("special")->as_bool()};
             const auto flag = [&](const char* key) { const auto* v = t.find(key); return v && v->is_bool() && v->as_bool(); };
             if (flag("lstrip") || flag("rstrip") || flag("single_word") || flag("normalized"))
