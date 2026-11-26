@@ -234,6 +234,9 @@ struct CohortResult {
     // (Appended last, so positional initialisers of the leading fields stay valid.)
     // Why the request ended: "stop", "length", "context" (CohortRequest::context_tokens), "cancelled" or "error".
     std::string_view finish = "error";
+    // Lone-lane speculation receipt (CohortConfig::lane_speculation; empty when the lane never ran a speculator step):
+    // one JSON object of integers and booleans (CohortDecoder::finish).
+    std::string lane_speculation;
 };
 
 struct CohortConfig;
@@ -300,6 +303,9 @@ struct CohortConfig {
         std::uint32_t max_live = 1;
         std::uint32_t max_rows = 8;
         std::string engine, backend;
+        // One stderr line per finished request that ran a speculator step: `strix-lane-spec {the receipt's fields,
+        // "stats": the strix-spec-stats JSON of the lane's drafter}` (diagnostic only: no schedule or bits change).
+        bool log = false;
     } lane_speculation;
 };
 
@@ -365,6 +371,8 @@ public:
     [[nodiscard]] std::uint64_t lane_speculation_suspends() const noexcept { return lane_spec_suspends_; }
     [[nodiscard]] std::uint64_t lane_speculation_resumes() const noexcept { return lane_spec_resumes_; }
     [[nodiscard]] std::uint64_t lane_speculation_lookup_only() const noexcept { return lane_spec_lookup_only_; }
+    // Speculator starts where CohortBackend::lane_speculation_ready answered false (every lane, every request).
+    [[nodiscard]] std::uint64_t lane_speculation_ready_false() const noexcept { return lane_spec_ready_false_; }
     // Decode time (ms) still owed to decoding lanes for prompt time (CohortConfig::prompt_share).
     [[nodiscard]] double prompt_debt_ms() const noexcept { return planner_.debt_ms(); }
     // Test hook: a fixed clock step (ms) per call instead of the wall clock; 0 = wall clock.
@@ -406,6 +414,7 @@ private:
     std::uint64_t order_ = 0, steps_ = 0, rows_ = 0, used_bytes_ = 0;
     std::uint64_t prompt_groups_ = 0, grouped_prompts_ = 0, gap_overshoots_ = 0;
     std::uint64_t lane_spec_steps_ = 0, lane_spec_suspends_ = 0, lane_spec_resumes_ = 0, lane_spec_lookup_only_ = 0;
+    std::uint64_t lane_spec_ready_false_ = 0;
     std::uint32_t lane_spec_rows_ = 0;  // the lane speculator's widest window (max_rows within rows_per_forward)
     double gap_overshoot_ms_ = 0;
     std::uint32_t peak_live_ = 0;

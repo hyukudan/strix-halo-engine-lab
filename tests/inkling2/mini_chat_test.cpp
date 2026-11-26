@@ -2,6 +2,7 @@
 #include "strix/serve/chat_template_kit.hpp"
 
 #include <iostream>
+#include <string>
 #include <string_view>
 
 namespace {
@@ -97,8 +98,29 @@ bool check_images() {
 
 }  // namespace
 
+// The command line (--messages FILE: render_inkling2_chat_request) and the server (prepare_chat: the request's messages
+// rendered with reasoning_effort "none", the only served effort) share one render. The same request body therefore
+// gives the same prompt on both sides; a body without reasoning_effort renders the template default (0.9) on the
+// command line, which is the only difference (q61: the code prompt, 658 CLI tokens vs 656 served: "0.9" vs "0").
+bool check_cli_server_parity() {
+    constexpr std::string_view messages = R"([{"role":"user","content":"Rename `summarise`.\n\n```python\nx = 1\n```"}])";
+    const auto served = render_inkling2_chat(parse_json(messages), {}, Json("none"));
+    const auto cli_none =
+        render_inkling2_chat_request(std::string(R"({"reasoning_effort":"none","messages":)") + std::string(messages) + "}");
+    const auto cli_default = render_inkling2_chat_request(std::string(R"({"messages":)") + std::string(messages) + "}");
+    std::string expected_default = served;
+    const auto at = expected_default.find("Thinking effort level: 0");
+    if (at == std::string::npos) {
+        std::cerr << "served render: no effort line\n";
+        return false;
+    }
+    expected_default.replace(at, std::string_view("Thinking effort level: 0").size(), "Thinking effort level: 0.9");
+    return matches("CLI request with reasoning_effort none vs served render", cli_none, served) &&
+           matches("CLI request without reasoning_effort vs the template default", cli_default, expected_default);
+}
+
 int main() {
-    return check_template() && check_errors() && check_images() &&
+    return check_template() && check_errors() && check_images() && check_cli_server_parity() &&
            matches("shared compact JSON", chat_kit::compact_json(parse_json(R"({"z":[1e-4,1e-5,1e15,1e16,-0.0,-0],"a":0})"),
                                                                  chat_kit::JsonKeyOrder::recursive),
                    R"({"a":0,"z":[0.0001,1e-05,1000000000000000.0,1e+16,-0.0,0]})") ? 0 : 1;

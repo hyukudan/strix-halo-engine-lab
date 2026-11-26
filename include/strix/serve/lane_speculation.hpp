@@ -62,6 +62,10 @@ public:
     [[nodiscard]] bool chained() const noexcept { return chain_.engine() != nullptr; }
     // Model drafter attachments (the first start and every restart on a resume).
     [[nodiscard]] std::uint64_t chain_starts() const noexcept { return chain_starts_; }
+    // Starts that asked CohortBackend::lane_speculation_ready and got false; starts where it answered true but
+    // lane_chain_drafter returned no drafter (receipts: why a lane drafts lookup-only).
+    [[nodiscard]] std::uint64_t ready_refusals() const noexcept { return ready_refusals_; }
+    [[nodiscard]] std::uint64_t chain_refusals() const noexcept { return chain_refusals_; }
     [[nodiscard]] const spec::BlockDrafter& drafter() const;
     [[nodiscard]] const CohortLaneTarget& target() const noexcept { return target_; }
 
@@ -97,7 +101,7 @@ private:
     std::optional<spec::BlockDrafter> drafter_;
     std::optional<spec::BlockSpeculator> speculator_;
     std::uint64_t seen_ = 0;  // stream tokens the drafter's lookup index holds
-    std::uint64_t chain_starts_ = 0;
+    std::uint64_t chain_starts_ = 0, ready_refusals_ = 0, chain_refusals_ = 0;
     bool active_ = false, lookup_only_ = false;
 };
 

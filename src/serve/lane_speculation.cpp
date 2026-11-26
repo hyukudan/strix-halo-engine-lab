@@ -115,12 +115,21 @@ void LaneSpeculator::start(std::uint32_t anchor, std::span<const std::uint32_t> 
     const std::uint64_t position = stream.size() - 1U;  // committed positions; the anchor is the next row
     // The engine's model drafter, restarted at (anchor, position) when its inputs for the lane are complete.
     const auto restart = [&]() -> spec::ChainDrafter* {
-        if (!backend_.lane_speculation_ready(lane_)) return nullptr;
-        return backend_.lane_chain_drafter(lane_, anchor, position);
+        if (!backend_.lane_speculation_ready(lane_)) {
+            ++ready_refusals_;
+            return nullptr;
+        }
+        spec::ChainDrafter* const engine = backend_.lane_chain_drafter(lane_, anchor, position);
+        if (!engine) ++chain_refusals_;
+        return engine;
     };
     if (!drafter_) {
-        if (!backend_.lane_speculation_ready(lane_)) lookup_only_ = true;
+        if (!backend_.lane_speculation_ready(lane_)) {
+            lookup_only_ = true;
+            ++ready_refusals_;
+        }
         spec::ChainDrafter* const engine = lookup_only_ ? nullptr : backend_.lane_chain_drafter(lane_, anchor, position);
+        if (!lookup_only_ && !engine) ++chain_refusals_;
         chain_.attach(engine);
         if (engine) ++chain_starts_;
         build(engine != nullptr);

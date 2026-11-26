@@ -16,6 +16,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using strix::serve::CohortGroup;
@@ -570,6 +571,48 @@ void test_lane_binding() {
         check(std::equal(ids.begin(), ids.end(), solo.begin()), "lane binding: cancelled ids are a prefix of solo");
         check(std::ranges::all_of(raw->staged, [](std::uint32_t s) { return s == 0U; }),
               "lane binding: no window left staged after the cancellation");
+    }
+    {
+        // The served measurement sequence (a short warm-up, then the same prompt twice, one request at a time, all on
+        // lane 0) and a lone lane on a lane that is not ready: every request's receipt (CohortResult::lane_speculation,
+        // also the server's strix-lane-spec line) says whether the model drafter ran, and why not.
+        WindowDecoder* raw = nullptr;
+        LaneBinding* bound = nullptr;
+        auto cohort = make(raw, bound, true);
+        auto logged = config;
+        logged.lane_speculation.log = true;
+        CohortDecoder scheduler(*cohort, logged);
+        const auto has = [](const std::string& s, const char* part) { return s.find(part) != std::string::npos; };
+        for (const auto& [id, tokens] : {std::pair{1U, 8U}, std::pair{2U, 60U}, std::pair{3U, 60U}}) {
+            auto r = request(1U, tokens);
+            r.id = id;
+            scheduler.submit(r);
+            for (int step = 0; step < 300 && !scheduler.idle(); ++step) scheduler.step();
+            const auto done = scheduler.take_finished();
+            check(done.size() == 1U && done[0].ids == solo_ids(r), "lane receipt: sequential request ids == solo");
+            const auto& receipt = done[0].lane_speculation;
+            check(has(receipt, "\"lane\":0,") && has(receipt, "\"chained\":true") &&
+                      has(receipt, "\"lookup_only\":false") && has(receipt, "\"ready_false\":0,") &&
+                      has(receipt, "\"chain_starts\":1,") && has(receipt, "\"suspends\":0,"),
+                  "lane receipt: lane 0 drafts with the engine's drafter on every request");
+            // (how many passes the model drafts is the arbiter's choice on the wall clock: not asserted here)
+        }
+        // Two at once: the short one (lane 0) ends, the long one speculates alone on lane 1 (not ready): lookup-only.
+        auto a = request(4U, 6U), b = request(5U, 40U);
+        scheduler.submit(a);
+        scheduler.submit(b);
+        for (int step = 0; step < 300 && !scheduler.idle(); ++step) scheduler.step();
+        auto done = scheduler.take_finished();
+        std::ranges::sort(done, {}, &strix::serve::CohortResult::id);
+        check(done.size() == 2U && done[0].ids == solo_ids(a) && done[1].ids == solo_ids(b),
+              "lane receipt: pair ids == solo");
+        const auto& lone = done[1].lane_speculation;
+        check(has(lone, "\"lane\":1,") && has(lone, "\"chained\":false") && has(lone, "\"lookup_only\":true") &&
+                  has(lone, "\"ready_false\":1,") && has(lone, "\"chain_starts\":0,") &&
+                  has(lone, "\"model\":{\"passes\":0,"),
+              "lane receipt: a lone lane that is not ready drafts lookup-only and says why");
+        check(scheduler.lane_speculation_ready_false() == 1U && scheduler.lane_speculation_lookup_only() == 1U,
+              "lane receipt: the decoder's totals count the refusal");
     }
 }
 

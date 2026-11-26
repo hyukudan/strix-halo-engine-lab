@@ -308,6 +308,10 @@ public:
     // Posterior mean of the conditional survival at `depth` (decisions bound the cumulative survival, see .cpp).
     [[nodiscard]] double survival(Source source, std::uint32_t bucket, std::uint32_t depth) const;
     [[nodiscard]] const ArbiterConfig& config() const { return config_; }
+    // ArbiterConfig::probe_loss episode state (receipts): an episode is open; the realized loss (ms) of the last closed
+    // one (< 0: none closed yet).
+    [[nodiscard]] bool episode_open() const noexcept { return episode_open_; }
+    [[nodiscard]] double episode_loss_ms() const noexcept { return episode_loss_ms_; }
 
 private:
     struct Beta { double a = 0, b = 0; };

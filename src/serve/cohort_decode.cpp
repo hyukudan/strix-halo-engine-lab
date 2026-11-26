@@ -13,6 +13,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace strix::serve {
@@ -65,6 +66,29 @@ std::uint32_t sample_lane(CohortBackend& backend, std::uint32_t lane, TokenSampl
     if (backend.samples_on_device()) return backend.sample_final(lane, sampler, position);
     return sampler.decide(backend.read_final_logits(lane), position, nullptr).token;
 }
+// The lane's counters of one request (CohortResult::lane_speculation): integers and booleans only.
+struct LaneSpecCounts {
+    std::uint64_t steps = 0, suspends = 0, resumes = 0;
+};
+std::string lane_speculation_receipt(const LaneSpeculator& sp, std::uint32_t lane, const LaneSpecCounts& counts) {
+    const auto& drafter = sp.drafter();
+    const auto& stats = drafter.stats();
+    const auto& arbiter = drafter.arbiter();
+    const auto u = [](std::uint64_t v) { return std::to_string(v); };
+    const auto b = [](bool v) { return std::string(v ? "true" : "false"); };
+    const auto source = [&](spec::Source s) {
+        const auto k = static_cast<std::size_t>(s);
+        return "{\"passes\":" + u(stats.source_passes[k]) + ",\"proposed\":" + u(stats.source_proposed[k]) +
+               ",\"accepted\":" + u(stats.source_accepted[k]) + "}";
+    };
+    return "{\"lane\":" + u(lane) + ",\"steps\":" + u(counts.steps) + ",\"suspends\":" + u(counts.suspends) +
+           ",\"resumes\":" + u(counts.resumes) + ",\"chained\":" + b(sp.chained()) + ",\"lookup_only\":" +
+           b(sp.lookup_only()) + ",\"chain_starts\":" + u(sp.chain_starts()) + ",\"ready_false\":" +
+           u(sp.ready_refusals()) + ",\"chain_null\":" + u(sp.chain_refusals()) + ",\"passes\":" + u(stats.passes) +
+           ",\"emitted\":" + u(stats.emitted) + ",\"model\":" + source(spec::Source::model) + ",\"lookup\":" +
+           source(spec::Source::lookup) + ",\"serial\":" + source(spec::Source::serial) + ",\"episode_open\":" +
+           b(arbiter.episode_open()) + ",\"episode_closed_loss\":" + b(arbiter.episode_loss_ms() >= 0.0) + "}";
+}
 }  // namespace
 
 void CohortBackend::prefill_group(std::span<const CohortPrompt> members) {
@@ -90,6 +114,7 @@ struct CohortDecoder::Lane {
     std::vector<std::uint32_t> spec_unseen;
     std::uint32_t spec_anchor = 0;
     bool spec_lookup_only = false;  // counted in lane_speculation_lookup_only
+    std::uint64_t spec_steps = 0, spec_suspends = 0, spec_resumes = 0;  // this request's (CohortResult::lane_speculation)
     std::vector<double> tried, kept;  // kept histogram per draft row index: rows the target verified / kept
     std::uint64_t prompt_start = 0;   // prompt rows restored at admission (a group member starts from 0 only)
     bool whole = false;               // the backend's prefill reads the whole prompt and emits the first id
@@ -326,6 +351,24 @@ void CohortDecoder::finish(Lane& lane, std::string error) {
     if (lane.sampler) lane.result.sampling_receipt = job_sampling_receipt(*lane.sampler);
     for (std::size_t i = 0; i < lanes_.size(); ++i) {
         if (lanes_[i].get() != &lane) continue;
+        if (lane.speculator && lane.speculator->started()) {
+            lane.result.lane_speculation = lane_speculation_receipt(*lane.speculator, static_cast<std::uint32_t>(i),
+                                                                    {lane.spec_steps, lane.spec_suspends, lane.spec_resumes});
+            if (config_.lane_speculation.log) {
+                std::string line = lane.result.lane_speculation;
+                line.pop_back();  // the closing brace: the drafter's stats and the decoder's totals follow
+                std::fprintf(stderr,
+                             "strix-lane-spec %s,\"totals\":{\"steps\":%llu,\"suspends\":%llu,\"resumes\":%llu,"
+                             "\"lookup_only_lanes\":%llu,\"ready_false\":%llu},\"stats\":%s}\n",
+                             line.c_str(), static_cast<unsigned long long>(lane_spec_steps_),
+                             static_cast<unsigned long long>(lane_spec_suspends_),
+                             static_cast<unsigned long long>(lane_spec_resumes_),
+                             static_cast<unsigned long long>(lane_spec_lookup_only_),
+                             static_cast<unsigned long long>(lane_spec_ready_false_),
+                             lane.speculator->drafter().stats().json().c_str());
+                std::fflush(stderr);
+            }
+        }
         used_bytes_ -= lane.bytes;
         if (lane.request.retain && lane.result.error.empty() && !lane.result.cancelled && !lane.result.ids.empty()) {
             // committed inputs: the prompt (its last token was the first decode row), then every emitted id that a
@@ -610,8 +653,13 @@ void CohortDecoder::step() {
                 if (stream.size() != l.position + 1U || stream.back() != l.pending)
                     throw std::logic_error("cohort decoder: lane speculation out of step with the lane");
                 const bool resume = sp->started();
+                const std::uint64_t refused = sp->ready_refusals();
                 sp->start(l.pending, stream);
-                if (resume) ++lane_spec_resumes_;
+                lane_spec_ready_false_ += sp->ready_refusals() - refused;
+                if (resume) {
+                    ++lane_spec_resumes_;
+                    ++l.spec_resumes;
+                }
                 if (sp->lookup_only() && !l.spec_lookup_only) {
                     l.spec_lookup_only = true;
                     ++lane_spec_lookup_only_;
@@ -631,6 +679,7 @@ void CohortDecoder::step() {
             if (record.emitted == 0U || out.empty() || out.size() > room)
                 throw std::logic_error("cohort decoder: lane speculation produced an invalid window");
             ++lane_spec_steps_;
+            ++l.spec_steps;
             rows_ += record.rows;
             l.result.steps += 1;
             l.result.drafted += record.rows - 1U;
@@ -648,6 +697,7 @@ void CohortDecoder::step() {
         if (l.speculator && l.speculator->active()) {
             l.speculator->suspend();
             ++lane_spec_suspends_;
+            ++l.spec_suspends;
         }
         if (!l.spec_unseen.empty()) {
             if (l.drafter) {
