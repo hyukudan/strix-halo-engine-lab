@@ -334,6 +334,9 @@ struct PrefillWork {
     bool pair_ready = false;
     std::uint64_t prompt = 0, capacity = 0;
     unsigned rows = 0, lanes = 0, generated = 0;
+    // Scratch storage of the admitted layout (routed or the original full arena): no arithmetic change, but part of the
+    // execution key, so a receipt measured on one storage (the TURBO literal rows: routed) decides only that storage.
+    bool routed_scratch = true;
 };
 
 inline std::optional<strix::profile::Resolution> resolve_product(const Request& r, const EnvGet& env, bool baseline,
@@ -351,7 +354,7 @@ inline std::optional<strix::profile::Resolution> resolve_product(const Request& 
     inputs.env = profile_env;
     const auto execution = work.pair_ready ? p::ladder_execution({"hip", kTurboPrefillDevice,
             {work.prompt, work.capacity, work.lanes, work.rows, work.rows, 1, 0, work.generated},
-            kTurboPrefillSettings}) : std::string{};
+            work.routed_scratch ? kTurboPrefillSettings : kFullScratchPrefillSettings}) : std::string{};
     inputs.regime = {p::Phase::prefill, work.prompt, work.lanes,
                      execution.empty() ? std::string_view{} : kTurboPrefillDevice, execution};
     auto product = p::resolve(product_profile_engine, inputs);
@@ -365,6 +368,17 @@ inline std::optional<strix::profile::Resolution> resolve_product(const Request& 
             entry.ladder.clear();
             entry.ladder_lowered = false;
         }
+    }
+    // pf_wmma is profile-owned per prompt (select_prefill_wmma opens the bundle in a ProfileScope; the switch is never
+    // exported), and that selection admits no --allow-pending run. The shared benchmark opt-in of an unmeasured regime
+    // would only rename the cell in the receipt: report the exact cores that run. STRIX_GLM_PF_WMMA=1 forces the bundle.
+    for (auto& entry : product.entries) {
+        if (entry.lever->name != "pf_wmma" || entry.status != strix::profile::Status::unqualified) continue;
+        entry.value = std::string(entry.lever->builtin);
+        entry.status = strix::profile::Status::builtin;
+        entry.reason = "per-prompt cell: the benchmark opt-in does not open it";
+        entry.ladder.clear();
+        entry.ladder_lowered = false;
     }
     // These GLM routes inherit the umbrella after the baseline veto. Only report the inherited
     // value: the runtime owns the fallback and must still see the original environment.
@@ -396,8 +410,11 @@ inline std::optional<strix::profile::Resolution> resolve_product(const Request& 
     return product;
 }
 
-inline bool ordinary_turbo(const Request& r, const Effective& e) {
-    return r.product.profile == strix::profile::Name::turbo && !r.product.allow_pending &&
+// The ordinary pair workload of a lossy profile (FAST or TURBO): the only requests whose prefill the ladder rows of
+// pf_wmma can decide per prompt. Anything else keeps the startup resolution (the exact cores unless switched explicitly).
+inline bool ordinary_lossy_prefill(const Request& r, const Effective& e) {
+    return (r.product.profile == strix::profile::Name::fast || r.product.profile == strix::profile::Name::turbo) &&
+        !r.product.allow_pending &&
         !e.baseline && r.world == 2 && r.xch == "comm" && r.decode && !r.reference_gate &&
         !r.mem_plan && r.idcheck == 0 && e.prefill == "gemv" && e.identity.value == "r1b" &&
         e.mtp_spec.value == "1" && e.decode_xch.value == "xfer" && e.kmax == 3 && e.adaptive &&
@@ -429,13 +446,12 @@ inline bool measured_prefill_switches(const Effective& e, const EnvGet& env) {
     return true;
 }
 
-// Called for a whole prompt, after pair agreement and the final chunk/layout admission.
-inline bool select_prefill_turbo(const Request& r, const Effective& e, const EnvGet& env, const PrefillWork& work) {
-    if (!work.pair_ready || !ordinary_turbo(r, e) ||
-        !measured_prefill_switches(e, env) || work.rows != kTurboPrefillRows ||
-        work.capacity != kTurboPrefillCapacity || work.lanes != 1 || work.generated != kTurboPrefillGenerated)
-        return false;
-    if (work.prompt != product_ladder_rows[0].min_context && work.prompt != product_ladder_rows[1].min_context)
+// Called for a whole prompt, after pair agreement and the final chunk/layout admission. The composition, the chunk and
+// the lane count are the measured ones of every pf_wmma row; the shared ladder then decides the prompt: the TURBO rows
+// are literal keys (prompt, capacity, generated), the FAST row a band receipt bound to this execution.
+inline bool select_prefill_wmma(const Request& r, const Effective& e, const EnvGet& env, const PrefillWork& work) {
+    if (!work.pair_ready || !ordinary_lossy_prefill(r, e) || !measured_prefill_switches(e, env) ||
+        work.rows != kTurboPrefillRows || work.lanes != 1)
         return false;
     const auto product = resolve_product(r, env, e.baseline, work);
     const auto* wmma = product->find("pf_wmma");
@@ -553,7 +569,7 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
     e.spec_arbiter = arbiter == "1";
     e.world = r.world;
     resolve_sampled_mtp(e, env);
-    if (select_prefill_turbo(r, e, env, work)) e.product = resolve_product(r, env, e.baseline, work);
+    if (select_prefill_wmma(r, e, env, work)) e.product = resolve_product(r, env, e.baseline, work);
     return e;
 }
 
@@ -612,6 +628,7 @@ inline std::string mtp_decode_line(const Effective& e) {
                (e.mtp_spec_candidate && !e.head.mtp_complete ? " (" + e.head.reason + ")" : std::string{}) + "\n";
     std::string line = "effective mtp-decode=verified";
     for (const auto& path : e.head.mtp_files) line += " " + path.generic_string();
+    if (!e.head.mtp_digest.empty()) line += " payload=" + e.head.mtp_digest;
     return line + "\n";
 }
 
@@ -633,6 +650,8 @@ inline std::string print(const Effective& e, bool include_asset_receipt = true) 
     line("spec", e.spec);
     s += "effective mtp-head=" + e.head.reason + "\n";
     if (include_asset_receipt) s += mtp_decode_line(e);
+    // Path-free drafter content identity (mtp_payload_digest): part of the pair identity vote (print without assets).
+    if (e.mtp_spec.value == "1" && !e.head.mtp_digest.empty()) s += "effective mtp-payload=" + e.head.mtp_digest + "\n";
     s += "effective mtp-kmax=" + std::to_string(e.kmax) + " adaptive=" + (e.adaptive ? "1" : "0") + "\n";
     s += "effective mtp-bootstrap=" + std::string(e.mtp_spec.value == "1" ? (e.prefill == "gemv" ? "chunked" : "ref") : "plain") + "\n";
     s += "effective prefill=" + e.prefill + " (requested " + e.prefill_requested.value + ", " + e.prefill_requested.source + ")\n";

@@ -2844,13 +2844,13 @@
   },
   {
     "engine": "glm",
-    "name": "FAST WMMA prefill linear cores (glm-pf-wmma-x)",
+    "name": "FAST WMMA prefill bundle (glm-pf-wmma-x)",
     "flag_or_env": "STRIX_GLM_PF_WMMA",
-    "default": "off (glm rank --profile fast enables; opt-in FAST identity)",
-    "exact": "FAST identity (new FP32 summation order); pre-registered quality-parity check passed at 1K / 8K / 32K; OFF equals the exact 8K logits anchors on both ranks.",
-    "gain": "Pair 8K TTFT 15.45 -> 12.94 s (-16.3 %), 32K 62.3 -> 51.2 s (-17.8 %, mean of both run orders); whole-call MoE -28..-29 %, dense 8192 rows -28..-32 %",
-    "preconditions": "Dense calls of 2048+ rows (X3 route); MoE calls on V11/V14.",
-    "off_switch": "STRIX_GLM_PF_WMMA=0 (overrides --profile fast); unset stays off without fast",
+    "default": "on under --profile fast / turbo for pair prompts of 2,049..8,192 tokens in the measured execution (band receipt); TURBO also at 31,258 tokens; off otherwise",
+    "exact": "FAST identity (new FP32 summation order); FAST gate v2 with MoE route replay at 8K: 5 windows, 1,275 rows, pooled KL 0.00018, top-1 0.9969, dNLL -0.0013; OFF equals the exact 8K logits anchors on both ranks.",
+    "gain": "Pair 8,192-token prompt: exact cores 12.32 s -> bundle 8.23 s cold (x1.50; warm 655 -> 1,000 tok/s); TURBO 8K TTFT -16.3 %, 32K -17.8 %; FAST default (--profile fast alone, cold): CLI 8,192 tokens 12.78 -> 8.54 s (x1.50, 959 tok/s, forced-arm head logits bitwise = gate arm, EXACT bitwise unchanged); served 8,108 tokens 889 tok/s vs 628 before",
+    "preconditions": "Ordinary two-rank pair workload (Radeon 8060S x2, USB4 2x2x40, MTP decode on, 8,192-row chunks, one lane, fresh prompt); one shared resolver for CLI and server.",
+    "off_switch": "STRIX_GLM_PF_WMMA=0, --profile exact, or --baseline",
     "doc_anchor": "docs/optimizations.md#glm-pf-wmma-x"
   },
   {

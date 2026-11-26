@@ -356,7 +356,8 @@ int main() {
     check_bundle("deepseek41-pair", strix::deepseek41::pair_defaults::profile_table, strix::ds41::fast_profile::kBundle,
                  strix::deepseek41::pair_defaults::ladder_rows);
     check_table("glm-pair", strix::glm::rank_defaults::product_profile_table, false,
-                strix::glm::rank_defaults::product_ladder_rows);
+                strix::glm::rank_defaults::product_ladder_rows,
+                {p::Phase::prefill, 8192, 1, strix::glm::rank_defaults::kTurboPrefillDevice, p::kBandProbeExecution});
     check_table("deepseek41-rtx", strix::ds41::rtx::profile::shared_rows());
     minimax_bundle();
     check_table("minimax-pair", strix::minimax::defaults::profile_table, false, strix::minimax::defaults::ladder_rows);
@@ -374,7 +375,7 @@ int main() {
         const auto ds41_rows = bundle_rows(dp::profile_table, strix::ds41::fast_profile::kBundle);
         const auto mm_rows = bundle_rows(md::profile_table, md::kFastBundle);
         check_gates("deepseek41-pair", dp::profile_table, dp::fast_gates, ds41_rows);
-        check_gates("glm-pair", strix::glm::rank_defaults::product_profile_table, {});
+        check_gates("glm-pair", strix::glm::rank_defaults::product_profile_table, strix::glm::rank_defaults::fast_gates);
         check_gates("deepseek41-rtx", strix::ds41::rtx::profile::shared_rows(), {});
         check_gates("minimax-pair", md::profile_table, {}, mm_rows);
         check_gates("qwen-hip", strix::qwen::profile::table, {});
