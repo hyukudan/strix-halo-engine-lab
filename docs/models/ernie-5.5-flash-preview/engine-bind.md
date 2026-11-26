@@ -68,6 +68,9 @@ without a second key RMS, and reverses the VHA factor order used by the
 initial candidate. It keeps the raw output head. The mode is available to
 both the oracle and the chat runner. Set `STRIX_ERNIE_ORACLE_CHECKPOINT` when
 configuring the build to register the slow next-token loss fixture.
+For generation probes, `--bos` prepends the explicit BOS ID to the rendered
+chat. `--min-new-tokens` delays EOS eligibility for the specified number of
+generated tokens. Raw logit traces preserve every score for those probes.
 
 The [pair plan](pair-plan.md) describes native weight placement, memory admission,
 the shared transport seam and the first device ticket.

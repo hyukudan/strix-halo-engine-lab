@@ -31,6 +31,7 @@ static_assert(std::endian::native == std::endian::little, "CPU trace files use l
 
 struct Options {
     unsigned steps = 32, threads = 1, cache_mib = 0;
+    unsigned min_new_tokens = 0;
     unsigned start_layer = 0, end_layer = ernie::kLayerCount, limit = 128;
     std::optional<unsigned> prompt;
     std::string activation = "soft-clip";
@@ -106,6 +107,7 @@ Options parse_options(int argc, char** argv) {
         if (arg == "--multiply-fixed-gain") { opts.fixed_gain = true; continue; }
         if (++i == argc) throw std::invalid_argument("missing option value");
         if (arg == "--generate") opts.steps = number(argv[i]);
+        else if (arg == "--min-new-tokens") opts.min_new_tokens = number(argv[i]);
         else if (arg == "--threads") opts.threads = number(argv[i]);
         else if (arg == "--cache-mib") opts.cache_mib = number(argv[i]);
         else if (arg == "--prompt-index") opts.prompt = number(argv[i]);
@@ -123,6 +125,8 @@ Options parse_options(int argc, char** argv) {
     }
     if (!opts.steps || opts.steps > 4096 || !opts.threads || opts.threads > 16 || opts.cache_mib > 32768)
         throw std::invalid_argument("expected 1-4096 output tokens, 1-16 threads and 0-32768 MiB of decoded cache");
+    if (opts.min_new_tokens > opts.steps || (opts.min_new_tokens && (opts.oracle || !opts.replay.empty())))
+        throw std::invalid_argument("minimum new tokens require a free-running generation with a sufficient limit");
     if (!opts.capture.empty() && (!opts.packed.empty() || !opts.replay.empty()))
         throw std::invalid_argument("capture requires a free-running source-checkpoint run");
     if (opts.oracle && (opts.prompt || !opts.capture.empty() || !opts.replay.empty() ||
@@ -130,7 +134,7 @@ Options parse_options(int argc, char** argv) {
         opts.start_layer > opts.end_layer || opts.end_layer > ernie::kLayerCount ||
         (opts.start_layer != 0 && opts.resume.empty())))
         throw std::invalid_argument("invalid oracle options or missing layer cache");
-    if (!opts.oracle && (opts.bos || opts.save_layers || opts.dump_logits || !opts.resume.empty() || opts.start_layer != 0 ||
+    if (!opts.oracle && (opts.save_layers || opts.dump_logits || !opts.resume.empty() || opts.start_layer != 0 ||
         opts.end_layer != ernie::kLayerCount || opts.limit != 128 || opts.multimax != "identity"))
         throw std::invalid_argument("layer and text options require --oracle");
     return opts;
@@ -205,6 +209,11 @@ std::vector<std::uint32_t> top_logits(std::span<const float> logits) {
     });
     ids.resize(20);
     return ids;
+}
+
+bool is_eos(std::uint32_t token) {
+    return std::ranges::find(ernie::data::tokens::generation_eos_ids, token) !=
+           std::end(ernie::data::tokens::generation_eos_ids);
 }
 
 float rms(std::span<const float> row) {
@@ -442,14 +451,16 @@ void run_prompt(const Json& request, unsigned index, const strix::serve::BpeToke
     if (const auto* tools = request.find("tools")) chat.tools = *tools;
     chat.enable_thinking = false;
     const auto prompt = strix::serve::render_ernie_chat(chat);
-    const auto ids = prompt.encode(tokenizer);
+    auto ids = prompt.encode(tokenizer);
+    constexpr std::string_view bos_marker = "<|ERNIE_BEGIN|>";
+    if (opts.bos) ids.insert(ids.begin(), tokenizer.find(bos_marker));
     if (ids.empty() || ids.size() > 4096 || opts.steps > 4096 - ids.size())
         throw std::invalid_argument("CPU runner requires prompt plus generation to fit context 4096");
     fs::create_directory(folder);
     output_file(folder / "request.json") << request.dump() << '\n';
-    output_file(folder / "prompt.txt") << prompt.text();
+    output_file(folder / "prompt.txt") << (opts.bos ? bos_marker : std::string_view{}) << prompt.text();
     auto prompt_out = output_file(folder / "prompt.u32");
-    write_row(prompt_out, std::span(ids));
+    write_row(prompt_out, std::span<const std::uint32_t>(ids));
     prompt_out.close();
     std::cerr << "prompt " << index << " prefill " << ids.size() << " rows\n";
 
@@ -486,15 +497,20 @@ void run_prompt(const Json& request, unsigned index, const strix::serve::BpeToke
             auto first = trace_file(folder / "first-token-top20.tsv", "id\traw_logit");
             for (auto id : top) first << id << '\t' << logits[id] << '\n';
         }
-        generated.push_back(replay ? replay->next(step, logits) : top.front());
+        auto choice = top.front();
+        if (step < opts.min_new_tokens) {
+            const auto next = std::ranges::find_if_not(top, is_eos);
+            if (next == top.end()) throw std::logic_error("top candidates contain only stop tokens");
+            choice = *next;
+        }
+        generated.push_back(replay ? replay->next(step, logits) : choice);
         write_row(files.generated, std::span<const std::uint32_t>(generated).last(1));
         write_row(files.scores, std::span<const float>(logits));
         files.generated.flush();
         files.scores.flush();
         output_file(folder / "partial-response.txt") << tokenizer.decode(generated, false);
         std::cerr << "prompt " << index << " generated " << generated.size() << " id " << generated.back() << '\n';
-        if (std::ranges::find(ernie::data::tokens::generation_eos_ids, generated.back()) !=
-            std::end(ernie::data::tokens::generation_eos_ids) || step + 1 == opts.steps) break;
+        if (is_eos(generated.back()) || step + 1 == opts.steps) break;
         logits = reference.append(std::span<const std::uint32_t>(generated).last(1), observer);
     }
     if (calibration)
@@ -507,6 +523,7 @@ void run_prompt(const Json& request, unsigned index, const strix::serve::BpeToke
     output_file(folder / "response.txt") << response;
     auto receipt = Json(Json::Object{
         {"identity", "candidate-raw-head"}, {"activation", opts.activation},
+        {"bos", opts.bos}, {"minimum_new_tokens", std::uint64_t{opts.min_new_tokens}},
         {"bf16_projections", opts.bf16}, {"multiply_fixed_gain", opts.fixed_gain},
         {"variants", variant_names(opts)},
         {"pack", !opts.packed.empty()}, {"teacher_forced", replay.has_value()},
@@ -530,7 +547,7 @@ void run_prompt(const Json& request, unsigned index, const strix::serve::BpeToke
 int main(int argc, char** argv) try {
     if (argc < 4) {
         std::cerr << "usage: strix-ernie-cpu CHECKPOINT PROMPTS.json NEW_TRACE_DIR"
-                     " [--generate N] [--prompt-index N] [--activation soft-clip|hard-clip|swiglu]"
+                     " [--generate N] [--min-new-tokens N] [--bos] [--prompt-index N] [--activation soft-clip|hard-clip|swiglu]"
                      " [--bf16-projections] [--multiply-fixed-gain] [--recovered-contract] [--threads N] [--cache-mib N]"
                      " [--capture MODEL_DESCRIPTION] [--pack SIDECAR] [--replay TRACE_DIR]\n"
                      "       strix-ernie-cpu CHECKPOINT TEXT_FILE NEW_TRACE_DIR --oracle"
