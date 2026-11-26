@@ -779,12 +779,14 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf(const std::string& pat
     auto& impl = *const_cast<BpeTokenizer&>(*out).impl_;
     if (strict) {
         if (is_decimal) {
-            // Full byte coverage makes unknown-token and byte-fallback paths
-            // unreachable. Ordinary text must never emit an added ID.
-            for (const auto& encoded_byte : impl.byte_unicode) {
-                const auto id = out->find(encoded_byte);
+            // Every byte that can occur in UTF-8 needs an ordinary symbol.
+            // C0, C1 and F5 through FF never occur in valid UTF-8 input.
+            // Unknown-token and byte-fallback paths are unreachable there.
+            for (std::size_t byte = 0; byte < impl.byte_unicode.size(); ++byte) {
+                if (byte == 0xc0U || byte == 0xc1U || byte > 0xf4U) continue;
+                const auto id = out->find(impl.byte_unicode[byte]);
                 if (id == UINT32_MAX || out->type(id) != TokenType::normal)
-                    throw std::invalid_argument("tokenizer: decimal-triplet BPE needs a complete ordinary byte alphabet");
+                    throw std::invalid_argument("tokenizer: decimal-triplet BPE needs every ordinary UTF-8 byte");
             }
         }
         impl.ignore_merges = ignore && ignore->as_bool();
