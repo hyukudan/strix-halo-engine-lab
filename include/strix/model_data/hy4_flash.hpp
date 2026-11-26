@@ -10,10 +10,43 @@
 namespace strix::model_data::hy4_flash {
 
 namespace multi_device {
+namespace forms {
+namespace layers {
+inline constexpr std::string_view axis = "layer";
+inline constexpr std::int64_t ranks = 2;
+inline constexpr std::string_view wire = "reference";
+} // namespace layers
+namespace tensor {
+inline constexpr std::string_view draft_placement = "split";
+inline constexpr std::string_view expert_partition = "slots";
+inline constexpr double expert_shares[] = {0x1p-1 /* 0.5 */, 0x1p-1 /* 0.5 */};
+inline constexpr std::int64_t ranks = 2;
+inline constexpr std::string_view wire = "bf16-exact";
+} // namespace tensor
+} // namespace forms
 namespace legacy_env {
 inline constexpr std::string_view STRIX_HY4_TP_DRAFT = "forms.tensor.draft_placement";
 inline constexpr std::string_view STRIX_HY4_TP_JOIN_BF16 = "forms.tensor.wire";
 } // namespace legacy_env
+inline constexpr std::string_view order[] = {"measured_decode", "pair_prefill", "pair_decode"};
+namespace regimes {
+namespace measured_decode {
+inline constexpr std::string_view lever = "hy4_tp_mtp_decode";
+inline constexpr bool measured = true;
+inline constexpr std::string_view min_tier = "fast";
+inline constexpr std::string_view phase = "decode";
+inline constexpr std::string_view prefer[] = {"tensor"};
+} // namespace measured_decode
+namespace pair_decode {
+inline constexpr std::string_view phase = "decode";
+inline constexpr std::string_view prefer[] = {"layers"};
+} // namespace pair_decode
+namespace pair_prefill {
+inline constexpr std::string_view phase = "prefill";
+inline constexpr std::string_view prefer[] = {"layers"};
+} // namespace pair_prefill
+} // namespace regimes
+inline constexpr std::int64_t version = 1;
 } // namespace multi_device
 inline constexpr std::string_view name = "hy4-flash";
 namespace presets {
