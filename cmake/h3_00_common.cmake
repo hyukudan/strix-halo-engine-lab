@@ -2,6 +2,7 @@
 add_library(strix_h3_common INTERFACE)
 target_include_directories(strix_h3_common INTERFACE src include)
 target_compile_features(strix_h3_common INTERFACE cxx_std_20)
+target_link_libraries(strix_h3_common INTERFACE strix-weight)
 if(NOT MSVC)
     target_compile_options(strix_h3_common INTERFACE -fno-fast-math -ffp-contract=off)
 endif()
