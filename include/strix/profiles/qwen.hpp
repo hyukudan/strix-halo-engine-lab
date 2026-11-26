@@ -71,16 +71,7 @@ struct Resolution {
         return std::nullopt;
     }
     std::string qualification() const {
-        std::string provisional, unqualified;
-        for (const auto& entry : entries) {
-            auto* rows = entry.status == Status::provisional ? &provisional :
-                entry.status == Status::unqualified ? &unqualified : nullptr;
-            if (rows) *rows += (rows->empty() ? "" : ",") + std::string(entry.lever->name);
-        }
-        std::string out;
-        if (!provisional.empty()) out = "qualification in progress: " + provisional;
-        if (!unqualified.empty()) out += (out.empty() ? "" : "; ") + std::string("unqualified: ") + unqualified;
-        return out.empty() ? "qualified" : out;
+        return ::strix::profile::qualification_summary(entries);
     }
     std::vector<std::string> notices() const {
         std::vector<std::string> out;
@@ -122,7 +113,8 @@ struct Resolution {
                 pending.push(std::move(item));
             }
             if (entry.status == Status::provisional) provisional.push(serve::Json(std::string(lever.name)));
-            if (entry.status == Status::unqualified) unqualified.push(serve::Json(std::string(lever.name)));
+            if (::strix::profile::qualification_status(entry) == Status::unqualified)
+                unqualified.push(serve::Json(std::string(lever.name)));
         }
         out.set("levers", std::move(rows));
         if (is_turbo()) {

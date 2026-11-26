@@ -166,10 +166,9 @@ const Entry* Resolution::find(std::string_view lever) const {
     return nullptr;
 }
 std::string Resolution::qualification() const {
-    std::string rows;
-    for (const auto& e : entries)
-        if (e.status == Status::unqualified) rows += (rows.empty() ? "" : ",") + std::string(e.lever->name);
-    return rows.empty() ? "qualified" : "unqualified: " + rows;
+    return strix::profile::qualification_summary(entries, [](const Entry& entry) {
+        return strix::profile::qualification_status(entry, "off");
+    });
 }
 std::vector<std::string> Resolution::pending() const {
     std::vector<std::string> out;
@@ -218,7 +217,8 @@ std::string Resolution::json(const std::function<std::string(std::string_view)>&
         }
         out += '}';
         std::string& list = e.status == Status::pending ? pend : unq;
-        if (e.status == Status::pending || e.status == Status::unqualified) {
+        if (e.status == Status::pending ||
+            strix::profile::qualification_status(e, "off") == strix::profile::Status::unqualified) {
             if (!list.empty()) list += ',';
             escape(list, e.lever->name);
         }

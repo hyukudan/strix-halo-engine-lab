@@ -212,6 +212,10 @@ int main() {
     CHECK(syn({}, true, pf::Name::standard).find("runnable_pending") == nullptr);  // default leaves it alone
     CHECK(status(syn({}, true, pf::Name::fast, {{"TEST_RP", "0"}}), "runnable_pending") == "explicit-env");
     CHECK(syn({}, true, pf::Name::fast, {{"TEST_RP", "0"}}).qualification() == "qualified");
+    const auto explicit_pending = syn({}, false, pf::Name::standard, {{"TEST_RP", "1"}});
+    CHECK(status(explicit_pending, "runnable_pending") == "explicit-env");
+    CHECK(explicit_pending.qualification() == "unqualified: runnable_pending");
+    CHECK(explicit_pending.json().find("\"unqualified\":[\"runnable_pending\"]") != std::string::npos);
 
     // the receipt JSON carries the app's effective value when given
     const auto j = none.json([](std::string_view l) { return l == "wb_stream" ? std::string("on") : std::string(); });

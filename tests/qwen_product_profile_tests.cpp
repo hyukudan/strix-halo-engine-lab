@@ -140,6 +140,13 @@ void product() {
 void resolver() {
     Env env;
     pr::Inputs inputs{{}, lookup(env), false};
+    env["STRIX_PREFILL_INDEX_SCORE_WMMA"] = "1";
+    const auto explicit_index = pr::resolve(pr::Name::standard, inputs);
+    check(explicit_index.find("index_score_wmma")->status == pr::Status::explicit_env &&
+          explicit_index.qualification() == "unqualified: index_score_wmma" &&
+          explicit_index.json().find("\"unqualified\":[\"index_score_wmma\"]") != std::string::npos,
+          "explicit unqualified index arithmetic is stamped in its receipt");
+    env.clear();
     auto r = pr::resolve(pr::Name::fast, inputs, synthetic);
     check(r.find("ready")->status == pr::Status::set, "ready row applies");
     check(r.find("pending")->status == pr::Status::pending && r.find("absent")->status == pr::Status::pending, "pending never refuses");

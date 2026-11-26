@@ -595,6 +595,56 @@ struct Entry {
     std::string ladder_reference{};  // the reference the deciding timing rows must name (LadderRow::over)
 };
 
+// Adapters with their own app/option schemas bind the same qualification rule to their value columns.
+template <class Row>
+[[nodiscard]] bool explicit_value_qualified(const Row& lever, std::string_view value, std::string_view off,
+                                             std::span<const bool> provisional = {}, std::string_view same_bits = {}) {
+    if (lever.kind != Kind::bit_changing) return true;
+    if (value == lever.builtin || (!off.empty() && value == off)) return true;
+    const bool in_class = bit_class_member(same_bits, value);
+    for (std::size_t c = 0; c < lever.value.size(); ++c)
+        if (lever.ready[c] && (provisional.empty() || !provisional[c]) && !lever.value[c].empty() &&
+            (value == lever.value[c] || (in_class && bit_class_member(same_bits, lever.value[c]))))
+            return true;
+    return false;
+}
+
+template <class ResolvedEntry>
+[[nodiscard]] Status qualification_status(const ResolvedEntry& entry, std::string_view off,
+                                           std::span<const bool> provisional = {}, std::string_view same_bits = {}) {
+    using EntryStatus = decltype(entry.status);
+    if constexpr (requires { EntryStatus::provisional; }) {
+        if (entry.status == EntryStatus::provisional) return Status::provisional;
+    }
+    if (entry.status == EntryStatus::unqualified ||
+        ((entry.status == EntryStatus::explicit_cli || entry.status == EntryStatus::explicit_env) &&
+         !explicit_value_qualified(*entry.lever, entry.value, off, provisional, same_bits)))
+        return Status::unqualified;
+    return Status::builtin;
+}
+
+[[nodiscard]] inline Status qualification_status(const Entry& entry) {
+    return qualification_status(entry, entry.lever->off, entry.lever->provisional, entry.lever->same_bits);
+}
+
+template <class ResolvedEntry, class StatusOf>
+[[nodiscard]] std::string qualification_summary(const std::vector<ResolvedEntry>& entries, StatusOf status_of) {
+    std::string provisional, unqualified;
+    for (const auto& entry : entries) {
+        const auto status = status_of(entry);
+        auto* rows = status == Status::provisional ? &provisional : status == Status::unqualified ? &unqualified : nullptr;
+        if (rows != nullptr) *rows += (rows->empty() ? "" : ",") + std::string(entry.lever->name);
+    }
+    std::string out;
+    if (!provisional.empty()) out = "qualification in progress: " + provisional;
+    if (!unqualified.empty()) out += (out.empty() ? "" : "; ") + std::string("unqualified: ") + unqualified;
+    return out.empty() ? "qualified" : out;
+}
+
+[[nodiscard]] inline std::string qualification_summary(const std::vector<Entry>& entries) {
+    return qualification_summary(entries, [](const Entry& entry) { return qualification_status(entry); });
+}
+
 struct Inputs;
 struct Resolution;
 inline Resolution resolve(const Engine&, const Inputs&);
@@ -671,31 +721,13 @@ struct Resolution {
     // member of that value's same_bits class): the table's qualification data, one rule for every engine.
     [[nodiscard]] static bool explicit_value_qualified(const Entry& entry) {
         const Lever& lever = *entry.lever;
-        if (lever.kind != Kind::bit_changing) return true;
-        if (entry.value == lever.builtin || (!lever.off.empty() && entry.value == lever.off)) return true;
-        const bool in_class = bit_class_member(lever.same_bits, entry.value);
-        for (std::size_t c = 0; c < kProfileColumns; ++c)
-            if (lever.ready[c] && !lever.provisional[c] && !lever.value[c].empty() &&
-                (entry.value == lever.value[c] || (in_class && bit_class_member(lever.same_bits, lever.value[c]))))
-                return true;
-        return false;
+        return ::strix::profile::explicit_value_qualified(lever, entry.value, lever.off, lever.provisional, lever.same_bits);
     }
     // "qualified"; else "qualification in progress: <rows>" for provisional columns and/or "unqualified: <rows>"
     // when --allow-pending ran pending columns or an explicit setting chose a bit-changing value no qualified column
     // has, separated by "; ".
     [[nodiscard]] std::string qualification() const {
-        std::string provisional, unqualified;
-        for (const auto& entry : entries) {
-            const bool explicit_unqualified = (entry.status == Status::explicit_cli || entry.status == Status::explicit_env) &&
-                                              !explicit_value_qualified(entry);
-            auto* rows = entry.status == Status::provisional ? &provisional :
-                entry.status == Status::unqualified || explicit_unqualified ? &unqualified : nullptr;
-            if (rows != nullptr) *rows += (rows->empty() ? "" : ",") + std::string(entry.lever->name);
-        }
-        std::string out;
-        if (!provisional.empty()) out = "qualification in progress: " + provisional;
-        if (!unqualified.empty()) out += (out.empty() ? "" : "; ") + std::string("unqualified: ") + unqualified;
-        return out.empty() ? "qualified" : out;
+        return qualification_summary(entries);
     }
     // One stderr line per pending, provisional or unqualified row (and the quality fallback note).
     [[nodiscard]] std::vector<std::string> notices() const {
@@ -731,7 +763,7 @@ struct Resolution {
                 pending += "{\"lever\":" + json_string(lever.name) + ",\"target\":" + json_string(entry.target) +
                     ",\"runs\":" + json_string(entry.value) + "}";
             }
-            if (entry.status == Status::unqualified) {
+            if (qualification_status(entry) == Status::unqualified) {
                 if (!unqualified.empty()) unqualified += ',';
                 unqualified += json_string(lever.name);
             }

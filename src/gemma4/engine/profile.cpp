@@ -230,10 +230,9 @@ std::string Resolution::drafter() const {
     }
 }
 std::string Resolution::qualification() const {
-    std::string rows;
-    for (const auto& entry : entries)
-        if (entry.status == Status::unqualified) rows += (rows.empty() ? "" : ",") + std::string(entry.lever->name);
-    return rows.empty() ? "qualified" : "unqualified: " + rows;
+    return strix::profile::qualification_summary(entries, [](const Entry& entry) {
+        return strix::profile::qualification_status(entry, entry.lever->off);
+    });
 }
 std::string Resolution::json() const {
     std::string out = "{\"profile\":";
@@ -278,7 +277,7 @@ std::string Resolution::json() const {
             escape(pending, entry.value);
             pending += '}';
         }
-        if (entry.status == Status::unqualified) {
+        if (strix::profile::qualification_status(entry, entry.lever->off) == strix::profile::Status::unqualified) {
             if (!unqualified.empty()) unqualified += ',';
             escape(unqualified, entry.lever->name);
         }
