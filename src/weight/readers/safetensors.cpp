@@ -65,38 +65,51 @@ Status index_safetensors(std::shared_ptr<const Source> source, TensorIndex& out,
         out=std::move(result);return {Error::ok,{}};
     }catch(const std::exception& e){return {Error::malformed,e.what()};}
 }
-Status validate_safetensors_shard_manifest(const TensorIndex& index, std::string_view json,
-                                         std::string_view shard) {
-    if (index.container != Container::safetensors)
-        return {Error::unknown_format, "expected a safetensors index"};
+Status validate_safetensors_manifest(std::span<const SafetensorsManifestEntry> tensors,
+                                     std::string_view json, std::span<const std::string> missing_shards) {
     try {
         const auto manifest = serve::parse_json_unique(json);
         const auto* metadata = manifest.find("metadata");
         const auto* total_size = metadata ? metadata->find("total_size") : nullptr;
         const auto* weights = manifest.find("weight_map");
-        if (!total_size || !weights || weights->as_object().size() != index.tensors.size())
-            return {Error::malformed, "manifest does not describe every tensor in the shard"};
+        if (!total_size || !weights || !weights->is_object())
+            return {Error::malformed, "manifest needs total_size and weight_map"};
 
         std::map<std::string_view, std::string_view> shards;
         for (const auto& [name, owner] : weights->as_object()) shards.emplace(name, owner.as_string());
 
         std::uint64_t payload_bytes = 0;
-        for (const auto& tensor : index.tensors) {
+        for (const auto& tensor : tensors) {
             const auto it = shards.find(tensor.name);
-            if (it == shards.end() || it->second != shard)
-                return {Error::malformed, "missing or incorrect shard mapping for " + tensor.name};
+            if (it == shards.end() || it->second != tensor.shard)
+                return {Error::malformed, "missing or incorrect shard mapping for " + std::string(tensor.name)};
             shards.erase(it);
-            if (tensor.payload.range.bytes > std::numeric_limits<std::uint64_t>::max() - payload_bytes)
+            if (tensor.bytes > std::numeric_limits<std::uint64_t>::max() - payload_bytes)
                 return {Error::malformed, "shard payload total overflows"};
-            payload_bytes += tensor.payload.range.bytes;
+            payload_bytes += tensor.bytes;
         }
+        for (const auto& [name, shard] : shards)
+            if (std::ranges::find(missing_shards, shard) == missing_shards.end())
+                return {Error::malformed, "manifest tensor is absent from its shard: " + std::string(name)};
         const auto declared = total_size->as_int();
-        if (declared < 0 || static_cast<std::uint64_t>(declared) != payload_bytes)
+        if (declared < 0 || static_cast<std::uint64_t>(declared) < payload_bytes ||
+            (shards.empty() && static_cast<std::uint64_t>(declared) != payload_bytes))
             return {Error::malformed, "manifest total_size disagrees with the shard payload"};
         return {Error::ok, {}};
     } catch (const serve::JsonError& error) {
         return {Error::malformed, error.what()};
     }
+}
+
+Status validate_safetensors_shard_manifest(const TensorIndex& index, std::string_view json,
+                                         std::string_view shard) {
+    if (index.container != Container::safetensors)
+        return {Error::unknown_format, "expected a safetensors index"};
+    std::vector<SafetensorsManifestEntry> entries;
+    entries.reserve(index.tensors.size());
+    for (const auto& tensor : index.tensors)
+        entries.push_back({tensor.name, shard, tensor.payload.range.bytes});
+    return validate_safetensors_manifest(entries, json);
 }
 
 FormatId safetensors_format(std::string_view dtype) noexcept {
