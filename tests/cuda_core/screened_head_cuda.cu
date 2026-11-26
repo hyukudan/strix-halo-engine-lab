@@ -10,7 +10,7 @@
 //    a vocabulary that is not a multiple of 16), the separate softcap pass (core::enqueue_bf16_softcap_head) and the shared
 //    pick over R rows. The screened head over R lanes (strided activations, per-lane fallback) gives the same Pick per
 //    lane, and lane l equals the R=1 head of its row (R = 1, 2, 3, 4, 5, 8).
-// 5. Bench at the Inkling 2 Mini head shape (200,058 x 2,304): full vs screened per head, then R = 1, 2, 4, 8 lanes against
+// 5. Bench at the Inkling 2 Mini head shape (200,058 x 2,304): full vs screened per head, then R = 1, 2, 4, 8, 16, 32 lanes against
 //    the incumbent multi-row head. REFUSED unless 1-4 PASS.
 // usage: cuda_core_screened_head_test [--bench]   (no flag: tests only)
 #include <cuda_runtime.h>
@@ -39,6 +39,7 @@ namespace hp = strix::cuda::core::head_argmax;
 namespace rt = strix::core::row_transforms;
 namespace cc = strix::cuda_core;
 namespace ha = strix::head_argmax;
+namespace plan = strix::core::screened_head_plan;
 
 int failures = 0;
 
@@ -451,7 +452,7 @@ void bench() {
     constexpr unsigned rows = 200058U, width = 2304U, iterations = 50U;
     std::mt19937 rng(4321U);
     std::normal_distribution<float> normal(0.0F, 1.0F);
-    constexpr unsigned max_lanes = 8U;
+    constexpr unsigned max_lanes = 32U;
     std::vector<float> xl(std::size_t{max_lanes} * width);
     for (auto& v : xl) v = normal(rng);
     // 1,024 random rows repeated (cheap to generate; repeated rows only add exact ties far below the dominant rows).
@@ -530,11 +531,12 @@ void bench() {
     CK(cudaGraphExecDestroy(exec));
     CK(cudaGraphDestroy(graph));
     // Lanes: the engine form over R rows (one projection launch set, softcap pass, R-row pick) versus the screened head
-    // over R lanes (pass 1 reads the plane once per group of pass1_lanes lanes).
+    // over R lanes (pass 1 reads the plane from memory once: lane groups of pass1_lanes share it in L2), plus the
+    // schedule identity of the pass-1 bounds against the R=1 form.
     {
         hs::ResidentScreen wide(dw, rows, width, 30.0F, stream, 8U, max_lanes);
         auto* dpicks = device_alloc<ha::Pick>(max_lanes);
-        for (const unsigned lanes : {1U, 2U, 4U, 8U}) {
+        for (const unsigned lanes : {1U, 2U, 4U, 8U, 16U, 32U}) {
             auto engine = make_engine(rows, lanes);
             CK(engine.enqueue(dw, dxl, width, 30.0F, stream));
             CK(cudaStreamSynchronize(stream));
@@ -545,7 +547,35 @@ void bench() {
             const auto got_l = read_picks(dpicks, lanes);
             bool lanes_ok = wide.usable();
             for (unsigned l = 0; l < lanes; ++l) lanes_ok = lanes_ok && same(got_l[l], want_l[l]);
+            // Schedule identity: the pass-1 bounds (upper[] of every row) and Lstar of each lane are bitwise the R=1
+            // form's (one-row tiles, one group) on the same activation.
+            const auto lane_launch = wide.launch(dxl, lanes, width);
+            const auto lp = hs::detail::parts(lane_launch);
+            std::vector<float> got_upper(rows), want_upper(rows);
+            std::vector<hs::State> lane_states(lanes);
+            CK(cudaMemcpy(lane_states.data(), lp.state, lanes * sizeof(hs::State), cudaMemcpyDeviceToHost));
+            unsigned upper_diff = 0, lkey_diff = 0;
+            for (unsigned l = 0; l < lanes; ++l) {
+                CK(cudaMemcpy(got_upper.data(), lp.upper + std::size_t{l} * lp.strides.upper, rows * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+                CK(screen.enqueue(dxl + std::size_t{l} * width, EmitPick{dpick}, stream));
+                CK(cudaStreamSynchronize(stream));
+                const auto rp = hs::detail::parts(screen.launch(dxl + std::size_t{l} * width));
+                CK(cudaMemcpy(want_upper.data(), rp.upper, rows * sizeof(float), cudaMemcpyDeviceToHost));
+                hs::State one{};
+                CK(cudaMemcpy(&one, rp.state, sizeof(hs::State), cudaMemcpyDeviceToHost));
+                if (std::memcmp(got_upper.data(), want_upper.data(), rows * sizeof(float)) != 0) ++upper_diff;
+                if (one.lkey != lane_states[l].lkey) ++lkey_diff;
+            }
+            lanes_ok = lanes_ok && upper_diff == 0U && lkey_diff == 0U;
             if (!lanes_ok) ++failures;
+            const unsigned groups = plan::pass1_groups(lanes, lane_launch.pass1_lanes);
+            std::printf("%s screened-head-cuda pass1 schedule lanes=%u: %u group(s) x %u lanes, tile rows %u, blocks %u "
+                        "(resident %u, cap %u); upper/Lstar vs R=1: %u/%u lane(s) differ\n",
+                        upper_diff == 0U && lkey_diff == 0U ? "PASS" : "FAIL", lanes, groups, lane_launch.pass1_lanes,
+                        plan::pass1_tile_rows(lane_launch.pass1_lanes),
+                        plan::pass1_blocks(lane_launch.grids.pass1, lane_launch.pass1_resident, groups),
+                        lane_launch.pass1_resident, lane_launch.grids.pass1, upper_diff, lkey_diff);
             auto* dpicks2 = device_alloc<ha::Pick2>(lanes);
             const double top2_us = time_us([&] { CK(wide.enqueue2(dxl, EmitPick2{dpicks2}, stream, lanes, width)); });
             CK(cudaFree(dpicks2));

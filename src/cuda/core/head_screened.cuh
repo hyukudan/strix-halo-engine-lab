@@ -5,7 +5,8 @@
 // Five fixed launches, no host read between them (graph-capture safe), each a separate stage function so a step program
 // can bind them as five one-launch leaves:
 //   1 prep     one block per lane: nx = inflated ||x||_2, the FALLBACK flag (non-finite x or overflow guard), state reset
-//   2 pass1    warp per plane row, up to kMaxPass1Lanes lanes per block row (the plane row is read once for all of them):
+//   2 pass1    warp per row tile (plan::pass1_tile_rows rows), up to kMaxPass1Lanes lanes per block (the plane row is
+//              read once for all of them; lane groups folded into the block index, one wave of resident blocks):
 //              y_hat, e, U (stored per lane), Lstar = max L (ordered-key atomic max per lane)
 //   3 compact  per lane: candidates i with G(U_i) >= G(Lstar) -> ids (warp-aggregated atomic); FALLBACK or too many -> ALL
 //   4 pass2    the incumbent R=1 FP32 head row body (dense_bf16_fp32_r1_mapped, the mapped trait of
@@ -98,25 +99,32 @@ __global__ void __launch_bounds__(256) prep_kernel(const float* x, unsigned x_st
     }
 }
 
-// Block row blockIdx.y serves lanes [y * Lanes, min(lanes, (y + 1) * Lanes)); xs holds their activations ([Lanes][width]).
+// Lane group g = block % groups serves lanes [g * Lanes, min(lanes, (g + 1) * Lanes)); xs holds their activations
+// ([Lanes][width]). Each warp carries TileRows consecutive plane rows (plan::pass1_tile_rows): the activations it reads
+// from shared memory for one unit serve all of them. Per (row, lane) the arithmetic is the one-row form's (thread t folds
+// units t, t + 32, ... in order, then the warp sum), so every bound is bitwise independent of the schedule.
 // Top2 (runner-up trait) also tracks the second-largest lower bound per lane in key2: each warp folds its own top two,
 // then max(key1) and max(min(previous key1, own first), own second) give the global second-largest of the multiset.
 template <unsigned Bits, unsigned Lanes, bool Top2>
-__global__ void __launch_bounds__(plan::kPass1Waves * 32U) pass1_kernel(PlaneView plane, const float* x, unsigned lanes,
-                                                                        Strides strides, sh::Bound bound, State* state,
-                                                                        float* upper, unsigned* key2) {
+// Two blocks per SM: a group of 8 lanes carries a 4-row tile (32 accumulators + 32 decoded weights per thread); the
+// register cap keeps 16 warps resident (one block of 8 warps cannot cover the memory latency).
+__global__ void __launch_bounds__(plan::kPass1Waves * 32U, 2) pass1_kernel(PlaneView plane, const float* x, unsigned lanes,
+                                                                        unsigned groups, Strides strides, sh::Bound bound,
+                                                                        State* state, float* upper, unsigned* key2) {
+    constexpr unsigned TileRows = plan::pass1_tile_rows(Lanes);
     extern __shared__ __align__(16) float xs[];
-    const unsigned first = blockIdx.y * Lanes;
+    __shared__ float nxs[Lanes];
+    const auto map = plan::pass1_map(blockIdx.x, gridDim.x, groups);
+    const unsigned first = map.group * Lanes;
     const unsigned live = lanes - first < Lanes ? lanes - first : Lanes;
     bool any = false;
-    float nx[Lanes];
 #pragma unroll
     for (unsigned l = 0; l < Lanes; ++l) {
         const bool on = l < live && state[first + l].flag == 0U;
         any = any || on;
-        nx[l] = on ? state[first + l].nx : 0.0F;
+        if (threadIdx.x == 0U) nxs[l] = on ? state[first + l].nx : 0.0F;
     }
-    if (!any) return;  // uniform: every lane of this block row runs the full head
+    if (!any) return;  // uniform: every lane of this group runs the full head
     const unsigned warp = threadIdx.x / 32U, lane = threadIdx.x % 32U;
     const unsigned quads = plane.width / 4U;
     for (unsigned i = threadIdx.x; i < Lanes * quads; i += blockDim.x) {
@@ -128,66 +136,83 @@ __global__ void __launch_bounds__(plan::kPass1Waves * 32U) pass1_kernel(PlaneVie
     __syncthreads();
     const unsigned units = plane.width / sh::kUnit;
     float lmax[Lanes], lmax2[Lanes];
-    bool bad[Lanes];
+    unsigned bad = 0U;  // bit l: lane l saw a non-finite bound
 #pragma unroll
-    for (unsigned l = 0; l < Lanes; ++l) {
-        lmax[l] = lmax2[l] = __int_as_float(static_cast<int>(0xff800000U));  // -inf
-        bad[l] = false;
-    }
-    for (unsigned row = blockIdx.x * plan::kPass1Waves + warp; row < plane.rows; row += gridDim.x * plan::kPass1Waves) {
-        const std::uint8_t* base = plane.data + std::size_t{row} * plane.row_bytes;
-        const std::uint16_t* scales = reinterpret_cast<const std::uint16_t*>(base + plane.scales_offset);
-        float acc[Lanes];
+    for (unsigned l = 0; l < Lanes; ++l) lmax[l] = lmax2[l] = __int_as_float(static_cast<int>(0xff800000U));  // -inf
+    const unsigned tiles = (plane.rows + TileRows - 1U) / TileRows, step = plan::pass1_tile_step(map);
+    for (unsigned tile = plan::pass1_first_tile(map, warp); tile < tiles; tile += step) {
+        const unsigned row0 = tile * TileRows;
+        const std::uint8_t* base[TileRows];
 #pragma unroll
-        for (unsigned l = 0; l < Lanes; ++l) acc[l] = 0.0F;
+        for (unsigned r = 0; r < TileRows; ++r)  // a clipped tail row re-reads row0 (in bounds) and is never stored
+            base[r] = plane.data + std::size_t{row0 + r < plane.rows ? row0 + r : row0} * plane.row_bytes;
+        float acc[TileRows][Lanes];
+#pragma unroll
+        for (unsigned r = 0; r < TileRows; ++r)
+#pragma unroll
+            for (unsigned l = 0; l < Lanes; ++l) acc[r][l] = 0.0F;
         for (unsigned u = lane; u < units; u += 32U) {
-            float q[8];
-            if constexpr (Bits == 4U) {
-                const unsigned word = *reinterpret_cast<const unsigned*>(base + 4U * u);
+            float q[TileRows][8], s[TileRows];
 #pragma unroll
-                for (unsigned j = 0; j < 8U; ++j) q[j] = static_cast<float>(static_cast<int>((word >> (4U * j)) & 15U) - 8);
-            } else {
-                const uint2 word = *reinterpret_cast<const uint2*>(base + 8U * u);
+            for (unsigned r = 0; r < TileRows; ++r) {
+                if constexpr (Bits == 4U) {
+                    const unsigned word = *reinterpret_cast<const unsigned*>(base[r] + 4U * u);
 #pragma unroll
-                for (unsigned j = 0; j < 8U; ++j) {
-                    const unsigned w32 = j < 4U ? word.x : word.y;
-                    q[j] = static_cast<float>(static_cast<int>(static_cast<std::int8_t>((w32 >> (8U * (j % 4U))) & 255U)));
+                    for (unsigned j = 0; j < 8U; ++j)
+                        q[r][j] = static_cast<float>(static_cast<int>((word >> (4U * j)) & 15U) - 8);
+                } else {
+                    const uint2 word = *reinterpret_cast<const uint2*>(base[r] + 8U * u);
+#pragma unroll
+                    for (unsigned j = 0; j < 8U; ++j) {
+                        const unsigned w32 = j < 4U ? word.x : word.y;
+                        q[r][j] = static_cast<float>(
+                            static_cast<int>(static_cast<std::int8_t>((w32 >> (8U * (j % 4U))) & 255U)));
+                    }
                 }
+                const std::uint16_t* scales = reinterpret_cast<const std::uint16_t*>(base[r] + plane.scales_offset);
+                s[r] = __uint_as_float(static_cast<unsigned>(scales[u / 4U]) << 16U);
             }
-            const float s = __uint_as_float(static_cast<unsigned>(scales[u / 4U]) << 16U);
 #pragma unroll
             for (unsigned l = 0; l < Lanes; ++l) {
                 const float4 x0 = *reinterpret_cast<const float4*>(xs + l * plane.width + 8U * u);
                 const float4 x1 = *reinterpret_cast<const float4*>(xs + l * plane.width + 8U * u + 4U);
                 const float xv[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
-                float inner = 0.0F;
 #pragma unroll
-                for (unsigned j = 0; j < 8U; ++j) inner = __fmaf_rn(q[j], xv[j], inner);
-                acc[l] = __fmaf_rn(s, inner, acc[l]);
+                for (unsigned r = 0; r < TileRows; ++r) {
+                    float inner = 0.0F;
+#pragma unroll
+                    for (unsigned j = 0; j < 8U; ++j) inner = __fmaf_rn(q[r][j], xv[j], inner);
+                    acc[r][l] = __fmaf_rn(s[r], inner, acc[r][l]);
+                }
             }
         }
-        const float slack = __fmul_rn(bound.gamma, plane.amplitude[row]);
-        const float residual = plane.residual[row];
 #pragma unroll
-        for (unsigned l = 0; l < Lanes; ++l) {
-            const float yhat = ::strix::cuda_core::warp_sum_xor(acc[l]);
-            const float e =
-                __fadd_rn(__fmul_rn(__fmul_rn(nx[l], __fadd_rn(residual, slack)), bound.margin), bound.abs_slack);
-            // Outward-rounded interval: L <= yhat - e (round down), U >= yhat + e (round up), both as real numbers.
-            const float hi = __fadd_ru(yhat, e), lo = __fadd_rd(yhat, -e);
-            if (l < live) {
-                if (lane == 0U) upper[std::size_t{first + l} * strides.upper + row] = hi;
-                if (!(isfinite(hi) && isfinite(lo))) {
-                    bad[l] = true;
-                } else if constexpr (Top2) {
-                    if (lo > lmax[l]) {
-                        lmax2[l] = lmax[l];
-                        lmax[l] = lo;
-                    } else if (lo > lmax2[l]) {
-                        lmax2[l] = lo;
+        for (unsigned r = 0; r < TileRows; ++r) {
+            const unsigned row = row0 + r;
+            if (row >= plane.rows) break;  // warp-uniform
+            const float slack = __fmul_rn(bound.gamma, plane.amplitude[row]);
+            const float residual = plane.residual[row];
+#pragma unroll
+            for (unsigned l = 0; l < Lanes; ++l) {
+                const float yhat = ::strix::cuda_core::warp_sum_xor(acc[r][l]);
+                const float e = __fadd_rn(__fmul_rn(__fmul_rn(nxs[l], __fadd_rn(residual, slack)), bound.margin),
+                                          bound.abs_slack);
+                // Outward-rounded interval: L <= yhat - e (round down), U >= yhat + e (round up), both as real numbers.
+                const float hi = __fadd_ru(yhat, e), lo = __fadd_rd(yhat, -e);
+                if (l < live) {
+                    if (lane == 0U) upper[std::size_t{first + l} * strides.upper + row] = hi;
+                    if (!(isfinite(hi) && isfinite(lo))) {
+                        bad |= 1U << l;
+                    } else if constexpr (Top2) {
+                        if (lo > lmax[l]) {
+                            lmax2[l] = lmax[l];
+                            lmax[l] = lo;
+                        } else if (lo > lmax2[l]) {
+                            lmax2[l] = lo;
+                        }
+                    } else {
+                        lmax[l] = fmaxf(lmax[l], lo);
                     }
-                } else {
-                    lmax[l] = fmaxf(lmax[l], lo);
                 }
             }
         }
@@ -196,7 +221,7 @@ __global__ void __launch_bounds__(plan::kPass1Waves * 32U) pass1_kernel(PlaneVie
 #pragma unroll
         for (unsigned l = 0; l < Lanes; ++l) {
             if (l >= live) continue;
-            if (bad[l]) atomicOr(&state[first + l].flag, 1U);
+            if ((bad >> l) & 1U) atomicOr(&state[first + l].flag, 1U);
             const float none = __int_as_float(static_cast<int>(0xff800000U));
             if (lmax[l] > none) {
                 const unsigned k1 = order_key(lmax[l]);
@@ -308,12 +333,27 @@ cudaError_t ensure_pass1_shared(std::size_t bytes) {
 }
 
 template <unsigned Bits, bool Top2>
-cudaError_t pass1_form(const Launch& a, const Parts& p, unsigned per_group, cudaStream_t stream, bool launch) {
+cudaError_t pass1_form(const Launch& a, const Parts& p, unsigned per_group, cudaStream_t stream, bool launch,
+                       unsigned* resident = nullptr) {
     const std::size_t smem = std::size_t{per_group} * a.head.width * sizeof(float);
-    const dim3 grid(a.grids.pass1, plan::pass1_groups(a.lanes, per_group)), block(plan::kPass1Waves * 32U);
+    const unsigned groups = plan::pass1_groups(a.lanes, per_group);
+    const dim3 grid(plan::pass1_blocks(a.grids.pass1, a.pass1_resident, groups)), block(plan::kPass1Waves * 32U);
     const auto run = [&](auto kernel, cudaError_t ready) {
-        if (ready != cudaSuccess || !launch) return ready;
-        kernel<<<grid, block, smem, stream>>>(a.plane, a.x, a.lanes, p.strides, a.bound, p.state, p.upper, p.key2);
+        if (ready != cudaSuccess) return ready;
+        if (resident) {  // host query at load: SMs x blocks per SM of this instantiation at this shared size
+            int device = 0, sms = 0, per_sm = 0;
+            if (const auto e = cudaGetDevice(&device); e != cudaSuccess) return e;
+            if (const auto e = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device); e != cudaSuccess)
+                return e;
+            if (const auto e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel,
+                                                                             static_cast<int>(block.x), smem);
+                e != cudaSuccess)
+                return e;
+            *resident = static_cast<unsigned>(sms > 0 ? sms : 0) * static_cast<unsigned>(per_sm > 0 ? per_sm : 0);
+        }
+        if (!launch) return cudaSuccess;
+        kernel<<<grid, block, smem, stream>>>(a.plane, a.x, a.lanes, groups, p.strides, a.bound, p.state, p.upper,
+                                              p.key2);
         return cudaGetLastError();
     };
     switch (per_group) {
@@ -326,9 +366,10 @@ cudaError_t pass1_form(const Launch& a, const Parts& p, unsigned per_group, cuda
 }
 
 template <unsigned Bits>
-cudaError_t pass1_bits(const Launch& a, const Parts& p, unsigned per_group, cudaStream_t stream, bool launch) {
-    return a.runner_up ? pass1_form<Bits, true>(a, p, per_group, stream, launch)
-                       : pass1_form<Bits, false>(a, p, per_group, stream, launch);
+cudaError_t pass1_bits(const Launch& a, const Parts& p, unsigned per_group, cudaStream_t stream, bool launch,
+                       unsigned* resident = nullptr) {
+    return a.runner_up ? pass1_form<Bits, true>(a, p, per_group, stream, launch, resident)
+                       : pass1_form<Bits, false>(a, p, per_group, stream, launch, resident);
 }
 
 }  // namespace detail
@@ -357,6 +398,15 @@ inline cudaError_t prepare_pass1(const Launch& a) {
     const auto p = detail::parts(a);
     return a.plane.bits == 4U ? detail::pass1_bits<4U>(a, p, a.pass1_lanes, nullptr, false)
                               : detail::pass1_bits<8U>(a, p, a.pass1_lanes, nullptr, false);
+}
+
+// prepare_pass1 plus the pass-1 blocks the device holds at once for the launch's instantiation (Launch::pass1_resident;
+// host only, at load).
+inline cudaError_t prepare_pass1(const Launch& a, unsigned& resident) {
+    const auto p = detail::parts(a);
+    resident = 0U;
+    return a.plane.bits == 4U ? detail::pass1_bits<4U>(a, p, a.pass1_lanes, nullptr, false, &resident)
+                              : detail::pass1_bits<8U>(a, p, a.pass1_lanes, nullptr, false, &resident);
 }
 
 inline cudaError_t launch_pass1(const Launch& a, cudaStream_t stream) {
@@ -482,8 +532,12 @@ public:
         head_ = {device_weights, rows, width, softcap};
         grids_ = default_grids(device);
         for (const bool second : {false, true}) {
-            for (unsigned lanes = 1U; lanes <= max_lanes; lanes *= 2U) check(prepare_pass1(launch({}, lanes, width, second)));
-            check(prepare_pass1(launch({}, max_lanes, width, second)));
+            const auto prepare = [&](unsigned lanes) {
+                const auto a = launch({}, lanes, width, second);
+                check(prepare_pass1(a, resident_[second ? 1 : 0][form_index(a.pass1_lanes)]));
+            };
+            for (unsigned lanes = 1U; lanes <= max_lanes; lanes *= 2U) prepare(lanes);
+            prepare(max_lanes);
         }
     }
 
@@ -497,9 +551,19 @@ public:
     // runner_up: candidates cover the second row too (launch_pick2 / enqueue<true>).
     [[nodiscard]] Launch launch(const float* x, unsigned lanes = 1U, unsigned x_stride = 0U,
                                 bool runner_up = false) const noexcept {
-        return {view_, bound_, head_, x, static_cast<std::uint8_t*>(scratch_.get()), kCapacity, lanes,
-                lanes > 1U ? x_stride : head_.width, grids_, plan::pass1_lanes(head_.width, lanes, shared_limit_),
-                runner_up};
+        const unsigned per_group = plan::pass1_lanes(head_.width, lanes, shared_limit_);
+        return {view_,
+                bound_,
+                head_,
+                x,
+                static_cast<std::uint8_t*>(scratch_.get()),
+                kCapacity,
+                lanes,
+                lanes > 1U ? x_stride : head_.width,
+                grids_,
+                per_group,
+                runner_up,
+                resident_[runner_up ? 1 : 0][form_index(per_group)]};
     }
 
     // x: FP32 [width] (or lanes rows at x_stride floats) on the device. Same Pick per lane as the full head
@@ -546,6 +610,15 @@ private:
     std::size_t bytes_ = 0;
     unsigned max_lanes_ = 0;
     std::size_t shared_limit_ = 48U * 1024U;
+    // Pass-1 resident blocks per instantiation: [runner_up][log2 lanes per group], measured at load (0: not prepared).
+    static constexpr unsigned kForms = 4U;  // 1, 2, 4, 8 lanes per group (plan::kMaxPass1Lanes)
+    static_assert(plan::kMaxPass1Lanes == 1U << (kForms - 1U), "one resident entry per pass-1 lane form");
+    static constexpr unsigned form_index(unsigned per_group) noexcept {
+        unsigned i = 0U;
+        while (i + 1U < kForms && (1U << i) < per_group) ++i;
+        return i;
+    }
+    unsigned resident_[2][kForms] = {};
 };
 
 }  // namespace strix::cuda::core::head_screened
