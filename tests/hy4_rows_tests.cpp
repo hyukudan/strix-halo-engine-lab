@@ -291,6 +291,23 @@ void check_spec_mtp() {
                     static_cast<unsigned long long>(res.chain_calls), static_cast<unsigned long long>(res.chain_rows),
                     static_cast<unsigned long long>(f.teacher_rows), static_cast<unsigned long long>(f.chain_rows));
     }
+    FakeMtpForward seeded;
+    auto oo = o;
+    hb::rows::MtpSource<FakeMtpForward> source(seeded);
+    source.install(prompt);
+    const auto anchor = seeded.prefill(prompt);
+    source.finish_prompt(anchor);
+    const auto seeds = hb::rows::parse_verify_seeds("44.6,52.4,60,67.5,74.9,82.3,89.6,97");
+    hb::rows::seed_spec_options(oo, 0, 2, 0, 0, seeds);
+    CHECK(oo.verify_ms == seeds);
+    std::size_t published = 0;
+    oo.publish = [&](std::span<const std::uint32_t> ids) {
+        CHECK(std::ranges::equal(ids, std::span(plain).subspan(published, ids.size())));
+        published += ids.size();
+        return true;
+    };
+    const auto result = hb::rows::spec_decode(seeded, prompt, anchor, n, oo, source);
+    CHECK(published == plain.size() && result.ids == plain);
 }
 
 // The stated confidence (BlockDrafter::seed_chain_survival -> Arbiter::seed_model_survival) raises the chain arm's

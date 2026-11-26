@@ -268,6 +268,71 @@ void request_tests() {
     }
 }
 
+void placement_tests(const std::filesystem::path& root) {
+    namespace md = strix::profile::multi_device;
+    const auto model = strix::model_description::load((root / "models/hy4-flash.toml").string());
+    const auto policy = md::parse_policy(model);
+    strix::device::Topology devices;
+    devices.nodes.resize(2);
+    for (std::uint32_t rank = 0; rank < 2; ++rank) {
+        auto& node = devices.nodes[rank];
+        node.id = node.host = "fake" + std::to_string(rank);
+        node.rank = rank;
+        node.arch = "gfx1151";
+        node.memory_gbytes_ps = 200;
+    }
+    devices.links.push_back({"link", 0, 1, "usb4", 4.0, 30.0, 0.0, "usb4", true, true});
+    md::BandReceipt receipt{"fake-identity", "hy4-flash", "hy4_tp_mtp_decode", strix::device::topology_id(devices),
+        "usb4auto/channel", "test-layout", "gfx1151", 2048, 2048, 128, 512, 300, 300, 1.5, 1.3, 0.02};
+    const auto query = strix::hy4::pair_query(devices, strix::profile::Name::fast, 277, 2048, 300, "usb4auto",
+                                             "gfx1151", "test-layout", &receipt);
+    const auto verify = [&](const md::Query& q, md::Form want) {
+        const auto native = strix::hy4::resolve_pair_placement(model, q);
+        const auto served = h::placement_config(model, q);
+        check(native.form == want && native.json(policy, q).dump() == served.dump(), "CLI and serve placement parity");
+    };
+    verify(query, md::Form::tensor);
+    check(!md::select(policy, query).ladder_reference.empty(), "TP has a bound execution key");
+    auto changed = query;
+    changed.phase = md::Phase::prefill;
+    verify(changed, md::Form::layers);
+    changed = query;
+    changed.tier = strix::profile::Name::standard;
+    verify(changed, md::Form::layers);
+    changed = query;
+    changed.tier = strix::profile::Name::turbo;
+    verify(changed, md::Form::tensor);
+    changed = query;
+    changed.execution.receipt = nullptr;
+    verify(changed, md::Form::layers);
+    changed = query;
+    changed.execution.pair = "different-pair";
+    verify(changed, md::Form::layers);
+    changed = query;
+    changed.execution.link = "usb4auto/staged";
+    verify(changed, md::Form::layers);
+    changed = query;
+    changed.execution.layout = "different-layout";
+    verify(changed, md::Form::layers);
+    changed = query;
+    changed.execution.context = 4096;
+    verify(changed, md::Form::layers);
+    changed = query;
+    changed.prompt_rows = 513;
+    verify(changed, md::Form::layers);
+    changed = query;
+    changed.execution.decode_tokens = 16;
+    verify(changed, md::Form::layers);
+    changed = query;
+    changed.devices = 1;
+    verify(changed, md::Form::single);
+    receipt.speedup = 1.01;
+    verify(query, md::Form::layers);
+    receipt.speedup = 1.5;
+    receipt.single_speedup = 0.95;
+    verify(query, md::Form::layers);
+}
+
 void admission_tests() {
     h::register_family();
     h::register_family();  // idempotent
@@ -282,11 +347,13 @@ void admission_tests() {
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
         const auto root = std::filesystem::temp_directory_path() / "strix-hy4-serve-tests";
         std::error_code ignored;
         std::filesystem::remove_all(root, ignored);
+        check(argc == 2, "source fixture root passed");
+        if (argc == 2) placement_tests(argv[1]);
         option_tests();
         shell_tests(root);
         request_tests();

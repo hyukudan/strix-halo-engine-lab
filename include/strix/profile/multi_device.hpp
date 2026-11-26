@@ -59,8 +59,9 @@ struct Regime {
     Name min_tier = Name::standard;
     std::vector<Form> prefer;
     std::string wire;                     // "" = the form's wire
-    std::string lever;                    // parsed for the receipt, not resolved: a bit-changing wire stays report-only
+    std::string lever;                    // nonempty: requires a matching measured band for this regime
     bool enabled = true;
+    bool measured = false;
 };
 
 struct LegacySwitch {
@@ -79,12 +80,30 @@ struct Policy {
 // Throws std::invalid_argument naming the offending key.
 [[nodiscard]] Policy parse_policy(const model_description::ModelDescription&);
 
+// The deployment's measured comparison is scoped to a single pair, link and layout.
+struct BandReceipt {
+    std::string id, model, lever, pair, link, layout, device;
+    std::uint64_t min_context = 0, max_context = 0;
+    std::uint64_t min_prompt_rows = 0, max_prompt_rows = 0;
+    std::uint64_t min_decode_tokens = 0, max_decode_tokens = 0;
+    double speedup = 0, single_speedup = 0, noise = 0;
+};
+[[nodiscard]] BandReceipt load_band_receipt(const std::string& path);
+
+struct Execution {
+    std::string model, pair, link, layout, device;
+    std::uint64_t context = 0, decode_tokens = 0;
+    const BandReceipt* receipt = nullptr;
+};
+
 struct Query {
     Name tier = Name::standard;
     Phase phase = Phase::request;
     std::optional<std::uint64_t> prompt_rows;   // unknown: a regime with a row bound does not match
     std::uint64_t ready_requests = 1;
     std::uint32_t devices = 1;                  // whole-model capable devices available to this launch
+    Execution execution;
+    bool rank_executor = false;   // native binding executes both layer and tensor pair forms
     std::optional<Form> placement;              // explicit --placement: wins or refuses, never silently replaced
 };
 
@@ -98,6 +117,7 @@ struct Decision {
     std::string wire = "reference";
     std::string rule = "absent";                // absent | explicit | regime:NAME | default | fallback
     std::string reason;
+    std::string ladder_reference;
     std::vector<LegacyOverride> legacy;
     [[nodiscard]] serve::Json json(const Policy&, const Query&) const;
 };
