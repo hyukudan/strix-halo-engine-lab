@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/qwen_prefill_pair.hpp"
+#include "strix/pair/state_staging.hpp"
 #include <limits>
 #include <future>
 
@@ -96,12 +97,7 @@ std::uint64_t handoff(bool producer, std::span<const StatePart> parts,
     return total;
 }
 
-// Each slot stays owned until both its copy and blocking wire operation finish.
-struct StateStaging {
-    virtual ~StateStaging() = default;
-    virtual std::span<std::byte> buffer(std::size_t slot) = 0;
-    virtual void copy_device(bool save, void* device, std::span<std::byte> host) = 0;
-};
+using pair::StateStaging;
 std::unique_ptr<StateStaging> make_hip_state_staging();
 
 template<class Send, class Receive, class Copy, class Checksum, class Abort>
