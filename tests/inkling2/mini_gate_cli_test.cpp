@@ -136,6 +136,12 @@ void test_native_w4a4_admission() {
 
 void test_cuda_route_options() {
     using Mode = strix::serve::CliSpeculation;
+    using strix::exec::resolve_decode_route;
+    constexpr auto routes = std::span{cli::kCudaDecoders};
+    static_assert(resolve_decode_route(routes, {.sampling = true}) == cli::CudaDecoder::program);
+    static_assert(resolve_decode_route(routes, {.verifier = true}) == cli::CudaDecoder::resident);
+    static_assert(resolve_decode_route(routes, {.taps = true}) == cli::CudaDecoder::resident);
+    static_assert(!resolve_decode_route(routes, {.sampled_verifier = true}));
     constexpr auto bf16 = strix::weight::kBf16WeightStorage;
     constexpr auto q8 = strix::weight::kQ8WeightStorage;
     // The row default (auto) on CUDA: the verifying route (resident replay: drafter, arbiter, verify window program).
