@@ -1,13 +1,16 @@
 #pragma once
 
+#include "strix/model/bind.hpp"
+#include "strix/model_data/inkling2_mini.hpp"
+
 namespace strix::inkling2 {
 
 inline constexpr unsigned kMaxContext = 1U << 20U;
 inline constexpr unsigned kSlidingWindow = 1024;
 inline constexpr unsigned kHiddenWidth = 2304;
 inline constexpr unsigned kVocabulary = 201024;
-inline constexpr unsigned kOutputVocabulary = 200058;
-inline constexpr unsigned kMiniEosToken = 200006;
+inline constexpr auto kOutputVocabulary = model::narrow<unsigned>(model_data::inkling2_mini::dims::vocab_out);
+inline constexpr auto kMiniEosToken = model::narrow<unsigned>(model_data::inkling2_mini::dims::eos_token);
 inline constexpr float kLogitSoftcap = 30.0F;
 inline constexpr unsigned kHeadWidth = 128;
 inline constexpr unsigned kQueryHeads = 24;

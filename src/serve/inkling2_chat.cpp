@@ -1,6 +1,7 @@
 #include "strix/serve/inkling2_chat.hpp"
 
-#include "inkling2/inkling2_mini_config.hpp"
+#include "strix/model/bind.hpp"
+#include "strix/model_data/inkling2_mini.hpp"
 #include "strix/serve/chat_template_kit.hpp"
 
 #include <array>
@@ -12,8 +13,11 @@
 // The role and content markers, effort aliases and tool envelopes belong to the checkpoint.
 namespace strix::serve {
 
+namespace inkling_dims = model_data::inkling2_mini::dims;
+
 const BpeTokenizer::HfIdentity inkling2_mini_tokenizer_identity{
-    "o200k", inkling2::kOutputVocabulary, inkling2::kMiniEosToken, "<|begin_of_text|>", 200028U};
+    "o200k", model::narrow<unsigned>(inkling_dims::vocab_out), model::narrow<unsigned>(inkling_dims::eos_token),
+    "<|begin_of_text|>", 200028U};
 
 namespace {
 
