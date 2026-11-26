@@ -312,7 +312,9 @@ def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False):
             w["cleared_by_class"] = w["class"] in final_pass
     pooled["off_distribution"] = off_distribution(windows, limits)
     pooled["reference_suspect"] = [w["name"] for w in windows if w["reference_suspect"]]
-    pooled["reference_suspect_classes"] = [c["name"] for c in pooled["classes"] if c["final"] and c["reference_suspect"]]
+    suspect_classes = [c["name"] for c in pooled["classes"] if c["final"] and c["reference_suspect"]]
+    if suspect_classes:
+        pooled["reference_suspect_classes"] = suspect_classes
     pooled["unresolved"] = sorted({w["class"] for w in windows if w["state"] == "unresolved" and not w["cleared_by_class"]} |
                                   {c["name"] for c in pooled["classes"] if c["state"] == "unresolved" or not c["final"]})
     if flips is not None:
@@ -326,7 +328,7 @@ def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False):
     pooled["checks"] = checks
     if not all(checks.values()):
         pooled["state"] = "FAIL"
-    elif pooled["reference_suspect"] or pooled["reference_suspect_classes"] or pooled["off_distribution"]:
+    elif pooled["reference_suspect"] or suspect_classes or pooled["off_distribution"]:
         pooled["state"] = "HOLD"     # never PASS: the exact path is examined on those windows first
     elif pooled["unresolved"]:
         pooled["state"] = "UNRESOLVED"   # provisional: the lever stays opt-in for these classes
