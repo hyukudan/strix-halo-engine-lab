@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <iostream>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -261,7 +262,6 @@ void CohortDecoder::admit() {
         lane->result.id = lane->request.id;
         lane->result.submit_ms = w.submit_ms;
         lane->bytes = reserved_bytes(lane->request);
-        used_bytes_ += lane->bytes;
         lane->whole = backend_.prefill_emits_first();
         if (token_sampling_enabled(lane->request.sampling)) {
             // A stable request identity makes an explicit seed replayable across lane assignments (the request's
@@ -281,8 +281,12 @@ void CohortDecoder::admit() {
         }
         Lane& l = *lane;
         const auto index = static_cast<std::uint32_t>(free - lanes_.begin());
+        used_bytes_ += lane->bytes;
         *free = std::move(lane);
         peak_live_ = std::max(peak_live_, live());
+        // From here the lane is published: a backend or callback failure retires it as a failed request (finish:
+        // budget returned, lane released) instead of leaving it half-initialised in its slot.
+        try {
         // the engine's per-request words reach the backend (every rank under ReplicatedCohort) before any prompt row;
         // a request without traits makes no bind call, so plain requests make exactly the round-1 backend calls
         if (!l.request.traits.empty()) backend_.bind_lane(index, l.request.id, l.request.traits);
@@ -297,6 +301,9 @@ void CohortDecoder::admit() {
             if (restored != 0 && l.request.prefilled) l.request.prefilled(restored);
             if (l.whole && l.prompt_left() == 0) l.first_due = true;
             else if (l.prompt_left() == 0) l.pending = p.back();
+        }
+        } catch (const std::exception& ex) {
+            finish(l, std::string("admit: ") + ex.what());
         }
     }
 }
@@ -318,6 +325,8 @@ void CohortDecoder::finish(Lane& lane, std::string error) {
     for (std::size_t i = 0; i < lanes_.size(); ++i) {
         if (lanes_[i].get() != &lane) continue;
         used_bytes_ -= lane.bytes;
+        // prefix capture is optional: its failure must never keep the lane from retiring
+        try {
         if (lane.request.retain && lane.result.error.empty() && !lane.result.cancelled && !lane.result.ids.empty()) {
             // committed inputs: the prompt (its last token was the first decode row), then every emitted id that a
             // later row consumed; ids cut at a stop are all consumed, so prompt ++ ids is cut at `position`.
@@ -326,8 +335,16 @@ void CohortDecoder::finish(Lane& lane, std::string error) {
             committed.resize(static_cast<std::size_t>(std::min<std::uint64_t>(committed.size(), lane.position)));
             backend_.capture(static_cast<std::uint32_t>(i), committed);
         }
+        } catch (const std::exception& ex) {
+            std::cerr << "cohort decoder: prefix capture failed (" << ex.what() << "); lane retired without it\n";
+        }
         finished_.push_back(std::move(lane.result));
-        backend_.release(static_cast<std::uint32_t>(i));
+        try {
+            backend_.release(static_cast<std::uint32_t>(i));
+        } catch (...) {
+            lanes_[i].reset();
+            throw;
+        }
         lanes_[i].reset();
         return;
     }
@@ -710,7 +727,20 @@ void CohortDecoder::step() {
         base += groups[k].rows;
     }
     top.assign(tokens.size(), 0U);
-    backend_.verify(groups, tokens, top);
+    // A backend failure of the verify or commit fails every lane of this forward (selections discarded, lanes
+    // released, budget returned) and leaves the decoder usable; the next step starts clean.
+    const auto fail_forward = [&](const char* what, const std::exception& ex) {
+        for (std::size_t k = 0; k < n; ++k)
+            if (auto& selection = run[k]->request.selection) selection->discard();
+        for (std::size_t k = 0; k < n; ++k) finish(*run[k], std::string(what) + ": " + ex.what());
+        verification_ = std::move(scratch);
+    };
+    try {
+        backend_.verify(groups, tokens, top);
+    } catch (const std::exception& ex) {
+        fail_forward("verify", ex);
+        return;
+    }
     keep.resize(n);
     std::vector<std::vector<std::uint32_t>> chosen(n);  // the ids each lane emits this step
     std::vector<std::unique_ptr<MtpSelectionReceipt>> receipts(n);
@@ -750,7 +780,12 @@ void CohortDecoder::step() {
         }
         base += rows;
     }
-    backend_.commit(keep);
+    try {
+        backend_.commit(keep);
+    } catch (const std::exception& ex) {
+        fail_forward("commit", ex);
+        return;
+    }
     for (auto& receipt : receipts)
         if (receipt) receipt->publish();  // the model prefix is committed: the selection state follows it
     const double decode_ms = now_ms() - t0;
