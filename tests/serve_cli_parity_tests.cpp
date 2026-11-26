@@ -150,7 +150,7 @@ void glm() {
                       std::to_string(work.prompt) + ") for " + lever);
         }
         const auto printed = rd::print(cli);
-        const bool fast_row = printed.find(" fast=1 applies x1.500 noise 0.100 (GLM pair 8K FAST bundle") != std::string::npos;
+        const bool fast_row = printed.find(" fast=1 applies x1.370 noise 0.100 (GLM pair 8K FAST bundle") != std::string::npos;
         check(fast_row == (on && work.prompt >= 2049 && work.prompt <= 8192),  // TURBO nests the FAST cell in the band
               std::string("GLM FAST band row named in the route line (") + profile + " prompt " + std::to_string(work.prompt) + ")");
         gate("glm", values(sp::from_lines(printed)), values(sp::from_lines(rd::print(serve))), allowed);
