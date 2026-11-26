@@ -2004,6 +2004,7 @@ int main(int argc, char** argv) {
         strix::minimax::defaults::apply_host_defaults("rank");
         const auto capabilities = strix::minimax::defaults::transport_capabilities(
             argv[3], [](const char* key) { return std::getenv(key); });
+        const auto pair_model_identity = mm::Engine::pair_model_identity(opt.model_dir);
         auto opened = strix::dist::open_pair(argv[3], opt.rank, {std::chrono::seconds(180), capabilities});
         auto transport = std::move(opened.host);
         if (!opened.receipt.empty()) std::printf("transport: %s\n", opened.receipt.c_str());
@@ -2063,7 +2064,7 @@ int main(int argc, char** argv) {
         if (exchanger) eng.set_exchanger(exchanger.get(), xfer_env == nullptr || std::string(xfer_env) == "on");
         if (pfx) eng.set_prefill_exchanger(pfx.get(), pfx_on);
         const auto lr = eng.load();
-        eng.agree_pair(false);
+        eng.agree_pair(pair_model_identity, false);
         std::printf("rank %u: load %.1f s, %.1f GiB read (%s), device used %.1f GiB\n", opt.rank, lr.seconds, lr.gib_read,
                     lr.direct_io ? "O_DIRECT" : "buffered", lr.device_gib);
         std::fflush(stdout);

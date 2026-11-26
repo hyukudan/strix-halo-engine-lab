@@ -80,6 +80,7 @@ public:
         g_stop.store(false);
         std::signal(SIGINT,on_signal); std::signal(SIGTERM,on_signal);
         const auto capabilities = strix::minimax::defaults::transport_capabilities(transport_spec, lookup);
+        const auto pair_model_identity = mm::Engine::pair_model_identity(opt.model_dir);
         auto opened = strix::dist::open_pair(transport_spec, opt.rank, {std::chrono::seconds(300), capabilities});
         transport = std::move(opened.host);
         gpu_direct = std::move(opened.direct);
@@ -136,7 +137,7 @@ public:
         phases.mark("weights");
         const std::uint32_t dspark_config = 0x4d4d0400U | (static_cast<std::uint32_t>(dspark_prior) << 7) | (static_cast<std::uint32_t>(dspark_mode) << 5) |
                                             (dspark_dir.empty() ? 0U : 16U) | dspark_inflight;
-        eng.agree_pair(true, dspark_config);
+        eng.agree_pair(pair_model_identity, true, dspark_config);
         std::printf("rank %u: load %.1f s, device used %.1f GiB\n", opt.rank, lr.seconds, lr.device_gib);
         std::fflush(stdout);
         phases.mark("peer-agree");
