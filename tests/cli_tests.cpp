@@ -227,14 +227,21 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
         for (const auto* backend : {"hip", "cuda"}) {
             const auto exact = profile::resolve_model_preset(description, Name::standard, backend);
             const auto implicit = profile::resolve_model_preset(description, {}, backend);
-            const auto fast = profile::resolve_model_preset(description, Name::fast, backend);
-            const auto turbo = profile::resolve_model_preset(description, Name::turbo, backend);
             const auto* declared_default = description.find("presets.default");
             require(declared_default != nullptr, "every model declares an implicit preset");
             const auto* declared_name = std::get_if<std::string>(&declared_default->data);
             require(declared_name != nullptr, "implicit preset must be a string");
             require(implicit.requested == profile::parse_tier(*declared_name),
                     "implicit preset must agree with its declared tier");
+            if (entry.family == "ernie") {
+                require(exact.levers == Name::standard && implicit.levers == Name::standard,
+                        "ERNIE inventory resolves EXACT");
+                refuses([&] { (void)profile::resolve_model_preset(description, Name::fast, backend); }, "missing presets.fast");
+                refuses([&] { (void)profile::resolve_model_preset(description, Name::turbo, backend); }, "missing presets.turbo");
+                continue;
+            }
+            const auto fast = profile::resolve_model_preset(description, Name::fast, backend);
+            const auto turbo = profile::resolve_model_preset(description, Name::turbo, backend);
             if (entry.family == "glm5") {
                 const auto column = std::string_view(backend) == "hip" ? Name::turbo : Name::fast;
                 require(turbo.levers == column, "GLM chooses the native column for the selected backend");
@@ -255,6 +262,7 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
                 turbo.append_options(forwarded);
                 require(forwarded == std::vector<std::string>{"--profile", "turbo"},
                         "served Inkling TURBO reaches the engine with the CLI's --profile turbo");
+            }
             const auto* turbo_levers = description.find(std::string("presets.turbo.") + backend + ".levers");
             if (turbo_levers == nullptr) turbo_levers = description.find("presets.turbo.levers");
             const auto* declared_levers = turbo_levers ? std::get_if<std::string>(&turbo_levers->data) : nullptr;

@@ -12,8 +12,8 @@ namespace strix::model_data::ernie_5_5_flash_preview {
 inline constexpr std::string_view architecture = "Ernie5_5_MoeForCausalLM";
 namespace attention {
 inline constexpr bool add_full_attention_sink_bias = true;
-inline constexpr std::int64_t compress_ratios[] = {128, 128, 128, 128, 128, 128, 128, -2, 128, 128, 128, 128, 128, 
-    128, -2, 128, 128, 128, 128, 128, 128, -2, 128, 128, 128, 128, 128, 128, -2, 128, 128, 128, 128, 128, 128, -2, 
+inline constexpr std::int64_t compress_ratios[] = {128, 128, 128, 128, 128, 128, 128, -2, 128, 128, 128, 128, 128,
+    128, -2, 128, 128, 128, 128, 128, 128, -2, 128, 128, 128, 128, 128, 128, -2, 128, 128, 128, 128, 128, 128, -2,
     128, 128, 128, 128, 128, 128, -2};
 inline constexpr double compress_rope_theta = 0x1.388p+17 /* 160000 */;
 inline constexpr bool csa_dense_mode = true;

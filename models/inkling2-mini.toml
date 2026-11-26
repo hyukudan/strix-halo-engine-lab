@@ -67,7 +67,7 @@ levers = "fast"
 
 # Under a preset the TURBO column of the shared engine is not forwarded off HIP (CUDA keeps the FAST levers).
 [presets.turbo]
-levers = "turbo"
+levers = "fast"
 
 # The HIP engine resolves its TURBO column (include/strix/profiles/inkling2_mini.hpp): the FAST levers plus the
 # prefill ladder rows with a measured gain (the CLI and the server select the same class per prompt).
