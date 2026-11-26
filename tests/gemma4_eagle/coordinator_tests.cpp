@@ -461,6 +461,53 @@ int main() {
             set_env("STRIX_G4_MTP_CONF", "0");
         }
 #endif
+        {
+            // Shared emission hook (quality capture, strix::GreedyEmissionHook): forcing the OFF greedy ids reproduces them
+            // with the hook's argmax == the forced token at every step; forcing other tokens emits exactly those tokens.
+            // Steps run 0..n-1 and the logits row positions are consecutive from the anchor (prompt size - 1); every
+            // call carries a full vocabulary row. A drafting request with a hook is refused at submit.
+            const auto& prompt = prompts[4];
+            for (const bool same : {true, false}) {
+                Backend hb;
+                const auto vocab = hb.config().vocab;
+                std::vector<std::uint32_t> forced;
+                for (std::size_t i = 0; i < off[4].size() && i < 24; ++i)
+                    forced.push_back(same ? off[4][i] : std::uint32_t((off[4][i] + 7U * i + 3U) % vocab));
+                std::vector<std::uint64_t> steps, positions;
+                std::vector<std::uint32_t> winners;
+                bool full_rows = true;
+                en::Request req;
+                req.prompt = prompt;
+                req.max_tokens = forced.size();
+                req.dflash = en::DraftMode::off;
+                if (!same) req.stop_ids.clear();
+                req.emission_hook = [&](std::uint64_t step, std::uint64_t position, std::uint32_t argmax, std::span<const float> logits) {
+                    steps.push_back(step); positions.push_back(position); winners.push_back(argmax);
+                    full_rows = full_rows && logits.size() == vocab;
+                    return step < forced.size() ? forced[step] : argmax;
+                };
+                en::Coordinator coordinator(hb, {});
+                const auto slot = coordinator.submit(req);
+                coordinator.run();
+                const auto& result = coordinator.result(slot);
+                EAGLE_CHECK(result.ids == forced, "emission hook (%s): emitted ids == forced", same ? "greedy" : "other");
+                EAGLE_CHECK(full_rows, "emission hook: full vocabulary rows");
+                bool order = steps.size() == forced.size();
+                for (std::size_t i = 0; order && i < steps.size(); ++i)
+                    order = steps[i] == i && positions[i] == prompt.size() - 1 + i;
+                EAGLE_CHECK(order, "emission hook: steps 0..n-1, positions consecutive from the anchor");
+                if (same) EAGLE_CHECK(winners == forced, "emission hook: forcing the greedy ids leaves every argmax unchanged");
+            }
+            Backend rb;
+            en::Coordinator refused(rb, {});
+            en::Request req;
+            req.prompt = prompt;
+            req.emission_hook = [](std::uint64_t, std::uint64_t, std::uint32_t argmax, std::span<const float>) { return argmax; };
+            bool rejected = false;
+            try { (void)refused.submit(req); } catch (const std::exception&) { rejected = true; }
+            EAGLE_CHECK(rejected, "emission hook with drafting (dflash auto) refused");
+            std::printf("coordinator: emission hook forcing (greedy and other ids), step/position order, drafting refusal\n");
+        }
         std::printf("coordinator: eagle sessions == OFF for k in {1,4,7}, prompt lengths 1/2/8/9/16/17/random, 1 and 3 streams; oracle accepted %llu/%llu, host drafter (1 and 3 streams) %llu/%llu\n",
                     (unsigned long long)oracle_stats.accepted, (unsigned long long)oracle_stats.attempted,
                     (unsigned long long)real_stats.accepted, (unsigned long long)real_stats.attempted);

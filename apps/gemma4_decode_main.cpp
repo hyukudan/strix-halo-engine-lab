@@ -2,12 +2,14 @@
 #include "gemma4/engine/runtime.hpp"
 #include "gemma4/ref/npz.hpp"
 #include "gemma4_prefill_ab.hpp"
+#include "bitcalc_measurement.hpp"
 #ifdef STRIX_GEMMA4_DEVICE_BACKEND
 #include "gemma4/engine/pair.hpp"
 #include "strix/pair/link.hpp"
 #endif
 
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string_view>
 
@@ -16,6 +18,19 @@ namespace g4 = strix::gemma4;
 using Json = strix::serve::Json;
 namespace {
 Json ids_json(std::span<const std::uint32_t> ids) { auto j = Json::array(); for (auto id : ids) j.push(std::uint64_t(id)); return j; }
+// Token IDs separated by whitespace and/or commas (the option_qual case files use commas).
+std::vector<std::uint32_t> read_ids(const std::string& path) {
+    auto text = e::read_text(path);
+    for (auto& ch : text) if (ch == ',') ch = ' ';
+    std::istringstream input(text); std::string word; std::vector<std::uint32_t> ids;
+    while (input >> word) {
+        if (word.empty() || word[0] == '-') throw std::invalid_argument("invalid token ID");
+        std::size_t end = 0; const auto value = std::stoull(word,&end);
+        if (end != word.size() || value > UINT32_MAX) throw std::invalid_argument("invalid token ID");
+        ids.push_back(std::uint32_t(value));
+    }
+    return ids;
+}
 void emit(const e::Options& options, const e::Runtime& runtime, std::span<const std::uint32_t> ids, Json result) {
     if (options.output == "ids") { for (std::size_t i = 0; i < ids.size(); ++i) std::cout << (i ? " " : "") << ids[i]; std::cout << '\n'; }
     else if (options.output == "text") {
@@ -78,22 +93,31 @@ int main(int argc, char** argv) {
             if (gold.size() < options.request.max_tokens) throw std::invalid_argument("fixture generation prefix unavailable");
             gold.resize(options.request.max_tokens); prompts.push_back(std::move(prompt)); expected.push_back(std::move(gold));
         }
+        // Quality-kit capture (shared apps/bitcalc_measurement.hpp): STRIX_BITCALC_FORCE_TOKENS / STRIX_BITCALC_LOGITS_OUT
+        // for one prompt, or STRIX_BITCALC_CASES=FILE ("FORCE OUT PROMPT_IDS" per line) for a list served by one model load.
+        std::vector<strix::decode_cli::BitcalcCase> bitcalc_cases;
+        if (const char* list = std::getenv("STRIX_BITCALC_CASES"); list && *list) {
+            if (!prompts.empty() || !options.ids.empty() || !options.prompt.empty())
+                throw std::invalid_argument("STRIX_BITCALC_CASES names the prompts itself (no --ids/--prompt/--fixture)");
+            bitcalc_cases = strix::decode_cli::read_bitcalc_cases(list);
+            for (const auto& c : bitcalc_cases) {
+                if (c.prompt.empty()) throw std::invalid_argument("STRIX_BITCALC_CASES lines need FORCE OUT PROMPT_IDS");
+                prompts.push_back(read_ids(c.prompt));
+            }
+        }
         if (prompts.empty()) {
             std::vector<std::uint32_t> prompt;
-            if (!options.ids.empty()) {
-                std::istringstream input(e::read_text(options.ids)); std::string word;
-                while (input >> word) {
-                    if (word.empty() || word[0] == '-') throw std::invalid_argument("invalid token ID");
-                    std::size_t end = 0; const auto value = std::stoull(word,&end);
-                    if (end != word.size() || value > UINT32_MAX) throw std::invalid_argument("invalid token ID");
-                    prompt.push_back(std::uint32_t(value));
-                }
-            } else if (!options.prompt.empty() && runtime.tokenizer) prompt = runtime.tokenizer->encode(options.prompt);
+            if (!options.ids.empty()) prompt = read_ids(options.ids);
+            else if (!options.prompt.empty() && runtime.tokenizer) prompt = runtime.tokenizer->encode(options.prompt);
             else throw std::invalid_argument("provide --ids, --prompt with tokenizer, --chat or --fixture");
             prompts.push_back(std::move(prompt));
         }
+        const bool bitcalc_env = !bitcalc_cases.empty() || strix::decode_cli::BitcalcMeasurement().enabled();
+        if (bitcalc_env && (options.streams != 1 || (bitcalc_cases.empty() && prompts.size() != 1)))
+            throw std::invalid_argument("STRIX_BITCALC capture runs one stream (one prompt, or STRIX_BITCALC_CASES for a list)");
 #ifdef STRIX_GEMMA4_DEVICE_BACKEND
         if (e::pair_enabled()) {
+            if (bitcalc_env) throw std::invalid_argument("STRIX_BITCALC capture runs on the single-device route");
             if (prompts.size() != 1 || !expected.empty()) throw std::invalid_argument("pair route runs one --ids/--prompt request");
             return e::run_pair(options,runtime,prompts.front(),[&](std::span<const std::uint32_t> ids, Json receipt) {
                 emit(options,runtime,ids,std::move(receipt));
@@ -103,13 +127,29 @@ int main(int argc, char** argv) {
         bool matched = true, failed = false;
         for (std::size_t p = 0; p < prompts.size(); ++p) {
             e::Coordinator coordinator(*runtime.backend,runtime.drafts);
+            std::optional<strix::decode_cli::BitcalcMeasurement> bitcalc;
+            if (!bitcalc_cases.empty()) bitcalc.emplace(bitcalc_cases[p].out.c_str(),bitcalc_cases[p].force.c_str());
+            else if (bitcalc_env) bitcalc.emplace();
             std::vector<std::size_t> slots;
-            for (std::uint32_t s = 0; s < options.streams; ++s) { auto r = options.request; r.prompt = prompts[p]; slots.push_back(coordinator.submit(std::move(r))); }
+            for (std::uint32_t s = 0; s < options.streams; ++s) {
+                auto r = options.request; r.prompt = prompts[p];
+                if (bitcalc) {
+                    bitcalc->prepare(runtime.backend->config().vocab,r.prompt.size(),r.max_tokens);
+                    r.emission_hook = bitcalc->hook();
+                }
+                slots.push_back(coordinator.submit(std::move(r)));
+            }
             coordinator.run();
+            if (bitcalc) bitcalc->finish();
             for (const auto slot : slots) {
                 const auto& result = coordinator.result(slot);
                 failed |= result.status == e::Status::failed;
                 auto receipt = coordinator.receipt(slot); receipt.set("stream",std::uint64_t(slot));
+                if (bitcalc) {
+                    receipt.set("prompt_index",std::uint64_t(p));
+                    receipt.set("bitcalc_forced_steps",std::uint64_t(bitcalc->forced_steps()));
+                    receipt.set("bitcalc_force_sha256",bitcalc->force_tokens_sha256());
+                }
                 if (!expected.empty()) { const bool equal = result.ids == expected[p]; receipt.set("reference_equal",equal); matched &= equal; }
                 emit(options,runtime,result.ids,receipt);
             }

@@ -4,6 +4,7 @@
 #include "gemma4/dflash/dflash.hpp"
 #include "auto_policy.hpp"
 #include "native_memory.hpp"
+#include "strix/serial_request.hpp"
 #include "strix/serve/json.hpp"
 #include "strix/token_sampling.hpp"
 #include <functional>
@@ -227,6 +228,10 @@ struct Request {
     Sampling sampling;
     DraftMode dflash = DraftMode::automatic;
     std::uint32_t draft_k = 7;
+    // Shared quality-kit hook (strix/serial_request.hpp; apps/bitcalc_measurement.hpp): called once per decode
+    // selection with (step, logits row position, greedy winner, FP32 logits); the token it returns is emitted and fed
+    // back (teacher forcing). Needs greedy plain decode (temperature 0, dflash off); arithmetic is unchanged.
+    strix::GreedyEmissionHook emission_hook{};
 };
 [[nodiscard]] strix::serve::Json effective_config(const Backend& backend, const Request& request,
     bool drafter_available, std::size_t streams = 1);
