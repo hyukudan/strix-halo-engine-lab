@@ -206,9 +206,9 @@ def read_routes(path, opener=None):
     while at < len(data):
         if at + 16 > len(data):
             raise GateError(f"{path}: truncated record header")
-        layer, rows, k, _ = np.frombuffer(data, "<u4", 4, at).tolist()
+        layer, rows, k, flags = np.frombuffer(data, "<u4", 4, at).tolist()
         n = rows * k
-        if k == 0 or k > 64 or at + 16 + 8 * n > len(data):
+        if rows == 0 or k == 0 or k > 64 or flags != 0 or at + 16 + 8 * n > len(data):
             raise GateError(f"{path}: corrupt or truncated record {len(out)}")
         ids = np.frombuffer(data, "<u4", n, at + 16).reshape(rows, k)
         w = np.frombuffer(data, "<f4", n, at + 16 + 4 * n).reshape(rows, k)
@@ -220,6 +220,8 @@ def read_routes(path, opener=None):
 def route_flips(ref_path, arm_path, opener=None):
     """Order-independent ID differences and weight differences on matching experts, for the same call sequence."""
     a, b = read_routes(ref_path, opener), read_routes(arm_path, opener)
+    if not a:
+        raise GateError(f"{ref_path}: no router calls")
     if len(a) != len(b):
         raise GateError(f"{arm_path}: {len(b)} router calls, the reference has {len(a)}")
     per = {}
@@ -228,19 +230,31 @@ def route_flips(ref_path, arm_path, opener=None):
     for i, ((la, ia, wa), (lb, ib, wb)) in enumerate(zip(a, b)):
         if la != lb or ia.shape != ib.shape:
             raise GateError(f"{arm_path}: call {i} is layer {lb} shape {ib.shape}, the reference has layer {la} shape {ia.shape}")
-        k = ia.shape[1]
         if not np.isfinite(wa).all():
             raise GateError(f"{ref_path}: non-finite reference router weight at call {i}")
         finite_weights &= bool(np.isfinite(wb).all())
         missing = 0
-        for x, y, wx, wy in zip(ia, ib, wa, wb):
-            common, ix, iy = np.intersect1d(x, y, return_indices=True)
-            missing += k - common.size
-            if common.size and finite_weights:
-                delta = wx[ix].astype(np.float64) - wy[iy]
+        # Bound the temporary rows x top-k x top-k matrix; long prompt
+        # recordings may contain many millions of rows across their layers.
+        for start in range(0, ia.shape[0], 4096):
+            span = slice(start, start + 4096)
+            x, y = ia[span], ib[span]
+            for ids in (x, y):
+                ordered = np.sort(ids, axis=1)
+                if np.any(ordered[:, 1:] == ordered[:, :-1]):
+                    raise GateError(f"{arm_path}: repeated expert ID within a row at call {i}")
+            if np.array_equal(x, y):
+                delta = wa[span].astype(np.float64) - wb[span] if finite_weights else None
+            else:
+                matches = x[:, :, None] == y[:, None, :]
+                present = matches.any(axis=2)
+                missing += present.size - int(present.sum())
+                delta = ((wa[span].astype(np.float64) - np.take_along_axis(wb[span], matches.argmax(axis=2), axis=1))[present]
+                         if finite_weights else None)
+            if delta is not None and delta.size:
                 max_weight_delta = max(max_weight_delta, float(np.abs(delta).max()))
-                sq_weight_delta += float(np.dot(delta, delta))
-                matched += common.size
+                sq_weight_delta += float(np.sum(delta * delta))
+                matched += delta.size
         s = per.setdefault(int(la), [0, 0])
         s[0] += ia.size
         s[1] += missing
@@ -669,6 +683,9 @@ def qual(a):
             w["replay"] = replay[case]
             if not (a.cand_free and a.null_free):
                 raise GateError(f"{case}: MoE routes present: --cand-free and --null-free arms are required")
+            arms = [a.ref, a.cand, *a.null, a.cand_free, a.null_free]
+            if len(set(arms)) != len(arms):
+                raise GateError(f"{case}: replayed and free-running qualification arms must be distinct")
             f = {"cand": route_flips(ref_route, route(a.cand_free), opener),
                  "null": route_flips(ref_route, route(a.null_free), opener)}
             check_free_record(ref_r, ref_route, f["cand"], f"{case}.{a.ref}")
@@ -756,6 +773,8 @@ def qual(a):
                "windows": [{k: v for k, v in w.items() if k != "_rows"} for w in windows], "pooled": p}
         if tier != "fast":
             doc["tier"] = tier
+        if replay:
+            doc.update(cand_free=a.cand_free, null_free=a.null_free)
         with open(a.json, "w", encoding="utf-8", opener=opener) as f:
             f.write(json.dumps(doc, indent=1, sort_keys=True, default=str) + "\n")
     stdout = sys.stdout

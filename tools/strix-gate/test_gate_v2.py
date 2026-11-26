@@ -16,6 +16,7 @@ import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import gate_v2 as v2  # noqa: E402
+import fast_logit_gate as sealed  # noqa: E402
 import test_fast_logit_gate as tfg  # noqa: E402
 
 
@@ -539,6 +540,9 @@ class HeadFormat(unittest.TestCase):
 
             args = ("--cand-free", "fast_free", "--null-free", "null_free")
             self.assertEqual(self.gate(d, *args)[0], 0)
+            rc, out = self.gate(d, "--cand-free", "exact", "--null-free", "null_free")
+            self.assertEqual(rc, 2, out)
+            self.assertIn("must be distinct", out)
             target = d / "w00-fast_free.f32"
             finite = target.read_bytes()
             target.write_bytes((-np.frombuffer(finite, "<f4")).tobytes())
@@ -549,6 +553,13 @@ class HeadFormat(unittest.TestCase):
             self.assertEqual(doc["pooled"]["flips"]["cand"]["ids"], 0)
             self.assertGreater(doc["windows"][0]["flips"]["cand"]["rms_weight_delta"], 0.6)
 
+            route = d / "routes" / "w00.fast_free.rte"
+            write_routes(route, [(0, [[1, 1]], [[0.1, 0.9]])])
+            rc, out = self.gate(d, *args)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("repeated expert ID", out)
+            write_routes(route, [(0, [[1, 2]], [[0.1, 0.9]])])
+
             target.write_bytes(np.array([np.nan], "<f4").tobytes() + finite[4:])
             self.assertEqual(self.gate(d, *args)[0], 1)
             doc = json.loads((d / "g.json").read_text(encoding="utf-8"))
@@ -558,6 +569,11 @@ class HeadFormat(unittest.TestCase):
             self.assertEqual(self.gate(d, *args)[0], 1)
             target.unlink()
             self.assertEqual(self.gate(d, *args)[0], 2)
+
+    def test_sealed_route_only_evidence_cannot_qualify_moe(self):
+        args = mock.Mock(mode="fast", route_flips=["w=ref.rte,cand.rte,null.rte"])
+        with self.assertRaisesRegex(sealed.GateError, "requires free-running logits"):
+            sealed.compare(args)
 
     def test_nonfinite_candidate_is_a_failure_not_an_evidence_error(self):
         with tempfile.TemporaryDirectory() as d:

@@ -789,18 +789,6 @@ def compare_selection(da, a, db, b, name):
 def compare_v2(a, names, results, null_prompt_kl, report, null_prompt=None):
     """FAST gate v2 verdict over the per-prompt rows (statistics in gate_v2.py, shared with the option_qual adapter)."""
     import gate_v2
-    flips_of = {}
-    for item in a.route_flips or []:
-        name, _, files = item.partition("=")
-        parts = files.split(",")
-        if name not in names or len(parts) != 3:
-            raise GateError(f"--route-flips {item!r}: want PROMPT=REF,CAND_FREE,NULL_FREE for a compared prompt")
-        try:
-            flips_of[name] = {"cand": gate_v2.route_flips(parts[0], parts[1]), "null": gate_v2.route_flips(parts[0], parts[2])}
-        except gate_v2.GateError as e:
-            raise GateError(str(e)) from e
-    if flips_of and sorted(flips_of) != names:
-        raise GateError("--route-flips must name every compared prompt (or none: dense engines)")
     windows = []
     try:
         for name, r in zip(names, results):
@@ -811,8 +799,8 @@ def compare_v2(a, names, results, null_prompt_kl, report, null_prompt=None):
                                      null_nlls=nu.get("nll") or None,
                                      null_kl_rows=nu.get("kl") or None, null_top1_rows=nu.get("agree") or None)
             windows.append(w)
-            print(gate_v2.window_line(w, flips_of.get(name)))
-        p = gate_v2.verdict(windows, [flips_of[n] for n in names] if flips_of else None)
+            print(gate_v2.window_line(w))
+        p = gate_v2.verdict(windows)
     except gate_v2.GateError as e:
         raise GateError(str(e)) from e
     print(gate_v2.pooled_line(p))
@@ -825,6 +813,9 @@ def compare_v2(a, names, results, null_prompt_kl, report, null_prompt=None):
 
 
 def compare(a):
+    if getattr(a, "route_flips", None):
+        raise GateError("MoE qualification requires free-running logits and replay receipts; use gate_v2.py qual "
+                        "with --cand-free and --null-free")
     if a.mode == "turbo":
         return compare_turbo(a)
     ranks = sorted(set(a.ranks))
@@ -834,8 +825,6 @@ def compare(a):
     v2 = getattr(a, "rule", "v1") == "v2"
     if v2 and (a.expect_identical or a.dnll_rule != "abs" or not null_dirs):
         raise GateError("--rule v2 needs at least one --null-arm and the plain dNLL rule (no --dnll-rule floor / --expect-identical)")
-    if not v2 and getattr(a, "route_flips", None):
-        raise GateError("--route-flips is a --rule v2 input")
     check_dnll_policy(a.dnll_rule, a.engine, a.profile, 0 if v2 else len(null_dirs))
     da, ma = load_arm(a.ref, ranks)
     db, mb = load_arm(a.cand, ranks)
@@ -1313,7 +1302,7 @@ def main(argv=None):
                    help="v2: FAST gate v2 (gate_v2.py): per prompt KL <= max(0.02, 1.5 x --null-arm KL), top-1 and dNLL "
                         "per prompt and pooled, >= 800 rows, dNLL se; needs >= 1 --null-arm")
     c.add_argument("--route-flips", action="append", metavar="PROMPT=REF,CAND_FREE,NULL_FREE",
-                   help="v2, MoE engines: strix-route-file/v1 records of one prompt (R1 flip ratio <= 1.5); one per prompt")
+                   help="retired route-only input; use gate_v2.py qual for MoE qualification")
     c.add_argument("--json")
     c.add_argument("--mode", choices=("fast", "turbo"), default="fast",
                    help="fast (default): absolute bar; turbo: T's loss vs E must not exceed the reference pack R's")

@@ -449,9 +449,8 @@ Capture logits for both free arms. A non-finite free-running candidate logit or 
 # option_qual runner output (arms: REF {"routes":{"out":true}}, NULL {"routes":{"in":"REF"},
 #   "env":{"STRIX_MOE_ROUTE_NULL":"0:1"}}, FAST {"routes":{"in":"REF"}}, FASTF / NULLF {"routes":{"out":true}})
 python tools/strix-gate/gate_v2.py qual OUT --ref REF --cand FAST --null NULL --cand-free FASTF --null-free NULLF
-# sealed strix-fast-dump arms
-python tools/strix-gate/fast_logit_gate.py compare REF CAND --ranks 0 --tokens p=p.u32 --rule v2 --null-arm NULL \
-    [--route-flips p=ref.rte,cand_free.rte,null_free.rte]
+# sealed strix-fast-dump arms for a dense run
+python tools/strix-gate/fast_logit_gate.py compare REF CAND --ranks 0 --tokens p=p.u32 --rule v2 --null-arm NULL
 ```
 
 Qwen HIP kit: `scripts/bench/qwen/fast-gate-v2.sh` (one model load per GPU ticket, resumable; arms in
