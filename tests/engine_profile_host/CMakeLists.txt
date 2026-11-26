@@ -60,9 +60,11 @@ add_test(NAME strix-optimization-table-current COMMAND strix-optimization-table 
 set_tests_properties(strix-optimization-table-current PROPERTIES LABELS "cpu;profile" TIMEOUT 60)
 
 # Exercise the real shared cluster resolvers together without device toolchains.
+set(ARG_TEST_ARGS --expect-family=glm --expect-family=minimax --expect-family=ds41)
 profile_host_test(strix-cluster-serve-cli-parity-tests "${STRIX_ROOT}/tests/serve_cli_parity_tests.cpp"
     "${STRIX_ROOT}/src/minimax/engine/mm_defaults.cpp" "${STRIX_ROOT}/src/deepseek41_pair_defaults.cpp"
     "${STRIX_ROOT}/src/ds41_prefill.cpp" "${STRIX_ROOT}/src/deepseek41_prefix_cache.cpp")
+unset(ARG_TEST_ARGS)
 # The DeepSeek prefix-cache piece plan lives with the host state cache closure (standalone adopter module).
 include("${STRIX_ROOT}/cmake/StrixStateCache.cmake")
 target_link_libraries(strix-cluster-serve-cli-parity-tests PRIVATE strix_state_cache)

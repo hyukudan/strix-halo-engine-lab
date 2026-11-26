@@ -39,6 +39,7 @@ namespace sp = strix::parity;
 int g_failures = 0;
 bool g_print = false;
 bool g_require_output_parity = false;
+bool g_strict_gemma = false;
 
 void check(bool ok, const std::string& what) {
     if (ok) return;
@@ -346,9 +347,10 @@ void ds41() {
             if (dir != "/md") return std::vector<std::string>{};
             return std::vector<std::string>{"z-DSpark-MXFP4.gguf", "a-DSpark-MXFP4.gguf", "unrelated.gguf"};
         };
-        const auto draft_args = [&](pd::App app, bool opt_out) {
+        const auto draft_args = [&](pd::App app, bool opt_out, bool explicit_draft = false) {
             std::vector<std::string> args{model, "--rank", "0", "--transport", "usb4auto", "--profile", "fast"};
             if (opt_out) args.emplace_back("--no-dspark");
+            if (explicit_draft) args.insert(args.end(), {"--dspark", "/md/z-DSpark-MXFP4.gguf"});
             const auto resolved = pd::resolve(app, args, [](const char*) -> const char* { return nullptr; },
                                               with_draft, pd::Build{true});
             return sp::from_args(std::span<const std::string>(resolved.args).subspan(1));
@@ -361,6 +363,15 @@ void ds41() {
               "ds41: the server opt-out suppresses discovery");
         check(!draft_args(pd::App::rank, false).contains("arg:--dspark"),
               "ds41: automatic DSpark discovery applies only to serve");
+        const auto explicit_cli = draft_args(pd::App::rank, false, true);
+        const auto explicit_server = draft_args(pd::App::serve, false, true);
+        const auto draft_option = [](const sp::Config& options) {
+            const auto it = options.find("arg:--dspark");
+            return sp::Config{{"draft", it == options.end() ? "" : it->second}};
+        };
+        gate("ds41/explicit-draft", draft_option(explicit_cli), draft_option(explicit_server), {});
+        check(draft_option(explicit_server).at("draft") == "/md/z-DSpark-MXFP4.gguf",
+              "ds41: explicit draft takes precedence over a discoverable draft");
     }
     namespace ds = strix::deepseek41;
     ds::PrefillOptions measured;
@@ -537,7 +548,7 @@ void gemma() {
         // can decode together (STRIX_G4_SERVE_SLOTS, default 8); the CLI runs one stream unless --streams N.
         {"streams", "the server decodes up to STRIX_G4_SERVE_SLOTS requests together"},
     };
-    gate("gemma", cli, config(served.options), allowed);
+    if (!g_strict_gemma) gate("gemma", cli, config(served.options), allowed);
 
     // Explicitly match concurrency so the test compares only model/tier settings.
     for (const std::string tier : {"exact", "fast", "turbo"}) {
@@ -583,36 +594,58 @@ void gemma() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::set<std::string_view> expected;
     for (int i = 1; i < argc; ++i) {
-        g_print |= std::strcmp(argv[i], "--print") == 0;
-        g_require_output_parity |= std::strcmp(argv[i], "--require-output-parity") == 0;
+        const std::string_view arg(argv[i]);
+        if (arg == "--print") g_print = true;
+        else if (arg == "--require-output-parity") g_require_output_parity = true;
+        else if (arg == "--strict-gemma") g_strict_gemma = true;
+        else if (arg.starts_with("--expect-family=")) expected.emplace(arg.substr(16));
+        else {
+            std::cerr << "FAIL: unknown parity argument " << arg << "\n";
+            return 1;
+        }
     }
     try {
         helper_tests();
+        if (g_strict_gemma) {
+#if defined(STRIX_PARITY_GEMMA4)
+            g_require_output_parity = true;
+            gemma();
+#else
+            check(false, "Gemma resolver is required for strict parity");
+#endif
+            return g_failures ? 1 : 0;
+        }
 #if defined(STRIX_PARITY_GLM)
         std::cout << "included: glm (exact/fast/turbo/quality; complete/missing MTP assets, default/opt-out)\n";
         glm();
+        expected.erase("glm");
 #else
         std::cout << "skipped: glm (resolver not linked)\n";
 #endif
 #if defined(STRIX_PARITY_MINIMAX)
         std::cout << "included: minimax\n";
         minimax();
+        expected.erase("minimax");
 #else
         std::cout << "skipped: minimax (resolver not linked)\n";
 #endif
 #if defined(STRIX_PARITY_DS41)
         std::cout << "included: ds41\n";
         ds41();
+        expected.erase("ds41");
 #else
         std::cout << "skipped: ds41 (resolver not linked)\n";
 #endif
 #if defined(STRIX_PARITY_GEMMA4)
         std::cout << "included: gemma\n";
         gemma();
+        expected.erase("gemma");
 #else
         std::cout << "skipped: gemma (strix_gemma4_engine not built)\n";
 #endif
+        for (const auto family : expected) check(false, "expected parity resolver missing: " + std::string(family));
         std::cout << "qwen: strix-qwen-effective-config-tests (serve / CLI parity case)\n";
     } catch (const std::exception& e) {
         std::cerr << "FAIL: exception: " << e.what() << "\n";
