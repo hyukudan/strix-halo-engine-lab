@@ -115,8 +115,9 @@ inline bool announce_drafter_once(const std::string& line) {
     static std::mutex lock;
     static std::set<std::string> printed;
     const std::lock_guard<std::mutex> guard(lock);
-    // One line per drafter file whatever the route words (a retry or a second consumer resolves the same file).
-    const auto open = line.find(" (");
+    // One line per drafter file whatever the route words (a retry or a second consumer resolves the same file). The
+    // route words are the last parenthesis: a path may hold " (" itself (Program Files (x86)).
+    const auto open = line.rfind(" (");
     return printed.insert(line.substr(0, open)).second;
 }
 

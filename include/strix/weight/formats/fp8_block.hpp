@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 
 namespace strix::weight {
 
@@ -15,6 +16,8 @@ namespace strix::weight {
 template <std::size_t BlockRows, std::size_t BlockColumns, class Scale>
 class BlockScaledE4M3 {
     static_assert(BlockRows > 0 && BlockColumns > 0);
+    static_assert(std::is_same_v<Scale, float> || std::is_same_v<Scale, std::uint8_t>,
+                  "the scale plane is FP32 or E8M0 bytes; any other type would convert silently and decode wrong values");
 public:
     constexpr static std::size_t scale_rows(std::size_t rows) {
         return rows / BlockRows + (rows % BlockRows != 0U);

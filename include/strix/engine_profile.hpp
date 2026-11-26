@@ -474,7 +474,6 @@ struct Engine {
     turbo::WeightCaps weight_caps{};        // weight sources / widths this build can load under turbo
     std::span<const IdentityVariant> variants{};  // declared identity variants (empty: the incumbent identity only)
     std::span<const LadderRow> ladder{};    // measured regimes of the lossy cells (ladder rule above)
-    bool preset_keeps_provisional_incumbents = false;  // opt in to native parity for granted cells
 };
 
 // Tier words: exact | fast | turbo; `exact` is the default column (spelled "default" in receipts, kept as an alias).
@@ -1244,6 +1243,16 @@ inline bool bind_band_receipts(std::vector<LadderRow>& rows, const LadderArms& a
     return changed;
 }
 
+// Binds the band receipts until the chain settles: a chain of k band-bound levers settles in at most k + 1 passes (each
+// pass binds the next lever over the cells the previous pass admitted); the bound keeps a defective table from looping.
+// Every resolver that builds ladder arms calls this one loop (`build_arms` rebuilds the arms over the bound rows).
+template <class BuildArms>
+void settle_band_receipts(std::vector<LadderRow>& rows, LadderArms& arms, std::deque<std::string>& storage,
+                          BuildArms&& build_arms) {
+    for (std::size_t pass = 0; pass <= rows.size() && bind_band_receipts(rows, arms, storage); ++pass)
+        arms = build_arms();
+}
+
 // Route line of one lever in one regime: 'strix-ladder/v1 <lever> <phase> ctx=<n> lanes=<n> dev=<device>:<steps>
 // -> <tier>=<value>'. Says which cell runs and why every higher cell does not.
 [[nodiscard]] inline std::string ladder_route(std::string_view lever, const Regime& regime, const LadderCell& cell) {
@@ -1380,10 +1389,7 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         }, out.allow_pending); };
     auto arms = build_arms();
     std::deque<std::string> band_references;  // band receipts bind to this run's own reference
-    // A chain of k band-bound levers settles in at most k + 1 passes (each pass binds the next lever over the cells
-    // the previous pass admitted); the bound keeps a defective table from looping.
-    for (std::size_t pass = 0; pass <= ladder.size() && bind_band_receipts(ladder, arms, band_references); ++pass)
-        arms = build_arms();
+    settle_band_receipts(ladder, arms, band_references, build_arms);
     for (const auto& lever : engine.table) {
         const auto column = value_column(lever, profile_column);
         const std::string* cli = last_setting(inputs.cli, lever.name);  // the value the arms spelled (dispatch precedence)
