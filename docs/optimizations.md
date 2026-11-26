@@ -4670,7 +4670,10 @@ inherit it).
 - **Off switch:** `STRIX_GLM_PF_WMMA=0`, `--profile exact`, or `--baseline`.
 - **Measured gain:** pair, 8,192-token prompt, both ranks: exact cores 12.32 s -> bundle 8.23 s cold (x1.50; warm
   655 -> 1,000 tok/s); whole-call MoE -28..-29 %, dense 8192 rows -28..-32 %. TURBO receipts: 8K TTFT 15.45 -> 12.94 s
-  (-16.3 %), 32K 62.3 -> 51.2 s (-17.8 %, mean of both run orders).
+  (-16.3 %), 32K 62.3 -> 51.2 s (-17.8 %, mean of both run orders). FAST default (product command line
+  `--profile fast` alone, same binary, one load per arm, cold): CLI 8,192 tokens EXACT 12.78 s -> FAST 8.54 s (x1.50,
+  959 tok/s; head logits of the forced arm bitwise equal to the gate arm, EXACT bitwise unchanged); served 8,108-token
+  prompt 889 tok/s (64 ids equal to the TURBO bundle record) vs 628 before.
 - **Implementation / evidence:** [shared core](../src/moe_core/grouped_f16.hpp), [GLM adapter](../src/glm/prefill/glm_pf_wmma_x.hpp), [MoE](../src/glm/prefill/glm_pf_wmma_moe.inc), [test](../tests/hip_glm_pf_wmma_tests.hip)
 
 <a id="glm-pf-wmma-live-fragments"></a>
