@@ -2,12 +2,29 @@
 // Host-only parsing shared by the transport opener and its tests. Every pair binary accepts the same spellings:
 // usb4auto / usb4-auto (host path), usb4gpu / usb4-gpu (GPU-direct streams), usb4:dev,... and tcp-listen/tcp-connect.
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace strix::dist {
+[[nodiscard]] constexpr std::string_view resolve_device_route(std::string_view value) noexcept {
+    return value.empty() ? "table" : value;
+}
+
+[[nodiscard]] inline std::string_view configured_device_route() noexcept {
+    const char* value = std::getenv("STRIX_DIST_ROUTE");
+    return resolve_device_route(value ? std::string_view(value) : std::string_view{});
+}
+
+[[nodiscard]] constexpr std::uint64_t device_route_identity(std::string_view value) noexcept {
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (const char byte : resolve_device_route(value))
+        hash = (hash ^ static_cast<unsigned char>(byte)) * 1099511628211ULL;
+    return hash;
+}
+
 enum class TransportKind { tcp_listen, tcp_connect, usb4_host, usb4_auto, usb4_gpu };
 struct TransportSpellings {
     std::string_view host = "usb4auto", gpu = "usb4gpu", host_alias = "usb4-auto";

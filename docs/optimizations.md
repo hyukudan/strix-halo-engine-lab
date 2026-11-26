@@ -7,6 +7,8 @@ GLM and MiniMax rank and serve, DeepSeek pair serve, and Hy4 rank send a version
 304-byte startup record in each direction. Bindings compare executable and model
 content, GPU architecture, route and profile, and the fields that govern the
 entry point's frame layout. Each peer refuses a mismatch before model traffic.
+Hy4 also binds teacher-forced continuation IDs. The existing GPU-direct
+bootstrap compares the communicator route policy before route calibration.
 Resource offers can differ and are resolved by their admission policy.
 [Shared record](../include/strix/pair/handshake.hpp) · [Host cases](../tests/pair_lockstep_tests.cpp).
 

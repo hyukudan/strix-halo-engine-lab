@@ -2,6 +2,7 @@
 #include "strix/env_flags.hpp"
 #include "strix/dist/communicator.hpp"
 #include "strix/dist/gpu_direct.hpp"
+#include "strix/dist/transport_spec.hpp"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -302,7 +303,9 @@ std::unique_ptr<DeviceExchange> usb4_gpu_direct(const Usb4AutoOptions& options, 
 std::string gpu_direct_bootstrap(GpuDirectLinks& exchange, std::uint32_t rank, Transport& control, const std::vector<GpuDirectRing>& rings,
                                  std::uint64_t nonce) {
     if (rings.size() != exchange.link_count()) throw std::invalid_argument("gpu-direct bootstrap: one ring description per link");
-    const auto params = exchange.parameters(), peer_params = swap_text(control, params);
+    // The communicator may start collective route calibration as soon as setup returns.
+    const auto params = exchange.parameters() + " route " + std::to_string(device_route_identity(configured_device_route()));
+    const auto peer_params = swap_text(control, params);
     if (params != peer_params) fail("the ranks' session parameters differ (this rank: " + params + "; peer: " + peer_params + ")");
     // 4. HELLO on every ring: who is at the other end of each cable (rank 0's index of that ring).
     std::vector<std::string> hello;

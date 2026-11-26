@@ -224,7 +224,7 @@ void agree_hy4_pair(strix::dist::Transport& transport, unsigned rank,
                     const strix::ModelContentIdentity& model, const strix::hy4::hipbind::ForwardOptions& o,
                     std::span<const std::uint32_t> prompt,
                     std::uint32_t gen, std::uint32_t repeat, std::uint64_t layout, std::uint64_t flags,
-                    double trip_us = 0.0, std::span<const double> rates = {}) {
+                    double trip_us = 0.0, std::span<const double> rates = {}, std::span<const std::uint32_t> teacher = {}) {
     try {
         auto hello = strix::pair::native_hello(0x32593448U, rank);  // "H4Y2"
         hello.model_sha256 = model.bytes;
@@ -240,9 +240,10 @@ void agree_hy4_pair(strix::dist::Transport& transport, unsigned rank,
             flags | (o.nextn ? 1ULL << 62U : 0U) | (o.head_q8 ? 1ULL << 63U : 0U),
             std::bit_cast<std::uint64_t>(trip_us),
             rates.empty() ? 0U : std::bit_cast<std::uint64_t>(rates[0]),
-            rates.empty() ? 0U : std::bit_cast<std::uint64_t>(rates[1]), 0U};
-        constexpr std::array<std::string_view, 9> fields{"prompt IDs", "generation or repeat count", "depth", "verify rows",
-            "next-token head", "wire or execution flags", "TP trip cost", "rank-zero split rate", "rank-one split rate"};
+            rates.empty() ? 0U : std::bit_cast<std::uint64_t>(rates[1]),
+            strix::pair::layers::fnv(14695981039346656037ULL, teacher)};
+        constexpr std::array<std::string_view, 10> fields{"prompt IDs", "generation or repeat count", "depth", "verify rows",
+            "next-token head", "wire or execution flags", "TP trip cost", "rank-zero split rate", "rank-one split rate", "teacher IDs"};
         (void)strix::pair::exchange_hello(hello, [&](auto out, auto in) { transport.exchange(out, in); }, fields);
     } catch (const std::exception& e) {
         transport.abort(e.what());
@@ -874,7 +875,7 @@ int run(int argc, char** argv) {
             (strix::envcfg::flag("STRIX_HY4_ROWS_EXPERT_UNION", true) ? 64U : 0U) |
             (tp_force ? 128U : 0U) | (opened.direct ? 256U : 0U);
         agree_hy4_pair(*opened.host, static_cast<std::uint32_t>(tp_rank), pair_vote, profile.fingerprint(), pair_model_identity, o, prompt,
-                       gen, repeat, 0U, flags, tp_trip_us, tp_rates);
+                       gen, repeat, 0U, flags, tp_trip_us, tp_rates, teacher);
         // largest gather: half the logits row (vocab / 2 FP32); the link probe sizes fit in 1 MiB; speculative decode: a
         // verify pass's MoE join at 8 rows (8 x (8 slot rows x 1536 + shared / 2) FP32) < 2 MiB
         // route: the shared policy (pair::select_route); the device-waited channel unless STRIX_TP_CHANNEL=0 (staged)
