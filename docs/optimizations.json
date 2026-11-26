@@ -2942,6 +2942,30 @@
     "doc_anchor": "docs/optimizations.md#ds41-pf-flash-q16"
   },
   {
+    "engine": "deepseek41",
+    "name": "DS41 FAST prefill: D1 composition and bounded decoder replay R=256 by band receipt",
+    "flag_or_env": "profile rows d1_prefill (ds41-prefill-d1-v1) and decoder_replay=256 (ds41-replay-r256-v1); explicit STRIX_DS41_FAST_* / STRIX_DS41_DECODER_REPLAY settings keep their own route",
+    "default": "FAST and TURBO (the implicit model preset is FAST): per request, on both ranks, for prompts of 4,096-8,192 and 8,193-32,768 tokens on gfx1151; EXACT and other prompts keep the previous prefill route",
+    "tier": "FAST (TURBO nests FAST)",
+    "status": "qualified: FAST gate v2 D1 and D1R final PASS (pair, 8K and 32K classes, 28 windows, 1,764 rows)",
+    "home": "include/strix/engine_profile.hpp (bind_band_receipts), include/strix/deepseek41_pair_profile_table.hpp (rows), src/deepseek41_pair_defaults.cpp (execution key), src/hip_deepseek41_prefill.hip (paired admission)",
+    "exact": "Bit-changing. D1 KL 0.0093, top-1 0.972, dNLL -0.0037 (se 0.0035); D1 + R256 KL 0.0101, top-1 0.972, dNLL +0.0001 (se 0.0037). The bounded replay equals the full run with the key floor bit for bit; deferred serve pieces, snapshot points and group passes take the exact plan.",
+    "gain": "Pair CLI: 8,192 tokens EXACT 1,128.5 -> D1 1,614 / 1,647 -> D1 + R256 1,855 tok/s; 32,768 tokens EXACT 1,257.2 -> D1 1,808.6 -> D1 + R256 1,981 tok/s (pre-integration binaries; device check of the integrated build pending).",
+    "preconditions": "World 2 pair over usb4-host, TP attention, 40 layers, chunk 1,024, window 8, four attention lanes, automatic MoE chunk; no explicit FAST switch; both ranks agree on the request fingerprint.",
+    "off_switch": "--profile exact, or any explicit STRIX_DS41_FAST_PREFILL / STRIX_DS41_DECODER_REPLAY value",
+    "doc_anchor": "docs/optimizations.md#ds41-fast-d1-band",
+    "engine_matrix": {
+      "inkling2-mini": "not bound: no DeepSeek prefill composition",
+      "qwen3.8-flash-next": "shared mechanism only (band receipts bind its own TURBO rows)",
+      "qwen3.8-27b": "shared mechanism only (band receipts bind its 512-row window rows)",
+      "deepseek-v4.1-flash": "bound (pair prefill, CLI and serve)",
+      "glm-5.3-flash": "not bound: no DeepSeek prefill composition",
+      "minimax-m3.1-flash": "not bound: no DeepSeek prefill composition",
+      "hy4-flash": "shared mechanism only (band ladder of its prefill window)",
+      "nemotron-3.5-bolt-e4b": "not bound: no DeepSeek prefill composition"
+    }
+  },
+  {
     "engine": "minimax",
     "name": "MiniMax MSA FAST flash reads q as a bf16 image after norm + RoPE",
     "flag_or_env": "STRIX_MM_PF_MSA_Q16",

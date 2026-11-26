@@ -4887,6 +4887,20 @@ The q_b epilogue applies the flash prologue's own RoPE (`rope_pair`, dims 448..5
 - **Measured gain:** q_b 2048 x 1024 x 8192: 1.505 -> 1.352 ms. Pair 11,594 warm, strict ABAB 3 pairs: d +15 / +30 / -29 ms (no wall gain beyond noise).
 - **Implementation / evidence:** [image store](../src/core/f16_dense_q8a8.hpp), [q_b](../src/hip_ds41_layer.hip), [policy](../src/hip_ds41_attention_flash.inl), [test](../tests/hip_ds41_fast_dense_tests.hip)
 
+<a id="ds41-fast-d1-band"></a>
+
+### DS41 FAST prefill: D1 composition and bounded decoder replay R=256 by band receipt
+
+**Engine:** `deepseek41` (shared `bind_band_receipts` in `include/strix/engine_profile.hpp`). **Control:** profile rows `d1_prefill` and `decoder_replay` (`--profile fast|turbo`; the implicit model preset is FAST). **Default:** FAST and TURBO, per request, for prompts of 4,096-8,192 and 8,193-32,768 tokens on gfx1151.
+
+Startup exports the previous prefill route. Each request resolves the profile again with its own execution key (backend, device product, priced workload, row split, cone, head rows, window, lanes, MoE chunk). The two band rows of each lever bind to that run's own reference, so the D1 composition (BF16 flash attention, FP16 dense, relaxed MoE with FP16 down, FP16 Engram and shared expert) and, on top of it, the bounded decoder replay R=256 run only inside their measured bands. Both ranks exchange the request fingerprint; either rank declining keeps the previous route on both.
+
+- **Exactness evidence:** Bit-changing. FAST gate v2 D1: KL 0.0093, top-1 0.972, dNLL -0.0037 (se 0.0035), route flips 1.05 x null. D1R (with R=256): KL 0.0101, top-1 0.972, dNLL +0.0001 (se 0.0037), route flips 0.37 x null. Pair, 8K and 32K classes, 28 windows, 1,764 rows, final PASS. The bounded replay equals the full run with the key floor bit for bit; deferred serve pieces, snapshot points and group passes take the exact plan.
+- **Off switch:** `--profile exact`, or any explicit `STRIX_DS41_FAST_PREFILL` / `STRIX_DS41_DECODER_REPLAY` value.
+- **Measured gain:** Pair CLI, 8,192 tokens: EXACT 1,128.5, D1 1,614 / 1,647, D1 + R256 1,855 tok/s. 32,768 tokens: EXACT 1,257.2, D1 1,808.6, D1 + R256 1,981 tok/s. Measured before integration; the integrated build needs its device check.
+- **Engines:** DeepSeek V4.1 Flash bound. Qwen3.8 Flash Next, Qwen3.8-27B and Hy4 Flash use the same band mechanism for their own rows. Inkling 2 Mini, GLM-5.3 Flash, MiniMax M3.1 Flash and Nemotron 3.5 Bolt E4B have no DeepSeek prefill composition.
+- **Implementation / evidence:** [rows](../include/strix/deepseek41_pair_profile_table.hpp), [execution key](../src/deepseek41_pair_defaults.cpp), [paired admission](../src/hip_deepseek41_prefill.hip), [tests](../tests/deepseek41_pair_defaults_tests.cpp)
+
 <a id="mm-pf-msa-q16"></a>
 
 ### MiniMax MSA FAST flash reads q as a bf16 image after norm + RoPE
