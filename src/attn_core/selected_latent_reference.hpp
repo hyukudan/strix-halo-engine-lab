@@ -11,10 +11,22 @@ struct SelectedLatentShape {
     [[nodiscard]] unsigned qk() const { return nope + rotary; }
 };
 
-// Split projection planes, each head-major. The key plane precedes the value
-// plane on disk. Every projected channel is a row of `latent` weights.
+// Head-major projection. Within each head, plain key rows precede value rows.
+// Every projected channel is a row of `latent` weights.
 struct SelectedLatentProjection {
-    std::span<const float> key, value;
+    SelectedLatentShape shape;
+    std::span<const float> weights;
+
+    [[nodiscard]] std::span<const float> head(std::size_t h) const {
+        const auto stride = (std::size_t{shape.nope} + shape.value) * shape.latent;
+        return weights.subspan(h * stride, stride);
+    }
+    [[nodiscard]] std::span<const float> key(std::size_t h) const {
+        return head(h).first(std::size_t{shape.nope} * shape.latent);
+    }
+    [[nodiscard]] std::span<const float> value(std::size_t h) const {
+        return head(h).last(std::size_t{shape.value} * shape.latent);
+    }
 };
 
 struct SelectedLatentRow {
@@ -26,7 +38,7 @@ inline SelectedLatentProjection split_latent_projection(SelectedLatentShape s, s
     const auto value_count = std::size_t{s.heads} * s.value * s.latent;
     if (s.heads == 0 || s.latent == 0 || s.nope == 0 || s.value == 0 || weights.size() != key_count + value_count)
         throw std::invalid_argument("latent attention: invalid KV projection");
-    return {weights.first(key_count), weights.subspan(key_count)};
+    return {s, weights};
 }
 
 inline void latent_key_inverse_rms_reference(SelectedLatentShape s, SelectedLatentProjection kv,
@@ -36,8 +48,7 @@ inline void latent_key_inverse_rms_reference(SelectedLatentShape s, SelectedLate
     std::vector<float> head(s.qk());
     std::ranges::copy(rotary, head.begin() + s.nope);
     for (std::size_t h = 0; h < s.heads; ++h) {
-        const auto stride = std::size_t{s.nope} * s.latent;
-        core::linear_reference(kv.key.subspan(h * stride, stride), latent, std::span(head).first(s.nope));
+        core::linear_reference(kv.key(h), latent, std::span(head).first(s.nope));
         inv[h] = attn::group_pool::rms_inv(head.data(), s.qk(), epsilon);
     }
 }
@@ -56,8 +67,7 @@ void selected_latent_attention_reference(SelectedLatentShape s, SelectedLatentPr
     std::vector<float> q_latent(s.latent), o_latent(s.latent);
     for (std::size_t h = 0; h < s.heads; ++h) {
         const auto q = query.subspan(h * s.qk(), s.qk());
-        const auto stride = std::size_t{s.nope} * s.latent;
-        const auto w = kv.key.subspan(h * stride, stride);
+        const auto w = kv.key(h);
         for (std::size_t d = 0; d < s.latent; ++d) {
             float sum = 0.0F;
             for (std::size_t i = 0; i < s.nope; ++i) sum = std::fma(q[i], w[i * s.latent + d], sum);
@@ -72,8 +82,7 @@ void selected_latent_attention_reference(SelectedLatentShape s, SelectedLatentPr
         };
         std::ranges::fill(o_latent, 0.0F);
         detail::causal_fp32_head(o_latent, selected.size(), sinks[h], score_at, value_at);
-        core::linear_reference(kv.value.subspan(h * std::size_t{s.value} * s.latent, std::size_t{s.value} * s.latent),
-                               o_latent, output.subspan(h * s.value, s.value));
+        core::linear_reference(kv.value(h), o_latent, output.subspan(h * s.value, s.value));
     }
 }
 

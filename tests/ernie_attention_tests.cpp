@@ -130,7 +130,7 @@ void compressed_index() {
 
 void latent_attention() {
     const SelectedLatentShape shape{2, 1, 1, 1, 1};
-    constexpr float weights[] = {3.0F, 1.0F, 5.0F, 7.0F};
+    constexpr float weights[] = {3.0F, 5.0F, 1.0F, 7.0F};
     const auto projections = split_latent_projection(shape, weights);
     constexpr float latent[] = {1.0F}, rotary[] = {4.0F}, epsilon = 1e-6F;
     std::array<float, 2> inverse;
