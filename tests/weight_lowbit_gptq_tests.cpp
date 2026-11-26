@@ -572,6 +572,18 @@ void check_nonfinite_feedback() {
     w[0] = 0.003F;
     check(gq::encode_rows<Storage>(w.data(), 1U, k, packed.data(), opts).code == wei::lowbit::EncodeStatus::nonfinite,
           "feedback overflow rejected before converting it to a code");
+    {
+        constexpr std::size_t columns = 2U * k;
+        std::vector<float> weights(columns, 0.003F), late_factor(columns * columns, 0.0F);
+        std::vector<std::uint8_t> output(2U * Storage::bytes, 0xffU);
+        for (std::size_t i = 0; i < columns; ++i) late_factor[i * columns + i] = 1.0F;
+        late_factor[columns - 1U] = std::numeric_limits<float>::quiet_NaN();
+        gq::Options late;
+        late.factor = late_factor.data();
+        check(gq::encode_rows<Storage>(weights.data(), 1U, columns, output.data(), late).code == wei::lowbit::EncodeStatus::nonfinite &&
+                  std::all_of(output.begin(), output.end(), [](std::uint8_t byte) { return byte == 0xffU; }),
+              "a NaN written by feedback into a later block refuses before further blocks are packed");
+    }
     std::vector<std::uint8_t> dead;
     for (const auto damp : {-0.25, std::numeric_limits<double>::infinity()}) {
         bool rejected = false;
