@@ -1,6 +1,7 @@
 #include "strix/glm_pair_profile_table.hpp"
 #include "strix/engine_profile.hpp"
 #include "strix/deepseek41_pair_profile_table.hpp"
+#include "strix/fast_profile.hpp"
 #include "strix/profiles/hy4.hpp"
 
 #include <iostream>
@@ -39,6 +40,30 @@ int main() try {
     exempt.in_baseline = false;
     vars.clear();
     require(resolve_default(exempt, true, env).value == "1", "baseline exemption");
+    {
+        const std::array members{strix::fast_profile::Member{"MEMBER", "2", "member-v1", "1 2"}};
+        const strix::fast_profile::Bundle bundle{"BUNDLE", "bundle-v1", members};
+        vars = {{"BUNDLE", "1"}, {"MEMBER", "0"}};
+        unsigned admissions = 0;
+        const auto admit = [&](const auto&) { ++admissions; return true; };
+        require(strix::fast_profile::expand(bundle, env, admit).at("MEMBER") == "0" && admissions == 0,
+                "explicit OFF wins without consulting bundle admission");
+        vars["MEMBER"] = "malformed";
+        require(strix::fast_profile::expand(bundle, env, admit).at("MEMBER") == "0" && admissions == 0,
+                "canonicalizing a malformed override does not fall back to the bundle");
+        vars["MEMBER"].clear();
+        require(strix::fast_profile::expand(bundle, env, admit).at("MEMBER") == "2" && admissions == 1,
+                "empty FAST member selects the admitted bundle value");
+        require(!strix::fast_profile::expand(bundle, env, [](const auto&) { return false; }).contains("MEMBER"),
+                "bundle cannot select a member whose admission failed");
+        const auto selected = resolve_member_override("", EmptyOverride::present, [&] {
+            ++admissions;
+            return "2";
+        });
+        require(selected.explicit_value && std::string_view(selected.value).empty() && admissions == 1,
+                "bundle bindings can preserve an empty explicit setting");
+        vars.clear();
+    }
     for (unsigned bits = 0; bits < 16; ++bits) {
         const bool ready = (bits & 1U) != 0, runnable = (bits & 2U) != 0;
         const bool allow = (bits & 4U) != 0, provisional = (bits & 8U) != 0;

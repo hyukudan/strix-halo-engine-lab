@@ -167,6 +167,15 @@ int main() {
     expect(run(explicit_env) == count(false) - 2U, "two explicit values are left alone");
     expect(std::string_view(find(explicit_env, "STRIX_QPF2K_PLE_TILE")) == "0", "explicit 0 kept");
     expect(std::string_view(find(explicit_env, "STRIX_QPF2K_QSA_BUDGET")) == "2048", "explicit budget kept");
+    Env empty_override{{master_env, "fast"}, {"STRIX_QPF2K_PLE_TILE", ""}};
+    unsigned attempted = 0;
+    apply(get_of(empty_override), [&](const char* key, const char* value) {
+        if (std::string_view(key) == "STRIX_QPF2K_PLE_TILE") ++attempted;
+        empty_override[key] = value;
+        return true;
+    });
+    expect(attempted == 0 && empty_override.at("STRIX_QPF2K_PLE_TILE").empty(),
+           "an explicit empty value vetoes composition");
 
     // The baseline vetoes the profile; a baseline of 0 does not.
     Env baseline{{master_env, "fast"}, {"STRIX_BASELINE", "1"}};

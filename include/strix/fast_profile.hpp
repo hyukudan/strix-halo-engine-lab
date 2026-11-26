@@ -7,6 +7,7 @@
 //             (strix/engine_profile.hpp), its rank agreement, its cache identity and its effective-config printing.
 // Header-only and host-only. The bundle switch is on only for exactly "1".
 #include "strix/env_flags.hpp"
+#include "strix/profile/member_override.hpp"
 
 #include <functional>
 #include <map>
@@ -71,8 +72,9 @@ inline std::string canonical(const Member& m, std::string_view raw) { return acc
 
 // Device-side reader: the explicit member value if set, else the bundle's value when the bundle is on, else "".
 inline const char* lever(const Bundle& b, const Member& m) {
-    if (const char* e = strix::envcfg::text(m.env); set(e)) return e;
-    return switch_on(strix::envcfg::text(b.env)) ? m.value : "";
+    return profile::resolve_member_override(strix::envcfg::text(m.env), profile::EmptyOverride::unset, [&] {
+        return switch_on(strix::envcfg::text(b.env)) ? m.value : "";
+    }).value;
 }
 
 // Host resolver: canonical bundle switch and member values. A set member is canonicalized; an unset member takes
@@ -83,8 +85,11 @@ inline Overrides expand(const Bundle& b, const Getenv& raw, const Admit& admit =
     const bool on = switch_on(sw);
     if (set(sw)) out.emplace(b.env, on ? "1" : "0");
     for (const auto& m : b.members) {
-        if (const char* v = raw(m.env); set(v)) out.emplace(m.env, canonical(m, v));
-        else if (on && (!admit || admit(m))) out.emplace(m.env, m.value);
+        const auto choice = profile::resolve_member_override(raw(m.env), profile::EmptyOverride::unset, [&] {
+            return on && (!admit || admit(m)) ? m.value : nullptr;
+        });
+        if (choice.explicit_value) out.emplace(m.env, canonical(m, choice.value));
+        else if (choice.value) out.emplace(m.env, choice.value);
     }
     return out;
 }
