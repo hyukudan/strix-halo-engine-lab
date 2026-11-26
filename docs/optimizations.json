@@ -40,7 +40,7 @@
     "default": "ON in every profile (EXACT bind)",
     "status": "production, EXACT",
     "home": "src/attn_core/eager_selected.hpp (score and value forms); src/hip_indexed_attention_launcher.hip (QSA operands and graph control)",
-    "exact": "Bitwise: dev_b 11-26 on PR head 2019eacec5 (cluster1 gfx1151): launcher fixture PASS and 128 generated ids equal to the former private form on the automatic (MTP), eager BF16, eager KV-int8 and long-prompt (4,096) routes.",
+    "exact": "Bitwise: on the integration head 2019eacec5 (one gfx1151 node): launcher fixture PASS and 128 generated ids equal to the former private form on the automatic (MTP), eager BF16, eager KV-int8 and long-prompt (4,096) routes.",
     "gain": "None claimed: same bits; one sample per route within +-1.5 % of the former form (not an ABBA timing).",
     "preconditions": "Qwen Flash Next HIP device build; fresh state and separate caches per build.",
     "off_switch": "none (the private form was deleted)",
