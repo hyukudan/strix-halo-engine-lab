@@ -6,7 +6,7 @@ Prints `code=true|false` and `hip=true|false` (one per line; append to $GITHUB_O
   tracked non-Markdown file names (a test that reads a document names its path, see
   `referenced_paths`). Lint (always run) covers the checks that read whole documentation trees.
 - hip: the offline gfx1151 HIP build. False when every changed path is outside its inputs
-  (documentation, Python, tools/scripts, CUDA-only sources, labs it does not build, other workflows).
+  (documentation, unrelated Python/tools/scripts, CUDA-only sources, labs it does not build, other workflows).
 
 Any doubt runs the job: `--all`, an empty or failed diff, or an unknown path answer true.
 Usage: ci_changes.py --all | ci_changes.py --base REV --head REV
@@ -27,6 +27,8 @@ NON_HIP_PREFIXES = ('docs/', 'tools/', 'scripts/', 'recipes/', 'release/', 'pack
                     '.github/')
 NON_HIP_SUFFIXES = DOC_SUFFIXES | {'.py', '.cu', '.cuh'}
 HIP_WORKFLOW = '.github/workflows/ci.yml'
+HIP_TOOL_INPUTS = {'tools/ci/check_generated_asm.py', 'tools/gen_ds41_qk_asm.py',
+                   'tools/check_kernel_scratch.py', 'tools/kernel_scratch_allowance.txt'}
 
 
 def is_doc(path):
@@ -35,7 +37,8 @@ def is_doc(path):
 
 
 def needs_hip(path):
-    if path == HIP_WORKFLOW:
+    if (path == HIP_WORKFLOW or path in HIP_TOOL_INPUTS
+            or (path.startswith('tools/gen_') and path.endswith('_vopd.py'))):
         return True
     if path.startswith('lab/'):
         return path.startswith(HIP_LABS)

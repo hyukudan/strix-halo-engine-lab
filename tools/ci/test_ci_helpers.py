@@ -47,6 +47,11 @@ class Classify(unittest.TestCase):
                      'lab/transport/tcp.cpp', '.github/workflows/other.yml'):
             self.check([path], True, False)
 
+    def test_codegen_and_scratch_contract_changes_run_hip_ci(self):
+        for path in ('tools/gen_q8_rows_vopd.py', 'tools/gen_ds41_qk_asm.py', 'tools/ci/check_generated_asm.py',
+                     'tools/check_kernel_scratch.py', 'tools/kernel_scratch_allowance.txt'):
+            self.check([path], True, True)
+
 
 class Shard(unittest.TestCase):
     class Fake:
