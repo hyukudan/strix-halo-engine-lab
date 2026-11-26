@@ -99,7 +99,7 @@ def _judge(kl, agree, d, null_kl, null_dis, null_d, limits):
     if null_d is not None and null_d.size > 1:
         j["null_dnll"], j["null_dnll_se"] = mean_se(null_d)
         cap = limits.get("se_null_cap", LIMITS["se_null_cap"]) * j["null_dnll_se"]
-        if math.isfinite(cap) and 0.0 < cap < se:
+        if math.isfinite(cap) and cap < se:
             se_used, j["dnll_se_rows"] = cap, se
     j["dnll_se"] = se_used
     j["dnll_limit"] = limits["max_dnll"] + (z * se_used if math.isfinite(se_used) else 0.0)
@@ -109,9 +109,9 @@ def _judge(kl, agree, d, null_kl, null_dis, null_d, limits):
     s = j["states"].values()
     j["state"] = "fail" if "fail" in s else ("unresolved" if "unresolved" in s else "pass")
     # R4: the lever beats the exact reference on the true text by more than suspect_z se, and the null does not move
-    # the same way (paired candidate-minus-null not below -suspect_z se as well)
+    # the same way (paired candidate-minus-null is also below -suspect_z se).
     sz = limits.get("suspect_z", LIMITS["suspect_z"])
-    suspect = math.isfinite(se_used) and dnll < -sz * se_used
+    suspect = math.isfinite(se) and dnll < -sz * se
     if suspect and null_d is not None and null_d.size == d.size and d.size > 1:
         j["cand_minus_null"], cn_se = mean_se(d - null_d)
         suspect = j["cand_minus_null"] < -sz * cn_se

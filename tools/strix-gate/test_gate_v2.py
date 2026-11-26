@@ -41,7 +41,7 @@ def window(name, n, kl, top1, dnll, null_kl, rng, hit=0.5, scale=0.05, null_top1
     hits = np.arange(n) < round(hit * n)
     null_nlls = None
     if null_dnll is not None:
-        null_nlls = [nll_ref + rows_with_mean(n, null_dnll, null_scale or scale, rng)]
+        null_nlls = [nll_ref + rows_with_mean(n, null_dnll, scale if null_scale is None else null_scale, rng)]
     return v2.window_stats(name, np.full(n, kl), agree, nll_ref, nll_ref + d, [null_kl], hits, hits,
                            null_top1s=None if null_top1 is None else [null_top1], null_nlls=null_nlls, cls=cls,
                            null_kl_rows=null_kl_rows)
@@ -279,6 +279,21 @@ class Statistics(unittest.TestCase):
         self.assertGreater(w["dnll_se_rows"], w["dnll_se"])
         self.assertEqual(w["state"], "fail")
         self.assertIn("capped 1.5 x null", v2.window_line(w))
+
+    def test_zero_variance_null_caps_the_window_before_class_pooling(self):
+        clean = [window(f"ok{i}", 63, 0.005, 0.97, 0.0, 0.004, self.rng, scale=0.0,
+                        null_dnll=0.0, null_scale=0.0) for i in range(13)]
+        bad = window("bad", 63, 0.005, 0.97, 0.05, 0.004, self.rng, scale=0.5,
+                     null_dnll=0.0, null_scale=0.0)
+        self.assertEqual(bad["dnll_se"], 0.0)
+        self.assertEqual(bad["states"]["dnll"], "fail")
+        self.assertEqual(v2.verdict(clean + [bad])["state"], "FAIL")
+
+    def test_reference_check_uses_candidate_uncapped_se(self):
+        w = window("noise", 63, 0.005, 0.97, -0.02, 0.004, self.rng, scale=0.10,
+                   null_dnll=0.1, null_scale=0.002)
+        self.assertLess(w["dnll_se"], 0.002)
+        self.assertFalse(w["reference_suspect"])
 
     def test_off_distribution_reference_holds(self):
         # refx_dense: a window opening with chat-template ids had EXACT NLL 7.07 against 0.9-2.0 elsewhere
