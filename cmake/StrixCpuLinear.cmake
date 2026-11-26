@@ -1,5 +1,7 @@
 # Baseline CPU feature detection and FP32 linear family, independent of accelerator SDKs.
-if(TARGET strix_cpu_linear OR NOT (STRIX_BACKEND_CPU OR STRIX_FAMILY_GEMMA4 OR STRIX_CUDA_QWEN_ONLY))
+# Built for its consumers: the CPU backend (STRIX_BACKEND_CPU, or any project that includes StrixBackendCpu.cmake,
+# which links it and sets STRIX_CPU_LINEAR_REQUIRED), Gemma 4 and the CUDA Qwen CPU expert route.
+if(TARGET strix_cpu_linear OR NOT (STRIX_BACKEND_CPU OR STRIX_FAMILY_GEMMA4 OR STRIX_CUDA_QWEN_ONLY OR STRIX_CPU_LINEAR_REQUIRED))
     return()
 endif()
 

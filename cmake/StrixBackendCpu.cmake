@@ -4,6 +4,7 @@ if(TARGET strix_backend_cpu)
     return()
 endif()
 get_filename_component(_strix_cpu_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+set(STRIX_CPU_LINEAR_REQUIRED ON)  # strix_backend_cpu links strix_cpu_linear (standalone projects set no family option)
 include(${CMAKE_CURRENT_LIST_DIR}/StrixCpuLinear.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/StrixWeight.cmake)
 add_library(strix_backend_cpu STATIC
