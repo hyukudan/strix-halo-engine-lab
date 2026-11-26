@@ -2,7 +2,7 @@
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #if defined(__HIPCC__)
-#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>  // the graph API only; HIP TUs include hip_runtime.h first (strix/hip_check.hpp)
 #define STRIX_GRAPH_RT(name) hip##name
 #else
 #include <cuda_runtime.h>

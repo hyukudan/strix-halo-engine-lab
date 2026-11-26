@@ -87,6 +87,38 @@ inline hipError_t hipGraphInstantiate(hipGraphExec_t* exec, hipGraph_t, void*, c
     *exec = nullptr;
     return hipSuccess;
 }
+// Graph inspection (strix/device/graph_inspection.hpp): every stub graph is one well-formed kernel node.
+using hipGraphNode_t = void*;
+enum hipGraphNodeType {
+    hipGraphNodeTypeKernel = 0, hipGraphNodeTypeMemcpy = 1, hipGraphNodeTypeMemset = 2,
+    hipGraphNodeTypeEmpty = 5, hipGraphNodeTypeWaitEvent = 6, hipGraphNodeTypeEventRecord = 7
+};
+struct hipStubDim3 { unsigned x = 0, y = 0, z = 0; };
+struct hipKernelNodeParams {
+    hipStubDim3 blockDim{};
+    void** extra = nullptr;
+    void* func = nullptr;
+    hipStubDim3 gridDim{};
+    void** kernelParams = nullptr;
+    unsigned sharedMemBytes = 0;
+};
+inline hipError_t hipGraphGetNodes(hipGraph_t, hipGraphNode_t* nodes, std::size_t* count) {
+    if (nodes != nullptr && *count >= 1U) nodes[0] = nullptr;
+    *count = 1;
+    return hipSuccess;
+}
+inline hipError_t hipGraphNodeGetType(hipGraphNode_t, hipGraphNodeType* type) {
+    *type = hipGraphNodeTypeKernel;
+    return hipSuccess;
+}
+inline hipError_t hipGraphKernelNodeGetParams(hipGraphNode_t, hipKernelNodeParams* params) {
+    static int kernel = 0;
+    *params = {};
+    params->func = &kernel;
+    params->blockDim = {1, 1, 1};
+    params->gridDim = {1, 1, 1};
+    return hipSuccess;
+}
 inline hipError_t hipGraphLaunch(hipGraphExec_t, hipStream_t) { return hipSuccess; }
 inline hipError_t hipGraphDestroy(hipGraph_t) { return hipSuccess; }
 inline hipError_t hipGraphExecDestroy(hipGraphExec_t) { return hipSuccess; }
