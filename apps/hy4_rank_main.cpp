@@ -565,7 +565,8 @@ int run_pair_stages(strix::hy4::hipbind::ForwardOptions o, const std::vector<std
 
 int run(int argc, char** argv) {
     const auto kept = strix::pair::strip_flags(argc, argv, "HY4", false);  // --rank / --peer / --transport -> HY4_*
-    (void)kept;\n    namespace md = strix::profile::multi_device;
+    (void)kept;
+    namespace md = strix::profile::multi_device;
     strix::hy4::hipbind::ForwardOptions o;
     std::vector<std::uint32_t> prompt, teacher;
     std::uint32_t gen = 0, top = 5, cut = 0, repeat = 1;
@@ -671,8 +672,8 @@ int run(int argc, char** argv) {
     namespace hp = strix::hy4::profile;
     namespace hr = strix::hy4::hipbind::rows;
     hipDeviceProp_t prop{};
-    int device = 0;
-    if (hipGetDevice(&device) == hipSuccess) (void)hipGetDeviceProperties(&prop, device);
+    int hip_device = 0;
+    if (hipGetDevice(&hip_device) == hipSuccess) (void)hipGetDeviceProperties(&prop, hip_device);
     const auto arch = hp::device_of(prop.gcnArchName);
     if (layer_pair && tp_rank >= 0)
         throw std::invalid_argument("--tp-rank replaces --rank and the automatic pair planner");
