@@ -14,7 +14,10 @@
 //   Int8G16  "kv-shadow-i8g16-v1": groups of 16 consecutive features of one K or V row. amax = max |x| scanned in feature
 //            order with `a > amax` (a NaN never wins); scale s = half(amax / 127) (FP32 division, RNE half), decode
 //            scale float(s); code = 0 when float(s) == 0, else clamp(rint(x / float(s)), -127, 127); value = float(s) * code
-//            (exact in FP32). A non-finite input raises flag_nonfinite, an infinite or NaN scale flag_overflow.
+//            (exact in FP32). A non-finite input raises flag_nonfinite, an infinite or NaN scale flag_overflow; a NaN
+//            quotient (only in a flagged group) codes 0. Finite groups lose only bounded magnitude: a group with
+//            amax < 2^-25 * 127 (about 3.8e-6) has scale 0 and codes 0, and a subnormal-half scale may saturate codes, so
+//            the error of such a group is at most amax per feature (no flag: the values are below the form's resolution).
 // Validity of a master row (policy of the writer): Untagged (rows are valid by construction) or Tagged (position tags:
 // row p is valid iff tags[p] == p; checked once per row, a mismatch raises flag_tag).
 // Failure word: OR of flag_nonfinite = 1, flag_tag = 2, flag_overflow = 4. The shadow's bits are written either way; a
@@ -32,6 +35,27 @@ namespace strix::attn::cache_shadow {
 
 inline constexpr unsigned flag_nonfinite = 1U, flag_tag = 2U, flag_overflow = 4U;
 inline constexpr unsigned group = 16U;  // Int8G16 features per scale
+
+// KV-format trait of a shadow reader (src/attn_core/shadow_kv_read.hpp): none = read the FP32 master, f16 = F16 form,
+// kv8 = Int8G16 form.
+enum class Form : std::uint32_t { none = 0, f16 = 1, kv8 = 2 };
+// Read descriptor of one shadow layer: K and V planes [admitted][width] (halves or codes), Int8G16 scales
+// [admitted][width / group] per plane, rows [0, mirrored) valid (newer rows are converted from the master by the
+// reader with the same encode).
+struct ShadowRead {
+    const void* k = nullptr;
+    const void* v = nullptr;
+    const std::uint16_t* k_scale = nullptr;
+    const std::uint16_t* v_scale = nullptr;
+    std::uint64_t mirrored = 0;
+    std::uint32_t width = 0;
+    std::uint32_t format = 0;  // Form
+};
+// Shadow bytes of `rows` positions of one layer (K and V planes, scales included).
+constexpr std::uint64_t shadow_bytes(Form f, std::uint64_t rows, std::uint32_t width) {
+    const std::uint64_t elements = 2ULL * rows * width;
+    return f == Form::f16 ? 2ULL * elements : f == Form::kv8 ? elements + 2ULL * (elements / group) : 0ULL;
+}
 
 // A half whose exponent field is all ones (infinity or NaN).
 STRIX_CS_HD inline bool half_special(std::uint16_t bits) { return (bits & 0x7c00U) == 0x7c00U; }
@@ -58,6 +82,8 @@ struct Int8G16 {
         if (d == 0.0F)
             return 0;
         float c = __builtin_rintf(x / d);
+        if (c != c)
+            return 0; // NaN quotient: x or the scale not finite (encode_group has raised its flag); no UB conversion
         c = c > 127.0F ? 127.0F : (c < -127.0F ? -127.0F : c);
         return int(c);
     }

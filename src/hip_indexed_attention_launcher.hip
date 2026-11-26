@@ -1,6 +1,7 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
 #include "strix/hip_mtp_prime_rows.hpp"
+#include "strix/attn/kv_int8_token.hpp"
 #include <type_traits>
 #include "strix/env_flags.hpp"
 #include "attn_core/index_score_wmma.hpp"
@@ -529,24 +530,31 @@ __device__ __forceinline__ float kv_int8_load(const void* state, std::uint64_t t
 // One block of kThreads threads (thread = feature, head_dim <= kThreads) quantizes one KV
 // head half of `source` (that half's kv_width FP32 values) into its token row. The maximum
 // is order-independent, so every writer (decode, rows, prefill) stores the same bytes.
+// Steps and domain: strix/attn/kv_int8_token.hpp (bytes == encode_row_ref; a row holding a NaN
+// or an infinity stores scale NaN and codes 0, and raises bit 8 of `status` when one is given).
 __device__ __forceinline__ void kv_int8_store_head(const float* source, void* state, std::uint64_t token,
-    std::uint32_t kv_width, std::uint32_t kv_heads, std::uint32_t half, std::uint32_t kv_head, std::uint32_t head_dim) {
+    std::uint32_t kv_width, std::uint32_t kv_heads, std::uint32_t half, std::uint32_t kv_head, std::uint32_t head_dim,
+    std::uint32_t* status = nullptr) {
+    namespace k8 = strix::attn::kv_int8_token;
     __shared__ float maximum[kThreads];
     const auto feature = static_cast<std::uint32_t>(threadIdx.x);
-    const float x = feature < head_dim ? round_bf16(source[kv_head * head_dim + feature]) : 0.0F;
-    maximum[feature] = fabsf(x);
+    const float raw = feature < head_dim ? source[kv_head * head_dim + feature] : 0.0F;
+    const float x = k8::round_bf16(raw);
+    maximum[feature] = k8::magnitude(raw, x);
     __syncthreads();
     for (std::uint32_t stride = kThreads / 2U; stride > 0U; stride >>= 1U) {
-        if (feature < stride) maximum[feature] = fmaxf(maximum[feature], maximum[feature + stride]);
+        if (feature < stride) maximum[feature] = k8::max_step(maximum[feature], maximum[feature + stride]);
         __syncthreads();
     }
-    const float scale = maximum[0] / 127.0F;
+    const float scale = k8::scale(maximum[0]);
     auto* row = static_cast<std::uint8_t*>(state) + token * kv_int8_row_bytes(kv_width, kv_heads);
-    if (feature < head_dim) {
-        const float code = scale > 0.0F ? fminf(fmaxf(rintf(x / scale), -127.0F), 127.0F) : 0.0F;
-        reinterpret_cast<std::int8_t*>(row)[half * kv_width + kv_head * head_dim + feature] = static_cast<std::int8_t>(code);
+    if (feature < head_dim)
+        reinterpret_cast<std::int8_t*>(row)[half * kv_width + kv_head * head_dim + feature] =
+            static_cast<std::int8_t>(k8::code(x, scale));
+    if (feature == 0U) {
+        reinterpret_cast<float*>(row + 2ULL * kv_width)[half * kv_heads + kv_head] = scale;
+        if (status != nullptr && !k8::finite(scale)) atomicOr(status, k8::status_nonfinite);
     }
-    if (feature == 0U) reinterpret_cast<float*>(row + 2ULL * kv_width)[half * kv_heads + kv_head] = scale;
 }
 
 __device__ float load_activation(
@@ -1324,7 +1332,7 @@ __global__ void store_kv_int8_kernel(
     if (dynamic.status != nullptr && (*dynamic.status != 0 || position >= dynamic.context_tokens)) return;
     const auto half = static_cast<std::uint32_t>(blockIdx.y);
     kv_int8_store_head(half ? current_v : current_k, state, position, kv_width, kv_heads, half,
-        static_cast<std::uint32_t>(blockIdx.x), head_dim);
+        static_cast<std::uint32_t>(blockIdx.x), head_dim, dynamic.status);
 }
 
 template <SmallWeightKind Kind, class... Source>

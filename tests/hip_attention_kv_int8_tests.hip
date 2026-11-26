@@ -1,3 +1,4 @@
+#include "strix/attn/kv_int8_token.hpp"
 #include "strix/hip_indexed_attention_launcher.hpp"
 #include "strix/indexed_attention_state.hpp"
 #include "strix/memory_plan.hpp"
@@ -16,7 +17,9 @@
 
 // kv-int8-tok-v1: the decode and window KV writers store the host model's bytes, and the decode,
 // window and prefill-group score/value kernels read them with identical results (bitwise), close to
-// an FP64 attention over the dequantized cache.
+// an FP64 attention over the dequantized cache. The host model is the shared reference
+// (strix/attn/kv_int8_token.hpp encode_row_ref); unselected tokens carry adversarial rows (NaN, +-Inf,
+// NaN payloads, a finite value whose BF16 rounding overflows) that must store scale NaN and codes 0.
 namespace {
 using namespace strix;
 constexpr std::uint32_t heads = 24, kv_heads = 2, dim = 256, kv_width = kv_heads * dim, width = heads * dim;
@@ -45,13 +48,10 @@ std::vector<std::uint8_t> quantize_row(const float* k, const float* v) {
     for (std::uint32_t half = 0; half < 2U; ++half)
         for (std::uint32_t h = 0; h < kv_heads; ++h) {
             const float* x = (half ? v : k) + h * dim;
-            float a = 0.0F;
-            for (std::uint32_t f = 0; f < dim; ++f) a = std::max(a, std::fabs(round_bf16(x[f])));
-            const float s = a / 127.0F;
-            for (std::uint32_t f = 0; f < dim; ++f) {
-                const float code = s > 0.0F ? std::clamp(std::nearbyint(round_bf16(x[f]) / s), -127.0F, 127.0F) : 0.0F;
-                row[half * kv_width + h * dim + f] = static_cast<std::uint8_t>(static_cast<std::int8_t>(code));
-            }
+            float s = 0.0F;
+            std::array<std::int8_t, dim> codes{};
+            (void)strix::attn::kv_int8_token::encode_row_ref(x, dim, codes.data(), s);
+            std::memcpy(row.data() + half * kv_width + h * dim, codes.data(), dim);
             std::memcpy(row.data() + 2U * kv_width + 4U * (half * kv_heads + h), &s, 4U);
         }
     return row;
@@ -92,6 +92,19 @@ int main() try {
             if (t == 5U && i % dim == 17U) k[t * kv_width + i] = 300.0F; // outlier dominates the head scale
             if (t == 9U && i % dim < 4U) v[t * kv_width + i] = (i % 2U ? 0.5F : -0.5F) * 127.0F; // exact ties of x / s
         }
+    // Adversarial rows on tokens the attention below never selects ((i * 29 + 11) % capacity).
+    std::array<bool, capacity> chosen{};
+    for (std::uint32_t i = 0; i < count; ++i) chosen[(i * 29U + 11U) % capacity] = true;
+    const std::array<std::uint32_t, 6> planted_bits = {0x7fc00000U, 0x7f800000U, 0xff800000U, 0x7f7fffffU, 0x7fffffffU, 0xffffffffU};
+    std::vector<std::uint32_t> planted;
+    for (std::uint32_t t = 0; t < capacity && planted.size() < planted_bits.size(); ++t)
+        if (!chosen[t]) {
+            const auto j = planted.size();
+            planted.push_back(t);
+            float* target = (j % 2U ? v.data() : k.data()) + t * kv_width + (j % kv_heads) * dim + 3U * j;
+            *target = std::bit_cast<float>(planted_bits[j]);
+        }
+    expect(planted.size() == planted_bits.size(), "adversarial rows planted on unselected tokens");
     auto* dk = device<float>(k.size());
     auto* dv = device<float>(v.size());
     check(hipMemcpy(dk, k.data(), k.size() * 4U, hipMemcpyHostToDevice), "upload k");
@@ -150,6 +163,16 @@ int main() try {
             }
     }
     expect(mismatched_rows == 0, "device rows equal the host quantizer (" + std::to_string(mismatched_rows) + " differ)");
+    for (std::size_t j = 0; j < planted.size(); ++j) {
+        const auto t = planted[j];
+        const auto half = static_cast<std::uint32_t>(j % 2U), h = static_cast<std::uint32_t>(j % kv_heads);
+        bool nan_row = true;
+        for (std::uint32_t f = 0; f < dim; ++f) {
+            const float d = dequantize(decode_bytes, t, half, h, f);
+            nan_row = nan_row && d != d;
+        }
+        expect(nan_row, "adversarial row " + std::to_string(j) + " decodes to NaN in every feature");
+    }
     // Half a step plus the FP32 roundings of x / s (|x / s| <= 127, ulp 2^-17) and of code * s.
     expect(worst <= 0.5 + 1e-5, "dequantization error is at most half a step (" + std::to_string(worst) + ")");
 

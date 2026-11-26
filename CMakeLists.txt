@@ -1107,6 +1107,14 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-cache-shadow-tests)
     add_test(NAME strix-cache-shadow-tests COMMAND strix-cache-shadow-tests)
     set_tests_properties(strix-cache-shadow-tests PROPERTIES LABELS "cpu;attn")
+    # Domain of the 8-bit KV forms (kv-int8-tok-v1 steps strix/attn/kv_int8_token.hpp, int8-g16 shadow) on non-finite,
+    # extreme-scale and 64K-accumulation inputs; finite kv-int8-tok-v1 rows == the v1 writer statements.
+    add_executable(strix-attn-kv8-numeric-tests tests/attn_kv8_numeric_tests.cpp)
+    target_include_directories(strix-attn-kv8-numeric-tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    target_compile_features(strix-attn-kv8-numeric-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-attn-kv8-numeric-tests)
+    add_test(NAME strix-attn-kv8-numeric-tests COMMAND strix-attn-kv8-numeric-tests)
+    set_tests_properties(strix-attn-kv8-numeric-tests PROPERTIES LABELS "cpu;attn")
     # Decode lanes of the prepared BF16 flash: per-lane split, workspace region and image rows (batch invariance).
     add_executable(strix-prepared-bf16-lanes-plan-tests tests/prepared_bf16_lanes_plan_tests.cpp)
     target_include_directories(strix-prepared-bf16-lanes-plan-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)

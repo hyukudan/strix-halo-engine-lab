@@ -182,13 +182,16 @@ public:
         if(!input_continuation_ || !target_ || prefill_) return {};
         const auto target=target_->cache_work_bound();
         const auto stream=gpu::DeviceStream::allocation_bound(config_,config_.max_positions);
-        if(!target || !stream) return {};
+        // A FAST decode attention gives each stream a shadow of its global rows (0 bytes when it is off).
+        const auto shadow=memory::shadow_stream_bytes(config_,config_.max_positions,gpu::fast_decode_attention_format());
+        if(!target || !stream || !shadow) return {};
         try {
             auto n=target->additional.total();
             // Restore installation may allocate the NEW request's full admitted
             // capacity, larger than the stored prefix. Old active slot and a
             // failed-install replacement can coexist. Never size these from F.
             memory::add(n,stream->additional.total(),2);
+            memory::add(n,*shadow,2);
             memory::add(n,sizeof(DeviceState),2);
             // Canonical digest stages one complete producer at a time; the
             // full stream device payload safely covers its K/V/tag vectors.
