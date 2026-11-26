@@ -603,6 +603,7 @@ def qual(a):
     if diag and manifest is None:
         raise GateError("--trace-diag needs --manifest (flip slots = prompt rows x traced layers)")
     windows, flips, replay, traced = [], [], {}, 0
+    nonfinite_candidate = []
     for case in cases:
         if manifest is not None and case not in manifest:
             raise GateError(f"{case}: not in the manifest")
@@ -615,7 +616,14 @@ def qual(a):
 
         ra, _ = reduce(logit(a.ref), logit(a.cand), **kw)
         nulls = [reduce(logit(a.ref), logit(n), **kw)[0] for n in a.null]
+        if ra["nonfinite_r"].any():
+            raise GateError(f"{case}: non-finite reference logits")
+        if any(x["nonfinite_c"].any() for x in nulls):
+            raise GateError(f"{case}: non-finite null logits")
         null_moved(case, [float(x["kl_rc"].mean()) for x in nulls])
+        if ra["nonfinite_c"].any():
+            nonfinite_candidate.append(case)
+            continue
         w = window_stats(case, ra["kl_rc"], ra["agree"].astype(bool), ra["nll_r"], ra["nll_c"],
                          [float(x["kl_rc"].mean()) for x in nulls], ra["top1_r_is_label"], ra["top1_c_is_label"],
                          null_top1s=[float(x["agree"].mean()) for x in nulls], null_nlls=[x["nll_c"] for x in nulls],
@@ -669,10 +677,15 @@ def qual(a):
     if traced and not replay:
         print(f"R1: no route tap: every arm ran free, so KL / top-1 / dNLL include route flips; flips from the engine trace "
               f"on {traced} of {len(windows)} windows (slots = prompt rows x traced layers)")
-    p = verdict(windows, flips if flips else None, limits=limits,
-                allow_null_floor=getattr(a, 'allow_null_floor', False))
+    if nonfinite_candidate:
+        p = {"state": "FAIL", "pass": False, "checks": {"candidate_finite": False},
+             "nonfinite_candidate": nonfinite_candidate}
+        print(f"POOLED v2 -> FAIL non-finite candidate logits: {', '.join(nonfinite_candidate)}")
+    else:
+        p = verdict(windows, flips if flips else None, limits=limits,
+                    allow_null_floor=getattr(a, 'allow_null_floor', False))
+        print(pooled_line(p, limits))
     exit_code = EXIT[p["state"]]
-    print(pooled_line(p, limits))
     if a.json:
         doc = {"schema": "strix-fast-gate-v2/v1", "limits": limits, "ref": a.ref, "cand": a.cand, "null": a.null,
                "format": a.format, "r1": r1,
@@ -690,7 +703,7 @@ def qual(a):
             stdout.flush()
         except (OSError, ValueError):
             return exit_code
-    if r4_input is not None:
+    if r4_input is not None and not nonfinite_candidate:
         try:
             _run_r4_diagnostic(r4_input, windows, p, classes, manifest, limits, protected,
                                stdout, sys.stderr, stdout_flushed)

@@ -504,6 +504,22 @@ class HeadFormat(unittest.TestCase):
             self.assertEqual(doc["windows"][0]["flips"]["cand"]["slots"], self.N * 4)
             self.assertTrue(0.0 < doc["pooled"]["held_out"]["label_is_ref_top1"] < 1.0)
 
+    def test_nonfinite_candidate_is_a_failure_not_an_evidence_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = self.kit(d, [f"w{i:02d}" for i in range(13)])
+            target = d / "w00-fast.f32"
+            original = target.read_bytes()
+            target.write_bytes(np.array([np.nan], dtype="<f4").tobytes() + original[4:])
+            rc, out = self.gate(d)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("non-finite candidate logits", out)
+            doc = json.loads((d / "g.json").read_text(encoding="utf-8"))
+            self.assertEqual(doc["pooled"]["nonfinite_candidate"], ["w00"])
+            target.write_bytes(original)
+            null = d / "w00-n0.f32"
+            null.write_bytes(np.array([np.inf], dtype="<f4").tobytes() + null.read_bytes()[4:])
+            self.assertEqual(self.gate(d)[0], 2)
+
     def test_head_gate_flip_ratio_fails(self):
         with tempfile.TemporaryDirectory() as d:
             rc, out = self.gate(self.kit(d, [f"w{i:02d}" for i in range(13)], null_ids=20, cand_ids=32))
