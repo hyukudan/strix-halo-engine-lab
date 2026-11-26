@@ -347,7 +347,7 @@ void early_launch(const Case& test) {
         bind.append(recipe, decode::RmsBf16{projected, scale.data, normalized, 1U, width, epsilon});
         ProgramKey key{};
         key.rows = test.rows;
-        const auto lowered = recipe.compile(key);
+        const auto lowered = recipe.compile(key, CudaReadback::resident);
         CudaExecutor executor(enabled, true, CudaDescriptorLayout::resident);
         executor.submit_resident(lowered.program, lowered.binding, stream.stream, [] {});
         check(cudaStreamSynchronize(stream.stream));
