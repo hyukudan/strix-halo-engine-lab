@@ -524,7 +524,7 @@ def read_trace_diag(paths, opener=None):
     """Free-running route flips from an engine's per-layer trace, for engines without a route tap: lines
     {"diag":1,"case":C,"arm":A,...,"layers":[{"l":0,...,"router_ids":I,...},...]} where router_ids counts the
     reference's selected experts missing from the arm's selection on that layer (order-free, over the traced rows).
-    Returns {(case, arm): (ids, layers)}; a diag line without layers (trace off) is skipped."""
+    Returns {(case, arm): (ids, layer_ids)}; a diag line without layers (trace off) is skipped."""
     out = {}
     for p in paths or []:
         with open(p, encoding="utf-8", errors="replace", opener=opener) as f:
@@ -533,12 +533,18 @@ def read_trace_diag(paths, opener=None):
             m = TRACE_DIAG.match(line)
             if not m:
                 continue
-            ids = [int(x) for x in re.findall(r'"router_ids":(\d+)', line)]
-            if not ids:
+            layers = json.loads(line).get("layers", [])
+            if not layers:
                 continue
+            per_layer = {}
+            for layer in layers:
+                number, ids = layer.get("l"), layer.get("router_ids")
+                if type(number) is not int or number < 0 or number in per_layer or type(ids) is not int or ids < 0:
+                    raise GateError(f"{p}: invalid router trace layers for {m.group(1)}.{m.group(2)}")
+                per_layer[number] = ids
             if m.groups() in out:
                 raise GateError(f"{p}: a second trace of {m.group(1)}.{m.group(2)}")
-            out[m.groups()] = (sum(ids), len(ids))
+            out[m.groups()] = (sum(per_layer.values()), tuple(sorted(per_layer)))
     return out
 
 
@@ -655,8 +661,8 @@ def qual(a):
                 raise GateError(f"{case}: trace of only one of the free-running candidate / null arms (R1 needs both)")
             if fc is not None:
                 if fc[1] != fn[1]:
-                    raise GateError(f"{case}: candidate trace has {fc[1]} layers, the null's {fn[1]}")
-                slots = int(manifest[case].size) * fc[1]
+                    raise GateError(f"{case}: candidate trace layers {fc[1]} differ from null layers {fn[1]}")
+                slots = int(manifest[case].size) * len(fc[1])
                 f = {k: {"slots": slots, "ids": v[0], "rate": v[0] / slots} for k, v in (("cand", fc), ("null", fn))}
                 flips.append(f)
                 w["flips"] = f

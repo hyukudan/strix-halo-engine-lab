@@ -599,6 +599,17 @@ class HeadFormat(unittest.TestCase):
             self.assertEqual(rc, 0, out)
             self.assertIn("engine trace on 12 of 13 windows", out)
 
+    def test_traces_must_cover_the_same_layer_ids(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = self.kit(d, [f"w{i:02d}" for i in range(13)])
+            log = d / "r0.log"
+            lines = log.read_text(encoding="utf-8").splitlines()
+            lines[1] = lines[1].replace('"l":2', '"l":7')
+            log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            rc, out = self.gate(d)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("candidate trace layers (0, 1, 3, 7) differ from null layers (0, 1, 2, 3)", out)
+
 
 class FrozenR4Diagnostic(unittest.TestCase):
     kit, gate = HeadFormat.kit, HeadFormat.gate
@@ -616,7 +627,8 @@ class FrozenR4Diagnostic(unittest.TestCase):
             with open(ref, "rb") as source, open(arm, "rb"):
                 nll = np.full(255, 4.0 if source.read(7) == b"outlier" else 1.0)
             return dict(kl_rc=np.full(nll.size, 1 / 1024), agree=np.ones_like(nll), nll_r=nll, nll_c=nll,
-                        top1_r_is_label=np.zeros_like(nll), top1_c_is_label=np.zeros_like(nll)), {}
+                        top1_r_is_label=np.zeros_like(nll), top1_c_is_label=np.zeros_like(nll),
+                        nonfinite_r=np.zeros_like(nll), nonfinite_c=np.zeros_like(nll)), {}
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(v2, "_option_qual_reduce", return_value=reduce_pair):
             d = self.kit(tmp, cases, cand_ids=20)
