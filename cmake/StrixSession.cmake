@@ -222,7 +222,7 @@ function(strix_session_link_services)
     # consumer; these targets were declared before the HIP target list.
     if(STRIX_ENABLE_HIP_RUNTIME AND DEFINED STRIX_HIP_ARCHS
        AND (TARGET strix_gemma4_session_service OR TARGET strix_minimax_session_service
-            OR TARGET strix-hip-decode-token))
+            OR TARGET strix-hip-decode-token OR TARGET strix_hy4_hip))
         foreach(_t strix_session_shell strix-serve strix-skeleton-serve skeleton_engine_tests
                 session_runtime_tests session_http_replay_tests session_registry_tests session_turn_cache_tests
                 minimax_service_tests minimax_service_compat minimax-native-paired-state

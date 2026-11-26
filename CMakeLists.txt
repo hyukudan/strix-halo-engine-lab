@@ -8283,6 +8283,8 @@ if(STRIX_FAMILY_HY4)
     strix_target_warnings(strix_hy4_hip)
     add_executable(strix-hy4-rank apps/hy4_rank_main.cpp)
     target_link_libraries(strix-hy4-rank PRIVATE strix_hy4_hip strix_dist strix_device strix_spec strix_tp_xport)  # pair: shared layer pipeline + link (gather channel); copy proposer
+    target_link_libraries(strix-hy4-rank PRIVATE strix_model_preset)
+    target_compile_definitions(strix-hy4-rank PRIVATE STRIX_HY4_MODEL_DESCRIPTION="${CMAKE_CURRENT_SOURCE_DIR}/models/hy4-flash.toml")
     strix_target_warnings(strix-hy4-rank)
     add_executable(strix-hy4-rows apps/hy4_rows_main.cpp)  # verify rows bench + speculative decode (hy4_hip_rows)
     target_link_libraries(strix-hy4-rows PRIVATE strix_hy4_hip strix_spec strix_dist strix_tp_xport)  # --tp-rank: pair gather + round messages

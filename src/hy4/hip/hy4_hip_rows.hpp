@@ -11,18 +11,23 @@
 // Home: src/hy4 (binding: Hy4 positions / rings data); the controller, proposer and Arbiter are shared (strix::spec).
 #include "hy4/hip/hy4_hip_plan.hpp"
 #include "strix/spec/block_drafter.hpp"
+#include "strix/spec/block_parallel.hpp"
 #include "strix/spec/engine_target.hpp"
 #include "strix/spec/mtp_chain.hpp"
 #include "strix/spec/pair_round.hpp"
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace strix::hy4::hipbind::rows {
@@ -269,7 +274,65 @@ struct SpecOptions {
     // tensor-parallel pair: the next-token block runs on both ranks with their shares (Forward::set_nextn_tp; rank 1 replays
     // the draft rounds on its own chain); false = the one-node block on rank 0 while rank 1 waits. Both ranks must agree.
     bool draft_tp = true;
+    std::function<bool(std::span<const std::uint32_t>)> publish = {};
 };
+// Exact prompt rows are a Hy4 adapter over the same target used by both launchers.
+template <class Fwd>
+std::vector<float> prefill_verify_rows(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t width, bool feed) {
+    const auto& c = f.config();
+    struct Staging {
+        Fwd& f;
+        float* rows;
+        ~Staging() { if (rows) f.free_f32(rows); }
+    } staged{f, feed ? f.alloc_f32(std::size_t{width} * c.hidden) : nullptr};
+    std::vector<float> last;
+    const auto size = static_cast<std::uint32_t>(prompt.size());
+    for (std::uint32_t pos = 0; pos < size;) {
+        const auto n = std::min(width, size - pos);
+        const bool tail = pos + n == size;
+        f.forward_rows(prompt.subspan(pos, n), tail);
+        if (feed) f.copy_f32_async(staged.rows, f.rows_hidden(), std::size_t{n} * c.hidden);
+        if (tail) {
+            const auto& logits = f.rows_logits();
+            last.assign(logits.end() - static_cast<std::ptrdiff_t>(c.vocab), logits.end());
+        }
+        f.commit_rows(n);
+        if (feed) f.feed_prompt_hidden(staged.rows, pos, n);
+        pos += n;
+    }
+    return last;
+}
+
+inline std::vector<double> parse_verify_seeds(const std::string& text) {
+    std::vector<double> seeds;
+    std::string_view remaining(text);
+    for (;;) {
+        const auto comma = remaining.find(',');
+        const auto part = remaining.substr(0, comma);
+        double ms = 0;
+        const auto result = std::from_chars(part.data(), part.data() + part.size(), ms);
+        if (result.ec != std::errc{} || result.ptr != part.data() + part.size() || !std::isfinite(ms) || ms <= 0)
+            throw std::invalid_argument("--verify-ms requires eight positive finite costs in milliseconds");
+        seeds.push_back(ms);
+        if (comma == std::string_view::npos) break;
+        remaining.remove_prefix(comma + 1U);
+    }
+    if (seeds.size() != kMaxVerifyRows) throw std::invalid_argument("--verify-ms requires eight costs (rows 1..8)");
+    return seeds;
+}
+
+inline void seed_spec_options(SpecOptions& options, double plain_ms, std::uint32_t ranks = 1U, double trip_ms = 0.0,
+                              std::uint32_t gathers = 0U, std::span<const double> measured = {}) {
+    options.chain_survival.assign(kChainSurvival.begin(), kChainSurvival.end());
+    if (!measured.empty()) {
+        options.verify_ms.assign(measured.begin(), measured.end());
+        return;
+    }
+    const auto cost = spec::moe_verify_cost(spec::hy4_verify_bytes(), plain_ms, kVerifySeedGbps, ranks, trip_ms, gathers);
+    options.verify_ms.clear();
+    for (std::uint32_t r = 1; r <= options.max_rows; ++r) options.verify_ms.push_back(spec::seed_ms(cost, r));
+}
+
 struct SpecResult {
     std::vector<std::uint32_t> ids;                   // emitted ids, ids[0] = the anchor
     std::vector<spec::StepRecord> steps;
@@ -309,17 +372,20 @@ SpecResult spec_run(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t
     spec::BlockSpeculator sp(drafter, target);
     sp.start(anchor);
     const auto t0 = std::chrono::steady_clock::now();
-    while (res.ids.size() < n) {
+    bool more = !o.publish || o.publish(res.ids);
+    while (more && res.ids.size() < n) {
         spec::StepParams p;
         p.remaining = n - static_cast<std::uint32_t>(res.ids.size());
         p.max_rows = o.max_rows;
         p.context = f.position();
+        const auto previous = res.ids.size();
         const auto r = sp.step(res.ids, p);
         if (r.emitted == 0U) break;
         res.steps.push_back(r);
         ++res.rows_hist[std::min<std::uint32_t>(r.rows, kMaxVerifyRows)];
         res.proposed += r.proposed;
         res.accepted += r.accepted;
+        if (o.publish) more = o.publish(std::span<const std::uint32_t>(res.ids).subspan(previous));
     }
     res.wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (res.ids.size() > n) res.ids.resize(n);

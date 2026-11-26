@@ -6070,3 +6070,55 @@ two applied at the store), dispatched by `enqueue_resident_q8_rows` (`src/core/r
 |---|---|
 | inkling2-mini | bound (HIP head, decode steps) |
 | qwen3.8-flash-next, qwen3.8-27b, deepseek-v4.1-flash, glm-5.3-flash, minimax-m3.1-flash, hy4-flash, nemotron-3.5-bolt-e4b | not bound: the decode head has no calibrated pack path and no resident low-bit rows |
+
+### Hy4 Flash measured pair placement and verification costs
+
+Hy4’s shared placement policy can select whole-model TP for FAST and TURBO pair
+decode when a deployment installs a winning identity receipt. The receipt matches the
+declared pair, measured USB4 channel, layout, prompt, context and decode-length bands. It must show
+a gain over the layer split and over one node beyond measured noise. Without a
+matching receipt, the pair uses the layer split. Prefill-only commands and the EXACT
+tier keep their existing layer placement. The TP path prefills each rank independently.
+
+Set `STRIX_PLACEMENT_RECEIPT` or pass `--pair-receipt FILE` on each rank. Use the same
+topology declaration and receipt on both nodes. The rank prints the execution fields
+even while commissioning a pair. This schema records the measured comparison:
+
+```toml
+schema = "strix-placement-receipt/v1"
+id = "deployment-measurement-id"
+verdict = "identity"
+model = "hy4-flash"
+lever = "hy4_tp_mtp_decode"
+pair = "<execution.pair>"
+link = "<execution.link>"
+layout = "<execution.layout>"
+device = "<execution.device>"
+min_context = 2048
+max_context = 2048
+min_prompt_rows = 277
+max_prompt_rows = 277
+min_decode_tokens = 300
+max_decode_tokens = 300
+speedup = 1.0
+single_speedup = 1.0
+noise = 0.02
+```
+
+Replace the example bands and ratios with measured values. Ratios of 1.0 keep the
+layer route. Use `--placement layers` with `strix run --device-count 2` to pin it.
+`--verify-ms` accepts an explicit eight-value R1–R8 cost table on the native MTP rank
+entry point. It changes the draft width selected by the arbiter. The target verifies
+every candidate and emits its own greedy IDs. The default retains the plain-step cost
+model pending a matched timing comparison.
+
+| Model | Receipt-bound TP placement | Explicit verify cost table |
+| --- | --- | --- |
+| DeepSeek V4.1 Flash | Unbound | Unbound |
+| Qwen3.8 Flash Next | Unbound | Unbound |
+| Qwen3.8-27B | Unbound | Unbound |
+| Inkling 2 Mini | Unbound | Unbound |
+| GLM-5.3 Flash | Unbound | Unbound |
+| MiniMax M3.1 Flash | Unbound | Unbound |
+| Nemotron 3.5 Bolt E4B | Unbound | Unbound |
+| Hy4 Flash | FAST/TURBO with a matching receipt | Explicit MTP rank option |

@@ -2,9 +2,8 @@ schema = "strix-model/v1"
 name = "hy4-flash"
 
 # Descriptive entry for the Hy4-flash family (GGUF architecture hy_v4_flash). strix-serve --model hy4_flash selects the
-# hy4_flash ServiceFactory (src/hy4/serve/session_service.cpp): options, effective config and pack admission run on the
-# host; serving refuses until a device binding (hy4_hipbind / hy4_cudabind) exists. No runner selection, no measured
-# figures. Geometry, tensor names and shapes come from the pack (src/weight/adapters/hy4.cpp), not from this file.
+# hy4_flash ServiceFactory (src/hy4/serve/session_service.cpp). Geometry, tensor names and shapes come from the
+# pack (src/weight/adapters/hy4.cpp). Pair timings are scoped to a deployment receipt.
 
 [weights.format]
 experts = "q4_k"
@@ -23,6 +22,37 @@ levers = "fast"
 
 [presets.turbo]
 levers = "turbo"
+
+[multi_device]
+version = 1
+order = ["measured_decode", "pair_prefill", "pair_decode"]
+
+[multi_device.forms.layers]
+ranks = 2
+axis = "layer"
+wire = "reference"
+
+[multi_device.forms.tensor]
+ranks = 2
+wire = "bf16-exact"
+expert_partition = "slots"
+expert_shares = [0.5, 0.5]
+draft_placement = "split"
+
+[multi_device.regimes.measured_decode]
+phase = "decode"
+min_tier = "fast"
+prefer = ["tensor"]
+lever = "hy4_tp_mtp_decode"
+measured = true
+
+[multi_device.regimes.pair_prefill]
+phase = "prefill"
+prefer = ["layers"]
+
+[multi_device.regimes.pair_decode]
+phase = "decode"
+prefer = ["layers"]
 
 # Engine-read switches of this model that a [multi_device] key is planned to replace (listed in the effective
 # config when set; they still act inside the engine).

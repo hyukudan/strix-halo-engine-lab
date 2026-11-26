@@ -476,8 +476,8 @@ os = "linux"
 function = "serve"
 state = "connected"
 sources = ["src/hy4/serve/session_service.cpp","src/serve/run.cpp"]
-entrypoint = "src/hy4/serve/session_service.cpp#install_session_service"
-note = "Common-shell factory requires STRIX_SERVE_HY4 at build time."
+entrypoint = "strix-serve --model hy4_flash --asset PART1.gguf -- --ctx N"
+note = "Common-shell HIP adapter on one node. Build with STRIX_FAMILY_HY4=ON."
 
 [[support]]
 family = "hy4_flash"

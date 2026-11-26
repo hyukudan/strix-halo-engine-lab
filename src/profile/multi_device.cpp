@@ -184,12 +184,15 @@ Regime parse_regime(const std::string& name, const Value& v, const std::string& 
             }
         } else if (key == "wire") r.wire = one_of(item, at, kWires);
         else if (key == "lever") r.lever = text(item, at);
-        else if (key == "enabled") {
+        else if (key == "enabled" || key == "measured") {
             const auto* b = std::get_if<bool>(&item.data);
             if (!b) refuse(at + " must be a boolean");
-            r.enabled = *b;
+            (key == "enabled" ? r.enabled : r.measured) = *b;
         } else refuse("unknown key " + at);
     }
+    if (r.measured && (r.lever.empty() || r.phase != Phase::decode || r.min_tier != Name::fast ||
+                       r.prefer != std::vector{Form::tensor}))
+        refuse(path + " measured placement needs a FAST decode lever preferring tensor");
     if (r.prefer.empty()) refuse(path + ".prefer is required");
     if (r.min_prompt_rows && r.max_prompt_rows && *r.min_prompt_rows > *r.max_prompt_rows)
         refuse(path + " has min_prompt_rows > max_prompt_rows");
@@ -218,6 +221,44 @@ void validate_regime(const Policy& policy, const Regime& r, const std::string& p
                        "' changes bits: the regime needs min_tier = \"fast\" or \"turbo\"");
         }
     }
+}
+
+std::string measured_reference(const Regime& regime, const Query& q) {
+    const auto& e = q.execution;
+    const auto* r = e.receipt;
+    if (!r || r->id.empty() || e.model.empty() || e.pair.empty() || e.link.empty() || e.layout.empty() || e.device.empty() ||
+        q.devices != 2 || !ladder_gain(r->single_speedup, r->noise) || !q.prompt_rows || e.context == 0 || r->lever != regime.lever ||
+        r->model != e.model || r->pair != e.pair || r->link != e.link || r->layout != e.layout || r->device != e.device ||
+        *q.prompt_rows < r->min_prompt_rows || *q.prompt_rows > r->max_prompt_rows ||
+        e.decode_tokens < r->min_decode_tokens || e.decode_tokens > r->max_decode_tokens)
+        return {};
+    LadderArms arms;
+    arms.execution = "pair-placement/v1";
+    // Length prefixes keep the tuple unambiguous. Reject delimiters reserved by LadderArms::over.
+    for (const auto* part : {&e.model, &e.pair, &e.link, &e.layout, &e.device}) {
+        if (part->find(';') != std::string::npos) return {};
+        arms.execution += "/" + std::to_string(part->size()) + ":" + *part;
+    }
+    arms.levers = {regime.lever};
+    arms.identities = {Identities{{{"layers", "layer-split@1"}, {"tensor", "tensor-decode@1"}}}};
+    arms.values[LadderArms::slot(Name::standard)] = {"layers"};
+    arms.incumbent[LadderArms::slot(Name::fast)] = {"layers"};
+    LadderRow row{};
+    row.lever = regime.lever;
+    row.value = "tensor";
+    row.device = e.device;
+    row.min_context = r->min_context;
+    row.max_context = r->max_context;
+    row.speedup = r->speedup;
+    row.noise = r->noise;
+    row.receipt = r->id;
+    row.band_bound = true;
+    std::vector rows{row};
+    std::deque<std::string> keys;
+    (void)bind_band_receipts(rows, arms, keys);
+    const profile::Regime priced{profile::Phase::decode, e.context, 1, e.device, arms.execution};
+    return ladder_judge(rows, regime.lever, row.value, Name::fast, priced, rows.front().over,
+                        "tensor-decode@1").rung == Rung::applies ? std::string(rows.front().over) : std::string{};
 }
 
 bool rows_match(const std::optional<std::uint64_t>& value, const std::optional<std::uint64_t>& lo,
@@ -278,6 +319,34 @@ std::string_view phase_name(Phase phase) noexcept {
 }
 
 bool exact_wire(std::string_view wire) noexcept { return wire == "reference" || wire == "bf16-exact"; }
+
+BandReceipt load_band_receipt(const std::string& path) {
+    const auto d = model_description::load(path);
+    const auto field = [&](const char* key) -> const Value& {
+        const auto* value = d.find(key);
+        if (!value) refuse(std::string("missing receipt key ") + key);
+        return *value;
+    };
+    (void)one_of(field("schema"), "schema", {"strix-placement-receipt/v1"});
+    const auto word = [&](const char* key) { return text(field(key), key); };
+    const auto bound = [&](const char* key) {
+        return static_cast<std::uint64_t>(integer(field(key), key, 1, std::numeric_limits<std::int64_t>::max()));
+    };
+    const auto real = [&](const char* key) {
+        const auto& value = field(key);
+        if (const auto* v = std::get_if<double>(&value.data)) return *v;
+        if (const auto* v = std::get_if<std::int64_t>(&value.data)) return static_cast<double>(*v);
+        refuse(std::string(key) + " must be a number");
+    };
+    BandReceipt r{word("id"), word("model"), word("lever"), word("pair"), word("link"), word("layout"), word("device"),
+                  bound("min_context"), bound("max_context"), bound("min_prompt_rows"), bound("max_prompt_rows"),
+                  bound("min_decode_tokens"), bound("max_decode_tokens"), real("speedup"), real("single_speedup"), real("noise")};
+    (void)one_of(field("verdict"), "verdict", {"identity"});
+    if (r.min_context > r.max_context || r.min_prompt_rows > r.max_prompt_rows || r.min_decode_tokens > r.max_decode_tokens ||
+        !valid_ladder_measurement(r.speedup, r.noise) || !valid_ladder_measurement(r.single_speedup, r.noise))
+        refuse("invalid placement receipt bounds or measurement");
+    return r;
+}
 
 Policy parse_policy(const model_description::ModelDescription& description) {
     Policy policy;
@@ -348,13 +417,20 @@ Decision select(const Policy& policy, const Query& q) {
         if (tier_rank(q.tier) < tier_rank(r.min_tier)) continue;
         if (!rows_match(q.prompt_rows, r.min_prompt_rows, r.max_prompt_rows)) continue;
         if (!rows_match(q.ready_requests, r.min_ready_requests, r.max_ready_requests)) continue;
+        const auto reference = r.measured ? measured_reference(r, q) : std::string{};
+        if (r.measured && reference.empty()) {
+            skipped += (skipped.empty() ? "" : "; ") + std::string("no matching winning band for ") + r.name;
+            continue;
+        }
         for (auto form : r.prefer) {
             const auto wire = r.wire.empty() ? form_wire(policy, form) : r.wire;
             if (auto why = blocked(policy, form, q, wire); !why.empty()) {
                 skipped += (skipped.empty() ? "" : "; ") + why;
                 continue;
             }
-            return decided(policy, form, q, wire, "regime:" + r.name, skipped.empty() ? "matched" : skipped);
+            auto result = decided(policy, form, q, wire, "regime:" + r.name, skipped.empty() ? "matched" : skipped);
+            result.ladder_reference = reference;
+            return result;
         }
     }
     const auto default_wire = form_wire(policy, policy.default_form);
@@ -405,7 +481,11 @@ serve::Json Decision::json(const Policy& policy, const Query& q) const {
         {"ranks", static_cast<std::int64_t>(ranks)}, {"devices", static_cast<std::int64_t>(q.devices)},
         {"phase", phase_name(q.phase)}, {"wire", wire},
         {"wire_status", exact_wire(wire) ? "exact" : "report-only: changes bits and no executor resolves a qualified lever yet"}, {"rule", rule}, {"reason", reason}, {"declared", declared},
-        {"executed_by", executed_by(form)}};
+        {"executed_by", q.rank_executor && (form == Form::layers || form == Form::tensor) ? "engine" : executed_by(form)}};
+    if (!q.execution.pair.empty())
+        out.set("execution", Json::Object{{"model", q.execution.model}, {"pair", q.execution.pair}, {"link", q.execution.link},
+            {"layout", q.execution.layout}, {"device", q.execution.device}, {"context", q.execution.context}, {"decode_tokens", q.execution.decode_tokens}});
+    if (!ladder_reference.empty()) out.set("ladder_reference", ladder_reference);
     if (const auto it = policy.forms.find(form); it != policy.forms.end() && !it->second.fields.empty()) {
         // The form block is the form's declared defaults; a regime's wire replaces the form's, so the effective wire
         // is reported once (top-level `wire`) and `settings.wire` agrees with it; the declared one stays visible.

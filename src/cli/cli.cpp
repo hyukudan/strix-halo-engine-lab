@@ -54,6 +54,7 @@ constexpr Route routes[] = {
     {"qwen35", "apps/hip_qwen35_decode_main.hip", "strix-hip-qwen35-decode", "hip", "cli-generate", false, "--model"},
     {"qwen35", "apps/cuda_qwen35_decode_main.cu", "strix-cuda-qwen35-decode", "cuda", "cli-generate", false, "--model"},
     {"hy4_flash", "apps/hy4_rank_main.cpp", "strix-hy4-rank", "hip", "cli-generate", false},
+    {"hy4_flash", "apps/strix_serve_main.cpp", "strix-serve", "hip", "serve", true, "--asset", "", "--bind", "--port"},
 };
 
 [[noreturn]] void invalid(std::string reason) { throw std::invalid_argument(std::move(reason)); }
@@ -283,7 +284,14 @@ Command resolve(const Request& req, const std::vector<model_registry::Entry>& en
             rest.erase(rest.begin());
         }
         if (!req.print_effective_config) check_route(route, rest);
+        const bool hy4_rank = route.binary == "strix-hy4-rank";
+        const bool hy4_shell = route.binary == "strix-serve";
+        auto query = placement_query(req);
+        const bool native_pair = hy4_rank && query.devices == 2 &&
+            (!query.placement || query.placement == profile::multi_device::Form::layers ||
+             query.placement == profile::multi_device::Form::tensor);
         Command cmd{executable, {}};
+        if (hy4_shell) cmd.args.insert(cmd.args.end(), {"--model", entry.id});
         if (!route.model_flag.empty()) cmd.args.emplace_back(route.model_flag);
         cmd.args.push_back(std::move(asset));
         if (!route.serve_flag.empty()) cmd.args.emplace_back(route.serve_flag);
@@ -298,21 +306,36 @@ Command resolve(const Request& req, const std::vector<model_registry::Entry>& en
                    std::ranges::find(rest, "--http-port") == rest.end()) {
             cmd.args.insert(cmd.args.end(), {"--http-port", "8080"});
         }
-        cmd.args.insert(cmd.args.end(), rest.begin(), rest.end());
+        if (!hy4_shell) cmd.args.insert(cmd.args.end(), rest.begin(), rest.end());
+        if (native_pair) {
+            cmd.args.emplace_back("--pair-expected");
+            if (query.placement) cmd.args.insert(cmd.args.end(), {"--pair-placement", req.placement});
+            // Request facts become available in the rank; no shell decision can grant this form.
+            query.placement.reset();
+        }
+        if (hy4_shell) {
+            if (req.profile) cmd.args.insert(cmd.args.end(), {"--profile", std::string(profile::tier_word(*req.profile))});
+            if (req.device_count) cmd.args.insert(cmd.args.end(), {"--device-count", std::to_string(req.device_count)});
+            if (!req.placement.empty()) cmd.args.insert(cmd.args.end(), {"--placement", req.placement});
+            if (req.print_effective_config) cmd.args.emplace_back("--print-effective-config");
+            cmd.args.emplace_back("--");
+            cmd.args.insert(cmd.args.end(), rest.begin(), rest.end());
+            return cmd;
+        }
         if (description) {
             // A native --profile in the engine arguments (or a model without [presets]) keeps its passthrough (no preset injection), but the explicit
             // placement is still validated: the description stays available independently of argument injection.
             if (!req.profile && !req.print_effective_config && (native_profile_arguments(rest) || !description->find("presets"))) {
-                auto query = placement_query(req);
                 if (const auto word = native_profile_word(rest); !word.empty()) {
                     try { query.tier = profile::parse_tier(word); } catch (const std::invalid_argument&) {}   // the engine rejects it
                 }
                 cmd.placement = profile::multi_device::resolve(*description, query);
             } else {
-                cmd.preset = profile::resolve_model_preset(*description, req.profile, route.backend, placement_query(req));
+                cmd.preset = profile::resolve_model_preset(*description, req.profile, route.backend, query);
                 cmd.preset->append_options(cmd.args);
                 cmd.placement = cmd.preset->placement;
             }
+            if (native_pair) cmd.placement.reset();
         }
         if (req.print_effective_config) cmd.args.emplace_back("--print-effective-config");
         return cmd;
@@ -340,7 +363,11 @@ int launch(const Request& request, const std::vector<model_registry::Entry>& ent
                                              placement_query(req)).config.dump() << '\n';
         return 0;
     }
-    const auto command = resolve(req, entries, support::load(data / "support/matrix.toml"), probes, bin, exists, description);
+    auto command = resolve(req, entries, support::load(data / "support/matrix.toml"), probes, bin, exists, description);
+    if (entry.family == "hy4_flash") {
+        if (req.verb == Verb::serve) command.args.insert(command.args.begin(), {"--registry-root", data.string()});
+        else command.args.insert(command.args.end(), {"--pair-model", (data / entry.description).string()});
+    }
     if (command.preset && req.print_effective_config)
         out << command.preset->config.dump() << '\n' << std::flush;
     if (req.dry_run) {
