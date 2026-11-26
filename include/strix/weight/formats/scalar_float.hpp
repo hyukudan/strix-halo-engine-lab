@@ -17,6 +17,10 @@ namespace strix::weight::scalar_float {
 STRIX_SCALAR_FLOAT_HD std::uint32_t f2u(float x) { return __builtin_bit_cast(std::uint32_t, x); }
 STRIX_SCALAR_FLOAT_HD float u2f(std::uint32_t u) { return __builtin_bit_cast(float, u); }
 STRIX_SCALAR_FLOAT_HD float pow2f(int e) { return u2f(static_cast<std::uint32_t>(e + 127) << 23U); }  // e in [-126, 127]
+STRIX_SCALAR_FLOAT_HD int log2_ceil_positive_normal(float x) {
+    const std::uint32_t b = f2u(x);
+    return static_cast<int>((b >> 23U) & 255U) - 127 + ((b & 0x7fffffU) != 0U ? 1 : 0);
+}
 
 // Round to nearest even, preserving NaN as quiet NaN and both signs of zero.
 STRIX_SCALAR_FLOAT_HD std::uint16_t bf16_encode(float x) {

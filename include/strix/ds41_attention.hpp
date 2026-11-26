@@ -51,8 +51,7 @@ DS41A_HD float e4m3_value(std::uint8_t c) { return codec::e4m3(c); }
 DS41A_HD float e2m1_value(std::uint8_t c) { return codec::e2m1(c); }
 DS41A_HD int e2m1_int2(std::uint8_t c) { return codec::e2m1_doubled(c); }
 DS41A_HD int log2_ceil(float x) {  // ceil(log2(x)) from the bits, x > 0 (the reference's fast_log2_ceil)
-    const std::uint32_t b = f2u(x);
-    return static_cast<int>((b >> 23U) & 255U) - 127 + ((b & 0x7FFFFFU) != 0U ? 1 : 0);
+    return codec::log2_ceil_positive_normal(x);
 }
 DS41A_HD float f16_to_float(std::uint16_t h) {  // exact half conversion; backend forms below
 #if defined(__CUDA_ARCH__)
