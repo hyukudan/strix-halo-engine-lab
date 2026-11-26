@@ -172,6 +172,20 @@ public:
         provenance_ = std::move(next);
         return provenance_.windows().size() - 1U;
     }
+    // Generation can discover additional input IDs after the initial prompt.
+    // Keep the window index stable so its already attributed rows still agree
+    // with the completed sequence. Both identities and shingles are rebuilt.
+    void extend_window(std::size_t window, std::span<const std::uint32_t> ids) {
+        if (window >= window_ids_.size()) throw std::out_of_range("calibration window index");
+        if (ids.empty()) return;
+        auto combined = window_ids_[window];
+        combined.insert(combined.end(), ids.begin(), ids.end());
+        Provenance next;
+        for (std::size_t i = 0; i < window_ids_.size(); ++i)
+            next.add_window(i == window ? combined : window_ids_[i]);
+        window_ids_[window].swap(combined);
+        provenance_ = std::move(next);
+    }
     // Throws std::runtime_error unless every input's rows are all attributed to registered windows.
     void check_attribution(const std::string& where) const {
         const auto windows = provenance_.windows().size();
@@ -207,12 +221,20 @@ public:
     }
 
     void write(const std::string& path) const {
+        write_partition(path, [](const InputMoments&) { return true; });
+    }
+
+    // Export one group of inputs with the same provenance and row
+    // attribution as the full capture, from the original moment arrays.
+    template <typename Select>
+    void write_partition(const std::string& path, Select select) const {
         check_attribution(path);
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         if (!out) throw std::runtime_error("cannot write calibration moments " + path);
         static constexpr char digits[] = "0123456789abcdef";
         const auto windows = provenance_.windows().size();
-        out << (layout_ == MomentLayout::diagonal ? kDiagonalMomentFileTag : kMomentFileTag) << ' ' << inputs_.size() << ' ' << windows << ' '
+        const auto inputs = std::ranges::count_if(inputs_, select);
+        out << (layout_ == MomentLayout::diagonal ? kDiagonalMomentFileTag : kMomentFileTag) << ' ' << inputs << ' ' << windows << ' '
             << provenance_.shingles().size() << '\n';
         for (const auto& w : provenance_.windows()) {
             out << "window ";
@@ -227,6 +249,7 @@ public:
         }
         std::vector<float> row;
         for (const auto& e : inputs_) {
+            if (!select(e)) continue;
             out << "input " << e.name << ' ' << e.width << ' ' << e.rows << ' ';
             if (windows == 0U) out << '-';
             for (std::size_t w = 0; w < windows; ++w)
