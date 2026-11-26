@@ -548,15 +548,19 @@ endif()
 if(NOT STRIX_CUDA_DS41_ONLY)
     add_library(strix_inkling2_mini_checkpoint STATIC
         src/inkling2/inkling2_mini_checkpoint.cpp
+        src/inkling2/inkling2_mini_pack_source.cpp
         src/inkling2/inkling2_mini_resident_weights.cpp)
     target_include_directories(strix_inkling2_mini_checkpoint PUBLIC src)
     target_link_libraries(strix_inkling2_mini_checkpoint PUBLIC strix-weight)
     strix_target_warnings(strix_inkling2_mini_checkpoint)
+    target_link_libraries(strix-lowbit-calib-pack PRIVATE strix_inkling2_mini_checkpoint)
+    target_compile_definitions(strix-lowbit-calib-pack PRIVATE STRIX_PACK_INKLING2_MINI)
     add_executable(strix-inkling2-mini-inspect apps/inkling2_mini_inspect.cpp)
     target_link_libraries(strix-inkling2-mini-inspect PRIVATE strix_inkling2_mini_checkpoint)
     strix_target_warnings(strix-inkling2-mini-inspect)
     add_executable(strix-inkling2-mini-cpu
         apps/inkling2_mini_cpu.cpp
+        apps/inkling2_mini_cpu_pack_study.cpp
         src/inkling2/inkling2_mini_host.cpp
         src/inkling2/inkling2_mini_dspark_reference.cpp)
     target_link_libraries(strix-inkling2-mini-cpu PRIVATE strix_inkling2_mini_checkpoint strix_serve)

@@ -122,15 +122,19 @@ private:
         if (visit.pass == 0) return mini_rms_norm(raw, scale);
 
         const auto base = std::string("controllers.") + std::string(controller) + ".";
-        const auto down = backend_.parameter(mini_layer_parameter(visit.physical_layer, base + "down_weight"),
-                                             2U * kHiddenWidth * kControllerRank);
+        const auto down_name = mini_layer_parameter(visit.physical_layer, base + "down_weight");
+        const auto down = backend_.parameter(down_name, 2U * kHiddenWidth * kControllerRank);
         const auto forget = backend_.parameter(mini_layer_parameter(visit.physical_layer, base + "forget_weight"),
                                                kHiddenWidth * kControllerRank);
         const auto gain = backend_.parameter(mini_layer_parameter(visit.physical_layer, base + "gain_weight"),
                                              kHiddenWidth * kControllerRank);
         const auto gated = ref::apply_low_rank_gate(raw, messages_.value().message(visit, path),
-                                                    {down, forget, gain}, 1e-6F,
-                                                    ref::DownProjectionPrecision::bf16);
+            {down, forget, gain}, 1e-6F, ref::DownProjectionPrecision::bf16,
+            [&](std::span<const float> x, std::span<float> y) {
+                if constexpr (requires { backend_.study_controller(down_name, x, y); })
+                    return backend_.study_controller(down_name, x, y);
+                return false;
+            });
         return mini_rms_norm(gated, scale);
     }
 

@@ -6434,6 +6434,25 @@ writing payloads. Host tests check arithmetic and reject inconsistent shard mapp
 The offline source contract applies to matrices in the supported encodings and ranks. ERNIE has a
 sizing example and needs a model binding. See [calibrated low-bit packs](engine/lowbit-calibration.md#host-strix-packs-for-grouped-experts).
 
+<a id="strixpack-host-role-study"></a>
+## CPU Strix pack role study
+
+`--pack-study` is an explicit CPU option to capture diagonal moments and routes and isolate compact
+projections on held-out text. The shared Strix pack reference decodes each group scale once and uses
+the existing ascending-column FMA chain. A model description carries formats and coder choices.
+Logical weight bytes per B1 decode step are computed from the checkpoint and model schedule.
+
+| Model | CPU role study binding |
+|---|---|
+| qwen3.8-flash-next | Pending |
+| qwen3.8-27b | Pending |
+| deepseek-v4.1-flash | Pending |
+| glm-5.3-flash | Pending |
+| minimax-m3.1-flash | Pending |
+| hy4-flash | Pending |
+| nemotron-3.5-bolt-e4b | Pending |
+| inkling2-mini | Text CPU reference with BF16, NVFP4 and MXFP8 sources |
+
 ### Hy4 Flash measured pair placement and verification costs
 
 Hy4’s shared placement policy can select whole-model TP for FAST and TURBO pair

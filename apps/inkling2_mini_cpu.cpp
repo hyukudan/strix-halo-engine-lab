@@ -79,7 +79,10 @@ private:
 
 }  // namespace
 
+int mini_cpu_pack_study(int argc, char** argv);
+
 int main(int argc, char** argv) {
+    if (argc >= 2 && std::string_view(argv[1]) == "--pack-study") return mini_cpu_pack_study(argc, argv);
     using namespace strix::inkling2;
     namespace serve = strix::serve;
     serve::SerialGenerationFamily family{

@@ -7,15 +7,30 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace strix::inkling2 {
+
+// Optional host study taps. Names are checkpoint tensor names, except for
+// expert slices, which append an expert ID and the logical projection.
+struct MiniHostStudy {
+    virtual ~MiniHostStudy() = default;
+    virtual void input(std::string_view, std::span<const float>) {}
+    virtual void embedding(unsigned) {}
+    virtual void routes(unsigned, std::span<std::uint32_t>, std::span<float>) {}
+    virtual bool project(std::string_view, std::span<const float>, std::span<float>, std::size_t) { return false; }
+    virtual bool lookup(std::string_view, unsigned, std::span<float>) { return false; }
+};
+
+void mini_cpu_finalize_logits(std::span<float> logits);
 
 // Serial CPU reference for one unpadded text sequence. After an I/O or
 // arithmetic failure during a step, the session is invalid and must be reopened.
 class MiniHostDecoder final : public spec::VerifyTarget {
 public:
-    MiniHostDecoder(const std::string& checkpoint_path, unsigned max_positions, const char* dspark = nullptr);
+    MiniHostDecoder(const std::string& checkpoint_path, unsigned max_positions, const char* dspark = nullptr,
+                    MiniHostStudy* study = nullptr);
     ~MiniHostDecoder() override;
 
     MiniHostDecoder(const MiniHostDecoder&) = delete;
