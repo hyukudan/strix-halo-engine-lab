@@ -5697,11 +5697,12 @@ See [admission, lifetime, resources and the native ticket](engine/prefill/hc-nor
 
 ## Measured profile receipts
 
-Set `STRIX_PROFILE_STRICT_RECEIPTS=1` to require a recorded reference for automatic band promotion. The reference must
-match the complete execution, including pack and route settings outside the lever table, every effective lever identity,
-and the candidate identity. An unrecorded reference falls back to the lower tier. With the setting unset, historical
-band rows without a recorded reference continue to use the compatibility binding. Explicit lever settings keep their
-existing precedence. The control only changes automatic FAST/TURBO admission and has no performance gain of its own.
+Set `STRIX_PROFILE_STRICT_RECEIPTS=1` to require a winning recorded timing in the requested regime and an admitted
+column for automatic FAST/TURBO promotion. A band reference must match the complete execution, including pack and
+route settings outside the lever table, every effective lever identity, and the candidate identity. Historical grants
+alone and provisional columns without explicit benchmark permission fall back to the lower tier. With the setting
+unset, historical grants and band rows without a recorded reference retain compatibility admission. Explicit lever
+settings keep their precedence. The control changes automatic FAST/TURBO admission.
 
 ## HC low-band layout
 

@@ -492,6 +492,25 @@ void cuda_cli_server() {
 }
 
 void custom_adapters() {
+    // The shipped Qwen composition is provisional above its 8K gate.
+    {
+        namespace qwen = strix::qwen::profile;
+        qwen::Inputs in;
+        bool strict_receipts = false;
+        in.env = [&](const char* key) -> const char* {
+            return strict_receipts && std::string_view(key) == p::kStrictReceiptsEnv ? "1" : nullptr;
+        };
+        in.regimes = qwen::fast_regimes;
+        in.max_prompt_tokens = 32768;
+        in.regime = {p::Phase::prefill, 32768, 1, "gfx1151", kExec};
+        const auto compatibility = qwen::resolve(p::Name::fast, in);
+        strict_receipts = true;
+        const auto strict = qwen::resolve(p::Name::fast, in);
+        for (const auto lever : {"qsa_budget", "moe_route_bf16", "gdn_fp16_chunk"}) {
+            require(compatibility.find(lever)->status == p::Status::provisional, "Qwen keeps the legacy 32K composition");
+            require(strict.find(lever)->status == p::Status::pending, "strict Qwen FAST refuses the provisional 32K cell");
+        }
+    }
     constexpr p::Regime regime{p::Phase::prefill, 4096, 1, "dev", "fixture-exec"};
     const p::LadderRow sample = measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 4096, 4096, 1, 1,
                                                    1.008, 0.002, "r/fast"}, kExactArm);

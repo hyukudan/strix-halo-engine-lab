@@ -257,8 +257,8 @@ struct LadderRow {
     std::string_view receipt;
     // Incumbent grant: a cell a resolver already applied before the ladder rule, kept with the receipt that qualified
     // it (or made it provisional). It covers every regime, so the cell keeps running exactly where its own readiness
-    // (unchanged by the ladder) admits it; where a timing row covers the regime, the timing row decides. Phase, device,
-    // bands, speedup and noise are unused.
+    // (unchanged by the ladder) admits it in compatibility mode. Where a timing row covers the regime, the timing row
+    // decides. Measured-receipt policy does not admit grants. Phase, device, bands, speedup and noise are unused.
     bool incumbent = false;
     // Paired decision: names the partner lever. The row was measured on the combined operation of this cell and the
     // partner's cell (one complete workload against the effective arm of the tier below) and decides only that pair
@@ -400,15 +400,16 @@ struct LadderVerdict {
 };
 
 // The verdict over the receipts matching `key` (ladder_receipt_matches()): applies only when every matching receipt
-// shows a gain; with no matching receipt, an incumbent grant with a receipt keeps the cell (Rung::incumbent), and
-// otherwise the cell resolves to the tier below (unmeasured). A grant is matched on lever, value, tier, receipt AND the
-// declared implementation identity of the value (ReceiptKey::identity). Receipts that do not match are ignored entirely.
+// shows a gain. With no matching receipt, compatibility mode can keep a historical grant (Rung::incumbent) and
+// measured-receipt policy resolves to the tier below. A grant matches the lever, value, tier, receipt and the declared
+// implementation identity of the value (ReceiptKey::identity).
 [[nodiscard]] constexpr LadderVerdict ladder_verdict(std::span<const LadderRow> rows, const ReceiptKey& key) noexcept {
     const LadderRow* worst = nullptr;
     const LadderRow* grant = nullptr;
+    const bool allow_grants = key.regime == nullptr || !key.regime->require_measured_receipts;
     for (const auto& row : rows) {
         if (row.incumbent) {
-            if (!grant && key.joint.empty() && !row.receipt.empty() && !row.identity.empty() &&
+            if (allow_grants && !grant && key.joint.empty() && !row.receipt.empty() && !row.identity.empty() &&
                 row.identity == key.identity && ladder_names(row, key.lever, key.value, key.tier))
                 grant = &row;
             continue;
@@ -1184,9 +1185,13 @@ template <class Row, class Admission>
                                             const LadderArms& arms, LadderCell lower) {
     const auto column = value_column(lever, tier);
     const auto wanted = lever.value[column];
+    const bool judged = ladder_judged(lever) && (tier == Name::fast || tier == Name::turbo);
+    const auto admission = wanted.empty() || wanted == lever.builtin ? Status::builtin : admit(column);
     // A cell spelling the builtin runs without a qualification of its own (resolve() treats it as builtin).
-    const bool eligible = !wanted.empty() && (wanted == lever.builtin || applied(admit(column)));
-    if (!ladder_judged(lever) || (tier != Name::fast && tier != Name::turbo))
+    // A speed receipt alone cannot promote a provisional column under measured-receipt policy.
+    const bool qualified = !judged || !regime.require_measured_receipts || allow_pending || admission == Status::set;
+    const bool eligible = !wanted.empty() && (wanted == lever.builtin || (qualified && applied(admission)));
+    if (!judged)
         return {eligible ? wanted : lever.builtin, tier, {}};
 
     lower.measured = false;  // the lower step's own verdict is not this tier's
@@ -1195,11 +1200,12 @@ template <class Row, class Admission>
         // the cell FAST resolved, whatever value the proposal spells (a companion setting of the proposal stays
         // pending in its own row); it never drops an admitted FAST member. FAST falls back to the builtin.
         if (tier == Name::turbo) {
-            if (lower.value != lever.builtin)
+            if (lower.value != lever.builtin || !qualified)
                 lower.route = " turbo=" + std::string(wanted) + " refused by column admission" + lower.route;
             return lower;
         }
-        return {lever.builtin, Name::standard, {}};
+        return {lever.builtin, Name::standard,
+                qualified ? std::string{} : " fast=" + std::string(wanted) + " refused by column admission"};
     }
     if (!eligible || (tier == Name::turbo && column == static_cast<unsigned>(Name::fast)) ||
         wanted == lower.value) return lower;

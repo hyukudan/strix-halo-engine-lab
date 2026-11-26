@@ -100,6 +100,46 @@ int main() try {
         vars.erase(kStrictReceiptsEnv);
     }
 
+    // Historical grants preserve compatibility. Strict mode requires a winning timing and an admitted column.
+    {
+        Inputs receipt_inputs = inputs;
+        std::array rows{pending};
+        rows[0].ready[1] = true;
+        const auto grant = incumbent_cell("item", "1", Name::fast, kProvisionalBeforeLadder, "v1");
+        std::array evidence{grant, timing};
+        const Engine incumbent{"incumbent", "", rows, false, {}, {}, {}, evidence};
+        const auto value = [&] { return resolve(incumbent, receipt_inputs).find("item")->value; };
+        receipt_inputs.profile = Name::fast;
+        receipt_inputs.allow_pending = false;
+        receipt_inputs.regime = {};
+        require(value() == "1", "legacy grant survives without timing");
+        vars[kStrictReceiptsEnv] = "1";
+        require(value() == "0", "strict receipts cannot borrow a historical grant");
+        receipt_inputs.regime = measured;
+        require(value() == "1", "strict receipts admit the winning scoped timing");
+        for (const auto& outside : {Regime{Phase::decode, 8, 1, "fixture", "fixture-exec"},
+                                    Regime{Phase::prefill, 9, 1, "fixture", "fixture-exec"},
+                                    Regime{Phase::prefill, 8, 2, "fixture", "fixture-exec"},
+                                    Regime{Phase::prefill, 8, 1, "other-device", "fixture-exec"},
+                                    Regime{Phase::prefill, 8, 1, "fixture", "other-exec"}}) {
+            receipt_inputs.regime = outside;
+            require(value() == "0", "strict receipts enforce phase, band, lanes, device and complete reference");
+        }
+        receipt_inputs.regime = measured;
+        for (const auto ratio : {0.95, 1.00}) {
+            evidence[1].speedup = ratio;
+            require(value() == "0", "a grant cannot overturn a slow or noisy timing");
+        }
+        evidence[1] = timing;
+        rows[0].ready[1] = false;
+        rows[0].provisional[1] = true;
+        require(value() == "0", "strict receipts do not automatically promote provisional cells with timing alone");
+        receipt_inputs.allow_pending = true;
+        require(value() == "1", "explicit provisional benchmark remains possible");
+        receipt_inputs.allow_pending = false;
+        vars.erase(kStrictReceiptsEnv);
+    }
+
     // The ordinary shared consumer keeps the original preset behavior even with historical grants.
     {
         Lever qualified = pending;
