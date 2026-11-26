@@ -1,6 +1,7 @@
 #pragma once
 
 #include "storage.hpp"
+#include "strix/attn/cache_shadow.hpp"
 #include <cstdint>
 #include <vector>
 
@@ -16,17 +17,11 @@ namespace strix::gemma4::gpu {
 // (unsynced committed rows, overlay rows) in registers with the same operations, so the bytes they compute never
 // depend on when the mirror was synchronized. The exact routes never read it; it is allocated only when a FAST
 // reader syncs it.
-enum class MirrorFormat : std::uint32_t { none = 0, f16 = 1, kv8 = 2 };
-inline constexpr std::uint32_t kv8_group = 16;
-struct Fp16MirrorRead {
-    const void* k = nullptr;            // f16: halves [admitted][width]; kv8: int8 codes [admitted][width]
-    const void* v = nullptr;
-    const std::uint16_t* k_scale = nullptr; // kv8: FP16 scales [admitted][width / kv8_group]
-    const std::uint16_t* v_scale = nullptr;
-    std::uint64_t mirrored = 0;         // rows [0, mirrored) hold the converted committed rows
-    std::uint32_t width = 0;
-    std::uint32_t format = 0;           // MirrorFormat
-};
+// The form and the read descriptor are the shared shadow contract (strix/attn/cache_shadow.hpp; reader trait
+// src/attn_core/shadow_kv_read.hpp).
+using MirrorFormat = strix::attn::cache_shadow::Form;
+inline constexpr std::uint32_t kv8_group = strix::attn::cache_shadow::group;
+using Fp16MirrorRead = strix::attn::cache_shadow::ShadowRead;
 struct Fp16Mirror {
     struct Layer {
         Buffer values;              // K rows then V rows (halves or codes)

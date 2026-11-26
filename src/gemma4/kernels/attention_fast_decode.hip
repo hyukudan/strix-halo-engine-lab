@@ -3,6 +3,8 @@
 #include "attention_fast_decode.hpp"
 #include "gemma4/kv/layout.hpp"
 #include "attn_core/cache_shadow.hpp"
+#include "attn_core/shadow_kv_read.hpp"
+#include "strix/attn/split_decode_plan.hpp"
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -13,10 +15,14 @@ namespace {
 namespace cs = strix::attn::cache_shadow;
 namespace sc = strix::attn_core::cache_shadow;
 static_assert(kv8_group == cs::group);
-constexpr unsigned fd_dim = 512, fd_tile = 128, fd_threads = 256, fd_waves = fd_threads / 32U;
+// The global layers' split-K row plan as data (strix/attn/split_decode_plan.hpp); every count below reads it.
+constexpr strix::attn::SplitDecodePlan fd_plan{.dim = 512, .tile = 128, .threads = 256, .group = group, .heads = heads,
+                                               .kv_heads = kv_heads, .max_positions = max_positions};
+static_assert(fd_plan.valid());
+constexpr unsigned fd_dim = fd_plan.dim, fd_tile = fd_plan.tile, fd_threads = fd_plan.threads, fd_waves = fd_threads / 32U;
 // Per (row, KV head, tile): maxima[group], denominators[group], values[group][fd_dim].
-constexpr unsigned fd_partial = 2U * group + group * fd_dim;
-constexpr unsigned fd_max_tiles = (max_positions + fd_tile - 1U) / fd_tile;
+constexpr unsigned fd_partial = fd_plan.partial_floats();
+constexpr unsigned fd_max_tiles = fd_plan.max_tiles();
 constexpr unsigned fd_merge_threads = 256, fd_merge_waves = fd_merge_threads / 32U, fd_slices = fd_dim / 32U;
 static_assert(group == 4U && fd_tile % 64U == 0 && (fd_tile / 4U) % 4U == 0);
 
@@ -35,57 +41,18 @@ __device__ inline const float* fd_kv_at(const KvRead& r, std::uint64_t p, bool v
     }
     return (value ? r.v : r.k) + std::size_t(slot) * r.width;
 }
-__device__ inline float half_value(unsigned bits16) { return cs::F16::decode((unsigned short)bits16); }
-// Count consecutive elements [at, at + Count) of the K (or V) row of position p, as FP32 values of the identity's
-// reduced operands. Format f16: the FP16 halves (the mirror's below `mirrored`, else the FP32 row - committed or
-// overlay - rounded RNE). Format kv8: d * code of the KV8 groups (the shared Int8G16 shadow form, strix/attn/cache_shadow.hpp); Count 16 = one lane's own group,
-// Count 8 = half a group held by two consecutive lanes (lane bit 0), whose amax they combine by one xor shuffle
-// (every lane of the wave calls with the same p, so the shuffle is uniform).
+// K / V operands through the shared KV-format trait (src/attn_core/shadow_kv_read.hpp): rows below the mirror's
+// `mirrored` from the per-stream shadow, newer rows (committed or overlay) converted in registers from the FP32 row with
+// the same encode, so the values never depend on when the mirror was synchronized. Format f16: FP16 halves; kv8: the
+// shared Int8G16 form. Count 16 = one lane's own group, Count 8 = half a group held by two consecutive lanes.
+using strix::attn_core::shadow_kv::decode_raw;
+using strix::attn_core::shadow_kv::fetch_raw;
+using strix::attn_core::shadow_kv::RawKv;
 template <unsigned Count, MirrorFormat Format>
 __device__ inline void load_kv(const KvRead& r, const Fp16MirrorRead& m, std::uint64_t p, bool value, unsigned at,
                                float (&out)[Count], unsigned* failure) {
-    static_assert(Count == 8U || Count == 16U);
     if (p < m.mirrored) {
-        if constexpr (Format == MirrorFormat::f16) {
-            const auto* src = static_cast<const std::uint16_t*>(value ? m.v : m.k) + std::size_t(p) * m.width + at;
-            if constexpr (Count == 16U) {
-#pragma unroll
-                for (unsigned c = 0; c < 2; ++c) {
-                    const uint4 u = *reinterpret_cast<const uint4*>(src + 8U * c);
-                    const unsigned w[4] = {u.x, u.y, u.z, u.w};
-#pragma unroll
-                    for (unsigned i = 0; i < 4; ++i) {
-                        out[8U * c + 2U * i] = half_value(w[i] & 0xffffU);
-                        out[8U * c + 2U * i + 1U] = half_value(w[i] >> 16U);
-                    }
-                }
-            } else {
-                const uint4 u = *reinterpret_cast<const uint4*>(src);
-                const unsigned w[4] = {u.x, u.y, u.z, u.w};
-#pragma unroll
-                for (unsigned i = 0; i < 4; ++i) {
-                    out[2U * i] = half_value(w[i] & 0xffffU);
-                    out[2U * i + 1U] = half_value(w[i] >> 16U);
-                }
-            }
-        } else {
-            const auto* codes = static_cast<const std::int8_t*>(value ? m.v : m.k) + std::size_t(p) * m.width + at;
-            const float d = cs::Int8G16::scale_value((value ? m.v_scale : m.k_scale)[std::size_t(p) * (m.width / kv8_group) +
-                                                                            at / kv8_group]);
-            unsigned w[Count / 4U];
-            if constexpr (Count == 16U) {
-                const uint4 u = *reinterpret_cast<const uint4*>(codes);
-                w[0] = u.x; w[1] = u.y; w[2] = u.z; w[3] = u.w;
-            } else {
-                const uint2 u = *reinterpret_cast<const uint2*>(codes);
-                w[0] = u.x; w[1] = u.y;
-            }
-#pragma unroll
-            for (unsigned c = 0; c < Count / 4U; ++c)
-#pragma unroll
-                for (unsigned i = 0; i < 4; ++i)
-                    out[4U * c + i] = cs::Int8G16::decode(int(std::int8_t((w[c] >> (8U * i)) & 0xffU)), d);
-        }
+        strix::attn_core::shadow_kv::load_shadow<Count, Format>(m, p, value, at, out);
         return;
     }
     const float* row = fd_kv_at(r, p, value, failure);
@@ -95,81 +62,7 @@ __device__ inline void load_kv(const KvRead& r, const Fp16MirrorRead& m, std::ui
             out[i] = 0.0F;
         return;
     }
-#pragma unroll
-    for (unsigned c = 0; c < Count / 4U; ++c) {
-        const float4 f = *reinterpret_cast<const float4*>(row + at + 4U * c);
-        out[4U * c] = f.x;
-        out[4U * c + 1U] = f.y;
-        out[4U * c + 2U] = f.z;
-        out[4U * c + 3U] = f.w;
-    }
-    if constexpr (Format == MirrorFormat::f16) {
-#pragma unroll
-        for (unsigned i = 0; i < Count; ++i)
-            out[i] = sc::f16_rounded(out[i], failure);
-    } else {
-        float amax = 0.0F;
-#pragma unroll
-        for (unsigned i = 0; i < Count; ++i) {
-            sc::note_nonfinite(out[i], failure);
-            amax = cs::Int8G16::max_step(amax, cs::Int8G16::magnitude(out[i]));
-        }
-        if constexpr (Count == 8U) {
-            const float other = __shfl_xor(amax, 1, 32);
-            amax = cs::Int8G16::max_step(amax, other);
-        }
-        const float d = cs::Int8G16::scale_value(sc::scale_flagged(amax, failure));
-#pragma unroll
-        for (unsigned i = 0; i < Count; ++i)
-            out[i] = cs::Int8G16::decode(cs::Int8G16::code(out[i], d), d);
-    }
-}
-// Raw mirror operands of one lane, fetched ahead of their use (loads in flight): Count 16 = 32 B of halves or
-// 16 B of codes + scale, Count 8 = 16 B of halves or 8 B of codes + scale. Decoding gives exactly load_kv's values.
-template <unsigned Count, MirrorFormat Format>
-struct RawKv {
-    uint4 a, b;
-    unsigned short scale;
-};
-template <unsigned Count, MirrorFormat Format>
-__device__ inline RawKv<Count, Format> fetch_raw(const Fp16MirrorRead& m, std::uint64_t p, bool value, unsigned at) {
-    RawKv<Count, Format> raw{};
-    if constexpr (Format == MirrorFormat::f16) {
-        const auto* src = static_cast<const std::uint16_t*>(value ? m.v : m.k) + std::size_t(p) * m.width + at;
-        raw.a = *reinterpret_cast<const uint4*>(src);
-        if constexpr (Count == 16U)
-            raw.b = *reinterpret_cast<const uint4*>(src + 8U);
-    } else {
-        const auto* codes = static_cast<const std::int8_t*>(value ? m.v : m.k) + std::size_t(p) * m.width + at;
-        if constexpr (Count == 16U)
-            raw.a = *reinterpret_cast<const uint4*>(codes);
-        else {
-            const uint2 u = *reinterpret_cast<const uint2*>(codes);
-            raw.a.x = u.x;
-            raw.a.y = u.y;
-        }
-        raw.scale = (value ? m.v_scale : m.k_scale)[std::size_t(p) * (m.width / kv8_group) + at / kv8_group];
-    }
-    return raw;
-}
-template <unsigned Count, MirrorFormat Format>
-__device__ inline void decode_raw(const RawKv<Count, Format>& raw, float (&out)[Count]) {
-    if constexpr (Format == MirrorFormat::f16) {
-        const unsigned w[8] = {raw.a.x, raw.a.y, raw.a.z, raw.a.w, raw.b.x, raw.b.y, raw.b.z, raw.b.w};
-#pragma unroll
-        for (unsigned i = 0; i < Count / 2U; ++i) {
-            out[2U * i] = half_value(w[i] & 0xffffU);
-            out[2U * i + 1U] = half_value(w[i] >> 16U);
-        }
-    } else {
-        const float d = cs::Int8G16::scale_value(raw.scale);
-        const unsigned w[4] = {raw.a.x, raw.a.y, raw.a.z, raw.a.w};
-#pragma unroll
-        for (unsigned c = 0; c < Count / 4U; ++c)
-#pragma unroll
-            for (unsigned i = 0; i < 4; ++i)
-                out[4U * c + i] = cs::Int8G16::decode(int(std::int8_t((w[c] >> (8U * i)) & 0xffU)), d);
-    }
+    strix::attn_core::shadow_kv::convert_master<Count, Format>(row + at, out, failure);
 }
 // The normed and rotated query, exactly as the exact chunk kernels form it (norm, then rotation): one wave per
 // (row, query head), written once per layer instead of once per tile block.
@@ -445,8 +338,7 @@ MirrorFormat fast_decode_attention_format() {
 }
 // Scratch: the rows' normed queries (rows x heads x 512 floats), then the tile partials.
 std::size_t fast_decode_attention_scratch_bytes(std::uint32_t rows, std::uint32_t stride) {
-    const std::size_t tiles = (std::size_t(stride) + fd_tile - 1U) / fd_tile;
-    return std::size_t(rows) * (heads * fd_dim + kv_heads * tiles * fd_partial) * sizeof(float);
+    return std::size_t(fd_plan.scratch_bytes(rows, stride));
 }
 bool fast_decode_attention(const float* q, LinearView q_norm, const std::uint64_t* positions, const float* table,
                            const KvRead* reads, const Fp16MirrorRead* mirrors, std::uint32_t rows,
