@@ -36,13 +36,18 @@ std::size_t elements(unsigned rows, unsigned columns) {
     return std::size_t{rows} * columns;
 }
 
-hc::Spec hc_spec(unsigned hidden, hc::Site site) {
+hc::Spec hc_spec(unsigned hidden, hc::Site site, bool checkpoint = false) {
     hc::Spec spec{};
     spec.hidden = hidden;
     spec.streams = kStreams;
     spec.site = site;
     spec.sinkhorn_iters = kSinkhornIters;
     spec.pre_eps = spec.comb_eps = spec.norm_eps = kHcEps;
+    if (checkpoint) {
+        spec.norm_eps = kRmsEps;
+        spec.norm_eps_outside_sqrt = site == hc::Site::sublayer;
+        spec.store = hc::Store::bf16;
+    }
     return spec;
 }
 
@@ -197,7 +202,7 @@ LayerResult FirstRowReference::block(unsigned layer, std::span<const float> stre
                                      const AttentionRow& attend) const {
     if (layer >= kLayerCount || !attend)
         throw std::invalid_argument("ERNIE: invalid target block binding");
-    auto site = hc_spec(shape_.hidden, hc::Site::sublayer);
+    auto site = hc_spec(shape_.hidden, hc::Site::sublayer, shape_.contracts.checkpoint_hc);
     const auto residual_contract = shape_.contracts.residual;
     if (residual_contract == ResidualContract::half_post) site.post_magnitude = 1.0F;
     if (residual_contract == ResidualContract::bf16) site.store = hc::Store::bf16;
@@ -219,8 +224,11 @@ LayerResult FirstRowReference::block(unsigned layer, std::span<const float> stre
                 for (unsigned j = 0; j < i; ++j)
                     std::swap(mix.comb[i * kStreams + j], mix.comb[j * kStreams + i]);
         std::vector<float> normalized(shape_.hidden);
-        hc::collapse(site, residual, mix.pre, normalized);
-        core::rms_norm_bf16_reference(normalized, read(prefix + norm, normalized.size()), epsilon);
+        auto collapse_site = site;
+        if (shape_.contracts.checkpoint_hc) collapse_site.store = hc::Store::f32;
+        hc::collapse(collapse_site, residual, mix.pre, normalized);
+        core::rms_norm_bf16_reference(normalized, read(prefix + norm, normalized.size()), epsilon,
+                                      shape_.contracts.checkpoint_hc);
         hc::expand(site, compute(normalized), residual, mix, next);
     };
     LayerResult result{std::vector<float>(site.flat()), std::vector<float>(shape_.hidden),
@@ -246,7 +254,7 @@ std::vector<float> FirstRowReference::embed(std::uint32_t token) const {
 }
 
 std::vector<float> FirstRowReference::head_input(std::span<const float> streams) const {
-    auto site = hc_spec(shape_.hidden, hc::Site::head);
+    auto site = hc_spec(shape_.hidden, hc::Site::head, shape_.contracts.checkpoint_hc);
     if (shape_.contracts.residual == ResidualContract::bf16) site.store = hc::Store::bf16;
     const auto fn = read("model.mhc_contract.hc_head_fn", site.flat() * site.mix_rows());
     const auto base = read("model.mhc_contract.hc_head_base", site.mix_rows());

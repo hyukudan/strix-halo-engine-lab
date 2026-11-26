@@ -39,11 +39,13 @@ inline void softmax_bf16_reference(std::span<float> row) {
 }
 
 // Shared float storage with explicit BF16 rounding boundaries.
-inline void rms_norm_bf16_reference(std::span<float> row, std::span<const float> gain, float epsilon) {
+inline void rms_norm_bf16_reference(std::span<float> row, std::span<const float> gain, float epsilon,
+                                   bool round_numerator = false) {
     if (row.empty() || gain.size() != row.size()) throw std::invalid_argument("BF16 RMSNorm: invalid row shape");
     const float inv = attn::group_pool::rms_inv(row.data(), static_cast<unsigned>(row.size()), epsilon);
     for (std::size_t i = 0; i < row.size(); ++i) row[i] = (row[i] * inv) * gain[i];
     round_bf16_reference(row);
+    if (round_numerator) round_bf16_reference(row);
 }
 
 inline std::vector<float> mix_rms_norm_bf16_reference(std::span<const float> taps, std::span<const float> coefficients,
