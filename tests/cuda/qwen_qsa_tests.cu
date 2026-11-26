@@ -20,8 +20,10 @@
 #include "qwen_gguf_host.hpp"
 #include "strix/cuda/qwen_qsa.hpp"
 #include "strix/cuda/amd_math_tables.hpp"
+#include "../cuda_core/select_qwen_baseline.cuh"
 
 namespace q = strix::cuda::qwen_qsa;
+namespace frozen = select_qwen_baseline;
 namespace am = strix::cuda::amdmath;
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { std::fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); std::exit(2); } } while (0)
@@ -360,11 +362,14 @@ static void test_norm_rope(const std::vector<float>& qn, const std::vector<float
 static void test_select() {
     // 64 rows at positions with 600 .. 8300 complete blocks; scores: random, heavy ties, +-0, -inf, NaN, too few finite.
     const unsigned rows = 64;
-    const std::uint64_t p0 = 2050;  // visible 2051 .. -> complete 512 (row 0..1: all visible) then 513 ..
+    const std::uint64_t p0 = 2050;  // 2051 visible in row 0; top-k begins at row 1.
     std::vector<std::uint64_t> pos(rows);
     for (unsigned r = 0; r < rows; ++r) pos[r] = r < 8 ? p0 + r : 2400 + static_cast<std::uint64_t>(r) * 470U;  // not contiguous: one launch per row below
     const std::uint32_t max_blocks = 33000 / 4;
-    std::vector<float> all(static_cast<size_t>(rows) * max_blocks, 0.0F);
+    constexpr std::uint32_t score_poison_bits = 0x7F7F7F7FU;
+    float score_poison;
+    std::memcpy(&score_poison, &score_poison_bits, sizeof(score_poison));
+    std::vector<float> all(static_cast<size_t>(rows) * max_blocks, score_poison);
     std::uniform_real_distribution<float> u(0.0F, 4.0F);
     for (unsigned r = 0; r < rows; ++r) {
         const auto complete = static_cast<std::uint32_t>((pos[r] + 1) / 4);
@@ -383,12 +388,34 @@ static void test_select() {
         }
     }
     Dev<float> ds(all);
-    Dev<std::uint32_t> dsel(static_cast<size_t>(rows) * 2051U);
-    for (unsigned r = 0; r < rows; ++r)
+    Dev<float> old_scores(all);
+    const std::vector<std::uint32_t> sentinel(static_cast<size_t>(rows) * q::kMaxSelected, 0xA5A5A5A5U);
+    Dev<std::uint32_t> dsel(sentinel), old_ids(sentinel);
+    for (unsigned r = 0; r < rows; ++r) {
         q::select_rows(ds.p + static_cast<size_t>(r) * max_blocks, max_blocks, 1, pos[r], dsel.p + static_cast<size_t>(r) * 2051U, nullptr);
+        frozen::select_kernel<<<1, frozen::kSelectThreads>>>(old_scores.p + static_cast<size_t>(r) * max_blocks,
+            max_blocks, pos[r], old_ids.p + static_cast<size_t>(r) * q::kMaxSelected);
+        CK(cudaGetLastError());
+    }
     CK(cudaDeviceSynchronize());
     const auto got = dsel.get();
     const auto got_scores = ds.get();
+    same("select frozen IDs", got, old_ids.get());
+    same("select frozen masked scores", got_scores, old_scores.get());
+    // Explicitly check the guards as well as the frozen reference. Short rows
+    // leave unused ID slots and blocks beyond the complete prefix untouched.
+    bool guards = true;
+    for (unsigned r = 0; r < rows; ++r) {
+        const auto complete = static_cast<std::uint32_t>((pos[r] + 1U) / q::kRatio);
+        const std::size_t score_row = std::size_t{r} * max_blocks;
+        const std::size_t id_row = std::size_t{r} * q::kMaxSelected;
+        guards = guards && std::memcmp(got_scores.data() + score_row + complete, all.data() + score_row + complete,
+            (max_blocks - complete) * sizeof(float)) == 0 &&
+            std::memcmp(got.data() + id_row + q::selected_count(pos[r]), sentinel.data() + id_row + q::selected_count(pos[r]),
+                (q::kMaxSelected - q::selected_count(pos[r])) * sizeof(std::uint32_t)) == 0;
+    }
+    (guards ? g_pass : g_fail)++;
+    std::printf("%s select unwritten ID slots and score padding\n", guards ? "ok  " : "FAIL");
     unsigned bad = 0, bad_scores = 0;
     for (unsigned r = 0; r < rows; ++r) {
         std::vector<float> s(all.begin() + static_cast<long long>(r) * max_blocks, all.begin() + static_cast<long long>(r + 1) * max_blocks);
@@ -603,6 +630,11 @@ static void fixture_probe() {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && !std::strcmp(argv[1], "--selection-only")) {
+        test_select();
+        std::printf("qwen_qsa_tests: %d passed, %d failed\n", g_pass, g_fail);
+        return g_fail ? 1 : 0;
+    }
     bool real = true, do_bench = false;
     for (int i = 1; i < argc; ++i) { if (!std::strcmp(argv[i], "--no-real")) real = false; if (!std::strcmp(argv[i], "--bench")) do_bench = true; }
     const char* td = std::getenv("STRIX_QRTX_TABLES");

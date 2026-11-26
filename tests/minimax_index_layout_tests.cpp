@@ -1,6 +1,5 @@
 // Host-only route ownership, byte accounting, admission and missing-layout gates.
 #include "minimax/engine/route_identity.hpp"
-#include "minimax/engine/mm_common.hpp"
 
 #include <array>
 #include <iostream>
@@ -8,7 +7,6 @@
 #include <string_view>
 
 namespace r = strix::minimax::route;
-namespace d = strix::minimax::engine::detail;
 namespace {
 void check(bool ok) { if (!ok) throw std::runtime_error("MiniMax index layout test failed"); }
 template<class Exception, class F> void refuses(F action, std::string_view message) {
@@ -19,7 +17,8 @@ template<class Exception, class F> void refuses(F action, std::string_view messa
     throw std::runtime_error("MiniMax index layout gate did not refuse");
 }
 constexpr auto bytes(unsigned mask) {
-    return r::index_weight_bytes(mask, d::kHidden, d::kIdxQ / 2, 128, d::kLayers);
+    constexpr unsigned hidden = 6144, rank_query = 256, key = 128, layers = 60;
+    return r::index_weight_bytes(mask, hidden, rank_query, key, layers);
 }
 static_assert(bytes(8) == 283115520ULL);
 static_assert(bytes(15) - bytes(8) == 1132462080ULL);  // 1.0546875 GiB/rank

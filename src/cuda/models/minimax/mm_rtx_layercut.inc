@@ -86,7 +86,7 @@ struct KvPool {  // fixed pinned fragments of one rank; get() blocks until one i
 struct BlockTimes { double buf_wait = 0, gpu = 0, act_q = -1, act_sent[2]{-1, -1}, kv_sent[2]{-1, -1}; };
 
 void run_layercut(const lc::Resolved& cfg, Store& store, const std::vector<std::uint16_t>& table,
-                  const float* w_in0, const cu::RopeRow* rope, const std::vector<std::uint32_t>& tokens,
+                  const chain::Norm* input_norm_d, const float* rope, const std::vector<std::uint32_t>& tokens,
                   const std::string& destinations, const std::string& pair_identity, unsigned repeat, bool bp,
                   bool abab_xport = false) {
     const auto endpoints = strix::handoff::parse_path_map(destinations);
@@ -98,12 +98,16 @@ void run_layercut(const lc::Resolved& cfg, Store& store, const std::vector<std::
     seq.cap = static_cast<std::uint32_t>(tokens.size());
     seq.k = dalloc<std::uint16_t>(std::size_t{cut} * seq.cap * 512);
     seq.v = dalloc<std::uint16_t>(std::size_t{cut} * seq.cap * 512);
-    seq.ik = dalloc<std::uint16_t>(std::size_t{cut} * seq.cap * 128);
-    cu::SeqView* seq_d = dalloc<cu::SeqView>(1);
+    auto index_cache = cu::msa_index_cache(nullptr, seq.cap, cut);
+    seq.ik = dalloc<std::uint16_t>(index_cache.sequence_stride);
+    index_cache.base = seq.ik;
+    auto* seq_d = dalloc<strix::attn::SelectedBlockSequence>(1);
     Runner run;
-    // A separate scratch runner for the short tail keeps R-dependent strides/maps correct.
+    // Rebuild scratch and tile geometry for the short tail's row count.
     run.alloc(std::min<std::size_t>(block, tokens.size()), (seq.cap + 127) / 128);
     run.row_seq = dupload(std::vector<std::uint32_t>(run.R, 0));
+    seq.rows = static_cast<std::uint32_t>(run.R);
+    run.prepare_msa_geometry({&seq, 1}, index_cache);
     struct CopyStream {
         cudaStream_t value = nullptr;
         CopyStream() { ck(cudaStreamCreateWithFlags(&value, cudaStreamNonBlocking), "cut copy stream"); }
@@ -190,7 +194,8 @@ void run_layercut(const lc::Resolved& cfg, Store& store, const std::vector<std::
                         for (std::uint32_t f = 0; f < desc.rows; f += frag) {
                             const std::uint32_t n = std::min(frag, desc.rows - f);
                             std::uint8_t* buf = pool[rank].get();
-                            cu::export_layer(kv_seq, layer, rank, desc.row0 + f, n, buf, kv_streams[rank].value);
+                            cu::export_layer(kv_seq, index_cache.layer_stride, layer, rank, desc.row0 + f, n, buf,
+                                kv_streams[rank].value);
                             ck(cudaStreamSynchronize(kv_streams[rank].value), "cut KV export");
                             const bool last = layer + 1 == cut && f + n == desc.rows;
                             lanes->bulk(rank, {lc::kKv, layer, 0, desc.row0 + f, n},
@@ -229,17 +234,16 @@ void run_layercut(const lc::Resolved& cfg, Store& store, const std::vector<std::
             }
             times->blocks[b].buf_wait = secs(w0, Clock::now());
             const auto desc = schedule[b];
+            seq.rows = desc.rows; seq.pos0 = static_cast<std::uint32_t>(desc.row0);
             if (run.R != desc.rows) {
-                run.release(); run.tiles_d = nullptr;
+                run.release();
                 run.alloc(desc.rows, (seq.cap + 127) / 128);
                 run.row_seq = dupload(std::vector<std::uint32_t>(run.R, 0));
+                run.prepare_msa_geometry({&seq, 1}, index_cache);
             }
-            seq.rows = desc.rows; seq.pos0 = static_cast<std::uint32_t>(desc.row0);
-            ck(cudaMemcpy(seq_d, &seq, sizeof(seq), cudaMemcpyHostToDevice), "cut sequence");
-            cudaFree(run.tiles_d);
-            std::vector<uint2> tiles;
-            for (unsigned r = 0; r < desc.rows; r += 32) tiles.push_back(make_uint2(r, std::min(32U, desc.rows - r)));
-            run.tiles_d = dupload(tiles); run.n_tiles = static_cast<unsigned>(tiles.size());
+            const auto attention_seq = cu::msa_attention_sequence(seq);
+            ck(cudaMemcpy(seq_d, &attention_seq, sizeof(attention_seq), cudaMemcpyHostToDevice), "cut attention sequence");
+            run.prepare_msa_rows({&seq, 1}, cut, rope, tokens.size());
             std::vector<std::uint32_t> embedding(std::size_t{desc.rows} * kHidden);
             for (unsigned r = 0; r < desc.rows; ++r) {
                 const auto token = tokens[static_cast<std::size_t>(desc.row0) + r];
@@ -249,15 +253,15 @@ void run_layercut(const lc::Resolved& cfg, Store& store, const std::vector<std::
             }
             const auto begin = Clock::now();
             ck(cudaMemcpy(run.h, embedding.data(), embedding.size() * 4, cudaMemcpyHostToDevice), "cut embed");
-            cu::rmsnorm(run.h, w_in0, run.hn, desc.rows, nullptr);
+            cu::rmsnorm(run.h, input_norm_d, run.hn, desc.rows, nullptr);
             for (unsigned layer = 0; layer < cut; ++layer) {
-                run.layer(hx::bind(store.meta[layer], store.dev[layer]), layer, seq_d, rope);
+                run.layer(hx::bind(store.meta[layer], store.dev[layer]), store.exchange_norms_d + 2U * layer, layer, seq_d);
                 if (!act_first) {
                     auto& slot = ring[b % 2];
                     ck(cudaEventRecord(slot.layer_ready, nullptr), "cut layer event");
                     ck(cudaStreamWaitEvent(copy, slot.layer_ready, 0), "cut copy waits layer");
                     for (unsigned rank = 0; rank < 2; ++rank)
-                        cu::export_layer(seq, layer, rank, desc.row0, desc.rows,
+                        cu::export_layer(seq, index_cache.layer_stride, layer, rank, desc.row0, desc.rows,
                             slot.kv[rank] + std::size_t{layer} * block * 1280, copy);
                 }
             }

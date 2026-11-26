@@ -74,15 +74,14 @@ model-kernel src/cuda/models/glm/projection.inl 8
 model-kernel src/cuda/models/glm/row_mma.cuh 2
 model-kernel src/cuda/models/minimax/fp32_identity.cu 5
 model-kernel src/cuda/models/minimax/mm_fp32_identity_tests.cu 1
-model-kernel src/cuda/models/minimax/mm_rtx_kernels.cu 12
 model-kernel src/cuda/models/qwen/qwen_dense.cu 2
 model-kernel src/cuda/models/qwen/qwen_gdn.cu 12
-model-kernel src/cuda/models/qwen/qwen_hc.cu 22
+model-kernel src/cuda/models/qwen/qwen_hc.cu 20
 model-kernel src/cuda/models/qwen/qwen_moe.cu 4
 model-kernel src/cuda/models/qwen/qwen_mtp_draft.cu 8
 model-kernel src/cuda/models/qwen/qwen_plemtp.cu 22
 model-kernel src/cuda/models/qwen/qwen_prefill_driver.cu 2
-model-kernel src/cuda/models/qwen/qwen_qsa.cu 28
+model-kernel src/cuda/models/qwen/qwen_qsa.cu 20
 model-kernel src/cuda/models/qwen/qwen_transcode.cu 2
 model-kernel src/gemma4/dflash/device.hip 7
 model-kernel src/gemma4/eagle/device.hip 5
@@ -233,7 +232,7 @@ raw-getenv src/cuda/models/glm/producer/profile.cpp 1
 raw-getenv src/cuda/models/glm/producer/service.cpp 3
 raw-getenv src/cuda/models/minimax/fp32_identity.cu 1
 raw-getenv src/cuda/models/minimax/mm_fp32_identity_tests.cu 1
-raw-getenv src/cuda/models/minimax/mm_rtx_kernels.cu 3
+raw-getenv src/cuda/models/minimax/mm_rtx_kernels.cu 2
 raw-getenv src/cuda/models/minimax/mm_rtx_prefill_main.cu 3
 raw-getenv src/cuda/models/qwen/qwen_prefill_driver.cu 7
 raw-getenv src/cuda/models/qwen/qwen_prefix_identity.cpp 2

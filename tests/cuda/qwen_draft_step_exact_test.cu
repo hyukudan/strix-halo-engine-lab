@@ -1,8 +1,8 @@
 // Byte-identity + timing test: MTP draft/commit step kernels, old vs new (decode rows 1..8; prefill rows 9..2019 for the fused
 // projection and hyper output, which launch_mtp_cache_rows routes to the v2 forms at every row count).
 //   qwen_draft_step_exact_test --tables DIR
-// Includes the two .cu files directly to reach their anonymous-namespace kernels. Build: tests/cuda/build_qwen_test.bat
-// (sources: this file + src/cuda/core/amd_math_tables.cu; gguf_reader not needed).
+// Includes the two .cu files directly to reach their anonymous-namespace kernels.
+// Build the qwen_draft_step_exact_test CMake target. Pass --embedding-only for the lookup fixture alone.
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -207,7 +207,46 @@ static void test_draft() {
     }
 }
 
+static bool test_embedding() {
+    constexpr std::uint32_t vocab = 2, rows = 4;
+    constexpr auto width = pm::kHidden;
+    constexpr auto row_bytes = width / 32U * 34U;
+    std::vector<std::uint8_t> table(vocab * row_bytes);
+    for (unsigned block = 0; block < vocab * (width / 32U); ++block) {
+        constexpr std::uint16_t scales[] = {0x3c00U, 0x8000U, 0x3555U, 0x7e01U, 0x0001U};
+        const auto scale = scales[block % 5U];
+        table[block * 34U] = static_cast<std::uint8_t>(scale);
+        table[block * 34U + 1U] = static_cast<std::uint8_t>(scale >> 8U);
+        for (unsigned code = 0; code < 32U; ++code)
+            table[block * 34U + 2U + code] = static_cast<std::uint8_t>(block * 13U + code * 17U);
+    }
+    auto* weights = dalloc(table);
+    auto* ids = dalloc(std::vector<std::uint32_t>{1U, 0U, vocab, UINT32_MAX});
+    auto* old_rows = dzero<std::uint16_t>(rows * width);
+    auto* new_rows = dzero<std::uint16_t>(rows * width);
+    auto* old_status = dalloc(std::vector<std::uint32_t>{0x10U});
+    auto* new_status = dalloc(std::vector<std::uint32_t>{0x10U});
+    pm::MtpWeights w{};
+    w.token_embd = weights;
+    w.vocab = vocab;
+    pm::mtp_embedding_kernel<><<<dim3(width / 256U, rows), 256>>>(weights, vocab, ids, old_rows, old_status);
+    CK(cudaGetLastError());
+    pm::launch_mtp_embedding(w, ids, rows, new_rows, new_status, nullptr);
+    const auto expected = fetch(old_rows, rows * width);
+    const auto actual = fetch(new_rows, rows * width);
+    const bool equal = same(expected, actual) && fetch(old_status, 1)[0] == 0x11U && fetch(new_status, 1)[0] == 0x11U;
+    for (void* p : {static_cast<void*>(weights), static_cast<void*>(ids), static_cast<void*>(old_rows),
+                    static_cast<void*>(new_rows), static_cast<void*>(old_status), static_cast<void*>(new_status)})
+        CK(cudaFree(p));
+    std::printf("%s Qwen K10c MTP embedding bytes and invalid-ID status\n", equal ? "PASS" : "FAIL");
+    return equal;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--embedding-only") {
+        CK(cudaSetDevice(0));
+        return test_embedding() ? 0 : 1;
+    }
     std::string tables = "D:\\tmp\\qrtxpf-build\\tables";
     for (int i = 1; i + 1 < argc; i += 2) if (std::string(argv[i]) == "--tables") tables = argv[i + 1];
     CK(cudaSetDevice(0));

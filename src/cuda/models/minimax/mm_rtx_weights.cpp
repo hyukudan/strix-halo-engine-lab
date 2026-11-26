@@ -1,7 +1,12 @@
 // Per-layer weight blobs of the RTX PRO prefill. See mm_rtx_weights.hpp.
 #include "mm_rtx_weights.hpp"
+#include "mm_rtx_index.hpp"
+#include "mm_rtx_prep.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 
 namespace strix::minimax::rtxpf::host {
@@ -9,7 +14,7 @@ namespace strix::minimax::rtxpf::host {
 namespace {
 
 const std::string kP = "language_model.model.";
-constexpr unsigned kHidden = 6144, kQLocal = 4096, kKVLocal = 256, kIdxLocal = 256, kDenseLocal = 6144, kExpertLocal = 1536;
+constexpr unsigned kHidden = 6144, kQLocal = 4096, kKVLocal = 256, kDenseLocal = 6144, kExpertLocal = 1536;
 
 struct Builder {
     LayerBlob& b;
@@ -30,6 +35,10 @@ struct Builder {
         return m;
     }
     std::size_t floats(const std::vector<float>& f) { return put(f.data(), f.size() * 4); }
+    std::size_t gemma_gain(std::vector<float> weight) {
+        for (float& gain : weight) gain = 1.0F + gain;
+        return floats(weight);
+    }
 };
 
 std::vector<float> transpose_rows(const std::vector<float>& a, std::size_t cols, std::size_t r0, std::size_t nr) {
@@ -44,26 +53,41 @@ std::vector<float> transpose_rows(const std::vector<float>& a, std::size_t cols,
 LayerBlob build_layer(Pack& pack, unsigned L, bool residual_only) {
     LayerBlob blob;
     Builder bd{blob};
-    blob.bytes.reserve(std::size_t{2800} << 20);
     const std::string lp = kP + "layers." + std::to_string(L) + ".", a = lp + "self_attn.", b = lp + "block_sparse_moe.";
     static const char* const kMlp[3] = {"gate_proj", "up_proj", "down_proj"};
     static const char* const kExp[3] = {"w1", "w3", "w2"};
-    const auto wiq_all = pack.floats(a + "index_q_proj.weight");  // [512][6144]
+    const std::string iq_name = a + kIndexQuery.tensor, ik_name = a + kIndexKey.tensor;
+    if (!kIndexQuery.admits(pack.info(iq_name))) throw std::runtime_error("MMIDX refused " + iq_name);
+    if (!kIndexKey.admits(pack.info(ik_name))) throw std::runtime_error("MMIDX refused " + ik_name);
+    blob.bytes.reserve(std::size_t{2800} << 20);
+    const auto wiq_all = pack.floats(iq_name);
     for (unsigned r = 0; r < 2; ++r) {
         RankRef& rr = blob.r[r];
         rr.q = bd.mat(pack.slice_out(a + "q_proj", r * kQLocal, kQLocal));
         rr.k = bd.mat(pack.slice_out(a + "k_proj", r * kKVLocal, kKVLocal));
         rr.v = bd.mat(pack.slice_out(a + "v_proj", r * kKVLocal, kKVLocal));
         rr.o = bd.mat(pack.slice_in(a + "o_proj", r * kQLocal, kQLocal));
-        rr.wiq = bd.floats(transpose_rows(wiq_all, kHidden, r * kIdxLocal, kIdxLocal));
+        rr.wiq = bd.floats(transpose_rows(wiq_all, kIndexInput, r * kIndexQuery.outputs, kIndexQuery.outputs));
     }
-    blob.wik = bd.floats(transpose_rows(pack.floats(a + "index_k_proj.weight"), kHidden, 0, 128));
-    blob.q_w = bd.floats(pack.floats(a + "q_norm.weight"));
-    blob.k_w = bd.floats(pack.floats(a + "k_norm.weight"));
-    blob.iq_w = bd.floats(pack.floats(a + "index_q_norm.weight"));
-    blob.ik_w = bd.floats(pack.floats(a + "index_k_norm.weight"));
-    blob.w_post = bd.floats(pack.floats(lp + "post_attention_layernorm.weight"));
-    blob.w_next = residual_only ? bd.floats(std::vector<float>(kHidden, 0.0F)) : bd.floats(pack.floats(L + 1 < kLayers ? kP + "layers." + std::to_string(L + 1) + ".input_layernorm.weight" : kP + "norm.weight"));
+    blob.wik = bd.floats(transpose_rows(pack.floats(ik_name), kIndexInput, 0, kIndexKey.outputs));
+    const auto prep_gain = [&](const char* tensor) {
+        const auto name = a + tensor;
+        if (!pack.has(name)) throw std::runtime_error("MMPREP refused missing " + name);
+        const auto& info = pack.info(name);
+        if (!cuda::admits_msa_prep_gain(info.dtype, info.bytes)) throw std::runtime_error("MMPREP refused " + name);
+        const auto gain = pack.floats(name);
+        if (!std::ranges::all_of(gain, [](float entry) { return std::isfinite(entry); }))
+            throw std::runtime_error("MMPREP refused nonfinite " + name);
+        return bd.floats(gain);
+    };
+    blob.q_w = prep_gain("q_norm.weight");
+    blob.k_w = prep_gain("k_norm.weight");
+    blob.iq_w = prep_gain("index_q_norm.weight");
+    blob.ik_w = prep_gain("index_k_norm.weight");
+    blob.w_post = bd.gemma_gain(pack.floats(lp + "post_attention_layernorm.weight"));
+    blob.w_next = residual_only ? bd.floats(std::vector<float>(kHidden, 1.0F))
+                                : bd.gemma_gain(pack.floats(L + 1 < kLayers ? kP + "layers." + std::to_string(L + 1) +
+                                                                                 ".input_layernorm.weight" : kP + "norm.weight"));
     blob.moe = L >= kFirstMoe;
     auto mlp = [&](unsigned r, const std::string& pre, const char* const* nm, unsigned inter) {
         MlpRef m;
@@ -121,8 +145,6 @@ DevLayer bind(const LayerBlob& blob, const std::uint8_t* base) {
     d.k_w = f(blob.k_w);
     d.iq_w = f(blob.iq_w);
     d.ik_w = f(blob.ik_w);
-    d.w_post = f(blob.w_post);
-    d.w_next = f(blob.w_next);
     d.moe = blob.moe;
     if (blob.moe) {
         d.router = f(blob.router);
