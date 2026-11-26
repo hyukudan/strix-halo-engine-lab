@@ -98,10 +98,18 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.moe_w4a4 = admit_mini_moe_w4a4(resolution, resolved.backend);
     // Backend admission of the served route lever (kMiniServedCliRoute): HIP runs the command line's route, a CUDA
     // server declines it (requested stays in the receipt, mini_served_route_startup_field).
-    out.served_cli_route = mini_served_prefill_emits_first(resolved.backend == "hip", out.served_route_requested);
-    // The prompt chunk: --prefill-rows, else the route's (the incumbent 128-row held-back chunks without the lever,
-    // the command line's chunk and tail rule with it), clamped to the context. Lanes: mini_serve_lane_rows.
-    const auto schedule = mini_served_prefill_schedule_from_env(true, out.served_cli_route, out.tier);
+    const bool hip = resolved.backend == "hip";
+    out.served_cli_route = mini_served_prefill_emits_first(hip, out.served_route_requested);
+    auto schedule = mini_served_prefill_schedule_from_env(hip, out.served_cli_route, out.tier);
+    // Trial of the CLI chunk on the HIP held-back route. Keep the existing lane cap and admit a memory fallback.
+    const bool tall_held_back = hip && !out.served_cli_route && !explicit_rows &&
+        out.tier == profile::Name::standard && out.moe_w4a4 == moe_core::grouped_w4a4::Activations::bf16 &&
+        !out.experts_nvfp4 && out.context > kMiniServedHeldBackChunk &&
+        env_flag_default_off("STRIX_INK_HIP_SERVED_TALL_CHUNK");
+    if (tall_held_back) {
+        out.prefill_fallback_rows = kMiniServedHeldBackChunk;
+        schedule.chunk = mini_prefill_schedule(hip, out.tier).chunk;
+    }
     out.prefill_rows = std::min(explicit_rows.value_or(schedule.chunk), out.context);
     if (out.served_cli_route) {
         if (out.prefill_rows == 0U) throw std::invalid_argument("--prefill-rows must be positive");
@@ -112,8 +120,9 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     return resolved;
 }
 
-serve::CohortConfig scheduling(const MiniServeOptions& opt, const serve::CohortBackend& backend) {
+serve::CohortConfig scheduling(const MiniServeOptions& opt, const MiniServeCohort& device) {
     serve::CohortConfig config;
+    const auto& backend = *device.backend;
     // Admitted speculation (the decoder staged windows: backend.max_window > 1): each greedy lane drafts from its own
     // context (the shared cohort drafter) and verifies the window on its slot; draft rows by live lanes are the
     // model's data (drafts only while one lane is live, the previous one-row route at two or more).
@@ -128,7 +137,7 @@ serve::CohortConfig scheduling(const MiniServeOptions& opt, const serve::CohortB
     // A prompt runs as the command line's calls (whole chunks, the final one with its tail); beside a decoding lane
     // the cohort cuts pieces of kMiniServeDecodingRows inside those chunks where the decoder's piece rule allows (HIP),
     // so the bits never depend on other lanes (the backend's prompt_piece_rule; CUDA: none, whole chunks).
-    config.prompt_slice = opt.prefill_rows;
+    config.prompt_slice = device.prefill_rows == 0U ? opt.prefill_rows : device.prefill_rows;
     config.prompt_slice_decoding = opt.served_cli_route && backend.prompt_piece_rule().cuttable() &&
                                    opt.prefill_rows > kMiniServeDecodingRows ? kMiniServeDecodingRows : 0U;
     return config;
@@ -140,7 +149,7 @@ public:
                 const MiniServeTokenizer& tokenizer, MiniChat chat)
         : tokenizer_(tokenizer(opt.tokenizer)), device_(backend(opt)),
           queue_(std::max(64U, device_.backend->lanes())),
-          cohort_(queue_, *device_.backend, scheduling(opt, *device_.backend), [](const serve::GenerationJob& job) {
+          cohort_(queue_, *device_.backend, scheduling(opt, device_), [](const serve::GenerationJob& job) {
               if (job.copy_rows) throw std::invalid_argument("Inkling serving does not support copy_rows");
               if (job.window_rows) throw std::invalid_argument("Inkling serving does not support window_rows");
               if (job.prompt.size() < 2 ||

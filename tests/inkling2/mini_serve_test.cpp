@@ -369,6 +369,7 @@ struct ServedShape {
     std::optional<unsigned> prefill_rows;
     std::optional<unsigned> context;
     std::optional<unsigned> slots;
+    bool tall_held_back = false;
 };
 
 void set_expert_env(const char* value) {
@@ -606,11 +607,12 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             // Without the lever the served shape is the incumbent one, written out here from the rule the server had
             // before the lever existed: a 128-row chunk unless --prefill-rows, clamped to the context; lanes = --slots,
             // else that clamped chunk; no tail; held-back prompt token; grouped decode.
-            const unsigned chunk = std::min(shape.prefill_rows.value_or(128U), context);
-            const unsigned lanes = shape.slots.value_or(0U) != 0U ? *shape.slots : chunk;
+            const unsigned chunk = std::min(shape.prefill_rows.value_or(shape.tall_held_back ? 8192U : 128U), context);
+            const unsigned lanes = shape.slots.value_or(0U) != 0U ? *shape.slots : shape.tall_held_back ? 128U : chunk;
             require(options.prefill_rows == chunk && mini::mini_serve_lane_rows(options) == lanes &&
-                        options.prefill_tail == 0U && options.lane_rows == 0U,
-                    "lever off: the served chunk, lane cap and tail are the incumbent ones");
+                        options.prefill_tail == 0U && options.lane_rows == 0U &&
+                        options.prefill_fallback_rows == (shape.tall_held_back ? 128U : 0U),
+                    "the held-back chunk, lane cap and fallback follow the requested shape");
         } else {
             // With the lever: the command line's chunk and tail rule, emits-first; lanes = --slots, else an explicit
             // (clamped) --prefill-rows, else the served lane cap.
@@ -621,6 +623,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                                                                        : mini::kMiniServeLaneRows;
             require(options.prefill_rows == chunk && mini::mini_serve_lane_rows(options) == lanes &&
                         options.prefill_tail == mini::mini_prefill_tail_capacity(chunk, cli.tail_divisor, context) &&
+                        options.prefill_fallback_rows == 0U &&
                         mini::mini_prefill_piece_rule(true).cuttable(),
                     "lever on: the command line's schedule and the served lane cap");
         }
@@ -1000,6 +1003,13 @@ int main(int argc, char** argv) try {
     set_cli_route_env("0");
     wiring(argv[1], "hip", false);
     set_cli_route_env(nullptr);
+    set_env("STRIX_INK_HIP_SERVED_TALL_CHUNK", "1");
+    for (const ServedShape shape : {ServedShape{{}, {}, {}, true}, ServedShape{{}, 2048U, 6U, true},
+                                    ServedShape{{}, 64U, {}}, ServedShape{256U, {}, {}}})
+        wiring(argv[1], "hip", false, false, W4a4::bf16, "exact", false, false, false, shape);
+    wiring(argv[1], "hip", false, false, W4a4::bf16, "turbo");
+    wiring(argv[1], "cuda", false, false, W4a4::bf16, "exact");
+    set_env("STRIX_INK_HIP_SERVED_TALL_CHUNK", nullptr);
     // The projected-bias lever per tier (opt-in): unset and 0 keep the image route, 1 selects the projected flash;
     // tests/inkling2/mini_gate_cli_test.cpp pins the same table through the CLI.
     for (const auto* tier : {"exact", "fast", "turbo"}) {

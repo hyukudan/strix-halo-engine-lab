@@ -23,6 +23,7 @@ struct MiniServeOptions {
     unsigned context = 8192;
     // Prefill chunk rows (resolve: --prefill-rows, else the route's chunk, clamped to the context).
     unsigned prefill_rows = 128;
+    unsigned prefill_fallback_rows = 0;  // HIP held-back tall chunk trial only
     unsigned slots = 0;
     // Served route lever (kMiniServedCliRoute): requested by the profile resolution, and admitted by the backend (HIP;
     // a CUDA server declines). Only the admitted route reads the three fields below it.
@@ -84,7 +85,7 @@ std::uint32_t mini_serve_kv_slots(Decoder& decoder, std::uint64_t free, std::uin
 // it always had); on the admitted served route lever an explicit --prefill-rows (clamped) or kMiniServeLaneRows.
 inline unsigned mini_serve_lane_rows(const MiniServeOptions& opt) noexcept {
     if (opt.slots) return opt.slots;
-    if (!opt.served_cli_route) return opt.prefill_rows;
+    if (!opt.served_cli_route) return opt.prefill_fallback_rows ? opt.prefill_fallback_rows : opt.prefill_rows;
     return opt.lane_rows ? opt.lane_rows : kMiniServeLaneRows;
 }
 
@@ -114,6 +115,7 @@ struct MiniServeCohort {
     // With the projected-bias lever selected: the decoder's projected-bias submissions so far (the counter the command
     // line reports), read once when the server stops (mini_projected_bias_dispatches_line). Empty: lever off.
     std::function<std::uint64_t()> projected_bias_dispatches;
+    unsigned prefill_rows = 0;  // the chunk admitted by the resident decoder
 };
 
 MiniServeCohort make_mini_hip_cohort(const MiniServeOptions&);

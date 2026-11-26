@@ -5,6 +5,7 @@
 #include "inkling2_mini_weight_device.hpp"
 #include "strix/device/gate.hpp"
 #include "strix/serve/fixed_kv_cohort.hpp"
+#include "strix/serve/prefill_chunk_fallback.hpp"
 #include "strix/spec/drafter_source.hpp"
 
 #include <functional>
@@ -38,6 +39,7 @@ inline MiniServeCohort make_mini_device_cohort(
     if (!(scope.checkpoint == weight::Digest256{})) std::cerr << weight::weight_load_scope_receipt(scope.view()) << '\n';
     std::uint64_t slot_bytes = 0;
     unsigned lanes = 0;
+    unsigned effective_chunk = opt.prefill_rows;
     MiniDecoderLevers levers;
     bool windows = false;
     std::string_view windows_declined = "decoder declined verify windows";
@@ -45,12 +47,13 @@ inline MiniServeCohort make_mini_device_cohort(
 #if !defined(__HIPCC__)
     exec::CohortProgramPolicy programs;
 #endif
-    auto cohort = load_mini_weights(opt.checkpoint, weights, opt.tier, weight_options, scope.view(), extent, [&](MiniLowBitRows lowbit) {
+    using Cohort = serve::FixedKvCohort<MiniResidentDecoder>;
+    const auto load_cohort = [&](MiniLowBitRows lowbit, unsigned chunk) {
         const bool calibrated = lowbit.admitted != nullptr;
         const bool decode_only_pack = lowbit.decode_only;
         // The served route is admitted before constructing the decoder. The same load transaction
         // checks capacity and allocates the slots before publishing the cohort.
-        auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
+        auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, chunk,
             opt.served_cli_route && kMiniPackedDecodeDefault, MiniResidentBackend::default_step_graphs,
             weights.roles(), 0U, false, rows, opt.served_cli_route ? opt.prefill_tail : 0U,
             opt.experts_nvfp4, opt.controller_one_plane, opt.served_cli_route, std::move(lowbit));
@@ -59,14 +62,14 @@ inline MiniServeCohort make_mini_device_cohort(
 #if defined(__HIPCC__)
         // A TURBO load whose prompts may select the rotated integer class builds its images now, not in the first prompt.
         if (mini_prompt_moe_may_select(weight_options, scope.device_class, moe_core::grouped_w4a4::Activations::iu4_rot,
-                                       MiniPromptExecution{scope.cost_device, opt.context,
-                                                           static_cast<std::uint32_t>(opt.prefill_rows)}))
+                                       MiniPromptExecution{scope.cost_device, opt.context, chunk}))
             decoder->set_moe_w4a4(moe_core::grouped_w4a4::Activations::iu4_rot);
 #endif
         levers = configure_mini_decoder(*decoder, opt.moe_w4a4, opt.combine_image, opt.prepared_round_fold,
                                         opt.attn_projected_bias, opt.screened_head, opt.verify_rows);
         // Admitted speculation: one-lane verify windows on any slot (per-slot tapes count in the slot's bytes). The
         // decoder declines windows on a calibrated low-bit target (mini_speculation_policy never requests both).
+        windows_declined = "decoder declined verify windows";
         windows = decoder->set_slot_windows(opt.speculation);
         slot_bytes = decoder->slot_bytes();
         // Keep the CUDA screened plane only when it costs no slot, then enforce the calibrated load's slot promise.
@@ -80,6 +83,9 @@ inline MiniServeCohort make_mini_device_cohort(
             memory = mini_gpu::memory_info();
             lanes = mini_serve_kv_slots(*decoder, memory.free, memory.total, budget.device_bytes, opt.kv_bytes, rows);
         }
+        if (opt.prefill_fallback_rows != 0U && chunk > opt.prefill_fallback_rows &&
+            (lanes == 0U || (opt.slots != 0U && lanes < rows)))
+            return std::unique_ptr<Cohort>{};
         require_mini_weight_slot_capacity(lanes, rows, calibrated);
         levers.head = decoder->head();
 #if !defined(__HIPCC__)
@@ -87,11 +93,10 @@ inline MiniServeCohort make_mini_device_cohort(
 #endif
         // The cohort owns the decoder while the server observes its projected-bias dispatches.
         auto* observed = decoder.get();
-        using Cohort = serve::FixedKvCohort<MiniResidentDecoder>;
         Cohort::PrefillPolicy policy;
         if (!kMiniProfile.ladder.empty())
             policy = [options = weight_options, device = scope.device_class, product = scope.cost_device,
-                      context = std::uint64_t{opt.context}, chunk = static_cast<std::uint32_t>(opt.prefill_rows)](
+                      context = std::uint64_t{opt.context}, chunk](
                          MiniResidentDecoder& resident, std::uint64_t tokens, bool first) {
                 resident.set_moe_w4a4(mini_prompt_moe(options, device, tokens, first, nullptr,
                                                       MiniPromptExecution{product, context, chunk}));
@@ -103,8 +108,20 @@ inline MiniServeCohort make_mini_device_cohort(
             std::make_unique<Cohort>(std::move(decoder), opt.context, forward_rows, lanes, std::move(policy));
         if (opt.attn_projected_bias)
             projected_bias_dispatches = [observed] { return observed->projected_attention_dispatches(); };
+        effective_chunk = chunk;
         return candidate;
-    });
+    };
+    auto cohort = load_mini_weights(opt.checkpoint, weights, opt.tier, weight_options, scope.view(), extent,
+        [&](MiniLowBitRows lowbit) {
+            auto candidate = serve::load_with_chunk_fallback(opt.prefill_rows, opt.prefill_fallback_rows == 0U,
+                opt.prefill_fallback_rows, std::cerr, [&](unsigned chunk) { return load_cohort(lowbit, chunk); });
+            if (candidate) return candidate;
+            std::cerr << "strix-prefill-chunk " << opt.prefill_rows << " -> " << opt.prefill_fallback_rows
+                      << " (slot capacity)\n";
+            return load_cohort(std::move(lowbit), opt.prefill_fallback_rows);
+        });
+    if (opt.prefill_fallback_rows != 0U)
+        std::cerr << "Inkling HIP held-back prefill_chunk " << effective_chunk << '\n';
     std::cerr << "Inkling " << backend << " slots " << lanes << " context " << opt.context
               << " KV and history bytes per slot " << slot_bytes
               << " profile " << mini_profile_name(opt.tier)
@@ -136,7 +153,7 @@ inline MiniServeCohort make_mini_device_cohort(
     speculation.admitted = windows;
     std::cerr << mini_speculation_line(speculation, opt.verify_rows) << '\n';
     if (windows) std::cerr << spec::drafter_receipt("served", {{}, spec::DrafterSource::context, {}}) << '\n';
-    return {std::move(cohort), weights, std::move(projected_bias_dispatches)};
+    return {std::move(cohort), weights, std::move(projected_bias_dispatches), effective_chunk};
 }
 
 } // namespace strix::inkling2
