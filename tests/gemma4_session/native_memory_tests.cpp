@@ -35,6 +35,12 @@ int main() {
         CHECK(!m::exact_stream_bound(c,0,{144,64,12,64,32,56}));
         CHECK(!m::exact_stream_bound(c,100,{144,64,12,64,32,56}));
         CHECK(!m::exact_stream_bound(c,31,{UINT64_MAX,64,12,64,32,56}));
+        // FAST decode-attention shadow: global producers only (layer 2 aliases producer 0), K and V planes.
+        using Form=strix::attn::cache_shadow::Form;
+        CHECK(m::shadow_stream_bytes(c,31,Form::none)==0U);
+        CHECK(m::shadow_stream_bytes(c,31,Form::f16)==2U*31U*128U*2U);
+        CHECK(m::shadow_stream_bytes(c,31,Form::kv8)==2U*31U*128U+2U*(2U*31U*128U/16U));
+        CHECK(!m::shadow_stream_bytes(c,0,Form::kv8) && !m::shadow_stream_bytes(c,100,Form::kv8));
         c.layer.back().producer=99;CHECK(!m::exact_stream_bound(c,31,{144,64,12,64,32,56}));
         const auto a=m::attention(65,3,8,64);
         CHECK(a.scores==8*3*128*4 && a.maxima==8*3*3*4 && a.partials==8*3*2*513*4);

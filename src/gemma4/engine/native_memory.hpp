@@ -4,6 +4,7 @@
 #include <optional>
 #include <stdexcept>
 #include "gemma4/contracts/g4_types.hpp"
+#include "strix/attn/cache_shadow.hpp"
 #include <algorithm>
 
 namespace strix::gemma4::memory {
@@ -74,6 +75,19 @@ inline std::optional<Work> exact_stream_bound(const ModelConfig& c,std::uint32_t
         (void)n.additional.total();return n;
     } catch(const std::overflow_error&) {return {};}
 #endif
+}
+// Device bytes of a stream's FAST decode-attention shadow (kv/fp16_mirror.hip: K and V of every global producer
+// layer at `admitted` rows, strix/attn/cache_shadow.hpp shadow_bytes), on top of exact_stream_bound; 0 for Form::none.
+inline std::optional<std::uint64_t> shadow_stream_bytes(const ModelConfig& c,std::uint32_t admitted,
+                                                        strix::attn::cache_shadow::Form form) {
+    if(!admitted || admitted>c.max_positions || !c.kv_heads || c.layer.size()!=c.layers) return {};
+    std::uint64_t n=0;
+    try {
+        for(std::uint32_t l=0;l<c.layers;++l)
+            if(c.layer[l].producer==l && c.layer[l].attention==AttentionKind::global)
+                add(n,strix::attn::cache_shadow::shadow_bytes(form,admitted,c.kv_heads*c.layer[l].head_dim));
+    } catch(const std::overflow_error&) {return {};}
+    return n;
 }
 // Exact decode target attention scratch geometry (target.hip). The pass accepts
 // at most eight rows. Rounding is storage only and does not change reductions.
