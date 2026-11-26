@@ -1,5 +1,7 @@
 #include "strix/serve/aux_lane.hpp"
 
+#include "strix/env_flags.hpp"
+
 #include <algorithm>
 #include <condition_variable>
 #include <cstdio>
@@ -78,14 +80,7 @@ UnitKind parse_unit(std::string_view text) {
 }
 
 Config with_environment(Config base) {
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4996)
-#endif
-    const char* value = std::getenv("STRIX_AUX_UNIT");
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
+    const char* value = envcfg::lookup_unrecorded("STRIX_AUX_UNIT");
     if (!value || !*value) return base;
     const std::string_view text(value);
     if (text == "auto") {

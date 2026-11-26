@@ -1,5 +1,7 @@
 #include "strix/serve/health.hpp"
 
+#include "strix/env_flags.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -175,8 +177,7 @@ BackendHealth BackendProbeSlot::snapshot() const {
     }
 }
 bool serve_health_record_enabled() noexcept {
-    const auto* value = std::getenv("STRIX_SERVE_HEALTH_RECORD");
-    return !value || std::string_view(value) != "0";
+    return env_flag_default_on("STRIX_SERVE_HEALTH_RECORD");
 }
 HealthResponse render_health(const ServeHealthRecord& c, const BackendHealth& evidence,
     std::string_view service_state, std::string_view model, const QueueSnapshot& load, std::string_view capabilities_id) {

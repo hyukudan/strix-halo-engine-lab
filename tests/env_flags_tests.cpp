@@ -49,7 +49,14 @@ int main() {
         if (put(value) != 0) { std::fprintf(stderr, "cannot set test environment\n"); std::exit(2); }
         body();
     };
+    with("legacy", [&] {
+        const auto* raw = strix::envcfg::lookup_unrecorded(key);
+        check(raw && std::string(raw) == "legacy");
+        check(strix::envcfg::describe().empty());
+    });
     with(nullptr, [&] {
+        check(strix::envcfg::lookup_unrecorded(key) == nullptr);
+        check(strix::envcfg::describe().empty());
         check(strix::env_number<int>(key, -7, 0, 10) == -7);
         check(strix::env_bytes(key, 5) == 5U);
         check(strix::env_choice(key, 1, {"a", "b"}) == 1U);

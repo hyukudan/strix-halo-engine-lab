@@ -24,6 +24,23 @@
 // variable instead of being silently read as some default (N=12x, MODE=Fast).
 namespace strix {
 
+namespace envcfg {
+
+// For policies that have their own receipts (or none). Keep unset and empty
+// distinct and leave caching to the caller.
+inline const char* lookup_unrecorded(const char* name) noexcept {
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+    return std::getenv(name);
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+}
+
+}  // namespace envcfg
+
 // Most flags compare the entire value. Some legacy readers compare only byte 0;
 // keep that choice explicit ("0tail" and "1tail" otherwise change meaning).
 enum class EnvFlagMatch { exact, first_character };
@@ -39,12 +56,12 @@ inline bool env_flag_matches(const char* value, const char* flag, EnvFlagMatch m
 
 // Unset and empty are ON; only "0" (or a leading '0' when selected) disables.
 inline bool env_flag_default_on(const char* name, EnvFlagMatch match = EnvFlagMatch::exact) {
-    return !detail::env_flag_matches(std::getenv(name), "0", match);
+    return !detail::env_flag_matches(envcfg::lookup_unrecorded(name), "0", match);
 }
 
 // Unset and empty are OFF; only "1" (or a leading '1' when selected) enables.
 inline bool env_flag_default_off(const char* name, EnvFlagMatch match = EnvFlagMatch::exact) {
-    return detail::env_flag_matches(std::getenv(name), "1", match);
+    return detail::env_flag_matches(envcfg::lookup_unrecorded(name), "1", match);
 }
 
 // A number in [lo, hi]; unset or empty gives `fallback` (not range checked: a default may be a sentinel). Integers
@@ -52,7 +69,7 @@ inline bool env_flag_default_off(const char* name, EnvFlagMatch match = EnvFlagM
 template <class T>
 T env_number(const char* name, T fallback, T lo = std::numeric_limits<T>::lowest(), T hi = std::numeric_limits<T>::max()) {
     static_assert(std::is_arithmetic_v<T> && !std::is_same_v<T, bool>, "env_number: arithmetic type");
-    const char* value = std::getenv(name);
+    const char* value = envcfg::lookup_unrecorded(name);
     if (value == nullptr || value[0] == '\0') return fallback;
     if (std::isspace(static_cast<unsigned char>(value[0]))) detail::env_reject(name, value, "leading space");
     const auto range = [&] { return "out of range [" + std::to_string(lo) + ", " + std::to_string(hi) + "]"; };
@@ -81,7 +98,7 @@ T env_number(const char* name, T fallback, T lo = std::numeric_limits<T>::lowest
 // A byte count: a decimal integer with an optional binary suffix K, M, G or T (also KB / KiB ...), in [lo, hi].
 inline std::uint64_t env_bytes(const char* name, std::uint64_t fallback, std::uint64_t lo = 0,
                                std::uint64_t hi = std::numeric_limits<std::uint64_t>::max()) {
-    const char* value = std::getenv(name);
+    const char* value = envcfg::lookup_unrecorded(name);
     if (value == nullptr || value[0] == '\0') return fallback;
     if (value[0] == '-' || std::isspace(static_cast<unsigned char>(value[0]))) detail::env_reject(name, value, "not a byte count");
     char* end = nullptr;
@@ -108,7 +125,7 @@ inline std::uint64_t env_bytes(const char* name, std::uint64_t fallback, std::ui
 
 // The index of the value among `choices` (exact, case-sensitive); unset or empty gives `fallback`.
 inline std::size_t env_choice(const char* name, std::size_t fallback, std::initializer_list<const char*> choices) {
-    const char* value = std::getenv(name);
+    const char* value = envcfg::lookup_unrecorded(name);
     if (value == nullptr || value[0] == '\0') return fallback;
     std::size_t index = 0;
     std::string allowed;
@@ -181,7 +198,7 @@ inline bool parse_flag(const char* raw, bool default_on, EnvFlagMatch match = En
 }
 
 inline bool flag(const char* name, bool default_on, EnvFlagMatch match = EnvFlagMatch::first_character) {
-    const char* raw = std::getenv(name);
+    const char* raw = envcfg::lookup_unrecorded(name);
     const bool on = parse_flag(raw, default_on, match);
     record(name, raw, on ? "1" : "0");
     return on;
@@ -189,7 +206,7 @@ inline bool flag(const char* name, bool default_on, EnvFlagMatch match = EnvFlag
 
 // Integer switch: atoi of the value, `fallback` when unset (empty -> 0 like atoi).
 inline int integer(const char* name, int fallback) {
-    const char* raw = std::getenv(name);
+    const char* raw = envcfg::lookup_unrecorded(name);
     const int v = raw ? std::atoi(raw) : fallback;
     record(name, raw, std::to_string(v));
     return v;
@@ -200,20 +217,20 @@ inline int integer(const char* name, int fallback) {
 template <class T>
 T number(const char* name, T fallback, T lo = std::numeric_limits<T>::lowest(), T hi = std::numeric_limits<T>::max()) {
     const T v = env_number<T>(name, fallback, lo, hi);
-    record(name, std::getenv(name), std::to_string(v));
+    record(name, envcfg::lookup_unrecorded(name), std::to_string(v));
     return v;
 }
 
 // Raw text switch (nullptr when unset), recorded for the effective config.
 inline const char* text(const char* name) {
-    const char* raw = std::getenv(name);
+    const char* raw = envcfg::lookup_unrecorded(name);
     record(name, raw, raw ? raw : "");
     return raw;
 }
 
 // Choice switch: index of the value in `choices`, `fallback` when unset or unknown.
 inline int choice(const char* name, std::initializer_list<const char*> choices, int fallback) {
-    const char* raw = std::getenv(name);
+    const char* raw = envcfg::lookup_unrecorded(name);
     int index = fallback, i = 0;
     if (raw)
         for (const char* c : choices) { if (std::strcmp(raw, c) == 0) { index = i; break; } ++i; }

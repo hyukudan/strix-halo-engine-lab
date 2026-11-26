@@ -252,7 +252,6 @@ raw-getenv include/strix/ds41_engram_tp.hpp 1
 raw-getenv include/strix/ds41_prefill_tuning.hpp 1
 raw-getenv include/strix/ds41_touch_batch.hpp 1
 raw-getenv include/strix/ds41_weight_read_options.hpp 2
-raw-getenv include/strix/engine_profile.hpp 1
 raw-getenv include/strix/hip_setup_quiescence.hpp 1
 raw-getenv include/strix/host_phase_timing.hpp 2
 raw-getenv include/strix/known_window_cohort.hpp 1
@@ -269,8 +268,6 @@ raw-getenv include/strix/qwen_allon.hpp 2
 raw-getenv include/strix/qwen_prefill_handoff.hpp 1
 raw-getenv include/strix/qwen_prefill_pair.hpp 2
 raw-getenv include/strix/qwen_prefill_pipe_dump.hpp 2
-raw-getenv include/strix/serve/resident_session.hpp 1
-raw-getenv include/strix/serve/slot_capacity.hpp 2
 raw-getenv include/strix/startup_markers.hpp 1
 raw-getenv include/strix/turbo.hpp 1
 raw-getenv include/strix/unbuffered_file.hpp 1
@@ -466,8 +463,6 @@ raw-getenv src/ple_lookup.cpp 1
 raw-getenv src/ple_reclaim.cpp 7
 raw-getenv src/preflight.cpp 1
 raw-getenv src/serve/api.cpp 1
-raw-getenv src/serve/aux_lane.cpp 1
-raw-getenv src/serve/health.cpp 1
 raw-getenv src/serve/media.cpp 2
 raw-getenv src/speculative_verify_runtime.cpp 2
 raw-getenv src/token_sampling.cpp 4

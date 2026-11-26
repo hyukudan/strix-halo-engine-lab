@@ -19,6 +19,7 @@
 // error status and the session goes on; an engine exception during a run ends the process (the driver then
 // marks the job crashed and serves the rest in the next session).
 
+#include "strix/env_flags.hpp"
 #include "strix/lever_cache.hpp"
 #include "strix/serve/resident_plan.hpp"
 
@@ -589,7 +590,7 @@ inline constexpr double kMaxBudgetS = 300.0;
         return schedule(scheduled_plan, groups);
     }();
     oc.slots = slots.size();
-    const Baseline base = capture_baseline(plan, [](const char* k) { return std::getenv(k); });
+    const Baseline base = capture_baseline(plan, envcfg::lookup_unrecorded);
     std::vector<std::string> mismatch(plan.arms.size());
     for (std::size_t a = 0; a < plan.arms.size(); ++a) {
         mismatch[a] = reload_mismatch(plan.arms[a], h.levers, base);

@@ -6,6 +6,8 @@
 //   active peak  reusable scratch a slot needs only while it runs.
 // Engines fill these terms and the memory observations; the arithmetic, the limiting term and the report live here.
 // Pure host code: no device types, no engine dependency.
+#include "strix/env_flags.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -266,13 +268,13 @@ inline std::string capacity_report_json(const CapacityReport& report) {
 // Unset (default): every charge is unchanged.
 inline bool slot_exact_from(const char* value) { return value && std::string_view(value) == "1"; }
 inline bool slot_exact() {
-    static const bool on = slot_exact_from(std::getenv("STRIX_SERVE_SLOT_EXACT"));
+    static const bool on = slot_exact_from(envcfg::lookup_unrecorded("STRIX_SERVE_SLOT_EXACT"));
     return on;
 }
 // STRIX_SERVE_CENSUS=1: print the memory census lines (before load, after load, at the slot probe).
 inline bool census_enabled_from(const char* value) { return value && std::string_view(value) == "1"; }
 inline bool census_enabled() {
-    static const bool on = census_enabled_from(std::getenv("STRIX_SERVE_CENSUS"));
+    static const bool on = census_enabled_from(envcfg::lookup_unrecorded("STRIX_SERVE_CENSUS"));
     return on;
 }
 
