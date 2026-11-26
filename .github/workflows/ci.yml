@@ -260,6 +260,28 @@ jobs:
           cmake --build build/msvc --target strix-cpu-backend-host-tests strix-cpu-routed-expert-tests || exit /b 1
           ctest --test-dir build/msvc --output-on-failure --no-tests=error -R "^strix-cpu-(backend-host|routed-expert)-tests$"
 
+  host-sanitizers:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    env:
+      ASAN_OPTIONS: halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check serving and cohort fixtures with ASan and UBSan
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build/sanitizers -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined -no-pie"
+          targets=(strix-cohort-decode-tests strix-serve-config-tests strix-serve-json-constraint-tests)
+          cmake --build build/sanitizers --parallel 2 --target "${targets[@]}"
+          for target in "${targets[@]}"; do
+            ctest --test-dir build/sanitizers --output-on-failure --no-tests=error -R "^${target}$"
+          done
+
   hip-offline-build:
     needs: changes
     if: needs.changes.outputs.hip == 'true'
