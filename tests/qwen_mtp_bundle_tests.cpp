@@ -21,6 +21,19 @@ template<class F> void refuses(F f) {
     bool threw=false;try{f();}catch(const std::exception&){threw=true;}
     require(threw,"expected refusal");
 }
+// A header-only GGUF v3 (no tensors) declaring the drafter-target identity keys discovery reads.
+std::string target_gguf(std::uint32_t layers) {
+    std::string out("GGUF");
+    const auto u32=[&](std::uint32_t v) { for(int i=0;i<4;++i)out.push_back(static_cast<char>((v>>(8*i))&255U)); };
+    const auto u64=[&](std::uint64_t v) { for(int i=0;i<8;++i)out.push_back(static_cast<char>((v>>(8*i))&255U)); };
+    const auto str=[&](const std::string& v) { u64(v.size());out+=v; };
+    u32(3);u64(0);u64(3);
+    str("general.architecture");u32(8);str("qwen4exp");
+    str("qwen4exp.block_count");u32(4);u32(layers);
+    str("qwen4exp.embedding_length");u32(4);u32(2560);
+    out.resize((out.size()+31U)/32U*32U,char{0});
+    return out;
+}
 void write(const std::filesystem::path& p,const std::string& text) {
     std::ofstream f(p,std::ios::binary);f<<text;
     if(!f)throw std::runtime_error("fixture write failed");
@@ -192,7 +205,7 @@ int main(int argc,char** argv) try {
     {
         // Discovery of a registry drafter beside the model (no bundle json): the shipped MTP/ layout, by size.
         const auto model_dir=dir/"profile-model";std::filesystem::create_directories(model_dir/"MTP");
-        const auto pmodel=model_dir/"target.gguf";write(pmodel,"target bytes");
+        const auto pmodel=model_dir/"target.gguf";write(pmodel,target_gguf(48));
         const auto base_file=model_dir/"MTP"/"mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
         std::vector<std::string> plain{"decode",pmodel.string()};
         for(int token=1;token<=17;++token)plain.push_back(std::to_string(token));
@@ -213,6 +226,11 @@ int main(int argc,char** argv) try {
         write(base_file,"short");
         require(!capture(plain,text).mtp.enabled && text.find("expects 2786568256")!=std::string::npos,"wrong size is not taken and is named");
         std::filesystem::resize_file(base_file,2786568256ULL);
+        // Placement alone binds nothing: a model of another identity keeps plain decode and names the draft it left out.
+        write(pmodel,target_gguf(64));
+        require(!capture(plain,text).mtp.enabled && text.find("draft base targets qwen4exp 48 x 2560")!=std::string::npos,
+            "a draft for another target is not taken and is named");
+        write(pmodel,target_gguf(48));
         const auto picked=capture(plain,text);
         require(picked.mtp.enabled && picked.mtp_native_bundle && picked.mtp.calibration_rows==16U &&
             picked.mtp.sidecar==base_file.string() && picked.mtp.sidecar_logical_name==base_file.filename().string(),"base sidecar under MTP/");
