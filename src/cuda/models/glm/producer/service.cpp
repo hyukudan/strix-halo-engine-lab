@@ -13,6 +13,7 @@
 #include "schedule.hpp"
 #include "decode_command.hpp"
 #include "crash_report.hpp"
+#include "strix/serve/http_wire.hpp"
 #include "strix/serve/json.hpp"
 #include <atomic>
 #include <cuda.h>
@@ -47,16 +48,18 @@ struct Http {
 // One bounded HTTP request per connection. No chunked bodies, pipelining,
 // duplicate Content-Length, implicit tokenization or unsupported generation fields.
 Http request(w::Socket fd){
-    std::string data;char c;while(data.find("\r\n\r\n")==std::string::npos){w::require(data.size()<16384,"HTTP header too large");w::require(recv(fd,&c,1,0)==1,"HTTP header EOF");data+=c;}
-    auto end=data.find("\r\n");auto line=data.substr(0,end);auto a=line.find(' '),b=line.rfind(' ');
+    // The shared reader: poll-bounded reads under one total deadline (header, then body at >= 1 MiB/s), token field
+    // names, plain-digit Content-Length with any repetition refused, and a body buffer that follows the bytes received.
+    strix::serve::HttpWireLimits limits;limits.max_header_bytes=16384;limits.max_body_bytes=4*1024*1024;limits.request_timeout_ms=30000;limits.reject_repeated_length=true;
+    strix::serve::HttpWireMessage message;std::string carry;
+    const std::string error=strix::serve::read_http_message([fd](char* p,std::size_t n,int ms){return strix::serve::wire_recv(fd,p,n,ms);},message,limits,carry);
+    w::require(error.empty(),error.c_str());
+    w::require(message.header("transfer-encoding").empty(),"transfer encoding unsupported");
+    auto& line=message.start;auto a=line.find(' '),b=line.rfind(' ');
     w::require(a!=std::string::npos&&a<b&&line.substr(b+1)=="HTTP/1.1","HTTP request line");
-    Http r{line.substr(0,a),line.substr(a+1,b-a-1),{}};bool seen=false;std::size_t size=0;
-    for(auto off=end+2;off+2<data.size();){auto next=data.find("\r\n",off);if(next==off)break;auto header=data.substr(off,next-off);auto colon=header.find(':');w::require(colon!=std::string::npos,"HTTP header");auto key=header.substr(0,colon);for(char& x:key)if(x>='A'&&x<='Z')x+=32;
-        if(key=="content-length"){w::require(!seen,"duplicate length");seen=true;auto value=header.substr(colon+1);auto first=value.find_first_not_of(" \t");w::require(first!=std::string::npos,"empty length");value=value.substr(first);w::require(value.find_first_not_of("0123456789")==std::string::npos&&value.size()<10,"invalid length");size=std::stoull(value);w::require(size<=4*1024*1024,"HTTP body too large");}
-        w::require(key!="transfer-encoding","transfer encoding unsupported");off=next+2;
-    }
-    if(r.method=="POST")w::require(seen,"Content-Length required");
-    r.body.resize(size);if(size)w::io(fd,std::as_writable_bytes(std::span(r.body)),false);return r;
+    Http r{line.substr(0,a),line.substr(a+1,b-a-1),{}};
+    if(r.method=="POST")w::require(message.content_length.has_value(),"Content-Length required");
+    r.body=std::move(message.body);return r;
 }
 std::vector<std::uint32_t> read_prompt(const std::string& file,unsigned capacity){
     std::ifstream in(file,std::ios::binary);w::require(bool(in),"open prompt file");std::vector<char> bytes((std::istreambuf_iterator<char>(in)),{});
@@ -433,9 +436,9 @@ int main(int argc,char** argv){p::install_crash_report();try{
     auto expected_key=w::read_key(key_file);p::SocketRuntime sockets;
     w::SocketOwner listener;listener.fd=socket(AF_INET,SOCK_STREAM,0);w::require(listener.fd!=w::bad_socket,"HTTP socket");sockaddr_in address{};address.sin_family=AF_INET;address.sin_port=htons(static_cast<u_short>(port));w::require(inet_pton(AF_INET,bind.c_str(),&address.sin_addr)==1,"numeric HTTP bind");
     w::require(::bind(listener.fd,reinterpret_cast<sockaddr*>(&address),sizeof address)==0&&listen(listener.fd,8)==0,"HTTP bind/listen");
-    std::mutex busy;std::atomic<unsigned> connections=0;
-    for(;;){auto fd=accept(listener.fd,nullptr,nullptr);if(fd==w::bad_socket)continue;if(connections.fetch_add(1)>=8){--connections;w::close_socket(fd);continue;}
-        std::thread([&,fd]{w::SocketOwner client;client.fd=fd;DWORD timeout=120000;setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,reinterpret_cast<char*>(&timeout),sizeof timeout);setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,reinterpret_cast<char*>(&timeout),sizeof timeout);
+    std::mutex busy;std::atomic<int> connections=0;
+    for(;;){auto fd=accept(listener.fd,nullptr,nullptr);if(fd==w::bad_socket){std::this_thread::sleep_for(std::chrono::milliseconds(10));continue;}
+        if(!strix::serve::spawn_counted_connection(connections,8,[&,fd]{w::SocketOwner client;client.fd=fd;DWORD timeout=120000;setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,reinterpret_cast<char*>(&timeout),sizeof timeout);setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,reinterpret_cast<char*>(&timeout),sizeof timeout);
             try{auto req=request(fd);if(req.method=="GET"&&req.path=="/health"){response(fd,200,health);}
                 else if(req.method=="POST"&&req.path=="/v1/prefill"){
                     auto body=strix::serve::parse_json(req.body);fields(body,{"tokens","handoff","identity"});auto& handoff=field(body,"handoff");fields(handoff,{"rank0","rank1","key","node_identity","dsa_once","index_tail"});
@@ -451,7 +454,7 @@ int main(int argc,char** argv){p::install_crash_report();try{
                     // index_tail (wire Begin.version 3/4): the DSA index key/gate carry only the open pool block's rows.
                     const bool index_tail=handoff.find("index_tail")&&handoff.find("index_tail")->as_bool();
                     std::vector<std::uint32_t> tokens;for(auto& t:field(body,"tokens").as_array()){auto n=t.as_int();w::require(n>=0&&n<154880,"token out of vocabulary");tokens.push_back(std::uint32_t(n));}w::require(tokens.size()>=2&&tokens.size()<=capacity,"prompt capacity");
-                    std::unique_lock lock(busy,std::try_to_lock);if(!lock.owns_lock()){response(fd,503,"{\"error\":\"producer busy\"}");--connections;return;}
+                    std::unique_lock lock(busy,std::try_to_lock);if(!lock.owns_lock()){response(fd,503,"{\"error\":\"producer busy\"}");return;}
                     auto started=std::chrono::steady_clock::now();w::Begin b;b.layers=46;b.frontier=tokens.size()-1;b.total=tokens.size();b.node=node;b.producer=id;b.version=w::wire_version(dsa_once,index_tail);b.model=w::unhex(runtime.model_sha256());b.prompt=w::hash(std::as_bytes(std::span(tokens)));std::random_device random;for(auto& x:b.transaction.bytes)x=std::uint8_t(random());
                     auto connect_rank=[&](unsigned rank){auto begin=b;begin.rank=rank;auto endpoint=field(handoff,rank?"rank1":"rank0").as_string();return std::make_unique<p::Sender>(endpoint,expected_key,begin);};
                     auto c0=std::async(std::launch::async,connect_rank,0),c1=std::async(std::launch::async,connect_rank,1);
@@ -460,20 +463,19 @@ int main(int argc,char** argv){p::install_crash_report();try{
                     const auto produced=std::chrono::steady_clock::now();rank0.drain();rank1.drain();auto s0=std::async(std::launch::async,[&]{rank0.sender->commit();}),s1=std::async(std::launch::async,[&]{rank1.sender->commit();});s0.get();s1.get();
                     auto receipt=Json::object();receipt.set("status","LOCALLY_SEALED_BOTH");receipt.set("global_commit","requires both node receipts");receipt.set("qualification","DRAFT");receipt.set("requested_route","rtx-native");receipt.set("effective_route","rtx-native");receipt.set("producer_identity",id);receipt.set("node_prefill_identity",node=="r1b"?"r1":node);receipt.set("node_decode_identity",node);receipt.set("composed_identity",id+"+"+(node=="r1b"?"r1":node)+"+"+node);receipt.set("model_sha256",runtime.model_sha256());receipt.set("producer_executable_sha256",executable_hash);receipt.set("cache_manifest_sha256",model.empty()?Json(manifest_hash):Json());receipt.set("weight_source",model.empty()?"cache":"shards");receipt.set("qualification_receipt",Json());receipt.set("node_executable_hashes",Json());receipt.set("phase_timings",strix::serve::parse_json(runtime.timings()));receipt.set("fallback_reason",Json());receipt.set("frontier",std::uint64_t(b.frontier));receipt.set("mtp","prefix pairs complete; node seed pending");receipt.set("raw_bytes",rank0.sender->raw_bytes()+rank1.sender->raw_bytes());receipt.set("wire_bytes",rank0.sender->wire_bytes()+rank1.sender->wire_bytes());receipt.set("wire_bytes_rank0",rank0.sender->wire_bytes());receipt.set("wire_bytes_rank1",rank1.sender->wire_bytes());receipt.set("dsa_once",dsa_once);receipt.set("wire_version",int(b.version));receipt.set("producer_ms",std::chrono::duration<double,std::milli>(produced-started).count());receipt.set("total_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count());receipt.set("capacity_cache_profile",strix::serve::parse_json(health));persist_residency(runtime,receipt);response(fd,200,receipt.dump());
                 }else if(req.method=="POST"&&req.path=="/v1/generate"){
-                    if(!enable_generate){response(fd,404,"{\"error\":\"generation not enabled (--enable-generate)\"}");--connections;return;}
+                    if(!enable_generate){response(fd,404,"{\"error\":\"generation not enabled (--enable-generate)\"}");return;}
                     p::GenerateRequest g;
                     try{g=p::parse_generate(strix::serve::parse_json(req.body),capacity);
                         auto supplied=w::unhex(g.key_hex);if(!w::secure_equal(w::hash(std::as_bytes(std::span(supplied.bytes))),w::hash(expected_key)))throw p::RequestError(401,"generate key authentication failed");}
-                    catch(const p::RequestError& e){auto j=Json::object();j.set("error",e.what());response(fd,e.code,j.dump());--connections;return;}
-                    catch(const std::exception&){response(fd,400,"{\"error\":\"malformed generate request\"}");--connections;return;}
-                    std::unique_lock lock(busy,std::try_to_lock);if(!lock.owns_lock()){response(fd,503,"{\"error\":\"producer busy\"}");--connections;return;}
+                    catch(const p::RequestError& e){auto j=Json::object();j.set("error",e.what());response(fd,e.code,j.dump());return;}
+                    catch(const std::exception&){response(fd,400,"{\"error\":\"malformed generate request\"}");return;}
+                    std::unique_lock lock(busy,std::try_to_lock);if(!lock.owns_lock()){response(fd,503,"{\"error\":\"producer busy\"}");return;}
                     try{auto receipt=strix::serve::parse_json(runtime.generate(g.tokens,g.max_new,g.stop,false));identity_fields(receipt);runtime.reset_session();
                         const bool within=finalize_memory(runtime,receipt,"request:generate");response(fd,within?200:507,receipt.dump());} // finalization inside the boundary
                     catch(const std::exception& e){auto j=failed_receipt(runtime,std::string("generation failed; session invalidated: ")+e.what(),"request:generate (failed)");
                         try{runtime.reset_session();}catch(...){}identity_fields(j);response(fd,500,j.dump());}
                 }else response(fd,404,"{\"error\":\"unknown endpoint\"}");
             }catch(const std::exception&){try{response(fd,400,"{\"error\":\"prefill rejected or aborted; no global commit receipt\"}");}catch(...){} }
-            --connections;
-        }).detach();
+        })){w::close_socket(fd);}  // at the cap or no thread: refused, never counted
     }
 }catch(const std::exception& e){std::cerr<<"FAIL: "<<e.what()<<"\n";return 1;}}
