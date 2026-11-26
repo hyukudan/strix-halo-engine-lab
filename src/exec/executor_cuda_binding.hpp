@@ -14,16 +14,18 @@ enum class GraphAction { eager, capture, rebind, replay };
 
 inline const CudaProgramBinding empty_binding{};
 
+inline bool requires_capture(const Program& program) {
+    return !program.launches.empty() && program.launches.front().chain_identity.starts_with(detail::cuda_capture_recipe);
+}
+
 inline bool strict_capture(const Program& program, const CudaProgramBinding& binding, bool check_all) {
-    return check_all || binding.readback == CudaReadback::resident ||
-        (!program.launches.empty() && program.launches.front().chain_identity.starts_with(detail::cuda_capture_recipe));
+    return check_all || binding.readback == CudaReadback::resident || requires_capture(program);
 }
 
 inline void validate_capture_grid(const Grid& observed, const BoundLaunch& launch) {
     if (observed != launch.grid)
         throw std::runtime_error("captured CUDA geometry differs from bound grid: " + launch.identity);
 }
-
 
 inline void validate_step_width(const ProgramKey& key) {
     if ((key.phase == Phase::decode || key.phase == Phase::verify) && !session::is_step_replay_width(key.rows))

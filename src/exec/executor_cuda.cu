@@ -357,7 +357,7 @@ struct CudaExecutor::Impl {
         auto& staging = *slot.staging;
         const auto& staged = stage_input(staging, program, input, steps);
         auto* graph = graph_for(program, binding);  // Capture/update cannot execute the program.
-        if (!graph && requires_capture(program))
+        if (!graph && cuda_detail::requires_capture(program))
             throw std::runtime_error("CUDA program capture declined");
         const auto queue = stream->get();
         const auto resident = static_cast<cudaStream_t>(options.resident_stream);
