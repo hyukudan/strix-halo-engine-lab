@@ -416,7 +416,7 @@ void profile_parity() {
     const auto create = [&](const mini::MiniServeOptions& options) {
         loaded = options;
         return mini::MiniServeCohort{
-            std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(), 32U, 3U, 2U), {}, {}, 0U, 0U};
+            std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(), 32U, 3U, 2U), {}, {}, 0U};
     };
     sv::ServiceFactories factories;
     mini::install_mini_service(factories, {create, create},
@@ -643,11 +643,10 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                         config.max_draft == 0U && !config.context_draft,
                     "lever off: one admitted chunk alone, 128-row pieces beside a decoding lane (CUDA)");
             sv::validate_prompt_pieces(config, rule, chunk);
-            // The CUDA device cohort's pieces (kMiniCudaServeDecodingRows) where the chunk is larger; never priced.
-            const auto wide = mini::mini_serve_scheduling(chunk, rule, mini::kMiniCudaServeDecodingRows);
-            require(wide.prompt_slice_decoding ==
-                            (!hip_backend && chunk > mini::kMiniCudaServeDecodingRows ? mini::kMiniCudaServeDecodingRows
-                                                                                       : 0U) &&
+            // The CUDA device cohort's pieces (the shared long pieces) where the chunk is larger; never priced.
+            const auto wide = mini::mini_serve_scheduling(chunk, rule, mini::kMiniCudaServePieces);
+            require(mini::kMiniCudaServePieces.piece_rows == 1024U &&
+                        wide.prompt_slice_decoding == (!hip_backend && chunk > 1024U ? 1024U : 0U) &&
                         wide.prompt_gap_ms == 0.0 && config.prompt_gap_ms == 0.0,
                     "lever off: 1024-row CUDA pieces beside a decoding lane, no gap pricing");
             sv::validate_prompt_pieces(wide, rule, chunk);
@@ -692,7 +691,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         if (options.attn_projected_bias) observed = [&served_dispatches] { return served_dispatches; };
         return mini::MiniServeCohort{
             std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable), 32U, 3U, 2U), weights,
-            std::move(observed), 0U, 0U};
+            std::move(observed), 0U};
     };
     mini::MiniServeBackends backends;
     if (std::string_view(backend) == "hip") backends.hip = create;

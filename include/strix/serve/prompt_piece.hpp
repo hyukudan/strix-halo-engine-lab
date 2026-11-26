@@ -50,4 +50,28 @@ struct PromptPieceChoice {
     return {least <= top ? least : chunk_left, true};
 }
 
+// Mixed service: the policy data a server binds into CohortConfig::prompt_slice_decoding. A prompt admitted while
+// another lane decodes runs in pieces of `piece_rows` rows, cut where the decoder's PromptPieceRule keeps the bits, so
+// a decoding lane waits about one piece and its decode round. Fixed rows, not a priced grant: the bits never depend
+// on the size, and a fixed size holds no learned state (CohortConfig::prompt_gap_ms learns a row cost per pass).
+struct MixedServicePieces {
+    std::uint32_t piece_rows = 0;  // 0 = whole chunks beside decoding lanes
+};
+// The measured sizes, by regime:
+// - short: 128 rows, the incumbent mixed-service bound (Inkling 2 Mini served routes on gfx1151). RTX PRO 6000,
+//   Inkling 2 Mini q35: a 145-157 ms decode gap, but an 8K prompt beside a decoding lane took 9.7 s (a ~124 ms fixed
+//   cost per prefill pass, one pass per 128 rows).
+// - long: 1024 rows, for a device whose prefill pass carries a large fixed cost. RTX PRO 6000, Inkling 2 Mini held-back
+//   served route, ticket q41: decode gap 190 ms while an 8K prompt is admitted (priced grants, q39: 849-853 ms), the
+//   8K prompt 2.5-2.7 s beside the lane, C8 aggregate 192-196 tok/s over 3 reps.
+inline constexpr MixedServicePieces kMixedServiceShortPieces{128U};
+inline constexpr MixedServicePieces kMixedServiceLongPieces{1024U};
+
+// Rows of a piece beside decoding lanes for prompt calls of `chunk` rows: the policy's rows where the rule can cut and
+// the chunk is larger, else 0 (whole chunks).
+[[nodiscard]] constexpr std::uint32_t mixed_service_piece_rows(MixedServicePieces policy, PromptPieceRule rule,
+                                                               std::uint64_t chunk) noexcept {
+    return rule.cuttable() && policy.piece_rows != 0U && chunk > policy.piece_rows ? policy.piece_rows : 0U;
+}
+
 }  // namespace strix::serve

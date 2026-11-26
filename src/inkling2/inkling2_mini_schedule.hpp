@@ -207,23 +207,22 @@ constexpr serve::PromptPieceRule mini_prefill_piece_rule(bool hip, bool cli_rout
 
 // Served lane cap without --slots (an explicit --prefill-rows without --slots caps the lanes at its rows, as it did
 // before the served chunk and the lane cap were separate), and the rows of one served prompt piece while another lane
-// decodes (the incumbent 128-row mixed-service bound, on both routes).
+// decodes (the shared short mixed-service pieces, serve::kMixedServiceShortPieces: the incumbent 128-row bound).
 inline constexpr unsigned kMiniServeLaneRows = 128U;
-inline constexpr unsigned kMiniServeDecodingRows = 128U;
+inline constexpr unsigned kMiniServeDecodingRows = serve::kMixedServiceShortPieces.piece_rows;
 static_assert(kMiniServeDecodingRows % kMiniPrefillWaveRows == 0U &&
               kMiniServeDecodingRows > attn_core::dense::kKeySplitMaxRows, "a served piece keeps the long-chunk forms");
 static_assert(kMiniServeDecodingRows % kMiniCudaPieceRows == 0U && kMiniServeDecodingRows > 3U * kMiniCudaPieceRows,
               "a CUDA held-back piece is cuttable (serve::validate_prompt_pieces)");
 
-// CUDA held-back route beside decoding lanes: pieces of kMiniCudaServeDecodingRows rows. RTX PRO q35 (f8d8f9e38, one
-// decoding lane): a 128-row piece ~135 ms, an 8192-row prompt alone 848 ms (~124 ms per pass + ~0.088 ms per row), so
-// 128-row pieces kept a 145-157 ms decode gap but made an 8K prompt beside a lane take 9.7 s; 1024-row pieces bound
-// the gap near 225 ms and admit an 8K prompt in 8 passes. Fixed, not priced: with the shared gap pricing
-// (CohortConfig::prompt_gap_ms 250 ms, 124 ms per pass) the learned row cost came out near zero and the planner granted
-// whole 8K calls beside a decoding lane (RTX q39: 849-853 ms gaps).
-inline constexpr unsigned kMiniCudaServeDecodingRows = 1024U;
-static_assert(kMiniCudaServeDecodingRows % kMiniCudaPieceRows == 0U &&
-                  kMiniCudaServeDecodingRows > 3U * kMiniCudaPieceRows,
+// CUDA held-back route beside decoding lanes: the shared long pieces (serve::kMixedServiceLongPieces, 1024 rows). RTX
+// PRO q35 (one decoding lane): a 128-row piece ~135 ms, an 8192-row prompt alone 848 ms (~124 ms per pass + ~0.088 ms
+// per row), so 128-row pieces made an 8K prompt beside a lane take 9.7 s. Fixed, not priced: with the shared gap
+// pricing (CohortConfig::prompt_gap_ms 250 ms, 124 ms per pass) the learned row cost came out near zero and the planner
+// granted whole 8K calls beside a decoding lane (q39: 849-853 ms gaps); the long pieces held 190 ms (q41).
+inline constexpr serve::MixedServicePieces kMiniCudaServePieces = serve::kMixedServiceLongPieces;
+static_assert(kMiniCudaServePieces.piece_rows % kMiniCudaPieceRows == 0U &&
+                  kMiniCudaServePieces.piece_rows > 3U * kMiniCudaPieceRows,
               "a CUDA held-back piece is cuttable (serve::validate_prompt_pieces)");
 
 }  // namespace strix::inkling2

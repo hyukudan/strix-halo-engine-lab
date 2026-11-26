@@ -126,22 +126,21 @@ struct MiniServeCohort {
     // The prompt chunk the load admitted (serve::load_with_chunk_ladder; 0 = MiniServeOptions::prefill_rows): the
     // cohort's prompt slice.
     unsigned prefill_rows = 0;
-    // Rows of a prompt piece beside decoding lanes (0 = kMiniServeDecodingRows): the CUDA held-back route's
-    // kMiniCudaServeDecodingRows.
-    unsigned prompt_decoding_rows = 0;
+    // Prompt pieces beside decoding lanes (shared mixed-service data): the CUDA held-back route's long pieces.
+    serve::MixedServicePieces mixed_service = serve::kMixedServiceShortPieces;
 };
 
 // The served cohort's prompt service: alone, a prompt runs the admitted chunk per call (prompt_slice); beside a
 // decoding lane, pieces of kMiniServeDecodingRows (the incumbent 128-row mixed-service bound) cut inside those chunks
 // where the decoder's piece rule keeps the bits (CohortBackend::prompt_piece_rule: the HIP command line's route, the
-// CUDA held-back route, whose pieces are kMiniCudaServeDecodingRows rows); a decoder without a rule runs whole chunks.
+// CUDA held-back route, whose pieces are the shared long pieces); a decoder without a rule runs whole chunks.
 inline serve::CohortConfig mini_serve_scheduling(unsigned chunk, serve::PromptPieceRule rule,
-                                                 unsigned decoding_rows = kMiniServeDecodingRows) {
+                                                 serve::MixedServicePieces pieces = serve::kMixedServiceShortPieces) {
     serve::CohortConfig config;
     config.context_draft = false;
     config.max_draft = 0;
     config.prompt_slice = chunk;
-    config.prompt_slice_decoding = rule.cuttable() && chunk > decoding_rows ? decoding_rows : 0U;
+    config.prompt_slice_decoding = serve::mixed_service_piece_rows(pieces, rule, chunk);
     return config;
 }
 

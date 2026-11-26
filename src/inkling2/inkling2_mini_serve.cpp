@@ -132,9 +132,7 @@ serve::CohortConfig scheduling(const MiniServeOptions& opt, const MiniServeCohor
     const serve::CohortBackend& backend = *device.backend;
     // The chunk the load admitted (the chunk ladder may keep a smaller one), never the requested one.
     auto config = mini_serve_scheduling(device.prefill_rows != 0U ? device.prefill_rows : opt.prefill_rows,
-                                        backend.prompt_piece_rule(),
-                                        device.prompt_decoding_rows != 0U ? device.prompt_decoding_rows
-                                                                          : kMiniServeDecodingRows);
+                                        backend.prompt_piece_rule(), device.mixed_service);
     // Admitted speculation (the decoder staged windows: backend.max_window > 1): each greedy lane drafts from its own
     // context (the shared cohort drafter) and verifies the window on its slot; draft rows by live lanes are the
     // model's data (drafts only while one lane is live, the previous one-row route at two or more).

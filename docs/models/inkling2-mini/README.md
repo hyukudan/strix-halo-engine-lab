@@ -91,9 +91,10 @@ run, and every prefill row the grouped tile; `--packed-decode` /
 `--grouped-decode` as on the command line) and, without `--prefill-rows`, the command line's prompt chunk:
 it keeps the largest of 8192, 2048 and 128 rows whose load leaves the slot
 count of the 128-row chunk (startup line `prefill_chunk`), and a prompt
-admitted beside a decoding lane runs in pieces of 1024 rows (cut at 32-row
-steps), so a decoding lane waits about one piece (near 225 ms on an RTX PRO)
-and an 8K prompt takes 8 of them; every prompt row,
+admitted beside a decoding lane runs in the shared long pieces of 1024 rows
+(`serve::kMixedServiceLongPieces`, cut at 32-row steps), so a decoding lane
+waits about one piece (190 ms on an RTX PRO 6000) and an 8K prompt takes 8 of
+them (2.5-2.7 s beside a decoding lane); every prompt row,
 a one-row chunk included, runs the prefill form, so the bits do not change
 with the chunk or the pieces. The served route switch `STRIX_INK_SERVED_CLI_ROUTE=1`
 (`inkling2-mini-served-cli-route@1`, off in every profile column) makes a HIP

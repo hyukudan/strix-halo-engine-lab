@@ -537,6 +537,15 @@ void test_prompt_piece_rows() {
     check(prompt_piece_rows(1030, 1030, 8192, rule) == 1030 && prompt_piece_rows(1100, 1030, 8192, rule) == 1024,
           "piece: the step is a multiple of the alignment");
     check(prompt_piece_rows(500, 100, 8192, PromptPieceRule{}) == 500, "piece: an uncuttable chunk runs whole");
+    // The shared mixed-service sizes: the policy's rows where the rule cuts a larger chunk, else whole chunks.
+    static_assert(kMixedServiceShortPieces.piece_rows == 128U && kMixedServiceLongPieces.piece_rows == 1024U);
+    check(mixed_service_piece_rows(kMixedServiceLongPieces, {32, 32}, 8192) == 1024U &&
+              mixed_service_piece_rows(kMixedServiceShortPieces, {32, 32}, 8192) == 128U,
+          "mixed service: the policy's rows inside a larger chunk");
+    check(mixed_service_piece_rows(kMixedServiceLongPieces, {32, 32}, 1024) == 0U &&
+              mixed_service_piece_rows(kMixedServiceLongPieces, PromptPieceRule{}, 8192) == 0U &&
+              mixed_service_piece_rows(MixedServicePieces{}, {32, 32}, 8192) == 0U,
+          "mixed service: whole chunks when the chunk fits, the rule cannot cut or the policy has no pieces");
 }
 
 // A priced grant never dispatches more rows than the grant when ANY bit-safe cut <= grant exists; only when none
