@@ -233,6 +233,14 @@ void test_moe() {
     shape.contracts.router = RouterContract::gain_before_normalize;
     const auto renormalized = engine(weights, shape).block(1, residual);
     expect(renormalized.experts == result.experts, "mixture gain leaves the selection plane intact");
+    auto checkpoint = tiny_shape();
+    checkpoint.route.scale = 1.0F;
+    checkpoint.contracts.router = RouterContract::summed_scores;
+    const auto summed = engine(weights, checkpoint).block(1, residual);
+    expect(summed.experts == result.experts, "summed scores preserve bias ordering for this row");
+    near(summed.expert_weights.at(0), (1.25F / 10.25F) * 2.0F, 1e-6F,
+         "sum of both sigmoids, top-k denominator, then learned gain");
+    near(summed.expert_weights.at(1), 1.0F / 10.25F, 1e-6F, "bias is excluded from the denominator");
     near(renormalized.expert_weights.at(0), 3.0F * 1.5F / 6.0F, 1e-6F, "gain belongs in denominator");
     near(renormalized.expert_weights.at(1), 3.0F * 0.5F / 6.0F, 1e-6F, "gain denominator covers every route");
     const float latent = 5.65625F; // BF16-rounded sqrt(32).

@@ -144,6 +144,10 @@ void FirstRowReference::feed_forward(unsigned layer_id, const std::string& layer
         for (std::size_t i = 0; i < mix.size(); ++i) mix[i] *= gain[i];
     if (s.contracts.router == RouterContract::unit_gain || s.contracts.router == RouterContract::gain_before_normalize)
         std::ranges::fill(gain, 1.0F);
+    if (s.contracts.router == RouterContract::summed_scores) {
+        std::ranges::transform(select, mix, select.begin(), std::plus<>{});
+        mix = select;
+    }
     result.experts.resize(s.route.top_k);
     result.expert_weights.resize(s.route.top_k);
     moe::route_select_split_ref(s.route, select, mix, read(prefix + "e_score_correction_bias", s.route.experts),
