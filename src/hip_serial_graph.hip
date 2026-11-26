@@ -243,7 +243,7 @@ HipSerialGraph::HipSerialGraph(CompiledSerialExecution compiled, std::shared_ptr
         hip_check(hipStreamEndCapture(p.stream, &p.graph), "serial graph capture end"); p.capturing = false;
         std::size_t nodes = 0; hip_check(hipGraphGetNodes(p.graph, nullptr, &nodes), "serial graph node inventory");
         if (!nodes || p.order.size() != p.compiled.execution.steps.size()) throw std::runtime_error("whole graph capture has missing work");
-        hip_check(::strix::device::native::instantiate_segment_graph(&p.executable, p.graph, nullptr, nullptr, 0), "serial graph instantiate");
+        hip_check(::strix::device::native::instantiate_segment_graph(&p.executable, p.graph, nullptr, nullptr, std::size_t{0}), "serial graph instantiate");
     } catch (...) {
         p.failed = true;
         if (p.capturing) { hipGraph_t invalid = nullptr; const auto result = hipStreamEndCapture(p.stream, &invalid);

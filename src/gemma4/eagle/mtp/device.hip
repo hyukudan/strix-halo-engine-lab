@@ -574,7 +574,7 @@ struct DeviceDrafter::Impl {
                 try { enqueue(from, to); } catch (...) { hipGraph_t g0 = nullptr; (void)hipStreamEndCapture(stream, &g0); if (g0) (void)hipGraphDestroy(g0); throw; }
                 checked(hipStreamEndCapture(stream, &sources[from][to]));
                 slot.reset();
-                checked(::strix::device::native::instantiate_segment_graph(&exec, sources[from][to], nullptr, nullptr, 0));
+                checked(::strix::device::native::instantiate_segment_graph(&exec, sources[from][to], nullptr, nullptr, std::size_t{0}));
                 counters.draft_captures.fetch_add(1);
                 counters.draft_capture_ns.fetch_add(std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - capture_begin).count()));

@@ -1058,7 +1058,7 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
                 capturing = false;
                 capture_slot.reset();
                 hip_checked(status);
-                hip_checked(::strix::device::native::instantiate_segment_graph(&pending.executable, pending.graph, nullptr, nullptr, 0));
+                hip_checked(::strix::device::native::instantiate_segment_graph(&pending.executable, pending.graph, nullptr, nullptr, std::size_t{0}));
                 counters.target_captures.fetch_add(1);
                 counters.target_capture_ns.fetch_add(std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - capture_begin).count()));
