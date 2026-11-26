@@ -6,13 +6,16 @@
 #include "strix/ds41_dspark_vocab.hpp"
 #include "ds41_dspark_model.hpp"
 #include "strix/ds41_dspark_driver.hpp"
+#include "strix/session/stream_readback.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <filesystem>
 #include <fstream>
@@ -28,6 +31,90 @@ void expect(bool condition, const std::string& message) {
     if (!condition) {
         ++failures;
         std::cerr << "FAIL: " << message << '\n';
+    }
+}
+
+struct FakeReadback {
+    using Stream = unsigned;
+    struct Copy {
+        void* dst;
+        const void* src;
+        std::size_t bytes;
+    };
+    static inline std::array<Copy, 2U> queued{};
+    static inline std::size_t count = 0U;
+    static inline unsigned pins = 0U, releases = 0U, waits = 0U;
+    static inline bool refuse_pin = false, reject_second_copy = false;
+
+    static void* try_pin(std::size_t bytes) {
+        ++pins;
+        return refuse_pin ? nullptr : ::operator new(bytes);
+    }
+    static void unpin(void* memory) {
+        ++releases;
+        ::operator delete(memory);
+    }
+    static void copy_to_host(void* dst, const void* src, std::size_t bytes, Stream stream, const char*) {
+        if (stream != 7U) throw std::logic_error("copy on the wrong stream");
+        if (reject_second_copy && count == 1U) throw std::runtime_error("copy submission failed");
+        queued.at(count) = {dst, src, bytes};
+        ++count;
+    }
+    static void wait(Stream stream, const char*) {
+        if (stream != 7U) throw std::logic_error("wait on the wrong stream");
+        ++waits;
+        (void)drain(stream);
+    }
+    static bool drain(Stream) noexcept {
+        for (std::size_t i = 0; i < count; ++i)
+            std::memcpy(queued[i].dst, queued[i].src, queued[i].bytes);
+        count = 0U;
+        return true;
+    }
+};
+
+void test_draft_readback() {
+    struct Reply {
+        decltype(Draft::tokens) tokens;
+        decltype(Draft::confidence) confidence;
+    };
+    const decltype(Draft::confidence) confidence{
+        1.0F, -3.0F, -0.0F, std::bit_cast<float>(0x7fc00011U), 0.625F};
+    auto tokens = decltype(Draft::tokens){7U, 5U, 3U, 0U, 99U, 1U};
+    for (const auto refuse_pin : {false, true}) {
+        FakeReadback::refuse_pin = refuse_pin;
+        const auto start_pins = FakeReadback::pins;
+        const auto start_releases = FakeReadback::releases;
+        const auto start_waits = FakeReadback::waits;
+        {
+            strix::session::StreamReadback<Reply, FakeReadback> staging;
+            const auto read = [&] {
+                return staging.receive(7U, [&](auto& reply, auto copy) {
+                    copy(std::span(reply.tokens), tokens.data(), "test token copy");
+                    copy(std::span(reply.confidence), confidence.data(), "test confidence copy");
+                }, "test reply completion");
+            };
+            const auto first = read();
+            expect(first.tokens == tokens, "readback preserves every token");
+            const auto saved_confidence = std::bit_cast<std::array<std::uint32_t, block_size>>(first.confidence);
+            expect(saved_confidence == std::bit_cast<std::array<std::uint32_t, block_size>>(confidence),
+                   "readback preserves every confidence bit");
+            const auto buffer = FakeReadback::queued[0].dst;
+            ++tokens[0];
+            const auto second = read();
+            expect(second.tokens == tokens && first.tokens[0] + 1U == second.tokens[0], "readback returns independent snapshots");
+            expect(buffer == FakeReadback::queued[0].dst, "readback reuses the same host slot");
+            expect(FakeReadback::waits == start_waits + 2U, "two replies use exactly two stream fences");
+            FakeReadback::reject_second_copy = true;
+            bool rejected = false;
+            try { (void)read(); }
+            catch (const std::runtime_error&) { rejected = true; }
+            FakeReadback::reject_second_copy = false;
+            expect(rejected && FakeReadback::count == 0U, "failed second submission retires the first copy");
+            expect(read().tokens == tokens, "readback can be reused after the failing reply retires");
+        }
+        expect(FakeReadback::pins == start_pins + 1U, "readback pins once at setup");
+        expect(FakeReadback::releases == start_releases + (refuse_pin ? 0U : 1U), "readback releases pinned storage once");
     }
 }
 
@@ -652,6 +739,7 @@ int main() {
     }
 
     test_f16();
+    test_draft_readback();
     test_e4m3();
     test_wave_sum();
     test_sinkhorn();

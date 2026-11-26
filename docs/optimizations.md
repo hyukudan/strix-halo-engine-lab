@@ -44,6 +44,13 @@ Cooperative two-rank DSpark candidate exchange. The payload, zero padding and tr
 
 Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=affected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
 
+<a id="hip-pinned-decision-readback"></a>
+### HIP pinned decision readback
+
+`STRIX_HIP_PINNED_REPLIES=1` opts DeepSeek HIP DSpark and GLM HIP into a reusable per-engine host reply buffer. DSpark submits its token and confidence copies before one completion fence, removing one fence and two transient allocations per draft. GLM applies the same staging to checkpoint flags and selected IDs with the existing fence positions. If pinning is refused, the session uses reusable pageable storage. The default is off because live scheduling can use observed draft and decode times. Host tests compare IDs and confidence bits and count fences. Native token/state identity and timings are pending.
+
+DeepSeek and GLM bind the HIP option. Inkling, both Qwen engines, MiniMax, Hy4 and Nemotron keep their existing routes.
+
 <a id="hy4-engram-request-staging-reuse"></a>
 ### Hy4 Engram request staging reuse
 

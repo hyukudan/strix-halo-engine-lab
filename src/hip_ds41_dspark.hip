@@ -5,6 +5,7 @@
 #include "strix/hip_argmax_core.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/hip_ds41_dspark.hpp"
+#include "strix/hip_stream_readback.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -24,6 +25,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -662,6 +664,11 @@ struct DeviceDrafter::Impl {
     Buffer<float> best_values{markov_blocks};
     Buffer<std::uint32_t> best_ids{markov_blocks};
     Buffer<float> confidence_out{block_size};
+    struct DraftReply {
+        std::array<std::uint32_t, block_size + 1U> tokens;
+        std::array<float, block_size> confidence;
+    };
+    std::optional<device::HipStreamReadback<DraftReply>> draft_reply;
     // Candidate-form Markov chain (STRIX_DS41_DSPARK_MARKOV=cand; kernels in dspark_common/markov_cand_kernels.hpp). The
     // domain (core ids, then extras) splits in two halves by position as in local_rows(); every chain step of row k scores
     // each half's top-C of row k's head logits (value desc, position asc) and H, the |H| domain ids of largest Markov-head
@@ -784,6 +791,7 @@ struct DeviceDrafter::Impl {
         gpu_routes = flag("STRIX_DS41_DSPARK_GPU_ROUTES");
         if (mcfg.cand) cand_init();
         check(hipDeviceSynchronize(), "upload");
+        if (device::hip_pinned_replies_enabled()) draft_reply.emplace();
         memlog("route tables + extra rows", gtt_mark, std::uint64_t{extra_capacity} * output.row_bytes);
     }
     std::uint64_t memlog_stages_expected = 0;
@@ -1338,10 +1346,19 @@ Draft DeviceDrafter::draft(std::uint32_t token, bool keep_logits, DraftTimes* ti
     enqueue_hc_pre(m.streams.data, rows, pre, mix_count, m.x.data, m.stream);
     enqueue_rms_norm(m.x.data, rows, hidden, m.final_norm.data, m.xn.data, m.stream);
     m.head(rows);
-    const auto tokens = m.tokens.download(m.stream);
-    const auto conf = m.confidence_out.download(m.stream);
-    std::copy(tokens.begin(), tokens.end(), out.tokens.begin());
-    std::copy(conf.begin(), conf.end(), out.confidence.begin());
+    if (m.draft_reply) {
+        const auto reply = m.draft_reply->receive(m.stream, [&](auto& frame, auto copy) {
+            copy(std::span(frame.tokens), m.tokens.data, "draft tokens readback");
+            copy(std::span(frame.confidence), m.confidence_out.data, "draft confidence readback");
+        }, "draft reply completion");
+        out.tokens = reply.tokens;
+        out.confidence = reply.confidence;
+    } else {
+        const auto tokens = m.tokens.download(m.stream);
+        const auto conf = m.confidence_out.download(m.stream);
+        std::copy(tokens.begin(), tokens.end(), out.tokens.begin());
+        std::copy(conf.begin(), conf.end(), out.confidence.begin());
+    }
     const auto local = m.local_rows();
     out.candidates.fill(local.core_count + local.extra_count);
     if (keep_logits) {
