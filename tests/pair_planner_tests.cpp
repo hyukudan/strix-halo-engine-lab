@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -250,6 +251,86 @@ void test_calibrated_qwen_dense() {
           "calibrated tensor arithmetic, in-token trip measured");
     check(std::abs(t.ms - 39.86) < 0.1 && has(p.line, "single_ms=62.0"), "prediction ~39.9 ms vs 62.0 one node");
 }
+
+void test_split_phase() {
+    auto s = two_units(243.0, "usb4", 4.58);
+    dv::set_measured(s, 0U, 1U, dv::GapClass::back_to_back, cost(26.0, 4.0));
+    dv::set_measured(s, 0U, 1U, dv::GapClass::in_token, cost(32.0, 2.8));
+    const auto m = qwen_dense();
+    pl::Costs c;
+    c.set = &s;
+    c.route = GatherRoute::channel;
+    pl::Request pf;
+    pf.regime = pl::Regime::prefill;
+    pf.rows = 512U;
+    pf.windows = 16U;
+    pf.hop_bytes_per_row = 20480.0;
+    pl::SplitPhaseOption option;
+    option.name = "pipeline-tensor";
+    option.extra_resident_bytes = {64U, 128U};
+    option.min_prompt_rows = 2048U;
+    option.max_context_tokens = 16384U;
+    option.handoff_bytes_per_row = 4096U;
+    option.handoff_fixed_bytes = 256U;
+    option.handoff_trips = 16U;
+    option.handoff_setup_ms = 0.75;
+    option.handoff_exact = true;
+    pl::SplitPhaseRequest q;
+    q.prompt_rows = 8192U;
+    q.context_tokens = 8192U;
+    q.free_bytes = {64U, 128U};
+    auto prefill = pl::plan(m, c, pf);
+    auto decode = pl::plan(m, c, {});
+    auto p = pl::split_phase(c, q, option, prefill, decode);
+    check(!p.admissible && has(p.reason, "explicit placement"), "split phase is opt-in");
+    q.placement = option.name;
+    p = pl::split_phase(c, q, option, prefill, decode);
+    check(!p.admissible && has(p.reason, "measured handoff route"), "split phase needs the measured gap class");
+    dv::set_measured(s, 0U, 1U, dv::GapClass::idle, cost(80.0, 0.0));
+    prefill = pl::plan(m, c, pf);
+    decode = pl::plan(m, c, {});
+    p = pl::split_phase(c, q, option, prefill, decode);
+    check(!p.admissible && has(p.reason, "bulk rate"), "latency-only handoff probe cannot price payload");
+    dv::set_measured(s, 0U, 1U, dv::GapClass::idle, cost(80.0, 2.0));
+    p = pl::split_phase(c, q, option, prefill, decode);
+    check(!p.admissible && has(p.reason, "same device"), "split phase refuses estimates from stale calibration");
+    prefill = pl::plan(m, c, pf);
+    decode = pl::plan(m, c, {});
+    p = pl::split_phase(c, q, option, prefill, decode);
+    const double transfer_ms = 0.75 + 16 * 0.08 + 33554688.0 / 2.0e6;
+    check(p.admissible && p.exact && p.handoff_bytes == 33554688U && std::abs(p.handoff_ms - transfer_ms) < 1e-9,
+          "split phase charges setup, serialized trips and bytes");
+    check(std::abs(p.prefill_with_handoff_ms - p.prefill.ms - transfer_ms) < 1e-9 &&
+          has(p.line, "prefill_form=layers decode_form=tensor") && has(p.line, "handoff_bytes=33554688 handoff_trips=16") &&
+          has(p.line, "evidence=prediction"), "split phase receipt identifies phases and prediction");
+    q.free_bytes[1] = 127U;
+    p = pl::split_phase(c, q, option, prefill, decode);
+    check(!p.admissible && has(p.reason, "headroom of b"), "each rank must fit its peak co-resident layout");
+    q.free_bytes[1] = 128U;
+    q.ready_requests = 2U;
+    p = pl::split_phase(c, q, option, prefill, decode);
+    check(!p.admissible && has(p.reason, "concurrency band"), "option refuses unpriced concurrency");
+    q.ready_requests = 1U;
+    q.context_tokens = 32768U;
+    p = pl::split_phase(c, q, option, prefill, decode);
+    check(!p.admissible && has(p.reason, "context"), "option refuses unpriced context");
+    q.context_tokens = 8192U;
+    q.prompt_rows = 4096U;
+    p = pl::split_phase(c, q, option, prefill, decode);
+    check(!p.admissible && has(p.reason, "prefill windows"), "handoff rows and prefill window count must match");
+    q.prompt_rows = 8192U;
+    option.handoff_exact = false;
+    p = pl::split_phase(c, q, option, prefill, decode);
+    check(!p.admissible && has(p.reason, "allow_fast"), "handoff must preserve bits under EXACT");
+    option.handoff_exact = true;
+    option.handoff_fixed_bytes = std::numeric_limits<std::uint64_t>::max();
+    p = pl::split_phase(c, q, option, prefill, decode);
+    check(!p.admissible && has(p.reason, "overflow"), "handoff byte calculation cannot wrap");
+    option.handoff_fixed_bytes = 256U;
+    option.handoff_bytes_per_row = 200000U;
+    p = pl::split_phase(c, q, option, prefill, decode);
+    check(!p.admissible && has(p.reason, "single-device gain bar"), "handoff cost can erase prefill savings");
+}
 }  // namespace
 
 int main() {
@@ -262,6 +343,7 @@ int main() {
         test_spec_overlap_inputs();
         test_does_not_fit();
         test_calibrated_qwen_dense();
+        test_split_phase();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: exception %s\n", e.what());
         return 1;
