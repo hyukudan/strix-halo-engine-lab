@@ -1,10 +1,38 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 
 namespace strix::serve::tokenizer_utf8 {
+
+// Byte-level BPE maps printable bytes to their same-valued Unicode code point
+// and assigns the remaining bytes consecutive code points starting at U+0100.
+inline constexpr auto kByteBpeCodePoints = [] {
+    std::array<std::uint32_t, 256> points{};
+    std::uint32_t extra = 0x100U;
+    for (std::uint32_t byte = 0; byte < points.size(); ++byte) {
+        const bool direct = (byte >= 0x21U && byte <= 0x7EU) || (byte >= 0xA1U && byte <= 0xACU) || byte >= 0xAEU;
+        points[byte] = direct ? byte : extra++;
+    }
+    return points;
+}();
+
+inline std::array<std::string, 256> byte_bpe_alphabet() {
+    std::array<std::string, 256> symbols;
+    for (std::size_t byte = 0; byte < symbols.size(); ++byte) {
+        const auto cp = kByteBpeCodePoints[byte];
+        if (cp < 0x80U) {
+            symbols[byte].push_back(static_cast<char>(cp));
+        } else {
+            symbols[byte].push_back(static_cast<char>(0xC0U | (cp >> 6U)));
+            symbols[byte].push_back(static_cast<char>(0x80U | (cp & 0x3FU)));
+        }
+    }
+    return symbols;
+}
 
 // Rust String::from_utf8_lossy: every maximal invalid prefix becomes one U+FFFD.
 inline void append_lossy(std::string& out, std::string_view bytes) {

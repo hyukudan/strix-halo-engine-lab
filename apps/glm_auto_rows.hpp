@@ -3,7 +3,7 @@
 // strix-glm5-serve, so both entry points size the exchange and the prefill chunk the same way for the same memory:
 // a dry run of the load and prefill admissions at 8192 rows over every capacity-layout candidate, one vote per probe
 // with the peer, then the entry point's row agreement (the CLI's decode handshake, the server's row merge).
-#include "glm_rank_defaults.hpp"
+#include "glm/load/glm_rank_defaults.hpp"
 #include "glm/engine/glm_mem.hpp"
 #include "glm/prefill/glm_pf_capacity_policy.hpp"
 #include "glm/prefill/glm_pf_load_admission.hpp"

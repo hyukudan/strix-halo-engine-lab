@@ -4101,7 +4101,7 @@ Use chunked gemv prefill with the R1 arithmetic identity.
 - **Exactness evidence:** Real-model logits are bitwise equal on both ranks to previous exact R1 prefill; 1K/8K/32K gates. This does not assert R1b decode equality to R1.
 - **Off switch:** --prefill ref; STRIX_GLM_PREFILL=ref if no CLI prefill override
 - **Measured gain:** 1K/8K/32K TTFT 4.268/34.70/144.75 s = 240/236/226 tok/s
-- **Implementation / evidence:** [Resolver](../apps/glm_rank_defaults.hpp), [admission](../apps/glm_rank_main.cpp)
+- **Implementation / evidence:** [Resolver](../src/glm/load/glm_rank_defaults.hpp), [admission](../apps/glm_rank_main.cpp)
 
 <a id="glm-identity"></a>
 
@@ -4162,7 +4162,7 @@ Compute host transport CRC using parallel workers while retaining integrity chec
 - **Exactness evidence:** Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_DIST_CRC_PARALLEL=0
 - **Measured gain:** hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-hp-crc-overlap"></a>
 
@@ -4178,7 +4178,7 @@ Overlap host CRC work with exchange transfers.
 - **Exactness evidence:** Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_DIST_HOST_CRC_OVERLAP=0
 - **Measured gain:** hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-hp-chunk-bytes"></a>
 
@@ -4194,7 +4194,7 @@ Split host exchange payloads into 1 MiB chunks.
 - **Exactness evidence:** Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_DIST_HOST_CHUNK_BYTES=0
 - **Measured gain:** hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-hsa-no-fragment-allocator"></a>
 
@@ -4210,7 +4210,7 @@ Disable the HSA fragment allocator so production allocation granules fit GTT.
 - **Exactness evidence:** Measurement: production decode and prefill configuration; allocator granules fit GTT; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** HSA_DISABLE_FRAGMENT_ALLOCATOR=0
 - **Measured gain:** production decode and prefill configuration; allocator granules fit GTT
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-r1b-dense-auto"></a>
 
@@ -4226,7 +4226,7 @@ Select dense variant 7 within the R1b generation identity.
 - **Exactness evidence:** Measurement: R1b-fast kernels -7.8 % R1 / -5.4 % R8, same tokens; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_R1B_DENSE=2
 - **Measured gain:** R1b-fast kernels -7.8 % R1 / -5.4 % R8, same tokens
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-r1b-hc-v4"></a>
 
@@ -4242,7 +4242,7 @@ Use HC variant 4 within the R1b generation identity.
 - **Exactness evidence:** Measurement: with r1b-dense-auto, R1b-fast kernels -7.8 % R1 / -5.4 % R8, same tokens; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_R1B_HC=1
 - **Measured gain:** with r1b-dense-auto, R1b-fast kernels -7.8 % R1 / -5.4 % R8, same tokens
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-hc-pre-v7"></a>
 
@@ -4258,7 +4258,7 @@ Use the qualified v7 pre-HC reduction/normalization schedule.
 - **Exactness evidence:** Measurement: hc_pre 77.4-77.9 vs 102.1-102.8 us, gates 0-7 bitwise; tokens match reference; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_HC_PRE_V=4
 - **Measured gain:** hc_pre 77.4-77.9 vs 102.1-102.8 us, gates 0-7 bitwise; tokens match reference
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-post-exchange-fast"></a>
 
@@ -4274,7 +4274,7 @@ Consume post-exchange values through fused fast kernels rather than separate ref
 - **Exactness evidence:** Measurement: fast post-exchange consumers match STRIX_GLM_POST=ref and reference (real model, 6 layers); compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_POST=ref
 - **Measured gain:** fast post-exchange consumers match STRIX_GLM_POST=ref and reference (real model, 6 layers)
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-attn-fast"></a>
 
@@ -4290,7 +4290,7 @@ Install FastAttn at the attention seam, preserving the selected identity and sta
 - **Exactness evidence:** Measurement: FastAttn matches STRIX_GLM_ATTN=ref (G3), Tier A 12-40x; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_ATTN=ref
 - **Measured gain:** FastAttn matches STRIX_GLM_ATTN=ref (G3), Tier A 12-40x
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-attn-tierb-fused"></a>
 
@@ -4306,7 +4306,7 @@ Use fused Tier-B attention projections from raw weights instead of prepared libr
 - **Exactness evidence:** Measurement: fused Tier B -2.46 ms/token vs strix_gemv, tokens match reference; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_TIERB=lib
 - **Measured gain:** fused Tier B -2.46 ms/token vs strix_gemv, tokens match reference
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-xfer-boundary-fused"></a>
 
@@ -4322,7 +4322,7 @@ Fuse exchange reduction and its dependent boundary work.
 - **Exactness evidence:** Measurement: Xfer reduce +1.41 -> fused boundary ~+1.10 ms/token over local, bitwise; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_BOUNDARY=0
 - **Measured gain:** Xfer reduce +1.41 -> fused boundary ~+1.10 ms/token over local, bitwise
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-xfer-producer-publish"></a>
 
@@ -4354,7 +4354,7 @@ Use raw-only expert storage and the bitwise FastMoe implementation so the TP2 mo
 - **Exactness evidence:** Measurement: FastMoe matches DefaultMoe bitwise (real TP2 slices); raw-only experts (fits GTT); compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_MOE=ref (excluded from master baseline for capacity)
 - **Measured gain:** FastMoe matches DefaultMoe bitwise (real TP2 slices); raw-only experts (fits GTT)
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-max-rows-auto"></a>
 ### Memory-admitted prefill chunk rows
@@ -4412,7 +4412,7 @@ Grouped expert work in exact chunked prefill; calls of 128 rows or more run rout
 - **Exactness evidence:** Bitwise for all outputs: v7, v10, v11 and v14 route routed and shared experts through the X2 / X3 cores with the v3 expert order, gather/scatter and fold (X3 keeps the X2 DOT2 chains, reduce4 and split order; only the operand source changes); v3 and v11 row buckets run the same statements for every live row; the device plan's pairs, tiles and groups are byte-equal to the host plan for every gated call, and invalid ids raise the engine's flag instead of throwing; MoE outputs, FP16 down inputs and final rows equal v3 for row tails, 2047/2048/2049 and 4096-row calls, concentrated expert groups, signed zero, FP16 subnormals, +-Inf and NaN payloads; on the real pair decode anchors, speculative oracle and 1K/8K/32K prefill logits equal the v3 path. Internal FP32 gate/up workspace NaN payloads may differ in the FP16 overflow case (+Inf meeting -Inf inside a DOT2 chain; not reachable with finite activations); the payload is discarded at the FP16 down input.
 - **Off switch:** STRIX_GLM_PF_EXACTMOE_V=11, 10, 7 (previous large-call cores) or 3; STRIX_GLM_PF_EXACTMOE_V3_RCAP=0; STRIX_GLM_PF_EXACTMOE_PLAN=host; 1 for the baseline
 - **Measured gain:** 8K TTFT 25.24 -> 20.32 s (-19.5 %) and 1K 3.75 -> 3.18 s (-15 %) vs STRIX_GLM_PF_EXACTMOE_V=7 in the same run (two pairs each, 8,192-row chunks); MoE call v7 -> v11: 128 rows 17.2 -> 10.1 ms, 512 rows 29.2 -> 16.9 ms, 4096 rows 127 -> 75 ms; v3 row buckets -18 to -22 % on calls of 33-100 rows
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [MoE](../src/glm/prefill/glm_pf_exact_moe.hip), [tests](../tests/hip_glm_pf_exact_moe_tests.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [MoE](../src/glm/prefill/glm_pf_exact_moe.hip), [tests](../tests/hip_glm_pf_exact_moe_tests.hip)
 
 <a id="glm-pf-exact-x"></a>
 
@@ -4428,7 +4428,7 @@ Register-blocked exact prefill linear: LDS-decoded weights reused over 64 rows, 
 - **Exactness evidence:** Bitwise: X/X2/X3 keep the TM path's DOT2 chains, fold and split order (X3 reads the wave-uniform activation pairs with scalar loads; LDS holds only decoded weights); dense outputs byte-equal TM for row tails 1..32, 2047/2048/2049 and 4096-row calls, signed zero, FP16 subnormals, +-Inf and NaN payloads; on the real pair decode anchors, speculative oracle and 1K/8K/32K prefill logits equal the X=0 path.
 - **Off switch:** STRIX_GLM_PF_EXACT_X=2 (previous X2 core) or 0
 - **Measured gain:** X3: 8K TTFT 21.42 -> 18.37 s (-14.3 %) vs STRIX_GLM_PF_EXACT_X=2 in the same run (two pairs, MoE v10 in both arms); X2 earlier: 8K 29.59 -> 27.93 s (-5.6 %) vs X=0; logits bitwise on both ranks. Row floor 2048 -> 64 (32 with FAST WMMA), pair, fresh process per arm: 1,024-token prompt exact 2.429 -> 2.055 s (-15.4 %), logits, state and tokens identical on both ranks; served 8,192-token prompt admitted while another request decodes, FAST profile: time to first token about 22.6 -> 18.56 s (362 -> 441 tok/s), every chunk call on the WMMA core (6,496 launches, none bypassed) and the same 16 tokens as the request served alone (before, the first token differed); background stream 2.03 -> 2.71 tok/s during the prefill, longest stall 1.64 -> 1.23 s. The 8K whole-prompt route is unchanged (8.93 s, same logits)
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [X core](../src/glm/prefill/glm_pf_exact_x.hpp), [tests](../tests/hip_glm_pf_exact_tests.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [X core](../src/glm/prefill/glm_pf_exact_x.hpp), [tests](../tests/hip_glm_pf_exact_tests.hip)
 
 <a id="glm-pf-obar-v5"></a>
 
@@ -4447,7 +4447,7 @@ is widened to f32 once per block (v7). v10 keeps v7's k order and merge and stag
 - **Exactness evidence:** Bitwise equal to v7, v5 and the decode kernel on the prefill gate (probabilities, o-bar, outputs; NaN/Inf/subnormal latents, list lengths 1..2051).
 - **Off switch:** STRIX_GLM_PF_OBAR=7 (v7), =5 (v5) or =2 (v2)
 - **Measured gain:** 9.0-10.2 vs 16.6-17.3 us/row per DSA layer at chunk positions 4096..28672 (6.6 vs 11.3 at 0); v5 was 2.9x v2
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-pf-mla-gemm-v2"></a>
 
@@ -4464,7 +4464,7 @@ The MLA query absorption and output projection GEMMs keep every output's chain (
 - **Exactness evidence:** Absorbed queries and outputs bitwise equal to v1 and to the decode kernel on the prefill gate.
 - **Off switch:** STRIX_GLM_PF_MLA_GEMM=1
 - **Measured gain:** absorb 6.1 -> 4.6 and output 4.1 -> 3.3 us/row per DSA layer (32 heads per rank)
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-pf-mla-gemm-v3"></a>
 
@@ -4482,7 +4482,7 @@ the v2 chain (k ascending from +0, fmaf), so the result has the same bits as v2.
 - **Exactness evidence:** Bitwise: every arm on both ranks of the pair equals the public exact anchors at 8K and 32K (prefill logits and state).
 - **Off switch:** STRIX_GLM_PF_MLA_GEMM=2 (v2) or 1 (legacy tiled GEMM); --baseline selects v2
 - **Measured gain:** Two-node pair, alternating arms: MLA GEMM time per rank 0.715 -> 0.425 s at 8K (-41 %), 2.853 -> 1.628 s at 32K (-43 %); TTFT 8,192 tokens 15.34 -> 15.05 s (534 -> 544 tok/s, -1.9 %), 32,768 tokens 62.36 -> 60.91 s (525 -> 538 tok/s, -2.3 %)
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
 
 <a id="glm-pf-dense-rows-v3"></a>
 
@@ -4501,7 +4501,7 @@ parity and keep the v2 tile.
 - **Exactness evidence:** Device test v3 == v2 bitwise over every tile and the grouped production shapes (417 checks, 0 failures); logits bitwise equal on both ranks at 8K across v3 / v2 / v1.
 - **Off switch:** STRIX_GLM_PF_DENSE_ROWS=2 (v2) or 1 (v1)
 - **Measured gain:** TTFT at 8,192 tokens at parity with v2 within noise (14.29 vs 14.33 s; a second pair run 14.80 vs 14.72 s, medians of two runs; 14.49 s with v1). Grouped calls at 8192 rows: KDA 9.33 -> 6.77 ms, indexer 8.98 -> 6.62 ms; at 4096 rows 4.17 -> 2.89 ms and 4.14 -> 2.83 ms
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
 
 <a id="glm-pf-dense-rows-v4"></a>
 
@@ -4536,7 +4536,7 @@ with the same weight conversion). Calls with more than 4096 inputs (the 16384-lo
 - **Exactness evidence:** Device test v2 == v1 bitwise over the production shapes (80/80); logits and state bitwise equal v1 on both ranks of the pair at 1K and 8K.
 - **Off switch:** STRIX_GLM_PF_DENSE_ROWS=1
 - **Measured gain:** 8K TTFT 15.06 -> 14.92 s (544 -> 549 tok/s, -0.9 %), 1K warm 2.80 -> 2.75 s (366 -> 372 tok/s, -1.9 %), every v2 arm faster than every v1 arm; KDA f_b / g_b (128 -> 4096) 1.19-1.21x at 8192 rows
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-pf-kda-pack"></a>
 
@@ -4576,7 +4576,7 @@ selections overlap and share latent lines in L2, while a row's absorbed query is
 - **Exactness evidence:** Bitwise equal to v6 and v3 on the kernel fixtures; complete same-identity tokens plus logits/state digests on the pair.
 - **Off switch:** STRIX_GLM_PF_SCORES=6 (v6), =5 (v5), =4 (v4), =3 (v3) or =2 (v2)
 - **Measured gain:** v7 4.90 / 6.08 / 7.87 / 9.89 vs v6 4.96 / 8.42 / 9.41 / 10.46 us/row per DSA layer at chunk positions 0 / 4096 / 12288 / 28672 (-1 / -28 / -16 / -5 %; groups of 16 or 64 rows gained less, all rows at once lost 38 % at position 0); rank 0 of a 32K pair prefill 2.59-2.60 -> 2.26-2.28 s in scores, 32K TTFT 65.68 -> 65.54 s (-0.2 %, mean of both run orders, not slower); at 8K scores 0.533 -> 0.485 s, TTFT 16.23 -> 16.12 s (-0.6 %). v6 3.40 / 8.27 / 10.38 vs v5 4.57 / 9.27 / 11.39 us/row per DSA layer at chunk positions 0 / 4096 / 28672 (-26 / -11 / -9 %); v5 was 8.6-11.5 vs 14.0 for v4 at 4096..28672, v4 -8..-17 % vs v3, v3 -22 % vs v2. Rank 0 of a 32K pair prefill 2.94-2.99 -> 2.61-2.63 s in scores. Together with KDA scan v3 on the two-node pair: 32K TTFT 68.76 -> 67.72 s (-1.5 %, mean of both run orders), logits bitwise equal on both ranks
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-pf-kda-scan-v3"></a>
 <a id="glm-pf-kda-scan-v5"></a>
@@ -4601,7 +4601,7 @@ state (non-finite values are absorbing).
 - **Exactness evidence:** Raw scan outputs, outputs and states after every chunk bitwise equal to v1 and to the decode kernel on the prefill gate (real and synthetic weights, special rows).
 - **Off switch:** STRIX_GLM_PF_KDA_SCAN=5 (v5), =3 (v3) or =1 (v1)
 - **Measured gain:** v6 prep + conv + scan 2.02 -> 1.82 us/row per KDA layer at C=4096 (2.00 -> 1.82 at C=2048; layer bench, v5 and v6 paired per repetition; v6 bitwise == decode on the prefill gate, 52 checks); v5 1.18-1.20 vs v3 1.23-1.25 us/row per KDA layer (-3.7 %); rank 0 of an 8K pair prefill 0.355 -> 0.340 s in the scan, 8K TTFT 16.60 vs 16.60 s (mean of 8 arms, both run orders: neutral); v3 1.84-1.93 -> 1.23-1.28 us/row per KDA layer at chunk positions 0 / 4096 / 28672 (-33 %); rank 0 of an 8K pair prefill 0.534 -> 0.355 s in the scan, of a 32K one 2.15-2.22 -> 1.43-1.44 s; 8K TTFT 16.63 -> 16.34 s (-1.7 %, alone). Together with MLA scores v6: 32K TTFT 68.76 -> 67.72 s (-1.5 %, mean of both run orders), logits bitwise equal on both ranks
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 ### Prefill pipeline and async exchange start
 
@@ -4616,7 +4616,7 @@ Overlap two whole layers of the chunked prefill, and start the host exchange asy
 - **Exactness evidence:** Prefill gate bitwise to the reference row-by-row prefill (token, logits, all state bytes); TTFT logits equal on both ranks at 1K/8K/32K.
 - **Off switch:** STRIX_GLM_PF_PIPELINE=1, STRIX_DIST_ASYNC_START=0, or --baseline
 - **Measured gain:** 8K about -4 %; the exchange is fully hidden (GPU idle per 2K prefill 0.97 to 0.09 s)
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 ### Prefill chunk rows 4096
 
@@ -4631,7 +4631,7 @@ Process prefill in 4096-row chunks.
 - **Exactness evidence:** Logits equal to the reference prefill on both ranks at 1K/8K/32K.
 - **Off switch:** --max-rows 2048 / 1024, or --baseline
 - **Measured gain:** with the pipeline on: 8K 35.1 s at 1024, 32.1 s at 2048, 30.1-30.8 s at 4096; 32K 136.7 to 128.4 s vs 2048
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-mtp-spec"></a>
 
@@ -4648,7 +4648,7 @@ cache in chunks during prefill. Committed tokens are the target's greedy tokens.
 - **Exactness evidence:** Full token vectors and prompt logits equal --mtp 0 on 7 prompts, both ranks; MTP-fill prefill equals the row-by-row bootstrap; speculative runs exact in every arm with identical adaptive decisions on both ranks.
 - **Off switch:** --mtp 0 (or --mtp-spec 0, STRIX_GLM_MTP_SPEC=0, --baseline); STRIX_GLM_SPEC_XCH=comm and STRIX_GLM_SPEC_KDA_TREE=1 restore the previous verify exchange and tree
 - **Measured gain:** Decode chat / code / JSON 40.3-40.6 -> 26.98 / 22.46 / 24.98 ms/token (1.50x / 1.79x / 1.62x); cost: TTFT 8K +2.9 %, 32K +8.7 % (MTP cache fill)
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [spec runtime](../src/glm/spec/glm_spec_run.cpp)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [spec runtime](../src/glm/spec/glm_spec_run.cpp)
 
 `STRIX_GLM_MOE_PIPE=1` is included as an opt-in experiment (default off, not yet gated); the fused decode HC norm
 (`STRIX_GLM_HC_NORM`) is now a default, see [below](#glm-hc-norm-fused).
@@ -4666,7 +4666,7 @@ TP2 ranks take the same decision without an extra exchange. The serve keeps the 
 - **Exactness evidence:** committed tokens are the greedy verify tokens in every arm; token fnv equal ON vs OFF on 3 prompts.
 - **Off switch:** STRIX_SPEC_ARBITER=0 (or --baseline) keeps the MTP chain alone.
 - **Measured gain:** pair ABBA, 256 tokens: 20.4 -> 15.1 ms/token (1K), 21.1 -> 15.0 (6K), 19.7 -> 13.7 (copy prompt).
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [spec runtime](../src/glm/spec/glm_spec_run.cpp)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [spec runtime](../src/glm/spec/glm_spec_run.cpp)
 
 <a id="glm-pf-indexer-v2"></a>
 
@@ -4684,7 +4684,7 @@ ascending, then the tail) with a parallel radix digit search and ballot compacti
 - **Exactness evidence:** Keys, scaled head weights, token lists and counts bitwise equal to scores v2 / select v1 and to the decode indexer on the prefill gate.
 - **Off switch:** STRIX_GLM_PF_IDX=2 (v2) or =1 (v1); STRIX_GLM_PF_SELECT=1
 - **Measured gain:** at chunk position 28672 (8192 pools): scores 5.3 vs 9.6, select 0.38 vs 0.99 us/row per DSA layer; at 4096: 1.17 vs 1.81 and 0.08 vs 0.50
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-pf-hc-fuse"></a>
 
@@ -4704,7 +4704,7 @@ the chain's 24 outputs over three CTAs (same bits).
 - **Exactness evidence:** Fused expand + normed chains bitwise equal to the unfused expand + v2 / v1 sites on the prefill gate (fixture-free mode included; only NaN payloads may differ in flagged runs); pair logits bitwise.
 - **Off switch:** STRIX_GLM_PF_HC_FUSE=0, or --baseline
 - **Measured gain:** Two-node pair TTFT, ABBA x2: 1K -1.1 %, 8K -1.3 %
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
 
 <a id="glm-pf-sumexp"></a>
 
@@ -4725,7 +4725,7 @@ are unchanged.
 - **Exactness evidence:** Pair kernel bitwise equal to the sum followed by the fused expand over the device stress set (35 checks, 0 failures); hoist placements 0 / 1 / 2 bitwise (47 checks, 0 failures); pair logits bitwise on both ranks at 1K, 8K and 32K.
 - **Off switch:** STRIX_GLM_PF_SUMEXP=0 (sum, then the fused expand, previous seam order); STRIX_GLM_PF_HC_HOIST=0; --baseline
 - **Measured gain:** Seam sum + fused expand 4.26 -> 3.91 ms per call (-8.2 %); 8,192-token TTFT unchanged within noise (14.34-14.40 s on both arms)
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip), [engine seam](../src/glm/engine/engine.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip), [engine seam](../src/glm/engine/engine.hip)
 
 <a id="glm-pf-mixnorm"></a>
 
@@ -4744,7 +4744,7 @@ read back. Covers the plain sites and the sites already fed by the fused expand 
 - **Exactness evidence:** Device gate bitwise against the two-kernel path over 1 to 4096 rows and special values (only propagated NaN payloads may differ, positions equal); pair logits bitwise equal the anchors at 1K, 8K and 32K.
 - **Off switch:** STRIX_GLM_PF_MIXNORM=0, or --baseline
 - **Measured gain:** Two-node pair TTFT, alternating arms: 8,192 tokens 15.07 -> 14.95 s (544 -> 548 tok/s, -0.8 %), 32,768 tokens 63.23 -> 62.23 s (518 -> 527 tok/s, -1.6 %)
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
 
 <a id="glm-pf-hc-expand-bw"></a>
 
@@ -4765,7 +4765,7 @@ earlier model-private two-rows-per-block kernel (`STRIX_GLM_PF_HC_EXPAND_ROWS`, 
 - **Exactness evidence:** Device fixture bitwise against the original one-row kernel (payload, guards and flag by memcmp, special values, the pair-sum path, the mapped receive view); pair logits, state and token digests equal at 8K.
 - **Off switch:** STRIX_GLM_PF_HC_EXPAND_BW=0, or --baseline
 - **Measured gain:** None in wall time: two-node pair, 8,192 tokens, ABAB with two prefills per process, prefill cold / warm 13.84 / 14.56 s (two-row kernel) vs 13.81 / 14.50 s, within the spread of each arm. The traced per-call time fell 10.8 -> 2.2 ms, but that is the GPU share each kernel got while the other prefill stream ran; isolated, the shared kernel costs the same as the one-row kernel. The change removes a model-private kernel family.
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip), [shared row expansion](../src/core/hc_expand_rows.hpp), [GLM policy](../src/glm/prefill/glm_hc_expand_bw.inc)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip), [shared row expansion](../src/core/hc_expand_rows.hpp), [GLM policy](../src/glm/prefill/glm_hc_expand_bw.inc)
 
 <a id="glm-pf-staged"></a>
 
@@ -4785,7 +4785,7 @@ views only if both offer them; stderr reports the outcome.
 - **Exactness evidence:** Prefill anchors exact on the pair (16/16); logits bitwise against STRIX_GLM_PF_STAGED=0.
 - **Off switch:** STRIX_GLM_PF_STAGED=0, or --baseline
 - **Measured gain:** Two-node pair warm TTFT, ABBA: 1K 2.856 / 2.860 -> 2.832 / 2.838 s (-0.8 %), 8K 15.43 / 15.41 -> 15.28 / 15.25 s (-0.9 %), every staged arm below every unstaged arm; 32K neutral (63.07 vs 63.13 s, one pair, logits identical). Default-on prefill with all three pair levers: 1K 2.83 s, 8K 15.27 s, 32K 63.1 s
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [engine](../src/glm/engine/engine.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [engine](../src/glm/engine/engine.hip)
 
 <a id="glm-hc-norm-fused"></a>
 
@@ -4801,7 +4801,7 @@ R1b decode fuses the hyper-connection finish (hc_fin) with the following RMSNorm
 - **Exactness evidence:** Tokens and R8 rows equal the reference.
 - **Off switch:** STRIX_GLM_HC_NORM=0, or --baseline
 - **Measured gain:** Pair ABA x2: C1 MTP decode -2.3 %, R8 -3.1 %
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [R1b kernels](../src/glm/engine/glm_r1b.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [R1b kernels](../src/glm/engine/glm_r1b.hip)
 
 <a id="glm-hc-site"></a>
 
@@ -4820,7 +4820,7 @@ last workgroup to arrive runs the unchanged finish. 2 = also two launches at 2..
   queued repeats; pair decode tokens and R8 rows equal the reference on both ranks.
 - **Off switch:** STRIX_GLM_HC_SITE=0, or --baseline
 - **Measured gain:** Pair, fresh process per arm, --mtp 0: C1 -1.45 % (39.72 / 39.71 -> 39.12 / 39.16 ms/token); R8 unchanged
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [R1b kernels](../src/glm/engine/glm_r1b.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [R1b kernels](../src/glm/engine/glm_r1b.hip)
 
 <a id="glm-step-flag"></a>
 
@@ -4838,7 +4838,7 @@ their checks.
 - **Exactness evidence:** No arithmetic change; pair decode tokens and R8 rows equal the reference on both ranks.
 - **Off switch:** STRIX_GLM_STEP_FLAG=0, or --baseline
 - **Measured gain:** Pair, fresh process per arm, --mtp 0: C1 -0.2 % (39.07 / 39.12 -> 39.00 / 39.03 ms/token); R8 within noise
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [engine](../src/glm/engine/engine.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [engine](../src/glm/engine/engine.hip)
 
 <a id="glm-pf-wmma-x"></a>
 

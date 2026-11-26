@@ -1,7 +1,7 @@
 #include "../apps/hip_prefix_state_cache.hpp"
 #include "strix/prompt_terminal_diagnostics.hpp"
 #include "strix/mtp_target_window_payload.hpp"
-#include "../apps/state_cache_stats.hpp"
+#include "strix/serve/state_cache_stats.hpp"
 #include <stdexcept>
 #include <cstdio>
 #include <string>

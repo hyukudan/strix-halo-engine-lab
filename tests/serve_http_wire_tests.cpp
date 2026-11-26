@@ -39,6 +39,26 @@ using namespace std::chrono_literals;
 
 std::string head_of(const std::string& fields) { return "POST /v1/prefill HTTP/1.1\r\nHost: x" + fields; }
 
+void test_close_response_head() {
+    const struct { int status; std::string_view reason; } cases[] = {
+        {200, "OK"}, {400, "Bad Request"}, {401, "Unauthorized"}, {404, "Not Found"},
+        {405, "Method Not Allowed"}, {408, "Request Timeout"}, {409, "Conflict"},
+        {413, "Payload Too Large"}, {431, "Request Header Fields Too Large"},
+        {500, "Internal Server Error"}, {502, "Bad Gateway"}, {503, "Service Unavailable"},
+        {599, "Status"},
+    };
+    const std::string body("\x01\x00\x7f\x80\xff", 5);
+    for (const auto& [status, reason] : cases) {
+        const std::string old_head = "HTTP/1.1 " + std::to_string(status) + ' ' + std::string(reason) +
+            "\r\nContent-Type: application/octet-stream\r\nContent-Length: 5\r\nConnection: close\r\n\r\n";
+        const auto head = strix::serve::format_http_close_response_head(
+            status, strix::serve::http_prefill_reason(status), "application/octet-stream", body.size());
+        CHECK(head + body == old_head + body);
+    }
+    CHECK(strix::serve::format_http_close_response_head(200, "OK", "application/json", 0) ==
+          "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+}
+
 void test_head_table() {
     const HttpWireLimits limits;
     struct Row { std::string fields; bool ok; const char* name; };
@@ -347,6 +367,7 @@ int main() {
     test_qwen_prefill_request();
     test_error_status();
     test_head_table();
+    test_close_response_head();
     test_reader();
     test_deadline();
     test_spawn();

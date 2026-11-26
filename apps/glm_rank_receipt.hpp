@@ -2,7 +2,7 @@
 // Host-only receipt adapter. This is a partial description of the resolved defaults,
 // not a complete execution receipt or evidence of numerical compatibility. Callers
 // must add verified asset, state, build, device and workload digests when available.
-#include "glm_rank_defaults.hpp"
+#include "glm/load/glm_rank_defaults.hpp"
 
 namespace strix::glm::rank_defaults {
 

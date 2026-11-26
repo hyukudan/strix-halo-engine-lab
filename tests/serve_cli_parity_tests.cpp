@@ -15,7 +15,7 @@
 #include <vector>
 
 #if defined(STRIX_PARITY_GLM)
-#include "glm_rank_defaults.hpp"
+#include "glm/load/glm_rank_defaults.hpp"
 #endif
 #if defined(STRIX_PARITY_MINIMAX)
 #include "minimax/engine/mm_defaults.hpp"

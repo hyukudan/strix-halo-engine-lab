@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/weight/admission.hpp"
+#include "strix/weight/formats/fp8_block_admission.hpp"
 
 #include "strix/ds41_formats.hpp"
 
@@ -32,9 +33,9 @@
 // lane order of the Q8_0 x A8 sites with the Q8_0 block term replaced.
 namespace strix::ds41 {
 
-inline constexpr std::size_t fp8_block = 32;
-// Exponents with a normal FP32 dot scale 2^(e - 136); the loader rejects tensors outside (the 1017 checkpoint: 114-119).
-inline constexpr std::uint8_t fp8_min_exponent = 10, fp8_max_exponent = 254;
+inline constexpr auto fp8_block = weight::fp8_block_admission::block;
+inline constexpr auto fp8_min_exponent = weight::fp8_block_admission::min_exponent;
+inline constexpr auto fp8_max_exponent = weight::fp8_block_admission::max_exponent;
 // Numerical identities of the native FP8 steps (the Q8_0 forms are q8_0-a8-product-v1 etc. in deepseek41_plan.cpp).
 inline constexpr const char* fp8_product_identity = "e4m3-b32x32-a8-int-product-v1";
 inline constexpr const char* fp8_grouped_identity = "a8+e4m3-b32x32-a8-int-product-grouped8-v1";

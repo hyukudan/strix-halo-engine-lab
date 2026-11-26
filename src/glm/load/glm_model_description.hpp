@@ -1,7 +1,7 @@
 #pragma once
 
 #include "strix/model_description.hpp"
-#include "../../model_graph/model_graph.hpp"
+#include "strix/model_graph.hpp"
 
 #include <string>
 #include <string_view>

@@ -28,6 +28,10 @@ import os
 import sys
 import urllib.request
 import unicodedata
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from unicode_ranges import nonzero_ranges, require_pinned_ucd
 
 CAT_VERSION = '16.0.0'
 NFC_VERSION = '9.0.0'
@@ -115,21 +119,6 @@ def class_flags(cat):
             f |= F_N
         return f
     return flags
-
-
-def ranges_of(value, limit=0x110000):
-    out, cur = [], None
-    for c in range(limit):
-        v = value(c)
-        if cur and cur[2] == v and cur[1] + 1 == c:
-            cur[1] = c
-            continue
-        if cur and cur[2]:
-            out.append(tuple(cur))
-        cur = [c, c, v]
-    if cur and cur[2]:
-        out.append(tuple(cur))
-    return out
 
 
 class Nfc:
@@ -262,14 +251,15 @@ def main():
         cat, ccc, dec, excl = from_unicodedata()
         cat_version = nfc_version = 'unicodedata ' + unicodedata.unidata_version
     else:
+        require_pinned_ucd()
         cat, _, _ = read_unicode_data(fetch(a.ucd_dir, CAT_VERSION, 'UnicodeData'))
         _, ccc, dec = read_unicode_data(fetch(a.ucd_dir, NFC_VERSION, 'UnicodeData'))
         excl = read_exclusions(fetch(a.ucd_dir, NFC_VERSION, 'CompositionExclusions'))
         cat_version, nfc_version = 'UCD ' + CAT_VERSION, 'UCD ' + NFC_VERSION
 
     flags = class_flags(cat)
-    cat_ranges = ranges_of(flags)
-    ccc_ranges = ranges_of(lambda c: ccc.get(c, 0))
+    cat_ranges = list(nonzero_ranges(flags))
+    ccc_ranges = list(nonzero_ranges(lambda c: ccc.get(c, 0)))
     # composition: two-code-point canonical decompositions of starters, minus exclusions
     compose = {}
     for c, d in sorted(dec.items()):

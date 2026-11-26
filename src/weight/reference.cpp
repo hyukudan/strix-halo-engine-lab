@@ -1,4 +1,5 @@
 #include "formats/catalog.hpp"
+#include "strix/weight/formats/exl3_transport.hpp"
 #include <algorithm>
 #include <cstring>
 #include <numeric>
@@ -6,7 +7,8 @@
 #include <cmath>
 #include <array>
 #include "strix/ggml_dequant.hpp"
-#include "strix/ds41_native_fp8.hpp"
+#include "strix/weight/formats/fp8_block_admission.hpp"
+#include "strix/weight/formats/scalar_float.hpp"
 namespace strix::weight::detail {
 namespace {
 Status range_valid(const Slice& slice) {
@@ -52,8 +54,8 @@ Status validate_special(const WeightView& view,bool scan_values) {
     view.parameters.transform!="planar" && view.parameters.transform!="interleaved") return {Error::malformed,"unknown packed layout"};
  if(name=="block.e4m3-e8m0.32x32") {
   status=required(view,"block_scales",Scalar::e8m0,{{rows/32,width/32,0,0},2},part); if(!status) return status;
-  status=inspect(part->data,1,[](const Byte* p) { auto e=std::to_integer<unsigned>(*p); return e>=ds41::fp8_min_exponent && e<=ds41::fp8_max_exponent; }); if(!status) return status;
-  return inspect(view.payload,1,[](const Byte* p) { return (std::to_integer<unsigned>(*p)&127)!=127; });
+  status=inspect(part->data,1,[](const Byte* p) { return fp8_block_admission::supports_exponent(std::to_integer<std::uint8_t>(*p)); }); if(!status) return status;
+  return inspect(view.payload,1,[](const Byte* p) { return !scalar_float::e4m3_is_nan(std::to_integer<std::uint8_t>(*p)); });
  }
  if(name=="nvidia.nvfp4") {
   if(view.shape.rank!=2 || width%64) return {Error::unsupported_shape,"NVFP4 requires matrix K multiple of 64"};
@@ -82,7 +84,7 @@ Status validate_special(const WeightView& view,bool scan_values) {
   }
  }
  if(name.starts_with("exl3.")) {
-  if(view.shape.rank!=2 || width%128 || rows%128 || view.parameters.transform!="hadamard128") return {Error::unsupported_shape,"EXL3 requires declared H128 transform geometry"};
+  if(view.shape.rank!=2 || !exl3_transport::aligned_shape(width,rows) || view.parameters.transform!="hadamard128") return {Error::unsupported_shape,"EXL3 requires declared H128 transform geometry"};
   if(name=="exl3.mul1.tiles16") {
    status=required(view,"codebook_marker",Scalar::i32,{{1,0,0,0},1},part); if(!status) return status;
    status=inspect(part->data,4,[](const Byte* p) {
@@ -95,7 +97,7 @@ Status validate_special(const WeightView& view,bool scan_values) {
    return inspect(part->data,2,finite_half);
   }
   auto scales=view.payload; scales.range.bytes=2*(width+rows);
-  return inspect(scales,2,finite_half);
+  return inspect(scales,2,[](const Byte* p) { return exl3_transport::finite_scale(std::to_integer<std::uint8_t>(p[1])); });
  }
  return status;
 }
@@ -157,7 +159,7 @@ Status validate_impl(const WeightView& view,bool scan_values) {
  }
  // Gemma transport has contiguous FP16 input/output sidecars before the rings.
  if(view.storage.name=="exl3.gemma.transport") {
-   if(view.shape.rank!=2 || view.shape.dims[0]%128 || view.shape.dims[1]%128)
+   if(view.shape.rank!=2 || !exl3_transport::aligned_shape(view.shape.dims[1],view.shape.dims[0]))
      return {Error::unsupported_shape,"Gemma transport requires I/O multiples of 128"};
    const auto scales=view.shape.dims[0]+view.shape.dims[1];
    if(scales> (UINT64_MAX-bytes)/2) return {Error::malformed,"transport size overflow"};

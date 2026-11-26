@@ -1035,14 +1035,7 @@ inline void request_variant(const Engine& engine, Inputs& inputs, std::string_vi
 inline const char* environment(const Lookup& env, std::string_view key) {
     const std::string k(key);
     if (env) return env(k.c_str());
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4996)  // getenv: read once at startup, before any thread
-#endif
-    return std::getenv(k.c_str());
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
+    return envcfg::lookup_unrecorded(k.c_str());
 }
 
 inline constexpr char kPresetEnv[] = "STRIX_INTERNAL_MODEL_PRESET";

@@ -1,7 +1,7 @@
 #include "strix/qwen27_model.hpp"
 #include "strix/model_family_registry.hpp"
 #include "strix/ggml_dequant.hpp"
-#include "model_graph/model_graph.hpp"
+#include "strix/model_graph.hpp"
 #include <algorithm>
 #include <bit>
 #include <cmath>

@@ -381,7 +381,7 @@ full-T boundary strictly inside its repeated system + tools prefix
 That boundary is already a certified full-T continuation, so no plan, certificate or
 row changes; another conversation with the same prefix restores there instead of
 at the cadence boundary below it. Both capture paths read the requested set through
-`prefix_capture_boundary_selected` (`apps/qwen_cache_admission.hpp`).
+`prefix_capture_boundary_selected` (`include/strix/qwen/cache_admission.hpp`).
 
 The unit after the root mark is usually a tail owner (a short user turn follows the
 prefix), which writes the recurrent and fixed state on its own stream. An async

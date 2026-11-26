@@ -1,7 +1,7 @@
 #pragma once
 #include "strix/env_flags.hpp"
 #include "strix/qwen_target_state_digest.hpp"
-#include "qwen_cache_admission.hpp"
+#include "strix/qwen/cache_admission.hpp"
 #include "prefix_state_cache_identity.hpp"
 #include "qwen_tiled_prompt_plan.hpp"
 #include "qwen_serial_prompt_certificate.hpp"

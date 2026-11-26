@@ -94,6 +94,14 @@ inline constexpr std::size_t kMaxRequestJsonValues = std::size_t{1} << 21U;
 [[nodiscard]] Json parse_json_unique(std::string_view text);
 // Bound input bytes before UTF-8 validation and DOM values before constructing each value.
 [[nodiscard]] Json parse_json_unique(std::string_view text, std::size_t max_bytes, std::size_t max_values);
+
+// Tokenizer assets can bind a lower depth limit and preserve their existing
+// structural diagnostic. Invalid scalar lexemes retain their local JSON error.
+struct JsonAssetPolicy {
+    unsigned max_depth;
+    std::string_view structural_error;
+};
+[[nodiscard]] Json parse_json_asset(std::string_view text, const JsonAssetPolicy& policy);
 void append_json_string(std::string& out, std::string_view value);
 
 }  // namespace strix::serve

@@ -38,7 +38,7 @@ inline constexpr ::strix::session::kv_precision::Caps kKvCaps{"glm-pair", ::stri
 using EnvGet = std::function<const char*(const char*)>;
 
 inline EnvGet process_env() {
-    return [](const char* k) -> const char* { return std::getenv(k); };
+    return [](const char* k) -> const char* { return envcfg::lookup_unrecorded(k); };
 }
 
 // One environment-switched item. on = what the default resolves to, off = the old path. app_sets: the app applies `on`
@@ -638,7 +638,7 @@ inline std::string print(const Effective& e, bool include_asset_receipt = true) 
     s += std::string("effective baseline=") + (e.baseline ? "1" : "0") + "\n";
     line("identity", e.identity);
     {  // STRIX_GLM_MODEL_FORMAT (the load converts / refuses; inspection only reports it)
-        const char* f = std::getenv("STRIX_GLM_MODEL_FORMAT");
+        const char* f = envcfg::lookup_unrecorded("STRIX_GLM_MODEL_FORMAT");
         const bool i4 = f != nullptr && std::string(f) == "fast_i4";
         s += std::string("effective model-format=") + (i4 ? "fast_i4 (identity glm-fast-i4: routed INT4 g64 W4A4 prefill / W4A16 decode, lossy; exact identities refused)"
                                                          : "exl3 (default)") + "\n";

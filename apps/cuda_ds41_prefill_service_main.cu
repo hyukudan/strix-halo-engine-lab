@@ -203,27 +203,9 @@ std::string read_message(Sock s, Message& m, std::size_t max_body, bool is_respo
     return err;
 }
 
-const char* reason(int status) {
-    switch (status) {
-    case 200: return "OK";
-    case 400: return "Bad Request";
-    case 401: return "Unauthorized";
-    case 404: return "Not Found";
-    case 405: return "Method Not Allowed";
-    case 409: return "Conflict";
-    case 408: return "Request Timeout";
-    case 413: return "Payload Too Large";
-    case 431: return "Request Header Fields Too Large";
-    case 500: return "Internal Server Error";
-    case 502: return "Bad Gateway";
-    case 503: return "Service Unavailable";
-    default: return "Status";
-    }
-}
-
 void respond(Sock s, int status, const std::string& body, const char* type = "application/json") {
-    std::string head = "HTTP/1.1 " + std::to_string(status) + " " + reason(status) + "\r\nContent-Type: " + type +
-                       "\r\nContent-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n";
+    const auto head = strix::serve::format_http_close_response_head(
+        status, strix::serve::http_prefill_reason(status), type, body.size());
     if (send_all(s, head.data(), head.size())) send_all(s, body.data(), body.size());
 }
 

@@ -109,6 +109,36 @@ inline constexpr std::string_view kHttpWireHeadersTooLarge = "headers too large"
     return 400;
 }
 
+// The prefill response reason table is part of the wire format of the Qwen and
+// DeepSeek services. A caller with another protocol can supply its own reason.
+[[nodiscard]] inline constexpr std::string_view http_prefill_reason(int status) {
+    switch (status) {
+    case 200: return "OK";
+    case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 404: return "Not Found";
+    case 405: return "Method Not Allowed";
+    case 408: return "Request Timeout";
+    case 409: return "Conflict";
+    case 413: return "Payload Too Large";
+    case 431: return "Request Header Fields Too Large";
+    case 500: return "Internal Server Error";
+    case 502: return "Bad Gateway";
+    case 503: return "Service Unavailable";
+    default: return "Status";
+    }
+}
+
+[[nodiscard]] inline std::string format_http_close_response_head(
+    int status, std::string_view reason, std::string_view content_type, std::size_t body_bytes) {
+    std::string head = "HTTP/1.1 " + std::to_string(status) + " ";
+    head.append(reason);
+    head.append("\r\nContent-Type: ").append(content_type);
+    head.append("\r\nContent-Length: ").append(std::to_string(body_bytes));
+    head.append("\r\nConnection: close\r\n\r\n");
+    return head;
+}
+
 namespace wire_detail {
 
 inline bool is_tchar(char c) {

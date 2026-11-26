@@ -1,7 +1,7 @@
 // Queue protection of prefix states (PrefixStateCache::protect_longest + serve::QueuedPrefixProtection), the
 // governed automatic budget rule (serve::automatic_cache_budget / fit_cache_late) and the pending Qwen cache
 // qualification rows (batch 8/16, context 32,768). Host-only.
-#include "qwen_cache_admission.hpp"
+#include "strix/qwen/cache_admission.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/prefix_state_cache.hpp"
 #include "strix/serve/cache_budget_rule.hpp"

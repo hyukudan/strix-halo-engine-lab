@@ -72,13 +72,7 @@ float fp8_dot_scale(std::uint8_t e) noexcept { return std::bit_cast<float>(stati
 
 std::string fp8_tensor_check(std::span<const std::uint8_t> codes, std::span<const std::uint8_t> scales, std::size_t rows,
                              std::size_t width) {
-    if (rows == 0U || width == 0U || rows % fp8_block != 0U || width % fp8_block != 0U) return "rows and width must be multiples of 32";
-    if (codes.size() != rows * width || scales.size() != rows / fp8_block * (width / fp8_block)) return "codes or exponents of the wrong size";
-    for (const auto c : codes)
-        if ((c & 0x7FU) == 0x7FU) return "NaN code";
-    for (const auto e : scales)
-        if (e < fp8_min_exponent || e > fp8_max_exponent) return "block exponent " + std::to_string(e) + " outside [10, 254]";
-    return {};
+    return weight::fp8_block_admission::check(codes, scales, rows, width);
 }
 
 float product_fp8(const std::uint8_t* codes, const std::uint8_t* scales, const std::int8_t* x, const float* deltas, std::size_t width) {

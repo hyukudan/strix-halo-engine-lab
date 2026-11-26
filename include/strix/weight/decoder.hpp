@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/weight/formats/exl3_transport.hpp"
 
 #include "strix/weight/types.hpp"
 
@@ -153,7 +154,7 @@ inline constexpr DecoderFormatInfo kDecoderFormats[] = {
     {{"exl3.mul1.tiles16", 1},         256,  32, 16, ScaleLayout::trellis_f16_sidecars, detail::abc,
         detail::hadamard128, detail::hadamard128, 0xff},
     {{"exl3.gemma.transport", 1},      256,  32, 16, ScaleLayout::trellis_f16_prefix, detail::abc,
-        detail::hadamard128, detail::hadamard128, 0xb8}, // 4, 5, 6, 8 bits.
+        detail::hadamard128, detail::hadamard128, exl3_transport::kRateMask},
     {{"gguf.iu4_g64.strix", 1},         64,  34, 64, ScaleLayout::group_f16_plane, detail::abc},
     {{"image.q6p32", 1},                32,  26, 32, ScaleLayout::chunk_f16_plane, detail::abc},
     {{"image.cb4", 1},                  32,  18, 32, ScaleLayout::block_f16_or_row_plane, detail::abc},

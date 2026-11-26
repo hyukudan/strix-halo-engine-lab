@@ -1,4 +1,4 @@
-// HIP Qwen root mark (apps/qwen_cache_admission.hpp prefix_root_capture + prefix_capture_boundary_selected):
+// HIP Qwen root mark (include/strix/qwen/cache_admission.hpp prefix_root_capture + prefix_capture_boundary_selected):
 // 1. the root is session::root_mark on the T grid: the deepest multiple of T strictly inside the system + tools prefix
 //    and at most n - 2;
 // 2. on the qualified tiled plan (T 2048, tails 1024/256/64/16, schedule 12) every nonzero root is a full-T
@@ -11,7 +11,7 @@
 //    next unit is another owner is fenced (event on a known tail-owner stream, host otherwise), a cadence one refused;
 // 6. the served case (system 6258 of n 6277): the root 6144 is followed by a tail owner; under the incumbent order
 //    the sibling restores 4096 (the device failure), fenced it restores 6144.
-#include "qwen_cache_admission.hpp"
+#include "strix/qwen/cache_admission.hpp"
 #include "qwen_tiled_prompt_plan.hpp"
 
 #include <algorithm>

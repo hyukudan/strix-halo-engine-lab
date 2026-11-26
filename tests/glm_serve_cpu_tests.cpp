@@ -1773,7 +1773,10 @@ int main(int argc, char** argv) {
         // Store rule = MemAvailable >= snapshot bound + the GLM load admission's RAM margin (8 GiB default).
         constexpr std::uint64_t GiB = 1ULL << 30, MiB = 1ULL << 20;
         CHECK(gs::kPrefixMemoryMargin == 8 * GiB);
+        CHECK(gs::prefix_snapshot_bound(0) == 152'633'400ULL);
         const auto bound2k = gs::prefix_snapshot_bound(1994);
+        CHECK(bound2k == 192'449'592ULL);
+        CHECK(gs::prefix_snapshot_bound(UINT64_MAX) == UINT64_MAX);
         // Measured on the GLM 4.05 bpw pair (rank 1 serving, 2K prompt): MemAvailable 14976 MiB. The former fixed
         // 16 GiB floor refused every store there; the snapshot (< 200 MiB) plus the margin fits.
         std::istringstream rank1("MemFree: 0 kB\nMemAvailable: 15335424 kB\n");

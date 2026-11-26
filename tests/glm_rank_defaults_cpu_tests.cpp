@@ -3,7 +3,7 @@
 // the old path while explicit settings win.
 //   measured decode configuration: decode 64 + R8 batch, qualification passed
 //   measured prefill configuration: hp host path, exact TTFT 1K/8K
-#include "glm_rank_defaults.hpp"
+#include "glm/load/glm_rank_defaults.hpp"
 #include "glm_rank_startup.hpp"
 #include "glm/spec/glm_spec_merge.hpp"
 #include "glm/engine/glm_mem.hpp"

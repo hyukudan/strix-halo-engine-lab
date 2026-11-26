@@ -53,7 +53,7 @@
 #include "strix/glm/pair_state.hpp"
 #include "strix/pair/state_decls.hpp"
 #include "strix/device/hip_gate.hpp"
-#include "glm_rank_defaults.hpp"
+#include "glm/load/glm_rank_defaults.hpp"
 #include "glm_prefill_turbo.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
 #include "glm_auto_rows.hpp"

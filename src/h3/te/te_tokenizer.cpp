@@ -1,4 +1,5 @@
 #include "h3/te/te_tokenizer.hpp"
+#include "serve/tokenizer_utf8.hpp"
 
 #include "strix/serve/json.hpp"
 #include "strix/serve/tokenizer_limits.hpp"
@@ -223,18 +224,6 @@ std::vector<std::size_t> pre_split(const std::vector<std::uint32_t>& c) {
     return ends;
 }
 
-std::array<std::string, 256> byte_alphabet() {
-    std::array<std::string, 256> out{};
-    std::uint32_t extra = 0;
-    for (std::uint32_t b = 0; b < 256U; ++b) {
-        const bool direct = (b >= '!' && b <= '~') || (b >= 0xA1U && b <= 0xACU) || (b >= 0xAEU && b <= 0xFFU);
-        std::string s;
-        append_utf8(s, direct ? b : 256U + extra++);
-        out[b] = s;
-    }
-    return out;
-}
-
 std::string read_file(const std::string& path) {
     return serve::read_tokenizer_file(path, "te tokenizer");
 }
@@ -339,7 +328,7 @@ struct Tokenizer::Impl {
     std::unordered_map<std::string, std::int32_t> vocab;
     std::unordered_map<std::string, std::uint32_t> ranks;
     std::vector<std::pair<std::string, std::int32_t>> added;  // longest text first
-    std::array<std::string, 256> alphabet = byte_alphabet();
+    std::array<std::string, 256> alphabet = serve::tokenizer_utf8::byte_bpe_alphabet();
     std::size_t size = 0;
 
     // Byte-pair merges by rank. Round R merges every occurrence (left to right) of the pair of lowest rank R; pairs a

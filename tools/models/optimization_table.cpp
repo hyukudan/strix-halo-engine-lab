@@ -3,7 +3,7 @@
 //   strix-optimization-table --check F  fail unless F equals the table (docs/engine/optimization-table.md)
 // The table is generated from the engines' own defaults tables; nothing here is maintained by hand.
 #include "strix/deepseek41_pair_defaults.hpp"
-#include "glm_rank_defaults.hpp"
+#include "glm/load/glm_rank_defaults.hpp"
 #include "minimax/engine/mm_defaults.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/qwen_allon.hpp"

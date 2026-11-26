@@ -103,7 +103,7 @@ VisionSpec parse_vision_spec(const std::string& text) {
     check("adapter_merge_size", num("adapter_merge_size", num("spatial_merge_size", 2)), want.merge);
     check("posemb_grid_size", num("posemb_grid_size", 32), want.pos_grid);
     check("projection_hidden_dim", num("projection_hidden_dim", 4096), want.projection);
-    check("text_hidden_size", num("text_hidden_size", 2304), want.text_width);
+    check("text_hidden_size", num("text_hidden_size", want.text_width), want.text_width);
     check("temporal_patch_size", num("temporal_patch_size", 2), 2);  // video only; images use one frame
     if (const auto* eps = vc->find("layer_norm_eps")) spec.eps = static_cast<float>(eps->as_double());
     if (spec.eps != want.eps) bad("unsupported vision_config.layer_norm_eps");

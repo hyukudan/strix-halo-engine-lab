@@ -1587,7 +1587,7 @@ inline void resolve_http_session_ram(EffectiveConfig& result, const PrefillMemor
 // the solo suffix class (qwen_suffix_solo_class), so the batch scheduler then runs every prompt alone: no nested prompts, no
 // prompt groups, no prompt-window cohorts (scheduling only; each prompt's units and per-row arithmetic are unchanged).
 // STRIX_BATCH_CACHE_SOLO=0 keeps the incumbent scheduler; its restores decline batch-suffix-not-solo.
-// AUTO stays declined until a batch row is qualified (qwen_cache_admission.hpp).
+// AUTO stays declined until a batch row is qualified (strix/qwen/cache_admission.hpp).
 // Startup supplies the admitted route (zero for the single runner) before constructing runners or cache identities.
 inline void resolve_batch_cache_scheduler(Options& o, const Environment& env,
     std::optional<std::uint32_t> admitted_slots=std::nullopt) {

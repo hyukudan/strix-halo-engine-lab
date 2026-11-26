@@ -1,5 +1,5 @@
 #pragma once
-#include "state_cache_stats.hpp"
+#include "strix/serve/state_cache_stats.hpp"
 // Serialized by the bridge request mutex. Uses the existing prefix-cache allocator/LRU.
 #include "strix/session_state_cache.hpp"
 #include "strix/session/checkpoint_io.hpp"

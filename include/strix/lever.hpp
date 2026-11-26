@@ -141,7 +141,7 @@ struct Choice {
 // --print-effective-config lists the lever with the value it resolved to.
 [[nodiscard]] inline Choice select(const Decl& row, const Inputs& in, bool gate_open = false) {
     const std::string env(row.env);
-    const char* raw = std::getenv(env.c_str());
+    const char* raw = envcfg::lookup_unrecorded(env.c_str());
     const Choice choice = select(row, in, raw, gate_open);
     envcfg::record(env.c_str(), raw != nullptr && *raw != '\0' ? raw : nullptr, choice.on ? "1" : "0");
     return choice;

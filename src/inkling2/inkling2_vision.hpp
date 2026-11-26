@@ -15,6 +15,8 @@
 // Mapping onto the shared tower (no shared-kernel change): the class token is patch row 0 with zero pixels (the patch
 // embedding has no bias) and its embedding as that row's position addend; LayerScale is folded into the out and
 // second MLP linears (FP32, before the device builds its FP16 panels); q, k and v are concatenated.
+#include "strix/model/bind.hpp"
+#include "strix/model_data/inkling2_mini.hpp"
 #include "strix/vision/adapter.hpp"
 #include "strix/vision/preprocess.hpp"
 #include "strix/weight/tensor_access.hpp"
@@ -32,7 +34,8 @@ inline constexpr unsigned kVisionDefaultMaxTokens = 4096;
 // vision_config of the checkpoint, checked against the one tower this adapter implements.
 struct VisionSpec {
     unsigned layers = 23, width = 1024, heads = 16, mlp_width = 4096, patch = 20, merge = 2, pos_grid = 32;
-    unsigned projection = 4096, text_width = 2304;
+    unsigned projection = 4096;
+    unsigned text_width = model::narrow<unsigned>(model_data::inkling2_mini::dims::hidden);
     float eps = 1e-5F, rope_theta = 10000.0F;
     bool projector_bias = false;
 };

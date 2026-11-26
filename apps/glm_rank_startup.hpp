@@ -1,6 +1,6 @@
 #pragma once
 // Host-only adapter for the existing two-round decode configuration handshake.
-#include "glm_rank_defaults.hpp"
+#include "glm/load/glm_rank_defaults.hpp"
 #include "glm/spec/glm_spec_merge.hpp"
 #include <array>
 #include <cstdint>

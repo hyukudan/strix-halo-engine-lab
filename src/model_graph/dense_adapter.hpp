@@ -1,5 +1,5 @@
 #pragma once
-#include "model_graph.hpp"
+#include "strix/model_graph.hpp"
 #include "strix/dense_model_config.hpp"
 
 namespace strix::model_graph {

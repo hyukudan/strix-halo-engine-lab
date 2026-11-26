@@ -1,6 +1,6 @@
 #include "glm/prefill/glm_pf_load_admission.hpp"
 #include "glm/engine/glm_kvshard_exchange.hpp"
-#include "glm_rank_defaults.hpp"
+#include "glm/load/glm_rank_defaults.hpp"
 
 #include <cstdlib>
 #include <iostream>

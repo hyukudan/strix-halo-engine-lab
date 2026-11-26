@@ -12,23 +12,12 @@ usage: gen_te_unicode.py OUT.inc
 """
 import sys
 import unicodedata
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from unicode_ranges import UNICODE_LIMIT, nonzero_ranges, require_pinned_ucd
 
 SBASE, SCOUNT = 0xAC00, 11172
-
-
-def ranges(fn):
-    out, cur = [], None
-    for cp in range(0x110000):
-        v = fn(cp)
-        if cur and cur[2] == v and cur[1] + 1 == cp:
-            cur[1] = cp
-            continue
-        if cur and cur[2]:
-            out.append(tuple(cur))
-        cur = [cp, cp, v]
-    if cur and cur[2]:
-        out.append(tuple(cur))
-    return out
 
 
 def full_decomp(cp):
@@ -42,11 +31,12 @@ def full_decomp(cp):
 
 
 def main(path):
-    cat = ranges(lambda cp: {"L": 1, "M": 2, "N": 4}.get(unicodedata.category(chr(cp))[0], 0))
-    ccc = ranges(lambda cp: unicodedata.combining(chr(cp)))
+    require_pinned_ucd()
+    cat = list(nonzero_ranges(lambda cp: {"L": 1, "M": 2, "N": 4}.get(unicodedata.category(chr(cp))[0], 0)))
+    ccc = list(nonzero_ranges(lambda cp: unicodedata.combining(chr(cp))))
     decomp, data = [], []
     compose = []
-    for cp in range(0x110000):
+    for cp in range(UNICODE_LIMIT):
         if SBASE <= cp < SBASE + SCOUNT:
             continue
         d = unicodedata.decomposition(chr(cp))
