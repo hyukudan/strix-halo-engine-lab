@@ -967,8 +967,12 @@ int main() {
             // Under a model preset (strix run/serve --profile turbo): the measured cap9 row applies, a provisional TURBO
             // row stays pending.
             struct Preset {
-                Preset() { (void)::setenv(profile::kPresetEnv, "1", 1); }
-                ~Preset() { (void)::unsetenv(profile::kPresetEnv); }
+                std::string previous;
+                Preset() {
+                    if (const char* prior = profile::environment({}, profile::kPresetEnv)) previous = prior;
+                    expect(profile::export_environment(profile::kPresetEnv, "1"), "enable the model preset marker");
+                }
+                ~Preset() { (void)profile::export_environment(profile::kPresetEnv, previous.c_str()); }
             } preset;
             const auto under = parse_on("turbo", "gfx1151", product);
             auto copy = under;
