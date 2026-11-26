@@ -72,7 +72,14 @@ bool sync_file(std::FILE* f) noexcept {
 // Atomic replacement of `to` by `from` (same directory), the old file intact on failure.
 bool replace_file(const std::filesystem::path& from,const std::filesystem::path& to) noexcept {
 #ifdef _WIN32
-    return MoveFileExW(from.c_str(),to.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0;
+    // An unlocked reader (or the system scanning the new file) can hold the target for a moment; the store holds
+    // the per-key lock, so the replacement is retried briefly instead of losing the store.
+    for(int attempt=0;;++attempt) {
+        if(MoveFileExW(from.c_str(),to.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0) return true;
+        const DWORD error=GetLastError();
+        if(attempt>=200 || (error!=ERROR_ACCESS_DENIED && error!=ERROR_SHARING_VIOLATION)) return false;
+        Sleep(1);
+    }
 #else
     return ::rename(from.c_str(),to.c_str())==0;
 #endif
