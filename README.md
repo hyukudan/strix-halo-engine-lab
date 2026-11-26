@@ -58,14 +58,16 @@ with other prompt sets, so part of each change is the route and the prompt:
 - DeepSeek V4.1 Flash EXACT prefill at 2K (791.9 before) and 8K (1,123.8 before).
 - MiniMax M3.1 Flash EXACT prefill at 1K (472.3 before); the second 8K repeat (587) is below the previous 621.6.
 - GLM-5.3 Flash EXACT prefill at 32K (595 before).
-- Qwen3.8-27B prefill: the shipped default runs 64-row prompt windows, 2K 187–199 and 8K 115–117 against 644 / 606
-  (EXACT) and 684 / 635 (FAST) before. Plain TP pair decode 20.22 (20.61 before).
+- Qwen3.8-27B prefill: this run used 64-row prompt windows, 2K 187–199 and 8K 115–117 against 644 / 606
+  (EXACT) and 684 / 635 (FAST) before. Plain TP pair decode 20.22 (20.61 before). The current HIP FAST
+  resolver has qualified 512-row windows for the single-rank IU4 decode application through 24,576 prompt tokens.
+  See the [model profile documentation](docs/models/qwen3.8-27b/README.md).
 - Qwen3.8-Flash-Next decode: 20.6–22.1 plain, against 51.0 with MTP before; the MTP drafter bundle is not installed
   beside the model on our nodes, so the default resolves to plain decode.
 - Hy4-flash FAST decode with the tier's own 4096-row prompt: 14.25 at 8K (16.78 before).
 
 **Not measured on `ca2de6ae8`:** Nemotron 3.5 Bolt E4B (its tokenizer and RoPE tables are not on our nodes); Qwen3.8-27B
-at 32K (the shipped-default prefill did not finish inside our 470 s run limit); Qwen3.8-Flash-Next over HTTP
+at 32K (prefill did not finish inside the 470 s limit in that run); Qwen3.8-Flash-Next over HTTP
 (`strix-serve --model qwen3.8-flash-next` needs an MTP calibration golden and the tiled MTP recipe to start); per-content
 MTP and DSpark decode rows (code, prose, JSON, edit); Hy4-flash `exact` and TURBO pairs at 32K. TURBO rows marked
 "= FAST levers" resolve to the FAST lever set on that engine.
