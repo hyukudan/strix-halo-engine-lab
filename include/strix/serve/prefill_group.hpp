@@ -143,19 +143,18 @@ struct PrefillGroupPolicy {
 //   cost           the family's measured pass cost (a + b x rows)
 //   gap_budget_ms  decode-gap budget left for this pass (the admit-first gap); +infinity when nothing decodes.
 //                  It only limits company: the oldest prompt runs even when it alone exceeds the budget.
-[[nodiscard]] inline std::vector<std::uint64_t> plan_prefill_group(std::span<const GroupCandidate> candidates,
-                                                                   const PrefillGroupPolicy& policy,
-                                                                   const PrefillGroupCost& cost, double gap_budget_ms,
-                                                                   const PrefillGroupCapacity& capacity = {}) {
-    std::vector<std::uint64_t> ids;
-    if (candidates.empty()) return ids;
+inline void plan_prefill_group(std::span<const GroupCandidate> candidates, const PrefillGroupPolicy& policy,
+                               const PrefillGroupCost& cost, double gap_budget_ms, const PrefillGroupCapacity& capacity,
+                               std::vector<std::uint64_t>& ids) {
+    ids.clear();
+    if (candidates.empty()) return;
     for (std::size_t i = 1; i < candidates.size(); ++i)
         if (candidates[i].arrival_seq <= candidates[i - 1].arrival_seq)
             throw std::invalid_argument("plan_prefill_group: candidates must be oldest first");
     const GroupCandidate& first = candidates.front();
     ids.push_back(first.id);
     if (!policy.groups() || first.image_rows || first.rows == 0U || first.rows >= policy.short_rows ||
-        !capacity.accepts(first.route_class) || first.rows > capacity.member_rows) return ids;
+        !capacity.accepts(first.route_class) || first.rows > capacity.member_rows) return;
     std::uint64_t rows = first.rows;
     std::uint64_t windows = capacity.window_count(first.rows);
     std::uint64_t local_rows = capacity.local_count(first.rows, first.route_class);
@@ -176,6 +175,14 @@ struct PrefillGroupPolicy {
         local_rows = next_local;
         ids.push_back(c.id);
     }
+}
+
+[[nodiscard]] inline std::vector<std::uint64_t> plan_prefill_group(std::span<const GroupCandidate> candidates,
+                                                                 const PrefillGroupPolicy& policy,
+                                                                 const PrefillGroupCost& cost, double gap_budget_ms,
+                                                                 const PrefillGroupCapacity& capacity = {}) {
+    std::vector<std::uint64_t> ids;
+    plan_prefill_group(candidates, policy, cost, gap_budget_ms, capacity, ids);
     return ids;
 }
 

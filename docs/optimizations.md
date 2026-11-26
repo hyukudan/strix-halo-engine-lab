@@ -68,9 +68,9 @@ Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-
 <a id="cohort-verification-scratch-reuse"></a>
 ### Cohort verification scratch reuse
 
-Backends using the shared cohort decoder. Host cohort tests compare cohort and solo IDs, including device-draft and per-lane selection hooks. Reuses verification and commit staging across host rounds. Wall time unmeasured. The host code lives in `src/serve/cohort_decode.cpp`.
+Backends using the shared cohort decoder. Host cohort tests compare cohort and solo IDs, including device-draft and per-lane selection hooks. Reuses prompt planning, lane drafts, row planning, verification and commit buffers across host rounds. The steady-state counting fixture checks the full greedy IDs and committed state digest. Device wall time is unmeasured. The host code lives in `src/serve/cohort_decode.cpp`.
 
-Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=CUDA cohort, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+Engine matrix: inkling2-mini=HIP and CUDA HTTP cohorts, qwen3.8-flash-next=unaffected, qwen3.8-27b=CUDA cohort, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
 
 Qwen guarded wave reductions can use exact DPP/permlanex16 exchanges (build-time lever, off by default: configure with `-DSTRIX_DPP_REDUCE=ON`; the all-on build uses it); addition trees are unchanged, native byte-equality qualification is pending, and no speed gain is claimed.
 
@@ -402,6 +402,18 @@ HTTP serving (`--http-serve`) without an explicit tiled configuration resolves t
 - **Off switch:** `STRIX_SERVE_PREFILL=0` with an explicit tiled configuration; `--prefix-cache-block-rows 0` (T-sized checkpoints). Explicit `--known-prefix-prefill-rows` and budgets always win; `--baseline` / `STRIX_BASELINE=1` suppresses the automatic T.
 - **Measured gain:** One Strix Halo node, same binary, interleaved arms, identical token IDs, versus explicit T2048: cold TTFT 21.95 vs 22.93 s at 17K tokens (-4.3 %), 11.08/11.11 vs 11.53/11.58 s for two 8.5K prompts (-3.9 %/-4.0 %); eight staggered 8.5K prompts queued: TTFT p50 65.3 vs 66.4-71.7 s, wave wall 103.7 vs 105.2-110.2 s. T8192 uses capacity: 29 vs 55 admitted slots, a queueing tradeoff only above 29 concurrent requests.
 - **Implementation / evidence:** [Resolver](../apps/qwen_effective_config.hpp), [serving](engine/serving/serving.md#default-prompt-prefill)
+
+<a id="qwen-http-slot-admission"></a>
+
+### Qwen HTTP slot growth at cohort admission
+
+**Engine:** Qwen Flash Next HIP HTTP cohort. **Control:** `--http-slot-build admission`. **Default:** `--http-slot-build on-demand`.
+
+When queued work needs more slots, the scheduler keeps stepping the active cohort and prepares additional slots before admitting the next cohort. The allocator enters its device-wide setup phase with zero live lanes. The same capacity ceiling and per-slot memory checks apply. An admission can wait for the current cohort to drain.
+
+- **Exactness evidence:** The host replay checks the full IDs and final state digests for active and queued requests, including declined growth. Native identity and timing are pending.
+- **Measured gain:** Pending. The HTTP slots gate compares the largest active-stream token gap and next-cohort TTFT with staggered arrivals.
+- **Implementation / evidence:** [Slot policy](../include/strix/serve/slot_capacity.hpp), [serving](engine/serving/serving.md), [gate](../tests/http_slots_gpu_gate.py).
 
 <a id="qwen-residency"></a>
 
@@ -5067,6 +5079,15 @@ Startup exports the previous prefill route. Each request resolves the profile ag
 - **Band edges:** the receipts are pair-CLI runs; timed points are 8,128 / 8,192 and 32,768 tokens, and the lower band edges (pair CLI ABBA, warm run, FAST = D1 + R=256 vs EXACT): 4,096 x1.60 (4,089 -> 2,557 ms), 6,000 x1.57, 8,193 x1.58 (7,172 -> 4,537 ms), 16,384 x1.55; the nominal edges stay. D1 without R=256 is not a product execution (an explicit lever leaves the measured composition).
 - **Engines:** DeepSeek V4.1 Flash bound. Qwen3.8 Flash Next, Qwen3.8-27B and Hy4 Flash use the same band mechanism for their own rows. Inkling 2 Mini, GLM-5.3 Flash, MiniMax M3.1 Flash and Nemotron 3.5 Bolt E4B have no DeepSeek prefill composition. Same class of serve-vs-CLI gap (a serve-only option or piece plan that leaves the CLI's measured route), to check per engine: Qwen HIP serve (1024-row cache checkpoints and T8192 pieces against the CLI's whole-prompt FAST rows), Hy4 Flash (served `prompt_rows` against the FAST row qualified at <= 4K), GLM-5.3 Flash pair (band rows that need MemAvailable for auto max-rows 8192; a server holding more memory can fall out of them), MiniMax M3.1 Flash pair (serve default transport usb4gpu vs CLI usb4-auto, a parity exception never measured on the same transport), Gemma 4 (server sizes the EXL3 core for 8 streams, CLI for 1). Inkling 2 Mini served chunks were aligned with the CLI earlier (shared served chunk ladder).
 - **Implementation / evidence:** [rows](../include/strix/deepseek41_pair_profile_table.hpp), [execution key](../src/deepseek41_pair_defaults.cpp), [paired admission](../src/hip_deepseek41_prefill.hip), [tests](../tests/deepseek41_pair_defaults_tests.cpp)
+
+<a id="serve-bench-prompt-ids"></a>
+
+### Fixed token IDs for HTTP band measurements
+
+**Engine:** shared benchmark client. **Control:** `tools/serve_bench.py --prompt-ids-file FILE`. Pass a JSON array of token IDs to a completions endpoint. Repeat the option to cycle through fixtures. The host test checks that 2,048- and 8,192-token fixtures reach the request boundary with every ID intact.
+
+- **Use:** Measure the same prompt IDs at a band edge on the CLI and over HTTP. This option changes the benchmark input. Engine admission and serving defaults are unchanged.
+- **Engines:** DeepSeek V4.1 Flash is the initial measurement target. Any binding with a token-array completions endpoint can use the same client.
 
 <a id="mm-pf-msa-q16"></a>
 

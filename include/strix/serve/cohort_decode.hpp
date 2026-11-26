@@ -326,6 +326,7 @@ public:
 
 private:
     struct Lane;
+    struct StepScratch;
     struct VerificationScratch {
         std::vector<CohortGroup> groups;
         std::vector<std::uint32_t> tokens, top, keep;
@@ -357,6 +358,7 @@ private:
     std::vector<std::unique_ptr<Lane>> lanes_;  // index = backend lane; null = free
     std::vector<CohortResult> finished_;
     VerificationScratch verification_;
+    std::unique_ptr<StepScratch> step_scratch_;
     std::uint64_t order_ = 0, steps_ = 0, rows_ = 0, used_bytes_ = 0;
     std::uint64_t prompt_groups_ = 0, grouped_prompts_ = 0, gap_overshoots_ = 0;
     double gap_overshoot_ms_ = 0;

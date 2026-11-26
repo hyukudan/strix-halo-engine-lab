@@ -360,6 +360,42 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b"data: " + json.dumps(final).encode() + b"\n\ndata: [DONE]\n\n")
 
 
+class TokenIdPrompts(unittest.TestCase):
+    def test_completion_preserves_exact_prompt_lengths_and_ids(self):
+        prompts = [[7, 4, 9, 2] * 512, [8, 3, 6, 1] * 2048]
+        with tempfile.TemporaryDirectory() as folder:
+            argv = ["--url", "http://benchmark.invalid", "--concurrency", "2",
+                    "--max-tokens", "1", "--settle", "0"]
+            for index, ids in enumerate(prompts):
+                path = os.path.join(folder, f"prompt{index}.json")
+                with open(path, "w", encoding="utf-8") as stream:
+                    json.dump(ids, stream)
+                argv += ["--prompt-ids-file", path]
+            with mock.patch.object(sb, "stream_request", return_value=dict(
+                    arrival=0.0, token_times=[0.5], tokens=1, error=None)) as request:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(sb.main(argv), 0)
+            self.assertEqual(request.call_count, 2)
+            self.assertTrue(all(call.args[0] == "http://benchmark.invalid/v1/completions"
+                                for call in request.call_args_list))
+            sent = [call.args[1]["prompt"] for call in request.call_args_list]
+            self.assertEqual(sorted(sent, key=len), prompts)
+            with self.assertRaisesRegex(SystemExit, "requires completions"):
+                sb.main(argv + ["--chat"])
+            with self.assertRaisesRegex(SystemExit, "cannot be combined"):
+                sb.main(argv + ["--body-extra", '{"prompt":"substitute"}'])
+
+    def test_invalid_token_does_not_make_a_request(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "bad.json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump([9, True], stream)
+            with mock.patch.object(sb, "stream_request") as request:
+                with self.assertRaisesRegex(SystemExit, "unsigned 32-bit integers"):
+                    sb.main(["--url", "http://benchmark.invalid", "--prompt-ids-file", path])
+                request.assert_not_called()
+
+
 class LiveLoopback(unittest.TestCase):
     def test_burst_against_a_loopback_server(self):
         with tempfile.TemporaryDirectory() as folder:

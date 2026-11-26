@@ -12,15 +12,6 @@ namespace {
 
 constexpr std::size_t kNone = static_cast<std::size_t>(-1);
 
-// Prompt lanes in arrival order (stable for equal orders).
-std::vector<std::size_t> prompt_lanes_by_arrival(std::span<const StepLane> lanes) {
-    std::vector<std::size_t> out;
-    for (std::size_t i = 0; i < lanes.size(); ++i)
-        if (lanes[i].prompt) out.push_back(i);
-    std::stable_sort(out.begin(), out.end(), [&](std::size_t a, std::size_t b) { return lanes[a].order < lanes[b].order; });
-    return out;
-}
-
 // True when a goes before b among lanes that are not aged. Arrival order breaks every tie.
 bool ahead(const StepLane& a, const StepLane& b, const StepLimits& limits) {
     if (limits.prompt_order == PromptOrder::shortest) return a.prompt_remaining < b.prompt_remaining;
@@ -71,6 +62,15 @@ std::uint32_t clamp_rows(std::uint64_t rows) {
 
 StepPlan StepPlanner::plan(std::span<const StepLane> lanes, const StepLimits& limits) {
     StepPlan out;
+    plan(lanes, limits, out);
+    return out;
+}
+
+void StepPlanner::plan(std::span<const StepLane> lanes, const StepLimits& limits, StepPlan& out) {
+    out.decode_lanes.clear();
+    out.prompt.clear();
+    out.overtaken.clear();
+    out.prompt_before_decode = false;
     share_ = limits.prompt_share > 0.0 ? limits.prompt_share : 0.0;
     fixed_ms_ = limits.prompt_pass_fixed_ms > 0.0 ? limits.prompt_pass_fixed_ms : 0.0;
     planned_rows_ = 0;
@@ -80,15 +80,22 @@ StepPlan StepPlanner::plan(std::span<const StepLane> lanes, const StepLimits& li
         if (!lane.prompt && out.decode_lanes.size() < decode_cap) out.decode_lanes.push_back(lane.lane);
     const bool decoding = !out.decode_lanes.empty();
 
-    const auto arrival = prompt_lanes_by_arrival(lanes);
+    auto& arrival = prompt_arrival_;
+    arrival.clear();
+    for (std::size_t i = 0; i < lanes.size(); ++i)
+        if (lanes[i].prompt) arrival.push_back(i);
     if (arrival.empty()) {
         debt_ms_ = 0.0;
-        return out;
+        return;
     }
-    if (decoding && debt_ms_ > 0.0) return out;  // the decoders are owed time
+    if (decoding && debt_ms_ > 0.0) return;  // the decoders are owed time
+    // Arrival ties keep the input order.
+    std::sort(arrival.begin(), arrival.end(), [&](std::size_t a, std::size_t b) {
+        return lanes[a].order == lanes[b].order ? a < b : lanes[a].order < lanes[b].order;
+    });
 
     const std::size_t head = head_position(lanes, arrival, limits);
-    if (head == kNone) return out;
+    if (head == kNone) return;
 
     const double row_ms = observed_rows_ ? observed_ms_ / static_cast<double>(observed_rows_) : limits.prompt_row_ms;
     const std::uint32_t unit = unit_rows(limits, decoding, row_ms);
@@ -122,7 +129,6 @@ StepPlan StepPlanner::plan(std::span<const StepLane> lanes, const StepLimits& li
     }
     if (!out.prompt.empty())
         for (std::size_t p = 0; p < head; ++p) out.overtaken.push_back(lanes[arrival[p]].lane);
-    return out;
 }
 
 void StepPlanner::account(double prompt_ms, double decode_ms, double suspended_ms, std::uint64_t prompt_rows) {

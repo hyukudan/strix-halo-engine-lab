@@ -23,6 +23,9 @@ public:
     using Pump = std::function<void(const Submit&, const std::function<bool()>&)>;
     struct Native {
         std::function<void(bool)> add_slot;
+        // Opt-in alternate growth at admission. False means keep stepping the
+        // current batch without taking more work until there is room to build.
+        std::function<bool(std::uint64_t)> prepare_admission_slots;
         std::function<bool()> has_free_slot;
         std::function<std::size_t()> active;
         Submit submit;
@@ -76,6 +79,7 @@ private:
     std::unique_lock<std::mutex> batch_lock_;
     std::string failure_;
     bool drained_ = false;
+    bool admission_paused_ = false;
     enum class Turn { growth, admission, work } turn_ = Turn::growth;
     serve::SessionRuntime runtime_;
     serve::QueuedPrefixProtection protection_;

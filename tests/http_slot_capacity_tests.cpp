@@ -102,6 +102,20 @@ int main() {
     expect(deploy_single.http_batch_explicit && !deploy_single.http_batch_cap && !deploy_single.deployment_spec->slots);
     auto parsed = parse({"decoder", "model.gguf", "1"});
     expect(!parsed.http_batch_explicit);
+    expect(!parsed.http_build_slots_at_admission);
+    const auto parsed_legacy = parse({"decoder", "model.gguf", "1", "--http-slot-build", "on-demand"});
+    expect(!parsed_legacy.http_build_slots_at_admission);
+    bool refused_growth = false;
+    try { (void)parse({"decoder", "model.gguf", "1", "--http-slot-build", "admission"}); }
+    catch (const std::invalid_argument& e) {
+        refused_growth = std::string_view(e.what()).find("requires batched HTTP serving") != std::string_view::npos;
+    }
+    expect(refused_growth);
+    std::size_t built = 0;
+    const auto build = [&] { ++built; return true; };
+    expect(strix::serve::prepare_admission_slots(1, 1, 2, 2, 3, true, build) && built == 0);
+    expect(!strix::serve::prepare_admission_slots(2, 1, 2, 2, 3, true, build) && built == 0);
+    expect(strix::serve::prepare_admission_slots(2, 0, 2, 2, 3, true, build) && built == 1);
     parsed = parse({"decoder", "model.gguf", "1", "--http-batch", "0"});
     expect(parsed.http_batch_explicit && !parsed.http_batch_cap);
     parsed = parse({"decoder", "model.gguf", "1", "--http-batch", "16"});

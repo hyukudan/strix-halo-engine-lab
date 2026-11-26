@@ -4,6 +4,7 @@
 #include "strix/serve/api.hpp"
 #include "strix/serve/health.hpp"
 #include "strix/serve/job_sampling.hpp"
+#include "strix/serve/slot_capacity.hpp"
 #include "strix/token_sampling.hpp"
 #include "../../apps/http_session_completion.hpp"
 #ifndef QWEN_ENTRY
@@ -11,6 +12,7 @@
 #endif
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <future>
@@ -27,7 +29,7 @@ static bool available(std::mutex& mutex) {
     }).get();
 }
 struct Receipt { std::string json() const { return "{\"witness\":7}"; } };
-struct Options { std::uint64_t context_tokens=64; Receipt product_profile; };
+struct Options { std::uint64_t context_tokens=64; Receipt product_profile; bool http_build_slots_at_admission=false; };
 // The production binding calls make_http_mtp_sampler (apps/hip_decode_options.hpp) with the server options; here the
 // startup acceptance is the HTTP default, coupled.
 inline std::shared_ptr<TokenSampler> make_http_mtp_sampler(const serve::SamplingParameters& s, std::string& error, const Options&) {
@@ -105,6 +107,15 @@ struct MtpBatchRunner {
             else {physical.emplace_back();events.push_back("built:"+std::to_string(slots()-1));}
         }
     }
+    bool prepare_admission_slots(std::uint64_t pending) {
+        return serve::prepare_admission_slots(pending, active(), slots(), slots(), slots_capacity, false, [&] {
+            CHECK(active() == 0 && queue.snapshot().running == 0 && available(mutex));
+            if (memory_refusal) { events.push_back("memory:refused"); return false; }
+            physical.emplace_back();
+            events.push_back("built:"+std::to_string(slots()-1));
+            return true;
+        });
+    }
     void set_service_admission(std::function<std::size_t()> q,AdmissionPump p) {queued=std::move(q);pump=std::move(p);}
     void admit(MtpBatchRequest r) {
         if(check_mutex)CHECK(!available(mutex));
@@ -181,6 +192,46 @@ static serve::GenerationJob job(unsigned id,unsigned count=1) {
     j.on_admitted=[id]{events.push_back("admitted:"+std::to_string(id));};
     return j;
 }
+#ifndef QWEN_ENTRY
+static void admission_slot_growth(bool memory_refusal) {
+    events.clear(); stop=false;
+    Options options;
+    options.http_build_slots_at_admission=true;
+    HttpConstraintRequests constraints;
+    Probe probe;
+    const bool probing=false, samples=true;
+    std::atomic<bool> failed{false};
+    serve::GenerationQueue queue;
+    MtpBatchRunner runner(queue);
+    runner.slots_capacity=2;
+    runner.check_mutex=true;
+    runner.memory_refusal=memory_refusal;
+    const auto first=queue.submit(job(10,3));
+    std::shared_ptr<serve::GenerationTicket> second, third;
+    runner.arrivals=[&] { second=queue.submit(job(20)); third=queue.submit(job(30)); };
+#include "current_binding.inc"
+    owner.run();
+    CHECK(!failed && queue.snapshot().running==0 && queue.snapshot().queued==0);
+    const auto event=[&](std::string_view text) {
+        const auto found=std::find(events.begin(),events.end(),text);
+        CHECK(found!=events.end());
+        return found;
+    };
+    const auto growth=event(memory_refusal ? "memory:refused" : "built:1");
+    CHECK(event("output:10") < event("output:11") && event("output:11") < event("output:12"));
+    CHECK(event("output:12") < growth && growth < event("admit:20:0"));
+    CHECK(std::none_of(events.begin(),events.end(),[](const auto& item) { return item.starts_with("grow:"); }));
+    const auto verify=[](const auto& ticket, std::vector<std::uint32_t> expected) {
+        CHECK(ticket);
+        bool done=false;
+        CHECK(ticket->wait(std::chrono::milliseconds(1),done,false)==expected && done && ticket->error().empty());
+        const auto digest=std::pair<std::string,std::string>{"final_state_digest","\"final\""};
+        const auto stats=ticket->stats();
+        CHECK(std::find(stats.engine_extra.begin(),stats.engine_extra.end(),digest)!=stats.engine_extra.end());
+    };
+    verify(first,{10,11,12}); verify(second,{20}); verify(third,{30});
+}
+#endif
 static serve::Json stats_json(const serve::GenerationStats& s) {
     auto j=serve::Json::object();
     // Only real queue wall time is outside this deterministic comparison.
@@ -609,6 +660,11 @@ int main(int argc,char** argv) try {
     if(argc==2 && std::string(argv[1])=="--failure-probe") {CHECK(argc==0);}
 #ifndef QWEN_ENTRY
     if(argc==2 && std::string(argv[1])=="--queue-protection") {queue_protection_without_nesting();return 0;}
+    if(argc==2 && std::string(argv[1])=="--admission-slot-growth") {
+        strix::decode_cli::admission_slot_growth(false);
+        strix::decode_cli::admission_slot_growth(true);
+        return 0;
+    }
     if(argc==2 && std::string(argv[1])=="--readiness-phases") {
         for(unsigned mode=0;mode<3;++mode)(void)strix::decode_cli::http_scenario(mode);
         std::cout<<"Qwen idle, completion, pre-admission disconnect and teardown phases passed\n";return 0;

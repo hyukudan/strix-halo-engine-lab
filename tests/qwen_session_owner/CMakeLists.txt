@@ -55,6 +55,8 @@ add_test(NAME qwen-session-owner-queue-protection COMMAND qwen_session_owner_tes
 set_tests_properties(qwen-session-owner-queue-protection PROPERTIES TIMEOUT 30 LABELS "cpu;session;qwen"
     ENVIRONMENT "STRIX_PREFIX_QUEUE_PROTECT=1;STRIX_BATCH_NEST_ROWS=0")
 set_tests_properties(qwen-session-owner PROPERTIES TIMEOUT 30 LABELS "cpu;session;qwen")
+add_test(NAME qwen-session-owner-admission-slot-growth COMMAND qwen_session_owner_tests --admission-slot-growth)
+set_tests_properties(qwen-session-owner-admission-slot-growth PROPERTIES TIMEOUT 15 LABELS "cpu;session;qwen")
 add_test(NAME qwen-session-owner-readiness COMMAND qwen_session_owner_tests --readiness-phases)
 set_tests_properties(qwen-session-owner-readiness PROPERTIES TIMEOUT 15 LABELS "cpu;session;qwen;readiness")
 add_test(NAME qwen-session-owner-counter COMMAND qwen_session_owner_tests --sampling-counter)
