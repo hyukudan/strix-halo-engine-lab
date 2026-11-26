@@ -8,6 +8,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <new>
 #include <ctime>
 #include <cstdint>
 #include <iostream>
@@ -452,6 +455,98 @@ void benchmark_rejects_nonpositive_rounds() {
         require(rejected, "nonpositive rounds must be rejected before loading assets");
     }
 }
+// Malformed tokenizer assets: each must give a clean error (never a crash or an allocation sized by the file).
+std::string gguf_bytes_u32(std::uint32_t v) { return std::string(reinterpret_cast<const char*>(&v), 4); }
+std::string gguf_bytes_u64(std::uint64_t v) { return std::string(reinterpret_cast<const char*>(&v), 8); }
+std::string gguf_bytes_str(const std::string& s) { return gguf_bytes_u64(s.size()) + s; }
+
+std::string gguf_with(std::uint64_t entries, const std::string& body) {
+    return std::string("GGUF") + gguf_bytes_u32(3) + gguf_bytes_u64(0) + gguf_bytes_u64(entries) + body;
+}
+
+std::string gguf_model_entry() { return gguf_bytes_str("tokenizer.ggml.model") + gguf_bytes_u32(8) + gguf_bytes_str("gpt2"); }
+
+std::string gguf_array_entry(const std::string& key, std::uint32_t item, std::uint64_t count, const std::string& data = {}) {
+    return gguf_bytes_str(key) + gguf_bytes_u32(9) + gguf_bytes_u32(item) + gguf_bytes_u64(count) + data;
+}
+
+std::string write_asset(const std::string& name, const std::string& bytes) {
+    const auto path = (std::filesystem::temp_directory_path() / ("strix_tok_audit_" + name)).string();
+    std::ofstream(path, std::ios::binary).write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    return path;
+}
+
+// True when `load` throws a runtime/invalid-argument error (not an allocation failure).
+template <class F>
+bool clean_error(F&& load, std::string_view needle = {}) {
+    try { load(); } catch (const std::bad_alloc&) { return false; } catch (const std::length_error&) { return false; }
+    catch (const std::exception& e) {
+        return (dynamic_cast<const std::runtime_error*>(&e) || dynamic_cast<const std::invalid_argument*>(&e)) &&
+               std::string_view(e.what()).find(needle) != std::string_view::npos;
+    }
+    return false;
+}
+
+std::string json_escape(const std::string& s) {
+    std::string out;
+    for (const char c : s) { if (c == '\\' || c == '"') out.push_back('\\'); out.push_back(c); }
+    return out;
+}
+
+std::string hf_json(const std::string& vocab, const std::string& added = {}) {
+    const std::string glm =
+        "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+    return R"({"model":{"type":"BPE","vocab":)" + vocab + R"(,"merges":[],"ignore_merges":true},)" +
+           R"("pre_tokenizer":{"pretokenizers":[{"pattern":{"Regex":")" + json_escape(glm) + R"("}},{"type":"ByteLevel"}]})" +
+           (added.empty() ? "" : R"(,"added_tokens":)" + added) + "}";
+}
+
+void malformed_assets() {
+    std::string failed;
+    const auto expect = [&](bool ok, const std::string& what) { if (!ok) failed += what + "; "; };
+    const auto model = gguf_model_entry();
+    const std::uint64_t huge = std::uint64_t{1} << 62U;
+    struct Case { const char* name; std::string bytes; };
+    const std::vector<Case> gguf{
+        {"tokens-count-huge", gguf_with(2, model + gguf_array_entry("tokenizer.ggml.tokens", 8, std::uint64_t{1} << 40U))},
+        {"merges-count-huge", gguf_with(2, model + gguf_array_entry("tokenizer.ggml.merges", 8, huge))},
+        {"types-count-huge", gguf_with(2, model + gguf_array_entry("tokenizer.ggml.token_type", 5, huge))},
+        {"types-count-over-file", gguf_with(2, model + gguf_array_entry("tokenizer.ggml.token_type", 5, 1000000))},
+        {"skip-wraps-negative", gguf_with(3, model + gguf_array_entry("x", 0, ~std::uint64_t{0} - 24U) + gguf_array_entry("y", 0, 0))},
+        {"skip-past-end", gguf_with(2, model + gguf_array_entry("x", 4, 1000000))},
+        {"skip-count-overflows-product", gguf_with(2, model + gguf_array_entry("x", 10, std::uint64_t{1} << 61U))},
+        {"entries-count-huge", gguf_with(~std::uint64_t{0}, model)},
+    };
+    for (const auto& c : gguf) {
+        const auto path = write_asset(c.name, c.bytes);
+        const std::string_view needle = std::string_view(c.name) == "entries-count-huge" ? "GGUF" : "GGUF array count";
+        expect(clean_error([&] { (void)BpeTokenizer::load_gguf(path); }, needle), std::string("GGUF case not a clean error: ") + c.name);
+        std::filesystem::remove(path);
+    }
+    // HF JSON: IDs are bounded before they size the vocabulary tables.
+    const std::vector<Case> hf{
+        {"id-int-max", hf_json(R"({"a":2147483647})")},
+        {"id-over-cap", hf_json(R"({"a":4194304})")},
+        {"id-negative", hf_json(R"({"a":-1})")},
+        {"added-id-huge", hf_json(R"({"a":1})", R"([{"id":2147483647,"content":"<x>","special":true}])")},
+        {"added-missing-content", hf_json(R"({"a":1})", R"([{"id":2,"special":true}])")},
+    };
+    for (const auto& c : hf) {
+        const auto path = write_asset(c.name, c.bytes);
+        const std::string_view hf_needle = std::string_view(c.name).starts_with("id-") || std::string_view(c.name).starts_with("added-id")
+            ? "token ID out of range" : "added token needs";
+        expect(clean_error([&] { (void)BpeTokenizer::load_hf_json(path); }, hf_needle), std::string("HF case not a clean error: ") + c.name);
+        std::filesystem::remove(path);
+    }
+    // An oversized (sparse, all-zero) file is refused before parsing.
+    const auto big = write_asset("oversized", "{");
+    std::filesystem::resize_file(big, (std::uintmax_t{128} << 20U) + 1U);
+    expect(clean_error([&] { (void)BpeTokenizer::load_hf_json(big); }, "size limit"), "oversized tokenizer.json is not a clean error");
+    std::filesystem::remove(big);
+    expect(clean_error([&] { (void)BpeTokenizer::load_hf_json("strix_no_such_dir/none.json"); }), "missing file is not a clean error");
+    require(failed.empty(), "not a clean error: " + failed);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -464,6 +559,7 @@ int main(int argc, char** argv) {
         benchmark_rejects_nonpositive_rounds();
         equivalence();
         interfaces_and_stream();
+        malformed_assets();
     } catch (const std::exception& error) {
         std::cerr << "incremental tokenizer tests failed: " << error.what() << '\n';
         return 1;
