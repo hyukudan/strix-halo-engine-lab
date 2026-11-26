@@ -4000,27 +4000,44 @@ std::vector<float> Engine::last_logits(std::size_t rows) const {
 }
 void Engine::abort(const std::string& reason) { impl_->comm.transport().abort(reason); }
 void Engine::exchange_bytes(const void* out, void* in, std::size_t bytes) { impl_->exchange_bytes(out, in, bytes); }
-void Engine::agree_pair(bool serving, std::uint32_t draft_protocol) {
+ModelContentIdentity Engine::pair_model_identity(const std::string& model_dir) {
+    std::vector<strix::ModelContentFile> files;
+    for (const auto& path : assets::pack_files(model_dir)) files.push_back({path.filename().string(), path});
+    return strix::build_model_content_identity(files);
+}
+
+void Engine::agree_pair(const ModelContentIdentity& model, bool serving, std::uint32_t draft_protocol) {
     auto& m = *impl_;
     try {
         auto hello = strix::pair::native_hello(serving ? 0x32534d4dU : 0x32524d4dU, m.opt.rank);  // "MMS2" / "MMR2"
-        std::vector<strix::ModelContentFile> files;
-        for (const auto& path : assets::pack_files(m.opt.model_dir)) files.push_back({path.filename().string(), path});
-        hello.model_sha256 = strix::build_model_content_identity(files).bytes;
+        hello.model_sha256 = model.bytes;
         hello.profile = defaults::profile_resolution(strix::envcfg::text).fingerprint();
         hello.route = strix::route::fingerprint();
         hello.context = m.opt.capacity;
         hello.slots = m.opt.slots;
         hello.max_rows = m.opt.max_rows;
         hello.transport_capabilities = m.comm.group().transport_capabilities;
+        std::uint64_t decode_wire = 0U, prefill_wire = 0U, prefill_chunk = 0U;
+        if (m.xfer_on) {
+            const auto& wire = m.xf->options();
+            decode_wire = (std::uint64_t{wire.fold_capacity} << 2U) |
+                (wire.crc ? 1U : 0U) | (wire.crc && wire.crc_deferred ? 2U : 0U);
+        }
+        if (m.pf_on) {
+            const auto& wire = m.pf->options();
+            prefill_wire = (wire.joined ? 1U : 0U) | (wire.crc ? 2U : 0U);
+            prefill_chunk = wire.chunk;
+        }
         hello.contract = {m.comm.group().plan, draft_protocol,
             (std::uint64_t{static_cast<unsigned>(m.split_policy.mode)} << 32U) | m.split_policy.crossover,
             (m.xfer_on ? 1U : 0U) | (m.pf_on ? 2U : 0U) | (m.pf_interleave ? 4U : 0U) |
                 (m.pf_force_comm ? 8U : 0U) | (m.comm.device_exchange() != nullptr ? 16U : 0U),
-            static_cast<std::uint64_t>(m.pf_fmt), m.opt.unit_chunks};
-        constexpr std::array<std::string_view, 6> fields{"group or deployment", "DSpark protocol", "split frame policy",
-            "decode or prefill exchange route", "prefill wire format", "prefill unit size"};
-        (void)strix::pair::exchange_hello(hello, [&](auto out, auto in) { m.exchange_bytes(out.data(), in.data(), out.size()); }, fields);
+            static_cast<std::uint64_t>(m.pf_fmt), m.opt.unit_chunks, decode_wire, prefill_wire, prefill_chunk};
+        constexpr std::array<std::string_view, 9> fields{"group or deployment", "DSpark protocol", "split frame policy",
+            "decode or prefill exchange route", "prefill wire format", "prefill unit size", "decode CRC or row fold",
+            "prefill framing or CRC", "prefill message chunk"};
+        const strix::dist::Tag tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 0x4d4d484cU, 0U};
+        (void)strix::pair::exchange_hello(hello, [&](auto out, auto in) { m.comm.exchange_host(out, in, tag); }, fields);
         std::printf("rank %u: route fingerprint %016llx agreed with the peer\n", m.opt.rank, static_cast<unsigned long long>(hello.route));
     } catch (...) {
         m.comm.cancel_pending("MiniMax pair hello failed");

@@ -3,6 +3,7 @@
 #include "glm_rank_defaults.hpp"
 #include "glm_route_levers.hpp"
 #include "attn_core/index_score_mode.hpp"
+#include "glm/xfer/glm_xfer.hpp"
 #include "strix/dist/transport.hpp"
 #include "strix/glm/engine.hpp"
 #include "strix/pair/handshake_hip.hpp"
@@ -38,13 +39,17 @@ inline bool agree_glm_pair(dist::Transport& transport, const engine::Options& op
         hello.transport_capabilities = capabilities;
         namespace idx = strix::attn_core::idx;
         const auto idx_mode = idx::wmma_mode(strix::glm::pf::kIndexerWmmaUnsetMode);
+        xfer::Options wire;
+        wire.capacity = xfer::GlmSchedule::row_bytes(8U);
+        wire.from_env();
+        const std::uint64_t wire_flags = (wire.crc ? 1U : 0U) | (wire.crc && wire.crc_deferred ? 2U : 0U);
         hello.contract = {(std::uint64_t{opt.split_frame_mode} << 32U) | opt.split_frame_crossover,
-            static_cast<std::uint64_t>(std::max(0, envcfg::integer("STRIX_GLMX_FOLD", 0))),
+            (wire_flags << 32U) | wire.fold_capacity,
             (opt.auto_rows ? 1U : 0U) | (gpu_direct ? 2U : 0U) | (opt.prefill_units ? 4U : 0U) |
                 (eff.kv_shard_auto ? 8U : 0U) | (eff.kv_shard ? 16U : 0U),
             (std::uint64_t{opt.layers} << 32U) | eff.kmax, eff.adaptive ? 1U : 0U, prompt_and_decode, lane_contract, config,
             idx_mode == idx::kModeExact ? 0U : idx_mode};
-        constexpr std::array<std::string_view, 9> fields{"split frame policy", "row fold", "row, device or KV layout policy",
+        constexpr std::array<std::string_view, 9> fields{"split frame policy", "CRC and row fold", "row, device or KV layout policy",
             "model depth or MTP window", "MTP adaptive policy", "prompt or decode count", "serve lane or import policy",
             "effective runtime flags", "indexer score mode"};
         hello.offers[0] = turbo ? 1U : 0U;

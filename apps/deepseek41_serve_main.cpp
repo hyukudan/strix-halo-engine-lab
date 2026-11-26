@@ -141,7 +141,6 @@
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/pair/embed_frame.hpp"
-#include "strix/model_content_hash.hpp"
 #include "strix/vision/api_media.hpp"
 #include "strix/vision/embed_cache.hpp"
 #include "strix/vision/encoder.hpp"

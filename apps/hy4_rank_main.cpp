@@ -221,14 +221,13 @@ void print_top(std::size_t p, std::uint32_t token, const std::vector<float>& log
 
 void agree_hy4_pair(strix::dist::Transport& transport, unsigned rank,
                     const strix::profile::multi_device::PlacementVote& vote, std::uint64_t profile,
-                    const strix::hy4::hipbind::ForwardOptions& o, std::span<const std::uint32_t> prompt,
+                    const strix::ModelContentIdentity& model, const strix::hy4::hipbind::ForwardOptions& o,
+                    std::span<const std::uint32_t> prompt,
                     std::uint32_t gen, std::uint32_t repeat, std::uint64_t layout, std::uint64_t flags,
                     double trip_us = 0.0, std::span<const double> rates = {}) {
     try {
         auto hello = strix::pair::native_hello(0x32593448U, rank);  // "H4Y2"
-        std::vector<strix::ModelContentFile> parts;
-        for (std::size_t i = 0; i < o.parts.size(); ++i) parts.push_back({std::to_string(i), o.parts[i]});
-        hello.model_sha256 = strix::build_model_content_identity(parts).bytes;
+        hello.model_sha256 = model.bytes;
         hello.profile = profile;
         hello.placement = vote.form;
         hello.placement_reference = vote.reference;
@@ -255,7 +254,8 @@ void agree_hy4_pair(strix::dist::Transport& transport, unsigned rank,
 int run_pair(strix::hy4::hipbind::ForwardOptions o, const std::vector<std::uint32_t>& prompt, std::uint32_t gen, std::uint32_t cut,
              std::uint32_t repeat, std::uint16_t port, bool rows_explicit, bool pipe_guess,
              const std::vector<strix::hy4::hipbind::PairWindowCost>& window_costs,
-             const strix::profile::multi_device::PlacementVote& vote, std::uint64_t profile) {
+             const strix::profile::multi_device::PlacementVote& vote, std::uint64_t profile,
+             const strix::ModelContentIdentity& model) {
     namespace layers = strix::pair::layers;
     using clock = std::chrono::steady_clock;
     const auto ms_since = [](clock::time_point t) { return std::chrono::duration<double, std::milli>(clock::now() - t).count(); };
@@ -282,7 +282,7 @@ int run_pair(strix::hy4::hipbind::ForwardOptions o, const std::vector<std::uint3
               << ms_since(t_load) / 1000.0 << "\n" << std::flush;
     auto link = strix::pair::open_link(rank, "HY4", port);
     strix::dist::Transport* t = link.get();
-    agree_hy4_pair(*t, rank, vote, profile, o, prompt, gen, repeat, cut, pipe_guess ? 1U : 0U);
+    agree_hy4_pair(*t, rank, vote, profile, model, o, prompt, gen, repeat, cut, pipe_guess ? 1U : 0U);
     const std::size_t row_bytes = fwd.seam_row_bytes();
     auto stream = static_cast<hipStream_t>(fwd.stream_handle());
     const std::uint32_t W = o.prompt_rows;
@@ -429,7 +429,8 @@ int run_pair(strix::hy4::hipbind::ForwardOptions o, const std::vector<std::uint3
 // prefill at the same width.
 int run_pair_stages(strix::hy4::hipbind::ForwardOptions o, const std::vector<std::uint32_t>& prompt, std::uint32_t gen,
                     const std::string& map_text, std::uint32_t repeat, std::uint16_t port,
-                    const strix::profile::multi_device::PlacementVote& vote, std::uint64_t profile) {
+                    const strix::profile::multi_device::PlacementVote& vote, std::uint64_t profile,
+                    const strix::ModelContentIdentity& model) {
     namespace layers = strix::pair::layers;
     using Forward = strix::hy4::hipbind::Forward;
     using clock = std::chrono::steady_clock;
@@ -475,7 +476,7 @@ int run_pair_stages(strix::hy4::hipbind::ForwardOptions o, const std::vector<std
     };
     auto link = strix::pair::open_link(rank, "HY4", port);
     strix::dist::Transport* t = link.get();
-    agree_hy4_pair(*t, rank, vote, profile, o, prompt, gen, repeat,
+    agree_hy4_pair(*t, rank, vote, profile, model, o, prompt, gen, repeat,
                    layers::fnv(14695981039346656037ULL, map.text()), 2U);
     const std::size_t row_bytes = own.front().fwd->seam_row_bytes();
     const std::uint32_t W = o.prompt_rows;
@@ -834,14 +835,20 @@ int run(int argc, char** argv) {
         if (plan.map.virtual_stages() > 1U) stage_map = plan.map.text();
     }
     if (stage_map == "off") stage_map.clear();
+    strix::ModelContentIdentity pair_model_identity;
+    if (layer_pair || tp_rank >= 0) {
+        std::vector<strix::ModelContentFile> parts;
+        for (std::size_t i = 0; i < o.parts.size(); ++i) parts.push_back({std::to_string(i), o.parts[i]});
+        pair_model_identity = strix::build_model_content_identity(parts);
+    }
     if (layer_pair && !stage_map.empty()) {
         if (cut != 0U || pipe_guess || !window_costs.empty())
             throw std::invalid_argument("--stage-map replaces --cut; --pipe-guess and --window-costs are two-stage options");
-        return run_pair_stages(o, prompt, gen, stage_map, std::max(repeat, 1U), port, pair_vote, profile.fingerprint());
+        return run_pair_stages(o, prompt, gen, stage_map, std::max(repeat, 1U), port, pair_vote, profile.fingerprint(), pair_model_identity);
     }
     if (layer_pair)  // the placement decision: a pair resolved to tensor placement runs the TP path below
         return run_pair(o, prompt, gen, cut, std::max(repeat, 1U), port, rows_explicit, pipe_guess, window_costs,
-                        pair_vote, profile.fingerprint());
+                        pair_vote, profile.fingerprint(), pair_model_identity);
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
     strix::hy4::hipbind::Forward fwd(o);
@@ -866,7 +873,7 @@ int run(int argc, char** argv) {
             (strix::envcfg::flag("STRIX_HY4_TP_DRAFT", true) ? 32U : 0U) |
             (strix::envcfg::flag("STRIX_HY4_ROWS_EXPERT_UNION", true) ? 64U : 0U) |
             (tp_force ? 128U : 0U) | (opened.direct ? 256U : 0U);
-        agree_hy4_pair(*opened.host, static_cast<std::uint32_t>(tp_rank), pair_vote, profile.fingerprint(), o, prompt,
+        agree_hy4_pair(*opened.host, static_cast<std::uint32_t>(tp_rank), pair_vote, profile.fingerprint(), pair_model_identity, o, prompt,
                        gen, repeat, 0U, flags, tp_trip_us, tp_rates);
         // largest gather: half the logits row (vocab / 2 FP32); the link probe sizes fit in 1 MiB; speculative decode: a
         // verify pass's MoE join at 8 rows (8 x (8 slot rows x 1536 + shared / 2) FP32) < 2 MiB
