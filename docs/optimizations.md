@@ -6126,3 +6126,55 @@ The CUDA server builds its decoder with the command line's decode form: every de
 | Inkling 2 Mini | bound: CLI (both backends) and CUDA server (every width); HIP server: through the served route lever row |
 | Hy4 Flash | not bound: its MoE decode runs its own form and switch (own catalog rows), not serve::resolve_decode_form |
 | Gemma 4 / Nemotron E4B | not applicable: no routed experts |
+
+<a id="inkling2-screened-head"></a>
+
+## Inkling 2 Mini CUDA EXACT screened greedy head
+
+**Engine:** `inkling2-mini` (CUDA). **Control:** STRIX_INK_SCREENED_HEAD=0/1 (row inkling2-mini-screened-head@1). **Default:** ON in every tier (CUDA); HIP: its own binding.
+
+A greedy pick whose scores nobody reads runs the shared EXACT screened head: same token and status as the full head, without materialising the full score row.
+
+- **Shared home:** src/core/screened_head.hpp + src/core/screened_head_plan.hpp (EXACT screened greedy head).
+- **Tier and regime:** EXACT, FAST, QUALITY, TURBO (inherits FAST); CUDA CLI and server decode, greedy picks without a score read.
+- **Exactness evidence:** EXACT: bitwise the incumbent route. RTX receipts (cuda_pf2-kit): q16 on the #1280 head (9/9 logits, 13/13 ids, CLI and served), q26 CLI and q27 served (ids equal row off vs on), q38 served held-back fixture with the rows on (every arm equal at 34 / 130 / 8209 prompt rows, digests equal to the rows off).
+- **Off switch:** STRIX_INK_SCREENED_HEAD=0 (the full head).
+- **Measured gain:** Both rows together, RTX PRO server (cuda_pf2-kit ticket q27, strix-serve of aa53a1a07, context 34816, 8 slots, EXACT without vs with the rows): 8K prefill 9,642 -> 10,998 tok/s (+14 %), C1 decode 72.6 -> 73.7 tok/s, C8 aggregate 166.8 -> 167.8 tok/s; not measured apart.
+- **Preconditions:** CUDA greedy picks that return no score row; a step that returns or reads scores keeps the full head.
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: candidate (decode); the shared head exists, the engine's greedy pick does not call it (lev_x T18) |
+| Qwen3.8 27B dense | not bound: candidate (decode); the shared head exists, the engine's greedy pick does not call it (lev_x T18) |
+| DeepSeek V4.1 Flash | not bound: candidate (decode); the shared head exists, the engine's greedy pick does not call it (lev_x T18) |
+| GLM 5.3 Flash | not bound: candidate (decode); the shared head exists, the engine's greedy pick does not call it (lev_x T18) |
+| MiniMax M3.1 Flash | not bound: candidate (decode); the shared head exists, the engine's greedy pick does not call it (lev_x T18) |
+| Inkling 2 Mini | bound: CUDA (this row: default in every tier, CLI and server) and HIP (its own binding, STRIX_SCREENED_HEAD) |
+| Hy4 Flash | not bound: candidate (decode); the shared head exists, the engine's greedy pick does not call it (lev_x T18) |
+| Gemma 4 / Nemotron E4B | not bound: candidate (decode); the shared head exists, the engine's greedy pick does not call it (lev_x T18) |
+
+<a id="inkling2-attn-projected-bias"></a>
+
+## Inkling 2 Mini CUDA EXACT projected relative bias in the prompt flash
+
+**Engine:** `inkling2-mini` (CUDA). **Control:** STRIX_INK_ATTN_PROJECTED_BIAS=0/1 (row inkling2-mini-attn-projected-bias@1). **Default:** ON in every tier (CUDA); HIP: its own projected route.
+
+The CUDA prompt flash projects the relative attention bias itself (cuda_core::PreparedBf16Projection) instead of reading the bias image; same bits.
+
+- **Shared home:** src/attn_core/dense_flash_prefill.hpp (projected bias) + cuda_core::PreparedBf16Projection.
+- **Tier and regime:** EXACT, FAST, QUALITY, TURBO (inherits FAST); CUDA prefill (CLI and served prompts).
+- **Exactness evidence:** EXACT: bitwise the incumbent route. RTX receipts (cuda_pf2-kit): q16 on the #1280 head (9/9 logits, 13/13 ids, CLI and served), q26 CLI and q27 served (ids equal row off vs on), q38 served held-back fixture with the rows on (every arm equal at 34 / 130 / 8209 prompt rows, digests equal to the rows off).
+- **Off switch:** STRIX_INK_ATTN_PROJECTED_BIAS=0 (the image route).
+- **Measured gain:** Both rows together, RTX PRO server (cuda_pf2-kit ticket q27, strix-serve of aa53a1a07, context 34816, 8 slots, EXACT without vs with the rows): 8K prefill 9,642 -> 10,998 tok/s (+14 %), C1 decode 72.6 -> 73.7 tok/s, C8 aggregate 166.8 -> 167.8 tok/s; not measured apart.
+- **Preconditions:** CUDA prompt flash of more than one row (a one-row call keeps the image route).
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not applicable: its attention has no relative-bias term to project |
+| Qwen3.8 27B dense | not applicable: its attention has no relative-bias term to project |
+| DeepSeek V4.1 Flash | not applicable: its attention has no relative-bias term to project |
+| GLM 5.3 Flash | not applicable: its attention has no relative-bias term to project |
+| MiniMax M3.1 Flash | not applicable: its attention has no relative-bias term to project |
+| Inkling 2 Mini | bound: CUDA prompt flash (this row: default in every tier); HIP selects its projected route in its own binding |
+| Hy4 Flash | not applicable: its attention has no relative-bias term to project |
+| Gemma 4 / Nemotron E4B | not applicable: its attention has no relative-bias term to project |
