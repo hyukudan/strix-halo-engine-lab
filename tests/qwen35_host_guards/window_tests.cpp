@@ -37,6 +37,13 @@ int cudaGraphInstantiate(cudaGraphExec_t* e, cudaGraph_t, unsigned long long) { 
 int cudaGraphGetNodes(cudaGraph_t, void*, std::size_t* n) { *n = 3; return cudaSuccess; }
 int cudaGraphLaunch(cudaGraphExec_t, cudaStream_t) { calls += 'L'; return cudaSuccess; }
 int cudaGraphExecDestroy(cudaGraphExec_t) { return cudaSuccess; }
+// The engine installs its captures through the shared segment instantiation (strix/device/graph_inspection.hpp);
+// the mock graph has no node vocabulary to inspect, so it instantiates directly.
+namespace strix::device::native {
+inline int instantiate_segment_graph(cudaGraphExec_t* e, cudaGraph_t g, unsigned long long flags) {
+    return cudaGraphInstantiate(e, g, flags);
+}
+}  // namespace strix::device::native
 int cudaGetLastError() { return cudaSuccess; }
 int cudaMemsetAsync(void*, int, std::size_t, cudaStream_t) { return cudaSuccess; }
 

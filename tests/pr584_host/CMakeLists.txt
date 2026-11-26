@@ -48,6 +48,8 @@ host_target(pr720-shared-allocation shared_allocation.cpp)
 add_test(NAME pr720-shared-allocation-retry COMMAND pr720-shared-allocation)
 
 host_target(pr584-profile profile.cpp "${ROOT}/src/deepseek41_pair_defaults.cpp")
+include("${ROOT}/cmake/StrixDevice.cmake")  # the pair defaults check HIP receipt profiles (strix/device/profiles.hpp)
+target_link_libraries(pr584-profile PRIVATE strix_device)
 add_test(NAME pr584-profile-agreement COMMAND pr584-profile)
 host_target(pr584-dense dense.cpp)
 add_test(NAME pr584-dense-parts COMMAND pr584-dense)

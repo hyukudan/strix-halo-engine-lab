@@ -131,7 +131,7 @@ private:
             if constexpr (requires { backend_.linear("controller_down", down_name, x, y); }) {
                 backend_.linear("controller_down", down_name, x, y);
             } else {
-                core::linear_reference(backend_.parameter(down_name, x.size() * y.size()), x, y);
+                core::linear_reference(backend_.parameter(down_name, static_cast<unsigned>(x.size() * y.size())), x, y);
             }
         };
         const auto gated = ref::apply_low_rank_gate_with(raw, messages_.value().message(visit, path),
