@@ -2,6 +2,9 @@
 // Channel's existing publication enum must coexist with the shared Backend API.
 namespace strix::xport { enum class Publish : std::uint32_t; }
 #include "xport/transport_backend.hpp"
+#include "xport/failure_log.hpp"
+#include <memory>
+#include <string>
 #include <array>
 #include <stdexcept>
 #include <vector>
@@ -76,7 +79,24 @@ static void minimax_publication_modes() {
         throw std::runtime_error("MiniMax extra publication/wait");
 }
 
+static void first_failure_log() {
+    // No GPU or peer is needed to prove the original cause is emitted once,
+    // before the owning thread calls check(), even if another error follows.
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> file(std::tmpfile(), &std::fclose);
+    require(file != nullptr);
+    std::string failure;
+    strix::xport::report_first_failure(failure, "producer of sequence 42 not published within the timeout", 1, file.get());
+    strix::xport::report_first_failure(failure, "peer closed", 1, file.get());
+    require(failure == "producer of sequence 42 not published within the timeout");
+    std::rewind(file.get());
+    char line[256]{};
+    require(std::fgets(line, sizeof(line), file.get()) != nullptr);
+    require(std::string(line) == "xport: rank=1 exchange failed: producer of sequence 42 not published within the timeout\n");
+    require(std::fgets(line, sizeof(line), file.get()) == nullptr);
+}
+
 int main() {
+    first_failure_log();
     minimax_publication_modes();
     Runtime r;
     // Simulate earlier control traffic on the same Channel before this adapter.
