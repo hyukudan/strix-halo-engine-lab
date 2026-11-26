@@ -5897,6 +5897,13 @@ if(BUILD_TESTING)
 endif()
 endif()
 
+# The model generator and profile catalogue need host resolver metadata even in builds
+# without the DeepSeek inference family.
+add_library(strix_ds41_rtx_profile STATIC src/ds41_rtx_profile.cpp)
+target_include_directories(strix_ds41_rtx_profile PUBLIC include)
+target_compile_features(strix_ds41_rtx_profile PUBLIC cxx_std_20)
+strix_target_warnings(strix_ds41_rtx_profile)
+
 # ---- deepseek41 model family module (optional) ----
 if(STRIX_FAMILY_DEEPSEEK41)
 add_library(strix_family_deepseek41 STATIC src/deepseek41_model.cpp src/deepseek41_plan.cpp src/deepseek41_family.cpp)
@@ -6897,11 +6904,6 @@ if(NOT TARGET strix_ds41_xrpc)
         target_compile_options(strix_ds41_xrpc PRIVATE -ffp-contract=off)
     endif()
 endif()
-# Pure host resolver: available to inspection/tests without a CUDA toolchain.
-add_library(strix_ds41_rtx_profile STATIC src/ds41_rtx_profile.cpp)
-target_include_directories(strix_ds41_rtx_profile PUBLIC include)
-target_compile_features(strix_ds41_rtx_profile PUBLIC cxx_std_20)
-strix_target_warnings(strix_ds41_rtx_profile)
 if(BUILD_TESTING)
     add_executable(strix-ds41-rtx-profile-tests tests/ds41_rtx_profile_tests.cpp)
     target_link_libraries(strix-ds41-rtx-profile-tests PRIVATE strix_ds41_rtx_profile)
