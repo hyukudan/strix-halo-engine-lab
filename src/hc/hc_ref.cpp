@@ -54,6 +54,7 @@ std::vector<float> raw_mixes(const Spec& spec, std::span<const float> streams, c
     const std::size_t rows = spec.mix_rows();
     require(streams.size() == n, "hc: stream geometry");
     require(spec.fn == FnType::f16 ? w.fn_f16.size() == rows * n : w.fn_f32.size() == rows * n, "hc: fn geometry");
+    require(w.layout == FnLayout::mix_major || spec.fn == FnType::f32, "hc: feature-major fn requires F32");
     const float r = ds41::declared_rsqrt(
         ds41::chunked_dot_of([&](std::size_t i) { return streams[i]; }, [&](std::size_t i) { return streams[i]; }, n) /
             static_cast<float>(n) +
@@ -64,6 +65,9 @@ std::vector<float> raw_mixes(const Spec& spec, std::span<const float> streams, c
         if (spec.fn == FnType::f16) {
             const std::uint16_t* row = w.fn_f16.data() + m * n;
             d = ds41::chunked_dot_of([&](std::size_t i) { return ds41::f16_to_float(row[i]); },
+                                     [&](std::size_t i) { return streams[i]; }, n);
+        } else if (w.layout == FnLayout::feature_major) {
+            d = ds41::chunked_dot_of([&](std::size_t i) { return w.fn_f32[i * rows + m]; },
                                      [&](std::size_t i) { return streams[i]; }, n);
         } else {
             const float* row = w.fn_f32.data() + m * n;

@@ -113,6 +113,11 @@ void modelb_fp64(std::mt19937& g) {
         const auto scale = uniform(g, spec.scale_count(), 0.5F, 2.0F);
         const strix::hc::SiteWeights w{{}, fn, base, scale};
         const auto raw = strix::hc::raw_mixes(spec, stream, w);
+        std::vector<float> transposed(fn.size());
+        for (std::size_t m = 0; m < rows; ++m)
+            for (std::size_t i = 0; i < n; ++i) transposed[i * rows + m] = fn[m * n + i];
+        check(same_bits(raw, strix::hc::raw_mixes(spec, stream,
+            {{}, transposed, base, scale, strix::hc::FnLayout::feature_major})), "F32 feature-major mixes bitwise");
         const auto mix = strix::hc::split(spec, raw, base, scale);
 
         double ss = 0.0;
