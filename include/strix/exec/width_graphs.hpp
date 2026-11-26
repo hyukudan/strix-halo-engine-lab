@@ -116,33 +116,14 @@ private:
     template <class Work>
     bool record(Stream stream, std::uint32_t at, Work& work) {
         discard(at);
-        if (STRIX_WIDTH_RT(StreamBeginCapture)(stream, STRIX_WIDTH_RT(StreamCaptureModeThreadLocal)) !=
-            STRIX_WIDTH_RT(Success)) return false;
-        capturing_ = true;
-        bool enqueued = false;
-        try {
-            work();
-            enqueued = true;
-        } catch (...) {
-            // The caller retries the step through its eager path after capture ends.
-        }
-        STRIX_WIDTH_RT(Graph_t) graph{};
-        const auto end = STRIX_WIDTH_RT(StreamEndCapture)(stream, &graph);
-        capturing_ = false;
-        if (!enqueued || end != STRIX_WIDTH_RT(Success) || !graph) {
-            if (graph) (void)STRIX_WIDTH_RT(GraphDestroy)(graph);
-            return false;
-        }
+        const auto graph = device::native::record_step_graph(stream, capturing_, work);
+        if (!graph) return false;
         std::size_t count = 0;
         if (!device::native::inspect_raw_step_graph(graph, count)) {
             (void)STRIX_WIDTH_RT(GraphDestroy)(graph);
             return false;
         }
-#if defined(__HIPCC__)
-        const auto status = hipGraphInstantiate(&exec_[at], graph, nullptr, nullptr, 0U);
-#else
-        const auto status = cudaGraphInstantiate(&exec_[at], graph, 0U);
-#endif
+        const auto status = device::native::instantiate_step_graph(&exec_[at], graph);
         (void)STRIX_WIDTH_RT(GraphDestroy)(graph);
         if (status != STRIX_WIDTH_RT(Success)) {
             exec_[at] = nullptr;
