@@ -100,7 +100,7 @@ bool parse_num(std::string_view s, T& v) {
 std::vector<std::string_view> split(std::string_view line) {
     std::vector<std::string_view> out;
     std::size_t at = 0;
-    while (at <= line.size()) {
+    while (at <= line.size() && out.size() < 17U) {
         const auto next = line.find(' ', at);
         if (next == std::string_view::npos) {
             out.push_back(line.substr(at));
@@ -145,19 +145,39 @@ Status pack_identity(const Source& file, std::size_t header_bytes, std::span<con
     return kOk;
 }
 
-std::string pack_header(std::size_t count, const Digest256& checkpoint) {
-    return std::string(kLowbitPackTag) + " " + std::to_string(count) + "\ncheckpoint " + hex(checkpoint) + "\n";
+constexpr std::size_t kDigestBytes = 32;
+
+std::string pack_header(std::size_t count, const Digest256& checkpoint, PackVersion version = PackVersion::legacy) {
+    return std::string(version == PackVersion::checked ? kCheckedLowbitPackTag : kLowbitPackTag) + " " + std::to_string(count) + "\ncheckpoint " + hex(checkpoint) + "\n";
 }
 
-std::string entry_line(const LowbitPackEntry& e, std::uint64_t offset) {
-    return "tensor " + e.tensor + " " + std::string(e.storage.name) + " " +
+void describe_scales(LowbitPackEntry& entry) {
+    const bool sp = lowbit_storage_has_header(entry.storage);
+    entry.group_size = sp ? 32U : 64U;
+    entry.scale_form = sp ? "e5m3+tensor-base" : "fp16";
+}
+
+bool label(std::string_view s) {
+    return !s.empty() && s.size() <= 64U && std::ranges::all_of(s, [](unsigned char c) {
+        return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.' || c == '@';
+    });
+}
+
+std::string entry_line(const LowbitPackEntry& e, std::uint64_t offset, PackVersion version = PackVersion::legacy) {
+    std::string line = "tensor " + e.tensor + " " + std::string(e.storage.name) + " " +
            std::to_string(e.storage.revision) + " " + std::to_string(e.rows) + " " +
            std::to_string(e.columns) + " " + std::to_string(offset) + " " + std::to_string(e.bytes) +
-           " " + hex(e.source) + (e.sp_header ? " " + header_hex(*e.sp_header) : std::string{}) + "\n";
+           " " + hex(e.source);
+    if (e.sp_header) line += " " + header_hex(*e.sp_header);
+    else if (version == PackVersion::checked) line += " -";
+    if (version == PackVersion::checked)
+        line += " " + std::to_string(e.group_size) + " " + std::string(e.scale_form) + " " +
+                e.coding.role + " " + e.coding.coder + " " + hex(e.coding.calibration) + " " + hex(e.payload);
+    return line + "\n";
 }
 
-Status validate_entry(const LowbitPackEntry& e, std::set<std::string>& names) {
-    if (e.tensor.empty() || std::ranges::any_of(e.tensor, [](unsigned char c) { return c <= ' ' || c == 127; }))
+Status validate_entry(const LowbitPackEntry& e, std::set<std::string>& names, bool validate_name = true) {
+    if (validate_name && (e.tensor.empty() || std::ranges::any_of(e.tensor, [](unsigned char c) { return c <= 32U || c == 127U; })))
         return fail(Error::malformed, "invalid tensor name in low-bit pack: " + e.tensor);
     if (!supported(e.storage)) return fail(Error::unknown_format, "unsupported pack format for " + e.tensor);
     if (const auto why = lowbit_header_defect(e.storage, e.sp_header); !why.empty())
@@ -192,6 +212,7 @@ struct LowbitPackWriter::Staging {
     std::ofstream stream;
     std::set<std::string> remaining, written;
     std::uint64_t reserve{}, pos{};
+    PackVersion version = PackVersion::legacy;
     bool owns_directory = false;
 
     ~Staging() {
@@ -206,17 +227,19 @@ struct LowbitPackWriter::Staging {
 LowbitPackWriter::LowbitPackWriter(const Digest256& checkpoint) : checkpoint_(checkpoint) {}
 
 LowbitPackWriter::LowbitPackWriter(const Digest256& checkpoint, const std::string& path,
-                                   std::span<const std::string_view> names)
+                                   std::span<const std::string_view> names, PackVersion version)
     : checkpoint_(checkpoint), staging_(std::make_unique<Staging>()) {
     auto& stage = *staging_;
     if (checkpoint.bytes == Digest256{}.bytes || names.empty())
         throw std::invalid_argument("streaming pack needs a checkpoint identity and tensor names");
-    std::uint64_t header = pack_header(names.size(), checkpoint).size() + 4U;
+    stage.version = version;
+    std::uint64_t header = pack_header(names.size(), checkpoint, version).size() + 4U;
+    const auto entry_reserve = version == PackVersion::checked ? 544U : 256U;
     for (const auto name : names) {
         // Space for all decimal fields at their largest width and a Strix header.
-        if (name.size() > kMaxHeader || header + name.size() + 256U > kMaxHeader)
+        if (name.size() > kMaxHeader || header + name.size() + entry_reserve > kMaxHeader)
             throw std::invalid_argument("streaming pack header exceeds 64 MiB");
-        header += name.size() + 256U;
+        header += name.size() + entry_reserve;
         if (!stage.remaining.emplace(name).second)
             throw std::invalid_argument("duplicate pack tensor: " + std::string(name));
     }
@@ -238,7 +261,7 @@ LowbitPackWriter::~LowbitPackWriter() = default;
 
 void LowbitPackWriter::add(std::string tensor, FormatId storage, std::uint64_t rows, std::uint64_t columns,
                            const Digest256& source, std::vector<std::uint8_t> bytes,
-                           std::optional<sp::Header> sp_header) {
+                           std::optional<sp::Header> sp_header, PackCoding coding) {
     Item item;
     item.entry.tensor = std::move(tensor);
     item.entry.storage = storage;
@@ -251,6 +274,13 @@ void LowbitPackWriter::add(std::string tensor, FormatId storage, std::uint64_t r
         auto& stage = *staging_;
         if (!stage.remaining.contains(item.entry.tensor))
             throw std::invalid_argument("pack tensor was not planned or is duplicated: " + item.entry.tensor);
+        if (stage.version == PackVersion::checked) {
+            if (!label(coding.role) || !label(coding.coder))
+                throw std::invalid_argument("missing or invalid role/coder for " + item.entry.tensor);
+            item.entry.coding = std::move(coding);
+            describe_scales(item.entry);
+            item.entry.payload = digest_bytes(std::as_bytes(std::span(bytes)));
+        }
         if (const auto status = validate_entry(item.entry, stage.written); !status)
             throw std::invalid_argument(status.detail);
         item.entry.offset = align_up(stage.pos);
@@ -320,8 +350,8 @@ Status LowbitPackWriter::finish() {
     if (!staging_ || !staging_->stream) return fail(Error::malformed, "pack staging is not writable");
     auto& stage = *staging_;
     if (!stage.remaining.empty()) return fail(Error::malformed, "pack missing planned tensor " + *stage.remaining.begin());
-    std::string header = pack_header(items_.size(), checkpoint_);
-    for (const auto& item : items_) header += entry_line(item.entry, item.entry.offset);
+    std::string header = pack_header(items_.size(), checkpoint_, stage.version);
+    for (const auto& item : items_) header += entry_line(item.entry, item.entry.offset, stage.version);
     header += "end\n";
     if (header.size() > stage.reserve) return fail(Error::malformed, "pack header exceeded its reservation");
     header.resize(static_cast<std::size_t>(stage.reserve), '\n');
@@ -329,6 +359,18 @@ Status LowbitPackWriter::finish() {
     stage.stream.write(header.data(), static_cast<std::streamsize>(header.size()));
     stage.stream.close();
     if (!stage.stream) return fail(Error::malformed, "could not finish staged pack");
+    if (stage.version == PackVersion::checked) {
+        Digest256 digest{};
+        {
+            std::shared_ptr<const Source> file;
+            if (const auto status = open_source(stage.file.string(), file); !status) return status;
+            if (const auto status = digest_slice({file, {0, stage.pos}}, digest); !status) return status;
+        }
+        std::ofstream trailer(stage.file, std::ios::binary | std::ios::app);
+        trailer.write(reinterpret_cast<const char*>(digest.bytes.data()), kDigestBytes);
+        trailer.close();
+        if (!trailer) return fail(Error::malformed, "could not write pack digest");
+    }
     std::error_code error;
     std::filesystem::create_hard_link(stage.file, stage.destination, error);
     if (error) return fail(Error::malformed, "could not publish staged pack: " + error.message());
@@ -338,15 +380,19 @@ Status LowbitPackWriter::finish() {
 }
 
 Status LowbitPack::open(const std::string& path, const Digest256& checkpoint, LowbitPack& out) {
-    return open_impl(path, checkpoint, false, out);
+    return open_impl(path, &checkpoint, false, out);
 }
 
 Status LowbitPack::open_host(const std::string& path, const Digest256& checkpoint, LowbitPack& out) {
-    return open_impl(path, checkpoint, true, out);
+    return open_impl(path, &checkpoint, true, out);
 }
 
-Status LowbitPack::open_impl(const std::string& path, const Digest256& checkpoint, bool host, LowbitPack& out) {
-    if (checkpoint.bytes == Digest256{}.bytes)
+Status LowbitPack::inspect(const std::string& path, LowbitPack& out) {
+    return open_impl(path, nullptr, true, out);
+}
+
+Status LowbitPack::open_impl(const std::string& path, const Digest256* checkpoint, bool host, LowbitPack& out) {
+    if (checkpoint && checkpoint->bytes == Digest256{}.bytes)
         return fail(Error::stale_source, "low-bit pack " + path + " needs the checkpoint identity it is bound to");
     // One open file for the framing, the identity and the resident slices handed out by find().
     std::shared_ptr<const Source> file;
@@ -363,6 +409,13 @@ Status LowbitPack::open_impl(const std::string& path, const Digest256& checkpoin
             return fail(Error::malformed, "low-bit pack header not terminated: " + path);
         block.resize(static_cast<std::size_t>(std::min<std::uint64_t>(kAlign, file_size - text.size())));
         if (const auto status = read_at(text.size(), block); !status) return fail(Error::malformed, "short read of " + path);
+        if (text.empty()) {
+            const std::string_view prefix(reinterpret_cast<const char*>(block.data()), block.size());
+            const auto tag = prefix.substr(0, prefix.find_first_of(" \n"));
+            if (tag != kLowbitPackTag && tag != kCheckedLowbitPackTag)
+                return fail(Error::unknown_format, "unsupported low-bit pack version (expected v2 or v3): " +
+                            std::string(tag.substr(0, 80)));
+        }
         const auto search_from = text.size() > 4U ? text.size() - 4U : 0U;
         text.append(reinterpret_cast<const char*>(block.data()), block.size());
         const auto at = text.find("\nend\n", search_from);
@@ -382,7 +435,8 @@ Status LowbitPack::open_impl(const std::string& path, const Digest256& checkpoin
     }
     const auto first = split(lines.front());
     std::uint64_t count = 0;
-    if (first.size() != 2U || first[0] != kLowbitPackTag || !parse_num(first[1], count))
+    const bool checked = first[0] == kCheckedLowbitPackTag;
+    if (first.size() != 2U || !parse_num(first[1], count))
         return fail(Error::malformed, "bad low-bit pack tag in " + path + " (expected " + std::string(kLowbitPackTag) + ")");
     if (lines.size() < 3U || count != lines.size() - 3U || lines.back() != "end")
         return fail(Error::malformed, "low-bit pack entry count mismatch in " + path);
@@ -390,9 +444,15 @@ Status LowbitPack::open_impl(const std::string& path, const Digest256& checkpoin
     Digest256 declared{};
     if (bound.size() != 2U || bound[0] != "checkpoint" || !parse_hex(bound[1], declared))
         return fail(Error::malformed, "low-bit pack " + path + " lacks its checkpoint line");
-    if (declared.bytes != checkpoint.bytes)
+    if (declared == Digest256{})
+        return fail(Error::malformed, "low-bit pack has an empty checkpoint digest");
+    if (checkpoint && declared != *checkpoint)
         return fail(Error::stale_source, "low-bit pack " + path + " was coded from checkpoint " + hex(declared).substr(0, 16) +
-                                             ", the model is " + hex(checkpoint).substr(0, 16));
+                                             ", the model is " + hex(*checkpoint).substr(0, 16));
+    if (checked && file_size - padded < kDigestBytes)
+        return fail(Error::malformed, "low-bit pack digest trailer truncated");
+    const auto payload_end = checked ? file_size - kDigestBytes : file_size;
+    std::uint64_t previous_end = padded;
 
     std::vector<LowbitPackEntry> entries;
     std::set<std::string> names;
@@ -400,7 +460,7 @@ Status LowbitPack::open_impl(const std::string& path, const Digest256& checkpoin
         const auto f = split(lines[static_cast<std::size_t>(i) + 2U]);
         std::uint32_t version = 0;
         LowbitPackEntry e{};
-        if ((f.size() != 9U && f.size() != 10U) || f[0] != "tensor" || f[1].empty() || !parse_num(f[3], version) ||
+        if ((checked ? f.size() != 16U : (f.size() != 9U && f.size() != 10U)) || f[0] != "tensor" || f[1].empty() || !parse_num(f[3], version) ||
             !parse_num(f[4], e.rows) || !parse_num(f[5], e.columns) || !parse_num(f[6], e.offset) ||
             !parse_num(f[7], e.bytes) || !parse_hex(f[8], e.source))
             return fail(Error::malformed, "bad low-bit pack entry line " + std::to_string(i + 3U));
@@ -410,15 +470,26 @@ Status LowbitPack::open_impl(const std::string& path, const Digest256& checkpoin
         const auto storage = parse_format(f[2], version);
         if (!storage) return fail(Error::unknown_format, "unsupported low-bit pack format for " + e.tensor);
         e.storage = *storage;
-        if (f.size() == 10U) {
+        if (f.size() >= 10U && (!checked || f[9] != "-")) {
             sp::Header tensor_header;
             if (const auto why = parse_header(f[9], storage_bits(e.storage), tensor_header); !why.empty())
                 return fail(Error::malformed, e.tensor + ": Strix pack header: " + why);
             e.sp_header = tensor_header;
         }
-        if (const auto status = validate_entry(e, names); !status) return status;
-        if (e.offset % kAlign != 0U || e.offset < padded || e.offset > file_size || e.bytes > file_size - e.offset)
-            return fail(Error::malformed, "payload outside file for " + e.tensor);
+        describe_scales(e);
+        if (checked) {
+            unsigned group = 0;
+            if (!parse_num(f[10], group) || group != e.group_size || f[11] != e.scale_form ||
+                !label(f[12]) || !label(f[13]) || !parse_hex(f[14], e.coding.calibration) || !parse_hex(f[15], e.payload))
+                return fail(Error::malformed, "invalid coding metadata for " + e.tensor);
+            e.coding.role = f[12];
+            e.coding.coder = f[13];
+        }
+        if (const auto status = validate_entry(e, names, checked); !status) return status;
+        if (e.offset % kAlign != 0U || e.offset < (checked ? previous_end : padded) ||
+            e.offset > payload_end || e.bytes > payload_end - e.offset)
+            return fail(Error::malformed, "misaligned, overlapping or truncated payload for " + e.tensor);
+        previous_end = e.offset + e.bytes;
         entries.push_back(std::move(e));
     }
     std::vector<ByteRange> ranges;
@@ -430,11 +501,23 @@ Status LowbitPack::open_impl(const std::string& path, const Digest256& checkpoin
             return fail(Error::malformed, "overlapping low-bit pack payloads");
 
     Digest256 identity;
-    if (const auto status = pack_identity(*file, header.size(), entries, identity); !status) return status;
+    if (checked) {
+        if (previous_end != payload_end) return fail(Error::malformed, "unexpected bytes before pack digest");
+        if (const auto status = read_at(payload_end, std::as_writable_bytes(std::span(identity.bytes))); !status) return status;
+    } else if (const auto status = pack_identity(*file, header.size(), entries, identity); !status) return status;
+    out.version_ = checked ? PackVersion::checked : PackVersion::legacy;
     out.path_ = path;
     out.file_ = std::move(file);
     out.entry_index_.clear();
-    for (std::size_t i = 0; i < entries.size(); ++i) out.entry_index_.emplace(entries[i].tensor, i);
+    out.roles_.clear();
+    out.checks_.clear();
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        out.entry_index_.emplace(entries[i].tensor, i);
+        if (checked) {
+            out.roles_[entries[i].coding.role].push_back(i);
+            out.checks_.push_back(std::make_shared<Check>());
+        }
+    }
     out.entries_ = std::move(entries);
     out.header_bytes_ = header.size();
     out.identity_ = identity;
@@ -442,12 +525,58 @@ Status LowbitPack::open_impl(const std::string& path, const Digest256& checkpoin
     return kOk;
 }
 
+const LowbitPackEntry* LowbitPack::entry(std::string_view tensor) const {
+    const auto it = entry_index_.find(tensor);
+    return it == entry_index_.end() ? nullptr : &entries_[it->second];
+}
+
+std::span<const std::size_t> LowbitPack::role_entries(std::string_view role) const {
+    const auto it = roles_.find(role);
+    return it == roles_.end() ? std::span<const std::size_t>{} : std::span<const std::size_t>(it->second);
+}
+
+Status LowbitPack::verify_tensor(std::size_t index, MappedBytes& bytes) const {
+    const auto& e = entries_[index];
+    if (const auto status = file_->map({e.offset, e.bytes}, bytes); !status) return status;
+    if (version_ == PackVersion::legacy) return kOk;
+    auto& check = *checks_[index];
+    std::call_once(check.once, [&] {
+        check.result = digest_bytes(bytes.bytes) == e.payload ? kOk :
+            fail(Error::stale_source, "pack payload digest mismatch for " + e.tensor);
+    });
+    if (!check.result) bytes = {};
+    return check.result;
+}
+
+Status LowbitPack::map_tensor(std::string_view tensor, MappedBytes& out) const {
+    out = {};
+    const auto it = entry_index_.find(tensor);
+    if (it == entry_index_.end()) return fail(Error::malformed, "pack has no tensor " + std::string(tensor));
+    return verify_tensor(it->second, out);
+}
+
 Status LowbitPack::verify_identity() const {
     if (!file_) return fail(Error::stale_source, "calibrated pack was not opened");
     Digest256 current;
+    if (version_ == PackVersion::checked) {
+        if (const auto status = digest_slice({file_, {0, file_->size() - kDigestBytes}}, current); !status) return status;
+        if (current != identity_) return fail(Error::stale_source, "whole-file pack digest mismatch");
+        return kOk;
+    }
     if (const auto status = pack_identity(*file_, header_bytes_, entries_, current); !status)
         return fail(status.code, "calibrated pack changed during upload: " + status.detail);
     if (!(current == identity_)) return fail(Error::stale_source, "calibrated pack digest changed during upload");
+    return kOk;
+}
+
+Status LowbitPack::verify_payloads() const {
+    if (!file_) return fail(Error::stale_source, "calibrated pack was not opened");
+    if (version_ == PackVersion::legacy) return kOk;
+    for (const auto& entry : entries_) {
+        Digest256 current{};
+        if (const auto status = digest_slice({file_, {entry.offset, entry.bytes}}, current); !status) return status;
+        if (current != entry.payload) return fail(Error::stale_source, "pack payload digest mismatch for " + entry.tensor);
+    }
     return kOk;
 }
 
@@ -478,6 +607,10 @@ Status LowbitPack::find_impl(std::string_view tensor, FormatId storage, const Pa
     Digest256 digest{};
     if (const auto status = source.digest(digest); !status) return status;
     if (digest.bytes != entry.source.bytes) return fail(Error::stale_source, "pack source digest mismatch for " + entry.tensor);
+    if (version_ == PackVersion::checked) {
+        MappedBytes bytes;
+        if (const auto status = verify_tensor(it->second, bytes); !status) return status;
+    }
     out = Slice{file_, {entry.offset, entry.bytes}};
     if (outer_exponent && entry.sp_header) *outer_exponent = entry.sp_header->base;
     return kOk;

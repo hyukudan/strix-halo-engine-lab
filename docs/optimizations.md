@@ -6899,3 +6899,20 @@ with an eager forward walk. Opaque stream capture can inspect native kernels
 and transfer nodes. Checking a kernel against an independent predicted shape
 requires a declared leaf. Device token, logit and state qualification is recorded
 separately for each binding.
+<a id="strixpack-mapped-host"></a>
+## Mapped Strix pack v3
+The v3 writer streams one matrix and records per-tensor coding metadata and SHA-256. The host reader checks only
+requested payloads and reuses read-only mapped views. Whole-file verification is explicit. V2 readers and writing
+defaults retain the established sidecar contract. The grouped CPU bank caches each routed expert projection and can
+warm experts in descending route-count order. The mapped organization preserves packed bytes. SP4, SP3 and SP2
+conversion changes the source weights and requires explicit opt-in. See [the user guide](engine/strix-pack.md).
+| Engine | V3 mapped projection | Expert-granular loading |
+|---|---|---|
+| Inkling 2 Mini | Explicit CPU option for bound projections | Physical banks reuse mapped expert projections across visits |
+| Qwen3.8 Flash-Next | Shared host API | Device binding pending |
+| Qwen3.8 27B | Shared host API | Dense model |
+| DeepSeek V4.1 Flash | Shared host API | Device binding pending |
+| GLM 5.3 Flash | Shared host API | Device binding pending |
+| MiniMax M3.1 Flash | Shared host API | Device binding pending |
+| Hy4 Flash | Shared host API | Device binding pending |
+| Nemotron 3.5 Bolt E4B | Shared host API | Dense model |

@@ -502,10 +502,13 @@ inline void mark_foldable(Header& h, const std::uint8_t* bytes, std::size_t n, s
     if (smallest < 0x1p-14 || largest > 65504.0) h.flags = static_cast<std::uint8_t>(h.flags | kFlagNotFoldable);
 }
 
+enum class ScaleSelection { clip_search, nearest_max };
+
 // Round-to-nearest coding of a whole tensor (no calibration): out = n * S::row_bytes(k) bytes; optional n x k decode.
 template <class S>
 inline lowbit::EncodeStatus encode_rows(const float* w, std::size_t n, std::size_t k, const Header& h, std::uint8_t* out,
-                        float* dequant = nullptr, const float* importance = nullptr) {
+                        float* dequant = nullptr, const float* importance = nullptr,
+                        ScaleSelection selection = ScaleSelection::clip_search) {
     require_coding_shape(w, n, k);
     if (!out || h.bits != S::bits || *h.invalid() != '\0')
         throw std::invalid_argument("Strix pack coder requires a matching header and an output buffer");
@@ -517,9 +520,20 @@ inline lowbit::EncodeStatus encode_rows(const float* w, std::size_t n, std::size
             unsigned codes[S::elements];
             std::uint8_t scales[S::groups];
             const float* src = w + r * k + b * S::elements;
-            for (unsigned g = 0; g < S::groups; ++g)
-                encode_group<S>(src + g * S::group, h, codes + g * S::group, scales[g],
-                                importance ? importance + b * S::elements + g * S::group : nullptr);
+            for (unsigned g = 0; g < S::groups; ++g) {
+                const auto* group = src + g * S::group;
+                auto* indices = codes + g * S::group;
+                if (selection == ScaleSelection::clip_search) {
+                    encode_group<S>(group, h, indices, scales[g],
+                                    importance ? importance + b * S::elements + g * S::group : nullptr);
+                } else {
+                    const auto amax = tensor_amax(group, S::group);
+                    scales[g] = nearest_scale_byte(static_cast<double>(amax) / h.table[S::levels - 1U], h.base);
+                    const auto scale = static_cast<double>(scale_value(scales[g], h.base));
+                    for (unsigned j = 0; j < S::group; ++j)
+                        indices[j] = amax > 0.0F ? quantise<S>(group[j], scale, h.table.data()) : 0U;
+                }
+            }
             std::uint8_t* block = out + (r * blocks + b) * S::bytes;
             pack_block<S>(codes, scales, block);
             if (dequant)

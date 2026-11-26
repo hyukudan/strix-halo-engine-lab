@@ -2,6 +2,7 @@
 #include "strix/weight/confined_file.hpp"
 #include "core/sha256.hpp"
 #include "strix/file_snapshot.hpp"
+#include "strix/file_map.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
@@ -49,6 +50,7 @@ class FileSource final : public Source {
         return {{{std::uint64_t(st.st_size),std::uint64_t(st.st_mtim.tv_sec),std::uint64_t(st.st_mtim.tv_nsec),std::uint64_t(st.st_ctim.tv_sec),std::uint64_t(st.st_ctim.tv_nsec),std::uint64_t(st.st_ino)}}};
 #endif
     }
+    mutable std::shared_ptr<const FileMap> mapping_;
     mutable std::mutex mutex_; mutable std::optional<Digest256> digest_; mutable std::once_flag digest_once_;
 public:
     explicit FileSource(FileHandle file, std::string shard)
@@ -121,6 +123,27 @@ public:
         catch(const std::exception& e){return {Error::stale_source,e.what()};}
         return {Error::ok,{}};
     }
+    Status map(ByteRange range, MappedBytes& out) const override {
+        out = {};
+        if (range.offset > size_ || range.bytes > size_ - range.offset)
+            return {Error::malformed, "source mapping outside bounds"};
+        std::lock_guard lock(mutex_);
+        try {
+            if (snapshot() != snapshot_) return {Error::stale_source, "source changed after indexing"};
+            if (!mapping_) {
+                auto mapping = std::make_shared<FileMap>();
+#ifdef _WIN32
+                mapping->open_handle(reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(file_))), size_);
+#else
+                mapping->open_handle(fileno(file_), size_);
+#endif
+                mapping_ = std::move(mapping);
+            }
+            out = {mapping_, {reinterpret_cast<const Byte*>(mapping_->data()) + range.offset,
+                              static_cast<std::size_t>(range.bytes)}};
+        } catch (const std::exception& e) { return {Error::device_failure, e.what()}; }
+        return {Error::ok, {}};
+    }
     Digest256 identity() const override {
         {std::lock_guard lock(mutex_);if(!(snapshot()==snapshot_))throw std::runtime_error("source changed after indexing");}
         std::call_once(digest_once_,[&] {
@@ -141,6 +164,7 @@ class NamespaceSource final:public Source {
 public:
     NamespaceSource(std::shared_ptr<const Source> source,std::string shard):source_(std::move(source)),shard_(std::move(shard)){}
     Status read(ByteRange range,std::span<Byte> out) const override{return source_->read(range,out);}
+    Status map(ByteRange range, MappedBytes& out) const override{return source_->map(range,out);}
     std::uint64_t size() const noexcept override{return source_->size();}
     Digest256 identity() const override{return source_->identity();}
     std::string shard_name() const override{return shard_;}

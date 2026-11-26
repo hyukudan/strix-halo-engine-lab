@@ -11,11 +11,17 @@ inline float decode_f32_le(const Byte* bytes) {
     return std::bit_cast<float>(bits);
 }
 
+// The owner pins the immutable file view across pack/source destruction.
+struct MappedBytes {
+    std::shared_ptr<const void> owner;
+    std::span<const Byte> bytes;
+};
 struct Source {
   virtual ~Source() = default;
   virtual Status read(ByteRange, std::span<Byte>) const = 0;
   virtual std::uint64_t size() const noexcept = 0;
   virtual Digest256 identity() const = 0;
+  virtual Status map(ByteRange, MappedBytes&) const { return {Error::unsupported_arithmetic, "source is not mappable"}; }
   // Stable shard namespace, independent of a tensor name. Not a content digest.
   virtual std::string shard_name() const { return {}; }
   // Optional positioned-I/O cache hint; it never changes the stored bytes.

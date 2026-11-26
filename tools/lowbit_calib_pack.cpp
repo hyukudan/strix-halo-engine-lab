@@ -1,5 +1,7 @@
 // Calibrated low-bit packs and per-matrix numerical diagnostics. See docs/engine/lowbit-calibration.md.
 #include "strix/serve/json.hpp"
+#include "core/sha256.hpp"
+#include <bit>
 #include "strix/weight/admission.hpp"
 #include "strix/weight/calib_moments.hpp"
 #include "strix/weight/calib_provenance.hpp"
@@ -98,7 +100,7 @@ struct Rule {
 };
 
 struct Args {
-    std::string model, out, report, dequant_out, plan, probe;
+    std::string model, out, report, dequant_out, plan, probe, checked_role;
     std::vector<std::string> moments, eval, heldout;
     std::size_t moments_bytes = std::numeric_limits<std::size_t>::max();
     std::vector<Rule> rules;
@@ -137,6 +139,7 @@ Args parse(int argc, char** argv) {
         }
         else if (arg == "--heldout") a.heldout.push_back(value());
         else if (arg == "--out") a.out = value();
+        else if (arg == "--checked-role") a.checked_role = value();
         else if (arg == "--report") a.report = value();
         else if (arg == "--technique") a.technique = parse_technique(value());
         else if (arg == "--damp") a.damp = std::stod(value());
@@ -159,10 +162,11 @@ Args parse(int argc, char** argv) {
     if (a.model.empty()) throw std::invalid_argument("need --model");
     if (!a.probe.empty()) {
         if (!a.plan.empty() || !a.rules.empty() || !a.out.empty() || !a.dequant_out.empty() || !a.report.empty() ||
-            !a.moments.empty() || !a.eval.empty() || !a.heldout.empty() || a.compare)
+            !a.moments.empty() || !a.eval.empty() || !a.heldout.empty() || !a.checked_role.empty() || a.compare)
             throw std::invalid_argument("--probe-source is a read-only standalone operation");
         return a;
     }
+    if (!a.checked_role.empty() && a.out.empty()) throw std::invalid_argument("--checked-role requires --out");
     if (a.rules.empty() == a.plan.empty())
         throw std::invalid_argument("need --storage rules or --plan");
     if (!a.eval.empty() && a.eval.size() != a.moments.size())
@@ -407,7 +411,7 @@ int main(int argc, char** argv) {
             wei::Digest256 digest{};
             if (const auto status = checkpoint.digest(digest); !status)
                 throw std::runtime_error("checkpoint digest: " + status.detail);
-            writer.emplace(digest, args.out, names);
+            writer.emplace(digest, args.out, names, args.checked_role.empty() ? wei::PackVersion::legacy : wei::PackVersion::checked);
         }
         std::ofstream report;
         if (!args.report.empty()) {
@@ -418,6 +422,7 @@ int main(int argc, char** argv) {
             report << '\n';
         }
         DequantTensors dequant_out;
+        wei::Digest256 calibration{};
         double total_rtn = 0.0, total_sel = 0.0;
         const auto process = [&](Selection& selection, const wei::calib::InputMoments* input,
                                  const wei::calib::InputMoments* held, const std::vector<float>& importance,
@@ -495,8 +500,14 @@ int main(int argc, char** argv) {
                     for (std::size_t i = 0; i < bf.size(); ++i) bf[i] = exact_bf16(coded.dequant[i]);
                     dequant_out[t->name] = {{n, k}, std::move(bf)};
                 }
-                if (chosen && writer)
-                    writer->add(t->name, storage_id(a.format, a.fit), n, k, digest, std::move(coded.bytes), coded.header);
+                if (chosen && writer) {
+                    wei::PackCoding coding;
+                    if (!args.checked_role.empty())
+                        coding = {args.checked_role, std::string("clip-") + technique_name(tech) +
+                                  (a.fit ? "-fitted@1" : "-fixed@1"), calibration};
+                    writer->add(t->name, storage_id(a.format, a.fit), n, k, digest, std::move(coded.bytes), coded.header,
+                                std::move(coding));
+                }
             }
             selection.processed = true;
         };
@@ -506,7 +517,30 @@ int main(int argc, char** argv) {
             wei::calib::Provenance heldout, all_cal, all_eval;
             for (const auto& manifest : args.heldout) heldout.add_manifest(manifest);
             for (std::size_t layer = 0; layer < args.moments.size(); ++layer) {
-                const auto cal = wei::calib::MomentSet::read(args.moments[layer], args.moments_bytes);
+                const auto& fit_path = args.moments[layer];
+                const auto cal = [&] {
+                    if (args.checked_role.empty() || args.technique == Technique::rtn)
+                        return wei::calib::MomentSet::read(fit_path, args.moments_bytes);
+                    std::shared_ptr<const wei::Source> fit;
+                    if (const auto status = wei::open_source(fit_path, fit); !status)
+                        throw std::runtime_error("open calibration moments: " + status.detail);
+                    auto stream = wei::source_stream(fit);
+                    auto result = wei::calib::MomentSet::read(*stream, fit_path, args.moments_bytes);
+                    wei::Digest256 fit_digest{};
+                    if (const auto status = wei::digest_slice({fit, {0, fit->size()}}, fit_digest); !status)
+                        throw std::runtime_error("digest calibration moments: " + status.detail);
+                    strix::core::Sha256 hash;
+                    constexpr std::string_view tag = "strix-pack-calibration@1";
+                    hash.update(tag.data(), tag.size());
+                    hash.update(fit_digest.bytes.data(), fit_digest.bytes.size());
+                    const auto damp = std::bit_cast<std::uint64_t>(args.damp);
+                    std::array<std::uint8_t, 8> bits{};
+                    for (unsigned i = 0; i < bits.size(); ++i)
+                        bits[i] = static_cast<std::uint8_t>(damp >> (i * 8U));
+                    hash.update(bits.data(), bits.size());
+                    calibration = {hash.finish()};
+                    return result;
+                }();
                 std::optional<wei::calib::MomentSet> eval;
                 if (!args.eval.empty())
                     eval.emplace(wei::calib::MomentSet::read(args.eval[layer], args.moments_bytes - cal.moment_bytes()));

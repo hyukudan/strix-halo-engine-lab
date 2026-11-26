@@ -255,6 +255,10 @@ public:
         static_assert(sizeof(float) == 4U);
         std::ifstream in(path, std::ios::binary);
         if (!in) throw std::runtime_error("cannot read calibration moments " + path);
+        return read(in, path, max_moment_bytes);
+    }
+
+    static MomentSet read(std::istream& in, const std::string& path, std::size_t max_moment_bytes) {
         std::string line;
         std::getline(in, line);
         std::istringstream head(line);

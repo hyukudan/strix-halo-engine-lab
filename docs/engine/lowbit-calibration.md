@@ -2,6 +2,7 @@
 
 The [Strix Pack v1 specification](strix-pack-v1.md) defines SP2, SP3, SP4, SP4T and the v2 sidecar
 container. It links to backend conformance fixtures and model-independent size and error measurements.
+For explicit host conversion and integrity checks, see [Strix packs](strix-pack.md).
 
 The low-bit resident row storages `strix.q4_g64` and `strix.q6_g64` (`include/strix/weight/host_lowbit.hpp`) are
 normally produced at load time from BF16 matrices: one FP16 scale per 64 weights, chosen by a clip search on the

@@ -20,15 +20,19 @@ void append(core::Sha256& hash, const Digest256& digest) {
     hash.update(digest.bytes.data(), digest.bytes.size());
 }
 
-Digest256 matrix_digest(PackMatrixSource::Encoding encoding, const Digest256& codes, const Digest256& scales) {
+Digest256 matrix_digest(PackMatrixSource::Encoding encoding, const Digest256& codes, const Digest256& scales,
+                        std::span<const Byte> amax = {}, std::span<const Byte> denominator = {}) {
     if (encoding == PackMatrixSource::Encoding::bf16) return codes;
     constexpr std::string_view tag = "strix-pack-source/v1";
     core::Sha256 hash;
     hash.update(tag.data(), tag.size());
-    const char kind = encoding == PackMatrixSource::Encoding::mxfp4 ? 'm' : 'f';
+    constexpr char kinds[] = "-mfnx";
+    const char kind = kinds[static_cast<std::size_t>(encoding)];
     hash.update(&kind, 1);
     append(hash, codes);
     append(hash, scales);
+    if (!amax.empty()) hash.update(amax.data(), amax.size());
+    if (!denominator.empty()) hash.update(denominator.data(), denominator.size());
     return {hash.finish()};
 }
 }  // namespace
@@ -147,12 +151,68 @@ Status PackMatrixSource::bind(const PackCheckpoint& checkpoint, const RawTensor&
     return ok;
 }
 
+Status bind_pack_bank(const PackCheckpoint& checkpoint, const RawTensor& tensor, microscaled::RowOrder order,
+                      microscaled::ExpertSlabView& out) {
+    using namespace microscaled;
+    const auto invalid = [&] { return Status{Error::unsupported_shape, tensor.name + ": invalid microscaled expert bank"}; };
+    const bool nv = tensor.wire_dtype == "U8";
+    if ((!nv && tensor.wire_dtype != "F8_E4M3") || tensor.shape.rank != 3U)
+        return {Error::unknown_format, tensor.name + ": expected rank-3 NVFP4 or MXFP8 code plane"};
+    const auto [experts, rows, encoded, unused] = tensor.shape.dims;
+    (void)unused;
+    constexpr auto limit = std::numeric_limits<std::size_t>::max();
+    if (experts == 0 || rows == 0 || encoded == 0 || experts > limit || rows > limit || encoded > limit / 2U)
+        return invalid();
+    const auto columns = encoded * (nv ? 2U : 1U);
+    const auto block = nv ? kNvfp4BlockColumns : kMxfp8BlockColumns;
+    if (rows > limit / sizeof(float) / columns || columns % block != 0) return invalid();
+    const auto* scale = checkpoint.find(tensor.name + "_scale");
+    if (!scale || scale->wire_dtype != (nv ? "F8_E4M3" : "U8") || scale->shape.rank != 3U ||
+        scale->shape.dims != std::array<std::uint64_t, 4>{experts, rows, columns / block, 0})
+        return {Error::malformed, tensor.name + ": incompatible or missing scale plane"};
+    ExpertSlabView bank{nv ? MatrixFormat::nvfp4 : MatrixFormat::mxfp8, order, static_cast<std::size_t>(experts),
+                        static_cast<std::size_t>(rows), static_cast<std::size_t>(columns),
+                        tensor.payload, scale->payload, {}, {}};
+    if (nv) {
+        const auto* amax = checkpoint.find(tensor.name + "_amax");
+        const auto* denominator = checkpoint.find(tensor.name + "_outer_scale_denominator");
+        if (!amax || !denominator || amax->wire_dtype != "F32" || denominator->wire_dtype != "F32" ||
+            amax->extents != std::vector<std::uint64_t>{experts} || denominator->extents != std::vector<std::uint64_t>{1})
+            return {Error::malformed, tensor.name + ": incompatible or missing NVFP4 outer-scale planes"};
+        bank.amax = amax->payload;
+        bank.denominator = denominator->payload;
+    }
+    MatrixView check;
+    if (const auto status = bank.matrix(0, check); !status) return status;
+    out = std::move(bank);
+    return ok;
+}
+
+Status pack_expert(const microscaled::ExpertSlabView& bank, std::size_t expert, PackMatrixSource& out) {
+    microscaled::MatrixView matrix;
+    if (const auto status = bank.matrix(expert, matrix); !status) return status;
+    const auto encoding = matrix.format == microscaled::MatrixFormat::nvfp4 ?
+        PackMatrixSource::Encoding::nvfp4 : PackMatrixSource::Encoding::mxfp8;
+    out = {encoding, matrix.rows, matrix.columns, matrix.codes, matrix.block_scales,
+           matrix.amax, matrix.denominator, bank.row_order};
+    return ok;
+}
+
+std::string packed_expert_name(std::string_view bank, std::size_t expert) {
+    return std::string(bank) + "#" + std::to_string(expert);
+}
+
 Status PackMatrixSource::digest(Digest256& out) const {
     Digest256 raw{}, scale{};
     if (const auto s = digest_slice(codes, raw); !s) return s;
     if (encoding != Encoding::bf16)
         if (const auto s = digest_slice(scales, scale); !s) return s;
-    out = matrix_digest(encoding, raw, scale);
+    if (encoding == Encoding::nvfp4) {
+        std::array<Byte, 4> max{}, divisor{};
+        if (const auto s = read_slice(amax, max); !s) return s;
+        if (const auto s = read_slice(denominator, divisor); !s) return s;
+        out = matrix_digest(encoding, raw, scale, max, divisor);
+    } else out = matrix_digest(encoding, raw, scale);
     return ok;
 }
 
@@ -166,7 +226,11 @@ Status PackMatrixSource::decode(std::vector<float>& out, Digest256* digest_out) 
         (encoding == Encoding::mxfp4 && (columns % 32U || codes.range.bytes != count / 2U ||
                                          scales.range.bytes != count / 32U)) ||
         (encoding == Encoding::fp8_block && (codes.range.bytes != count ||
-                 scales.range.bytes != 4U * Block::scale_rows(rows) * Block::scale_columns(columns))))
+                 scales.range.bytes != 4U * Block::scale_rows(rows) * Block::scale_columns(columns))) ||
+        (encoding == Encoding::nvfp4 && (columns % microscaled::kNvfp4BlockColumns || codes.range.bytes != count / 2U ||
+                                         scales.range.bytes != count / microscaled::kNvfp4BlockColumns)) ||
+        (encoding == Encoding::mxfp8 && (columns % microscaled::kMxfp8BlockColumns || codes.range.bytes != count ||
+                                         scales.range.bytes != count / microscaled::kMxfp8BlockColumns)))
         return {Error::malformed, "pack source payload disagrees with matrix geometry"};
     std::vector<std::uint8_t> raw(static_cast<std::size_t>(codes.range.bytes));
     std::vector<std::uint8_t> scale(static_cast<std::size_t>(scales.range.bytes));
@@ -187,6 +251,32 @@ Status PackMatrixSource::decode(std::vector<float>& out, Digest256* digest_out) 
         } catch (const std::invalid_argument& e) {
             return {Error::malformed, e.what()};
         }
+    } else if (encoding == Encoding::nvfp4 || encoding == Encoding::mxfp8) {
+        const bool nv = encoding == Encoding::nvfp4;
+        std::array<Byte, 4> max{}, divisor{};
+        if (nv) {
+            if (const auto status = read_slice(amax, max); !status) return status;
+            if (const auto status = read_slice(denominator, divisor); !status) return status;
+        }
+        const auto code_stride = nv ? columns / 2U : columns;
+        const auto scale_stride = columns / (nv ? microscaled::kNvfp4BlockColumns : microscaled::kMxfp8BlockColumns);
+        try {
+            for (std::size_t r = 0; r < rows; ++r) {
+                const auto physical = microscaled::physical_row(row_order, rows, r);
+                const auto rc = std::span(raw).subspan(physical * code_stride, code_stride);
+                const auto rs = std::span(scale).subspan(physical * scale_stride, scale_stride);
+                const auto dst = std::span(matrix).subspan(r * columns, columns);
+                if (nv) microscaled::decode_nvfp4_row(rc, rs, decode_f32_le(max.data()), decode_f32_le(divisor.data()), dst);
+                else microscaled::decode_mxfp8_row(rc, rs, dst);
+            }
+        } catch (const std::invalid_argument& error) { return {Error::malformed, error.what()}; }
+        if (digest_out)
+            *digest_out = matrix_digest(encoding, digest_bytes(std::as_bytes(std::span(raw))),
+                                        digest_bytes(std::as_bytes(std::span(scale))),
+                                        nv ? std::span<const Byte>(max) : std::span<const Byte>{},
+                                        nv ? std::span<const Byte>(divisor) : std::span<const Byte>{});
+        out = std::move(matrix);
+        return ok;
     } else {
         std::vector<float> scales_f32(scale.size() / 4U);
         for (std::size_t i = 0; i < scales_f32.size(); ++i)

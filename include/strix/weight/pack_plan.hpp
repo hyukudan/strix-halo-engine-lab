@@ -9,6 +9,13 @@ namespace strix::serve { class Json; }
 
 namespace strix::weight {
 
+struct PackRouteCount {
+    std::uint64_t layer{}, expert{}, count{};
+};
+
+// The same route-count input is used for planning and warming packed banks.
+[[nodiscard]] std::vector<PackRouteCount> pack_route_counts(const serve::Json& routes);
+
 struct PackPlanEntry {
     std::string tensor;
     FormatId storage;  // Empty for a tensor kept in its source representation.
