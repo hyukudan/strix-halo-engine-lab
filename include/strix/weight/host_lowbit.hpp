@@ -152,11 +152,12 @@ inline EncodeStatus::Code encode_group(const float* w, int* q, std::uint16_t& sc
                 err += importance[j] * (d * d);
             }
         }
-        if (best < 0.0F || err < best) {
+        if (std::isfinite(err) && (best < 0.0F || err < best)) {
             best = err;
             scale = bits;
         }
     }
+    if (best < 0.0F) return EncodeStatus::nonfinite;
     const auto sd = static_cast<double>(f16_bits_to_f32(scale)), inv = 1.0 / sd;
     for (unsigned j = 0; j < Storage::group; ++j) q[j] = quantise<Storage>(w[j], sd, inv);
     return EncodeStatus::ok;

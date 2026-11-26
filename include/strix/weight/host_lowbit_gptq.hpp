@@ -115,11 +115,18 @@ inline void cholesky_lower(std::vector<double>& a, std::size_t k, unsigned threa
 // (they never reach the output on the calibration rows).
 inline std::vector<float> inverse_factor(std::vector<double> h, std::size_t k, double damp, std::vector<std::uint8_t>& dead,
                                          unsigned threads = 1U) {
-    if (h.size() != k * k) throw std::invalid_argument("lowbit gptq: second moment size");
+    if (k == 0 || k > h.size() / k || h.size() != k * k)
+        throw std::invalid_argument("lowbit gptq: second moment size");
+    if (!std::isfinite(damp) || damp < 0.0) throw std::invalid_argument("lowbit gptq: invalid damping");
     dead.assign(k, 0);
     double mean = 0.0;
     for (std::size_t i = 0; i < k; ++i) {
-        for (std::size_t j = 0; j < i; ++j) h[j * k + i] = h[i * k + j];
+        for (std::size_t j = 0; j <= i; ++j) {
+            const double moment = h[i * k + j];
+            if (!std::isfinite(moment) || (i == j && moment < 0.0))
+                throw std::invalid_argument("lowbit gptq: invalid second moment");
+            h[j * k + i] = moment;
+        }
         if (h[i * k + i] == 0.0) {
             h[i * k + i] = 1.0;
             dead[i] = 1;
@@ -127,7 +134,9 @@ inline std::vector<float> inverse_factor(std::vector<double> h, std::size_t k, d
         mean += h[i * k + i];
     }
     mean /= static_cast<double>(k);
-    for (std::size_t i = 0; i < k; ++i) h[i * k + i] += damp * mean;
+    const double damping = damp * mean;
+    if (!std::isfinite(damping)) throw std::invalid_argument("lowbit gptq: damping overflow");
+    for (std::size_t i = 0; i < k; ++i) h[i * k + i] += damping;
     cholesky_lower(h, k, threads);  // H = L L^T
     // Columns of L^-1 by forward substitution (column-major: column c holds rows >= c), then
     // H^-1[i][j] = sum_p L^-1[p][i] L^-1[p][j] over p >= max(i, j); each value one fixed-order sum.
@@ -153,8 +162,15 @@ inline std::vector<float> inverse_factor(std::vector<double> h, std::size_t k, d
     });
     cholesky_lower(hinv, k, threads);  // H^-1 = M M^T, U = M^T
     std::vector<float> u(k * k, 0.0F);
-    for (std::size_t i = 0; i < k; ++i)
-        for (std::size_t j = i; j < k; ++j) u[i * k + j] = static_cast<float>(hinv[j * k + i]);
+    for (std::size_t i = 0; i < k; ++i) {
+        for (std::size_t j = i; j < k; ++j) {
+            const double value = hinv[j * k + i];
+            if (!std::isfinite(value) || std::abs(value) > std::numeric_limits<float>::max())
+                throw std::runtime_error("lowbit gptq: inverse factor does not fit FP32");
+            u[i * k + j] = static_cast<float>(value);
+        }
+        if (!(u[i * k + i] > 0.0F)) throw std::runtime_error("lowbit gptq: inverse factor pivot underflow");
+    }
     return u;
 }
 
@@ -234,12 +250,21 @@ template <class Codec>
 inline EncodeStatus encode_rows_with(const Codec& codec, const float* w, std::size_t n, std::size_t k, std::uint8_t* out,
                                      const Options& opt = {}) {
     if (!w || !out || !n || !k || k % Codec::elements != 0U) throw std::invalid_argument("lowbit gptq: K % 128 == 0");
+    constexpr auto max_elements = static_cast<std::size_t>(std::numeric_limits<std::ptrdiff_t>::max());
+    if (n > max_elements / k || (opt.factor && k > max_elements / k))
+        throw std::invalid_argument("lowbit gptq: row or factor size overflow");
     for (std::size_t e = 0; e < n * k; ++e)
         if (!std::isfinite(w[e])) return {EncodeStatus::nonfinite};
+    for (std::size_t i = 0; i < k; ++i) {
+        if (opt.factor && (!std::isfinite(opt.factor[i * k + i]) || opt.factor[i * k + i] <= 0.0F))
+            return {EncodeStatus::nonfinite};
+        if (opt.importance && (!std::isfinite(opt.importance[i]) || opt.importance[i] < 0.0F))
+            return {EncodeStatus::nonfinite};
+    }
     const std::size_t blocks = k / Codec::elements, row_bytes = blocks * Codec::bytes;
     constexpr std::size_t kRowBlock = 16;  // rows coded together so each U row is read once per block
     const std::size_t row_blocks = (n + kRowBlock - 1U) / kRowBlock;
-    std::vector<std::uint8_t> failed(row_blocks, 0);
+    std::vector<EncodeStatus::Code> statuses(row_blocks, EncodeStatus::ok);
     detail::parallel_for(row_blocks, opt.threads, [&](std::size_t b) {
         const NearestRounding nearest;
         const std::size_t r0 = b * kRowBlock, rn = std::min(n - r0, kRowBlock);
@@ -257,16 +282,28 @@ inline EncodeStatus encode_rows_with(const Codec& codec, const float* w, std::si
             for (std::size_t r = 0; r < rn; ++r) {
                 float* row = rows.data() + r * k;
                 auto& st = states[r * Codec::groups + group];
-                if (in_block % Codec::group == 0U &&
-                    codec.begin(row + i, opt.importance ? opt.importance + i : nullptr, st) != EncodeStatus::ok) {
-                    failed[b] = 1;
+                if (!std::isfinite(row[i])) {
+                    statuses[b] = EncodeStatus::nonfinite;
                     return;
+                }
+                if (in_block % Codec::group == 0U) {
+                    if (opt.factor && std::any_of(row + i, row + i + Codec::group,
+                                                  [](float value) { return !std::isfinite(value); })) {
+                        statuses[b] = EncodeStatus::nonfinite;
+                        return;
+                    }
+                    statuses[b] = codec.begin(row + i, opt.importance ? opt.importance + i : nullptr, st);
+                    if (statuses[b] != EncodeStatus::ok) return;
                 }
                 const int code = codec.code(row[i], st);
                 q[r * Codec::elements + in_block] = code;
                 const float dq = codec.value(code, st);
                 if (opt.dequant) opt.dequant[(r0 + r) * k + i] = dq;
                 err[r] = opt.factor ? (row[i] - dq) / opt.factor[i * k + i] : 0.0F;
+                if (!std::isfinite(dq) || !std::isfinite(err[r])) {
+                    statuses[b] = EncodeStatus::nonfinite;
+                    return;
+                }
                 if (in_block + 1U == Codec::elements)
                     codec.pack(q.data() + r * Codec::elements, states.data() + r * Codec::groups,
                                out + (r0 + r) * row_bytes + (i / Codec::elements) * Codec::bytes);
@@ -280,8 +317,8 @@ inline EncodeStatus encode_rows_with(const Codec& codec, const float* w, std::si
             }
         }
     });
-    for (const auto f : failed)
-        if (f) return {EncodeStatus::scale_overflow};
+    for (const auto status : statuses)
+        if (status != EncodeStatus::ok) return {status};
     return {EncodeStatus::ok};
 }
 

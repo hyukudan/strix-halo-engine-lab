@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <new>
 #include <random>
 #include <string>
@@ -555,6 +556,34 @@ void check_parallel_errors() {
     check(ran >= 48U, "other slices ran to completion");
 }
 
+void check_nonfinite_feedback() {
+    using Storage = wei::Q4G64Storage;
+    constexpr std::size_t k = Storage::elements;
+    std::vector<float> w(k, 0.01F), factor(k * k, 0.0F);
+    std::vector<std::uint8_t> packed(Storage::bytes);
+    for (std::size_t i = 0; i < k; ++i) factor[i * k + i] = 1.0F;
+    gq::Options opts;
+    opts.factor = factor.data();
+    factor[0] = 0.0F;
+    check(gq::encode_rows<Storage>(w.data(), 1U, k, packed.data(), opts).code == wei::lowbit::EncodeStatus::nonfinite,
+          "zero pivot rejected before coding");
+    factor[0] = std::numeric_limits<float>::min();
+    factor[1] = std::numeric_limits<float>::max();
+    w[0] = 0.003F;
+    check(gq::encode_rows<Storage>(w.data(), 1U, k, packed.data(), opts).code == wei::lowbit::EncodeStatus::nonfinite,
+          "feedback overflow rejected before converting it to a code");
+    std::vector<std::uint8_t> dead;
+    for (const auto damp : {-0.25, std::numeric_limits<double>::infinity()}) {
+        bool rejected = false;
+        try {
+            (void)gq::inverse_factor({1.0}, 1U, damp, dead);
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        check(rejected, "invalid damping rejected before factorization");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -565,6 +594,7 @@ int main() {
     check_add_atomic();
     check_empty_inputs();
     check_parallel_errors();
+    check_nonfinite_feedback();
     check_storage<wei::Q4G64Storage>("q4_g64");
     check_storage<wei::Q6G64Storage>("q6_g64");
     if (failures) {

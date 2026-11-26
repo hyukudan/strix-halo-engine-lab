@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -154,6 +155,7 @@ Args parse(int argc, char** argv) {
             a.rules.push_back({v.substr(0, eq), parse_format(v.substr(eq + 1U))});
         } else throw std::invalid_argument("unknown argument " + std::string(arg));
     }
+    if (!std::isfinite(a.damp) || a.damp < 0.0) throw std::invalid_argument("--damp must be finite and nonnegative");
     if (a.model.empty()) throw std::invalid_argument("need --model");
     if (!a.probe.empty()) {
         if (!a.plan.empty() || !a.rules.empty() || !a.out.empty() || !a.dequant_out.empty() || !a.report.empty() ||
@@ -538,8 +540,12 @@ int main(int argc, char** argv) {
                         factor = gq::inverse_factor(input.h, input.width, args.damp, dead, args.threads);
                     }
                     std::vector<float> importance(input.width);
-                    for (std::size_t i = 0; i < input.width; ++i)
-                        importance[i] = static_cast<float>(input.diagonal(i));
+                    for (std::size_t i = 0; i < input.width; ++i) {
+                        const double energy = input.diagonal(i);
+                        if (energy > std::numeric_limits<float>::max())
+                            throw std::runtime_error("calibration importance does not fit FP32 for " + input.name);
+                        importance[i] = static_cast<float>(energy);
+                    }
                     for (auto* item : inputs) process(*item, &input, held, importance, factor, dead);
                 }
             }
