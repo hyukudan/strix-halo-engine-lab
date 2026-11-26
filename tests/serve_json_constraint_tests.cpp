@@ -51,6 +51,17 @@ void operator delete(void* p) noexcept { allocation_failure::deallocate(p); }
 void operator delete[](void* p) noexcept { allocation_failure::deallocate(p); }
 void operator delete(void* p, std::size_t) noexcept { allocation_failure::deallocate(p); }
 void operator delete[](void* p, std::size_t) noexcept { allocation_failure::deallocate(p); }
+// The nothrow forms (std::stable_sort's temporary buffer, for one) must come from the same replacement as the delete
+// above; left to the runtime, a sanitizer serves them from its own heap and reports the free as mismatched. They forward
+// to the replaced new exactly as the library default does, so the allocation sweep sees the same sequence.
+void* operator new(std::size_t bytes, const std::nothrow_t&) noexcept {
+    try { return ::operator new(bytes); } catch (...) { return nullptr; }
+}
+void* operator new[](std::size_t bytes, const std::nothrow_t&) noexcept {
+    try { return ::operator new(bytes); } catch (...) { return nullptr; }
+}
+void operator delete(void* p, const std::nothrow_t&) noexcept { allocation_failure::deallocate(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { allocation_failure::deallocate(p); }
 
 namespace strix::serve {
 struct ConstraintProgramCacheTestAccess {
@@ -1156,6 +1167,19 @@ void adversarial_compilation() {
     small = {}; small.alternative_expansions = 2;
     measure("alternative-cap", [] { return parse_json(R"({"anyOf":[{"const":1},{"const":2}]})"); }, true, small);
 }
+// Peak process RSS is not a bound under AddressSanitizer (shadow memory and quarantine count in it); the compilation
+// steps and the time still bound the expansion there.
+#if defined(__SANITIZE_ADDRESS__)
+constexpr bool kAddressSanitizer = true;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+constexpr bool kAddressSanitizer = true;
+#else
+constexpr bool kAddressSanitizer = false;
+#endif
+#else
+constexpr bool kAddressSanitizer = false;
+#endif
 void branching_expansion() {
     for (const unsigned levels : {11U, 12U, 20U}) {
         Json defs = Json::object();
@@ -1180,7 +1204,8 @@ void branching_expansion() {
         check(accepts(p, "true") && accepts(p, "{}"), "branching expansion preserves language");
         check(stats.expansion_recursion_high_water == 1, "constant native expansion recursion");
         check(stats.expansion_stack_high_water == 1, "single-alternative work stack bounded");
-        check(stats.compilation_steps < 20000 && ms < 2000 && rss < 65536, "branching expansion bounded work/time/memory");
+        check(stats.compilation_steps < 20000 && ms < 2000 && (kAddressSanitizer || rss < 65536),
+              "branching expansion bounded work/time/memory");
         std::cout << "branching expansion levels=" << levels << " schema_bytes=" << spec.dump().size()
                   << " ms=" << ms << " peak_rss_kib=" << rss
                   << " recursion_high_water=" << stats.expansion_recursion_high_water
