@@ -1,6 +1,8 @@
 #pragma once
 
+#include "native_launch_contract.hpp"
 #include "executor_cuda.hpp"
+#include "strix/exec/graph_runner.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -12,6 +14,19 @@ namespace strix::exec::cuda_detail {
 enum class GraphAction { eager, capture, rebind, replay };
 
 inline const CudaProgramBinding empty_binding{};
+
+inline bool requires_capture(const Program& program) {
+    return !program.launches.empty() && program.launches.front().chain_identity.starts_with(detail::cuda_capture_recipe);
+}
+
+inline bool strict_capture(const Program& program, const CudaProgramBinding& binding, bool check_all) {
+    return check_all || binding.readback == CudaReadback::resident || requires_capture(program);
+}
+
+inline void validate_capture_grid(const Grid& observed, const BoundLaunch& launch) {
+    if (observed != launch.grid)
+        throw std::runtime_error("captured CUDA geometry differs from bound grid: " + launch.identity);
+}
 
 inline void validate_step_width(const ProgramKey& key) {
     if ((key.phase == Phase::decode || key.phase == Phase::verify) && !session::is_step_replay_width(key.rows))
@@ -26,15 +41,10 @@ inline void validate_step_feed(std::uint32_t valid, std::uint32_t feed, std::uin
 // Validate the block that the executor uploads to its stable device address.
 // The width includes masked rows, even when only a subset of slots is active.
 inline void validate_x3_input(const Program& program, const StepBlock& input, std::uint32_t steps) {
-    if (input.h.rows != program.key.rows || !session::is_step_replay_width(input.h.rows) ||
-        input.h.stop_count > kStepMaxStops || (input.h.stop_count != 0 && step_stop_address(input.h) == 0))
+    if (input.h.rows != program.key.rows || !session::is_step_replay_width(input.h.rows))
         throw std::invalid_argument("invalid CUDA X3 step header");
-    std::uint32_t valid = 0;
-    for (std::uint32_t i = 0; i < input.h.rows; ++i) {
-        if ((step_row(input, i).flags & step_valid) != 0) valid |= std::uint32_t{1} << i;
-    }
-    if (valid != input.h.valid_mask) throw std::invalid_argument("invalid CUDA X3 step valid mask");
-    validate_step_feed(valid, input.h.feed_mask, steps);
+    validate_graph_rows(input);
+    validate_step_feed(input.h.valid_mask, input.h.feed_mask, steps);
 }
 
 [[nodiscard]] inline CudaNodeKind node_kind(const CudaProgramBinding& binding, std::size_t index) {

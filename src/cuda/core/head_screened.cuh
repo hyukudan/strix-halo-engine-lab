@@ -385,7 +385,8 @@ inline unsigned pass1_lanes(unsigned width, unsigned lanes, int device = 0) {
 // ---- The five stages (one kernel launch each). `a` must satisfy plan::launch_valid; enqueue() checks it once. ----
 inline cudaError_t launch_prep(const Launch& a, cudaStream_t stream) {
     const auto p = detail::parts(a);
-    detail::prep_kernel<0> <<<a.lanes, 256, 0, stream>>>(a.x, p.strides.x, a.head.width, a.bound, a.plane.max_amplitude,
+    const auto geometry = plan::lane_grid(a);
+    detail::prep_kernel<0><<<geometry.grid<dim3>(), geometry.block<dim3>(), 0, stream>>>(a.x, p.strides.x, a.head.width, a.bound, a.plane.max_amplitude,
                                                      p.state, p.key2);
     return cudaGetLastError();
 }
@@ -415,23 +416,25 @@ inline cudaError_t launch_pass1(const Launch& a, cudaStream_t stream) {
 
 inline cudaError_t launch_compact(const Launch& a, cudaStream_t stream) {
     const auto p = detail::parts(a);
-    const dim3 grid(a.grids.compact, a.lanes);
+    const auto geometry = plan::compact_grid(a);
+    const auto grid = geometry.grid<dim3>(), block = geometry.block<dim3>();
     if (a.runner_up)
-        detail::compact_kernel<true><<<grid, plan::kCompactThreads, 0, stream>>>(
+        detail::compact_kernel<true><<<grid, block, 0, stream>>>(
             p.upper, a.head.rows, a.head.softcap, a.capacity, p.strides, p.state, p.ids, p.key2);
     else
-        detail::compact_kernel<false><<<grid, plan::kCompactThreads, 0, stream>>>(
+        detail::compact_kernel<false><<<grid, block, 0, stream>>>(
             p.upper, a.head.rows, a.head.softcap, a.capacity, p.strides, p.state, p.ids, p.key2);
     return cudaGetLastError();
 }
 
 inline cudaError_t launch_pass2(const Launch& a, cudaStream_t stream) {
     const auto p = detail::parts(a);
+    const auto geometry = plan::pass2_grid(a);
     const ::strix::cuda_core::MappedLaneStrides lanes{p.strides.x, p.strides.y, p.strides.ids,
                                                       sizeof(State) / sizeof(std::uint32_t)};
     return ::strix::cuda_core::dense_bf16_fp32_r1_mapped_epilogue(
         a.head.weights, a.x, p.y, p.ids, &p.state->count, a.capacity, a.head.rows, a.head.width,
-        ::strix::cuda_core::Bf16Fp32Store::softcap, a.head.softcap, a.grids.pass2, stream, a.lanes, lanes);
+        ::strix::cuda_core::Bf16Fp32Store::softcap, a.head.softcap, geometry.blocks[0], stream, geometry.blocks[1], lanes);
 }
 
 // emit(lane, ha::Pick) runs on the device once per lane (head_argmax Emit contract, the engine's adapter); the Pick's
@@ -440,7 +443,7 @@ template <class Emit>
 cudaError_t launch_pick(const Launch& a, Emit emit, cudaStream_t stream) {
     const auto p = detail::parts(a);
     detail::pick_kernel<Emit, ha::Pick>
-        <<<a.lanes, 256, 0, stream>>>(p.y, p.ids, p.state, a.head.rows, a.capacity, p.strides, emit);
+        <<<plan::lane_grid(a).grid<dim3>(), plan::lane_grid(a).block<dim3>(), 0, stream>>>(p.y, p.ids, p.state, a.head.rows, a.capacity, p.strides, emit);
     return cudaGetLastError();
 }
 
@@ -451,7 +454,7 @@ cudaError_t launch_pick2(const Launch& a, Emit emit, cudaStream_t stream) {
     if (!a.runner_up) return cudaErrorInvalidValue;
     const auto p = detail::parts(a);
     detail::pick_kernel<Emit, ha::Pick2>
-        <<<a.lanes, 256, 0, stream>>>(p.y, p.ids, p.state, a.head.rows, a.capacity, p.strides, emit);
+        <<<plan::lane_grid(a).grid<dim3>(), plan::lane_grid(a).block<dim3>(), 0, stream>>>(p.y, p.ids, p.state, a.head.rows, a.capacity, p.strides, emit);
     return cudaGetLastError();
 }
 

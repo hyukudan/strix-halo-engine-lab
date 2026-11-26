@@ -153,14 +153,16 @@ __global__ __launch_bounds__(kTop * kWarp) void down_combine(Args args) {
 template <packed::MatrixFormat Format>
 inline cudaError_t launch_gate_up(const Args& args, cudaStream_t stream) {
     if (!fits<Format, kTop>(args)) return cudaErrorInvalidValue;
-    gate_up<Format><<<dim3(gate_blocks(args.intermediate), kTop), kGateWarps * kWarp, 0, stream>>>(args);
+    const auto shape = gate_up_launch(args.intermediate);
+    gate_up<Format><<<shape.template grid<dim3>(), shape.template block<dim3>(), shape.shared_bytes, stream>>>(args);
     return cudaGetLastError();
 }
 
 template <packed::MatrixFormat Format>
 inline cudaError_t launch_down_combine(const Args& args, cudaStream_t stream) {
     if (!fits<Format, kTop>(args)) return cudaErrorInvalidValue;
-    down_combine<Format><<<down_blocks(args.hidden), kTop * kWarp, 0, stream>>>(args);
+    const auto shape = down_combine_launch(args.hidden);
+    down_combine<Format><<<shape.template grid<dim3>(), shape.template block<dim3>(), shape.shared_bytes, stream>>>(args);
     return cudaGetLastError();
 }
 

@@ -1,3 +1,4 @@
+#include "strix/device/graph_inspection.hpp"
 #include "strix/weight/admission.hpp"
 // CUDA Qwen prefill driver (see include/strix/cuda/qwen_prefill.hpp): model upload, per-block step loop in the HIP
 // step order, node state export. The arithmetic lives in the family libraries (qwen_hc, qwen_dense, qwen_gdn, qwen_qsa,
@@ -2567,7 +2568,7 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
                     cudaGraph_t graph = nullptr;
                     ck(cudaStreamEndCapture(m.stream, &graph), "end capture");
                     cudaGraphExec_t exec = nullptr;
-                    const auto st = cudaGraphInstantiate(&exec, graph, 0);
+                    const auto st = ::strix::device::native::instantiate_segment_graph(&exec, graph, 0);
                     cudaGraphDestroy(graph);
                     ck(st, "graph instantiate");
                     g.seg.push_back(exec);
@@ -3394,7 +3395,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
     if (capture) {
         cudaGraph_t graph = nullptr;
         ck(cudaStreamEndCapture(m.stream, &graph), "end draft capture");
-        const auto st = cudaGraphInstantiate(&dexec, graph, 0);
+        const auto st = ::strix::device::native::instantiate_segment_graph(&dexec, graph, 0);
         cudaGraphDestroy(graph);
         ck(st, "draft graph instantiate");
         while (m.draft_graphs.size() >= 64) {

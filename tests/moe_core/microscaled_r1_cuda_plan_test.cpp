@@ -1,3 +1,4 @@
+#include "cuda/core/mma_tile.cuh"
 #include "moe_core/microscaled_r1_cuda_plan.hpp"
 #include "moe_core/microscaled_r1_pipe_plan.hpp"
 #include "moe_core/microscaled_r1.hpp"
@@ -46,6 +47,26 @@ constexpr std::uint64_t matrix_bytes(unsigned rows, unsigned width, unsigned val
 } // namespace
 
 int main() {
+    using Geometry = strix::device::LaunchGeometry;
+    static_assert(r1::gate_up_launch(1152U, 8U, 8U) == Geometry{{72, 64, 1}, {256, 1, 1}, 0});
+    static_assert(r1::down_combine_launch(2304U, 8U) == Geometry{{576, 8, 1}, {256, 1, 1}, 0});
+    static_assert(r1::pipe::gate_up_launch(1152U) == Geometry{{288, 8, 1}, {128, 1, 1}, 0});
+    static_assert(r1::pipe::down_combine_launch(2304U) == Geometry{{1152, 1, 1}, {256, 1, 1}, 0});
+    static_assert(strix::moe_core::grouped_rows::row_launch(257, 65536) == Geometry{{2, 65535, 1}, {256, 1, 1}, 0});
+    namespace mma = strix::cuda::core::mma::microscaled;
+    mma::view::Args grouped{};
+    grouped.inputs = 2304;
+    grouped.outputs = 1152;
+    grouped.count = 8;
+    grouped.max_tile_rows = 1;
+    grouped.schedule = mma::view::Schedule::automatic;
+    const auto decode = mma::choose_projection(grouped, true, [] { return 0U; });
+    if (decode.kind != mma::ProjectionKind::decode || decode.geometry.blocks[2] != grouped.count) return 2;
+    grouped.schedule = mma::view::Schedule::tall;
+    const auto tall = mma::choose_projection(grouped, true, [] { return 128U * 1024U; });
+    if (tall.kind != mma::ProjectionKind::tall || tall.geometry.blocks[0] != grouped.outputs / mma::tall::kOutputs ||
+        tall.geometry.shared_bytes == 0 || tall.geometry == decode.geometry) return 3;
+    if (mma::choose_projection(grouped, true, [] { return 0U; }).kind != mma::ProjectionKind::unsupported) return 4;
     using Fp4 = r1::CudaRun<1U, 16U>;
     using Fp8 = r1::CudaRun<2U, 32U>;
     static_assert(Fp4::kRunBytes == 128U && Fp8::kRunBytes == 128U);

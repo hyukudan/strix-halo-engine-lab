@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/device/decode_geometry.hpp"
 #include <algorithm>
 #include <cmath>
 #include <concepts>
@@ -722,13 +723,18 @@ inline Error launch_pointwise(std::size_t elements, Transform transform, Stream 
 }  // namespace detail
 
 // An input may alias its output only for an identical per-row layout.
+inline device::LaunchGeometry normalize_geometry(unsigned rows, unsigned operands) {
+    return device::decode_geometry::row_groups(std::min(rows, detail::kGridLimit), operands, detail::kThreads);
+}
+
 inline Error launch_normalize(NormalizeArgs args, Stream stream) {
     if (args.rows == 0U) return success;
     if (!fits(args)) return invalid_value;
     if (args.input_stride == 0U) args.input_stride = args.width;
     if (args.output_stride == 0U) args.output_stride = args.width;
     if (args.input == args.output && args.input_stride != args.output_stride) return invalid_value;
-    detail::normalize<<<std::min(args.rows, detail::kGridLimit), detail::kThreads, 0, stream>>>(args);
+    const auto geometry = normalize_geometry(args.rows, 1);
+    detail::normalize<<<geometry.grid<dim3>(), geometry.block<dim3>(), 0, stream>>>(args);
     return detail::last_error();
 }
 
@@ -743,8 +749,8 @@ inline Error launch_normalize_pair(NormalizePairArgs pair, Stream stream) {
         if (args->output_stride == 0U) args->output_stride = args->width;
         if (args->input == args->output && args->input_stride != args->output_stride) return invalid_value;
     }
-    const dim3 grid(std::min(first.rows, detail::kGridLimit), 2U);
-    detail::normalize_pair<<<grid, detail::kThreads, 0, stream>>>(first, second);
+    const auto geometry = normalize_geometry(first.rows, 2);
+    detail::normalize_pair<<<geometry.grid<dim3>(), geometry.block<dim3>(), 0, stream>>>(first, second);
     return detail::last_error();
 }
 #endif

@@ -1,5 +1,8 @@
 #pragma once
 
+#include "strix/device/launch_geometry.hpp"
+
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 
@@ -12,7 +15,6 @@
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #include "strix/weight/formats/scalar_float.hpp"
 
-#include <algorithm>
 #include <limits>
 #endif
 
@@ -62,11 +64,15 @@ struct CombineImageArgs {
 };
 #endif
 
-#if defined(__HIPCC__) || defined(__CUDACC__)
-namespace detail {
-
 inline constexpr unsigned kThreads = 256U;
 inline constexpr unsigned kGridRows = 65535U;
+
+constexpr device::LaunchGeometry row_launch(unsigned width, unsigned rows) {
+    return {{(width - 1U) / kThreads + 1U, std::min(rows, kGridRows), 1}, {kThreads, 1, 1}, 0};
+}
+
+#if defined(__HIPCC__) || defined(__CUDACC__)
+namespace detail {
 
 #if defined(__HIPCC__)
 using Error = hipError_t;
@@ -164,10 +170,6 @@ static __global__ __launch_bounds__(kThreads) void combine_kernel(typename Opera
     }
 }
 
-inline dim3 grid(unsigned width, unsigned rows) {
-    return dim3((width - 1U) / kThreads + 1U, std::min(rows, kGridRows));
-}
-
 }  // namespace detail
 
 // The validated grouping plan supplies assignment_rows and an optional
@@ -179,7 +181,8 @@ inline detail::Error gather(const GatherArgs& args, detail::Stream stream) {
         args.input_stride < args.width || args.grouped_stride < args.width ||
         args.assignments > max_elements / args.input_stride ||
         args.assignments > max_elements / args.grouped_stride) return detail::invalid;
-    detail::gather_kernel<<<detail::grid(args.width, args.assignments), detail::kThreads, 0, stream>>>(args);
+    const auto shape = row_launch(args.width, args.assignments);
+    detail::gather_kernel<<<shape.grid<dim3>(), shape.block<dim3>(), shape.shared_bytes, stream>>>(args);
     return detail::launch_error();
 }
 
@@ -193,7 +196,8 @@ inline detail::Error token_rows(const GatherArgs& args, detail::Stream stream) {
     if (!args.input || !args.grouped || args.width == 0U || args.input_stride < args.width ||
         args.grouped_stride < args.width || args.assignments > max_elements / args.input_stride ||
         args.assignments > max_elements / args.grouped_stride) return detail::invalid;
-    detail::token_rows_kernel<<<detail::grid(args.width, args.assignments), detail::kThreads, 0, stream>>>(args);
+    const auto shape = row_launch(args.width, args.assignments);
+    detail::token_rows_kernel<<<shape.grid<dim3>(), shape.block<dim3>(), shape.shared_bytes, stream>>>(args);
     return detail::launch_error();
 }
 #endif
@@ -209,7 +213,8 @@ inline detail::Error combine(const CombineArgs& args, detail::Stream stream) {
         args.rows > std::numeric_limits<std::uint32_t>::max() / args.top_k ||
         args.rows > max_elements / args.top_k / args.grouped_stride ||
         args.rows > max_elements / args.output_stride) return detail::invalid;
-    detail::combine_kernel<detail::Fp32Operand><<<detail::grid(args.width, args.rows), detail::kThreads, 0, stream>>>(args);
+    const auto shape = row_launch(args.width, args.rows);
+    detail::combine_kernel<detail::Fp32Operand><<<shape.grid<dim3>(), shape.block<dim3>(), shape.shared_bytes, stream>>>(args);
     return detail::launch_error();
 }
 
@@ -224,7 +229,8 @@ inline detail::Error combine_image(const CombineImageArgs& args, detail::Stream 
         args.output_stride < args.width || args.rows > std::numeric_limits<std::uint32_t>::max() / args.top_k ||
         args.rows > max_elements / args.top_k / args.grouped_stride ||
         args.rows > max_elements / args.output_stride) return detail::invalid;
-    detail::combine_kernel<detail::ImageOperand><<<detail::grid(args.width, args.rows), detail::kThreads, 0, stream>>>(args);
+    const auto shape = row_launch(args.width, args.rows);
+    detail::combine_kernel<detail::ImageOperand><<<shape.grid<dim3>(), shape.block<dim3>(), shape.shared_bytes, stream>>>(args);
     return detail::launch_error();
 }
 #endif

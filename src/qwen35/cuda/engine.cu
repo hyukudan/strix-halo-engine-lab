@@ -1,5 +1,6 @@
 // Qwen3.8-27B dense family (`qwen35`) CUDA engine over the shared cuda_core. See include/strix/qwen35/cuda_engine.hpp.
 // Home: specific (model layer composition); all arithmetic is in src/cuda_core (shared).
+#include "strix/device/graph_inspection.hpp"
 #include "strix/qwen35/cuda_engine.hpp"
 
 #include <algorithm>
@@ -916,7 +917,7 @@ struct CudaEngine::Impl {
                 }
                 CK(cudaStreamEndCapture(s, g.put()));
                 Graph gr;
-                CK(cudaGraphInstantiate(gr.exec.put(), g.get(), 0));
+                CK(::strix::device::native::instantiate_segment_graph(gr.exec.put(), g.get(), 0));
                 std::size_t n = 0;
                 CK(cudaGraphGetNodes(g.get(), nullptr, &n));
                 gr.nodes = n;
@@ -1188,7 +1189,7 @@ struct CudaEngine::Impl {
                 }
                 CK(cudaStreamEndCapture(s, gr.put()));
                 Graph ge;
-                CK(cudaGraphInstantiate(ge.exec.put(), gr.get(), 0));
+                CK(::strix::device::native::instantiate_segment_graph(ge.exec.put(), gr.get(), 0));
                 std::size_t nn = 0;
                 CK(cudaGraphGetNodes(gr.get(), nullptr, &nn));
                 ge.nodes = nn;
@@ -1952,7 +1953,7 @@ struct CudaEngine::Impl {
         }
         CK(cudaStreamEndCapture(s, g.put()));
         Graph gr;
-        CK(cudaGraphInstantiate(gr.exec.put(), g.get(), 0));
+        CK(::strix::device::native::instantiate_segment_graph(gr.exec.put(), g.get(), 0));
         std::size_t n = 0;
         CK(cudaGraphGetNodes(g.get(), nullptr, &n));
         gr.nodes = n;

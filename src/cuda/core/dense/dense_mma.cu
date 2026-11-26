@@ -5,6 +5,7 @@
 // ascending warp order. q8_0: int8 values are exact in bf16; each 32-block partial starts from zero and is folded into the
 // running sum as tot = tot + fl(d * part), blocks ascending per warp. Thread-level k permutation: thread q of a quad owns 8
 // consecutive k of the 32-block (same permutation for A and B, so the sum is unchanged).
+#include "strix/device/decode_geometry.hpp"
 #include "dense_mma.hpp"
 #include "rows_bf16_narrow.cuh"
 #include "core/dense_bf16_narrow_plan.hpp"
@@ -283,7 +284,8 @@ __global__ void __launch_bounds__(256) mma_kernel(const __grid_constant__ MmaGro
 
 template <WeightFormat F>
 cudaError_t grouped_by_nt(const MmaGroupArgs& args, std::uint32_t row_count, cudaStream_t stream) {
-    const dim3 grid(args.tiles.total()), block(256);
+    const device::LaunchGeometry geometry = device::decode_geometry::dense_mma(args.tiles.total());
+    const auto grid = geometry.grid<dim3>(), block = geometry.block<dim3>();
     if (row_count <= 8) return launch_pdl(mma_kernel<F, 1>, grid, block, stream, args, row_count);
     if (row_count <= 16) return launch_pdl(mma_kernel<F, 2>, grid, block, stream, args, row_count);
     if (row_count <= 24) return launch_pdl(mma_kernel<F, 3>, grid, block, stream, args, row_count);
@@ -292,7 +294,8 @@ cudaError_t grouped_by_nt(const MmaGroupArgs& args, std::uint32_t row_count, cud
 
 template <WeightFormat F, int NT, int TERMS, bool FUSED, bool RoundBf16 = false>
 cudaError_t go(const MmaCall& c, const MmaArgs& ma, std::uint32_t tiles, cudaStream_t s) {
-    return launch_pdl(mma_kernel<F, NT, TERMS, FUSED, RoundBf16>, dim3(tiles), dim3(256), s, ma, c.w1, c.x, c.residual, c.in, c.rows);
+    const device::LaunchGeometry geometry = device::decode_geometry::dense_mma(tiles);
+    return launch_pdl(mma_kernel<F, NT, TERMS, FUSED, RoundBf16>, geometry.grid<dim3>(), geometry.block<dim3>(), s, ma, c.w1, c.x, c.residual, c.in, c.rows);
 }
 template <WeightFormat F, int TERMS, bool FUSED, bool RoundBf16 = false>
 cudaError_t by_nt(const MmaCall& c, const MmaArgs& ma, std::uint32_t tiles, cudaStream_t s) {
@@ -318,7 +321,7 @@ static cudaError_t launch_mma(const MmaCall& c, cudaStream_t s) {
         ma.w[j] = c.w[j];
         ma.y[j] = c.y[j];
         ma.out[j] = c.out[j];
-        tiles += c.out[j] / 16;
+        tiles += c.out[j] / core::rows::kTileOut;
         ma.tile_end[j] = tiles;
     }
     for (int j = c.n; j < kMmaMaxMulti; ++j) ma.tile_end[j] = tiles;
@@ -399,15 +402,15 @@ cudaError_t dense_bf16_mma3_rows_round(const DenseWeight* ws, float* const* ys, 
 
 cudaError_t dense_bf16_mma3_r1_output_split(const DenseWeight& weight, float* output,
                                            const float* input, cudaStream_t stream) {
-    const auto blocks = core::bf16_narrow_blocks(weight.in, weight.out, 32U, 2U * kBf16NarrowOutputs);
+    const auto geometry = bf16_narrow_geometry(weight.in, weight.out);
     const auto aligned = [](const void* p, std::uintptr_t bytes) {
         return p && reinterpret_cast<std::uintptr_t>(p) % bytes == 0U;
     };
-    if (blocks == 0U || weight.format != WeightFormat::bf16 || !aligned(weight.data, 16U) ||
+    if (geometry.blocks[0] == 0U || weight.format != WeightFormat::bf16 || !aligned(weight.data, 16U) ||
         !aligned(input, 16U) || !aligned(output, alignof(float)) || output == input ||
         weight.out > static_cast<std::size_t>(-1) / sizeof(std::uint16_t) / weight.in)
         return cudaErrorInvalidValue;
-    return launch_pdl(mma3_r1_output_split, dim3(blocks), dim3(kBf16NarrowThreads), stream,
+    return launch_pdl(mma3_r1_output_split, geometry.grid<dim3>(), geometry.block<dim3>(), stream,
                       weight.data, weight.in, input, output);
 }
 
@@ -427,8 +430,8 @@ cudaError_t dense_bf16_mma3_step(const float* input, unsigned in,
     for (std::size_t i = projections.size(); i < kMmaMaxMulti; ++i) args.tile_end[i] = tiles;
     return cuda::core::dispatch_step_rows(grid.y, [&]<unsigned Width> {
         const cuda::core::StepRows<Width> binding{descriptor};
-        if (round) mma_step_kernel<Width, true><<<grid, 256, 0, stream>>>(args, input, in, binding);
-        else mma_step_kernel<Width, false><<<grid, 256, 0, stream>>>(args, input, in, binding);
+        if (round) mma_step_kernel<Width, true><<<grid, device::decode_geometry::row_threads, 0, stream>>>(args, input, in, binding);
+        else mma_step_kernel<Width, false><<<grid, device::decode_geometry::row_threads, 0, stream>>>(args, input, in, binding);
         return cudaGetLastError();
     });
 }

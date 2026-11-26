@@ -1,4 +1,5 @@
 // NeoX rotate-half RoPE over the first rotary_dim dims. See rope.hpp.
+#include "strix/device/decode_geometry.hpp"
 #include "strix/cuda_core/rope.hpp"
 
 #include "../common.cuh"
@@ -28,7 +29,8 @@ __global__ void rope_kernel(float* x, GroupedView v, std::uint32_t half, const f
 cudaError_t rope_apply(float* x, const GroupedView& view, std::uint32_t rotary_dim, const float* cos_table,
                        const float* sin_table, const std::uint32_t* pos0, cudaStream_t stream, const RowMap& rm) {
     if (rotary_dim == 0 || rotary_dim % 2 != 0 || rotary_dim > view.n) return cudaErrorInvalidValue;
-    return launch_pdl(rope_kernel, dim3(view.groups, view.rows), dim3(32), stream, x, view, rotary_dim / 2, cos_table, sin_table, pos0, rm);
+    const device::LaunchGeometry geometry = device::decode_geometry::rotary(view.groups, view.rows);
+    return launch_pdl(rope_kernel, geometry.grid<dim3>(), geometry.block<dim3>(), stream, x, view, rotary_dim / 2, cos_table, sin_table, pos0, rm);
 }
 
 }  // namespace strix::cuda_core

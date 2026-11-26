@@ -6842,3 +6842,26 @@ For example, configure with `-DCMAKE_CUDA_ARCHITECTURES=89-real` and
 for an image matching the current compute capability before an NVFP4 kernel
 can run. Compilation of an image supplies no device quality or timing receipt.
 The shared build rules live in `cmake/StrixCudaArchs.cmake`.
+### Captured decode graph contracts
+The CUDA decode catalog and the native launchers share host geometry plans for the
+covered operator families. Debug and test capture compares a bound kernel's
+grid, block and dynamic shared memory with the native node before installation.
+The physical program also checks command kind, dependencies and node count.
+A device-specific shared-memory budget is part of the transition plan.
+Scalar and width runners share the submission order. They record on a cache
+miss, upload a fresh descriptor on each use and launch exactly once. A
+linear inclusive verify window requires consecutive positions from one slot,
+the declared parent/ancestor chain and matching valid bits. Each window binding
+names its convolution history, tape, tap plane, tape stride and head form.
+Changing a captured destination invalidates that width. A launch error reaches
+the owner because some work may already have been submitted.
+The route resolver matches verification, taps, single-row sampling and sampled
+verification independently. The Inkling CUDA CLI uses those requirements when
+selecting its decoder. The shared CLI also checks the verification interface
+on the loaded decoder before starting forced speculation.
+Host tests exercise two physical bindings over stable fake allocations, replay
+different tokens and positions, move tape storage and compare a partial commit
+with an eager forward walk. Opaque stream capture can inspect native kernels
+and transfer nodes. Checking a kernel against an independent predicted shape
+requires a declared leaf. Device token, logit and state qualification is recorded
+separately for each binding.

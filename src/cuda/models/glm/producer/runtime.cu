@@ -1,4 +1,5 @@
 // CUDA port of project-owned node mHC kernels; retain ascending chains and FP32 nonlinear arithmetic.
+#include "strix/device/graph_inspection.hpp"
 #include "../kda.cuh"
 #include "../mtp.cuh"
 #include "../head.cuh"
@@ -384,6 +385,7 @@ struct GraphTemplate {
             catch(...){cudaStreamEndCapture(stream,&graph);record("graph capture failed");if(graph)cudaGraphDestroy(graph);throw;}
             try{
                 sample("graph capture");
+                ck(::strix::device::native::inspect_segment_graph(graph));
                 bool instantiate=!executable;
                 if(executable){cudaGraphExecUpdateResultInfo info{};auto status=cudaGraphExecUpdate(executable,graph,&info);instantiate=status!=cudaSuccess||info.result!=cudaGraphExecUpdateSuccess;
                     if(instantiate){cudaGetLastError();sample("graph update failed"); // gated before the replacement

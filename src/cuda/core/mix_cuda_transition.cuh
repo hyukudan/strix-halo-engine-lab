@@ -26,6 +26,7 @@
 // Every global read of the launch precedes the first cluster barrier and every global store follows it, so the add
 // operands may alias the current bank or a raw row (TransitionArgs::fits) across blocks.
 
+#include "strix/device/launch_geometry.hpp"
 #include "mix_cuda_latency.cuh"
 #include "dense/a8_helpers.cuh"
 #include "norms/row_math.cuh"
@@ -267,39 +268,38 @@ inline constexpr std::size_t kTransitionStaticSharedBound =
                      ::strix::core::residual_mix::kMaxQueries * (kTransitionNormLanes / 32U)) +
     2048U;
 
-// The launch plan, device-independent (bindings and host tests use it): every query row staged at entry.
-[[nodiscard]] inline TransitionGrid transition_grid(const ::strix::core::residual_mix::TransitionArgs& args) {
+// Device-independent construction. The budget excludes the kernel's static reservation.
+[[nodiscard]] inline TransitionGrid transition_grid(const ::strix::core::residual_mix::TransitionArgs& args,
+                                                    std::size_t dynamic_budget = static_cast<std::size_t>(-1)) {
     if (!::strix::core::residual_mix::fits(args)) return {};
     const auto plan = transition_plan(args.mix.width, args.mix.bank_count);
     if (plan.tiles == 0U) return {};
-    const auto stage = transition_stage(args.mix.width, args.mix.query_count, args.add.lhs != nullptr,
-                                        static_cast<std::size_t>(-1));
+    const auto stage = transition_stage(args.mix.width, args.mix.query_count, args.add.lhs != nullptr, dynamic_budget);
     if (stage.query_rows == 0U) return {};
     return {detail::kPairedLanes, plan.slices, plan.tiles, stage.query_rows, stage.bytes};
 }
 
-// One cluster of grid.tiles blocks: every image the separate add, readout and norm leaves store, with their bits. A
-// device whose opt-in shared memory cannot hold every query row stages them in batches (transition_stage).
-[[nodiscard]] inline cudaError_t enqueue_transition(const ::strix::core::residual_mix::TransitionArgs& args,
-                                                    cudaStream_t stream) {
-    auto grid = transition_grid(args);
+inline device::LaunchGeometry transition_geometry(const TransitionGrid& grid) {
+    return {{grid.tiles, 1, 1}, {grid.threads, grid.slices, 1}, static_cast<unsigned>(grid.smem)};
+}
+
+inline cudaError_t resolve_transition_grid(const ::strix::core::residual_mix::TransitionArgs& args, TransitionGrid& grid) {
+    grid = transition_grid(args);
     if (grid.slices == 0U) return cudaErrorInvalidValue;
-    if (grid.smem + kTransitionStaticSharedBound > 48U * 1024U) {
-        int device = 0, limit = 0;
-        if (const auto status = cudaGetDevice(&device); status != cudaSuccess) return status;
-        if (const auto status = cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-            status != cudaSuccess)
-            return status;
-        const auto available = static_cast<std::size_t>(limit);
-        if (grid.smem + kTransitionStaticSharedBound > available) {
-            if (available <= kTransitionStaticSharedBound) return cudaErrorInvalidValue;
-            const auto stage = transition_stage(args.mix.width, args.mix.query_count, args.add.lhs != nullptr,
-                                                available - kTransitionStaticSharedBound);
-            if (stage.query_rows == 0U) return cudaErrorInvalidValue;
-            grid.ring = stage.query_rows;
-            grid.smem = stage.bytes;
-        }
-    }
+    if (grid.smem + kTransitionStaticSharedBound <= 48U * 1024U) return cudaSuccess;
+    int ordinal = 0, limit = 0;
+    if (const auto status = cudaGetDevice(&ordinal); status != cudaSuccess) return status;
+    if (const auto status = cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, ordinal);
+        status != cudaSuccess) return status;
+    if (limit <= 0 || static_cast<std::size_t>(limit) <= kTransitionStaticSharedBound) return cudaErrorInvalidValue;
+    grid = transition_grid(args, static_cast<std::size_t>(limit) - kTransitionStaticSharedBound);
+    return grid.slices != 0U ? cudaSuccess : cudaErrorInvalidValue;
+}
+
+// Baked ring depth and shared bytes are applied as one plan. Binding and the
+// enqueue cannot select different ring depths on devices with smaller limits.
+inline cudaError_t enqueue_transition(const ::strix::core::residual_mix::TransitionArgs& args, const TransitionGrid& grid,
+                                      cudaStream_t stream) {
     const auto kernel = args.mix.normalized ? detail::transition_kernel<true> : detail::transition_kernel<false>;
     if (grid.smem + kTransitionStaticSharedBound > 48U * 1024U) {
         if (const auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -307,8 +307,15 @@ inline constexpr std::size_t kTransitionStaticSharedBound =
             status != cudaSuccess)
             return status;
     }
-    return cuda_core::launch_pdl_cluster(kernel, dim3(grid.tiles), dim3(grid.threads, grid.slices), grid.tiles,
-                                         grid.smem, stream, args, grid.ring);
+    const auto geometry = transition_geometry(grid);
+    return cuda_core::launch_pdl_cluster(kernel, geometry.grid<dim3>(), geometry.block<dim3>(), grid.tiles,
+                                         geometry.shared_bytes, stream, args, grid.ring);
+}
+
+inline cudaError_t enqueue_transition(const ::strix::core::residual_mix::TransitionArgs& args, cudaStream_t stream) {
+    TransitionGrid grid{};
+    if (const auto status = resolve_transition_grid(args, grid); status != cudaSuccess) return status;
+    return enqueue_transition(args, grid, stream);
 }
 
 }  // namespace strix::cuda::mix

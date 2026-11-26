@@ -63,8 +63,6 @@ struct EmitGreedy {
     __device__ void masked(unsigned row) const { output[row].status = RowStatus::masked; }
 };
 
-dim3 dimensions(const std::array<unsigned, 3>& axes) { return {axes[0], axes[1], axes[2]}; }
-
 template <Leaf Which, unsigned Width, class Args>
 void thunk(std::span<const std::byte> bytes, const Grid& shape, void* stream_handle) {
     static_assert(std::is_trivially_copyable_v<LaunchArgs<Args>>);
@@ -74,7 +72,7 @@ void thunk(std::span<const std::byte> bytes, const Grid& shape, void* stream_han
     std::memcpy(&launch, bytes.data(), sizeof(launch));
     const auto& a = launch.scalar;
     const StepRows<Width> rows{launch.descriptor};
-    const auto grid = dimensions(shape.blocks), block = dimensions(shape.threads);
+    const auto grid = shape.grid<dim3>(), block = shape.block<dim3>();
     const auto stream = static_cast<cudaStream_t>(stream_handle);
     cudaError_t status = cudaSuccess;
     if constexpr (Which == Leaf::dense_fp32) {

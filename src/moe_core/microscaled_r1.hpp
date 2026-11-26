@@ -1,5 +1,7 @@
 #pragma once
 
+#include "strix/device/launch_geometry.hpp"
+
 #include "core/gemv_rows.hpp"
 #include "moe_core/device_grouped_plan.hpp"
 #include "moe_core/expert_activation.hpp"
@@ -211,6 +213,16 @@ inline constexpr GridLimits kHipGridLimits{0x7FFFFFFFU, 0xFFFFU, 0xFFFFFFFFU};
 inline constexpr GridLimits kCudaGridLimits{0x7FFFFFFFU, 0xFFFFU, std::numeric_limits<std::uint64_t>::max()};
 // Work-items of one CTA: kWavesPerBlock waves of 32 lanes (wave32 HIP, CUDA warps; the devices launch() admits).
 inline constexpr unsigned kBlockThreads = 32U * kWavesPerBlock;
+
+constexpr device::LaunchGeometry gate_up_launch(unsigned intermediate, unsigned rows, unsigned top_k) {
+    const auto grid = gate_up_grid(intermediate, rows, top_k, kGeometry.gate_columns);
+    return {{grid.x, grid.y, 1}, {kBlockThreads, 1, 1}, 0};
+}
+
+constexpr device::LaunchGeometry down_combine_launch(unsigned hidden, unsigned rows) {
+    const auto grid = down_combine_grid(hidden, rows, kGeometry.down_columns);
+    return {{grid.x, grid.y, 1}, {kBlockThreads, 1, 1}, 0};
+}
 STRIX_R1_HD constexpr bool grid_launchable(std::uint64_t x, std::uint64_t y, unsigned threads,
                                            const GridLimits& limits) {
     return x >= 1U && y >= 1U && x <= limits.x && y <= limits.y && x * threads <= limits.axis_work_items &&
@@ -1333,16 +1345,16 @@ inline hipError_t enqueue_gate_up(const Args& args, hipStream_t stream, unsigned
 template <packed::MatrixFormat Format, unsigned TopK, class Entry = EntryComplete>
 inline cudaError_t launch_gate_up(const Args& args, cudaStream_t stream, unsigned rows = 1U) {
     if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits, Grids::gate)) return cudaErrorInvalidValue;
-    const auto grid = gate_up_grid(args.intermediate, rows, TopK, detail::kGateColumns);
-    detail::gate_up<Format, TopK, detail::kGateColumns, Entry><<<dim3(grid.x, grid.y), detail::kThreads, 0, stream>>>(args);
+    const auto shape = gate_up_launch(args.intermediate, rows, TopK);
+    detail::gate_up<Format, TopK, detail::kGateColumns, Entry><<<shape.template grid<dim3>(), shape.template block<dim3>(), shape.shared_bytes, stream>>>(args);
     return cudaGetLastError();
 }
 
 template <packed::MatrixFormat Format, unsigned TopK, class Entry = EntryComplete>
 inline cudaError_t launch_down_combine(const Args& args, cudaStream_t stream, unsigned rows = 1U) {
     if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits, Grids::down)) return cudaErrorInvalidValue;
-    const auto grid = down_combine_grid(args.hidden, rows, detail::kDownColumns);
-    detail::down_combine<Format, TopK, detail::kDownColumns, Entry><<<dim3(grid.x, grid.y), detail::kThreads, 0, stream>>>(args);
+    const auto shape = down_combine_launch(args.hidden, rows);
+    detail::down_combine<Format, TopK, detail::kDownColumns, Entry><<<shape.template grid<dim3>(), shape.template block<dim3>(), shape.shared_bytes, stream>>>(args);
     return cudaGetLastError();
 }
 
@@ -1352,8 +1364,8 @@ inline cudaError_t launch_down_combine_tail(const Args& args, const Tail& tail, 
                                             unsigned rows = 1U) {
     if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits, Grids::down) || !admits_tail(args, tail, rows, TopK))
         return cudaErrorInvalidValue;
-    const auto blocks = down_blocks(args.hidden, detail::kDownColumns);
-    detail::down_combine<Format, TopK, detail::kDownColumns, Entry, Tail><<<dim3(blocks, rows), detail::kThreads, 0, stream>>>(args, tail);
+    const auto shape = down_combine_launch(args.hidden, rows);
+    detail::down_combine<Format, TopK, detail::kDownColumns, Entry, Tail><<<shape.template grid<dim3>(), shape.template block<dim3>(), shape.shared_bytes, stream>>>(args, tail);
     return cudaGetLastError();
 }
 
@@ -1364,9 +1376,9 @@ inline cudaError_t launch_gate_up_routed(const Args& args, const Route& route, c
                                          unsigned rows = 1U) {
     if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits, Grids::gate) || !admits_route<TopK>(args, route, rows))
         return cudaErrorInvalidValue;
-    const auto columns = gate_blocks(args.intermediate, detail::kGateColumns);
+    const auto shape = gate_up_launch(args.intermediate, rows, TopK);
     detail::gate_up<Format, TopK, detail::kGateColumns, Entry, Route>
-        <<<dim3(columns, rows * TopK), detail::kThreads, 0, stream>>>(args, route);
+        <<<shape.template grid<dim3>(), shape.template block<dim3>(), shape.shared_bytes, stream>>>(args, route);
     return cudaGetLastError();
 }
 
@@ -1445,11 +1457,11 @@ inline cudaError_t enqueue_step(const StepArgs& args, cudaStream_t stream) {
     if (!args.step || !fits<Format, TopK>(a) || a.intermediate > limit / Rows / TopK || !grid_ok)
         return cudaErrorInvalidValue;
     if constexpr (GateUp) {
-        const auto grid = gate_up_grid(a.intermediate, Rows, TopK, detail::kGateColumns);
-        detail::gate_up_step<Format, TopK><<<dim3(grid.x, grid.y), detail::kThreads, 0, stream>>>(args);
+        const auto shape = gate_up_launch(a.intermediate, Rows, TopK);
+        detail::gate_up_step<Format, TopK><<<shape.template grid<dim3>(), shape.template block<dim3>(), shape.shared_bytes, stream>>>(args);
     } else {
-        const auto grid = down_combine_grid(a.hidden, Rows, detail::kDownColumns);
-        detail::down_combine_step<Format, TopK><<<dim3(grid.x, grid.y), detail::kThreads, 0, stream>>>(args);
+        const auto shape = down_combine_launch(a.hidden, Rows);
+        detail::down_combine_step<Format, TopK><<<shape.template grid<dim3>(), shape.template block<dim3>(), shape.shared_bytes, stream>>>(args);
     }
     return cudaGetLastError();
 }

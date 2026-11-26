@@ -1,3 +1,4 @@
+#include "strix/device/graph_inspection.hpp"
 #include <hip/hip_runtime.h>
 #include "device.hpp"
 #include "gemma4/kernels/capture_guard.hpp"
@@ -573,7 +574,7 @@ struct DeviceDrafter::Impl {
                 try { enqueue(from, to); } catch (...) { hipGraph_t g0 = nullptr; (void)hipStreamEndCapture(stream, &g0); if (g0) (void)hipGraphDestroy(g0); throw; }
                 checked(hipStreamEndCapture(stream, &sources[from][to]));
                 slot.reset();
-                checked(hipGraphInstantiate(&exec, sources[from][to], nullptr, nullptr, 0));
+                checked(::strix::device::native::instantiate_segment_graph(&exec, sources[from][to], nullptr, nullptr, 0));
                 counters.draft_captures.fetch_add(1);
                 counters.draft_capture_ns.fetch_add(std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - capture_begin).count()));

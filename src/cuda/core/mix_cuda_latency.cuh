@@ -140,7 +140,8 @@ bank_softmax_tiled(const __grid_constant__ Args args) {
     const auto grid = latency_grid(args);
     if (grid.tiles == 0U) return cudaErrorInvalidValue;
     const auto kernel = args.normalized ? detail::bank_softmax_tiled<true> : detail::bank_softmax_tiled<false>;
-    return cuda_core::launch_pdl(kernel, dim3(grid.tiles, grid.queries), dim3(kLatencyBankThreads, grid.banks), stream, args);
+    const auto geometry = latency_geometry(grid);
+    return cuda_core::launch_pdl(kernel, geometry.grid<dim3>(), geometry.block<dim3>(), stream, args);
 }
 
 // The residual readout the shared launch_mix binds (core/residual_mix.hpp): a one-row readout whose shape the tiled
@@ -159,7 +160,8 @@ bank_softmax_tiled(const __grid_constant__ Args args) {
     if (grid.tiles == 0U) return cudaErrorInvalidValue;
     const auto kernel = args.normalized ? detail::bank_softmax_tiled<true, Args, detail::BatchJobs>
                                         : detail::bank_softmax_tiled<false, Args, detail::BatchJobs>;
-    return cuda_core::launch_pdl(kernel, dim3(grid.tiles, grid.queries), dim3(kLatencyBankThreads, grid.banks), stream, args);
+    const auto geometry = latency_geometry(grid);
+    return cuda_core::launch_pdl(kernel, geometry.grid<dim3>(), geometry.block<dim3>(), stream, args);
 }
 
 } // namespace strix::cuda::mix

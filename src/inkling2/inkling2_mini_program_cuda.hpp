@@ -307,11 +307,14 @@ public:
         } else {
             prepare(lowering);
         }
+        // The scalar is a fallback of the host-position thunks. The positional step
+        // kernels read the descriptor, and the finite check never reads the position.
+        const auto host_position = position ? 0U : chunk.first_position;
         const AppendKvBf16 append{prep.key, prep.value, state.kv.keys, state.kv.values, position,
-                                  kQueryHeads, kKvHeads, kHeadWidth, state.kv.slots, chunk.first_position,
+                                  kQueryHeads, kKvHeads, kHeadWidth, state.kv.slots, host_position,
                                   Shape::kScoreScale, state.kv.wrapped};
         const PreparedFlashBf16 flash{prep.query, prep.relative_logits, prep.sinks, state.kv.keys, state.kv.values,
-                                     attended, position, kQueryHeads, kKvHeads, state.kv.slots, chunk.first_position,
+                                     attended, position, kQueryHeads, kKvHeads, state.kv.slots, host_position,
                                      kRelativeExtent, full ? 0U : kSlidingWindow, Shape::kScoreScale, state.kv.wrapped};
         if (mode_.key.program.tap) {
             add_leaf(AppendKvHostBf16{append});
@@ -321,7 +324,7 @@ public:
             add_leaf(flash);
         }
         add_leaf(PreparedFinite{{prep.query, prep.key, prep.value, prep.relative_logits, prep.sinks,
-                                attended, chunk.first_position, 1U}, kQueryHeads, kKvHeads, kHeadWidth,
+                                attended, host_position, 1U}, kQueryHeads, kKvHeads, kHeadWidth,
                                kRelativeExtent, storage_.flags.data() + visit.logical_layer});
         require(attn_core::enqueue_prepared_gqa_output<Shape>(lowering, 1U,
             weights.projection(MiniAttentionProjection::output), attended, prep.gate_logits, gated, output.data()));
@@ -576,7 +579,7 @@ private:
         bool clip(float* row, const std::uint16_t* gain, unsigned, unsigned heads, unsigned width, float threshold,
                   bool position_scale, unsigned first, const std::uint32_t* position = nullptr) const {
             lower.add_leaf(exec::cuda_decode::HeadClipBf16{row, gain, row, position, heads, width,
-                position_scale ? first : 0U, position_scale ? Shape::kPositionFloor : 0U,
+                position_scale && !position ? first : 0U, position_scale ? Shape::kPositionFloor : 0U,
                 Shape::kAttentionEpsilon, threshold, position_scale ? Shape::kPositionAlpha : 0.0F});
             return success;
         }

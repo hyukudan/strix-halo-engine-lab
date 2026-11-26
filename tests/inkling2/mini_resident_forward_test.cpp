@@ -509,14 +509,46 @@ struct TapeBackend : RingBackend {
     // Copies into the bound tape: each (visit, stream) region is recorded once per staged append (a duplicate
     // recording wrote the same bytes twice: one more launch per stream and visit in every verify window).
     std::span<const float> tape_range;
-    std::vector<const float*> tape_writes;
+    struct TapeCopy {
+        MiniConstRows source;
+        MiniMutableRows destination;
+        void replay() const { std::ranges::copy(source, destination.begin()); }
+    };
+    std::vector<TapeCopy> copies;
+    std::size_t next_copy = 0;
+    bool replaying = false;
+    unsigned windows = 0;
+
+    // The fake kernels run the production walk to generate new inputs at each leaf. Keep the
+    // D2D commands from the first capture, including both physical endpoints and their extent.
+    template <class Work>
+    bool try_window_graph(MiniResidentChunk, Work& work, bool taped) {
+        if (!taped || tape_range.empty()) return false;
+        next_copy = 0;
+        replaying = windows != 0U;
+        work();
+        if (next_copy != copies.size() || copies.empty()) throw std::runtime_error("incomplete window tape capture");
+        ++windows;
+        return true;
+    }
     template <class T>
     void copy(std::span<const T> source, std::span<T> output) {
         if constexpr (std::is_same_v<T, float>) {
             const auto* at = output.data();
             if (!output.empty() && !tape_range.empty() && at >= tape_range.data() &&
-                at < tape_range.data() + tape_range.size())
-                tape_writes.push_back(at);
+                at < tape_range.data() + tape_range.size()) {
+                if (!replaying) {
+                    if (std::ranges::any_of(copies, [at](const auto& cmd) { return cmd.destination.data() == at; }))
+                        throw std::runtime_error("duplicate window tape capture");
+                    copies.push_back({source, output});
+                }
+                const auto& captured = copies.at(next_copy++);
+                if (source.data() != captured.source.data() || output.data() != captured.destination.data() ||
+                    source.size() != captured.source.size() || output.size() != captured.destination.size() ||
+                    source.size() != output.size()) throw std::runtime_error("changed window tape binding");
+                captured.replay();
+                return;
+            }
         }
         RingBackend::copy(source, output);
     }
@@ -598,11 +630,8 @@ bool check_convolution_tape_commit() {
     taped.backend.tape_range = taped.tape;
     unsigned replays = 0;
     for (const unsigned keep : {1U, 0U, 3U, 2U, 4U, 1U}) {
-        taped.backend.tape_writes.clear();
+        std::ranges::fill(taped.tape, std::numeric_limits<float>::quiet_NaN());
         taped.append(TapeLane::kRows, true);
-        auto writes = taped.backend.tape_writes;
-        std::ranges::sort(writes);
-        if (writes.empty() || std::ranges::adjacent_find(writes) != writes.end()) return false;
         replayed.append(TapeLane::kRows, true);
         taped.state.commit_staged(taped.backend, keep, [&](unsigned rows) { ++replays; taped.append(rows, false); });
         replayed.state.commit_staged(replayed.backend, keep, [&](unsigned rows) { replayed.append(rows, false); });
@@ -612,7 +641,7 @@ bool check_convolution_tape_commit() {
     // One more row continues identically from the rebuilt histories.
     taped.append(1, false);
     replayed.append(1, false);
-    return replays == 0U && equal_rows(taped.histories, replayed.histories) &&
+    return taped.backend.windows == 6U && replays == 0U && equal_rows(taped.histories, replayed.histories) &&
            equal_rows(std::span(taped.outputs).first(kHiddenWidth), std::span(replayed.outputs).first(kHiddenWidth));
 }
 
@@ -778,7 +807,13 @@ int main() {
     if (!check_draft_tap_frontier()) return 20;
     if (!check_cohort_append()) return 23;
     if (!check_prepared_groups()) return 24;
-    if (!check_convolution_tape_commit()) return 25;
+    try {
+        if (!check_convolution_tape_commit()) return 25;
+    } catch (const std::logic_error&) {
+        return 25;
+    } catch (const std::runtime_error&) {
+        return 25;
+    }
 
     // A failed later prefill chunk must retire the partially committed lane.
     FixtureBackend sequence_backend;

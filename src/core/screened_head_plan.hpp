@@ -4,6 +4,7 @@
 // No HIP or CUDA type appears here: a backend contributes only kernel bodies and its allocator / copy calls
 // (core/hip_screened_head.hpp, cuda/core/head_screened.cuh). The math and the invariant are in core/screened_head.hpp.
 // The rescore trait (end of this file) is the FAST form: exact rows for the largest scores of an approximate head.
+#include "strix/device/decode_geometry.hpp"
 #include "core/byte_range.hpp"
 #include "core/screened_head.hpp"
 #include "strix/env_flags.hpp"
@@ -241,6 +242,16 @@ struct Pass1Grid {
 inline Pass1Grid pass1_grid(const Launch& a) noexcept {
     return {pass1_blocks(a.grids.pass1, a.pass1_resident, pass1_groups(a.lanes, a.pass1_lanes)), kPass1Waves * 32U,
             std::size_t{a.pass1_lanes} * a.head.width * sizeof(float)};
+}
+
+inline device::LaunchGeometry lane_grid(const Launch& launch) {
+    return device::decode_geometry::row_groups(launch.lanes);
+}
+inline device::LaunchGeometry compact_grid(const Launch& launch) {
+    return device::decode_geometry::row_groups(launch.grids.compact, launch.lanes, kCompactThreads);
+}
+inline device::LaunchGeometry pass2_grid(const Launch& launch) {
+    return device::decode_geometry::mapped_dense(launch.grids.pass2, launch.lanes);
 }
 
 constexpr bool pass1_lanes_valid(unsigned per_group, unsigned lanes) noexcept {

@@ -1,3 +1,4 @@
+#include "strix/device/decode_geometry.hpp"
 #include "catalog_cuda_wr1.hpp"
 #include "core/dense_row_plan.hpp"
 #include "strix/core/rows.hpp"
@@ -31,8 +32,7 @@ bool positive(float value) { return value > 0.0F && std::isfinite(value); }
 
 Grid pointwise(std::size_t elements, unsigned rows) {
     require(elements != 0 && elements <= max_floats / rows);
-    return {{static_cast<unsigned>(std::min<std::size_t>((elements - 1U) / 256U + 1U, 65535U)), rows, 1},
-            {256, 1, 1}, 0};
+    return device::decode_geometry::pointwise(elements, rows);
 }
 
 mix::NormalizeArgs normalize(mix::NormalizeArgs args, unsigned rows) {
@@ -98,10 +98,12 @@ KernelBinding Bindings::bind(const Bf16DenseGroup& a) const {
         outputs += p.outputs;
     }
     require(outputs <= std::numeric_limits<unsigned>::max() - 7U);
-    const auto blocks = mma ? outputs / core::rows::kTileOut : (outputs - 1U) / 8U + 1U;
     const auto which = !mma ? Leaf::dense_fp32 : round_bf16 ? Leaf::dense_mma3_round : Leaf::dense_mma3;
     const auto tiles = mma ? rows : rows / core::dense_step_row_tile(rows);
-    return leaf(which, {{static_cast<unsigned>(blocks), tiles, 1}, {256, 1, 1}, 0}, a);
+    const auto total = static_cast<unsigned>(outputs);
+    const auto geometry = mma ? device::decode_geometry::dense_mma(total / core::rows::kTileOut, tiles)
+                              : device::decode_geometry::dense_fma(total, tiles);
+    return leaf(which, geometry, a);
 }
 
 KernelBinding Bindings::bind(const mix::MixArgs& a) const {
@@ -133,7 +135,7 @@ KernelBinding Bindings::bind(const RmsBf16& a) const {
     require(a.input && a.output && a.groups && a.groups <= grid_x_limit && a.width && a.width <= 8192U &&
             a.groups <= std::numeric_limits<unsigned>::max() / a.width &&
             a.groups <= max_floats / rows / a.width && positive(a.epsilon));
-    return leaf(Leaf::rms, {{a.groups, rows, 1}, {256, 1, 1}, 0}, a);
+    return leaf(Leaf::rms, device::decode_geometry::row_groups(a.groups, rows), a);
 }
 
 KernelBinding Bindings::bind(const Bf16RelativeProjection16& a) const {
@@ -149,8 +151,7 @@ KernelBinding Bindings::bind(const HeadClipBf16& a) const {
     require(a.input && a.output && a.heads && a.heads <= grid_x_limit && a.width && a.width <= 256U &&
             a.heads <= max_floats / rows / a.width && positive(a.epsilon) && positive(a.threshold) &&
             (!a.scale_floor || std::isfinite(a.scale_alpha)));
-    const auto threads = a.width <= 32U ? 32U : a.width <= 128U ? 128U : 256U;
-    return leaf(Leaf::clip, {{a.heads, rows, 1}, {threads, 1, 1}, 0}, a);
+    return leaf(Leaf::clip, device::decode_geometry::head_clip(a.heads, rows, a.width), a);
 }
 
 KernelBinding Bindings::bind_partial(const Greedy& a) const {

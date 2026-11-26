@@ -39,6 +39,10 @@ public:
     void fail(std::uint32_t width) noexcept {
         if (const auto at = index(width); at < kWidths) states_[at] = {false, true};
     }
+    // A different baked binding is a new candidate even after a prior capture decline.
+    void invalidate_width(std::uint32_t width) noexcept {
+        if (const auto at = index(width); at < kWidths) states_[at] = {};
+    }
     void invalidate() noexcept {
         for (auto& state : states_) state.ready = false;
     }

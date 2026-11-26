@@ -5,6 +5,7 @@
 // and walks every key tile serially (24 CTAs on 188 SMs for Inkling 2 Mini). Here one CTA = one KV head with its query
 // heads packed (K/V read once per group) x one chunk of <= kMaxSplits chunks; one key per thread for the scores, one
 // dimension pair per thread for P V, everything FP32. Separate translation unit: the prefill kernels are untouched.
+#include "strix/device/decode_geometry.hpp"
 #include "attn_decode.cuh"
 
 #include "common.cuh"
@@ -281,17 +282,17 @@ __global__ void __launch_bounds__(kThreads)
 }
 
 template <unsigned G>
-void launch(dim3 grid, cudaStream_t stream, const AttentionDims& d, const PreparedBf16Flash& prepared, const float* q,
+void launch(const device::LaunchGeometry& geometry, cudaStream_t stream, const AttentionDims& d, const PreparedBf16Flash& prepared, const float* q,
             const __nv_bfloat16* k, const __nv_bfloat16* v, const std::uint32_t* position, float* out,
             std::uint32_t* tickets, float* partials, std::uint32_t capacity) {
-    decode_split_kernel<G><<<grid, kThreads, 0, stream>>>(d, prepared, q, k, v, position, out, tickets, partials, capacity);
+    decode_split_kernel<G><<<geometry.grid<dim3>(), geometry.block<dim3>(), 0, stream>>>(d, prepared, q, k, v, position, out, tickets, partials, capacity);
 }
 
 template <unsigned G>
-void launch_lanes(dim3 grid, cudaStream_t stream, const AttentionDims& d, const PreparedBf16Flash& prepared,
+void launch_lanes(const device::LaunchGeometry& geometry, cudaStream_t stream, const AttentionDims& d, const PreparedBf16Flash& prepared,
                   const float* q, const attn::lanes::LaneBlock& block, float* out, std::uint32_t* tickets,
                   float* partials, const attn_split::SplitLaneLayout& layout) {
-    decode_split_lanes_kernel<G><<<grid, kThreads, 0, stream>>>(d, prepared, q, block, out, tickets, partials, layout);
+    decode_split_lanes_kernel<G><<<geometry.grid<dim3>(), geometry.block<dim3>(), 0, stream>>>(d, prepared, q, block, out, tickets, partials, layout);
 }
 
 attn_split::SplitLaneLayout lane_layout(const AttentionDims& d, std::uint32_t window) {
@@ -344,7 +345,7 @@ cudaError_t attention_decode_prepared_split_bf16(const AttentionDims& d, const P
     const std::uint32_t capacity = attn_split::decode_split_capacity(d.max_positions, prepared.window);
     auto* tickets = static_cast<std::uint32_t*>(workspace);
     auto* partials = reinterpret_cast<float*>(static_cast<unsigned char*>(workspace) + decode_split::ticket_bytes(d.kv_heads));
-    const dim3 grid(d.kv_heads, capacity);
+    const auto grid = device::decode_geometry::prepared_split(d.kv_heads, capacity, 1, decode_split::kThreads);
     switch (d.heads / d.kv_heads) {
     case 1: decode_split::launch<1>(grid, stream, d, prepared, q, k_cache, v_cache, device_position, out, tickets, partials, capacity); break;
     case 2: decode_split::launch<2>(grid, stream, d, prepared, q, k_cache, v_cache, device_position, out, tickets, partials, capacity); break;
@@ -400,7 +401,7 @@ cudaError_t attention_decode_prepared_split_lanes_bf16(const AttentionDims& d, c
     // Blocks run in stream order on the same workspace: every completed lane leaves its tickets at zero.
     for (unsigned b = 0; b < attn::lanes::launch_count(lanes.size()); ++b) {
         const auto block = attn::lanes::make_block(lanes, b);
-        const dim3 grid(d.kv_heads, layout.capacity, block.count);
+        const auto grid = device::decode_geometry::prepared_split(d.kv_heads, layout.capacity, block.count, decode_split::kThreads);
         switch (layout.group) {
         case 1: decode_split::launch_lanes<1>(grid, stream, d, prepared, q, block, out, tickets, partials, layout); break;
         case 2: decode_split::launch_lanes<2>(grid, stream, d, prepared, q, block, out, tickets, partials, layout); break;

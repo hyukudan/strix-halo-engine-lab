@@ -306,6 +306,7 @@ public:
         tape_rows_ = rows;
     }
     unsigned convolution_tape_rows() const { return tape_rows_; }
+    const float* convolution_tape_data() const noexcept { return tape_.data(); }
 
     void require_append(KvAppendChunk chunk) const {
         if (poisoned_ || staged() || chunk.first_position != committed_ || !plan_.admits(chunk.first_position, chunk.rows))

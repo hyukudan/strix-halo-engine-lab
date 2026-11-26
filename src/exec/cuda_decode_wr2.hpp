@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/device/decode_geometry.hpp"
 #include "attn_core/prepared_step.hpp"
 #include "core/short_convolution.hpp"
 #include "cuda/core/step_row_store.cuh"
@@ -14,6 +15,9 @@
 #endif
 
 namespace strix::exec::cuda_decode {
+
+namespace wr2_geometry = ::strix::device::decode_geometry;
+
 
 struct StepCheckedWaveRoute {
     const StepBlock* step;
@@ -98,28 +102,25 @@ cudaError_t route(const StepCheckedWaveRoute& a, cudaStream_t stream) {
 inline BoundStepLeaf bind_step(const attn_core::PreparedStepKv& a, unsigned rows) {
     return wr2_detail::by_width(rows, [&]<unsigned R>() {
         return wr2_detail::bind<R, cuda_core::prepared_step_kv<R>>(a, "cuda-sm120-kv-append-bf16",
-            {{a.kv_heads, R, 1}, {a.width, 1, 1}, 0});
+            wr2_geometry::prepared_kv(a.kv_heads, R, a.width));
     });
 }
 
 inline BoundStepLeaf bind_step(const attn_core::PreparedStepFlash& a, unsigned rows) {
-    constexpr unsigned shared = 2U * 32U * (4U * 128U + 32U + 16U);
     return wr2_detail::by_width(rows, [&]<unsigned R>() {
         return wr2_detail::bind<R, cuda_core::prepared_step_flash<R>>(a, "cuda-sm120-prepared-attention-bf16-pad2",
-            {{a.heads, R, 1}, {256, 1, 1}, shared});
+            wr2_geometry::prepared_flash128(a.heads, R));
     });
 }
 
 inline BoundStepLeaf bind_step(const attn_core::PreparedStepFinite& a, unsigned rows) {
     if (!supports_wr2_width(rows) || a.rows.count != rows) throw std::invalid_argument("invalid WR2 finite width");
-    const unsigned stride = std::max(a.width, a.relative_extent);
-    const auto heads = std::size_t{rows} * a.heads;
-    constexpr auto limit = std::numeric_limits<std::size_t>::max() / sizeof(float);
-    if (stride == 0U || heads == 0U || heads > limit / stride) throw std::invalid_argument("invalid WR2 finite shape");
-    const auto blocks = static_cast<unsigned>(std::min<std::size_t>((heads * stride - 1U) / 256U + 1U, 65535U));
+    const auto scan = attn_core::prepared_finite_scan(rows, a.heads, a.width, a.relative_extent);
+    if (scan.elements == 0U) throw std::invalid_argument("invalid WR2 finite shape");
+    const auto geometry = wr2_geometry::pointwise(scan.elements);
     return wr2_detail::by_width(rows, [&]<unsigned R>() {
         return wr2_detail::bind<R, attn_core::enqueue_prepared_step_finite<R>>(a, "cuda-sm120-prepared-finite",
-            {{blocks, 1, 1}, {256, 1, 1}, 0});
+            geometry);
     });
 }
 
@@ -127,7 +128,7 @@ inline BoundStepLeaf bind_step(const core::causal_conv::StepArgs& a, unsigned ro
     using namespace core::causal_conv;
     if (!core::valid_short_convolution_plan(a.plan)) throw std::invalid_argument("invalid WR2 convolution shape");
     const auto grid = launch_plan(a.plan, {rows, a.input, a.static_weights, a.dynamic_weights, a.pending, a.output});
-    const Grid native{{grid.channel_blocks, 1, 1}, {grid.threads, 1, 1}, 0};
+    const Grid native = grid.step_geometry();
     return wr2_detail::by_width(rows, [&]<unsigned R>() {
         if (a.round_bf16) return wr2_detail::bind<R, enqueue_step<R, true>>(a, "cuda-sm120-causal-convolution-bf16", native);
         return wr2_detail::bind<R, enqueue_step<R, false>>(a, "cuda-sm120-causal-convolution-f32", native);
@@ -138,20 +139,18 @@ inline BoundStepLeaf bind_step(const core::causal_conv::StepArgs& a, unsigned ro
 // come from the step descriptor, so the R = 1 decode graph and every verify graph reuse their capture.
 inline BoundStepLeaf bind_step(const cuda::core::StepRowStoreBf16& a, unsigned rows) {
     if (!cuda::core::valid_step_row_store(a)) throw std::invalid_argument("invalid step row store");
-    const unsigned blocks = cuda::core::step_row_store_blocks(a.width);
     return wr2_detail::by_width(rows, [&]<unsigned R>() {
         return wr2_detail::bind<R, cuda::core::enqueue_step_row_store_bf16<R>>(a, "cuda-sm120-step-row-store-bf16",
-            {{blocks, R, 1}, {256, 1, 1}, 0});
+            cuda::core::step_row_store_geometry(a.width, R));
     });
 }
 
 template <class Policy, class Math, class Traits>
 BoundStepLeaf bind_step_route(const StepCheckedWaveRoute& a, unsigned rows, std::string_view policy_identity) {
     if (policy_identity.empty()) throw std::invalid_argument("missing WR2 route policy identity");
-    constexpr unsigned waves = moe_core::kCheckedRouteRowsPerBlock;
     return wr2_detail::by_width(rows, [&]<unsigned R>() {
         return wr2_detail::bind<R, wr2_detail::route<R, Policy, Math, Traits>>(a, policy_identity,
-            {{(R - 1U) / waves + 1U, 1, 1}, {waves * 32U, 1, 1}, 0});
+            moe_core::checked_route_launch(R));
     });
 }
 

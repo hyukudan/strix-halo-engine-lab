@@ -18,6 +18,8 @@
 // a3 (row g+8); b0 (slots 2t..2t+1, col g), b1 (slots 8+2t.., col g); c0,c1 (row g, cols 2t, 2t+1), c2,c3 (row g+8).
 #pragma once
 
+#include "strix/device/launch_geometry.hpp"
+
 #include "../../moe_core/grouped_microscaled_rows.hpp"
 #include "../../moe_core/grouped_tall_plan.hpp"
 #include "native_mma.hpp"
@@ -335,6 +337,43 @@ inline constexpr unsigned row_slices(unsigned max_tile_rows, unsigned rows_per_c
     return view::tile_row_slices(max_tile_rows, kRowsPerTile, rows_per_cta);
 }
 
+template<unsigned MBlocks, unsigned OutputTile>
+constexpr device::LaunchGeometry projection_launch(const view::Args& args) {
+    using Shape = TileShape<MBlocks, OutputTile>;
+    return {{args.outputs / OutputTile, row_slices(args.max_tile_rows, Shape::kRows), args.count},
+            {Shape::kThreads, 1, 1}, 0};
+}
+
+constexpr device::LaunchGeometry tall_projection_launch(const view::Args& args, bool nvfp4, tall::FormId id) {
+    const auto form = tall::form(id);
+    return {{args.outputs / tall::kOutputs, tall::row_slices(form, args.max_tile_rows), args.count},
+            {form.threads(), 1, 1}, tall::shared_bytes(form, tall::layout(form, nvfp4), args.inputs, nvfp4)};
+}
+
+enum class ProjectionKind { unsupported, decode, tile, tall };
+
+struct ProjectionChoice {
+    ProjectionKind kind = ProjectionKind::unsupported;
+    device::LaunchGeometry geometry{};
+    tall::FormId tall_id{};
+};
+
+template<class SharedBudget>
+inline ProjectionChoice choose_projection(const view::Args& args, bool nvfp4, SharedBudget shared_budget) {
+    const bool tile = output_tile(args.outputs, args.max_tile_rows) == kTileOutputs;
+    const bool wide = args.max_tile_rows > kRowsPerTile;
+    if (wide && args.schedule != view::Schedule::automatic && args.schedule != view::Schedule::tall) return {};
+    if (args.schedule == view::Schedule::tall || (args.schedule == view::Schedule::automatic && tile) || wide) {
+        tall::FormId id{};
+        if (tall::resolve(args, nvfp4, shared_budget(), id))
+            return {ProjectionKind::tall, tall_projection_launch(args, nvfp4, id), id};
+        if (args.schedule == view::Schedule::tall || wide) return {};
+    }
+    if (tile)
+        return {ProjectionKind::tile, projection_launch<native_mma::kTileMBlocks, kTileOutputs>(args), {}};
+    return {ProjectionKind::decode, projection_launch<native_mma::kDecodeMBlocks, kDecodeOutputs>(args), {}};
+}
+
 inline bool fits(const view::Args& args) {
     return view::fits_args(args, kInputAlignment, output_tile(args.outputs, args.max_tile_rows));
 }
@@ -470,15 +509,14 @@ __global__ __launch_bounds__(TileShape<MBlocks, OutputTile>::kThreads, Shift ? 4
 
 template<packed::MatrixFormat Format, unsigned MBlocks, unsigned OutputTile>
 inline cudaError_t launch_form(const view::Args& args, cudaStream_t stream) {
-    using Shape = TileShape<MBlocks, OutputTile>;
-    const dim3 grid(args.outputs / OutputTile, row_slices(args.max_tile_rows, Shape::kRows), args.count);
+    const auto shape = projection_launch<MBlocks, OutputTile>(args);
     if constexpr (Format == packed::MatrixFormat::nvfp4) {
         if (args.decode == view::Decode::shift) {
-            projection<Format, MBlocks, OutputTile, true><<<grid, Shape::kThreads, 0, stream>>>(args);
+            projection<Format, MBlocks, OutputTile, true><<<shape.template grid<dim3>(), shape.template block<dim3>(), shape.shared_bytes, stream>>>(args);
             return cudaGetLastError();
         }
     }
-    projection<Format, MBlocks, OutputTile><<<grid, Shape::kThreads, 0, stream>>>(args);
+    projection<Format, MBlocks, OutputTile><<<shape.template grid<dim3>(), shape.template block<dim3>(), shape.shared_bytes, stream>>>(args);
     return cudaGetLastError();
 }
 
@@ -763,12 +801,11 @@ inline std::size_t shared_budget() {
 template<packed::MatrixFormat Format, tall::FormId Id>
 inline cudaError_t launch_tall_form(const view::Args& args, cudaStream_t stream) {
     constexpr tall::Form F = tall::form(Id);
-    constexpr tall::Layout L = tall::layout(F, Format == packed::MatrixFormat::nvfp4);
-    const dim3 grid(args.outputs / tall::kOutputs, tall::row_slices(F, args.max_tile_rows), args.count);
+    const auto shape = tall_projection_launch(args, Format == packed::MatrixFormat::nvfp4, Id);
     auto* kernel = projection_tall<Format, Id, false>;
     if constexpr (Format == packed::MatrixFormat::nvfp4)
         if (args.decode == view::Decode::shift) kernel = projection_tall<Format, Id, true>;
-    const unsigned shared = tall::shared_bytes(F, L, args.inputs, Format == packed::MatrixFormat::nvfp4);
+    const unsigned shared = shape.shared_bytes;
     if constexpr (F.staged_scales) {
         // The opt-in attribute belongs to the specialization, not the stream. Never lower it
         // to a request's K-dependent extent: another host thread may be launching a wider K.
@@ -791,7 +828,7 @@ inline cudaError_t launch_tall_form(const view::Args& args, cudaStream_t stream)
         if (const auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                      static_cast<int>(shared)); status != cudaSuccess) return status;
     }
-    kernel<<<grid, F.threads(), shared, stream>>>(args);
+    kernel<<<shape.template grid<dim3>(), shape.template block<dim3>(), shared, stream>>>(args);
     return cudaGetLastError();
 }
 
@@ -816,18 +853,13 @@ inline cudaError_t launch_tall(tall::FormId id, const view::Args& args, cudaStre
 template<packed::MatrixFormat Format>
 inline cudaError_t launch(const view::Args& args, cudaStream_t stream) {
     if (!fits(args)) return cudaErrorInvalidValue;
-    const bool tile = output_tile(args.outputs, args.max_tile_rows) == kTileOutputs;
-    const bool wide = args.max_tile_rows > kRowsPerTile;
-    if (wide && args.schedule != view::Schedule::automatic && args.schedule != view::Schedule::tall)
-        return cudaErrorInvalidValue;
-    if (args.schedule == view::Schedule::tall || (args.schedule == view::Schedule::automatic && tile) || wide) {
-        tall::FormId id{};
-        if (tall::resolve(args, Format == packed::MatrixFormat::nvfp4, detail::shared_budget(), id))
-            return detail::launch_tall<Format>(id, args, stream);
-        if (args.schedule == view::Schedule::tall || wide) return cudaErrorInvalidValue;
+    const auto choice = choose_projection(args, Format == packed::MatrixFormat::nvfp4, detail::shared_budget);
+    switch (choice.kind) {
+    case ProjectionKind::tall: return detail::launch_tall<Format>(choice.tall_id, args, stream);
+    case ProjectionKind::tile: return detail::launch_form<Format, native_mma::kTileMBlocks, kTileOutputs>(args, stream);
+    case ProjectionKind::decode: return detail::launch_form<Format, native_mma::kDecodeMBlocks, kDecodeOutputs>(args, stream);
+    default: return cudaErrorInvalidValue;
     }
-    if (tile) return detail::launch_form<Format, native_mma::kTileMBlocks, kTileOutputs>(args, stream);
-    return detail::launch_form<Format, native_mma::kDecodeMBlocks, kDecodeOutputs>(args, stream);
 }
 #endif
 

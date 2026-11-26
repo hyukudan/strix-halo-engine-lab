@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/device/decode_geometry.hpp"
 #include "norm.hpp"
 #include "norm_numeric_traits.hpp"
 
@@ -403,13 +404,14 @@ inline core::pointwise::Status l2_clip_bf16(const Bf16HeadClipArgs& args, core::
                                      args.rows > std::numeric_limits<unsigned>::max() - args.position.first))) {
         return core::pointwise::invalid;
     }
-    const dim3 grid(args.groups, args.rows < 65535U ? args.rows : 65535U);
+    const device::LaunchGeometry geometry = device::decode_geometry::head_clip(args.groups, args.rows, args.width);
+    const auto grid = geometry.grid<dim3>();
     const auto launch = [&]<unsigned Threads> {
         if (device_position) clip_step_kernel<Threads><<<grid, Threads, 0, stream>>>(args, device_position);
         else clip_kernel<Threads><<<grid, Threads, 0, stream>>>(args);
     };
-    if (args.width <= 32U) launch.template operator()<32>();
-    else if (args.width <= 128U) launch.template operator()<128>();
+    if (geometry.threads[0] == 32U) launch.template operator()<32>();
+    else if (geometry.threads[0] == 128U) launch.template operator()<128>();
     else launch.template operator()<256>();
     return core::pointwise::last_error();
 }
@@ -428,12 +430,13 @@ inline core::pointwise::Status l2_clip_bf16_rows(const Bf16HeadClipArgs& args, c
         return core::pointwise::invalid;
     }
     if (args.position.floor == 0) return l2_clip_bf16(args, stream);  // position-free: the plain row clip
-    const dim3 grid(args.groups, args.rows);
+    const device::LaunchGeometry geometry = device::decode_geometry::head_clip(args.groups, args.rows, args.width);
+    const auto grid = geometry.grid<dim3>();
     const auto launch = [&]<unsigned Threads> {
         clip_rows_kernel<Threads><<<grid, Threads, 0, stream>>>(args, positions, stride);
     };
-    if (args.width <= 32U) launch.template operator()<32>();
-    else if (args.width <= 128U) launch.template operator()<128>();
+    if (geometry.threads[0] == 32U) launch.template operator()<32>();
+    else if (geometry.threads[0] == 128U) launch.template operator()<128>();
     else launch.template operator()<256>();
     return core::pointwise::last_error();
 }

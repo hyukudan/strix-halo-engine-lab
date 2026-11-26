@@ -1,5 +1,8 @@
 // Gated DeltaNet decode with deferred commit: causal depthwise conv (k=4) + SiLU, l2norm q/k, delta rule with sequential rows
 // into a shadow state side, gated RMSNorm. See gdn.hpp for the contract.
+#include "strix/device/decode_geometry.hpp"
+
+#include <limits>
 #include "strix/cuda_core/gdn.hpp"
 #include "../../core/short_convolution.hpp"
 
@@ -376,9 +379,13 @@ cudaError_t gdn_window_convolution(const GdnDims& d, const GdnLayer& layer, cons
     if (!valid_window(d, rows)) return cudaErrorInvalidValue;
     const std::uint32_t C = d.conv_channels();
     const float qscale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.key_dim)));
-    return leaf_dev ? launch_pdl(conv_pre_kernel<true>, dim3(C / 128), dim3(128), stream, layer.conv_w, state.conv, win.raw,
+    const auto heads = device::decode_geometry::gdn_convolution_heads(d.key_heads, d.value_heads);
+    if (heads > std::numeric_limits<std::uint32_t>::max() / 128U) return cudaErrorInvalidValue;
+    const auto geometry = device::decode_geometry::gdn(static_cast<unsigned>(heads));
+    const auto grid = geometry.grid<dim3>(), block = geometry.block<dim3>();
+    return leaf_dev ? launch_pdl(conv_pre_kernel<true>, grid, block, stream, layer.conv_w, state.conv, win.raw,
                                  win.qkv_c, C, rows, d.key_heads, 2 * d.key_heads, qscale, GdnSlotTable{}, leaf_dev)
-                    : launch_pdl(conv_pre_kernel<false>, dim3(C / 128), dim3(128), stream, layer.conv_w, state.conv, win.raw,
+                    : launch_pdl(conv_pre_kernel<false>, grid, block, stream, layer.conv_w, state.conv, win.raw,
                                  win.qkv_c, C, rows, d.key_heads, 2 * d.key_heads, qscale, GdnSlotTable{},
                                  static_cast<const std::uint32_t*>(nullptr));
 }
@@ -398,7 +405,8 @@ cudaError_t gdn_window_recurrence(const GdnDims& d, const GdnLayer& layer, const
         return launch_pdl_smem(delta_window_tree_kernel, dim3(d.value_heads), dim3(128), kBackup, stream, a, d, rows, parity_dev, eps,
                                leaf_dev);
     }
-    return launch_pdl(delta_window_kernel, dim3(d.value_heads), dim3(128), stream, a, d, rows, parity_dev, eps, GdnSlotTable{});
+    const device::LaunchGeometry geometry = device::decode_geometry::gdn(d.value_heads);
+    return launch_pdl(delta_window_kernel, geometry.grid<dim3>(), geometry.block<dim3>(), stream, a, d, rows, parity_dev, eps, GdnSlotTable{});
 }
 
 }  // namespace strix::cuda_core

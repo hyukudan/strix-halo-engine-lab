@@ -404,7 +404,7 @@ void pass1_schedule_tests() {
                plan::pass1_blocks(2U, 0U, 4U) == 4U,
            "whole lane groups, at least one block per group");
     const unsigned row_counts[] = {1U, 3U, 7U, 64U, 1001U, 20011U};
-    const unsigned residents[] = {0U, 3U, 376U, 564U, 1504U};
+    const unsigned residents[] = {0U, 3U, 376U, 564U, 1128U, 1504U};
     const std::size_t limits[] = {48U * 1024U, 227U * 1024U};
     for (const std::size_t limit : limits)
         for (unsigned lanes = 1U; lanes <= plan::kMaxLanes; ++lanes) {

@@ -260,7 +260,7 @@ public:
     void check(mini_gpu::Status status) const { mini_gpu::check(status, "Inkling 2 Mini stage"); }
     void set_gate_route_tap(strix::moe::RouteTap* tap) {
         graph_.invalidate();
-        invalidate_cohort_graphs();
+        invalidate_width_graphs();
         gate_route_tap_ = tap;
     }
     // Calibration input statistics (strix/weight/calib_moments.hpp, off when null): every eager chunk run while a
@@ -269,7 +269,7 @@ public:
     // decode steps of generated tokens) belong to no declared window and are not captured.
     void set_calibration_moments(weight::calib::MomentSet* moments) {
         graph_.invalidate();
-        invalidate_cohort_graphs();
+        invalidate_width_graphs();
         calibration_ = moments;
         calibration_window_.reset();
     }
@@ -288,7 +288,7 @@ public:
     }
     void set_gate_order_null(bool enabled) {
         graph_.invalidate();
-        invalidate_cohort_graphs();
+        invalidate_width_graphs();
         gate_order_null_ = enabled;
         null_applications_ = 0;
     }
@@ -308,7 +308,7 @@ public:
         }
         if (effective != prepared_round_fold_) {
             graph_.invalidate();
-            invalidate_cohort_graphs();
+            invalidate_width_graphs();
             prepared_round_fold_ = effective;
         }
 #else
@@ -444,9 +444,10 @@ public:
 #endif
     }
 
-    void invalidate_cohort_graphs() noexcept {
+    void invalidate_width_graphs() noexcept {
 #if !defined(__HIPCC__)
         cohort_graphs_.invalidate();
+        window_graphs_.invalidate();
 #endif
     }
 
@@ -514,7 +515,20 @@ public:
     // sequence's caches: the bind_lane / flash_body of the eager lanes launch, so the same bits), the position-scaled
     // clips and the DSpark tap store read *capture_position() + row, the embedding reads the ids from the block; every
     // other stage is position-free (fixed addresses). The decoder sets the program around its staged verify append.
+    // KV addresses used through the slot directory can vary per replay. The serial convolution,
+    // tape copies, tap plane and choice of head remain physical operands of a captured window.
+    struct WindowBinding {
+        const float* history;
+        const float* tape;
+        const std::uint16_t* taps;
+        unsigned tape_rows;
+        unsigned pick_rows;
+        bool lanes_screened;
+        bool screened;
+        bool operator==(const WindowBinding&) const = default;
+    };
     struct WindowProgram {
+        WindowBinding binding;
         exec::StepBlock block;
         MiniCohortLanes lanes;
     };
@@ -528,7 +542,7 @@ public:
     // Window programs that ran so far (monotonic): window_replayed() is cleared with the program when the append ends,
     // so a reader after the append (the identity fixture) counts runs here.
     [[nodiscard]] std::uint64_t window_runs() const noexcept { return window_runs_; }
-    [[nodiscard]] const exec::WidthStepGraphs& window_graphs() const noexcept { return window_graphs_; }
+    [[nodiscard]] const exec::BoundWidthStepGraphs<WindowBinding>& window_graphs() const noexcept { return window_graphs_; }
 
     // session::RowAppendState::append offers a taped staged window here (after its eager checkpoints). False: nothing
     // ran (no program set, graphs off, a host tap, or this width declined); the work then runs eagerly.
@@ -548,7 +562,7 @@ public:
             window_lanes_ = &program.lanes;
             clear_flags();
             work();
-        });
+        }, program.binding);
         window_replayed_ = ran;
         window_runs_ += ran ? 1U : 0U;
         return ran;
@@ -1461,7 +1475,7 @@ private:
     exec::WidthStepGraphs cohort_graphs_;  // shared step descriptor, CUDA graph per width
     std::optional<MiniCohortLanes> cohort_lanes_;  // set while a cohort is captured or submitted eagerly
 #if !defined(__HIPCC__)
-    exec::WidthStepGraphs window_graphs_;          // verify window programs, one per window rows
+    exec::BoundWidthStepGraphs<WindowBinding> window_graphs_{exec::GraphRows::inclusive_window};
     const WindowProgram* window_program_{};        // set by the decoder around a staged verify append
     const MiniCohortLanes* window_lanes_{};        // set while a verify window program is captured
     const std::uint32_t* window_position_{};       // device position of the window's first row

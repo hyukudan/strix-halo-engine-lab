@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/device/launch_geometry.hpp"
 #include "strix/exec/arena.hpp"
 #include "strix/graph/stage_graph.hpp"
 
@@ -67,11 +68,7 @@ struct ProgramStage {
 // Opaque binding handle. The stable identity string is independent of this handle.
 enum class KernelId : std::uint64_t {};
 
-struct Grid {
-    std::array<std::uint32_t, 3> blocks{1, 1, 1};
-    std::array<std::uint32_t, 3> threads{1, 1, 1};
-    std::uint32_t shared_bytes = 0;
-};
+using Grid = device::LaunchGeometry;
 
 using LaunchFn = void (*)(std::span<const std::byte> args, const Grid& grid, void* stream);
 inline constexpr std::uint32_t no_launch = std::numeric_limits<std::uint32_t>::max();
