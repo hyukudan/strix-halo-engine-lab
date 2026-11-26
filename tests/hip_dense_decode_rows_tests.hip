@@ -14,7 +14,7 @@
 //   ungated   q_stride = Dim, gated = false: rows 1/5/16 x len 1K / 33000
 // --bench [LENS] [ROWS] [BUDGET_S]: no-model timing, kernel-only events per call, the 64 MiB cache-flush write between
 // calls outside the events: ms per call of v0 (main's kernel, engine options) and every (P, U) form plus the device
-// plan, for each context in LENS (comma list, default 8192,32768,131072) and row count in ROWS (default 1,2,4,8,12,16);
+// plan, for each context in LENS (comma list, default 8192,32768,131072) and row count in ROWS (default 1,2,4,8,12,16; up to 64: the EXACT prefill windows);
 // cells past BUDGET_S seconds (default 80) are skipped. x16 = one Qwen 27B dense step.
 #include <hip/hip_runtime.h>
 
@@ -175,7 +175,7 @@ int main(int argc, char** argv) {
     const double budget = argc > 4 ? std::atof(argv[4]) : 80.0;
     for (const unsigned len : lens)
         for (const unsigned rows : rowss) {
-            if (len < rows || len > MAXL || rows < 1U || rows > 16U || elapsed() > budget) {
+            if (len < rows || len > MAXL || rows < 1U || rows > MAXR || elapsed() > budget) {
                 std::printf("len %u rows %u SKIPPED (%s)\n", len, rows, elapsed() > budget ? "budget" : "range");
                 continue;
             }
