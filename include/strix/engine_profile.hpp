@@ -601,7 +601,7 @@ struct Entry {
 template <class Row>
 [[nodiscard]] bool explicit_value_qualified(const Row& lever, std::string_view value, std::string_view off,
                                              std::span<const bool> provisional = {}, std::string_view same_bits = {}) {
-    if (lever.kind != Kind::bit_changing) return true;
+    if (lever.kind != decltype(lever.kind)::bit_changing) return true;
     if (value == lever.builtin || (!off.empty() && value == off)) return true;
     const bool in_class = bit_class_member(same_bits, value);
     for (std::size_t c = 0; c < lever.value.size(); ++c)

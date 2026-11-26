@@ -300,6 +300,28 @@ void ds41() {
 }
 
 void glm_cuda() {
+    // The producer currently leaves its bit-changing rows inaccessible to CLI/environment overrides.
+    // Add switches to a copied table to exercise the binding without exposing new production options.
+    const auto declared = glm::levers();
+    const auto candidate = std::ranges::find(declared, "prefill_tile_large", &glm::Lever::name);
+    check(candidate != declared.end(), "GLM producer pending tile row");
+    auto row = *candidate;
+    row.env = "STRIX_FIXTURE_TILE";
+    row.options[0] = {"--fixture-tile", "*"};
+    const std::array fixture{row};
+    const auto unqualified = [&](const glm::Inputs& in, glm::Status source) {
+        const auto resolution = glm::resolve(glm::App::decode_service, in, fixture);
+        const auto* entry = resolution.find(row.name);
+        check(entry && entry->value == "8192" && entry->status == source &&
+            resolution.qualification() == "unqualified: prefill_tile_large" &&
+            resolution.json().find("\"unqualified\":[\"prefill_tile_large\"]") != std::string::npos,
+            "GLM producer explicit pending tile is unqualified and retains its source");
+    };
+    unqualified({{"--fixture-tile", "8192"}, env()}, glm::Status::explicit_cli);
+    unqualified({{}, env({{std::string(row.env), "8192"}})}, glm::Status::explicit_env);
+    check(glm::resolve(glm::App::decode_service, {{}, env({{std::string(row.env), "off"}})}, fixture)
+              .qualification() == "qualified", "GLM producer explicit off is qualified");
+
     constexpr std::array apps{glm::App::decode_service};
     rtx<glm::Inputs>("glm_cuda", glm::levers(), std::span<const glm::App>(apps),
         [](auto app, const auto& in, auto rows) { return glm::resolve(app, in, rows); },
