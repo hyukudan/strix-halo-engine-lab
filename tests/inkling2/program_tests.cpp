@@ -857,17 +857,21 @@ std::uint64_t check_physical_plan(unsigned position, FixtureWeights& weights, de
         // every replay); without a tap plane the program is the incumbent one (no extra launch).
         std::vector<std::uint16_t> taps(MiniDSparkTapPlan::elements(position + 1U));
         const auto tapped = build_recipe(key.program.tap, false, false, {}, false, false, taps);
-        if (position == 7U && screened && !key.grouped) {
-            // Keep the arena, program width, layout and descriptor address fixed. Rebind the
-            // actual 48-visit walk at a different committed row, with different replay data.
-            bind_position = 3U;
-            descriptor.row[0] = {913U, bind_position, 2U, exec::kStepNoParent, 1U, exec::step_valid, 42U, 7U};
-            descriptor.h = {1U, 1U, 19U, 1U, 0U, 0U, 0U, 0U};
-            const auto other = build_recipe(key.program.tap, false, false, {}, false, false, taps);
-            exec::verify_dry_capture(tapped.program, other.program);
-            check(tapped.binding == other.binding, "replay input changed transfer kinds or program edges");
-            bind_position = position;
-            descriptor = {};
+        if (position == 7U) {
+            // Keep arena, head, layout and descriptor address fixed. Rebind every scheduled
+            // leaf in the fused and unfused 48-visit walks with a different committed row.
+            const auto compare_rebind = [&](const auto& captured, bool fusion) {
+                bind_position = 3U;
+                descriptor.row[0] = {913U, bind_position, 2U, exec::kStepNoParent, 1U, exec::step_valid, 42U, 7U};
+                descriptor.h = {1U, 1U, 19U, 1U, 0U, 0U, 0U, 0U};
+                const auto other = build_recipe(fusion, false, false, {}, false, false, taps);
+                exec::verify_dry_capture(captured.program, other.program);
+                check(captured.binding == other.binding, "replay input changed transfer kinds or program edges");
+                bind_position = position;
+                descriptor = {};
+            };
+            compare_rebind(tapped, false);
+            compare_rebind(build_recipe(true, false, false, {}, false, false, taps), true);
         }
         std::size_t found = 0;
         for (const auto& launch : tapped.program.launches) {
