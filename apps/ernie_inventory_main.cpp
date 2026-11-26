@@ -67,9 +67,9 @@ struct Stats {
 };
 
 void scale_report(std::vector<float> scales) {
-    std::ranges::sort(scales);
-    if (!std::ranges::all_of(scales, [](float s) { return std::isfinite(s) && s > 0.0F; }))
+    if (scales.empty() || !std::ranges::all_of(scales, [](float s) { return std::isfinite(s) && s > 0.0F; }))
         throw std::runtime_error("probe contains an invalid block scale");
+    std::ranges::sort(scales);
     std::cout << "scales n=" << scales.size() << " min=" << scales.front()
               << " p10=" << scales[scales.size() / 10U]
               << " median=" << scales[scales.size() / 2U]
