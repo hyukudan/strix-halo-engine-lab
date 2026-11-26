@@ -70,13 +70,14 @@ inline constexpr std::string_view kFastGatePfWmma =
     "head dump bitwise equal to the gated arm";
 inline constexpr strix::profile::FastGate fast_gates[] = {{"pf_wmma", "1", kFastGatePfWmma}};
 
-// TURBO: two measured prompt lengths, one fresh request at a time on the USB4 pair. Ratios are the lower of the two
-// observed TURBO/FAST throughput ratios at each length, with a conservative 10% margin. Inside the FAST band the FAST
-// cell already runs the bundle, so TURBO nests it there (the 8,108-token row decides only if the FAST row is revoked).
+// A prompt inside the FAST band: the startup pair vote asks whether this execution can run the bundle at all; each
+// prompt is then decided by the rows below (select_prefill_wmma).
+inline constexpr std::uint64_t kPrefillProbePrompt = 8192;
+
+// TURBO: one fresh request at a time on the USB4 pair, ratio = the lower of the two observed TURBO/FAST throughput
+// ratios with a conservative 10% margin. Inside the FAST band the FAST cell runs the bundle and TURBO nests it (its
+// former 8,108-token receipt, measured against the exact cores, is superseded there by the band row).
 inline constexpr strix::profile::LadderRow product_ladder_rows[] = {
-    {"pf_wmma", "1", strix::profile::Name::turbo, strix::profile::Phase::prefill, kTurboPrefillDevice,
-     8108, 8108, 1, 1, 1.51, 0.10, "GLM pair 8K TURBO vs FAST, docs/models/glm-5.3/README.md",
-     false, {}, {}, STRIX_GLM_TURBO_ARM("8108")},
     {"pf_wmma", "1", strix::profile::Name::turbo, strix::profile::Phase::prefill, kTurboPrefillDevice,
      31258, 31258, 1, 1, 1.54, 0.10, "GLM pair 32K TURBO vs FAST, docs/models/glm-5.3/README.md",
      false, {}, {}, STRIX_GLM_TURBO_ARM("31258")},

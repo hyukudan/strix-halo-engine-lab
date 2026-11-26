@@ -4654,7 +4654,7 @@ inherit it).
 - **Automatic selection:** one shared resolver for the command line and the server. The FAST cell is qualified by its
   gate (below) and timed by a band receipt bound to the run's own execution (`profile::bind_band_receipts`): device
   gfx1151/Radeon-8060S, prefill, one lane, 2,049..8,192 tokens, x1.50 noise 0.10. TURBO runs the FAST cell inside that
-  band and its own literal receipts at 8,108 and 31,258 tokens. Each prompt prints
+  band and its own literal receipt at 31,258 tokens. Each prompt prints
   `glm-pf-wmma-x profile=<p> prompt=<n> chunk=<rows> effective=wmma|exact-cores` and the `strix-ladder/v1 pf_wmma`
   route that decided it.
 - **Fallback notice:** prompts of 2,048 tokens or fewer, above 8,192 tokens (32K is TURBO only), other devices, links,

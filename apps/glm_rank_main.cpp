@@ -439,7 +439,7 @@ int main(int argc, char** argv) {
             auto opened = strix::dist::open_pair(transport_spec, opt.rank);
             turbo_prefill_pair = rd::select_prefill_wmma(request, eff, rd::process_env(),
                 {rd::ordinary_lossy_prefill(request, eff) && rd::measured_prefill_pair(opened.usb4_topology.streams, opened.direct != nullptr) && !deployment.plan,
-                 rd::product_ladder_rows[0].min_context, opt.capacity, opt.max_rows, opt.slots, decode_n});
+                 rd::kPrefillProbePrompt, opt.capacity, opt.max_rows, opt.slots, decode_n});
             auto transport = std::move(opened.host);
             const auto& receipt = opened.receipt;
             if (deployment.provider) deployment.resolve_live(opt, *transport);

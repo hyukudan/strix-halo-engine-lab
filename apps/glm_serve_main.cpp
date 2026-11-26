@@ -1368,7 +1368,7 @@ int main(int argc, char** argv) {
         const bool turbo_candidate = turbo_prefill_device && rd::measured_prefill_layout(eng.prefill_pipeline()) &&
             !deployment.plan && !serial && rtx_prefill.empty() && import_listen.empty();
         ops.turbo_prefill_pair = rd::select_prefill_wmma(request, eff, rd::process_env(),
-            {turbo_candidate, rd::product_ladder_rows[0].min_context, opt.capacity, opt.max_rows, opt.slots,
+            {turbo_candidate, rd::kPrefillProbePrompt, opt.capacity, opt.max_rows, opt.slots,
              rd::kTurboPrefillGenerated});
         if (rd::ordinary_lossy_prefill(request, eff) && !strix::glm::pf::wmma_x::enabled()) {
             ops.turbo_prefill_policy = [&](std::uint64_t prompt, unsigned generated, bool fresh) {

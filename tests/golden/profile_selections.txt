@@ -47,7 +47,7 @@ A deepseek41-rtx fast host_promote=on s3
 A deepseek41-rtx fast batch_long=off s4
 A deepseek41-rtx fast fp16_dense_prefill=off s4
 A deepseek41-rtx turbo throws deepseek41-rtx: --profile turbo is not declared for this engine
-A glm-pair fast pf_wmma=0 s3
+A glm-pair fast pf_wmma=0 s4
 A glm-pair fast stored_i4=exl3 s3
 A glm-pair fast mla_wmma=0 s3
 A glm-pair fast mla_ob16=0 s3
