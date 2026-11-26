@@ -783,7 +783,7 @@ Decision Arbiter::decide(const StepInput& input) {
         const bool stay = paced && episode_open_ && episode_net_ms_ >= -episode_allow_ms_;
         if (episode_open_ && !stay) {
             episode_open_ = false;
-            episode_loss_ms_ = std::max(0.0, -episode_net_ms_);
+            episode_loss_ms_ = std::max(0.0, -episode_warm_net_ms_);
         }
         const double priced_excess = charge ? std::max(0.0, ms - tokens * pick_ms_per_token) : 0.0;
         const double excess = !charge ? 0.0 : episode_loss_ms_ >= 0.0 ? episode_loss_ms_ : priced_excess;
@@ -794,7 +794,7 @@ Decision Arbiter::decide(const StepInput& input) {
             model_barred_until_ = 0;
             if (paced && !stay) {
                 episode_open_ = true;
-                episode_net_ms_ = 0.0;
+                episode_net_ms_ = episode_warm_net_ms_ = 0.0;
                 episode_rate_ = pick_ms_per_token;
                 episode_allow_ms_ = 0.5 * priced_excess;
                 episode_cap_ms_ = 3.0 * ms;
@@ -855,9 +855,20 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
         cycle_passes_ *= f;
     }
     decided_ms_ = decided_excess_ms_ = decided_plain_ms_ = 0.0;
-    if (episode_pass_ && o.source == Source::model)  // ArbiterConfig::probe_loss: the episode's realized net
-        episode_net_ms_ = std::min(episode_cap_ms_, episode_net_ms_ + double(std::max<std::size_t>(emitted.size(), 1)) *
-                                                                     episode_rate_ - (o.verify_ms + o.draft_ms));
+    bool cold = false;  // ArbiterConfig::cold_walls: a first wall of its width is not a price
+    if (adaptive && config_.learn_costs && config_.cold_walls > 0 && o.rows > 0 && o.verify_ms > 0.0) {
+        if (width_walls_.size() <= o.rows) width_walls_.resize(o.rows + 1, 0);
+        cold = width_walls_[o.rows]++ < config_.cold_walls;
+    }
+    // ArbiterConfig::probe_loss: the episode's realized net closes it; the loss that paces the next probe leaves the
+    // cold passes out (their one-time work is no more the drafter's loss than it is a price). Charged, the captures of
+    // an unlucky opening paced the next probe beyond the request (replay of a measured CUDA code run: model 12 of 223
+    // passes; left out of the pacing, ~52 of 54).
+    if (episode_pass_ && o.source == Source::model) {
+        const double net = double(std::max<std::size_t>(emitted.size(), 1)) * episode_rate_ - (o.verify_ms + o.draft_ms);
+        episode_net_ms_ = std::min(episode_cap_ms_, episode_net_ms_ + net);
+        if (!cold) episode_warm_net_ms_ = std::min(episode_cap_ms_, episode_warm_net_ms_ + net);
+    }
     episode_pass_ = false;
     if (adaptive && o.source == Source::model) {
         learn(model_, o.proposed, o.accepted, 1.0);
@@ -895,11 +906,6 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
     if (adaptive) {
         auto& c = cost_[context_bin(o.context)];
         if (config_.learn_costs) for (auto& w : c.weight) w *= config_.cost_aging;
-        bool cold = false;  // ArbiterConfig::cold_walls: a first wall of its width is not a price
-        if (config_.learn_costs && config_.cold_walls > 0 && o.rows > 0 && o.verify_ms > 0.0) {
-            if (width_walls_.size() <= o.rows) width_walls_.resize(o.rows + 1, 0);
-            cold = width_walls_[o.rows]++ < config_.cold_walls;
-        }
         if (config_.learn_costs && !cold && o.rows > 0 && o.rows < c.ms.size() && o.verify_ms > 0.0) {
             auto& w = c.weight[o.rows];
             c.ms[o.rows] = (c.ms[o.rows] * w + o.verify_ms) / (w + 1.0);
