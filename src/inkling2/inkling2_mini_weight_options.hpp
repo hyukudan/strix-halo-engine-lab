@@ -332,8 +332,9 @@ inline unsigned mini_speculation_verify_rows(unsigned verify_rows, bool speculat
 
 // The effective speculation of one run, the one rule of the command line and the server. `requested`: the run asks
 // for speculation (an explicit --speculation / --dspark, else the row kMiniSpeculation); `explicit_request`: it came
-// from the run's own flags. A calibrated low-bit target (the q4 row) and speculation never share a run: a verify window
-// runs the incumbent verify body, so its picks would not be the low-bit decode's picks. The explicit request wins: an
+// from the run's own flags. The calibrated low-bit TURBO row (the q4 row) and speculation never share a run: its receipt
+// measured plain decode only (an explicit decode-only qualification arm verifies on its own low-bit copies and may
+// speculate, apps/inkling2_mini_gpu_main.hpp). The explicit request wins: an
 // explicit speculation declines the low-bit row (incumbent weights, as before); a row default yields to the requested
 // low-bit row (plain decode on that target). A backend without verify windows declines with its own reason.
 struct MiniSpeculationPolicy {
