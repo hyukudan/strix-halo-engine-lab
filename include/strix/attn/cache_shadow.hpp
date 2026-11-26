@@ -14,7 +14,10 @@
 //   Int8G16  "kv-shadow-i8g16-v1": groups of 16 consecutive features of one K or V row. amax = max |x| scanned in feature
 //            order with `a > amax` (a NaN never wins); scale s = half(amax / 127) (FP32 division, RNE half), decode
 //            scale float(s); code = 0 when float(s) == 0, else clamp(rint(x / float(s)), -127, 127); value = float(s) * code
-//            (exact in FP32). A non-finite input raises flag_nonfinite, an infinite or NaN scale flag_overflow.
+//            (exact in FP32). A non-finite input raises flag_nonfinite, an infinite or NaN scale flag_overflow; a NaN
+//            quotient (only in a flagged group) codes 0. Finite groups lose only bounded magnitude: a group with
+//            amax < 2^-25 * 127 (about 3.8e-6) has scale 0 and codes 0, and a subnormal-half scale may saturate codes, so
+//            the error of such a group is at most amax per feature (no flag: the values are below the form's resolution).
 // Validity of a master row (policy of the writer): Untagged (rows are valid by construction) or Tagged (position tags:
 // row p is valid iff tags[p] == p; checked once per row, a mismatch raises flag_tag).
 // Failure word: OR of flag_nonfinite = 1, flag_tag = 2, flag_overflow = 4. The shadow's bits are written either way; a
@@ -58,6 +61,8 @@ struct Int8G16 {
         if (d == 0.0F)
             return 0;
         float c = __builtin_rintf(x / d);
+        if (c != c)
+            return 0; // NaN quotient: x or the scale not finite (encode_group has raised its flag); no UB conversion
         c = c > 127.0F ? 127.0F : (c < -127.0F ? -127.0F : c);
         return int(c);
     }
