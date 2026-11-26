@@ -61,8 +61,9 @@ The HIP QSA launcher runs the score and value forms of `src/attn_core/eager_sele
 server, in every profile; the adapter supplies BF16 or int8 KV reads, captured selection counts and status checks.
 The launcher's private score / output bodies were deleted after the device identity (integration head
 2019eacec5, one gfx1151 node): launcher fixture PASS and 128 generated ids equal to the private form on the
-automatic (MTP), eager BF16, eager KV-int8 and long-prompt (4,096) routes. No gain is claimed (same bits; one
-sample per route within +-1.5 %, not an ABBA timing).
+automatic (MTP), eager BF16, eager KV-int8 and long-prompt (4,096) routes, and the launcher object's ISA identical
+to the qualified build (no logits were compared). No gain is claimed (same ids and ISA; one sample per route within
++-1.5 %, not an ABBA timing).
 
 | Model | Shared EXL3 Hadamard adapter | Shared eager QSA score and output |
 |---|---|---|
