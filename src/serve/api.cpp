@@ -1,4 +1,5 @@
 #include "strix/serve/api.hpp"
+#include "strix/serve/secure_equal.hpp"
 
 #include "strix/serve/chat_template.hpp"
 #include "strix/serve/constraint_selection.hpp"
@@ -947,7 +948,8 @@ struct ApiService::Impl {
         double requested = config.default_max_tokens;
         for (const char* key : {"max_completion_tokens", "max_tokens"})
             if (const auto* v = body.find(key); v && !v->is_null()) {
-                if (!v->is_number() || v->as_double() < 1.0) throw ApiError(400, "invalid_request_error", std::string(key) + " must be a positive integer", key);
+                // Whole numbers only (a fraction was silently truncated); larger counts are clamped below.
+                if (!v->is_number() || v->as_double() < 1.0 || std::floor(v->as_double()) != v->as_double()) throw ApiError(400, "invalid_request_error", std::string(key) + " must be a positive integer", key);
                 requested = v->as_double();
                 break;
             }
@@ -963,7 +965,10 @@ struct ApiService::Impl {
     void authorize(const HttpRequest& request) const {
         if (config.api_key.empty()) return;
         const auto bearer = request.header("authorization");
-        if (bearer == "Bearer " + config.api_key || request.header("x-api-key") == config.api_key) return;
+        // Both comparisons always run, each in time independent of the key content.
+        const bool by_bearer = secure_equal(bearer, "Bearer " + config.api_key);
+        const bool by_header = secure_equal(request.header("x-api-key"), config.api_key);
+        if (by_bearer || by_header) return;
         throw ApiError(401, "authentication_error", "invalid or missing API key");
     }
 

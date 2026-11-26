@@ -1763,6 +1763,7 @@ int main(int argc, char** argv) try {
         else if (mode == "defaults") defaults_api.handle(r, w);
         else if (mode == "sample") sample_api.handle(r, w);
         else if (mode == "reject") reject_api.handle(r, w);
+        else if (mode == "throw-utf8") throw std::runtime_error("handler failed: caf\xc3\xa9\x01!");
         else api.handle(r, w);
     });
     server.listen();
@@ -1770,6 +1771,20 @@ int main(int argc, char** argv) try {
     std::thread http_thread([&] { server.serve(); });
     std::thread engine_thread([&] { queue.run(engine); });
     const std::string auth = "Authorization: Bearer secret\r\n";
+    {   // a handler failure keeps the UTF-8 text of its message and blanks control bytes in the 500 body
+        const auto reply = http(port, "GET", "/v1/capabilities", "", auth + "X-Test-Config: throw-utf8\r\n");
+        check(reply.status == 500 && reply.body.find("handler failed: caf\xc3\xa9 !") != std::string::npos,
+              "500 body keeps UTF-8 bytes of the error text");
+    }
+    {   // a fractional max_tokens is a client error in the clamping (non-exact) mode too
+        const auto reply = http(port, "POST", "/v1/completions", R"({"model":"test-model","prompt":"hello","max_tokens":1.5})", auth);
+        const auto error = parse_json(reply.body);
+        check(reply.status == 400 && at(at(error, "error"), "param").as_string() == "max_tokens", "fractional max_tokens refused");
+    }
+    for (const char* key : {"Authorization: Bearer secreT\r\n", "Authorization: Bearer secre\r\n", "Authorization: Bearer secrets\r\n",
+                            "x-api-key: Secret\r\n", "x-api-key: \r\n"})  // near-miss keys are refused
+        check(http(port, "GET", "/v1/capabilities", "", key).status == 401, "near-miss API key refused");
+    check(http(port, "GET", "/v1/capabilities", "", "x-api-key: secret\r\n").status == 200, "x-api-key spelling accepted");
     for (const char* value : {"1.5", "1e100", "1e999", "-1", "17", "true", "\"8\""}) {
         const auto reply = http(port, "POST", "/v1/completions",
             std::string("{\"model\":\"test-model\",\"prompt\":\"hello\",\"max_tokens\":1,\"window_rows\":") + value + "}", auth);
