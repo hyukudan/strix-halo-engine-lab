@@ -56,6 +56,16 @@ void CohortBackend::bind_lane(std::uint32_t, std::uint64_t, std::span<const std:
 void CohortBackend::control(std::span<const std::uint32_t>) {}
 
 namespace {
+// Cleanup while a contract violation (std::logic_error) is in flight: the lanes are retired either way, and a backend
+// release failure inside the cleanup is dropped so that the contract error is the one rethrown.
+template <class Cleanup>
+void cleanup_keeping_contract_error(Cleanup&& cleanup) noexcept {
+    try {
+        cleanup();
+    } catch (...) {
+    }
+}
+
 // The most ids a request runs to: max_tokens, or the engine's context ceiling when that is lower.
 std::uint64_t token_limit(const CohortRequest& r) {
     return r.context_tokens != 0 ? std::min(r.max_tokens, r.context_tokens) : r.max_tokens;
@@ -304,7 +314,7 @@ void CohortDecoder::admit() {
             else if (l.prompt_left() == 0) l.pending = p.back();
         }
         } catch (const std::logic_error& ex) {  // a contract violation stays fatal, after the lane is retired
-            finish(l, std::string("admit: ") + ex.what());
+            cleanup_keeping_contract_error([&] { finish(l, std::string("admit: ") + ex.what()); });
             throw;
         } catch (const std::exception& ex) {
             finish(l, std::string("admit: ") + ex.what());
@@ -579,8 +589,11 @@ void CohortDecoder::step() {
         try {
             backend_.prefill_group(members);
         } catch (const std::exception& ex) {
+            if (dynamic_cast<const std::logic_error*>(&ex) != nullptr) {
+                cleanup_keeping_contract_error([&] { fail_prompt(group, ex); });
+                throw;
+            }
             fail_prompt(group, ex);
-            if (dynamic_cast<const std::logic_error*>(&ex) != nullptr) throw;
             return;
         }
         prompt_ms = now_ms() - t0;
@@ -614,8 +627,11 @@ void CohortDecoder::step() {
                                     l.prompt_read == 0, l.request.prompt.size());
         } catch (const std::exception& ex) {
             const std::uint32_t one[1] = {plan.prompt.front().lane};
+            if (dynamic_cast<const std::logic_error*>(&ex) != nullptr) {
+                cleanup_keeping_contract_error([&] { fail_prompt(one, ex); });
+                throw;
+            }
             fail_prompt(one, ex);
-            if (dynamic_cast<const std::logic_error*>(&ex) != nullptr) throw;
             return;
         }
         prompt_ms = now_ms() - t0;
@@ -775,7 +791,7 @@ void CohortDecoder::step() {
     try {
         backend_.verify(groups, tokens, top);
     } catch (const std::logic_error& ex) {  // contract violations stay fatal after the cleanup
-        fail_forward("verify", ex);
+        cleanup_keeping_contract_error([&] { fail_forward("verify", ex); });
         throw;
     } catch (const std::exception& ex) {
         fail_forward("verify", ex);
@@ -823,7 +839,7 @@ void CohortDecoder::step() {
     try {
         backend_.commit(keep);
     } catch (const std::logic_error& ex) {  // contract violations stay fatal after the cleanup
-        fail_forward("commit", ex);
+        cleanup_keeping_contract_error([&] { fail_forward("commit", ex); });
         throw;
     } catch (const std::exception& ex) {
         fail_forward("commit", ex);

@@ -1316,6 +1316,11 @@ class FaultBackend final : public FakeBackend {
 public:
     using FakeBackend::FakeBackend;
     bool bind = false, restore_throws = false, capture_throws = false, verify_throws = false, commit_throws = false;
+    bool verify_contract = false, release_throws = false;
+    void release(std::uint32_t lane) override {
+        FakeBackend::release(lane);
+        if (std::exchange(release_throws, false)) throw std::runtime_error("injected release failure");
+    }
     void bind_lane(std::uint32_t, std::uint64_t, std::span<const std::uint32_t>) override {
         if (std::exchange(bind, false)) throw std::runtime_error("injected bind_lane failure");
     }
@@ -1329,6 +1334,7 @@ public:
     void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                 std::span<std::uint32_t> top) override {
         if (std::exchange(verify_throws, false)) throw std::runtime_error("injected verify failure");
+        if (std::exchange(verify_contract, false)) throw std::logic_error("injected verify contract violation");
         FakeBackend::verify(groups, tokens, top);
     }
     void commit(std::span<const std::uint32_t> accept) override {
@@ -1410,6 +1416,30 @@ void test_backend_faults() {
     fault_scenario("fault capture", [](FaultBackend& be) { be.capture_throws = true; }, 0, false);
     fault_scenario("fault verify", [](FaultBackend& be) { be.verify_throws = true; }, 1, true);
     fault_scenario("fault commit", [](FaultBackend& be) { be.commit_throws = true; }, 1, true);
+    // A contract violation stays the error that leaves the decoder even when a release fails during its cleanup.
+    {
+        FaultBackend be(4, 32, 23);
+        CohortConfig cfg;
+        cfg.context_draft = false;
+        cfg.max_draft = 0;
+        CohortDecoder dec(be, cfg);
+        be.verify_contract = true;
+        be.release_throws = true;
+        dec.submit(fault_request(1, 23));
+        std::string caught = "none";
+        for (int s = 0; s < 200 && !dec.idle() && caught == "none"; ++s) {
+            try {
+                dec.step();
+            } catch (const std::logic_error& e) {
+                caught = std::string("logic_error: ") + e.what();
+            } catch (const std::exception& e) {
+                caught = std::string("other: ") + e.what();
+            }
+        }
+        check(caught == "logic_error: injected verify contract violation",
+              "fault verify contract + release failure: the contract error is rethrown (" + caught + ")");
+        check(dec.live() == 0, "fault verify contract + release failure: the lane is retired");
+    }
 }
 
 int main() {

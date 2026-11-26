@@ -650,14 +650,18 @@ void run_decoder_pair_failure() {
     check(thrown.empty(), "pair failure: the decoder loop and close() do not throw (" + thrown + ")");
     // The verify failure fails the lanes of that forward; a lane still in its prompt then fails its prefill cleanly.
     check(first.size() == 2, "pair failure: both requests return a result");
-    std::size_t by_verify = 0;
+    // The fake backend is deterministic: exactly one lane fails in the verify, the other in its prefill after the abort.
+    std::size_t by_verify = 0, by_abort = 0;
     for (const auto& r : first) {
         by_verify += r.error.find("verify: rank 0 verify failed") != std::string::npos ? 1U : 0U;
-        check(r.finish == "error" && (r.error.find("rank 0 verify failed") != std::string::npos ||
-                                      r.error.find("link aborted by an earlier failure") != std::string::npos),
-              "pair failure: request " + std::to_string(r.id) + " fails cleanly (" + r.error + ")");
+        by_abort += r.error.find("prefill:") != std::string::npos &&
+                            r.error.find("link aborted by an earlier failure") != std::string::npos
+                        ? 1U
+                        : 0U;
+        check(r.finish == "error", "pair failure: request " + std::to_string(r.id) + " fails cleanly (" + r.error + ")");
     }
-    check(by_verify >= 1, "pair failure: the failed forward's lane carries the verify error");
+    check(by_verify == 1 && by_abort == 1, "pair failure: one lane carries the verify error, the other the prefill abort (verify " +
+                                               std::to_string(by_verify) + ", abort " + std::to_string(by_abort) + ")");
     check(be0.releases >= 2, "pair failure: rank 0 frees its lanes after the abort");
     check(later.size() == 1 && later[0].finish == "error" &&
               later[0].error.find("link aborted by an earlier failure") != std::string::npos,
