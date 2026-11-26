@@ -28,6 +28,13 @@ inline constexpr std::array<strix::profile::Lever, 14> profile_table{{
      false, {}, true, {}, {{{"0", "v1"}, {"1", "ds41-fast-pf-v1"}}}},
     {"dense_min_rows", "STRIX_DS41_FAST_DENSE_MIN_ROWS", "", {}, "128", strix::profile::Kind::bit_changing,
      {}, {true, true, true, true}, "", "", "FAST dense dispatch threshold", false, {}, true, {}, {{{"128", "v1"}}}},
+    // One decision for the complete D1 composition, before replay so the replay receipt binds over D1. A benchmark outside the receipt must explicitly
+    // set the constituent switches. Pending startup never exports request-specific arithmetic.
+    {"d1_prefill", "", "", {"", "1", "", ""}, "0", strix::profile::Kind::bit_changing,
+     {true, true, true, false}, {true, false, true, false}, "D1 full prefill", "0",
+     "D1: BF16 flash attention, FP16 dense, relaxed MoE with FP16 down, FP16 Engram and shared expert. Replay OFF. "
+     "Unmatched requests retain the previous prefill route (explicit switches still apply).",
+     false, {}, true, {}, {{{"0", "v1"}, {"1", "ds41-prefill-d1-v1"}}}},
     // Prefill only: FAST policy ds41-decoder-replay-bounded-v1 (value R rows, a multiple of 128): every decoder layer runs
     // its last R rows, window keys floored at the cut, its dense products in the exact form (bounded run == full run
     // with the floor, bit for bit; not bit-equal to the full decode). 'fast' runs R=256 (key floor
@@ -67,13 +74,6 @@ inline constexpr std::array<strix::profile::Lever, 14> profile_table{{
      {}, {true, true, true, true}, "", "0", "explicit BF16 hi/lo attention diagnostic", false, {}, true, {}, {{{"0", "v1"}, {"1", "bf16-hi-lo-v1"}}}},
     {"prefill_fp16_dense_lt", "STRIX_DS41_PREFILL_FP16_DENSE", "", {"", "", "", ""}, "0", strix::profile::Kind::bit_changing,
      {}, {}, "", "0", "explicit FP16 dense diagnostic; requires the optional hipBLASLt build", false, {}, true, {}, {{{"0", "v1"}, {"1", "fp16-hipblaslt-v1"}}}},
-    // One decision for the complete D1 composition. A benchmark outside the receipt must explicitly
-    // set the constituent switches. Pending startup never exports request-specific arithmetic.
-    {"d1_prefill", "", "", {"", "1", "", ""}, "0", strix::profile::Kind::bit_changing,
-     {true, true, true, false}, {true, false, true, false}, "D1 full prefill", "0",
-     "D1: BF16 flash attention, FP16 dense, relaxed MoE with FP16 down, FP16 Engram and shared expert. Replay OFF. "
-     "Unmatched requests retain the previous prefill route (explicit switches still apply).",
-     false, {}, true, {}, {{{"0", "v1"}, {"1", "ds41-prefill-d1-v1"}}}},
 }};
 
 inline constexpr std::string_view kFastGateD1 =
@@ -89,27 +89,27 @@ inline constexpr strix::profile::LadderRow ladder_rows[] = {
     // Band receipts (bind_band_receipts per request): the complete D1 composition and, on top of it, the bounded
     // decoder replay R=256. Timed on the pair CLI (gfx1151, one request) at 8,192 and 32,768 prompt tokens; the quality
     // arms at 8,128 gave the same direction (16.148 / 16.179 s EXACT, 12.564 / 12.695 s D1). Outside the bands, or
-    // when either rank declines, the request keeps the previous prefill route.
+    // when either rank declines, the request keeps the previous prefill route. The 8,128 timing is D1 only.
     {.lever = "d1_prefill", .value = "1", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
      .device = "gfx1151", .min_context = 4096, .max_context = 8192, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1614.0 / 1128.5, .noise = 0.05,
-     .receipt = "D1 final 8K PASS. Pair CLI 8,192 tokens: EXACT 1,128.5 tok/s, D1 1,614 / 1,647 tok/s (no replay).",
-     .band_bound = true},
+     .receipt = "D1 final 8K PASS. Pair CLI 8,192 tokens: EXACT 1,128.5 tok/s, D1 1,614 / 1,647 tok/s (no replay). Quality runner 8,128 tokens: EXACT 16.148 / 16.179 s, D1 12.564 / 12.695 s.",
+     .band_bound = true, .band_evidence = {{8128, 8192}, {8128, 32768}, kFastGateD1, true}},
     {.lever = "d1_prefill", .value = "1", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
      .device = "gfx1151", .min_context = 8193, .max_context = 32768, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1808.6 / 1257.2, .noise = 0.05,
      .receipt = "D1 final 32K PASS. Pair CLI 32,768 tokens: EXACT 1,257.2 tok/s, D1 1,808.6 tok/s (no replay).",
-     .band_bound = true},
+     .band_bound = true, .band_evidence = {{32768}, {8128, 32768}, kFastGateD1, true}},
     {.lever = "decoder_replay", .value = "256", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
      .device = "gfx1151", .min_context = 4096, .max_context = 8192, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1855.0 / 1647.0, .noise = 0.05,
      .receipt = "D1R final PASS. Pair CLI 8,192 tokens over D1: 1,614 / 1,647 tok/s without replay, 1,855 tok/s with R=256.",
-     .band_bound = true},
+     .band_bound = true, .band_evidence = {{8192}, {8128, 32768}, kFastGateD1R, true}},
     {.lever = "decoder_replay", .value = "256", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
      .device = "gfx1151", .min_context = 8193, .max_context = 32768, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1981.0 / 1808.6, .noise = 0.05,
      .receipt = "D1R final PASS. Pair CLI 32,768 tokens over D1: 1,808.6 tok/s without replay, 1,981 tok/s with R=256.",
-     .band_bound = true},
+     .band_bound = true, .band_evidence = {{32768}, {8128, 32768}, kFastGateD1R, true}},
 };
 
 }  // namespace strix::deepseek41::pair_defaults

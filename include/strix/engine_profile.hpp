@@ -230,6 +230,19 @@ struct JointLadderScope {
 
 // One measured regime of one lossy cell: `speedup` = throughput of `tier` / throughput of the tier below on the same
 // build, device and regime (an ABAB receipt), `noise` its stated margin.
+struct BandEvidence {
+    // Zero entries are unused. Timing points can just miss the nominal edge when CLI and serving count the
+    // same fixture differently. Gate lengths record held-out workloads, independently of timing.
+    std::array<std::uint64_t, 4> timed{};
+    std::array<std::uint64_t, 4> gated{};
+    std::string_view gate_scope{};
+    // The lower edge has no timing within kBandEdgeTolerance tokens (EDGE-TIMING PENDING in the band inventory).
+    bool lower_edge_unproven = false;
+    // Edge state, data: true narrows an unproven band to its first in-band timing point. False (every row until the
+    // device edge timings report) keeps the nominal band, so a pending edge never removes a tier default unmeasured.
+    bool narrow_to_floor = false;
+};
+
 struct LadderRow {
     std::string_view lever;  // profile row name (or weight-load policy key)
     std::string_view value;  // the measured value of the cell (empty: every value)
@@ -275,7 +288,31 @@ struct LadderRow {
     // the device class and the band, and only where the execution is known (priced workload, device product). Unbound
     // (no execution) it matches nothing.
     bool band_bound = false;
+    BandEvidence band_evidence{};
 };
+
+// Bound the rounding allowance to three tokens (the same fixture can differ by a few tokens by entry point).
+inline constexpr std::uint64_t kBandEdgeTolerance = 3;
+
+[[nodiscard]] constexpr bool band_edge_timed(const LadderRow& row) noexcept {
+    return std::any_of(row.band_evidence.timed.begin(), row.band_evidence.timed.end(), [&](std::uint64_t tokens) {
+        return tokens != 0 && tokens <= row.max_context &&
+               (tokens >= row.min_context ? tokens - row.min_context : row.min_context - tokens) <= kBandEdgeTolerance;
+    });
+}
+
+// The configured band is retained for the device campaign. An unproven edge keeps the nominal band until its row sets
+// narrow_to_floor; then it starts at the first winning measurement inside it. A band with missing or inconsistent
+// evidence (no timing at a proven edge, no in-band timing for an unproven one) cannot match any request.
+[[nodiscard]] constexpr std::uint64_t ladder_min_context(const LadderRow& row) noexcept {
+    if (!row.band_bound) return row.min_context;
+    if (!row.band_evidence.lower_edge_unproven) return band_edge_timed(row) ? row.min_context : 0;
+    std::uint64_t first = 0;
+    for (const auto tokens : row.band_evidence.timed)
+        if (tokens != 0 && tokens >= row.min_context && tokens <= row.max_context && (first == 0 || tokens < first))
+            first = tokens;
+    return first == 0 || row.band_evidence.narrow_to_floor ? first : row.min_context;
+}
 
 // Receipts of incumbent grants for cells that ran before the ladder rule without a quality gate of their own.
 inline constexpr std::string_view kProvisionalBeforeLadder =
@@ -338,7 +375,7 @@ struct ReceiptKey {
         return false;
     const auto& regime = *key.regime;
     if (row.phase != regime.phase || row.device.empty() || row.device != regime.device ||
-        !ladder_band(regime.context, row.min_context, row.max_context, regime.lanes, row.min_lanes, row.max_lanes))
+        !ladder_band(regime.context, ladder_min_context(row), row.max_context, regime.lanes, row.min_lanes, row.max_lanes))
         return false;
     if (key.joint.empty())
         return !key.reference.empty() && !regime.execution.empty() && row.over == key.reference;
@@ -1467,6 +1504,9 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         if (!valid_ladder_measurement(row.speedup, row.noise)) return where + ": invalid speedup or noise";
         if (row.min_context < 1 || row.min_context > row.max_context || row.min_lanes < 1 || row.min_lanes > row.max_lanes)
             return where + ": ladder row band empty or unordered";
+        if (row.band_bound && (ladder_min_context(row) == 0 ||
+                               row.band_evidence.lower_edge_unproven == band_edge_timed(row)))
+            return where + ": band has no timing receipt at its lower edge or an explicitly narrowed measured floor";
     }
     return {};
 }
@@ -1486,7 +1526,9 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
                         out.push_back({phase, context, lanes, device});
     for (const auto& row : engine.ladder) {
         if (row.incumbent) continue;
-        const std::uint64_t contexts[] = {row.min_context, row.max_context, row.min_context - 1,
+        const auto floor = ladder_min_context(row);
+        if (floor == 0) continue;
+        const std::uint64_t contexts[] = {row.min_context, floor, floor - 1, row.max_context, row.min_context - 1,
                                           row.max_context == kNoContextBound ? row.max_context : row.max_context + 1};
         const std::uint32_t lanes[] = {row.min_lanes, row.max_lanes, row.min_lanes - 1,
                                        row.max_lanes == kNoLaneBound ? row.max_lanes : row.max_lanes + 1};

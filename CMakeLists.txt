@@ -2773,6 +2773,13 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-profile-fast-set-tests)
     add_test(NAME strix-profile-fast-set-tests COMMAND strix-profile-fast-set-tests)
     set_tests_properties(strix-profile-fast-set-tests PROPERTIES LABELS "cpu;profile" TIMEOUT 60)
+    add_executable(strix-band-inventory tools/band_inventory.cpp)
+    target_include_directories(strix-band-inventory PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_features(strix-band-inventory PRIVATE cxx_std_20)
+    strix_target_warnings(strix-band-inventory)
+    add_test(NAME strix-band-inventory-current COMMAND strix-band-inventory check
+             ${CMAKE_CURRENT_SOURCE_DIR}/docs/band-edges.json ${CMAKE_CURRENT_SOURCE_DIR}/docs/band-edges.md)
+    set_tests_properties(strix-band-inventory-current PROPERTIES LABELS "cpu;profile" TIMEOUT 60)
     # Ladder rule over every engine table: no regime resolves to a cell not measured faster than the cell below it.
     add_executable(strix-profile-ladder-tests tests/profile_ladder_tests.cpp src/minimax/engine/mm_defaults.cpp
         src/ds41_rtx_profile.cpp src/gemma4/engine/profile.cpp src/cuda/models/glm/producer/profile.cpp)
