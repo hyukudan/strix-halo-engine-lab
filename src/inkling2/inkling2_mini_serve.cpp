@@ -75,7 +75,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.prepared_round_fold = mini_prepared_round_fold(resolution);
     out.experts_nvfp4 = mini_experts_nvfp4(resolution);
     out.combine_image = mini_combine_image(resolution);
-    out.served_route_requested = mini_served_cli_route(resolution);
+    (void)mini_served_cli_route(resolution);  // a malformed served route setting refuses the server here
     out.attn_projected_bias = mini_attn_projected_bias(resolution);
     out.screened_head = mini_screened_head(resolution);
     out.controller_one_plane = mini_controller_one_plane(resolution);
@@ -100,9 +100,10 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.verify_rows = mini_speculation_verify_rows(mini_verify_rows(resolution), out.speculation);
     // The W4A4 class is admitted for the resolved backend (HIP refuses a selected class instead of running BF16).
     out.moe_w4a4 = admit_mini_moe_w4a4(resolution, resolved.backend);
-    // Backend admission of the served route lever (kMiniServedCliRoute): HIP runs the command line's route, a CUDA
-    // server declines it (requested stays in the receipt, mini_served_route_startup_field).
+    // Admission of the served route lever (kMiniServedCliRoute): a server of either backend runs the command line's
+    // route (mini_served_prefill_emits_first; the receipt carries requested / admitted, mini_served_route_startup_field).
     const bool hip = resolved.backend == "hip";
+    out.served_route_requested = mini_served_route_request(resolution, hip);
     out.served_cli_route = mini_served_prefill_emits_first(hip, out.served_route_requested);
     if (hip && (out.packed_decode_flag || out.grouped_decode_flag))
         throw std::invalid_argument("a HIP Inkling server takes no decode form flag (the served route lever row sets it)");
@@ -125,15 +126,18 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
         // whatever chunk the schedule took; an implicit chunk retries at the command line's fallback rows when its
         // device workspaces are refused (serve::load_with_chunk_fallback).
         out.lane_rows = std::min(explicit_rows.value_or(kMiniServeLaneRows), out.context);
-        out.prefill_fallback_rows = explicit_rows    ? 0U
-                                    : hip_tall_chunk ? kMiniServedHeldBackChunk
-                                                     : mini_served_prefill_fallback_rows(hip, out.served_cli_route, out.tier);
     } else {
         if (out.prefill_rows == 0U) throw std::invalid_argument("--prefill-rows must be positive");
         // An explicit chunk without --slots also caps the lanes (the clamped chunk), as on the incumbent route.
         if (explicit_rows) out.lane_rows = out.prefill_rows;
         out.prefill_tail = mini_prefill_tail_capacity(out.prefill_rows, schedule.tail_divisor, out.context);
     }
+    // An implicit chunk on a chunk-invariant backend (CUDA) retries at the command line's fallback rows when its slots
+    // fall short (serve::load_with_chunk_ladder); with the lever those smaller candidates run the held-back route. The
+    // explicit HIP tall-chunk option falls back to the incumbent 128 rows.
+    out.prefill_fallback_rows = explicit_rows    ? 0U
+                                : hip_tall_chunk ? kMiniServedHeldBackChunk
+                                                 : mini_served_prefill_fallback_rows(hip, out.tier);
     return resolved;
 }
 
@@ -193,18 +197,18 @@ private:
         serve::ApiConfig config;
         cohort_.configure_api(config);
         config.capabilities_extra = [cohort = std::move(config.capabilities_extra), tier = opt.tier,
-                                     requested = opt.served_route_requested, admitted = opt.served_cli_route,
+                                     requested = opt.served_route_requested, admitted = device_.served_route,
                                      weights = device_.weights,
                                      speculation = std::string(mini_served_speculation_name(opt))](serve::Json& value) {
             cohort(value);
             value.set("profile", serve::Json(mini_profile_name(tier)));
-            // The served route lever, only when requested (absent: the incumbent route, as before the lever): what was
-            // requested, what this backend admitted, and the qualification of the admitted route.
+            // The served route lever, only when requested (absent: the held-back route): what was requested, what this
+            // backend admitted, and the qualification of the admitted route (the lever row's receipts, q44 / q45).
             if (requested)
                 value.set("served_route", serve::Json(serve::Json::Object{
                     {"requested", serve::Json(true)},
                     {"admitted", serve::Json(admitted)},
-                    {"qualification", serve::Json(admitted ? "unqualified" : "n/a")},
+                    {"qualification", serve::Json(admitted ? "qualified" : "n/a")},
                 }));
             value.set("weight_load", serve::Json(serve::Json::Object{
                 {"storage", serve::Json(weights.storage.name)},

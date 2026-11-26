@@ -97,11 +97,18 @@ waits about one piece and one decode round (190 ms on an RTX PRO 6000); the
 pieces run back to back with one decode round between them (prompt share 0,
 `STRIX_SERVE_PROMPT_SHARE` replaces it); every prompt row,
 a one-row chunk included, runs the prefill form, so the bits do not change
-with the chunk or the pieces. The served route switch `STRIX_INK_SERVED_CLI_ROUTE=1`
-(`inkling2-mini-served-cli-route@1`, off in every profile column) makes a HIP
-server run the command line's route; a CUDA server declines it. The startup
+with the chunk or the pieces. A CUDA server runs the command line's route by
+default (`inkling2-mini-served-cli-route@1`, the build's behaviour; the switch
+`STRIX_INK_SERVED_CLI_ROUTE=0` keeps the held-back route above): the final
+prompt row is a prefill row and the first id comes from it, as on the command
+line, so the served EXACT ids are the command line's (RTX PRO 6000: 8/8 prompts,
+at the held-back route's speed and slot bytes). The chunk ladder still guards
+the slot count: the command line's chunk runs this route, a smaller candidate
+runs the held-back route (one startup line says so). A HIP server runs it only
+with `STRIX_INK_SERVED_CLI_ROUTE=1` (its working memory per slot grows with the
+command line's chunk and tail). The startup
 line reports it as `served_route off`, `declined`, or `on qualification
-unqualified` with its form, chunk and tail; the command line prints
+qualified` with its form, chunk and tail; the command line prints
 `strix-served-route/v1 ... effective n/a`. On that route decode is packed and
 a served lane keeps the bits of its own lone decode at any cohort width:
 cohorts run in passes of at most 16 lanes, the row limit of the dense one-row

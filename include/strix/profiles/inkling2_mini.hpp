@@ -156,12 +156,15 @@ inline constexpr std::string_view kMiniPreparedRoundFold = "inkling2-mini-prepar
 // HIP selects its projected route in its own binding). The default in every tier after the RTX identity receipts
 // (cuda_pf2-kit); an explicit 0 keeps the incumbent image route. Switch: STRIX_INK_ATTN_PROJECTED_BIAS=0/1.
 inline constexpr std::string_view kMiniAttnProjectedBias = "inkling2-mini-attn-projected-bias@1";
-// Served route lever, opt-in: a HIP server runs the command line's route (packed decode unless a flag selects grouped,
-// the whole prompt by the command line's chunks and tail rule, the first id from the final prefill row), so a served
-// lane carries the bits of the same request on the command line at any cohort width. Off in every profile column (all
-// cells empty, builtin 0): the served default keeps its incumbent route (the last prompt token held back and decoded,
-// grouped cohort decode) until the migration is qualified against it. Select it with STRIX_INK_SERVED_CLI_ROUTE=1 (any
-// profile); a CUDA server declines it. The command line always runs this route and does not read the switch.
+// Served route lever: the server runs the command line's route (the command line's decode form, the whole prompt by
+// the command line's chunks and tail rule, the first id from the final prefill row), so a served lane carries the bits
+// of the same request on the command line at any cohort width (CLI == server). The build's behaviour (builtin 1, no
+// profile column sets it) after the RTX receipts (cuda_pf2-kit q44: served prefill == CLI prefill bitwise; q45: server
+// ids == CLI ids 8/8 at the held-back route's speed, slot bytes equal): the held-back served EXACT ids were a defect
+// (q43: 1/8 equal to the command line). A CUDA server runs it; a HIP server only when set explicitly
+// (mini_served_route_request: its per-slot working memory, the command line's chunk instead of the 128-row held-back
+// chunk, awaits its own decision). An explicit 0 keeps the held-back route (the last prompt token decoded as the first
+// decode row). The command line always runs this route and does not read the switch.
 inline constexpr std::string_view kMiniServedCliRoute = "inkling2-mini-served-cli-route@1";
 // Draft CUDA controller schedule. One plane requires explicit selection and a resident weight certificate.
 inline constexpr std::string_view kMiniControllerPlanes = "inkling2-mini-controller-planes@1";
@@ -237,11 +240,12 @@ inline constexpr std::array<profile::Lever, 19> kMiniLevers{{
      "q27 served on origin/main (ids equal lever off vs on)",
      false, {}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniServedCliRoute, .env = "STRIX_INK_SERVED_CLI_ROUTE", .option = "",
-     .value = {"", "", "", ""}, .builtin = "0",
+     .value = {"", "", "", ""}, .builtin = "1",
      .kind = profile::Kind::bit_changing, .ready = {false, false, false, false},
      .runnable = {true, true, true, true}, .target = "", .off = "0",
-     .source = "waits for the served migration identity (served lanes against the incumbent served route); device "
-               "evidence so far: served cohort lanes == the same served decoder's lone lane at cohort widths 2..17",
+     .source = "RTX receipts (cuda_pf2-kit): q44 served prefill == CLI prefill bitwise (first id, scores, KV, histories, "
+               "4 decode steps; pieces) and lanes == lone; q45 server ids == CLI ids 8/8, C1 / C8 / gap / slot bytes equal "
+               "to the held-back route; HIP: ink_fix2 t1 server ids == CLI 128/128",
      .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniScreenedHead, .env = "STRIX_INK_SCREENED_HEAD", .option = "",
      .value = {"1", "1", "1", ""}, .builtin = "0",

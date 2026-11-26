@@ -806,19 +806,19 @@ void test_screened_head_decision() {
 }
 }  // namespace
 
-// The served route row: opt-in in every profile column (EXACT, FAST and TURBO keep the incumbent served route), an
-// explicit 1 selects it and labels the run unqualified until its migration is qualified, 0 keeps it off.
+// The served route row: the build's behaviour (builtin 1, no profile column sets it) after the RTX receipts q44 / q45; an
+// explicit 0 keeps the held-back route. A HIP server takes it only when set explicitly.
 void test_served_route() {
     const profile::Lever* lever = nullptr;
     for (const auto& row : mini::kMiniProfile.table)
         if (row.name == mini::kMiniServedCliRoute) lever = &row;
     require(lever != nullptr && lever->name == "inkling2-mini-served-cli-route@1" &&
-                lever->env == "STRIX_INK_SERVED_CLI_ROUTE" && lever->builtin == "0" && lever->off == "0" &&
+                lever->env == "STRIX_INK_SERVED_CLI_ROUTE" && lever->builtin == "1" && lever->off == "0" &&
                 lever->kind == profile::Kind::bit_changing && lever->omit_builtin_fingerprint,
             "served route row identity");
     for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
         require(lever->value[static_cast<unsigned>(tier)].empty() && !lever->ready[static_cast<unsigned>(tier)],
-                "served route: no profile column selects it");
+                "served route: no profile column sets it (the builtin runs it)");
         for (const char* value : {static_cast<const char*>(nullptr), "0", "1"}) {
             mini::MiniWeightOptions options;
             options.tier.profile = tier;
@@ -826,14 +826,21 @@ void test_served_route() {
                 return std::strcmp(key, "STRIX_INK_SERVED_CLI_ROUTE") == 0 ? value : nullptr;
             };
             const auto resolution = mini::resolve_mini_profile(options, true);
-            const bool on = value != nullptr && std::strcmp(value, "1") == 0;
-            require(mini::mini_served_cli_route(resolution) == on, "served route: explicit opt-in only");
-            require((resolution.qualification() == "qualified") == !on, "served route: an opt-in run is unqualified");
+            const bool explicit_on = value != nullptr && std::strcmp(value, "1") == 0;
+            const bool on = explicit_on || value == nullptr;
+            require(mini::mini_served_cli_route(resolution) == on, "served route: the column, an explicit 1 or 0");
+            require(resolution.qualification() == "qualified", "served route: every setting is qualified");
+            // The backend's request: CUDA runs the resolved value, HIP an explicit 1 only.
+            require(mini::mini_served_route_request(resolution, false) == on &&
+                        mini::mini_served_route_request(resolution, true) == explicit_on,
+                    "served route: CUDA takes the column, HIP an explicit setting only");
             // The command line's resolution: the request stays visible on its own line, never as an effective lever.
             auto cli = resolution;
             mini::mini_cli_decline_served_route(cli);
-            require(!mini::mini_served_cli_route(cli) && cli.qualification() == "qualified" &&
-                        cli.summary().find("served-cli-route") == std::string::npos,
+            const auto* declined = cli.find(mini::kMiniServedCliRoute);
+            require(declined != nullptr && declined->value == lever->builtin &&
+                        (declined->status == profile::Status::builtin || declined->status == profile::Status::off) &&
+                        cli.qualification() == "qualified" && cli.summary().find("served-cli-route") == std::string::npos,
                     "served route: the command line's summary and qualification carry no server-only setting");
             require(mini::mini_served_route_cli_line(cli) ==
                         std::string("strix-served-route/v1 requested ") + (on ? "1" : "0") +

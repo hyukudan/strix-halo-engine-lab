@@ -416,8 +416,10 @@ void profile_parity() {
     std::optional<mini::MiniServeOptions> loaded;
     const auto create = [&](const mini::MiniServeOptions& options) {
         loaded = options;
+        // The load admits the requested served route (no chunk ladder fallback in this fixture).
         return mini::MiniServeCohort{
-            std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(), 32U, 3U, 2U), {}, {}, 0U};
+            std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(), 32U, 3U, 2U), {}, {}, 0U,
+            sv::kMixedServiceShortPieces, options.served_cli_route};
     };
     sv::ServiceFactories factories;
     mini::install_mini_service(factories, {create, create},
@@ -595,20 +597,29 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         // The served prefill resolves the down-image lever like the CLI and the gate do: off unless selected explicitly.
         require(options.combine_image == image, "down-image selection did not reach native adapter");
         require(options.controller_one_plane == controller_one_plane, "controller plane value did not reach native adapter");
-        // The served route lever (opt-in in every profile column): a HIP server runs the command line's route only when
-        // STRIX_INK_SERVED_CLI_ROUTE=1 selects it; a CUDA server declines it and keeps the requested bit in its receipt.
+        // The served route lever (selected by every profile column): a CUDA server runs the command line's route unless
+        // STRIX_INK_SERVED_CLI_ROUTE=0; a HIP server only when STRIX_INK_SERVED_CLI_ROUTE=1 selects it explicitly.
         const bool hip_backend = std::string_view(backend) == "hip";
-        const bool route = cli_route && hip_backend;
-        require(options.served_route_requested == cli_route && options.served_cli_route == route,
-                "served route lever: opt-in, HIP only");
+        const char* route_env = std::getenv("STRIX_INK_SERVED_CLI_ROUTE");
+        const bool explicit_off = route_env != nullptr && std::string_view(route_env) == "0";
+        const bool route = cli_route || (!hip_backend && !explicit_off);
+        require(options.served_route_requested == route && options.served_cli_route == route,
+                "served route lever: CUDA default on (explicit 0 off), HIP explicit 1 only");
         const auto field = mini::mini_served_route_startup_field(options);
         // Without a decoder the tail is the offered capacity; the startup line prints what the decoder admitted.
         require(!route || (field.find(" prefill_tail_offered " + std::to_string(options.prefill_tail) + ' ') != std::string::npos &&
                            mini::mini_served_route_startup_field(options, 0U).find(" prefill_tail 0 ") != std::string::npos),
                 "served route receipt: offered tail without a decoder, the decoder's admitted tail at startup");
-        require(route ? field.starts_with("on qualification unqualified moe_decode packed ")
-                      : field == (cli_route ? "declined" : "off"),
-                "served route receipt: off, declined or on with its qualification");
+        // The field names the lever decoder's decode form: the CUDA flags (HIP takes none).
+        if (route && !hip_backend) {
+            auto grouped = options;
+            grouped.grouped_decode_flag = true;
+            require(mini::mini_served_route_startup_field(grouped).starts_with(
+                        "on qualification qualified moe_decode grouped "),
+                    "served route receipt: a CUDA --grouped-decode lever decoder is named grouped");
+        }
+        require(route ? field.starts_with("on qualification qualified moe_decode packed ") : field == "off",
+                "served route receipt: off or on with its qualification");
         const unsigned context = shape.context.value_or(8192U);
         require(options.context == context && options.slots == shape.slots.value_or(0U), "served shape options");
         if (!route) {
@@ -664,15 +675,32 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         } else {
             // With the lever: the command line's chunk and tail rule, emits-first; lanes = --slots, else an explicit
             // (clamped) --prefill-rows, else the served lane cap.
-            const auto cli = mini::mini_prefill_schedule_from_env(true, options.tier);
+            const auto cli = mini::mini_prefill_schedule_from_env(hip_backend, options.tier);
             const unsigned chunk = std::min(shape.prefill_rows.value_or(cli.chunk), context);
             const unsigned lanes = shape.slots.value_or(0U) != 0U ? *shape.slots
                                    : shape.prefill_rows                ? chunk
                                                                        : mini::kMiniServeLaneRows;
+            const auto rule = mini::mini_prefill_piece_rule(hip_backend, true);
+            // The chunk ladder: HIP one candidate; an implicit CUDA chunk keeps the held-back ladder, whose smaller
+            // candidates run the held-back route (the lever runs at the command line's chunk only).
+            const unsigned fallback = hip_backend || shape.prefill_rows ? 0U
+                : mini::mini_cli_prefill_fallback_rows(mini::MiniPrefillBackend::cuda, options.tier);
             require(options.prefill_rows == chunk && mini::mini_serve_lane_rows(options) == lanes &&
                         options.prefill_tail == mini::mini_prefill_tail_capacity(chunk, cli.tail_divisor, context) &&
-                        mini::mini_prefill_piece_rule(true, true).cuttable(),
-                    "lever on: the command line's schedule and the served lane cap");
+                        (hip_backend || options.prefill_tail == 0U) && rule.cuttable() &&
+                        options.prefill_fallback_rows == fallback &&
+                        mini::mini_served_chunk_ladder(options.prefill_rows, options.prefill_fallback_rows).rows[0] ==
+                            chunk,
+                    "lever on: the command line's schedule (CUDA: no tail) at the first candidate, the served lane cap");
+            // CUDA: the lever's prompts take the CUDA cut rule and the long pieces beside a decoding lane, as on the
+            // held-back route (the device cohort's pieces follow the backend, not the route).
+            if (!hip_backend) {
+                const auto wide = mini::mini_serve_scheduling(chunk, rule, mini::kMiniCudaServePieces);
+                require(rule.align == 32U && rule.short_rows == 32U &&
+                            wide.prompt_slice_decoding == (chunk > 1024U ? 1024U : 0U),
+                        "lever on, CUDA: 32-row cut rule and the 1024-row pieces");
+                sv::validate_prompt_pieces(wide, rule, chunk);
+            }
         }
         // The served tier is the registry preset's native column for the requested --profile (models/inkling2-mini.toml:
         // TURBO: the engine's TURBO column on HIP, the FAST column elsewhere), resolved by the native command line's
@@ -702,7 +730,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         if (options.attn_projected_bias) observed = [&served_dispatches] { return served_dispatches; };
         return mini::MiniServeCohort{
             std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable), 32U, 3U, 2U), weights,
-            std::move(observed), 0U};
+            std::move(observed), 0U, sv::kMixedServiceShortPieces, options.served_cli_route};
     };
     mini::MiniServeBackends backends;
     if (std::string_view(backend) == "hip") backends.hip = create;
@@ -890,14 +918,17 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                      (weights->find("storage")->as_string() == (qualify_q8 ? "gguf.q8_0" : "plain.bf16") &&
                       weights->find("status")->as_string() == (qualify_q8 ? "unqualified" : "pending"))),
                     "Inkling capability response does not match the loaded plan");
-            // The served route lever: absent without a request (the incumbent capabilities), else requested / admitted
-            // (HIP only) / qualification of the admitted route.
+            // The served route lever: absent without a request (the held-back route), else requested / admitted /
+            // qualification of the admitted route. CUDA requests the column (on unless an explicit 0), HIP an explicit 1.
             const auto* route = effective.find("served_route");
-            const bool admitted = cli_route && std::string_view(backend) == "hip";
-            require((route != nullptr) == cli_route &&
-                        (!route || (route->find("requested")->as_bool() && route->find("admitted")->as_bool() == admitted &&
-                                    route->find("qualification")->as_string() == (admitted ? "unqualified" : "n/a"))),
-                    "Inkling capability response misreports the served route lever");
+            const char* route_env = std::getenv("STRIX_INK_SERVED_CLI_ROUTE");
+            const bool explicit_off = route_env != nullptr && std::string_view(route_env) == "0";
+            const bool admitted = cli_route || (std::string_view(backend) != "hip" && !explicit_off);
+            const bool route_ok =
+                (route != nullptr) == admitted &&
+                (!route || (route->find("requested")->as_bool() && route->find("admitted")->as_bool() == admitted &&
+                            route->find("qualification")->as_string() == (admitted ? "qualified" : "n/a")));
+            require(route_ok, "Inkling capability response misreports the served route lever");
             const auto* sampling = effective.find("sampling");
             const auto* temperature = sampling ? sampling->find("positive_temperature") : nullptr;
             require(temperature && temperature->as_string() == (sample_capable ? "sample" : "reject"),
@@ -1052,8 +1083,8 @@ int main(int argc, char** argv) try {
     set_image_env("0");
     wiring(argv[1], "hip", false);
     set_image_env(nullptr);
-    // The served route lever: off by default in every tier (above); STRIX_INK_SERVED_CLI_ROUTE=1 selects the command
-    // line's route on HIP (CUDA declines it and keeps the incumbent shape) in any tier; an explicit 0 keeps it off.
+    // The served route lever: on by default on CUDA in every tier (above), HIP only with an explicit 1; an explicit 0
+    // keeps the held-back route on both.
     set_cli_route_env("1");
     for (const auto* backend : {"hip", "cuda"})
         for (const auto* tier : {"exact", "fast", "turbo"})
@@ -1062,6 +1093,11 @@ int main(int argc, char** argv) try {
                 wiring(argv[1], backend, false, false, W4a4::bf16, tier, false, false, true, shape);
     set_cli_route_env("0");
     wiring(argv[1], "hip", false);
+    // An explicit 0: the held-back shape (CUDA: the chunk ladder and its long pieces) on both backends.
+    for (const auto* backend : {"hip", "cuda"})
+        for (const ServedShape shape : {ServedShape{}, ServedShape{{}, 15U, {}}, ServedShape{8192U, 15U, {}},
+                                        ServedShape{32U, {}, {}}, ServedShape{{}, {}, 9U}})
+            wiring(argv[1], backend, false, false, W4a4::bf16, "exact", false, false, false, shape);
     set_cli_route_env(nullptr);
     // The explicit HIP tall-chunk option: the EXACT BF16 held-back route only (an explicit --prefill-rows, a context of
     // 128 rows or less, another tier and CUDA keep their incumbent shapes).
