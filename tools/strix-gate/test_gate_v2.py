@@ -396,9 +396,17 @@ class Statistics(unittest.TestCase):
             write_routes(path / "cand", [(0, [[2, 1]], [[0.25, 0.75]])])
             self.assertEqual(v2.route_flips(path / "ref", path / "cand")["max_abs_weight_delta"], 0.0)
             for bad_weight in (float("nan"), float("inf"), -float("inf")):
+                # A non-finite candidate weight is failure evidence of the candidate (reported, scored as a fail),
+                # not an error of the recording; a non-finite reference weight is still refused.
                 write_routes(path / "cand", [(0, [[2, 1]], [[bad_weight, 0.75]])])
+                flips = v2.route_flips(path / "ref", path / "cand")
+                self.assertFalse(flips["finite_weights"])
+                self.assertIsNone(flips["max_abs_weight_delta"])
+                write_routes(path / "ref", [(0, [[1, 2]], [[0.75, bad_weight]])])
+                write_routes(path / "cand", [(0, [[2, 1]], [[0.25, 0.75]])])
                 with self.assertRaisesRegex(v2.GateError, "non-finite"):
                     v2.route_flips(path / "ref", path / "cand")
+                write_routes(path / "ref", [(0, [[1, 2]], [[0.75, 0.25]])])
 
     def test_free_route_receipt_rejects_replay_missing_control_and_wrong_counts(self):
         counts = {"records": 3, "rows": 9}

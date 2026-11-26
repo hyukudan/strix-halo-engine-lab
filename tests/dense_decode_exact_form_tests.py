@@ -91,7 +91,8 @@ check("strix-hip-dense-decode-rows-default-tests" in cmake, "CMake: the rows tes
 HOST_FMA_TEST_OPTIONS = re.compile(
     r"(?m)^[ \t]*target_compile_options\("
     r"(?:strix-route-(?:lane-dot|unfused)-contract-test PRIVATE (?:-O3 )?-ffp-contract=fast"
-    r"|strix-attn-chunk-decode-lane-tests PRIVATE -ffp-contract=fast(?:-honor-pragmas)?)\)[ \t]*$"
+    r"|strix-attn-chunk-decode-lane-tests PRIVATE -ffp-contract=fast(?:-honor-pragmas)?"
+    r"|strix-declared-exp-forms-tests PRIVATE -frounding-math -ffp-contract=fast)\)[ \t]*$"
 )
 
 
@@ -107,6 +108,9 @@ check(not forbidden_fast_math("target_compile_options(strix-route-unfused-contra
       "CMake guard: allow explicit host unfused contraction regression")
 check(not forbidden_fast_math("target_compile_options(strix-attn-chunk-decode-lane-tests PRIVATE -ffp-contract=fast)"),
       "CMake guard: allow explicit host attention lane contraction regression")
+check(not forbidden_fast_math(
+    "target_compile_options(strix-declared-exp-forms-tests PRIVATE -frounding-math -ffp-contract=fast)"),
+      "CMake guard: allow the declared exponential forms' contracted host regression")
 check(not forbidden_fast_math(
     "target_compile_options(strix-attn-chunk-decode-lane-tests PRIVATE -ffp-contract=fast-honor-pragmas)"),
       "CMake guard: allow explicit host attention lane contraction regression (Clang)")
