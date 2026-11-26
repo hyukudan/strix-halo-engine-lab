@@ -1,5 +1,6 @@
 // deepseek41 DSpark drafter on CUDA: the kernels of hip_ds41_dspark.hip (wave32 = one CUDA warp, same reduction
 // trees) and the resident drafter, on the CUDA layer core for the operations it shares with the target.
+#include "strix/device/graph_inspection.hpp"
 #include "strix/cuda/ds41_dspark.hpp"
 
 #include "strix/cuda/ds41_core.hpp"
@@ -1006,7 +1007,7 @@ Draft CudaDrafter::draft(std::uint32_t token, bool keep_logits, CudaDraftTimes* 
             STRIX_CUDA_CHECK(cudaStreamBeginCapture(m.st, cudaStreamCaptureModeThreadLocal));
             enqueue_draft_step(m, false, out);
             STRIX_CUDA_CHECK(cudaStreamEndCapture(m.st, &g));
-            STRIX_CUDA_CHECK(cudaGraphInstantiate(&m.graph, g, 0));
+            STRIX_CUDA_CHECK(::strix::device::native::instantiate_segment_graph(&m.graph, g, 0));
             STRIX_CUDA_CHECK(cudaGraphDestroy(g));
             m.graph_core = m.core;
             m.graph_capacity = m.extra_capacity;

@@ -8,11 +8,32 @@
 #include <iostream>
 #include <stdexcept>
 
+// Select the CUDA API spelling and provide the one-node host runtime stand-in.
+#define __CUDACC__ 1
+#include "strix/device/graph_inspection.hpp"
+#undef __CUDACC__
+
 namespace {
 namespace ex = strix::exec;
 
 void check(bool ok, const char* message) {
     if (!ok) throw std::runtime_error(message);
+}
+
+void native_inventory() {
+    namespace native = strix::device::native;
+    std::size_t count = 0;
+    StubGraphNode node{cudaGraphNodeTypeKernel, {}};
+    node.kernel.func = &node;
+    check(native::inspect_raw_step_graph(&node, count) && count == 1U, "valid native leaf refused");
+    node.kernel.blockDim.y = 0;
+    check(native::inspect_segment_graph(&node) == cudaErrorInvalidValue, "invalid kernel block accepted");
+    node.kind = cudaGraphNodeTypeEventRecord;
+    check(!native::inspect_raw_step_graph(&node, count) && native::inspect_segment_graph(&node) == cudaSuccess,
+          "events belong to segmented capture");
+    node.kind = cudaGraphNodeTypeHost;
+    check(native::inspect_segment_graph(&node) == cudaErrorInvalidValue, "host callback in a device segment");
+    check(!native::inspect_raw_step_graph(nullptr, count), "empty capture was accepted");
 }
 
 // Single-stream fake driver. Capture records addresses and commands only. The work at each
@@ -47,7 +68,7 @@ struct Runtime {
 };
 
 void replay_windows() {
-    ex::StepGraphRunner<Runtime::Tape*> runner;
+    ex::StepGraphRunner<Runtime::Tape*> runner{ex::GraphRows::inclusive_window};
     Runtime rt;
     Runtime::Tape first{}, second{};
     auto* destination = &first;
@@ -73,6 +94,12 @@ void replay_windows() {
     } catch (const std::invalid_argument&) {}
     check(rt.launches == 3 && rt.uploads == 3, "invalid header submitted work");
     block.h.valid_mask = 3;
+    block.row[1].slot = 1;
+    try {
+        (void)run();
+        throw std::runtime_error("cross-slot verify window reached replay");
+    } catch (const std::invalid_argument&) {}
+    block.row[1].slot = 0;
     runner.invalidate(rt);
     rt.decline = true;
     check(!run() && !run() && rt.records == 3 && rt.uploads == 3 && rt.launches == 3,
@@ -125,6 +152,7 @@ void dry_arguments() {
 }  // namespace
 
 int main() try {
+    native_inventory();
     replay_windows();
     dry_arguments();
     return 0;

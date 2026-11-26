@@ -17,6 +17,34 @@ constexpr unsigned cudaStreamNonBlocking = 1U;
 using cudaStream_t = void*;
 using cudaGraph_t = void*;
 using cudaGraphExec_t = void*;
+enum cudaGraphNodeType {
+    cudaGraphNodeTypeKernel, cudaGraphNodeTypeMemcpy, cudaGraphNodeTypeMemset, cudaGraphNodeTypeEmpty,
+    cudaGraphNodeTypeEventRecord, cudaGraphNodeTypeWaitEvent, cudaGraphNodeTypeHost
+};
+struct cudaKernelNodeParams {
+    void* func{};
+    struct Extent { unsigned x = 1, y = 1, z = 1; } gridDim, blockDim;
+};
+struct StubGraphNode {
+    cudaGraphNodeType kind;
+    cudaKernelNodeParams kernel;
+};
+using cudaGraphNode_t = StubGraphNode*;
+
+// The capture fixtures use one native node. A null handle models an empty graph.
+inline cudaError_t cudaGraphGetNodes(cudaGraph_t graph, cudaGraphNode_t* nodes, std::size_t* count) {
+    if (graph && nodes && *count) nodes[0] = static_cast<StubGraphNode*>(graph);
+    *count = graph ? 1U : 0U;
+    return cudaSuccess;
+}
+inline cudaError_t cudaGraphNodeGetType(cudaGraphNode_t node, cudaGraphNodeType* type) {
+    *type = node->kind;
+    return cudaSuccess;
+}
+inline cudaError_t cudaGraphKernelNodeGetParams(cudaGraphNode_t node, cudaKernelNodeParams* result) {
+    *result = node->kernel;
+    return cudaSuccess;
+}
 struct cudaGraphExecUpdateResultInfo {
     int result;
 };

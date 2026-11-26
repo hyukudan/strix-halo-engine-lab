@@ -9,14 +9,26 @@
 
 namespace strix::exec {
 
+enum class GraphRows { cohort, single, inclusive_window };
+
 // Captured device arguments can only name a different request via the uploaded block.
 // Refuse a half-initialized mask before a kernel can read id zero or skip a state write.
-inline void validate_graph_rows(const StepBlock& block) {
+inline void validate_graph_rows(const StepBlock& block, GraphRows layout = GraphRows::cohort) {
     if (block.h.rows == 0U || block.h.rows > kStepMaxRows)
         throw std::invalid_argument("invalid graph descriptor width");
+    if (layout == GraphRows::single && block.h.rows != 1U)
+        throw std::invalid_argument("single-row graph requires one row");
     std::uint32_t valid = 0;
-    for (std::uint32_t i = 0; i < block.h.rows; ++i)
-        if (block.row[i].flags & step_valid) valid |= std::uint32_t{1} << i;
+    for (std::uint32_t i = 0; i < block.h.rows; ++i) {
+        const auto bit = std::uint32_t{1} << i;
+        const auto& row = block.row[i];
+        if (row.flags & step_valid) valid |= bit;
+        if (layout == GraphRows::inclusive_window &&
+            (row.flags != step_valid || row.slot != block.row[0].slot ||
+             row.position != std::uint64_t{block.row[0].position} + i ||
+             row.parent != (i == 0U ? kStepNoParent : i - 1U) || row.ancestors != ((bit - 1U) | bit)))
+            throw std::invalid_argument("invalid inclusive verify window");
+    }
     if (valid != block.h.valid_mask || (block.h.feed_mask & ~valid) != 0U)
         throw std::invalid_argument("inconsistent graph descriptor masks");
 }
@@ -34,13 +46,15 @@ struct IndirectGraphBinding {
 template <class Binding = IndirectGraphBinding>
 class StepGraphRunner {
 public:
+    explicit StepGraphRunner(GraphRows layout = GraphRows::cohort) : layout_(layout) {}
+
     template <class Runtime, class Stream, class Work>
     bool run(Runtime& runtime, Stream stream, bool enabled, bool stable, const StepBlock& block,
              const Binding& binding, Work& work) {
         const auto width = block.h.rows;
         const auto index = WidthReplayPolicy::index(width);
         if (index >= WidthReplayPolicy::kWidths) return false;
-        if (enabled && stable) validate_graph_rows(block);
+        if (enabled && stable) validate_graph_rows(block, layout_);
         if (bindings_[index] && *bindings_[index] != binding) {
             runtime.discard(index);
             policy_.invalidate_width(width);
@@ -87,6 +101,7 @@ public:
     [[nodiscard]] const WidthReplayPolicy& policy() const noexcept { return policy_; }
 
 private:
+    GraphRows layout_;
     WidthReplayPolicy policy_;
     std::array<std::optional<Binding>, WidthReplayPolicy::kWidths> bindings_{};
 };

@@ -1475,7 +1475,7 @@ private:
     exec::WidthStepGraphs cohort_graphs_;  // shared step descriptor, CUDA graph per width
     std::optional<MiniCohortLanes> cohort_lanes_;  // set while a cohort is captured or submitted eagerly
 #if !defined(__HIPCC__)
-    exec::BoundWidthStepGraphs<WindowBinding> window_graphs_;          // verify window programs, one per window rows
+    exec::BoundWidthStepGraphs<WindowBinding> window_graphs_{exec::GraphRows::inclusive_window};
     const WindowProgram* window_program_{};        // set by the decoder around a staged verify append
     const MiniCohortLanes* window_lanes_{};        // set while a verify window program is captured
     const std::uint32_t* window_position_{};       // device position of the window's first row

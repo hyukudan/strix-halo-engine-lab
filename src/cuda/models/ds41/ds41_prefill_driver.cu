@@ -1,3 +1,4 @@
+#include "strix/device/graph_inspection.hpp"
 #include "strix/weight/admission.hpp"
 // deepseek41 CUDA prefill driver (cuda_ds41_prefill.hpp): the DevicePrefill plan on the CUDA layer kernels, with the
 // cone, the tiered routed-expert provider and the Engram rows from the model file.
@@ -2662,7 +2663,7 @@ std::vector<CudaPrefillResult> CudaPrefill::run_contexts(std::span<const CudaBat
             capturing = false;
             cudaGraph_t graph = nullptr;
             STRIX_CUDA_CHECK(cudaStreamEndCapture(st, &graph));
-            const cudaError_t inst = cudaGraphInstantiate(&exec, graph, 0ULL);
+            const cudaError_t inst = ::strix::device::native::instantiate_segment_graph(&exec, graph, 0ULL);
             cudaGraphDestroy(graph);
             STRIX_CUDA_CHECK(inst);
             ++result.graph_captures;
@@ -4564,7 +4565,7 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
             capturing = false;
             cudaGraph_t graph = nullptr;
             STRIX_CUDA_CHECK(cudaStreamEndCapture(st, &graph));
-            const cudaError_t inst = cudaGraphInstantiate(&exec, graph, 0ULL);
+            const cudaError_t inst = ::strix::device::native::instantiate_segment_graph(&exec, graph, 0ULL);
             cudaGraphDestroy(graph);
             STRIX_CUDA_CHECK(inst);
             ++result.graph_captures;

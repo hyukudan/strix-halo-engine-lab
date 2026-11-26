@@ -32,7 +32,7 @@ public:
     using Policy = WidthReplayPolicy;
     using Stream = device::native::Stream;
 
-    BoundWidthStepGraphs() = default;
+    explicit BoundWidthStepGraphs(GraphRows layout = GraphRows::cohort) : runner_(layout) {}
     ~BoundWidthStepGraphs() {
         invalidate();
         if (device_) (void)STRIX_WIDTH_RT(Free)(device_);
