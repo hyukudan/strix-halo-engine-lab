@@ -345,12 +345,21 @@ int main() try {
             in.allow_pending = false;
         }
 
+        // r89 (#1310): no timing row prices a width inside the window class, so every execution keeps the incumbent 4096
+        // (an execution key alone, the 8K band, an explicit head override: the same cell); BASE keeps the serial reference.
         const hy::Regime legacy_key{hy::Device::gfx1151, hy::Topology::one_node, 8192, hy::single_greedy_8k};
         for (const auto tier : {Name::fast, Name::turbo}) {
             in.profile = tier;
             const auto chosen = hy::resolve(legacy_key, in);
             require(chosen->find("prompt_rows")->value == "4096" && chosen->find("head_q8")->value == "1" &&
-                    chosen->find("pf_mha")->value == "1", "Hy4 architecture-only execution key keeps the 4096 schedule");
+                        chosen->find("pf_mha")->value == "1",
+                    "Hy4 8K greedy rank keeps the incumbent 4096 schedule (no matched timing row)");
+            auto other = legacy_key;
+            other.execution = {};
+            require(hy::resolve(other, in)->find("prompt_rows")->value == "4096", "unpriced Hy4 execution keeps its schedule");
+            in.cli = {{"prompt_rows", "2048"}};
+            require(hy::resolve(legacy_key, in)->find("prompt_rows")->value == "2048", "Hy4 explicit window width wins");
+            in.cli.clear();
         }
         in.profile = Name::standard;
         require(hy::resolve(legacy_key, in)->find("prompt_rows")->value == "0", "Hy4 BASE keeps the serial reference");

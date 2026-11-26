@@ -98,6 +98,10 @@ struct RankExecution {
         {rank.prompt_tokens, rank.context_capacity, 1, rank.prompt_tokens, 0, 1, 0, rank.generated_tokens}, settings});
 }
 
+// The FAST window width is one value (4096) in every regime: a width inside the same_bits class becomes a schedule only
+// through a timing row of `measured` (the shared ladder: execution key with the device product and the effective runtime
+// settings, matched cold and warm arms, a gain beyond the noise). The 11-25 8K pair of receipts does not decide: 2048 was
+// +1.2 % on wall in one warm A/B and -1.6 % in the matched repeat (14.755 vs 14.520 s, same ids and anchor), so no row.
 [[nodiscard]] inline Device device_of(std::string_view arch) {  // hipDeviceProp_t::gcnArchName; features after ':' ignored
     return arch.substr(0, arch.find(':')) == "gfx1151" ? Device::gfx1151 : Device::unknown;
 }

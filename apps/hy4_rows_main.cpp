@@ -16,6 +16,7 @@
 // strix-hy4-rows PART.gguf... --ids-file F [--context N] [--prompt-rows N] [--reps K] [--spec N] [--max-rows R]
 //   [--verify-ms a,b,...] [--gbps G] [--mtp [--mtp-head full|q8|q4] [--mtp-copy 0|1] [--chain-ms S,F] [--survival c,...] [--mtp-taps DIR
 //   [--taps-gen N] [--depth D]]]; --content LABEL=PATH (repeatable) instead of --ids-file: one spec run per content
+//   --head-q8 0|1: the FAST decode head copy (weights.head.q8_0@1) in the steps and the verify rows (ROWS_BITWISE checks both)
 //   [--tp-rank 0|1 [--tp-transport usb4auto|tcp-listen:PORT|tcp-connect:HOST:PORT]]: the same run on a tensor-parallel
 //     pair (each rank loads the whole pack): bench rows / plain steps on both ranks with their shares; --spec: rank 0
 //     drafts and decides, rank 1 replays its verify passes (FOLLOW line), ids compared with plain greedy on rank 0.
@@ -610,7 +611,7 @@ int main(int argc, char** argv) {
         std::uint32_t reps = 10, spec_n = 0, max_rows = hb::rows::kMaxVerifyRows;
         bool union_ab = false;  // bench: rows check + strict ABAB verify timing, expert union off / on (one load)
         std::vector<double> verify_ms;
-        double gbps = 207.0;
+        double gbps = hb::rows::kVerifySeedGbps;
         bool mtp = false, mtp_copy = true;
         std::vector<double> chain_ms, survival;
         std::string taps_dir;
@@ -639,6 +640,7 @@ int main(int argc, char** argv) {
             else if (a == "--gbps" && more) gbps = std::stod(argv[++i]);
             else if (a == "--union-ab") union_ab = true;
             else if (a == "--mtp") mtp = true;
+            else if (a == "--head-q8" && more) o.head_q8 = std::stoul(argv[++i]) != 0UL;
             else if (a == "--tp-rank" && more) tp_rank = static_cast<int>(std::stoul(argv[++i]));
             else if (a == "--tp-transport" && more) tp_spec = argv[++i];
             else if (a == "--prefill-route" && more) {
@@ -841,7 +843,8 @@ int main(int argc, char** argv) {
                     so.chain_flush_ms = chain_ms[1];
                 }
                 // the host oracle's prose conditionals (hy4_recipe: P(run>=k) .714 .452 .197 .133 .034 .017)
-                so.chain_survival = survival.empty() ? std::vector<double>{0.714, 0.633, 0.436, 0.675, 0.256, 0.5} : survival;
+                so.chain_survival = survival.empty() ? std::vector<double>(hb::rows::kChainSurvival.begin(), hb::rows::kChainSurvival.end())
+                                                     : survival;
             }
             const double prime_t0 = now_ms();  // the spec path's prompt pass (with the block: its teacher flushes when the ring fills)
             if (prime(f, ids, batched, source.get(), sp) != first_id) throw std::runtime_error("repeat prompt anchor differs (" + label + ")");
