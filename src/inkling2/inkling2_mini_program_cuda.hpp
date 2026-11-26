@@ -769,8 +769,7 @@ struct MiniCudaProgramDecoder::Impl {
                           << (forms.transition ? "B3-transition" : "") << (screened ? " head=screened" : "")
                           << (moe_tail ? (mode.moe_tail ? " moe_tail=on" : " moe_tail=declined") : "")
                           << (moe_route_inline ? (mode.moe_route_inline ? " moe_route=inline" : " moe_route=declined") : "")
-                          << '
-';
+                          << '\n';
             }
             if (tapped && !reported_tap) {
                 std::cerr << "inkling2 step graph route=program captures=0 nodes=" << plan.program.launches.size()

@@ -451,8 +451,9 @@ void test_d1_request_profile() {
             const std::vector<std::string> args{MODEL, "--rank", "0", "--transport",
                 app == pd::App::prefill ? "usb4-auto" : "usb4auto", "--profile", tier};
             const auto startup = w.run(app, args);
-            const auto resolve = [&](std::uint64_t prompt, const ds::PrefillOptions& o, std::string_view product = device, bool route = true) {
-                return pd::resolve_prefill_profile(*startup.profile, o, prompt, product, route).value_or(*startup.profile);
+            const auto resolve = [&](std::uint64_t prompt, const ds::PrefillOptions& o, std::string_view product = {}, bool route = true) {
+                return pd::resolve_prefill_profile(*startup.profile, o, prompt, product.empty() ? device : product, route)
+                    .value_or(*startup.profile);
             };
             const auto hit = resolve(8128, measured);
             const bool expect_d1 = std::string_view(tier) != "exact";
