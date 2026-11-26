@@ -52,6 +52,9 @@ inline constexpr std::array<strix::profile::Lever, 11> product_profile_table{{
 inline constexpr std::string_view kTurboPrefillDevice = "gfx1151/Radeon-8060S";
 inline constexpr std::string_view kTurboPrefillSettings =
     "tp2-usb4-host-2x2x40-r1b-gemv-exl3-pipeline2-routed-qwin0-mtp-wmma-x3-mla-kda-attn16";
+// The same execution on the original full scratch arena (storage only; STRIX_GLM_PF_SCRATCH auto picks it when it fits).
+inline constexpr std::string_view kFullScratchPrefillSettings =
+    "tp2-usb4-host-2x2x40-r1b-gemv-exl3-pipeline2-full-qwin0-mtp-wmma-x3-mla-kda-attn16";
 inline constexpr std::uint64_t kTurboPrefillCapacity = 36864;
 inline constexpr unsigned kTurboPrefillRows = 8192, kTurboPrefillGenerated = 64;
 

@@ -334,6 +334,9 @@ struct PrefillWork {
     bool pair_ready = false;
     std::uint64_t prompt = 0, capacity = 0;
     unsigned rows = 0, lanes = 0, generated = 0;
+    // Scratch storage of the admitted layout (routed or the original full arena): no arithmetic change, but part of the
+    // execution key, so a receipt measured on one storage (the TURBO literal rows: routed) decides only that storage.
+    bool routed_scratch = true;
 };
 
 inline std::optional<strix::profile::Resolution> resolve_product(const Request& r, const EnvGet& env, bool baseline,
@@ -351,7 +354,7 @@ inline std::optional<strix::profile::Resolution> resolve_product(const Request& 
     inputs.env = profile_env;
     const auto execution = work.pair_ready ? p::ladder_execution({"hip", kTurboPrefillDevice,
             {work.prompt, work.capacity, work.lanes, work.rows, work.rows, 1, 0, work.generated},
-            kTurboPrefillSettings}) : std::string{};
+            work.routed_scratch ? kTurboPrefillSettings : kFullScratchPrefillSettings}) : std::string{};
     inputs.regime = {p::Phase::prefill, work.prompt, work.lanes,
                      execution.empty() ? std::string_view{} : kTurboPrefillDevice, execution};
     auto product = p::resolve(product_profile_engine, inputs);

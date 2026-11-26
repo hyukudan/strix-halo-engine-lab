@@ -1125,7 +1125,7 @@ int main(int argc, char** argv) {
             }
             const rd::PrefillWork work{startup_handshake && turbo_prefill_pair && mtp_spec_on &&
                     rd::measured_prefill_layout(eng.prefill_pipeline()) && embed_splice.empty() && bitcalc_cases.empty(),
-                toks.size(), opt.capacity, opt.max_rows, opt.slots, decode_n};
+                toks.size(), opt.capacity, opt.max_rows, opt.slots, decode_n, rd::routed_prefill_scratch()};
             const bool turbo = rd::select_prefill_wmma(request, eff, rd::process_env(), work);
             if (rd::ordinary_lossy_prefill(request, eff) && !strix::glm::pf::wmma_x::enabled())
                 rd::report_prefill_wmma(opt.rank, request, eff, rd::process_env(), work, turbo);

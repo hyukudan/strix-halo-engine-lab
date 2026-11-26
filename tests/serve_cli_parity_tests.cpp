@@ -187,6 +187,11 @@ void glm() {
     }, false);                                                                 // explicit off wins
     for (const char* profile : {"exact", "quality"})
         verify_profile(profile, {true, 8192, 36864, 8192, 1, 64}, none, false);
+    // Scratch storage (full arena vs routed) is spelled in the execution key: the band row binds either (the gate and
+    // the FAST timing ran on the full arena), the TURBO literal key names routed scratch only.
+    verify_profile("fast", {true, 8192, 8448, 8192, 1, 64, false}, none, true);
+    verify_profile("turbo", {true, 8192, 8448, 8192, 1, 64, false}, none, true);
+    verify_profile("turbo", {true, 31258, 36864, 8192, 1, 64, false}, none, false);
     // Sampled MTP (row serve_sampled_mtp): both entry points resolve and admit it in rd::resolve, so the same request
     // gives the same route, the same receipt line and the same refusals (the command line reports it inapplicable).
     for (const char* profile : {"exact", "fast", "turbo", "quality"})

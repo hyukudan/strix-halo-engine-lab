@@ -4648,14 +4648,14 @@ inherit it).
 | deepseek-v4.1-flash, minimax-m3.1-flash, qwen3.8-flash-next, qwen3.8-27b, hy4-flash, inkling2-mini, nemotron-3.5-bolt-e4b, ernie-5.5-flash-preview | any | not applicable (GLM prefill cores; their FAST rows are their own) |
 
 - **Preconditions:** the ordinary pair workload: `--world 2`, comm exchange, MTP decode on (complete layer-45 head),
-  R1b identity, chunked prefill with the 2-stage pipeline and routed scratch, 8,192-row chunks (`max-rows` auto admits
+  R1b identity, chunked prefill with the 2-stage pipeline (routed or full scratch arena), 8,192-row chunks (`max-rows` auto admits
   them at about 112 GiB available memory; with 4,096-row chunks the exact cores run), one lane, a fresh whole prompt
   (served: greedy text request without a cached prefix), both ranks voting the same device class and link.
 - **Automatic selection:** one shared resolver for the command line and the server. The FAST cell is qualified by its
   gate (below) and timed by a band receipt bound to the run's own execution (`profile::bind_band_receipts`): device
   gfx1151/Radeon-8060S, prefill, one lane, 2,049..8,192 tokens, x1.50 noise 0.10. TURBO runs the FAST cell inside that
   band and its own literal receipt at 31,258 tokens. Each prompt prints
-  `glm-pf-wmma-x profile=<p> prompt=<n> chunk=<rows> effective=wmma|exact-cores` and the `strix-ladder/v1 pf_wmma`
+  `glm-pf-wmma-x profile=<p> prompt=<n> chunk=<rows> scratch=<routed|full> effective=wmma|exact-cores (reason)` and the `strix-ladder/v1 pf_wmma`
   route that decided it.
 - **Fallback notice:** prompts of 2,048 tokens or fewer, above 8,192 tokens (32K is TURBO only), other devices, links,
   chunks or compositions, and two-rank native modes without configuration agreement keep the exact cores. Two-rank
