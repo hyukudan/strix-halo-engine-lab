@@ -235,13 +235,25 @@ void scoped_fast_route() {
         if (row.gate.lever == "wide_rows") top = std::max(top, row.gate.max_prompt_tokens);
     }
     require(window_rows, "the ledger holds the window rows");
+    // The window applies from the band's first winning timing point (sp::ladder_min_context), not from an untimed edge.
+    const auto band_floor = [](std::uint64_t prompt) {
+        for (const auto& band : hp::kBandRows)
+            if (prompt >= band.min_context && prompt <= band.max_context) return sp::ladder_min_context(band);
+        return std::uint64_t{0};
+    };
+    require(band_floor(1) == 64 && band_floor(2049) == 2049 && band_floor(8193) == 8193,
+            "the timed floors of the window bands (64, 2,049, 8,193)");
     for (const auto& row : hp::kQualified) {
         if (row.gate.lever != "wide_rows") continue;
         for (const auto prompt : {row.gate.min_prompt_tokens, (row.gate.min_prompt_tokens + row.gate.max_prompt_tokens) / 2,
                                   row.gate.max_prompt_tokens}) {
             for (const auto tier : {sp::Name::fast, sp::Name::turbo}) {
                 const auto r = resolve({prompt}, tier, no_env, {});
-                require(composite(r, prompt), "FAST and TURBO resolve the gated route inside its band");
+                if (prompt < band_floor(prompt)) {
+                    require(previous(r), "a prompt below the band's first winning timing keeps EXACT windows");
+                    continue;
+                }
+                require(composite(r, prompt), "FAST and TURBO resolve the gated route from the band's timed floor");
                 q::PrefillFlags flags;
                 hp::apply_window(hp::App::decode, r, flags);
                 require(flags.width == 512 && !flags.exact, "the applied window reaches the engine flags");

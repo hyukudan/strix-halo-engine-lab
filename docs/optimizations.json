@@ -998,10 +998,10 @@
     "engine": "qwen",
     "name": "Qwen 27B HIP FAST/TURBO prefill: 512-row window inside the gated bands",
     "flag_or_env": "--profile fast|turbo (decode app); off: --profile exact, --wide N / --wide-exact N, --rows N",
-    "default": "ON in FAST and TURBO on gfx1151, one rank, one lane, IU4 g64 pack, known execution, prompt in a gated band (1..2,048, 2,049..8,192, 8,193..24,576); previous route (64-row EXACT windows) elsewhere and in EXACT",
+    "default": "ON in FAST and TURBO on gfx1151, one rank, one lane, IU4 g64 pack, known execution, prompt of 64..24,576 tokens (bands 64..2,048, 2,049..8,192, 8,193..24,576); 64-row EXACT windows elsewhere and in EXACT",
     "exact": "Bit-changing (FAST class): per-class gate v2 PASS in every class of every band (KL <= 0.00008, top-1 >= 0.996, |dNLL| <= 0.0008 vs EXACT --wide-exact 512, one-ulp null); default dumps bitwise the gated window arm. A4W4 48-63 failed the same gate (pending).",
     "gain": "One Strix Halo node, --no-mtp, prompt seconds EXACT 64 rows -> 512-row window: 2,048 tokens 10.27 -> 2.99 s, 8,192 tokens 67.60 -> 12.93 s, 24,576 tokens 534.39 -> 45.43 s (11.8x).",
-    "preconditions": "Qwen 27B dense IU4 g64 pack, one gfx1151 device, one rank, one lane, prompt inside a gated band.",
+    "preconditions": "Qwen 27B dense IU4 g64 pack, one gfx1151 device, one rank, one lane, prompt inside a timed and gated band (64..24,576 tokens).",
     "off_switch": "--profile exact; --wide N / --wide-exact N; --rows N",
     "doc_anchor": "docs/optimizations.md#qwen27-hip-fast-window"
   },
