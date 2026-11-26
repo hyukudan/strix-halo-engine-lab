@@ -333,9 +333,10 @@ cudaError_t ensure_pass1_shared(std::size_t bytes) {
 }
 
 template <unsigned Bits, bool Top2>
-cudaError_t pass1_form(const Launch& a, const Parts& p, unsigned per_group, cudaStream_t stream, bool launch,
-                       unsigned* resident = nullptr) {
-    // per_group is a.pass1_lanes (every caller below): the geometry is the bound one (plan::pass1_grid).
+cudaError_t pass1_form(const Launch& a, const Parts& p, cudaStream_t stream, bool launch, unsigned* resident = nullptr) {
+    // The kernel form, the group count and the geometry all come from the launch (a.pass1_lanes), the bound one
+    // (plan::pass1_grid): a caller cannot pass a lane count that disagrees with the grid.
+    const unsigned per_group = a.pass1_lanes;
     const auto geometry = plan::pass1_grid(a);
     const std::size_t smem = geometry.shared_bytes;
     const unsigned groups = plan::pass1_groups(a.lanes, per_group);
@@ -368,10 +369,10 @@ cudaError_t pass1_form(const Launch& a, const Parts& p, unsigned per_group, cuda
 }
 
 template <unsigned Bits>
-cudaError_t pass1_bits(const Launch& a, const Parts& p, unsigned per_group, cudaStream_t stream, bool launch,
+cudaError_t pass1_bits(const Launch& a, const Parts& p, cudaStream_t stream, bool launch,
                        unsigned* resident = nullptr) {
-    return a.runner_up ? pass1_form<Bits, true>(a, p, per_group, stream, launch, resident)
-                       : pass1_form<Bits, false>(a, p, per_group, stream, launch, resident);
+    return a.runner_up ? pass1_form<Bits, true>(a, p, stream, launch, resident)
+                       : pass1_form<Bits, false>(a, p, stream, launch, resident);
 }
 
 }  // namespace detail
@@ -393,8 +394,8 @@ inline cudaError_t launch_prep(const Launch& a, cudaStream_t stream) {
 // every lane count it will launch, so no enqueue inside a capture has to).
 inline cudaError_t prepare_pass1(const Launch& a) {
     const auto p = detail::parts(a);
-    return a.plane.bits == 4U ? detail::pass1_bits<4U>(a, p, a.pass1_lanes, nullptr, false)
-                              : detail::pass1_bits<8U>(a, p, a.pass1_lanes, nullptr, false);
+    return a.plane.bits == 4U ? detail::pass1_bits<4U>(a, p, nullptr, false)
+                              : detail::pass1_bits<8U>(a, p, nullptr, false);
 }
 
 // prepare_pass1 plus the pass-1 blocks the device holds at once for the launch's instantiation (Launch::pass1_resident;
@@ -402,14 +403,14 @@ inline cudaError_t prepare_pass1(const Launch& a) {
 inline cudaError_t prepare_pass1(const Launch& a, unsigned& resident) {
     const auto p = detail::parts(a);
     resident = 0U;
-    return a.plane.bits == 4U ? detail::pass1_bits<4U>(a, p, a.pass1_lanes, nullptr, false, &resident)
-                              : detail::pass1_bits<8U>(a, p, a.pass1_lanes, nullptr, false, &resident);
+    return a.plane.bits == 4U ? detail::pass1_bits<4U>(a, p, nullptr, false, &resident)
+                              : detail::pass1_bits<8U>(a, p, nullptr, false, &resident);
 }
 
 inline cudaError_t launch_pass1(const Launch& a, cudaStream_t stream) {
     const auto p = detail::parts(a);
-    return a.plane.bits == 4U ? detail::pass1_bits<4U>(a, p, a.pass1_lanes, stream, true)
-                              : detail::pass1_bits<8U>(a, p, a.pass1_lanes, stream, true);
+    return a.plane.bits == 4U ? detail::pass1_bits<4U>(a, p, stream, true)
+                              : detail::pass1_bits<8U>(a, p, stream, true);
 }
 
 inline cudaError_t launch_compact(const Launch& a, cudaStream_t stream) {
