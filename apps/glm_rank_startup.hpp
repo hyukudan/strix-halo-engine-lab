@@ -3,6 +3,10 @@
 #include "glm_rank_defaults.hpp"
 #include "glm/spec/glm_spec_merge.hpp"
 #include <array>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 
 namespace strix::glm::rank_defaults {
 inline bool has_startup_handshake(unsigned world, const std::string& xch, bool decode, bool reference_gate) {
@@ -94,5 +98,31 @@ unsigned recheck_rows(unsigned rows, bool enabled, Merge&& merge) {
     ctl.kind = 0x474c4d52U;
     merge(&proposal, 1, ctl);
     return proposal.id;
+}
+// MTP drafter content (r94), voted after startup_agreement returned eligible on both ranks (so both run this round):
+// FNV-1a 32 of the payload digest. Ranks whose layer-45 shards match in names and sizes but differ in payload refuse
+// at startup instead of speculating with different drafters.
+inline std::uint32_t drafter_digest_hash(std::string_view digest) noexcept {
+    std::uint32_t h = 2166136261U;
+    for (const unsigned char c : digest) h = (h ^ c) * 16777619U;
+    return h;
+}
+template<class Merge>
+void agree_drafter_digest(std::string_view digest, bool enabled, Merge&& merge) {
+    if (!enabled) return;
+    const std::uint32_t mine = drafter_digest_hash(digest);
+    spec::MergeRow row;
+    row.value = static_cast<float>(mine);
+    row.id = mine;
+    spec::MergeCtl ctl;
+    ctl.kind = spec::kEligibilityMerge;
+    merge(&row, 1, ctl);
+    spec::MergeRow vote;
+    vote.flag = row.id != mine ? 1U : 0U;
+    spec::MergeCtl vote_ctl;
+    vote_ctl.kind = spec::kConfigurationMismatchMerge;
+    merge(&vote, 1, vote_ctl);
+    if (vote.flag != 0)
+        throw std::runtime_error("TP2 ranks hold different MTP drafter payloads (this rank: " + std::string(digest) + ")");
 }
 }  // namespace strix::glm::rank_defaults

@@ -21,7 +21,7 @@ void environment(const char* key,const char* value) {
     setenv(key,value,1);
 #endif
 }
-std::shared_ptr<const g::serve::Tokenizer> tokenizer(const std::filesystem::path& directory,bool thought=false) {
+[[maybe_unused]] std::shared_ptr<const g::serve::Tokenizer> tokenizer(const std::filesystem::path& directory,bool thought=false) {
     std::filesystem::create_directories(directory);
     const auto asset=directory/(thought?"thinking.json":"tokenizer.json");
     const auto script=directory/(thought?"thinking.py":"tokenizer.py");
@@ -64,7 +64,7 @@ for x in a['added_tokens']:
     CHECK(std::system(("python \""+script.string()+"\"").c_str())==0 || std::system(("python3 \""+script.string()+"\"").c_str())==0);
     return g::serve::Tokenizer::load(asset);
 }
-g::ModelManifest http_model() {
+[[maybe_unused]] g::ModelManifest http_model() {
     auto m=tiny();m.config.vocab=128;
     // Reuse the existing fixture coefficients, extending only vocabulary rows
     // so the unchanged production adapter's fixed ID 106 is representable.
@@ -138,7 +138,7 @@ public:
     std::unique_ptr<e::StreamState> create_stream()override{return std::make_unique<TraceStream>(target().create_stream(),log);}
     std::unique_ptr<e::StreamState> create_stream(std::uint32_t n)override{return std::make_unique<TraceStream>(target().create_stream(n),log);}
     const g::ModelConfig& config()const override{return target().config();}
-    Json identity()const override{auto j=target().identity();if(unknown_identity)j.set("model_hash","");
+    Json identity()const override{auto j=target().identity();if(unknown_identity){j.set("model_hash","");}
         if(memory_wrapper)j.set("backend","host-memory-wrapper-evidence");return j;}
     std::optional<std::uint64_t> native_turn_work_bound()const override {
         return memory_wrapper?reported_work:target().native_turn_work_bound();
@@ -266,7 +266,7 @@ void causal(const g::ModelManifest& m,g::RopeTables t,const g::serve::Adapter& a
     CHECK(std::uint64_t(phase(j).find("target_rows")->as_int())==p.size()+ids.size()-1-cached);
     std::cout<<"causal prompt="<<p.size()<<" cached="<<cached<<" output="<<ids.size()<<" physical="<<all.size()-cached<<" sealed="<<sealed<<'\n';
 }
-void two_turns(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g::serve::Tokenizer> tok) {
+[[maybe_unused]] void two_turns(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g::serve::Tokenizer> tok) {
     g::serve::Adapter adapter(tok);
     for(const auto mode:{0,1,2,3}) {
         const bool stream=mode==1;
@@ -283,7 +283,7 @@ void two_turns(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g
         const auto p=prompt(second,adapter);auto actual=prompt(first,adapter);auto ids=generated(j1);actual.insert(actual.end(),ids.begin(),ids.end());
         if(!(p.size()>actual.size() && std::equal(actual.begin(),actual.end(),p.begin()))) {
             std::cerr<<"actual="<<tok->decode(actual)<<"\nrendered="<<tok->decode(p)<<"\n";
-            for(auto x:actual)std::cerr<<x<<',';std::cerr<<"\n";for(auto x:p)std::cerr<<x<<',';std::cerr<<"\n";
+            for(auto x:actual){std::cerr<<x<<',';}std::cerr<<"\n";for(auto x:p){std::cerr<<x<<',';}std::cerr<<"\n";
         }
         CHECK(p.size()>actual.size() && std::equal(actual.begin(),actual.end(),p.begin()));
         RealBackend enabled_backend(m,t);Settings cold_settings;
@@ -305,7 +305,7 @@ void two_turns(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g
     }
     environment("STRIX_G4_SERVE_BATCH","1");environment("STRIX_G4_SERVE_PREFIX","1");
 }
-void refusals(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g::serve::Tokenizer> tok) {
+[[maybe_unused]] void refusals(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g::serve::Tokenizer> tok) {
     g::serve::Adapter adapter(tok);
     for(int mode=0;mode<20;++mode) {
         Settings settings;RealBackend backend(m,t);auto config=configuration(settings);
@@ -348,7 +348,7 @@ void ordinary_seed(Json& b,const g::ModelManifest& m,g::RopeTables t,const g::se
         if(ordinary){b.set("seed",seed);return;}
     }throw std::runtime_error("no ordinary tiny-model seed");
 }
-void mismatches(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g::serve::Tokenizer> tok) {
+[[maybe_unused]] void mismatches(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g::serve::Tokenizer> tok) {
     for(int mode=0;mode<5;++mode) {
         std::cout<<"mismatch "<<mode<<"\n";
         Settings settings;RealBackend backend(m,t);
@@ -371,7 +371,7 @@ void mismatches(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const 
         CHECK(backend.log.rows.at(n).position==0);
     }
 }
-void retention(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g::serve::Tokenizer> tok) {
+[[maybe_unused]] void retention(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g::serve::Tokenizer> tok) {
     for(bool keep:{false,true}) {
         Settings settings;settings.keep=keep?"protected":"";RealBackend backend(m,t);auto c=configuration(settings);c.policy.max_entries=1;
         e::Api api(backend,tok,{},e::DraftMode::off,"model",{}, {},e::Api::Owner::standalone,c);
@@ -382,7 +382,7 @@ void retention(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g
         CHECK(api.runtime().cache_stats().bytes<=c.policy.max_bytes);
     }
 }
-void failures(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g::serve::Tokenizer> tok) {
+[[maybe_unused]] void failures(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g::serve::Tokenizer> tok) {
     // Identify exact finalization fork/query positions with a successful run;
     // this observes real eager copies, not synthetic cache insertion.
     std::size_t forks=0,queries=0,calls=0;
@@ -409,7 +409,7 @@ void failures(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g:
         CHECK(response(http(api,body())).find("choices")); // fresh generation, no stale pending/cache leakage
     }
 }
-void stops_and_capacity(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g::serve::Tokenizer> tok) {
+[[maybe_unused]] void stops_and_capacity(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g::serve::Tokenizer> tok) {
     const g::serve::Adapter adapter(tok);
     for(const auto stop:{1U,106U}) {
         auto b=body();const auto ids=prompt(b,adapter);Reference ref(m,t,{});ref.append(ids);
@@ -430,7 +430,7 @@ void stops_and_capacity(const g::ModelManifest& m,g::RopeTables t,std::shared_pt
     const auto calls=backend.log.calls;b.set("max_tokens",std::uint64_t(b.find("max_tokens")->as_int()+1));
     CHECK(http(api,b).status==400 && backend.log.calls==calls); // HTTP context admission remains unchanged
 }
-void no_store_hit(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g::serve::Tokenizer> tok) {
+[[maybe_unused]] void no_store_hit(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g::serve::Tokenizer> tok) {
     Settings settings;RealBackend backend(m,t);e::Api api(backend,tok,{},e::DraftMode::off,"model",{}, {},e::Api::Owner::standalone,configuration(settings));
     auto first=body();auto j=response(http(api,first));const auto before=api.runtime().cache_stats();const auto count=backend.log.rows.size();
     settings.no_store=true;auto b=next_turn(first,generated(j),*tok);auto next=response(http(api,b));
@@ -438,7 +438,7 @@ void no_store_hit(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<cons
     CHECK(api.runtime().cache_stats().bytes==before.bytes);g::serve::Adapter adapter(tok);
     causal(m,t,adapter,b,next,backend.log,count,prompt(first,adapter).size()+generated(j).size(),false);
 }
-void disconnects(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g::serve::Tokenizer> tok) {
+[[maybe_unused]] void disconnects(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g::serve::Tokenizer> tok) {
     for(bool during:{false,true}) {
         Settings settings;RealBackend backend(m,t);e::Api api(backend,tok,{},e::DraftMode::off,"model",{}, {},e::Api::Owner::standalone,configuration(settings));
         Writer writer;if(during)backend.on_call=[&]{writer.gone->store(true);};else writer.gone->store(true);
@@ -447,7 +447,7 @@ void disconnects(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const
         backend.on_call={};CHECK(response(http(api,body())).find("choices"));
     }
 }
-void thinking(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g::serve::Tokenizer> tok) {
+[[maybe_unused]] void thinking(const g::ModelManifest& m,g::RopeTables t,std::shared_ptr<const g::serve::Tokenizer> tok) {
     g::serve::Adapter adapter(tok);auto b=body(false,true);b.set("max_tokens",5);b.set("thinking_budget",2);
     // Find an actual sampler seed whose first selected tiny-model ID is the
     // tokenizer's whole thought header. The logits/selection are never replaced.

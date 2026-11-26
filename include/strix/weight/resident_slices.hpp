@@ -191,7 +191,7 @@ public:
             throw std::invalid_argument("incompatible resident matrix " + std::string(name));
         const auto& entry = it->second;
         return {storage_.subspan(entry.offset, entry.bytes), *entry.matrix_storage,
-                entry.rows, entry.columns, entry.row_bytes, entry.outer_exponent};
+                entry.rows, entry.columns, entry.row_bytes, false, entry.outer_exponent};
     }
 
     Status bind_expert_slab(const microscaled::ExpertSlabView& slab, std::string_view codes_name,

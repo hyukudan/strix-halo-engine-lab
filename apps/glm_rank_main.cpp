@@ -313,6 +313,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         rd::apply_env(eff, [](const char* k, const char* v) { (void)::setenv(k, v, 0); });
+        // Drafter content identity (r94): read once here, named by the receipt and by the pair identity (print()).
+        if (eff.mtp_spec.value == "1") eff.head.mtp_digest = rd::mtp_payload_digest(eff.head);
         std::fputs(rd::mtp_decode_line(eff).c_str(), stderr);
         if (eff.product) {
             std::fprintf(stderr, "profile %s\n", eff.product->json().c_str());
@@ -435,9 +437,9 @@ int main(int argc, char** argv) {
             // the DS/MiniMax 'hp' host path (STRIX_DIST_CRC_PARALLEL / HOST_CRC_OVERLAP / HOST_CHUNK_BYTES) is set by rank_defaults
             (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "600000", 0);
             auto opened = strix::dist::open_pair(transport_spec, opt.rank);
-            turbo_prefill_pair = rd::select_prefill_turbo(request, eff, rd::process_env(),
-                {rd::ordinary_turbo(request, eff) && rd::measured_prefill_pair(opened.usb4_topology.streams, opened.direct != nullptr) && !deployment.plan,
-                 rd::product_ladder_rows[0].min_context, opt.capacity, opt.max_rows, opt.slots, decode_n});
+            turbo_prefill_pair = rd::select_prefill_wmma(request, eff, rd::process_env(),
+                {rd::ordinary_lossy_prefill(request, eff) && rd::measured_prefill_pair(opened.usb4_topology.streams, opened.direct != nullptr) && !deployment.plan,
+                 rd::kPrefillProbePrompt, opt.capacity, opt.max_rows, opt.slots, decode_n});
             auto transport = std::move(opened.host);
             const auto& receipt = opened.receipt;
             if (deployment.provider) deployment.resolve_live(opt, *transport);
@@ -538,6 +540,8 @@ int main(int argc, char** argv) {
             rd::agree_max_rows(eff, result.rows);
             opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
             mtp_spec_on = result.eligible;
+            rd::agree_drafter_digest(eff.head.mtp_digest, startup_handshake && mtp_spec_on,
+                [&](auto* rows, unsigned n, auto& ctl) { eng.exchange()->merge(rows, n, ctl, nullptr); });
             if (!mtp_spec_on)
                 std::printf("rank %u mtp-spec: unavailable on at least one rank (head or precondition); using plain decode\n", opt.rank);
         };
@@ -1123,10 +1127,10 @@ int main(int argc, char** argv) {
             }
             const rd::PrefillWork work{startup_handshake && turbo_prefill_pair && mtp_spec_on &&
                     rd::measured_prefill_layout(eng.prefill_pipeline()) && embed_splice.empty() && bitcalc_cases.empty(),
-                toks.size(), opt.capacity, opt.max_rows, opt.slots, decode_n};
-            const bool turbo = rd::select_prefill_turbo(request, eff, rd::process_env(), work);
-            if (rd::ordinary_turbo(request, eff) && !strix::glm::pf::wmma_x::enabled())
-                rd::report_prefill_turbo(opt.rank, work, turbo);
+                toks.size(), opt.capacity, opt.max_rows, opt.slots, decode_n, rd::routed_prefill_scratch()};
+            const bool turbo = rd::select_prefill_wmma(request, eff, rd::process_env(), work);
+            if (rd::ordinary_lossy_prefill(request, eff) && !strix::glm::pf::wmma_x::enabled())
+                rd::report_prefill_wmma(opt.rank, request, eff, rd::process_env(), work, turbo);
             const auto t0 = Clock::now();
             auto& control = decode_control;
             sp::Seed seed;
@@ -1159,7 +1163,7 @@ int main(int argc, char** argv) {
                 const auto wd = W::dense_calls.exchange(0), wmo = W::moe_calls.exchange(0), wq = W::iu4_moe_calls.exchange(0);
                 std::printf("rank %u prefill identity %s (STRIX_GLM_PF_WMMA=%s, prefill %s, wmma calls dense %llu moe %llu)",
                             opt.rank, eng.model_fast_i4() ? "glm-fast-i4 FAST (routed W4A4 g64)" :
-                            wd + wmo ? (turbo ? "glm-pf-wmma-x TURBO" : wq ? "glm-pf-wmma-x+iu4 FAST" : "glm-pf-wmma-x FAST") :
+                            wd + wmo ? (turbo && request.product.profile == strix::profile::Name::turbo ? "glm-pf-wmma-x TURBO" : wq ? "glm-pf-wmma-x+iu4 FAST" : "glm-pf-wmma-x FAST") :
                                 prefill_mode == "wmma" ? "prefill-wmma route" : "exact",
                             wm ? wm : "unset", prefill_mode.c_str(), static_cast<unsigned long long>(wd), static_cast<unsigned long long>(wmo));
                 if (wq) std::printf(" iu4 moe %llu", static_cast<unsigned long long>(wq));  // STRIX_GLM_PF_IU4=1 only

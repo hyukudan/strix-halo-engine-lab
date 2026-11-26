@@ -31,6 +31,10 @@ struct PrefillFlags {
     bool dump = false;         // --dump-logits: logits of every prompt row the path computes
     bool dump_window = false;  // wide path + dump: every row of the last wide window (else its last row)
     std::uint32_t tf_rows = 0; // wide path: the last N prompt tokens on the decode row path
+
+    // --dump-window asks for the last wide window, so without --wide it takes the wide path at the window the profile
+    // applies (else the engine default); --dump-logits alone keeps the one-row windows of its references.
+    [[nodiscard]] bool row_path() const noexcept { return !width && (rows || (dump && !dump_window)); }
 };
 
 // Engine options from the flags: untouched (engine defaults) unless an explicit width is given; the row path needs no
@@ -40,7 +44,7 @@ void apply_prefill_flags(const PrefillFlags& f, std::uint32_t max_rows, Options&
     if (f.width) {
         opt.prefill_rows = f.width;
         opt.wide_exact = f.exact;
-    } else if (f.rows || f.dump) {
+    } else if (f.row_path()) {
         opt.prefill_rows = max_rows;
     }
 }
@@ -69,7 +73,7 @@ struct PrefillPlan {
     if (f.rows > max_rows) throw std::invalid_argument("prefill: --rows exceeds the decode window limit");
     PrefillPlan p;
     p.requested = f.width;
-    p.row_path = !f.width && (f.rows || f.dump);
+    p.row_path = f.row_path();
     const auto push = [&](std::size_t at, std::size_t end, std::uint32_t w, bool tail) {
         while (at < end) {
             const auto n = static_cast<std::uint32_t>(std::min<std::size_t>(w, end - at));

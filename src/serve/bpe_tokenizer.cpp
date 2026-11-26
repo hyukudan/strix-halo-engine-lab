@@ -22,7 +22,7 @@ namespace {
 struct UnicodeRange { std::uint32_t first, last; std::uint8_t flags; };
 #include "unicode_tables.inc"
 
-constexpr std::uint8_t kLetter = 1U, kMark = 2U, kNumber = 4U, kPunctuation = 8U, kSymbol = 16U;
+constexpr std::uint8_t kLetter = 1U, kMark = 2U, kNumber = 4U, kPunctuation = 8U, kSymbol = 16U, kDecimal = 32U;
 
 std::uint8_t category(std::uint32_t cp) {
     std::size_t lo = 0, hi = std::size(kUnicodeRanges);
@@ -82,6 +82,7 @@ CodePoints decode_utf8(std::string_view text, bool opaque_invalid = false) {
 enum class SplitScheme : std::uint8_t {
     word_runs,         // contractions, one optional lead symbol + word run, digit runs, symbol runs, whitespace runs
     isolating_splits,  // three isolating splits (digit groups, word/symbol classes, whitespace)
+    right_aligned_decimal, // isolated decimal runs, split into groups of three from the right
     class_spans,       // Unicode class spans with case-aware words (o200k::split)
 };
 struct PreSplitRule {
@@ -99,6 +100,7 @@ constexpr PreSplitRule kPreSplitRules[] = {
     {"deepseek-v3", SplitScheme::isolating_splits, true, 1U, false, true, false},
     {"hy_v4", SplitScheme::isolating_splits, true, 1U, false, true, false},
     {"glm4", SplitScheme::word_runs, false, 3U, true, false, false},
+    {"decimal-triplets", SplitScheme::right_aligned_decimal, true, 3U, false, false, false},
     {"o200k", SplitScheme::class_spans, true, 1U, true, false, true},
 };
 const PreSplitRule* find_pre_split_rule(std::string_view pre) {
@@ -185,7 +187,7 @@ std::vector<std::pair<std::size_t, std::size_t>> pre_split(const CodePoints& tex
 //   3. [!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*
 //      |\s*[\r\n]+|\s+(?!\S)|\s+
 // In pattern 3 the alternatives are tried in order at each position; a piece's end is its text's end.
-std::vector<std::pair<std::size_t, std::size_t>> pre_split_isolating(const CodePoints& text) {
+std::vector<std::pair<std::size_t, std::size_t>> pre_split_isolating(const CodePoints& text, bool right_aligned) {
     const auto& c = text.cp;
     const auto n = c.size();
     using Range = std::pair<std::size_t, std::size_t>;
@@ -208,7 +210,28 @@ std::vector<std::pair<std::size_t, std::size_t>> pre_split_isolating(const CodeP
     };
     std::vector<Range> pieces;
     if (n != 0U) pieces.emplace_back(0U, n);
-    pieces = isolate(pieces, [](std::uint32_t cp) { return (category(cp) & kNumber) != 0U; }, 3U);
+    if (right_aligned) {
+        const auto decimal = [](std::uint32_t cp) { return (category(cp) & kDecimal) != 0U; };
+        const auto numbers = isolate(pieces, [](std::uint32_t cp) { return (category(cp) & kNumber) != 0U; }, SIZE_MAX);
+        const auto runs = isolate(numbers, decimal, SIZE_MAX);
+        pieces.clear();
+        for (const auto& [a, b] : runs) {
+            if (!decimal(c[a])) {
+                pieces.emplace_back(a, b);
+                continue;
+            }
+            // The serialized pipeline first limits the regex span to 510 digits. Since
+            // 510 is divisible by three, only the leftmost triplet can be partial.
+            auto start = a;
+            if (const auto remainder = (b - a) % 3U; remainder != 0U) {
+                pieces.emplace_back(a, a + remainder);
+                start += remainder;
+            }
+            for (; start < b; start += 3U) pieces.emplace_back(start, start + 3U);
+        }
+    } else {
+        pieces = isolate(pieces, [](std::uint32_t cp) { return (category(cp) & kNumber) != 0U; }, 3U);
+    }
     pieces = isolate(pieces, [](std::uint32_t cp) {
         return (cp >= 0x4E00U && cp <= 0x9FA5U) || (cp >= 0x3040U && cp <= 0x309FU) || (cp >= 0x30A0U && cp <= 0x30FFU);
     }, SIZE_MAX);
@@ -278,7 +301,8 @@ std::vector<std::pair<std::size_t, std::size_t>> pre_split_isolating(const CodeP
 }
 
 std::vector<std::pair<std::size_t, std::size_t>> pre_ranges(const CodePoints& text, const PreSplitRule& rule) {
-    if (rule.scheme == SplitScheme::isolating_splits) return pre_split_isolating(text);
+    if (rule.scheme == SplitScheme::isolating_splits || rule.scheme == SplitScheme::right_aligned_decimal)
+        return pre_split_isolating(text, rule.scheme == SplitScheme::right_aligned_decimal);
     if (rule.scheme == SplitScheme::class_spans) {
         auto spans = o200k::split(text.cp);
         for (auto& [begin, end] : spans) {
@@ -318,6 +342,65 @@ bool plain_hf_byte_bpe_layout(const Json& root, const Json& model, const Json& p
            field_is_unset(model, "continuing_subword_prefix") && field_is_unset(model, "end_of_word_suffix") &&
            (!model.find("byte_fallback") || field_is_bool(model, "byte_fallback", false)) &&
            (!model.find("fuse_unk") || field_is_bool(model, "fuse_unk", false));
+}
+
+
+bool isolated_regex(const Json& split, std::string_view expression) {
+    const auto* pattern = split.find("pattern");
+    return field_is_string(split, "type", "Split") && field_is_string(split, "behavior", "Isolated") &&
+           field_is_bool(split, "invert", false) && pattern && field_is_string(*pattern, "Regex", expression);
+}
+
+bool decimal_triplet_layout(const Json::Array& stages) {
+    constexpr auto cjk = u8"[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+";
+    const std::string_view cjk_pattern(reinterpret_cast<const char*>(cjk));
+    constexpr std::string_view classes =
+        "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+"
+        "|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+"
+        "| ?[\\p{P}\\p{S}]+[\r\n]*"
+        "|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
+    // Recognize the serialized schema as a unit. These are data signatures for
+    // the shared scanner, which does not evaluate regexes from an asset.
+    return stages.size() == 7U && field_is_string(stages[0], "type", "Digits") &&
+           field_is_bool(stages[0], "individual_digits", false) &&
+           isolated_regex(stages[1], R"(\p{Nd}{1,510}(?=(?>\p{Nd}{510})*(?:\P{Nd}|$))|\G\p{Nd}{510})") &&
+           isolated_regex(stages[2], R"(\A\p{Nd}{1,2}(?=\p{Nd}{3}+\z))") &&
+           isolated_regex(stages[3], R"(\A\p{Nd}{3}|\G\p{Nd}{3})") &&
+           isolated_regex(stages[4], cjk_pattern) &&
+           isolated_regex(stages[5], classes) &&
+           field_is_string(stages[6], "type", "ByteLevel") &&
+           field_is_bool(stages[6], "add_prefix_space", false) && field_is_bool(stages[6], "use_regex", false);
+}
+
+// encode() is the raw BPE API. A supported single-prefix template is validated
+// at load time, but protocol renderers own insertion of framing IDs.
+bool raw_prefix_template(const Json& root, const Json& vocab) {
+    const auto* processor = root.find("post_processor");
+    if (!processor || processor->is_null()) return true;
+    if (!field_is_string(*processor, "type", "TemplateProcessing")) return false;
+    const auto* single = processor->find("single");
+    const auto* pair = processor->find("pair");
+    const auto* specials = processor->find("special_tokens");
+    if (!single || !single->is_array() || single->size() != 2U || !pair || !pair->is_array() ||
+        pair->size() != 4U || !specials || !specials->is_object() || specials->size() != 1U) return false;
+    const auto& [prefix, entry] = specials->as_object().front();
+    const auto* ids = entry.find("ids");
+    const auto* tokens = entry.find("tokens");
+    const auto* vocab_id = vocab.find(prefix);
+    if (!field_is_string(entry, "id", prefix) || !vocab_id || !ids || !ids->is_array() || ids->size() != 1U ||
+        ids->as_array().front().as_int() != vocab_id->as_int() ||
+        !tokens || !tokens->is_array() || tokens->size() != 1U || tokens->as_array().front().as_string() != prefix)
+        return false;
+    const auto matches = [](const Json& item, std::string_view key, std::string_view id, std::int64_t type) {
+        const auto* body = item.find(key);
+        const auto* type_id = body ? body->find("type_id") : nullptr;
+        return body && field_is_string(*body, "id", id) && type_id && type_id->as_int() == type;
+    };
+    const auto& a = single->as_array();
+    const auto& b = pair->as_array();
+    return matches(a[0], "SpecialToken", prefix, 0) && matches(a[1], "Sequence", "A", 0) &&
+           matches(b[0], "SpecialToken", prefix, 0) && matches(b[1], "Sequence", "A", 0) &&
+           matches(b[2], "SpecialToken", prefix, 1) && matches(b[3], "Sequence", "B", 1);
 }
 
 std::array<std::string, 256> byte_to_unicode() {
@@ -519,7 +602,13 @@ struct BpeTokenizer::Impl {
         result.reserve(symbols.size());
         for (const auto& symbol : symbols) {
             const auto id = ids.find(symbol);
-            if (id != ids.end()) { result.push_back(id->second); continue; }
+            if (id != ids.end()) {
+                if (rule->scheme == SplitScheme::right_aligned_decimal &&
+                    static_cast<TokenType>(types[id->second]) != TokenType::normal)
+                    throw std::runtime_error("tokenizer: ordinary BPE reached an added token");
+                result.push_back(id->second);
+                continue;
+            }
             throw std::runtime_error("tokenizer: BPE symbol is not in the vocabulary");
         }
         while (!pieces->insert(hash, piece, result)) {
@@ -617,20 +706,32 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf(const std::string& pat
         R"((?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
     const Json* seq = pre->find("pretokenizers");
     const auto* ignore = model->find("ignore_merges");
-    if (!seq || !seq->is_array() || seq->size() != 2U ||
+    const bool is_decimal = strict && seq && seq->is_array() && field_is_string(*pre, "type", "Sequence") &&
+                            decimal_triplet_layout(seq->as_array());
+    if (!seq || !seq->is_array() || (seq->size() != 2U && !is_decimal) ||
         (strict ? (ignore && !ignore->is_bool()) : !field_is_bool(*model, "ignore_merges", true)) ||
         !field_is_unset(root, "normalizer")) {
         throw std::invalid_argument("tokenizer: " + path + " has an unsupported byte-level BPE layout");
     }
     const auto& split = seq->as_array()[0];
-    const auto& bytelevel = seq->as_array()[1];
+    const auto& bytelevel = seq->as_array().back();
     const auto* pattern = split.find("pattern");
     const bool is_glm = pattern && field_is_string(*pattern, "Regex", glm_pattern);
     const bool plain_layout = plain_hf_byte_bpe_layout(root, *model, *pre, split, bytelevel);
     const bool is_o200k = pattern && field_is_string(*pattern, "Regex", o200k::kPattern) && plain_layout;
     const bool is_qwen = strict && pattern && field_is_string(*pattern, "Regex", qwen_pattern);
-    if ((!is_glm && !is_o200k && !is_qwen) || (strict && !plain_layout) ||
-        !field_is_string(bytelevel, "type", "ByteLevel")) {
+    const auto* decoder = root.find("decoder");
+    const auto* unk = model->find("unk_token");
+    const bool decimal_layout = is_decimal && decoder && field_is_string(*decoder, "type", "ByteLevel") &&
+        field_is_unset(root, "padding") && field_is_unset(root, "truncation") &&
+        field_is_unset(*model, "dropout") && field_is_unset(*model, "continuing_subword_prefix") &&
+        field_is_unset(*model, "end_of_word_suffix") &&
+        (!model->find("fuse_unk") || field_is_bool(*model, "fuse_unk", false)) &&
+        (!model->find("byte_fallback") || model->find("byte_fallback")->is_bool()) &&
+        (!unk || unk->is_null() || (unk->is_string() && vocab->find(unk->as_string()))) &&
+        raw_prefix_template(root, *vocab);
+    if ((!is_glm && !is_o200k && !is_qwen && !decimal_layout) ||
+        (strict && !plain_layout && !decimal_layout) || !field_is_string(bytelevel, "type", "ByteLevel")) {
         throw std::invalid_argument("tokenizer: " + path + " has an unsupported byte-level pre-tokenizer");
     }
     std::vector<std::string> tokens;
@@ -673,9 +774,21 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf(const std::string& pat
             merges.push_back(m.as_array().at(0).as_string() + " " + m.as_array().at(1).as_string());
         }
     }
-    auto out = from_parts(std::move(tokens), std::move(types), merges, is_o200k ? "o200k" : is_qwen ? "qwen35" : "glm4");
+    auto out = from_parts(std::move(tokens), std::move(types), merges,
+                          is_decimal ? "decimal-triplets" : is_o200k ? "o200k" : is_qwen ? "qwen35" : "glm4");
     auto& impl = *const_cast<BpeTokenizer&>(*out).impl_;
     if (strict) {
+        if (is_decimal) {
+            // Every byte that can occur in UTF-8 needs an ordinary symbol.
+            // C0, C1 and F5 through FF never occur in valid UTF-8 input.
+            // Unknown-token and byte-fallback paths are unreachable there.
+            for (std::size_t byte = 0; byte < impl.byte_unicode.size(); ++byte) {
+                if (byte == 0xc0U || byte == 0xc1U || byte > 0xf4U) continue;
+                const auto id = out->find(impl.byte_unicode[byte]);
+                if (id == UINT32_MAX || out->type(id) != TokenType::normal)
+                    throw std::invalid_argument("tokenizer: decimal-triplet BPE needs every ordinary UTF-8 byte");
+            }
+        }
         impl.ignore_merges = ignore && ignore->as_bool();
         for (const auto id : impl.specials)
             impl.special_start[static_cast<unsigned char>(impl.tokens[id][0])] = true;
@@ -731,7 +844,8 @@ std::vector<std::uint32_t> BpeTokenizer::encode_marks(std::string_view text, boo
                                                       std::vector<EncodeMark>* marks) const {
     std::vector<std::uint32_t> out;
     // HF non-special added tokens still match with special parsing off.
-    if (!parse_special && !impl_->rule->whole_added_tokens) { impl_->encode_plain(text, out); return out; }
+    if (!parse_special && !impl_->rule->whole_added_tokens &&
+        impl_->rule->scheme != SplitScheme::right_aligned_decimal) { impl_->encode_plain(text, out); return out; }
     std::size_t start = 0, i = 0;
     while (i < text.size()) {
         bool matched = false;
@@ -763,7 +877,8 @@ bool BpeTokenizer::encode_some(std::string_view text, bool parse_special, Encode
     if (slice_bytes == 0U) slice_bytes = 1U;
     // The same special-token scan as encode(): positions below `scanned` start no special token, so every position
     // in (encoded, scanned) lies inside one plain segment of the one-shot encoding.
-    const bool scan_specials = parse_special || impl_->rule->whole_added_tokens;
+    const bool scan_specials = parse_special || impl_->rule->whole_added_tokens ||
+                               impl_->rule->scheme == SplitScheme::right_aligned_decimal;
     const auto ascii_letter = [&](std::size_t k) {
         const auto b = static_cast<unsigned char>(text[k]);
         return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z');

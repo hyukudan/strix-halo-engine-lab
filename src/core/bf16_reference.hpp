@@ -14,6 +14,21 @@ inline void round_bf16_reference(std::span<float> row) {
     for (auto& x : row) x = attn::group_indexer::bf16_round(x);
 }
 
+// Pointwise sigmoid gate after an upstream projection. The BF16 policy
+// models the operand and result stores of the gated output epilogue.
+enum class SigmoidGatePrecision { f32, bf16 };
+
+inline void sigmoid_product_reference(std::span<const float> values, std::span<const float> logits,
+                                      std::span<float> out, SigmoidGatePrecision precision) {
+    if (values.size() != logits.size() || values.size() != out.size())
+        throw std::invalid_argument("sigmoid product: row shapes differ");
+    const auto round = [precision](float value) {
+        return precision == SigmoidGatePrecision::bf16 ? attn::group_indexer::bf16_round(value) : value;
+    };
+    for (std::size_t i = 0; i < out.size(); ++i)
+        out[i] = round(round(values[i]) * (1.0F / (1.0F + std::exp(-round(logits[i])))));
+}
+
 inline void softmax_bf16_reference(std::span<float> row) {
     if (row.empty()) throw std::invalid_argument("BF16 softmax: empty row");
     const auto maximum = *std::ranges::max_element(row);

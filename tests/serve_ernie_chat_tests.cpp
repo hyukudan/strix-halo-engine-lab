@@ -45,7 +45,8 @@ Json load_fixture(const char* path) {
     return parse_json_unique(std::string(std::istreambuf_iterator<char>(file), {}));
 }
 
-void test_prompts(const Json& cases, const BpeTokenizer& tokenizer, bool official) {
+void test_prompts(const Json& cases, const BpeTokenizer& tokenizer, const Json* goldens = nullptr, bool dump = false) {
+    if (goldens) check(goldens->size() == cases.size(), "one golden per chat case");
     for (const auto& example : cases.as_array()) {
         ChatTemplateInput input;
         input.messages = field(example, "messages");
@@ -59,7 +60,13 @@ void test_prompts(const Json& cases, const BpeTokenizer& tokenizer, bool officia
         const auto ids = prompt.encode(tokenizer);
         check(tokenizer.decode(ids) == prompt.text(), "fixture prompt round trip");
         check(ids.front() == tokenizer.find("<|ERNIE_MASK|>"), "explicit leading mask");
-        if (official) {
+        if (goldens) {
+            const auto* expected = goldens->find(name);
+            check(expected && expected->size() == ids.size(), "golden length for " + name);
+            for (std::size_t i = 0; i < ids.size(); ++i)
+                check(expected->as_array()[i].as_int() == ids[i], "golden token ID for " + name);
+        }
+        if (dump) {
             std::cout << name << ':';
             for (const auto id : ids) std::cout << ' ' << id;
             std::cout << '\n';
@@ -80,6 +87,56 @@ void test_prompts(const Json& cases, const BpeTokenizer& tokenizer, bool officia
     check(std::ranges::count(ids, tokenizer.find("<|ernie:im_end|>")) == 2, "user end spelling is plain");
     check(std::ranges::count(ids, tokenizer.find("</ernie:think>")) == 0, "user reasoning delimiter is plain");
     check(tokenizer.decode(ids) == injected.text(), "literal marker spellings round trip");
+}
+
+void test_checkpoint_tokenizer(const BpeTokenizer& tokenizer) {
+    const std::pair<std::string_view, std::uint32_t> controls[] = {
+        {"<|ERNIE_PAD|>", 0}, {"<|ERNIE_BEGIN|>", 1}, {"<|ERNIE_MASK|>", 2},
+        {"<|ernie:im_start|>", 7}, {"<|ernie:im_end|>", 8},
+        {"<ernie:tool_call>", 17}, {"</ernie:tool_call>", 18},
+        {"<ernie:think>", 19}, {"</ernie:think>", 20},
+    };
+    check(tokenizer.vocab_size() == 201216 && tokenizer.eos_token() == 8, "checkpoint vocabulary and chat EOS");
+    std::size_t added_count = 0;
+    for (std::uint32_t id = 0; id < tokenizer.vocab_size(); ++id) {
+        const auto type = tokenizer.type(id);
+        if (type != BpeTokenizer::TokenType::control && type != BpeTokenizer::TokenType::user_defined) continue;
+        ++added_count;
+        check(tokenizer.encode(tokenizer.token_bytes(id)) == std::vector<std::uint32_t>{id}, "atomic added token");
+    }
+    check(added_count == 1216, "checkpoint added tokens");
+    for (const auto& [text, id] : controls)
+        check(tokenizer.encode(text) == std::vector<std::uint32_t>{id}, "checkpoint control ID");
+    for (const auto text : {
+             ""sv, "  English: It's 12345, with CRLF.\r\n\tDone!  "sv,
+             "繁體中文、简体中文。日本語かなカナ 한국어"sv,
+             "Съешь ещё этих мягких французских булок."sv,
+             "العربية ١٢٣٤٥ हिन्दी १२३४५ ไทย"sv,
+             "Café y cafe\u0301. Straße, Ελληνικά, tiê\u0301ng Viê\u0323t."sv,
+             "אֵלֶּה 👩🏽‍💻🐈  nonbreaking space ²¼."sv,
+             "chr(0):\0end"sv, "<|ERNIE_MASK|> literal </ernie:think>"sv,
+         }) {
+        const auto ordinary = tokenizer.encode_ordinary(text);
+        check(tokenizer.decode(ordinary) == text, "ordinary multilingual byte round trip");
+        check(tokenizer.decode(tokenizer.encode(text)) == text, "multilingual byte round trip");
+        check(ordinary.empty() || ordinary.front() != 2U, "raw encoding has no template prefix");
+        for (const auto id : ordinary) check(tokenizer.type(id) == BpeTokenizer::TokenType::normal, "ordinary ID isolation");
+        BpeTokenizer::EncodeCursor cursor;
+        std::vector<std::uint32_t> incremental;
+        while (tokenizer.encode_some(text, true, cursor, 3, incremental)) {}
+        check(incremental == tokenizer.encode(text), "incremental raw encoding");
+    }
+    const auto digits = [&](std::string_view whole, std::string_view first, std::string_view triplet, std::size_t repetitions) {
+        auto expected = tokenizer.encode_ordinary(first);
+        const auto group = tokenizer.encode_ordinary(triplet);
+        for (std::size_t i = 0; i < repetitions; ++i) expected.insert(expected.end(), group.begin(), group.end());
+        check(tokenizer.encode_ordinary(whole) == expected, "decimal triplets align from the right");
+    };
+    digits("1234", "1", "234", 1);
+    digits("١٢٣٤٥", "١٢", "٣٤٥", 1);
+    auto long_run = std::string("12");
+    for (auto i = 0; i < 171; ++i) long_run += "345";
+    digits(long_run, "12", "345", 171);
 }
 
 class Script final : public GenerationEngine {
@@ -205,16 +262,23 @@ void test_api(const std::shared_ptr<const BpeTokenizer>& tok) {
 
 int main(int argc, char** argv) {
     try {
-        check(argc == 3 || argc == 4, "usage: prompt fixture, synthetic tokenizer, optional checkpoint tokenizer");
+        check(argc >= 4 && argc <= 6, "usage: prompts, synthetic tokenizer, goldens, optional checkpoint tokenizer [--dump]");
+        const bool dump = argc == 6 && std::string_view(argv[5]) == "--dump";
+        check(argc != 6 || dump, "unknown argument");
         const auto asset = load_ernie_tokenizer(argv[2]);
         check(asset->encode("ab").size() == 2U, "BPE respects ignore_merges=false");
         check(asset->encode("<!>", false).size() == 1U, "legacy false mode can still activate non-special added tokens");
         check(asset->encode_ordinary("<!>").size() == 3U, "ordinary spans bypass all added tokens");
         const auto cases = load_fixture(argv[1]);
         const auto toy = byte_fixture();
-        test_prompts(cases, *toy, false);
+        test_prompts(cases, *toy);
         test_api(toy);
-        if (argc == 4) test_prompts(cases, *load_ernie_tokenizer(argv[3]), true);
+        if (argc >= 5) {
+            const auto official = load_ernie_tokenizer(argv[4]);
+            test_checkpoint_tokenizer(*official);
+            const auto goldens = dump ? Json{} : load_fixture(argv[3]);
+            test_prompts(cases, *official, dump ? nullptr : &goldens, dump);
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

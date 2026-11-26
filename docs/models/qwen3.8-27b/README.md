@@ -85,19 +85,78 @@ summed in ascending warp order. q8_0: int8 values are exact in bf16; each 32-blo
 - FAST policies: `mma2` (hi + mid), `mma1` (hi only; max |dlogit| 8x larger, see RESULT). Not the default.
 - Shapes not covered (in % 32, out % 16, f32 weights) fall back to fp32 kernels.
 
-## A4W4 layer table (HIP, FAST)
-`--profile fast` (decode and spec apps) exports `STRIX_DENSE_A4W4_LAYERS=48-63`: on wide prefill windows (rows > 16, not
-`--wide-exact` / `--prefill-exact`) the IU4 GEMMs of layers 48-63 run the shared A4W4 class `dense-iu4a4-rot-v1`
-(`src/core/iu4a4_dense.hpp`: Hadamard-128 rotated A4 g32 activations x rotated W4 per-128 weights on iu4 WMMA); the other
-layers keep the wide IU4 path (`dense-iu4a16-f16-v1`). `--profile fast` also selects the 512-row wide prefill window
-(`--wide 512` / `--prefill-rows 512`): the composite of both cells is the gated arm (row "48-63 vs EXACT" below, held-out
-set). `exact` keeps the engine's 64-row EXACT windows. `--profile turbo` runs the same FAST levers on HIP (no HIP TURBO
-row is qualified). Off switches: `--wide 16` / `--prefill-rows 16` for the window, `STRIX_DENSE_A4W4_LAYERS=none` for
-the layer table. `STRIX_DENSE_A4W4=1` alone (every layer) fails the gate and is in no profile.
+## FAST prefill window (HIP decode app)
 
-Window timing (one gfx1151 node, same binary and prompt ids, `--no-mtp`): 8K prefill EXACT 64-row windows 116 tok/s,
-FAST 512-row windows + A4W4 48-63 660 tok/s; 2K 193 -> 614 tok/s; a 32K prompt runs in about a minute with the FAST
-window while the 64-row EXACT windows need several minutes.
+FAST and TURBO prefill with the 512-row IU4 window (`--wide 512`, A4W4 off) by default when the
+prompt is inside a gated band: one gfx1151 device, one rank (no `--tp-rank`), one lane, the IU4 g64
+pack and a known execution. The band rows live in the shared regime ledger and band receipts
+(`include/strix/profiles/qwen_dense_hip.hpp`: `kQualified`, `kBandRows`); outside them, and for EXACT,
+the spec app, TP, other devices or packs, the previous route stays (64-row EXACT windows). Off
+switches: `--profile exact`, an explicit `--wide N` / `--wide-exact N`, or `--rows N`.
+`--dump-logits FILE --dump-window` dumps every row of the last window of the route the profile
+resolves; `--dump-logits` alone keeps the one-row reference path.
+
+FAST gate v2 per content class (`tools/strix-gate/gate_v2.py qual`, limits KL <= 0.02, top-1 >= 0.93,
+dNLL <= +0.01, >= 800 rows per class): held-out texts (prose: Perl pod and licence texts; code: the
+Python standard library; structured: ISO code JSON and the freedesktop MIME XML), 4 windows per class at
+2,048 and 8,192 tokens and one text per class cut at 24,576 and 24,064 tokens, 511 scored rows per window,
+reference EXACT `--wide-exact 512` (`--tf-rows`), null arm `STRIX_DENSE_NULL=0:100:1234`.
+
+| Band (tokens) | Arm | prose KL / top-1 / dNLL | code KL / top-1 / dNLL | structured KL / top-1 / dNLL | Verdict |
+|---|---|---|---|---|---|
+| 2,048 | 512-row window | 0.00008 / 0.9961 / -0.0008 | 0.00002 / 0.9971 / -0.0001 | 0.00001 / 1.0000 / +0.0001 | PASS |
+| 2,048 | window + A4W4 48-63 | 0.2095 / 0.8454 / +0.1157 | 0.0669 / 0.9310 / +0.0518 | 0.0707 / 0.9677 / +0.0464 | FAIL |
+| 8,192 | 512-row window | 0.00007 / 0.9961 / +0.0002 | 0.00003 / 0.9976 / -0.0003 | 0.00001 / 1.0000 / +0.00001 | PASS |
+| 8,192 | window + A4W4 48-63 | 0.1792 / 0.8704 / +0.1099 | 0.0649 / 0.9178 / +0.0632 | 0.0097 / 0.9902 / +0.0004 | FAIL |
+| 24,576 (cuts 24,576 + 24,064) | 512-row window | 0.00006 / 0.9951 / -0.0004 | 0.00001 / 1.0000 / -0.0000 | 0.00001 / 1.0000 / -0.0003 | PASS |
+
+The bands are 1..2,048, 2,049..8,192 and 8,193..24,576 tokens, each gated at its top. Longer prompts keep the
+64-row EXACT windows: their EXACT reference does not finish inside one night queue turn.
+
+Timing (one gfx1151 node, the IU4 pack, `--no-mtp --gen 1`, meas_nodes prompt ids, mirrored order,
+EXACT one cold prefill per round, the window warm of `--repeat 2`, kfd evictions 0, prompt seconds):
+
+| Prompt tokens | EXACT 64 rows | 512-row window | window + A4W4 48-63 | `--profile fast` (default) |
+|---|---:|---:|---:|---:|
+| 2,048 | 10.24 / 10.30 | 2.98 / 3.00 | 2.81 / 2.80 | 2.82 / 2.81 |
+| 8,192 | 67.57 / 67.63 | 12.91 / 12.94 | 12.09 / 12.11 | 12.11 / 12.10 |
+| 24,576 | 534.39 | 45.45 / 45.42 | not run | 45.32 / 45.76 |
+
+2,048 and 8,192 ran on one node in one turn; 24,576 ran on the other node, the window and default arms in one
+turn and the EXACT run (one cold prefill, 534 s) in its own turn, same binary and ids.
+
+The `--profile fast` column above ran the provisional data (window + A4W4); with the gated data the
+default dumps are bitwise the 512-row window arm (2,048 and 8,192 tokens, 3 cases each).
+
+## A4W4 layer table (HIP, FAST)
+
+The 512-row window and A4W4 layers 48-63 formed one candidate. It failed the per-class gate above
+at 2,048 and 8,192 tokens (prose and code), so its FAST cell stays pending. The single-text
+8,192-token result below did not predict the per-class result. Other devices, multi-rank or
+multi-lane execution, other packs, other window widths and different execution modes keep their
+previous routes. There is no separately qualified HIP TURBO lever.
+
+For an explicit experiment, set `STRIX_DENSE_A4W4_LAYERS=48-63` with `--wide 512`
+(decode) or `--prefill-rows 512` (spec). Layers 48-63 use `dense-iu4a4-rot-v1`
+(Hadamard-128 rotated A4 g32 activations and rotated W4 per-128 weights on IU4 WMMA).
+Other layers use `dense-iu4a16-f16-v1`. Use `STRIX_DENSE_A4W4_LAYERS=none` to disable
+the layer table. The all-layer arm failed the gate. Explicit EXACT windows and decode
+row diagnostics use their own routes. A plain `--dump-logits` retains every prompt row
+when no explicit width is supplied.
+
+Window timing on one gfx1151 node used revision `ca2de6ae8`, the Qwen 27B IU4 pack and
+identical prompt IDs. The command was `strix run qwen3.8-27b --profile exact --asset MODEL -- --prompt-ids @IDS --gen 64 --repeat 2`;
+the candidate used `--profile fast` and appended `--wide 512` on that revision.
+Both arms ran with MTP enabled. The 32,500-token EXACT run used `--repeat 1`.
+Warm GPU clocks were 2,612-2,726 MHz for completed EXACT runs and 2,473-2,554 MHz
+for the candidate. Runs started below 70 °C via the same cooldown procedure.
+The power cap was unrecorded.
+
+| Prompt tokens | EXACT 64 rows (warm tok/s) | Candidate 512 + A4W4 48-63 (warm tok/s) |
+|---|---:|---:|
+| 2048 | 187.1 | 612.2 |
+| 8192 | 115.7 | 547.8 |
+| 32500 | timeout at 470 s | 436.8 |
 
 FAST gate v2 (`tools/strix-gate`): 8,192-token prompts, 256 teacher-forced rows per window, 4 windows (1,024 rows), null
 arm `STRIX_DENSE_NULL=0:100:1234` (one FP16 ulp of one residual element before layer 0; per-window null KL 2-3e-5).
@@ -108,16 +167,14 @@ Set A = 2 texts x 2 cut points (used to choose the layers); set B = 4 slices of 
 | 0-63 | wide IU4 | A | 0.0763 | 0.906 | +0.0090 | FAIL |
 | 48-63 | wide IU4 | A | 0.0053 | 0.976 | +0.0026 | PASS |
 | 8-15, 48-63 | wide IU4 | A | 0.0095 | 0.960 | +0.0073 | FAIL (one window dNLL) |
-| 48-63 | EXACT (`--wide-exact 512`) | B | 0.0069 | 0.971 | -0.0104 | PASS |
+| 48-63 | EXACT (`--wide-exact 512`) | B | 0.0069 | 0.971 | -0.0104 | PASS on B |
 | none (wide IU4 alone) | EXACT (`--wide-exact 512`) | B | 0.00003 | 0.999 | -0.0003 | PASS |
 
 Choice: one arm per group of 8 layers (set A, reference wide IU4). Pooled KL by group 0-7 .0233, 8-15 .0047,
 16-23 .0082, 24-31 .0101, 32-39 .0166, 40-47 .0116, 48-55 .0034, 56-63 .0018; the sum (.0797) matches the all-layer
 KL (.0763). Adding any further group to 48-63 breaks one window's KL or dNLL limit.
 
-Speed (one gfx1151 node, `--wide 512`, strict ABAB, 3 pairs, same binary): 8K warm 15,945 -> 15,199 ms (-4.7 %,
-514 -> 539 tok/s); 8K cold 15,705 -> 14,937 ms (-4.9 %); 32K (one prefill per process) 81,504 -> 78,045 ms (-4.2 %,
-402 -> 420 tok/s). The rotated copy of the 16 layers costs 3.0 GiB of device memory and 0.5 s at load.
+The rotated copy of the 16 layers uses about 3 GiB of device memory.
 
 ## Multi-session batched decode (CUDA, exact class, default path for slots)
 

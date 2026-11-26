@@ -13,6 +13,9 @@ __device__ __forceinline__ const std::uint32_t* words_at(const std::uint32_t* ba
     return reinterpret_cast<const std::uint32_t*>(reinterpret_cast<std::uintptr_t>(base) + byte_offset - back_bytes);
 }
 
+// Precondition of every kernel below: `ids` holds only this shard's experts, expert_first <= id < expert_first +
+// local experts (the adapter filters the routes before launch). The local index is unsigned: an unfiltered global id
+// below expert_first would wrap and address the shard's tables out of range.
 // grid (local / 16 / Waves, gate_splits, entries * 2), block 32 * Waves.
 template <class Layer, int Bits, int Waves, int Depth, unsigned StageHalves>
 __global__ __launch_bounds__(32 * Waves) void gate_up_kernel(Layer L, const float* x, const std::int32_t* ids,

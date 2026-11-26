@@ -76,11 +76,16 @@ inline constexpr std::int64_t vocab = 201216;
 namespace drafter {
 inline constexpr std::int64_t block = 7;
 inline constexpr std::string_view kind = "block";
+inline constexpr std::int64_t layers = 3;
 inline constexpr std::int64_t rank = 256;
 inline constexpr std::int64_t taps[] = {40, 41, 42};
 } // namespace drafter
 namespace extras {
+inline constexpr std::string_view dspark_attention_kind = "uncompressed";
+inline constexpr std::int64_t dspark_confidence_input = 4352;
+inline constexpr std::int64_t dspark_feature_projection[] = {4096, 12288};
 inline constexpr std::int64_t dspark_noise_token_id = 1024;
+inline constexpr bool dspark_shared_lm_head = true;
 inline constexpr double hc_eps = 0x1.0c6f7a0b5ed8dp-20 /* 1e-06 */;
 inline constexpr std::int64_t hc_mult = 4;
 inline constexpr std::int64_t hc_sinkhorn_iters = 20;
@@ -122,6 +127,7 @@ inline constexpr std::string_view schema = "strix-model/v1";
 namespace tokens {
 inline constexpr std::int64_t bos_token_id = 1;
 inline constexpr std::int64_t eos_token_id = 2;
+inline constexpr std::int64_t generation_eos_ids[] = {2, 8};
 inline constexpr std::int64_t pad_token_id = 0;
 } // namespace tokens
 namespace weights {

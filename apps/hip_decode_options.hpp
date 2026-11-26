@@ -2245,9 +2245,14 @@ inline Options parse_options(
         std::vector<std::string> rejected_drafters;
         std::optional<strix::session::DrafterDiscovery> profile_drafter;
         // The YaRN route keeps its own contract: only an explicit or adjacent bundle selects MTP there.
-        if (bundle.empty() && !bundle_json_present && !explicit_mtp && !no_mtp && !yarn)
-            profile_drafter=strix::session::discover_drafter_sidecar(argv[1],mtp_drafter_candidates(),
-                mtp_recommended_draft_profile,&rejected_drafters);
+        if (bundle.empty() && !bundle_json_present && !explicit_mtp && !no_mtp && !yarn) {
+            // Placement alone does not bind a draft: the model must declare the draft's target identity.
+            const std::filesystem::path model_path(argv[1]);
+            const auto candidates=mtp_drafter_candidates(model_path,mtp_target_shape(model_path),&rejected_drafters);
+            if (!candidates.empty())
+                profile_drafter=strix::session::discover_drafter_sidecar(argv[1],candidates,
+                    mtp_recommended_draft_profile,&rejected_drafters);
+        }
         speculation.assets_found=!bundle.empty() || bundle_json_present || profile_drafter.has_value();
         auto decision=strix::session::resolve_speculation_default(capability,speculation);
         const bool off=yarn_bundle_serial_retry || (yarn && env && std::string_view(env)=="0") ||
@@ -3935,8 +3940,9 @@ inline Options parse_options(
     options.product_profile_inputs.regimes = strix::qwen::profile::fast_regimes;
     options.profile_device_class = std::string(device_class);
     options.profile_device_product = std::string(device_product);
-    // A serving capacity is not a request's actual prompt length: HTTP keeps the startup regime (no execution key);
-    // a request resolves with resolve_request_product_profile() over its own prompt.
+    // A serving capacity is not a request's actual prompt length: HTTP keeps the startup regime (no execution key), so
+    // the band rows (for example TURBO cap9 on 4,096-32,768 prompt tokens) are CLI-only. The server's levers are process
+    // global; a per-request resolution needs request-scoped levers first.
     if (options.http_serve) {
         options.product_profile_inputs.regime = strix::profile::startup_prefill_regime(device_class);
         options.product_profile = strix::qwen::profile::resolve(

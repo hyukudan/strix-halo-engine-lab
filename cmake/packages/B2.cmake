@@ -32,3 +32,16 @@ if(STRIX_B2_CUDA_FIXTURE)
     endif()
     # Native execution is by explicit operator invocation only.
 endif()
+
+# No-model device bench of the HIP dense rows GEMV against the declared split tree (bits vs CPU tree, GB/s per shape).
+# Explicit operator invocation only: not a ctest (it needs a device and times kernels).
+if(BUILD_TESTING AND STRIX_ENABLE_HIP_RUNTIME AND TARGET strix_tiled_core)
+    add_executable(strix-hip-dense-rows-split-bench EXCLUDE_FROM_ALL tests/core/dense_rows_split_bench_hip.hip)
+    target_link_libraries(strix-hip-dense-rows-split-bench PRIVATE strix_tiled_core)
+    target_include_directories(strix-hip-dense-rows-split-bench PRIVATE include src)
+    strix_target_warnings(strix-hip-dense-rows-split-bench)
+    target_compile_options(strix-hip-dense-rows-split-bench PRIVATE -O3 ${STRIX_HIP_WAVE32_FLAG} -ffp-contract=off
+        -fno-fast-math -fdenormal-fp-math=ieee)
+    set_target_properties(strix-hip-dense-rows-split-bench PROPERTIES
+        HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+endif()

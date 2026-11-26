@@ -1,5 +1,6 @@
 #include "cuda/core/select_score.cuh"
 #include "cuda/models/glm/dsa_selection.hpp"
+#include "cuda/models/minimax/mm_rtx_select.hpp"
 #include "select_minimax_baseline.cuh"
 #include "select_fixture_common.cuh"
 #include "select_oracle.hpp"
@@ -24,6 +25,7 @@ namespace qwen = strix::cuda::qwen_qsa;
 namespace ds = strix::ds41::cuda::attn;
 namespace glm = strix::glm::rtxpf;
 namespace mm = strix::minimax::rtxpf::cuda::k5c_baseline;
+namespace mm_binding = strix::minimax::rtxpf::cuda;
 
 void qwen_case() {
     constexpr unsigned rows = 13, first = 2046, stride = 523;
@@ -339,18 +341,11 @@ void mm_case() {
     compare("MiniMax score bytes", ref, got);
     Device<unsigned> ref_ids(rows * heads * 16, poison), got_ids(rows * heads * 16, poison);
     Device<unsigned> ref_count(rows * heads, poison), got_count(rows * heads, poison);
-    std::vector<sel::PickRow> pick_rows(rows * heads);
-    for (unsigned i = 0; i < rows * heads; ++i) {
-        auto& row = pick_rows[i];
-        row.scores = got.data + i * blocks;
-        row.groups = (pos0 + i / heads + 128U) / 128U;
-        row.selected = got_ids.data + i * 16;
-        row.count = got_count.data + i;
-    }
-    Device pick_args(pick_rows);
+    const std::array seqs{mm_binding::SeqView{0, rows, end, nullptr, nullptr, keys.data, pos0}};
+    Device pick_args(mm_binding::msa_pick_rows(seqs, rows, blocks, got.data, got_ids.data, got_count.data));
     mm::select_kernel<<<1, 128>>>(seq.data, seq_ids.data, rows, blocks, ref.data, ref_ids.data, ref_count.data);
     check(cudaGetLastError(), "MiniMax incumbent selection");
-    check(sel::enqueue_pick(pick_args.data, rows * heads, {16, 1, sel::KeyOrder::canonical_float, true}, nullptr), "MiniMax pick");
+    check(sel::enqueue_pick(pick_args.data, rows * heads, mm_binding::kMsaPick, nullptr), "MiniMax pick");
     compare("MiniMax ids", ref_ids, got_ids);
     compare("MiniMax counts", ref_count, got_count);
 }
@@ -377,15 +372,14 @@ void mm_strided_case() {
     Device tight_keys(tight), padded_keys(padded);
     Device query(values(rows * heads * 128, 731));
     std::vector<mm::SeqView> ref_sequences;
-    std::vector<sel::ScoreSequence> sequences;
+    std::vector<mm_binding::SeqView> sequences;
     std::vector<unsigned> row_sequence, visible_counts;
     std::vector<uint2> ref_tiles;
-    std::vector<sel::ScoreTile> tiles;
     unsigned first_row = 0;
     for (unsigned s = 0; s < lengths.size(); ++s) {
         ref_sequences.push_back({first_row, lengths[s], cap, nullptr, nullptr,
                                  tight_keys.data + s * tight_sequence, positions[s]});
-        sequences.push_back({first_row, positions[s]});
+        sequences.push_back({first_row, lengths[s], positions[s] + lengths[s], nullptr, nullptr, nullptr, positions[s]});
         for (unsigned r = 0; r < lengths[s]; ++r) {
             row_sequence.push_back(s);
             visible_counts.push_back(positions[s] + r + 1U);
@@ -393,38 +387,40 @@ void mm_strided_case() {
         for (unsigned r = 0; r < lengths[s]; r += 32U) {
             const unsigned count = std::min(32U, lengths[s] - r);
             ref_tiles.push_back(make_uint2(first_row + r, count));
-            tiles.push_back({first_row + r, count});
         }
         first_row += lengths[s];
     }
     Device ref_sequence_map(ref_sequences);
-    Device sequence_map(sequences);
+    Device sequence_map(mm_binding::msa_score_sequences(sequences));
     Device row_map(row_sequence);
     Device ref_tile_map(ref_tiles);
+    const auto tiles = mm_binding::msa_score_tiles(sequences);
     Device tile_map(tiles);
     check(sel::prepare_strided_score_tiles(), "strided shared-key smem");
     constexpr unsigned score_elements = rows * heads * blocks;
     constexpr unsigned canary = heads * blocks;
+    const std::array caches{mm_binding::msa_index_cache(tight_keys.data, cap, layers),
+        sel::StridedScoreCache{padded_keys.data + base_offset, sequence_stride, layer_stride, row_stride}};
     for (unsigned layer = 0; layer < layers; ++layer) {
         Device<float> ref_warps(score_elements + canary, score_poison), ref_tiled(score_elements + canary, score_poison);
-        Device<float> warps(score_elements + canary, score_poison), tiled(score_elements + canary, score_poison);
-        sel::StridedScoreArgs args{{padded_keys.data + base_offset, sequence_stride, layer_stride, row_stride},
-            row_map.data, sequence_map.data, query.data, warps.data, layer, rows, blocks};
-        constexpr sel::ScoreSpec spec{16, heads, 128, 128};
+        constexpr auto spec = mm_binding::kMsaScore;
         const auto tile_count = static_cast<unsigned>(tiles.size());
         launch_mm_baseline<sel::ScoreForm::block_max>(ref_sequence_map.data, row_map.data, rows, blocks, layer,
             query.data, ref_warps.data, nullptr, 0);
         launch_mm_baseline<sel::ScoreForm::block_max_tiled>(ref_sequence_map.data, row_map.data, rows, blocks, layer,
-            query.data, ref_tiled.data, ref_tile_map.data, tile_count);
-        check(sel::enqueue_scores<sel::ScoreForm::block_max>(args, spec, nullptr), "strided packed warp scores");
-        args.scores = tiled.data;
-        args.tiles = tile_map.data;
-        args.tile_count = tile_count;
-        check(sel::enqueue_scores<sel::ScoreForm::block_max_tiled>(args, spec, nullptr), "strided shared-key scores");
+            query.data, ref_tiled.data, ref_tile_map.data, static_cast<unsigned>(ref_tiles.size()));
         const auto expected_warps = ref_warps.read();
         const auto expected_tiled = ref_tiled.read();
-        compare("MiniMax strided block_max score bytes", expected_warps, warps.read());
-        compare("MiniMax strided block_max_tiled score bytes", expected_tiled, tiled.read());
+        for (const auto cache : caches) {
+            Device<float> warps(score_elements + canary, score_poison), tiled(score_elements + canary, score_poison);
+            sel::StridedScoreArgs args{cache, row_map.data, sequence_map.data, query.data, warps.data,
+                layer, rows, blocks, tile_map.data, tile_count};
+            check(sel::enqueue_scores<sel::ScoreForm::block_max>(args, spec, nullptr), "strided packed warp scores");
+            args.scores = tiled.data;
+            check(sel::enqueue_scores<sel::ScoreForm::block_max_tiled>(args, spec, nullptr), "strided shared-key scores");
+            compare("MiniMax strided block_max score bytes", expected_warps, warps.read());
+            compare("MiniMax strided block_max_tiled score bytes", expected_tiled, tiled.read());
+        }
         for (unsigned i = 0; i < expected_warps.size(); ++i) {
             unsigned visible_blocks = 0;
             if (i < score_elements) visible_blocks = (visible_counts[i / (heads * blocks)] + 127U) / 128U;

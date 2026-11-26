@@ -8,7 +8,8 @@
 //   1. an explicit `--mtp-bundle FILE`;
 //   2. `MODEL.gguf.mtp-bundle.json` beside the model;
 //   3. a registry drafter whose sidecar exists under the model directory at its source path
-//      (for example `MTP/NAME.gguf`) or by its logical name beside the model, with the registry's exact size.
+//      (for example `MTP/NAME.gguf`), by its logical name in the engine's drafter directory (`MTP/LOGICAL`), or by
+//      its logical name beside the model, with the registry's exact size.
 // A candidate named `preferred` (the recommended one) is tried first; the rest follow in registry order.
 #include <cstddef>
 #include <cstdint>
@@ -28,6 +29,7 @@ struct DrafterCandidate {
     std::string_view source_path;   // path of the file inside the model directory as shipped ("MTP/x.gguf")
     std::string_view logical_name;  // file name as it may sit beside the model
     std::uint64_t bytes = 0;        // exact size of the file; 0 accepts any non-empty file
+    std::string_view drafter_dir{}; // directory beside the model where the engine's drafters ship ("MTP"); empty: none
 };
 
 struct DrafterDiscovery {
@@ -65,9 +67,13 @@ std::optional<DrafterDiscovery> discover_drafter_sidecar(const std::filesystem::
         std::size_t at = 0;
         for (const auto& candidate : candidates) {
             if (at++ != wanted) continue;
-            const std::string_view places[] = {candidate.source_path, candidate.logical_name};
-            for (std::size_t place = 0; place < 2U; ++place) {
-                if (places[place].empty() || (place == 1U && places[1] == places[0])) continue;
+            const std::string in_dir = candidate.drafter_dir.empty() || candidate.logical_name.empty() ? std::string()
+                : (std::filesystem::path(std::string(candidate.drafter_dir)) / std::string(candidate.logical_name)).generic_string();
+            const std::string_view places[] = {candidate.source_path, in_dir, candidate.logical_name};
+            for (std::size_t place = 0; place < 3U; ++place) {
+                if (places[place].empty() || (place == 1U && places[1] == places[0]) ||
+                    (place == 2U && (places[2] == places[0] || places[2] == places[1])))
+                    continue;
                 auto path = directory / std::filesystem::path(std::string(places[place]));
                 path.make_preferred();
                 const auto size = detail::regular_file_size(path);
@@ -82,7 +88,9 @@ std::optional<DrafterDiscovery> discover_drafter_sidecar(const std::filesystem::
                 found.path = path;
                 found.name = std::string(candidate.name);
                 found.how = "registry drafter '" + std::string(candidate.name) + "' " +
-                    (place == 0U ? "at " + std::string(places[0]) : "by logical name beside the model");
+                    (place == 0U ? "at " + std::string(places[0])
+                     : place == 1U ? "by logical name in " + std::string(candidate.drafter_dir) + "/"
+                                   : "by logical name beside the model");
                 found.bytes = *size;
                 found.index = wanted;
                 return found;
@@ -107,8 +115,9 @@ inline bool announce_drafter_once(const std::string& line) {
     static std::mutex lock;
     static std::set<std::string> printed;
     const std::lock_guard<std::mutex> guard(lock);
-    // One line per drafter file whatever the route words (a retry or a second consumer resolves the same file).
-    const auto open = line.find(" (");
+    // One line per drafter file whatever the route words (a retry or a second consumer resolves the same file). The
+    // route words are the last parenthesis: a path may hold " (" itself (Program Files (x86)).
+    const auto open = line.rfind(" (");
     return printed.insert(line.substr(0, open)).second;
 }
 

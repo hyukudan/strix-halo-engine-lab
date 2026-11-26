@@ -212,7 +212,7 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
     auto arms = build_arms();
     // Band receipts name no literal execution: they bind to this run's own reference (shared bind_band_receipts).
     std::deque<std::string> band_references;
-    if (::strix::profile::bind_band_receipts(ladder, arms, band_references)) arms = build_arms();
+    ::strix::profile::settle_band_receipts(ladder, arms, band_references, build_arms);
     for (const auto& lever : rows) {
         const auto column = ::strix::profile::value_column(lever, profile);  // empty turbo cell: the fast cell
         const std::string* cli = nullptr;

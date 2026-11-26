@@ -1,4 +1,4 @@
-// Model-free device fixture of the FAST QSA form v2 (qsa::attention(..., mma = true) -> shared row-group core):
+// Model-free device fixture of the FAST QSA form v2 through the shared row-group core:
 //   1. union byte-compare: the device union lists (tokens, row masks, counts) left in the workspace equal the host oracle
 //      built with the same rowgroup_union.hpp functions (an exact invariant of the FAST form);
 //   2. accuracy against the exact three-kernel attention() on the same inputs (FAST: reported, loose sanity bound);
@@ -7,7 +7,9 @@
 // ascending 4-token blocks per row, drawn per 4-row tile from a shared base set with churn 0.12 (4-row union / per-row
 // count ~1.4, the in-model 8K figure is 1.37), then the tail.
 //   qwen_qsa_rowgroup_test <tables dir> [--no-timing]
+//   qwen_qsa_rowgroup_test --binding-exact
 #include "strix/cuda/qwen_qsa.hpp"
+#include "qwen_qsa_rowgroup.hpp"
 
 #include "strix/cuda/amd_math_tables.hpp"
 #include "../../src/cuda/core/attention_rowgroup.cuh"
@@ -32,9 +34,49 @@ namespace {
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); std::exit(2); }
 }
-// Layout twin of the Qwen binding (qwen_qsa.cu QsaRowgroup): only Shape / carve are used here.
-struct Layout { static constexpr unsigned D = qsa::kHeadDim, Heads = 12, Rows = 4, Cap = qsa::kMaxSelected; };
-constexpr unsigned kR = Layout::Rows, kUnionCap = rg::Shape<Layout>::UnionCap;
+// Qwen policy and entry points frozen from qwen_qsa.cu at 302722588.
+struct FrozenRowgroup {
+    static constexpr unsigned D = qsa::kHeadDim, Heads = 12, Rows = 4, Cap = qsa::kMaxSelected;
+    static constexpr float kScaleLog2 = 0.0625F * 1.44269504088896341F;
+    const float* q_gate;
+    std::uint64_t first_position;
+    const std::uint32_t* selected;
+    const std::uint16_t* kv;
+    float* output;
+    std::uint32_t rows;
+    __device__ unsigned count(unsigned row) const { return qsa::selected_count(first_position + row); }
+    __device__ std::uint32_t key(unsigned row, unsigned j) const {
+        return selected[static_cast<std::uint64_t>(row) * Cap + j];
+    }
+    __device__ const std::uint16_t* key_row(std::uint32_t token, unsigned kvh) const {
+        return kv + static_cast<std::uint64_t>(token) * (qsa::kKvWidth * 2ULL) + static_cast<std::uint64_t>(kvh) * D;
+    }
+    __device__ const std::uint16_t* value_row(std::uint32_t token, unsigned kvh) const {
+        return key_row(token, kvh) + qsa::kKvWidth;
+    }
+    __device__ float query(unsigned row, unsigned kvh, unsigned h, unsigned d) const {
+        return q_gate[static_cast<std::uint64_t>(row) * qsa::kQGateWidth +
+            static_cast<std::uint64_t>(kvh * Heads + h) * D * 2ULL + d];
+    }
+    __device__ static float round_bf16(float x) {
+        const auto b = __float_as_uint(x);
+        return __uint_as_float(((b + 0x7fffU + ((b >> 16U) & 1U)) >> 16U) << 16U);
+    }
+    __device__ void store2(unsigned row, unsigned kvh, unsigned h, unsigned d, float a0, float a1) const {
+        const auto head = kvh * Heads + h;
+        const float* g = q_gate + static_cast<std::uint64_t>(row) * qsa::kQGateWidth +
+            static_cast<std::uint64_t>(head) * D * 2ULL + D + d;
+        const float g0 = round_bf16(1.0F / (1.0F + __expf(-g[0]))), g1 = round_bf16(1.0F / (1.0F + __expf(-g[1])));
+        *reinterpret_cast<float2*>(output + static_cast<std::uint64_t>(row) * qsa::kAttnWidth +
+            static_cast<std::uint64_t>(head) * D + d) =
+            make_float2(round_bf16(round_bf16(a0) * g0), round_bf16(round_bf16(a1) * g1));
+    }
+};
+using Layout = FrozenRowgroup;
+using Shape = rg::Shape<Layout>;
+constexpr unsigned kR = Layout::Rows, kUnionCap = Shape::UnionCap;
+__global__ __launch_bounds__(256) void frozen_union(Layout p, rg::Union u) { rg::union_body(p, u); }
+__global__ __launch_bounds__(Shape::Threads, 2) void frozen_flash(Layout p, rg::Union u) { rg::flash_body(p, u); }
 
 std::mt19937 rng(20261118);
 float uniform(float lo, float hi) { return std::uniform_real_distribution<float>(lo, hi)(rng); }
@@ -79,9 +121,71 @@ Inputs make_inputs(std::uint32_t rows, std::uint64_t first, float qscale, double
 }
 void free_inputs(Inputs& in) { cudaFree(in.kv); cudaFree(in.q); cudaFree(in.sel); }
 
+int binding_exact() {
+    constexpr unsigned rows = 7, first = 2047, tiles = (rows + kR - 1U) / kR;
+    constexpr auto workspace_bytes = rg::workspace_bytes<Layout>(tiles);
+    constexpr auto out_count = rows * qsa::kAttnWidth;
+    auto in = make_inputs(rows, first, 2.0F, 0.12);
+    // Force the last (partial) tile down the ordered concatenation path.
+    auto* row5 = in.host_sel.data() + 5U * qsa::kMaxSelected;
+    row5[3] = row5[1];
+    ck(cudaMemcpy(in.sel, in.host_sel.data(), in.host_sel.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice), "patch selected");
+    cudaStream_t stream = nullptr;
+    ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+    qsa::prepare_attention_mma();
+    ck(cudaFuncSetAttribute(frozen_union, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(Shape::UnionSmem)), "frozen union smem");
+    std::uint8_t *old_ws = nullptr, *new_ws = nullptr;
+    float *old_out = nullptr, *new_out = nullptr;
+    ck(cudaMalloc(&old_ws, workspace_bytes), "old workspace");
+    ck(cudaMalloc(&new_ws, workspace_bytes), "new workspace");
+    ck(cudaMalloc(&old_out, out_count * sizeof(float)), "old output");
+    ck(cudaMalloc(&new_out, out_count * sizeof(float)), "new output");
+    for (auto* ws : {old_ws, new_ws}) ck(cudaMemsetAsync(ws, 0xA5, workspace_bytes, stream), "workspace sentinel");
+    for (auto* out : {old_out, new_out}) ck(cudaMemsetAsync(out, 0xFF, out_count * sizeof(float), stream), "output sentinel");
+    const Layout old{in.q, first, in.sel, in.kv, old_out, rows};
+    const auto u = rg::carve<Layout>(old_ws, tiles);
+    frozen_union<<<tiles, 256, Shape::UnionSmem, stream>>>(old, u);
+    ck(cudaGetLastError(), "frozen union");
+    frozen_flash<<<dim3(qsa::kKvHeads, tiles), Shape::Threads, Shape::FlashSmem, stream>>>(old, u);
+    ck(cudaGetLastError(), "frozen flash");
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    ck(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+    qsa::enqueue_attention_mma(in.q, rows, first, in.sel, in.kv, new_ws, new_out, stream);
+    ck(cudaStreamEndCapture(stream, &graph), "end capture");
+    ck(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+    ck(cudaGraphLaunch(exec, stream), "replay");
+    ck(cudaStreamSynchronize(stream), "sync");
+
+    std::vector<std::uint8_t> old_workspace(workspace_bytes), new_workspace(workspace_bytes);
+    std::vector<float> old_output(out_count), new_output(out_count);
+    ck(cudaMemcpy(old_workspace.data(), old_ws, workspace_bytes, cudaMemcpyDeviceToHost), "read old workspace");
+    ck(cudaMemcpy(new_workspace.data(), new_ws, workspace_bytes, cudaMemcpyDeviceToHost), "read new workspace");
+    ck(cudaMemcpy(old_output.data(), old_out, out_count * sizeof(float), cudaMemcpyDeviceToHost), "read old output");
+    ck(cudaMemcpy(new_output.data(), new_out, out_count * sizeof(float), cudaMemcpyDeviceToHost), "read new output");
+    const bool exact = old_workspace == new_workspace &&
+        std::memcmp(old_output.data(), new_output.data(), out_count * sizeof(float)) == 0 &&
+        std::all_of(new_output.begin(), new_output.end(), [](float x) { return std::isfinite(x); });
+    ck(cudaGraphExecDestroy(exec), "destroy exec");
+    ck(cudaGraphDestroy(graph), "destroy graph");
+    ck(cudaStreamDestroy(stream), "destroy stream");
+    ck(cudaFree(old_ws), "free old workspace");
+    ck(cudaFree(new_ws), "free new workspace");
+    ck(cudaFree(old_out), "free old output");
+    ck(cudaFree(new_out), "free new output");
+    free_inputs(in);
+    std::printf("QSA row-group graph output and full workspace %s\n", exact ? "EXACT" : "MISMATCH");
+    return exact ? 0 : 1;
+}
+
 void run(const Inputs& in, std::uint32_t n, std::uint64_t first, std::uint32_t c, float* scores, float* out, const am::Tables& t, bool mma) {
-    qsa::attention(in.q + std::uint64_t{c} * qsa::kQGateWidth, n, first + c, in.sel + std::uint64_t{c} * qsa::kMaxSelected, in.kv, scores,
-        out + std::uint64_t{c} * qsa::kAttnWidth, t, nullptr, mma);
+    const auto* query = in.q + std::uint64_t{c} * qsa::kQGateWidth;
+    const auto* selected = in.sel + std::uint64_t{c} * qsa::kMaxSelected;
+    out += std::uint64_t{c} * qsa::kAttnWidth;
+    if (mma) qsa::enqueue_attention_mma(query, n, first + c, selected, in.kv, scores, out, nullptr);
+    else qsa::attention(query, n, first + c, selected, in.kv, scores, out, t, nullptr);
 }
 
 int failures = 0;
@@ -93,7 +197,7 @@ void host_union(const Inputs& in, std::uint32_t rows, std::uint64_t first, unsig
     for (unsigned r = 0; r < kR; ++r) {
         const unsigned row = tile * kR + r;
         n[r] = row < rows ? qsa::selected_count(first + row) : 0U;
-        std::copy_n(&in.host_sel[std::uint64_t{row} * qsa::kMaxSelected], n[r], lists.begin() + r * Layout::Cap);
+        if (n[r]) std::copy_n(&in.host_sel[std::uint64_t{row} * qsa::kMaxSelected], n[r], lists.begin() + r * Layout::Cap);
     }
     unsigned total = 0;
     for (unsigned r = 0; r < kR; ++r) {
@@ -195,10 +299,12 @@ void timing(std::uint32_t rows, const am::Tables& tables) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--binding-exact") == 0) return binding_exact();
     if (argc < 2 || argc > 3 || (argc == 3 && std::strcmp(argv[2], "--no-timing") != 0)) {
-        std::fprintf(stderr, "usage: qwen_qsa_rowgroup_test <tables dir> [--no-timing]\n"); return 1;
+        std::fprintf(stderr, "usage: qwen_qsa_rowgroup_test <tables dir> [--no-timing] | --binding-exact\n"); return 1;
     }
     const auto tables = am::load_tables(argv[1]);
+    qsa::prepare_attention_mma();
     for (const std::uint64_t first : {0ULL, 9000ULL})
         for (const std::uint32_t rows : {1U, 17U, 1024U}) compare(rows, first, 2.0F, tables);
     compare(1024, 9000, 6.0F, tables);   // peaked softmax

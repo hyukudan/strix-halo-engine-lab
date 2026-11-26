@@ -5,6 +5,7 @@
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -174,12 +175,34 @@ void check_factory(const std::string& root) {
 }
 // The front as the user runs it (`strix-serve --model qwen3.8-flash-next --profile fast --asset MODEL.gguf ...`): the
 // expanded native argv resolves the registry drafter beside the model and keeps MTP on with --http-batch 8.
+// A header-only GGUF v3 (no tensors) declaring the drafter-target identity keys discovery reads.
+void write_target_gguf(const std::filesystem::path& path, std::uint32_t layers) {
+    std::ofstream f(path, std::ios::binary);
+    const auto u32 = [&](std::uint32_t v) { f.write(reinterpret_cast<const char*>(&v), sizeof v); };
+    const auto u64 = [&](std::uint64_t v) { f.write(reinterpret_cast<const char*>(&v), sizeof v); };
+    const auto str = [&](const std::string& v) { u64(v.size()); f.write(v.data(), static_cast<std::streamsize>(v.size())); };
+    f.write("GGUF", 4);
+    u32(3);
+    u64(0);
+    u64(3);
+    str("general.architecture");
+    u32(8);
+    str("qwen4exp");
+    str("qwen4exp.block_count");
+    u32(4);
+    u32(layers);
+    str("qwen4exp.embedding_length");
+    u32(4);
+    u32(2560);
+    const auto end = static_cast<std::uint64_t>(f.tellp());
+    for (auto pad = (32U - end % 32U) % 32U; pad != 0; --pad) f.put(char{0});
+}
 void check_discovered_drafter(const std::string& root) {
     const auto dir = std::filesystem::temp_directory_path() / "strix-serve-discovered-drafter";
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir / "MTP");
     const auto model = dir / "model.gguf";
-    { std::ofstream file(model, std::ios::binary); file << "target bytes"; }
+    write_target_gguf(model, 48);
     const auto sidecar = dir / "MTP" / "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
     { std::ofstream file(sidecar, std::ios::binary); file << "x"; }
     std::filesystem::resize_file(sidecar, 2786568256ULL);
@@ -209,6 +232,11 @@ void check_discovered_drafter(const std::string& root) {
     CHECK(options.http_serve && options.mtp.enabled && options.mtp_native_bundle &&
           options.supplied_options.contains("--http-batch"));
     CHECK(options.mtp.sidecar == sidecar.string());
+    // A model of another identity (layer count) never binds the draft placed beside it.
+    write_target_gguf(model, 64);
+    expanded.clear();
+    (void)invoke(start, factories, shell);
+    CHECK(expanded.empty() || legacy_options(expanded).mtp.sidecar != sidecar.string());
     std::error_code ignored;
     std::filesystem::remove_all(dir, ignored);
 }

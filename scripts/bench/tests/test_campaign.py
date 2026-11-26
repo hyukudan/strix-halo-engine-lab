@@ -161,8 +161,27 @@ class PublicCampaignTest(unittest.TestCase):
         self.assertEqual([line.split()[1] for line in plan.getvalue().splitlines() if line.startswith('deepseek_native_decode')],
                          ['decode-greedy-r1', 'decode-spec-r1', 'decode-spec-r2', 'decode-greedy-r2',
                           'decode-greedy-r3', 'decode-spec-r3'])
-        self.assertEqual(plan.getvalue().count('--profile fast'), 3)
+        # The TURBO preset's native tier is turbo (models/deepseek-v4.1-flash.toml [presets.turbo]).
+        self.assertEqual(params['native_tier'], 'turbo')
+        self.assertEqual(plan.getvalue().count('--profile turbo'), 3)
         self.assertEqual(set(sum(kit.DEEPSEEK_GROUPS.values(), ())), {x['id'] for x in texts})
+
+    def test_schema_accepts_every_campaign_native_tier(self):
+        schema = kit.read(Path(kit.__file__).resolve().parents[1] / 'results.schema.json')
+
+        def find(node):
+            if isinstance(node, dict):
+                if 'native_tier' in node and isinstance(node['native_tier'], dict) and 'enum' in node['native_tier']:
+                    return node['native_tier']['enum']
+                return next((r for r in map(find, node.values()) if r is not None), None)
+            if isinstance(node, list):
+                return next((r for r in map(find, node) if r is not None), None)
+            return None
+
+        allowed = find(schema)
+        self.assertIsNotNone(allowed)
+        self.assertEqual(set(allowed), set(interface.DEEPSEEK_CAMPAIGN_TIERS))
+        self.assertIn(interface.deepseek_campaign_tier('turbo', kit.KIT), allowed)
 
     def test_public_group_aggregation_requires_all_measured_jobs(self):
         measurements = [

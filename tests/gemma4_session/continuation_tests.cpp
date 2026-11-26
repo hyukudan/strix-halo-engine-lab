@@ -15,6 +15,7 @@ template<class F> void refuses(F f) {
     bool caught=false; try { f(); } catch(const std::exception&) {caught=true;} CHECK(caught);
 }
 namespace {
+// Cases marked [[maybe_unused]] run from this file's main only; turn_cache_integration_tests.cpp includes the file without it.
 // Ordinary loaded-family weights and real HostTarget evaluation; no model math
 // or synthetic StreamState is implemented by this test.
 g::ModelManifest tiny() {
@@ -179,7 +180,7 @@ void equivalent(e::SessionEngine& engine,s::KvHandle h,const Reference& ref) {
     CHECK(engine.result(h).ids==ref.generated);CHECK(engine.result(h).rng_draws==ref.draws);
     CHECK(digest(engine,h)==ref.state.digest());
 }
-void boundaries() {
+[[maybe_unused]] void boundaries() {
     auto model=tiny();Tables tables;
     for(bool sampled:{false,true})for(auto n:{1U,7U,8U,9U,15U,16U,17U,25U}) {
         Observed backend(model,tables.view());std::mutex mutex;e::SessionEngine engine(backend,{}, {},mutex,2,0,0);
@@ -199,7 +200,7 @@ void boundaries() {
         CHECK(backend.trace.size()==n+3); // first output uses zero new rows
     }
 }
-void interleaved() {
+[[maybe_unused]] void interleaved() {
     auto model=tiny();Tables tables;Observed backend(model,tables.view());std::mutex mutex;
     e::SessionEngine engine(backend,{}, {},mutex,2,0,0);auto h=engine.store().acquire();auto p=sampler(true);
     Reference ref(model,tables.view(),policy(p));auto ids=input(9);engine.prefill(ids,h);ref.append(ids);
@@ -219,7 +220,7 @@ void interleaved() {
     }
     CHECK(!engine.store().supports_fork());
 }
-void terminal_boundaries() {
+[[maybe_unused]] void terminal_boundaries() {
     auto model=tiny();Tables tables;Observed backend(model,tables.view());std::mutex mutex;
     e::SessionEngine engine(backend,{}, {},mutex,2,0,0);auto h=engine.store().acquire();auto ids=input(8);engine.prefill(ids,h);
     auto p=sampler(true);p.max_tokens=0;auto calls=backend.calls;const auto before=digest(engine,h);
@@ -257,7 +258,7 @@ void terminal_boundaries() {
     refuses([&]{engine.append_external(ids,full);});q.max_tokens=8;end=engine.decode(full,q);
     CHECK(end.tokens.empty() && end.finish==s::FinishReason::context);CHECK(backend.calls==calls);CHECK(engine.store().pending(full)==anchor);
 }
-void resumed_bounded_policy() {
+[[maybe_unused]] void resumed_bounded_policy() {
     auto model=tiny();Tables tables;Observed backend(model,tables.view());std::mutex mutex;
     e::SessionEngine engine(backend,{}, {},mutex,1,0,0);auto h=engine.store().acquire();
     auto ids=input(7);auto p=sampler(true);Reference ref(model,tables.view(),policy(p));
@@ -280,7 +281,7 @@ void resumed_bounded_policy() {
     CHECK(backend.calls==calls && result.tokens==std::vector<std::uint32_t>{ref.decode()});
     equivalent(engine,h,ref);
 }
-void rejection_and_caps() {
+[[maybe_unused]] void rejection_and_caps() {
     auto model=tiny();Tables tables;Observed backend(model,tables.view());std::mutex mutex;
     e::SessionEngine engine(backend,{}, {},mutex,3,0,0);auto h=engine.store().acquire();auto ids=input(1);engine.prefill(ids,h);
     const auto caps=engine.caps();CHECK(caps.external_append && caps.lane_resume && caps.mixed_advance);
@@ -319,7 +320,7 @@ void rejection_and_caps() {
     e::SessionEngine identity(backend,{}, {},mutex,1,0,0);auto bad_identity=identity.store().acquire();
     refuses([&]{identity.prefill(ids,bad_identity);});CHECK(!identity.caps().external_append && !identity.caps().lane_resume);
 }
-void rollback() {
+[[maybe_unused]] void rollback() {
     auto model=tiny();Tables tables;Observed backend(model,tables.view());std::mutex mutex;
     backend.faults=std::make_shared<Faults>();
     e::SessionEngine engine(backend,{}, {},mutex,3,0,0);auto h=engine.store().acquire();auto ids=input(9);auto p=sampler(true);
@@ -351,7 +352,7 @@ void rollback() {
         refuses([&]{(void)engine.store().capture(h);});refuses([&]{engine.lane_receipt(h);});};
     engine.append_external(ids,empty);CHECK(attempted);backend.on_call={};
 }
-void mixed_group() {
+[[maybe_unused]] void mixed_group() {
     auto model=tiny();Tables tables;Observed backend(model,tables.view());std::mutex mutex;
     e::SessionEngine engine(backend,{}, {},mutex,3,0,0);auto a=engine.store().acquire(),b=engine.store().acquire(),c=engine.store().acquire();
     auto ids=input(1);engine.prefill(ids,a);engine.prefill(ids,b);auto p=sampler();
@@ -374,7 +375,7 @@ void mixed_group() {
     const s::AdvanceItem first{a,{},q,{}};result=engine.advance({&first,1});CHECK(backend.calls==before);CHECK(result[0].output.tokens.size()==1);
     engine.store().restore(a,fresh);CHECK(!engine.store().pending(a));CHECK(engine.result(a).ids.empty());
 }
-void mixed_long_prompt() {
+[[maybe_unused]] void mixed_long_prompt() {
     auto model=tiny();Tables tables;Observed backend(model,tables.view());std::mutex mutex;
     e::SessionEngine engine(backend,{}, {},mutex,2,0,0);
     auto legacy=engine.store().acquire(),lane=engine.store().acquire();
@@ -404,7 +405,7 @@ void mixed_long_prompt() {
 }
 // Exercise the device-checked result contract without claiming native execution.
 // Retained selection has no row in the other lane's device winner array.
-void retained_with_device_rows() {
+[[maybe_unused]] void retained_with_device_rows() {
     auto model=tiny();Tables tables;Observed backend(model,tables.view());backend.device_checked=true;
     std::mutex mutex;e::SessionEngine engine(backend,{}, {},mutex,2,0,0);
     auto a=engine.store().acquire(),b=engine.store().acquire();auto ids=input(9);auto p=sampler();
@@ -425,7 +426,7 @@ void retained_with_device_rows() {
     CHECK(out[1].output.tokens==std::vector<std::uint32_t>{br.decode()});
     equivalent(engine,a,ar);equivalent(engine,b,br);
 }
-void publication_failure() {
+[[maybe_unused]] void publication_failure() {
     auto model=tiny();Tables tables;Observed backend(model,tables.view());backend.faults=std::make_shared<Faults>();std::mutex mutex;
     e::SessionEngine engine(backend,{}, {},mutex,3,0,0);
     auto legacy=engine.store().acquire(),a=engine.store().acquire(),b=engine.store().acquire();
@@ -459,7 +460,7 @@ void publication_failure() {
     CHECK(engine.result(legacy).ids==results[0].output.tokens);engine.store().release(a);
     auto reused=engine.store().acquire();engine.prefill(ids,reused);CHECK(engine.store().consumed(reused)==ids.size());
 }
-void bounded_pending_and_cancel() {
+[[maybe_unused]] void bounded_pending_and_cancel() {
     auto model=tiny();Tables tables;Observed backend(model,tables.view());std::mutex mutex;
     e::SessionEngine engine(backend,{}, {},mutex,8,0,0);std::vector<s::KvHandle> handles;
     auto ids=input(1);auto p=sampler();

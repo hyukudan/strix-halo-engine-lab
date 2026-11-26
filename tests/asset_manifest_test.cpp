@@ -55,8 +55,19 @@ void draft_min_p_profiles() {
         check(rejected);
     }
 }
+// Drafter discovery binds a registry draft only to the target it was trained for (architecture, layers, hidden).
+void draft_targets() {
+    for (const auto& p : strix::mtp_draft_profiles) {
+        check(strix::mtp_draft_target_matches(p, "qwen4exp", 48, 2560));
+        check(!strix::mtp_draft_target_matches(p, "qwen4exp", 64, 5120));
+        check(!strix::mtp_draft_target_matches(p, "qwen35", 48, 2560));
+        check(!strix::mtp_draft_target_matches(p, "qwen4exp", 49, 2560));  // the draft sidecar's own layer count
+        check(!strix::mtp_draft_target_matches(p, "", 0, 0));               // unreadable model identity
+    }
+}
 int main() try {
     draft_min_p_profiles();
+    draft_targets();
     std::random_device random;
     std::filesystem::path root;
     for (unsigned attempt = 0; attempt < 100; ++attempt) {

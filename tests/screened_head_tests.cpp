@@ -389,10 +389,57 @@ void builder_tests() {
     expect(sh::guard_ok(sh::inflated_norm(xs, b), 1.0F) && sh::inflated_norm(xs, b) > 1.0e-30F * 9.0F, "tiny x keeps a sound norm floor");
 }
 
+// The pass-1 schedule (screened_head_plan: row tiles, one-wave grid, lane groups folded into the block index) computes
+// every (row, lane) bound exactly once, for every lane count the resident screen admits, any grid cap and any resident
+// count, including clipped tail tiles. The device bodies walk exactly this loop.
+void pass1_schedule_tests() {
+    namespace plan = strix::core::screened_head_plan;
+    expect(plan::pass1_tile_rows(1U) == 1U && plan::pass1_tile_rows(2U) == 1U && plan::pass1_tile_rows(4U) == 2U &&
+               plan::pass1_tile_rows(8U) == 4U,
+           "tile rows 1, 1, 2, 4 for 1, 2, 4, 8 lanes per group");
+    expect(plan::pass1_blocks(1504U, 0U, 1U) == 1504U && plan::pass1_blocks(1504U, 1504U, 1U) == 1504U,
+           "one lane keeps the owner's grid");
+    expect(plan::pass1_blocks(1504U, 376U, 1U) == 376U, "eight lanes: one wave of resident blocks");
+    expect(plan::pass1_blocks(1504U, 375U, 4U) == 372U && plan::pass1_blocks(1504U, 3U, 4U) == 4U &&
+               plan::pass1_blocks(2U, 0U, 4U) == 4U,
+           "whole lane groups, at least one block per group");
+    const unsigned row_counts[] = {1U, 3U, 7U, 64U, 1001U, 20011U};
+    const unsigned residents[] = {0U, 3U, 376U, 564U, 1504U};
+    const std::size_t limits[] = {48U * 1024U, 227U * 1024U};
+    for (const std::size_t limit : limits)
+        for (unsigned lanes = 1U; lanes <= plan::kMaxLanes; ++lanes) {
+            const unsigned per_group = plan::pass1_lanes(2304U, lanes, limit);
+            const unsigned groups = plan::pass1_groups(lanes, per_group);
+            expect(per_group != 0U && plan::pass1_lanes_valid(per_group, lanes), "lane form admitted", lanes, per_group);
+            expect(groups * per_group >= lanes && (groups - 1U) * per_group < lanes, "groups cover the lanes", lanes,
+                   groups);
+            const unsigned tile_rows = plan::pass1_tile_rows(per_group);
+            for (const unsigned resident : residents)
+                for (const unsigned rows : row_counts) {
+                    const unsigned blocks = plan::pass1_blocks(1504U, resident, groups);
+                    expect(blocks % groups == 0U && blocks >= groups, "blocks are whole groups", blocks, groups);
+                    std::vector<unsigned> seen(std::size_t{rows} * groups, 0U);
+                    const unsigned tiles = (rows + tile_rows - 1U) / tile_rows;
+                    for (unsigned block = 0; block < blocks; ++block) {
+                        const auto map = plan::pass1_map(block, blocks, groups);
+                        for (unsigned warp = 0; warp < plan::kPass1Waves; ++warp)
+                            for (unsigned tile = plan::pass1_first_tile(map, warp); tile < tiles;
+                                 tile += plan::pass1_tile_step(map))
+                                for (unsigned r = 0; r < tile_rows && tile * tile_rows + r < rows; ++r)
+                                    ++seen[std::size_t{tile * tile_rows + r} * groups + map.group];
+                    }
+                    const bool once = std::all_of(seen.begin(), seen.end(), [](unsigned v) { return v == 1U; });
+                    expect(once, "every (row, lane group) bound computed exactly once", rows, lanes);
+                }
+        }
+    std::puts("screened-head pass1 schedule: lanes 1..32, tiles 1/2/4, one-wave grids, folded groups ok");
+}
+
 }  // namespace
 
 int main() {
     builder_tests();
+    pass1_schedule_tests();
     softcap_monotone_host();
     rescore_plan_tests();
     const Scenario scenarios[] = {

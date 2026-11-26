@@ -329,6 +329,10 @@ int main(int argc, char** argv) {
         preq.slot_bench = slots != 0;
         if (opt.qual_null_order) preq.unshown.emplace_back("--qual-null-order");
         if (step_program) preq.unshown.emplace_back("--step-program");
+        // The EXACT large-route identity ran chunk 2,048, no ramp and one or two slots (qp::kExactLargeIdentity).
+        if (pf_chunk != 2048U) preq.unshown.emplace_back("--prefill-chunk");
+        if (pf_ramp != 0U) preq.unshown.emplace_back("--prefill-ramp");
+        if (pf_slots != 1U && pf_slots != 2U) preq.unshown.emplace_back("--prefill-slots");
         const auto route = qp::plan_prompt(*resolved, preq);
         const std::string profile_text = qp::describe(*resolved) + "  kv: " + kv.receipt() + "\n" + qp::describe_route(route);
         if (!pf_norm_fold.empty()) opt.prefill_norm_fold = q::parse_prefill_norm_fold(pf_norm_fold);

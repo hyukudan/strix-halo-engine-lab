@@ -28,6 +28,12 @@ struct CopyBf16Round {
     __device__ void operator()(std::size_t i) const { output[i] = bf16_round(input[i]); }
 };
 
+struct Copy {
+    const float* input;
+    float* output;
+    __device__ void operator()(std::size_t i) const { output[i] = input[i]; }
+};
+
 struct WidenRepeatedBf16Row {
     const std::uint16_t* input;
     float* output;

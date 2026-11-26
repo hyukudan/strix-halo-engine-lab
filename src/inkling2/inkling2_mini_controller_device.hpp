@@ -5,6 +5,16 @@
 #include "inkling2_mini_resident_forward.hpp"
 #include "inkling2_mini_resident_weights.hpp"
 
+namespace strix::inkling2 {
+
+// Each cross-pass query tensor holds two rows per core layer (query/moe or key/value).
+inline constexpr unsigned kMiniMessageQueryRows = 2U * (kCoreLast - kCoreFirst);
+
+// One batch holds the message rows of both query tensors for the next pass.
+inline constexpr std::size_t kMiniMessageBatchElements = 2U * std::size_t{kMiniMessageQueryRows} * kHiddenWidth;
+
+}  // namespace strix::inkling2
+
 #if defined(__HIPCC__) || defined(__CUDACC__)
 namespace strix::inkling2 {
 

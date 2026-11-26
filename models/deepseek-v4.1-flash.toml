@@ -87,8 +87,8 @@ block = 5
 
 # Launchers project these columns into the engine's native, gated registry.
 [presets]
-# Match the native invocation without a tier word.
-default = "exact"
+# FAST is the product default; the presets resolve the native granted cells, as the native CLI does for --profile fast.
+default = "fast"
 native_kv = "fp8 ring + fp4 compressed (model-defined)"
 
 [presets.exact]

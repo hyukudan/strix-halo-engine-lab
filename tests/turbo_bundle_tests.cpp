@@ -96,9 +96,10 @@ void families() {
         in.regime = {p::Phase::prefill, 8128, 1, "gfx1151", p::kBandProbeExecution};
         const auto measured = p::resolve(ds, in);
         require(find(measured, "d1_prefill")->value == "1", "DeepSeek TURBO inherits the measured FAST D1 row");
+        require(find(measured, "decoder_replay")->value == "256", "DeepSeek TURBO inherits the measured FAST R256 row");
     }
-    require(find(r, "moe_iu4")->value == "0" && find(r, "moe_iu4")->status == p::Status::pending,
-            "DeepSeek IU4 remains pending in TURBO");
+    require(find(r, "moe_iu4")->value == "0" && find(r, "moe_iu4")->status == p::Status::builtin,
+            "DeepSeek IU4 is not a TURBO row (measured slower than FAST)");
     std::size_t engram_rows = 0;
     for (const auto& row : profile_table)
         if (std::string_view(row.env) == "STRIX_DS41_FAST_ENGRAM") ++engram_rows;

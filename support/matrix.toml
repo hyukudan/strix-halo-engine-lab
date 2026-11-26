@@ -515,6 +515,18 @@ state = "connected"
 sources = ["apps/inkling2_mini_hip.hip"]
 entrypoint = "strix-inkling2-mini-hip MODEL.safetensors --prompt TEXT --generate N"
 note = "Identity receipts on the integrated build are pending."
+
+[[support]]
+family = "ernie"
+format = "safetensors-mxfp4-fp8"
+backend = "cpu"
+arch = "x86_64"
+os = "linux"
+function = "inventory"
+state = "implemented"
+sources = ["apps/ernie_inventory_main.cpp","src/ernie/inventory.cpp"]
+note = "Host checkpoint inventory, tokenizer and operator references only. Native execution and qualification are pending."
+
 [[consumer]]
 component = "FP16 tall dense core"
 operation = "Pack activation tiles"

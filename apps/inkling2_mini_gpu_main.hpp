@@ -233,7 +233,8 @@ inline void run_gate(const char* checkpoint, const Options& options, std::span<c
 
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 static_assert(kLatencyFormsMix == kMiniFormsMix && kLatencyFormsMoe == kMiniFormsMoe &&
-              kLatencyFormsAll == kMiniFormsAll && kMiniDefaultForms == kMiniFormsMix);
+              kLatencyFormsAll == kMiniFormsAll && kMiniDefaultForms == kMiniFormsMix &&
+              kLatencyFormsBatch == kMiniFormsBatch && kLatencyFormsB3 == kMiniFormsB3);
 
 using MiniCudaProgramLoad = std::unique_ptr<serve::SerialGenerationDecoder> (*)(const serve::SerialGenerationLoad&,
                                                                                 moe_core::grouped_w4a4::Activations, bool, bool,
@@ -247,6 +248,8 @@ inline MiniCudaProgramLoad select_mini_cuda_program(bool fuse, unsigned forms) {
         case kMiniFormsMix: return load_mini_cuda_program<on, kMiniFormsMix>;
         case kMiniFormsMoe: return load_mini_cuda_program<on, kMiniFormsMoe>;
         case kMiniFormsAll: return load_mini_cuda_program<on, kMiniFormsAll>;
+        case kMiniFormsBatch: return load_mini_cuda_program<on, kMiniFormsBatch>;
+        case kMiniFormsB3: return load_mini_cuda_program<on, kMiniFormsB3>;
         default: return load_mini_cuda_program<on, 0U>;
         }
     };
@@ -282,13 +285,13 @@ int main(int argc, char** argv) {
 #endif
                      "]"
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
-                     " [--no-epilogue-fusion] [--latency-forms[=mix|=moe] | --no-latency-forms]"
+                     " [--no-epilogue-fusion] [--latency-forms[=mix|moe|batch|b3] | --no-latency-forms]"
 #endif
                      " [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed N]\n"
                      "       MODEL.safetensors --gate-manifest FILE --gate-out DIR --gate-arm NAME"
                      " --gate-rows N --gate-mode prefill|decode [--prefill-chunk N] [--packed-decode | --grouped-decode]"
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
-                     " [--no-epilogue-fusion] [--latency-forms[=mix|=moe] | --no-latency-forms]"
+                     " [--no-epilogue-fusion] [--latency-forms[=mix|moe|batch|b3] | --no-latency-forms]"
 #endif
                      "\n"
                      "       MODEL.safetensors --tokenize FILE [--tokenizer FILE]\n"
@@ -339,16 +342,23 @@ int main(int argc, char** argv) {
         auto weight_options = options.weights;
         // The server's rule (mini_speculation_policy): an explicit speculation declines the low-bit row, the row default
         // yields to a requested low-bit row.
+        // A decode-only weight arm (explicit qualification: one-row decode on its weights, verify windows on BF16) is a
+        // low-bit target too: the server declines its windows (same_target), so the command line declines speculation.
+        const bool decode_only_arm = weight_options.qualify != nullptr && weight_options.qualify_decode_only;
         const auto speculation_policy = mini_speculation_policy(
             options.generation.speculation != serve::CliSpeculation::off,
-            options.generation.speculation_requested || options.dspark != nullptr, weight_options.lowbit_turbo);
+            options.generation.speculation_requested || options.dspark != nullptr,
+            weight_options.lowbit_turbo || decode_only_arm);
         if (weight_options.lowbit_turbo && !speculation_policy.lowbit) {
             weight_options.lowbit_turbo = false;
             std::cerr << "strix-lowbit-pack/v2 declined (" << kMiniLowbitSpeculationDecline
                       << "); using incumbent weights\n";
         }
-        if (speculation_policy.requested && !speculation_policy.admitted)
+        if (speculation_policy.requested && (!speculation_policy.admitted || decode_only_arm)) {
+            if (decode_only_arm && speculation_policy.admitted)
+                std::cerr << "speculation declined (" << kMiniSpeculationLowbitDecline << ": decode-only weight arm)\n";
             options.generation.speculation = serve::CliSpeculation::off;
+        }
         const auto resolve_weights = [&options, &weight_options, model = std::string(argv[1])](strix::weight::WeightLoadExtent extent) {
             auto scope = mini_weight_scope(model, options.tier.profile, weight_options, extent);
             const auto plan = resolve_mini_resident_weight_load(options.tier.profile, weight_options, scope.view(), extent);

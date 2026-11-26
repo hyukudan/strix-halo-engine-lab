@@ -84,10 +84,6 @@ if(STRIX_K10C_CUDA_FIXTURE)
     strix_k10c_incumbent(${glm} "__device__ float bf16_to_float(" "\n" glm_math)
     strix_k10c_incumbent(${glm} "__global__ void embed(" "__global__ void add(" glm_kernel)
 
-    set(mm cuda/models/minimax/mm_rtx_kernels.cu)
-    strix_k10c_incumbent(${mm} "__device__ __forceinline__ float u2f(" "__device__ __forceinline__ std::uint16_t float_to_bf16(" mm_math)
-    strix_k10c_incumbent(${mm} "__global__ void embed_kernel(" "// Gemma norm" mm_kernel)
-
     set(nvfp4 cuda/core/dense/nvfp4.cu)
     strix_k10c_incumbent(${nvfp4} "__device__ __forceinline__ void e2m1_word(" "__device__ __forceinline__ std::uint32_t f32_to_e4m3(" fp4_convert)
     strix_k10c_incumbent(${nvfp4} "__device__ __forceinline__ std::uint32_t hmul2(" "__device__ __forceinline__ void mma16816(" fp4_mul)
@@ -123,10 +119,6 @@ using U16 = std::uint16_t;
 using U32 = std::uint32_t;
 ${glm_math}
 ${glm_kernel}
-}
-namespace incumbent::minimax {
-using strix::minimax::rtxpf::cuda::kHidden;
-${mm_math}${mm_kernel}
 }
 ")
 

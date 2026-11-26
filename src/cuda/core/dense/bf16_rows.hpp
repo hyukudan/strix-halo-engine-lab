@@ -158,6 +158,61 @@ inline cudaError_t enqueue_bf16_dense_rows(const float* input, unsigned input_wi
     return status;
 }
 
+// Rows padded to the tall tile (the plane a one-term split stores is [rows_pad][input_width]).
+[[nodiscard]] constexpr unsigned bf16_plane_rows_pad(unsigned rows) { return (rows + 127U) / 128U * 128U; }
+
+// True when every projection of a BF16-exact operand takes the tall one-plane path (big; the compact tile is
+// three-term only), the path enqueue_bf16_dense_rows_plane runs. A caller that produces the operand plane itself
+// (no split) admits first.
+[[nodiscard]] inline bool bf16_plane_rows_admitted(unsigned input_width, unsigned rows,
+                                                   std::span<const core::Bf16RowProjection> projections,
+                                                   const BigCtx* context) {
+    if (!context || rows == 0 || rows > std::numeric_limits<unsigned>::max() - 127U ||
+        input_width == 0U || input_width % 32U != 0 || projections.empty() ||
+        projections.size() > kMaxBf16RowProjections) return false;
+    constexpr auto max_plane_elements = std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t);
+    if (input_width > max_plane_elements / bf16_plane_rows_pad(rows)) return false;
+    const bool round_bf16 = projections.front().round_bf16;
+    for (const auto& projection : projections) {
+        if (!projection.weights || !projection.output || projection.round_bf16 != round_bf16 ||
+            (round_bf16 && projection.round_separate) || !projection.contiguous(input_width)) return false;
+        if (plan_bf16_row_projection(input_width, projection.outputs, rows, kMaxRows, true, 1) != Bf16RowPath::big)
+            return false;
+    }
+    return true;
+}
+
+// enqueue_bf16_dense_rows with Bf16Operand::bf16_exact, reading the caller's operand plane instead of splitting an
+// FP32 input: plane = [bf16_plane_rows_pad(rows)][input_width] u16, row r = the BF16 encodings of the BF16-exact
+// finite values of input row r (the bits the one-term split stores), 16-byte aligned. Rows rows..rows_pad-1 must be
+// writable: they are zero-filled here, as the split stores them. Same kernels, same epilogues, same bits; a shape the
+// planner sends elsewhere is refused (cudaErrorInvalidValue) before any launch.
+inline cudaError_t enqueue_bf16_dense_rows_plane(std::uint16_t* plane, unsigned input_width, unsigned rows,
+                                                 std::span<const core::Bf16RowProjection> projections,
+                                                 cudaStream_t stream, BigCtx* context) {
+    if (!plane || reinterpret_cast<std::uintptr_t>(plane) % 16U != 0U ||
+        !bf16_plane_rows_admitted(input_width, rows, projections, context)) return cudaErrorInvalidValue;
+    const unsigned rows_pad = bf16_plane_rows_pad(rows);
+    if (rows_pad > rows) {
+        const auto status = cudaMemsetAsync(plane + std::size_t{rows} * input_width, 0,
+                                            std::size_t{rows_pad - rows} * input_width * sizeof(std::uint16_t), stream);
+        if (status != cudaSuccess) return status;
+    }
+    BigAct activation{};
+    activation.planes = plane;
+    activation.rows = rows;
+    activation.rows_pad = rows_pad;
+    activation.in = input_width;
+    activation.terms = 1;
+    const auto epilogue = projections.front().round_bf16 ? BigEpi::round_bf16 : BigEpi::none;
+    for (const auto& projection : projections) {
+        const DenseWeight weight{projection.weights, WeightFormat::bf16, projection.outputs, input_width};
+        const auto status = dense_big_gemm(weight, activation, projection.output, nullptr, epilogue, stream, context);
+        if (status != cudaSuccess) return status;
+    }
+    return cudaSuccess;
+}
+
 // Device token IDs must already be validated. The gather widens BF16 and
 // the in-place RMSNorm applies BF16 gain before its single BF16 output round.
 inline cudaError_t enqueue_bf16_embeddings_rmsnorm(const std::uint16_t* table, unsigned vocabulary,

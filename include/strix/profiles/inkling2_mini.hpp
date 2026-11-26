@@ -50,7 +50,7 @@ inline constexpr weight::WeightLoadPolicy kMiniFastWeightPolicy = weight::kHeadQ
 // (mini_lowbit_row_decline). It is not a TURBO default: since the HIP greedy pick screens the BF16 head, the row decodes
 // slower than FAST at B=1 (served, 16 slots, context 16384, ABBA: 20.08 / 20.10 against 23.10 / 23.70 tok/s) and within
 // FAST's own spread at C8 / C16 (48.80 / 48.80 against 47.60 / 49.02; 58.79 / 59.02 against 55.74 / 58.19), so the
-// ladder rule leaves TURBO on the tier below. The row's stated gain (kMiniLowBitDecisionRows) predates the screened head.
+// ladder rule leaves TURBO on the tier below. The row states that current receipt, so it admits nothing until a new one.
 inline constexpr std::string_view kMiniLowBitTurbo = "inkling2-mini-lowbit-turbo@1";
 inline constexpr std::string_view kMiniLowBitPackFile = "inkling2-mini-q4.lowbit-pack";
 // Head in Strix pack SP4 (fixed table) from an explicit calibrated pack (STRIX_LOWBIT_PACK, strix-lowbit-calib-pack
@@ -95,7 +95,11 @@ inline constexpr std::array<weight::WeightLoadDecision, 1> kMiniWeightLoadDecisi
      weight::digest_from_hex("54182047338baf7005882cf2062d334aea4b8bb662d6cb484f1ccfce6926508b"),
      {.receipt = "docs/engine/lowbit-calibration.md", .date = "2026-11-24", .rows = 2457,
       .max_context = kMiniLowBitMeasuredExtent.context, .max_lanes = kMiniLowBitMeasuredExtent.lanes,
-      .speedup = 27.03 / 23.36,  // smallest measured gain against BF16 across widths 1, 8 and 16
+      // Current receipt (screened BF16 head on HIP, served, 16 slots, context 16384, ABBA): the lowest ratio of the
+      // measured widths, B=1 20.08 against 23.70 tok/s (C8 48.80 against 49.02, C16 58.79 against 58.19: within
+      // FAST's spread). Not a gain, so the explicit lever declines until a new receipt; the earlier 27.03 / 23.36
+      // was measured against the unscreened BF16 head and is history only.
+      .speedup = 20.08 / 23.70,
       .tier = profile::Name::turbo, .max_rows = kMiniLowBitStepBand},
      "vs BF16 decode (bf16 prefill, q4 decode) kl=0.0033 top1=0.980 dnll=+0.0027 flips=0.00x windows_failed=0/39 "
      "pack=b0bd0103dcdd9ffd"},
@@ -280,8 +284,10 @@ inline constexpr std::array<profile::Lever, 19> kMiniLevers{{
     {.name = kMiniLowBitHead, .env = "STRIX_INK_LOWBIT_HEAD", .option = "",
      .value = {"", "", "", ""}, .builtin = "0", .kind = profile::Kind::bit_changing,
      .ready = {}, .runnable = {false, true, false, true}, .target = "sp4t", .off = "0",
-     .source = "pending: SP4 fixed-table head (emulated gate v2 0/39 FAST); awaits the device gate v2 receipt and a "
-               "decision row; HIP command line only",
+     .source = "explicit option: SP4 fixed-table head, device gate v2 decode 2026-11-26 FAST fails 1/39 windows "
+               "(+1 unresolved), TURBO limits 39/39 pass, CLI B=1 -3.1 % per step vs the BF16 head "
+               "(docs/engine/lowbit-calibration.md); a TURBO row awaits the served arm and a combined receipt; HIP "
+               "command line only",
      .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"sp4t", "sp4t-head-v1"}}}},
 }};
 

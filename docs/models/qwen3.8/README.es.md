@@ -326,12 +326,16 @@ los pares más rápidos. A 262K (YaRN factor 2, ruta en serie, `--profile defaul
 intercalados) el prefill pasó de **191.2 a 185.7 s (−2.9 %, 1,371 → 1,412 tok/s)**, cada ejecución fast más rápida
 que cada ejecución default; el decode no cambia. Véase el [catálogo](../../optimizations.md#qwen-moe-route-bf16).
 
-**Poda de rutas MoE: conmutador opcional, desactivado por defecto, fuera de todos los perfiles.**
+**Poda de rutas MoE: conmutador opcional; fila de banda TURBO en la CLI de prefill.**
 `STRIX_QPF2K_MOE_ROUTE_PRUNE=cap9` (o `--prefill-moe-route-prune cap9`) descarta el experto de menor peso de cada fila
 del prefill antes de construir el plan de rutas: alrededor de un 2 % menos de tiempo de prefill a 8,192 y 32,768
 tokens, dentro de la puerta FAST compuesta en ambas longitudes. `cap8` da un 4-5 % y sale de la puerta a 32,768 tokens.
 Cambia los logits y añade `+rp<spec>` a la identidad del prefill; para volver atrás, quite la variable y reinicie.
-Cifras y gramática: [moe-route-prune](../../engine/kernels/moe-route-prune.md).
+EXACT y FAST nunca lo aplican. `--profile turbo` aplica cap9 por ejecución en gfx1151 para prompts de 4,096-8,192 y
+8,193-32,768 tokens (recibos de banda: 8K 4,020.9 → 3,919.3 ms, 32K 16,140.4 → 15,846.1 ms frente a FAST; calidad
+medida solo a 8K: KL 0.00528, top-1 0.9707). Solo en la CLI: el servidor HTTP resuelve el régimen de arranque, no el
+prompt de cada petición, así que TURBO servido conserva las filas FAST. Cifras y gramática:
+[moe-route-prune](../../engine/kernels/moe-route-prune.md).
 
 **GDN por bloques en WMMA FP16 en el prefill: candidato opcional (opt-in), pendiente de cualificación.**
 `STRIX_QPF2K_GDN_FP16_CHUNK=1` (o `--gdn-fp16-chunk 1`) ejecuta la convolución, la recurrencia y la norma con puerta de

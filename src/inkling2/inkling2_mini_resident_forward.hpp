@@ -324,9 +324,10 @@ private:
                       MiniMutableRows output) {
             const auto path = static_cast<unsigned>(stream);
             if constexpr (Batched) {
-                // Cohort lane mode: one launch over every lane, histories resolved on the device.
+                // Cohort lane mode: one launch over every lane, histories resolved on the device. A taped (staged)
+                // group records its rows below, one group at a time.
                 if constexpr (requires { backend_.convolve_lanes(visit, stream, input, visit_groups_.front().state.history[path], output); }) {
-                    if (backend_.cohort_lanes_active()) {
+                    if (backend_.cohort_lanes_active() && visit_groups_.front().state.tape[path].empty()) {
                         backend_.convolve_lanes(visit, stream, input, visit_groups_.front().state.history[path], output);
                         return;
                     }
@@ -334,14 +335,29 @@ private:
                 std::size_t base = 0;
                 for (const auto& group : visit_groups_) {
                     const auto elements = std::size_t{group.chunk.rows} * kHiddenWidth;
+                    record_tape(input.subspan(base, elements), group.state.tape[path]);
                     backend_.convolve(visit, stream, input.subspan(base, elements), group.state.history[path],
                                       output.subspan(base, elements));
                     base += elements;
                 }
             } else {
+                record_tape(input, visit_state_.tape[path]);
                 backend_.convolve(visit, stream, input, visit_state_.history[path], output);
                 // A taped (staged verify) chunk keeps every input row of the stream for its partial commit.
                 if (const auto tape = visit_state_.tape[path]; !tape.empty()) backend_.copy(input, tape);
+            }
+        }
+
+        // Convolution tape of a staged append (bound only for verify windows): row r of the stream input goes to
+        // tape[r * width, (r + 1) * width). A partial commit then rebuilds the history from these copies.
+        void record_tape(MiniConstRows input, MiniMutableRows tape) {
+            if (tape.empty()) return;
+            if (tape.size() != input.size())
+                throw std::invalid_argument("Inkling 2 Mini: convolution tape does not cover the staged rows");
+            if constexpr (requires { backend_.copy(input, tape); }) {
+                backend_.copy(input, tape);
+            } else {
+                throw std::logic_error("Inkling 2 Mini: this backend cannot record a convolution tape");
             }
         }
 

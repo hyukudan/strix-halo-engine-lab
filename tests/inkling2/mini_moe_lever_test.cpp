@@ -94,7 +94,7 @@ void test_row() {
             "existing block row retains its slot and StrixPack and both low-bit candidates are bound");
     require(mini::kMiniLevers[18].name == mini::kMiniLowBitHead, "the SP4 fixed-table head row closes the table");
     // The speculation row: exact, builtin auto (the default of every tier, legacy identity), off explicit.
-    const auto* speculation = std::ranges::find_if(mini::kMiniLevers, [](const profile::Lever& lever) {
+    const auto speculation = std::ranges::find_if(mini::kMiniLevers, [](const profile::Lever& lever) {
         return lever.name == mini::kMiniSpeculation;
     });
     require(speculation != mini::kMiniLevers.end() && speculation->kind == profile::Kind::exact &&
@@ -453,12 +453,12 @@ void test_projected_bias() {
 // receipt; an explicit STRIX_MOE_EXPERTS_NVFP4=1 opts in (unqualified), 0 is the off switch, other values are refused.
 // The verify rows row: an exact lever, opt-in (off in every tier, builtin the per-row incumbent), bound to the engine,
 // switchable by STRIX_INK_VERIFY_ROWS, refused on a malformed value, and reaching the decoder through the one helper.
-// It is appended after main's rows; the block-candidate row retains its original slot.
+// The block-candidate row follows the image recipe.
 void test_verify_rows() {
     const auto& row = *std::find_if(mini::kMiniLevers.begin(), mini::kMiniLevers.end(),
                                     [](const auto& lever) { return lever.name == mini::kMiniVerifyRows; });
     require(row.name == mini::kMiniVerifyRows && row.name == "inkling2-mini-verify-rows@1", "verify rows row identity");
-    require(mini::kMiniLevers[11].name == strix::spec::kBlockDraftLever.name, "the block-candidate row retains its original slot");
+    require(mini::kMiniLevers[12].name == strix::spec::kBlockDraftLever.name, "the block-candidate row follows the image recipe");
     require(row.env == "STRIX_INK_VERIFY_ROWS" && row.off == "0" && row.builtin == "0" &&
                 row.kind == profile::Kind::exact, "verify rows row is an exact lever, off by default");
     for (std::size_t column = 0; column < profile::kProfileColumns; ++column)
@@ -644,8 +644,8 @@ void test_screened_head_row() {
         }
     require(lever != nullptr && lever->name == "inkling2-mini-screened-head@1" && index == 7U &&
                 mini::kMiniProfile.table[6].name == mini::kMiniServedCliRoute &&
-                mini::kMiniProfile.table[11].name == strix::spec::kBlockDraftLever.name,
-            "screened head row identity and position (appended; the block-candidate row retains its original slot)");
+                mini::kMiniProfile.table[12].name == strix::spec::kBlockDraftLever.name,
+            "screened head row identity and position (the block-candidate row follows the image recipe)");
     require(lever->env == "STRIX_INK_SCREENED_HEAD" && lever->off == "0" && lever->builtin == "0" &&
                 lever->kind == profile::Kind::exact && lever->omit_builtin_fingerprint && lever->option.empty(),
             "screened head row is an exact lever, off by default");

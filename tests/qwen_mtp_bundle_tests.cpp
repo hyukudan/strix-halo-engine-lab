@@ -21,6 +21,19 @@ template<class F> void refuses(F f) {
     bool threw=false;try{f();}catch(const std::exception&){threw=true;}
     require(threw,"expected refusal");
 }
+// A header-only GGUF v3 (no tensors) declaring the drafter-target identity keys discovery reads.
+std::string target_gguf(std::uint32_t layers) {
+    std::string out("GGUF");
+    const auto u32=[&](std::uint32_t v) { for(int i=0;i<4;++i)out.push_back(static_cast<char>((v>>(8*i))&255U)); };
+    const auto u64=[&](std::uint64_t v) { for(int i=0;i<8;++i)out.push_back(static_cast<char>((v>>(8*i))&255U)); };
+    const auto str=[&](const std::string& v) { u64(v.size());out+=v; };
+    u32(3);u64(0);u64(3);
+    str("general.architecture");u32(8);str("qwen4exp");
+    str("qwen4exp.block_count");u32(4);u32(layers);
+    str("qwen4exp.embedding_length");u32(4);u32(2560);
+    out.resize((out.size()+31U)/32U*32U,char{0});
+    return out;
+}
 void write(const std::filesystem::path& p,const std::string& text) {
     std::ofstream f(p,std::ios::binary);f<<text;
     if(!f)throw std::runtime_error("fixture write failed");
@@ -106,6 +119,29 @@ int main(int argc,char** argv) try {
     SAME(window_arena_bytes);SAME(window_capture_bytes);SAME(window_checkpoint_bytes);SAME(window_total_bytes);
     SAME(window_history_intervals);
 #undef SAME
+    // Exercise the guide's pins and calibration geometry without the HIP-only organization flags.
+    std::vector<std::string> guide_args{"decode", (dir/"target.gguf").string()};
+    for (int token = 1; token <= 32; ++token) guide_args.push_back(std::to_string(token));
+    const auto pins_begin = std::find(explicit_bundle_args.begin(), explicit_bundle_args.end(), "--mtp");
+    const auto pins_end = std::find(pins_begin, explicit_bundle_args.end(), "--mtp-golden");
+    guide_args.insert(guide_args.end(), pins_begin, pins_end);
+    guide_args.insert(guide_args.end(), {"--generate", "64", "--context", "33280", "--mtp-calibration-rows", "8"});
+    auto guide_dump_args = guide_args;
+    guide_dump_args.insert(guide_dump_args.end(), {"--known-prefix-window", "--known-prefix-full-rows",
+        "--known-prefix-prefill-rows", "8192", "--known-prefix-workspace-budget-bytes", "8589934592",
+        "--known-prefix-host-metadata-budget-bytes", "2147483648", "--known-prefix-uma-budget-bytes", "128849018880",
+        "--known-prefix-host-headroom-bytes", "4294967296", "--mtp-golden-dump", "qwen-t8192.golden"});
+    const auto guide_dump = parse(guide_dump_args);
+    require(mtp_tiled_prompt(guide_dump) && guide_dump.known_prefix_prefill_rows == 8192 &&
+        guide_dump.mtp.golden_dump == "qwen-t8192.golden" && !guide_dump.http_serve, "guide uses tiled golden dump");
+    guide_args.insert(guide_args.end(), {"--http-serve", "--http-batch", "0", "--http-bind", "127.0.0.1",
+        "--http-port", "8082", "--mtp-golden", "qwen-t8192.golden", "--mtp-golden-sha256", sha});
+    const auto guide_served = parse(guide_args);
+    require(http_prefill_pending(guide_served) && guide_served.http_batch_explicit && !guide_served.http_batch &&
+        guide_served.mtp.golden == guide_dump.mtp.golden_dump && mtp_calibration_rows(guide_served) == mtp_calibration_rows(guide_dump) &&
+        mtp_calibration_rows(guide_served) == 8 && guide_served.mtp.sidecar_logical_name == guide_dump.mtp.sidecar_logical_name,
+        "guide uses automatic single HTTP owner with matching MTP pins and calibration geometry");
+
     const auto stats=file_hash_cache_stats();verify_mtp_bundle_sidecar(sidecar.string(),sha,3);
     verify_mtp_bundle_sidecar(sidecar.string(),"BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD",3);
 #if defined(__linux__)
@@ -169,7 +205,7 @@ int main(int argc,char** argv) try {
     {
         // Discovery of a registry drafter beside the model (no bundle json): the shipped MTP/ layout, by size.
         const auto model_dir=dir/"profile-model";std::filesystem::create_directories(model_dir/"MTP");
-        const auto pmodel=model_dir/"target.gguf";write(pmodel,"target bytes");
+        const auto pmodel=model_dir/"target.gguf";write(pmodel,target_gguf(48));
         const auto base_file=model_dir/"MTP"/"mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
         std::vector<std::string> plain{"decode",pmodel.string()};
         for(int token=1;token<=17;++token)plain.push_back(std::to_string(token));
@@ -190,6 +226,11 @@ int main(int argc,char** argv) try {
         write(base_file,"short");
         require(!capture(plain,text).mtp.enabled && text.find("expects 2786568256")!=std::string::npos,"wrong size is not taken and is named");
         std::filesystem::resize_file(base_file,2786568256ULL);
+        // Placement alone binds nothing: a model of another identity keeps plain decode and names the draft it left out.
+        write(pmodel,target_gguf(64));
+        require(!capture(plain,text).mtp.enabled && text.find("draft base targets qwen4exp 48 x 2560")!=std::string::npos,
+            "a draft for another target is not taken and is named");
+        write(pmodel,target_gguf(48));
         const auto picked=capture(plain,text);
         require(picked.mtp.enabled && picked.mtp_native_bundle && picked.mtp.calibration_rows==16U &&
             picked.mtp.sidecar==base_file.string() && picked.mtp.sidecar_logical_name==base_file.filename().string(),"base sidecar under MTP/");
@@ -420,7 +461,7 @@ int main(int argc,char** argv) try {
     env("XDG_CACHE_HOME",(dir/"xdg").string());require(mtp_golden_cache_dir()==dir/"xdg/strix-engine/goldens","XDG path");
     env("XDG_CACHE_HOME","");env("HOME",dir.string());require(mtp_golden_cache_dir()==dir/".cache/strix-engine/goldens","HOME path");
     write(bundle,"{\"version\":1,\"version\":1,\"options\":{}}");refuses([&]{read_mtp_bundle(bundle);});
-    opts.set("--mtp-sidecar","/absolute/sidecar.gguf");json.set("options",opts);write(bundle,json.dump());
+    opts.set("--mtp-sidecar",std::filesystem::absolute(sidecar).string());json.set("options",opts);write(bundle,json.dump());
     refuses([&]{read_mtp_bundle(bundle);});
     write(bundle,"{\"version\":1,\"options\":{}}");refuses([&]{read_mtp_bundle(bundle);});
     std::cout<<"MTP bundle CPU contracts passed\n";

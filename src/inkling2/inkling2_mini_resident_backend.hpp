@@ -653,6 +653,9 @@ public:
     }
 
 private:
+    // Key / value convolution tape of a staged append (bound only for verify windows), or none.
+    static float* tape_rows(std::span<float> tape) { return tape.empty() ? nullptr : tape.data(); }
+
     void attention_grouped(LayerVisit visit, const MiniResidentAttentionGroup* single,
                            std::span<const MiniResidentAttentionGroup> groups,
                            MiniConstRows query, MiniConstRows key, MiniConstRows value, MiniMutableRows output) {
@@ -675,6 +678,8 @@ private:
             take(kQueryHeads * kRelativeWidth),
             single ? single->state.history[0].data() : nullptr,
             single ? single->state.history[1].data() : nullptr,
+            single ? tape_rows(single->state.tape[0]) : nullptr,
+            single ? tape_rows(single->state.tape[1]) : nullptr,
         };
         const MiniPreparedAttention prep{
             take(kQueryWidth), take(kKvWidth), take(kKvWidth), take(kQueryHeads * kRelativeExtent),
@@ -860,7 +865,8 @@ private:
         if (!single) {
             for (const auto& group : groups)
                 prep_groups_.push_back({group.chunk.first_position, group.chunk.rows,
-                                        group.state.history[0].data(), group.state.history[1].data()});
+                                        group.state.history[0].data(), group.state.history[1].data(),
+                                        tape_rows(group.state.tape[0]), tape_rows(group.state.tape[1])});
         }
 #if defined(__HIPCC__)
         const auto* cohort = cohort_lanes_ ? &*cohort_lanes_ : nullptr;

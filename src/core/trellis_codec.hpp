@@ -27,6 +27,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include "strix/hip/legacy_intrinsics.hpp"
 #include "trellis_format.hpp"
 
 namespace strix::core::trellis {

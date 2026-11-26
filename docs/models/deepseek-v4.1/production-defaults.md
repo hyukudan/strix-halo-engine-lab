@@ -186,14 +186,19 @@ and every off switch.
 ## Product profiles
 
 Use the same `--profile exact|fast|turbo` on both ranks. `exact` (also `default`)
-keeps the production arithmetic above. FAST can select the complete D1 prefill composition
-when the actual prompt and paired execution match its gate and timing receipt. The gate
-class through 8,192 tokens passed. The matched timing covers the 8,128-token quality
-runner with tensor-parallel attention, no row split or suffix cone, and a 64-row scoring
-head. Native CLI and HTTP prefill retain their previous arithmetic pending a matched
-quality receipt for their execution. TURBO inherits admitted FAST. Decoder replay and
-IU4 remain pending. Explicit arithmetic switches still opt into experiments. Startup
-inspection reports D1 pending because the prompt is unknown.
+keeps the production arithmetic above. FAST (the implicit model preset) selects the D1
+prefill composition and, on top of an admitted D1 request, the bounded decoder replay
+R=256, per request, for prompts of 4,096-8,192 and 8,193-32,768 tokens on the gfx1151
+pair with one lane. Gate v2 passed for the 8K and 32K classes (D1 and D1 + R256, final
+PASS); the timing receipts are pair prefill CLI runs at 8,128 / 8,192 and 32,768 tokens
+(details in [optimizations.md](../../optimizations.md#ds41-fast-d1-band)). The pair
+prefill CLI and the HTTP server enter the same admission: the server sends a fresh whole
+text prompt run as one piece to it whatever its slot count. Pieces cut for prefix-cache
+snapshots, continuations, image rows, group passes and a server with a disk tier
+(prefix cache or session directory) keep the previous route. TURBO inherits admitted
+FAST; IU4 has no TURBO cell (measured slower). Explicit arithmetic switches still opt
+into experiments. Startup inspection reports D1 and R=256 pending because the prompt is
+unknown.
 
 ## Transport and USB4 layout (P17.4)
 

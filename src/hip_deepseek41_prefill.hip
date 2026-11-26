@@ -1714,7 +1714,7 @@ PrefillResult DevicePrefill::run_full_prompt(std::span<const std::uint32_t> toke
     const auto& o = m.options;
     const char* baseline = strix::envcfg::text("STRIX_DS41_BASELINE");
     const bool baseline_on = baseline && *baseline && std::string_view(baseline) != "0";
-    const bool scope = o.quality_head_rows == 64U && o.communicator->transport_name().starts_with("usb4-host:") && m.moe_window_auto &&
+    const bool scope = o.communicator->transport_name().starts_with("usb4-host:") && m.moe_window_auto &&
         m.overlay == nullptr && m.file->size() == pinned_file(PinnedFileKind::target_q2).bytes &&
         m.dense_select && m.split_min_rows == PrefillOptions{}.split_min_rows && !m.moe_joint &&
         m.joint_max_rows == PrefillOptions{}.joint_max_rows && m.async_gather && m.pack &&
@@ -1722,10 +1722,11 @@ PrefillResult DevicePrefill::run_full_prompt(std::span<const std::uint32_t> toke
         m.task == nullptr && m.snap_next.empty() && m.embed_next.empty() &&
         !baseline_on;
     const auto resolution = pair_defaults::resolve_prefill_profile(
-        startup, o, tokens.size(), scope ? strix::device::hip_cost_device_identity() : std::string{}, scope);
-    // CLI and serve use a one-row head. It rules out D1 on both ranks before a request exchange.
-    if (o.quality_head_rows != 64U) return run(tokens);
+        startup, o, tokens.size(), static_cast<std::uint32_t>(std::max<std::size_t>(1U, m.group.size())),
+        scope ? strix::device::hip_cost_device_identity() : std::string{}, scope);
     const auto* d1 = resolution ? resolution->find("d1_prefill") : nullptr;
+    // R=256 runs only on top of an admitted D1 request (gate v2 D1R scored exactly that set).
+    const auto* replay = resolution ? resolution->find("decoder_replay") : nullptr;
     bool local = d1 && d1->value == "1";
 
     // Either rank may decline before any arithmetic changes. The startup profile handshake
@@ -1755,6 +1756,10 @@ PrefillResult DevicePrefill::run_full_prompt(std::span<const std::uint32_t> toke
         ~RestoreOptions() { active = std::move(previous); }
     } restore{m.options, m.options};
     apply_d1_prefill(m.options);
+    if (replay && replay->value == "256") {
+        std::fprintf(stderr, "%s\n", replay->ladder.c_str());
+        m.options.decoder_replay_rows = 256U;
+    }
     return run(tokens);
 }
 
@@ -1871,9 +1876,9 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     // cone a later piece takes over (a decoder-deferral request), that writes in-run snapshot states, or a group pass
     // needs every decoder row, so it takes the exact plan (bound 0, reported in decoder_replay_rows) instead of
     // refusing; the caller's piece plan decides, the same on both ranks (agreed below).
-    const std::uint32_t next_rows = std::exchange(m.defer_next, 0U);
+    const std::uint32_t deferral_rows = std::exchange(m.defer_next, 0U);
     const std::uint32_t requested = P0 != 0U ? 0U : (m.options.decoder_replay_override || m.options.decoder_replay_rows != 0U) ? m.options.decoder_replay_rows : prefill_decoder_replay_rows();
-    const std::uint32_t bounded = next_rows != 0U || !m.snap_points.empty() || grp != nullptr ? 0U : requested;
+    const std::uint32_t bounded = deferral_rows != 0U || !m.snap_points.empty() || grp != nullptr ? 0U : requested;
     const bool bounded_oracle = bounded != 0U && prefill_decoder_replay_oracle();
     result.decoder_replay_rows = bounded;
     result.decoder_replay_oracle = bounded_oracle;
@@ -1881,17 +1886,17 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     {
         static strix::lever_cache<bool> defer_on_cache{[] { const char* v = std::getenv("STRIX_DS41_DEFER_DECODER"); return !(v && std::strcmp(v, "0") == 0); }};
         const bool defer_on = defer_on_cache.get();
-        if (next_rows != 0U && defer_on && m.options.cone && m.options.layers == c.num_hidden_layers && m.options.layers > first_decoder &&
+        if (deferral_rows != 0U && defer_on && m.options.cone && m.options.layers == c.num_hidden_layers && m.options.layers > first_decoder &&
             m.snap_points.empty() && (P0 + T) % W == 0U && grp == nullptr) {
             ds41::SuffixReplayGeometry g;
             g.layers = c.num_hidden_layers;
             g.draft_rows = m.options.draft_rows;
             defer = true;
-            for (const auto& pl : ds41::plan_suffix_replay(g, 0U, next_rows).layers)
+            for (const auto& pl : ds41::plan_suffix_replay(g, 0U, deferral_rows).layers)
                 if (pl.layer >= first_decoder && pl.out_begin / W * W < attn::kWindow) defer = false;
         }
         if (grp == nullptr && m.distributed() && (m.options.cone || bounded != 0U) && m.options.layers == c.num_hidden_layers) {  // both ranks: the same decision
-            const std::array<std::uint32_t, 3> mine{defer ? 1U : 0U, defer ? next_rows : 0U, bounded | (bounded_oracle ? 0x80000000U : 0U)};
+            const std::array<std::uint32_t, 3> mine{defer ? 1U : 0U, defer ? deferral_rows : 0U, bounded | (bounded_oracle ? 0x80000000U : 0U)};
             std::array<std::uint32_t, 3> other{};
             m.options.communicator->exchange_host(std::as_bytes(std::span(mine)), std::as_writable_bytes(std::span(other)),
                                                   dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 0x64656631U, P0});

@@ -131,27 +131,40 @@ void glm() {
         }
         gate("glm", values(sp::from_lines(rd::print(cli))), values(sp::from_lines(rd::print(server))), allowed);
     }
-    // The measured 8K/32K pair executions and each unmatched axis use the same product resolver.
-    const std::vector<std::string> turbo{"--world", "2", "--profile", "turbo"};
-    const auto measured_cli_args = rd::serve_request_args(turbo, true);
+    // The measured pair executions and each unmatched axis use the same product resolver: the TURBO literal rows
+    // (8,108 / 31,258 tokens, capacity 36,864, 64 generated) and the FAST band row (2,049..8,192 tokens, any capacity,
+    // bound to the run's own execution). TURBO nests FAST inside the band. EXACT never selects the bundle.
     rd::ModelFacts complete;
     complete.mtp_present = complete.mtp_complete = true;
-    const auto verify = [&](const rd::PrefillWork& work, const rd::EnvGet& env, bool on) {
-        const auto cli = rd::resolve(rd::scan(measured_cli_args), env, complete, work);
-        const auto serve = rd::resolve_serve(turbo, true, env, complete, work);
+    const auto verify_profile = [&](const char* profile, const rd::PrefillWork& work, const rd::EnvGet& env, bool on) {
+        const std::vector<std::string> args{"--world", "2", "--profile", profile};
+        const auto cli = rd::resolve(rd::scan(rd::serve_request_args(args, true)), env, complete, work);
+        const auto serve = rd::resolve_serve(args, true, env, complete, work);
         for (const auto* lever : {"pf_wmma", "mla_wmma", "kda_wmma", "attn_wmma"}) {
             const auto* a = cli.product->find(lever);
             const auto* b = serve.product->find(lever);
             check(a && b && a->value == (on ? "1" : "0") && b->value == a->value,
-                  "GLM measured/fallback arithmetic agrees for " + std::string(lever));
+                  std::string("GLM measured/fallback arithmetic agrees (") + profile + " prompt " +
+                      std::to_string(work.prompt) + ") for " + lever);
         }
-        gate("glm", values(sp::from_lines(rd::print(cli))), values(sp::from_lines(rd::print(serve))), allowed);
+        const auto printed = rd::print(cli);
+        const bool fast_row = printed.find(" fast=1 applies x1.500 noise 0.100 (GLM pair 8K FAST bundle") != std::string::npos;
+        check(fast_row == (on && work.prompt >= 2049 && work.prompt <= 8192),  // TURBO nests the FAST cell in the band
+              std::string("GLM FAST band row named in the route line (") + profile + " prompt " + std::to_string(work.prompt) + ")");
+        gate("glm", values(sp::from_lines(printed)), values(sp::from_lines(rd::print(serve))), allowed);
+    };
+    const auto verify = [&](const rd::PrefillWork& work, const rd::EnvGet& env, bool on) {
+        verify_profile("turbo", work, env, on);
     };
     verify({true, 8108, 36864, 8192, 1, 64}, none, true);
     verify({true, 31258, 36864, 8192, 1, 64}, none, true);
     verify({false, 8108, 36864, 8192, 1, 64}, none, false);
-    verify({true, 4096, 36864, 8192, 1, 64}, none, false);
-    verify({true, 8109, 36864, 8192, 1, 64}, none, false);
+    verify({true, 4096, 36864, 8192, 1, 64}, none, true);    // FAST band
+    verify({true, 8109, 36864, 8192, 1, 64}, none, true);    // FAST band
+    verify({true, 2048, 36864, 8192, 1, 64}, none, false);
+    verify({true, 8193, 36864, 8192, 1, 64}, none, false);
+    verify({true, 31258, 32768, 8192, 1, 64}, none, false);  // literal TURBO key: capacity
+    verify({true, 31259, 36864, 8192, 1, 64}, none, false);
     verify({true, 8108, 36864, 4096, 1, 64}, none, false);
     verify({true, 8108, 36864, 8192, 2, 64}, none, false);
     verify({true, 8108, 36864, 8192, 1, 64}, [](const char* key) -> const char* {
@@ -160,6 +173,25 @@ void glm() {
     verify({true, 8108, 36864, 8192, 1, 64}, [](const char* key) -> const char* {
         return std::string_view(key) == "STRIX_GLM_PF_ATTN_WMMA_T" ? "32" : nullptr;
     }, false);
+    // FAST: the band row alone decides the prompt (capacity and generated are not keys of a band receipt).
+    for (const std::uint64_t prompt : {2049ULL, 4096ULL, 8108ULL, 8192ULL})
+        for (const std::uint64_t capacity : {16384ULL, 36864ULL})
+            verify_profile("fast", {true, prompt, capacity, 8192, 1, 512}, none, true);
+    for (const std::uint64_t prompt : {1ULL, 2048ULL, 8193ULL, 31258ULL})  // 32K stays TURBO
+        verify_profile("fast", {true, prompt, 36864, 8192, 1, 64}, none, false);
+    verify_profile("fast", {false, 8192, 36864, 8192, 1, 64}, none, false);  // pair not voted ready
+    verify_profile("fast", {true, 8192, 36864, 4096, 1, 64}, none, false);   // unmeasured chunk
+    verify_profile("fast", {true, 8192, 36864, 8192, 2, 64}, none, false);   // two lanes
+    verify_profile("fast", {true, 8192, 36864, 8192, 1, 64}, [](const char* key) -> const char* {
+        return std::string_view(key) == "STRIX_GLM_PF_WMMA" ? "0" : nullptr;
+    }, false);                                                                 // explicit off wins
+    for (const char* profile : {"exact", "quality"})
+        verify_profile(profile, {true, 8192, 36864, 8192, 1, 64}, none, false);
+    // Scratch storage (full arena vs routed) is spelled in the execution key: the band row binds either (the gate and
+    // the FAST timing ran on the full arena), the TURBO literal key names routed scratch only.
+    verify_profile("fast", {true, 8192, 8448, 8192, 1, 64, false}, none, true);
+    verify_profile("turbo", {true, 8192, 8448, 8192, 1, 64, false}, none, true);
+    verify_profile("turbo", {true, 31258, 36864, 8192, 1, 64, false}, none, false);
     // Sampled MTP (row serve_sampled_mtp): both entry points resolve and admit it in rd::resolve, so the same request
     // gives the same route, the same receipt line and the same refusals (the command line reports it inapplicable).
     for (const char* profile : {"exact", "fast", "turbo", "quality"})
@@ -314,21 +346,40 @@ void ds41() {
     measured.row_split = false;
     measured.cone = false;
     measured.quality_head_rows = 64;
+    std::uint32_t lanes = 1;
     const auto request = [&](pd::App app, const char* rank, std::uint64_t prompt) {
         const auto startup = pd::resolve(app, {model, "--rank", rank,
             "--transport", app == pd::App::prefill ? "usb4-auto" : "usb4auto", "--profile", "turbo"},
             [](const char*) -> const char* { return nullptr; }, probe, pd::Build{true});
-        const auto result = pd::resolve_prefill_profile(*startup.profile, measured, prompt,
+        const auto result = pd::resolve_prefill_profile(*startup.profile, measured, prompt, lanes,
                                                        "gfx1151|AMD Radeon 8060S Graphics|fixture", true).value_or(*startup.profile);
         return sp::Config{{"d1_prefill", result.find("d1_prefill")->value},
+                          {"decoder_replay", result.find("decoder_replay")->value},
                           {"fingerprint", pr::hex_identity(result.fingerprint())}};
     };
-    for (const auto prompt : {8128U, 8193U, 32768U}) {
+    measured.max_positions = 32768;
+    for (const auto prompt : {4095U, 8128U, 8193U, 32768U, 32769U}) {
         const auto cli = request(pd::App::prefill, "0", prompt);
         const auto server = request(pd::App::serve, "1", prompt);
         gate("ds41+prompt+" + std::to_string(prompt), cli, server, {});
-        check(cli.at("d1_prefill") == (prompt == 8128U ? "1" : "0"),
-              "ds41: both ranks use D1 only for a measured prompt");
+        const bool banded = prompt >= 4096U && prompt <= 32768U;
+        check(cli.at("d1_prefill") == (banded ? "1" : "0") && cli.at("decoder_replay") == (banded ? "256" : "0"),
+              "ds41: both ranks use D1 + R256 only inside the measured bands");
+    }
+    // The default server (eight slots, session RAM, no disk tier) sends a fresh whole text prompt to the same device
+    // admission as the CLI; the slot count is not a scope. Pieces, image rows and disk tiers keep the previous route.
+    check(pd::served_full_prompt(0U, 8128U, 8128U, false, false), "ds41: an eight-slot server enters the CLI admission");
+    check(!pd::served_full_prompt(0U, 4096U, 8128U, false, false), "ds41: a cut piece keeps the previous route");
+    check(!pd::served_full_prompt(256U, 8128U, 8128U, false, false), "ds41: a continuation keeps the previous route");
+    check(!pd::served_full_prompt(0U, 8128U, 8128U, true, false), "ds41: image rows keep the previous route");
+    check(!pd::served_full_prompt(0U, 8128U, 8128U, false, true), "ds41: a disk tier keeps the previous route");
+    // The live lane count reaches the band rows (max_lanes 1): a pass of two sequences declines on both entries.
+    lanes = 2;
+    for (const auto prompt : {8128U, 32768U}) {
+        const auto cli = request(pd::App::prefill, "0", prompt);
+        const auto server = request(pd::App::serve, "1", prompt);
+        gate("ds41+lanes2+" + std::to_string(prompt), cli, server, {});
+        check(cli.at("d1_prefill") == "0" && cli.at("decoder_replay") == "0", "ds41: two lanes leave the measured bands");
     }
 
 }

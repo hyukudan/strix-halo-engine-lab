@@ -413,8 +413,9 @@ def run_tier(args, model, tier, prompts, out, local, peer, id_hash):
             if cell.startswith('prefill-') and seed_error:
                 raise ValueError(seed_error)
             measure_cell(row, cell, prompts, seed, args.port, deadline, id_hash, counters)
-        except (ValueError, KeyError, TypeError, IndexError, OSError) as exc:
-            row['errors'] = [str(exc)]
+        except (ValueError, KeyError, TypeError, IndexError, OSError, threading.BrokenBarrierError) as exc:
+            # A broken cohort barrier (one slow submit) invalidates this cell only; the next cells and compare still run.
+            row['errors'] = [str(exc) or type(exc).__name__]
         rows.append(row)
         append_receipt(out, row)
     return rows

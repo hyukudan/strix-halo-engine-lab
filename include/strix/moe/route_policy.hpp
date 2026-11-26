@@ -284,8 +284,11 @@ inline void validate_route_row(const RoutePolicy& p, std::size_t scores, std::si
 
 // Shared single-row selection. Callers validate spans and supply experts bytes of scratch.
 // Inputs are already transformed scores. Bias changes selection only.
+// A split projection can supply a separate mixture score plane and expert gains.
 inline void route_select_row(const RoutePolicy& p, const float* scores, const float* bias,
-                             std::uint32_t* ids, float* weights, std::uint8_t* taken) {
+                             std::uint32_t* ids, float* weights, std::uint8_t* taken,
+                             const float* mixture = nullptr, const float* expert_gain = nullptr) {
+    if (!mixture) mixture = scores;
     const bool gfx1151 = p.math == RouteMath::gfx1151_v1;
     constexpr float empty = -std::numeric_limits<float>::infinity();
     for (std::uint32_t e = 0; e < p.experts; ++e) taken[e] = 0U;
@@ -317,11 +320,13 @@ inline void route_select_row(const RoutePolicy& p, const float* scores, const fl
     }
     const bool renorm = p.renormalize && (p.top_k > 1U || p.renorm_single);
     float sum = 0.0F;
-    for (std::uint32_t k = 0; k < p.top_k; ++k) sum = sum + (ids[k] == p.experts ? empty : scores[ids[k]]);
+    for (std::uint32_t k = 0; k < p.top_k; ++k) sum = sum + (ids[k] == p.experts ? empty : mixture[ids[k]]);
     const float denominator = sum + p.renorm_eps;
     for (std::uint32_t k = 0; k < p.top_k; ++k) {
-        const float s = ids[k] == p.experts ? empty : scores[ids[k]];
+        const auto expert = ids[k];
+        const float s = expert == p.experts ? empty : mixture[expert];
         weights[k] = (renorm ? s / denominator : s) * p.scale;
+        if (expert_gain && expert != p.experts) weights[k] *= expert_gain[expert];
     }
 }
 
@@ -330,6 +335,21 @@ inline void route_select_ref(const RoutePolicy& p, std::span<const float> scores
     validate_route_row(p, scores.size(), bias.size(), ids.size(), weights.size());
     std::vector<std::uint8_t> taken(p.experts);
     route_select_row(p, scores.data(), bias.data(), ids.data(), weights.data(), taken.data());
+}
+
+// Separate selection and mixture scores. The optional expert gain is applied
+// after normalization. Callers bind the two projections and score transforms.
+inline void route_select_split_ref(const RoutePolicy& p, std::span<const float> select_scores,
+                                   std::span<const float> mix_scores, std::span<const float> bias,
+                                   std::span<const float> expert_gain, std::span<std::uint32_t> ids,
+                                   std::span<float> weights) {
+    validate_route_row(p, select_scores.size(), bias.size(), ids.size(), weights.size());
+    if (mix_scores.size() != p.experts || (!expert_gain.empty() && expert_gain.size() != p.experts) ||
+        p.math != RouteMath::native)
+        throw std::invalid_argument("route policy: invalid split score planes");
+    std::vector<std::uint8_t> taken(p.experts);
+    route_select_row(p, select_scores.data(), bias.data(), ids.data(), weights.data(), taken.data(),
+                     mix_scores.data(), expert_gain.empty() ? nullptr : expert_gain.data());
 }
 
 // Host transform of one row: softmax (m = max over e ascending, p_e = exp(z_e - m), sum ascending from 0, s_e = p_e / sum),

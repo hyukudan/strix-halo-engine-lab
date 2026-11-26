@@ -67,51 +67,31 @@ void validate_token_ids(const Token* ids, std::size_t count, std::uint32_t vocab
 }
 } // namespace strix::core
 
-#if defined(__HIPCC__)
-#define STRIX_DENSE_LINEAR_HD __host__ __device__
-#else
-#define STRIX_DENSE_LINEAR_HD
-#endif
+#include "strix/decode_projection_group.hpp"
 
 namespace strix::core::dense_linear {
-// One launch for up to kTightGroupMax projections of one input (decode rows). Block b of the launch belongs to the
-// projection p with first[p] <= b < first[p + 1] and runs p's single-projection body as its block b - first[p], so
-// every stored value is computed by the same instructions as in p's own launch (bitwise equal).
+// One launch for up to kTightGroupMax projections of one input (decode rows), indexed by the shared projection-group
+// table (strix/decode_projection_group.hpp; the backend-neutral rows plan emits the same index per launch). Block b of
+// the launch belongs to the projection p with first[p] <= b < first[p + 1] (decode::locate) and runs p's
+// single-projection body as its block b - first[p], so every stored value is computed by the same instructions as in
+// p's own launch (bitwise equal).
 inline constexpr unsigned kTightGroupMax = 6U;  // 6 = the 3-column-role attention prepare (q, relative, sink, gate, k, v) of one layer
+using TightBlocks = decode::GroupIndex<kTightGroupMax>;
 
-struct TightBlocks {
-    unsigned first[kTightGroupMax + 1U]{};
-    unsigned count{};
-};
-
-struct TightSlot {
-    unsigned projection, block;
-};
-
-// outputs[p] > 0 for p < count, 1 <= count <= kTightGroupMax. Returns false (plan untouched) when a block count does
-// not fit 32 bits.
+// Member p gets ceil(outputs[p] / block_outputs) blocks. outputs[p] > 0 for p < count, 1 <= count <= kTightGroupMax.
+// Returns false (plan untouched) on an empty member, a count outside 1..kTightGroupMax or a block total past 32 bits.
 constexpr bool plan_tight_blocks(const unsigned* outputs, unsigned count, unsigned block_outputs, TightBlocks& plan) {
     if (count == 0U || count > kTightGroupMax || block_outputs == 0U) return false;
     TightBlocks next{};
-    unsigned total = 0U;
     for (unsigned p = 0; p < count; ++p) {
         if (outputs[p] == 0U) return false;
         const unsigned blocks = outputs[p] / block_outputs + (outputs[p] % block_outputs != 0U ? 1U : 0U);
-        if (blocks > 0xffffffffU - total) return false;
-        next.first[p] = total;
-        total += blocks;
+        if (blocks > 0xffffffffU - next.first[p]) return false;
+        next.first[p + 1U] = next.first[p] + blocks;
     }
-    next.first[count] = total;
     next.count = count;
     plan = next;
     return true;
-}
-
-// block < plan.first[plan.count]. The scan is uniform per block (count <= kTightGroupMax).
-STRIX_DENSE_LINEAR_HD constexpr TightSlot locate(const TightBlocks& plan, unsigned block) {
-    unsigned p = 0U;
-    while (p + 1U < plan.count && block >= plan.first[p + 1U]) ++p;
-    return {p, block - plan.first[p]};
 }
 } // namespace strix::core::dense_linear
 
@@ -214,9 +194,10 @@ struct TightGroup {
 template <unsigned Rows, unsigned T, weight_decode::Format Format, Epilogue Ep>
 __global__ void __launch_bounds__(128) grouped_kernel(TightGroup g, const float* x, unsigned nrows) {
     static_assert(Ep != Epilogue::silu_mul, "grouped projections store one matrix each");
-    const auto slot = locate(g.blocks, blockIdx.x);
-    body<Rows, T, Format, Ep>(g.w[slot.projection], g.w[slot.projection], x, g.out[slot.projection], nrows,
-                              slot.block);
+    unsigned projection = 0U;
+    std::uint32_t block = 0U;
+    decode::locate(g.blocks.first, g.blocks.count, blockIdx.x, projection, block);
+    body<Rows, T, Format, Ep>(g.w[projection], g.w[projection], x, g.out[projection], nrows, block);
 }
 
 // Outputs per wave. A decode row (Rows 1) runs one output per wave: twice the waves in flight, and every output keeps

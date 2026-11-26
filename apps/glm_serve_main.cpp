@@ -1212,6 +1212,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         rd::apply_env(eff, [](const char* k, const char* v) { (void)::setenv(k, v, 0); });
+        // Drafter content identity (r94): read once here, named by the receipt and by the pair identity (print()).
+        if (eff.mtp_spec.value == "1") eff.head.mtp_digest = rd::mtp_payload_digest(eff.head);
         std::fputs(rd::mtp_decode_line(eff).c_str(), stderr);
         opt.mtp = mtp_on;
         opt.spec = mtp_on;
@@ -1244,7 +1246,7 @@ int main(int argc, char** argv) {
             (void)::setenv("STRIX_DIST_USB4_TIMEOUT_MS", "600000", 0);
             (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "600000", 0);
             auto opened = strix::dist::open_pair(transport_spec, opt.rank);
-            turbo_prefill_device = rd::ordinary_turbo(request, eff) && rd::measured_prefill_pair(opened.usb4_topology.streams, opened.direct != nullptr);
+            turbo_prefill_device = rd::ordinary_lossy_prefill(request, eff) && rd::measured_prefill_pair(opened.usb4_topology.streams, opened.direct != nullptr);
             auto transport = std::move(opened.host);
             const auto& receipt = opened.receipt;
             if (deployment.provider) {
@@ -1365,14 +1367,15 @@ int main(int argc, char** argv) {
         ops.world = opt.world;
         const bool turbo_candidate = turbo_prefill_device && rd::measured_prefill_layout(eng.prefill_pipeline()) &&
             !deployment.plan && !serial && rtx_prefill.empty() && import_listen.empty();
-        ops.turbo_prefill_pair = rd::select_prefill_turbo(request, eff, rd::process_env(),
-            {turbo_candidate, rd::product_ladder_rows[0].min_context, opt.capacity, opt.max_rows, opt.slots,
+        ops.turbo_prefill_pair = rd::select_prefill_wmma(request, eff, rd::process_env(),
+            {turbo_candidate, rd::kPrefillProbePrompt, opt.capacity, opt.max_rows, opt.slots,
              rd::kTurboPrefillGenerated});
-        if (rd::ordinary_turbo(request, eff) && !strix::glm::pf::wmma_x::enabled()) {
+        if (rd::ordinary_lossy_prefill(request, eff) && !strix::glm::pf::wmma_x::enabled()) {
             ops.turbo_prefill_policy = [&](std::uint64_t prompt, unsigned generated, bool fresh) {
-                const rd::PrefillWork work{ops.turbo_prefill_pair && fresh, prompt, opt.capacity, opt.max_rows, opt.slots, generated};
-                const bool selected = rd::select_prefill_turbo(request, eff, rd::process_env(), work);
-                rd::report_prefill_turbo(opt.rank, work, selected);
+                const rd::PrefillWork work{ops.turbo_prefill_pair && fresh, prompt, opt.capacity, opt.max_rows, opt.slots, generated,
+                                           rd::routed_prefill_scratch()};
+                const bool selected = rd::select_prefill_wmma(request, eff, rd::process_env(), work);
+                rd::report_prefill_wmma(opt.rank, request, eff, rd::process_env(), work, selected);
                 return selected;
             };
         }
