@@ -1718,16 +1718,32 @@ PrefillResult DevicePrefill::run_full_prompt(std::span<const std::uint32_t> toke
         m.overlay == nullptr && m.file->size() == pinned_file(PinnedFileKind::target_q2).bytes &&
         m.dense_select && m.split_min_rows == PrefillOptions{}.split_min_rows && !m.moe_joint &&
         m.joint_max_rows == PrefillOptions{}.joint_max_rows && m.async_gather && m.pack &&
-        m.overlap && m.moe_persist && m.staged_gather_allowed && m.early_q_b && m.group.empty() &&
+        m.overlap && m.moe_persist && m.staged_gather_allowed && m.early_q_b &&
         m.task == nullptr && m.snap_next.empty() && m.embed_next.empty() &&
         !baseline_on;
+    // One sequence per forward: a multi-slot server keeps idle group-pass storage (group_members, run_group only), which
+    // neither runs here nor changes this pass's arithmetic, so it is not a live lane.
     const auto resolution = pair_defaults::resolve_prefill_profile(
-        startup, o, tokens.size(), static_cast<std::uint32_t>(std::max<std::size_t>(1U, m.group.size())),
-        scope ? strix::device::hip_cost_device_identity() : std::string{}, scope);
+        startup, o, tokens.size(), 1U, scope ? strix::device::hip_cost_device_identity() : std::string{}, scope);
     const auto* d1 = resolution ? resolution->find("d1_prefill") : nullptr;
     // R=256 runs only on top of an admitted D1 request (gate v2 D1R scored exactly that set).
     const auto* replay = resolution ? resolution->find("decoder_replay") : nullptr;
     bool local = d1 && d1->value == "1";
+    // The decline line names this rank's first failing condition (stderr only; the route is unchanged).
+    const char* why = local ? "" : !scope ? "outside the measured execution:" : !resolution ? "options outside the measured composition" : "no band row applies";
+    std::string missing;
+    if (!scope) {
+        const std::pair<bool, const char*> terms[] = {
+            {o.communicator->transport_name().starts_with("usb4-host:"), "transport"}, {m.moe_window_auto, "moe-window"},
+            {m.overlay == nullptr, "overlay"}, {m.file->size() == pinned_file(PinnedFileKind::target_q2).bytes, "weights-file"},
+            {m.dense_select, "dense-select"}, {m.split_min_rows == PrefillOptions{}.split_min_rows, "split-min-rows"},
+            {!m.moe_joint, "moe-joint"}, {m.joint_max_rows == PrefillOptions{}.joint_max_rows, "joint-max-rows"},
+            {m.async_gather, "async-gather"}, {m.pack, "pack"}, {m.overlap, "overlap"}, {m.moe_persist, "moe-persist"},
+            {m.staged_gather_allowed, "staged-gather"}, {m.early_q_b, "early-q-b"}, {m.task == nullptr, "task"},
+            {m.snap_next.empty(), "snapshots"}, {m.embed_next.empty(), "embeds"}, {!baseline_on, "baseline"}};
+        for (const auto& [ok, name] : terms)
+            if (!ok) missing += std::string(" ") + name;
+    }
 
     // Either rank may decline before any arithmetic changes. The startup profile handshake
     // already agrees the tier and explicit switches. This exchange agrees the request's route.
@@ -1736,6 +1752,7 @@ PrefillResult DevicePrefill::run_full_prompt(std::span<const std::uint32_t> toke
             m.prepare_flash_mirrors();
         } catch (const std::runtime_error&) {
             local = false;
+            why = "flash mirrors unavailable";
         }
     }
     const std::array<std::uint64_t, 2> mine{tokens.size(), local ? resolution->fingerprint() : 0U};
@@ -1744,7 +1761,8 @@ PrefillResult DevicePrefill::run_full_prompt(std::span<const std::uint32_t> toke
         strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 0x44315046U, 0U});
     if (peer[0] != mine[0]) throw std::runtime_error("deepseek41 D1: ranks disagree on prompt length");
     if (!pair_defaults::paired_d1(mine[1], peer[1])) {
-        std::fprintf(stderr, "deepseek41 D1: %zu prompt tokens, no paired D1 admission; previous prefill route\n", tokens.size());
+        std::fprintf(stderr, "deepseek41 D1: %zu prompt tokens, no paired D1 admission (this rank: %s%s; peer: %s); previous prefill route\n",
+                     tokens.size(), local ? "admitted" : why, missing.c_str(), peer[1] != 0U ? "admitted" : "declined");
         return run(tokens);
     }
     std::fprintf(stderr, "%s\n", d1->ladder.c_str());

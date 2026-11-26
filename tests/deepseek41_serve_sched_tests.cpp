@@ -335,6 +335,17 @@ void auto_rows() {
     expect(sc::auto_prefill_rows(49152, t) == 16384U, "auto rows: drafter loaded first -> 16384");
     t.wide_pieces = false;  // outside the measured envelope (large context, other window / slabs): at most 16384
     expect(sc::auto_prefill_rows(49152, t) == 16384U, "auto rows: no 32768 outside the measured envelope");
+    // A FAST / TURBO server: the whole-prompt band (D1 + R256 up to 32,768) asks the prefill to hold 32,768 rows when they
+    // fit under the same rule; the default pieces stay the measured 16,384 (auto_piece_rows).
+    t.wide_pieces = true;
+    expect(sc::auto_prefill_rows(49152, t, 32768U) == 32768U, "auto rows: the whole-prompt band holds 32768 rows when they fit");
+    expect(sc::auto_piece_rows(32768U) == 16384U && sc::auto_piece_rows(8192U) == 8192U, "auto rows: default pieces stay <= 16384");
+    expect(sc::auto_prefill_rows(36864, t, 32768U) == 32768U, "auto rows: context 36864 holds a 32768-row whole prompt");
+    expect(sc::auto_prefill_rows(49152, t, 16384U) == 16384U, "auto rows: a band inside the default pieces changes nothing");
+    expect(sc::auto_prefill_rows(16384, t, 32768U) == 16384U, "auto rows: never above the context");
+    t.wide_pieces = false;
+    expect(sc::auto_prefill_rows(49152, t, 32768U) == 16384U, "auto rows: the band stays inside the measured envelope");
+    expect(sc::auto_prefill_rows(49152, r, 32768U) == 16384U, "auto rows: the band never squeezes the margin (drafter peak reserved)");
     {
         std::map<std::string, std::string> env;
         const auto look = [&](const char* k) { const auto it = env.find(k); return it == env.end() ? std::string() : it->second; };

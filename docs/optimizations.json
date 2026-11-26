@@ -3011,12 +3011,12 @@
     "doc_anchor": "docs/optimizations.md#ds41-fast-d1-band",
     "engine_matrix": {
       "inkling2-mini": "not bound: no DeepSeek prefill composition",
-      "qwen3.8-flash-next": "shared mechanism only (band receipts bind its own TURBO rows)",
-      "qwen3.8-27b": "shared mechanism only (band receipts bind its 512-row window rows)",
-      "deepseek-v4.1-flash": "bound (pair prefill, CLI and serve)",
-      "glm-5.3-flash": "not bound: no DeepSeek prefill composition",
-      "minimax-m3.1-flash": "not bound: no DeepSeek prefill composition",
-      "hy4-flash": "shared mechanism only (band ladder of its prefill window)",
+      "qwen3.8-flash-next": "shared mechanism only (band receipts bind its own TURBO rows); same serve-gap class to check: HIP serve 1024-row cache checkpoints / T8192 pieces vs the CLI whole prompt",
+      "qwen3.8-27b": "shared mechanism only (band receipts bind its 512-row window rows); same serve-gap class to check: served cache checkpoints vs the CLI window rows",
+      "deepseek-v4.1-flash": "bound (pair prefill, CLI and serve; served DSpark seed <= R and FAST/TURBO 32,768-row capacity resolve the CLI cells; in-run cache capture keeps the previous route)",
+      "glm-5.3-flash": "not bound: no DeepSeek prefill composition; same serve-gap class to check: band rows that need MemAvailable for auto max-rows 8192 on a server that holds more memory",
+      "minimax-m3.1-flash": "not bound: no DeepSeek prefill composition; same serve-gap class to check: serve transport usb4gpu vs CLI usb4-auto (parity exception, never measured on one transport)",
+      "hy4-flash": "shared mechanism only (band ladder of its prefill window); same serve-gap class to check: served prompt_rows vs the FAST row qualified at <= 4K",
       "nemotron-3.5-bolt-e4b": "not bound: no DeepSeek prefill composition"
     }
   },
