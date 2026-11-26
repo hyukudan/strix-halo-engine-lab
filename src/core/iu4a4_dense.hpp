@@ -208,26 +208,34 @@ __global__ __launch_bounds__(256) void quantise_kernel(const float* __restrict__
 // value meet in LDS. Same operations, same bits as quantise_kernel. F::apply(a, b) maps two inputs to the value that
 // is quantised (an engine's gated unit, e.g. SiLU(g) * u, so the FP32 product is never stored); Ident takes a.
 // Rows up to kCtaInputs inputs; quantise_kernel takes longer rows.
+// Waves trait (waves per row): 8 = the CTA form above; 1 = the register wave-row form, one wave per row (8 rows per
+// 256-thread CTA) for rows up to kWaveInputs inputs: the wave keeps every step of its row in registers and the maximum
+// and the first non-finite value meet through shuffles only (no LDS, no barrier), so each wave streams its own row and a
+// CTA keeps eight rows of loads in flight instead of one. Same operations and bits: the row maximum and the first
+// non-finite index in k order do not depend on which wave or lane meets them first.
 inline constexpr unsigned kCtaSteps = 12U, kCtaInputs = 8U * kCtaSteps * 2U * 128U;  // 24,576
+inline constexpr unsigned kWaveSteps = 12U, kWaveInputs = kWaveSteps * 2U * 128U;    // 3,072
 struct Ident {
     __device__ __forceinline__ static float apply(float a, float) { return a; }
 };
-template <class F, bool Rows>
+template <class F, bool Rows, unsigned Waves = 8U>
 __device__ __forceinline__ void quantise_cta_row(const float* __restrict__ x0, const float* __restrict__ x1, unsigned x_stride, Act a) {
 #pragma clang fp contract(off)
-    __shared__ float s_amax[8], s_bad[8];
-    __shared__ unsigned s_badk[8];
-    const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x >> 5U, row = blockIdx.x;
+    static_assert(Waves == 8U || Waves == 1U, "8 waves per row (CTA form) or one (wave-row form)");
+    constexpr unsigned kSteps = Waves == 8U ? kCtaSteps : kWaveSteps;
+    const unsigned lane = threadIdx.x & 31U;
+    const unsigned wave = Waves == 8U ? threadIdx.x >> 5U : 0U;  // the row's step owner
+    const unsigned row = Waves == 8U ? blockIdx.x : blockIdx.x * 8U + (threadIdx.x >> 5U);
     const unsigned mp = padded_rows(a.rows), in = a.in, blocks = in / rot::kBlock, steps = (blocks + 1U) / 2U;
     const unsigned half = lane >> 4U, sub = lane & 15U;
     const bool live_row = row < a.rows;
     const std::size_t ro = std::size_t(live_row ? row : 0U) * x_stride;
-    float v[kCtaSteps][8];
+    float v[kSteps][8];
     float amax_m = 0.0f, bad = 0.0f;
     unsigned bad_k = 0xffffffffU;
 #pragma unroll
-    for (unsigned q = 0; q < kCtaSteps; ++q) {
-        const unsigned blk = 2U * (wave + 8U * q) + half;
+    for (unsigned q = 0; q < kSteps; ++q) {
+        const unsigned blk = 2U * (wave + Waves * q) + half;
         if (live_row && blk < blocks) {
             const std::size_t at = ro + blk * rot::kBlock + sub * 8U;
             const F4 lo = *reinterpret_cast<const F4*>(x0 + at), hi = *reinterpret_cast<const F4*>(x0 + at + 4U);
@@ -243,7 +251,7 @@ __device__ __forceinline__ void quantise_cta_row(const float* __restrict__ x0, c
 #pragma unroll
             for (unsigned j = 0; j < 8U; ++j) v[q][j] = 0.0f;
         }
-        if (wave + 8U * q < steps) {  // wave-uniform: every lane of the wave takes part in the shuffles
+        if (wave + Waves * q < steps) {  // wave-uniform: every lane of the wave takes part in the shuffles
             a4_tiles::Emu<32U, true>::fwht(v[q]);
 #pragma unroll
             for (unsigned j = 0; j < 8U; ++j) {
@@ -263,20 +271,24 @@ __device__ __forceinline__ void quantise_cta_row(const float* __restrict__ x0, c
         const float ov = __shfl_xor(bad, int(d), 32);
         if (ok < bad_k) bad_k = ok, bad = ov;
     }
-    if (lane == 0U) s_amax[wave] = amax_m, s_bad[wave] = bad, s_badk[wave] = bad_k;
-    __syncthreads();
-    for (unsigned o = 0; o < 8U; ++o) {
-        amax_m = fmax_(amax_m, s_amax[o]);
-        if (s_badk[o] < bad_k) bad_k = s_badk[o], bad = s_bad[o];
+    if constexpr (Waves == 8U) {
+        __shared__ float s_amax[8], s_bad[8];
+        __shared__ unsigned s_badk[8];
+        if (lane == 0U) s_amax[wave] = amax_m, s_bad[wave] = bad, s_badk[wave] = bad_k;
+        __syncthreads();
+        for (unsigned o = 0; o < 8U; ++o) {
+            amax_m = fmax_(amax_m, s_amax[o]);
+            if (s_badk[o] < bad_k) bad_k = s_badk[o], bad = s_bad[o];
+        }
     }
     const bool finite = bad_k == 0xffffffffU;
     const float base = finite ? amax_m / (7.0f * static_cast<float>(rot::kUMax)) : bad;
-    if (threadIdx.x == 0U) a.base[row] = base;
+    if ((Waves == 8U ? threadIdx.x : lane) == 0U) a.base[row] = base;
     const bool coded = finite && base > 0.0f;
 #pragma unroll
-    for (unsigned q = 0; q < kCtaSteps; ++q) {
-        if (wave + 8U * q >= steps) continue;
-        const unsigned blk = 2U * (wave + 8U * q) + half;
+    for (unsigned q = 0; q < kSteps; ++q) {
+        if (wave + Waves * q >= steps) continue;
+        const unsigned blk = 2U * (wave + Waves * q) + half;
         float amax = 0.0f;
 #pragma unroll
         for (unsigned j = 0; j < 8U; ++j) amax = fmax_(amax, a4_tiles::fabs_(v[q][j]));
@@ -306,17 +318,17 @@ __device__ __forceinline__ void quantise_cta_row(const float* __restrict__ x0, c
         }
     }
 }
-template <class F, bool Rows>
+template <class F, bool Rows, unsigned Waves = 8U>
 __global__ __launch_bounds__(256) void quantise_cta_kernel(const float* __restrict__ x0, const float* __restrict__ x1, unsigned x_stride, Act a) {
-    quantise_cta_row<F, Rows>(x0, x1, x_stride, a);
+    quantise_cta_row<F, Rows, Waves>(x0, x1, x_stride, a);
 }
 // Verdict-gated form: the launch stores nothing when *verdict != 0. The word must not change during the launch (every
 // wave reads the same value before the first barrier).
-template <class F, bool Rows>
+template <class F, bool Rows, unsigned Waves = 8U>
 __global__ __launch_bounds__(256) void quantise_cta_gated_kernel(const unsigned* __restrict__ verdict, const float* __restrict__ x0,
                                                                  const float* __restrict__ x1, unsigned x_stride, Act a) {
     if (*verdict != 0U) return;
-    quantise_cta_row<F, Rows>(x0, x1, x_stride, a);
+    quantise_cta_row<F, Rows, Waves>(x0, x1, x_stride, a);
 }
 
 // One thread per (column n, block b); load time.
@@ -787,14 +799,21 @@ __global__ __launch_bounds__(256) void grouped_gemm_kernel(Src src, Act a, unsig
 // Host side (stream-ordered; callers check supported() and hipGetLastError()).
 // x: rows of a.in values at x_stride floats. quantise_map2: the quantised value is F::apply(a[k], b[k]) (same stride);
 // with a second input it needs map2_supported(in).
+// The wave-row schedule is an explicit candidate for short activation rows.
+enum class QuantiseSchedule { incumbent, wave_rows };
+
 inline bool map2_supported(unsigned in) { return in <= detail::kCtaInputs; }
 template <class F = detail::Ident, bool Rows = false>
-inline void enqueue_quantise_map2(const float* x0, const float* x1, unsigned x_stride, const Act& a, hipStream_t s) {
-    if (a.in <= detail::kCtaInputs) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::quantise_cta_kernel<F, Rows>), dim3(padded_rows(a.rows)), dim3(256), 0, s, x0, x1, x_stride, a);
+inline void enqueue_quantise_map2(const float* x0, const float* x1, unsigned x_stride, const Act& a, hipStream_t s,
+                                  QuantiseSchedule schedule = QuantiseSchedule::incumbent) {
+    if (schedule == QuantiseSchedule::wave_rows && a.in <= detail::kWaveInputs)
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::quantise_cta_kernel<F, Rows, 1U>), dim3(padded_rows(a.rows) / 8U), dim3(256), 0, s, x0, x1, x_stride, a);
+    else if (a.in <= detail::kCtaInputs) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::quantise_cta_kernel<F, Rows>), dim3(padded_rows(a.rows)), dim3(256), 0, s, x0, x1, x_stride, a);
     else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, detail::quantise_kernel<Rows>, dim3((padded_rows(a.rows) + 7U) / 8U), dim3(256), 0, s, x0, x_stride, a);
 }
-inline void enqueue_quantise(const float* x, unsigned x_stride, const Act& a, hipStream_t s) {
-    enqueue_quantise_map2<detail::Ident>(x, nullptr, x_stride, a, s);
+inline void enqueue_quantise(const float* x, unsigned x_stride, const Act& a, hipStream_t s,
+                             QuantiseSchedule schedule = QuantiseSchedule::incumbent) {
+    enqueue_quantise_map2<detail::Ident>(x, nullptr, x_stride, a, s, schedule);
 }
 // The row-major image of the grouped launch (same values as enqueue_quantise; byte sizes act_*_bytes).
 inline void enqueue_quantise_rows(const float* x, unsigned x_stride, const Act& a, hipStream_t s) {
@@ -802,9 +821,14 @@ inline void enqueue_quantise_rows(const float* x, unsigned x_stride, const Act& 
 }
 // Same image, verdict-gated (nothing stored when *verdict != 0; the word must not change during the launch). Needs
 // map2_supported(a.in).
-inline void enqueue_quantise_rows_gated(const unsigned* verdict, const float* x, unsigned x_stride, const Act& a, hipStream_t s) {
-    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::quantise_cta_gated_kernel<detail::Ident, true>), dim3(padded_rows(a.rows)), dim3(256), 0, s,
-                         verdict, x, nullptr, x_stride, a);
+inline void enqueue_quantise_rows_gated(const unsigned* verdict, const float* x, unsigned x_stride, const Act& a, hipStream_t s,
+                                  QuantiseSchedule schedule = QuantiseSchedule::incumbent) {
+    if (schedule == QuantiseSchedule::wave_rows && a.in <= detail::kWaveInputs)
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::quantise_cta_gated_kernel<detail::Ident, true, 1U>), dim3(padded_rows(a.rows) / 8U), dim3(256), 0,
+                             s, verdict, x, nullptr, x_stride, a);
+    else
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::quantise_cta_gated_kernel<detail::Ident, true>), dim3(padded_rows(a.rows)), dim3(256), 0, s,
+                             verdict, x, nullptr, x_stride, a);
 }
 // Requantisation from a weight source (Src::requantise(col, b, n, dst) -> step, see detail::requantise_kernel).
 template <class Src>

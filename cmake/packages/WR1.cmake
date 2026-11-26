@@ -22,7 +22,8 @@ if(TARGET strix_exec_cuda_decode_catalog)
         CUDA_ARCHITECTURES "${wr1_archs}")
 
     add_executable(strix-wr1-cuda-fixture EXCLUDE_FROM_ALL tests/cuda_core/wr1_cuda_fixture.cu)
-    target_link_libraries(strix-wr1-cuda-fixture PRIVATE strix_wr1_cuda strix_exec_cuda_decode_catalog strix_cuda_core_kernels)
+    target_link_libraries(strix-wr1-cuda-fixture PRIVATE strix_wr1_cuda strix_exec_cuda
+        strix_exec_cuda_decode_catalog strix_cuda_core_kernels)
     set_target_properties(strix-wr1-cuda-fixture PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON
         CUDA_ARCHITECTURES "120a-real")
     foreach(wr1_target IN ITEMS strix_wr1_cuda strix-wr1-cuda-fixture)

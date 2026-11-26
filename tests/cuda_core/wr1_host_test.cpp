@@ -40,7 +40,7 @@ void test() {
     std::set<std::string> identities;
 
     for (auto rows : wr1::widths) {
-        wr1::Bindings bindings(&descriptor, rows, thunks);
+        wr1::Bindings bindings(&descriptor, rows, thunks, true);
         CudaProgramRecipe recipe;
         const auto append = [&](const auto& args, bool = false) { bindings.append(recipe, args); };
         const auto fp32 = decode::Bf16DenseGroup{input.data(), 32,
@@ -80,8 +80,20 @@ void test() {
             check(captured == &descriptor, "descriptor address was not captured");
             identities.insert(launch.entry);
         }
-        for (std::size_t i = 1; i < lowered.binding.nodes.size(); ++i)
-            check(lowered.binding.nodes[i].after.front().kind == CudaEdgeKind::completion, "WR1 edge is not completion");
+        // Early launch: only the dense and RMS bodies wait before step I/O, so only they take a
+        // programmatic edge; every other leaf keeps a completion edge (the incumbent schedule).
+        check(lowered.binding.nodes.front().after.empty(), "first WR1 leaf has a predecessor");
+        unsigned programmatic = 0;
+        for (std::size_t i = 1; i < lowered.binding.nodes.size(); ++i) {
+            const auto& entry = lowered.program.launches[i].entry;
+            const bool waits = entry.starts_with("cuda-wr1-dense-") || entry.starts_with("cuda-wr1-rms-bf16-");
+            const auto& after = lowered.binding.nodes[i].after;
+            check(after.size() == 1 && after.front().predecessor == i - 1, "WR1 leaves are not one chain");
+            check(after.front().kind == (waits ? CudaEdgeKind::programmatic : CudaEdgeKind::completion),
+                  "WR1 edge does not follow the leaf's wait contract");
+            programmatic += waits ? 1U : 0U;
+        }
+        check(programmatic >= 2, "WR1 chain has no early-launch dense edge");
         // fp32 dense: row tiles of up to 8 descriptor rows share one weight read (17 outputs: 3 blocks of 8 warps).
         const auto tiles = rows < 8U ? 1U : rows / 8U;
         check(bindings.bind(fp32).grid.blocks == std::array{3U, tiles, 1U}, "fp32 dense row-tile grid");
@@ -97,6 +109,30 @@ void test() {
         refuses([&] { (void)bindings.bind(wr1::Greedy{input.data(), partial.data(), nullptr, 32, 1}); });
     }
     check(identities.size() == wr1::widths.size() * static_cast<unsigned>(wr1::Leaf::count), "missing recipe identity");
+    unsigned waited = 0;
+    for (unsigned id = 0; id < static_cast<unsigned>(wr1::Leaf::count); ++id) {
+        const auto which = static_cast<wr1::Leaf>(id);
+        const auto contract = wr1::pdl_contract(which);
+        const bool waits = which == wr1::Leaf::dense_fp32 || which == wr1::Leaf::dense_mma3 ||
+                           which == wr1::Leaf::dense_mma3_round || which == wr1::Leaf::rms;
+        check(waits ? contract.wait == PdlWait::before_step_io && contract.opt_out == PdlOptOut::none
+                    : contract.wait == PdlWait::undeclared && contract.opt_out == PdlOptOut::legacy_schedule,
+              "WR1 leaf PDL contract");
+        waited += waits ? 1U : 0U;
+    }
+    check(waited == 4, "WR1 waited leaf count");
+    {
+        wr1::Bindings bindings(&descriptor, 4, thunks, true);
+        const decode::RmsBf16 args{input.data(), weights.data(), output.data(), 1U, 32U, 0.001F};
+        const auto rms = bindings.bind(args);
+        check(rms.pdl.wait == PdlWait::before_step_io && rms.pdl.opt_out == PdlOptOut::none,
+              "RMS binding lost its wait contract");
+        check(bindings.bind(decode::Bf16Round{output.data(), 32}).pdl.opt_out == PdlOptOut::legacy_schedule,
+              "pointwise binding gained an early launch");
+        const wr1::Bindings incumbent(&descriptor, 4, thunks);
+        check(incumbent.bind(args).pdl.opt_out == PdlOptOut::legacy_schedule,
+              "the incumbent WR1 graph must opt out of early launch");
+    }
     check(decode::controller_scratch_floats(32, 16, 1) == 144 &&
           decode::controller_scratch_floats(32, 16, 4) == 832, "controller scratch layout");
     refuses([&] { (void)wr1::Bindings(&descriptor, 3, thunks); });

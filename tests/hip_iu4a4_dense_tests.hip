@@ -30,7 +30,8 @@ struct Mul {  // map2 functor of the fixture (an engine passes its gated unit)
     __device__ __forceinline__ static float apply(float a, float b) { return a * b; }
 };
 
-int run_case(unsigned rows, unsigned in, unsigned n, unsigned seed, bool map2 = false, unsigned pitch = 0U, bool staged = false) {
+int run_case(unsigned rows, unsigned in, unsigned n, unsigned seed, bool map2 = false, unsigned pitch = 0U, bool staged = false,
+             ad::QuantiseSchedule schedule = ad::QuantiseSchedule::incumbent) {
     const unsigned ys = pitch ? pitch : n;  // output row pitch (floats); columns n .. ys - 1 must stay untouched
     std::mt19937 g(seed);
     const unsigned mp = ad::padded_rows(rows), blocks = in / rot::kBlock;
@@ -74,8 +75,8 @@ int run_case(unsigned rows, unsigned in, unsigned n, unsigned seed, bool map2 = 
     const ad::Act act{dcodes, du, dbase, rows, in};
     const ad::Weights wt{dw, dstep, in, n};
     ad::enqueue_requantise(dpack, dsc, in, n, dw, dstep, nullptr);
-    if (map2) ad::enqueue_quantise_map2<Mul>(dx, dx2, in, act, nullptr);
-    else ad::enqueue_quantise(dx, in, act, nullptr);
+    if (map2) ad::enqueue_quantise_map2<Mul>(dx, dx2, in, act, nullptr, schedule);
+    else ad::enqueue_quantise(dx, in, act, nullptr, schedule);
     if (staged) ad::enqueue_gemm(wt, act, ad::OutCols{dy, ys, n / 16U}, nullptr, ad::StagedRawStore{});
     else ad::enqueue_gemm(wt, act, ad::OutCols{dy, ys, n / 16U}, nullptr);
     CHECK(hipGetLastError());
@@ -205,6 +206,10 @@ int main() {
     fails += run_case(70, 640, 96, 7U, false, 1024U, true);  // staged epilogue: 16 B aligned rows at a 4 KiB pitch
     fails += run_case(37, 256, 48, 8U, false, 51U, true);    // staged epilogue: odd pitch (unaligned chunks, scalar stores)
     fails += run_case(300, 2048, 400, 4U, false, 0U, true);  // staged epilogue: 3 m CTAs, 25 W tiles (partial n CTA)
+    constexpr auto wave = ad::QuantiseSchedule::wave_rows;
+    fails += run_case(4100, 2304, 32, 9U, false, 0U, false, wave);  // eight rows per CTA, padded tail
+    fails += run_case(33, 1152, 32, 10U, true, 0U, false, wave);     // map2, odd block count
+    fails += run_case(24, 3200, 32, 11U, false, 0U, false, wave);    // past the bound, falls back to CTA
     std::printf("%s\n", fails ? "iu4a4_dense tests FAILED" : "iu4a4_dense tests PASS");
     return fails ? 1 : 0;
 }

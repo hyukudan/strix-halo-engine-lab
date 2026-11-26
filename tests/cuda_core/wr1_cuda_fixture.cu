@@ -1,5 +1,6 @@
 #include "exec/catalog_cuda_wr1.hpp"
 #include "exec/cuda_decode_lowering.hpp"
+#include "exec/executor_cuda.hpp"
 #include "cuda/core/head_argmax.cuh"
 #include "strix/cuda_core/dense.hpp"
 
@@ -328,6 +329,36 @@ void greedy(const Case& test) {
     equal<RowOut>(y.read(), expected, "greedy result/masked status");
 }
 
+void early_launch(const Case& test) {
+    constexpr unsigned width = 64;
+    const Device<float> source(input(test.rows * width, 18));
+    const Device<std::uint16_t> scale(weights(width, 19)), matrix(weights(width * width, 20));
+    Mirror intermediate(test.rows * width), output(test.rows * width);
+    Captured stream;
+    check(cudaStreamCreateWithFlags(&stream.stream, cudaStreamNonBlocking));
+    for (const bool enabled : {false, true}) {
+        strix::cuda_core::set_programmatic_launch(enabled);
+        const wr1::Bindings bind(test.device.data, test.rows, wr1::native_thunks(), enabled);
+        auto* projected = enabled ? intermediate.wide.data : intermediate.scalar.data;
+        auto* normalized = enabled ? output.wide.data : output.scalar.data;
+        CudaProgramRecipe recipe;
+        bind.append(recipe, decode::Bf16DenseGroup{source.data, width,
+            {Bf16RowProjection{matrix.data, width, projected}}, 1U, decode::Bf16DenseMode::fp32});
+        bind.append(recipe, decode::RmsBf16{projected, scale.data, normalized, 1U, width, epsilon});
+        ProgramKey key{};
+        key.rows = test.rows;
+        const auto lowered = recipe.compile(key, CudaReadback::resident);
+        CudaExecutor executor(enabled, true, CudaDescriptorLayout::resident);
+        executor.submit_resident(lowered.program, lowered.binding, stream.stream, [] {});
+        check(cudaStreamSynchronize(stream.stream));
+        if (executor.graph_stats(lowered.program.key).pdl_edges != (enabled ? 1U : 0U))
+            throw std::runtime_error("WR1 graph did not capture the requested edge type");
+    }
+    strix::cuda_core::set_programmatic_launch(false);
+    intermediate.compare("WR1 graph dense projection");
+    output.compare("WR1 graph programmatic RMS");
+}
+
 }  // namespace
 
 int main() try {
@@ -341,6 +372,7 @@ int main() try {
             relative(test);
             clip(test);
             greedy(test);
+            early_launch(test);
         }
         std::printf("wr1_cuda PASS R=%u dense controller residual_read message_bank relative_logits head_clip greedy_head padding\n",
                     width);
