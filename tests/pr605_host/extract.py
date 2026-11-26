@@ -25,6 +25,6 @@ iu4_dispatch = re.search(r"int fast_i4_mode = -1;\n.*?\nbool fast_i4\(\) \{.*?\n
 (out / "replay_host.hpp").write_text(
     "inline void apply_replay(PrefillOptions& o, const PrefillOptions& p) {\n" + copies + "\n}\n"
     "inline PrefillResult resolve_replay(const PrefillOptions& o, std::uint32_t inherited, std::uint32_t P0 = 0U,\n"
-    "                                    std::uint32_t next_rows = 0U, bool snapshot = false, bool group = false) {\n"
+    "                                    std::uint32_t deferral_rows = 0U, bool snapshot = false, bool group = false) {\n"
     + resolution + "\n    const bool bounded_oracle = false;\n    PrefillResult result;\n"
     + report + "\n    return result;\n}\n", encoding="utf-8")

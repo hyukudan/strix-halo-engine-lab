@@ -30,13 +30,18 @@ inline constexpr std::array<strix::profile::Lever, 14> profile_table{{
      {}, {true, true, true, true}, "", "", "FAST dense dispatch threshold", false, {}, true, {}, {{{"128", "v1"}}}},
     // Prefill only: FAST policy ds41-decoder-replay-bounded-v1 (value R rows, a multiple of 128): every decoder layer runs
     // its last R rows, window keys floored at the cut, its dense products in the exact form (bounded run == full run
-    // with the floor, bit for bit; not bit-equal to the full decode). Explicit only, OFF in default / fast / quality;
-    // set, it enters the profile fingerprint (rank agreement, prefix-cache identity). TURBO R=256 is pending a
-    // matched timing and quality receipt on the executing key floor.
-    {"decoder_replay", "STRIX_DS41_DECODER_REPLAY", "", {"", "", "", "256"}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true, false}, {true, true, true, true}, "ds41-replay-r256-v1", "0",
-     "pending: TURBO timing over effective FAST and quality for R=256 with key floor round_down(T - R, 256); "
-     "the historical R=256 gate ran on floor T - R", false, {}, true, {},
+    // with the floor, bit for bit; not bit-equal to the full decode). 'fast' runs R=256 (key floor
+    // round_down(T - R, 256)) on an admitted D1 request inside its band receipts; TURBO nests it (empty cell). OFF in default / quality.
+    // Qualified by FAST gate v2 D1R (8K and 32K classes). A run that needs every decoder row (a deferred serve piece,
+    // in-run prefix snapshots, a group pass) takes the exact plan instead. Set, it enters the profile fingerprint (rank
+    // agreement, prefix-cache identity).
+    {"decoder_replay", "STRIX_DS41_DECODER_REPLAY", "", {"", "256", "", ""}, "0", strix::profile::Kind::bit_changing,
+     {true, true, true, false}, {true, true, true, true}, "", "0",
+     "FAST bounded decoder replay R=256 (ds41-replay-r256-v1, key floor round_down(T - R, 256)) on the resolved fast set; "
+     "FAST gate v2 D1R on fast set + R256: qualified (8K and 32K classes, 28 windows, 1,764 rows, final PASS: KL 0.0101, "
+     "top-1 0.972, dNLL +0.0001 se 0.0037, route flips 0.37 x null; 8K class KL 0.0121 top-1 0.962, 32K class KL 0.0080 "
+     "top-1 0.982 dNLL +0.0060 se 0.0044)",
+     false, {false, false, false, false}, true, {},
      {{{"0", "v1"}, {"256", "ds41-replay-r256-v1"}}}},
     {"engram_f16wmma", "STRIX_DS41_FAST_ENGRAM", "", {}, "0", strix::profile::Kind::bit_changing,
      {}, {true, true, true, true}, "", "0", "explicit FAST FP16 Engram projection",
@@ -48,13 +53,12 @@ inline constexpr std::array<strix::profile::Lever, 14> profile_table{{
      {}, {true, true, true, true}, "", "0", "explicit FAST FP16 routed MoE down (requires relaxed MoE)",
      false, {}, true, {}, {{{"0", "v1"}, {"1", "ds41-moe-f16wmma-v1"}}}},
     // Prefill only: routed experts as IU4 codes x A4 activations (gguf-iu4-direct-v1; the stored IQ2_XXS / Q2_K weights
-    // are decoded inside the product, no pack). Automatic TURBO admission needs the actual request prefill regime
-    // and must replace relaxed MoE atomically for execution and prefix identity. Explicit STRIX_DS41_FAST_I4=1
-    // already displaces the profile-selected relaxed MoE.
-    {"moe_iu4", "STRIX_DS41_FAST_I4", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true, false}, {true, false, true, true}, "gguf-iu4-direct-v1", "0",
-     "pending: TURBO prefill timing over FAST and quality (KL / top-1 / dNLL vs BF16) for gguf-iu4-direct-v1; "
-     "automatic admission requires the request prefill regime and atomic replacement of relaxed MoE", false,
+    // are decoded inside the product, no pack). No profile selects it: on the pair prefill it is slower than the
+    // relaxed MoE it replaces (source below). Explicit STRIX_DS41_FAST_I4=1 displaces the profile-selected relaxed MoE.
+    {"moe_iu4", "STRIX_DS41_FAST_I4", "", {"", "", "", ""}, "0", strix::profile::Kind::bit_changing,
+     {true, false, true, false}, {true, false, true, true}, "", "0",
+     "explicit only: no profile selects gguf-iu4-direct-v1 (pair prefill 8,192 tokens over the resolved fast set: "
+     "4,975 ms FAST, 18,116 ms scope all, 15,110 ms scope gu; slower than FAST, no TURBO row)", false,
      {}, true, {}, {{{"0", "v1"}, {"1", "gguf-iu4-direct-v1"}}}},
     {"moe_iu4_scope", "STRIX_DS41_FAST_I4_SCOPE", "", {"", "", "", ""}, "", strix::profile::Kind::bit_changing,
      {}, {true, true, true, true}, "", "", "explicit IU4 projection scope: all (default) or gu", false, {}, true, {}, {{{"", "all-v1"}, {"all", "all-v1"}, {"gu", "gu-v1"}}}},
@@ -73,16 +77,38 @@ inline constexpr std::array<strix::profile::Lever, 14> profile_table{{
 }};
 
 inline constexpr std::string_view kFastGateD1 =
-    "FAST gate v2 D1, complete set without replay: 8K class 14 windows, 882 rows, final PASS "
-    "(KL 0.0116, top-1 0.962, dNLL -0.0072); 32K class 126 rows, provisional";
-inline constexpr strix::profile::FastGate fast_gates[] = {{"d1_prefill", "1", kFastGateD1}};
+    "FAST gate v2 D1, complete D1 set without replay, pair, prompts <= 8,192 and 32,768: 28 windows, 1,764 rows, final PASS "
+    "(KL 0.0093, top-1 0.972, dNLL -0.0037 se 0.0035, route flips 1.05 x null)";
+inline constexpr std::string_view kFastGateD1R =
+    "FAST gate v2 D1R, complete D1 set + decoder replay R=256, pair, prompts <= 8,192 and 32,768: 28 windows, 1,764 "
+    "rows, final PASS (KL 0.0101, top-1 0.972, dNLL +0.0001 se 0.0037, route flips 0.37 x null)";
+inline constexpr strix::profile::FastGate fast_gates[] = {{"d1_prefill", "1", kFastGateD1},
+                                                          {"decoder_replay", "256", kFastGateD1R}};
 
 inline constexpr strix::profile::LadderRow ladder_rows[] = {
+    // Band receipts (bind_band_receipts per request): the complete D1 composition and, on top of it, the bounded
+    // decoder replay R=256. Timed on the pair CLI (gfx1151, one request) at 8,192 and 32,768 prompt tokens; the quality
+    // arms at 8,128 gave the same direction (16.148 / 16.179 s EXACT, 12.564 / 12.695 s D1). Outside the bands, or
+    // when either rank declines, the request keeps the previous prefill route.
     {.lever = "d1_prefill", .value = "1", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
-     .device = "gfx1151", .min_context = 8128, .max_context = 8128, .min_lanes = 1, .max_lanes = 1,
-     .speedup = 16.179274 / 12.694894, .noise = 0.05,
-     .receipt = "D1 final 8K PASS. Pair quality-arm timings at 8128 were 16.148/16.179 s EXACT and 12.564/12.695 s D1. "
-                "single full prompt, no row split or cone, head64, chunk 1024. Other executions keep the previous route.",
+     .device = "gfx1151", .min_context = 4096, .max_context = 8192, .min_lanes = 1, .max_lanes = 1,
+     .speedup = 1614.0 / 1128.5, .noise = 0.05,
+     .receipt = "D1 final 8K PASS. Pair CLI 8,192 tokens: EXACT 1,128.5 tok/s, D1 1,614 / 1,647 tok/s (no replay).",
+     .band_bound = true},
+    {.lever = "d1_prefill", .value = "1", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
+     .device = "gfx1151", .min_context = 8193, .max_context = 32768, .min_lanes = 1, .max_lanes = 1,
+     .speedup = 1808.6 / 1257.2, .noise = 0.05,
+     .receipt = "D1 final 32K PASS. Pair CLI 32,768 tokens: EXACT 1,257.2 tok/s, D1 1,808.6 tok/s (no replay).",
+     .band_bound = true},
+    {.lever = "decoder_replay", .value = "256", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
+     .device = "gfx1151", .min_context = 4096, .max_context = 8192, .min_lanes = 1, .max_lanes = 1,
+     .speedup = 1855.0 / 1647.0, .noise = 0.05,
+     .receipt = "D1R final PASS. Pair CLI 8,192 tokens over D1: 1,614 / 1,647 tok/s without replay, 1,855 tok/s with R=256.",
+     .band_bound = true},
+    {.lever = "decoder_replay", .value = "256", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
+     .device = "gfx1151", .min_context = 8193, .max_context = 32768, .min_lanes = 1, .max_lanes = 1,
+     .speedup = 1981.0 / 1808.6, .noise = 0.05,
+     .receipt = "D1R final PASS. Pair CLI 32,768 tokens over D1: 1,808.6 tok/s without replay, 1,981 tok/s with R=256.",
      .band_bound = true},
 };
 

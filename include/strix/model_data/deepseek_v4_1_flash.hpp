@@ -91,7 +91,7 @@ inline constexpr std::string_view STRIX_DS41_EXPERT_TP_LAYOUT = "forms.tensor.ex
 } // namespace multi_device
 inline constexpr std::string_view name = "deepseek-v4.1-flash";
 namespace presets {
-inline constexpr std::string_view default_ = "exact";
+inline constexpr std::string_view default_ = "fast";
 namespace exact {
 inline constexpr std::string_view levers = "exact";
 } // namespace exact

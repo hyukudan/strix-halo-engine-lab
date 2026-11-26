@@ -218,14 +218,13 @@ const strix::profile::Resolution& profile_resolution() {
 std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::profile::Resolution& startup,
     const PrefillOptions& o, std::uint64_t prompt_tokens, std::string_view device_product, bool measured_reference) {
     namespace p = strix::profile;
-    // The quality-arm timing uses the same arithmetic as the gate. The native TTFT
-    // observation used row splitting, the exact cone and head1. It cannot widen this receipt.
+    // Both measured executions bind the band receipts: the pair CLI / serve request (row split, exact cone, head1) and
+    // the quality arms (no row split, no cone, head64). The execution key spells which one ran.
     if (!measured_reference || (!device_product.starts_with("gfx1151|") && !device_product.starts_with("gfx1151:")) ||
         device_product.find("|AMD Radeon 8060S Graphics|") == std::string_view::npos ||
-        o.world != 2U || !o.tp_attention || o.row_split || o.cone || o.expert_tp || o.stream_experts ||
-        o.layers != 40U || o.max_positions != 8192U || (o.max_rows != 0U && o.max_rows != 8192U) ||
-        o.chunk_rows != 1024U || o.window_rows != 8U || o.attention_lanes != 4U || o.moe_chunk_rows != 4096U ||
-        !o.engram_direct_io || o.draft_rows != 0U || o.quality_head_rows != 64U ||
+        o.world != 2U || !o.tp_attention || o.expert_tp || o.stream_experts || o.layers != 40U ||
+        prompt_tokens > o.max_positions || o.chunk_rows != 1024U || o.window_rows != 8U || o.attention_lanes != 4U ||
+        (o.moe_chunk_rows != 0U && o.moe_chunk_rows != 4096U) || !o.engram_direct_io || o.draft_rows != 0U ||
         o.fp16_dense || o.bf16_attention || o.fast_attention || o.fast_dense || o.fast_moe ||
         o.fast_engram || o.fast_shared || o.fast_moe_f16 || o.fast_i4 > 0 || o.null_ulp_layer >= 0 ||
         o.approx_layer_first != 0U || o.approx_layer_end != PrefillOptions{}.approx_layer_end ||
@@ -238,7 +237,9 @@ std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::p
 
     const auto execution = p::ladder_execution({"hip", device_product,
         {prompt_tokens, o.max_positions, 1U, o.chunk_rows, o.max_rows == 0U ? o.max_positions : o.max_rows},
-        "ds41-1017-q2,usb4-host-pair,ep,tp-attention,no-cone,head64,window8,attention-lanes4,moe-chunk-auto4096"});
+        "ds41-1017-q2,usb4-host-pair,ep,tp-attention," + std::string(o.row_split ? "row-split," : "no-row-split,") +
+            (o.cone ? "cone," : "no-cone,") + "head" + std::to_string(o.quality_head_rows) +
+            ",window8,attention-lanes4," + (o.moe_chunk_rows == 0U ? "moe-chunk-auto" : "moe-chunk-auto4096")});
     p::Inputs inputs;
     inputs.profile = startup.profile;
     inputs.env = [](const char*) -> const char* { return nullptr; };

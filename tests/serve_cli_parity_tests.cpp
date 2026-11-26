@@ -321,14 +321,17 @@ void ds41() {
         const auto result = pd::resolve_prefill_profile(*startup.profile, measured, prompt,
                                                        "gfx1151|AMD Radeon 8060S Graphics|fixture", true).value_or(*startup.profile);
         return sp::Config{{"d1_prefill", result.find("d1_prefill")->value},
+                          {"decoder_replay", result.find("decoder_replay")->value},
                           {"fingerprint", pr::hex_identity(result.fingerprint())}};
     };
-    for (const auto prompt : {8128U, 8193U, 32768U}) {
+    measured.max_positions = 32768;
+    for (const auto prompt : {4095U, 8128U, 8193U, 32768U, 32769U}) {
         const auto cli = request(pd::App::prefill, "0", prompt);
         const auto server = request(pd::App::serve, "1", prompt);
         gate("ds41+prompt+" + std::to_string(prompt), cli, server, {});
-        check(cli.at("d1_prefill") == (prompt == 8128U ? "1" : "0"),
-              "ds41: both ranks use D1 only for a measured prompt");
+        const bool banded = prompt >= 4096U && prompt <= 32768U;
+        check(cli.at("d1_prefill") == (banded ? "1" : "0") && cli.at("decoder_replay") == (banded ? "256" : "0"),
+              "ds41: both ranks use D1 + R256 only inside the measured bands");
     }
 
 }

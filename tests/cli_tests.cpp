@@ -270,9 +270,10 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
             require(turbo.requested == Name::turbo && turbo.levers == expected_levers,
                     "TURBO selects its backend override or the model's declared levers");
             if (entry.family == "deepseek41") {
-                require(turbo.levers == Name::turbo, "DeepSeek preset forwards TURBO to the native resolver");
-                require(implicit.requested == Name::standard && implicit.levers == Name::standard,
-                        "DeepSeek implicit preset keeps EXACT arithmetic");
+                require(turbo.requested == Name::turbo && turbo.levers == Name::turbo,
+                        "DeepSeek preset forwards TURBO to the native resolver");
+                require(implicit.requested == Name::fast && implicit.levers == Name::fast,
+                        "DeepSeek implicit preset is the FAST product default");
             }
             require(exact.kv != "fp8" && fast.kv != "fp8", "FP8 KV shadow is TURBO only");
             require((turbo.kv == "fp8") == (entry.family == "qwen35" && std::string_view(backend) == "cuda"),

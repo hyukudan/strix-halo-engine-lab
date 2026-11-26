@@ -457,6 +457,21 @@ void test_d1_request_profile() {
             const auto hit = resolve(8128, measured);
             const bool expect_d1 = std::string_view(tier) != "exact";
             check(hit.find("d1_prefill")->value == (expect_d1 ? "1" : "0"), "D1 matches the measured execution under FAST and TURBO");
+            check(hit.find("decoder_replay")->value == (expect_d1 ? "256" : "0"), "R256 rides on the measured D1 band");
+            // The pair CLI / serve request (row split, exact cone, head1, automatic MoE chunk) binds the same band rows.
+            ds::PrefillOptions native;
+            native.world = 2;
+            native.max_positions = 32768;
+            for (std::uint64_t prompt : {4096U, 8192U, 8193U, 32768U}) {
+                const auto cli = resolve(prompt, native);
+                check(cli.find("d1_prefill")->value == (expect_d1 ? "1" : "0") &&
+                          cli.find("decoder_replay")->value == (expect_d1 ? "256" : "0"),
+                      "CLI and serve requests in the 8K and 32K bands take D1 + R256 under FAST and TURBO");
+            }
+            for (std::uint64_t prompt : {4095U, 32769U})
+                check(resolve(prompt, native).find("d1_prefill")->value == "0" &&
+                          resolve(prompt, native).find("decoder_replay")->value == "0",
+                      "outside the measured bands the request keeps the previous route");
             if (expect_d1) {
                 const auto identity = hit.fingerprint();
                 check(pd::paired_d1(identity, identity) && !pd::paired_d1(identity, 0) &&
@@ -466,15 +481,15 @@ void test_d1_request_profile() {
             if (expect_d1)
                 check(hit.find("d1_prefill")->ladder.find("D1 final 8K PASS") != std::string::npos,
                       "D1 receipt comes from the shared ladder");
-            for (std::uint64_t prompt : {0U, 8127U, 8192U, 8193U, 32768U})
-                check(resolve(prompt, measured).find("d1_prefill")->value == "0", "D1 declines an unpriced prompt");
+            for (std::uint64_t prompt : {0U, 4095U, 8193U})
+                check(resolve(prompt, measured).find("d1_prefill")->value == "0",
+                      "D1 declines an unpriced prompt (8,193 exceeds the quality arms' 8,192 positions)");
             for (const auto change : {+[](ds::PrefillOptions& o) { o.fast_moe = true; },
                                      +[](ds::PrefillOptions& o) { o.decoder_replay_rows = 256; },
                                      +[](ds::PrefillOptions& o) { o.chunk_rows = 2048; },
                                      +[](ds::PrefillOptions& o) { o.attention_lanes = 2; },
                                      +[](ds::PrefillOptions& o) { o.world = 1; },
-                                     +[](ds::PrefillOptions& o) { o.row_split = true; },
-                                     +[](ds::PrefillOptions& o) { o.quality_head_rows = 1; }}) {
+                                     +[](ds::PrefillOptions& o) { o.moe_chunk_rows = 2048; }}) {
                 auto other = measured;
                 change(other);
                 check(resolve(8128, other).find("d1_prefill")->value == "0", "D1 requires measured shape and full composition");
@@ -530,11 +545,14 @@ void test_profile() {
         turbo_args.insert(turbo_args.end(), {"--profile", "turbo", "--allow-pending"});
         const auto turbo = w.run(app, turbo_args);
         const auto* i4 = turbo.profile->find("moe_iu4");
-        check(i4 && i4->status == pr::Status::pending && i4->value == "0",
-              "IU4 stays off under TURBO (even --allow-pending) without a measured prefill row over FAST");
+        check(i4 && i4->status == pr::Status::builtin && i4->value == "0",
+              "IU4 is not a TURBO row (measured slower than FAST), even with --allow-pending");
         const auto* replay = turbo.profile->find("decoder_replay");
-        check(replay && replay->requested == "256" && replay->value == "0" && replay->status == pr::Status::pending,
-              "R256 is identified and stays pending without a matched TURBO receipt");
+        check(replay && replay->value == "256" && replay->status == pr::Status::set,
+              "TURBO nests the FAST decoder replay R256 (qualified)");
+        const auto* fast_replay = f.profile->find("decoder_replay");
+        check(fast_replay && fast_replay->value == "256" && fast_replay->status == pr::Status::set,
+              "FAST selects decoder replay R256 (gate v2 D1R, qualified)");
         auto i4_world = w;
         i4_world.env["STRIX_DS41_FAST_I4"] = "1";
         for (const auto* profile : {"fast", "turbo"}) {
