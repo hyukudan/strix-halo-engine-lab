@@ -81,6 +81,7 @@ host_link = "integrated"
 unified = true
 measured = "memory_bytes"
 lowbit_rows = { small_rows = 64, wide_panels = 64 }
+legacy_hip_receipt_product = "AMD Radeon 8060S Graphics"
 note = "our nodes; memory_bytes = GPU-visible memory as configured there (depends on the GTT setting); HIP reports 20 compute units (WGPs); measured stream read about 243 GB/s; WMMA FP16 = BF16 = IU8 rate"
 
 [[profiles]]

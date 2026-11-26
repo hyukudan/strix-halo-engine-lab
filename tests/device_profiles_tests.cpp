@@ -65,6 +65,12 @@ void catalogue() {
     for (const char* n : {"rtx-pro-6000-blackwell-96", "rtx-5090-32", "rtx-5080-16", "rtx-4090-24", "strix-halo-128",
                           "dgx-spark-gb10-128", "rx-9070-xt-16", "custom"})
         require(device::find_profile(n) != nullptr, n);
+    require(device::hip_receipt_profile_matches("strix-halo-128", "gfx1151:xnack-|AMD Radeon 8060S Graphics|fixture"),
+            "legacy receipt accepts the recorded architecture and product");
+    require(!device::hip_receipt_profile_matches("strix-halo-128", "gfx1152|AMD Radeon 8060S Graphics|fixture") &&
+                !device::hip_receipt_profile_matches("strix-halo-128", "gfx1151|another product|AMD Radeon 8060S Graphics|fixture") &&
+                !device::hip_receipt_profile_matches("strix-halo-32cu", "gfx1151|AMD Radeon 8060S Graphics|fixture"),
+            "the receipt does not attach to another architecture, field or profile");
     const auto* p5090 = device::find_profile("rtx-5090-32");
     require(p5090->units == 170 && p5090->arch == "sm_120" && p5090->memory_bytes == 32607ULL * 1048576ULL, "5090 entry");
     require(device::find_profile("rtx-pro-6000-blackwell-96")->memory_bytes == kProBytes, "PRO memory is the measured total");
@@ -99,6 +105,7 @@ void catalogue() {
         expected.erase("name");
         // Internal admission metadata does not extend the v1 CLI export schema.
         expected.erase("unmeasured");
+        expected.erase("legacy_hip_receipt_product");
         require(device::catalogue().at(i).name == key, "catalogue order follows the data");
         require(std::get<Value::Table>(exported.at(key).data) == expected, "exported profile matches its data");
     }

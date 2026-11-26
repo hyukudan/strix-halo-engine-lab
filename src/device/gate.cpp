@@ -1,6 +1,7 @@
 #include "strix/device/gate.hpp"
 #include "strix/device/process_budget.hpp"
 #include "strix/device/profiles.hpp"
+#include "strix/hip/arch.hpp"
 #include "strix/r1_rows_tiles.hpp"
 
 #include <cctype>
@@ -100,17 +101,18 @@ std::string policy_denial(const Declaration& declaration, const Visible& v, cons
     return {};
 }
 
-Descriptor implicit_integrated(const Visible& v) {
+Descriptor implicit_device(const Visible& v) {
     Descriptor d;
-    d.id = "integrated";
+    d.id = v.integrated ? "integrated" : "generic";
     d.vendor = v.vendor;
     d.arch = v.arch;
     d.uuid = v.uuid;
     d.pci = v.pci;
     d.name = v.name;
     d.memory_bytes = v.memory_bytes;
-    d.attach.kind = "integrated";
-    d.roles = {"pair", "decode", "prefill"};
+    d.attach.kind = v.integrated ? "integrated" : "pcie";
+    d.roles = v.integrated ? std::vector<std::string>{"pair", "decode", "prefill"}
+                           : std::vector<std::string>{"decode", "replica"};
     return d;
 }
 
@@ -226,8 +228,19 @@ Bound resolve(const Declaration* declaration, const std::vector<Visible>& all, c
     if (visible.empty()) refuse("no " + vendor + " device is visible");
 
     if (!declaration) {
-        if (request.vendor == Vendor::amd && visible.size() == 1 && visible.front().integrated && request.select.empty())
-            return finish(Bound{implicit_integrated(visible.front()), visible.front(), "implicit", {}, {}, {}}, request);
+        if (request.profile == "generic-hip" && request.vendor == Vendor::amd && visible.size() == 1 &&
+            request.select.empty() && (request.ordinal < 0 || request.ordinal == visible.front().ordinal)) {
+            const auto& gpu = visible.front();
+            const auto why = hip::arch::launch_refusal(gpu.arch, gpu.wave_size, hip::arch::LaunchRequirement::Wave32);
+            if (!why.empty()) refuse("generic HIP admission on " + gpu.arch + ": " + std::string(why));
+            auto device = implicit_device(gpu);
+            if (!request.role.empty())
+                if (auto denied = role_refusal(device, request.role); !denied.empty()) refuse(denied);
+            return finish(Bound{std::move(device), gpu, "implicit", {}, {}, {}}, request);
+        }
+        if (request.vendor == Vendor::amd && visible.size() == 1 && visible.front().integrated && request.select.empty() &&
+            request.profile != "generic-hip")
+            return finish(Bound{implicit_device(visible.front()), visible.front(), "implicit", {}, {}, {}}, request);
         std::string list;
         for (const auto& v : visible) list += (list.empty() ? "" : "; ") + describe(v);
         refuse("no device declaration was found, so every " + vendor +
@@ -367,11 +380,18 @@ std::string units_text(const std::vector<Descriptor>& units) {
 std::string receipt_line(const Bound& bound) {
     const auto& d = bound.device;
     const auto& v = bound.visible;
+    std::string profile_note;
+    if (v.vendor == Vendor::amd && v.wave_size != 0) {
+        const auto& hardware = describe_hip_profile(v.arch, v.compute_units, v.integrated);
+        if (hardware.unmeasured)
+            profile_note = " hardware_profile=" + std::string(hardware.name) +
+                           " (unmeasured; no hardware tuning inferred)";
+    }
     return "device: id=" + d.id + " vendor=" + std::string(vendor_name(v.vendor)) + " uuid=" + shown_uuid(v.vendor, v.uuid) +
            " pci=" + (v.pci.empty() ? std::string("-") : v.pci) + " name=\"" + v.name + "\" arch=" + (v.arch.empty() ? std::string("-") : v.arch) +
            " ordinal=" + std::to_string(v.ordinal) + " attach=" + attach_text(d.attach) + " roles=" + roles_text(d) +
            " declared=" + bound.source + (bound.units.empty() ? std::string() : " units=" + units_text(bound.units)) +
-           budget_text(bound.budget);
+           budget_text(bound.budget) + profile_note;
 }
 
 namespace {

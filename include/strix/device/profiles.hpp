@@ -38,12 +38,19 @@ struct Profile {
     std::string_view note;
     LowBitRows lowbit_rows{};       // measured q4_g64 / q6_g64 FP16 group-scale schedule
     bool unmeasured = false;        // generic row: no measured schedule, capacity or rates
+    std::string_view legacy_hip_receipt_product{};  // product field of an existing receipt key
 };
 
 // The whole catalogue, in a fixed order. "custom" is the empty profile: every value comes from the entry.
 [[nodiscard]] const std::vector<Profile>& catalogue();
 // nullptr when unknown.
 [[nodiscard]] const Profile* find_profile(std::string_view name) noexcept;
+// Hardware description only. A match is independent of product branding and supplies no implicit budget or tuning.
+// An absent or ambiguous match resolves to the generic-hip row.
+[[nodiscard]] const Profile& describe_hip_profile(std::string_view arch, unsigned compute_units, bool integrated);
+// Matches the architecture and legacy product field for an existing qualification receipt.
+// A physical profile match alone confers no receipt or schedule.
+[[nodiscard]] bool hip_receipt_profile_matches(std::string_view profile, std::string_view cost_identity);
 // Comma-separated catalogue names, for refusals ("unknown profile x; known: a, b, ...").
 [[nodiscard]] std::string profile_names();
 // CLI export of the catalogue: one [profiles.<name>] table per entry.

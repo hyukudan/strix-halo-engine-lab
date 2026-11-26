@@ -27,7 +27,7 @@ add_library(strix_device STATIC
     ${CMAKE_CURRENT_LIST_DIR}/../src/device/process_topology.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../src/deploy/memory_plan.cpp)
 target_link_libraries(strix_device PUBLIC strix_model_description)
-target_include_directories(strix_device PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_include_directories(strix_device PUBLIC "${CMAKE_CURRENT_LIST_DIR}/../include" PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_compile_features(strix_device PUBLIC cxx_std_20)
 if(MSVC)
     target_compile_definitions(strix_device PRIVATE _CRT_SECURE_NO_WARNINGS)

@@ -122,6 +122,14 @@ resolution before adding overrides. `ON` means enabled; `auto` means enabled whe
 The [JSON catalog](optimizations.json) provides the same controls for tools; the [README](../README.md)
 is the compact overview, and [toggles](toggles.md) lists every switch by area. Run commands and agent instructions are in [AGENTS.md](../AGENTS.md).
 
+### Generic HIP device admission
+
+The shared HIP device gate accepts an explicit `--device-profile generic-hip` on an
+unambiguous AMD wave32 device. The catalogue hardware match never grants a budget or
+schedule by itself. Existing qualification decisions are still scoped to their receipt.
+The host fixture covers RDNA3, RDNA3.5, RDNA4, CDNA and unknown device descriptors.
+[Generic HIP devices](devices.md#generic-hip-admission)
+
 ### Unmeasured device catalogue entries
 
 The shared device catalogue provides planning identities for additional AMD, Intel and Apple GPU families.

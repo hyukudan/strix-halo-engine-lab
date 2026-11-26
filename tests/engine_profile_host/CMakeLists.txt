@@ -5,6 +5,7 @@ project(strix_profile_host_checks LANGUAGES CXX)
 # The full repository build and original engine gates remain separate requirements.
 include(CTest)
 get_filename_component(STRIX_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+include("${STRIX_ROOT}/cmake/StrixDevice.cmake")
 
 function(profile_host_test target)
     add_executable(${target} ${ARGN})
@@ -67,7 +68,9 @@ profile_host_test(strix-cluster-serve-cli-parity-tests "${STRIX_ROOT}/tests/serv
 unset(ARG_TEST_ARGS)
 # The DeepSeek prefix-cache piece plan lives with the host state cache closure (standalone adopter module).
 include("${STRIX_ROOT}/cmake/StrixStateCache.cmake")
-target_link_libraries(strix-cluster-serve-cli-parity-tests PRIVATE strix_state_cache)
+target_link_libraries(strix-cluster-serve-cli-parity-tests PRIVATE strix_state_cache strix_device)
+target_link_libraries(strix-deepseek41-pair-defaults-tests PRIVATE strix_device)
+target_link_libraries(strix-optimization-table PRIVATE strix_device)
 target_compile_definitions(strix-cluster-serve-cli-parity-tests PRIVATE
     STRIX_PARITY_GLM=1 STRIX_PARITY_MINIMAX=1 STRIX_PARITY_DS41=1)
 set_tests_properties(strix-cluster-serve-cli-parity-tests PROPERTIES

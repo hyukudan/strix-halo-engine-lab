@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/device/gate.hpp"
+#include "strix/hip/arch.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -39,6 +40,9 @@ public:
             if (const auto colon = v.arch.find(':'); colon != std::string::npos) v.arch.erase(colon);
             v.memory_bytes = p.totalGlobalMem;
             v.integrated = p.integrated != 0;
+            if (p.multiProcessorCount > 0)
+                v.compute_units = hip::arch::compute_units_from(v.arch, static_cast<unsigned>(p.multiProcessorCount));
+            if (p.warpSize > 0) v.wave_size = static_cast<unsigned>(p.warpSize);
             out.push_back(std::move(v));
         }
         return out;

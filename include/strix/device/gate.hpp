@@ -28,6 +28,8 @@ struct Visible {
     std::string arch; // "sm_120", "gfx1151"
     std::uint64_t memory_bytes = 0;
     bool integrated = false;
+    unsigned compute_units = 0; // physical CU count; 0 = not reported
+    unsigned wave_size = 0;     // native lane count; 0 = not reported
 };
 
 // Identity text from what the vendor runtimes report (16 raw UUID bytes; PCI domain/bus/device, function 0).
@@ -100,7 +102,8 @@ struct Verdict {
 [[nodiscard]] Verdict classify(const Declaration& declaration, const Visible& visible);
 
 // Pure decision. `declaration` is null when no file was found: every device is then undeclared, except that a lone
-// integrated AMD device keeps working (the behaviour before declarations existed).
+// integrated AMD device keeps working. With an explicit generic-hip profile a lone supported HIP device can
+// also bind without a declaration. The opt-in does not replace a declaration's identity or denial policies.
 [[nodiscard]] Bound resolve(const Declaration* declaration, const std::vector<Visible>& visible, const Request& request);
 
 // Where the declaration and the selection come from, outside the command line.

@@ -57,6 +57,22 @@ roles = ["replica"]
 Such an entry is *planned*: the planner sizes it and predicts its decode rate; the gate never binds it (each card a
 process runs on is still declared with its own identity). No catalogue card has NVLink, so `nvlink` is refused.
 
+## Generic HIP admission
+
+Use `--device-profile generic-hip` (or `STRIX_DEVICE_PROFILE=generic-hip`) to opt in to
+running on the only visible AMD GPU without a declaration when its runtime properties
+satisfy the wave32 contract. This setting supplies no memory cap, link rate, or measured
+schedule. The device receipt names the unmeasured physical profile when the device
+matches one, or the generic fallback if the properties do not match a catalogue row.
+Physical matching uses architecture, compute units and integration as reported by the
+runtime. Product names are only retained in legacy qualification receipt keys.
+
+Kernels still check the instruction and fragment layout they require. The wave32
+contract alone does not enable an RDNA3/RDNA3.5 WMMA kernel on RDNA4 or a wave32 kernel
+on CDNA. Select a declaration for multiple GPUs or an explicitly provisioned role.
+The HIP binder requires the selected card at local ordinal zero; use
+`HIP_VISIBLE_DEVICES` to expose it in that position.
+
 ## Which budget wins
 
 One resolver (`include/strix/device/budget.hpp`) serves every route, the CLI and the server alike:

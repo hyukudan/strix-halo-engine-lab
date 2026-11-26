@@ -7,6 +7,7 @@
 #include "strix/deepseek41_prefill.hpp"
 #include "strix/deepseek41_serve_cache_policy.hpp"
 #include "strix/ds41_prefill.hpp"
+#include "strix/device/profiles.hpp"
 #include "strix/host_memory.hpp"
 #include "strix/session/speculation_default.hpp"
 
@@ -247,8 +248,7 @@ std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::p
     namespace p = strix::profile;
     // Both measured executions bind the band receipts: the pair CLI / serve request (row split, exact cone, head1) and
     // the quality arms (no row split, no cone, head64). The execution key spells which one ran.
-    if (!measured_reference || (!device_product.starts_with("gfx1151|") && !device_product.starts_with("gfx1151:")) ||
-        device_product.find("|AMD Radeon 8060S Graphics|") == std::string_view::npos ||
+    if (!measured_reference || !device::hip_receipt_profile_matches("strix-halo-128", device_product) ||
         o.world != 2U || !o.tp_attention || o.expert_tp || o.stream_experts || o.layers != 40U ||
         prompt_tokens > o.max_positions || o.chunk_rows != 1024U || o.window_rows != 8U || o.attention_lanes != 4U ||
         (o.moe_chunk_rows != 0U && o.moe_chunk_rows != 4096U) || !o.engram_direct_io ||

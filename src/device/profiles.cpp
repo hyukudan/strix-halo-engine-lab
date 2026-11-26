@@ -1,6 +1,7 @@
 #include "strix/device/profiles.hpp"
 #include "strix/device/link_class.hpp"
 #include "strix/device/profiles_data.hpp"
+#include "strix/hip/arch.hpp"
 #include "strix/model_description.hpp"
 
 #include <iomanip>
@@ -54,11 +55,13 @@ Profile parse_profile(const Table& row) {
         profile.lowbit_rows = {unsigned_field<std::uint32_t>(lowbit, "small_rows"),
                                unsigned_field<std::uint32_t>(lowbit, "wide_panels")};
     }
+    if (row.contains("legacy_hip_receipt_product"))
+        profile.legacy_hip_receipt_product = field<std::string>(row, "legacy_hip_receipt_product");
     if (row.contains("unmeasured")) profile.unmeasured = field<bool>(row, "unmeasured");
     if (profile.unmeasured && (!profile.measured.empty() || profile.lowbit_rows.small_rows ||
                                profile.memory_bytes || profile.memory_gbytes_ps || profile.peaks.fp32 ||
                                profile.peaks.fp16 || profile.peaks.bf16 || profile.peaks.fp8 ||
-                               profile.peaks.fp4 || profile.peaks.int8))
+                               profile.peaks.fp4 || profile.peaks.int8 || !profile.legacy_hip_receipt_product.empty()))
         throw std::invalid_argument("device profiles: an unmeasured profile supplies hardware identity only");
     return profile;
 }
@@ -118,6 +121,39 @@ const Profile* find_profile(std::string_view name) noexcept {
     for (const auto& p : catalogue())
         if (p.name == name) return &p;
     return nullptr;
+}
+
+const Profile& describe_hip_profile(std::string_view arch, unsigned compute_units, bool integrated) {
+    arch = hip::arch::base_name(arch);
+    const Profile* match = nullptr;
+    if (!arch.empty()) {
+        for (const auto& profile : catalogue()) {
+            if (profile.vendor != "amd" || profile.arch != arch || profile.unified != integrated ||
+                (profile.units != 0U && profile.units != compute_units)) continue;
+            if (match != nullptr) {
+                match = nullptr;
+                break;
+            }
+            match = &profile;
+        }
+    }
+    if (match != nullptr) return *match;
+    const auto* generic = find_profile("generic-hip");
+    if (generic == nullptr || !generic->unmeasured)
+        throw std::invalid_argument("device profiles: missing the unmeasured generic-hip fallback");
+    return *generic;
+}
+
+bool hip_receipt_profile_matches(std::string_view name, std::string_view cost_identity) {
+    const auto* profile = find_profile(name);
+    if (profile == nullptr || profile->vendor != "amd" || profile->legacy_hip_receipt_product.empty()) return false;
+    const auto arch_end = cost_identity.find('|');
+    if (arch_end == std::string_view::npos ||
+        hip::arch::base_name(cost_identity.substr(0, arch_end)) != profile->arch) return false;
+    cost_identity.remove_prefix(arch_end + 1);
+    const auto product_end = cost_identity.find('|');
+    return product_end != std::string_view::npos &&
+           cost_identity.substr(0, product_end) == profile->legacy_hip_receipt_product;
 }
 
 std::string profile_names() {

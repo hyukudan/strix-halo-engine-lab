@@ -1,5 +1,7 @@
 #include "strix/device/gate.hpp"
 #include "strix/device/hip_gate.hpp"
+#include "strix/device/profiles.hpp"
+#include "strix/hip/arch.hpp"
 
 #include <cstdlib>
 #include <filesystem>
@@ -266,6 +268,74 @@ void gate() {
     require(resolve(&node, {igpu}, want(Vendor::amd, {}, -1, "prefill")).device.id == "igpu", "integrated prefill needs no rate");
 }
 
+void hip_profiles_and_admission() {
+    namespace arch = strix::hip::arch;
+    struct Case {
+        const char* arch;
+        unsigned reported_units;
+        unsigned wave;
+        bool integrated;
+        const char* profile;
+        bool wave32;
+        bool rdna3_layout;
+    };
+    constexpr Case cases[] = {
+        {"gfx1151:xnack-", 20, 32, true, "strix-halo-128", true, true},
+        {"gfx1151", 16, 32, true, "strix-halo-32cu", true, true},
+        {"gfx1151", 14, 32, true, "generic-hip", true, true},
+        {"gfx1150", 8, 32, true, "generic-hip", true, true},
+        {"gfx1152", 8, 32, true, "gorgon-gfx1152", true, true},
+        {"gfx1153", 4, 32, true, "gorgon-gfx1153", true, true},
+        {"gfx1100", 48, 32, false, "generic-hip", true, true},
+        {"gfx1101", 30, 32, false, "generic-hip", true, true},
+        {"gfx1102", 16, 32, false, "generic-hip", true, true},
+        {"gfx1103", 6, 32, true, "generic-hip", true, true},
+        {"gfx1200", 16, 32, false, "generic-hip", true, false},
+        {"gfx1201", 32, 32, false, "rx-9070-xt-16", true, false},
+        {"gfx1201", 28, 32, false, "generic-hip", true, false},
+        {"gfx942", 304, 64, false, "amd-gfx942", false, false},
+        {"gfx950", 256, 64, false, "amd-gfx950", false, false},
+        {"gfx11510", 20, 32, false, "generic-hip", false, false},
+        {"gfx1151", 20, 64, true, "strix-halo-128", false, false},
+        {"future-gpu", 32, 32, false, "generic-hip", false, false},
+    };
+    Request mode;
+    mode.profile = "generic-hip";
+    for (const auto& c : cases) {
+        auto gpu = amd(0, "03:00.0", c.integrated, c.arch);
+        gpu.name = "arbitrary runtime name";
+        gpu.compute_units = arch::compute_units_from(c.arch, c.reported_units);
+        gpu.wave_size = c.wave;
+        const auto& p = describe_hip_profile(gpu.arch, gpu.compute_units, gpu.integrated);
+        require(p.name == c.profile, c.arch);
+        require(arch::launch_refusal(gpu.arch, gpu.wave_size, arch::LaunchRequirement::Rdna3Layout).empty() ==
+                c.rdna3_layout, "RDNA3 fragment layout admission");
+        const auto try_bind = [&] { return resolve(nullptr, {gpu}, mode); };
+        if (c.wave32) {
+            const auto bound = try_bind();
+            require(!bound.budget.device_capped() && bound.device.lowbit_rows.small_rows == 0,
+                    "generic admission applies no sizing cap or measured schedule");
+            if (p.unmeasured)
+                require(receipt_line(bound).find("hardware_profile=" + std::string(p.name) + " (unmeasured") != std::string::npos,
+                        "receipt explains the unmeasured hardware profile");
+        } else {
+            rejects([&] { (void)try_bind(); }, "generic HIP admission", "unsupported capabilities refused");
+        }
+    }
+
+    auto discrete = amd(0, "03:00.0", false, "gfx1100");
+    discrete.wave_size = 32;
+    rejects([&] { (void)resolve(nullptr, {discrete}, Request{}); }, "no device declaration", "discrete default stays fail closed");
+    mode.ordinal = 1;
+    rejects([&] { (void)resolve(nullptr, {discrete}, mode); }, "no device declaration", "generic opt-in respects explicit ordinal");
+    mode.ordinal = -1;
+    rejects([&] { (void)resolve(nullptr, {discrete, amd(1, "04:00.0", false)}, mode); }, "no device declaration",
+            "generic opt-in refuses an ambiguous host");
+    const auto denied = parse_declaration("schema = \"strix-devices-v1\"\n[device_policies.no-gpu]\n"
+                                          "name_contains = \"radeon\"\nexcluded = true\n");
+    rejects([&] { (void)resolve(&denied, {discrete}, mode); }, "denied by policy", "generic opt-in cannot override an existing declaration");
+}
+
 void entry_points() {
     const auto path = (std::filesystem::temp_directory_path() / "strix-device-gate-tests.toml").string();
     {
@@ -485,6 +555,7 @@ int main() {
         listing();
         parser();
         gate();
+        hip_profiles_and_admission();
         entry_points();
         units();
         host_wait();

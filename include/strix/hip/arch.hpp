@@ -96,6 +96,15 @@ constexpr Family family_from_name(std::string_view name) {
     return Family::Unknown;
 }
 
+// HIP reports WGPs on RDNA and CUs on GCN/CDNA.
+constexpr unsigned compute_units_from(std::string_view arch, unsigned multiprocessors) {
+    if (arch.size() < 5U || !arch.starts_with("gfx")) return 0U;
+    const char major = arch[3];
+    if (major == '1' && (arch[4] == '0' || arch[4] == '1' || arch[4] == '2')) return 2U * multiprocessors;
+    if (major == '9') return multiprocessors;
+    return 0U;
+}
+
 enum class LaunchRequirement : std::uint8_t { Wave32, Rdna3Layout };
 
 // An empty reason admits the instruction and layout contract only.
