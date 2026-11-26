@@ -6619,15 +6619,15 @@ One-row callers of the residual bank readout and of a one-projection rounded nar
 
 ## Session row append: staged verify window programs
 
-**Engine:** `shared`. **Control:** backend member try_window_graph(chunk, work, taped); Inkling 2 Mini: STRIX_INKLING_WINDOW_PROGRAMS=1. **Default:** off (no backend replays a window by default: q53 measured a loss with it on).
+**Engine:** `shared`. **Control:** backend member try_window_graph(chunk, work, taped); Inkling 2 Mini: STRIX_INKLING_WINDOW_PROGRAMS=0 (off switch). **Default:** on for Inkling 2 Mini CUDA with the EXACT levers the fixture covers (every width captured at load when a drafter is loaded; prompts keep the window programs).
 
-A taped staged verify window is offered to the backend after its eager checkpoints; a backend may replay one captured program per window rows, else the work runs eagerly. Off by default: identity passes, but the drafter's acceptance collapses with the programs on (q53).
+A taped staged verify window is offered to the backend after its eager checkpoints; a backend may replay one captured program per window rows, else the work runs eagerly. Inkling 2 Mini CUDA captures every width at load (a drafter loaded) and keeps the programs across prompts, so no capture wall enters a timed decode.
 
 - **Shared home:** include/strix/session/kv_row_append.hpp, src/core/resident_greedy.hpp; src/inkling2 binding
 - **Tier and regime:** EXACT, FAST, QUALITY, TURBO; CUDA CLI speculative decode (verify windows)
 - **Exactness evidence:** EXACT verification: q52r device fixture (Inkling 2 Mini CUDA, programs vs eager windows) 42,525 items, 0 differing, programs ran at every width 2..8; q53: ids equal to the q46 resident run with the programs on. Host: tests/session_conv_tape_tests.cpp (offer after the checkpoints, accept == decline), strix-e2i-step-inputs-tests (window block valid mask).
-- **Off switch:** default off; STRIX_INKLING_WINDOW_PROGRAMS=1 turns the Inkling 2 Mini programs on for the EXACT levers the fixture covers (other profiles decline with the reason)
-- **Measured gain:** none measured: q53 (RTX PRO, code, CLI EXACT 256 tokens, programs on) 93.13 tok/s vs 132.80 with the programs off: the drafter's acceptance collapses (26/92, mean 1.3 vs 201/343, 3.94); cause open.
+- **Off switch:** STRIX_INKLING_WINDOW_PROGRAMS=0 runs every staged verify window eagerly; profiles the fixture does not cover decline with the reason
+- **Measured gain:** q62 (RTX PRO, Inkling 2 Mini CUDA CLI EXACT 256 tokens, --speculation auto, ids equal): code 170.81 / 169.28 tok/s with the programs vs 132.01 / 132.82 eager (+28.4 %, 8-row verify wall 35.51 -> 25.81 ms); prose 97.81 vs 99.41 eager (-1.6 %) with the widths captured inside the decode. The q53 / q60 collapses (4 / 6 model passes) were the capture walls closing the arbiter's probe episode: fixed in the shared arbiter (cold passes out of the episode) and removed at the source by the load-time capture; its confirm receipt: see the Inkling row.
 - **Preconditions:** a backend that defines try_window_graph; taped staged verify windows of 2..16 rows without score reads.
 
 | Model | Binding |
@@ -6637,7 +6637,7 @@ A taped staged verify window is offered to the backend after its eager checkpoin
 | DeepSeek V4.1 Flash | not bound: no backend defines try_window_graph; appends unchanged (eager) |
 | GLM 5.3 Flash | not bound: no backend defines try_window_graph; appends unchanged (eager) |
 | MiniMax M3.1 Flash | not bound: no backend defines try_window_graph; appends unchanged (eager) |
-| Inkling 2 Mini | bound (opt-in): CUDA resident decoder window programs; default off (q53) |
+| Inkling 2 Mini | bound: CUDA resident decoder window programs, default on (EXACT levers; q52r identity, q62 timing) |
 | Hy4 Flash | not bound: no backend defines try_window_graph; appends unchanged (eager) |
 | Nemotron 3.5 Bolt E4B | not bound: no backend defines try_window_graph; appends unchanged (eager) |
 
