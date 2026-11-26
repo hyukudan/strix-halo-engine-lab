@@ -13,9 +13,10 @@ namespace strix::spec {
 // A sampled RowRule decides every row with the serial draw at its position, so
 // the emitted ids are those of serial sampled decode with the same policy and
 // request identity; the target must support it (supports_row_rule(true)).
+// An optional RoundSink (not owned) sees every verify round after its commit (BlockSpeculator::set_round_sink).
 [[nodiscard]] SerialGreedyRequestResult execute_block_token_continuation(
     const SerialTokenContinuationRequest& request, std::span<const std::uint32_t> prompt,
     BlockDrafter& drafter, VerifyTarget& target, std::uint32_t max_rows,
-    const std::function<void(std::uint32_t)>& emit = {}, const RowRule& rule = {});
+    const std::function<void(std::uint32_t)>& emit = {}, const RowRule& rule = {}, RoundSink* sink = nullptr);
 
 }  // namespace strix::spec

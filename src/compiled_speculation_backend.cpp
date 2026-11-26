@@ -225,13 +225,14 @@ namespace strix::spec {
 SerialGreedyRequestResult execute_block_token_continuation(
     const SerialTokenContinuationRequest& request, std::span<const std::uint32_t> prompt,
     BlockDrafter& drafter, VerifyTarget& target, std::uint32_t max_rows,
-    const std::function<void(std::uint32_t)>& emit, const RowRule& rule) {
+    const std::function<void(std::uint32_t)>& emit, const RowRule& rule, RoundSink* sink) {
     if (max_rows == 0U || prompt.size() != request.start_position)
         throw std::invalid_argument("invalid block continuation frontier or row limit");
     if (rule.sampled() && !target.supports_row_rule(true))
         throw std::invalid_argument("block continuation: the verify target cannot decide sampled rows");
 
     BlockSpeculator speculator(drafter, target, rule);
+    speculator.set_round_sink(sink);
     std::vector<std::uint32_t> ready;
     std::size_t cursor{};
     bool started = false;

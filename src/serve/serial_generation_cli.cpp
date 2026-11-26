@@ -1,6 +1,7 @@
 #include "strix/serve/serial_generation_cli.hpp"
 
 #include "core/dense_linear.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/serial_request.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
@@ -315,6 +316,31 @@ TextInput read_text_input(const char* path) {
 
 std::string read_text(const char* path) { return read_text_input(path).text; }
 
+// Per-round diagnostic (STRIX_SPEC_ROUND_LOG=N; off by default): the first N verify rounds of a speculating run, one
+// stderr line each, written after the round's commit (spec::RoundSink): no effect on any decision or bit. Two runs that
+// should decide alike (e.g. an executor switched on and off) are compared line by line; the first differing line names
+// the round, and its fields what differs (source / window, drafts, the target's pick at every verified row, accepted).
+class RoundLog final : public spec::RoundSink {
+public:
+    RoundLog(std::ostream& out, std::uint32_t rounds) : out_(out), left_(rounds) {}
+    void round(const spec::RoundRecord& record) override {
+        if (left_ == 0U) return;
+        --left_;
+        out_ << "spec-round " << index_++ << " context " << record.context << " source "
+             << spec::source_name(record.source) << " rows " << record.rows << " accepted " << record.accepted
+             << " copy " << record.copy << " ext " << record.ext << " drafts";
+        for (const auto id : record.drafts) out_ << ' ' << id;
+        out_ << " picks";
+        for (const auto id : record.greedy) out_ << ' ' << id;
+        out_ << '\n';
+    }
+
+private:
+    std::ostream& out_;
+    std::uint32_t left_;
+    std::uint32_t index_ = 0;
+};
+
 }  // namespace
 
 // --messages with image parts: the shared media layer normalizes them (data URLs / base64 only: the CLI has no
@@ -604,8 +630,11 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
             cost_seeded = spec::seed_verify_costs(seeds, *drafter, max_rows);
             if (chain_k > 0U) (void)spec::seed_draft_costs(seeds, *drafter, chain_k);
         }
-        generated =spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit,
-                                                           row_rule);
+        std::optional<RoundLog> round_log;
+        if (const int rounds = envcfg::integer("STRIX_SPEC_ROUND_LOG", 0); rounds > 0)
+            round_log.emplace(std::cerr, static_cast<std::uint32_t>(rounds));
+        generated = spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit,
+                                                           row_rule, round_log ? &*round_log : nullptr);
     } else {
         generated = execute_serial_token_continuation(request, [&](std::uint32_t input, std::uint64_t position) {
             const auto selected = decoder->decode(input, logits);
