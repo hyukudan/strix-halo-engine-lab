@@ -313,29 +313,32 @@ struct OutputError {
 };
 
 inline OutputError output_error(const float* w, const float* wq, std::size_t n, std::size_t k, const std::vector<double>& h,
-                                unsigned threads = 1U) {
-    if (h.size() != k * k) throw std::invalid_argument("lowbit gptq: second moment size");
-    std::vector<double> err(n, 0.0), sig(n, 0.0);
-    detail::parallel_for(n, threads, [&](std::size_t c) {
-        const float* a = w + c * k;
-        const float* b = wq + c * k;
+                                unsigned threads = 1U, bool diagonal = false, std::size_t stride = 1U) {
+    if (h.size() != (diagonal ? k : k * k) || stride == 0U)
+        throw std::invalid_argument("lowbit gptq: second moment size or sampling stride");
+    const auto sampled = n / stride + (n % stride != 0U);
+    std::vector<double> err(sampled, 0.0), sig(sampled, 0.0);
+    detail::parallel_for(sampled, threads, [&](std::size_t c) {
+        const float* a = w + c * stride * k;
+        const float* b = wq + c * stride * k;
         double e = 0.0, s = 0.0;
         for (std::size_t i = 0; i < k; ++i) {
             const double di = static_cast<double>(b[i]) - a[i], wi = a[i];
-            const double* hi = h.data() + i * k;
+            const double* hi = h.data() + (diagonal ? i : i * k);
             double ed = 0.0, sd = 0.0;
-            for (std::size_t j = 0; j < i; ++j) {
+            for (std::size_t j = 0; j < (diagonal ? 0U : i); ++j) {
                 ed += hi[j] * (static_cast<double>(b[j]) - a[j]);
                 sd += hi[j] * a[j];
             }
-            e += di * (2.0 * ed + hi[i] * di);
-            s += wi * (2.0 * sd + hi[i] * wi);
+            const auto h_ii = hi[diagonal ? 0U : i];
+            e += di * (2.0 * ed + h_ii * di);
+            s += wi * (2.0 * sd + h_ii * wi);
         }
         err[c] = e;
         sig[c] = s;
     });
     OutputError total;
-    for (std::size_t c = 0; c < n; ++c) {
+    for (std::size_t c = 0; c < sampled; ++c) {
         total.error += err[c];
         total.signal += sig[c];
     }

@@ -8,6 +8,7 @@ struct MatrixLoadGeometry {
 };
 // Compact rank-two [N,K] image geometry for the shared BF16/Q8_0 loaders.
 Status matrix_load_geometry(FormatId, const Shape&, MatrixLoadGeometry&);
+Status strixpack_matrix_geometry(FormatId, const Shape&, MatrixLoadGeometry&);
 // Load a complete compact, little-endian BF16 matrix or transcode it into Q8_0.
 // The caller publishes the destination only on success. Conversion uses bounded
 // input staging, so the complete BF16 and Q8_0 images need not coexist in RAM.

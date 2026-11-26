@@ -28,10 +28,10 @@ per token do not change; only the codes and scales do.
   - Neither technique: the load-time bytes, bit for bit (host test).
 - `include/strix/weight/lowbit_pack.hpp`: the pack sidecar `strix-lowbit-pack/v2`. It is bound to the full SHA-256 of
   the checkpoint file it was coded from (the statistics depend on every tensor, packed or not) and each coded matrix to
-  the full SHA-256 of its BF16 source payload. Opening it for another checkpoint, or finding a matrix whose source bytes
+  the digest of its original matrix bytes, including the scale plane for a paired encoding. Opening it for another checkpoint, or finding a matrix whose source bytes
   differ anywhere, fails with `stale_source`; framing, bounds, the identity and the resident slices are read from one
   open file. `ResidentSlicePlan` loads a matrix it holds instead of converting it.
-- `tools/lowbit_calib_pack.cpp` (`strix-lowbit-calib-pack`): BF16 checkpoint + statistics in, pack out. It refuses
+- `tools/lowbit_calib_pack.cpp` (`strix-lowbit-calib-pack`): checkpoint matrices and optional calibration statistics in, pack out. It refuses
   statistics without provenance, and statistics that share a window or any run of 32 ids with a held-out gate manifest
   (`--heldout`, required, every manifest the qualification uses). The evaluation statistics (`--eval`) must carry
   provenance too and are held to the same rule against the held-out manifests and against the fit windows
@@ -47,6 +47,76 @@ per token do not change; only the codes and scales do.
   operands, one FP32 multiplier per 32-weight group, 2^base at the store), FP16 form only
   (`hip.sp4t.f16-group32-scale-chain@1`). Inkling 2 Mini binds it as the head arm `weights.head.sp4t@1`
   (`--qualify-decode-weights`, or the pending lever `STRIX_INK_LOWBIT_HEAD=sp4t`, command line only).
+
+## Host Strix packs for grouped experts
+
+`--model` accepts a single safetensors file, an indexed checkpoint directory, or its safetensors index JSON.
+The shared source binds rank-2 BF16 matrices, packed MXFP4 (`I8`, low nibble first, plus `F8_E8M0` per 32
+columns), and E4M3 FP8 with an F32 scale per 128×128 block. Paired scales use the matrix name plus
+`_scale_inv` and may be in another shard. Decoding produces FP32 using the shared weight codecs.
+
+- The checkpoint fingerprint is SHA-256 of the sole file, or SHA-256 of the literal
+  `strix-pack-sharded-checkpoint/v1` followed by the 32-byte SHA-256 of the manifest and the 32-byte SHA-256
+  of each complete shard in lexical filename order. A BF16 entry retains its payload SHA-256. Paired entries
+  hash the literal `strix-pack-source/v1`, one byte (`m` for MXFP4, `f` for FP8), then the 32-byte code hash and
+  the 32-byte scale hash. `--probe-source TENSOR` indexes the checkpoint and reads just the named matrix and
+  its scale plane, printing the decoded FP32 byte digest on a little-endian host.
+- `--technique rtn` can pack without calibration inputs. `--table fixed` keeps the existing `strix.sp4t@1`
+  output for SP4. Fitted SP4 and both SP3/SP2 table modes write `strix.sp4@1`, `strix.sp3@1` or
+  `strix.sp2@1` with the complete 16-byte header in each entry. Use `LowbitPack::open_host` for these host
+  storages. The grouped CPU projection consumes the expert-major plan and can mix bit widths in one call.
+  The model runtime requires its own explicit binding and a qualified device tile.
+- With `--out`, the writer stages the payload of each matrix into an adjacent file as it is coded and retains
+  only entry metadata. It publishes the completed sidecar to a new name through a hard link on the same
+  filesystem. `--report` and the diagnostic `--dequant-out` also take new paths. The dequant diagnostic
+  accumulates its selected BF16 output in memory. Use `--out` for whole-model work.
+
+### Layer moments and memory
+
+A capture binding can register the calibration windows once, declare the inputs for its current layer, and
+call `MomentSet::flush_layer(path)`. The write releases the layer's input buffers and invalidates its input
+handles. Replay the same windows or register more before capturing another layer. Pass one `--moments FILE`
+per layer to the packer, with `--eval FILE` in the same order if used. The packer opens one layer pair at a
+time, validates its provenance and checks all fit windows against all evaluation windows. Each selected
+tensor must occur once across the supplied layers. A full layer can be captured and packed separately if
+disk space limits the number of full moment files kept at once.
+
+Select `MomentLayout::diagonal` when capturing to write `strix-calib-moments/diagonal-v1`. It keeps the v4
+provenance and attribution records, followed by one FP32 value per column of each input. `importance`
+uses those entries for clipping and the printed output proxy uses a diagonal covariance. `feedback` and
+`both` require full fit moments. An evaluation file may independently use a diagonal proxy.
+
+Let `K_i` be the width of input `i` in the active layer, and `S_i = K_i` for diagonal storage or
+`K_i²` for full storage. Capturing bounds the FP64 moment arrays, including update scratch, by
+`8 × (sum S_i + max S_i)` bytes. Pass a byte limit to the `MomentSet` constructor to enforce that component.
+A fit/evaluation pair uses `8 × sum S_i` bytes across both files, enforced by `--moments-bytes N`.
+Serialization uses up to one additional `4 × max K_i` byte row. These bounds cover the moment values.
+Token ids, attribution, provenance, coder factors, worker scratch and one matrix's weights have separate
+storage. For 512 experts with two K=2048 inputs each, one diagonal fit layer uses 16 MiB of moment arrays
+with 16 KiB update scratch. Its on-disk diagonal payload is 8 MiB. Checkpoint headers and file handles are
+shared by all layers.
+
+### Pack plan
+
+`strix-lowbit-pack-plan --model-description FILE --budget-gib N --cold sp2|sp3|sp4` prints TSV columns
+`tensor`, `format` and `bytes` to stdout. The summary on stderr includes resident weight bytes and exit
+code 2 denotes an over-budget plan. `--reserve-gib N` reserves space for KV, activations and scratch.
+The plan accounts for resident matrix payloads. Sidecar framing and alignment are on-disk allocations.
+
+The JSON schema `strix-pack-model/v1` accepts optional `retained_bytes` for aggregate weight estimates,
+`retained` entries with `name` and `bytes` for individually listed source tensors, and `expert_groups`
+with `first_layer`, `layers`, `experts` and `projections`. Each projection declares `name` (with
+`{layer}` and `{expert}`), `rows` and logical `columns`. For a mixed plan, add measured `routes`
+triples `[layer, expert, count]` and pass `--cold sp2 --hot-experts N`. Candidates with positive counts
+are considered by count descending, then layer and expert ascending. A promotion to SP3 includes every
+projection of that expert and must fit under the remaining budget. Feed the TSV back to the packer with
+`--plan FILE` for exact tensor selection.
+
+The [ERNIE sizing description](../../examples/ernie-pack-description.json) uses 42 routed layers, 512
+experts per layer, three 2048×2048 matrices per expert, and an estimated 22.19 GB of retained weights.
+At 108 GiB, all SP2 uses 91.5 GiB and SP2 with 3,225 experts promoted to SP3 uses 96.3 GiB. The mixed
+footprint can be reproduced with synthetic positive route counts for any 3,225 experts. Actual selection
+requires a route capture. These are model weight estimates.
 
 ## Procedure
 

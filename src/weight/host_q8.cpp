@@ -47,12 +47,8 @@ public:
 };
 }
 
-Status matrix_load_geometry(FormatId storage, const Shape& shape, MatrixLoadGeometry& out) {
- if (is_strixpack_storage(storage))
-  return {Error::unsupported_arithmetic, "Strix pack storage " + serialize_id(storage) + " requires the Strix pack loader"};
- if (!(storage == kBf16WeightStorage) && !(storage == kQ8WeightStorage) && !(storage == kQ4G64WeightStorage) &&
-     !(storage == kQ6G64WeightStorage) && !(storage == kSP4TWeightStorage))
-  return {Error::unknown_format, "no compact BF16 matrix loader for requested storage"};
+namespace {
+Status matrix_geometry(FormatId storage, const Shape& shape, MatrixLoadGeometry& out) {
  if (shape.rank != 2 || !shape.dims[0] || !shape.dims[1])
   return {Error::unsupported_shape, "weight matrix requires nonempty [N,K]"};
  Geometry geometry{};
@@ -67,6 +63,23 @@ Status matrix_load_geometry(FormatId storage, const Shape& shape, MatrixLoadGeom
   return {Error::memory_budget, "weight matrix byte count overflow"};
  out = {row_bytes, shape.dims[0] * row_bytes};
  return {Error::ok, {}};
+}
+
+}  // namespace
+
+Status matrix_load_geometry(FormatId storage, const Shape& shape, MatrixLoadGeometry& out) {
+ if (is_strixpack_storage(storage))
+  return {Error::unsupported_arithmetic, "Strix pack storage " + serialize_id(storage) + " requires the Strix pack loader"};
+ if (!(storage == kBf16WeightStorage) && !(storage == kQ8WeightStorage) && !(storage == kQ4G64WeightStorage) &&
+     !(storage == kQ6G64WeightStorage) && !(storage == kSP4TWeightStorage))
+  return {Error::unknown_format, "no compact BF16 matrix loader for requested storage"};
+ return matrix_geometry(storage, shape, out);
+}
+
+Status strixpack_matrix_geometry(FormatId storage, const Shape& shape, MatrixLoadGeometry& out) {
+ if (!is_strixpack_storage(storage))
+  return {Error::unknown_format, "expected SP2, SP3 or SP4 storage"};
+ return matrix_geometry(storage, shape, out);
 }
 
 namespace {
