@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
 #include <random>
 #include <system_error>
@@ -20,6 +21,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <fcntl.h>
 #include <io.h>
 #include <process.h>
 #else
@@ -35,8 +37,20 @@ constexpr std::string_view magic="strix-cost-table";
 
 std::FILE* open_file(const std::filesystem::path& path,bool write) {
 #ifdef _WIN32
+    if(!write) {
+        // Share delete: a concurrent store replaces the file (MoveFileExW) while an unlocked load still reads it; a
+        // reader opened without it makes that replacement fail and the store lose its entries.
+        const HANDLE h=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,
+            OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+        if(h==INVALID_HANDLE_VALUE) return nullptr;
+        const int fd=_open_osfhandle(reinterpret_cast<intptr_t>(h),_O_RDONLY|_O_BINARY);
+        if(fd<0) {CloseHandle(h);return nullptr;}
+        std::FILE* f=_fdopen(fd,"rb");
+        if(!f) _close(fd);
+        return f;
+    }
     std::FILE* f=nullptr;
-    return _wfopen_s(&f,path.c_str(),write?L"wb":L"rb")==0?f:nullptr;
+    return _wfopen_s(&f,path.c_str(),L"wb")==0?f:nullptr;
 #else
     return std::fopen(path.c_str(),write?"wb":"rb");
 #endif
