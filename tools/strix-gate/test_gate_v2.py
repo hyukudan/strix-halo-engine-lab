@@ -260,7 +260,7 @@ class Statistics(unittest.TestCase):
         self.assertEqual(p["state"], "PASS")
 
     def test_reference_check_holds(self):
-        base = [window(f"b{i}", 256, 0.005, 0.97, 0.0, 0.004, self.rng) for i in range(4)]
+        base = [window(f"b{i}", 256, 0.005, 0.97, 0.0, 0.004, self.rng, null_dnll=0.0) for i in range(4)]
         # the lever beats the exact reference by ~10 se on the true text, no null NLL: HOLD, never PASS
         w = window("sus", 63, 0.005, 0.97, -0.19, 0.004, self.rng, scale=0.157)
         self.assertTrue(w["reference_suspect"])
@@ -271,6 +271,15 @@ class Statistics(unittest.TestCase):
         self.assertFalse(w["reference_suspect"])
         self.assertIn("null dNLL -0.19000", v2.window_line(w))
         self.assertEqual(v2.verdict(base + [w])["state"], "PASS")
+
+    def test_final_class_reference_check_holds(self):
+        windows = [window(f"p{i}", 63, 0.005, 0.97, -0.02, 0.004, self.rng, scale=0.10,
+                          null_dnll=0.0, null_scale=0.0, cls="prose") for i in range(13)]
+        self.assertFalse(any(w["reference_suspect"] for w in windows))
+        result = v2.verdict(windows)
+        self.assertEqual(result["state"], "HOLD")
+        self.assertEqual(result["reference_suspect_classes"], ["prose"])
+        self.assertIn("reference suspect class prose", v2.pooled_line(result))
 
     def test_se_capped_by_the_null(self):
         # row se 0.0198 but the null's se on the same window is 0.005: the dNLL limit uses 1.5 x 0.005

@@ -19,7 +19,7 @@ that the reference's own chaos is not charged to the lever:
      default one class, or the prompt-length band with a manifest) are pooled and judged by the same rule; a class
      verdict is final on >= 800 rows. The pooled top-1 and dNLL limits stay absolute (>= 800 rows pooled).
   R3 dNLL on held-out ids (labels that neither arm generated), at least 800 scored rows pooled, standard error shown.
-  R4 reference check: a window where the candidate beats the exact reference by more than 3 se (and, with a null, the
+  R4 reference check: a window or final class where the candidate beats the exact reference by more than 3 se (and, with a null, the
      candidate-minus-null difference is also below -3 se) is "reference suspect"; a window whose reference NLL is far
      above the others (> max(3 x median, median + 2 nats), >= 3 windows) is "off-distribution" (control or
      chat-template ids, a timing prompt). Either makes the verdict HOLD, never PASS.
@@ -280,6 +280,7 @@ def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False):
             w["cleared_by_class"] = w["class"] in final_pass
     pooled["off_distribution"] = off_distribution(windows, limits)
     pooled["reference_suspect"] = [w["name"] for w in windows if w["reference_suspect"]]
+    pooled["reference_suspect_classes"] = [c["name"] for c in pooled["classes"] if c["final"] and c["reference_suspect"]]
     pooled["unresolved"] = sorted({w["class"] for w in windows if w["state"] == "unresolved" and not w["cleared_by_class"]} |
                                   {c["name"] for c in pooled["classes"] if c["state"] == "unresolved" or not c["final"]})
     if flips is not None:
@@ -293,7 +294,7 @@ def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False):
     pooled["checks"] = checks
     if not all(checks.values()):
         pooled["state"] = "FAIL"
-    elif pooled["reference_suspect"] or pooled["off_distribution"]:
+    elif pooled["reference_suspect"] or pooled["reference_suspect_classes"] or pooled["off_distribution"]:
         pooled["state"] = "HOLD"     # never PASS: the exact path is examined on those windows first
     elif pooled["unresolved"]:
         pooled["state"] = "UNRESOLVED"   # provisional: the lever stays opt-in for these classes
@@ -421,9 +422,10 @@ def _state_text(x):
 
 
 def class_line(c):
+    flag = " [reference_suspect]" if c["reference_suspect"] else ""
     return (f"class {c['name']}: windows {len(c['windows'])} rows {c['rows']} ({'final' if c['final'] else 'provisional'}, "
             f">= {LIMITS['min_rows']}) KL {c['kl']:.5f} top-1 {c['top1']:.4f} (fail < {c['top1_limit']:.4f}) dNLL "
-            f"{c['dnll']:+.5f} se {c['dnll_se']:.5f} (fail > {c['dnll_limit']:+.5f}) -> {_state_text(c)}")
+            f"{c['dnll']:+.5f} se {c['dnll_se']:.5f} (fail > {c['dnll_limit']:+.5f}) -> {_state_text(c)}{flag}")
 
 
 def pooled_line(p, limits=LIMITS):
@@ -436,6 +438,7 @@ def pooled_line(p, limits=LIMITS):
     why = {"FAIL": ",".join(bad), "UNRESOLVED": "classes " + ",".join(p.get("unresolved", [])) + " (provisional: opt-in there)",
            "HOLD": "; ".join(x for x in (
                ("reference suspect " + ",".join(p.get("reference_suspect", []))) if p.get("reference_suspect") else "",
+               ("reference suspect class " + ",".join(p["reference_suspect_classes"])) if p.get("reference_suspect_classes") else "",
                ("off-distribution reference " + ",".join(p.get("off_distribution", []))) if p.get("off_distribution") else "")
                if x) + " (examine the exact path on those windows, then re-run)", "PASS": ""}[p["state"]]
     lines = [class_line(c) for c in p.get("classes", [])]
@@ -759,7 +762,8 @@ def r4_assessment(path, windows, pooled, manifest, limits):
 
     failed = any(not ok for k, ok in pooled["checks"].items() if k != "classes") or any(
         c["state"] == "fail" for c in (*content.values(), *bands.values()))
-    state = ("FAIL" if failed else "HOLD" if flagged or pooled["reference_suspect"]
+    suspect_class = any(c["final"] and c["reference_suspect"] for c in (*content.values(), *bands.values()))
+    state = ("FAIL" if failed else "HOLD" if flagged or pooled["reference_suspect"] or suspect_class
              else "UNRESOLVED" if unresolved else "PASS")
     return [*lines, f"frozen-bar assessment would be {state}"]
 
