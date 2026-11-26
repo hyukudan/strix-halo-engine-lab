@@ -211,6 +211,11 @@ public:
         f.read(h.data(), static_cast<std::streamsize>(n));
         if (!f) throw std::runtime_error("h3 lora: truncated header in " + path);
         data0_ = 8U + n;
+        f.seekg(0, std::ios::end);
+        const std::streamoff file_size = f.tellg();
+        if (!f || file_size < 0 || static_cast<std::uint64_t>(file_size) < data0_)
+            throw std::runtime_error("h3 lora: cannot size " + path);
+        const std::uint64_t data_bytes = static_cast<std::uint64_t>(file_size) - data0_;
         const detail::Json j = detail::JsonParser(h).parse();
         if (j.kind != detail::Json::kObj) throw std::runtime_error("h3 lora: header is not an object");
         bool any_prefixed = false, any_plain = false;
@@ -225,10 +230,18 @@ public:
             const detail::Json* of = kv.second.get("data_offsets");
             if (!dt || !sh || !of || of->arr.size() != 2) throw std::runtime_error("h3 lora: bad tensor entry " + kv.first);
             t.dtype = dt->str;
-            for (const auto& d : sh->arr) t.shape.push_back(detail::lora_extent(d, kv.first));
+            std::uint64_t elements = 1;
+            for (const auto& d : sh->arr) {
+                t.shape.push_back(detail::lora_extent(d, kv.first));
+                const std::uint64_t e = t.shape.back();
+                if (e != 0 && elements > UINT64_MAX / e) throw std::runtime_error("h3 lora: shape of " + kv.first + " overflows");
+                elements *= e;
+            }
             t.begin = detail::lora_extent(of->arr[0], kv.first);
             t.end = detail::lora_extent(of->arr[1], kv.first);
             if (t.end < t.begin) throw std::runtime_error("h3 lora: reversed data_offsets of " + kv.first);
+            // read() allocates end - begin bytes: the extent must lie inside the file before anything is allocated
+            if (t.end > data_bytes) throw std::runtime_error("h3 lora: data_offsets of " + kv.first + " past the end of " + path);
             (kv.first.rfind(kPrefix, 0) == 0 ? any_prefixed : any_plain) = true;
             tensors_[kv.first] = t;
         }

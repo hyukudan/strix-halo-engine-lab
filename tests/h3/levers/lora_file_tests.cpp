@@ -69,7 +69,8 @@ template <class F> bool throws(F f) {
     return false;
 }
 
-// Malformed headers are refused while parsing: deep nesting, negative / fractional / reversed extents.
+// Malformed headers are refused while parsing: deep nesting, negative / fractional / reversed extents, an extent past
+// the end of the file (2 data bytes here) and a shape whose element count overflows.
 void test_malformed_headers() {
     const std::string p = (std::filesystem::temp_directory_path() / "h3_lora_file_bad.safetensors").string();
     const std::string headers[] = {
@@ -79,6 +80,9 @@ void test_malformed_headers() {
         R"({"m.lora_B.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"m.lora_A.weight":{"dtype":"BF16","shape":[1],"data_offsets":[-2,0]}})",
         R"({"m.lora_B.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"m.lora_A.weight":{"dtype":"BF16","shape":[1],"data_offsets":[2,0]}})",
         R"({"m.lora_B.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"m.lora_A.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,1e300]}})",
+        R"({"m.lora_B.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"m.lora_A.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,4503599627370496]}})",
+        R"({"m.lora_B.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,4]},"m.lora_A.weight":{"dtype":"BF16","shape":[1],"data_offsets":[2,4]}})",
+        R"({"m.lora_B.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"m.lora_A.weight":{"dtype":"BF16","shape":[4294967296,4294967296],"data_offsets":[0,0]}})",
     };
     for (const auto& h : headers) {
         {
