@@ -492,7 +492,11 @@ def stop_on_signal(number, _frame):
 
 
 def main(argv, kit, id_hash, sha):
+    if argv and argv[0] == 'band-edges':
+        import band_edges
+        return band_edges.main(argv[1:], kit, id_hash, sys.modules[__name__])
     parser = argparse.ArgumentParser(prog='bench.sh campaign')
+    parser.epilog = 'Use band-edges plan, sample or report for ladder timing.'
     actions = parser.add_subparsers(dest='action', required=True)
     default = actions.add_parser('default')
     default.add_argument('--dry-run', action='store_true')

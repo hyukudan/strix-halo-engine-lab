@@ -458,16 +458,21 @@ void test_d1_request_profile() {
             const auto hit = resolve(8128, measured);
             const bool expect_d1 = std::string_view(tier) != "exact";
             check(hit.find("d1_prefill")->value == (expect_d1 ? "1" : "0"), "D1 matches the measured execution under FAST and TURBO");
-            check(hit.find("decoder_replay")->value == (expect_d1 ? "256" : "0"), "R256 rides on the measured D1 band");
+            check(hit.find("decoder_replay")->value == "0", "the 8,128-token D1 timing does not qualify replay");
             // The pair CLI / serve request (row split, exact cone, head1, automatic MoE chunk) binds the same band rows.
             ds::PrefillOptions native;
             native.world = 2;
             native.max_positions = 32768;
-            for (std::uint64_t prompt : {4096U, 8192U, 8193U, 32768U}) {
+            for (std::uint64_t prompt : {4096U, 8127U, 8128U, 8191U, 8192U, 8193U, 32767U, 32768U}) {
                 const auto cli = resolve(prompt, native);
-                check(cli.find("d1_prefill")->value == (expect_d1 ? "1" : "0") &&
-                          cli.find("decoder_replay")->value == (expect_d1 ? "256" : "0"),
-                      "CLI and serve requests in the 8K and 32K bands take D1 + R256 under FAST and TURBO");
+                const bool d1 = expect_d1 && ((prompt >= 8128U && prompt <= 8192U) || prompt == 32768U);
+                const bool replay = expect_d1 && (prompt == 8192U || prompt == 32768U);
+                check(cli.find("d1_prefill")->value == (d1 ? "1" : "0") &&
+                          cli.find("decoder_replay")->value == (replay ? "256" : "0"),
+                      "CLI and serve requests admit D1 and R256 at their own measured floors");
+                if (replay)
+                    check(cli.find("decoder_replay")->ladder_reference.find("d1_prefill=1{ds41-prefill-d1-v1}") != std::string::npos,
+                          "R256 is measured over the complete D1 execution");
             }
             for (std::uint64_t prompt : {4095U, 32769U})
                 check(resolve(prompt, native).find("d1_prefill")->value == "0" &&

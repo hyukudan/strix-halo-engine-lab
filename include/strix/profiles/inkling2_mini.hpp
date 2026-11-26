@@ -300,10 +300,12 @@ inline constexpr std::string_view kMiniIu4PrefillReceipt =
 inline constexpr std::array<profile::LadderRow, 2> kMiniLadder{{
     {.lever = kMiniMoeW4a4, .value = "iu4", .tier = profile::Name::turbo, .phase = profile::Phase::prefill,
      .device = "gfx1151", .min_context = 4307, .max_context = 8236, .min_lanes = 1, .max_lanes = 1,
-     .speedup = 1.091, .noise = 0.01, .receipt = kMiniIu4PrefillReceipt, .band_bound = true},
+     .speedup = 1.091, .noise = 0.01, .receipt = kMiniIu4PrefillReceipt, .band_bound = true,
+     .band_evidence = {{4307, 4309, 8234, 8236}, {}, "Gate v2 prefill, 16 replayed prose windows, 1,008 scored rows; prompt lengths unspecified."}},
     {.lever = kMiniMoeW4a4, .value = "iu4", .tier = profile::Name::turbo, .phase = profile::Phase::prefill,
      .device = "gfx1151", .min_context = 8237, .max_context = 32760, .min_lanes = 1, .max_lanes = 1,
-     .speedup = 1.068, .noise = 0.01, .receipt = kMiniIu4PrefillReceipt, .band_bound = true},
+     .speedup = 1.068, .noise = 0.01, .receipt = kMiniIu4PrefillReceipt, .band_bound = true,
+     .band_evidence = {{8234, 8236, 32758, 32760}, {}, "Gate v2 prefill, 16 replayed prose windows, 1,008 scored rows; prompt lengths unspecified."}},
 }};
 
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.

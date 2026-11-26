@@ -98,15 +98,16 @@ inline constexpr std::string_view kTime2k = "qwen_night-tim-c1-2k8k 2,048: EXACT
 inline constexpr std::string_view kTime8k = "qwen_night-tim-c1-2k8k 8,192: EXACT-64 67.60 s, wide-512 12.93 s";
 inline constexpr std::string_view kTime24k = "qwen_night-tim-c2-24k(-exact) 24,576: EXACT-64 534.39 s, wide-512 45.43 s";
 [[nodiscard]] inline constexpr sp::LadderRow band_row(std::string_view lever, std::string_view value, std::uint64_t lo,
-                                                     std::uint64_t hi, double speedup, std::string_view receipt) {
+                                                     std::uint64_t hi, double speedup, std::string_view receipt,
+                                                     sp::BandEvidence evidence) {
     return {.lever = lever, .value = value, .tier = sp::Name::fast, .phase = sp::Phase::prefill, .device = "gfx1151",
             .min_context = lo, .max_context = hi, .min_lanes = 1, .max_lanes = 1, .speedup = speedup, .noise = kNoise,
-            .receipt = receipt, .band_bound = true};
+            .receipt = receipt, .band_bound = true, .band_evidence = evidence};
 }
 inline constexpr sp::LadderRow kBandRows[] = {
-    band_row("wide_rows", "512", 1, 2048, kWide2k, kTime2k),
-    band_row("wide_rows", "512", 2049, 8192, kWide8k, kTime8k),
-    band_row("wide_rows", "512", 8193, 24576, kWide24k, kTime24k),
+    band_row("wide_rows", "512", 1, 2048, kWide2k, kTime2k, {{2048}, {2048}, kGate2k, true}),
+    band_row("wide_rows", "512", 2049, 8192, kWide8k, kTime8k, {{8192}, {8192}, kGate8k, true}),
+    band_row("wide_rows", "512", 8193, 24576, kWide24k, kTime24k, {{24576}, {24064, 24576}, kGate24k, true}),
 };
 
 [[nodiscard]] inline const Qualified* qualification(std::string_view lever, std::string_view value,

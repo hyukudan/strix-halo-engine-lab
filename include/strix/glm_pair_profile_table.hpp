@@ -83,7 +83,8 @@ inline constexpr std::uint64_t kPrefillProbePrompt = 8192;
 inline constexpr strix::profile::LadderRow product_ladder_rows[] = {
     {"pf_wmma", "1", strix::profile::Name::turbo, strix::profile::Phase::prefill, kTurboPrefillDevice,
      31258, 31258, 1, 1, 1.54, 0.10, "GLM pair 32K TURBO vs FAST, docs/models/glm-5.3/README.md",
-     false, {}, {}, STRIX_GLM_TURBO_ARM("31258")},
+     false, {}, {}, STRIX_GLM_TURBO_ARM("31258"), {}, false,
+     {{31258}, {}, "The TURBO quality citation is 8K, 512 scored rows (exact prompt length unspecified); no 32K gate cited."}},
     // FAST band receipt (LadderRow::band_bound: bound per run to its own reference by profile::bind_band_receipts, so it
     // decides only a known pair execution). Band: the gate windows are 8,192 tokens; the 8K band below them follows the
     // shared band convention (2,049..8,192). Prompts of 2,048 or fewer tokens and above 8,192 keep the exact prefill
@@ -94,7 +95,7 @@ inline constexpr strix::profile::LadderRow product_ladder_rows[] = {
      .device = kTurboPrefillDevice, .min_context = 2049, .max_context = 8192, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1.50, .noise = 0.10,
      .receipt = "GLM pair 8K FAST bundle vs EXACT cores (gate v2 8K route replay PASS), docs/optimizations.md#glm-pf-wmma-x",
-     .band_bound = true}};
+     .band_bound = true, .band_evidence = {{8192}, {8192}, kFastGatePfWmma, true}}};
 #undef STRIX_GLM_TURBO_ARM
 inline const strix::profile::Engine product_profile_engine{"glm-pair", "", product_profile_table, false, "glm-turbo-v1",
                                                            {}, {}, product_ladder_rows};

@@ -258,7 +258,7 @@ void defects() {
 // its cell must be eligible and judged over exactly the reference the row names; an entry alone proves nothing (a cell
 // whose column admission is off has an entry with no judgment).
 std::string shipped_row_defect(const p::Engine& engine, const p::LadderRow& row) {
-    const auto actual = resolve(engine, row.tier, {row.phase, row.min_context, row.min_lanes, row.device,
+    const auto actual = resolve(engine, row.tier, {row.phase, p::ladder_min_context(row), row.min_lanes, row.device,
                                                    row.band_bound ? p::kBandProbeExecution : p::ladder_reference_execution(row.over)});
     const auto* entry = actual.find(row.lever);
     if (entry == nullptr) return "no entry for the lever";
@@ -1676,6 +1676,34 @@ void minimax_i4_binding() {
 
 }  // namespace
 
+void band_lower_edge() {
+    p::LadderRow band{kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1024, 8192, 1, 1, 1.25, 0.02,
+                      "r/floor"};
+    band.band_bound = true;
+    band.band_evidence.timed = {8192, 4096};
+    std::array rows{band};
+    const p::Engine engine{"edge-test", "", kRows, false, "edge-test-v1", {}, {}, rows};
+    require(!p::ladder_defect(engine).empty(), "an untimed lower edge cannot be presented as proven");
+    rows[0].band_evidence.lower_edge_unproven = true;
+    require(p::ladder_defect(engine).empty(), "a marked edge with a timed in-band floor is valid");
+    for (const auto tier : {p::Name::fast, p::Name::turbo}) {
+        for (const auto prompt : {1024ULL, 4095ULL, 4096ULL, 8192ULL, 8193ULL}) {
+            const auto actual = resolve(engine, tier, {p::Phase::prefill, prompt, 1, "dev", kExec});
+            require(actual.find(kLever)->value == (prompt >= 4096 && prompt <= 8192 ? "a8" : "off"),
+                    "a narrowed band binds only between the first in-band timing and the upper edge");
+        }
+    }
+    rows[0].band_evidence.timed = {800, 8193};
+    require(!p::ladder_defect(engine).empty(), "an unproven edge requires a timing in the declared band");
+    rows[0].band_evidence = {{1021}, {}, {}};
+    require(p::ladder_defect(engine).empty(), "the same prompt within the token-count tolerance covers the edge");
+    rows[0].band_evidence.timed[0] = 1020;
+    require(!p::ladder_defect(engine).empty(), "the rounding tolerance is bounded");
+    rows[0].band_evidence.timed = {};
+    rows[0].band_evidence.gated = {1024};
+    require(!p::ladder_defect(engine).empty(), "quality gate lengths do not count as timing receipts");
+}
+
 // Band receipts along a chain: the second lever's band row binds over the cell the first lever's band row admits
 // (bind + arms repeated until the references settle), so both cells of a measured chain run inside their bands.
 void band_chain() {
@@ -1688,6 +1716,7 @@ void band_chain() {
     const auto band = [](std::string_view lever, std::string_view value, double speedup) {
         p::LadderRow row{lever, value, p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, speedup, 0.02, "r/band"};
         row.band_bound = true;
+        row.band_evidence = {{1}, {}, {}};
         return row;
     };
     const std::array rows{band("chain-window@1", "w", 1.5), band("chain-layers@1", "l", 1.1)};
@@ -1722,6 +1751,7 @@ int main(int argc, char** argv) try {
                      {p::Phase::decode, 16384U, 1, "gfx1151", kExec});
     verdicts();
     band_chain();
+    band_lower_edge();
     bound_evidence();
     defects();
     shipped_rows();

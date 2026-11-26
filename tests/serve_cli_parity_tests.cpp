@@ -131,9 +131,8 @@ void glm() {
         }
         gate("glm", values(sp::from_lines(rd::print(cli))), values(sp::from_lines(rd::print(server))), allowed);
     }
-    // The measured pair executions and each unmatched axis use the same product resolver: the TURBO literal rows
-    // (8,108 / 31,258 tokens, capacity 36,864, 64 generated) and the FAST band row (2,049..8,192 tokens, any capacity,
-    // bound to the run's own execution). TURBO nests FAST inside the band. EXACT never selects the bundle.
+    // Both adapters use the same resolver. The FAST band starts at its only timing point (8,192 tokens);
+    // the TURBO fixed key needs 31,258 tokens, capacity 36,864 and 64 generated.
     rd::ModelFacts complete;
     complete.mtp_present = complete.mtp_complete = true;
     const auto verify_profile = [&](const char* profile, const rd::PrefillWork& work, const rd::EnvGet& env, bool on) {
@@ -149,18 +148,18 @@ void glm() {
         }
         const auto printed = rd::print(cli);
         const bool fast_row = printed.find(" fast=1 applies x1.500 noise 0.100 (GLM pair 8K FAST bundle") != std::string::npos;
-        check(fast_row == (on && work.prompt >= 2049 && work.prompt <= 8192),  // TURBO nests the FAST cell in the band
+        check(fast_row == (on && work.prompt == 8192),  // TURBO nests the FAST cell in the band
               std::string("GLM FAST band row named in the route line (") + profile + " prompt " + std::to_string(work.prompt) + ")");
         gate("glm", values(sp::from_lines(printed)), values(sp::from_lines(rd::print(serve))), allowed);
     };
     const auto verify = [&](const rd::PrefillWork& work, const rd::EnvGet& env, bool on) {
         verify_profile("turbo", work, env, on);
     };
-    verify({true, 8108, 36864, 8192, 1, 64}, none, true);
+    verify({true, 8108, 36864, 8192, 1, 64}, none, false);
     verify({true, 31258, 36864, 8192, 1, 64}, none, true);
     verify({false, 8108, 36864, 8192, 1, 64}, none, false);
-    verify({true, 4096, 36864, 8192, 1, 64}, none, true);    // FAST band
-    verify({true, 8109, 36864, 8192, 1, 64}, none, true);    // FAST band
+    verify({true, 4096, 36864, 8192, 1, 64}, none, false);   // unproven FAST lower edge
+    verify({true, 8191, 36864, 8192, 1, 64}, none, false);   // just below the timed floor
     verify({true, 2048, 36864, 8192, 1, 64}, none, false);
     verify({true, 8193, 36864, 8192, 1, 64}, none, false);
     verify({true, 31258, 32768, 8192, 1, 64}, none, false);  // literal TURBO key: capacity
@@ -174,10 +173,9 @@ void glm() {
         return std::string_view(key) == "STRIX_GLM_PF_ATTN_WMMA_T" ? "32" : nullptr;
     }, false);
     // FAST: the band row alone decides the prompt (capacity and generated are not keys of a band receipt).
-    for (const std::uint64_t prompt : {2049ULL, 4096ULL, 8108ULL, 8192ULL})
-        for (const std::uint64_t capacity : {16384ULL, 36864ULL})
-            verify_profile("fast", {true, prompt, capacity, 8192, 1, 512}, none, true);
-    for (const std::uint64_t prompt : {1ULL, 2048ULL, 8193ULL, 31258ULL})  // 32K stays TURBO
+    for (const std::uint64_t capacity : {16384ULL, 36864ULL})
+        verify_profile("fast", {true, 8192, capacity, 8192, 1, 512}, none, true);
+    for (const std::uint64_t prompt : {1ULL, 2048ULL, 2049ULL, 4096ULL, 8191ULL, 8193ULL, 31258ULL})  // 32K stays TURBO
         verify_profile("fast", {true, prompt, 36864, 8192, 1, 64}, none, false);
     verify_profile("fast", {false, 8192, 36864, 8192, 1, 64}, none, false);  // pair not voted ready
     verify_profile("fast", {true, 8192, 36864, 4096, 1, 64}, none, false);   // unmeasured chunk
@@ -357,13 +355,14 @@ void ds41() {
                           {"fingerprint", pr::hex_identity(result.fingerprint())}};
     };
     measured.max_positions = 32768;
-    for (const auto prompt : {4095U, 8128U, 8193U, 32768U, 32769U}) {
+    for (const auto prompt : {4095U, 4096U, 8127U, 8128U, 8191U, 8192U, 8193U, 32767U, 32768U, 32769U}) {
         const auto cli = request(pd::App::prefill, "0", prompt);
         const auto server = request(pd::App::serve, "1", prompt);
         gate("ds41+prompt+" + std::to_string(prompt), cli, server, {});
-        const bool banded = prompt >= 4096U && prompt <= 32768U;
-        check(cli.at("d1_prefill") == (banded ? "1" : "0") && cli.at("decoder_replay") == (banded ? "256" : "0"),
-              "ds41: both ranks use D1 + R256 only inside the measured bands");
+        const bool d1 = (prompt >= 8128U && prompt <= 8192U) || prompt == 32768U;
+        const bool replay = prompt == 8192U || prompt == 32768U;
+        check(cli.at("d1_prefill") == (d1 ? "1" : "0") && cli.at("decoder_replay") == (replay ? "256" : "0"),
+              "ds41: both ranks honor the separate D1 and R256 measured floors");
     }
 
 }

@@ -3,6 +3,7 @@ A deepseek41-pair fast moe_relaxed=0 s3
 A deepseek41-pair fast dense_f16=0 s3
 A deepseek41-pair fast fast_prefill=0 s3
 A deepseek41-pair fast dense_min_rows=128 s3
+A deepseek41-pair fast d1_prefill=0 s4
 A deepseek41-pair fast decoder_replay=0 s4
 A deepseek41-pair fast engram_f16wmma=0 s3
 A deepseek41-pair fast shared_f16=0 s3
@@ -11,12 +12,12 @@ A deepseek41-pair fast moe_iu4=0 s3
 A deepseek41-pair fast moe_iu4_scope= s3
 A deepseek41-pair fast prefill_bf16_attention=0 s3
 A deepseek41-pair fast prefill_fp16_dense_lt=0 s3
-A deepseek41-pair fast d1_prefill=0 s4
 A deepseek41-pair turbo attention_f16wmma=0 s3
 A deepseek41-pair turbo moe_relaxed=0 s3
 A deepseek41-pair turbo dense_f16=0 s3
 A deepseek41-pair turbo fast_prefill=0 s3
 A deepseek41-pair turbo dense_min_rows=128 s3
+A deepseek41-pair turbo d1_prefill=0 s4
 A deepseek41-pair turbo decoder_replay=0 s4
 A deepseek41-pair turbo engram_f16wmma=0 s3
 A deepseek41-pair turbo shared_f16=0 s3
@@ -25,7 +26,6 @@ A deepseek41-pair turbo moe_iu4=0 s3
 A deepseek41-pair turbo moe_iu4_scope= s3
 A deepseek41-pair turbo prefill_bf16_attention=0 s3
 A deepseek41-pair turbo prefill_fp16_dense_lt=0 s3
-A deepseek41-pair turbo d1_prefill=0 s4
 A deepseek41-rtx fast lean_state=on s3
 A deepseek41-rtx fast q8_r1=on s3
 A deepseek41-rtx fast dsrtxk=on s3
@@ -285,7 +285,7 @@ B qwen-cuda turbo expert_fast=1 s7
 B qwen-cuda turbo mtp_defer_prompt=1 s0
 B qwen-hip turbo ctx=4096 qsa_budget=1536 s0
 B qwen-hip turbo ctx=4096 moe_route_bf16=1 s0
-B qwen-hip turbo ctx=4096 moe_route_prune=cap9 s0
+B qwen-hip turbo ctx=4096 moe_route_prune=off s4
 B qwen-hip turbo ctx=4096 gdn_fp16_chunk=1 s0
 B qwen-hip turbo ctx=4096 index_proj_wmma=1 s7
 B qwen-hip turbo ctx=4096 index_score_wmma=1 s7
@@ -327,7 +327,7 @@ B qwen-cuda turbo expert_fast=1 s7
 B qwen-cuda turbo mtp_defer_prompt=1 s0
 B qwen-hip turbo ctx=8193 qsa_budget=1536 s7
 B qwen-hip turbo ctx=8193 moe_route_bf16=1 s7
-B qwen-hip turbo ctx=8193 moe_route_prune=cap9 s0
+B qwen-hip turbo ctx=8193 moe_route_prune=off s4
 B qwen-hip turbo ctx=8193 gdn_fp16_chunk=1 s7
 B qwen-hip turbo ctx=8193 index_proj_wmma=1 s7
 B qwen-hip turbo ctx=8193 index_score_wmma=1 s7

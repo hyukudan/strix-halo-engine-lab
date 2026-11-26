@@ -110,8 +110,9 @@ reference EXACT `--wide-exact 512` (`--tf-rows`), null arm `STRIX_DENSE_NULL=0:1
 | 8,192 | window + A4W4 48-63 | 0.1792 / 0.8704 / +0.1099 | 0.0649 / 0.9178 / +0.0632 | 0.0097 / 0.9902 / +0.0004 | FAIL |
 | 24,576 (cuts 24,576 + 24,064) | 512-row window | 0.00006 / 0.9951 / -0.0004 | 0.00001 / 1.0000 / -0.0000 | 0.00001 / 1.0000 / -0.0003 | PASS |
 
-The bands are 1..2,048, 2,049..8,192 and 8,193..24,576 tokens, each gated at its top. Longer prompts keep the
-64-row EXACT windows: their EXACT reference does not finish inside one night queue turn.
+The nominal timing bands are 1..2,048, 2,049..8,192 and 8,193..24,576 tokens. The timed 512-row window
+wins at 2,048, 8,192 and 24,576 tokens. These three lengths are the current FAST/TURBO defaults. Other
+prompts use the 64-row EXACT windows. See the [timing inventory](../../band-edges.md) for each gate cut.
 
 Timing (one gfx1151 node, the IU4 pack, `--no-mtp --gen 1`, meas_nodes prompt ids, mirrored order,
 EXACT one cold prefill per round, the window warm of `--repeat 2`, kfd evictions 0, prompt seconds):

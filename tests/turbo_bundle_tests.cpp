@@ -93,7 +93,7 @@ void families() {
         p::Inputs in;
         in.profile = tier;
         in.env = env_of(none);
-        in.regime = {p::Phase::prefill, 8128, 1, "gfx1151", p::kBandProbeExecution};
+        in.regime = {p::Phase::prefill, 8192, 1, "gfx1151", p::kBandProbeExecution};
         const auto measured = p::resolve(ds, in);
         require(find(measured, "d1_prefill")->value == "1", "DeepSeek TURBO inherits the measured FAST D1 row");
         require(find(measured, "decoder_replay")->value == "256", "DeepSeek TURBO inherits the measured FAST R256 row");

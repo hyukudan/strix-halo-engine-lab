@@ -1179,13 +1179,13 @@ the decode app keeps 16-row windows unless `--wide-exact N`, the pair app keeps 
 ### Qwen 27B HIP: FAST and TURBO prefill with the 512-row window inside the gated bands
 
 **Engine:** `qwen` (27B dense, HIP decode app `strix-hip-qwen35-decode`). **Control:** `--profile fast|turbo`
-(default product profile FAST). **Default:** ON in FAST and TURBO inside the gated prompt bands; EXACT unchanged.
+(default product profile FAST). **Default:** ON in FAST and TURBO at 2,048, 8,192 and 24,576 prompt tokens.
 
 The 512-row IU4 window (`--wide 512`, A4W4 off) is the FAST/TURBO prefill route when the shared regime ledger
 (`sp::RegimeGate` rows, quality per prompt band) and the shared band receipts (`LadderRow::band_bound`, timing per band,
 bound by `bind_band_receipts` to the run's own reference and re-bound until the ladder chain settles) both cover the
-run: gfx1151, one rank, one lane, the IU4 g64 pack, a known execution and a prompt in 1..2,048, 2,049..8,192 or
-8,193..24,576 tokens. Elsewhere the previous route (64-row EXACT windows) stays. The A4W4 48-63 layer table failed the same
+run: gfx1151, one rank, one lane, the IU4 g64 pack, a known execution and a prompt of 2,048, 8,192 or
+24,576 tokens. The [ladder inventory](band-edges.md) records the original intervals and measured floors. Other prompts use the 64-row EXACT windows. The A4W4 48-63 layer table failed the same
 per-class gate and stays pending. `--dump-logits --dump-window` without `--wide` now dumps the last window of the route
 the profile resolves (the gate's default arm); `--dump-logits` alone keeps its one-row reference path. Windows wider
 than the decode window read back the one argmax the engine returns for them (the all-rows head; fixes a
@@ -1193,12 +1193,12 @@ than the decode window read back the one argmax the engine returns for them (the
 
 | Engine | Device | Status |
 |---|---|---|
-| qwen 27B dense, HIP decode app | gfx1151, one rank, one lane, IU4 g64 | ON in FAST/TURBO inside the gated bands |
+| qwen 27B dense, HIP decode app | gfx1151, one rank, one lane, IU4 g64 | ON in FAST/TURBO at the three timed lengths |
 | qwen 27B dense, HIP spec / pair apps, TP | gfx1151 | previous route (not gated on that execution) |
 | qwen 27B dense, CUDA | any | not applicable (own windows) |
 | other engines | any | not applicable |
 
-- **Preconditions:** Qwen 27B dense IU4 g64 pack on one gfx1151 device, one rank, one lane, prompt inside a gated band.
+- **Preconditions:** Qwen 27B dense IU4 g64 pack on one gfx1151 device, one rank, one lane, prompt at a timed and gated length.
 - **Exactness evidence:** Bit-changing (FAST class). Per-class gate v2 PASS in every class of every band (KL <= 0.00008,
   top-1 >= 0.996, |dNLL| <= 0.0008 against EXACT `--wide-exact 512`, one-ulp null); the default's dumps are bitwise the
   gated window arm (6 cases, 2,048 and 8,192 tokens); EXACT reference bits equal across the two nodes.
@@ -4664,7 +4664,7 @@ their checks.
 ### FAST WMMA prefill bundle (glm-pf-wmma-x)
 
 **Engine:** `glm`. **Control:** `STRIX_GLM_PF_WMMA`. **Default:** on under `--profile fast` (and `turbo`) for a two-rank
-pair prompt of 2,049..8,192 tokens in the measured execution (below); off everywhere else. `STRIX_GLM_PF_WMMA=1` forces
+pair prompt of 8,192 tokens in the measured execution (below). `STRIX_GLM_PF_WMMA=1` forces
 it, `=0` keeps the exact cores.
 
 The exact prefill's X3 linear calls run on `v_wmma_f32_16x16x16_f16` over the exact cores' FP16 operands: dense calls of
@@ -4677,7 +4677,7 @@ inherit it).
 
 | Engine | Device | Status |
 |---|---|---|
-| glm-5.3-flash, pair (`strix-glm5-rank`, `strix-glm5-serve`) | two Radeon 8060S (gfx1151), USB4 2x2x40 host transport | FAST/TURBO: ON for prompts of 2,049..8,192 tokens; TURBO also at the measured 31,258-token prompt |
+| glm-5.3-flash, pair (`strix-glm5-rank`, `strix-glm5-serve`) | two Radeon 8060S (gfx1151), USB4 2x2x40 host transport | FAST/TURBO: ON at 8,192 tokens; TURBO also at the measured 31,258-token prompt |
 | glm-5.3-flash, one GPU or other topologies | any | exact cores (no receipt for that execution) |
 | glm-5.3-flash, CUDA producer | sm_120 | not applicable (own profile table) |
 | deepseek-v4.1-flash, minimax-m3.1-flash, qwen3.8-flash-next, qwen3.8-27b, hy4-flash, inkling2-mini, nemotron-3.5-bolt-e4b, ernie-5.5-flash-preview | any | not applicable (GLM prefill cores; their FAST rows are their own) |
@@ -4919,13 +4919,30 @@ The q_b epilogue applies the flash prologue's own RoPE (`rope_pair`, dims 448..5
 - **Measured gain:** q_b 2048 x 1024 x 8192: 1.505 -> 1.352 ms. Pair 11,594 warm, strict ABAB 3 pairs: d +15 / +30 / -29 ms (no wall gain beyond noise).
 - **Implementation / evidence:** [image store](../src/core/f16_dense_q8a8.hpp), [q_b](../src/hip_ds41_layer.hip), [policy](../src/hip_ds41_attention_flash.inl), [test](../tests/hip_ds41_fast_dense_tests.hip)
 
+<a id="prompt-band-timing-floor"></a>
+
+### Shared prompt band timing floor
+
+The shared profile ladder starts a band with an unproven lower edge at its first winning in-band timing point. Each row still binds through the full execution key and retains its quality and device conditions. See the [generated band inventory](band-edges.md) and [device campaign](engine/bench-band-edges.md).
+
+| Model | Effective automatic admission by this policy |
+|---|---|
+| Inkling 2 Mini | TURBO IU4 uses measured near-edge bands 4,307–8,236 and 8,237–32,760 |
+| Qwen3.8 Flash Next | TURBO cap9 at 8,192 and 32,768 |
+| Qwen3.8 27B | HIP FAST/TURBO 512-row window at 2,048, 8,192 and 24,576 |
+| DeepSeek V4.1 Flash | Pair FAST/TURBO D1 at 8,128–8,192 and 32,768, R256 at 8,192 and 32,768 |
+| GLM-5.3 Flash | Pair FAST/TURBO WMMA bundle at 8,192, with the fixed TURBO key at 31,258 |
+| MiniMax M3.1 Flash | No band-bound timing rows |
+| Hy4 Flash | No band-bound timing rows |
+| Nemotron 3.5 Bolt E4B | No band-bound timing rows |
+
 <a id="ds41-fast-d1-band"></a>
 
 ### DS41 FAST prefill: D1 composition and bounded decoder replay R=256 by band receipt
 
-**Engine:** `deepseek41` (shared `bind_band_receipts` in `include/strix/engine_profile.hpp`). **Control:** profile rows `d1_prefill` and `decoder_replay` (`--profile fast|turbo`; the implicit model preset is FAST). **Default:** FAST and TURBO, per request, for prompts of 4,096-8,192 and 8,193-32,768 tokens on gfx1151.
+**Engine:** `deepseek41` (shared `bind_band_receipts` in `include/strix/engine_profile.hpp`). **Control:** profile rows `d1_prefill` and `decoder_replay` (`--profile fast|turbo`; the implicit model preset is FAST). **Default:** FAST and TURBO, per request on gfx1151. D1 at 8,128–8,192 and 32,768 tokens. R256 over D1 at 8,192 and 32,768 tokens.
 
-Startup exports the previous prefill route. Each request resolves the profile again with its own execution key (backend, device product, priced workload, row split, cone, head rows, window, lanes, MoE chunk). The two band rows of each lever bind to that run's own reference, so the D1 composition (BF16 flash attention, FP16 dense, relaxed MoE with FP16 down, FP16 Engram and shared expert) and, on top of it, the bounded decoder replay R=256 run only inside their measured bands. Both ranks exchange the request fingerprint; either rank declining keeps the previous route on both.
+Startup exports the previous prefill route. Each request resolves the profile again with its own execution key (backend, device product, priced workload, row split, cone, head rows, window, lanes, MoE chunk). The two band rows of each lever bind to that run's own reference above their [timing floors](band-edges.md), so the D1 composition (BF16 flash attention, FP16 dense, relaxed MoE with FP16 down, FP16 Engram and shared expert) and, on top of it, the bounded decoder replay R=256 run only inside their measured bands. Both ranks exchange the request fingerprint; either rank declining keeps the previous route on both.
 
 - **Exactness evidence:** Bit-changing. FAST gate v2 D1: KL 0.0093, top-1 0.972, dNLL -0.0037 (se 0.0035), route flips 1.05 x null. D1R (with R=256): KL 0.0101, top-1 0.972, dNLL +0.0001 (se 0.0037), route flips 0.37 x null. Pair, 8K and 32K classes, 28 windows, 1,764 rows, final PASS. The bounded replay equals the full run with the key floor bit for bit; deferred serve pieces, snapshot points and group passes take the exact plan.
 - **Off switch:** `--profile exact`, or any explicit `STRIX_DS41_FAST_PREFILL` / `STRIX_DS41_DECODER_REPLAY` value.

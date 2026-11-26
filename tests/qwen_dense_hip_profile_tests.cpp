@@ -239,7 +239,11 @@ void scoped_fast_route() {
                                   row.gate.max_prompt_tokens}) {
             for (const auto tier : {sp::Name::fast, sp::Name::turbo}) {
                 const auto r = resolve({prompt}, tier, no_env, {});
-                require(composite(r, prompt), "FAST and TURBO resolve the gated route inside its band");
+                if (prompt != row.gate.max_prompt_tokens) {
+                    require(previous(r), "a gated but untimed lower prompt keeps EXACT windows");
+                    continue;
+                }
+                require(composite(r, prompt), "FAST and TURBO resolve the gated route at the timed prompt");
                 q::PrefillFlags flags;
                 hp::apply_window(hp::App::decode, r, flags);
                 require(flags.width == 512 && !flags.exact, "the applied window reaches the engine flags");
