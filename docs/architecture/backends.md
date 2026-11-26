@@ -4,8 +4,7 @@ The engine is modular by device, in three layers:
 
 1. **Shared, model-agnostic logic**: graph, session, serve, xport, spec, policies, identities, and
    the arithmetic contracts of every operator (host references in `src/ops`, `include/strix/*_formats.hpp`).
-2. **One backend per vendor or device kind** (HIP, CUDA, CPU; NPU later) implementing the same core
-   interfaces below.
+2. **One backend per vendor or device kind** implementing the shared core interfaces below.
 3. **Architecture specialisations** inside a backend (gfx1151 WMMA, sm_120 tensor cores,
    AVX-512/AMX, NEON/SVE), selected by capability, never by model.
 
@@ -31,7 +30,7 @@ with no vendor include; the vendor body lives in the backend tree.
 
 ## The backend interface
 
-Every backend implements the operations below. Each one is defined by its **arithmetic contract**
+The operations below describe the backend contract. Each one is defined by its **arithmetic contract**
 (operation order, rounding points), so any two backends that claim the same contract give the same
 bits, and the host reference is the oracle.
 
@@ -80,6 +79,19 @@ Its FP32 MMA accumulation is a declared tolerance-qualified arithmetic identity;
 it does not register as an exact replacement for an existing dense identity.
 Caller-owned workspace and capability selection follow the memory/stream contract
 above. Model adapters and complete-workload qualification remain pending.
+
+## Experimental Intel, Vulkan and Metal backends
+
+- **Intel SYCL / Level Zero** provides operator references and a Gemma 4 E4B Q8_0
+  reference route in the dedicated `strix-gemma4-serve --backend intel` executable
+  when built with oneAPI. It uses host-managed model state, synchronous transfers
+  for operator inputs and results, and a resident cache for Q8_0 weights.
+  The route runs without a drafter and reports `PENDING-HARDWARE`.
+- **Vulkan and Metal** provide RMSNorm operator references. Each call stages the
+  input and waits for completion. These backends have no model execution plan.
+  The Vulkan adapter uses the Linux Vulkan loader.
+
+The shared `strix-serve --backend` interface offers HIP and CUDA.
 
 ## CPU backend
 
