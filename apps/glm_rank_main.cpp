@@ -313,6 +313,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         rd::apply_env(eff, [](const char* k, const char* v) { (void)::setenv(k, v, 0); });
+        // Drafter content identity (r94): read once here, named by the receipt and by the pair identity (print()).
+        if (eff.mtp_spec.value == "1") eff.head.mtp_digest = rd::mtp_payload_digest(eff.head);
         std::fputs(rd::mtp_decode_line(eff).c_str(), stderr);
         if (eff.product) {
             std::fprintf(stderr, "profile %s\n", eff.product->json().c_str());

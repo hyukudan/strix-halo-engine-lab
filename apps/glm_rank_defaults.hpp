@@ -614,6 +614,7 @@ inline std::string mtp_decode_line(const Effective& e) {
                (e.mtp_spec_candidate && !e.head.mtp_complete ? " (" + e.head.reason + ")" : std::string{}) + "\n";
     std::string line = "effective mtp-decode=verified";
     for (const auto& path : e.head.mtp_files) line += " " + path.generic_string();
+    if (!e.head.mtp_digest.empty()) line += " payload=" + e.head.mtp_digest;
     return line + "\n";
 }
 
@@ -635,6 +636,8 @@ inline std::string print(const Effective& e, bool include_asset_receipt = true) 
     line("spec", e.spec);
     s += "effective mtp-head=" + e.head.reason + "\n";
     if (include_asset_receipt) s += mtp_decode_line(e);
+    // Path-free drafter content identity (mtp_payload_digest): part of the pair identity vote (print without assets).
+    if (e.mtp_spec.value == "1" && !e.head.mtp_digest.empty()) s += "effective mtp-payload=" + e.head.mtp_digest + "\n";
     s += "effective mtp-kmax=" + std::to_string(e.kmax) + " adaptive=" + (e.adaptive ? "1" : "0") + "\n";
     s += "effective mtp-bootstrap=" + std::string(e.mtp_spec.value == "1" ? (e.prefill == "gemv" ? "chunked" : "ref") : "plain") + "\n";
     s += "effective prefill=" + e.prefill + " (requested " + e.prefill_requested.value + ", " + e.prefill_requested.source + ")\n";
