@@ -4626,9 +4626,9 @@ their checks.
 
 <a id="glm-pf-wmma-x"></a>
 
-### FAST WMMA prefill linear cores (glm-pf-wmma-x)
+### TURBO WMMA prefill linear cores (glm-pf-wmma-x)
 
-**Engine:** `glm`. **Control:** `STRIX_GLM_PF_WMMA`. **Default:** off (explicit `STRIX_GLM_PF_WMMA=1` only; unqualified for `--profile fast`, see the quality line; opt-in FAST identity).
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_WMMA`. **Default:** off. `--profile turbo` selects the bundle in the measured pair workload. `STRIX_GLM_PF_WMMA=1` forces it.
 
 The exact prefill's X3 linear calls run on `v_wmma_f32_16x16x16_f16` over the exact cores' FP16 operands: dense calls of
 2048+ rows (X3 route) and the MoE gate/up/down of the V11/V14 route. Per (row, output) each stage of four 16-wide
@@ -4637,10 +4637,10 @@ tiles per wave (remainders on 64-row storage); the H128/svh epilogue, plan, tran
 exact path's. `STRIX_GLM_PF_WMMA_ROWS=64` and `STRIX_GLM_PF_WMMA_CP=1` select other tilings with the same bits.
 
 - **Preconditions:** dense calls of 2048+ rows (`STRIX_GLM_PF_EXACT_X` auto / 4); MoE calls on V11 or V14 (auto from 128 rows). Other calls stay exact.
-- **Automatic selection:** none today: `--profile fast` does not select it (the FAST prefill set fails the 8K quality gate, KL 0.0587 and 0.492 on two windows, no single member carrying it; it returns to the fast column when fixed). An explicit environment value runs it. `default` exports nothing, `quality` uses default with a notice, and baseline vetoes the profile addition. The bare `--profile` keeps its timing meaning.
-- **Fallback notice:** None; each rank prints `prefill identity glm-pf-wmma-x FAST (... wmma calls dense D moe M)` only when WMMA calls ran, else `prefill identity exact` (`prefill identity prefill-wmma route` under `--prefill wmma`). Two ranks: the switch is part of the startup agreement (a mismatch stops both ranks); modes without that handshake refuse `STRIX_GLM_PF_WMMA=1`.
-- **Exactness evidence:** FAST identity (new FP32 summation order). Quality: pre-registered quality-parity check passed at 1K / 8K / 32K; the later per-window FAST gate of the whole FAST prefill set fails at 8K (above), so the lever is unqualified for the profile. Synthetic: WMMA vs FP64 2.5-2.8e-7 rel-L2 (exact X3 1.9-8.2e-7); every WMMA tiling bitwise equal (hip_glm_pf_wmma_tests). Pair: FAST deterministic; OFF equals the exact 8K logits anchors on both ranks.
-- **Off switch:** STRIX_GLM_PF_WMMA=0 (also overrides `--profile fast`); without a named fast profile, unset keeps it off
+- **Automatic selection:** `--profile turbo` admits the complete X3, MLA, KDA and sparse-attention bundle when the pair reaches the measured device, topology, prefill and prompt regime. The bundle failed the 8K FAST gate, with KL 0.0587 and 0.492 in its two windows. The bare `--profile` keeps its timing meaning.
+- **Fallback notice:** The profile uses the FAST route outside the [measured pair workload](models/glm-5.3/README.md), including two-rank native modes without configuration agreement. The per-prompt receipt prints the selected route. Two-rank execution still requires configuration agreement for an explicit arithmetic switch.
+- **Exactness evidence:** FAST identity (new FP32 summation order). Quality: pre-registered quality-parity check passed at 1K / 8K / 32K; the later per-window FAST gate of the whole FAST prefill set fails at 8K (above), so the lever is unqualified for FAST. Synthetic: WMMA vs FP64 2.5-2.8e-7 rel-L2 (exact X3 1.9-8.2e-7); every WMMA tiling bitwise equal (hip_glm_pf_wmma_tests). Pair: FAST deterministic; OFF equals the exact 8K logits anchors on both ranks.
+- **Off switch:** `STRIX_GLM_PF_WMMA=0` overrides `--profile turbo`.
 - **Measured gain:** Pair 8K TTFT 15.45 -> 12.94 s (-16.3 %), 32K 62.3 -> 51.2 s (-17.8 %, mean of both run orders); whole-call MoE -28..-29 %, dense 8192 rows -28..-32 %
 - **Implementation / evidence:** [shared core](../src/moe_core/grouped_f16.hpp), [GLM adapter](../src/glm/prefill/glm_pf_wmma_x.hpp), [MoE](../src/glm/prefill/glm_pf_wmma_moe.inc), [test](../tests/hip_glm_pf_wmma_tests.hip)
 

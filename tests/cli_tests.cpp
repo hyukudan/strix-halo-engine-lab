@@ -235,6 +235,14 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
             require(declared_name != nullptr, "implicit preset must be a string");
             require(implicit.requested == profile::parse_tier(*declared_name),
                     "implicit preset must agree with its declared tier");
+            if (entry.family == "glm5") {
+                const auto column = std::string_view(backend) == "hip" ? Name::turbo : Name::fast;
+                require(turbo.levers == column, "GLM chooses the native column for the selected backend");
+                std::vector<std::string> args;
+                turbo.append_options(args);
+                require(args == std::vector<std::string>{"--profile", std::string(profile::tier_word(column))},
+                        "GLM passes the backend's product profile to the native engine");
+            }
             if (entry.family == "inkling2")
                 require(implicit.requested == Name::standard && implicit.levers == Name::standard,
                         "Inkling Mini implicit profile must remain EXACT");

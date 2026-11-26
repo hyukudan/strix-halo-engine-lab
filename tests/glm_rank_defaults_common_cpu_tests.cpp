@@ -1,5 +1,8 @@
 // Host-only defaults and product-profile checks. The bare --profile retains kernel timing.
 #include "glm_rank_receipt.hpp"
+#include "glm_rank_startup.hpp"
+#include "glm_prefill_turbo.hpp"
+#include "glm/prefill/glm_pf_attn_wmma.hpp"
 #include "glm/engine/glm_kvshard_exchange.hpp"
 #include "glm/engine/glm_mem.hpp"
 
@@ -147,7 +150,7 @@ void test_glm_product_profiles() {
     CHECK(rd::print(fast) == rd::print(plain) + fast.product->describe());
     const auto turbo = rd::resolve(rd::scan({"--profile", "turbo", "--allow-pending", "--decode", "64"}), empty);
     // The independent TURBO candidates stay at their builtin without a timing row.
-    CHECK(turbo.product && turbo.product->find("pf_wmma")->value == "1");
+    CHECK(turbo.product && turbo.product->find("pf_wmma")->value == "0");
     const auto* stored = turbo.product->find("stored_i4");
     CHECK(stored && stored->value == "exl3" && stored->lever->runnable[3]);
     for (const char* lever : {"idxproj_wmma", "router_wmma"})
@@ -190,6 +193,68 @@ void test_glm_product_profiles() {
     }
 }
 
+void test_glm_idcheck_turbo_fallback() {
+    const auto request = rd::scan({"--world", "2", "--profile", "turbo", "--idcheck", "8"});
+    const Env absent;
+    const auto effective = rd::resolve(request, lookup(absent));
+    CHECK(effective.prefill == "ref");
+    CHECK(!rd::has_config_agreement(request.world, request.xch, request.decode, request.reference_gate, false));
+    for (const auto* lever : {"pf_wmma", "mla_wmma", "kda_wmma", "attn_wmma"})
+        CHECK(effective.product->find(lever)->value == "0");
+    CHECK(!exports(effective).contains("STRIX_GLM_PF_WMMA"));
+
+    const Env forced{{"STRIX_GLM_PF_WMMA", "1"}};
+    const auto explicit_run = rd::resolve(request, lookup(forced));
+    CHECK(explicit_run.product->find("pf_wmma")->value == "1");
+    CHECK(explicit_run.product->find("pf_wmma")->status == profile::Status::explicit_env);
+}
+
+void test_glm_turbo_pair_and_scope() {
+    strix::device::Visible device;
+    device.integrated = true;
+    device.name = "AMD Radeon 8060S Graphics";
+    device.arch = "gfx1151";
+    struct Stream { std::string xdomain; double link_gbps; };
+    std::array<Stream, 4> link{};
+    for (unsigned i = 0; i < 4; ++i) {
+        link[i].xdomain = std::to_string(i % 2U);
+        link[i].link_gbps = 40.0;
+    }
+    CHECK(rd::measured_prefill_pair(device, link, false));
+    CHECK(!rd::measured_prefill_pair(device, link, true));
+    link[3].link_gbps = 20.0;
+    CHECK(!rd::measured_prefill_pair(device, link, false));
+    link[3].link_gbps = 40.0;
+    device.name = "unmeasured gfx1151";
+    CHECK(!rd::measured_prefill_pair(device, link, false));
+
+    for (const bool peer_admitted : {false, true}) {
+        bool admitted = true;
+        const auto result = rd::startup_agreement({1, 0, 8192, 64, 36864, 0, 1, 9}, false, true,
+            [&](auto*, unsigned n, auto& ctl) {
+                if (n == 8) {
+                    CHECK(ctl.replay_flag == 1U);
+                    if (peer_admitted) ctl.replay_flag |= 2U;
+                }
+            }, &admitted, 0);
+        CHECK(result.eligible && result.rows == 8192);
+        CHECK(admitted == peer_admitted);
+    }
+
+    namespace pf = strix::glm::pf;
+    const bool base = pf::wmma_x::enabled();
+    const bool mla = pf::mla_wmma::enabled();
+    const bool kda = pf::kda_wmma::enabled();
+    const bool attn = pf::attn_wmma::enabled();
+    {
+        const pf::wmma_x::ProfileScope scope(true);
+        CHECK(pf::wmma_x::enabled() && pf::mla_wmma::enabled() &&
+              pf::kda_wmma::enabled() && pf::attn_wmma::enabled());
+    }
+    CHECK(pf::wmma_x::enabled() == base && pf::mla_wmma::enabled() == mla &&
+          pf::kda_wmma::enabled() == kda && pf::attn_wmma::enabled() == attn);
+}
+
 void test_glm_inherited_wmma() {
     using profile::Status;
     const auto turbo = rd::scan({"--profile", "turbo", "--allow-pending"});
@@ -200,7 +265,7 @@ void test_glm_inherited_wmma() {
         const char* umbrella;
         bool on;
     };
-    for (const Case& arm : {Case{turbo, nullptr, true}, Case{baseline, nullptr, false},
+    for (const Case& arm : {Case{turbo, nullptr, false}, Case{baseline, nullptr, false},
                             Case{turbo, "0", false}, Case{turbo, "1", true}, Case{baseline, "1", true},
                             Case{turbo, "", false}, Case{turbo, "1tail", false}}) {
         for (const char* value : {static_cast<const char*>(nullptr), "", "0", "1"}) {
@@ -514,6 +579,8 @@ int main() {
     test_common_profile_admission();
     test_glm_product_profiles();
     test_glm_inherited_wmma();
+    test_glm_idcheck_turbo_fallback();
+    test_glm_turbo_pair_and_scope();
     test_glm_exact_index_score_routes();
     test_partial_receipt();
     std::printf("glm defaults common cpu tests: %d checks, %d failures\n", checks, failures);
