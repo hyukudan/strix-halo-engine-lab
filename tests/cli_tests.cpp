@@ -250,6 +250,11 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
                         "Inkling Mini implicit profile must remain EXACT");
             require(exact.levers == Name::standard && fast.levers == Name::fast && fast.requested == Name::fast,
                     "explicit exact and FAST select their native columns");
+            if (entry.family == "inkling2" && std::string_view(backend) == "hip") {
+                std::vector<std::string> forwarded;
+                turbo.append_options(forwarded);
+                require(forwarded == std::vector<std::string>{"--profile", "turbo"},
+                        "served Inkling TURBO reaches the engine with the CLI's --profile turbo");
             const auto* turbo_levers = description.find(std::string("presets.turbo.") + backend + ".levers");
             if (turbo_levers == nullptr) turbo_levers = description.find("presets.turbo.levers");
             const auto* declared_levers = turbo_levers ? std::get_if<std::string>(&turbo_levers->data) : nullptr;

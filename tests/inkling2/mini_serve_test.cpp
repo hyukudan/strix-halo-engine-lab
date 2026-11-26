@@ -540,11 +540,13 @@ void profile_parity() {
     std::cout << "inkling2-mini-profile-parity: ok\n";
 }
 
-// The native column the registry preset forwards for a served --profile (models/inkling2-mini.toml [presets.*]).
-strix::profile::Name served_native_tier(std::string_view tier_name) {
+// The native column the registry preset forwards for a served --profile on `backend` (models/inkling2-mini.toml
+// [presets.*]): TURBO forwards the engine's TURBO column on HIP and the FAST levers elsewhere.
+strix::profile::Name served_native_tier(std::string_view tier_name, std::string_view backend) {
     namespace presets = strix::model_data::inkling2_mini::presets;
     return strix::profile::parse(tier_name == "exact" ? presets::exact::levers
                                  : tier_name == "fast" ? presets::fast::levers
+                                 : backend == "hip"    ? presets::turbo::hip::levers
                                                        : presets::turbo::levers);
 }
 
@@ -623,9 +625,9 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                     "lever on: the command line's schedule and the served lane cap");
         }
         // The served tier is the registry preset's native column for the requested --profile (models/inkling2-mini.toml:
-        // TURBO runs the engine's TURBO column), resolved by the native command line's resolver with the same lever
-        // classes.
-        const auto native = served_native_tier(tier_name);
+        // TURBO: the engine's TURBO column on HIP, the FAST column elsewhere), resolved by the native command line's
+        // resolver with the same lever classes.
+        const auto native = served_native_tier(tier_name, backend);
         mini::MiniWeightOptions cli_weights;
         cli_weights.tier.profile = native;
         cli_weights.qualify_q8 = qualify_q8;
@@ -820,7 +822,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             const auto effective = sv::parse_json(capabilities.body);
             const auto* profile = effective.find("profile");
             const auto* weights = effective.find("weight_load");
-            require(capabilities.status == 200 && profile && profile->as_string() == mini::mini_profile_name(served_native_tier(tier_name)) && weights &&
+            require(capabilities.status == 200 && profile && profile->as_string() == mini::mini_profile_name(served_native_tier(tier_name, backend)) && weights &&
                     (tier_name != "fast" ||  // the FAST plan; the other tiers carry their own weight plan
                      (weights->find("storage")->as_string() == (qualify_q8 ? "gguf.q8_0" : "plain.bf16") &&
                       weights->find("status")->as_string() == (qualify_q8 ? "unqualified" : "pending"))),
@@ -947,7 +949,7 @@ int main(int argc, char** argv) try {
     for (const auto* backend : {"hip", "cuda"}) {
         wiring(argv[1], backend, false);
         wiring(argv[1], backend, true);
-        // The deployed TURBO preset with the served route switch unset: the engine's TURBO column; TURBO nests FAST, so
+        // The deployed TURBO preset with the served route switch unset: the engine's column for this backend; TURBO nests FAST, so
         // the Q8_0 qualification arm stays admitted.
         wiring(argv[1], backend, true, false, W4a4::bf16, "turbo");
         // Every tier keeps the incumbent served shape without the lever, also for chunks above the context and

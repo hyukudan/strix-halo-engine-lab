@@ -214,6 +214,8 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
 // mse-r2-gate-up = nvfp4_mse_r2_gate_up, mse-r2 = nvfp4_mse_r2 (two-term activation rule r2@1 of moe_core/nvfp4_act_rule.hpp),
 // r2 = nvfp4_r2 (two nearest@1 terms on both projections).
 // Every value but 0 / 1 is a candidate of the route-flip re-qualification, not yet gated.
+// iu4 = iu4_rot: the rotated integer class on HIP (moe_core/grouped_iu4a4.hpp; every expert layer, both projections;
+// the TURBO cell, selected per prompt in the prefill regimes of kMiniLadder); CUDA declines it (BF16 tile).
 inline moe_core::grouped_w4a4::Activations mini_moe_w4a4_class(const profile::Resolution& tier) {
     using A = moe_core::grouped_w4a4::Activations;
     const auto* entry = tier.find(kMiniMoeW4a4);
@@ -224,7 +226,8 @@ inline moe_core::grouped_w4a4::Activations mini_moe_w4a4_class(const profile::Re
     if (entry->value == "mse-r2-gate-up") return A::nvfp4_mse_r2_gate_up;
     if (entry->value == "mse-r2") return A::nvfp4_mse_r2;
     if (entry->value == "r2") return A::nvfp4_r2;
-    throw std::invalid_argument("STRIX_INK_MOE_W4A4 must be 0, 1, mse, mse-gate-up, mse-r2-gate-up, mse-r2 or r2");
+    if (entry->value == "iu4") return A::iu4_rot;
+    throw std::invalid_argument("STRIX_INK_MOE_W4A4 must be 0, 1, mse, mse-gate-up, mse-r2-gate-up, mse-r2, r2 or iu4");
 }
 
 // Resolved state of the W4A4 expert lever (true: multi-row prefill chunks run NVFP4 expert layers as W4A4 on CUDA).
@@ -460,15 +463,21 @@ MiniDecoderLevers configure_mini_decoder(Decoder& decoder, const profile::Resolu
                                   mini_screened_head(tier), mini_verify_rows(tier));
 }
 
-// The W4A4 class a run on `backend` ("hip", "cuda") executes. Only the CUDA backend holds the grouped W4A4 tile: a
-// selected class that the backend cannot run is refused, never replaced by the BF16 tile under the class's name. Every
-// entry point (generation CLI, gate, step program, server) admits through here before it reports or binds the class.
+// The expert operand class a run on `backend` ("hip", "cuda") executes. The NVFP4 W4A4 classes run on the CUDA backend only
+// and the rotated integer class (iu4_rot) on the HIP backend only: a selected class that the backend cannot run is
+// refused, never replaced by the BF16 tile under the class's name. Every entry point (generation CLI, gate, step program,
+// server) admits through here before it reports or binds the class.
 inline moe_core::grouped_w4a4::Activations admit_mini_moe_w4a4(moe_core::grouped_w4a4::Activations activations,
                                                                 std::string_view backend) {
-    if (activations != moe_core::grouped_w4a4::Activations::bf16 && backend != "cuda")
+    using A = moe_core::grouped_w4a4::Activations;
+    if (activations == A::bf16) return activations;
+    const bool rotated = activations == A::iu4_rot;
+    if (rotated ? backend != "hip" : backend != "cuda")
         throw std::invalid_argument(std::string("STRIX_INK_MOE_W4A4 selects ") +
                                     moe_core::grouped_w4a4::identity(activations) + ": the " + std::string(backend) +
-                                    " backend has no grouped W4A4 tile (CUDA only); select 0 to run the BF16 tile");
+                                    (rotated ? " backend has no rotated integer expert tile (HIP only)"
+                                             : " backend has no grouped W4A4 tile (CUDA only)") +
+                                    "; select 0 to run the BF16 tile");
     return activations;
 }
 
@@ -549,26 +558,59 @@ inline void mini_cli_decline_served_route(profile::Resolution& tier) {
     }
 }
 
+// What the ladder's timing rows need to know about the run beyond its device class: the device product identity (shared
+// cost identity, MiniWeightScope::cost_device), the resident context capacity and the prefill chunk. Empty product or
+// zero capacity or chunk: the execution is not known and no timing row decides (the tier below runs).
+struct MiniPromptExecution {
+    std::string_view product;
+    std::uint64_t context = 0;
+    std::uint32_t chunk = 0;
+    std::string_view backend = kMiniBuildBackend;  // the backend the run executes on (host tests name another)
+};
+
+// The spelling of Regime::execution of one prompt (strix::profile::ladder_execution): the same function for the command
+// line, the gate and the server, so a band receipt binds one reference whatever the entry point.
+inline std::string mini_ladder_execution(const MiniPromptExecution& run, std::uint64_t tokens) {
+    const auto capacity = std::max(run.context, tokens);
+    return profile::ladder_execution({run.backend, run.product, {tokens, capacity, 1U, run.chunk, run.chunk, 0U, 0U, 0U}});
+}
+
 // One scoped selection for serial CLI, the gate and each served prompt. Explicit
 // selection was already validated during parsing and keeps its precedence. `receipt` (the command line's resolution)
-// declines the served route lever as the command line's own resolution does.
+// declines the served route lever as the command line's own resolution does. `run`: the execution the timing rows bind
+// (mini_ladder_execution); default: unknown, so no ladder row decides.
 inline moe_core::grouped_w4a4::Activations mini_prompt_moe(const MiniWeightOptions& options,
                                                          std::string_view device, std::uint64_t tokens,
-                                                         bool print = true, profile::Resolution* receipt = nullptr) {
+                                                         bool print = true, profile::Resolution* receipt = nullptr,
+                                                         const MiniPromptExecution& run = {}) {
     auto inputs = options.tier;
-    inputs.regime = {profile::Phase::prefill, tokens, 1, device};
+    const auto execution = mini_ladder_execution(run, tokens);
+    inputs.regime = {profile::Phase::prefill, tokens, 1, device, execution};
     auto selected = resolve_mini_weight_profile(options, inputs);
     admit_mini_strixpack_receipt(selected);
     if (print)
         for (const auto& entry : selected.entries)
             if (!entry.ladder.empty()) std::cerr << entry.ladder << '\n';
-    const auto arithmetic = admit_mini_moe_w4a4(mini_moe_w4a4_class(selected), kMiniBuildBackend);
+    const auto arithmetic = admit_mini_moe_w4a4(mini_moe_w4a4_class(selected), run.backend);
     if (receipt) {
         mini_defer_vision_recipe(selected);
         mini_cli_decline_served_route(selected);
         *receipt = std::move(selected);
     }
     return arithmetic;
+}
+
+// Whether some prompt may select `wanted` on `device`: the tier's own resolution, or a prompt size inside one of the
+// lever's ladder rows for that device. A load that may select a class with load-time operands (iu4: rotated images)
+// builds them once at load instead of inside the first such prompt. `run`: as mini_prompt_moe.
+inline bool mini_prompt_moe_may_select(const MiniWeightOptions& options, std::string_view device,
+                                       moe_core::grouped_w4a4::Activations wanted, const MiniPromptExecution& run = {}) {
+    if (mini_moe_w4a4_class(profile::resolve(kMiniProfile, options.tier)) == wanted) return true;
+    for (const auto& row : kMiniProfile.ladder)
+        if (row.lever == kMiniMoeW4a4 && !row.incumbent && row.device == device && row.phase == profile::Phase::prefill &&
+            mini_prompt_moe(options, device, row.min_context, false, nullptr, run) == wanted)
+            return true;
+    return false;
 }
 
 inline const char* mini_profile_name(profile::Name tier) {

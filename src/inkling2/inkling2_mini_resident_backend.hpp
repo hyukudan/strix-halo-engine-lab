@@ -15,6 +15,9 @@
 #include "moe_core/microscaled_r1.hpp"
 
 #include <algorithm>
+#include <array>
+#include <deque>
+#include <cstdio>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -332,11 +335,21 @@ public:
     // nvfp4_mse_r2_gate_up / nvfp4_mse_r2 = two-term activations on gate-up / on both projections, nvfp4_r2 = two nearest@1
     // terms on both projections).
     // bf16 = lever off. Every entry point (gate, generation CLI, step program, server) passes the resolved class.
+    // HIP: the rotated integer class (Activations::iu4_rot, moe_core/grouped_iu4a4.hpp, grouped-iu4a4-rot-v1): every layer
+    // whose experts pass admission gets a rotated image of both projections here (load time; ~13 GB at Inkling 2 Mini
+    // shapes) and multi-row prefill chunks run it; the NVFP4 classes are CUDA values (ignored). CUDA declines iu4_rot.
     void set_moe_w4a4(moe_core::grouped_w4a4::Activations activations) {
-        // Admission for this build's backend: a class the backend cannot run is refused (HIP holds no W4A4 tile).
+        // Admission for this build's backend: a class the backend cannot run is refused (CUDA: the W4A4 classes; HIP: iu4_rot).
         static_cast<void>(admit_mini_moe_w4a4(activations, kMiniBuildBackend));
-#if !defined(__HIPCC__)
-        moe_w4a4_ = activations != moe_core::grouped_w4a4::Activations::bf16;
+#if defined(__HIPCC__)
+        // Images are built on the first iu4 selection and kept; each selection (per prompt under the ladder) turns the
+        // class on or off for the chunks that follow. Narrow (NVFP4-transcoded) experts keep the BF16 tile: the images
+        // are built from the checkpoint's own matrices.
+        const bool iu4 = activations == moe_core::grouped_w4a4::Activations::iu4_rot && !weights_.narrow_experts();
+        if (iu4 && !moe_iu4_) build_iu4_images();
+        iu4_on_ = iu4 && moe_iu4_;
+#else
+        moe_w4a4_ = moe_core::grouped_w4a4::w4a4_gate_up(activations);
         moe_w4a4_class_ = activations;
         if (!moe_w4a4_) return;
         for (unsigned layer = 0; layer < kPhysicalLayers; ++layer)
@@ -1021,7 +1034,9 @@ public:
                                                     kExperts, kHiddenWidth}, rows, input, logits, stream_));
 #endif
 #if defined(__HIPCC__)
-        const MiniMoeWorkspace workspace{moe_bf16_.span(), moe_fp32_.span(), moe_activation_.span(), {},
+        const bool iu4 = chunk_iu4_ && iu4_images_[layer].gate_up.codes != nullptr;
+        const MiniMoeWorkspace workspace{moe_bf16_.span(), moe_fp32_.span(), moe_activation_.span(),
+                                         iu4 ? moe_nvfp4_->span() : std::span<std::uint8_t>{},
                                          moe_nan_seen_ ? moe_nan_seen_->data() : nullptr};
 #else
         using A = moe_core::grouped_w4a4::Activations;
@@ -1043,7 +1058,9 @@ public:
                                                                          gate_route_tap_));
         else
             check(enqueue_mini_hip_resident_moe(layer, rows, input, logits, bias, output, buffers,
-                                                matrices, csr, planned, workspace, stream_, gate_route_tap_));
+                                                matrices, csr, planned, workspace, stream_, gate_route_tap_,
+                                                iu4 ? moe_core::grouped_iu4a4::Selection{&iu4_images_[layer]}
+                                                    : moe_core::grouped_iu4a4::Selection{}));
 #else
         if (weights_.narrow_experts())
             check(enqueue_mini_cuda_resident_moe_decoded<MiniMoeNarrowConfig>(
@@ -1057,6 +1074,58 @@ public:
     }
 
 private:
+#if defined(__HIPCC__)
+    // Rotated images of both expert projections of every admitted layer (gate/up in the paired column order), built once
+    // from the resident matrices; a layer whose matrices do not sit at one code stride keeps the BF16 tile.
+    void build_iu4_images() {
+        namespace gi = moe_core::grouped_iu4a4;
+        using weight::microscaled::MatrixFormat;
+        constexpr unsigned gate_width = 2U * kExpertWidth;
+        const std::size_t gate_codes = gi::image_code_bytes(kHiddenWidth, gate_width);
+        const std::size_t gate_steps = gi::image_step_floats(kHiddenWidth, gate_width);
+        const std::size_t down_codes = gi::image_code_bytes(kExpertWidth, kHiddenWidth);
+        const std::size_t down_steps = gi::image_step_floats(kExpertWidth, kHiddenWidth);
+        unsigned built = 0U;
+        for (unsigned layer = 0; layer < kPhysicalLayers; ++layer) {
+            const auto experts = weights_.experts(layer);
+            if (experts.size() != kExperts || kExperts < 2U) continue;
+            std::array<weight::microscaled::PackedMatrix, kExperts> gate{}, down{};
+            for (unsigned e = 0; e < kExperts; ++e) gate[e] = experts[e].gate_up, down[e] = experts[e].down;
+            const auto stride = [](const auto& m) { return static_cast<std::size_t>(m[1].codes - m[0].codes); };
+            if (!gi::expert_codes_strided(gate, gate[0].codes, stride(gate)) ||
+                !gi::expert_codes_strided(down, down[0].codes, stride(down)))
+                continue;
+            auto& codes = iu4_codes_.emplace_back(std::size_t{kExperts} * (gate_codes + down_codes));
+            auto& steps = iu4_steps_.emplace_back(std::size_t{kExperts} * (gate_steps + down_steps));
+            gi::LayerImages& im = iu4_images_[layer];
+            im.gate_up = {codes.data(), steps.data(), gate_codes, gate_steps, kExperts};
+            im.down = {codes.data() + std::size_t{kExperts} * gate_codes, steps.data() + std::size_t{kExperts} * gate_steps,
+                       down_codes, down_steps, kExperts};
+            im.gate_up_codes = gate[0].codes;
+            im.gate_up_stride = stride(gate);
+            im.down_codes = down[0].codes;
+            im.down_stride = stride(down);
+            for (unsigned e = 0; e < kExperts; ++e) {
+                const auto run = [&]<MatrixFormat F>() {
+                    gi::enqueue_requantise_expert<F>(gate[e], kExpertWidth, kHiddenWidth, gate_width,
+                                                     im.gate_up.codes + e * gate_codes, im.gate_up.steps + e * gate_steps, stream_);
+                    gi::enqueue_requantise_expert<F>(down[e], 0U, kExpertWidth, kHiddenWidth,
+                                                     im.down.codes + e * down_codes, im.down.steps + e * down_steps, stream_);
+                };
+                if (MiniMoeConfig::format(layer) == MatrixFormat::nvfp4) run.template operator()<MatrixFormat::nvfp4>();
+                else run.template operator()<MatrixFormat::mxfp8>();
+            }
+            check(hipGetLastError());
+            ++built;
+        }
+        mini_gpu::synchronize(stream_);
+        moe_iu4_ = built > 0U;
+        const auto act = gi::act_bytes(max_rows_, max_rows_ * kExpertsPerToken, kHiddenWidth, kExpertWidth);
+        if (moe_iu4_ && !moe_nvfp4_) moe_nvfp4_.emplace(act);
+        std::fprintf(stderr, "strix-moe-iu4a4 %s layers %u/%u (rotated expert images %.2f GB)\n", moe_core::grouped_iu4a4::kArithmeticId,
+                     built, kPhysicalLayers, double(built) * double(kExperts) * double(gate_codes + down_codes + 4U * (gate_steps + down_steps)) / 1e9);
+    }
+#endif
     // The row geometry of a chunk and the prompt-row rule of the bound W4A4 class (mini_resident_chunk_route). The class
     // quantises each token row on its own and sums each (row, output) in a fixed K order, so a prompt row's bits do not
     // depend on how the prompt is chunked.
@@ -1068,7 +1137,9 @@ private:
                         (!weights_.bf16_bound() || decode_cohort_width == 0U ||
                          mini_lowbit_receipt_width(decode_cohort_width));
         route_ = mini_resident_chunk_route(kind, rows, packed_decode_, moe_w4a4_bound(), cohort_rows_);
-#if !defined(__HIPCC__)
+#if defined(__HIPCC__)
+        chunk_iu4_ = iu4_on_ && kind == MiniAppendKind::prefill && rows > 1U;
+#else
         chunk_w4a4_ = mini_w4a4_rows(moe_w4a4_, kind);
 #endif
         route_flag_rows_ = route_.packed_moe ? rows : 1U;
@@ -1193,6 +1264,12 @@ private:
     moe_core::grouped_w4a4::Activations moe_w4a4_class_ = moe_core::grouped_w4a4::Activations::nvfp4;
     std::array<bool, kPhysicalLayers> moe_w4a4_layer_{};
     std::optional<mini_gpu::Buffer<std::uint8_t>> moe_nvfp4_;
+#else
+    bool moe_iu4_ = false, iu4_on_ = false, chunk_iu4_ = false;  // images built, class selected, this chunk
+    std::array<moe_core::grouped_iu4a4::LayerImages, kPhysicalLayers> iu4_images_{};
+    std::deque<mini_gpu::Buffer<std::uint8_t>> iu4_codes_;  // deque: Buffer is not movable
+    std::deque<mini_gpu::Buffer<float>> iu4_steps_;
+    std::optional<mini_gpu::Buffer<std::uint8_t>> moe_nvfp4_;  // A4 activation images of a pass (grouped_iu4a4::act_bytes)
 #endif
     core::LowBitArithmetic lowbit_arithmetic_;
     bool step_graphs_;

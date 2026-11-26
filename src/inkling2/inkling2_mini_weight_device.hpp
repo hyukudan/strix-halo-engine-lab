@@ -35,6 +35,9 @@ namespace strix::inkling2 {
 struct MiniWeightScope {
     weight::Backend backend{};
     std::string device_class, weight_device_class, compiler_id;
+    // The shared cost identity of the device product (always the product, whatever the weight-load key above holds): the
+    // device the ladder's timing rows execute on (mini_ladder_execution). Empty: unknown, no timing row decides.
+    std::string cost_device;
     std::string_view regime;
     weight::Digest256 build{}, checkpoint{};
     [[nodiscard]] weight::WeightLoadScope view() const {
@@ -82,9 +85,11 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
     // Empty when the runtime cannot describe the device: no weight row matches then.
 #if defined(__HIPCC__)
     // The explicitly enabled calibrated row retains the scope of its historical gfx1151 receipt.
-    out.weight_device_class = row_requested ? out.device_class : device::hip_cost_device_identity();
+    out.cost_device = device::hip_cost_device_identity();
+    out.weight_device_class = row_requested ? out.device_class : out.cost_device;
 #else
-    out.weight_device_class = device::cuda_cost_device_identity();
+    out.cost_device = device::cuda_cost_device_identity();
+    out.weight_device_class = out.cost_device;
 #endif
     if (!needed) return out;
     out.build = identity;

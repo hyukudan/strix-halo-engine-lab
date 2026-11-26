@@ -4,6 +4,7 @@
 #include "mini_moe_device_fixture.hpp"
 
 #include <cstdlib>
+#include <utility>
 #include <iostream>
 
 namespace {
@@ -11,7 +12,10 @@ namespace {
 struct Hip {
     using MoeBackend = strix::inkling2::MiniHipMoeBackend;
     using Stream = hipStream_t;
-    static constexpr auto enqueue_resident = strix::inkling2::enqueue_mini_hip_resident_moe;
+    // A forwarding call keeps the launcher's defaulted trailing arguments (a function pointer would drop them).
+    static hipError_t enqueue_resident(auto&&... args) {
+        return strix::inkling2::enqueue_mini_hip_resident_moe(std::forward<decltype(args)>(args)...);
+    }
 
     static void require(hipError_t status) {
         if (status == hipSuccess) return;

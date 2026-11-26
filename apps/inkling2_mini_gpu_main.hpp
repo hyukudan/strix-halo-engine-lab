@@ -117,7 +117,7 @@ private:
 
 inline void run_gate(const char* checkpoint, const Options& options, std::span<const session::HeadGateWindow> windows,
                      weight::WeightLoadExtent extent, weight::WeightLoadPlan& weights,
-                     const weight::WeightLoadScope& scope, std::string_view device
+                     const weight::WeightLoadScope& scope, std::string_view device, std::string_view product
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                      , bool step_program, bool epilogue_fusion, unsigned latency_forms
 #endif
@@ -173,7 +173,8 @@ inline void run_gate(const char* checkpoint, const Options& options, std::span<c
     for (const auto& window : windows) {
         if (!kMiniProfile.ladder.empty()) {
             const auto prompt_tokens = mode == session::HeadGateMode::decode ? window.ids.size() - options.gate_rows : window.ids.size();
-            decoder.set_moe_w4a4(mini_prompt_moe(options.weights, device, prompt_tokens));
+            decoder.set_moe_w4a4(mini_prompt_moe(options.weights, device, prompt_tokens, true, nullptr,
+                                                 MiniPromptExecution{product, positions, static_cast<std::uint32_t>(max_rows)}));
         }
         const auto dump = out / (window.name + "-" + options.gate_arm + ".f32");
         const auto ids_dump = out / (window.name + "-" + options.gate_arm + ".ids");
@@ -393,11 +394,12 @@ int main(int argc, char** argv) {
         if (step_program)
             family.load = [program_load = cli::select_mini_cuda_program(program_options.epilogue_fusion,
                                                                         program_options.latency_forms),
-                           &options, device = early.scope.device_class,
+                           &options, device = early.scope.device_class, product = early.scope.cost_device,
                            controller_one_plane = mini_controller_one_plane(options.tier),
                            projected_bias = mini_attn_projected_bias(options.tier),
                            screened_head = mini_screened_head(options.tier)](const serve::SerialGenerationLoad& load) {
-                return program_load(load, mini_prompt_moe(options.weights, device, load.prompt_tokens, false, &options.tier),
+                return program_load(load, mini_prompt_moe(options.weights, device, load.prompt_tokens, false, &options.tier,
+                                                MiniPromptExecution{product, load.positions, load.prefill_chunk}),
                                     controller_one_plane, projected_bias, screened_head);
             };
         else
@@ -421,7 +423,9 @@ int main(int argc, char** argv) {
                 std::cerr << "strix-lowbit-pack/v2 declined (" << decline << "); using incumbent weights\n";
             loaded = resolve_weights(extent);
             const auto moe_w4a4 = mini_prompt_moe(weight_options, loaded->scope.device_class,
-                                                 load.prompt_tokens, false, &options.tier);
+                                                 load.prompt_tokens, false, &options.tier,
+                                                 MiniPromptExecution{loaded->scope.cost_device, load.positions,
+                                                                     load.prefill_chunk});
             return load_mini_weights(load.checkpoint, loaded->plan, options.tier.profile, weight_options, loaded->scope.view(),
                                      extent, [&](MiniLowBitRows lowbit) {
                 return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, loaded->plan.roles(), dspark,
@@ -482,7 +486,8 @@ int main(int argc, char** argv) {
                 std::cerr << strix::weight::weight_load_scope_receipt(scope.view()) << '\n';
         };
         if (options.gate_manifest) {
-            cli::run_gate(argv[1], options, gate_windows, gate_extent, weights, early.scope.view(), early.scope.device_class
+            cli::run_gate(argv[1], options, gate_windows, gate_extent, weights, early.scope.view(), early.scope.device_class,
+                          early.scope.cost_device
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                           , step_program, program_options.epilogue_fusion, program_options.latency_forms
 #endif

@@ -2,6 +2,8 @@
 #include "inkling2/inkling2_mini_weight_options.hpp"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <span>
@@ -19,6 +21,22 @@ namespace profile = strix::profile;
 void require(bool passed, const char* detail) {
     if (!passed) throw std::runtime_error(detail);
 }
+
+// The process-wide model preset switch strix-serve exports around its engine (restored on scope exit).
+struct PresetEnv {
+    PresetEnv() { set("1"); }
+    ~PresetEnv() { set(nullptr); }
+    PresetEnv(const PresetEnv&) = delete;
+    PresetEnv& operator=(const PresetEnv&) = delete;
+    static void set(const char* value) {
+#ifdef _MSC_VER
+        (void)_putenv_s(profile::kPresetEnv, value ? value : "");
+#else
+        if (value) (void)::setenv(profile::kPresetEnv, value, 1);
+        else (void)::unsetenv(profile::kPresetEnv);
+#endif
+    }
+};
 
 // Hermetic environment: only the Inkling switches under test, when given.
 profile::Inputs inputs(profile::Name tier, const char* value = nullptr, const char* image = nullptr,
@@ -100,9 +118,11 @@ void test_row() {
     require(lever.name == mini::kMiniMoeW4a4 && lever.name == "inkling2-mini-moe-w4a4@1", "w4a4 identity");
     require(lever.env == "STRIX_INK_MOE_W4A4" && lever.off == "0" && lever.builtin == "0", "w4a4 off switch");
     require(lever.kind == profile::Kind::bit_changing, "bit-changing lever");
-    require(lever.value[0].empty() && lever.value[1] == "1" && lever.value[3].empty(), "exact off, fast/turbo on");
+    require(lever.value[0].empty() && lever.value[1] == "1" && lever.value[3] == "iu4", "exact off, fast 1, turbo iu4");
     for (std::size_t column = 0; column < profile::kProfileColumns; ++column)
-        require(!lever.ready[column] && !lever.provisional[column], "row stays opt-in until its FAST gate");
+        require(lever.ready[column] == (column == 3U) && !lever.provisional[column],
+                "fast stays opt-in until its FAST gate; turbo iu4 is ready with its declared quality");
+    require(profile::ladder_defect(mini::kMiniProfile).empty(), "Inkling ladder rows are well formed");
     require(lever.runnable[1] && lever.runnable[3] && !lever.runnable[0], "fast/turbo columns runnable");
 }
 
@@ -141,23 +161,28 @@ void test_resolution() {
                                               {"mse-gate-up", A::nvfp4_mse_gate_up},
                                               {"mse-r2-gate-up", A::nvfp4_mse_r2_gate_up},
                                               {"mse-r2", A::nvfp4_mse_r2},
-                                              {"r2", A::nvfp4_r2}}) {
+                                              {"r2", A::nvfp4_r2},
+                                              {"iu4", A::iu4_rot}}) {
             options.tier = inputs(tier, value);
             require(mini::mini_moe_w4a4_class(mini::resolve_mini_profile(options, true)) == expected,
                     "lever value selects the shared activation class");
-            require(mini::mini_moe_w4a4(mini::resolve_mini_profile(options, true)), "candidate values run W4A4");
+            require(mini::mini_moe_w4a4(mini::resolve_mini_profile(options, true)), "candidate values select a class");
             // Backend admission (CLI, gate, step program, server): CUDA runs the class; HIP refuses it instead of
             // running the BF16 tile under the class's name.
             const auto resolved = mini::resolve_mini_profile(options, true);
-            require(mini::admit_mini_moe_w4a4(resolved, "cuda") == expected, "CUDA admits the selected class");
-            bool hip_refused = false;
+            // The rotated integer class is the HIP class, the NVFP4 classes are CUDA classes.
+            const bool rotated = expected == A::iu4_rot;
+            const char* runs = rotated ? "hip" : "cuda";
+            const char* refuses = rotated ? "cuda" : "hip";
+            require(mini::admit_mini_moe_w4a4(resolved, runs) == expected, "the class's backend admits it");
+            bool refused_here = false;
             try {
-                static_cast<void>(mini::admit_mini_moe_w4a4(resolved, "hip"));
+                static_cast<void>(mini::admit_mini_moe_w4a4(resolved, refuses));
             } catch (const std::invalid_argument& error) {
-                hip_refused = std::string(error.what()).find(strix::moe_core::grouped_w4a4::identity(expected)) !=
-                              std::string::npos;
+                refused_here = std::string(error.what()).find(strix::moe_core::grouped_w4a4::identity(expected)) !=
+                               std::string::npos;
             }
-            require(hip_refused, "HIP refuses a selected W4A4 class and names it");
+            require(refused_here, "the other backend refuses a selected class and names it");
         }
         options.tier = inputs(tier, "0");
         require(mini::admit_mini_moe_w4a4(mini::resolve_mini_profile(options, true), "hip") == A::bf16,
@@ -174,6 +199,77 @@ void test_resolution() {
         refused = true;
     }
     require(refused, "malformed W4A4 switch must be refused");
+}
+
+// TURBO iu4 runs only in the measured prefill regimes of its ladder rows (gfx1151, prompts of 4,307..32,760 tokens);
+// every other regime, device and tier keeps the BF16 tile; explicit switches run as set.
+void test_ladder() {
+    using A = strix::moe_core::grouped_w4a4::Activations;
+    mini::MiniWeightOptions options;
+    // The execution every entry point spells for the timing rows (mini_ladder_execution): device product, resident
+    // context capacity, prefill chunk. The band receipts bind to it per run (LadderRow::band_bound).
+    // The host test names the HIP backend: the class is admitted per backend (the build's own backend is CUDA here).
+    const mini::MiniPromptExecution known{"gfx1151|product|cu40|mem", 65536U, 128U, "hip"};
+    const auto prompt = [&](profile::Name tier, const char* device, std::uint64_t tokens, const char* value = nullptr,
+                            const mini::MiniPromptExecution& run = {"gfx1151|product|cu40|mem", 65536U, 128U, "hip"}) {
+        options.tier = inputs(tier, value);
+        return mini::mini_prompt_moe(options, device, tokens, false, nullptr, run);
+    };
+    for (const std::uint64_t tokens : {4307ULL, 4309ULL, 8192ULL, 8236ULL, 8237ULL, 32758ULL, 32760ULL})
+        require(prompt(profile::Name::turbo, "gfx1151", tokens) == A::iu4_rot, "TURBO prefill inside the rows runs iu4");
+    for (const std::uint64_t tokens : {0ULL, 1ULL, 4306ULL, 32761ULL, 131072ULL})
+        require(prompt(profile::Name::turbo, "gfx1151", tokens) == A::bf16, "unmeasured prompt sizes keep the BF16 tile");
+    require(prompt(profile::Name::turbo, "sm_120", 8236U) == A::bf16, "other devices keep the BF16 tile");
+    require(prompt(profile::Name::turbo, "", 8236U) == A::bf16, "an unknown device keeps the BF16 tile");
+    require(prompt(profile::Name::fast, "gfx1151", 8236U) == A::bf16, "FAST keeps the BF16 tile");
+    require(prompt(profile::Name::standard, "gfx1151", 8236U) == A::bf16, "EXACT keeps the BF16 tile");
+    require(prompt(profile::Name::turbo, "gfx1151", 8236U, "0") == A::bf16, "off switch wins in TURBO");
+    require(prompt(profile::Name::fast, "gfx1151", 2048U, "iu4") == A::iu4_rot, "explicit iu4 runs as set");
+    // The rows are band receipts bound to the run's own execution: an execution that is not known decides nothing.
+    for (const auto& unknown : {mini::MiniPromptExecution{"", 0U, 0U, "hip"},
+                                mini::MiniPromptExecution{"gfx1151|product", 65536U, 0U, "hip"},
+                                mini::MiniPromptExecution{"", 65536U, 128U, "hip"}})
+        require(prompt(profile::Name::turbo, "gfx1151", 8236U, nullptr, unknown) == A::bf16,
+                "an unknown execution keeps the BF16 tile");
+    require(!mini::mini_ladder_execution(known, 8236U).empty() && mini::mini_ladder_execution({"", 0U, 0U, "hip"}, 8236U).empty(),
+            "the execution spelling needs the device product and the chunk");
+    require(mini::mini_ladder_execution(known, 8236U) != mini::mini_ladder_execution(known, 8237U),
+            "the execution spells the prompt");
+    for (const auto& row : mini::kMiniProfile.ladder)
+        require(row.band_bound && row.over.empty() && !row.incumbent && row.joint.empty(),
+                "Inkling timing rows are band receipts");
+
+    profile::Resolution receipt;
+    options.tier = inputs(profile::Name::turbo);
+    static_cast<void>(mini::mini_prompt_moe(options, "gfx1151", 8236U, false, &receipt, known));
+    const auto* entry = receipt.find(mini::kMiniMoeW4a4);
+    require(entry != nullptr && entry->status == profile::Status::set, "TURBO iu4 applies as a ready cell");
+    require(entry->ladder.find("turbo=iu4 applies x1.091") != std::string::npos, "route line names the measured row");
+    auto decode = inputs(profile::Name::turbo);
+    decode.regime = {profile::Phase::decode, 8236U, 1, "gfx1151"};
+    require(mini::mini_moe_w4a4_class(profile::resolve(mini::kMiniProfile, decode)) == A::bf16, "decode keeps the BF16 tile");
+
+    options.tier = inputs(profile::Name::turbo);
+    require(mini::mini_prompt_moe_may_select(options, "gfx1151", A::iu4_rot, known), "a TURBO gfx1151 load builds iu4 images");
+    require(!mini::mini_prompt_moe_may_select(options, "gfx1151", A::iu4_rot), "an unknown execution builds none");
+    require(!mini::mini_prompt_moe_may_select(options, "sm_120", A::iu4_rot, known), "a TURBO load elsewhere builds none");
+    options.tier = inputs(profile::Name::fast);
+    require(!mini::mini_prompt_moe_may_select(options, "gfx1151", A::iu4_rot, known), "a FAST load builds none");
+    options.tier = inputs(profile::Name::fast, "iu4");
+    require(mini::mini_prompt_moe_may_select(options, "sm_120", A::iu4_rot, known), "an explicit iu4 load builds them");
+
+    // strix-serve resolves under a model preset, which admits only ready cells: the server selects what the CLI
+    // selects for the same prompt (served prompts of the receipt: 4,307 / 8,234 / 32,758 tokens).
+    {
+        const PresetEnv preset;
+        for (const std::uint64_t tokens : {4307ULL, 8234ULL, 32758ULL})
+            require(prompt(profile::Name::turbo, "gfx1151", tokens) == A::iu4_rot, "served TURBO selects the CLI cell");
+        require(prompt(profile::Name::turbo, "gfx1151", 2048U) == A::bf16, "served TURBO keeps BF16 outside the rows");
+        require(prompt(profile::Name::fast, "gfx1151", 8234U) == A::bf16, "served FAST keeps the BF16 tile");
+        options.tier = inputs(profile::Name::turbo);
+        require(mini::mini_prompt_moe_may_select(options, "gfx1151", A::iu4_rot, known), "a served TURBO load builds images");
+    }
+    require(!profile::model_preset(), "preset scope restored");
 }
 
 // The down-image lever: off in every profile unless selected explicitly (STRIX_INK_COMBINE_IMAGE=1), one value for every
@@ -725,6 +821,7 @@ int main() {
         test_vision_recipe_row();
         test_served_route();
         test_resolution();
+        test_ladder();
         test_combine_image();
         test_controller_planes();
         test_configure();

@@ -65,9 +65,13 @@ levers = "exact"
 [presets.fast]
 levers = "fast"
 
-# The engine's TURBO column: a TURBO cell without its own value takes the FAST one, and explicit TURBO levers (the
-# calibrated q4 decode row, STRIX_INK_LOWBIT_TURBO=1) resolve on the served route as on the command line.
+# Under a preset the TURBO column of the shared engine is not forwarded off HIP (CUDA keeps the FAST levers).
 [presets.turbo]
+levers = "turbo"
+
+# The HIP engine resolves its TURBO column (include/strix/profiles/inkling2_mini.hpp): the FAST levers plus the
+# prefill ladder rows with a measured gain (the CLI and the server select the same class per prompt).
+[presets.turbo.hip]
 levers = "turbo"
 
 # Multi-device placement, resolved by the shared profile resolver (strix-serve --model inkling2-mini --device-count N, strix-router
