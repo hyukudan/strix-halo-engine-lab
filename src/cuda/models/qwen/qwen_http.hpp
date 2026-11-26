@@ -30,6 +30,8 @@
 #include <utility>
 #include <vector>
 
+#include "strix/serve/http_wire.hpp"
+
 namespace strix::qwen_http {
 
 #ifdef _WIN32
@@ -103,56 +105,24 @@ struct Message {
 
 // Reads one message from `s`, starting with any bytes already in `carry` (and leaving there what follows the message,
 // so a keep-alive connection can read the next one). Without Content-Length a response body runs to the connection's
-// end (requests: no body). Returns an error text, empty on success.
-inline std::string read_message(Sock s, Message& m, std::size_t max_body, bool is_response, std::string& carry) {
-    std::string buf = std::move(carry);
-    carry.clear();
-    char tmp[65536];
-    std::size_t head_end = std::string::npos;
-    while ((head_end = buf.find("\r\n\r\n")) == std::string::npos) {
-        if (buf.size() > 65536) return "headers too large";
-        const int k = recv_some(s, tmp, sizeof(tmp));
-        if (k <= 0) return buf.empty() ? "connection closed" : "truncated headers";
-        buf.append(tmp, static_cast<std::size_t>(k));
-    }
-    const std::string head = buf.substr(0, head_end);
-    std::size_t pos = head.find("\r\n");
-    m.start = head.substr(0, pos);
+// end (requests: no body). Returns an error text, empty on success. The parsing and the limits are the shared
+// strix::serve reader's: a request must arrive within one total deadline (header, then body at >= 1 MiB/s), a
+// Content-Length is plain digits and repeated fields must agree, and the body buffer grows with the bytes received.
+// A reply is read without that deadline (its peer may compute first); the socket's own timeouts bound each wait.
+inline std::string read_message(Sock s, Message& m, std::size_t max_body, bool is_response, std::string& carry,
+                                int request_timeout_ms = 60'000) {
+    strix::serve::HttpWireLimits limits;
+    limits.max_body_bytes = max_body;
+    limits.request_timeout_ms = is_response ? 0 : request_timeout_ms;
+    limits.body_until_close = is_response;
+    strix::serve::HttpWireMessage w;
+    const std::string err = strix::serve::read_http_message(
+        [s](char* p, std::size_t n, int ms) { return strix::serve::wire_recv(s, p, n, ms); }, w, limits, carry);
+    m.start = std::move(w.start);
     m.headers.clear();
-    while (pos != std::string::npos) {
-        const std::size_t next = head.find("\r\n", pos + 2);
-        const std::string line = head.substr(pos + 2, next == std::string::npos ? std::string::npos : next - pos - 2);
-        if (const auto colon = line.find(':'); colon != std::string::npos) m.headers[lower(trim(line.substr(0, colon)))] = trim(line.substr(colon + 1));
-        pos = next;
-    }
-    m.body = buf.substr(head_end + 4);
-    if (!m.header("transfer-encoding").empty() && lower(m.header("transfer-encoding")) != "identity") return "chunked bodies are not supported";
-    const std::string cl = m.header("content-length");
-    if (cl.empty()) {
-        if (!is_response) { carry = std::move(m.body); m.body.clear(); return {}; }
-        for (;;) {
-            const int k = recv_some(s, tmp, sizeof(tmp));
-            if (k <= 0) break;
-            m.body.append(tmp, static_cast<std::size_t>(k));
-            if (m.body.size() > max_body) return "body too large";
-        }
-        return {};
-    }
-    std::size_t want = 0;
-    try {
-        want = static_cast<std::size_t>(std::stoull(cl));
-    } catch (const std::exception&) {
-        return "bad Content-Length";
-    }
-    if (want > max_body) return "body too large";
-    if (m.body.size() > want) { carry = m.body.substr(want); m.body.resize(want); }
-    m.body.reserve(want);
-    while (m.body.size() < want) {
-        const int k = recv_some(s, tmp, std::min(sizeof(tmp), want - m.body.size()));
-        if (k <= 0) return "truncated body";
-        m.body.append(tmp, static_cast<std::size_t>(k));
-    }
-    return {};
+    for (const auto& [k, v] : w.headers) m.headers[k] = v;
+    m.body = std::move(w.body);
+    return err;
 }
 
 inline const char* reason(int status) {
