@@ -66,7 +66,7 @@ struct FakeReadback {
         (void)drain(stream);
     }
     static bool drain(Stream) noexcept {
-        for (std::size_t i = 0; i < count; ++i)
+        for (std::size_t i = 0; i < count && i < queued.size(); ++i)  // copy_to_host bounds count (queued.at)
             std::memcpy(queued[i].dst, queued[i].src, queued[i].bytes);
         count = 0U;
         return true;
