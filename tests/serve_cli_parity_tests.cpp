@@ -385,7 +385,7 @@ void ds41() {
     }
     lanes = 1;
 
-    // ds_par: the options each entry really builds. The pair CLI (apps/deepseek41_prefill_main.cpp options()): positions =
+    // The options each entry really builds. The pair CLI (apps/deepseek41_prefill_main.cpp options()): positions =
     // the prompt, no row cap, no drafter seed. The default server (slot_prefill_options): positions = --context, rows =
     // the auto capacity, and DSpark's 128-row seed. Same request -> same D1 / R256 cells (the seed rides on R256:
     // plan_bounded_replay computes the same rows for any seed <= R).
