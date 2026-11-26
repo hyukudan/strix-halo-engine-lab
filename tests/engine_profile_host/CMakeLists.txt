@@ -60,8 +60,15 @@ add_test(NAME strix-optimization-table-current COMMAND strix-optimization-table 
 set_tests_properties(strix-optimization-table-current PROPERTIES LABELS "cpu;profile" TIMEOUT 60)
 
 # Exercise the real shared cluster resolvers together without device toolchains.
+# The DS41 parity cases also call the production replay and prefix-piece planners.
+# Reuse the host-only cache/IO closure used by the DS41 prefix owner fixture;
+# do not stub the planner or omit its assertions in the standalone gate.
+include("${STRIX_ROOT}/cmake/StrixStateCache.cmake")
 profile_host_test(strix-cluster-serve-cli-parity-tests "${STRIX_ROOT}/tests/serve_cli_parity_tests.cpp"
-    "${STRIX_ROOT}/src/minimax/engine/mm_defaults.cpp" "${STRIX_ROOT}/src/deepseek41_pair_defaults.cpp")
+    "${STRIX_ROOT}/src/minimax/engine/mm_defaults.cpp" "${STRIX_ROOT}/src/deepseek41_pair_defaults.cpp"
+    "${STRIX_ROOT}/src/ds41_prefill.cpp" "${STRIX_ROOT}/src/deepseek41_prefix_cache.cpp"
+    "${STRIX_ROOT}/src/deepseek41_attention_state.cpp")
+target_link_libraries(strix-cluster-serve-cli-parity-tests PRIVATE strix_state_cache)
 target_compile_definitions(strix-cluster-serve-cli-parity-tests PRIVATE
     STRIX_PARITY_GLM=1 STRIX_PARITY_MINIMAX=1 STRIX_PARITY_DS41=1)
 
