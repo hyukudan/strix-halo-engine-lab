@@ -40,8 +40,8 @@ std::string_view consumer_name(TensorConsumer consumer) noexcept {
     using enum TensorConsumer;
     switch (consumer) {
     case first_row_reference: return "first_row_reference";
-    case hca_history_pending: return "hca_history_pending";
-    case mla_layer_pending: return "mla_layer_pending";
+    case hca_history_candidate: return "hca_history_candidate";
+    case mla_layer_candidate: return "mla_layer_candidate";
     case multimax_pending: return "multimax_pending";
     case draft_pending: return "draft_pending";
     case unknown: return "unknown";
@@ -53,7 +53,7 @@ TensorConsumer tensor_consumer(std::string_view name, const Tensor& tensor) noex
     using enum TensorConsumer;
     if (tensor.module == Module::unclassified) return unknown;
     if (tensor.drafter) return draft_pending;
-    if (tensor.layer && layer_is_mla(*tensor.layer)) return mla_layer_pending;
+    if (tensor.layer && layer_is_mla(*tensor.layer)) return mla_layer_candidate;
     switch (tensor.module) {
     case Module::embedding:
     case Module::layer_norm:
@@ -68,10 +68,10 @@ TensorConsumer tensor_consumer(std::string_view name, const Tensor& tensor) noex
     case Module::routed_expert:
     case Module::final_norm:
     case Module::hc_contract: return first_row_reference;
-    case Module::compressor: return hca_history_pending;
+    case Module::compressor: return hca_history_candidate;
     case Module::mla:
     case Module::sparse_indexer:
-    case Module::flash_indexer: return mla_layer_pending;
+    case Module::flash_indexer: return mla_layer_candidate;
     case Module::lm_head: return name == "lm_head.weight" ? first_row_reference : multimax_pending;
     case Module::draft_input:
     case Module::draft_markov:
@@ -97,12 +97,13 @@ PairPayload pair_payload(const Inventory& inventory, unsigned cut) {
 
 CheckpointWeights::CheckpointWeights(Inventory inventory) : inventory_(std::move(inventory)) {}
 
-void CheckpointWeights::read(std::string_view name, std::span<float> out, std::size_t first_element) const {
+void CheckpointWeights::read(std::string_view name, std::span<float> out, std::size_t first_element,
+                             const RowExecutor& execute) const {
     const auto it = inventory_.tensors.find(name);
     if (it == inventory_.tensors.end()) throw std::invalid_argument("ERNIE: missing tensor " + std::string(name));
     const auto& tensor = it->second;
-    if (tensor_consumer(name, tensor) != TensorConsumer::first_row_reference)
-        throw std::invalid_argument("ERNIE: no first-row consumer for " + std::string(name));
+    if (tensor.drafter || tensor.module == Module::unclassified)
+        throw std::invalid_argument("ERNIE: no target consumer for " + std::string(name));
     if (weight::slice_dtype(tensor.wire_dtype) != weight::SliceDtype::bytes) {
         read_plain(name, tensor, out, first_element);
         return;
@@ -128,18 +129,26 @@ void CheckpointWeights::read(std::string_view name, std::span<float> out, std::s
     const auto codes = read_codes(tensor);
     if (codes.size() / packed_width != rows || codes.size() % packed_width != 0)
         throw std::invalid_argument("ERNIE: code slice does not match matrix shape");
+    const auto schedule = [&](const RowRange& decode) {
+        if (execute) execute(rows, decode);
+        else decode(0, rows);
+    };
     if (fp8) {
         std::vector<float> scales(scale_rows * scale_columns);
         read_plain(scale_name, scale, scales);
         const Fp8 matrix(codes, scales, rows, columns);
-        for (std::size_t row = 0; row < rows; ++row) matrix.decode_row(row, out.subspan(row * columns, columns));
+        schedule([&](std::size_t first, std::size_t last) {
+            for (auto row = first; row < last; ++row) matrix.decode_row(row, out.subspan(row * columns, columns));
+        });
     } else {
         const auto scales = read_codes(scale);
         if (scales.size() / scale_columns != rows || scales.size() % scale_columns != 0)
             throw std::invalid_argument("ERNIE: scale slice does not match MXFP4 matrix shape");
-        for (std::size_t row = 0; row < rows; ++row)
-            weight::microscaled::decode_mxfp4_row(std::span(codes).subspan(row * packed_width, packed_width),
-                std::span(scales).subspan(row * scale_columns, scale_columns), out.subspan(row * columns, columns));
+        schedule([&](std::size_t first, std::size_t last) {
+            for (auto row = first; row < last; ++row)
+                weight::microscaled::decode_mxfp4_row(std::span(codes).subspan(row * packed_width, packed_width),
+                    std::span(scales).subspan(row * scale_columns, scale_columns), out.subspan(row * columns, columns));
+        });
     }
 }
 

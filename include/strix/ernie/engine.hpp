@@ -17,6 +17,11 @@ struct ReferenceShape {
 
 using ReferenceRead = std::function<void(std::string_view name, std::span<float> values, std::size_t first_element)>;
 using ReferenceActivation = float (*)(float gate, float up, float beta, float linear_beta);
+using ReferenceProject = std::function<void(const std::string& name, std::span<const float> input,
+                                             std::span<float> output, unsigned groups)>;
+using ExpertObserver = std::function<void(unsigned layer, unsigned expert, std::span<const float> value,
+                                          bool down)>;
+using AttentionRow = std::function<std::vector<float>(std::span<const float>)>;
 
 struct LayerResult {
     std::vector<float> attention_streams;
@@ -33,19 +38,27 @@ struct LayerResult {
 class FirstRowReference {
 public:
     FirstRowReference(ReferenceShape shape, ReferenceRead read, ReferenceActivation activation);
+    FirstRowReference(ReferenceShape shape, ReferenceRead read, ReferenceActivation activation,
+                      ReferenceProject project, ExpertObserver observe_expert);
 
     [[nodiscard]] LayerResult block(unsigned layer, std::span<const float> streams) const;
+    [[nodiscard]] LayerResult block(unsigned layer, std::span<const float> streams,
+                                    const AttentionRow& attend) const;
+    [[nodiscard]] std::vector<float> embed(std::uint32_t token) const;
+    [[nodiscard]] std::vector<float> raw_logits(std::span<const float> streams) const;
     [[nodiscard]] std::vector<float> embedding_first_block_logits(std::uint32_t token) const;
 
 private:
     [[nodiscard]] std::vector<float> read(const std::string& name, std::size_t count, std::size_t first = 0) const;
     void project(const std::string& name, std::span<const float> x, std::span<float> y) const;
     [[nodiscard]] std::vector<float> attention(const std::string& prefix, std::span<const float> input) const;
-    void feed_forward(const std::string& prefix, bool routed, std::span<const float> input, LayerResult& out) const;
+    void feed_forward(unsigned layer, const std::string& prefix, std::span<const float> input, LayerResult& out) const;
 
     ReferenceShape shape_;
     ReferenceRead read_;
     ReferenceActivation activation_;
+    ReferenceProject project_;
+    ExpertObserver observe_expert_;
 };
 
 } // namespace strix::ernie

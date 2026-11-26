@@ -128,6 +128,16 @@ void test_decode() {
     std::vector<float> fp8(codes.size()), mxfp4(64);
     weights.read("fp8.weight", fp8);
     weights.read("mx.weight", mxfp4);
+    const CheckpointWeights::RowExecutor reverse_partitions = [](auto rows, const auto& decode) {
+        decode(rows / 2, rows);
+        decode(0, rows / 2);
+    };
+    std::vector<float> scheduled_fp8(fp8.size()), scheduled_mx(mxfp4.size());
+    weights.read("fp8.weight", scheduled_fp8, 0, reverse_partitions);
+    weights.read("mx.weight", scheduled_mx, 0, reverse_partitions);
+    expect(std::ranges::equal(std::as_bytes(std::span(fp8)), std::as_bytes(std::span(scheduled_fp8))) &&
+           std::ranges::equal(std::as_bytes(std::span(mxfp4)), std::as_bytes(std::span(scheduled_mx))),
+           "quantized decoder partitions preserve FP32 bits");
     expect(fp8[0] == 2 && fp8[255] == 2 && fp8[256] == 0.5F && fp8[257] == -0.75F,
            "128x128 F32-scale FP8 partial tile");
     expect(mxfp4[0] == 2 && mxfp4[1] == -12 && mxfp4[2] == 0 && mxfp4[32] == 0.75F && mxfp4[33] == 1.5F,
@@ -227,13 +237,13 @@ void test_consumers() {
     auto deferred = norm;
     expect(tensor_consumer("norm", norm) == first_row_reference, "bound norm");
     deferred.layer = 7;
-    expect(tensor_consumer("norm", deferred) == mla_layer_pending, "deferred MLA block");
+    expect(tensor_consumer("norm", deferred) == mla_layer_candidate, "candidate MLA block");
     deferred.drafter = true;
     expect(tensor_consumer("norm", deferred) == draft_pending, "deferred DSpark block");
     deferred.drafter = false;
     deferred.layer = 0;
     deferred.module = Module::compressor;
-    expect(tensor_consumer("ape", deferred) == hca_history_pending, "deferred HCA history");
+    expect(tensor_consumer("ape", deferred) == hca_history_candidate, "candidate HCA history");
     deferred.layer.reset();
     deferred.module = Module::lm_head;
     expect(tensor_consumer("multimax_ranges", deferred) == multimax_pending &&

@@ -53,9 +53,11 @@ void hca_carry() {
         if (name.ends_with("linear_o_group_proj")) values[0] = values[3] = 1.0F;
     };
     bool fail_output = false;
-    const auto project = [&](const std::string& name, std::span<const float> input, std::span<float> output) {
+    const auto project = [&](const std::string& name, std::span<const float> input, std::span<float> output, unsigned) {
         if (name.ends_with(".o_proj.weight")) {
             if (fail_output) throw std::runtime_error("mock output projection failure");
+            std::ranges::copy(input, output.begin());
+        } else if (name.ends_with("linear_o_group_proj")) {
             std::ranges::copy(input, output.begin());
         } else if (name.ends_with("linear_kv_proj.weight")) {
             std::ranges::fill(output, input.front());
@@ -169,7 +171,7 @@ void mla_history() {
         if (name.ends_with("layernorm.weight")) std::ranges::fill(values, 1.0F);
         if (name.ends_with("kv_b_proj.weight")) values[nope_dim * lora_rank] = 1.0F;
     };
-    const auto project = [](const std::string& name, std::span<const float> input, std::span<float> output) {
+    const auto project = [](const std::string& name, std::span<const float> input, std::span<float> output, unsigned) {
         std::ranges::fill(output, 0.0F);
         if (name.ends_with("kv_a_proj_with_mqa.weight") || name.ends_with(".o_proj.weight"))
             output[0] = input.front();

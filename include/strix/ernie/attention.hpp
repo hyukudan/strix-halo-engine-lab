@@ -7,7 +7,7 @@
 
 namespace strix::ernie {
 
-using AttentionProject = std::function<void(const std::string&, std::span<const float>, std::span<float>)>;
+using AttentionProject = ReferenceProject;
 
 // One layer of one sequence. Copies own their complete causal history.
 class AttentionHistory {

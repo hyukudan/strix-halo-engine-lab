@@ -52,9 +52,10 @@ struct LayerWeights {
         read(prefix + std::string(role), out, 0);
         return out;
     }
-    void linear(std::string_view role, std::span<const float> input, std::span<float> output) const {
-        if (project) project(prefix + std::string(role), input, output);
-        else core::linear_reference(tensor(role, input.size() * output.size()), input, output);
+    void linear(std::string_view role, std::span<const float> input, std::span<float> output,
+                unsigned groups = 1) const {
+        if (project) project(prefix + std::string(role), input, output, groups);
+        else core::grouped_linear_reference(tensor(role, input.size() / groups * output.size()), input, output, groups);
     }
 };
 
@@ -150,8 +151,7 @@ std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
     window_rope.apply(heads, width, true);
     postmix(w, s, heads);
     std::vector<float> grouped(std::size_t{s.o_groups} * s.o_rank);
-    const auto group_matrix = w.tensor("linear_o_group_proj", heads.size() / s.o_groups * grouped.size());
-    core::grouped_linear_reference(group_matrix, heads, grouped, s.o_groups);
+    w.linear("linear_o_group_proj", heads, grouped, s.o_groups);
     auto output = output_projection(w, q_lora, grouped, s.hidden);
     if (!record_history) return output;
 
