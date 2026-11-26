@@ -5,6 +5,8 @@ project(strix_profile_host_checks LANGUAGES CXX)
 # The full repository build and original engine gates remain separate requirements.
 include(CTest)
 get_filename_component(STRIX_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+include("${STRIX_ROOT}/cmake/StrixHostFp.cmake")
+cmake_language(DEFER CALL strix_host_reference_fp)
 
 function(profile_host_test target)
     add_executable(${target} ${ARGN})

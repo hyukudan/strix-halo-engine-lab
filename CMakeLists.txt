@@ -14,6 +14,8 @@ if(NOT strix_multi_config AND "${CMAKE_BUILD_TYPE}" STREQUAL "")
 endif()
 
 project(strix_engine_lab VERSION 0.1.0 LANGUAGES CXX)
+include(cmake/StrixHostFp.cmake)
+cmake_language(DEFER CALL strix_host_reference_fp)
 include(cmake/StrixWeight.cmake)
 option(STRIX_WFMT_TESTS "Build shared weight-format contract tests" OFF)
 if(STRIX_WFMT_TESTS)
@@ -438,6 +440,20 @@ endif()
 strix_target_warnings(strix_core)
 
 include(CTest)
+if(BUILD_TESTING AND CMAKE_EXPORT_COMPILE_COMMANDS AND CMAKE_GENERATOR MATCHES "Ninja|Makefiles"
+        AND NOT STRIX_CUDA_DS41_ONLY)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        set(strix_host_fp_test_options)
+        if(STRIX_HOST_LOGPROB_UNCONTRACTED)
+            list(APPEND strix_host_fp_test_options --uncontracted-logprob)
+        endif()
+        add_test(NAME strix-host-fp-flags-tests COMMAND ${Python3_EXECUTABLE} -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/host_fp_flags_test.py"
+            "${CMAKE_CURRENT_BINARY_DIR}/compile_commands.json"
+            ${strix_host_fp_test_options})
+    endif()
+endif()
 if(BUILD_TESTING)
     add_executable(strix-ieee-half-tests tests/ieee_half_tests.cpp)
     target_include_directories(strix-ieee-half-tests PRIVATE include)
