@@ -7,7 +7,7 @@
 #include "strix/qsa_committed_pool.hpp"
 #include <iostream>
 #include "strix/serve/state_cache_stats.hpp"
-#include "qwen_cache_admission.hpp"
+#include "strix/qwen/cache_admission.hpp"
 #include "strix/profiles/qwen.hpp"
 
 #include "qwen_prefill_options.hpp"
