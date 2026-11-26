@@ -804,7 +804,7 @@ private:
         for (std::uint32_t row = 0; row < rows; ++row)
             program.block.row[row] = {ids[row], first + row, slot, exec::kStepNoParent, 0U,
                                       static_cast<std::uint32_t>(exec::step_valid), 0U, 0U};
-        const auto& owner = *slots_[slot];
+        auto& owner = *slots_[slot];
         const auto planes = owner.planes();
         program.lanes = {exec::step_lane_view(backend_.window_block(), slot_directory_.data(), decode_rows_, rows),
                          {reinterpret_cast<std::uintptr_t>(planes.keys.data()),
