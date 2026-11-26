@@ -114,6 +114,13 @@ void replay_windows() {
     runner.reset(rt);
     rt.throw_on_launch = false;
     check(run(), "reset should retry failed capture");
+    runner.reset(rt);
+    auto broken = [&]() -> Runtime::Tape* { throw std::logic_error("could not record"); };
+    try {
+        (void)runner.run(rt, 0, true, true, block, destination, broken);
+        throw std::runtime_error("failed recording reached launch");
+    } catch (const std::logic_error&) {}
+    check(!rt.tapes[1] && runner.policy().failed(2), "partially recorded graph was retained");
 }
 
 void dry_arguments() {

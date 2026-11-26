@@ -16,6 +16,8 @@ enum class GraphRows { cohort, single, inclusive_window };
 inline void validate_graph_rows(const StepBlock& block, GraphRows layout = GraphRows::cohort) {
     if (block.h.rows == 0U || block.h.rows > kStepMaxRows)
         throw std::invalid_argument("invalid graph descriptor width");
+    if (block.h.stop_count > kStepMaxStops || (block.h.stop_count && !step_stop_address(block.h)))
+        throw std::invalid_argument("invalid graph stop table");
     if (layout == GraphRows::single && block.h.rows != 1U)
         throw std::invalid_argument("single-row graph requires one row");
     std::uint32_t valid = 0;
@@ -65,16 +67,16 @@ public:
             runtime.discard(index);
             return false;
         }
-        if (action == WidthReplayAction::capture) {
-            bindings_[index] = binding;
-            if (!runtime.capture(stream, index, work)) {
-                runtime.discard(index);
-                policy_.fail(width);
-                return false;
-            }
-            policy_.captured(width);
-        }
         try {
+            if (action == WidthReplayAction::capture) {
+                bindings_[index] = binding;
+                if (!runtime.capture(stream, index, work)) {
+                    runtime.discard(index);
+                    policy_.fail(width);
+                    return false;
+                }
+                policy_.captured(width);
+            }
             runtime.upload(stream, block);
             runtime.launch(stream, index);
         } catch (...) {

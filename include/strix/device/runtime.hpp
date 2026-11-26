@@ -148,7 +148,6 @@ STRIX_DEVICE_RT(Graph_t) record_step_graph(Stream stream, bool& capturing, Work&
     return nullptr;
 }
 
-
 inline Status instantiate_step_graph(STRIX_DEVICE_RT(GraphExec_t)* executable, STRIX_DEVICE_RT(Graph_t) graph) {
 #if defined(__HIPCC__)
     return hipGraphInstantiate(executable, graph, nullptr, nullptr, 0U);

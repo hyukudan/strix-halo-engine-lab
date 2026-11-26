@@ -1005,10 +1005,18 @@ Draft CudaDrafter::draft(std::uint32_t token, bool keep_logits, CudaDraftTimes* 
             m.graph = nullptr;
             cudaGraph_t g = nullptr;
             STRIX_CUDA_CHECK(cudaStreamBeginCapture(m.st, cudaStreamCaptureModeThreadLocal));
-            enqueue_draft_step(m, false, out);
+            try {
+                enqueue_draft_step(m, false, out);
+            } catch (...) {
+                (void)cudaStreamEndCapture(m.st, &g);
+                if (g) (void)cudaGraphDestroy(g);
+                throw;
+            }
             STRIX_CUDA_CHECK(cudaStreamEndCapture(m.st, &g));
-            STRIX_CUDA_CHECK(::strix::device::native::instantiate_segment_graph(&m.graph, g, 0));
-            STRIX_CUDA_CHECK(cudaGraphDestroy(g));
+            const auto installed = ::strix::device::native::instantiate_segment_graph(&m.graph, g, 0);
+            const auto released = cudaGraphDestroy(g);
+            STRIX_CUDA_CHECK(installed);
+            STRIX_CUDA_CHECK(released);
             m.graph_core = m.core;
             m.graph_capacity = m.extra_capacity;
             m.graph_extras = extras;

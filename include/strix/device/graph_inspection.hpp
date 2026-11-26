@@ -12,7 +12,6 @@
 #include <cstddef>
 #include <memory>
 #include <new>
-#include <span>
 
 namespace strix::device::native {
 
@@ -28,7 +27,8 @@ inline bool inspect_raw_step_graph(STRIX_GRAPH_RT(Graph_t) graph, std::size_t& c
     std::unique_ptr<Node[]> nodes{new (std::nothrow) Node[count]};
     if (!nodes || STRIX_GRAPH_RT(GraphGetNodes)(graph, nodes.get(), &count) != STRIX_GRAPH_RT(Success) ||
         count != allocated) return false;
-    for (const auto node : std::span(nodes.get(), count)) {
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto node = nodes[i];
         STRIX_GRAPH_RT(GraphNodeType) kind{};
         if (STRIX_GRAPH_RT(GraphNodeGetType)(node, &kind) != STRIX_GRAPH_RT(Success)) return false;
         if (kind == STRIX_GRAPH_RT(GraphNodeTypeMemcpy) || kind == STRIX_GRAPH_RT(GraphNodeTypeMemset)) continue;
