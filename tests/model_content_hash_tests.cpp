@@ -144,6 +144,30 @@ void windows_cache_tests(const std::filesystem::path& root) {
 }  // namespace
 
 int main() {
+    {  // the pair model identity hashes the parts concurrently with the fast file digest: same bits as the byte oracle,
+       // independent of the order of the parts, repeatable
+        const auto dir = std::filesystem::temp_directory_path() / "strix-identity-parts-test";
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+        std::vector<std::byte> data(3U * 1024U * 1024U + 37U);
+        std::uint32_t x = 99U;
+        for (auto& b : data) {
+            x = x * 1664525U + 1013904223U;
+            b = static_cast<std::byte>(x >> 24U);
+        }
+        const auto a = dir / "a.bin", b = dir / "b.bin";
+        write_file(a, std::string_view(reinterpret_cast<const char*>(data.data()), data.size()));
+        write_file(b, std::string_view(reinterpret_cast<const char*>(data.data()) + 5, data.size() - 5U));
+        const auto full = strix::sha256_file_content(a, strix::FileHashPolicy::full);
+        expect(full == strix::sha256_bytes(data), "file digest equals the byte oracle (fast provider)");
+        const std::vector<strix::ModelContentFile> ab{{"0", a}, {"1", b}}, ba{{"1", b}, {"0", a}};
+        const auto id1 = strix::build_model_content_identity(ab);
+        expect(id1 == strix::build_model_content_identity(ba), "identity does not depend on the order of the parts");
+        expect(id1 == strix::build_model_content_identity(ab), "identity is repeatable");
+        expect(!(id1 == strix::build_model_content_identity(std::vector<strix::ModelContentFile>{{"0", b}, {"1", a}})),
+               "identity depends on which part is which");
+        std::filesystem::remove_all(dir);
+    }
     expect(strix::model_content_identity_hex(strix::sha256_bytes({})) ==
                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
            "SHA-256 empty buffer matches known vector");

@@ -839,7 +839,16 @@ int run(int argc, char** argv) {
     if (layer_pair || tp_rank >= 0) {
         std::vector<strix::ModelContentFile> parts;
         for (std::size_t i = 0; i < o.parts.size(); ++i) parts.push_back({std::to_string(i), o.parts[i]});
+        // The identity hashes every byte of the model on a cold hash cache (minutes): say so, the pair prints nothing else
+        // until the weights are loaded.
+        std::uintmax_t id_bytes = 0;
+        for (const auto& part : o.parts) id_bytes += std::filesystem::file_size(part);
+        std::cout << "pair model identity: hashing " << std::fixed << std::setprecision(1) << static_cast<double>(id_bytes) / 1073741824.0
+                  << " GiB (cached after the first run)\n" << std::flush;
+        const auto id_t0 = std::chrono::steady_clock::now();
         pair_model_identity = strix::build_model_content_identity(parts);
+        std::cout << "pair model identity: done in " << std::setprecision(1)
+                  << std::chrono::duration<double>(std::chrono::steady_clock::now() - id_t0).count() << " s\n" << std::flush;
     }
     if (layer_pair && !stage_map.empty()) {
         if (cut != 0U || pipe_guess || !window_costs.empty())

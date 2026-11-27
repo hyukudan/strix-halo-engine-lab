@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <optional>
 #include <string>
@@ -349,7 +350,9 @@ private:
     std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> context_;
     std::uint64_t total_bytes_ = 0;
 };
-#elif defined(_WIN32)
+#else
+// Every platform without the optional provider hashes files with Sha256Fast: the SHA extensions where the CPU has
+// them (about 1.4 GB/s, against about 0.3 GB/s for the portable code), the portable code otherwise; same digest.
 class FileSha256 {
     Sha256Fast hash_;
 public:
@@ -358,8 +361,6 @@ public:
     }
     ModelContentIdentity finalize(){return hash_.finalize();}
 };
-#else
-using FileSha256 = Sha256;
 #endif
 
 [[maybe_unused]] FileDigest hash_file_stable_uncached(const std::filesystem::path& path, const FileHashProgress& progress={});
@@ -821,9 +822,16 @@ ModelContentIdentity build_model_content_identity(
     aggregate.update(
         "STRIX-MODEL-CONTENT-V1");
 
+    // The files are independent reads: hash them concurrently (a cold two-part model of 168 GB is bound by the
+    // hashing, not the disk); the aggregate below folds the digests in the sorted logical-name order, as before.
+    std::vector<std::future<FileDigest>> digests;
+    digests.reserve(ordered.size());
+    for (const auto* file : ordered)
+        digests.push_back(std::async(ordered.size() > 1U ? std::launch::async : std::launch::deferred,
+                                     [path = file->path] { return hash_file_stable(path); }));
+    std::size_t at = 0;
     for (const auto* file : ordered) {
-        const auto digest =
-            hash_file_stable(file->path);
+        const auto digest = digests[at++].get();
         aggregate.update_u64(
             static_cast<std::uint64_t>(
                 file->logical_name.size()));
