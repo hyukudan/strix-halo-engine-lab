@@ -241,8 +241,19 @@ void scoped_fast_route() {
             if (prompt >= band.min_context && prompt <= band.max_context) return sp::ladder_min_context(band);
         return std::uint64_t{0};
     };
-    require(band_floor(1) == 64 && band_floor(2049) == 2049 && band_floor(8193) == 8193,
-            "the timed floors of the window bands (64, 2,049, 8,193)");
+    require(band_floor(1) == 64 && band_floor(2049) == 2049 && band_floor(8193) == 8193 && band_floor(24577) == 24577,
+            "the timed floors of the window bands (64, 2,049, 8,193, 24,577: timed at 24,576, within the edge tolerance)");
+    require(top == 32768, "the window ledger ends at the 32,768-token gate");
+    // One ladder, two spellings: the spec rows are the decode rows under the spec app's window lever.
+    require(std::size(hp::kSpecBandRows) == std::size(hp::kBandRows), "one band ladder for both apps");
+    for (std::size_t i = 0; i < std::size(hp::kBandRows) && i < std::size(hp::kSpecBandRows); ++i) {
+        const auto& d = hp::kBandRows[i];
+        const auto& s = hp::kSpecBandRows[i];
+        require(d.lever == "wide_rows" && s.lever == "prefill_rows" && d.value == s.value && d.min_context == s.min_context &&
+                    d.max_context == s.max_context && d.speedup == s.speedup && d.receipt == s.receipt &&
+                    d.band_evidence.timed == s.band_evidence.timed && d.band_evidence.gated == s.band_evidence.gated,
+                "the spec band row equals the decode band row but for the lever");
+    }
     for (const auto& row : hp::kQualified) {
         if (row.gate.lever != "wide_rows") continue;
         for (const auto prompt : {row.gate.min_prompt_tokens, (row.gate.min_prompt_tokens + row.gate.max_prompt_tokens) / 2,
@@ -259,9 +270,22 @@ void scoped_fast_route() {
                 require(flags.width == 512 && !flags.exact, "the applied window reaches the engine flags");
             }
             require(previous(resolve({prompt}, sp::Name::standard, no_env, {})), "EXACT keeps its windows inside the band");
+            // The speculative app prefills through the same plan: the same resolver, gate rows and band ladder (its own
+            // execution spelling binds the band row as its own reference).
             const auto spec = resolve({prompt}, sp::Name::fast, no_env, {}, hp::App::spec);
-            require(!sp::applied(window(spec, hp::App::spec).status) && !sp::applied(layers(spec).status),
-                    "the spec app keeps its route (no gate on that execution)");
+            const auto& sw = window(spec, hp::App::spec);
+            if (prompt < band_floor(prompt)) {
+                require(!sp::applied(sw.status) && !sp::applied(layers(spec).status), "spec below the band floor: EXACT windows");
+            } else {
+                require(sw.status == sp::Status::set && sw.value == "512" && !sw.ladder_reference.empty() &&
+                            !sp::applied(layers(spec).status),
+                        "the spec app resolves the band's window through the decode app's resolver");
+                q::PrefillFlags sf;
+                hp::apply_window(hp::App::spec, spec, sf);
+                require(sf.width == 512 && !sf.exact, "the spec app's applied window reaches the engine flags");
+            }
+            const auto spec_exact = resolve({prompt}, sp::Name::standard, no_env, {}, hp::App::spec);
+            require(!sp::applied(window(spec_exact, hp::App::spec).status), "spec EXACT keeps its windows inside the band");
         }
     }
     const std::uint64_t inside = top;

@@ -7183,3 +7183,28 @@ The exact decode attention walks the K/V prefix once per block for `pairs` (row,
 | Inkling 2 Mini | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
 | Hy4 Flash | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
 | Nemotron 3.5 Bolt E4B | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
+
+<a id="qwen-27b-prefill-window-32k"></a>
+## Qwen 27B HIP: 512-row prefill window up to 32,768 tokens, tensor-parallel ranks and the speculative app
+
+**Engine:** `qwen`. **Control:** --profile fast|turbo (band rows); --wide N / --wide-exact N (decode), --prefill-rows N / --prefill-exact (spec). **Default:** ON in FAST and TURBO inside the gated bands (64..32,768 tokens), whole-model prefill (one rank or each --tp-rank), IU4 g64 pack, one lane
+
+FAST and TURBO prefill a Qwen 27B prompt with the 512-row IU4 window inside the gated bands, now up to 32,768 tokens, in the decode app, on each rank of the tensor-parallel decode (every rank prefills the whole prompt) and in the speculative app, all through one resolver and one band ladder.
+
+- **Shared home:** include/strix/profiles/qwen_dense_hip.hpp (band rows through the shared resolver, bind_band_receipts)
+- **Tier and regime:** FAST, TURBO
+- **Exactness evidence:** Lossy FAST lever: gate v2 PASS per class at 32,768 (cuts 32,768 + 32,256, 1,022 rows per class): prose KL 0.00006 top-1 0.9971, code 0.00004 / 0.9961, structured 0.00001 / 1.0000, pooled dNLL -0.00027. EXACT unchanged (2,048-token state-resumed tail == reference). FAST default dump at 32,768 == the gated window arm.
+- **Off switch:** --profile exact, or an explicit window option
+- **Measured gain:** One gfx1151 node: TTFT 32,768 996.5 s (EXACT-64, the previous route) -> 61.5 s default (62.35 s warm window); tensor-parallel pair 8,192: 68.9 -> 16.1 s per rank, same generated ids; spec app --prefill-bench 8192 67.8 -> 12.7 s. 65,536 (explicit --wide 512, no band): 147.7 s. Decode unchanged: 13.21 / 11.47 / 10.74 / 8.65 tok/s at 8K / 24.6K / 32K / 64K.
+- **Preconditions:** gfx1151, IU4 g64 pack, whole-model prefill, one lane, known execution; prompt inside a band.
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: other engine and prefill route (its own band rows) |
+| Qwen3.8 27B dense | bound: HIP decode app, --tp-rank ranks, speculative app (this row) |
+| DeepSeek V4.1 Flash | not bound: model-specific gate rows |
+| GLM 5.3 Flash | not bound: model-specific gate rows |
+| MiniMax M3.1 Flash | not bound: model-specific gate rows |
+| Inkling 2 Mini | not bound: model-specific gate rows |
+| Hy4 Flash | not bound: model-specific gate rows |
+| Nemotron 3.5 Bolt E4B | not bound: model-specific gate rows |

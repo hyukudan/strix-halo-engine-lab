@@ -4794,7 +4794,7 @@ int main() { return 0; }"
         target_include_directories(strix-hip-qwen35-pair PRIVATE src)
         add_executable(strix-hip-qwen35-spec apps/hip_qwen35_spec_main.hip)
         set_target_properties(strix-hip-qwen35-spec PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_link_libraries(strix-hip-qwen35-spec PRIVATE strix_qwen35_hip_engine strix_spec)
+        target_link_libraries(strix-hip-qwen35-spec PRIVATE strix_qwen35_hip_engine strix_spec strix_device)  # device product identity of the prefill regime
         # Measurement probe: IU4 decode projection split by output columns (run_cols) - bits vs the full launch, us per share.
         add_executable(strix-hip-dense-iu4-cols-probe tools/hip_dense_iu4_cols_probe.hip)
         set_target_properties(strix-hip-dense-iu4-cols-probe PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")

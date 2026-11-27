@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -35,6 +36,8 @@
 #include "strix/qwen35/prefill_windows.hpp"
 #include "strix/profiles/qwen_dense_hip.hpp"
 #include "strix/qwen35/hip_spec_defaults.hpp"
+#include "strix/session/checkpoint_io.hpp"
+#include "strix/session/state_image.hpp"
 #include "strix/spec/engine_target.hpp"
 #include "../src/core/dense_linear.hpp"
 #include "../src/core/dense_linear_iu4.hpp"
@@ -92,6 +95,7 @@ int main(int argc, char** argv) try {
     double tp_trip_us = 0.0;       // --tp-trip-us override of the measured trip latency; 0 = measured at start-up
     double tp_gap_us = -1.0;       // --tp-gap-us: measured host gap per join of the staged route (a receipt value); < 0 = unknown
     bool tp_force = false;
+    std::string state_in, state_out;  // --state-in / --state-out: prompt state image (strix/session/state_image.hpp)
     for (std::size_t i = 0; i < args.size(); ++i) {
         const auto& a = args[i];
         auto next = [&]() -> std::string {
@@ -133,6 +137,11 @@ int main(int argc, char** argv) try {
             if (!std::isfinite(tp_gap_us) || tp_gap_us < 0.0) throw std::invalid_argument("--tp-gap-us must be finite and >= 0");
         }
         else if (a == "--tp-force") tp_force = true;
+        // Long references in bounded turns: --state-out FILE writes every layer's state after the prompt; --state-in FILE
+        // imports it and prefills only the prompt past its positions (same ids required). Bytes cross unchanged and the
+        // windows are batch-invariant in EXACT, so the continued run is the uninterrupted one. One rank, no MTP, one pass.
+        else if (a == "--state-in") state_in = next();
+        else if (a == "--state-out") state_out = next();
         else throw std::invalid_argument("unknown flag " + a);
     }
     // The profile resolves for this run (before load): prompt length, device class and product, the IU4 pack, one rank.
@@ -143,24 +152,18 @@ int main(int argc, char** argv) try {
         while (!ids_arg.empty() && std::isspace(static_cast<unsigned char>(ids_arg.back()))) ids_arg.pop_back();
     }
     const auto prompt = parse_ids(ids_arg);
+    // The prefill regime (shared with the speculative app, hip_profile::run_regime): device product, prompt, capacity and
+    // settings; unreadable GGUF header: no IU4 pack, no FAST cell (the load below reports it).
     const std::string device_product = inspect ? std::string{} : strix::device::hip_cost_device_identity();
-    const std::string device_class = device_product.substr(0, std::min(device_product.find('|'), device_product.find(':')));
-    bool iu4_pack = false;
-    try {
-        if (!inspect && !model.empty())
-            for (const auto& t : strix::gguf::read_file(model).tensors) iu4_pack = iu4_pack || t.ggml_type == strix::gguf::type_strix_iu4_g64;
-    } catch (const std::exception&) {
-        iu4_pack = false;  // unreadable header: the load below reports it; no FAST cell qualifies
-    }
+    const bool iu4_pack = !inspect && hip_profile::iu4_pack(model);
     const std::uint64_t capacity = maxpos ? std::uint64_t{maxpos} : prompt.size() + gen + HipEngine::max_rows();
     const std::string settings = "mtp=" + spec_args.mtp + "|tp=" + (tp_rank < 0 ? "off" : "on");
-    const std::string execution = inspect ? std::string{} : strix::profile::ladder_execution({"hip", device_product,
-        {prompt.size(), capacity, 1U, static_cast<std::uint32_t>(std::min<std::size_t>(prompt.size(), 0xFFFFFFFFU)), 0U, 0U, 0U, gen},
-        settings});
+    const auto prefill_run = hip_profile::run_regime(device_product, prompt.size(), capacity, gen, settings);
     auto profile_inputs = command.inputs;
-    profile_inputs.regime = {strix::profile::Phase::prefill, prompt.size(), 1U, device_class, execution};
+    profile_inputs.regime = prefill_run.regime(prompt.size());
+    // --tp-rank splits only the decode: every rank prefills the whole prompt alone first (enable_tp after the prompt).
     const auto profile = hip_profile::resolve_prefill(hip_profile::App::decode, profile_inputs, pf, HipEngine::max_rows(),
-                                                      {tp_rank < 0, iu4_pack});
+                                                      {true, iu4_pack});
     if (hip_profile::finish(hip_profile::App::decode, profile, inspect)) return 0;
     hip_profile::apply_window(hip_profile::App::decode, profile, pf);  // the window the profile applied runs
     if (tp_rank > 1) throw std::invalid_argument("--tp-rank 0|1");
@@ -237,7 +240,39 @@ int main(int argc, char** argv) try {
     };
     // Prompt windows (shared plan, prefill_windows.hpp): chunked by the width the engine resolved, logits only where the
     // plan asks (the last window; every row on the diagnostic dump paths).
-    const PrefillPlan pplan = plan_prefill(pf, prompt.size(), E->prefill_rows(), HipEngine::max_rows());
+    // State image (--state-in / --state-out): the shared codec (strix/session/state_image.hpp, published with
+    // session/checkpoint_io.hpp), one region "layers" = HipEngine::export_state of every layer; the layout key binds the
+    // model file, geometry and the resolved prompt windows, the token history binds the prompt prefix.
+    namespace si = strix::session::state_image;
+    namespace ckio = strix::session::checkpoint_io;
+    std::size_t resumed = 0;  // prompt positions imported from --state-in (the windows below start there)
+    const auto& state_cf = E->config();
+    const std::string state_layout = "qwen35-hip-state v1 model_bytes=" + std::to_string(std::filesystem::file_size(model)) +
+                                     " layers=" + std::to_string(state_cf.layers) + " hidden=" + std::to_string(state_cf.hidden) +
+                                     " prefill_rows=" + std::to_string(E->prefill_rows()) + " exact=" + (opt.wide_exact ? "1" : "0");
+    if (!state_in.empty() || !state_out.empty()) {
+        if (tp_rank >= 0 || chain || repeat > 1U || pf.row_path())
+            throw std::invalid_argument("--state-in / --state-out: one rank, --no-mtp, one pass, window path");
+    }
+    if (!state_in.empty()) {
+        std::vector<std::uint8_t> raw;
+        ckio::read(state_in, raw, ckio::DirectIo::buffered, false);
+        auto image = si::decode(std::as_bytes(std::span<const std::uint8_t>(raw)), state_layout);
+        raw = {};
+        if (image.tokens.size() != image.position || image.position == 0 || image.position >= uprompt.size() ||
+            !std::equal(image.tokens.begin(), image.tokens.end(), uprompt.begin()))
+            throw std::invalid_argument("--state-in: the image's tokens are not a strict prefix of the prompt");
+        if (image.regions.size() != 1U || image.regions[0].name != "layers")
+            throw std::runtime_error("--state-in: the image holds no 'layers' region");
+        resumed = static_cast<std::size_t>(image.position);
+        E->bench_seek(static_cast<std::uint32_t>(resumed));  // committed = the image's positions (the state size follows)
+        const auto& bytes = image.regions[0].bytes;
+        if (bytes.size() != E->state_bytes(0, state_cf.layers))
+            throw std::runtime_error("--state-in: the 'layers' region differs from this engine's state at the image's positions");
+        E->import_state(0, state_cf.layers, static_cast<std::uint32_t>(resumed), bytes.data());
+        std::printf("state in: %s, %zu positions, %zu bytes\n", state_in.c_str(), resumed, bytes.size());
+    }
+    const PrefillPlan pplan = plan_prefill(pf, prompt.size() - resumed, E->prefill_rows(), HipEngine::max_rows());
     std::size_t logit_windows = 0;
     for (const auto& w : pplan.windows) logit_windows += w.tops() ? 1U : 0U;
     std::printf("prefill windows: requested %s, resolved %u rows, %s path, %zu windows, logits on %zu\n",
@@ -251,7 +286,7 @@ int main(int argc, char** argv) try {
     if (chain) chain->reset();
     const auto t_pf0 = std::chrono::steady_clock::now();
     for (const auto& w : pplan.windows) {
-        const auto o = E->forward_commit(uprompt.data() + w.at, w.rows, w.want);
+        const auto o = E->forward_commit(uprompt.data() + resumed + w.at, w.rows, w.want);
         if (const unsigned m = w.tops()) {
             // A window of more rows than the decode window returns every row's logits but only the last row's argmax
             // (engine: the all-rows head of a wide window); read what it returns.
@@ -272,7 +307,19 @@ int main(int argc, char** argv) try {
         std::printf("prefill %u/%u (%s): %zu tokens %.1f ms = %.1f tok/s\n", pass + 1U, repeat,
                     pass == 0U ? "cold" : pass + 1U == repeat ? "warm" : "mid", prompt.size(), pf_ms, double(prompt.size()) * 1000.0 / pf_ms);
     }
-    std::printf("prompt %zu tokens: %.1f ms\n", prompt.size(), pf_ms);
+    if (resumed) std::printf("prompt %zu tokens (state in at %zu: %zu prefilled): %.1f ms\n", prompt.size(), resumed, prompt.size() - resumed, pf_ms);
+    else std::printf("prompt %zu tokens: %.1f ms\n", prompt.size(), pf_ms);
+    if (!state_out.empty()) {
+        E->sync();
+        si::Image image;
+        image.layout = state_layout;
+        image.position = uprompt.size();
+        image.tokens = uprompt;
+        image.regions.push_back({"layers", std::vector<std::byte>(E->state_bytes(0, state_cf.layers))});
+        E->export_state(0, state_cf.layers, image.regions[0].bytes.data());
+        ckio::atomic_write(state_out, si::encode(image));
+        std::printf("state out: %s, %zu positions, %zu bytes\n", state_out.c_str(), prompt.size(), image.regions[0].bytes.size());
+    }
     std::vector<int> generated{int(first_top)};
     // Speculation costs of this device (hip_spec_defaults.hpp hip_dense_measure_costs): after the prompt, before the decode
     // clock starts; discarded windows, the committed state is untouched.
