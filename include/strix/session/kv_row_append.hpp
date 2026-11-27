@@ -250,6 +250,97 @@ public:
         for (const auto& group : groups) group.state->committed_ += group.chunk.rows;
     }
 
+    // One lane of a staged batch: its chunk and its OWN checkpoint workspaces (disjoint from every other lane's
+    // workspaces, histories and tapes), which hold the lane's rollback images until its commit_staged.
+    struct StagedGroup {
+        RowAppendState* state;
+        KvAppendChunk chunk;
+        std::span<float> history_checkpoint;
+        std::span<std::uint16_t> kv_checkpoint;
+    };
+
+    // Staged batch (the mixed verify pass of a cohort): ONE work over several lanes' windows, each lane left staged
+    // exactly as its own append(..., stage = true) would leave it, so each lane then keeps its own prefix with
+    // commit_staged (a taped lane by copies; otherwise restore and a replay of that lane alone). Every lane's
+    // checkpoints are taken first, then the tape choice is made per lane by append's rule (the chunk fits the lane's
+    // bound tape and saved no ring row); the work sees each lane's tape through visit(). A failure before the work
+    // wrote only scratch (nothing published, no lane changed); a failed work, finish or validation retires every lane
+    // of the batch, as append_batch does. No program capture: the work runs eagerly.
+    template <class Backend, class Work, class Validate>
+    static void stage_batch(Backend& backend, std::span<const StagedGroup> groups, Work work, Validate validate) {
+        if (groups.empty()) throw std::invalid_argument("empty resident staged batch");
+        for (std::size_t i = 0; i < groups.size(); ++i) {
+            const auto& group = groups[i];
+            if (!group.state || std::ranges::any_of(groups.first(i), [&](const auto& prior) {
+                    return prior.state == group.state;
+                }))
+                throw std::invalid_argument("invalid or duplicate resident staged lane");
+            group.state->require_append(group.chunk);
+            if (group.history_checkpoint.size() < group.state->history_.size())
+                throw std::invalid_argument("incomplete resident history checkpoint workspace");
+        }
+        for (const auto& group : groups) {
+            for (const auto& other : groups) {
+                // A lane's rollback images may not alias any lane's resident history or tape, nor another lane's images.
+                const auto& o = *other.state;
+                if (spans_overlap(group.history_checkpoint, o.history_) || spans_overlap(group.kv_checkpoint, o.history_) ||
+                    spans_overlap(group.history_checkpoint, o.tape_) || spans_overlap(group.kv_checkpoint, o.tape_))
+                    throw std::invalid_argument("staged batch checkpoint overlaps a lane's resident state");
+                if (&other != &group &&
+                    (spans_overlap(group.history_checkpoint, other.history_checkpoint) ||
+                     spans_overlap(group.kv_checkpoint, other.kv_checkpoint) ||
+                     spans_overlap(group.history_checkpoint, other.kv_checkpoint)))
+                    throw std::invalid_argument("staged batch lanes share a checkpoint workspace");
+            }
+        }
+        struct Taken {
+            std::span<const float> history;
+            KvBackups kv;
+            bool tape;
+        };
+        std::vector<Taken> taken;
+        taken.reserve(groups.size());
+        try {
+            for (const auto& group : groups) {
+                auto& s = *group.state;
+                const auto histories = group.history_checkpoint.first(s.history_.size());
+                const auto backups = s.make_kv_backups(group.chunk, group.kv_checkpoint);
+                backend.copy(std::span<const float>(s.history_), histories);
+                for (const auto& backup : backups) {
+                    if (backup.saved.empty()) break;
+                    backend.copy(std::span<const std::uint16_t>(backup.target), backup.saved);
+                }
+                taken.push_back({histories, backups, group.chunk.rows <= s.tape_rows_ && backups.front().saved.empty()});
+            }
+        } catch (...) {
+            // Only scratch has been written: drain; no lane changed (a failed drain retires the lanes).
+            for (const auto& group : groups) group.state->drain_or_poison([&] { backend.finish(); });
+            throw;
+        }
+        bool completed = false;
+        try {
+            for (std::size_t i = 0; i < groups.size(); ++i)
+                groups[i].state->taping_ = taken[i].tape ? groups[i].chunk.rows : 0U;
+            work();
+            for (const auto& group : groups) group.state->taping_ = 0U;
+            backend.finish();
+            completed = true;
+            validate();
+        } catch (...) {
+            for (const auto& group : groups) {
+                group.state->taping_ = 0U;
+                group.state->poison();
+            }
+            if (!completed) {
+                try { backend.finish(); } catch (...) {}
+            }
+            throw;
+        }
+        for (std::size_t i = 0; i < groups.size(); ++i)
+            groups[i].state->pending_.emplace(
+                Pending{groups[i].chunk.rows, taken[i].history, taken[i].kv, false, taken[i].tape});
+    }
+
     RowAppendState(Plan plan, KvRowPlanes kv, std::span<float> history)
         : plan_(std::move(plan)), kv_(kv), history_(history) {
         if (!slice_kv_visit(plan_, Plan::visits().front(), kv_).keys ||

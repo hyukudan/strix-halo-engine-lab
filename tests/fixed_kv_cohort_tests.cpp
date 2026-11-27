@@ -817,6 +817,203 @@ void test_prompt_tail() {
     static_assert(prompt_slice_rows(8192U, 8192U, 100U, 1024U) == 100U);    // short prompt: all of it
 }
 
+// The mixed pass (FixedKvCohort over a decoder with stage_slot_rows / commit_slot_rows): every drafted lane and every
+// greedy one-row lane of a verify in ONE staged decoder pass, each lane kept or rolled back on its own.
+struct MixedDecoder : WindowDecoder {
+    std::uint32_t passes = 0, decode_passes = 0, max_windows_in_pass = 0, max_rows_in_pass = 0, decode_beside_stage = 0;
+    std::uint32_t mixed_cap = 12U;
+    [[nodiscard]] std::uint32_t max_mixed_rows() const { return mixed_cap; }
+    void decode_slots(std::span<const std::uint32_t> slots, std::span<const std::uint32_t> tokens,
+                      std::span<std::uint32_t> top) {
+        ++decode_passes;
+        if (std::ranges::any_of(staged, [](std::uint32_t r) { return r != 0U; })) ++decode_beside_stage;
+        WindowDecoder::decode_slots(slots, tokens, top);
+    }
+    void stage_slot_rows(std::span<const strix::serve::SlotRows> lanes, std::span<const std::uint32_t> tokens,
+                         std::span<std::uint32_t> top) {
+        if (std::ranges::any_of(staged, [](std::uint32_t r) { return r != 0U; }))
+            throw std::logic_error("mixed pass over staged rows");
+        std::size_t total = 0;
+        for (const auto& lane : lanes) total += lane.rows;
+        if (total != tokens.size() || top.size() != tokens.size() || total > max_mixed_rows())
+            throw std::logic_error("bad mixed pass");
+        std::size_t at = 0;
+        std::uint32_t windows_here = 0;
+        for (const auto& lane : lanes) {
+            if (lane.rows == 0U || lane.rows > max_slot_window() || staged.at(lane.slot) != 0U)
+                throw std::logic_error("bad mixed lane");
+            auto h = history.at(lane.slot);  // the lane's committed state only: rows of other lanes never enter
+            for (std::uint32_t r = 0; r < lane.rows; ++r) {
+                h.push_back(tokens[at + r]);
+                top[at + r] = model(h);
+            }
+            staged[lane.slot] = lane.rows;
+            stage_tokens[lane.slot].assign(tokens.begin() + static_cast<std::ptrdiff_t>(at),
+                                           tokens.begin() + static_cast<std::ptrdiff_t>(at + lane.rows));
+            if (lane.rows > 1U) {
+                ++windows_here;
+                ++windows;
+                window_rows += lane.rows;
+            }
+            at += lane.rows;
+        }
+        ++passes;
+        max_windows_in_pass = std::max(max_windows_in_pass, windows_here);
+        max_rows_in_pass = std::max(max_rows_in_pass, static_cast<std::uint32_t>(total));
+        max_live_with_window = std::max(max_live_with_window, live_slots);
+    }
+    void commit_slot_rows(std::span<const strix::serve::SlotRows> lanes, std::span<const std::uint32_t> tokens,
+                          std::span<const std::uint32_t> keep) {
+        if (keep.size() != lanes.size()) throw std::logic_error("bad mixed commit");
+        std::size_t at = 0;
+        for (std::size_t i = 0; i < lanes.size(); ++i) {
+            const auto slot = lanes[i].slot;
+            const auto rows = tokens.subspan(at, lanes[i].rows);
+            if (staged.at(slot) != lanes[i].rows || keep[i] > lanes[i].rows ||
+                !std::ranges::equal(rows, stage_tokens[slot]))
+                throw std::logic_error("bad mixed lane commit");
+            if (keep[i] == 0U) ++discarded;
+            history[slot].insert(history[slot].end(), rows.begin(), rows.begin() + keep[i]);
+            staged[slot] = 0U;
+            at += lanes[i].rows;
+        }
+    }
+};
+
+struct MixedRun {
+    std::vector<std::vector<std::uint32_t>> ids;
+    std::uint64_t drafted = 0, accepted = 0;
+    std::uint32_t passes = 0, decode_passes = 0, max_windows_in_pass = 0, max_rows_in_pass = 0, decode_beside_stage = 0;
+};
+
+MixedRun run_mixed(std::uint32_t lanes, std::uint32_t rows, std::uint32_t max_draft, std::vector<std::uint32_t> by_live) {
+    using strix::serve::CohortConfig;
+    using strix::serve::CohortDecoder;
+    using strix::serve::CohortRequest;
+    auto decoder = std::make_unique<MixedDecoder>();
+    auto* raw = decoder.get();
+    raw->mixed_cap = rows;
+    FixedKvCohort<MixedDecoder> cohort(std::move(decoder), 512U, rows, lanes);
+    check(cohort.max_batch_verify_rows() == rows && cohort.max_window(0U) == 4U, "mixed: row bound and window bound");
+    CohortConfig config;
+    config.context_draft = max_draft != 0U;
+    config.max_draft = max_draft;
+    config.max_draft_by_live = std::move(by_live);
+    config.prompt_slice = 16U;
+    config.prior = {40.0, 1.0, 1.0, 0.0};  // a draft row is cheap against the pass: the planner drafts every lane
+    config.learn_cost = false;
+    CohortDecoder scheduler(cohort, config);
+    std::vector<CohortRequest> requests;
+    for (std::uint32_t i = 0; i < lanes; ++i) {
+        CohortRequest r;
+        r.id = i + 1U;
+        r.prompt = {31U + i, 32U, 33U, 34U, 35U, 30U + i % 6U};
+        r.max_tokens = 50U + 7U * i;
+        requests.push_back(r);
+        scheduler.submit(r);
+    }
+    for (int step = 0; step < 600 && !scheduler.idle(); ++step) {
+        raw->live_slots = scheduler.live();
+        scheduler.step();
+    }
+    MixedRun out;
+    out.ids.resize(requests.size());
+    for (const auto& r : scheduler.take_finished()) {
+        check(r.error.empty(), "mixed: no request error");
+        out.ids.at(r.id - 1U) = r.ids;
+        out.drafted += r.drafted;
+        out.accepted += r.accepted;
+    }
+    for (const auto& q : requests) check(out.ids.at(q.id - 1U) == solo_ids(q), "mixed: ids per lane == the solo run");
+    out.passes = raw->passes;
+    out.decode_passes = raw->decode_passes;
+    out.max_windows_in_pass = raw->max_windows_in_pass;
+    out.max_rows_in_pass = raw->max_rows_in_pass;
+    out.decode_beside_stage = raw->decode_beside_stage;
+    return out;
+}
+
+void test_mixed_pass() {
+    // Direct contract: two drafted lanes and a greedy one-row lane in one staged pass; a one-row lane that reads
+    // scores runs after it (decode_slots); each lane commits its own prefix; a released lane's rows are discarded.
+    {
+        auto decoder = std::make_unique<MixedDecoder>();
+        auto* raw = decoder.get();
+        FixedKvCohort<MixedDecoder> cohort(std::move(decoder), 64U, 12U, 4U);
+        for (std::uint32_t lane = 0; lane < 4U; ++lane) {
+            const std::uint32_t prompt[] = {31U + lane, 32U, 33U};
+            cohort.prefill(lane, prompt, true);
+        }
+        const auto base = raw->history;
+        const CohortGroup groups[] = {{0U, 3U, false}, {1U, 1U, true}, {2U, 1U, false}, {3U, 4U, false}};
+        const std::uint32_t tokens[] = {30U, 35U, 34U, 30U, 31U, 32U, 33U, 34U, 35U};
+        std::uint32_t top[9] = {};
+        cohort.verify(groups, tokens, top);
+        check(raw->passes == 1U && raw->decode_passes == 1U && raw->last_slots == std::vector<std::uint32_t>{1U},
+              "mixed: one staged pass, the score-reading lane alone in decode_slots after it");
+        check(raw->staged[0] == 3U && raw->staged[1] == 0U && raw->staged[2] == 1U && raw->staged[3] == 4U,
+              "mixed: windows and greedy one-row lanes staged per slot");
+        auto h0 = base[0];
+        for (std::size_t r = 0; r < 3U; ++r) {
+            h0.push_back(tokens[r]);
+            check(top[r] == MixedDecoder::model(h0), "mixed: lane 0 picks == its lone window");
+        }
+        auto h3 = base[3];
+        for (std::size_t r = 0; r < 4U; ++r) {
+            h3.push_back(tokens[5U + r]);
+            check(top[5U + r] == MixedDecoder::model(h3), "mixed: lane 3 picks == its lone window");
+        }
+        const std::uint32_t over[] = {4U, 1U, 1U, 1U};
+        check(throws([&] { cohort.commit(over); }), "mixed: a keep beyond the window refused");
+        cohort.release(3U);
+        const std::uint32_t keep[] = {2U, 1U, 1U, 3U};
+        cohort.commit(keep);
+        check(raw->history[0].size() == base[0].size() + 2U && raw->history[1].size() == base[1].size() + 1U &&
+                  raw->history[2].size() == base[2].size() + 1U && raw->history[3].size() == base[3].size(),
+              "mixed: per-lane prefixes kept, the released lane's rows discarded");
+        check(std::ranges::all_of(raw->staged, [](std::uint32_t r) { return r == 0U; }), "mixed: nothing stays staged");
+        // An uncommitted mixed pass is discarded before the next backend work (every lane's rows dropped).
+        const auto before = raw->history;
+        const CohortGroup again[] = {{0U, 2U, false}, {2U, 2U, false}};
+        const std::uint32_t t2[] = {30U, 31U, 30U, 31U};
+        std::uint32_t top2[4] = {};
+        cohort.verify(again, t2, top2);
+        const std::uint32_t prompt[] = {40U};
+        cohort.prefill(1U, prompt, false);
+        check(raw->history[0] == before[0] && raw->history[2] == before[2], "mixed: an abandoned pass is discarded");
+        // One-row verifies keep the incumbent decode_slots pass (no staging).
+        const auto passes = raw->passes;
+        const CohortGroup ones[] = {{0U, 1U, false}, {2U, 1U, false}};
+        const std::uint32_t t3[] = {30U, 31U};
+        std::uint32_t top3[2] = {};
+        cohort.verify(ones, t3, top3);
+        const std::uint32_t k3[] = {1U, 1U};
+        cohort.commit(k3);
+        check(raw->passes == passes, "mixed: a one-row verify does not stage");
+        // Beyond the decoder's mixed bound: refused before any work.
+        raw->mixed_cap = 3U;
+        check(throws([&] { cohort.verify(again, t2, top2); }) && raw->passes == passes,
+              "mixed: a pass beyond max_mixed_rows refused");
+    }
+    // End to end: every live lane drafts (by-live table empty) and the verify of all lanes is one pass per round;
+    // ids per lane equal the solo run at 2, 4 and 8 lanes.
+    for (const std::uint32_t lanes : {2U, 4U, 8U}) {
+        const auto run = run_mixed(lanes, 4U * lanes, 3U, {});
+        check(run.drafted > 0U && run.accepted > 0U, "mixed: lanes drafted and kept drafts");
+        check(run.max_windows_in_pass >= 2U, "mixed: several lanes' windows verified in one pass");
+        check(run.max_rows_in_pass <= 4U * lanes, "mixed: a pass within the row bound");
+        check(run.decode_beside_stage == 0U, "mixed: greedy lanes never run a second pass in a round");
+        std::printf("mixed lanes %u: passes %u decode passes %u max windows/pass %u max rows/pass %u drafted %llu "
+                    "accepted %llu\n", lanes, run.passes, run.decode_passes, run.max_windows_in_pass,
+                    run.max_rows_in_pass, static_cast<unsigned long long>(run.drafted),
+                    static_cast<unsigned long long>(run.accepted));
+    }
+    // The live-lane table still caps drafts: {3, 0} keeps the incumbent one-drafting-lane rule.
+    const auto capped = run_mixed(4U, 16U, 3U, {3U, 0U});
+    check(capped.max_windows_in_pass <= 1U, "mixed: the by-live table caps drafting lanes");
+}
+
+
 int main() {
     test_prompt_tail();
     test_geometry();
@@ -828,6 +1025,7 @@ int main() {
     test_prefill_route_selected();
     test_verify_windows();
     test_lane_binding();
+    test_mixed_pass();
     if (failures != 0) {
         std::fprintf(stderr, "fixed-kv-cohort: %d failures\n", failures);
         return EXIT_FAILURE;
