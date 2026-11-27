@@ -3077,7 +3077,7 @@
     "preconditions": "strix-glm5-serve with MTP on and sampling available; one sampled request decoding (C1); never in batched verify (G2).",
     "off_switch": "STRIX_GLM_SERVE_SAMPLED_MTP=0 or unset (plain steps); =coupled keeps the tokens of plain sampling; =rejection (--profile fast or turbo only) selects rejection sampling, exact in distribution, not token-equal to plain sampling.",
     "doc_anchor": "docs/optimizations.md#glm-serve-sampled-mtp"
-  ,"all_on":{"lever":"glm_sampled_mtp","identity":"pending","class":"exact","gate":"none","engines":["glm"],"backends":["hip"],"phase":"decode","env":"STRIX_GLM_SERVE_SAMPLED_MTP","value":"1","needs":[]}},
+  ,"all_on":{"lever":"glm_sampled_mtp","identity":"pending","class":"exact","gate":"none","engines":["glm"],"backends":["hip"],"phase":"decode","env":"STRIX_GLM_SERVE_SAMPLED_MTP","value":"coupled","needs":[]}},
   {
     "engine": "glm",
     "name": "Server decode-first chunked prefill",
