@@ -112,7 +112,7 @@ DecodeAttentionBands server_decode_bands(const Options& o) {
         // The startup resolution exported its own decode_attention value (exact) into the environment: not an explicit
         // user setting (the gate above saw none), so this lookup does not report it.
         request.env = [](const char* key) -> const char* {
-            return std::string_view(key) == "STRIX_G4_DECODE_ATTN" ? nullptr : std::getenv(key);
+            return std::string_view(key) == "STRIX_G4_DECODE_ATTN" ? nullptr : strix::envcfg::text(key);
         };
         request.regime = {strix::profile::Phase::decode,regime->prompt_tokens,lanes,"gfx1151",regime->execution};
         const auto resolved = profile::resolve(name,app,request);
