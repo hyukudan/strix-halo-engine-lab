@@ -6576,10 +6576,15 @@ it in `src/inkling2/inkling2_mini_weight_options.hpp` (qualifiable policy), `src
   (+7.8 %). Token ids equal the BF16 run on both prompts; MTP acceptance is unchanged (prose 429 / 437 both arms). The
   same arm without speculation decodes at 28.5 ms (the former decline). Served decode not measured: the arm is command
   line only.
-- **Why no FAST row yet:** a FAST decision row (`kMiniWeightLoadDecisionRows`, decode regime) needs a served receipt at
-  the step widths 1, 8 and 16 (16 slots, context 16384, ABBA against FAST); the served lever exists
+- **Why no FAST row yet:** a FAST decision row (`kMiniWeightLoadDecisionRows`, decode regime) needs a served receipt
+  across the step band (16 slots, context 16384, ABBA against FAST); the served lever exists
   (`STRIX_INK_LOWBIT_HEAD=sp4t-attn` with `STRIX_LOWBIT_PACK`; the CUDA server refuses it). The gate PASS above is its
   quality half.
+- **Step widths:** every cohort width from 1 to the band (16) reads the low-bit image. With only widths 1, 8 and 16 a
+  lane switched between the low-bit and the BF16 image while the cohort grew and shrank, so its ids followed the
+  arrival timing (lane 0 of eight requests differed from its lone run, two identical eight-request runs differed).
+  Served on gfx1151 (8 slots, context 4096, 128 tokens): lane 0 of eight requests equals its lone run and two runs
+  agree; two requests 34.28 -> 37.75 tokens/s, four 45.24 -> 47.14, eight-request pass 77.5 ms.
 - **Off switch:** do not pass the qualification arm.
 
 | model | SP4 attention + head decode arm |
