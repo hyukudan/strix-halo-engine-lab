@@ -4931,6 +4931,7 @@ static int run_decode_entry(
                         dump_options.mtp_bundle_path.clear();
                         dump_options.mtp.golden.clear();dump_options.mtp.golden_sha256.clear();
                         dump_options.mtp.golden_dump=temp.string();
+                        strix::decode_cli::withdraw_mtp_copy_wide(dump_options, "calibration golden dump runs no wide copy cycle");
                         std::ostringstream ignored;
                         strix::decode_cli::run_mtp_decode_bridge(dump_options,model,compiled,parents,session,direct_dispatcher,
                             generations,catalog_config.deferred_moe_status,optimization_profile.selected,ignored,make_window);

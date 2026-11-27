@@ -1389,6 +1389,16 @@ inline constexpr std::array<std::uint32_t, 4> default_known_prefill_tail_rows{10
 // tiled tail block of a default size (explicit tails, a 2048-row fallback tile, an untiled prompt) or runs the baseline,
 // the default is withdrawn entirely and the command runs exactly as without it; it never turns into a startup error.
 // Explicit --mtp-copy-wide-rows keeps its own validation. Not decided while the HTTP prefill is still pending.
+// The wide copy cycle is a decode-time accelerator of a live request: a calibration golden dump (one prompt, no
+// request) never runs it, and validate_mtp_cli refuses --mtp-copy-wide-rows together with a golden dump. A server's
+// first start generates the missing golden through such a dump of its own options, so the dump copy drops the cycle.
+inline void withdraw_mtp_copy_wide(Options& options, const char* reason) {
+    auto& m = options.mtp;
+    m.copy_wide_rows.clear();
+    m.ngram_context = m.ngram_copy_edit = m.ngram_wide_only = false;
+    m.copy_wide_auto = m.copy_wide_default = false;
+    m.copy_wide_reason = reason;
+}
 inline void settle_mtp_copy_wide_default(Options& options) {
     auto& m = options.mtp;
     if (!m.copy_wide_default || http_prefill_pending(options)) return;
@@ -1397,10 +1407,7 @@ inline void settle_mtp_copy_wide_default(Options& options) {
         std::all_of(m.copy_wide_rows.begin(), m.copy_wide_rows.end(),
             [&](std::uint32_t rows) { return std::find(tails.begin(), tails.end(), rows) != tails.end(); });
     if (kept) return;
-    m.copy_wide_rows.clear();
-    m.ngram_context = m.ngram_copy_edit = m.ngram_wide_only = false;
-    m.copy_wide_auto = m.copy_wide_default = false;
-    m.copy_wide_reason = "served default withdrawn: the resolved prompt route has no tiled tail block of the wide size";
+    withdraw_mtp_copy_wide(options, "served default withdrawn: the resolved prompt route has no tiled tail block of the wide size");
 }
 inline void apply_default_known_prefill_tail_rows(Options& options, const char* schedule) {
     if (!options.known_prefix_tail_rows.empty() || options.known_prefix_tail_rows_off || !options.known_prefix_window ||

@@ -472,6 +472,18 @@ void campaign_defaults_contract(){
                 !withdrawn.mtp.ngram_copy_edit && !withdrawn.mtp.ngram_wide_only && !withdrawn.mtp.copy_wide_auto &&
                 withdrawn.known_prefix_tail_rows==std::vector<std::uint32_t>{64U,16U} &&
                 withdrawn.mtp.copy_wide_reason.find("withdrawn")!=std::string::npos,"tails without the wide size withdraw the default");
+            {   // A server's first start dumps its calibration golden from a copy of its own options: the served wide default
+                // would make that dump invalid (copy-wide + golden dump), so the dump copy withdraws it and stays valid.
+                auto dump=def;dump.mtp.golden.clear();dump.mtp.golden_sha256.clear();dump.mtp.golden_dump="g.tmp";
+                bool refused=false;
+                try{validate_resolved_mtp_cli(dump);}catch(const std::invalid_argument& e){refused=std::string(e.what()).find("no golden dump")!=std::string::npos;}
+                require(refused,"the served wide default is refused together with a golden dump");
+                withdraw_mtp_copy_wide(dump,"dump");
+                require(dump.mtp.copy_wide_rows.empty() && !dump.mtp.copy_wide_default && !dump.mtp.ngram_copy_edit,"withdraw clears the cycle");
+                bool still_refused=false;
+                try{validate_resolved_mtp_cli(dump);}catch(const std::invalid_argument& e){still_refused=std::string(e.what()).find("wide")!=std::string::npos;}
+                require(!still_refused,"the golden dump copy no longer trips the wide-copy validation");
+            }
             auto baseline=def;baseline.baseline=true;settle_mtp_copy_wide_default(baseline);
             require(!baseline.mtp.copy_wide_default && baseline.mtp.copy_wide_rows.empty(),"the baseline withdraws the default");
             auto pending=def;pending.known_prefix_prefill_rows=0U;pending.known_prefix_prefill_explicit=false;
