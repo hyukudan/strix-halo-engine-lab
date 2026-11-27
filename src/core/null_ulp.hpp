@@ -7,7 +7,6 @@
 // a hash of (seed, index), so seeds sample the noise. Zero and non-finite values are left untouched.
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 
 #if defined(__HIPCC__)
 #include <hip/hip_runtime.h>
@@ -20,12 +19,12 @@ namespace strix::core::null_ulp {
 
 STRIX_NULL_HD inline std::uint32_t bits_of(float f) {
     std::uint32_t b;
-    std::memcpy(&b, &f, 4);
+    __builtin_memcpy(&b, &f, 4);
     return b;
 }
 STRIX_NULL_HD inline float float_of(std::uint32_t b) {
     float f;
-    std::memcpy(&f, &b, 4);
+    __builtin_memcpy(&f, &b, 4);
     return f;
 }
 
