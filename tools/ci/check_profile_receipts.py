@@ -54,7 +54,7 @@ def check_doc_links():
 
 def check_qwen():
     source = read(PROFILES + "qwen_dense_hip.hpp")
-    receipt = section(QWEN, "fast-prefill-window-hip-decode-app")
+    receipt = section(QWEN, "fast-prefill-window-hip-decode-and-speculative-apps")
     band_table = read("docs/band-edges.md")
     for suffix, tokens in (("2k", "2,048"), ("8k", "8,192"), ("24k", "24,576")):
         gate, = fields(source, rf'kGate{suffix}\s*=\s*"([^"]+)";', f"kGate{suffix}")

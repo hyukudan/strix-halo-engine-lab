@@ -7,7 +7,7 @@ public evidence.
 
 | Header constants | Public evidence checked |
 | --- | --- |
-| `qwen_dense_hip.hpp` `kGate{2,8,24}k`, `kTime{2,8,24}k`, `kWide{2,8,24}k` | Gate outcomes and rounded timing arms in the [Qwen model record](../models/qwen3.8-27b/README.md#fast-prefill-window-hip-decode-app). Receipt strings are also compared to the [band table](../band-edges.md). |
+| `qwen_dense_hip.hpp` `kGate{2,8,24}k`, `kTime{2,8,24}k`, `kWide{2,8,24}k` | Gate outcomes and rounded timing arms in the [Qwen model record](../models/qwen3.8-27b/README.md#fast-prefill-window-hip-decode-and-speculative-apps). Receipt strings are also compared to the [band table](../band-edges.md). |
 | `inkling2_mini.hpp` `kMiniWeightLoadRows` | Date, sample count and context band in the [Q8 evidence register](../decisions/evidence-register.md#inkling-2-mini-q8_0-attention-and-head-on-gfx1151). |
 | `inkling2_mini.hpp` `kMiniWeightLoadDecisionRows`, `kMiniLowBitPackIdentity`, `kMiniLowBitMeasuredExtent`, `kMiniLowBitStepBand` | Sample count, scope, pack prefix, gate metrics and timing arms in the [calibration record](lowbit-calibration.md#inkling-2-mini-rows-gfx1151-hip-71). |
 

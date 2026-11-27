@@ -266,10 +266,11 @@ void minimax() {
     const auto server = sp::from_lines(md::effective_config(md::parse_cli("serve", {}), none));
     static constexpr sp::Allowed allowed[] = {
         {"app", "the entry point's own name", "effective_config receipt label, not an execution value"},
-        {"session_reason", "text that quotes the app and transport names", "effective_config explanation only"},
-        // EXCEPTION for the user (not measured server vs CLI on the same transport): the server defaults to the device
-        // exchange, the CLI to the host exchange.
-        {"transport", "serve default usb4gpu (device exchange), rank default usb4-auto (host exchange)"},
+        {"session_reason", "explanation of the session_cache row (quotes the app and transport names)", "effective_config explanation only"},
+        // Both entry points default to the host exchange (usb4-auto); on it the server admits its session cache across
+        // requests (serve/usb4-auto is the gated session route), which a one-shot CLI run does not have.
+        {"session_cache", "server session cache across requests on the gated host route; one-shot CLI keeps no session",
+         "tools/minimax/session_cache_gate.sh on serve/usb4-auto: automatic and explicit ON output == OFF output"},
         {"serve.*", "scheduler / speculation policy between concurrent requests; no CLI counterpart"},
         // One host-path table (mm_defaults host_defaults()), two columns:
         {"host.STRIX_DIST_USB4_TIMEOUT_MS", "transport only: a request fails within a minute when the peer is gone"},

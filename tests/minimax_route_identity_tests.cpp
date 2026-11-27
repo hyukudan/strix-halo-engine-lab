@@ -513,8 +513,10 @@ void host_pin_selector() {
 }
 void selector_boundary_proofs() {
     using namespace strix::minimax::defaults;
-    const Cli serve = parse_cli("serve", {});
-    require(serve.transport == "usb4gpu", "serve direct transport construction default");
+    // The serve default is the host route; the direct route is an explicit --transport usb4gpu, still refused below.
+    require(parse_cli("serve", {}).transport == "usb4-auto", "serve host transport construction default");
+    const Cli serve = parse_cli("serve", {"M", "--transport", "usb4gpu"});
+    require(serve.transport == "usb4gpu", "serve explicit direct transport construction");
     const Lookup explicit_cache = [](const char* key) -> const char* {
         return std::string_view(key) == "STRIX_SESSION_CACHE" ? "on" : nullptr;
     };

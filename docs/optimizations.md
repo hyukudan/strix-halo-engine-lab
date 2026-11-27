@@ -1445,7 +1445,7 @@ than the decode window read back the one argmax the engine returns for them (the
   8,193-24,575) and runs with MTP on are covered by the gate classes, not by a timing receipt.
 - **Implementation / evidence:** [profile rows](../include/strix/profiles/qwen_dense_hip.hpp),
   [shared band receipts](../include/strix/engine_profile.hpp), [prefill windows](../include/strix/qwen35/prefill_windows.hpp),
-  [model page](models/qwen3.8-27b/README.md#fast-prefill-window-hip-decode-app)
+  [model page](models/qwen3.8-27b/README.md#fast-prefill-window-hip-decode-and-speculative-apps)
 
 <a id="qwen27-hip-decode-attn-row-share"></a>
 
