@@ -218,7 +218,7 @@ raw-getenv apps/hip_mtp_decode_bridge.hpp 38
 raw-getenv apps/hip_mtp_wide_copy.hpp 1
 raw-getenv apps/hip_prefix_state_cache.hpp 4
 raw-getenv apps/hip_qwen_prefill_mtp_handoff.inc 6
-raw-getenv apps/hy4_rank_main.cpp 3
+raw-getenv apps/hy4_rank_main.cpp 2
 raw-getenv apps/minimax_rank_main.cpp 60
 raw-getenv apps/prefix_state_cache_identity.hpp 4
 raw-getenv apps/qwen_cache_family_contract.hpp 1
