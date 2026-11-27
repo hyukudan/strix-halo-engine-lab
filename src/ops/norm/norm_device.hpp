@@ -34,11 +34,13 @@ template <class Store>
 inline constexpr bool replaces_row_store = requires { requires Store::kReplacesRow; };
 
 // The output expression of rmsnorm_row for element i (v = the row value, r = the RMS factor, wi = the weight when the
-// Traits read one), then the optional second store.
+// Traits read one), then the optional second store. Traits::numerator(v), when declared, replaces the row value in the
+// output only (the RMS factor keeps the unrounded sum of squares); Traits without it emit the same code as before.
 template <class Traits, class Store>
 __device__ __forceinline__ void rmsnorm_emit(const typename Traits::Scale* w, typename Traits::ScaleFormat wt, float* yr,
                                              std::size_t base, const Store& store, unsigned i, float v, float r, float wi) {
     constexpr OutputForm form = output_form_of<Traits>();  // the Traits' output rounding (norm.hpp OutputForm)
+    if constexpr (requires { Traits::numerator(v); }) v = Traits::numerator(v);
     float y = 0.0F;
     if constexpr (requires { Traits::finish(v * r, wt); }) y = Traits::finish(v * r, wt);
     else if constexpr (form == OutputForm::plain) y = w ? (v * r) * wi : v * r;
