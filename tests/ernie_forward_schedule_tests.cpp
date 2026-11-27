@@ -171,6 +171,25 @@ int main() try {
         (void)bounded.append(std::span(prompt).last(1));
     } catch (const std::invalid_argument&) { rejected = true; }
     check(rejected, "bounded attention accepted an unreachable position");
+    auto checkpoint = shape;
+    checkpoint.contracts.router = ernie::RouterContract::summed_scores;
+    checkpoint.contracts.vha = ernie::VhaContract::swapped;
+    checkpoint.contracts.norm_routed_output = true;
+    checkpoint.contracts.checkpoint_attention = true;
+    checkpoint.contracts.checkpoint_hc = true;
+    checkpoint.contracts.checkpoint_stores = true;
+    ernie::CpuReference checkpoint_batch(checkpoint, fixture, soft);
+    const auto batch_logits = checkpoint_batch.append(prompt);
+    ernie::CpuReference checkpoint_step(checkpoint, bounded_read, soft, {}, {}, {}, std::size(prompt));
+    (void)checkpoint_step.append(std::span(prompt).first(1));
+    const auto step_logits = checkpoint_step.append(std::span(prompt).last(1));
+    check(std::ranges::equal(batch_logits, step_logits, [](float a, float b) {
+        return std::bit_cast<std::uint32_t>(a) == std::bit_cast<std::uint32_t>(b);
+    }), "checkpoint prefill and incremental decode changed logits");
+    const auto checkpoint_rows = checkpoint_batch.prefill(checkpoint_batch.embed_rows(prompt), 0, ernie::kLayerCount);
+    core::linear_reference(head, checkpoint_batch.head_input(checkpoint_rows.back()), scores);
+    check(scores == batch_logits, "checkpoint teacher-forced and greedy head differ");
+
     return 0;
 } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';
