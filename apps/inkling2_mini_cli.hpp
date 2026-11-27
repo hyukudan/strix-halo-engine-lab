@@ -27,6 +27,7 @@ struct Options {
     const char* host_pack{};
     const char* host_pack_hot{};
     bool dspark_off{};  // --dspark off: no drafter, not even the model's sidecar under auto
+    const char* dflash{};  // --dflash DIR: the block-diffusion drafter directory (config.json + model.safetensors)
     const char* gate_manifest{};
     const char* gate_out{};
     const char* gate_arm{};
@@ -50,6 +51,10 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
                 const char* file = value();
                 options.dspark_off = std::string_view(file) == "off";
                 options.dspark = options.dspark_off ? nullptr : file;
+                return true;
+            }
+            if (argument == "--dflash" && native) {
+                options.dflash = value();
                 return true;
             }
             if (!native) {
@@ -113,6 +118,13 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
             std::filesystem::equivalent(generation.logits, options.dspark))
             throw std::invalid_argument("logits output must differ from the DSpark sidecar");
     }
+    if (options.dflash) {
+        if (options.dspark || options.dspark_off)
+            throw std::invalid_argument("--dflash and --dspark name one drafter: choose one");
+        if (gate || generation.tokenize_file || generation.speculation != serve::CliSpeculation::automatic ||
+            token_sampling_enabled(generation.sampling))
+            throw std::invalid_argument("--dflash requires greedy --speculation auto with model generation");
+    }
     options.weights.lowbit_turbo = mini_lowbit_turbo(options.tier);
     if (native) apply_mini_lowbit_head(options.weights, options.tier);
     else if (const auto* head = options.tier.find(kMiniLowBitHead); head != nullptr && head->value != "0")
@@ -149,7 +161,7 @@ inline StepProgramOptions extract_step_program(std::vector<char*>& args) {
     constexpr std::string_view value_options[]{
         "--generate", "--logits", "--temperature", "--top-k", "--top-p", "--min-p", "--seed", "--prompt", "--messages",
         "--tokenize", "--tokenizer", "--prefill-chunk", "--profile", "--gate-manifest", "--gate-out",
-        "--gate-arm", "--gate-rows", "--gate-mode", "--dspark", "--speculation",
+        "--gate-arm", "--gate-rows", "--gate-mode", "--dspark", "--dflash", "--speculation",
     };
     StepProgramOptions options;
     auto output = args.begin() + 2;
@@ -247,8 +259,8 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
     require_mini_expert_consumer(options.tier, false);
     if (options.gate_order_null)
         throw std::invalid_argument("--gate-order-null requires resident replay with --step-graph or --no-step-graph");
-    if (options.dspark)
-        throw std::invalid_argument("CUDA step program does not support --dspark; choose resident replay "
+    if (options.dspark || options.dflash)
+        throw std::invalid_argument("CUDA step program does not support --dspark / --dflash; choose resident replay "
                                     "with --step-graph or --no-step-graph");
     const auto selected = std::span{&kProgramDecoder, 1U};
     const auto can_verify = exec::resolve_decode_route(selected, {.verifier = true, .sampled_verifier = sampled});

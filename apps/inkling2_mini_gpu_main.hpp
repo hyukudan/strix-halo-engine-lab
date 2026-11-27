@@ -10,6 +10,7 @@
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 #include "inkling2/inkling2_mini_program_cuda.hpp"
 #endif
+#include "inkling2/inkling2_mini_resident_dflash.hpp"
 #include "inkling2/inkling2_mini_resident_dspark.hpp"
 #include "inkling2/inkling2_mini_weight_device.hpp"
 #include "strix/env_flags.hpp"
@@ -45,9 +46,10 @@ public:
                      moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16,
                      bool combine_image = false, bool prepared_round_fold = false, bool narrow_experts = false,
                      bool controller_one_plane = false, bool attn_projected_bias = false, bool screened_head = false,
-                     unsigned verify_rows = 0U, MiniLowBitRows lowbit = {}, bool plain_program = false)
+                     unsigned verify_rows = 0U, MiniLowBitRows lowbit = {}, bool plain_program = false,
+                     const char* dflash = nullptr)
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
-                   load.verify_rows, dspark != nullptr, 1U, load.prefill_tail, narrow_experts, controller_one_plane, false, lowbit),
+                   load.verify_rows, dspark != nullptr || dflash != nullptr, 1U, load.prefill_tail, narrow_experts, controller_one_plane, false, lowbit),
           projected_bias_(attn_projected_bias) {
         const auto levers = configure_mini_decoder(decoder_, moe_w4a4, combine_image, prepared_round_fold,
                                                    attn_projected_bias, screened_head, verify_rows);
@@ -57,6 +59,15 @@ public:
                   << '\n';
         std::cerr << "Inkling verify_rows " << mini_verify_rows_name(levers.verify_rows, verify_rows) << '\n';
         if (dspark) drafter_.emplace(decoder_, load.positions, dspark);
+        // The block-diffusion drafter (--dflash DIR): the shared device forward over the same tap plane.
+        if (dflash) {
+            if (auto problem = MiniDFlashTarget::problem(dflash); !problem.empty())
+                throw std::invalid_argument("--dflash " + std::string(dflash) + ": " + problem);
+            dflash_ = std::make_unique<MiniResidentDFlash>(MiniDFlashTarget{decoder_}, dflash);
+            std::cerr << "inkling2 drafter dflash block " << dflash_->config().block << " layers "
+                      << dflash_->config().layers << " window " << dflash_->config().window << " selector top-k "
+                      << dflash_->config().selector_top_k << '\n';
+        }
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         // The speculator's one-row steps on the CUDA step program (the program route's forms and fusion) over this
         // decoder's own state: same KV / histories / DSpark taps, so drafting passes on the resident verify windows
@@ -92,7 +103,7 @@ public:
         else if (asked) std::cerr << "inkling2 verify window programs declined (unproven for this profile: the identity "
                                      "fixture covers the EXACT levers only)\n";
         std::cerr << "inkling2 verify window programs " << (decoder_.window_programs() ? "on" : "off");
-        if (dspark && decoder_.window_programs()) std::cerr << " prewarmed " << decoder_.prewarm_window_programs();
+        if ((dspark || dflash) && decoder_.window_programs()) std::cerr << " prewarmed " << decoder_.prewarm_window_programs();
         std::cerr << '\n';
 #endif
         // Calibration statistics (off unless STRIX_CALIB_MOMENTS=FILE): the prompt's attention / output-projection /
@@ -102,6 +113,9 @@ public:
             calibration_.emplace();
             decoder_.set_calibration_moments(&*calibration_);
         }
+        // Diagnostic (off unless STRIX_INKLING_DUMP_TAPS=FILE): at exit, the prompt ids and the committed draft tap
+        // plane, the input of the offline drafter acceptance tool (apps/inkling2_mini_dflash_accept.cpp).
+        if (const char* path = strix::envcfg::text("STRIX_INKLING_DUMP_TAPS"); path && *path) taps_path_ = path;
     }
 
     // Receipt of the verify window programs over the run: equal to the load line's prewarmed count when no width was
@@ -111,6 +125,7 @@ public:
         if (decoder_.window_programs())
             std::cerr << "inkling2 verify window programs captured " << decoder_.window_program_captures() << '\n';
 #endif
+        dump_taps();
     }
     DeviceCliDecoder(const DeviceCliDecoder&) = delete;
     DeviceCliDecoder& operator=(const DeviceCliDecoder&) = delete;
@@ -119,6 +134,7 @@ public:
         // Provenance: the prompt is registered as a window before its rows are captured, every captured row counts
         // against it, and the window closes with the prefill (the packer refuses windows shared with held-out sets).
         if (calibration_) decoder_.set_calibration_window(calibration_->add_window(ids));
+        if (!taps_path_.empty()) prompt_ids_.assign(ids.begin(), ids.end());
         const auto next = decoder_.prefill(ids, logits);
         if (calibration_) {
             decoder_.set_calibration_window(std::nullopt);
@@ -158,20 +174,56 @@ public:
     }
 
     spec::ChainDrafter* chain_drafter(std::uint32_t anchor, std::uint32_t position) override {
+        if (dflash_) {
+            dflash_->start(anchor, position);
+            return dflash_.get();
+        }
         if (!drafter_) return nullptr;
         drafter_->start(anchor, position);
         return &*drafter_;
     }
 
 private:
+    // File: "INKTAPS1", u32 positions, u32 row width (taps x hidden), u32 prompt ids, u32 0, the prompt ids (u32), then
+    // the BF16 tap rows [position][tap][hidden] of every committed position (the generated ids are the CLI's output).
+    void dump_taps() noexcept {
+        if (taps_path_.empty()) return;
+        try {
+            const auto taps = decoder_.committed_taps();
+            if (taps.empty()) {
+                std::cerr << "inkling2 taps dump: no tap plane (the draft taps are captured only with a DSpark drafter)\n";
+                return;
+            }
+            std::vector<std::uint16_t> host(taps.size());
+            mini_gpu::copy(host.data(), taps.data(), taps.size_bytes(), mini_gpu::device_to_host, nullptr);
+            mini_gpu::synchronize(nullptr);
+            const std::array<std::uint32_t, 4> head{static_cast<std::uint32_t>(taps.size() / MiniDSparkTapPlan::width),
+                                                    MiniDSparkTapPlan::width,
+                                                    static_cast<std::uint32_t>(prompt_ids_.size()), 0U};
+            std::ofstream out(taps_path_, std::ios::binary);
+            out.write("INKTAPS1", 8);
+            out.write(reinterpret_cast<const char*>(head.data()), sizeof(head));
+            out.write(reinterpret_cast<const char*>(prompt_ids_.data()),
+                      static_cast<std::streamsize>(prompt_ids_.size() * sizeof(std::uint32_t)));
+            out.write(reinterpret_cast<const char*>(host.data()), static_cast<std::streamsize>(host.size() * sizeof(std::uint16_t)));
+            std::cerr << "inkling2 taps dump positions " << head[0] << " prompt " << head[2] << " file " << taps_path_
+                      << (out ? "" : " WRITE FAILED") << '\n';
+        } catch (const std::exception& e) {
+            std::cerr << "inkling2 taps dump failed: " << e.what() << '\n';
+        }
+    }
+
     MiniResidentDecoder decoder_;
     spec::EngineVerifyTarget<MiniResidentDecoder> target_{decoder_};
     std::optional<MiniResidentDSpark> drafter_;
+    std::unique_ptr<MiniResidentDFlash> dflash_;
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
     std::optional<MiniCudaProgramDecoder> plain_;  // after decoder_: destroyed first (it holds the decoder)
 #endif
     std::optional<weight::calib::MomentSet> calibration_;
     std::string calibration_path_;
+    std::string taps_path_;
+    std::vector<std::uint32_t> prompt_ids_;
     bool projected_bias_ = false;
 };
 
@@ -338,7 +390,7 @@ int main(int argc, char** argv) {
         std::cerr << "usage: " << executable
                   << " MODEL.safetensors (TOKEN [TOKEN ...] | --prompt TEXT | --messages FILE) [--tokenizer FILE]"
                      " [--prefill-chunk N] [--packed-decode | --grouped-decode] [--generate N] [--logits FILE]"
-                     " [--speculation off|auto|verify|lookup] [--dspark FILE]"
+                     " [--speculation off|auto|verify|lookup] [--dspark FILE] [--dflash DIR]"
                      " [--step-graph | --no-step-graph"
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                      " | --step-program (default for decode)"
@@ -408,7 +460,7 @@ int main(int argc, char** argv) {
         // the arm's target and its speculation is not declined. The TURBO row keeps the server's rule.
         const auto speculation_policy = mini_speculation_policy(
             options.generation.speculation != serve::CliSpeculation::off,
-            options.generation.speculation_requested || options.dspark != nullptr,
+            options.generation.speculation_requested || options.dspark != nullptr || options.dflash != nullptr,
             weight_options.lowbit_turbo);
         if (weight_options.lowbit_turbo && !speculation_policy.lowbit) {
             weight_options.lowbit_turbo = false;
@@ -449,7 +501,7 @@ int main(int argc, char** argv) {
         const auto drafter = [&] {
             auto found = strix::spec::resolve_drafter_file(
                 {.file = options.dspark ? std::string_view(options.dspark) : std::string_view{},
-                 .off = options.dspark_off,
+                 .off = options.dspark_off || options.dflash != nullptr,
                  .speculating = options.generation.speculation == serve::CliSpeculation::automatic &&
                                 !options.gate_manifest && !options.generation.tokenize_file &&
                                 !token_sampling_enabled(options.generation.sampling)},
@@ -487,6 +539,8 @@ int main(int argc, char** argv) {
             // The drafter loads only when this request may draft (the shared CLI's resolved mode).
             const char* dspark = drafter.enabled() && load.speculation == serve::CliSpeculation::automatic
                                      ? drafter.path.c_str() : nullptr;
+            const char* dflash = options.dflash && load.speculation == serve::CliSpeculation::automatic
+                                     ? options.dflash : nullptr;
             const strix::weight::WeightLoadExtent extent{load.positions, 1U};
             if (const auto decline = mini_lowbit_row_decline(options.tier.profile, weight_options, kMiniWeightBackend,
                                                              extent);
@@ -501,7 +555,7 @@ int main(int argc, char** argv) {
                                      extent, [&](MiniLowBitRows lowbit) {
                 return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, loaded->plan.roles(), dspark,
                     moe_w4a4, combine_image, round_fold, narrow, controller_one_plane, projected_bias, screened_head,
-                    verify_rows, std::move(lowbit), plain_program);
+                    verify_rows, std::move(lowbit), plain_program, dflash);
             });
         };
         // The rows the decoder was loaded with once the shared load fell back (strix-prefill-chunk line): a second load

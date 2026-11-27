@@ -624,6 +624,12 @@ if(NOT STRIX_CUDA_DS41_ONLY)
         src/inkling2/inkling2_mini_dspark_reference.cpp)
     target_link_libraries(strix-inkling2-mini-cpu PRIVATE strix_inkling2_mini_checkpoint strix_serve)
     strix_target_warnings(strix-inkling2-mini-cpu)
+    # Offline drafter acceptance (teacher-forced on dumped target taps): DFlash 2 vs the bundled DSpark, same taps.
+    add_executable(strix-inkling2-mini-dflash-accept
+        apps/inkling2_mini_dflash_accept.cpp
+        src/inkling2/inkling2_mini_dspark_reference.cpp)
+    target_link_libraries(strix-inkling2-mini-dflash-accept PRIVATE strix_inkling2_mini_checkpoint strix_serve strix_spec_dflash)
+    strix_target_warnings(strix-inkling2-mini-dflash-accept)
     if(MSVC)
         target_compile_options(strix-inkling2-mini-cpu PRIVATE /fp:strict)
     else()
@@ -4196,7 +4202,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_link_libraries(strix_tiled_core PUBLIC "${STRIX_HIP_RUNTIME_LIBRARY}")
 
     add_executable(strix-inkling2-mini-hip apps/inkling2_mini_hip.hip)
-    target_link_libraries(strix-inkling2-mini-hip PRIVATE strix_tiled_core strix_hip_runtime strix_inkling2_mini_checkpoint strix_core strix_serve strix_device_hip)  # a low-bit load binds its declared device
+    target_link_libraries(strix-inkling2-mini-hip PRIVATE strix_tiled_core strix_hip_runtime strix_inkling2_mini_checkpoint strix_core strix_serve strix_device_hip
+        strix_spec_dflash)  # a low-bit load binds its declared device
     strix_target_warnings(strix-inkling2-mini-hip)
     target_compile_options(strix-inkling2-mini-hip PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math
         -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
