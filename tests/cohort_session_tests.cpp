@@ -126,6 +126,8 @@ void exercise_session() {
     config.context_draft = false;
     config.prompt_slice = 32;
     sv::CohortSession session(queue, backend, config);
+    // The host fixture must not price prompt/decode debt using runner scheduling latency.
+    session.set_fake_clock(1.0);
     auto& runtime = session.runtime();
 
     auto a_job = job({11, 12, 13}, 8);
@@ -250,6 +252,8 @@ void exercise_sampling() {
     sv::CohortConfig config;
     config.context_draft = false;
     sv::CohortSession session(queue, backend, config);
+    // Keep the mixed-width sampling check independent of wall-clock prompt debt.
+    session.set_fake_clock(1.0);
     auto& runtime = session.runtime();
     sv::ApiConfig api;
     session.configure_api(api);
