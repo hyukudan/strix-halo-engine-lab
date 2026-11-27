@@ -383,7 +383,7 @@ void explicit_catalogue_tests(const std::filesystem::path& root) {
                 std::string(lever) + " is refused with its precondition on the shipped weights: got\n" + shipped);
     // A3: the measured losers are not all-on levers in their losing regimes, and stay all-on outside them.
     const auto qwen_any = run("qwen3.8-flash-next", ao::Tier::turbo, {});
-    require(qwen_any.find("lever qwen_moe_direct_b source=refused reason=measured slower in prefill 8192..32768") !=
+    require(qwen_any.find("lever qwen_moe_direct_b source=refused reason=measured slower in prefill 8192..1048576") !=
                     std::string::npos &&
                 qwen_any.find("lever qwen_router_bf16 source=refused reason=measured slower in decode") != std::string::npos,
             "the measured losers are refused for a launch of every phase: got\n" + qwen_any);

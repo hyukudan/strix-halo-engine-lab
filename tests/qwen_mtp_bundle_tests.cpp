@@ -285,6 +285,15 @@ int main(int argc,char** argv) try {
             }
             const std::vector<std::string> short_prompt{"decode",pmodel.string(),"--prompt-ids",few_file.string(),"--generate","128","--profile","fast"};
             require(!capture(short_prompt,text).mtp.enabled,"a prompt file under 17 ids keeps plain decode");
+            // --kv is route-neutral whatever its value: an INT8 KV launch keeps the MTP default (the MTP windows admit
+            // INT8 KV storage), it is not silently dropped to plain decode.
+            const std::vector<std::string> int8_kv{"decode",pmodel.string(),"--prompt-ids",ids_file.string(),"--generate","128",
+                "--profile","turbo","--kv","int8"};
+            std::string int8_refusal;
+            bool int8_mtp=false;
+            try { int8_mtp=capture(int8_kv,text).mtp.enabled; } catch(const std::exception& e) { int8_refusal=e.what(); }
+            const std::string int8_why="--kv int8 keeps the MTP default: "+(int8_refusal.empty()?std::string("plain decode"):int8_refusal);
+            require(int8_mtp,int8_why.c_str());
             const std::vector<std::string> owned{"decode",pmodel.string(),"--prompt-ids",ids_file.string(),"--generate","128","--profile","fast",
                 "--gpu-greedy-token"};
             require(!capture(owned,text).mtp.enabled,"a route option next to the tier still owns the route");
