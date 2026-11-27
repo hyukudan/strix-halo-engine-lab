@@ -12,6 +12,7 @@
 
 namespace strix::attn_core {
 
+using LatentHeadRange = attn::ReferenceHeadRange;
 using LatentHeadExecutor = attn::ReferenceHeadExecutor;
 
 struct SelectedLatentShape {
