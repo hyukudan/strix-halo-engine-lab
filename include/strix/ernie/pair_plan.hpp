@@ -97,7 +97,7 @@ struct PairFirstTokenOps {
     std::function<std::uint32_t()> top;
 };
 
-// Host coordination for the first-token ticket. The rank's native hooks own KV
+// Host coordination for the first-token run. The rank's native hooks own KV
 // and execute only [first,last). Both ranks verify the same assets, geometry,
 // numerics and prompt before the shared prefill pipe sends any activations.
 // A fresh device session is required after failure.

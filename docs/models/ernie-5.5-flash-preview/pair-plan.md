@@ -56,10 +56,10 @@ using it to compare against a CPU receipt.
 | HCA | HIP streaming softmax `src/attn_core/online_softmax.hpp:25`, window addressing `src/hip_ds41_attention.hip:107`. CUDA flash schedule `src/cuda/core/attn_flash.cu`. | Add an R128 channel-tiled gated APE pool to `src/attn_core/group_pool.hpp:41` with bounded shared memory. Bind the two rotary domains, causal history, sink and output merge. Existing compressed-cache operands need a new trait. |
 | MLA, indexer and head mixing | HIP latent score and value bodies `src/attn_core/selected_exact_mla.hpp:111`, `src/attn_core/selected_exact_mla.hpp:245`; grouped index scoring `src/attn_core/index_score_wmma.hpp:82` and radix selection `src/attn_core/select_radix3.hpp:120`. CUDA selected-block schedule `src/cuda/core/attn_selected_blocks.cuh`. | Bind MLA rank 512, RoPE 64, split K192/V256, the offset sink and 64-head indexer with Q/K width 128 and causal top-2048. Supply the Hadamard/FP4 keys, FlashIndexer head-gating policy, VHA rank 16 and gated attention as shared score, gather and epilogue traits. |
 
-## First device ticket
+## First device run
 
 Run from the checked-out engine. Set `SOURCE` to the complete official
-checkpoint (the staging volume), `MODEL` to a rank's local target directory,
+checkpoint (the source volume), `MODEL` to a rank's local target directory,
 `RECEIPTS` to a receipt directory and `R` to the rank. Each rank copies only
 the shards that hold its own tensors: the rank-scoped plan reads the complete
 source once and lists them, and the same plan on the rank copy refuses if any
@@ -107,7 +107,7 @@ timeout 120s build/ernie-pair/strix-dist-host-exchange-bench --transport usb4aut
 ```
 
 The executable commands finish at the plan and link receipt. The next
-ticket needs a native rank executable that uses the range loader and
+step needs a native rank executable that uses the range loader and
 `run_pair_first_token` hooks. First admit a single target-only slot and
 load rank-owned ranges, using measured alignment, staging and scratch.
 Feed the first oracle prompt's token IDs unchanged with greedy selection.
@@ -125,7 +125,7 @@ native callbacks emit these receipts, run the comparison against a completed
 CPU prompt directory.
 
 ```sh
-python -I tools/ernie_trace_compare.py "$ORACLE/prompt-0" "$RECEIPTS/rank-0" "$RECEIPTS/rank-1" +  --cut 22 > "$RECEIPTS/first-token-compare.json"
+python -I tools/ernie_trace_compare.py "$ORACLE/prompt-0" "$RECEIPTS/rank-0" "$RECEIPTS/rank-1" --cut 22 > "$RECEIPTS/first-token-compare.json"
 ```
 
 The receipt reports the reference identity. Agreement with a candidate raw-head

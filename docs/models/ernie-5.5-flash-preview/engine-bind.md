@@ -82,7 +82,7 @@ chat. `--min-new-tokens` delays EOS eligibility for the specified number of
 generated tokens. Raw logit traces preserve every score for those probes.
 
 The [pair plan](pair-plan.md) describes native weight placement, memory admission,
-the shared transport seam and the first device ticket.
+the shared transport seam and the first device run.
 
 | Stage | Shared component | Model binding |
 | --- | --- | --- |
