@@ -571,11 +571,12 @@ void profile_parity() {
             loaded.reset();
             const auto cli = parse_cli(tier, "hip");
             const auto service = factory->create(selection);
-            const bool expected = std::string_view(tier) != "exact" && value && std::string_view(value) != "0";
+            // Unset: the FAST column (TURBO inherits it) selects the SP4 attention + head arm on HIP.
+            const bool expected = std::string_view(tier) != "exact" && (!value || std::string_view(value) != "0");
             require(service && loaded && cli.weights.qualify_decode_only == expected &&
                         loaded->weight_options.qualify_decode_only == expected &&
                         loaded->weight_options.qualify == cli.weights.qualify &&
-                        (!expected || std::string_view(value) != "sp4t-attn" ||
+                        (!expected || (value && std::string_view(value) != "sp4t-attn") ||
                          loaded->weight_options.qualify == &strix::weight::kAttentionHeadSP4TPolicy),
                     "CLI and server take the same SP4 attention + head decode arm");
         }
@@ -587,6 +588,16 @@ void profile_parity() {
     require(refuses([&] { (void)factory->create(selection); }, "qualified on HIP only"),
             "the CUDA server refuses the SP4 attention + head arm");
     set_env("STRIX_INK_LOWBIT_HEAD", nullptr);
+    // The column value selects nothing on CUDA (its receipts are gfx1151): CLI and server keep the incumbent weights.
+    for (const auto* tier : {"fast", "turbo"}) {
+        selection.arguments.back() = tier;
+        loaded.reset();
+        const auto cli = parse_cli(tier, "cuda");
+        const auto service = factory->create(selection);
+        require(service && loaded && !cli.weights.qualify_decode_only && cli.weights.qualify == nullptr &&
+                    !loaded->weight_options.qualify_decode_only && loaded->weight_options.qualify == nullptr,
+                "the SP4 column selects no arm on CUDA, CLI and server alike");
+    }
     selection.arguments[3] = "hip";
     selection.arguments.back() = "fast";
     for (const char* backend : {"hip", "cuda"}) {

@@ -114,30 +114,43 @@ inline bool mini_lowbit_turbo(const profile::Resolution& tier) {
 
 // STRIX_INK_LOWBIT_HEAD, in FAST or TURBO: "sp4t" selects the SP4 head arm (kMiniSp4HeadPolicy); "sp4t-attn" the SP4
 // attention projections + head arm (weights.attention_head.sp4t@1, the arm of --qualify-decode-weights); "0" (builtin)
-// leaves the weights as they are. nullptr: no arm.
-inline const weight::WeightLoadPolicy* mini_lowbit_head_policy(const profile::Resolution& tier) {
+// leaves the weights as they are. nullptr: no arm. The FAST column (TURBO inherits it) selects "sp4t-attn" on the backend
+// its receipts were taken on (HIP gfx1151): a column value on another backend selects nothing; an explicit setting keeps
+// its own admission (the server refuses a non-HIP backend with its reason).
+inline bool mini_lowbit_head_explicit(const profile::Entry& entry) {
+    return entry.status == profile::Status::explicit_env || entry.status == profile::Status::explicit_cli;
+}
+inline const weight::WeightLoadPolicy* mini_lowbit_head_policy(const profile::Resolution& tier, bool hip = true) {
     const auto* entry = tier.find(kMiniLowBitHead);
     if (entry == nullptr || entry->value == "0") return nullptr;
     const weight::WeightLoadPolicy* policy = entry->value == "sp4t"        ? &kMiniSp4HeadPolicy
                                              : entry->value == "sp4t-attn" ? &weight::kAttentionHeadSP4TPolicy
                                                                            : nullptr;
     if (policy == nullptr) throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD must be 0, sp4t or sp4t-attn");
+    if (!hip && !mini_lowbit_head_explicit(*entry)) return nullptr;
     return tier.profile == profile::Name::fast || tier.profile == profile::Name::turbo ? policy : nullptr;
 }
-inline bool mini_lowbit_head(const profile::Resolution& tier) { return mini_lowbit_head_policy(tier) != nullptr; }
+inline bool mini_lowbit_head(const profile::Resolution& tier, bool hip = true) {
+    return mini_lowbit_head_policy(tier, hip) != nullptr;
+}
 
-// The lever's arm is a decode-only qualification arm (the BF16 image prefills, the SP4 copies decode): it needs
-// STRIX_LOWBIT_PACK and combines with no other weight arm. The command line and the server call this one rule.
-inline void apply_mini_lowbit_head(MiniWeightOptions& options, const profile::Resolution& tier) {
-    const auto* policy = mini_lowbit_head_policy(tier);
+// The lever's arm is a decode-only arm (the BF16 image prefills, the SP4 copies decode). From the profile column it reads
+// the governed pack beside the model (kMiniSp4AttnPackFile, pinned identity) and steps aside for any other requested
+// weight arm; set explicitly it is a qualification arm (STRIX_LOWBIT_PACK) that combines with no other weight arm. The
+// command line and the server call this one rule.
+inline void apply_mini_lowbit_head(MiniWeightOptions& options, const profile::Resolution& tier, bool hip = true) {
+    const auto* policy = mini_lowbit_head_policy(tier, hip);
     if (policy == nullptr) {
-        // One record with --all-on: a selected SP4 head arm that this tier does not take says so (all_on_engaged.hpp).
+        // One record with --all-on: a selected SP4 head arm that this tier or backend does not take says so
+        // (all_on_engaged.hpp).
         if (const auto* entry = tier.find(kMiniLowBitHead); entry != nullptr && entry->value != "0")
-            (void)profile::all_on::engaged("STRIX_INK_LOWBIT_HEAD", false, "FAST and TURBO only", std::cerr);
+            (void)profile::all_on::engaged("STRIX_INK_LOWBIT_HEAD", false,
+                                           hip ? "FAST and TURBO only" : "HIP gfx1151 only", std::cerr);
         return;
     }
-    if (options.qualify != nullptr || options.qualify_q8 || options.lowbit_turbo || options.disable_q8)
-        throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD combines with no other weight arm");
+    const bool other_arm = options.qualify != nullptr || options.qualify_q8 || options.lowbit_turbo || options.disable_q8;
+    if (other_arm && !mini_lowbit_head_explicit(*tier.find(kMiniLowBitHead))) return;
+    if (other_arm) throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD combines with no other weight arm");
     options.qualify = policy;
     options.qualify_decode_only = true;
 }

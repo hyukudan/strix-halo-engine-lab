@@ -55,8 +55,14 @@ inline constexpr std::string_view kMiniLowBitTurbo = "inkling2-mini-lowbit-turbo
 inline constexpr std::string_view kMiniLowBitPackFile = "inkling2-mini-q4.lowbit-pack";
 // Head in Strix pack SP4 (fixed table) from an explicit calibrated pack (STRIX_LOWBIT_PACK, strix-lowbit-calib-pack
 // --storage unembed.weight=sp4 --table fixed): the decode-only head arm (BF16 image kept for prefill, verify and the
-// widths outside the band). Pending in FAST and TURBO: no decision row until its device gate v2 receipt.
+// widths outside the band). The FAST column (TURBO inherits it) selects the attention projections + head arm
+// ("sp4t-attn") with the governed pack below; the head-alone arm ("sp4t") stays explicit.
 inline constexpr std::string_view kMiniLowBitHead = "inkling2-mini-lowbit-head@1";
+// The SP4 attention + head pack the FAST column was gated and timed with (strix-lowbit-calib-pack, technique both,
+// damp 0.1, 97 matrices: q/k/v/o x 24 + head), read beside the model unless STRIX_LOWBIT_PACK names another one.
+inline constexpr std::string_view kMiniSp4AttnPackFile = "inkling2-mini-sp4t-attn.lowbit-pack";
+inline constexpr weight::Digest256 kMiniSp4AttnPackIdentity =
+    weight::digest_from_hex("ede1ecc1ceb47a15013bb3b2364060a38311766a32c7a89f1f2b920ee44be5ef");
 inline constexpr weight::WeightLoadPolicy kMiniSp4HeadPolicy = weight::kHeadSP4TPolicy;
 inline constexpr weight::WeightLoadPolicy kMiniTurboWeightPolicy = weight::kAttentionHeadQ4Policy;
 // The row covers decode steps only. The low-bit copies are resident beside the BF16 image used for
@@ -294,12 +300,15 @@ inline constexpr std::array<profile::Lever, 19> kMiniLevers{{
     weight::kLowBitFoldedScaleLever,
     weight::kLowBitRowsSelectLever,
     {.name = kMiniLowBitHead, .env = "STRIX_INK_LOWBIT_HEAD", .option = "",
-     .value = {"", "", "", ""}, .builtin = "0", .kind = profile::Kind::bit_changing,
-     .ready = {}, .runnable = {false, true, false, true}, .target = "sp4t", .off = "0",
-     .source = "explicit option: SP4 fixed-table head, device gate v2 decode 2026-11-26 FAST fails 1/39 windows "
-               "(+1 unresolved), TURBO limits 39/39 pass, CLI B=1 -3.1 % per step vs the BF16 head "
-               "(docs/engine/lowbit-calibration.md); a TURBO row awaits the served arm and a combined receipt; HIP "
-               "command line only",
+     .value = {"", "sp4t-attn", "", ""}, .builtin = "0", .kind = profile::Kind::bit_changing,
+     .ready = {false, true, false, true}, .runnable = {false, true, false, true}, .target = "sp4t-attn", .off = "0",
+     .source = "FAST default (TURBO inherits), HIP gfx1151 only: SP4 fixed-table attention projections + head, decode-only "
+               "(BF16 image prefills), governed pack beside the model (kMiniSp4AttnPackFile, pinned identity). Device "
+               "gate v2 decode 2026-11-26, 39 held-out windows / 2457 rows, 8K / 32K / 64K: FAST PASS (KL 0.00207, "
+               "top-1 0.981, dNLL -0.00014; 0 windows FAIL). CLI B=1 FAST with speculation, same binary, 6 prompts "
+               "2026-11-27: 1.19x tok/s geometric mean (0.95x .. 1.37x; one code prompt slower: its SP4 text takes 2.71 "
+               "tokens per pass against 4.40), plain decode 1.18x (code and prose); served 8 / 16 slots 1.05x / 1.04x "
+               "(one sample). \"sp4t\" (head alone) stays explicit: its gate fails 1/39 FAST windows",
      .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"sp4t", "sp4t-head-v1"}, {"sp4t-attn", "sp4t-attention-head-v1"}}}},
 }};
 

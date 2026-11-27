@@ -114,7 +114,7 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
             throw std::invalid_argument("logits output must differ from the DSpark sidecar");
     }
     options.weights.lowbit_turbo = mini_lowbit_turbo(options.tier);
-    if (native) apply_mini_lowbit_head(options.weights, options.tier);
+    if (native) apply_mini_lowbit_head(options.weights, options.tier, backend == "hip");
     else if (const auto* head = options.tier.find(kMiniLowBitHead); head != nullptr && head->value != "0")
         (void)strix::profile::all_on::engaged("STRIX_INK_LOWBIT_HEAD", false, "native HIP execution only", std::cerr);
     mini_cli_decline_served_route(options.tier);
