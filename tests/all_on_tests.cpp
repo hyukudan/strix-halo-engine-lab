@@ -137,6 +137,17 @@ void fixture_tests() {
     require(lines_of(levers, ao::Tier::turbo, {}, only("X_T_ONLY", "0")).find("lever needs_t source=refused reason=requires t_only\n") !=
                 std::string::npos,
             "an explicit 0 does not satisfy a requirement");
+    // An explicit override of a tier default must not be reported as active or satisfy a dependency.
+    auto default_requirement = levers;
+    for (auto& lever : default_requirement)
+        if (lever.name == "t_only") lever.default_tiers = {"turbo"};
+    const auto default_off = lines_of(default_requirement, ao::Tier::turbo, {}, only("X_T_ONLY", "0"));
+    require(default_off.find("lever t_only source=explicit reason=explicit setting kept: off\n") != std::string::npos &&
+                default_off.find("lever needs_t source=refused reason=requires t_only\n") != std::string::npos,
+            "explicit off overrides a tier default and refuses its dependant");
+    require(lines_of(default_requirement, ao::Tier::turbo, {}, only("X_T_ONLY", "1"))
+                .find("lever t_only source=explicit reason=explicit setting kept\n") != std::string::npos,
+            "explicit on overrides the default diagnostic");
     // Incompatibility holds in both directions: an explicit later peer refuses an earlier all-on lever.
     require(lines_of(levers, ao::Tier::exact, {}, only("X_PB", "1")).find(
                 "lever pair_a source=refused reason=incompatible with pair_b\nlever pair_b source=explicit reason=explicit setting kept\n") !=
