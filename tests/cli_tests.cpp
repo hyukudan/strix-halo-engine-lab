@@ -2,7 +2,9 @@
 #include "strix/deploy/route.hpp"
 #include "strix/serve/json.hpp"
 #include "../src/cli/detail.hpp"
+#include "strix/session/speculation_default.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -530,6 +532,114 @@ void deployment(const fs::path& fixture, const Probes& probes, const ExecutableE
     require(!native.refused && parse_json(native.route_json).find("route_id")->as_string() ==
         result.find("route")->find("route_id")->as_string(), "CLI route equals provider resolution with the same budgets");
 }
+
+// Every `strix run` / `strix-serve` command the README shows (inline code spans and fenced blocks) must resolve
+// through the launcher without an option error: the arguments are parsed, the preset and placement are resolved and
+// the engine command is printed (--dry-run); no model is loaded.
+std::vector<std::vector<std::string>> readme_quick_starts(const fs::path& readme) {
+    std::ifstream in(readme);
+    require(static_cast<bool>(in), "README is readable");
+    std::vector<std::string> units;
+    std::string line, fenced;
+    bool fence = false;
+    while (std::getline(in, line)) {
+        if (line.starts_with("```")) { fence = !fence; if (!fence && !fenced.empty()) { units.push_back(fenced); fenced.clear(); } continue; }
+        if (fence) {
+            const bool more = line.ends_with("\\");
+            if (more) line.pop_back();
+            fenced += line + " ";
+            if (!more) { units.push_back(fenced); fenced.clear(); }
+            continue;
+        }
+        std::size_t open = line.find('`');
+        while (open != std::string::npos) {
+            const auto close = line.find('`', open + 1);
+            if (close == std::string::npos) break;
+            units.push_back(line.substr(open + 1, close - open - 1));
+            open = line.find('`', close + 1);
+        }
+    }
+    std::vector<std::vector<std::string>> commands;
+    for (const auto& unit : units) {
+        std::istringstream words(unit);
+        std::vector<std::string> tokens;
+        for (std::string word; words >> word;) tokens.push_back(word);
+        if (tokens.size() < 3) continue;
+        if (tokens[0] == "strix" && (tokens[1] == "run" || tokens[1] == "serve")) tokens.erase(tokens.begin());
+        else if (tokens[0] == "strix-serve") tokens[0] = "serve";
+        else continue;
+        // Templates (NAME) and prose mentions without an asset cannot resolve; the rank placeholder is a value.
+        const auto has = [&](std::string_view word) { return std::find(tokens.begin(), tokens.end(), word) != tokens.end(); };
+        if (!(tokens[0] == "run" || tokens[0] == "serve") || has("NAME") || !has("--asset")) continue;
+        for (auto& token : tokens) if (token == "R") token = "0";
+        commands.push_back(std::move(tokens));
+    }
+    return commands;
+}
+
+void readme_commands_resolve(const fs::path& readme, const fs::path& data) {
+    const auto commands = readme_quick_starts(readme);
+    require(commands.size() >= 10, "README quick starts were found");
+    std::string failures;
+    std::size_t resolved = 0;
+    for (auto command : commands) {
+        if (command[1] != "--model") command.insert(command.begin() + 1, "--model");
+        // Keep each quick start's own placement; only add the no-launch switch before the engine arguments.
+        const auto split = std::find(command.begin(), command.end(), "--");
+        command.insert(split, "--dry-run");
+        std::string joined;
+        for (const auto& word : command) joined += word + " ";
+        Probes probes;
+        const bool cuda = std::find(command.begin(), command.end(), "cuda") != command.end();
+        probes.host = cuda ? Platform::windows_host : Platform::linux_host;
+        probes.cuda_loaded = true;
+        probes.nodes_open = true;
+        std::ostringstream out;
+        try {
+            const auto status = dispatch(parse(command), "test bin", data, probes, [](const auto&) { return true; }, out);
+            if (status != 0 || out.str().empty()) failures += "status " + std::to_string(status) + ": " + joined + "\n";
+            else ++resolved;
+        } catch (const std::exception& error) {
+            failures += std::string(error.what()) + ": " + joined + "\n";
+        }
+    }
+    require(failures.empty(), failures.c_str());
+    require(resolved == commands.size(), "every README command resolved");
+}
+
+// The strix run command of the Qwen flash-next entry resolves, in every tier, to engine arguments that carry only
+// route-neutral options after the asset and the prompt, so the engine's shared default (MTP drafter) is not owned away.
+void qwen_launcher_keeps_speculation_default(const fs::path& data) {
+    for (const std::string tier : {"exact", "fast", "turbo"}) {
+        Probes probes;
+        probes.nodes_open = true;
+        std::ostringstream out;
+        const std::vector<std::string> command{"run", "qwen3.8-flash-next", "--profile", tier, "--asset", "MODEL.gguf",
+                                               "--dry-run", "--", "--prompt-ids", "prompt.ids", "--generate", "128"};
+        require(dispatch(parse(command), "test bin", data, probes, [](const auto&) { return true; }, out) == 0, "qwen dry run");
+        std::istringstream words(out.str());
+        std::vector<std::string> args;
+        for (std::string word; words >> word;) {
+            if (word.size() >= 2 && word.front() == '\'' && word.back() == '\'') word = word.substr(1, word.size() - 2);
+            if (!word.empty() && word.front() != '#') args.push_back(word);
+        }
+        const auto model_at = std::find(args.begin(), args.end(), "MODEL.gguf");
+        require(model_at != args.end(), "dry run carries the asset");
+        bool profile_seen = false;
+        for (auto it = model_at + 1; it != args.end(); ++it) {
+            const std::string_view arg = *it;
+            if (strix::session::speculation_neutral_value_option(arg)) {
+                profile_seen |= arg == "--profile";
+                ++it;
+                continue;
+            }
+            require(arg == "--generate" ? (++it != args.end()) : false, "launcher engine arguments stay route-neutral");
+        }
+        require(profile_seen, "the tier reaches the engine as --profile");
+        require(std::find(args.begin(), args.end(), "--no-mtp") == args.end() &&
+                std::find(args.begin(), args.end(), "--mtp") == args.end(), "the launcher neither disables nor spells MTP");
+    }
+}
 } // namespace
 
 int main() {
@@ -542,6 +652,8 @@ int main() {
         launch(STRIX_CLI_FIXTURE, exists);
         deployment(STRIX_CLI_FIXTURE, probes, exists);
         model_presets(STRIX_CLI_BUILD_DATA, [](const auto&) { return true; });
+        qwen_launcher_keeps_speculation_default(STRIX_CLI_BUILD_DATA);
+        readme_commands_resolve(STRIX_CLI_README, STRIX_CLI_BUILD_DATA);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

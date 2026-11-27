@@ -88,7 +88,7 @@ function(strix_add_cli)
         add_executable(strix-cli-tests "${root}/tests/cli_tests.cpp")
         target_link_libraries(strix-cli-tests PRIVATE strix_cli strix_cli_inspection_bindings strix_serve_json)
         target_compile_definitions(strix-cli-tests PRIVATE "STRIX_CLI_FIXTURE=\"${root}/tests/fixtures/cli\""
-            "STRIX_CLI_BUILD_DATA=\"${CMAKE_CURRENT_BINARY_DIR}/share/strix\"")
+            "STRIX_CLI_BUILD_DATA=\"${CMAKE_CURRENT_BINARY_DIR}/share/strix\"" "STRIX_CLI_README=\"${root}/README.md\"")
         strix_target_warnings(strix-cli-tests)
         add_test(NAME strix-cli-tests COMMAND strix-cli-tests)
         add_executable(strix-multi-device-tests "${root}/tests/multi_device_tests.cpp")
