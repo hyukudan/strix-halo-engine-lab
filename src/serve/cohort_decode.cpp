@@ -978,6 +978,9 @@ void CohortDecoder::step() {
             if (auto& selection = run[k]->request.selection) selection->discard();
         verification_ = std::move(scratch);
         fail_lanes(std::span<Lane* const>(run.data(), n), std::string(what) + ": " + ex.what());
+        // Lanes that already finished in this step's speculator pass are not in `run`: finish them as well.
+        for (auto& [l, error] : done) finish(*l, std::move(error));
+        done.clear();
     };
     try {
         backend_.verify(groups, tokens, top);

@@ -124,8 +124,8 @@ inline MiniServeCohort make_mini_device_cohort(
             windows = decoder->set_slot_windows(opt.speculation);
             windows_declined = "decoder declined verify windows";
 #if !defined(__HIPCC__)
-            // Verify window programs for the staged windows: the command line's switch (STRIX_INKLING_WINDOW_PROGRAMS=1)
-            // and its proven levers (identity fixture q52r: EXACT levers only), so a served window runs the command
+            // Verify window programs for the staged windows: the command line's rule (on by default,
+            // STRIX_INKLING_WINDOW_PROGRAMS=0 turns them off) and its proven levers (identity fixture q52r: EXACT levers only), so a served window runs the command
             // line's window arithmetic and wall.
             window_programs = windows && mini_window_programs_requested();
             if (window_programs && !mini_window_programs_proven(opt.combine_image, opt.prepared_round_fold,

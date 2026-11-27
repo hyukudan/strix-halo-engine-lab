@@ -7,6 +7,7 @@
 #include "strix/model_data/inkling2_mini.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
 #include "strix/serve/row_budget.hpp"
+#include "strix/spec/probe_policy.hpp"
 #include "strix/weight/lowbit_pack.hpp"
 #include "strix/weight/resolve.hpp"
 
@@ -527,7 +528,7 @@ inline constexpr std::string_view kMiniBuildBackend = "cuda";
 // The charged re-probe episodes this backend's build runs: the model TOML's [speculation.probe_loss] row for it
 // (spec::resolve_probe_loss), the fixed interval where the TOML has none.
 #if defined(__HIPCC__)
-inline constexpr double kMiniProbeLoss = 0.0;
+inline constexpr double kMiniProbeLoss = strix::spec::kFixedReprobeInterval;
 #else
 inline constexpr double kMiniProbeLoss = model_data::inkling2_mini::speculation::probe_loss::cuda;
 #endif

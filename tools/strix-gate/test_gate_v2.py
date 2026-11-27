@@ -599,7 +599,11 @@ class HeadFormat(unittest.TestCase):
             self.assertEqual(self.gate(d, *args)[0], 1)
             target.write_bytes(finite)
             write_routes(d / "routes" / "w00.fast_free.rte", [(0, [[1, 2]], [[np.inf, 0.9]])])
-            self.assertEqual(self.gate(d, *args)[0], 1)
+            rc, out = self.gate(d, *args)
+            self.assertEqual(rc, 1, out)
+            # A non-finite candidate router weight is a FAIL of the candidate, not an evidence error.
+            doc = json.loads((d / "g.json").read_text(encoding="utf-8"))
+            self.assertEqual(doc["pooled"]["free_run"]["state"], "FAIL")
             target.unlink()
             self.assertEqual(self.gate(d, *args)[0], 2)
 
