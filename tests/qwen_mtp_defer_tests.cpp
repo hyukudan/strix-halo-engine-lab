@@ -161,6 +161,14 @@ int main() {
                 if (defer && n > 1) expect(deferred != 0 || n == 1, "a prompt with a last block defers it");
             }
         }
+    // Ring sized to the prompt: grows only when the whole prompt fits, always a multiple of the chain's widest call
+    static_assert(qmd::prompt_ring_rows(8192, 5120, 1ULL << 30, 512, 32) == 8192, "8K prompt: whole prompt");
+    static_assert(qmd::prompt_ring_rows(8000, 5120, 1ULL << 30, 512, 32) == 8000, "grid multiple already");
+    static_assert(qmd::prompt_ring_rows(8001, 5120, 1ULL << 30, 512, 32) == 8032, "rounded up to the grid");
+    static_assert(qmd::prompt_ring_rows(32500, 5120, 1ULL << 30, 512, 32) == 32512, "32K prompt: 666 MB of rows");
+    static_assert(qmd::prompt_ring_rows(65536, 5120, 1ULL << 30, 512, 32) == 512, "does not fit: incumbent");
+    static_assert(qmd::prompt_ring_rows(100, 5120, 1ULL << 30, 512, 32) == 512, "short prompt: incumbent");
+    static_assert(qmd::prompt_ring_rows(8192, 0, 1ULL << 30, 512, 32) == 512, "no width: incumbent");
     if (failures) return EXIT_FAILURE;
     std::puts("qwen_mtp_defer: all checks passed");
     return EXIT_SUCCESS;
