@@ -18,13 +18,15 @@ public:
         attn::hybrid_rope_tail(rows, width, cos_, sin_, inverse);
     }
 
-    void apply_leading(std::span<float> rows, unsigned width) const {
+    void apply_leading_split_half(std::span<float> rows, unsigned width) const {
         const auto dim = static_cast<unsigned>(2U * cos_.size());
         if (width == 0 || rows.size() % width != 0 || dim > width)
             throw std::invalid_argument("rotary row: invalid leading rotary shape");
         if (dim == 0) return;
+        const auto half = cos_.size();
         for (std::size_t offset = 0; offset < rows.size(); offset += width)
-            apply(rows.subspan(offset, dim), dim);
+            for (std::size_t pair = 0; pair < half; ++pair)
+                attn::rope_pair(rows[offset + pair], rows[offset + half + pair], cos_[pair], sin_[pair], false);
     }
 
 private:

@@ -83,8 +83,8 @@ inline void index_layer_norm_reference(std::span<float> key, std::span<const flo
 }
 
 inline void rotate_index_rows_reference(std::span<float> rows, unsigned width,
-                                        const RotaryReferenceRow& rope, bool leading, bool bf16) {
-    if (leading) rope.apply_leading(rows, width);
+                                        const RotaryReferenceRow& rope, bool leading_split_half, bool bf16) {
+    if (leading_split_half) rope.apply_leading_split_half(rows, width);
     else rope.apply(rows, width);
     for (std::size_t offset = 0; offset < rows.size(); offset += width) {
         auto row = rows.subspan(offset, width);

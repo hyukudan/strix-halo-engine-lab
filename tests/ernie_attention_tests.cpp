@@ -6,6 +6,8 @@
 #include "attn_core/value_head_mix_reference.hpp"
 #include "core/hadamard_reference.hpp"
 
+#include <bit>
+
 #include <array>
 #include <iostream>
 
@@ -153,6 +155,94 @@ void compressed_index() {
           "future high-scoring key lies outside the causal prefix");
 }
 
+void index_window_rows() {
+    struct Case {
+        unsigned position, history, window;
+    };
+    constexpr std::array cases{Case{0, 0, 1}, Case{5, 0, 6}, Case{127, 0, 128}, Case{128, 1, 128},
+        Case{200, 73, 128}, Case{2175, 2048, 128}, Case{2176, 2049, 128}, Case{5000, 4873, 128}};
+    constexpr unsigned budget = 2048, window = 128;
+    for (const auto& c : cases) {
+        const SparseWindowReference selection(c.position, window, budget);
+        check(selection.dense() == (c.history <= budget), "entire history selected only within budget");
+        check(selection.history == c.history, "indexer excludes the entire final window");
+        const auto retained = c.history < budget ? c.history : budget;
+        std::vector<std::uint32_t> rows(retained);
+        for (unsigned i = 0; i < retained; ++i) rows[i] = c.history - retained + i;
+        const auto history = rows;
+        selection.append_window(rows);
+        check(rows.size() == retained + c.window &&
+              std::ranges::equal(history, std::span(rows).first(retained)),
+              "window append preserves the original index order");
+        for (unsigned i = 0; i < c.window; ++i)
+            check(rows[retained + i] == c.history + i, "window contains consecutive keys, including self");
+    }
+}
+
+void index_leading_rotary() {
+    constexpr unsigned heads = 64, width = 128, rotary_width = 64, half = rotary_width / 2;
+    constexpr double base = 8'000'000.;
+    for (const unsigned tokens : {1U, 7U, 4096U}) {
+        for (unsigned token = 0; token < tokens; ++token) {
+            const auto position = (token * 541U + 9U) % 65536U;
+            const RotaryReferenceRow rope(rotary_width, position, base);
+            std::vector<float> query(std::size_t{heads} * width), key(width);
+            for (std::size_t i = 0; i < query.size(); ++i)
+                query[i] = static_cast<float>(static_cast<int>((i * 17U + token * 3U) % 61U) - 30) / 32.0F;
+            std::ranges::copy(std::span(query).last(width), key.begin());
+            auto reference = query;
+            std::array<float, half> c{}, sn{};
+            for (unsigned d = 0; d < half; ++d) {
+                const double theta = static_cast<double>(position) / std::pow(base, static_cast<double>(d) / half);
+                c[d] = static_cast<float>(std::cos(theta));
+                sn[d] = static_cast<float>(std::sin(theta));
+            }
+            for (unsigned head = 0; head < heads; ++head) {
+                const auto at = std::size_t{head} * width;
+                for (unsigned d = 0; d < half; ++d) {
+                    const auto a = query[at + d], b = query[at + half + d];
+                    reference[at + d] = a * c[d] - b * sn[d];
+                    reference[at + half + d] = a * sn[d] + b * c[d];
+                }
+            }
+            const auto original_query = query.data(), original_key = key.data();
+            rope.apply_leading_split_half(query, width);
+            rope.apply_leading_split_half(key, width);
+            check(query.data() == original_query && key.data() == original_key, "partial rotary stays in place");
+            core::round_bf16_reference(reference);
+            core::round_bf16_reference(query);
+            core::round_bf16_reference(key);
+            check(query == reference, "indexer rotates leading split halves and leaves the tail intact");
+            check(std::ranges::equal(key, std::span(reference).last(width)), "keys use the same partial rotary layout");
+        }
+    }
+}
+
+void index_hadamard_rows() {
+    constexpr unsigned width = 128;
+    for (const unsigned rows : {1U, 2U, 5U, 6U, 7U, 64U, 129U, 1026U}) {
+        double squared_error = 0.0, squared_reference = 0.0;
+        for (unsigned row = 0; row < rows; ++row) {
+            std::array<float, width> input{};
+            for (unsigned d = 0; d < width; ++d)
+                input[d] = static_cast<float>(static_cast<int>((d * 71U + row * 53U) % 127U) - 63) / 32.0F;
+            auto output = input;
+            core::hadamard_reference(output);
+            core::round_bf16_reference(output);
+            for (unsigned d = 0; d < width; ++d) {
+                double exact = 0.0;
+                for (unsigned i = 0; i < width; ++i)
+                    exact += (std::popcount(i & d) % 2 == 0 ? 1.0 : -1.0) * input[i];
+                exact /= std::sqrt(static_cast<double>(width));
+                const double error = static_cast<double>(output[d]) - exact;
+                squared_error += error * error;
+                squared_reference += exact * exact;
+            }
+        }
+        check(squared_error < 1e-4 * squared_reference, "BF16 Hadamard rows match dense orthonormal transform");
+    }
+}
+
 void folded_value_mix() {
     constexpr std::array input_factor{1.0F, 2.0F};
     constexpr std::array output_factor{-0.5F, 0.25F};
@@ -243,6 +333,9 @@ int main() {
         pool_and_merge();
         hca_carry();
         compressed_index();
+        index_window_rows();
+        index_leading_rotary();
+        index_hadamard_rows();
         folded_value_mix();
         latent_attention();
         mla_history();
