@@ -2,6 +2,7 @@
 
 #include "strix/deploy/binding.hpp"
 #include "strix/dist/transport_spec.hpp"
+#include "strix/indexed_attention_state.hpp"
 #include "strix/pair/first_token.hpp"
 #include "strix/pair/rank_image.hpp"
 
@@ -19,19 +20,17 @@ namespace layers = pair::layers;
 
 constexpr auto kWindow = model::narrow<std::uint32_t>(data::attention::sliding_window);
 constexpr auto kHcaWidth = model::narrow<std::uint64_t>(data::dims::head_dim);
-constexpr auto kMlaRank = model::narrow<std::uint64_t>(data::attention::mla::kv_lora_rank);
-constexpr auto kMlaRope = model::narrow<std::uint64_t>(data::attention::mla::qk_rope_head_dim);
-constexpr auto kIndexWidth = model::narrow<std::uint64_t>(data::attention::indexer::index_head_dim);
 constexpr auto kKvBlock = model::narrow<std::uint64_t>(data::weights::checkpoint::weight_block_size[1]);
 constexpr std::uint32_t kPairProtocol = 1;
-constexpr auto kIndexBlock = model::narrow<std::uint64_t>(data::weights::checkpoint::expert_block_columns);
+constexpr SparseLatentRowDims kMlaRow{model::narrow<std::uint64_t>(data::attention::mla::kv_lora_rank), kKvBlock,
+                                      model::narrow<std::uint64_t>(data::attention::mla::qk_rope_head_dim),
+                                      model::narrow<std::uint64_t>(data::attention::indexer::index_head_dim),
+                                      model::narrow<std::uint64_t>(data::weights::checkpoint::expert_block_columns)};
 
-// Candidate compact layouts: FP8 KV + F32 scales; split MLA rotary FP8 and
-// separate E2M1 index keys (one byte of E8M0 per group).
-static_assert(kHcaWidth % kKvBlock == 0 && kMlaRank % kKvBlock == 0 && kIndexWidth % kIndexBlock == 0);
-constexpr auto kHcaEntry = kHcaWidth + (kHcaWidth / kKvBlock) * sizeof(float);
-constexpr auto kMlaEntry = kMlaRank + (kMlaRank / kKvBlock) * sizeof(float) + kMlaRope +
-                           kIndexWidth / 2U + kIndexWidth / kIndexBlock;
+// Candidate compact layouts (shared formulas, ERNIE dimensions).
+static_assert(kHcaWidth % kKvBlock == 0 && kMlaRow.valid());
+constexpr auto kHcaEntry = block_scaled_fp8_row_bytes(kHcaWidth, kKvBlock);
+constexpr auto kMlaEntry = sparse_latent_row_bytes(kMlaRow);
 
 using deploy::checked_add;
 
@@ -46,12 +45,13 @@ PairLayer describe_layer(std::uint32_t layer, std::uint32_t context) {
     } else {
         result.attention = PairAttention::hca;
         result.compression_ratio = static_cast<std::uint32_t>(data::attention::compress_ratios[layer]);
-        result.history_rows = std::min(context, kWindow);
-        result.compressed_rows = (context + result.compression_ratio - 1U) / result.compression_ratio;
+        const auto rows = compressed_history_rows(context, kWindow, result.compression_ratio);
+        result.history_rows = rows.history_rows;
+        result.compressed_rows = rows.compressed_rows;
         result.kv_bytes = (result.history_rows + result.compressed_rows) * kHcaEntry;
         // Unfused carry budget: retain projection and gate in F32 for a
         // complete incomplete-group window; APE itself is in the weights.
-        result.carry_bytes = result.compression_ratio * kHcaWidth * 2U * sizeof(float);
+        result.carry_bytes = compressed_history_carry_bytes(result.compression_ratio, kHcaWidth);
     }
     return result;
 }

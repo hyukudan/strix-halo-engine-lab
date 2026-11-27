@@ -3314,6 +3314,11 @@ if(BUILD_TESTING)
         COMMAND strix-indexed-attention-workspace-tests
     )
 
+    add_executable(strix-indexed-attention-state-tests tests/indexed_attention_state_tests.cpp)
+    target_link_libraries(strix-indexed-attention-state-tests PRIVATE strix_core)
+    strix_target_warnings(strix-indexed-attention-state-tests)
+    add_test(NAME strix-indexed-attention-state-tests COMMAND strix-indexed-attention-state-tests)
+
     add_executable(strix-recurrent-plan-tests tests/recurrent_plan_tests.cpp)
     target_link_libraries(strix-recurrent-plan-tests PRIVATE strix_core)
     strix_target_warnings(strix-recurrent-plan-tests)
