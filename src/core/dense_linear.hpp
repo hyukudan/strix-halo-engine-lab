@@ -126,6 +126,16 @@ __device__ __forceinline__ float silu(float x) { return x / (1.0F + expf(-x)); }
 // (ids == nullptr: row o) with the same per-output body; it stores the FP32 sum at out[o].
 // store_gathered(_bf16) (Rows 4..16, tight tile): live row r < nrows reads input row in_rows[r] of x and stores output row
 // out_rows[r] of out; the unused rows alias live row 0 and are not stored. The per-output sum is the tight-row body's.
+// Rows per register group of the row sweep (gemv_rows_direct.inc). Every accumulator still visits its elements in the
+// same ascending order whatever the grouping, so the bits do not change. The long 16-weight decodes (128-block FP8, MXFP4)
+// are hoisted across the groups by the compiler: at 8 and 16 rows the 8-row groups ran out of VGPRs (256, 24-113 spilled,
+// 100-456 B of scratch per lane); 4-row groups (and 2 outputs per wave at 16 rows, kTightTile) keep them in registers.
+// The other formats keep the incumbent grouping.
+template <weight_decode::Format Format>
+inline constexpr bool kLongDecode = Format == weight_decode::Format::e4m3_b128 || Format == weight_decode::Format::mxfp4_b32;
+template <weight_decode::Format Format, unsigned Rows, unsigned Streams>
+inline constexpr unsigned kRowGroup = kLongDecode<Format> && Rows > 4U ? 4U : Rows > 8U ? (Streams == 2U ? 4U : 8U) : Rows;
+
 template <unsigned Rows, unsigned T, weight_decode::Format Format, Epilogue Ep>
 __device__ __forceinline__ void body(View w, View up, const float* x, float* out, unsigned nrows, unsigned block,
                                      const std::uint32_t* ids = nullptr, const std::uint32_t* in_rows = nullptr,
@@ -142,6 +152,7 @@ __device__ __forceinline__ void body(View w, View up, const float* x, float* out
 #define GEMV_ROWS_CHUNK weight_decode::Chunk<Format>
 #define GEMV_ROWS_LOAD_CHUNK(row, start) weight_decode::Chunk<Format>(row, start)
 #define GEMV_ROWS_LANE_SUM(partial) wave_sum32(partial)
+#define GEMV_ROWS_ROW_GROUP (kRowGroup<Format, Rows, Streams>)
 #define GEMV_ROWS_INPUT_ROW(row) (gather ? in_rows[(row)] : (tight && (row) != 0U && (row) >= nrows ? 0U : (row)))
 #define GEMV_ROWS_STORE(row, o, sa, sb)                                                                              \
     if (lane == 0 && (o) < outputs && (row) < nrows)                                                               \
@@ -159,6 +170,7 @@ __device__ __forceinline__ void body(View w, View up, const float* x, float* out
 #undef GEMV_ROWS_CHUNK
 #undef GEMV_ROWS_LOAD_CHUNK
 #undef GEMV_ROWS_LANE_SUM
+#undef GEMV_ROWS_ROW_GROUP
 #undef GEMV_ROWS_INPUT_ROW
 #undef GEMV_ROWS_STORE
 }
@@ -240,8 +252,9 @@ inline hipError_t enqueue_slot_rows(const SlotRows& g, unsigned projections, uns
 
 // Outputs per wave. A decode row (Rows 1) runs one output per wave: twice the waves in flight, and every output keeps
 // its own chunk / element order, so the bits match any other tile (cold BF16, T2 -> T1: K2304 x 3072 69 -> 63 us).
-template <unsigned Rows>
-inline constexpr unsigned kTightTile = Rows == 1U ? 1U : Rows <= 8U ? 2U : 4U;
+// The long decodes (kLongDecode) keep 2 outputs per wave at 16 rows: 4 x 16 accumulators plus the hoisted decodes spill.
+template <unsigned Rows, weight_decode::Format Format = weight_decode::Format::bf16>
+inline constexpr unsigned kTightTile = Rows == 1U ? 1U : Rows <= 8U || kLongDecode<Format> ? 2U : 4U;
 
 // Expert-major rows (MoE experts selected on the device, many rows per expert): the same per-output body as slot rows, but one
 // launch block computes `Rows` slots of ONE expert at once, so the expert's matrix is decoded once per tile instead of once
@@ -264,7 +277,7 @@ struct ExpertRows {
 template <unsigned Rows, weight_decode::Format Format, bool RoundBf16>
 __global__ void __launch_bounds__(128) expert_rows_kernel(ExpertRows g, const float* x) {
     static_assert(Rows == 4U || Rows == 8U || Rows == 16U, "expert tiles are 4, 8 or 16 rows");
-    constexpr unsigned tile_outputs = kTightTile<Rows>, block_outputs = 4U * tile_outputs;
+    constexpr unsigned tile_outputs = kTightTile<Rows, Format>, block_outputs = 4U * tile_outputs;
     constexpr auto epilogue = RoundBf16 ? Epilogue::store_gathered_bf16 : Epilogue::store_gathered;
     const unsigned blocks = (g.outputs + block_outputs - 1U) / block_outputs;
     const std::size_t per_tile = std::size_t(blocks) * g.projections;
@@ -295,7 +308,7 @@ inline hipError_t enqueue_expert_rows(const ExpertRows& g, unsigned rows_per_til
     if (g.projections == 0U || g.projections > kSlotProjectionsMax || tile_bound == 0U || g.input_divisor == 0U ||
         g.outputs == 0U || g.top_k == 0U || g.inputs % 16U != 0U)
         return hipErrorInvalidValue;
-    const unsigned block_outputs = 4U * (rows_per_tile == 16U ? 4U : 2U);
+    const unsigned block_outputs = 4U * (rows_per_tile == 16U ? kTightTile<16U, Format> : 2U);
     const std::uint64_t bound = std::uint64_t{tile_bound} * ((g.outputs + block_outputs - 1U) / block_outputs) * g.projections;
     const unsigned grid = static_cast<unsigned>(bound < 8192U ? bound : 8192U);
     switch (rows_per_tile) {
@@ -310,7 +323,7 @@ inline hipError_t enqueue_expert_rows(const ExpertRows& g, unsigned rows_per_til
 // Any chunk format (weight_decode.hpp): w.row_bytes is the format's row image (weight_decode::row_bytes).
 template <unsigned Rows, weight_decode::Format Format, bool RoundBf16 = false>
 inline void launch_tight_rows(View w, const float* input, float* output, unsigned rows, hipStream_t stream) {
-    constexpr unsigned tile = kTightTile<Rows>;
+    constexpr unsigned tile = kTightTile<Rows, Format>;
     constexpr unsigned block_outputs = 4U * tile;
     constexpr auto epilogue = RoundBf16 ? Epilogue::store_tight_rows_bf16 : Epilogue::store_tight_rows;
     kernel<Rows, tile, Format, epilogue>

@@ -46,7 +46,11 @@
             // Rows > 8 run in groups of 8 rows with a scheduling barrier between the groups: the whole row set hoisted
             // at once needs 64 VGPRs of activations and spilled to scratch at 16 rows (256 VGPR, 132-492 B/lane).
             // Every accumulator still visits its elements in the same ascending order, so the bits do not change.
+#ifdef GEMV_ROWS_ROW_GROUP
+            constexpr unsigned RG = GEMV_ROWS_ROW_GROUP;  // the binding's register-group trait
+#else
             constexpr unsigned RG = Rows > 8U ? (Streams == 2U ? 4U : 8U) : Rows;
+#endif
 #pragma unroll
             for (unsigned g = 0; g < 4; ++g) {
 #pragma unroll
@@ -80,7 +84,7 @@
                             }
                         }
                     }
-                    if constexpr (Rows > 8U)
+                    if constexpr (RG < Rows)
                         __builtin_amdgcn_sched_barrier(0);
                 }
             }
