@@ -307,6 +307,15 @@ std::size_t count_missing_known_tensors(const Inventory& inventory) {
     }));
 }
 
+std::vector<std::string> missing_known_tensor_names(const Inventory& inventory) {
+    std::vector<std::string> names;
+    for (const auto& entry : known_schema())
+        if (!inventory.tensors.contains(entry.first)) names.push_back(entry.first);
+    return names;
+}
+
+std::optional<unsigned> target_layer(std::string_view name) { return tensor_layer(name, false); }
+
 Status inspect_weights(const std::filesystem::path& root, Inventory& out) {
     std::error_code error;
     if (!std::filesystem::is_directory(root, error))
@@ -337,7 +346,8 @@ Status inspect_weights(const std::filesystem::path& root, Inventory& out) {
     if (auto status = inspect(std::string(kFlashIndexerShard)); !status) return status;
     if (auto status = check_manifest(root / "model.safetensors.index.json", inventory); !status)
         return status;
-    inventory.missing_known_tensors = count_missing_known_tensors(inventory);
+    inventory.missing_known = missing_known_tensor_names(inventory);
+    inventory.missing_known_tensors = inventory.missing_known.size();
     out = std::move(inventory);
     return {Error::ok, {}};
 }

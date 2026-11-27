@@ -54,6 +54,7 @@ struct Tensor {
 struct Inventory {
     std::map<std::string, Tensor, std::less<>> tensors;
     std::vector<std::string> missing_shards;
+    std::vector<std::string> missing_known; // Schema names absent from the present shards.
     std::size_t missing_known_tensors{};
     bool has_manifest{};
 };
@@ -66,5 +67,8 @@ struct Inventory {
 // Accumulate one already indexed shard. On failure, tensors is unchanged.
 [[nodiscard]] weight::Status add_shard(const weight::TensorIndex& shard, Inventory& inventory);
 [[nodiscard]] std::size_t count_missing_known_tensors(const Inventory& inventory);
+[[nodiscard]] std::vector<std::string> missing_known_tensor_names(const Inventory& inventory);
+// Layer of a target tensor name; empty for global and drafter names.
+[[nodiscard]] std::optional<unsigned> target_layer(std::string_view name);
 
 } // namespace strix::ernie

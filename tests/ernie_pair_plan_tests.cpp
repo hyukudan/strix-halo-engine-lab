@@ -222,6 +222,40 @@ int main() try {
     auto overflow = limits;
     overflow.alignment = std::uint64_t{1} << 63U;
     rejects([&] { (void)make_pair_plan(inventory, topology, overflow, "usb4auto"); }, "memory wraparound accepted");
+    check(pair_owner("model.layers.21.x") == 0U && pair_owner("model.layers.22.x") == 1U &&
+          pair_owner("model.embed_tokens.weight") == 0U && pair_owner("model.norm.weight") == 1U &&
+          !pair_owner("model.mtp.0.x"), "fixed-cut tensor ownership");
+
+    // Range admission: the rank-0 copy omits the shard holding only rank-1 and drafter tensors.
+    auto rank0 = inventory;
+    for (unsigned i = kPairCut; i < kLayerCount; ++i) {
+        auto name = target_layer_prefix(i) + "self_attn.test";
+        rank0.tensors.erase(name);
+        rank0.missing_known.push_back(std::move(name));
+    }
+    for (const char* name : {"lm_head.weight", "model.mtp.weight"}) {
+        rank0.tensors.erase(name);
+        rank0.missing_known.emplace_back(name);
+    }
+    rank0.missing_shards.emplace_back("b.safetensors");
+    rank0.missing_known_tensors = rank0.missing_known.size();
+    rejects([&] { (void)make_pair_plan(rank0, topology, limits, "usb4auto"); },
+            "whole plan accepted a single-rank copy");
+    const auto local = make_pair_plan(rank0, topology, limits, "usb4auto", 0U);
+    bool same = local.ranks[0].tensors.size() == a.tensors.size();
+    for (std::size_t i = 0; same && i < a.tensors.size(); ++i)
+        same = local.ranks[0].tensors[i].name == a.tensors[i].name &&
+               local.ranks[0].tensors[i].resident_offset == a.tensors[i].resident_offset;
+    check(local.admitted() && local.local == 0U && same && local.ranks[1].tensors.empty() &&
+          local.ranks[0].memory.required == a.memory.required,
+          "rank-scoped plan differs from the whole plan for its own rank");
+    rejects([&] { (void)make_pair_plan(rank0, topology, limits, "usb4auto", 1U); },
+            "rank 1 admitted from a copy without its tensors");
+    rank0.missing_known.push_back(target_layer_prefix(0) + "self_attn.other");
+    rank0.missing_known_tensors = rank0.missing_known.size();
+    rejects([&] { (void)make_pair_plan(rank0, topology, limits, "usb4auto", 0U); },
+            "rank 0 admitted without one of its own tensors");
+
     inventory.missing_shards.push_back("missing");
     rejects([&] { (void)make_pair_plan(inventory, topology, limits, "usb4auto"); },
             "partial checkpoint accepted");

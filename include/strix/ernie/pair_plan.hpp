@@ -6,6 +6,7 @@
 #include "strix/pair/layer_pipeline.hpp"
 
 #include <array>
+#include <optional>
 
 namespace strix::ernie {
 
@@ -63,7 +64,10 @@ struct PairPlan {
     PairLimits limits;
     std::string transport;
     std::uint64_t draft_bytes{};
+    // Set for a rank-scoped plan: only this rank's tensors and memory are known.
+    std::optional<std::uint32_t> local;
     [[nodiscard]] bool admitted() const noexcept {
+        if (local) return *local < ranks.size() && ranks[*local].memory.admitted();
         return ranks[0].memory.admitted() && ranks[1].memory.admitted();
     }
 };
@@ -71,8 +75,14 @@ struct PairPlan {
 // A fixed whole-layer cut for first-token bring-up. This does not price the
 // transport or qualify the native numerics. Rebuild with observed usable bytes
 // and measured scratch before native allocation.
+// With local_rank, the checkpoint copy may omit shards: every absent target
+// tensor must belong to the other rank (drafter tensors stay deferred), and only
+// the local rank's tensors and memory are planned and admitted.
 [[nodiscard]] PairPlan make_pair_plan(const Inventory& inventory, const device::Topology& topology,
-                                      const PairLimits& limits, std::string transport);
+                                      const PairLimits& limits, std::string transport,
+                                      std::optional<std::uint32_t> local_rank = std::nullopt);
+// Rank owning a target tensor in the fixed cut; empty for drafter tensors.
+[[nodiscard]] std::optional<std::uint32_t> pair_owner(std::string_view name);
 
 using PairWeightWrite = std::function<void(std::uint64_t resident_offset, std::span<const std::byte>)>;
 

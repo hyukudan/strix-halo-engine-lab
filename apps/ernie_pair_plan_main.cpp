@@ -2,6 +2,8 @@
 
 #include <charconv>
 #include <iostream>
+#include <optional>
+#include <string>
 
 namespace {
 
@@ -51,13 +53,19 @@ void print_ranges(const PairPlan& plan) {
 } // namespace
 
 int main(int argc, char** argv) try {
-    if (argc != 11 && argc != 12) {
+    if (argc < 11 || argc > 14) {
         std::cerr << "usage: strix-ernie-pair-plan CHECKPOINT_DIR TOPOLOGY_TOML CONTEXT PREFILL_ROWS "
-                     "ALIGNMENT LOAD_CHUNK_BYTES SCRATCH0 SCRATCH1 RESERVE0 RESERVE1 [--ranges]\n";
+                     "ALIGNMENT LOAD_CHUNK_BYTES SCRATCH0 SCRATCH1 RESERVE0 RESERVE1 [--ranges] [--rank R]\n";
         return 2;
     }
-    const bool ranges = argc == 12 && std::string_view(argv[11]) == "--ranges";
-    if (argc == 12 && !ranges) throw std::invalid_argument("Unknown ERNIE pair argument");
+    bool ranges = false;
+    std::optional<std::uint32_t> local_rank;
+    for (int arg = 11; arg < argc; ++arg) {
+        const std::string_view flag(argv[arg]);
+        if (flag == "--ranges" && !ranges) ranges = true;
+        else if (flag == "--rank" && !local_rank && arg + 1 < argc) local_rank = number<std::uint32_t>(argv[++arg]);
+        else throw std::invalid_argument("Unknown ERNIE pair argument");
+    }
     PairLimits limits;
     limits.context = number<std::uint32_t>(argv[3]);
     limits.prefill_rows = number<std::uint32_t>(argv[4]);
@@ -70,11 +78,13 @@ int main(int argc, char** argv) try {
     Inventory inventory;
     if (const auto status = inspect_weights(argv[1], inventory); !status)
         throw std::runtime_error(status.detail);
-    const auto plan = make_pair_plan(inventory, topology, limits, "usb4auto");
-    std::cout << "scope=host-planning transport=" << plan.transport << " context=" << limits.context
+    const auto plan = make_pair_plan(inventory, topology, limits, "usb4auto", local_rank);
+    std::cout << "scope=" << (local_rank ? "rank-" + std::to_string(*local_rank) : std::string("host-planning"))
+              << " missing_shards=" << inventory.missing_shards.size() << " transport=" << plan.transport << " context=" << limits.context
               << " prefill_rows=" << limits.prefill_rows << " seam_row_bytes=" << kPairRowBytes
               << " draft_deferred=" << plan.draft_bytes << '\n';
-    for (const auto& rank : plan.ranks) print_rank(rank);
+    for (const auto& rank : plan.ranks)
+        if (!local_rank || rank.placement.stage == *local_rank) print_rank(rank);
     if (ranges) print_ranges(plan);
     return plan.admitted() ? 0 : 1;
 } catch (const std::exception& error) {

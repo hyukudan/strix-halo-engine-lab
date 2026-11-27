@@ -6,6 +6,7 @@
 #include <bit>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <tuple>
 #include <utility>
 
@@ -69,10 +70,28 @@ bool sha256_spelling(std::string_view digest) {
 
 } // namespace
 
+std::optional<std::uint32_t> pair_owner(std::string_view name) {
+    if (name.starts_with("model.mtp.")) return std::nullopt;
+    if (const auto layer = target_layer(name)) return *layer < kPairCut ? 0U : 1U;
+    return name == "model.embed_tokens.weight" ? 0U : 1U;
+}
+
 PairPlan make_pair_plan(const Inventory& inventory, const device::Topology& topology,
-                        const PairLimits& limits, std::string transport) {
-    if (!inventory.has_manifest || !inventory.missing_shards.empty() || inventory.missing_known_tensors != 0)
+                        const PairLimits& limits, std::string transport,
+                        std::optional<std::uint32_t> local_rank) {
+    const auto owns = [&](std::uint32_t rank) { return !local_rank || *local_rank == rank; };
+    if (!inventory.has_manifest ||
+        (!local_rank && (!inventory.missing_shards.empty() || inventory.missing_known_tensors != 0)))
         throw std::invalid_argument("ERNIE pair: a complete validated checkpoint inventory is required");
+    if (local_rank) {
+        // Range admission: a rank copy may omit shards that hold only the peer's tensors.
+        if (*local_rank > 1U || inventory.missing_known.size() != inventory.missing_known_tensors)
+            throw std::invalid_argument("ERNIE pair: rank scope needs rank 0 or 1 and the missing tensor names");
+        for (const auto& name : inventory.missing_known)
+            if (const auto owner = pair_owner(name); owner && *owner == *local_rank)
+                throw std::invalid_argument("ERNIE pair: rank " + std::to_string(*local_rank) +
+                                            " copy lacks its tensor " + name);
+    }
     if (topology.nodes.size() != 2 || topology.nodes[0].rank != 0 || topology.nodes[1].rank != 1 ||
         !std::ranges::any_of(topology.links, [](const auto& link) { return link.a == 0 && link.b == 1; }))
         throw std::invalid_argument("ERNIE pair: topology requires ranks 0 and 1 with a direct link");
@@ -103,16 +122,21 @@ PairPlan make_pair_plan(const Inventory& inventory, const device::Topology& topo
         }
         if (tensor.layer && *tensor.layer >= kLayerCount)
             throw std::invalid_argument("ERNIE pair: target layer out of range for " + name);
+        const bool first = tensor.layer ? *tensor.layer < kPairCut : tensor.module == Module::embedding;
+        if (!owns(first ? 0U : 1U)) continue; // Peer-owned tensor in a shard both ranks read.
         if (tensor.layer) ++layer_tensor_count[*tensor.layer];
         embedding |= !tensor.layer && tensor.module == Module::embedding;
         head |= !tensor.layer && tensor.module == Module::lm_head && name == "lm_head.weight";
-        const bool first = tensor.layer ? *tensor.layer < kPairCut : tensor.module == Module::embedding;
         plan.ranks[first ? 0U : 1U].tensors.push_back(
             {name, verified.source->shard_name(), tensor.module, tensor.layer, tensor.wire_dtype,
              tensor.shape, std::move(verified), 0});
     }
-    if (!embedding || !head || std::ranges::find(layer_tensor_count, 0U) != layer_tensor_count.end())
+    bool layers = true;
+    for (std::uint32_t layer = 0; layer < kLayerCount; ++layer)
+        layers = layers && (!owns(layer < kPairCut ? 0U : 1U) || layer_tensor_count[layer] != 0U);
+    if ((owns(0U) && !embedding) || (owns(1U) && !head) || !layers)
         throw std::invalid_argument("ERNIE pair: missing embedding, head or target layer");
+    plan.local = local_rank;
 
     for (std::uint32_t rank = 0; rank < plan.ranks.size(); ++rank) {
         auto& out = plan.ranks[rank];
@@ -176,7 +200,8 @@ std::uint32_t run_pair_first_token(const PairPlan& plan, std::uint32_t rank,
     std::span<const std::uint32_t> prompt, std::string_view asset_sha256,
     std::string_view numeric_identity, dist::Transport& link, const PairFirstTokenOps& ops) {
     try {
-        if (!plan.admitted() || rank >= plan.ranks.size() || !link.supports_peer_abort())
+        if (!plan.admitted() || rank >= plan.ranks.size() || (plan.local && *plan.local != rank) ||
+            !link.supports_peer_abort())
             throw std::invalid_argument("ERNIE pair: an admitted two-rank plan and abortable link are required");
         const auto& placement = plan.ranks[rank].placement;
         const auto valid_token = [](std::uint32_t id) { return id < data::dims::vocab; };
