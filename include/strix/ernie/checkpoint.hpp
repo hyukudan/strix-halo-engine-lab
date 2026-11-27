@@ -32,8 +32,6 @@ struct PairPayload {
 struct CheckpointReadPolicy {
     bool table_mxfp4 = false;
     bool high_nibble_first = false;
-    bool transpose_experts = false;
-    bool transpose_fp8_scales = false;
 };
 
 class CheckpointWeights {

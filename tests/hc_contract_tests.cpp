@@ -360,6 +360,16 @@ void geometry_rejected() {
 
 } // namespace
 
+void interleave_is_feature_major() {
+    strix::hc::Spec spec{};
+    spec.streams = 3;
+    spec.hidden = 2;
+    const float streams[] = {0, 1, 10, 11, 20, 21};
+    const auto ordered = strix::hc::interleave_features(spec, streams);
+    const std::vector<float> expected{0, 10, 20, 1, 11, 21};
+    check(ordered == expected, "feature interleave order");
+}
+
 int main() {
     std::mt19937 g(20261118U);
     ds41_bitwise(g);
@@ -369,6 +379,7 @@ int main() {
     collapse_variance_boundary();
     outside_root_sublayer_cases(g);
     geometry_rejected();
+    interleave_is_feature_major();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

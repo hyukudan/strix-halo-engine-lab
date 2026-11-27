@@ -77,8 +77,44 @@ void tensor_access_test() {
           "named slab binding checks slice sizes against geometry");
 }
 }
+static void dequantized_matrix_test() {
+    using Tile = BlockScaledE4M3<2, 32, float>;
+    constexpr std::size_t rows = 3, columns = 64;
+    std::vector<std::uint8_t> fp8(rows * columns), packed(rows * columns / 2U), exps(rows * columns / 32U);
+    for (std::size_t i = 0; i < fp8.size(); ++i) fp8[i] = static_cast<std::uint8_t>((i * 7U) % 120U);
+    for (std::size_t i = 0; i < packed.size(); ++i) packed[i] = static_cast<std::uint8_t>(i * 37U);
+    for (std::size_t i = 0; i < exps.size(); ++i) exps[i] = static_cast<std::uint8_t>(120U + i);
+    const std::vector<float> tile_scales{0.5F, 2.0F, 1.0F, 0.25F};
+    std::vector<float> expected(rows * columns), whole(rows * columns), split(rows * columns);
+    const Tile tile(fp8, tile_scales, rows, columns);
+    for (std::size_t row = 0; row < rows; ++row) tile.decode_row(row, std::span(expected).subspan(row * columns, columns));
+    microscaled::dequantize_fp8_block_matrix<Tile>(fp8, tile_scales, rows, columns, whole, microscaled::run_whole_matrix);
+    microscaled::dequantize_fp8_block_matrix<Tile>(fp8, tile_scales, rows, columns, split, [](std::size_t count, const auto& work) {
+        for (std::size_t row = count; row-- > 0;) work(row, row + 1U);
+    });
+    check(whole == expected && split == expected, "FP8 block matrix dequantization matches the row decoder");
+    for (const bool high : {false, true}) {
+        for (std::size_t row = 0; row < rows; ++row)
+            microscaled::decode_mxfp4_row_table(std::span(packed).subspan(row * columns / 2U, columns / 2U),
+                                                std::span(exps).subspan(row * 2U, 2U),
+                                                std::span(expected).subspan(row * columns, columns), high);
+        microscaled::dequantize_mxfp4_matrix(packed, exps, rows, columns, whole, {true, high}, microscaled::run_whole_matrix);
+        check(whole == expected, "MXFP4 matrix dequantization matches the row decoder");
+    }
+    microscaled::dequantize_mxfp4_matrix(packed, exps, rows, columns, whole, {}, microscaled::run_whole_matrix);
+    for (std::size_t row = 0; row < rows; ++row)
+        microscaled::decode_mxfp4_row(std::span(packed).subspan(row * columns / 2U, columns / 2U),
+                                      std::span(exps).subspan(row * 2U, 2U),
+                                      std::span(expected).subspan(row * columns, columns));
+    check(whole == expected, "default MXFP4 decoder");
+    bool refused = false;
+    try { microscaled::dequantize_mxfp4_matrix(packed, exps, rows, 48, whole, {}, microscaled::run_whole_matrix); }
+    catch (const std::invalid_argument&) { refused = true; }
+    check(refused, "mismatched MXFP4 geometry is refused");
+}
 bool wfmt_readers_test() try {
     tensor_access_test();
+    dequantized_matrix_test();
     std::vector<Byte> gg;for(char c:std::string("GGUF"))gg.push_back(Byte(c));u64(gg,3,4);u64(gg,2);u64(gg,0);
     for(unsigned type:{1U,8U}){text(gg,type==1?"a.weight":"b.weight");u64(gg,2,4);u64(gg,32);u64(gg,2);u64(gg,type,4);u64(gg,type==1?0:128);}
     while(gg.size()%32)gg.push_back(Byte{0});const auto payload=gg.size();for(unsigned i=0;i<196;++i)gg.push_back(Byte(i&255));

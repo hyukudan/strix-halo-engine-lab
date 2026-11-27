@@ -1,7 +1,7 @@
 #include "strix/ernie/checkpoint.hpp"
 
 #include "strix/weight/formats/fp8_block.hpp"
-#include "strix/weight/formats/microscaled.hpp"
+#include "strix/weight/formats/microscaled_matrix.hpp"
 #include "strix/weight/typed_slice.hpp"
 
 #include <stdexcept>
@@ -130,46 +130,20 @@ void CheckpointWeights::read(std::string_view name, std::span<float> out, std::s
     const auto codes = read_codes(tensor);
     if (codes.size() / packed_width != rows || codes.size() % packed_width != 0)
         throw std::invalid_argument("ERNIE: code slice does not match matrix shape");
-    const auto schedule = [&](const RowRange& decode) {
-        if (execute) execute(rows, decode);
-        else decode(0, rows);
+    const auto schedule = [&](std::size_t count, const auto& work) {
+        if (execute) execute(count, work);
+        else work(std::size_t{0}, count);
     };
     if (fp8) {
         std::vector<float> scales(scale_rows * scale_columns);
         read_plain(scale_name, scale, scales);
-        if (policy_.transpose_fp8_scales && scale_rows > 1 && scale_columns > 1) {
-            const auto stored = scales;
-            for (std::size_t row = 0; row < scale_rows; ++row)
-                for (std::size_t col = 0; col < scale_columns; ++col)
-                    scales[row * scale_columns + col] = stored[col * scale_rows + row];
-        }
-        const Fp8 matrix(codes, scales, rows, columns);
-        schedule([&](std::size_t first, std::size_t last) {
-            for (auto row = first; row < last; ++row) matrix.decode_row(row, out.subspan(row * columns, columns));
-        });
+        weight::microscaled::dequantize_fp8_block_matrix<Fp8>(codes, scales, rows, columns, out, schedule);
     } else {
         const auto scales = read_codes(scale);
         if (scales.size() / scale_columns != rows || scales.size() % scale_columns != 0)
             throw std::invalid_argument("ERNIE: scale slice does not match MXFP4 matrix shape");
-        schedule([&](std::size_t first, std::size_t last) {
-            for (auto row = first; row < last; ++row) {
-                const auto bytes = std::span(codes).subspan(row * packed_width, packed_width);
-                const auto block_scales = std::span(scales).subspan(row * scale_columns, scale_columns);
-                auto values = out.subspan(row * columns, columns);
-                if (policy_.table_mxfp4 || policy_.high_nibble_first)
-                    weight::microscaled::decode_mxfp4_row_table(bytes, block_scales, values, policy_.high_nibble_first);
-                else weight::microscaled::decode_mxfp4_row(bytes, block_scales, values);
-            }
-        });
-        if (policy_.transpose_experts) {
-            if (rows != columns) throw std::invalid_argument("ERNIE: transpose probe requires a square expert matrix");
-            constexpr std::size_t tile = 32;
-            for (std::size_t i = 0; i < rows; i += tile)
-                for (std::size_t j = 0; j <= i; j += tile)
-                    for (auto r = i; r < std::min(i + tile, rows); ++r)
-                        for (auto c = j; c < std::min(j + tile, r); ++c)
-                            std::swap(out[r * rows + c], out[c * rows + r]);
-        }
+        weight::microscaled::dequantize_mxfp4_matrix(
+            codes, scales, rows, columns, out, {policy_.table_mxfp4, policy_.high_nibble_first}, schedule);
     }
 }
 
