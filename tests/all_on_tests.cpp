@@ -318,6 +318,18 @@ void needs_slower_tests() {
         threw = true;
     }
     require(threw, "an unknown precondition kind is a catalogue error");
+    // Signed negative bounds must not wrap into uint64_t and silently bypass a losing regime.
+    for (const std::string_view bounds : {"[-1,8192]", "[-2,-1]", "[8192,4096]"}) {
+        for (const bool losing : {false, true}) {
+            const std::string prefix = R"json([{"row":"r","lever":"bad","class":"exact","gate":"none","engines":["m"],"backends":["hip"],"phase":"any","env":"X","value":"1","needs":[],)json";
+            const std::string field = losing ? std::string(R"json("slower":[{"phase":"prefill","receipt":"fixture","tokens":)json") +
+                std::string(bounds) + "}]" : std::string(R"json("tokens":)json") + std::string(bounds);
+            bool bad = false;
+            try { (void)ao::parse_catalogue(prefix + field + "}]"); }
+            catch (const std::invalid_argument&) { bad = true; }
+            require(bad, "invalid token bounds must be rejected: " + field);
+        }
+    }
 }
 
 // The engine side of the one record: a switch exported by --all-on that the engine does not engage prints its line.
