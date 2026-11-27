@@ -5,8 +5,8 @@
 // Resolution (resolve()):
 //   exact / fast / quality   the model's native KV precision (Caps::native).
 //   turbo                    fp8 when the engine has an fp8 KV path, else the native precision with a note saying so.
-//   explicit --kv X          wins over the tier (CLI > tier default, as every lever). A non-native value is recorded as
-//                            explicit and bit-changing; under exact the receipt says the run is not the exact reference.
+//   explicit --kv X          wins over non-exact tier defaults. EXACT requires the engine's native KV.
+//                            Refusals include a receipt for the effective tier and its native KV.
 //   unsupported X            refused by name, with the precisions the engine does implement (Caps::unavailable gives the
 //                            engine's own hint). Never replaced by another precision.
 // No other input exists: no slot count, memory pressure or context length selects the precision, so it never switches
@@ -23,14 +23,16 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
-#include <exception>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
 namespace strix::session::kv_precision {
+
+struct RequestError : std::invalid_argument {
+    using std::invalid_argument::invalid_argument;
+};
 
 enum class Precision : std::uint8_t { fp32 = 0, fp16 = 1, bf16 = 2, fp8 = 3, int8 = 4 };
 inline constexpr std::array<std::string_view, 5> kWords{"fp32", "fp16", "bf16", "fp8", "int8"};
@@ -93,10 +95,10 @@ struct Request {
 // Records one value. Throws on an unknown word or a second setting (two spellings of one setting included).
 inline void set(Request& r, std::string_view value, std::string_view spelling = kOption) {
     if (r.given())
-        throw std::invalid_argument(std::string(spelling) + ": the KV precision is already set by " + r.spelling);
+        throw RequestError(std::string(spelling) + ": the KV precision is already set by " + r.spelling);
     if (value == "native") r.native = true;
     else if (const auto p = parse(value)) r.value = *p;
-    else throw std::invalid_argument(std::string(spelling) + " expects native|fp32|fp16|bf16|fp8|int8 (got '" +
+    else throw RequestError(std::string(spelling) + " expects native|fp32|fp16|bf16|fp8|int8 (got '" +
                                      std::string(value) + "')");
     r.spelling = std::string(spelling);
 }
@@ -105,7 +107,7 @@ inline void set(Request& r, std::string_view value, std::string_view spelling = 
 inline bool take(int argc, const char* const* argv, int& i, Request& r) {
     const std::string_view a = argv[i];
     if (a == kOption) {
-        if (i + 1 >= argc) throw std::invalid_argument("--kv requires a value (native|fp32|fp16|bf16|fp8|int8)");
+        if (i + 1 >= argc) throw RequestError("--kv requires a value (native|fp32|fp16|bf16|fp8|int8)");
         set(r, argv[++i]);
         return true;
     }
@@ -134,19 +136,6 @@ inline Request extract(int& argc, char** argv) {
     return r;
 }
 
-// The product tier named by `--profile WORD` / `--profile=WORD` (the last one), for an engine whose own parser resolves
-// the profile later; a bare `--profile` (timing in some engines) or no option gives exact.
-inline profile::Name scan_tier(int argc, const char* const* argv) {
-    profile::Name out = profile::Name::standard;
-    for (int i = 1; i < argc; ++i) {
-        const std::string_view a = argv[i];
-        if (a == "--") break;
-        if (a == "--profile" && i + 1 < argc && profile::is_name(argv[i + 1])) out = profile::parse(argv[++i]);
-        else if (a.starts_with("--profile=") && profile::is_name(a.substr(10))) out = profile::parse(a.substr(10));
-    }
-    return out;
-}
-
 // lever: an engine's per-phase lever (its profile cell or its own option) selected the precision; the engine reports it.
 enum class Source : std::uint8_t { native = 0, tier = 1, explicit_option = 2, lever = 3 };
 [[nodiscard]] constexpr std::string_view source_name(Source s) noexcept {
@@ -166,15 +155,18 @@ struct Resolution {
     Precision native = Precision::bf16;
     Source source = Source::native;
     std::string form;   // storage form identity of `precision`
-    std::string note;   // turbo default not available, or an explicit non-native value under exact
+    std::string note;   // capability or per-phase detail
     [[nodiscard]] bool changes_output() const noexcept { return precision != native; }
     [[nodiscard]] std::string_view word() const noexcept { return kv_precision::word(precision); }
+    [[nodiscard]] const char* tier_word() const noexcept {
+        return tier == profile::Name::standard ? "exact" : profile::name(tier);
+    }
     // Cache-key / rank-agreement field.
     [[nodiscard]] std::string identity() const { return "kv=" + std::string(word()); }
     // One receipt line: "kv=fp8 native=bf16 source=turbo-default form=kv-e4m3-tok-v1 tier=turbo[ note=...]".
     [[nodiscard]] std::string receipt() const {
         std::string out = identity() + " native=" + std::string(kv_precision::word(native)) + " source=" +
-                          std::string(source_name(source)) + " form=" + form + " tier=" + profile::name(tier);
+                          std::string(source_name(source)) + " form=" + form + " tier=" + tier_word();
         if (!note.empty()) out += " note=\"" + note + "\"";
         return out;
     }
@@ -182,7 +174,7 @@ struct Resolution {
         std::string out = "{\"precision\":" + profile::json_string(word()) + ",\"native\":" +
                           profile::json_string(kv_precision::word(native)) + ",\"source\":" +
                           profile::json_string(source_name(source)) + ",\"form\":" + profile::json_string(form) +
-                          ",\"tier\":" + profile::json_string(profile::name(tier)) +
+                          ",\"tier\":" + profile::json_string(tier_word()) +
                           ",\"changes_output\":" + (changes_output() ? "true" : "false");
         if (!note.empty()) out += ",\"note\":" + profile::json_string(note);
         return out + "}";
@@ -190,17 +182,16 @@ struct Resolution {
 };
 
 enum class TierDefault { fp8_if_supported, resolved_by_levers };
-enum class ExactOverride { report_identity_change, require_native };
 
-// Throws std::invalid_argument naming the engine, the request and what the engine implements.
+// Throws RequestError naming the engine, the request and what the engine implements.
 inline Resolution resolve(profile::Name tier, const Request& request, const Caps& caps,
-                          TierDefault policy = TierDefault::fp8_if_supported,
-                          ExactOverride override = ExactOverride::report_identity_change) {
+                          TierDefault policy = TierDefault::fp8_if_supported) {
     Resolution r;
     r.engine = std::string(caps.engine);
     r.tier = tier;
     r.native = caps.native;
     r.precision = caps.native;
+    r.form = std::string(caps.form(caps.native));
     if (request.value) {
         const Precision want = *request.value;
         if (!caps.supports(want)) {
@@ -209,15 +200,14 @@ inline Resolution resolve(profile::Name tier, const Request& request, const Caps
                                   std::string(kv_precision::word(want)) + " KV path (supported: " + caps.supported_text() +
                                   "; native " + std::string(kv_precision::word(caps.native)) + ")";
             if (!caps.unavailable.empty()) message += "; " + std::string(caps.unavailable);
-            throw std::invalid_argument(message);
+            throw RequestError(message + "; strix-kv: " + r.json());
         }
-        if (tier == profile::Name::standard && override == ExactOverride::require_native && want != caps.native)
-            throw std::invalid_argument(std::string(caps.engine) + ": " + request.spelling + " " +
-                                        std::string(kv_precision::word(want)) + " refused: exact requires native KV");
+        if (tier == profile::Name::standard && want != caps.native)
+            throw RequestError(r.engine + ": " + request.spelling + " " +
+                                        std::string(kv_precision::word(want)) +
+                                        " refused: exact requires native KV; strix-kv: " + r.json());
         r.precision = want;
         r.source = Source::explicit_option;
-        if (r.changes_output() && tier == profile::Name::standard)
-            r.note = "explicit non-native KV under exact: not the exact reference";
     } else if (!request.native && tier == profile::Name::turbo && policy == TierDefault::fp8_if_supported) {
         if (caps.supports(Precision::fp8)) {
             r.precision = Precision::fp8;
@@ -227,30 +217,16 @@ inline Resolution resolve(profile::Name tier, const Request& request, const Caps
             if (!caps.unavailable.empty()) r.note += " (" + std::string(caps.unavailable) + ")";
         }
     }
-    r.form = std::string(caps.form(r.precision));
+    if (r.changes_output()) r.form = std::string(caps.form(r.precision));
     return r;
 }
 
 // The receipt line every engine prints once per run: "strix-kv: {json}".
 [[nodiscard]] inline std::string receipt_line(const Resolution& r) { return "strix-kv: " + r.json(); }
 
-// For a main() whose own parser runs afterwards (an engine whose KV precision is only its native one, or that applies
-// the resolution itself): takes --kv out of the argument vector, resolves it with the tier named by --profile, prints
-// receipt_line() on `receipt` and returns the resolution. On a refusal it prints the one-line reason and exits with 2.
-inline Resolution bind_main(int& argc, char** argv, const Caps& caps, std::FILE* receipt = stderr) {
-    try {
-        const auto request = extract(argc, argv);
-        auto r = resolve(scan_tier(argc, argv), request, caps);
-        if (receipt) {
-            std::fprintf(receipt, "%s\n", receipt_line(r).c_str());
-            std::fflush(receipt);
-        }
-        return r;
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "%s\n", e.what());
-        std::fflush(stderr);
-        std::exit(2);
-    }
+inline void emit_receipt(const Resolution& r, std::FILE* receipt = stderr) {
+    std::fprintf(receipt, "%s\n", receipt_line(r).c_str());
+    std::fflush(receipt);
 }
 
 }  // namespace strix::session::kv_precision

@@ -1,4 +1,5 @@
 #include "strix/profiles/gemma4.hpp"
+#include "strix/session/kv_precision.hpp"
 
 #include <cstdlib>
 #include <deque>
@@ -412,6 +413,15 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
                         else { entry.value = lever.builtin; entry.status = Status::absent; }
                     }
                 }
+            }
+            if (lever.name == "decode_attention" && profile == Name::standard &&
+                (entry.value == "g4-dattn-f1" || entry.value == dattn_form_value)) {
+                namespace kvp = strix::session::kv_precision;
+                constexpr kvp::Caps caps{"gemma4", kvp::Precision::fp32,
+                    kvp::bit(kvp::Precision::fp16) | kvp::bit(kvp::Precision::int8)};
+                kvp::Request request;
+                kvp::set(request, entry.value == dattn_form_value ? "int8" : "fp16", lever.env);
+                (void)kvp::resolve(profile, request, caps);
             }
             if ((entry.status == Status::explicit_env || entry.status == Status::explicit_cli) && !lever.asset &&
                 entry.value != lever.builtin) {

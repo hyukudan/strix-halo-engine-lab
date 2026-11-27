@@ -340,7 +340,8 @@ strix::profile::ExecutionReceipt host_receipt(App app, const Resolved& resolved,
     return out;
 }
 
-Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_env, const Probe& probe, const Build& build) {
+Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_env, const Probe& probe, const Build& build,
+                 const ::strix::session::kv_precision::Request& kv_request) {
     Resolved r;
     std::vector<std::string> user;
     for (const auto& a : in) {
@@ -371,6 +372,7 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
         fast_env.insert_or_assign("STRIX_DS41_FAST_MOE", "0");
     profile_inputs.env = fp::lookup(fast_env, raw_env);
     r.profile = strix::profile::resolve(profile_engine(), profile_inputs);
+    r.kv = strix::session::kv_precision::resolve(r.profile->profile, kv_request, kKvCaps);
     const auto profile_env = strix::profile::exports(*r.profile, fast_env);
     r.set_env = profile_env;
     if (auto extra = strix::profile::profile_args(*r.profile); !extra.empty())
@@ -554,6 +556,8 @@ DsparkSettings resolve_dspark_settings() {
 }
 
 Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
+    namespace kvp = ::strix::session::kv_precision;
+    const auto kv_request = kvp::extract(argc, argv);
     std::vector<std::string> in(argv + 1, argv + argc);
     Probe probe;
     probe.available_memory = []() -> std::uint64_t {
@@ -593,7 +597,8 @@ Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
         for (std::filesystem::directory_iterator it(d, ec), end; !ec && it != end; it.increment(ec)) out.push_back(it->path().filename().string());
         return out;
     };
-    auto r = resolve(app, in, [](const char* n) { return static_cast<const char*>(std::getenv(n)); }, probe, build);
+    auto r = resolve(app, in, [](const char* n) { return static_cast<const char*>(std::getenv(n)); }, probe, build, kv_request);
+    kvp::emit_receipt(r.kv);
     if (!r.print_only && r.profile) r.profile->weights.require_honoured();
     for (const auto& [k, v] : r.set_env) {
 #ifdef _WIN32

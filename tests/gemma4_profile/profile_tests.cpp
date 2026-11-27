@@ -342,6 +342,19 @@ void product_table() {
     // reference by the shared binder); outside a band, or with no known regime, TURBO keeps the FAST cell.
     // STRIX_G4_DECODE_ATTN=exact switches it off.
     for (const auto app : {pr::App::engine, pr::App::decode_bench}) {
+        for (const auto form : {"g4-dattn-f1", "g4-dattn-f2"}) {
+            bool refused = false;
+            try {
+                (void)pr::resolve(pr::Name::standard, app, in({}, {}, lookup({{"STRIX_G4_DECODE_ATTN", form}})));
+            } catch (const std::invalid_argument& error) {
+                const std::string_view message(error.what());
+                refused = message.starts_with("gemma4: STRIX_G4_DECODE_ATTN ") &&
+                    message.find("exact requires native KV; strix-kv: ") != std::string_view::npos &&
+                    message.find("\"tier\":\"exact\"") != std::string_view::npos &&
+                    message.find("\"precision\":\"fp32\"") != std::string_view::npos;
+            }
+            check(refused, "EXACT refuses a decode KV mirror with its effective receipt");
+        }
         r = pr::resolve(pr::Name::fast, app, in());
         check(value(r, "decode_attention") == "exact" && !r.active("decode_attention"), "fast runs the exact decode attention");
         pr::Inputs pending_ok = in(); pending_ok.allow_pending = true;
@@ -414,7 +427,7 @@ void product_table() {
         }
         r = pr::resolve(pr::Name::fast, app, in({}, {}, lookup({{"STRIX_G4_DECODE_ATTN", "exact"}})));
         check(status(r, "decode_attention") == pr::Status::off && !r.active("decode_attention"), "STRIX_G4_DECODE_ATTN=exact is OFF");
-        r = pr::resolve(pr::Name::standard, app, in({}, {}, lookup({{"STRIX_G4_DECODE_ATTN", "g4-dattn-f1"}})));
+        r = pr::resolve(pr::Name::fast, app, in({}, {}, lookup({{"STRIX_G4_DECODE_ATTN", "g4-dattn-f1"}})));
         check(status(r, "decode_attention") == pr::Status::explicit_env &&
               r.qualification() == "unqualified: decode_attention" &&
               r.json().find("\"unqualified\":[\"decode_attention\"]") != std::string::npos,

@@ -22,10 +22,15 @@ Options parse(std::initializer_list<const char*> args) {
     for (auto& arg : storage) argv.push_back(arg.data());
     return parse_options(static_cast<int>(argv.size()), argv.data());
 }
-template<class Function> void rejects(Function operation, std::string_view message) {
+template<class Function> void rejects(Function operation, std::string_view message,
+                                      std::string_view receipt_tier = {}) {
     try { operation(); expect(false, "expected CLI rejection"); }
     catch (const std::invalid_argument& error) {
-        if (std::string_view(error.what()) != message) {
+        const std::string_view actual(error.what());
+        const bool matches = receipt_tier.empty() ? actual == message :
+            actual.starts_with(std::string(message) + "; strix-kv: ") &&
+            actual.find(std::string("\"tier\":\"") + std::string(receipt_tier) + "\"") != std::string_view::npos;
+        if (!matches) {
             ++failures; std::cerr << "expected CLI rejection: " << message << "\nactual CLI rejection: " << error.what() << '\n';
         }
     }
@@ -874,7 +879,7 @@ int main() {
     rejects([] { (void)parse({"decoder", "m", "1", "--gdn-recurrent-storage", "unknown"}); }, "GDN recurrent storage must be key-value or value-key");
     expect(defaults.attention_kv_storage == AttentionKvStorage::bf16 && !defaults.attention_kv_storage_explicit,
         "the BF16 KV cache is the default");
-    auto int8_kv = parse({"decoder", "m", "1", "--attention-kv-storage", "kv-int8-tok-v1"});
+    auto int8_kv = parse({"decoder", "m", "1", "--profile", "fast", "--attention-kv-storage", "kv-int8-tok-v1"});
     expect(int8_kv.attention_kv_storage == AttentionKvStorage::int8_token && int8_kv.attention_kv_storage_explicit,
         "kv-int8-tok-v1 has an explicit selector");
     expect(parse({"decoder", "m", "1", "--attention-kv-storage=bf16"}).attention_kv_storage == AttentionKvStorage::bf16,
@@ -910,13 +915,17 @@ int main() {
            defaults.kv.json().find("\"precision\":\"bf16\"") != std::string::npos, "the receipt names the native BF16 KV");
     expect(int8_kv.kv.word() == "int8" && int8_kv.kv.form == "kv-int8-tok-v1" && int8_kv.kv.changes_output(),
            "the legacy int8 spelling resolves through --kv");
-    auto kv_int8 = parse({"decoder", "m", "1", "--kv", "int8"});
+    auto kv_int8 = parse({"decoder", "m", "1", "--kv", "int8", "--profile", "fast"});
     expect(kv_int8.attention_kv_storage == AttentionKvStorage::int8_token && kv_int8.attention_kv_storage_explicit &&
            kv_int8.kv.word() == "int8", "--kv int8 selects kv-int8-tok-v1");
     expect(parse({"decoder", "m", "1", "--kv=bf16"}).attention_kv_storage == AttentionKvStorage::bf16, "--kv=bf16");
+    rejects([] { (void)parse({"decoder", "m", "1", "--profile", "exact", "--kv", "int8"}); },
+        "qwen-hip: --kv int8 refused: exact requires native KV", "exact");
+    rejects([] { (void)parse({"decoder", "m", "1", "--attention-kv-storage=kv-int8-tok-v1", "--profile=exact"}); },
+        "qwen-hip: --attention-kv-storage int8 refused: exact requires native KV", "exact");
     rejects([] { (void)parse({"decoder", "m", "1", "--kv", "fp8"}); },
         "qwen-hip: --kv fp8 refused: this engine has no fp8 KV path (supported: bf16|int8; native bf16); "
-        "the HIP 8-bit KV form is --kv int8 (kv-int8-tok-v1)");
+        "the HIP 8-bit KV form is --kv int8 (kv-int8-tok-v1)", "fast");
     rejects([] { (void)parse({"decoder", "m", "1", "--kv", "int8", "--attention-kv-storage", "bf16"}); },
         "duplicate attention KV storage option");
     rejects([] { (void)parse({"decoder", "m", "1", "--attention-kv-storage", "bf16", "--kv", "int8"}); },

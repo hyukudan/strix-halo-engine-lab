@@ -3278,12 +3278,6 @@ inline Options parse_options(
         }
         if (strix::session::kv_precision::take(argc, argv, index, options.kv_request)) {
             if (options.attention_kv_storage_explicit) throw std::invalid_argument("duplicate attention KV storage option");
-            // Refuses a precision this engine has no KV path for (fp8: gfx1151) before anything else; the tier is applied
-            // at the end (it cannot change the storage here: turbo keeps BF16 on this backend).
-            const auto early = strix::session::kv_precision::resolve(
-                strix::profile::Name::standard, options.kv_request, strix::qwen::profile::kKvCaps);
-            options.attention_kv_storage = early.precision == strix::session::kv_precision::Precision::int8
-                ? strix::AttentionKvStorage::int8_token : strix::AttentionKvStorage::bf16;
             options.attention_kv_storage_explicit = true;
             continue;
         }
@@ -4017,6 +4011,8 @@ inline Options parse_options(
     // KV precision: native BF16 in every tier (no FP8 here, so turbo keeps BF16 with a note); only --kv changes it.
     options.kv = strix::session::kv_precision::resolve(options.product_profile.profile, options.kv_request,
         strix::qwen::profile::kKvCaps);
+    options.attention_kv_storage = options.kv.precision == strix::session::kv_precision::Precision::int8
+        ? strix::AttentionKvStorage::int8_token : strix::AttentionKvStorage::bf16;
     return options;
 }
 

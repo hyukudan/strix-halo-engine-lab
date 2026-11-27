@@ -1012,11 +1012,11 @@ int main(int argc, char** argv) {
     // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
     // GPU of a node keeps working (declared=implicit).
     strix::device::bind_hip_main(argc, argv);
-    // KV precision (--kv): native-only here; refuses any other value by name and prints the "strix-kv:" receipt line.
-    (void)strix::session::kv_precision::bind_main(argc, argv, strix::glm::rank_defaults::kKvCaps);
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::setvbuf(stderr, nullptr, _IONBF, 0);
     try {
+        namespace kvp = strix::session::kv_precision;
+        const auto kv_request = kvp::extract(argc, argv);
         if (argc < 2) {
             std::fprintf(stderr, "usage: %s MODEL_DIR --world 1|2 [--rank R --transport T] [--slots S] [--capacity C] [--serial] "
                                  "[--host H] [--port P] [--profile exact|fast|quality|turbo] [--deploy FILE|auto] [--deploy-check] [--prefix-cache-gib G] [--selftest N [--selftest-tokens M] [--selftest-prefix [--selftest-prefix-long L]]] "
@@ -1173,6 +1173,8 @@ int main(int argc, char** argv) {
         // max-rows runs the CLI's load-time admission (rd::admit_auto_rows) and a row merge between the two ranks.
         const auto request = rd::scan(rd::serve_request_args(rank_args, serve_mtp));
         auto eff = rd::resolve(request, rd::process_env(), rd::probe_model_mtp(argv[1]));
+        const auto tier = eff.product ? eff.product->profile : strix::profile::Name::standard;
+        kvp::emit_receipt(kvp::resolve(tier, kv_request, rd::kKvCaps));
         // Sampled MTP is resolved and admitted inside that resolution (row serve_sampled_mtp; coupled under any profile,
         // rejection fast / turbo only); execution and the receipt read eff.sampled_mtp only. The sampler options are
         // validated here, before any rank connects or the model loads, with the acceptance rule the row resolved (off:

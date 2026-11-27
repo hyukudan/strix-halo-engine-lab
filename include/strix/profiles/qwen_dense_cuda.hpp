@@ -658,6 +658,7 @@ inline kvp::Resolution resolve_kv(std::optional<Name> profile, const kvp::Reques
 
 // Records the attention's KV read precision as the resolved levers left it (profile cells or per-lever options).
 inline void observe_kv(kvp::Resolution& kv, const Resolved& r) {
+    kv.tier = r.resolution.profile;
     std::string on;
     unsigned offered_levers = 0, on_levers = 0;
     for (const auto lever : kKvLevers) {
@@ -665,6 +666,11 @@ inline void observe_kv(kvp::Resolution& kv, const Resolved& r) {
         if (e == nullptr) continue;
         ++offered_levers;
         if (e->value == "on" && e->status != sp::Status::builtin && e->status != sp::Status::pending) {
+            if (kv.tier == Name::standard) {
+                kvp::Request request;
+                kvp::set(request, "fp8", e->lever->option);
+                (void)kvp::resolve(kv.tier, request, kKvCaps);
+            }
             ++on_levers;
             on += (on.empty() ? "" : ",") + std::string(lever);
         }

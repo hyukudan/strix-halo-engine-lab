@@ -3,6 +3,7 @@
 `--attention-kv-storage kv-int8-tok-v1` stores the QSA attention KV cache of the target model in int8 with
 one FP32 scale per token, KV head and K/V half. The default, `--attention-kv-storage bf16` (or no flag), keeps
 the canonical BF16 cache and every existing route, token, identity and receipt field unchanged.
+Use `--profile fast` with this override. EXACT refuses a non-native KV precision.
 
 It is a new named numerical identity, not an organization of the BF16 arithmetic: attention reads
 dequantized values, so logits differ from the BF16 cache. It is opt-in and not qualified

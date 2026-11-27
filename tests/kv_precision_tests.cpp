@@ -96,23 +96,7 @@ void options() {
               std::string_view(argv[3]) == "--" && std::string_view(argv[4]) == "--kv" && argv[6] == nullptr,
           "extract removes --kv before -- and keeps the rest");
 
-    const char* t1[] = {"bin", "--profile", "turbo"};
-    const char* t2[] = {"bin", "--profile", "--x"};
-    const char* t3[] = {"bin", "--profile=fast"};
-    const char* t4[] = {"bin", "--", "--profile", "turbo"};
-    check(kvp::scan_tier(3, t1) == Name::turbo && kvp::scan_tier(3, t2) == Name::standard && kvp::scan_tier(2, t3) == Name::fast &&
-              kvp::scan_tier(4, t4) == Name::standard,
-          "scan_tier reads only a tier word (a bare --profile is timing in some engines)");
-    const kvp::Caps dual_cache{"dual-cache", Precision::bf16, kvp::bit(Precision::fp8)};
-    kvp::Request request;
-    kvp::set(request, "fp8");
-    const auto strict = kvp::ExactOverride::require_native;
-    const auto tier_default = kvp::TierDefault::resolved_by_levers;
-    check(refusal([&] { (void)kvp::resolve(Name::standard, request, dual_cache, tier_default, strict); }).find("requires native KV")
-              != std::string::npos,
-          "explicit strict policy refuses bit-changing KV under exact");
-    check(kvp::resolve(Name::fast, request, dual_cache, tier_default, strict).precision == Precision::fp8,
-          "strict exact policy admits explicit FP8 under fast");
+
 }
 
 void tiers() {
@@ -142,9 +126,18 @@ void tiers() {
     check(t.precision == Precision::bf16 && t.source == kvp::Source::explicit_option, "explicit wins over the tier default");
     t = kvp::resolve(Name::fast, request("fp8"), kCuda);
     check(t.precision == Precision::fp8 && t.source == kvp::Source::explicit_option && t.note.empty(), "explicit fp8 under fast");
-    t = kvp::resolve(Name::standard, request("fp8"), kCuda);
-    check(t.precision == Precision::fp8 && t.note == "explicit non-native KV under exact: not the exact reference",
-          "explicit fp8 under exact runs, stamped as not the reference");
+    for (const auto* caps : {&kHip, &kBf16Only, &kCuda, &kDs41, &kF32Native}) {
+        for (const auto precision : kvp::kWords) {
+            const auto error = refusal([&] { (void)kvp::resolve(Name::standard, request(precision), *caps); });
+            if (precision == kvp::word(caps->native)) {
+                check(error.empty(), "EXACT accepts explicit native precision");
+            } else {
+                check(error.find(" refused: ") != std::string::npos &&
+                          error.ends_with(kvp::receipt_line(kvp::resolve(Name::standard, {}, *caps))),
+                      "EXACT refuses every non-native precision and reports its effective tier and KV");
+            }
+        }
+    }
     t = kvp::resolve(Name::standard, request("bf16"), kCuda);
     check(t.source == kvp::Source::explicit_option && !t.changes_output() && t.note.empty(), "explicit native: no note");
     // The same inputs give the same resolution: nothing else (slots, memory, context) is an input.
@@ -153,12 +146,12 @@ void tiers() {
 }
 
 void refusals() {
-    check(refusal([] { (void)kvp::resolve(Name::turbo, request("fp8"), kHip); }) ==
+    check(refusal([] { (void)kvp::resolve(Name::turbo, request("fp8"), kHip); }).starts_with(
               "qwen-hip: --kv fp8 refused: this engine has no fp8 KV path (supported: bf16|int8; native bf16); "
-              "the HIP 8-bit KV form is --kv int8 (kv-int8-tok-v1)",
+              "the HIP 8-bit KV form is --kv int8 (kv-int8-tok-v1); strix-kv: "),
           "HIP refuses fp8 by name and points at int8");
-    check(refusal([] { (void)kvp::resolve(Name::fast, request("fp8"), kBf16Only); }) ==
-              "glm-pair: --kv fp8 refused: this engine has no fp8 KV path (supported: bf16; native bf16)",
+    check(refusal([] { (void)kvp::resolve(Name::fast, request("fp8"), kBf16Only); }).starts_with(
+              "glm-pair: --kv fp8 refused: this engine has no fp8 KV path (supported: bf16; native bf16); strix-kv: "),
           "a BF16-only engine refuses fp8");
     check(!refusal([] { (void)kvp::resolve(Name::fast, request("int8"), kBf16Only); }).empty(), "and int8");
     check(refusal([] { (void)kvp::resolve(Name::standard, request("bf16"), kDs41); }).find(
@@ -166,7 +159,8 @@ void refusals() {
               "the KV format is defined by the model") == 0,
           "a model-defined FP8 KV refuses bf16");
     check(!refusal([] { (void)kvp::resolve(Name::standard, request("fp16"), kCuda); }).empty(), "fp16 without a path");
-    check(refusal([] { (void)kvp::resolve(Name::standard, request("fp16"), kF32Native); }).empty(), "fp16 with a path");
+    check(refusal([] { (void)kvp::resolve(Name::standard, request("fp16"), kF32Native); }).find(
+              "exact requires native KV") != std::string::npos, "EXACT refuses FP16 with a path");
     check(strix::ds41::rtx::profile::kKvCaps.native == Precision::fp8, "DS41 RTX: native fp8");
 }
 
@@ -189,6 +183,13 @@ void serve_config() {
     const cf::Option table[] = {kvp::kServeConfigOption, {"attention_kv_storage", "--attention-kv-storage", cf::Kind::value, 0, {}}};
     auto e = cf::expand_text("kv = \"fp8\"\n", "/cfg/serve.toml", {"bin"}, table);
     check(e.argv.size() == 3 && e.argv[1] == "--kv" && e.argv[2] == "fp8", "kv = \"fp8\" expands to --kv fp8");
+    const char* argv[] = {e.argv[0].c_str(), e.argv[1].c_str(), e.argv[2].c_str()};
+    kvp::Request kv;
+    int at = 1;
+    check(kvp::take(3, argv, at, kv), "the expanded config uses the shared KV parser");
+    check(refusal([&] { (void)kvp::resolve(Name::standard, kv, kCuda); }).find(
+              "exact requires native KV; strix-kv: ") != std::string::npos,
+          "the serve-config override cannot bypass EXACT");
     e = cf::expand_text("kv = \"fp8\"\n", "/cfg/serve.toml", {"bin", "--kv", "bf16"}, table);
     check(e.argv.size() == 3 && e.argv[2] == "bf16", "the CLI wins over the file");
 }
@@ -213,14 +214,22 @@ void cuda_adapter() {
           "a lever option together with --kv is refused");
     // observe_kv(): the receipt reports what the resolved levers do.
     cli = {{"decode_attn8", "on"}};
-    const auto resolved = qp::resolve(std::nullopt, qp::Regime{qp::Weights::nvfp4_rtn, qp::Route::windows, 64}, cli);
-    kv = kvp::resolve(Name::standard, {}, qp::kKvCaps);
+    const auto exact = qp::resolve(Name::standard, qp::Regime{qp::Weights::nvfp4_rtn, qp::Route::windows, 64}, cli);
+    check(refusal([&] { qp::observe_kv(kv, *exact); }).starts_with(
+              "qwen35-cuda-dense: --decode-attn8 fp8 refused: exact requires native KV; strix-kv: "),
+          "the direct decode lever cannot bypass EXACT");
+    const auto resolved = qp::resolve(Name::fast, qp::Regime{qp::Weights::nvfp4_rtn, qp::Route::windows, 64}, cli);
+    kv = kvp::resolve(Name::fast, {}, qp::kKvCaps);
     qp::observe_kv(kv, *resolved);
     check(kv.precision == Precision::fp8 && kv.source == kvp::Source::lever && kv.note.find("decode_attn8 on") != std::string::npos,
           "a per-lever option that reads the e4m3 shadow is reported as fp8");
     cli = {{"prefill_attn8", "on"}};
-    const auto partial = qp::resolve(std::nullopt, qp::Regime{qp::Weights::nvfp4_rtn, qp::Route::large_prefill, 64}, cli);
-    kv = kvp::resolve(Name::standard, {}, qp::kKvCaps);
+    const auto exact_prefill = qp::resolve(Name::standard, qp::Regime{qp::Weights::nvfp4_rtn, qp::Route::large_prefill, 64}, cli);
+    check(refusal([&] { qp::observe_kv(kv, *exact_prefill); }).starts_with(
+              "qwen35-cuda-dense: --prefill-attn8 fp8 refused: exact requires native KV; strix-kv: "),
+          "the direct prefill lever cannot bypass EXACT");
+    const auto partial = qp::resolve(Name::fast, qp::Regime{qp::Weights::nvfp4_rtn, qp::Route::large_prefill, 64}, cli);
+    kv = kvp::resolve(Name::fast, {}, qp::kKvCaps);
     qp::observe_kv(kv, *partial);
     check(kv.precision == Precision::bf16 && kv.note.find("prefill_attn8 on: attention reads the e4m3 KV shadow in that phase only") !=
                                                  std::string::npos,

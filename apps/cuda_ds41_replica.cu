@@ -364,8 +364,10 @@ int main(int argc, char** argv) {
     // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
     // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
     strix::device::bind_cuda_main(argc, argv);
-    // KV precision (--kv): native-only here; refuses any other value by name and prints the "strix-kv:" receipt line.
-    (void)strix::session::kv_precision::bind_main(argc, argv, strix::ds41::rtx::profile::kKvCaps);
+    namespace kvp = strix::session::kv_precision;
+    kvp::Request kv_request;
+    try { kv_request = kvp::extract(argc, argv); }
+    catch (const std::exception& e) { usage(e.what()); }
     if (argc < 2) usage("MODEL.gguf [options]");
     const std::string model = argv[1];
     std::string state_file, ref_file, routes, seqmod = "5:0", chats_arg, seqs_file, json_out, timeline_out, phases_arg = "exact0,pressure,exact8,chats8,chats0";
@@ -750,7 +752,10 @@ int main(int argc, char** argv) {
     // lowest explicit layer: the parser's options and the levers' variables already read above win over it)
     namespace rprof = strix::ds41::rtx::profile;
     rprof::Resolution prof;
-    try { prof = rprof::resolve(rprof::App::replica, rprof::Inputs{launch_args, {}}); }
+    try {
+        prof = rprof::resolve(rprof::App::replica, rprof::Inputs{launch_args, {}});
+        kvp::emit_receipt(kvp::resolve(prof.name, kv_request, rprof::kKvCaps));
+    }
     catch (const std::exception& e) { usage(e.what()); }
     {
         // a profile value other than the builtin form: today none (every ready row is the replica's default)

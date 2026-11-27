@@ -113,7 +113,8 @@ struct World {
     std::uint64_t memory = 64ULL << 30U, free_disk = 512ULL << 30U;
     std::uint64_t usable = UINT64_MAX;  // MemAvailable - host floor; UINT64_MAX leaves the probe unset
 
-    pd::Resolved run(pd::App app, const std::vector<std::string>& args) const {
+    pd::Resolved run(pd::App app, const std::vector<std::string>& args,
+                     const strix::session::kv_precision::Request& kv_request = {}) const {
         pd::Probe p;
         p.available_memory = [this] { return memory; };
         if (usable != UINT64_MAX) p.usable_memory = [this] { return usable; };
@@ -129,7 +130,7 @@ struct World {
         return pd::resolve(app, args, [this](const char* n) -> const char* {
             const auto it = env.find(n);
             return it == env.end() ? nullptr : it->second.c_str();
-        }, p, build);
+        }, p, build, kv_request);
     }
 };
 
@@ -547,6 +548,21 @@ void test_profile() {
         auto fast_args = plain_args;
         fast_args.insert(fast_args.end(), {"--profile", "fast"});
         const auto f = w.run(app, fast_args);
+        check(f.kv.tier == f.profile->profile && f.kv.tier_word() == std::string_view("fast") &&
+                  f.kv.word() == "fp8" && !f.kv.changes_output(),
+              "native FP8 KV receipt follows the resolved FAST tier");
+        namespace kvp = strix::session::kv_precision;
+        kvp::Request other_kv;
+        kvp::set(other_kv, "bf16");
+        try {
+            (void)w.run(app, {MODEL, "--profile", "exact"}, other_kv);
+            check(false, "EXACT refuses changing DeepSeek's native FP8 KV");
+        } catch (const kvp::RequestError& error) {
+            const std::string_view message(error.what());
+            check(message.find("--kv bf16 refused") != std::string_view::npos &&
+                      message.ends_with(kvp::receipt_line(base.kv)),
+                  "non-native KV error carries DeepSeek's effective EXACT receipt");
+        }
         auto turbo_args = plain_args;
         turbo_args.insert(turbo_args.end(), {"--profile", "turbo", "--allow-pending"});
         const auto turbo = w.run(app, turbo_args);

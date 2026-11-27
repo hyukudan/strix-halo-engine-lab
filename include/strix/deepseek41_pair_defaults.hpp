@@ -99,6 +99,7 @@ struct Resolved {
     std::vector<std::string> notices;                          // one line each
     bool print_only = false;                                   // --print-effective-config (removed from args)
     std::optional<strix::profile::Resolution> profile;         // --profile (removed from args); always resolved
+    strix::session::kv_precision::Resolution kv;
     // STRIX_DS41_DECODE_XPORT as BatchForward resolves it (strix/ds41_decode_xport.hpp): "communicator" / "channel",
     // then the origin ("default" / "explicit"). One rule for CLI, serve and engine; both ranks also agree at load.
     std::string decode_xport;
@@ -173,7 +174,8 @@ std::span<const strix::profile::DefaultItem> default_items();
 // ds41-expert-tp2-i1152-v1), assets and lineage; unresolved fields stay empty.
 strix::profile::ExecutionReceipt host_receipt(App app, const Resolved& resolved,
                                              strix::profile::NumericalIdentity identity = {});
-Resolved resolve(App app, const std::vector<std::string>& args, const Getenv& env, const Probe& probe, const Build& build);
+Resolved resolve(App app, const std::vector<std::string>& args, const Getenv& env, const Probe& probe, const Build& build,
+                 const strix::session::kv_precision::Request& kv_request = {});
 // The printed form of --print-effective-config: "app", then every set/unset variable and argument, one per line.
 std::string describe(App app, const Resolved& r);
 

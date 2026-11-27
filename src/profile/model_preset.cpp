@@ -192,12 +192,10 @@ void ModelPreset::append_options(std::vector<std::string>& args) const {
         });
     };
     if (has("--profile")) throw std::invalid_argument("specify --profile before engine arguments");
-    if (requested != Name::turbo &&
-        (has("--prefill-attn8") || has("--decode-attn8"))) {
-        // These CUDA dense aliases select the same FP8 KV reader as --kv.
-        throw std::invalid_argument("KV attention overrides require the turbo preset");
-    }
-    if (requested != Name::turbo) {
+    // The engine has the native format and the effective EXACT tier for the KV refusal receipt.
+    if (requested != Name::turbo && levers != Name::standard) {
+        if (has("--prefill-attn8") || has("--decode-attn8"))
+            throw std::invalid_argument("KV attention overrides require the turbo preset");
         for (auto it = args.begin(); it != args.end(); ++it) {
             if (*it == "--kv=fp8" || (*it == "--kv" && it + 1 != args.end() && *(it + 1) == "fp8"))
                 throw std::invalid_argument("--kv fp8 requires the turbo preset");

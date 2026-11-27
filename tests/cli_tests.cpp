@@ -424,6 +424,15 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
     req.profile = Name::fast;
     req.args = {"--kv=fp8"};
     refuses([&] { (void)resolve(req, entries, matrix, probes, "bin", exists, &dense); }, "requires the turbo preset");
+    req.profile = Name::standard;
+    req.print_effective_config = false;
+    const auto exact_preset = resolve(req, entries, matrix, probes, "bin", exists, &dense);
+    require(exact_preset.args == std::vector<std::string>{"--model", "model.gguf", "--kv=fp8", "--profile", "exact"},
+            "launcher forwards EXACT and the KV selector for refusal with the engine's effective receipt");
+    req.args = {"--decode-attn8", "off"};
+    const auto exact_off = resolve(req, entries, matrix, probes, "bin", exists, &dense);
+    require(exact_off.args == std::vector<std::string>{"--model", "model.gguf", "--decode-attn8", "off", "--profile", "exact"},
+            "launcher forwards an explicit native attention selection under EXACT");
     req.args = {"--profile", "exact"};
     refuses([&] { (void)resolve(req, entries, matrix, probes, "bin", exists, &dense); }, "before engine arguments");
     refuses([] { (void)parse({"run", "qwen3.8-27b", "--profile", "quality"}); }, "requires exact, fast or turbo");

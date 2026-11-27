@@ -141,11 +141,11 @@ int main(int argc, char** argv) {
     // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
     // GPU of a node keeps working (declared=implicit).
     strix::device::bind_hip_main(argc, argv);
-    // KV precision (--kv): native-only here; refuses any other value by name and prints the "strix-kv:" receipt line.
-    (void)strix::session::kv_precision::bind_main(argc, argv, strix::glm::rank_defaults::kKvCaps);
     std::setvbuf(stdout, nullptr, _IOLBF, 0);  // line-buffered: a killed run still leaves every printed line in its log
     std::setvbuf(stderr, nullptr, _IONBF, 0);  // unbuffered (the C default, made explicit): progress and errors land at once
     try {
+        namespace kvp = strix::session::kv_precision;
+        const auto kv_request = kvp::extract(argc, argv);
         strix::validate_sampling_startup_environment(); // refused before any rank starts protocol work
         if (strix::print_device_profile_if_requested(argc, argv)) return 0;
         if (argc < 2) {
@@ -299,6 +299,8 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("--mtp-prefill must be ref or chunked");
         const auto request = rd::scan(std::vector<std::string>(argv + 2, argv + argc));
         auto eff = rd::resolve(request, rd::process_env(), rd::probe_model_mtp(argv[1]));
+        const auto tier = eff.product ? eff.product->profile : strix::profile::Name::standard;
+        kvp::emit_receipt(kvp::resolve(tier, kv_request, rd::kKvCaps));
         rd::fallback_without_handshake(eff, request, rd::process_env());
         if (!deployment.file.empty() || deployment.check) {
             opt.mtp = eff.mtp.value == "1"; opt.spec = eff.spec.value == "1";
@@ -1986,6 +1988,9 @@ int main(int argc, char** argv) {
         std::printf("rank %u: done %.1f s\n", opt.rank, secs(t_start, Clock::now()));
         if (split_ab_fail) std::printf("rank %u: EXACTNESS FAILURE (split-ab replay)\n", opt.rank);
         return split_ab_fail ? 4 : 0;
+    } catch (const strix::session::kv_precision::RequestError& e) {
+        std::fprintf(stderr, "error: %s\n", e.what());
+        return 2;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

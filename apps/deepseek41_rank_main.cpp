@@ -2069,8 +2069,6 @@ int main(int argc, char** argv) try {
     // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
     // GPU of a node keeps working (declared=implicit).
     strix::device::bind_hip_main(argc, argv);
-    // KV precision (--kv): native-only here; refuses any other value by name and prints the "strix-kv:" receipt line.
-    (void)strix::session::kv_precision::bind_main(argc, argv, strix::deepseek41::pair_defaults::kKvCaps);
     // Sampling environment (retired counter identity, acceptance switches): refused before any rank starts protocol work.
     strix::validate_sampling_startup_environment();
     const strix::deepseek41::pair_defaults::Effective production_defaults(strix::deepseek41::pair_defaults::App::rank, argc, argv, strix::deepseek41::pair_defaults::this_build());  // before any option or env read
