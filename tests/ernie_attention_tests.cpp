@@ -115,6 +115,35 @@ void hca_carry() {
 
 }
 
+void repeated_hca_groups() {
+    ernie::ReferenceShape shape{};
+    shape.hidden = shape.head_dim = shape.o_rank = 2;
+    shape.heads = shape.q_rank = shape.o_groups = shape.vha_rank = 1;
+    shape.contracts.checkpoint_attention = true;
+    const auto read = [](std::string_view name, std::span<float> values, std::size_t) {
+        std::ranges::fill(values, name.ends_with("norm.weight") ? 1.0F : 0.0F);
+    };
+    const auto project = [](const std::string& name, std::span<const float> input,
+                            std::span<float> output, unsigned) {
+        std::ranges::fill(output, 0.0F);
+        if (name.ends_with(".o_proj.weight") || name.ends_with("linear_o_group_proj"))
+            std::ranges::copy(input, output.begin());
+        else if (name.ends_with("linear_wkv.weight"))
+            output.front() = input.front();
+    };
+    constexpr unsigned total = 513, window = 128, ratio = 128;
+    ernie::AttentionHistory history(total);
+    for (unsigned pos = 0; pos < total; ++pos) {
+        const std::array input{pos / ratio % 2U == 0 ? 1.0F : -1.0F, 0.0F};
+        const auto output = ernie::attention_reference(40, shape, read, input, history, project);
+        const unsigned closed = (pos + 1U) / ratio;
+        const auto raw = std::min(pos + 1U, window);
+        const float sum = closed % 2U == 0 ? 0.0F : 1.4140625F;
+        const auto ungated = weight::scalar_float::bf16_round(sum / static_cast<float>(1U + raw + closed));
+        check(output.front() == ungated / 2.0F, "each R128 group joins when complete and survives window eviction");
+    }
+}
+
 void packed_hca_binding() {
     ernie::ReferenceShape shape{};
     shape.hidden = 1;
@@ -315,6 +344,88 @@ void folded_value_mix() {
     check(values == std::array{-5.0F, -6.0F, 9.5F, 13.0F}, "folded VHA mixes across heads only");
 }
 
+void head_mix_partition_reference() {
+    constexpr unsigned heads = 64, rank = 2, width = 4;
+    std::array<float, heads * rank> u{}, v{};
+    for (unsigned h = 0; h < heads; ++h) {
+        u[rank * h] = h % 2U == 0 ? 0.125F : -0.25F;
+        u[rank * h + 1U] = h % 4U == 0 ? -0.25F : 0.125F;
+        v[rank * h] = static_cast<float>(h % 8U) / 8.0F;
+        v[rank * h + 1U] = h % 3U == 0 ? 0.25F : -0.125F;
+    }
+    const auto matrix = fold_value_head_mix_reference(heads, rank, v, u, true);
+    for (const unsigned world : {2U, 4U}) {
+        const unsigned local_heads = heads / world;
+        for (const unsigned tokens : {1U, 37U}) {
+            for (unsigned row = 0; row < tokens; ++row) {
+                std::array<float, heads * width> input{};
+                for (unsigned i = 0; i < input.size(); ++i)
+                    input[i] = static_cast<float>(static_cast<int>((row * 31U + i * 13U) % 21U) - 10) / 8.0F;
+                std::array<float, rank * width> global{};
+                for (unsigned part = 0; part < world; ++part) {
+                    std::array<float, rank * width> local{};
+                    for (unsigned r = 0; r < rank; ++r)
+                        for (unsigned h = part * local_heads; h < (part + 1U) * local_heads; ++h)
+                            for (unsigned d = 0; d < width; ++d)
+                                local[r * width + d] += input[h * width + d] * u[h * rank + r];
+                    for (unsigned i = 0; i < global.size(); ++i) global[i] += local[i];
+                }
+                auto partitioned = input;
+                for (unsigned h = 0; h < heads; ++h)
+                    for (unsigned d = 0; d < width; ++d)
+                        for (unsigned r = 0; r < rank; ++r)
+                            partitioned[h * width + d] += v[h * rank + r] * global[r * width + d];
+                auto full = input, folded = input;
+                residual_value_head_mix(full, heads, rank, v, u);
+                apply_folded_value_head_mix_reference(folded, heads, matrix);
+                core::round_bf16_reference(partitioned);
+                core::round_bf16_reference(full);
+                core::round_bf16_reference(folded);
+                check(full == partitioned, "shards reduce the U-transpose latent before applying V");
+                check(full == folded, "dyadic folded and partitioned head mixes agree");
+            }
+        }
+    }
+}
+
+void packed_hca_head_mix_rows() {
+    constexpr unsigned heads = 2, width = 128, rope_width = 2;
+    constexpr std::array u{1.0F, 0.5F}, v{-0.5F, 0.25F};
+    const auto matrix = fold_value_head_mix_reference(heads, 1, v, u, true);
+    for (const unsigned tokens : {1U, 7U, 300U}) {
+        for (unsigned row = 0; row < tokens; ++row) {
+            const unsigned position = 3U + 11U * row;
+            const RotaryReferenceRow rope(rope_width, position, 10000.0);
+            std::array<float, heads * width> operand{};
+            for (unsigned i = 0; i < operand.size(); ++i)
+                operand[i] = static_cast<float>(static_cast<int>((i * 13U + row * 11U) % 49U) - 24) / 8.0F;
+            auto actual = operand;
+            apply_folded_value_head_mix_reference(actual, heads, matrix);
+            compressed_mqa_output_input_reference(actual, width, rope, width);
+
+            std::array<float, heads * width> expected{};
+            for (unsigned d = 0; d < width; ++d) {
+                expected[d] = operand[d] / 2.0F - operand[width + d] / 4.0F;
+                expected[width + d] = operand[d] / 4.0F + 1.125F * operand[width + d];
+            }
+            const auto angle = static_cast<double>(position);
+            const auto c = static_cast<float>(std::cos(angle)), sn = static_cast<float>(std::sin(angle));
+            for (unsigned head = 0; head < heads; ++head) {
+                auto group = std::span(expected).subspan(head * width, width);
+                const float x = group[width - 2], y = group[width - 1];
+                group[width - 2] = x * c + y * sn;
+                group[width - 1] = y * c - x * sn;
+                float peak = 1e-10F;
+                for (const float z : group) peak = std::max(peak, std::fabs(z));
+                const auto exponent = static_cast<int>(std::ceil(std::log2(static_cast<double>(peak) / 448.0)));
+                const float scale = std::ldexp(1.0F, exponent);
+                for (float& z : group) z = weight::scalar_float::e4m3(weight::scalar_float::e4m3_encode(z / scale)) * scale;
+            }
+            check(actual == expected, "one-pass head fold and inverse rotary reach block quantization in FP32");
+        }
+    }
+}
+
 void latent_attention() {
     const SelectedLatentShape shape{2, 1, 1, 1, 1};
     constexpr float weights[] = {3.0F, 5.0F, 1.0F, 7.0F};
@@ -394,6 +505,7 @@ int main() {
     try {
         pool_and_merge();
         hca_carry();
+        repeated_hca_groups();
         packed_hca_binding();
         packed_hca_gate_rows();
         compressed_index();
@@ -401,6 +513,8 @@ int main() {
         index_leading_rotary();
         index_hadamard_rows();
         folded_value_mix();
+        head_mix_partition_reference();
+        packed_hca_head_mix_rows();
         latent_attention();
         mla_history();
     } catch (const std::exception& error) {
