@@ -3,7 +3,9 @@
 #define STRIX_G4_SHARED_API_TEST_SUPPORT
 #include "turn_cache_integration_tests.cpp"
 #include "strix/serve/api.hpp"
+#include "strix/serve/request_fields.hpp"
 #include "gemma4/features/features.hpp"
+#include "gemma4/engine/runtime.hpp"
 #include <thread>
 #include <fstream>
 #include <iterator>
@@ -119,6 +121,19 @@ void routes(const g::ModelManifest& m,g::RopeTables rope,std::shared_ptr<const g
     const auto stop=response(http(api,stopped));CHECK(stop.find("choices")->as_array()[0].find("finish_reason")->as_string()=="stop");
     CHECK(stop.find("choices")->as_array()[0].find("message")->find("content")->as_string().empty());
     CHECK(stop.find("usage")->find("completion_tokens")->as_int()==std::int64_t(generated(stop).size()));
+    // The shared request fields reach this server like every other: the same chat body with return_token_ids parses on the
+    // family parser and on the service, the answer carries the generated ids, and the shared "strix" block times the
+    // prompt and decode passes.
+    auto with_ids=body();with_ids.set("return_token_ids",true);
+    CHECK(e::parse_chat_request(with_ids).generation.max_tokens==e::parse_chat_request(body()).generation.max_tokens);
+    for(const auto* field:{"return_token_ids","return_token_emissions"}) CHECK(srv::is_presentation_field(field));
+    CHECK(!srv::is_presentation_field("unknown_policy"));
+    const auto timed=response(http(api,with_ids));const auto* receipt=timed.find("strix");CHECK(receipt);
+    const auto* token_ids=receipt->find("token_ids");CHECK(token_ids && token_ids->as_array().size()==generated(timed).size());
+    for(std::size_t i=0;i<generated(timed).size();++i)CHECK(token_ids->as_array()[i].as_int()==std::int64_t(generated(timed)[i]));
+    CHECK(receipt->find("prefill_ms") && receipt->find("decode_ms") && receipt->find("queue_ms"));
+    CHECK(receipt->find("prefill_ms")->as_double()>=0 && receipt->find("decode_ms")->as_double()>0);
+    CHECK(receipt->find("prefill_ms")->as_double()+receipt->find("decode_ms")->as_double()>0);
 }
 void invalid(const g::ModelManifest& m,g::RopeTables rope,std::shared_ptr<const g::serve::Tokenizer> tok) {
     RealBackend backend(m,rope);e::Api api(backend,tok,{},e::DraftMode::off,"model");
@@ -347,12 +362,29 @@ void grouped(const g::ModelManifest& m,g::RopeTables rope,std::shared_ptr<const 
     environment("STRIX_G4_SERVE_SLOTS","1");
 }
 }
+// The common serving options take the names every server takes: --slots (the stream count, as --streams) and --context.
+void serve_options() {
+    const auto prepare=[](std::vector<std::string> words) {
+        words.insert(words.begin(),"strix-serve");words.emplace_back("--help");
+        std::vector<char*> argv;for(auto& w:words)argv.push_back(w.data());
+        return e::prepare_serve(int(argv.size()),argv.data());
+    };
+    const auto slots=prepare({"m","--slots","3","--context","2048"});
+    CHECK(slots.options.streams==3 && slots.deployment_slots==3 && slots.options.deployment_context==2048);
+    const auto streams=prepare({"m","--streams","2"});
+    CHECK(streams.options.streams==2 && streams.deployment_slots==2 && streams.options.deployment_context==0);
+    CHECK(prepare({"m"}).options.deployment_context==0);
+    for(const auto* bad:{"0","x","4294967296"}) {
+        bool refused=false;try{(void)prepare({"m","--context",bad});}catch(const std::invalid_argument&){refused=true;}CHECK(refused);
+    }
+    bool too_many=false;try{(void)prepare({"m","--slots","9"});}catch(const std::invalid_argument&){too_many=true;}CHECK(too_many);
+}
 int main(int argc,char** argv) {
     try {
         CHECK(argc==2);environment("STRIX_G4_SERVE_SLOTS","1");environment("STRIX_G4_SERVE_BATCH","1");environment("STRIX_G4_SERVE_PREFIX","0");
         auto tok=tokenizer(std::filesystem::absolute(argv[1]));auto m=http_model();identify(m);Tables tables;auto rope=tables.view();
         ratio_request(m,rope,tok);
-        legacy_hook_contract();live_stream(m,rope,tok);routes(m,rope,tok);invalid(m,rope,tok);grouped(m,rope,tok);wire_no_store(m,rope,tok);features_with_live_work(m,rope,tok);tool_stream_protocol(tok);sse_disconnects(m,rope,tok);
+        legacy_hook_contract();live_stream(m,rope,tok);routes(m,rope,tok);invalid(m,rope,tok);serve_options();grouped(m,rope,tok);wire_no_store(m,rope,tok);features_with_live_work(m,rope,tok);tool_stream_protocol(tok);sse_disconnects(m,rope,tok);
         // Existing independent model/cursor/cache proofs now execute through the
         // same production frontend, including failed restoration and accounting.
         two_turns(m,rope,tok);refusals(m,rope,tok);mismatches(m,rope,tok);retention(m,rope,tok);
