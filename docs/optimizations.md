@@ -7397,3 +7397,28 @@ The GLM FAST prefill band ([glm-pf-wmma-x](#glm-pf-wmma-x)) is admitted per meas
 | Inkling 2 Mini | not bound: no GLM prefill layout list |
 | Hy4 Flash | not bound: no GLM prefill layout list |
 | Nemotron 3.5 Bolt E4B | not bound: no GLM prefill layout list |
+
+<a id="moe-r1-union-hip-plan"></a>
+## HIP microscaled R1 plan: one weight read per routed expert for 8+ cohort rows
+
+**Engine:** `shared`. **Control:** STRIX_MOE_R1_UNION (read once); expert_union parameter of microscaled_r1::launch / launch_rows. **Default:** on (HIP) at 8 or more rows per launch; rows kernels below 8 rows, on CUDA and on the host.
+
+A served cohort pass routes R rows x 8 slots; at C8 the 64 assignments fall on about 44 distinct experts. The rows kernels read and decode an expert once per assignment and round each input per wave. The plan's gate_up union reads and decodes each chunk of an expert's weights once for all rows routed to it (up to 4 rows per pass: 8 inputs of accumulators spill on gfx1151), with the pass rows rounded once to BF16 codes in LDS (4 codes of padding per chunk: one bank pair per lane). The down projection keeps the rows kernel in nvfp4 (the union down is slower there) and runs the union in mxfp8.
+
+- **Shared home:** src/moe_core/microscaled_r1.hpp (decode_chunk_inputs, stream_inputs, dot_inputs_streamed, gate_up_union, launch)
+- **Tier and regime:** EXACT; multi-request decode, 8..16 rows per MoE launch
+- **Exactness evidence:** bit for bit per row (same FMA chain in ascending K, same decoded weight, same rounded input, same butterfly). No-model bench: union and plan equal rows on activations and outputs, 18/18 cases. Device fixture: an 8-row plan launch equals eight one-row launches. ISA of every existing kernel identical. Served EXACT ids equal with the switch on and off (C1 / C2 / C4 / C8).
+- **Off switch:** STRIX_MOE_R1_UNION=0
+- **Measured gain:** no-model bench per visit at R=8 (served routes): nvfp4 1,210 -> 1,043 us (-13.8%), mxfp8 2,351 -> 1,933 us (-17.8%). Served EXACT Inkling 2 Mini, 8 slots, one binary: C8 pass 95.4 -> 88.8 ms, aggregate 52.01 -> 55.24 tok/s (x1.062).
+- **Preconditions:** HIP, microscaled expert matrix, input rows of whole chunks and 8-byte aligned for the LDS staging (otherwise global loads, same bits), 8..16 rows per launch.
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: experts are not microscaled R1 matrices |
+| Qwen3.8 27B dense | not bound: dense model |
+| DeepSeek V4.1 Flash | not bound: experts are not microscaled R1 matrices on HIP |
+| GLM 5.3 Flash | not bound: experts are not microscaled R1 matrices on HIP |
+| MiniMax M3.1 Flash | not bound: experts are not microscaled R1 matrices on HIP |
+| Inkling 2 Mini | bound: served cohort passes (decode::launch_rows, nvfp4 and mxfp8 experts) |
+| Hy4 Flash | not bound: experts are not microscaled R1 matrices on HIP |
+| Nemotron 3.5 Bolt E4B | not bound: experts are not microscaled R1 matrices on HIP |
