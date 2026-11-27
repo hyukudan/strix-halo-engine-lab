@@ -1,4 +1,5 @@
 #include "strix/ds41_moe.hpp"
+#include "strix/moe/combine.hpp"
 #include "strix/moe/route_project.hpp"
 
 #include <algorithm>
@@ -104,7 +105,7 @@ std::vector<float> reference_half_sum(const WindowRoutes& routes, std::span<cons
             float sum = 0.0F;
             for (auto k = first; k < end; ++k) {
                 const std::size_t slot = routes.order[r * top_k + k];
-                sum = sum + weights[slot] * raw[slot * hidden + o];
+                sum = moe::add_weighted_expert_f32(sum, weights[slot], raw[slot * hidden + o]);
             }
             out[static_cast<std::size_t>(r) * hidden + o] = sum;
         }
@@ -153,9 +154,8 @@ WindowReference reference_window(const ExpertTensors& t, const std::vector<A8Act
             float low = 0.0F, high = 0.0F;
             for (std::uint32_t k = 0; k < top_k; ++k) {
                 const auto slot = routes.order[r * top_k + k];
-                const float term = weights[slot] * out.raw[slot * t.hidden + o];
-                if (k < routes.low_counts[r]) low = low + term;
-                else high = high + term;
+                auto& sum = k < routes.low_counts[r] ? low : high;
+                sum = moe::add_weighted_expert_f32(sum, weights[slot], out.raw[slot * t.hidden + o]);
             }
             out.y[r * t.hidden + o] = (shared[r * t.hidden + o] + low) + high;
         }

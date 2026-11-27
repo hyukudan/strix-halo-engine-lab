@@ -3,6 +3,8 @@
 // are the device's bits; see docs/models/deepseek-v4.1/attention.md for the declared order.
 #include "strix/ds41_attention.hpp"
 
+#include "attn_core/masks.hpp"
+#include "attn_core/sparse_index_reference.hpp"
 #include "strix/deepseek41_model.hpp"
 
 #include <algorithm>
@@ -50,18 +52,6 @@ void quant_fp4_e4m3_16(const float* x, std::uint8_t* entry) {  // 512 values -> 
             entry[8 * g + i / 2] = static_cast<std::uint8_t>(lo | (hi << 4U));
         }
         entry[256 + g] = sc;
-    }
-}
-// FP4 with power-of-two (E8M0) scales per 32: codes and exponents (s = 2^e).
-void quant_fp4_e8m0_32(const float* x, unsigned n, std::uint8_t* codes, int* exps) {
-    for (unsigned g = 0; g < n / 32; ++g) {
-        float amax = 0.0F;
-        for (unsigned i = 0; i < 32; ++i) amax = std::fmax(amax, std::fabs(x[32 * g + i]));
-        amax = std::fmax(amax, 7.05296657e-38F);  // 6 * 2^-126
-        const int e = log2_ceil(amax * (1.0F / 6.0F));
-        const float s = pow2f(e);
-        for (unsigned i = 0; i < 32; ++i) codes[32 * g + i] = e2m1_encode(clampf(x[32 * g + i] / s, -6.0F, 6.0F));
-        exps[g] = e;
     }
 }
 void check_rows(std::size_t rows) {
@@ -217,7 +207,7 @@ void compress(const CompressArgs& a, CompressState& state, std::span<std::uint8_
         rope_tail(k, kIdxDim, rope, false);
         std::uint8_t codes[kIdxDim];
         int exps[4];
-        quant_fp4_e8m0_32(k, kIdxDim, codes, exps);
+        attn_core::quantize_index_fp4_reference(k, kIdxDim, codes, exps);
         std::uint8_t* ie = &idx_cache[slot * kIdxEntryBytes];
         for (unsigned i = 0; i < 64; ++i) ie[i] = static_cast<std::uint8_t>(codes[2 * i] | (codes[2 * i + 1] << 4U));
         for (unsigned g = 0; g < 4; ++g) ie[64 + g] = static_cast<std::uint8_t>(exps[g] + 127);
@@ -239,7 +229,7 @@ void index_scores(const IndexArgs& a, std::span<const std::uint8_t> idx_cache, s
             float q[kIdxDim];
             std::copy_n(&a.q[(r * kIdxHeads + h) * kIdxDim], kIdxDim, q);
             rope_tail(q, kIdxDim, rope, false);
-            quant_fp4_e8m0_32(q, kIdxDim, qc[h], qe[h]);
+            attn_core::quantize_index_fp4_reference(q, kIdxDim, qc[h], qe[h]);
             w[h] = a.w[r * kIdxHeads + h] * kIdxWeightScale;
         }
         const std::uint64_t count = (a.pos[r] + 1) / a.ratio;
@@ -266,20 +256,6 @@ void index_scores(const IndexArgs& a, std::span<const std::uint8_t> idx_cache, s
     }
 }
 
-namespace {
-// The k best (key descending, index ascending), returned in ascending index order.
-std::vector<std::uint32_t> best_k(std::span<const std::uint32_t> keys, unsigned k) {
-    std::vector<std::uint32_t> order(keys.size());
-    for (std::uint32_t i = 0; i < order.size(); ++i) order[i] = i;
-    const std::size_t take = std::min<std::size_t>(k, order.size());
-    std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(take), order.end(),
-        [&](std::uint32_t x, std::uint32_t y) { return keys[x] != keys[y] ? keys[x] > keys[y] : x < y; });
-    order.resize(take);
-    std::sort(order.begin(), order.end());
-    return order;
-}
-}  // namespace
-
 std::vector<std::uint32_t> select_topk(std::span<const float> scores, Pool pool, std::span<std::uint8_t> candidates,
     unsigned topk, unsigned cand_blocks, unsigned block_size) {
     const std::size_t n = scores.size();
@@ -293,11 +269,11 @@ std::vector<std::uint32_t> select_topk(std::span<const float> scores, Pool pool,
         bs[last] = std::numeric_limits<float>::infinity();
         for (std::size_t b = 0; b < nb; ++b) bk[b] = order_key(bs[b]);
         std::fill(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(nb), std::uint8_t{0});
-        for (const auto b : best_k(bk, cand_blocks)) if (bs[b] > ninf) candidates[b] = 1;
+        for (const auto b : attn_core::ordered_top_k<std::uint32_t>(bk, cand_blocks)) if (bs[b] > ninf) candidates[b] = 1;
     }
     for (std::size_t t = 0; t < n; ++t)
         keys[t] = order_key(pool == Pool::candidate_user && candidates[t / block_size] == 0 ? ninf : scores[t]);
-    return best_k(keys, topk);
+    return attn_core::ordered_top_k<std::uint32_t>(keys, topk);
 }
 
 void attention(const AttentionArgs& a, std::span<const std::uint8_t> ring, std::span<const std::uint8_t> kv_cache, std::span<float> o) {
@@ -307,7 +283,7 @@ void attention(const AttentionArgs& a, std::span<const std::uint8_t> ring, std::
     for (std::size_t r = 0; r < rows; ++r) {
         const std::uint64_t p = a.pos[r];
         const RopeRow rope = rope_row(a.rope, p);
-        const unsigned nw = static_cast<unsigned>(std::min<std::uint64_t>(p + 1, kWindow));
+        const unsigned nw = attn_core::mask::window_count(p, kWindow);
         const unsigned nc = a.idx_count.empty() ? 0U : a.idx_count[r];
         const unsigned n = nw + nc, chunks = (n + kChunk - 1) / kChunk;
         const auto key = [&](unsigned j) {

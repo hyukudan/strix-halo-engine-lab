@@ -1,9 +1,11 @@
 #pragma once
 
 #include "core/linear_reference.hpp"
+#include "strix/moe/combine.hpp"
 #include "strix/moe/route_policy.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -16,6 +18,21 @@
 namespace strix::moe {
 
 enum class ExpertProjection { gate_up, down };
+
+struct NativeGluMath {
+    static float exp(float value) { return std::exp(value); }
+    static float tanh(float value) { return std::tanh(value); }
+};
+
+// The caller owns the format at each GEMM boundary. 'active' may alias gate.
+template <class Activation, class Convert>
+void activate_glu_reference(std::span<const float> gate, std::span<const float> up, std::span<float> active,
+                            const Activation& activation, const Convert& convert) {
+    if (gate.size() != up.size() || gate.size() != active.size())
+        throw std::invalid_argument("GLU reference: inconsistent projected rows");
+    for (std::size_t column = 0; column < active.size(); ++column)
+        active[column] = convert(activation(convert(gate[column]), convert(up[column])));
+}
 
 // Grouped reference for one row, with independently selected routes. Combine
 // in ascending expert ID, independently of the weight-normalization order.
@@ -37,15 +54,11 @@ void combine_routed_reference(std::size_t intermediate, std::span<const float> i
     std::vector<float> combined(output.size());
     for (const auto slot : slots) {
         project(ids[slot], ExpertProjection::gate_up, input, std::span<float>(gate_up));
-        for (std::size_t column = 0; column < intermediate; ++column) {
-            active[column] = convert(activation(convert(gate_up[column]), convert(gate_up[intermediate + column])));
-        }
+        activate_glu_reference(std::span(gate_up).first(intermediate), std::span(gate_up).subspan(intermediate),
+                               active, activation, convert);
         project(ids[slot], ExpertProjection::down, std::span<const float>(active), std::span<float>(down));
-        for (std::size_t column = 0; column < output.size(); ++column) {
-            // Explicit multiply before accumulation. Build this reference with contraction disabled.
-            const float contribution = weights[slot] * convert(down[column]);
-            combined[column] += contribution;
-        }
+        for (std::size_t column = 0; column < output.size(); ++column)
+            combined[column] = add_weighted_expert_f32(combined[column], weights[slot], convert(down[column]));
     }
     std::ranges::transform(combined, output.begin(), convert);
 }

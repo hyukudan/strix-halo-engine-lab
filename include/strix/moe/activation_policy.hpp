@@ -19,8 +19,17 @@ struct SwigluClamped {
     float gate;
     float up;
 };
+STRIX_MOE_ACT_HD inline SwigluClamped swiglu_clamp(float gate, float up, float gate_cap, float up_cap) {
+    return {gate > gate_cap ? gate_cap : gate, up < -up_cap ? -up_cap : (up > up_cap ? up_cap : up)};
+}
 STRIX_MOE_ACT_HD inline SwigluClamped swiglu_clamp(float gate, float up, float limit) {
-    return {gate > limit ? limit : gate, up < -limit ? -limit : (up > limit ? limit : up)};
+    return swiglu_clamp(gate, up, limit, limit);
+}
+
+// Multiplying a separately computed sigmoid preserves this form's rounding.
+template <class Math>
+STRIX_MOE_ACT_HD inline float swiglu_sigmoid_product(float gate, float up) {
+    return (gate * (1.0F / (1.0F + Math::exp(-gate)))) * up;
 }
 
 // The sigmoid operates on the raw gate. Only the linear gate factor

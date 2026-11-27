@@ -20,6 +20,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -69,6 +70,37 @@ struct Ds41Math {
     static float log1p(float x) { return strix::ds41::declared_log1p(x); }
     static float sqrt(float x) { return strix::ds41::declared_sqrt(x); }
 };
+
+void split_sigmoid_router() {
+    struct Math {
+        static float exp(float value) { return std::exp(value); }
+    };
+    constexpr float floor = 1e-20F;
+    constexpr float inf = std::numeric_limits<float>::infinity();
+    RoutePolicy policy{.selection_bias = true, .experts = 4, .top_k = 2, .renorm_eps = floor};
+    constexpr std::array bias{0.0F, 1.0F, 0.0F, 0.0F};
+    std::array<std::uint32_t, 2> ids{};
+    std::array<float, 2> weights{};
+    for (bool normalize : {false, true}) {
+        std::array first{0.0F, inf, -inf, -0.0F}, second{inf, -inf, 0.0F, inf};
+        std::array gains{2.0F, 3.0F, 4.0F, 5.0F};
+        policy.renormalize = normalize;
+        route_split_logits_ref<Math>(policy, SplitRouteMode::summed_scores, first, second, bias, gains, ids, weights,
+                                     floor);
+        const float denominator = normalize ? 2.5F : 1.0F;
+        check(ids == std::array<std::uint32_t, 2>{1U, 0U} &&
+              weights == std::array{(1.0F / denominator) * gains[1], (1.5F / denominator) * gains[0]},
+              "split sigmoid: summed scores, bias-only selection, cutoff tie, then gain");
+    }
+    for (const float score : {0.0F, floor / 4.0F, floor, 2.0F * floor}) {
+        const std::array scores{0.0F, score, 0.0F, 0.0F};
+        constexpr std::array gains{2.0F, 3.0F, 4.0F, 5.0F};
+        route_select_split_ref(policy, scores, scores, bias, gains, ids, weights, floor);
+        const float expected = (score / std::max(score, floor)) * gains[1];
+        check(ids == std::array<std::uint32_t, 2>{1U, 0U} && weights == std::array{expected, 0.0F},
+              "split sigmoid: gain follows floor-clamped normalization across its boundary");
+    }
+}
 
 void hip_row_grid() {
     using Grid = strix::moe_core::RouteWaveGrid;
@@ -421,6 +453,7 @@ void hy4_oracle_compare() {
 
 int main() {
     modelb_top16();
+    split_sigmoid_router();
     hip_row_grid();
     named_words();
 #if defined(STRIX_RP_HY4)

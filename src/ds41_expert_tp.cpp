@@ -1,5 +1,6 @@
 #include "strix/ds41_expert_tp.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/moe/combine.hpp"
 
 #include <algorithm>
 #include <array>
@@ -193,7 +194,7 @@ WindowTp reference_window(const ExpertTensors& t, const std::vector<A8Activation
                 float s = 0.0F;
                 for (std::uint32_t k = 0; k < top_k; ++k) {
                     const std::size_t slot = routes.order[r * top_k + k];
-                    s = s + weights[slot] * out.partial[p][slot * t.hidden + o];
+                    s = moe::add_weighted_expert_f32(s, weights[slot], out.partial[p][slot * t.hidden + o]);
                 }
                 out.sum[p][r * t.hidden + o] = s;
             }

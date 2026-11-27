@@ -6,6 +6,8 @@
 #include "strix/ds41_layer.hpp"
 #include "strix/hc/hc_ref.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -14,6 +16,7 @@
 #include <random>
 #include <span>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -203,6 +206,144 @@ void identity_is_a_skip() {
           "identity matrix differs (0 * inf)");
 }
 
+void mix_epsilon_position() {
+    strix::hc::Spec spec{.streams = 1, .hidden = 1, .site = strix::hc::Site::head, .norm_eps = 0.25F};
+    constexpr std::array<float, 1> row{0.25F}, weight{1.0F};
+    const strix::hc::SiteWeights weights{{}, weight, {}, {}};
+    const float inside = strix::hc::raw_mixes(spec, row, weights).front();
+    spec.norm_eps_outside_sqrt = true;
+    const float outside = strix::hc::raw_mixes(spec, row, weights).front();
+    check(std::fabs(inside - 0.25F / std::sqrt(0.3125F)) < 1e-6F, "mix epsilon inside RMS square root");
+    check(outside == 0.5F, "mix epsilon outside RMS square root");
+}
+
+void collapse_variance_boundary() {
+    using namespace strix::hc;
+    const Spec spec{.streams = 1, .hidden = 1, .site = Site::head, .store = Store::bf16};
+    constexpr std::array residual{1.0F}, pre{1.00390625F}, gain{1.0F};
+    std::array<float, 1> output{};
+    collapse_rms_bf16(spec, residual, pre, gain, 1e-6F, CollapseVariance::before_store, output);
+    check(output[0] == 0.99609375F, "variance before store, BF16 numerator");
+    collapse_rms_bf16(spec, residual, pre, gain, 1e-6F, CollapseVariance::after_store, output);
+    check(output[0] == 1.0F, "variance and numerator after store");
+}
+
+void outside_root_sublayer_cases(std::mt19937& random) {
+    using namespace strix::hc;
+    constexpr Spec spec{.streams = 4, .hidden = 4096, .sinkhorn_iters = 20,
+                        .store = Store::bf16, .pre_eps = 1e-6F, .comb_eps = 1e-6F,
+                        .norm_eps = 0.5F, .norm_eps_outside_sqrt = true};
+    constexpr float layer_epsilon = 1e-6F;
+    constexpr std::size_t hidden = spec.hidden, flat = spec.flat(), rows = spec.mix_rows();
+    constexpr std::array scales{1.0F, 1.0F, 1.0F};
+    const auto base = uniform(random, rows, -0.1F, 0.1F);
+    const auto gain = uniform(random, hidden, -1.0F, 1.0F, true);
+    auto weight = uniform(random, rows * flat, -0.02F, 0.02F);
+    auto pinned_post = std::span(weight).subspan(spec.streams * flat, flat);
+    std::ranges::fill(pinned_post, 0.0F);
+    pinned_post.front() = 1.5F;
+    const SiteWeights weights{{}, weight, base, scales};
+    enum class Input { full, broadcast, post };
+    for (const auto count : {1U, 8U, 128U}) {
+        for (const auto entry : {Input::full, Input::broadcast, Input::post}) {
+            double root_gap = 0.0;
+            for (unsigned token = 0; token < count; ++token) {
+                auto residual = uniform(random, flat, -1.75F, 1.75F, true);
+                residual.front() = 1.25F;
+                if (entry == Input::broadcast)
+                    for (std::size_t stream = 1; stream < spec.streams; ++stream)
+                        std::copy_n(residual.begin(), hidden, residual.begin() + std::ptrdiff_t(stream * hidden));
+                if (entry == Input::post) {
+                    auto branch = uniform(random, hidden, -1.0F, 1.0F, true);
+                    Mix previous{{}, uniform(random, spec.streams, 0.0F, 1.0F),
+                                 uniform(random, spec.comb_rows(), 0.0F, 1.0F)};
+                    branch.front() = 1.25F;
+                    previous.post.front() = 0.75F;
+                    for (std::size_t source = 0; source < spec.streams; ++source)
+                        previous.comb[source * spec.streams] = source == 0U ? 0.5F : 0.0F;
+                    std::vector<float> next(flat);
+                    expand(spec, branch, residual, previous, next);
+                    for (std::size_t stream = 0; stream < spec.streams; ++stream)
+                        for (std::size_t i = 0; i < hidden; ++i) {
+                            double wanted = double(branch[i]) * previous.post[stream];
+                            for (std::size_t source = 0; source < spec.streams; ++source)
+                                wanted += double(residual[source * hidden + i]) *
+                                    previous.comb[source * spec.streams + stream];
+                            wanted = store_value(static_cast<float>(wanted), Store::bf16);
+                            check(std::fabs(next[stream * hidden + i] - wanted) <= 0.01 + 0.01 * std::fabs(wanted),
+                                  "post branch and comb column belong to destination stream");
+                        }
+                    residual = std::move(next);
+                }
+                const auto got = mixes(spec, residual, weights);
+                const auto sigmoid = [](double value) { return 1.0 / (1.0 + std::exp(-value)); };
+                double squares = 0.0;
+                for (auto value : residual) squares += double(value) * value;
+                const double mean_square = squares / flat;
+                const double inv = 1.0 / (std::sqrt(mean_square) + spec.norm_eps);
+                const double inside = 1.0 / std::sqrt(mean_square + spec.norm_eps);
+                std::array<double, rows> projected{};
+                for (std::size_t mix = 0; mix < rows; ++mix)
+                    for (std::size_t i = 0; i < flat; ++i)
+                        projected[mix] += double(residual[i]) * weight[mix * flat + i];
+                std::array<double, spec.streams> pre{};
+                for (std::size_t stream = 0; stream < spec.streams; ++stream) {
+                    pre[stream] = sigmoid(projected[stream] * inv + base[stream]) + spec.pre_eps;
+                    const auto i = stream + spec.streams;
+                    const double post = 2.0 * sigmoid(projected[i] * inv + base[i]);
+                    root_gap = std::max(root_gap, std::fabs(post - 2.0 * sigmoid(projected[i] * inside + base[i])));
+                    check(std::fabs(got.post[stream] - post) <= 0.005, "outside-root post coefficient");
+                }
+                std::array<std::array<double, spec.streams>, spec.streams> comb{};
+                for (std::size_t source = 0; source < spec.streams; ++source) {
+                    double total = 0.0;
+                    for (std::size_t dest = 0; dest < spec.streams; ++dest) {
+                        const auto i = 2U * spec.streams + source * spec.streams + dest;
+                        comb[source][dest] = std::exp(projected[i] * inv + base[i]);
+                        total += comb[source][dest];
+                    }
+                    for (auto& value : comb[source]) value = value / total + spec.comb_eps;
+                }
+                for (unsigned pass = 0; pass < spec.sinkhorn_iters; ++pass) {
+                    if (pass != 0U)
+                        for (auto& row : comb) {
+                            double total = spec.comb_eps;
+                            for (auto value : row) total += value;
+                            for (auto& value : row) value /= total;
+                        }
+                    for (std::size_t dest = 0; dest < spec.streams; ++dest) {
+                        double total = spec.comb_eps;
+                        for (const auto& row : comb) total += row[dest];
+                        for (auto& row : comb) row[dest] /= total;
+                    }
+                }
+                for (std::size_t source = 0; source < spec.streams; ++source)
+                    for (std::size_t dest = 0; dest < spec.streams; ++dest)
+                        check(std::fabs(got.comb[source * spec.streams + dest] - comb[source][dest]) <= 0.005,
+                              "outside-root residual mixing matrix");
+                std::vector<float> normalized(hidden), oracle(hidden);
+                collapse_rms_bf16(spec, residual, got.pre, gain, layer_epsilon,
+                                  CollapseVariance::before_store, normalized);
+                double layer_squares = 0.0;
+                for (std::size_t i = 0; i < hidden; ++i) {
+                    double sum = 0.0;
+                    for (std::size_t stream = 0; stream < spec.streams; ++stream)
+                        sum += double(residual[stream * hidden + i]) * pre[stream];
+                    oracle[i] = store_value(static_cast<float>(sum), Store::bf16);
+                    layer_squares += double(oracle[i]) * oracle[i];
+                }
+                const double inverse = 1.0 / std::sqrt(layer_squares / hidden + layer_epsilon);
+                for (std::size_t i = 0; i < hidden; ++i) {
+                    const float wanted = store_value(static_cast<float>(oracle[i] * inverse * gain[i]), Store::bf16);
+                    check(std::fabs(normalized[i] - wanted) <= 0.05 + 0.01 * std::fabs(wanted),
+                          "outside-root collapse and layer RMS");
+                }
+            }
+            check(root_gap > 0.05, "outside-root case distinguishes the inside-root formula");
+        }
+    }
+}
+
 void geometry_rejected() {
     auto spec = hc_fixture::identity_bf16_spec(strix::hc::Site::sublayer);
     bool threw = false;
@@ -224,6 +365,9 @@ int main() {
     ds41_bitwise(g);
     modelb_fp64(g);
     identity_is_a_skip();
+    mix_epsilon_position();
+    collapse_variance_boundary();
+    outside_root_sublayer_cases(g);
     geometry_rejected();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);

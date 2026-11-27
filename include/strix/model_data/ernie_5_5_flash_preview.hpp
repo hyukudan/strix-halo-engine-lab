@@ -25,6 +25,7 @@ namespace indexer {
 inline constexpr std::int64_t index_head_dim = 128;
 inline constexpr std::int64_t index_n_heads = 64;
 inline constexpr std::int64_t index_topk = 2048;
+inline constexpr std::int64_t prefill_head_topk = 8;
 inline constexpr std::string_view sidecar = "flashindexer/flashindexer.safetensors";
 } // namespace indexer
 inline constexpr std::string_view kind = "dsv4_hybrid";
@@ -92,7 +93,9 @@ inline constexpr std::int64_t dspark_noise_token_id = 1024;
 inline constexpr bool dspark_shared_lm_head = true;
 inline constexpr double hc_eps = 0x1.0c6f7a0b5ed8dp-20 /* 1e-06 */;
 inline constexpr std::int64_t hc_mult = 4;
+inline constexpr double hc_post_magnitude = 0x1p+1 /* 2 */;
 inline constexpr std::int64_t hc_sinkhorn_iters = 20;
+inline constexpr std::string_view head_logit_transform = "linear_quadratic_hinges";
 inline constexpr std::int64_t multimax_parameters = 4;
 inline constexpr std::int64_t num_nextn_predict_layers = 0;
 inline constexpr bool tie_word_embeddings = false;
@@ -117,6 +120,7 @@ inline constexpr bool norm_topk_prob = true;
 inline constexpr std::int64_t num_experts_per_tok = 10;
 inline constexpr double routed_scaling_factor = 0x1.8p+1 /* 3 */;
 inline constexpr bool routed_scaling_factor_learnable = true;
+inline constexpr double router_renorm_floor = 0x1.79ca10c924223p-67 /* 1e-20 */;
 inline constexpr std::string_view scoring_func = "sigmoid";
 inline constexpr std::int64_t topk_group = 1;
 inline constexpr std::string_view topk_method = "noaux_tc";

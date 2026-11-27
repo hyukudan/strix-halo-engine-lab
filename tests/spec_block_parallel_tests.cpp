@@ -3,12 +3,16 @@
 // every policy / accuracy / source mix, ONE forward per draft, anchor position tracked through every step kind), the flat
 // cost config, and the MoE verify pricing used in the HY4 break-even table.
 #include "strix/spec/block_parallel.hpp"
+#include "strix/spec/draft_reference.hpp"
+#include "strix/ernie/draft.hpp"
+#include "core/multimax_reference.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -208,6 +212,98 @@ void controller_tests() {
                     ++cases;
                 }
     std::printf("controller: %d cases PASS (hybrid blocks with a prefix policy: %llu)\n", cases, (unsigned long long)hybrids);
+}
+
+void ernie_draft_layout() {
+    const auto& policy = strix::ernie::dspark_block_policy;
+    const auto& declaration = strix::ernie::dspark_declaration;
+    sp::validate(policy);
+    BP_CHECK(sp::max_drafts(policy) == 7 && declaration.max_k == 7, "DSpark proposes from all seven rows");
+    BP_CHECK(policy.target_layers[0] == 40 && policy.target_layers[1] == 41 && policy.target_layers[2] == 42,
+             "DSpark takes three late target taps");
+    BP_CHECK(policy.kv == sp::KvSource::own_ring && policy.ring == 128 && declaration.shares.size() == 2,
+             "DSpark owns its context ring and shares the target vocabulary weights");
+    std::vector<std::uint32_t> ids;
+    sp::block_ids(policy, 17, {}, 2, ids);
+    BP_CHECK(ids.size() == 7 && ids.front() == 17 &&
+             std::ranges::all_of(std::span(ids).subspan(1), [](auto id) { return id == 1024; }),
+             "DSpark fills the complete block even when fewer proposals are requested");
+    BP_CHECK(sp::proposal_row(policy, 0) == 0 && sp::proposal_row(policy, 6) == 6 && sp::row_visible(policy, 0, 6),
+             "the anchor predicts first and sees trailing noise rows");
+    static_assert(strix::ernie::echo_mtp_layers == 0, "Preview only has the bundled block drafter");
+}
+
+void draft_reference_cases() {
+    std::array<float, 2> mean{};
+    constexpr std::array post{1.0F, 3.0F, 5.0F, 7.0F};
+    sp::draft_stream_mean_bf16_reference(post, mean);
+    BP_CHECK((mean == std::array{3.0F, 5.0F}), "target tap averages across streams");
+    constexpr std::array feature_matrix{0.0F, 0.2F, 0.0F, 0.0F};
+    constexpr std::array gain{1.0F, 1.0F};
+    std::array<float, 2> context{};
+    sp::draft_project_norm_bf16_reference(feature_matrix, mean, gain, 0.5F, context);
+    BP_CHECK((context == std::array{1.0F, 0.0F}), "projected target taps are normalized");
+
+    constexpr float mask = -std::numeric_limits<float>::infinity();
+    constexpr auto nan = std::numeric_limits<float>::quiet_NaN();
+    constexpr std::array ranges{0.0F, 0.0F, 0.0F, 0.0F}, strengths{0.0F, 0.0F, 0.0F, -1.0F};
+    std::array special{mask, -2.0F, nan};
+    strix::core::multimax_f32_reference(special, ranges, strengths, true);
+    BP_CHECK(special[0] == mask && special[1] == -2.0F && std::isnan(special[2]),
+             "the hinge transform preserves masks and NaNs");
+
+}
+
+void bundled_markov_verify() {
+    struct MarkovForward final : sp::BlockForward {
+        std::vector<std::uint32_t> accepted;
+        std::size_t calls = 0;
+        void forward(const sp::BlockRequest& req, std::vector<std::uint32_t>& proposals,
+                     std::vector<float>&) override {
+            BP_CHECK(req.ids.size() == 7 && req.ids[0] == 2 && req.k == 2 && req.anchor_pos == 2 &&
+                     std::ranges::all_of(req.ids.subspan(1), [](auto id) { return id == 1024; }),
+                     "one complete bundled block starts from the target anchor");
+            constexpr float mask = -std::numeric_limits<float>::infinity();
+            constexpr std::array<float, 7 * 3> raw{0.0F, 0.5F, mask, 0.0F, 1.0F, mask};
+            constexpr std::array by_rank{10.0F, 20.0F, 30.0F, -1.0F, 0.0F, 1.0F};
+            constexpr std::array head{0.0F, 0.5F, 0.0F, 1.0F, 0.0F, 0.0F};
+            proposals.resize(req.k);
+            sp::draft_markov_greedy_reference(raw, 3, by_rank, head, req.ids[0], proposals, [&](auto row) {
+                constexpr std::array before{0.5F, 1.5F, -0.5F, 0.0F};
+                constexpr std::array ranges{0.0F, 0.0F, 0.0F, 0.0F}, strengths{0.0F, 0.0F, 0.0F, -1.0F};
+                BP_CHECK(calls < req.k && row[0] == before[2 * calls] && row[1] == before[2 * calls + 1],
+                         "the transform receives the anchor or previous proposal's bias");
+                ++calls;
+                strix::core::multimax_f32_reference(row, ranges, strengths);
+                row[2] = 100.0F;  // A masked id cannot win even if the transform increases its score.
+            });
+        }
+        void accept(std::span<const std::uint32_t> emitted) override {
+            accepted.assign(emitted.begin(), emitted.end());
+        }
+    } forward;
+    const auto& policy = strix::ernie::dspark_block_policy;
+    sp::ParallelBlockDrafter parallel(policy, forward);
+    sp::BlockConfig config;
+    config.copy = false;
+    config.fixed_costs = true;
+    config.arbiter.model_prior = {100.0, 1.0};
+    sp::BlockDrafter drafter(sp::parallel_block_config(policy, 0.1, config), &parallel);
+    for (std::uint32_t rows = 1; rows <= 3; ++rows) drafter.seed_verify_ms(rows, 10.0);
+    const World world{{4, 5}, {2, 0, 2, 1}};
+    Target target(world);
+    drafter.commit(world.prompt);
+    std::vector<std::uint32_t> emitted{world.response.front()};
+    drafter.commit(emitted);
+    parallel.start(emitted.front(), world.prompt.size());
+    sp::BlockSpeculator speculator(drafter, target);
+    speculator.start(emitted.front());
+    const auto step = speculator.step(emitted, {.remaining = 3, .max_rows = 3, .context = world.prompt.size()});
+    BP_CHECK(step.accepted == 1 && target.committed == 2 && target.last == std::vector<std::uint32_t>({2, 0, 1}) &&
+             emitted == std::vector<std::uint32_t>({2, 0, 2}) && forward.accepted == std::vector<std::uint32_t>({0, 2}),
+             "verify keeps the matching Markov proposal and commits the target continuation");
+    BP_CHECK(parallel.passes() == 1 && parallel.anchor_pos() == 4 && forward.calls == 2,
+             "one block, one scores transform per proposal, and a committed anchor advance");
 }
 
 void cost_tests() {
@@ -561,6 +657,9 @@ void replay_tests() {
 
 int main() {
     layout_tests();
+    ernie_draft_layout();
+    draft_reference_cases();
+    bundled_markov_verify();
     cost_tests();
     prefix_tests();
     pricing_tests();

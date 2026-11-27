@@ -1,7 +1,7 @@
 #include "strix/ernie/checkpoint.hpp"
 
 #include "strix/weight/formats/fp8_block.hpp"
-#include "strix/weight/formats/microscaled.hpp"
+#include "strix/weight/formats/microscaled_matrix.hpp"
 #include "strix/weight/typed_slice.hpp"
 
 #include <stdexcept>
@@ -40,9 +40,9 @@ std::string_view consumer_name(TensorConsumer consumer) noexcept {
     using enum TensorConsumer;
     switch (consumer) {
     case first_row_reference: return "first_row_reference";
-    case hca_history_pending: return "hca_history_pending";
-    case mla_layer_pending: return "mla_layer_pending";
-    case multimax_pending: return "multimax_pending";
+    case hca_history_candidate: return "hca_history_candidate";
+    case mla_layer_candidate: return "mla_layer_candidate";
+    case vocabulary_activation: return "vocabulary_activation";
     case draft_pending: return "draft_pending";
     case unknown: return "unknown";
     }
@@ -53,7 +53,7 @@ TensorConsumer tensor_consumer(std::string_view name, const Tensor& tensor) noex
     using enum TensorConsumer;
     if (tensor.module == Module::unclassified) return unknown;
     if (tensor.drafter) return draft_pending;
-    if (tensor.layer && layer_is_mla(*tensor.layer)) return mla_layer_pending;
+    if (tensor.layer && layer_is_mla(*tensor.layer)) return mla_layer_candidate;
     switch (tensor.module) {
     case Module::embedding:
     case Module::layer_norm:
@@ -68,11 +68,11 @@ TensorConsumer tensor_consumer(std::string_view name, const Tensor& tensor) noex
     case Module::routed_expert:
     case Module::final_norm:
     case Module::hc_contract: return first_row_reference;
-    case Module::compressor: return hca_history_pending;
+    case Module::compressor: return hca_history_candidate;
     case Module::mla:
     case Module::sparse_indexer:
-    case Module::flash_indexer: return mla_layer_pending;
-    case Module::lm_head: return name == "lm_head.weight" ? first_row_reference : multimax_pending;
+    case Module::flash_indexer: return mla_layer_candidate;
+    case Module::lm_head: return name == "lm_head.weight" ? first_row_reference : vocabulary_activation;
     case Module::draft_input:
     case Module::draft_markov:
     case Module::draft_confidence: return draft_pending;
@@ -95,14 +95,16 @@ PairPayload pair_payload(const Inventory& inventory, unsigned cut) {
     return plan;
 }
 
-CheckpointWeights::CheckpointWeights(Inventory inventory) : inventory_(std::move(inventory)) {}
+CheckpointWeights::CheckpointWeights(Inventory inventory, CheckpointReadPolicy policy)
+    : inventory_(std::move(inventory)), policy_(policy) {}
 
-void CheckpointWeights::read(std::string_view name, std::span<float> out, std::size_t first_element) const {
+void CheckpointWeights::read(std::string_view name, std::span<float> out, std::size_t first_element,
+                             const RowExecutor& execute) const {
     const auto it = inventory_.tensors.find(name);
     if (it == inventory_.tensors.end()) throw std::invalid_argument("ERNIE: missing tensor " + std::string(name));
     const auto& tensor = it->second;
-    if (tensor_consumer(name, tensor) != TensorConsumer::first_row_reference)
-        throw std::invalid_argument("ERNIE: no first-row consumer for " + std::string(name));
+    if (tensor.drafter || tensor.module == Module::unclassified)
+        throw std::invalid_argument("ERNIE: no target consumer for " + std::string(name));
     if (weight::slice_dtype(tensor.wire_dtype) != weight::SliceDtype::bytes) {
         read_plain(name, tensor, out, first_element);
         return;
@@ -128,18 +130,20 @@ void CheckpointWeights::read(std::string_view name, std::span<float> out, std::s
     const auto codes = read_codes(tensor);
     if (codes.size() / packed_width != rows || codes.size() % packed_width != 0)
         throw std::invalid_argument("ERNIE: code slice does not match matrix shape");
+    const auto schedule = [&](std::size_t count, const auto& work) {
+        if (execute) execute(count, work);
+        else work(std::size_t{0}, count);
+    };
     if (fp8) {
         std::vector<float> scales(scale_rows * scale_columns);
         read_plain(scale_name, scale, scales);
-        const Fp8 matrix(codes, scales, rows, columns);
-        for (std::size_t row = 0; row < rows; ++row) matrix.decode_row(row, out.subspan(row * columns, columns));
+        weight::microscaled::dequantize_fp8_block_matrix<Fp8>(codes, scales, rows, columns, out, schedule);
     } else {
         const auto scales = read_codes(scale);
         if (scales.size() / scale_columns != rows || scales.size() % scale_columns != 0)
             throw std::invalid_argument("ERNIE: scale slice does not match MXFP4 matrix shape");
-        for (std::size_t row = 0; row < rows; ++row)
-            weight::microscaled::decode_mxfp4_row(std::span(codes).subspan(row * packed_width, packed_width),
-                std::span(scales).subspan(row * scale_columns, scale_columns), out.subspan(row * columns, columns));
+        weight::microscaled::dequantize_mxfp4_matrix(
+            codes, scales, rows, columns, out, {policy_.table_mxfp4, policy_.high_nibble_first}, schedule);
     }
 }
 

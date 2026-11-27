@@ -3,11 +3,13 @@
 // chain steps, accept() after a partial verify) without any GPU, and that the device-fed chain (engine feed hooks) issues the
 // same calls and proposes the same ids as the host-fed chain with at most one synchronizing read per draft.
 #include "strix/spec/mtp_chain.hpp"
+#include "strix/spec/draft_reference.hpp"
 #include "strix/qwen35/hip_engine.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -67,6 +69,41 @@ struct HostDev {
     static void release(FakeEngine&, float* p) { delete[] p; }
     static void copy(FakeEngine&, float* d, const float* s, std::size_t n) { std::memcpy(d, s, n * sizeof(float)); }
 };
+
+void joined_residual_chain() {
+    struct JoinedEngine : FakeEngine {
+        std::array<float, kH> first_join{};
+        bool saw_carry = false;
+        FakeMtpOut mtp_forward(const std::uint32_t* tokens, const float* hidden, unsigned rows, unsigned pos0, bool) {
+            constexpr std::array embedding{1.0F, 0.0F}, gain{1.0F, 1.0F};
+            constexpr std::array hidden_matrix{2.0F, 0.0F, 0.0F, 4.0F};
+            constexpr std::array embed_matrix{0.0F, 2.0F, 3.0F, 0.0F};
+            out_h.resize(std::size_t{rows} * kH);
+            out_top.resize(rows);
+            for (unsigned r = 0; r < rows; ++r) {
+                const auto offset = std::size_t{r} * kH;
+                const std::span<const float> previous(hidden + offset, kH);
+                auto joined = std::span(out_h).subspan(offset, kH);
+                sp::mtp_join_bf16_reference(previous, embedding, gain, gain, hidden_matrix, embed_matrix, 0.5F,
+                                            joined);
+                if (pos0 + r == 0) std::ranges::copy(joined, first_join.begin());
+                else saw_carry = std::ranges::equal(previous, first_join);
+                out_top[r] = tokens[r] + static_cast<std::uint32_t>(joined[0] > 1.0F);
+            }
+            return {out_top.data(), out_h.data(), out_h.data()};
+        }
+    } engine;
+    sp::MtpChain<JoinedEngine, HostDev> chain(engine, true, 3, 8);
+    constexpr std::array residual{1.0F, 0.0F, 0.0F, 1.0F};
+    constexpr std::uint32_t prompt = 9;
+    chain.observe_prefill({nullptr, nullptr, residual.data()}, 1, &prompt, 10);
+    std::vector<std::uint32_t> ids;
+    chain.draft({}, 2, ids);
+    MC_CHECK((engine.first_join == std::array{2.0F, 3.0F, 0.0F, 7.0F}),
+             "MTP projects each residual stream and adds the projected embedding");
+    MC_CHECK(engine.saw_carry && ids == std::vector<std::uint32_t>({11, 12}),
+             "MTP feeds its joined streams and previous proposal into the next draft row");
+}
 // The same fake with the device-feed hooks: the feed is host memory; a step's input id comes from a slot unless given.
 struct FakeFedEngine : FakeEngine {
     static constexpr std::uint32_t kMtpFeedSlots = 64;
@@ -332,6 +369,7 @@ std::vector<KvWrite> final_kv(const std::vector<KvWrite>& w) {
 }  // namespace
 
 int main() {
+    joined_residual_chain();
     FakeEngine e;
     sp::MtpChain<FakeEngine, HostDev> chain(e, false, 3, 8);  // chunk 3 rows, ring 8
     // prefill: positions 0..4 with hidden first-element 10*pos, tokens 11..15, anchor 99 follows position 4

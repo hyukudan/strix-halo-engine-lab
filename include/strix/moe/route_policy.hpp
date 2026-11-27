@@ -45,6 +45,9 @@ enum class RouteKey : std::uint8_t { float_serial, ordered_bits };
 enum class RouteOrder : std::uint8_t { selection, ascending_id };
 enum class RouteMath : std::uint8_t { native, gfx1151_v1 };
 enum class RouteStatus : std::uint32_t { ok, invalid_route };
+enum class SplitRouteMode : std::uint8_t {
+    separate_planes, unit_gain, gain_before_normalize, swapped_planes, single_plane, summed_scores
+};
 
 inline constexpr unsigned kGfx1151RouteLanes = 256U;
 inline constexpr unsigned kGfx1151RouteExperts = 2U * kGfx1151RouteLanes;
@@ -285,9 +288,11 @@ inline void validate_route_row(const RoutePolicy& p, std::size_t scores, std::si
 // Shared single-row selection. Callers validate spans and supply experts bytes of scratch.
 // Inputs are already transformed scores. Bias changes selection only.
 // A split projection can supply a separate mixture score plane and expert gains.
+// A positive normalization floor uses max(sum, floor) in place of sum + epsilon.
 inline void route_select_row(const RoutePolicy& p, const float* scores, const float* bias,
                              std::uint32_t* ids, float* weights, std::uint8_t* taken,
-                             const float* mixture = nullptr, const float* expert_gain = nullptr) {
+                             const float* mixture = nullptr, const float* expert_gain = nullptr,
+                             float renorm_floor = 0.0F) {
     if (!mixture) mixture = scores;
     const bool gfx1151 = p.math == RouteMath::gfx1151_v1;
     constexpr float empty = -std::numeric_limits<float>::infinity();
@@ -321,7 +326,7 @@ inline void route_select_row(const RoutePolicy& p, const float* scores, const fl
     const bool renorm = p.renormalize && (p.top_k > 1U || p.renorm_single);
     float sum = 0.0F;
     for (std::uint32_t k = 0; k < p.top_k; ++k) sum = sum + (ids[k] == p.experts ? empty : mixture[ids[k]]);
-    const float denominator = sum + p.renorm_eps;
+    const float denominator = renorm_floor > 0.0F ? (renorm_floor > sum ? renorm_floor : sum) : sum + p.renorm_eps;
     for (std::uint32_t k = 0; k < p.top_k; ++k) {
         const auto expert = ids[k];
         const float s = expert == p.experts ? empty : mixture[expert];
@@ -342,14 +347,14 @@ inline void route_select_ref(const RoutePolicy& p, std::span<const float> scores
 inline void route_select_split_ref(const RoutePolicy& p, std::span<const float> select_scores,
                                    std::span<const float> mix_scores, std::span<const float> bias,
                                    std::span<const float> expert_gain, std::span<std::uint32_t> ids,
-                                   std::span<float> weights) {
+                                   std::span<float> weights, float renorm_floor = 0.0F) {
     validate_route_row(p, select_scores.size(), bias.size(), ids.size(), weights.size());
     if (mix_scores.size() != p.experts || (!expert_gain.empty() && expert_gain.size() != p.experts) ||
         p.math != RouteMath::native)
         throw std::invalid_argument("route policy: invalid split score planes");
     std::vector<std::uint8_t> taken(p.experts);
     route_select_row(p, select_scores.data(), bias.data(), ids.data(), weights.data(), taken.data(),
-                     mix_scores.data(), expert_gain.empty() ? nullptr : expert_gain.data());
+                     mix_scores.data(), expert_gain.empty() ? nullptr : expert_gain.data(), renorm_floor);
 }
 
 // Host transform of one row: softmax (m = max over e ascending, p_e = exp(z_e - m), sum ascending from 0, s_e = p_e / sum),
@@ -377,6 +382,32 @@ void route_scores_ref(RouteScore score, std::span<const float> logits, std::span
     } else {
         throw std::invalid_argument("route policy: Math has no log1p / sqrt for sqrt_softplus");
     }
+}
+
+// Two FP32 router projections. The scratch rows are consumed in place. In
+// summed mode the two individually transformed scores supply both selection
+// and mixture. Per-expert gains normally apply only after route normalization.
+template <class Math>
+void route_split_logits_ref(const RoutePolicy& policy, SplitRouteMode mode,
+                            std::span<float> first, std::span<float> second, std::span<const float> bias,
+                            std::span<float> gains, std::span<std::uint32_t> ids, std::span<float> weights,
+                            float summed_renorm_floor) {
+    if (first.size() != policy.experts || second.size() != policy.experts || gains.size() != policy.experts)
+        throw std::invalid_argument("route policy: invalid split logits or gains");
+    route_scores_ref<Math>(policy.score, first, first);
+    route_scores_ref<Math>(policy.score, second, second);
+    if (mode == SplitRouteMode::summed_scores) {
+        for (std::size_t i = 0; i < first.size(); ++i) first[i] += second[i];
+        second = first;
+    }
+    if (mode == SplitRouteMode::swapped_planes) std::swap(first, second);
+    if (mode == SplitRouteMode::single_plane) second = first;
+    if (mode == SplitRouteMode::gain_before_normalize)
+        for (std::size_t i = 0; i < second.size(); ++i) second[i] *= gains[i];
+    if (mode == SplitRouteMode::unit_gain || mode == SplitRouteMode::gain_before_normalize)
+        std::ranges::fill(gains, 1.0F);
+    route_select_split_ref(policy, first, second, bias, gains, ids, weights,
+                           mode == SplitRouteMode::summed_scores ? summed_renorm_floor : 0.0F);
 }
 
 // CPU oracle for the gfx1151 softmax tree. The callable binds the engine's exp

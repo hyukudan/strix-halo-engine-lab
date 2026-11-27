@@ -13,7 +13,7 @@
 // Operation order (FP32 accumulation, every product and sum rounded on its own: no contraction to FMA):
 //   n = streams * hidden; dot(a, b) = the chunked lane dot of ds41_layer.hpp (chunks of 640 in ascending order,
 //   lane l of a chunk takes elements l, l + 32, ... with acc = acc + a * b, butterfly 16, 8, 4, 2, 1);
-//   r = 1 / declared_sqrt(dot(x, x) / n + norm_eps);                    (rsqrt AFTER the dot: scale-after-dot)
+//   r = mix_rms_inverse(dot(x, x) / n, norm_eps, norm_eps_outside_sqrt); (scale after the dot)
 //   mix[m] = dot(fn[m], x) * r;                                          (fn F16 -> F32 exactly)
 //   pre[j]  = declared_sigmoid(mix[j] * scale[0] + base[j]) + pre_eps;
 //   post[j] = post_magnitude * declared_sigmoid(mix[N + j] * scale[1] + base[N + j]) + post_eps;
@@ -51,6 +51,7 @@ enum class Comb : std::uint8_t { sinkhorn, identity };
 enum class FnType : std::uint8_t { f16, f32 };
 enum class Store : std::uint8_t { f32, bf16 };
 enum class Site : std::uint8_t { sublayer, head };  // head: pre-only mix, collapse only
+enum class CollapseVariance : std::uint8_t { before_store, after_store };
 
 inline constexpr std::uint32_t max_streams = 8;
 
@@ -64,6 +65,7 @@ struct Spec {
     Store store = Store::f32;
     float post_magnitude = 2.0F;
     float pre_eps = 0.0F, post_eps = 0.0F, comb_eps = 0.0F, norm_eps = 0.0F;
+    bool norm_eps_outside_sqrt = false;
 
     [[nodiscard]] constexpr std::uint32_t post_rows() const { return site == Site::head ? 0U : streams; }
     [[nodiscard]] constexpr std::uint32_t comb_rows() const {
@@ -81,6 +83,10 @@ struct Spec {
 };
 
 // ---- per-value pieces shared by the oracle and the device bodies ----------------------------------------
+STRIX_HC_HD inline float mix_rms_inverse(float mean_square, float epsilon, bool epsilon_outside_sqrt) {
+    return epsilon_outside_sqrt ? 1.0F / (ds41::declared_sqrt(mean_square) + epsilon)
+                                : ds41::declared_rsqrt(mean_square + epsilon);
+}
 STRIX_HC_HD inline float store_value(float v, Store store) {
     return store == Store::bf16 ? ds41::round_to_bf16(v) : v;
 }

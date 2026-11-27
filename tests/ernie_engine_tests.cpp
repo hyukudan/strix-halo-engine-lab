@@ -62,7 +62,7 @@ struct Fixture {
         bytes(inverse, "F8_E8M0", {rows, columns / 32U}, std::as_bytes(scales), Module::routed_expert);
     }
 
-    void norms_and_attention(unsigned layer, bool live) {
+    void norms_and_attention(unsigned layer, bool live, float kv_gain = 1.0F) {
         const auto base = target_layer_prefix(layer);
         const float ones[] = {1, 1}, sinks[] = {0, 0}, one[] = {1};
         floats(base + "input_layernorm.weight", ones);
@@ -78,7 +78,7 @@ struct Fixture {
         floats(p + "q_layernorm.weight", one);
         fp8(p + "linear_q_up_proj.weight", 4, 1, std::array<std::uint8_t, 4>{});
         fp8(p + "linear_kv_proj.weight", 2, 2, std::array<std::uint8_t, 4>{0, 0, 0x38, 0});
-        floats(p + "kv_layernorm.weight", ones);
+        floats(p + "kv_layernorm.weight", std::array<float, 2>{kv_gain, kv_gain});
         floats(p + "core_attention.attn_sink", sinks);
         floats(p + "vha_postmix_U", std::array<float, 2>{0, 1});
         floats(p + "vha_postmix_V", std::array<float, 2>{1, 0});
@@ -103,8 +103,8 @@ ReferenceShape tiny_shape() {
     return s;
 }
 
-FirstRowReference engine(const CheckpointWeights& weights) {
-    return FirstRowReference(tiny_shape(),
+FirstRowReference engine(const CheckpointWeights& weights, ReferenceShape shape = tiny_shape()) {
+    return FirstRowReference(shape,
         [&weights](auto name, auto out, auto offset) { weights.read(name, out, offset); },
         [](float gate, float up, float beta, float linear_beta) {
             expect(beta == 4.0F && linear_beta == 25.0F, "TOML activation parameters");
@@ -128,6 +128,16 @@ void test_decode() {
     std::vector<float> fp8(codes.size()), mxfp4(64);
     weights.read("fp8.weight", fp8);
     weights.read("mx.weight", mxfp4);
+    const CheckpointWeights::RowExecutor reverse_partitions = [](auto rows, const auto& decode) {
+        decode(rows / 2, rows);
+        decode(0, rows / 2);
+    };
+    std::vector<float> scheduled_fp8(fp8.size()), scheduled_mx(mxfp4.size());
+    weights.read("fp8.weight", scheduled_fp8, 0, reverse_partitions);
+    weights.read("mx.weight", scheduled_mx, 0, reverse_partitions);
+    expect(std::ranges::equal(std::as_bytes(std::span(fp8)), std::as_bytes(std::span(scheduled_fp8))) &&
+           std::ranges::equal(std::as_bytes(std::span(mxfp4)), std::as_bytes(std::span(scheduled_mx))),
+           "quantized decoder partitions preserve FP32 bits");
     expect(fp8[0] == 2 && fp8[255] == 2 && fp8[256] == 0.5F && fp8[257] == -0.75F,
            "128x128 F32-scale FP8 partial tile");
     expect(mxfp4[0] == 2 && mxfp4[1] == -12 && mxfp4[2] == 0 && mxfp4[32] == 0.75F && mxfp4[33] == 1.5F,
@@ -136,7 +146,7 @@ void test_decode() {
 
 void test_first_block() {
     Fixture f;
-    f.norms_and_attention(0, true);
+    f.norms_and_attention(0, true, 2.0F);
     const auto p = target_layer_prefix(0) + "mlp.";
     const std::array<std::uint8_t, 2> second{0, 0x38};
     f.fp8(p + "gate_proj.weight", 1, 2, second);
@@ -157,6 +167,14 @@ void test_first_block() {
     const auto block = ref.block(0, input);
     expect(block.experts.empty(), "dense block emitted routed experts");
     near(block.attention_streams[1], std::sqrt(2.0F) / 2.0F, 0.0001F, "sink, VHA and gate");
+    auto shape = tiny_shape();
+    shape.contracts.key_norm = KeyNormContract::weighted_only;
+    const auto weighted = engine(weights, shape).block(0, input);
+    near(weighted.attention_streams[1], 1.4140625F, 0.0001F, "learned KV gain survives a single norm");
+    shape.contracts.key_norm = KeyNormContract::candidate;
+    shape.contracts.vha = VhaContract::swapped;
+    const auto swapped = engine(weights, shape).block(0, input);
+    near(swapped.attention_streams[1], std::sqrt(2.0F) / 4.0F, 0.0001F, "swapped VHA factors");
     near(block.ffn[1], 4.0F / 3.0F, 0.005F, "FP8 dense GLU");
     const auto logits = ref.embedding_first_block_logits(1);
     const auto h = std::sqrt(2.0F) / 2.0F + 4.0F / 3.0F;
@@ -211,6 +229,28 @@ void test_moe() {
     expect(result.experts == std::vector<std::uint32_t>{11, 0, 1, 2, 3, 4, 5, 6, 7, 8}, "top-10 and tie order");
     near(result.expert_weights.at(0), 0.75F / 5.25F * 3.0F * 2.0F, 1e-6F, "post-normalization gain");
     near(result.expert_weights.at(1), 0.5F / 5.25F * 3.0F, 1e-6F, "mix plane ignores selection bias");
+    auto shape = tiny_shape();
+    shape.contracts.router = RouterContract::gain_before_normalize;
+    const auto renormalized = engine(weights, shape).block(1, residual);
+    expect(renormalized.experts == result.experts, "mixture gain leaves the selection plane intact");
+    auto checkpoint = tiny_shape();
+    checkpoint.route.scale = 1.0F;
+    checkpoint.contracts.router = RouterContract::summed_scores;
+    const auto summed = engine(weights, checkpoint).block(1, residual);
+    expect(summed.experts == result.experts, "summed scores preserve bias ordering for this row");
+    near(summed.expert_weights.at(0), (1.25F / 10.25F) * 2.0F, 1e-6F,
+         "sum of both sigmoids, top-k denominator, then learned gain");
+    near(summed.expert_weights.at(1), 1.0F / 10.25F, 1e-6F, "bias is excluded from the denominator");
+    constexpr std::array zero_scores{0.0F, 0.0F}, zero_bias{1.0F, 0.0F}, zero_gain{3.0F, 2.0F};
+    auto policy = checkpoint.route;
+    policy.experts = policy.top_k = 2;
+    std::array<std::uint32_t, 2> ids{};
+    std::array<float, 2> route_weights{};
+    strix::moe::route_select_split_ref(policy, zero_scores, zero_scores, zero_bias, zero_gain, ids, route_weights, 1e-20F);
+    expect(ids == std::array<std::uint32_t, 2>{0, 1} && route_weights == zero_scores,
+           "a saturated routing row keeps finite zero weights");
+    near(renormalized.expert_weights.at(0), 3.0F * 1.5F / 6.0F, 1e-6F, "gain belongs in denominator");
+    near(renormalized.expert_weights.at(1), 3.0F * 0.5F / 6.0F, 1e-6F, "gain denominator covers every route");
     const float latent = 5.65625F; // BF16-rounded sqrt(32).
     const float routed = 3.0F * (4.5F + 3.0F) / 5.25F * latent * latent;
     near(result.ffn[0], routed, 0.001F, "weighted MXFP4 latent sum");
@@ -227,17 +267,17 @@ void test_consumers() {
     auto deferred = norm;
     expect(tensor_consumer("norm", norm) == first_row_reference, "bound norm");
     deferred.layer = 7;
-    expect(tensor_consumer("norm", deferred) == mla_layer_pending, "deferred MLA block");
+    expect(tensor_consumer("norm", deferred) == mla_layer_candidate, "candidate MLA block");
     deferred.drafter = true;
     expect(tensor_consumer("norm", deferred) == draft_pending, "deferred DSpark block");
     deferred.drafter = false;
     deferred.layer = 0;
     deferred.module = Module::compressor;
-    expect(tensor_consumer("ape", deferred) == hca_history_pending, "deferred HCA history");
+    expect(tensor_consumer("ape", deferred) == hca_history_candidate, "candidate HCA history");
     deferred.layer.reset();
     deferred.module = Module::lm_head;
-    expect(tensor_consumer("multimax_ranges", deferred) == multimax_pending &&
-           tensor_consumer("lm_head.weight", deferred) == first_row_reference, "raw head and deferred MultiMax");
+    expect(tensor_consumer("model.lm_head.multimax_ranges", deferred) == vocabulary_activation &&
+           tensor_consumer("lm_head.weight", deferred) == first_row_reference, "vocabulary projection and learned activation");
     deferred.module = Module::unclassified;
     expect(tensor_consumer("unknown", deferred) == unknown, "unknown tensor must be reported");
 

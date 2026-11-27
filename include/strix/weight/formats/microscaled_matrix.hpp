@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/weight/formats/fp8_block.hpp"
 #include "strix/weight/formats/microscaled.hpp"
 #include "strix/weight/source.hpp"
 
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <limits>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -235,5 +237,53 @@ private:
     std::vector<std::uint8_t> codes_;
     std::vector<std::uint8_t> scales_;
 };
+
+// ---- dequantized FP32 rows from a code plane and a scale plane -------------------------------------------
+// `schedule(rows, work)` runs `work(first, last)` over row ranges (a row executor); pass `run_whole_matrix` to
+// decode serially. Each row decodes independently, so any partition gives the same values.
+struct RunWholeMatrix {
+    template <class Work>
+    void operator()(std::size_t rows, const Work& work) const { work(std::size_t{0}, rows); }
+};
+inline constexpr RunWholeMatrix run_whole_matrix{};
+
+struct Mxfp4DecodePolicy {
+    bool table = false;             // lookup-table decoder (same values)
+    bool high_nibble_first = false; // the first element of a byte is its high nibble
+};
+
+// E4M3 codes with one scale per Fp8Matrix tile (a weight::BlockScaledE4M3 instantiation) into rows x columns floats.
+template <class Fp8Matrix, class Schedule>
+void dequantize_fp8_block_matrix(std::span<const std::uint8_t> codes, std::span<const float> scales,
+                                 std::size_t rows, std::size_t columns, std::span<float> out,
+                                 const Schedule& schedule) {
+    if (out.size() != rows * columns) throw std::invalid_argument("dequantized matrix: output size mismatch");
+    const Fp8Matrix matrix(codes, scales, rows, columns);
+    schedule(rows, [&](std::size_t first, std::size_t last) {
+        for (auto row = first; row < last; ++row) matrix.decode_row(row, out.subspan(row * columns, columns));
+    });
+}
+
+// Packed E2M1 codes (columns / 2 bytes per row) with one E8M0 scale per 32 columns into rows x columns floats.
+template <class Schedule>
+void dequantize_mxfp4_matrix(std::span<const std::uint8_t> codes, std::span<const std::uint8_t> block_scales,
+                             std::size_t rows, std::size_t columns, std::span<float> out,
+                             const Mxfp4DecodePolicy& policy, const Schedule& schedule) {
+    const auto packed = columns / 2U;
+    const auto scale_columns = columns / kMxfp4BlockColumns;
+    if (rows == 0 || columns == 0 || columns % kMxfp4BlockColumns != 0 || out.size() != rows * columns ||
+        codes.size() != rows * packed || block_scales.size() != rows * scale_columns)
+        throw std::invalid_argument("dequantized matrix: MXFP4 code, scale and output shapes disagree");
+    schedule(rows, [&](std::size_t first, std::size_t last) {
+        for (auto row = first; row < last; ++row) {
+            const auto bytes = codes.subspan(row * packed, packed);
+            const auto scales = block_scales.subspan(row * scale_columns, scale_columns);
+            auto values = out.subspan(row * columns, columns);
+            if (policy.table || policy.high_nibble_first)
+                decode_mxfp4_row_table(bytes, scales, values, policy.high_nibble_first);
+            else decode_mxfp4_row(bytes, scales, values);
+        }
+    });
+}
 
 }  // namespace strix::weight::microscaled

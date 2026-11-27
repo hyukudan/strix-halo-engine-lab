@@ -5,6 +5,8 @@
 #include "strix/weight/host_q8.hpp"
 
 #include <algorithm>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <set>
@@ -197,6 +199,47 @@ PackPlan plan_strix_pack(const Json& description, FormatId cold, std::uint64_t h
         ++plan.hot_experts;
     }
     return plan;
+}
+
+void write_measured_pack_description(const std::filesystem::path& directory,
+                                     const std::filesystem::path& model_description,
+                                     std::span<const PackRouteCount> routes, const calib::MomentSet& moments,
+                                     std::span<const MeasuredPackLayer> layers) {
+    std::ifstream in(model_description, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot open pack model description " + model_description.string());
+    const std::string encoded{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    auto description = serve::parse_json_unique(encoded);
+    const auto* schema = description.find("schema");
+    if (!schema || schema->as_string() != "strix-pack-model/v1")
+        throw std::invalid_argument("invalid pack model description");
+    auto counts = Json::array();
+    for (const auto& route : routes) counts.push(Json::Array{route.layer, route.expert, route.count});
+    description.set("routes", std::move(counts));
+    if (!std::filesystem::create_directory(directory))
+        throw std::runtime_error("calibration capture directory already exists: " + directory.string());
+    for (const auto& layer : layers)
+        moments.write_partition((directory / ("layer-" + std::to_string(layer.layer) + ".moments")).string(),
+                                [&](const auto& input) { return input.name.starts_with(layer.tensor_prefix); });
+    const auto plan_path = directory / "measured-pack-description.json";
+    std::ofstream out(plan_path, std::ios::binary);
+    out << description.dump() << '\n';
+    out.close();
+    if (!out) throw std::runtime_error("cannot write " + plan_path.string());
+}
+
+void write_pack_slice_plan(const std::filesystem::path& path, std::string_view storage,
+                           std::span<const PackSliceMatrix> matrices) {
+    const auto format = strixpack_format(storage);
+    if (!is_strixpack_storage(format)) throw std::invalid_argument("pack slice plan needs a strixpack storage");
+    std::string rows = "tensor\tformat\tbytes\n";
+    for (const auto& matrix : matrices)
+        rows += matrix.tensor + '\t' + std::string(storage) + '\t' +
+                std::to_string(strixpack_matrix_bytes(format, matrix.rows, matrix.columns)) + '\n';
+    if (std::filesystem::exists(path)) throw std::runtime_error("pack plan already exists: " + path.string());
+    std::ofstream out(path, std::ios::binary);
+    out << rows;
+    out.close();
+    if (!out) throw std::runtime_error("cannot write " + path.string());
 }
 
 }  // namespace strix::weight

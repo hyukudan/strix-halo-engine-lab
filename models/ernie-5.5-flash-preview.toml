@@ -63,6 +63,7 @@ split_kv_b_projection = true
 index_head_dim = 128
 index_n_heads = 64
 index_topk = 2048
+prefill_head_topk = 8
 sidecar = "flashindexer/flashindexer.safetensors"
 
 [attention.rope_scaling]
@@ -88,6 +89,7 @@ topk_group = 1
 scoring_func = "sigmoid"
 topk_method = "noaux_tc"
 norm_topk_prob = true
+router_renorm_floor = 1e-20
 routed_scaling_factor = 3.0
 routed_scaling_factor_learnable = true
 hidden_act = "situ"
@@ -96,9 +98,11 @@ activation_situ_linear_beta = 25.0
 
 [extras]
 hc_mult = 4
+hc_post_magnitude = 2.0
 hc_sinkhorn_iters = 20
 hc_eps = 0.000001
 tie_word_embeddings = false
+head_logit_transform = "linear_quadratic_hinges"
 multimax_parameters = 4
 dspark_attention_kind = "uncompressed"
 dspark_confidence_input = 4352

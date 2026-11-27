@@ -19,6 +19,11 @@ inline constexpr float excluded_score = -std::numeric_limits<float>::infinity();
 
 // Sliding window: keys p - window + 1 .. p; window 0 = full causal.
 STRIX_ATTN_MASK_HD inline unsigned window_lo(unsigned p, unsigned window) { return window && p >= window ? p - window + 1U : 0U; }
+template<class Position>
+STRIX_ATTN_MASK_HD constexpr unsigned window_count(Position p, unsigned window) {
+    const auto visible = p + 1U;
+    return visible < window ? static_cast<unsigned>(visible) : window;
+}
 STRIX_ATTN_MASK_HD inline bool causal_ok(unsigned key, unsigned pos, unsigned lo) { return key <= pos && key >= lo; }
 // Keys a run of consecutive query positions [first, last] can see: [begin, end) (block skip outside it).
 struct Range {

@@ -1,31 +1,110 @@
 # ERNIE 5.5 Flash Preview host engine binding
 
 `strix-ernie-engine-plan CHECKPOINT_DIR [--list] [--cut N]` validates the sharded
-safetensors inventory and manifest. Its TSV lists every indexed tensor without a
-first-row consumer. `--list` includes the bound tensors and their source ranges.
+safetensors inventory and manifest. Its TSV identifies first-row consumers, new
+host candidate consumers, and pending tensors. `--list` includes all bound
+tensors and their source ranges.
 The command reads one 256-byte F32 attention sink from layer 0 after validating
 the complete header set. The command exits nonzero on incomplete inventory,
 unknown tensors, malformed metadata, or probe failure. Output and status can be
 captured separately.
 
+`strix-ernie-cpu CHECKPOINT_DIR PROMPTS.json NEW_TRACE_DIR --generate 32`
+runs the target-only CPU reference. The prompt file contains an array of
+objects with `messages` and optional `tools`. The runner renders ERNIE chat
+with thinking disabled, preserves the causal history and selects greedily from
+the scores after the checkpoint's learned linear and quadratic hinges. The trace
+contains little-endian prompt and sampled IDs, raw and transformed FP32 logit
+files, first-row top-20, per-layer stream digests/RMS and selected route IDs
+and weights. Raw scores in the checkpoint host profile are widened from the
+BF16 projection store. `--head-store-f32` exposes the FP32 accumulator for
+comparison on the same states.
+
+The host runner accepts `--threads` and `--cache-mib`. Its single-thread,
+zero-cache configuration keeps the scalar dot order. For a schedule
+comparison, `--replay PRIOR_TRACE_DIR` feeds the same continuation IDs and
+reports full-row bit identity, KL and top-1 agreement. Capture diagonal moments
+with `--capture MODEL_DESCRIPTION` on a free-running checkpoint trace. It
+writes the per-layer files and a pack description with measured routes. The
+two-bit and three-bit pilot plans replace the observed experts from a narrow
+slice. Load an explicit sidecar with `--pack` and use `--replay` for paired
+logit measurements. These options do not enter runtime tiers.
+
+### Teacher-forced host diagnostics
+
+```sh
+strix-ernie-cpu CHECKPOINT_DIR TEXT.txt BASE --oracle --limit 64 --save-layers \
+  --threads 12 --cache-mib 8192 --ordered-simd --table-mxfp4 --profile-host
+strix-ernie-cpu CHECKPOINT_DIR TEXT.txt PROBE --oracle --limit 64 --resume BASE \
+  --start-layer 7 --end-layer 8 --threads 12 --cache-mib 8192 \
+  --ordered-simd --table-mxfp4
+```
+
+The oracle tokenizes ordinary UTF-8 text. Each row predicts the actual next
+token from the causal prefix. `--bos` explicitly inserts the checkpoint's begin
+token. `scores.tsv` contains IDs, negative log-likelihood in nats and top-1
+hits. `run.json` includes the mean, perplexity and empirical unigram entropy for
+the same target IDs. The oracle accepts up to 600 tokens. `rms.tsv`,
+`stream-rms.tsv` and `layers.tsv` describe the residual before each indexed
+layer and after the last layer. `--trace-sites` records the attention and FFN
+residuals per stream in `site-rms.tsv`.
+`--dump-logits` writes the FP32 scores before the selected MultiMax probe.
+
+With `--save-layers`, the runner writes a little-endian F32 image at each
+boundary. Use the same immutable checkpoint and text to resume that image.
+The runner checks the saved token IDs and boundary size and rebuilds causal
+history within every recomputed layer. Boundary 43 is the input to the output
+head. Stopping earlier applies the final head as an intermediate diagnostic;
+the resulting loss is a logit-lens score for that boundary. `--lens-stride N`
+scores every Nth position at each boundary with the same final head and writes
+`lens.tsv`. To score previously saved boundaries without rerunning the stack,
+combine `--rescore-layers` with `--resume BASE` and the desired layer range.
+
+The scalar reference and the opt-in ordered FMA path run the same column
+chain for each output. The batch head streams each weight block once for
+every position. The table MXFP4 decoder is also opt-in and widens the same
+low-first E2M1 and E8M0 operands. `--profile-host` reports projection and
+weight-access timings separately. Contract switches are experimental host
+diagnostics and carry their settings into the receipt.
+`--parallel-mla` distributes independent attention heads and folded head-mix
+output rows over the same host workers. It admits the decoded KV-B matrix to
+the bounded cache. `--variant hca-fp8-epilogue` selects block E4M3 stores at
+the two HCA output projection inputs for explicit comparisons.
+
+`--recovered-contract` selects the host candidate that applies the learned
+expert gain before renormalization, keeps the weighted KV normalization
+without a second key RMS, and reverses the VHA factor order used by the
+initial candidate. It keeps the raw output head. The mode is available to
+both the oracle and the chat runner. Set `STRIX_ERNIE_ORACLE_CHECKPOINT` when
+configuring the build to register the slow next-token loss fixture.
+For generation probes, `--bos` prepends the explicit BOS ID to the rendered
+chat. `--min-new-tokens` delays EOS eligibility for the specified number of
+generated tokens. Raw logit traces preserve every score for those probes.
+
+The [pair plan](pair-plan.md) describes native weight placement, memory admission,
+the shared transport seam and the first device run.
+
 | Stage | Shared component | Model binding |
 | --- | --- | --- |
 | Weight access | Safetensors index, typed slices, block E4M3 and split MXFP4 decoders | Named tensors and scale companions, FP8 128×128 with F32 scales, MXFP4 E8M0 per 32 columns |
-| Attention | Causal GQA with sink, hybrid RoPE also bound by DeepSeek, head RMS, low-rank head mixing, grouped linear and sigmoid product | Position-zero HCA, Q LoRA, one KV head, VHA before grouped projection, sigmoid gate before final output projection |
-| Residual and norm | HC host contract and BF16 RMS | Four streams, feature-major F32 HC function, three scales and 20 Sinkhorn iterations |
-| FFN and experts | Linear, split-score routing, grouped expert reference, latent expert composition | Dense first block, latent RMS/down/up, top-10 with a separate ungated shared expert |
-| Logits | HC head collapse, RMS and linear reference | Diagnostic head immediately after block 0, raw BF16-head scores |
+| Attention | Causal window and rotary, compressed-history softmax and carry, selected latent attention, FP4 index selection and folded head mix | HCA R128, MLA per-head KV-B planes, index head gate and output gate wiring |
+| Residual and norm | HC host contract and BF16 RMS with FP32 collapse variance | Four streams, feature-major F32 HC function, three scales and 20 Sinkhorn iterations |
+| FFN and experts | Linear, split-score routing, activation policies, ordered expert reference and latent expert composition | Dense first block, latent RMS after combine, top-10 floor renormalization with per-expert gain and an ungated shared expert |
+| Logits | HC head collapse, RMS, linear reference and learned hinge epilogue | Independent head projection and two vectors of learned coefficients |
+| Draft | Shared block and chain policies, BF16 tap projection and MTP join, Markov score correction and greedy verification | Bundled block geometry, taps, shared embedding and head. The target runner leaves draft execution disabled. |
 | Session and HTTP | `session::Engine`, `KvStore`, `SessionRuntime`, shared tokenizer/API and ERNIE chat binding | The serve adapter configures the API from an admitted session runtime and installs the existing ERNIE protocol |
 
-The host reference exercises a single position in any target HCA block. The
-caller supplies the activation arithmetic. The synthetic fixture uses
+The first-row diagnostic exercises a single position in any target HCA block.
+The caller supplies the activation arithmetic. Its synthetic fixture uses
 elementwise multiplication and assumes the first router selects, the second
 router supplies the renormalized mixture, and expert gain applies afterward.
 The diagnostic also assumes a zero-value sink, residual `U(Vᵀ·values)`, the
 shared HC coefficient order, and a BF16 rounding boundary after weighted RMS.
-These assumptions need independent operator captures before they define
-checkpoint numerics. The first-block scores test the data path. Generation
-requires all 43 blocks and MultiMax.
+The full CPU reference sums both sigmoid planes before ranking, renormalizes
+the selected scores and applies the learned gain. Its activation defaults to
+soft-capped SwiGLU with a sigmoid on the raw gate. Hard-cap and plain SwiGLU
+are available for operator probes. Native captures are still required for
+checkpoint parity at the compression boundary and for activation quantization.
 
 ## Next tasks for a target-only first token
 
@@ -36,14 +115,11 @@ requires all 43 blocks and MultiMax.
    tails and expert ties. Record outputs for layers 0, 1 and 7, including each
    route ID and mixture weight. Compare staged tensors and raw logits before
    comparing selected IDs.
-2. **Finish attention in the host reference.** Bind the shared gated/APE
-   pooling and an incremental carry policy to 128×512 HCA groups. Freeze the
-   merge order and separate RoPE domains with positions 127–129 and an
-   incomplete final group. Bind the shared selected MLA core and determine
-   how to split KV-B into K192 and V256 planes. Freeze FlashIndexer head
-   selection, Hadamard/FP4 keys, causal top-2048 and tie order. Capture the six
-   MLA layers and the HCA cache layout before using the CPU path as a
-   first-token oracle.
+2. **Validate the host attention wiring.** The synthetic cases exercise HCA
+   positions 127–129 and an incomplete final group, plus selected latent
+   attention, packed index keys, masking and tie order. Compare state and scores
+   from the official checkpoint across the compression boundary and beyond
+   2,048 visible positions to establish the HCA and FlashIndexer contracts.
 3. **Build the native bindings and verify the shape boundary.**
 
    | Bind the existing HIP body when its arithmetic and stores match the fixtures | Extend the existing shared family |

@@ -20,6 +20,13 @@ namespace strix::moe {
 
 enum class CombineForm : std::uint8_t { fma_f32, bf16_steps };
 
+// One step of an ordered FP32 combine. Callers that bind this arithmetic
+// compile without FP contraction.
+inline float add_weighted_expert_f32(float sum, float weight, float projected) {
+    const float term = weight * projected;
+    return sum + term;
+}
+
 // Round a float to the nearest bfloat16 (ties to even); NaN stays NaN (the bits of ds41::round_to_bf16).
 inline float combine_round_bf16(float x) {
     std::uint32_t bits = 0;
