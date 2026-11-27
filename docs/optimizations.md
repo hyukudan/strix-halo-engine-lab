@@ -7493,7 +7493,7 @@ grid dimension, so the groups read each plane row together; the screen is now si
 
 With both drafters beside the checkpoint (the MTP sidecar and the `dflash2` block-diffusion directory), the HIP EXACT CLI
 binds both and runs them under the shared per-regime selector; the block arm wins ties. FAST prose was slower under the
-selector (-5.1 % in both repetitions), so FAST, TURBO and CUDA keep the MTP sidecar alone and bind the block drafter only
+selector (-5.1 / -5.3 %, both repetitions), so FAST, TURBO and CUDA keep the MTP sidecar alone and bind the block drafter only
 when it is named.
 
 - **Shared home:** include/strix/spec/arm_selector.hpp, src/serve/serial_generation_cli.cpp (chain_arms), include/strix/spec/drafter_source.hpp; binding in apps/inkling2_mini_gpu_main.hpp

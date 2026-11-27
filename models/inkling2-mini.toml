@@ -55,7 +55,7 @@ drafter = "mtp.safetensors"
 # The block-diffusion drafter (DFlash 2, src/spec/dflash_resident.hpp): a directory beside the checkpoint (config.json +
 # model.safetensors). Under the HIP EXACT tier the CLI resident route binds it when present and valid, beside the MTP
 # sidecar, both under the shared per-regime selector (gfx1151: code 53.1 -> 61.0 tok/s, prose 29.3 -> 30.8; ids equal).
-# FAST (prose -5.1 % under the selector), TURBO and CUDA bind it only when named (--dflash DIR). Never fetched by the
+# FAST (prose -5.1 / -5.3 % under the selector), TURBO and CUDA bind it only when named (--dflash DIR). Never fetched by the
 # engine.
 block_drafter = "dflash2"
 max_draft_by_live = [7, 0]

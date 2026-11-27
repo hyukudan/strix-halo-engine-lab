@@ -516,9 +516,9 @@ int main(int argc, char** argv) {
         // registry's block drafter; --dflash off keeps the MTP sidecar alone, --dflash DIR --dspark off the block alone.
         // HIP EXACT binds the block drafter beside the checkpoint by default: on gfx1151 the selector over both drafters
         // was never slower than the MTP sidecar alone there (code 53.1 -> 61.0 tok/s, prose 29.3 -> 30.8 / 32.1, ids
-        // equal). FAST keeps the sidecar alone (code +5.4 %, but prose 41.2 -> 39.0, -5.1 % in both repetitions) until
-        // the selector policy is never slower there, and CUDA keeps it until its own device receipt: in those runs the
-        // block drafter binds only when named, and --dflash DIR alone runs it alone.
+        // equal). FAST keeps the sidecar alone (code +5.4 %, but prose 41.2 -> 39.1 / 39.0, -5.1 / -5.3 %) until the
+        // selector policy is never slower there, and CUDA keeps it until its own device receipt: in those runs the block
+        // drafter binds only when named, and --dflash DIR alone runs it alone.
 #if defined(__HIPCC__)
         const bool block_by_default = options.tier.profile == strix::profile::Name::standard;
 #else
