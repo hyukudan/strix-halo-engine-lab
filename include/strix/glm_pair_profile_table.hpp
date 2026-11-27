@@ -85,7 +85,11 @@ inline constexpr unsigned kTurboPrefillRows = 8192, kTurboPrefillGenerated = 64;
 inline constexpr std::string_view kFastGatePfWmma =
     "FAST gate v2 PASS, pair, 8K with MoE route replay (glm_fast gate-fast2.json): 5 windows of 8,192 tokens, 1,275 rows, "
     "pooled KL 0.00018 (null 0.00007), top-1 0.9969, dNLL -0.0013 (se 0.0009), free route-flip ratio 1.05; product-route "
-    "head dump bitwise equal to the gated arm";
+    "head dump bitwise equal to the gated arm. "
+    "Gate re-score pending: the current gate v2 re-run with the free-running arms passes with route replay, fails "
+    "the absolute bars free-running (KL 0.363, top-1 0.902; the exact arm's own free one-ulp null gives KL 0.367) "
+    "and passes with --allow-null-floor. Which rule applies is a pending gate policy decision; the FAST default "
+    "stays until the owner decides.";
 inline constexpr strix::profile::FastGate fast_gates[] = {{"pf_wmma", "1", kFastGatePfWmma}};
 
 // A prompt inside the FAST band: the startup pair vote asks whether this execution can run the bundle at all; each

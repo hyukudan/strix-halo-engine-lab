@@ -308,3 +308,20 @@ drafter, 256 decode tokens per command line run; receipts q64 and q65. Catalogue
   98.76 / plain 102.12 (478 prompt tokens).
 
 Detailed receipts (per-arm logs, tickets) remain outside Git.
+
+## MiniMax serving host route default and the GLM 2x1x40 prefill layout
+
+**observed** (2026-11-27). Radeon 8060S pair over USB4, layout 2x1x40 (two cables, one host stream each, GPU-direct
+streams present) unless marked layout 1. Catalogue rows:
+[MiniMax serving host route](../optimizations.md#minimax-serve-host-route-default),
+[GLM 2x1x40 prefill layout](../optimizations.md#glm-pf-wmma-2x1x40).
+
+- M3D, MiniMax served 8K TTFT, three runs per arm: GPU-direct (the former default) 17.33 / 17.39 / 17.36 s, host route
+  12.24 / 11.60 / 12.01 s; decode equal; outputs identical. The new binary without `--transport`: 12.33 / 11.71 /
+  12.79 s, transport usb4-host, identical outputs. With usb4gpu the server declined its session cache (route not
+  qualified); the host route is the qualified session-cache route (`session_cache_gate.sh`: ON == OFF).
+- G4B, GLM pair CLI ABAB at 2,049 tokens (earlier binary): default (2x1x40 not in the layout list) = exact cores
+  3.821 / 3.824 s; forced band `STRIX_GLM_PF_WMMA=1` 2.777 / 2.775 s (x1.377; layout 1 x1.37). 8,192 tokens not timed
+  on 2x1x40 (8,192-row admission needs about 113 GiB per rank; the node had 101 GiB).
+
+Detailed receipts (per-arm logs, tickets) remain outside Git.

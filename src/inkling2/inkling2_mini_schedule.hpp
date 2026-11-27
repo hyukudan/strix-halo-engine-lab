@@ -238,7 +238,7 @@ static_assert(kMiniCudaServePieces.piece_rows % kMiniCudaPieceRows == 0U &&
 // route, whose pieces cut at 16-row wave tiles above the key-split bound), the short ones on the HIP held-back route (its
 // 128-row chunk is already the piece). gfx1151 C8 (8 x 256 tokens, 8 slots, context 4096, the command line's route):
 // with 128-row pieces the prompts of the later lanes waited 22.6 s for their first token even with prompt share 0
-// (128-row pieces prefill at ~580 tok/s against ~2,000 tok/s for the whole chunk), ink_meas s3c.
+// (128-row pieces prefill at ~580 tok/s against ~2,000 tok/s for the whole chunk), receipt S3C.
 constexpr serve::MixedServicePieces mini_serve_pieces(bool hip, bool cli_route) noexcept {
     return !hip || cli_route ? serve::kMixedServiceLongPieces : serve::kMixedServiceShortPieces;
 }

@@ -143,7 +143,7 @@ inline constexpr std::string_view kTime2k = "qwen_night-tim-c1-2k8k 2,048: EXACT
 inline constexpr std::string_view kTime8k = "qwen_night-tim-c1-2k8k 8,192: EXACT-64 67.60 s, wide-512 12.93 s";
 inline constexpr std::string_view kTime24k = "qwen_night-tim-c2-24k(-exact) 24,576: EXACT-64 534.39 s, wide-512 45.43 s";
 inline constexpr std::string_view kTime32k =
-    "opt_q27b-c1-32k 32,768: EXACT-64 301.85 s (row-share 64), wide-512 62.35 s; 24,576: EXACT-64 197.56 s, default 42.67 s";
+    "q27-c1-32k 32,768: EXACT-64 301.85 s (row-share 64), wide-512 62.35 s; 24,576: EXACT-64 197.56 s, default 42.67 s";
 [[nodiscard]] inline constexpr sp::LadderRow band_row(std::string_view lever, std::string_view value, std::uint64_t lo,
                                                      std::uint64_t hi, double speedup, std::string_view receipt,
                                                      sp::BandEvidence evidence) {

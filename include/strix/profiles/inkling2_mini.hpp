@@ -250,7 +250,7 @@ inline constexpr std::array<profile::Lever, 19> kMiniLevers{{
      .source = "RTX receipts (cuda_pf2-kit): q44 served prefill == CLI prefill bitwise (first id, scores, KV, histories, "
                "4 decode steps; pieces) and lanes == lone; q45 server ids == CLI ids 8/8, C1 / C8 / gap / slot bytes equal "
                "to the held-back route; HIP: ink_fix2 t1 server ids == CLI 128/128; gfx1151 served EXACT prefill, 1 slot, "
-               "held-back -> this route (ink_meas s1/s2): 1K 582 -> 1,590, 8K 580 -> 2,203, 32K 543 -> 1,942, 58K 515 -> "
+               "held-back -> this route (served receipts S1/S2): 1K 582 -> 1,590, 8K 580 -> 2,203, 32K 543 -> 1,942, 58K 515 -> "
                "1,661 tok/s, ids equal at the five lengths",
      .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniScreenedHead, .env = "STRIX_INK_SCREENED_HEAD", .option = "",
@@ -310,7 +310,7 @@ inline constexpr std::array<profile::Lever, 19> kMiniLevers{{
 // the server alike) inside the band; no FAST prefill lever runs on that device, so the reference is the builtin arm.
 // Measured ends, CLI (prompts of 4,309 / 8,236 / 32,760 tokens) / served (the same texts, 4,307 / 8,234 / 32,758
 // tokens): 4K x1.1211 / x1.1171, 8K x1.0915 / x1.0944, 32K x1.0689 / x1.0861. A band takes the lower speedup of its
-// two ends, rounded down. Low band (ink_meas t6 / s7, iu4 alone against the TURBO default outside the band, i.e. the BF16
+// two ends, rounded down. Low band (receipts T6 / S7, iu4 alone against the TURBO default outside the band, i.e. the BF16
 // tile; CLI ABBA, served off / on with the command line's route): 1,143 tokens CLI x1.234 / x1.233, 1,148 tokens served
 // x1.239 / x1.238; its upper end is the 4K end above. Above 32,760 tokens the served 59,258-token end measured x1.002
 // (CLI 59,253 x1.080 / x1.086): no band there. Prompts below 1,143 or above 32,760 tokens are unmeasured and keep the tier
@@ -320,19 +320,29 @@ inline constexpr std::string_view kMiniIu4PrefillReceipt =
 inline constexpr std::string_view kMiniIu4PrefillLowReceipt =
     "grouped-iu4a4-rot-v1 prefill timing, gfx1151, CLI ABBA + served off/on, TURBO default vs iu4, prompts of 1,143 / "
     "1,148 tokens with the 4,307 / 4,309-token ends";
+// Gate of the iu4 TURBO rows; the dumps were not kept (gate re-score pending).
+inline constexpr std::string_view kMiniIu4Gate =
+    "Gate v2 prefill, 16 replayed prose windows, 1,008 scored rows; prompt lengths unspecified. "
+    "Gate re-score pending: the dumps of these 16 windows were not kept, so the current gate cannot re-run this "
+    "receipt; the iu4 prefill windows must be dumped again, including prompts of 1,143..4,306 tokens.";
+inline constexpr std::string_view kMiniIu4GateLow =
+    "Gate v2 prefill, 16 replayed prose windows, 1,008 scored rows; prompt lengths unspecified. "
+    "Gate re-score pending: the dumps of these 16 windows were not kept, so the current gate cannot re-run this "
+    "receipt; the iu4 prefill windows must be dumped again, including prompts of 1,143..4,306 tokens. The "
+    "1,143..4,306-token band reuses this gate: no window of that length is known to be in it.";
 inline constexpr std::array<profile::LadderRow, 3> kMiniLadder{{
     {.lever = kMiniMoeW4a4, .value = "iu4", .tier = profile::Name::turbo, .phase = profile::Phase::prefill,
      .device = "gfx1151", .min_context = 1143, .max_context = 4306, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1.117, .noise = 0.01, .receipt = kMiniIu4PrefillLowReceipt, .identity = "v1", .band_bound = true,
-     .band_evidence = {{1143, 1148, 4307, 4309}, {}, "Gate v2 prefill, 16 replayed prose windows, 1,008 scored rows; prompt lengths unspecified."}},
+     .band_evidence = {{1143, 1148, 4307, 4309}, {}, kMiniIu4GateLow}},
     {.lever = kMiniMoeW4a4, .value = "iu4", .tier = profile::Name::turbo, .phase = profile::Phase::prefill,
      .device = "gfx1151", .min_context = 4307, .max_context = 8236, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1.091, .noise = 0.01, .receipt = kMiniIu4PrefillReceipt, .identity = "v1", .band_bound = true,
-     .band_evidence = {{4307, 4309, 8234, 8236}, {}, "Gate v2 prefill, 16 replayed prose windows, 1,008 scored rows; prompt lengths unspecified."}},
+     .band_evidence = {{4307, 4309, 8234, 8236}, {}, kMiniIu4Gate}},
     {.lever = kMiniMoeW4a4, .value = "iu4", .tier = profile::Name::turbo, .phase = profile::Phase::prefill,
      .device = "gfx1151", .min_context = 8237, .max_context = 32760, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1.068, .noise = 0.01, .receipt = kMiniIu4PrefillReceipt, .identity = "v1", .band_bound = true,
-     .band_evidence = {{8234, 8236, 32758, 32760}, {}, "Gate v2 prefill, 16 replayed prose windows, 1,008 scored rows; prompt lengths unspecified."}},
+     .band_evidence = {{8234, 8236, 32758, 32760}, {}, kMiniIu4Gate}},
 }};
 
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.

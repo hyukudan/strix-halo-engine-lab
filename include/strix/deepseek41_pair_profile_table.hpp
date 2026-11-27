@@ -78,10 +78,18 @@ inline constexpr std::array<strix::profile::Lever, 14> profile_table{{
 
 inline constexpr std::string_view kFastGateD1 =
     "FAST gate v2 D1, complete D1 set without replay, pair, prompts <= 8,192 and 32,768: 28 windows, 1,764 rows, final PASS "
-    "(KL 0.0093, top-1 0.972, dNLL -0.0037 se 0.0035, route flips 1.05 x null)";
+    "(KL 0.0093, top-1 0.972, dNLL -0.0037 se 0.0035, route flips 1.05 x null). "
+    "Gate re-score pending: the current gate v2 re-run on the saved D1 / D1R dumps gives NO VERDICT (rule R3: 7 "
+    "of the 28 windows are greedy, every label equals the reference top-1; without them the 32K class has fewer "
+    "than 800 rows). The metrics are unchanged; non-greedy 32K windows must be dumped again on the GPU. The FAST "
+    "default stays until the owner decides.";
 inline constexpr std::string_view kFastGateD1R =
     "FAST gate v2 D1R, complete D1 set + decoder replay R=256, pair, prompts <= 8,192 and 32,768: 28 windows, 1,764 "
-    "rows, final PASS (KL 0.0101, top-1 0.972, dNLL +0.0001 se 0.0037, route flips 0.37 x null)";
+    "rows, final PASS (KL 0.0101, top-1 0.972, dNLL +0.0001 se 0.0037, route flips 0.37 x null). "
+    "Gate re-score pending: the current gate v2 re-run on the saved D1 / D1R dumps gives NO VERDICT (rule R3: 7 "
+    "of the 28 windows are greedy, every label equals the reference top-1; without them the 32K class has fewer "
+    "than 800 rows). The metrics are unchanged; non-greedy 32K windows must be dumped again on the GPU. The FAST "
+    "default stays until the owner decides.";
 inline constexpr strix::profile::FastGate fast_gates[] = {{"d1_prefill", "1", kFastGateD1},
                                                           {"decoder_replay", "256", kFastGateD1R}};
 

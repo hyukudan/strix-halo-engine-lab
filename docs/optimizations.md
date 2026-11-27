@@ -4937,7 +4937,7 @@ inherit it).
   execution still requires configuration agreement for an explicit arithmetic switch.
 - **Exactness evidence:** FAST identity (new FP32 summation order). FAST gate v2 with MoE route replay, pair, 5 windows
   of 8,192 tokens (prose, JSON, two 32K-document slices), 1,275 held-out rows: pooled KL 0.00018 (one-ulp null
-  0.00007), top-1 0.9969, dNLL -0.0013 (se 0.0009), free route-flip ratio 1.05; every window passes. Free-running
+  0.00007), top-1 0.9969, dNLL -0.0013 (se 0.0009), free route-flip ratio 1.05; every window passes. Gate re-score pending: the current gate v2 re-run with the free-running arms passes with route replay, fails the absolute bars free-running (KL 0.363, top-1 0.902; the exact arm's own free one-ulp null gives KL 0.367) and passes with --allow-null-floor. Which rule applies is a pending gate policy decision; the FAST default stays until the owner decides. Free-running
   (no replay) KL is not discriminating on GLM: the exact arm's own one-ulp null flips routes as much. The product
   route's head dump is bitwise equal to the gated arm. Synthetic: WMMA vs FP64 2.5-2.8e-7 rel-L2 (exact X3
   1.9-8.2e-7); every WMMA tiling bitwise equal (hip_glm_pf_wmma_tests). OFF equals the exact 8K logits anchors on both
@@ -5167,7 +5167,7 @@ The q_b epilogue applies the flash prologue's own RoPE (`rope_pair`, dims 448..5
 
 Startup exports the previous prefill route. Each request resolves the profile again with its own execution key (backend, device product, priced workload, row split, cone, head rows, window, lanes, MoE chunk). The two band rows of each lever bind to that run's own reference, so the D1 composition (BF16 flash attention, FP16 dense, relaxed MoE with FP16 down, FP16 Engram and shared expert) and, on top of it, the bounded decoder replay R=256 run only inside their measured bands. Both ranks exchange the request fingerprint; either rank declining keeps the previous route on both.
 
-- **Exactness evidence:** Bit-changing. FAST gate v2 D1: KL 0.0093, top-1 0.972, dNLL -0.0037 (se 0.0035), route flips 1.05 x null. D1R (with R=256): KL 0.0101, top-1 0.972, dNLL +0.0001 (se 0.0037), route flips 0.37 x null. Pair, 8K and 32K classes, 28 windows, 1,764 rows, final PASS. The bounded replay equals the full run with the key floor bit for bit; deferred serve pieces, snapshot points and group passes take the exact plan.
+- **Exactness evidence:** Bit-changing. FAST gate v2 D1: KL 0.0093, top-1 0.972, dNLL -0.0037 (se 0.0035), route flips 1.05 x null. D1R (with R=256): KL 0.0101, top-1 0.972, dNLL +0.0001 (se 0.0037), route flips 0.37 x null. Pair, 8K and 32K classes, 28 windows, 1,764 rows, final PASS. Gate re-score pending: the current gate v2 re-run on the saved D1 / D1R dumps gives NO VERDICT (rule R3: 7 of the 28 windows are greedy, every label equals the reference top-1; without them the 32K class has fewer than 800 rows). The metrics are unchanged; non-greedy 32K windows must be dumped again on the GPU. The FAST default stays until the owner decides. The bounded replay equals the full run with the key floor bit for bit; deferred serve pieces, snapshot points and group passes take the exact plan.
 - **Off switch:** `--profile exact`, or any explicit `STRIX_DS41_FAST_PREFILL` / `STRIX_DS41_DECODER_REPLAY` value.
 - **Measured gain:** Pair CLI, 8,192 tokens: EXACT 1,128.5, D1 1,614 / 1,647, D1 + R256 1,855 tok/s. 32,768 tokens: EXACT 1,257.2, D1 1,808.6, D1 + R256 1,981 tok/s. Measured before integration; the integrated build needs its device check.
 - **Served scope:** the HTTP server and `strix run` (the same binary) enter the same admission (`DevicePrefill::run_full_prompt`) for a fresh whole text prompt run as one piece, at any slot count (`served_full_prompt`), and resolve the CLI's cells: the idle group-pass storage of a multi-slot server is not a lane, a DSpark seed of at most R rows rides on R=256 (`plan_bounded_replay` computes the same rows for any seed <= R; without the replay the seed declines), and in FAST / TURBO `--prefill-rows auto` holds the band's 32,768 rows when they fit under the same memory rule (`whole_prompt_band`, `served_piece_rows`; the default pieces stay 16,384, EXACT is unchanged). Serving-only routes keep the previous route and the decline line names the condition: in-run prefix-cache capture (the default `--cache-profile agent`; the bounded replay cannot write mid-run states), continuations, image rows, phase-B units while another request decodes, and servers with a disk tier. The receipts are pair-CLI runs; timed points are 8,128 / 8,192 and 32,768 tokens, the lower band edges (4,096, 8,193) are covered by the gate classes but untimed.
@@ -6233,7 +6233,7 @@ decode, verify and one-row calls keep the BF16 tile. The CLI, the step-program l
 ## Inkling 2 Mini prompt prefill: rotated integer A4W4 experts (TURBO, HIP)
 
 **Engine:** `inkling2-mini` (HIP gfx1151). **Control:** TURBO cell `iu4` of lever `inkling2-mini-moe-w4a4@1`,
-`STRIX_INK_MOE_W4A4`. **Default:** on under `--profile turbo` for prompts of 4,307..32,760 tokens on gfx1151, in the
+`STRIX_INK_MOE_W4A4`. **Default:** on under `--profile turbo` for prompts of 1,143..32,760 tokens on gfx1151, in the
 CLI and in `strix-serve` (same resolver, same rows); off in every other profile and regime.
 
 Multi-row prompt-prefill chunks of every expert layer run the shared rotated integer class
@@ -6242,14 +6242,14 @@ built once at load (13.00 GB at Inkling 2 Mini shapes), tokens and the SwiGLU ou
 grouped GEMM runs the integer WMMA. Decode, one-row calls, other devices and prompt sizes outside the rows keep the
 BF16 tile; CUDA declines the class.
 
-- **Preconditions:** HIP gfx1151, `--profile turbo`, a prompt inside a ladder row (4,307..8,236 tokens x1.091;
+- **Preconditions:** HIP gfx1151, `--profile turbo`, a prompt inside a ladder row (1,143..4,306 tokens x1.117; 4,307..8,236 tokens x1.091;
   8,237..32,760 tokens x1.068). The route line `strix-ladder/v1 inkling2-mini-moe-w4a4@1 ...` names the row.
   The rows are band receipts bound to the run's own execution (backend, device product, prompt, context capacity,
   prefill chunk; one spelling for the CLI, the gate and the server): a run whose execution is not known, and the
   narrow-experts image (`STRIX_MOE_EXPERTS_NVFP4=1`), keep the BF16 tile.
 - **Quality (TURBO, declared):** gate v2, prefill regime, 16 held-out prose windows (1,008 rows, routes replayed),
   against the BF16 tile of the same engine: KL 0.0179, top-1 0.9296, dNLL +0.0035, free route-flip ratio 5.55. It
-  does not pass the FAST gate (top-1, windows, flip ratio), so it is a TURBO cell only.
+  does not pass the FAST gate (top-1, windows, flip ratio), so it is a TURBO cell only. Gate re-score pending: the dumps of these 16 windows were not kept, so the current gate cannot re-run this receipt; the iu4 prefill windows must be dumped again, including prompts of 1,143..4,306 tokens. The 1,143..4,306-token band reuses this gate: no window of that length is known to be in it.
 - **Off switch:** `STRIX_INK_MOE_W4A4=0`, or any profile other than `turbo`.
 - **Measured gain (TURBO over EXACT, prompt prefill, one gfx1151 node, kernel 7.4.0-rc1, default power, load below 3,
   one binary, medians):**
@@ -6549,7 +6549,7 @@ The CUDA server builds its decoder with the command line's decode form: every de
 
 - **Shared home:** include/strix/serve/decode_form.hpp (serve::resolve_decode_form); src/moe_core/microscaled_r1.hpp (packed one-row body, launch_rows).
 - **Tier and regime:** EXACT reference (the CLI's EXACT decode form; the served ids change from main's grouped bits); RTX PRO server, 8 slots, C1 and C8.
-- **Exactness evidence:** EXACT reference = the CLI's packed decode form. The served EXACT ids CHANGE against main's grouped server (q20 / q35: DIFFER); every lane equals its lone run at any width (q39 / q41 / q42: C8 lanes == C1 8/8, FAST == EXACT; CUDA fixture run_r1_rows: every launch_rows row == a one-row launch). CLI == server (fixed defect): the CUDA server runs the command line's route by default (served route row kMiniServedCliRoute, builtin 1; STRIX_INK_SERVED_CLI_ROUTE=0 = the former held-back route, where the last prompt token was the first decode row: q43 1/8 ids equal to the CLI). It prefills every prompt row on the CLI's calls and emits the first id from the final prefill row: q45 8/8 server ids == CLI ids (same rendering, reasoning_effort none) at the held-back route's speed (C1 102.1 vs 103.0 tok/s, C8 209.5-215.1 vs 213.0-213.3, gap 177-180 vs 177-179 ms, slot bytes equal); q44 fixture: served prefill == CLI prefill bitwise (first id, scores, KV, histories, 4 decode steps; pieces included). The served EXACT ids change from the held-back route's to the CLI's. A HIP server runs the route only with STRIX_INK_SERVED_CLI_ROUTE=1. Main's grouped server was not CLI == server either (q20).
+- **Exactness evidence:** EXACT reference = the CLI's packed decode form. The served EXACT ids CHANGE against main's grouped server (q20 / q35: DIFFER); every lane equals its lone run at any width (q39 / q41 / q42: C8 lanes == C1 8/8, FAST == EXACT; CUDA fixture run_r1_rows: every launch_rows row == a one-row launch). CLI == server (fixed defect): the CUDA server runs the command line's route by default (served route row kMiniServedCliRoute, builtin 1; STRIX_INK_SERVED_CLI_ROUTE=0 = the former held-back route, where the last prompt token was the first decode row: q43 1/8 ids equal to the CLI). It prefills every prompt row on the CLI's calls and emits the first id from the final prefill row: q45 8/8 server ids == CLI ids (same rendering, reasoning_effort none) at the held-back route's speed (C1 102.1 vs 103.0 tok/s, C8 209.5-215.1 vs 213.0-213.3, gap 177-180 vs 177-179 ms, slot bytes equal); q44 fixture: served prefill == CLI prefill bitwise (first id, scores, KV, histories, 4 decode steps; pieces included). The served EXACT ids change from the held-back route's to the CLI's. A HIP server runs the route only with STRIX_INK_SERVED_CLI_ROUTE=1. Main's grouped server was not CLI == server either (q20). HIP (gfx1151, C8, 8 prompts x 256 tokens, EXACT): the default served route's ids equal the command line route's (receipts S9 == EB8 == EB8z, 8/8); main's held-back cohort route with grouped decode (EA8) differs in 7 of 8 prompts, so the HIP served EXACT ids also change, to the CLI's.
 - **Off switch:** --grouped-decode.
 - **Measured gain:** RTX PRO 6000 server (cuda_pf2-kit, context 34816, 8 slots, EXACT): C1 decode 66.5 tok/s (main's grouped served form, q36) -> 100.2 tok/s (q42) / 100.7 tok/s (q43); C8 aggregate 166.8 tok/s (aa53a1a07, q27) -> 207.0 / 212.2 / 212.6 tok/s (q42, 3 reps). Command: cd wave4/turbo/cuda_pf2-kit && bash ticket.sh q42.
 - **Preconditions:** CUDA server; HIP server: only through the served route lever row (refuses the flags).
@@ -7179,7 +7179,7 @@ The exact decode attention walks the K/V prefix once per block for `pairs` (row,
 | Model | Binding |
 | --- | --- |
 | Qwen3.8 Flash-Next MoE | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
-| Qwen3.8 27B dense | bound: HIP decode, tensor-parallel and speculative apps (64-row EXACT prefill windows) |
+| Qwen3.8 27B dense | bound: HIP decode and speculative apps on one GPU (table kv 4; 64-row EXACT prefill windows); tensor-parallel ranks (kv 2 per rank) have no table and keep the main schedule: same bits, no gain |
 | DeepSeek V4.1 Flash | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
 | GLM 5.3 Flash | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
 | MiniMax M3.1 Flash | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
@@ -7211,3 +7211,55 @@ FAST and TURBO prefill a Qwen 27B prompt with the 512-row IU4 window inside the 
 | Inkling 2 Mini | not bound: model-specific gate rows |
 | Hy4 Flash | not bound: model-specific gate rows |
 | Nemotron 3.5 Bolt E4B | not bound: model-specific gate rows |
+
+<a id="minimax-serve-host-route-default"></a>
+
+## MiniMax serving: host pair route by default
+
+**Engine:** `minimax`. **Control:** strix-minimax-serve / rank --transport (default usb4-auto: the host pair route); --transport usb4gpu for GPU-direct. **Default:** host route (usb4-auto) for serving and ranks in every tier; GPU-direct only on an explicit --transport usb4gpu
+
+The MiniMax server was the only pair server whose default transport was GPU-direct (usb4gpu); DeepSeek and GLM serve on usb4-auto. Every MiniMax pair receipt ran on the host route.
+
+- **Shared home:** src/minimax/engine/mm_defaults.cpp (Cli::transport, parse_cli); src/minimax/serve/session_service.hpp
+- **Tier and regime:** EXACT, FAST, TURBO; pair serving and ranks
+- **Exactness evidence:** Transport only, same arithmetic: on the 2x1x40 USB4 layout (GPU-direct streams present) the host and direct routes give identical 8K served output (receipt M3D); on layout 1 (USB4 host 2x2x40) a usb4gpu request already fell back to the host route, so the effective route there does not change. Session cache: serve/usb4-auto/fixed-width-one-session-v1 is the only route qualified for the session cache, so with this default the server admits its session cache by default on layout 1 too (the former usb4gpu request fell back to the host route without admitting it); session_cache_gate.sh: cache ON == OFF.
+- **Off switch:** --transport usb4gpu (GPU-direct)
+- **Measured gain:** 8K served TTFT on the 2x1x40 layout (receipt M3D, three runs): GPU-direct 17.33 / 17.39 / 17.36 s, host route 12.24 / 11.60 / 12.01 s (-31 %); decode equal; outputs identical. The new binary without --transport: 12.33 / 11.71 / 12.79 s, transport usb4-host, outputs identical. Layout 1: unchanged (it already ran the host route).
+- **Preconditions:** MiniMax pair serving or ranks (world 2) over USB4. Measured layouts: usb4-host 2x2x40 (layout 1, every earlier MiniMax pair receipt) and 2x1x40 (two cables, one host stream each, GPU-direct present).
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: no MiniMax transport default |
+| Qwen3.8 27B dense | not bound: no MiniMax transport default |
+| DeepSeek V4.1 Flash | already usb4-auto by default (serving) |
+| GLM 5.3 Flash | already usb4-auto by default (serving) |
+| MiniMax M3.1 Flash | bound: serving and ranks default to the host route |
+| Inkling 2 Mini | not bound: no MiniMax transport default |
+| Hy4 Flash | not bound: no MiniMax transport default |
+| Nemotron 3.5 Bolt E4B | not bound: no MiniMax transport default |
+
+<a id="glm-pf-wmma-2x1x40"></a>
+
+## GLM FAST prefill band on the 2x1x40 USB4 host layout
+
+**Engine:** `glm`. **Control:** data row usb4-host-2x1x40 in kMeasuredPrefillLayouts (include/strix/glm_pair_profile_table.hpp); STRIX_GLM_PF_WMMA. **Default:** FAST / TURBO pair prompts inside the pf_wmma band (2,049..8,192 tokens) also run the bundle on the usb4-host-2x1x40 layout (two cables, one host stream each, 40 Gb/s, no direct); before, that layout declined to the exact cores. Layouts with GPU-direct streams or one cable keep the exact cores.
+
+The GLM FAST prefill band ([glm-pf-wmma-x](#glm-pf-wmma-x)) is admitted per measured link layout; the list is data. The 2x1x40 layout joins layout 1 with a lower-edge receipt.
+
+- **Shared home:** include/strix/glm_pair_profile_table.hpp (classify_link, kMeasuredPrefillLayouts)
+- **Tier and regime:** FAST, TURBO; pair prefill, 2,049..8,192 tokens
+- **Exactness evidence:** FAST: the pf_wmma bundle with the same bundle and exchange bits as its gated arm (gate and identity of glm-pf-wmma-x). Layout 1 is byte-identical to before: prefill_settings(layout 1) equals the former constants (glm_rank_defaults_common_cpu_tests). The 2x1x40 layout has its own execution key.
+- **Off switch:** STRIX_GLM_PF_WMMA=0 or --profile exact; a layout outside kMeasuredPrefillLayouts keeps the exact cores
+- **Measured gain:** Pair CLI ABAB at the 2,049-token lower edge on 2x1x40 (receipt G4B, earlier binary): exact cores 3.821 / 3.824 s, band 2.777 / 2.775 s (x1.377; layout 1: x1.37). The 8,192-token upper edge is not timed on 2x1x40 (its 8,192-row admission needs about 113 GiB per rank; that node had 101 GiB): the band's upper edges are timed on layout 1 only, and one host stream per cable may change the result at long prompts.
+- **Preconditions:** GLM pair (world 2), --profile fast or turbo, a layout listed in kMeasuredPrefillLayouts (usb4-host-2x2x40, usb4-host-2x1x40), a prompt inside the band; 2x1x40 timed at the lower edge only.
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: no GLM prefill layout list |
+| Qwen3.8 27B dense | not bound: no GLM prefill layout list |
+| DeepSeek V4.1 Flash | not bound: no GLM prefill layout list |
+| GLM 5.3 Flash | bound: layout data row in kMeasuredPrefillLayouts |
+| MiniMax M3.1 Flash | not bound: no GLM prefill layout list |
+| Inkling 2 Mini | not bound: no GLM prefill layout list |
+| Hy4 Flash | not bound: no GLM prefill layout list |
+| Nemotron 3.5 Bolt E4B | not bound: no GLM prefill layout list |
