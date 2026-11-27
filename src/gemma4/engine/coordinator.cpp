@@ -303,6 +303,8 @@ std::size_t Coordinator::submit_at(std::size_t slot, Request r, std::shared_ptr<
     const auto* environment = std::getenv("STRIX_G4_DFLASH");
     if (environment && std::string(environment) == "on" && r.dflash == DraftMode::automatic) r.dflash = DraftMode::on;
     require(!r.prompt.empty() && r.max_tokens > 0 && r.draft_k <= 7, "invalid prompt/max_tokens/draft_k");
+    require(!r.emission_hook || (r.sampling.temperature == 0 && r.dflash == DraftMode::off && !prefix),
+            "emission hook (quality capture) needs greedy plain decode: temperature 0, dflash off, no restored prefix");
     require(r.prompt.size() <= c.max_positions && r.max_tokens <= c.max_positions-r.prompt.size(), "request exceeds context capacity");
     for (const auto id : r.prompt) require(id < c.vocab, "prompt token outside vocabulary");
     if(prefix && prefix->purpose==PrefixSnapshot::Purpose::complete_turn)
@@ -907,7 +909,8 @@ bool Coordinator::advance(std::span<const LaneAdvance> lanes, bool subset) {
             const bool hidden = s.input_mode || demand(s) != HiddenDemand::none;
             // Logits leave the device only for sampled decode rows (greedy rows use
             // the backend's device winners), taps only for a drafter that reads them.
-            const bool logits = s.input_mode || (!w.prefill && (s.request.sampling.temperature != 0 || logits_digest_enabled())),
+            const bool logits = s.input_mode || (!w.prefill && (s.request.sampling.temperature != 0 || logits_digest_enabled() ||
+                                                                 s.request.emission_hook)),
                 taps = s.input_mode || (s.draft && s.draft->wants_taps());
             for (std::size_t r = 0; r < w.rows; ++r) {
                 const auto token = s.input_mode ? (w.prefill ? s.input[s.input_offset+r] : s.pending.value()) :
@@ -958,6 +961,17 @@ bool Coordinator::advance(std::span<const LaneAdvance> lanes, bool subset) {
                             selected.push_back(s.sampler->decide(logits,position,nullptr).token);
                             ++s.out.rng_draws;
                         } else selected.push_back(select_token(logits,s.request.sampling,s.out.rng_draws));
+                    }
+                    if (s.request.emission_hook) {
+                        // Quality capture: the hook sees this row's FP32 logits and its greedy winner and returns the
+                        // token to emit (the forced label, or the winner past the forced list).
+                        const auto logits = w.retained ? std::span<const float>(s.final_logits) :
+                            std::span<const float>(out.logits.data()+row*out.vocab,out.vocab);
+                        require(logits.size() == out.vocab, "emission hook needs the row's exported logits");
+                        const auto position = w.retained ? s.out.frontier-1 : plans[row].position;
+                        const auto emitted = s.request.emission_hook(s.out.ids.size()+r,position,selected.back(),logits);
+                        require(emitted < out.vocab, "emission hook token outside vocabulary");
+                        selected.back() = emitted;
                     }
                 }
                 verdict = dflash::verify_greedy({w.proposals.data(),w.k},selected,

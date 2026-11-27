@@ -156,6 +156,39 @@ int main() {
             std::as_bytes(std::span<const char>("0, \t\n", 5U)))), "forcing SHA-256 covers exact bytes");
         measured.finish();
     }
+    {
+        // Case list (STRIX_BITCALC_CASES): 2 or 3 fields, the same count on every line; explicit paths per case.
+        using strix::decode_cli::read_bitcalc_cases;
+        const auto list = (root / "cases.txt").string();
+        const auto write_list = [&](const char* text) { std::ofstream(list, std::ios::binary) << text; };
+        write_list("f0 o0 p0\n\n  f1\to1 p1  \n");
+        const auto cases = read_bitcalc_cases(list);
+        expect(cases.size() == 2U && cases[0].force == "f0" && cases[0].out == "o0" && cases[0].prompt == "p0" &&
+               cases[1].force == "f1" && cases[1].out == "o1" && cases[1].prompt == "p1", "case list: three fields, blank lines skipped");
+        write_list("f0 o0\nf1 o1\n");
+        const auto two = read_bitcalc_cases(list);
+        expect(two.size() == 2U && two[1].out == "o1" && two[1].prompt.empty(), "case list: two fields leave the prompt empty");
+        write_list("f0 o0 p0\nf1 o1\n");
+        rejects([&] { (void)read_bitcalc_cases(list); }, "case list: mixed field counts rejected");
+        write_list("f0\n");
+        rejects([&] { (void)read_bitcalc_cases(list); }, "case list: one field rejected");
+        write_list("\n\n");
+        rejects([&] { (void)read_bitcalc_cases(list); }, "case list: empty list rejected");
+        rejects([&] { (void)read_bitcalc_cases((root / "missing.txt").string()); }, "case list: missing file rejected");
+        const auto case_capture = (root / "case.bin").string();
+        {
+            BitcalcMeasurement explicit_case(case_capture.c_str(), nullptr);
+            expect(explicit_case.enabled(), "explicit case path enables capture without the environment");
+            explicit_case.prepare(4, 1, 1);
+            expect(explicit_case.hook()(0, 0, 1, values) == 1U, "explicit case without forcing emits greedy");
+            explicit_case.finish();
+        }
+        expect(std::filesystem::file_size(case_capture) == 24U + 4U * values.size(), "explicit case writes one record");
+        rejects([&] { BitcalcMeasurement bad("", nullptr); }, "explicit empty path rejected");
+        expect(!BitcalcMeasurement(nullptr, nullptr).enabled(), "explicit null paths leave capture off");
+        std::filesystem::remove(case_capture);
+        std::filesystem::remove(list);
+    }
     std::filesystem::remove(tokens);
     std::filesystem::remove(root);
     if (!failures) std::cout << "bitcalc measurement tests passed\n";

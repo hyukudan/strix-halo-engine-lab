@@ -7,7 +7,10 @@
 #include "capture_guard.hpp"
 #include "gemma4/exl3/device.hpp"
 #include "attention_fast_decode.hpp"
+#include "core/null_perturb.hpp"
+#include "strix/env_flags.hpp"
 #include <array>
+#include <cstdio>
 #include <atomic>
 #include <iostream>
 #include <algorithm>
@@ -22,6 +25,24 @@
 
 namespace strix::gemma4::gpu {
 namespace {
+// STRIX_DENSE_NULL=LAYER:POS:ELEM (gate v2 null control, test hook; shared grammar core/null_perturb.hpp): one FP16 ulp
+// on residual element ELEM of the row at absolute position POS at the input of layer 0 (the embedding row, which the
+// PLE projection and layer 0's input norm read). Layer 0 only: every later layer's input norm is fused into the
+// previous layer's epilogue (layer_norm_fusion), so no unfused residual read exists there. Unset = nullptr.
+const strix::core::NullSite* dense_null_site(unsigned layers, unsigned width) {
+    static const std::optional<strix::core::NullSite> site = [&]() -> std::optional<strix::core::NullSite> {
+        const char* v = strix::envcfg::text("STRIX_DENSE_NULL");
+        if (v == nullptr || *v == 0) return std::nullopt;
+        const auto n = strix::core::parse_null_site(v, layers, width, "STRIX_DENSE_NULL");
+        if (n.layer != 0U)
+            throw std::invalid_argument("STRIX_DENSE_NULL: gemma4 takes layer 0 only (later input norms are fused into the "
+                                        "previous layer's epilogue)");
+        std::fprintf(stderr, "gemma4: gate null control: one FP16 ulp at layer 0 pos %llu elem %u (STRIX_DENSE_NULL)\n",
+                     static_cast<unsigned long long>(n.pos), n.elem);
+        return n;
+    }();
+    return site ? &*site : nullptr;
+}
 bool enabled(const char* name) {
     const auto* p = std::getenv(name);
     return !p || std::string_view(p) != "0";
@@ -692,6 +713,11 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
         positions[i] = r->position;
         stride = std::max(stride, unsigned(r->position + 1));
     }
+    // Gate null row of this pass (STRIX_DENSE_NULL); its pass runs eagerly: no graph replay, no capture (host round trip).
+    int null_row = -1;
+    if (const auto* site = dense_null_site(c.layers, c.hidden))
+        for (unsigned i = 0; i < n; ++i)
+            if (positions[i] == site->pos) null_row = int(i);
     // Stable 64-position buckets alter storage/launch bounds only. Visible-key
     // iteration in every reduction still comes from the absolute row descriptor.
     stride = ((stride + attention_chunk - 1U) / attention_chunk) * attention_chunk;
@@ -771,14 +797,14 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
             hip_checked(hipEventRecord(b.start, b.queue));
         auto& counters = capture_guard_state();
         auto capture_begin = std::chrono::steady_clock::now();
-        if (b.options.graphs && cached != b.graphs.end()) {
+        if (b.options.graphs && null_row < 0 && cached != b.graphs.end()) {
             counters.target_replays.fetch_add(1);
             b.stats.pass_weight_bytes = cached->second.traffic;
             hip_checked(hipGraphLaunch(cached->second.executable, b.queue));
         } else {
             // No new capture while a prefill pass runs on another thread: this pass then runs the same
             // kernels with the same arguments eagerly (bitwise identical) and caches no graph.
-            if (b.options.graphs) {
+            if (b.options.graphs && null_row < 0) {
                 capture_slot.emplace();
                 if (!capture_slot->granted()) capture_slot.reset();
             }
@@ -793,6 +819,18 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
                 embedding(w.embedding, b.tokens.as<unsigned>(), n, b.residual.as<float>(), embedding_scale, b.queue);
                 b.finite(b.residual, std::size_t(n) * c.hidden);
             });
+            if (null_row >= 0) {
+                const auto* site = dense_null_site(c.layers, c.hidden);
+                float* at = b.residual.as<float>() + std::size_t(null_row) * c.hidden + site->elem;
+                std::uint32_t bits = 0;
+                hip_checked(hipMemcpyAsync(&bits, at, sizeof bits, hipMemcpyDeviceToHost, b.queue));
+                hip_checked(hipStreamSynchronize(b.queue));
+                bits = strix::core::fp16_ulp_up_bits(bits);
+                hip_checked(hipMemcpyAsync(at, &bits, sizeof bits, hipMemcpyHostToDevice, b.queue));
+                hip_checked(hipStreamSynchronize(b.queue));
+                std::fprintf(stderr, "gemma4: gate null control applied at pos %llu\n",
+                             static_cast<unsigned long long>(site->pos));
+            }
             b.dot("ple_model", w.ple_model, b.residual, b.ple, n);
             b.run("ple_combine", [&] {
                 ple_combine(b.ple.as<float>(), w.ple_table, w.ple_model_norm, b.tokens.as<unsigned>(), n, c.layers,
