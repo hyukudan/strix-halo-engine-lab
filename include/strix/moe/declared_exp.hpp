@@ -119,6 +119,36 @@ STRIX_DECL_MOE_HD inline float swiglu_clamped(float gate, float up, float limit)
     return (c.gate / (1.0F + declared_exp(-c.gate))) * c.up;
 }
 
+// tanh(x) from basic IEEE operations only (declared_exp, no fused operations, no library call), so that host and
+// device give the same bits. |x| < 0.25: odd Taylor series through x^13 in Horner form (truncation below 3e-10
+// relative); 0.25 <= |x| < 9.25: (1 - e) / (1 + e) with e = declared_exp(-2|x|) (1 - e >= 0.39: no cancellation);
+// beyond: +-1 (tanh(9.25) rounds to 1 in binary32). The sign is applied last; NaN propagates.
+STRIX_DECL_MOE_HD inline float declared_tanh(float x) {
+    if (!(x == x)) return x;
+    const float a = x < 0.0F ? -x : x;
+    float t = 1.0F;
+    if (a < 0.25F) {
+        const float a2 = a * a;
+        float p = 3.59212803e-3F;     // 21844 / 6081075
+        p = p * a2 + -8.86323552e-3F; // -1382 / 155925
+        p = p * a2 + 2.18694885e-2F;  // 62 / 2835
+        p = p * a2 + -5.39682540e-2F; // -17 / 315
+        p = p * a2 + 1.33333333e-1F;  // 2 / 15
+        p = p * a2 + -3.33333333e-1F; // -1 / 3
+        t = a + a * (a2 * p);
+    } else if (a < 9.25F) {
+        const float e = declared_exp(-2.0F * a);
+        t = (1.0F - e) / (1.0F + e);
+    }
+    return x < 0.0F ? -t : t;
+}
+
+// The declared exp / tanh as a Math trait of the shared GLU forms (moe::SoftcappedSwiglu, ops::glu): host and device
+// bind the same bits (the native traits bind the platform's libm, whose bits differ between libraries).
+struct DeclaredGluMath {
+    STRIX_DECL_MOE_HD static float exp(float x) { return declared_exp(x); }
+    STRIX_DECL_MOE_HD static float tanh(float x) { return declared_tanh(x); }
+};
 
 } // namespace strix::moe::declared_math
 #undef STRIX_DECL_MOE_HD

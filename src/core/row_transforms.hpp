@@ -3,6 +3,7 @@
 #include "core/pointwise.hpp"
 #include "ops/norm/norm_device.hpp"
 #include "strix/attn/cache_rows.hpp"
+#include "strix/numeric/declared.hpp"
 #include "strix/weight/formats/scalar_float.hpp"
 
 #include <cmath>
@@ -121,15 +122,25 @@ struct Bf16SigmoidProduct {
     __device__ void operator()(std::size_t i) const { output[i] = value(input, gate_logits, i); }
 };
 
+// The exp of a sigmoid gate: the device libm (default, the incumbent bits) or the declared exp (numeric::declared_exp,
+// the host reference's bits on every platform; core/bf16_reference.hpp sigmoid_product_reference declared_exp).
+struct NativeSigmoidExp {
+    __device__ static float exp(float x) { return expf(x); }
+};
+struct DeclaredSigmoidExp {
+    __device__ static float exp(float x) { return ::strix::numeric::declared_exp(x); }
+};
+
 // Bf16SigmoidProduct with the sigmoid itself rounded to BF16 before the product (core/bf16_reference.hpp
 // SigmoidGatePrecision::bf16_sigmoid): B(B(x) * B(sigmoid(B(gate)))).
+template <class Exp = NativeSigmoidExp>
 struct Bf16RoundedSigmoidProduct {
     const float* input;
     const float* gate_logits;
     float* output;
     __device__ void operator()(std::size_t i) const {
         const float gate = bf16_round(gate_logits[i]);
-        const float sigmoid = bf16_round(__fdiv_rn(1.0F, __fadd_rn(1.0F, expf(-gate))));
+        const float sigmoid = bf16_round(__fdiv_rn(1.0F, __fadd_rn(1.0F, Exp::exp(-gate))));
         output[i] = bf16_round(__fmul_rn(bf16_round(input[i]), sigmoid));
     }
 };

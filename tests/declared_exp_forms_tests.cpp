@@ -74,6 +74,33 @@ bool exp_accuracy() {
     return true;
 }
 
+// declared_tanh: within 4 ulps of tanh (binary64 oracle rounded to binary32) on a dense sweep, tiny magnitudes and
+// the branch borders; odd; +-1 saturation; NaN propagates. The shared GLU trait binds the same functions.
+std::uint32_t ulp_distance(float a, float b) {
+    const auto key = [](float v) {
+        const auto u = std::bit_cast<std::uint32_t>(v);
+        return (u & 0x80000000U) ? 0x80000000U - (u & 0x7fffffffU) : 0x80000000U + u;
+    };
+    const auto x = key(a), y = key(b);
+    return x > y ? x - y : y - x;
+}
+bool tanh_accuracy() {
+    using strix::moe::declared_math::declared_tanh;
+    const auto close = [](float x) {
+        const float oracle = static_cast<float>(std::tanh(static_cast<double>(x)));
+        return ulp_distance(declared_tanh(x), oracle) <= 4U && declared_tanh(-x) == -declared_tanh(x);
+    };
+    for (int i = -12 * 8192; i <= 12 * 8192; ++i)
+        if (!close(static_cast<float>(i) / 8192.0F)) return false;
+    for (int k = 2; k < 140; ++k)
+        if (!close(std::ldexp(1.0F, -k)) || !close(std::ldexp(1.5F, -k))) return false;
+    for (const float b : {0.25F, 9.25F})
+        if (!close(std::nextafter(b, 0.0F)) || !close(b) || !close(std::nextafter(b, 20.0F))) return false;
+    const strix::moe::SoftcappedSwiglu<strix::moe::declared_math::DeclaredGluMath> situ{7.0F, 7.0F};
+    return declared_tanh(30.0F) == 1.0F && declared_tanh(-30.0F) == -1.0F && std::isnan(declared_tanh(std::nanf(""))) &&
+           declared_tanh(0.0F) == 0.0F && std::isfinite(situ(1.5F, -2.0F));
+}
+
 bool distinct_square_forms() {
     // At the addition midpoint, the square's discarded low bit determines
     // whether the result rounds up if multiply and add are fused.
@@ -89,7 +116,7 @@ int main() {
     const volatile float lower = -103.9F;
     const bool frozen = std::isinf(declared_exp(upper)) && declared_exp(lower) == 0.0F &&
                         std::isinf(declared_exp<ExpForm::frozen_v1>(upper));
-    bool ok = frozen && exp_accuracy() && distinct_square_forms() && same_bits_all_rounding_modes();
+    bool ok = frozen && exp_accuracy() && tanh_accuracy() && distinct_square_forms() && same_bits_all_rounding_modes();
 #if defined(_M_X64) || defined(__SSE2__)
     const auto original = _mm_getcsr();
     _mm_setcsr(original | 0x8040U);  // Flush results and treat inputs as zero.

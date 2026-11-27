@@ -32,6 +32,7 @@ STRIX_NUMERIC_HD inline float declared_sqrt(float x) {
 #endif
 }
 
+STRIX_NUMERIC_HD inline float declared_tanh(float x) { return ::strix::moe::declared_math::declared_tanh(x); }
 STRIX_NUMERIC_HD inline float declared_sigmoid(float x) { return 1.0F / (1.0F + declared_exp(-x)); }
 STRIX_NUMERIC_HD inline float declared_rsqrt(float x) { return 1.0F / declared_sqrt(x); }
 // IEEE half to float (exact; NaN payloads kept). CUDA uses hardware conversion with payload restoration;
