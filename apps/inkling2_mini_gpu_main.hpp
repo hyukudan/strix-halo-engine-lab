@@ -173,8 +173,9 @@ public:
         return decoder_.max_verify_rows();
     }
 
-    // Explicitly binding both drafters puts the MTP sidecar (arm 0) and the block drafter under the shared selector.
-    // The block arm wins ties and has no minimum acceptance threshold for an initial probe.
+    // Both drafters bound: the incumbent MTP sidecar (arm 0, the fallback) and the block drafter under the shared
+    // per-regime selector. The block arm declares wins_ties from its device receipts (ink_df3: never slower than the
+    // sidecar on code / reasoning / prose, RTX and gfx1151) and needs no probe gate (its pass costs ~1 ms more).
     std::vector<ChainArm> chain_arms(std::uint32_t anchor, std::uint32_t position) override {
         if (!dflash_ || !drafter_) return {};
         drafter_->start(anchor, position);
@@ -509,15 +510,16 @@ int main(int argc, char** argv) {
         // --dspark file is never declined (its loader error stands).
         // The block-diffusion drafter first (--dflash DIR|off, else the registry's directory beside the checkpoint,
         // models/inkling2-mini.toml [speculation].block_drafter, validated against this target before anything is
-        // reserved for it; a directory it refuses is declined with its reason): when one binds, the MTP sidecar is not
-        // loaded. An explicit --dspark FILE / off excludes the registry's block drafter.
+        // reserved for it; a directory it refuses is declined with its reason). When both bind, both run under the
+        // shared per-regime selector (DeviceCliDecoder::chain_arms). An explicit --dspark FILE / off excludes the
+        // registry's block drafter; --dflash off keeps the MTP sidecar alone, --dflash DIR --dspark off the block alone.
         const bool may_draft = options.generation.speculation == serve::CliSpeculation::automatic &&
                                !options.gate_manifest && !options.generation.tokenize_file &&
                                !token_sampling_enabled(options.generation.sampling);
         const auto block_drafter = [&] {
             auto found = strix::spec::resolve_drafter_dir(
                 {.file = options.dflash ? std::string_view(options.dflash) : std::string_view{},
-                 .off = options.dflash_off || options.dspark_off || options.dspark != nullptr,
+                 .off = options.dflash_off || (options.dflash == nullptr && (options.dspark_off || options.dspark != nullptr)),
                  .speculating = may_draft},
                 argv[1], strix::model_data::inkling2_mini::speculation::block_drafter);
             if (found.source == strix::spec::DrafterSource::beside_model)
@@ -528,7 +530,7 @@ int main(int argc, char** argv) {
         const auto drafter = [&] {
             auto found = strix::spec::resolve_drafter_file(
                 {.file = options.dspark ? std::string_view(options.dspark) : std::string_view{},
-                 .off = options.dspark_off || block_drafter.enabled(),
+                 .off = options.dspark_off,
                  .speculating = may_draft},
                 argv[1], strix::model_data::inkling2_mini::speculation::drafter);
             if (found.source == strix::spec::DrafterSource::beside_model)
