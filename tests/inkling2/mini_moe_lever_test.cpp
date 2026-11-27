@@ -775,6 +775,24 @@ void test_screened_head_decision() {
     require(mini::mini_screened_pick(hip, true, MiniAppendKind::verify, true, false, false) &&
                 !mini::mini_screened_pick(hip, false, MiniAppendKind::verify, true, false, false),
             "HIP binding keeps its rule");
+    // The CUDA cohort pass (decode_cohort): every lane picks through the lanes form of the screened head only under the
+    // lever, with no lane reading its scores, the lanes within the plane's scratch and the BF16 head as the full head.
+    require(mini::mini_cohort_lanes_screened(false, true, lever, 8U, 8U, false) &&
+                mini::mini_cohort_lanes_screened(false, true, lever, 1U, 16U, false),
+            "cohort: unread lanes within the scratch pick screened");
+    require(!mini::mini_cohort_lanes_screened(true, true, lever, 8U, 8U, false),
+            "cohort: a lane that reads its scores keeps the full head for the pass");
+    require(!mini::mini_cohort_lanes_screened(false, true, lever, 9U, 8U, false) &&
+                !mini::mini_cohort_lanes_screened(false, true, lever, 0U, 8U, false),
+            "cohort: lanes beyond the plane's scratch (or none) keep the full head");
+    require(!mini::mini_cohort_lanes_screened(false, false, lever, 8U, 8U, false) &&
+                !mini::mini_cohort_lanes_screened(false, true, mini::MiniHeadReason::kv_slot, 8U, 8U, false) &&
+                !mini::mini_cohort_lanes_screened(false, true, hip, 8U, 8U, false) &&
+                !mini::mini_cohort_lanes_screened(false, true, lever, 8U, 8U, true),
+            "cohort: no plane, a released plane, HIP's binding or a compact head keep the full head");
+    require(mini::mini_screen_lanes(8U, 16U) == 16U && mini::mini_screen_lanes(8U, 4U) == 8U &&
+                mini::mini_screen_lanes(0U, 0U) == 1U,
+            "screen scratch serves a whole verify window and a whole cohort pass");
     const auto with = [](const char* value) {
         mini::MiniWeightOptions options;
         options.tier = inputs(profile::Name::standard);

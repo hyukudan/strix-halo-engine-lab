@@ -505,7 +505,7 @@ public:
             if (width != 0U) {
                 if (!draft_taps_.span().empty() && std::ranges::find(slots, 0U) != slots.end())
                     slot0_taps_stale_ = true;
-                decode_cohort(slots, ids, top, width);
+                decode_cohort(slots, ids, top, width, reads_scores);
                 return;
             }
         }
@@ -916,9 +916,17 @@ private:
     // same transaction runs the incumbent eager forward for the R lanes. Each lane's bits are those of its
     // eager row (lane stages: shared EXACT lane forms; row-wise stages: batch invariant).
     void decode_cohort(std::span<const unsigned> slots, std::span<const unsigned> ids, std::span<unsigned> top,
-                       std::uint32_t width) {
+                       std::uint32_t width, bool reads_scores) {
         const auto rows = static_cast<unsigned>(slots.size());
         pending_scores_ = {};  // the cohort rewrites hidden_ and every score row it describes (last_logit_rows_)
+        // A cohort whose scores nobody reads picks every lane through the lanes form of the EXACT screened head when the
+        // screened-head lever built its plane (cuda/core/head_screened.cuh: lane l is bitwise the R=1 head of its row, the
+        // incumbent full-head token and status): the plane is read once for the cohort instead of the full BF16 head
+        // (0.92 GB) once per lane. The score rows stay deferred (pending_scores_) and are projected from hidden_ only on a
+        // read (materialize_scores), as after the one-row screened pick. A compact head keeps its own full head.
+        const bool lanes_screened = mini_cohort_lanes_screened(
+            reads_scores, screen_.has_value(), head_.reason, rows, screen_ ? screen_->max_lanes() : 0U,
+            weights_.compact_head_bound() && backend_.lowbit_chunk());
         cohort_lanes_.clear();
         for (unsigned row = 0; row < rows; ++row)
             cohort_lanes_.push_back({slots[row], groups_[row].state->committed(), ids[row]});
@@ -955,6 +963,14 @@ private:
                 forward.run_batch(groups_, rows, embeddings_.span().first(eager_rows), hidden_.span().first(eager_rows),
                                   [&] { embed(ids, embeddings_.span().first(eager_rows), rows, kind_of(rows)); });
             }
+            if (lanes_screened) {
+                greedy_.enqueue_produced_rows(rows, [&](std::uint32_t* device_tokens) {
+                    return screen_->enqueue(hidden_.data(),
+                        ::strix::cuda::core::head_argmax::EmitIndexOrNone{device_tokens}, stream_.get(), rows,
+                        kHiddenWidth);
+                }, stream_.get());
+                return;
+            }
             for (unsigned row = 0; row < rows; ++row)
                 project_head(hidden_.data() + std::size_t{row} * kHiddenWidth,
                              logits.subspan(::strix::head::logit_row_offset(row, kLogitPitch), kOutputVocabulary), true);
@@ -962,6 +978,12 @@ private:
         }, [&] {
             for (std::size_t row = 0; row < top.size(); ++row) (void)checked_token(greedy_, row);
         });
+        if (lanes_screened) {
+            pending_scores_ = {hidden_.data(), rows, logits.data()};
+            if (lanes_picks_++ == 0U)
+                std::fprintf(stderr, "Inkling CUDA cohort head screened lanes=%u max_lanes=%u\n", rows,
+                             screen_->max_lanes());
+        }
         if (launched && had_graph) {
             ++(rows < width ? padded_cohort_replays_ : full_cohort_replays_);
             auto& reported = rows < width ? reported_padded_cohort_replays_ : reported_cohort_replays_;
@@ -1432,9 +1454,10 @@ private:
     bool build_screen() {
         if (weights_.compact()) return false;
         try {
-            // Scratch for a whole verify window (the lanes pick of append); the one-row pick uses lane 0.
+            // Scratch for a whole verify window (the lanes pick of append) and a whole cohort pass (decode_cohort, one
+            // row per slot); the one-row pick uses lane 0.
             screen_.emplace(weights_.bf16("unembed.weight").data(), kOutputVocabulary, kHiddenWidth, kLogitSoftcap,
-                            stream_.get(), 8U, std::max(1U, max_verify_rows()));
+                            stream_.get(), 8U, mini_screen_lanes(max_verify_rows(), decode_rows_));
         } catch (const std::exception& error) {
             screen_.reset();
             static_cast<void>(cudaGetLastError());

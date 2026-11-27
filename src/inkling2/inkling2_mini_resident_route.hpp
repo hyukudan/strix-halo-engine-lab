@@ -119,6 +119,22 @@ constexpr bool mini_screened_pick(MiniHeadReason reason, bool built, MiniAppendK
     return kind != MiniAppendKind::verify || reason == MiniHeadReason::hip_binding;
 }
 
+// Whether a CUDA cohort pass (one decode row per lane) picks every lane through the lanes form of the screened head:
+// the lever built the plane, no lane reads its scores (reads_scores: the cohort group contract), the lanes fit the
+// plane's lane scratch, and the head it replaces is the BF16 full head (a compact head keeps its own).
+constexpr bool mini_cohort_lanes_screened(bool reads_scores, bool built, MiniHeadReason reason, unsigned lanes,
+                                          unsigned max_lanes, bool compact_head) noexcept {
+    return !reads_scores && built && reason == MiniHeadReason::lever && lanes != 0U && lanes <= max_lanes &&
+           !compact_head;
+}
+
+// Lanes the CUDA screened head's scratch serves: a whole verify window (the lanes pick of append) and a whole cohort
+// pass (one row per decode slot).
+constexpr unsigned mini_screen_lanes(unsigned max_verify_rows, unsigned decode_rows) noexcept {
+    const unsigned lanes = max_verify_rows > decode_rows ? max_verify_rows : decode_rows;
+    return lanes == 0U ? 1U : lanes;
+}
+
 // The one prompt-row rule of an opted-in W4A4 expert class, shared by the CLI session and the served lanes: every
 // prefill-kind row runs the class whatever the chunk geometry, and decode / verify rows keep the BF16 tile. A one-row
 // prefill chunk therefore takes the grouped route (the packed one-row route has no W4A4 class).
