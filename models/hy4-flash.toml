@@ -39,6 +39,12 @@ expert_partition = "slots"
 expert_shares = [0.5, 0.5]
 draft_placement = "split"
 
+# The whole model also fits one node (the served one-node launch, speculation on): two such nodes serve independent
+# requests as replicas behind strix-router (--placement replica). No regime selects it, so a pair launch is unchanged.
+[multi_device.forms.replica]
+ranks = 2
+objective = "throughput"
+
 [multi_device.regimes.measured_decode]
 phase = "decode"
 min_tier = "fast"

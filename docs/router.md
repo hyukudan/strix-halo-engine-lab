@@ -21,6 +21,9 @@ With `--description models/<name>.toml` the router first resolves the model's `[
 same resolver as `strix run|serve --device-count N`: it starts only if the model admits the `replica` form for that many
 endpoints, and prints `effective-multi-device {...}` (form, ranks, wire, rule, reason). A model without the section,
 or with one endpoint, is refused with the reason. `--profile exact|fast|turbo` sets the tier of that check.
+Models whose whole engine fits one node declare the form: `inkling2-mini`, `qwen3.8-flash-next` and
+`nemotron-3.5-bolt-e4b` (single + replica), and `hy4-flash` beside its pair forms, where only `--placement replica`
+selects it.
 Policy admission resolves each endpoint, refuses overlapping addresses (including scope and port), and requires a
 distinct `worker_instance_id` from each worker's status route. The router keeps the socket address that reported
 the ID for each worker. A later status poll excludes entries that report duplicate or missing IDs. Older workers

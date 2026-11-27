@@ -371,21 +371,38 @@ void registered_models(const std::filesystem::path& root) {
         const auto* member = preset.config.find("multi_device");
         require(member && member->find("form") && member->find("form")->as_string() == "single",
                 entry.name + ": effective config states multi_device.form = single on one device");
-        if (entry.name == "inkling2-mini") {
+        if (entry.name == "hy4-flash") {
+            // The pair forms keep their regimes; the replica form sits beside them and is selected only explicitly.
+            require(p.forms.count(md::Form::replica) == 1 && p.forms.at(md::Form::replica).ranks == 2,
+                    "hy4-flash: declares two replicas");
+            for (auto phase : {md::Phase::prefill, md::Phase::decode}) {
+                auto selected = query(Name::standard, 2, phase, 4096, 1);
+                require(md::select(p, selected).form != md::Form::replica, "hy4-flash: a pair launch never picks replicas");
+                selected.placement = md::Form::replica;
+                require(md::select(p, selected).form == md::Form::replica, "hy4-flash: explicit replicas resolve");
+            }
+            require(strix::profile::resolve_replica_router(description, {}, 2, true).placement.form == md::Form::replica,
+                    "hy4-flash: the router admits explicit replicas");
+            refuses([&] { (void)strix::profile::resolve_replica_router(description, {}, 2); },
+                    "does not resolve the replica form for 2 replicas");
+        }
+        // Whole-model engines that fit one node and declare only single + replica.
+        if (entry.name == "inkling2-mini" || entry.name == "qwen3.8-flash-next" || entry.name == "nemotron-3.5-bolt-e4b") {
+            const std::string name = entry.name;
             // Two whole-model devices: explicit replicas for every tier and phase, with single as the default.
-            require(p.regimes.empty() && p.forms.size() == 2, "inkling2-mini: single + replica, no parked regime");
+            require(p.regimes.empty() && p.forms.size() == 2, name + ": single + replica, no parked regime");
             for (Name tier : {Name::standard, Name::fast, Name::turbo})
                 for (auto phase : {md::Phase::request, md::Phase::prefill, md::Phase::decode}) {
                     auto selected = query(tier, 2, phase, 32768, 1);
-                    require(md::select(p, selected).form == md::Form::single, "inkling2-mini: single is the default");
+                    require(md::select(p, selected).form == md::Form::single, name + ": single is the default");
                     selected.placement = md::Form::replica;
                     const auto d = md::select(p, selected);
                     require(d.form == md::Form::replica && d.ranks == 2 && d.wire == "reference",
-                            "inkling2-mini: two devices resolve replicas");
+                            name + ": two devices resolve replicas");
                 }
             const auto router = strix::profile::resolve_replica_router(description, {}, 2, true);
-            require(router.placement.form == md::Form::replica && router.requested == Name::standard,
-                    "inkling2-mini: the router admits explicit replicas at the default tier");
+            require(router.placement.form == md::Form::replica && router.requested == preset.requested,
+                    name + ": the router admits explicit replicas at the default tier");
             // One endpoint is not a replica set: the router refuses it, for every tier.
             for (Name tier : {Name::standard, Name::fast, Name::turbo})
                 refuses([&] { (void)strix::profile::resolve_replica_router(description, tier, 1); },
@@ -395,7 +412,7 @@ void registered_models(const std::filesystem::path& root) {
             two.devices = 2;
             two.placement = md::Form::replica;
             const auto standalone = strix::profile::resolve_model_preset(description, {}, "hip", two);
-            require(standalone.placement.form == md::Form::replica, "inkling2-mini: two devices report replicas");
+            require(standalone.placement.form == md::Form::replica, name + ": two devices report replicas");
             refuses([&] { md::admit(standalone.placement, md::Executor::engine); }, "runs behind strix-router");
         }
     }

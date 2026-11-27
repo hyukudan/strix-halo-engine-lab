@@ -83,6 +83,19 @@ levers = "fast"
 [presets.turbo]
 levers = "turbo"
 
+# Multi-device placement, resolved by the shared profile resolver (strix-serve --device-count N, strix-router
+# --description). The whole model fits one node, so two nodes serve independent requests as replicas behind
+# strix-router: each request runs on one node with the single-node identity. One device resolves single, as before.
+# The engine's layer pair stays an engine switch (legacy_env below) until its form is declared with a receipt.
+[multi_device]
+version = 1
+default = "single"
+fallback = "single"
+
+[multi_device.forms.replica]
+ranks = 2
+objective = "throughput"
+
 # Engine-read switches of this model that a [multi_device] key is planned to replace (listed in the effective
 # config when set; they still act inside the engine).
 [multi_device.legacy_env]
