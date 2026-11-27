@@ -63,7 +63,7 @@ std::string file_hash(const std::filesystem::path& path) { const MappedFile f(pa
 // the file; --prompt with --tokenizer: its tokenization). The decode attention format is a process property read when
 // the device backend is built, so a TURBO band row can only decide here, once per process. Unknown length, a chat /
 // fixture / deploy run, a non-device backend or an unknown device product: no regime (the startup resolution stands).
-struct DecodeRegime { std::uint64_t prompt_tokens = 0; std::string execution; };
+}  // namespace
 // The regime of one decode run on this device: the single place the CLI (one prompt) and the server (one request,
 // per admission) spell it, so both resolve the same band rows. Decode does not chunk: the chunk spells one row per
 // step. The capacity is the prompt plus the generation. No regime off gfx1151 or without a device backend.
@@ -78,6 +78,7 @@ std::optional<DecodeRegime> device_decode_regime([[maybe_unused]] std::uint64_t 
     return std::nullopt;
 #endif
 }
+namespace {
 std::optional<DecodeRegime> decode_regime(const Options& o) {
     if (o.backend != "device" || o.deploy_check || !o.chat.empty() || !o.fixtures.empty() || (o.ids.empty() == o.prompt.empty()))
         return std::nullopt;
@@ -94,19 +95,21 @@ std::optional<DecodeRegime> decode_regime(const Options& o) {
     if (!tokens) return std::nullopt;
     return device_decode_regime(tokens,o.request.max_tokens,o.streams);
 }
+}  // namespace
 // Server: the lever resolved once per request admission (Coordinator -> StreamState::bind_request) with the regime
 // of that request, by the same profile::resolve call and the same regime the one-prompt CLI uses. Empty unless the
 // startup resolution would have selected the bands: TURBO on the device backend with decode_attention neither set
 // nor switched off explicitly (its startup value is then the builtin: no regime was known).
-DecodeAttentionBands server_decode_bands(const Options& o) {
+DecodeAttentionBands server_decode_bands(const Options& o, DecodeRegimeProvider regime_of) {
     if (o.profile.name != profile::Name::turbo || o.backend != "device") return {};
     const auto* entry = o.profile.find("decode_attention");
     if (!entry || entry->status == profile::Status::explicit_env || entry->status == profile::Status::explicit_cli ||
         entry->status == profile::Status::off || entry->value != entry->lever->builtin)
         return {};
-    return [name = o.profile.name, app = o.profile.app, inputs = o.profile_inputs](
+    return [name = o.profile.name, app = o.profile.app, inputs = o.profile_inputs, regime_of = std::move(regime_of)](
                std::uint32_t prompt, std::uint32_t admitted, std::uint32_t lanes) -> std::int32_t {
-        const auto regime = device_decode_regime(prompt, admitted > prompt ? admitted - prompt : 0, lanes);
+        // admitted = prompt + max_tokens (Coordinator): the generation the CLI passes as its request's max_tokens.
+        const auto regime = regime_of(prompt, admitted > prompt ? admitted - prompt : 0, lanes);
         if (!regime) return 0;
         auto request = inputs;
         // The startup resolution exported its own decode_attention value (exact) into the environment: not an explicit
@@ -119,7 +122,6 @@ DecodeAttentionBands server_decode_bands(const Options& o) {
         const auto* chosen = resolved.find("decode_attention");
         return chosen && chosen->value == profile::dattn_form_value ? 2 : 0;
     };
-}
 }
 Options parse_options(int argc, char** argv) {
     Options o;

@@ -33,6 +33,15 @@ struct Options {
     bool inspect = false, help = false;
 };
 Options parse_options(int argc, char** argv);
+// The decode regime of one decode run on this device (prompt length and the ladder execution word): the single place
+// the one-prompt CLI and the server spell it. No regime off gfx1151 or without a device backend.
+struct DecodeRegime { std::uint64_t prompt_tokens = 0; std::string execution; };
+using DecodeRegimeProvider =
+    std::function<std::optional<DecodeRegime>(std::uint64_t tokens, std::uint64_t max_tokens, std::uint32_t lanes)>;
+std::optional<DecodeRegime> device_decode_regime(std::uint64_t tokens, std::uint64_t max_tokens, std::uint32_t lanes);
+// Server: the per-request decode attention resolver (empty unless TURBO on the device backend with the lever not set
+// explicitly). `regime_of` is the device regime; host tests inject their own.
+DecodeAttentionBands server_decode_bands(const Options& o, DecodeRegimeProvider regime_of = device_decode_regime);
 std::string read_text(const std::filesystem::path& path);
 class Runtime {
 public:
