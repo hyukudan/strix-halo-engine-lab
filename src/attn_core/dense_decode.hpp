@@ -146,13 +146,22 @@ __device__ __forceinline__ float acc_step(float acc, float corr, float w, float 
     return acc * corr + w * v;
 }
 
+// Key list of the main schedule (`Keys` trait): which rows of the K/V row array a query at position t walks and in which
+// logical order (the wave of logical key k is k % waves). last(t) is the inclusive last logical key, slot(t, k) the row of
+// logical key k. LinearKeys is the incumbent (rows 0..t, slot == k): the kernels' machine code is what it was without the
+// trait. attn_core/window_pool_keys.hpp is the sliding window + pooled rows list (host contract in the same header).
+struct LinearKeys {
+    __device__ __forceinline__ unsigned last(unsigned t) const { return t; }
+    __device__ __forceinline__ unsigned slot(unsigned, unsigned k) const { return k; }
+};
+
 // The main schedule (main's kernel; per-position arithmetic in online_step / acc_step): grid (rows, heads), block =
 // 32 * waves threads, one block walks the K/V prefix for one (row, q head). It is the off switch, the form for devices
 // and heads shapes without a measured table and the table's (1, 1) choice. ctx [row][head][Dim].
-template <unsigned Dim, bool Sink = false, class Math = ExpfMath>
+template <unsigned Dim, bool Sink = false, class Math = ExpfMath, class Keys = LinearKeys>
 __global__ void __launch_bounds__(32U * waves) attend_main_kernel(Params p, const float* q_n, const float* q_in,
                                                              const std::uint16_t* k_cache, const std::uint16_t* v_cache,
-                                                             float* ctx, const float* sinks = nullptr) {
+                                                             float* ctx, const float* sinks = nullptr, Keys keys = Keys()) {
 #pragma clang fp contract(off)  // the merge below is main's text; see online_step
     constexpr unsigned per_lane = Dim / 32U;
     static_assert(per_lane % 8U == 0U);
@@ -165,7 +174,9 @@ __global__ void __launch_bounds__(32U * waves) attend_main_kernel(Params p, cons
     for (unsigned e = 0; e < per_lane; ++e)
         q[e] = q_n[(std::size_t(row) * p.heads + head) * Dim + lane * per_lane + e];
     float m = -INFINITY, l = 0.0F, acc[per_lane] = {};
-    for (unsigned pos = wave; pos <= last; pos += waves) {
+    const unsigned top_key = keys.last(last);
+    for (unsigned key = wave; key <= top_key; key += waves) {
+        const unsigned pos = keys.slot(last, key);
         const std::size_t at = (std::size_t(pos) * p.kv_heads + kh) * Dim + lane * per_lane;
         float s = 0.0F;
         for (unsigned e = 0; e < per_lane; ++e)
@@ -379,6 +390,32 @@ inline void attend_sink(const Params& p, const float* q_scratch, const float* q_
                         const std::uint16_t* v_cache, float* ctx, const float* sinks, hipStream_t stream) {
     attend_main_kernel<Dim, true, Math><<<dim3(p.rows, p.heads), dim3(32U * waves), 0, stream>>>(p, q_scratch, q_in, k_cache,
                                                                                          v_cache, ctx, sinks);
+}
+// The same with a key list (`Keys` trait above; rows past a position's list are never read, p.pos0 + row = the position).
+template <unsigned Dim, class Math, class Keys>
+inline void attend_sink_keys(const Params& p, const float* q_scratch, const float* q_in, const std::uint16_t* k_cache,
+                             const std::uint16_t* v_cache, float* ctx, const float* sinks, const Keys& keys,
+                             hipStream_t stream) {
+    attend_main_kernel<Dim, true, Math, Keys><<<dim3(p.rows, p.heads), dim3(32U * waves), 0, stream>>>(
+        p, q_scratch, q_in, k_cache, v_cache, ctx, sinks, keys);
+}
+
+// A per-row selected position list as a `Keys` list: Sel has bound(row) = the last slot (inclusive) and at(row, slot) = the
+// position; the row is the query position minus p.pos0.
+template <class Sel>
+struct RowListKeys {
+    Sel sel;
+    unsigned pos0;
+    __device__ __forceinline__ unsigned last(unsigned t) const { return sel.bound(t - pos0); }
+    __device__ __forceinline__ unsigned slot(unsigned t, unsigned k) const { return sel.at(t - pos0, k); }
+};
+
+// The same with a selected position list per row (the `Keys` trait through RowListKeys); `sel` is passed by value.
+template <unsigned Dim, class Math, class Sel>
+inline void attend_sink_selected(const Params& p, const float* q_scratch, const float* q_in, const std::uint16_t* k_cache,
+                                 const std::uint16_t* v_cache, float* ctx, const float* sinks, Sel sel, hipStream_t stream) {
+    attend_main_kernel<Dim, true, Math, RowListKeys<Sel>><<<dim3(p.rows, p.heads), dim3(32U * waves), 0, stream>>>(
+        p, q_scratch, q_in, k_cache, v_cache, ctx, sinks, RowListKeys<Sel>{sel, p.pos0});
 }
 
 template <unsigned Dim>

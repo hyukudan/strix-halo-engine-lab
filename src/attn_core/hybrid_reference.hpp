@@ -11,16 +11,19 @@
 namespace strix::attn_core {
 
 // A complete non-overlapping group, with the last projected row supplied
-// separately so callers can commit carry only after attention succeeds.
+// separately so callers can commit carry only after attention succeeds. The declared order replaces the library
+// exponential by numeric::declared_exp, the one definition of the device pool (attn_core/compressor_pool.hpp); the
+// remaining statements (max, ascending sum, quotient, ascending weighted sum) are the same in both orders.
 template<unsigned Ratio>
 void projected_ape_pool_reference(std::span<const float> values, std::span<const float> logits,
     std::span<const float> last_value, std::span<const float> last_logit, std::span<const float> ape,
-    std::span<float> pooled) {
+    std::span<float> pooled, attn::ReferenceOrder order = attn::ReferenceOrder::sequential) {
     const auto dim = pooled.size();
     if (dim == 0 || values.size() != (Ratio - 1U) * dim || logits.size() != values.size() ||
         last_value.size() != dim || last_logit.size() != dim || ape.size() != Ratio * dim)
         throw std::invalid_argument("gated APE: invalid projected group");
-    const auto exp = [](float value) { return std::exp(value); };
+    const bool declared = order == attn::ReferenceOrder::declared;
+    const auto exp = [declared](float value) { return declared ? numeric::declared_exp(value) : std::exp(value); };
     for (std::size_t i = 0; i < dim; ++i) {
         float channel_logits[Ratio], channel_values[Ratio];
         for (std::size_t row = 0; row < Ratio - 1U; ++row) {

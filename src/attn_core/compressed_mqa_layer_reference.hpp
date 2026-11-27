@@ -71,7 +71,7 @@ std::vector<float> compressed_mqa_layer_reference(const Weights& w, const Compre
     if (keep_compressor && carry_row == Ratio - 1U) {
         pooled.resize(width);
         projected_ape_pool_reference<Ratio>(state.carry_values, state.carry_logits, carry_value, carry_logit,
-            w.tensor(r.compressor_ape, std::size_t{Ratio} * width), pooled);
+            w.tensor(r.compressor_ape, std::size_t{Ratio} * width), pooled, s.order);
         order_rms_norm_bf16_reference(s.order, pooled, w.tensor(r.compressor_norm, width), s.eps);
         rotary(s.rope_dim, position + 1U - Ratio, true).apply(pooled, width);
         if (bf16) core::round_bf16_reference(pooled);
