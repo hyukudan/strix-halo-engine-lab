@@ -2247,8 +2247,7 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
         else if(tune==82U)resources.template operator()<82U>();
         else resources.template operator()<88U>(); // BF16 admission above fixes the tune set.
         if(strix::moe_route_organizations(true,prefill_tiers()!=0,prefill_down_lds()).declined) {
-            static const bool declined=[]{std::fprintf(stderr,"MoE route i8: tier split / down LDS epilogue declined (they store BF16 route words)
-");return true;}();
+            static const bool declined=[]{std::fprintf(stderr,"MoE route i8: tier split / down LDS epilogue declined (they store BF16 route words)\n");return true;}();
             (void)declined;
         }
         static const bool witness=[]{std::fprintf(stderr,"MoE FAST lever route i8: ON (bit-changing; STRIX_PREFILL_MOE_ROUTE_I8=0 restores route bf16)\n");return true;}();
