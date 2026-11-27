@@ -1454,7 +1454,7 @@ struct ApiService::Impl {
             const auto tokens = ticket->wait(std::chrono::milliseconds(200), done, !ticket->cancelled());
             family_deltas();
             for (const auto id : tokens) {
-                if (out.family) continue;
+                if (out.family) { out.token_ids.push_back(id); continue; }  // the family presents the text; the IDs stay the shared answer
                 if (config.timed_completion_envelope && !(spec && spec->logprobs)) {
                     out.token_ids.push_back(id);
                     if ((on_text || on_delta) && !is_stop_token(id) && !stopped) {
