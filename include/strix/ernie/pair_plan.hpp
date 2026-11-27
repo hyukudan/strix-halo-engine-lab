@@ -3,7 +3,8 @@
 #include "strix/device/topology.hpp"
 #include "strix/dist/transport.hpp"
 #include "strix/ernie/inventory.hpp"
-#include "strix/pair/layer_pipeline.hpp"
+#include "strix/pair/first_token.hpp"
+#include "strix/pair/rank_memory.hpp"
 
 #include <array>
 #include <optional>
@@ -37,11 +38,7 @@ struct PairTensor {
     std::uint64_t resident_offset{};
 };
 
-struct PairMemory {
-    std::uint64_t usable{}, weight_payload{}, weight_resident{}, kv_payload{}, kv_resident{}, carry{};
-    std::uint64_t logits{}, exchange{}, load_staging{}, scratch{}, reserve{}, required{};
-    [[nodiscard]] bool admitted() const noexcept { return usable > 0 && required <= usable; }
-};
+using PairMemory = pair::RankMemory;
 
 struct PairRank {
     pair::layers::Placement placement;
@@ -90,12 +87,7 @@ using PairWeightWrite = std::function<void(std::uint64_t resident_offset, std::s
 // chunk synchronously and publishes the new resident image only after success.
 void stream_pair_weights(const PairRank& rank, std::span<std::byte> staging, const PairWeightWrite& write);
 
-struct PairFirstTokenOps {
-    decltype(pair::layers::StageOps::range) forward;
-    decltype(pair::layers::StageOps::seam) seam;
-    std::function<void()> fence;
-    std::function<std::uint32_t()> top;
-};
+using PairFirstTokenOps = pair::layers::FirstTokenOps;
 
 // Host coordination for the first-token run. The rank's native hooks own KV
 // and execute only [first,last). Both ranks verify the same assets, geometry,

@@ -2,8 +2,8 @@
 
 #include "strix/deploy/binding.hpp"
 #include "strix/dist/transport_spec.hpp"
-#include "strix/pair/handshake.hpp"
-#include "strix/weight/levers.hpp"
+#include "strix/pair/first_token.hpp"
+#include "strix/pair/rank_image.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -24,9 +24,6 @@ constexpr auto kMlaRope = model::narrow<std::uint64_t>(data::attention::mla::qk_
 constexpr auto kIndexWidth = model::narrow<std::uint64_t>(data::attention::indexer::index_head_dim);
 constexpr auto kKvBlock = model::narrow<std::uint64_t>(data::weights::checkpoint::weight_block_size[1]);
 constexpr std::uint32_t kPairProtocol = 1;
-constexpr std::array<std::string_view, 7> kHelloFields{
-    "layer cut", "layer count", "activation row bytes", "context", "prefill width", "numeric or prompt identity",
-    "prompt length"};
 constexpr auto kIndexBlock = model::narrow<std::uint64_t>(data::weights::checkpoint::expert_block_columns);
 
 // Candidate compact layouts: FP8 KV + F32 scales; split MLA rotary FP8 and
@@ -36,7 +33,6 @@ constexpr auto kHcaEntry = kHcaWidth + (kHcaWidth / kKvBlock) * sizeof(float);
 constexpr auto kMlaEntry = kMlaRank + (kMlaRank / kKvBlock) * sizeof(float) + kMlaRope +
                            kIndexWidth / 2U + kIndexWidth / kIndexBlock;
 
-using deploy::aligned;
 using deploy::checked_add;
 
 PairLayer describe_layer(std::uint32_t layer, std::uint32_t context) {
@@ -63,18 +59,15 @@ PairLayer describe_layer(std::uint32_t layer, std::uint32_t context) {
 PairPlan build_pair_plan(const Inventory& inventory, const device::Topology& topology,
                           const PairLimits& limits, std::string transport,
                           std::optional<std::uint32_t> local_rank) {
-    const auto owns = [&](std::uint32_t rank) { return !local_rank || *local_rank == rank; };
+    const auto owns = [&](std::uint32_t rank) { return pair::covers_rank(local_rank, rank); };
     if (!inventory.has_manifest ||
         (!local_rank && (!inventory.missing_shards.empty() || inventory.missing_known_tensors != 0)))
         throw std::invalid_argument("ERNIE pair: a complete validated checkpoint inventory is required");
     if (local_rank) {
         // Range admission: a rank copy may omit shards that hold only the peer's tensors.
-        if (*local_rank > 1U || inventory.missing_known.size() != inventory.missing_known_tensors)
-            throw std::invalid_argument("ERNIE pair: rank scope needs rank 0 or 1 and the missing tensor names");
-        for (const auto& name : inventory.missing_known)
-            if (const auto owner = pair_owner(name); owner && *owner == *local_rank)
-                throw std::invalid_argument("ERNIE pair: rank " + std::to_string(*local_rank) +
-                                            " copy lacks its tensor " + name);
+        if (inventory.missing_known.size() != inventory.missing_known_tensors)
+            throw std::invalid_argument("ERNIE pair: rank scope needs the missing tensor names");
+        pair::check_rank_scope(*local_rank, inventory.missing_known, pair_owner);
     }
     if (topology.nodes.size() != 2 || topology.nodes[0].rank != 0 || topology.nodes[1].rank != 1 ||
         !std::ranges::any_of(topology.links, [](const auto& link) { return link.a == 0 && link.b == 1; }))
@@ -126,37 +119,28 @@ PairPlan build_pair_plan(const Inventory& inventory, const device::Topology& top
         auto& out = plan.ranks[rank];
         out.placement = {{0U, kPairCut, kLayerCount}, rank};
         out.placement.check();
-        // Compute the packed destination offsets in the source read order.
-        std::ranges::sort(out.tensors, {}, [](const PairTensor& item) {
-            return std::tie(item.shard, item.source.range.offset, item.name);
-        });
+        const auto image = pair::pack_rank_image(out.tensors, limits.alignment);
         auto& memory = out.memory;
-        std::uint64_t largest_tensor = 0;
         memory.usable = topology.nodes[rank].memory_bytes;
-        for (auto& item : out.tensors) {
-            item.resident_offset = aligned(memory.weight_resident, limits.alignment);
-            memory.weight_resident = checked_add(item.resident_offset, item.source.range.bytes);
-            memory.weight_payload = checked_add(memory.weight_payload, item.source.range.bytes);
-            largest_tensor = std::max(largest_tensor, item.source.range.bytes);
-        }
-        memory.weight_resident = aligned(memory.weight_resident, limits.alignment);
+        memory.weight_payload = image.payload;
+        memory.weight_resident = image.resident;
+        std::vector<pair::LayerState> state;
         for (auto layer = out.placement.first(); layer < out.placement.last(); ++layer) {
             const auto descriptor = describe_layer(layer, limits.context);
-            memory.kv_payload = checked_add(memory.kv_payload, descriptor.kv_bytes);
-            memory.kv_resident = checked_add(memory.kv_resident, aligned(descriptor.kv_bytes, limits.alignment));
-            memory.carry = checked_add(memory.carry, aligned(descriptor.carry_bytes, limits.alignment));
+            state.push_back({descriptor.kv_bytes, descriptor.carry_bytes});
             out.layers.push_back(descriptor);
         }
-        memory.logits = out.placement.head() ? aligned(kPairLogitsBytes, limits.alignment) : 0U;
-        // Two seam slots plus the runner's in/out activation buffer.
-        const auto seam_slot = aligned(kPairRowBytes * limits.prefill_rows, limits.alignment);
-        memory.exchange = checked_add(checked_add(seam_slot, seam_slot), seam_slot);
-        memory.load_staging = aligned(std::min(limits.load_chunk_bytes, largest_tensor), limits.alignment);
-        memory.scratch = aligned(limits.scratch[rank], limits.alignment);
-        memory.reserve = aligned(limits.reserve[rank], limits.alignment);
-        for (const auto bytes : {memory.weight_resident, memory.kv_resident, memory.carry, memory.logits,
-                                 memory.exchange, memory.load_staging, memory.scratch, memory.reserve})
-            memory.required = checked_add(memory.required, bytes);
+        pair::RankTerms terms;
+        terms.alignment = limits.alignment;
+        terms.load_chunk_bytes = limits.load_chunk_bytes;
+        terms.largest_tensor = image.largest;
+        terms.row_bytes = kPairRowBytes;
+        terms.rows = limits.prefill_rows;
+        terms.logits_bytes = out.placement.head() ? kPairLogitsBytes : 0U;
+        terms.scratch = limits.scratch[rank];
+        terms.reserve = limits.reserve[rank];
+        terms.layers = state;
+        pair::account_rank_memory(memory, terms);
     }
     return plan;
 }
@@ -181,86 +165,28 @@ PairPlan make_pair_plan(const Inventory& inventory, const device::Topology& topo
 
 void stream_pair_weights(const PairRank& rank, std::span<std::byte> staging, const PairWeightWrite& write) {
     if (!rank.memory.admitted()) throw std::invalid_argument("ERNIE pair: rank exceeds usable memory");
-    if (staging.empty() || staging.size() > rank.memory.load_staging || !write)
-        throw std::invalid_argument("ERNIE pair: invalid weight staging or writer");
-    for (const auto& tensor : rank.tensors) {
-        for (std::uint64_t offset = 0; offset < tensor.source.range.bytes;) {
-            const auto count = std::min<std::uint64_t>(staging.size(), tensor.source.range.bytes - offset);
-            const auto chunk = staging.first(static_cast<std::size_t>(count));
-            weight::Slice slice;
-            if (const auto status = weight::subslice(tensor.source, {offset, count}, slice); !status)
-                throw std::runtime_error(tensor.name + ": " + status.detail);
-            if (const auto status = weight::read_slice(slice, chunk); !status)
-                throw std::runtime_error(tensor.name + ": " + status.detail);
-            write(tensor.resident_offset + offset, chunk);
-            offset += count;
-        }
-    }
+    if (staging.size() > rank.memory.load_staging)
+        throw std::invalid_argument("ERNIE pair: weight staging exceeds the admitted chunk");
+    pair::stream_rank_image(std::span<const PairTensor>(rank.tensors), staging, write);
 }
 
 std::uint32_t run_pair_first_token(const PairPlan& plan, std::uint32_t rank,
     std::span<const std::uint32_t> prompt, std::string_view asset_sha256,
     std::string_view numeric_identity, dist::Transport& link, const PairFirstTokenOps& ops) {
-    try {
-        if (!plan.admitted() || rank >= plan.ranks.size() || (plan.local && *plan.local != rank) ||
-            !link.supports_peer_abort())
-            throw std::invalid_argument("ERNIE pair: an admitted two-rank plan and abortable link are required");
-        const auto& placement = plan.ranks[rank].placement;
-        const auto digest = weight::digest_from_hex(asset_sha256);
-        const auto valid_token = [](std::uint32_t id) { return id < data::dims::vocab; };
-        if (prompt.empty() || prompt.size() > plan.limits.context || !std::ranges::all_of(prompt, valid_token) ||
-            digest.bytes == std::array<std::uint8_t, 32>{} || numeric_identity.empty() ||
-            !ops.forward || !ops.seam || !ops.fence || (placement.head() && !ops.top))
-            throw std::invalid_argument("ERNIE pair: invalid first-token prompt, identity or device hooks");
-
-        const std::array<std::uint32_t, 5> layout{
-            kPairCut, kLayerCount, static_cast<std::uint32_t>(kPairRowBytes), plan.limits.context, plan.limits.prefill_rows};
-        const auto assets = layers::fnv(14695981039346656037ULL, asset_sha256);
-        const auto layout_key = layers::fnv(layers::fnv(assets, numeric_identity), layout);
-        const auto identity = layers::fnv(layout_key, prompt);
-        pair::PairHello hello;
-        hello.protocol = kPairProtocol;
-        hello.rank = rank;
-        hello.model_sha256 = digest.bytes;
-        hello.context = plan.limits.context;
-        hello.max_rows = plan.limits.prefill_rows;
-        hello.placement = kPairCut;
-        hello.contract = {kPairCut, kLayerCount, kPairRowBytes, plan.limits.context, plan.limits.prefill_rows,
-                          identity, prompt.size()};
-        (void)pair::exchange_hello(hello, [&](std::span<const std::byte> out, std::span<std::byte> in) {
-            link.exchange(out, in);
-        }, kHelloFields);
-
-        const layers::Link channel{
-            [&](std::span<const std::byte> bytes) { link.send(bytes); },
-            [&](std::span<std::byte> bytes) { link.receive(bytes); }};
-        const auto windows = layers::windows(prompt.size(), plan.limits.prefill_rows).size();
-        pair::PipeOptions options;
-        options.validate = layers::validator(identity, windows, kPairCut, plan.limits.prefill_rows, kPairRowBytes);
-        pair::Pipe pipe(rank, windows, channel.send, channel.receive,
-                        [&] { link.abort("ERNIE pair: prefill pipe failed"); }, std::move(options));
-        layers::StageOps prefill;
-        prefill.forward = [&](std::span<const std::uint32_t> ids, const layers::Window& window, bool head) {
-            ops.forward(ids, window, placement.first(), placement.last(), head);
-        };
-        prefill.seam = ops.seam;
-        prefill.fence = ops.fence;
-        prefill.row_bytes = kPairRowBytes;
-        (void)layers::prefill(placement, prompt, plan.limits.prefill_rows, identity,
-                              placement.embeds() ? nullptr : &pipe, placement.head() ? nullptr : &pipe, prefill);
-
-        layers::DecodeOps first;
-        first.row_bytes = kPairRowBytes;
-        const auto token = placement.head() ? ops.top() : 0U;
-        if (!valid_token(token)) throw std::runtime_error("ERNIE pair: first token is out of vocabulary");
-        const auto result = layers::decode(placement, token, 1U,
-            placement.embeds() ? nullptr : &channel, placement.head() ? nullptr : &channel, first).ids.front();
-        if (!valid_token(result)) throw std::runtime_error("ERNIE pair: peer relayed an out-of-vocabulary token");
-        return result;
-    } catch (...) {
+    if (!plan.admitted() || rank >= plan.ranks.size() || (plan.local && *plan.local != rank)) {
         link.abort("ERNIE pair: first-token session failed");
-        throw;
+        throw std::invalid_argument("ERNIE pair: an admitted two-rank plan is required");
     }
+    pair::layers::FirstTokenSpec spec;
+    spec.protocol = kPairProtocol;
+    spec.cut = kPairCut;
+    spec.layers = kLayerCount;
+    spec.context = plan.limits.context;
+    spec.prefill_rows = plan.limits.prefill_rows;
+    spec.vocab = data::dims::vocab;
+    spec.row_bytes = kPairRowBytes;
+    return pair::layers::first_token(plan.ranks[rank].placement, rank, prompt, spec, asset_sha256, numeric_identity,
+                                     link, ops);
 }
 
 } // namespace strix::ernie
