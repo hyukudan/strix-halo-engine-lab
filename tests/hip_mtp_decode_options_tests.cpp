@@ -474,7 +474,7 @@ void campaign_defaults_contract(){
                 withdrawn.mtp.copy_wide_reason.find("withdrawn")!=std::string::npos,"tails without the wide size withdraw the default");
             {   // A server's first start dumps its calibration golden from a copy of its own options: the served wide default
                 // would make that dump invalid (copy-wide + golden dump), so the dump copy withdraws it and stays valid.
-                auto dump=def;dump.mtp.golden.clear();dump.mtp.golden_sha256.clear();dump.mtp.golden_dump="g.tmp";
+                auto dump=def;dump.mtp.golden.clear();dump.mtp.golden_sha256.clear();dump.mtp.golden_dump="g.tmp";dump.tokens.assign(64U,1U);dump.generate_tokens=8U;
                 bool refused=false;
                 try{validate_resolved_mtp_cli(dump);}catch(const std::invalid_argument& e){refused=std::string(e.what()).find("no golden dump")!=std::string::npos;}
                 require(refused,"the served wide default is refused together with a golden dump");

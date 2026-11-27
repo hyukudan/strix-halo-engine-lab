@@ -70,6 +70,9 @@ strix-serve --model qwen3.8-flash-next --profile fast --asset MODEL.gguf --bind 
 - `--http-batch 8` asks for 8 slots. The server builds as many as memory allows and prints the count (`http slots 4
   (cap 8: limited by MemAvailable budget)` with this 111 GB pack on a 128 GB node).
 - No `--known-prefix-*` flags: the server resolves its tiled prefill (T8192, smaller tiles under memory pressure).
+- The served context is the qualified 8192 tokens unless you pass one: a longer prompt answers HTTP 400 ("does not fit the
+  context of 8192 tokens"). Add `--context 36864` (or `--context=36864`) after the `--` for 8K..32K prompts; an explicit
+  context other than 8192 implies `--unqualified-context`, as the command-line resolver decides beyond 8192.
 
 Qwen's [prefix-state cache](../../engine/serving/prefix-state-cache.md) restores complete attention/GDN
 state at admitted boundaries and reads only the suffix. Configure `--prefix-cache-host-bytes N` and
