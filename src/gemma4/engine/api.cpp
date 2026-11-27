@@ -159,8 +159,7 @@ struct Api::Impl {
             std::lock_guard lock(warned_mutex);
             if(!warned_fields.insert(key).second) return;
         }
-        std::fprintf(stderr,"strix-gemma4-serve: ignoring unknown request field \"%s\" (STRIX_G4_SERVE_STRICT_FIELDS=1 refuses it)
-",key.c_str());
+        std::fprintf(stderr,"strix-gemma4-serve: ignoring unknown request field \"%s\" (STRIX_G4_SERVE_STRICT_FIELDS=1 refuses it)\n",key.c_str());
     }
     std::unique_ptr<SessionEngine> session_engine;
     std::unique_ptr<strix::serve::SessionRuntime> session_runtime;
