@@ -4834,6 +4834,7 @@ int main() { return 0; }"
         target_compile_definitions(strix_hip_runtime PUBLIC STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS=1)
     endif()
     target_compile_features(strix_hip_runtime PUBLIC cxx_std_20)
+    target_link_libraries(strix_hip_runtime PUBLIC strix-weight)  # converted low-bit packs (hip_qwen_onfly_i4.cpp)
     target_compile_definitions(strix_hip_runtime PUBLIC STRIX_DPP_REDUCE=$<BOOL:${STRIX_DPP_REDUCE}>)
     # Host-side redirects only: SDK declarations are included before macros;
     # kernels are never counted as submits by this observer.

@@ -42,8 +42,9 @@ inline constexpr ::strix::session::kv_precision::Caps kKvCaps{
     "the HIP 8-bit KV form is --kv int8 (kv-int8-tok-v1)"};
 // Weight sources this build loads under turbo (onfly / converted flip to runnable with their loaders).
 inline constexpr ::strix::profile::turbo::WeightCaps kWeightCaps{
-    {true, true, false}, {false, false, false, false, true, false, false, false, false}, "rtn-g64",
-    "onfly INT4 g64 is built for decode dense projections only (qwen)", "converted low-bit pack loader is not implemented in this build"};
+    {true, true, true}, {false, false, false, false, true, false, false, false, false}, "rtn-g64",
+    "onfly INT4 g64 is built for decode dense projections only (qwen)",
+    "converted packs hold strix.q4_g64 decode dense projections only (qwen)"};
 struct Resolution {
     Name profile = Name::standard;
     std::vector<Entry> entries;

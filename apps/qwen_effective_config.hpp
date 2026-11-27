@@ -571,7 +571,9 @@ inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request
     result.options.turbo = strix::onfly_i4::resolve(request.options.turbo_request, [&](const char* name) -> const char* {
         const auto it = result.environment.find(name);
         return it == result.environment.end() ? nullptr : it->second.c_str();
-    }, request.options.product_profile.weights.effective == strix::profile::turbo::Source::onfly);
+    }, request.options.product_profile.weights.effective == strix::profile::turbo::Source::onfly ? strix::onfly_i4::Source::onfly :
+       request.options.product_profile.weights.effective == strix::profile::turbo::Source::converted ? strix::onfly_i4::Source::converted :
+       strix::onfly_i4::Source::native, request.options.product_profile.weights.pack);
     result.options.product_profile.onfly = result.options.turbo;
     validate_onfly_i4_routes(result.options);
     if (result.options.eager_code_load && !result.environment.contains("HIP_ENABLE_DEFERRED_LOADING"))

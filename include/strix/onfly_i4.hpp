@@ -19,6 +19,7 @@ namespace strix::onfly_i4 {
 
 enum Group : unsigned { gdn_in = 1U, gdn_out = 2U, qsa_io = 4U, shared_expert = 8U, all_groups = 15U };
 inline constexpr std::string_view kIdentity = "qwen-turbo-plus-onfly-i4g64-v2";
+inline constexpr std::string_view kConvertedIdentity = "qwen-turbo-plus-converted-i4g64-v1";
 inline constexpr std::string_view kScopeNote = "decode/window dense projections i4g64; cohort/batching unqualified; prefill (rows >= 16) q8_0";
 inline constexpr int kScaleLegacy = 0, kScaleFullRange = 2001, kScaleMse = 2002;
 inline constexpr bool dispatch_width(std::uint64_t k) {
@@ -53,18 +54,28 @@ struct Resolved {
     int scale_rule = kScaleFullRange;
     core::iu4_rows::SingleDecodeResolution row_decode;
     core::iu4_rows::RowReductionResolution row_reduction;
-    [[nodiscard]] bool active() const { return source == Source::onfly; }
+    // converted: the calibrated pack (strix-lowbit-pack, strix.q4_g64 matrices) read instead of rounding at load; the
+    // tensors it holds (within `groups`) get the INT4 rows, every other tensor keeps its Q8_0 rows.
+    std::string pack;
+    [[nodiscard]] bool active() const { return source == Source::onfly || source == Source::converted; }
+    [[nodiscard]] bool converted() const { return source == Source::converted; }
     // Identity for cache keys / receipts; empty for native (byte-identical to the unmodified engine).
     [[nodiscard]] std::string identity() const {
         if (!active()) return {};
-        auto value = std::string(kIdentity) + "-g" + std::to_string(groups) + "-" + std::string(scale_rule_name(scale_rule));
+        auto value = converted() ?
+            std::string(kConvertedIdentity) + "-g" + std::to_string(groups) + "-" + pack_name() :
+            std::string(kIdentity) + "-g" + std::to_string(groups) + "-" + std::string(scale_rule_name(scale_rule));
         if (row_reduction.effective == core::iu4_rows::RowReduction::canonical)
             value += "-" + std::string(core::iu4_rows::row_reduction_contract(row_reduction.effective));
         return value;
     }
     [[nodiscard]] std::string json() const {
         return "{\"identity\":\"" + identity() + "\",\"group_mask\":" + std::to_string(groups) +
-            ",\"scale_rule\":\"" + std::string(scale_rule_name(scale_rule)) + "\"}";
+            ",\"scale_rule\":\"" + (converted() ? std::string("pack") : std::string(scale_rule_name(scale_rule))) + "\"}";
+    }
+    [[nodiscard]] std::string pack_name() const {
+        const auto slash = pack.find_last_of("/\\");
+        return slash == std::string::npos ? pack : pack.substr(slash + 1U);
     }
 };
 
@@ -100,14 +111,19 @@ inline std::string groups_text(unsigned mask) {
 
 // CLI > environment > default; `env(name)` returns nullptr when unset.
 // `onfly`: the profile resolution's effective weight source is onfly at 4 bits (turbo::Weights).
-inline Resolved resolve(const Request& cli, const std::function<const char*(const char*)>& env, bool onfly) {
+inline Resolved resolve(const Request& cli, const std::function<const char*(const char*)>& env, Source source,
+                        std::string pack = {}) {
     const auto pick = [&](const std::string& typed, const char* name) {
         if (!typed.empty()) return typed;
         const char* v = env(name);
         return v ? std::string(v) : std::string{};
     };
     Resolved r;
-    r.source = onfly ? Source::onfly : Source::native;
+    r.source = source;
+    if (source == Source::converted) {
+        if (pack.empty()) throw std::invalid_argument("converted low-bit weights need --turbo-weights-pack PATH");
+        r.pack = std::move(pack);
+    }
     r.groups = parse_groups(pick(cli.groups, "STRIX_TURBO_ONFLY_GROUPS"));
     const auto rule = pick(cli.scale_rule, "STRIX_TURBO_ONFLY_SCALE");
     if (rule.empty() || rule == "full") r.scale_rule = kScaleFullRange;
@@ -117,6 +133,10 @@ inline Resolved resolve(const Request& cli, const std::function<const char*(cons
     r.row_decode = core::iu4_rows::resolve_single_decode_policy(r.active(), pick({}, "STRIX_IU4_R8_SINGLE_DECODE"));
     r.row_reduction = core::iu4_rows::resolve_row_reduction(r.active(), pick({}, "STRIX_IU4_ROW_REDUCTION"));
     return r;
+}
+
+inline Resolved resolve(const Request& cli, const std::function<const char*(const char*)>& env, bool onfly) {
+    return resolve(cli, env, onfly ? Source::onfly : Source::native);
 }
 
 // Group of a Q8_0 dense projection by tensor name (0 = not an onfly candidate).

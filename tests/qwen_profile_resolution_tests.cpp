@@ -214,7 +214,8 @@ void pending_weights_inspection() {
                             "--print-effective-config"});
     const auto c = dc::resolve_effective_config({o, {}}, strix::ModelContract::qwen38_flash_next(), {}, {}, "", {}, {});
     const auto text = dc::effective_config_json(c);
-    check(text.find("converted") != std::string::npos && text.find("pending") != std::string::npos,
+    // The HIP build loads converted packs; a request without its pack is refused and serialized as such.
+    check(text.find("converted") != std::string::npos && text.find("--turbo-weights-pack") != std::string::npos,
           "inspection must serialize the refused weight request");
     bool refused = false;
     bool exported = false;

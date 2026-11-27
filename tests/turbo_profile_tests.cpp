@@ -320,9 +320,13 @@ void qwen_adapter() {
     require(!throws([&] { strix::decode_cli::validate_onfly_i4_routes(route); }), "onfly HTTP single runner admitted");
     opts.weights.source = "converted";
     opts.weights.pack = "model-int4.pack";
+    const auto converted = q::resolve(p::Name::turbo, opts);
+    require(converted.weights.honoured() && converted.weights.identity() == "converted-int4" &&
+            converted.weights.pack == "model-int4.pack", "qwen HIP loads converted 4-bit packs");
+    opts.weights.pack.reset();
     const auto refused = q::resolve(p::Name::turbo, opts);
     require(!refused.weights.honoured() && throws([&] { q::apply(refused, [](const char*, const char*) { return true; }); }),
-            "qwen refuses converted weights until its loader is in the build");
+            "qwen refuses converted weights without their pack");
 }
 
 }  // namespace
