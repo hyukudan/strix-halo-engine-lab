@@ -2,6 +2,7 @@
 
 #include "attn_core/causal_gqa_reference.hpp"
 #include "strix/attn/group_pool.hpp"
+#include "strix/attn/reference_executor.hpp"
 
 #include <array>
 
@@ -43,29 +44,33 @@ struct ReferenceHybridQueries {
 template<class WindowAt, class WindowValueAt, class PooledKeyAt, class PooledValueAt>
 void hybrid_mqa_reference(const ReferenceHybridQueries& q, std::size_t window_count, std::size_t pooled_count,
     WindowAt window_at, WindowValueAt window_value, PooledKeyAt pooled_key, PooledValueAt pooled_value,
-    std::span<float> output) {
+    std::span<float> output, const attn::ReferenceHeadExecutor& execute = {}) {
     if (q.dim == 0 || window_count == 0 || q.window_heads.size() != q.sink.size() * q.dim ||
         q.compressed_heads.size() != q.window_heads.size() || output.size() != q.window_heads.size())
         throw std::invalid_argument("hybrid attention: invalid head geometry");
     const float scale = 1.0F / std::sqrt(static_cast<float>(q.dim));
     std::ranges::fill(output, 0.0F);
-    for (std::size_t h = 0; h < q.sink.size(); ++h) {
-        const auto at = h * q.dim;
-        const auto score_at = [&](std::size_t row) {
-            const bool local = row < window_count;
-            const auto head = (local ? q.window_heads : q.compressed_heads).subspan(at, q.dim);
-            const auto key = local ? window_at(row) : pooled_key(row - window_count);
-            if (key.size() != q.dim) throw std::invalid_argument("hybrid attention: invalid key width");
-            float score = 0.0F;
-            for (std::size_t d = 0; d < head.size(); ++d) score += head[d] * key[d];
-            return score * scale;
-        };
-        const auto value_at = [&](std::size_t row) {
-            return row < window_count ? window_value(row) : pooled_value(row - window_count);
-        };
-        detail::causal_fp32_head(output.subspan(at, q.dim), window_count + pooled_count,
-                                 q.sink[h], score_at, value_at);
-    }
+    const auto work = [&](std::size_t first, std::size_t last) {
+        for (std::size_t h = first; h < last; ++h) {
+            const auto at = h * q.dim;
+            const auto score_at = [&](std::size_t row) {
+                const bool local = row < window_count;
+                const auto head = (local ? q.window_heads : q.compressed_heads).subspan(at, q.dim);
+                const auto key = local ? window_at(row) : pooled_key(row - window_count);
+                if (key.size() != q.dim) throw std::invalid_argument("hybrid attention: invalid key width");
+                float score = 0.0F;
+                for (std::size_t d = 0; d < head.size(); ++d) score += head[d] * key[d];
+                return score * scale;
+            };
+            const auto value_at = [&](std::size_t row) {
+                return row < window_count ? window_value(row) : pooled_value(row - window_count);
+            };
+            detail::causal_fp32_head(output.subspan(at, q.dim), window_count + pooled_count,
+                                     q.sink[h], score_at, value_at);
+        }
+    };
+    if (execute) execute(q.sink.size(), work);
+    else work(0, q.sink.size());
 }
 
 template<class WindowAt, class PooledKeyAt, class PooledValueAt>

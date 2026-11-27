@@ -33,7 +33,7 @@ struct CompressedMqaInputs {
 // pooled values to the local frame, retaining one common softmax.
 inline std::vector<float> compressed_mqa_reference(const CompressedMqaStep& step, const CompressedMqaInputs& in,
     const RotaryReferenceRow& window_rope, const RotaryReferenceRow& compressed_rope,
-    const attn::CompressedReferenceHistory& state) {
+    const attn::CompressedReferenceHistory& state, const attn::ReferenceHeadExecutor& execute = {}) {
     std::vector<float> compressed_query(in.query.begin(), in.query.end());
     window_rope.apply(in.query, step.width);
     window_rope.apply(in.key, step.width);
@@ -86,7 +86,8 @@ inline std::vector<float> compressed_mqa_reference(const CompressedMqaStep& step
         return std::span<const float>(compressed_values).subspan(row * step.width, step.width);
     };
     hybrid_mqa_reference({step.width, in.query, compressed_query, in.sinks},
-        mask::window_count(step.position, step.window), compressed_count, window_at, window_value, pooled_key, pooled_value, heads);
+        mask::window_count(step.position, step.window), compressed_count, window_at, window_value, pooled_key,
+        pooled_value, heads, execute);
     return heads;
 }
 

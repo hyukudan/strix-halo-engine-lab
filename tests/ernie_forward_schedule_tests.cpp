@@ -116,7 +116,7 @@ int main() try {
 
     const ernie::ReferenceShape shape{
         .hidden = 4, .vocab = 20, .dense_width = 3, .latent_width = 2, .expert_width = 3,
-        .heads = 1, .head_dim = 4, .rope_dim = 2, .q_rank = 2, .o_groups = 1, .o_rank = 2, .vha_rank = 1,
+        .heads = 2, .head_dim = 4, .rope_dim = 2, .q_rank = 2, .o_groups = 1, .o_rank = 2, .vha_rank = 1,
         .route = {.score = moe::RouteScore::sigmoid, .selection_bias = true,
                   .experts = 2, .top_k = 2, .renormalize = true}};
     const ernie::ReferenceRead fixture = [](auto name, auto out, auto offset) {
@@ -138,7 +138,7 @@ int main() try {
         core::reference_row_ranges(lane, 4, count, work);
     });
     check(threaded.prefill(threaded.embed_rows(prompt), 0, ernie::kLayerCount) == end,
-          "MLA head scheduler changed the prefill");
+          "attention head scheduler changed the prefill");
     std::vector<float> head(shape.hidden * shape.vocab), scores(shape.vocab);
     fixture("lm_head.weight", std::span(head), 0);
     core::linear_reference(head, whole.head_input(end.back()), scores);
@@ -187,6 +187,11 @@ int main() try {
         return std::bit_cast<std::uint32_t>(a) == std::bit_cast<std::uint32_t>(b);
     }), "checkpoint prefill and incremental decode changed logits");
     const auto checkpoint_rows = checkpoint_batch.prefill(checkpoint_batch.embed_rows(prompt), 0, ernie::kLayerCount);
+    const ernie::CpuReference reverse_heads(checkpoint, fixture, soft, {}, {}, [](auto count, const auto& work) {
+        for (auto end = count; end != 0; --end) work(end - 1, end);
+    });
+    check(reverse_heads.prefill(reverse_heads.embed_rows(prompt), 0, ernie::kLayerCount) == checkpoint_rows,
+          "independent head scheduling changed checkpoint attention bits");
     core::linear_reference(head, checkpoint_batch.head_input(checkpoint_rows.back()), scores);
     check(scores == batch_logits, "checkpoint teacher-forced and greedy head differ");
 

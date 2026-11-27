@@ -52,10 +52,11 @@ struct LayerWeights {
     }
 };
 
-void postmix(const LayerWeights& w, const ReferenceShape& s, std::span<float> heads, std::vector<float>& folded) {
+void postmix(const LayerWeights& w, const ReferenceShape& s, std::span<float> heads, std::vector<float>& folded,
+             const AttentionHeadExecutor& execute) {
     if (s.contracts.vha == VhaContract::off) return;
     if (!folded.empty()) {
-        attn_core::apply_folded_value_head_mix_reference(heads, s.heads, folded);
+        attn_core::apply_folded_value_head_mix_reference(heads, s.heads, folded, execute);
         return;
     }
     const auto count = std::size_t{s.heads} * s.vha_rank;
@@ -64,7 +65,7 @@ void postmix(const LayerWeights& w, const ReferenceShape& s, std::span<float> he
     const auto residual = s.contracts.vha != VhaContract::non_residual;
     if (s.contracts.checkpoint_attention) {
         folded = attn_core::fold_value_head_mix_reference(s.heads, s.vha_rank, u, v, residual);
-        attn_core::apply_folded_value_head_mix_reference(heads, s.heads, folded);
+        attn_core::apply_folded_value_head_mix_reference(heads, s.heads, folded, execute);
     } else {
         attn_core::residual_value_head_mix(heads, s.heads, s.vha_rank, u, v, residual);
     }
@@ -80,7 +81,7 @@ void gate_values(const LayerWeights& w, std::span<const float> query_lora, std::
 
 std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
     std::span<const float> input, unsigned position, attn::CompressedReferenceHistory& state,
-    std::vector<float>& folded_mix, bool record_history, bool keep_compressor) {
+    std::vector<float>& folded_mix, bool record_history, bool keep_compressor, const AttentionHeadExecutor& execute) {
     const auto width = s.head_dim;
     const auto eps = s.contracts.rms_epsilon > 0 ? s.contracts.rms_epsilon : kEpsilon;
     const bool checkpoint = s.contracts.checkpoint_attention;
@@ -127,10 +128,10 @@ std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
 
     const auto sinks = w.tensor("core_attention.attn_sink", s.heads);
     const attn_core::CompressedMqaInputs operands{query, kv, local_value, sinks, carry_value, carry_logit, pooled};
-    auto heads = attn_core::compressed_mqa_reference(step, operands, window_rope, compressed_rope, state);
+    auto heads = attn_core::compressed_mqa_reference(step, operands, window_rope, compressed_rope, state, execute);
     if (checkpoint) core::round_bf16_reference(heads);
     else if (!s.contracts.no_hca_inverse_rope) window_rope.apply(heads, width, true);
-    postmix(w, s, heads, folded_mix);
+    postmix(w, s, heads, folded_mix, execute);
     if (checkpoint) attn_core::compressed_mqa_output_input_reference(heads, width, window_rope, packed_block);
     std::vector<float> grouped(std::size_t{s.o_groups} * s.o_rank);
     w.linear("linear_o_group_proj", heads, grouped, s.o_groups);
@@ -234,7 +235,7 @@ std::vector<float> mla_reference(const LayerWeights& w, const ReferenceShape& s,
         w.tensor("core_attention.softmax_offset", shape.heads), selected, row_at, output_heads, execute);
     if (checkpoint) core::round_bf16_reference(output_heads);
     if (s.contracts.gate_before_vha) gate_values(w, q_lora, output_heads, checkpoint);
-    postmix(w, s, output_heads, folded_mix);
+    postmix(w, s, output_heads, folded_mix, execute);
     if (checkpoint) core::round_bf16_reference(output_heads);
     if (!s.contracts.gate_before_vha) gate_values(w, q_lora, output_heads, checkpoint);
     std::vector<float> output(s.hidden);
@@ -267,7 +268,7 @@ std::vector<float> attention_reference(unsigned layer, const ReferenceShape& sha
         ? mla_reference(weights, shape, input, history.position_, history.mla_, history.folded_mix_, execute_heads,
                         history.max_rows_ > indexed_prefix_limit, index_prefill)
         : hca_reference(weights, shape, input, history.position_, history.hca_, history.folded_mix_,
-                        true, history.max_rows_ >= kCompression);
+                        true, history.max_rows_ >= kCompression, execute_heads);
     history.layer_ = layer;
     ++history.position_;
     return result;
@@ -276,7 +277,7 @@ std::vector<float> attention_reference(unsigned layer, const ReferenceShape& sha
 std::vector<float> attention_reference_first_hca(const std::string& prefix, const ReferenceShape& shape,
     const ReferenceRead& read, std::span<const float> input, const AttentionProject& project) {
     AttentionHistory state;
-    return hca_reference({read, project, prefix}, shape, input, 0, state.hca_, state.folded_mix_, false, false);
+    return hca_reference({read, project, prefix}, shape, input, 0, state.hca_, state.folded_mix_, false, false, {});
 }
 
 } // namespace strix::ernie

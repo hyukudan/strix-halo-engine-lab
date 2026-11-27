@@ -2,6 +2,7 @@
 
 #include "core/linear_reference.hpp"
 #include "strix/attn/group_indexer.hpp"
+#include "strix/attn/reference_executor.hpp"
 
 #include <vector>
 
@@ -25,19 +26,24 @@ inline std::vector<float> fold_value_head_mix_reference(unsigned heads, unsigned
 }
 
 inline void apply_folded_value_head_mix_reference(std::span<float> values, unsigned heads,
-                                                  std::span<const float> folded) {
+                                                  std::span<const float> folded,
+                                                  const attn::ReferenceHeadExecutor& execute = {}) {
     if (heads == 0 || values.empty() || values.size() % heads != 0 || folded.size() != std::size_t{heads} * heads)
         throw std::invalid_argument("value head mix: incompatible folded dimensions");
     const auto width = values.size() / heads;
     std::vector<float> result(values.size());
-    for (unsigned h = 0; h < heads; ++h) {
-        auto out = std::span(result).subspan(h * width, width);
-        for (unsigned g = 0; g < heads; ++g) {
-            const auto in = values.subspan(g * width, width);
-            const float coefficient = folded[std::size_t{h} * heads + g];
-            for (std::size_t d = 0; d < width; ++d) out[d] = std::fma(coefficient, in[d], out[d]);
+    const auto work = [&](std::size_t first, std::size_t last) {
+        for (auto h = first; h < last; ++h) {
+            auto out = std::span(result).subspan(h * width, width);
+            for (unsigned g = 0; g < heads; ++g) {
+                const auto in = values.subspan(g * width, width);
+                const float coefficient = folded[h * heads + g];
+                for (std::size_t d = 0; d < width; ++d) out[d] = std::fma(coefficient, in[d], out[d]);
+            }
         }
-    }
+    };
+    if (execute) execute(heads, work);
+    else work(0, heads);
     std::ranges::copy(result, values.begin());
 }
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "strix/attn/reference_executor.hpp"
+
 #include "attn_core/causal_gqa_reference.hpp"
 #include "attn_core/reference_cache.hpp"
 #include "core/linear_reference.hpp"
@@ -10,8 +12,7 @@
 
 namespace strix::attn_core {
 
-using LatentHeadRange = std::function<void(std::size_t, std::size_t)>;
-using LatentHeadExecutor = std::function<void(std::size_t, const LatentHeadRange&)>;
+using LatentHeadExecutor = attn::ReferenceHeadExecutor;
 
 struct SelectedLatentShape {
     unsigned heads, latent, nope, rotary, value;

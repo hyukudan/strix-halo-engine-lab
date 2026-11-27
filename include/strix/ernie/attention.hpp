@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/ernie/engine.hpp"
+#include "strix/attn/reference_executor.hpp"
 #include "strix/attn/reference_history.hpp"
 
 #include <cstdint>
@@ -9,8 +10,8 @@
 namespace strix::ernie {
 
 using AttentionProject = ReferenceProject;
-using AttentionHeadRange = std::function<void(std::size_t, std::size_t)>;
-using AttentionHeadExecutor = std::function<void(std::size_t, const AttentionHeadRange&)>;
+using AttentionHeadRange = attn::ReferenceHeadRange;
+using AttentionHeadExecutor = attn::ReferenceHeadExecutor;
 
 // One layer of one sequence. Copies own their complete causal history.
 class AttentionHistory {
