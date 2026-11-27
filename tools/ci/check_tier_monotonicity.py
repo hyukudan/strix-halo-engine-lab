@@ -15,6 +15,7 @@ TIERS = ("exact", "fast", "turbo")
 HEADER = "| Model | Hardware | Route | Decode mode | Profile | Prompt (tokens) | Decode (tok/s) | Prefill (tok/s) | Main |"
 RATES = r"[0-9][0-9,]*(?:\.[0-9]+)?(?:\s*(?:/|–)\s*[0-9][0-9,]*(?:\.[0-9]+)?)*"
 LABEL = r"\d+K"
+DECODE_AFTER = r" \(after ([0-9][0-9,]*): ([^()]+)\)"
 
 
 def rates(text):
@@ -32,13 +33,26 @@ def rates(text):
 def phase_cells(phase, text, prompts):
     if text == "—":
         return {}
-    # Parenthesized observations have a different prompt or give the sample count.
+    # An explicit decode context is a separate observation. Other annotations
+    # describe the measurement (for example, its sample count).
+    result = {}
+    if phase == "decode":
+        for context, rate in re.findall(DECODE_AFTER, text):
+            context = context.replace(",", "")
+            if context in result:
+                raise ValueError(f"duplicate decode context: {context}")
+            result[context] = rates(rate)
     text = re.sub(r" \([^)]*\)", "", text)
     if phase == "decode" and not re.match(LABEL + r" ", text):
-        return {prompts.partition("; decode after ")[2] or prompts: rates(text)}
+        context = prompts.partition("; decode after ")[2] or prompts
+        if " / " not in context:
+            context = context.replace(",", "")
+        if context in result:
+            raise ValueError(f"duplicate decode context: {context}")
+        result[context] = rates(text)
+        return result
     prefix = prompts.partition("; decode after ")[0]
     if re.match(LABEL + r" ", text):
-        result = {}
         for part in text.split(", "):
             label, sep, rate = part.partition(" ")
             if not sep or not re.fullmatch(LABEL, label) or label in result:

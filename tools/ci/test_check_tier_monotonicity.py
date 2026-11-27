@@ -50,6 +50,17 @@ class TierMonotonicityTests(unittest.TestCase):
                 "| M | pair | CLI | plain | TURBO | same | 22 | 80 | `base` |\n")
         self.assertEqual(violations(TABLE + rows), {"base\tM\tpair\tCLI\tplain\tprefill\t2048\texact\tturbo\t100\t80"})
 
+    def test_additional_decode_observation_is_compared_at_its_own_context(self):
+        rows = ("| M | pair | HTTP | plain | EXACT | 1,102; decode after 508 | 27 (after 1,102: 30 / 32) | — | `base` |\n"
+                "| M | pair | HTTP | plain | FAST | 1,102; decode after 1,102 | 29 | — | `base` |\n")
+        self.assertEqual(violations(TABLE + rows), {"base\tM\tpair\tHTTP\tplain\tdecode\t1102\texact\tfast\t31\t29"})
+        self.assertEqual(violations(TABLE + rows.replace("FAST | 1,102; decode after 1,102", "FAST | 1,102; decode after 508")), set())
+
+    def test_repeated_explicit_decode_context_is_refused(self):
+        row = "| M | pair | HTTP | plain | EXACT | 1,102; decode after 1,102 | 27 (after 1,102: 30) | — | `base` |\n"
+        with self.assertRaisesRegex(ValueError, "duplicate decode context: 1102"):
+            violations(TABLE + row)
+
     def test_empty_or_unparseable_table_refused(self):
         with self.assertRaisesRegex(ValueError, "missing"):
             violations("")
