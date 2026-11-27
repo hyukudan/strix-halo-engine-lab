@@ -1,0 +1,56 @@
+# gate_r 2026-11-27 (origin/main d179ad0d08): windows cut by heldout_windows.py cut; *.provenance.tsv lists every cut window
+# (spares included); the windows scored are the ones in this report. Reference-only pre-filter (heldout_windows.py prefilter,
+# --max-greedy 0.95) before any candidate was read. glm5 names w0..w9 = en2-a-2304 en2-b-2304 es2-a-2304 code2-a-2304 chat2-a-2304 en8-a-8192 es8-a-8192 es8-b-8192 code8-a-8192 chat8-a-8192
+# deepseek41 ds8 (reference arm exact, head 64)
+en8-a-8128	keep	0.6032	63
+es8-a-8128	keep	0.5873	63
+en8-b-8128	keep	0.6667	63
+es8-b-8128	keep	0.6667	63
+en8-c-8128	keep	0.6825	63
+es8-c-8128	keep	0.5397	63
+en8-d-8128	keep	0.4921	63
+es8-d-8128	keep	0.7302	63
+code8-a-8128	DROP	0.9841	63
+code8-c-8128	keep	0.9365	63
+chat8-a-8128	keep	0.5714	63
+chat8-b-8128	keep	0.8889	63
+chat8-c-8128	keep	0.5556	63
+code8-f-8128	keep	0.8889	63
+code8-g-8128	DROP	0.9524	63
+prefilter exact: 15 windows, dropped 2 (label == reference top-1 > 0.95), kept 13, missing 0
+# deepseek41 ds32 (reference arm exact, head 64)
+en32-a-32768	keep	0.7937	63
+es32-a-32768	keep	0.6508	63
+code32-f-32768	DROP	0.9683	63
+chat32-a-32768	keep	0.6508	63
+en32-b-32768	keep	0.5873	63
+es32-b-32768	keep	0.6190	63
+chat32-b-32768	keep	0.6667	63
+en32-c-32768	keep	0.7143	63
+es32-c-32768	keep	0.6984	63
+chat32-c-32768	keep	0.5238	63
+en32-d-32768	keep	0.8254	63
+es32-d-32768	keep	0.6667	63
+code32-d-32768	DROP	0.9841	63
+en32-e-32768	keep	0.9365	63
+es32-e-32768	keep	0.8254	63
+chat32-d-32768	missing	-
+code32-g-32768	missing	-
+code32-h-32768	missing	-
+code32-a-32768	missing	-
+code32-b-32768	missing	-
+code32-c-32768	missing	-
+code32-e-32768	missing	-
+prefilter exact: 22 windows, dropped 2 (label == reference top-1 > 0.95), kept 13, missing 7
+# glm5 (reference arm E, last 256 rows)
+w0	keep	0.6157	255
+w1	keep	0.6235	255
+w2	keep	0.5765	255
+w3	keep	0.9137	255
+w4	keep	0.7608	255
+w5	keep	0.5412	255
+w6	keep	0.5216	255
+w7	keep	0.5922	255
+w8	DROP	0.9961	255
+w9	keep	0.7412	255
+prefilter exact: 10 windows, dropped 1 (label == reference top-1 > 0.95), kept 9, missing 0
