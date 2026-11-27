@@ -216,7 +216,8 @@ strix_target_warnings(strix_lookup)
 # Shared drafting layer: context proposer (copy cursor, long proposals), lookup/drafter/serial arbiter, stats line.
 include(cmake/StrixTokenSampling.cmake)
 add_library(strix_spec STATIC src/spec/drafting.cpp src/spec/block_drafter.cpp src/spec/draft_rows.cpp
-    src/spec/block_parallel.cpp src/spec/row_rule.cpp)
+    src/spec/block_parallel.cpp src/spec/row_rule.cpp src/spec/draft_reference.cpp)
+target_include_directories(strix_spec PRIVATE src)
 target_link_libraries(strix_spec PUBLIC strix_lookup strix_token_sampling)
 strix_target_warnings(strix_spec)
 
@@ -1504,7 +1505,7 @@ target_link_libraries(strix_core PUBLIC strix_serve_json)
 
 # Shared hyper-connection host arithmetic used by both standalone and hybrid engines.
 add_library(strix_hc STATIC src/hc/hc_ref.cpp)
-target_include_directories(strix_hc PUBLIC include)
+target_include_directories(strix_hc PUBLIC include PRIVATE src)
 target_compile_features(strix_hc PUBLIC cxx_std_20)
 strix_target_warnings(strix_hc)
 if(NOT MSVC)
@@ -2183,6 +2184,7 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-spec-pair-round-tests)
     add_test(NAME strix-spec-pair-round-tests COMMAND strix-spec-pair-round-tests)
     add_executable(strix-spec-block-parallel-tests tests/spec_block_parallel_tests.cpp)
+    target_include_directories(strix-spec-block-parallel-tests PRIVATE src)
     add_executable(strix-block-candidate-tests tests/block_candidate_tests.cpp)
     target_include_directories(strix-block-candidate-tests PRIVATE src)
     target_link_libraries(strix-block-candidate-tests PRIVATE strix_block_candidate)
