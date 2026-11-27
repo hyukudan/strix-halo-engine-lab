@@ -628,7 +628,8 @@ void qwen_launcher_keeps_speculation_default(const fs::path& data) {
         const auto model_at = std::find_if(args.begin(), args.end(), [](const std::string& word) {
             return word == "MODEL.gguf" || word.ends_with("/MODEL.gguf") || word.ends_with("\\MODEL.gguf");
         });
-        require(model_at != args.end(), "dry run carries the asset: got " + out.str().substr(0, 400));
+        if (model_at == args.end()) std::cerr << "dry run printed:\n" << out.str() << '\n';
+        require(model_at != args.end(), "dry run carries the asset");
         bool profile_seen = false;
         for (auto it = model_at + 1; it != args.end(); ++it) {
             const std::string_view arg = *it;
