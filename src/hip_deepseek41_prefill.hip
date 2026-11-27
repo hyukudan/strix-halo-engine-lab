@@ -20,6 +20,7 @@
 #include "core/tp_join_sum.hpp"
 #include "core/hip_host_ready.hpp"
 #include "core/layer_read_ahead.hpp"
+#include "core/null_ulp.hpp"
 #include <optional>
 #include "strix/ds41_engram.hpp"
 #include "strix/session/embed_splice_hip.hpp"
@@ -127,25 +128,8 @@ std::vector<T> download(const T* p, std::size_t n, hipStream_t s) {
     return out;
 }
 
-// Diagnostics (PrefillOptions::null_ulp_layer / trace): the last mantissa bit of every finite nonzero value flipped,
+// Diagnostics (PrefillOptions::null_ulp_layer / trace): the shared one-ulp null (core/null_ulp.hpp) on every stream value,
 // and an order-independent 64-bit hash per stream row.
-// seed != 0: one ulp up or down (magnitude +-1 in the bit pattern) by a hash of (seed, i), so seeds sample the noise.
-__global__ void ulp_flip_kernel(float* p, std::size_t n, std::uint32_t seed) {
-    const std::size_t i = blockIdx.x * 256ULL + threadIdx.x;
-    if (i >= n) return;
-    const float f = p[i];
-    if (f == 0.0F || !isfinite(f)) return;
-    if (seed == 0U) {
-        p[i] = __int_as_float(__float_as_int(f) ^ 1);
-        return;
-    }
-    std::uint64_t x = (std::uint64_t{seed} << 40) ^ i;
-    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
-    x ^= x >> 31;
-    const int b = __float_as_int(f);
-    p[i] = __int_as_float((x & 1U) || (b & 0x7FFFFF) == 0 ? b + 1 : b - 1);
-}
 __global__ void row_hash_kernel(const float* s, std::size_t row, std::uint64_t* out) {
     __shared__ std::uint64_t red[256];
     const float* r = s + blockIdx.x * row;
@@ -3503,9 +3487,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 m.identity_pre = false;
                 if (m.options.null_ulp_layer == static_cast<int>(layer) && no > 0U) {
                     const std::size_t count = std::size_t{no} * stream_row;
-                    ulp_flip_kernel<<<static_cast<unsigned>((count + 255U) / 256U), 256, 0, st>>>(stream_now() + std::size_t{o0} * stream_row, count,
-                                                                                     m.options.null_seed);
-                    check(hipGetLastError(), "ulp flip");
+                    check(strix::core::null_ulp::enqueue(stream_now() + std::size_t{o0} * stream_row, count, m.options.null_seed, st), "ulp flip");
                 }
                 if (m.options.trace) {
                     PrefillLayerTrace t;
