@@ -44,8 +44,8 @@ void test_row() {
     require(lever.env == "STRIX_INK_PREPARED_ROUND_FOLD" && lever.off == "0" && lever.builtin == "0",
             "default-off builtin, 0 switches it off");
     require(lever.kind == profile::Kind::exact, "exact schedule trait");
-    // Opt-in: every cell is empty, so no profile selects it by default.
-    for (const auto& cell : lever.value) require(cell.empty(), "row cells empty: no tier selects the fold by default");
+    // Same bits: every profile column selects it (EXACT included).
+    for (const auto& cell : lever.value) require(cell == "1", "every tier selects the fold by default");
 }
 
 void test_resolution() {
@@ -53,16 +53,17 @@ void test_resolution() {
     const profile::Engine bare{"inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1"};
     require(bare.table.empty() && !mini::mini_prepared_round_fold(profile::resolve(bare, inputs(profile::Name::standard))),
             "no row: off");
-    // Real default resolution of every profile: off.
+    // Real default resolution of every profile: on.
     for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo, profile::Name::quality})
-        require(!fold(tier), "off by default in every profile");
+        require(fold(tier), "on by default in every profile");
     // The EXACT identity is the legacy one when no lever is applied (the two CUDA EXACT defaults switched off).
     mini::MiniWeightOptions plain;
     plain.tier = inputs(profile::Name::standard);
-    // The CUDA EXACT defaults (projected bias, screened head) are non-builtin values the fingerprint mixes: switch
-    // both off (their builtins) to compare with the legacy identity.
+    // The EXACT defaults (projected bias, screened head, this fold) are non-builtin values the fingerprint mixes: switch
+    // them off (their builtins) to compare with the legacy identity.
     plain.tier.env = [](const char* key) -> const char* {
-        return std::strcmp(key, "STRIX_INK_ATTN_PROJECTED_BIAS") == 0 || std::strcmp(key, "STRIX_INK_SCREENED_HEAD") == 0
+        return std::strcmp(key, "STRIX_INK_ATTN_PROJECTED_BIAS") == 0 || std::strcmp(key, "STRIX_INK_SCREENED_HEAD") == 0 ||
+                       std::strcmp(key, "STRIX_INK_PREPARED_ROUND_FOLD") == 0
                    ? "0" : nullptr;
     };
     require(mini::resolve_mini_profile(plain, true).fingerprint() ==
@@ -98,16 +99,16 @@ void test_resolution() {
     }
 }
 
-// The receipt shows the row only when selected: the default startup profile line is the legacy one.
+// The receipt names the row when selected (the default) and drops it with the off switch.
 void test_receipt() {
     mini::MiniWeightOptions options;
     options.tier = inputs(profile::Name::standard);
-    const auto off = mini::resolve_mini_profile(options, true).summary();
-    options.tier = inputs(profile::Name::standard, "1");
     const auto on = mini::resolve_mini_profile(options, true).summary();
-    require(on.find("prepared-round-fold") != std::string::npos, "explicit on: the profile line names the row");
-    require(off.find("prepared-round-fold") == std::string::npos, "default: nothing to report");
-    std::cout << "exact (default): " << off << "\nexact (STRIX_INK_PREPARED_ROUND_FOLD=1): " << on << '\n';
+    options.tier = inputs(profile::Name::standard, "0");
+    const auto off = mini::resolve_mini_profile(options, true).summary();
+    require(on.find("prepared-round-fold") != std::string::npos, "default: the profile line names the row");
+    require(off.find("prepared-round-fold") == std::string::npos, "off switch: nothing to report");
+    std::cout << "exact (default): " << on << "\nexact (STRIX_INK_PREPARED_ROUND_FOLD=0): " << off << '\n';
 }
 
 }  // namespace

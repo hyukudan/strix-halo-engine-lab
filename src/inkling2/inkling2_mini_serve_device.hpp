@@ -135,7 +135,8 @@ inline MiniServeCohort make_mini_device_cohort(
             // STRIX_INKLING_WINDOW_PROGRAMS=0 turns them off) and its proven levers (identity fixture q52r: EXACT levers only), so a served window runs the command
             // line's window arithmetic and wall.
             window_programs = windows && mini_window_programs_requested();
-            if (window_programs && !mini_window_programs_proven(opt.combine_image, opt.prepared_round_fold,
+            // The fold the backend runs (levers), not the request: CUDA declines the default-on fold.
+            if (window_programs && !mini_window_programs_proven(opt.combine_image, levers.prepared_round_fold,
                                                                 opt.experts_nvfp4, opt.controller_one_plane,
                                                                 opt.moe_w4a4, opt.attn_projected_bias, weights.roles())) {
                 window_programs = false;

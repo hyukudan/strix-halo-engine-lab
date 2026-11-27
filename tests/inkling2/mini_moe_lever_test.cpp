@@ -135,11 +135,12 @@ void test_resolution() {
     require(exact.find(mini::kMiniMoeW4a4) != nullptr, "exact resolution carries the row");
     require(exact.qualification() == "qualified", "exact receipt");
     const profile::Engine legacy{"inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1"};
-    // The CUDA EXACT defaults (projected bias, screened head) are non-builtin effective values, so the default
-    // fingerprint mixes them; with both explicitly 0 (their builtins, which the fingerprint omits) it is the legacy one.
+    // The EXACT defaults (projected bias, screened head, prepared round fold) are non-builtin effective values, so the
+    // default fingerprint mixes them; with all explicitly 0 (their builtins, which the fingerprint omits) it is the legacy one.
     auto incumbent_inputs = inputs(profile::Name::standard);
     incumbent_inputs.env = [](const char* key) -> const char* {
-        return std::strcmp(key, "STRIX_INK_ATTN_PROJECTED_BIAS") == 0 || std::strcmp(key, "STRIX_INK_SCREENED_HEAD") == 0
+        return std::strcmp(key, "STRIX_INK_ATTN_PROJECTED_BIAS") == 0 || std::strcmp(key, "STRIX_INK_SCREENED_HEAD") == 0 ||
+                       std::strcmp(key, "STRIX_INK_PREPARED_ROUND_FOLD") == 0
                    ? "0" : nullptr;
     };
     require(profile::resolve(mini::kMiniProfile, incumbent_inputs).fingerprint() ==
@@ -148,9 +149,9 @@ void test_resolution() {
     require(exact.fingerprint() != profile::resolve(legacy, inputs(profile::Name::standard)).fingerprint(),
             "the EXACT defaults are a distinct run identity from the legacy one");
     const auto exact_image = profile::resolve(mini::kMiniProfile, inputs(profile::Name::standard, nullptr, "1"));
-    const auto exact_fold = profile::resolve(mini::kMiniProfile, inputs(profile::Name::standard, nullptr, nullptr, "1"));
+    const auto exact_fold = profile::resolve(mini::kMiniProfile, inputs(profile::Name::standard, nullptr, nullptr, "0"));
     require(exact.fingerprint() != exact_image.fingerprint(), "the selected down image is part of the run identity");
-    require(exact.fingerprint() != exact_fold.fingerprint(), "the selected round fold is part of the run identity");
+    require(exact.fingerprint() != exact_fold.fingerprint(), "the switched-off round fold is part of the run identity");
     require(exact_image.fingerprint() != exact_fold.fingerprint(), "the two levers are distinct identities");
 
     mini::MiniWeightOptions options;
@@ -346,7 +347,7 @@ void test_configure() {
     FakeDecoder decoder;
     require(mini::configure_mini_decoder(decoder, resolved).down_image && decoder.image_calls == 1 && decoder.image,
             "the resolved image lever reaches the decoder");
-    require(!decoder.fold, "the round fold stays off while only the image is selected");
+    require(decoder.fold, "the round fold keeps its default (on) when the image is selected");
     // The projected-bias lever reaches every decoder through the same helper the CLI, the gate and the server call; an
     // explicit 0 keeps the incumbent image route.
     for (const char* value : {"1", "0"}) {
@@ -364,8 +365,8 @@ void test_configure() {
     FakeDecoder by_default;
     {
         const auto levers = mini::configure_mini_decoder(by_default, mini::resolve_mini_profile(options, true));
-        require(!levers.down_image && !levers.prepared_round_fold && !by_default.fold && !by_default.image,
-                "no other lever is applied by default");
+        require(!levers.down_image && !by_default.image, "the down image is not applied by default");
+        require(levers.prepared_round_fold && by_default.fold, "the round fold (same bits) is applied by default");
         require(by_default.projected, "the projected-bias route is the default (RTX identity receipts)");
         require(by_default.verify == 0U && levers.verify_rows == 0U, "the verify rows lever is opt-in: off by default");
     }
@@ -453,10 +454,11 @@ void test_projected_bias() {
     // fingerprint omits: the legacy run identity.
     const profile::Engine legacy{"inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1"};
     const auto legacy_print = profile::resolve(legacy, in(profile::Name::standard, nullptr)).fingerprint();
-    // The other CUDA EXACT default (the screened head) is switched off too: its default is a non-builtin value as well.
+    // The other EXACT defaults (the screened head, the round fold) are switched off too: non-builtin values as well.
     profile::Inputs both_off = in(profile::Name::standard, nullptr);
     both_off.env = [](const char* key) -> const char* {
-        return std::strcmp(key, "STRIX_INK_ATTN_PROJECTED_BIAS") == 0 || std::strcmp(key, "STRIX_INK_SCREENED_HEAD") == 0
+        return std::strcmp(key, "STRIX_INK_ATTN_PROJECTED_BIAS") == 0 || std::strcmp(key, "STRIX_INK_SCREENED_HEAD") == 0 ||
+                       std::strcmp(key, "STRIX_INK_PREPARED_ROUND_FOLD") == 0
                    ? "0" : nullptr;
     };
     require(profile::resolve(mini::kMiniProfile, both_off).fingerprint() == legacy_print,
@@ -564,7 +566,8 @@ void test_verify_rows() {
     const profile::Engine legacy{"inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1"};
     profile::Inputs exact_off = in(profile::Name::standard, nullptr);  // the two CUDA EXACT defaults off (their builtins)
     exact_off.env = [](const char* key) -> const char* {
-        return std::strcmp(key, "STRIX_INK_ATTN_PROJECTED_BIAS") == 0 || std::strcmp(key, "STRIX_INK_SCREENED_HEAD") == 0
+        return std::strcmp(key, "STRIX_INK_ATTN_PROJECTED_BIAS") == 0 || std::strcmp(key, "STRIX_INK_SCREENED_HEAD") == 0 ||
+                       std::strcmp(key, "STRIX_INK_PREPARED_ROUND_FOLD") == 0
                    ? "0" : nullptr;
     };
     require(profile::resolve(mini::kMiniProfile, exact_off).fingerprint() ==
@@ -762,7 +765,8 @@ void test_screened_head_row() {
     const profile::Engine legacy{"inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1"};
     profile::Inputs both_off = in(profile::Name::standard, nullptr);  // the other CUDA EXACT default off too
     both_off.env = [](const char* key) -> const char* {
-        return std::strcmp(key, "STRIX_INK_ATTN_PROJECTED_BIAS") == 0 || std::strcmp(key, "STRIX_INK_SCREENED_HEAD") == 0
+        return std::strcmp(key, "STRIX_INK_ATTN_PROJECTED_BIAS") == 0 || std::strcmp(key, "STRIX_INK_SCREENED_HEAD") == 0 ||
+                       std::strcmp(key, "STRIX_INK_PREPARED_ROUND_FOLD") == 0
                    ? "0" : nullptr;
     };
     require(profile::resolve(mini::kMiniProfile, both_off).fingerprint() ==

@@ -33,8 +33,12 @@ struct MiniPreparedHipBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGqa
     bool fold_rounds() const { return fold; }
     static bool store_round(unsigned rows) { return rows > core::gemv_rows::max_rows; }
 
+    // Decode heights: one launch for up to dense_linear::kTightGroupMax projections of one input (q, relative, sink,
+    // gate, and k / v where they share it). Each block runs its projection's own tight-row body, so the stored values
+    // are the bits of the narrower groups; fewer launches per visit. STRIX_INKLING_HIP_TIGHT_GROUP=0 keeps the
+    // fma_rows::kGroupMax groups.
     static bool use_wide_tight_group(unsigned rows) {
-        static const bool enabled = strix::envcfg::flag("STRIX_INKLING_HIP_TIGHT_GROUP", false);
+        static const bool enabled = strix::envcfg::flag("STRIX_INKLING_HIP_TIGHT_GROUP", true);
         return enabled && rows <= core::gemv_rows::max_rows;
     }
 

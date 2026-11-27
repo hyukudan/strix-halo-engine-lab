@@ -79,7 +79,8 @@ public:
         // program route could not run (it had no embeddings prefill); no device receipt covers it yet.
         const char* row_route = strix::envcfg::text("STRIX_INKLING_PLAIN_ROW_ROUTE");
         if (row_route && std::string_view(row_route) == "resident") plain_program = false;
-        if (plain_program && !combine_image && !prepared_round_fold && !narrow_experts) {
+        // The fold the backend runs (levers), not the request: CUDA declines the default-on fold, so the program stays.
+        if (plain_program && !combine_image && !levers.prepared_round_fold && !narrow_experts) {
             plain_.emplace(decoder_, true, mini_latency_forms(kMiniDefaultForms));
             decoder_.set_plain_row_route([this](unsigned token, std::span<float> logits) {
                 return plain_->decode(token, logits);
@@ -97,7 +98,7 @@ public:
         // Off switch STRIX_INKLING_WINDOW_PROGRAMS=0. With a drafter every width is captured here, at load, so no capture
         // wall enters a timed decode (prewarm_window_programs; the line counts them, and the end line counts any later).
         const bool asked = mini_window_programs_requested();  // the server's rule too (inkling2_mini_weight_options.hpp)
-        const bool proven = mini_window_programs_proven(combine_image, prepared_round_fold, narrow_experts,
+        const bool proven = mini_window_programs_proven(combine_image, levers.prepared_round_fold, narrow_experts,
                                                         controller_one_plane, moe_w4a4, attn_projected_bias, storage);
         if (asked && proven) decoder_.set_window_programs(true);
         else if (asked) std::cerr << "inkling2 verify window programs declined (unproven for this profile: the identity "

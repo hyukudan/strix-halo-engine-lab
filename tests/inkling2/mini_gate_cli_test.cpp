@@ -413,14 +413,14 @@ void test_options() {
     require(parse({"1", "--profile", "exact"}).tier.profile == Name::standard, "expected explicit exact");
     require(parse({"1", "--profile", "fast"}).tier.profile == Name::fast, "expected FAST");
     require(parse({"1", "--profile", "turbo"}).tier.profile == Name::turbo, "expected TURBO");
-    // The prepared-attention round fold is off in every profile by default; STRIX_INK_PREPARED_ROUND_FOLD=1 selects it
-    // through the same resolution the server reads (tests/inkling2/mini_serve_test.cpp).
+    // The prepared-attention round fold is on in every profile by default; STRIX_INK_PREPARED_ROUND_FOLD=0 switches it
+    // off through the same resolution the server reads (tests/inkling2/mini_serve_test.cpp).
     set_round_fold_env(nullptr);
     for (const auto* tier : {"exact", "fast", "turbo"})
-        require(!strix::inkling2::mini_prepared_round_fold(parse({"1", "--profile", tier}).tier), "round fold off by default");
-    set_round_fold_env("1");
+        require(strix::inkling2::mini_prepared_round_fold(parse({"1", "--profile", tier}).tier), "round fold on by default");
+    set_round_fold_env("0");
     for (const auto* tier : {"exact", "fast", "turbo"})
-        require(strix::inkling2::mini_prepared_round_fold(parse({"1", "--profile", tier}).tier), "explicit round fold");
+        require(!strix::inkling2::mini_prepared_round_fold(parse({"1", "--profile", tier}).tier), "round fold off switch");
     set_round_fold_env(nullptr);
     require(strix::inkling2::mini_controller_one_plane(parse({"1", "--profile", "fast", "--controller-planes", "1"}).tier),
             "CLI must resolve the explicit one-plane candidate");
@@ -494,9 +494,10 @@ void test_options() {
             "expected evaluation-order null arm");
     std::ostringstream profile_line;
     cli::write_profile(gate.tier, profile_line, true);
-    // The speculation row's builtin (auto) reports no lever; the two CUDA EXACT defaults are the only levers off their
-    // builtin, named in table order.
-    require(profile_line.str() == "profile exact levers inkling2-mini-attn-projected-bias@1=1 "
+    // The speculation row's builtin (auto) reports no lever; the EXACT defaults (round fold, the two CUDA ones) are the
+    // only levers off their builtin, named in table order.
+    require(profile_line.str() == "profile exact levers inkling2-mini-prepared-round-fold@1=1 "
+                                  "inkling2-mini-attn-projected-bias@1=1 "
                                   "inkling2-mini-screened-head@1=1 reference BASE\n",
             "device profile receipt differs");
 }

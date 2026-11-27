@@ -270,8 +270,8 @@ inline bool mini_moe_w4a4(const profile::Resolution& tier) {
 }
 
 // Resolved state of the prepared-attention round fold (HIP: the stage's plain BF16 rounds fold into their producers,
-// same bits; off unless STRIX_INK_PREPARED_ROUND_FOLD=1 selects it, in any profile). The serial CLI and the server
-// read it from the same resolution.
+// same bits; on in every profile, STRIX_INK_PREPARED_ROUND_FOLD=0 keeps the separate rounds). The serial CLI and the
+// server read it from the same resolution.
 inline bool mini_prepared_round_fold(const profile::Resolution& tier) {
     const auto* entry = tier.find(kMiniPreparedRoundFold);
     if (entry == nullptr || entry->value == "0") return false;

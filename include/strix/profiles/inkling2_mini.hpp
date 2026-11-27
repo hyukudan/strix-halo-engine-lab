@@ -155,8 +155,9 @@ inline constexpr std::string_view kMiniCombineImage = "inkling2-mini-combine-dow
 // Exact schedule trait of the HIP prepared attention (identity: the bits of the separate BF16 round passes): the stage's
 // plain BF16 rounds fold into their producers, the K/V convolutions round their reads and stores and, at prefill
 // heights, the output projection rounds each completed sum in its store with the separate pass's own function
-// (core::RoundStore::separate). Opt-in: off in every profile column (all cells empty, builtin 0); select it with
-// STRIX_INK_PREPARED_ROUND_FOLD=1 (any profile), through the one resolver the CLI, the gate and the server share.
+// (core::RoundStore::separate). On in every profile column (same bits; each fold removes one elementwise launch, three
+// per decode visit); STRIX_INK_PREPARED_ROUND_FOLD=0 keeps the separate rounds, through the one resolver the CLI, the
+// gate and the server share.
 inline constexpr std::string_view kMiniPreparedRoundFold = "inkling2-mini-prepared-round-fold@1";
 // Exact lever: the CUDA prompt flash projects the relative bias itself (cuda_core::PreparedBf16Projection)
 // instead of reading the [row][head][distance] image the prepare stage produces. Same FP32 FMA chain in feature order,
@@ -234,11 +235,13 @@ inline constexpr std::array<profile::Lever, 19> kMiniLevers{{
      "operand-position fixture); gfx1151 only",
      false, {}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniPreparedRoundFold, .env = "STRIX_INK_PREPARED_ROUND_FOLD", .option = "",
-     .value = {"", "", "", ""}, .builtin = "0",
+     .value = {"1", "1", "1", "1"}, .builtin = "0",
      .kind = profile::Kind::exact, .ready = {true, true, true, true}, .runnable = {true, true, true, true},
      .target = "", .off = "0",
-     .source = "tests/core/round_fold_hip.hip (every store: the separate round's bits) and the isolated fold off/on "
-               "identity ticket of the HIP prepared attention",
+     .source = "tests/core/round_fold_hip.hip (every store: the separate round's bits), the isolated fold off/on "
+               "identity ticket of the HIP prepared attention, and gfx1151 one-lane decode A/B (CLI, EXACT, code prompt, "
+               "256 tokens, 5 alternated pairs with the wide decode projection group): greedy ids equal, on faster in "
+               "every pair",
      .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {kMiniExpertsNvfp4, "STRIX_MOE_EXPERTS_NVFP4", "", {"", "", "", "1"}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
