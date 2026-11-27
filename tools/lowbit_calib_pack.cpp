@@ -237,9 +237,15 @@ std::map<std::string, Selection, std::less<>> select(const Args& args, const wei
             const auto bytes = integer(std::string_view(line).substr(last + 1U));
             if (name_format == "keep") continue;
             const auto source = resolve(name);
-            if (bytes != wei::strixpack_matrix_bytes(wei::strixpack_format(name_format), source.rows, source.columns))
-                throw std::invalid_argument("pack plan bytes disagree with geometry of " + name);
-            selected.emplace(name, Selection{name, parse_format(name_format), technique});
+            // A plan row names any storage of this tool: the group-scaled q4 / q6 rows (one technique per row, so a
+            // mixed allocation picks rounding or error feedback per matrix) or a Strix pack format.
+            const auto format = parse_format(name_format);
+            const std::uint64_t expected = format == Format::q4 ?
+                source.rows * wei::Q4G64Storage::row_bytes(source.columns) :
+                format == Format::q6 ? source.rows * wei::Q6G64Storage::row_bytes(source.columns) :
+                wei::strixpack_matrix_bytes(wei::strixpack_format(name_format), source.rows, source.columns);
+            if (bytes != expected) throw std::invalid_argument("pack plan bytes disagree with geometry of " + name);
+            selected.emplace(name, Selection{name, format, technique});
         }
         if (!in.eof()) throw std::runtime_error("cannot finish reading " + args.plan);
     } else {
