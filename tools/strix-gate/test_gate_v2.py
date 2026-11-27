@@ -738,6 +738,51 @@ class HeadFormat(unittest.TestCase):
             self.assertEqual(rc, 2, out)
             self.assertIn("frozen qualification IDs differ", out)
 
+    def test_promotion_requires_a_paired_witness_and_frozen_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cases = [f"w{i:02d}" for i in range(13)]
+            d = self.kit(directory, cases, cand_ids=20)
+            plan, witness = d / "plan.json", d / "witness.json"
+            records, windows = {}, {}
+            for case in cases:
+                ids = np.array((d / f"{case}.ids").read_text(encoding="utf-8").split(), dtype="<u4")
+                labels = hashlib.sha256(ids.tobytes()).hexdigest()
+                windows[case] = {"class": "prose", "ids_sha256": labels}
+                records[case] = {
+                    arm: {"binary_sha256": "a" * 64, "model_sha256": "b" * 64,
+                          "numerical_config_sha256": ("d" if arm == "fast" else "c") * 64,
+                          "logits_sha256": hashlib.sha256((d / f"{case}-{arm}.f32").read_bytes()).hexdigest(),
+                          "ids_sha256": labels, "head_ids_sha256": labels,
+                          "control": {"order": "test-order@1", "applications": self.R} if arm == "n0" else None}
+                    for arm in ("exact", "fast", "n0")
+                }
+            plan.write_text(json.dumps({"schema": "strix-gate-frozen-qualification/v1", "windows": windows,
+                                        "reference_nll": {"prose": [10.0] * 3},
+                                        "null_envelope": {"max_kl": 1.0, "min_top1": 0.0,
+                                                          "max_abs_dnll": 1.0}}), encoding="utf-8")
+            plan_sha = hashlib.sha256(plan.read_bytes()).hexdigest()
+            witness_doc = {"schema": "strix-gate-held-out-witness/v1", "plan_sha256": plan_sha, "cases": records}
+            args = ["--promotion", "--frozen-qualification", str(plan), plan_sha,
+                    "--held-out-witness", str(witness)]
+            self.assertEqual(self.gate(d, "--promotion")[0], 2)
+            self.assertEqual(self.gate(d)[0], 0)
+            self.assertNotIn("promotion", json.loads((d / "g.json").read_text(encoding="utf-8")))
+            witness.write_text(json.dumps(witness_doc), encoding="utf-8")
+            rc, out = self.gate(d, *args)
+            self.assertEqual(rc, 0, out)
+            receipt = json.loads((d / "g.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["promotion"]["plan_sha256"], plan_sha)
+            self.assertEqual(receipt["promotion"]["witness_sha256"], hashlib.sha256(witness.read_bytes()).hexdigest())
+            self.assertEqual(self.gate(d, *args, "--allow-null-floor")[0], 2)
+            for field in ("logits_sha256", "ids_sha256", "model_sha256"):
+                with self.subTest(field=field):
+                    record = records[cases[0]]["fast"]
+                    previous = record[field]
+                    record[field] = "0" * 64
+                    witness.write_text(json.dumps(witness_doc), encoding="utf-8")
+                    self.assertEqual(self.gate(d, *args)[0], 2)
+                    record[field] = previous
+
     def test_nonfinite_last_head_row_is_checked_without_scoring_an_extra_label(self):
         with tempfile.TemporaryDirectory() as d:
             d = self.kit(d, [f"w{i:02d}" for i in range(13)])

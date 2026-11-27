@@ -813,6 +813,8 @@ def compare_v2(a, names, results, null_prompt_kl, report, null_prompt=None):
 
 
 def compare(a):
+    if not a.expect_identical:
+        print("HISTORICAL COMPARISON: use gate_v2.py qual --promotion for tier admission")
     if getattr(a, "route_flips", None):
         raise GateError("MoE qualification requires free-running logits and replay receipts; use gate_v2.py qual "
                         "with --cand-free and --null-free")
@@ -847,7 +849,7 @@ def compare(a):
         nulls.append((dn, mn))
     onset = check_floor_execution(ma, mb, nulls, a.engine, a.profile) if a.dnll_rule == "floor" else None
     mm_floor = a.dnll_rule == "floor" and a.engine == "minimax"
-    report = {"ref": {k: ma[0][k] for k in ("run_id", "arm", "env", "attest")}, "cand": {k: mb[0][k] for k in ("run_id", "arm", "env", "attest")},
+    report = {"purpose": "identity" if a.expect_identical else "historical", "ref": {k: ma[0][k] for k in ("run_id", "arm", "env", "attest")}, "cand": {k: mb[0][k] for k in ("run_id", "arm", "env", "attest")},
               "ref_binary": [m["binary"]["sha256"] for m in ma], "cand_binary": [m["binary"]["sha256"] for m in mb], "prompts": {}}
     if a.dnll_rule == "floor":
         report["ref"]["execution"] = ma[0]["execution"]
@@ -1282,7 +1284,7 @@ def main(argv=None):
     w.add_argument("--engine-log", required=True, help="the rank's complete engine stdout + stderr")
     w.add_argument("--model", required=True, help="model directory the rank loaded")
     w.add_argument("--out", required=True, help="execution-r<rank>.json to write (then: seal --execution-witness)")
-    c = sub.add_parser("compare")
+    c = sub.add_parser("compare", help="compare archived captures or verify bit identity")
     c.add_argument("ref")
     c.add_argument("cand")
     c.add_argument("--ranks", type=int, nargs="+", default=[0])

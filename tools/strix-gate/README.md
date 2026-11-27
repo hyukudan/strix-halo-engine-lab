@@ -487,6 +487,18 @@ uint32 IDs. Step and spool captures include their labels in the hashed logit fil
 from the executed arms. The checker validates the binding of that record to the inputs. Disabling the check permits
 historical fixtures with no launcher record.
 
+Tier promotion uses `qual --promotion --frozen-qualification PLAN.json SHA256
+--held-out-witness WITNESS.json --json RECEIPT.json`, with the normal capture options.
+The frozen plan includes a null envelope. The witness has schema
+`strix-gate-held-out-witness/v1`, `plan_sha256` and a `cases` map from case to arm to
+capture record. Each arm records `ids_sha256`, `logits_sha256`, `binary_sha256`,
+`model_sha256` and `numerical_config_sha256`. For reference and null arms, add the
+order control and, for head dumps, the head IDs digest specified above. A replayed
+case also includes both free-running arms with the same execution identities as
+their corresponding replayed arms. The promotion receipt records the verified
+plan, witness, binary and pack digests. Sealed-arm comparisons remain available
+for historical evidence and bit-identity checks.
+
 For preregistered qualification, `qual --frozen-qualification PLAN.json SHA256` pins the complete case set, content
 classes, IDs and class-specific R4 reference distribution. Publish the SHA-256 before collecting the candidate.
 The plan has `schema` equal to `strix-gate-frozen-qualification/v1`, a `windows` map from case to

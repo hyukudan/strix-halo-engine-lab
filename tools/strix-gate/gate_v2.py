@@ -699,6 +699,19 @@ def verify_null_witness(witness, case, arms, capture_hashes, head_ids):
                 raise GateError(f"{case}.{arm}: null witness needs an applied order-only control")
 
 
+def verify_promotion_pair(records, case, arm, info, baseline, labels_sha, expected_config=None):
+    rec = records.get(arm)
+    fields = ("binary_sha256", "model_sha256", "numerical_config_sha256", "logits_sha256")
+    if not isinstance(rec, dict) or not all(digest(rec.get(k)) for k in fields):
+        raise GateError(f"{case}.{arm}: promotion witness needs candidate and capture identities")
+    if (info.get("ref_sha256") != baseline["logits_sha256"] or info.get("cand_sha256") != rec["logits_sha256"]
+            or rec.get("ids_sha256") != labels_sha):
+        raise GateError(f"{case}.{arm}: promotion witness differs from the paired captures or held-out IDs")
+    if expected_config is not None and any(rec[k] != expected_config[k] for k in fields[:3]):
+        raise GateError(f"{case}.{arm}: promotion witness differs from the replayed execution")
+    return tuple(rec[k] for k in fields[:3])
+
+
 def qual(a):
     """option_qual adapter: reduce every case's REF vs CAND / NULL logits, check replay receipts, count free flips."""
     out = pathlib.Path(a.out)
@@ -720,6 +733,18 @@ def qual(a):
             return reduce_pair(ref, cand, a.format, **kw)
         return _r4_reduce_pair(reduce_pair, ref, cand, a.format, opener, **kw)
 
+    promotion = getattr(a, "promotion", False)
+    promotion_path = getattr(a, "held_out_witness", None)
+    if promotion and not (getattr(a, "frozen_qualification", None) and promotion_path and a.json):
+        raise GateError("--promotion requires --frozen-qualification, --held-out-witness and --json")
+    if promotion_path and not promotion:
+        raise GateError("--held-out-witness requires --promotion")
+    if promotion and getattr(a, "allow_null_floor", False):
+        raise GateError("promotion requires the absolute pooled bars")
+    if promotion and getattr(a, "null_control_witness", None):
+        raise GateError("the promotion witness includes the null control witness")
+    if promotion and bool(a.cand_free) != bool(a.null_free):
+        raise GateError("promotion requires both free-running arms for replay")
     tier = getattr(a, "tier", "fast") or "fast"
     if len(set([a.ref, a.cand, *a.null])) != 2 + len(a.null):
         raise GateError("v2 needs distinct reference, candidate and null arms")
@@ -757,9 +782,27 @@ def qual(a):
                                             for w in frozen_windows.values())):
         raise GateError("--document-uncertainty needs a frozen qualification plan with a document ID for every window")
     witness_path = getattr(a, "null_control_witness", None)
-    if null_envelope is not None and not witness_path:
+    promotion_sha = None
+    execution_pairs = set()
+    if promotion:
+        if null_envelope is None:
+            raise GateError("promotion requires a frozen null envelope")
+        with open(promotion_path, "rb", opener=opener) as f:
+            data = f.read(R4_MAX_INPUT_BYTES + 1)
+        if len(data) > R4_MAX_INPUT_BYTES:
+            raise GateError("promotion witness exceeds size limit")
+        doc = json.loads(data)
+        if (not isinstance(doc, dict) or doc.get("schema") != "strix-gate-held-out-witness/v1"
+                or doc.get("plan_sha256") != plan[1] or not isinstance(doc.get("cases"), dict)
+                or set(doc["cases"]) != set(cases) or len(cases) != len(set(cases))):
+            raise GateError("promotion witness must name the frozen plan and cover every scored case once")
+        promotion_sha = hashlib.sha256(data).hexdigest()
+        witness_path = None
+        witness = doc["cases"]
+    elif null_envelope is not None and not witness_path:
         raise GateError("a frozen null envelope requires --null-control-witness")
-    witness = None
+    if not promotion:
+        witness = None
     if witness_path:
         with open(witness_path, encoding="utf-8", opener=opener) as f:
             doc = json.load(f)
@@ -785,7 +828,8 @@ def qual(a):
 
         ra, ra_info = reduce(logit(a.ref), logit(a.cand), **kw)
         frozen = frozen_windows.get(case)
-        if frozen and ids_digest(manifest[case] if head else ra["label"]) != frozen["ids_sha256"]:
+        labels_sha = ids_digest(manifest[case] if head else ra["label"]) if frozen else None
+        if frozen and labels_sha != frozen["ids_sha256"]:
             raise GateError(f"{case}: frozen qualification IDs differ from the scored window")
         null_pairs = [reduce(logit(a.ref), logit(n), **kw) for n in a.null]
         nulls = [rows for rows, _ in null_pairs]
@@ -794,7 +838,25 @@ def qual(a):
             if any(info.get("ref_sha256") != ref_sha for _, info in null_pairs):
                 raise GateError(f"{case}: reference capture changed while reading controls")
             capture_hashes = [ref_sha, *(info.get("cand_sha256") for _, info in null_pairs)]
-            verify_null_witness(witness, case, [a.ref, *a.null], capture_hashes, manifest[case] if head else None)
+            controls = [a.ref, *a.null]
+            null_witness = witness
+            if promotion:
+                records = witness[case]
+                free_arms = [a.cand_free, a.null_free] if route(a.ref).exists() else []
+                expected_arms = [*controls, a.cand, *free_arms]
+                if (None in expected_arms or len(set(expected_arms)) != len(expected_arms)
+                        or not isinstance(records, dict) or set(records) != set(expected_arms)):
+                    raise GateError(f"{case}: promotion witness must cover all distinct executed arms")
+                if any(not isinstance(rec, dict) or rec.get("ids_sha256") != labels_sha for rec in records.values()):
+                    raise GateError(f"{case}: promotion witness differs from the held-out IDs")
+                null_witness = {case: {arm: records[arm] for arm in controls}}
+            verify_null_witness(null_witness, case, controls, capture_hashes, manifest[case] if head else None)
+            if promotion:
+                baseline = records[a.ref]
+                candidate = verify_promotion_pair(records, case, a.cand, ra_info, baseline, labels_sha)
+                if tier == "fast" and candidate[1] != baseline["model_sha256"]:
+                    raise GateError(f"{case}: FAST promotion must use the same reference and candidate pack")
+                execution_pairs.add((baseline["binary_sha256"], baseline["model_sha256"], *candidate[:2]))
         if ra["nonfinite_r"].any() or ra_info.get("ref_unscored_nonfinite"):
             raise GateError(f"{case}: non-finite reference logits")
         if any(rows["nonfinite_c"].any() or info.get("cand_unscored_nonfinite") for rows, info in null_pairs):
@@ -829,6 +891,9 @@ def qual(a):
                 check_free_record(route_receipt(err(arm), what), route(arm), f[key], what, null=key == "null")
             fc, fc_info = reduce(logit(a.ref), logit(a.cand_free), **kw)
             fn, fn_info = reduce(logit(a.ref), logit(a.null_free), **kw)
+            if promotion:
+                verify_promotion_pair(records, case, a.cand_free, fc_info, baseline, labels_sha, records[a.cand])
+                verify_promotion_pair(records, case, a.null_free, fn_info, baseline, labels_sha, baseline)
             if (fc["nonfinite_r"].any() or fc_info.get("ref_unscored_nonfinite")
                     or fn["nonfinite_r"].any() or fn_info.get("ref_unscored_nonfinite")):
                 raise GateError(f"{case}: non-finite reference logits")
@@ -912,6 +977,10 @@ def qual(a):
             diagnostic = document_uncertainty(windows, frozen_windows)
             p["document_uncertainty"] = diagnostic
             print(f"DNLL DIAGNOSTIC (document clusters) {json.dumps(diagnostic, sort_keys=True)}")
+    if promotion and len(execution_pairs) != 1:
+        raise GateError("promotion needs one paired reference and candidate binary and pack across cases")
+    if promotion and p["pass"] and ((a.cand_free and not replay) or (diag and traced != len(windows))):
+        raise GateError("promotion requires all declared replay or trace evidence")
     exit_code = EXIT[p["state"]]
     if a.json:
         doc = {"schema": "strix-fast-gate-v2/v1", "limits": limits, "ref": a.ref, "cand": a.cand, "null": a.null,
@@ -919,6 +988,12 @@ def qual(a):
                "windows": [{k: v for k, v in w.items() if k != "_rows"} for w in windows], "pooled": p}
         if tier != "fast":
             doc["tier"] = tier
+        if promotion:
+            ref_binary, ref_pack, cand_binary, cand_pack = next(iter(execution_pairs))
+            doc["promotion"] = {"schema": "strix-gate-promotion/v1", "plan_sha256": plan[1],
+                                "witness_sha256": promotion_sha, "reference_binary_sha256": ref_binary,
+                                "reference_pack_sha256": ref_pack, "candidate_binary_sha256": cand_binary,
+                                "candidate_pack_sha256": cand_pack}
         if replay:
             doc.update(cand_free=a.cand_free, null_free=a.null_free)
         with open(a.json, "w", encoding="utf-8", opener=opener) as f:
@@ -1217,6 +1292,8 @@ def main(argv=None):
                    "with --manifest, else one class)")
     q.add_argument("--frozen-qualification", nargs=2, metavar=("PLAN", "SHA256"),
                    help="require the preregistered window IDs, content labels and reference NLL bars")
+    q.add_argument("--promotion", action="store_true", help="write a promotion receipt with verified paired evidence")
+    q.add_argument("--held-out-witness", metavar="JSON", help="bind the frozen IDs, captures and execution identities of every promotion arm")
     q.add_argument("--document-uncertainty", action="store_true", help="also report dNLL SE for the frozen plan's document clusters")
     q.add_argument("--r4-assess", metavar="ORIGINAL_NLLS", help="diagnostic only on stderr: JSON {content class: "
                    "[original reference NLLs]} (requires --classes and --manifest)")
