@@ -103,6 +103,14 @@ void hca_carry() {
     ernie::AttentionHistory weighted;
     output = ernie::attention_reference(0, s, read, first, weighted, project);
     near(output[0], 0.5F, "HCA preserves the learned KV gain through attention and the output gate");
+    for (unsigned p = 1; p < 127; ++p)
+        output = ernie::attention_reference(0, s, read, rest, weighted, project);
+    check(output[0] == 0.0078125F, "checkpoint HCA sees the raw row until the first group closes");
+    output = ernie::attention_reference(0, s, read, rest, weighted, project);
+    check(output[0] == 0.01153564453125F, "checkpoint HCA includes the completed group alongside the raw row");
+    output = ernie::attention_reference(0, s, read, rest, weighted, project);
+    check(output[0] == 0.00384521484375F, "checkpoint HCA reuses the committed compressed KV value");
+
 }
 
 void compressed_index() {

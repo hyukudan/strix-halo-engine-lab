@@ -178,13 +178,15 @@ std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
         if (row == state.compressed.size() / width) return pooled;
         return std::span(state.compressed).subspan(row * width, width);
     };
-    std::vector<float> compressed_values = state.compressed;
-    compressed_values.insert(compressed_values.end(), pooled.begin(), pooled.end());
+    std::vector<float> compressed_values;
     if (!checkpoint) {
+        compressed_values = state.compressed;
+        compressed_values.insert(compressed_values.end(), pooled.begin(), pooled.end());
         compressed_rope.apply(compressed_values, width, true);
         window_rope.apply(compressed_values, width);
     }
     const auto pooled_value = [&](std::size_t row) {
+        if (checkpoint) return pooled_key(row);
         return std::span<const float>(compressed_values).subspan(row * width, width);
     };
     std::vector<float> heads(query.size());
