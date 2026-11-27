@@ -34,6 +34,14 @@ struct Copy {
     __device__ void operator()(std::size_t i) const { output[i] = input[i]; }
 };
 
+// out[i] = a[i] + b[i] in FP32 (one rounding; out may alias a).
+struct Add {
+    const float* a;
+    const float* b;
+    float* out;
+    __device__ void operator()(std::size_t i) const { out[i] = __fadd_rn(a[i], b[i]); }
+};
+
 struct WidenRepeatedBf16Row {
     const std::uint16_t* input;
     float* output;
