@@ -81,9 +81,15 @@ void catalogue() {
         require(profile->memory_bytes == 0 && profile->memory_gbytes_ps == 0 && profile->lowbit_rows.small_rows == 0,
                 "unmeasured catalogue row cannot carry a memory cap, bandwidth or schedule");
     }
-    for (const auto& p : device::catalogue())
-        if (p.name != "custom" && !p.unmeasured)
+    for (const auto& p : device::catalogue()) {
+        if (p.unmeasured) {
+            require(p.peaks.fp32 == 0.0 && p.peaks.fp16 == 0.0 && p.peaks.bf16 == 0.0 &&
+                        p.peaks.fp8 == 0.0 && p.peaks.fp4 == 0.0 && p.peaks.int8 == 0.0,
+                    "unmeasured catalogue row cannot carry peak arithmetic rates");
+        } else if (p.name != "custom") {
             require(p.memory_bytes > 0 && p.memory_gbytes_ps > 0 && p.units > 0, "every sized profile retains its facts");
+        }
+    }
     require(device::find_interconnect("pcie5x16") && !device::find_interconnect("nvlink"), "interconnect classes");
     // The exported TOML keeps the named v1 tables, with all source values in catalogue order.
     using model_description::Value;
