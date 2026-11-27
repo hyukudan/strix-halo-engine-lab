@@ -35,19 +35,20 @@ inline constexpr std::array<strix::profile::Lever, 14> profile_table{{
      "D1: BF16 flash attention, FP16 dense, relaxed MoE with FP16 down, FP16 Engram and shared expert. Replay OFF. "
      "Unmatched requests retain the previous prefill route (explicit switches still apply).",
      false, {}, true, {}, {{{"0", "v1"}, {"1", "ds41-prefill-d1-v1"}}}},
-    // Prefill only: FAST policy ds41-decoder-replay-bounded-v1 (value R rows, a multiple of 128): every decoder layer runs
-    // its last R rows, window keys floored at the cut, its dense products in the exact form (bounded run == full run
-    // with the floor, bit for bit; not bit-equal to the full decode). 'fast' runs R=256 (key floor
-    // round_down(T - R, 256)) on an admitted D1 request inside its band receipts; TURBO nests it (empty cell). OFF in default / quality.
-    // Qualified by FAST gate v2 D1R (8K and 32K classes). A run that needs every decoder row (a deferred serve piece,
-    // in-run prefix snapshots, a group pass) takes the exact plan instead. Set, it enters the profile fingerprint (rank
-    // agreement, prefix-cache identity).
-    {"decoder_replay", "STRIX_DS41_DECODER_REPLAY", "", {"", "256", "", ""}, "0", strix::profile::Kind::bit_changing,
-     {true, true, true, false}, {true, false, true, false}, "", "0",
-     "FAST bounded decoder replay R=256 (ds41-replay-r256-v1, key floor round_down(T - R, 256)) on the resolved fast set; "
-     "FAST gate v2 D1R on fast set + R256: qualified (8K and 32K classes, 28 windows, 1,764 rows, final PASS: KL 0.0101, "
-     "top-1 0.972, dNLL +0.0001 se 0.0037, route flips 0.37 x null; 8K class KL 0.0121 top-1 0.962, 32K class KL 0.0080 "
-     "top-1 0.982 dNLL +0.0060 se 0.0044)",
+    // Prefill only: TURBO policy ds41-decoder-replay-bounded-v1 (value R rows, a multiple of 128): every decoder layer
+    // runs its last R rows, window keys floored at the cut, its dense products in the exact form (bounded run == full
+    // run with the floor, bit for bit; not bit-equal to the full decode). 'turbo' runs R=256 (key floor
+    // round_down(T - R, 256)) on an admitted D1 request inside its TURBO band receipt (prompts 4,096..8,192); OFF in
+    // default / fast / quality. Held-out re-score (gate_r, heldout/v1): FAST gate FAIL in both bands (dNLL), TURBO gate
+    // PASS at 8K, FAIL at 32K (two windows) -> no tier above 8,192 (explicit STRIX_DS41_DECODER_REPLAY=256 only). A run
+    // that needs every decoder row (a deferred serve piece, in-run prefix snapshots, a group pass) takes the exact plan
+    // instead. Set, it enters the profile fingerprint (rank agreement, prefix-cache identity).
+    {"decoder_replay", "STRIX_DS41_DECODER_REPLAY", "", {"", "", "", "256"}, "0", strix::profile::Kind::bit_changing,
+     {true, true, true, true}, {true, false, true, false}, "", "0",
+     "TURBO bounded decoder replay R=256 (ds41-replay-r256-v1, key floor round_down(T - R, 256)) over D1, prompts "
+     "4,096..8,192 only. Held-out gate v2 re-score (heldout/v1, 13 windows / 819 rows per band): FAST FAIL 8K (dNLL "
+     "+0.0122 se 0.0080 > +0.01) and 32K (dNLL +0.0225 se 0.0111, windows en32-a / chat32-b); TURBO tier PASS 8K "
+     "(KL 0.0122, top-1 0.961, dNLL +0.0122 <= 0.03, flips 0.42 x null), TURBO FAIL 32K (windows)",
      false, {false, false, false, false}, true, {},
      {{{"0", "v1"}, {"256", "ds41-replay-r256-v1"}}}},
     {"engram_f16wmma", "STRIX_DS41_FAST_ENGRAM", "", {}, "0", strix::profile::Kind::bit_changing,
@@ -76,55 +77,48 @@ inline constexpr std::array<strix::profile::Lever, 14> profile_table{{
      {}, {}, "", "0", "explicit FP16 dense diagnostic; requires the optional hipBLASLt build", false, {}, true, {}, {{{"0", "v1"}, {"1", "fp16-hipblaslt-v1"}}}},
 }};
 
+// Held-out re-score (gate_r 2026-11-27, origin/main d179ad0d08 quality binary fd050a5a, corrected gate v2, no null
+// floor, window set tools/strix-gate/heldout/v1: prose en / es, code, chat; reference-only pre-filter drops windows
+// with label == reference top-1 > 0.95). Receipts: gate_r score/{ds8,ds32,all}.
 inline constexpr std::string_view kFastGateD1 =
-    "FAST gate v2 D1, complete D1 set without replay, pair, prompts <= 8,192 and 32,768: 28 windows, 1,764 rows, final PASS "
-    "(KL 0.0093, top-1 0.972, dNLL -0.0037 se 0.0035, route flips 1.05 x null). "
-    "Gate re-score pending: the current gate v2 re-run on the saved D1 / D1R dumps gives NO VERDICT (rule R3: 7 "
-    "of the 28 windows are greedy, every label equals the reference top-1; without them the 32K class has fewer "
-    "than 800 rows). The metrics are unchanged; non-greedy 32K windows must be dumped again on the GPU. The FAST "
-    "default stays until the owner decides.";
-inline constexpr std::string_view kFastGateD1R =
-    "FAST gate v2 D1R, complete D1 set + decoder replay R=256, pair, prompts <= 8,192 and 32,768: 28 windows, 1,764 "
-    "rows, final PASS (KL 0.0101, top-1 0.972, dNLL +0.0001 se 0.0037, route flips 0.37 x null). "
-    "Gate re-score pending: the current gate v2 re-run on the saved D1 / D1R dumps gives NO VERDICT (rule R3: 7 "
-    "of the 28 windows are greedy, every label equals the reference top-1; without them the 32K class has fewer "
-    "than 800 rows). The metrics are unchanged; non-greedy 32K windows must be dumped again on the GPU. The FAST "
-    "default stays until the owner decides.";
-inline constexpr strix::profile::FastGate fast_gates[] = {{"d1_prefill", "1", kFastGateD1},
-                                                          {"decoder_replay", "256", kFastGateD1R}};
+    "FAST gate v2 D1 (complete D1 set without replay, pair, quality head 64), held-out windows heldout/v1: 8,128-token "
+    "class 13 windows / 819 rows (2 of 15 dropped by the reference pre-filter), final PASS (KL 0.0105, top-1 0.961, "
+    "dNLL +0.0003 se 0.0064, route flips 1.07 x null); 32,768-token class 13 windows / 819 rows (2 dropped), final "
+    "PASS (KL 0.0142, top-1 0.965, dNLL -0.0024 se 0.0090, flips 1.06 x null); pooled 1,638 rows PASS (KL 0.0124, "
+    "top-1 0.963, dNLL -0.0011 se 0.0055).";
+inline constexpr std::string_view kTurboGateD1R =
+    "Gate v2 D1R (D1 + decoder replay R=256), same held-out windows: FAST FAIL in both classes (8,128: KL 0.0122, "
+    "top-1 0.961, dNLL +0.0122 se 0.0080 > +0.01; 32,768: KL 0.0200, top-1 0.961, dNLL +0.0225 se 0.0111, windows "
+    "en32-a +0.117 / chat32-b +0.126). TURBO tier (KL <= 0.05, top-1 >= 0.90, dNLL <= 0.03, flips <= 2): 8,128 PASS "
+    "(flips 0.42 x null); 32,768 FAIL (windows en32-a, chat32-b) -> no tier above 8,192.";
+inline constexpr strix::profile::FastGate fast_gates[] = {{"d1_prefill", "1", kFastGateD1}};
 
 inline constexpr strix::profile::LadderRow ladder_rows[] = {
-    // Band receipts (bind_band_receipts per request): the complete D1 composition and, on top of it, the bounded
-    // decoder replay R=256. Timed on the pair CLI (gfx1151, one request) at 8,192 and 32,768 prompt tokens; the quality
-    // arms at 8,128 gave the same direction (16.148 / 16.179 s EXACT, 12.564 / 12.695 s D1). Outside the bands, or
-    // when either rank declines, the request keeps the previous prefill route. The 8,128 timing is D1 only. Lower edges
-    // timed on the pair CLI (ABBA, warm run, the FAST product D1 + R=256 vs EXACT; D1 alone is not a product execution:
-    // any explicit lever leaves the measured composition): 4,096 x1.60, 6,000 x1.57, 8,193 x1.58, 16,384 x1.55 -> the
-    // nominal edges stay.
+    // Band receipts (bind_band_receipts per request): the complete D1 composition (FAST) and, on top of it in TURBO
+    // only, the bounded decoder replay R=256 (4,096..8,192). Timed on the pair CLI (gfx1151, one request) at 8,192 and
+    // 32,768 prompt tokens; the quality arms at 8,128 gave the same direction (16.148 / 16.179 s EXACT, 12.564 / 12.695 s
+    // D1). Outside the bands, or when either rank declines, the request keeps the previous prefill route. Lower edges
+    // of D1 alone timed on the quality runner (gate_r, no row split, no cone, head 64, two runs, bit-equal hashes):
+    // 4,096 EXACT 9.84 / 9.01 s, D1 7.55 / 7.56 s (x1.19..1.30); 8,193 EXACT 17.81 / 17.68 s, D1 14.61 / 14.58 s (x1.21)
+    // -> the nominal edges stay. A drafter seed (served DSpark) rides only on the replay: FAST seeded requests decline D1.
     {.lever = "d1_prefill", .value = "1", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
      .device = "gfx1151", .min_context = 4096, .max_context = 8192, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1614.0 / 1128.5, .noise = 0.05,
-     .receipt = "D1 final 8K PASS. Pair CLI 8,192 tokens: EXACT 1,128.5 tok/s, D1 1,614 / 1,647 tok/s (no replay). Quality runner 8,128 tokens: EXACT 16.148 / 16.179 s, D1 12.564 / 12.695 s. "
-                "Lower edge 4,096: EXACT 4,089 ms, FAST (D1 + R256) 2,557 ms (x1.60); 6,000: x1.57.",
-     .identity = "ds41-prefill-d1-v1", .band_bound = true, .band_evidence = {{4096, 6000, 8128, 8192}, {8128, 32768}, kFastGateD1, false}},
+     .receipt = "D1 held-out 8K PASS. Pair CLI 8,192 tokens: EXACT 1,128.5 tok/s, D1 1,614 / 1,647 tok/s (no replay). Quality runner 8,128 tokens: EXACT 16.148 / 16.179 s, D1 12.564 / 12.695 s. "
+                "Lower edge 4,096 (quality runner, D1 alone): EXACT 9.84 / 9.01 s, D1 7.55 / 7.56 s (x1.19..1.30).",
+     .identity = "ds41-prefill-d1-v1", .band_bound = true, .band_evidence = {{4096, 8128, 8192}, {8128, 32768}, kFastGateD1, false}},
     {.lever = "d1_prefill", .value = "1", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
      .device = "gfx1151", .min_context = 8193, .max_context = 32768, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1808.6 / 1257.2, .noise = 0.05,
-     .receipt = "D1 final 32K PASS. Pair CLI 32,768 tokens: EXACT 1,257.2 tok/s, D1 1,808.6 tok/s (no replay). "
-                "Lower edge 8,193: EXACT 7,172 ms, FAST (D1 + R256) 4,537 ms (x1.58); 16,384: x1.55.",
-     .identity = "ds41-prefill-d1-v1", .band_bound = true, .band_evidence = {{8193, 16384, 32768}, {8128, 32768}, kFastGateD1, false}},
-    {.lever = "decoder_replay", .value = "256", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
+     .receipt = "D1 held-out 32K PASS. Pair CLI 32,768 tokens: EXACT 1,257.2 tok/s, D1 1,808.6 tok/s (no replay). "
+                "Lower edge 8,193 (quality runner, D1 alone): EXACT 17.81 / 17.68 s, D1 14.61 / 14.58 s (x1.21).",
+     .identity = "ds41-prefill-d1-v1", .band_bound = true, .band_evidence = {{8193, 32768}, {8128, 32768}, kFastGateD1, false}},
+    {.lever = "decoder_replay", .value = "256", .tier = strix::profile::Name::turbo, .phase = strix::profile::Phase::prefill,
      .device = "gfx1151", .min_context = 4096, .max_context = 8192, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1855.0 / 1647.0, .noise = 0.05,
-     .receipt = "D1R final PASS. Pair CLI 8,192 tokens over D1: 1,614 / 1,647 tok/s without replay, 1,855 tok/s with R=256. "
-                "Lower edge 4,096: FAST 2,557 ms vs EXACT 4,089 ms (x1.60); 6,000: x1.57.",
-     .identity = "ds41-replay-r256-v1", .band_bound = true, .band_evidence = {{4096, 6000, 8192}, {8128, 32768}, kFastGateD1R, false}},
-    {.lever = "decoder_replay", .value = "256", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
-     .device = "gfx1151", .min_context = 8193, .max_context = 32768, .min_lanes = 1, .max_lanes = 1,
-     .speedup = 1981.0 / 1808.6, .noise = 0.05,
-     .receipt = "D1R final PASS. Pair CLI 32,768 tokens over D1: 1,808.6 tok/s without replay, 1,981 tok/s with R=256. "
-                "Lower edge 8,193: FAST 4,537 ms vs EXACT 7,172 ms (x1.58); 16,384: x1.55.",
-     .identity = "ds41-replay-r256-v1", .band_bound = true, .band_evidence = {{8193, 16384, 32768}, {8128, 32768}, kFastGateD1R, false}},
+     .receipt = "D1R TURBO 8K PASS (held-out; FAST FAIL dNLL). Pair CLI 8,192 tokens over D1: 1,614 / 1,647 tok/s without replay, 1,855 tok/s with R=256. "
+                "Lower edge 4,096 (quality runner): D1 7.55 / 7.56 s, D1 + R256 4.24 / 4.23 s.",
+     .identity = "ds41-replay-r256-v1", .band_bound = true, .band_evidence = {{4096, 8128, 8192}, {8128}, kTurboGateD1R, false}},
 };
 
 }  // namespace strix::deepseek41::pair_defaults
