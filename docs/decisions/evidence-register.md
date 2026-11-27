@@ -307,6 +307,15 @@ drafter, 256 decode tokens per command line run; receipts q64 and q65. Catalogue
   input change. Reference rows at the new default: code auto 178.83 / plain 97.51 tok/s (656 prompt tokens), prose auto
   98.76 / plain 102.12 (478 prompt tokens).
 
+## Gemma 4 INT8 global KV shadow decode timing
+
+**observed** (2026-11). Radeon 8060S (gfx1151), Q4_K_M, `fast` profile, drafting off, one node, 128 greedy tokens, fresh
+process per run, ABBA. Catalogue row:
+[Int8 global KV shadow](../optimizations.md#g4-int8-global-kv-shadow).
+
+- G4D, decode C1 exact attention vs g4-dattn-f2: 2K 46.06 -> 48.31, 8K 41.65 -> 45.34, 32K 29.60 -> 43.21, 64K
+  21.18 -> 38.52 tok/s (x1.049 / x1.089 / x1.460 / x1.819; noise <= 2 %). C1 only: no multi-stream arm was timed.
+
 Detailed receipts (per-arm logs, tickets) remain outside Git.
 
 ## MiniMax serving host route default and the GLM 2x1x40 prefill layout
