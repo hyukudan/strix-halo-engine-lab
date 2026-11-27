@@ -263,6 +263,33 @@ bool check_weight_reads(HeaderSource& source, const wei::TensorIndex& index) {
     for (unsigned layer = 0; layer < mini::kPhysicalLayers; ++layer)
         if (mini::is_full_attention(layer)) ++full_layers;
     if (attention_converted != 7U * mini::kPhysicalLayers + 2U * full_layers) return false;
+    // The gate storage of a policy (weight::RoleStorage::gate) converts exactly the attention output gates, one per
+    // physical layer, and nothing else; with the attention-only Q8_0 row the gate was already among its tensors, so
+    // naming it changes nothing there.
+    const auto gate_q8 = mini::MiniResidentWeightPlan::make(
+        text, wei::RoleStorage{wei::kBf16WeightStorage, wei::kBf16WeightStorage, wei::kQ8WeightStorage});
+    if (gate_q8.ranges().size() != resident.ranges().size() || source.payload_reads() != 0) return false;
+    unsigned gates_converted = 0;
+    for (std::size_t i = 0; i < resident.ranges().size(); ++i) {
+        const auto& before = resident.ranges()[i];
+        const auto& gq = gate_q8.ranges()[i];
+        if (gq.source.source == before.source.source) {
+            if (gq.source.range.offset != before.source.range.offset || gq.bytes != before.bytes) return false;
+            continue;
+        }
+        bool is_gate = false;
+        for (unsigned layer = 0; layer < mini::kPhysicalLayers; ++layer) {
+            const auto* gate = text.find("model.llm.layers." + std::to_string(layer) + ".attn.gate_attn.weight");
+            is_gate = is_gate || (gate && gate->payload.range.offset == before.source.range.offset);
+        }
+        if (!is_gate || gq.source.range.offset != 0U || gq.bytes * 64U != before.bytes * 34U) return false;
+        ++gates_converted;
+    }
+    if (gates_converted != mini::kPhysicalLayers) return false;
+    const auto attention_gate_q8 = mini::MiniResidentWeightPlan::make(
+        text, wei::RoleStorage{wei::kQ8WeightStorage, wei::kBf16WeightStorage, wei::kQ8WeightStorage});
+    if (attention_gate_q8.bytes() != attention_q8.bytes() ||
+        attention_gate_q8.ranges().size() != attention_q8.ranges().size()) return false;
     try {
         (void)mini::MiniResidentWeights::bind(resident, {});
         return false;

@@ -349,6 +349,21 @@ void test_lowbit_arms() {
                 "SP4 attention + head arm resolves strix.sp4t on every tagged role, unqualified");
         require(mini::mini_lowbit_consumers(plan.head_storage).data() == strix::core::kResidentSp4ArithmeticHip.data(),
                 "SP4 arm names the SP4 consumer identity");
+        require(plan.gate_storage == weight::kBf16WeightStorage && plan.roles().gate == weight::kBf16WeightStorage,
+                "the first SP4 arm keeps the attention output gate BF16");
+    }
+    {
+        // The SP4 attention + gate + head arm: the same decode-only arm with the output gate in strix.sp4t too.
+        mini::MiniWeightOptions arm;
+        const auto value = [] { return std::string_view("weights.attention_gate_head.sp4t@1"); };
+        require(mini::parse_mini_weight_option(arm, "--qualify-decode-weights", value, true) && arm.qualify_decode_only &&
+                    arm.qualify != nullptr && weight::same_id(arm.qualify->id, weight::kAttentionGateHeadSP4TPolicy.id),
+                "SP4 attention + gate + head decode-only arm");
+        const auto plan = mini::resolve_mini_resident_weight_load(profile::Name::fast, arm, hip);
+        require(plan.storage == weight::kSP4TWeightStorage && plan.head_storage == weight::kSP4TWeightStorage &&
+                    plan.gate_storage == weight::kSP4TWeightStorage && plan.roles().gate == weight::kSP4TWeightStorage &&
+                    plan.status == profile::Status::unqualified,
+                "SP4 attention + gate + head arm resolves strix.sp4t on the gate too, unqualified");
     }
     for (const char* key : {"weights.head.q6_g64@1", "weights.head.q4_g64@1"}) {
         mini::MiniWeightOptions arm;

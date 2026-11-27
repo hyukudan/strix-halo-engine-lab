@@ -22,10 +22,20 @@ bool attention_only_q8(weight::RoleStorage storage) {
     return storage.attention == weight::kQ8WeightStorage && storage.head == weight::kBf16WeightStorage;
 }
 
-bool compact_attention_projection(MiniAttentionProjection role, bool all_q8_projections) {
+// compact_gate: the policy names a storage for the attention output gate (weight::RoleStorage::gate).
+bool compact_attention_projection(MiniAttentionProjection role, bool all_q8_projections, bool compact_gate = false) {
     using Role = MiniAttentionProjection;
     return role == Role::query || role == Role::key || role == Role::value || role == Role::output ||
-           (all_q8_projections && role != Role::relative_bias);
+           (compact_gate && role == Role::output_gate) || (all_q8_projections && role != Role::relative_bias);
+}
+
+// "layers.<physical>.attn.gate_attn.weight": the attention output gate of the naming map (MiniAttentionProjection::output_gate).
+bool is_attention_gate_tensor(std::string_view name) {
+    constexpr std::string_view layers = "layers.";
+    if (!name.starts_with(layers)) return false;
+    const auto dot = name.find('.', layers.size());
+    return dot != std::string_view::npos &&
+           name.substr(dot + 1U) == mini_attention_projection_spec(MiniAttentionProjection::output_gate).tensor_suffix;
 }
 
 bool is_compact_q8_attention_tensor(std::string_view name) {
@@ -52,13 +62,14 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
                format == weight::kQ4G64WeightStorage || format == weight::kQ6G64WeightStorage ||
                format == weight::kSP4TWeightStorage;
     };
-    if (!stored(storage.attention) || !stored(storage.head))
+    if (!stored(storage.attention) || !stored(storage.head) || !stored(storage.gate))
         throw std::invalid_argument("invalid Inkling 2 Mini resident weight storage");
     if (!weight::valid_row_pitch_rule(rule)) throw std::invalid_argument("Inkling 2 Mini: invalid resident row pitch rule");
     const auto output_pitch = weight::pitched_row_bytes(kQueryWidth * sizeof(std::uint16_t), rule);
     MiniResidentWeightPlan plan;
     plan.storage_ = storage;
-    plan.keep_bf16_ = keep_bf16 && (storage.attention != weight::kBf16WeightStorage || storage.head != weight::kBf16WeightStorage);
+    plan.keep_bf16_ = keep_bf16 && (storage.attention != weight::kBf16WeightStorage || storage.head != weight::kBf16WeightStorage ||
+                                    storage.gate != weight::kBf16WeightStorage);
     const auto schema = mini_text_tensor_schema();
     plan.narrow_experts_ = narrow_experts;
     std::set<std::string, std::less<>> narrowed_tensors;
@@ -77,9 +88,13 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
     for (const auto& spec : schema) {
         if (!spec.resident || narrowed_tensors.contains(spec.name)) continue;
         const auto name = std::string_view(spec.name).substr(kMiniTextTensorPrefix.size());
-        const auto role_storage = spec.load_matrix_role == weight::Role::head ? storage.head : storage.attention;
+        // The output gate has no tagged role: it takes the policy's gate storage when one is named (else, as before, the
+        // attention-only Q8_0 row's).
+        const bool gate = storage.gate != weight::kBf16WeightStorage && is_attention_gate_tensor(name);
+        const auto role_storage = gate ? storage.gate
+                                : spec.load_matrix_role == weight::Role::head ? storage.head : storage.attention;
         const bool compact = role_storage != weight::kBf16WeightStorage &&
-            (spec.load_matrix_role || (attention_only_q8(storage) && is_compact_q8_attention_tensor(name)));
+            (spec.load_matrix_role || gate || (attention_only_q8(storage) && is_compact_q8_attention_tensor(name)));
         const auto pitch = !compact && spec.load_matrix_role == weight::Role::attention_o ? output_pitch : 0U;
         const auto* raw = weights.find(spec.name);
         std::optional<weight::Slice> prepacked;
@@ -150,7 +165,8 @@ MiniResidentWeights MiniResidentWeights::bind(const MiniResidentWeightPlan& plan
                 const auto role = static_cast<Role>(i);
                 if (!is_full_attention(layer) && (role == Role::key_taps || role == Role::value_taps)) continue;
                 const auto name = prefix + std::string(mini_attention_projection_spec(role).tensor_suffix);
-                if (compact_attention_projection(role, attention_only_q8(plan.storage_)))
+                if (compact_attention_projection(role, attention_only_q8(plan.storage_),
+                                                 plan.storage_.gate != weight::kBf16WeightStorage))
                     attention.matrix[i] = bound.slices_.matrix(compact_name(name));
                 else
                     attention.matrix[i] = bound.bf16(name).data();

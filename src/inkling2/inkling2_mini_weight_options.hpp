@@ -42,10 +42,10 @@ struct MiniWeightOptions {
 // The bindings a qualification key may name: the model's Q8_0 binding (legacy id included), the shared low-bit mixes and
 // the shared head-only low-bit rows (attention BF16), plus attention-only Q8_0 and the Strix pack SP4 attention + head
 // row (from a calibrated pack, STRIX_LOWBIT_PACK).
-inline constexpr std::array<weight::WeightLoadPolicy, 9> kMiniQualifiablePolicies{
+inline constexpr std::array<weight::WeightLoadPolicy, 10> kMiniQualifiablePolicies{
     kMiniWeightLoadPolicy, weight::kAttentionQ8Policy, weight::kAttentionHeadQ6Policy, weight::kAttentionQ4HeadQ6Policy,
     weight::kAttentionHeadQ4Policy, weight::kHeadQ6Policy, weight::kHeadQ4Policy, kMiniSp4HeadPolicy,
-    weight::kAttentionHeadSP4TPolicy};
+    weight::kAttentionHeadSP4TPolicy, weight::kAttentionGateHeadSP4TPolicy};
 
 inline const weight::WeightLoadPolicy& mini_weight_load_policy(const MiniWeightOptions& options) {
     if (options.qualify == nullptr || weight::same_id(options.qualify->id, kMiniWeightLoadPolicy.id))
@@ -115,7 +115,8 @@ inline bool mini_lowbit_turbo(const profile::Resolution& tier) {
 }
 
 // STRIX_INK_LOWBIT_HEAD, in FAST or TURBO: "sp4t" selects the SP4 head arm (kMiniSp4HeadPolicy); "sp4t-attn" the SP4
-// attention projections + head arm (weights.attention_head.sp4t@1, the arm of --qualify-decode-weights); "0" (builtin)
+// attention projections + head arm (weights.attention_head.sp4t@1, the arm of --qualify-decode-weights); "sp4t-attn-gate"
+// the same arm plus the attention output gate (weights.attention_gate_head.sp4t@1, explicit: STRIX_LOWBIT_PACK); "0" (builtin)
 // leaves the weights as they are. nullptr: no arm. The FAST column (TURBO inherits it) selects "sp4t-attn" on the backend
 // its receipts were taken on (HIP gfx1151): a column value on another backend selects nothing; an explicit setting keeps
 // its own admission (the server refuses a non-HIP backend with its reason).
@@ -125,10 +126,12 @@ inline bool mini_lowbit_head_explicit(const profile::Entry& entry) {
 inline const weight::WeightLoadPolicy* mini_lowbit_head_policy(const profile::Resolution& tier, bool hip = true) {
     const auto* entry = tier.find(kMiniLowBitHead);
     if (entry == nullptr || entry->value == "0") return nullptr;
-    const weight::WeightLoadPolicy* policy = entry->value == "sp4t"        ? &kMiniSp4HeadPolicy
-                                             : entry->value == "sp4t-attn" ? &weight::kAttentionHeadSP4TPolicy
-                                                                           : nullptr;
-    if (policy == nullptr) throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD must be 0, sp4t or sp4t-attn");
+    const weight::WeightLoadPolicy* policy = entry->value == "sp4t"             ? &kMiniSp4HeadPolicy
+                                             : entry->value == "sp4t-attn"      ? &weight::kAttentionHeadSP4TPolicy
+                                             : entry->value == "sp4t-attn-gate" ? &weight::kAttentionGateHeadSP4TPolicy
+                                                                                : nullptr;
+    if (policy == nullptr)
+        throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD must be 0, sp4t, sp4t-attn or sp4t-attn-gate");
     if (!hip && !mini_lowbit_head_explicit(*entry)) return nullptr;
     return tier.profile == profile::Name::fast || tier.profile == profile::Name::turbo ? policy : nullptr;
 }
@@ -824,7 +827,8 @@ inline weight::WeightLoadPlan resolve_mini_resident_weight_load(profile::Name ti
     // The resident image serves every request from one position and one lane up to extent.
     auto plan = weight::resolve_weight_load(weight::builtin_registry(), policy,
         {tier, scope, formats, !options.disable_q8, qualify, kMiniWeightLoadRegimes, extent, {1, 1}}, kMiniWeightLoadDecisions);
-    if (qualify && (plan.storage != policy.target || plan.head_storage != policy.head_target()))
+    if (qualify && (plan.storage != policy.target || plan.head_storage != policy.head_target() ||
+                    plan.gate_storage != policy.gate_target()))
         throw std::invalid_argument("the qualified compact weights were not admitted on this backend");
     plan.strixpack = strixpack;
     return plan;

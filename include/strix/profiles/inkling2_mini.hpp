@@ -316,7 +316,8 @@ inline constexpr std::array<profile::Lever, 19> kMiniLevers{{
                "2026-11-27: 1.19x tok/s geometric mean (0.95x .. 1.37x; one code prompt slower: its SP4 text takes 2.71 "
                "tokens per pass against 4.40), plain decode 1.18x (code and prose); served 8 / 16 slots 1.05x / 1.04x "
                "(one sample). \"sp4t\" (head alone) stays explicit: its gate fails 1/39 FAST windows",
-     .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"sp4t", "sp4t-head-v1"}, {"sp4t-attn", "sp4t-attention-head-v1"}}}},
+     .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"sp4t", "sp4t-head-v1"}, {"sp4t-attn", "sp4t-attention-head-v1"},
+                  {"sp4t-attn-gate", "sp4t-attention-gate-head-v1"}}}},
 }};
 
 // TURBO prefill timing of the iu4 cell on gfx1151 (one node, one binary for the CLI and strix-serve, prompt prefill time
