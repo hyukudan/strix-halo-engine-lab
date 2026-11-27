@@ -316,15 +316,10 @@ struct Api::Impl {
             refuse_unexecuted(body,false,false);
             for(const auto& [key,value]:body.as_object()) {
                 (void)value;
-                bool known=false;
-                for(const auto* name:{"model","messages","tools","tool_choice","stream","stream_options","max_tokens",
-                    "max_completion_tokens","temperature","top_p","top_k","min_p","seed","enable_thinking","preserve_thinking",
-                    "conversational_mode","thinking_budget","chat_template_kwargs","dflash","n","stop","state_cache"})known|=key==name;
-                known|=is_presentation_field(key);
-                if(request.path=="/v1/completions")for(const auto* name:{"prompt","echo","best_of","suffix"})known|=key==name;
-                if(request.path=="/v1/messages")for(const auto* name:{"system","thinking","stop_sequences","output_config"})known|=key==name;
-                if(request.path=="/v1/responses")for(const auto* name:{"input","instructions","max_output_tokens","store","background",
-                    "previous_response_id","conversation","include","truncation","max_tool_calls","text"})known|=key==name;
+                // Shared protocol and presentation fields, then the Gemma family's own chat fields.
+                bool known=is_route_field(request.path,key) || is_presentation_field(key);
+                for(const auto* name:{"enable_thinking","preserve_thinking","conversational_mode","thinking_budget",
+                    "chat_template_kwargs","dflash"})known|=key==name;
                 if(!known)throw RequestFieldError(key,"unsupported field: "+key);
             }
             if (const auto* v=body.find("temperature"); v && v->is_number()) {

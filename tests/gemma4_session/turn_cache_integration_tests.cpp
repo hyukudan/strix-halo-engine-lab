@@ -230,7 +230,11 @@ Json stable(Json j) {
         Json::Object out;
         for(const auto& [k,v]:j.as_object()) {
             if(k=="id" || k=="created" || k=="timings" || k=="serve_prefix" || k=="cached_tokens" ||
-                k.ends_with("_ms") || k=="decode_tokens_per_second" || k=="target_calls" || k=="target_rows" || k=="steps" || k=="admitted_at_step")continue;
+                k=="target_calls" || k=="target_rows" || k=="steps" || k=="admitted_at_step")continue;
+            // Wall-clock members of the shared receipt: compared by presence and type, not by value.
+            if(k.ends_with("_ms") || k=="decode_tokens_per_second") {
+                out.emplace_back(k,Json(v.is_number()?"number":"not-a-number"));continue;
+            }
             out.emplace_back(k,stable(v));
         }return Json(std::move(out));
     }

@@ -26,6 +26,10 @@ void refuse_unexecuted(const Json& body, bool allow_constraints = false, bool al
 // Response-presentation fields the shared service reads on every generation route and answers the same way for every
 // server (token IDs, emission trace). A server that checks body keys against its own list admits these through here.
 [[nodiscard]] bool is_presentation_field(std::string_view key) noexcept;
+// Protocol fields of a generation route (/v1/chat/completions, /v1/completions, /v1/messages, /v1/responses) that the
+// shared service reads or normalizes (sampling, limits, streaming, tools, stop, the state cache policy). A server that
+// checks body keys against an allow-list admits these through here and lists only its family fields.
+[[nodiscard]] bool is_route_field(std::string_view path, std::string_view key) noexcept;
 
 // The exact non-negative integer a JSON number spelling denotes, or nothing when it is fractional, negative (other than
 // zero) or above uint64.

@@ -1,5 +1,7 @@
 #include "strix/serve/request_fields.hpp"
 
+#include <initializer_list>
+
 #include <charconv>
 #include <cmath>
 #include <limits>
@@ -133,6 +135,22 @@ double finite_number(const Json& value, const char* field, double low, double hi
 
 bool is_presentation_field(std::string_view key) noexcept {
     return key == "return_token_ids" || key == "return_token_emissions";
+}
+
+bool is_route_field(std::string_view path, std::string_view key) noexcept {
+    const auto any = [key](std::initializer_list<std::string_view> names) {
+        for (const auto name : names) if (key == name) return true;
+        return false;
+    };
+    if (any({"model", "messages", "tools", "tool_choice", "stream", "stream_options", "max_tokens", "max_completion_tokens",
+             "temperature", "top_p", "top_k", "min_p", "seed", "n", "stop", "state_cache"}))
+        return true;
+    if (path == "/v1/completions") return any({"prompt", "echo", "best_of", "suffix"});
+    if (path == "/v1/messages") return any({"system", "thinking", "stop_sequences", "output_config"});
+    if (path == "/v1/responses")
+        return any({"input", "instructions", "max_output_tokens", "store", "background", "previous_response_id",
+                    "conversation", "include", "truncation", "max_tool_calls", "text"});
+    return false;
 }
 
 }  // namespace strix::serve
