@@ -243,7 +243,8 @@ target_compile_options(cuda_core_bf16_plane_report_test PRIVATE "$<$<COMPILE_LAN
 if(TARGET strix_inkling2_mini_checkpoint)
     add_executable(strix-inkling2-mini-cuda ${_cc_root}/apps/inkling2_mini_cuda.cu)
     target_include_directories(strix-inkling2-mini-cuda PRIVATE ${_cc_root}/src)
-    target_link_libraries(strix-inkling2-mini-cuda PRIVATE strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core strix_serve)
+    target_link_libraries(strix-inkling2-mini-cuda PRIVATE strix_cuda_core_kernels strix_inkling2_mini_checkpoint strix_core strix_serve
+        strix_spec_dflash)
     target_compile_options(strix-inkling2-mini-cuda PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false;--expt-relaxed-constexpr>)
     target_compile_options(strix-inkling2-mini-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${_cc_mini_warnings}>")

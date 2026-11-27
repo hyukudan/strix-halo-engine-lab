@@ -841,6 +841,7 @@ public:
 
 private:
     friend class MiniResidentDSpark;
+    friend class MiniDFlashTarget;
     using Slot = session::ResidentRowSlot<MiniSessionStatePlan, mini_gpu::Buffer>;
 
     // Directory entry of every allocated slot (K plane, V plane, histories): the state::StateTable layout the
