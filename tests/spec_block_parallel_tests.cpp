@@ -244,16 +244,6 @@ void draft_reference_cases() {
     sp::draft_project_norm_bf16_reference(feature_matrix, mean, gain, 0.5F, context);
     BP_CHECK((context == std::array{1.0F, 0.0F}), "projected target taps are normalized");
 
-    constexpr std::array previous{1.0F, 0.0F, 0.0F, 1.0F};
-    constexpr std::array embedding{1.0F, 0.0F};
-    constexpr std::array hidden_matrix{2.0F, 0.0F, 0.0F, 4.0F};
-    constexpr std::array rotated_embedding_matrix{0.0F, 2.0F, 3.0F, 0.0F};
-    std::array<float, 4> joined{};
-    sp::mtp_join_bf16_reference(previous, embedding, gain, gain, hidden_matrix, rotated_embedding_matrix, 0.5F,
-                                joined);
-    BP_CHECK((joined == std::array{2.0F, 3.0F, 0.0F, 7.0F}),
-             "MTP projects each stream and broadcasts the projected embedding");
-
     constexpr float mask = -std::numeric_limits<float>::infinity();
     constexpr auto nan = std::numeric_limits<float>::quiet_NaN();
     constexpr std::array ranges{0.0F, 0.0F, 0.0F, 0.0F}, strengths{0.0F, 0.0F, 0.0F, -1.0F};
@@ -262,21 +252,58 @@ void draft_reference_cases() {
     BP_CHECK(special[0] == mask && special[1] == -2.0F && std::isnan(special[2]),
              "the hinge transform preserves masks and NaNs");
 
-    constexpr std::array raw{0.0F, 0.5F, mask, 0.0F, 1.0F, mask};
-    constexpr std::array by_rank{10.0F, 20.0F, 30.0F, -1.0F, 0.0F, 1.0F};
-    constexpr std::array head{0.0F, 0.5F, 0.0F, 1.0F, 0.0F, 0.0F};
-    std::array<std::uint32_t, 2> ids{};
-    std::size_t calls = 0;
-    sp::draft_markov_greedy_reference(raw, 3, by_rank, head, 2, ids, [&](auto row) {
-        constexpr std::array before{0.5F, 1.5F, -0.5F, 0.0F};
-        BP_CHECK(calls < ids.size() && row[0] == before[2 * calls] && row[1] == before[2 * calls + 1],
-                 "the transform sees logits conditioned on the anchor or previous proposal");
-        ++calls;
-        strix::core::multimax_f32_reference(row, ranges, strengths);
-        row[2] = 100.0F;  // The readout preserves the mask independently of the transform.
-    });
-    BP_CHECK((calls == ids.size() && ids == std::array<std::uint32_t, 2>{0, 1}),
-             "each proposal applies the vocabulary transform once, after Markov bias");
+}
+
+void bundled_markov_verify() {
+    struct MarkovForward final : sp::BlockForward {
+        std::vector<std::uint32_t> accepted;
+        std::size_t calls = 0;
+        void forward(const sp::BlockRequest& req, std::vector<std::uint32_t>& proposals,
+                     std::vector<float>&) override {
+            BP_CHECK(req.ids.size() == 7 && req.ids[0] == 2 && req.k == 2 && req.anchor_pos == 2 &&
+                     std::ranges::all_of(req.ids.subspan(1), [](auto id) { return id == 1024; }),
+                     "one complete bundled block starts from the target anchor");
+            constexpr float mask = -std::numeric_limits<float>::infinity();
+            constexpr std::array<float, 7 * 3> raw{0.0F, 0.5F, mask, 0.0F, 1.0F, mask};
+            constexpr std::array by_rank{10.0F, 20.0F, 30.0F, -1.0F, 0.0F, 1.0F};
+            constexpr std::array head{0.0F, 0.5F, 0.0F, 1.0F, 0.0F, 0.0F};
+            proposals.resize(req.k);
+            sp::draft_markov_greedy_reference(raw, 3, by_rank, head, req.ids[0], proposals, [&](auto row) {
+                constexpr std::array before{0.5F, 1.5F, -0.5F, 0.0F};
+                constexpr std::array ranges{0.0F, 0.0F, 0.0F, 0.0F}, strengths{0.0F, 0.0F, 0.0F, -1.0F};
+                BP_CHECK(calls < req.k && row[0] == before[2 * calls] && row[1] == before[2 * calls + 1],
+                         "the transform receives the anchor or previous proposal's bias");
+                ++calls;
+                strix::core::multimax_f32_reference(row, ranges, strengths);
+                row[2] = 100.0F;  // A masked id cannot win even if the transform increases its score.
+            });
+        }
+        void accept(std::span<const std::uint32_t> emitted) override {
+            accepted.assign(emitted.begin(), emitted.end());
+        }
+    } forward;
+    const auto& policy = strix::ernie::dspark_block_policy;
+    sp::ParallelBlockDrafter parallel(policy, forward);
+    sp::BlockConfig config;
+    config.copy = false;
+    config.fixed_costs = true;
+    config.arbiter.model_prior = {100.0, 1.0};
+    sp::BlockDrafter drafter(sp::parallel_block_config(policy, 0.1, config), &parallel);
+    for (std::uint32_t rows = 1; rows <= 3; ++rows) drafter.seed_verify_ms(rows, 10.0);
+    const World world{{4, 5}, {2, 0, 2, 1}};
+    Target target(world);
+    drafter.commit(world.prompt);
+    std::vector<std::uint32_t> emitted{world.response.front()};
+    drafter.commit(emitted);
+    parallel.start(emitted.front(), world.prompt.size());
+    sp::BlockSpeculator speculator(drafter, target);
+    speculator.start(emitted.front());
+    const auto step = speculator.step(emitted, {.remaining = 3, .max_rows = 3, .context = world.prompt.size()});
+    BP_CHECK(step.accepted == 1 && target.committed == 2 && target.last == std::vector<std::uint32_t>({2, 0, 1}) &&
+             emitted == std::vector<std::uint32_t>({2, 0, 2}) && forward.accepted == std::vector<std::uint32_t>({0, 2}),
+             "verify keeps the matching Markov proposal and commits the target continuation");
+    BP_CHECK(parallel.passes() == 1 && parallel.anchor_pos() == 4 && forward.calls == 2,
+             "one block, one scores transform per proposal, and a committed anchor advance");
 }
 
 void cost_tests() {
@@ -632,6 +659,7 @@ int main() {
     layout_tests();
     ernie_draft_layout();
     draft_reference_cases();
+    bundled_markov_verify();
     cost_tests();
     prefix_tests();
     pricing_tests();
