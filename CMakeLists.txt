@@ -5478,6 +5478,7 @@ int main() { return 0; }"
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_compile_options(strix-hip-q8-rows-heads-tests PRIVATE
             ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_include_directories(strix-hip-q8-rows-heads-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
         target_link_libraries(strix-hip-q8-rows-heads-tests PRIVATE strix_hip_runtime strix_core)
         strix_target_warnings(strix-hip-q8-rows-heads-tests)
         add_test(NAME strix-hip-q8-rows-heads-tests COMMAND strix-hip-q8-rows-heads-tests)

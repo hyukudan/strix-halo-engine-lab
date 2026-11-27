@@ -5,9 +5,13 @@
 //  2. timing (printed, not asserted): per layer, the incumbent per-head launch_hip_dense_rows loop, the per-head q8_rows
 //     loop and the one-launch head form; and the streaming rate of launch_hip_dense_rows vs q8_rows on the large model-B
 //     Q8_0 projection shapes. Weights rotate over copies larger than the 32 MB last-level cache.
+//  3. verify windows (q8_rows::launch_heads_rows_f32, the stock HeadsF32 arithmetic): R = 1..8 input rows in ONE launch ==
+//     launch_heads_f32 on each row alone, bitwise, at the same geometries; --bench times R = 8 as the former pairs of rows
+//     (four HeadsRowsF32<2> launches) against the one-launch window.
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
 #include "../src/hip_q8_rows_gemv.hpp"
+#include "../src/hip_q8_rows_sites.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
 
 #include <hip/hip_runtime.h>
@@ -198,6 +202,68 @@ int main(int argc, char** argv) {
             const double t_heads = time_us([&](unsigned i) { heads_q8(ws[i % kCopies], x, ya, g, s); }, 200U, s);
             std::printf("TIME %s us/layer: dense_rows_loop=%.1f q8_rows_loop=%.1f heads=%.1f (heads %.1f GB/s)\n", g.name, t_dense,
                         t_loop, t_heads, bytes / (t_heads * 1e3));
+            for (auto* c : ws) CHECK(hipFree(c));
+        }
+        CHECK(hipFree(const_cast<unsigned char*>(w)));
+        CHECK(hipFree(const_cast<float*>(x)));
+        CHECK(hipFree(ya));
+        CHECK(hipFree(yb));
+    }
+    // 3. verify windows: R rows in one head launch == each row's one-row launch (stock HeadsF32 arithmetic), bitwise.
+    for (const auto& g : geos) {
+        namespace qr = strix::q8_rows;
+        const std::uint64_t outputs = std::uint64_t{g.heads} * g.head_outputs;
+        const std::size_t x_row = std::size_t{g.heads} * g.stride, y_row = outputs;
+        constexpr std::uint32_t kR = 8U;
+        const auto wh = q8_rows_host(outputs, g.width);
+        std::vector<float> xh(kR * x_row);
+        for (auto& v : xh) v = static_cast<float>(static_cast<std::int32_t>(next_u32() % 2001U) - 1000) / 250.0F;
+        const auto* w = to_device(wh);
+        const auto* x = to_device(xh);
+        float *ya = nullptr, *yb = nullptr;
+        CHECK(hipMalloc(&ya, kR * y_row * 4U));
+        CHECK(hipMalloc(&yb, kR * y_row * 4U));
+        int bad = 0;
+        for (std::uint32_t R = 1U; R <= kR; ++R) {
+            CHECK(hipMemset(ya, 0xff, kR * y_row * 4U));
+            CHECK(hipMemset(yb, 0x7f, kR * y_row * 4U));
+            qr::launch_heads_rows_f32(w, g.heads, g.width, g.head_outputs, x, g.stride, x_row, ya, g.head_outputs, y_row, R, s);
+            for (std::uint32_t r = 0; r < R; ++r)
+                qr::launch_heads_f32(w, g.heads, g.width, g.head_outputs, x + r * x_row, g.stride, yb + r * y_row, g.head_outputs, s);
+            CHECK(hipStreamSynchronize(s));
+            std::vector<float> a(R * y_row), b(R * y_row);
+            CHECK(hipMemcpy(a.data(), ya, R * y_row * 4U, hipMemcpyDeviceToHost));
+            CHECK(hipMemcpy(b.data(), yb, R * y_row * 4U, hipMemcpyDeviceToHost));
+            if (std::memcmp(a.data(), b.data(), R * y_row * 4U) != 0) ++bad;
+        }
+        std::printf("WINDOW %s heads=%u R=1..%u bitwise_vs_rows %d/%u %s\n", g.name, g.heads, kR, static_cast<int>(kR) - bad, kR, bad ? "FAIL" : "PASS");
+        failures += bad;
+        if (bench) {
+            constexpr unsigned kCopies = 8U;  // > 32 MB last-level cache
+            std::vector<unsigned char*> ws(kCopies);
+            for (auto& c : ws) c = to_device(wh);
+            const auto pairs = [&](const unsigned char* wt) {
+                for (std::uint32_t r = 0; r < kR; r += 2U) {
+                    qr::HeadsRowsF32<2U> site{};
+                    site.input[0] = x + r * x_row;
+                    site.input[1] = x + (r + 1U) * x_row;
+                    site.segments = qr::segments({{wt, g.heads * g.head_outputs}});
+                    site.width = g.width;
+                    site.outputs = g.heads * g.head_outputs;
+                    site.head_outputs = g.head_outputs;
+                    site.input_stride = g.stride;
+                    site.out_stride = g.head_outputs;
+                    site.row_stride = y_row;
+                    site.out = yb + r * y_row;
+                    qr::launch_heads(site, s);
+                }
+            };
+            const double t_pairs = time_us([&](unsigned i) { pairs(ws[i % kCopies]); }, 100U, s);
+            const double t_window = time_us([&](unsigned i) {
+                qr::launch_heads_rows_f32(ws[i % kCopies], g.heads, g.width, g.head_outputs, x, g.stride, x_row, ya, g.head_outputs,
+                                          y_row, kR, s); }, 100U, s);
+            std::printf("TIME_R8 %s us/layer: pairs=%.1f window=%.1f (window %.1f GB/s)\n", g.name, t_pairs, t_window,
+                        static_cast<double>(wh.size()) / (t_window * 1e3));
             for (auto* c : ws) CHECK(hipFree(c));
         }
         CHECK(hipFree(const_cast<unsigned char*>(w)));
