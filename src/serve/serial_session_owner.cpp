@@ -17,6 +17,8 @@ session::StepResult SerialSessionOwner::ControlEngine::decode(session::KvHandle&
 session::Capabilities SerialSessionOwner::ControlEngine::caps() const {
     session::Capabilities c;
     c.max_context = context_; c.max_slots = 1; c.max_batch = 1; c.owner_control = true;
+    // A native engine that samples takes the float filters itself (as the cohort owner declares them).
+    c.temperature = c.top_k = c.top_p = c.min_p = c.seed = samples_;
     return c;
 }
 session::Hooks SerialSessionOwner::logical_hooks() {
@@ -43,7 +45,7 @@ SessionHooks SerialSessionOwner::owner_hooks(std::function<void(const Generation
 }
 SerialSessionOwner::SerialSessionOwner(GenerationQueue& queue, GenerationEngine& native,
     std::function<void(const GenerationStats&)> observe)
-    : native_(native), engine_(native.context_tokens()), leases_(1, 1, logical_hooks()),
+    : native_(native), engine_(native.context_tokens(), native.supports_sampling()), leases_(1, 1, logical_hooks()),
       runtime_(queue, engine_, leases_, no_retention(), owner_hooks(std::move(observe))) {}
 
 void SerialSessionOwner::turn(SessionRuntime& owner) {

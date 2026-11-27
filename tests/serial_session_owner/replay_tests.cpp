@@ -254,6 +254,21 @@ static void http_refusals() {
 }
 #endif
 
+// The owner declares the sampling filters exactly when the native engine samples (supports_sampling).
+void sampling_capabilities(){
+ struct Native final:serve::GenerationEngine {
+  bool samples;explicit Native(bool s):samples(s){}
+  std::uint64_t context_tokens()const override{return 64;}
+  bool supports_sampling()const override{return samples;}
+  serve::GenerationStats generate(serve::GenerationJob&)override{return {};}
+ };
+ for(bool samples:{false,true}){
+  serve::GenerationQueue q;Native e(samples);serve::SerialSessionOwner owner(q,e);const auto c=owner.runtime().capabilities();
+  CHECK(c.temperature==samples&&c.top_k==samples&&c.top_p==samples&&c.min_p==samples&&c.seed==samples);
+  CHECK(c.max_slots==1&&c.max_batch==1&&c.owner_control);q.shutdown();owner.runtime().run();
+ }
+}
+
 int main(int argc,char** argv)try {
  if(argc==2&&std::string(argv[1])=="--failure-probe")CHECK(argc==0);
  serve::GenerationQueue::test_now=clock_submit;
@@ -262,7 +277,7 @@ int main(int argc,char** argv)try {
  for(unsigned m=0;m<5;++m)all.push(bridge(m));for(unsigned m=0;m<3;++m)all.push(http(m));wake_and_throw();
  auto bytes=all.dump()+"\n";
 #ifndef SERIAL_ENTRY
- leases_and_expiry();http_refusals();native_control_routes();native_policy_receipts();
+ leases_and_expiry();http_refusals();native_control_routes();native_policy_receipts();sampling_capabilities();
 #endif
  if(argc==3&&std::string(argv[1])=="--capture"){std::ofstream f(argv[2],std::ios::binary);CHECK(f);f<<bytes;}
  else if(argc==3&&std::string(argv[1])=="--compare"){std::ifstream f(argv[2],std::ios::binary);CHECK(f);std::string expected((std::istreambuf_iterator<char>(f)),{});CHECK(expected==bytes);}

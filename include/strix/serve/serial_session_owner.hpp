@@ -15,13 +15,15 @@ public:
 private:
     class ControlEngine final : public session::Engine {
     public:
-        explicit ControlEngine(std::uint64_t context) : context_(context) {}
+        // samples = the native engine's supports_sampling(): the sampling filters the API may forward to it.
+        ControlEngine(std::uint64_t context, bool samples) : context_(context), samples_(samples) {}
         void prefill(std::span<const std::uint32_t>, session::KvHandle&) override;
         session::StepResult decode(session::KvHandle&, const session::SamplerState&) override;
         session::Capabilities caps() const override;
         profile::ExecutionReceipt receipt() const override { return {}; }
     private:
         std::uint64_t context_;
+        bool samples_;
     };
     static session::Hooks logical_hooks();
     SessionHooks owner_hooks(std::function<void(const GenerationStats&)>);
