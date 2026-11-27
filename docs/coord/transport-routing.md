@@ -38,12 +38,13 @@ The existing module drain/release boundaries precede communicator reuse.
 | Decode (1–8 rows, 24–192 KiB partials) | Keep XFER and its fused producer/consumer boundaries, even with `usb4gpu` | [Boundary set](../measured-gains.md): 48.56 → 44.40 ms/token (a set, not isolated link timing); [deferred CRC](../optimizations.md#mm-xfer-crc-deferred): 0.04–0.12 ms/token below neighboring inline arms, 7 processes, identical tokens. There is no matched XFER-vs-direct workload receipt; the 160 KB raw probe is not that comparison. `STRIX_MM_XFER=off` selects communicator dispatch. |
 | Rank prefill | Keep PFX on USB4, including the host side of `usb4gpu` | [PFX](../optimizations.md#mm-rank-pfx): TTFT 1K −3.5%, 8K −1.5%, exact in-process A/B/A. Do not replace this measured overlap with an unmeasured direct path. `STRIX_MM_PFX=load` leaves it off; `off` omits it. |
 | Rank PFX chunks | Keep 4 MiB | [Fresh-process measurements](../optimizations.md#mm-pfx-chunk): 1K 2.469 → 2.423 s; 4K 9.168 → 9.025 s; 8K unchanged around 590 tok/s because transfer is hidden. 16 MiB was no better. |
-| Serve prefill / other large communicator payloads | Default `usb4gpu` with the production size router | Large-buffer probe favors direct. Serve cannot enable PFX without losing nested serving; PFX stays absent. Serve-specific 8K TTFT and exactness remain pending. |
+| Serve prefill / other large communicator payloads | Default `usb4-auto` (host USB4) | The paired service reached first token in 11.60–12.24 s at 8K over host USB4, compared with 17.33–17.39 s when GPU-direct negotiated on the same link layout. The service keeps its nested prefill path. |
 | Control and prompt-token blocks (up to 64 KiB) | Host | Small-message probe and production decode result above. No all-direct default. |
 
-Serve `--transport usb4-auto` restores host-only, including the previously
-qualified session-cache route. Session reuse on `usb4gpu` stays declined until
-its separate native qualification; this change does not widen that allowlist.
+Rank and serve default to `usb4-auto`. Automatic session reuse is qualified for
+the served host route when its session policy admits the request. To request
+GPU-direct, pass `--transport usb4gpu` to the server. Session reuse is declined
+when GPU-direct is negotiated.
 An idle paired heartbeat retires GPU receives before the DMA deadline, including
 when XFER is off. Unavailable GPU streams negotiate host-only and report the
 reason. Explicit `STRIX_DIST_ROUTE` continues to override communicator routing.
