@@ -1,6 +1,8 @@
 #pragma once
 // Host-only parsing shared by the transport opener and its tests. Every pair binary accepts the same spellings:
 // usb4auto / usb4-auto (host path), usb4gpu / usb4-gpu (GPU-direct streams), usb4:dev,... and tcp-listen/tcp-connect.
+#include "strix/env_flags.hpp"
+
 #include <cstdint>
 #include <cstdlib>
 #include <stdexcept>
@@ -14,7 +16,7 @@ namespace strix::dist {
 }
 
 [[nodiscard]] inline std::string_view configured_device_route() noexcept {
-    const char* value = std::getenv("STRIX_DIST_ROUTE");
+    const char* value = envcfg::lookup_unrecorded("STRIX_DIST_ROUTE");
     return resolve_device_route(value ? std::string_view(value) : std::string_view{});
 }
 

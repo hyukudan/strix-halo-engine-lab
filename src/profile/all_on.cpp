@@ -1,5 +1,6 @@
 #include "strix/profile/all_on.hpp"
 
+#include "strix/env_flags.hpp"
 #include "strix/profile/model_preset.hpp"
 #include "strix/serve/json.hpp"
 
@@ -26,7 +27,7 @@ void put_env(const std::string& key, const char* value) {
 #endif
 
 bool env_set(std::string_view key) {
-    const char* value = std::getenv(std::string(key).c_str());
+    const char* value = strix::envcfg::lookup_unrecorded(std::string(key).c_str());
     return value != nullptr && *value != '\0';
 }
 
@@ -286,7 +287,7 @@ std::vector<std::string> engines_of(const model_description::ModelDescription* d
 }
 
 bool env_requested() {
-    const char* value = std::getenv(kEnv);
+    const char* value = strix::envcfg::text(kEnv);
     if (value == nullptr || *value == '\0' || std::string_view(value) == "0") return false;
     if (std::string_view(value) == "1") return true;
     throw std::invalid_argument(std::string(kEnv) + " must be 0 or 1");
@@ -321,7 +322,8 @@ Scope begin(const model_description::ModelDescription* description, std::optiona
     query.tier = tier_of(resolved);
     query.backend = backend.empty() ? "hip" : std::string(backend);
     query.engines = engines_of(description);
-    query.band = parse_band(band.empty() ? std::string_view(std::getenv(kBandEnv) ? std::getenv(kBandEnv) : "") : band);
+    const char* band_env = band.empty() ? strix::envcfg::text(kBandEnv) : nullptr;
+    query.band = parse_band(band.empty() ? std::string_view(band_env ? band_env : "") : band);
     query.env_is_set = env_set;
     scope.plan_ = resolve(catalogue(), query);
     out << "all-on: tier=" << tier_word(query.tier) << " backend=" << query.backend << " levers=" << scope.plan_.lines.size() << '\n'

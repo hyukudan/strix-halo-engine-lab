@@ -2006,7 +2006,7 @@ int main(int argc, char** argv) {
         // (mm_defaults host_defaults(); --print-effective-config prints the rows). An explicit value wins.
         strix::minimax::defaults::apply_host_defaults("rank");
         const auto capabilities = strix::minimax::defaults::transport_capabilities(
-            argv[3], [](const char* key) { return std::getenv(key); });
+            argv[3], [](const char* key) { return strix::envcfg::lookup_unrecorded(key); });
         const auto pair_model_identity = mm::Engine::pair_model_identity(opt.model_dir);
         auto opened = strix::dist::open_pair(argv[3], opt.rank, {std::chrono::seconds(180), capabilities});
         auto transport = std::move(opened.host);
