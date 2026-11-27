@@ -5,6 +5,7 @@
 #include "cpu/core/ordered_linear_reference.hpp"
 #include "moe_core/reference.hpp"
 #include "strix/ernie/calibration.hpp"
+#include "strix/numeric/logit_comparison.hpp"
 #include "strix/ernie/checkpoint.hpp"
 #include "strix/ernie/forward.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
@@ -446,7 +447,7 @@ void run_oracle(std::vector<std::uint32_t> ids, const Options& opts, const fs::p
     unsigned hits = 0;
     for (std::size_t row = 0; row < rows.size(); ++row) {
         transform_logits(logits[row], opts.multimax, logit_transform);
-        const auto score = ernie::score_next_token(logits[row], targets[row]);
+        const auto score = strix::numeric::score_next_token(logits[row], targets[row]);
         const bool hit = score.best_id == targets[row];
         scores << row << '\t' << inputs[row] << '\t' << targets[row] << '\t' << score.best_id << '\t'
                << score.nll << '\t' << hit << '\n';
@@ -464,7 +465,7 @@ void run_oracle(std::vector<std::uint32_t> ids, const Options& opts, const fs::p
         for (std::size_t i = 0; i < layer_logits.size(); ++i) {
             const auto row = i * opts.lens_stride;
             transform_logits(layer_logits[i], opts.multimax, logit_transform);
-            const auto score = ernie::score_next_token(layer_logits[i], targets[row]);
+            const auto score = strix::numeric::score_next_token(layer_logits[i], targets[row]);
             *lens << layer << '\t' << row << '\t' << inputs[row] << '\t' << targets[row] << '\t'
                   << score.best_id << '\t' << score.nll << '\t' << (score.best_id == targets[row]) << '\n';
         }

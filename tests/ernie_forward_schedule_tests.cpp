@@ -1,6 +1,7 @@
 #include "core/streamed_linear_reference.hpp"
 #include "cpu/core/dense.hpp"
 #include "strix/ernie/forward.hpp"
+#include "strix/numeric/logit_comparison.hpp"
 #include "strix/weight/formats/microscaled.hpp"
 
 #include <bit>
@@ -144,13 +145,13 @@ int main() try {
     core::linear_reference(head, whole.head_input(end.back()), scores);
     check(scores == together, "teacher-forced head changed the serial logits");
     const float fixture_logits[] = {1000, 1000, 999};
-    const auto score = ernie::score_next_token(fixture_logits, 2);
+    const auto score = strix::numeric::score_next_token(fixture_logits, 2);
     check(score.best_id == 0 && std::abs(score.nll - (1 + std::log(2 + std::exp(-1.0)))) < 1e-12,
           "stable loss or deterministic tie break");
     bool rejected = false;
     try {
         const float bad[] = {0, std::numeric_limits<float>::infinity()};
-        (void)ernie::score_next_token(bad, 0);
+        (void)strix::numeric::score_next_token(bad, 0);
     } catch (const std::invalid_argument&) { rejected = true; }
     check(rejected, "nonfinite logits accepted");
     (void)separate.append(std::span(prompt).first(1));

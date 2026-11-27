@@ -10,12 +10,6 @@ using LayerObserver = std::function<void(std::size_t position, unsigned layer, c
 using ReferenceRows = std::vector<std::vector<float>>;
 using LayerBoundaryObserver = std::function<void(unsigned layer, const ReferenceRows&)>;
 
-struct NextTokenScore {
-    double nll;
-    std::uint32_t best_id;
-};
-[[nodiscard]] NextTokenScore score_next_token(std::span<const float> logits, std::uint32_t target);
-
 // Candidate arithmetic for checkpoint exploration. The logits are the raw head
 // output. Keep this identity separate from a validated checkpoint reference.
 enum class CandidateActivation { swiglu, soft_clip, hard_clip };

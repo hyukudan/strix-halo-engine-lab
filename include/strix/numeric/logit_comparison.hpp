@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <span>
 #include <stdexcept>
 
@@ -34,6 +35,24 @@ struct LogitComparison {
     }
     return {std::max(0.0, weighted_delta / ref_mass + std::log(cand_mass / ref_mass)),
             static_cast<std::size_t>(ref_max - reference.begin()), static_cast<std::size_t>(cand_max - candidate.begin())};
+}
+
+struct NextTokenScore {
+    double nll;
+    std::uint32_t best_id;
+};
+
+// Negative log-likelihood of `target` and the greedy ID of one logits row
+// (stable log-sum-exp; ties choose the lowest token ID).
+[[nodiscard]] inline NextTokenScore score_next_token(std::span<const float> logits, std::uint32_t target) {
+    if (target >= logits.size()) throw std::out_of_range("next-token score: target outside vocabulary");
+    if (!std::ranges::all_of(logits, [](float value) { return std::isfinite(value); }))
+        throw std::invalid_argument("next-token score: nonfinite logits");
+    const auto best = std::ranges::max_element(logits);
+    double partition = 0;
+    for (float value : logits) partition += std::exp(double{value} - *best);
+    return {std::log(partition) + (double{*best} - logits[target]),
+            static_cast<std::uint32_t>(best - logits.begin())};
 }
 
 }  // namespace strix::numeric

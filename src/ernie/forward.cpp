@@ -37,17 +37,6 @@ CpuReference::CpuReference(ReferenceShape shape, ReferenceRead read, ReferenceAc
     history_.fill(AttentionHistory(max_rows));
 }
 
-NextTokenScore score_next_token(std::span<const float> logits, std::uint32_t target) {
-    if (target >= logits.size()) throw std::out_of_range("ERNIE: target outside vocabulary");
-    if (!std::ranges::all_of(logits, [](float value) { return std::isfinite(value); }))
-        throw std::invalid_argument("ERNIE: nonfinite logits");
-    const auto best = std::ranges::max_element(logits);
-    double partition = 0;
-    for (float value : logits) partition += std::exp(double{value} - *best);
-    return {std::log(partition) + (double{*best} - logits[target]),
-            static_cast<std::uint32_t>(best - logits.begin())};
-}
-
 ReferenceRows CpuReference::embed_rows(std::span<const std::uint32_t> tokens) const {
     if (tokens.empty() || tokens.size() > data::dims::max_context)
         throw std::invalid_argument("ERNIE: invalid prefill token count");
