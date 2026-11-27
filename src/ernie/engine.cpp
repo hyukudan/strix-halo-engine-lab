@@ -52,10 +52,6 @@ hc::Spec hc_spec(unsigned hidden, hc::Site site, bool checkpoint = false) {
     return spec;
 }
 
-struct RouteMath {
-    static float exp(float x) { return std::exp(x); }
-};
-
 } // namespace
 
 ReferenceShape checkpoint_reference_shape() {
@@ -138,7 +134,7 @@ void FirstRowReference::feed_forward(unsigned layer_id, const std::string& layer
     auto gain = read(prefix + "gate.routed_scaling_factor_param", s.route.experts);
     result.experts.resize(s.route.top_k);
     result.expert_weights.resize(s.route.top_k);
-    moe::route_split_logits_ref<RouteMath>(s.route, s.contracts.router, select, mix,
+    moe::route_split_logits_ref<moe::NativeGluMath>(s.route, select, mix,
         read(prefix + "e_score_correction_bias", s.route.experts), gain, result.experts, result.expert_weights,
         nearest_float(m::router_renorm_floor));
 
@@ -153,7 +149,7 @@ void FirstRowReference::feed_forward(unsigned layer_id, const std::string& layer
             project(expert + "w2.weight", value, out);
         }
     };
-    const auto epsilon = s.contracts.rms_epsilon > 0 ? s.contracts.rms_epsilon : kRmsEps;
+    const auto epsilon = kRmsEps;
     moe_core::latent_experts_reference(input, read(prefix + "latent_norm.weight", s.latent_width), epsilon,
         [&](auto in, auto out) { project(prefix + "fc1_latent_proj.weight", in, out); },
         [&](auto in, auto out) {
@@ -185,7 +181,7 @@ LayerResult FirstRowReference::block(unsigned layer, std::span<const float> stre
     if (layer >= kLayerCount || !attend)
         throw std::invalid_argument("ERNIE: invalid target block binding");
     auto site = hc_spec(shape_.hidden, hc::Site::sublayer, shape_.contracts.checkpoint_hc);
-    const auto epsilon = shape_.contracts.rms_epsilon > 0 ? shape_.contracts.rms_epsilon : kRmsEps;
+    const auto epsilon = kRmsEps;
     const auto prefix = target_layer_prefix(layer);
     const auto run_site = [&](const char* name, const char* norm, std::span<const float> residual,
                               std::span<float> next, const auto& compute) {
@@ -232,7 +228,7 @@ std::vector<float> FirstRowReference::head_input(std::span<const float> streams)
     const auto mix = hc::mixes(site, streams, {{}, fn, base, scale, hc::FnLayout::feature_major});
     std::vector<float> row(shape_.hidden);
     hc::collapse(site, streams, mix.pre, row);
-    const auto epsilon = shape_.contracts.rms_epsilon > 0 ? shape_.contracts.rms_epsilon : kRmsEps;
+    const auto epsilon = kRmsEps;
     core::rms_norm_bf16_reference(row, read("model.norm.weight", row.size()), epsilon);
     return row;
 }

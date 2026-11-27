@@ -164,12 +164,9 @@ void packed_hca_binding() {
         else std::ranges::fill(output, name.ends_with("linear_kv_proj.weight") ? 1.0F : 0.0F);
     };
     constexpr std::array input{0.0F};
-    ernie::AttentionHistory base(1), candidate(1);
+    ernie::AttentionHistory base(1);
     const auto base_out = ernie::attention_reference(40, shape, read, input, base, project);
     check(grouped_input == 0.53125F && base_out.front() == 0.53125F, "BF16 attention epilogue keeps both midpoint stores");
-    shape.contracts.hca_fp8_epilogue = true;
-    const auto candidate_out = ernie::attention_reference(40, shape, read, input, candidate, project);
-    check(grouped_input == 0.5F && candidate_out.front() == 0.5F, "optional epilogue quantizes both projection inputs");
 }
 
 void packed_hca_gate_rows() {

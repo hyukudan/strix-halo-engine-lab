@@ -39,9 +39,8 @@ struct Options {
     unsigned lens_stride = 0;
     std::optional<unsigned> prompt;
     std::string activation = "soft-clip";
-    std::string multimax = "identity";
-    std::vector<std::string> variants;
-    ernie::HostContracts contracts;
+    std::string multimax = "checkpoint";
+    ernie::HostContracts contracts = ernie::kCheckpointContracts;
     ernie::CheckpointReadPolicy decode;
     fs::path capture, packed, replay, resume;
     bool bf16 = false, fixed_gain = false, oracle = false, bos = false, save_layers = false, profile = false;
@@ -49,31 +48,6 @@ struct Options {
     bool rescore_layers = false, head_f32 = false;
     bool trace_sites = false;
 };
-
-void set_variant(Options& opts, std::string_view name) {
-    auto& c = opts.contracts;
-    using ernie::RouterContract;
-    using ernie::VhaContract;
-    using ernie::KeyNormContract;
-    if (name == "router-unit") c.router = RouterContract::unit_gain;
-    else if (name == "router-gain-before-norm") c.router = RouterContract::gain_before_normalize;
-    else if (name == "router-summed-scores") c.router = RouterContract::summed_scores;
-    else if (name == "norm-routed-output") c.norm_routed_output = true;
-    else if (name == "checkpoint-attention") c.checkpoint_attention = true;
-    else if (name == "hca-fp8-epilogue") c.hca_fp8_epilogue = true;
-    else if (name == "checkpoint-hc") c.checkpoint_hc = true;
-    else if (name == "checkpoint-stores") c.checkpoint_stores = true;
-    else if (name == "router-swap") c.router = RouterContract::swapped_planes;
-    else if (name == "router-one-plane") c.router = RouterContract::single_plane;
-    else if (name == "vha-swap") c.vha = VhaContract::swapped;
-    else if (name == "kv-no-head-norm") c.key_norm = KeyNormContract::weighted_only;
-    else if (name == "rope-position-one") c.position_offset = 1;
-    else if (name == "rope-base-160k") c.rope_base = 160000;
-    else if (name == "rms-eps-1e-5") c.rms_epsilon = 1e-5F;
-    else if (name == "mxfp4-nibble-swap") opts.decode.high_nibble_first = true;
-    else throw std::invalid_argument("unknown host contract " + std::string(name));
-    opts.variants.emplace_back(name);
-}
 
 unsigned number(std::string_view text) {
     unsigned value{};
@@ -85,9 +59,6 @@ unsigned number(std::string_view text) {
 
 Options parse_options(int argc, char** argv) {
     Options opts;
-    enum class Contract { checkpoint, recovered, candidate };
-    auto contract = Contract::checkpoint;
-    std::vector<std::string_view> overrides;
     std::optional<std::string_view> multimax_override;
     for (int i = 4; i < argc; ++i) {
         const std::string_view arg = argv[i];
@@ -95,9 +66,6 @@ Options parse_options(int argc, char** argv) {
         if (arg == "--ordered-simd") { opts.simd = true; continue; }
         if (arg == "--table-mxfp4") { opts.decode.table_mxfp4 = true; continue; }
         if (arg == "--parallel-mla") { opts.parallel_mla = true; continue; }
-        if (arg == "--recovered-contract") { contract = Contract::recovered; continue; }
-        if (arg == "--candidate-contract") { contract = Contract::candidate; continue; }
-        if (arg == "--checkpoint-contract") { contract = Contract::checkpoint; continue; }
         if (arg == "--bos") { opts.bos = true; continue; }
         if (arg == "--save-layers") { opts.save_layers = true; continue; }
         if (arg == "--rescore-layers") { opts.rescore_layers = true; continue; }
@@ -114,7 +82,6 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--cache-mib") opts.cache_mib = number(argv[i]);
         else if (arg == "--prompt-index") opts.prompt = number(argv[i]);
         else if (arg == "--activation") opts.activation = argv[i];
-        else if (arg == "--variant") overrides.emplace_back(argv[i]);
         else if (arg == "--multimax") multimax_override = argv[i];
         else if (arg == "--capture") opts.capture = argv[i];
         else if (arg == "--pack") opts.packed = argv[i];
@@ -126,21 +93,6 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--lens-stride") opts.lens_stride = number(argv[i]);
         else throw std::invalid_argument("unrecognized option " + std::string(arg));
     }
-    if (contract == Contract::checkpoint) {
-        set_variant(opts, "router-summed-scores");
-        set_variant(opts, "norm-routed-output");
-        set_variant(opts, "kv-no-head-norm");
-        set_variant(opts, "vha-swap");
-        set_variant(opts, "checkpoint-attention");
-        set_variant(opts, "checkpoint-hc");
-        set_variant(opts, "checkpoint-stores");
-        opts.multimax = "checkpoint";
-    } else if (contract == Contract::recovered) {
-        set_variant(opts, "router-gain-before-norm");
-        set_variant(opts, "kv-no-head-norm");
-        set_variant(opts, "vha-swap");
-    }
-    for (const auto variant : overrides) set_variant(opts, variant);
     if (multimax_override) opts.multimax = *multimax_override;
     if (opts.multimax != "checkpoint" && opts.multimax != "identity")
         throw std::invalid_argument("unknown vocabulary activation");
@@ -161,12 +113,6 @@ Options parse_options(int argc, char** argv) {
     if (opts.rescore_layers && (opts.resume.empty() || opts.save_layers || opts.trace_sites))
         throw std::invalid_argument("rescoring requires a saved layer cache");
     return opts;
-}
-
-Json::Array variant_names(const Options& opts) {
-    Json::Array names;
-    for (const auto& variant : opts.variants) names.emplace_back(variant);
-    return names;
 }
 
 core::LinearQuadraticHinges load_logit_transform(std::string_view mode, const ernie::ReferenceRead& read) {
@@ -438,7 +384,7 @@ void run_oracle(std::vector<std::uint32_t> ids, const Options& opts, const fs::p
     const auto head_seconds = std::chrono::duration<double>(head_done - prefill).count();
     const auto receipt = Json(Json::Object{
         {"activation", opts.activation}, {"multiply_fixed_gain", opts.fixed_gain}, {"bf16_projections", opts.bf16},
-        {"variants", variant_names(opts)}, {"multimax", opts.multimax},
+        {"multimax", opts.multimax},
         {"head_store", head_stores_bf16(opts) ? "bf16" : "f32"},
         {"lens_stride", std::uint64_t{opts.lens_stride}}, {"rescored_layers", opts.rescore_layers},
         {"bos", opts.bos}, {"first_layer", std::uint64_t{opts.start_layer}}, {"end_layer", std::uint64_t{opts.end_layer}},
@@ -611,7 +557,6 @@ void run_prompt(const Json& request, unsigned index, const strix::serve::BpeToke
         {"head_store", head_stores_bf16(opts) ? "bf16" : "f32"},
         {"bos", opts.bos}, {"minimum_new_tokens", std::uint64_t{opts.min_new_tokens}},
         {"bf16_projections", opts.bf16}, {"multiply_fixed_gain", opts.fixed_gain},
-        {"variants", variant_names(opts)},
         {"pack", !opts.packed.empty()}, {"teacher_forced", replay.has_value()},
         {"ordered_simd", opts.simd}, {"table_mxfp4", opts.decode.table_mxfp4}, {"parallel_mla", opts.parallel_mla},
         {"threads", static_cast<std::uint64_t>(opts.threads)}, {"cache_mib", static_cast<std::uint64_t>(opts.cache_mib)},
@@ -634,14 +579,14 @@ int main(int argc, char** argv) try {
     if (argc < 4) {
         std::cerr << "usage: strix-ernie-cpu CHECKPOINT PROMPTS.json NEW_TRACE_DIR"
                      " [--generate N] [--min-new-tokens N] [--bos] [--prompt-index N] [--activation soft-clip|hard-clip|swiglu]"
-                     " [--bf16-projections] [--multiply-fixed-gain] [--checkpoint-contract|--recovered-contract|--candidate-contract] [--threads N] [--cache-mib N]"
+                     " [--bf16-projections] [--multiply-fixed-gain] [--threads N] [--cache-mib N]"
                      " [--capture MODEL_DESCRIPTION] [--pack SIDECAR] [--replay TRACE_DIR]\n"
                      "       strix-ernie-cpu CHECKPOINT TEXT_FILE NEW_TRACE_DIR --oracle"
                      " [--bos] [--limit N] [--save-layers] [--dump-logits] [--resume TRACE_DIR]"
                      " [--rescore-layers] [--lens-stride N] [--head-store-f32] [--trace-sites]"
                      " [--start-layer N] [--end-layer N] [--threads N] [--cache-mib N] [--profile-host]"
-                     " [--ordered-simd] [--table-mxfp4] [--parallel-mla] [--checkpoint-contract|--recovered-contract|--candidate-contract]"
-                     " [--variant NAME] [--multimax checkpoint|identity]\n";
+                     " [--ordered-simd] [--table-mxfp4] [--parallel-mla]"
+                     " [--multimax checkpoint|identity]\n";
         return 2;
     }
     const fs::path checkpoint = argv[1], folder = argv[3];

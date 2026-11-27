@@ -248,8 +248,7 @@ struct RunWholeMatrix {
 inline constexpr RunWholeMatrix run_whole_matrix{};
 
 struct Mxfp4DecodePolicy {
-    bool table = false;             // lookup-table decoder (same values)
-    bool high_nibble_first = false; // the first element of a byte is its high nibble
+    bool table = false; // lookup-table decoder (same values)
 };
 
 // E4M3 codes with one scale per Fp8Matrix tile (a weight::BlockScaledE4M3 instantiation) into rows x columns floats.
@@ -279,8 +278,7 @@ void dequantize_mxfp4_matrix(std::span<const std::uint8_t> codes, std::span<cons
             const auto bytes = codes.subspan(row * packed, packed);
             const auto scales = block_scales.subspan(row * scale_columns, scale_columns);
             auto values = out.subspan(row * columns, columns);
-            if (policy.table || policy.high_nibble_first)
-                decode_mxfp4_row_table(bytes, scales, values, policy.high_nibble_first);
+            if (policy.table) decode_mxfp4_row_table(bytes, scales, values);
             else decode_mxfp4_row(bytes, scales, values);
         }
     });

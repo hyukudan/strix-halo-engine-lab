@@ -45,9 +45,6 @@ enum class RouteKey : std::uint8_t { float_serial, ordered_bits };
 enum class RouteOrder : std::uint8_t { selection, ascending_id };
 enum class RouteMath : std::uint8_t { native, gfx1151_v1 };
 enum class RouteStatus : std::uint32_t { ok, invalid_route };
-enum class SplitRouteMode : std::uint8_t {
-    separate_planes, unit_gain, gain_before_normalize, swapped_planes, single_plane, summed_scores
-};
 
 inline constexpr unsigned kGfx1151RouteLanes = 256U;
 inline constexpr unsigned kGfx1151RouteExperts = 2U * kGfx1151RouteLanes;
@@ -384,11 +381,11 @@ void route_scores_ref(RouteScore score, std::span<const float> logits, std::span
     }
 }
 
-// Two FP32 router projections. The scratch rows are consumed in place. In
-// summed mode the two individually transformed scores supply both selection
-// and mixture. Per-expert gains normally apply only after route normalization.
+// Two FP32 router projections whose individually transformed scores are summed; the sum supplies both
+// selection and mixture. The scratch rows are consumed in place. Per-expert gains apply after route
+// normalization.
 template <class Math>
-void route_split_logits_ref(const RoutePolicy& policy, SplitRouteMode mode,
+void route_split_logits_ref(const RoutePolicy& policy,
                             std::span<float> first, std::span<float> second, std::span<const float> bias,
                             std::span<float> gains, std::span<std::uint32_t> ids, std::span<float> weights,
                             float summed_renorm_floor) {
@@ -396,18 +393,8 @@ void route_split_logits_ref(const RoutePolicy& policy, SplitRouteMode mode,
         throw std::invalid_argument("route policy: invalid split logits or gains");
     route_scores_ref<Math>(policy.score, first, first);
     route_scores_ref<Math>(policy.score, second, second);
-    if (mode == SplitRouteMode::summed_scores) {
-        for (std::size_t i = 0; i < first.size(); ++i) first[i] += second[i];
-        second = first;
-    }
-    if (mode == SplitRouteMode::swapped_planes) std::swap(first, second);
-    if (mode == SplitRouteMode::single_plane) second = first;
-    if (mode == SplitRouteMode::gain_before_normalize)
-        for (std::size_t i = 0; i < second.size(); ++i) second[i] *= gains[i];
-    if (mode == SplitRouteMode::unit_gain || mode == SplitRouteMode::gain_before_normalize)
-        std::ranges::fill(gains, 1.0F);
-    route_select_split_ref(policy, first, second, bias, gains, ids, weights,
-                           mode == SplitRouteMode::summed_scores ? summed_renorm_floor : 0.0F);
+    for (std::size_t i = 0; i < first.size(); ++i) first[i] += second[i];
+    route_select_split_ref(policy, first, first, bias, gains, ids, weights, summed_renorm_floor);
 }
 
 // CPU oracle for the gfx1151 softmax tree. The callable binds the engine's exp

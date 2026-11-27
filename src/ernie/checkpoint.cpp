@@ -143,7 +143,7 @@ void CheckpointWeights::read(std::string_view name, std::span<float> out, std::s
         if (scales.size() / scale_columns != rows || scales.size() % scale_columns != 0)
             throw std::invalid_argument("ERNIE: scale slice does not match MXFP4 matrix shape");
         weight::microscaled::dequantize_mxfp4_matrix(
-            codes, scales, rows, columns, out, {policy_.table_mxfp4, policy_.high_nibble_first}, schedule);
+            codes, scales, rows, columns, out, {policy_.table_mxfp4}, schedule);
     }
 }
 

@@ -85,7 +85,7 @@ void split_sigmoid_router() {
         std::array first{0.0F, inf, -inf, -0.0F}, second{inf, -inf, 0.0F, inf};
         std::array gains{2.0F, 3.0F, 4.0F, 5.0F};
         policy.renormalize = normalize;
-        route_split_logits_ref<Math>(policy, SplitRouteMode::summed_scores, first, second, bias, gains, ids, weights,
+        route_split_logits_ref<Math>(policy, first, second, bias, gains, ids, weights,
                                      floor);
         const float denominator = normalize ? 2.5F : 1.0F;
         check(ids == std::array<std::uint32_t, 2>{1U, 0U} &&

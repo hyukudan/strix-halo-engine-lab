@@ -18,7 +18,6 @@ constexpr auto kIndexDim = narrow<unsigned>(a::indexer::index_head_dim);
 constexpr auto kIndexHeads = narrow<unsigned>(a::indexer::index_n_heads);
 constexpr auto kTopK = narrow<unsigned>(a::indexer::index_topk);
 constexpr auto kIndexPrefillHeads = narrow<unsigned>(a::indexer::prefill_head_topk);
-constexpr auto kOutputFp8Block = narrow<unsigned>(data::weights::checkpoint::weight_block_size[1]);
 constexpr attn::HybridYarn kYarn{static_cast<double>(a::rope_scaling::original_max_position_embeddings),
     a::rope_scaling::factor, a::rope_scaling::beta_fast, a::rope_scaling::beta_slow};
 static_assert(a::rope_interleave && a::qk_norm == "per_head" && a::use_fast_hadamard &&
@@ -26,10 +25,8 @@ static_assert(a::rope_interleave && a::qk_norm == "per_head" && a::use_fast_hada
 static_assert(kWindow > 0 && kCompression >= 2 && kIndexDim % 32U == 0 && kTopK > 0);
 static_assert(kIndexPrefillHeads > 0 && kIndexPrefillHeads <= kIndexHeads);
 
-attn_core::RotaryReferenceRow rotary_row(unsigned dim, unsigned position, bool compressed,
-                                        const HostContracts& contract) {
-    const double base = contract.rope_base > 0 ? contract.rope_base : static_cast<double>(a::rope_theta);
-    return {dim, position + contract.position_offset, compressed ? a::compress_rope_theta : base,
+attn_core::RotaryReferenceRow rotary_row(unsigned dim, unsigned position, bool compressed) {
+    return {dim, position, compressed ? a::compress_rope_theta : static_cast<double>(a::rope_theta),
             compressed ? &kYarn : nullptr};
 }
 
@@ -50,7 +47,8 @@ struct LayerWeights {
     }
 };
 
-constexpr attn_core::ValueHeadMixRoles kMixRoles{"vha_postmix_U", "vha_postmix_V"};
+// The checkpoint stores the two post-mix factors exchanged: the tensor named V expands, U contracts.
+constexpr attn_core::ValueHeadMixRoles kMixRoles{"vha_postmix_V", "vha_postmix_U"};
 
 constexpr attn_core::CompressedMqaLayerRoles kHcaRoles{
     "linear_q_down_proj.weight", "q_layernorm.weight", "linear_q_up_proj.weight", "linear_kv_proj.weight",
@@ -67,24 +65,24 @@ constexpr attn_core::SelectedLatentLayerRoles kMlaRoles{
     "core_attention.indexer.linear_gate.weight", "core_attention.indexer.flashindexer_bias",
     "core_attention.softmax_offset", "o_proj.weight", "gate_proj.weight", kMixRoles};
 
-float layer_epsilon(const ReferenceShape& s) {
-    return s.contracts.rms_epsilon > 0 ? s.contracts.rms_epsilon : kEpsilon;
+// The checkpoint folds the value-head mix once per history and rounds the output gate through BF16.
+attn_core::FoldForm fold_form(const ReferenceShape& s) {
+    return s.contracts.checkpoint_attention ? attn_core::FoldForm::folded : attn_core::FoldForm::residual;
 }
 
-// Learned key gain stands alone on the checkpoint path and under the weighted-only contract.
-bool unit_key_norm(const ReferenceShape& s) {
-    return !s.contracts.checkpoint_attention && s.contracts.key_norm == KeyNormContract::candidate;
+core::SigmoidGatePrecision gate_precision(const ReferenceShape& s) {
+    return s.contracts.checkpoint_attention ? core::SigmoidGatePrecision::bf16_sigmoid
+                                            : core::SigmoidGatePrecision::f32;
 }
 
 std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
     std::span<const float> input, unsigned position, attn::CompressedReferenceHistory& state,
     std::vector<float>& folded_mix, bool record_history, bool keep_compressor, const AttentionHeadExecutor& execute) {
     const attn_core::CompressedMqaLayerShape shape{s.hidden, s.heads, s.head_dim, s.rope_dim, s.q_rank, s.o_groups,
-        s.o_rank, s.vha_rank, kWindow, layer_epsilon(s), s.contracts.checkpoint_attention, unit_key_norm(s),
-        s.contracts.vha == VhaContract::swapped, s.contracts.hca_fp8_epilogue ? kOutputFp8Block : 0U};
+        s.o_rank, s.vha_rank, kWindow, kEpsilon, s.contracts.checkpoint_attention, fold_form(s), gate_precision(s)};
     return attn_core::compressed_mqa_layer_reference<kCompression>(w, kHcaRoles, shape, input, position, state,
         folded_mix, record_history, keep_compressor, execute,
-        [&](unsigned dim, unsigned at, bool compressed) { return rotary_row(dim, at, compressed, s.contracts); });
+        [&](unsigned dim, unsigned at, bool compressed) { return rotary_row(dim, at, compressed); });
 }
 
 std::vector<float> mla_reference(const LayerWeights& w, const ReferenceShape& s,
@@ -94,11 +92,10 @@ std::vector<float> mla_reference(const LayerWeights& w, const ReferenceShape& s,
         {s.heads, narrow<unsigned>(a::mla::kv_lora_rank), narrow<unsigned>(a::mla::qk_nope_head_dim),
          narrow<unsigned>(a::mla::qk_rope_head_dim), narrow<unsigned>(a::mla::v_head_dim)},
         s.hidden, s.q_rank, s.vha_rank, kIndexDim, kIndexHeads, kTopK, kIndexPrefillHeads, kWindow,
-        layer_epsilon(s), kEpsilon, s.contracts.checkpoint_attention, unit_key_norm(s),
-        s.contracts.vha == VhaContract::swapped};
+        kEpsilon, kEpsilon, s.contracts.checkpoint_attention, fold_form(s), gate_precision(s)};
     return attn_core::selected_latent_layer_reference(w, kMlaRoles, shape, input, position, state, folded_mix,
         execute, keep_index, index_prefill,
-        [&](unsigned dim, unsigned at, bool compressed) { return rotary_row(dim, at, compressed, s.contracts); });
+        [&](unsigned dim, unsigned at, bool compressed) { return rotary_row(dim, at, compressed); });
 }
 
 } // namespace

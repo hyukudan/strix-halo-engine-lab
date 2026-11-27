@@ -31,7 +31,6 @@ struct PairPayload {
 // Plain tensors also support ranged reads, e.g. one embedding row.
 struct CheckpointReadPolicy {
     bool table_mxfp4 = false;
-    bool high_nibble_first = false;
 };
 
 class CheckpointWeights {

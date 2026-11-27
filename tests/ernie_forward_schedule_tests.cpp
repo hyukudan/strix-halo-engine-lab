@@ -65,19 +65,23 @@ int main() try {
               std::bit_cast<std::uint32_t>(core::dot_f32(std::span(matrix).first(width), input)),
               "SIMD teacher-forced dot changed bits");
     }
+    {
+        const float logits[]{1.0F, 3.0F, 3.0F, -2.0F, 3.0F};
+        const auto top = numeric::top_k_ids(logits, 4);
+        check(top == std::vector<std::uint32_t>{1, 2, 4, 0}, "top-k ids are best first with lowest-id ties");
+        check(numeric::top_k_ids(logits, 99).size() == 5 && numeric::top_k_ids(logits, 0).empty(),
+              "top-k count clamps to the vocabulary");
+    }
     const std::uint8_t codes[] = {0x80, 0x91, 0xa2, 0xb3, 0xc4, 0xd5, 0xe6, 0xf7,
                                   0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87};
     for (unsigned e = 0; e < 253; ++e) {
         const std::uint8_t scales[] = {static_cast<std::uint8_t>(e)};
-        float regular[32], table[32], swapped[32];
+        float regular[32], table[32];
         weight::microscaled::decode_mxfp4_row(codes, scales, regular);
         weight::microscaled::decode_mxfp4_row_table(codes, scales, table);
-        weight::microscaled::decode_mxfp4_row_table(codes, scales, swapped, true);
         for (std::size_t i = 0; i < std::size(regular); ++i) {
             check(std::bit_cast<std::uint32_t>(regular[i]) == std::bit_cast<std::uint32_t>(table[i]),
                   "table decoder changed MXFP4 bits");
-            check(std::bit_cast<std::uint32_t>(regular[i ^ 1U]) == std::bit_cast<std::uint32_t>(swapped[i]),
-                  "high-nibble probe did not swap adjacent coefficients");
         }
     }
     core::parallel_linear_reference(lane, 4, matrix, x, parallel);
@@ -190,8 +194,6 @@ int main() try {
     } catch (const std::invalid_argument&) { rejected = true; }
     check(rejected, "bounded attention accepted an unreachable position");
     auto checkpoint = shape;
-    checkpoint.contracts.router = ernie::RouterContract::summed_scores;
-    checkpoint.contracts.vha = ernie::VhaContract::swapped;
     checkpoint.contracts.norm_routed_output = true;
     checkpoint.contracts.checkpoint_attention = true;
     checkpoint.contracts.checkpoint_hc = true;

@@ -80,8 +80,8 @@ struct Fixture {
         fp8(p + "linear_kv_proj.weight", 2, 2, std::array<std::uint8_t, 4>{0, 0, 0x38, 0});
         floats(p + "kv_layernorm.weight", std::array<float, 2>{kv_gain, kv_gain});
         floats(p + "core_attention.attn_sink", sinks);
-        floats(p + "vha_postmix_U", std::array<float, 2>{0, 1});
-        floats(p + "vha_postmix_V", std::array<float, 2>{1, 0});
+        floats(p + "vha_postmix_V", std::array<float, 2>{0, 1}); // the checkpoint stores the factors exchanged
+        floats(p + "vha_postmix_U", std::array<float, 2>{1, 0});
         fp8(p + "linear_o_group_proj", 2, 2, std::array<std::uint8_t, 4>{0, 0x38, 0, 0x38});
         fp8(p + "gate_proj.weight", 2, 1, std::array<std::uint8_t, 2>{});
         fp8(p + "o_proj.weight", 2, 2,
@@ -167,14 +167,6 @@ void test_first_block() {
     const auto block = ref.block(0, input);
     expect(block.experts.empty(), "dense block emitted routed experts");
     near(block.attention_streams[1], std::sqrt(2.0F) / 2.0F, 0.0001F, "sink, VHA and gate");
-    auto shape = tiny_shape();
-    shape.contracts.key_norm = KeyNormContract::weighted_only;
-    const auto weighted = engine(weights, shape).block(0, input);
-    near(weighted.attention_streams[1], 1.4140625F, 0.0001F, "learned KV gain survives a single norm");
-    shape.contracts.key_norm = KeyNormContract::candidate;
-    shape.contracts.vha = VhaContract::swapped;
-    const auto swapped = engine(weights, shape).block(0, input);
-    near(swapped.attention_streams[1], std::sqrt(2.0F) / 4.0F, 0.0001F, "swapped VHA factors");
     near(block.ffn[1], 4.0F / 3.0F, 0.005F, "FP8 dense GLU");
     const auto logits = ref.embedding_first_block_logits(1);
     const auto h = std::sqrt(2.0F) / 2.0F + 4.0F / 3.0F;
@@ -227,20 +219,14 @@ void test_moe() {
     const float residual[]{1, 0, 1, 0, 1, 0, 1, 0};
     const auto result = engine(weights).block(1, residual);
     expect(result.experts == std::vector<std::uint32_t>{11, 0, 1, 2, 3, 4, 5, 6, 7, 8}, "top-10 and tie order");
-    near(result.expert_weights.at(0), 0.75F / 5.25F * 3.0F * 2.0F, 1e-6F, "post-normalization gain");
-    near(result.expert_weights.at(1), 0.5F / 5.25F * 3.0F, 1e-6F, "mix plane ignores selection bias");
-    auto shape = tiny_shape();
-    shape.contracts.router = RouterContract::gain_before_normalize;
-    const auto renormalized = engine(weights, shape).block(1, residual);
-    expect(renormalized.experts == result.experts, "mixture gain leaves the selection plane intact");
     auto checkpoint = tiny_shape();
     checkpoint.route.scale = 1.0F;
-    checkpoint.contracts.router = RouterContract::summed_scores;
     const auto summed = engine(weights, checkpoint).block(1, residual);
     expect(summed.experts == result.experts, "summed scores preserve bias ordering for this row");
     near(summed.expert_weights.at(0), (1.25F / 10.25F) * 2.0F, 1e-6F,
          "sum of both sigmoids, top-k denominator, then learned gain");
     near(summed.expert_weights.at(1), 1.0F / 10.25F, 1e-6F, "bias is excluded from the denominator");
+    near(result.expert_weights.at(0), 3.0F * (1.25F / 10.25F) * 2.0F, 1e-6F, "released scale on the summed scores");
     constexpr std::array zero_scores{0.0F, 0.0F}, zero_bias{1.0F, 0.0F}, zero_gain{3.0F, 2.0F};
     auto policy = checkpoint.route;
     policy.experts = policy.top_k = 2;
@@ -249,10 +235,8 @@ void test_moe() {
     strix::moe::route_select_split_ref(policy, zero_scores, zero_scores, zero_bias, zero_gain, ids, route_weights, 1e-20F);
     expect(ids == std::array<std::uint32_t, 2>{0, 1} && route_weights == zero_scores,
            "a saturated routing row keeps finite zero weights");
-    near(renormalized.expert_weights.at(0), 3.0F * 1.5F / 6.0F, 1e-6F, "gain belongs in denominator");
-    near(renormalized.expert_weights.at(1), 3.0F * 0.5F / 6.0F, 1e-6F, "gain denominator covers every route");
     const float latent = 5.65625F; // BF16-rounded sqrt(32).
-    const float routed = 3.0F * (4.5F + 3.0F) / 5.25F * latent * latent;
+    const float routed = 3.0F * (5.0F + 9.0F) / 10.25F * latent * latent;
     near(result.ffn[0], routed, 0.001F, "weighted MXFP4 latent sum");
     near(result.ffn[1], row * row, 1e-6F, "ungated shared expert");
     for (std::size_t i = 0; i < result.streams.size(); i += 2) {

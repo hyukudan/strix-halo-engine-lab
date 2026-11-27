@@ -7,23 +7,16 @@
 
 namespace strix::ernie {
 
-using RouterContract = moe::SplitRouteMode;
-enum class VhaContract { residual, swapped };
-enum class KeyNormContract { candidate, weighted_only };
-
+// Numerics of the released checkpoint. The default value of each field is the plain reference form used
+// by the unit fixtures; the checkpoint contract sets all of them.
 struct HostContracts {
-    RouterContract router{};
-    VhaContract vha{};
-    KeyNormContract key_norm{};
     bool norm_routed_output = false;
     bool checkpoint_attention = false;
-    bool hca_fp8_epilogue = false;
     bool checkpoint_hc = false;
     bool checkpoint_stores = false;
-    unsigned position_offset = 0;
-    float rope_base = 0;
-    float rms_epsilon = 0;
 };
+
+inline constexpr HostContracts kCheckpointContracts{true, true, true, true};
 
 struct ReferenceShape {
     unsigned hidden, vocab, dense_width, latent_width, expert_width;

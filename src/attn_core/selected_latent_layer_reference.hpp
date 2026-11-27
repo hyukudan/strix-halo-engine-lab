@@ -34,9 +34,9 @@ struct SelectedLatentLayerShape {
     unsigned hidden, q_rank, vha_rank;
     unsigned index_dim, index_heads, top_k, prefill_index_heads, window;
     float eps, index_eps;
-    bool checkpoint;
-    bool key_inverse_rms; // reference path: divide each key by its RMS (otherwise the learned gain stands alone)
-    bool vha_swapped;
+    bool checkpoint; // BF16 stores and the checkpoint operation order; off divides each key by its RMS
+    FoldForm fold;
+    core::SigmoidGatePrecision gate_precision;
     // One packed index key (E2M1 pairs plus one scale byte per 32 elements).
     [[nodiscard]] unsigned packed_index_bytes() const { return index_dim / 2U + index_dim / 32U; }
 };
@@ -104,7 +104,7 @@ std::vector<float> selected_latent_layer_reference(const Weights& w, const Selec
 
     const auto kv_b = w.tensor(r.kv_up, std::size_t{shape.heads} * (shape.nope + shape.value) * shape.latent);
     const auto projections = split_latent_projection(shape, kv_b, false);
-    if (checkpoint || !s.key_inverse_rms) std::ranges::fill(inverse, 1.0F);
+    if (checkpoint) std::ranges::fill(inverse, 1.0F);
     else latent_key_inverse_rms_reference(shape, projections, latent, rotary_key, s.eps, inverse, execute);
     const auto rope = rotary(shape.rotary, position, false);
     rope.apply(query, shape.qk());
@@ -132,10 +132,10 @@ std::vector<float> selected_latent_layer_reference(const Weights& w, const Selec
     selected_latent_attention_reference(shape, projections, query, w.tensor(r.softmax_offset, shape.heads), selected,
                                         row_at, output_heads, execute);
     if (checkpoint) core::round_bf16_reference(output_heads);
-    value_head_postmix_reference(w, r.mix, shape.heads, s.vha_rank, s.vha_swapped, checkpoint, output_heads,
+    value_head_postmix_reference(w, r.mix, shape.heads, s.vha_rank, s.fold, output_heads,
                                  folded_mix, execute);
     if (checkpoint) core::round_bf16_reference(output_heads);
-    sigmoid_gate_values_reference(w, r.gate, q_lora, output_heads, checkpoint);
+    sigmoid_gate_values_reference(w, r.gate, q_lora, output_heads, s.gate_precision);
     std::vector<float> output(s.hidden);
     w.linear(r.o_proj, output_heads, output, 1U);
 

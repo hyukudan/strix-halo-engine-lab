@@ -64,18 +64,11 @@ The scalar reference and the opt-in ordered FMA path run the same column
 chain for each output. The batch head streams each weight block once for
 every position. The table MXFP4 decoder is also opt-in and widens the same
 low-first E2M1 and E8M0 operands. `--profile-host` reports projection and
-weight-access timings separately. Contract switches are experimental host
-diagnostics and carry their settings into the receipt.
+weight-access timings separately. The host always runs the checkpoint
+numerics; the receipt records the multimax mode.
 `--parallel-mla` distributes independent attention heads and folded head-mix
 output rows over the same host workers. It admits the decoded KV-B matrix to
-the bounded cache. `--variant hca-fp8-epilogue` selects block E4M3 stores at
-the two HCA output projection inputs for explicit comparisons.
-
-`--recovered-contract` selects the host candidate that applies the learned
-expert gain before renormalization, keeps the weighted KV normalization
-without a second key RMS, and reverses the VHA factor order used by the
-initial candidate. It keeps the raw output head. The mode is available to
-both the oracle and the chat runner. Set `STRIX_ERNIE_ORACLE_CHECKPOINT` when
+the bounded cache. Set `STRIX_ERNIE_ORACLE_CHECKPOINT` when
 configuring the build to register the slow next-token loss fixture.
 For generation probes, `--bos` prepends the explicit BOS ID to the rendered
 chat. `--min-new-tokens` delays EOS eligibility for the specified number of

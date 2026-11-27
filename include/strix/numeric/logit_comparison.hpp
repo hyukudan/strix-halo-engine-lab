@@ -5,7 +5,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <numeric>
 #include <stdexcept>
+#include <vector>
 
 namespace strix::numeric {
 
@@ -35,6 +37,20 @@ struct LogitComparison {
     }
     return {std::max(0.0, weighted_delta / ref_mass + std::log(cand_mass / ref_mass)),
             static_cast<std::size_t>(ref_max - reference.begin()), static_cast<std::size_t>(cand_max - candidate.begin())};
+}
+
+// The `count` highest logits as token ids, best first; ties choose the lowest id. `count` is clamped to
+// the vocabulary size.
+[[nodiscard]] inline std::vector<std::uint32_t> top_k_ids(std::span<const float> logits, std::size_t count) {
+    std::vector<std::uint32_t> ids(logits.size());
+    std::iota(ids.begin(), ids.end(), std::uint32_t{0});
+    count = std::min(count, ids.size());
+    std::partial_sort(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(count), ids.end(),
+                      [&](std::uint32_t a, std::uint32_t b) {
+                          return logits[a] == logits[b] ? a < b : logits[a] > logits[b];
+                      });
+    ids.resize(count);
+    return ids;
 }
 
 struct NextTokenScore {

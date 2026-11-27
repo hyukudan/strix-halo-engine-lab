@@ -1,4 +1,5 @@
 #include "device/hip_cost_identity.hpp"
+#include "strix/numeric/logit_comparison.hpp"
 #include "strix/pair/link_flags.hpp"
 #include "strix/pair/chain_topology.hpp"
 #include "strix/device/process_topology.hpp"
@@ -375,49 +376,9 @@ struct RankedLogit {
 std::vector<RankedLogit> top_logits(
     const std::vector<float>& logits,
     std::size_t count) {
-    std::vector<std::uint32_t> order(
-        logits.size());
-    for (std::size_t index = 0;
-         index < order.size();
-         ++index) {
-        order[index] =
-            static_cast<std::uint32_t>(
-                index);
-    }
-
-    count =
-        std::min(
-            count,
-            order.size());
-    std::partial_sort(
-        order.begin(),
-        order.begin() +
-            static_cast<
-                std::ptrdiff_t>(
-                count),
-        order.end(),
-        [&](std::uint32_t left,
-            std::uint32_t right) {
-            if (logits[left] !=
-                logits[right]) {
-                return logits[left] >
-                       logits[right];
-            }
-            return left < right;
-        });
-
     std::vector<RankedLogit> result;
-    result.reserve(count);
-    for (std::size_t index = 0;
-         index < count;
-         ++index) {
-        const auto token =
-            order[index];
-        result.push_back(
-            RankedLogit{
-                token,
-                logits[token],
-            });
+    for (const auto token : strix::numeric::top_k_ids(logits, count)) {
+        result.push_back(RankedLogit{token, logits[token]});
     }
     return result;
 }

@@ -93,14 +93,12 @@ static void dequantized_matrix_test() {
         for (std::size_t row = count; row-- > 0;) work(row, row + 1U);
     });
     check(whole == expected && split == expected, "FP8 block matrix dequantization matches the row decoder");
-    for (const bool high : {false, true}) {
-        for (std::size_t row = 0; row < rows; ++row)
-            microscaled::decode_mxfp4_row_table(std::span(packed).subspan(row * columns / 2U, columns / 2U),
-                                                std::span(exps).subspan(row * 2U, 2U),
-                                                std::span(expected).subspan(row * columns, columns), high);
-        microscaled::dequantize_mxfp4_matrix(packed, exps, rows, columns, whole, {true, high}, microscaled::run_whole_matrix);
-        check(whole == expected, "MXFP4 matrix dequantization matches the row decoder");
-    }
+    for (std::size_t row = 0; row < rows; ++row)
+        microscaled::decode_mxfp4_row_table(std::span(packed).subspan(row * columns / 2U, columns / 2U),
+                                            std::span(exps).subspan(row * 2U, 2U),
+                                            std::span(expected).subspan(row * columns, columns));
+    microscaled::dequantize_mxfp4_matrix(packed, exps, rows, columns, whole, {true}, microscaled::run_whole_matrix);
+    check(whole == expected, "MXFP4 matrix dequantization matches the row decoder");
     microscaled::dequantize_mxfp4_matrix(packed, exps, rows, columns, whole, {}, microscaled::run_whole_matrix);
     for (std::size_t row = 0; row < rows; ++row)
         microscaled::decode_mxfp4_row(std::span(packed).subspan(row * columns / 2U, columns / 2U),

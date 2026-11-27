@@ -29,9 +29,8 @@ struct CompressedMqaLayerShape {
     unsigned hidden, heads, head_dim, rope_dim, q_rank, o_groups, o_rank, vha_rank, window;
     float eps;
     bool checkpoint;       // BF16 stores and the checkpoint operation order
-    bool kv_head_norm;     // unit head norm on the shared key row (reference path only)
-    bool vha_swapped;      // the two post-mix factors are stored exchanged
-    unsigned packed_block; // FP8 block of the output-input epilogue; 0 = none
+    FoldForm fold;
+    core::SigmoidGatePrecision gate_precision;
 };
 
 // rotary(dim, position, compressed) -> RotaryReferenceRow
@@ -42,8 +41,6 @@ std::vector<float> compressed_mqa_layer_reference(const Weights& w, const Compre
     bool keep_compressor, const attn::ReferenceHeadExecutor& execute, const Rotary& rotary) {
     const auto width = s.head_dim;
     const bool checkpoint = s.checkpoint;
-    if (s.packed_block != 0 && (!checkpoint || width % s.packed_block != 0 || s.o_rank % s.packed_block != 0))
-        throw std::invalid_argument("compressed MQA: packed FP8 epilogue requires checkpoint stores and aligned rows");
     const CompressedMqaStep step{position, width, s.window, record_history, keep_compressor,
                                  checkpoint, false, checkpoint};
     validate_compressed_mqa_history<Ratio>(step, state);
@@ -55,7 +52,7 @@ std::vector<float> compressed_mqa_layer_reference(const Weights& w, const Compre
     w.linear(r.kv_proj, input, kv, 1U);
     core::rms_norm_bf16_reference(kv, w.tensor(r.kv_norm, kv.size()), s.eps);
     attn::head_rms_reference(query, width, s.eps);
-    if (!checkpoint && s.kv_head_norm) attn::head_rms_reference(kv, width, s.eps);
+    if (!checkpoint) attn::head_rms_reference(kv, width, s.eps);
 
     std::vector<float> carry_value, carry_logit, pooled;
     if (keep_compressor) {
@@ -81,13 +78,12 @@ std::vector<float> compressed_mqa_layer_reference(const Weights& w, const Compre
     auto heads = compressed_mqa_reference(step, operands, window_rope, compressed_rope, state, execute);
     if (checkpoint) core::round_bf16_reference(heads);
     else window_rope.apply(heads, width, true);
-    value_head_postmix_reference(w, r.mix, s.heads, s.vha_rank, s.vha_swapped, checkpoint, heads, folded_mix, execute);
-    if (checkpoint) compressed_mqa_output_input_reference(heads, width, window_rope, s.packed_block);
+    value_head_postmix_reference(w, r.mix, s.heads, s.vha_rank, s.fold, heads, folded_mix, execute);
+    if (checkpoint) compressed_mqa_output_input_reference(heads, width, window_rope, 0U);
     std::vector<float> grouped(std::size_t{s.o_groups} * s.o_rank);
     w.linear(r.o_group, heads, grouped, s.o_groups);
     std::vector<float> output(s.hidden);
-    sigmoid_gate_values_reference(w, r.gate, q_lora, grouped, checkpoint);
-    if (s.packed_block != 0) core::round_block_fp8_activation_reference(grouped, s.packed_block);
+    sigmoid_gate_values_reference(w, r.gate, q_lora, grouped, s.gate_precision);
     w.linear(r.o_proj, grouped, output, 1U);
     commit_compressed_mqa_history<Ratio>(step, operands, state);
     return output;
