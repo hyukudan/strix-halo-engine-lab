@@ -2246,6 +2246,11 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
         if(tune==80U)resources.template operator()<80U>();
         else if(tune==82U)resources.template operator()<82U>();
         else resources.template operator()<88U>(); // BF16 admission above fixes the tune set.
+        if(strix::moe_route_organizations(true,prefill_tiers()!=0,prefill_down_lds()).declined) {
+            static const bool declined=[]{std::fprintf(stderr,"MoE route i8: tier split / down LDS epilogue declined (they store BF16 route words)
+");return true;}();
+            (void)declined;
+        }
         static const bool witness=[]{std::fprintf(stderr,"MoE FAST lever route i8: ON (bit-changing; STRIX_PREFILL_MOE_ROUTE_I8=0 restores route bf16)\n");return true;}();
         (void)witness;
     }
@@ -2533,7 +2538,7 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                     prefill_da16_mark(0U,stream);
                     hip_check(hipMemsetAsync(arrive,0,static_cast<std::size_t>(batches)*sizeof(unsigned),stream),"qpf2k DA16 counters clear");
                     // Tunes 80/88 already have 64-row CTAs; retain their launch path.
-                    if constexpr(Tune==82U) if(prefill_tiers()) {
+                    if constexpr(Tune==82U) if(strix::moe_route_organizations(rows.route_i8,prefill_tiers()!=0,false).tiers) {
                         if(prefill_tile64()) {
                             static const bool declined=[] {
                                 std::fprintf(stderr,"qpf2k moe tile64 declined: tier organization active\n");return true;
