@@ -220,6 +220,12 @@ add_library(strix_spec STATIC src/spec/drafting.cpp src/spec/block_drafter.cpp s
 target_include_directories(strix_spec PRIVATE src)
 target_link_libraries(strix_spec PUBLIC strix_lookup strix_token_sampling)
 strix_target_warnings(strix_spec)
+# Shared block-diffusion drafter (DFlash family) host reference: the drafter's config.json as data, its safetensors
+# file, the forward over the target's committed taps (include/strix/spec/dflash_drafter.hpp).
+add_library(strix_spec_dflash STATIC src/spec/dflash_drafter.cpp)
+target_include_directories(strix_spec_dflash PRIVATE src)
+target_link_libraries(strix_spec_dflash PUBLIC strix_spec strix-weight strix_serve_json Threads::Threads)
+strix_target_warnings(strix_spec_dflash)
 
 # Host mathematical oracle and candidate adapter; production device paths stay unbound.
 add_library(strix_block_candidate STATIC src/core/block_draft_reference.cpp src/spec/block_candidate.cpp)
@@ -2193,6 +2199,15 @@ if(BUILD_TESTING)
     target_link_libraries(strix-spec-pair-round-tests PRIVATE strix_spec Threads::Threads)
     strix_target_warnings(strix-spec-pair-round-tests)
     add_test(NAME strix-spec-pair-round-tests COMMAND strix-spec-pair-round-tests)
+    add_executable(strix-spec-dflash-tests tests/spec_dflash_drafter_tests.cpp)
+    target_link_libraries(strix-spec-dflash-tests PRIVATE strix_spec_dflash strix_core)
+    strix_target_warnings(strix-spec-dflash-tests)
+    add_test(NAME strix-spec-dflash-tests COMMAND strix-spec-dflash-tests)
+    add_executable(strix-spec-dflash-rows-tests tests/spec_dflash_rows_tests.cpp)
+    target_include_directories(strix-spec-dflash-rows-tests PRIVATE src)
+    target_link_libraries(strix-spec-dflash-rows-tests PRIVATE strix_spec_dflash)
+    strix_target_warnings(strix-spec-dflash-rows-tests)
+    add_test(NAME strix-spec-dflash-rows-tests COMMAND strix-spec-dflash-rows-tests)
     add_executable(strix-spec-block-parallel-tests tests/spec_block_parallel_tests.cpp)
     target_include_directories(strix-spec-block-parallel-tests PRIVATE src)
     add_executable(strix-block-candidate-tests tests/block_candidate_tests.cpp)
