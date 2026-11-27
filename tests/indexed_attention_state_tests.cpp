@@ -3,6 +3,7 @@
 #include "strix/memory_plan.hpp"
 
 #include <iostream>
+#include <stdexcept>
 
 namespace {
 
@@ -13,6 +14,16 @@ void expect(bool condition, const char* message) {
         std::cerr << "FAIL: " << message << '\n';
         ++failures;
     }
+}
+
+template <class Operation>
+bool rejects(Operation operation) {
+    try {
+        operation();
+    } catch (const std::invalid_argument&) {
+        return true;
+    }
+    return false;
 }
 
 }  // namespace
@@ -56,6 +67,13 @@ int main() {
     constexpr strix::SparseLatentRowDims dims{512, 128, 64, 128, 32};
     static_assert(dims.valid());
     expect(strix::sparse_latent_row_bytes(dims) == 528 + 64 + 64 + 4, "sparse latent row: latent + rope + E2M1 key + scales");
+
+    // Zero divisors: rejected at run time; constant evaluation of the same call is ill-formed (not testable here).
+    expect(rejects([] { (void)strix::compressed_history_rows(1000, 128, 0); }), "zero compression ratio is rejected");
+    expect(rejects([] { (void)strix::block_scaled_fp8_row_bytes(512, 0); }), "zero FP8 block is rejected");
+    expect(rejects([] { (void)strix::sparse_latent_row_bytes({512, 0, 64, 128, 32}); }), "zero latent block is rejected");
+    expect(rejects([] { (void)strix::sparse_latent_row_bytes({512, 128, 64, 128, 0}); }), "zero index block is rejected");
+    static_assert(strix::compressed_history_rows(1000, 128, 4).compressed_rows == 250);
 
     if (failures == 0) {
         std::cout

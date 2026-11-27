@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 
 namespace strix {
 
@@ -27,20 +28,23 @@ build_indexed_attention_state_layout(
 // Per-layer cache bytes of the compressed-history and sparse-latent attention forms (candidate compact layouts, not a
 // final wire format). The model declares its dimensions; the formulas are shared.
 //
-// A block-scaled FP8 row: one code byte per element and one FP32 scale per `block` elements.
-[[nodiscard]] constexpr std::uint64_t block_scaled_fp8_row_bytes(std::uint64_t width, std::uint64_t block) noexcept {
+// A block-scaled FP8 row: one code byte per element and one FP32 scale per `block` elements. A zero block is
+// invalid: a compile error in constant evaluation, std::invalid_argument at run time.
+[[nodiscard]] constexpr std::uint64_t block_scaled_fp8_row_bytes(std::uint64_t width, std::uint64_t block) {
+    if (block == 0U) throw std::invalid_argument("block-scaled FP8 row: block must be at least 1");
     return width + (width / block) * sizeof(float);
 }
 
 // Rows a compressed-history layer keeps for `context` tokens: a sliding window of raw rows plus one compressed row
-// per `ratio` tokens (rounded up).
+// per `ratio` tokens (rounded up). A zero ratio is invalid (same error style as above).
 struct CompressedHistoryRows {
     std::uint32_t history_rows = 0;
     std::uint32_t compressed_rows = 0;
 };
 
 [[nodiscard]] constexpr CompressedHistoryRows compressed_history_rows(
-    std::uint32_t context, std::uint32_t window, std::uint32_t ratio) noexcept {
+    std::uint32_t context, std::uint32_t window, std::uint32_t ratio) {
+    if (ratio == 0U) throw std::invalid_argument("compressed history rows: ratio must be at least 1");
     return {std::min(context, window), (context + ratio - 1U) / ratio};
 }
 
@@ -58,7 +62,9 @@ struct SparseLatentRowDims {
     }
 };
 
-[[nodiscard]] constexpr std::uint64_t sparse_latent_row_bytes(const SparseLatentRowDims& d) noexcept {
+[[nodiscard]] constexpr std::uint64_t sparse_latent_row_bytes(const SparseLatentRowDims& d) {
+    if (d.latent_block == 0U || d.index_block == 0U)
+        throw std::invalid_argument("sparse latent row: block widths must be at least 1");
     return block_scaled_fp8_row_bytes(d.latent_width, d.latent_block) + d.rope_width + d.index_width / 2U +
            d.index_width / d.index_block;
 }
