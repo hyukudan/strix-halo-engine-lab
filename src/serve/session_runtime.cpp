@@ -591,7 +591,9 @@ struct SessionRuntime::Impl {
             items.push_back({l.handle,std::span(l.taken.job.prompt).subspan(l.offset),samplers[n],
                 [this, lane=&l] { const bool stop=cancelled(*lane); if(stop) lane->cancel.request_stop(); return stop; }});
         }
+        const auto advance_started=std::chrono::steady_clock::now();
         auto results=engine.advance(items);
+        const auto advance_ms=elapsed(advance_started);
         require(results.size()==items.size(),"mixed result count mismatch");
         require(std::any_of(results.begin(),results.end(),[](const auto& r){return r.input_tokens || !r.output.tokens.empty() ||
             r.output.finish!=FinishReason::none || !r.error.empty();}),"mixed plan made no progress");
@@ -616,6 +618,11 @@ struct SessionRuntime::Impl {
                     require(o.accepted_drafts<=o.proposed_drafts && o.accepted_drafts<=o.tokens.size(),"mixed draft counts");
                 }
                 l.offset+=r.input_tokens; l.rng=o.rng_draws;
+                // Same split as the separate prefill and decode passes: the pass wall time is charged to the lane's prompt
+                // time while it only ingests prompt rows, and to its decode time once it emits tokens.
+                (o.tokens.empty() && r.input_tokens ? l.stats.prefill_ms : l.stats.decode_ms)+=advance_ms;
+                if(!o.tokens.empty() && !l.stats.generated_tokens && l.taken.job.observation_complete())
+                    l.stats.first_token_ms=elapsed(l.taken.submitted);
                 l.phase_remaining-=static_cast<std::uint32_t>(o.tokens.size());
                 l.stats.generated_tokens+=o.tokens.size();
                 if(!o.tokens.empty()) {++l.stats.cycles;l.stats.proposed+=o.proposed_drafts;l.stats.accepted+=o.accepted_drafts;}
