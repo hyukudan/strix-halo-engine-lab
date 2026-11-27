@@ -3528,7 +3528,7 @@
     "preconditions": "Full-row known-prefix fast FP16 MoE on native or YaRN long-context plain CLI routes, Q4_K/Q5_K gate/up, Q5_1/Q8_0 DA16 certificate down, effective tunes 80/82/88 including XOR rows, ROUTE=14, MC=1; default vector and MERGE_VEC=0 scalar merge/commit, including unsafe fallback. No added rotary site or YaRN rotary identity change; YaRN model-fidelity and complete-workload qualification pending. Other writers/readers, GSQ, core/G3/P1, SMALL, MTP, nested/serving, cache/session and CUDA decline. Logical dot row bytes halve; allocation and arena pitch remain FP32-sized.",
     "off_switch": "Any environment value starting with 0; --prefill-moe-route-bf16 off; --baseline; STRIX_BASELINE=1; STRIX_QPF2K_DEFAULTS=0.",
     "doc_anchor": "docs/optimizations.md#qwen-moe-route-bf16"
-  ,"all_on":{"lever":"qwen_moe_route_bf16","class":"fast","gate":"pending","engines":["qwen"],"backends":["hip"],"phase":"prefill","env":"STRIX_QPF2K_MOE_ROUTE_BF16","value":"1","quality":"BF16 round of each route dot; model fidelity qualification pending","needs":[]}},
+  ,"all_on":{"lever":"qwen_moe_route_bf16","class":"fast","gate":"pending","engines":["qwen"],"backends":["hip"],"phase":"prefill","env":"STRIX_QPF2K_MOE_ROUTE_BF16","value":"1","quality":"BF16 round of each route dot; model fidelity qualification pending","needs":["arg:--no-mtp|env:STRIX_MTP=0|env:STRIX_MTP=off"],"needs_reason":"the BF16 route storage declines the MTP bundle (the default speculative decode, about twice the plain decode): it applies only with MTP off"}},
   {
     "engine": "qwen",
     "name": "MoE prepared Q4_K direct-B candidate",
