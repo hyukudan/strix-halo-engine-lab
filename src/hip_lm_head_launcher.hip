@@ -1,5 +1,6 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
+#include "strix/numeric/bf16_bits.hpp"
 #include "core/gemv_tree.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
@@ -134,12 +135,7 @@ WeightKind weight_kind(
     }
 }
 
-__device__ float bf16_to_float(
-    std::uint16_t bits) {
-    return __uint_as_float(
-        static_cast<std::uint32_t>(
-            bits) << 16U);
-}
+using numeric::bf16_bits::bf16_to_float;
 
 __device__ float load_activation(
     const float* value) {

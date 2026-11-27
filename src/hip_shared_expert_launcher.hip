@@ -1,5 +1,6 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
+#include "strix/numeric/bf16_bits.hpp"
 #include "core/gemv_tree.hpp"
 #include "strix/cohort_step_plan.hpp"
 #include "strix/env_flags.hpp"
@@ -144,12 +145,7 @@ WeightKind weight_kind(
     }
 }
 
-__device__ float bf16_to_float(
-    std::uint16_t bits) {
-    return __uint_as_float(
-        static_cast<std::uint32_t>(
-            bits) << 16U);
-}
+using numeric::bf16_bits::bf16_to_float;
 
 __device__ float load_activation(
     const float* value) {
@@ -170,15 +166,7 @@ __device__ void store_activation(
 __device__ void store_activation(
     std::uint16_t* destination,
     float value) {
-    const auto bits =
-        __float_as_uint(value);
-    const auto rounded =
-        bits +
-        0x7fffU +
-        ((bits >> 16U) & 1U);
-    *destination =
-        static_cast<std::uint16_t>(
-            rounded >> 16U);
+    *destination = numeric::bf16_bits::float_to_bf16(value);
 }
 
 template <WeightKind Kind>

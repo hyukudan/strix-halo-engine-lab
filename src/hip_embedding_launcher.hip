@@ -1,4 +1,5 @@
 #include "strix/hip_mtp_prime_rows.hpp"
+#include "strix/numeric/bf16_bits.hpp"
 #include <type_traits>
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
@@ -119,12 +120,7 @@ EmbeddingWeightKind weight_kind(
     }
 }
 
-__device__ __forceinline__ float bf16_to_float(
-    std::uint16_t bits) {
-    return __uint_as_float(
-        static_cast<std::uint32_t>(
-            bits) << 16U);
-}
+using numeric::bf16_bits::bf16_to_float;
 
 __device__ __forceinline__ void store_output(
     float* destination,

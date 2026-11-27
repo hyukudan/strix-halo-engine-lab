@@ -12,6 +12,8 @@
 // the caller's cleared workspace and are returned to zero by the launch itself.
 #include <cstdint>
 
+#include "strix/numeric/bf16_bits.hpp"
+
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #define STRIX_SLOT_MERGE_HD __host__ __device__
 #else
@@ -51,7 +53,7 @@ inline constexpr std::uint32_t nonfinite_status = 8U;
 }
 // bf16 round-to-nearest-even of the f32 bits, without NaN canonicalisation (the incumbent activation store).
 [[nodiscard]] STRIX_SLOT_MERGE_HD constexpr std::uint16_t bf16_rne(std::uint32_t bits) noexcept {
-    return static_cast<std::uint16_t>((bits + 0x7fffU + ((bits >> 16U) & 1U)) >> 16U);
+    return ::strix::numeric::bf16_bits::rne(bits);
 }
 
 } // namespace strix::moe_slot_merge

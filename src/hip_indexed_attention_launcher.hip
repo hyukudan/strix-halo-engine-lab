@@ -1,5 +1,6 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
+#include "strix/numeric/bf16_bits.hpp"
 #include "core/gemv_tree.hpp"
 #include "strix/hip_mtp_prime_rows.hpp"
 #include "strix/attn/kv_int8_token.hpp"
@@ -469,28 +470,9 @@ SmallWeightKind small_weight_kind(
     }
 }
 
-__device__ float bf16_to_float(
-    std::uint16_t bits) {
-    return __uint_as_float(
-        static_cast<std::uint32_t>(bits) << 16U);
-}
-
-__device__ std::uint16_t float_to_bf16(
-    float value) {
-    const auto bits = __float_as_uint(value);
-    const auto rounded =
-        bits +
-        0x7fffU +
-        ((bits >> 16U) & 1U);
-    return static_cast<std::uint16_t>(
-        rounded >> 16U);
-}
-
-__device__ float round_bf16(
-    float value) {
-    return bf16_to_float(
-        float_to_bf16(value));
-}
+using numeric::bf16_bits::bf16_to_float;
+using numeric::bf16_bits::float_to_bf16;
+using numeric::bf16_bits::round_bf16;
 
 // kv-int8-tok-v1 (AttentionKvStorage::int8_token). The KV row of one token and layer is
 // [K codes kv_width | V codes kv_width | FP32 scales: K heads, then V heads]. Per (token, KV

@@ -1,5 +1,6 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
+#include "strix/numeric/bf16_bits.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
 #include "strix/cohort_step_plan.hpp"
 #include "strix/env_flags.hpp"
@@ -161,12 +162,7 @@ RouterWeightKind weight_kind(
     }
 }
 
-__device__ float bf16_to_float(
-    std::uint16_t bits) {
-    return __uint_as_float(
-        static_cast<std::uint32_t>(
-            bits) << 16U);
-}
+using numeric::bf16_bits::bf16_to_float;
 
 template <typename Activation>
 __device__ float load_activation(

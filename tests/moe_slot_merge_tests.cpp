@@ -2,6 +2,7 @@
 // (row tile, slot) blocks, the ticket protocol yields bit-for-bit the incumbent one-CTA serial tail (merged
 // accumulation, committed output, status and first-error record), and the ticket words fit the status pad.
 #include "strix/moe_slot_merge.hpp"
+#include "strix/numeric/bf16_bits.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -168,6 +169,24 @@ int main() {
     expect(sm::fails_commit(0x7f7f8000U, true) && !sm::fails_commit(0x7f7f8000U, false), "bf16 commit threshold");
     expect(sm::fails_commit(0xff800000U, false) && sm::fails_commit(0x7fc00000U, false), "inf / nan fail");
     expect(sm::bf16_rne(0x3f808000U) == 0x3f80U && sm::bf16_rne(0x3f818000U) == 0x3f82U, "bf16 ties to even");
+    {
+        // The shared BF16 activation codec equals the launchers' former private rounding for every high half and
+        // the rounding-critical low halves (ties, carries into the exponent, NaN payloads), and so does the slot merge.
+        namespace bb = strix::numeric::bf16_bits;
+        const std::uint32_t lows[] = {0x0000U, 0x0001U, 0x7fffU, 0x8000U, 0x8001U, 0xffffU, 0x1234U, 0xc000U};
+        bool same = true;
+        for (std::uint32_t high = 0; high < 0x10000U; ++high)
+            for (const auto low : lows) {
+                const std::uint32_t bits = (high << 16U) | low;
+                const auto former = static_cast<std::uint16_t>((bits + 0x7fffU + ((bits >> 16U) & 1U)) >> 16U);
+                const float value = std::bit_cast<float>(bits);
+                const std::uint32_t widened = static_cast<std::uint32_t>(former) << 16U;
+                same = same && bb::rne(bits) == former && bb::float_to_bf16(value) == former &&
+                       sm::bf16_rne(bits) == former && std::bit_cast<std::uint32_t>(bb::bf16_to_float(former)) == widened &&
+                       std::bit_cast<std::uint32_t>(bb::round_bf16(value)) == widened;
+            }
+        expect(same, "shared bf16 codec equals the former launcher rounding");
+    }
     const std::uint32_t shapes[][2] = {{2560U, 10U}, {2048U, 8U}, {256U, 1U}, {1024U, 4U}, {2560U, 1U}};
     for (const auto& shape : shapes)
         for (int mode = 0; mode < 6; ++mode) {

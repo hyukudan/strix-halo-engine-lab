@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
+#include "strix/numeric/bf16_bits.hpp"
 #include "core/gemv_tree.hpp"
 #include "strix/profile/all_on_engaged.hpp"
 #include <iostream>
@@ -325,31 +326,9 @@ SmallWeightKind small_weight_kind(
     }
 }
 
-__device__ float bf16_to_float(
-    std::uint16_t bits) {
-    return __uint_as_float(
-        static_cast<std::uint32_t>(
-            bits) << 16U);
-}
-
-__device__ std::uint16_t float_to_bf16(
-    float value) {
-    const auto bits =
-        __float_as_uint(value);
-    const auto rounded =
-        bits +
-        0x7fffU +
-        ((bits >> 16U) & 1U);
-    return static_cast<std::uint16_t>(
-        rounded >> 16U);
-}
-
-__device__ float round_bf16(
-    float value) {
-    return bf16_to_float(
-        float_to_bf16(value));
-}
-
+using numeric::bf16_bits::bf16_to_float;
+using numeric::bf16_bits::float_to_bf16;
+using numeric::bf16_bits::round_bf16;
 
 template <WeightKind Kind>
 __device__ float load_weight(
