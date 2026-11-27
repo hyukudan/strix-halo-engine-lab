@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/model/bind.hpp"
 #include "strix/model_data/ernie_5_5_flash_preview.hpp"
 #include "strix/spec/block_parallel.hpp"
 #include "strix/spec/draft_decl.hpp"
@@ -11,7 +12,8 @@ namespace strix::ernie {
 namespace draft_data = model_data::ernie_5_5_flash_preview;
 
 inline constexpr std::array<std::int32_t, 3> dspark_taps{
-    draft_data::drafter::taps[0], draft_data::drafter::taps[1], draft_data::drafter::taps[2]};
+    model::narrow<std::int32_t>(draft_data::drafter::taps[0]), model::narrow<std::int32_t>(draft_data::drafter::taps[1]),
+    model::narrow<std::int32_t>(draft_data::drafter::taps[2])};
 inline constexpr std::array<std::string_view, 2> dspark_target_weights{
     "model.embed_tokens.weight", "lm_head.weight"};
 

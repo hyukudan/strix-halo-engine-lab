@@ -3,13 +3,16 @@
 // every policy / accuracy / source mix, ONE forward per draft, anchor position tracked through every step kind), the flat
 // cost config, and the MoE verify pricing used in the HY4 break-even table.
 #include "strix/spec/block_parallel.hpp"
+#include "strix/spec/draft_reference.hpp"
 #include "strix/ernie/draft.hpp"
+#include "core/multimax_reference.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -228,6 +231,52 @@ void ernie_draft_layout() {
     BP_CHECK(sp::proposal_row(policy, 0) == 0 && sp::proposal_row(policy, 6) == 6 && sp::row_visible(policy, 0, 6),
              "the anchor predicts first and sees trailing noise rows");
     static_assert(strix::ernie::echo_mtp_layers == 0, "Preview only has the bundled block drafter");
+}
+
+void draft_reference_cases() {
+    std::array<float, 2> mean{};
+    constexpr std::array post{1.0F, 3.0F, 5.0F, 7.0F};
+    sp::draft_stream_mean_bf16_reference(post, mean);
+    BP_CHECK((mean == std::array{3.0F, 5.0F}), "target tap averages across streams");
+    constexpr std::array feature_matrix{0.0F, 0.2F, 0.0F, 0.0F};
+    constexpr std::array gain{1.0F, 1.0F};
+    std::array<float, 2> context{};
+    sp::draft_project_norm_bf16_reference(feature_matrix, mean, gain, 0.5F, context);
+    BP_CHECK((context == std::array{1.0F, 0.0F}), "projected target taps are normalized");
+
+    constexpr std::array previous{1.0F, 0.0F, 0.0F, 1.0F};
+    constexpr std::array embedding{1.0F, 0.0F};
+    constexpr std::array hidden_matrix{2.0F, 0.0F, 0.0F, 4.0F};
+    constexpr std::array rotated_embedding_matrix{0.0F, 2.0F, 3.0F, 0.0F};
+    std::array<float, 4> joined{};
+    sp::mtp_join_bf16_reference(previous, embedding, gain, gain, hidden_matrix, rotated_embedding_matrix, 0.5F,
+                                joined);
+    BP_CHECK((joined == std::array{2.0F, 3.0F, 0.0F, 7.0F}),
+             "MTP projects each stream and broadcasts the projected embedding");
+
+    constexpr float mask = -std::numeric_limits<float>::infinity();
+    constexpr auto nan = std::numeric_limits<float>::quiet_NaN();
+    constexpr std::array ranges{0.0F, 0.0F, 0.0F, 0.0F}, strengths{0.0F, 0.0F, 0.0F, -1.0F};
+    std::array special{mask, -2.0F, nan};
+    strix::core::multimax_f32_reference(special, ranges, strengths, true);
+    BP_CHECK(special[0] == mask && special[1] == -2.0F && std::isnan(special[2]),
+             "the hinge transform preserves masks and NaNs");
+
+    constexpr std::array raw{0.0F, 0.5F, mask, 0.0F, 1.0F, mask};
+    constexpr std::array by_rank{10.0F, 20.0F, 30.0F, -1.0F, 0.0F, 1.0F};
+    constexpr std::array head{0.0F, 0.5F, 0.0F, 1.0F, 0.0F, 0.0F};
+    std::array<std::uint32_t, 2> ids{};
+    std::size_t calls = 0;
+    sp::draft_markov_greedy_reference(raw, 3, by_rank, head, 2, ids, [&](auto row) {
+        constexpr std::array before{0.5F, 1.5F, -0.5F, 0.0F};
+        BP_CHECK(calls < ids.size() && row[0] == before[2 * calls] && row[1] == before[2 * calls + 1],
+                 "the transform sees logits conditioned on the anchor or previous proposal");
+        ++calls;
+        strix::core::multimax_f32_reference(row, ranges, strengths);
+        row[2] = 100.0F;  // The readout preserves the mask independently of the transform.
+    });
+    BP_CHECK((calls == ids.size() && ids == std::array<std::uint32_t, 2>{0, 1}),
+             "each proposal applies the vocabulary transform once, after Markov bias");
 }
 
 void cost_tests() {
@@ -582,6 +631,7 @@ void replay_tests() {
 int main() {
     layout_tests();
     ernie_draft_layout();
+    draft_reference_cases();
     cost_tests();
     prefix_tests();
     pricing_tests();
