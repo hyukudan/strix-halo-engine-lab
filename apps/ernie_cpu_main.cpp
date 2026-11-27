@@ -28,6 +28,7 @@ namespace core = strix::core;
 using strix::serve::Json;
 using Clock = std::chrono::steady_clock;
 constexpr std::size_t kMiB = std::size_t{1} << 20;
+constexpr unsigned kOracleMaxTokens = 600;
 static_assert(std::endian::native == std::endian::little, "CPU trace files use little endian");
 
 struct Options {
@@ -156,7 +157,7 @@ Options parse_options(int argc, char** argv) {
     if (!opts.capture.empty() && (!opts.packed.empty() || !opts.replay.empty()))
         throw std::invalid_argument("capture requires a free-running source-checkpoint run");
     if (opts.oracle && (opts.prompt || !opts.capture.empty() || !opts.replay.empty() ||
-        opts.limit < 2 || opts.limit > 128 || opts.cache_mib > 8192 ||
+        opts.limit < 2 || opts.limit > kOracleMaxTokens || opts.cache_mib > 8192 ||
         opts.start_layer > opts.end_layer || opts.end_layer > ernie::kLayerCount ||
         (opts.start_layer != 0 && opts.resume.empty())))
         throw std::invalid_argument("invalid oracle options or missing layer cache");
