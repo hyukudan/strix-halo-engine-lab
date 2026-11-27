@@ -53,6 +53,8 @@ struct ServePreparation {
     // HTTP slot override from --streams or a deployment plan (0: STRIX_G4_SERVE_SLOTS applies).
     std::uint32_t deployment_slots = 0;
     std::string output;
+    // Start lines of levers the server declines to apply (also printed to stderr by prepare_serve).
+    std::vector<std::string> notices;
     bool bind_given = false, port_given = false;
 };
 ServePreparation prepare_serve(int argc, char** argv);

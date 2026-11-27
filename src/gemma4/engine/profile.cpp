@@ -34,7 +34,7 @@ constexpr std::string_view dattn_gate_receipt =
     "0.985, +0.0041) / 32K (1,024: 0.0032, "
     "0.987, +0.0042) / 64K (1,024: 0.0019, 0.981, -0.0003); FAST FAIL (per-window dNLL > 0.01 under the null-capped se)";
 // Decode C1 ABBA, FAST exact attention vs FAST + g4-dattn-f2 (Q4_K_M, 128 greedy tokens, fresh process per run).
-constexpr std::string_view dattn_turbo_timing = "g4-dattn-f2 decode C1 ABBA vs exact attention";
+constexpr std::string_view dattn_turbo_timing = "G4D g4-dattn-f2 decode C1 ABBA vs exact attention";
 // TURBO band receipts of g4-dattn-f2 (bound per run to its own FAST reference by profile::bind_band_receipts): each band
 // starts at its timed lower edge; speedup = that edge's measured decode ratio (the ratio grows with the context).
 constexpr strix::profile::LadderRow dattn_band(std::uint64_t lo, std::uint64_t hi, double speedup, double noise) {
@@ -46,6 +46,7 @@ constexpr strix::profile::LadderRow dattn_band(std::uint64_t lo, std::uint64_t h
     row.device = "gfx1151";
     row.min_context = lo;
     row.max_context = hi;
+    row.max_lanes = 1;  // timed at C1 only
     row.speedup = speedup;
     row.noise = noise;
     row.receipt = dattn_turbo_timing;
@@ -386,7 +387,12 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
                 const auto selected_column = lowered_turbo ? strix::profile::value_column(lever, cell.tier) : column;
                 const auto admission = cell.benchmark ? strix::profile::Status::unqualified : admit(selected_column);
                 if (profile == Name::turbo) entry.value = cell.value;
-                if ((!entry.ladder.empty() && cell.value == lever.builtin) ||
+                // Out of every band of a column the gate admitted: a decided builtin, not a pending qualification.
+                const bool out_of_band = cell.out_of_band && cell.value == lever.builtin && admission == strix::profile::Status::set;
+                if (out_of_band) {
+                    entry.value = lever.builtin;
+                    entry.status = Status::builtin;
+                } else if ((!entry.ladder.empty() && cell.value == lever.builtin) ||
                     admission == strix::profile::Status::pending) {
                     if (lever.builtin_unqualified)
                         refuse(std::string(lever.source) + (entry.ladder.empty()
@@ -449,6 +455,14 @@ PrefillRouteChoice prefill_route_for_decode(std::string_view route, std::string_
         return {"exact", "gemma4 prefill: STRIX_G4_PREFILL_IDENTITY=a8 needs decode identity g4-a8-v1 (decode is " +
                          std::string(decode_identity) + "); prefill-exact runs"};
     return {route, {}};
+}
+std::string serve_decode_attention_notice(const Resolution& resolution, std::string_view backend) {
+    if (resolution.name != Name::turbo || backend != "device") return {};
+    const auto* entry = resolution.find("decode_attention");
+    if (!entry || entry->status == Status::explicit_env || entry->status == Status::explicit_cli || entry->status == Status::off ||
+        entry->value != entry->lever->builtin)
+        return {};
+    return "g4-dattn-f2: not applied: the server has one decode attention format per process (open deviation; CLI applies it 8K-64K)";
 }
 void apply(const Resolution& resolution) {
     for (const auto& line : resolution.notices()) std::cerr << line << '\n';

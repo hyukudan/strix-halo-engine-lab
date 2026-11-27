@@ -373,6 +373,38 @@ void product_table() {
             r = pr::resolve(pr::Name::turbo, app, outside);
             check(value(r, "decode_attention") == "exact", "turbo keeps the fast cell outside its measured bands and device");
         }
+        // Out of band the cell is a decided builtin (not pending); a multi-stream CLI run is out of band too (timed at C1).
+        {
+            pr::Inputs outside = in();
+            outside.regime = {shared::Phase::decode, 4096, 1, "gfx1151", "fixture-exec"};
+            r = pr::resolve(pr::Name::turbo, app, outside);
+            check(status(r, "decode_attention") == pr::Status::builtin, "out of band decode_attention is builtin, not pending");
+            r = pr::resolve(pr::Name::fast, app, outside);
+            check(status(r, "decode_attention") == pr::Status::builtin, "fast reports the same builtin state");
+            pr::Inputs lanes = in();
+            lanes.regime = {shared::Phase::decode, 32768, 4, "gfx1151", "fixture-exec"};
+            r = pr::resolve(pr::Name::turbo, app, lanes);
+            check(value(r, "decode_attention") == "exact" && status(r, "decode_attention") == pr::Status::builtin,
+                  "the C1-timed bands do not apply at 4 streams");
+        }
+        // Server (prepare_serve resolves with no decode regime): TURBO runs the exact attention and says so at start;
+        // the one-prompt CLI resolution of the same prompt still selects the band. Open deviation of CLI == server.
+        {
+            r = pr::resolve(pr::Name::turbo, app, in());
+            const auto notice = pr::serve_decode_attention_notice(r, "device");
+            check(notice.find("g4-dattn-f2: not applied") != std::string::npos &&
+                  notice.find("one decode attention format per process") != std::string::npos &&
+                  notice.find("open deviation") != std::string::npos, "the TURBO server states why g4-dattn-f2 is not applied");
+            check(pr::serve_decode_attention_notice(r, "host").empty(), "no line on the host backend");
+            check(pr::serve_decode_attention_notice(pr::resolve(pr::Name::fast, app, in()), "device").empty(), "no line in fast");
+            check(pr::serve_decode_attention_notice(pr::resolve(pr::Name::turbo, app, in({}, {}, lookup({{"STRIX_G4_DECODE_ATTN", "exact"}}))),
+                                                    "device").empty(), "no line when the lever is switched off explicitly");
+            pr::Inputs cli = in();
+            cli.regime = {shared::Phase::decode, 32768, 1, "gfx1151", "fixture-exec"};
+            r = pr::resolve(pr::Name::turbo, app, cli);
+            check(value(r, "decode_attention") == "g4-dattn-f2" && pr::serve_decode_attention_notice(r, "device").empty(),
+                  "the CLI resolution still selects the band (and prints no refusal)");
+        }
         r = pr::resolve(pr::Name::fast, app, in({}, {}, lookup({{"STRIX_G4_DECODE_ATTN", "exact"}})));
         check(status(r, "decode_attention") == pr::Status::off && !r.active("decode_attention"), "STRIX_G4_DECODE_ATTN=exact is OFF");
         r = pr::resolve(pr::Name::standard, app, in({}, {}, lookup({{"STRIX_G4_DECODE_ATTN", "g4-dattn-f1"}})));

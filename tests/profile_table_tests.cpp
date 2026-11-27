@@ -13,6 +13,7 @@
 #include "strix/profiles/qwen_dense_hip.hpp"
 #include "minimax/engine/mm_defaults.hpp"
 
+#include <vector>
 #include <algorithm>
 #include <array>
 #include <iomanip>
@@ -359,20 +360,33 @@ void matrix(const char* registry) {
                     (binding.backend == "cuda" && !device.vendor.empty() && device.vendor != "nvidia") ||
                     (binding.backend == "cpu" && !device.vendor.empty())) continue;
                 for (const auto tier : {p::Name::standard, p::Name::fast, p::Name::turbo}) {
-                    for (const auto context : {0U, 2048U, 4096U, 8192U, 8193U, 16384U, 32768U}) {
-                        const auto lanes = binding.route == "pair" ? 2U : 1U;
+                    // Prefill regimes for every binding; the Gemma family also resolves its decode regimes (the TURBO
+                    // decode-attention bands are timed at one lane, so four lanes at 32K must stay exact).
+                    struct Case { p::Phase phase; unsigned context, lanes; };
+                    std::vector<Case> cases;
+                    for (const auto context : {0U, 2048U, 4096U, 8192U, 8193U, 16384U, 32768U})
+                        cases.push_back({p::Phase::prefill, context, binding.route == "pair" ? 2U : 1U});
+                    if (binding.tag == "gemma4") {
+                        for (const auto context : {2048U, 4096U, 8191U, 8192U, 32768U, 65280U, 65536U, 65537U})
+                            cases.push_back({p::Phase::decode, context, 1U});
+                        cases.push_back({p::Phase::decode, 32768U, 4U});
+                    }
+                    for (const auto& one : cases) {
+                        const auto context = one.context;
+                        const auto lanes = one.lanes;
                         p::Inputs in;
                         in.profile = tier;
                         in.env = no_env;
                         in.backend = binding.backend;
-                        in.regime = {p::Phase::prefill, context, lanes, device.arch, "matrix"};
+                        in.regime = {one.phase, context, lanes, device.arch, "matrix"};
                         const auto emit = [&](const auto& resolution) {
                             std::cout << '\t' << std::quoted(resolution.qualification());
                             for (const auto& entry : resolution.entries)
                                 std::cout << '\t' << entry.lever->name << '=' << std::quoted(entry.value)
                                           << '/' << static_cast<unsigned>(entry.status);
                         };
-                        std::cout << model.name << '\t' << binding.backend << '\t' << binding.route << '\t'
+                        std::cout << model.name << '\t' << binding.backend << '\t'
+                                  << (one.phase == p::Phase::decode ? std::string(binding.route) + "-decode" : std::string(binding.route)) << '\t'
                                   << device.name << '\t' << (tier == p::Name::standard ? "exact" : p::name(tier))
                                   << '\t' << context;
                         try {

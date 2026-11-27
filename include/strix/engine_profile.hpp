@@ -1079,6 +1079,9 @@ struct LadderCell {
     bool benchmark = false;
     std::string reference{};  // LadderArms::over() of the highest judged step (what its timing rows must name)
     bool measured = false;    // a timing row decided the cell (applies, slower or within noise)
+    // The lever's judged value has band rows and the regime lies outside every one of them: the cell keeps the tier
+    // below by design (a decided out-of-band state, not a pending qualification). Adapters may report it as builtin.
+    bool out_of_band = false;
 };
 
 // Version of the reference spelling (LadderRow::over). Bumped when the spelling rule changes, so a receipt written
@@ -1170,6 +1173,21 @@ struct NoExplicitSetting {
     std::optional<std::string_view> operator()(const auto&) const noexcept { return std::nullopt; }
 };
 
+// `value` of `lever` has band-bound timing rows in `tier` and `regime` lies in none of them (phase, device, context and
+// lanes): the regime is out of band, which the cell reports as its tier-below value, not as a pending row.
+[[nodiscard]] constexpr bool outside_every_band(std::span<const LadderRow> rows, std::string_view lever,
+                                                std::string_view value, Name tier, const Regime& regime) noexcept {
+    bool banded = false;
+    for (const auto& row : rows) {
+        if (row.incumbent || !row.band_bound || !row.joint.empty() || !ladder_names(row, lever, value, tier)) continue;
+        banded = true;
+        if (row.phase == regime.phase && !row.device.empty() && row.device == regime.device &&
+            ladder_band(regime.context, ladder_min_context(row), row.max_context, regime.lanes, row.min_lanes, row.max_lanes))
+            return false;
+    }
+    return banded;
+}
+
 // The cell `lever` runs in `tier` over `lower`, its resolved cell of the tier below (the same cell the tier below
 // exports, an unqualified benchmark cell included: a fallback never drops what the reference was spelled over).
 template <class Row, class Admission>
@@ -1188,6 +1206,7 @@ template <class Row, class Admission>
         return {eligible ? wanted : lever.builtin, tier, {}};
 
     lower.measured = false;  // the lower step's own verdict is not this tier's
+    lower.out_of_band = false;
     if (!wanted.empty() && !eligible) {
         // TURBO nests FAST: a TURBO proposal its column does not admit (pending, or not runnable in this build) leaves
         // the cell FAST resolved, whatever value the proposal spells (a companion setting of the proposal stays
@@ -1227,6 +1246,7 @@ template <class Row, class Admission>
     lower.route = step + lower.route;
     lower.reference = reference;
     lower.measured = measured;
+    lower.out_of_band = verdict.rung == Rung::unmeasured && outside_every_band(rows, lever.name, wanted, tier, regime);
     return lower;
 }
 

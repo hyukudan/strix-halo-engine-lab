@@ -764,7 +764,7 @@ E ds41-rtx fast app2 host_promote=on s0
 E ds41-rtx fast app2 batch_long=off s5
 E ds41-rtx fast app2 fp16_dense_prefill=off s5
 D gemma4 turbo app1 decode_identity=g4-a8-v1 s0
-D gemma4 turbo app1 decode_attention=exact s4
+D gemma4 turbo app1 decode_attention=exact s3
 D gemma4 turbo app1 a8_ffn_ple_fuse=1 s3
 D gemma4 turbo app1 draft=off s6
 D gemma4 turbo app1 draft_mode=auto s3
@@ -776,7 +776,7 @@ D gemma4 turbo app1 prefill_route=fast s0
 D gemma4 turbo app1 prefill_route_attention=flash s0
 D gemma4 turbo app1 mtp_q8=0 s4
 D gemma4 turbo app2 decode_identity=g4-a8-v1 s0
-D gemma4 turbo app2 decode_attention=exact s4
+D gemma4 turbo app2 decode_attention=exact s3
 D gemma4 turbo app2 a8_ffn_ple_fuse=1 s3
 D gemma4 turbo app4 throws profile 'turbo' requires prefill_linears = wmma: the prefill bench runs WMMA prefill linears (g4-wmma-pf-v1; STRIX_G4_PREFILL_LINEAR_POLICY selects g4-wmma-pf-v2), stamped unqualified here: the engine applies the qualified identity per profile and pack; measure prefill-exact through strix-gemma4-decode prompt prefill (--allow-pending runs the unqualified implementation, benchmarking only)
 E ds41-rtx turbo app1 throws ds41 RTX: --profile turbo is not bound on this backend yet (pending: RTX cache namespace and turbo column; use the pair engine's ds41-turbo-v1)

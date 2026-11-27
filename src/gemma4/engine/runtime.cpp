@@ -349,6 +349,10 @@ Runtime::Runtime(const Options& o) {
 ServePreparation prepare_serve(int argc,char** argv) {
         ServePreparation prepared;
         auto& options=prepared.options; options=parse_options(argc,argv);
+        if (auto notice=profile::serve_decode_attention_notice(options.profile,options.backend); !notice.empty()) {
+            std::cerr<<notice<<'\n';
+            prepared.notices.push_back(std::move(notice));
+        }
         std::ostringstream report;
         // Up to serve_slots() requests decode together: session-fixed choices (the EXL3 core identity) see that
         // stream count unless --streams sets it.

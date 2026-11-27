@@ -99,6 +99,11 @@ struct Inputs {
 };
 // Throws std::invalid_argument naming the pending piece when a required column is unavailable.
 [[nodiscard]] Resolution resolve(Name profile, App app, const Inputs& inputs = {}, std::span<const Lever> table = levers());
+// The server (prepare_serve) sets no decode regime: the decode attention format is one process property, so the TURBO
+// band rows of decode_attention (g4-dattn-f2) cannot decide there. Returns the start line that says so when `resolution`
+// is TURBO on the device backend and the lever was not set explicitly (empty: nothing to say). OPEN DEVIATION of the rule
+// "CLI and server resolve the same levers"; closing it needs the per-format split of the global attention pass.
+[[nodiscard]] std::string serve_decode_attention_notice(const Resolution& resolution, std::string_view backend);
 // Exports the switches of entries with status `set` or `unqualified` to the process environment
 // (never asset or off-switch levers). Call before anything reads (and caches) those switches.
 void apply(const Resolution& resolution);
