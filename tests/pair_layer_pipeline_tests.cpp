@@ -311,6 +311,7 @@ Shared run_share(const Weights& m, const std::vector<std::uint32_t>& prompt, uns
                 layers::RelayOps r;
                 r.save = [&](std::uint32_t layer) { return t.save(layer, layer + 1U); };
                 r.load = [&](std::uint32_t layer, std::span<const std::byte> b) { t.load(layer, layer + 1U, b); };
+                r.layer_bytes = [](std::uint32_t) { return std::uint64_t{H} * 8U; };
                 r.chunk_bytes = chunk;
                 const auto rs = layers::share_state(p, first, s ? &up : nullptr, s ? nullptr : &down, r);
                 out.state_bytes[s] = rs.bytes;

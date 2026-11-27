@@ -531,7 +531,8 @@ inline void line_hello(const Link* up, const Link* down, std::uint64_t version =
 // other stage's pipe progress thread still reads the shared transport; the barrier orders the phases, it does not explain the
 // intermittent corruption seen on the host transport with it in place, whose cause is not established).
 // The first token (known on the head stage) reaches the other stages with the relay to them. One round per stage, so the
-// two directions of a link do not overlap: the wall is the sum of the rounds.
+// two directions of a link do not overlap: the wall is the sum of the rounds. Every rank is a decoder once, so ops must bind
+// layer_bytes on every rank (relay_state).
 inline RelayStats share_state(const Placement& p, std::uint32_t first_token, const Link* up, const Link* down,
                               const RelayOps& ops) {
     RelayStats total;
