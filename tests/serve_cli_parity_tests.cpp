@@ -3,6 +3,7 @@
 // the test fails on any difference that is not listed below with the reason serving requires it, and on any listed
 // difference that no longer exists. `--print` prints both resolved configurations side by side (the report tools use it).
 #include "strix/serve_cli_parity.hpp"
+#include "strix/env_arms.hpp"
 
 #include <span>
 
@@ -405,7 +406,7 @@ void ds41() {
         const auto native = config(pd::App::rank, profile);
         check(pr::export_environment(pr::kPresetEnv, "1"), "enable DeepSeek model preset marker");
         const auto preset = config(pd::App::serve, profile);
-        check(pr::export_environment(pr::kPresetEnv, previous ? previous->c_str() : ""), "restore model preset marker");
+        strix::env_arms::set_env(pr::kPresetEnv, previous);
         gate(std::string("ds41+preset+") + profile, native, preset, allowed);
         check(preset.at("arg:--slots") == "8", "ds41: serve uses the resolved eight slots");
     }
@@ -585,17 +586,19 @@ void gemma() {
         // Both native executables export the selected profile to the process. Start each arm with the
         // same environment so an exported CLI lever does not turn into an explicit HTTP override.
         struct ProfileEnvironment {
-            std::vector<std::pair<std::string, std::string>> saved;
+            // An unset switch is restored as unset: on POSIX an empty value would stay defined and count as an
+            // explicit (and refused) setting at the next resolution.
+            std::vector<std::pair<std::string, std::optional<std::string>>> saved;
             ProfileEnvironment() {
                 for (const auto& lever : strix::gemma4::profile::levers()) {
                     if (lever.env.empty()) continue;
                     const std::string key(lever.env);
                     const char* raw = strix::profile::environment({}, key);
-                    saved.emplace_back(key, raw ? raw : "");
+                    saved.emplace_back(key, raw ? std::optional<std::string>(raw) : std::nullopt);
                 }
             }
             ~ProfileEnvironment() {
-                for (const auto& [key, value] : saved) (void)strix::profile::export_environment(key.c_str(), value.c_str());
+                for (const auto& [key, value] : saved) strix::env_arms::set_env(key, value);
             }
         } environment;
         return resolve();
