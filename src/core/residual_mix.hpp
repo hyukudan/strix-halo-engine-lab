@@ -41,6 +41,7 @@ cudaError_t enqueue_schedule(const ::strix::core::residual_mix::MixArgs& args, c
 #endif
 
 #include "core/residual_mix_plan.hpp"
+#include "core/controller_block_plan.hpp"
 
 namespace strix::core::residual_mix {
 
@@ -865,6 +866,30 @@ struct ControllerWeights {
 
 namespace detail {
 
+// Block-per-row controller arguments (the final norm's epsilon is the backend's: it fills norm_epsilon).
+inline controller_block::Args fused_controller_args(const LowRankController& plan, const ControllerWeights& weights,
+                                                    unsigned rows, ConstRows raw, const float* bank0,
+                                                    const float* bank1, const float* message, float* output) {
+    controller_block::Args args;
+    args.raw = raw.data();
+    args.bank0 = bank0;
+    args.bank1 = bank1;
+    args.message = message;
+    args.query = weights.query.data();
+    args.down = weights.down;
+    args.forget = weights.forget;
+    args.gain = weights.gain;
+    args.scale = weights.norm;
+    args.output = output;
+    args.rows = rows;
+    args.width = plan.width;
+    args.rank = plan.rank;
+    args.operand_epsilon = plan.epsilon;
+    args.round_operands = plan.round_operands_bf16;
+    args.round_latent = plan.round_latent_bf16;
+    return args;
+}
+
 inline bool valid_controller(const LowRankController& plan, unsigned rows) {
     return rows != 0U && plan.width != 0U && plan.width <= std::numeric_limits<unsigned>::max() / 2U &&
            plan.rank != 0U && rows <= kMaxElements / plan.scratch_elements_per_row() && plan.epsilon > 0.0F &&
@@ -895,6 +920,13 @@ void enqueue_low_rank_controller_tail(LowRankController plan, ControllerWeights 
         !detail::disjoint_rows(message.data(), elements, output.data(), elements))
         throw std::invalid_argument("invalid low-rank controller buffers");
 
+    // A backend may run the whole controller after the readout as one block-per-row launch (the bits of the launches
+    // below; none of the scratch rows is written). It returns false where it does not admit the shape.
+    if constexpr (requires(controller_block::Args args) { { operations.fused_controller(args) } -> std::same_as<bool>; }) {
+        if (operations.fused_controller(detail::fused_controller_args(plan, weights, rows, raw, nullptr, nullptr,
+                                                                       message.data(), output.data())))
+            return;
+    }
     const auto operands = scratch.subspan(elements, 2U * elements);
     // Gate outputs reuse the down input after the projection has consumed it.
     const auto forget = operands.first(elements);
@@ -995,6 +1027,14 @@ void enqueue_low_rank_controller(LowRankController plan, ControllerWeights weigh
     MixArgs mix{};
     if (!bind_banks(mix, bank, elements))
         throw std::invalid_argument("invalid low-rank controller bank or normalization");
+    // A backend may run the readout and the whole controller as one block-per-row launch (the bits of the launches
+    // below; the scratch rows are not written). It returns false where it does not admit the shape.
+    if constexpr (requires(controller_block::Args args) { { operations.fused_controller(args) } -> std::same_as<bool>; }) {
+        if (bank.size() == 2U &&
+            operations.fused_controller(detail::fused_controller_args(plan, weights, rows, raw, bank[0].data(),
+                                                                       bank[1].data(), nullptr, output.data())))
+            return;
+    }
     mix.queries = weights.query.data();
     mix.output[0] = message.data();
     mix.rows = rows;

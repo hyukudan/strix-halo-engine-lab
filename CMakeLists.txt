@@ -913,6 +913,11 @@ if(BUILD_TESTING)
     target_compile_features(strix-gdn-recurrence-rows-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-gdn-recurrence-rows-tests)
     add_test(NAME strix-gdn-recurrence-rows-tests COMMAND strix-gdn-recurrence-rows-tests)
+    add_executable(strix-controller-block-plan-host-tests tests/core/controller_block_plan_host_test.cpp)
+    target_include_directories(strix-controller-block-plan-host-tests PRIVATE src)
+    target_compile_features(strix-controller-block-plan-host-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-controller-block-plan-host-tests)
+    add_test(NAME strix-controller-block-plan-host-tests COMMAND strix-controller-block-plan-host-tests)
     add_executable(strix-launch-overlap-tests tests/launch_overlap_tests.cpp)
     target_include_directories(strix-launch-overlap-tests PRIVATE include)
     target_compile_features(strix-launch-overlap-tests PRIVATE cxx_std_20)
@@ -4422,6 +4427,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-controller-image-test tests/core/controller_image_hip.hip)
         add_executable(strix-hip-projection-image-packed-test tests/core/projection_image_packed_hip.hip)
         add_executable(strix-hip-controller-rms-test tests/core/controller_rms_hip.hip)
+        add_executable(strix-hip-controller-block-test tests/core/controller_block_hip.hip)
         add_executable(strix-hip-mix-serial-registers-test tests/core/mix_serial_registers_hip.hip)
         add_executable(strix-hip-rms-wave-rows-test tests/core/rms_wave_rows_hip.hip)
         add_executable(strix-hip-dense-linear-tight-rows-test tests/core/dense_linear_tight_rows_hip.hip)
@@ -4442,6 +4448,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-controller-image-test
                        strix-hip-projection-image-packed-test
                        strix-hip-controller-rms-test
+                       strix-hip-controller-block-test
                        strix-hip-mix-serial-registers-test
                        strix-hip-rms-wave-rows-test
                        strix-hip-dense-linear-tight-rows-test strix-hip-dense-flash-projected-bias-test
@@ -4536,6 +4543,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-controller-image-test
                        strix-hip-projection-image-packed-test
                        strix-hip-controller-rms-test
+                       strix-hip-controller-block-test
                        strix-hip-mix-serial-registers-test
                        strix-hip-rms-wave-rows-test
                        strix-hip-inkling2-mini-attention-projected-bias-test
