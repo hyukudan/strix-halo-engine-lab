@@ -623,7 +623,13 @@ public:
     void keep_prefill_grouped() noexcept { grouped_prefill_ = !kBackendHip; }
     [[nodiscard]] bool prefill_grouped() const noexcept { return grouped_prefill_; }
     // The rotated integer prefill class is selected (images built and on): prompt rows then run a lossy class.
-    [[nodiscard]] bool prefill_iu4_selected() const noexcept { return iu4_on_; }
+    [[nodiscard]] bool prefill_iu4_selected() const noexcept {
+#if defined(__HIPCC__)
+        return iu4_on_;
+#else
+        return false;  // the rotated integer class is a HIP route
+#endif
+    }
 
     void finish() {
         std::array<unsigned, (1U + kMiniMaxVerifyRows) * kLogicalVisits> storage{};
