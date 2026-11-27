@@ -1220,6 +1220,25 @@ int main() {
     auto explicit_context = parse({"decoder","m","1","--context","8192","--optimization-profile","auto"});
     expect(resolve_optimization_profile(explicit_context, model, info, manifest,
         validated_model_content_identity, true).automatic_applied, "explicit qualified context eligible");
+    // Both spellings of the context option (the README served form is `-- ... --context=N`), and the served
+    // form keeps the qualified profile at a long capacity (unqualified-context is implied, as the CLI resolver does).
+    {
+        const auto equals = parse({"decoder","m","1","--context=36864"});
+        const auto spaced = parse({"decoder","m","1","--context","36864"});
+        expect(spaced.context_tokens == 36864U && equals.context_tokens == 36864U && equals.context_explicit,
+               "--context N and --context=N are one option");
+        auto served = equals;
+        served.http_serve = true;
+        expect(served_context_implies_unqualified(served), "served explicit long context implies unqualified-context");
+        served.context_tokens = 8192U;
+        expect(!served_context_implies_unqualified(served), "served 8192 stays qualified");
+        served.context_tokens = 36864U; served.unqualified_context = true;
+        expect(!served_context_implies_unqualified(served), "explicit unqualified-context is kept as is");
+        expect(!served_context_implies_unqualified(equals), "CLI form never implies it");
+        const auto cli = parse({"decoder","m","1","--context=36864","--unqualified-context"});
+        expect(cli.context_tokens == 36864U && cli.unqualified_context, "--context=N parses in the CLI form");
+        rejects([] { (void)parse({"decoder","m","1","--context=x"}); }, "context must be an unsigned integer");
+    }
     auto roundtrip = parse({"decoder","m","1","--generate","511","--prefix-cache-roundtrip"});
     roundtrip.tokens.assign(43,1);
     expect(resolve_optimization_profile(roundtrip, model, info, manifest,

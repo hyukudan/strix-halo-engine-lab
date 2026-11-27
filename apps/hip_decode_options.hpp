@@ -2184,6 +2184,12 @@ inline bool product_profile_prefill_f16_off(const Options& o) {
     return row && strix::profile::applied(row->status) && row->value == row->lever->off;
 }
 
+// The served form (--http-serve) has no known prompt for the resolver to size a context from, so an explicit capacity
+// other than the qualified 8192 implies --unqualified-context, as the CLI resolver decides beyond 8192.
+inline bool served_context_implies_unqualified(const Options& o) {
+    return o.http_serve && o.context_explicit && o.context_tokens != 8192U && !o.unqualified_context;
+}
+
 inline Options parse_options(
     int argc,
     char** argv, bool defer_qpf2k_defaults = false, std::string bundle_path = {},
@@ -3603,8 +3609,14 @@ inline Options parse_options(
             options.unqualified_context = true;
             continue;
         }
-        if (argument == "--context") {
+        if (argument == "--context" || argument.starts_with("--context=")) {
             options.context_explicit = true;
+            // Both spellings (`--context N`, `--context=N`) reach the same value; the launcher and the other
+            // engines document either one.
+            if (argument != "--context") {
+                options.context_tokens = parse_u64(argument.substr(10), "context");
+                continue;
+            }
             if (index + 1 >= argc) {
                 throw std::invalid_argument(
                     "--context requires a token count");
@@ -3906,6 +3918,10 @@ inline Options parse_options(
         throw std::invalid_argument(
             "context must be non-zero");
     }
+    // The served form has no known prompt for the resolver to size the context from: an explicit capacity other than
+    // the qualified 8192 is the same automatic unqualified-context decision the CLI resolver makes beyond 8192
+    // (docs/models/qwen3.8/README.md), not a reason to drop the qualified profile or to refuse the server.
+    if (served_context_implies_unqualified(options)) options.unqualified_context = true;
     if (options.unqualified_context && !options.context_explicit)
         throw std::invalid_argument("--unqualified-context requires --context");
     if (!options.raw_recording_path.empty()) {
