@@ -650,18 +650,37 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
                                  "gfx1151").product_profile;
         };
         for (const auto* tier : {"exact", "fast", "turbo"}) {
-            std::vector<std::string> request_words{"decoder", "target.gguf", "--profile", tier, "--context", "8192",
-                                                   "--no-mtp", "--prefill-moe-route-prune", "off"};
+            // The server arm is this function's serving command line (a server needs its tiled MTP route); the rank
+            // arm is the same words without the serving switches.
+            auto request_words = args;
+            for (const auto& [flag, value] : {std::pair<const char*, const char*>{"--profile", tier},
+                                              {"--prefill-moe-route-prune", "off"}}) {
+                const auto it = std::find(request_words.begin(), request_words.end(), flag);
+                if (it == request_words.end()) request_words.insert(request_words.end(), {flag, value});
+                else *(it + 1) = value;
+            }
             auto cli_words = request_words;
-            cli_words.insert(cli_words.end(), {"--generate", "8", "1", "2", "3"});
-            request_words.emplace_back("--http-serve");
+            std::erase(cli_words, std::string("--http-serve"));
+            if (const auto batch = std::find(cli_words.begin(), cli_words.end(), "--http-batch"); batch != cli_words.end())
+                cli_words.erase(batch, batch + 2);
             const auto cli = resolved_profile(std::move(cli_words));
             const auto serve = resolved_profile(std::move(request_words));
             const auto* route = cli.find("moe_route_prune");
             expect(route && route->value == "off", "Qwen HIP: explicit route off reaches the resolver");
-            if (cli.json() != serve.json())
-                std::cerr << "Qwen HIP " << tier << " CLI profile: " << cli.json() << "\nserver profile: " << serve.json() << '\n';
-            expect(cli.json() == serve.json(), "Qwen HIP: rank and serve apply the same explicit route and receipt");
+            // The ladder text names the regime it was read for: the command line's prompt length, while a server
+            // resolves at start-up (ctx=0) and per request. Every value, status and switch must still be equal.
+            const auto without_regime_length = [](std::string text) {
+                for (auto at = text.find("ctx="); at != std::string::npos; at = text.find("ctx=", at + 4)) {
+                    auto end = at + 4;
+                    while (end < text.size() && text[end] >= '0' && text[end] <= '9') ++end;
+                    text.replace(at + 4, end - (at + 4), "N");
+                }
+                return text;
+            };
+            const auto cli_json = without_regime_length(cli.json()), serve_json = without_regime_length(serve.json());
+            if (cli_json != serve_json)
+                std::cerr << "Qwen HIP " << tier << " CLI profile: " << cli_json << "\nserver profile: " << serve_json << '\n';
+            expect(cli_json == serve_json, "Qwen HIP: rank and serve apply the same explicit route and receipt");
         }
     }
     {
