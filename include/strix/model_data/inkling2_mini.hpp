@@ -9,12 +9,12 @@
 
 namespace strix::model_data::inkling2_mini {
 
-namespace chat {
-inline constexpr std::string_view reasoning_effort = "none";
-} // namespace chat
 namespace catalogue {
 inline constexpr std::string_view engines[] = {"inkling2-mini"};
 } // namespace catalogue
+namespace chat {
+inline constexpr std::string_view reasoning_effort = "none";
+} // namespace chat
 namespace dims {
 inline constexpr std::int64_t context = 1048576;
 inline constexpr std::int64_t conv_taps = 4;
