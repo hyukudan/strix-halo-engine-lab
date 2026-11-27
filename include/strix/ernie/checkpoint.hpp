@@ -7,7 +7,7 @@
 namespace strix::ernie {
 
 enum class TensorConsumer {
-    first_row_reference, hca_history_candidate, mla_layer_candidate, multimax_pending,
+    first_row_reference, hca_history_candidate, mla_layer_candidate, vocabulary_activation,
     draft_pending, unknown
 };
 

@@ -276,8 +276,8 @@ void test_consumers() {
     expect(tensor_consumer("ape", deferred) == hca_history_candidate, "candidate HCA history");
     deferred.layer.reset();
     deferred.module = Module::lm_head;
-    expect(tensor_consumer("multimax_ranges", deferred) == multimax_pending &&
-           tensor_consumer("lm_head.weight", deferred) == first_row_reference, "raw head and deferred MultiMax");
+    expect(tensor_consumer("model.lm_head.multimax_ranges", deferred) == vocabulary_activation &&
+           tensor_consumer("lm_head.weight", deferred) == first_row_reference, "vocabulary projection and learned activation");
     deferred.module = Module::unclassified;
     expect(tensor_consumer("unknown", deferred) == unknown, "unknown tensor must be reported");
 

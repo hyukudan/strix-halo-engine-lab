@@ -42,7 +42,7 @@ std::string_view consumer_name(TensorConsumer consumer) noexcept {
     case first_row_reference: return "first_row_reference";
     case hca_history_candidate: return "hca_history_candidate";
     case mla_layer_candidate: return "mla_layer_candidate";
-    case multimax_pending: return "multimax_pending";
+    case vocabulary_activation: return "vocabulary_activation";
     case draft_pending: return "draft_pending";
     case unknown: return "unknown";
     }
@@ -72,7 +72,7 @@ TensorConsumer tensor_consumer(std::string_view name, const Tensor& tensor) noex
     case Module::mla:
     case Module::sparse_indexer:
     case Module::flash_indexer: return mla_layer_candidate;
-    case Module::lm_head: return name == "lm_head.weight" ? first_row_reference : multimax_pending;
+    case Module::lm_head: return name == "lm_head.weight" ? first_row_reference : vocabulary_activation;
     case Module::draft_input:
     case Module::draft_markov:
     case Module::draft_confidence: return draft_pending;
