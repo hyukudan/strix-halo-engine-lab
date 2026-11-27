@@ -476,6 +476,8 @@ int main(int argc, char** argv) {
         else
 #endif
         family.load = [&loaded, &resolve_weights, &options, &weight_options, step_graphs, &drafter, plain_program,
+                       parsed_weights = weight_options, device = early.scope.device_class,
+                       product = early.scope.cost_device,
                        combine_image = mini_combine_image(options.tier),
                        round_fold = mini_prepared_round_fold(options.tier),
                        narrow = mini_experts_nvfp4(options.tier),
@@ -488,6 +490,12 @@ int main(int argc, char** argv) {
             const char* dspark = drafter.enabled() && load.speculation == serve::CliSpeculation::automatic
                                      ? drafter.path.c_str() : nullptr;
             const strix::weight::WeightLoadExtent extent{load.positions, 1U};
+            // The SP4 attention + head column in this run's decode regime (the server's rule with its own extent).
+            weight_options = parsed_weights;
+            const auto lowbit_head = mini_decode_lowbit_head(weight_options, device, extent,
+                MiniPromptExecution{product, load.positions, load.prefill_chunk},
+                kMiniWeightBackend == strix::weight::Backend::hip);
+            if (!lowbit_head.ladder.empty()) std::cerr << lowbit_head.ladder << '\n';
             if (const auto decline = mini_lowbit_row_decline(options.tier.profile, weight_options, kMiniWeightBackend,
                                                              extent);
                 !decline.empty())
@@ -497,6 +505,7 @@ int main(int argc, char** argv) {
                                                  load.prompt_tokens, false, &options.tier,
                                                  MiniPromptExecution{loaded->scope.cost_device, load.positions,
                                                                      load.prefill_chunk});
+            mini_record_decode_entry(options.tier, lowbit_head);
             return load_mini_weights(load.checkpoint, loaded->plan, options.tier.profile, weight_options, loaded->scope.view(),
                                      extent, [&](MiniLowBitRows lowbit) {
                 return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, loaded->plan.roles(), dspark,

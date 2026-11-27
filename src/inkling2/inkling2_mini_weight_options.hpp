@@ -710,6 +710,39 @@ inline bool mini_prompt_moe_may_select(const MiniWeightOptions& options, std::st
     return false;
 }
 
+// The spelling of Regime::execution of one instance's decode (strix::profile::ladder_execution) over its weight extent
+// (serial CLI: prompt + generated positions, one lane; server: configured context, slot cap). Unknown product, context,
+// lanes or chunk: empty, and no timing row decides.
+inline std::string mini_decode_execution(const MiniPromptExecution& run, weight::WeightLoadExtent extent) {
+    return profile::ladder_execution({run.backend, run.product,
+        {extent.context, extent.context, extent.lanes, run.chunk, 0U, extent.lanes, 0U, 0U}});
+}
+
+// The SP4 attention + head column (kMiniLowBitHead) in the instance's decode regime: the command line (at load: prompt +
+// generated positions, one lane) and the server (configured context, slot cap) call this one rule before resolving the
+// weight load. The column runs only where a decode row of kMiniLadder measured a gain (profile::apply_ladder); elsewhere
+// the tier below (builtin "0"), the route line saying why. An explicit setting was applied at parsing
+// (apply_mini_lowbit_head) and stands. Returns the regime's entry (mini_record_decode_entry stamps it into the receipt).
+inline profile::Entry mini_decode_lowbit_head(MiniWeightOptions& options, std::string_view device,
+                                              weight::WeightLoadExtent extent, const MiniPromptExecution& run,
+                                              bool hip) {
+    auto inputs = options.tier;
+    const auto execution = mini_decode_execution(run, extent);
+    inputs.regime = {profile::Phase::decode, extent.context, extent.lanes, device, execution};
+    const auto decoded = resolve_mini_weight_profile(options, inputs);
+    const auto* entry = decoded.find(kMiniLowBitHead);
+    if (entry == nullptr) return {};
+    if (!mini_lowbit_head_explicit(*entry)) apply_mini_lowbit_head(options, decoded, hip);
+    return *entry;
+}
+
+// The run's resolution (receipt, fingerprint) states the decode-regime cell that loaded, not the prompt regime's.
+inline void mini_record_decode_entry(profile::Resolution& receipt, const profile::Entry& decoded) {
+    if (decoded.lever == nullptr) return;
+    for (auto& recorded : receipt.entries)
+        if (recorded.lever == decoded.lever) recorded = decoded;
+}
+
 inline const char* mini_profile_name(profile::Name tier) {
     return tier == profile::Name::standard ? "exact" : profile::name(tier);
 }

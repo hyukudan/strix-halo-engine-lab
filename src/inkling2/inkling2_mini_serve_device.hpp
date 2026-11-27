@@ -39,6 +39,13 @@ inline MiniServeCohort make_mini_device_cohort(
     // budget: lane-banded gains do not select).
     const weight::WeightLoadExtent extent{opt.context, opt.slots ? rows : 0U};
     auto weight_options = opt.weight_options;
+    // The SP4 attention + head column in this instance's decode regime (the command line's rule with its own extent).
+    {
+        const auto probe = mini_weight_scope(opt.checkpoint, opt.tier, weight_options, extent);
+        const auto lowbit_head = mini_decode_lowbit_head(weight_options, probe.device_class, extent,
+            MiniPromptExecution{probe.cost_device, opt.context, opt.prefill_rows}, kServeHip);
+        if (!lowbit_head.ladder.empty()) std::cerr << lowbit_head.ladder << '\n';
+    }
     // Any served route admits the calibrated row: its decoder serves prompts emits-first (mini_served_prompt_emits_first),
     // so the final prompt token stays a BF16 prefill row. Outside the row's measured regime the incumbent loads.
     if (const auto decline = mini_lowbit_row_decline(opt.tier, weight_options, kMiniWeightBackend, extent);
