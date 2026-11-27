@@ -4,6 +4,9 @@
 #include "inkling2_mini_attention_prepare_device.hpp"
 #include "inkling2_mini_dense_hip.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/profile/all_on_engaged.hpp"
+
+#include <iostream>
 
 namespace strix::inkling2 {
 
@@ -71,9 +74,19 @@ struct MiniPreparedHipImageBackend : MiniPreparedHipBackend {
         if (use_wide_tight_group(rows)) return MiniPreparedHipBackend::linear(input, width, rows, views);
         static const bool compact = strix::envcfg::flag(
             "STRIX_INKLING2_HIP_ATTN_PREP_COMPACT", false, strix::EnvFlagMatch::exact);
-        if (compact && rows > core::gemv_rows::max_rows)
+        if (compact && rows > core::gemv_rows::max_rows) {
+            // One record with --all-on: a call with a narrow projection that the compact schedule leaves on the shared
+            // tile (an ordered alias between its projections; the shared split rule) says so once.
+            if (core::fma_rows::bf16_compact_narrow_present(width, rows, views) &&
+                !core::fma_rows::bf16_compact_call_split(input, width, rows, views)) {
+                static const bool recorded = strix::profile::all_on::engaged(
+                    "STRIX_INKLING2_HIP_ATTN_PREP_COMPACT", false,
+                    "a narrow projection shares bytes with another projection of its call", std::cerr);
+                (void)recorded;
+            }
             return core::fma_rows::enqueue_bf16_rows_routed<core::fma_rows::Bf16RowsSchedule::compact_narrow>(
                 input, width, rows, views, kVocabulary, operand_image, stream);
+        }
         return core::fma_rows::enqueue_bf16_rows_routed(input, width, rows, views, kVocabulary, operand_image, stream);
     }
 
