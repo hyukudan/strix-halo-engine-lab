@@ -551,7 +551,7 @@ void test_calibrated_row_speculation_admission() {
 
 void test_calibrated_pack_requires_complete_inventory() {
     mini::mini_require_calibrated_pack_matrix_count(4U, 4U);
-    for (const auto [observed, expected] : {std::pair{0U, 4U}, std::pair{3U, 4U}, std::pair{0U, 0U}}) {
+    for (const auto& [observed, expected] : {std::pair{0U, 4U}, std::pair{3U, 4U}, std::pair{0U, 0U}}) {
         bool refused = false;
         try {
             mini::mini_require_calibrated_pack_matrix_count(observed, expected);

@@ -176,8 +176,8 @@ std::string entry_line(const LowbitPackEntry& e, std::uint64_t offset, PackVersi
     return line + "\n";
 }
 
-Status validate_entry(const LowbitPackEntry& e, std::set<std::string>& names, bool validate_name = true) {
-    if (validate_name && (e.tensor.empty() || std::ranges::any_of(e.tensor, [](unsigned char c) { return c <= 32U || c == 127U; })))
+Status validate_entry(const LowbitPackEntry& e, std::set<std::string>& names) {
+    if (e.tensor.empty() || std::ranges::any_of(e.tensor, [](unsigned char c) { return c <= 32U || c == 127U; }))
         return fail(Error::malformed, "invalid tensor name in low-bit pack: " + e.tensor);
     if (!supported(e.storage)) return fail(Error::unknown_format, "unsupported pack format for " + e.tensor);
     if (const auto why = lowbit_header_defect(e.storage, e.sp_header); !why.empty())
@@ -485,7 +485,7 @@ Status LowbitPack::open_impl(const std::string& path, const Digest256* checkpoin
             e.coding.role = f[12];
             e.coding.coder = f[13];
         }
-        if (const auto status = validate_entry(e, names, checked); !status) return status;
+        if (const auto status = validate_entry(e, names); !status) return status;
         if (e.offset % kAlign != 0U || e.offset < (checked ? previous_end : padded) ||
             e.offset > payload_end || e.bytes > payload_end - e.offset)
             return fail(Error::malformed, "misaligned, overlapping or truncated payload for " + e.tensor);
