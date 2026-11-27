@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <future>
 #include <limits>
@@ -823,15 +824,31 @@ ModelContentIdentity build_model_content_identity(
         "STRIX-MODEL-CONTENT-V1");
 
     // The files are independent reads: hash them concurrently (a cold two-part model of 168 GB is bound by the
-    // hashing, not the disk); the aggregate below folds the digests in the sorted logical-name order, as before.
-    std::vector<std::future<FileDigest>> digests;
-    digests.reserve(ordered.size());
-    for (const auto* file : ordered)
-        digests.push_back(std::async(ordered.size() > 1U ? std::launch::async : std::launch::deferred,
-                                     [path = file->path] { return hash_file_stable(path); }));
+    // hashing, not the disk), at most kHashWorkers at once so a many-shard model does not thrash the disk; the
+    // aggregate below folds the digests in the sorted logical-name order, as before.
+    constexpr std::size_t kHashWorkers = 4;
+    std::vector<std::optional<FileDigest>> digests(ordered.size());
+    {
+        std::atomic<std::size_t> next{0};
+        const auto worker = [&] {
+            try {
+                for (std::size_t i = next.fetch_add(1U); i < ordered.size(); i = next.fetch_add(1U))
+                    digests[i] = hash_file_stable(ordered[i]->path);
+            } catch (...) {next.store(ordered.size());throw;}  // the other workers stop at their next file
+        };
+        std::vector<std::future<void>> workers;
+        const std::size_t count = std::min(kHashWorkers, ordered.size());
+        for (std::size_t w = 1; w < count; ++w) workers.push_back(std::async(std::launch::async, worker));
+        std::exception_ptr failure;
+        try {worker();} catch (...) {failure = std::current_exception();}
+        for (auto& w : workers) {
+            try {w.get();} catch (...) {if (!failure) failure = std::current_exception();}
+        }
+        if (failure) std::rethrow_exception(failure);
+    }
     std::size_t at = 0;
     for (const auto* file : ordered) {
-        const auto digest = digests[at++].get();
+        const auto digest = *digests[at++];
         aggregate.update_u64(
             static_cast<std::uint64_t>(
                 file->logical_name.size()));

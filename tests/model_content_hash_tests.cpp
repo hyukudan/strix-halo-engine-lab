@@ -166,6 +166,20 @@ int main() {
         expect(id1 == strix::build_model_content_identity(ab), "identity is repeatable");
         expect(!(id1 == strix::build_model_content_identity(std::vector<strix::ModelContentFile>{{"0", b}, {"1", a}})),
                "identity depends on which part is which");
+        // more parts than hash workers: every part is hashed once, in any order; a missing part fails, never hangs
+        std::vector<strix::ModelContentFile> many, reversed;
+        for (int i = 0; i < 7; ++i) {
+            const auto p = dir / ("p" + std::to_string(i) + ".bin");
+            write_file(p, std::string_view(reinterpret_cast<const char*>(data.data()) + i, 4096U + static_cast<std::size_t>(i)));
+            many.push_back({std::to_string(i), p});
+        }
+        reversed.assign(many.rbegin(), many.rend());
+        const auto id7 = strix::build_model_content_identity(many);
+        expect(id7 == strix::build_model_content_identity(reversed), "seven-part identity does not depend on the order");
+        many.push_back({"7", dir / "missing.bin"});
+        bool threw = false;
+        try {(void)strix::build_model_content_identity(many);} catch (const std::exception&) {threw = true;}
+        expect(threw, "a missing part makes the identity fail");
         std::filesystem::remove_all(dir);
     }
     expect(strix::model_content_identity_hex(strix::sha256_bytes({})) ==
