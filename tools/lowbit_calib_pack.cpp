@@ -395,7 +395,24 @@ double seconds_since(std::chrono::steady_clock::time_point t0) {
 
 }  // namespace
 
+constexpr std::string_view kUsage =
+    "usage: strix-lowbit-calib-pack --model INDEX (--storage SUBSTRING=q4|q6|sp4|sp3|sp2 ... | --plan FILE) [options]\n"
+    "  --inkling2-mini          read the model through the Inkling 2 Mini source adapter\n"
+    "  --moments FILE           activation moments (repeatable); --moments-bytes N caps the bytes read\n"
+    "  --eval FILE / --heldout FILE   scoring inputs (repeatable)\n"
+    "  --out FILE               calibrated pack; --checked-role ROLE checks one projection role of it\n"
+    "  --report FILE            per-matrix numerical report\n"
+    "  --technique NAME --damp X --threads N --compare --proxy-stride N --table fixed|auto\n"
+    "  --dequant-out FILE       dequantised copy for diagnostics\n"
+    "  --probe-source FILE      read-only standalone probe\n"
+    "See docs/engine/lowbit-calibration.md.\n";
+
 int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i)
+        if (const std::string_view arg = argv[i]; arg == "--help" || arg == "-h") {
+            std::cout << kUsage;
+            return 0;
+        }
     try {
         const auto args = parse(argc, argv);
         const auto t0 = std::chrono::steady_clock::now();

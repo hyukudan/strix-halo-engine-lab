@@ -11,6 +11,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace {
 constexpr double gib = 1073741824.0;
@@ -25,7 +26,17 @@ std::uint64_t gib_bytes(const std::string& text) {
 }
 }  // namespace
 
+constexpr std::string_view kUsage =
+    "usage: strix-lowbit-pack-plan --model-description FILE --cold sp2|sp3|sp4 --budget-gib N\n"
+    "                              [--reserve-gib N] [--hot-experts N]\n"
+    "Prints the Strix pack plan (tensor, format, bytes[, coder]) that fits the device budget.\n";
+
 int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i)
+        if (const std::string_view arg = argv[i]; arg == "--help" || arg == "-h") {
+            std::cout << kUsage;
+            return 0;
+        }
     try {
         std::string description, cold;
         std::uint64_t budget = 0, reserve = 0, hot = 0;
