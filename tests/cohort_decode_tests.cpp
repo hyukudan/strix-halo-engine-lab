@@ -803,6 +803,169 @@ void test_group_gap_room() {
     std::cout << "group gap: company capped by the unfloored room\n";
 }
 
+// Sub-pass groups (PrefillGroupCapacity::passes): a burst of whole prompts waiting together is ONE group work of up to
+// passes x one slice unit of rows while no lane decodes (so every lane starts decoding together); beside a decoding lane,
+// and with passes 1, the group stays within one slice unit as before. Prompts of 666 and 1885 rows, 8 lanes, slice 4096.
+class GroupPassesBackend final : public CohortBackend {
+public:
+    static constexpr std::uint32_t kVocab = 31;
+    explicit GroupPassesBackend(std::uint32_t passes) : passes_(passes) {}
+    std::uint32_t lanes() const override { return 9; }
+    std::uint32_t rows_per_forward() const override { return 9; }
+    std::uint32_t max_positions() const override { return 8192; }
+    bool prefill_emits_first() const override { return true; }
+    PrefillGroupCapacity prompt_group_capacity() const override {
+        PrefillGroupCapacity capacity;
+        capacity.members = 9;
+        capacity.rows = 3U * 4096U;
+        capacity.member_rows = 4096;
+        capacity.passes = passes_;
+        return capacity;
+    }
+    void prefill(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) override {
+        if (first) ctx_.at(lane).clear();
+        ctx_.at(lane).insert(ctx_.at(lane).end(), tokens.begin(), tokens.end());
+        ++solo_prefills;
+    }
+    std::uint32_t prefill_top(std::uint32_t lane) override { return next_id(ctx_.at(lane), kVocab); }
+    void prefill_group(std::span<const CohortPrompt> members) override {
+        std::uint64_t rows = 0;
+        for (const auto& m : members) {
+            ctx_.at(m.lane).assign(m.tokens.begin(), m.tokens.end());
+            rows += m.tokens.size();
+        }
+        group_members.push_back(members.size());
+        group_rows.push_back(rows);
+    }
+    void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
+                std::span<std::uint32_t> top) override {
+        window_.clear();
+        for (std::size_t g = 0; g < groups.size(); ++g) {
+            auto c = ctx_.at(groups[g].lane);
+            c.push_back(tokens[g]);
+            top[g] = next_id(c, kVocab);
+            window_.emplace_back(groups[g].lane, tokens[g]);
+        }
+    }
+    void commit(std::span<const std::uint32_t>) override {
+        for (const auto& [lane, token] : window_) ctx_.at(lane).push_back(token);
+        window_.clear();
+    }
+    void release(std::uint32_t) override {}
+    unsigned solo_prefills = 0;
+    std::vector<std::size_t> group_members;
+    std::vector<std::uint64_t> group_rows;
+
+private:
+    std::uint32_t passes_;
+    std::vector<std::vector<std::uint32_t>> ctx_ = std::vector<std::vector<std::uint32_t>>(9);
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> window_;
+};
+
+CohortConfig passes_config() {
+    CohortConfig cfg;
+    cfg.context_draft = false;
+    cfg.prompt_slice = 4096;
+    cfg.prompt_group.short_rows = 4097;  // whole prompts of up to one slice group
+    cfg.prompt_group.max_rows = 3U * 4096U;
+    return cfg;
+}
+
+void test_group_passes() {
+    const auto make = [](std::uint64_t id, std::uint32_t rows) {
+        CohortRequest r;
+        r.id = id;
+        r.max_tokens = 3;
+        for (std::uint32_t k = 0; k < rows; ++k) r.prompt.push_back((k * 7U + static_cast<std::uint32_t>(id)) % GroupPassesBackend::kVocab);
+        return r;
+    };
+    // 4 x 666 and 4 x 1885 rows (10,204): passes 3 -> one group of all eight; passes 1 -> groups within 4096 rows
+    for (const std::uint32_t passes : {3U, 1U}) {
+        GroupPassesBackend be(passes);
+        CohortDecoder dec(be, passes_config());
+        std::vector<CohortRequest> burst;
+        for (std::uint64_t i = 0; i < 8; ++i) burst.push_back(make(i + 1U, i % 2U == 0U ? 666U : 1885U));
+        for (const auto& r : burst) dec.submit(r);
+        dec.run();
+        const auto done = dec.take_finished();
+        check(done.size() == 8U, "group passes: all eight finish");
+        for (const auto& r : done) check(r.error.empty() && r.ids == solo(burst.at(r.id - 1U), GroupPassesBackend::kVocab),
+                                          "group passes: ids == solo");
+        const std::string at = " (passes " + std::to_string(passes) + ")";
+        if (passes == 3U) {
+            check(be.group_members == std::vector<std::size_t>{8U} && be.group_rows == std::vector<std::uint64_t>{10204U} &&
+                      be.solo_prefills == 0U && dec.prompt_groups() == 1U,
+                  "group passes: the whole burst is ONE group work of eight members" + at);
+        } else {
+            std::uint64_t members = be.solo_prefills;
+            bool within = true;
+            for (std::size_t g = 0; g < be.group_members.size(); ++g) {
+                members += be.group_members[g];
+                within = within && be.group_rows[g] <= 4096U && be.group_members[g] < 8U;
+            }
+            check(members == 8U && within && be.group_members.size() >= 2U,
+                  "group passes: passes 1 keeps the one-slice groups" + at);
+        }
+    }
+    // a decoding lane: the group stays within one slice unit even with passes 3
+    {
+        GroupPassesBackend be(3U);
+        CohortDecoder dec(be, passes_config());
+        CohortRequest decoding = make(100U, 40U);
+        decoding.max_tokens = 400;
+        dec.submit(decoding);
+        for (int k = 0; k < 3; ++k) dec.step();  // its prompt, then it decodes
+        std::vector<CohortRequest> burst;
+        for (std::uint64_t i = 0; i < 8; ++i) burst.push_back(make(i + 1U, i % 2U == 0U ? 666U : 1885U));
+        for (const auto& r : burst) dec.submit(r);
+        for (int k = 0; k < 40 && be.group_members.size() + be.solo_prefills < 8U; ++k) dec.step();
+        bool within = true;
+        for (std::size_t g = 0; g < be.group_members.size(); ++g)
+            within = within && be.group_rows[g] <= 4096U && be.group_members[g] < 8U;
+        check(within && be.solo_prefills + be.group_members.size() >= 2U,
+              "group passes: beside a decoding lane the groups stay within one slice unit");
+        dec.run();
+        for (const auto& r : dec.take_finished()) {
+            if (r.id == 100U) check(r.ids == solo(decoding, GroupPassesBackend::kVocab), "group passes: decoding lane ids == solo");
+            else check(r.error.empty() && r.ids == solo(burst.at(r.id - 1U), GroupPassesBackend::kVocab),
+                       "group passes: burst ids == solo beside a decoding lane");
+        }
+    }
+    // burst follow-up: two prompts group and hold their first ids; six more arrive before any decode pass -> ONE group of
+    // six (all lanes then decode together). After one decode pass ran, the plan is today's (one-slice groups).
+    for (const bool decode_first : {false, true}) {
+        GroupPassesBackend be(3U);
+        CohortDecoder dec(be, passes_config());
+        std::vector<CohortRequest> all;
+        for (std::uint64_t i = 0; i < 8; ++i) all.push_back(make(i + 1U, i % 2U == 0U ? 666U : 1885U));
+        // the first two lanes outlive the burst (a lane that retired leaves only undecoded lanes: a new burst)
+        all[0].max_tokens = all[1].max_tokens = 64U;
+        dec.submit(all[0]);
+        dec.submit(all[1]);
+        dec.step();  // the first two prompts: one group, first ids emitted
+        if (decode_first) dec.step();  // their first decode pass
+        for (std::size_t i = 2; i < 8; ++i) dec.submit(all[i]);
+        for (int k = 0; !decode_first && k < 40 && be.group_members.size() < 2U; ++k) dec.step();
+        if (!decode_first) {
+            check(be.group_members == std::vector<std::size_t>({2U, 6U}) && be.solo_prefills == 0U,
+                  "burst follow-up: six more arrivals before any decode pass are ONE group");
+        }
+        dec.run();
+        if (decode_first) {
+            // the planner's plan: the priced gap may run the next heads alone (solo prefills, possibly sliced), and no
+            // later group passes one slice unit
+            bool within = !be.group_members.empty() && be.group_members[0] == 2U;
+            for (std::size_t g = 1; g < be.group_members.size(); ++g)
+                within = within && be.group_rows[g] <= 4096U && be.group_members[g] < 6U;
+            check(within, "burst follow-up: after a decode pass the groups stay within one slice unit");
+        }
+        for (const auto& r : dec.take_finished())
+            check(r.error.empty() && r.ids == solo(all.at(r.id - 1U), GroupPassesBackend::kVocab),
+                  "burst follow-up: ids == solo");
+    }
+    std::cout << "group passes: a burst is one group work while nothing decodes\n";
+}
+
 // Cold start under a priced gap (review r19 P2): the decoding lane's 8-row prompt is below the 32-row sampling floor,
 // so no row cost is learned. Fixed pass 20 ms + decode round 10 ms = 30 ms already exceed a 25 ms target: a lone
 // 12-row arrival runs (the head pass is necessary) and is recorded as an overshoot; two 12-row arrivals get no company
@@ -1461,6 +1624,7 @@ int main() {
     test_gap_row_cost_one_pass();
     test_gap_bounded_rows();
     test_group_gap_room();
+    test_group_passes();
     test_group_gap_cold();
     test_gap_forward_price();
     test_bounded_slices_keep_forms();

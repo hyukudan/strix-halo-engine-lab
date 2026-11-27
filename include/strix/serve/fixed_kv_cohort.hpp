@@ -25,6 +25,10 @@ namespace strix::serve {
 // single-session prefill does: a served lane then runs the same prefill rows
 // as that session. The call's final scores are its row 0 (read_slot_logits),
 // copied out only when a sampled lane asks, like a one-lane decode window.
+// A decoder that also offers prefill_group_first(slots, prompts, firsts), prefill_group_capacity() and
+// prefill_route_class(rows) runs waiting whole prompts as ONE grouped work on the emits-first route (the scheduler's
+// plan_prefill_group): each member's state and first id equal its prefill_slot_first run, and its final scores are the
+// group's row of its position among the members (read_slot_logits(row)).
 // A decoder that offers per-slot verify windows serves greedy lanes whose group carries drafts (CohortConfig::max_draft):
 // stage_slot_window(slot, tokens, top) stages tokens.size() rows on the slot (the pending token, then the drafts) and
 // writes each row's greedy pick, commit_slot_window(slot, tokens, keep) keeps the leading `keep` rows (0 discards the
@@ -112,8 +116,49 @@ public:
         if constexpr (kPlainPrefill) decoder_->prefill_slot(lane, tokens, first);
     }
 
+    // Grouped whole prompts (emits-first decoders offering prefill_group_first): the decoder's capacity and route class,
+    // else the backend defaults (no grouping, the solo loop).
+    [[nodiscard]] PrefillGroupCapacity prompt_group_capacity() const override {
+        if constexpr (kGroups) {
+            if (emits_first_) {
+                auto capacity = decoder_->prefill_group_capacity();
+                capacity.members = std::min<std::uint64_t>(capacity.members, lanes_);
+                return capacity;
+            }
+        }
+        return CohortBackend::prompt_group_capacity();
+    }
+    [[nodiscard]] std::uint32_t prompt_route_class(std::uint64_t rows) const override {
+        if constexpr (kGroups) {
+            if (emits_first_) return decoder_->prefill_route_class(rows);
+        }
+        return CohortBackend::prompt_route_class(rows);
+    }
+    void prefill_group(std::span<const CohortPrompt> members) override {
+        if constexpr (kGroups) {
+            if (emits_first_) {
+                discard_staged();
+                withdraw();
+                group_slots_.clear();
+                group_prompts_.clear();
+                for (const auto& member : members) {
+                    if (!member.first) throw std::logic_error("fixed KV cohort: a group member must start its prompt");
+                    if (prefill_policy_) prefill_policy_(*decoder_, member.tokens.size(), true);
+                    group_slots_.push_back(member.lane);
+                    group_prompts_.push_back(member.tokens);
+                }
+                group_tops_.assign(members.size(), 0U);
+                decoder_->prefill_group_first(group_slots_, group_prompts_, group_tops_);
+                group_lanes_ = group_slots_;  // the member order is the decoder's score row order
+                return;
+            }
+        }
+        CohortBackend::prefill_group(members);
+    }
+
     [[nodiscard]] std::uint32_t prefill_top(std::uint32_t lane) override {
         if (!emits_first_) return CohortBackend::prefill_top(lane);
+        if (const auto row = group_row(lane); row != kNoLane) return group_tops_[row];
         if (lane == kNoLane || lane != prefill_lane_)
             throw std::logic_error("fixed KV cohort: first id requested for a lane not just prefilled");
         return prefill_top_;
@@ -227,6 +272,7 @@ public:
     std::span<const float> read_final_logits(std::uint32_t lane) override {
         if constexpr (kReadsLogits) {
             if (lane != kNoLane && lane == prefill_lane_) return read_row(0U);  // emits-first: the prefill's row 0
+            if (const auto row = group_row(lane); row != kNoLane) return read_row(row);  // a group member's row
             if (verify_pending_ && lane != kNoLane)
                 for (std::size_t row = 0; row < window_.size(); ++row)
                     if (window_[row] == lane) return read_row(static_cast<std::uint32_t>(row));
@@ -294,6 +340,7 @@ public:
     // keeps its place for commit. A subsequent first prefill resets the reused slot's frontier and history.
     void release(std::uint32_t lane) override {
         if (lane == prefill_lane_) prefill_lane_ = kNoLane;
+        std::ranges::replace(group_lanes_, lane, kNoLane);
         std::ranges::replace(window_, lane, kNoLane);
         for (auto& w : windows_)
             if (w.lane == lane) w.lane = kNoLane;
@@ -332,6 +379,13 @@ private:
         { decoder.prefill_call_chunk_rows(std::uint64_t{}) } -> std::convertible_to<std::uint64_t>;
     };
 
+    static constexpr bool kGroups = requires(Decoder& decoder, const Decoder& view, std::span<const std::uint32_t> slots,
+                                             std::span<const std::span<const std::uint32_t>> prompts,
+                                             std::span<std::uint32_t> firsts) {
+        decoder.prefill_group_first(slots, prompts, firsts);
+        { view.prefill_group_capacity() } -> std::convertible_to<PrefillGroupCapacity>;
+        { view.prefill_route_class(std::uint64_t{}) } -> std::convertible_to<std::uint32_t>;
+    };
     static constexpr bool kEmitsFirst = requires(Decoder& decoder, std::span<const std::uint32_t> tokens) {
         { decoder.prefill_slot_first(std::uint32_t{}, tokens, bool{}) } -> std::convertible_to<std::uint32_t>;
     };
@@ -440,6 +494,14 @@ private:
         groups_.clear();
         verify_pending_ = false;
         prefill_lane_ = kNoLane;
+        group_lanes_.clear();
+    }
+
+    // Position of the lane among the last group's members (its score row), or kNoLane.
+    [[nodiscard]] std::uint32_t group_row(std::uint32_t lane) const noexcept {
+        if (lane == kNoLane) return kNoLane;
+        const auto at = std::ranges::find(group_lanes_, lane);
+        return at == group_lanes_.end() ? kNoLane : static_cast<std::uint32_t>(at - group_lanes_.begin());
     }
 
     std::span<const float> read_row(std::uint32_t row) {
@@ -475,6 +537,9 @@ private:
     // emits-first: the lane of the last prefill call and its first id, valid until the next backend call; kept apart
     // from the verify window, so a commit right after a prefill is refused.
     std::uint32_t prefill_lane_ = kNoLane, prefill_top_ = 0;
+    // The last grouped prefill: member lanes in score row order (kNoLane = released since) and their first ids.
+    std::vector<std::uint32_t> group_lanes_, group_tops_, group_slots_;
+    std::vector<std::span<const std::uint32_t>> group_prompts_;
     bool emits_first_ = kEmitsFirst;  // the served route (kSelectsRoute: the decoder's identity)
 };
 

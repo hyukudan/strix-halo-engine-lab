@@ -60,6 +60,11 @@ struct PrefillGroupCapacity {
     std::uint32_t rejected_class_mask = 0;
     const char* reason = "eligible-routes-only";
     bool fast = false;  // the owner runs non-exact levers (a FAST profile): see qualify_fast
+    // Sub-passes one group work may run (default 1: the group is one pass). With passes > 1 the scheduler offers a group
+    // up to passes x one slice unit of rows while no lane decodes (a burst of waiting prompts then starts decoding
+    // together); beside a decoding lane the group stays within one slice unit (and the priced gap). The owner splits the
+    // members into its sub-passes; `rows` still bounds the whole group.
+    std::uint32_t passes = 1;
 
     [[nodiscard]] bool accepts(std::uint32_t route) const noexcept {
         return members >= 2U && window_rows != 0U && (route & rejected_class_mask) == 0U;

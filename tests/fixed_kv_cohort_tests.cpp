@@ -296,6 +296,82 @@ void test_prefill_route_selected() {
     }
 }
 
+// A decoder that also groups whole prompts (prefill_group_first, prefill_group_capacity, prefill_route_class): the
+// cohort forwards its capacity and route class, runs the members as ONE decoder call, serves each member's first id and
+// final scores row (its position among the members) until the next backend call or its release.
+struct GroupDecoder : EmitsDecoder {
+    unsigned group_calls = 0;
+    std::vector<std::uint32_t> group_slots;
+    [[nodiscard]] strix::serve::PrefillGroupCapacity prefill_group_capacity() const {
+        strix::serve::PrefillGroupCapacity capacity;
+        capacity.members = 16U;
+        capacity.passes = 3U;
+        capacity.rejected_class_mask = 1U;
+        return capacity;
+    }
+    [[nodiscard]] std::uint32_t prefill_route_class(std::uint64_t rows) const { return rows <= 16U ? 1U : 0U; }
+    void prefill_group_first(std::span<const std::uint32_t> slots, std::span<const std::span<const std::uint32_t>> prompts,
+                             std::span<std::uint32_t> firsts) {
+        ++group_calls;
+        group_slots.assign(slots.begin(), slots.end());
+        last_slots.assign(slots.begin(), slots.end());  // score row r = member r
+        for (std::size_t m = 0; m < slots.size(); ++m) {
+            prefilled.push_back(slots[m] * 2U + 1U);
+            firsts[m] = 9000U + 10U * slots[m] + static_cast<std::uint32_t>(prompts[m].size());
+        }
+    }
+};
+
+void test_prompt_group() {
+    // a decoder without the group hooks: no grouping (members 1), the default solo loop
+    {
+        FixedKvCohort<EmitsDecoder> plain(std::make_unique<EmitsDecoder>(), 64U, 8U, 8U);
+        check(plain.prompt_group_capacity().members == 1U && plain.prompt_group_capacity().passes == 1U &&
+                  plain.prompt_route_class(40U) == 0U,
+              "no group hooks: capacity members 1, one pass, route class 0");
+        const std::uint32_t a[] = {1U, 2U, 3U}, b[] = {4U, 5U};
+        const strix::serve::CohortPrompt members[] = {{0U, a, true}, {1U, b, true}};
+        plain.prefill_group(members);
+        check(plain.prefill_top(1U) == 7012U && throws([&] { (void)plain.prefill_top(0U); }),
+              "no group hooks: the solo loop leaves the last member's first id");
+    }
+    auto decoder = std::make_unique<GroupDecoder>();
+    auto* raw = decoder.get();
+    FixedKvCohort<GroupDecoder> cohort(std::move(decoder), 64U, 8U, 4U);
+    const auto capacity = cohort.prompt_group_capacity();
+    check(capacity.members == 4U && capacity.passes == 3U && capacity.rejected_class_mask == 1U,
+          "group capacity: the decoder's, members clamped to the lanes");
+    check(cohort.prompt_route_class(10U) == 1U && cohort.prompt_route_class(40U) == 0U, "group route class: the decoder's");
+    std::vector<std::uint32_t> p0(40U, 1U), p1(21U, 2U), p2(30U, 3U);
+    const strix::serve::CohortPrompt members[] = {{2U, p0, true}, {0U, p1, true}, {3U, p2, true}};
+    cohort.prefill_group(members);
+    check(raw->group_calls == 1U && raw->group_slots == std::vector<std::uint32_t>({2U, 0U, 3U}),
+          "the members reach the decoder as ONE call, in order");
+    check(cohort.prefill_top(2U) == 9060U && cohort.prefill_top(0U) == 9021U && cohort.prefill_top(3U) == 9060U,
+          "each member's first id");
+    check(cohort.prefill_top(3U) == 9060U && throws([&] { (void)cohort.prefill_top(1U); }),
+          "a lane outside the group has no first id");
+    const auto scores = cohort.read_final_logits(0U);
+    check(scores.size() == 4U && scores[0] == 1.0F && scores[1] == 0.0F, "member scores = its row among the members");
+    const auto last = cohort.read_final_logits(3U);
+    check(last[0] == 2.0F && last[1] == 3.0F, "the third member reads score row 2");
+    cohort.release(0U);
+    check(throws([&] { (void)cohort.prefill_top(0U); }) && cohort.prefill_top(2U) == 9060U,
+          "release withdraws one member only");
+    const strix::serve::CohortPrompt restart[] = {{2U, p0, false}, {3U, p2, true}};
+    check(throws([&] { cohort.prefill_group(restart); }), "a member that does not start its prompt is refused");
+    cohort.prefill_group(members);
+    const CohortGroup groups[] = {{2U, 1U}};
+    const std::uint32_t tokens[] = {4U};
+    std::uint32_t top[1] = {};
+    cohort.verify(groups, tokens, top);
+    check(throws([&] { (void)cohort.prefill_top(2U); }), "a decode window withdraws the group's first ids");
+    cohort.prefill_group(members);
+    cohort.prefill(1U, std::span<const std::uint32_t>(p1), true);
+    check(throws([&] { (void)cohort.prefill_top(2U); }) && cohort.prefill_top(1U) == 7031U,
+          "a solo prefill withdraws the group's first ids");
+}
+
 // A decoder with per-slot verify windows over a deterministic model: the greedy id after a row is a function of the
 // slot's committed history and the row's token (so drafting cannot change ids unless a window commits a row the model
 // did not pick). It records every window and refuses a second staged window (one checkpoint workspace).
@@ -1023,6 +1099,7 @@ int main() {
     test_unannotated_groups_read();
     test_prefill_emits_first();
     test_prefill_route_selected();
+    test_prompt_group();
     test_verify_windows();
     test_lane_binding();
     test_mixed_pass();

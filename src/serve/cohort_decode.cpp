@@ -130,6 +130,7 @@ struct CohortDecoder::Lane {
     std::uint64_t spec_steps = 0, spec_suspends = 0, spec_resumes = 0;  // this request's (CohortResult::lane_speculation)
     std::vector<double> tried, kept;  // kept histogram per draft row index: rows the target verified / kept
     std::uint64_t prompt_start = 0;   // prompt rows restored at admission (a group member starts from 0 only)
+    bool decoded = false;             // a decode pass ran since the prompt finished (burst follow-up group rule)
     bool whole = false;               // the backend's prefill reads the whole prompt and emits the first id
     bool first_due = false;           // whole prompt restored: the first id is due from the restored last row
     // Bounded slices (prompt_slice_decoding): the rows [region_start, region_end) the unbounded schedule passes in one
@@ -619,33 +620,64 @@ void CohortDecoder::step() {
     // it may share its pass (plan_prefill_group: arrival order, one route class, at most one slice of rows).
     auto& group = round.group;
     group.clear();
+    // Burst follow-up: lanes that hold only their prefill's first id (no decode pass ran yet) do not make the burst wait on
+    // the priced gap or the decoders' debt: with a multi-pass group capacity the waiting whole prompts of the burst run as
+    // one group work, so all lanes then decode together. Once any lane has run a decode pass the plan is the planner's.
+    const bool lane_decoding = std::any_of(step_lanes.begin(), step_lanes.end(), [](const StepLane& entry) { return !entry.prompt; });
+    const bool burst_follow = lane_decoding && std::all_of(step_lanes.begin(), step_lanes.end(), [&](const StepLane& entry) {
+        return entry.prompt || !lanes_[entry.lane]->decoded;
+    });
+    bool injected = false;  // the planner held the prompts for the decoders' debt: the oldest waiting prompt heads the group
+    if (burst_follow && plan.prompt.empty() && config_.prompt_group.groups() && backend_.prompt_group_capacity().passes > 1U) {
+        std::int64_t oldest = -1;
+        for (std::size_t i = 0; i < lanes_.size(); ++i) {
+            const auto& c = lanes_[i];
+            if (c && c->prompt_start == 0 && c->prompt_read == 0 && c->prompt_left() > 0 &&
+                (oldest < 0 || c->order < lanes_[static_cast<std::size_t>(oldest)]->order))
+                oldest = static_cast<std::int64_t>(i);
+        }
+        if (oldest >= 0) {
+            plan.prompt.push_back({static_cast<std::uint32_t>(oldest), 0U});
+            injected = true;
+        }
+    }
     if (!plan.prompt.empty() && config_.prompt_group.groups()) {
         const std::uint32_t head = plan.prompt.front().lane;
         const Lane& h = *lanes_[head];
         // the planner runs the head's whole prompt this step (its entry = the rows it gives the head, 0 = one unit);
         // the group may fill the rest of one slice unit
-        const std::uint64_t head_rows = plan.prompt.front().rows ? plan.prompt.front().rows : units[0];
+        const PrefillGroupCapacity capacity = backend_.prompt_group_capacity();
+        const bool wide = capacity.passes > 1U && (!lane_decoding || burst_follow);
+        const std::uint64_t head_rows = burst_follow && wide ? full_slice
+            : plan.prompt.front().rows ? plan.prompt.front().rows : units[0];
         // company fills at most one unit, and under a priced gap never past the unfloored room (the head itself runs
         // even when it alone exceeds it: a floor overshoot, recorded below)
-        const std::uint64_t want = std::min<std::uint64_t>(units[0], gap_room);
-        const PrefillGroupCapacity capacity = backend_.prompt_group_capacity();
+        // (a backend that runs the group as several sub-passes, capacity.passes, offers more rows while no lane decodes: the
+        // whole burst of waiting prompts then starts decoding together)
+        const std::uint64_t passes = wide ? capacity.passes : 1U;
+        const std::uint64_t want = burst_follow && wide ? std::uint64_t{full_slice} * passes
+                                                         : std::min<std::uint64_t>(units[0] * passes, gap_room);
         if (capacity.members >= 2U && h.prompt_start == 0 && h.prompt_read == 0 && h.prompt_left() <= head_rows) {
             auto& others = round.others;
             others.clear();
             for (std::size_t i = 0; i < lanes_.size(); ++i) {
                 const auto& c = lanes_[i];
-                if (c && i != head && c->prompt_start == 0 && c->prompt_read == 0 && c->prompt_left() > 0 && c->order > h.order)
+                // a multi-pass group also takes waiting prompts older than the head (the planner's short-first pick):
+                // they are served earlier, never later, than they would be alone
+                if (c && i != head && c->prompt_start == 0 && c->prompt_read == 0 && c->prompt_left() > 0 &&
+                    (passes > 1U || c->order > h.order))
                     others.push_back(static_cast<std::uint32_t>(i));
             }
             std::sort(others.begin(), others.end(), [&](auto a, auto b) { return lanes_[a]->order < lanes_[b]->order; });
             auto& candidates = round.candidates;
             candidates.clear();
+            std::uint64_t offered = 0;
             const auto offer = [&](std::uint32_t i) {
                 const std::uint64_t rows = lanes_[i]->prompt_left();
                 GroupCandidate c;
                 c.id = i;
                 c.rows = static_cast<std::uint32_t>(std::min<std::uint64_t>(rows, std::numeric_limits<std::uint32_t>::max()));
-                c.arrival_seq = lanes_[i]->order;
+                c.arrival_seq = passes > 1U ? offered++ : lanes_[i]->order;  // the head first, then oldest first
                 c.route_class = backend_.prompt_route_class(rows);
                 candidates.push_back(c);
             };
@@ -657,6 +689,7 @@ void CohortDecoder::step() {
                                capacity, group);
         }
     }
+    if (injected && group.size() <= 1U) plan.prompt.clear();  // no company: the planner's hold stands
     // A backend failure of a prompt pass fails the lanes of that pass, as a failed verify does, and ends this step (no
     // first id is pending yet); a contract violation (std::logic_error) stays fatal after the cleanup.
     const auto fail_prompt = [&](auto indices, const std::exception& ex) {
@@ -752,6 +785,7 @@ void CohortDecoder::step() {
     const bool speculate = config_.lane_speculation.enabled && live() <= config_.lane_speculation.max_live;
     for (const auto id : plan.decode_lanes) {
         Lane& l = *lanes_[id];
+        l.decoded = true;  // a decode pass (round or speculator step) runs for it in this step
         if (speculate && !l.sampler && !l.request.selection) {
             const double s0 = now_ms();
             auto& sp = l.speculator;
