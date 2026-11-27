@@ -28,7 +28,10 @@ struct CompressedMqaLayerRoles {
 struct CompressedMqaLayerShape {
     unsigned hidden, heads, head_dim, rope_dim, q_rank, o_groups, o_rank, vha_rank, window;
     float eps;
-    bool checkpoint;       // BF16 stores and the checkpoint operation order
+    StorePrecision store;      // BF16 rounding of the pooled row and the attention heads
+    HeadNorm key_norm;         // head RMS of the key/value row after its projection norm
+    bool shared_rotary_domain; // window rows use the compressed rotary domain and share it with pooled rows
+    OutputRope output_rope;    // where the inverse rotary of the output heads is applied
     FoldForm fold;
     core::SigmoidGatePrecision gate_precision;
 };
@@ -40,9 +43,9 @@ std::vector<float> compressed_mqa_layer_reference(const Weights& w, const Compre
     attn::CompressedReferenceHistory& state, std::vector<float>& folded_mix, bool record_history,
     bool keep_compressor, const attn::ReferenceHeadExecutor& execute, const Rotary& rotary) {
     const auto width = s.head_dim;
-    const bool checkpoint = s.checkpoint;
+    const bool bf16 = s.store == StorePrecision::bf16;
     const CompressedMqaStep step{position, width, s.window, record_history, keep_compressor,
-                                 checkpoint, false, checkpoint};
+                                 bf16, false, s.shared_rotary_domain};
     validate_compressed_mqa_history<Ratio>(step, state);
 
     std::vector<float> q_lora(s.q_rank), query(std::size_t{s.heads} * width), kv(width);
@@ -52,7 +55,7 @@ std::vector<float> compressed_mqa_layer_reference(const Weights& w, const Compre
     w.linear(r.kv_proj, input, kv, 1U);
     core::rms_norm_bf16_reference(kv, w.tensor(r.kv_norm, kv.size()), s.eps);
     attn::head_rms_reference(query, width, s.eps);
-    if (!checkpoint) attn::head_rms_reference(kv, width, s.eps);
+    if (s.key_norm == HeadNorm::head_rms) attn::head_rms_reference(kv, width, s.eps);
 
     std::vector<float> carry_value, carry_logit, pooled;
     if (keep_compressor) {
@@ -62,7 +65,7 @@ std::vector<float> compressed_mqa_layer_reference(const Weights& w, const Compre
         w.linear(r.compressor_gate, input, carry_logit, 1U);
     }
     const auto carry_row = position % Ratio;
-    const auto window_rope = rotary(s.rope_dim, position, checkpoint);
+    const auto window_rope = rotary(s.rope_dim, position, s.shared_rotary_domain);
     const auto compressed_rope = rotary(s.rope_dim, position, true);
     if (keep_compressor && carry_row == Ratio - 1U) {
         pooled.resize(width);
@@ -70,16 +73,16 @@ std::vector<float> compressed_mqa_layer_reference(const Weights& w, const Compre
             w.tensor(r.compressor_ape, std::size_t{Ratio} * width), pooled);
         core::rms_norm_bf16_reference(pooled, w.tensor(r.compressor_norm, width), s.eps);
         rotary(s.rope_dim, position + 1U - Ratio, true).apply(pooled, width);
-        if (checkpoint) core::round_bf16_reference(pooled);
+        if (bf16) core::round_bf16_reference(pooled);
     }
 
     const auto sinks = w.tensor(r.sink, s.heads);
     const CompressedMqaInputs operands{query, kv, {}, sinks, carry_value, carry_logit, pooled};
     auto heads = compressed_mqa_reference(step, operands, window_rope, compressed_rope, state, execute);
-    if (checkpoint) core::round_bf16_reference(heads);
-    else window_rope.apply(heads, width, true);
+    if (bf16) core::round_bf16_reference(heads);
+    if (s.output_rope == OutputRope::before_mix) window_rope.apply(heads, width, true);
     value_head_postmix_reference(w, r.mix, s.heads, s.vha_rank, s.fold, heads, folded_mix, execute);
-    if (checkpoint) compressed_mqa_output_input_reference(heads, width, window_rope, 0U);
+    if (s.output_rope == OutputRope::after_mix) compressed_mqa_output_input_reference(heads, width, window_rope, 0U);
     std::vector<float> grouped(std::size_t{s.o_groups} * s.o_rank);
     w.linear(r.o_group, heads, grouped, s.o_groups);
     std::vector<float> output(s.hidden);

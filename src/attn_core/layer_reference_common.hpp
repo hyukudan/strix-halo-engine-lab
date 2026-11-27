@@ -23,6 +23,15 @@ struct ValueHeadMixRoles {
 // How the value-head mix is applied: factor by factor on every row, or as one folded matrix.
 enum class FoldForm : std::uint8_t { residual, folded };
 
+// Precision of the stored intermediates: full single precision, or rounded through BF16.
+enum class StorePrecision : std::uint8_t { fp32, bf16 };
+
+// Where the rotary is undone on the attention output heads: before the value-head mix, or on its result.
+enum class OutputRope : std::uint8_t { before_mix, after_mix };
+
+// Per-head RMS normalisation of a projected stream: applied, or left as projected.
+enum class HeadNorm : std::uint8_t { head_rms, none };
+
 // Value-head mix. The folded matrix is built once per history and reused. A model whose checkpoint
 // stores the two factors exchanged names its roles accordingly.
 template <class Weights>

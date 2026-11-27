@@ -75,11 +75,24 @@ core::SigmoidGatePrecision gate_precision(const ReferenceShape& s) {
                                             : core::SigmoidGatePrecision::f32;
 }
 
+bool checkpoint_path(const ReferenceShape& s) { return s.contracts.checkpoint_attention; }
+
+// The checkpoint stores BF16 intermediates and takes its keys as projected; the unit fixtures run full precision
+// and normalise each head.
+attn_core::StorePrecision store_precision(const ReferenceShape& s) {
+    return checkpoint_path(s) ? attn_core::StorePrecision::bf16 : attn_core::StorePrecision::fp32;
+}
+attn_core::HeadNorm key_norm(const ReferenceShape& s) {
+    return checkpoint_path(s) ? attn_core::HeadNorm::none : attn_core::HeadNorm::head_rms;
+}
+
 std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
     std::span<const float> input, unsigned position, attn::CompressedReferenceHistory& state,
     std::vector<float>& folded_mix, bool record_history, bool keep_compressor, const AttentionHeadExecutor& execute) {
     const attn_core::CompressedMqaLayerShape shape{s.hidden, s.heads, s.head_dim, s.rope_dim, s.q_rank, s.o_groups,
-        s.o_rank, s.vha_rank, kWindow, kEpsilon, s.contracts.checkpoint_attention, fold_form(s), gate_precision(s)};
+        s.o_rank, s.vha_rank, kWindow, kEpsilon, store_precision(s), key_norm(s), checkpoint_path(s),
+        checkpoint_path(s) ? attn_core::OutputRope::after_mix : attn_core::OutputRope::before_mix, fold_form(s),
+        gate_precision(s)};
     return attn_core::compressed_mqa_layer_reference<kCompression>(w, kHcaRoles, shape, input, position, state,
         folded_mix, record_history, keep_compressor, execute,
         [&](unsigned dim, unsigned at, bool compressed) { return rotary_row(dim, at, compressed); });
@@ -92,7 +105,8 @@ std::vector<float> mla_reference(const LayerWeights& w, const ReferenceShape& s,
         {s.heads, narrow<unsigned>(a::mla::kv_lora_rank), narrow<unsigned>(a::mla::qk_nope_head_dim),
          narrow<unsigned>(a::mla::qk_rope_head_dim), narrow<unsigned>(a::mla::v_head_dim)},
         s.hidden, s.q_rank, s.vha_rank, kIndexDim, kIndexHeads, kTopK, kIndexPrefillHeads, kWindow,
-        kEpsilon, kEpsilon, s.contracts.checkpoint_attention, fold_form(s), gate_precision(s)};
+        kEpsilon, kEpsilon, store_precision(s), key_norm(s), checkpoint_path(s), checkpoint_path(s), checkpoint_path(s),
+        checkpoint_path(s), checkpoint_path(s), fold_form(s), gate_precision(s)};
     return attn_core::selected_latent_layer_reference(w, kMlaRoles, shape, input, position, state, folded_mix,
         execute, keep_index, index_prefill,
         [&](unsigned dim, unsigned at, bool compressed) { return rotary_row(dim, at, compressed); });

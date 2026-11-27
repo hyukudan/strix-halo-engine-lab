@@ -34,33 +34,38 @@ struct SelectedLatentLayerShape {
     unsigned hidden, q_rank, vha_rank;
     unsigned index_dim, index_heads, top_k, prefill_index_heads, window;
     float eps, index_eps;
-    bool checkpoint; // BF16 stores and the checkpoint operation order; off divides each key by its RMS
+    StorePrecision store;         // BF16 rounding of query, rotary key, index rotation and output heads
+    HeadNorm query_norm;          // head RMS of the projected query
+    bool unit_key_inverse_rms;    // keys enter with inverse RMS 1 instead of the computed per-key value
+    bool leading_split_half_index; // index rows rotate on the leading split-half layout
+    bool quantized_index_query;   // the rotated index query is quantised before scoring
+    bool window_join;             // the recent window joins the indexer's selection
+    bool weighted_index_scoring;  // scale/prefill-mix the head weights and weighted top-k; off adds gate+bias
     FoldForm fold;
     core::SigmoidGatePrecision gate_precision;
     // One packed index key (E2M1 pairs plus one scale byte per 32 elements).
     [[nodiscard]] unsigned packed_index_bytes() const { return index_dim / 2U + index_dim / 32U; }
 };
 
-// Rows the indexer keeps for `position`; the window of recent rows joins on the checkpoint path.
+// Rows the indexer keeps for `position`; the window of recent rows joins when the shape says so.
 template <class Weights>
 std::vector<std::uint32_t> select_indexed_rows_reference(const Weights& w, const SelectedLatentLayerRoles& r,
     const SelectedLatentLayerShape& s, const RotaryReferenceRow& rope, std::span<const float> input,
     std::span<const float> q_lora, unsigned position, std::span<const std::uint8_t> index_history,
     std::span<const std::uint8_t> current_key, bool prefill) {
-    const bool checkpoint = s.checkpoint;
-    const SparseWindowReference window(position, checkpoint ? s.window : 0U, s.top_k);
+    const SparseWindowReference window(position, s.window_join ? s.window : 0U, s.top_k);
     if (window.dense()) return window.dense_rows();
     std::vector<float> query(std::size_t{s.index_heads} * s.index_dim), weights(s.index_heads);
     w.linear(r.index_query, q_lora, query, 1U);
-    rotate_index_rows_reference(query, s.index_dim, rope, checkpoint, checkpoint);
-    if (checkpoint) quantize_index_query_reference(query, s.index_dim);
+    rotate_index_rows_reference(query, s.index_dim, rope, s.leading_split_half_index, s.store == StorePrecision::bf16);
+    if (s.quantized_index_query) quantize_index_query_reference(query, s.index_dim);
 
     w.linear(r.index_head_weights, input, weights, 1U);
     const auto packed = s.packed_index_bytes();
     const auto key_at = [&](std::size_t row) {
         return row == position ? current_key : index_history.subspan(row * packed, packed);
     };
-    if (checkpoint) {
+    if (s.weighted_index_scoring) {
         const float scale = 1.0F / std::sqrt(static_cast<float>(s.index_dim * s.index_heads));
         for (auto& weight : weights) weight *= scale;
         if (prefill) {
@@ -94,22 +99,22 @@ std::vector<float> selected_latent_layer_reference(const Weights& w, const Selec
         combined(shape.latent + shape.rotary), inverse(shape.heads), output_heads(std::size_t{shape.heads} * shape.value);
     const auto latent = std::span(combined).first(shape.latent);
     const auto rotary_key = std::span(combined).last(shape.rotary);
-    const bool checkpoint = s.checkpoint;
+    const bool bf16 = s.store == StorePrecision::bf16;
     w.linear(r.q_down, input, q_lora, 1U);
     core::rms_norm_bf16_reference(q_lora, w.tensor(r.q_norm, q_lora.size()), s.eps);
     w.linear(r.q_up, q_lora, query, 1U);
-    if (!checkpoint) attn::head_rms_reference(query, shape.qk(), s.eps);
+    if (s.query_norm == HeadNorm::head_rms) attn::head_rms_reference(query, shape.qk(), s.eps);
     w.linear(r.kv_down, input, combined, 1U);
     core::rms_norm_bf16_reference(latent, w.tensor(r.kv_norm, latent.size()), s.eps);
 
     const auto kv_b = w.tensor(r.kv_up, std::size_t{shape.heads} * (shape.nope + shape.value) * shape.latent);
     const auto projections = split_latent_projection(shape, kv_b, false);
-    if (checkpoint) std::ranges::fill(inverse, 1.0F);
+    if (s.unit_key_inverse_rms) std::ranges::fill(inverse, 1.0F);
     else latent_key_inverse_rms_reference(shape, projections, latent, rotary_key, s.eps, inverse, execute);
     const auto rope = rotary(shape.rotary, position, false);
     rope.apply(query, shape.qk());
     rope.apply(rotary_key, shape.rotary);
-    if (checkpoint) {
+    if (bf16) {
         core::round_bf16_reference(query);
         core::round_bf16_reference(rotary_key);
     }
@@ -120,7 +125,7 @@ std::vector<float> selected_latent_layer_reference(const Weights& w, const Selec
         w.linear(r.index_key, input, index_key, 1U);
         index_layer_norm_reference(index_key, w.tensor(r.index_key_norm_weight, s.index_dim),
             w.tensor(r.index_key_norm_bias, s.index_dim), s.index_eps);
-        rotate_index_rows_reference(index_key, s.index_dim, rope, checkpoint, checkpoint);
+        rotate_index_rows_reference(index_key, s.index_dim, rope, s.leading_split_half_index, bf16);
         index_entry = pack_index_fp4_reference(index_key);
     }
     const auto selected = select_indexed_rows_reference(w, r, s, rope, input, q_lora, position, state.index_keys,
@@ -131,10 +136,10 @@ std::vector<float> selected_latent_layer_reference(const Weights& w, const Selec
     };
     selected_latent_attention_reference(shape, projections, query, w.tensor(r.softmax_offset, shape.heads), selected,
                                         row_at, output_heads, execute);
-    if (checkpoint) core::round_bf16_reference(output_heads);
+    if (bf16) core::round_bf16_reference(output_heads);
     value_head_postmix_reference(w, r.mix, shape.heads, s.vha_rank, s.fold, output_heads,
                                  folded_mix, execute);
-    if (checkpoint) core::round_bf16_reference(output_heads);
+    if (bf16) core::round_bf16_reference(output_heads);
     sigmoid_gate_values_reference(w, r.gate, q_lora, output_heads, s.gate_precision);
     std::vector<float> output(s.hidden);
     w.linear(r.o_proj, output_heads, output, 1U);
