@@ -58,35 +58,35 @@ using it to compare against a CPU receipt.
 
 ## First device ticket
 
-Run from the checked-out engine on the device hosts. Set `SOURCE` to the
-mounted staging copy of the official checkpoint, `MODEL` to a rank's local
-target directory, `RECEIPTS` to a shared receipt directory and `R` to its
-rank. Perform the manifest preparation once on the source volume. Copy and
-verify it on both nodes.
+Run from the checked-out engine. Set `SOURCE` to the complete official
+checkpoint (the staging volume), `MODEL` to a rank's local target directory,
+`RECEIPTS` to a receipt directory and `R` to the rank. Each rank copies only
+the shards that hold its own tensors: the rank-scoped plan reads the complete
+source once and lists them, and the same plan on the rank copy refuses if any
+tensor the rank owns is absent.
 
 ```sh
 set -eu
-mkdir -p "$RECEIPTS"
+mkdir -p "$RECEIPTS" "$MODEL/flashindexer"
+build/ernie-pair/strix-ernie-pair-plan "$SOURCE" "$TOPOLOGY" 4096 1 256 16777216 \
+  2147483648 2147483648 4294967296 4294967296 --ranges --rank "$R" > "$RECEIPTS/rank-$R-source-plan.tsv"
 {
-  printf '%s\n' config.json generation_config.json model.safetensors.index.json tokenizer.json tokenizer_config.json
-  for i in $(seq 1 128); do printf 'model-%05d-of-00128.safetensors\n' "$i"; done
-  printf '%s\n' flashindexer/flashindexer.safetensors
-} > "$RECEIPTS/assets.list"
-test "$(cd "$SOURCE" && xargs -d '\n' stat -c %s < "$RECEIPTS/assets.list" | awk '{s+=$1} END {printf "%.0f",s}')" = 165934789354
-(cd "$SOURCE" && xargs -d '\n' sha256sum < "$RECEIPTS/assets.list") > "$RECEIPTS/assets.sha256"
-
-mkdir -p "$MODEL"
-rsync -a --files-from="$RECEIPTS/assets.list" "$SOURCE/" "$MODEL/"
-(cd "$MODEL" && sha256sum -c "$RECEIPTS/assets.sha256") > "$RECEIPTS/rank-$R-assets.log"
-sha256sum "$RECEIPTS/assets.sha256"
+  printf '%s\n' config.json generation_config.json model.safetensors.index.json tokenizer.json tokenizer_config.json \
+    flashindexer/flashindexer.safetensors
+  awk -F '\t' '$3 ~ /^model-/ {print $3}' "$RECEIPTS/rank-$R-source-plan.tsv" | sort -u
+} > "$RECEIPTS/rank-$R-assets.list"
+(cd "$SOURCE" && xargs -d '\n' sha256sum < "$RECEIPTS/rank-$R-assets.list") > "$RECEIPTS/rank-$R-assets.sha256"
+rsync -a --files-from="$RECEIPTS/rank-$R-assets.list" "$SOURCE/" "$MODEL/"
+(cd "$MODEL" && sha256sum -c "$RECEIPTS/rank-$R-assets.sha256") > "$RECEIPTS/rank-$R-assets.log"
 ```
 
-The copy uses 165,934,789,354 bytes (154.54 GiB) of data per node, plus
-filesystem overhead. It carries 128 primary shards (165,901,394,480 bytes),
-the FlashIndexer sidecar (3,148,112 bytes) and five JSON control files
-(30,246,762 bytes). Copy all named files because the shared loader validates
-the entire sharded inventory. The actual rank image writes just its own
-indexed target ranges.
+Rank 0 (embedding and layers [0,22)) reads 60 of the 128 primary shards,
+77,766,645,728 bytes; rank 1 (layers [22,43), the closing hyper-connection,
+final norm, MultiMax and the vocabulary projection) reads 61 shards,
+79,672,826,672 bytes. One shard holds tensors of both ranks. The five JSON
+control files (30,246,762 bytes) and the FlashIndexer sidecar (3,148,112
+bytes) go to both ranks. The eight shards that hold only drafter tensors
+(9,759,356,648 bytes) are copied to the head rank when the drafter binds.
 
 Set `TOPOLOGY` to the shared `strix-topology-v1` TOML with ranks 0 and 1,
 a USB4 link, and both nodes' usable memory. The illustrative scratch/reserve
@@ -101,7 +101,7 @@ ctest --test-dir build/ernie-pair --no-tests=error --output-on-failure \
   -R '^(strix-ernie-pair-plan-tests|strix-hip-(hc-core|ds41-attention|ds41-native-fp8|qsa-index-score-wmma)-tests)$'
 
 build/ernie-pair/strix-ernie-pair-plan "$MODEL" "$TOPOLOGY" 4096 1 256 16777216 \
-  2147483648 2147483648 4294967296 4294967296 --ranges > "$RECEIPTS/rank-$R-plan.tsv"
+  2147483648 2147483648 4294967296 4294967296 --ranges --rank "$R" > "$RECEIPTS/rank-$R-plan.tsv"
 timeout 120s build/ernie-pair/strix-dist-host-exchange-bench --transport usb4auto --rank "$R" \
   --sizes 65536,262144,1048576 --warmup 5 --iters 20 > "$RECEIPTS/rank-$R-link.log"
 ```
