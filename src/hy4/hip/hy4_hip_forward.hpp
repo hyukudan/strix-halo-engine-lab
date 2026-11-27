@@ -195,6 +195,9 @@ public:
     [[nodiscard]] bool has_dfly() const noexcept;
     void dfly_hidden(const float* device_row);
     void dfly_block(std::uint32_t anchor, std::uint32_t pos, std::uint32_t k, std::uint32_t* proposals);
+    // Whether a block of `rows` rows (anchor included) at positions pos .. pos + rows - 1 is inside dfly_block's room (the
+    // context and the index-share budget); false where dfly_block would refuse (the per-regime selector retires the arm).
+    [[nodiscard]] bool dfly_room(std::uint64_t pos, std::uint32_t rows) const noexcept;
     [[nodiscard]] std::uint64_t dfly_blocks() const noexcept;
     [[nodiscard]] double dfly_ms() const noexcept;  // wall of every block (receipt)
     void set_nextn_row_loop(bool on) noexcept;

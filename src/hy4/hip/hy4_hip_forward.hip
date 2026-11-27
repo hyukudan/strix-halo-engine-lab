@@ -2451,6 +2451,7 @@ void Forward::dfly_hidden(const float* device_row) { copy_f32_async(impl_->df.hi
 void Forward::dfly_block(std::uint32_t anchor, std::uint32_t pos, std::uint32_t k, std::uint32_t* proposals) {
     impl_->dfly_block(anchor, pos, k, proposals);
 }
+bool Forward::dfly_room(std::uint64_t pos, std::uint32_t rows) const noexcept { return impl_->dfly_room(pos, rows); }
 std::uint64_t Forward::dfly_blocks() const noexcept { return impl_->df.blocks; }
 double Forward::dfly_ms() const noexcept { return impl_->df.ms; }
 void Forward::set_nextn_row_loop(bool on) noexcept { impl_->nx.row_loop = on; }

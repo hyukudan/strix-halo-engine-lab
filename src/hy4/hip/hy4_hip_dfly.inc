@@ -120,6 +120,12 @@ void dfly_candidates(const float* row) {
 
 // One block: rows r = 0 .. k at positions p .. p + k (row 0 = the anchor, the others = the fill id); df.hid = the target
 // hidden (output_norm) of position p - 1. Writes the k proposals (tokens p + 1 .. p + k). Synchronises.
+// dfly_block's position guards as a query (no throw): rows >= 2 within the verify rows, inside the context and below the
+// index-share budget (the causal prefix: every row dense).
+bool dfly_room(std::uint64_t p, std::uint32_t R) const noexcept {
+    if (!df.on || R < 2U || R > vr.max || p == 0U || p + R > context || p + R > df.budget) return false;
+    return index_dense_rows(static_cast<std::uint32_t>(p), R) == R;
+}
 void dfly_block(std::uint32_t anchor, std::uint32_t p, std::uint32_t k, std::uint32_t* out) {
     if (!df.on) throw std::logic_error("hy4 hip forward: dfly_block needs ForwardOptions::dfly");
     const std::uint32_t R = k + 1U, h = c.hidden;

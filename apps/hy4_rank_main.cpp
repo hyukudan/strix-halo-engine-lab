@@ -29,6 +29,7 @@
 #include "strix/pair/stage_map.hpp"
 #include "strix/profiles/hy4.hpp"
 #include "strix/spec/block_parallel.hpp"
+#include "strix/spec/drafter_source.hpp"
 #include "strix/spec/drafting.hpp"
 #include "strix/spec/pair_round.hpp"
 #include "xport/hip_pipe_staging.hpp"
@@ -633,6 +634,11 @@ int run(int argc, char** argv) {
     bool print_config = false;
     // Exact speculative decode (src/hy4/hy4_speculation.hpp): --mtp forces it, --no-mtp / STRIX_MTP=0 opt out; the
     // EXACT prompt runs as verify rows of --prompt-vrows R (1..8, 0 = one step per position; each row bitwise the step).
+    // DFly2 block drafter (default when its shard is beside the pack and the decode speculates; --dfly FILE | off) beside
+    // the next-token block, both under the shared per-regime selector (spec::ArmSelector) or alone (--dfly-arm only);
+    // --dfly-format q8|bf16, --dfly-block N.
+    std::uint32_t dfly_block = 0;
+    std::string dfly_arm = "sel", dfly_text;  // dfly_text: --dfly FILE | off (empty: beside the pack when speculating)
     std::uint32_t prompt_vrows = strix::hy4::hipbind::rows::kMaxVerifyRows;
     std::string dump_path;  // --dump-logits F: every host logits row (FP32, vocab floats per step) appended to F
     std::vector<strix::hy4::hipbind::PairWindowCost> window_costs;  // --window-costs ROWS:MS,... (pair calibration)
@@ -656,6 +662,10 @@ int run(int argc, char** argv) {
         else if (a == "--top" && more) top = static_cast<std::uint32_t>(std::stoul(args[++i]));
         else if (strix::session::speculation_opt_out_argument(a)) {}  // read by speculation_run_from_arguments
         else if (a == "--mtp") {}  // read by speculation_run_from_arguments
+        else if (a == "--dfly" && more) dfly_text = args[++i];
+        else if (a == "--dfly-format" && more) o.dfly_format = args[++i];
+        else if (a == "--dfly-block" && more) dfly_block = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        else if (a == "--dfly-arm" && more) dfly_arm = args[++i];
         else if (a == "--prompt-vrows" && more) {
             prompt_vrows = static_cast<std::uint32_t>(std::stoul(args[++i]));
             if (prompt_vrows > strix::hy4::hipbind::rows::kMaxVerifyRows) throw std::invalid_argument("--prompt-vrows 0..8");
@@ -807,13 +817,24 @@ int run(int argc, char** argv) {
         if (!e.reason.empty()) std::cerr << e.lever->name << ": " << e.reason << '\n';
     if (o.parts.empty() || prompt.empty())
         throw std::invalid_argument("usage: strix-hy4-rank PART1.gguf [PART2.gguf] --ids-file F [--gen N] [--teacher F] [--layers D] "
-                                    "[--context C] [--top K] [--timing] [--prompt-rows R] [--dump-logits F] [--profile exact|fast|turbo] "
+                                    "[--context C] [--top K] [--timing] [--prompt-rows R] [--dump-logits F] [--profile exact|fast|turbo] [--dfly FILE|off [--dfly-arm sel|only]] "
                                     "[--rank 0|1 --cut K | --stage-map C0,C1,..,L|off --repeat K --port P --pipe-guess copy|off --window-costs ROWS:MS,...]");
     // Decode route, every tier: exact speculative decode where the pack ships its next-token block and this rank holds the
     // whole model (one node, or a tensor-parallel rank); the shared resolver words the decision (hy4_speculation.hpp).
     spec_run.whole_model = !layer_pair && spec_run.whole_model;
     const auto spec_decision = strix::hy4::speculation(spec_run);
     const bool spec_on = spec_decision.enabled && gen > 1U && spec_room;
+    if (dfly_arm != "sel" && dfly_arm != "only") throw std::invalid_argument("--dfly-arm sel|only");
+    // The DFly2 shard (shared drafter resolver: explicit file, off, or beside the pack when the decode speculates) loads
+    // only where this rank drafts (one node, TP rank 0; rank 1 follows) on the whole model.
+    const bool dfly_drafts = spec_on && tp_rank != 1 && !o.parts.empty();
+    const auto dfly_file = strix::spec::resolve_drafter_file(
+        {dfly_text == "off" ? std::string_view{} : std::string_view{dfly_text}, dfly_text == "off", dfly_drafts},
+        dfly_drafts ? std::filesystem::path(o.parts.front()) : std::filesystem::path{}, strix::hy4::kDflySidecar);
+    o.dfly = dfly_drafts ? std::filesystem::path(dfly_file.path) : std::filesystem::path{};
+    if (spec_on && tp_rank != 1)
+        std::cout << "drafter dfly source=" << strix::spec::drafter_source_name(dfly_file.source)
+                  << (o.dfly.empty() ? std::string() : " arm=" + dfly_arm) << "\n";
     // EXACT prompt (no windows): verify rows of prompt_vrows positions, each row bitwise step() at its position (the BASE
     // reference form of the long gate, run_gate_ref); one-node whole model; per-position logits dumps keep the steps.
     const bool rows_prompt = o.prompt_rows == 0U && prompt_vrows > 0U && spec_run.whole_model && tp_rank < 0 && !gref.on &&
@@ -912,6 +933,16 @@ int run(int argc, char** argv) {
     const bool draft_tp = tp_rank >= 0 && strix::envcfg::flag("STRIX_HY4_TP_DRAFT", true);
     std::unique_ptr<hr::MtpSource<strix::hy4::hipbind::Forward>> mtp;
     if (spec_on && (tp_rank != 1 || draft_tp)) mtp = std::make_unique<hr::MtpSource<strix::hy4::hipbind::Forward>>(fwd);
+    // --dfly: the DFly2 source; with the selector one prompt pass feeds both drafters (ArmsFeed)
+    std::unique_ptr<hr::DflySource<strix::hy4::hipbind::Forward>> dfly;
+    std::unique_ptr<hr::ArmsFeed<strix::hy4::hipbind::Forward>> arms;
+    if (mtp && !o.dfly.empty()) {
+        dfly = std::make_unique<hr::DflySource<strix::hy4::hipbind::Forward>>(fwd, dfly_block);
+        if (dfly_arm == "sel") arms = std::make_unique<hr::ArmsFeed<strix::hy4::hipbind::Forward>>(fwd, *mtp, *dfly);
+    }
+    hr::PromptFeed* const prompt_feed = arms   ? static_cast<hr::PromptFeed*>(arms.get())
+                                 : dfly ? static_cast<hr::PromptFeed*>(dfly.get())
+                                        : static_cast<hr::PromptFeed*>(mtp.get());
     // EXACT prompt as verify rows (rows_prompt): forward_rows over prompt_vrows positions, committed; the last row's logits
     // are the prompt's; with the block the rows' hidden are staged (the block's flush reuses the verify workspace) and fed.
     const auto vrows_prompt = [&](bool feed) { return hr::prefill_verify_rows(fwd, prompt, prompt_vrows, feed); };
@@ -928,8 +959,8 @@ int run(int argc, char** argv) {
     }
     if (rows_prompt) {  // EXACT prompt: same bits as the position-by-position steps; the last position printed like a step
         const auto s0 = clock::now();
-        if (mtp) mtp->install(prompt);
-        prompt_logits = vrows_prompt(mtp != nullptr);
+        if (prompt_feed) prompt_feed->install(prompt);
+        prompt_logits = vrows_prompt(prompt_feed != nullptr);
         prompt_ms = std::chrono::duration<double, std::milli>(clock::now() - s0).count();
         std::cout << "prefill tokens=" << prompt.size() << " verify_rows=" << prompt_vrows << " ms=" << std::setprecision(1) << prompt_ms
                   << " tok_s=" << std::setprecision(1) << 1000.0 * static_cast<double>(prompt.size()) / prompt_ms
@@ -938,7 +969,7 @@ int run(int argc, char** argv) {
     }
     if (o.prompt_rows != 0U) {  // batched prompt: one call; the last prompt position is printed like a step
         const auto s0 = clock::now();
-        if (mtp) mtp->install(prompt);  // prefill() feeds every prompt row's hidden to the block's teacher pass
+        if (prompt_feed) prompt_feed->install(prompt);  // prefill() feeds every prompt row's hidden to the drafters
         prompt_logits = fwd.prefill(prompt);
         prompt_ms = std::chrono::duration<double, std::milli>(clock::now() - s0).count();
         const auto& t = fwd.times();
@@ -989,7 +1020,7 @@ int run(int argc, char** argv) {
     if (!verify_seeds.empty() && !spec_on) throw std::invalid_argument("--verify-ms requires speculative decode");
     if (spec_on) {  // exact speculative decode (strix-hy4-rows --mtp, the record route): the ids of plain greedy decode
         const auto anchor = static_cast<std::uint32_t>(std::max_element(prompt_logits.begin(), prompt_logits.end()) - prompt_logits.begin());
-        if (mtp) mtp->finish_prompt(anchor);
+        if (prompt_feed) prompt_feed->finish_prompt(anchor);
         strix::spec::pair_round::Exchange pair_ex;
         double trip_ms = 0.0;
         if (tpg) {  // tensor-parallel pair: every verify pass (and draft round with the block on both ranks) on both ranks
@@ -1042,7 +1073,14 @@ int run(int argc, char** argv) {
         hr::seed_spec_options(so, step_ms, tpg ? 2U : 1U, trip_ms, tpg ? fwd.tp_gathers_per_step() : 0U, verify_seeds);
         so.draft_tp = draft_tp;
         if (!verify_seeds.empty()) std::cout << "spec verify seeds explicit\n";
-        const auto res = hr::spec_decode(fwd, prompt, anchor, gen, so, *mtp, tpg ? &pair_ex : nullptr);
+        hr::SpecOptions dso = so;  // the DFly2 arm: its block seeds (flush = the block pass, step = one chain slot)
+        dso.chain_survival.clear();
+        dso.chain_step_ms = hr::kDflySeedStepMs;
+        dso.chain_flush_ms = hr::kDflySeedFlushMs;
+        const auto* pex = tpg ? &pair_ex : nullptr;
+        const auto res = arms   ? hr::spec_decode(fwd, prompt, anchor, gen, so, dso, *mtp, *dfly, pex)
+                         : dfly ? hr::spec_decode(fwd, prompt, anchor, gen, dso, *dfly, pex)
+                                : hr::spec_decode(fwd, prompt, anchor, gen, so, *mtp, pex);
         if (tpg) tpg->finish();
         generated = res.ids;
         gen_ms = res.wall_ms;
@@ -1052,10 +1090,17 @@ int run(int argc, char** argv) {
                   << res.accepted << " rows";
         for (std::size_t r = 1; r < res.rows_hist.size(); ++r) std::cout << " R" << r << ':' << res.rows_hist[r];
         std::cout << std::setprecision(2) << "; plain step " << step_ms << " ms; block calls " << res.chain_calls << " drafts "
-                  << res.chain_drafts << "; wall verify " << std::setprecision(1) << res.verify_ms << " draft " << res.chain_ms << " other "
-                  << res.wall_ms - res.verify_ms - res.chain_ms << " ms" << (tpg ? (draft_tp ? " (tp, block tp)" : " (tp, block rank 0)") : "")
+                  << res.chain_drafts << "; wall verify " << std::setprecision(1) << res.verify_ms << " draft " << res.chain_ms + res.dfly_ms
+                  << " other " << res.wall_ms - res.verify_ms - res.chain_ms - res.dfly_ms << " ms" << (tpg ? (draft_tp ? " (tp, block tp)" : " (tp, block rank 0)") : "")
                   << "\nids";
         for (const auto id : generated) std::cout << ' ' << id;
+        if (res.selector)
+            std::cout << "\nspec selector mtp passes " << res.arms[0].passes << " tokens " << res.arms[0].tokens << " | dfly passes "
+                      << res.arms[1].passes << " tokens " << res.arms[1].tokens << " probes " << res.arms[1].probes << " wins " << res.arms[1].wins
+                      << " blocks " << res.dfly_calls << " | switches " << res.switches << " fallbacks " << res.fallbacks << " probe ledger "
+                      << std::setprecision(1) << res.probe_ledger_ms << " ms";
+        else if (dfly)
+            std::cout << "\nspec drafter dfly blocks " << res.chain_calls << " (--dfly-arm only)";
         std::cout << "\n" << std::setprecision(1) << "time prompt_ms=" << prompt_ms << " gen_ms=" << gen_ms
                   << " total_ms=" << std::chrono::duration<double, std::milli>(clock::now() - t0).count() << " decode_tok_s="
                   << std::setprecision(2) << (gen_ms > 0 ? 1000.0 * (gen - 1U) / gen_ms : 0.0) << "\n";

@@ -5,6 +5,7 @@
 #include "hy4/hy4_speculation.hpp"
 #include "strix/profiles/hy4.hpp"
 #include "strix/serve/tokenizer.hpp"
+#include "strix/spec/drafter_source.hpp"
 #include "strix/weight_pack.hpp"
 
 #include <hip/hip_runtime.h>
@@ -65,9 +66,17 @@ public:
         forward_.sync();
         forward_.reset();
         std::unique_ptr<rows::MtpSource<hb::Forward>> mtp;
+        std::unique_ptr<rows::DflySource<hb::Forward>> dfly;  // with the next-token block under the per-regime selector
+        std::unique_ptr<rows::ArmsFeed<hb::Forward>> arms;
         if (speculative) {
             mtp = std::make_unique<rows::MtpSource<hb::Forward>>(forward_);
-            mtp->install(job.prompt);
+            if (forward_.has_dfly()) {
+                dfly = std::make_unique<rows::DflySource<hb::Forward>>(forward_, 0U);
+                arms = std::make_unique<rows::ArmsFeed<hb::Forward>>(forward_, *mtp, *dfly);
+                arms->install(job.prompt);
+            } else {
+                mtp->install(job.prompt);
+            }
         }
         std::vector<float> exact_logits;
         const auto* logits = &exact_logits;
@@ -77,7 +86,8 @@ public:
         stats.prefill_ms = elapsed(start);
         const auto decode_start = Clock::now();
         if (speculative) {
-            mtp->finish_prompt(next);
+            if (arms) arms->finish_prompt(next);
+            else mtp->finish_prompt(next);
             // Publish the anchor before calibration, then only newly verified rows.
             if (publish(std::span(&next, 1))) {
                 double best = std::numeric_limits<double>::infinity();
@@ -93,7 +103,12 @@ public:
                     if (std::exchange(first, false)) return true;
                     return publish(ids);
                 };
-                const auto result = rows::spec_decode(forward_, job.prompt, next, length, spec, *mtp);
+                rows::SpecOptions dso = spec;  // the DFly2 arm: its block seeds
+                dso.chain_survival.clear();
+                dso.chain_step_ms = rows::kDflySeedStepMs;
+                dso.chain_flush_ms = rows::kDflySeedFlushMs;
+                const auto result = arms ? rows::spec_decode(forward_, job.prompt, next, length, spec, dso, *mtp, *dfly)
+                                         : rows::spec_decode(forward_, job.prompt, next, length, spec, *mtp);
                 stats.cycles = result.steps.size();
                 stats.proposed = result.proposed;
                 stats.accepted = result.accepted;
@@ -107,6 +122,7 @@ public:
         }
         stats.decode_ms = elapsed(decode_start);
         stats.engine_extra.emplace_back("hy4_speculation", speculative ? "true" : "false");
+        stats.engine_extra.emplace_back("hy4_drafters", !speculative ? "none" : arms ? "mtp+dfly (selector)" : "mtp");
         return stats;
     }
 };
@@ -139,6 +155,9 @@ SessionAssets load_hip_service(const Options& options, const PackFacts& pack) {
     run.no_mtp = options.no_mtp;
     run.environment = envcfg::text(::strix::session::speculation_environment);
     native.nextn = speculation(run).enabled;
+    // The DFly2 shard beside the pack when the decode speculates: the same shared resolver and file as strix-hy4-rank.
+    if (native.nextn && !native.parts.empty())
+        native.dfly = ::strix::spec::resolve_drafter_file({{}, false, true}, native.parts.front(), kDflySidecar).path;
     ::strix::profile::apply(resolved->resolution);
     auto tokenizer = std::make_shared<sv::BpeApiTokenizer>(sv::BpeTokenizer::load_gguf(options.gguf));
     return {std::move(tokenizer), std::make_unique<Engine>(std::move(native))};

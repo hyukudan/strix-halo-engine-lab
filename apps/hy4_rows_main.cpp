@@ -17,6 +17,8 @@
 //     as the chain arm of the shared BlockDrafter (ParallelBlockDrafter over the Hy4 BlockForward); per content the MTP arm
 //     and the DFly2 arm alternate --dfly-reps times (SPEC / DFLY lines labelled content:mtp / content:dfly). --dfly-format
 //     q8|bf16 (pack Linears), --dfly-block N (rows incl. the anchor, <= 8; default the preset), --dfly-ms S,F (Arbiter seeds).
+//     --arms LIST (with --dfly; default mtp,dfly,sel): the arms of each rep in order; sel = both drafters under the shared
+//     per-regime selector (spec::ArmSelector; SEL line: passes / tokens / wall per arm, probes, switches).
 // strix-hy4-rows PART.gguf... --ids-file F [--context N] [--prompt-rows N] [--reps K] [--spec N] [--max-rows R]
 //   [--verify-ms a,b,...] [--gbps G] [--mtp [--mtp-head full|q8|q4] [--mtp-copy 0|1] [--chain-ms S,F] [--survival c,...] [--mtp-taps DIR
 //   [--taps-gen N] [--depth D]]]; --content LABEL=PATH (repeatable) instead of --ids-file: one spec run per content
@@ -60,6 +62,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -620,6 +623,7 @@ int main(int argc, char** argv) {
         bool mtp = false, mtp_copy = true;
         std::vector<double> chain_ms, survival, dfly_ms;
         std::uint32_t dfly_block = 0, dfly_reps = 1;
+        std::string arms_text = "mtp,dfly,sel";
         std::string taps_dir;
         std::uint32_t taps_gen = 128, depth = 6;
         // tensor-parallel pair (Forward::enable_tp on both ranks, each holding the whole pack): rank 0 drafts and decides,
@@ -652,6 +656,7 @@ int main(int argc, char** argv) {
             else if (a == "--dfly-block" && more) dfly_block = static_cast<std::uint32_t>(std::stoul(argv[++i]));
             else if (a == "--dfly-reps" && more) dfly_reps = static_cast<std::uint32_t>(std::stoul(argv[++i]));
             else if (a == "--dfly-ms" && more) dfly_ms = read_list(argv[++i]);
+            else if (a == "--arms" && more) arms_text = argv[++i];
             else if (a == "--head-q8" && more) o.head_q8 = std::stoul(argv[++i]) != 0UL;
             else if (a == "--tp-rank" && more) tp_rank = static_cast<int>(std::stoul(argv[++i]));
             else if (a == "--tp-transport" && more) tp_spec = argv[++i];
@@ -817,16 +822,29 @@ int main(int argc, char** argv) {
         }
         // ---- spec, per content: plain greedy reference, then the speculative decode from the same prompt state
         int rc = 0;
-        // --dfly: per content the MTP arm and the DFly2 arm alternate (dfly_reps pairs, same process, same prompt state)
-        std::vector<bool> arm_list{false};
+        // --dfly: per content the arms of --arms alternate (dfly_reps rounds, same process, same prompt state)
+        enum Arm : int { kMtp = 0, kDfly = 1, kSel = 2 };
+        std::vector<int> arm_list{kMtp};
         if (!o.dfly.empty()) {
-            arm_list.clear();
-            for (std::uint32_t r = 0; r < dfly_reps; ++r) {
-                arm_list.push_back(false);
-                arm_list.push_back(true);
+            std::vector<int> round;
+            std::string_view rest(arms_text);
+            while (!rest.empty()) {
+                const auto comma = rest.find(',');
+                const auto t = rest.substr(0, comma);
+                if (t == "mtp") round.push_back(kMtp);
+                else if (t == "dfly") round.push_back(kDfly);
+                else if (t == "sel") round.push_back(kSel);
+                else throw std::invalid_argument("--arms takes mtp, dfly and sel");
+                if (comma == std::string_view::npos) break;
+                rest.remove_prefix(comma + 1U);
             }
+            if (round.empty()) throw std::invalid_argument("--arms is empty");
+            arm_list.clear();
+            for (std::uint32_t r = 0; r < dfly_reps; ++r) arm_list.insert(arm_list.end(), round.begin(), round.end());
         }
-        const auto arm_label = [&o](const std::string& l, bool dfly_arm) { return o.dfly.empty() ? l : l + (dfly_arm ? ":dfly" : ":mtp"); };
+        const auto arm_label = [&o](const std::string& l, int arm) {
+            return o.dfly.empty() ? l : l + (arm == kDfly ? ":dfly" : arm == kSel ? ":sel" : ":mtp");
+        };
         for (std::size_t ci = 0; ci < contents.size(); ++ci) {
             const auto& [clabel, ids] = contents[ci];
             const std::uint32_t first_id = ci == 0U ? anchor : prime(f, ids, batched, nullptr, sp);
@@ -847,10 +865,10 @@ int main(int argc, char** argv) {
             // tensor-parallel drafter (both ranks; STRIX_HY4_TP_DRAFT=0: rank 0 alone, one-node block): both ranks must agree
             so.draft_tp = tp_rank >= 0 && mtp && strix::envcfg::flag("STRIX_HY4_TP_DRAFT", true);
             if (follower) {  // rank 1: the same prompt pass (with the block when the drafter runs on both), then rank 0's rounds
-                for (const bool dfly_arm : arm_list) {  // the leader's arm order (rank 1 follows the verify passes of a DFly2 arm)
-                const std::string label = arm_label(clabel, dfly_arm);
+                for (const int arm : arm_list) {  // the leader's arm order (rank 1 follows the verify passes of a DFly2 arm)
+                const std::string label = arm_label(clabel, arm);
                 std::unique_ptr<hb::rows::MtpSource<hb::Forward>> fsrc;
-                if (so.draft_tp && !dfly_arm) fsrc = std::make_unique<hb::rows::MtpSource<hb::Forward>>(f);
+                if (so.draft_tp && arm != kDfly) fsrc = std::make_unique<hb::rows::MtpSource<hb::Forward>>(f);
                 const double prime_t1 = now_ms();
                 if (prime(f, ids, batched, fsrc.get(), sp) != first_id) throw std::runtime_error("repeat prompt anchor differs (" + label + ")");
                 std::printf("PRIME %s prompt %zu ids %.1f ms (tp rank 1%s)\n", label.c_str(), ids.size(), now_ms() - prime_t1,
@@ -869,17 +887,22 @@ int main(int argc, char** argv) {
                 continue;
             }
             const hb::rows::SpecOptions so_base = so;
-            for (const bool dfly_arm : arm_list) {
-            const std::string label = arm_label(clabel, dfly_arm);
+            for (const int arm : arm_list) {
+            const std::string label = arm_label(clabel, arm);
+            const bool dfly_arm = arm == kDfly, sel_arm = arm == kSel;
             so = so_base;
+            hb::rows::SpecOptions dso = so_base;  // the selector's DFly2 arm
             std::unique_ptr<hb::rows::MtpSource<hb::Forward>> source;
             std::unique_ptr<hb::rows::DflySource<hb::Forward>> dsrc;
-            if (dfly_arm) {  // the block drafter as the chain arm: flush = the block pass, step = one chain slot
+            std::unique_ptr<hb::rows::ArmsFeed<hb::Forward>> both;
+            if (dfly_arm || sel_arm) {  // the block drafter as a chain arm: flush = the block pass, step = one chain slot
                 dsrc = std::make_unique<hb::rows::DflySource<hb::Forward>>(f, dfly_block);
-                so.copy = mtp_copy;
-                so.chain_step_ms = dfly_ms.empty() ? hb::rows::kDflySeedStepMs : dfly_ms[0];
-                so.chain_flush_ms = dfly_ms.empty() ? hb::rows::kDflySeedFlushMs : dfly_ms[1];
-            } else if (mtp) {
+                dso.copy = mtp_copy;
+                dso.chain_step_ms = dfly_ms.empty() ? hb::rows::kDflySeedStepMs : dfly_ms[0];
+                dso.chain_flush_ms = dfly_ms.empty() ? hb::rows::kDflySeedFlushMs : dfly_ms[1];
+                if (dfly_arm) so = dso;
+            }
+            if (mtp && !dfly_arm) {
                 source = std::make_unique<hb::rows::MtpSource<hb::Forward>>(f);
                 so.copy = mtp_copy;
                 if (!chain_ms.empty()) {
@@ -891,11 +914,15 @@ int main(int argc, char** argv) {
                                                      : survival;
             }
             const double prime_t0 = now_ms();  // the spec path's prompt pass (with the block: its teacher flushes when the ring fills)
-            hb::rows::PromptFeed* const feed = dsrc ? static_cast<hb::rows::PromptFeed*>(dsrc.get()) : source.get();
+            if (sel_arm) both = std::make_unique<hb::rows::ArmsFeed<hb::Forward>>(f, *source, *dsrc);
+            hb::rows::PromptFeed* const feed = both ? static_cast<hb::rows::PromptFeed*>(both.get())
+                                               : dsrc ? static_cast<hb::rows::PromptFeed*>(dsrc.get())
+                                                      : source.get();
             if (prime(f, ids, batched, feed, sp) != first_id) throw std::runtime_error("repeat prompt anchor differs (" + label + ")");
             std::printf("PRIME %s prompt %zu ids %.1f ms%s\n", label.c_str(), ids.size(), now_ms() - prime_t0, source ? " (with the block)" : "");
             const auto* pex = tp_rank == 0 ? &pair_ex : nullptr;
-            const auto res = dsrc     ? hb::rows::spec_decode(f, ids, first_id, spec_n, so, *dsrc, pex)
+            const auto res = both     ? hb::rows::spec_decode(f, ids, first_id, spec_n, so, dso, *source, *dsrc, pex)
+                             : dsrc     ? hb::rows::spec_decode(f, ids, first_id, spec_n, so, *dsrc, pex)
                              : source ? hb::rows::spec_decode(f, ids, first_id, spec_n, so, *source, pex)
                                       : hb::rows::spec_decode(f, ids, first_id, spec_n, so, pex);
             std::printf("PLAIN %s %s %.2f tok/s (%.2f ms/token) ids_fnv %016llx\n", label.c_str(), tp_rank == 0 ? "tp rank 0" : "one node",
@@ -916,23 +943,37 @@ int main(int argc, char** argv) {
                         label.c_str(), equal ? 1 : 0, first_bad, 1000.0 * gen / plain_ms, step_ms, 1000.0 * gen / res.wall_ms, res.steps.size(),
                         res.steps.empty() ? 0.0 : gen / static_cast<double>(res.steps.size()), static_cast<unsigned long long>(res.proposed),
                         static_cast<unsigned long long>(res.accepted));
-            if (dsrc)
+            if (res.selector)
+                std::printf("SEL %s mtp passes %llu tokens %llu wall %.1f ms | dfly passes %llu tokens %llu wall %.1f ms probes %llu "
+                            "probe passes %llu wins %llu | switches %llu fallbacks %llu probe ledger %.1f ms | dfly blocks %llu %.1f ms | mtp drafts %llu "
+                            "%.1f ms | dfly seeds step %.2f flush %.1f\n",
+                            label.c_str(), static_cast<unsigned long long>(res.arms[0].passes),
+                            static_cast<unsigned long long>(res.arms[0].tokens), res.arms[0].ms,
+                            static_cast<unsigned long long>(res.arms[1].passes), static_cast<unsigned long long>(res.arms[1].tokens),
+                            res.arms[1].ms, static_cast<unsigned long long>(res.arms[1].probes),
+                            static_cast<unsigned long long>(res.arms[1].probe_passes), static_cast<unsigned long long>(res.arms[1].wins),
+                            static_cast<unsigned long long>(res.switches), static_cast<unsigned long long>(res.fallbacks),
+                            res.probe_ledger_ms,
+                            static_cast<unsigned long long>(res.dfly_calls), res.dfly_ms, static_cast<unsigned long long>(res.chain_drafts),
+                            res.chain_ms, dso.chain_step_ms, dso.chain_flush_ms);
+            if (dsrc && !res.selector)
                 std::printf("DFLY %s blocks %llu draft wall %.1f ms (%.2f ms/block) block rows %u format %s seeds step %.2f flush %.1f%s\n",
                             label.c_str(), static_cast<unsigned long long>(res.chain_calls), res.chain_ms,
                             res.chain_calls ? res.chain_ms / static_cast<double>(res.chain_calls) : 0.0, dsrc->chain().policy().block,
                             o.dfly_format.c_str(), so.chain_step_ms, so.chain_flush_ms, so.copy ? " +copy+hybrid" : "");
-            if (mtp && !dsrc)
+            if (mtp && !dfly_arm)
                 std::printf("MTP %s block calls %llu rows %llu drafts %llu id reads %llu draft wall %.1f ms (%.2f ms/draft) chain %s seeds step %.1f flush %.1f%s\n",
                             label.c_str(), static_cast<unsigned long long>(res.chain_calls), static_cast<unsigned long long>(res.chain_rows),
                             static_cast<unsigned long long>(res.chain_drafts), static_cast<unsigned long long>(res.chain_reads), res.chain_ms,
                             res.chain_drafts ? res.chain_ms / static_cast<double>(res.chain_drafts) : 0.0, so.copy ? "+copy+hybrid" : "only",
                             so.chain_step_ms, so.chain_flush_ms, so.draft_tp ? " block tp" : (tp_rank == 0 ? " block rank 0" : ""));
-            if (mtp && !dsrc)  // where a pass's wall goes: verify passes, drafter (flush + chain), the rest (round message, host)
+            if (mtp && !dfly_arm) {  // where a pass's wall goes: verify passes, drafters (flush + chain, DFly2 blocks), the rest
+                const double draft = res.chain_ms + res.dfly_ms;
+                const double passes = static_cast<double>(std::max<std::size_t>(res.steps.size(), 1U));
                 std::printf("WALL %s total %.1f ms verify %.1f draft %.1f other %.1f (per pass %.2f / %.2f / %.2f)\n", label.c_str(), res.wall_ms,
-                            res.verify_ms, res.chain_ms, res.wall_ms - res.verify_ms - res.chain_ms,
-                            res.verify_ms / static_cast<double>(std::max<std::size_t>(res.steps.size(), 1U)),
-                            res.chain_ms / static_cast<double>(std::max<std::size_t>(res.steps.size(), 1U)),
-                            (res.wall_ms - res.verify_ms - res.chain_ms) / static_cast<double>(std::max<std::size_t>(res.steps.size(), 1U)));
+                            res.verify_ms, draft, res.wall_ms - res.verify_ms - draft, res.verify_ms / passes, draft / passes,
+                            (res.wall_ms - res.verify_ms - draft) / passes);
+            }
             std::fflush(stdout);
             if (!equal) rc = 3;
             }

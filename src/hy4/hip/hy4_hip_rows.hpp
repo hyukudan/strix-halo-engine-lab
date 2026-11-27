@@ -10,6 +10,7 @@
 // before any read, which holds when every ring is sized for the verify rows (check_rewind below replays it).
 // Home: src/hy4 (binding: Hy4 positions / rings data); the controller, proposer and Arbiter are shared (strix::spec).
 #include "hy4/hip/hy4_hip_plan.hpp"
+#include "strix/spec/arm_selector.hpp"
 #include "strix/spec/block_drafter.hpp"
 #include "strix/spec/block_parallel.hpp"
 #include "strix/spec/engine_target.hpp"
@@ -43,6 +44,17 @@ inline constexpr std::array<double, 6> kChainSurvival{0.714, 0.633, 0.436, 0.675
 // DFly2 block arm seeds (PREDICTION of hy4_df2-STATE section 4, Q8_0 drafter + FAST head; the Arbiter refines both online):
 // flush = one block pass (embedding, 5 draft layers, the head over the rows), step = one hidden-correction slot.
 inline constexpr double kDflySeedStepMs = 0.5, kDflySeedFlushMs = 8.0;
+// Per-regime selector (spec::ArmSelector, arm 0 = the next-token block, arm 1 = DFly2): the block arm is probed only while
+// the next-token arm emits >= this many tokens per pass. Measured one node (hy4_df2): a block pass 9.0-9.5 ms = 2.6 next-token
+// drafts of 3.58 ms, so the block can only pay where ~2.5 drafts are accepted (prose 2.1 tokens/pass: DFly2 -22 %;
+// think 2.6: +1.4 %; code 3.05: +2.9 %, pair +6.9 %).
+inline constexpr double kDflyProbeMinTokens = 2.5;
+// The selector's DFly2 arm starts from this stated confidence (conditional survival by depth, BlockDrafter::
+// seed_chain_survival): without it the arm's Arbiter opens depth one frontier probe at a time and a probe episode measures
+// only that cold start (measured t1 code: 6 probe passes at 2.67 tokens / pass vs 3.88 for DFly2 alone). Flat 0.80 =
+// the offline think acceptance E(7) 4.121 (hy4_df: 1 + sum c^d, d = 1..7); code E(7) 4.637 is c ~0.86. The arm is probed
+// only past kDflyProbeMinTokens (think / code regimes), where this prior holds; online counts refine it.
+inline constexpr std::array<double, 7> kDflySurvival{0.80, 0.80, 0.80, 0.80, 0.80, 0.80, 0.80};
 // Routed experts of a verify window in the shared A8 union rows form (each distinct expert read once, rows bitwise == the
 // per-row loop). Off switch: STRIX_HY4_ROWS_EXPERT_UNION=0.
 inline constexpr bool kExpertUnionDefault = true;  // measured bitwise (ROWS 30/30) and faster at R >= 2
@@ -194,12 +206,16 @@ public:
     MtpSource(const MtpSource&) = delete;
     MtpSource& operator=(const MtpSource&) = delete;
     void install(std::span<const std::uint32_t> prompt) override {
+        prepare(prompt);
+        f_.set_prompt_hidden([this](const float* rows, std::uint32_t p0, std::uint32_t n) { feed(rows, p0, n); });
+    }
+    // install() without the sink (a shared sink calls feed(); ArmsFeed).
+    void prepare(std::span<const std::uint32_t> prompt) {
         if (prompt.empty()) throw std::invalid_argument("hy4 rows: MTP prompt is empty");
         prompt_.assign(prompt.begin(), prompt.end());
         base_ = f_.position();
         fed_ = 0;
         if (!last_) last_ = f_.alloc_f32(f_.config().hidden);
-        f_.set_prompt_hidden([this](const float* rows, std::uint32_t p0, std::uint32_t n) { feed(rows, p0, n); });
     }
     // After f.prefill(prompt): anchor = the greedy id after the prompt (the last prompt row's successor).
     void finish_prompt(std::uint32_t anchor) override {
@@ -209,8 +225,6 @@ public:
         chain_.observe_prefill(o, 1U, &prompt_.back(), anchor);
     }
     [[nodiscard]] MtpDrafter<Fwd>& chain() { return chain_; }
-
-private:
     void feed(const float* rows, std::uint32_t p0, std::uint32_t n) {
         if (p0 != base_ + fed_ || std::size_t{fed_} + n > prompt_.size()) throw std::logic_error("hy4 rows: MTP prompt rows out of order");
         const std::uint32_t* toks = prompt_.data() + fed_;
@@ -223,6 +237,8 @@ private:
         if (tail) f_.copy_f32_async(last_, rows + std::size_t{n - 1U} * f_.config().hidden, f_.config().hidden);
         fed_ += n;
     }
+
+private:
     Fwd& f_;
     MtpEngine<Fwd> eng_;
     MtpDrafter<Fwd> chain_;
@@ -271,15 +287,19 @@ public:
         return p;
     }
     void install(std::span<const std::uint32_t> prompt) override {
+        prepare(prompt);
+        f_.set_prompt_hidden([this](const float* rows, std::uint32_t p0, std::uint32_t n) { feed(rows, p0, n); });
+    }
+    void prepare(std::span<const std::uint32_t> prompt) {
         if (prompt.empty()) throw std::invalid_argument("hy4 dfly: prompt is empty");
         size_ = static_cast<std::uint32_t>(prompt.size());
         base_ = f_.position();
         fed_ = 0;
-        f_.set_prompt_hidden([this](const float* rows, std::uint32_t p0, std::uint32_t n) {
-            if (p0 != base_ + fed_ || fed_ + n > size_) throw std::logic_error("hy4 dfly: prompt rows out of order");
-            fed_ += n;
-            if (fed_ == size_) f_.dfly_hidden(rows + std::size_t{n - 1U} * f_.config().hidden);
-        });
+    }
+    void feed(const float* rows, std::uint32_t p0, std::uint32_t n) {
+        if (p0 != base_ + fed_ || fed_ + n > size_) throw std::logic_error("hy4 dfly: prompt rows out of order");
+        fed_ += n;
+        if (fed_ == size_) f_.dfly_hidden(rows + std::size_t{n - 1U} * f_.config().hidden);
     }
     void finish_prompt(std::uint32_t anchor) override {
         f_.set_prompt_hidden({});
@@ -294,6 +314,33 @@ private:
     DflyForward<Fwd> fwd_;
     spec::ParallelBlockDrafter drafter_;
     std::uint32_t size_ = 0, base_ = 0, fed_ = 0;
+};
+
+// Both drafters fed by one prompt pass (the forward has one prompt-hidden sink): the per-regime selector's arms.
+template <class Fwd>
+class ArmsFeed final : public PromptFeed {
+public:
+    ArmsFeed(Fwd& f, MtpSource<Fwd>& mtp, DflySource<Fwd>& dfly) : f_(f), mtp_(mtp), dfly_(dfly) {}
+    ~ArmsFeed() override { f_.set_prompt_hidden({}); }
+    ArmsFeed(const ArmsFeed&) = delete;
+    ArmsFeed& operator=(const ArmsFeed&) = delete;
+    void install(std::span<const std::uint32_t> prompt) override {
+        mtp_.prepare(prompt);
+        dfly_.prepare(prompt);
+        f_.set_prompt_hidden([this](const float* rows, std::uint32_t p0, std::uint32_t n) {
+            mtp_.feed(rows, p0, n);
+            dfly_.feed(rows, p0, n);
+        });
+    }
+    void finish_prompt(std::uint32_t anchor) override {
+        mtp_.finish_prompt(anchor);
+        dfly_.finish_prompt(anchor);
+    }
+
+private:
+    Fwd& f_;
+    MtpSource<Fwd>& mtp_;
+    DflySource<Fwd>& dfly_;
 };
 
 // The next-token block tensor-parallel for one decode (Forward::set_nextn_tp), the one-node form again after it.
@@ -421,34 +468,45 @@ struct SpecResult {
     std::uint64_t chain_calls = 0, chain_rows = 0, chain_drafts = 0, chain_reads = 0;
     double chain_ms = 0;
     double verify_ms = 0;  // chain arm: wall of the verify passes (forward_rows, synchronised)
+    // per-regime selector (spec_decode with both drafters): per arm [0 next-token block, 1 DFly2] passes / tokens / wall /
+    // probes / probe passes / wins, switches, probe ledger (ms of realised probe losses)
+    struct Arm {
+        std::uint64_t passes = 0, tokens = 0, probes = 0, probe_passes = 0, wins = 0;
+        double ms = 0.0;
+    };
+    std::array<Arm, 2> arms{};
+    std::uint64_t switches = 0, fallbacks = 0, dfly_calls = 0;
+    double probe_ledger_ms = 0.0, dfly_ms = 0.0;
+    bool selector = false;
 };
 
 namespace detail {
-// One speculative decode over `target` (the rows contract, with the chain's view when `chain` is set).
-template <class Fwd>
-SpecResult spec_run(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t anchor, std::uint32_t n, const SpecOptions& o,
-                    spec::ChainDrafter* chain, std::span<const double> survival, spec::VerifyTarget& target) {
+// The BlockDrafter of one arm: windows 1..max_rows, copy / chain / hybrid arms, the chain's wall seeds.
+inline spec::BlockConfig block_config(const SpecOptions& o, bool chain) {
     if (o.max_rows < 1U || o.max_rows > kMaxVerifyRows) throw std::invalid_argument("hy4 rows: spec max rows outside 1..8");
     spec::BlockConfig bc;
     bc.max_block = o.max_rows;
     bc.arbiter.windows.clear();
     for (std::uint32_t w = 1; w <= o.max_rows; ++w) bc.arbiter.windows.push_back(w);
-    bc.copy = o.copy || chain == nullptr;
-    bc.chain = chain != nullptr;
-    bc.hybrid = chain != nullptr && o.copy;
+    bc.copy = o.copy || !chain;
+    bc.chain = chain;
+    bc.hybrid = chain && o.copy;
     bc.chain_max_k = o.max_rows > 1U ? o.max_rows - 1U : 1U;
     bc.chain_seed_step_ms = o.chain_step_ms;
     bc.chain_seed_flush_ms = o.chain_flush_ms;
     bc.fixed_costs = !o.verify_ms.empty();
     spec::apply_probe_loss(bc.arbiter, spec::kFixedReprobeInterval);  // no [speculation.probe_loss] row in hy4-flash.toml
-    spec::BlockDrafter drafter(bc, chain);
-    for (std::uint32_t r = 1; r <= o.max_rows && r <= o.verify_ms.size(); ++r) drafter.seed_verify_ms(r, o.verify_ms[r - 1U]);
-    if (chain && !survival.empty()) drafter.seed_chain_survival(survival, o.survival_weight);
-    drafter.commit(prompt);
+    return bc;
+}
+inline void seed_arm(spec::BlockDrafter& d, const SpecOptions& o, bool chain, std::span<const double> survival) {
+    for (std::uint32_t r = 1; r <= o.max_rows && r <= o.verify_ms.size(); ++r) d.seed_verify_ms(r, o.verify_ms[r - 1U]);
+    if (chain && !survival.empty()) d.seed_chain_survival(survival, o.survival_weight);
+}
+// The decode loop over a speculator whose drafter(s) have seen the prompt and the anchor.
+template <class Fwd>
+SpecResult spec_loop(Fwd& f, std::uint32_t anchor, std::uint32_t n, const SpecOptions& o, spec::BlockSpeculator& sp) {
     SpecResult res;
     res.ids.push_back(anchor);
-    drafter.commit(std::span<const std::uint32_t>(res.ids.data(), 1));
-    spec::BlockSpeculator sp(drafter, target);
     sp.start(anchor);
     const auto t0 = std::chrono::steady_clock::now();
     bool more = !o.publish || o.publish(res.ids);
@@ -468,6 +526,47 @@ SpecResult spec_run(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t
     }
     res.wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (res.ids.size() > n) res.ids.resize(n);
+    return res;
+}
+// One speculative decode over `target` (the rows contract, with the chain's view when `chain` is set).
+template <class Fwd>
+SpecResult spec_run(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t anchor, std::uint32_t n, const SpecOptions& o,
+                    spec::ChainDrafter* chain, std::span<const double> survival, spec::VerifyTarget& target) {
+    spec::BlockDrafter drafter(block_config(o, chain != nullptr), chain);
+    seed_arm(drafter, o, chain != nullptr, survival);
+    drafter.commit(prompt);
+    drafter.commit(std::span<const std::uint32_t>(&anchor, 1));
+    spec::BlockSpeculator sp(drafter, target);
+    return spec_loop(f, anchor, n, o, sp);
+}
+// The per-regime selector over the two drafters: arm 0 = the next-token block (`mto`), arm 1 = DFly2 (`dfo`).
+// The DFly2 arm drafts only where its block has room (Forward::dfly_room: context and index-share budget); past it the
+// selector falls back to the next-token arm instead of the block refusing.
+template <class Fwd>
+SpecResult select_run(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t anchor, std::uint32_t n, const SpecOptions& mto,
+                      const SpecOptions& dfo, spec::ChainDrafter& mtp, spec::ChainDrafter& dfly, spec::VerifyTarget& target,
+                      const spec::ArmSelectorConfig& cfg) {
+    if (mto.max_rows != dfo.max_rows) throw std::invalid_argument("hy4 rows: selector arms with different max rows");
+    spec::BlockDrafter dm(block_config(mto, true), &mtp), dd(block_config(dfo, true), &dfly);
+    seed_arm(dm, mto, true, mto.chain_survival);
+    seed_arm(dd, dfo, true, dfo.chain_survival.empty() ? std::span<const double>(kDflySurvival) : std::span<const double>(dfo.chain_survival));
+    spec::ArmSelector sel(cfg);
+    sel.add(dm, "mtp");
+    // wins_ties: past the gate DFly2 won every measured regime (think +1.4 %, code +2.9 %, pair code +6.9 %; hy4_df2)
+    sel.add(dd, "dfly", kDflyProbeMinTokens, [&f](std::uint64_t context, std::uint32_t rows) { return f.dfly_room(context, rows); },
+            true);
+    sel.commit(prompt);
+    sel.commit(std::span<const std::uint32_t>(&anchor, 1));
+    spec::BlockSpeculator sp(sel, target);
+    auto res = spec_loop(f, anchor, n, mto, sp);
+    res.selector = true;
+    for (std::size_t a = 0; a < 2; ++a) {
+        const auto& st = sel.stats(a);
+        res.arms[a] = {st.passes, st.tokens, st.probes, st.probe_passes, st.wins, st.ms};
+    }
+    res.switches = sel.switches();
+    res.fallbacks = sel.fallbacks();
+    res.probe_ledger_ms = sel.probe_ledger_ms();
     return res;
 }
 }  // namespace detail
@@ -533,6 +632,41 @@ SpecResult spec_decode(Fwd& f, std::span<const std::uint32_t> prompt, std::uint3
     res.chain_calls = f.dfly_blocks() - blocks0;
     res.chain_drafts = ch.passes();
     res.chain_ms = f.dfly_ms() - ms0;
+    return res;
+}
+
+// Both drafters under the shared per-regime selector (spec::ArmSelector): an ArmsFeed installed before the prefill (one
+// prompt pass feeds both) and finished with the anchor. Arm 0 = the next-token block with `mto` (its chain survival, seeds,
+// draft_tp), arm 1 = DFly2 with `dfo` (its block seeds). The verify target is the chain arm's (it hands every pass's rows
+// to the next-token chain, which follows the stream while DFly2 drafts); ids are the plain ones whatever arm runs.
+// Pair: the next-token block keeps its draft rounds on both ranks (draft_tp), DFly2 runs on rank 0; rank 1 follows with
+// spec_follow(f, pair, mtp) (its chain gets every accept with the round messages). chain_calls / chain_ms: next-token
+// block calls and wall; dfly_calls / dfly_ms: DFly2 blocks and wall.
+template <class Fwd>
+SpecResult spec_decode(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t anchor, std::uint32_t n, const SpecOptions& mto,
+                       const SpecOptions& dfo, MtpSource<Fwd>& mtp, DflySource<Fwd>& dfly,
+                       const spec::pair_round::Exchange* pair = nullptr, const spec::ArmSelectorConfig& cfg = {}) {
+    auto& mc = mtp.chain();
+    auto& dc = dfly.chain();
+    ChainVerifyTarget<Fwd> target(f, mc);
+    const auto blocks0 = f.dfly_blocks();
+    const double dms0 = f.dfly_ms();
+    SpecResult res;
+    if (pair == nullptr) res = detail::select_run(f, prompt, anchor, n, mto, dfo, mc, dc, target, cfg);
+    else {
+        spec::pair_round::PairVerifyLeader lead(target, *pair, [&f] { return std::uint64_t{f.position()}; });
+        const NextnTp tp(f, mto.draft_tp);
+        res = detail::select_run(f, prompt, anchor, n, mto, dfo, mto.draft_tp ? lead.chain(mc) : mc, dc, lead, cfg);
+        lead.finish();
+    }
+    res.chain_calls = mc.calls();
+    res.chain_rows = mc.rows();
+    res.chain_drafts = mc.drafts();
+    res.chain_reads = mc.host_reads();
+    res.chain_ms = mc.draft_wall_ms();
+    res.dfly_calls = f.dfly_blocks() - blocks0;
+    res.dfly_ms = f.dfly_ms() - dms0;
+    res.verify_ms = target.verify_ms();
     return res;
 }
 

@@ -18,6 +18,10 @@ namespace strix::hy4 {
 // (strix/session/speculation_default.hpp: --no-mtp / STRIX_MTP=0 opt out). Measured faster on the record route
 // (strix-hy4-rows --mtp, 11-21, ids == plain): one node code 32.2 / prose 22.93 tok/s vs plain 17.9; TP pair code 47.24.
 // The layer split holds no whole model (no block on either stage): unavailable there.
+// The publisher's DFly2 block drafter shard (model.dfly_layers.*), looked for beside the pack's first part when the decode
+// speculates (spec::resolve_drafter_file: an explicit --dfly FILE wins, --dfly off refuses). Model data.
+inline constexpr const char* kDflySidecar = "official/model-00148-of-00148.safetensors";
+
 struct SpeculationRun {
     bool block_in_pack = false;          // GGUF <arch>.nextn_predict_layers > 0 (the block ships in the pack)
     bool whole_model = true;             // one node or a tensor-parallel rank (each holds the whole pack)
