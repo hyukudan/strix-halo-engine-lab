@@ -32,12 +32,13 @@ inline constexpr MoeRouteI8Layout moe_route_i8_layout(unsigned hidden,unsigned t
     const auto exponents=(n+1U)&~std::uint64_t{1},fallback=exponents+2U*g*top_k;
     return {n,g,exponents,fallback,fallback+2U*n};
 }
-// Only the DA16 certificate down kernel (and its matching ordered merge) writes/reads the one-byte plane. The tier split
-// and the LDS vector epilogue store BF16 words into the same rows, so with I8 the merge would decode BF16 bits as codes and
-// exponents (non-finite accumulation). I8 therefore declines both organisations; BF16 keeps them.
-struct MoeRouteOrganizations { bool tiers, lds_epilogue, declined; };
-inline constexpr MoeRouteOrganizations moe_route_organizations(bool i8,bool tiers,bool lds_epilogue) {
-    return {tiers&&!i8,lds_epilogue&&!i8,i8&&(tiers||lds_epilogue)};
+// Only the DA16 certificate down kernel (and its matching ordered merge) writes/reads the one-byte plane. Every other down
+// organisation of the certificate path stores BF16 words into the same rows: the tier split, the LDS vector epilogue and
+// the TILE64 down (bit 1 of STRIX_QPF2K_MOE_TILE64). With I8 the merge would decode BF16 bits as codes and exponents
+// (non-finite accumulation), so I8 declines all three; BF16 keeps them. The TILE64 gate/up writes no route words.
+struct MoeRouteOrganizations { bool tiers, lds_epilogue, tile64_down, declined; };
+inline constexpr MoeRouteOrganizations moe_route_organizations(bool i8,bool tiers,bool lds_epilogue,bool tile64_down) {
+    return {tiers&&!i8,lds_epilogue&&!i8,tile64_down&&!i8,i8&&(tiers||lds_epilogue||tile64_down)};
 }
 inline constexpr std::int16_t moe_route_i8_fallback=-32768;
 // RNE(127.5) is 128: the upper endpoint is strict. Zero groups canonically use E=0.

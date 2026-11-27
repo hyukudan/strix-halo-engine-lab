@@ -39,7 +39,7 @@ inline bool prefill_down_lds() {
 inline bool prefill_down_lds_admitted(const PrefillRows& rows) {
     // The scalar contract permits dword-aligned row views. Only vector-store
     // views may use the 16-byte epilogue; other views retain scalar stores.
-    return strix::moe_route_organizations(rows.route_i8,false,prefill_down_lds()).lds_epilogue&&reinterpret_cast<std::uintptr_t>(rows.rawdots.base)%16U==0U&&rows.rawdots.stride%16U==0U;
+    return strix::moe_route_organizations(rows.route_i8,false,prefill_down_lds(),false).lds_epilogue&&reinterpret_cast<std::uintptr_t>(rows.rawdots.base)%16U==0U&&rows.rawdots.stride%16U==0U;
 }
 template<auto Kernel> void prefill_tier_resources() {
     static const bool once=[] {

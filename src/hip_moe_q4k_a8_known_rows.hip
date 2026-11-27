@@ -2246,8 +2246,8 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
         if(tune==80U)resources.template operator()<80U>();
         else if(tune==82U)resources.template operator()<82U>();
         else resources.template operator()<88U>(); // BF16 admission above fixes the tune set.
-        if(strix::moe_route_organizations(true,prefill_tiers()!=0,prefill_down_lds()).declined) {
-            static const bool declined=[]{std::fprintf(stderr,"MoE route i8: tier split / down LDS epilogue declined (they store BF16 route words)\n");return true;}();
+        if(strix::moe_route_organizations(true,prefill_tiers()!=0,prefill_down_lds(),(prefill_tile64()&2U)!=0U).declined) {
+            static const bool declined=[]{std::fprintf(stderr,"MoE route i8: tier split / down LDS epilogue / down TILE64 declined (they store BF16 route words)\n");return true;}();
             (void)declined;
         }
         static const bool witness=[]{std::fprintf(stderr,"MoE FAST lever route i8: ON (bit-changing; STRIX_PREFILL_MOE_ROUTE_I8=0 restores route bf16)\n");return true;}();
@@ -2537,7 +2537,7 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                     prefill_da16_mark(0U,stream);
                     hip_check(hipMemsetAsync(arrive,0,static_cast<std::size_t>(batches)*sizeof(unsigned),stream),"qpf2k DA16 counters clear");
                     // Tunes 80/88 already have 64-row CTAs; retain their launch path.
-                    if constexpr(Tune==82U) if(strix::moe_route_organizations(rows.route_i8,prefill_tiers()!=0,false).tiers) {
+                    if constexpr(Tune==82U) if(strix::moe_route_organizations(rows.route_i8,prefill_tiers()!=0,false,false).tiers) {
                         if(prefill_tile64()) {
                             static const bool declined=[] {
                                 std::fprintf(stderr,"qpf2k moe tile64 declined: tier organization active\n");return true;
@@ -2568,7 +2568,10 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                     // TILE64 (bit 0 gate/up, bit 1 down) is default OFF until node timing, admitted only for the 128-row DA16 tune.
                     // Q5_K gate/up always retains its incumbent specialization.
                     // Keep individually qualified organizations independent until joint native gates exist.
-                    const unsigned requested_tile64=Tune==82U&&!q20&&(down_type==7U||down_type==8U)?prefill_tile64():0U;
+                    const unsigned asked_tile64=Tune==82U&&!q20&&(down_type==7U||down_type==8U)?prefill_tile64():0U;
+                    // Route I8: the TILE64 down stores BF16 route words (declined with the route I8 notice); gate/up stays.
+                    const unsigned requested_tile64=strix::moe_route_organizations(rows.route_i8,false,false,(asked_tile64&2U)!=0U).tile64_down
+                        ?asked_tile64:(asked_tile64&~2U);
                     const unsigned tile64=prefill_down_lds_admitted(rows)?0U:requested_tile64;
                     if(requested_tile64&&!tile64) {
                         static const bool declined=[] {

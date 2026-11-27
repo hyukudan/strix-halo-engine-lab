@@ -4063,12 +4063,15 @@ int main(int argc, char** arguments) {
             expect(moe_route_bf16_bits(bits)==expected,"route BF16 RNE / nonfinite / denormal bits");
     }
     {
-        // A2: route I8 must decline the tier split and the LDS epilogue (they write BF16 words the I8 merge cannot read).
-        for (const bool tiers : {false,true}) for (const bool lds : {false,true}) {
-            const auto i8=moe_route_organizations(true,tiers,lds);
-            const auto bf=moe_route_organizations(false,tiers,lds);
-            expect(!i8.tiers && !i8.lds_epilogue && i8.declined==(tiers||lds),"route I8 declines tiers and LDS epilogue");
-            expect(bf.tiers==tiers && bf.lds_epilogue==lds && !bf.declined,"route BF16 keeps tiers and LDS epilogue");
+        // A2: route I8 must decline every down organisation that writes BF16 route words the I8 merge cannot read: the tier
+        // split, the LDS epilogue and the TILE64 down.
+        for (const bool tiers : {false,true}) for (const bool lds : {false,true}) for (const bool t64 : {false,true}) {
+            const auto i8=moe_route_organizations(true,tiers,lds,t64);
+            const auto bf=moe_route_organizations(false,tiers,lds,t64);
+            expect(!i8.tiers && !i8.lds_epilogue && !i8.tile64_down && i8.declined==(tiers||lds||t64),
+                "route I8 declines tiers, LDS epilogue and TILE64 down");
+            expect(bf.tiers==tiers && bf.lds_epilogue==lds && bf.tile64_down==t64 && !bf.declined,
+                "route BF16 keeps tiers, LDS epilogue and TILE64 down");
         }
     }
     {
