@@ -24,6 +24,7 @@
 #include <vector>
 
 #if defined(__HIPCC__)
+#include "core/controller_block_rows.hpp"
 #include "inkling2_mini_attention_hip.hpp"
 #include "inkling2_mini_attention_prepare_hip.hpp"
 #include "inkling2_mini_moe_hip.hpp"
@@ -690,6 +691,20 @@ public:
             stream_);
         if (status == hipErrorNotSupported) return false;
         check(status);
+        return true;
+    }
+#endif
+
+#if defined(__HIPCC__)
+    // The whole low-rank controller (readout or given message, operand norms, down, gates, controller, final norm) as one
+    // block-per-row launch for the row counts the shared plan prefers it at (controller_block::preferred: 9..16 decode,
+    // verify and cohort rows; STRIX_RESIDUAL_CONTROLLER_FUSED=0 keeps the launches); false = the caller keeps the
+    // launches. Same bits either way.
+    bool fused_controller(core::controller_block::Args args) {
+        if (!controller_fused_ || !core::controller_block::preferred(args.rows)) return false;
+        args.norm_epsilon = kMiniHipRmsEpsilon;
+        if (!core::controller_block::admits(args)) return false;
+        check(core::controller_block::enqueue(args, stream_));
         return true;
     }
 #endif
@@ -1525,6 +1540,8 @@ private:
     // Fused decode transitions (HIP), read once: the residual bank batch of each pass's controller messages
     // (STRIX_RESIDUAL_BANK_BATCH=0 keeps one readout per controller) and the MoE tail (STRIX_MOE_TAIL=0).
     bool bank_batch_ = env_flag_default_on("STRIX_RESIDUAL_BANK_BATCH");
+    // The block-per-row controller launch (STRIX_RESIDUAL_CONTROLLER_FUSED=0 keeps the six launches).
+    bool controller_fused_ = env_flag_default_on("STRIX_RESIDUAL_CONTROLLER_FUSED");
     bool moe_tail_ = mini_moe_tail_switch();
     // The bank whose message rows the last batch produced (the controller scratch after one controller row).
     std::array<const float*, 2> batched_bank_{};
