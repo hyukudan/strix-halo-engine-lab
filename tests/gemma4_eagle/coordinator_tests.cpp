@@ -26,9 +26,12 @@ struct State final : en::StreamState {
     // MTP sessions need a KV view to draft; the scripted MTP drafter below never reads it (eagle sessions ignore it).
     bool kv_view(std::uint32_t, const KvTxn*, KvView& out) const override { out = {}; return true; }
     std::vector<std::pair<std::uint32_t, std::uint32_t>>* binds = nullptr; // (prompt tokens, lanes) of bind_request
+    std::string form; // the band rule of the server: the INT8 KV form for one live request, exact otherwise
     void bind_request(std::uint32_t prompt_tokens, std::uint32_t lanes) override {
         if (binds) binds->emplace_back(prompt_tokens, lanes);
+        if (binds) form = lanes == 1 ? "g4-dattn-f2" : "exact";
     }
+    std::string decode_attention() const override { return form; }
 };
 struct Backend final : en::Backend {
     MockTarget target;
@@ -204,6 +207,14 @@ int main() {
             EAGLE_CHECK(bound.binds.size() == 2 && bound.binds[0] == std::make_pair(5U, 1U) &&
                         bound.binds[1] == std::make_pair(9U, 2U), "bind_request: prompt length and live lanes per admitted stream");
             two.run();
+            // Each receipt names the decode attention form its request ran (the KV precision is never silent).
+            const auto form_of = [&](std::size_t slot) {
+                const auto receipt = two.receipt(slot);
+                const auto* f = receipt.find("decode_attention");
+                return f ? f->as_string() : std::string("(absent)");
+            };
+            EAGLE_CHECK(form_of(0) == "g4-dattn-f2" && form_of(1) == "exact",
+                        "receipt: per-request decode attention form, got %s / %s", form_of(0).c_str(), form_of(1).c_str());
             en::Request later;
             later.prompt.assign(6, 7);
             later.max_tokens = 2;

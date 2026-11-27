@@ -34,6 +34,12 @@ public:
     void bind_request(std::uint32_t prompt_tokens, std::uint32_t lanes) override {
         if (bands_ && *bands_) state_.bind_decode_attention((*bands_)(prompt_tokens,admitted_,lanes));
     }
+    std::string decode_attention() const override {
+        if (!bands_ || !*bands_ || state_.decode_attention() < 0) return {};
+        const auto form = state_.decode_attention();
+        return gpu::fast_decode_attention_name(form == 2 ? gpu::MirrorFormat::kv8 : form == 1 ? gpu::MirrorFormat::f16
+                                                                                              : gpu::MirrorFormat::none);
+    }
     std::unique_ptr<KvTxn> begin() override { return state_.begin(); }
     std::uint64_t frontier() const override { return state_.frontier(); }
     std::string digest() const override { return state_.digest(); }

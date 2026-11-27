@@ -333,6 +333,7 @@ std::size_t Coordinator::submit_at(std::size_t slot, Request r, std::shared_ptr<
         return other.get() != (slot < slots_.size() ? slots_[slot].get() : nullptr) && other->out.status == Status::running;
     }));
     s->state->bind_request(std::uint32_t(prompt.size()), lanes);
+    s->out.decode_attention = s->state->decode_attention();
     s->generation = ++generation_;
     require(bool(s->state) && s->state->frontier() == (prefix ? prefix->tokens.size() : 0), "backend must provide a fresh stream");
     if (!prefix) s->out.digest = s->state->digest();
@@ -354,6 +355,7 @@ std::size_t Coordinator::submit_at(std::size_t slot, Request r, std::shared_ptr<
             s->draft.reset();
             s->state = backend_.create_stream(admitted);
             s->state->bind_request(std::uint32_t(prompt.size()), lanes);
+            s->out.decode_attention = s->state->decode_attention();
             if (s->dflash_enabled && s->request.dflash != DraftMode::off && drafts_ && s->request.sampling.temperature == 0)
                 s->draft = drafts_();
             if (s->draft) s->draft->attach(*s->state);
@@ -1120,6 +1122,8 @@ Json Coordinator::receipt(std::size_t slot) const {
     const auto& s = *slots_.at(slot); const auto& r = s.out;
     Json j = effective_config(backend_,s.request,bool(drafts_),r.peak_streams), acceptance = Json::object(), timings = Json::object();
     j.set("rng_draws",r.rng_draws);
+    // A per-request decode attention form (TURBO band rows) is named in the receipt of each request.
+    if (!r.decode_attention.empty()) j.set("decode_attention",r.decode_attention);
     auto switches = Json(j.find("off_switches")->as_object());
     switches.set("STRIX_G4_DFLASH",s.dflash_enabled);
     j.set("off_switches",switches); j.set("finish_reason",status_name(r.status)); j.set("frontier",r.frontier);
