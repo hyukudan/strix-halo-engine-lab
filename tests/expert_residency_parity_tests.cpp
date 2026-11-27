@@ -44,7 +44,9 @@ CliOptions bench_tail(const std::vector<std::string>& args) {
     if (stop != args.size()) throw std::invalid_argument("unknown option " + args[stop]);
     return out;
 }
-bool same(const Options& a, const Options& b) { return a.mode == b.mode && a.vram_budget == b.vram_budget; }
+bool same(const Options& a, const Options& b) {
+    return a.mode == b.mode && a.vram_budget == b.vram_budget && a.promotion_budget_bytes == b.promotion_budget_bytes;
+}
 bool throws(const std::vector<std::string>& args) {
     try { (void)serve_loop(args); } catch (const std::invalid_argument&) {
         try { (void)bench_tail(args); } catch (const std::invalid_argument&) { return true; }
@@ -56,6 +58,7 @@ bool throws(const std::vector<std::string>& args) {
 int main() {
     set_env("STRIX_EXPERT_RESIDENCY", "");
     set_env("STRIX_VRAM_BUDGET_GIB", "");
+    set_env("STRIX_EXPERT_PROMOTION_MIB", "");
     for (const char* mode : {"full", "tiered"}) {
         set_env("STRIX_EXPERT_RESIDENCY", mode);
         REQUIRE(finish_cli(serve_loop({"--expert-residency", "auto"})).mode == Mode::automatic);
@@ -64,7 +67,8 @@ int main() {
     set_env("STRIX_EXPERT_RESIDENCY", "");
     const std::vector<std::vector<std::string>> cases = {
         {}, {"--expert-residency", "full"}, {"--expert-residency", "tiered", "--vram-budget-gib", "12"},
-        {"--vram-budget-gib", "7.5"}, {"--expert-residency", "auto", "--vram-budget-gib", "24"}, {"--print-effective-config"}};
+        {"--vram-budget-gib", "7.5"}, {"--expert-residency", "auto", "--vram-budget-gib", "24"},
+        {"--expert-promotion-mib", "0"}, {"--expert-promotion-mib", "8", "--print-effective-config"}};
     for (const auto& args : cases) {
         const auto s = serve_loop(args), b = bench_tail(args);
         REQUIRE(same(finish_cli(s), finish_cli(b)));
@@ -81,23 +85,33 @@ int main() {
     // environment fills what the flags left; flags win
     set_env("STRIX_EXPERT_RESIDENCY", "tiered");
     set_env("STRIX_VRAM_BUDGET_GIB", "16");
+    set_env("STRIX_EXPERT_PROMOTION_MIB", "16");
     {
         const auto s = serve_loop({}), b = bench_tail({});
         REQUIRE(same(finish_cli(s), finish_cli(b)));
         REQUIRE(finish_cli(s).mode == Mode::tiered && finish_cli(s).vram_budget == 16ull << 30);
+        REQUIRE(finish_cli(s).promotion_budget_bytes == 16ull << 20);
         const auto f = serve_loop({"--expert-residency", "full", "--vram-budget-gib", "9"});
         const auto g = bench_tail({"--expert-residency", "full", "--vram-budget-gib", "9"});
         REQUIRE(same(finish_cli(f), finish_cli(g)));
         REQUIRE(finish_cli(f).mode == Mode::full && finish_cli(f).vram_budget == 9ull << 30);
+        const auto seed_serve = serve_loop({"--port", "8090", "--expert-promotion-mib", "0"});
+        const auto seed_bench = bench_tail({"--expert-promotion-mib", "0"});
+        REQUIRE(same(finish_cli(seed_serve), finish_cli(seed_bench)));
+        REQUIRE(finish_cli(seed_serve).promotion_budget_bytes == 0);
     }
     set_env("STRIX_EXPERT_RESIDENCY", "");
     set_env("STRIX_VRAM_BUDGET_GIB", "");
+    set_env("STRIX_EXPERT_PROMOTION_MIB", "");
     // the same malformed input is refused by both
     REQUIRE(throws({"--expert-residency", "banana"}));
     REQUIRE(throws({"--vram-budget-gib", "0"}));
     REQUIRE(throws({"--vram-budget-gib", "-3"}));
     REQUIRE(throws({"--vram-budget-gib", "lots"}));
     REQUIRE(throws({"--expert-residency"}));
+    REQUIRE(throws({"--expert-promotion-mib"}));
+    REQUIRE(throws({"--expert-promotion-mib", "-1"}));
+    REQUIRE(throws({"--expert-promotion-mib", "17592186044416"}));
     REQUIRE(throws({"--no-such-flag"}));
     if (failures) { std::cerr << failures << " failure(s)\n"; return 1; }
     std::cout << "expert residency parity tests passed\n";

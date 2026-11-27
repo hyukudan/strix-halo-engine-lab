@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 using namespace strix::residency;
@@ -124,6 +125,24 @@ void test_resolve() {
         Decision d3 = resolve(o, m, {96 * GiB, 96 * GiB}, sessions(), {110 * GiB});
         REQUIRE(d3.ok);
     }
+    {
+        Options o;
+        o.promotion_budget_bytes = 0;
+        const CardBytes card{96 * GiB, 96 * GiB};
+        const auto full = resolve(o, m, card, sessions(), big_host());
+        REQUIRE(full.ok && full.mode == Mode::full);
+        REQUIRE(has(decision_json(full), "\"expert_promotion_budget_active\":false"));
+        o.vram_budget = 12 * GiB;
+        const auto tiered = resolve(o, m, card, sessions(), big_host());
+        REQUIRE(tiered.ok && tiered.mode == Mode::tiered);
+        REQUIRE(has(decision_json(tiered), "\"expert_promotion_budget_bytes\":0"));
+        REQUIRE(has(decision_json(tiered), "\"expert_promotion_budget_active\":true"));
+        const auto declined = resolve(o, m, card, sessions(), {60 * GiB});
+        REQUIRE(!declined.ok && declined.mode == Mode::tiered);
+        REQUIRE(has(decision_json(declined), "\"expert_promotion_budget_active\":false"));
+        o.promotion_budget_bytes.reset();
+        REQUIRE(!has(decision_json(resolve(o, m, card, sessions(), big_host())), "expert_promotion_budget"));
+    }
     {  // json carries every field
         Options o;
         o.vram_budget = 12 * GiB;
@@ -137,7 +156,8 @@ void test_resolve() {
         // Intel Clang treats char as signed: JSON must escape controls while preserving UTF-8 bytes.
         d.reason = std::string("q\"\\\n") + "\xC3\xA9";
         const std::string escaped = decision_json(d);
-        REQUIRE(has(escaped, R"("reason":"q\"\\\n)"));
+        constexpr auto escaped_reason = R"("reason":"q\"\\\n)";
+        REQUIRE(has(escaped, escaped_reason));
         REQUIRE(has(escaped, "\xC3\xA9"));
     }
     {  // device profile cap (route_budget) is a residency input: same plan as the equal explicit budget, smaller cap wins
@@ -219,6 +239,11 @@ void test_flags() {
     REQUIRE(rejects({"--vram-budget-gib", "abc"}));
     REQUIRE(rejects({"--vram-budget-gib", "8x"}));
     REQUIRE(rejects({"--expert-residency", "some"}));
+    REQUIRE(parse({"--expert-promotion-mib", "0"}).promotion_budget_bytes == 0);
+    REQUIRE(parse({"--expert-promotion-mib", "17592186044415"}).promotion_budget_bytes ==
+            (std::numeric_limits<std::uint64_t>::max() >> 20) << 20);
+    for (const auto* value : {"", "-1", "2.5", "3m", "17592186044416", "18446744073709551616"})
+        REQUIRE(rejects({"--expert-promotion-mib", value}));
     Options unused;
     REQUIRE(!parse_flag("--other", [] { return std::string(); }, unused));
 
@@ -367,12 +392,57 @@ void test_planner() {
             REQUIRE(has(j, k));
     }
 }
+
+void test_explicit_promotion_budget() {
+    constexpr std::uint64_t MiB = 1ull << 20;
+    auto model = small_model(3);
+    model.expert_bytes = {65 * MiB, 2 * MiB, MiB};
+    PlannerConfig config;
+    Planner legacy(model, 2, config);
+    config.promotion_budget_bytes = 3 * MiB;
+    Planner capped(model, 2, config);
+    step(legacy, 3, {4, 5});
+    step(capped, 3, {4, 5});
+    const auto old_moves = legacy.plan();
+    REQUIRE(old_moves.size() == 1 && old_moves.front().layer == 0);
+    REQUIRE(!has(receipt_json(legacy.receipt()), "expert_promotion_budget"));
+    const auto moves = capped.plan();
+    REQUIRE(moves.size() == 2);
+    std::uint64_t copied_bytes = 0;
+    for (const auto& move : moves) {
+        REQUIRE(move.layer != 0);
+        REQUIRE(capped.table(move.layer)[move.expert] == -1);
+        copied_bytes += model.expert_bytes[move.layer];
+        capped.commit(move);
+        REQUIRE(capped.table(move.layer)[move.expert] == static_cast<std::int32_t>(move.slot));
+    }
+    REQUIRE(copied_bytes == 3 * MiB);
+    REQUIRE(capped.receipt().promoted_bytes == copied_bytes);
+    REQUIRE(has(receipt_json(capped.receipt()), "\"expert_promotion_budget_bytes\":3145728"));
+
+    config.promotion_budget_bytes = 0;
+    Planner seed_only(model, 1, config);
+    std::uint32_t counts[16] = {};
+    counts[4] = 30;
+    for (std::uint32_t layer = 0; layer < 3; ++layer) seed_only.seed(layer, counts);
+    seed_only.fill_from_seed();
+    for (int i = 0; i < 40; ++i) {
+        step(seed_only, 3, {5});
+        REQUIRE(seed_only.plan().empty());
+    }
+    for (std::uint32_t layer = 0; layer < 3; ++layer) REQUIRE(seed_only.table(layer)[4] == 0);
+    const auto receipt = seed_only.receipt();
+    REQUIRE(receipt.steps == 40 && receipt.active_bytes == 40 * 68 * MiB && receipt.hit_bytes == 0);
+    REQUIRE(receipt.promotions == 0 && receipt.resident_bytes == 68 * MiB);
+    REQUIRE(has(receipt_json(receipt), "\"expert_promotion_budget_bytes\":0"));
+}
 }  // namespace
 
 int main() try {
     test_resolve();
     test_flags();
     test_planner();
+    test_explicit_promotion_budget();
     if (failures) {
         std::cerr << failures << " residency check(s) failed\n";
         return 1;

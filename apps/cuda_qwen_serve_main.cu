@@ -10,7 +10,7 @@
 //       [--mtp-depth 7] [--min-p P (default 0.7, in [0,1])] [--max-queue 64] [--http-slots 4] [--prefill-chunk 1024|auto] [--prefill-overlap-rows 1024]
 //       [--admit-grace-ms 2] [--cohort-depth fair|max] [--slot-margin-mib 2048] [--block-rows N] [--mtp-defer-prompt on|off]
 //       [--http-anthropic-thinking-budget enforce|note]
-//       [--expert-residency auto|full|tiered] [--vram-budget-gib N] [--print-effective-config]
+//       [--expert-residency auto|full|tiered] [--vram-budget-gib N] [--expert-promotion-mib N] [--print-effective-config]
 //       [--prefix-cache on|off] [--prefix-cache-block 256] [--prefix-cache-stride 16384] [--prefix-cache-root on|off]
 //       [--prefix-cache-host-mb N] [--prefix-cache-vram-mb 0]
 // Context cap: --max-positions P is the largest session (KV/index/pooled + MTP cache, 31,616 B per position + 233 MB).
@@ -242,7 +242,7 @@ Options parse(int argc, char** argv) {
             if (v != "enforce" && v != "note") throw std::invalid_argument("--http-anthropic-thinking-budget requires enforce|note");
             o.anthropic_thinking_budget_enforce = v == "enforce";
         }
-        else if (strix::residency::consume_cli_arg(a, next, residency_cli)) {}  // --expert-residency, --vram-budget-gib, --print-effective-config
+        else if (strix::residency::consume_cli_arg(a, next, residency_cli)) {}
         else if (a == "--slot-margin-mib") o.slot_margin_mib = static_cast<std::uint32_t>(std::stoul(next()));
         else throw std::invalid_argument("unknown option " + a);
     }
