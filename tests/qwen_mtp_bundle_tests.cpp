@@ -439,24 +439,22 @@ int main(int argc,char** argv) try {
     const MtpBundleSetupRetry identity_test_state;
     detail::prefill_identity_override()={};
     env("STRIX_PREFILL_EXACT_FP16","");env("STRIX_PREFILL_HC_OUTPUT_WMMA","1");
+    // This block checks the retry's identity bookkeeping (override, runtime mask, receipt), so it names EXACT: no --profile
+    // is the FAST preset, whose rows the app exports to the process environment before the runtime mask is read, which
+    // this harness does not do.
+    auto identity_base=base;identity_base.insert(identity_base.end(),{"--profile","exact"});
     const auto resolve_identity=[&](const Options& options) {
         return resolve_effective_config({options,requested_prefill_environment()},model,{}, {},"",{},{});
     };
     const auto fresh_serial=[&] {
         YarnBundleSerialRetry retry;
-        return resolve_identity(parse(base));
+        return resolve_identity(parse(identity_base));
     }();
-    // No --profile resolves the FAST preset: the serial retry keeps its prefill rows, READY plus the FAST GDN chunk row
-    // the preset applies to this in-band prompt.
-    const auto* gdn_row=fresh_serial.options.product_profile.find("gdn_fp16_chunk");
-    const unsigned fast_rows=gdn_row && strix::profile::applied(gdn_row->status) && gdn_row->value=="1"
-        ? 1U<<static_cast<unsigned>(PrefillOption::gdn_fp16_chunk) : 0U;
-    require(fresh_serial.prefill_option_mask==(kPrefillOptionsReady|fast_rows),
-        "fresh serial retains the default (FAST preset) prefill arithmetic");
+    require(fresh_serial.prefill_option_mask==kPrefillOptionsReady,"fresh serial retains READY arithmetic");
     for(const auto* failure:{"admission refusal","preflight failure","bridge setup failure","golden dump failure"}) {
         env("STRIX_PREFILL_PIPE","0");env("STRIX_QSA_SCORE_RING_ROWS","");
         MtpBundleSetupRetry state;state.selected=true;
-        auto attempt=parse(base);
+        auto attempt=parse(identity_base);
         require(attempt.mtp.enabled,"automatic YaRN bundle selected before setup");
         set_prefill_identity_override(attempt.prefill_exact_fp16,attempt.prefill_disabled);
         const auto resolved=resolve_identity(attempt);
@@ -473,8 +471,8 @@ int main(int argc,char** argv) try {
             ++attempts;
             require(std::string(std::getenv("STRIX_PREFILL_PIPE"))=="0" && !std::getenv("STRIX_QSA_SCORE_RING_ROWS"),"retry restores requested environment");
             require(qpf2k::defaulted_items==previous_defaulted,"retry restores default provenance");
-            require(!parse(base).mtp.enabled,"bundle failure retries serial even with adjacent bundle");
-            const auto serial_config=resolve_identity(parse(base));
+            require(!parse(identity_base).mtp.enabled,"bundle failure retries serial even with adjacent bundle");
+            const auto serial_config=resolve_identity(parse(identity_base));
             set_prefill_identity_override(serial_config.options.prefill_exact_fp16,serial_config.options.prefill_disabled);
             require(detail::prefill_identity_override().disabled==fresh_serial.options.prefill_disabled &&
                 detail::prefill_identity_override().exact==fresh_serial.options.prefill_exact_fp16 &&
