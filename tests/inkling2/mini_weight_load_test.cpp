@@ -526,6 +526,24 @@ void test_capacity_and_pack_fallback() {
     };
     std::filesystem::remove(path);
     run([] { return 16U; }, "cannot open low-bit pack", 0U);
+    mini::MiniWeightOptions explicit_arm;
+    require(mini::parse_mini_weight_option(explicit_arm, "--qualify-decode-weights",
+                [] { return "weights.head.q4_g64@1"; }, true),
+            "parse explicit decode qualification");
+    const auto require_pack_refusal = [&](const std::string& supplied, std::string_view reason) {
+        auto plan = mini::resolve_mini_resident_weight_load(profile::Name::turbo, explicit_arm, scope, extent);
+        bool loaded = false, refused = false;
+        std::ostringstream receipt;
+        try {
+            static_cast<void>(mini::load_mini_weight_pack(plan, profile::Name::turbo, explicit_arm, scope, extent,
+                supplied, nullptr, receipt, [&](const mini::MiniLowBitRows&) { loaded = true; return 0U; }));
+        } catch (const std::runtime_error& error) {
+            refused = std::string_view(error.what()).find(reason) != std::string_view::npos;
+        }
+        require(refused && !loaded && receipt.str().empty(), "explicit qualification refuses the fallback");
+    };
+    require_pack_refusal({}, "requires STRIX_LOWBIT_PACK");
+    require_pack_refusal(path.string(), "cannot open low-bit pack");
     require(static_cast<bool>(weight::LowbitPackWriter(checkpoint).write(path.string())), "write test pack");
     run([] { return mini::mini_weight_slot_capacity(400, 1000, 800, 0, 10, 16, true); }, nullptr, 1U);
     run([] { return mini::mini_weight_slot_capacity(350, 1000, 800, 0, 10, 16, true); },

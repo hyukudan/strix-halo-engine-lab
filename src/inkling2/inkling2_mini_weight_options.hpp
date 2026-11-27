@@ -34,6 +34,7 @@ struct MiniWeightOptions {
     // The shared policy of an explicit qualification arm (--qualify-weights KEY); nullptr: none.
     const weight::WeightLoadPolicy* qualify{};
     bool qualify_decode_only{};
+    bool require_decode_pack{};  // explicit --qualify-decode-weights, never a profile default
     bool lowbit_turbo{};  // resolved from the shared profile lever
 };
 
@@ -221,10 +222,12 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
         options.tier.cli.emplace_back(std::string(spec::kBlockDraftLeverName), value());
     } else if (native && argument == "--qualify-q8") {
         options.qualify_decode_only = false;
+        options.require_decode_pack = false;
         options.qualify_q8 = true;
         options.qualify = &weight::kAttentionHeadQ8Policy;
     } else if (native && (argument == "--qualify-weights" || argument == "--qualify-decode-weights")) {
         options.qualify_decode_only = argument == "--qualify-decode-weights";
+        options.require_decode_pack = options.qualify_decode_only;
         const std::string_view key(value());
         options.qualify = weight::find_weight_load_policy(key, kMiniQualifiablePolicies);
         const bool strixpack = options.qualify && weight::is_strixpack_storage(options.qualify->target);
@@ -811,6 +814,7 @@ inline weight::WeightLoadPlan mini_plain_weight_fallback(profile::Name tier, con
     incumbent.qualify = nullptr;
     incumbent.qualify_q8 = false;
     incumbent.qualify_decode_only = false;
+    incumbent.require_decode_pack = false;
     incumbent.lowbit_turbo = false;
     auto plan = resolve_mini_resident_weight_load(tier, incumbent, scope, extent);
     plan.reason = reason;
@@ -833,8 +837,8 @@ inline std::uint32_t mini_weight_slot_capacity(std::uint64_t free, std::uint64_t
     return slots;
 }
 
-// Keep the admitted handle through staging and verification. Destroy any failed image before
-// rebuilding the incumbent, and publish the fallback plan with the weights that actually loaded.
+// Keep the admitted handle through staging and verification. For profile-selected weights, destroy any failed
+// image before rebuilding the incumbent, and publish the fallback plan with the weights that actually loaded.
 template <class Load>
 auto load_mini_weight_pack(weight::WeightLoadPlan& plan, profile::Name tier, const MiniWeightOptions& options,
                            const weight::WeightLoadScope& incumbent_scope, weight::WeightLoadExtent extent,
@@ -849,6 +853,7 @@ auto load_mini_weight_pack(weight::WeightLoadPlan& plan, profile::Name tier, con
         if (const auto checked = rows.admitted->verify_identity(); !checked) throw std::runtime_error(checked.detail);
         return loaded;
     } catch (const std::runtime_error& error) {
+        if (options.require_decode_pack) throw;
         if (options.qualify == &kMiniSp4HeadPolicy)
             (void)profile::all_on::engaged("STRIX_INK_LOWBIT_HEAD", false,
                                            "no calibrated pack was admitted; incumbent weights", receipt);
