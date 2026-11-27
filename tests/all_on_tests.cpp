@@ -109,7 +109,7 @@ void fixture_tests() {
                 "lever f_pass source=all-on\n"
                 "lever f_pend source=all-on gate=pending reason=quality: KL 0.01\n"
                 "lever f_fail source=all-on gate=FAIL reason=quality: turbo limits pass\n"
-                "lever t_only source=all-on reason=quality: dNLL +0.005\n"
+                "lever t_only source=all-on gate=none reason=quality: dNLL +0.005\n"
                 "lever t_default source=default\n"
                 "lever kv_fp8 source=default\n"
                 "lever unk source=refused reason=unclassified: no receipt\n"
@@ -269,6 +269,17 @@ void explicit_catalogue_tests(const std::filesystem::path& root) {
                     std::string::npos &&
                 ink.find("lever ink_lowbit_folded_scale source=explicit reason=explicit setting kept\n") != std::string::npos,
             "an explicit later peer refuses the earlier incompatible lever: got\n" + ink);
+    // An explicit value equal to the switch's incumbent (the default low-bit scale named by its own word) is an
+    // explicit off: it neither runs the lever nor refuses its incompatible peer.
+    const auto incumbent = run("inkling2-mini", ao::Tier::turbo, only("STRIX_LOWBIT_FOLDED_SCALE", "f16_group_scale"));
+    require(incumbent.find("lever ink_lowbit_folded_scale source=explicit reason=explicit setting kept: off\n") !=
+                    std::string::npos &&
+                incumbent.find("lever ink_lowbit_rows_select source=all-on") != std::string::npos,
+            "an explicit incumbent value is off and leaves the incompatible peer on: got\n" + incumbent);
+    // An ungated TURBO lever says so on its all-on line.
+    const auto turbo = run("inkling2-mini", ao::Tier::turbo, {});
+    require(turbo.find("lever ink_lowbit_head_sp4t source=all-on gate=none") != std::string::npos,
+            "an ungated TURBO lever prints gate=none: got\n" + turbo);
 }
 
 void binding_tests(const std::filesystem::path& root) {

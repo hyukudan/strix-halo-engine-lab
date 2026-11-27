@@ -46,6 +46,9 @@ struct Lever {
     Phase phase = Phase::any;
     std::optional<std::pair<std::uint64_t, std::uint64_t>> tokens;   // prompt / context band, inclusive
     std::string env, value;                       // one environment switch ...
+    // Explicit values of `env` that keep the incumbent (catalogue "off"; default {"0"}): such a value is an explicit
+    // off, not an explicit on, wherever it is set (e.g. the default low-bit scale named by its own word).
+    std::vector<std::string> off_values;
     std::vector<std::string> args;                // ... or engine arguments
     std::vector<std::string> incompatible_with, requires_levers, default_tiers;
     std::string quality, reason;

@@ -45,6 +45,9 @@ def build() -> str:
             raise SystemExit(f"{name}: a classified lever needs exactly one of env and args")
         if item.get("identity", "pending") != "pending" or (item.get("identity") and item["class"] != "exact"):
             raise SystemExit(f"{name}: identity may only be pending, on an exact lever")
+        off = item.get("off", ["0"])
+        if not isinstance(off, list) or not all(isinstance(v, str) and v for v in off) or item.get("value") in off:
+            raise SystemExit(f"{name}: off must list the incumbent values of its switch, not its all-on value")
         out.append({"row": row["name"], **item})
     for item in out:
         for other in item.get("incompatible_with", []) + item.get("requires", []):

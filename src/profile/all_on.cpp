@@ -131,6 +131,10 @@ std::vector<Lever> parse_catalogue(std::string_view json) {
         }
         lever.env = text_or_empty(row, "env");
         lever.value = text_or_empty(row, "value");
+        lever.off_values = strings(row, "off");
+        if (lever.off_values.empty()) lever.off_values = {"0"};
+        if (contains(lever.off_values, lever.value))
+            throw std::invalid_argument("all_on catalogue: " + lever.name + ": its value is one of its off values");
         lever.args = strings(row, "args");
         lever.incompatible_with = strings(row, "incompatible_with");
         lever.requires_levers = strings(row, "requires");
@@ -228,7 +232,7 @@ Plan resolve(std::span<const Lever> levers, const Query& query) {
         } else if (contains(lever.default_tiers, tier_word(query.tier))) {
             slot.state = State::def;
         } else if (const auto value = query.env_value && !lever.env.empty() ? query.env_value(lever.env) : std::nullopt) {
-            const bool off = *value == "0";
+            const bool off = contains(lever.off_values, *value);
             slot.state = off ? State::explicit_off : State::explicit_on;
             slot.reason = off ? "explicit setting kept: off" : "explicit setting kept";
         } else if (lever.cls == Class::fast && lever.gate != Gate::pass && query.tier == Tier::fast) {
@@ -237,8 +241,8 @@ Plan resolve(std::span<const Lever> levers, const Query& query) {
         } else {
             slot.state = State::all_on;
             if (lever.identity_pending) slot.marks += " identity=pending";
-            // A lever that needs more than FAST says its gate and its quality.
-            if (query.tier == Tier::turbo && lever.cls == Class::fast && lever.gate != Gate::pass)
+            // A lever that needs more than FAST says its gate (none for an ungated TURBO lever) and its quality.
+            if (query.tier == Tier::turbo && (lever.cls == Class::fast || lever.cls == Class::turbo) && lever.gate != Gate::pass)
                 slot.marks += " gate=" + std::string(gate_word(lever.gate));
             if (query.tier == Tier::turbo && (lever.cls == Class::turbo || (lever.cls == Class::fast && lever.gate != Gate::pass)))
                 slot.reason = "quality: " + (lever.quality.empty() ? std::string("not stated") : lever.quality);
