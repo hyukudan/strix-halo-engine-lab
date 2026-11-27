@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -91,7 +92,13 @@ struct Lane {
     // position; the tape (when the transaction asks) receives the same input rows.
     void append(unsigned rows, bool stage) {
         const auto first = state.committed();
-        state.append(*this, {first, rows}, history_backup, kv_backup, [&] {
+        state.append(*this, {first, rows}, history_backup, kv_backup, [&] { forward(first, rows); }, [] {}, nullptr,
+                     stage);
+    }
+
+    // The lane's rows of one work (an append, or its part of a staged batch).
+    void forward(unsigned first, unsigned rows) {
+        {
             for (const auto visit : Plan::visits()) {
                 const auto view = state.visit(visit);
                 const auto& layout = kPlan.visit(visit);
@@ -114,7 +121,7 @@ struct Lane {
                     }
                 }
             }
-        }, [] {}, nullptr, stage);
+        }
     }
 
     void commit(unsigned keep) {
@@ -192,6 +199,101 @@ void window_program_gate() {
     untaped.commit(3);
 }
 
+
+// RowAppendState::stage_batch: one work over several lanes' windows leaves each lane staged as its own staged append
+// would, and each lane's commit_staged then publishes exactly the lone lane's state (taped lanes by copies, a lane
+// whose window saved a ring row by its own replay). Refusals: a duplicate lane, shared checkpoints; a failed work
+// retires every lane of the batch.
+void staged_batch_equals_lone() {
+    using L = Lane<8>;
+    const unsigned prefixes[3] = {0U, 5U, 37U};
+    const unsigned rows[3] = {3U, 1U, 5U};
+    const unsigned keeps[4][3] = {{2U, 1U, 0U}, {3U, 1U, 5U}, {1U, 0U, 3U}, {0U, 1U, 1U}};
+    for (const bool taped : {false, true})
+        for (const auto& keep : keeps) {
+            L batch[3], lone[3];
+            for (unsigned i = 0; i < 3U; ++i)
+                for (auto* l : {&batch[i], &lone[i]}) {
+                    if (taped) {
+                        l->tape.resize(std::size_t{8} * l->state.convolution_row_elements());
+                        l->state.bind_convolution_tape(l->tape, 8);
+                    }
+                    for (unsigned done = 0; done < prefixes[i];) {
+                        const unsigned chunk = prefixes[i] - done < 8U ? prefixes[i] - done : 8U;
+                        l->append(chunk, false);
+                        done += chunk;
+                    }
+                }
+            using State = decltype(batch[0].state);
+            std::vector<State::StagedGroup> groups;
+            for (unsigned i = 0; i < 3U; ++i)
+                groups.push_back({&batch[i].state, {batch[i].state.committed(), rows[i]}, batch[i].history_backup,
+                                  batch[i].kv_backup});
+            unsigned works = 0;
+            State::stage_batch(batch[0], std::span<const State::StagedGroup>(groups), [&] {
+                ++works;
+                for (unsigned i = 0; i < 3U; ++i) batch[i].forward(prefixes[i], rows[i]);
+            }, [] {});
+            check(works == 1U, "staged batch: one work for every lane");
+            for (unsigned i = 0; i < 3U; ++i) {
+                check(batch[i].state.staged() && batch[i].state.committed() == prefixes[i], "staged batch: lane staged");
+                lone[i].append(rows[i], true);
+                batch[i].commit(keep[i]);
+                lone[i].commit(keep[i]);
+                check(!batch[i].state.staged() && !batch[i].state.poisoned(), "staged batch: lane published");
+                check(batch[i].state.committed() == lone[i].state.committed(), "staged batch: frontier == lone");
+                check(batch[i].history == lone[i].history, "staged batch: histories == lone");
+                check(batch[i].replays == lone[i].replays, "staged batch: same commit form as lone (tape or replay)");
+                for (const auto visit : L::Plan::visits()) {
+                    const auto a = batch[i].state.visit(visit).kv, b = lone[i].state.visit(visit).kv;
+                    const unsigned end = prefixes[i] + keep[i];
+                    for (unsigned position = 0; position < end; ++position) {
+                        if (a.wrapped && position + 4U <= end - 1U) continue;
+                        const auto cell = a.wrapped ? position % a.slots : position;
+                        check(a.keys[cell] == b.keys[cell], "staged batch: visible KV cells == lone");
+                    }
+                }
+                batch[i].append(2, false);
+                lone[i].append(2, false);
+                check(batch[i].history == lone[i].history, "staged batch: next append == lone");
+            }
+            if (taped) check(batch[0].replays == 0U, "staged batch: a taped lane without ring rows never replays");
+        }
+    // Refusals before any write, and a failed work retiring the batch.
+    {
+        L a, b;
+        using State = decltype(a.state);
+        a.append(2, false);
+        b.append(3, false);
+        const auto before = a.history;
+        std::vector<State::StagedGroup> dup{{&a.state, {2U, 2U}, a.history_backup, a.kv_backup},
+                                           {&a.state, {2U, 2U}, b.history_backup, b.kv_backup}};
+        bool refused = false;
+        try { State::stage_batch(a, std::span<const State::StagedGroup>(dup), [] {}, [] {}); }
+        catch (const std::invalid_argument&) { refused = true; }
+        check(refused && !a.state.staged() && a.history == before, "staged batch: duplicate lane refused");
+        std::vector<State::StagedGroup> shared{{&a.state, {2U, 2U}, a.history_backup, a.kv_backup},
+                                              {&b.state, {3U, 2U}, a.history_backup, b.kv_backup}};
+        refused = false;
+        try { State::stage_batch(a, std::span<const State::StagedGroup>(shared), [] {}, [] {}); }
+        catch (const std::invalid_argument&) { refused = true; }
+        check(refused && !a.state.staged() && !b.state.staged(), "staged batch: shared checkpoint refused");
+        std::vector<State::StagedGroup> over{{&a.state, {2U, 2U}, b.history, a.kv_backup},
+                                            {&b.state, {3U, 2U}, b.history_backup, b.kv_backup}};
+        refused = false;
+        try { State::stage_batch(a, std::span<const State::StagedGroup>(over), [] {}, [] {}); }
+        catch (const std::invalid_argument&) { refused = true; }
+        check(refused, "staged batch: checkpoint over another lane's history refused");
+        std::vector<State::StagedGroup> ok{{&a.state, {2U, 2U}, a.history_backup, a.kv_backup},
+                                          {&b.state, {3U, 2U}, b.history_backup, b.kv_backup}};
+        bool failed = false;
+        try {
+            State::stage_batch(a, std::span<const State::StagedGroup>(ok), [] { throw std::runtime_error("device"); },
+                               [] {});
+        } catch (const std::runtime_error&) { failed = true; }
+        check(failed && a.state.poisoned() && b.state.poisoned(), "staged batch: a failed work retires every lane");
+    }
+}
 }  // namespace
 
 int main() {
@@ -261,6 +363,7 @@ int main() {
         check(slot.state().convolution_tape_rows() == 4U, "tape kept across resets");
     }
     window_program_gate();
+    staged_batch_equals_lone();
     std::cout << "session conv tape tests passed\n";
     return 0;
 }
