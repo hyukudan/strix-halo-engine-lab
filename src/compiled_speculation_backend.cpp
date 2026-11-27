@@ -222,17 +222,13 @@ replay_target_token(
 
 namespace strix::spec {
 
-SerialGreedyRequestResult execute_block_token_continuation(
-    const SerialTokenContinuationRequest& request, std::span<const std::uint32_t> prompt,
-    BlockDrafter& drafter, VerifyTarget& target, std::uint32_t max_rows,
-    const std::function<void(std::uint32_t)>& emit, const RowRule& rule, RoundSink* sink) {
-    if (max_rows == 0U || prompt.size() != request.start_position)
-        throw std::invalid_argument("invalid block continuation frontier or row limit");
-    if (rule.sampled() && !target.supports_row_rule(true))
-        throw std::invalid_argument("block continuation: the verify target cannot decide sampled rows");
+namespace {
 
-    BlockSpeculator speculator(drafter, target, rule);
-    speculator.set_round_sink(sink);
+// One request's block continuation over a built speculator; `commit` hands the prompt and the anchor to the drafter(s).
+template <class Commit>
+SerialGreedyRequestResult run_block_continuation(const SerialTokenContinuationRequest& request,
+    std::span<const std::uint32_t> prompt, BlockSpeculator& speculator, std::uint32_t max_rows,
+    const std::function<void(std::uint32_t)>& emit, Commit&& commit) {
     std::vector<std::uint32_t> ready;
     std::size_t cursor{};
     bool started = false;
@@ -240,8 +236,8 @@ SerialGreedyRequestResult execute_block_token_continuation(
     // block queues only outputs the serial driver can consume in this request.
     return execute_serial_token_continuation(request, [&](std::uint32_t input, std::uint64_t position) {
         if (!started) {
-            drafter.commit(prompt);
-            drafter.commit({&input, 1U});
+            commit(prompt);
+            commit(std::span<const std::uint32_t>(&input, 1U));
             speculator.start(input);
             started = true;
         }
@@ -257,6 +253,38 @@ SerialGreedyRequestResult execute_block_token_continuation(
         }
         return ready[cursor++];
     }, emit);
+}
+
+void check_block_continuation(const SerialTokenContinuationRequest& request, std::span<const std::uint32_t> prompt,
+                              VerifyTarget& target, std::uint32_t max_rows, const RowRule& rule) {
+    if (max_rows == 0U || prompt.size() != request.start_position)
+        throw std::invalid_argument("invalid block continuation frontier or row limit");
+    if (rule.sampled() && !target.supports_row_rule(true))
+        throw std::invalid_argument("block continuation: the verify target cannot decide sampled rows");
+}
+
+}  // namespace
+
+SerialGreedyRequestResult execute_block_token_continuation(
+    const SerialTokenContinuationRequest& request, std::span<const std::uint32_t> prompt,
+    BlockDrafter& drafter, VerifyTarget& target, std::uint32_t max_rows,
+    const std::function<void(std::uint32_t)>& emit, const RowRule& rule, RoundSink* sink) {
+    check_block_continuation(request, prompt, target, max_rows, rule);
+    BlockSpeculator speculator(drafter, target, rule);
+    speculator.set_round_sink(sink);
+    return run_block_continuation(request, prompt, speculator, max_rows, emit,
+                                  [&](std::span<const std::uint32_t> ids) { drafter.commit(ids); });
+}
+
+SerialGreedyRequestResult execute_block_token_continuation(
+    const SerialTokenContinuationRequest& request, std::span<const std::uint32_t> prompt,
+    ArmSelector& arms, VerifyTarget& target, std::uint32_t max_rows,
+    const std::function<void(std::uint32_t)>& emit, const RowRule& rule, RoundSink* sink) {
+    check_block_continuation(request, prompt, target, max_rows, rule);
+    BlockSpeculator speculator(arms, target, rule);
+    speculator.set_round_sink(sink);
+    return run_block_continuation(request, prompt, speculator, max_rows, emit,
+                                  [&](std::span<const std::uint32_t> ids) { arms.commit(ids); });
 }
 
 }  // namespace strix::spec

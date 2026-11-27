@@ -26,6 +26,7 @@
 #include <iostream>
 #include <iterator>
 #include <numeric>
+#include <deque>
 #include <optional>
 #include <ostream>
 #include <random>
@@ -608,8 +609,14 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         setup.probe_loss = family.speculation_probe_loss;
         if (options.speculation != CliSpeculation::verify)
             setup.tune = [&](spec::BlockConfig& config) { decoder->tune_speculation(config); };
+        // Several drafters (greedy auto): one BlockDrafter per arm under the shared per-regime selector.
+        auto arms = options.speculation == CliSpeculation::automatic && !row_rule.sampled()
+            ? decoder->chain_arms(next, prompt_size) : std::vector<SerialGenerationDecoder::ChainArm>{};
+        if (arms.size() < 2U) arms.clear();
+        spec::ChainDrafter* arm_chain = nullptr;
         setup.chain = [&](spec::BlockConfig& config) -> spec::ChainDrafter* {
             config.force_lookup = options.speculation == CliSpeculation::lookup;
+            if (!arms.empty()) return arm_chain;
             return options.speculation == CliSpeculation::automatic ? decoder->chain_drafter(next, prompt_size) : nullptr;
         };
         setup.prices = [&](spec::BlockConfig& config, spec::ChainDrafter* chain) {
@@ -634,18 +641,42 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
             else
                 decoder->seed_speculation(built);
         };
-        (void)spec::make_block_drafter(drafter, setup);
         // Walls measured by earlier runs win over the engine's declared seeds (applied after them).
-        if (cost_table) {
+        const auto seed_costs = [&](spec::BlockDrafter& built) {
+            if (!cost_table) return;
             const auto& seeds = cost_prior ? *cost_prior : *cost_table;
-            cost_seeded = spec::seed_verify_costs(seeds, *drafter, max_rows);
-            if (chain_k > 0U) (void)spec::seed_draft_costs(seeds, *drafter, chain_k);
-        }
+            cost_seeded = spec::seed_verify_costs(seeds, built, max_rows);
+            if (chain_k > 0U) (void)spec::seed_draft_costs(seeds, built, chain_k);
+        };
         std::optional<RoundLog> round_log;
         if (const int rounds = envcfg::integer("STRIX_SPEC_ROUND_LOG", 0); rounds > 0)
             round_log.emplace(std::cerr, static_cast<std::uint32_t>(rounds));
-        generated = spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit,
-                                                           row_rule, round_log ? &*round_log : nullptr);
+        if (arms.empty()) {
+            (void)spec::make_block_drafter(drafter, setup);
+            seed_costs(*drafter);
+            generated = spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit,
+                                                               row_rule, round_log ? &*round_log : nullptr);
+        } else {
+            std::deque<std::optional<spec::BlockDrafter>> built(arms.size());
+            spec::ArmSelector selector;
+            for (std::size_t a = 0; a < arms.size(); ++a) {
+                arm_chain = arms[a].chain;
+                auto& arm = spec::make_block_drafter(built[a], setup);
+                seed_costs(arm);
+                (void)selector.add(arm, arms[a].name, arms[a].probe_min_tokens, {}, arms[a].wins_ties);
+            }
+            generated = spec::execute_block_token_continuation(request, options.prompt, selector, *verify, max_rows, emit,
+                                                               row_rule, round_log ? &*round_log : nullptr);
+            std::cerr << "strix-speculation-selector/v1 arms " << selector.size();
+            for (std::size_t a = 0; a < selector.size(); ++a) {
+                const auto& st = selector.stats(a);
+                std::cerr << " | " << st.name << " passes " << st.passes << " tokens " << st.tokens << " probes " << st.probes
+                          << " ms " << static_cast<std::uint64_t>(st.ms);
+            }
+            if (selector.active() < selector.size()) std::cerr << " | active " << selector.stats(selector.active()).name;
+            std::cerr << "
+";
+        }
     } else {
         // A decoder that samples on the device decides every sampled row there: the same ids for the request's seed,
         // without the logits row's host copy and host transform (STRIX_SAMPLE_PATH=host keeps the host path).

@@ -56,6 +56,17 @@ public:
     virtual std::uint32_t max_verify_rows(CliSpeculation) const { return 0; }
     // Optional, request-owned drafter. Called after prefill for greedy auto.
     virtual spec::ChainDrafter* chain_drafter(std::uint32_t, std::uint32_t) { return nullptr; }
+    // Optional: several request-owned drafters for the shared per-regime selector (spec::ArmSelector), asked after
+    // prefill for greedy auto before chain_drafter; two or more arms replace the single chain. Arm 0 is the fallback
+    // (always available). Per arm: probe_min_tokens (probe it only while the active arm emits at least this many
+    // tokens per pass) and wins_ties (it takes inconclusive probes: stated from device receipts). Never changes ids.
+    struct ChainArm {
+        spec::ChainDrafter* chain = nullptr;
+        std::string name;
+        double probe_min_tokens = 0.0;
+        bool wins_ties = false;
+    };
+    virtual std::vector<ChainArm> chain_arms(std::uint32_t, std::uint32_t) { return {}; }
     // Optional engine data for the shared speculator (auto and lookup): arbiter windows, the copy + chain hybrid,
     // chain cost seeds. Called before the request's mode settings (block width, forced lookup, diagnostic prices),
     // which win. Never changes emitted ids.

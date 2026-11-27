@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/serial_request.hpp"
+#include "strix/spec/arm_selector.hpp"
 #include "strix/spec/block_drafter.hpp"
 #include "strix/spec/row_rule.hpp"
 
@@ -17,6 +18,12 @@ namespace strix::spec {
 [[nodiscard]] SerialGreedyRequestResult execute_block_token_continuation(
     const SerialTokenContinuationRequest& request, std::span<const std::uint32_t> prompt,
     BlockDrafter& drafter, VerifyTarget& target, std::uint32_t max_rows,
+    const std::function<void(std::uint32_t)>& emit = {}, const RowRule& rule = {}, RoundSink* sink = nullptr);
+// The same continuation with several drafters under the shared per-regime selector (spec::ArmSelector): every arm
+// sees the prompt and the anchor, the selector picks the drafter of each pass, the verify decides every id.
+[[nodiscard]] SerialGreedyRequestResult execute_block_token_continuation(
+    const SerialTokenContinuationRequest& request, std::span<const std::uint32_t> prompt,
+    ArmSelector& arms, VerifyTarget& target, std::uint32_t max_rows,
     const std::function<void(std::uint32_t)>& emit = {}, const RowRule& rule = {}, RoundSink* sink = nullptr);
 
 }  // namespace strix::spec
