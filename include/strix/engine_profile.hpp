@@ -290,6 +290,8 @@ struct LadderRow {
     std::string_view promotion{};
 };
 
+#include "strix/profile/promotion_receipts.inc"
+
 // Bound the rounding allowance to three tokens (the same fixture can differ by a few tokens by entry point).
 inline constexpr std::uint64_t kBandEdgeTolerance = 3;
 

@@ -1,0 +1,79 @@
+{
+  "include/strix/deepseek41_pair_profile_table.hpp": {
+    "band": 3,
+    "incumbent": 0,
+    "legacy-reference": 0,
+    "unversioned-table-row": 3,
+    "window-band": 0
+  },
+  "include/strix/glm_pair_profile_table.hpp": {
+    "band": 1,
+    "incumbent": 0,
+    "legacy-reference": 0,
+    "unversioned-table-row": 2,
+    "window-band": 0
+  },
+  "include/strix/profiles/hy4.hpp": {
+    "band": 0,
+    "incumbent": 1,
+    "legacy-reference": 0,
+    "unversioned-table-row": 0,
+    "window-band": 0
+  },
+  "include/strix/profiles/inkling2_mini.hpp": {
+    "band": 4,
+    "incumbent": 0,
+    "legacy-reference": 0,
+    "unversioned-table-row": 0,
+    "window-band": 0
+  },
+  "include/strix/profiles/qwen_cuda.hpp": {
+    "band": 0,
+    "incumbent": 8,
+    "legacy-reference": 0,
+    "unversioned-table-row": 8,
+    "window-band": 0
+  },
+  "include/strix/profiles/qwen_dense_cuda.hpp": {
+    "band": 0,
+    "incumbent": 1,
+    "legacy-reference": 0,
+    "unversioned-table-row": 0,
+    "window-band": 0
+  },
+  "include/strix/profiles/qwen_dense_hip.hpp": {
+    "band": 1,
+    "incumbent": 0,
+    "legacy-reference": 0,
+    "unversioned-table-row": 0,
+    "window-band": 5
+  },
+  "include/strix/qwen_profile_table.hpp": {
+    "band": 2,
+    "incumbent": 14,
+    "legacy-reference": 0,
+    "unversioned-table-row": 16,
+    "window-band": 0
+  },
+  "src/gemma4/engine/profile.cpp": {
+    "band": 1,
+    "incumbent": 3,
+    "legacy-reference": 0,
+    "unversioned-table-row": 6,
+    "window-band": 0
+  },
+  "src/minimax/engine/mm_profile_table.hpp": {
+    "band": 0,
+    "incumbent": 2,
+    "legacy-reference": 0,
+    "unversioned-table-row": 2,
+    "window-band": 0
+  },
+  "src/profile/multi_device.cpp": {
+    "band": 1,
+    "incumbent": 0,
+    "legacy-reference": 1,
+    "unversioned-table-row": 0,
+    "window-band": 0
+  }
+}

@@ -856,7 +856,8 @@ def qual(a):
                 candidate = verify_promotion_pair(records, case, a.cand, ra_info, baseline, labels_sha)
                 if tier == "fast" and candidate[1] != baseline["model_sha256"]:
                     raise GateError(f"{case}: FAST promotion must use the same reference and candidate pack")
-                execution_pairs.add((baseline["binary_sha256"], baseline["model_sha256"], *candidate[:2]))
+                execution_pairs.add((baseline["binary_sha256"], baseline["model_sha256"],
+                                     baseline["numerical_config_sha256"], *candidate))
         if ra["nonfinite_r"].any() or ra_info.get("ref_unscored_nonfinite"):
             raise GateError(f"{case}: non-finite reference logits")
         if any(rows["nonfinite_c"].any() or info.get("cand_unscored_nonfinite") for rows, info in null_pairs):
@@ -978,7 +979,7 @@ def qual(a):
             p["document_uncertainty"] = diagnostic
             print(f"DNLL DIAGNOSTIC (document clusters) {json.dumps(diagnostic, sort_keys=True)}")
     if promotion and len(execution_pairs) != 1:
-        raise GateError("promotion needs one paired reference and candidate binary and pack across cases")
+        raise GateError("promotion needs one reference and candidate execution identity across cases")
     if promotion and p["pass"] and ((a.cand_free and not replay) or (diag and traced != len(windows))):
         raise GateError("promotion requires all declared replay or trace evidence")
     exit_code = EXIT[p["state"]]
@@ -989,11 +990,12 @@ def qual(a):
         if tier != "fast":
             doc["tier"] = tier
         if promotion:
-            ref_binary, ref_pack, cand_binary, cand_pack = next(iter(execution_pairs))
+            ref_binary, ref_pack, ref_config, cand_binary, cand_pack, cand_config = next(iter(execution_pairs))
             doc["promotion"] = {"schema": "strix-gate-promotion/v1", "plan_sha256": plan[1],
                                 "witness_sha256": promotion_sha, "reference_binary_sha256": ref_binary,
                                 "reference_pack_sha256": ref_pack, "candidate_binary_sha256": cand_binary,
-                                "candidate_pack_sha256": cand_pack}
+                                "candidate_pack_sha256": cand_pack, "reference_config_sha256": ref_config,
+                                "candidate_config_sha256": cand_config}
         if replay:
             doc.update(cand_free=a.cand_free, null_free=a.null_free)
         with open(a.json, "w", encoding="utf-8", opener=opener) as f:

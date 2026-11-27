@@ -64,9 +64,9 @@ bool render(std::ostream& out, bool json) {
              << "until device edge timings report and its row sets `narrow_to_floor` (then it starts at its first "
              << "winning timing point, shown as the measured floor). "
              << "The lower-edge tolerance is " << p::kBandEdgeTolerance << " tokens for prompt counts.\n\n"
-             << "The per-request key is produced by `bind_band_receipts` using `LadderArms::over`. "
-             << "It includes the complete execution and reference lever chain, the candidate identity and the tier. "
-             << "Fixed keys appear in full in the [JSON inventory](band-edges.json). "
+             << "Historical per-request keys are marked RECAPTURE PENDING. "
+             << "A recaptured band binds the recorded execution, reference lever chain and candidate identity. "
+             << "Recorded keys appear in full in the [JSON inventory](band-edges.json). "
              << "An unspecified gate length means the source does not give a prompt length.\n\n"
              << "| Model / engine | Tier | Nominal band | Effective band | Edge state | Key / candidate | Timing tokens | Gate tokens | Receipts |\n"
              << "|---|---|---:|---:|---|---|---|---|---|\n";
@@ -94,6 +94,8 @@ bool render(std::ostream& out, bool json) {
         const auto tier = p::name(row.tier);
         const auto key = row.band_bound && row.over.empty()
             ? std::string_view{"bind_band_receipts/LadderArms::over"} : row.over;
+        const auto capture = !row.promotion.empty() ? "manifest" :
+            row.band_bound && row.over.empty() ? "pending" : "fixed-legacy";
         if (json) {
             if (!first) out << ',';
             const auto field = [&](std::string_view name, std::string_view value) {
@@ -111,6 +113,8 @@ bool render(std::ostream& out, bool json) {
             field("value", row.value);
             field("implementation", identity);
             field("execution_key", key);
+            field("capture", capture);
+            if (!row.promotion.empty()) field("promotion", row.promotion);
             field("execution_scope", binding.execution);
             field("timing_receipt", row.receipt);
             field("gate_receipt", row.band_evidence.gate_scope);
@@ -130,7 +134,9 @@ bool render(std::ostream& out, bool json) {
                 << tier << " | " << row.min_context << "–" << row.max_context << " | " << floor << "–"
                 << row.max_context << " | " << edge_state;
             if (row.band_evidence.lower_edge_unproven) out << " (measured floor " << measured_floor << ')';
-            out << " | " << (row.band_bound && row.over.empty() ? "Per request" : "Fixed") << ", `" << row.lever
+            const auto status = !row.promotion.empty() ? "Manifest" :
+                row.band_bound && row.over.empty() ? "RECAPTURE PENDING" : "Fixed";
+            out << " | " << status << ", `" << row.lever
                 << '=' << row.value << '{' << identity << "}` | " << lengths(row.band_evidence.timed, false)
                 << " | " << lengths(row.band_evidence.gated, false) << " | " << row.receipt << ' '
                 << row.band_evidence.gate_scope << " |\n";
@@ -138,9 +144,8 @@ bool render(std::ostream& out, bool json) {
         first = false;
     }
     if (json) out << "\n  ]\n}\n";
-    else out << "\nThe remaining model bindings (Ernie, Hunyuan, MiniMax and Nemotron), and the RTX/CUDA "
-             << "bindings, supply no band-bound timing rows. Their incumbent grants, readiness and standalone "
-             << "schedules are outside this inventory.\n";
+    else out << "\nThis inventory covers the tables above. Other model bindings, incumbent grants and standalone "
+             << "schedules are tracked separately.\n";
     return !first;
 }
 

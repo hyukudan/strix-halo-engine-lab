@@ -46,6 +46,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 2
+        with:
+          fetch-depth: 2
 
       - name: Benchmark completion-marker regression (CPU-only)
         shell: bash
@@ -85,7 +87,11 @@ jobs:
         run: python3 -B tools/qualification/test_verify_profile_parity.py
 
       - name: Profile receipts
-        run: python3 -B tools/ci/check_profile_receipts.py
+        run: |
+          set -euo pipefail
+          python3 -B tools/ci/check_profile_receipts.py
+          python3 -B tools/ci/test_check_promotion_manifest.py
+          python3 -B tools/ci/check_promotion_manifest.py --base HEAD^1
 
       - name: Best-on-record ledger
         shell: bash
