@@ -144,6 +144,10 @@ void FirstRowReference::feed_forward(unsigned layer_id, const std::string& layer
     project(prefix + "gate.weight_1", input, mix);
     moe::route_scores_ref<RouteMath>(s.route.score, select, select);
     moe::route_scores_ref<RouteMath>(s.route.score, mix, mix);
+    if (s.contracts.router == RouterContract::summed_scores) {
+        std::ranges::transform(select, mix, select.begin(), std::plus<>{});
+        mix = select;
+    }
     if (s.contracts.router == RouterContract::swapped_planes) std::swap(select, mix);
     if (s.contracts.router == RouterContract::single_plane) mix = select;
     auto gain = read(prefix + "gate.routed_scaling_factor_param", s.route.experts);
@@ -151,14 +155,11 @@ void FirstRowReference::feed_forward(unsigned layer_id, const std::string& layer
         for (std::size_t i = 0; i < mix.size(); ++i) mix[i] *= gain[i];
     if (s.contracts.router == RouterContract::unit_gain || s.contracts.router == RouterContract::gain_before_normalize)
         std::ranges::fill(gain, 1.0F);
-    if (s.contracts.router == RouterContract::summed_scores) {
-        std::ranges::transform(select, mix, select.begin(), std::plus<>{});
-        mix = select;
-    }
     result.experts.resize(s.route.top_k);
     result.expert_weights.resize(s.route.top_k);
     moe::route_select_split_ref(s.route, select, mix, read(prefix + "e_score_correction_bias", s.route.experts),
-        gain, result.experts, result.expert_weights);
+        gain, result.experts, result.expert_weights,
+        s.contracts.router == RouterContract::summed_scores ? 1e-20F : 0.0F);
 
     const auto project_expert = [&](unsigned id, moe::ExpertProjection kind,
                                     std::span<const float> value, std::span<float> out) {
@@ -177,12 +178,12 @@ void FirstRowReference::feed_forward(unsigned layer_id, const std::string& layer
         [&](auto in, auto out) {
             moe::combine_routed_reference(s.expert_width, in, result.experts, result.expert_weights,
                 project_expert, activate, [](float v) { return v; }, out);
+            if (s.contracts.checkpoint_stores) core::round_bf16_reference(out);
         },
         [&](auto in, auto out) { project(prefix + "fc2_latent_proj.weight", in, out); },
         [&](auto in, auto out) {
             const auto shared = prefix + "shared_experts.";
             glu(shared + "w1.weight", shared + "w3.weight", shared + "w2.weight", s.expert_width, in, out);
-            if (s.contracts.checkpoint_stores) core::round_bf16_reference(out);
         }, result.ffn, s.contracts.norm_routed_output ? moe_core::LatentNormSite::routed_output
                                                      : moe_core::LatentNormSite::expert_input);
     if (s.contracts.checkpoint_stores) core::round_bf16_reference(result.ffn);

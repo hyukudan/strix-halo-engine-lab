@@ -241,6 +241,14 @@ void test_moe() {
     near(summed.expert_weights.at(0), (1.25F / 10.25F) * 2.0F, 1e-6F,
          "sum of both sigmoids, top-k denominator, then learned gain");
     near(summed.expert_weights.at(1), 1.0F / 10.25F, 1e-6F, "bias is excluded from the denominator");
+    constexpr std::array zero_scores{0.0F, 0.0F}, zero_bias{1.0F, 0.0F}, zero_gain{3.0F, 2.0F};
+    auto policy = checkpoint.route;
+    policy.experts = policy.top_k = 2;
+    std::array<std::uint32_t, 2> ids{};
+    std::array<float, 2> route_weights{};
+    strix::moe::route_select_split_ref(policy, zero_scores, zero_scores, zero_bias, zero_gain, ids, route_weights, 1e-20F);
+    expect(ids == std::array<std::uint32_t, 2>{0, 1} && route_weights == zero_scores,
+           "a saturated routing row keeps finite zero weights");
     near(renormalized.expert_weights.at(0), 3.0F * 1.5F / 6.0F, 1e-6F, "gain belongs in denominator");
     near(renormalized.expert_weights.at(1), 3.0F * 0.5F / 6.0F, 1e-6F, "gain denominator covers every route");
     const float latent = 5.65625F; // BF16-rounded sqrt(32).

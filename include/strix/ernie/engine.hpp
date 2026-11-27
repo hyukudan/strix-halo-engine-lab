@@ -21,9 +21,9 @@ struct HostContracts {
     bool gate_before_vha = false;
     bool no_hca_inverse_rope = false;
     bool norm_routed_output = false;
-    bool checkpoint_stores = false;
-    bool checkpoint_hc = false;
     bool checkpoint_attention = false;
+    bool checkpoint_hc = false;
+    bool checkpoint_stores = false;
     unsigned position_offset = 0;
     float rope_base = 0;
     float rms_epsilon = 0;
