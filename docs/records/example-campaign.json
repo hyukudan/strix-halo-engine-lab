@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "runs": {
+    "default": {
+      "minimax-m3.1/pair/exact/served/aggregate-c8": {
+        "value": 56.1,
+        "workload": {
+          "prompt_tokens": 190,
+          "generated_tokens": 256,
+          "requests": 8,
+          "timing": "wall",
+          "notes": "Eight distinct short prompts, approximately 190 tokens each."
+        },
+        "commit": "e6ce78571",
+        "date": "2026-11-02",
+        "receipt": "docs/models/minimax-m3.1/README.md#measured-results"
+      }
+    }
+  }
+}

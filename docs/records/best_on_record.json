@@ -1,0 +1,1739 @@
+{
+  "version": 1,
+  "records": {
+    "deepseek-v4.1/pair/exact/cli/aggregate-c8": {
+      "value": 113.9,
+      "workload": {
+        "prompt_tokens": null,
+        "generated_tokens": null,
+        "requests": 8,
+        "timing": "decode",
+        "notes": "Eight independent decode rows, rate from step time."
+      },
+      "commit": "6a5604bf",
+      "date": "2026-10-26",
+      "receipt": "docs/models/deepseek-v4.1/README.md#measured-results-the-pair"
+    },
+    "deepseek-v4.1/pair/exact/cli/decode-b1": {
+      "value": 39.98,
+      "workload": {
+        "prompt_tokens": [
+          15,
+          21
+        ],
+        "generated_tokens": 256,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "Short chat, DSpark, earlier published overview."
+      },
+      "commit": "f42edd05e",
+      "date": "2026-11-21",
+      "receipt": "README.md#results"
+    },
+    "deepseek-v4.1/pair/exact/cli/prefill-2k": {
+      "value": 791.9,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Earlier published 2K CLI snapshot, prompt class unspecified."
+      },
+      "commit": "d3a89ae16",
+      "date": "2026-11-21",
+      "receipt": "README.md#results"
+    },
+    "deepseek-v4.1/pair/exact/cli/prefill-32k": {
+      "value": 1285,
+      "workload": {
+        "prompt_tokens": 32768,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Engine prompt benchmark, warm."
+      },
+      "commit": "e5886cb79",
+      "date": "2026-11-14",
+      "receipt": "docs/performance.md#current-snapshot"
+    },
+    "deepseek-v4.1/pair/exact/cli/prefill-8k": {
+      "value": 1165,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Engine prompt benchmark, warm."
+      },
+      "commit": "e5886cb79",
+      "date": "2026-11-14",
+      "receipt": "docs/performance.md#current-snapshot"
+    },
+    "deepseek-v4.1/pair/exact/served/aggregate-c8": {
+      "value": 103.29,
+      "workload": {
+        "prompt_tokens": [
+          17,
+          46
+        ],
+        "generated_tokens": 256,
+        "requests": 8,
+        "timing": "wall",
+        "notes": "Whole-run median, grouped short-prompt admission."
+      },
+      "commit": "ebe642fb",
+      "date": "2026-11-14",
+      "receipt": "docs/performance.md#current-snapshot"
+    },
+    "deepseek-v4.1/pair/exact/served/decode-b1": {
+      "value": 57.7,
+      "workload": {
+        "prompt_tokens": 344,
+        "generated_tokens": 128,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "DSpark, short chat."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "deepseek-v4.1/pair/exact/served/prefill-2k": {
+      "value": 782,
+      "workload": {
+        "prompt_tokens": 1971,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "deepseek-v4.1/pair/exact/served/prefill-32k": {
+      "value": 1273,
+      "workload": {
+        "prompt_tokens": 30975,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "deepseek-v4.1/pair/exact/served/prefill-8k": {
+      "value": 1111,
+      "workload": {
+        "prompt_tokens": 7994,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "deepseek-v4.1/pair/fast/cli/prefill-32k": {
+      "value": 1981,
+      "workload": {
+        "prompt_tokens": 32768,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "D1 plus R256 public band receipt, inherited in TURBO."
+      },
+      "commit": "3d9c562e",
+      "date": "2026-11-26",
+      "receipt": "docs/band-edges.md",
+      "receipt_revision": true
+    },
+    "deepseek-v4.1/pair/fast/cli/prefill-8k": {
+      "value": 1855,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "D1 plus R256 public band receipt, inherited in TURBO."
+      },
+      "commit": "3d9c562e",
+      "date": "2026-11-26",
+      "receipt": "docs/band-edges.md",
+      "receipt_revision": true
+    },
+    "deepseek-v4.1/pair/fast/served/decode-b1": {
+      "value": 53.7,
+      "workload": {
+        "prompt_tokens": 344,
+        "generated_tokens": 128,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "DSpark, short chat."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "deepseek-v4.1/pair/fast/served/prefill-2k": {
+      "value": 969,
+      "workload": {
+        "prompt_tokens": 1971,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "deepseek-v4.1/pair/fast/served/prefill-32k": {
+      "value": 1708,
+      "workload": {
+        "prompt_tokens": 30975,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "deepseek-v4.1/pair/fast/served/prefill-8k": {
+      "value": 1588,
+      "workload": {
+        "prompt_tokens": 7994,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "deepseek-v4.1/pair/turbo/cli/prefill-32k": {
+      "value": 1981,
+      "workload": {
+        "prompt_tokens": 32768,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "D1 plus R256 public band receipt, inherited in TURBO."
+      },
+      "commit": "3d9c562e",
+      "date": "2026-11-26",
+      "receipt": "docs/band-edges.md",
+      "receipt_revision": true
+    },
+    "deepseek-v4.1/pair/turbo/cli/prefill-8k": {
+      "value": 1855,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "D1 plus R256 public band receipt, inherited in TURBO."
+      },
+      "commit": "3d9c562e",
+      "date": "2026-11-26",
+      "receipt": "docs/band-edges.md",
+      "receipt_revision": true
+    },
+    "deepseek-v4.1/pair/turbo/served/prefill-32k": {
+      "value": 1710,
+      "workload": {
+        "prompt_tokens": 30975,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "deepseek-v4.1/pair/turbo/served/prefill-8k": {
+      "value": 1591,
+      "workload": {
+        "prompt_tokens": 7994,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "glm-5.3/pair/exact/cli/aggregate-c8": {
+      "value": 71.3,
+      "workload": {
+        "prompt_tokens": null,
+        "generated_tokens": null,
+        "requests": 8,
+        "timing": "decode",
+        "notes": "R8 device batch, rate from step time."
+      },
+      "commit": "ec76191f2",
+      "date": "2026-11-04",
+      "receipt": "docs/models/glm-5.3/README.md#measured-results-the-pair"
+    },
+    "glm-5.3/pair/exact/cli/decode-b1": {
+      "value": 37.1,
+      "workload": {
+        "prompt_tokens": null,
+        "generated_tokens": [
+          64,
+          128
+        ],
+        "requests": 1,
+        "timing": "decode",
+        "notes": "Chat, default MTP self-speculation."
+      },
+      "commit": "63dcea5e",
+      "date": "2026-11-15",
+      "receipt": "docs/models/glm-5.3/README.md#measured-results-the-pair",
+      "receipt_revision": true
+    },
+    "glm-5.3/pair/exact/cli/prefill-32k": {
+      "value": 642,
+      "workload": {
+        "prompt_tokens": 32768,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Warm second prefill."
+      },
+      "commit": "2c46c63f",
+      "date": "2026-11-15",
+      "receipt": "docs/models/glm-5.3/README.md#measured-results-the-pair"
+    },
+    "glm-5.3/pair/exact/cli/prefill-8k": {
+      "value": 664,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Warm second prefill."
+      },
+      "commit": "2c46c63f",
+      "date": "2026-11-15",
+      "receipt": "docs/models/glm-5.3/README.md#measured-results-the-pair"
+    },
+    "glm-5.3/pair/exact/served/decode-b1": {
+      "value": 42.8,
+      "workload": {
+        "prompt_tokens": 362,
+        "generated_tokens": 128,
+        "requests": 1,
+        "timing": "decode"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "glm-5.3/pair/exact/served/prefill-2k": {
+      "value": 531,
+      "workload": {
+        "prompt_tokens": 2037,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "glm-5.3/pair/exact/served/prefill-32k": {
+      "value": 578,
+      "workload": {
+        "prompt_tokens": 31258,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "glm-5.3/pair/exact/served/prefill-8k": {
+      "value": 629,
+      "workload": {
+        "prompt_tokens": 8108,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "glm-5.3/pair/fast/cli/prefill-2k": {
+      "value": 734.41,
+      "workload": {
+        "prompt_tokens": 2049,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "ttft",
+        "notes": "Qualified lower edge, 2,049 tokens in 2.79 seconds."
+      },
+      "commit": "3d9c562e",
+      "date": "2026-11-26",
+      "receipt": "docs/band-edges.md",
+      "receipt_revision": true
+    },
+    "glm-5.3/pair/fast/cli/prefill-8k": {
+      "value": 1000,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Warm WMMA bundle receipt for the default band. Free-running gate re-score is pending a policy decision."
+      },
+      "commit": "3d9c562e",
+      "date": "2026-11-26",
+      "receipt": "docs/optimizations.md#glm-pf-wmma-x",
+      "receipt_revision": true
+    },
+    "glm-5.3/pair/fast/served/decode-b1": {
+      "value": 41.1,
+      "workload": {
+        "prompt_tokens": 362,
+        "generated_tokens": 128,
+        "requests": 1,
+        "timing": "decode"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "glm-5.3/pair/fast/served/prefill-2k": {
+      "value": 530,
+      "workload": {
+        "prompt_tokens": 2037,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "glm-5.3/pair/fast/served/prefill-32k": {
+      "value": 568,
+      "workload": {
+        "prompt_tokens": 31258,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "glm-5.3/pair/fast/served/prefill-8k": {
+      "value": 628,
+      "workload": {
+        "prompt_tokens": 8108,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "glm-5.3/pair/turbo/cli/prefill-8k": {
+      "value": 1000,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Warm WMMA bundle receipt for the default band. Free-running gate re-score is pending a policy decision."
+      },
+      "commit": "3d9c562e",
+      "date": "2026-11-26",
+      "receipt": "docs/optimizations.md#glm-pf-wmma-x",
+      "receipt_revision": true
+    },
+    "glm-5.3/pair/turbo/served/decode-b1": {
+      "value": 41.3,
+      "workload": {
+        "prompt_tokens": 362,
+        "generated_tokens": 128,
+        "requests": 1,
+        "timing": "decode"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "glm-5.3/pair/turbo/served/prefill-2k": {
+      "value": 718,
+      "workload": {
+        "prompt_tokens": 2037,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "glm-5.3/pair/turbo/served/prefill-32k": {
+      "value": 879,
+      "workload": {
+        "prompt_tokens": 31258,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "glm-5.3/pair/turbo/served/prefill-8k": {
+      "value": 949,
+      "workload": {
+        "prompt_tokens": 8108,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "hy4-flash/one/exact/cli/decode-b1": {
+      "value": 15.75,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": 64,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "BASE, plain."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "hy4-flash/one/exact/cli/prefill-2k": {
+      "value": 15.2,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": 64,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "BASE position by position."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "hy4-flash/one/fast/cli/decode-b1": {
+      "value": 17,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": 64,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "Manual 2048-row prompt windows."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "hy4-flash/one/fast/cli/prefill-2k": {
+      "value": 810,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": 64,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "8K default, 2K and 32K explicit 2048 rows."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "hy4-flash/one/fast/cli/prefill-32k": {
+      "value": 699,
+      "workload": {
+        "prompt_tokens": 32500,
+        "generated_tokens": 64,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "8K default, 2K and 32K explicit 2048 rows."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "hy4-flash/one/fast/cli/prefill-8k": {
+      "value": 782,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": 64,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "8K default, 2K and 32K explicit 2048 rows."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "hy4-flash/one/turbo/cli/decode-b1": {
+      "value": 15.65,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": 64,
+        "requests": 1,
+        "timing": "decode"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "hy4-flash/one/turbo/cli/prefill-8k": {
+      "value": 739,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": 64,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "hy4-flash/pair/exact/cli/decode-b1": {
+      "value": 22.42,
+      "workload": {
+        "prompt_tokens": 1024,
+        "generated_tokens": 64,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "Tensor parallel, plain."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "hy4-flash/pair/fast/cli/decode-b1": {
+      "value": 22.64,
+      "workload": {
+        "prompt_tokens": 1024,
+        "generated_tokens": 64,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "Tensor parallel, plain."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "hy4-flash/pair/fast/cli/prefill-32k": {
+      "value": 1328,
+      "workload": {
+        "prompt_tokens": 32500,
+        "generated_tokens": 64,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "USB4 layer split."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "hy4-flash/pair/fast/cli/prefill-8k": {
+      "value": 1387,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": 64,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "USB4 layer split."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "inkling2-mini/one/exact/cli/prefill-32k": {
+      "value": 1939,
+      "workload": {
+        "prompt_tokens": 32760,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Public catalog qualification medians for the integrated ladder; 32K is inside the ladder."
+      },
+      "commit": "1f0b9287",
+      "date": "2026-11-26",
+      "receipt": "docs/optimizations.md#inkling2-moe-iu4-turbo",
+      "receipt_revision": true
+    },
+    "inkling2-mini/one/exact/cli/prefill-8k": {
+      "value": 2181,
+      "workload": {
+        "prompt_tokens": 8236,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Public catalog qualification medians for the integrated ladder; 32K is inside the ladder."
+      },
+      "commit": "1f0b9287",
+      "date": "2026-11-26",
+      "receipt": "docs/optimizations.md#inkling2-moe-iu4-turbo",
+      "receipt_revision": true
+    },
+    "inkling2-mini/one/exact/served/decode-b1": {
+      "value": 23.6,
+      "workload": {
+        "prompt_tokens": 396,
+        "generated_tokens": 128,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "Short chat, published build resolves to the same route."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "inkling2-mini/one/exact/served/prefill-2k": {
+      "value": 591,
+      "workload": {
+        "prompt_tokens": 2280,
+        "generated_tokens": 64,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Published build resolves to the same route."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "inkling2-mini/one/exact/served/prefill-32k": {
+      "value": 1890,
+      "workload": {
+        "prompt_tokens": 32758,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Public catalog qualification medians for the integrated ladder; 32K is inside the ladder."
+      },
+      "commit": "1f0b9287",
+      "date": "2026-11-26",
+      "receipt": "docs/optimizations.md#inkling2-moe-iu4-turbo",
+      "receipt_revision": true
+    },
+    "inkling2-mini/one/exact/served/prefill-8k": {
+      "value": 2037,
+      "workload": {
+        "prompt_tokens": 8234,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Public catalog qualification medians for the integrated ladder; 32K is inside the ladder."
+      },
+      "commit": "1f0b9287",
+      "date": "2026-11-26",
+      "receipt": "docs/optimizations.md#inkling2-moe-iu4-turbo",
+      "receipt_revision": true
+    },
+    "inkling2-mini/one/fast/served/decode-b1": {
+      "value": 23.6,
+      "workload": {
+        "prompt_tokens": 396,
+        "generated_tokens": 128,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "Short chat, published build resolves to the same route."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "inkling2-mini/one/fast/served/prefill-2k": {
+      "value": 591,
+      "workload": {
+        "prompt_tokens": 2280,
+        "generated_tokens": 64,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Published build resolves to the same route."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "inkling2-mini/one/fast/served/prefill-32k": {
+      "value": 578,
+      "workload": {
+        "prompt_tokens": 35170,
+        "generated_tokens": 64,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Published build resolves to the same route."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "inkling2-mini/one/fast/served/prefill-8k": {
+      "value": 601,
+      "workload": {
+        "prompt_tokens": 9116,
+        "generated_tokens": 64,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Published build resolves to the same route."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "inkling2-mini/one/turbo/cli/prefill-32k": {
+      "value": 2072,
+      "workload": {
+        "prompt_tokens": 32760,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Public catalog qualification medians for the integrated ladder; 32K is inside the ladder."
+      },
+      "commit": "1f0b9287",
+      "date": "2026-11-26",
+      "receipt": "docs/optimizations.md#inkling2-moe-iu4-turbo",
+      "receipt_revision": true
+    },
+    "inkling2-mini/one/turbo/cli/prefill-8k": {
+      "value": 2380,
+      "workload": {
+        "prompt_tokens": 8236,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Public catalog qualification medians for the integrated ladder; 32K is inside the ladder."
+      },
+      "commit": "1f0b9287",
+      "date": "2026-11-26",
+      "receipt": "docs/optimizations.md#inkling2-moe-iu4-turbo",
+      "receipt_revision": true
+    },
+    "inkling2-mini/one/turbo/served/decode-b1": {
+      "value": 23.6,
+      "workload": {
+        "prompt_tokens": 396,
+        "generated_tokens": 128,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "Short chat, published build resolves to the same route."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "inkling2-mini/one/turbo/served/prefill-2k": {
+      "value": 591,
+      "workload": {
+        "prompt_tokens": 2280,
+        "generated_tokens": 64,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Published build resolves to the same route."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "inkling2-mini/one/turbo/served/prefill-32k": {
+      "value": 2053,
+      "workload": {
+        "prompt_tokens": 32758,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Public catalog qualification medians for the integrated ladder; 32K is inside the ladder."
+      },
+      "commit": "1f0b9287",
+      "date": "2026-11-26",
+      "receipt": "docs/optimizations.md#inkling2-moe-iu4-turbo",
+      "receipt_revision": true
+    },
+    "inkling2-mini/one/turbo/served/prefill-8k": {
+      "value": 2229,
+      "workload": {
+        "prompt_tokens": 8234,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Public catalog qualification medians for the integrated ladder; 32K is inside the ladder."
+      },
+      "commit": "1f0b9287",
+      "date": "2026-11-26",
+      "receipt": "docs/optimizations.md#inkling2-moe-iu4-turbo",
+      "receipt_revision": true
+    },
+    "minimax-m3.1/pair/exact/cli/aggregate-c8": {
+      "value": 61.4,
+      "workload": {
+        "prompt_tokens": 1024,
+        "generated_tokens": null,
+        "requests": 8,
+        "timing": "decode",
+        "notes": "Eight independent decode rows, rate from step time; public release revision."
+      },
+      "commit": "ff3df9a6",
+      "date": "2026-10-26",
+      "receipt": "docs/models/minimax-m3.1/README.md#measured-results",
+      "receipt_revision": true
+    },
+    "minimax-m3.1/pair/exact/cli/decode-b1": {
+      "value": 23.28,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": 256,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "Greedy, code."
+      },
+      "commit": "f42edd05e",
+      "date": "2026-11-21",
+      "receipt": "README.md#results"
+    },
+    "minimax-m3.1/pair/exact/cli/prefill-32k": {
+      "value": 644,
+      "workload": {
+        "prompt_tokens": 32768,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "First session in a fresh process."
+      },
+      "commit": "515ea90b",
+      "date": "2026-11-15",
+      "receipt": "docs/models/minimax-m3.1/README.md#measured-results"
+    },
+    "minimax-m3.1/pair/exact/cli/prefill-8k": {
+      "value": 669,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Warm second session."
+      },
+      "commit": "ae06f9466",
+      "date": "2026-11-14",
+      "receipt": "docs/models/minimax-m3.1/README.md#measured-results"
+    },
+    "minimax-m3.1/pair/exact/served/aggregate-c8": {
+      "value": 56.1,
+      "workload": {
+        "prompt_tokens": 190,
+        "generated_tokens": 256,
+        "requests": 8,
+        "timing": "wall",
+        "notes": "Best repeat of eight distinct prompts, length approximate."
+      },
+      "commit": "e6ce78571",
+      "date": "2026-11-02",
+      "receipt": "docs/models/minimax-m3.1/README.md#measured-results"
+    },
+    "minimax-m3.1/pair/exact/served/decode-b1": {
+      "value": 27,
+      "workload": {
+        "prompt_tokens": 508,
+        "generated_tokens": 128,
+        "requests": 1,
+        "timing": "decode"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "minimax-m3.1/pair/exact/served/prefill-32k": {
+      "value": 590,
+      "workload": {
+        "prompt_tokens": 30179,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "minimax-m3.1/pair/exact/served/prefill-8k": {
+      "value": 667,
+      "workload": {
+        "prompt_tokens": 7791,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "minimax-m3.1/pair/fast/cli/prefill-32k": {
+      "value": 682,
+      "workload": {
+        "prompt_tokens": 32768,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Qualified layers 40–59, cold."
+      },
+      "commit": "515ea90b",
+      "date": "2026-11-15",
+      "receipt": "docs/models/minimax-m3.1/README.md#measured-results"
+    },
+    "minimax-m3.1/pair/fast/cli/prefill-8k": {
+      "value": 687,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Qualified layers 40–59, cold."
+      },
+      "commit": "515ea90b",
+      "date": "2026-11-15",
+      "receipt": "docs/models/minimax-m3.1/README.md#measured-results"
+    },
+    "minimax-m3.1/pair/fast/served/decode-b1": {
+      "value": 27.1,
+      "workload": {
+        "prompt_tokens": 508,
+        "generated_tokens": 128,
+        "requests": 1,
+        "timing": "decode"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "minimax-m3.1/pair/fast/served/prefill-32k": {
+      "value": 640,
+      "workload": {
+        "prompt_tokens": 30179,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "minimax-m3.1/pair/fast/served/prefill-8k": {
+      "value": 709,
+      "workload": {
+        "prompt_tokens": 7791,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "minimax-m3.1/pair/turbo/served/decode-b1": {
+      "value": 26.7,
+      "workload": {
+        "prompt_tokens": 508,
+        "generated_tokens": 128,
+        "requests": 1,
+        "timing": "decode"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "minimax-m3.1/pair/turbo/served/prefill-32k": {
+      "value": 674,
+      "workload": {
+        "prompt_tokens": 30179,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "minimax-m3.1/pair/turbo/served/prefill-8k": {
+      "value": 709,
+      "workload": {
+        "prompt_tokens": 7791,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "nemotron-3.5-bolt-e4b/one/exact/cli/aggregate-c8": {
+      "value": 237.9,
+      "workload": {
+        "prompt_tokens": null,
+        "generated_tokens": 256,
+        "requests": 8,
+        "timing": "decode",
+        "notes": "Plain benchmark decode, no drafting."
+      },
+      "commit": "cb207e9d",
+      "date": "2026-11-02",
+      "receipt": "docs/models/nemotron-3.5-bolt-e4b/README.md#measured-results",
+      "receipt_revision": true
+    },
+    "nemotron-3.5-bolt-e4b/one/exact/cli/decode-b1": {
+      "value": 91.9,
+      "workload": {
+        "prompt_tokens": null,
+        "generated_tokens": 256,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "Shipped MTP plus lookup, benchmark."
+      },
+      "commit": "cb207e9d",
+      "date": "2026-11-02",
+      "receipt": "docs/models/nemotron-3.5-bolt-e4b/README.md#measured-results",
+      "receipt_revision": true
+    },
+    "nemotron-3.5-bolt-e4b/one/exact/cli/prefill-2k": {
+      "value": 539,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Historical native prompt timing, Q4_K_M."
+      },
+      "commit": "e80432ce",
+      "date": "2026-11-10",
+      "receipt": "docs/models/nemotron-3.5-bolt-e4b/README.md#measured-results",
+      "receipt_revision": true
+    },
+    "nemotron-3.5-bolt-e4b/one/exact/cli/prefill-32k": {
+      "value": 420,
+      "workload": {
+        "prompt_tokens": 32768,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Historical native prompt timing, Q4_K_M."
+      },
+      "commit": "e80432ce",
+      "date": "2026-11-10",
+      "receipt": "docs/models/nemotron-3.5-bolt-e4b/README.md#measured-results",
+      "receipt_revision": true
+    },
+    "nemotron-3.5-bolt-e4b/one/exact/cli/prefill-8k": {
+      "value": 509,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Historical native prompt timing, Q4_K_M."
+      },
+      "commit": "e80432ce",
+      "date": "2026-11-10",
+      "receipt": "docs/models/nemotron-3.5-bolt-e4b/README.md#measured-results",
+      "receipt_revision": true
+    },
+    "nemotron-3.5-bolt-e4b/one/exact/served/aggregate-c8": {
+      "value": 187.4,
+      "workload": {
+        "prompt_tokens": null,
+        "generated_tokens": 128,
+        "requests": 8,
+        "timing": "wall",
+        "notes": "Short chat, prefix cache off."
+      },
+      "commit": "d7069831d",
+      "date": "2026-11-03",
+      "receipt": "docs/performance.md#current-snapshot"
+    },
+    "nemotron-3.5-bolt-e4b/one/exact/served/decode-b1": {
+      "value": 92.1,
+      "workload": {
+        "prompt_tokens": null,
+        "generated_tokens": 128,
+        "requests": 1,
+        "timing": "wall",
+        "notes": "End-to-end short chat, prefix cache off."
+      },
+      "commit": "d7069831d",
+      "date": "2026-11-03",
+      "receipt": "docs/performance.md#current-snapshot"
+    },
+    "nemotron-3.5-bolt-e4b/one/fast/cli/aggregate-c8": {
+      "value": 340.6,
+      "workload": {
+        "prompt_tokens": null,
+        "generated_tokens": 256,
+        "requests": 8,
+        "timing": "decode",
+        "notes": "Plain benchmark decode, no drafting."
+      },
+      "commit": "cb207e9d",
+      "date": "2026-11-02",
+      "receipt": "docs/models/nemotron-3.5-bolt-e4b/README.md#measured-results",
+      "receipt_revision": true
+    },
+    "nemotron-3.5-bolt-e4b/one/fast/cli/decode-b1": {
+      "value": 99.5,
+      "workload": {
+        "prompt_tokens": null,
+        "generated_tokens": 256,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "Shipped MTP plus lookup, benchmark."
+      },
+      "commit": "cb207e9d",
+      "date": "2026-11-02",
+      "receipt": "docs/models/nemotron-3.5-bolt-e4b/README.md#measured-results",
+      "receipt_revision": true
+    },
+    "nemotron-3.5-bolt-e4b/one/fast/cli/prefill-2k": {
+      "value": 2880,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Historical native prompt timing, Q4_K_M."
+      },
+      "commit": "e80432ce",
+      "date": "2026-11-10",
+      "receipt": "docs/models/nemotron-3.5-bolt-e4b/README.md#measured-results",
+      "receipt_revision": true
+    },
+    "nemotron-3.5-bolt-e4b/one/fast/cli/prefill-32k": {
+      "value": 2336,
+      "workload": {
+        "prompt_tokens": 32768,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Historical native prompt timing, Q4_K_M."
+      },
+      "commit": "e80432ce",
+      "date": "2026-11-10",
+      "receipt": "docs/models/nemotron-3.5-bolt-e4b/README.md#measured-results",
+      "receipt_revision": true
+    },
+    "nemotron-3.5-bolt-e4b/one/fast/cli/prefill-8k": {
+      "value": 2780,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Historical native prompt timing, Q4_K_M."
+      },
+      "commit": "e80432ce",
+      "date": "2026-11-10",
+      "receipt": "docs/models/nemotron-3.5-bolt-e4b/README.md#measured-results",
+      "receipt_revision": true
+    },
+    "nemotron-3.5-bolt-e4b/one/turbo/cli/decode-b1": {
+      "value": 45.34,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "Published TURBO attention band, drafting off."
+      },
+      "commit": "1eba63b4",
+      "date": "2026-11-27",
+      "receipt": "docs/optimizations.md#g4-int8-global-kv-shadow",
+      "receipt_revision": true
+    },
+    "nemotron-3.5-bolt-e4b/one/turbo/cli/prefill-2k": {
+      "value": 2880,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Historical native prompt timing, Q4_K_M."
+      },
+      "commit": "e80432ce",
+      "date": "2026-11-10",
+      "receipt": "docs/models/nemotron-3.5-bolt-e4b/README.md#measured-results",
+      "receipt_revision": true
+    },
+    "nemotron-3.5-bolt-e4b/one/turbo/cli/prefill-32k": {
+      "value": 2336,
+      "workload": {
+        "prompt_tokens": 32768,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Historical native prompt timing, Q4_K_M."
+      },
+      "commit": "e80432ce",
+      "date": "2026-11-10",
+      "receipt": "docs/models/nemotron-3.5-bolt-e4b/README.md#measured-results",
+      "receipt_revision": true
+    },
+    "nemotron-3.5-bolt-e4b/one/turbo/cli/prefill-8k": {
+      "value": 2780,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Historical native prompt timing, Q4_K_M."
+      },
+      "commit": "e80432ce",
+      "date": "2026-11-10",
+      "receipt": "docs/models/nemotron-3.5-bolt-e4b/README.md#measured-results",
+      "receipt_revision": true
+    },
+    "nemotron-3.5-bolt-e4b/pair/fast/cli/prefill-2k": {
+      "value": 4132,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Layer pipeline, fresh process, drafting off."
+      },
+      "commit": "51b42906e",
+      "date": "2026-11-10",
+      "receipt": "docs/models/nemotron-3.5-bolt-e4b/README.md#two-nodes-pipeline-prompt-prefill-opt-in"
+    },
+    "nemotron-3.5-bolt-e4b/pair/fast/cli/prefill-32k": {
+      "value": 3965,
+      "workload": {
+        "prompt_tokens": 32768,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Layer pipeline, fresh process, drafting off."
+      },
+      "commit": "51b42906e",
+      "date": "2026-11-10",
+      "receipt": "docs/models/nemotron-3.5-bolt-e4b/README.md#two-nodes-pipeline-prompt-prefill-opt-in"
+    },
+    "nemotron-3.5-bolt-e4b/pair/fast/cli/prefill-8k": {
+      "value": 4804,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Layer pipeline, fresh process, drafting off."
+      },
+      "commit": "51b42906e",
+      "date": "2026-11-10",
+      "receipt": "docs/models/nemotron-3.5-bolt-e4b/README.md#two-nodes-pipeline-prompt-prefill-opt-in"
+    },
+    "qwen3.8-27b/one/exact/cli/decode-b1": {
+      "value": 35.3,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": 128,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "MTP default after 2K."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "qwen3.8-27b/one/exact/cli/prefill-2k": {
+      "value": 644,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Earlier published CLI snapshot, plain decode; FAST explicitly used 512 rows."
+      },
+      "commit": "d3a89ae16",
+      "date": "2026-11-21",
+      "receipt": "README.md#results"
+    },
+    "qwen3.8-27b/one/exact/cli/prefill-32k": {
+      "value": 517,
+      "workload": {
+        "prompt_tokens": 32768,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Earlier published CLI snapshot, real text and plain decode."
+      },
+      "commit": "d3a89ae16",
+      "date": "2026-11-21",
+      "receipt": "README.md#results"
+    },
+    "qwen3.8-27b/one/exact/cli/prefill-8k": {
+      "value": 606,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Earlier published CLI snapshot, plain decode; FAST explicitly used 512 rows."
+      },
+      "commit": "d3a89ae16",
+      "date": "2026-11-21",
+      "receipt": "README.md#results"
+    },
+    "qwen3.8-27b/one/fast/cli/decode-b1": {
+      "value": 35.2,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": 128,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "MTP default after 2K."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "qwen3.8-27b/one/fast/cli/prefill-2k": {
+      "value": 728.83,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": 1,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Qualified 512-row window: 2K/8K fastest profile arm, 32K explicit window."
+      },
+      "commit": "3d9c562e",
+      "date": "2026-11-26",
+      "receipt": "docs/models/qwen3.8-27b/README.md#fast-prefill-window-hip-decode-and-speculative-apps",
+      "receipt_revision": true
+    },
+    "qwen3.8-27b/one/fast/cli/prefill-32k": {
+      "value": 532.81,
+      "workload": {
+        "prompt_tokens": 32768,
+        "generated_tokens": 1,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Published default band, 32,768 tokens in 61.5 seconds."
+      },
+      "commit": "3d9c562e",
+      "date": "2026-11-26",
+      "receipt": "docs/optimizations.md",
+      "receipt_revision": true
+    },
+    "qwen3.8-27b/one/fast/cli/prefill-8k": {
+      "value": 677.02,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": 1,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Qualified 512-row window: 2K/8K fastest profile arm, 32K explicit window."
+      },
+      "commit": "3d9c562e",
+      "date": "2026-11-26",
+      "receipt": "docs/models/qwen3.8-27b/README.md#fast-prefill-window-hip-decode-and-speculative-apps",
+      "receipt_revision": true
+    },
+    "qwen3.8-27b/one/turbo/cli/prefill-2k": {
+      "value": 728.83,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": 1,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "TURBO inherits the same default windows in these admitted bands."
+      },
+      "commit": "3d9c562e",
+      "date": "2026-11-26",
+      "receipt": "docs/models/qwen3.8-27b/README.md#fast-prefill-window-hip-decode-and-speculative-apps",
+      "receipt_revision": true
+    },
+    "qwen3.8-27b/one/turbo/cli/prefill-32k": {
+      "value": 532.81,
+      "workload": {
+        "prompt_tokens": 32768,
+        "generated_tokens": 1,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "TURBO inherits the same default windows in these admitted bands."
+      },
+      "commit": "3d9c562e",
+      "date": "2026-11-26",
+      "receipt": "docs/models/qwen3.8-27b/README.md#fast-prefill-window-hip-decode-and-speculative-apps",
+      "receipt_revision": true
+    },
+    "qwen3.8-27b/one/turbo/cli/prefill-8k": {
+      "value": 677.02,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": 1,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "TURBO inherits the same default windows in these admitted bands."
+      },
+      "commit": "3d9c562e",
+      "date": "2026-11-26",
+      "receipt": "docs/models/qwen3.8-27b/README.md#fast-prefill-window-hip-decode-and-speculative-apps",
+      "receipt_revision": true
+    },
+    "qwen3.8-27b/pair/exact/cli/decode-b1": {
+      "value": 45.4,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": 128,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "Tensor parallel, MTP default."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "qwen3.8-27b/pair/fast/cli/decode-b1": {
+      "value": 45.5,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": 128,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "Tensor parallel, MTP default."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "qwen3.8/one/exact/cli/decode-b1": {
+      "value": 51,
+      "workload": {
+        "prompt_tokens": 32768,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "MTP with automatic prefill, earlier published overview."
+      },
+      "commit": "d3a89ae16",
+      "date": "2026-11-21",
+      "receipt": "README.md#results"
+    },
+    "qwen3.8/one/exact/cli/prefill-2k": {
+      "value": 1435,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "qwen3.8/one/exact/cli/prefill-32k": {
+      "value": 1856,
+      "workload": {
+        "prompt_tokens": 32768,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Warm page cache, real text."
+      },
+      "commit": "e5886cb79",
+      "date": "2026-11-14",
+      "receipt": "docs/performance.md#current-snapshot"
+    },
+    "qwen3.8/one/exact/cli/prefill-8k": {
+      "value": 1885,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Warm page cache, real text."
+      },
+      "commit": "ae06f9466",
+      "date": "2026-11-14",
+      "receipt": "docs/performance.md#current-snapshot"
+    },
+    "qwen3.8/one/exact/served/decode-b1": {
+      "value": 40.2,
+      "workload": {
+        "prompt_tokens": null,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "MTP with automatic windows, prose, earlier published overview."
+      },
+      "commit": "d3a89ae16",
+      "date": "2026-11-21",
+      "receipt": "README.md#results"
+    },
+    "qwen3.8/one/fast/cli/decode-b1": {
+      "value": 21.9,
+      "workload": {
+        "prompt_tokens": [
+          2048,
+          32500
+        ],
+        "generated_tokens": 128,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "Plain decode, bundle absent."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "qwen3.8/one/fast/cli/prefill-2k": {
+      "value": 1673,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "qwen3.8/one/fast/cli/prefill-32k": {
+      "value": 1975,
+      "workload": {
+        "prompt_tokens": 32768,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Warm page cache, real text."
+      },
+      "commit": "e5886cb79",
+      "date": "2026-11-14",
+      "receipt": "docs/performance.md#current-snapshot"
+    },
+    "qwen3.8/one/fast/cli/prefill-8k": {
+      "value": 2008,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Warm page cache, real text."
+      },
+      "commit": "ae06f9466",
+      "date": "2026-11-14",
+      "receipt": "docs/performance.md#current-snapshot"
+    },
+    "qwen3.8/one/turbo/cli/decode-b1": {
+      "value": 21.8,
+      "workload": {
+        "prompt_tokens": [
+          2048,
+          32500
+        ],
+        "generated_tokens": 128,
+        "requests": 1,
+        "timing": "decode",
+        "notes": "Plain decode, bundle absent."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "qwen3.8/one/turbo/cli/prefill-2k": {
+      "value": 1188,
+      "workload": {
+        "prompt_tokens": 2048,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "qwen3.8/one/turbo/cli/prefill-32k": {
+      "value": 1665,
+      "workload": {
+        "prompt_tokens": 32500,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill"
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "README.md#results"
+    },
+    "qwen3.8/one/turbo/cli/prefill-8k": {
+      "value": 2080.05,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "Main cap9 re-measure, 8,192 tokens in 3.9374 seconds."
+      },
+      "commit": "ca2de6ae8",
+      "date": "2026-11-25",
+      "receipt": "docs/band-edges.md"
+    },
+    "qwen3.8/pair/exact/cli/prefill-32k": {
+      "value": 2968,
+      "workload": {
+        "prompt_tokens": 32768,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "USB4 state handoff; 8K forced pipeline."
+      },
+      "commit": "e5886cb79",
+      "date": "2026-11-14",
+      "receipt": "docs/performance.md#current-snapshot"
+    },
+    "qwen3.8/pair/exact/cli/prefill-8k": {
+      "value": 2233,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "USB4 state handoff; 8K forced pipeline."
+      },
+      "commit": "e5886cb79",
+      "date": "2026-11-14",
+      "receipt": "docs/performance.md#current-snapshot"
+    },
+    "qwen3.8/pair/fast/cli/prefill-32k": {
+      "value": 3191,
+      "workload": {
+        "prompt_tokens": 32768,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "USB4 state handoff; 8K forced pipeline."
+      },
+      "commit": "e5886cb79",
+      "date": "2026-11-14",
+      "receipt": "docs/performance.md#current-snapshot"
+    },
+    "qwen3.8/pair/fast/cli/prefill-8k": {
+      "value": 2389,
+      "workload": {
+        "prompt_tokens": 8192,
+        "generated_tokens": null,
+        "requests": 1,
+        "timing": "prefill",
+        "notes": "USB4 state handoff; 8K forced pipeline."
+      },
+      "commit": "e5886cb79",
+      "date": "2026-11-14",
+      "receipt": "docs/performance.md#current-snapshot"
+    }
+  },
+  "acceptances": []
+}
