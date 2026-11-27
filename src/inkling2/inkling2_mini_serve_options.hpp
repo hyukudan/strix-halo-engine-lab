@@ -62,12 +62,12 @@ struct MiniServeOptions {
     bool controller_one_plane = false;
     // Resolved screened-head lever (mini_screened_head), the value the CLI and the gate read.
     bool screened_head = false;
-    // Speculation (kMiniSpeculation, or an explicit --speculation off|auto): requested, and admitted (both backends run
-    // it as lane_speculation, mini_served_lane_speculation).
+    // Speculation (kMiniSpeculation, or an explicit --speculation off|auto): requested, and admitted (HIP: lanes draft
+    // from their context through one-lane verify windows while one lane is live; CUDA: lane_speculation).
     bool speculation_requested = false;
     bool speculation = false;
-    // An admitted speculation runs the shared lone-lane speculator on both backends (CohortConfig::lane_speculation: the
-    // command line's speculator step while one lane is live, the model's DSpark sidecar on slot 0's taps).
+    // CUDA: an admitted speculation runs the shared lone-lane speculator (CohortConfig::lane_speculation: the command
+    // line's speculator step while one lane is live, the model's DSpark sidecar on slot 0's taps).
     bool lane_speculation = false;
     MiniSpeculationPolicy speculation_policy{};  // the resolved rule (mini_speculation_line)
 };
@@ -137,26 +137,6 @@ struct MiniServeCohort {
     // a smaller candidate (slot capacity) the held-back route.
     bool served_route = false;
 };
-
-// ONE admission rule of the served lone-lane speculator, both backends: every admitted speculation binds the shared
-// LaneSpeculator (one greedy lane drafts and verifies while at most one request is live; two or more live requests take the
-// shared round again, serve::CohortDecoder). No backend is excluded: HIP binds the same verify windows (stage / commit with
-// slot tapes) and the DSpark drafter over slot 0's taps as the command line.
-constexpr bool mini_served_lane_speculation(bool speculation_admitted) noexcept { return speculation_admitted; }
-
-// The cohort speculation config of a served load: `windows` = the decoder staged verify windows (backend.max_window > 1).
-// Lone-lane speculation (the command line's speculator step) when admitted, else the context-draft round, else none.
-inline void mini_serve_speculation_config(serve::CohortConfig& config, bool speculation, bool lane_speculation,
-                                          bool windows, unsigned max_rows, double probe_loss) {
-    config.context_draft = false;
-    config.max_draft = 0;
-    if (windows && speculation && lane_speculation) {
-        config.lane_speculation = {true, 1U, max_rows, probe_loss, true};
-        return;
-    }
-    config.context_draft = windows && speculation;
-    config.max_draft = windows && speculation ? max_rows - 1U : 0U;
-}
 
 // The HIP tall prompt chunk (STRIX_INK_HIP_SERVED_TALL_CHUNK=1) of the HELD-BACK served route: the command line's chunk
 // although HIP is not declared chunk-invariant. ONE rule for the server and the optimization catalogue, every tier:

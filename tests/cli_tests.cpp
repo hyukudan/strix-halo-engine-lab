@@ -620,11 +620,15 @@ void qwen_launcher_keeps_speculation_default(const fs::path& data) {
         std::istringstream words(out.str());
         std::vector<std::string> args;
         for (std::string word; words >> word;) {
-            if (word.size() >= 2 && word.front() == '\'' && word.back() == '\'') word = word.substr(1, word.size() - 2);
+            // The dry run quotes words for the host shell (single quotes on POSIX, double quotes on Windows).
+            if (word.size() >= 2 && (word.front() == '\'' || word.front() == '"') && word.back() == word.front())
+                word = word.substr(1, word.size() - 2);
             if (!word.empty() && word.front() != '#') args.push_back(word);
         }
-        const auto model_at = std::find(args.begin(), args.end(), "MODEL.gguf");
-        require(model_at != args.end(), "dry run carries the asset");
+        const auto model_at = std::find_if(args.begin(), args.end(), [](const std::string& word) {
+            return word == "MODEL.gguf" || word.ends_with("/MODEL.gguf") || word.ends_with("\\MODEL.gguf");
+        });
+        require(model_at != args.end(), "dry run carries the asset: got " + out.str().substr(0, 400));
         bool profile_seen = false;
         for (auto it = model_at + 1; it != args.end(); ++it) {
             const std::string_view arg = *it;
