@@ -1,11 +1,11 @@
 #pragma once
 
 #if defined(__HIPCC__)
-#include "strix/device/decode_geometry.hpp"
 #include <hip/hip_runtime.h>
 #elif defined(__CUDACC__)
 #include <cuda_runtime.h>
 #endif
+#include "strix/device/decode_geometry.hpp"  // the launch plan of elements(), shared by both device languages
 
 #include <cstddef>
 #include <limits>
