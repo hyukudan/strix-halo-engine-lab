@@ -8,6 +8,7 @@
 #include "dist_crc32c_parallel.hpp"
 #include "dist_crc32c_vector.hpp"
 #include "dist_latency_trace.hpp"
+#include "dist_stream_link.hpp"
 
 #include "strix/serve/json.hpp"
 
@@ -318,16 +319,31 @@ void read_all(int fd, std::span<std::byte> bytes, const char* what) {
     }
 }
 
-std::string errno_text(int error) {
-    switch (error) {
-    case ENODEV: return "ENODEV: the stream device is gone (link unplugged or controller reset)";
-    case ETIMEDOUT: return "ETIMEDOUT: the driver timed out (peer or domain gone)";
-    case ENXIO: return "ENXIO: no stream attached (peer service gone)";
-    case ENOMEM: return "ENOMEM: the driver could not allocate the stream rings (memory pressure)";
-    case EPIPE: return "EPIPE: the peer closed the stream (its rank failed or exited)";
-    case ECONNRESET: return "ECONNRESET: the peer closed the stream (its rank failed or exited)";
-    default: return std::strerror(error);
-    }
+using link::errno_text;  // the stream errors read the same on the raw and the integrity path
+
+// Per-stream integrity (src/dist_stream_link.hpp): sequence + CRC32C + acknowledgement + bounded resend on every host-path
+// byte. STRIX_DIST_USB4_INTEGRITY=0 turns it off (rank 0's choice travels in the pairing plan); the other knobs tune it:
+// STRIX_DIST_USB4_PIECE (payload bytes per unit), _LOSS_MS (half a unit silent for this long = a lost frame),
+// _ACK_MS (unacknowledged retained pieces are resent after this long, doubling), _LINGER_US (send() waits this long for
+// the acknowledgement before it keeps a copy), _RESENDS (resends of one damaged piece before the hard error).
+bool usb4_integrity_wanted() {
+    const char* v = std::getenv("STRIX_DIST_USB4_INTEGRITY");
+    return !(v && std::string(v) == "0");
+}
+link::Options usb4_link_options(std::chrono::milliseconds timeout) {
+    link::Options o;
+    o.timeout = timeout;
+    const auto number = [](const char* key, unsigned long long fallback) {
+        const char* v = std::getenv(key);
+        return v && *v ? std::stoull(v) : fallback;
+    };
+    o.piece = static_cast<std::size_t>(std::clamp<unsigned long long>(number("STRIX_DIST_USB4_PIECE", o.piece), 4096ULL, 1ULL << 30U));
+    o.loss = std::chrono::milliseconds(number("STRIX_DIST_USB4_LOSS_MS", static_cast<unsigned long long>(o.loss.count())));
+    o.ack = std::chrono::milliseconds(number("STRIX_DIST_USB4_ACK_MS", static_cast<unsigned long long>(o.ack.count())));
+    o.linger = std::chrono::microseconds(number("STRIX_DIST_USB4_LINGER_US", static_cast<unsigned long long>(o.linger.count())));
+    o.attempts = static_cast<unsigned>(std::clamp<unsigned long long>(number("STRIX_DIST_USB4_RESENDS", o.attempts), 1ULL, 64ULL));
+    o.spin = strix::envcfg::flag("STRIX_DIST_USB4_SPIN", false);
+    return o;
 }
 
 // Host path of USB4 streams. Each stream has a persistent writer and a persistent reader, so a stream's
@@ -341,8 +357,10 @@ std::string errno_text(int error) {
 class Usb4HostTransport final : public Transport {
 public:
     Usb4HostTransport(std::vector<int> fds, std::vector<std::string> names, std::vector<std::uint32_t> weights,
-                      std::size_t min_part = 0, std::chrono::milliseconds timeout = std::chrono::milliseconds(120000))
-        : names_(std::move(names)), fds_(std::move(fds)), weights_(std::move(weights)), min_part_(min_part), timeout_(timeout) {
+                      std::size_t min_part = 0, std::chrono::milliseconds timeout = std::chrono::milliseconds(120000),
+                      bool integrity = usb4_integrity_wanted(), std::vector<std::unique_ptr<link::Link>> links = {})
+        : names_(std::move(names)), fds_(std::move(fds)), weights_(std::move(weights)), min_part_(min_part), timeout_(timeout),
+          integrity_(integrity), links_(std::move(links)) {
         if (fds_.empty() || fds_.size() > 8U || names_.size() != fds_.size() || weights_.size() != fds_.size()) {
             for (const int fd : fds_) ::close(fd);
             fail("usb4 host transport takes one to eight streams, each with a name and a weight");
@@ -360,6 +378,21 @@ public:
                 for (const int open_fd : fds_) ::close(open_fd);
                 fail(std::string("usb4 host transport: cannot make a stream non-blocking: ") + std::strerror(error));
             }
+        // The links carry the sequence/acknowledgement state of each stream (the open probe already used them).
+        if (integrity_) {
+            if (links_.empty())
+                for (std::size_t k = 0; k < fds_.size(); ++k)
+                    links_.push_back(std::make_unique<link::Link>(fds_[k], names_[k], usb4_link_options(timeout_)));
+            if (links_.size() != fds_.size()) {
+                for (const int fd : fds_) ::close(fd);
+                fail("usb4 host transport: one integrity link per stream");
+            }
+            for (auto& l : links_) l->set_abort(&aborted_);
+        } else {
+            links_.clear();
+        }
+        // The service thread keeps every link's repair going while the calling threads wait on other streams.
+        if (integrity_) servicer_ = std::thread([this] { service_loop(); });
         // STRIX_DIST_USB4_EAGER=N: messages of at most N bytes are moved on the calling thread, with no hand-off to the
         // per-stream threads. Every direction of every stream progresses in one poll loop, so a part larger than what
         // a stream buffers cannot deadlock two ranks that both write before they read.
@@ -401,6 +434,13 @@ public:
     }
     ~Usb4HostTransport() override {
         if (traffic_) std::fprintf(stderr, "%s\n", traffic().c_str());
+        stop_servicer();
+        if (integrity_) {
+            // Retained pieces the peer may still ask for, then one receipt line (the counters of every stream).
+            if (!poisoned_.load(std::memory_order_acquire))
+                for (auto& l : links_) l->drain(std::chrono::milliseconds(3000));
+            std::fprintf(stderr, "%s\n", integrity_line().c_str());
+        }
         aborted_.store(true, std::memory_order_release);
         writers_.clear();
         readers_.clear();
@@ -427,7 +467,24 @@ public:
             out += std::string(i ? "," : " (streams ") + (table_[i].first == SIZE_MAX ? std::string("inf") : std::to_string(table_[i].first)) + ":" +
                    std::to_string(table_[i].second) + (i + 1U == table_.size() || !table_[i + 1U].second ? ")" : "");
         if (eager_) out += " (eager up to " + std::to_string(eager_) + " B)";
+        if (!integrity_) out += " (integrity off)";
         return out;
+    }
+    // "usb4 integrity: clean (N pieces out, M in)" or the counters of every stream that saw damage.
+    [[nodiscard]] std::string integrity_line() const {
+        if (!integrity_) return "usb4 integrity: off";
+        std::uint64_t out_pieces = 0, in_pieces = 0;
+        bool clean = true;
+        for (const auto& l : links_) {
+            out_pieces += l->counters().pieces_out.load();
+            in_pieces += l->counters().pieces_in.load();
+            clean = clean && l->clean();
+        }
+        std::string text = "usb4 integrity: " + std::string(clean ? "clean" : "REPAIRED") + " (" + std::to_string(out_pieces) + " pieces out, " +
+                           std::to_string(in_pieces) + " in)";
+        if (!clean)
+            for (const auto& l : links_) text += "; " + l->summary();
+        return text;
     }
 
 private:
@@ -450,7 +507,14 @@ private:
         const auto end = k + 1U == used ? size : (size * through / total) & ~std::uint64_t{63};
         return message.subspan(begin, end - begin);
     }
+    // The service thread works on these descriptors: it stops before any of them is closed (a closed number may be reused).
+    void stop_servicer() {
+        servicer_stop_.store(true, std::memory_order_release);
+        std::lock_guard lock(servicer_mutex_);
+        if (servicer_.joinable() && servicer_.get_id() != std::this_thread::get_id()) servicer_.join();
+    }
     void close_all() {
+        stop_servicer();
         std::lock_guard lock(fds_mutex_); // abort() may be switching them to /dev/null on another thread
         for (auto& fd : fds_)
             if (fd >= 0) { ::close(fd); fd = -1; }
@@ -476,7 +540,35 @@ private:
             return; // ready, or an error/hang-up that the read or write reports precisely
         }
     }
+    // Link errors name the stream already; they fail the transport like any stream failure.
+    template <class F> void on_link(std::size_t k, F&& f) {
+        try {
+            f();
+        } catch (const link::Stopped&) {
+            throw Aborted{};
+        } catch (const link::Error& e) {
+            fail_text(k, e.what());
+        }
+    }
     void write_part(std::size_t k, std::span<const std::byte> bytes) {
+        if (integrity_) {
+            latency::mark("stream_write_begin", k);
+            auto& st = stats_[k];
+            const auto begin_ns = traffic_ ? now_ns() : 0U;
+            st.want_w.store(bytes.size(), std::memory_order_relaxed);
+            st.done_w.store(0, std::memory_order_relaxed);
+            on_link(k, [&] { links_[k]->send(bytes); });
+            st.done_w.store(bytes.size(), std::memory_order_relaxed);
+            st.last_w.store(now_ns(), std::memory_order_relaxed);
+            if (traffic_) {
+                const auto end_ns = now_ns();
+                st.bytes_w.fetch_add(bytes.size(), std::memory_order_relaxed);
+                st.busy_w.fetch_add(end_ns - begin_ns, std::memory_order_relaxed);
+                st.fin_w.store(end_ns, std::memory_order_relaxed);
+            }
+            latency::mark("stream_write_end", k);
+            return;
+        }
         latency::mark("stream_write_begin", k);
         std::size_t done = 0;
         auto deadline = std::chrono::steady_clock::now() + timeout_;
@@ -515,6 +607,24 @@ private:
         latency::mark("stream_write_end", k);
     }
     void read_part(std::size_t k, std::span<std::byte> bytes) {
+        if (integrity_) {
+            latency::mark("stream_read_begin", k);
+            auto& st = stats_[k];
+            const auto begin_ns = traffic_ ? now_ns() : 0U;
+            st.want_r.store(bytes.size(), std::memory_order_relaxed);
+            st.done_r.store(0, std::memory_order_relaxed);
+            on_link(k, [&] { links_[k]->receive(bytes); });
+            st.done_r.store(bytes.size(), std::memory_order_relaxed);
+            st.last_r.store(now_ns(), std::memory_order_relaxed);
+            if (traffic_) {
+                const auto end_ns = now_ns();
+                st.bytes_r.fetch_add(bytes.size(), std::memory_order_relaxed);
+                st.busy_r.fetch_add(end_ns - begin_ns, std::memory_order_relaxed);
+                st.fin_r.store(end_ns, std::memory_order_relaxed);
+            }
+            latency::mark("stream_read_end", k);
+            return;
+        }
         latency::mark("stream_read_begin", k);
         std::size_t done = 0;
         auto deadline = std::chrono::steady_clock::now() + timeout_;
@@ -560,6 +670,10 @@ private:
     // for the peer), or at the end.
     void eager(const std::span<const std::byte>* out, const std::span<std::byte>* in, std::size_t used, void (*on_wire)(void*) = nullptr,
                void* context = nullptr, bool small_ordered = false) {
+        if (integrity_) {
+            eager_links(out, in, used, on_wire, context, small_ordered);
+            return;
+        }
         std::array<std::span<const std::byte>, 8> wpart{};
         std::array<std::span<std::byte>, 8> rpart{};
         std::array<std::size_t, 8> wdone{}, rdone{};
@@ -650,7 +764,132 @@ private:
         }
         if (on_wire) on_wire(context);
     }
+    // The eager path over the integrity links: the same single-thread loop, in units. No acknowledgement wait: a small
+    // message is copied, handed to the driver and the call returns; its ACK is read by a later call (Link::service).
+    void eager_links(const std::span<const std::byte>* out, const std::span<std::byte>* in, std::size_t used, void (*on_wire)(void*),
+                     void* context, bool small_ordered) {
+        std::array<bool, 8> wbusy{}, rbusy{};
+        std::size_t open = 0, wopen = 0;
+        std::vector<link::Link::Use> uses;  // the service thread keeps off these links until the call returns
+        uses.reserve(used);
+        for (std::size_t k = 0; k < used; ++k) uses.push_back(links_[k]->hold());
+        for (std::size_t k = 0; k < used; ++k) {
+            auto& st = stats_[k];
+            if (out) {
+                const auto piece = part(*out, k, used);
+                st.want_w.store(piece.size(), std::memory_order_relaxed);
+                st.done_w.store(0, std::memory_order_relaxed);
+                if (!piece.empty()) {
+                    on_link(k, [&] { links_[k]->begin_send(piece, small_resend_, small_resend_); });
+                    wbusy[k] = true;
+                    ++open;
+                    ++wopen;
+                }
+            }
+            if (in) {
+                const auto piece = part(*in, k, used);
+                st.want_r.store(piece.size(), std::memory_order_relaxed);
+                st.done_r.store(0, std::memory_order_relaxed);
+                if (!piece.empty()) {
+                    links_[k]->begin_receive(piece);
+                    rbusy[k] = true;
+                    ++open;
+                }
+            }
+        }
+        auto deadline = std::chrono::steady_clock::now() + timeout_;
+        const auto spin_deadline = small_ordered ? std::chrono::steady_clock::now() + xport::SmallProgress::wire_spin
+                                                : std::chrono::steady_clock::time_point{};
+        std::array<pollfd, 8> fds{};
+        std::array<std::size_t, 8> stream{};
+        while (open) {
+            bool moved = false;
+            for (std::size_t k = 0; k < used; ++k) {
+                if (!wbusy[k] && !rbusy[k]) continue;
+                on_link(k, [&] { moved |= links_[k]->progress(rbusy[k]); });
+                if (wbusy[k] && links_[k]->send_written()) {
+                    wbusy[k] = false;
+                    --open;
+                    --wopen;
+                    stats_[k].done_w.store(stats_[k].want_w.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                    stats_[k].last_w.store(now_ns(), std::memory_order_relaxed);
+                }
+                if (rbusy[k] && links_[k]->received()) {
+                    rbusy[k] = false;
+                    --open;
+                    stats_[k].done_r.store(stats_[k].want_r.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                    stats_[k].last_r.store(now_ns(), std::memory_order_relaxed);
+                }
+            }
+            if (on_wire && !wopen && open) {
+                on_wire(context);
+                on_wire = nullptr;
+                continue;
+            }
+            if (!open) break;
+            if (aborted_.load(std::memory_order_acquire)) throw Aborted{};
+            const auto now = std::chrono::steady_clock::now();
+            if (moved) { deadline = now + timeout_; continue; }
+            if (now >= deadline) {
+                std::size_t k = 0;
+                while (!wbusy[k] && !rbusy[k]) ++k;
+                fail_stream(k, std::string(wbusy[k] ? "write" : "read") + ": no progress within " + std::to_string(timeout_.count()) + " ms (" +
+                                   links_[k]->state() + ")");
+            }
+            if (spin_) { cpu_relax(); continue; }
+            if (small_ordered && now < spin_deadline) { cpu_relax(); continue; }
+            std::size_t n = 0;
+            for (std::size_t k = 0; k < used; ++k)
+                if (wbusy[k] || rbusy[k]) { fds[n] = pollfd{fds_[k], links_[k]->events(), 0}; stream[n++] = k; }
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+            const int ready = ::poll(fds.data(), static_cast<nfds_t>(n), static_cast<int>(std::clamp<long long>(left, 0, 20)));
+            if (ready < 0 && errno != EINTR) fail_stream(stream[0], "poll: " + errno_text(errno));
+            for (std::size_t i = 0; ready > 0 && i < n; ++i) {
+                if (!fds[i].revents) continue;
+                stats_[stream[i]].revents.store(fds[i].revents, std::memory_order_relaxed);
+                if (fds[i].revents & POLLNVAL) fail_stream(stream[i], "descriptor closed");
+            }
+        }
+        if (on_wire) on_wire(context);
+    }
+    // Every link that has repair work (retained pieces, control units, a requested resend), whatever the calling threads
+    // wait on: a peer that waits for a resend on a stream this rank is not using now still gets it, and a lost tail is
+    // resent on its acknowledgement clock. Idle links cost a flag check every few milliseconds. A link failure here
+    // fails the transport (the waiting threads leave on the abort flag with this cause).
+    void service_loop() {
+        std::array<pollfd, 8> fds{};
+        while (!servicer_stop_.load(std::memory_order_acquire) && !aborted_.load(std::memory_order_acquire)) {
+            std::size_t n = 0;
+            try {
+                for (std::size_t k = 0; k < links_.size(); ++k) {
+                    if (!links_[k]->needs_service()) continue;
+                    links_[k]->service();
+                    // Write room only: polling for input would wake this thread on every unit a caller's next transfer
+                    // brings (acknowledgements and requests are read on the next pass).
+                    if (links_[k]->needs_service() && (links_[k]->events() & POLLOUT)) fds[n++] = pollfd{fds_[k], POLLOUT, 0};
+                }
+            } catch (const link::Stopped&) {
+                return;
+            } catch (const link::Error& e) {
+                std::lock_guard lock(root_mutex_);
+                if (root_.empty()) root_ = e.what();
+                aborted_.store(true, std::memory_order_release);
+                return;
+            }
+            if (n) (void)::poll(fds.data(), static_cast<nfds_t>(n), 2);
+            else std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
     struct Aborted {};
+    [[noreturn]] void fail_text(std::size_t k, const std::string& text) {
+        (void)k;
+        {
+            std::lock_guard lock(root_mutex_);
+            if (root_.empty()) root_ = text;
+        }
+        aborted_.store(true, std::memory_order_release);
+        fail(text);
+    }
     [[noreturn]] void fail_stream(std::size_t k, const std::string& what) {
         const std::string text = "usb4 stream " + names_[k] + ": " + what;
         {
@@ -749,6 +988,14 @@ private:
     std::size_t min_part_ = 0, eager_ = 0;
     std::array<std::pair<std::size_t, std::size_t>, 4> table_{}; // (message bytes up to, streams), STRIX_DIST_USB4_STREAMS
     std::chrono::milliseconds timeout_;
+    bool integrity_ = true;
+    std::vector<std::unique_ptr<link::Link>> links_;
+    // STRIX_DIST_USB4_SMALL_RESEND=0: eager (small) messages go without a copy: damage to them is detected and fails the
+    // transport by name instead of being repaired (saves a copy of at most the eager limit and one ACK unit per message).
+    const bool small_resend_ = strix::envcfg::flag("STRIX_DIST_USB4_SMALL_RESEND", true);
+    std::thread servicer_;
+    std::mutex servicer_mutex_;
+    std::atomic<bool> servicer_stop_{false};
     bool small_spin_ = false;
     const bool spin_ = strix::envcfg::flag("STRIX_DIST_USB4_SPIN", false);
     std::atomic<bool> aborted_{false};
@@ -816,7 +1063,9 @@ public:
             out << (k ? "; " : "") << names_[k] << ": wrote " << st.done_w.load() << "/" << st.want_w.load() << " (last " << ago(st.last_w.load())
                 << "), read " << st.done_r.load() << "/" << st.want_r.load() << " (last " << ago(st.last_r.load()) << "), revents 0x" << std::hex
                 << st.revents.load() << std::dec;
+            if (integrity_ && k < links_.size()) out << " [" << links_[k]->state() << "]";
         }
+        if (integrity_) out << "; " << integrity_line();
         return out.str();
     }
 
@@ -871,6 +1120,7 @@ struct Plan {
 };
 static_assert(sizeof(Plan) == 128);
 constexpr std::uint32_t plan_joint = 1U;
+constexpr std::uint32_t plan_integrity_off = 2U;  // rank 0 runs without per-stream integrity (STRIX_DIST_USB4_INTEGRITY=0)
 
 template <class T> std::uint32_t body_crc(const T& value) {
     return crc32c(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&value), offsetof(T, crc)));
@@ -1163,11 +1413,7 @@ bool handshake_step(Candidate& c, std::uint32_t index, const Handshake& hs) {
 
 // Version 2 used the same 128 bytes, with its CRC immediately after min_part and zero padding thereafter.
 // Normalize it to Plan only inside this process; version 3 retains its existing wire representation.
-void write_plan(int fd, const Plan& plan) {
-    if (plan.version != 2U) {
-        write_all(fd, std::span<const std::byte>(reinterpret_cast<const std::byte*>(&plan), sizeof(plan)), "usb4 plan");
-        return;
-    }
+Plan wire_plan(const Plan& plan) {
     Plan wire = plan;
     if (plan.version == 2U) {
         constexpr auto prefix = offsetof(Plan, streams_up_to);
@@ -1176,6 +1422,10 @@ void write_plan(int fd, const Plan& plan) {
         std::memset(bytes + prefix, 0, sizeof(wire) - prefix);
         std::memcpy(bytes + prefix, &crc, sizeof(crc));
     }
+    return wire;
+}
+void write_plan(int fd, const Plan& plan) {
+    const Plan wire = wire_plan(plan);
     write_all(fd, std::span<const std::byte>(reinterpret_cast<const std::byte*>(&wire), sizeof(wire)), "usb4 plan");
 }
 Plan check_plan(Plan plan, std::uint32_t version = pairing_version) {
@@ -1242,22 +1492,34 @@ bool same_plan(const Plan& a, const Plan& b) {
     return true;
 }
 // Rank 0 sends the plan on its first stream; rank 1 echoes it after checking it.
-void agree(int fd, std::uint32_t rank, Plan& plan) {
+// With an integrity link the plan travels in its units (the probe already used that stream's sequence).
+void agree(int fd, std::uint32_t rank, Plan& plan, link::Link* l = nullptr) {
     plan.crc = body_crc(plan);
+    const auto put = [&](const Plan& p) {
+        if (!l) return write_plan(fd, p);
+        const Plan wire = wire_plan(p);
+        l->send(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&wire), sizeof(wire)));
+    };
+    const auto get = [&](std::uint32_t version) {
+        if (!l) return read_plan(fd, version);
+        Plan got;
+        l->receive(std::span<std::byte>(reinterpret_cast<std::byte*>(&got), sizeof(got)));
+        return check_plan(got, version);
+    };
     if (rank == 0U) {
-        write_plan(fd, plan);
-        if (!same_plan(read_plan(fd, plan.version), plan)) fail("usb4 pairing: the peer did not echo the plan");
+        put(plan);
+        if (!same_plan(get(plan.version), plan)) fail("usb4 pairing: the peer did not echo the plan");
     } else {
-        const auto theirs = read_plan(fd, plan.version);
+        const auto theirs = get(plan.version);
         bool ok = theirs.count == plan.count;
         for (std::uint32_t i = 0; ok && i < plan.count; ++i) ok = theirs.index[i] == plan.index[i];
-        write_plan(fd, theirs);
+        put(theirs);
         if (!ok) fail("usb4 pairing: the two ranks disagree on the streams");
         plan = theirs;
     }
 }
 
-double probe_exchange(const std::vector<int>& fds, std::size_t bytes, std::uint32_t rank) {
+double probe_exchange(const std::vector<int>& fds, std::size_t bytes, std::uint32_t rank, const std::vector<link::Link*>& links = {}) {
     const std::size_t count = fds.size();
     std::vector<std::vector<std::byte>> out(count), in(count);
     for (std::size_t k = 0; k < count; ++k) {
@@ -1272,10 +1534,16 @@ double probe_exchange(const std::vector<int>& fds, std::size_t bytes, std::uint3
     std::vector<std::exception_ptr> errors(2U * count);
     for (std::size_t k = 0; k < count; ++k) {
         threads.emplace_back([&, k] {
-            try { write_all(fds[k], out[k], "usb4 probe"); } catch (...) { errors[2U * k] = std::current_exception(); }
+            try {
+                if (links.empty()) write_all(fds[k], out[k], "usb4 probe");
+                else links[k]->send(out[k]);
+            } catch (...) { errors[2U * k] = std::current_exception(); }
         });
         threads.emplace_back([&, k] {
-            try { read_all(fds[k], in[k], "usb4 probe"); } catch (...) { errors[2U * k + 1U] = std::current_exception(); }
+            try {
+                if (links.empty()) read_all(fds[k], in[k], "usb4 probe");
+                else links[k]->receive(in[k]);
+            } catch (...) { errors[2U * k + 1U] = std::current_exception(); }
         });
     }
     for (auto& t : threads) t.join();
@@ -1291,7 +1559,8 @@ double probe_exchange(const std::vector<int>& fds, std::size_t bytes, std::uint3
 
 // Every stream at once, stream k carrying parts[k] bytes each way: per stream, the seconds until both its write and its
 // read are complete (the rate each stream really gets while all of them share the host).
-std::vector<double> probe_joint(const std::vector<int>& fds, const std::vector<std::size_t>& parts, std::uint32_t rank) {
+std::vector<double> probe_joint(const std::vector<int>& fds, const std::vector<std::size_t>& parts, std::uint32_t rank,
+                                const std::vector<link::Link*>& links = {}) {
     const std::size_t count = fds.size();
     std::vector<std::vector<std::byte>> out(count), in(count);
     for (std::size_t k = 0; k < count; ++k) {
@@ -1305,11 +1574,17 @@ std::vector<double> probe_joint(const std::vector<int>& fds, const std::vector<s
     std::vector<std::exception_ptr> errors(2U * count);
     for (std::size_t k = 0; k < count; ++k) {
         threads.emplace_back([&, k] {
-            try { write_all(fds[k], out[k], "usb4 joint probe"); } catch (...) { errors[2U * k] = std::current_exception(); }
+            try {
+                if (links.empty()) write_all(fds[k], out[k], "usb4 joint probe");
+                else links[k]->send(out[k]);
+            } catch (...) { errors[2U * k] = std::current_exception(); }
             wend[k] = std::chrono::steady_clock::now();
         });
         threads.emplace_back([&, k] {
-            try { read_all(fds[k], in[k], "usb4 joint probe"); } catch (...) { errors[2U * k + 1U] = std::current_exception(); }
+            try {
+                if (links.empty()) read_all(fds[k], in[k], "usb4 joint probe");
+                else links[k]->receive(in[k]);
+            } catch (...) { errors[2U * k + 1U] = std::current_exception(); }
             rend[k] = std::chrono::steady_clock::now();
         });
     }
@@ -1593,6 +1868,7 @@ std::unique_ptr<Transport> usb4_host_auto(const Usb4AutoOptions& options, Usb4To
         if (options.rank == 0U) {
             plan.count = static_cast<std::uint32_t>(accepted.size());
             for (std::size_t k = 0; k < accepted.size(); ++k) plan.index[k] = candidates[accepted[k]].info.rank0_index;
+            if (plan.version != 2U && !usb4_integrity_wanted()) plan.flags |= plan_integrity_off;  // v2 plans carry no flags
             plan.crc = body_crc(plan);
             set_blocking(candidates[plan_stream].fd, true);
             write_plan(candidates[plan_stream].fd, plan);
@@ -1654,6 +1930,35 @@ std::unique_ptr<Transport> usb4_host_auto(const Usb4AutoOptions& options, Usb4To
         for (const auto i : accepted) set_blocking(candidates[i].fd, false);
         std::vector<int> fds;
         for (const auto i : accepted) fds.push_back(candidates[i].fd);
+        // From here on every byte of these streams travels in integrity units (rank 0's choice; a v2 plan carries no
+        // flags, so both ranks follow their own STRIX_DIST_USB4_INTEGRITY there). The probe and the plan use them too.
+        const bool integrity = plan.version == 2U ? usb4_integrity_wanted() : (plan.flags & plan_integrity_off) == 0U;
+        std::vector<std::unique_ptr<link::Link>> links;
+        std::map<int, link::Link*> link_of;
+        if (integrity)
+            for (const auto i : accepted) {
+                auto& c = candidates[i];
+                links.push_back(std::make_unique<link::Link>(c.fd, c.info.device + ">tbstream" + std::to_string(c.info.remote_device),
+                                                             usb4_link_options(usb4_stream_timeout(options.io_timeout))));
+                link_of[c.fd] = links.back().get();
+            }
+        const auto links_for = [&](const std::vector<int>& list) {
+            std::vector<link::Link*> out;
+            if (integrity)
+                for (const int fd : list) out.push_back(link_of.at(fd));
+            return out;
+        };
+        // A 64-byte token each way on one stream.
+        const auto token_exchange = [&](int fd, const char* what) {
+            std::array<std::byte, 64> token{}, back{};
+            if (integrity) {
+                link_of.at(fd)->send(token);
+                link_of.at(fd)->receive(back);
+            } else {
+                write_all(fd, token, what);
+                read_all(fd, back, what);
+            }
+        };
         // Cables (XDomains) in striping order; each one measured with all its streams at once.
         std::vector<std::string> order;
         for (const auto i : accepted)
@@ -1667,17 +1972,14 @@ std::unique_ptr<Transport> usb4_host_auto(const Usb4AutoOptions& options, Usb4To
             if (options.probe_bytes) {
                 // A 64-byte barrier on the cable before each repetition: without it the rank that starts
                 // later finds the peer's data already buffered and overstates the rate.
-                const auto barrier = [&] {
-                    std::array<std::byte, 64> token{}, back{};
-                    write_all(cable_fds[0], token, "usb4 probe barrier");
-                    read_all(cable_fds[0], back, "usb4 probe barrier");
-                };
+                const auto barrier = [&] { token_exchange(cable_fds[0], "usb4 probe barrier"); };
+                const auto cable_links = links_for(cable_fds);
                 barrier();
-                (void)probe_exchange(cable_fds, std::min<std::size_t>(options.probe_bytes, 256U * 1024U), options.rank); // warm-up
+                (void)probe_exchange(cable_fds, std::min<std::size_t>(options.probe_bytes, 256U * 1024U), options.rank, cable_links); // warm-up
                 std::vector<double> times;
                 for (int rep = 0; rep < 5; ++rep) {
                     barrier();
-                    times.push_back(probe_exchange(cable_fds, options.probe_bytes, options.rank));
+                    times.push_back(probe_exchange(cable_fds, options.probe_bytes, options.rank, cable_links));
                 }
                 std::sort(times.begin(), times.end());
                 gbps = static_cast<double>((options.probe_bytes / cable_fds.size()) & ~std::size_t{63}) * static_cast<double>(cable_fds.size()) * 8.0 / times[2] / 1e9;
@@ -1719,14 +2021,12 @@ std::unique_ptr<Transport> usb4_host_auto(const Usb4AutoOptions& options, Usb4To
             if (const char* c = std::getenv("STRIX_DIST_USB4_CALIBRATE"); transport_has(options.transport_capabilities, usb4_joint_calibration) && c && std::string(c) == "joint" && !explicit_weights && accepted.size() > 1U)
                 weights.flags |= plan_joint;
         }
-        agree(fds[0], options.rank, weights);
+        link::Link* plan_link = integrity ? link_of.at(fds[0]) : nullptr;
+        agree(fds[0], options.rank, weights, plan_link);
         if (weights.flags & plan_joint) {
             const std::size_t total = std::max<std::size_t>(options.probe_bytes, std::size_t{16} << 20U) * order.size();
-            const auto barrier = [&] {
-                std::array<std::byte, 64> token{}, back{};
-                write_all(fds[0], token, "usb4 joint probe barrier");
-                read_all(fds[0], back, "usb4 joint probe barrier");
-            };
+            const auto barrier = [&] { token_exchange(fds[0], "usb4 joint probe barrier"); };
+            const auto all_links = links_for(fds);
             for (int round = 0; round < 2; ++round) {
                 std::uint64_t sum = 0;
                 for (std::size_t k = 0; k < accepted.size(); ++k) sum += weights.weight[k];
@@ -1735,7 +2035,7 @@ std::unique_ptr<Transport> usb4_host_auto(const Usb4AutoOptions& options, Usb4To
                 std::vector<std::vector<double>> times(accepted.size());
                 for (int rep = 0; rep < 3; ++rep) {
                     barrier();
-                    const auto t = probe_joint(fds, parts, options.rank);
+                    const auto t = probe_joint(fds, parts, options.rank, all_links);
                     for (std::size_t k = 0; k < t.size(); ++k) times[k].push_back(t[k]);
                 }
                 for (std::size_t k = 0; k < accepted.size(); ++k) {
@@ -1743,7 +2043,7 @@ std::unique_ptr<Transport> usb4_host_auto(const Usb4AutoOptions& options, Usb4To
                     const double gbps = static_cast<double>(parts[k]) * 8.0 / times[k][1] / 1e9;  // median of 3, one direction
                     weights.weight[k] = std::max<std::uint32_t>(1U, static_cast<std::uint32_t>(gbps * 1000.0));
                 }
-                agree(fds[0], options.rank, weights);  // rank 0's measurement decides
+                agree(fds[0], options.rank, weights, plan_link);  // rank 0's measurement decides
             }
         }
         std::vector<std::string> names;
@@ -1757,7 +2057,7 @@ std::unique_ptr<Transport> usb4_host_auto(const Usb4AutoOptions& options, Usb4To
         }
         for (const auto i : accepted) candidates[i].fd = -1; // owned by the transport from here on
         auto transport = std::make_unique<Usb4HostTransport>(std::move(fds), std::move(names), std::move(stream_weights), weights.min_part,
-                                                             options.io_timeout);
+                                                             options.io_timeout, integrity, std::move(links));
         std::array<std::pair<std::size_t, std::size_t>, 4> table{};
         for (std::size_t i = 0; i < 4U && weights.streams_count[i]; ++i)
             table[i] = {weights.streams_up_to[i] == UINT32_MAX ? SIZE_MAX : std::size_t{weights.streams_up_to[i]}, std::size_t{weights.streams_count[i]}};
