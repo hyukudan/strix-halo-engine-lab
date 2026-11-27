@@ -593,7 +593,10 @@ Cli parse_cli(const std::string& app, const std::vector<std::string>& args) {
     if (app != "rank" && app != "serve") throw std::invalid_argument("parse_cli: app must be rank or serve");
     Cli c;
     c.app = app;
-    if (app == "serve") c.transport = "usb4gpu";
+    // Serve and rank default to the host route (Cli::transport). Every MiniMax pair receipt ran on it: on USB4 layout 1
+    // a usb4gpu request fell back to it, and on layout 2bq (gpu_direct streams present) the negotiated direct route
+    // measured 8K served TTFT 17.3 s vs 12.0 s on the host route with identical output (md_dev2 m3d). GPU-direct stays
+    // an explicit --transport usb4gpu.
     std::size_t i = 0;
     if (app == "rank") {  // MODEL_DIR RANK TRANSPORT OUT_DIR [options]
         if (args.size() > 2 && args[2].rfind("--", 0) != 0) c.transport = args[2];

@@ -210,6 +210,10 @@ void glm() {
                                  rd::serve_prefill_work(true, true, 8192, 16384, 4096, 64, true)})
         check(!rd::select_prefill_wmma(c1_server, c1_serve_config, none, declined),
               "GLM serve declines the live FAST row without pair agreement, a fresh whole prompt and its measured chunk");
+    // USB4 layout 2bq through the host route: CLI and serve resolve the same FAST band row on its own execution key.
+    check(rd::select_prefill_wmma(c1_rank, c1_cli_config, none, rd::single_lane_prefill(true, 8192, 16384, 8192, 64, true, "usb4-host-2x1x40")) &&
+          rd::select_prefill_wmma(c1_server, c1_serve_config, none, rd::serve_prefill_work(true, true, 8192, 16384, 8192, 64, true, "usb4-host-2x1x40")),
+          "GLM FAST band row: CLI == serve on the measured 2bq host layout");
     const auto c1_turbo = rd::scan(rd::serve_request_args({"--world", "2", "--profile", "turbo"}, true));
     const auto c1_turbo_config = rd::resolve(c1_turbo, none, complete);
     check(!rd::select_prefill_wmma(c1_turbo, c1_turbo_config, none,

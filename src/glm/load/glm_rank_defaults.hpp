@@ -337,20 +337,25 @@ struct PrefillWork {
     // Scratch storage of the admitted layout (routed or the original full arena): no arithmetic change, but part of the
     // execution key, so a receipt measured on one storage (the TURBO literal rows: routed) decides only that storage.
     bool routed_scratch = true;
+    // The pair link layout of the run (strix::dist::LinkLayout::key(), one of kMeasuredPrefillLayouts): part of the
+    // execution key, so a literal row timed on one layout decides only that layout.
+    std::string_view link = kMeasuredPrefillLayouts[0];
 };
 
 // Rank runs its prompt loop serially. Serve calls this for a fresh whole prompt
 // with no decoding cohort. The reserved slot capacity is not a workload lane.
 inline PrefillWork single_lane_prefill(bool ready, std::uint64_t prompt, std::uint64_t capacity,
-                                       unsigned rows, unsigned generated, bool routed_scratch = true) {
-    return {ready, prompt, capacity, rows, 1U, generated, routed_scratch};
+                                       unsigned rows, unsigned generated, bool routed_scratch = true,
+                                       std::string_view link = kMeasuredPrefillLayouts[0]) {
+    return {ready, prompt, capacity, rows, 1U, generated, routed_scratch, link};
 }
 
 // Only the FAST band receipt applies to serve, including when TURBO inherits it.
 inline PrefillWork serve_prefill_work(bool pair_ready, bool fresh, std::uint64_t prompt, std::uint64_t capacity,
-                                      unsigned rows, unsigned generated, bool routed_scratch) {
+                                      unsigned rows, unsigned generated, bool routed_scratch,
+                                      std::string_view link = kMeasuredPrefillLayouts[0]) {
     return single_lane_prefill(pair_ready && fresh && prompt <= kPrefillProbePrompt,
-                               prompt, capacity, rows, generated, routed_scratch);
+                               prompt, capacity, rows, generated, routed_scratch, link);
 }
 
 inline std::optional<strix::profile::Resolution> resolve_product(const Request& r, const EnvGet& env, bool baseline,
@@ -366,9 +371,10 @@ inline std::optional<strix::profile::Resolution> resolve_product(const Request& 
         return std::nullopt;
     auto inputs = r.product;
     inputs.env = profile_env;
+    const auto settings = prefill_settings(work.link, work.routed_scratch);
     const auto execution = work.pair_ready ? p::ladder_execution({"hip", kTurboPrefillDevice,
-            {work.prompt, work.capacity, work.lanes, work.rows, work.rows, 1, 0, work.generated},
-            work.routed_scratch ? kTurboPrefillSettings : kFullScratchPrefillSettings}) : std::string{};
+            {work.prompt, work.capacity, work.lanes, work.rows, work.rows, 1, 0, work.generated}, settings})
+                                           : std::string{};
     inputs.regime = {p::Phase::prefill, work.prompt, work.lanes,
                      execution.empty() ? std::string_view{} : kTurboPrefillDevice, execution};
     auto product = p::resolve(product_profile_engine, inputs);

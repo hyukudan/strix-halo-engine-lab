@@ -431,6 +431,7 @@ int main(int argc, char** argv) {
         std::unique_ptr<strix::dist::Communicator> comm;
         std::shared_ptr<strix::glm::xfer::XferExchange> xfer_exchange;
         bool turbo_prefill_pair = false;
+        std::string_view pair_link = rd::kMeasuredPrefillLayouts[0];  // the negotiated layout (execution key)
         const char* lt = std::getenv("STRIX_GLM_LOAD_TEST");
         if (opt.world == 2 && !(lt != nullptr && std::string(lt) == "1")) {
             if (transport_spec.empty()) throw std::invalid_argument("--world 2 needs --transport");
@@ -438,10 +439,11 @@ int main(int argc, char** argv) {
             // the DS/MiniMax 'hp' host path (STRIX_DIST_CRC_PARALLEL / HOST_CRC_OVERLAP / HOST_CHUNK_BYTES) is set by rank_defaults
             (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "600000", 0);
             auto opened = strix::dist::open_pair(transport_spec, opt.rank);
+            pair_link = rd::prefill_link(opened.usb4_topology.streams, opened.direct != nullptr);
             turbo_prefill_pair = rd::select_prefill_wmma(request, eff, rd::process_env(),
                 rd::single_lane_prefill(rd::ordinary_lossy_prefill(request, eff) &&
                     rd::measured_prefill_pair(opened.usb4_topology.streams, opened.direct != nullptr) && !deployment.plan,
-                    rd::kPrefillProbePrompt, opt.capacity, opt.max_rows, decode_n));
+                    rd::kPrefillProbePrompt, opt.capacity, opt.max_rows, decode_n, true, pair_link));
             auto transport = std::move(opened.host);
             const auto& receipt = opened.receipt;
             if (deployment.provider) deployment.resolve_live(opt, *transport);
@@ -1098,7 +1100,7 @@ int main(int argc, char** argv) {
             }
             const auto work = rd::single_lane_prefill(startup_handshake && turbo_prefill_pair && mtp_spec_on &&
                     rd::measured_prefill_layout(eng.prefill_pipeline()) && embed_splice.empty() && bitcalc_cases.empty(),
-                toks.size(), opt.capacity, opt.max_rows, decode_n, rd::routed_prefill_scratch());
+                toks.size(), opt.capacity, opt.max_rows, decode_n, rd::routed_prefill_scratch(), pair_link);
             const bool turbo = rd::select_prefill_wmma(request, eff, rd::process_env(), work);
             if (rd::ordinary_lossy_prefill(request, eff) && !strix::glm::pf::wmma_x::enabled())
                 rd::report_prefill_wmma(opt.rank, request, eff, rd::process_env(), work, turbo);

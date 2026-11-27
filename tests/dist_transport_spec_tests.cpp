@@ -1,3 +1,4 @@
+#include "strix/dist/link_layout.hpp"
 #include "strix/dist/transport_spec.hpp"
 #include <iostream>
 
@@ -54,5 +55,21 @@ int main() try {
     rejects("usb4:a", strict);
     rejects("usb4auto:ignored", strict);
     rejects("usb4gpu:ignored", strict);
-    std::cout << "PASS: one pair dialect, TCP endpoints, USB4 devices, aliases and rejection contracts\n";
+    // Link layout keys: the measured pair layouts are named by cables x host streams per cable x link rate.
+    struct Stream { std::string xdomain; double link_gbps; };
+    const std::vector<Stream> layout1{{"a", 40.0}, {"b", 40.0}, {"a", 40.0}, {"b", 40.0}};  // data0+data1 host, 2 cables
+    const std::vector<Stream> layout2bq{{"a", 40.0}, {"b", 40.0}};                          // data0 host, data1 gpu_direct
+    require(classify_link(layout1, false).key() == "usb4-host-2x2x40");
+    require(classify_link(layout2bq, false).key() == "usb4-host-2x1x40");
+    require(classify_link(layout2bq, true).key() == "usb4-host-2x1x40+direct");
+    require(classify_link(std::vector<Stream>{{"a", 40.0}, {"a", 40.0}, {"b", 40.0}}, false).key() == "unknown");  // uneven
+    require(classify_link(std::vector<Stream>{{"a", 40.0}, {"b", 20.0}}, false).key() == "unknown");               // mixed rate
+    require(classify_link(std::vector<Stream>{{"", 40.0}, {"b", 40.0}}, false).key() == "unknown");                // no XDomain
+    require(classify_link(std::vector<Stream>{}, false).key() == "unknown");
+    constexpr std::string_view measured[] = {"usb4-host-2x2x40", "usb4-host-2x1x40"};
+    require(measured_layout(classify_link(layout1, false), measured));
+    require(measured_layout(classify_link(layout2bq, false), measured));
+    require(!measured_layout(classify_link(layout2bq, true), measured));
+    require(!measured_layout(classify_link(std::vector<Stream>{{"a", 40.0}}, false), measured));
+    std::cout << "PASS: one pair dialect, TCP endpoints, USB4 devices, aliases, rejection contracts and link layout keys\n";
 } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
