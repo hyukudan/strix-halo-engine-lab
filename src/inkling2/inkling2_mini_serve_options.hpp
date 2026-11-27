@@ -62,13 +62,13 @@ struct MiniServeOptions {
     bool controller_one_plane = false;
     // Resolved screened-head lever (mini_screened_head), the value the CLI and the gate read.
     bool screened_head = false;
-    // Speculation (kMiniSpeculation, or an explicit --speculation off|auto): requested, and admitted (HIP: lanes draft
-    // from their context through one-lane verify windows while one lane is live; CUDA: lane_speculation).
+    // Speculation (kMiniSpeculation, or an explicit --speculation off|auto): requested, and admitted. An admitted
+    // speculation runs the shared lone-lane speculator on either backend (mini_served_lane_speculation: the command
+    // line's speculator step while one lane is live, the model's DSpark sidecar on slot 0's taps).
     bool speculation_requested = false;
     bool speculation = false;
-    // CUDA: an admitted speculation runs the shared lone-lane speculator (CohortConfig::lane_speculation: the command
-    // line's speculator step while one lane is live, the model's DSpark sidecar on slot 0's taps).
-    bool lane_speculation = false;
+    // The resolved backend's [speculation.probe_loss] row (mini_probe_loss), the command line's value for that backend.
+    double probe_loss = 0.0;
     MiniSpeculationPolicy speculation_policy{};  // the resolved rule (mini_speculation_line)
 };
 
@@ -150,6 +150,15 @@ inline serve::CohortConfig mini_serve_scheduling(unsigned chunk, serve::PromptPi
     config.prompt_slice = chunk;
     serve::bind_mixed_service(config, pieces, rule, chunk);
     return config;
+}
+
+// Served speculation of a cohort whose decoder stages verify windows (CohortBackend::max_window > 1), on either backend:
+// the shared lone-lane speculator (the command line's speculator step: drafter setup, arbiter, verify windows and the
+// backend's probe loss) while one lane is live; two or more live lanes take the round, one row each. One
+// strix-lane-spec line per finished request (the lane's receipt and drafter stats). No windows: off.
+inline serve::CohortConfig::LaneSpeculation mini_served_lane_speculation(bool windows, double probe_loss) {
+    if (!windows) return {};
+    return {true, 1U, kMiniMaxVerifyRows, probe_loss, true};
 }
 
 MiniServeCohort make_mini_hip_cohort(const MiniServeOptions&);

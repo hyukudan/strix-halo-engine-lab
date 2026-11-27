@@ -59,18 +59,18 @@ inline MiniServeCohort make_mini_device_cohort(
 #if !defined(__HIPCC__)
     exec::CohortProgramPolicy programs;
 #endif
-    // Lone-lane speculation (CUDA): the model's DSpark sidecar beside the checkpoint, validated like the command line's
-    // (absent or declined: the lone lane drafts lookup-only). Found, the decoder captures slot 0's DSpark taps and the
-    // cohort binds the drafter (MiniServeLaneBinding) before the slots are budgeted.
+    // Lone-lane speculation (either backend): the model's DSpark sidecar beside the checkpoint, validated like the
+    // command line's (absent or declined: the lone lane drafts lookup-only). Found, the decoder captures slot 0's DSpark
+    // taps and the cohort binds the drafter (MiniServeLaneBinding) before the slots are budgeted.
     spec::ResolvedDrafter drafter{{}, spec::DrafterSource::context, {}};
-    if (opt.lane_speculation) {
+    if (opt.speculation) {
         drafter = spec::resolve_drafter_file({{}, false, true}, opt.checkpoint,
                                              model_data::inkling2_mini::speculation::drafter);
         if (drafter.source == spec::DrafterSource::beside_model)
             if (auto problem = MiniDSparkDeviceWeights::sidecar_problem(drafter.path); !problem.empty())
                 drafter = spec::decline_drafter(drafter, std::move(problem));
     }
-    const bool draft_taps = opt.lane_speculation && !drafter.path.empty();
+    const bool draft_taps = opt.speculation && !drafter.path.empty();
     bool lanes_bound = false;
     [[maybe_unused]] bool window_programs = false, window_programs_declined = false;
     [[maybe_unused]] unsigned window_prewarmed = 0U;
@@ -252,19 +252,16 @@ inline MiniServeCohort make_mini_device_cohort(
               << " weight_status " << profile::status_name(weights.status) << " (" << weights.reason << ")"
               << (weights.turbo_quality.empty() ? "" : " turbo_quality ") << weights.turbo_quality << '\n'
               << weight::weight_load_regime_receipt(weights) << '\n';
-    // The command line's speculation line (mini_speculation_line), with the decoder's admission; a served lane drafts
-    // from its own context (no sidecar drafter on this route).
+    // The command line's speculation line (mini_speculation_line), with the decoder's admission.
     auto speculation = opt.speculation_policy;
     if (speculation.admitted && !windows) speculation.reason = windows_declined;
     speculation.admitted = windows;
     std::cerr << mini_speculation_line(speculation, opt.verify_rows) << '\n';
     if (windows) {
-        // CUDA lone-lane speculation: the DSpark drafter bound on slot 0 (else lookup-only drafts); HIP: context drafts.
-        if (opt.lane_speculation && !lanes_bound && !drafter.path.empty())
-            drafter = spec::decline_drafter(drafter, "verify windows declined");
+        // Lone-lane speculation: the DSpark drafter bound on slot 0 (else lookup-only drafts).
+        if (!lanes_bound && !drafter.path.empty()) drafter = spec::decline_drafter(drafter, "verify windows declined");
         std::cerr << spec::drafter_receipt("served", drafter) << '\n';
-        if (opt.lane_speculation)
-            std::cerr << "Inkling lane_speculation on max_live 1 drafter " << (lanes_bound ? "dspark" : "lookup") << '\n';
+        std::cerr << "Inkling lane_speculation on max_live 1 drafter " << (lanes_bound ? "dspark" : "lookup") << '\n';
 #if !defined(__HIPCC__)
         std::cerr << "Inkling verify window programs "
                   << (window_programs ? "on prewarmed " + std::to_string(window_prewarmed)

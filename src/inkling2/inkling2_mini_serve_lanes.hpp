@@ -10,10 +10,10 @@
 
 namespace strix::inkling2 {
 
-// The served lone-lane speculation of a CUDA Inkling 2 Mini cohort (serve::FixedKvLaneBinding): the command line's
-// DSpark drafter (the model's MTP sidecar) over the served decoder's slot 0 DSpark taps. Slot 0's taps are its only
-// tap plane: a lane on another slot, or slot 0 after one of its rows ran inside a cohort program (no tap store), drafts
-// lookup-only (the shared LaneSpeculator asks ready() first). The drafter lives with the server; each new slot-0
+// The served lone-lane speculation of an Inkling 2 Mini cohort, HIP or CUDA (serve::FixedKvLaneBinding): the command
+// line's DSpark drafter (the model's MTP sidecar) over the served decoder's slot 0 DSpark taps. Slot 0's taps are its
+// only tap plane: a lane on another slot, or slot 0 after one of its rows ran inside a grouped forward or a cohort
+// program (no tap store), drafts lookup-only (the shared LaneSpeculator asks ready() first). The drafter lives with the server; each new slot-0
 // sequence restarts its projected context.
 class MiniServeLaneBinding final : public serve::FixedKvLaneBinding {
 public:
