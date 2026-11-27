@@ -153,6 +153,30 @@ constexpr bool check_served_pass_lanes() {
 
 static_assert(check_served_pass_lanes());
 
+// Head of a served cohort pass: the screened lanes head only for a cohort that is ONE pass (its skipped score rows are
+// recomputed from the head inputs only the last pass leaves), of two or more rows within the screen, with the lanes pick
+// admitted, no score reader and the decode weights; every other pass keeps the pitched rows head.
+constexpr bool check_served_pass_screened() {
+    using strix::inkling2::mini_served_pass_screened;
+    constexpr unsigned one_row_cap = 16U, screen = 8U;
+    for (unsigned lanes = 1U; lanes <= 64U; ++lanes) {
+        const auto passes = strix::serve::plan_cohort_passes(lanes, strix::inkling2::mini_cohort_pass_cap(true, one_row_cap));
+        for (unsigned pass = 0; pass < passes.count; ++pass) {
+            const auto rows = passes.rows(pass);
+            const bool expect = passes.count == 1U && rows >= 2U && rows <= screen;
+            if (mini_served_pass_screened(true, false, false, rows, lanes, screen) != expect) return false;
+            if (mini_served_pass_screened(false, false, false, rows, lanes, screen) ||
+                mini_served_pass_screened(true, true, false, rows, lanes, screen) ||
+                mini_served_pass_screened(true, false, true, rows, lanes, screen))
+                return false;
+        }
+    }
+    return !mini_served_pass_screened(true, false, false, 8U, 8U, 0U) &&
+           mini_served_pass_screened(true, false, false, 8U, 8U, 8U);
+}
+
+static_assert(check_served_pass_screened());
+
 // The transaction MiniResidentDecoder::decode_slots runs (serve::run_cohort_passes, the production call): 17 lanes at
 // the HIP one-row cap 16 are passes of 9 + 8 rows; with ids = buf[0..17) and top = buf[1..18) the first pass's picks
 // would overwrite the first input of the second pass without the snapshot. A second pass that throws must leave every

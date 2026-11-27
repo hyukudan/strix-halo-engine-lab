@@ -483,7 +483,7 @@ public:
         // Served route lever (the decoder was built with it): balanced packed passes, decode_slots_served below. Without
         // the lever every cohort takes the incumbent body that follows.
         if (served_cli_route_) {
-            decode_slots_served(slots, ids, top);
+            decode_slots_served(slots, ids, top, reads_scores);
             return;
         }
 #endif
@@ -584,7 +584,8 @@ public:
     // lane's bits do not depend on the cohort width. The whole cohort is checked before the first pass writes;
     // serve::run_cohort_passes copies the input ids before any pass (ids and top may overlap) and publishes the picks
     // only after every pass finished: a pass that throws retires every lane of the cohort and top stays untouched.
-    void decode_slots_served(std::span<const unsigned> slots, std::span<const unsigned> ids, std::span<unsigned> top) {
+    void decode_slots_served(std::span<const unsigned> slots, std::span<const unsigned> ids, std::span<unsigned> top,
+                             bool reads_scores) {
         if (slots.empty() || slots.size() != ids.size() || slots.size() != top.size() || slots.size() > decode_rows_)
             throw std::invalid_argument("Inkling 2 Mini: invalid decode batch size");
 
@@ -608,6 +609,7 @@ public:
         // Lane r's head scores land at logit row r for any pass split.
         const auto lanes = static_cast<unsigned>(ids.size());
         MiniResidentSessionState::require_batch(groups_);
+        bool screened = false;
         ::strix::serve::run_cohort_passes(ids, top, mini_cohort_pass_cap(backend_.packed_decode(), kCohortPassRows),
                                           pass_ids_, pass_picks_,
                                           [&](unsigned first, unsigned rows, std::span<const unsigned> pass_ids,
@@ -620,12 +622,23 @@ public:
             const auto kind = rows <= kMaxVerifyRows ? MiniAppendKind::verify : MiniAppendKind::decode;
             const auto groups = std::span<const MiniResidentAppendGroup>(groups_).subspan(first, rows);
             select_lowbit_cohort(groups, lanes);
+            // Head (mini_served_pass_screened): a one-pass cohort whose scores nobody reads picks through the lanes
+            // form of the EXACT screened head; its score rows are recomputed on a read (pending_scores_ below).
+            screened = mini_served_pass_screened(verify_lanes_pick_, reads_scores,
+                                                 backend_.lowbit_applies(MiniAppendKind::decode, rows), rows, lanes,
+                                                 screen_ ? screen_->max_lanes() : 0U);
             MiniResidentForward forward(backend_, workspace());
             const auto pass = [&] {
                 forward.append_batch(groups, rows,
                                      embeddings, hidden, [&] {
                     embed(pass_ids, embeddings, rows, kind, lanes);
                 }, [&](MiniConstRows output) {
+                    if (screened) {
+                        greedy_.enqueue_produced_rows(rows, [&](HipGreedyRowsReply* replies) {
+                            return screen_->enqueue_lanes(output.data(), rows, kHiddenWidth, replies, stream_.get());
+                        });
+                        return;
+                    }
                     project_head_rows(output.data(), rows, scores.first(std::size_t{rows} * kLogitPitch));
                     greedy_.enqueue_rows(logits, rows, kLogitPitch, stream_.get());
                 }, [&] {
@@ -651,6 +664,14 @@ public:
             for (const auto& group : groups_) group.state->poison();
             last_logit_rows_ = 0U;
         });
+        if (screened) {
+            // The one pass's head inputs stay in hidden_ until the next forward (materialize_scores reads them).
+            pending_scores_ = {hidden_.data(), lanes, logits_.data()};
+            ++lanes_picks_;
+            if (served_screened_passes_++ == 0U)
+                std::cerr << "Inkling HIP served cohort head screened lanes=" << lanes << '
+';
+        }
         last_logit_rows_ = lanes;
     }
 #endif
@@ -1661,6 +1682,7 @@ private:
     std::uint64_t screened_picks_{};  // greedy picks that ran screened (note_screened_pick)
     std::uint64_t lanes_picks_{};     // multi-row picks through the lanes screened head (lanes_picks)
     std::uint64_t served_lane_passes_{};  // served cohort passes run in lane mode (mini_served_pass_lanes)
+    std::uint64_t served_screened_passes_{};  // served passes picked by the screened lanes head
     std::array<unsigned, kMaxVerifyRows> verify_ids_{}, verify_top_{};
     std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits_;
     std::size_t staged_logits_size_{};
