@@ -169,10 +169,10 @@ void check_union_fit() {
           "union: verify width 16");
     args.experts = route::kMaxUnionExperts + 32U;
     check(!r1::fits_union<MatrixFormat::nvfp4, 8U, 8U>(args, 8U, cuda), "union: expert mask bound");
-    check(r1::kUnionGeometry<4U>.gate_columns == r1::kCudaGeometry.gate_columns &&
-              r1::kUnionGeometry<4U>.down_columns == r1::kCudaGeometry.down_columns &&
+    // Host / CUDA union: two weight rows per warp at every union width (one gate and one up, or two down).
+    check(r1::kUnionGeometry<4U>.gate_columns == 1U && r1::kUnionGeometry<4U>.down_columns == 2U &&
               r1::kUnionGeometry<8U>.gate_columns == 1U && r1::kUnionGeometry<8U>.down_columns == 2U &&
-              r1::kUnionGeometry<16U>.gate_columns == 1U && r1::kUnionGeometry<16U>.down_columns == 1U,
+              r1::kUnionGeometry<16U>.gate_columns == 1U && r1::kUnionGeometry<16U>.down_columns == 2U,
           "union: geometry table");
 }
 

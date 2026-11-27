@@ -4542,20 +4542,20 @@ int main(int argc, char** arguments) {
             auto drafted=sidecar_argv;
             drafted.insert(drafted.end(),{"--mtp-draft-chain","--mtp-spec-min-p","0.7","--mtp-draft-q4",
                 "--mtp-draft-vocab","auto:draft-vocab","--mtp-draft-context-vocab","4096","--context","33280"});
-            // Without that organization the server takes the decode profile, which is qualified at context 8192;
-            // any other explicit context needs --unqualified-context, the same rule as the single-request command.
-            const auto served_drafted=resolve(RequestedOptions{parse(drafted),{}},memory);
-            expect(!served_drafted.options.known_prefix_prefill_rows &&
-                served_drafted.serve_prefill_notice.find("explicit tiled configuration required")!=std::string::npos &&
-                served_drafted.serve_prefill_notice.find("decode profile not adopted: context-not-qualified "
-                    "(context 33280 needs --unqualified-context)")!=std::string::npos,
-                "recipe server without organization flags at context 33280 names --unqualified-context in its notice");
-            drafted.emplace_back("--unqualified-context");
-            const auto served_unqualified=resolve(RequestedOptions{parse(drafted),{}},memory);
-            expect(served_unqualified.options.known_prefix_prefill_rows==8192 && served_unqualified.options.automatic_prefill &&
-                served_unqualified.options.numerical_profile==dense_a8_profile && served_unqualified.options.virtual_q8_lm_head &&
-                served_unqualified.options.prefetch_q8_lm_head,
-                "recipe server with --unqualified-context adopts the decode profile and admits automatic T8192");
+            // Without that organization the server takes the decode profile, which is qualified at context 8192. The
+            // served form has no known prompt to size a context from, so an explicit capacity other than 8192 implies
+            // --unqualified-context (served_context_implies_unqualified): the server keeps the decode profile, with and
+            // without the explicit flag.
+            for (const bool explicit_flag : {false, true}) {
+                if (explicit_flag) drafted.emplace_back("--unqualified-context");
+                const auto served_unqualified=resolve(RequestedOptions{parse(drafted),{}},memory);
+                expect(served_unqualified.options.unqualified_context &&
+                    served_unqualified.options.known_prefix_prefill_rows==8192 && served_unqualified.options.automatic_prefill &&
+                    served_unqualified.options.numerical_profile==dense_a8_profile && served_unqualified.options.virtual_q8_lm_head &&
+                    served_unqualified.options.prefetch_q8_lm_head,
+                    explicit_flag ? "recipe server with --unqualified-context adopts the decode profile and admits automatic T8192"
+                                  : "recipe server at context 33280 implies --unqualified-context and adopts the decode profile");
+            }
         }
         expect(fast.options.known_prefix_tail_rows==std::vector<std::uint32_t>({1024,256,64,16}),
             "HTTP keeps all tail owners for future requests");
