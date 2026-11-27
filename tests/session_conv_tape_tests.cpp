@@ -284,6 +284,21 @@ void staged_batch_equals_lone() {
         try { State::stage_batch(a, std::span<const State::StagedGroup>(over), [] {}, [] {}); }
         catch (const std::invalid_argument&) { refused = true; }
         check(refused, "staged batch: checkpoint over another lane's history refused");
+        // A checkpoint over any resident KV plane could overwrite committed rows before work or destroy rollback data.
+        const auto keys_before = a.keys;
+        const auto values_before = b.values;
+        unsigned alias_works = 0;
+        for (auto alias : {std::span<std::uint16_t>(a.keys), std::span<std::uint16_t>(b.values)}) {
+            std::vector<State::StagedGroup> kv_alias{{&a.state, {2U, 2U}, a.history_backup, alias},
+                                                    {&b.state, {3U, 2U}, b.history_backup, b.kv_backup}};
+            refused = false;
+            try {
+                State::stage_batch(a, std::span<const State::StagedGroup>(kv_alias), [&] { ++alias_works; }, [] {});
+            } catch (const std::invalid_argument&) { refused = true; }
+            check(refused && alias_works == 0U && !a.state.staged() && !b.state.staged() &&
+                      !a.state.poisoned() && !b.state.poisoned() && a.keys == keys_before && b.values == values_before,
+                  "staged batch: own or other lane KV checkpoint alias refused before work");
+        }
         std::vector<State::StagedGroup> ok{{&a.state, {2U, 2U}, a.history_backup, a.kv_backup},
                                           {&b.state, {3U, 2U}, b.history_backup, b.kv_backup}};
         bool failed = false;
