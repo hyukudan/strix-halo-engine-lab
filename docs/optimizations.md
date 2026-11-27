@@ -6931,9 +6931,9 @@ A taped staged verify window is offered to the backend after its eager checkpoin
 
 - **Shared home:** include/strix/session/kv_row_append.hpp, src/core/resident_greedy.hpp; src/inkling2 binding
 - **Tier and regime:** EXACT, FAST, QUALITY, TURBO; CUDA CLI speculative decode (verify windows)
-- **Exactness evidence:** EXACT verification: q52r device fixture (Inkling 2 Mini CUDA, programs vs eager windows) 42,525 items, 0 differing, programs ran at every width 2..8; q53: ids equal to the q46 resident run with the programs on. Host: tests/session_conv_tape_tests.cpp (offer after the checkpoints, accept == decline), strix-e2i-step-inputs-tests (window block valid mask).
+- **Exactness evidence:** EXACT verification: q52r device fixture (Inkling 2 Mini CUDA, programs vs eager windows) 42,525 items, 0 differing, programs ran at every width 2..8; q53: ids equal to the q46 resident run with the programs on; q64: ids equal to q46 R0 (code) and q47 Fp (prose) with the load-time capture. Host: tests/session_conv_tape_tests.cpp (offer after the checkpoints, accept == decline), strix-e2i-step-inputs-tests (window block valid mask).
 - **Off switch:** STRIX_INKLING_WINDOW_PROGRAMS=0 runs every staged verify window eagerly; profiles the fixture does not cover decline with the reason
-- **Measured gain:** q62 (RTX PRO, Inkling 2 Mini CUDA CLI EXACT 256 tokens, --speculation auto, ids equal): code 170.81 / 169.28 tok/s with the programs vs 132.01 / 132.82 eager (+28.4 %, 8-row verify wall 35.51 -> 25.81 ms); prose 97.81 vs 99.41 eager (-1.6 %) with the widths captured inside the decode. The q53 / q60 collapses (4 / 6 model passes) were the capture walls closing the arbiter's probe episode: fixed in the shared arbiter (cold passes out of the episode) and removed at the source by the load-time capture; its confirm receipt: see the Inkling row.
+- **Measured gain:** q64 (RTX PRO, Inkling 2 Mini CUDA CLI EXACT 256 tokens, --speculation auto, the default: programs on, every width captured at load, prewarmed 7 == captured 7; ids equal in all 10 arms): code 176.51 / 176.99 tok/s warm and 174.82 / 176.82 / 176.17 cold vs 133.57 / 132.50 eager (+32.9 %, 51 model passes 201/342 in every arm); prose 99.51 vs 99.22 eager (programs not slower). Earlier q62 (widths captured inside the decode): code +28.4 %, prose 97.81 vs 99.41 (-1.6 %): that capture wall is what the load-time capture removed. The q53 / q60 collapses (4 / 6 model passes) were capture walls closing the arbiter's probe episode, fixed in the shared arbiter (cold passes out of the episode).
 - **Preconditions:** a backend that defines try_window_graph; taped staged verify windows of 2..16 rows without score reads.
 
 | Model | Binding |
@@ -7086,7 +7086,7 @@ A sampled CLI row is drawn on the device by the shared sampler (one 4-byte reply
 
 - **Shared home:** src/serve/serial_generation_cli.cpp (SerialGenerationDecoder::decode_sampled), strix/cuda/token_sampling_device.hpp; src/inkling2 binding
 - **Tier and regime:** EXACT, FAST, QUALITY, TURBO; CUDA CLI sampled decode
-- **Exactness evidence:** Same draws: the shared device sampler's decision equals the host TokenSampler's (strix/cuda/token_sampling_device.hpp tests). q59: ids Sd == Sh == Sd2 == Sh2 == q56 So (T 0.7 seed 7); greedy G == q46 R0. Host: strix-serial-generation-cli-tests (device decision path).
+- **Exactness evidence:** Same draws within these limits: a row with at most 2,048 entries after cutoff and top-k (device_top_p_candidates) runs one workgroup with sequential sums in token id order, the host TokenSampler's CDF. Larger rows use fixed parallel sums (no top-p) or mass quantiles in rank-key order (top-p): at a CDF boundary the device may pick the adjacent token, and the device rank key orders +0 above -0 where the host ties both zeros by token id. Greedy rows are unaffected. STRIX_SAMPLE_PATH=host where the host CDF is required. q59: ids Sd == Sh == Sd2 == Sh2 == q56 So (T 0.7 seed 7); greedy G == q46 R0. Host: strix-serial-generation-cli-tests (device decision path), strix-token-sampling-device-plan-tests (2,048 boundary pinned, host boundary oracle), strix-token-sampling-host-path-tests (STRIX_SAMPLE_PATH=host selects the host sampler); device: token_sampling_device_cases (6,144-entry rows past the boundary).
 - **Off switch:** STRIX_SAMPLE_PATH=host
 - **Measured gain:** q59 (RTX PRO, CLI EXACT 256 tokens, code, T 0.7 seed 7): 94.06 / 93.90 tok/s on the device vs 91.95 / 91.97 host (+2.2 %); greedy 97.78.
 - **Preconditions:** CUDA build with the step program route; a sampled request (temperature > 0)
@@ -7101,6 +7101,59 @@ A sampled CLI row is drawn on the device by the shared sampler (one 4-byte reply
 | Inkling 2 Mini | bound: CUDA CLI step program route |
 | Hy4 Flash | not bound: the CLI samples on the host |
 | Nemotron 3.5 Bolt E4B | not bound: the CLI samples on the host |
+
+<a id="inkling2-served-lone-lane-spec"></a>
+
+## CUDA server: lone-lane speculation on the command line's speculator step
+
+**Engine:** `inkling2-mini`. **Control:** server --speculation auto|off (resolved speculation auto). **Default:** on for CUDA serving when the resolved speculation is auto and a drafter is loaded, while one lane is live (max_live 1); two or more live lanes take the cohort round (one-row route).
+
+While one lane is live, the CUDA server runs the command line's speculator step for it (same drafter setup, arbiter and verify windows as the CLI's auto); two or more live lanes take the cohort round. One strix-lane-spec line per finished request carries the lane's receipt.
+
+- **Shared home:** src/serve/cohort_decode.cpp (LaneSpeculator, strix-lane-spec receipt), src/spec/drafting.cpp; src/inkling2/inkling2_mini_serve.cpp binding
+- **Tier and regime:** EXACT, FAST, QUALITY, TURBO; CUDA served decode, one live lane
+- **Exactness evidence:** EXACT: the lone lane verifies every window on the target (LaneSpeculator: the command line's drafter setup, arbiter and verify windows; DSpark drafter on slot 0); sampled lanes draft nothing (max_draft 0). q65: served code C1 ids == CLI Ac 2/2; served C1 == q45 8/8; C8 == C1 8/8 x3. Host: strix-cohort-lane-speculation-tests, strix-fixed-kv-cohort-tests.
+- **Off switch:** --speculation off (every lane on the one-row route)
+- **Measured gain:** q65 (RTX PRO, Inkling 2 Mini CUDA server EXACT, 656-token code prompt, --speculation auto): C1 172.71 tok/s = 0.966x the command line's 178.83 at the same effort (q63 before the slot 0 tape fix: 0.56x); C8 median 215.4 tok/s. The 0.98 served/CLI band is not reached (1.4 points short); the remaining ~0.9 ms per step sits in the served step, not in the decisions (53 vs 51 model passes).
+- **Preconditions:** CUDA build, a drafter loaded, resolved speculation auto, exactly one live lane; HIP keeps the context-draft cohort route
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: no served lane speculator |
+| Qwen3.8 27B dense | not bound: no served lane speculator |
+| DeepSeek V4.1 Flash | not bound: no served lane speculator |
+| GLM 5.3 Flash | not bound: no served lane speculator |
+| MiniMax M3.1 Flash | not bound: no served lane speculator |
+| Inkling 2 Mini | bound: CUDA server, one live lane (q65) |
+| Hy4 Flash | not bound: no served lane speculator |
+| Nemotron 3.5 Bolt E4B | not bound: no served lane speculator |
+
+<a id="inkling2-chat-default-effort"></a>
+
+## Chat default reasoning effort from the model file (command line = server)
+
+**Engine:** `inkling2-mini`. **Control:** models/inkling2-mini.toml [chat] reasoning_effort; a request's own reasoning_effort overrides it. **Default:** none for the command line (--messages) and the server; before, the command line rendered an absent effort as 0.9.
+
+**User-visible change:** the command line output for the same `--messages` prompt changes. A chat request that names no reasoning effort is rendered with the model file's default (`none`) by both front ends; earlier builds of the command line rendered it as 0.9 (`high`), so the prompt ids, and therefore the generated text, differ from those builds. Name `reasoning_effort` in the request to keep a specific effort.
+
+- **Shared home:** src/serve/inkling2_chat.cpp (effort_text), models/inkling2-mini.toml [chat]
+- **Tier and regime:** every tier; command line --messages and served chat
+- **Exactness evidence:** Changes the prompt, not the arithmetic: a --messages request without reasoning_effort now renders effort 0 (none), as the server does, so its prompt ids and its command line output differ from earlier builds for the same input; the same request renders the same ids through both front ends (inkling2-mini-chat-test parity). Reference rows rebased to the new default: q65 command line code auto 178.83 / plain 97.51 tok/s (656 prompt tokens), prose auto 98.76 / plain 102.12 (478 prompt tokens); served C1 code ids == command line Ac.
+- **Off switch:** name the effort in the request: reasoning_effort "high" (0.9) renders the earlier command line prompt
+- **Measured gain:** none claimed (front-end parity); speed references at the new default: q65 as above
+- **Preconditions:** chat input (--messages or the server's chat endpoint) that names no reasoning_effort
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not applicable: no reasoning_effort chat field |
+| Qwen3.8 27B dense | not applicable: no reasoning_effort chat field |
+| DeepSeek V4.1 Flash | not applicable: no reasoning_effort chat field |
+| GLM 5.3 Flash | not applicable: no reasoning_effort chat field |
+| MiniMax M3.1 Flash | not applicable: no reasoning_effort chat field |
+| Inkling 2 Mini | bound: command line and server read [chat] reasoning_effort |
+| Hy4 Flash | not applicable: no reasoning_effort chat field |
+| Nemotron 3.5 Bolt E4B | not applicable: no reasoning_effort chat field |
+
 <a id="g4-int8-global-kv-shadow"></a>
 ### Int8 global KV shadow for decode attention at depth (shared shadow trait)
 Nemotron 3.5 Bolt E4B global layers, `STRIX_G4_DECODE_ATTN=g4-dattn-f2` (explicit option; the `fast` row stays pending its quality gate). The decode attention reads int8 groups of 16 features with one FP16 scale (the shared int8-g16 shadow form) instead of the FP32 cache: 16,128 instead of 57,344 bytes per position over the seven global layers. C1 decode, Q4_K_M, `fast`, drafting off, one node, fresh process per run, ABBA: 2K 46.06 -> 48.31, 8K 41.65 -> 45.34, 32K 29.60 -> 43.21, 64K 21.18 -> 38.52 tok/s. Changes logits; each arm is deterministic. The shadow is kept beside the FP32 cache (+603,979,776 bytes per 64K stream, charged in the stream work bound). The reader trait lives in `src/attn_core/shadow_kv_read.hpp`, the split-K plan in `include/strix/attn/split_decode_plan.hpp`. Off switch: `STRIX_G4_DECODE_ATTN=exact`.

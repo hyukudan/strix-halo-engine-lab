@@ -286,3 +286,25 @@ windows of three content classes (prose, code, structured) at 8K, 32K and 64K co
   needs a served lever for the pack and a served speed receipt at the decode step widths.
 
 Detailed receipts (per-window reductions, tickets, timing summaries) remain outside Git.
+
+## Inkling 2 Mini CUDA: window programs at load, served lone-lane speculation, chat default effort
+
+**observed** (2026-11-26). RTX PRO, Inkling 2 Mini CUDA, `--profile exact`, `--speculation auto` with the DSpark
+drafter, 256 decode tokens per command line run; receipts q64 and q65. Catalogue rows:
+[verify window programs](../optimizations.md#verify-window-program),
+[served lone-lane speculation](../optimizations.md#inkling2-served-lone-lane-spec),
+[chat default effort](../optimizations.md#inkling2-chat-default-effort).
+
+- q64, verify window programs on by default with every width captured at load (prewarmed 7 == captured 7): code
+  176.51 / 176.99 tok/s warm and 174.82 / 176.82 / 176.17 cold against 133.57 / 132.50 eager (+32.9 %, 51 model passes
+  in every arm); prose 99.51 against 99.22 eager. Ids equal in all 10 arms (code against the resident reference, prose
+  against the earlier prose reference).
+- q65, served lone-lane speculation (one live lane): code C1 172.71 tok/s, 0.966x the command line's 178.83 for the
+  same 656-token prompt at the same effort; C8 median 215.4 tok/s. Served C1 ids equal the command line's; served
+  C8 ids equal C1. The 0.98 served/command line band is not met.
+- q65, chat default effort: the command line now renders a request without `reasoning_effort` with the model file's
+  default (`none`), as the server does. Earlier builds rendered 0.9, so the prompt ids and the output for the same
+  input change. Reference rows at the new default: code auto 178.83 / plain 97.51 tok/s (656 prompt tokens), prose auto
+  98.76 / plain 102.12 (478 prompt tokens).
+
+Detailed receipts (per-arm logs, tickets) remain outside Git.

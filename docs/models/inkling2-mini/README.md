@@ -56,7 +56,12 @@ cmake --build build-cuda --target strix-inkling2-mini-cuda
 
 Both commands accept token IDs, raw text via `--prompt`, or chat via
 `--messages FILE`. The chat file can be a JSON message array or an object
-with `messages` and optional `tools` and `reasoning_effort` fields. The
+with `messages` and optional `tools` and `reasoning_effort` fields. A chat
+file without `reasoning_effort` uses the model file's default (`[chat]
+reasoning_effort = "none"`), the same as the server. Earlier builds of the
+command line rendered it as `high` (0.9), so the output for the same chat file
+changes; set `"reasoning_effort": "high"` to keep the earlier prompt
+([catalogue row](../../optimizations.md#inkling2-chat-default-effort)). The
 official `tokenizer.json` defaults to the checkpoint directory. Supply
 `--tokenizer FILE` to select another copy of the same tokenizer. Use
 `--tokenize FILE` to print raw-text token IDs without loading model weights.
