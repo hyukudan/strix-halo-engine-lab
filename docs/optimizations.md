@@ -7446,3 +7446,31 @@ A served cohort pass runs its lane-stateful stages (K/V and post convolutions, p
 | Inkling 2 Mini | bound: HIP served passes and the incumbent cohort body (CUDA: cohort programs already in lane mode) |
 | Hy4 Flash | not bound: own session service |
 | Nemotron 3.5 Bolt E4B | not bound: no served cohort |
+
+<a id="inkling-hip-served-head-wide"></a>
+## Inkling 2 Mini HIP served cohort head: the EXACT screen holds the cohort width
+
+**Engine:** `inkling2-mini`. **Control:** STRIX_INKLING_SERVED_HEAD_WIDE. **Default:** on (HIP served route).
+
+A served one-pass cohort picks through the lanes form of the BF16 EXACT screened head only when the screen holds its rows.
+The decoder sized the screen for one pass-1 group (the lanes whose activations fit one block's shared memory: 4 on gfx1151),
+so an 8-lane pass read the full BF16 head (0.93 GB). The shared lanes head already runs several pass-1 groups as the fastest
+grid dimension, so the groups read each plane row together; the screen is now sized for the served cohort width.
+
+- **Shared home:** src/core/hip_screened_head.hpp (enqueue_lanes); binding in the Inkling decoder (admit_lanes_pick, mini_screen_lanes)
+- **Tier and regime:** EXACT; served one-pass cohorts of 2..32 lanes
+- **Exactness evidence:** each lane keeps its one-row screened pick; served ids equal with the switch on and off (C1, C2, C4, C8, two C8 reps per arm)
+- **Off switch:** STRIX_INKLING_SERVED_HEAD_WIDE=0
+- **Measured gain:** Served EXACT Inkling 2 Mini, gfx1151, 8 slots, one binary, three on/off pairs: C8 pass 89.6 -> 86.8, 88.1 -> 86.0, 87.1 -> 85.6 ms (mean -2.1 ms, -2.4 %); C1 / C2 / C4 unchanged within noise (26.64 / 35.33 / 44.31 vs 26.71 / 34.20 / 44.15 tok/s aggregate); ids equal.
+- **Preconditions:** HIP served route, screened head bound, a one-pass cohort whose scores nobody reads, decode weights
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: no served cohort screened head on HIP |
+| Qwen3.8 27B dense | not bound: no served cohort screened head on HIP |
+| DeepSeek V4.1 Flash | not bound: no served cohort screened head on HIP |
+| GLM 5.3 Flash | not bound: no served cohort screened head on HIP |
+| MiniMax M3.1 Flash | not bound: no served cohort screened head on HIP |
+| Inkling 2 Mini | bound: HIP served cohort passes (the CUDA cohort already sizes its screen for the cohort width) |
+| Hy4 Flash | not bound: no served cohort screened head on HIP |
+| Nemotron 3.5 Bolt E4B | not bound: no served cohort screened head on HIP |
