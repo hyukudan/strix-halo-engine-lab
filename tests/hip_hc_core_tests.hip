@@ -176,6 +176,21 @@ hc::Spec ds41_ref(std::uint32_t hidden, std::uint32_t iters) {
     return s;
 }
 
+// ERNIE 5.5 checkpoint sublayer site: RMS eps after the root, bfloat16 stores, Sinkhorn, F32 fn (mix-major on the
+// device). A large eps makes the two eps placements differ in every row.
+constexpr hc::Spec ernie_device{.streams = 4, .hidden = 0, .site = hc::Site::sublayer, .comb = hc::Comb::sinkhorn,
+                                .sinkhorn_iters = 0, .fn = hc::FnType::f32, .store = hc::Store::bf16,
+                                .post_magnitude = 2.0F, .norm_eps_outside_sqrt = true};
+hc::Spec ernie_ref(std::uint32_t hidden, std::uint32_t iters) {
+    hc::Spec s = ernie_device;
+    s.hidden = hidden;
+    s.sinkhorn_iters = iters;
+    s.pre_eps = 1e-6F;
+    s.comb_eps = 1e-6F;
+    s.norm_eps = 1e-3F;
+    return s;
+}
+
 } // namespace
 
 int main() {
@@ -185,6 +200,7 @@ int main() {
         run_case<modelb_head>("modelb-head", modelb_head, 9, 0, modelb_head.pre_eps, false, false, 3);
         run_case<ds41_device>("ds41", ds41_ref(1536, 20), 9, 20, 1e-6F, false, true, 4);
         run_case<ds41_device>("ds41-copy0", ds41_ref(1536, 1), 2, 1, 1e-6F, true, false, 5);
+        run_case<ernie_device>("ernie-sublayer-eps-outside", ernie_ref(4096, 20), 9, 20, 1e-6F, false, false, 6);
     } catch (const std::exception& e) {
         std::printf("hc-core: error %s\n", e.what());
         return 2;

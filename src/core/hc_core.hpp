@@ -7,7 +7,8 @@
 //   comb             sinkhorn (N x N comb rows, Sinkhorn on the lanes of one wave; N == 4) or identity (no stage);
 //   fn               F16 or F32 mix weights;
 //   store            FP32 or the bfloat16 rounding of every collapse / expand output;
-//   post_magnitude, post_eps   compile-time constants of the post coefficient (post_eps 0: no add, as DS41).
+//   post_magnitude, post_eps   compile-time constants of the post coefficient (post_eps 0: no add, as DS41);
+//   norm_eps_outside_sqrt      the RMS eps after the root (mix_rms_inverse), compile-time (false: DS41 / Hy4).
 // hidden, the Sinkhorn iterations, the pre/comb eps (hc_eps) and the RMS eps (norm_eps) are runtime arguments, so
 // Spec::hidden / sinkhorn_iters / pre_eps / comb_eps / norm_eps are not read here.
 //
@@ -422,7 +423,8 @@ __device__ __forceinline__ void mix_final_wave(const float* __restrict__ partial
         for (unsigned c = 0; c < chunks; ++c) d = d + p[c];
     }
     constexpr unsigned h = S.streams;
-    const float rr = ::strix::numeric::declared_rsqrt(__shfl(d, static_cast<int>(mix_rows<S>), wave) / static_cast<float>(n) + norm_eps);
+    const float rr = ::strix::hc::mix_rms_inverse(__shfl(d, static_cast<int>(mix_rows<S>), wave) / static_cast<float>(n),
+                                                  norm_eps, S.norm_eps_outside_sqrt);
     M& o = out[r];
     if constexpr (S.post_rows() == 0U) {
         if (t < h) o.pre[t] = ::strix::numeric::declared_sigmoid((d * rr) * scale[0] + base[t]) + hc_eps;
