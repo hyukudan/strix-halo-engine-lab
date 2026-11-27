@@ -227,6 +227,11 @@ template<class Traits>
 void Channel<Traits>::init() {
     if (transport_ == nullptr) throw std::invalid_argument("glmxfer: no transport");
     if (options_.rank > 1) throw std::invalid_argument("glmxfer: rank must be 0 or 1");
+    // A deferred CRC releases the RX flag before the payload is checked: allowed only when the transport verified the
+    // bytes already (USB4 integrity links, in-process). Over a raw stream every payload is checked before publication.
+    // Both ranks agree: the transport's integrity mode is part of the pairing plan.
+    deferred_declined_ = options_.crc && options_.crc_deferred && !transport_->verifies_delivery();
+    options_.crc_deferred = payload_crc_after_publish(options_.crc, options_.crc_deferred, transport_->verifies_delivery());
     if (options_.capacity == 0 || options_.capacity > 0xFFFFFFFFULL) throw std::invalid_argument("glmxfer: capacity");
     if (options_.depth < 2 || options_.depth > 64) throw std::invalid_argument("glmxfer: depth must be 2..64");
     stride_ = (options_.capacity + sizeof(Trailer) + 4095) & ~std::size_t{4095};
@@ -528,7 +533,8 @@ template<class Traits>
 std::string Channel<Traits>::name() const {
     const char* pub = options_.publish == Publish::kernel ? "kernel" : options_.publish == Publish::write_value ? "write_value" : "producer";
     return "glmxfer(" + transport_->name() + ", depth " + std::to_string(options_.depth) + ", publish " + pub +
-           ", crc " + Traits::crc_description(options_.crc, options_.crc_deferred) + ")";
+           ", crc " + Traits::crc_description(options_.crc, options_.crc_deferred) +
+           (deferred_declined_ ? " (deferred declined: the transport does not verify delivery)" : "") + ")";
 }
 
 template<class Traits>

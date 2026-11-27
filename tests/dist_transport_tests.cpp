@@ -255,6 +255,23 @@ void test_silent_peer() {
     expect(ms < 1500.0, "the deadline is honoured (" + std::to_string(ms) + " ms)");
     std::cout << "silent peer: failed after " << ms << " ms: " << message << '\n';
 }
+// verifies_delivery(): true exactly when every delivered byte was checked below the caller (USB4 integrity links,
+// in-process pair); the raw stream (STRIX_DIST_USB4_INTEGRITY=0) proves nothing, so payload CRCs above it must be
+// checked before a consumer sees the payload.
+void test_verifies_delivery() {
+    {
+        auto pair = make_pair(2, 0, std::chrono::milliseconds(3000));
+        expect(pair.a->verifies_delivery() && pair.b->verifies_delivery(), "integrity links (default) verify delivery");
+    }
+    ::setenv("STRIX_DIST_USB4_INTEGRITY", "0", 1);
+    {
+        auto pair = make_pair(2, 0, std::chrono::milliseconds(3000));
+        expect(!pair.a->verifies_delivery() && !pair.b->verifies_delivery(), "the raw stream does not verify delivery");
+    }
+    ::unsetenv("STRIX_DIST_USB4_INTEGRITY");
+    auto memory = strix::dist::memory_pair();
+    expect(memory.first->verifies_delivery() && memory.second->verifies_delivery(), "the in-process pair verifies delivery");
+}
 void test_small_ordered() {
     // Cross the former eager limit and the opt-in cap, with partial I/O and a
     // peer delayed beyond the spin budget. Also preserve eager=0's worker route.
@@ -345,6 +362,7 @@ int main() try {
     test_on_wire();
     test_peer_failure();
     test_silent_peer();
+    test_verifies_delivery();
     test_small_ordered();
     if (failures == 0) std::cout << "dist transport tests passed\n";
     return failures == 0 ? 0 : 1;

@@ -33,6 +33,10 @@ public:
     // Progress of the transfer in flight, for failure reports (per stream: bytes done / expected, last read and
     // write, last poll events). Empty when the backend keeps none.
     [[nodiscard]] virtual std::string state() const { return {}; }
+    // Whether every byte a receive / exchange returns has already been checked against what the peer sent (sequence +
+    // checksum per unit, lost or damaged units resent), so a consumer may use it before any later check of its own.
+    // False unless the backend proves it: a layer above must then verify a payload before it publishes it.
+    [[nodiscard]] virtual bool verifies_delivery() const noexcept { return false; }
 };
 
 } // namespace strix::dist

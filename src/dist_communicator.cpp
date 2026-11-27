@@ -119,6 +119,7 @@ public:
         receive(in);
     }
     [[nodiscard]] std::string name() const override { return "memory"; }
+    [[nodiscard]] bool verifies_delivery() const noexcept override { return true; }  // the bytes never leave the process
     [[nodiscard]] bool supports_peer_abort() const noexcept override { return true; }
     void abort(const std::string&) override {
         {
@@ -469,6 +470,9 @@ public:
         if (!integrity_) out += " (integrity off)";
         return out;
     }
+    // With the integrity links every path (eager, striped, threaded) hands over only units whose sequence and CRC32C
+    // matched; a unit that cannot be repaired ends the call with an error instead of reaching the caller.
+    [[nodiscard]] bool verifies_delivery() const noexcept override { return integrity_; }
     // "usb4 integrity: clean (N pieces out, M in)" or the counters of every stream that saw damage.
     [[nodiscard]] std::string integrity_line() const {
         if (!integrity_) return "usb4 integrity: off";
@@ -2289,6 +2293,9 @@ Communicator::Communicator(Group group, std::unique_ptr<Transport> transport, st
     // default on (ds41/xfer t1: R6 -0.7 %, R1/N8 equal or better, exact); =0: inline CRCs
     crc_defer_ = transport_has(group_.transport_capabilities, deferred_crc);
     if (const char* v = std::getenv("STRIX_DIST_CRC_DEFER"); v && v[0] == '0' && v[1] == '\0') crc_defer_ = false;
+    // A deferred CRC hands the payload over before it is checked: only over a transport that verified the bytes
+    // already (both ranks agree, the integrity mode is in the pairing plan). Otherwise each payload is checked first.
+    if (!transport_->verifies_delivery()) crc_defer_ = false;
     {  // default 1 MiB chunks (w5); =0: one piece
         const char* v = std::getenv("STRIX_DIST_HOST_CHUNK_BYTES");
         const auto chunk = v && *v ? static_cast<std::size_t>(std::stoull(v)) : (transport_has(group_.transport_capabilities, host_chunk_default) ? std::size_t{1048576} : std::size_t{0});

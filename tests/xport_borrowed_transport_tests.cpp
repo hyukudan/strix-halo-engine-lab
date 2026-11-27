@@ -1,4 +1,5 @@
 #include "xport/borrowed_transport.hpp"
+#include "xport/wire.hpp"
 
 #include <array>
 #include <stdexcept>
@@ -174,6 +175,34 @@ void fallback() {
     require(serial.phase == 2);
     require(borrowed.state().empty());
     borrowed.abort("default no-op");
+    require(!borrowed.verifies_delivery());  // the base default: nothing proven
+}
+
+// The borrower reports exactly what the backend proves about delivered bytes, and the channel's deferred payload CRC
+// follows it: deferred only over a verifying transport, checked before publication otherwise.
+struct Verified final : strix::dist::Transport {
+    bool verified = true;
+    void send(std::span<const std::byte>) override {}
+    void receive(std::span<std::byte>) override {}
+    void exchange(std::span<const std::byte>, std::span<std::byte>) override {}
+    std::string name() const override { return "verified"; }
+    bool verifies_delivery() const noexcept override { return verified; }
+};
+void delivery() {
+    Verified backend;
+    strix::xport::BorrowedTransport<> borrowed(backend);
+    require(borrowed.verifies_delivery());
+    backend.verified = false;
+    require(!borrowed.verifies_delivery());
+    using strix::xport::payload_crc_after_publish;
+    static_assert(payload_crc_after_publish(true, true, true));
+    static_assert(!payload_crc_after_publish(true, true, false));   // raw stream / device path: check before publish
+    static_assert(!payload_crc_after_publish(true, false, true));
+    static_assert(!payload_crc_after_publish(false, true, true));
+    for (const bool v : {true, false}) {
+        backend.verified = v;
+        require(payload_crc_after_publish(true, true, borrowed.verifies_delivery()) == v);
+    }
 }
 } // namespace
 
@@ -185,4 +214,5 @@ int main() {
     forwarding<BorrowedAbort::forward, BorrowedState::base_default>(); // MiniMax serve.
     forwarding<BorrowedAbort::forward, BorrowedState::forward>(); // GLM.
     fallback();
+    delivery();
 }

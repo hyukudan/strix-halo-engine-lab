@@ -179,6 +179,7 @@ private:
     std::vector<Ticket> tickets_; // tagged API only; legacy GLM send/recv has no extra work
     dist::Transport* transport_ = nullptr;
     Options options_;
+    bool deferred_declined_ = false;  // deferred CRC asked, transport does not verify delivery: checked before publication
     std::size_t stride_ = 0;
     std::byte* tx_host_ = nullptr;
     std::byte* rx_host_ = nullptr;

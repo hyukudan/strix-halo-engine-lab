@@ -6,6 +6,13 @@
 #include <span>
 
 namespace strix::xport {
+// A payload CRC may be checked after the payload is published to its consumer (deferred: off the critical path) only
+// when the transport already verified every delivered byte (Transport::verifies_delivery). Otherwise the receiver
+// checks it before the publication, so no consumer ever reads a payload known to be damaged.
+[[nodiscard]] constexpr bool payload_crc_after_publish(bool crc, bool deferred_requested, bool transport_verifies) noexcept {
+    return crc && deferred_requested && transport_verifies;
+}
+
 // Transport receives exactly payload followed by the engine's trailer, with no added header.
 template<class Transport, class Trailer>
 void exchange_frame(Transport& transport, std::byte* tx, std::byte* rx,

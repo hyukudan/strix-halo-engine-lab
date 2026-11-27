@@ -19,6 +19,7 @@ public:
     void exchange(std::span<const std::byte> o, std::span<std::byte> i) override { t_.exchange(o, i); }
     // Inherit exchange-then-callback, even when the backend supports overlap.
     [[nodiscard]] std::string name() const override { return t_.name(); }
+    [[nodiscard]] bool verifies_delivery() const noexcept override { return t_.verifies_delivery(); }
     void abort(const std::string& why) override {
         if constexpr (Abort == BorrowedAbort::forward) t_.abort(why);
         else dist::Transport::abort(why);
