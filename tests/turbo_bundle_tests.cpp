@@ -96,7 +96,8 @@ void families() {
         in.regime = {p::Phase::prefill, 8128, 1, "gfx1151", p::kBandProbeExecution};
         const auto measured = p::resolve(ds, in);
         require(find(measured, "d1_prefill")->value == "1", "DeepSeek TURBO inherits the measured FAST D1 row");
-        require(find(measured, "decoder_replay")->value == "256", "DeepSeek TURBO inherits the measured FAST R256 row");
+        require(find(measured, "decoder_replay")->value == (tier == p::Name::turbo ? "256" : "0"),
+                "DeepSeek R256 is a TURBO row only (FAST gate FAIL on the held-out re-score)");
     }
     require(find(r, "moe_iu4")->value == "0" && find(r, "moe_iu4")->status == p::Status::builtin,
             "DeepSeek IU4 is not a TURBO row (measured slower than FAST)");
