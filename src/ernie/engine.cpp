@@ -130,7 +130,7 @@ void FirstRowReference::feed_forward(unsigned layer_id, const std::string& layer
         std::vector<float> gate_values(width), up_values(width);
         project(gate, in, gate_values);
         project(up, in, up_values);
-        std::ranges::transform(gate_values, up_values, gate_values.begin(), activate);
+        moe::activate_glu_reference(gate_values, up_values, gate_values, activate, [](float value) { return value; });
         project(down, gate_values, out);
     };
     if (!layer_has_moe(layer_id)) {
@@ -142,24 +142,11 @@ void FirstRowReference::feed_forward(unsigned layer_id, const std::string& layer
     std::vector<float> select(s.route.experts), mix(s.route.experts);
     project(prefix + "gate.weight", input, select);
     project(prefix + "gate.weight_1", input, mix);
-    moe::route_scores_ref<RouteMath>(s.route.score, select, select);
-    moe::route_scores_ref<RouteMath>(s.route.score, mix, mix);
-    if (s.contracts.router == RouterContract::summed_scores) {
-        std::ranges::transform(select, mix, select.begin(), std::plus<>{});
-        mix = select;
-    }
-    if (s.contracts.router == RouterContract::swapped_planes) std::swap(select, mix);
-    if (s.contracts.router == RouterContract::single_plane) mix = select;
     auto gain = read(prefix + "gate.routed_scaling_factor_param", s.route.experts);
-    if (s.contracts.router == RouterContract::gain_before_normalize)
-        for (std::size_t i = 0; i < mix.size(); ++i) mix[i] *= gain[i];
-    if (s.contracts.router == RouterContract::unit_gain || s.contracts.router == RouterContract::gain_before_normalize)
-        std::ranges::fill(gain, 1.0F);
     result.experts.resize(s.route.top_k);
     result.expert_weights.resize(s.route.top_k);
-    moe::route_select_split_ref(s.route, select, mix, read(prefix + "e_score_correction_bias", s.route.experts),
-        gain, result.experts, result.expert_weights,
-        s.contracts.router == RouterContract::summed_scores ? 1e-20F : 0.0F);
+    moe::route_split_logits_ref<RouteMath>(s.route, s.contracts.router, select, mix,
+        read(prefix + "e_score_correction_bias", s.route.experts), gain, result.experts, result.expert_weights, 1e-20F);
 
     const auto project_expert = [&](unsigned id, moe::ExpertProjection kind,
                                     std::span<const float> value, std::span<float> out) {

@@ -1,5 +1,6 @@
 #include "strix/ernie/forward.hpp"
 
+#include "moe_core/reference.hpp"
 #include "strix/moe/activation_policy.hpp"
 
 #include <algorithm>
@@ -7,30 +8,21 @@
 #include <utility>
 
 namespace strix::ernie {
-namespace {
-struct ActivationMath {
-    static float exp(float value) { return std::exp(value); }
-    static float tanh(float value) { return std::tanh(value); }
-};
-
-float swiglu(float gate, float up) {
-    return (gate * (1.0F / (1.0F + std::exp(-gate)))) * up;
-}
-} // namespace
 
 ReferenceActivation candidate_activation(CandidateActivation activation) {
     switch (activation) {
     case CandidateActivation::swiglu:
         return [](float gate, float up, float, float) {
-            return swiglu(gate, up);
+            return moe::swiglu_sigmoid_product<moe::NativeGluMath>(gate, up);
         };
     case CandidateActivation::soft_clip:
         return [](float gate, float up, float beta, float linear_beta) {
-            return moe::SoftcappedSwiglu<ActivationMath>{beta, linear_beta}(gate, up);
+            return moe::SoftcappedSwiglu<moe::NativeGluMath>{beta, linear_beta}(gate, up);
         };
     case CandidateActivation::hard_clip:
         return [](float gate, float up, float beta, float linear_beta) {
-            return swiglu(std::min(gate, beta), std::clamp(up, -linear_beta, linear_beta));
+            const auto clamped = moe::swiglu_clamp(gate, up, beta, linear_beta);
+            return moe::swiglu_sigmoid_product<moe::NativeGluMath>(clamped.gate, clamped.up);
         };
     }
     throw std::invalid_argument("ERNIE: invalid candidate activation");

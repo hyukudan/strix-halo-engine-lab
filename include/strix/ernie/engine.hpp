@@ -7,7 +7,7 @@
 
 namespace strix::ernie {
 
-enum class RouterContract { candidate, unit_gain, gain_before_normalize, swapped_planes, single_plane, summed_scores };
+using RouterContract = moe::SplitRouteMode;
 enum class VhaContract { residual, swapped, off, non_residual };
 enum class KeyNormContract { candidate, value_before_head_norm, weighted_only, none };
 enum class ResidualContract { candidate, transpose, half_post, feature_interleave, bf16 };
