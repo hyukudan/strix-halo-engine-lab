@@ -7436,7 +7436,7 @@ A served cohort pass runs its lane-stateful stages (K/V and post convolutions, p
 - **Tier and regime:** EXACT, FAST, TURBO; HIP multi-request decode
 - **Exactness evidence:** EXACT: each lane keeps its one-row step bits. HIP cohort-lanes fixture, served route and incumbent body: logits, K/V rows and histories bitwise against each lane alone at widths 2 3 4 8 9 16 17 (12 steps); served C8 ids equal with the switch on and off.
 - **Off switch:** STRIX_INKLING_HIP_LANES=0
-- **Measured gain:** one gfx1151 node, strix-serve EXACT, 8 slots, 8 concurrent requests of 128 tokens, same binary (receipt coh3 t1): 8-row pass 103.5 -> 95.6 ms ((span 128 - span 32) / 96), aggregate with prefill 49.10 -> 51.73 tok/s (x1.054); one request unchanged (26.71 / 26.64 tok/s). Kernel trace (receipt coh3 p1): the lane-stateful stages were about 2,900 launches per 8-row pass.
+- **Measured gain:** one gfx1151 node, strix-serve EXACT, 8 slots, 8 concurrent requests of 128 tokens, same binary: 8-row pass 103.5 -> 95.6 ms ((span 128 - span 32) / 96), aggregate with prefill 49.10 -> 51.73 tok/s (x1.054); one request unchanged (26.71 / 26.64 tok/s). Kernel trace: the lane-stateful stages were about 2,900 launches per 8-row pass.
 - **Preconditions:** HIP, a cohort pass of at least two lanes, no host taps recorded (a recorded drafter tap keeps one launch per lane), at most 32 rows per step block.
 
 | Model | Binding |

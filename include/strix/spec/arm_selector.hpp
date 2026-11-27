@@ -12,7 +12,7 @@
 //   ms per token - pass walls) is below -probe_stop active passes; at the end it replaces the active arm only when its
 //   rate beats the active rate by `switch_in` (hysteresis); an inconclusive probe (rate within probe_band below that bar)
 //   of an arm that wins ties (below) runs on up to probe_passes_max passes before it decides (6 passes of text carry +-15 % noise, more than the few %
-//   between two good drafters; measured t1b code: a 6-pass block probe at 0.94x the bundled rate, 1.03x over the run);
+//   between two good drafters; measured code workload: a 6-pass block probe at 0.94x the bundled rate, 1.03x over the run);
 // - a measured arm is probed again every `probe_every` passes (doubled after each losing probe, up to `probe_max`)
 //   while the probe ledger (sum of the probes' realised losses) stays <= probe_loss x the decode's wall;
 // - regime change: when the active rate falls below `drop` x another arm's last measured rate, that arm is probed now;

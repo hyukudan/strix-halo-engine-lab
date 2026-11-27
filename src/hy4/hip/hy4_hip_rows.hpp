@@ -41,18 +41,18 @@ inline constexpr std::uint32_t kMaxVerifyRows = 8;
 // and the chain's stated confidence, the host oracle's prose conditionals P(run >= k) .714 .452 .197 .133 .034 .017.
 inline constexpr double kVerifySeedGbps = 207.0;
 inline constexpr std::array<double, 6> kChainSurvival{0.714, 0.633, 0.436, 0.675, 0.256, 0.5};
-// DFly2 block arm seeds (PREDICTION of hy4_df2-STATE section 4, Q8_0 drafter + FAST head; the Arbiter refines both online):
+// DFly2 block arm seeds (estimated for the Q8_0 drafter and FAST head, refined online):
 // flush = one block pass (embedding, 5 draft layers, the head over the rows), step = one hidden-correction slot.
 inline constexpr double kDflySeedStepMs = 0.5, kDflySeedFlushMs = 8.0;
 // Per-regime selector (spec::ArmSelector, arm 0 = the next-token block, arm 1 = DFly2): the block arm is probed only while
-// the next-token arm emits >= this many tokens per pass. Measured one node (hy4_df2): a block pass 9.0-9.5 ms = 2.6 next-token
+// the next-token arm emits >= this many tokens per pass. On one node, a block pass 9.0-9.5 ms = 2.6 next-token
 // drafts of 3.58 ms, so the block can only pay where ~2.5 drafts are accepted (prose 2.1 tokens/pass: DFly2 -22 %;
 // think 2.6: +1.4 %; code 3.05: +2.9 %, pair +6.9 %).
 inline constexpr double kDflyProbeMinTokens = 2.5;
 // The selector's DFly2 arm starts from this stated confidence (conditional survival by depth, BlockDrafter::
 // seed_chain_survival): without it the arm's Arbiter opens depth one frontier probe at a time and a probe episode measures
-// only that cold start (measured t1 code: 6 probe passes at 2.67 tokens / pass vs 3.88 for DFly2 alone). Flat 0.80 =
-// the offline think acceptance E(7) 4.121 (hy4_df: 1 + sum c^d, d = 1..7); code E(7) 4.637 is c ~0.86. The arm is probed
+// only that cold start (measured code workload: 6 probe passes at 2.67 tokens / pass vs 3.88 for DFly2 alone). Flat 0.80 =
+// the offline think acceptance E(7) 4.121 (1 + sum c^d, d = 1..7); code E(7) 4.637 is c ~0.86. The arm is probed
 // only past kDflyProbeMinTokens (think / code regimes), where this prior holds; online counts refine it.
 inline constexpr std::array<double, 7> kDflySurvival{0.80, 0.80, 0.80, 0.80, 0.80, 0.80, 0.80};
 // Routed experts of a verify window in the shared A8 union rows form (each distinct expert read once, rows bitwise == the
@@ -552,7 +552,7 @@ SpecResult select_run(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32
     seed_arm(dd, dfo, true, dfo.chain_survival.empty() ? std::span<const double>(kDflySurvival) : std::span<const double>(dfo.chain_survival));
     spec::ArmSelector sel(cfg);
     sel.add(dm, "mtp");
-    // wins_ties: past the gate DFly2 won every measured regime (think +1.4 %, code +2.9 %, pair code +6.9 %; hy4_df2)
+    // wins_ties: past the gate DFly2 won every measured regime (think +1.4 %, code +2.9 %, pair code +6.9 %)
     sel.add(dd, "dfly", kDflyProbeMinTokens, [&f](std::uint64_t context, std::uint32_t rows) { return f.dfly_room(context, rows); },
             true);
     sel.commit(prompt);

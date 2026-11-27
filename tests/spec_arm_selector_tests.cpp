@@ -74,7 +74,7 @@ PolicyRun run_policy(std::uint32_t passes, double min_tokens1, Regime regime, st
     return r;
 }
 
-// Hy4 one node, measured shapes (hy4_df2): prose bundled 21.70 tok/s at ~2.1 tokens/pass; block 16.98 with its
+// Hy4 one node, measured shapes: prose bundled 21.70 tok/s at ~2.1 tokens/pass; block 16.98 with its
 // arbiter mostly serial (~1.1 tokens/pass at 65 ms); code bundled 32.32 (3.05 tokens/pass), block 33.26 (3.88).
 const Shape kProse0{2.1, 2.1 / 21.70 * 1000.0}, kProse1{1.1, 1.1 / 16.98 * 1000.0};
 const Shape kCode0{3.05, 3.05 / 32.32 * 1000.0}, kCode1{3.88, 3.88 / 33.26 * 1000.0};

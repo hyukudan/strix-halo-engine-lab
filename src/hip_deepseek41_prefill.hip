@@ -352,12 +352,12 @@ bool prefill_flash_q16() {
 std::uint32_t prefill_moe_window_cap() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_MOE_WINDOW_CAP", 8192U, 1U, 65536U); }
 bool prefill_joint_layer() { return strix::envcfg::flag("STRIX_DS41_PREFILL_JOINT_LAYER", false, strix::EnvFlagMatch::exact); }
 std::uint32_t prefill_joint_layer_rows() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_JOINT_LAYER_ROWS", 1024U, 0U, 65536U); }
-// FAST policy ds41-decoder-replay-bounded-v1 (STRIX_DS41_DECODER_REPLAY = R rows, a multiple of 128; 0/unset off; set by the
+// Bounded replay policy ds41-decoder-replay-bounded-v1 (STRIX_DS41_DECODER_REPLAY = R rows, a multiple of 128; 0/unset off; set by the
 // governed profile table): every decoder layer runs only its last R rows, window keys floored at the cut
 // (ds41::plan_bounded_replay). STRIX_DS41_DECODER_REPLAY_ORACLE=1 (measurement only): the exact cone's rows with the same
 // key floors, whose last-row logits and state equal the bounded run's bit for bit only without row-set dependent FAST
-// levers (fixture b); under the FAST set (for one, FAST Engram's per-view FP16 flag) they differ (ds_replay: en32-a R = 512,
-// the last 8 head rows, which both forms compute, differ), so the bounded run keeps every decoder row from the cut.
+// levers. At R = 512, the FAST set with per-view Engram FP16 selection can change the final eight head rows.
+// The bounded run therefore keeps every decoder row from the cut.
 std::uint32_t prefill_decoder_replay_rows() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_DECODER_REPLAY", 0U, 0U, 65536U); }
 bool prefill_decoder_replay_oracle() { return strix::envcfg::flag("STRIX_DS41_DECODER_REPLAY_ORACLE", false, strix::EnvFlagMatch::exact); }
 unsigned prefill_window_drain() { return strix::envcfg::number<unsigned>("STRIX_DS41_PREFILL_WINDOW_DRAIN", 1U, 0U, 3U); }
