@@ -94,23 +94,61 @@ __device__ __forceinline__ void accumulate(unsigned pair, float2 input, float& s
     sum = __fmaf_rn(high_bf16(pair), input.y, sum);
 }
 
+// One warp owns a packed weight tile. Above the register input cap, copy the tile once from global memory and
+// reuse it from shared memory for the remaining inputs. The tile retains the original code and scale bytes.
+template <class T>
+__device__ __forceinline__ void copy_union_row(T* dst, const T* src, unsigned count, unsigned lane) {
+    for (unsigned i = lane; i < count; i += 32U) dst[i] = src[i];
+}
+
+template <packed::MatrixFormat Format, unsigned Columns, unsigned Outputs>
+__device__ __forceinline__ packed::PackedMatrix stage_union_weights(const packed::PackedMatrix& matrix,
+                                                                    unsigned col, unsigned stride, unsigned live,
+                                                                    unsigned width, unsigned lane,
+                                                                    unsigned* warp_tile) {
+    using Operand = packed::PackedOperand<Format>;
+    const unsigned code_bytes = Operand::kNvfp4 ? width / 2U : width;
+    const unsigned scale_bytes = width / static_cast<unsigned>(Operand::kBlockColumns);
+    auto* codes = reinterpret_cast<std::uint8_t*>(warp_tile);
+    auto* scales = codes + Outputs * code_bytes;
+    __syncwarp();  // a preceding expert may still be reading this warp's tile
+#pragma unroll
+    for (unsigned i = 0; i < Outputs; ++i) {
+        const unsigned offset = i % Columns;
+        if (offset >= live) continue;
+        const auto row = Operand{matrix}.tile16_address(col + offset + (i / Columns) * stride, 0U);
+        auto* dst = codes + i * code_bytes;
+        if (reinterpret_cast<std::uintptr_t>(row.codes) % sizeof(unsigned) == 0U) {
+            copy_union_row(reinterpret_cast<unsigned*>(dst), reinterpret_cast<const unsigned*>(row.codes),
+                           code_bytes / sizeof(unsigned), lane);
+        } else {
+            copy_union_row(dst, row.codes, code_bytes, lane);
+        }
+        copy_union_row(scales + i * scale_bytes, row.scale_code, scale_bytes, lane);
+    }
+    __syncwarp();
+    return {codes, scales, Outputs, width, matrix.outer_scale, packed::RowOrder::contiguous};
+}
+
 // The packed dot for the inputs whose bit is set in `mask` (bit n = inputs[n], mask < 2^Inputs) against the same weight rows. Every code word and block scale is
 // loaded and decoded once and accumulated into each input's own accumulators: per input the lane chunks, decode, FMA
 // order and butterfly are those of a one-input dot, so out[n] is bitwise the dot of inputs[n] alone (the expert union of
 // a rows launch reads each expert once for all its routed rows). The aligned run path and the short / unaligned scalar
 // path give the same bits (same per-lane K sequence 2 lane + 64 j, decode == decode_pair), so one alignment decision
 // for all inputs keeps every input's bits.
-template <packed::MatrixFormat Format, unsigned Columns, unsigned Inputs, unsigned Outputs, class Input>
+template <packed::MatrixFormat Format, unsigned Columns, unsigned Inputs, unsigned Outputs, bool Union = false,
+          class Input>
 __device__ __forceinline__ void dot_masked_inputs(const packed::PackedMatrix& matrix, unsigned col, unsigned stride,
                                                   unsigned live, const Input* const (&inputs)[Inputs], unsigned mask,
-                                                  unsigned width, unsigned lane, float (*out)[Outputs]) {
+                                                  unsigned width, unsigned lane, float (*out)[Outputs],
+                                                  bool shared_weights = false, bool allow_aligned = true) {
     using Operand = packed::PackedOperand<Format>;
     using Run = CudaRun<Operand::kNvfp4 ? 1U : 2U, Operand::kBlockColumns>;
     constexpr unsigned values_per_byte = Operand::kNvfp4 ? 2U : 1U;
     constexpr unsigned warp_mask = 0xffffffffU;
     const Operand weights{matrix};
     typename Operand::Tile16Address rows[Outputs];
-    bool aligned = matrix.columns % (Run::kWordBytes * values_per_byte) == 0U &&
+    bool aligned = allow_aligned && matrix.columns % (Run::kWordBytes * values_per_byte) == 0U &&
                    reinterpret_cast<std::uintptr_t>(matrix.codes) % Run::kWordBytes == 0U &&
                    reinterpret_cast<std::uintptr_t>(inputs[0]) % (2U * sizeof(Input)) == 0U;
 #pragma unroll
@@ -126,13 +164,27 @@ __device__ __forceinline__ void dot_masked_inputs(const packed::PackedMatrix& ma
     }
 
     const unsigned full = aligned ? width / Run::kColumns * Run::kColumns : 0U;
-    for (unsigned base = 0; base < full; base += Run::kColumns) {
-        unsigned codes[Outputs], scales[Outputs];
+    const auto load_run = [&](unsigned base, unsigned (&codes)[Outputs], unsigned (&scales)[Outputs]) {
 #pragma unroll
         for (unsigned i = 0; i < Outputs; ++i) {
-            const auto* run = rows[i].codes + base / values_per_byte;
-            codes[i] = __ldg(reinterpret_cast<const unsigned*>(run) + lane);
-            scales[i] = __ldg(rows[i].scale_code + base / Operand::kBlockColumns + (lane & (Run::kScales - 1U)));
+            const auto* code = reinterpret_cast<const unsigned*>(rows[i].codes + base / values_per_byte) + lane;
+            const auto* scale = rows[i].scale_code + base / Operand::kBlockColumns + (lane & (Run::kScales - 1U));
+            codes[i] = shared_weights ? *code : __ldg(code);
+            scales[i] = shared_weights ? *scale : __ldg(scale);
+        }
+    };
+    // Keep the next packed run in flight while this run decodes and accumulates. The rows and step dots keep their
+    // incumbent loop, so enable this schedule only for the expert union.
+    unsigned codes[Outputs], scales[Outputs];
+    if constexpr (Union) {
+        if (full != 0U) load_run(0U, codes, scales);
+    }
+    for (unsigned base = 0; base < full; base += Run::kColumns) {
+        unsigned next_codes[Outputs], next_scales[Outputs];
+        if constexpr (Union) {
+            if (base + Run::kColumns < full) load_run(base + Run::kColumns, next_codes, next_scales);
+        } else {
+            load_run(base, codes, scales);
         }
 #pragma unroll 1
         for (unsigned stripe = 0; stripe < Run::kPairsPerWord; ++stripe) {
@@ -149,6 +201,15 @@ __device__ __forceinline__ void dot_masked_inputs(const packed::PackedMatrix& ma
 #pragma unroll
                 for (unsigned n = 0; n < Inputs; ++n) {
                     if ((mask >> n) & 1U) accumulate(pair, x[n], out[n][i]);
+                }
+            }
+        }
+        if constexpr (Union) {
+            if (base + Run::kColumns < full) {
+#pragma unroll
+                for (unsigned i = 0; i < Outputs; ++i) {
+                    codes[i] = next_codes[i];
+                    scales[i] = next_scales[i];
                 }
             }
         }
@@ -179,6 +240,34 @@ __device__ __forceinline__ void dot_masked_inputs(const packed::PackedMatrix& ma
         }
     }
 }
+
+template <packed::MatrixFormat Format, unsigned Columns, unsigned Outputs>
+struct UnionWeightTile {
+    packed::PackedMatrix matrix;
+    unsigned col, stride, live, width;
+    bool staged, allow_aligned;
+
+    __device__ __forceinline__ UnionWeightTile(const packed::PackedMatrix& source, unsigned first, unsigned half_stride,
+                                              unsigned live_columns, unsigned k, unsigned lane, bool stage,
+                                              unsigned* scratch, unsigned warp_words)
+        : matrix(source), col(first), stride(half_stride), live(live_columns), width(k), staged(stage),
+          allow_aligned(reinterpret_cast<std::uintptr_t>(source.codes) % sizeof(unsigned) == 0U) {
+        if (staged) {
+            matrix = stage_union_weights<Format, Columns, Outputs>(source, col, stride, live, width, lane,
+                                                                    scratch + (threadIdx.x / 32U) * warp_words);
+            col = 0U;
+            stride = Columns;
+        }
+    }
+
+    template <unsigned Inputs, class Input>
+    __device__ __forceinline__ void dot(const Input* const (&inputs)[Inputs], unsigned count, unsigned lane,
+                                       float (&out)[Inputs][Outputs]) const {
+        dot_masked_inputs<Format, Columns, Inputs, Outputs, true>(matrix, col, stride, live, inputs,
+                                                                 (1U << count) - 1U, width, lane, out, staged,
+                                                                 allow_aligned);
+    }
+};
 
 // The first `count` inputs (count <= Inputs): the expert union of a rows launch.
 template <packed::MatrixFormat Format, unsigned Columns, unsigned Inputs, unsigned Outputs, class Input>

@@ -7404,9 +7404,11 @@ The GLM FAST prefill band ([glm-pf-wmma-x](#glm-pf-wmma-x)) is admitted per meas
 <a id="moe-r1-union-hip-plan"></a>
 ## HIP microscaled R1 plan: one weight read per routed expert for 8+ cohort rows
 
-**Engine:** `shared`. **Control:** STRIX_MOE_R1_UNION (read once); expert_union parameter of microscaled_r1::launch / launch_rows. **Default:** on (HIP) at 8 or more rows per launch; rows kernels below 8 rows, on CUDA and on the host.
+**Engine:** `shared`. **Control:** STRIX_MOE_R1_UNION (read once) or the expert_union parameter of microscaled_r1::launch / launch_rows. **Default:** on for HIP at 8 or more rows per launch. CUDA takes the shared plan with `STRIX_MOE_R1_UNION=1` and is pending device qualification.
 
 A served cohort pass routes R rows x 8 slots; at C8 the 64 assignments fall on about 44 distinct experts. The rows kernels read and decode an expert once per assignment and round each input per wave. The plan's gate_up union reads and decodes each chunk of an expert's weights once for all rows routed to it (up to 4 rows per pass: 8 inputs of accumulators spill on gfx1151), with the pass rows rounded once to BF16 codes in LDS (4 codes of padding per chunk: one bank pair per lane). The down projection keeps the rows kernel in nvfp4 (the union down is slower there) and runs the union in mxfp8.
+
+The CUDA body shares each packed load among up to four inputs in registers. For higher fanout it stages the packed tile in shared memory once and reuses it for subsequent groups of inputs. The CUDA bench `cuda_core_moe_r1_route_union_bench` checks both expert formats and accepts recorded router calls with `--routes FILE`.
 
 - **Shared home:** src/moe_core/microscaled_r1.hpp (decode_chunk_inputs, stream_inputs, dot_inputs_streamed, gate_up_union, launch)
 - **Tier and regime:** EXACT; multi-request decode, 8..16 rows per MoE launch

@@ -10,7 +10,7 @@
 #include "moe_core/r1_tail.hpp"
 
 #include "moe_core/microscaled_r1_geometry.hpp"
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) || defined(__CUDACC__)
 #include "strix/env_flags.hpp"
 #endif
 #include "strix/exec/descriptor.hpp"
@@ -194,49 +194,49 @@ inline constexpr Geometry kGeometry = kCudaGeometry;
 // The descriptor-bound step kernels (verify windows of 1..16 rows, enqueue_step) are the rows launch of the decode
 // kernels and use kGeometry: grid (gate_blocks, rows * TopK) for gate_up, (down_blocks, rows) for down_combine.
 
-// Expert-union launches (CUDA): one pass carries up to MaxRows inputs per weight row, so the per-input accumulators
-// grow with MaxRows; wide passes take fewer columns per warp to stay in registers (the columns change no bit).
-// HIP (stream_inputs): every input loads its activation quads per weight quad, so a wave keeps the rows launch's
-// columns (each activation load feeds 4 weight rows) and takes at most kUnionInputs inputs per pass.
+// The union caps live input accumulators per wave. HIP keeps its rows geometry. CUDA uses two weight rows per warp
+// (one gate and one up, or two down) so a packed tile for high fanout fits in shared memory.
 template <unsigned MaxRows>
 inline constexpr Geometry kUnionGeometry =
 #if defined(__HIPCC__)
     kHipGeometry;
 #else
-    MaxRows <= 4U ? kCudaGeometry : (MaxRows <= 8U ? Geometry{1U, 2U} : Geometry{1U, 1U});
+    Geometry{1U, 2U};
 #endif
-// Inputs of one union pass (dot_inputs) per wave: an expert routed by more assignments streams its columns again for
-// the next pass (from cache). HIP: 4 (8 inputs held 32 accumulators: 197-233 VGPRs on gfx1151, one CTA per CU, and
-// spills under the rows kernels' occupancy bound); real cohort windows route ~1.5 assignments per distinct expert.
-// Fewest routed rows the decode plan (launch) runs as an expert union. HIP: 8 (gfx1151 union bench, served-like routes:
-// R = 4 shares too few experts, 26 distinct of 32, and the union ran 6-12 % slower than the rows launch; R = 8 / 16
-// faster). CUDA: never (its union forms measured slower than the rows launch: coh_rtx).
-inline constexpr unsigned kUnionMinRows =
-#if defined(__HIPCC__)
-    8U;
-#else
-    std::numeric_limits<unsigned>::max();
-#endif
+// Below eight rows the decode cohort usually shares too few expert weights to pay for a union plan.
+inline constexpr unsigned kUnionMinRows = 8U;
+
+constexpr unsigned decode_union_capacity(bool selected, unsigned rows) {
+    if (!selected || rows < kUnionMinRows || rows > kMaxLaunchRows) return 0U;
+    return rows <= 8U ? 8U : 16U;
+}
 
 // Formats whose decode plan also runs down_combine as a union (launch). HIP: MXFP8 only (gfx1151 union bench, served-like
 // routes, R = 8: MXFP8 down union 704 vs rows 800 us; the NVFP4 down union, half the bytes per FMA and global
 // activation rows, ran 460-498 vs rows 390 us at either column count, so NVFP4 keeps the rows down after the union
-// gate). CUDA: no union plan (kUnionMinRows).
+// gate). Both backends use the same decode policy.
 template <packed::MatrixFormat Format>
-inline constexpr bool kUnionDown =
-#if defined(__HIPCC__)
-    Format == packed::MatrixFormat::mxfp8;
-#else
-    false;
-#endif
+inline constexpr bool kUnionDown = Format == packed::MatrixFormat::mxfp8;
 
 template <unsigned MaxRows>
-inline constexpr unsigned kUnionInputs =
-#if defined(__HIPCC__)
-    MaxRows < 4U ? MaxRows : 4U;
-#else
-    MaxRows;
-#endif
+inline constexpr unsigned kUnionInputs = MaxRows < 4U ? MaxRows : 4U;
+
+// Bytes for CUDA's packed tile: a separate word-aligned code/scale plane per warp. The budget leaves space for the
+// route plan and down-combine terms within the default shared-memory limit of the supported devices.
+inline constexpr unsigned kCudaUnionStageMaxBytes = 40U * 1024U;
+template <packed::MatrixFormat Format>
+STRIX_R1_HD constexpr std::uint64_t cuda_union_warp_words(unsigned width, unsigned outputs) {
+    using Operand = packed::PackedOperand<Format>;
+    const auto codes = Operand::kNvfp4 ? width / 2U : width;
+    const auto scales = width / Operand::kBlockColumns;
+    return (std::uint64_t{outputs} * (codes + scales) + 3U) / 4U;
+}
+
+template <packed::MatrixFormat Format>
+constexpr unsigned cuda_union_stage_bytes(unsigned width, unsigned outputs) {
+    const auto bytes = cuda_union_warp_words<Format>(width, outputs) * kWavesPerBlock * sizeof(unsigned);
+    return bytes <= kCudaUnionStageMaxBytes ? static_cast<unsigned>(bytes) : 0U;
+}
 
 // Launch-grid limits are backend data. The shared geometry is computed in 64 bits; every launch checks the grid(s) it
 // submits against the limits of the backend that submits them before anything is enqueued (a call no form can
@@ -309,6 +309,11 @@ template <packed::MatrixFormat Format, unsigned TopK, unsigned MaxRows>
 inline bool fits_union(const Args& a, unsigned rows, const GridLimits& limits, Grids grids = Grids::both) {
     static_assert(MaxRows >= 1U && MaxRows <= r1_route::kMaxUnionRows && MaxRows * TopK <= 256U);
     constexpr auto geometry = kUnionGeometry<MaxRows>;
+#if defined(STRIX_MOE_R1_CUDA_PACKED_DOT)
+    if ((grids != Grids::down && cuda_union_stage_bytes<Format>(a.hidden, 2U * geometry.gate_columns) == 0U) ||
+        (grids != Grids::gate && cuda_union_stage_bytes<Format>(a.intermediate, geometry.down_columns) == 0U))
+        return false;
+#endif
     return rows >= 1U && rows <= MaxRows && a.experts <= r1_route::kMaxUnionExperts && fits<Format, TopK>(a) &&
            std::uint64_t{rows} * TopK * a.intermediate <=
                std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t) &&
@@ -1266,8 +1271,7 @@ __device__ __forceinline__ void down_combine_row(Args args, Tail... tail) {
 
 
 // ---- Expert union of a routed rows launch (r1_route.hpp; CUDA and HIP bodies) ----
-// Both backends are wave32 (kWarp == 32: 32-bit masks of one wave); wave_ballot is the only backend intrinsic. On HIP
-// dot_inputs runs dot_rows per input (same bits; the weights of an expert are read again from cache per input).
+// Both backends are wave32 (kWarp == 32: 32-bit masks of one wave).
 __device__ __forceinline__ unsigned wave_ballot(bool predicate) {
     static_assert(kWarp == 32U, "the union masks are one 32-bit word per wave");
 #if defined(__HIPCC__)
@@ -1334,6 +1338,14 @@ __device__ __forceinline__ void union_mark(UnionPlan<TopK, MaxRows>& plan, unsig
 }
 
 __device__ __forceinline__ unsigned popcount(unsigned bits) { return static_cast<unsigned>(__popc(bits)); }
+
+template <unsigned Words>
+__device__ __forceinline__ unsigned union_assignment_count(const unsigned (&mask)[Words]) {
+    unsigned count = 0U;
+#pragma unroll
+    for (unsigned w = 0; w < Words; ++w) count += popcount(mask[w]);
+    return count;
+}
 
 // Group of expert e: the number of distinct experts below it.
 template <unsigned TopK, unsigned MaxRows>
@@ -1419,7 +1431,11 @@ __global__ __launch_bounds__(kThreads) void gate_up_union(Args args, unsigned ro
     for (unsigned a = threadIdx.x; a < rows * TopK; a += kThreads) {
         if (union_member(plan, a, args.experts) && union_rank(plan, plan.ids[a]) == blockIdx.y) {
             atomicOr(&plan.group[a / 32U], 1U << (a % 32U));
+#if defined(STRIX_MOE_R1_CUDA_PACKED_DOT)
+            atomicExch(&plan.expert, plan.ids[a]);
+#else
             plan.expert = plan.ids[a];
+#endif
         }
     }
     __syncthreads();
@@ -1443,6 +1459,14 @@ __global__ __launch_bounds__(kThreads) void gate_up_union(Args args, unsigned ro
     unsigned mask[Plan::kAssignmentWords];
 #pragma unroll
     for (unsigned w = 0; w < Plan::kAssignmentWords; ++w) mask[w] = plan.group[w];
+#if defined(STRIX_MOE_R1_CUDA_PACKED_DOT)
+    extern __shared__ unsigned packed_tiles[];
+    constexpr unsigned kOutputs = 2U * GateColumns;
+    const cuda_body::UnionWeightTile<Format, GateColumns, kOutputs> tile{
+        args.matrices[expert].gate_up, col, args.intermediate, live, args.hidden, lane,
+        union_assignment_count(mask) > kInputs, packed_tiles,
+        static_cast<unsigned>(cuda_union_warp_words<Format>(args.hidden, kOutputs))};
+#endif
     const moe::SoftcappedSwiglu<activation::DeviceMath> swiglu{args.gate_cap, args.up_cap};
     for (;;) {
         unsigned taken[kInputs];
@@ -1455,6 +1479,9 @@ __global__ __launch_bounds__(kThreads) void gate_up_union(Args args, unsigned ro
                                                        args.intermediate).input;
         }
         float pair[kInputs][2U * GateColumns];
+#if defined(STRIX_MOE_R1_CUDA_PACKED_DOT)
+        tile.dot(inputs, count, lane, pair);
+#else
 #if defined(__HIPCC__)
         if (staged) {
             // Round the pass's rows once into LDS as BF16 codes (input_bf16's bits), then stream from LDS.
@@ -1492,6 +1519,7 @@ __global__ __launch_bounds__(kThreads) void gate_up_union(Args args, unsigned ro
             dot_inputs<Format, GateColumns>(args.matrices[expert].gate_up, col, args.intermediate, live, inputs, count,
                                             args.hidden, lane, pair);
         }
+#endif
         if (lane == 0U) {
 #pragma unroll
             for (unsigned n = 0; n < kInputs; ++n) {
@@ -1539,6 +1567,13 @@ __global__ __launch_bounds__(kThreads) void down_union(Args args, unsigned rows,
             const unsigned a = w * kWarp + lane;
             mask[w] = wave_ballot(a < rows * TopK && union_member(plan, a, args.experts) && plan.ids[a] == expert);
         }
+#if defined(STRIX_MOE_R1_CUDA_PACKED_DOT)
+        extern __shared__ unsigned packed_tiles[];
+        const cuda_body::UnionWeightTile<Format, DownColumns, DownColumns> tile{
+            args.matrices[expert].down, col, 0U, live, args.intermediate, lane,
+            union_assignment_count(mask) > kUnionInputs<MaxRows>, packed_tiles,
+            static_cast<unsigned>(cuda_union_warp_words<Format>(args.intermediate, DownColumns))};
+#endif
         for (;;) {
             unsigned taken[kUnionInputs<MaxRows>];
             const unsigned count = union_take(mask, taken);
@@ -1549,8 +1584,12 @@ __global__ __launch_bounds__(kThreads) void down_union(Args args, unsigned rows,
                 inputs[n] = args.activation + std::size_t{n < count ? taken[n] : 0U} * args.intermediate;
             }
             float projected[kUnionInputs<MaxRows>][DownColumns];
+#if defined(STRIX_MOE_R1_CUDA_PACKED_DOT)
+            tile.dot(inputs, count, lane, projected);
+#else
             dot_inputs<Format, DownColumns>(args.matrices[expert].down, col, 0U, live, inputs, count,
                                             args.intermediate, lane, projected);
+#endif
             if (lane == 0U) {
 #pragma unroll
                 for (unsigned n = 0; n < kUnionInputs<MaxRows>; ++n) {
@@ -1710,8 +1749,9 @@ inline cudaError_t launch_gate_up_union(const Args& args, unsigned rows, cudaStr
     constexpr auto geometry = kUnionGeometry<MaxRows>;
     const auto columns = gate_blocks(args.intermediate, geometry.gate_columns);
     const auto groups = r1_route::union_groups(rows, TopK, args.experts);
+    const unsigned staged = cuda_union_stage_bytes<Format>(args.hidden, 2U * geometry.gate_columns);
     detail::gate_up_union<Format, TopK, MaxRows, geometry.gate_columns, Entry>
-        <<<dim3(columns, groups), detail::kThreads, 0, stream>>>(args, rows, step);
+        <<<dim3(columns, groups), detail::kThreads, staged, stream>>>(args, rows, step);
     return cudaGetLastError();
 }
 
@@ -1724,8 +1764,9 @@ inline cudaError_t launch_gate_up_union_routed(const Args& args, const Route& ro
     constexpr auto geometry = kUnionGeometry<MaxRows>;
     const auto columns = gate_blocks(args.intermediate, geometry.gate_columns);
     const auto groups = r1_route::union_groups(rows, TopK, args.experts);
+    const unsigned staged = cuda_union_stage_bytes<Format>(args.hidden, 2U * geometry.gate_columns);
     detail::gate_up_union<Format, TopK, MaxRows, geometry.gate_columns, Entry, Route>
-        <<<dim3(columns, groups), detail::kThreads, 0, stream>>>(args, rows, step, route);
+        <<<dim3(columns, groups), detail::kThreads, staged, stream>>>(args, rows, step, route);
     return cudaGetLastError();
 }
 
@@ -1735,8 +1776,9 @@ inline cudaError_t launch_down_union(const Args& args, unsigned rows, cudaStream
     if (!fits_union<Format, TopK, MaxRows>(args, rows, kBackendGridLimits, Grids::down)) return cudaErrorInvalidValue;
     constexpr auto geometry = kUnionGeometry<MaxRows>;
     const auto blocks = down_blocks(args.hidden, geometry.down_columns);
+    const unsigned staged = cuda_union_stage_bytes<Format>(args.intermediate, geometry.down_columns);
     detail::down_union<Format, TopK, MaxRows, geometry.down_columns, Entry>
-        <<<blocks, detail::kThreads, 0, stream>>>(args, rows, step);
+        <<<blocks, detail::kThreads, staged, stream>>>(args, rows, step);
     return cudaGetLastError();
 }
 
@@ -1815,14 +1857,16 @@ inline hipError_t launch_down_union(const Args& args, unsigned rows, hipStream_t
 }
 #endif
 
-#if defined(__HIPCC__)
-// Off switch of the HIP decode plan's expert union (kUnionMinRows): STRIX_MOE_R1_UNION=0 keeps the rows launch at every
-// row count. Read once (recorded for the effective-config receipt); default on (exact: same bits either way).
+// Read once per process. HIP's measured plan defaults on. CUDA is opt-in pending the device identity and timing gates.
 inline bool expert_union_selected() {
-    static const bool on = strix::envcfg::flag("STRIX_MOE_R1_UNION", true, strix::EnvFlagMatch::exact);
+#if defined(__HIPCC__)
+    constexpr bool default_on = true;
+#else
+    constexpr bool default_on = false;
+#endif
+    static const bool on = strix::envcfg::flag("STRIX_MOE_R1_UNION", default_on, strix::EnvFlagMatch::exact);
     return on;
 }
-#endif
 
 // Decode plan for 1 .. kMaxLaunchRows routed rows (one gate_up and one down_combine launch). The caller admits a wave32
 // HIP device or CUDA sm_80+, supplies prevalidated weights and a checked route for every row, and an activation scratch
@@ -1831,29 +1875,39 @@ template <packed::MatrixFormat Format, unsigned TopK>
 #if defined(__HIPCC__)
 inline hipError_t launch(const Args& args, hipStream_t stream, unsigned rows = 1U,
                          bool expert_union = expert_union_selected()) {
-    if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits, Grids::both, kMaxLaunchRows))
-        return hipErrorInvalidValue;
-    // Expert union (expert_union, kUnionMinRows): rows that share routed experts read each of them once in gate_up and,
-    // where kUnionDown admits the format, in down_combine; the union gate writes every activation row where the rows
-    // gate writes it, so either down reads it. Every output equals the rows launch bit for bit (union bench ID lines).
+    constexpr auto success = hipSuccess;
+    constexpr auto invalid = hipErrorInvalidValue;
+#else
+inline cudaError_t launch(const Args& args, cudaStream_t stream, unsigned rows = 1U,
+                          bool expert_union = expert_union_selected()) {
+    constexpr auto success = cudaSuccess;
+    constexpr auto invalid = cudaErrorInvalidValue;
+#endif
+    if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits, Grids::both, kMaxLaunchRows)) return invalid;
+
+    // Both downs read the same activation layout. Select the capacity and format policy in this plan for either backend.
     bool union_gate = false;
-    if (expert_union && rows >= kUnionMinRows) {
-        if (rows <= 8U && fits_union<Format, TopK, 8U>(args, rows, kBackendGridLimits)) {
-            if (const auto status = launch_gate_up_union<Format, TopK, 8U>(args, rows, stream); status != hipSuccess)
-                return status;
-            if constexpr (kUnionDown<Format>) return launch_down_union<Format, TopK, 8U>(args, rows, stream);
+#if defined(__HIPCC__) || defined(STRIX_MOE_R1_CUDA_PACKED_DOT)
+    if constexpr (TopK <= 256U / kMaxLaunchRows) {
+        const auto try_union = [&]<unsigned Capacity>() {
+            constexpr auto grids = kUnionDown<Format> ? Grids::both : Grids::gate;
+            if (!fits_union<Format, TopK, Capacity>(args, rows, kBackendGridLimits, grids)) return success;
             union_gate = true;
-        } else if (fits_union<Format, TopK, 16U>(args, rows, kBackendGridLimits)) {
-            if (const auto status = launch_gate_up_union<Format, TopK, 16U>(args, rows, stream); status != hipSuccess)
+            if (const auto status = launch_gate_up_union<Format, TopK, Capacity>(args, rows, stream); status != success)
                 return status;
-            if constexpr (kUnionDown<Format>) return launch_down_union<Format, TopK, 16U>(args, rows, stream);
-            union_gate = true;
+            if constexpr (kUnionDown<Format>) return launch_down_union<Format, TopK, Capacity>(args, rows, stream);
+            return success;
+        };
+        const unsigned capacity = decode_union_capacity(expert_union, rows);
+        if (capacity != 0U) {
+            const auto status = capacity == 8U ? try_union.template operator()<8U>() :
+                                                 try_union.template operator()<16U>();
+            if (status != success || (union_gate && kUnionDown<Format>)) return status;
         }
     }
 #else
-inline cudaError_t launch(const Args& args, cudaStream_t stream, unsigned rows = 1U) {
-    if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits, Grids::both, kMaxLaunchRows))
-        return cudaErrorInvalidValue;
+    (void)expert_union;
+    (void)success;
 #endif
     constexpr auto threads = detail::kThreads;
     const auto columns = gate_blocks(args.intermediate, detail::kGateColumns);
@@ -1872,8 +1926,10 @@ inline cudaError_t launch(const Args& args, cudaStream_t stream, unsigned rows =
     }
     return hipGetLastError();
 #else
-    detail::gate_up<Format, TopK><<<dim3(columns, rows * TopK), threads, 0, stream>>>(args);
-    if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
+    if (!union_gate) {
+        detail::gate_up<Format, TopK><<<dim3(columns, rows * TopK), threads, 0, stream>>>(args);
+        if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
+    }
     detail::down_combine<Format, TopK><<<dim3(down_grid, rows), threads, 0, stream>>>(args);
     return cudaGetLastError();
 #endif
@@ -1916,21 +1972,20 @@ template <packed::MatrixFormat Format, unsigned TopK>
 #if defined(__HIPCC__)
 inline hipError_t launch_rows(const Args& args, hipStream_t stream, unsigned rows, unsigned scratch_rows = kMaxRows,
                              bool expert_union = expert_union_selected()) {
+    constexpr auto success = hipSuccess;
+    constexpr auto invalid = hipErrorInvalidValue;
+#else
+inline cudaError_t launch_rows(const Args& args, cudaStream_t stream, unsigned rows, unsigned scratch_rows = kMaxRows,
+                              bool expert_union = expert_union_selected()) {
+    constexpr auto success = cudaSuccess;
+    constexpr auto invalid = cudaErrorInvalidValue;
+#endif
     const unsigned cap = rows_chunk_cap(scratch_rows);
-    if (rows == 0U || cap == 0U) return hipErrorInvalidValue;
-    return for_each_rows_chunk(rows, hipSuccess, [&](unsigned first, unsigned count) {
+    if (rows == 0U || cap == 0U) return invalid;
+    return for_each_rows_chunk(rows, success, [&](unsigned first, unsigned count) {
         return launch<Format, TopK>(rows_chunk<TopK>(args, first), stream, count, expert_union);
     }, cap);
 }
-#else
-inline cudaError_t launch_rows(const Args& args, cudaStream_t stream, unsigned rows, unsigned scratch_rows = kMaxRows) {
-    const unsigned cap = rows_chunk_cap(scratch_rows);
-    if (rows == 0U || cap == 0U) return cudaErrorInvalidValue;
-    return for_each_rows_chunk(rows, cudaSuccess, [&](unsigned first, unsigned count) {
-        return launch<Format, TopK>(rows_chunk<TopK>(args, first), stream, count);
-    }, cap);
-}
-#endif
 #endif
 
 } // namespace strix::moe_core::microscaled_r1

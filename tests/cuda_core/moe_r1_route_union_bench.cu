@@ -2,29 +2,37 @@
 //   ROUTED  gate_up with an inline checked route (no route launch) vs the route launch + gate_up + down_combine:
 //           ids, weights, status, activations and outputs bitwise, rows 1 and 3, two route policies (selection order /
 //           float keys, ascending ids / ordered keys), a failed row (non-finite logit).
-//   UNION   expert-union gate_up / down vs the rows launches: activations and outputs bitwise for 2..8 rows, routes with
+//   UNION   expert-union gate_up / down vs the rows launches: activations and outputs bitwise for 2..16 rows, routes with
 //           distinct, shared and repeated experts, a failed row, an invalid id and a row the step block marks invalid;
 //           the inline-routed union vs route launch + union.
 //   TIME    (unless --check-only) graph-captured decode visits on synthetic top-8 experts (hidden 2304, intermediate
 //           1152, 128 experts; 16 rotating route sets so expert bytes come from DRAM):
 //           r1: route launch + gate_up + down (no PDL) | the same with PDL R1 entries | routed gate_up + down (PDL);
-//           union: rows launches vs union launches at R = 4 and 8, uniform and correlated routes (distinct experts).
-// Synthetic shapes and policies only: no model data. RESULT PASS requires every identity line EQUAL.
+//           union: direct rows vs both union projections (PDL); plan: rows vs the shared decode plan (same scratch).
+//           Both cover R = 4, 8 and 16 on uniform and correlated routes.
+//   REPLAY  optional --routes FILE (repeatable), strix-route-file/v1 from a route tap. Replay ids and FP32 weights with
+//           synthetic activations and experts. Timing is enabled unless --check-only. RESULT PASS requires every identity
+//           line to be EQUAL and every requested file to provide compatible records.
 
 #include "cuda/core/common.cuh"
 #include "moe_core/microscaled_r1.hpp"
 #include "moe_core/route_wave_kernel.hpp"
+#include "strix/moe/route_file.hpp"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <numeric>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -37,6 +45,52 @@ namespace moe = strix::moe;
 using packed::MatrixFormat;
 
 constexpr unsigned kHidden = 2304, kInter = 1152, kExperts = 128, kTop = 8, kSets = 16, kMax = route::kMaxUnionRows;
+
+struct RouteSample {
+    unsigned rows, layer;
+    std::vector<unsigned> ids;
+    std::vector<float> weights;
+};
+
+std::vector<RouteSample> read_routes(const char* path) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    const auto end = in.tellg();
+    in.seekg(0);
+    char magic[sizeof(moe::kRouteFileMagic)]{};
+    std::uint32_t version{}, reserved{};
+    in.read(magic, sizeof(magic));
+    in.read(reinterpret_cast<char*>(&version), sizeof(version));
+    in.read(reinterpret_cast<char*>(&reserved), sizeof(reserved));
+    if (!in || std::memcmp(magic, moe::kRouteFileMagic, sizeof(magic)) != 0 ||
+        version != moe::kRouteFileVersion || reserved != 0U)
+        throw std::runtime_error("invalid route file header");
+
+    std::array<unsigned, kMax + 1U> sampled{};
+    std::vector<RouteSample> result;
+    while (in.tellg() < end) {
+        moe::RouteRecordHeader h{};
+        in.read(reinterpret_cast<char*>(&h), sizeof(h));
+        if (!in || h.rows == 0U || h.top_k == 0U || h.top_k > moe::kRouteMaxTopK || h.flags != 0U)
+            throw std::runtime_error("invalid route record header");
+        const auto bytes = static_cast<std::streamoff>(std::uint64_t{h.rows} * h.top_k * 8U);
+        if (bytes > end - in.tellg()) throw std::runtime_error("truncated route record");
+        if (h.top_k != kTop || h.rows > kMax || sampled[h.rows] == kSets) {
+            in.seekg(bytes, std::ios::cur);
+            continue;
+        }
+        const auto entries = h.rows * kTop;
+        RouteSample sample{h.rows, h.layer, std::vector<unsigned>(entries), std::vector<float>(entries)};
+        in.read(reinterpret_cast<char*>(sample.ids.data()), static_cast<std::streamsize>(entries * sizeof(unsigned)));
+        in.read(reinterpret_cast<char*>(sample.weights.data()), static_cast<std::streamsize>(entries * sizeof(float)));
+        if (!in || std::any_of(sample.ids.begin(), sample.ids.end(), [](unsigned id) { return id >= kExperts; }) ||
+            std::any_of(sample.weights.begin(), sample.weights.end(), [](float w) { return !std::isfinite(w); }))
+            throw std::runtime_error("invalid expert id or weight in route record");
+        result.push_back(std::move(sample));
+        ++sampled[h.rows];
+    }
+    if (!in || result.empty()) throw std::runtime_error("no compatible route records");
+    return result;
+}
 
 // Two checked route policies of the R1 decode shape (data of this bench, not a model).
 struct SelectionPolicy {
@@ -261,7 +315,7 @@ void check_routed(Bench& b, unsigned rows, bool poison, const char* policy) {
 }
 
 // Explicit route sets for the union identity (ids written directly, not routed).
-enum class Shape { distinct, shared, repeated };
+enum class Shape { distinct, shared, repeated, hot };
 std::vector<unsigned> ids_of(Shape shape, unsigned rows, Rng& rng) {
     std::vector<unsigned> ids(kMax * kTop, 0U), pool(kExperts);
     std::iota(pool.begin(), pool.end(), 0U);
@@ -272,6 +326,10 @@ std::vector<unsigned> ids_of(Shape shape, unsigned rows, Rng& rng) {
         if (shape == Shape::repeated) {
             ids[row * kTop + 7U] = ids[row * kTop];  // the same expert twice in one row (two assignments)
             if (row == 1U) ids[row * kTop + 3U] = kExperts;  // an invalid id: the row is not stored
+        }
+        if (shape == Shape::hot) {
+            // Every row uses the same expert, including when fanout exceeds the register input cap.
+            for (unsigned slot = 0; slot < kTop; ++slot) ids[row * kTop + slot] = slot;
         }
     }
     return ids;
@@ -306,15 +364,20 @@ void check_union(Bench& b, unsigned rows, Shape shape, Rng& rng, bool failed_row
     check(r1::launch_gate_up_union<F, kTop, MaxRows, r1::EntryPdl>(args_of(b, b.b), rows, nullptr, step), "union gate_up");
     check(r1::launch_down_union<F, kTop, MaxRows, r1::EntryPdl>(args_of(b, b.b), rows, nullptr, step), "union down");
     const auto x = snap(b.a), y = snap(b.b);
-    std::vector<std::uint8_t> valid(rows, 1U);
-    if (step_row) valid[0] = 0U;
     const auto groups = route::expert_union(ids, status_rows, {}, rows, kTop, kExperts);
     char detail[128];
-    static const char* shapes[] = {"distinct", "shared", "repeated"};
+    static const char* shapes[] = {"distinct", "shared", "repeated", "hot"};
     std::snprintf(detail, sizeof(detail), "%s max=%u rows=%u %s%s%s distinct=%zu", name<F>(), MaxRows, rows,
                   shapes[static_cast<unsigned>(shape)], failed_row ? " failed-row" : "", step_row ? " step-row" : "",
                   groups.size());
     verdict("UNION", same(x.activation, y.activation) && same(x.output, y.output), detail);
+    if (!step_row) {
+        fill(b.b.output, std::size_t{kMax} * kHidden, -0x1p+120F);
+        fill(b.b.activation, std::size_t{kMax} * kTop * kInter, std::uint16_t{0x7654U});
+        check(r1::launch_rows<F, kTop>(args_of(b, b.b), nullptr, rows, kMax, true), "union plan");
+        const auto plan = snap(b.b);
+        verdict("PLAN", same(x.activation, plan.activation) && same(x.output, plan.output), detail);
+    }
 }
 
 // The inline-routed union vs route launch + union (routes from correlated logits).
@@ -422,8 +485,43 @@ void time_r1(Bench& b, int iters) {
     cudaStreamDestroy(stream);
 }
 
-// Union vs rows launches at R rows: kSets visits per graph, routes from the route launch on the logits sets
-// (even = uniform rows, odd = correlated rows), timed per parity.
+std::pair<float, float> time_pair(cudaStream_t stream, cudaGraphExec_t off, cudaGraphExec_t on,
+                                  std::size_t visits, int iters) {
+    std::array<float, 5> ta{}, tb{};
+    const auto time = [&](cudaGraphExec_t graph) { return graph_us(stream, graph, iters) / static_cast<float>(visits); };
+    for (unsigned round = 0; round < ta.size(); ++round) {
+        if (round % 2U == 0U) {
+            ta[round] = time(off);
+            tb[round] = time(on);
+        } else {
+            tb[round] = time(on);
+            ta[round] = time(off);
+        }
+    }
+    std::sort(ta.begin(), ta.end());
+    std::sort(tb.begin(), tb.end());
+    check(cudaGraphExecDestroy(off), "destroy rows graph");
+    check(cudaGraphExecDestroy(on), "destroy union graph");
+    return {ta[2], tb[2]};
+}
+
+// The same plan/rows arms for both synthetic and recorded route sets. The scratch capacity is held constant.
+template <MatrixFormat F>
+void time_plans(cudaStream_t stream, const std::vector<r1::Args>& visits, unsigned rows, const char* route_kind,
+                double groups, int iters) {
+    const auto record = [&](bool expert_union) {
+        return capture(stream, [&] {
+            for (const auto& args : visits)
+                check(r1::launch_rows<F, kTop>(args, stream, rows, kMax, expert_union), "decode plan");
+        });
+    };
+    const auto off = record(false), on = record(true);
+    const auto [rows_us, plan_us] = time_pair(stream, off, on, visits.size(), iters);
+    std::printf("TIME plan %s R=%u routes=%s distinct=%.1f/%u visits=%zu rows_us=%.2f plan_us=%.2f ratio=%.3f\n",
+                name<F>(), rows, route_kind, groups, rows * kTop, visits.size(), rows_us, plan_us, plan_us / rows_us);
+}
+
+// Even sets are uniform, odd sets correlated. Route selection occurs before capture.
 template <MatrixFormat F, unsigned MaxRows>
 void time_union(Bench& b, unsigned rows, int iters) {
     using Policy = SelectionPolicy;
@@ -449,28 +547,24 @@ void time_union(Bench& b, unsigned rows, int iters) {
                         kExperts, kHidden, kInter, 30.0F, 30.0F};
     };
     for (unsigned parity = 0; parity < 2U; ++parity) {
+        std::vector<r1::Args> visits;
+        for (unsigned set = parity; set < kSets; set += 2U) visits.push_back(args(set));
         const auto rows_form = capture(stream, [&] {
-            for (unsigned set = parity; set < kSets; set += 2U) rows_launches<F, r1::EntryPdl>(args(set), rows, stream);
+            for (const auto& visit : visits) rows_launches<F, r1::EntryPdl>(visit, rows, stream);
         });
         const auto union_form = capture(stream, [&] {
-            for (unsigned set = parity; set < kSets; set += 2U) {
-                check(r1::launch_gate_up_union<F, kTop, MaxRows, r1::EntryPdl>(args(set), rows, stream), "union gate");
-                check(r1::launch_down_union<F, kTop, MaxRows, r1::EntryPdl>(args(set), rows, stream), "union down");
+            for (const auto& visit : visits) {
+                check(r1::launch_gate_up_union<F, kTop, MaxRows, r1::EntryPdl>(visit, rows, stream), "union gate");
+                check(r1::launch_down_union<F, kTop, MaxRows, r1::EntryPdl>(visit, rows, stream), "union down");
             }
         });
-        std::vector<float> ta, tb;
-        for (int round = 0; round < 5; ++round) {
-            ta.push_back(graph_us(stream, rows_form, iters) / (kSets / 2U));
-            tb.push_back(graph_us(stream, union_form, iters) / (kSets / 2U));
-        }
-        std::sort(ta.begin(), ta.end());
-        std::sort(tb.begin(), tb.end());
-        const double groups = distinct[parity] / (kSets / 2U);
-        std::printf("TIME union %s R=%u routes=%s distinct=%.1f/%u rows_us=%.2f union_us=%.2f ratio=%.3f "
-                    "union_GBs=%.0f\n", name<F>(), rows, parity == 0U ? "uniform" : "correlated", groups, rows * kTop,
-                    ta[2], tb[2], tb[2] / ta[2], groups * static_cast<double>(b.expert_bytes) / (tb[2] * 1e3));
-        cudaGraphExecDestroy(rows_form);
-        cudaGraphExecDestroy(union_form);
+        const auto [rows_us, union_us] = time_pair(stream, rows_form, union_form, visits.size(), iters);
+        const auto* route_kind = parity == 0U ? "uniform" : "correlated";
+        const double groups = distinct[parity] / static_cast<double>(visits.size());
+        std::printf("TIME union %s R=%u routes=%s distinct=%.1f/%u rows_us=%.2f union_us=%.2f ratio=%.3f union_GBs=%.0f\n",
+                    name<F>(), rows, route_kind, groups, rows * kTop, rows_us, union_us, union_us / rows_us,
+                    groups * static_cast<double>(b.expert_bytes) / (union_us * 1e3));
+        time_plans<F>(stream, visits, rows, route_kind, groups, iters);
     }
     for (unsigned set = 0; set < kSets; ++set) {
         cudaFree(ids[set]);
@@ -481,7 +575,48 @@ void time_union(Bench& b, unsigned rows, int iters) {
 }
 
 template <MatrixFormat F>
-void run(int iters, bool check_only) {
+void check_recorded(Bench& b, const std::vector<RouteSample>& samples, int iters, bool check_only) {
+    std::array<std::vector<r1::Args>, kMax + 1U> by_width;
+    std::array<double, kMax + 1U> distinct{};
+    cudaStream_t stream;
+    check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+    for (const auto& sample : samples) {
+        auto a = args_of(b, b.a), c = args_of(b, b.b);
+        auto* ids = upload(sample.ids);
+        auto* weights = upload(sample.weights);
+        auto* status = upload(std::vector<unsigned>(sample.rows, 0U));
+        clear(b.a);
+        clear(b.b);
+        a.ids = c.ids = ids;
+        a.weights = c.weights = weights;
+        a.failure = c.failure = status;
+        check(r1::launch_rows<F, kTop>(a, stream, sample.rows, kMax, false), "recorded rows");
+        check(r1::launch_rows<F, kTop>(c, stream, sample.rows, kMax, true), "recorded union plan");
+        const auto x = snap(b.a), y = snap(b.b);
+        const auto groups = route::expert_union(sample.ids, {}, {}, sample.rows, kTop, kExperts).size();
+        char detail[112];
+        std::snprintf(detail, sizeof(detail), "%s layer=%u rows=%u distinct=%zu", name<F>(), sample.layer, sample.rows,
+                      groups);
+        verdict("REPLAY", same(x.activation, y.activation) && same(x.output, y.output), detail);
+        by_width[sample.rows].push_back(a);
+        distinct[sample.rows] += static_cast<double>(groups);
+    }
+    for (unsigned rows = 1U; rows <= kMax; ++rows) {
+        const auto& visits = by_width[rows];
+        if (visits.empty()) continue;
+        if (!check_only && !g_fail)
+            time_plans<F>(stream, visits, rows, "recorded", distinct[rows] / static_cast<double>(visits.size()), iters);
+        for (const auto& args : visits) {
+            check(cudaFree(const_cast<unsigned*>(args.ids)), "free recorded ids");
+            check(cudaFree(const_cast<float*>(args.weights)), "free recorded weights");
+            check(cudaFree(const_cast<unsigned*>(args.failure)), "free recorded status");
+        }
+    }
+    check(cudaStreamDestroy(stream), "destroy replay stream");
+}
+
+template <MatrixFormat F>
+void run(int iters, bool check_only, const std::vector<std::vector<RouteSample>>& recorded) {
     Bench b = make<F>();
     for (const unsigned rows : {1U, 3U}) {
         check_routed<F, SelectionPolicy>(b, rows, false, "selection");
@@ -489,6 +624,7 @@ void run(int iters, bool check_only) {
     }
     check_routed<F, SelectionPolicy>(b, 3U, true, "selection");
     Rng rng{0x1234ULL};
+    check_union<F, 4U>(b, 1U, Shape::distinct, rng, false, false);
     for (const auto shape : {Shape::distinct, Shape::shared, Shape::repeated}) {
         check_union<F, 4U>(b, 2U, shape, rng, false, false);
         check_union<F, 4U>(b, 4U, shape, rng, shape == Shape::shared, shape == Shape::repeated);
@@ -496,9 +632,11 @@ void run(int iters, bool check_only) {
         check_union<F, 8U>(b, 8U, shape, rng, shape != Shape::distinct, false);
         check_union<F, 16U>(b, 16U, shape, rng, shape == Shape::shared, shape == Shape::repeated);
     }
+    check_union<F, 16U>(b, 16U, Shape::hot, rng, false, false);
     check_routed_union<F, 4U, SelectionPolicy>(b, 4U, 1U);
     check_routed_union<F, 8U, SelectionPolicy>(b, 8U, 1U);
     check_routed_union<F, 8U, AscendingPolicy>(b, 8U, 2U);
+    for (const auto& samples : recorded) check_recorded<F>(b, samples, iters, check_only);
     if (check_only || g_fail) return;  // timings only after every identity line is EQUAL
     time_r1<F>(b, iters);
     time_union<F, 4U>(b, 4U, iters);
@@ -508,15 +646,21 @@ void run(int iters, bool check_only) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
     int iters = 50;
     bool check_only = false;
+    std::vector<std::vector<RouteSample>> recorded;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--iters") && i + 1 < argc) iters = std::max(1, std::atoi(argv[++i]));
         else if (!std::strcmp(argv[i], "--check-only")) check_only = true;
+        else if (!std::strcmp(argv[i], "--routes") && i + 1 < argc) recorded.push_back(read_routes(argv[++i]));
+        else throw std::invalid_argument("usage: [--iters N] [--check-only] [--routes FILE]...");
     }
-    run<MatrixFormat::nvfp4>(iters, check_only);
-    run<MatrixFormat::mxfp8>(iters, check_only);
+    run<MatrixFormat::nvfp4>(iters, check_only, recorded);
+    run<MatrixFormat::mxfp8>(iters, check_only, recorded);
     std::printf("RESULT %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
+} catch (const std::exception& e) {
+    std::fprintf(stderr, "%s\nRESULT FAIL\n", e.what());
+    return 1;
 }

@@ -151,8 +151,19 @@ int main() {
     }
     // Inkling 2 Mini gate rows (hidden 2304): 4 staged inputs = 20 736 bytes of LDS per CTA.
     static_assert(r1::union_stage_bytes<MatrixFormat::nvfp4, 4U>(2304U) == 20736U);
-    // Host / CUDA plans never run the union (kUnionMinRows); the host keeps every input of a union pass.
-    static_assert(r1::kUnionMinRows > r1::kMaxLaunchRows && r1::kUnionInputs<8U> == 8U);
+    static_assert(r1::kUnionMinRows == 8U && r1::kUnionInputs<8U> == 4U && r1::kUnionInputs<16U> == 4U);
+    static_assert(!r1::kUnionDown<MatrixFormat::nvfp4> && r1::kUnionDown<MatrixFormat::mxfp8>);
+    static_assert(r1::cuda_union_stage_bytes<MatrixFormat::nvfp4>(2304U, 2U) == 20736U);
+    static_assert(r1::cuda_union_stage_bytes<MatrixFormat::mxfp8>(2304U, 2U) == 38016U);
+    static_assert(r1::cuda_union_stage_bytes<MatrixFormat::mxfp8>(1152U, 2U) == 19008U);
+    static_assert(r1::cuda_union_stage_bytes<MatrixFormat::mxfp8>(4096U, 2U) == 0U);
+    for (unsigned rows = 0; rows <= r1::kMaxLaunchRows + 1U; ++rows) {
+        const unsigned expected = rows == 8U ? 8U : (rows >= 9U && rows <= 16U ? 16U : 0U);
+        if (r1::decode_union_capacity(false, rows) != 0U || r1::decode_union_capacity(true, rows) != expected) {
+            std::printf("FAIL union decode capacity %u\n", rows);
+            return 1;
+        }
+    }
     static_assert(r1::kGeometry.gate_columns == r1::kCudaGeometry.gate_columns &&
                       r1::kGeometry.down_columns == r1::kCudaGeometry.down_columns,
                   "host / CUDA builds keep one row per wave");
