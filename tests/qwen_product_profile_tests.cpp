@@ -259,12 +259,20 @@ void provisional_resolution() {
 }
 void cli_and_receipts() {
     const auto plain = parse({"decoder","model.gguf","1"});
-    const auto explicit_default = parse({"decoder","model.gguf","1","--profile","default"});
+    // No --profile is the FAST preset: the cells `strix run` resolves (--profile fast with the preset marker).
+    const auto explicit_default = [] {
+        std::string previous;
+        if (const char* prior = strix::profile::environment({}, strix::profile::kPresetEnv)) previous = prior;
+        (void)strix::profile::export_environment(strix::profile::kPresetEnv, "1");
+        auto preset = parse({"decoder","model.gguf","1","--profile","fast"});
+        (void)strix::profile::export_environment(strix::profile::kPresetEnv, previous.c_str());
+        return preset;
+    }();
     const auto effective_bytes = [](const dc::Options& o) {
         return dc::effective_config_json(dc::resolve_effective_config({o,{}},
             strix::ModelContract::qwen38_flash_next(), {}, {}, "", {}, {}));
     };
-    check(effective_bytes(plain) == effective_bytes(explicit_default), "omitted and explicit default effective bytes are identical");
+    check(effective_bytes(plain) == effective_bytes(explicit_default), "omitted profile and the FAST preset effective bytes are identical");
     for (const auto value : {"default","fast","quality"}) {
         const auto o = parse({"decoder","model.gguf","1","--profile",value,"--allow-pending"});
         check(o.product_profile.profile == pr::parse(value), "CLI profile parsed");
@@ -284,9 +292,9 @@ void cli_and_receipts() {
             gdn_env["STRIX_QPF2K_GDN_FP16_CHUNK"] = "1";
             gdn_env["STRIX_QPF2K_QSA_BUDGET"] = "1536";
         }
-        // The plain run is EXACT (the default column switches the FP16 WMMA prefill rows off): fast takes its own rows.
+        // The plain run is the FAST preset: each named tier takes its own rows.
         auto plain_tier = plain;
-        if (fast) plain_tier.product_profile = o.product_profile;
+        plain_tier.product_profile = o.product_profile;
         auto expected = strix::serve::parse_json_unique(dc::effective_config_json(dc::resolve_effective_config({plain_tier,gdn_env}, strix::ModelContract::qwen38_flash_next(), {}, {}, "", {}, {})));
         expected.set("profile", *json.find("profile"));
         expected.set("kv", *json.find("kv"));  // the KV receipt names the tier (and turbo's note)

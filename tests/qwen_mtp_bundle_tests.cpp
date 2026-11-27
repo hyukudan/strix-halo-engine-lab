@@ -446,7 +446,13 @@ int main(int argc,char** argv) try {
         YarnBundleSerialRetry retry;
         return resolve_identity(parse(base));
     }();
-    require(fresh_serial.prefill_option_mask==kPrefillOptionsReady,"fresh serial retains READY arithmetic");
+    // No --profile resolves the FAST preset: the serial retry keeps its prefill rows, READY plus the FAST GDN chunk row
+    // the preset applies to this in-band prompt.
+    const auto* gdn_row=fresh_serial.options.product_profile.find("gdn_fp16_chunk");
+    const unsigned fast_rows=gdn_row && strix::profile::applied(gdn_row->status) && gdn_row->value=="1"
+        ? 1U<<static_cast<unsigned>(PrefillOption::gdn_fp16_chunk) : 0U;
+    require(fresh_serial.prefill_option_mask==(kPrefillOptionsReady|fast_rows),
+        "fresh serial retains the default (FAST preset) prefill arithmetic");
     for(const auto* failure:{"admission refusal","preflight failure","bridge setup failure","golden dump failure"}) {
         env("STRIX_PREFILL_PIPE","0");env("STRIX_QSA_SCORE_RING_ROWS","");
         MtpBundleSetupRetry state;state.selected=true;
