@@ -40,20 +40,26 @@ struct Geometry {
 
 // Numerics points the files on disk do not settle (settled by measured acceptance on this reference). The default is the measured choice; the
 // other values exist for the acceptance measurement only (strix-hy4-dfly accept --variant). Measured on the official
-// drafter + oracle taps (golden copy loop 29 anchors, prose 60): default E 2.43 (4.03 / 1.65); bidirectional 1.84,
-// h pre-norm 2.20, fusion eh 1.10, sigmoid mix 1.21 (bidir), every Correction placement lower (1.07 .. 2.37).
+// drafter + oracle taps (golden copy loop 29 anchors, prose 60): E 2.43 with hc=off (4.03 / 1.65); bidirectional 1.84,
+// h pre-norm 2.20, fusion eh 1.10, sigmoid mix 1.21 (bidir), the guessed Correction placements lower (1.07 .. 2.37).
+// The chain (hc=chain, the default) is the publisher's contract (its HiddenStatesCorrection; prev = the own pick): device
+// taps, block 8, prose 91 anchors: E 1.80 vs 1.51 off (the guessed placements never fed the previous pick).
 enum class HiddenForm : std::uint8_t { post_norm, pre_norm };                 // h = output_norm(hc_head) or hc_head
 enum class FusionForm : std::uint8_t { eh, e_plus_gate, sigmoid_mix };      // x0 = eh | e0 + g*eh | s(g)*eh + (1-s(g))*e0
-// h += C(e0, h) | x_j>=1 = e_mask + C(e_mask, h) | x0 += C(e0, h) | before final_norm x_j += C(e_j, x_j)
-enum class Correction : std::uint8_t { off, hidden_residual, mask_residual, slot0_residual, output_residual };
+// h += C(e0, h) | x_j>=1 = e_mask + C(e_mask, h) | x0 += C(e0, h) | before final_norm x_j += C(e_j, x_j) |
+// chain (the publisher's serving contract): after final_norm, slot j >= 1 reads y_j' = y_j + C(E(prev_j), y_j) with
+// prev_1 = the anchor and prev_j = the slot j-1 pick, pick_j = argmax head(y_j') (over the `candidates` best ids of
+// head(y_j) when candidates > 0), confidence_j on y_j'. C(e, h) = down(silu(gate z) * up z), z = cat(hidden_norm(h), embed_norm(e)).
+enum class Correction : std::uint8_t { off, hidden_residual, mask_residual, slot0_residual, output_residual, chain };
 enum class Mask : std::uint8_t { causal, bidirectional };                   // block rows among themselves
 struct Variant {
     HiddenForm hidden = HiddenForm::post_norm;
     FusionForm fusion = FusionForm::e_plus_gate;
-    Correction correction = Correction::off;
+    Correction correction = Correction::chain;
     Mask mask = Mask::causal;
+    std::uint32_t candidates = 0;  // chain only: 0 = full head per slot, N = the N best ids of the uncorrected head
 };
-// "h=post,fus=eh,hc=off,mask=causal" form; throws std::invalid_argument on an unknown key / value.
+// "h=post,fus=eh,hc=off,mask=causal,cand=256" form; throws std::invalid_argument on an unknown key / value.
 [[nodiscard]] Variant parse_variant(const std::string& text);
 
 // Drafter tensors by their shard name without the "model.dfly_layers." prefix (e.g. "0.self_attn.q_a_proj.weight").

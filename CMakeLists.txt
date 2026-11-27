@@ -1840,7 +1840,7 @@ target_link_libraries(strix-hy4-ref PRIVATE strix_hy4_ref)
 include(cmake/StrixIntelHy4.cmake)
 strix_target_warnings(strix-hy4-ref)
 # DFly2 drafter tools on the oracle: target-state taps of a greedy run (the drafter's KV-share / hidden inputs).
-add_library(strix_hy4_dfly_ref STATIC src/hy4/ref/hy4_dfly_ref.cpp)
+add_library(strix_hy4_dfly_ref STATIC src/hy4/ref/hy4_dfly_ref.cpp src/hy4/ref/hy4_dfly_pack.cpp)
 target_link_libraries(strix_hy4_dfly_ref PUBLIC strix_hy4_ref)
 strix_target_warnings(strix_hy4_dfly_ref)
 add_executable(strix-hy4-dfly apps/hy4_dfly_main.cpp)
@@ -2393,6 +2393,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-hy4-dfly-ref-tests PRIVATE strix_hy4_dfly_ref)
     strix_target_warnings(strix-hy4-dfly-ref-tests)
     add_test(NAME strix-hy4-dfly-ref-tests COMMAND strix-hy4-dfly-ref-tests)
+    # DFly2 drafter pack: the shard as Hy4 blocks (names / dims, kv_b absorb split, slot-0 gate fold, Q8_0 rows by the shared rule).
+    add_executable(strix-hy4-dfly-pack-tests tests/hy4_dfly_pack_tests.cpp)
+    target_link_libraries(strix-hy4-dfly-pack-tests PRIVATE strix_hy4_dfly_ref)
+    strix_target_warnings(strix-hy4-dfly-pack-tests)
+    add_test(NAME strix-hy4-dfly-pack-tests COMMAND strix-hy4-dfly-pack-tests)
     # Hy4 HIP binding plan (stage map: every stage a shared entry; cache plan on the shared cache-row layouts).
     add_executable(strix-hy4-hip-plan-tests tests/hy4_hip_plan_tests.cpp)
     target_link_libraries(strix-hy4-hip-plan-tests PRIVATE strix_hy4_ref)
@@ -8549,6 +8554,7 @@ if(STRIX_FAMILY_HY4)
         -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
     target_link_libraries(strix_hy4_hip PUBLIC strix_hy4_ref strix_hip_runtime strix_q4k_a8_hip_probe strix_engram strix_ds41_hip)
     target_link_libraries(strix_hy4_hip PRIVATE strix_state_cache strix_tiled_core)  # state image files; head Q8_0 transcode
+    target_link_libraries(strix_hy4_hip PRIVATE strix_hy4_dfly_ref strix_spec)  # DFly2 drafter pack (host) + its block preset
     strix_target_warnings(strix_hy4_hip)
     add_executable(strix-hy4-rank apps/hy4_rank_main.cpp)
     target_link_libraries(strix-hy4-rank PRIVATE strix_state_cache strix_hy4_hip strix_dist strix_device strix_spec strix_tp_xport)  # pair: shared layer pipeline + link (gather channel); copy proposer

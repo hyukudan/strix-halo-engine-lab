@@ -78,10 +78,10 @@ Vec cat(std::span<const float> a, std::span<const float> b) {
     return y;
 }
 
-// hidden_correction: down(silu(gate z) * up z), z = cat(embed_norm(e), hidden_norm(h)).
+// hidden_correction: down(silu(gate z) * up z), z = cat(hidden_norm(h), embed_norm(e)) (the publisher's order).
 Vec correction(const Geometry& g, Weights& w, std::span<const float> e, std::span<const float> h) {
-    const auto z = cat(rms(e, w.tensor("hidden_correction.embed_norm.weight"), g.eps),
-                       rms(h, w.tensor("hidden_correction.hidden_norm.weight"), g.eps));
+    const auto z = cat(rms(h, w.tensor("hidden_correction.hidden_norm.weight"), g.eps),
+                       rms(e, w.tensor("hidden_correction.embed_norm.weight"), g.eps));
     const auto gt = linear(w.tensor("hidden_correction.gate_proj.weight"), z, g.hidden);
     const auto up = linear(w.tensor("hidden_correction.up_proj.weight"), z, g.hidden);
     Vec m(g.hidden);
@@ -196,8 +196,10 @@ Variant parse_variant(const std::string& text) {
                                        : val == "mix" ? FusionForm::sigmoid_mix : (bad(), v.fusion);
         else if (k == "hc") v.correction = val == "off" ? Correction::off : val == "h+" ? Correction::hidden_residual
                                            : val == "mask+" ? Correction::mask_residual : val == "slot0+" ? Correction::slot0_residual
-                                           : val == "out+" ? Correction::output_residual : (bad(), v.correction);
+                                           : val == "out+" ? Correction::output_residual
+                                           : val == "chain" ? Correction::chain : (bad(), v.correction);
         else if (k == "mask") v.mask = val == "causal" ? Mask::causal : val == "bidir" ? Mask::bidirectional : (bad(), v.mask);
+        else if (k == "cand") v.candidates = static_cast<std::uint32_t>(std::stoul(val));
         else bad();
     }
     return v;
@@ -331,13 +333,38 @@ Block draft(const Geometry& g, const Variant& v, Weights& w, Target& target, std
             for (std::size_t i = 0; i < H; ++i) x[j][i] = bf(x[j][i] + c[i]);
         }
     }
+    std::uint32_t prev = anchor;
+    Vec base;
+    std::vector<std::uint32_t> order;
     for (std::size_t j = 0; j < R; ++j) {
-        const auto y = rms(x[j], w.tensor("final_norm.weight"), g.eps);
+        auto y = rms(x[j], w.tensor("final_norm.weight"), g.eps);
         out.final_rows.insert(out.final_rows.end(), y.begin(), y.end());
         if (j == 0) continue;
+        if (v.correction == Correction::chain) {
+            if (v.candidates > 0U) target.logits(y, base);
+            const auto pe = target.embed(prev);
+            const auto c = correction(g, w, pe, y);
+            for (std::size_t i = 0; i < H; ++i) y[i] = bf(y[i] + c[i]);
+        }
         target.logits(y, logits);
-        out.proposals.push_back(static_cast<std::uint32_t>(std::max_element(logits.begin(), logits.end()) - logits.begin()));
+        std::uint32_t pick = 0;
+        if (v.correction == Correction::chain && v.candidates > 0U && v.candidates < base.size()) {
+            // the N best uncorrected ids (value desc., lower id on ties), then the corrected argmax among them
+            order.resize(base.size());
+            for (std::uint32_t t = 0; t < order.size(); ++t) order[t] = t;
+            const auto better = [&](std::uint32_t a, std::uint32_t b) { return base[a] > base[b] || (base[a] == base[b] && a < b); };
+            std::partial_sort(order.begin(), order.begin() + v.candidates, order.end(), better);
+            pick = order[0];
+            for (std::uint32_t k = 1; k < v.candidates; ++k) {
+                const auto t = order[k];
+                if (logits[t] > logits[pick] || (logits[t] == logits[pick] && t < pick)) pick = t;
+            }
+        } else {
+            pick = static_cast<std::uint32_t>(std::max_element(logits.begin(), logits.end()) - logits.begin());
+        }
+        out.proposals.push_back(pick);
         out.confidence.push_back(sigmoid(dot(cw.data(), y.data(), H) + cb));
+        prev = pick;
     }
     return out;
 }

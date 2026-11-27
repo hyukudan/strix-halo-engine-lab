@@ -4,6 +4,7 @@
 // step reads: per fed position the last-layer hidden (hc_head output, before and after output_norm), the latent rows of
 // the drafter's KV-share layers, the embedding rows of the fed ids and of the mask id, and the BF16 head table.
 //   strix-hy4-dfly accept SHARD.safetensors TAPDIR[,TAPDIR...] [--variant V[;V...]]
+//                       [--block N] [--anchors FIRST:COUNT]   (block length; a slice of the anchor list per process)
 // drafts one DFly2 block (src/hy4/ref/hy4_dfly_ref) at every anchor of the greedy region of each taps run and prints the
 // acceptance against the target's greedy ids: E = 1 + mean accepted run (0..5), hit rate per proposal row, ms per block.
 //   strix-hy4-dfly mtp PART1.gguf [PART2.gguf] TAPDIR[,TAPDIR...] [--hidden pre|post] [--chain pre|post] [--depth D] [--threads T]
@@ -160,7 +161,8 @@ std::map<std::string, std::string> read_manifest(const std::filesystem::path& di
 // The target side of a taps run: embedding rows of the fed ids + mask, the KV-share latent rows, the BF16 head.
 class TapTarget final : public strix::hy4::dfly::Target {
 public:
-    TapTarget(const std::filesystem::path& dir, const std::vector<float>* head) : head_(head) {
+    TapTarget(const std::filesystem::path& dir, const std::vector<float>* head, const std::vector<float>* table = nullptr)
+        : head_(head), table_(table) {
         auto m = read_manifest(dir);
         P = static_cast<std::uint32_t>(std::stoul(m.at("positions")));
         prompt = static_cast<std::uint32_t>(std::stoul(m.at("prompt")));
@@ -175,7 +177,11 @@ public:
         row_[kMaskId] = P;
     }
     std::span<const float> embed(std::uint32_t token) override {
-        return {emb_.data() + std::size_t{row_.at(token)} * hidden_, hidden_};
+        const auto it = row_.find(token);
+        if (it != row_.end()) return {emb_.data() + std::size_t{it->second} * hidden_, hidden_};
+        if (table_ == nullptr || table_->size() < (std::size_t{token} + 1U) * hidden_)
+            throw std::out_of_range("embed: id outside the fed ids and no embed_table.bf16");
+        return {table_->data() + std::size_t{token} * hidden_, hidden_};  // a drafted id the run never fed (chain)
     }
     std::span<const float> latent(std::uint32_t layer, std::uint32_t pos) override {
         return {lat_.data() + (std::size_t{layer} * P + pos) * latent_, latent_};
@@ -203,6 +209,7 @@ public:
 
 private:
     const std::vector<float>* head_;
+    const std::vector<float>* table_;
     std::size_t hidden_ = 0, latent_ = 0;
     std::vector<float> lat_, emb_;
     std::map<std::uint32_t, std::uint32_t> row_;
@@ -225,35 +232,49 @@ std::vector<float> read_head(const std::filesystem::path& path) {
 int accept(int argc, char** argv) {
     if (argc < 4) throw std::invalid_argument("usage: strix-hy4-dfly accept SHARD TAPDIR[,TAPDIR...] [--variant V[;V...]]");
     const std::filesystem::path shard = argv[2];
-    std::vector<std::string> dirs, variants{"h=post,fus=e+g,hc=off,mask=causal"};
+    std::vector<std::string> dirs, variants{"h=post,fus=e+g,hc=chain,mask=causal"};
     {
         std::stringstream in(argv[3]);
         std::string d;
         while (std::getline(in, d, ',')) dirs.push_back(d);
     }
+    std::uint32_t block = 0, first = 0, count = ~0U;
     for (int i = 4; i + 1 < argc; ++i) {
-        if (std::string(argv[i]) == "--variant") {
+        if (std::string(argv[i]) == "--block") {
+            block = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+        } else if (std::string(argv[i]) == "--anchors") {
+            const std::string r = argv[++i];
+            first = static_cast<std::uint32_t>(std::stoul(r.substr(0, r.find(':'))));
+            count = static_cast<std::uint32_t>(std::stoul(r.substr(r.find(':') + 1U)));
+        } else if (std::string(argv[i]) == "--variant") {
             variants.clear();
             std::stringstream in(argv[++i]);
             std::string v;
             while (std::getline(in, v, ';')) variants.push_back(v);
         }
     }
-    const auto g = strix::hy4::dfly::Geometry::official();
+    auto g = strix::hy4::dfly::Geometry::official();
+    if (block >= 2U) g.block = block;  // the old pack has no per-slot table: the block length is a serving choice
     auto w = strix::hy4::dfly::shard_weights(shard);
     const auto head = read_head(std::filesystem::path(dirs.front()) / "head.bf16");
+    const auto table_path = std::filesystem::path(dirs.front()) / "embed_table.bf16";
+    const auto table = std::filesystem::exists(table_path) ? read_head(table_path) : std::vector<float>{};
     std::vector<std::unique_ptr<TapTarget>> sets;
-    for (const auto& d : dirs) sets.push_back(std::make_unique<TapTarget>(d, &head));
+    for (const auto& d : dirs) sets.push_back(std::make_unique<TapTarget>(d, &head, table.empty() ? nullptr : &table));
     for (const auto& text : variants) {
         const auto v = strix::hy4::dfly::parse_variant(text);
-        std::vector<std::uint32_t> hit(g.block - 1U, 0U);
+        std::vector<std::uint32_t> hit(g.block - 1U, 0U), runs(g.block, 0U);
         std::uint64_t accepted = 0, blocks = 0;
+        std::uint32_t anchor_index = 0;
         double ms = 0.0;
         for (std::size_t s = 0; s < sets.size(); ++s) {
             auto& t = *sets[s];
             for (std::uint32_t p = t.prompt - 1U; p + g.block - 1U <= t.P; ++p) {
                 const auto& hs = v.hidden == strix::hy4::dfly::HiddenForm::pre_norm ? t.pre : t.post;
                 const std::span<const float> h(hs.data() + std::size_t{p - 1U} * g.hidden, g.hidden);
+                // --anchors FIRST:COUNT: score only that slice of the anchor list (short processes on a shared host)
+                const auto index = anchor_index++;
+                if (index < first || index - first >= count) continue;
                 const auto t0 = std::chrono::steady_clock::now();
                 const auto b = strix::hy4::dfly::draft(g, v, *w, t, t.ids[p], p, h, g.block);
                 ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -267,14 +288,23 @@ int accept(int argc, char** argv) {
                     run += alive ? 1U : 0U;
                     std::cout << ' ' << b.proposals[j] << (ok ? "+" : "-");
                 }
-                std::cout << " run " << run << '\n';
+                std::cout << " run " << run << '\n' << std::flush;
                 accepted += run;
+                ++runs[run];
                 ++blocks;
             }
         }
         std::cout << "E " << 1.0 + static_cast<double>(accepted) / static_cast<double>(blocks) << " blocks " << blocks << " rows";
         for (const auto x : hit) std::cout << ' ' << static_cast<double>(x) / static_cast<double>(blocks);
-        std::cout << " ms_per_block " << ms / static_cast<double>(blocks) << " | " << text << '\n' << std::flush;
+        std::cout << " ms_per_block " << ms / static_cast<double>(blocks) << " | " << text << '\n';
+        // E(K) = 1 + mean min(run, K): the block truncated to K drafts (exact for the causal mask)
+        std::cout << "EK";
+        for (std::uint32_t k = 1; k < g.block; ++k) {
+            std::uint64_t sum = 0;
+            for (std::uint32_t r = 0; r < g.block; ++r) sum += std::uint64_t{std::min(r, k)} * runs[r];
+            std::cout << ' ' << 1.0 + static_cast<double>(sum) / static_cast<double>(blocks);
+        }
+        std::cout << " | " << text << '\n' << std::flush;
     }
     return 0;
 }
@@ -308,12 +338,14 @@ int kvb(int argc, char** argv) {
 int embed(int argc, char** argv) {
     std::vector<std::filesystem::path> parts;
     std::filesystem::path dir;
+    bool tables = false;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a.size() > 5 && a.ends_with(".gguf")) parts.emplace_back(a);
+        else if (a == "--tables") tables = true;
         else dir = a;
     }
-    if (parts.empty() || dir.empty()) throw std::invalid_argument("usage: strix-hy4-dfly embed PART1.gguf [PART2.gguf] TAPDIR");
+    if (parts.empty() || dir.empty()) throw std::invalid_argument("usage: strix-hy4-dfly embed PART1.gguf [PART2.gguf] TAPDIR [--tables]");
     const auto m = read_manifest(dir);
     const auto P = static_cast<std::uint32_t>(std::stoul(m.at("positions")));
     const auto ids = read_ids((dir / "ids.txt").string());
@@ -327,6 +359,22 @@ int embed(int argc, char** argv) {
     };
     for (std::uint32_t p = 0; p < P; ++p) row(ids[p]);
     row(kMaskId);
+    if (tables) {  // the BF16 head and the full embedding table (chain correction: drafted ids the run never fed)
+        const auto put_bf16 = [&](const char* tensor, const char* file) {
+            const auto& t = weights->tensor(tensor);
+            std::ofstream bf(dir / file, std::ios::binary);
+            std::vector<std::uint16_t> buf(t.size());
+            for (std::size_t i = 0; i < t.size(); ++i) {
+                std::uint32_t bits = 0;
+                const float v = strix::ds41::round_to_bf16(t[i]);
+                std::memcpy(&bits, &v, sizeof(bits));
+                buf[i] = static_cast<std::uint16_t>(bits >> 16U);
+            }
+            bf.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(buf.size() * sizeof(std::uint16_t)));
+        };
+        put_bf16("output.weight", "head.bf16");
+        put_bf16("token_embd.weight", "embed_table.bf16");
+    }
     return 0;
 }
 
