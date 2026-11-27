@@ -693,6 +693,12 @@ void hy4_launcher_resolves_documented_drafter(const fs::path& data) {
     };
     require(classify({"--top", "0", "--profile", "fast", "--kv", "bf16"}) == "default", "--top 0 is the production form");
     require(classify({"--top", "5"}) == "explicit-route", "--top 5 keeps the per-step logits");
+    require(classify({"--top", "00"}) == "default", "numeric zero keeps the production route");
+    require(classify({"--top", "5", "--top", "0"}) == "default", "the last top option wins");
+    require(classify({"--top", "0", "--top", "5"}) == "explicit-route", "the final nonzero top requests logits");
+    require(classify({"--ids-file", "--no-mtp"}) == "default", "an option value is not an MTP opt-out");
+    require(classify({"--ids-file", "--timing", "--no-mtp"}) == "cli-opt-out", "real flags after values are read");
+    require(classify({"--dump-logits", "--no-mtp"}) == "explicit-route", "output filename is not an opt-out");
     require(classify({"--timing"}) == "explicit-route", "--timing keeps the plain steps");
     require(classify({"--no-mtp"}) == "cli-opt-out", "--no-mtp opts out");
     require(classify({"--mtp", "--timing"}) == "explicit", "--mtp wins over the per-step route");
