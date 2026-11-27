@@ -43,6 +43,26 @@ public:
             out[col] = scalar_float::e4m3(codes[col]) * expand_scale(scales[col / BlockColumns]);
     }
 
+    // Row-local image of one row for the device row sweeps (core/weight_decode.hpp Format::e4m3_b128 when BlockColumns
+    // is 128): per column block, the FP32 scale of the row's tile (little-endian bytes), then its BlockColumns codes.
+    // Same decoded weights as decode_row; whole column blocks only.
+    constexpr static std::size_t row_block_bytes(std::size_t columns) {
+        return columns / BlockColumns * (sizeof(float) + BlockColumns);
+    }
+    void pack_row_blocks(std::size_t row, std::span<std::uint8_t> out) const {
+        if (row >= rows_ || columns_ % BlockColumns != 0U || out.size() != row_block_bytes(columns_))
+            throw std::invalid_argument("E4M3 block matrix: invalid row-block image");
+        const auto codes = codes_.subspan(row * columns_, columns_);
+        const auto scales = scales_.subspan((row / BlockRows) * scale_columns_, scale_columns_);
+        auto* dst = out.data();
+        for (std::size_t block = 0; block < scale_columns_; ++block) {
+            const auto bits = scalar_float::f2u(expand_scale(scales[block]));
+            for (unsigned byte = 0; byte < sizeof(float); ++byte)
+                *dst++ = static_cast<std::uint8_t>(bits >> (8U * byte));
+            for (std::size_t col = 0; col < BlockColumns; ++col) *dst++ = codes[block * BlockColumns + col];
+        }
+    }
+
 private:
     static float expand_scale(float value) { return value; }
     static float expand_scale(std::uint8_t value) { return scalar_float::e8m0(value); }

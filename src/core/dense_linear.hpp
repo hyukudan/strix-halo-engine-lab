@@ -205,13 +205,19 @@ __global__ void __launch_bounds__(128) grouped_kernel(TightGroup g, const float*
 template <unsigned Rows>
 inline constexpr unsigned kTightTile = Rows == 1U ? 1U : Rows <= 8U ? 2U : 4U;
 
-template <unsigned Rows, bool RoundBf16 = false>
-inline void launch_bf16_tight_rows(View w, const float* input, float* output, unsigned rows, hipStream_t stream) {
+// Any chunk format (weight_decode.hpp): w.row_bytes is the format's row image (weight_decode::row_bytes).
+template <unsigned Rows, weight_decode::Format Format, bool RoundBf16 = false>
+inline void launch_tight_rows(View w, const float* input, float* output, unsigned rows, hipStream_t stream) {
     constexpr unsigned tile = kTightTile<Rows>;
     constexpr unsigned block_outputs = 4U * tile;
     constexpr auto epilogue = RoundBf16 ? Epilogue::store_tight_rows_bf16 : Epilogue::store_tight_rows;
-    kernel<Rows, tile, weight_decode::Format::bf16, epilogue>
+    kernel<Rows, tile, Format, epilogue>
         <<<(w.outputs + block_outputs - 1U) / block_outputs, 128, 0, stream>>>(w, w, input, output, rows);
+}
+
+template <unsigned Rows, bool RoundBf16 = false>
+inline void launch_bf16_tight_rows(View w, const float* input, float* output, unsigned rows, hipStream_t stream) {
+    launch_tight_rows<Rows, weight_decode::Format::bf16, RoundBf16>(w, input, output, rows, stream);
 }
 
 template <unsigned Rows, bool RoundBf16 = false>
@@ -233,15 +239,20 @@ inline hipError_t launch_bf16_tight_rows_group(const View* w, float* const* outp
     return hipGetLastError();
 }
 
-// The caller validates the tight view and the live row count (1..16).
+// The caller validates the tight view and the live row count (1..16). Per-row bits do not depend on the bucket.
+template <weight_decode::Format Format, bool RoundBf16 = false>
+inline hipError_t enqueue_tight_rows(View w, const float* input, float* output, unsigned rows, hipStream_t stream) {
+    if (rows <= 1U) launch_tight_rows<1, Format, RoundBf16>(w, input, output, rows, stream);
+    else if (rows <= 2U) launch_tight_rows<2, Format, RoundBf16>(w, input, output, rows, stream);
+    else if (rows <= 4U) launch_tight_rows<4, Format, RoundBf16>(w, input, output, rows, stream);
+    else if (rows <= 8U) launch_tight_rows<8, Format, RoundBf16>(w, input, output, rows, stream);
+    else launch_tight_rows<16, Format, RoundBf16>(w, input, output, rows, stream);
+    return hipGetLastError();
+}
+
 template <bool RoundBf16 = false>
 inline hipError_t enqueue_bf16_tight_rows(View w, const float* input, float* output, unsigned rows, hipStream_t stream) {
-    if (rows <= 1U) launch_bf16_tight_rows<1, RoundBf16>(w, input, output, rows, stream);
-    else if (rows <= 2U) launch_bf16_tight_rows<2, RoundBf16>(w, input, output, rows, stream);
-    else if (rows <= 4U) launch_bf16_tight_rows<4, RoundBf16>(w, input, output, rows, stream);
-    else if (rows <= 8U) launch_bf16_tight_rows<8, RoundBf16>(w, input, output, rows, stream);
-    else launch_bf16_tight_rows<16, RoundBf16>(w, input, output, rows, stream);
-    return hipGetLastError();
+    return enqueue_tight_rows<weight_decode::Format::bf16, RoundBf16>(w, input, output, rows, stream);
 }
 
 // Same contract per view as enqueue_bf16_tight_rows; all views read the same input. One launch.
