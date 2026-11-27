@@ -200,6 +200,39 @@ __global__ void __launch_bounds__(128) grouped_kernel(TightGroup g, const float*
     body<Rows, T, Format, Ep>(g.w[projection], g.w[projection], x, g.out[projection], nrows, block);
 }
 
+// Slot rows (MoE experts selected on the device): launch (slot, projection) pairs, one decode row per slot, each with
+// the incumbent Rows 1 tight-row body, so every stored value has the bits of its own enqueue_tight_rows call (and of any
+// row-bucket launch: per-row results are bucket-independent). Slot s runs the matrix table[p][experts[s]] (a device table
+// of per-expert row-image base pointers; every table matrix has the same inputs / outputs / row_bytes) on the input row
+// x[s / input_divisor] and stores output row s of out[p]. Grid: (ceil(outputs / 4), slots, projections). The caller keeps
+// every expert id < the table size; nothing is read back by the host (graph-capture safe).
+inline constexpr unsigned kSlotProjectionsMax = 2U;
+struct SlotRows {
+    const std::uint8_t* const* table[kSlotProjectionsMax];
+    float* out[kSlotProjectionsMax];
+    unsigned inputs, outputs, input_divisor;
+    std::size_t row_bytes;
+};
+
+template <weight_decode::Format Format, bool RoundBf16>
+__global__ void __launch_bounds__(128) slot_rows_kernel(SlotRows g, const std::uint32_t* experts, const float* x) {
+    constexpr auto epilogue = RoundBf16 ? Epilogue::store_tight_rows_bf16 : Epilogue::store_tight_rows;
+    const unsigned slot = blockIdx.y, projection = blockIdx.z;
+    const View w{g.table[projection][experts[slot]], g.inputs, g.outputs, g.row_bytes};
+    body<1U, 1U, Format, epilogue>(w, w, x + std::size_t(slot / g.input_divisor) * g.inputs,
+                                   g.out[projection] + std::size_t(slot) * g.outputs, 1U, blockIdx.x);
+}
+
+template <weight_decode::Format Format, bool RoundBf16 = false>
+inline hipError_t enqueue_slot_rows(const SlotRows& g, unsigned projections, unsigned slots, const std::uint32_t* experts,
+                                    const float* x, hipStream_t stream) {
+    if (projections == 0U || projections > kSlotProjectionsMax || slots == 0U || g.input_divisor == 0U || g.outputs == 0U ||
+        g.inputs % 16U != 0U)
+        return hipErrorInvalidValue;
+    slot_rows_kernel<Format, RoundBf16><<<dim3((g.outputs + 3U) / 4U, slots, projections), 128, 0, stream>>>(g, experts, x);
+    return hipGetLastError();
+}
+
 // Outputs per wave. A decode row (Rows 1) runs one output per wave: twice the waves in flight, and every output keeps
 // its own chunk / element order, so the bits match any other tile (cold BF16, T2 -> T1: K2304 x 3072 69 -> 63 us).
 template <unsigned Rows>

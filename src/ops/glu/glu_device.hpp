@@ -18,6 +18,13 @@ __global__ void swiglu_kernel(const float* __restrict__ gate, const float* __res
     if (i < n) act[i] = swiglu<Exp, R, F>(gate[i], up[i], limit);
 }
 
+template <class Math, Round R>
+__global__ void softcapped_swiglu_kernel(const float* __restrict__ gate, const float* __restrict__ up, std::size_t n,
+                                         float gate_cap, float up_cap, float* __restrict__ act) {
+    const std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+    if (i < n) act[i] = softcapped_swiglu<Math, R>(gate[i], up[i], gate_cap, up_cap);
+}
+
 // A8 store policy: one wave32 per contiguous group, eight groups per block.
 template <class Exp, Round R, Form F, class Epilogue>
 __global__ __launch_bounds__(256) void swiglu_kernel(const float* __restrict__ gate, const float* __restrict__ up,
@@ -57,6 +64,15 @@ inline void launch_swiglu(const float* gate, const float* up, std::size_t n, flo
     if (n == 0U) return;
     hipLaunchKernelGGL(HIP_KERNEL_NAME(swiglu_kernel<Exp, R, F>), dim3(blocks_of(n)), dim3(256), 0, stream, gate, up, n, limit,
                        act);
+}
+
+// act[i] = softcapped_swiglu(gate[i], up[i], caps), i < n.
+template <class Math, Round R>
+inline void launch_softcapped_swiglu(const float* gate, const float* up, std::size_t n, float gate_cap, float up_cap,
+                                     float* act, hipStream_t stream) {
+    if (n == 0U) return;
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(softcapped_swiglu_kernel<Math, R>), dim3(blocks_of(n)), dim3(256), 0, stream, gate,
+                       up, n, gate_cap, up_cap, act);
 }
 
 // Caller admits wave32 and supplies complete groups in tightly packed rows.

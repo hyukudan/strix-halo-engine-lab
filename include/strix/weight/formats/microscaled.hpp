@@ -312,6 +312,21 @@ inline void decode_mxfp4_row_table(std::span<const std::uint8_t> codes,
     }
 }
 
+// Row-local image of one split MXFP4 row for the device row sweeps (core/weight_decode.hpp Format::mxfp4_b32): per 32
+// columns, the E8M0 scale byte then the 16 nibble bytes (low nibble first), 17 bytes. Same weights as decode_mxfp4_row.
+constexpr std::size_t mxfp4_row_block_bytes(std::size_t columns) { return columns / kMxfp4BlockColumns * 17U; }
+inline void pack_mxfp4_row_blocks(std::span<const std::uint8_t> codes, std::span<const std::uint8_t> block_scales,
+                                  std::span<std::uint8_t> out) {
+    constexpr auto half = kMxfp4BlockColumns / 2U;
+    if (block_scales.empty() || codes.size() != block_scales.size() * half || out.size() != block_scales.size() * (half + 1U))
+        throw std::invalid_argument("MXFP4 row-block image: inconsistent dimensions");
+    for (std::size_t block = 0; block < block_scales.size(); ++block) {
+        auto* dst = out.data() + block * (half + 1U);
+        *dst++ = block_scales[block];
+        for (std::size_t i = 0; i < half; ++i) *dst++ = codes[block * half + i];
+    }
+}
+
 // MXFP8 has one E8M0 scale per 32 columns of each row. Each E4M3 value is a byte.
 inline void decode_mxfp8_row(std::span<const std::uint8_t> codes,
                              std::span<const std::uint8_t> block_scales,

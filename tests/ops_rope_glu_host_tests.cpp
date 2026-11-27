@@ -61,6 +61,15 @@ void glu_tests() {
     check(bf_ok, "swiglu bf16 == modelb reference expression");
     check(gate_ok, "sigmoid gate bf16 == modelb reference expression");
     check(gate_none_ok, "sigmoid gate none");
+    // SiTU: the shared trait on the native math is the moe softcapped functor (one BF16 round after the product).
+    bool situ_ok = true;
+    for (int i = 0; i < 20000; ++i) {
+        const float g = bf(next_value(24.0F)), u = bf(next_value(24.0F));
+        const float v = strix::moe::SoftcappedSwiglu<strix::ops::glu::NativeMath>{4.0F, 25.0F}(g, u);
+        situ_ok = situ_ok && same_bits(strix::ops::glu::softcapped_swiglu<strix::ops::glu::NativeMath, Round::none>(g, u, 4.0F, 25.0F), v) &&
+                  same_bits(strix::ops::glu::softcapped_swiglu<strix::ops::glu::NativeMath, Round::bf16>(g, u, 4.0F, 25.0F), bf(v));
+    }
+    check(situ_ok, "softcapped swiglu == moe::SoftcappedSwiglu (+ one bf16 round)");
     // Clamp edges: gate clamped from above only, up on both sides, NaN passes through, +inf limit = none.
     check(strix::ops::glu::swiglu<DeclaredExp, Round::none>(50.0F, 1.0F, 10.0F) ==
               strix::ops::glu::swiglu<DeclaredExp, Round::none>(10.0F, 1.0F, 10.0F), "gate clamp");

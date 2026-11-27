@@ -6,6 +6,9 @@
 //   attend  per (row, q head) pair: 8 waves take positions w, w+8, ... with an online softmax, the waves merge in
 //           wave order; optional sigmoid output gate; causal (row r sees keys 0..pos0+r). One block walks the K/V
 //           of a kv head once for P pairs (strix/attn_row_share.hpp plan); per pair the arithmetic is the P = 1 form's.
+// Optional learned sink (Sink = true, the main schedule only): a per-head F32 logit with a zero value; it seeds the wave
+// merge as one more partial (m = sink, l = 1, acc = 0), the host's online softmax seeded with the sink. Sink = false
+// is the unchanged incumbent code.
 // Layouts: q_in [row][head][q_stride] (q at +0, gate at +Dim when q_stride == 2*Dim);
 //          k_in/v_in [row][kv_head][Dim]; cache [position][kv_head][Dim] bf16.
 // Home: shared (attn_core): no model names; Dim is a template parameter (256 instantiated by qwen35).
@@ -18,6 +21,7 @@
 #include "core/wave_uniform.hpp"
 #include "strix/attn_row_share.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/numeric/declared.hpp"
 
 namespace strix::attn_core::dense_decode {
 
@@ -117,10 +121,23 @@ __global__ void __launch_bounds__(Dim) prep_kernel(Params p, const float* q_in, 
 struct Step {
     float mn, corr, w;
 };
-__device__ __forceinline__ Step online_step(float s, float scale, float m, float& l) {
+// The exponential of the softmax (online weights, wave merge, sink term). ExpfMath is the library expf (every
+// incumbent binding: the default of every kernel below); DeclaredExpMath is strix::numeric::declared_exp, the one
+// definition host and device share, so a host reference that calls declared_exp reproduces the device bits.
+struct ExpfMath {
+    __device__ __forceinline__ static float exp(float x) { return expf(x); }
+};
+struct DeclaredExpMath {
+    __device__ __forceinline__ static float exp(float x) {
+#pragma clang fp contract(off)
+        return numeric::declared_exp(x);
+    }
+};
+template <class Math = ExpfMath>
+__device__ __forceinline__ Step online_step(float s, float scale, float m, float& l, Math = Math()) {
 #pragma clang fp contract(off)
     s *= scale;
-    const float mn = fmaxf(m, s), corr = expf(m - mn), w = expf(s - mn);
+    const float mn = fmaxf(m, s), corr = Math::exp(m - mn), w = Math::exp(s - mn);
     l = l * corr + w;
     return Step{mn, corr, w};
 }
@@ -132,10 +149,10 @@ __device__ __forceinline__ float acc_step(float acc, float corr, float w, float 
 // The main schedule (main's kernel; per-position arithmetic in online_step / acc_step): grid (rows, heads), block =
 // 32 * waves threads, one block walks the K/V prefix for one (row, q head). It is the off switch, the form for devices
 // and heads shapes without a measured table and the table's (1, 1) choice. ctx [row][head][Dim].
-template <unsigned Dim>
+template <unsigned Dim, bool Sink = false, class Math = ExpfMath>
 __global__ void __launch_bounds__(32U * waves) attend_main_kernel(Params p, const float* q_n, const float* q_in,
                                                              const std::uint16_t* k_cache, const std::uint16_t* v_cache,
-                                                             float* ctx) {
+                                                             float* ctx, const float* sinks = nullptr) {
 #pragma clang fp contract(off)  // the merge below is main's text; see online_step
     constexpr unsigned per_lane = Dim / 32U;
     static_assert(per_lane % 8U == 0U);
@@ -156,7 +173,7 @@ __global__ void __launch_bounds__(32U * waves) attend_main_kernel(Params p, cons
 #pragma unroll
         for (unsigned o = 16U; o > 0U; o >>= 1U)
             s += __shfl_xor(s, int(o), 32);
-        const Step st = online_step(s, p.scale, m, l);
+        const Step st = online_step(s, p.scale, m, l, Math{});
         for (unsigned e = 0; e < per_lane; ++e)
             acc[e] = acc_step(acc[e], st.corr, st.w, from_bf16(v_cache[at + e]));
         m = st.mn;
@@ -172,16 +189,20 @@ __global__ void __launch_bounds__(32U * waves) attend_main_kernel(Params p, cons
         float M = -INFINITY;
         for (unsigned w = 0; w < waves; ++w)
             M = fmaxf(M, m_s[w]);
+        if constexpr (Sink)
+            M = fmaxf(M, sinks[head]);
         float L = 0.0F, O = 0.0F;
+        if constexpr (Sink)
+            L = Math::exp(sinks[head] - M);
         for (unsigned w = 0; w < waves; ++w) {
-            const float f = m_s[w] == -INFINITY ? 0.0F : expf(m_s[w] - M);
+            const float f = m_s[w] == -INFINITY ? 0.0F : Math::exp(m_s[w] - M);
             L += l_s[w] * f;
             O += acc_s[w][d] * f;
         }
         float o = O / L;
         if (p.gated) {
             const float g = q_in[(std::size_t(row) * p.heads + head) * p.q_stride + Dim + d];
-            o *= 1.0F / (1.0F + expf(-g));
+            o *= 1.0F / (1.0F + Math::exp(-g));
         }
         ctx[(std::size_t(row) * p.heads + head) * Dim + d] = o;
     }
@@ -191,10 +212,10 @@ __global__ void __launch_bounds__(32U * waves) attend_main_kernel(Params p, cons
 // (attn_row_share pair order: row = j / group, q head = kh * group + j % group). Each K/V position is loaded once per
 // wave and applied to every pair whose row sees it; per pair: the same dot / butterfly / online-softmax sequence and
 // the same wave-order merge as P = 1, so the bits do not depend on P. ctx [row][head][Dim].
-template <unsigned Dim, unsigned P = 1U, unsigned U = 1U>
+template <unsigned Dim, unsigned P = 1U, unsigned U = 1U, bool Sink = false, class Math = ExpfMath>
 __global__ void __launch_bounds__(32U * waves) attend_kernel(Params p, const float* q_n, const float* q_in,
                                                              const std::uint16_t* k_cache, const std::uint16_t* v_cache,
-                                                             float* ctx) {
+                                                             float* ctx, const float* sinks = nullptr) {
 #pragma clang fp contract(off)  // the merge below is main's text; see online_step
     constexpr unsigned per_lane = Dim / 32U;
     static_assert(per_lane % 8U == 0U && P >= 1U && U >= 1U);
@@ -253,7 +274,7 @@ __global__ void __launch_bounds__(32U * waves) attend_kernel(Params p, const flo
 #pragma unroll
                 for (unsigned o = 16U; o > 0U; o >>= 1U)
                     s += __shfl_xor(s, int(o), 32);
-                const Step st = online_step(s, p.scale, m[i], l[i]);
+                const Step st = online_step(s, p.scale, m[i], l[i], Math{});
                 for (unsigned e = 0; e < per_lane; ++e)
                     acc[i][e] = acc_step(acc[i][e], st.corr, st.w, from_bf16(vr[u][e]));
                 m[i] = st.mn;
@@ -278,16 +299,20 @@ __global__ void __launch_bounds__(32U * waves) attend_kernel(Params p, const flo
             float M = -INFINITY;
             for (unsigned w = 0; w < waves; ++w)
                 M = fmaxf(M, m_s[w]);
+            if constexpr (Sink)
+                M = fmaxf(M, sinks[head]);
             float L = 0.0F, O = 0.0F;
+            if constexpr (Sink)
+                L = Math::exp(sinks[head] - M);
             for (unsigned w = 0; w < waves; ++w) {
-                const float f = m_s[w] == -INFINITY ? 0.0F : expf(m_s[w] - M);
+                const float f = m_s[w] == -INFINITY ? 0.0F : Math::exp(m_s[w] - M);
                 L += l_s[w] * f;
                 O += acc_s[w][d] * f;
             }
             float o = O / L;
             if (p.gated) {
                 const float g = q_in[(std::size_t(row) * p.heads + head) * p.q_stride + Dim + d];
-                o *= 1.0F / (1.0F + expf(-g));
+                o *= 1.0F / (1.0F + Math::exp(-g));
             }
             ctx[(std::size_t(row) * p.heads + head) * Dim + d] = o;
         }
@@ -345,6 +370,15 @@ inline void attend(const Params& p, const float* q_scratch, const float* q_in, c
         attend_kernel<Dim, 3U, 1U><<<grid, block, 0, stream>>>(p, q_scratch, q_in, k_cache, v_cache, ctx);
     else  // (1, 1): the main schedule
         attend_main_kernel<Dim><<<dim3(p.rows, p.heads), block, 0, stream>>>(p, q_scratch, q_in, k_cache, v_cache, ctx);
+}
+
+// attend with the learned sink (sinks [heads] F32 logits): the main schedule, one block per (row, head), any group / kv
+// head split. A separate function, so the sink kernel is instantiated only where it is called.
+template <unsigned Dim, class Math = ExpfMath>
+inline void attend_sink(const Params& p, const float* q_scratch, const float* q_in, const std::uint16_t* k_cache,
+                        const std::uint16_t* v_cache, float* ctx, const float* sinks, hipStream_t stream) {
+    attend_main_kernel<Dim, true, Math><<<dim3(p.rows, p.heads), dim3(32U * waves), 0, stream>>>(p, q_scratch, q_in, k_cache,
+                                                                                         v_cache, ctx, sinks);
 }
 
 template <unsigned Dim>

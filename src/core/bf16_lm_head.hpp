@@ -2,6 +2,7 @@
 
 #include "core/dense_row_plan.hpp"
 #include "core/row_transforms.hpp"
+#include "strix/core/logit_epilogue.hpp"
 #include "strix/logit_rows.hpp"
 
 namespace strix::core {
@@ -17,6 +18,17 @@ inline row_transforms::Status enqueue_bf16_head_softcap(
     unsigned rows, unsigned outputs, float* logits, float cap, row_transforms::Stream stream) {
     return row_transforms::elements(std::size_t{rows} * outputs,
         row_transforms::Bf16Softcap{logits, cap}, stream);
+}
+
+// Linear / quadratic hinges on FP32 logit rows, in place (row_transforms::LogitHinges): the head epilogue of a
+// LinearQuadraticHinges vocabulary activation. A template, so its kernel is instantiated only where it is called.
+template <class Hinges = LinearQuadraticHinges>
+row_transforms::Status enqueue_logit_hinges(unsigned rows, unsigned outputs, float* logits, const Hinges& hinges,
+                                            bool preserve_mask, row_transforms::Stream stream) {
+    const auto& t = hinges.thresholds;
+    const auto& g = hinges.gains;
+    return row_transforms::elements(std::size_t{rows} * outputs,
+        row_transforms::LogitHinges{logits, t[0], t[1], t[2], t[3], g[0], g[1], g[2], g[3], preserve_mask}, stream);
 }
 
 // Project only the live vocabulary. Keep the BF16 boundary before softcap

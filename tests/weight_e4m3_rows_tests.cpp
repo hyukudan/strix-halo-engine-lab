@@ -72,7 +72,7 @@ void check_matrix(std::size_t rows, std::size_t columns, bool power_of_two, std:
 
 int main() {
     std::mt19937 random(20261127U);
-    check_matrix(130, 384, true, random);   // two row tiles, the second partial; ERNIE scales are powers of two
+    check_matrix(130, 384, true, random);   // two row tiles, the second partial; scales are powers of two
     check_matrix(64, 1024, false, random);  // arbitrary FP32 scales: still the host's one FP32 product
     bool rejected = false;
     try {

@@ -270,6 +270,15 @@ __device__ __forceinline__ void combine_body(const float* w, const float* eo, co
         for (unsigned k = 0; k < TopK; ++k)
             acc = __builtin_fmaf(w[static_cast<std::size_t>(r) * TopK + k], eo[(static_cast<std::size_t>(r) * TopK + k) * Width + d], acc);
         y[static_cast<std::size_t>(r) * Width + d] = acc + shared[static_cast<std::size_t>(r) * Width + d];
+    } else if constexpr (Form == moe::CombineForm::f32_steps_bf16) {
+        static_assert(!RoundEo, "moe combine: RoundEo is bound for bf16_steps only");
+        float acc = 0.0F;
+        for (unsigned k = 0; k < TopK; ++k) {
+            const float wk = w == nullptr ? 1.0F : w[static_cast<std::size_t>(r) * TopK + k];
+            acc = __fadd_rn(acc, __fmul_rn(wk, eo[(static_cast<std::size_t>(r) * TopK + k) * Width + d]));
+        }
+        const std::size_t at = static_cast<std::size_t>(r) * Width + d;
+        y[at] = combine_bf16(shared == nullptr ? acc : __fadd_rn(acc, shared[at]));
     } else {
         float acc = 0.0F;
         for (unsigned k = 0; k < TopK; ++k) {

@@ -53,6 +53,20 @@ STRIX_OPS_GLU_HD inline float swiglu(float gate, float up, float limit) {
     }
 }
 
+// Softcapped SiLU-GLU (SiTU): strix::moe::SoftcappedSwiglu (sigmoid on the raw gate, tanh caps on the linear gate
+// factor and on up), then one R on the product. Math supplies exp and tanh (NativeMath: expf / tanhf; the host reference
+// binds std::exp / std::tanh, so a device binding must report its libm difference).
+struct NativeMath {
+    STRIX_OPS_GLU_HD static float exp(float x) { return expf(x); }
+    STRIX_OPS_GLU_HD static float tanh(float x) { return tanhf(x); }
+};
+template <class Math, Round R>
+STRIX_OPS_GLU_HD inline float softcapped_swiglu(float gate, float up, float gate_cap, float up_cap) {
+    const float v = strix::moe::SoftcappedSwiglu<Math>{gate_cap, up_cap}(gate, up);
+    if constexpr (R == Round::none) return v;
+    else return ::strix::numeric::round_to_bf16(v);
+}
+
 // A8 consumes the completed FP32 activation as a lane of a 32-value group.
 // The backend supplies its group quantizer, including its lane exchange.
 struct A8Epilogue {

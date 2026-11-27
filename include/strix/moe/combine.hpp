@@ -9,6 +9,9 @@
 //                         acc = +0; acc = bf(acc + bf(eo_k[d] * w_k)); y[d] = base ? bf(acc + base[d]) : acc
 //                         w == nullptr: unit weights, term = eo_k[d] (no product): with top_k = 1 and BF16-valued eo
 //                         this is the BF16 add y = bf(eo + base) (e.g. routed output + shared expert output).
+//   f32_steps_bf16 (a reference that accumulates experts in FP32 with separately rounded products, then stores BF16):
+//                         acc = +0; acc = acc + (w_k * eo_k[d]) (product and add each rounded, never fused);
+//                         y[d] = bf(base ? acc + base[d] : acc)
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -18,7 +21,7 @@
 
 namespace strix::moe {
 
-enum class CombineForm : std::uint8_t { fma_f32, bf16_steps };
+enum class CombineForm : std::uint8_t { fma_f32, bf16_steps, f32_steps_bf16 };
 
 // One step of an ordered FP32 combine. Callers that bind this arithmetic
 // compile without FP contraction.
@@ -54,6 +57,8 @@ inline void combine_ref(CombineForm form, std::uint32_t rows, std::uint32_t top_
                 const float e = eo[(static_cast<std::size_t>(r) * top_k + k) * width + d];
                 if (form == CombineForm::fma_f32) {
                     acc = std::fma(w[static_cast<std::size_t>(r) * top_k + k], e, acc);
+                } else if (form == CombineForm::f32_steps_bf16) {
+                    acc = add_weighted_expert_f32(acc, w.empty() ? 1.0F : w[static_cast<std::size_t>(r) * top_k + k], e);
                 } else {
                     const float term = w.empty() ? e : combine_round_bf16(e * w[static_cast<std::size_t>(r) * top_k + k]);
                     acc = combine_round_bf16(acc + term);
@@ -61,6 +66,7 @@ inline void combine_ref(CombineForm form, std::uint32_t rows, std::uint32_t top_
             }
             const std::size_t at = static_cast<std::size_t>(r) * width + d;
             if (form == CombineForm::fma_f32) y[at] = acc + base[at];
+            else if (form == CombineForm::f32_steps_bf16) y[at] = combine_round_bf16(base.empty() ? acc : acc + base[at]);
             else y[at] = base.empty() ? acc : combine_round_bf16(acc + base[at]);
         }
 }

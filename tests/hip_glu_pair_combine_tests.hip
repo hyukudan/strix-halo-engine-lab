@@ -232,6 +232,30 @@ void run_combine(unsigned reps, hipStream_t s) {
     }
     for (float* p : {e0, e1, wd, y0, y1}) CHECK(hipFree(p));
 }
+
+// f32_steps_bf16 (FP32 steps with separately rounded products, one BF16 store): device vs the host oracle, bitwise, with and
+// without a base row (10 x 2048).
+void run_combine_f32_steps() {
+    constexpr unsigned K = 10U, L = 2048U, R = 3U;
+    std::vector<float> eo(std::size_t{R} * K * L), w(std::size_t{R} * K), base(std::size_t{R} * L), host0(std::size_t{R} * L),
+        host1(std::size_t{R} * L);
+    for (auto& v : eo) v = uniform(-2.0F, 2.0F) * (next_u32() % 7U == 0U ? 1000.0F : 1.0F);
+    for (auto& v : w) v = uniform(0.0F, 0.5F);
+    for (auto& v : base) v = uniform(-1.0F, 1.0F);
+    strix::moe::combine_ref(strix::moe::CombineForm::f32_steps_bf16, R, K, L, w, eo, {}, host0);
+    strix::moe::combine_ref(strix::moe::CombineForm::f32_steps_bf16, R, K, L, w, eo, base, host1);
+    float *ed = to_device(eo), *wd = to_device(w), *bd = to_device(base), *y0 = zeros<float>(std::size_t{R} * L),
+          *y1 = zeros<float>(std::size_t{R} * L);
+    strix::moe_core::enqueue_combine<strix::moe::CombineForm::f32_steps_bf16, K, L>(wd, ed, nullptr, y0, R, nullptr);
+    strix::moe_core::enqueue_combine<strix::moe::CombineForm::f32_steps_bf16, K, L>(wd, ed, bd, y1, R, nullptr);
+    CHECK(hipDeviceSynchronize());
+    CHECK(hipGetLastError());
+    const std::size_t bad0 = mismatches(to_host(y0, host0.size()), host0), bad1 = mismatches(to_host(y1, host1.size()), host1);
+    std::printf("combine f32_steps_bf16 3x10x2048 vs host: no base %zu, base %zu mismatches -> %s\n", bad0, bad1,
+                bad0 + bad1 == 0U ? "PASS" : "FAIL");
+    expect(bad0 + bad1 == 0U, "combine f32_steps_bf16");
+    for (float* p : {ed, wd, bd, y0, y1}) CHECK(hipFree(p));
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -244,6 +268,7 @@ int main(int argc, char** argv) {
     run_group({3072U, 1536U, 1536U, "hy4-moe latent+shared gate/up"}, bench ? 5U : 1U, bench ? 400U : 0U, s);
     run_group({3072U, 0U, 13824U, "hy4-dense gate/up"}, 1U, bench ? 60U : 0U, s);
     run_combine(bench ? 2000U : 0U, s);
+    run_combine_f32_steps();
     bool threw = false;
     try {
         float* d = zeros<float>(8);

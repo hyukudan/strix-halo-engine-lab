@@ -38,6 +38,22 @@ float wave_chunk_square_sum(const float* xr, unsigned n) {
     return total;
 }
 
+// Host emulation of ReductionOrder::lane_strided_fma_lds_halving on one row of n > 0 values with `lanes` (a power of
+// two) virtual lanes: lane t chains the squares of x[t], x[t + lanes], ... in form F, then the halving tree
+// partial[l] = partial[l] + partial[l + h] for h = lanes / 2 .. 1; the row sum is partial[0]. `partial` has `lanes`
+// floats of scratch. Rows of at most 32 J values on the wave-rows kernel have the same bits as any lanes >= 32 J.
+template <SquareForm F>
+float lane_strided_square_sum(const float* xr, unsigned n, unsigned lanes, float* partial) {
+    for (unsigned lane = 0; lane < lanes; ++lane) {
+        float a = 0.0F;
+        for (unsigned i = lane; i < n; i += lanes) a = square_step<F>(a, xr[i]);
+        partial[lane] = a;
+    }
+    for (unsigned h = lanes / 2; h > 0; h >>= 1U)
+        for (unsigned lane = 0; lane < h; ++lane) partial[lane] = partial[lane] + partial[lane + h];
+    return partial[0];
+}
+
 // Host-only reference for the supported reduction contracts. Host traits supply
 // load() and inv_sqrt(); a host result does not qualify device code generation.
 // Compile with contraction/fast math disabled, as for the engine's device path.
@@ -60,15 +76,7 @@ void reference(const typename Traits::Input* x, const typename Traits::Scale* w,
         if constexpr (chunked) {
             ss = wave_chunk_square_sum<Traits>(xr, n);
         } else {
-            for (unsigned lane = 0; lane < lanes; ++lane) {
-                float a = 0.0F;
-                for (unsigned i = lane; i < n; i += lanes) a = square_step<square_form_of<Traits>()>(a, xr[i]);
-                partial[lane] = a;
-            }
-            for (unsigned h = lanes / 2; h > 0; h >>= 1U)
-                for (unsigned lane = 0; lane < h; ++lane)
-                    partial[lane] = partial[lane] + partial[lane + h];
-            ss = partial[0];
+            ss = lane_strided_square_sum<square_form_of<Traits>()>(xr, n, lanes, partial.data());
         }
         const float r = Traits::inv_sqrt(ss / static_cast<float>(n) + eps);
         constexpr OutputForm form = output_form_of<Traits>();

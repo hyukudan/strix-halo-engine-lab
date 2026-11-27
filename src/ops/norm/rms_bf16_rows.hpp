@@ -42,6 +42,27 @@ struct Bf16RoundedNumeratorTraits : Bf16ScaleSqrtDivTraits {
     __device__ static float numerator(float v) { return weight::scalar_float::bf16_round(v); }
 };
 
+// The unweighted RMS rows: FP32 out = x * r, no scale (pass scale = nullptr) and no rounding (the host's per-head
+// attn::head_rms_reference: the same r = 1 / sqrt(ss / n + eps), the product stored as FP32 for the caller's next step).
+// Used through enqueue_rms_bf16_rows_rounded_numerator<Bf16ScaleSqrtDivPlainTraits> (any Traits is admitted).
+struct Bf16ScaleSqrtDivPlainTraits : DeclaredF32Traits<OutputForm::plain> {
+    using Scale = std::uint16_t;
+    __device__ static float inv_sqrt(float value) { return __fdiv_rn(1.0F, __fsqrt_rn(value)); }
+    __device__ static float load(const Scale* scale, ScaleFormat, unsigned i) {
+        return weight::scalar_float::u2f(std::uint32_t{scale[i]} << 16U);
+    }
+};
+
+// The same rows with the declared square root (strix::numeric::declared_sqrt: the correctly rounded root through double
+// precision) in the factor: __fsqrt_rn is not correctly rounded over the whole range on every device, the declared root
+// is, and it is the one the host reference of a declared-arithmetic model computes. 1 / root is the IEEE quotient.
+template <class Base>
+struct DeclaredSqrtOf : Base {
+    __device__ static float inv_sqrt(float value) { return __fdiv_rn(1.0F, ::strix::numeric::declared_sqrt(value)); }
+};
+using Bf16DeclaredSqrtTraits = DeclaredSqrtOf<Bf16ScaleSqrtDivTraits>;
+using Bf16DeclaredSqrtPlainTraits = DeclaredSqrtOf<Bf16ScaleSqrtDivPlainTraits>;
+
 namespace detail {
 template <class Traits, unsigned J>
 void launch_rms_wave_rows(const Bf16RmsRows& args, float epsilon, hipStream_t stream) {
@@ -84,9 +105,10 @@ hipError_t enqueue_rms_bf16_rows(const Bf16RmsRows& args, float epsilon, RmsRows
 
 // Parallel uses the lane-strided FMA and LDS halving tree (rows of at most 256 values: one wave per row with the same
 // tree and bits, rmsnorm_wave_rows_kernel). One lane retains the ascending reference sum for device qualification.
+template <class Traits = Bf16ScaleSqrtDivTraits>
 inline hipError_t enqueue_rms_bf16_rows(const Bf16RmsRows& args, float epsilon, RmsRowsReduction reduction,
                                        hipStream_t stream) {
-    return detail::enqueue_rms_bf16_rows<Bf16ScaleSqrtDivTraits>(args, epsilon, reduction, stream);
+    return detail::enqueue_rms_bf16_rows<Traits>(args, epsilon, reduction, stream);
 }
 // The same reductions with Bf16RoundedNumeratorTraits. A template, so its kernels are instantiated only where it is
 // called (the objects of the other includers keep their machine code).

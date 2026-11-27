@@ -113,6 +113,52 @@ struct Bf16SigmoidProduct {
     __device__ void operator()(std::size_t i) const { output[i] = value(input, gate_logits, i); }
 };
 
+// Bf16SigmoidProduct with the sigmoid itself rounded to BF16 before the product (core/bf16_reference.hpp
+// SigmoidGatePrecision::bf16_sigmoid): B(B(x) * B(sigmoid(B(gate)))).
+struct Bf16RoundedSigmoidProduct {
+    const float* input;
+    const float* gate_logits;
+    float* output;
+    __device__ void operator()(std::size_t i) const {
+        const float gate = bf16_round(gate_logits[i]);
+        const float sigmoid = bf16_round(__fdiv_rn(1.0F, __fadd_rn(1.0F, expf(-gate))));
+        output[i] = bf16_round(__fmul_rn(bf16_round(input[i]), sigmoid));
+    }
+};
+
+// Mix across the head axis with a folded [heads][heads] matrix (attn_core/value_head_mix_reference.hpp
+// apply_folded_value_head_mix_reference): out[row][h][d] = fma-chain over g = 0 .. heads - 1 ascending from +0 of
+// folded[h][g] * in[row][g][d]. Element i of the flat [row][head][width] output; input and output are disjoint.
+struct FoldedHeadMix {
+    const float* input;
+    const float* folded;
+    float* output;
+    unsigned heads;
+    unsigned width;
+    __device__ void operator()(std::size_t i) const {
+        const std::size_t d = i % width, h = (i / width) % heads, row = i / (std::size_t{width} * heads);
+        const float* in = input + row * heads * width + d;
+        float sum = 0.0F;
+        for (unsigned g = 0; g < heads; ++g) sum = __builtin_fmaf(folded[h * heads + g], in[std::size_t{g} * width], sum);
+        output[i] = sum;
+    }
+};
+
+// Copy a [rows][vectors][width] block between two layouts (row / vector strides in elements; the caller offsets the
+// pointers): the permutation the per-head and per-group projections of a row-major activation need (a projection sweep
+// reads tight rows, so a head's or group's columns of all rows are gathered first, and scattered back after).
+struct StridedCopy {
+    const float* input;
+    float* output;
+    unsigned width;
+    unsigned vectors;
+    std::size_t in_row, in_vector, out_row, out_vector;
+    __device__ void operator()(std::size_t i) const {
+        const std::size_t d = i % width, v = (i / width) % vectors, r = i / (std::size_t{width} * vectors);
+        output[r * out_row + v * out_vector + d] = input[r * in_row + v * in_vector + d];
+    }
+};
+
 // The same gated value stored as the BF16 operand image a BF16 projection makes of Bf16SigmoidProduct's FP32 output
 // (bf16_encode of that value, core/fma_bf16_rows.hpp enqueue_bf16_operand_image): no FP32 plane and no image pass.
 struct Bf16SigmoidProductImage {
@@ -135,6 +181,26 @@ struct Bf16Softcap {
     float* row;
     float cap;
     __device__ void operator()(std::size_t i) const { row[i] = bf16_softcap(row[i], cap); }
+};
+
+// Linear and quadratic logit hinges (strix/core/logit_epilogue.hpp, host core/multimax_reference.hpp
+// multimax_f32_reference): the four hinges read the same x, every subtract, multiply and add rounds on its own (no
+// contraction), ReLU keeps NaN and maps x <= 0 to +0; with preserve_mask a -inf logit stays -inf.
+struct LogitHinges {
+    float* row;
+    float t0, t1, t2, t3, g0, g1, g2, g3;
+    bool preserve_mask;
+    __device__ static float relu(float v) { return v <= 0.0F ? 0.0F : v; }
+    __device__ void operator()(std::size_t i) const {
+        const float x = row[i];
+        if (preserve_mask && x == -__builtin_inff()) return;
+        const float lower = relu(__fsub_rn(t0, x)), upper = relu(__fsub_rn(x, t1));
+        const float lower_square = relu(__fsub_rn(t2, x)), upper_square = relu(__fsub_rn(x, t3));
+        const float a = __fmul_rn(g0, lower), b = __fmul_rn(g1, upper);
+        const float c = __fmul_rn(g2, __fmul_rn(lower_square, lower_square));
+        const float d = __fmul_rn(g3, __fmul_rn(upper_square, upper_square));
+        row[i] = __fadd_rn(__fadd_rn(__fadd_rn(__fadd_rn(x, a), b), c), d);
+    }
 };
 
 // A short projection into a large output row. Each lane owns `Columns` adjacent
