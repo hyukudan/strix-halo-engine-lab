@@ -49,6 +49,7 @@ struct Lever {
     std::vector<std::string> args;                // ... or engine arguments
     std::vector<std::string> incompatible_with, requires_levers, default_tiers;
     std::string quality, reason;
+    bool identity_pending = false;   // "identity":"pending": an exact lever whose device identity is not yet receipted
 };
 
 [[nodiscard]] std::vector<Lever> parse_catalogue(std::string_view json);
@@ -66,12 +67,16 @@ struct Query {
     std::string backend;                    // "hip" | "cuda"
     std::vector<std::string> engines;       // catalogue engines of the model
     Band band;
-    std::function<bool(std::string_view)> env_is_set;   // an explicit environment value always wins
+    // The explicit environment value of a switch (nullopt when unset or empty). An explicit value always wins:
+    // "0" keeps the lever off, any other value keeps it on (source=explicit), and incompatibility and requirements
+    // see that real state.
+    std::function<std::optional<std::string>(std::string_view)> env_value;
 };
 
 struct Line {
-    std::string lever, source, reason;      // source: default | all-on | refused
-    [[nodiscard]] std::string text() const;  // "lever NAME source=SOURCE[ reason=TEXT]"
+    std::string lever, source, reason;      // source: default | explicit | all-on | refused
+    std::string marks;                      // " identity=pending" / " gate=G" on an all-on line, else empty
+    [[nodiscard]] std::string text() const;  // "lever NAME source=SOURCE[ identity=pending][ gate=G][ reason=TEXT]"
 };
 
 struct Plan {

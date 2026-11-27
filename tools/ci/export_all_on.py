@@ -24,8 +24,12 @@ PHASES = {"any", "prefill", "decode"}
 
 def build() -> str:
     rows = json.loads(CATALOGUE.read_text(encoding="utf-8"))
-    out, seen = [], set()
+    out, seen, keys = [], set(), set()
     for row in rows:
+        key = (row["engine"], row["name"])
+        if key in keys:
+            raise SystemExit(f"duplicate catalogue row (engine, name) {key}")
+        keys.add(key)
         item = row.get("all_on")
         if item is None:
             continue
@@ -39,11 +43,18 @@ def build() -> str:
             raise SystemExit(f"{name}: a classified lever needs backends")
         if item["class"] not in ("unclassified", "kv") and bool(item.get("env")) == bool(item.get("args")):
             raise SystemExit(f"{name}: a classified lever needs exactly one of env and args")
+        if item.get("identity", "pending") != "pending" or (item.get("identity") and item["class"] != "exact"):
+            raise SystemExit(f"{name}: identity may only be pending, on an exact lever")
         out.append({"row": row["name"], **item})
     for item in out:
         for other in item.get("incompatible_with", []) + item.get("requires", []):
             if other not in seen:
                 raise SystemExit(f"{item['lever']}: unknown lever {other}")
+    by_name = {item["lever"]: item for item in out}
+    for item in out:
+        for other in item.get("incompatible_with", []):
+            if item["lever"] not in by_name[other].get("incompatible_with", []):
+                raise SystemExit(f"{item['lever']}: incompatible with {other}, but {other} does not name it")
     lines = ",\n".join("  " + json.dumps(item, ensure_ascii=False, separators=(",", ":")) for item in out)
     return "[\n" + lines + "\n]\n"
 

@@ -11,7 +11,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -56,14 +58,23 @@ constexpr char fixture[] = R"json([
 {"row":"r","lever":"foreign","class":"exact","gate":"none","engines":["other"],"backends":["hip"],"phase":"any","env":"X_FOREIGN","value":"1"}
 ])json";
 
-std::string lines_of(const std::vector<ao::Lever>& levers, ao::Tier tier, ao::Band band = {},
-                     std::function<bool(std::string_view)> is_set = {}) {
+using EnvValue = std::function<std::optional<std::string>(std::string_view)>;
+
+// One explicit environment value; every other switch unset.
+EnvValue only(std::string key, std::string value) {
+    return [key = std::move(key), value = std::move(value)](std::string_view name) -> std::optional<std::string> {
+        if (name == key) return value;
+        return std::nullopt;
+    };
+}
+
+std::string lines_of(const std::vector<ao::Lever>& levers, ao::Tier tier, ao::Band band = {}, EnvValue env = {}) {
     ao::Query query;
     query.tier = tier;
     query.backend = "hip";
     query.engines = {"m"};
     query.band = band;
-    query.env_is_set = std::move(is_set);
+    query.env_value = std::move(env);
     return ao::resolve(levers, query).text();
 }
 
@@ -96,8 +107,8 @@ void fixture_tests() {
                 "lever e_env source=all-on\n"
                 "lever e_args source=all-on\n"
                 "lever f_pass source=all-on\n"
-                "lever f_pend source=all-on reason=quality: KL 0.01\n"
-                "lever f_fail source=all-on reason=quality: turbo limits pass\n"
+                "lever f_pend source=all-on gate=pending reason=quality: KL 0.01\n"
+                "lever f_fail source=all-on gate=FAIL reason=quality: turbo limits pass\n"
                 "lever t_only source=all-on reason=quality: dNLL +0.005\n"
                 "lever t_default source=default\n"
                 "lever kv_fp8 source=default\n"
@@ -115,10 +126,28 @@ void fixture_tests() {
             "out-of-band lever is refused");
     require(lines_of(levers, ao::Tier::exact, ao::parse_band("decode")).find("banded") == std::string::npos,
             "a prefill band lever does not belong to a decode regime");
-    // An explicit environment value wins and is kept.
-    require(lines_of(levers, ao::Tier::exact, {}, [](std::string_view key) { return key == "X_E_ENV"; })
-                .starts_with("lever e_env source=default reason=explicit setting kept\n"),
+    // An explicit environment value wins and is kept, with its real state: "0" is off.
+    require(lines_of(levers, ao::Tier::exact, {}, only("X_E_ENV", "1"))
+                .starts_with("lever e_env source=explicit reason=explicit setting kept\n"),
             "an explicit setting is kept");
+    require(lines_of(levers, ao::Tier::exact, {}, only("X_E_ENV", "0"))
+                .starts_with("lever e_env source=explicit reason=explicit setting kept: off\n"),
+            "an explicit 0 is kept as off");
+    // A requirement switched off explicitly refuses its dependant (review P2-2, first case).
+    require(lines_of(levers, ao::Tier::turbo, {}, only("X_T_ONLY", "0")).find("lever needs_t source=refused reason=requires t_only\n") !=
+                std::string::npos,
+            "an explicit 0 does not satisfy a requirement");
+    // Incompatibility holds in both directions: an explicit later peer refuses an earlier all-on lever.
+    require(lines_of(levers, ao::Tier::exact, {}, only("X_PB", "1")).find(
+                "lever pair_a source=refused reason=incompatible with pair_b\nlever pair_b source=explicit reason=explicit setting kept\n") !=
+                std::string::npos,
+            "an explicit later peer refuses the earlier lever");
+    require(lines_of(levers, ao::Tier::exact, {}, only("X_PB", "0")).find("lever pair_a source=all-on\n") != std::string::npos,
+            "an explicit 0 peer does not refuse");
+    // An exact lever whose device identity is pending says so on its all-on line.
+    const auto pending = ao::parse_catalogue(
+        R"([{"row":"r","lever":"e_id","class":"exact","gate":"none","engines":["m"],"backends":["hip"],"phase":"any","env":"X_ID","value":"1","identity":"pending"}])");
+    require(lines_of(pending, ao::Tier::exact) == "lever e_id source=all-on identity=pending\n", "identity=pending is printed");
     // The plan exports exactly the all-on levers.
     ao::Query query;
     query.tier = ao::Tier::fast;
@@ -138,6 +167,13 @@ void fixture_tests() {
         (void)ao::parse_catalogue(R"([{"row":"r","lever":"x","class":"exact","gate":"none","engines":["m"],"backends":[],"phase":"any","env":"A","value":"1"}])");
     } catch (const std::invalid_argument&) { refused = true; }
     require(refused, "a classified lever without backends is refused");
+    refused = false;
+    try {
+        (void)ao::parse_catalogue(R"([
+{"row":"r","lever":"a","class":"exact","gate":"none","engines":["m"],"backends":["hip"],"phase":"any","env":"A","value":"1","incompatible_with":["b"]},
+{"row":"r","lever":"b","class":"exact","gate":"none","engines":["m"],"backends":["hip"],"phase":"any","env":"B","value":"1"}])");
+    } catch (const std::invalid_argument&) { refused = true; }
+    require(refused, "a one-sided incompatibility is refused");
     refused = false;
     try { (void)ao::parse_band("prefill:x"); } catch (const std::invalid_argument&) { refused = true; }
     require(refused, "a malformed band is refused");
@@ -212,6 +248,29 @@ void catalogue_tests(const std::filesystem::path& root) {
     }
 }
 
+// The review's two cases on the shipped catalogue (P2-2).
+void explicit_catalogue_tests(const std::filesystem::path& root) {
+    const auto& levers = ao::catalogue();
+    const auto run = [&](const std::string& model, ao::Tier tier, EnvValue env) {
+        const auto desc = description(root, model);
+        ao::Query query;
+        query.tier = tier;
+        query.backend = "hip";
+        query.engines = ao::engines_of(&desc);
+        query.env_value = std::move(env);
+        return ao::resolve(levers, query).text();
+    };
+    const auto qwen = run("qwen3.8-flash-next", ao::Tier::exact, only("STRIX_QPF2K_HC_RECOMPUTE_NORM", "0"));
+    require(qwen.find("lever qwen_hc_recompute source=explicit reason=explicit setting kept: off\n") != std::string::npos &&
+                qwen.find("lever qwen_hc_inverse_reuse source=refused reason=requires qwen_hc_recompute\n") != std::string::npos,
+            "an explicitly disabled requirement refuses its dependant: got\n" + qwen);
+    const auto ink = run("inkling2-mini", ao::Tier::turbo, only("STRIX_LOWBIT_FOLDED_SCALE", "f16_folded_scale"));
+    require(ink.find("lever ink_lowbit_rows_select source=refused reason=incompatible with ink_lowbit_folded_scale\n") !=
+                    std::string::npos &&
+                ink.find("lever ink_lowbit_folded_scale source=explicit reason=explicit setting kept\n") != std::string::npos,
+            "an explicit later peer refuses the earlier incompatible lever: got\n" + ink);
+}
+
 void binding_tests(const std::filesystem::path& root) {
     const auto desc = description(root, "qwen3.8-flash-next");
     put("STRIX_QPF2K_MOE_DIRECT_B", nullptr);
@@ -228,7 +287,7 @@ void binding_tests(const std::filesystem::path& root) {
         require(std::string(std::getenv("STRIX_QWEN_ROUTER_BF16")) == "0", "an explicit value is not overwritten");
         require(out.str().starts_with("all-on: tier=fast backend=hip levers="), "header line");
         require(out.str().find("lever qwen_moe_direct_b source=all-on\n") != std::string::npos, "printed lever line");
-        require(out.str().find("lever qwen_router_bf16 source=default reason=explicit setting kept\n") != std::string::npos,
+        require(out.str().find("lever qwen_router_bf16 source=explicit reason=explicit setting kept: off\n") != std::string::npos,
                 "explicit lever line");
         std::ostringstream again;
         const auto second = ao::begin(&desc, Name::fast, "hip", "", again, true, args);
@@ -274,7 +333,7 @@ void table(const std::filesystem::path& root) {
                 query.engines = ao::engines_of(&desc);
                 for (const auto& line : ao::resolve(levers, query).lines)
                     std::cout << "| " << (tier == ao::Tier::exact ? "exact" : tier == ao::Tier::fast ? "fast" : "turbo") << " | "
-                              << line.lever << " | " << line.source << " | " << line.reason << " |\n";
+                              << line.lever << " | " << line.source << line.marks << " | " << line.reason << " |\n";
             }
         }
     }
@@ -294,6 +353,7 @@ int main(int argc, char** argv) {
         }
         fixture_tests();
         catalogue_tests(root);
+        explicit_catalogue_tests(root);
         binding_tests(root);
         cli_tests();
     } catch (const std::exception& e) {

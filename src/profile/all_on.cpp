@@ -26,10 +26,13 @@ void put_env(const std::string& key, const char* value) {
 }
 #endif
 
-bool env_set(std::string_view key) {
+std::optional<std::string> env_value(std::string_view key) {
     const char* value = strix::envcfg::lookup_unrecorded(std::string(key).c_str());
-    return value != nullptr && *value != '\0';
+    if (value == nullptr || *value == '\0') return std::nullopt;
+    return std::string(value);
 }
+
+bool env_set(std::string_view key) { return env_value(key).has_value(); }
 
 const std::string& text(const Json& row, std::string_view key) {
     const auto* item = row.find(key);
@@ -134,6 +137,8 @@ std::vector<Lever> parse_catalogue(std::string_view json) {
         lever.default_tiers = strings(row, "default_tiers");
         lever.quality = text_or_empty(row, "quality");
         lever.reason = text_or_empty(row, "reason");
+        if (const auto identity = text_or_empty(row, "identity"); identity == "pending") lever.identity_pending = true;
+        else if (!identity.empty()) throw std::invalid_argument("all_on catalogue: " + lever.name + ": identity must be pending");
         const bool applicable = lever.cls != Class::unclassified && lever.cls != Class::kv;
         if (applicable && (lever.env.empty() == lever.args.empty() || lever.backends.empty()))
             throw std::invalid_argument("all_on catalogue: " + lever.name + " needs backends and one of env and args");
@@ -143,6 +148,13 @@ std::vector<Lever> parse_catalogue(std::string_view json) {
         for (const auto* list : {&lever.incompatible_with, &lever.requires_levers})
             for (const auto& other : *list)
                 if (!seen.contains(other)) throw std::invalid_argument("all_on catalogue: " + lever.name + " names unknown lever " + other);
+        // Incompatibility is a symmetric relation: each side names the other.
+        for (const auto& other : lever.incompatible_with) {
+            const auto peer = std::ranges::find(out, other, &Lever::name);
+            if (!contains(peer->incompatible_with, lever.name))
+                throw std::invalid_argument("all_on catalogue: " + lever.name + " is incompatible with " + other + " but " +
+                                            other + " does not name it");
+        }
     }
     return out;
 }
@@ -169,7 +181,7 @@ Band parse_band(std::string_view word) {
 }
 
 std::string Line::text() const {
-    std::string out = "lever " + lever + " source=" + source;
+    std::string out = "lever " + lever + " source=" + source + marks;
     if (!reason.empty()) out += " reason=" + reason;
     return out;
 }
@@ -181,11 +193,11 @@ std::string Plan::text() const {
 }
 
 Plan resolve(std::span<const Lever> levers, const Query& query) {
-    enum class State : std::uint8_t { skip, refused, def, all_on };
+    enum class State : std::uint8_t { skip, refused, def, explicit_on, explicit_off, all_on };
     struct Slot {
         const Lever* lever = nullptr;
         State state = State::skip;
-        std::string reason;
+        std::string reason, marks;
     };
     std::vector<Slot> slots;
     const auto rank = [](Class cls) { return cls == Class::turbo ? 2 : cls == Class::fast ? 1 : 0; };
@@ -215,15 +227,19 @@ Plan resolve(std::span<const Lever> levers, const Query& query) {
             slot.reason = defect;
         } else if (contains(lever.default_tiers, tier_word(query.tier))) {
             slot.state = State::def;
-        } else if (query.env_is_set && !lever.env.empty() && query.env_is_set(lever.env)) {
-            slot.state = State::def;
-            slot.reason = "explicit setting kept";
+        } else if (const auto value = query.env_value && !lever.env.empty() ? query.env_value(lever.env) : std::nullopt) {
+            const bool off = *value == "0";
+            slot.state = off ? State::explicit_off : State::explicit_on;
+            slot.reason = off ? "explicit setting kept: off" : "explicit setting kept";
         } else if (lever.cls == Class::fast && lever.gate != Gate::pass && query.tier == Tier::fast) {
             slot.state = State::refused;
             slot.reason = "gate v2 " + std::string(gate_word(lever.gate)) + " for fast";
         } else {
             slot.state = State::all_on;
-            // A lever that needs more than FAST says its quality.
+            if (lever.identity_pending) slot.marks += " identity=pending";
+            // A lever that needs more than FAST says its gate and its quality.
+            if (query.tier == Tier::turbo && lever.cls == Class::fast && lever.gate != Gate::pass)
+                slot.marks += " gate=" + std::string(gate_word(lever.gate));
             if (query.tier == Tier::turbo && (lever.cls == Class::turbo || (lever.cls == Class::fast && lever.gate != Gate::pass)))
                 slot.reason = "quality: " + (lever.quality.empty() ? std::string("not stated") : lever.quality);
         }
@@ -233,13 +249,22 @@ Plan resolve(std::span<const Lever> levers, const Query& query) {
         for (auto& slot : slots) if (slot.lever->name == name) return &slot;
         return nullptr;
     };
-    const auto on = [](const Slot* slot) { return slot != nullptr && (slot->state == State::all_on || slot->state == State::def); };
-    // Incompatible pairs: the earlier catalogue row keeps its place, the later one is refused with the reason.
+    const auto settled = [](const Slot* slot) {
+        return slot != nullptr && (slot->state == State::def || slot->state == State::explicit_on);
+    };
+    const auto on = [&](const Slot* slot) { return settled(slot) || (slot != nullptr && slot->state == State::all_on); };
+    // Incompatible pairs (symmetric): a default or explicit peer always wins wherever its row is; between two all-on
+    // levers the earlier catalogue row keeps its place and the later one is refused with the reason.
     for (auto& slot : slots) {
         if (slot.state != State::all_on) continue;
         for (const auto& other : slot.lever->incompatible_with) {
             const Slot* peer = find(other);
-            if (on(peer) && peer < &slot) { slot.state = State::refused; slot.reason = "incompatible with " + other; break; }
+            if (settled(peer) || (on(peer) && peer < &slot)) {
+                slot.state = State::refused;
+                slot.reason = "incompatible with " + other;
+                slot.marks.clear();
+                break;
+            }
         }
     }
     for (bool changed = true; changed;) {
@@ -250,6 +275,7 @@ Plan resolve(std::span<const Lever> levers, const Query& query) {
                 if (!on(find(need))) {
                     slot.state = State::refused;
                     slot.reason = "requires " + need;
+                    slot.marks.clear();
                     changed = true;
                     break;
                 }
@@ -258,7 +284,11 @@ Plan resolve(std::span<const Lever> levers, const Query& query) {
     }
     Plan plan;
     for (const auto& slot : slots) {
-        Line line{slot.lever->name, slot.state == State::all_on ? "all-on" : slot.state == State::def ? "default" : "refused", slot.reason};
+        const char* source = slot.state == State::all_on ? "all-on"
+                             : slot.state == State::def ? "default"
+                             : slot.state == State::explicit_on || slot.state == State::explicit_off ? "explicit"
+                                                                                                       : "refused";
+        Line line{slot.lever->name, source, slot.reason, slot.marks};
         plan.lines.push_back(std::move(line));
         if (slot.state != State::all_on) continue;
         if (!slot.lever->env.empty()) plan.env.emplace_back(slot.lever->env, slot.lever->value);
@@ -324,7 +354,7 @@ Scope begin(const model_description::ModelDescription* description, std::optiona
     query.engines = engines_of(description);
     const char* band_env = band.empty() ? strix::envcfg::text(kBandEnv) : nullptr;
     query.band = parse_band(band.empty() ? std::string_view(band_env ? band_env : "") : band);
-    query.env_is_set = env_set;
+    query.env_value = env_value;
     scope.plan_ = resolve(catalogue(), query);
     out << "all-on: tier=" << tier_word(query.tier) << " backend=" << query.backend << " levers=" << scope.plan_.lines.size() << '\n'
         << scope.plan_.text();
