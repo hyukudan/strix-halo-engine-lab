@@ -322,7 +322,7 @@ void needs_slower_tests() {
 
 // The engine side of the one record: a switch exported by --all-on that the engine does not engage prints its line.
 void engaged_tests() {
-    put(ao::kLeversEnv, "X_A,STRIX_INK_HIP_SERVED_TALL_CHUNK");
+    put(ao::kLeversEnv, "x_a:X_A,ink_hip_tall_chunk:STRIX_INK_HIP_SERVED_TALL_CHUNK");
     std::ostringstream out;
     require(ao::engaged("X_A", true, "unused", out) && out.str().empty(), "an engaged lever prints nothing");
     require(!ao::engaged("STRIX_INK_HIP_SERVED_TALL_CHUNK", false, "tier fast route", out) &&
@@ -381,12 +381,17 @@ void explicit_catalogue_tests(const std::filesystem::path& root) {
                     std::string::npos &&
                 qwen_short.find("lever qwen_moe_tiers source=all-on") != std::string::npos,
             "TURBO all-on never runs route I8 with the tier split: got\n" + qwen_short);
-    // A5: the served tall chunk is not bitwise: never an EXACT all-on lever; TURBO takes it (gate pending for FAST).
-    const auto ink_exact = run("inkling2-mini", ao::Tier::exact, {});
-    const auto ink_turbo = run("inkling2-mini", ao::Tier::turbo, {});
+    // A5: the served tall chunk is not bitwise: never an EXACT all-on lever; TURBO takes it (gate pending for FAST) on
+    // the held-back route only, which is what the server admits (mini_served_tall_chunk_admitted): on the default
+    // command line route it would be printed but not run.
+    const auto ink_exact = run("inkling2-mini", ao::Tier::exact, only("STRIX_INK_SERVED_CLI_ROUTE", "0"));
+    const auto ink_turbo = run("inkling2-mini", ao::Tier::turbo, only("STRIX_INK_SERVED_CLI_ROUTE", "0"));
+    const auto ink_route = run("inkling2-mini", ao::Tier::turbo, {});
     require(ink_exact.find("ink_hip_tall_chunk") == std::string::npos &&
-                ink_turbo.find("lever ink_hip_tall_chunk source=all-on gate=pending") != std::string::npos,
-            "the tall chunk is a FAST-class lever: got\n" + ink_exact + ink_turbo);
+                ink_turbo.find("lever ink_hip_tall_chunk source=all-on gate=pending") != std::string::npos &&
+                ink_route.find("lever ink_hip_tall_chunk source=refused reason=precondition env:STRIX_INK_SERVED_CLI_ROUTE=0 "
+                               "unmet") != std::string::npos,
+            "the tall chunk is a FAST-class lever of the held-back route: got\n" + ink_exact + ink_turbo + ink_route);
     const auto qwen = run("qwen3.8-flash-next", ao::Tier::exact, only("STRIX_QPF2K_HC_RECOMPUTE_NORM", "0"));
     require(qwen.find("lever qwen_hc_recompute source=explicit reason=explicit setting kept: off\n") != std::string::npos &&
                 qwen.find("lever qwen_hc_inverse_reuse source=refused reason=requires qwen_hc_recompute\n") != std::string::npos,
@@ -427,7 +432,8 @@ void binding_tests(const std::filesystem::path& root) {
         require(out.str().starts_with("all-on: tier=fast backend=hip levers="), "header line");
         require(out.str().find("lever qwen_hc_recompute source=all-on\n") != std::string::npos, "printed lever line");
         const char* exported = std::getenv(ao::kLeversEnv);
-        require(exported != nullptr && std::string(exported).find("STRIX_QPF2K_HC_RECOMPUTE_NORM") != std::string::npos &&
+        require(exported != nullptr &&
+                    std::string(exported).find("qwen_hc_recompute:STRIX_QPF2K_HC_RECOMPUTE_NORM") != std::string::npos &&
                     std::string(exported).find("STRIX_QWEN_ROUTER_BF16") == std::string::npos,
                 "the exported switches are listed for the engines (an explicit one is not)");
         require(out.str().find("lever qwen_router_bf16 source=explicit reason=explicit setting kept: off\n") != std::string::npos,

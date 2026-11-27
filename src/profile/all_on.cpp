@@ -420,22 +420,6 @@ std::vector<std::string> model_values(const model_description::ModelDescription*
     return out;
 }
 
-bool engaged(std::string_view env, bool on, std::string_view reason, std::ostream& out) {
-    if (on) return true;
-    const auto list = env_value(kLeversEnv);
-    if (!list) return false;
-    const auto keys = split(*list, ',');
-    if (std::ranges::find(keys, env) == keys.end()) return false;
-    std::string name(env);
-    for (const auto& lever : catalogue())
-        if (lever.env == env) {
-            name = lever.name;
-            break;
-        }
-    out << "all-on: lever " << name << " source=all-on applied=no reason=" << reason << '\n';
-    return false;
-}
-
 std::vector<std::string> engines_of(const model_description::ModelDescription* description) {
     std::vector<std::string> out;
     if (description == nullptr) return out;
@@ -497,12 +481,16 @@ Scope begin(const model_description::ModelDescription* description, std::optiona
         << scope.plan_.text();
     args.insert(args.end(), scope.plan_.args.begin(), scope.plan_.args.end());
     if (!apply) return scope;
+    // "LEVER:ENV" of every switch this scope exported (all_on_engaged.hpp reads it on the engine side).
     std::string exported;
     for (const auto& [key, value] : scope.plan_.env) {
         if (env_set(key)) continue;
         put_env(key, value.c_str());
         scope.set_.push_back(key);
-        exported += (exported.empty() ? "" : ",") + key;
+        for (const auto& line : scope.plan_.lines)
+            if (const auto it = std::ranges::find(catalogue(), line.lever, &Lever::name);
+                line.source == "all-on" && it != catalogue().end() && it->env == key)
+                exported += (exported.empty() ? "" : ",") + line.lever + ":" + key;
     }
     put_env(kAppliedEnv, "1");
     scope.set_.emplace_back(kAppliedEnv);

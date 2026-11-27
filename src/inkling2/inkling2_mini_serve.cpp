@@ -2,6 +2,7 @@
 #include "inkling2_mini_config.hpp"
 #include "inkling2_mini_schedule.hpp"
 
+#include "strix/profile/all_on_engaged.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/inkling2_chat.hpp"
 
@@ -122,11 +123,19 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     // that run the BF16 expert tile; not bitwise, so never an EXACT lever): the held-back BF16 route tries
     // the command line's chunk although HIP is not declared chunk-invariant (a distinct identity); the shared chunk
     // ladder keeps it only where its whole load keeps the 128-row chunk's slot capacity, else the incumbent 128 rows.
+    const bool tall_requested = env_flag_default_off("STRIX_INK_HIP_SERVED_TALL_CHUNK");
     const bool hip_tall_chunk = mini_served_tall_chunk_admitted(
         hip, out.tier, out.served_cli_route, explicit_rows.has_value(), out.context,
         out.moe_w4a4 == moe_core::grouped_w4a4::Activations::bf16, out.experts_nvfp4,
         out.weight_options.qualify != nullptr && out.weight_options.qualify_decode_only,
-        env_flag_default_off("STRIX_INK_HIP_SERVED_TALL_CHUNK"));
+        tall_requested);
+    // One record with --all-on: an exported tall chunk this server does not run says so (all_on_engaged.hpp).
+    if (tall_requested)
+        (void)profile::all_on::engaged("STRIX_INK_HIP_SERVED_TALL_CHUNK", hip_tall_chunk,
+                                       out.served_cli_route ? "the served command line route already runs its own chunk"
+                                       : out.tier == profile::Name::standard ? "EXACT: the tall chunk changes decode ids"
+                                                                             : "not admitted for this route, tile or context",
+                                       std::cerr);
     if (hip_tall_chunk) schedule.chunk = mini_prefill_schedule(hip, out.tier).chunk;
     out.prefill_rows = std::min(explicit_rows.value_or(schedule.chunk), out.context);
     if (!out.served_cli_route) {

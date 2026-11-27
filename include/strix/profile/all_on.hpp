@@ -15,6 +15,7 @@
 // models/*.toml ([catalogue] engines = [...]). Nothing here names a model.
 #include "strix/engine_profile.hpp"
 #include "strix/model_description.hpp"
+#include "strix/profile/all_on_engaged.hpp"   // kLeversEnv and engaged(): the engine side of the one record
 
 #include <cstdint>
 #include <functional>
@@ -31,8 +32,6 @@ namespace strix::profile::all_on {
 inline constexpr char kEnv[] = "STRIX_ALL_ON";
 inline constexpr char kBandEnv[] = "STRIX_ALL_ON_BAND";
 inline constexpr char kAppliedEnv[] = "STRIX_ALL_ON_APPLIED";  // set by the first shell so a second one does not repeat it
-// The switches the first shell exported, comma separated: an engine that does not engage one of them says so (engaged()).
-inline constexpr char kLeversEnv[] = "STRIX_ALL_ON_LEVERS";
 
 enum class Tier : std::uint8_t { exact, fast, turbo };
 enum class Class : std::uint8_t { exact, fast, turbo, kv, unclassified };
@@ -111,11 +110,7 @@ struct Plan {
 [[nodiscard]] Tier tier_of(Name);
 // The text values of a model description key: a scalar as one element, an array element-wise, nothing when absent.
 [[nodiscard]] std::vector<std::string> model_values(const model_description::ModelDescription*, std::string_view key);
-// The engine side of the one record: an engine whose own admission gates a switch calls this with the result. When the
-// switch was exported by --all-on (kLeversEnv) and `engaged` is false it prints one line
-// "all-on: lever NAME source=all-on applied=no reason=REASON" to `out`, so the printed plan never claims a lever the
-// engine did not run. Returns `engaged`.
-bool engaged(std::string_view env, bool engaged, std::string_view reason, std::ostream& out);
+
 [[nodiscard]] std::vector<std::string> engines_of(const model_description::ModelDescription*);
 // STRIX_ALL_ON: unset or 0 off, 1 on, anything else std::invalid_argument.
 [[nodiscard]] bool env_requested();
