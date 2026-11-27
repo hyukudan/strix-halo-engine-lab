@@ -128,7 +128,7 @@ void routes(const g::ModelManifest& m,g::RopeTables rope,std::shared_ptr<const g
     CHECK(e::parse_chat_request(with_ids).generation.max_tokens==e::parse_chat_request(body()).generation.max_tokens);
     for(const auto* field:{"return_token_ids","return_token_emissions"}) CHECK(srv::is_presentation_field(field));
     CHECK(!srv::is_presentation_field("unknown_policy"));
-    const auto timed=response(http(api,with_ids));const auto* receipt=timed.find("strix");CHECK(receipt);
+    const auto timed=response(http(api,with_ids));const auto* receipt=timed.find("strix");CHECK(receipt);std::fprintf(stderr,"DBG %s\n",receipt->dump().c_str());
     const auto* token_ids=receipt->find("token_ids");CHECK(token_ids && token_ids->as_array().size()==generated(timed).size());
     for(std::size_t i=0;i<generated(timed).size();++i)CHECK(token_ids->as_array()[i].as_int()==std::int64_t(generated(timed)[i]));
     CHECK(receipt->find("prefill_ms") && receipt->find("decode_ms") && receipt->find("queue_ms"));

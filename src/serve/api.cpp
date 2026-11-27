@@ -1750,7 +1750,16 @@ struct ApiService::Impl {
             if (!note.empty()) out.set("note", Json(note));
             return out;
         }
-        if (o && o->family && !o->family->receipt.is_null()) return o->family->receipt;
+        if (o && o->family && !o->family->receipt.is_null()) {
+            // A family that states its own receipt keeps every member of it; the members every server answers the same
+            // way (requested token IDs, the queue / prompt / decode timings) come from the shared schema, never twice.
+            if (!o->family->receipt.is_object()) return o->family->receipt;
+            Json out(o->family->receipt.as_object());  // a copy: Json containers share storage
+            const auto shared = engine_json_text(*o, note, body);
+            for (const char* key : {"token_ids", "queue_ms", "prefill_ms", "decode_ms", "decode_tokens_per_second"})
+                if (const auto* value = shared.find(key); value && !out.find(key)) out.set(key, *value);
+            return out;
+        }
         auto out = o ? engine_json(*o, note, body) : Json::object();
         if (spec && !o) selection_json(out, *spec, initial_verdict(*spec), resolved.temperature > 0.0);
         if (!note.empty()) out.set("note", Json(note));
