@@ -335,7 +335,7 @@ void auto_rows() {
     expect(sc::auto_prefill_rows(49152, t) == 16384U, "auto rows: drafter loaded first -> 16384");
     t.wide_pieces = false;  // outside the measured envelope (large context, other window / slabs): at most 16384
     expect(sc::auto_prefill_rows(49152, t) == 16384U, "auto rows: no 32768 outside the measured envelope");
-    // A FAST / TURBO server: the whole-prompt band (D1 + R256 up to 32,768) asks the prefill to hold 32,768 rows when they
+    // A FAST / TURBO server: the whole-prompt band (D1 + bounded replay up to 32,768) asks the prefill to hold 32,768 rows when they
     // fit under the same rule; the default pieces stay the measured 16,384 (auto_piece_rows).
     t.wide_pieces = true;
     expect(sc::auto_prefill_rows(49152, t, 32768U) == 32768U, "auto rows: the whole-prompt band holds 32768 rows when they fit");

@@ -188,17 +188,17 @@ and every off switch.
 Use the same `--profile exact|fast|turbo` on both ranks. `exact` (also `default`)
 keeps the production arithmetic above. FAST (the implicit model preset) selects the D1
 prefill composition, per request, for prompts of 4,096-8,192 and 8,193-32,768 tokens on
-the gfx1151 pair with one lane. TURBO adds, on top of an admitted D1 request, the bounded
-decoder replay R=256 for prompts of 4,096-8,192 tokens; above 8,192 it is explicit only
-(`STRIX_DS41_DECODER_REPLAY=256`). The held-out re-score of gate v2 (window set
-`heldout/v1`) passed D1 for FAST and D1 + R256 for TURBO in that band; the timing receipts are pair prefill CLI runs at 8,128 / 8,192 and 32,768 tokens
+the gfx1151 pair with one lane, and, on top of an admitted D1 request of 4,096-8,192
+tokens, the bounded decoder replay R=512. Held-out gate v2 passed for D1 in the 8K and
+32K classes and for D1 + R512 in the 8K class (R=256 failed FAST and stays explicit
+only; the 32K replay row waits for its gate); the timing receipts are pair prefill CLI runs at 8,128 / 8,192 and 32,768 tokens
 (details in [optimizations.md](../../optimizations.md#ds41-fast-d1-band)). The pair
 prefill CLI and the HTTP server enter the same admission: the server sends a fresh whole
 text prompt run as one piece to it whatever its slot count. Pieces cut for prefix-cache
 snapshots, continuations, image rows, group passes and a server with a disk tier
 (prefix cache or session directory) keep the previous route. TURBO inherits admitted
 FAST; IU4 has no TURBO cell (measured slower). Explicit arithmetic switches still opt
-into experiments. Startup inspection reports D1 and R=256 pending because the prompt is
+into experiments. Startup inspection reports D1 and R=512 pending because the prompt is
 unknown.
 
 ## Transport and USB4 layout (P17.4)

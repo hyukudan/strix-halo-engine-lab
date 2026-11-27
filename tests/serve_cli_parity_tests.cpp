@@ -477,8 +477,8 @@ void ds41() {
         const auto server = request(pd::App::serve, "1", prompt);
         gate("ds41+prompt+" + std::to_string(prompt), cli, server, {});
         const bool banded = prompt >= 4096U && prompt <= 32768U, replay = banded && prompt <= 8192U;
-        check(cli.at("d1_prefill") == (banded ? "1" : "0") && cli.at("decoder_replay") == (replay ? "256" : "0"),
-              "ds41: both ranks use D1 inside the measured bands, TURBO R256 only up to 8,192");
+        check(cli.at("d1_prefill") == (banded ? "1" : "0") && cli.at("decoder_replay") == (replay ? "512" : "0"),
+              "ds41: both ranks use D1 inside the measured bands, R512 only up to 8,192");
     }
     // The default server (eight slots, session RAM, no disk tier) sends a fresh whole text prompt to the same device
     // admission as the CLI; the slot count is not a scope. Pieces, image rows and disk tiers keep the previous route.
@@ -499,10 +499,10 @@ void ds41() {
 
     // The options each entry really builds. The pair CLI (apps/deepseek41_prefill_main.cpp options()): positions =
     // the prompt, no row cap, no drafter seed. The default server (slot_prefill_options): positions = --context, rows =
-    // the auto capacity, and DSpark's 128-row seed. Same request -> same D1 / R256 cells (the seed rides on R256:
-    // plan_bounded_replay computes the same rows for any seed <= R). Since the held-out re-score (gate_r) R256 is a
-    // TURBO row up to 8,192 only, so a seeded server request without R256 (FAST, TURBO above 8,192) declines D1 and
-    // keeps the previous prefill route while the CLI runs D1: a known served/CLI gap until a seeded D1 receipt exists.
+    // the auto capacity, and DSpark's 128-row seed. Same request -> same D1 / replay cells (the seed rides on the
+    // replay: plan_bounded_replay computes the same rows for any seed <= R). R=512 is a FAST row up to 8,192 (ds_replay
+    // held-out gate v2), so FAST and TURBO seeded server requests there resolve the CLI cells; above 8,192 (no replay
+    // row yet) the seeded server declines D1 and keeps the previous prefill route while the CLI runs D1.
     const auto cells = [&](const ds::PrefillOptions& o, const char* rank, std::uint64_t prompt, pd::App app,
                            const char* profile) -> sp::Config {
         const auto startup = pd::resolve(app, {model, "--rank", rank,
@@ -531,29 +531,29 @@ void ds41() {
             const auto cli = cells(cli_o, "0", prompt, pd::App::prefill, profile);
             const auto server = cells(serve_o, "1", prompt, pd::App::serve, profile);
             const bool fast = std::string_view(profile) != "exact", banded = fast && prompt >= 4096U;
-            const bool replay = banded && std::string_view(profile) == "turbo" && prompt <= 8192U;
+            const bool replay = banded && prompt <= 8192U;
             if (banded && !replay) {
                 check(server.at("d1_prefill") == "declined" && cli.at("d1_prefill") == "1" && cli.at("decoder_replay") == "0",
-                      std::string("ds41: without R256 the seeded server declines D1 (") + profile + ")");
+                      std::string("ds41: without the replay the seeded server declines D1 (") + profile + ")");
                 continue;
             }
             gate(std::string("ds41+request+") + profile + "+" + std::to_string(prompt), cli, server, {});
-            check(server.at("d1_prefill") == (banded ? "1" : "0") && server.at("decoder_replay") == (replay ? "256" : "0"),
+            check(server.at("d1_prefill") == (banded ? "1" : "0") && server.at("decoder_replay") == (replay ? "512" : "0"),
                   std::string("ds41: the seeded server request resolves the CLI cells (") + profile + ")");
         }
     {
         ds::PrefillOptions seeded;
         seeded.world = 2;
         seeded.max_positions = 36864;
-        seeded.draft_rows = 257;  // a seed wider than R: the bounded plan refuses it, so the band declines
+        seeded.draft_rows = 513;  // a seed wider than R: the bounded plan refuses it, so the band declines
         check(cells(seeded, "0", 8192U, pd::App::serve, "fast").at("d1_prefill") == "declined",
               "ds41: a seed wider than the replay bound declines D1");
         for (const std::uint64_t total : {std::uint64_t{8192}, std::uint64_t{32768}}) {
             strix::ds41::SuffixReplayGeometry g0, g1;
             g0.draft_rows = 0;
             g1.draft_rows = 128;
-            const auto a = strix::ds41::plan_bounded_replay(g0, 0U, total, 256U);
-            const auto b = strix::ds41::plan_bounded_replay(g1, 0U, total, 256U);
+            const auto a = strix::ds41::plan_bounded_replay(g0, 0U, total, 512U);
+            const auto b = strix::ds41::plan_bounded_replay(g1, 0U, total, 512U);
             bool same = a.replay_row_layers == b.replay_row_layers && a.layers.size() == b.layers.size();
             for (std::size_t i = 0; same && i < a.layers.size(); ++i)
                 same = a.layers[i].out_begin == b.layers[i].out_begin && a.layers[i].kv_begin == b.layers[i].kv_begin;

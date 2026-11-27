@@ -457,9 +457,13 @@ void test_d1_request_profile() {
             };
             const auto hit = resolve(8128, measured);
             const bool expect_d1 = std::string_view(tier) != "exact";
-            const bool expect_r256 = std::string_view(tier) == "turbo";  // gate_r: R256 failed FAST, passed TURBO <= 8,192
+            // ds_replay (held-out gate v2): R=512 passes FAST in 4,096..8,192; TURBO nests the FAST cell. 8,193..32,768
+            // keeps D1 without replay until its gate completes.
+            const auto expect_replay = [&](std::uint64_t prompt) -> std::string_view {
+                return expect_d1 && prompt >= 4096U && prompt <= 8192U ? "512" : "0";
+            };
             check(hit.find("d1_prefill")->value == (expect_d1 ? "1" : "0"), "D1 matches the measured execution under FAST and TURBO");
-            check(hit.find("decoder_replay")->value == (expect_r256 ? "256" : "0"), "R256 rides on the D1 band in TURBO only");
+            check(hit.find("decoder_replay")->value == expect_replay(8128), "R512 rides on the D1 band in FAST and TURBO");
             // The pair CLI / serve request (row split, exact cone, head1, automatic MoE chunk) binds the same band rows.
             ds::PrefillOptions native;
             native.world = 2;
@@ -467,8 +471,8 @@ void test_d1_request_profile() {
             for (std::uint64_t prompt : {4096U, 8192U, 8193U, 32768U}) {
                 const auto cli = resolve(prompt, native);
                 check(cli.find("d1_prefill")->value == (expect_d1 ? "1" : "0") &&
-                          cli.find("decoder_replay")->value == (expect_r256 && prompt <= 8192U ? "256" : "0"),
-                      "CLI and serve requests in the 8K and 32K bands take D1 under FAST and TURBO, R256 only in TURBO <= 8,192");
+                          cli.find("decoder_replay")->value == expect_replay(prompt),
+                      "CLI and serve requests in the 8K and 32K bands take D1 under FAST and TURBO, R512 only <= 8,192");
             }
             for (std::uint64_t prompt : {4095U, 32769U})
                 check(resolve(prompt, native).find("d1_prefill")->value == "0" &&
@@ -551,10 +555,10 @@ void test_profile() {
               "IU4 is not a TURBO row (measured slower than FAST), even with --allow-pending");
         const auto* replay = turbo.profile->find("decoder_replay");
         check(replay && replay->value == "0" && replay->status == pr::Status::pending,
-              "TURBO startup leaves R256 to the request's band receipt (test_d1_request_profile)");
+              "TURBO startup leaves R512 to the request's band receipt (test_d1_request_profile)");
         const auto* fast_replay = f.profile->find("decoder_replay");
-        check(fast_replay && fast_replay->value == "0" && fast_replay->status == pr::Status::builtin,
-              "FAST never selects R256 (gate_r held-out re-score: FAST gate FAIL)");
+        check(fast_replay && fast_replay->value == "0" && fast_replay->status == pr::Status::pending,
+              "FAST startup leaves R512 to the request's band receipt (ds_replay held-out gate v2 PASS)");
         auto i4_world = w;
         i4_world.env["STRIX_DS41_FAST_I4"] = "1";
         for (const auto* profile : {"fast", "turbo"}) {

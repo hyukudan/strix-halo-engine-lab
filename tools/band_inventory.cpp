@@ -26,7 +26,7 @@ struct Binding {
 constexpr Binding bindings[] = {
     {"deepseek-v4.1-flash", "deepseek41-pair", "include/strix/deepseek41_pair_profile_table.hpp",
      strix::deepseek41::pair_defaults::ladder_rows, strix::deepseek41::pair_defaults::profile_table,
-     "HIP pair, known priced prefill; D1 over EXACT, R256 over D1 without replay"},
+     "HIP pair, known priced prefill; D1 over EXACT, R512 over D1 without replay"},
     {"glm-5.3-flash", "glm-pair", "include/strix/glm_pair_profile_table.hpp",
      strix::glm::rank_defaults::product_ladder_rows, strix::glm::rank_defaults::product_profile_table,
      "HIP USB4 pair ready, admitted 8192-row chunk; full or routed scratch"},
