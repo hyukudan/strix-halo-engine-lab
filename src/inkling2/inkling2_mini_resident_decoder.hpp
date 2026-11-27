@@ -624,7 +624,7 @@ public:
             select_lowbit_cohort(groups, lanes);
             // Head (mini_served_pass_screened): a one-pass cohort whose scores nobody reads picks through the lanes
             // form of the EXACT screened head; its score rows are recomputed on a read (pending_scores_ below).
-            screened = mini_served_pass_screened(verify_lanes_pick_, reads_scores,
+            screened = mini_served_pass_screened(served_lanes_pick_, reads_scores,
                                                  backend_.lowbit_applies(MiniAppendKind::decode, rows), rows, lanes,
                                                  screen_ ? screen_->max_lanes() : 0U);
             MiniResidentForward forward(backend_, workspace());
@@ -669,8 +669,7 @@ public:
             pending_scores_ = {hidden_.data(), lanes, logits_.data()};
             ++lanes_picks_;
             if (served_screened_passes_++ == 0U)
-                std::cerr << "Inkling HIP served cohort head screened lanes=" << lanes << '
-';
+                std::cerr << "Inkling HIP served cohort head screened lanes=" << lanes << '\n';
         }
         last_logit_rows_ = lanes;
     }
@@ -833,6 +832,10 @@ public:
         const bool effective = level != 0U && max_verify_rows() > 1U;
         const bool lanes_pick = effective && level >= 2U && admit_lanes_pick();
         verify_lanes_pick_ = lanes_pick;
+        // Served route (decode_slots_served): its cohort passes pick through the lanes form whenever the decoder has
+        // its BF16 screen (the HIP binding of the screened head, on unless STRIX_SCREENED_HEAD=0), as the CUDA cohort
+        // does; this lever (verify rows) governs verify windows only.
+        served_lanes_pick_ = served_cli_route_ && (lanes_pick || admit_lanes_pick());
 #else
         static_cast<void>(level);
         const bool effective = false;
@@ -1675,6 +1678,7 @@ private:
     bool window_programs_{false};  // set_window_programs: the owner decides (the CUDA CLI: on for the EXACT levers)
 #endif
 #if defined(__HIPCC__)
+    bool served_lanes_pick_{false};  // served cohort passes may pick through the lanes screen (set_verify_rows)
     bool verify_lanes_pick_{false};  // verify rows level 2 admitted (set_verify_rows): lanes screened picks
 #endif
     bool screened_graph_{false};

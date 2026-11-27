@@ -73,8 +73,8 @@ constexpr bool mini_served_pass_lanes(bool selected, unsigned rows, bool host_ta
 }
 
 // Head of a served cohort pass (HIP, decode_slots_served): the pass picks through the lanes form of the EXACT screened
-// head (one plane read for its lanes, each lane with the token and status of its one-row pick) when the verify rows
-// lever admitted the lanes pick (`lanes_pick`), nothing reads the cohort's scores, the pass keeps the decode weights
+// head (one plane read for its lanes, each lane with the token and status of its one-row pick) when the decoder sized
+// its screen for lanes (`lanes_pick`: the screened head's HIP binding), nothing reads the cohort's scores, the pass keeps the decode weights
 // (`lowbit` off), the whole cohort is this one pass (the skipped score rows are recomputed on a read from hidden_, which
 // keeps only the last pass's head inputs) and the screen holds its rows. Otherwise the pitched rows head.
 constexpr bool mini_served_pass_screened(bool lanes_pick, bool reads_scores, bool lowbit, unsigned rows, unsigned lanes,
