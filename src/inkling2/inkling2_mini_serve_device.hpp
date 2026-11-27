@@ -206,9 +206,9 @@ inline MiniServeCohort make_mini_device_cohort(
     speculation.admitted = windows;
     std::cerr << mini_speculation_line(speculation, opt.verify_rows) << '\n';
     if (windows) std::cerr << spec::drafter_receipt("served", {{}, spec::DrafterSource::context, {}}) << '\n';
-    // CUDA, either prompt route: the shared long pieces beside decoding lanes, cut by the CUDA rule
-    // (mini_prefill_piece_rule); HIP keeps the short ones.
-    const auto pieces = !kServeHip ? kMiniCudaServePieces : serve::kMixedServiceShortPieces;
+    // Prompt pieces beside decoding lanes (mini_serve_pieces): the shared long pieces where the admitted route cuts
+    // prompt rows (CUDA either route, HIP the command line's route), the short ones on the HIP held-back route.
+    const auto pieces = mini_serve_pieces(kServeHip, served_route);
     return {std::move(cohort), weights, std::move(projected_bias_dispatches), chunk_rows, pieces, served_route};
 }
 

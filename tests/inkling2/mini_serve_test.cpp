@@ -706,6 +706,17 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                             wide.prompt_slice_decoding == (chunk > 1024U ? 1024U : 0U),
                         "lever on, CUDA: 32-row cut rule and the 1024-row pieces");
                 sv::validate_prompt_pieces(wide, rule, chunk);
+            } else {
+                // HIP: the command line's route takes the shared long pieces too (mini_serve_pieces), cut at the wave
+                // tile above the key-split bound, one decode round per piece.
+                const auto pieces = mini::mini_serve_pieces(true, true);
+                const auto wide = mini::mini_serve_scheduling(chunk, rule, pieces);
+                require(pieces.piece_rows == 1024U && pieces.prompt_share == 0.0 &&
+                            mini::mini_serve_pieces(true, false).piece_rows == 128U &&
+                            wide.prompt_slice_decoding == (chunk > 1024U ? 1024U : 0U) &&
+                            wide.prompt_share == (chunk > 1024U ? 0.0 : 1.0),
+                        "lever on, HIP: the 1024-row pieces on the command line's route, 128 rows held-back");
+                sv::validate_prompt_pieces(wide, rule, chunk);
             }
         }
         // The served tier is the registry preset's native column for the requested --profile (models/inkling2-mini.toml:

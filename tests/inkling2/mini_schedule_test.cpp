@@ -210,6 +210,9 @@ int served_prefill_gate() {
                                                             mini_served_prefill_fallback_rows(true, Name::standard));
     static_assert(hip_route.count == 2U && hip_route.rows[0] == 8192U && hip_route.rows[1] == kMiniServedHeldBackChunk);
     static_assert(hip_held_back.count == 1U && hip_held_back.rows[0] == kMiniServedHeldBackChunk);
+    // Prompt pieces beside decoding lanes: long wherever the route cuts prompt rows, short on the HIP held-back route.
+    static_assert(mini_serve_pieces(true, true).piece_rows == 1024U && mini_serve_pieces(false, true).piece_rows == 1024U &&
+                  mini_serve_pieces(false, false).piece_rows == 1024U && mini_serve_pieces(true, false).piece_rows == 128U);
     static_assert(mini_prefill_tail_capacity(8192U, 8U, 8192U) == 0U && mini_prefill_tail_capacity(8192U, 8U, 9000U) == 808U);
     static_assert(mini_call_first_chunk(8193U, 8192U, 0U) == 8192U && mini_call_first_chunk(8209U, 8192U, 17U) == 8209U);
     return failed;

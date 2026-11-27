@@ -128,7 +128,7 @@ struct MiniServeCohort {
     // The prompt chunk the load admitted (serve::load_with_chunk_ladder; 0 = MiniServeOptions::prefill_rows): the
     // cohort's prompt slice.
     unsigned prefill_rows = 0;
-    // Prompt pieces beside decoding lanes (shared mixed-service data): the CUDA held-back route's long pieces.
+    // Prompt pieces beside decoding lanes (shared mixed-service data, mini_serve_pieces).
     serve::MixedServicePieces mixed_service = serve::kMixedServiceShortPieces;
     // The served route lever as the load admitted it: the chunk ladder's first candidate runs the command line's route,
     // a smaller candidate (slot capacity) the held-back route.
