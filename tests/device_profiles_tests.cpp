@@ -80,6 +80,9 @@ void catalogue() {
         require(profile && profile->unmeasured, n);
         require(profile->memory_bytes == 0 && profile->memory_gbytes_ps == 0 && profile->lowbit_rows.small_rows == 0,
                 "unmeasured catalogue row cannot carry a memory cap, bandwidth or schedule");
+        require(profile->peaks.fp32 == 0.0 && profile->peaks.fp16 == 0.0 && profile->peaks.bf16 == 0.0 &&
+                    profile->peaks.fp8 == 0.0 && profile->peaks.fp4 == 0.0 && profile->peaks.int8 == 0.0,
+                "unmeasured catalogue row cannot carry peak arithmetic rates");
     }
     for (const auto& p : device::catalogue())
         if (p.name != "custom" && !p.unmeasured)
