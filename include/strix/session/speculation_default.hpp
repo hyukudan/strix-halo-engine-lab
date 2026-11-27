@@ -41,6 +41,14 @@ inline constexpr const char* speculation_environment = "STRIX_MTP";
 inline bool speculation_opt_out_argument(std::string_view argument) {
     return argument == speculation_opt_out_flag;
 }
+// Options the launchers add to every production command (the tier, the KV storage) and the prompt source: they
+// choose levers and inputs, never a decode route, so an engine's "plain production command" test must not count them.
+inline bool speculation_neutral_value_option(std::string_view argument) {
+    return argument == "--profile" || argument == "--kv" || argument == "--prompt-ids";
+}
+inline bool speculation_neutral_inline_option(std::string_view argument) {
+    return argument.starts_with("--profile=") || argument.starts_with("--kv=");
+}
 inline bool speculation_environment_off(const char* value) {
     const std::string_view text = value ? value : "";
     return text == "0" || text == "off";

@@ -223,6 +223,16 @@ int main(int argc,char** argv) try {
         std::string text;
         require(!capture(plain,text).mtp.enabled && text.find("no registry drafter beside the model")!=std::string::npos,
             "no sidecar: one fallback notice naming the registry layout");
+        {
+            // An explicit --http-batch without a drafter names the reason, not only the missing windows.
+            auto no_drafter=plain;no_drafter.erase(no_drafter.end()-2,no_drafter.end());
+            no_drafter.insert(no_drafter.end(),{"--generate","64","--http-batch","8","--http-serve"});
+            std::string reason;
+            try {(void)capture(no_drafter,text);} catch(const std::exception& error) {reason=error.what();}
+            require(reason.find("--http-batch: missing prefix windows")!=std::string::npos &&
+                reason.find("the MTP default was not selected: assets-missing")!=std::string::npos,
+                "served command without a drafter names why MTP was not selected");
+        }
         write(base_file,"short");
         require(!capture(plain,text).mtp.enabled && text.find("expects 2786568256")!=std::string::npos,"wrong size is not taken and is named");
         std::filesystem::resize_file(base_file,2786568256ULL);
@@ -256,6 +266,36 @@ int main(int argc,char** argv) try {
         }
         // The same arguments again print nothing new (a server prepares and launches from one command line).
         require(capture(plain,text).mtp.enabled && text.empty(),"each drafter line prints once per process");
+        {
+            // The launchers (strix run / strix-serve) hand the engine MODEL --prompt-ids FILE --generate N plus the tier
+            // (--profile) and the KV storage (--kv): none of them owns a route, so the documented MTP default stays.
+            std::string ids;
+            for(int token=1;token<=40;++token)ids+=std::to_string(token)+(token%8?" ":"\n");
+            const auto ids_file=model_dir/"prompt.ids";write(ids_file,ids);
+            const auto few_file=model_dir/"few.ids";write(few_file,"1 2 3 4 5\n");
+            for(const std::string tier:{"exact","fast","turbo"}) {
+                const std::vector<std::string> launched{"decode",pmodel.string(),"--prompt-ids",ids_file.string(),"--generate","128",
+                    "--profile",tier,"--kv","bf16"};
+                const auto run=capture(launched,text);
+                require(run.mtp.enabled && run.mtp.runtime_automatic && run.mtp.window_prefix && run.mtp.draft_chain,
+                    "launcher CLI command (prompt file, tier, KV) keeps the MTP default for a tier");
+                auto inline_form=launched;inline_form[6]="--profile="+tier;inline_form.erase(inline_form.begin()+7);
+                inline_form[7]="--kv=bf16";inline_form.pop_back();
+                require(capture(inline_form,text).mtp.enabled,"inline --profile=/--kv= spelling keeps the MTP default for a tier");
+            }
+            const std::vector<std::string> short_prompt{"decode",pmodel.string(),"--prompt-ids",few_file.string(),"--generate","128","--profile","fast"};
+            require(!capture(short_prompt,text).mtp.enabled,"a prompt file under 17 ids keeps plain decode");
+            const std::vector<std::string> owned{"decode",pmodel.string(),"--prompt-ids",ids_file.string(),"--generate","128","--profile","fast",
+                "--gpu-greedy-token"};
+            require(!capture(owned,text).mtp.enabled,"a route option next to the tier still owns the route");
+            // README serving quick start: calibration prompt file, --http-batch 8, tier and KV from the launcher.
+            const std::vector<std::string> served_launch{"strix-serve",pmodel.string(),"--prompt-ids",ids_file.string(),"--generate","64",
+                "--http-batch","8","--profile","fast","--kv","bf16","--http-serve"};
+            const auto served_run=capture(served_launch,text);
+            require(served_run.http_serve && served_run.mtp.enabled && served_run.mtp.window_prefix && served_run.mtp.draft_chain &&
+                served_run.mtp.window_rows_set==std::vector<std::uint32_t>{2U,4U,8U} && served_run.http_batch_explicit,
+                "served quick start resolves tiled MTP serving (prefix windows, draft chain, rows 2,4,8)");
+        }
         std::filesystem::create_directories(model_dir/"draft-vocab");
         require(defer(plain).mtp.draft_vocab.find((model_dir/"draft-vocab").string())!=std::string::npos,"draft-vocab beside the model is used");
         // The recommended drafter wins when two exist; a logical-name copy beside the model is found too.

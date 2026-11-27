@@ -1276,6 +1276,9 @@ inline void validate_release_manifest(const Options& o) {
         throw std::invalid_argument(release_manifest_mode_error);
 }
 
+// Why the shared speculation default did not select MTP for the command being parsed ("" when it did): the
+// batched HTTP route names it, because the missing windows/draft chain it reports are the MTP bundle's options.
+inline std::string& speculation_default_note() { thread_local std::string note; return note; }
 // Resolve compatibility before route-dependent validation. A cap never enables missing prerequisites.
 inline std::string http_batch_incompatibility(const Options& o) {
     if (o.rtx_state_import) return "single-only state import";
@@ -1291,7 +1294,12 @@ inline void resolve_http_route(Options& o) {
         o.http_batch = 0;
         o.http_slot_reason = "explicit single route";
     } else if (!o.http_slot_reason.empty()) {
-        if (o.http_batch_explicit) throw std::invalid_argument("--http-batch: " + o.http_slot_reason);
+        if (o.http_batch_explicit) {
+            const auto& note = speculation_default_note();
+            throw std::invalid_argument("--http-batch: " + o.http_slot_reason +
+                (note.empty() || o.mtp.enabled ? std::string{} : " (the MTP default was not selected: " + note +
+                 "; the served command needs the drafter beside the model and a calibration prompt of at least 17 ids)"));
+        }
         o.http_batch = 0;
     } else {
         o.http_batch = o.http_batch_cap ? o.http_batch_cap : 1U;
@@ -2193,6 +2201,7 @@ inline Options parse_options(
         // The plain production command: MODEL, prompt tokens, a generation budget and nothing that owns a route.
         bool no_mtp=false, plain=true, value_next=false, http_serve=false, prompt_ids_file=false, leading=true;
         std::size_t prompt_tokens=0, leading_tokens=0;
+        std::string prompt_ids_path;
         std::uint64_t generate=0;
         for (int i=0;i<argc;++i) {
             const std::string arg=argv[i];
@@ -2201,13 +2210,18 @@ inline Options parse_options(
                 if (value_next) {
                     value_next=false;
                     if (argv[i-1]==std::string_view("--generate")) generate=std::strtoull(arg.c_str(),nullptr,10);
-                } else if (arg=="--generate" || arg=="--context") value_next=true;
+                    else if (argv[i-1]==std::string_view("--prompt-ids")) prompt_ids_path=arg;
+                } else if (arg=="--generate" || arg=="--context" || strix::session::speculation_neutral_value_option(arg)) {
+                    value_next=true;
+                    if (arg!="--generate" && arg!="--context") leading=false;
+                    prompt_ids_file |= arg=="--prompt-ids";
+                }
                 else if (arg.starts_with("--generate=")) generate=std::strtoull(arg.c_str()+11,nullptr,10);
                 else if (arg.starts_with("--")) {
                     leading=false;
                     http_serve |= arg=="--http-serve";
-                    prompt_ids_file |= arg=="--prompt-ids";
                     plain &= arg.starts_with("--context=") || arg=="--unqualified-context" ||
+                        strix::session::speculation_neutral_inline_option(arg) ||
                         arg=="--print-effective-config" || arg=="--mtp-bundle" || arg.starts_with("--mtp-bundle=");
                 } else {
                     ++prompt_tokens;
@@ -2228,6 +2242,13 @@ inline Options parse_options(
             if (arg=="--rope-yarn" && i+1<argc) yarn=std::string_view(argv[i+1])!="off";
             if (arg.starts_with("--rope-yarn=")) yarn=arg.substr(12)!="off";
             expanded.push_back(arg);
+        }
+        // A prompt read from --prompt-ids FILE counts like positional ids (the route needs 17); the full file is
+        // validated later by the option parser.
+        if (!prompt_ids_path.empty()) {
+            std::ifstream ids(prompt_ids_path);
+            std::string word;
+            while (prompt_tokens<17U && ids>>word) ++prompt_tokens;
         }
         yarn &= !baseline;
         if (!bundle.empty() && explicit_mtp) throw std::invalid_argument("explicit MTP flags and bundle are mutually exclusive");
@@ -2289,6 +2310,8 @@ inline Options parse_options(
                 }
             }
         }
+        speculation_default_note()=decision.enabled ? std::string{} : std::string(decision.source);
+        if (decision.source=="assets-missing") speculation_default_note()+=": "+fallback_detail;
         if (!yarn && !yarn_bundle_serial_retry && decision.report_fallback) {
             if (!profile_drafter && !bundle_json_present) {
                 fallback_detail+=" and no registry drafter beside the model (MTP/"+std::string(mtp_draft_profiles[0].logical_name)+")";
