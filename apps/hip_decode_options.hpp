@@ -2177,9 +2177,10 @@ inline std::string qwen_ladder_execution(const Options& o, std::uint64_t prompt_
 }
 // The profile of one prefill of `prompt_tokens`: the CLI prompt, or one HTTP request's prompt (same code, same
 // regime: phase, prompt length as context, one lane, device class, execution key).
-inline strix::qwen::profile::Resolution resolve_request_product_profile(Options& o, std::uint64_t prompt_tokens) {
+inline strix::qwen::profile::Resolution resolve_request_product_profile(const Options& o, std::uint64_t prompt_tokens) {
     const std::string execution = qwen_ladder_execution(o, prompt_tokens);
     auto inputs = o.product_profile_inputs;
+    if (prompt_tokens != 0) inputs.max_prompt_tokens = prompt_tokens;
     inputs.regime = strix::profile::Regime{strix::profile::Phase::prefill, prompt_tokens, 1, o.profile_device_class, execution};
     return strix::qwen::profile::resolve_requested(o.product_profile_requested, inputs);
 }

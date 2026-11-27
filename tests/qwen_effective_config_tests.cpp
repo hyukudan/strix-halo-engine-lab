@@ -650,11 +650,11 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
     {
         // Compare the profile consumed by the entry point, including the entire stable lever receipt.
         // Match an explicit off switch on both arms because the server cannot apply band-scoped env per request.
-        const auto resolved_profile = [](std::vector<std::string> words) {
+        const auto parsed_options = [](std::vector<std::string> words) {
             std::vector<char*> pointers;
             for (auto& word : words) pointers.push_back(word.data());
             return parse_options(static_cast<int>(pointers.size()), pointers.data(), false, {}, DecodeAssets::defer,
-                                 "gfx1151").product_profile;
+                                 "gfx1151");
         };
         for (const auto* tier : {"exact", "fast", "turbo"}) {
             // The server arm is this function's serving command line (a server needs its tiled MTP route); the rank
@@ -670,8 +670,10 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
             std::erase(cli_words, std::string("--http-serve"));
             if (const auto batch = std::find(cli_words.begin(), cli_words.end(), "--http-batch"); batch != cli_words.end())
                 cli_words.erase(batch, batch + 2);
-            const auto cli = resolved_profile(std::move(cli_words));
-            const auto serve = resolved_profile(std::move(request_words));
+            auto cli_options = parsed_options(std::move(cli_words));
+            auto serve_options = parsed_options(std::move(request_words));
+            const auto& cli = cli_options.product_profile;
+            const auto& serve = serve_options.product_profile;
             const auto* route = cli.find("moe_route_prune");
             expect(route && route->value == "off", "Qwen HIP: explicit route off reaches the resolver");
             // The ladder text names the regime it was read for: the command line's prompt length, while a server
@@ -688,6 +690,20 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
             if (cli_json != serve_json)
                 std::cerr << "Qwen HIP " << tier << " CLI profile: " << cli_json << "\nserver profile: " << serve_json << '\n';
             expect(cli_json == serve_json, "Qwen HIP: rank and serve apply the same explicit route and receipt");
+            // Resolve both parsed entry points with the same request facts, independently
+            // of the process's startup prefill allocation or HTTP concurrency.
+            for (auto* options : {&cli_options, &serve_options}) {
+                options->profile_device_product = "gfx1151-fixture";
+                options->context_tokens = 32768;
+                options->known_prefix_prefill_rows = 4096;
+                options->generate_tokens = 64;
+            }
+            for (const auto prompt : {4096U, 8192U, 8193U, 32768U}) {
+                const auto cli_request = resolve_request_product_profile(cli_options, prompt);
+                const auto http_request = resolve_request_product_profile(serve_options, prompt);
+                expect(cli_request.json() == http_request.json(),
+                       "Qwen HIP matched request facts produce the full same profile receipt");
+            }
         }
     }
     {

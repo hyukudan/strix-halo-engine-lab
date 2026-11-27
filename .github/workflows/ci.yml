@@ -81,6 +81,9 @@ jobs:
         run: |
           python3 -B tools/ci/check_tier_monotonicity.py --base HEAD^1
           python3 -B tools/ci/test_check_tier_monotonicity.py
+      - name: CLI and HTTP capture comparison
+        run: python3 -B tools/qualification/test_verify_profile_parity.py
+
       - name: Profile receipts
         run: python3 -B tools/ci/check_profile_receipts.py
 
