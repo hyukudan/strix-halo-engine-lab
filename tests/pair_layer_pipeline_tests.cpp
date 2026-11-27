@@ -238,6 +238,91 @@ std::vector<Result> run_chain(const Weights& m, const std::vector<std::uint32_t>
     return out;
 }
 
+// Two-stage prefill handed to a decode that runs on EVERY rank (share_state) with the head's per-window rows returned to
+// stage 0 (return_rows): each rank then decodes alone with the whole model; ids, logits bytes and the returned rows must
+// equal one rank's.
+struct Shared {
+    Result res[2];
+    std::vector<float> head_rows, first_rows;   // the final rows of every window: computed on the head, received on stage 0
+    std::uint64_t state_bytes[2]{}, tail_bytes[2]{};
+};
+Shared run_share(const Weights& m, const std::vector<std::uint32_t>& prompt, unsigned width, unsigned gen, std::uint32_t cut) {
+    Shared out;
+    const std::vector<std::uint32_t> cuts{0, cut, m.layers};
+    Channel link;
+    const auto wins = layers::windows(prompt.size(), width);
+    const auto count = wins.size();
+    const std::size_t row_bytes = H * 4U;
+    std::vector<std::thread> threads;
+    for (unsigned s = 0; s < 2U; ++s)
+        threads.emplace_back([&, s] {
+            try {
+                layers::Placement p{cuts, s};
+                Toy t(m, 0, m.layers, width);   // TP-style: every rank holds the whole model
+                t.stage_end = cuts[s + 1U];
+                PipeOptions po;
+                po.validate = layers::validator(1U, count, cut, width, row_bytes);
+                std::unique_ptr<Pipe> pipe;
+                if (s == 1U)
+                    pipe = std::make_unique<Pipe>(1U, count, [&](std::span<const std::byte> b) { link.send(1, b); },
+                        [&](std::span<std::byte> b) { link.receive(0, b); }, [&] { link.close(); }, po);
+                else
+                    pipe = std::make_unique<Pipe>(0U, count, [&](std::span<const std::byte> b) { link.send(0, b); },
+                        [&](std::span<std::byte> b) { link.receive(1, b); }, [&] { link.close(); }, po);
+                std::vector<float> rows;   // head: the final rows of each window, in order
+                layers::StageOps ops;
+                ops.row_bytes = row_bytes;
+                ops.forward = [&](std::span<const std::uint32_t> tok, const layers::Window& w, bool head) {
+                    t.range(p.first(), p.last(), tok.data(), w.rows, head);
+                    if (p.head()) rows.insert(rows.end(), t.x.begin(), t.x.begin() + std::ptrdiff_t(w.rows * H));
+                };
+                ops.seam = [&](PipeFrame& f, bool save, std::size_t bytes) {
+                    if (save) std::memcpy(f.payload.data(), t.x.data(), bytes); else std::memcpy(t.x.data(), f.payload.data(), bytes); };
+                ops.fence = [] {};
+                (void)layers::prefill(p, prompt, width, 1U, p.embeds() ? nullptr : pipe.get(), p.head() ? nullptr : pipe.get(), ops);
+                pipe.reset();
+                layers::Link up, down;
+                if (s == 1U) { up.send = [&](std::span<const std::byte> b) { link.send(1, b); }; up.receive = [&](std::span<std::byte> b) { link.receive(0, b); }; }
+                else { down.send = [&](std::span<const std::byte> b) { link.send(0, b); }; down.receive = [&](std::span<std::byte> b) { link.receive(1, b); }; }
+                const std::uint32_t first = p.head() ? t.top() : 0U;
+                layers::RelayOps r;
+                r.save = [&](std::uint32_t layer) { return t.save(layer, layer + 1U); };
+                r.load = [&](std::uint32_t layer, std::span<const std::byte> b) { t.load(layer, layer + 1U, b); };
+                const auto rs = layers::share_state(p, first, s ? &up : nullptr, s ? nullptr : &down, r);
+                out.state_bytes[s] = rs.bytes;
+                layers::TailOps tail;
+                tail.row_bytes = row_bytes;
+                tail.save = [&](std::uint32_t w, std::span<std::byte> b) {
+                    std::size_t at = 0;
+                    for (std::uint32_t i = 0; i < w; ++i) at += std::size_t(wins[i].rows) * H;
+                    std::memcpy(b.data(), &rows[at], b.size());
+                };
+                std::vector<float> got;
+                tail.load = [&](std::uint32_t, const layers::Window&, std::span<const std::byte> b) {
+                    const auto n = got.size(); got.resize(n + b.size() / 4U); std::memcpy(&got[n], b.data(), b.size()); };
+                out.tail_bytes[s] = layers::return_rows(p, prompt.size(), width, s ? &up : nullptr, s ? nullptr : &down, tail);
+                if (s == 0U) out.first_rows = got; else out.head_rows = rows;
+                // decode alone on the whole model (no links)
+                t.stage_end = m.layers;
+                layers::Placement dp{{0U, m.layers}, 0U};
+                layers::DecodeOps d;
+                d.row_bytes = row_bytes;
+                d.forward = [&](std::uint32_t tok, bool head) { t.range(0, m.layers, &tok, 1U, head); };
+                d.top = [&] { return t.top(); };
+                d.export_row = [&](std::span<std::byte> b) { std::memcpy(b.data(), t.x.data(), row_bytes); };
+                d.import_row = [&](std::span<const std::byte> b) { std::memcpy(t.x.data(), b.data(), row_bytes); };
+                const auto st = layers::decode(dp, rs.token, gen, nullptr, nullptr, d);
+                out.res[s].ids = st.ids;
+                out.res[s].dec_logits = t.logits;
+            } catch (const std::exception& e) {
+                out.res[s].error = e.what();
+                link.close();
+            }
+        });
+    for (auto& t : threads) t.join();
+    return out;
+}
+
 std::string text(const std::vector<std::uint32_t>& cuts) {
     std::string s;
     for (auto c : cuts) s += (s.empty() ? "" : ",") + std::to_string(c);
@@ -285,6 +370,25 @@ int main() {
             ++relayed;
         }
     }
+    // two-stage prefill shared with a decode on every rank: both ranks' ids / decode logits equal one rank; the head's
+    // per-window rows reach stage 0 byte for byte; the state moved is every layer once per direction
+    unsigned shared = 0;
+    for (std::uint32_t k = 1; k < 7; ++k) {
+        const auto r = run_share(m, prompt, width, gen, k);
+        const std::string tag = "share cut " + std::to_string(k);
+        for (unsigned s = 0; s < 2U; ++s) {
+            expect(r.res[s].error.empty(), tag + " stage " + std::to_string(s) + " error: " + r.res[s].error);
+            expect(r.res[s].ids == ref.ids, tag + " stage " + std::to_string(s) + " ids differ from one rank");
+            expect(r.res[s].dec_logits.size() == ref.dec_logits.size() &&
+                   std::memcmp(r.res[s].dec_logits.data(), ref.dec_logits.data(), ref.dec_logits.size() * 4U) == 0,
+                   tag + " stage " + std::to_string(s) + " decode logits bytes differ from one rank");
+        }
+        expect(r.state_bytes[0] == 7U * H * 8U && r.state_bytes[1] == 7U * H * 8U,
+               tag + " state bytes: every layer once per rank (sent own + received peer's)");
+        expect(r.head_rows.size() == prompt.size() * H && r.first_rows == r.head_rows, tag + " returned rows differ from the head's");
+        expect(r.tail_bytes[0] == prompt.size() * H * 4U && r.tail_bytes[1] == r.tail_bytes[0], tag + " tail bytes");
+        ++shared;
+    }
     // pipelined speculation on the first stage: every guess policy gives the one-rank ids and decode logits bytes;
     // the stage-0 counters match the policy; a rewind that keeps the guessed state is detected.
     const unsigned sgen = 12;
@@ -326,7 +430,8 @@ int main() {
     expect(threw, "non-increasing cuts refused");
     if (failures) { std::fprintf(stderr, "%d failure(s)\n", failures); return 1; }
     std::printf("PASS: layer pipeline over N ranks (%u plans, N=1..4, ids and logits bytes equal to one rank; "
-                "%u relayed decodes equal; %u pipelined-speculation runs equal, negative control detected)\n",
-                checked, relayed, spec_checked);
+                "%u relayed decodes equal; %u shared-state decodes + tail rows equal; %u pipelined-speculation runs equal, "
+                "negative control detected)\n",
+                checked, relayed, shared, spec_checked);
     return 0;
 }

@@ -381,6 +381,72 @@ inline RelayStats relay_state(const Placement& p, std::uint32_t decoder, std::ui
     return out;
 }
 
+// End-of-prefill hand-off of a layer-split prefill to a decode that runs on EVERY rank (tensor-parallel decode: each rank
+// holds the whole model and the whole sequence state). Every stage is the decoder once, in stage order, over the same
+// per-layer messages as relay_state(): afterwards every rank holds the state of every layer, bit for bit what a whole
+// prefill on that rank leaves (the layer ranges run the same launches as the whole range, so the state bytes are equal).
+// The first token (known on the head stage) reaches the other stages with the relay to them. One round per stage, so the
+// two directions of a link do not overlap: the wall is the sum of the rounds.
+inline RelayStats share_state(const Placement& p, std::uint32_t first_token, const Link* up, const Link* down,
+                              const RelayOps& ops) {
+    RelayStats total;
+    total.token = first_token;
+    for (std::uint32_t decoder = 0; decoder < p.stages(); ++decoder) {
+        const auto round = relay_state(p, decoder, first_token, up, down, ops);
+        total.bytes += round.bytes;
+        total.messages += round.messages;
+        total.ms += round.ms;
+        if (p.stage == decoder) total.token = round.token;
+    }
+    return total;
+}
+
+// Per-window rows from the head stage back to the first stage after a two-stage prefill (the rows only the head computes:
+// the final trunk hidden that a speculation drafter reads on every rank). One message per window, in window order:
+// {tail_magic, window, rows, bytes, checksum} + bytes. `save` fills the head's rows of one window (its own record of them),
+// `load` hands them to the first stage. Two stages only; returns the bytes moved on this rank.
+inline constexpr std::uint64_t tail_magic = 0x314c494154594c53ULL;  // "SLYTAIL1"
+struct TailOps {
+    std::size_t row_bytes = 0;
+    std::function<void(std::uint32_t window, std::span<std::byte> out)> save;                   // head stage
+    std::function<void(std::uint32_t window, const Window&, std::span<const std::byte>)> load;  // first stage
+    std::function<std::uint32_t(std::span<const std::byte>)> checksum;                          // empty: SeamCrc
+};
+inline std::uint64_t return_rows(const Placement& p, std::size_t prompt_tokens, std::uint32_t width, const Link* up,
+                                 const Link* down, const TailOps& ops) {
+    p.check();
+    if (p.stages() != 2U) throw std::invalid_argument("tail rows: two stages only");
+    if (ops.row_bytes == 0) throw std::invalid_argument("tail rows: row_bytes unset");
+    const auto check_sum = [&](std::span<const std::byte> b) {
+        if (ops.checksum) return ops.checksum(b);
+        SeamCrc crc; crc.update(b); return crc.value();
+    };
+    const auto ws = windows(prompt_tokens, width);
+    std::uint64_t moved = 0;
+    std::vector<std::byte> bytes;
+    for (std::uint32_t w = 0; w < ws.size(); ++w) {
+        bytes.resize(std::size_t(ws[w].rows) * ops.row_bytes);
+        std::uint64_t words[5]{};
+        if (p.head()) {
+            if (!up) throw std::invalid_argument("tail rows: the head stage needs its upstream link");
+            ops.save(w, bytes);
+            words[0] = tail_magic; words[1] = w; words[2] = ws[w].rows; words[3] = bytes.size(); words[4] = check_sum(bytes);
+            up->send(std::as_bytes(std::span(words)));
+            up->send(bytes);
+        } else {
+            if (!down) throw std::invalid_argument("tail rows: the first stage needs its downstream link");
+            down->receive(std::as_writable_bytes(std::span(words)));
+            if (words[0] != tail_magic || words[1] != w || words[2] != ws[w].rows || words[3] != bytes.size())
+                throw std::runtime_error("tail rows: message does not match the window");
+            down->receive(bytes);
+            if (check_sum(bytes) != words[4]) throw std::runtime_error("tail rows: checksum mismatch");
+            ops.load(w, ws[w], bytes);
+        }
+        moved += bytes.size();
+    }
+    return moved;
+}
+
 // Interleaved virtual stages on two ranks (strix/pair/stage_map.hpp): the 2v stages of a StageMap alternate between the
 // ranks (stage s on rank s % 2) and every layer's sequence state stays with the rank that owns its stage, in prefill AND
 // decode. Each rank runs its (stage, chunk) steps in the shared StagePipes order (groups of chunks, depth-first); every
