@@ -20,6 +20,7 @@ constexpr auto kCompression = narrow<unsigned>(a::compress_ratios[0]);
 constexpr auto kIndexDim = narrow<unsigned>(a::indexer::index_head_dim);
 constexpr auto kIndexHeads = narrow<unsigned>(a::indexer::index_n_heads);
 constexpr auto kTopK = narrow<unsigned>(a::indexer::index_topk);
+constexpr auto kOutputFp8Block = narrow<unsigned>(data::weights::checkpoint::weight_block_size[1]);
 constexpr auto kPackedIndex = kIndexDim / 2U + kIndexDim / 32U;
 constexpr attn::HybridYarn kYarn{static_cast<double>(a::rope_scaling::original_max_position_embeddings),
     a::rope_scaling::factor, a::rope_scaling::beta_fast, a::rope_scaling::beta_slow};
@@ -83,6 +84,9 @@ std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
     const auto width = s.head_dim;
     const auto eps = s.contracts.rms_epsilon > 0 ? s.contracts.rms_epsilon : kEpsilon;
     const bool checkpoint = s.contracts.checkpoint_attention;
+    const auto packed_block = s.contracts.hca_fp8_epilogue ? kOutputFp8Block : 0U;
+    if (packed_block != 0 && (!checkpoint || width % packed_block != 0 || s.o_rank % packed_block != 0))
+        throw std::invalid_argument("ERNIE HCA: packed FP8 epilogue requires checkpoint stores and aligned rows");
     const bool separate_values = !checkpoint && s.contracts.key_norm == KeyNormContract::value_before_head_norm;
     const attn_core::CompressedMqaStep step{position, width, kWindow, record_history, keep_compressor,
                                           checkpoint, separate_values, checkpoint};
@@ -127,14 +131,12 @@ std::vector<float> hca_reference(const LayerWeights& w, const ReferenceShape& s,
     if (checkpoint) core::round_bf16_reference(heads);
     else if (!s.contracts.no_hca_inverse_rope) window_rope.apply(heads, width, true);
     postmix(w, s, heads, folded_mix);
-    if (checkpoint) {
-        window_rope.apply(heads, width, true);
-        core::round_bf16_reference(heads);
-    }
+    if (checkpoint) attn_core::compressed_mqa_output_input_reference(heads, width, window_rope, packed_block);
     std::vector<float> grouped(std::size_t{s.o_groups} * s.o_rank);
     w.linear("linear_o_group_proj", heads, grouped, s.o_groups);
     std::vector<float> output(s.hidden);
     gate_values(w, q_lora, grouped, checkpoint);
+    if (packed_block != 0) core::round_block_fp8_activation_reference(grouped, packed_block);
     w.linear("o_proj.weight", grouped, output);
     attn_core::commit_compressed_mqa_history<kCompression>(step, operands, state);
     return output;

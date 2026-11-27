@@ -4,9 +4,18 @@
 #include "attn_core/reference_cache.hpp"
 #include "attn_core/rotary_reference.hpp"
 #include "core/bf16_reference.hpp"
+#include "core/block_fp8_activation_reference.hpp"
 #include "strix/attn/reference_history.hpp"
 
 namespace strix::attn_core {
+
+// After the fold, preserve the FP32 values through the inverse rotation.
+inline void compressed_mqa_output_input_reference(std::span<float> heads, unsigned width,
+    const RotaryReferenceRow& rotary, unsigned fp8_columns) {
+    rotary.apply(heads, width, true);
+    if (fp8_columns != 0) core::round_block_fp8_activation_reference(heads, fp8_columns);
+    else core::round_bf16_reference(heads);
+}
 
 struct CompressedMqaStep {
     unsigned position, width, window;

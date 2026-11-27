@@ -1,6 +1,6 @@
 #include "strix/ernie/attention.hpp"
 
-#include "attn_core/hybrid_reference.hpp"
+#include "attn_core/compressed_history_reference.hpp"
 #include "attn_core/selected_latent_reference.hpp"
 #include "attn_core/sparse_index_reference.hpp"
 #include "attn_core/value_head_mix_reference.hpp"
@@ -113,6 +113,68 @@ void hca_carry() {
     output = ernie::attention_reference(0, s, read, rest, weighted, project);
     check(output[0] == 0.00384521484375F, "checkpoint HCA reuses the committed compressed KV value");
 
+}
+
+void packed_hca_binding() {
+    ernie::ReferenceShape shape{};
+    shape.hidden = 1;
+    shape.head_dim = 128;
+    shape.o_rank = 512;
+    shape.heads = shape.q_rank = shape.o_groups = shape.vha_rank = 1;
+    shape.contracts.checkpoint_attention = true;
+    const auto read = [](std::string_view name, std::span<float> values, std::size_t) {
+        std::ranges::fill(values, name.ends_with("norm.weight") ? 1.0F : 0.0F);
+        if (name.ends_with("kv_layernorm.weight")) values.front() = 1.0625F;
+    };
+    float grouped_input = 0.0F;
+    const auto project = [&](const std::string& name, std::span<const float> input, std::span<float> output, unsigned) {
+        if (name.ends_with("linear_o_group_proj")) {
+            grouped_input = input.front();
+            std::ranges::fill(output, 1.0625F);
+        } else if (name.ends_with(".o_proj.weight")) output.front() = input.front();
+        else std::ranges::fill(output, name.ends_with("linear_kv_proj.weight") ? 1.0F : 0.0F);
+    };
+    constexpr std::array input{0.0F};
+    ernie::AttentionHistory base(1), candidate(1);
+    const auto base_out = ernie::attention_reference(40, shape, read, input, base, project);
+    check(grouped_input == 0.53125F && base_out.front() == 0.53125F, "BF16 attention epilogue keeps both midpoint stores");
+    shape.contracts.hca_fp8_epilogue = true;
+    const auto candidate_out = ernie::attention_reference(40, shape, read, input, candidate, project);
+    check(grouped_input == 0.5F && candidate_out.front() == 0.5F, "optional epilogue quantizes both projection inputs");
+}
+
+void packed_hca_gate_rows() {
+    constexpr unsigned block = 128;
+    for (const unsigned width : {8192U, 16384U}) {
+        for (const unsigned rows : {1U, 5U, 1000U}) {
+            std::vector<float> values(width), gates(width), actual(width), reference(width);
+            for (unsigned row = 0; row < rows; ++row) {
+                for (unsigned i = 0; i < width; ++i) {
+                    const auto value = static_cast<int>((row * 17U + i * 23U) % 61U) - 30;
+                    const auto gate = static_cast<int>((row * 13U + i * 19U) % 69U) - 34;
+                    values[i] = static_cast<float>(value) / 8.0F;
+                    gates[i] = static_cast<float>(gate) / 4.0F;
+                    const auto sigmoid = 1.0F / (1.0F + std::exp(-gates[i]));
+                    using weight::scalar_float::bf16_round;
+                    reference[i] = bf16_round(values[i] * bf16_round(sigmoid));
+                }
+                core::sigmoid_product_reference(values, gates, actual, core::SigmoidGatePrecision::bf16_sigmoid);
+                check(actual == reference, "packed gate retains the unfused BF16 product");
+                for (unsigned first = 0; first < width; first += block) {
+                    float peak = 1e-10F;
+                    for (unsigned i = 0; i < block; ++i) peak = std::max(peak, std::fabs(reference[first + i]));
+                    const auto exponent = static_cast<int>(std::ceil(std::log2(static_cast<double>(peak) / 448.0)));
+                    const float scale = std::ldexp(1.0F, exponent);
+                    for (unsigned i = 0; i < block; ++i) {
+                        auto& x = reference[first + i];
+                        x = weight::scalar_float::e4m3(weight::scalar_float::e4m3_encode(x / scale)) * scale;
+                    }
+                }
+                core::round_block_fp8_activation_reference(actual, block);
+                check(actual == reference, "packed gate agrees with separately quantized BF16 product");
+            }
+        }
+    }
 }
 
 void compressed_index() {
@@ -332,6 +394,8 @@ int main() {
     try {
         pool_and_merge();
         hca_carry();
+        packed_hca_binding();
+        packed_hca_gate_rows();
         compressed_index();
         index_window_rows();
         index_leading_rotary();
