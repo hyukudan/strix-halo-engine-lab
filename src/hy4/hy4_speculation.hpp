@@ -3,8 +3,9 @@
 // (src/hy4/serve/session_service.cpp): the model only declares its speculative capability; the shared default
 // resolver (strix/session/speculation_default.hpp) decides. Host-only.
 #include "strix/session/speculation_default.hpp"
+#include "strix/env_flags.hpp"
 
-#include <cstdlib>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -31,14 +32,33 @@ struct SpeculationRun {
 // `--top 0` is the plain production form (device greedy row); any other --top asks for every step's logits.
 [[nodiscard]] inline SpeculationRun speculation_run_from_arguments(const std::vector<std::string>& args) {
     SpeculationRun run;
-    run.environment = std::getenv(::strix::session::speculation_environment);
+    run.environment = ::strix::envcfg::lookup_unrecorded(::strix::session::speculation_environment);
+    bool top_route = false;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string_view arg = args[i];
+        const bool more = i + 1 < args.size();
         if (::strix::session::speculation_opt_out_argument(arg)) run.no_mtp = true;
         else if (arg == "--mtp") run.explicit_mtp = true;
-        else if (arg == "--teacher" || arg == "--dump-logits" || arg == "--timing" || arg == "--gate-ref") run.per_step_route = true;
-        else if (arg == "--top" && i + 1 < args.size() && args[i + 1] != "0") run.per_step_route = true;
+        else if (arg == "--timing" || arg == "--gate-ref") run.per_step_route = true;
+        else if (arg == "--top" && more) {
+            // Match the rank parser: numeric zero is zero, and the last --top wins.
+            top_route = static_cast<std::uint32_t>(std::stoul(args[++i])) != 0U;
+        } else if ((arg == "--teacher" || arg == "--dump-logits") && more) {
+            run.per_step_route = true;
+            ++i;
+        } else if (more && (::strix::session::speculation_neutral_value_option(arg) ||
+                   arg == "--ids-file" || arg == "--gen" || arg == "--layers" || arg == "--context" ||
+                   arg == "--prompt-vrows" || arg == "--verify-rows" || arg == "--state-in" ||
+                   arg == "--state-out" || arg == "--until" || arg == "--budget" || arg == "--score" ||
+                   arg == "--save-at" || arg == "--window-costs" || arg == "--cut" || arg == "--stage-map" ||
+                   arg == "--repeat" || arg == "--port" || arg == "--pair-model" || arg == "--pair-receipt" ||
+                   arg == "--pair-placement" || arg == "--verify-ms" || arg == "--tp-rank" ||
+                   arg == "--tp-transport" || arg == "--tp-trip-us" || arg == "--tp-rates" || arg == "--pipe-guess")) {
+            // A value (e.g. an ids file named --no-mtp) is not a route switch.
+            ++i;
+        }
     }
+    run.per_step_route = run.per_step_route || top_route;
     return run;
 }
 [[nodiscard]] inline ::strix::session::SpeculationCapability speculation_capability(bool available) {
