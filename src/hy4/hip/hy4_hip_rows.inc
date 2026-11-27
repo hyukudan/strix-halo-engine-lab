@@ -5,11 +5,12 @@
 //  - Q8_0 Linears: shared q8_rows with a Rows = R Site (q8_rows::LinearRowsF32, the stock site of the step's LinearF32): every (output,
 //    row) accumulator gets the same products in the same column order and the same lane / leaf tree for any Rows
 //    (hip_q8_rows_gemv.hpp reduce: lane bits 16..1, leaf bits 2..0, whatever the pair count);
-//  - absorb heads K_b / V_b: q8_rows launch_heads with a Rows = 2 head Site (launch_heads admits 1..2 rows; Outs 4 both);
+//  - absorb heads K_b / V_b: q8_rows launch_heads_rows_f32 (one launch for the R <= 8 rows; launch_heads admits 1..8 rows);
 //  - other Linears (router): launch_hip_dense_rows with rows = R (rows tile, w5b: bits equal; row_loop = the reference);
 //  - row-independent kernels in one launch over R rows: HC mixes / collapse / expand, rmsnorm (one block per row), rope
-//    (positions[r]), cache row stores (positions iota + p0), query images, route wave, swiglu, epilogues, combine;
-//  - per row, in row order: rmsnorm of the kv latent (strided rows), indexer keys / select, flash at the row's own
+//    (positions[r]), cache row stores (positions iota + p0), query images, route wave, swiglu, epilogues, combine, the
+//    kv latent rmsnorm (strided rows, one block per row);
+//  - per row, in row order: indexer keys / select, flash at the row's own
 //    position, routed experts (the C1 A8 probe / down admit one logical row), Engram (n-gram history up to the row).
 // Cache stores of all R rows precede the rows' reads: legal because every ring is sized for the verify rows
 // (rows::cache_rows -> layer_caches max_rows; rows::check_rewind replays it).
@@ -196,27 +197,10 @@ void linear_vrows_w(const std::uint8_t* weights, std::uint32_t type, const float
     if (round) glu::launch_epilogue<glu::Round::bf16>(y, bias, outputs, total, y, s);
     check(hipGetLastError(), "linear verify rows launch");
 }
-// launch_heads_f32() over R rows: pairs of rows per launch (launch_heads admits 1..2 rows), the odd row alone.
+// launch_heads_f32() over R rows: the shared window plan (one launch for the R <= 8 verify rows: the weight read once).
 void absorb_vrows(const std::uint8_t* wt, std::uint32_t heads, std::uint32_t width, std::uint32_t head_outputs, const float* x,
                   std::uint32_t x_stride, std::size_t x_row, float* y, std::uint32_t y_stride, std::size_t y_row, std::uint32_t R) {
-    for (std::uint32_t r = 0; r < R; r += 2U) {
-        if (R - r < 2U) {
-            strix::q8_rows::launch_heads_f32(wt, heads, width, head_outputs, x + r * x_row, x_stride, y + r * y_row, y_stride, s);
-            break;
-        }
-        strix::q8_rows::HeadsRowsF32<2U> site{};
-        site.input[0] = x + r * x_row;
-        site.input[1] = x + (r + 1U) * x_row;
-        site.segments = strix::q8_rows::segments({{wt, heads * head_outputs}});
-        site.width = width;
-        site.outputs = heads * head_outputs;
-        site.head_outputs = head_outputs;
-        site.input_stride = x_stride;
-        site.out_stride = y_stride;
-        site.row_stride = y_row;
-        site.out = y + r * y_row;
-        strix::q8_rows::launch_heads(site, s);
-    }
+    strix::q8_rows::launch_heads_rows_f32(wt, heads, width, head_outputs, x, x_stride, x_row, y, y_stride, y_row, R, s);
 }
 
 // The cache side of attention_vrows: rows vr.p0 .. vr.p0 + R - 1 of layer l's latent (kv_a -> kv norm -> rope -> store) and,
@@ -230,7 +214,10 @@ void cache_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> latent[l] (+ t
     const std::uint32_t* positions = iota + vr.p0;
     linear_vrows(blk(l, "attn_kv_a_mqa.weight"), vr.xn, c.hidden, row, R, vr.ckv);
     const float* kvn = t(blk(l, "attn_kv_a_norm.weight")).f();
-    for (std::uint32_t r = 0; r < R; ++r) norm(vr.ckv + std::size_t{r} * row, kvn, kl, c.rms_eps, vr.ckv + std::size_t{r} * row);
+    // the R rows' kv norm in one launch (the shared strided row form: each row the bits of norm() on that row)
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(strix::ops::norm::rmsnorm_strided_kernel<NormTraits, 256>), dim3(R), dim3(256), 0, s,
+                         vr.ckv, std::size_t{row}, kvn, 0, kl, c.rms_eps, vr.ckv, std::size_t{row});
+    check(hipGetLastError(), "rmsnorm verify rows launch");
     rp::launch<rp::Round::bf16>({vr.ckv, R, 1U, row, row, kl, rope / 2U, idx ? cos_idx : cos_swa, idx ? sin_idx : sin_swa, positions, false}, s);
     check(dcr::store_rows({vr.ckv, row, positions, 0U, R, latent_rows[l], latent[l], flag}, s), "latent verify rows store");
     if (idx && !dfly_block_id(l))  // a DFly2 block has no indexer: it never writes the KV-share layer's keys
