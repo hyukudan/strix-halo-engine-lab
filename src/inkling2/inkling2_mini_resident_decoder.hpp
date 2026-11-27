@@ -468,6 +468,21 @@ public:
     void step_program_screened_pick() { note_screened_pick(); }
 #endif
 
+    // With DSpark taps captured, a cohort step of several lanes steps them one at a time so slot 0 records its taps
+    // (CUDA). HIP keeps the packed passes (served throughput at C > 1 must not pay for the lone lane's drafter): a step
+    // that carries slot 0 leaves its tap plane short of the frontier (slot0_taps_complete() false until the slot's next
+    // sequence), so that lane drafts lookup-only afterwards, as after a CUDA cohort program.
+    bool steps_for_taps(std::span<const unsigned> slots) noexcept {
+        if (draft_taps_.span().empty()) return false;
+#if defined(__HIPCC__)
+        if (std::ranges::find(slots, 0U) != slots.end()) slot0_taps_stale_ = true;
+        return false;
+#else
+        (void)slots;
+        return true;
+#endif
+    }
+
     // One forward for all lanes. Every row keeps single-row decode arithmetic,
     // so a lane matches its own decode() stream. With DSpark tap capture on,
     // lanes step one at a time so each committed position records its taps.
@@ -510,7 +525,7 @@ public:
             }
         }
 #endif
-        if (groups_.size() == 1U || draft_taps_.span().size() != 0U) {
+        if (groups_.size() == 1U || steps_for_taps(slots)) {
             for (std::size_t row = 0; row < slots.size(); ++row)
                 top[row] = append(*groups_[row].state, ids.subspan(row, 1U), true, {}, MiniAppendKind::decode, {}, nullptr,
                                   reads_scores);
@@ -597,7 +612,7 @@ public:
             groups_.push_back({&state, {state.committed(), 1U}});
         }
         pass_ids_.assign(ids.begin(), ids.end());  // ids and top may overlap: read the inputs from the copy
-        if (groups_.size() == 1U || draft_taps_.span().size() != 0U) {
+        if (groups_.size() == 1U || steps_for_taps(slots)) {
             for (std::size_t row = 0; row < slots.size(); ++row)
                 top[row] = append(*groups_[row].state, std::span<const unsigned>(pass_ids_).subspan(row, 1U), true, {},
                                  MiniAppendKind::decode);

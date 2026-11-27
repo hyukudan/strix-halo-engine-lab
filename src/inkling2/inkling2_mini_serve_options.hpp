@@ -62,12 +62,12 @@ struct MiniServeOptions {
     bool controller_one_plane = false;
     // Resolved screened-head lever (mini_screened_head), the value the CLI and the gate read.
     bool screened_head = false;
-    // Speculation (kMiniSpeculation, or an explicit --speculation off|auto): requested, and admitted (HIP: lanes draft
-    // from their context through one-lane verify windows while one lane is live; CUDA: lane_speculation).
+    // Speculation (kMiniSpeculation, or an explicit --speculation off|auto): requested, and admitted (both backends run
+    // it as lane_speculation, mini_served_lane_speculation).
     bool speculation_requested = false;
     bool speculation = false;
-    // CUDA: an admitted speculation runs the shared lone-lane speculator (CohortConfig::lane_speculation: the command
-    // line's speculator step while one lane is live, the model's DSpark sidecar on slot 0's taps).
+    // An admitted speculation runs the shared lone-lane speculator on both backends (CohortConfig::lane_speculation: the
+    // command line's speculator step while one lane is live, the model's DSpark sidecar on slot 0's taps).
     bool lane_speculation = false;
     MiniSpeculationPolicy speculation_policy{};  // the resolved rule (mini_speculation_line)
 };
@@ -137,6 +137,42 @@ struct MiniServeCohort {
     // a smaller candidate (slot capacity) the held-back route.
     bool served_route = false;
 };
+
+// ONE admission rule of the served lone-lane speculator, both backends: every admitted speculation binds the shared
+// LaneSpeculator (one greedy lane drafts and verifies while at most one request is live; two or more live requests take the
+// shared round again, serve::CohortDecoder). No backend is excluded: HIP binds the same verify windows (stage / commit with
+// slot tapes) and the DSpark drafter over slot 0's taps as the command line.
+constexpr bool mini_served_lane_speculation(bool speculation_admitted) noexcept { return speculation_admitted; }
+
+// The cohort speculation config of a served load: `windows` = the decoder staged verify windows (backend.max_window > 1).
+// Lone-lane speculation (the command line's speculator step) when admitted, else the context-draft round, else none.
+inline void mini_serve_speculation_config(serve::CohortConfig& config, bool speculation, bool lane_speculation,
+                                          bool windows, unsigned max_rows, double probe_loss) {
+    config.context_draft = false;
+    config.max_draft = 0;
+    if (windows && speculation && lane_speculation) {
+        config.lane_speculation = {true, 1U, max_rows, probe_loss, true};
+        return;
+    }
+    config.context_draft = windows && speculation;
+    config.max_draft = windows && speculation ? max_rows - 1U : 0U;
+}
+
+// The HIP tall prompt chunk (STRIX_INK_HIP_SERVED_TALL_CHUNK=1) of the HELD-BACK served route: the command line's chunk
+// although HIP is not declared chunk-invariant. ONE rule for the server and the optimization catalogue, every tier:
+// - the held-back route is requested (an explicit STRIX_INK_SERVED_CLI_ROUTE=0; the command line's route already runs
+//   the command line's chunk) and no explicit --prefill-rows, a context above the incumbent 128 rows;
+// - the BF16 expert tile (no W4A4 class bound) and checkpoint experts: a bound W4A4 class, the NVFP4 narrow image or a
+//   calibrated decode-only image serve every prompt emits-first (mini_served_prompt_emits_first), so there is no
+//   held-back route to widen; the decoder refuses the calibrated image on the held-back route.
+// The tier is NOT part of the rule: FAST and TURBO take it where they run the BF16 tile; the lever changes the decode ids
+// (a different chunk in the HIP prefill), so its catalogue class is fast, never EXACT.
+constexpr bool mini_served_tall_chunk_admitted(bool hip, bool served_cli_route, bool explicit_rows, unsigned context,
+                                               bool bf16_expert_tile, bool experts_nvfp4, bool decode_only_image,
+                                               bool requested) noexcept {
+    return hip && requested && !served_cli_route && !explicit_rows && bf16_expert_tile && !experts_nvfp4 &&
+           !decode_only_image && context > kMiniServedHeldBackChunk;
+}
 
 // The served cohort's prompt service: alone, a prompt runs the admitted chunk per call (prompt_slice); beside a
 // decoding lane, pieces of kMiniServeDecodingRows (the incumbent 128-row mixed-service bound) cut inside those chunks

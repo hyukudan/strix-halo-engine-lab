@@ -59,7 +59,7 @@ inline MiniServeCohort make_mini_device_cohort(
 #if !defined(__HIPCC__)
     exec::CohortProgramPolicy programs;
 #endif
-    // Lone-lane speculation (CUDA): the model's DSpark sidecar beside the checkpoint, validated like the command line's
+    // Lone-lane speculation (CUDA and HIP): the model's DSpark sidecar beside the checkpoint, validated like the command line's
     // (absent or declined: the lone lane drafts lookup-only). Found, the decoder captures slot 0's DSpark taps and the
     // cohort binds the drafter (MiniServeLaneBinding) before the slots are budgeted.
     spec::ResolvedDrafter drafter{{}, spec::DrafterSource::context, {}};
@@ -92,15 +92,11 @@ inline MiniServeCohort make_mini_device_cohort(
         const auto ladder = mini_served_chunk_ladder(opt.prefill_rows, opt.prefill_fallback_rows);
         const auto load = [&](std::uint32_t chunk, bool last) {
             const bool route = opt.served_cli_route && chunk == ladder.rows[0];
-            // CUDA: slot 0 binds the command line's verify window tape (the constructor's verify rows, as the command
-            // line's load.verify_rows) when windows may be served: a staged window is then taped, so it replays its
-            // window program and a partial commit rebuilds by copies. Without it (q63) every served window ran eagerly
-            // and every partial commit replayed its kept rows: served code 100.9 tok/s vs 180.6 on the command line.
-#if defined(__HIPCC__)
-            const unsigned tape_rows = 0U;  // HIP served windows: unchanged
-#else
+            // Slot 0 binds the command line's verify window tape (the constructor's verify rows, as the command line's
+            // load.verify_rows) when windows may be served, on CUDA and HIP: a staged window is then taped, so a partial
+            // commit rebuilds by copies (CUDA also replays its window program). Without it (q63) every served window ran
+            // eagerly and every partial commit replayed its kept rows: served code 100.9 tok/s vs 180.6 on the command line.
             const unsigned tape_rows = opt.speculation ? kMiniMaxVerifyRows : 0U;
-#endif
             auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, chunk,
                 packed_decode, MiniResidentBackend::default_step_graphs,
                 weights.roles(), tape_rows, draft_taps, rows, route ? opt.prefill_tail : 0U,
@@ -259,7 +255,7 @@ inline MiniServeCohort make_mini_device_cohort(
     speculation.admitted = windows;
     std::cerr << mini_speculation_line(speculation, opt.verify_rows) << '\n';
     if (windows) {
-        // CUDA lone-lane speculation: the DSpark drafter bound on slot 0 (else lookup-only drafts); HIP: context drafts.
+        // Lone-lane speculation (CUDA and HIP): the DSpark drafter bound on slot 0 (else lookup-only drafts).
         if (opt.lane_speculation && !lanes_bound && !drafter.path.empty())
             drafter = spec::decline_drafter(drafter, "verify windows declined");
         std::cerr << spec::drafter_receipt("served", drafter) << '\n';

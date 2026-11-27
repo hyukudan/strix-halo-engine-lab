@@ -464,6 +464,67 @@ void profile_parity() {
     }
     set_expert_env(nullptr);
     set_w4a4_env(nullptr);
+    // Lone-lane speculation is ONE admission rule on both backends (mini_served_lane_speculation): an admitted
+    // speculation binds the shared lone-lane speculator, no backend (HIP included) keeps a private context-draft round.
+    const auto saved_arguments = selection.arguments;
+    for (const auto* backend : {"hip", "cuda"}) {
+        for (const auto* mode : {"auto", "off"}) {
+            selection.arguments = {"--checkpoint", "MODEL.safetensors", "--backend", backend, "--profile", "exact",
+                                   "--speculation", mode};
+            loaded.reset();
+            require(factory->create(selection) && loaded, "speculation binding: the server did not load");
+            const bool on = std::string_view(mode) == "auto";
+            require(loaded->speculation == on && loaded->lane_speculation == on,
+                    "speculation auto must engage lane speculation on every backend, off must not");
+        }
+    }
+    selection.arguments = saved_arguments;
+    {
+        // The cohort config: one live lane speculates (lane_speculation, max_live 1, no context-draft round); a load whose
+        // decoder staged no windows, or a run that does not speculate, binds neither; lane speculation off keeps the
+        // context-draft round. Two or more live lanes take the shared round (tests/cohort_lane_speculation_tests.cpp).
+        sv::CohortConfig config;
+        mini::mini_serve_speculation_config(config, true, true, true, 8U, 0.25);
+        require(config.lane_speculation.enabled && config.lane_speculation.max_live == 1U &&
+                    config.lane_speculation.max_rows == 8U && !config.context_draft && config.max_draft == 0U,
+                "lane speculation config: one live lane, no context drafts");
+        sv::CohortConfig none;
+        mini::mini_serve_speculation_config(none, true, true, false, 8U, 0.25);
+        require(!none.lane_speculation.enabled && !none.context_draft && none.max_draft == 0U,
+                "no verify windows: no speculation");
+        sv::CohortConfig off;
+        mini::mini_serve_speculation_config(off, false, false, true, 8U, 0.25);
+        require(!off.lane_speculation.enabled && !off.context_draft && off.max_draft == 0U,
+                "speculation off: no speculation");
+        sv::CohortConfig context;
+        mini::mini_serve_speculation_config(context, true, false, true, 8U, 0.25);
+        require(!context.lane_speculation.enabled && context.context_draft && context.max_draft == 7U,
+                "lane speculation off: the context-draft round");
+    }
+    {
+        // The HIP tall chunk admission: one source for the server and the catalogue (c.md table). Arguments: hip,
+        // served_cli_route, explicit_rows, context, bf16 tile, experts_nvfp4, decode-only image, requested. The tier is
+        // not an argument: EXACT, FAST and TURBO that run the BF16 tile answer alike.
+        using mini::mini_served_tall_chunk_admitted;
+        require(mini_served_tall_chunk_admitted(true, false, false, 8192U, true, false, false, true),
+                "tall chunk: held-back BF16 route admitted");
+        require(!mini_served_tall_chunk_admitted(false, false, false, 8192U, true, false, false, true),
+                "tall chunk: CUDA is chunk-invariant already");
+        require(!mini_served_tall_chunk_admitted(true, true, false, 8192U, true, false, false, true),
+                "tall chunk: the command line's route already runs the command line's chunk");
+        require(!mini_served_tall_chunk_admitted(true, false, true, 8192U, true, false, false, true),
+                "tall chunk: explicit --prefill-rows wins");
+        require(!mini_served_tall_chunk_admitted(true, false, false, 128U, true, false, false, true),
+                "tall chunk: context within the incumbent rows");
+        require(!mini_served_tall_chunk_admitted(true, false, false, 8192U, false, false, false, true),
+                "tall chunk: a bound W4A4 class serves prompts emits-first");
+        require(!mini_served_tall_chunk_admitted(true, false, false, 8192U, true, true, false, true),
+                "tall chunk: NVFP4 experts");
+        require(!mini_served_tall_chunk_admitted(true, false, false, 8192U, true, false, true, true),
+                "tall chunk: calibrated decode-only image");
+        require(!mini_served_tall_chunk_admitted(true, false, false, 8192U, true, false, false, false),
+                "tall chunk: not requested");
+    }
     const auto previous_arguments = selection.arguments;
     set_cli_route_env("1");
     for (const auto* backend : {"hip", "cuda"}) {
