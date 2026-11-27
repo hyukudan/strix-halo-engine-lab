@@ -4,6 +4,7 @@
 // step reads: per fed position the last-layer hidden (hc_head output, before and after output_norm), the latent rows of
 // the drafter's KV-share layers, the embedding rows of the fed ids and of the mask id, and the BF16 head table.
 //   strix-hy4-dfly accept SHARD.safetensors TAPDIR[,TAPDIR...] [--variant V[;V...]]
+//                       [--block N] [--anchors FIRST:COUNT]   (block length; a slice of the anchor list per process)
 // drafts one DFly2 block (src/hy4/ref/hy4_dfly_ref) at every anchor of the greedy region of each taps run and prints the
 // acceptance against the target's greedy ids: E = 1 + mean accepted run (0..5), hit rate per proposal row, ms per block.
 //   strix-hy4-dfly mtp PART1.gguf [PART2.gguf] TAPDIR[,TAPDIR...] [--hidden pre|post] [--chain pre|post] [--depth D] [--threads T]
@@ -31,7 +32,6 @@
 #include <memory>
 #include <span>
 #include <thread>
-#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -238,10 +238,14 @@ int accept(int argc, char** argv) {
         std::string d;
         while (std::getline(in, d, ',')) dirs.push_back(d);
     }
-    std::uint32_t block = 0;
+    std::uint32_t block = 0, first = 0, count = ~0U;
     for (int i = 4; i + 1 < argc; ++i) {
         if (std::string(argv[i]) == "--block") {
             block = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+        } else if (std::string(argv[i]) == "--anchors") {
+            const std::string r = argv[++i];
+            first = static_cast<std::uint32_t>(std::stoul(r.substr(0, r.find(':'))));
+            count = static_cast<std::uint32_t>(std::stoul(r.substr(r.find(':') + 1U)));
         } else if (std::string(argv[i]) == "--variant") {
             variants.clear();
             std::stringstream in(argv[++i]);
@@ -261,15 +265,16 @@ int accept(int argc, char** argv) {
         const auto v = strix::hy4::dfly::parse_variant(text);
         std::vector<std::uint32_t> hit(g.block - 1U, 0U), runs(g.block, 0U);
         std::uint64_t accepted = 0, blocks = 0;
+        std::uint32_t anchor_index = 0;
         double ms = 0.0;
         for (std::size_t s = 0; s < sets.size(); ++s) {
             auto& t = *sets[s];
             for (std::uint32_t p = t.prompt - 1U; p + g.block - 1U <= t.P; ++p) {
                 const auto& hs = v.hidden == strix::hy4::dfly::HiddenForm::pre_norm ? t.pre : t.post;
                 const std::span<const float> h(hs.data() + std::size_t{p - 1U} * g.hidden, g.hidden);
-                // a shared host: sleep while the file named by STRIX_PAUSE_FILE exists (a device ticket needs a quiet host)
-                if (const char* pause = std::getenv("STRIX_PAUSE_FILE"); pause != nullptr)
-                    while (std::filesystem::exists(pause)) std::this_thread::sleep_for(std::chrono::seconds(5));
+                // --anchors FIRST:COUNT: score only that slice of the anchor list (short processes on a shared host)
+                const auto index = anchor_index++;
+                if (index < first || index - first >= count) continue;
                 const auto t0 = std::chrono::steady_clock::now();
                 const auto b = strix::hy4::dfly::draft(g, v, *w, t, t.ids[p], p, h, g.block);
                 ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -283,7 +288,7 @@ int accept(int argc, char** argv) {
                     run += alive ? 1U : 0U;
                     std::cout << ' ' << b.proposals[j] << (ok ? "+" : "-");
                 }
-                std::cout << " run " << run << '\n';
+                std::cout << " run " << run << '\n' << std::flush;
                 accepted += run;
                 ++runs[run];
                 ++blocks;
