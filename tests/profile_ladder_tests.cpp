@@ -1884,6 +1884,36 @@ void promoted_band() {
             "EXACT selection shares no part of the promoted cell");
 }
 
+void recaptured_grant() {
+    const auto captured = keep(p::ladder_execution({"hip", "dev-product-a", {1024, 8192, 1, 512},
+                                                   "pack=weight-v1|route=cli|ranks=1"}));
+    const auto unmatched = keep(p::ladder_execution({"hip", "dev-product-b", {1024, 8192, 1, 512},
+                                                    "pack=weight-v1|route=cli|ranks=1"}));
+    auto band = measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1024, 8192, 1, 1,
+                               1.25, 0.02, "r/capture"}, kExactArm, captured);
+    band.identity = "v1";
+    band.band_bound = true;
+    band.band_evidence.timed = {1024, 8192};
+    auto legacy = band;
+    legacy.over = {};
+    band.promotion = "fixture-band";
+    const std::array rows{p::incumbent_cell(kLever, "a8", p::Name::fast, "r/grant", "v1"), legacy, band};
+    auto table = kRows;
+    p::Engine engine{"retire-grant-test", "", table, false, "retire-grant-test-v1", {}, {}, rows};
+    const p::Regime measured{p::Phase::prefill, 1024, 1, "dev", captured};
+    const p::Regime out_of_scope{p::Phase::prefill, 1024, 1, "dev", unmatched};
+    const p::Regime outside{p::Phase::prefill, 8193, 1, "dev", captured};
+    const auto runs = [&](const p::Regime& regime) {
+        return resolve(engine, p::Name::fast, regime).find(kLever)->value == "a8";
+    };
+    require(runs(measured), "the recaptured band replaces the historical grant");
+    require(!runs(out_of_scope), "the grant and the synthetic denominator cannot fill a recaptured band");
+    require(runs(outside), "the historical grant remains outside the recaptured band");
+    table[0].ready[1] = false;
+    table[0].provisional[1] = true;
+    require(!runs(measured), "timing alone cannot promote a provisional column");
+}
+
 // Band receipts along a chain: the second lever's band row binds over the cell the first lever's band row admits
 // (bind + arms repeated until the references settle), so both cells of a measured chain run inside their bands.
 void band_chain() {
@@ -1943,6 +1973,7 @@ int main(int argc, char** argv) try {
     band_lower_edge();
     band_max_edge();
     promoted_band();
+    recaptured_grant();
     bound_evidence();
     defects();
     shipped_rows();

@@ -405,6 +405,15 @@ struct BandReference {
         ladder_band(regime.context, ladder_min_context(row), row.max_context, regime.lanes, row.min_lanes, row.max_lanes);
 }
 
+// A recaptured band uses measured admission by default in its declared regime. Historical
+// grants and synthetic references remain available elsewhere while those bands await capture.
+[[nodiscard]] constexpr bool recaptured_band(std::span<const LadderRow> rows, const ReceiptKey& key) noexcept {
+    return key.regime != nullptr && key.joint.empty() && std::any_of(rows.begin(), rows.end(), [&](const LadderRow& row) {
+        return !row.promotion.empty() && ladder_names(row, key.lever, key.value, key.tier) &&
+            ladder_covers_band(row, *key.regime);
+    });
+}
+
 [[nodiscard]] constexpr bool promoted_band_matches(const LadderRow& row, const ReceiptKey& key) noexcept {
     const auto recorded = band_reference(row.over);
     const auto actual = band_reference(key.reference);
@@ -461,7 +470,8 @@ struct LadderVerdict {
 [[nodiscard]] constexpr LadderVerdict ladder_verdict(std::span<const LadderRow> rows, const ReceiptKey& key) noexcept {
     const LadderRow* worst = nullptr;
     const LadderRow* grant = nullptr;
-    const bool allow_grants = key.regime == nullptr || !key.regime->require_measured_receipts;
+    const bool require_recapture = recaptured_band(rows, key);
+    const bool allow_grants = !require_recapture && (key.regime == nullptr || !key.regime->require_measured_receipts);
     for (const auto& row : rows) {
         if (row.incumbent) {
             if (allow_grants && !grant && key.joint.empty() && !row.receipt.empty() && !row.identity.empty() &&
@@ -469,6 +479,7 @@ struct LadderVerdict {
                 grant = &row;
             continue;
         }
+        if (require_recapture && row.promotion.empty()) continue;
         if (!ladder_receipt_matches(row, key)) continue;
         if (row.receipt.empty() || !valid_ladder_measurement(row.speedup, row.noise))
             return {Rung::unmeasured, nullptr, tier_below(key.tier)};
@@ -1266,7 +1277,9 @@ template <class Row, class Admission>
     const auto admission = wanted.empty() || wanted == lever.builtin ? Status::builtin : admit(column);
     // A cell spelling the builtin runs without a qualification of its own (resolve() treats it as builtin).
     // A speed receipt alone cannot promote a provisional column under measured-receipt policy.
-    const bool qualified = !judged || !regime.require_measured_receipts || allow_pending || admission == Status::set;
+    const bool measured_only = judged && (regime.require_measured_receipts ||
+        recaptured_band(rows, {lever.name, wanted, tier, &regime}));
+    const bool qualified = !measured_only || allow_pending || admission == Status::set;
     const bool eligible = !wanted.empty() && (wanted == lever.builtin || (qualified && applied(admission)));
     if (!judged)
         return {eligible ? wanted : lever.builtin, tier, {}};
@@ -1345,7 +1358,14 @@ template <class Row, class AdmitOf, class ExplicitOf = NoExplicitSetting>
         arms.identities.emplace_back(lever.identity);
     }
     std::vector<LadderRow> grants;
-    for (const auto& row : rows) if (row.incumbent) grants.push_back(row);
+    for (const auto& row : rows) {
+        if (row.incumbent) grants.push_back(row);
+        else if (!row.promotion.empty()) {
+            auto scope = row;
+            scope.over = {};
+            grants.push_back(scope);
+        }
+    }
     const auto n = arms.levers.size();
     for (const Name tier : {Name::standard, Name::fast, Name::turbo}) {
         const auto t = LadderArms::slot(tier);
@@ -1658,6 +1678,7 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         if (cell.empty() || (!row.value.empty() && row.value != cell))
             return where + ": ladder row value is not the tier's cell";
         if (row.incumbent) {
+            if (!row.promotion.empty()) return where + ": incumbent grant cannot be a promotion";
             if (row.receipt.empty()) return where + ": incumbent grant without a receipt";
             if (row.identity.empty()) return where + ": incumbent grant without the implementation identity it granted";
             if (!row.joint.empty()) return where + ": incumbent grant cannot be a paired row";
