@@ -177,6 +177,33 @@ constexpr bool check_served_pass_screened() {
 
 static_assert(check_served_pass_screened());
 
+// Screen sizing (admit_lanes_pick): verify windows keep one pass-1 group; the served route with the wide switch holds
+// its whole cohort (up to the plan's lane cap), so an 8-lane served pass at a 4-lane group picks screened; without the
+// switch, off the served route, or with a group under two lanes it does not.
+constexpr bool check_screen_lanes() {
+    using strix::inkling2::mini_screen_lanes;
+    using strix::inkling2::mini_served_pass_screened;
+    constexpr unsigned cap = 32U;
+    for (unsigned group = 0U; group <= 8U; ++group)
+        for (unsigned cohort = 1U; cohort <= 40U; ++cohort) {
+            const unsigned wide = mini_screen_lanes(true, true, group, cohort, cap);
+            const unsigned narrow = mini_screen_lanes(true, false, group, cohort, cap);
+            const unsigned verify = mini_screen_lanes(false, true, group, cohort, cap);
+            if (group < 2U) {
+                if (wide != 0U || narrow != 0U || verify != 0U) return false;
+                continue;
+            }
+            if (narrow != group || verify != group) return false;
+            if (wide != (cohort > group ? (cohort < cap ? cohort : cap) : group)) return false;
+        }
+    const unsigned c8 = mini_screen_lanes(true, true, 4U, 8U, cap);
+    return c8 == 8U && mini_served_pass_screened(true, false, false, 8U, 8U, c8) &&
+           !mini_served_pass_screened(true, false, false, 8U, 8U, mini_screen_lanes(true, false, 4U, 8U, cap)) &&
+           mini_screen_lanes(true, true, 4U, 64U, cap) == cap && mini_screen_lanes(true, true, 4U, 8U, 1U) == 0U;
+}
+
+static_assert(check_screen_lanes());
+
 // The transaction MiniResidentDecoder::decode_slots runs (serve::run_cohort_passes, the production call): 17 lanes at
 // the HIP one-row cap 16 are passes of 9 + 8 rows; with ids = buf[0..17) and top = buf[1..18) the first pass's picks
 // would overwrite the first input of the second pass without the snapshot. A second pass that throws must leave every

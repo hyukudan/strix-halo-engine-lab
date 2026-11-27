@@ -215,7 +215,7 @@ public:
     [[nodiscard]] std::uint64_t lanes_picks() const noexcept { return lanes_picks_; }
     [[nodiscard]] unsigned lanes_pick_capacity() const noexcept {
 #if defined(__HIPCC__)
-        return verify_lanes_pick_ && screen_ ? screen_->max_lanes() : 0U;
+        return verify_lanes_pick_ ? verify_screen_lanes() : 0U;
 #else
         return 0U;
 #endif
@@ -531,7 +531,7 @@ public:
 #if defined(__HIPCC__)
         // Cohort weights follow decode admission even when the packed kernels use verify geometry.
         const bool lanes_screened = !backend_.lowbit_applies(MiniAppendKind::decode, rows) &&
-                                    verify_lanes_pick_ && !reads_scores && rows > 1U && rows <= screen_->max_lanes();
+                                    verify_lanes_pick_ && !reads_scores && rows > 1U && rows <= verify_screen_lanes();
 #endif
         select_lowbit_cohort(groups_, rows);
         MiniResidentForward forward(backend_, workspace());
@@ -1350,7 +1350,7 @@ private:
         // Level 2 keeps the full single-row head for announced score reads and screens unread verify windows in lanes.
         need_scores = need_scores || (verify_lanes_pick_ && scores_read);
         const bool lanes_screened = !lowbit && verify_lanes_pick_ && pick_next && multi_pick && !need_scores &&
-                                    verify_top.size() <= screen_->max_lanes();
+                                    verify_top.size() <= verify_screen_lanes();
 #else
         // A CUDA verify window whose scores nobody reads (no host rows, no announced read) picks every row through the
         // lanes form of the EXACT screened head (cuda/core/head_screened.cuh: lane l is the R=1 head of its row, the
@@ -1552,17 +1552,29 @@ private:
 
     // Verify rows level 2: rebuild the screened head with as many lanes as one pass-1 group holds on this device (the
     // plane is read once for all of them, screened_head_plan::pass1_lanes against the shared memory of the device the
-    // screen launches on). Declined (the one-row screen kept) without a screened head or with fewer than two lanes.
+    // screen launches on); the served route sizes it for its cohort width (mini_screen_lanes: its pass-1 groups read the
+    // plane rows together). Declined (the one-row screen kept) without a screened head or with fewer than two lanes.
     bool admit_lanes_pick() {
         if (!screen_) return false;
         int device = 0;
         mini_gpu::check(hipGetDevice(&device), "query the Mini head device");
-        const auto lanes = core::hip_screened_head::pass1_lanes(kHiddenWidth, kMaxVerifyRows, device);
+        const auto group = core::hip_screened_head::pass1_lanes(kHiddenWidth, kMaxVerifyRows, device);
+        const auto lanes = mini_screen_lanes(served_cli_route_, served_head_wide_, group,
+                                             std::min(decode_rows_, kCohortPassRows), core::screened_head_plan::kMaxLanes);
         if (lanes < 2U) return false;
         emplace_screen(lanes);
-        if (screen_) return true;
+        if (screen_) {
+            screen_group_lanes_ = std::min(group, lanes);
+            return true;
+        }
         emplace_screen(1U);
         return false;
+    }
+
+    // Rows a verify window (or the incumbent cohort body) screens through the lanes pick: one pass-1 group, as before the
+    // served screen was sized for the cohort width.
+    [[nodiscard]] unsigned verify_screen_lanes() const noexcept {
+        return screen_ ? std::min(screen_->max_lanes(), screen_group_lanes_) : 0U;
     }
 #endif
 
@@ -1680,6 +1692,10 @@ private:
 #if defined(__HIPCC__)
     bool served_lanes_pick_{false};  // served cohort passes may pick through the lanes screen (set_verify_rows)
     bool verify_lanes_pick_{false};  // verify rows level 2 admitted (set_verify_rows): lanes screened picks
+    unsigned screen_group_lanes_{0};  // lanes one pass-1 group stages (admit_lanes_pick): the verify windows' cap
+    // Served cohort head (mini_screen_lanes): the screen sized for the cohort width (default on);
+    // STRIX_INKLING_SERVED_HEAD_WIDE=0 keeps it at one pass-1 group (wider served passes take the pitched rows head).
+    const bool served_head_wide_{strix::envcfg::flag("STRIX_INKLING_SERVED_HEAD_WIDE", true)};
 #endif
     bool screened_graph_{false};
     MiniHead head_{};                  // the effective greedy head (set_screened_head / release_screen)

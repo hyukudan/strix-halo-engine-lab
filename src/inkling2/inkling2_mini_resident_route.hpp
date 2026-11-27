@@ -82,6 +82,20 @@ constexpr bool mini_served_pass_screened(bool lanes_pick, bool reads_scores, boo
     return lanes_pick && !reads_scores && !lowbit && rows > 1U && rows == lanes && rows <= screen_lanes;
 }
 
+// Lanes the HIP BF16 screen is sized for (admit_lanes_pick). `group` = the lanes one pass-1 block stages on the device
+// (screened_head_plan::pass1_lanes); fewer than two declines the lanes pick (0). Verify windows screen at most `group`
+// rows. The served route sizes the screen for its cohort width (`cohort`, at most `cap` = screened_head_plan::kMaxLanes)
+// when `wide` is selected (STRIX_INKLING_SERVED_HEAD_WIDE, default on): a pass wider than a group runs its pass-1 groups
+// as the fastest grid dimension, so the groups read each plane row together instead of the full BF16 head once per pass;
+// every lane keeps its one-row pick (EXACT).
+constexpr unsigned mini_screen_lanes(bool served, bool wide, unsigned group, unsigned cohort, unsigned cap) noexcept {
+    if (group < 2U || cap < 2U) return 0U;
+    const unsigned held = group < cap ? group : cap;
+    if (!served || !wide) return held;
+    const unsigned width = cohort < cap ? cohort : cap;
+    return width > held ? width : held;
+}
+
 // HIP targets the exact down-image lever (inkling2-mini-combine-down-image@1) is qualified on: the NaN identity fixture and
 // the model receipts cover gfx1151 only; the resident device policy admits more targets for the rest of the model.
 // `arch` is the gcnArchName up to the first ':'.
