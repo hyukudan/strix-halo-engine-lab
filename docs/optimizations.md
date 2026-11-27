@@ -7107,18 +7107,18 @@ A sampled CLI row is drawn on the device by the shared sampler (one 4-byte reply
 
 <a id="inkling2-served-lone-lane-spec"></a>
 
-## CUDA server: lone-lane speculation on the command line's speculator step
+## Server (HIP and CUDA): lone-lane speculation on the command line's speculator step
 
-**Engine:** `inkling2-mini`. **Control:** server --speculation auto|off (resolved speculation auto). **Default:** on for CUDA serving when the resolved speculation is auto and a drafter is loaded, while one lane is live (max_live 1); two or more live lanes take the cohort round (one-row route).
+**Engine:** `inkling2-mini`. **Control:** server --speculation auto|off (resolved speculation auto). **Default:** on for HIP and CUDA serving when the resolved speculation is auto (DSpark drafter when the model's MTP sidecar is found, else lookup drafts), while one lane is live (max_live 1); two or more live lanes take the cohort round (one-row route).
 
-While one lane is live, the CUDA server runs the command line's speculator step for it (same drafter setup, arbiter and verify windows as the CLI's auto); two or more live lanes take the cohort round. One strix-lane-spec line per finished request carries the lane's receipt.
+While one lane is live, the HIP and CUDA servers run the command line's speculator step for it (same drafter setup, arbiter and verify windows as the CLI's auto); two or more live lanes take the cohort round. One strix-lane-spec line per finished request carries the lane's receipt.
 
 - **Shared home:** src/serve/cohort_decode.cpp (LaneSpeculator, strix-lane-spec receipt), src/spec/drafting.cpp; src/inkling2/inkling2_mini_serve.cpp binding
-- **Tier and regime:** EXACT, FAST, QUALITY, TURBO; CUDA served decode, one live lane
-- **Exactness evidence:** EXACT: the lone lane verifies every window on the target (LaneSpeculator: the command line's drafter setup, arbiter and verify windows; DSpark drafter on slot 0); sampled lanes draft nothing (max_draft 0). q65: served code C1 ids == CLI Ac 2/2; served C1 == q45 8/8; C8 == C1 8/8 x3. Host: strix-cohort-lane-speculation-tests, strix-fixed-kv-cohort-tests.
+- **Tier and regime:** EXACT, FAST, QUALITY, TURBO; HIP and CUDA served decode, one live lane
+- **Exactness evidence:** EXACT: the lone lane verifies every window on the target (LaneSpeculator: the command line's drafter setup, arbiter and verify windows; DSpark drafter on slot 0); sampled lanes draft nothing (max_draft 0). q65: served code C1 ids == CLI Ac 2/2; served C1 == q45 8/8; C8 == C1 8/8 x3. HIP (cluster2 gfx1151, ink_hsrv t1-t3): served ids == CLI auto == CLI --speculation off, 256/256, code and prose, EXACT / FAST / TURBO; 8-slot server C1 / C2 / C4 / C8 ids equal with speculation on and off (t2). Host: strix-cohort-lane-speculation-tests, strix-fixed-kv-cohort-tests, inkling2-mini-serve (both backends bind the lone-lane speculator).
 - **Off switch:** --speculation off (every lane on the one-row route)
-- **Measured gain:** q65 (RTX PRO, Inkling 2 Mini CUDA server EXACT, 656-token code prompt, --speculation auto): C1 172.71 tok/s = 0.966x the command line's 178.83 at the same effort (q63 before the slot 0 tape fix: 0.56x); C8 median 215.4 tok/s. The 0.98 served/CLI band is not reached (1.4 points short); the remaining ~0.9 ms per step sits in the served step, not in the decisions (53 vs 51 model passes).
-- **Preconditions:** CUDA build, a drafter loaded, resolved speculation auto, exactly one live lane; HIP keeps the context-draft cohort route
+- **Measured gain:** q65 (RTX PRO, Inkling 2 Mini CUDA server EXACT, 656-token code prompt, --speculation auto): C1 172.71 tok/s = 0.966x the command line's 178.83 at the same effort (q63 before the slot 0 tape fix: 0.56x); C8 median 215.4 tok/s. The 0.98 served/CLI band is not reached (1.4 points short); the remaining ~0.9 ms per step sits in the served step, not in the decisions (53 vs 51 model passes). HIP (Strix Halo gfx1151, one node, 660-token code / 1,879-token prose chat prompt, 256 tokens; ink_hsrv t1 / t3): served C1 EXACT 48.96 / 48.81 tok/s vs CLI auto 48.92 (1.00x; the campaign build served 25.9 = the context-draft route), FAST 48.76 / 48.25 vs 48.92 (0.99x), TURBO 48.82 / 48.65 vs 47.78 (1.02x); prose 29.19 vs CLI 29.36 and served plain 29.34 (the shared arbiter keeps prose at the plain rate); C2..C8 unchanged (lone lane only): C8 48.49 vs 48.36 with speculation off (t2).
+- **Preconditions:** HIP or CUDA build, resolved speculation auto, exactly one live lane; the model drafter on slot 0 only (another slot, or slot 0 after a grouped forward, drafts lookup-only)
 
 | Model | Binding |
 | --- | --- |
@@ -7127,7 +7127,7 @@ While one lane is live, the CUDA server runs the command line's speculator step 
 | DeepSeek V4.1 Flash | not bound: no served lane speculator |
 | GLM 5.3 Flash | not bound: no served lane speculator |
 | MiniMax M3.1 Flash | not bound: no served lane speculator |
-| Inkling 2 Mini | bound: CUDA server, one live lane (q65) |
+| Inkling 2 Mini | bound: HIP server (ink_hsrv t1-t3) and CUDA server (q65), one live lane |
 | Hy4 Flash | not bound: no served lane speculator |
 | Nemotron 3.5 Bolt E4B | not bound: no served lane speculator |
 
