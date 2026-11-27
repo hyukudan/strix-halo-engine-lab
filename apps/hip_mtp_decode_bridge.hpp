@@ -596,6 +596,8 @@ public:
         return [this,rows](std::size_t step,const std::function<ExecutionDispatchContext(std::uint32_t)>& row) {
             if(step!=tap_) return;
             const auto stream=hip_execution_stream();
+            const struct TapTimer {double& total;std::chrono::steady_clock::time_point t0=std::chrono::steady_clock::now();
+                ~TapTimer(){total+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();}} tap_timer{prime_tap_ms_};
             if(pipe_tap_copy() && rows>1U) {
                 // STRIX_PREFILL_PIPE bit 2: the same bytes in one 2-D copy when the arena spaces the tap rows evenly.
                 std::vector<std::uintptr_t> address(rows);std::uint64_t bytes=UINT64_MAX;
@@ -659,11 +661,13 @@ public:
             int device=0;strix::hip_check(hipGetDevice(&device),"get priming device");
             const auto submit=[this,device,stream,last,capture=capture_,views=std::move(views),next=std::move(next)] {
                 try {
+                    const auto t0=std::chrono::steady_clock::now();
                     strix::hip_check(hipSetDevice(device),"bind priming device");
                     const bool pending=runtime_.prime_hidden_rows_submit(qualified_,activated_,views,next,producer_rotary_);
                     strix::hip_check(hipMemcpyAsync(held_,last,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice,stream),"tiled MTP held copy");
                     if(capture) capture->submit_predictor(stream);
                     if(!pending) strix::hip_check(hipStreamSynchronize(stream),"tiled MTP held copy");
+                    prime_submit_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
                     return pending;
                 } catch(...) {if(capture && capture->quarantine) capture->fatal();throw;}
             };
@@ -691,9 +695,11 @@ public:
                 !block.owner->completion_pending(),order,n_-1U,
                 block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),capture_tag(order));
         }
+        const auto prime_t0=std::chrono::steady_clock::now();
         runtime_.prime_hidden_rows(qualified_,activated_,views,next,producer_rotary_);
         strix::hip_check(hipMemcpy(held_,block_hidden_+static_cast<std::size_t>(rows-1U)*width_,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
             "tiled MTP held copy");
+        prime_sync_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-prime_t0).count();prime_sync_rows_+=rows;
         pos_+=rows;
         const bool complete=!block.owner->completion_pending() && !runtime_.prime_hidden_rows_pending() &&
             runtime_.next_source_position()+1U==pos_;
@@ -798,6 +804,9 @@ public:
            <<",\"block_ms\":"<<block_ms_<<",\"tail_ms\":"<<tail_ms_<<",\"serial_ms\":"<<serial_ms_;
         if(window_rows_) out<<",\"window_rows\":"<<window_rows_;
         // Execution witnesses for gates: pipe-async blocks, SMALL units, grouped tail blocks, window rows run in a cohort.
+        {const auto counts=runtime_.prime_row_counts();
+         out<<",\"prime_tap_ms\":"<<prime_tap_ms_<<",\"prime_sync_ms\":"<<prime_sync_ms_<<",\"prime_sync_rows\":"<<prime_sync_rows_<<",\"prime_submit_ms\":"<<prime_submit_ms_
+            <<",\"prime_drain_ms\":"<<prime_drain_ms_<<",\"prime_batched_rows\":"<<counts.first<<",\"prime_single_rows\":"<<counts.second;}
         out<<",\"pipe_async_blocks\":"<<pipe_async_blocks_<<",\"small_units\":"<<small_units_<<",\"grouped_tail_blocks\":"<<grouped_tail_blocks_
            <<",\"cohort_window_rows\":"<<cohort_window_rows_;
         if(final_logits_digest_) out<<",\"final_logits_digest\":\""<<model_content_identity_hex(*final_logits_digest_)<<'"';
@@ -924,8 +933,10 @@ private:
         if(!priming_) {PrefixAsyncCapture::reap();return;}
         priming_=false;
         try {
+            const auto drain_t0=std::chrono::steady_clock::now();
             const bool pending=!submitter_.valid() || submitter_.get();
             if(pending) runtime_.prime_hidden_rows_complete(); // incumbent completion location
+            prime_drain_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-drain_t0).count();
             if(capture_) {
                 capture_->commit(!runtime_.prime_hidden_rows_pending() &&
                     runtime_.next_source_position()+1U==capture_->checkpoint->position &&
@@ -1107,6 +1118,9 @@ private:
     bool window_pending_=false;
     std::uint64_t n_=0,width_=0,restored_=0,pos_=0,blocks_=0,tail_blocks_=0,serial_rows_=0,grouped_blocks_=0,window_rows_=0,
         pipe_async_blocks_=0,small_units_=0,grouped_tail_blocks_=0,cohort_window_rows_=0;
+    // Predictor priming cost (receipt prime_*): host wall of the synchronous priming (includes its GPU wait), of the async submit
+    // (enqueue only, may run on the worker thread) and of the drains that wait for async priming (exposed wait).
+    double prime_tap_ms_=0.0,prime_sync_ms_=0.0,prime_submit_ms_=0.0,prime_drain_ms_=0.0;std::uint64_t prime_sync_rows_=0;
     double block_ms_=0.0,tail_ms_=0.0,serial_ms_=0.0;  // wall time of the T blocks, the tail blocks, the serial rows (not the windows)
     bool forced_ladder_=false;
     bool small_=false;

@@ -147,6 +147,7 @@ struct HipMtpRuntime::Impl {
     std::unique_ptr<unsigned char,void(*)(unsigned char*)> prime_scratch{nullptr,[](unsigned char* p){(void)hipFree(p);}};
     std::uint64_t prime_slot=0;
     std::uint32_t prime_capacity=0;
+    std::uint64_t prime_batched_rows=0,prime_single_rows=0;
     bool prime_unavailable=false;
     // Multi-session draft batch: the batch stream carrying this chain's steps (null outside a batch) and the
     // entry/exit events ordering it with the owner stream.
@@ -783,19 +784,20 @@ bool HipMtpRuntime::prime_hidden_rows_submit(const QualifiedMtpDraftPlan& plan,c
         if(hidden.size()>1U && p.prime_rows_admitted() && p.prime_rows_ready())
             for(;i+1U<hidden.size();) {
                 const auto n=std::min<std::size_t>(hidden.size()-1U-i,p.prime_capacity);
-                p.prime_rows(p.next_source+i,hidden.subspan(i,n),next_tokens.subspan(i,n),stream);i+=n;
+                p.prime_rows(p.next_source+i,hidden.subspan(i,n),next_tokens.subspan(i,n),stream);i+=n;p.prime_batched_rows+=n;
             }
         for(;i<hidden.size();++i) {
             const auto c=p.context(p.next_source+i);
             p.copy(wide,hidden[i]);
             launch_hip_mtp_embedding(c,next_tokens[i],stream);p.cache_row_front(c,stream);
-            launch_hip_mtp_cache_rows(c,stream);
+            launch_hip_mtp_cache_rows(c,stream);++p.prime_single_rows;
         }
     } catch(...) {p.failure();throw;}
     p.primed_rows=hidden.size();
     return true;
 }
 bool HipMtpRuntime::prime_hidden_rows_pending() const noexcept {return impl_->primed_rows!=0U;}
+std::pair<std::uint64_t,std::uint64_t> HipMtpRuntime::prime_row_counts() const noexcept {return {impl_->prime_batched_rows,impl_->prime_single_rows};}
 void HipMtpRuntime::prime_hidden_rows_complete() {
     auto& p=*impl_;
     require(p.primed_rows && p.active && p.cache_only_active && !p.cycle,"MTP hidden-row completion requires submitted priming rows");

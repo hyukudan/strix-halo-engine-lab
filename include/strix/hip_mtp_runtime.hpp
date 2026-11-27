@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <utility>
 #include <optional>
 #include "strix/hip_mtp_draft_head.hpp"
 #include "strix/hip_mtp_resources.hpp"
@@ -88,6 +89,8 @@ public:
     const RotaryIdentity& producer_rotary);
     void prime_hidden_rows_complete();
     [[nodiscard]] bool prime_hidden_rows_pending() const noexcept;
+    // Rows primed through the batched kernels / the one-row path since construction (receipt: which priming form ran).
+    [[nodiscard]] std::pair<std::uint64_t,std::uint64_t> prime_row_counts() const noexcept;
     // Prefix state cache: the caller wrote durable cache rows [0, source) back into this fresh idle
     // runtime's KV/raw-index backing; republish `source` as its frontier.
     void restore_cache_frontier(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,std::uint64_t source);
