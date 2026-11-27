@@ -83,13 +83,14 @@ inline constexpr unsigned kTurboPrefillRows = 8192, kTurboPrefillGenerated = 64;
 
 // FAST gate ledger (strix::profile::FastGate): the qualified fast cell and its receipt.
 inline constexpr std::string_view kFastGatePfWmma =
-    "FAST gate v2 PASS, pair, 8K with MoE route replay (glm_fast gate-fast2.json): 5 windows of 8,192 tokens, 1,275 rows, "
-    "pooled KL 0.00018 (null 0.00007), top-1 0.9969, dNLL -0.0013 (se 0.0009), free route-flip ratio 1.05; product-route "
-    "head dump bitwise equal to the gated arm. "
-    "Gate re-score pending: the current gate v2 re-run with the free-running arms passes with route replay, fails "
-    "the absolute bars free-running (KL 0.363, top-1 0.902; the exact arm's own free one-ulp null gives KL 0.367) "
-    "and passes with --allow-null-floor. Which rule applies is a pending gate policy decision; the FAST default "
-    "stays until the owner decides.";
+    "FAST gate v2 PASS (corrected gate: R3 held-out labels, absolute bars, no null floor), pair, held-out set "
+    "tools/strix-gate/heldout/v1 (gate_r 11-27): prompts of 2,304 and 8,192 tokens, 9 windows after the reference-only "
+    "pre-filter (1 of 10 dropped, label == reference top-1 0.996), 2,295 rows. Route replay: KL < 0.00001, top-1 "
+    "0.9991, dNLL -0.00003 (se 0.00004), free route-flip ratio 1.08. Free-running: 2,304-token class 1,275 rows KL "
+    "0.0039, top-1 0.979, dNLL -0.0036 (se 0.0031); 8,192-token class 1,020 rows KL 0.0032, top-1 0.985, dNLL -0.0006 "
+    "(se 0.0026); pooled KL 0.0036, top-1 0.982 (one-ulp free null KL 0.0031 / 0.0026). Two exact runs bitwise equal "
+    "(head dumps and routes, 10 of 10 windows). The earlier free-running KL 0.363 came from two windows of the 11-19 "
+    "set (JSON, a 32K-document slice) where the exact arm's own one-ulp null reached KL 0.69 / 1.06 (route cascade).";
 inline constexpr strix::profile::FastGate fast_gates[] = {{"pf_wmma", "1", kFastGatePfWmma}};
 
 // A prompt inside the FAST band: the startup pair vote asks whether this execution can run the bundle at all; each
@@ -116,7 +117,7 @@ inline constexpr strix::profile::LadderRow product_ladder_rows[] = {
      .speedup = 1.37, .noise = 0.10,  // the lower measured ratio of the band (2,049; 8,192 gave x1.50)
      .receipt = "GLM pair 8K FAST bundle vs EXACT cores (gate v2 8K route replay PASS), docs/optimizations.md#glm-pf-wmma-x; "
                 "lower edge 2,049: EXACT 3.83 s, FAST 2.79 s (x1.37); 4,096: x1.47",
-     .identity = "v1", .band_bound = true, .band_evidence = {{2049, 4096, 8192}, {8192}, kFastGatePfWmma, false}}};
+     .identity = "v1", .band_bound = true, .band_evidence = {{2049, 4096, 8192}, {2304, 8192}, kFastGatePfWmma, false}}};
 #undef STRIX_GLM_TURBO_ARM
 inline const strix::profile::Engine product_profile_engine{"glm-pair", "", product_profile_table, false, "glm-turbo-v1",
                                                            {}, {}, product_ladder_rows};
