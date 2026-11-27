@@ -21,12 +21,18 @@ bool enabled(const char* name) {
 }
 class DeviceState final : public StreamState {
 public:
-    DeviceState(const ModelConfig& config, std::uint32_t admitted, bool accounted)
-        : owned_(std::make_unique<gpu::DeviceStream>(config,admitted)), state_(*owned_), accounted_(accounted) {}
-    DeviceState(std::unique_ptr<gpu::DeviceStream> stream, bool accounted)
-        : owned_(std::move(stream)), state_(*owned_), accounted_(accounted) {}
+    DeviceState(const ModelConfig& config, std::uint32_t admitted, bool accounted,
+                std::shared_ptr<const DecodeAttentionBands> bands = {})
+        : owned_(std::make_unique<gpu::DeviceStream>(config,admitted)), state_(*owned_), accounted_(accounted),
+          admitted_(admitted), bands_(std::move(bands)) {}
+    DeviceState(std::unique_ptr<gpu::DeviceStream> stream, bool accounted, std::uint32_t admitted,
+                std::shared_ptr<const DecodeAttentionBands> bands = {})
+        : owned_(std::move(stream)), state_(*owned_), accounted_(accounted), admitted_(admitted), bands_(std::move(bands)) {}
     std::unique_ptr<StreamState> fork(std::uint32_t admitted) const override {
-        return std::make_unique<DeviceState>(state_.fork(admitted),accounted_);
+        return std::make_unique<DeviceState>(state_.fork(admitted),accounted_,admitted,bands_);
+    }
+    void bind_request(std::uint32_t prompt_tokens, std::uint32_t lanes) override {
+        if (bands_ && *bands_) state_.bind_decode_attention((*bands_)(prompt_tokens,admitted_,lanes));
     }
     std::unique_ptr<KvTxn> begin() override { return state_.begin(); }
     std::uint64_t frontier() const override { return state_.frontier(); }
@@ -49,11 +55,15 @@ private:
     std::unique_ptr<gpu::DeviceStream> owned_;
     gpu::DeviceStream& state_;
     bool accounted_ = false;
+    std::uint32_t admitted_ = 0;
+    std::shared_ptr<const DecodeAttentionBands> bands_;
 };
 class DeviceBackend final : public Backend {
 public:
-    DeviceBackend(const ModelManifest& model, RopeTables tables, bool inspect, NativeInputContinuation continuation)
-        : config_(model.config), host_embedding_(bind_host_weights(model).embedding), host_head_(bind_host_weights(model).head), metadata_(strix::serve::Json::object()) {
+    DeviceBackend(const ModelManifest& model, RopeTables tables, bool inspect, NativeInputContinuation continuation,
+                  DecodeAttentionBands bands)
+        : bands_(bands ? std::make_shared<const DecodeAttentionBands>(std::move(bands)) : nullptr),
+          config_(model.config), host_embedding_(bind_host_weights(model).embedding), host_head_(bind_host_weights(model).head), metadata_(strix::serve::Json::object()) {
         metadata_.set("backend","gfx1151-device"); metadata_.set("identity",model.identity);
         metadata_.set("model_hash",model.model_hash); metadata_.set("rope_hash",tables.hash);
         metadata_.set("cache_dtype",model.cache_dtype);
@@ -91,7 +101,9 @@ public:
         const std::string decode_identity{selected && *selected ? selected : arithmetic_id};
         // A FAST decode attention (STRIX_G4_DECODE_ATTN) changes decode rows: no prefill route equals them then
         // (the a8 route still runs; prefill_matches_decode is false).
-        const std::string decode_attention{gpu::fast_decode_attention_name(gpu::fast_decode_attention_format())};
+        // Per-request bands: some requests run g4-dattn-f2, so the decode attention is not "exact" for the process.
+        const std::string decode_attention{bands_ && gpu::fast_decode_attention_format() == gpu::MirrorFormat::none ?
+            std::string("per-request") : std::string(gpu::fast_decode_attention_name(gpu::fast_decode_attention_format()))};
         const auto* identity = std::getenv("STRIX_G4_PREFILL_IDENTITY");
         const auto choice = profile::prefill_route_for_decode(profile::prefill_route(identity ? identity : "",model.gguf_file_type,
             bind_host_weights(model).layer.front().gate.format == WeightFormat::exl3_mul1),decode_identity);
@@ -129,6 +141,7 @@ public:
         // Read-only inspection must never initialize HIP or upload weights.
         if (!inspect) {
             gpu::DeviceOptions options; options.identity = selected && *selected ? selected : arithmetic_id;
+            options.decode_attention_bands = bool(bands_);
             target_ = std::make_unique<gpu::DeviceTarget>(bind_host_weights(model),tables,options);
             if (a8_route && target_->stats().identity != a8::arithmetic_id)
                 throw std::logic_error("a8 prefill requires g4-a8-v1 decode");
@@ -183,7 +196,10 @@ public:
         const auto target=target_->cache_work_bound();
         const auto stream=gpu::DeviceStream::allocation_bound(config_,config_.max_positions);
         // A FAST decode attention gives each stream a shadow of its global rows (0 bytes when it is off).
-        const auto shadow=memory::shadow_stream_bytes(config_,config_.max_positions,gpu::fast_decode_attention_format());
+        // (With per-request bands every stream may hold the kv8 shadow of the largest context.)
+        const auto shadow=memory::shadow_stream_bytes(config_,config_.max_positions,
+            gpu::fast_decode_attention_format() == gpu::MirrorFormat::none && bands_ ? gpu::MirrorFormat::kv8 :
+            gpu::fast_decode_attention_format());
         if(!target || !stream || !shadow) return {};
         try {
             auto n=target->additional.total();
@@ -279,7 +295,7 @@ public:
     std::unique_ptr<StreamState> create_stream() override { return create_stream(config_.max_positions); }
     std::unique_ptr<StreamState> create_stream(std::uint32_t admitted) override {
         if (!target_) throw std::logic_error("inspection backend cannot execute");
-        return std::make_unique<DeviceState>(config_,admitted,input_continuation_);
+        return std::make_unique<DeviceState>(config_,admitted,input_continuation_,bands_);
     }
     ForwardResult forward_rows(std::span<const RowPlan> rows) override {
         if (!target_) throw std::logic_error("inspection backend cannot execute");
@@ -304,6 +320,7 @@ public:
         return result;
     }
 private:
+    std::shared_ptr<const DecodeAttentionBands> bands_;
     ModelConfig config_;
     LinearView host_embedding_;
     LinearView host_head_;
@@ -394,8 +411,9 @@ private:
     std::unique_ptr<dflash::DeviceDrafter> drafter_;
 };
 }
-std::unique_ptr<Backend> make_device_backend(const ModelManifest& model, RopeTables tables, bool inspect, NativeInputContinuation continuation) {
-    return std::make_unique<DeviceBackend>(model,tables,inspect,continuation);
+std::unique_ptr<Backend> make_device_backend(const ModelManifest& model, RopeTables tables, bool inspect, NativeInputContinuation continuation,
+    DecodeAttentionBands bands) {
+    return std::make_unique<DeviceBackend>(model,tables,inspect,continuation,std::move(bands));
 }
 DraftFactory device_drafts(const dflash::Weights& weights, dflash::RopeView rope, LinearView embedding,
     Backend* backend, bool prepare, LinearView head) {

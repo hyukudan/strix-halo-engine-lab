@@ -456,14 +456,6 @@ PrefillRouteChoice prefill_route_for_decode(std::string_view route, std::string_
                          std::string(decode_identity) + "); prefill-exact runs"};
     return {route, {}};
 }
-std::string serve_decode_attention_notice(const Resolution& resolution, std::string_view backend) {
-    if (resolution.name != Name::turbo || backend != "device") return {};
-    const auto* entry = resolution.find("decode_attention");
-    if (!entry || entry->status == Status::explicit_env || entry->status == Status::explicit_cli || entry->status == Status::off ||
-        entry->value != entry->lever->builtin)
-        return {};
-    return "g4-dattn-f2: not applied: the server has one decode attention format per process (open deviation; CLI applies it 8K-64K)";
-}
 void apply(const Resolution& resolution) {
     for (const auto& line : resolution.notices()) std::cerr << line << '\n';
     for (const auto& entry : resolution.entries) {

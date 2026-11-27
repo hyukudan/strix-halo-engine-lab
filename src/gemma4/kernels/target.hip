@@ -197,6 +197,9 @@ struct DeviceTarget::Impl {
     Buffer tokens, positions, reads, writes, scores, maxima, partials, failure, candidates, winners, attention_counters;
     Buffer tickets;
     // g4-dattn-f1 (STRIX_G4_DECODE_ATTN, FAST): per (layer, row) FP16 mirror descriptors and split-K scratch.
+    // fast_decode = the process can run a FAST decode attention for some stream: STRIX_G4_DECODE_ATTN (every stream
+    // not bound otherwise) or the server's per-request band rows (DeviceOptions::decode_attention_bands); fast_format
+    // = the process form (none when only the bands may select one). The form of a row is its stream's.
     bool fast_decode = false;
     MirrorFormat fast_format = MirrorFormat::none;
     Buffer fast_mirrors, fast_scratch;
@@ -543,11 +546,13 @@ DeviceTarget::DeviceTarget(const HostWeights& host, RopeTables tables, DeviceOpt
     b.tickets.zero();
     b.candidates.resize(8ULL * ((c.vocab + 255U) / 256U) * sizeof(Candidate));
     b.fast_format = fast_decode_attention_format();
-    b.fast_decode = b.fast_format != MirrorFormat::none;
+    b.fast_decode = b.fast_format != MirrorFormat::none || options.decode_attention_bands;
     {
         static const bool witnessed = [&] {
             std::cerr << "gemma4 decode attention identity "
-                      << fast_decode_attention_name(b.fast_format) << std::endl;
+                      << (options.decode_attention_bands && b.fast_format == MirrorFormat::none
+                              ? "per-request bands (exact or g4-dattn-f2)" : fast_decode_attention_name(b.fast_format))
+                      << std::endl;
             return true;
         }();
         (void)witnessed;
@@ -770,17 +775,35 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
             }
         b.input(b.reads, b.host_reads, descriptors.data(), descriptors.size() * sizeof(KvRead));
         b.input(b.writes, b.host_writes, destinations.data(), destinations.size() * sizeof(KvWrite));
-        if (b.fast_decode) {
-            // g4-dattn-f1: bring each stream's FP16 mirror to its committed frontier (64-row steps; the kernel
+        // The decode attention form of every row: its stream's (bound at admission), else the process form. Rows of
+        // one pass may differ; each equal-form run of rows is attended by its own kernel (the bytes of a row never
+        // depend on the other rows of the pass).
+        std::array<MirrorFormat, 8> row_form{};
+        unsigned fast_mask = 0; // bit 2r (f16) / 2r+1 (kv8) per fast row: part of the graph key
+        const auto stream_form = [&](const DeviceStream::Impl& s) {
+            if (!b.fast_decode)
+                return MirrorFormat::none;
+            return s.decode_attention >= 0 ? static_cast<MirrorFormat>(s.decode_attention) : b.fast_format;
+        };
+        for (unsigned r = 0; r < n; ++r) {
+            row_form[r] = stream_form(*static_cast<DeviceStream::Impl::Txn*>(rows[r]->transaction)->stream);
+            if (row_form[r] != MirrorFormat::none)
+                fast_mask |= (row_form[r] == MirrorFormat::kv8 ? 2U : 1U) << (2U * r);
+        }
+        if (fast_mask) {
+            // g4-dattn-f1/f2: bring each fast stream's mirror to its committed frontier (64-row steps; the kernel
             // rounds every later row itself, so the bytes do not depend on this schedule), then one descriptor
-            // per (global layer, row).
+            // per (global layer, row); rows of exact streams keep an empty descriptor.
             for (auto& entry : transactions)
-                fp16_mirror_sync(*entry.first->stream, b.fast_format, b.failure.as<unsigned>(), b.queue);
+                if (const auto form = stream_form(*entry.first->stream); form != MirrorFormat::none)
+                    fp16_mirror_sync(*entry.first->stream, form, b.failure.as<unsigned>(), b.queue);
             auto& mirrors = b.mirror_descriptors;
             mirrors.assign(descriptors.size(), Fp16MirrorRead{});
             for (unsigned l = 0; l < c.layers; ++l)
                 if (c.layer[l].attention == AttentionKind::global)
                     for (unsigned r = 0; r < n; ++r) {
+                        if (row_form[r] == MirrorFormat::none)
+                            continue;
                         const auto* tx = static_cast<DeviceStream::Impl::Txn*>(rows[r]->transaction);
                         mirrors[8ULL * l + r] = fp16_mirror_read(*tx->stream, c.layer[l].producer);
                     }
@@ -790,7 +813,7 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
         // transaction's only new position; the schedule is part of the graph key.
         const bool single_rows = std::all_of(transactions.begin(), transactions.end(),
                                              [](const auto& t) { return t.second.size() == 1U; });
-        const auto key = std::make_pair(n, stride * 2U + (single_rows ? 1U : 0U));
+        const auto key = std::make_pair(n | (fast_mask << 4U), stride * 2U + (single_rows ? 1U : 0U));
         const auto cached = b.graphs.find(key);
         b.stats.graphs = b.options.graphs;
         if (b.options.graph_timing)
@@ -878,7 +901,7 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
                 }
                 bool attended = false;
                 const bool attention_a8 = b.stats.a8 && a8::quantized(y.o.format) && (c.heads * dim) % 256U == 0;
-                const bool fast_global = b.fast_decode && global;
+                const bool fast_global = fast_mask != 0 && global;
                 if (a.producer == l && single_rows && !fast_global)
                     b.run("attention_kv_store", [&] {
                         attended = fused_attention_store(
@@ -914,15 +937,40 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
                         });
                     }
                 }
-                if (!attended && fast_global)
-                    b.run("fast_decode_attention", [&] {
-                        attended = fast_decode_attention(
-                            b.q.as<float>(), y.q_norm, b.positions.as<std::uint64_t>(), table,
-                            b.reads.as<KvRead>() + 8ULL * l, b.fast_mirrors.as<Fp16MirrorRead>() + 8ULL * l, n, c.heads,
-                            dim, stride, b.att.as<float>(), b.fast_scratch.as<float>(), b.fast_scratch.size(),
-                            b.failure.as<unsigned>(), b.queue, b.stats.norm_search, b.stats.norm_bounds,
-                            b.stats.norm_intervals, b.fast_format, attention_a8 ? b.a8_output(c.heads * dim) : A8Rows{});
-                    });
+                if (!attended && fast_global) {
+                    // One launch set per run of rows with the same form; the run's rows start at r0 of every
+                    // row-indexed operand (queries, positions, descriptors, outputs, quantized rows).
+                    attended = true;
+                    for (unsigned r0 = 0, r1 = 0; r0 < n && attended; r0 = r1) {
+                        for (r1 = r0 + 1; r1 < n && row_form[r1] == row_form[r0];)
+                            ++r1;
+                        const unsigned count = r1 - r0;
+                        const std::size_t row_floats = std::size_t(c.heads) * dim;
+                        A8Rows run_a8 = attention_a8 ? b.a8_output(c.heads * dim) : A8Rows{};
+                        if (run_a8.codes) {
+                            run_a8.codes += std::size_t(r0) * run_a8.width;
+                            run_a8.meta += std::size_t(r0) * (run_a8.width / 32U);
+                        }
+                        if (row_form[r0] != MirrorFormat::none)
+                            b.run("fast_decode_attention", [&] {
+                                attended = fast_decode_attention(
+                                    b.q.as<float>() + r0 * row_floats, y.q_norm, b.positions.as<std::uint64_t>() + r0, table,
+                                    b.reads.as<KvRead>() + 8ULL * l + r0, b.fast_mirrors.as<Fp16MirrorRead>() + 8ULL * l + r0,
+                                    count, c.heads, dim, stride, b.att.as<float>() + r0 * row_floats, b.fast_scratch.as<float>(),
+                                    b.fast_scratch.size(), b.failure.as<unsigned>(), b.queue, b.stats.norm_search,
+                                    b.stats.norm_bounds, b.stats.norm_intervals, row_form[r0], run_a8);
+                            });
+                        else
+                            b.run("fused_attention", [&] {
+                                attended = fused_attention(
+                                    b.q.as<float>() + r0 * row_floats, y.q_norm, b.positions.as<std::uint64_t>() + r0, table,
+                                    b.reads.as<KvRead>() + 8ULL * l + r0, count, c.heads, dim, stride, global,
+                                    b.att.as<float>() + r0 * row_floats, b.failure.as<unsigned>(), b.queue, b.stats.norm_search,
+                                    b.stats.norm_bounds, b.stats.norm_intervals, b.scores.as<float>(), b.maxima.as<float>(),
+                                    b.partials.as<float>(), b.attention_counters.as<unsigned>(), run_a8);
+                            });
+                    }
+                }
                 if (!attended)
                     b.run("fused_attention", [&] {
                         attended = fused_attention(b.q.as<float>(), y.q_norm, b.positions.as<std::uint64_t>(), table,
@@ -1139,9 +1187,10 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
             b.failure.download(&failure, sizeof(failure));
         if (failure)
             throw std::runtime_error("nonfinite execution or missing device KV tag");
-        if (b.fast_decode)
+        if (fast_mask)
             for (auto& entry : transactions)
-                fp16_mirror_confirm(*entry.first->stream);
+                if (stream_form(*entry.first->stream) != MirrorFormat::none)
+                    fp16_mirror_confirm(*entry.first->stream);
         if (want_hidden) {
             std::vector<float> normalized;
             const float* hidden_data = b.host_hidden.as<float>();

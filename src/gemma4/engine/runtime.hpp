@@ -26,6 +26,10 @@ struct Options {
     std::uint16_t port = 8080;
     Request request;
     profile::Resolution profile; // --profile exact|fast|turbo|quality, resolved and exported by parse_options
+    profile::Inputs profile_inputs; // the explicit settings that resolution used (no decode regime): per-request re-resolution
+    // Server only (prepare_serve): the decode attention (g4-dattn-f2) is resolved per request with the CLI's regime
+    // and band rows (TURBO, device, lever not set explicitly); empty otherwise.
+    DecodeAttentionBands decode_bands;
     bool inspect = false, help = false;
 };
 Options parse_options(int argc, char** argv);
@@ -64,8 +68,10 @@ enum class NativeInputContinuation { off, exact_g4_v1 };
 // Optional device library implements this factory and engine::Backend/StreamState.
 // Model/tables outlive it; begin() returns its own KvTxn recognized by forward_rows.
 #ifdef STRIX_GEMMA4_DEVICE_BACKEND
+// `bands` (server, TURBO): per-request decode attention; the shadow mirror and scratch are then allocated for the
+// largest context and every stream binds its own form (empty: the process form, STRIX_G4_DECODE_ATTN).
 std::unique_ptr<Backend> make_device_backend(const ModelManifest& model, RopeTables tables, bool inspect = false,
-    NativeInputContinuation continuation = NativeInputContinuation::off);
+    NativeInputContinuation continuation = NativeInputContinuation::off, DecodeAttentionBands bands = {});
 DraftFactory device_drafts(const dflash::Weights& weights, dflash::RopeView rope, LinearView embedding,
     Backend* backend = nullptr, bool prepare = true, LinearView head = {});
 #endif

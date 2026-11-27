@@ -12,6 +12,9 @@ struct DeviceOptions {
     // Numerical identity name ("g4-v1" or the opt-in "g4-a8-v1"); null: STRIX_G4_IDENTITY, else g4-v1.
     const char* identity = nullptr;
     bool a8_ffn_ple_fuse = true; // g4-a8-v1 only; STRIX_G4_A8_FFN_PLE_FUSE=0 switches it off
+    // The server's per-request decode attention (profile band rows): streams bound to a FAST form get their shadow
+    // mirror and the split-K scratch is allocated, whatever STRIX_G4_DECODE_ATTN says. Streams not bound stay exact.
+    bool decode_attention_bands = false;
 };
 struct DeviceStats {
     std::size_t resident_weight_bytes = 0, pass_weight_bytes = 0;

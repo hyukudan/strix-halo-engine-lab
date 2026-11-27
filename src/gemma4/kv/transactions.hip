@@ -241,6 +241,13 @@ DeviceStream::DeviceStream(const ModelConfig& config, unsigned admitted) : impl_
         }
 }
 DeviceStream::~DeviceStream() = default;
+// Bound once, right after the stream is created or forked (its mirror is empty then).
+void DeviceStream::bind_decode_attention(std::int32_t form) {
+    if (form < -1 || form > 2)
+        throw std::invalid_argument("decode attention form");
+    impl_->decode_attention = form;
+}
+std::int32_t DeviceStream::decode_attention() const { return impl_->decode_attention; }
 std::optional<memory::Payload> DeviceStream::memory_payload() const {
     const auto& s=*impl_;
     if(impl_.use_count()!=1 || s.busy || s.poisoned || s.fp16_mirror || s.flash_pack ||

@@ -87,6 +87,12 @@ class DeviceStream {
     // Read-only view of a producing layer: committed snapshot plus, when given, that transaction's current overlay
     // (position-tag checked by the reader). Additive; no layout change. Drafters never write KV.
     [[nodiscard]] KvView kv_view(std::uint32_t layer, const KvTxn* transaction = nullptr) const;
+    // Decode attention form of this stream's global layers (strix::attn::cache_shadow::Form value: 0 exact, 1 f16,
+    // 2 kv8), bound when the request is admitted: the pass reads the stream's form per row, so streams of different
+    // forms share a decode pass. -1 (default) = unbound: the process form (STRIX_G4_DECODE_ATTN) applies. Call it
+    // before the first pass (the mirror form is fixed at its first sync).
+    void bind_decode_attention(std::int32_t form);
+    [[nodiscard]] std::int32_t decode_attention() const;
     struct Impl;
 
   private:
@@ -138,6 +144,7 @@ struct DeviceStream::Impl {
     // FAST readers only (kv/fp16_mirror.hpp): FP16 halves of the committed global rows; empty on a new or forked
     // stream, never read by the exact routes.
     std::shared_ptr<Fp16Mirror> fp16_mirror;
+    std::int32_t decode_attention = -1; // DeviceStream::bind_decode_attention
     // FAST flash prefill only: FP16 K / V^T packs of the global producers, rows [0, packed) valid (same append-only
     // rule as the mirror); empty on a new or forked stream.
     std::shared_ptr<FlashPrefillPack> flash_pack;

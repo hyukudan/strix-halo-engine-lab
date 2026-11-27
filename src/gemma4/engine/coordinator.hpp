@@ -52,7 +52,15 @@ public:
     // Unknown payloads must not claim a complete host retention budget.
     [[nodiscard]] virtual std::optional<std::uint64_t> retained_bytes() const { return std::nullopt; }
     [[nodiscard]] virtual std::optional<memory::Payload> native_payload() const { return {}; }
+    // Called once by the coordinator right after the stream is created or forked for a request (before any pass):
+    // `prompt_tokens` of the request and `lanes` = requests live on the coordinator including this one. A backend
+    // whose numerics depend on the request regime (the TURBO decode attention bands) binds them here.
+    virtual void bind_request(std::uint32_t prompt_tokens, std::uint32_t lanes) { (void)prompt_tokens; (void)lanes; }
 };
+// The per-request decode attention resolver of a serving backend: strix::attn::cache_shadow::Form value (0 exact,
+// 2 kv8) of a request with `prompt_tokens`, a stream admitting `admitted` positions and `lanes` live requests. It is
+// the profile resolution the one-prompt CLI uses (profile::resolve + its decode regime), called per request.
+using DecodeAttentionBands = std::function<std::int32_t(std::uint32_t prompt_tokens, std::uint32_t admitted, std::uint32_t lanes)>;
 // Rows of one exact many-row prefill call (no logits): taps per row and, when
 // requested, the final-norm hidden rows that RowPlan::export_hidden returns: every row for HiddenDemand::all_rows;
 // for last_committed at least the call's (each item's) last row: one row, or every row from a backend that

@@ -25,14 +25,20 @@ struct State final : en::StreamState {
     std::string digest() const override { return std::to_string(s.hashes.back()); }
     // MTP sessions need a KV view to draft; the scripted MTP drafter below never reads it (eagle sessions ignore it).
     bool kv_view(std::uint32_t, const KvTxn*, KvView& out) const override { out = {}; return true; }
+    std::vector<std::pair<std::uint32_t, std::uint32_t>>* binds = nullptr; // (prompt tokens, lanes) of bind_request
+    void bind_request(std::uint32_t prompt_tokens, std::uint32_t lanes) override {
+        if (binds) binds->emplace_back(prompt_tokens, lanes);
+    }
 };
 struct Backend final : en::Backend {
     MockTarget target;
     ModelConfig c;
     Backend() { c.hidden = target.hidden; c.vocab = target.vocab; }
     State* last = nullptr; // the coordinator creates the stream right before calling the draft factory
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> binds;
     std::unique_ptr<en::StreamState> create_stream() override {
         auto state = std::make_unique<State>();
+        state->binds = &binds;
         last = state.get();
         return state;
     }
@@ -183,6 +189,28 @@ int main() {
         // The confidence window is DEFAULT ON for MTP sessions; every section except the confidence one below checks the
         // AutoPolicy path, so it runs with the OFF switch.
         set_env("STRIX_G4_MTP_CONF", "0");
+        {
+            // Per-request decode regime: every admitted stream is bound once with its prompt length and the number of
+            // live requests including itself (the server resolves the TURBO decode attention band rows from them).
+            Backend bound;
+            en::Coordinator two(bound, {});
+            for (const std::size_t n : {std::size_t(5), std::size_t(9)}) {
+                en::Request req;
+                req.prompt.assign(n, 7);
+                req.max_tokens = 4;
+                req.dflash = en::DraftMode::off;
+                (void)two.submit(req);
+            }
+            EAGLE_CHECK(bound.binds.size() == 2 && bound.binds[0] == std::make_pair(5U, 1U) &&
+                        bound.binds[1] == std::make_pair(9U, 2U), "bind_request: prompt length and live lanes per admitted stream");
+            two.run();
+            en::Request later;
+            later.prompt.assign(6, 7);
+            later.max_tokens = 2;
+            later.dflash = en::DraftMode::off;
+            (void)two.submit(later);
+            EAGLE_CHECK(bound.binds.size() == 3 && bound.binds[2] == std::make_pair(6U, 1U), "bind_request: finished requests do not count as lanes");
+        }
         Fixture fx;
         Rng r{41};
         // Prompt lengths at the prefill-window edges (the coordinator prefills prompt[0..n-2] in <= 8-row windows; the

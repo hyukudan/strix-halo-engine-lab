@@ -64,6 +64,20 @@ std::string file_hash(const std::filesystem::path& path) { const MappedFile f(pa
 // the device backend is built, so a TURBO band row can only decide here, once per process. Unknown length, a chat /
 // fixture / deploy run, a non-device backend or an unknown device product: no regime (the startup resolution stands).
 struct DecodeRegime { std::uint64_t prompt_tokens = 0; std::string execution; };
+// The regime of one decode run on this device: the single place the CLI (one prompt) and the server (one request,
+// per admission) spell it, so both resolve the same band rows. Decode does not chunk: the chunk spells one row per
+// step. The capacity is the prompt plus the generation. No regime off gfx1151 or without a device backend.
+std::optional<DecodeRegime> device_decode_regime([[maybe_unused]] std::uint64_t tokens, [[maybe_unused]] std::uint64_t max_tokens,
+                                                 [[maybe_unused]] std::uint32_t lanes) {
+#ifdef STRIX_GEMMA4_DEVICE_BACKEND
+    const auto product = strix::device::hip_cost_device_identity();
+    if (product.rfind("gfx1151",0) != 0) return std::nullopt;
+    return DecodeRegime{tokens, strix::profile::ladder_execution({"hip",product,
+        {tokens,tokens + max_tokens,lanes,1U,0U,0U,0U,static_cast<std::uint32_t>(max_tokens)},"gemma4-cli,one-prompt-decode"})};
+#else
+    return std::nullopt;
+#endif
+}
 std::optional<DecodeRegime> decode_regime(const Options& o) {
     if (o.backend != "device" || o.deploy_check || !o.chat.empty() || !o.fixtures.empty() || (o.ids.empty() == o.prompt.empty()))
         return std::nullopt;
@@ -78,15 +92,33 @@ std::optional<DecodeRegime> decode_regime(const Options& o) {
         tokens = gemma4::serve::Tokenizer::load(o.tokenizer)->encode(o.prompt).size();
     }
     if (!tokens) return std::nullopt;
-#ifdef STRIX_GEMMA4_DEVICE_BACKEND
-    const auto product = strix::device::hip_cost_device_identity();
-    if (product.rfind("gfx1151",0) != 0) return std::nullopt;
-    // Decode does not chunk: the chunk spells one row per step. The capacity is the prompt plus the generation.
-    return DecodeRegime{tokens, strix::profile::ladder_execution({"hip",product,
-        {tokens,tokens + o.request.max_tokens,o.streams,1U,0U,0U,0U,static_cast<std::uint32_t>(o.request.max_tokens)},"gemma4-cli,one-prompt-decode"})};
-#else
-    return std::nullopt;
-#endif
+    return device_decode_regime(tokens,o.request.max_tokens,o.streams);
+}
+// Server: the lever resolved once per request admission (Coordinator -> StreamState::bind_request) with the regime
+// of that request, by the same profile::resolve call and the same regime the one-prompt CLI uses. Empty unless the
+// startup resolution would have selected the bands: TURBO on the device backend with decode_attention neither set
+// nor switched off explicitly (its startup value is then the builtin: no regime was known).
+DecodeAttentionBands server_decode_bands(const Options& o) {
+    if (o.profile.name != profile::Name::turbo || o.backend != "device") return {};
+    const auto* entry = o.profile.find("decode_attention");
+    if (!entry || entry->status == profile::Status::explicit_env || entry->status == profile::Status::explicit_cli ||
+        entry->status == profile::Status::off || entry->value != entry->lever->builtin)
+        return {};
+    return [name = o.profile.name, app = o.profile.app, inputs = o.profile_inputs](
+               std::uint32_t prompt, std::uint32_t admitted, std::uint32_t lanes) -> std::int32_t {
+        const auto regime = device_decode_regime(prompt, admitted > prompt ? admitted - prompt : 0, lanes);
+        if (!regime) return 0;
+        auto request = inputs;
+        // The startup resolution exported its own decode_attention value (exact) into the environment: not an explicit
+        // user setting (the gate above saw none), so this lookup does not report it.
+        request.env = [](const char* key) -> const char* {
+            return std::string_view(key) == "STRIX_G4_DECODE_ATTN" ? nullptr : std::getenv(key);
+        };
+        request.regime = {strix::profile::Phase::decode,regime->prompt_tokens,lanes,"gfx1151",regime->execution};
+        const auto resolved = profile::resolve(name,app,request);
+        const auto* chosen = resolved.find("decode_attention");
+        return chosen && chosen->value == profile::dattn_form_value ? 2 : 0;
+    };
 }
 }
 Options parse_options(int argc, char** argv) {
@@ -171,6 +203,7 @@ Options parse_options(int argc, char** argv) {
     // One resolution carries the decode regime when the CLI knows it (never the server: prepare_serve does not set one).
     const auto regime = decode_regime(o);
     if (regime) inputs.regime = {strix::profile::Phase::decode,regime->prompt_tokens,o.streams,"gfx1151",regime->execution};
+    o.profile_inputs = inputs;
     o.profile = profile::resolve(selected,profile::App::engine,inputs);
     profile::apply(o.profile);
     if (const auto* draft = o.profile.find("draft")) {
@@ -231,7 +264,7 @@ Runtime::Runtime(const Options& o) {
 #endif
     else {
 #ifdef STRIX_GEMMA4_DEVICE_BACKEND
-        backend = make_device_backend(manifest,rope.view,o.inspect);
+        backend = make_device_backend(manifest,rope.view,o.inspect,NativeInputContinuation::off,o.decode_bands);
 #else
         throw std::invalid_argument("device backend is not built");
 #endif
@@ -349,9 +382,11 @@ Runtime::Runtime(const Options& o) {
 ServePreparation prepare_serve(int argc,char** argv) {
         ServePreparation prepared;
         auto& options=prepared.options; options=parse_options(argc,argv);
-        if (auto notice=profile::serve_decode_attention_notice(options.profile,options.backend); !notice.empty()) {
-            std::cerr<<notice<<'\n';
-            prepared.notices.push_back(std::move(notice));
+        options.decode_bands=server_decode_bands(options);
+        if (options.decode_bands) {
+            auto line=std::string("g4-dattn-f2: resolved per request with the CLI band rows (")+std::string(profile::dattn_band_text)+")";
+            std::cerr<<line<<'\n';
+            prepared.notices.push_back(std::move(line));
         }
         std::ostringstream report;
         // Up to serve_slots() requests decode together: session-fixed choices (the EXL3 core identity) see that
