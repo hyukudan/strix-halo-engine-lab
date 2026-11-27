@@ -9,6 +9,8 @@
 #include "strix/qwen_router_bf16.hpp"
 #include "strix/qwen_onfly_i4.hpp"
 #include "strix/qwen_allon.hpp"
+#include "strix/profile/all_on_engaged.hpp"
+#include <iostream>
 #include "hip_decode_options.hpp"
 #include "qwen_tiled_prompt_plan.hpp"
 #include "known_prefill_reservation.hpp"
@@ -557,6 +559,14 @@ inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request
     result.options.early_setup = exact_defaults && request.options.early_setup && enabled("STRIX_QPF2K_EARLY_SETUP");
     result.options.eager_code_load = exact_defaults && request.options.eager_code_load && enabled("STRIX_EAGER_CODE_LOAD");
     result.options.qwen_router_bf16 = exact_defaults && env_is(result.environment, "STRIX_QWEN_ROUTER_BF16", "1") && enabled("STRIX_Q6P");
+    {   // all-on record: the router copy is declined under the baseline, the defaults-off switch and the registry switch
+        static const bool noted = [&] {
+            strix::profile::all_on::engaged("STRIX_QWEN_ROUTER_BF16", result.options.qwen_router_bf16,
+                !exact_defaults ? "baseline or defaults off" : "registry switch off", std::cerr);
+            return true;
+        }();
+        (void)noted;
+    }
     // TURBO+ weight source: one resolver for the CLI and the server (both build their Options through this function).
     result.options.turbo = strix::onfly_i4::resolve(request.options.turbo_request, [&](const char* name) -> const char* {
         const auto it = result.environment.find(name);
@@ -581,6 +591,13 @@ inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request
             (result.prefill_option_mask & kPrefillGdnChunkRev3);
         result.options.prefill_disabled |= excluded;
         result.prefill_option_mask = normalize_prefill_options(result.prefill_option_mask & ~excluded);
+        // all-on record: these FAST prefill options are not run on the MTP route
+        static const bool noted = [] {
+            for (const char* name : {"STRIX_PREFILL_INDEX_PROJ_WMMA", "STRIX_PREFILL_INDEX_SCORE_WMMA", "STRIX_QPF2K_GDN_FP16_CHUNK"})
+                strix::profile::all_on::engaged(name, false, "MTP route keeps the upstream prefill arithmetic", std::cerr);
+            return true;
+        }();
+        (void)noted;
     }
     result.options.resolved_prefill_option_mask = result.prefill_option_mask;
     const auto budget = result.environment.find("STRIX_QPF2K_QSA_BUDGET");
@@ -588,6 +605,14 @@ inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request
     result.options.resolved_qsa_prefill_budget = result.options.prefill_exact_fp16 ||
         (master != result.environment.end() && master->second == "1") ? 0U :
         parse_qsa_prefill_budget(budget == result.environment.end() ? "" : budget->second);
+    {   // all-on record: the exact prefill master switch zeroes the attention budget
+        static const bool noted = [&] {
+            strix::profile::all_on::engaged("STRIX_QPF2K_QSA_BUDGET", result.options.resolved_qsa_prefill_budget != 0U,
+                "exact prefill master switch is set", std::cerr);
+            return true;
+        }();
+        (void)noted;
+    }
     return result;
 }
 #include "qwen_yarn_admission.inc"
@@ -1897,6 +1922,16 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
         o.prefill_moe_route_bf16_reason = "unsupported DA16 geometry or writer format";
         route_error = "MoE route BF16 candidate declined: " + o.prefill_moe_route_bf16_reason;
     }
+    {   // all-on record: BF16 route storage (and with it I8) needs the certified DA16 merge+commit tail
+        static const bool noted = [&] {
+            strix::profile::all_on::engaged("STRIX_QPF2K_MOE_ROUTE_BF16", o.prefill_moe_route_bf16,
+                o.prefill_moe_route_bf16_reason, std::cerr);
+            strix::profile::all_on::engaged("STRIX_PREFILL_MOE_ROUTE_I8", o.prefill_moe_route_bf16,
+                "needs MoE route BF16 storage", std::cerr);
+            return true;
+        }();
+        (void)noted;
+    }
     if (profile_route && !o.prefill_moe_route_bf16) {
         for (auto& entry : o.product_profile.entries) if (entry.lever->name == "moe_route_bf16") {
             entry.status = qwen::profile::Status::pending;
@@ -1908,7 +1943,16 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
         }
     } else if (!route_error.empty()) result.error = std::move(route_error);
     for (auto& entry : o.product_profile.entries) {
-        if (entry.lever->name != "moe_route_prune" || !profile::applied(entry.status)) continue;
+        if (entry.lever->name != "moe_route_prune") continue;
+        if (!profile::applied(entry.status)) {
+            static const bool noted = [&] {
+                strix::profile::all_on::engaged("STRIX_QPF2K_MOE_ROUTE_PRUNE", false,
+                    entry.reason.empty() ? "not applied by the product profile" : entry.reason, std::cerr);
+                return true;
+            }();
+            (void)noted;
+            continue;
+        }
         // An explicit request still reaches the launcher's existing hard checks.
         std::string_view refusal = moe_da16_route_refusal(o, result.environment, result.gsq_owner, capabilities.fp16_operands);
         if (request.paired_prefill) refusal = "pair prefill is unsupported";
@@ -1922,6 +1966,13 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
                  !env_is(result.environment, "STRIX_QPF2K_MOE_ROUTE", "14")))
             refusal = "certified DA16 merge+commit schedule is inactive";
         if (refusal.empty()) break;
+        {
+            static const bool noted = [&] {
+                strix::profile::all_on::engaged("STRIX_QPF2K_MOE_ROUTE_PRUNE", false, refusal, std::cerr);
+                return true;
+            }();
+            (void)noted;
+        }
         entry.status = qwen::profile::Status::pending;
         entry.target = entry.requested;
         entry.value = entry.lever->builtin;
@@ -1937,6 +1988,16 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     o.prefill_moe_direct_b=direct.effective;
     o.prefill_moe_direct_b_reason=direct.reason;
     o.prefill_moe_direct_b_bytes=direct.effective?direct.bytes:0;
+    {   // all-on record (one process-once site per lever)
+        static const bool noted = [&] {
+            strix::profile::all_on::engaged("STRIX_QPF2K_MOE_DIRECT_B", direct.effective, direct.reason, std::cerr);
+            strix::profile::all_on::engaged("STRIX_MTP_DEVICE_HANDOFF", o.mtp.enabled, "no MTP route", std::cerr);
+            strix::profile::all_on::engaged("STRIX_MTP_SAMPLED_ACCEPT", o.http_serve || (o.mtp.enabled && o.mtp.sample_temperature > 0.0),
+                o.mtp.enabled ? "greedy decoding has no sampled acceptance" : "no MTP route", std::cerr);
+            return true;
+        }();
+        (void)noted;
+    }
     if (!result.error.empty()) result.admitted = false;
     if (o.http_serve && !o.baseline && o.prefix_cache && o.prefix_cache_host_bytes &&
         !o.prefix_cache_block_rows_explicit && o.known_prefix_prefill_rows >= 1024 &&

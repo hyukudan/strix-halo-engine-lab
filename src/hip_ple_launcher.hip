@@ -1,6 +1,8 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/profile/all_on_engaged.hpp"
+#include <iostream>
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "core/ordered_reduce.hpp"
 #include "strix/hip_launch_context.hpp"
@@ -2744,6 +2746,11 @@ struct HipPleKnownWindow::Impl {
             if (q8_rows::tiled::supported(tk, tiled_rows) && q8_rows::tiled::supported(tv, tiled_rows)) {
                 static const bool witness = [] { std::fprintf(stderr, "qpf2k ple rows f16 tiled active (FAST ple_rows_f16)\n"); return true; }();
                 (void)witness;
+                static const bool noted_tile = [] {
+                    strix::profile::all_on::engaged("STRIX_QPF2K_PLE_TILE", false, "the FAST tiled PLE rows route runs instead", std::cerr);
+                    return true;
+                }();
+                (void)noted_tile;
                 q8_rows::tiled::launch(tk, tiled_rows, hip_execution_stream());
                 q8_rows::tiled::launch(tv, tiled_rows, hip_execution_stream());
                 check_hip(hipGetLastError(), "prefill PLE tiled f16 projection launch");
@@ -2760,6 +2767,12 @@ struct HipPleKnownWindow::Impl {
             (void)witness;
             ple_tile_launch(key, value, groups, packed, hip_execution_stream());
         } else {
+            static const bool noted = [] {
+                strix::profile::all_on::engaged("STRIX_QPF2K_PLE_TILE", false,
+                    "input panel is not shared by key and value or its ranges overlap", std::cerr);
+                return true;
+            }();
+            (void)noted;
             ple_batch_launch(key, q8_rows::lane_weights(key, hip_execution_stream()), groups, packed, hip_execution_stream());
             ple_batch_launch(value, q8_rows::lane_weights(value, hip_execution_stream()), groups, packed, hip_execution_stream());
         }

@@ -4,7 +4,10 @@
 #include "strix/gsq_a8_groups.hpp"
 #include "strix/model_manifest.hpp"
 
+#include "strix/profile/all_on_engaged.hpp"
+
 #include <array>
+#include <iostream>
 #include <cstdlib>
 #include <cstdint>
 #include <string>
@@ -109,7 +112,16 @@ inline const char* decode_fuse_suppression(Get get, bool base, bool gsq) noexcep
     return nullptr;
 }
 inline bool decode_fuse_enabled() noexcept {
-    return !decode_fuse_suppression([](const char* name) { return std::getenv(name); }, baseline, gsq_model);
+    const char* why = decode_fuse_suppression([](const char* name) { return std::getenv(name); }, baseline, gsq_model);
+    // All-on record: the first suppression of the process is reported once.
+    if (why != nullptr) {
+        static const bool noted = [why] {
+            strix::profile::all_on::engaged("STRIX_QWEN_DECODE_FUSE", false, why, std::cerr);
+            return true;
+        }();
+        (void)noted;
+    }
+    return why == nullptr;
 }
 // Exact cross-group projection batching adds no rotary arithmetic.
 template<class Get>

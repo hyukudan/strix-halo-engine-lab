@@ -16,10 +16,12 @@
 // the table for the environment the run WILL have (config file environment
 // overlaid on the process environment) before that environment is injected.
 
+#include <cstdint>
 #include <cstdlib>
 #include <string>
 
 #include "strix/env_flags.hpp"
+#include "strix/moe_route_bf16.hpp"
 
 namespace strix {
 
@@ -119,6 +121,30 @@ struct PrefillMoePolicy {
         return out + "}";
     }
 };
+
+// Why a routed-MoE prefill organisation that is requested is not what the launcher runs. nullptr = admitted by the
+// policy. Pure host logic shared by the launcher (which feeds strix::profile::all_on::engaged with it) and the host
+// tests. Per-call facts (the tune of the call, the alignment of the raw-dot view) are arguments.
+//
+// The tier split and the LDS epilogue both stand down under the route-control rounding (it has its own down kernel) and
+// under route I8 (the one-byte route plane is written by the DA16 certificate down kernel only).
+inline const char* moe_tiers_decline(const PrefillMoePolicy& p, bool route_i8, unsigned tune) {
+    if (p.route_ctrl) return "route-control rounding has its own down kernel";
+    if (!moe_route_organizations(route_i8, p.tiers != 0, false, false).tiers && p.tiers != 0)
+        return "route I8 plane is written by the certificate down kernel only";
+    if (p.tiers == 0) return "tier value must be 1 or 2";
+    if (tune != 82U) return "tier split needs tune 82";
+    return nullptr;
+}
+// `base` and `stride` describe the raw-dot view (bytes); the vector epilogue needs both 16-byte aligned.
+inline const char* moe_down_lds_decline(const PrefillMoePolicy& p, bool route_i8, std::uintptr_t base, std::uint64_t stride) {
+    if (p.route_ctrl) return "route-control rounding has its own down kernel";
+    if (!p.down_lds) return "switch value must be 1";
+    if (!moe_route_organizations(route_i8, false, true, false).lds_epilogue)
+        return "route I8 plane is written by the certificate down kernel only";
+    if (base % 16U != 0U || stride % 16U != 0U) return "raw-dot view is not 16-byte aligned";
+    return nullptr;
+}
 
 // Process-wide policy, resolved once from the process environment on first use
 // (no runtime code sets these variables), and recorded in the envcfg registry.

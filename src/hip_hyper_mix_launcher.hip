@@ -3,6 +3,8 @@
 #include "strix/cohort_step_plan.hpp"
 #include "strix/hip_mtp_prime_rows.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/profile/all_on_engaged.hpp"
+#include <iostream>
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/prefill_identity.hpp"
@@ -5306,6 +5308,15 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
         config.fast_prefill_wmma && config.hidden_size == 2560U && config.hc_count == 4U &&
         projection_kernel == 2U && !wide.normalized16 && !wide.inverse);
     const bool inverse_reuse = hc_inverse_reuse::admitted(Recompute, out16, reuse_explicit, reuse_auto);
+    if (!inverse_reuse && !reuse_explicit && qpf2k_hc_inverse_reuse_requested()) {
+        // All-on record (the first declined call of the process).
+        static const bool noted = [&] {
+            strix::profile::all_on::engaged("STRIX_QPF2K_HC_OUT16_INVERSE_REUSE", false,
+                !Recompute ? "needs the HC recompute route" : "output form is not the WMMA out16", std::cerr);
+            return true;
+        }();
+        (void)noted;
+    }
     if (output_kernel == 14U || output_kernel == 15U) output_kernel = 1U;
     if (out16 && (config.hidden_size != 2560U || config.hc_count != 4U || wide.normalized16 || wide.inverse ||
         (projection_kernel != 2U && projection_kernel != 4U && projection_kernel != kSkipKernel)))
@@ -5730,7 +5741,16 @@ unsigned wide_output_kernel() {
 // dispatch disables the prefetched projection and the output3/lowband consumers.
 bool qpf2k_hc_recompute_view(const PreparedHyperRows& prepared, HyperWideRows& wide,
     const HipHyperMixLauncherConfig& config, bool fold = false) {
-    if (!qpf2k_hc_recompute_norm(qpf2k_hc_out16())) return false;
+    // All-on record: the first refusal of the process is reported once (a later call of another shape may still run it).
+    const auto declined = [](const char* why) {
+        static const bool noted = [&] {
+            strix::profile::all_on::engaged("STRIX_QPF2K_HC_RECOMPUTE_NORM", false, why, std::cerr);
+            return true;
+        }();
+        (void)noted;
+        return false;
+    };
+    if (!qpf2k_hc_recompute_norm(qpf2k_hc_out16())) return declined("output form is not the WMMA out16");
     const auto& p = prepared.first;
     const auto on = [](const char* name) { const char* v = std::getenv(name); return v && v[0] != '0'; };
     const char* output_rows = std::getenv("STRIX_HC_WIDE2_OUTPUT_ROWS");
@@ -5739,18 +5759,20 @@ bool qpf2k_hc_recompute_view(const PreparedHyperRows& prepared, HyperWideRows& w
         config.hidden_size != 2560U || config.hc_count != 4U || config.lowrank != 320U ||
         wide.count > kHcwLowRows || p.norm_manifest->ggml_type != 0U || fast_output_kernel() != 1U ||
         !(qpf2k_hc_mask() & 8U) || qpf2k_hc_check() || on("STRIX_HC_WIDE_CHECK") ||
-        on("STRIX_HCW_NORM16") || on("STRIX_HCW_NORMFREE") || on("STRIX_HCW_NORMFREE_CHECK")) return false;
+        on("STRIX_HCW_NORM16") || on("STRIX_HCW_NORMFREE") || on("STRIX_HCW_NORMFREE_CHECK"))
+        return declined("HC shape, activation, output route or diagnostic switch not admitted");
     if (!qpf2k_hc_out16() && (!qpf2k_hc_output3() || (output_rows && std::atoi(output_rows) == 16) ||
-        (output_order && output_order[0] == 'f'))) return false;
+        (output_order && output_order[0] == 'f')))
+        return declined("HC output form not admitted");
     const auto& r = prepared.rows;
-    if (r.tile_input % kWindowRows) return false;
+    if (r.tile_input % kWindowRows) return declined("stream rows are not uniform");
     const std::uint64_t stride = r.tile_input / kWindowRows;
     const auto base = reinterpret_cast<std::uintptr_t>(r.input[0]);
-    if (base % 8U || stride % 8U) return false;
+    if (base % 8U || stride % 8U) return declined("stream rows are not 8-byte aligned");
     // Aliasing stream pitch: only the folded inject + norm writes the copy the consumers read; other sites keep the image.
     if (!fold && qpf2k_hc_recompute_mirror(stride)) return false;
     for (unsigned k = 0; k < kWindowRows; ++k)
-        if (reinterpret_cast<std::uintptr_t>(r.input[k]) != base + k * stride) return false;
+        if (reinterpret_cast<std::uintptr_t>(r.input[k]) != base + k * stride) return declined("stream rows are not uniform");
     // prepare_hyper_prefill_rows checked every output/workspace/injection extent
     // against all input rows. Same-stream consumers finish before the next site.
     wide.recompute_input = static_cast<const std::uint16_t*>(r.input[0]);

@@ -3,6 +3,8 @@
 #include <hip/hip_runtime.h>
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
+#include "strix/profile/all_on_engaged.hpp"
+#include <iostream>
 #include "core/short_convolution.hpp"
 #include "core/short_convolution_ring.hpp"
 #include "strix/env_flags.hpp"
@@ -4330,10 +4332,19 @@ bool gdn_fp16_chunk_enabled(const GdnKnownWindowRow& first, const GdnPrefillRows
         return strix::prefill_option_enabled(strix::PrefillOption::gdn_fp16_chunk) && !on("STRIX_QPF2K_GDN_CHECK") &&
             !on("STRIX_GDN_PREFILL_CHECK");
     }();
-    if (!requested || qpf2k::baseline || qpf2k::gsq_model) return false;
+    if (!requested || qpf2k::baseline || qpf2k::gsq_model) {
+        static const bool noted = [] {
+            strix::profile::all_on::engaged("STRIX_QPF2K_GDN_FP16_CHUNK", false,
+                qpf2k::gsq_model ? "GSQ checkpoint" : qpf2k::baseline ? "baseline" : "prefill option is off or a check mode is set", std::cerr);
+            return true;
+        }();
+        (void)noted;
+        return false;
+    }
     const bool fits = gdn_fp16_chunk_supported(first.head_dim, first.key_heads, first.value_heads, rows);
     static std::once_flag once;
     std::call_once(once, [&] {
+        strix::profile::all_on::engaged("STRIX_QPF2K_GDN_FP16_CHUNK", fits, "shape not supported", std::cerr);
         std::fprintf(stderr, fits ? "GDN FAST lever %s: ON (bit-changing; STRIX_QPF2K_GDN_FP16_CHUNK=0 is exact)\n"
                                   : "GDN FAST lever %s: requested, shape not supported -> exact recurrence\n", gdn_fp16_chunk::identity());
     });

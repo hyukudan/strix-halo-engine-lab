@@ -4,6 +4,9 @@
 #include "core/row_layout.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/moe_route_bf16.hpp"
+#include "strix/prefill_moe_policy.hpp"
+#include "strix/profile/all_on_engaged.hpp"
+#include <iostream>
 #include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_mtp_projection.hpp"
 #include "strix/hip_launch_context.hpp"
@@ -3207,6 +3210,31 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
             const bool ran=moe_q4k_a8::known_rows::prefill_direct_b_ran();
             if(ran)++p.direct_b->engaged;else ++p.direct_b->declined;
             p.direct_b->reason=moe_q4k_a8::known_rows::prefill_direct_b_reason();
+            if(!ran) {
+                static const bool noted=[&] {
+                    strix::profile::all_on::engaged("STRIX_QPF2K_MOE_DIRECT_B",false,p.direct_b->reason,std::cerr);return true;
+                }();
+                (void)noted;
+            }
+        }
+        // All-on record: the tier split and the down LDS epilogue are organisations of the same call (decisions in
+        // strix::moe_tiers_decline / moe_down_lds_decline, prefill_moe_policy.hpp).
+        if(!moe_q4k_a8::known_rows::prefill_tiers_ran()) {
+            static const bool noted=[&] {
+                const char* why=strix::moe_tiers_decline(strix::prefill_moe_policy(),rows.route_i8,moe_q4k_a8::known_rows::prefill_last_tune());
+                strix::profile::all_on::engaged("STRIX_QPF2K_MOE_TIERS",false,why?why:"not applicable to this call (format or schedule)",std::cerr);
+                return true;
+            }();
+            (void)noted;
+        }
+        if(!moe_q4k_a8::known_rows::prefill_down_lds_ran()) {
+            static const bool noted=[&] {
+                const char* why=strix::moe_down_lds_decline(strix::prefill_moe_policy(),rows.route_i8,
+                    reinterpret_cast<std::uintptr_t>(rows.rawdots.base),rows.rawdots.stride);
+                strix::profile::all_on::engaged("STRIX_QPF2K_MOE_DOWN_LDS_EPI",false,why?why:"not applicable to this call (format or schedule)",std::cerr);
+                return true;
+            }();
+            (void)noted;
         }
     } catch (...) {
         moe_q4k_a8::known_rows::set_prefill_stage_hook(nullptr, nullptr, 0U); // never leave it armed for a later call

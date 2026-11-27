@@ -5,6 +5,8 @@
 #include <type_traits>
 #include "strix/env_flags.hpp"
 #include "attn_core/index_score_wmma.hpp"
+#include "strix/profile/all_on_engaged.hpp"
+#include <iostream>
 #include "attn_core/index_score_band.hpp"
 #include "attn_core/eager_selected.hpp"
 #include "attn_core/eager_softmax.hpp"
@@ -5484,14 +5486,21 @@ bool qpf2k_index_batch_enabled() {
 }
 // Bit-changing indexer arithmetic is governed by the shared public prefill controls.
 bool qpf2k_index_wmma_enabled() {
-    if (!prefill_option_enabled(PrefillOption::index_proj_wmma) ||
-        qpf2k::suppressed(qpf2k::Item::index_rows)) return false;
+    // All-on record: process-wide refusals of the indexer projection (first call).
+    const auto note = [](const char* why) {
+        static const bool noted = [&] { strix::profile::all_on::engaged("STRIX_PREFILL_INDEX_PROJ_WMMA", false, why, std::cerr); return true; }();
+        (void)noted;
+        return false;
+    };
+    if (!prefill_option_enabled(PrefillOption::index_proj_wmma)) return note("prefill option is off");
+    if (qpf2k::suppressed(qpf2k::Item::index_rows)) return note("indexer rows are suppressed");
     int device = 0;
     hipDeviceProp_t properties{};
     check_hip(hipGetDevice(&device), "QSA index WMMA device");
     check_hip(hipGetDeviceProperties(&properties, device), "QSA index WMMA architecture");
     const std::string_view arch(properties.gcnArchName);
-    return (arch == "gfx1151" || arch.starts_with("gfx1151:")) && properties.warpSize == 32;
+    if (!((arch == "gfx1151" || arch.starts_with("gfx1151:")) && properties.warpSize == 32)) return note("device is not gfx1151 wave32");
+    return true;
 }
 std::atomic<std::uint64_t> qpf2k_launch_index_wmma{0};
 bool qpf2k_index_wmma_layout(const QsaRowsInputViews<64U>& v, std::uint32_t hidden) {
@@ -5509,13 +5518,31 @@ thread_local bool qpf2k_index_score_wmma_active = false;
 struct Qpf2kIndexScoreScope {
     explicit Qpf2kIndexScoreScope(unsigned mode, bool fast_qsa) {
         if (mode != 0U || !fast_qsa || !prefill_option_enabled(PrefillOption::index_score_wmma) ||
-            qpf2k::suppressed(qpf2k::Item::index_rows)) return;
+            qpf2k::suppressed(qpf2k::Item::index_rows)) {
+            // All-on record (first refusal; the scope is created per prefill part, decode and verify never enable it).
+            if (mode == 0U && fast_qsa) {
+                static const bool noted = [] {
+                    strix::profile::all_on::engaged("STRIX_PREFILL_INDEX_SCORE_WMMA", false,
+                        "prefill option is off or indexer rows are suppressed", std::cerr);
+                    return true;
+                }();
+                (void)noted;
+            }
+            return;
+        }
         int device = 0;
         hipDeviceProp_t p{};
         check_hip(hipGetDevice(&device), "QSA score WMMA device");
         check_hip(hipGetDeviceProperties(&p, device), "QSA score WMMA architecture");
         const std::string_view arch(p.gcnArchName);
         qpf2k_index_score_wmma_active = (arch == "gfx1151" || arch.starts_with("gfx1151:")) && p.warpSize == 32;
+        if (!qpf2k_index_score_wmma_active) {
+            static const bool noted = [] {
+                strix::profile::all_on::engaged("STRIX_PREFILL_INDEX_SCORE_WMMA", false, "device is not gfx1151 wave32", std::cerr);
+                return true;
+            }();
+            (void)noted;
+        }
     }
     ~Qpf2kIndexScoreScope() { qpf2k_index_score_wmma_active = false; }
     Qpf2kIndexScoreScope(const Qpf2kIndexScoreScope&) = delete;
@@ -5969,7 +5996,12 @@ bool qsa_fast_kv_pair_admitted(bool occ) {
         reinterpret_cast<const void*>(&qsa_fast::attend_order_kernel<64U, 4U, 3U>);
     hipFuncAttributes attr{};
     int paired = 0, production = 0;
-    const auto fail = [] { (void)hipGetLastError(); return false; }; // caller has checked preceding launches
+    // All-on record: the first refusal of the process is reported once.
+    const auto note = [](const char* why) {
+        static const bool noted = [&] { strix::profile::all_on::engaged("STRIX_QSA_FAST_KV_PAIR", false, why, std::cerr); return true; }();
+        (void)noted;
+    };
+    const auto fail = [&] { note("kernel attributes unavailable"); (void)hipGetLastError(); return false; }; // caller has checked preceding launches
     if (hipFuncGetAttributes(&attr, pair) != hipSuccess) return fail();
     if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&paired, pair, 512, 0U) != hipSuccess) return fail();
     if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&production, reference, 320, 0U) != hipSuccess) return fail();
@@ -5982,6 +6014,7 @@ bool qsa_fast_kv_pair_admitted(bool occ) {
         return true;
     }();
     (void)witnessed;
+    if (!admitted) note("paired loader spills, exceeds 48 KiB LDS or lowers the resident capacity");
     return admitted;
 }
 void qsa_fast_batch_flush(hipStream_t stream) {
@@ -6062,6 +6095,15 @@ void qsa_fast_batch_flush(hipStream_t stream) {
         } else {
             qpf2k_shadow_skipped.fetch_add(1U, std::memory_order_relaxed);
         }
+    }
+    if (qsa_fast_kv_pair_enabled() && (shadow || !(qpf2k_qsa_mask() & 64U))) {
+        // All-on record: the paired loader lives in the group-major attend (QSA mask bit 6) and never on the shadow route.
+        static const bool noted = [&] {
+            strix::profile::all_on::engaged("STRIX_QSA_FAST_KV_PAIR", false,
+                shadow ? "the shadow attend route runs instead" : "group-major attend (QSA mask bit 6) is not selected", std::cerr);
+            return true;
+        }();
+        (void)noted;
     }
     if (shadow) {
         STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(qsa_fast::attend_shadow_multi_kernel<64U, TR, G>), dim3(n * (64U / TR), b.kv_heads * (b.heads / b.kv_heads / HG), 1U),
