@@ -1,6 +1,6 @@
 #pragma once
-// Split-plane summed-score router (one wave per row): the device form of moe::route_split_logits_ref with
-// SplitRouteMode::summed_scores (include/strix/moe/route_policy.hpp). Two raw F32 logit planes [rows][experts];
+// Split-plane summed-score router (one wave per row): the device form of moe::route_split_logits_ref
+// (include/strix/moe/route_policy.hpp, the summed-score split router). Two raw F32 logit planes [rows][experts];
 // s_e = sigmoid(z1_e) + sigmoid(z2_e) (each score through Math::exp, then one F32 add), selection key s_e + bias_e,
 // the k picks of moe_core::route_wave_topk (ties -> lower id), the score sum from +0 in SELECTION order, denominator
 // max(sum, renorm_floor), w = ((s / den) * scale) * gain_e. The outputs are the same ids and bits as the host row;
