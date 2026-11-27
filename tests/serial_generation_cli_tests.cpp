@@ -67,6 +67,19 @@ void set_env(const char* name, const char* value) {
 #endif
 }
 
+// A chain drafter that proposes `id` k times and counts what it sees (the selector's idle arm still accepts every pass).
+struct FixedChain final : strix::spec::ChainDrafter {
+    std::uint32_t id = 1;
+    std::uint64_t drafts = 0, accepted = 0;
+    void draft(std::span<const std::uint32_t>, std::uint32_t k, std::vector<std::uint32_t>& out) override {
+        ++drafts;
+        out.assign(k, id);
+    }
+    void accept(std::span<const std::uint32_t> emitted) override { accepted += emitted.size(); }
+};
+bool offer_arms = false;  // the decoder offers two drafters to the shared per-regime selector
+FixedChain arm_a, arm_b;
+
 class Decoder final : public SerialGenerationDecoder, public strix::spec::VerifyTarget {
 public:
     explicit Decoder(unsigned rows) : rows_(rows) {}
@@ -93,6 +106,11 @@ public:
 
     std::uint32_t max_verify_rows(CliSpeculation) const override { return rows_; }
     strix::spec::VerifyTarget* verify_target() override { return offer_verifier ? this : nullptr; }
+    std::vector<ChainArm> chain_arms(std::uint32_t, std::uint32_t) override {
+        if (!offer_arms) return {};
+        arm_a.id = arm_b.id = next_;
+        return {{&arm_a, "a", 0.0, false}, {&arm_b, "b", 0.0, true}};
+    }
     std::string verify_cost_device() const override { return cost_device; }
     void tune_speculation(strix::spec::BlockConfig& config) const override {
         ++tunes;
@@ -662,6 +680,15 @@ int main() try {
     check(automatic.code == 0 && automatic.out.starts_with(plain.out.substr(0, generated_end)) &&
           inputs == plain_inputs && automatic.out.find("strix-spec-stats ") != std::string::npos,
           "greedy auto runs the shared verifier and matches serial IDs and commit");
+    tunes = seeds = 0;
+    offer_arms = true;
+    const auto selected = repeated("auto");
+    offer_arms = false;
+    check(selected.code == 0 && selected.out.starts_with(plain.out.substr(0, generated_end)) && inputs == plain_inputs &&
+          selected.out.find("strix-speculation-selector/v1 arms 2 | a passes ") != std::string::npos && tunes == 2 &&
+          seeds == 2 && arm_a.accepted > 0 && arm_a.accepted == arm_b.accepted && arm_a.drafts + arm_b.drafts > 0,
+          "two drafters: the shared selector runs both arms (one BlockDrafter each, tuned and seeded), every pass "
+          "reaches both chains, ids and commit equal serial");
     tunes = seeds = 0;
     const auto diagnostic = repeated("verify");
     check(diagnostic.code == 0 && diagnostic.out.starts_with(plain.out.substr(0, generated_end)) && tunes == 0 &&

@@ -667,15 +667,15 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
             }
             generated = spec::execute_block_token_continuation(request, options.prompt, selector, *verify, max_rows, emit,
                                                                row_rule, round_log ? &*round_log : nullptr);
-            std::cerr << "strix-speculation-selector/v1 arms " << selector.size();
+            // The selector's receipt beside the shared speculation stats: passes / tokens / probes / wall per arm.
+            out << "strix-speculation-selector/v1 arms " << selector.size();
             for (std::size_t a = 0; a < selector.size(); ++a) {
                 const auto& st = selector.stats(a);
-                std::cerr << " | " << st.name << " passes " << st.passes << " tokens " << st.tokens << " probes " << st.probes
-                          << " ms " << static_cast<std::uint64_t>(st.ms);
+                out << " | " << st.name << " passes " << st.passes << " tokens " << st.tokens << " probes " << st.probes
+                    << " ms " << static_cast<std::uint64_t>(st.ms);
             }
-            if (selector.active() < selector.size()) std::cerr << " | active " << selector.stats(selector.active()).name;
-            std::cerr << "
-";
+            if (selector.active() < selector.size()) out << " | active " << selector.stats(selector.active()).name;
+            out << '\n';
         }
     } else {
         // A decoder that samples on the device decides every sampled row there: the same ids for the request's seed,
