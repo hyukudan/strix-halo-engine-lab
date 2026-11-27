@@ -94,6 +94,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <iostream>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
