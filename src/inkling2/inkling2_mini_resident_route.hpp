@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/exec/descriptor.hpp"
 #include "strix/serve/decode_form.hpp"
 
 #include <string>
@@ -60,6 +61,15 @@ constexpr MiniResidentRoute mini_resident_route(MiniAppendKind kind, unsigned ro
 // runs passes of at most the backend's one-row cap (the dense rows family keeps its one-row body up to that many rows).
 constexpr unsigned mini_cohort_pass_cap(bool packed_decode, unsigned backend_one_row_cap) noexcept {
     return packed_decode ? backend_one_row_cap : 0U;
+}
+
+// Lane mode of one served cohort pass (HIP, decode_slots_served): the lane-stateful stages (K / V and post convolutions,
+// position-scaled clips, cache store + attention) run as ONE launch over the pass's lanes, each lane reading its own
+// slot, position and id from the step block (the shared lane forms the CUDA cohort programs and the HIP eager lanes
+// run; each lane keeps the bits of its one-row step). A lone lane keeps the one-row step; a pass wider than a step
+// block or with host taps recorded keeps the per-lane launches. `selected` = STRIX_INKLING_HIP_LANES (default on).
+constexpr bool mini_served_pass_lanes(bool selected, unsigned rows, bool host_taps_off) noexcept {
+    return selected && host_taps_off && rows > 1U && rows <= exec::kStepMaxRows;
 }
 
 // HIP targets the exact down-image lever (inkling2-mini-combine-down-image@1) is qualified on: the NaN identity fixture and

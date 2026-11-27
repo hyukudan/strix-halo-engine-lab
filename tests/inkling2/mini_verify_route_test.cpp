@@ -133,6 +133,26 @@ constexpr bool check_cohort_lanes() {
 
 static_assert(check_cohort_lanes());
 
+// Served cohort passes (decode_slots_served, HIP): every multi-row pass of any cohort width takes the shared lane forms
+// (one launch over the pass's lanes) when selected and no host taps are recorded; a lone lane keeps its one-row step;
+// the off switch or recorded taps keep one launch per lane; no pass is wider than a step block.
+constexpr bool check_served_pass_lanes() {
+    using strix::inkling2::mini_served_pass_lanes;
+    constexpr unsigned one_row_cap = 16U;
+    static_assert(one_row_cap <= strix::exec::kStepMaxRows);
+    for (unsigned lanes = 1U; lanes <= 64U; ++lanes) {
+        const auto passes = strix::serve::plan_cohort_passes(lanes, strix::inkling2::mini_cohort_pass_cap(true, one_row_cap));
+        for (unsigned pass = 0; pass < passes.count; ++pass) {
+            const auto rows = passes.rows(pass);
+            if (mini_served_pass_lanes(true, rows, true) != (rows > 1U)) return false;
+            if (mini_served_pass_lanes(false, rows, true) || mini_served_pass_lanes(true, rows, false)) return false;
+        }
+    }
+    return !mini_served_pass_lanes(true, strix::exec::kStepMaxRows + 1U, true) && !mini_served_pass_lanes(true, 1U, true);
+}
+
+static_assert(check_served_pass_lanes());
+
 // The transaction MiniResidentDecoder::decode_slots runs (serve::run_cohort_passes, the production call): 17 lanes at
 // the HIP one-row cap 16 are passes of 9 + 8 rows; with ids = buf[0..17) and top = buf[1..18) the first pass's picks
 // would overwrite the first input of the second pass without the snapshot. A second pass that throws must leave every
