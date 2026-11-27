@@ -459,10 +459,11 @@ void test_lowbit_receipts() {
             "EXACT ignores the FAST receipt");
     require(!is_q4(mini::mini_lowbit_receipt_plan(profile::Name::fast, fast.scope, extent, {})),
             "missing receipt keeps the incumbent head");
-    for (const unsigned width : {1U, 8U, 16U})
-        require(mini::mini_lowbit_receipt_width(width), "measured decode step width");
-    for (const unsigned width : {0U, 2U, 15U, 17U})
-        require(!mini::mini_lowbit_receipt_width(width), "unmeasured or unknown step width");
+    // Every cohort width up to the band reads the same image, so a lane keeps its arm while the cohort grows and shrinks.
+    for (unsigned width = 1U; width <= mini::kMiniLowBitStepBand; ++width)
+        require(mini::mini_lowbit_receipt_width(width), "decode step width inside the band");
+    for (const unsigned width : {0U, 17U, 64U})
+        require(!mini::mini_lowbit_receipt_width(width), "empty or out-of-band step width");
 }
 
 void test_pack_admission() {

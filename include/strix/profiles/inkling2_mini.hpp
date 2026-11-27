@@ -89,10 +89,13 @@ inline constexpr weight::Digest256 kMiniCheckpoint =
 inline constexpr std::uint32_t kMiniLowBitStepBand = 16U;
 inline constexpr weight::WeightLoadExtent kMiniLowBitMeasuredExtent{16384U, 16U};
 
-// The receipt measured these active decode widths. Configured context and lanes must also be known
+// Active decode widths that read the bound low-bit image: every width from one row to the measured band. The low-bit
+// rows sum each (row, output) in a fixed K order, so a lane's bits do not depend on how many lanes share its pass; a
+// width outside the set would switch a lane between the low-bit and the BF16 image as the cohort grows and shrinks
+// (admission and tail), and its ids would follow the arrival timing. Configured context and lanes must also be known
 // and within the row's evidence caps.
 inline constexpr bool mini_lowbit_receipt_width(std::uint32_t rows) noexcept {
-    return rows == 1U || rows == 8U || rows == kMiniLowBitStepBand;
+    return rows >= 1U && rows <= kMiniLowBitStepBand;
 }
 
 inline constexpr std::array<weight::WeightLoadDecision, 1> kMiniWeightLoadDecisionRows{{
