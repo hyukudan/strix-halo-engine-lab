@@ -123,6 +123,7 @@ void exercise_session() {
     Backend backend;
     sv::GenerationQueue queue;
     sv::CohortConfig config;
+    config.prompt_share = 0.0;  // prompts never wait on decode debt (no wall-clock input): the grouping is deterministic
     config.context_draft = false;
     config.prompt_slice = 32;
     sv::CohortSession session(queue, backend, config);
@@ -219,6 +220,7 @@ void exercise_receipt_split() {
     Backend backend;
     sv::GenerationQueue queue;
     sv::CohortConfig config;
+    config.prompt_share = 0.0;  // prompts never wait on decode debt (no wall-clock input): the grouping is deterministic
     config.context_draft = false;
     config.prompt_slice = 1;
     double submit = -1.0, first = -1.0, done = -1.0;
@@ -248,6 +250,7 @@ void exercise_sampling() {
     backend.sampled = true;
     sv::GenerationQueue queue;
     sv::CohortConfig config;
+    config.prompt_share = 0.0;  // prompts never wait on decode debt (no wall-clock input): the grouping is deterministic
     config.context_draft = false;
     sv::CohortSession session(queue, backend, config);
     auto& runtime = session.runtime();
@@ -314,6 +317,7 @@ void exercise_hooks() {
     Backend backend;
     sv::GenerationQueue queue;
     sv::CohortConfig config;
+    config.prompt_share = 0.0;  // prompts never wait on decode debt (no wall-clock input): the grouping is deterministic
     config.context_draft = false;
     sv::CohortSessionHooks hooks;
     std::size_t prepared = 0, finished = 0;
@@ -384,6 +388,7 @@ void exercise_idle_and_annotate() {
         Backend backend;
         sv::GenerationQueue queue;
         sv::CohortConfig config;
+        config.prompt_share = 0.0;  // prompts never wait on decode debt (no wall-clock input): the grouping is deterministic
         config.context_draft = false;
         sv::CohortSessionHooks hooks;
         int beats = 0;
@@ -403,6 +408,7 @@ void exercise_idle_and_annotate() {
         backend.sampled = true;
         sv::GenerationQueue queue;
         sv::CohortConfig config;
+        config.prompt_share = 0.0;  // prompts never wait on decode debt (no wall-clock input): the grouping is deterministic
         config.context_draft = false;
         sv::CohortSessionHooks hooks;
         bool called = false, saw = false;
@@ -432,6 +438,7 @@ void exercise_compatibility() {
     Backend backend;
     sv::GenerationQueue queue;
     sv::CohortConfig config;
+    config.prompt_share = 0.0;  // prompts never wait on decode debt (no wall-clock input): the grouping is deterministic
     config.context_draft = false;
     sv::CohortSession braced(queue, backend, config, {});
     std::size_t validated = 0;
