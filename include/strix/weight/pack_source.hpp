@@ -21,7 +21,7 @@ private:
 };
 
 struct PackMatrixSource {
-    enum class Encoding { bf16, mxfp4, fp8_block, nvfp4, mxfp8 };
+    enum class Encoding { bf16, mxfp4, fp8_block, nvfp4, mxfp8, exl3 };
     Encoding encoding{};
     std::size_t rows{}, columns{};
     Slice codes, scales;
@@ -30,6 +30,12 @@ struct PackMatrixSource {
     // Row window of a larger microscaled matrix: `rows` logical rows starting at `first_row`
     // of a matrix with `matrix_rows` rows (0 means the window is the whole matrix).
     std::size_t first_row{}, matrix_rows{};
+    // exl3 (a third-party trellis linear, formats/exl3_dense.hpp): `codes` are the trellis rings (input-tile-major,
+    // 32 * K bytes per 16 x 16 tile, K = stored width / 16), `scales` the binary16 input scales suh (one per column)
+    // and `output_scales` the binary16 output scales svh (one per row). rows = outputs, columns = inputs, both whole
+    // 128-element blocks. decode() returns the dense FP32 weight the device computes. A tensor "<base>.trellis" binds
+    // together with "<base>.suh" and "<base>.svh".
+    Slice output_scales{};
 
     static Status bind(const PackCheckpoint&, const RawTensor&, PackMatrixSource&);
     static Status bind(const microscaled::MatrixView&, microscaled::RowOrder, std::size_t first,

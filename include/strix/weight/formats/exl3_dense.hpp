@@ -78,6 +78,24 @@ inline float coefficient(const Linear& linear, unsigned k, unsigned n) {
     return core::trellis::mul1_value(Format::state_bytes(tile, int(linear.bits), Format::position(k % 16U, n % 16U)));
 }
 
+// The transformed-domain coefficients Q of a ring stream as a dense input-major matrix, q[k * outputs + n] (no scales,
+// no Hadamard): the matrix the device core multiplies. Needs whole 16 x 16 tiles only, so it also serves test shapes
+// that are not 128-blocks. Rings are the little-endian byte stream of the checkpoint words.
+inline std::vector<float> coefficients_kn(std::span<const std::uint8_t> rings, unsigned inputs, unsigned outputs,
+                                          unsigned bits) {
+    if (bits < 1 || bits > 8) throw std::invalid_argument("EXL3 bits must be in 1..8");
+    if (inputs == 0 || outputs == 0 || inputs % 16U || outputs % 16U)
+        throw std::invalid_argument("EXL3 coefficients need whole 16 x 16 tiles");
+    const std::size_t tiles = std::size_t{inputs / 16U} * (outputs / 16U);
+    if (rings.size() != tiles * static_cast<std::size_t>(core::trellis::Format::tile_bytes(int(bits))))
+        throw std::invalid_argument("EXL3 ring bytes do not match the matrix shape");
+    const Linear shape{rings, {}, {}, inputs, outputs, bits};
+    std::vector<float> q(std::size_t{inputs} * outputs);
+    for (unsigned k = 0; k < inputs; ++k)
+        for (unsigned n = 0; n < outputs; ++n) q[std::size_t{k} * outputs + n] = coefficient(shape, k, n);
+    return q;
+}
+
 // The dense weight W (outputs x inputs, output-major) of one EXL3 linear.
 inline std::vector<float> dense_rows(const Linear& linear) {
     validate(linear);

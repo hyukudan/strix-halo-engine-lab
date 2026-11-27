@@ -5,13 +5,16 @@
 //  3. the transformed-domain coefficients equal the shared registry decoder's (src/weight/formats/exl3.cpp layout:
 //     output-major rows, Format::tile(input tile, output tile));
 //  4. malformed shapes, ring sizes and nonfinite scales are refused.
+#include "minimax/rtxpf/fp32_identity_ref.hpp"
 #include "strix/weight/formats/exl3_dense.hpp"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -129,6 +132,33 @@ void registry_layout(std::mt19937& rng) {
     check(same, "the reader's coefficients are the registry decoder's");
 }
 
+// The FP32 prefill identity host reference (src/minimax/rtxpf/fp32_identity_ref.hpp) expands a trellis matrix into dense
+// FP32 w[k * output + n] with the MUL1 codebook. Its decode binds to coefficients_kn; this proves the two give the same
+// floats (bit patterns) on every codebook state and on random matrices at every rate, so the private copy can be deleted.
+void identity_reference_binding(std::mt19937& rng) {
+    namespace R = strix::minimax::rtxpf::ref;
+    bool codebook = true;
+    for (std::uint32_t state = 0; state < 65536U; ++state)
+        codebook = codebook && R::bits_of(R::mul1(state)) == R::bits_of(strix::core::trellis::mul1_value(state));
+    check(codebook, "the identity reference codebook equals the shared MUL1 value on all 65536 states");
+    for (const unsigned bits : {2U, 3U, 4U, 5U, 6U, 8U})
+        for (const auto shape : {std::pair{32U, 48U}, std::pair{128U, 256U}, std::pair{256U, 16U}}) {
+            const auto [input, output] = shape;
+            std::vector<std::uint32_t> words(std::size_t{input / 16U} * (output / 16U) * bits * 8U);
+            for (auto& w : words) w = static_cast<std::uint32_t>(rng());
+            std::vector<std::uint8_t> bytes;
+            for (const auto w : words)
+                for (unsigned b = 0; b < 4U; ++b) bytes.push_back(static_cast<std::uint8_t>(w >> (8U * b)));
+            const auto reference = R::decode(words.data(), input, output, static_cast<int>(bits));
+            const auto shared = ed::coefficients_kn(bytes, input, output, bits);
+            char what[96];
+            std::snprintf(what, sizeof what, "identity reference decode equals coefficients_kn (%u x %u, %u bits)", input, output, bits);
+            check(reference.size() == shared.size() &&
+                      std::memcmp(reference.data(), shared.data(), shared.size() * sizeof(float)) == 0, what);
+        }
+    check(refuses([&] { (void)ed::coefficients_kn(std::vector<std::uint8_t>(31), 16, 16, 1); }), "a short ring stream is refused by coefficients_kn");
+}
+
 void refusals(std::mt19937& rng) {
     auto pack = synthetic(128, 128, 4, rng);
     auto bad = pack.linear;
@@ -152,6 +182,7 @@ int main() {
     for (const unsigned bits : {2U, 3U, 4U, 5U, 6U, 8U}) staged_equivalence(128, 256, bits, rng);
     staged_equivalence(384, 128, 6, rng);
     registry_layout(rng);
+    identity_reference_binding(rng);
     refusals(rng);
     if (failures) return 1;
     std::printf("exl3 dense reader: all checks passed\n");

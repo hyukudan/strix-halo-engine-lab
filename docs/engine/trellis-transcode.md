@@ -32,13 +32,29 @@ container, identity and conformance tests as a pack made from a BF16 checkpoint.
 - the reader's coefficients are the shared registry decoder's (same tile and ring position);
 - malformed shapes, short ring streams, rates above 8 bits and nonfinite scales are refused.
 
+## Pack builder source (tests/weight_exl3_pack_tests.cpp)
+
+`strix::weight::PackMatrixSource` has an `exl3` encoding: a tensor named `<base>.trellis` (I16 or U16, shape
+`[in/16, out/16, 16*K]`, K in 1..8) binds together with `<base>.suh` (F16 `[in]`) and `<base>.svh` (F16 `[out]`) and
+decodes to `dense_rows` (rows = outputs, columns = inputs; both whole 128-blocks). `strix-lowbit-calib-pack` selects it
+like any other matrix (`--storage q_proj.trellis=sp4`) and the rest of the tool is unchanged: with `--moments` the
+calibrated coders run on the dense rows, without them the existing uncalibrated rule (`--technique rtn`) applies. The
+source digest covers the rings and both scale vectors. Pack tensor names are the `.trellis` names.
+
+Conformance (2, 3, 4, 5, 6, 8 bits): bind and decode equal `dense_rows` bit for bit; the SP4 rows (bytes and header) of
+the source equal those of the dense FP32 matrix packed directly; the shared SP4 row decoder returns the coder's values;
+refusals cover widths that are not 16*K, K outside 1..8, payload and shape disagreement, shapes outside 128-blocks,
+missing, mis-sized or mis-typed `suh` / `svh`.
+
+`coefficients_kn` returns the transformed-domain matrix `Q[k * outputs + n]` (no scales, no Hadamard). The FP32 prefill
+identity host reference (`src/minimax/rtxpf/fp32_identity_ref.hpp`) expands its dense copy through it; the test proves the
+reference and the shared reader give the same floats on all 65536 codebook states and on random matrices at every rate.
+
 ## What remains (in order)
 
-1. Source binding: an EXL3 entry in `include/strix/weight/pack_source.hpp` so `strix-lowbit-calib-pack` reads a trellis
-   tensor (rings + `suh` + `svh` by the pack's tensor names, given as data in the model TOML) through `dense_rows`.
-2. Calibration moments per role from text already on disk (no downloads), then the SP4 pack of the attention projections
-   (and the MiniMax head) with its identity.
-3. Consumer: the pair engines' attention projections read the shared grouped SP4 rows (`src/core/resident_q8_rows.hpp`)
+1. Calibration moments per role from text already on disk (no downloads), then the SP4 pack of the attention
+   projections (and the MiniMax head) with its identity.
+2. Consumer: the pair engines' attention projections read the shared grouped SP4 rows (`src/core/resident_q8_rows.hpp`)
    in decode, decode-only beside the trellis image (the Inkling 2 Mini arm is the pattern); ISA loop on the node.
-4. Gate v2 per band on the pair with the held-out window set, then ABAB, then FAST / TURBO columns with decode ladder
-   rows. The private dense decoder in `src/minimax/rtxpf/fp32_identity_ref.hpp` binds to this reader and is deleted.
+3. Gate v2 per band on the pair with the held-out window set, then ABAB, then FAST / TURBO columns with decode ladder
+   rows.

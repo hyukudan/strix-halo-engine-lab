@@ -3,6 +3,7 @@
 #include "core/sha256.hpp"
 #include "strix/serve/json.hpp"
 #include "strix/weight/confined_file.hpp"
+#include "strix/weight/formats/exl3_dense.hpp"
 #include "strix/weight/formats/fp8_block.hpp"
 #include "strix/weight/formats/microscaled.hpp"
 
@@ -26,7 +27,7 @@ Digest256 matrix_digest(PackMatrixSource::Encoding encoding, const Digest256& co
     constexpr std::string_view tag = "strix-pack-source/v1";
     core::Sha256 hash;
     hash.update(tag.data(), tag.size());
-    constexpr char kinds[] = "-mfnx";
+    constexpr char kinds[] = "-mfnxe";
     const char kind = kinds[static_cast<std::size_t>(encoding)];
     hash.update(&kind, 1);
     append(hash, codes);
@@ -50,6 +51,75 @@ Digest256 windowed_digest(const PackMatrixSource& source, const Digest256& whole
         hash.update(le.data(), le.size());
     }
     return {hash.finish()};
+}
+
+// The trellis width K (bits per weight) a ring payload of this geometry encodes; 0 when it is not a whole 1..8.
+unsigned exl3_bits(std::size_t rows, std::size_t columns, std::uint64_t ring_bytes) {
+    if (rows == 0 || columns == 0 || rows % exl3_dense::kBlock || columns % exl3_dense::kBlock) return 0;
+    const std::uint64_t per_bit = (rows / 16U) * (columns / 16U) * 32U;
+    if (ring_bytes % per_bit) return 0;
+    const auto bits = ring_bytes / per_bit;
+    return bits >= 1U && bits <= 8U ? static_cast<unsigned>(bits) : 0U;
+}
+
+Status bind_exl3(const PackCheckpoint& checkpoint, const RawTensor& tensor, PackMatrixSource& out) {
+    constexpr std::string_view suffix = ".trellis";
+    const auto base = std::string_view(tensor.name).substr(0, tensor.name.size() - suffix.size());
+    if (tensor.wire_dtype != "I16" && tensor.wire_dtype != "U16")
+        return {Error::unknown_format, tensor.name + ": expected I16 or U16 trellis rings"};
+    if (tensor.shape.rank != 3U || tensor.shape.dims[0] == 0 || tensor.shape.dims[1] == 0)
+        return {Error::unsupported_shape, tensor.name + ": expected a nonempty rank-3 [in/16, out/16, 16*K] trellis"};
+    const auto width = tensor.shape.dims[2];
+    if (width % 16U != 0U || width / 16U < 1U || width / 16U > 8U)
+        return {Error::unsupported_shape, tensor.name + ": trellis width must be 16*K with K in 1..8"};
+    constexpr std::uint64_t limit = std::numeric_limits<std::size_t>::max() / sizeof(float) / 16U;
+    const auto columns = tensor.shape.dims[0] * 16U, rows = tensor.shape.dims[1] * 16U;
+    if (tensor.shape.dims[0] > limit || tensor.shape.dims[1] > limit || rows > limit * 16U / columns)
+        return {Error::unsupported_shape, tensor.name + ": matrix size overflow"};
+    if (rows % exl3_dense::kBlock || columns % exl3_dense::kBlock)
+        return {Error::unsupported_shape, tensor.name + ": dense form needs whole 128-element blocks"};
+    if (tensor.payload.range.bytes != tensor.shape.dims[0] * tensor.shape.dims[1] * width * 2U)
+        return {Error::malformed, tensor.name + ": trellis payload disagrees with its shape"};
+    const auto* suh = checkpoint.find(std::string(base) + ".suh");
+    const auto* svh = checkpoint.find(std::string(base) + ".svh");
+    if (!suh || !svh) return {Error::malformed, tensor.name + ": missing .suh or .svh scale tensor"};
+    if (suh->wire_dtype != "F16" || svh->wire_dtype != "F16" || suh->shape.rank != 1U || svh->shape.rank != 1U ||
+        suh->shape.dims[0] != columns || svh->shape.dims[0] != rows)
+        return {Error::malformed, tensor.name + ": .suh / .svh must be F16 vectors of the input / output width"};
+    out = PackMatrixSource{PackMatrixSource::Encoding::exl3, static_cast<std::size_t>(rows),
+                           static_cast<std::size_t>(columns), tensor.payload, suh->payload};
+    out.output_scales = svh->payload;
+    return ok;
+}
+
+Status decode_exl3(const PackMatrixSource& source, std::vector<float>& out, Digest256* digest_out) {
+    const auto bits = exl3_bits(source.rows, source.columns, source.codes.range.bytes);
+    if (!bits || source.matrix_rows || source.first_row || source.scales.range.bytes != 2U * source.columns ||
+        source.output_scales.range.bytes != 2U * source.rows)
+        return {Error::malformed, "EXL3 source payload disagrees with matrix geometry"};
+    std::vector<std::uint8_t> rings(static_cast<std::size_t>(source.codes.range.bytes));
+    std::vector<std::uint8_t> suh_bytes(static_cast<std::size_t>(source.scales.range.bytes));
+    std::vector<std::uint8_t> svh_bytes(static_cast<std::size_t>(source.output_scales.range.bytes));
+    if (const auto s = read_slice(source.codes, std::as_writable_bytes(std::span(rings))); !s) return s;
+    if (const auto s = read_slice(source.scales, std::as_writable_bytes(std::span(suh_bytes))); !s) return s;
+    if (const auto s = read_slice(source.output_scales, std::as_writable_bytes(std::span(svh_bytes))); !s) return s;
+    const auto halves = [](const std::vector<std::uint8_t>& bytes) {
+        std::vector<std::uint16_t> values(bytes.size() / 2U);
+        for (std::size_t i = 0; i < values.size(); ++i)
+            values[i] = static_cast<std::uint16_t>(bytes[2U * i] | (std::uint32_t{bytes[2U * i + 1U]} << 8U));
+        return values;
+    };
+    const auto suh = halves(suh_bytes), svh = halves(svh_bytes);
+    try {
+        out = exl3_dense::dense_rows({rings, suh, svh, static_cast<unsigned>(source.columns),
+                                      static_cast<unsigned>(source.rows), bits});
+    } catch (const std::exception& error) {
+        return {Error::malformed, error.what()};
+    }
+    if (digest_out)
+        *digest_out = matrix_digest(PackMatrixSource::Encoding::exl3, digest_bytes(std::as_bytes(std::span(rings))),
+                                    digest_bytes(std::as_bytes(std::span(suh_bytes))), std::as_bytes(std::span(svh_bytes)));
+    return ok;
 }
 }  // namespace
 
@@ -140,6 +210,7 @@ Status PackCheckpoint::digest(Digest256& out) const {
 }
 
 Status PackMatrixSource::bind(const PackCheckpoint& checkpoint, const RawTensor& tensor, PackMatrixSource& out) {
+    if (tensor.name.ends_with(".trellis")) return bind_exl3(checkpoint, tensor, out);
     auto logical_rows = tensor.shape.dims[0], logical_columns = tensor.shape.dims[1];
     const bool mxfp4 = tensor.wire_dtype == "I8";
     const bool fp8 = tensor.wire_dtype == "F8_E4M3" || tensor.wire_dtype == "F8_E4M3FN";
@@ -223,6 +294,12 @@ Status PackMatrixSource::digest(Digest256& out) const {
     if (const auto s = digest_slice(codes, raw); !s) return s;
     if (encoding != Encoding::bf16)
         if (const auto s = digest_slice(scales, scale); !s) return s;
+    if (encoding == Encoding::exl3) {
+        std::vector<Byte> svh(static_cast<std::size_t>(output_scales.range.bytes));
+        if (const auto s = read_slice(output_scales, svh); !s) return s;
+        out = matrix_digest(encoding, raw, scale, svh);
+        return ok;
+    }
     if (encoding == Encoding::nvfp4) {
         std::array<Byte, 4> max{}, divisor{};
         if (const auto s = read_slice(amax, max); !s) return s;
@@ -249,6 +326,7 @@ Status PackMatrixSource::decode(std::vector<float>& out, Digest256* digest_out) 
     constexpr auto limit = std::numeric_limits<std::size_t>::max() / sizeof(float);
     if (!rows || !columns || columns > limit || rows > limit / columns)
         return {Error::unsupported_shape, "invalid pack source matrix geometry"};
+    if (encoding == Encoding::exl3) return decode_exl3(*this, out, digest_out);
     const auto count = rows * columns;
     const auto total_rows = matrix_rows ? matrix_rows : rows;
     if (first_row > total_rows || rows > total_rows - first_row ||
