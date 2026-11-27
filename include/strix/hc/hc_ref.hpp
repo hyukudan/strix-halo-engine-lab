@@ -43,13 +43,4 @@ void collapse_rms_bf16(const Spec& spec, std::span<const float> streams, std::sp
 void expand(const Spec& spec, std::span<const float> sub, std::span<const float> residual, const Mix& mix,
             std::span<float> out);
 
-// Stream-major [streams][hidden] to feature-major [hidden][streams]: the order of a mixing matrix whose columns
-// are grouped by feature (FnLayout and checkpoint conventions that interleave the streams of one feature).
-[[nodiscard]] inline std::vector<float> interleave_features(const Spec& spec, std::span<const float> streams) {
-    std::vector<float> ordered(streams.size());
-    for (std::size_t d = 0; d < spec.hidden; ++d)
-        for (std::size_t c = 0; c < spec.streams; ++c) ordered[d * spec.streams + c] = streams[c * spec.hidden + d];
-    return ordered;
-}
-
 } // namespace strix::hc
