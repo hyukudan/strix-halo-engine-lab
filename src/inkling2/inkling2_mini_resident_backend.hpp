@@ -704,10 +704,10 @@ public:
 #endif
 
 #if defined(__HIPCC__)
-    // The whole low-rank controller (readout or given message, operand norms, down, gates, controller, final norm) as one
-    // block-per-row launch for the row counts the shared plan prefers it at (controller_block::preferred: 9..16 decode,
-    // verify and cohort rows; STRIX_RESIDUAL_CONTROLLER_FUSED=0 keeps the launches); false = the caller keeps the
-    // launches. Same bits either way.
+    // The whole low-rank controller (readout or given message, operand norms, down, gates, controller, final norm) as the
+    // shared fused controller (two launches) for the row counts the shared plan prefers it at (controller_block::preferred:
+    // 1..16 decode, verify and cohort rows; STRIX_RESIDUAL_CONTROLLER_FUSED=0 keeps the launches); false = the caller
+    // keeps the launches. Same bits either way.
     bool fused_controller(core::controller_block::Args args) {
         if (!controller_fused_ || !core::controller_block::preferred(args.rows)) return false;
         args.norm_epsilon = kMiniHipRmsEpsilon;
@@ -1562,7 +1562,7 @@ private:
     // Fused decode transitions (HIP), read once: the residual bank batch of each pass's controller messages
     // (STRIX_RESIDUAL_BANK_BATCH=0 keeps one readout per controller) and the MoE tail (STRIX_MOE_TAIL=0).
     bool bank_batch_ = env_flag_default_on("STRIX_RESIDUAL_BANK_BATCH");
-    // The block-per-row controller launch (STRIX_RESIDUAL_CONTROLLER_FUSED=0 keeps the six launches).
+    // The shared fused controller (STRIX_RESIDUAL_CONTROLLER_FUSED=0 keeps the launches).
     bool controller_fused_ = env_flag_default_on("STRIX_RESIDUAL_CONTROLLER_FUSED");
     bool moe_tail_ = mini_moe_tail_switch();
     // The bank whose message rows the last batch produced (the controller scratch after one controller row).
