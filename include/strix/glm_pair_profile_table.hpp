@@ -133,6 +133,12 @@ inline constexpr strix::profile::LadderRow product_ladder_rows[] = {
                 "lower edge 2,049: EXACT 3.83 s, FAST 2.79 s (x1.37); 4,096: x1.47",
      .identity = "v1", .band_bound = true, .band_evidence = {{2049, 4096, 8192}, {2304, 8192}, kFastGatePfWmma, false}}};
 #undef STRIX_GLM_TURBO_ARM
+// The longest prompt a band-bound pf_wmma row covers on the measured device (today the FAST band edge, 8,192): serve
+// asks the ladder per prompt up to it (serve_prefill_work), so widening the band is a change of its row only. TURBO
+// literal rows do not widen it: they stay CLI-only.
+inline constexpr std::uint64_t kPrefillBandMaxPrompt = strix::profile::band_max_context(
+    product_ladder_rows, "pf_wmma", strix::profile::Phase::prefill, kTurboPrefillDevice);
+static_assert(kPrefillBandMaxPrompt >= kPrefillProbePrompt, "the startup probe prompt lies inside the FAST band");
 inline const strix::profile::Engine product_profile_engine{"glm-pair", "", product_profile_table, false, "glm-turbo-v1",
                                                            {}, {}, product_ladder_rows};
 

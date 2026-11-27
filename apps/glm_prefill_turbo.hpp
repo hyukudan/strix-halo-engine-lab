@@ -56,6 +56,7 @@ inline void report_prefill_wmma(unsigned rank, const Request& r, const Effective
     // The first unmet condition of select_prefill_wmma, in its order (the pair_ready vote folds device, link, layout
     // and the whole-prompt route of the entry point).
     const char* why = selected ? "matched 8060S USB4 TP2 ladder row"
+        : !work.pair_ready && work.prompt > kPrefillBandMaxPrompt ? "outside measured execution: prompt above the FAST band"
         : !work.pair_ready ? "outside measured execution: pair device / link / layout / prompt route"
         : !ordinary_lossy_prefill(r, e) ? "outside measured execution: not the ordinary pair workload"
         : !measured_prefill_switches(e, env) ? "outside measured execution: prefill composition"

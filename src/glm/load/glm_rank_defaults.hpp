@@ -359,11 +359,13 @@ inline PrefillWork single_lane_prefill(bool ready, std::uint64_t prompt, std::ui
     return {ready, prompt, capacity, rows, 1U, generated, routed_scratch, link};
 }
 
-// Only the FAST band receipt applies to serve, including when TURBO inherits it.
+// Only the FAST band receipt applies to serve, including when TURBO inherits it: a fresh whole prompt (one call; with
+// no decoding cohort the scheduler sends the rest of the prompt at once and the engine cuts it into max_rows pieces,
+// as the CLI does) asks the ladder up to the band's own upper edge (kPrefillBandMaxPrompt, data of the band row).
 inline PrefillWork serve_prefill_work(bool pair_ready, bool fresh, std::uint64_t prompt, std::uint64_t capacity,
                                       unsigned rows, unsigned generated, bool routed_scratch,
                                       std::string_view link = kMeasuredPrefillLayouts[0]) {
-    return single_lane_prefill(pair_ready && fresh && prompt <= kPrefillProbePrompt,
+    return single_lane_prefill(pair_ready && fresh && prompt <= kPrefillBandMaxPrompt,
                                prompt, capacity, rows, generated, routed_scratch, link);
 }
 

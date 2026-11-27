@@ -219,6 +219,11 @@ void glm() {
     check(!rd::select_prefill_wmma(c1_turbo, c1_turbo_config, none,
               rd::serve_prefill_work(true, true, 31258, 36864, 8192, 64, true)),
           "GLM serve does not select the CLI-only 32K TURBO receipt");
+    // The served prompt gate is the FAST band row's own upper edge (data), not a literal: today 8,192.
+    static_assert(rd::kPrefillBandMaxPrompt == 8192, "GLM FAST pf_wmma band edge (gate v2 windows of 8,192 tokens)");
+    check(rd::serve_prefill_work(true, true, rd::kPrefillBandMaxPrompt, 36864, 8192, 64, true).pair_ready &&
+              !rd::serve_prefill_work(true, true, rd::kPrefillBandMaxPrompt + 1, 36864, 8192, 64, true).pair_ready,
+          "GLM serve asks the ladder up to the FAST band edge and not beyond");
     // Scratch storage (full arena vs routed) is spelled in the execution key: the band row binds either (the gate and
     // the FAST timing ran on the full arena), the TURBO literal key names routed scratch only.
     verify_profile("fast", {true, 8192, 8448, 8192, 1, 64, false}, none, true);
