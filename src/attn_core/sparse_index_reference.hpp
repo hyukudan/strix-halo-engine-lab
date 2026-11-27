@@ -1,11 +1,15 @@
 #pragma once
 
-#include "../core/linear_reference.hpp"
+#include "attn_core/masks.hpp"
+#include "attn_core/rotary_reference.hpp"
+#include "core/bf16_reference.hpp"
+#include "core/hadamard_reference.hpp"
 #include "strix/weight/formats/scalar_float.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <numeric>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -64,6 +68,62 @@ inline void unpack_index_fp4_reference(std::span<const std::uint8_t> entry, std:
         key[i] = codec::e2m1(code) * codec::e8m0(entry[key.size() / 2U + i / 32U]);
     }
 }
+
+inline void index_layer_norm_reference(std::span<float> key, std::span<const float> weight,
+                                       std::span<const float> bias, float epsilon) {
+    if (key.empty() || weight.size() != key.size() || bias.size() != key.size())
+        throw std::invalid_argument("sparse index: invalid key normalization shape");
+    const float width = static_cast<float>(key.size());
+    const float mean = std::accumulate(key.begin(), key.end(), 0.0F) / width;
+    float square = 0.0F;
+    for (const float value : key) square = std::fma(value - mean, value - mean, square);
+    const float inv = 1.0F / std::sqrt(square / width + epsilon);
+    for (std::size_t i = 0; i < key.size(); ++i) key[i] = ((key[i] - mean) * inv) * weight[i] + bias[i];
+    core::round_bf16_reference(key);
+}
+
+inline void rotate_index_rows_reference(std::span<float> rows, unsigned width,
+                                        const RotaryReferenceRow& rope, bool leading, bool bf16) {
+    if (leading) rope.apply_leading(rows, width);
+    else rope.apply(rows, width);
+    for (std::size_t offset = 0; offset < rows.size(); offset += width) {
+        auto row = rows.subspan(offset, width);
+        if (bf16) core::round_bf16_reference(row);
+        core::hadamard_reference(row);
+        if (bf16) core::round_bf16_reference(row);
+    }
+}
+
+inline void quantize_index_query_reference(std::span<float> queries, unsigned width) {
+    if (width == 0 || queries.size() % width != 0)
+        throw std::invalid_argument("sparse index: invalid query width");
+    for (std::size_t offset = 0; offset < queries.size(); offset += width) {
+        auto row = queries.subspan(offset, width);
+        const auto packed = pack_index_fp4_reference(row);
+        unpack_index_fp4_reference(packed, row);
+    }
+}
+
+struct SparseWindowReference {
+    std::size_t visible, history;
+    unsigned budget;
+
+    SparseWindowReference(unsigned position, unsigned window, unsigned top_k)
+        : visible(std::size_t{position} + 1U),
+          history(window == 0 ? visible : mask::window_lo(position, window)), budget(top_k) {}
+
+    [[nodiscard]] bool dense() const { return history <= budget; }
+
+    [[nodiscard]] std::vector<std::uint32_t> dense_rows() const {
+        std::vector<std::uint32_t> rows(visible);
+        std::iota(rows.begin(), rows.end(), 0U);
+        return rows;
+    }
+
+    void append_window(std::vector<std::uint32_t>& rows) const {
+        for (auto row = history; row < visible; ++row) rows.push_back(static_cast<std::uint32_t>(row));
+    }
+};
 
 inline std::vector<float> index_head_weights_reference(std::span<const float> weights,
     std::span<const float> gate, std::span<const float> bias, unsigned retained) {

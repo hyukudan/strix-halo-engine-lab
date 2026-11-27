@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/ernie/engine.hpp"
+#include "strix/attn/reference_history.hpp"
 
 #include <cstdint>
 #include <string>
@@ -24,13 +25,9 @@ private:
     friend std::vector<float> attention_reference_first_hca(const std::string&, const ReferenceShape&,
         const ReferenceRead&, std::span<const float>, const AttentionProject&);
 
-    struct {
-        std::vector<float> window, window_values, compressed, carry_values, carry_logits, folded_mix;
-    } hca_;
-    struct {
-        std::vector<float> latents, rotary_keys, inverse_key_rms, folded_mix;
-        std::vector<std::uint8_t> index_keys;
-    } mla_;
+    attn::CompressedReferenceHistory hca_;
+    attn::LatentReferenceHistory mla_;
+    std::vector<float> folded_mix_;
     unsigned layer_ = kLayerCount;
     unsigned position_{};
     std::size_t max_rows_ = data::dims::max_context;

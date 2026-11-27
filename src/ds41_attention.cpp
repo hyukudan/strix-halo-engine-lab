@@ -3,6 +3,7 @@
 // are the device's bits; see docs/models/deepseek-v4.1/attention.md for the declared order.
 #include "strix/ds41_attention.hpp"
 
+#include "attn_core/masks.hpp"
 #include "attn_core/sparse_index_reference.hpp"
 #include "strix/deepseek41_model.hpp"
 
@@ -282,7 +283,7 @@ void attention(const AttentionArgs& a, std::span<const std::uint8_t> ring, std::
     for (std::size_t r = 0; r < rows; ++r) {
         const std::uint64_t p = a.pos[r];
         const RopeRow rope = rope_row(a.rope, p);
-        const unsigned nw = static_cast<unsigned>(std::min<std::uint64_t>(p + 1, kWindow));
+        const unsigned nw = attn_core::mask::window_count(p, kWindow);
         const unsigned nc = a.idx_count.empty() ? 0U : a.idx_count[r];
         const unsigned n = nw + nc, chunks = (n + kChunk - 1) / kChunk;
         const auto key = [&](unsigned j) {

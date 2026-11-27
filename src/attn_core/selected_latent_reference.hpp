@@ -1,8 +1,10 @@
 #pragma once
 
 #include "attn_core/causal_gqa_reference.hpp"
+#include "attn_core/reference_cache.hpp"
 #include "core/linear_reference.hpp"
 #include "strix/attn/group_pool.hpp"
+#include "strix/attn/reference_history.hpp"
 
 #include <functional>
 
@@ -41,6 +43,31 @@ struct SelectedLatentProjection {
 struct SelectedLatentRow {
     std::span<const float> latent, rotary_key, inverse_rms;
 };
+
+inline void validate_latent_history(SelectedLatentShape s, unsigned position,
+                                    const attn::LatentReferenceHistory& state) {
+    if (state.inverse_key_rms.size() != std::size_t{position} * s.heads)
+        throw std::invalid_argument("latent attention: history geometry changed");
+}
+
+inline SelectedLatentRow cached_latent_row(SelectedLatentShape s, std::size_t row,
+                                           const attn::LatentReferenceHistory& state) {
+    return {std::span(state.latents).subspan(row * s.latent, s.latent),
+            std::span(state.rotary_keys).subspan(row * s.rotary, s.rotary),
+            std::span(state.inverse_key_rms).subspan(row * s.heads, s.heads)};
+}
+
+inline void commit_latent_history(attn::LatentReferenceHistory& state, SelectedLatentRow row,
+                                  std::span<const std::uint8_t> index_entry) {
+    detail::reserve_append(state.latents, row.latent.size());
+    detail::reserve_append(state.rotary_keys, row.rotary_key.size());
+    detail::reserve_append(state.inverse_key_rms, row.inverse_rms.size());
+    detail::reserve_append(state.index_keys, index_entry.size());
+    state.latents.insert(state.latents.end(), row.latent.begin(), row.latent.end());
+    state.rotary_keys.insert(state.rotary_keys.end(), row.rotary_key.begin(), row.rotary_key.end());
+    state.inverse_key_rms.insert(state.inverse_key_rms.end(), row.inverse_rms.begin(), row.inverse_rms.end());
+    state.index_keys.insert(state.index_keys.end(), index_entry.begin(), index_entry.end());
+}
 
 inline SelectedLatentProjection split_latent_projection(SelectedLatentShape s, std::span<const float> weights,
                                                         bool global_split = false) {
