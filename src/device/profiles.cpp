@@ -59,9 +59,11 @@ Profile parse_profile(const Table& row) {
         profile.legacy_hip_receipt_product = field<std::string>(row, "legacy_hip_receipt_product");
     if (row.contains("unmeasured")) profile.unmeasured = field<bool>(row, "unmeasured");
     if (profile.unmeasured && (!profile.measured.empty() || profile.lowbit_rows.small_rows ||
-                               profile.memory_bytes || profile.memory_gbytes_ps || profile.peaks.fp32 ||
-                               profile.peaks.fp16 || profile.peaks.bf16 || profile.peaks.fp8 ||
-                               profile.peaks.fp4 || profile.peaks.int8 || !profile.legacy_hip_receipt_product.empty()))
+                               profile.memory_bytes || static_cast<bool>(profile.memory_gbytes_ps) ||
+                               static_cast<bool>(profile.peaks.fp32) || static_cast<bool>(profile.peaks.fp16) ||
+                               static_cast<bool>(profile.peaks.bf16) || static_cast<bool>(profile.peaks.fp8) ||
+                               static_cast<bool>(profile.peaks.fp4) || static_cast<bool>(profile.peaks.int8) ||
+                               !profile.legacy_hip_receipt_product.empty()))
         throw std::invalid_argument("device profiles: an unmeasured profile supplies hardware identity only");
     return profile;
 }
