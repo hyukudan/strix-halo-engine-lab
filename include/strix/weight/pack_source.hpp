@@ -27,8 +27,13 @@ struct PackMatrixSource {
     Slice codes, scales;
     Slice amax{}, denominator{};
     microscaled::RowOrder row_order{};
+    // Row window of a larger microscaled matrix: `rows` logical rows starting at `first_row`
+    // of a matrix with `matrix_rows` rows (0 means the window is the whole matrix).
+    std::size_t first_row{}, matrix_rows{};
 
     static Status bind(const PackCheckpoint&, const RawTensor&, PackMatrixSource&);
+    static Status bind(const microscaled::MatrixView&, microscaled::RowOrder, std::size_t first,
+                       std::size_t count, PackMatrixSource&);
     // When requested, hash the exact bytes already staged for this decode.
     Status decode(std::vector<float>& out, Digest256* digest = nullptr) const;
     Status digest(Digest256& out) const;

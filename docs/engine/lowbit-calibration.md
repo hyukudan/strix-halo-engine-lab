@@ -122,6 +122,39 @@ At 108 GiB, all SP2 uses 91.5 GiB and SP2 with 3,225 experts promoted to SP3 use
 footprint can be reproduced with synthetic positive route counts for any 3,225 experts. Actual selection
 requires a route capture. These are model weight estimates.
 
+
+### Inkling 2 Mini CPU role study
+
+Use the CPU reference with --pack-study tokenize TOKENIZER_JSON TEXT to produce plain token IDs.
+Put the fit windows and held-out windows in separate manifests. Each line is NAME TOKEN_COUNT IDS_PATH.
+Each ID file contains whitespace-separated decimal IDs.
+
+The capture subcommand takes CHECKPOINT FIT_MANIFEST NEW_DIRECTORY and writes fit.moments and
+routes.json. The diagonal moments track the row presented to each projection. Embedding lookup
+records unit channel gains and a separate per-token count. Route counts sum logical visits into
+physical layers. A gate or up expert entry names one logical half of the fused source, decoded with
+the same BF16 conversion as the exact CPU projection.
+
+The qualification script's inventory command records geometry and retained bytes. Its arm command
+writes a description for one role, format and coder. A matrices entry has name, rows, columns,
+format and an optional coder. An explicit keep entry needs source_bytes. Expert projections accept
+the same fields and an optional unobserved_coder for experts with zero captured routes. Passing
+--routes for an importance description sets that fallback to RTN. Feed the description to the
+plan tool and the resulting TSV to the packer with --inkling2-mini. A coder column overrides
+--technique for its row. Provide --moments and --heldout for calibrated rows.
+
+The score subcommand takes CHECKPOINT HELDOUT_MANIFEST NEW_DIRECTORY [PACK] and writes
+full-vocabulary FP32 logits and a route trace per window. Omit PACK for the exact control.
+Set STRIX_MOE_ROUTES_IN to the control directory for replay and also run a free arm for route flips.
+The score-head subcommand reuses the exact hidden rows and runs only the output projection.
+The study reducer reports pooled KL, agreement and delta NLL. Its B1 weight byte model uses
+200,058 head rows, one embedding row and eight experts per visit. Container metadata,
+CPU staging, activation traffic and elapsed time are outside this byte count.
+
+The choose subcommand searches measured role options to maximize bytes saved under the chosen
+pooled limits. It adds KL and disagreement and sums positive delta NLL. Its output is a model
+description and a prediction. Score the combined pack on the same held-out windows to verify
+that prediction. Tier qualification uses the gate's null, class and window rules.
 ## Procedure
 
 1. Collect statistics with an engine that binds the taps (Inkling 2 Mini: `STRIX_CALIB_MOMENTS=FILE` on an EXACT

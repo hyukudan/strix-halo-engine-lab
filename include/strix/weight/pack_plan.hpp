@@ -20,6 +20,7 @@ struct PackPlanEntry {
     std::string tensor;
     FormatId storage;  // Empty for a tensor kept in its source representation.
     std::uint64_t bytes{};
+    std::string coder;
 };
 
 struct PackPlan {

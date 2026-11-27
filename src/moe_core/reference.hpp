@@ -10,6 +10,7 @@
 #include <numeric>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 namespace strix::moe {
@@ -51,13 +52,14 @@ void combine_routed_reference(std::size_t intermediate, std::span<const float> i
 
 // One row of routed MoE. The conversion policy owns rounding at the hidden,
 // matvec, activation and final output boundaries.
-template <class Math, class ProjectExpert, class Activation, class Convert>
+template <class Math, class ProjectExpert, class Activation, class Convert, class ObserveRoutes = std::nullptr_t>
 void routed_reference(const RoutePolicy& route, std::size_t intermediate, std::span<const float> hidden,
                       std::span<const float> router, std::span<const float> selection_bias,
-                      ProjectExpert&& project, Activation activation, Convert convert, std::span<float> output) {
+                      ProjectExpert&& project, Activation activation, Convert convert, std::span<float> output,
+                      ObserveRoutes observe_routes = nullptr, std::span<const float> projected_router = {}) {
     if (const char* why = validate(route)) throw std::invalid_argument(why);
     if (hidden.empty() || output.size() != hidden.size() ||
-        router.size() % hidden.size() != 0 || router.size() / hidden.size() != route.experts ||
+        (projected_router.empty() && (router.size() % hidden.size() != 0 || router.size() / hidden.size() != route.experts)) ||
         (route.selection_bias && selection_bias.size() != route.experts) ||
         intermediate == 0 || intermediate > std::numeric_limits<std::size_t>::max() / 2) {
         throw std::invalid_argument("routed reference: invalid dimensions");
@@ -66,9 +68,14 @@ void routed_reference(const RoutePolicy& route, std::size_t intermediate, std::s
     std::ranges::transform(hidden, input.begin(), convert);
     std::vector<float> logits(route.experts), scores(route.experts), weights(route.top_k);
     std::vector<std::uint32_t> ids(route.top_k);
-    core::linear_reference(router, input, logits);
+    if (projected_router.empty()) core::linear_reference(router, input, logits);
+    else {
+        if (projected_router.size() != logits.size()) throw std::invalid_argument("invalid projected router width");
+        std::ranges::copy(projected_router, logits.begin());
+    }
     route_scores_ref<Math>(route.score, logits, scores);
     route_select_ref(route, scores, selection_bias, ids, weights);
+    if constexpr (!std::is_same_v<ObserveRoutes, std::nullptr_t>) observe_routes(ids, weights);
     combine_routed_reference(intermediate, input, ids, weights, project, activation, convert, output);
 }
 

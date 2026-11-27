@@ -6,6 +6,7 @@
 #include "core/linear_reference.hpp"
 #include "inkling2_mini_attention_prepare.hpp"
 #include "inkling2_mini_checkpoint.hpp"
+#include "inkling2_mini_pack_source.hpp"
 #include "inkling2_mini_forward.hpp"
 #include "inkling2_mini_dspark_reference.hpp"
 #include "inkling2_mini_moe_reference.hpp"
@@ -42,9 +43,17 @@ using VerifyWindow = session::GrowingVisitWindow<MiniCacheTraits, float>;
 
 }  // namespace
 
+void mini_cpu_finalize_logits(std::span<float> logits) {
+    mini_round_bf16(logits);
+    for (float& value : logits) {
+        if (!std::isfinite(value)) throw std::runtime_error("nonfinite Inkling 2 Mini logits");
+        value = kLogitSoftcap * std::tanh(value / kLogitSoftcap);
+    }
+}
+
 struct MiniHostDecoder::Impl {
     Impl(const std::string& path, unsigned capacity, const char* dspark_path, const char* host_pack,
-         const char* hot_routes) : cache_plan(capacity, 1U) {
+         const char* hot_routes, MiniHostStudy* taps) : study(taps), cache_plan(capacity, 1U) {
         require_checkpoint(weights.open(path));
         if (host_pack) bind_pack(host_pack);
         if (hot_routes) warm_pack(hot_routes);
@@ -133,6 +142,7 @@ struct MiniHostDecoder::Impl {
 
     void linear(std::string_view role, std::string_view name, std::span<const float> input,
                 std::span<float> output) const {
+        if (study_project(text_parameter(name), input, output)) return;
         if (!packed_linear(role, name, input, output, output.size()))
             core::linear_reference(parameter(name, input.size() * output.size()), input, output);
     }
@@ -141,6 +151,17 @@ struct MiniHostDecoder::Impl {
         std::vector<float> result(elements);
         require_checkpoint(weights.read(text_parameter(name), result, first));
         return result;
+    }
+
+    bool study_project(std::string_view name, std::span<const float> input, std::span<float> output,
+                       std::size_t first = 0) const {
+        if (!study) return false;
+        study->input(name, input);
+        return study->project(name, input, output, first);
+    }
+
+    bool study_controller(std::string_view name, std::span<const float> input, std::span<float> output) const {
+        return study && study_project(text_parameter(name), input, output);
     }
 
     std::vector<float> attention(LayerVisit visit, unsigned position, std::span<const float> q,
@@ -211,14 +232,27 @@ struct MiniHostDecoder::Impl {
 
     std::vector<float> moe(LayerVisit visit, std::span<const float> input) const {
         const auto layer = visit.physical_layer;
-        const auto router = parameter(mini_layer_parameter(layer, "mlp.gate.weight"), kExperts * kHiddenWidth);
+        const auto router_name = mini_layer_parameter(layer, "mlp.gate.weight");
+        std::array<float, kExperts> router_logits{};
+        const bool router_packed = study && study_project(text_parameter(router_name), input, router_logits);
+        const auto router = router_packed ? std::vector<float>{} : parameter(router_name, kExperts * kHiddenWidth);
         const auto bias = parameter(mini_layer_parameter(layer, "mlp.gate.bias"), kExperts);
         const auto project = [&](unsigned expert, strix::moe::ExpertProjection kind,
                                  std::span<const float> row, std::span<float> output) {
             const auto projection = kind == strix::moe::ExpertProjection::gate_up
                 ? MiniExpertProjection::gate_up : MiniExpertProjection::down;
+            bool gate_packed = false, up_packed = false;
+            if (study) {
+                if (projection == MiniExpertProjection::down) {
+                    if (study_project(mini_expert_pack_name(layer, expert, "down"), row, output)) return;
+                } else {
+                    gate_packed = study_project(mini_expert_pack_name(layer, expert, "gate"), row, output.first(kExpertWidth));
+                    up_packed = study_project(mini_expert_pack_name(layer, expert, "up"), row, output.last(kExpertWidth));
+                    if (gate_packed && up_packed) return;
+                }
+            }
             const auto index = projection == MiniExpertProjection::gate_up ? 0U : 1U;
-            if (auto* bank = expert_banks[layer][index].get()) {
+            if (auto* bank = expert_banks[layer][index].get(); bank && !gate_packed && !up_packed) {
                 grouped::MatrixView view;
                 require_checkpoint(bank->load(expert, view));
                 require_checkpoint(grouped::project_row(view, row, output));
@@ -229,32 +263,36 @@ struct MiniHostDecoder::Impl {
             weight::microscaled::StagedMatrix matrix;
             require_checkpoint(matrix.load(view, mini_expert_row_order(projection)));
             using weight::microscaled::MatrixFormat;
-            if (matrix.format() == MatrixFormat::nvfp4) {
-                core::microscaled_matvec_reference<MatrixFormat::nvfp4>(matrix.packed(), row, output);
-            } else {
-                core::microscaled_matvec_reference<MatrixFormat::mxfp8>(matrix.packed(), row, output);
-            }
+            const auto exact = gate_packed ? output.last(kExpertWidth) : (up_packed ? output.first(kExpertWidth) : output);
+            const auto first = gate_packed ? kExpertWidth : 0U;
+            if (matrix.format() == MatrixFormat::nvfp4)
+                core::microscaled_matvec_reference<MatrixFormat::nvfp4>(matrix.packed(), row, exact, first);
+            else
+                core::microscaled_matvec_reference<MatrixFormat::mxfp8>(matrix.packed(), row, exact, first);
         };
         std::vector<float> output(kHiddenWidth);
-        mini_moe_reference(input, router, bias, project, output);
+        if (study) {
+            mini_moe_reference(input, router, bias, project, output, [&](auto& ids, auto& scales) {
+                study->routes(visit.logical_layer, ids, scales);
+            }, router_packed ? std::span<const float>(router_logits) : std::span<const float>{});
+        } else {
+            mini_moe_reference(input, router, bias, project, output);
+        }
         return output;
     }
 
     std::vector<float> logits(std::span<const float> hidden) const {
         constexpr std::size_t rows_per_read = 128;
         std::vector<float> output(kOutputVocabulary);
-        if (!packed_linear("head", "unembed.weight", hidden, output, kVocabulary)) {
+        const bool packed = study && study->project("model.llm.unembed.weight", hidden, output, 0);
+        if (!packed && !packed_linear("head", "unembed.weight", hidden, output, kVocabulary)) {
             for (std::size_t first = 0; first < output.size(); first += rows_per_read) {
                 const auto rows = std::min(rows_per_read, output.size() - first);
                 const auto matrix = parameter("unembed.weight", rows * kHiddenWidth, first * kHiddenWidth);
                 core::linear_reference(matrix, hidden, std::span<float>(output).subspan(first, rows));
             }
         }
-        mini_round_bf16(output);
-        for (float& value : output) {
-            if (!std::isfinite(value)) throw std::runtime_error("nonfinite Inkling 2 Mini logits");
-            value = kLogitSoftcap * std::tanh(value / kLogitSoftcap);
-        }
+        mini_cpu_finalize_logits(output);
         return output;
     }
 
@@ -274,6 +312,11 @@ struct MiniHostDecoder::Impl {
         }
 
         failed = true;
+        if (study) {
+            study->embedding(token);
+            std::array<float, kHiddenWidth> row{};
+            if (study->lookup("model.llm.embed.weight", token, row)) return advance(row, want_logits, stage_taps);
+        }
         return advance(parameter("embed.weight", kHiddenWidth, std::size_t{token} * kHiddenWidth), want_logits,
                        stage_taps);
     }
@@ -293,6 +336,7 @@ struct MiniHostDecoder::Impl {
     std::vector<float> advance(std::span<const float> embedding, bool want_logits, bool stage_taps = false) {
         const auto normalized = mini_rms_norm(embedding, parameter("embed_norm.weight", kHiddenWidth));
         const auto hidden = mini_forward_row(*this, frontier, normalized);
+        if (study) study->input("model.llm.unembed.weight", hidden);
         auto result = want_logits ? logits(hidden) : std::vector<float>{};
         if (dspark) {
             if (stage_taps) staged_taps.insert(staged_taps.end(), tap_row.begin(), tap_row.end());
@@ -303,6 +347,7 @@ struct MiniHostDecoder::Impl {
         return result;
     }
 
+    MiniHostStudy* study;
     MiniTextWeights weights;
     weight::LowbitPack pack;
     std::array<std::array<std::unique_ptr<grouped::ExpertBank>, 2>, kPhysicalLayers> expert_banks;
@@ -318,8 +363,8 @@ struct MiniHostDecoder::Impl {
 };
 
 MiniHostDecoder::MiniHostDecoder(const std::string& path, unsigned max_positions, const char* dspark,
-                                 const char* host_pack, const char* hot_routes)
-    : impl_(std::make_unique<Impl>(path, max_positions, dspark, host_pack, hot_routes)) {}
+                                 const char* host_pack, const char* hot_routes, MiniHostStudy* study)
+    : impl_(std::make_unique<Impl>(path, max_positions, dspark, host_pack, hot_routes, study)) {}
 MiniHostDecoder::~MiniHostDecoder() = default;
 
 std::vector<float> MiniHostDecoder::step(unsigned token, bool want_logits) {

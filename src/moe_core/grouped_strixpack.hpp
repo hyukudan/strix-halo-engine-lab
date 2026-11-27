@@ -140,16 +140,36 @@ inline auto project_for(wei::FormatId format) {
 }  // namespace detail
 
 // An admitted packed view can also feed a single row directly. The output may
-// select a row prefix, for example when the head has padded vocabulary rows.
-inline wei::Status project_row(const MatrixView& matrix, std::span<const float> x, std::span<float> y) {
-    if (x.size() != matrix.columns || y.size() > matrix.rows || !detail::valid_matrix(matrix))
+// select a row window starting at `first`, for example the head's padded vocabulary
+// rows or one half of a fused projection.
+inline wei::Status project_row(const MatrixView& matrix, std::span<const float> x, std::span<float> y,
+                               std::size_t first = 0U) {
+    if (x.size() != matrix.columns || first > matrix.rows || y.size() > matrix.rows - first ||
+        !detail::valid_matrix(matrix))
         return {wei::Error::unsupported_shape, "packed projection dimensions disagree with the operand"};
     if (y.empty()) return {wei::Error::ok, {}};
-    // A row prefix is itself a packed matrix: rows are stored whole and in order.
-    MatrixView prefix = matrix;
-    prefix.rows = y.size();
-    prefix.bytes = matrix.bytes.first(matrix.bytes.size() / matrix.rows * y.size());
-    detail::project_for(matrix.storage)(prefix, x, y.data());
+    // A row window is itself a packed matrix: rows are stored whole and in order.
+    const auto row_bytes = matrix.bytes.size() / matrix.rows;
+    MatrixView window = matrix;
+    window.rows = y.size();
+    window.bytes = matrix.bytes.subspan(first * row_bytes, row_bytes * y.size());
+    detail::project_for(matrix.storage)(window, x, y.data());
+    return {wei::Error::ok, {}};
+}
+
+// One decoded row of an admitted matrix (an embedding lookup).
+inline wei::Status lookup(const MatrixView& matrix, std::size_t row, std::span<float> output) {
+    if (row >= matrix.rows || output.size() != matrix.columns || !detail::valid_matrix(matrix))
+        return {wei::Error::unsupported_shape, "invalid Strix pack lookup geometry"};
+    const auto decode = [&]<class Storage>() {
+        const auto* block = matrix.bytes.data() + row * Storage::row_bytes(matrix.columns);
+        for (std::size_t col = 0; col < matrix.columns; col += Storage::elements, block += Storage::bytes)
+            for (unsigned lane = 0; lane < Storage::elements; ++lane)
+                output[col + lane] = sp::decode<Storage>(block, lane, matrix.header);
+    };
+    if (matrix.storage == wei::kSP2WeightStorage) decode.template operator()<sp::SP2Storage>();
+    else if (matrix.storage == wei::kSP3WeightStorage) decode.template operator()<sp::SP3Storage>();
+    else decode.template operator()<sp::SP4Storage>();
     return {wei::Error::ok, {}};
 }
 

@@ -17,11 +17,12 @@ namespace strix::core {
 // Weights must be backed by an admitted packed matrix. Input and output must not overlap.
 template <weight::microscaled::MatrixFormat Format>
 void microscaled_matvec_reference(weight::microscaled::PackedMatrix weights, std::span<const float> input,
-                                  std::span<float> output) {
+                                  std::span<float> output, std::size_t first) {
     using Operand = weight::microscaled::PackedOperand<Format>;
     using weight::microscaled::RowOrder;
     if (!weights.codes || !weights.block_scales || weights.rows == 0 || weights.columns == 0 ||
-        weights.columns % Operand::kBlockColumns != 0 || weights.rows != output.size() ||
+        weights.columns % Operand::kBlockColumns != 0 || output.empty() || first > weights.rows ||
+        output.size() > weights.rows - first ||
         weights.columns != input.size() || weights.rows > std::numeric_limits<std::size_t>::max() / weights.columns ||
         (weights.row_order != RowOrder::contiguous &&
          (weights.row_order != RowOrder::interleaved_halves || weights.rows % 2U != 0))) {
@@ -37,7 +38,7 @@ void microscaled_matvec_reference(weight::microscaled::PackedMatrix weights, std
         float sum = 0.0F;
         for (std::size_t k = 0; k < input.size(); k += Operand::kTileColumns) {
             std::uint32_t packed[Operand::kTileColumns / 2U];
-            operand.decode_bf16(operand.load_tile16(row, k), packed);
+            operand.decode_bf16(operand.load_tile16(first + row, k), packed);
             for (std::size_t pair = 0; pair < Operand::kTileColumns / 2U; ++pair) {
                 const auto lo = std::bit_cast<float>(packed[pair] << 16U);
                 const auto hi = std::bit_cast<float>(packed[pair] & 0xffff0000U);
@@ -48,6 +49,14 @@ void microscaled_matvec_reference(weight::microscaled::PackedMatrix weights, std
         if (!std::isfinite(sum)) throw std::invalid_argument("microscaled linear reference: nonfinite projection");
         output[row] = sum;
     }
+}
+
+template <weight::microscaled::MatrixFormat Format>
+void microscaled_matvec_reference(weight::microscaled::PackedMatrix weights, std::span<const float> input,
+                                  std::span<float> output) {
+    if (weights.rows != output.size())
+        throw std::invalid_argument("microscaled linear reference: invalid matrix geometry");
+    microscaled_matvec_reference<Format>(weights, input, output, 0);
 }
 
 }  // namespace strix::core

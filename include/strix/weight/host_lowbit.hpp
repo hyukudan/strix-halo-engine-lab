@@ -346,11 +346,15 @@ inline float scale_value(std::uint8_t b, int base) noexcept {
 
 // Reference decode of element j of a superblock (host tests, emulation tooling).
 template <class S>
-inline float decode(const std::uint8_t* block, unsigned j, const Header& h) {
+inline float decode_scaled(const std::uint8_t* block, unsigned j, const Header& h, float scale) {
     const unsigned c = S::code(block, j);
-    const float magnitude = static_cast<float>(h.table[c & (S::levels - 1U)]) *
-                            scale_value(S::scale_byte(block, j / S::group), h.base);
+    const float magnitude = static_cast<float>(h.table[c & (S::levels - 1U)]) * scale;
     return (c >> (S::bits - 1U)) != 0U ? -magnitude : magnitude;
+}
+
+template <class S>
+inline float decode(const std::uint8_t* block, unsigned j, const Header& h) {
+    return decode_scaled<S>(block, j, h, scale_value(S::scale_byte(block, j / S::group), h.base));
 }
 
 // Codes (S::elements unsigned codes, sign << (Bits - 1) | index) and S::groups scale bytes -> one superblock.

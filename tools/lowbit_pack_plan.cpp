@@ -1,6 +1,7 @@
 #include "strix/serve/json.hpp"
 #include "strix/weight/pack_plan.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <fstream>
@@ -51,10 +52,14 @@ int main(int argc, char** argv) {
         namespace wei = strix::weight;
         const auto result = wei::plan_strix_pack(strix::serve::parse_json_unique(contents.str()),
                                                  wei::strixpack_format(cold), hot, budget, reserve);
-        std::cout << "tensor\tformat\tbytes\n";
-        for (const auto& tensor : result.tensors)
+        const bool coders = std::ranges::any_of(result.tensors, [](const auto& tensor) { return !tensor.coder.empty(); });
+        std::cout << "tensor\tformat\tbytes" << (coders ? "\tcoder\n" : "\n");
+        for (const auto& tensor : result.tensors) {
             std::cout << tensor.tensor << '\t' << (tensor.storage.name.empty() ? "keep" : wei::strixpack_label(tensor.storage))
-                      << '\t' << tensor.bytes << '\n';
+                      << '\t' << tensor.bytes;
+            if (coders) std::cout << '\t' << tensor.coder;
+            std::cout << '\n';
+        }
         std::cerr << (result.fits() ? "FIT" : "OVER BUDGET") << " bytes=" << result.bytes << " GiB=" << std::fixed
                   << std::setprecision(1) << static_cast<double>(result.bytes) / gib << " budget_bytes=" << result.budget
                   << " reserve_bytes=" << result.reserve << " hot_experts=" << result.hot_experts << '\n';

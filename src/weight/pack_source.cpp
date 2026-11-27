@@ -35,6 +35,22 @@ Digest256 matrix_digest(PackMatrixSource::Encoding encoding, const Digest256& co
     if (!denominator.empty()) hash.update(denominator.data(), denominator.size());
     return {hash.finish()};
 }
+
+// A row window of a larger matrix hashes its position in that matrix as well as the source bytes.
+Digest256 windowed_digest(const PackMatrixSource& source, const Digest256& whole) {
+    if (!source.matrix_rows) return whole;
+    constexpr std::string_view tag = "strix-pack-source-window/v1";
+    core::Sha256 hash;
+    hash.update(tag.data(), tag.size());
+    append(hash, whole);
+    for (const std::uint64_t value : {static_cast<std::uint64_t>(source.row_order), std::uint64_t{source.first_row},
+                                      std::uint64_t{source.rows}, std::uint64_t{source.matrix_rows}}) {
+        std::array<std::uint8_t, 8> le{};
+        for (unsigned i = 0; i < le.size(); ++i) le[i] = static_cast<std::uint8_t>(value >> (i * 8U));
+        hash.update(le.data(), le.size());
+    }
+    return {hash.finish()};
+}
 }  // namespace
 
 Status PackCheckpoint::open(const std::string& path, PackCheckpoint& out) {
@@ -211,8 +227,21 @@ Status PackMatrixSource::digest(Digest256& out) const {
         std::array<Byte, 4> max{}, divisor{};
         if (const auto s = read_slice(amax, max); !s) return s;
         if (const auto s = read_slice(denominator, divisor); !s) return s;
-        out = matrix_digest(encoding, raw, scale, max, divisor);
-    } else out = matrix_digest(encoding, raw, scale);
+        out = windowed_digest(*this, matrix_digest(encoding, raw, scale, max, divisor));
+    } else if (encoding == Encoding::mxfp8) out = windowed_digest(*this, matrix_digest(encoding, raw, scale));
+    else out = matrix_digest(encoding, raw, scale);
+    return ok;
+}
+
+Status PackMatrixSource::bind(const microscaled::MatrixView& view, microscaled::RowOrder order,
+                              std::size_t first, std::size_t count, PackMatrixSource& out) {
+    if (count == 0 || first > view.rows || count > view.rows - first || view.columns == 0 ||
+        count > std::numeric_limits<std::size_t>::max() / sizeof(float) / view.columns ||
+        !microscaled::detail::valid_row_order(order, view.rows) ||
+        (view.format != microscaled::MatrixFormat::nvfp4 && view.format != microscaled::MatrixFormat::mxfp8))
+        return {Error::unsupported_shape, "invalid source matrix row slice"};
+    out = {view.format == microscaled::MatrixFormat::nvfp4 ? Encoding::nvfp4 : Encoding::mxfp8,
+           count, view.columns, view.codes, view.block_scales, view.amax, view.denominator, order, first, first == 0 && count == view.rows ? 0 : view.rows};
     return ok;
 }
 
@@ -221,16 +250,22 @@ Status PackMatrixSource::decode(std::vector<float>& out, Digest256* digest_out) 
     if (!rows || !columns || columns > limit || rows > limit / columns)
         return {Error::unsupported_shape, "invalid pack source matrix geometry"};
     const auto count = rows * columns;
+    const auto total_rows = matrix_rows ? matrix_rows : rows;
+    if (first_row > total_rows || rows > total_rows - first_row ||
+        (matrix_rows && encoding != Encoding::nvfp4 && encoding != Encoding::mxfp8) ||
+        (total_rows != rows && total_rows > limit / columns))
+        return {Error::unsupported_shape, "invalid pack source row window"};
+    const auto stored = total_rows * columns;
     using Block = BlockScaledE4M3<128, 128, float>;
     if ((encoding == Encoding::bf16 && (codes.range.bytes != 2U * count || scales.range.bytes)) ||
         (encoding == Encoding::mxfp4 && (columns % 32U || codes.range.bytes != count / 2U ||
                                          scales.range.bytes != count / 32U)) ||
         (encoding == Encoding::fp8_block && (codes.range.bytes != count ||
                  scales.range.bytes != 4U * Block::scale_rows(rows) * Block::scale_columns(columns))) ||
-        (encoding == Encoding::nvfp4 && (columns % microscaled::kNvfp4BlockColumns || codes.range.bytes != count / 2U ||
-                                         scales.range.bytes != count / microscaled::kNvfp4BlockColumns)) ||
-        (encoding == Encoding::mxfp8 && (columns % microscaled::kMxfp8BlockColumns || codes.range.bytes != count ||
-                                         scales.range.bytes != count / microscaled::kMxfp8BlockColumns)))
+        (encoding == Encoding::nvfp4 && (columns % microscaled::kNvfp4BlockColumns || codes.range.bytes != stored / 2U ||
+                                         scales.range.bytes != stored / microscaled::kNvfp4BlockColumns)) ||
+        (encoding == Encoding::mxfp8 && (columns % microscaled::kMxfp8BlockColumns || codes.range.bytes != stored ||
+                                         scales.range.bytes != stored / microscaled::kMxfp8BlockColumns)))
         return {Error::malformed, "pack source payload disagrees with matrix geometry"};
     std::vector<std::uint8_t> raw(static_cast<std::size_t>(codes.range.bytes));
     std::vector<std::uint8_t> scale(static_cast<std::size_t>(scales.range.bytes));
@@ -262,7 +297,7 @@ Status PackMatrixSource::decode(std::vector<float>& out, Digest256* digest_out) 
         const auto scale_stride = columns / (nv ? microscaled::kNvfp4BlockColumns : microscaled::kMxfp8BlockColumns);
         try {
             for (std::size_t r = 0; r < rows; ++r) {
-                const auto physical = microscaled::physical_row(row_order, rows, r);
+                const auto physical = microscaled::physical_row(row_order, total_rows, first_row + r);
                 const auto rc = std::span(raw).subspan(physical * code_stride, code_stride);
                 const auto rs = std::span(scale).subspan(physical * scale_stride, scale_stride);
                 const auto dst = std::span(matrix).subspan(r * columns, columns);
@@ -271,10 +306,11 @@ Status PackMatrixSource::decode(std::vector<float>& out, Digest256* digest_out) 
             }
         } catch (const std::invalid_argument& error) { return {Error::malformed, error.what()}; }
         if (digest_out)
-            *digest_out = matrix_digest(encoding, digest_bytes(std::as_bytes(std::span(raw))),
-                                        digest_bytes(std::as_bytes(std::span(scale))),
-                                        nv ? std::span<const Byte>(max) : std::span<const Byte>{},
-                                        nv ? std::span<const Byte>(divisor) : std::span<const Byte>{});
+            *digest_out = windowed_digest(
+                *this, matrix_digest(encoding, digest_bytes(std::as_bytes(std::span(raw))),
+                                     digest_bytes(std::as_bytes(std::span(scale))),
+                                     nv ? std::span<const Byte>(max) : std::span<const Byte>{},
+                                     nv ? std::span<const Byte>(divisor) : std::span<const Byte>{}));
         out = std::move(matrix);
         return ok;
     } else {
