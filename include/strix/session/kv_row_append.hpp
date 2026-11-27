@@ -280,11 +280,15 @@ public:
                 throw std::invalid_argument("incomplete resident history checkpoint workspace");
         }
         for (const auto& group : groups) {
+            if (spans_overlap(group.history_checkpoint, group.kv_checkpoint))
+                throw std::invalid_argument("staged batch lane shares its checkpoint workspaces");
             for (const auto& other : groups) {
-                // A lane's rollback images may not alias any lane's resident history or tape, nor another lane's images.
+                // A lane's rollback images may not alias any lane's resident state, nor another lane's images.
                 const auto& o = *other.state;
                 if (spans_overlap(group.history_checkpoint, o.history_) || spans_overlap(group.kv_checkpoint, o.history_) ||
-                    spans_overlap(group.history_checkpoint, o.tape_) || spans_overlap(group.kv_checkpoint, o.tape_))
+                    spans_overlap(group.history_checkpoint, o.tape_) || spans_overlap(group.kv_checkpoint, o.tape_) ||
+                    spans_overlap(group.history_checkpoint, o.kv_.keys) || spans_overlap(group.kv_checkpoint, o.kv_.keys) ||
+                    spans_overlap(group.history_checkpoint, o.kv_.values) || spans_overlap(group.kv_checkpoint, o.kv_.values))
                     throw std::invalid_argument("staged batch checkpoint overlaps a lane's resident state");
                 if (&other != &group &&
                     (spans_overlap(group.history_checkpoint, other.history_checkpoint) ||
