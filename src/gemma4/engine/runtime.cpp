@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include "strix/env_flags.hpp"
 #ifdef STRIX_GEMMA4_DEVICE_BACKEND
 #include "device/hip_cost_identity.hpp"
 #endif
@@ -66,7 +67,7 @@ struct DecodeRegime { std::uint64_t prompt_tokens = 0; std::string execution; };
 std::optional<DecodeRegime> decode_regime(const Options& o) {
     if (o.backend != "device" || o.deploy_check || !o.chat.empty() || !o.fixtures.empty() || (o.ids.empty() == o.prompt.empty()))
         return std::nullopt;
-    if (const char* list = std::getenv("STRIX_BITCALC_CASES"); list && *list) return std::nullopt;
+    if (const char* list = strix::envcfg::text("STRIX_BITCALC_CASES"); list && *list) return std::nullopt;
     std::uint64_t tokens = 0;
     if (!o.ids.empty()) {
         auto text = read_text(o.ids);
