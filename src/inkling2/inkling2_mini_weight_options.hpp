@@ -111,21 +111,28 @@ inline bool mini_lowbit_turbo(const profile::Resolution& tier) {
     return tier.profile == profile::Name::turbo;
 }
 
-// STRIX_INK_LOWBIT_HEAD: "sp4t" selects the SP4 head arm in FAST or TURBO; "0" (builtin) leaves the head as is.
-inline bool mini_lowbit_head(const profile::Resolution& tier) {
+// STRIX_INK_LOWBIT_HEAD, in FAST or TURBO: "sp4t" selects the SP4 head arm (kMiniSp4HeadPolicy); "sp4t-attn" the SP4
+// attention projections + head arm (weights.attention_head.sp4t@1, the arm of --qualify-decode-weights); "0" (builtin)
+// leaves the weights as they are. nullptr: no arm.
+inline const weight::WeightLoadPolicy* mini_lowbit_head_policy(const profile::Resolution& tier) {
     const auto* entry = tier.find(kMiniLowBitHead);
-    if (entry == nullptr || entry->value == "0") return false;
-    if (entry->value != "sp4t") throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD must be 0 or sp4t");
-    return tier.profile == profile::Name::fast || tier.profile == profile::Name::turbo;
+    if (entry == nullptr || entry->value == "0") return nullptr;
+    const weight::WeightLoadPolicy* policy = entry->value == "sp4t"        ? &kMiniSp4HeadPolicy
+                                             : entry->value == "sp4t-attn" ? &weight::kAttentionHeadSP4TPolicy
+                                                                           : nullptr;
+    if (policy == nullptr) throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD must be 0, sp4t or sp4t-attn");
+    return tier.profile == profile::Name::fast || tier.profile == profile::Name::turbo ? policy : nullptr;
 }
+inline bool mini_lowbit_head(const profile::Resolution& tier) { return mini_lowbit_head_policy(tier) != nullptr; }
 
-// The lever's arm is the decode-only head qualification arm of kMiniSp4HeadPolicy: it needs STRIX_LOWBIT_PACK and
-// combines with no other weight arm.
+// The lever's arm is a decode-only qualification arm (the BF16 image prefills, the SP4 copies decode): it needs
+// STRIX_LOWBIT_PACK and combines with no other weight arm. The command line and the server call this one rule.
 inline void apply_mini_lowbit_head(MiniWeightOptions& options, const profile::Resolution& tier) {
-    if (!mini_lowbit_head(tier)) return;
+    const auto* policy = mini_lowbit_head_policy(tier);
+    if (policy == nullptr) return;
     if (options.qualify != nullptr || options.qualify_q8 || options.lowbit_turbo || options.disable_q8)
-        throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD=sp4t combines with no other weight arm");
-    options.qualify = &kMiniSp4HeadPolicy;
+        throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD combines with no other weight arm");
+    options.qualify = policy;
     options.qualify_decode_only = true;
 }
 

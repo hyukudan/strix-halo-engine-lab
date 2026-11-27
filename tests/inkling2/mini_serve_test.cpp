@@ -530,6 +530,32 @@ void profile_parity() {
         }
     }
     set_env("STRIX_INK_LOWBIT_TURBO", nullptr);
+    // STRIX_INK_LOWBIT_HEAD=sp4t: the server takes the SP4 attention + head decode arm through the same resolver as the
+    // command line (FAST and TURBO), and refuses it on CUDA.
+    for (const auto* tier : {"exact", "fast", "turbo"}) {
+        selection.arguments.back() = tier;
+        for (const auto* value : {static_cast<const char*>(nullptr), "0", "sp4t", "sp4t-attn"}) {
+            set_env("STRIX_INK_LOWBIT_HEAD", value);
+            loaded.reset();
+            const auto cli = parse_cli(tier, "hip");
+            const auto service = factory->create(selection);
+            const bool expected = std::string_view(tier) != "exact" && value && std::string_view(value) != "0";
+            require(service && loaded && cli.weights.qualify_decode_only == expected &&
+                        loaded->weight_options.qualify_decode_only == expected &&
+                        loaded->weight_options.qualify == cli.weights.qualify &&
+                        (!expected || std::string_view(value) != "sp4t-attn" ||
+                         loaded->weight_options.qualify == &strix::weight::kAttentionHeadSP4TPolicy),
+                    "CLI and server take the same SP4 attention + head decode arm");
+        }
+    }
+    selection.arguments[3] = "cuda";
+    selection.arguments.back() = "fast";
+    set_env("STRIX_INK_LOWBIT_HEAD", "sp4t-attn");
+    loaded.reset();
+    require(refuses([&] { (void)factory->create(selection); }, "qualified on HIP only"),
+            "the CUDA server refuses the SP4 attention + head arm");
+    set_env("STRIX_INK_LOWBIT_HEAD", nullptr);
+    selection.arguments[3] = "hip";
     selection.arguments.back() = "fast";
     for (const char* backend : {"hip", "cuda"}) {
         selection.arguments[3] = backend;

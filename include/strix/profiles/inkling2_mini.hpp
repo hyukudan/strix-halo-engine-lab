@@ -300,7 +300,7 @@ inline constexpr std::array<profile::Lever, 19> kMiniLevers{{
                "(+1 unresolved), TURBO limits 39/39 pass, CLI B=1 -3.1 % per step vs the BF16 head "
                "(docs/engine/lowbit-calibration.md); a TURBO row awaits the served arm and a combined receipt; HIP "
                "command line only",
-     .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"sp4t", "sp4t-head-v1"}}}},
+     .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"sp4t", "sp4t-head-v1"}, {"sp4t-attn", "sp4t-attention-head-v1"}}}},
 }};
 
 // TURBO prefill timing of the iu4 cell on gfx1151 (one node, one binary for the CLI and strix-serve, prompt prefill time

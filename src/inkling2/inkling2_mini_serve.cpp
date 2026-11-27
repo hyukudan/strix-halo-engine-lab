@@ -69,9 +69,13 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     const auto resolution = resolve_mini_profile(out.weight_options, true);
     out.tier = resolution.profile;
     out.weight_options.lowbit_turbo = mini_lowbit_turbo(resolution);
-    if (mini_lowbit_head(resolution))
-        std::cerr << "STRIX_INK_LOWBIT_HEAD=sp4t declined: the SP4 head arm runs on the command line only (no served "
-                     "identity yet); using incumbent weights\n";
+    // STRIX_INK_LOWBIT_HEAD=sp4t|sp4t-attn (FAST / TURBO, explicit): the SP4 head or attention + head decode arm through the same
+    // resolver and weight load as the command line (BF16 image prefills, the SP4 copies decode; needs
+    // STRIX_LOWBIT_PACK, else the shared loader declines to the incumbent weights with its receipt line).
+    apply_mini_lowbit_head(out.weight_options, resolution);
+    if (out.weight_options.qualify != nullptr && out.weight_options.qualify_decode_only)
+        std::cerr << "STRIX_INK_LOWBIT_HEAD: served decode-only arm " << out.weight_options.qualify->id.name
+                  << " (served speed receipt pending)\n";
     out.prepared_round_fold = mini_prepared_round_fold(resolution);
     out.experts_nvfp4 = mini_experts_nvfp4(resolution);
     out.combine_image = mini_combine_image(resolution);
@@ -86,6 +90,8 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
+    if (out.weight_options.qualify_decode_only && resolved.backend != "hip")
+        throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD: the SP4 decode arms are qualified on HIP only");
     // One speculation rule for the command line and the server (mini_speculation_policy: an explicit --speculation
     // wins over the row; speculation and a requested low-bit row never share a run). Served verify windows are
     // admitted on HIP (the verify rows body and per-slot tapes: each greedy lane drafts from its context while one lane

@@ -6418,7 +6418,8 @@ Both options are pending native token and logit identity checks.
 <a id="inkling2-sp4t-head"></a>
 ## Inkling 2 Mini decode head: Strix pack SP4, fixed table (`strix.sp4t`)
 
-**Engine:** `inkling2-mini` (HIP). **Control:** lever `inkling2-mini-lowbit-head@1` (`STRIX_INK_LOWBIT_HEAD=sp4t`) or
+**Engine:** `inkling2-mini` (HIP). **Control:** lever `inkling2-mini-lowbit-head@1` (`STRIX_INK_LOWBIT_HEAD=sp4t`, command
+line and HIP server) or
 `--qualify-decode-weights weights.head.sp4t@1`, with `STRIX_LOWBIT_PACK` naming a calibrated `strix.sp4t` pack.
 **Default:** off in every tier; an explicit option runnable under `--profile fast` and `--profile turbo`.
 
@@ -6450,7 +6451,8 @@ two applied at the store), dispatched by `enqueue_resident_q8_rows` (`src/core/r
 <a id="inkling2-sp4t-attention-head"></a>
 ## Inkling 2 Mini decode attention projections and head: Strix pack SP4, fixed table (`strix.sp4t`), with speculation
 
-**Engine:** `inkling2-mini` (HIP). **Control:** `--qualify-decode-weights weights.attention_head.sp4t@1` with
+**Engine:** `inkling2-mini` (HIP). **Control:** `STRIX_INK_LOWBIT_HEAD=sp4t-attn` (command line and HIP server, `--profile
+fast` / `turbo`) or `--qualify-decode-weights weights.attention_head.sp4t@1`, with
 `STRIX_LOWBIT_PACK` naming a calibrated `strix.sp4t` pack of the attention query / key / value / output projections and
 the head (`strix-lowbit-calib-pack`, one `--storage ROLE.weight=sp4` per role `attn.wq_du`, `attn.wk_dv`, `attn.wv_dv`,
 `attn.wo_ud`, `llm.unembed`, `--table fixed --technique both --damp 0.1`).
@@ -6476,9 +6478,10 @@ it in `src/inkling2/inkling2_mini_weight_options.hpp` (qualifiable policy), `src
   (+7.8 %). Token ids equal the BF16 run on both prompts; MTP acceptance is unchanged (prose 429 / 437 both arms). The
   same arm without speculation decodes at 28.5 ms (the former decline). Served decode not measured: the arm is command
   line only.
-- **Why no FAST row yet:** a FAST decision row (`kMiniWeightLoadDecisionRows`, decode regime) needs a served lever that
-  loads the pack and a served receipt at the step widths 1, 8 and 16 (16 slots, context 16384, ABBA against FAST); the
-  gate PASS above is its quality half.
+- **Why no FAST row yet:** a FAST decision row (`kMiniWeightLoadDecisionRows`, decode regime) needs a served receipt at
+  the step widths 1, 8 and 16 (16 slots, context 16384, ABBA against FAST); the served lever exists
+  (`STRIX_INK_LOWBIT_HEAD=sp4t-attn` with `STRIX_LOWBIT_PACK`; the CUDA server refuses it). The gate PASS above is its
+  quality half.
 - **Off switch:** do not pass the qualification arm.
 
 | model | SP4 attention + head decode arm |
