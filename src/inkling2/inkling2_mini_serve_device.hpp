@@ -242,8 +242,7 @@ inline MiniServeCohort make_mini_device_cohort(
               << " served_route " << mini_served_route_startup_field(shown, cohort->prompt_tail_rows())
               << " prepared_round_fold " << mini_round_fold_startup_field(opt, levers)
               << " verify_rows "
-              << mini_verify_rows_name(mini_served_verify_rows(levers.verify_rows, served_route, lanes),
-                                       opt.verify_rows)
+              << mini_verify_rows_name(mini_served_verify_rows(levers.verify_rows, lanes), opt.verify_rows)
               << " down_image " << mini_down_image_name(levers.down_image, opt.combine_image)
               << " head " << mini_head_field(levers.head)
               << " experts " << (opt.experts_nvfp4 ? "nvfp4" : "checkpoint")

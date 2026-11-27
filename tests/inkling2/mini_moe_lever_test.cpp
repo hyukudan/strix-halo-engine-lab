@@ -595,16 +595,15 @@ void test_verify_rows() {
                 std::string(mini::mini_verify_rows_name(1U, 1U)) == "on" &&
                 std::string(mini::mini_verify_rows_name(0U, 0U)) == "off",
             "the admitted verify rows level is reported against the selected one");
-    // A server reports the lanes pick only where a cohort can run it: two or more admitted slots on the incumbent
-    // served route; the served CLI route and a one-slot server run level 1, lower levels pass through.
-    require(mini::mini_served_verify_rows(2U, false, 4U) == 2U && mini::mini_served_verify_rows(2U, false, 2U) == 2U &&
-                mini::mini_served_verify_rows(2U, false, 1U) == 1U && mini::mini_served_verify_rows(2U, true, 4U) == 1U &&
-                mini::mini_served_verify_rows(1U, false, 1U) == 1U && mini::mini_served_verify_rows(0U, true, 1U) == 0U &&
-                std::string(mini::mini_verify_rows_name(mini::mini_served_verify_rows(2U, true, 4U), 2U)) ==
-                    "on+lanes-pick-declined" &&
-                std::string(mini::mini_verify_rows_name(mini::mini_served_verify_rows(2U, false, 1U), 2U)) ==
+    // A server reports the lanes pick only where a cohort can run it: two or more admitted slots (either served
+    // route); a one-slot server runs level 1, lower levels pass through.
+    require(mini::mini_served_verify_rows(2U, 4U) == 2U && mini::mini_served_verify_rows(2U, 2U) == 2U &&
+                mini::mini_served_verify_rows(2U, 1U) == 1U && mini::mini_served_verify_rows(1U, 1U) == 1U &&
+                mini::mini_served_verify_rows(0U, 1U) == 0U &&
+                std::string(mini::mini_verify_rows_name(mini::mini_served_verify_rows(2U, 4U), 2U)) == "on+lanes-pick" &&
+                std::string(mini::mini_verify_rows_name(mini::mini_served_verify_rows(2U, 1U), 2U)) ==
                     "on+lanes-pick-declined",
-            "a server with one admitted slot or on the served CLI route does not report the lanes pick");
+            "a server with one admitted slot does not report the lanes pick");
     options.tier = in(profile::Name::standard, "3");
     bool refused = false;
     try {
