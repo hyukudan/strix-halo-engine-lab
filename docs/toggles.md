@@ -89,8 +89,19 @@ the resolved tier, the regime band and the backend but is still an explicit opti
 - KV precision is not touched: it stays the tier preset's own toggle (OFF in EXACT and FAST, ON in TURBO).
 - Output: `all-on: tier=... backend=... levers=N`, then one line per lever,
   `lever NAME source=default|all-on|refused [reason=...]`. `refused` carries the reason: incompatible with another
-  lever, a missing requirement, a band the lever is not qualified for, a failed or pending gate, or `unclassified`
-  (a catalogue row without a complete classification; it stays off).
+  lever, a missing requirement, a band the lever is not qualified for, a failed or pending gate, an unmet
+  precondition, a measured losing regime, or `unclassified` (a catalogue row without a complete classification; it
+  stays off).
+- Preconditions: every classified lever states them (`needs`, `[]` for none): entries that must all hold, each a list
+  of alternatives `env:NAME`, `env:NAME=VALUE`, `arg:FLAG` (an engine argument of the launch) or `model:KEY=VALUE`
+  (the model description). An unmet one refuses the lever with `reason=precondition ... unmet: WHY`, so the switch
+  never asks the engine for something the launch cannot run (for example low-bit arithmetic without resident q4 / q6
+  weights).
+- Losing regimes: a lever measured slower than without it in a phase / length band (`slower`, with its receipt) is
+  not turned on there. A launch without a band covers every phase and length, so such a lever is refused unless
+  `--all-on-band` names a regime outside the losing one.
+- One record with the engine: the switches the resolver exported are listed in `STRIX_ALL_ON_LEVERS`; an engine whose
+  own admission does not engage one prints `all-on: lever NAME source=all-on applied=no reason=...`.
 - `--all-on-band any|prefill[:N]|decode[:N]` (env `STRIX_ALL_ON_BAND`) states the regime; band-limited levers need it.
 - An environment variable you set always wins (`source=default reason=explicit setting kept`).
 - `--dry-run` prints the lines and the lever arguments without exporting anything.

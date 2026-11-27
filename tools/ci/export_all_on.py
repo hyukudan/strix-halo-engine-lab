@@ -4,7 +4,10 @@
 Every catalogue row that is an explicit lever (or a lever that cannot be classified) carries an "all_on" object:
   lever, class (exact|fast|turbo|kv|unclassified), gate (pass|pending|fail|none), engines, backends, phase,
   tokens (optional [min, max] prompt or context band), env + value or args, incompatible_with, requires,
-  default_tiers (tiers where the lever already runs by default inside its band), quality, reason (unclassified).
+  default_tiers (tiers where the lever already runs by default inside its band), quality, reason (unclassified),
+  needs (required on every classified lever, [] for none: preconditions, each "A|B" alternatives of env:NAME,
+  env:NAME=VALUE, arg:FLAG, model:KEY=VALUE; needs_reason is the printed reason when one is unmet) and slower
+  (optional measured losing regimes [{phase, tokens?, receipt}]: --all-on does not turn the lever on there).
 The shared resolver (src/profile/all_on.cpp) embeds the exported file; nothing else is maintained by hand.
 
   export_all_on.py            rewrite data/profile/all_on.json
@@ -45,6 +48,17 @@ def build() -> str:
             raise SystemExit(f"{name}: a classified lever needs exactly one of env and args")
         if item.get("identity", "pending") != "pending" or (item.get("identity") and item["class"] != "exact"):
             raise SystemExit(f"{name}: identity may only be pending, on an exact lever")
+        if item["class"] not in ("unclassified", "kv") and not isinstance(item.get("needs"), list):
+            raise SystemExit(f"{name}: a classified lever states its preconditions (\"needs\": [] for none)")
+        for entry in item.get("needs", []):
+            for atom in entry.split("|"):
+                kind, _, body = atom.partition(":")
+                if kind not in ("env", "arg", "model") or not body or (kind == "model" and "=" not in body[1:]):
+                    raise SystemExit(f"{name}: precondition {atom!r} is not env:NAME[=VALUE], arg:FLAG or model:KEY=VALUE")
+        for slow in item.get("slower", []):
+            if slow.get("phase") not in PHASES or not slow.get("receipt") or (
+                    "tokens" in slow and (len(slow["tokens"]) != 2 or slow["tokens"][0] > slow["tokens"][1])):
+                raise SystemExit(f"{name}: slower needs phase, receipt and an optional [min, max] tokens band")
         off = item.get("off", ["0"])
         if not isinstance(off, list) or not all(isinstance(v, str) and v for v in off) or item.get("value") in off:
             raise SystemExit(f"{name}: off must list the incumbent values of its switch, not its all-on value")

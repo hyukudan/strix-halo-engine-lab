@@ -175,7 +175,7 @@ this section for Qwen, `STRIX_QWEN_ALLON=fast` also the FAST rows. An explicit p
 | qwen | sampled_coupled_accept | `STRIX_MTP_SAMPLED_ACCEPT` | coupled | exact | sampled MTP: drafted output equals plain sampled output per seed (3,456 runs) |
 | qwen | gdn_fp16_chunk | `STRIX_QPF2K_GDN_FP16_CHUNK` | 1 | fast (qualification in progress) | 262,144-token prefill 177.9 -> 170.0 s; relL2 3.3-4.4e-4 against FP64 |
 | qwen | moe_route_bf16 | `STRIX_QPF2K_MOE_ROUTE_BF16` | 1 | fast (qualification in progress) | BF16 routed output storage |
-| qwen | moe_route_i8 | `STRIX_PREFILL_MOE_ROUTE_I8` | 1 | fast (qualification in progress) | one-byte route dot storage with per-group exponent; needs moe_route_bf16 |
+| qwen | moe_route_i8 | `STRIX_PREFILL_MOE_ROUTE_I8` | 1 | fast (qualification in progress) | one-byte route dot storage with per-group exponent; needs moe_route_bf16; the tier split and the down LDS epilogue write BF16 route words, so they are declined under it (declared incompatible for --all-on) |
 | qwen | index_proj_wmma | `STRIX_PREFILL_INDEX_PROJ_WMMA` | 1 | fast (qualification in progress) | BF16 indexer projections on WMMA |
 | qwen | index_score_wmma | `STRIX_PREFILL_INDEX_SCORE_WMMA` | 1 | fast (qualification in progress) | BF16 index score on WMMA; P16384 unpacked regression recorded, repair pending |
 | qwen | qsa_budget_1536 | `STRIX_QPF2K_QSA_BUDGET` | 1536 | fast (qualification in progress) | attention budget 1536 (kept at 1536 by decision) |

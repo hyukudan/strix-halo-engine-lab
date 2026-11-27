@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <ostream>
 #include <set>
+#include <variant>
 #include <stdexcept>
 
 #include "strix/profile/all_on_data.hpp"
@@ -104,6 +105,85 @@ std::string band_defect(const Lever& lever, const Band& band) {
     return {};
 }
 
+std::optional<std::pair<std::uint64_t, std::uint64_t>> token_range(const Json& item, std::string_view what) {
+    const auto* tokens = item.find("tokens");
+    if (tokens == nullptr) return std::nullopt;
+    if (!tokens->is_array() || tokens->size() != 2U)
+        throw std::invalid_argument("all_on catalogue: " + std::string(what) + " tokens needs [min, max]");
+    return std::pair{static_cast<std::uint64_t>(tokens->as_array()[0].as_int()),
+                     static_cast<std::uint64_t>(tokens->as_array()[1].as_int())};
+}
+
+std::string range_word(const std::pair<std::uint64_t, std::uint64_t>& range) {
+    return std::to_string(range.first) + ".." + std::to_string(range.second);
+}
+
+std::vector<std::string_view> split(std::string_view text, char separator) {
+    std::vector<std::string_view> out;
+    for (std::size_t start = 0;;) {
+        const auto end = text.find(separator, start);
+        out.push_back(text.substr(start, end == std::string_view::npos ? std::string_view::npos : end - start));
+        if (end == std::string_view::npos) return out;
+        start = end + 1;
+    }
+}
+
+// One atom of a precondition: env:NAME, env:NAME=VALUE, arg:FLAG, model:KEY=VALUE (catalogue "needs").
+void check_atom(std::string_view atom, const std::string& lever) {
+    const auto colon = atom.find(':');
+    const auto kind = atom.substr(0, colon);
+    const auto body = colon == std::string_view::npos ? std::string_view{} : atom.substr(colon + 1);
+    const bool known = (kind == "env" || kind == "arg" || kind == "model") && !body.empty() &&
+                       (kind != "model" || (body.find('=') != std::string_view::npos && body.front() != '='));
+    if (!known)
+        throw std::invalid_argument("all_on catalogue: " + lever + ": precondition '" + std::string(atom) +
+                                    "' is not env:NAME[=VALUE], arg:FLAG or model:KEY=VALUE");
+}
+
+bool atom_holds(std::string_view atom, const Lever& lever, const Query& query) {
+    const auto colon = atom.find(':');
+    const auto kind = atom.substr(0, colon);
+    const auto body = atom.substr(colon + 1);
+    const auto equal = body.find('=');
+    const auto key = body.substr(0, equal);
+    if (kind == "env") {
+        const auto value = query.env_value ? query.env_value(key) : std::nullopt;
+        if (!value) return false;
+        if (equal != std::string_view::npos) return *value == body.substr(equal + 1);
+        return *value != "0" && !(key == lever.env && contains(lever.off_values, *value));
+    }
+    if (kind == "arg")
+        return std::ranges::any_of(query.args, [&](const std::string& arg) {
+            return arg == body || (arg.size() > body.size() && arg.starts_with(body) && arg[body.size()] == '=');
+        });
+    if (!query.model_values) return false;
+    return contains(query.model_values(key), body.substr(equal + 1));
+}
+
+// The first unmet precondition entry ("" when every entry holds).
+std::string unmet_need(const Lever& lever, const Query& query) {
+    for (const auto& entry : lever.needs) {
+        const auto atoms = split(entry, '|');
+        if (!std::ranges::any_of(atoms, [&](std::string_view atom) { return atom_holds(atom, lever, query); })) return entry;
+    }
+    return {};
+}
+
+// The measured losing regime the band falls in ("" when none): a band without a length overlaps every length.
+std::string slower_defect(const Lever& lever, const Band& band) {
+    for (const auto& slower : lever.slower) {
+        if (band.phase != Phase::any && slower.phase != Phase::any && band.phase != slower.phase) continue;
+        if (slower.tokens && band.tokens && (*band.tokens < slower.tokens->first || *band.tokens > slower.tokens->second))
+            continue;
+        std::string text = "measured slower in " + std::string(phase_word(slower.phase)) +
+                           (slower.tokens ? " " + range_word(*slower.tokens) + " tokens" : std::string{});
+        if (!slower.receipt.empty()) text += " (" + slower.receipt + ")";
+        if (slower.tokens && !band.tokens) text += "; a --all-on-band length outside it applies it";
+        return text;
+    }
+    return {};
+}
+
 std::string_view gate_word(Gate gate) {
     return gate == Gate::pass ? "pass" : gate == Gate::pending ? "pending" : gate == Gate::fail ? "FAIL" : "none";
 }
@@ -124,11 +204,7 @@ std::vector<Lever> parse_catalogue(std::string_view json) {
         lever.phase = parse_phase(text(row, "phase"));
         lever.engines = strings(row, "engines");
         lever.backends = strings(row, "backends");
-        if (const auto* tokens = row.find("tokens")) {
-            if (!tokens->is_array() || tokens->size() != 2U) throw std::invalid_argument("all_on catalogue: tokens needs [min, max]");
-            lever.tokens = std::pair{static_cast<std::uint64_t>(tokens->as_array()[0].as_int()),
-                                     static_cast<std::uint64_t>(tokens->as_array()[1].as_int())};
-        }
+        lever.tokens = token_range(row, lever.name);
         lever.env = text_or_empty(row, "env");
         lever.value = text_or_empty(row, "value");
         lever.off_values = strings(row, "off");
@@ -139,6 +215,20 @@ std::vector<Lever> parse_catalogue(std::string_view json) {
         lever.incompatible_with = strings(row, "incompatible_with");
         lever.requires_levers = strings(row, "requires");
         lever.default_tiers = strings(row, "default_tiers");
+        lever.needs = strings(row, "needs");
+        for (const auto& entry : lever.needs)
+            for (const auto atom : split(entry, '|')) check_atom(atom, lever.name);
+        lever.needs_reason = text_or_empty(row, "needs_reason");
+        if (const auto* slower = row.find("slower")) {
+            if (!slower->is_array()) throw std::invalid_argument("all_on catalogue: " + lever.name + ": slower must be an array");
+            for (const auto& item : slower->as_array()) {
+                Slower entry;
+                entry.phase = parse_phase(text(item, "phase"));
+                entry.tokens = token_range(item, lever.name + " slower");
+                entry.receipt = text_or_empty(item, "receipt");
+                lever.slower.push_back(std::move(entry));
+            }
+        }
         lever.quality = text_or_empty(row, "quality");
         lever.reason = text_or_empty(row, "reason");
         if (const auto identity = text_or_empty(row, "identity"); identity == "pending") lever.identity_pending = true;
@@ -238,6 +328,12 @@ Plan resolve(std::span<const Lever> levers, const Query& query) {
         } else if (lever.cls == Class::fast && lever.gate != Gate::pass && query.tier == Tier::fast) {
             slot.state = State::refused;
             slot.reason = "gate v2 " + std::string(gate_word(lever.gate)) + " for fast";
+        } else if (const auto unmet = unmet_need(lever, query); !unmet.empty()) {
+            slot.state = State::refused;
+            slot.reason = "precondition " + unmet + " unmet" + (lever.needs_reason.empty() ? "" : ": " + lever.needs_reason);
+        } else if (const auto slower = slower_defect(lever, query.band); !slower.empty()) {
+            slot.state = State::refused;
+            slot.reason = slower;
         } else {
             slot.state = State::all_on;
             if (lever.identity_pending) slot.marks += " identity=pending";
@@ -305,6 +401,41 @@ Tier tier_of(Name name) {
     return name == Name::turbo ? Tier::turbo : name == Name::fast ? Tier::fast : Tier::exact;
 }
 
+std::vector<std::string> model_values(const model_description::ModelDescription* description, std::string_view key) {
+    std::vector<std::string> out;
+    const auto* value = description == nullptr ? nullptr : description->find(key);
+    if (value == nullptr) return out;
+    const auto word = [](const model_description::Value& item) -> std::optional<std::string> {
+        if (const auto* text_value = std::get_if<std::string>(&item.data)) return *text_value;
+        if (const auto* flag = std::get_if<bool>(&item.data)) return std::string(*flag ? "true" : "false");
+        if (const auto* number = std::get_if<std::int64_t>(&item.data)) return std::to_string(*number);
+        return std::nullopt;
+    };
+    if (const auto* array = std::get_if<model_description::Value::Array>(&value->data)) {
+        for (const auto& item : *array)
+            if (auto text_value = word(item)) out.push_back(std::move(*text_value));
+    } else if (auto text_value = word(*value)) {
+        out.push_back(std::move(*text_value));
+    }
+    return out;
+}
+
+bool engaged(std::string_view env, bool on, std::string_view reason, std::ostream& out) {
+    if (on) return true;
+    const auto list = env_value(kLeversEnv);
+    if (!list) return false;
+    const auto keys = split(*list, ',');
+    if (std::ranges::find(keys, env) == keys.end()) return false;
+    std::string name(env);
+    for (const auto& lever : catalogue())
+        if (lever.env == env) {
+            name = lever.name;
+            break;
+        }
+    out << "all-on: lever " << name << " source=all-on applied=no reason=" << reason << '\n';
+    return false;
+}
+
 std::vector<std::string> engines_of(const model_description::ModelDescription* description) {
     std::vector<std::string> out;
     if (description == nullptr) return out;
@@ -359,18 +490,26 @@ Scope begin(const model_description::ModelDescription* description, std::optiona
     const char* band_env = band.empty() ? strix::envcfg::text(kBandEnv) : nullptr;
     query.band = parse_band(band.empty() ? std::string_view(band_env ? band_env : "") : band);
     query.env_value = env_value;
+    query.args = args;
+    query.model_values = [description](std::string_view key) { return model_values(description, key); };
     scope.plan_ = resolve(catalogue(), query);
     out << "all-on: tier=" << tier_word(query.tier) << " backend=" << query.backend << " levers=" << scope.plan_.lines.size() << '\n'
         << scope.plan_.text();
     args.insert(args.end(), scope.plan_.args.begin(), scope.plan_.args.end());
     if (!apply) return scope;
+    std::string exported;
     for (const auto& [key, value] : scope.plan_.env) {
         if (env_set(key)) continue;
         put_env(key, value.c_str());
         scope.set_.push_back(key);
+        exported += (exported.empty() ? "" : ",") + key;
     }
     put_env(kAppliedEnv, "1");
     scope.set_.emplace_back(kAppliedEnv);
+    if (!exported.empty() && !env_set(kLeversEnv)) {
+        put_env(kLeversEnv, exported.c_str());
+        scope.set_.emplace_back(kLeversEnv);
+    }
     return scope;
 }
 

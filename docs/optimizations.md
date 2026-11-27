@@ -5946,8 +5946,11 @@ in [bundle qualification](engine/prefill/hc-output-wmma-qualification.md#bundle-
 ### MoE prepared Q4_K direct-B candidate
 
 **Engine:** `qwen`. **Control:** `STRIX_QPF2K_MOE_DIRECT_B=1`.
-**Default:** OFF. **Status:** exact candidate; native execution and complete-workload
-qualification pending. No measured speedup is claimed.
+**Default:** OFF. **Status:** FAST-class candidate (gate v2 pending); not an all-on lever in its losing regime.
+No measured speedup is claimed. Integrated one-node device checks of the all-on composition: with the other all-on
+levers, the greedy IDs equal EXACT at 2K and 8K prompt tokens but differ at 32.5K (removing this lever alone restores
+them), and prefill is slower with it (8K: 1,618 tok/s with, 1,857 without; 32.5K: 1,419 with, 1,683 without), so the
+catalogue states class fast with its losing band 8,192-32,768 prompt tokens.
 
 The host selector admits paired local Q4_K routed gate/up tensors for full-row
 fast FP16 CLI prefill at T4096/T8192, effective tunes 80/82/88, core=0 and SMALL=0.

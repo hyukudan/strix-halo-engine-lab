@@ -214,6 +214,12 @@ void catalogue_tests(const std::filesystem::path& root) {
     require(from_rows == from_export, "data/profile/all_on.json equals the all_on rows of docs/optimizations.json "
                                       "(run tools/ci/export_all_on.py)");
     require(std::ranges::any_of(levers, [](const ao::Lever& lever) { return lever.cls == ao::Class::kv; }), "KV row present");
+    for (const auto& row : rows.as_array())
+        if (const auto* item = row.find("all_on")) {
+            const auto& cls = item->find("class")->as_string();
+            require(cls == "unclassified" || cls == "kv" || item->find("needs") != nullptr,
+                    item->find("lever")->as_string() + " states its preconditions (\"needs\")");
+        }
     for (const auto& name : models(root)) {
         const auto desc = description(root, name);
         for (const char* backend : {"hip", "cuda"}) {
@@ -248,63 +254,190 @@ void catalogue_tests(const std::filesystem::path& root) {
     }
 }
 
+// Preconditions and measured losing regimes (catalogue "needs" / "slower"): an unmet precondition and a band inside a
+// losing regime refuse the lever with a printed reason; an explicit setting still wins.
+constexpr char needs_fixture[] = R"json([
+{"row":"r","lever":"n_env","class":"exact","gate":"none","engines":["m"],"backends":["hip"],"phase":"any","env":"X_N_ENV","value":"1","needs":["env:X_PACK"],"needs_reason":"a pack"},
+{"row":"r","lever":"n_alt","class":"turbo","gate":"none","engines":["m"],"backends":["hip"],"phase":"decode","env":"X_N_ALT","value":"1","needs":["env:X_LOW=1|arg:--qualify-weights","model:weights.format.experts=q4_g64"]},
+{"row":"r","lever":"s_pre","class":"exact","gate":"none","engines":["m"],"backends":["hip"],"phase":"prefill","env":"X_S_PRE","value":"1","needs":[],"slower":[{"phase":"prefill","tokens":[8192,32768],"receipt":"loo 8K"}]},
+{"row":"r","lever":"s_dec","class":"exact","gate":"none","engines":["m"],"backends":["hip"],"phase":"any","env":"X_S_DEC","value":"1","needs":[],"slower":[{"phase":"decode","receipt":"loo dec"}]}
+])json";
+
+void needs_slower_tests() {
+    const auto levers = ao::parse_catalogue(needs_fixture);
+    const auto plan = [&](ao::Tier tier, std::string band, EnvValue env, std::vector<std::string> args,
+                          std::vector<std::string> experts) {
+        ao::Query query;
+        query.tier = tier;
+        query.backend = "hip";
+        query.engines = {"m"};
+        query.band = ao::parse_band(band);
+        query.env_value = std::move(env);
+        query.args = std::move(args);
+        query.model_values = [experts](std::string_view key) {
+            return key == "weights.format.experts" ? experts : std::vector<std::string>{};
+        };
+        return ao::resolve(levers, query).text();
+    };
+    const std::vector<std::string> bf16{"bf16", "nvfp4"}, q4{"q4_g64"};
+    const auto none = plan(ao::Tier::turbo, "any", {}, {}, bf16);
+    require(none == "lever n_env source=refused reason=precondition env:X_PACK unmet: a pack\n"
+                    "lever n_alt source=refused reason=precondition env:X_LOW=1|arg:--qualify-weights unmet\n"
+                    "lever s_pre source=refused reason=measured slower in prefill 8192..32768 tokens (loo 8K); a "
+                    "--all-on-band length outside it applies it\n"
+                    "lever s_dec source=refused reason=measured slower in decode (loo dec)\n",
+            "unmet preconditions and losing regimes refuse with their reasons: got\n" + none);
+    const auto met = plan(ao::Tier::turbo, "decode", only("X_PACK", "/p"), {"--qualify-weights=k"}, q4);
+    require(met.find("lever n_env source=all-on\n") != std::string::npos &&
+                met.find("lever n_alt source=all-on gate=none reason=quality: not stated\n") != std::string::npos,
+            "met preconditions (env set, arg=value form, model array element) admit the lever: got\n" + met);
+    const auto wrong_value = plan(ao::Tier::turbo, "decode", only("X_LOW", "0"), {}, q4);
+    require(wrong_value.find("lever n_alt source=refused reason=precondition env:X_LOW=1|arg:--qualify-weights unmet\n") !=
+                std::string::npos,
+            "env:NAME=VALUE needs that value: got\n" + wrong_value);
+    const auto no_model = plan(ao::Tier::turbo, "decode", only("X_LOW", "1"), {}, bf16);
+    require(no_model.find("lever n_alt source=refused reason=precondition model:weights.format.experts=q4_g64 unmet\n") !=
+                std::string::npos,
+            "every precondition entry must hold: got\n" + no_model);
+    const auto short_prompt = plan(ao::Tier::exact, "prefill:2048", {}, {}, bf16);
+    require(short_prompt.find("lever s_pre source=all-on\n") != std::string::npos &&
+                short_prompt.find("lever s_dec source=all-on\n") != std::string::npos,
+            "a band outside every losing regime applies the lever: got\n" + short_prompt);
+    const auto long_prompt = plan(ao::Tier::exact, "prefill:8192", {}, {}, bf16);
+    require(long_prompt.find("lever s_pre source=refused reason=measured slower in prefill 8192..32768 tokens (loo 8K)\n") !=
+                    std::string::npos &&
+                long_prompt.find("lever s_dec source=all-on\n") != std::string::npos,
+            "a band inside a losing regime refuses only that lever: got\n" + long_prompt);
+    const auto decode = plan(ao::Tier::exact, "decode:4096", only("X_S_DEC", "1"), {}, bf16);
+    require(decode.find("lever s_dec source=explicit reason=explicit setting kept\n") != std::string::npos,
+            "an explicit setting wins over a losing regime: got\n" + decode);
+    bool threw = false;
+    try {
+        (void)ao::parse_catalogue(R"json([{"row":"r","lever":"bad","class":"exact","gate":"none","engines":["m"],"backends":["hip"],"phase":"any","env":"X","value":"1","needs":["file:/x"]}])json");
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    require(threw, "an unknown precondition kind is a catalogue error");
+}
+
+// The engine side of the one record: a switch exported by --all-on that the engine does not engage prints its line.
+void engaged_tests() {
+    put(ao::kLeversEnv, "X_A,STRIX_INK_HIP_SERVED_TALL_CHUNK");
+    std::ostringstream out;
+    require(ao::engaged("X_A", true, "unused", out) && out.str().empty(), "an engaged lever prints nothing");
+    require(!ao::engaged("STRIX_INK_HIP_SERVED_TALL_CHUNK", false, "tier fast route", out) &&
+                out.str() == "all-on: lever ink_hip_tall_chunk source=all-on applied=no reason=tier fast route\n",
+            "an exported lever the engine does not engage says so under its catalogue name: got\n" + out.str());
+    std::ostringstream quiet;
+    require(!ao::engaged("X_OTHER", false, "r", quiet) && quiet.str().empty(), "a switch all-on did not export prints nothing");
+    put(ao::kLeversEnv, nullptr);
+    require(!ao::engaged("X_A", false, "r", quiet) && quiet.str().empty(), "without --all-on nothing is printed");
+}
+
 // The review's two cases on the shipped catalogue (P2-2).
 void explicit_catalogue_tests(const std::filesystem::path& root) {
     const auto& levers = ao::catalogue();
-    const auto run = [&](const std::string& model, ao::Tier tier, EnvValue env) {
+    const auto run = [&](const std::string& model, ao::Tier tier, EnvValue env, std::string band = "any") {
         const auto desc = description(root, model);
         ao::Query query;
         query.tier = tier;
         query.backend = "hip";
         query.engines = ao::engines_of(&desc);
         query.env_value = std::move(env);
+        query.band = ao::parse_band(band);
+        query.model_values = [desc](std::string_view key) { return ao::model_values(&desc, key); };
         return ao::resolve(levers, query).text();
     };
+    // The low-bit arithmetic levers need resident q4 / q6 weights (the shipped model has none): with the TURBO low-bit
+    // row requested they are admitted.
+    const auto lowbit = [](std::string key, std::string value) -> EnvValue {
+        return [key = std::move(key), value = std::move(value)](std::string_view name) -> std::optional<std::string> {
+            if (name == key) return value;
+            if (name == "STRIX_INK_LOWBIT_TURBO") return std::string("1");
+            return std::nullopt;
+        };
+    };
+    // A1: TURBO --all-on never selects a low-bit lever the shipped weights cannot run (the server refused to start).
+    const auto shipped = run("inkling2-mini", ao::Tier::turbo, {});
+    for (const char* lever : {"ink_lowbit_rows_select", "ink_lowbit_folded_scale", "ink_lowbit_head_sp4t"})
+        require(shipped.find("lever " + std::string(lever) + " source=refused reason=precondition ") != std::string::npos,
+                std::string(lever) + " is refused with its precondition on the shipped weights: got\n" + shipped);
+    // A3: the measured losers are not all-on levers in their losing regimes, and stay all-on outside them.
+    const auto qwen_any = run("qwen3.8-flash-next", ao::Tier::turbo, {});
+    require(qwen_any.find("lever qwen_moe_direct_b source=refused reason=measured slower in prefill 8192..32768") !=
+                    std::string::npos &&
+                qwen_any.find("lever qwen_router_bf16 source=refused reason=measured slower in decode") != std::string::npos,
+            "the measured losers are refused for a launch of every phase: got\n" + qwen_any);
+    const auto qwen_short = run("qwen3.8-flash-next", ao::Tier::turbo, {}, "prefill:2048");
+    require(qwen_short.find("lever qwen_moe_direct_b source=all-on") != std::string::npos &&
+                qwen_short.find("lever qwen_router_bf16 source=all-on") != std::string::npos,
+            "outside their losing regimes the levers stay all-on: got\n" + qwen_short);
+    // A4: direct B is not bitwise at 32.5K: never an EXACT all-on lever.
+    const auto qwen_exact = run("qwen3.8-flash-next", ao::Tier::exact, {}, "prefill:2048");
+    require(qwen_exact.find("qwen_moe_direct_b") == std::string::npos, "EXACT all-on has no lossy direct B: got\n" + qwen_exact);
+    // A2: one-byte route words and the tier split / down LDS epilogue are declared alternatives: TURBO all-on keeps the
+    // earlier rows and refuses route I8 (the pair ran a non-finite MoE accumulation).
+    require(qwen_short.find("lever qwen_moe_route_i8 source=refused reason=incompatible with qwen_moe_tiers\n") !=
+                    std::string::npos &&
+                qwen_short.find("lever qwen_moe_tiers source=all-on") != std::string::npos,
+            "TURBO all-on never runs route I8 with the tier split: got\n" + qwen_short);
+    // A5: the served tall chunk is not bitwise: never an EXACT all-on lever; TURBO takes it (gate pending for FAST).
+    const auto ink_exact = run("inkling2-mini", ao::Tier::exact, {});
+    const auto ink_turbo = run("inkling2-mini", ao::Tier::turbo, {});
+    require(ink_exact.find("ink_hip_tall_chunk") == std::string::npos &&
+                ink_turbo.find("lever ink_hip_tall_chunk source=all-on gate=pending") != std::string::npos,
+            "the tall chunk is a FAST-class lever: got\n" + ink_exact + ink_turbo);
     const auto qwen = run("qwen3.8-flash-next", ao::Tier::exact, only("STRIX_QPF2K_HC_RECOMPUTE_NORM", "0"));
     require(qwen.find("lever qwen_hc_recompute source=explicit reason=explicit setting kept: off\n") != std::string::npos &&
                 qwen.find("lever qwen_hc_inverse_reuse source=refused reason=requires qwen_hc_recompute\n") != std::string::npos,
             "an explicitly disabled requirement refuses its dependant: got\n" + qwen);
-    const auto ink = run("inkling2-mini", ao::Tier::turbo, only("STRIX_LOWBIT_FOLDED_SCALE", "f16_folded_scale"));
+    const auto ink = run("inkling2-mini", ao::Tier::turbo, lowbit("STRIX_LOWBIT_FOLDED_SCALE", "f16_folded_scale"));
     require(ink.find("lever ink_lowbit_rows_select source=refused reason=incompatible with ink_lowbit_folded_scale\n") !=
                     std::string::npos &&
                 ink.find("lever ink_lowbit_folded_scale source=explicit reason=explicit setting kept\n") != std::string::npos,
             "an explicit later peer refuses the earlier incompatible lever: got\n" + ink);
     // An explicit value equal to the switch's incumbent (the default low-bit scale named by its own word) is an
     // explicit off: it neither runs the lever nor refuses its incompatible peer.
-    const auto incumbent = run("inkling2-mini", ao::Tier::turbo, only("STRIX_LOWBIT_FOLDED_SCALE", "f16_group_scale"));
+    const auto incumbent = run("inkling2-mini", ao::Tier::turbo, lowbit("STRIX_LOWBIT_FOLDED_SCALE", "f16_group_scale"));
     require(incumbent.find("lever ink_lowbit_folded_scale source=explicit reason=explicit setting kept: off\n") !=
                     std::string::npos &&
                 incumbent.find("lever ink_lowbit_rows_select source=all-on") != std::string::npos,
             "an explicit incumbent value is off and leaves the incompatible peer on: got\n" + incumbent);
     // An ungated TURBO lever says so on its all-on line.
-    const auto turbo = run("inkling2-mini", ao::Tier::turbo, {});
+    const auto turbo = run("inkling2-mini", ao::Tier::turbo, only("STRIX_LOWBIT_PACK", "/packs/strix.sp4t"));
     require(turbo.find("lever ink_lowbit_head_sp4t source=all-on gate=none") != std::string::npos,
             "an ungated TURBO lever prints gate=none: got\n" + turbo);
 }
 
 void binding_tests(const std::filesystem::path& root) {
     const auto desc = description(root, "qwen3.8-flash-next");
-    put("STRIX_QPF2K_MOE_DIRECT_B", nullptr);
+    put("STRIX_QPF2K_HC_RECOMPUTE_NORM", nullptr);
     put("STRIX_QPF2K_MOE_ROUTE_BF16", nullptr);
     put("STRIX_QWEN_ROUTER_BF16", "0");
     put(ao::kAppliedEnv, nullptr);
     std::vector<std::string> args;
     std::ostringstream out;
     {
+        // An exact lever (HC normalized recompute) is exported under FAST; a pending-gate lossy one is not.
         const auto scope = ao::begin(&desc, Name::fast, "hip", "", out, true, args);
-        require(std::string(std::getenv("STRIX_QPF2K_MOE_DIRECT_B") ? std::getenv("STRIX_QPF2K_MOE_DIRECT_B") : "") == "1",
+        require(std::string(std::getenv("STRIX_QPF2K_HC_RECOMPUTE_NORM") ? std::getenv("STRIX_QPF2K_HC_RECOMPUTE_NORM") : "") == "1",
                 "an exact lever is exported under fast");
         require(std::getenv("STRIX_QPF2K_MOE_ROUTE_BF16") == nullptr, "a pending-gate lossy lever is not exported under fast");
         require(std::string(std::getenv("STRIX_QWEN_ROUTER_BF16")) == "0", "an explicit value is not overwritten");
         require(out.str().starts_with("all-on: tier=fast backend=hip levers="), "header line");
-        require(out.str().find("lever qwen_moe_direct_b source=all-on\n") != std::string::npos, "printed lever line");
+        require(out.str().find("lever qwen_hc_recompute source=all-on\n") != std::string::npos, "printed lever line");
+        const char* exported = std::getenv(ao::kLeversEnv);
+        require(exported != nullptr && std::string(exported).find("STRIX_QPF2K_HC_RECOMPUTE_NORM") != std::string::npos &&
+                    std::string(exported).find("STRIX_QWEN_ROUTER_BF16") == std::string::npos,
+                "the exported switches are listed for the engines (an explicit one is not)");
         require(out.str().find("lever qwen_router_bf16 source=explicit reason=explicit setting kept: off\n") != std::string::npos,
                 "explicit lever line");
         std::ostringstream again;
         const auto second = ao::begin(&desc, Name::fast, "hip", "", again, true, args);
         require(again.str().empty(), "a second shell prints and applies nothing");
     }
-    require(std::getenv("STRIX_QPF2K_MOE_DIRECT_B") == nullptr, "the scope restores the environment");
+    require(std::getenv("STRIX_QPF2K_HC_RECOMPUTE_NORM") == nullptr && std::getenv(ao::kLeversEnv) == nullptr,
+            "the scope restores the environment");
     // Dry run: arguments and lines, no exports.
     std::ostringstream dry;
     const auto desc27 = description(root, "qwen3.8-27b");
@@ -363,6 +496,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         fixture_tests();
+        needs_slower_tests();
+        engaged_tests();
         catalogue_tests(root);
         explicit_catalogue_tests(root);
         binding_tests(root);
