@@ -30,6 +30,7 @@ namespace strix::pair::layers {
 inline constexpr std::uint64_t seam_magic = 0x31454e4950594c53ULL;   // "SLYPINE1"
 inline constexpr std::uint64_t hidden_magic = 0x31444e4459414c53ULL; // decode hidden row
 inline constexpr std::uint64_t token_magic = 0x314e4b5459414c53ULL;  // decode token relay
+inline constexpr std::size_t decode_header_bytes = 4U * sizeof(std::uint64_t);
 inline constexpr std::uint64_t state_magic = 0x31544154535941ULL;    // end-of-prefill state relay to the decoder
 enum Word : std::size_t { w_magic = 0, w_start = 2, w_rows = 3, w_bytes = 4, w_identity = 5, w_tokens = 6, w_cut = 7 };
 
@@ -225,7 +226,7 @@ inline DecodeStats decode(const Placement& p, std::uint32_t first_token, std::ui
     p.check();
     if ((up != nullptr) == p.embeds() || (down != nullptr) == p.head())
         throw std::invalid_argument("layer pipeline: links do not match the stage (up: not first, down: not last)");
-    std::vector<std::byte> message(32U + ops.row_bytes);   // 4 header words + one row
+    std::vector<std::byte> message(decode_header_bytes + ops.row_bytes);
     const auto relay = [&](std::uint32_t token, std::uint64_t step) {   // last -> ... -> first
         std::uint64_t words[4] = {token_magic, step, token, 0};
         if (down) {
@@ -248,9 +249,9 @@ inline DecodeStats decode(const Placement& p, std::uint32_t first_token, std::ui
         for (std::uint64_t step = 1; step < count; ++step) {
             if (!ready) {
                 ops.forward(token, false);
-                ops.export_row(std::span(message).subspan(32U));
+                ops.export_row(std::span(message).subspan(decode_header_bytes));
             }
-            SeamCrc crc; crc.update(std::span<const std::byte>(message).subspan(32U));
+            SeamCrc crc; crc.update(std::span<const std::byte>(message).subspan(decode_header_bytes));
             const std::uint64_t h[4] = {hidden_magic, step, ops.row_bytes, crc.value()};
             std::memcpy(message.data(), h, sizeof h);
             down->send(message);
@@ -258,7 +259,7 @@ inline DecodeStats decode(const Placement& p, std::uint32_t first_token, std::ui
             const bool guessed = step + 1U < count && ops.guess(token, g);
             if (guessed) {
                 ops.forward(g, false);
-                ops.export_row(std::span(spare).subspan(32U));
+                ops.export_row(std::span(spare).subspan(decode_header_bytes));
                 ++out.guesses;
             }
             token = relay(0U, step);
@@ -275,15 +276,15 @@ inline DecodeStats decode(const Placement& p, std::uint32_t first_token, std::ui
             up->receive(message);
             std::uint64_t h[4];
             std::memcpy(h, message.data(), sizeof h);
-            SeamCrc crc; crc.update(std::span(message).subspan(32U));
+            SeamCrc crc; crc.update(std::span(message).subspan(decode_header_bytes));
             if (h[0] != hidden_magic || h[1] != step || h[2] != ops.row_bytes || h[3] != crc.value())
                 throw std::runtime_error("layer pipeline decode row mismatch (order, size or CRC)");
-            ops.import_row(std::span<const std::byte>(message).subspan(32U));
+            ops.import_row(std::span<const std::byte>(message).subspan(decode_header_bytes));
         }
         ops.forward(token, p.head());
         if (down) {
-            ops.export_row(std::span(message).subspan(32U));
-            SeamCrc crc; crc.update(std::span<const std::byte>(message).subspan(32U));
+            ops.export_row(std::span(message).subspan(decode_header_bytes));
+            SeamCrc crc; crc.update(std::span<const std::byte>(message).subspan(decode_header_bytes));
             const std::uint64_t h[4] = {hidden_magic, step, ops.row_bytes, crc.value()};
             std::memcpy(message.data(), h, sizeof h);
             down->send(message);
@@ -467,7 +468,7 @@ inline DecodeStats decode(const StageMap& map, unsigned rank, std::uint32_t firs
     check_stage_map(map, rank, static_cast<bool>(ops.range));
     const std::uint32_t stages = map.stages();
     const bool head_rank = map.owner(stages - 1U) == rank;
-    std::vector<std::byte> message(32U + ops.row_bytes);   // 4 header words + one row
+    std::vector<std::byte> message(decode_header_bytes + ops.row_bytes);
     const auto relay = [&](std::uint32_t token, std::uint64_t step) {
         std::uint64_t words[4] = {token_magic, step, token, 0};
         if (head_rank) {
@@ -491,15 +492,15 @@ inline DecodeStats decode(const StageMap& map, unsigned rank, std::uint32_t firs
                 peer.receive(message);
                 std::uint64_t h[4];
                 std::memcpy(h, message.data(), sizeof h);
-                SeamCrc crc; crc.update(std::span(message).subspan(32U));
+                SeamCrc crc; crc.update(std::span(message).subspan(decode_header_bytes));
                 if (h[0] != hidden_magic || h[1] != step * stages + s - 1U || h[2] != ops.row_bytes || h[3] != crc.value())
                     throw std::runtime_error("layer pipeline decode row mismatch (order, size or CRC)");
-                ops.import_row(std::span<const std::byte>(message).subspan(32U));
+                ops.import_row(std::span<const std::byte>(message).subspan(decode_header_bytes));
             }
             ops.range(token, map.cuts[s].layer, map.cuts[s + 1U].layer, s + 1U == stages);
             if (s + 1U < stages) {
-                ops.export_row(std::span(message).subspan(32U));
-                SeamCrc crc; crc.update(std::span<const std::byte>(message).subspan(32U));
+                ops.export_row(std::span(message).subspan(decode_header_bytes));
+                SeamCrc crc; crc.update(std::span<const std::byte>(message).subspan(decode_header_bytes));
                 const std::uint64_t h[4] = {hidden_magic, step * stages + s, ops.row_bytes, crc.value()};
                 std::memcpy(message.data(), h, sizeof h);
                 peer.send(message);

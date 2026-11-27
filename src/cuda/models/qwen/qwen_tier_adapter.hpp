@@ -111,7 +111,9 @@ public:
         executor_ = std::make_unique<cpu::expert::Executor>(static_cast<unsigned>(std::max(1, want)), *exp_);
         exchange_ = std::make_unique<tiered::Exchange>(L);
         worker_ = std::make_unique<tiered::TierWorker>(*exchange_, std::move(host), *executor_);
-        planner_ = std::make_unique<residency::Planner>(in_.model, S);
+        residency::PlannerConfig config;
+        config.promotion_budget_bytes = in_.decision.promotion_budget_bytes;
+        planner_ = std::make_unique<residency::Planner>(in_.model, S, config);
     }
     ~QwenTier() {
         worker_.reset();  // joins before the exchange goes

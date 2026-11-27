@@ -4,6 +4,7 @@
 #include "strix/residency/replacement.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,7 @@
 namespace strix::residency {
 namespace {
 constexpr std::uint64_t kGiB = 1ull << 30;
+constexpr std::uint64_t kMiB = 1ull << 20;
 
 double parse_gib(const char* what, const std::string& s) {
     char* end = nullptr;
@@ -25,6 +27,15 @@ double parse_gib(const char* what, const std::string& s) {
     return v;
 }
 std::uint64_t gib_to_bytes(double g) { return static_cast<std::uint64_t>(g * double(kGiB)); }
+
+std::uint64_t parse_promotion_bytes(std::string_view what, const std::string& s) {
+    std::uint64_t mib = 0;
+    const auto end = s.data() + s.size();
+    const auto parsed = std::from_chars(s.data(), end, mib);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || mib > std::numeric_limits<std::uint64_t>::max() / kMiB)
+        throw std::invalid_argument(std::string(what) + ": expected a nonnegative integer MiB count that fits in bytes");
+    return mib * kMiB;
+}
 
 bool parse_mode(std::string_view s, Mode& m) {
     if (s == "auto") m = Mode::automatic;
@@ -103,6 +114,10 @@ bool parse_flag(std::string_view arg, const std::function<std::string()>& next, 
         if (out.vram_budget == 0) throw std::invalid_argument("--vram-budget-gib: too small");
         return true;
     }
+    if (arg == "--expert-promotion-mib") {
+        out.promotion_budget_bytes = parse_promotion_bytes(arg, next());
+        return true;
+    }
     return false;
 }
 
@@ -117,6 +132,10 @@ Options with_environment(Options in) {
     if (in.vram_budget == 0) {
         if (const char* v = envcfg::text("STRIX_VRAM_BUDGET_GIB"); v && *v)
             in.vram_budget = gib_to_bytes(parse_gib("STRIX_VRAM_BUDGET_GIB", v));
+    }
+    if (!in.promotion_budget_bytes) {
+        if (const char* v = envcfg::text("STRIX_EXPERT_PROMOTION_MIB"); v && *v)
+            in.promotion_budget_bytes = parse_promotion_bytes("STRIX_EXPERT_PROMOTION_MIB", v);
     }
     return in;
 }
@@ -157,6 +176,7 @@ CardBytes live_budget_view(const CardBytes& physical, std::uint64_t device_cap,
 Decision resolve(const Options& opt, const ModelBytes& m, const CardBytes& card, const SessionBytes& s,
                  const HostBytes& host) {
     Decision d;
+    d.promotion_budget_bytes = opt.promotion_budget_bytes;
     d.positions_requested = s.positions;
     d.positions = s.positions;
     const BudgetCap applied = budget_cap(opt, card);
@@ -258,8 +278,13 @@ std::string decision_json(const Decision& d) {
     o += ",\"slots_per_layer\":" + std::to_string(d.slots_per_layer);
     o += ",\"positions\":" + std::to_string(d.positions);
     o += ",\"positions_requested\":" + std::to_string(d.positions_requested);
-    o += ",\"host_expert_bytes\":" + std::to_string(d.host_expert_bytes) + "}";
-    return o;
+    o += ",\"host_expert_bytes\":" + std::to_string(d.host_expert_bytes);
+    if (d.promotion_budget_bytes) {
+        o += ",\"expert_promotion_budget_bytes\":" + std::to_string(*d.promotion_budget_bytes);
+        o += ",\"expert_promotion_budget_active\":";
+        o += d.ok && d.mode == Mode::tiered ? "true" : "false";
+    }
+    return o + "}";
 }
 
 std::string receipt_json(const Receipt& r) {
@@ -274,8 +299,10 @@ std::string receipt_json(const Receipt& r) {
     o += ",\"upload_ms\":" + num(r.upload_ms);
     o += ",\"exchange_ms\":" + num(r.exchange_ms);
     o += ",\"resident_bytes\":" + std::to_string(r.resident_bytes);
-    o += ",\"context_filled\":" + std::to_string(r.context_filled) + "}";
-    return o;
+    o += ",\"context_filled\":" + std::to_string(r.context_filled);
+    if (r.promotion_budget_bytes)
+        o += ",\"expert_promotion_budget_bytes\":" + std::to_string(*r.promotion_budget_bytes);
+    return o + "}";
 }
 
 Planner::Planner(const ModelBytes& m, std::uint32_t slots_per_layer, PlannerConfig cfg)
@@ -321,6 +348,8 @@ void Planner::end_step() {
 }
 
 std::vector<Move> Planner::plan() const {
+    const auto budget = cfg_.promotion_budget_bytes.value_or(cfg_.upload_bytes_per_step);
+    if (cfg_.promotion_budget_bytes && budget == 0) return {};
     struct Cand {
         Move mv;
         double gain;
@@ -372,7 +401,9 @@ std::vector<Move> Planner::plan() const {
     std::uint64_t spent = 0;
     for (const Cand& c : all) {
         const std::uint64_t b = bytes_[c.mv.layer];
-        if (spent + b > cfg_.upload_bytes_per_step && !(out.empty() && b > cfg_.upload_bytes_per_step)) continue;
+        const bool fits = spent <= budget && b <= budget - spent;
+        const bool allow_single = !cfg_.promotion_budget_bytes && out.empty() && b > budget;
+        if (!fits && !allow_single) continue;
         spent += b;
         out.push_back(c.mv);
     }
@@ -406,6 +437,7 @@ void Planner::fill_from_seed() {
 
 Receipt Planner::receipt() const {
     Receipt r = rc_;
+    r.promotion_budget_bytes = cfg_.promotion_budget_bytes;
     r.resident_bytes = 0;
     for (std::uint32_t l = 0; l < layers_; ++l)
         for (std::uint32_t s = 0; s < slots_; ++s)

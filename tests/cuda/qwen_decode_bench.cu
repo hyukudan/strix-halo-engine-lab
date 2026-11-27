@@ -66,7 +66,7 @@ static int bench_main(int argc, char** argv) {
     }
     const auto n_arg = static_cast<std::uint64_t>(std::atoll(argv[5]));
     const auto g = static_cast<std::uint32_t>(std::atoi(argv[6]));
-    // optional flags after the six positionals: --expert-residency auto|full|tiered, --vram-budget-gib N, --print-effective-config
+    // Optional residency flags and --print-effective-config follow the six positionals.
     // (the same consumer and environment fold as the server: strix/residency/residency_cli.hpp)
     strix::residency::CliOptions residency_cli;
     try {

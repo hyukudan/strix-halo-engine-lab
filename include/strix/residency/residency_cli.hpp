@@ -1,7 +1,7 @@
 #pragma once
 // The residency command-line surface shared by every entry point (the Qwen CUDA serve, qwen_decode_bench): one consumer
-// for `--expert-residency auto|full|tiered`, `--vram-budget-gib N` and `--print-effective-config`, and one finisher that
-// folds in the environment (flags win). Header only and CUDA-free, so a host test can drive it.
+// for the residency flags and `--print-effective-config`, and one finisher that folds in the environment (flags win).
+// Header only and CUDA-free, so a host test can drive it.
 #include "strix/residency/expert_residency.hpp"
 
 #include <cstddef>

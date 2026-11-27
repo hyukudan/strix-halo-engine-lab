@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -31,13 +32,14 @@ struct Options {
     // cold experts then page from the model file (the reason says by how much). Budget emulation only.
     bool host_check = true;
     bool mode_explicit = false;
+    std::optional<std::uint64_t> promotion_budget_bytes;  // strict post-seed cap per step, 0 = seed only
 };
 
-// Consumes `--expert-residency auto|full|tiered` and `--vram-budget-gib N` (decimal ok, > 0). Returns true when
-// `arg` is one of the two flags (value taken from next()); false when it is not ours. A bad value throws
+// Consumes `--expert-residency auto|full|tiered`, `--vram-budget-gib N` (decimal ok, > 0), and
+// `--expert-promotion-mib N` (nonnegative integer). Returns false for other arguments. A bad value throws
 // std::invalid_argument. Serve and CLI both call this, so they accept the same flags.
 bool parse_flag(std::string_view arg, const std::function<std::string()>& next, Options& out);
-// STRIX_EXPERT_RESIDENCY / STRIX_VRAM_BUDGET_GIB via envcfg; only fills what the flags left unset (flags win).
+// Residency environment options fill what the flags left unset (flags win).
 // Callers: parse flags first, then call with_environment (explicit auto also wins over the environment).
 Options with_environment(Options in);
 
@@ -82,6 +84,7 @@ struct Decision {
     // budget is the engine allowance after live usage; cap_source: card | residency (--vram-budget-gib / STRIX_VRAM_BUDGET_GIB) | device_profile
     std::uint64_t cap = 0;
     std::string cap_source = "card";
+    std::optional<std::uint64_t> promotion_budget_bytes;
 };
 
 // Resolve the engine allowance: the explicit residency budget limits this engine; the device profile caps
@@ -105,6 +108,7 @@ struct PlannerConfig {
     double decay = 0.97;
     double margin_reuses = 1.5;
     std::uint64_t upload_bytes_per_step = 64ull << 20;
+    std::optional<std::uint64_t> promotion_budget_bytes;
 };
 
 struct Move {
@@ -117,6 +121,7 @@ struct Receipt {
     double cpu_ms = 0, upload_ms = 0, exchange_ms = 0;  // filled by the adapter
     std::uint64_t resident_bytes = 0;
     std::uint32_t context_filled = 0;  // filled by the adapter
+    std::optional<std::uint64_t> promotion_budget_bytes;
     double byte_hit_rate() const { return active_bytes ? double(hit_bytes) / double(active_bytes) : 1.0; }
 };
 std::string receipt_json(const Receipt&);
@@ -124,7 +129,8 @@ std::string receipt_json(const Receipt&);
 // Score = decayed count of steps that used the expert. Promote candidate c over victim v iff
 // score_c - score_v * bytes_v / bytes_c > margin_reuses (saved time per resident byte = reuse rate / CPU bandwidth,
 // so scores compare directly in reuses). Free slots fill first; promoted bytes per plan() <= upload_bytes_per_step
-// (a single expert larger than the budget is still allowed alone, otherwise it could never move); an expert
+// (a single expert larger than the budget is allowed alone). An explicit promotion_budget_bytes overrides this
+// budget with a hard cap after initialization. An expert
 // observed in the current step is never evicted; ties by (layer, expert) ascending. plan() is a pure function of
 // the state: calling it twice without commit() returns the same moves.
 class Planner {
