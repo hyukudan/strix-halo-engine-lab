@@ -467,10 +467,12 @@ void refreshed_selector_proofs() {
         {"serve-conversation", "src/minimax/serve/serve_runtime.cpp", "eng.set_unaligned_resume(conversation_agreed)"},
         {"serve-token-memo", "src/minimax/serve/minimax_api.cpp", "TokenMemo::enabled_by_default()"},
         {"serve-token-memo", "src/minimax/serve/minimax_api.cpp", "tokenizer->encode_marked(tail,true,marks)"},
-        {"route-receipt", "apps/minimax_rank_main.cpp", "strix::route::compare_ranks("},
-        {"route-receipt", "apps/minimax_rank_main.cpp", "strix::minimax::defaults::check_peer("},
-        {"route-receipt", "src/minimax/serve/serve_runtime.cpp", "strix::route::compare_ranks("},
-        {"route-receipt", "src/minimax/serve/serve_runtime.cpp", "strix::minimax::defaults::check_peer("},
+        // Both pair entry points agree through the shared pair hello, which carries the route and profile fingerprints.
+        {"route-receipt", "apps/minimax_rank_main.cpp", "eng.agree_pair(pair_model_identity, false)"},
+        {"route-receipt", "src/minimax/serve/serve_runtime.cpp", "eng.agree_pair(pair_model_identity, true, dspark_config)"},
+        {"route-receipt", "src/minimax/engine/engine.hip", "hello.route = strix::route::fingerprint();"},
+        {"route-receipt", "src/minimax/engine/engine.hip", "hello.profile = defaults::profile_resolution(strix::envcfg::text).fingerprint();"},
+        {"route-receipt", "src/minimax/engine/engine.hip", "strix::pair::exchange_hello(hello,"},
     };
     for (const auto& row : wiring) {
         (void)allow(row.id);
