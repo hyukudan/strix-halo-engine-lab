@@ -152,6 +152,11 @@ void check_fp8() {
 }
 
 void check_operator_traits() {
+    std::array collapse{1.00390625F};
+    constexpr std::array unit_gain{1.0F};
+    strix::core::rms_norm_bf16_reference(collapse, unit_gain, 1e-6F, true);
+    require(collapse == std::array{0.99609375F}, "fused RMS uses the unrounded variance and BF16 numerator");
+
     auto policy = moe::route_policy_named("sigmoid", true, "float_serial", "selection", 4, 2,
                                            true, false, 0.0F, 2.0F);
     constexpr std::array select{0.5F, 0.5F, 0.25F, 0.75F}, combination{0.25F, 0.125F, 0.5F, 0.75F},

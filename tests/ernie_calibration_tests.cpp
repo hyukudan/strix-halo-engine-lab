@@ -199,7 +199,7 @@ void multimax_test() {
         check(std::bit_cast<std::uint32_t>(values[i]) == output_bits[i], "MultiMax FP32 threshold or rounding");
     nonfinite = {std::numeric_limits<float>::quiet_NaN(), inf, -inf};
     strix::core::multimax_f32_reference(nonfinite, model_ranges, model_strengths);
-    check(std::ranges::all_of(nonfinite, [](float value) { return std::isnan(value); }),
+    check(std::isnan(nonfinite[0]) && std::isnan(nonfinite[1]) && nonfinite[2] == -inf,
           "MultiMax FP32 exceptional values");
 }
 
