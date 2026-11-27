@@ -579,11 +579,12 @@ void profile_parity() {
             loaded.reset();
             const auto cli = parse_cli(tier, "hip");
             const auto service = factory->create(selection);
+            // Unset: the FAST column (TURBO inherits it) targets the SP4 arm but stays pending until its decode ladder row.
             const bool expected = std::string_view(tier) != "exact" && value && std::string_view(value) != "0";
             require(service && loaded && cli.weights.qualify_decode_only == expected &&
                         loaded->weight_options.qualify_decode_only == expected &&
                         loaded->weight_options.qualify == cli.weights.qualify &&
-                        (!expected || std::string_view(value) != "sp4t-attn" ||
+                        (!expected || (value && std::string_view(value) != "sp4t-attn") ||
                          loaded->weight_options.qualify == &strix::weight::kAttentionHeadSP4TPolicy),
                     "CLI and server take the same SP4 attention + head decode arm");
         }
@@ -595,6 +596,68 @@ void profile_parity() {
     require(refuses([&] { (void)factory->create(selection); }, "qualified on HIP only"),
             "the CUDA server refuses the SP4 attention + head arm");
     set_env("STRIX_INK_LOWBIT_HEAD", nullptr);
+    // The column value selects nothing on CUDA (its receipts are gfx1151): CLI and server keep the incumbent weights.
+    for (const auto* tier : {"fast", "turbo"}) {
+        selection.arguments.back() = tier;
+        loaded.reset();
+        const auto cli = parse_cli(tier, "cuda");
+        const auto service = factory->create(selection);
+        require(service && loaded && !cli.weights.qualify_decode_only && cli.weights.qualify == nullptr &&
+                    !loaded->weight_options.qualify_decode_only && loaded->weight_options.qualify == nullptr,
+                "the SP4 column selects no arm on CUDA, CLI and server alike");
+    }
+    // The column runs in the decode regimes of its kMiniLadder rows only (one lane, 916..2141 resident positions,
+    // gfx1151, HIP): the command line (prompt + generated positions, one lane) and the server (context, slot cap) call
+    // mini_decode_lowbit_head with their extent. EXACT never takes it; outside the band the tier below (builtin 0).
+    {
+        struct DecodeCase {
+            strix::weight::WeightLoadExtent extent;
+            std::string_view device;
+            bool hip, band;  // band: the regime is inside the decode row (the arm loads on HIP only)
+        };
+        const DecodeCase cases[] = {
+            {{916U, 1U}, "gfx1151", true, true},   {{2141U, 1U}, "gfx1151", true, true},
+            {{1500U, 1U}, "gfx1151", true, true},  {{915U, 1U}, "gfx1151", true, false},
+            {{2142U, 1U}, "gfx1151", true, false}, {{16384U, 16U}, "gfx1151", true, false},
+            {{1500U, 8U}, "gfx1151", true, false}, {{1500U, 0U}, "gfx1151", true, false},
+            {{1500U, 1U}, "sm_120", true, false},  {{1500U, 1U}, "", true, false},
+            {{1500U, 1U}, "gfx1151", false, true},
+        };
+        for (const auto* tier : {"exact", "fast", "turbo"}) {
+            selection.arguments.back() = tier;
+            const auto cli = parse_cli(tier, "hip");
+            require(cli.weights.qualify == nullptr, "no decode regime at parsing: the SP4 column waits for the load");
+            for (const auto& c : cases) {
+                auto options = cli.weights;
+                const auto entry = mini::mini_decode_lowbit_head(options, c.device, c.extent,
+                    mini::MiniPromptExecution{"gfx1151 test product", c.extent.context, 128U}, c.hip);
+                const bool expected = std::string_view(tier) != "exact" && c.band && c.hip;
+                require(options.qualify_decode_only == expected &&
+                            (options.qualify == &strix::weight::kAttentionHeadSP4TPolicy) == expected &&
+                            (options.qualify == nullptr) == !expected,
+                        "the SP4 attention + head arm loads exactly in the measured decode band");
+                if (std::string_view(tier) != "exact")
+                    require(entry.value == (c.band ? "sp4t-attn" : "0"),
+                            ("the decode regime's cell is the one the band row decides: " + std::string(tier) + " ctx " +
+                             std::to_string(c.extent.context) + " lanes " + std::to_string(c.extent.lanes) + " dev " +
+                             std::string(c.device) + " -> " + entry.value + " |" + entry.ladder).c_str());
+                if (std::string_view(tier) != "exact" && c.device == "gfx1151" && c.extent.lanes == 1U)
+                    require(entry.ladder.find("decode ctx=") != std::string::npos,
+                            "the decode cell prints its ladder route line");
+                strix::profile::Resolution receipt = cli.tier;
+                mini::mini_record_decode_entry(receipt, entry);
+                const auto* recorded = receipt.find(mini::kMiniLowBitHead);
+                require(recorded && recorded->value == entry.value, "the run's receipt states the decode-regime cell");
+            }
+        }
+        // An explicit setting keeps its precedence in every regime.
+        set_env("STRIX_INK_LOWBIT_HEAD", "0");
+        auto off = parse_cli("fast", "hip").weights;
+        (void)mini::mini_decode_lowbit_head(off, "gfx1151", {1500U, 1U},
+                                            mini::MiniPromptExecution{"gfx1151 test product", 1500U, 128U}, true);
+        require(off.qualify == nullptr, "STRIX_INK_LOWBIT_HEAD=0 is the off switch in the band too");
+        set_env("STRIX_INK_LOWBIT_HEAD", nullptr);
+    }
     selection.arguments[3] = "hip";
     selection.arguments.back() = "fast";
     for (const char* backend : {"hip", "cuda"}) {
