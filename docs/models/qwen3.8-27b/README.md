@@ -103,8 +103,10 @@ resolves; `--dump-logits` alone keeps the one-row reference path.
 FAST gate v2 per content class (`tools/strix-gate/gate_v2.py qual`, limits KL <= 0.02, top-1 >= 0.93,
 dNLL <= +0.01, >= 800 rows per class): held-out texts (prose: Perl pod and licence texts; code: the
 Python standard library; structured: ISO code JSON and the freedesktop MIME XML), 4 windows per class at
-2,048 and 8,192 tokens and one text per class cut at 24,576 and 24,064 tokens, 511 scored rows per window,
-reference EXACT `--wide-exact 512` (`--tf-rows`), null arm `STRIX_DENSE_NULL=0:100:1234`.
+2,048 and 8,192 tokens and one text per class cut at 24,576 and 24,064 tokens (32,768 and 32,256 for the 32K band),
+511 scored rows per window, reference EXACT `--wide-exact 512` (`--tf-rows`; at 32K the 64-row EXACT windows, the
+same bits), null arm `STRIX_DENSE_NULL=0:100:1234` (32K: `0:26724:1234` for prose and code; for structured that step
+was absorbed before the scored rows, null == reference, so it ran at `0:100:1234`).
 
 | Band (tokens) | Arm | prose KL / top-1 / dNLL | code KL / top-1 / dNLL | structured KL / top-1 / dNLL | Verdict |
 |---|---|---|---|---|---|
@@ -113,10 +115,12 @@ reference EXACT `--wide-exact 512` (`--tf-rows`), null arm `STRIX_DENSE_NULL=0:1
 | 8,192 | 512-row window | 0.00007 / 0.9961 / +0.0002 | 0.00003 / 0.9976 / -0.0003 | 0.00001 / 1.0000 / +0.00001 | PASS |
 | 8,192 | window + A4W4 48-63 | 0.1792 / 0.8704 / +0.1099 | 0.0649 / 0.9178 / +0.0632 | 0.0097 / 0.9902 / +0.0004 | FAIL |
 | 24,576 (cuts 24,576 + 24,064) | 512-row window | 0.00006 / 0.9951 / -0.0004 | 0.00001 / 1.0000 / -0.0000 | 0.00001 / 1.0000 / -0.0003 | PASS |
+| 32,768 (cuts 32,768 + 32,256) | 512-row window | 0.00006 / 0.9971 / -0.0007 | 0.00004 / 0.9961 / -0.0001 | 0.00001 / 1.0000 / -0.00003 | PASS |
 
-The nominal timing bands are 1..2,048, 2,049..8,192 and 8,193..24,576 tokens. The timed 512-row window
+The nominal timing bands are 1..2,048, 2,049..8,192, 8,193..24,576 and 24,577..32,768 tokens. The timed 512-row window
 wins at every timed point from 64 tokens up: 64, 256, 1,024, 2,048, 2,049, 4,096, 8,192, 8,193 and 24,576 (at 4 and
-16 tokens it ties the EXACT windows, no gain). FAST/TURBO apply it on 64..2,048, 2,049..8,192 and 8,193..24,576 tokens.
+16 tokens it ties the EXACT windows, no gain) and 32,768. FAST/TURBO apply it on 64..2,048, 2,049..8,192, 8,193..24,576
+and 24,577..32,768 tokens.
 Other prompts use the 64-row EXACT windows. See the [timing inventory](../../band-edges.md) for each gate cut.
 
 Timing (one gfx1151 node, the IU4 pack, `--no-mtp --gen 1`, meas_nodes prompt ids, mirrored order,
@@ -127,6 +131,13 @@ EXACT one cold prefill per round, the window warm of `--repeat 2`, kfd evictions
 | 2,048 | 10.24 / 10.30 | 2.98 / 3.00 | 2.81 / 2.80 | 2.82 / 2.81 |
 | 8,192 | 67.57 / 67.63 | 12.91 / 12.94 | 12.09 / 12.11 | 12.11 / 12.10 |
 | 24,576 | 534.39 | 45.45 / 45.42 | not run | 45.32 / 45.76 |
+| 32,768 | 996.5 (four segments) | 62.52 / 62.35 | not run | not run |
+
+After the row-share change (EXACT 64-row windows on the 3-pair attention form, same bits: a whole 32,768-token EXACT
+prefill reproduces the segmented reference bit for bit) the EXACT column reads 8,192: 46.74 s (68.07 s with
+`STRIX_DECODE_ATTN_ROW_SHARE=0`, same binary), 24,576: 197.56 s, 32,768: 299.5-302.4 s (three texts); the window still
+wins x3.7 / x4.6 / x4.8. 65,536 tokens: the window 147.66 s (warm; no EXACT reference, no band, explicit `--wide 512`
+only). Decode (`--no-mtp`, 64 tokens after the prompt): 8,192 13.21 tok/s, 24,576 11.47, 32,768 10.74, 65,536 8.65.
 
 2,048 and 8,192 ran on one node in one turn; 24,576 ran on the other node, the window and default arms in one
 turn and the EXACT run (one cold prefill, 534 s) in its own turn, same binary and ids.

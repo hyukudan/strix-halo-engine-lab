@@ -241,8 +241,9 @@ void scoped_fast_route() {
             if (prompt >= band.min_context && prompt <= band.max_context) return sp::ladder_min_context(band);
         return std::uint64_t{0};
     };
-    require(band_floor(1) == 64 && band_floor(2049) == 2049 && band_floor(8193) == 8193,
-            "the timed floors of the window bands (64, 2,049, 8,193)");
+    require(band_floor(1) == 64 && band_floor(2049) == 2049 && band_floor(8193) == 8193 && band_floor(24577) == 24577,
+            "the timed floors of the window bands (64, 2,049, 8,193, 24,577: timed at 24,576, within the edge tolerance)");
+    require(top == 32768, "the window ledger ends at the 32,768-token gate");
     // One ladder, two spellings: the spec rows are the decode rows under the spec app's window lever.
     require(std::size(hp::kSpecBandRows) == std::size(hp::kBandRows), "one band ladder for both apps");
     for (std::size_t i = 0; i < std::size(hp::kBandRows) && i < std::size(hp::kSpecBandRows); ++i) {

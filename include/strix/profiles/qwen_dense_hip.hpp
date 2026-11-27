@@ -116,12 +116,15 @@ inline constexpr std::string_view kGate24k =
     "gate v2 24,576 tokens: 3 held-out texts (1 prose, 1 code, 1 structured) x cuts 24,576 + 24,064 x 512 rows, EXACT --wide-exact 512 ref, one-ulp null";
 // wide_rows 512 = the 512-row window alone (arm wide): PASS in every class of every band below. The composite
 // (+ a4w4_layers 48-63, arm composite) FAILED at 2,048 (prose KL 0.210, code 0.067, structured 0.071) and at 8,192
-// (prose KL 0.179, code 0.065): no A4W4 row, so its FAST cell stays pending. Above 24,576 tokens (the 32,768 EXACT
-// reference exceeds a night turn) no row: the previous route.
+// (prose KL 0.179, code 0.065): no A4W4 row, so its FAST cell stays pending. Above 32,768 tokens (no EXACT reference
+// there yet) no row: the previous route.
+inline constexpr std::string_view kGate32k =
+    "gate v2 32,768 tokens: 3 held-out texts (1 prose, 1 code, 1 structured) x cuts 32,768 + 32,256 x 512 rows, EXACT 64-row windows ref, one-ulp null";
 inline constexpr Qualified kQualified[] = {
     {"gfx1151", {"wide_rows", "512", 1, 2048, kGate2k}},
     {"gfx1151", {"wide_rows", "512", 2049, 8192, kGate8k}},
     {"gfx1151", {"wide_rows", "512", 8193, 24576, kGate24k}},
+    {"gfx1151", {"wide_rows", "512", 24577, 32768, kGate32k}},
 };
 
 // Timing per band (shared band receipts, LadderRow::band_bound): bound per run to its own reference by the shared
@@ -132,10 +135,15 @@ inline constexpr Qualified kQualified[] = {
 inline constexpr double kWide2k = 10271.0 / 2993.0;    // 512-row window over the 64-row EXACT windows, 2,048 tokens
 inline constexpr double kWide8k = 67597.0 / 12925.0;   // 8,192 tokens
 inline constexpr double kWide24k = 534392.0 / 45431.0;  // 24,576 tokens (EXACT one cold run, its own turn)
+// 32,768 tokens: EXACT-64 with the 3-pair row-share form on the 64-row windows (attn_row_share rows past the table;
+// same bits as before, whole run 996.5 s segmented -> 301.9 s), one cold run per arm, the window warm of --repeat 2.
+inline constexpr double kWide32k = 301852.0 / 62350.0;
 inline constexpr double kNoise = 0.02;
 inline constexpr std::string_view kTime2k = "qwen_night-tim-c1-2k8k 2,048: EXACT-64 10.27 s, wide-512 2.99 s";
 inline constexpr std::string_view kTime8k = "qwen_night-tim-c1-2k8k 8,192: EXACT-64 67.60 s, wide-512 12.93 s";
 inline constexpr std::string_view kTime24k = "qwen_night-tim-c2-24k(-exact) 24,576: EXACT-64 534.39 s, wide-512 45.43 s";
+inline constexpr std::string_view kTime32k =
+    "opt_q27b-c1-32k 32,768: EXACT-64 301.85 s (row-share 64), wide-512 62.35 s; 24,576: EXACT-64 197.56 s, default 42.67 s";
 [[nodiscard]] inline constexpr sp::LadderRow band_row(std::string_view lever, std::string_view value, std::uint64_t lo,
                                                      std::uint64_t hi, double speedup, std::string_view receipt,
                                                      sp::BandEvidence evidence) {
@@ -149,10 +157,11 @@ inline constexpr std::string_view kTime24k = "qwen_night-tim-c2-24k(-exact) 24,5
 // 3,024 ms; 4,096: 25,373 -> 6,290 ms; 8,193: 68,262 (one cold EXACT) -> 13,403 / 13,067 cold, so those edges hold.
 // One band ladder for the window cell, spelled per app by its window lever (decode --wide: wide_rows, spec
 // --prefill-rows: prefill_rows): the same windows of the same shared prefill plan.
-[[nodiscard]] inline constexpr std::array<sp::LadderRow, 3> window_band_rows(std::string_view lever) {
+[[nodiscard]] inline constexpr std::array<sp::LadderRow, 4> window_band_rows(std::string_view lever) {
     return {band_row(lever, "512", 1, 2048, kWide2k, kTime2k, {{64, 256, 1024, 2048}, {2048}, kGate2k, true, true}),
             band_row(lever, "512", 2049, 8192, kWide8k, kTime8k, {{2049, 4096, 8192}, {8192}, kGate8k, false}),
-            band_row(lever, "512", 8193, 24576, kWide24k, kTime24k, {{8193, 24576}, {24064, 24576}, kGate24k, false})};
+            band_row(lever, "512", 8193, 24576, kWide24k, kTime24k, {{8193, 24576}, {24064, 24576}, kGate24k, false}),
+            band_row(lever, "512", 24577, 32768, kWide32k, kTime32k, {{24576, 32768}, {32256, 32768}, kGate32k, false})};
 }
 inline constexpr auto kBandRows = window_band_rows("wide_rows");
 inline constexpr auto kSpecBandRows = window_band_rows("prefill_rows");

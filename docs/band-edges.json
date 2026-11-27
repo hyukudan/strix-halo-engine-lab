@@ -351,6 +351,33 @@
       "noise": 0.02,
       "timed_tokens": [8193, 24576],
       "gated_tokens": [24064, 24576]
+    },
+    {
+      "model": "qwen3.8-27b",
+      "engine": "qwen35-hip-decode",
+      "source": "include/strix/profiles/qwen_dense_hip.hpp",
+      "tier": "fast",
+      "reference_tier": "exact",
+      "phase": "prefill",
+      "device": "gfx1151",
+      "lever": "wide_rows",
+      "value": "512",
+      "implementation": "v1",
+      "execution_key": "bind_band_receipts/LadderArms::over",
+      "execution_scope": "HIP whole-model prefill (one rank or each tensor-parallel rank; decode and spec apps), IU4 g64 pack, one lane, known priced execution; timing with MTP off",
+      "timing_receipt": "opt_q27b-c1-32k 32,768: EXACT-64 301.85 s (row-share 64), wide-512 62.35 s; 24,576: EXACT-64 197.56 s, default 42.67 s",
+      "gate_receipt": "gate v2 32,768 tokens: 3 held-out texts (1 prose, 1 code, 1 structured) x cuts 32,768 + 32,256 x 512 rows, EXACT 64-row windows ref, one-ulp null",
+      "band": [24577, 32768],
+      "lanes": [1, 1],
+      "effective_lower_edge": 24577,
+      "band_bound": true,
+      "lower_edge_unproven": false,
+      "edge_state": "proven",
+      "measured_floor": 32768,
+      "speedup": 4.84125,
+      "noise": 0.02,
+      "timed_tokens": [24576, 32768],
+      "gated_tokens": [32256, 32768]
     }
   ]
 }
