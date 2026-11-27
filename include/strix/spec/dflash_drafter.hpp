@@ -13,7 +13,7 @@
 //   per layer:  h = norm_in(x);  [conv] (h, d) = conv_pre(h);  a = W_o attend(h);  [conv] a = conv_post(a, d);  x += a
 //               h = norm_post(x); [conv] (h, d) = conv_pre(h); m = W_d(silu(W_g h) * W_u h); [conv] m = conv_post(m, d); x += m
 //   y = norm(x); proposal j reads block row j + 1 (the anchor row never proposes).
-//   attend: Qwen3 GQA with per-head Q/K RMSNorm and NeoX RoPE; block row r sees the context keys j with
+//   attend: grouped-query attention with per-head Q/K RMSNorm and NeoX RoPE; block row r sees the context keys j with
 //     P + r - window < j < P (window 0: all) and every block row (non-causal).
 //   conv (DFlash 2, conv_kernel_size > 0): d = kernel_projection(h) as [side][tap][group]; side 0 filters h, side 1
 //     filters the sub-block output: out_r[c] = sum_{t <= r} (base[side][t][c] + d_r[side][t][c / group]) * in_{r-t}[c].

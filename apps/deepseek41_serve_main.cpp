@@ -4088,7 +4088,7 @@ std::uint32_t auto_prefill_rows(const Args& a, BatchForward& fwd, strix::dist::C
             const char* v = std::getenv(k);
             return v ? std::string(v) : std::string();
         });
-        // the tier's whole-prompt band (FAST / TURBO: D1 + R256 up to 32,768 rows) asks for that capacity first
+        // the tier's whole-prompt band (FAST / TURBO: D1 up to 32,768 rows; TURBO R256 up to 8,192) asks for that capacity first
         rows = sc::auto_prefill_rows(a.context, room, strix::deepseek41::pair_defaults::whole_prompt_capacity(
             strix::deepseek41::pair_defaults::whole_prompt_band(strix::deepseek41::pair_defaults::profile_resolution()), a.context));
     }

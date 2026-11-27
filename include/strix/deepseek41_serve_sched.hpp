@@ -178,8 +178,8 @@ template <class Env>
 // own weights, the drafter's peak and the margin; else min(2048, the context) (at least 32 rows, a multiple of 8) when that
 // fits too; else 0: no piece size fits (the serve refuses before READY instead of overcommitting into the margin).
 // whole_rows (pair_defaults::whole_prompt_capacity; 0: none): the tier's whole-prompt band asks the device prefill to
-// HOLD prompts up to that many rows in one piece (the CLI's execution, D1 + R256 at 32,768: 1,981 vs 1,290 tok/s in two
-// exact pieces); it comes first when it is wider than the default pieces and fits under the same rule (wide_pieces).
+// HOLD prompts up to that many rows in one piece (the CLI's execution; receipt measured with D1 + R256 at 32,768: 1,981 vs
+// 1,290 tok/s in two exact pieces; the tier rows now run D1 alone above 8,192); it comes first when it is wider than the default pieces and fits under the same rule (wide_pieces).
 // The capacity it returns is not the default piece size: auto_piece_rows keeps the measured pieces for other requests.
 [[nodiscard]] inline std::uint32_t auto_prefill_rows(std::uint32_t context, const AutoPrefillRoom& r, std::uint32_t whole_rows = 0U) noexcept {
     std::uint64_t room = r.mem_available != 0U ? std::min(r.device_free, r.mem_available) : r.device_free;

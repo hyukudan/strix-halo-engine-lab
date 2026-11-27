@@ -209,8 +209,8 @@ TTFT del servidor en el par, media de ambos órdenes, mismos logits e ids genera
 `--prefill-rows auto` se detiene ahora en piezas de 16384 filas: desde el cono del decodificador diferido, las piezas de
 32768 filas son más lentas en el par (8.01 / 28.30 / 39.94 s frente a 7.94 / 27.44 / 38.98 s con 8,399 / 32,499 / 44,699
 tokens, mismo binario, una carga por brazo; 25.03 frente a 24.44 s con 32,499 en `--profile fast`); un
-`--prefill-rows 32768` explícito sigue funcionando. Con `--profile fast` / `turbo` la banda D1 + R256 (prompts
-enteros de 4,096-32,768 tokens) pide ahora a auto una capacidad de 32,768 filas cuando cabe (9.9 GiB de scratch con
+`--prefill-rows 32768` explícito sigue funcionando. Con `--profile fast` / `turbo` la banda D1 (prompts
+enteros de 4,096-32,768 tokens; TURBO añade R256 hasta 8,192) pide ahora a auto una capacidad de 32,768 filas cuando cabe (9.9 GiB de scratch con
 contexto 36,864 en vez de 5.5): un prompt nuevo dentro de la banda y sin captura de caché corre en una pieza, la ejecución
 de la CLI; el resto de peticiones sigue en piezas de 16384 filas y EXACT no cambia. Los flujos residuales guardan ahora solo las filas de este rank
 (80 KiB menos por fila, 1.25 GiB con piezas de 16384 filas; sin efecto en la velocidad). Mismos logits e ids generados.

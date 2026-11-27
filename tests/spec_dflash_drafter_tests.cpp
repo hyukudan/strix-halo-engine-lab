@@ -293,7 +293,7 @@ int main() {
         check(chi < 70.0 && outside == 0U && accepted > 0 && accepted < draws, "speculative decision with q equals p");
     }
     {  // Device loader's host half: the resident plan built from the drafter directory binds every inventory tensor by
-       // name (the names the plan reads live through make(); a dangling view crashed the first device ticket, df3).
+       // name (the names the plan reads live through make(); a dangling view once crashed the device loader).
         const auto text = tiny_config(true, true);
         const auto c = Config::from_json_text(text);
         const auto dir = write_drafter_dir(c, text, 42U);
