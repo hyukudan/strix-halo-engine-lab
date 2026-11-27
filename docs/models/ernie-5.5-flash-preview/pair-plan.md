@@ -1,7 +1,18 @@
 # ERNIE target-only pair bring-up
 
 `strix-ernie-pair-plan` reads the official checkpoint headers and the shared
-topology declaration. It emits a fixed whole-layer cut for two ranks. Rank 0
+topology declaration. It emits a whole-layer cut for two ranks, chosen by the
+shared layer-chain planner (`pair::chain`, layer-owned state, priced
+layer-owned decode) from ERNIE's per-layer cache bytes; there is no ERNIE cut
+constant. ERNIE has no measured rates yet, so the planner is given unit costs:
+every layer costs one unit, the final norm and head one more on the last rank,
+both ranks read at one declared rate and a hop moves one row per millisecond
+(the plan is a prefill flow shop over 16 windows of the prefill width). The
+inputs are data only, so a rank-scoped checkpoint copy that omits the peer's
+shards chooses the same cut. The rank memory admission then checks that cut.
+With these declarations the planner chooses 22/21. Replace the unit costs with
+measured per-layer costs and link rates when the device fixture provides them.
+Rank 0
 owns the embedding and layers [0,22). Rank 1 owns layers [22,43), the final
 hyper-connection, final norm, MultiMax and the vocabulary projection. Each rank
 keeps its own sequence state. The seam transfers four contiguous FP32 residual
@@ -16,6 +27,14 @@ range and device-copy callbacks to the shared prefill pipe and relays the
 selected ID from rank 1 through the same link. Fake devices exercise this
 path with two prefill windows, check all four streams and verify peer rejection
 on a different asset digest. Native forward callbacks remain to be implemented.
+
+The pair hello uses protocol word `0x324E5245` ("ERN2", the FourCC style of
+the other engines' pair hellos; version 1 was the plain integer 1, so a peer
+built before this change is refused at the hello). The hello also carries the
+SHA-256 of the running executable and the device architecture, so two
+different executables or architectures are refused before any activation
+moves. The host path reports the architecture "cpu"; a native rank
+executable sets the GPU architecture name in `FirstTokenSpec::gpu_arch`.
 
 ## Local admission for one sequence
 

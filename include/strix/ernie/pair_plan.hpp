@@ -3,6 +3,7 @@
 #include "strix/device/topology.hpp"
 #include "strix/dist/transport.hpp"
 #include "strix/ernie/inventory.hpp"
+#include "strix/pair/chain.hpp"
 #include "strix/pair/first_token.hpp"
 #include "strix/pair/rank_memory.hpp"
 
@@ -11,7 +12,6 @@
 
 namespace strix::ernie {
 
-inline constexpr std::uint32_t kPairCut = (kLayerCount + 1U) / 2U;
 inline constexpr std::size_t kPairRowBytes =
     model::narrow<std::size_t>(data::extras::hc_mult * data::dims::hidden) * sizeof(float);
 inline constexpr std::size_t kPairLogitsBytes =
@@ -26,6 +26,9 @@ struct PairLayer {
     std::uint32_t history_rows{}, compressed_rows{}, compression_ratio{};
     std::uint64_t kv_bytes{}, carry_bytes{};
 };
+
+// Per-layer cache state at a context length (the byte declaration the shared planner and the memory admission read).
+[[nodiscard]] PairLayer describe_pair_layer(std::uint32_t layer, std::uint32_t context);
 
 struct PairTensor {
     std::string name;
@@ -69,7 +72,24 @@ struct PairPlan {
     }
 };
 
-// A fixed whole-layer cut for first-token bring-up. This does not price the
+// The whole-layer cut comes from the shared layer-chain planner (pair::chain, layer-owned state, priced layer-owned
+// decode) fed with ERNIE's per-layer state bytes. ERNIE declares no measured rates yet: layers cost the same, both
+// ranks read at one declared rate, the link moves one activation row per ms. The rank memory admission
+// (pair::RankMemory) then checks the chosen cut. The inputs are data only (no checkpoint bytes), so a rank-scoped
+// copy that omits the peer's shards chooses the same cut.
+struct PairChainInput {
+    std::vector<pair::chain::Device> devices;
+    std::vector<pair::chain::Link> links;
+    pair::chain::ModelShape shape;
+    pair::chain::Request request;
+};
+[[nodiscard]] PairChainInput pair_chain_input(const PairLimits& limits);
+[[nodiscard]] std::uint32_t pair_cut(const PairLimits& limits);
+
+// Rank that owns a tensor under `cut` (first layer of rank 1); nullopt: drafter tensors, placed after the target.
+[[nodiscard]] std::optional<std::uint32_t> pair_owner(std::string_view name, std::uint32_t cut);
+
+// A whole-layer cut for first-token bring-up. This does not price the
 // transport or qualify the native numerics. Rebuild with observed usable bytes
 // and measured scratch before native allocation.
 // With local_rank, the checkpoint copy may omit shards: every absent target
@@ -79,7 +99,6 @@ struct PairPlan {
                                       const PairLimits& limits, std::string transport,
                                       std::optional<std::uint32_t> local_rank = std::nullopt);
 // Rank owning a target tensor in the fixed cut; empty for drafter tensors.
-[[nodiscard]] std::optional<std::uint32_t> pair_owner(std::string_view name);
 
 using PairWeightWrite = std::function<void(std::uint64_t resident_offset, std::span<const std::byte>)>;
 

@@ -204,6 +204,22 @@ int main() try {
     check(a.memory.weight_payload == 46U && b.memory.weight_payload == 44U &&
           a.memory.weight_resident == 23U * 256U && b.memory.weight_resident == 22U * 256U &&
           plan.draft_bytes == 2U, "resident offsets and draft exclusion");
+    // The plan's cut is the shared layer-chain planner's choice for ERNIE's per-layer state, with the priced
+    // layer-owned decode, and the rank memory admission accepts that cut.
+    const auto input = pair_chain_input(limits);
+    check(input.request.price_layer_owned_decode && input.request.layer_owned_state &&
+          input.shape.state_fixed_bytes.size() == kLayerCount, "chain input declares layer-owned priced decode");
+    for (std::uint32_t layer = 0; layer < kLayerCount; ++layer) {
+        const auto state = describe_pair_layer(layer, limits.context);
+        check(input.shape.state_fixed_bytes[layer] == static_cast<double>(state.kv_bytes + state.carry_bytes),
+              "chain layer state differs from the plan's layer state");
+    }
+    const auto chosen = strix::pair::chain::choose(input.devices, input.links, input.shape, input.request).best;
+    const auto cut = pair_cut(limits);
+    check(chosen.valid && chosen.cuts.size() == 3U && chosen.cuts[1] == cut && chosen.decoder == 1U &&
+          chosen.decode_ms_per_token > 0.0, "pair_cut is the chain planner's cut");
+    check(a.placement.cuts == chosen.cuts && b.placement.cuts == chosen.cuts &&
+          a.memory.admitted() && b.memory.admitted(), "plan places and admits the chain's cut");
     offsets(a);
     offsets(b);
     first_token(plan, false);
@@ -222,13 +238,13 @@ int main() try {
     auto overflow = limits;
     overflow.alignment = std::uint64_t{1} << 63U;
     rejects([&] { (void)make_pair_plan(inventory, topology, overflow, "usb4auto"); }, "memory wraparound accepted");
-    check(pair_owner("model.layers.21.x") == 0U && pair_owner("model.layers.22.x") == 1U &&
-          pair_owner("model.embed_tokens.weight") == 0U && pair_owner("model.norm.weight") == 1U &&
-          !pair_owner("model.mtp.0.x"), "fixed-cut tensor ownership");
+    check(pair_owner("model.layers.21.x", cut) == 0U && pair_owner("model.layers.22.x", cut) == 1U &&
+          pair_owner("model.embed_tokens.weight", cut) == 0U && pair_owner("model.norm.weight", cut) == 1U &&
+          !pair_owner("model.mtp.0.x", cut), "tensor ownership follows the planner's cut");
 
     // Range admission: the rank-0 copy omits the shard holding only rank-1 and drafter tensors.
     auto rank0 = inventory;
-    for (unsigned i = kPairCut; i < kLayerCount; ++i) {
+    for (unsigned i = cut; i < kLayerCount; ++i) {
         auto name = target_layer_prefix(i) + "self_attn.test";
         rank0.tensors.erase(name);
         rank0.missing_known.push_back(std::move(name));

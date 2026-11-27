@@ -3,6 +3,7 @@
 // and prompt, the shared prefill pipe, and the first greedy decode relay. The model supplies the geometry and its
 // device hooks; a fresh device session is required after any failure (the link is aborted).
 #include "strix/dist/transport.hpp"
+#include "strix/pair/executable_identity.hpp"
 #include "strix/pair/handshake.hpp"
 #include "strix/pair/layer_pipeline.hpp"
 #include "strix/weight/levers.hpp"
@@ -19,6 +20,8 @@ namespace strix::pair::layers {
 struct FirstTokenSpec {
     std::uint32_t protocol{}, cut{}, layers{}, context{}, prefill_rows{}, vocab{};
     std::size_t row_bytes{};
+    // Device architecture the hello binds with the executable digest ("cpu" for the host path); required.
+    std::string_view gpu_arch{};
     // Names of the contract slots reported on a hello mismatch (see first_token_contract).
     static constexpr std::array<std::string_view, 7> kFields{
         "layer cut", "layer count", "activation row bytes", "context", "prefill width",
@@ -53,6 +56,8 @@ struct FirstTokenOps {
         PairHello hello;
         hello.protocol = spec.protocol;
         hello.rank = rank;
+        hello.executable_sha256 = executable_identity().bytes;
+        set_gpu_arch(hello, spec.gpu_arch);
         hello.model_sha256 = digest.bytes;
         hello.context = spec.context;
         hello.max_rows = spec.prefill_rows;

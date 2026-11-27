@@ -1673,7 +1673,7 @@ add_library(strix_ernie_engine STATIC
     src/ernie/attention.cpp src/ernie/calibration.cpp src/ernie/checkpoint.cpp src/ernie/engine.cpp
     src/ernie/forward.cpp src/ernie/pair_plan.cpp)
 target_include_directories(strix_ernie_engine PRIVATE src)
-target_link_libraries(strix_ernie_engine PUBLIC strix_ernie_inventory PRIVATE strix_hc Threads::Threads)
+target_link_libraries(strix_ernie_engine PUBLIC strix_ernie_inventory strix_core PRIVATE strix_hc Threads::Threads)
 strix_target_warnings(strix_ernie_engine)
 if(MSVC)
     target_compile_options(strix_ernie_engine PRIVATE /fp:strict)
