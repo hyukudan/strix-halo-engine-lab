@@ -117,6 +117,7 @@ inline constexpr bool norm_topk_prob = true;
 inline constexpr std::int64_t num_experts_per_tok = 10;
 inline constexpr double routed_scaling_factor = 0x1.8p+1 /* 3 */;
 inline constexpr bool routed_scaling_factor_learnable = true;
+inline constexpr double router_renorm_floor = 0x1.79ca10c924223p-67 /* 1e-20 */;
 inline constexpr std::string_view scoring_func = "sigmoid";
 inline constexpr std::int64_t topk_group = 1;
 inline constexpr std::string_view topk_method = "noaux_tc";

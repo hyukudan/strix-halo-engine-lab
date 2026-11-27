@@ -88,6 +88,7 @@ topk_group = 1
 scoring_func = "sigmoid"
 topk_method = "noaux_tc"
 norm_topk_prob = true
+router_renorm_floor = 1e-20
 routed_scaling_factor = 3.0
 routed_scaling_factor_learnable = true
 hidden_act = "situ"
