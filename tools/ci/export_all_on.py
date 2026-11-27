@@ -25,6 +25,12 @@ GATES = {"pass", "pending", "fail", "none"}
 PHASES = {"any", "prefill", "decode"}
 
 
+def valid_token_range(tokens) -> bool:
+    return (isinstance(tokens, list) and len(tokens) == 2
+            and all(type(value) is int and 0 <= value <= (1 << 63) - 1 for value in tokens)
+            and tokens[0] <= tokens[1])
+
+
 def build() -> str:
     rows = json.loads(CATALOGUE.read_text(encoding="utf-8"))
     out, seen, keys = [], set(), set()
@@ -55,9 +61,11 @@ def build() -> str:
                 kind, _, body = atom.partition(":")
                 if kind not in ("env", "arg", "model") or not body or (kind == "model" and "=" not in body[1:]):
                     raise SystemExit(f"{name}: precondition {atom!r} is not env:NAME[=VALUE], arg:FLAG or model:KEY=VALUE")
+        if "tokens" in item and not valid_token_range(item["tokens"]):
+            raise SystemExit(f"{name}: tokens needs nonnegative ordered integer bounds")
         for slow in item.get("slower", []):
             if slow.get("phase") not in PHASES or not slow.get("receipt") or (
-                    "tokens" in slow and (len(slow["tokens"]) != 2 or slow["tokens"][0] > slow["tokens"][1])):
+                    "tokens" in slow and not valid_token_range(slow["tokens"])):
                 raise SystemExit(f"{name}: slower needs phase, receipt and an optional [min, max] tokens band")
         off = item.get("off", ["0"])
         if not isinstance(off, list) or not all(isinstance(v, str) and v for v in off) or item.get("value") in off:
