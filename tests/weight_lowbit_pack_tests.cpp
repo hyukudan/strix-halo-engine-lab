@@ -2,6 +2,7 @@
 // and ResidentSlicePlan consuming a prepacked slice instead of converting BF16.
 #include "strix/weight/host_lowbit.hpp"
 #include "strix/weight/lowbit_pack.hpp"
+#include "strix/weight/pack_plan.hpp"
 #include "strix/weight/resident_slices.hpp"
 
 #include <algorithm>
@@ -11,6 +12,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
+#include <stdexcept>
 #include <random>
 #include <span>
 #include <string>
@@ -261,6 +264,21 @@ void run(const std::string& dir) {
     check(!wei::LowbitPack::open(write_file("empty.bin", {}), checkpoint, scratch), "empty file fails");
 }
 
+void slice_plan_test(const std::string& dir) {
+    const auto path = std::filesystem::path(dir) / "slice.tsv";
+    const std::vector<wei::PackSliceMatrix> matrices{{"a.w1", 4, 256}, {"a.w2", 8, 128}};
+    wei::write_pack_slice_plan(path, "sp2", matrices);
+    std::ifstream in(path, std::ios::binary);
+    const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    const auto fmt = wei::strixpack_format("sp2");
+    const auto expected = "tensor\tformat\tbytes\na.w1\tsp2\t" + std::to_string(wei::strixpack_matrix_bytes(fmt, 4, 256)) +
+                          "\na.w2\tsp2\t" + std::to_string(wei::strixpack_matrix_bytes(fmt, 8, 128)) + "\n";
+    check(text == expected, "slice plan rows");
+    bool refused = false;
+    try { wei::write_pack_slice_plan(path, "sp2", matrices); } catch (const std::runtime_error&) { refused = true; }
+    check(refused, "slice plan never overwrites");
+}
+
 }  // namespace
 
 int main() {
@@ -268,6 +286,7 @@ int main() {
     std::filesystem::create_directories(dir);
     try {
         run(dir.string());
+        slice_plan_test(dir.string());
     } catch (const std::exception& e) {
         ++failures;
         std::cerr << "exception: " << e.what() << '\n';
