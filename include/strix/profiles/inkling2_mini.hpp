@@ -55,8 +55,15 @@ inline constexpr std::string_view kMiniLowBitTurbo = "inkling2-mini-lowbit-turbo
 inline constexpr std::string_view kMiniLowBitPackFile = "inkling2-mini-q4.lowbit-pack";
 // Head in Strix pack SP4 (fixed table) from an explicit calibrated pack (STRIX_LOWBIT_PACK, strix-lowbit-calib-pack
 // --storage unembed.weight=sp4 --table fixed): the decode-only head arm (BF16 image kept for prefill, verify and the
-// widths outside the band). Pending in FAST and TURBO: no decision row until its device gate v2 receipt.
+// widths outside the band). The FAST column (TURBO inherits it) targets the attention projections + head arm ("sp4t-attn")
+// with the governed pack below in the decode regimes of its kMiniLadder rows (mini_decode_lowbit_head: the command line
+// and the server resolve it with their instance's decode regime); the head-alone arm ("sp4t") stays explicit.
 inline constexpr std::string_view kMiniLowBitHead = "inkling2-mini-lowbit-head@1";
+// The SP4 attention + head pack the FAST column was gated and timed with (strix-lowbit-calib-pack, technique both,
+// damp 0.1, 97 matrices: q/k/v/o x 24 + head), read beside the model unless STRIX_LOWBIT_PACK names another one.
+inline constexpr std::string_view kMiniSp4AttnPackFile = "inkling2-mini-sp4t-attn.lowbit-pack";
+inline constexpr weight::Digest256 kMiniSp4AttnPackIdentity =
+    weight::digest_from_hex("ede1ecc1ceb47a15013bb3b2364060a38311766a32c7a89f1f2b920ee44be5ef");
 inline constexpr weight::WeightLoadPolicy kMiniSp4HeadPolicy = weight::kHeadSP4TPolicy;
 inline constexpr weight::WeightLoadPolicy kMiniTurboWeightPolicy = weight::kAttentionHeadQ4Policy;
 // The row covers decode steps only. The low-bit copies are resident beside the BF16 image used for
@@ -294,12 +301,15 @@ inline constexpr std::array<profile::Lever, 19> kMiniLevers{{
     weight::kLowBitFoldedScaleLever,
     weight::kLowBitRowsSelectLever,
     {.name = kMiniLowBitHead, .env = "STRIX_INK_LOWBIT_HEAD", .option = "",
-     .value = {"", "", "", ""}, .builtin = "0", .kind = profile::Kind::bit_changing,
-     .ready = {}, .runnable = {false, true, false, true}, .target = "sp4t", .off = "0",
-     .source = "explicit option: SP4 fixed-table head, device gate v2 decode 2026-11-26 FAST fails 1/39 windows "
-               "(+1 unresolved), TURBO limits 39/39 pass, CLI B=1 -3.1 % per step vs the BF16 head "
-               "(docs/engine/lowbit-calibration.md); a TURBO row awaits the served arm and a combined receipt; HIP "
-               "command line only",
+     .value = {"", "sp4t-attn", "", ""}, .builtin = "0", .kind = profile::Kind::bit_changing,
+     .ready = {false, true, false, true}, .runnable = {false, true, false, true}, .target = "sp4t-attn", .off = "0",
+     .source = "FAST (TURBO inherits) in the decode regimes of its kMiniLadder rows (one lane, 916..2141 resident positions; elsewhere the tier below), HIP gfx1151 only: SP4 fixed-table attention projections + head, decode-only "
+               "(BF16 image prefills), governed pack beside the model (kMiniSp4AttnPackFile, pinned identity). Device "
+               "gate v2 decode 2026-11-26, 39 held-out windows / 2457 rows, 8K / 32K / 64K: FAST PASS (KL 0.00207, "
+               "top-1 0.981, dNLL -0.00014; 0 windows FAIL). CLI B=1 FAST with speculation, same binary, 6 prompts "
+               "2026-11-27: 1.19x tok/s geometric mean (0.95x .. 1.37x; one code prompt slower: its SP4 text takes 2.71 "
+               "tokens per pass against 4.40), plain decode 1.18x (code and prose); served 8 / 16 slots 1.05x / 1.04x "
+               "(one sample). \"sp4t\" (head alone) stays explicit: its gate fails 1/39 FAST windows",
      .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"sp4t", "sp4t-head-v1"}, {"sp4t-attn", "sp4t-attention-head-v1"}}}},
 }};
 
@@ -330,7 +340,26 @@ inline constexpr std::string_view kMiniIu4GateLow =
     "Gate re-score pending: the dumps of these 16 windows were not kept, so the current gate cannot re-run this "
     "receipt; the iu4 prefill windows must be dumped again, including prompts of 1,143..4,306 tokens. The "
     "1,143..4,306-token band reuses this gate: no window of that length is known to be in it.";
-inline constexpr std::array<profile::LadderRow, 3> kMiniLadder{{
+// FAST decode timing of the SP4 attention + head arm (sp4t-attn) on gfx1151: serial CLI, one lane, 256 generated tokens,
+// FAST with speculation, same binary, ABBA, the arm against the FAST builtin (BF16 attention + head). Regime context = the
+// instance's resident positions (WeightLoadExtent: prompt + generated), the value the command line and the server resolve
+// with (mini_decode_lowbit_head). Measured ends: 916 / 922 positions (prompts of 660 / 666 tokens: code 0.95x, two prose
+// 1.20x / 1.13x, geometric mean 1.088x) and 2,135 / 2,141 (prompts of 1,879 / 1,885: 1.37x / 1.28x / 1.27x, 1.306x);
+// plain decode (no speculation) 1.18x at both ends. The band takes the lower end, rounded down, with a 3 % noise margin
+// (largest arm spread). Contexts outside 916..2141 positions and more than one lane (served 8 / 16 slots: one sample,
+// 1.05x / 1.04x) are unmeasured and keep the tier below.
+inline constexpr std::string_view kMiniSp4AttnDecodeReceipt =
+    "sp4t-attention-head-v1 decode timing, gfx1151, CLI one lane, FAST + speculation ABBA vs FAST builtin, 256 tokens, "
+    "prompts of 660 / 666 / 1,879 / 1,885 tokens (resident positions 916..2,141)";
+inline constexpr std::string_view kMiniSp4AttnGate =
+    "Gate v2 decode 2026-11-26, 39 held-out windows / 2,457 rows at 8K / 32K / 64K contexts: FAST PASS (KL 0.00207, "
+    "top-1 0.981, dNLL -0.00014, 0 windows FAIL). The 916..2,141-position band reuses this gate: the arm's per-row "
+    "weight error does not depend on the context; no window of that length was scored.";
+inline constexpr std::array<profile::LadderRow, 4> kMiniLadder{{
+    {.lever = kMiniLowBitHead, .value = "sp4t-attn", .tier = profile::Name::fast, .phase = profile::Phase::decode,
+     .device = "gfx1151", .min_context = 916, .max_context = 2141, .min_lanes = 1, .max_lanes = 1,
+     .speedup = 1.08, .noise = 0.03, .receipt = kMiniSp4AttnDecodeReceipt, .identity = "sp4t-attention-head-v1",
+     .band_bound = true, .band_evidence = {{916, 922, 2135, 2141}, {}, kMiniSp4AttnGate}},
     {.lever = kMiniMoeW4a4, .value = "iu4", .tier = profile::Name::turbo, .phase = profile::Phase::prefill,
      .device = "gfx1151", .min_context = 1143, .max_context = 4306, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1.117, .noise = 0.01, .receipt = kMiniIu4PrefillLowReceipt, .identity = "v1", .band_bound = true,

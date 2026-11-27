@@ -189,9 +189,19 @@ auto load_mini_weights(const std::string& model, weight::WeightLoadPlan& plan, p
     };
     bind_mini_lowbit_device(plan);
     const bool measured = !options.qualify && !options.qualify_q8;
+    // The SP4 attention + head arm without STRIX_LOWBIT_PACK reads the governed pack beside the model, pinned to the
+    // identity its gate v2 and timing receipts were taken with (a missing or different pack declines to the incumbent
+    // weights with its receipt line).
+    const bool governed_sp4 = options.qualify_decode_only && options.qualify != nullptr &&
+                              options.qualify->id.name == weight::kAttentionHeadSP4TPolicy.id.name;
+    const weight::Digest256* pinned = measured ? &kMiniLowBitPackIdentity : nullptr;
     std::string path;
     if (const char* supplied = envcfg::text("STRIX_LOWBIT_PACK"); supplied && *supplied) path = supplied;
     else if (measured) path = (std::filesystem::path(model).parent_path() / kMiniLowBitPackFile).string();
+    else if (governed_sp4) {
+        path = (std::filesystem::path(model).parent_path() / kMiniSp4AttnPackFile).string();
+        pinned = &kMiniSp4AttnPackIdentity;
+    }
     auto incumbent_scope = scope;
     incumbent_scope.regime = {};
 #if defined(__HIPCC__)
@@ -201,7 +211,7 @@ auto load_mini_weights(const std::string& model, weight::WeightLoadPlan& plan, p
     incumbent_scope.build = weight::implementation_identity(core::kResidentQ8ArithmeticHip);
 #endif
     return load_mini_weight_pack(plan, tier, options, incumbent_scope, extent, path,
-                                  measured ? &kMiniLowBitPackIdentity : nullptr, std::cerr, load_with_arithmetic);
+                                  pinned, std::cerr, load_with_arithmetic);
 }
 
 } // namespace strix::inkling2
