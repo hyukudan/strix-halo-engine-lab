@@ -6,6 +6,10 @@
 //   q4_g64 / q6_g64  128-element superblocks (strix/weight/host_lowbit.hpp): weight = d * float(q), d the FP16 scale of
 //         the element's 64-group; a 16-weight chunk never crosses a group, its code words load 8 + 4 bytes aligned.
 //         This is the FP32 sweep decoder. The opt-in FP16 tile decodes integer operands via lowbit_f16_staging.hpp.
+//   e4m3_b128  row-local 132-byte blocks {f32 s, e4m3 q[128]} (strix/weight/formats/fp8_block.hpp pack_row_blocks: a
+//         128 x 128 block-scaled FP8 checkpoint matrix with its tile scale copied into each row); weight =
+//         e4m3(q) * s, the one FP32 product of the host decode (BlockScaledE4M3::decode_row), so the same weight bits.
+#include "strix/weight/formats/scalar_float.hpp"
 #include "strix/weight/host_lowbit.hpp"
 
 #include <cstddef>
@@ -23,7 +27,7 @@
 
 namespace strix::core::weight_decode {
 
-enum class Format : std::uint8_t { bf16, q8_0, q4_g64, q6_g64 };
+enum class Format : std::uint8_t { bf16, q8_0, q4_g64, q6_g64, e4m3_b128 };
 enum class HalfScale : std::uint8_t { hardware, software };
 
 #if !defined(__HIPCC__) && !defined(__HIP__)
@@ -116,6 +120,25 @@ template <bool Streaming, HalfScale Scale> struct Chunk<Format::q8_0, Streaming,
         return d * float(q < 128U ? int(q) : int(q) - 256);
     }
 };
+template <bool Streaming, HalfScale Scale> struct Chunk<Format::e4m3_b128, Streaming, Scale> {
+    uint4 codes;
+    float s;
+    STRIX_WEIGHT_CHUNK_DEVICE Chunk() = default;
+    // A 16-chunk never crosses a 128-block; the 132-byte block stride keeps the payload 4-byte aligned only.
+    STRIX_WEIGHT_CHUNK_DEVICE Chunk(const std::uint8_t* row, unsigned i) {
+        const std::uint8_t* p = row + std::size_t(i / 128U) * 132U;
+#if defined(__HIPCC__) || defined(__HIP__)
+        __builtin_memcpy(&s, p, sizeof(s));
+#else
+        std::memcpy(&s, p, sizeof(s));
+#endif
+        codes = load_chunk<Streaming>(p + 4 + i % 128U);
+    }
+    STRIX_WEIGHT_CHUNK_DEVICE float at(unsigned e) const {
+        const auto q = static_cast<std::uint8_t>(word_of(codes, e / 4U) >> ((e % 4U) * 8U));
+        return weight::scalar_float::e4m3(q) * s;
+    }
+};
 STRIX_WEIGHT_CHUNK_INLINE float half_scale(std::uint16_t h, HalfScale scale) {
 #if defined(__HIPCC__) || defined(__HIP__)
     if (scale == HalfScale::hardware) return float(__builtin_bit_cast(_Float16, h));
@@ -168,10 +191,11 @@ struct Chunk<Format::q6_g64, Streaming, Scale> : LowBitChunk<weight::Q6G64Storag
     using LowBitChunk<weight::Q6G64Storage, Scale>::LowBitChunk;
 };
 inline constexpr std::size_t row_bytes(Format f, std::size_t inputs) {
-    return f == Format::bf16     ? inputs * 2U
-           : f == Format::q8_0   ? (inputs / 32U) * 34U
-           : f == Format::q4_g64 ? std::size_t(weight::Q4G64Storage::row_bytes(inputs))
-                                 : std::size_t(weight::Q6G64Storage::row_bytes(inputs));
+    return f == Format::bf16        ? inputs * 2U
+           : f == Format::q8_0      ? (inputs / 32U) * 34U
+           : f == Format::e4m3_b128 ? (inputs / 128U) * 132U
+           : f == Format::q4_g64    ? std::size_t(weight::Q4G64Storage::row_bytes(inputs))
+                                    : std::size_t(weight::Q6G64Storage::row_bytes(inputs));
 }
 // Elements per storage block: the K granularity a matrix of this format needs.
 inline constexpr unsigned block_elements(Format f) { return f == Format::bf16 ? 16U : f == Format::q8_0 ? 32U : 128U; }

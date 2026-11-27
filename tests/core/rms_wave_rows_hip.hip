@@ -3,6 +3,9 @@
 // rows. Cases: widths 1 .. 256 around each register count (J = 1, 2, 4, 8), row counts around the 8-row block, with and
 // without the BF16 scale, in place and at a row stride, rows holding +0 / -0 / subnormal / overflowing values.
 // Width 257 keeps the block form (checked equal too). --bench: ms of both forms on 65,888 rows of 128 values in place.
+// Rounded numerator (enqueue_rms_bf16_rows_rounded_numerator): the serial form equals the host B((B(x) * r) * w) with r
+// from the FP32 row bit for bit, the parallel form is within 1 BF16 ulp, and on BF16-valued rows both forms equal the
+// plain entry's bits.
 // Exit 1 on a failed check.
 #include <hip/hip_runtime.h>
 #include "strix/hip/legacy_intrinsics.hpp"
@@ -11,6 +14,7 @@
 #include "ops/norm/rms_bf16_rows.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -48,6 +52,79 @@ std::uint16_t bf16(float x) {
 void block_form(const norm::Bf16RmsRows& a, hipStream_t stream) {
     norm::rmsnorm_strided_kernel<norm::Bf16ScaleSqrtDivTraits, 256><<<dim3(a.rows), 256, 0, stream>>>(
         a.input, a.input_row, a.scale, 0, a.width, kEpsilon, a.output, a.output_row);
+}
+
+float bf16_value(float x) {
+    const std::uint32_t u = std::uint32_t{bf16(x)} << 16U;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+std::vector<float> run_rows(const std::vector<float>& x, const std::vector<std::uint16_t>& w, unsigned rows,
+                            unsigned width, bool rounded, norm::RmsRowsReduction reduction) {
+    float* in = device<float>(x.size());
+    float* out = device<float>(x.size());
+    std::uint16_t* scale = device<std::uint16_t>(w.size());
+    require(hipMemcpy(in, x.data(), x.size() * 4U, hipMemcpyHostToDevice), "x");
+    require(hipMemcpy(scale, w.data(), w.size() * 2U, hipMemcpyHostToDevice), "w");
+    const norm::Bf16RmsRows a{in, scale, out, rows, width, width, width};
+    require(rounded ? norm::enqueue_rms_bf16_rows_rounded_numerator(a, kEpsilon, reduction, nullptr)
+                    : norm::enqueue_rms_bf16_rows(a, kEpsilon, reduction, nullptr), "rounded rms");
+    std::vector<float> y(x.size());
+    require(hipMemcpy(y.data(), out, y.size() * 4U, hipMemcpyDeviceToHost), "y");
+    require(hipFree(in), "free");
+    require(hipFree(out), "free");
+    require(hipFree(scale), "free");
+    return y;
+}
+
+bool rounded_numerator_case() {
+    std::mt19937 random(1127U);
+    std::uniform_real_distribution<float> value(-3.0F, 3.0F);
+    bool ok = true;
+    for (const unsigned width : {64U, 200U, 4096U}) {
+        constexpr unsigned rows = 3;
+        std::vector<float> x(std::size_t{rows} * width), xb(x.size());
+        std::vector<std::uint16_t> w(width);
+        for (auto& v : x) v = value(random);  // mantissas below BF16: the numerator rounding matters
+        for (std::size_t i = 0; i < x.size(); ++i) xb[i] = bf16_value(x[i]);
+        for (auto& v : w) v = bf16(value(random));
+        std::vector<float> host(x.size());
+        for (unsigned r = 0; r < rows; ++r) {
+            float ss = 0.0F;
+            for (unsigned i = 0; i < width; ++i) ss = std::fma(x[r * width + i], x[r * width + i], ss);
+            const float inv = 1.0F / std::sqrt(ss / float(width) + kEpsilon);
+            for (unsigned i = 0; i < width; ++i) {
+                const std::uint32_t wb = std::uint32_t{w[i]} << 16U;
+                float wf;
+                std::memcpy(&wf, &wb, 4);
+                host[r * width + i] = bf16_value((bf16_value(x[r * width + i]) * inv) * wf);
+            }
+        }
+        const auto serial = run_rows(x, w, rows, width, true, norm::RmsRowsReduction::serial_reference);
+        const auto parallel = run_rows(x, w, rows, width, true, norm::RmsRowsReduction::parallel);
+        unsigned max_ulp = 0;
+        for (std::size_t i = 0; i < host.size(); ++i) {
+            std::uint32_t a, b;
+            std::memcpy(&a, &parallel[i], 4);
+            std::memcpy(&b, &host[i], 4);
+            a >>= 16U;
+            b >>= 16U;
+            max_ulp = std::max(max_ulp, a > b ? a - b : b - a);
+        }
+        const bool serial_ok = std::memcmp(serial.data(), host.data(), host.size() * 4U) == 0;
+        bool plain_ok = true;
+        for (const auto reduction : {norm::RmsRowsReduction::serial_reference, norm::RmsRowsReduction::parallel}) {
+            const auto a = run_rows(xb, w, rows, width, true, reduction), b = run_rows(xb, w, rows, width, false, reduction);
+            plain_ok = plain_ok && std::memcmp(a.data(), b.data(), a.size() * 4U) == 0;
+        }
+        std::cout << "rounded numerator width " << width << ": serial " << (serial_ok ? "bitwise" : "DIFFERS")
+                  << ", parallel max BF16 ulp " << max_ulp << ", BF16 rows equal the plain entry "
+                  << (plain_ok ? "yes" : "NO") << std::endl;
+        ok = ok && serial_ok && max_ulp <= 1U && plain_ok;
+    }
+    return ok;
 }
 
 }  // namespace
@@ -137,5 +214,6 @@ int main(int argc, char** argv) {
                   << " ratio " << t[1] / t[0] << " wave_GBps " << double(rows) * width * 8.0 / (t[1] * 1.0e6) << '\n';
         require(hipFree(v), "free");
     }
+    ok = rounded_numerator_case() && ok;
     return ok ? 0 : 1;
 }
