@@ -605,7 +605,7 @@ void profile_parity() {
         struct DecodeCase {
             strix::weight::WeightLoadExtent extent;
             std::string_view device;
-            bool hip, inside;
+            bool hip, band;  // band: the regime is inside the decode row (the arm loads on HIP only)
         };
         const DecodeCase cases[] = {
             {{916U, 1U}, "gfx1151", true, true},   {{2141U, 1U}, "gfx1151", true, true},
@@ -613,7 +613,7 @@ void profile_parity() {
             {{2142U, 1U}, "gfx1151", true, false}, {{16384U, 16U}, "gfx1151", true, false},
             {{1500U, 8U}, "gfx1151", true, false}, {{1500U, 0U}, "gfx1151", true, false},
             {{1500U, 1U}, "sm_120", true, false},  {{1500U, 1U}, "", true, false},
-            {{1500U, 1U}, "gfx1151", false, false},
+            {{1500U, 1U}, "gfx1151", false, true},
         };
         for (const auto* tier : {"exact", "fast", "turbo"}) {
             selection.arguments.back() = tier;
@@ -623,15 +623,16 @@ void profile_parity() {
                 auto options = cli.weights;
                 const auto entry = mini::mini_decode_lowbit_head(options, c.device, c.extent,
                     mini::MiniPromptExecution{"gfx1151 test product", c.extent.context, 128U}, c.hip);
-                const bool expected = std::string_view(tier) != "exact" && c.inside;
+                const bool expected = std::string_view(tier) != "exact" && c.band && c.hip;
                 require(options.qualify_decode_only == expected &&
                             (options.qualify == &strix::weight::kAttentionHeadSP4TPolicy) == expected &&
                             (options.qualify == nullptr) == !expected,
                         "the SP4 attention + head arm loads exactly in the measured decode band");
                 if (std::string_view(tier) != "exact")
-                    require(entry.value == (c.hip && c.inside ? "sp4t-attn" : "0") ||
-                                (!c.hip && entry.value == "sp4t-attn" && c.inside),
-                            "the decode regime's cell is the one the band row decides");
+                    require(entry.value == (c.band ? "sp4t-attn" : "0"),
+                            ("the decode regime's cell is the one the band row decides: " + std::string(tier) + " ctx " +
+                             std::to_string(c.extent.context) + " lanes " + std::to_string(c.extent.lanes) + " dev " +
+                             std::string(c.device) + " -> " + entry.value + " |" + entry.ladder).c_str());
                 if (std::string_view(tier) != "exact" && c.device == "gfx1151" && c.extent.lanes == 1U)
                     require(entry.ladder.find("decode ctx=") != std::string::npos,
                             "the decode cell prints its ladder route line");
