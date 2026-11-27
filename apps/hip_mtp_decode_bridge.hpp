@@ -1,4 +1,5 @@
 #include "strix/env_flags.hpp"
+#include "strix/spec/mtp_defer.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/startup_markers.hpp"
 #pragma once
@@ -334,6 +335,19 @@ inline std::string rtx_import_receipt(const PrefixStateCacheRequestStats& q) {
 struct BatchCertContext {
     bool enabled=false,allow_restore=false,nesting_possible=false;
     QwenBatchConfig config;
+};
+// The predictor rows of the prompt's last block, recorded instead of launched (the shared policy is
+// strix/spec/mtp_defer.hpp: the block that completes the prompt is deferred in place). The first prompt token is the
+// target's own output and does not read them; the owner of this record launches the same call (same rows, positions,
+// tokens, same bits) before the first draft. The device rows (the block's tap rows and a copy of the previous held row)
+// stay alive until then.
+struct DeferredMtpPriming {
+    std::shared_ptr<std::byte> hidden,previous_held;
+    std::vector<MtpDeviceView> views;
+    std::vector<std::uint32_t> next;
+    RotaryIdentity rotary;
+    [[nodiscard]] bool pending() const noexcept {return !views.empty();}
+    [[nodiscard]] std::uint64_t rows() const noexcept {return views.size();}
 };
 class TiledMtpPrompt {
 public:
@@ -696,9 +710,29 @@ public:
                 block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),capture_tag(order));
         }
         const auto prime_t0=std::chrono::steady_clock::now();
+        // Deferred final block (opt-in of the caller, no prefix cache, no export/batch/resume): the same call is recorded and
+        // launched by the caller before the first draft.
+        const bool defer_prime=block.final && !views.empty() &&
+            strix::spec::mtp_defer::defer_final_priming(defer_final_,pos_,rows,n_,!!tiled_.cache,batch_,!!rtx_state_export_request(),priming_);
+        if(defer_prime) {
+            const auto release=[](std::byte* p){(void)hipFree(p);};
+            std::byte* previous=nullptr;
+            if(pos_) {
+                strix::hip_check(hipMalloc(reinterpret_cast<void**>(&previous),static_cast<std::size_t>(width_)),"deferred MTP previous held row");
+                deferred_.previous_held=std::shared_ptr<std::byte>(previous,release);
+                strix::hip_check(hipMemcpy(previous,held_,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),"deferred MTP previous held copy");
+                views[0]=view(previous);
+            }
+            deferred_.views=views;deferred_.next=next;deferred_.rotary=producer_rotary_;
+            deferred_.hidden=std::shared_ptr<std::byte>(hidden_allocation_,release);
+            hidden_allocation_=nullptr;
+            strix::hip_check(hipMemcpy(held_,block_hidden_+static_cast<std::size_t>(rows-1U)*width_,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
+                "tiled MTP held copy");
+        } else {
         runtime_.prime_hidden_rows(qualified_,activated_,views,next,producer_rotary_);
         strix::hip_check(hipMemcpy(held_,block_hidden_+static_cast<std::size_t>(rows-1U)*width_,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
             "tiled MTP held copy");
+        }
         prime_sync_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-prime_t0).count();prime_sync_rows_+=rows;
         pos_+=rows;
         const bool complete=!block.owner->completion_pending() && !runtime_.prime_hidden_rows_pending() &&
@@ -749,7 +783,9 @@ public:
                 terminal_logits_digest_=raw_fp32_logits_digest(logits);
             }
             if(final_sampler_) target_.replace_token_sampler(final_sampler_);
+            const auto adopt_t0=std::chrono::steady_clock::now();
             pending_=target_.adopt_prefill_row(session_,tokens_[static_cast<std::size_t>(n_-1U)],view(held_),logits,producer_rotary_,final_selector_);
+            adopt_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-adopt_t0).count();
             adopted_=true;
             phase_=Phase::done;
         }
@@ -783,11 +819,14 @@ public:
             return;
         }
     }
+    // The caller launches the last block's predictor rows itself (settle_deferred_mtp_priming) before the first draft.
+    void allow_deferred_final_priming() noexcept {defer_final_=true;}
+    [[nodiscard]] DeferredMtpPriming take_deferred_priming() {return std::move(deferred_);}
     HipMtpTargetHiddenTicket finish(std::string& receipt) {
         drain_priming();
         check_yarn_memory();
         if(!done())throw std::logic_error("tiled MTP prompt finished before its last row");
-        if(runtime_.next_source_position()+1U!=n_ || session_.next_position!=n_)
+        if(!strix::spec::mtp_defer::prompt_frontier_reached(runtime_.next_source_position(),deferred_.rows(),n_) || session_.next_position!=n_)
             throw std::logic_error("tiled MTP prompt did not reach the final prompt frontier");
         const auto prompt_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start_).count();
         std::ostringstream out;
@@ -806,7 +845,8 @@ public:
         // Execution witnesses for gates: pipe-async blocks, SMALL units, grouped tail blocks, window rows run in a cohort.
         {const auto counts=runtime_.prime_row_counts();
          out<<",\"prime_tap_ms\":"<<prime_tap_ms_<<",\"prime_sync_ms\":"<<prime_sync_ms_<<",\"prime_sync_rows\":"<<prime_sync_rows_<<",\"prime_submit_ms\":"<<prime_submit_ms_
-            <<",\"prime_drain_ms\":"<<prime_drain_ms_<<",\"prime_batched_rows\":"<<counts.first<<",\"prime_single_rows\":"<<counts.second;}
+            <<",\"prime_drain_ms\":"<<prime_drain_ms_<<",\"prime_batched_rows\":"<<counts.first<<",\"prime_single_rows\":"<<counts.second
+            <<",\"prime_deferred_rows\":"<<deferred_.rows()<<",\"exec_ms\":"<<exec_ms_<<",\"finish_ms\":"<<finish_ms_<<",\"adopt_ms\":"<<adopt_ms_;}
         out<<",\"pipe_async_blocks\":"<<pipe_async_blocks_<<",\"small_units\":"<<small_units_<<",\"grouped_tail_blocks\":"<<grouped_tail_blocks_
            <<",\"cohort_window_rows\":"<<cohort_window_rows_;
         if(final_logits_digest_) out<<",\"final_logits_digest\":\""<<model_content_identity_hex(*final_logits_digest_)<<'"';
@@ -981,13 +1021,17 @@ private:
             } else if(block.final) logits=block.backend->execute_rows(block_tokens(block),pos_);
             else block.backend->execute_state_rows(block_tokens(block),pos_);
             };
+            const auto exec_t0=std::chrono::steady_clock::now();
             if(execute_native) execute_native(owner,launch);else launch();
+            exec_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-exec_t0).count();
             owner.set_prefill_step_observer({});
             check_yarn_memory();
             // STRIX_PREFILL_TIMING=1: host milliseconds of the block's predictor rows, held row and capture (stderr).
             static const bool timing=strix::envcfg::flag("STRIX_PREFILL_TIMING", false);
-            const auto finish_start=timing?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+            const auto finish_start0=std::chrono::steady_clock::now();
+            const auto finish_start=timing?finish_start0:std::chrono::steady_clock::time_point{};
             finish_block(block,logits);
+            finish_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-finish_start0).count();
             if(timing) std::fprintf(stderr,"prefill bridge %-10s %8.2f ms (%u rows)\n","predictor",
                 std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-finish_start).count(),block.rows);
         } catch(...) {owner.set_prefill_step_observer({});throw;}
@@ -1121,6 +1165,10 @@ private:
     // Predictor priming cost (receipt prime_*): host wall of the synchronous priming (includes its GPU wait), of the async submit
     // (enqueue only, may run on the worker thread) and of the drains that wait for async priming (exposed wait).
     double prime_tap_ms_=0.0,prime_sync_ms_=0.0,prime_submit_ms_=0.0,prime_drain_ms_=0.0;std::uint64_t prime_sync_rows_=0;
+    // Host wall of the blocks' target launches (exec), of finish_block (finish: predictor rows, held row, adoption) and of the
+    // terminal adoption alone; deferred_: the last block's predictor rows left for the caller (take_deferred_priming).
+    double exec_ms_=0.0,finish_ms_=0.0,adopt_ms_=0.0;
+    bool defer_final_=false;DeferredMtpPriming deferred_;
     double block_ms_=0.0,tail_ms_=0.0,serial_ms_=0.0;  // wall time of the T blocks, the tail blocks, the serial rows (not the windows)
     bool forced_ladder_=false;
     bool small_=false;
@@ -1189,11 +1237,27 @@ inline HipMtpTargetHiddenTicket run_tiled_mtp_prompt(std::span<const std::uint32
     HipMtpTargetHidden& target,HipMtpRuntime& runtime,const QualifiedMtpDraftPlan& qualified,const ActivatedMtpDraftPlan& activated,
     const ExecutionRuntimeResources& resources,DirectLaunchDispatcher& dispatcher,std::byte* held,std::string& receipt,
     std::shared_ptr<TokenSampler> final_sampler={},HipMtpHostRowSelector final_selector={},
-    std::function<void(serve::GenerationProgress)> progress={},std::uint32_t stable_prefix=0) {
+    std::function<void(serve::GenerationProgress)> progress={},std::uint32_t stable_prefix=0,DeferredMtpPriming* deferred=nullptr) {
     TiledMtpPrompt prompt(tokens,model,compiled,tiled,session,target,runtime,qualified,activated,resources,dispatcher,held,
         std::move(final_sampler),std::move(final_selector),std::move(progress),false,true,false,{},false,stable_prefix);
+    if(deferred) prompt.allow_deferred_final_priming();
     while(!prompt.done()) prompt.step();
-    return prompt.finish(receipt);
+    auto ticket=prompt.finish(receipt);
+    if(deferred) *deferred=prompt.take_deferred_priming();
+    return ticket;
+}
+// Launches the recorded last-block predictor rows (the same call the prompt would have made); host ms of the call, which
+// waits for the rows. A no-op without a record.
+inline double settle_deferred_mtp_priming(HipMtpRuntime& runtime,const QualifiedMtpDraftPlan& qualified,
+    const ActivatedMtpDraftPlan& activated,DeferredMtpPriming& deferred) {
+    if(!deferred.pending()) return 0.0;
+    const auto t0=std::chrono::steady_clock::now();
+    runtime.prime_hidden_rows(qualified,activated,deferred.views,deferred.next,deferred.rotary);
+    const auto rows=deferred.rows();
+    deferred={};
+    const auto ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
+    std::fprintf(stderr,"mtp deferred prompt priming: rows=%llu settle_ms=%.2f\n",static_cast<unsigned long long>(rows),ms);
+    return ms;
 }
 
 #include "hip_qwen_prefill_mtp_handoff.inc"
@@ -2812,6 +2876,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     std::string stop="token-budget";
     double calibration_ms=0.0;
     std::string tiled_receipt;
+    DeferredMtpPriming deferred_priming;
     // h_{P-1} of the tiled prompt (one wide row), retained through the request.
     std::byte* tiled_held=nullptr;
     if(tiled_prompt && hipMalloc(reinterpret_cast<void**>(&tiled_held),static_cast<std::size_t>(width*2U))!=hipSuccess)
@@ -3612,9 +3677,14 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                     model,compiled,parents->tiled,session,*target,*runtime,
                     qualified,activated,r,dispatcher,tiled_held,tiled_receipt);
                 if(std::getenv("STRIX_QWEN_PF_PIPE_RANK")[0]=='1') return;
-            } else
-            pending=run_tiled_mtp_prompt(options.tokens,model,compiled,parents->tiled,session,*target,*runtime,qualified,activated,
-                r,dispatcher,tiled_held,tiled_receipt);
+            } else {
+                // The last block's predictor rows leave the prompt (strix/spec/mtp_defer.hpp): they run right after the first
+                // token is emitted, before the first draft. STRIX_MTP_DEFER_PRIME=0 keeps them in the prompt.
+                static const bool defer_prime=strix::envcfg::flag("STRIX_MTP_DEFER_PRIME",true);
+                const bool defer_here=defer_prime && !separated_prompt && !qualify && !component_diagnostic && !prompt_state_digest_request();
+                pending=run_tiled_mtp_prompt(options.tokens,model,compiled,parents->tiled,session,*target,*runtime,qualified,activated,
+                    r,dispatcher,tiled_held,tiled_receipt,{},{},{},0U,defer_here?&deferred_priming:nullptr);
+            }
         } else
         // Prefill handoff: every later target row, window and checkpoint runs the decode execution
         // from the state this prefill produced. The pending prompt row is re-minted with the
@@ -3646,6 +3716,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         if(m.draft_chain)greedy.set_draft_min_probability(mtp_draft_min_probability(m));
         if(!qualify && !m.ngram_off && ngram_wanted(m.ngram_draft))enable_ngram(greedy,options.tokens);
         if(qualify){
+            settle_deferred_mtp_priming(*runtime,qualified,activated,deferred_priming);
             MtpDecodeQualificationContext context{options,parents,native,target,std::move(window),session,dispatcher,generations,greedy,*runtime,std::move(pending)};
             qualify(context);
             assets->validate_assets_unchanged();
@@ -3657,6 +3728,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         pending.begin_step_logits_digest();
         publish_yarn_output([&] { strix::startup::first_token(); generated.push_back(pending.predicted_token()); });
         const auto start=std::chrono::steady_clock::now();
+        settle_deferred_mtp_priming(*runtime,qualified,activated,deferred_priming);
         while(generated.size()<options.generate_tokens && generated.back()!=eos.front()) {
             check_yarn_memory();
             PrefixAsyncCapture::reap();
