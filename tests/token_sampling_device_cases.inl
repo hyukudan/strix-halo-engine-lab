@@ -5,6 +5,7 @@
 // draft steps over draft-head-like entry lists must give the host's token and distribution.
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace strix;
@@ -31,7 +33,7 @@ std::vector<float> make_logits(std::mt19937_64& rng, std::uint32_t vocab, float 
     return out;
 }
 
-void check_boundary_identity() {
+void check_boundary_identity(bool require_host_parity) {
     // A sign-bit key orders +0 above -0 even though the host's numeric tie
     // goes to the smaller token ID. Keep this fixture as a migration witness.
     constexpr std::array<float, 2> signed_zeros{-0.0F, 0.0F};
@@ -40,7 +42,14 @@ void check_boundary_identity() {
     bool fallback = false;
     const auto host_tie = make_token_distribution(signed_zeros, {}, top_one).sample(middle);
     const auto device_tie = STRIX_TEST_DECIDE(signed_zeros, top_one, nullptr, middle, 0.0, 0.0, &fallback);
-    require(!fallback && host_tie == 0U && device_tie.token == 1U, "signed-zero ordering witness changed");
+    require(!fallback && host_tie == 0U, "signed-zero host golden or device path changed");
+    unsigned differences = 0;
+    const auto check_token = [&](std::string_view label, std::uint32_t actual, std::uint32_t expected) {
+        if (actual == expected) return;
+        ++differences;
+        std::cerr << label << ": got token " << actual << ", expected " << expected << '\n';
+    };
+    check_token("signed-zero target top-k tie", device_tie.token, require_host_parity ? host_tie : 1U);
 
     // Exact equal weights remove exp implementations from the comparison.
     // Sequential normalized sums put all three draws in host token 3071.
@@ -55,17 +64,41 @@ void check_boundary_identity() {
                 "CDF fixture needs 6144 retained tokens through the large-row route");
         for (std::size_t i = 0; i < uniforms.size(); ++i) {
             const auto device = STRIX_TEST_DECIDE(logits, policy, nullptr, uniforms[i], 0.0, 0.0, &fallback);
-            require(!fallback && host.sample(uniforms[i]) == 3071U && device.token == device_tokens[i],
-                    "large-row CDF boundary witness changed at draw " + std::to_string(i));
+            const auto host_token = host.sample(uniforms[i]);
+            require(!fallback && host_token == 3071U, "large-row CDF host golden or device path changed");
+            check_token(std::string(top_p < 1.0F ? "top-p" : "unfiltered") + " CDF draw " + std::to_string(i),
+                        device.token, require_host_parity ? host_token : device_tokens[i]);
         }
     }
+    if (require_host_parity) {
+        constexpr std::array<std::uint32_t, 2> ids{19U, 42U};
+        const auto host = make_token_distribution(signed_zeros, ids, top_one);
+        const auto draft = STRIX_TEST_DRAFT(signed_zeros, ids, top_one, middle);
+        check_token("signed-zero draft top-k tie", draft.token, host.sample(middle));
+
+        constexpr std::array<float, 4> equal_logits{};
+        constexpr std::array<std::uint32_t, 4> shuffled{31U, 7U, 18U, 4U};
+        constexpr TokenSamplingPolicy top_two{1.0F, 2U, 1.0F, 0.0F, 0U};
+        const auto target = make_token_distribution(equal_logits, shuffled, top_two);
+        const auto sampled = STRIX_TEST_DRAFT(equal_logits, shuffled, top_two, middle);
+        check_token("sparse draft CDF tie", sampled.token, target.sample(middle));
+        require(sampled.distribution.tokens().size() == target.tokens().size(), "draft tie support size");
+        for (const auto token : target.tokens()) {
+            const double actual = sampled.distribution.probability(token);
+            const double expected = target.probability(token);
+            require(std::bit_cast<std::uint64_t>(actual) == std::bit_cast<std::uint64_t>(expected),
+                    "draft tie probability differs at token " + std::to_string(token));
+        }
+    }
+    require(differences == 0, std::to_string(differences) + " boundary token decisions differ");
     std::cout << "signed-zero and large-row CDF identity witnesses: PASS\n";
 }
 } // namespace
 
 int main(int argc, char** argv) try {
-    if (argc > 1 && std::string(argv[1]) == "--boundary-audit-only") {
-        check_boundary_identity();
+    const std::string_view mode = argc > 1 ? argv[1] : "";
+    if (mode == "--boundary-audit-only" || mode == "--boundary-parity") {
+        check_boundary_identity(mode == "--boundary-parity");
         return 0;
     }
     // The second top-p finish can reset a zero-mass residual to an ordinary

@@ -54,16 +54,19 @@ void check_binary64_golden() {
            "binary64 rejection keeps the residual decision and all floating fields bitwise");
 
     const int original = std::fegetround();
-    if (std::fesetround(FE_DOWNWARD) == 0) {
+    for (const int mode : {FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+        if (std::fesetround(mode) != 0) continue;
         bool refused = false;
         try {
             static_cast<void>(strix::sample_speculation_target_token(cdf_row, rng(), 1, 0, identity));
         } catch (const std::invalid_argument&) {
             refused = true;
         }
-        static_cast<void>(std::fesetround(original));
-        expect(refused, "binary64 speculation refuses a non-nearest rounding environment");
+        const bool restored = std::fesetround(original) == 0;
+        expect(restored && refused, "binary64 speculation refuses a non-nearest rounding environment");
     }
+    expect(strix::sample_speculation_target_token(cdf_row, rng(), 1, 0, identity) == 1,
+           "binary64 bonus is unchanged after restoring nearest rounding");
 }
 
 strix::SpeculativeSamplingStepResult legacy_verify(const strix::SpeculativeSamplingStepRequest& request) {
