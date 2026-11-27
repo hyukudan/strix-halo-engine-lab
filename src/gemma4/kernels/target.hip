@@ -776,8 +776,10 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
         b.input(b.reads, b.host_reads, descriptors.data(), descriptors.size() * sizeof(KvRead));
         b.input(b.writes, b.host_writes, destinations.data(), destinations.size() * sizeof(KvWrite));
         // The decode attention form of every row: its stream's (bound at admission), else the process form. Rows of
-        // one pass may differ; each equal-form run of rows is attended by its own kernel (the bytes of a row never
-        // depend on the other rows of the pass).
+        // one pass may differ; each equal-form run of rows is attended by its own kernel. In a pass with a fast row the
+        // exact rows of the producer layer take kv_store + fused_attention instead of fused_attention_store: their bytes
+        // are expected equal to an all-exact pass (each row attends its own cache rows), a device identity check of
+        // the wave, not proven here. A run the kernels refuse sends the whole pass to exact attention (stderr notice).
         std::array<MirrorFormat, 8> row_form{};
         unsigned fast_mask = 0; // bit 2r (f16) / 2r+1 (kv8) per fast row: part of the graph key
         const auto stream_form = [&](const DeviceStream::Impl& s) {
@@ -970,6 +972,15 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
                                     b.partials.as<float>(), b.attention_counters.as<unsigned>(), run_a8);
                             });
                     }
+                }
+                if (!attended && fast_global) {
+                    // The per-row form runs were refused: every row of this pass (fast ones too) attends exact below.
+                    static const bool notice = [] {
+                        std::fprintf(stderr, "gemma4 decode attention: a per-row form pass was refused; that pass attends "
+                                             "every row with the exact kernel\n");
+                        return true;
+                    }();
+                    (void)notice;
                 }
                 if (!attended)
                     b.run("fused_attention", [&] {
