@@ -1,4 +1,5 @@
 #include "core/bf16_reference.hpp"
+#include "core/multimax_reference.hpp"
 #include "core/sha256.hpp"
 #include "core/streamed_linear_reference.hpp"
 #include "cpu/core/ordered_linear_reference.hpp"
@@ -52,6 +53,11 @@ void set_variant(Options& opts, std::string_view name) {
     using ernie::KeyNormContract;
     if (name == "router-unit") c.router = RouterContract::unit_gain;
     else if (name == "router-gain-before-norm") c.router = RouterContract::gain_before_normalize;
+    else if (name == "router-summed-scores") c.router = RouterContract::summed_scores;
+    else if (name == "norm-routed-output") c.norm_routed_output = true;
+    else if (name == "checkpoint-attention") c.checkpoint_attention = true;
+    else if (name == "checkpoint-hc") c.checkpoint_hc = true;
+    else if (name == "checkpoint-stores") c.checkpoint_stores = true;
     else if (name == "router-swap") c.router = RouterContract::swapped_planes;
     else if (name == "router-one-plane") c.router = RouterContract::single_plane;
     else if (name == "mla-global-kv") c.global_kv_split = true;
@@ -87,18 +93,19 @@ unsigned number(std::string_view text) {
 
 Options parse_options(int argc, char** argv) {
     Options opts;
+    enum class Contract { checkpoint, recovered, candidate };
+    auto contract = Contract::checkpoint;
+    std::vector<std::string_view> overrides;
+    std::optional<std::string_view> multimax_override;
     for (int i = 4; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (arg == "--oracle") { opts.oracle = true; continue; }
         if (arg == "--ordered-simd") { opts.simd = true; continue; }
         if (arg == "--table-mxfp4") { opts.decode.table_mxfp4 = true; continue; }
         if (arg == "--parallel-mla") { opts.parallel_mla = true; continue; }
-        if (arg == "--recovered-contract") {
-            set_variant(opts, "router-gain-before-norm");
-            set_variant(opts, "kv-no-head-norm");
-            set_variant(opts, "vha-swap");
-            continue;
-        }
+        if (arg == "--recovered-contract") { contract = Contract::recovered; continue; }
+        if (arg == "--candidate-contract") { contract = Contract::candidate; continue; }
+        if (arg == "--checkpoint-contract") { contract = Contract::checkpoint; continue; }
         if (arg == "--bos") { opts.bos = true; continue; }
         if (arg == "--save-layers") { opts.save_layers = true; continue; }
         if (arg == "--dump-logits") { opts.dump_logits = true; continue; }
@@ -112,8 +119,8 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--cache-mib") opts.cache_mib = number(argv[i]);
         else if (arg == "--prompt-index") opts.prompt = number(argv[i]);
         else if (arg == "--activation") opts.activation = argv[i];
-        else if (arg == "--variant") set_variant(opts, argv[i]);
-        else if (arg == "--multimax") opts.multimax = argv[i];
+        else if (arg == "--variant") overrides.emplace_back(argv[i]);
+        else if (arg == "--multimax") multimax_override = argv[i];
         else if (arg == "--capture") opts.capture = argv[i];
         else if (arg == "--pack") opts.packed = argv[i];
         else if (arg == "--replay") opts.replay = argv[i];
@@ -123,6 +130,25 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--limit") opts.limit = number(argv[i]);
         else throw std::invalid_argument("unrecognized option " + std::string(arg));
     }
+    if (contract == Contract::checkpoint) {
+        set_variant(opts, "router-summed-scores");
+        set_variant(opts, "norm-routed-output");
+        set_variant(opts, "kv-no-head-norm");
+        set_variant(opts, "vha-swap");
+        set_variant(opts, "checkpoint-attention");
+        set_variant(opts, "checkpoint-hc");
+        set_variant(opts, "checkpoint-stores");
+        opts.multimax = "checkpoint";
+    } else if (contract == Contract::recovered) {
+        set_variant(opts, "router-gain-before-norm");
+        set_variant(opts, "kv-no-head-norm");
+        set_variant(opts, "vha-swap");
+    }
+    for (const auto variant : overrides) set_variant(opts, variant);
+    if (multimax_override) opts.multimax = *multimax_override;
+    if (opts.multimax != "checkpoint" && opts.multimax != "identity" && opts.multimax != "hinge" &&
+        opts.multimax != "signed-hinge" && opts.multimax != "softplus")
+        throw std::invalid_argument("unknown vocabulary activation");
     if (!opts.steps || opts.steps > 4096 || !opts.threads || opts.threads > 16 || opts.cache_mib > 32768)
         throw std::invalid_argument("expected 1-4096 output tokens, 1-16 threads and 0-32768 MiB of decoded cache");
     if (opts.min_new_tokens > opts.steps || (opts.min_new_tokens && (opts.oracle || !opts.replay.empty())))
@@ -135,7 +161,7 @@ Options parse_options(int argc, char** argv) {
         (opts.start_layer != 0 && opts.resume.empty())))
         throw std::invalid_argument("invalid oracle options or missing layer cache");
     if (!opts.oracle && (opts.save_layers || opts.dump_logits || !opts.resume.empty() || opts.start_layer != 0 ||
-        opts.end_layer != ernie::kLayerCount || opts.limit != 128 || opts.multimax != "identity"))
+        opts.end_layer != ernie::kLayerCount || opts.limit != 128))
         throw std::invalid_argument("layer and text options require --oracle");
     return opts;
 }
@@ -151,7 +177,9 @@ void transform_logits(std::span<float> logits, std::string_view mode, const erni
     float ranges[4], strengths[4];
     read("model.lm_head.multimax_ranges", ranges, 0);
     read("model.lm_head.multimax_ts", strengths, 0);
-    if (mode == "hinge" || mode == "signed-hinge") {
+    if (mode == "checkpoint") {
+        core::multimax_f32_reference(logits, ranges, strengths);
+    } else if (mode == "hinge" || mode == "signed-hinge") {
         for (auto& z : logits) {
             const auto x = mode == "signed-hinge" ? std::abs(z) : z;
             float y = x;
@@ -344,7 +372,8 @@ void run_oracle(std::vector<std::uint32_t> ids, const Options& opts, const fs::p
             }
         });
     }
-    if (opts.bf16) for (auto& row : logits) core::round_bf16_reference(row);
+    if (opts.bf16 || opts.contracts.checkpoint_stores)
+        for (auto& row : logits) core::round_bf16_reference(row);
     if (opts.dump_logits) {
         auto dump = output_file(folder / "raw-logits.f32");
         for (const auto& row : logits) write_row(dump, std::span(row));
@@ -411,7 +440,9 @@ struct Replay {
     unsigned agreements = 0;
 
     Replay(const fs::path& previous, const fs::path& folder, std::span<const std::uint32_t> prompt, unsigned vocab)
-        : ids(input_file(previous / "generated.u32")), logits(input_file(previous / "raw-logits.f32")),
+        : ids(input_file(previous / "generated.u32")),
+          logits(input_file(fs::exists(previous / "selection-logits.f32") ? previous / "selection-logits.f32"
+                                                                           : previous / "raw-logits.f32")),
           comparison(trace_file(folder / "comparison.tsv", "step\tkl\treference_id\tcandidate_id\tsame_bits")),
           row(vocab) {
         auto original = input_file(previous / "prompt.u32");
@@ -476,7 +507,8 @@ void run_prompt(const Json& request, unsigned index, const strix::serve::BpeToke
                                  strix::moe::ExpertProjection::gate_up, value);
         };
     }
-    ernie::CpuReference reference(shape, read, activation(opts.activation), project, expert_observer, execute_heads);
+    ernie::CpuReference reference(shape, read, activation(opts.activation), project, expert_observer, execute_heads,
+                                  ids.size() + opts.steps - 1);
     RunFiles files(folder);
     const auto observer = [&](auto pos, auto layer, const auto& result) {
         files.layer(pos, layer, result);
@@ -491,10 +523,19 @@ void run_prompt(const Json& request, unsigned index, const strix::serve::BpeToke
     const auto started = Clock::now();
     auto logits = reference.append(ids, observer);
     const auto prefill = Clock::now();
+    std::optional<std::ofstream> selection_scores;
+    if (opts.multimax != "identity") selection_scores.emplace(output_file(folder / "selection-logits.f32"));
     for (unsigned step = 0; step < opts.steps; ++step) {
+        write_row(files.scores, std::span<const float>(logits));
+        transform_logits(logits, opts.multimax, read);
+        if (selection_scores) {
+            write_row(*selection_scores, std::span<const float>(logits));
+            selection_scores->flush();
+        }
         const auto top = top_logits(logits);
         if (step == 0) {
-            auto first = trace_file(folder / "first-token-top20.tsv", "id\traw_logit");
+            const auto label = opts.multimax == "identity" ? "id\traw_logit" : "id\tselection_logit";
+            auto first = trace_file(folder / "first-token-top20.tsv", label);
             for (auto id : top) first << id << '\t' << logits[id] << '\n';
         }
         auto choice = top.front();
@@ -505,7 +546,6 @@ void run_prompt(const Json& request, unsigned index, const strix::serve::BpeToke
         }
         generated.push_back(replay ? replay->next(step, logits) : choice);
         write_row(files.generated, std::span<const std::uint32_t>(generated).last(1));
-        write_row(files.scores, std::span<const float>(logits));
         files.generated.flush();
         files.scores.flush();
         output_file(folder / "partial-response.txt") << tokenizer.decode(generated, false);
@@ -522,7 +562,9 @@ void run_prompt(const Json& request, unsigned index, const strix::serve::BpeToke
     const auto response = tokenizer.decode(generated, false);
     output_file(folder / "response.txt") << response;
     auto receipt = Json(Json::Object{
-        {"identity", "candidate-raw-head"}, {"activation", opts.activation},
+        {"identity", opts.multimax == "checkpoint" ? "checkpoint-host" :
+                     (opts.multimax == "identity" ? "candidate-raw-head" : "candidate-transformed-head")},
+        {"activation", opts.activation}, {"multimax", opts.multimax},
         {"bos", opts.bos}, {"minimum_new_tokens", std::uint64_t{opts.min_new_tokens}},
         {"bf16_projections", opts.bf16}, {"multiply_fixed_gain", opts.fixed_gain},
         {"variants", variant_names(opts)},
@@ -548,13 +590,13 @@ int main(int argc, char** argv) try {
     if (argc < 4) {
         std::cerr << "usage: strix-ernie-cpu CHECKPOINT PROMPTS.json NEW_TRACE_DIR"
                      " [--generate N] [--min-new-tokens N] [--bos] [--prompt-index N] [--activation soft-clip|hard-clip|swiglu]"
-                     " [--bf16-projections] [--multiply-fixed-gain] [--recovered-contract] [--threads N] [--cache-mib N]"
+                     " [--bf16-projections] [--multiply-fixed-gain] [--checkpoint-contract|--recovered-contract|--candidate-contract] [--threads N] [--cache-mib N]"
                      " [--capture MODEL_DESCRIPTION] [--pack SIDECAR] [--replay TRACE_DIR]\n"
                      "       strix-ernie-cpu CHECKPOINT TEXT_FILE NEW_TRACE_DIR --oracle"
                      " [--bos] [--limit N] [--save-layers] [--dump-logits] [--resume TRACE_DIR]"
                      " [--start-layer N] [--end-layer N] [--threads N] [--cache-mib N] [--profile-host]"
-                     " [--ordered-simd] [--table-mxfp4] [--parallel-mla] [--recovered-contract]"
-                     " [--variant NAME] [--multimax identity|hinge|signed-hinge|softplus]\n";
+                     " [--ordered-simd] [--table-mxfp4] [--parallel-mla] [--checkpoint-contract|--recovered-contract|--candidate-contract]"
+                     " [--variant NAME] [--multimax checkpoint|identity|hinge|signed-hinge|softplus]\n";
         return 2;
     }
     const fs::path checkpoint = argv[1], folder = argv[3];
@@ -623,7 +665,10 @@ int main(int argc, char** argv) try {
             const auto matrix = cache.get(name, out.size() * (in.size() / groups), load);
             linear(name, matrix, in, out, groups);
         }
-        if (opts.bf16 && name.find(".linear_o_group_proj") == std::string::npos) core::round_bf16_reference(out);
+        const bool raw_router = name.ends_with(".gate.weight") || name.ends_with(".gate.weight_1");
+        if ((opts.contracts.checkpoint_stores && !raw_router) ||
+            (opts.bf16 && name.find(".linear_o_group_proj") == std::string::npos))
+            core::round_bf16_reference(out);
     };
     if (opts.oracle) {
         if (fs::file_size(argv[2]) > kMiB) throw std::invalid_argument("oracle text exceeds 1 MiB");
