@@ -51,6 +51,20 @@ constexpr bool defer_block(bool enabled, std::uint64_t first, std::uint32_t rows
     return enabled && first + rows == position;
 }
 
+// Engines whose last block's rows are launched by their caller later (the HIP bridge: the CLI single-request path) keep the
+// deferral to the plain case: the completing block (defer_block), no prefix cache that would capture the primed rows, no
+// batch or state export that reads them, and no earlier block's priming still in flight (the order of the calls never changes).
+constexpr bool defer_final_priming(bool enabled, std::uint64_t first, std::uint32_t rows, std::uint64_t position, bool has_cache,
+                                   bool batch, bool export_state, bool earlier_priming_in_flight) noexcept {
+    return defer_block(enabled, first, rows, position) && rows > 0 && !has_cache && !batch && !export_state && !earlier_priming_in_flight;
+}
+
+// The predictor frontier invariant of a prompt: the source rows primed so far plus the rows still deferred (each source row
+// is followed by its successor token) reach the last prompt position. Checked at the end of the prompt, before any draft.
+constexpr bool prompt_frontier_reached(std::uint64_t primed_frontier, std::uint64_t deferred_rows, std::uint64_t position) noexcept {
+    return primed_frontier + deferred_rows + 1U == position;
+}
+
 // An earlier prompt block (first + rows < position) is deferred through the stash: its tap rows and next tokens are copied
 // out of the block buffers (which the next block rewrites) to stash rows [stashed, stashed + pairs), and its call runs later
 // with those copies and otherwise identical arguments (same rows, positions and inputs: the same MTP bits). Calls settle in
