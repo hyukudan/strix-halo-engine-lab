@@ -155,10 +155,16 @@ void fixture_tests() {
             "an explicit later peer refuses the earlier lever");
     require(lines_of(levers, ao::Tier::exact, {}, only("X_PB", "0")).find("lever pair_a source=all-on\n") != std::string::npos,
             "an explicit 0 peer does not refuse");
-    // An exact lever whose device identity is pending says so on its all-on line.
+    // EXACT means bit identity: an exact lever whose device identity is pending is refused under EXACT with the reason,
+    // and taken (marked) by FAST and TURBO. An explicit setting is the caller's and is kept.
     const auto pending = ao::parse_catalogue(
         R"([{"row":"r","lever":"e_id","class":"exact","gate":"none","engines":["m"],"backends":["hip"],"phase":"any","env":"X_ID","value":"1","identity":"pending"}])");
-    require(lines_of(pending, ao::Tier::exact) == "lever e_id source=all-on identity=pending\n", "identity=pending is printed");
+    require(lines_of(pending, ao::Tier::exact) ==
+                "lever e_id source=refused reason=identity pending: EXACT takes only levers with proven bit identity\n",
+            "EXACT refuses an identity-pending lever: got\n" + lines_of(pending, ao::Tier::exact));
+    require(lines_of(pending, ao::Tier::fast) == "lever e_id source=all-on identity=pending\n", "FAST takes it, marked");
+    require(lines_of(pending, ao::Tier::exact, {}, only("X_ID", "1")) == "lever e_id source=explicit reason=explicit setting kept\n",
+            "an explicit setting of an identity-pending lever is kept under EXACT");
     // The plan exports exactly the all-on levers.
     ao::Query query;
     query.tier = ao::Tier::fast;
@@ -247,7 +253,9 @@ void catalogue_tests(const std::filesystem::path& root) {
                     require(it != levers.end(), where + ": unknown lever " + line.lever);
                     if (it == levers.end()) continue;
                     if (line.source == "all-on") {
-                        if (tier == ao::Tier::exact) require(it->cls == ao::Class::exact, where + ": " + line.lever + " is not exact");
+                        if (tier == ao::Tier::exact)
+                            require(it->cls == ao::Class::exact && !it->identity_pending,
+                                    where + ": " + line.lever + " is not exact with proven identity");
                         if (tier == ao::Tier::fast)
                             require(it->cls == ao::Class::exact || (it->cls == ao::Class::fast && it->gate == ao::Gate::pass),
                                     where + ": " + line.lever + " is not exact or gate-passing");
@@ -403,7 +411,7 @@ void explicit_catalogue_tests(const std::filesystem::path& root) {
                 ink_route.find("lever ink_hip_tall_chunk source=refused reason=precondition env:STRIX_INK_SERVED_CLI_ROUTE=0 "
                                "unmet") != std::string::npos,
             "the tall chunk is a FAST-class lever of the held-back route: got\n" + ink_exact + ink_turbo + ink_route);
-    const auto qwen = run("qwen3.8-flash-next", ao::Tier::exact, only("STRIX_QPF2K_HC_RECOMPUTE_NORM", "0"));
+    const auto qwen = run("qwen3.8-flash-next", ao::Tier::fast, only("STRIX_QPF2K_HC_RECOMPUTE_NORM", "0"));
     require(qwen.find("lever qwen_hc_recompute source=explicit reason=explicit setting kept: off\n") != std::string::npos &&
                 qwen.find("lever qwen_hc_inverse_reuse source=refused reason=requires qwen_hc_recompute\n") != std::string::npos,
             "an explicitly disabled requirement refuses its dependant: got\n" + qwen);
@@ -464,6 +472,20 @@ void binding_tests(const std::filesystem::path& root) {
         require(std::getenv(ao::kAppliedEnv) == nullptr, "dry run exports nothing");
         require(std::ranges::find(dry_args, "--prelaunch") != dry_args.end(), "dry run lists the lever arguments");
     }
+    {
+        // An argument lever is listed for the engine's record by its first argument.
+        std::ostringstream applied;
+        std::vector<std::string> real_args;
+        const auto scope = ao::begin(&desc27, Name::fast, "cuda", "", applied, true, real_args);
+        const char* exported = std::getenv(ao::kLeversEnv);
+        require(exported != nullptr && std::string(exported).find("qwen_rtx_spec_prelaunch:--prelaunch") != std::string::npos,
+                "an argument lever is listed by its first argument: got " + std::string(exported ? exported : "(unset)"));
+        std::ostringstream record;
+        require(!ao::engaged("--prelaunch", false, "no graph", record) &&
+                    record.str() == "all-on: lever qwen_rtx_spec_prelaunch source=all-on applied=no reason=no graph\n",
+                "an engine reports an argument lever it declines: got\n" + record.str());
+    }
+    require(std::getenv(ao::kLeversEnv) == nullptr, "the argument scope restores the environment");
     put("STRIX_QWEN_ROUTER_BF16", nullptr);
     put(ao::kEnv, "2");
     bool refused = false;

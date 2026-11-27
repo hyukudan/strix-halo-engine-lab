@@ -100,8 +100,11 @@ the resolved tier, the regime band and the backend but is still an explicit opti
 - Losing regimes: a lever measured slower than without it in a phase / length band (`slower`, with its receipt) is
   not turned on there. A launch without a band covers every phase and length, so such a lever is refused unless
   `--all-on-band` names a regime outside the losing one.
-- One record with the engine: the switches the resolver exported are listed in `STRIX_ALL_ON_LEVERS`; an engine whose
-  own admission does not engage one prints `all-on: lever NAME source=all-on applied=no reason=...`.
+- EXACT means bit identity: under `--profile exact`, an exact-class lever whose device identity is not yet receipted
+  (`identity: pending`) is refused with `reason=identity pending`; FAST and TURBO take it, marked `identity=pending`.
+- One record with the engine: the switches the resolver exported are listed in `STRIX_ALL_ON_LEVERS` (`LEVER:ENV`, or
+  `LEVER:--flag` for an argument lever); an engine whose own admission does not engage one prints
+  `all-on: lever NAME source=all-on applied=no reason=...`.
 - `--all-on-band any|prefill[:N]|decode[:N]` (env `STRIX_ALL_ON_BAND`) states the regime; band-limited levers need it.
 - An environment variable you set always wins (`source=default reason=explicit setting kept`).
 - `--dry-run` prints the lines and the lever arguments without exporting anything.

@@ -325,6 +325,10 @@ Plan resolve(std::span<const Lever> levers, const Query& query) {
             slot.reason = off ? "explicit setting kept: off" : "explicit setting kept";
         } else if (contains(lever.default_tiers, tier_word(query.tier))) {
             slot.state = State::def;
+        } else if (lever.identity_pending && query.tier == Tier::exact) {
+            // EXACT means bit identity: an exact-class lever whose device identity is not receipted is not an EXACT lever.
+            slot.state = State::refused;
+            slot.reason = "identity pending: EXACT takes only levers with proven bit identity";
         } else if (lever.cls == Class::fast && lever.gate != Gate::pass && query.tier == Tier::fast) {
             slot.state = State::refused;
             slot.reason = "gate v2 " + std::string(gate_word(lever.gate)) + " for fast";
@@ -492,6 +496,11 @@ Scope begin(const model_description::ModelDescription* description, std::optiona
                 line.source == "all-on" && it != catalogue().end() && it->env == key)
                 exported += (exported.empty() ? "" : ",") + line.lever + ":" + key;
     }
+    // An argument lever is listed by its first argument ("LEVER:--flag"): the engine reports it the same way.
+    for (const auto& line : scope.plan_.lines)
+        if (const auto it = std::ranges::find(catalogue(), line.lever, &Lever::name);
+            line.source == "all-on" && it != catalogue().end() && it->env.empty() && !it->args.empty())
+            exported += (exported.empty() ? "" : ",") + line.lever + ":" + it->args.front();
     put_env(kAppliedEnv, "1");
     scope.set_.emplace_back(kAppliedEnv);
     if (!exported.empty() && !env_set(kLeversEnv)) {

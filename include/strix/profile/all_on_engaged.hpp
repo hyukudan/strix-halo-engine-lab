@@ -1,7 +1,8 @@
 #pragma once
 // The engine side of --all-on (strix/profile/all_on.hpp), header only so an engine library needs no resolver link.
-// The first shell lists the switches it exported in STRIX_ALL_ON_LEVERS ("LEVER:ENV,LEVER:ENV"). An engine whose own
-// admission gates one of them calls engaged() with the result: when the switch was exported by --all-on and the engine
+// The first shell lists the switches it exported in STRIX_ALL_ON_LEVERS ("LEVER:ENV,LEVER:ENV"; an argument lever as
+// "LEVER:--flag", its first argument). An engine whose own admission gates one of them calls engaged() with the switch
+// (environment name or argument) and the result: when the switch was exported by --all-on and the engine
 // does not engage it, one line "all-on: lever LEVER source=all-on applied=no reason=REASON" goes to `out`, so the
 // printed plan never claims a lever the engine did not run. A switch the user set by hand is not in the list.
 #include "strix/env_flags.hpp"
