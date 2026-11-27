@@ -213,11 +213,10 @@ LayerResult FirstRowReference::block(unsigned layer, std::span<const float> stre
                 for (unsigned j = 0; j < i; ++j)
                     std::swap(mix.comb[i * kStreams + j], mix.comb[j * kStreams + i]);
         std::vector<float> normalized(shape_.hidden);
-        auto collapse_site = site;
-        if (shape_.contracts.checkpoint_hc) collapse_site.store = hc::Store::f32;
-        hc::collapse(collapse_site, residual, mix.pre, normalized);
-        core::rms_norm_bf16_reference(normalized, read(prefix + norm, normalized.size()), epsilon,
-                                      shape_.contracts.checkpoint_hc);
+        const auto variance = shape_.contracts.checkpoint_hc
+            ? hc::CollapseVariance::before_store : hc::CollapseVariance::after_store;
+        hc::collapse_rms_bf16(site, residual, mix.pre, read(prefix + norm, normalized.size()), epsilon, variance,
+                              normalized);
         hc::expand(site, compute(normalized), residual, mix, next);
     };
     LayerResult result{std::vector<float>(site.flat()), std::vector<float>(shape_.hidden),

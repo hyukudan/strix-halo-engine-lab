@@ -1,4 +1,5 @@
 #include "strix/hc/hc_ref.hpp"
+#include "core/bf16_reference.hpp"
 
 #include <stdexcept>
 
@@ -58,9 +59,7 @@ std::vector<float> raw_mixes(const Spec& spec, std::span<const float> streams, c
     const float mean_square =
         ds41::chunked_dot_of([&](std::size_t i) { return streams[i]; }, [&](std::size_t i) { return streams[i]; }, n) /
         static_cast<float>(n);
-    const float r = spec.norm_eps_outside_sqrt
-        ? 1.0F / (ds41::declared_sqrt(mean_square) + spec.norm_eps)
-        : ds41::declared_rsqrt(mean_square + spec.norm_eps);
+    const float r = mix_rms_inverse(mean_square, spec.norm_eps, spec.norm_eps_outside_sqrt);
     std::vector<float> mix(rows);
     for (std::size_t m = 0; m < rows; ++m) {
         float d;
@@ -108,6 +107,16 @@ void collapse(const Spec& spec, std::span<const float> streams, std::span<const 
             "hc: collapse geometry");
     for (std::size_t i = 0; i < spec.hidden; ++i)
         out[i] = collapse_at(streams.data(), spec.hidden, i, pre.data(), spec.streams, spec.store);
+}
+
+void collapse_rms_bf16(const Spec& spec, std::span<const float> streams, std::span<const float> pre,
+                       std::span<const float> gain, float epsilon, CollapseVariance variance,
+                       std::span<float> out) {
+    const bool delayed_store = spec.store == Store::bf16 && variance == CollapseVariance::before_store;
+    auto collapse_spec = spec;
+    if (delayed_store) collapse_spec.store = Store::f32;
+    collapse(collapse_spec, streams, pre, out);
+    core::rms_norm_bf16_reference(out, gain, epsilon, delayed_store);
 }
 
 void expand(const Spec& spec, std::span<const float> sub, std::span<const float> residual, const Mix& mix,

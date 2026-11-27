@@ -34,6 +34,11 @@ struct Mix {
 [[nodiscard]] Mix mixes(const Spec& spec, std::span<const float> streams, const SiteWeights& w);
 // out[i] = collapse_at(...) for i < hidden.
 void collapse(const Spec& spec, std::span<const float> streams, std::span<const float> pre, std::span<float> out);
+// Compute RMS variance on the selected side of the collapse store. The
+// numerator sees the store in both cases and the normalized output is BF16.
+void collapse_rms_bf16(const Spec& spec, std::span<const float> streams, std::span<const float> pre,
+                       std::span<const float> gain, float epsilon, CollapseVariance variance,
+                       std::span<float> out);
 // out[k][i] = expand_at(...) for k < streams, i < hidden (sublayer sites only).
 void expand(const Spec& spec, std::span<const float> sub, std::span<const float> residual, const Mix& mix,
             std::span<float> out);
