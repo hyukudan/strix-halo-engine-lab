@@ -127,7 +127,7 @@ inline MiniPrefillSchedule mini_prefill_schedule_from_env(bool hip, profile::Nam
     return schedule;
 }
 
-// Served prompt route. A server with the served route lever (kMiniServedCliRoute: default on CUDA, opt-in on HIP)
+// Served prompt route. A server with the served route lever (kMiniServedCliRoute: the default on every backend)
 // serves the command line's schedule above with the first id taken from the final prefill row (emits-first), so its
 // prompt rows run the command line's calls. Both backends admit it (device evidence, the cohort-lanes fixture's
 // served_prefill arm: served prefill == CLI prefill bitwise, first id, scores, KV, histories and the next decode steps;
@@ -154,12 +154,14 @@ inline MiniPrefillSchedule mini_served_prefill_schedule_from_env(bool hip, bool 
                                                            : mini_served_held_back_schedule(hip, tier);
 }
 
-// Fallback rows of the served chunk on a chunk-invariant backend (CUDA), either route: the command line's fallback rows;
-// 0 = no smaller candidate (HIP; an explicit --prefill-rows is never changed). The served route lever runs only at the
-// command line's chunk: a smaller candidate runs the held-back route (a smaller emits-first chunk would split a prompt
-// the command line runs as one chunk: 2049 rows at a 2048-row chunk = 2048 + a one-row chunk on the packed route).
+// Fallback rows of the served chunk, either route: on a chunk-invariant backend (CUDA) the command line's fallback rows;
+// on HIP the held-back 128 rows (its held-back chunk, so the command line's chunk of the route lever never costs a
+// session slot: a load that would lose slots at that chunk keeps the incumbent held-back route at 128 rows). An explicit
+// --prefill-rows is never changed (the caller passes no fallback). The served route lever runs only at the command line's
+// chunk: a smaller candidate runs the held-back route (a smaller emits-first chunk would split a prompt the command line
+// runs as one chunk: 2049 rows at a 2048-row chunk = 2048 + a one-row chunk on the packed route).
 constexpr unsigned mini_served_prefill_fallback_rows(bool hip, profile::Name tier) noexcept {
-    if (!mini_prefill_chunk_invariant(hip)) return 0U;
+    if (!mini_prefill_chunk_invariant(hip)) return kMiniServedHeldBackChunk;
     return mini_cli_prefill_fallback_rows(hip ? MiniPrefillBackend::hip : MiniPrefillBackend::cuda, tier);
 }
 
@@ -230,5 +232,18 @@ inline constexpr serve::MixedServicePieces kMiniCudaServePieces = serve::kMixedS
 static_assert(kMiniCudaServePieces.piece_rows % kMiniCudaPieceRows == 0U &&
                   kMiniCudaServePieces.piece_rows > 3U * kMiniCudaPieceRows,
               "a CUDA held-back piece is cuttable (serve::validate_prompt_pieces)");
+
+// Prompt pieces beside decoding lanes, per backend and route (shared mixed-service data): the shared long pieces wherever
+// the decoder cuts prompt rows into pieces with the bits of the whole chunk (CUDA either route; HIP the command line's
+// route, whose pieces cut at 16-row wave tiles above the key-split bound), the short ones on the HIP held-back route (its
+// 128-row chunk is already the piece). gfx1151 C8 (8 x 256 tokens, 8 slots, context 4096, the command line's route):
+// with 128-row pieces the prompts of the later lanes waited 22.6 s for their first token even with prompt share 0
+// (128-row pieces prefill at ~580 tok/s against ~2,000 tok/s for the whole chunk), ink_meas s3c.
+constexpr serve::MixedServicePieces mini_serve_pieces(bool hip, bool cli_route) noexcept {
+    return !hip || cli_route ? serve::kMixedServiceLongPieces : serve::kMixedServiceShortPieces;
+}
+static_assert(serve::kMixedServiceLongPieces.piece_rows % kMiniPrefillWaveRows == 0U &&
+                  serve::kMixedServiceLongPieces.piece_rows > attn_core::dense::kKeySplitMaxRows,
+              "a HIP long piece keeps the long-chunk forms");
 
 }  // namespace strix::inkling2

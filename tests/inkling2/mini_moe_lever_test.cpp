@@ -211,7 +211,7 @@ void test_resolution() {
     require(refused, "malformed W4A4 switch must be refused");
 }
 
-// TURBO iu4 runs only in the measured prefill regimes of its ladder rows (gfx1151, prompts of 4,307..32,760 tokens);
+// TURBO iu4 runs only in the measured prefill regimes of its ladder rows (gfx1151, prompts of 1,143..32,760 tokens);
 // every other regime, device and tier keeps the BF16 tile; explicit switches run as set.
 void test_ladder() {
     using A = strix::moe_core::grouped_w4a4::Activations;
@@ -225,9 +225,9 @@ void test_ladder() {
         options.tier = inputs(tier, value);
         return mini::mini_prompt_moe(options, device, tokens, false, nullptr, run);
     };
-    for (const std::uint64_t tokens : {4307ULL, 4309ULL, 8192ULL, 8236ULL, 8237ULL, 32758ULL, 32760ULL})
+    for (const std::uint64_t tokens : {1143ULL, 1148ULL, 4306ULL, 4307ULL, 4309ULL, 8192ULL, 8236ULL, 8237ULL, 32758ULL, 32760ULL})
         require(prompt(profile::Name::turbo, "gfx1151", tokens) == A::iu4_rot, "TURBO prefill inside the rows runs iu4");
-    for (const std::uint64_t tokens : {0ULL, 1ULL, 4306ULL, 32761ULL, 131072ULL})
+    for (const std::uint64_t tokens : {0ULL, 1ULL, 1142ULL, 32761ULL, 59258ULL, 131072ULL})
         require(prompt(profile::Name::turbo, "gfx1151", tokens) == A::bf16, "unmeasured prompt sizes keep the BF16 tile");
     require(prompt(profile::Name::turbo, "sm_120", 8236U) == A::bf16, "other devices keep the BF16 tile");
     require(prompt(profile::Name::turbo, "", 8236U) == A::bf16, "an unknown device keeps the BF16 tile");
@@ -269,12 +269,12 @@ void test_ladder() {
     require(mini::mini_prompt_moe_may_select(options, "sm_120", A::iu4_rot, known), "an explicit iu4 load builds them");
 
     // strix-serve resolves under a model preset, which admits only ready cells: the server selects what the CLI
-    // selects for the same prompt (served prompts of the receipt: 4,307 / 8,234 / 32,758 tokens).
+    // selects for the same prompt (served prompts of the receipts: 1,148 / 4,307 / 8,234 / 32,758 tokens).
     {
         const PresetEnv preset;
-        for (const std::uint64_t tokens : {4307ULL, 8234ULL, 32758ULL})
+        for (const std::uint64_t tokens : {1148ULL, 2048ULL, 4307ULL, 8234ULL, 32758ULL})
             require(prompt(profile::Name::turbo, "gfx1151", tokens) == A::iu4_rot, "served TURBO selects the CLI cell");
-        require(prompt(profile::Name::turbo, "gfx1151", 2048U) == A::bf16, "served TURBO keeps BF16 outside the rows");
+        require(prompt(profile::Name::turbo, "gfx1151", 1024U) == A::bf16, "served TURBO keeps BF16 outside the rows");
         require(prompt(profile::Name::fast, "gfx1151", 8234U) == A::bf16, "served FAST keeps the BF16 tile");
         options.tier = inputs(profile::Name::turbo);
         require(mini::mini_prompt_moe_may_select(options, "gfx1151", A::iu4_rot, known), "a served TURBO load builds images");
@@ -830,10 +830,9 @@ void test_served_route() {
             const bool on = explicit_on || value == nullptr;
             require(mini::mini_served_cli_route(resolution) == on, "served route: the column, an explicit 1 or 0");
             require(resolution.qualification() == "qualified", "served route: every setting is qualified");
-            // The backend's request: CUDA runs the resolved value, HIP an explicit 1 only.
-            require(mini::mini_served_route_request(resolution, false) == on &&
-                        mini::mini_served_route_request(resolution, true) == explicit_on,
-                    "served route: CUDA takes the column, HIP an explicit setting only");
+            // The backend's request: every backend runs the resolved value (an explicit 0 keeps the held-back route).
+            require(mini::mini_served_route_request(resolution) == on,
+                    "served route: every backend takes the resolved value");
             // The command line's resolution: the request stays visible on its own line, never as an effective lever.
             auto cli = resolution;
             mini::mini_cli_decline_served_route(cli);

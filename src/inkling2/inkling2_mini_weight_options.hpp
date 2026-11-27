@@ -401,15 +401,11 @@ inline bool mini_served_cli_route(const profile::Resolution& tier) {
     throw std::invalid_argument("STRIX_INK_SERVED_CLI_ROUTE must be 0 or 1");
 }
 
-// The served route a server of the backend requests: CUDA the resolved value (the profile columns select it); HIP only an
-// explicit setting (STRIX_INK_SERVED_CLI_ROUTE=1), so a HIP server keeps the held-back route by default until the
-// route's per-slot working memory on HIP (the command line's chunk instead of the 128-row held-back chunk) is decided.
-inline bool mini_served_route_request(const profile::Resolution& tier, bool hip) {
-    if (!mini_served_cli_route(tier)) return false;
-    if (!hip) return true;
-    const auto* entry = tier.find(kMiniServedCliRoute);
-    return entry->status == profile::Status::explicit_env || entry->status == profile::Status::explicit_cli;
-}
+// The served route a server requests: the resolved value on every backend (the builtin runs it; an explicit 0 keeps the
+// held-back route). The route's per-slot working memory (the command line's chunk instead of the 128-row held-back
+// chunk) never costs a session slot: the served load's chunk ladder (mini_served_prefill_fallback_rows) keeps the held-back
+// 128 rows as the smaller candidate wherever the command line's chunk would.
+inline bool mini_served_route_request(const profile::Resolution& tier) { return mini_served_cli_route(tier); }
 
 // The command line's receipt of the served route lever: the requested value as the resolution holds it (unparsed, so a
 // malformed server setting never aborts the command line) and that it does not apply here.

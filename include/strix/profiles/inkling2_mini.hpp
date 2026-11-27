@@ -161,10 +161,13 @@ inline constexpr std::string_view kMiniAttnProjectedBias = "inkling2-mini-attn-p
 // of the same request on the command line at any cohort width (CLI == server). The build's behaviour (builtin 1, no
 // profile column sets it) after the RTX receipts (cuda_pf2-kit q44: served prefill == CLI prefill bitwise; q45: server
 // ids == CLI ids 8/8 at the held-back route's speed, slot bytes equal): the held-back served EXACT ids were a defect
-// (q43: 1/8 equal to the command line). A CUDA server runs it; a HIP server only when set explicitly
-// (mini_served_route_request: its per-slot working memory, the command line's chunk instead of the 128-row held-back
-// chunk, awaits its own decision). An explicit 0 keeps the held-back route (the last prompt token decoded as the first
-// decode row). The command line always runs this route and does not read the switch.
+// (q43: 1/8 equal to the command line). Every server runs it (mini_served_route_request). On HIP its per-slot working
+// memory (the command line's chunk instead of the 128-row held-back chunk) never costs a session slot: the served chunk
+// ladder keeps the held-back route at 128 rows wherever the command line's chunk would (mini_served_prefill_fallback_rows).
+// HIP receipts: ink_fix2 t1 server ids == CLI 128/128; gfx1151 served EXACT prefill with the command line's chunk 8K
+// 601 -> 2,030 tok/s, 32K 578 -> 1,870 (ink_pf_ab, ids 7/7 equal to the held-back route). An explicit 0 keeps the
+// held-back route (the last prompt token decoded as the first decode row). The command line always runs this route and
+// does not read the switch.
 inline constexpr std::string_view kMiniServedCliRoute = "inkling2-mini-served-cli-route@1";
 // Draft CUDA controller schedule. One plane requires explicit selection and a resident weight certificate.
 inline constexpr std::string_view kMiniControllerPlanes = "inkling2-mini-controller-planes@1";
@@ -246,7 +249,9 @@ inline constexpr std::array<profile::Lever, 19> kMiniLevers{{
      .runnable = {true, true, true, true}, .target = "", .off = "0",
      .source = "RTX receipts (cuda_pf2-kit): q44 served prefill == CLI prefill bitwise (first id, scores, KV, histories, "
                "4 decode steps; pieces) and lanes == lone; q45 server ids == CLI ids 8/8, C1 / C8 / gap / slot bytes equal "
-               "to the held-back route; HIP: ink_fix2 t1 server ids == CLI 128/128",
+               "to the held-back route; HIP: ink_fix2 t1 server ids == CLI 128/128; gfx1151 served EXACT prefill, 1 slot, "
+               "held-back -> this route (ink_meas s1/s2): 1K 582 -> 1,590, 8K 580 -> 2,203, 32K 543 -> 1,942, 58K 515 -> "
+               "1,661 tok/s, ids equal at the five lengths",
      .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniScreenedHead, .env = "STRIX_INK_SCREENED_HEAD", .option = "",
      .value = {"1", "1", "1", ""}, .builtin = "0",
@@ -305,10 +310,21 @@ inline constexpr std::array<profile::Lever, 19> kMiniLevers{{
 // the server alike) inside the band; no FAST prefill lever runs on that device, so the reference is the builtin arm.
 // Measured ends, CLI (prompts of 4,309 / 8,236 / 32,760 tokens) / served (the same texts, 4,307 / 8,234 / 32,758
 // tokens): 4K x1.1211 / x1.1171, 8K x1.0915 / x1.0944, 32K x1.0689 / x1.0861. A band takes the lower speedup of its
-// two ends, rounded down; prompts below 4,307 or above 32,760 tokens are unmeasured and keep the tier below.
+// two ends, rounded down. Low band (ink_meas t6 / s7, iu4 alone against the TURBO default outside the band, i.e. the BF16
+// tile; CLI ABBA, served off / on with the command line's route): 1,143 tokens CLI x1.234 / x1.233, 1,148 tokens served
+// x1.239 / x1.238; its upper end is the 4K end above. Above 32,760 tokens the served 59,258-token end measured x1.002
+// (CLI 59,253 x1.080 / x1.086): no band there. Prompts below 1,143 or above 32,760 tokens are unmeasured and keep the tier
+// below.
 inline constexpr std::string_view kMiniIu4PrefillReceipt =
     "grouped-iu4a4-rot-v1 prefill timing, gfx1151, CLI + served, EXACT/TURBO interleaved, prompts of 4,307..32,760 tokens";
-inline constexpr std::array<profile::LadderRow, 2> kMiniLadder{{
+inline constexpr std::string_view kMiniIu4PrefillLowReceipt =
+    "grouped-iu4a4-rot-v1 prefill timing, gfx1151, CLI ABBA + served off/on, TURBO default vs iu4, prompts of 1,143 / "
+    "1,148 tokens with the 4,307 / 4,309-token ends";
+inline constexpr std::array<profile::LadderRow, 3> kMiniLadder{{
+    {.lever = kMiniMoeW4a4, .value = "iu4", .tier = profile::Name::turbo, .phase = profile::Phase::prefill,
+     .device = "gfx1151", .min_context = 1143, .max_context = 4306, .min_lanes = 1, .max_lanes = 1,
+     .speedup = 1.117, .noise = 0.01, .receipt = kMiniIu4PrefillLowReceipt, .identity = "v1", .band_bound = true,
+     .band_evidence = {{1143, 1148, 4307, 4309}, {}, "Gate v2 prefill, 16 replayed prose windows, 1,008 scored rows; prompt lengths unspecified."}},
     {.lever = kMiniMoeW4a4, .value = "iu4", .tier = profile::Name::turbo, .phase = profile::Phase::prefill,
      .device = "gfx1151", .min_context = 4307, .max_context = 8236, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1.091, .noise = 0.01, .receipt = kMiniIu4PrefillReceipt, .identity = "v1", .band_bound = true,
