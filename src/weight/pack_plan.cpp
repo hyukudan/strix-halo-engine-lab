@@ -1,6 +1,7 @@
 #include "strix/weight/pack_plan.hpp"
 
 #include "strix/serve/json.hpp"
+#include "strix/weight/calib_moments.hpp"
 #include "strix/weight/host_lowbit.hpp"
 #include "strix/weight/host_q8.hpp"
 

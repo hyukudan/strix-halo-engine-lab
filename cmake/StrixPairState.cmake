@@ -20,7 +20,8 @@ add_executable(pair_state_serialized_tests
     ${CMAKE_CURRENT_LIST_DIR}/../tests/pair_state_serialized_tests.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../src/deepseek41_attention_state.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../src/ds41_attention.cpp)
-target_include_directories(pair_state_serialized_tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../include)
+target_include_directories(pair_state_serialized_tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../include
+                                                               ${CMAKE_CURRENT_LIST_DIR}/../src)
 target_compile_features(pair_state_serialized_tests PRIVATE cxx_std_20)
 if(MSVC)
     target_compile_definitions(pair_state_serialized_tests PRIVATE _CRT_SECURE_NO_WARNINGS)

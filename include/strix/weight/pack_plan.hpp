@@ -1,6 +1,5 @@
 #pragma once
 
-#include "strix/weight/calib_moments.hpp"
 #include "strix/weight/registry.hpp"
 
 #include <cstdint>
@@ -11,6 +10,7 @@
 #include <vector>
 
 namespace strix::serve { class Json; }
+namespace strix::weight::calib { class MomentSet; }
 
 namespace strix::weight {
 
