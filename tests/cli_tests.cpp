@@ -3,6 +3,7 @@
 #include "strix/serve/json.hpp"
 #include "../src/cli/detail.hpp"
 #include "strix/session/speculation_default.hpp"
+#include "../src/hy4/hy4_speculation.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -645,6 +646,57 @@ void qwen_launcher_keeps_speculation_default(const fs::path& data) {
                 std::find(args.begin(), args.end(), "--mtp") == args.end(), "the launcher neither disables nor spells MTP");
     }
 }
+// Engine arguments of a dry run: the words after the asset, unquoted. The first words are the executable path.
+std::vector<std::string> dry_run_after_asset(const fs::path& data, const std::vector<std::string>& command, std::string_view asset) {
+    Probes probes;
+    probes.nodes_open = true;
+    std::ostringstream out;
+    require(dispatch(parse(command), "test bin", data, probes, [](const auto&) { return true; }, out) == 0, "dry run");
+    std::istringstream words(out.str());
+    std::vector<std::string> args;
+    for (std::string word; words >> word;) {
+        if (word.size() >= 2 && (word.front() == '\'' || word.front() == '"') && word.back() == word.front())
+            word = word.substr(1, word.size() - 2);
+        if (!word.empty() && word.front() != '#') args.push_back(word);
+    }
+    const auto at = std::find_if(args.begin(), args.end(), [asset](const std::string& word) {
+        return word == asset || word.ends_with("/" + std::string(asset)) || word.ends_with("\\" + std::string(asset));
+    });
+    require(at != args.end(), "dry run carries the asset");
+    return {at + 1, args.end()};
+}
+
+// strix run hy4-flash resolves the documented drafter: the launcher adds only route-neutral options to the production
+// command, so the engine's own argument classification and the shared speculation rule enable the next-token drafter.
+void hy4_launcher_resolves_documented_drafter(const fs::path& data) {
+    using strix::hy4::SpeculationRun;
+    for (const std::string tier : {"exact", "fast", "turbo"}) {
+        const std::vector<std::string> command{"run", "hy4-flash", "--profile", tier, "--asset", "PART1.gguf", "--dry-run",
+                                               "--", "PART2.gguf", "--ids-file", "prompt.ids", "--gen", "256"};
+        const auto args = dry_run_after_asset(data, command, "PART1.gguf");
+        require(std::find(args.begin(), args.end(), "--profile") != args.end(), "the tier reaches the rank");
+        for (std::size_t i = 0; i < args.size(); ++i)
+            require(args[i] != "--top" && args[i] != "--teacher" && args[i] != "--dump-logits" && args[i] != "--timing" &&
+                    args[i] != "--gate-ref" && args[i] != "--mtp" && args[i] != "--no-mtp", "the launcher adds no route option");
+        auto run = strix::hy4::speculation_run_from_arguments(args);
+        run.environment = nullptr;  // the caller's environment is not the launcher's
+        run.block_in_pack = true;   // the Hy4 pack ships its next-token block (GGUF nextn_predict_layers)
+        const auto decision = strix::hy4::speculation(run);
+        require(decision.enabled && decision.source == "default", "hy4 strix run resolves the MTP drafter");
+    }
+    // The rank's own spelling of a per-step or opted-out route still wins.
+    auto classify = [](std::vector<std::string> args) {
+        auto run = strix::hy4::speculation_run_from_arguments(args);
+        run.environment = nullptr;
+        run.block_in_pack = true;
+        return std::string(strix::hy4::speculation(run).source);
+    };
+    require(classify({"--top", "0", "--profile", "fast", "--kv", "bf16"}) == "default", "--top 0 is the production form");
+    require(classify({"--top", "5"}) == "explicit-route", "--top 5 keeps the per-step logits");
+    require(classify({"--timing"}) == "explicit-route", "--timing keeps the plain steps");
+    require(classify({"--no-mtp"}) == "cli-opt-out", "--no-mtp opts out");
+    require(classify({"--mtp", "--timing"}) == "explicit", "--mtp wins over the per-step route");
+}
 } // namespace
 
 int main() {
@@ -658,6 +710,7 @@ int main() {
         deployment(STRIX_CLI_FIXTURE, probes, exists);
         model_presets(STRIX_CLI_BUILD_DATA, [](const auto&) { return true; });
         qwen_launcher_keeps_speculation_default(STRIX_CLI_BUILD_DATA);
+        hy4_launcher_resolves_documented_drafter(STRIX_CLI_BUILD_DATA);
         readme_commands_resolve(STRIX_CLI_README, STRIX_CLI_BUILD_DATA);
         return 0;
     } catch (const std::exception& error) {

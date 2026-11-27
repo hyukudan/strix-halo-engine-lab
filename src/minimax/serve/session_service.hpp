@@ -1,5 +1,7 @@
 #pragma once
 #include "strix/serve/run.hpp"
+#include <filesystem>
+#include <string>
 #include "minimax/serve/minimax_api.hpp"
 #include "minimax/serve/minimax_lead.hpp"
 #include "minimax/engine/deployment.hpp"
@@ -72,5 +74,8 @@ struct ServiceAssets {
 using SessionAssetLoader = std::function<std::unique_ptr<ServiceAssets>(const ServePreparation&)>;
 void install_session_service(strix::serve::ServiceFactories&, SessionAssetLoader);
 void install_session_service(strix::serve::ServiceFactories&);
-int legacy_serve(int argc, char** argv);
+// The registry root of the legacy entry point: the compiled source tree when it holds models/registry.toml, else
+// `shipped_root` (the launcher's data directory, strix::cli::data_directory) when given.
+std::string serve_registry_root(const std::filesystem::path& compiled_root, const std::filesystem::path& shipped_root);
+int legacy_serve(int argc, char** argv, const std::filesystem::path& shipped_root = {});
 } // namespace strix::minimax::serve

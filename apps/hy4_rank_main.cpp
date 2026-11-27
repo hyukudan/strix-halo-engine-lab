@@ -633,7 +633,6 @@ int run(int argc, char** argv) {
     bool print_config = false;
     // Exact speculative decode (src/hy4/hy4_speculation.hpp): --mtp forces it, --no-mtp / STRIX_MTP=0 opt out; the
     // EXACT prompt runs as verify rows of --prompt-vrows R (1..8, 0 = one step per position; each row bitwise the step).
-    bool top_explicit = false, no_mtp = false, want_mtp = false;
     std::uint32_t prompt_vrows = strix::hy4::hipbind::rows::kMaxVerifyRows;
     std::string dump_path;  // --dump-logits F: every host logits row (FP32, vocab floats per step) appended to F
     std::vector<strix::hy4::hipbind::PairWindowCost> window_costs;  // --window-costs ROWS:MS,... (pair calibration)
@@ -654,9 +653,9 @@ int run(int argc, char** argv) {
         else if (a == "--gen" && more) gen = static_cast<std::uint32_t>(std::stoul(args[++i]));
         else if (a == "--layers" && more) o.depth = static_cast<std::uint32_t>(std::stoul(args[++i]));
         else if (a == "--context" && more) o.context = static_cast<std::uint32_t>(std::stoul(args[++i]));
-        else if (a == "--top" && more) top = static_cast<std::uint32_t>(std::stoul(args[++i])), top_explicit = true;
-        else if (strix::session::speculation_opt_out_argument(a)) no_mtp = true;
-        else if (a == "--mtp") want_mtp = true;
+        else if (a == "--top" && more) top = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        else if (strix::session::speculation_opt_out_argument(a)) {}  // read by speculation_run_from_arguments
+        else if (a == "--mtp") {}  // read by speculation_run_from_arguments
         else if (a == "--prompt-vrows" && more) {
             prompt_vrows = static_cast<std::uint32_t>(std::stoul(args[++i]));
             if (prompt_vrows > strix::hy4::hipbind::rows::kMaxVerifyRows) throw std::invalid_argument("--prompt-vrows 0..8");
@@ -723,14 +722,11 @@ int run(int argc, char** argv) {
         throw std::invalid_argument("--pair-placement needs --rank or a two-node topology");
 
     const bool stage_route = stage_map.empty() && cut == 0U && !pipe_guess && window_costs.empty();
-    strix::hy4::SpeculationRun spec_run;
+    // The route the argument list spells (hy4_speculation.hpp); the pack and the topology complete it.
+    auto spec_run = strix::hy4::speculation_run_from_arguments(args);
     if (!o.parts.empty() && (!print_config || (layer_pair && !pair_receipt.empty())))
         spec_run.block_in_pack = strix::hy4::Config::from_gguf(o.parts.front()).nextn > 0U;
     spec_run.whole_model = o.depth == 0U;
-    spec_run.no_mtp = no_mtp;
-    spec_run.environment = std::getenv(strix::session::speculation_environment);
-    spec_run.explicit_mtp = want_mtp;
-    spec_run.per_step_route = (top_explicit && top > 0U) || !teacher.empty() || !dump_path.empty() || timing || gref.on;
     const bool spec_room = prompt.size() + gen + hr::kMaxVerifyRows <= o.context;
     std::optional<strix::serve::Json> placement_config;
     // The decision both ranks must share; an explicit --tp-rank is the tensor form without a measured reference.

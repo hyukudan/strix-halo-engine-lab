@@ -4,6 +4,11 @@
 // resolver (strix/session/speculation_default.hpp) decides. Host-only.
 #include "strix/session/speculation_default.hpp"
 
+#include <cstdlib>
+#include <string>
+#include <string_view>
+#include <vector>
+
 namespace strix::hy4 {
 
 // Exact speculative decode, the same in every tier: the pack's next-token (MTP) block drafts through the shared MtpChain
@@ -21,6 +26,21 @@ struct SpeculationRun {
     bool explicit_mtp = false;           // --mtp
     bool per_step_route = false;         // the caller asked for every step's logits / forced tokens / stage timing
 };
+// The decode-route facts the rank's argument list spells. Only the options named here own a route; the tier, the KV
+// storage, the prompt, the generation budget and the context are route-neutral (a launcher adds them to every command).
+// `--top 0` is the plain production form (device greedy row); any other --top asks for every step's logits.
+[[nodiscard]] inline SpeculationRun speculation_run_from_arguments(const std::vector<std::string>& args) {
+    SpeculationRun run;
+    run.environment = std::getenv(::strix::session::speculation_environment);
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string_view arg = args[i];
+        if (::strix::session::speculation_opt_out_argument(arg)) run.no_mtp = true;
+        else if (arg == "--mtp") run.explicit_mtp = true;
+        else if (arg == "--teacher" || arg == "--dump-logits" || arg == "--timing" || arg == "--gate-ref") run.per_step_route = true;
+        else if (arg == "--top" && i + 1 < args.size() && args[i + 1] != "0") run.per_step_route = true;
+    }
+    return run;
+}
 [[nodiscard]] inline ::strix::session::SpeculationCapability speculation_capability(bool available) {
     return {"hy4", available, true, true, false};
 }
