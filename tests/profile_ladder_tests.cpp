@@ -1840,6 +1840,50 @@ void band_lower_edge() {
     require(!p::ladder_defect(engine).empty(), "quality gate lengths do not count as timing receipts");
 }
 
+void promoted_band() {
+    const auto execution = [](std::uint64_t prompt, std::uint32_t lanes, std::string_view product,
+                              std::string_view settings, std::uint32_t chunk) {
+        return keep(p::ladder_execution({"hip", product, {prompt, 8192, lanes, chunk}, settings}));
+    };
+    constexpr auto settings = "pack=weight-v1|route=cli|ranks=1";
+    const auto capture = execution(1024, 1, "dev-product-a", settings, 512);
+    auto band = measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1024, 8192, 1, 2,
+                               1.25, 0.02, "r/capture"}, kExactArm, capture);
+    band.identity = "v1";
+    band.band_bound = true;
+    band.band_evidence.timed = {1024, 8192};
+    band.promotion = "fixture-band";
+    const std::array rows{band};
+    p::Engine engine{"capture-test", "", kRows, false, "capture-test-v1", {}, {}, rows};
+    require(p::ladder_defect(engine).empty(), "recaptured band is well formed");
+    const auto runs = [&](std::uint64_t prompt, std::uint32_t lanes, std::string_view key) {
+        return resolve(engine, p::Name::fast, {p::Phase::prefill, prompt, lanes, "dev", key}).find(kLever)->value == "a8";
+    };
+    require(runs(1024, 1, capture), "recaptured point is on by default");
+    const auto inside = execution(4096, 2, "dev-product-a", settings, 512);
+    require(runs(4096, 2, inside), "only the measured band coordinates may vary");
+    require(!runs(4097, 2, inside), "prompt field must agree with the live regime");
+    require(!runs(4096, 1, inside), "lane field must agree with the live regime");
+    require(!runs(4096, 2, execution(4096, 2, "dev-product-b", settings, 512)), "product must match");
+    require(!runs(4096, 2, execution(4096, 2, "dev-product-a", "pack=weight-v2|route=cli|ranks=1", 512)),
+            "pack must match");
+    require(!runs(4096, 2, execution(4096, 2, "dev-product-a", "pack=weight-v1|route=http|ranks=1", 512)),
+            "route must match");
+    require(!runs(4096, 2, execution(4096, 2, "dev-product-a", "pack=weight-v1|route=cli|ranks=2", 512)),
+            "topology must match");
+    require(!runs(4096, 2, execution(4096, 2, "dev-product-a", settings, 1024)), "chunk must match");
+    require(!runs(8193, 2, execution(8193, 2, "dev-product-a", settings, 512)), "context band still bounds admission");
+    auto edited = kRows;
+    edited[0].identity[0].identity = "v2";
+    engine.table = edited;
+    require(!runs(4096, 2, inside), "changing the denominator implementation retires the receipt");
+    edited[0].identity[0].identity = "v1";
+    edited[0].identity[1].identity = "v2";
+    require(!runs(4096, 2, inside), "changing the candidate implementation retires the receipt");
+    require(resolve(engine, p::Name::standard, {p::Phase::prefill, 4096, 2, "dev", inside}).find(kLever)->value == "off",
+            "EXACT selection shares no part of the promoted cell");
+}
+
 // Band receipts along a chain: the second lever's band row binds over the cell the first lever's band row admits
 // (bind + arms repeated until the references settle), so both cells of a measured chain run inside their bands.
 void band_chain() {
@@ -1898,6 +1942,7 @@ int main(int argc, char** argv) try {
     band_chain();
     band_lower_edge();
     band_max_edge();
+    promoted_band();
     bound_evidence();
     defects();
     shipped_rows();

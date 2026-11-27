@@ -286,6 +286,8 @@ struct LadderRow {
     bool band_bound = false;
     BandEvidence band_evidence{};
     std::string_view compatibility_over{};  // populated only on resolver-owned copies of historical rows
+    // Manifest entry for a recaptured execution. Only prompt length and lanes may vary across its band.
+    std::string_view promotion{};
 };
 
 // Bound the rounding allowance to three tokens (the same fixture can differ by a few tokens by entry point).
@@ -361,6 +363,59 @@ struct ReceiptKey {
     const JointLadderScope* joint_scope = nullptr;
     std::string_view identity{};
 };
+// The capture records one actual execution. Only the two measured band coordinates can be
+// different at runtime. In particular, context capacity, prefill chunk, pack and route stay fixed.
+inline constexpr std::string_view kLadderArmVersion = "ladder-arm/v4";
+
+struct BandReference {
+    std::string_view product, capacity, remainder;
+    std::uint64_t prompt = 0, lanes = 0;
+};
+
+[[nodiscard]] constexpr std::uint64_t band_coordinate(std::string_view number) noexcept {
+    std::uint64_t value = 0;
+    for (const char digit : number) {
+        if (digit < '0' || digit > '9') return 0;
+        const auto units = static_cast<std::uint64_t>(digit - '0');
+        if (value > (std::numeric_limits<std::uint64_t>::max() - units) / 10) return 0;
+        value = value * 10 + units;
+    }
+    return value;
+}
+
+[[nodiscard]] constexpr BandReference band_reference(std::string_view key) noexcept {
+    if (!key.starts_with(kLadderArmVersion) || !key.substr(kLadderArmVersion.size()).starts_with(";exec/v1 backend="))
+        return {};
+    const auto execution_end = key.find(';', key.find(';') + 1);
+    const auto prompt = key.find(" prompt=");
+    if (execution_end == key.npos || prompt >= execution_end) return {};
+    const auto context = key.find(" context=", prompt + 8);
+    if (context >= execution_end) return {};
+    const auto lanes = key.find(" lanes=", context + 9);
+    if (lanes >= execution_end) return {};
+    const auto chunk = key.find(" chunk=", lanes + 7);
+    if (chunk >= execution_end) return {};
+    return {key.substr(0, prompt), key.substr(context, lanes - context), key.substr(chunk),
+            band_coordinate(key.substr(prompt + 8, context - prompt - 8)),
+            band_coordinate(key.substr(lanes + 7, chunk - lanes - 7))};
+}
+
+[[nodiscard]] constexpr bool ladder_covers_band(const LadderRow& row, const Regime& regime) noexcept {
+    return row.phase == regime.phase && !row.device.empty() && row.device == regime.device &&
+        ladder_band(regime.context, ladder_min_context(row), row.max_context, regime.lanes, row.min_lanes, row.max_lanes);
+}
+
+[[nodiscard]] constexpr bool promoted_band_matches(const LadderRow& row, const ReceiptKey& key) noexcept {
+    const auto recorded = band_reference(row.over);
+    const auto actual = band_reference(key.reference);
+    const auto& regime = *key.regime;
+    return ladder_band(recorded.prompt, ladder_min_context(row), row.max_context, recorded.lanes,
+                       std::uint64_t{row.min_lanes}, std::uint64_t{row.max_lanes}) &&
+           actual.prompt == regime.context && actual.lanes == regime.lanes &&
+           recorded.product == actual.product && recorded.capacity == actual.capacity &&
+           recorded.remainder == actual.remainder;
+}
+
 // The one matching rule of every timing receipt (ordinary and paired): equality of the lever, the measured value, the
 // tier, the phase and the device class, the regime inside the row's band, and EXACT equality of the complete key (the
 // ordinary reference spelling, or the paired scope). No prefix, no partial key: a receipt that does not match has no
@@ -371,11 +426,11 @@ struct ReceiptKey {
         row.value != key.value || row.tier != key.tier || row.joint != key.joint)
         return false;
     const auto& regime = *key.regime;
-    if (row.phase != regime.phase || row.device.empty() || row.device != regime.device ||
-        !ladder_band(regime.context, ladder_min_context(row), row.max_context, regime.lanes, row.min_lanes, row.max_lanes))
-        return false;
+    if (!ladder_covers_band(row, regime)) return false;
     if (key.joint.empty()) {
         if (row.band_bound && row.identity != key.identity) return false;
+        if (!row.promotion.empty())
+            return row.band_bound && !regime.execution.empty() && promoted_band_matches(row, key);
         const auto over = row.band_bound && row.over.empty() && !regime.require_measured_receipts
             ? row.compatibility_over : row.over;
         return !key.reference.empty() && !regime.execution.empty() && over == key.reference;
@@ -1086,7 +1141,6 @@ struct LadderCell {
 
 // Version of the reference spelling (LadderRow::over). Bumped when the spelling rule changes, so a receipt written
 // under another rule never matches.
-inline constexpr std::string_view kLadderArmVersion = "ladder-arm/v4";
 
 // The effective executions of a regime (ladder_arms()): the cell every lever of the table runs in EXACT, FAST and
 // TURBO, in table order (builtin values, exact schedule levers and explicit settings included), the incumbent value
@@ -1181,9 +1235,7 @@ struct NoExplicitSetting {
     for (const auto& row : rows) {
         if (row.incumbent || !row.band_bound || !row.joint.empty() || !ladder_names(row, lever, value, tier)) continue;
         banded = true;
-        if (row.phase == regime.phase && !row.device.empty() && row.device == regime.device &&
-            ladder_band(regime.context, ladder_min_context(row), row.max_context, regime.lanes, row.min_lanes, row.max_lanes))
-            return false;
+        if (ladder_covers_band(row, regime)) return false;
     }
     return banded;
 }
@@ -1338,7 +1390,7 @@ inline constexpr std::string_view kBandProbeExecution = "exec/v1 band-probe";
 inline bool bind_band_receipts(std::vector<LadderRow>& rows, const LadderArms& arms, std::deque<std::string>& storage) {
     bool changed = false;
     for (auto& row : rows) {
-        if (!row.band_bound || row.incumbent || !row.joint.empty() || !row.over.empty()) continue;
+        if (!row.band_bound || row.incumbent || !row.joint.empty() || !row.over.empty() || !row.promotion.empty()) continue;
         const auto at = arms.index(row.lever);
         const bool measured_candidate = identity_token(row.identity) && at < arms.identities.size() &&
             declared_identity(arms.identities[at], row.value) == row.identity;
@@ -1619,6 +1671,12 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
                 return where + ": paired row names no other lossy lever of the table";
         }
         if (row.joint.empty() && row.value.empty()) return where + ": timing row names no measured value";
+        if (!row.promotion.empty()) {
+            const auto capture = band_reference(row.over);
+            if (!row.band_bound || !identity_token(row.promotion) || capture.prompt == 0 || capture.lanes == 0 ||
+                capture.remainder.find(" settings=") == std::string_view::npos)
+                return where + ": promotion requires a measured band and a complete captured execution";
+        }
         if (row.band_bound && (!row.joint.empty() || !identity_token(row.identity)))
             return where + ": band receipt requires a single measured candidate and its implementation identity";
         const bool fixed_reference = row.joint.empty() && (!row.band_bound || !row.over.empty());
