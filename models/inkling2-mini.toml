@@ -52,6 +52,10 @@ residual_block_layers = 6
 # own forward, so lanes draft only while one lane is live.
 [speculation]
 drafter = "mtp.safetensors"
+# The block-diffusion drafter (DFlash 2, src/spec/dflash_resident.hpp): a directory beside the checkpoint (config.json +
+# model.safetensors), preferred by the CLI resident route over the MTP sidecar when present and valid (RTX df3: code
+# +2.3 %, prose with reasoning up to +4.3 %; gfx1151 t1: +9.6 % / +21 %; ids == plain). Never fetched by the engine.
+block_drafter = "dflash2"
 max_draft_by_live = [7, 0]
 
 # Charged re-probe episodes of the shared arbiter (include/strix/spec/probe_policy.hpp), per backend with a receipt.

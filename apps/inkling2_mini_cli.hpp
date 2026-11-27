@@ -28,6 +28,7 @@ struct Options {
     const char* host_pack_hot{};
     bool dspark_off{};  // --dspark off: no drafter, not even the model's sidecar under auto
     const char* dflash{};  // --dflash DIR: the block-diffusion drafter directory (config.json + model.safetensors)
+    bool dflash_off{};     // --dflash off: no block drafter, not even the registry's directory beside the model
     const char* gate_manifest{};
     const char* gate_out{};
     const char* gate_arm{};
@@ -55,7 +56,8 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
             }
             if (argument == "--dflash" && native) {
                 const char* dir = value();
-                options.dflash = std::string_view(dir) == "off" ? nullptr : dir;
+                options.dflash_off = std::string_view(dir) == "off";
+                options.dflash = options.dflash_off ? nullptr : dir;
                 return true;
             }
             if (!native) {

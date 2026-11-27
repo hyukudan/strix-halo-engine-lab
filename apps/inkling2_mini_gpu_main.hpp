@@ -399,7 +399,7 @@ int main(int argc, char** argv) {
         std::cerr << "usage: " << executable
                   << " MODEL.safetensors (TOKEN [TOKEN ...] | --prompt TEXT | --messages FILE) [--tokenizer FILE]"
                      " [--prefill-chunk N] [--packed-decode | --grouped-decode] [--generate N] [--logits FILE]"
-                     " [--speculation off|auto|verify|lookup] [--dspark FILE|off] [--dflash DIR|off]"
+                     " [--speculation off|auto|verify|lookup] [--dspark FILE] [--dflash DIR|off]"
                      " [--step-graph | --no-step-graph"
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                      " | --step-program (default for decode)"
@@ -507,14 +507,29 @@ int main(int argc, char** argv) {
         // MTP block schema before anything is reserved for it: a file the loader would refuse is declined with its
         // reason and the run keeps its context drafts (source absent / rejected = context drafts only); an explicit
         // --dspark file is never declined (its loader error stands).
-        // An explicit block alone selects that arm. Name both sidecars to use the shared selector.
+        // The block-diffusion drafter first (--dflash DIR|off, else the registry's directory beside the checkpoint,
+        // models/inkling2-mini.toml [speculation].block_drafter, validated against this target before anything is
+        // reserved for it; a directory it refuses is declined with its reason): when one binds, the MTP sidecar is not
+        // loaded. An explicit --dspark FILE / off excludes the registry's block drafter.
+        const bool may_draft = options.generation.speculation == serve::CliSpeculation::automatic &&
+                               !options.gate_manifest && !options.generation.tokenize_file &&
+                               !token_sampling_enabled(options.generation.sampling);
+        const auto block_drafter = [&] {
+            auto found = strix::spec::resolve_drafter_dir(
+                {.file = options.dflash ? std::string_view(options.dflash) : std::string_view{},
+                 .off = options.dflash_off || options.dspark_off || options.dspark != nullptr,
+                 .speculating = may_draft},
+                argv[1], strix::model_data::inkling2_mini::speculation::block_drafter);
+            if (found.source == strix::spec::DrafterSource::beside_model)
+                if (auto problem = strix::inkling2::MiniDFlashTarget::problem(found.path); !problem.empty())
+                    return strix::spec::decline_drafter(found, std::move(problem));
+            return found;
+        }();
         const auto drafter = [&] {
             auto found = strix::spec::resolve_drafter_file(
                 {.file = options.dspark ? std::string_view(options.dspark) : std::string_view{},
-                 .off = options.dspark_off || (options.dflash && !options.dspark),
-                 .speculating = options.generation.speculation == serve::CliSpeculation::automatic &&
-                                !options.gate_manifest && !options.generation.tokenize_file &&
-                                !token_sampling_enabled(options.generation.sampling)},
+                 .off = options.dspark_off || block_drafter.enabled(),
+                 .speculating = may_draft},
                 argv[1], strix::model_data::inkling2_mini::speculation::drafter);
             if (found.source == strix::spec::DrafterSource::beside_model)
                 if (auto problem = strix::inkling2::MiniDSparkDeviceWeights::sidecar_problem(found.path); !problem.empty())
@@ -537,7 +552,7 @@ int main(int argc, char** argv) {
             };
         else
 #endif
-        family.load = [&loaded, &resolve_weights, &options, &weight_options, step_graphs, &drafter, plain_program,
+        family.load = [&loaded, &resolve_weights, &options, &weight_options, step_graphs, &drafter, &block_drafter, plain_program,
                        parsed_weights = weight_options, device = early.scope.device_class,
                        product = early.scope.cost_device,
                        combine_image = mini_combine_image(options.tier),
@@ -551,8 +566,8 @@ int main(int argc, char** argv) {
             // The drafter loads only when this request may draft (the shared CLI's resolved mode).
             const char* dspark = drafter.enabled() && load.speculation == serve::CliSpeculation::automatic
                                      ? drafter.path.c_str() : nullptr;
-            const char* dflash = options.dflash && load.speculation == serve::CliSpeculation::automatic
-                                     ? options.dflash : nullptr;
+            const char* dflash = block_drafter.enabled() && load.speculation == serve::CliSpeculation::automatic
+                                     ? block_drafter.path.c_str() : nullptr;
             const strix::weight::WeightLoadExtent extent{load.positions, 1U};
             // The SP4 attention + head column in this run's decode regime (the server's rule with its own extent).
             weight_options = parsed_weights;
@@ -610,8 +625,10 @@ int main(int argc, char** argv) {
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
             if (!step_program)
 #endif
-            if (options.generation.speculation != serve::CliSpeculation::off)
+            if (options.generation.speculation != serve::CliSpeculation::off) {
                 std::cerr << strix::spec::drafter_receipt("resident", drafter) << '\n';
+                std::cerr << strix::spec::drafter_receipt("resident-block", block_drafter) << '\n';
+            }
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
             if (!route.speculation_reason.empty())
                 std::cerr << "strix-speculation-route/v1 requested auto effective off ("
