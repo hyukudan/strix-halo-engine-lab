@@ -7855,6 +7855,10 @@ if(STRIX_FAMILY_MINIMAX)
                             "$<TARGET_FILE:strix-minimax-rank>" "$<TARGET_FILE:strix-minimax-serve>")
                 endif()
             endif()
+        else()
+            # Say why the engine targets are absent instead of skipping them silently (a dangling library link in the
+            # trellis tree is the usual cause).
+            message(STATUS "MiniMax engine targets skipped: need strix_dist and STRIX_MINIMAX_TRELLIS_DIR with include/strix_trellis.h and build-qualification-v03/libstrix_trellis.a (STRIX_MINIMAX_TRELLIS_DIR='${STRIX_MINIMAX_TRELLIS_DIR}')")
         endif()
         foreach(target ${strix_minimax_msa_hip_targets})
             set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
@@ -8181,6 +8185,10 @@ if(STRIX_FAMILY_GLM5)
                 target_compile_features(strix-glm5-serve PRIVATE cxx_std_20)
                 strix_target_warnings(strix-glm5-serve)
             endif()
+        else()
+            # Say why the TP2 engine targets are absent instead of skipping them silently (a dangling library link
+            # in the trellis tree is the usual cause).
+            message(STATUS "GLM-5 TP2 engine targets skipped: need strix_dist and STRIX_GLM5_TRELLIS_DIR with include/strix_trellis.h and build-qualification-v03/libstrix_trellis.a (STRIX_GLM5_TRELLIS_DIR='${STRIX_GLM5_TRELLIS_DIR}')")
         endif()
         foreach(target ${strix_glm5_hip_targets})
             set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
