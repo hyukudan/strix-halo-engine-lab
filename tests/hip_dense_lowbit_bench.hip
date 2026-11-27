@@ -100,6 +100,8 @@ Packed pack(wd::Format format, const std::vector<std::uint16_t>& bits, unsigned 
         }
         break;
     }
+    case wd::Format::e4m3_b128:  // FP8 row format of the ERNIE bindings: not a column of this bench
+        std::exit(3);
     }
     return p;
 }
